@@ -783,6 +783,7 @@ def ram_test(s, image, expect_uefi, reset_after):
     name = image.stem
     if not s.wait(s.serial, True, 240):
         raise Stop('no ABL fastboot')
+    t0 = time.time()
     s.fastboot('boot', str(image), timeout=180)
     if not s.wait('piano-uefi', True, 40):
         raise Stop('our UEFI did not appear: ABL refused the image? (fastboot reboot bootloader; docs/persistent-boot.md, v2 fallback)')
@@ -794,24 +795,37 @@ def ram_test(s, image, expect_uefi, reset_after):
         lines = [m.decode(errors='replace') for m in re.findall(rb'UNIXNU[A-Z]*: [ -~]{0,200}', raw)]
         for line in lines[:60]:
             s.log('        | ' + line)
-        s.need(any(expect_uefi in line for line in lines), f'UEFI log has "{expect_uefi}"')
+        if lines:
+            s.need(any(expect_uefi in line for line in lines), f'UEFI log has "{expect_uefi}"')
+        else:
+            s.log('  WARN  the UEFI DEBUG log could not be read (the UEFI was gone before the dump): judged by the run below')
     else:
         s.log(f'  check {name}-uefi.bin has "{expect_uefi}"')
     s.wait('piano-uefi', False, 90)
     if not s.wait(s.serial, True, reset_after + 150):
         raise Stop(f'not back in ABL fastboot {reset_after + 150} s later (parked? power + volume-down 15-20 s)')
+    if s.execute:
+        took = int(time.time() - t0)
+        s.log(f'  {"ok   " if reset_after <= took <= reset_after + 150 else "WARN "} back in ABL fastboot after {took} s '
+              f'(the configuration it ran resets after {reset_after} s)')
     s.fastboot('boot', str(dump), timeout=180)
     if not s.wait('piano-uefi', True, 40):
         raise Stop('dump image: our UEFI did not appear')
     s.fastboot('oem', 'dump', '9cb00000', '700000', serial='piano-uefi', check=False)
     s.fastboot('get_staged', f'{name}-xnu.bin', serial='piano-uefi', check=False)
     s.log(f'  host$ python3 tooling/native/xnu-log.py decode {name}-xnu.bin > {name}-xnu.txt')
+    s.log(f'  check the Data store opens at LBA {store_new(s)} (the new partition end): "NativeRamBlock: Data store state ... first LBA"')
     if s.execute:
         r = subprocess.run(['python3', str(XNU_LOG), 'decode', str(s.dir / f'{name}-xnu.bin')], capture_output=True, text=True)
         (s.dir / f'{name}-xnu.txt').write_text(r.stdout)
         for line in r.stdout.splitlines():
             if re.search(r'NativeRamBlock: Data store|NativeUfs:.*(root|window|store)|panic\(|launchd\[1\]', line):
                 s.log('        | ' + line[:200])
+        lbas = re.findall(r'Data store state \d.*?first LBA (\d+)', r.stdout)
+        if lbas:
+            s.need(all(int(x) == store_new(s) for x in lbas), f'the Data store opened at LBA {lbas[-1]} = {store_new(s)}')
+        else:
+            s.log('  WARN  no "Data store state" line in the XNU log (store off, or the log ring lost it)')
     s.wait(s.serial, True, 120)
 
 
