@@ -1,0 +1,60 @@
+PianoPower is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE) around the audio DSP transport of UniXNU-sheng and the SCM
+client of Adreno830. What it takes from other work, and from where:
+
+UniXNU-sheng (unixnu-research/UniXNU-sheng, main 00ba90984e831e4c6ce30ec3d8a56e6434e9f1af), BSD-2-Clause-Patent (LICENSE
+sha256 5b1d3d911103cb0f41641ec0964c5ac1f7e229f57aa072b6ac38bae913a1307b; SM8550, the ADSP path hardware-verified there per its
+porting.toml), package/:
+  Taken unchanged (sha256 of the copies here = of the originals):
+    QcomSmem.c   4e9eb0ee22458dad30e1fcb7edb74a9d762222aff0623a6d5b85fb4a6e08bd03   QcomSmem.h   f2a25e807bfa0556f2ec19258d8b2f47782acdc5fe1d9bdab23ecbb9f948ae37
+    QcomSmp2p.c  f91c38e60fe86c5a55cbf9e822e0486997f7104d564ea90d6afe6ab40ac9d60b   QcomSmp2p.h  894f36fd14be184252ce64c4c8c908d161d31433185b190041f4bd18d47d68c6
+    QcomGlink.c  3d7e18c2cae2c6136b1b7bf43f8d69e49c99ed8e60d3ee7cd98c37891df9b1ba   QcomGlink.h  7e617c764e11ba7ca08e9976e39c35710515a16613ea66f3e845da538ad2df07
+    QcomQmp.c    6d5dd2e0ebf1f425f7fc929555edb275b8d499cfaa1f9c887bfcb68f09785249   QcomQmp.h    dd6722ade248435930c5f242ef78728f58f7e3bc6a9765fe229b32c87f342503
+    QcomRpmh.c   679a55467e6ed4c7e75a8191f1d6da48637377088ef5e27879b1c99bc4a62314   QcomRpmh.h   47e299744ff83989449d262f74f5dfd2ba1cdbf921b2886643735f2febb6ee21
+    QcomMdt.c    706f4a86624d119282683287bf408ae679275368f9bcc28d6f4ba652d3ad377a   QcomMdt.h    22d8e567b285e254becf1af41f8ba0c9c1cfcc5295f6246b4b9d09e5fef88477
+    QcomQrtr.c   d22ff8572b93424f1f03138204a44e10b444d0cb62b6be4f1c57b7d3b2ddbc74   QcomQrtr.h   3ead40f5f996497224ebef92e2e67820aa8372bab0a21646c15df954baba84f1
+    FatVolume.c  6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779   FatVolume.h  a438bcc5519bacfbfa6b6c55646fe4a3f7787f37a50c52103d8094c6871b67e7
+  Derived:
+    AdspProbe.cpp (eace137cc122c83551c971a0d6335d5c72fa7f1acc754d45221059be263f4e67) -> PianoAdsp.cpp. Kept: the bring-up order and
+      every step (survey, SMP2P item, doorbells, AOSS load_state, cmd-db + lcx/lmx votes through RSC TCS 1, DTB then DSP image
+      with init_image/mem_setup/segments/auth_and_reset, ready/fatal/handover on SMP2P, GLINK descriptor and FIFOs, the client queue).
+      Changed: SM8750 addresses (IPCC 0x406000, RSC drv-2 0x16520000, carveouts 0xb8200000 + 0x5780000 and 0x9ed80000 + 0x80000);
+      no interrupts (the IPCC doorbells and the RSC done bit are polled from the DSP thread: the native KC has no armcpu_spi_attach);
+      the secure calls through Sm8750Scm instead of its own SMC loop; one firmware source (modem_a, or piano-power-fw=DIR); a console
+      line per stage and a status struct instead of the native_adsp_stats arrays; the survey exported for piano-power=1.
+    AdspFirmware.c (ced26abf9e7ae3033dceaa1d39ccbf85e73abc636aac41aa7e3d3b2741e67a7c) -> PianoAdspFirmware.c: the headers from
+      NAME.mdt when there is no NAME.b00 (piano's modem_a), piece 0 read from that file; names piano_fw_*; strong imports of
+      NativeUfs's native_ufs_part_find/native_ufs_part_read (package/NativeUfs exports them).
+    ShengQrtr.c (d3cac365aa20c5a6dc02ab3f2635ccec2c332cfd1862ec805512935124d440cc) -> PianoQrtr.c: the same domain table and
+      locator; on PianoAdsp.h; counters and a console line per locator request instead of native_qrtr_stats.
+    ShengAdsp.h (d877fc12d123ab99c08f00a6e043daf46270da01a0b093673af1910ba08e0b7f) -> PianoAdsp.h: the client interface renamed,
+      plus the survey and status interface.
+    QcomScm.h (ab03ab1291f043cb281f4d64b82b0d497d0e4f61a5b888512f0ec852ae1a3244): its IPCC register offsets and doorbell ids, as
+      constants in PianoAdsp.cpp.
+    TouchBoard.h: the TLMM layout (configuration at 0x1000 * gpio: function 5:2, drive 8:6, output enable 9; input/output at +4),
+      used in PianoPower.cpp.
+  Read, not used: ShengBattmgr.c (b1d2868033bc357b89f6d252c218ddfb42e1f576d812d5efc3ef2f64dea09174) and ShengBattery.cpp
+    (a2c5c6334c73066026aa95867cdae17ee00e5d9c9fa408be0966a80cac792f1e): the Qualcomm battery manager protocol, which piano's DSP
+    firmware does not speak. PianoMca.c keeps their design (a pure codec, one request in flight, the owner's timer, refresh
+    cycles, notifications start a cycle) for piano's own property protocol, written fresh.
+
+Adreno830 (unixnu-research/Adreno830, main 1a1321056ffc5428ae925f4680093718b46ca7c2), MIT (LICENSE sha256
+16fbc0170994a48f60938d9f0d992d3bad113383cf90882f75c206e079c2a2dc; the notice is in this package's LICENSE), platform/sm8750:
+    Sm8750Scm.c  6e2c36fc87b68e684223988973ad27ca0b591b3119838abf0d2553ed9c79cc2e   Sm8750Scm.h  0715cbd4e24162ab2b20dcc3c600d8a5d6a7a3f254814afc1983c2deaee1ac7b
+  Taken unchanged: SM8750 SCM calls from EL1 under Gunyah (INTERRUPTED, WAITQ_SLEEP with GET_WQ_CTX polled, EBUSY), verified on the
+  13T for the GPU's PAS.
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent: package/PianoInput/SpmiObserver.h (the SPMI arbiter v7 observer reads),
+re-expressed in SpmiObserver.h with reads of up to 8 bytes and the owner table.
+
+Project-SunUEFI (unixnu-research/Project-SunUEFI, main 4ef87402e9d58465af871e4c4f4a5de87599d81c),
+uefi/components/usb-host/PianoUsbTypec.c (BSD-2-Clause-Patent; sha256 d3748b771c870fd4443013e4cbb5ee3b7fad0f36b78b670a7c70c9b96abc094b):
+  facts only, in ChargerPmic.h: the PMIH010x REVID check (TYPE 0x51, model 0x47/0x56), the charger block (lowest TYPE 0x02 with
+  SUBTYPE 0x7f/0xa8/0xba on SID 7), the 0x300 move for SUBTYPE 0xba..0xc4, DCDC +0x100, USBIN +0x300, Type-C +0x600, the Type-C
+  status bytes (+0x06 sink, +0x08 source, +0x0b attached/CC) and the port mode at +0x44. The code is written fresh.
+
+Specification only (GPL-2.0, read, never copied): the piano MCA property protocol, its property ids and the stock policy values,
+from Project-SunUEFI patches/linux/7.3/0001-platform.patch (drivers/power/supply/piano_mca.c, GPL-2.0-only) and its
+docs/devel/linux/kernel.md; Ubuntu's piano-charging.service (xiaomipad-8pro-mainline packaging) and the shipped xiaomi_mca.ko module
+descriptions. PianoMca.c describes and implements that behaviour in its own code. The bq27z561 standard commands come from TI's
+datasheet; the SM8750 addresses from piano's live DT (out/inputs/piano-boot.dtb). Not used at all: the K90 annibale drivers
+(APSL-2.0), Linux's qcom_battmgr, pmic_glink, qcom_q6v5_pas, bq27xxx and spmi-pmic-arb sources.

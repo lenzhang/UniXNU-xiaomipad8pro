@@ -12,7 +12,7 @@ hardware.** Hardware tests start after M2 (XNU RAM boot) or M3 (UFS), always wit
 | 1a | [native-gop-display.md](native-gop-display.md) | `NativeGopDisplay`: display.md's GOP step as a k27 native kext (DroidVMDisplay's CPU copy), `/arm-io/gop-display` | M2a: WindowServer's frames on the panel (built and linked 2026-11-11; Metal is the open blocker) | macOS-DroidVM `DroidVMDisplay` (GopFramebuffer read) |
 | 2 | [ufs.md](ufs.md) | `NativeUfs` for `qcom,sm8750-ufshc` | M3: real root/Data instead of the RAM seed | `ShengUfs` (13T host-verified) |
 | 3 | [touch.md](touch.md) | NT36532E over GENI SPI (+ keyboard cover note) | login by touch (keyboard cover is the fallback) | `ShengNovatekTouch` + `QcomGeniSpi` |
-| 4 | [charging.md](charging.md) | power source / charger policy / gauges | any native session longer than the battery | UniXNU-sheng power records, Project-SunUEFI power work |
+| 4 | [charging.md](charging.md) | `PianoPower`: fuel gauges over software I2C, the charger PMIC's port (SPMI, read only), the DSP's charger firmware (PAS + GLINK + MCA properties) | any native session longer than the battery; macOS as the default OS (built and linked 2026-11-11, inert without `piano-power`) | UniXNU-sheng ADSP/GLINK/QRTR transport, Adreno830 Sm8750Scm, Project-SunUEFI PMIH010x facts |
 | 5 | [gpu.md](gpu.md) | Adreno 830 KMD + Metal glue | GPU-composited desktop (M5) | `Adreno830` + `Sm8750Platform` + `AdrenoMetal` (13T Metal desktop) |
 | – | [usb-device-debug.md](usb-device-debug.md) | `PianoDwc3`: DWC3 device mode, two CDC-ACM ports (live kernel console + monitor, user pipe) | none (debugging aid for all of the above) | own gadget core; takeover order from Project-SunUEFI's piano DWC3 driver (Apple's XDCI class is not in the macOS KC) |
 
