@@ -157,3 +157,14 @@ Fails safe: RAM boot; `piano-reset-after` resets; without `piano-power` nothing 
 Transport from UniXNU-sheng (BSD-2-Clause-Patent) and Sm8750Scm from Adreno830 (MIT), hashes in `package/PianoPower/UPSTREAM`.
 `piano_mca.c`, xiaomi_mca, pmic_glink, qcom_battmgr, qcom_q6v5_pas and bq27xxx (GPL-2.0) are specification only; PianoMca.c,
 Gauge.h and ChargerPmic.h are written fresh.
+
+## Measured 2026-11-11 (level 1, read only, 240 s on the Mac's USB-C port)
+
+- SPMI arbiter v7, charger PMIC SID 7 = PMIH010x model 0x56; charger/DCDC/USBIN/Type-C blocks owned by EE 0 (the DSP's EE).
+- DSP: SMEM APPS/ADSP partition present, no SMP2P state: not running, as expected natively.
+- Both gauges answer (bq27z561 on qup1_se5 gpio52/53 and qup2_se3 gpio12/13): 4480/4479 mV, 99 %, 4287/4344 and 4235/4290 mAh,
+  28–30 °C, 113/114 cycles.
+- Type-C: a source attached on CC1, Rp 0x2 (500 mA). Battery current 0 mA ("idle") for the whole run: at 99 % the system ran
+  from the USB input without draining the pack. Whether a partly discharged pack charges without the DSP is still to be measured
+  (needs a lower charge level); level 2 (DSP start) is for an owner-attended session.
+- ABL `getvar battery-voltage` before/after: 4478 / 4477 mV.
