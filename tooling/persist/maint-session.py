@@ -433,8 +433,16 @@ class Session:
         raise Stop('no maintenance shell (USB NCM link up?)')
 
     def esp_reset_after(self):
-        m = re.search(r'piano-reset-after=(\d+)', (self.esp or {}).get('cmdlines', {}).get((self.esp or {}).get('default', ''), ''))
-        return int(m.group(1)) if m else 600
+        """The reset time of the default entry of the ESP on the tablet (the one written, else --esp). An ESP whose default does not
+        reset (default macos) never comes back to ABL fastboot by itself, so the RAM tests refuse it."""
+        name = self.state.get('esp_written') or self.a.esp
+        rec = self.esp_record(name) or {}
+        m = re.search(r'piano-reset-after=(\d+)', rec.get('cmdlines', {}).get(rec.get('default', ''), ''))
+        if not m:
+            raise Stop(f'the ESP on the tablet ({name}, default {rec.get("default")}) does not reset into ABL fastboot, so this RAM test '
+                       f'would not come back: write the -diag ESP for session 2 (step esp --esp esp-<profile>-diag.img), the -macos one '
+                       f'in session 3 (esp-final)')
+        return int(m.group(1))
 
 
 # ------------------------------------------------------------------------------------------------------------------------
@@ -505,7 +513,13 @@ def maint_boot(s):
     if out is not None:
         m = re.search(r'host_ip=(\S+)', out)
         s.need(m and m.group(1) == s.host_ip(), f'the tablet fetches from {m and m.group(1)}: this host\'s USB-link address')
-    s.fetch('tablet.sh', TABLET_SH, common.sha(TABLET_SH))
+    # tablet.sh is not on the tablet yet: its own 'fetch' cannot bring it. Bootstrap it with busybox wget + sha256sum.
+    digest = common.sha(TABLET_SH)
+    s.serve({'tablet.sh': TABLET_SH})
+    out = s.shell(f'mkdir -p /run/pp && rm -f /run/pp/tablet.sh && wget -q -O /run/pp/tablet.sh http://{s.host_ip()}:{s.a.http_port}/tablet.sh '
+                  f'&& sha256sum /run/pp/tablet.sh', 300)
+    if out is not None:
+        s.need(digest in out, f'tablet.sh fetched, sha256 {digest[:16]}')
     s.shell('piano-maint status')
 
 
