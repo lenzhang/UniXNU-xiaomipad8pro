@@ -55,7 +55,7 @@ boot DTB sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840
     | action = "tools"
   info  no AVB footer (unsigned, as the Ubuntu RAM set)
 
-== boot-piano-macos-ram-A-bundled.img  203726848 bytes  sha256 a99703f53f2b6719598347508884aa80174235b12e5d1e1e2d9dbe622842e5bd
+== boot-piano-macos-ram-A-bundled.img  203726848 bytes  sha256 9cdcd692083a0dca090488886f2567c5c6cf986b5f448b25230bffa3d34e70a5
   ok    header magic = b'ANDROID!' (Ubuntu RAM set: b'ANDROID!')
   ok    header kernel_addr = 32768 (Ubuntu RAM set: 32768)
   ok    header ramdisk_addr = 16777216 (Ubuntu RAM set: 16777216)
@@ -80,11 +80,11 @@ boot DTB sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840
   ok    v2 dtb section is the boot DTB
   ok    ramdisk is the payload the build recorded
   ok    ramdisk is a FAT volume with 5 files
-        EFI/UniXNU/Payloads/kernel.macho  92782592  e12a2ad3bc50027e0e6fb91de380e1b1d637a02a93d16260cdafaaf62cbc0af0
+        EFI/UniXNU/Payloads/kernel.macho  92782592  5a10c0ca665a1e5c8e4413f993685177a6941320947cc10ae2cc1dc478eca2f0
         EFI/UniXNU/Payloads/kernel.macho.adt  14896  f9b45c6560e05fac3c315f3cf6f219b39cad1a729cbd67c0b6d639657c18c695
         EFI/UniXNU/Payloads/kernel.macho.trustcache  446804  2b87b2241090c90508f26c8ca33129f7540922481a102359e99cf0adf00d10d6
         EFI/UniXNU/Payloads/scratch-data.img  83967024  cb50ceac16394c9f1da7f141ce0bb0b831b5ffac6bc9eeb56a9af99b1c147c11
-        EFI/UniXNU/unixnu.toml  2329  13e61cf833cd56ed2563f258cbd9efb820d98573369d7eeb5206851b14fdddea
+        EFI/UniXNU/unixnu.toml  2399  f6b2f95353c49bec4a651c14fe11316d6b143da79512a055eede29d4bf7fe76b
   ok    EFI/UniXNU/Payloads/kernel.macho is the input the build recorded
   ok    EFI/UniXNU/Payloads/kernel.macho.adt is the input the build recorded
   ok    EFI/UniXNU/Payloads/kernel.macho.trustcache is the input the build recorded

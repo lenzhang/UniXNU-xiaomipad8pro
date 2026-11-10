@@ -1,0 +1,145 @@
+From f1e046b22cbfbb83e459697f63d6f8318bf3c349 Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Tue, 10 Nov 2026 23:31:28 +0800
+Subject: [PATCH] k27: pstore-console=<phys>: the console mirrored into a RAM
+ mailbox that survives a reset
+
+The ring is stored 11 times (bitwise majority on read): piano's DRAM loses ~4 % of the bits across any reset. Used with
+cvp@9cb00000 (no-map, unused by Ubuntu and the firmware) and read back from Ubuntu through /dev/mem.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ osfmk/console/serial_console.c | 85 ++++++++++++++++++++++++++++++++++
+ pexpert/arm/pe_init.c          |  3 ++
+ 2 files changed, 88 insertions(+)
+
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 11d9eb4..f683e9f 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -55,6 +55,8 @@
+ 
+ #ifdef CONFIG_XNUPOST
+ #include <tests/xnupost.h>
++#include <pexpert/pexpert.h>
++#include <os/atomic_private.h>
+ kern_return_t console_serial_test(void);
+ kern_return_t console_serial_parallel_log_tests(void);
+ #endif
+@@ -529,9 +531,90 @@ console_resume()
+  * @param str The string of characters to print.
+  * @param size The number of characters in `str` to print.
+  */
++
++/*
++ * piano (k27 0055): pstore-console=<phys> [pstore-console-size=<bytes>, default 2 MiB; piano runs use 7 MiB, the whole cvp region] mirrors every console byte into a
++ * RAM mailbox that survives a reset (piano: cvp@9cb00000, read back from Ubuntu with /dev/mem): a 12-byte header
++ * ("DBGB" signature, start, size) and the ring 11 times over (bitwise majority against DRAM bit decay). Ubuntu's own
++ * ramoops zone does not work on piano (the firmware rewrites it each boot). A native boot leaves its log without a UART. Output before the mapping exists is kept in a static buffer
++ * and copied in when console_pstore_init() runs (PE_init_platform, VM initialized). No boot arg: nothing changes.
++ */
++#define PSTORE_SIG              0x42474244u     /* "DBGB": the DBGC layout with the ring stored PSTORE_COPIES (11) times */
++#define PSTORE_COPIES           11u
++#define PSTORE_EARLY_BYTES      (32u * 1024u)
++static volatile uint32_t *console_pstore_hdr;   /* [0] sig, [1] start, [2] size, then data */
++static volatile uint8_t *console_pstore_data;
++static uint32_t console_pstore_cap;
++static uint64_t console_pstore_total;
++static uint8_t console_pstore_early[PSTORE_EARLY_BYTES];
++static uint32_t console_pstore_early_len;
++static bool console_pstore_wanted = true;       /* cleared when the boot arg is absent */
++
++static void
++console_pstore_put(const char *str, int size)
++{
++	if (!console_pstore_wanted || size <= 0) {
++		return;
++	}
++	if (console_pstore_hdr == NULL) {
++		for (int i = 0; i < size && console_pstore_early_len < PSTORE_EARLY_BYTES; i++) {
++			console_pstore_early[console_pstore_early_len++] = (uint8_t)str[i];
++		}
++		return;
++	}
++	uint64_t at = os_atomic_add_orig(&console_pstore_total, (uint64_t)size, relaxed);
++	for (int i = 0; i < size; i++) {
++		uint64_t o = (at + (uint64_t)i) % console_pstore_cap;
++		/* PSTORE_COPIES copies: piano's DRAM loses ~4 % of the bits of the region across any reset (measured 2026-11-10,
++		 * Ubuntu reboot and PSCI reset alike); the reader (UniXNU-piano tooling/native/xnu-log.py) takes the bitwise
++		 * majority, ~2e-6 residual bit errors with 11 copies. */
++		for (uint32_t k = 0; k < PSTORE_COPIES; k++) {
++			console_pstore_data[o + (uint64_t)k * console_pstore_cap] = (uint8_t)str[i];
++		}
++	}
++	uint64_t total = at + (uint64_t)size;
++	console_pstore_hdr[1] = (uint32_t)(total % console_pstore_cap);
++	console_pstore_hdr[2] = (uint32_t)(total < console_pstore_cap ? total : console_pstore_cap);
++	__builtin_arm_dsb(0xf);
++}
++
++void console_pstore_init(void);
++void
++console_pstore_init(void)
++{
++	uint64_t base = 0, bytes = 0x200000;
++
++	if (!PE_parse_boot_argn("pstore-console", &base, sizeof(base)) || base == 0) {
++		console_pstore_wanted = false;
++		return;
++	}
++	(void)PE_parse_boot_argn("pstore-console-size", &bytes, sizeof(bytes));
++	if (bytes < 0x10000 || bytes > 0x1000000) {
++		console_pstore_wanted = false;
++		return;
++	}
++	vm_offset_t va = ml_io_map((vm_offset_t)base, (vm_size_t)bytes);
++	if (va == 0) {
++		console_pstore_wanted = false;
++		return;
++	}
++	console_pstore_cap = ((uint32_t)bytes - 16) / PSTORE_COPIES;  /* data = PSTORE_COPIES copies of the ring after the header */
++	console_pstore_data = (volatile uint8_t *)(va + 12);
++	console_pstore_total = 0;
++	((volatile uint32_t *)va)[1] = 0;
++	((volatile uint32_t *)va)[2] = 0;
++	((volatile uint32_t *)va)[0] = PSTORE_SIG;
++	__builtin_arm_dsb(0xf);
++	console_pstore_hdr = (volatile uint32_t *)va;
++	console_pstore_put((const char *)console_pstore_early, (int)console_pstore_early_len);
++	printf("pstore-console: mirroring the console to 0x%llx (+0x%llx), %u early bytes\n", base, bytes, console_pstore_early_len);
++}
++
+ void
+ console_write(char *str, int size)
+ {
++	console_pstore_put(str, size);
++
+ 	if (disableConsoleOutput) {
+ 		return;
+ 	}
+@@ -621,6 +704,8 @@ console_write_unbuffered(char c)
+ 		return;
+ 	}
+ 
++	console_pstore_put(&c, 1);
++
+ 	_cnputc(c, true);
+ }
+ 
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index b7134a6..980a575 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -482,6 +482,9 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 		pe_identify_machine(boot_args_ptr);
+ 	} else {
+ 		pe_arm_init_interrupts(args);
++		/* k27 0055: the console mirror into a Linux ramoops zone (pstore-console=), once ml_io_map works */
++		extern void console_pstore_init(void);
++		console_pstore_init();
+ 	}
+ 
+ 	if (!vm_initialized) {
+-- 
+2.55.0
+

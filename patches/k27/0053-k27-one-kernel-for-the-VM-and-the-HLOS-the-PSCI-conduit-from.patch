@@ -1,0 +1,145 @@
+From 3ca6c555117176398656dcc03c8a103f2e695eeb Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Tue, 10 Nov 2026 18:48:07 +0800
+Subject: [PATCH] k27: one kernel for the VM and the HLOS: the PSCI conduit
+ from the ADT (/psci method), XNU_VM_GUEST=0 for the native build
+
+- halt_all_cpus's PSCI SYSTEM_OFF/SYSTEM_RESET (0051) goes through the conduit the ADT's /psci "method" names, read once in
+  ml_parse_cpu_topology (ml_read_psci_conduit; ml_psci_conduit, ml_psci_conduit_from_dt for the host rig), as Linux's
+  psci_probe and ArmCpu's CPU_ON do: "hvc" in the crosvm/Gunyah VM, "smc" natively at EL1. The same kernel collection runs
+  in both; the VM ADT has said "hvc" all along, so the VM kernel behaves as before.
+- XNU_VM_GUEST is the one build flag: 1 (build-k27-piano.sh's default, the VM kernel) makes HVC the fallback when the ADT has
+  no usable /psci; 0 (K27_VARIANT=native) makes it SMC. The other XNU_VM_GUEST code is the piano's k27 in both variants and
+  now tests defined(XNU_VM_GUEST): 0052's 12 GiB zone VA and 0051's dead-union-parent release (the union root, not the VM).
+  0050's 16-bit ASIDs (XNU_VM_GUEST_TLB, BCM2837.h) and 0051's bootstrap-table sizing are unconditional already.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bsd/vfs/vfs_subr.c             |  4 +--
+ osfmk/arm64/machine_routines.c | 56 +++++++++++++++++++++++++++++++---
+ osfmk/kern/zalloc.c            |  2 +-
+ 3 files changed, 54 insertions(+), 8 deletions(-)
+
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+index 282c705..9cec12f 100644
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -2661,7 +2661,7 @@ vnode_rele_ext(vnode_t vp, int fmode, int dont_reenter)
+ }
+ 
+ 
+-#if XNU_VM_GUEST
++#if defined(XNU_VM_GUEST)   /* the piano's k27, VM and native alike: the union root, not the VM */
+ uint32_t vnode_rele_dead_past_zero;
+ #endif
+ 
+@@ -2681,7 +2681,7 @@ vnode_rele_internal(vnode_t vp, int fmode, int dont_reenter, int locked)
+ #endif
+ 	/* Enable atomic ops on v_usecount without the vnode lock */
+ 	old_usecount = os_atomic_dec_orig(&vp->v_usecount, relaxed);
+-#if XNU_VM_GUEST
++#if defined(XNU_VM_GUEST)
+ 	if (old_usecount < 1 && vp->v_type == VBAD) {
+ 		/*
+ 		 * A reclaimed vnode a child still names as its parent across mounts: the union of the SystemOS
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 2b62e95..1f59ef3 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -923,6 +923,44 @@ ml_get_machine_mem(void)
+ 	return machine_info.memory_size;
+ }
+ 
++#if defined(XNU_VM_GUEST)
++/*
++ * The PSCI conduit of this kernel's own PSCI calls (halt_all_cpus), read from the ADT's /psci "method" at boot like Linux's
++ * psci_probe and ArmCpu's psciConduit, so that the same kernel runs as a VM guest (crosvm/Gunyah: "hvc") and natively as the
++ * HLOS ("smc"). Without a usable /psci node the build's default applies: XNU_VM_GUEST=1 (the VM kernel, build-k27-piano.sh's
++ * default) keeps HVC as before this change, XNU_VM_GUEST=0 (K27_VARIANT=native) takes SMC.
++ */
++#define ML_PSCI_CONDUIT_HVC     1
++#define ML_PSCI_CONDUIT_SMC     2
++#if XNU_VM_GUEST
++#define ML_PSCI_CONDUIT_DEFAULT ML_PSCI_CONDUIT_HVC
++#else
++#define ML_PSCI_CONDUIT_DEFAULT ML_PSCI_CONDUIT_SMC
++#endif
++SECURITY_READ_ONLY_LATE(uint32_t) ml_psci_conduit = ML_PSCI_CONDUIT_DEFAULT;
++SECURITY_READ_ONLY_LATE(uint32_t) ml_psci_conduit_from_dt = 0;   /* 1: from /psci method; 0: the build's default */
++
++static void
++ml_read_psci_conduit(void)
++{
++	DTEntry entry;
++	void const *prop = NULL;
++	unsigned int size = 0;
++
++	if (SecureDTLookupEntry(NULL, "/psci", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "method", &prop, &size) != kSuccess || prop == NULL || size < 3) {
++		return;
++	}
++	if (strncmp((const char *)prop, "smc", 3) == 0) {
++		ml_psci_conduit = ML_PSCI_CONDUIT_SMC;
++		ml_psci_conduit_from_dt = 1;
++	} else if (strncmp((const char *)prop, "hvc", 3) == 0) {
++		ml_psci_conduit = ML_PSCI_CONDUIT_HVC;
++		ml_psci_conduit_from_dt = 1;
++	}
++}
++#endif /* defined(XNU_VM_GUEST) */
++
+ __attribute__((noreturn))
+ void
+ halt_all_cpus(boolean_t reboot)
+@@ -934,15 +972,20 @@ halt_all_cpus(boolean_t reboot)
+ 		printf("CPU halted\n");
+ 		PEHaltRestart(kPEHaltCPU);
+ 	}
+-#if XNU_VM_GUEST
++#if defined(XNU_VM_GUEST)
+ 	/*
+-	 * A VM guest ends here: PSCI SYSTEM_RESET or SYSTEM_OFF through the conduit crosvm's FDT names (/psci method "hvc"),
+-	 * so the hypervisor ends the VM and crosvm exits (or restarts it), where the platform expert has no power-off of its
+-	 * own and its reset went through SMC, which Gunyah does not route to PSCI.
++	 * The piano's k27 ends here: PSCI SYSTEM_RESET or SYSTEM_OFF through the conduit the ADT's /psci method names
++	 * (ml_read_psci_conduit), the one ArmCpu's CPU_ON uses too. In the VM that is "hvc" (crosvm's FDT): Gunyah ends the VM
++	 * and crosvm exits (or restarts it), where the platform expert has no power-off of its own and its reset went through
++	 * SMC, which Gunyah does not route to PSCI. Natively (the HLOS at EL1) it is "smc", the firmware's PSCI.
+ 	 */
+ 	{
+ 		register uint64_t x0 __asm__("x0") = reboot ? 0x84000009ULL : 0x84000008ULL;
+-		__asm__ volatile ("hvc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++		if (ml_psci_conduit == ML_PSCI_CONDUIT_SMC) {
++			__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++		} else {
++			__asm__ volatile ("hvc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++		}
+ 	}
+ #endif
+ 	while (1) {
+@@ -1363,6 +1406,9 @@ ml_parse_cpu_topology(void)
+ 	assert(topology_info.boot_cpu != NULL);
+ 	ml_read_chip_revision(&topology_info.chip_revision);
+ 	ml_cluster_power_override(&topology_info.cluster_power_down);
++#if defined(XNU_VM_GUEST)
++	ml_read_psci_conduit();
++#endif
+ 
+ 	/*
+ 	 * Set TPIDR_EL0 to indicate the correct cpu number & cluster id,
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index c831172..2fb471d 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -170,7 +170,7 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #if   XNU_PLATFORM_MacOSX
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+-#elif XNU_VM_GUEST
++#elif defined(XNU_VM_GUEST)   /* the piano's k27, VM and native alike (build-k27-piano.sh) */
+ /*
+  * VM guest (4 KiB pages, no ARM_LARGE_MEMORY): the kernel map shares its VA window with the physical
+  * aperture, which grows with the guest's RAM. With 24 GiB reserved for zones the pointer ranges were
+-- 
+2.55.0
+

@@ -1,0 +1,46 @@
+From de16623d957cccff6dfb78d8eca4a79842af9702 Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Tue, 10 Nov 2026 19:46:25 +0800
+Subject: [PATCH] k27: SM8750 MPIDRs: Affinity2 in the reset handler's and
+ ml_get_cpu_number's CPU lookups
+
+piano's prime cores are MPIDR 0x10000 and 0x10100 (cluster in Aff2, as UniXNU-sm8750-common's sm8750-smp.patch handles for
+the UniXNU kernels). k27 masked Aff1|Aff0 in both lookups, so natively cpu6 and cpu7 would have found cpu0's and cpu1's
+cpu_data. Both now mask Aff2|Aff1|Aff0; in the crosvm VM Aff2 is 0 and nothing changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ osfmk/arm64/machine_routines.c | 3 ++-
+ osfmk/arm64/start.s            | 2 +-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 1f59ef3..d95796c 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1487,7 +1487,8 @@ ml_get_boot_cluster_type(void)
+ int
+ ml_get_cpu_number(uint32_t phys_id)
+ {
+-	phys_id &= MPIDR_AFF1_MASK | MPIDR_AFF0_MASK;
++	/* SM8750 (piano natively): the two prime cores are MPIDR 0x10000/0x10100, cluster in Aff2; crosvm's vCPUs have Aff2 0. */
++	phys_id &= MPIDR_AFF2_MASK | MPIDR_AFF1_MASK | MPIDR_AFF0_MASK;
+ 
+ 	for (unsigned i = 0; i < topology_info.num_cpus; i++) {
+ 		if (topology_info.cpus[i].phys_id == phys_id) {
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 325192c..e099690 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -146,7 +146,7 @@ LEXT(reset_vector)
+ 	add		x19, x19, EXT(ResetHandlerData)@pageoff
+ 	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
+ #if HAS_CLUSTER || defined(BCM2837)
+-	and		x0, x15, #0xFFFF					// CPU number in Affinity0, cluster ID in Affinity1 (SM8550 and SM8350 number cores in Affinity1)
++	and		x0, x15, #0xFFFFFF				// Affinity 0-2: SM8550/SM8350 number cores in Affinity1, SM8750 has its second cluster in Affinity2
+ #else
+ 	and		x0, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
+ #endif
+-- 
+2.55.0
+

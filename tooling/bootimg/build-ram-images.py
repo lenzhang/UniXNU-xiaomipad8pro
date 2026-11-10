@@ -59,7 +59,11 @@ K27_ARGS = ['-v', 'debug=0x14e', 'kt_fixed_zones=120', '-no_slto_panic', 'ml-tim
             # 0042: userspace sees 24 MHz over the architected counter (19.2 MHz on SM8750 as in the VM).
             'droidvm-timebase-hz=24000000',
             'ca-triple-buffer=1', 'ca-free-wakeup=1', 'exec-env=com.apple.WebKit.WebContent:GIGACAGE_ENABLED=no',
-            'rootauth=0', 'vm_compression_limit=1572864', 'panic-spin=1', 'droidvm-tz=Asia/Singapore']
+            'rootauth=0', 'vm_compression_limit=1572864', 'droidvm-tz=Asia/Singapore',
+            # Unattended native runs (k27 0055/0056, docs/bringup-debugging.md): the console mirrored into cvp@9cb00000 (retained
+            # across resets, unused by Ubuntu and the firmware; Ubuntu's ramoops zone is overwritten by the firmware's demura), a reset after PIANO_RESET_AFTER s (Gunyah watchdog as the backstop), and no panic-spin, so a panic restarts
+            # (PSCI) and the tablet always comes back to Ubuntu with the log in /sys/fs/pstore/console-ramoops-0.
+            'pstore-console=0x9cb00000', 'pstore-console-size=0x700000', 'piano-reset-after=' + os.environ.get('PIANO_RESET_AFTER', '50')]
 
 
 def sha(path):

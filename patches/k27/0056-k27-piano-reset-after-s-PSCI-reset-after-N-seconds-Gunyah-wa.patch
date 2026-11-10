@@ -1,0 +1,100 @@
+From d0024403f10134148e2d0629f4cd92297d1b507a Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Tue, 10 Nov 2026 23:31:28 +0800
+Subject: [PATCH] k27: piano-reset-after=<s>: PSCI reset after N seconds,
+ Gunyah watchdog as the backstop
+
+Unattended native bring-up: the tablet always comes back (warm reset) instead of parking on a hang or a panic.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ osfmk/arm64/machine_routines.c | 73 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 73 insertions(+)
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index d95796c..9417e07 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -961,6 +961,79 @@ ml_read_psci_conduit(void)
+ }
+ #endif /* defined(XNU_VM_GUEST) */
+ 
++#if defined(XNU_VM_GUEST)
++/*
++ * piano (k27 0056): piano-reset-after=<seconds> for unattended native bring-up. A timer pets the Gunyah watchdog every
++ * 10 s and, once the uptime passes the limit, logs and resets through PSCI SYSTEM_RESET on the ADT's conduit (a warm
++ * reset: the pstore-console zone survives for Ubuntu to read). The watchdog (Gunyah SMCCC vendor-hyp service, SET_TIME
++ * bark/bite in ms <= 32768, CONTROL 3 = enable) is the backstop for hangs and panics that stop the timer: no pet for 32 s
++ * resets the tablet. Off without the boot arg (the VM never sets it).
++ */
++#include <kern/thread_call.h>
++#define GH_WDT_CONTROL  0x86000005ULL
++#define GH_WDT_STATUS   0x86000006ULL
++#define GH_WDT_PING     0x86000007ULL
++#define GH_WDT_SET_TIME 0x86000008ULL
++
++static uint64_t piano_reset_after_ns;
++static thread_call_t piano_reset_call;
++static bool piano_wdt_armed;
++
++static uint64_t
++piano_smc(uint64_t fn, uint64_t a1, uint64_t a2)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++	    "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	return x0;
++}
++
++static void
++piano_reset_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	uint64_t now;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
++	if (now >= piano_reset_after_ns) {
++		printf("piano-reset-after: %llu s reached, PSCI SYSTEM_RESET\n", piano_reset_after_ns / NSEC_PER_SEC);
++		delay(200000);
++		register uint64_t x0 __asm__("x0") = 0x84000009ULL;
++		if (ml_psci_conduit == ML_PSCI_CONDUIT_SMC) {
++			__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++		} else {
++			__asm__ volatile ("hvc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++		}
++		return;   /* still here: the watchdog (no more pets) takes the tablet down within 32 s */
++	}
++	if (piano_wdt_armed) {
++		(void)piano_smc(GH_WDT_PING, 0, 0);
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(10, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(piano_reset_call, deadline);
++}
++
++static void
++piano_reset_init(void)
++{
++	uint32_t secs = 0;
++	if (!PE_parse_boot_argn("piano-reset-after", &secs, sizeof(secs)) || secs == 0 || ml_psci_conduit != ML_PSCI_CONDUIT_SMC) {
++		return;
++	}
++	piano_reset_after_ns = (uint64_t)secs * NSEC_PER_SEC;
++	if ((int64_t)piano_smc(GH_WDT_STATUS, 0, 0) >= 0 &&
++	    (int64_t)piano_smc(GH_WDT_SET_TIME, 30000, 32000) == 0 && (int64_t)piano_smc(GH_WDT_CONTROL, 3, 0) == 0) {
++		piano_wdt_armed = true;
++	}
++	printf("piano-reset-after: reset at %u s, Gunyah watchdog %s\n", secs, piano_wdt_armed ? "armed (32 s bite)" : "not available");
++	piano_reset_call = thread_call_allocate_with_options(piano_reset_tick, NULL, THREAD_CALL_PRIORITY_KERNEL_HIGH, THREAD_CALL_OPTIONS_ONCE);
++	piano_reset_tick(NULL, NULL);
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_reset_init);
++#endif /* defined(XNU_VM_GUEST) */
++
+ __attribute__((noreturn))
+ void
+ halt_all_cpus(boolean_t reboot)
+-- 
+2.55.0
+

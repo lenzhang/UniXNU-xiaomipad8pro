@@ -23,3 +23,5 @@ local.toml
 __pycache__/
 *.pyc
 .DS_Store
+# Native run evidence (USB serials, boot ids): local only, summarised in docs/
+/logs/native-runs/
