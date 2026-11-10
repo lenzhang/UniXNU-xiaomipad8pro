@@ -66,6 +66,7 @@ struct Args {
   uint32_t phyread;   // piano-usb-phyread: 1 (default) read the M31 PHY in the probe
   uint32_t spmi;      // piano-usb-spmi: 1 (default) read the repeater over SPMI in the probe
   uint32_t pid;       // piano-usb-pid: USB product ID
+  uint32_t trace;     // piano-usb-trace: events logged one by one after each bus reset (default 400, 0 off)
 };
 Args gArgs;
 
@@ -89,6 +90,7 @@ void readArgs()
   gArgs.phyread = bootArg("piano-usb-phyread", 1);
   gArgs.spmi = bootArg("piano-usb-spmi", 1);
   gArgs.pid = bootArg("piano-usb-pid", kProduct) & 0xffff;
+  gArgs.trace = bootArg("piano-usb-trace", 400);
 }
 
 // -------------------------------------------------------------------------------------------------------------------- MMIO
@@ -207,7 +209,7 @@ void noteLater(const char *line)
 void noteThread(void *, wait_result_t)
 {
   for (;;) {
-    char line[260];
+    char line[640];
     uint32_t n = 0;
     IOLockLock(gLock);
     while (!gNotes.used()) IOLockSleep(gLock, &gNotes, THREAD_UNINT);
@@ -649,6 +651,7 @@ struct KernelHal {
     if (us >= 1000) IOSleep(us / 1000);
     else IODelay(us);
   }
+  uint64_t nowUs() { return nowNs() / 1000; }
   uint8_t *dma() { return gDmaVa; }
   uint64_t dmaPhys() { return gDmaPa; }
   unsigned txFill(unsigned port, uint8_t *dst, unsigned cap)
@@ -720,7 +723,7 @@ struct KernelHal {
   }
   __attribute__((format(printf, 2, 3))) void note(const char *fmt, ...)
   {
-    char line[256];
+    char line[640];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(line, sizeof line, fmt, ap);
@@ -986,7 +989,7 @@ bool takeover()
   note("core %s, %u IN endpoints: %u ACM port(s)", dwc31 ? "DWC_usb31/32" : "DWC_usb3", inEps, ports);
   stage(12, "takeover: halt");
   if (gHal.rd(DCTL) & DCTL_RUN_STOP) note("the firmware left RUN_STOP set (DSTS %08x)", gHal.rd(DSTS));
-  gGadget.bind(&gHal, ports, uint16_t(gArgs.pid));
+  gGadget.bind(&gHal, ports, uint16_t(gArgs.pid), gArgs.trace);
   if (!gGadget.halt(100)) note("no halt within 100 ms (DSTS %08x): continuing with the soft reset", gHal.rd(DSTS));
   stage(13, "takeover: DMA memory");
   if (!dmaAlloc()) { stage(-13, "takeover: DMA memory"); return false; }
@@ -1028,8 +1031,8 @@ void usbStatus()
           gSnpsId, gHal.rd(DCTL), gHal.rd(DSTS), dstsLinkState(gHal.rd(DSTS)), gHal.rd(DCFG), gHal.rd(GEVNTCOUNT));
   cprintf("speed %u address %u configuration %u; events %u (device %u): resets %u connects %u disconnects %u erratic %u overflows %u\n",
           s.speed, s.address, s.configuration, s.events, s.deviceEvents, s.resets, s.connects, s.disconnects, s.erratic, s.overflows);
-  cprintf("setups %u stalls %u; command errors %u timeouts %u (last %08x) start errors %u stale %u\n", s.setups, s.stalls, s.cmdErrors,
-          s.cmdTimeouts, s.lastCmdFailure, s.startErrors, s.stale);
+  cprintf("setups %u stalls %u EP0 timeouts %u; command errors %u timeouts %u (last %08x) start errors %u stale %u; notes dropped %llu\n",
+          s.setups, s.stalls, s.ep0Timeouts, s.cmdErrors, s.cmdTimeouts, s.lastCmdFailure, s.startErrors, s.stale, gNotes.dropped);
   cprintf("bulk in %u transfers %llu bytes, out %u transfers %llu bytes; ports DTR %x/%x; tx0 %u dropped %llu, tx1 %u dropped %llu\n",
           s.inTransfers, s.inBytes, s.outTransfers, s.outBytes, gLines[0], gLines[1], gTx[0].used(), gTx[0].dropped, gTx[1].used(),
           gTx[1].dropped);
@@ -1053,6 +1056,7 @@ void usbThread(void *, wait_result_t)
     const unsigned events = gGadget.poll();
     logPump();
     gGadget.pump();
+    gGadget.tick();
     const uint64_t now = nowNs();
     if (now - lastReport > 1000000000ull) {   // DSTS once a second while it changes (link state before the first reset)
       lastReport = now;
@@ -1129,7 +1133,7 @@ bool PianoDwc3::start(IOService *provider)
   }
   if (!ringAlloc(gTx[0], 256 * 1024) || !ringAlloc(gTx[1], 64 * 1024) || !ringAlloc(gRx1, 64 * 1024)) { stage(-7, "ring buffers"); return true; }
   thread_t thread = nullptr;
-  if (ringAlloc(gNotes, 16 * 1024) && kernel_thread_start(noteThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+  if (ringAlloc(gNotes, 64 * 1024) && kernel_thread_start(noteThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
   else gNotes.buf = nullptr;   // notes stay synchronous
   if (kernel_thread_start(monitorThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
   if (gArgs.shell && kernel_thread_start(shellThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);

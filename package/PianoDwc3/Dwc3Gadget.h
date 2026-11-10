@@ -9,6 +9,7 @@
 //   uint32_t rd(uint32_t off); void wr(uint32_t off, uint32_t v);   core registers (offsets of Dwc3Regs.h)
 //   void barrier();                                                 complete DMA-memory stores/loads against MMIO (dsb sy)
 //   void udelay(unsigned us);
+//   uint64_t nowUs();                                               a monotonic clock (the EP0 watchdog, snapshots)
 //   uint8_t *dma(); uint64_t dmaPhys();                             the non-cacheable region of Layout (CPU / device view)
 //   unsigned txFill(unsigned port, uint8_t *dst, unsigned cap);     bytes to send on the port's bulk IN (0: nothing)
 //   unsigned rxSpace(unsigned port);                                room for bulk OUT data
@@ -40,7 +41,7 @@ constexpr unsigned kPhys = 2 + 4 * kPorts;   // EP0 OUT/IN, then per port: (unus
 
 struct GadgetStats {
   uint32_t events, deviceEvents, resets, connects, disconnects, linkChanges, erratic, overflows, unknown;
-  uint32_t setups, stalls, cmdErrors, cmdTimeouts, startErrors, stale;
+  uint32_t setups, stalls, cmdErrors, cmdTimeouts, startErrors, stale, ep0Timeouts, reconnects;
   uint32_t inTransfers, outTransfers;
   uint64_t inBytes, outBytes;
   uint32_t lastSetupLo, lastSetupHi, lastCmdFailure;
@@ -54,11 +55,13 @@ public:
   uint16_t lineState[kPorts];
   uint8_t lineCoding[kPorts][7];
 
-  void bind(Hal *hal, unsigned ports, uint16_t product)
+  // traceEvents: how many events after each bus reset are logged one by one (with the EP0 state), 0 for none.
+  void bind(Hal *hal, unsigned ports, uint16_t product, uint32_t traceEvents = 0)
   {
     h = hal;
     portCount = ports < 1 ? 1 : ports > kPorts ? kPorts : ports;
     productId = product;
+    traceLimit = traceEvents;
     for (unsigned p = 0; p < kPorts; ++p) {
       static const uint8_t k115200[7] = {0x00, 0xc2, 0x01, 0x00, 0, 0, 8};   // 115200 8N1 (only reported, never used)
       for (unsigned i = 0; i < 7; ++i) lineCoding[p][i] = k115200[i];
@@ -96,8 +99,6 @@ public:
     uint8_t *m = h->dma();
     for (uint32_t i = 0; i < Layout::kEventBytes; ++i) m[Layout::kEvents + i] = 0;
     const uint64_t ring = h->dmaPhys() + Layout::kEvents;
-    h->wr(GCTL, (h->rd(GCTL) & ~GCTL_PRTCAPDIR_MASK) | GCTL_PRTCAP_DEVICE | GCTL_DSBLCLKGTNG);
-    h->wr(DCFG, (h->rd(DCFG) & ~(DCFG_DEVSPD_MASK | DCFG_DEVADDR_MASK | DCFG_NUMP_MASK | DCFG_LPM_CAP)) | DCFG_SPEED_HS | dcfgNump(16));
     h->barrier();
     h->wr(GEVNTADRLO, uint32_t(ring));
     h->wr(GEVNTADRHI, uint32_t(ring >> 32));
@@ -105,12 +106,27 @@ public:
     const uint32_t count = h->rd(GEVNTCOUNT) & 0xffffu;
     if (count) h->wr(GEVNTCOUNT, count);
     ringPos = 0;
+    return initDevice();
+  }
+
+  // The device side again (role, speed, EP0, transfer resources) with the event buffer as it is: after init(), and for a
+  // reconnect (the core keeps its event write position, as Linux relies on when it toggles RUN_STOP).
+  bool initDevice()
+  {
+    using namespace dwc3;
+    h->wr(GCTL, (h->rd(GCTL) & ~GCTL_PRTCAPDIR_MASK) | GCTL_PRTCAP_DEVICE | GCTL_DSBLCLKGTNG);
+    h->wr(DCFG, (h->rd(DCFG) & ~(DCFG_DEVSPD_MASK | DCFG_DEVADDR_MASK | DCFG_NUMP_MASK | DCFG_LPM_CAP)) | DCFG_SPEED_HS | dcfgNump(16));
     for (unsigned i = 0; i < kPhys; ++i) ep[i] = EpState{};
     phase = kIdle;
     ep0Mps = 64;
     highSpeed = true;
     setupNotes = 0;
     stats = GadgetStats{};
+    traceBudget = traceLimit;
+    recentPos = 0;
+    ep0Since = lastSetupUs = h->nowUs();
+    lastSnapshot = 0;
+    snapshots = 0;
     if (!cmd(0, CMD_DEPSTARTCFG, 0, 0, 0, nullptr)) return false;
     for (unsigned phys = 0; phys < 2; ++phys)
       if (!configureEp(phys, EP_CONTROL, ep0Mps, DEPCFG_ACTION_INIT, 0) || !cmd(phys, CMD_SETTRANSFRESOURCE, 1, 0, 0, nullptr)) return false;
@@ -186,6 +202,67 @@ public:
 
   bool inBusy(unsigned port) const { return ep[physOf(bulkEp(port), true)].busy; }
 
+  // Call from the poll loop. EP0 watchdog: a control transfer that has not moved for 1 s (no event for its data or status
+  // stage) is logged with the whole EP0 state, ended, and SETUP is armed again, so the host's retry gets through. While a host
+  // is attached but has not configured the device: a snapshot every 2 s (at most 30 per bus reset).
+  void tick()
+  {
+    const uint64_t now = h->nowUs();
+    if (!stats.connects) return;
+    if ((phase == kData || phase == kWaitStatus || phase == kStatus) && now - ep0Since > 1000000) {
+      ++stats.ep0Timeouts;
+      snapshot("EP0 stuck 1 s: ending it, SETUP again");
+      endXfer(0);
+      endXfer(1);
+      pendAddress = pendConfig = false;
+      pendLinePort = outPort = -1;
+      armSetup();
+    } else if (phase == kSetup && !ep[0].busy && now - ep0Since > 100000) {
+      snapshot("SETUP not armed: arming");
+      armSetup();
+    }
+    if (!configured() && snapshots < 30 && now - lastSnapshot > 2000000) {
+      lastSnapshot = now;
+      ++snapshots;
+      snapshot("not configured yet");
+    }
+    // A host that asked for something, then nothing for 10 s, and never configured us: disconnect and connect again (at
+    // most 3 times), so it enumerates once more and the trace shows whether it stops at the same request.
+    if (stats.setups && !configured() && phase == kSetup && ep[0].busy && now - lastSetupUs > 10000000 && reconnects < 3) {
+      ++reconnects;
+      snapshot("no request for 10 s and not configured: soft disconnect, connect again");
+      reconnect();
+    }
+  }
+
+  // RUN_STOP off, the endpoints and the event buffer set up again, RUN_STOP on (the counters are kept).
+  void reconnect()
+  {
+    halt(100);
+    busReset(false);
+    const GadgetStats kept = stats;   // after busReset: address and configuration are 0 again
+    h->udelay(300000);   // long enough for the host to see the detach
+    poll();              // whatever the halt produced, with the state of now
+    const bool ok = initDevice();
+    stats = kept;
+    stats.reconnects = reconnects;
+    if (!ok || !run(50)) h->note("reconnect: the core did not restart (DSTS %08x)", h->rd(dwc3::DSTS));
+  }
+
+  void snapshot(const char *why)
+  {
+    using namespace dwc3;
+    const volatile uint32_t *t0 = trb(0), *t1 = trb(1);
+    h->note("%s: phase %s (%s, status on %u) busy %u/%u since %llu ms; trb0 %08x %08x %08x %08x trb1 %08x %08x %08x %08x;"
+            " DEPCMD0 %08x DEPCMD1 %08x DSTS %08x DCFG %08x DALEPENA %08x GEVNTCOUNT %08x; events %u setups %u stalls %u stale %u;"
+            " last events %08x %08x %08x %08x %08x %08x",
+            why, phaseName(), threeStage ? "3-stage" : "2-stage", statusPhys, ep[0].busy, ep[1].busy,
+            (unsigned long long)((h->nowUs() - ep0Since) / 1000), t0[0], t0[1], t0[2], t0[3], t1[0], t1[1], t1[2], t1[3],
+            h->rd(depcmdBase(0) + 12), h->rd(depcmdBase(1) + 12), h->rd(DSTS), h->rd(DCFG), h->rd(DALEPENA), h->rd(GEVNTCOUNT),
+            stats.events, stats.setups, stats.stalls, stats.stale, recent[(recentPos - 6) & 7], recent[(recentPos - 5) & 7],
+            recent[(recentPos - 4) & 7], recent[(recentPos - 3) & 7], recent[(recentPos - 2) & 7], recent[(recentPos - 1) & 7]);
+  }
+
 private:
   enum Phase : uint8_t { kIdle, kSetup, kData, kWaitStatus, kStatus };
   enum Kind : uint8_t { kStall, kNoData, kIn, kOut };
@@ -196,6 +273,12 @@ private:
   unsigned portCount;
   uint16_t productId;
   uint32_t ringPos;
+  uint32_t traceLimit, traceBudget;   // events still logged one by one since the last bus reset
+  uint32_t recent[8];                 // the last events, for snapshots
+  uint32_t recentPos;
+  uint64_t ep0Since, lastSnapshot;    // EP0's last progress; the last periodic snapshot
+  uint64_t lastSetupUs;               // the last SETUP packet
+  uint32_t snapshots, reconnects;
   EpState ep[kPhys];
   Phase phase;
   bool threeStage, highSpeed;
@@ -307,9 +390,12 @@ private:
   bool armSetup()
   {
     phase = kSetup;
+    ep0Since = h->nowUs();
     volatile uint8_t *s = h->dma() + Layout::kSetup;
     for (unsigned i = 0; i < 8; ++i) s[i] = 0;
-    return startXfer(0, Layout::kSetup, 8, dwc3::TRBCTL_CONTROL_SETUP, false);
+    if (startXfer(0, Layout::kSetup, 8, dwc3::TRBCTL_CONTROL_SETUP, false)) return true;
+    h->note("SETUP could not be armed (DEPCMD0 %08x); tick() retries", h->rd(dwc3::depcmdBase(0) + 12));
+    return false;
   }
 
   void stallRestart()
@@ -323,10 +409,46 @@ private:
     armSetup();
   }
 
+  const char *phaseName() const
+  {
+    static const char *const names[] = {"idle", "setup", "data", "wait-status", "status"};
+    return phase <= kStatus ? names[phase] : "?";
+  }
+
+  // One line per event while traceBudget lasts: the raw word, what it is, and the EP0 state it arrives in (before handling).
+  void trace(uint32_t e)
+  {
+    using namespace dwc3;
+    if (!traceBudget) return;
+    --traceBudget;
+    if (e & 1) {
+      static const char *const names[] = {"disconnect", "reset", "connect-done", "link-change", "wakeup", "hibernation", "suspend",
+                                          "sof", "?", "erratic", "command-complete", "overflow", "vendor-test", "?", "?", "?"};
+      h->note("ev %08x device %s info %x (DSTS %08x)", e, names[devEventType(e)], devEventInfo(e), h->rd(DSTS));
+      return;
+    }
+    static const char *const types[] = {"?", "xfer-complete", "in-progress", "not-ready", "?", "?", "stream", "command-complete",
+                                        "?", "?", "?", "?", "?", "?", "?", "?"};
+    const unsigned phys = epEventPhys(e), type = epEventType(e), status = epEventStatus(e);
+    if (phys < kPhys && (type == EPT_XFER_COMPLETE || type == EPT_CMD_COMPLETE)) {
+      const volatile uint32_t *t = trb(phys);
+      h->note("ev %08x ep %u %s status %x | phase %s busy %u/%u | trb %08x %08x (posted %u)", e, phys, types[type], status,
+              phaseName(), ep[0].busy, ep[1].busy, t[2], t[3], ep[phys].posted);
+    } else if (type == EPT_XFER_NOT_READY) {
+      h->note("ev %08x ep %u not-ready %s%s | phase %s busy %u/%u", e, phys, (status & 3) == EP0_NOTREADY_STATUS ? "status" :
+              (status & 3) == EP0_NOTREADY_DATA ? "data" : "-", status & 8 ? " (transfer active)" : "", phaseName(), ep[0].busy,
+              ep[1].busy);
+    } else {
+      h->note("ev %08x ep %u %s status %x | phase %s", e, phys, types[type], status, phaseName());
+    }
+  }
+
   void handle(uint32_t e)
   {
     using namespace dwc3;
     ++stats.events;
+    recent[recentPos++ & 7] = e;
+    trace(e);
     if (e & 1) {
       if (eventIsDevice(e)) deviceEvent(e);
       else { ++stats.unknown; h->note("event %08x ignored", e); }
@@ -397,6 +519,8 @@ private:
     pendAddress = pendConfig = false;
     pendLinePort = outPort = -1;
     setupNotes = 0;
+    snapshots = 0;
+    if (stats.resets + stats.disconnects <= 8) traceBudget = traceLimit;   // a host that resets in a loop does not flood the log
     for (unsigned p = 0; p < kPorts; ++p)
       if (lineState[p]) { lineState[p] = 0; h->lineState(p, 0); }
     phase = kIdle;
@@ -410,6 +534,7 @@ private:
       volatile uint32_t *t = trb(phys);
       if (!ep[phys].busy || (t[3] & TRB_HWO)) { ++stats.stale; return; }
       ep[phys].busy = false;
+      ep0Since = h->nowUs();
       const uint32_t residual = trbResidual(t[2]), trbsts = trbStatus(t[2]);
       switch (phase) {
       case kSetup:
@@ -418,10 +543,12 @@ private:
         return;
       case kData:
         if (trbsts == TRBSTS_SETUP_PENDING) { armSetup(); return; }   // the host gave up on this request
+        if (phys != dataPhys) { ++stats.stale; return; }
         if (phys == 0 && outPort >= 0) dataOut(residual <= ep[0].posted ? ep[0].posted - residual : 0);
         phase = kWaitStatus;
         return;
       case kStatus:
+        if (phys != statusPhys) { ++stats.stale; return; }
         statusDone();
         armSetup();
         return;
@@ -430,11 +557,18 @@ private:
         return;
       }
     }
-    if (type == EPT_XFER_NOT_READY && (status & 3) == EP0_NOTREADY_STATUS && (phase == kWaitStatus || phase == kData)) {
-      if (phys != statusPhys) { h->note("status stage on the wrong direction"); stallRestart(); return; }
+    if (type != EPT_XFER_NOT_READY) return;
+    if ((status & 3) == EP0_NOTREADY_DATA && phase == kData && phys != dataPhys) {
+      h->note("data stage in the other direction (ep %u, expected %u): stall", phys, dataPhys);
+      stallRestart();
+      return;
+    }
+    if ((status & 3) == EP0_NOTREADY_STATUS && (phase == kWaitStatus || phase == kData)) {
+      ep0Since = h->nowUs();
+      if (phys != statusPhys) { h->note("status stage on the wrong direction (ep %u, expected %u)", phys, statusPhys); stallRestart(); return; }
       if (phase == kData) endXfer(dataPhys);   // the host moved on: a short data stage
       phase = kStatus;
-      startXfer(phys, Layout::kZero, 0, threeStage ? TRBCTL_CONTROL_STATUS3 : TRBCTL_CONTROL_STATUS2, false);
+      if (!startXfer(phys, Layout::kZero, 0, threeStage ? TRBCTL_CONTROL_STATUS3 : TRBCTL_CONTROL_STATUS2, false)) stallRestart();
     }
   }
 
@@ -445,16 +579,26 @@ private:
     uint8_t u[8];
     for (unsigned i = 0; i < 8; ++i) u[i] = s[i];
     ++stats.setups;
+    lastSetupUs = h->nowUs();
     stats.lastSetupLo = uint32_t(u[0]) | uint32_t(u[1]) << 8 | uint32_t(u[2]) << 16 | uint32_t(u[3]) << 24;
     stats.lastSetupHi = uint32_t(u[4]) | uint32_t(u[5]) << 8 | uint32_t(u[6]) << 16 | uint32_t(u[7]) << 24;
     const uint16_t length = uint16_t(u[6] | u[7] << 8);
     pendAddress = pendConfig = false;
     pendLinePort = outPort = -1;
     const Reply r = dispatch(u);
+    // What goes on the wire: an IN data stage is the reply cut to wLength (+ a zero-length packet when it ends short of
+    // wLength on a packet boundary); an OUT data stage is received into whole packets.
+    const uint16_t n = r.len < length ? r.len : length;
+    const bool zlp = r.kind == kIn && n < length && n && n % ep0Mps == 0;
+    const uint32_t outSize = (uint32_t(length) + ep0Mps - 1) / ep0Mps * ep0Mps;
     if (setupNotes < 48) {
       ++setupNotes;
-      h->note("setup %02x %02x %04x %04x %u -> %s %u", u[0], u[1], u[2] | u[3] << 8, u[4] | u[5] << 8, length,
-              r.kind == kStall ? "stall" : r.kind == kNoData ? "status" : r.kind == kIn ? "in" : "out", r.len);
+      if (r.kind == kIn)
+        h->note("setup %02x %02x %04x %04x %u -> in %u of %u bytes%s (%u packets of %u)", u[0], u[1], u[2] | u[3] << 8,
+                u[4] | u[5] << 8, length, n, r.len, zlp ? " + zero-length packet" : "", (n + ep0Mps - 1) / ep0Mps, ep0Mps);
+      else
+        h->note("setup %02x %02x %04x %04x %u -> %s", u[0], u[1], u[2] | u[3] << 8, u[4] | u[5] << 8, length,
+                r.kind == kStall ? "stall" : r.kind == kNoData ? "status only" : "out");
     }
     switch (r.kind) {
     case kStall:
@@ -465,24 +609,20 @@ private:
       statusPhys = 1;
       phase = kWaitStatus;
       return;
-    case kIn: {
-      const uint16_t n = r.len < length ? r.len : length;
+    case kIn:
       threeStage = true;
       dataPhys = 1;
       statusPhys = 0;
       phase = kData;
-      startXfer(1, Layout::kEp0, n, TRBCTL_CONTROL_DATA, n < length && n && n % ep0Mps == 0);
+      if (!startXfer(1, Layout::kEp0, n, TRBCTL_CONTROL_DATA, zlp)) stallRestart();
       return;
-    }
-    case kOut: {
-      const uint32_t size = (uint32_t(length) + ep0Mps - 1) / ep0Mps * ep0Mps;   // OUT TRBs are whole packets
+    case kOut:
       threeStage = true;
       dataPhys = 0;
       statusPhys = 1;
       phase = kData;
-      startXfer(0, Layout::kEp0, size, TRBCTL_CONTROL_DATA, false);
+      if (!startXfer(0, Layout::kEp0, outSize, TRBCTL_CONTROL_DATA, false)) stallRestart();
       return;
-    }
     }
   }
 

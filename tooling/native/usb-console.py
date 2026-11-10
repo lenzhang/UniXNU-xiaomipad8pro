@@ -66,6 +66,27 @@ def find_ports():
     return found
 
 
+def describe_gadgets():
+    """What macOS made of the gadget: one line per IOUSBHostDevice "piano macOS debug" (configuration, drivers, interfaces)."""
+    try:
+        out = subprocess.run(['ioreg', '-a', '-l', '-r', '-c', 'IOUSBHostDevice'], capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    lines = []
+    for root in (plistlib.loads(out) if out.strip() else []):
+        for node, _ in walk(root):
+            if node.get('IOObjectClass') != 'IOUSBHostDevice' or node.get('kUSBProductString', node.get('USB Product Name')) != PRODUCT:
+                continue
+            kids = node.get('IORegistryEntryChildren', [])
+            drivers = sorted({k.get('IOObjectClass', '?') for k in kids if k.get('IOObjectClass') != 'IOUSBHostInterface'})
+            interfaces = [k.get('kUSBString', '-') + '/' + ','.join(sorted({c.get('IOObjectClass', '?') for c in k.get('IORegistryEntryChildren', [])}) or 'no driver')
+                          for k in kids if k.get('IOObjectClass') == 'IOUSBHostInterface']
+            lines.append(f'gadget {node.get("idVendor", 0):04x}:{node.get("idProduct", 0):04x} at {node.get("locationID", 0):#x}, speed '
+                         f'{node.get("USBSpeed", node.get("Device Speed", "?"))}, configuration '
+                         f'{node.get("kUSBCurrentConfiguration", "none")}; drivers {drivers or "none"}; interfaces {interfaces or "none"}')
+    return lines
+
+
 def open_port(path):
     fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     tty.setraw(fd)
@@ -89,7 +110,8 @@ def main():
     args = a.parse_args()
     if args.list:
         ports = find_ports()
-        print('\n'.join(f'port {p}: {d}' for p, d in sorted(ports.items())) or 'no piano gadget attached')
+        print('\n'.join(describe_gadgets()) or 'no piano gadget in the USB tree')
+        print('\n'.join(f'port {p}: {d}' for p, d in sorted(ports.items())) or 'no serial ports of the gadget')
         others = sorted(str(p) for p in Path('/dev').glob('cu.usbmodem*'))
         if others:
             print('all /dev/cu.usbmodem*:', ' '.join(others))

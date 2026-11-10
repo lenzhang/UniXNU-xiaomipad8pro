@@ -141,6 +141,7 @@ IOPlatformExpertDevice ── PianoDwc3 (start, matching thread)   read-only pro
 | `piano-usb-replay=0` | 1 | port 0 starts at "now" instead of replaying the retained log |
 | `piano-usb-phyread=0`, `piano-usb-spmi=0` | 1 | skip the M31 / repeater reads of the probe |
 | `piano-usb-pid=N` | 1 (`1209:0001`, pid.codes test PID) | another USB product ID |
+| `piano-usb-trace=N` | 400 | log the first N controller events after each bus reset one by one (raw word, EP0 phase, TRB words); 0 off |
 
 On the Mac (no root, standard library only; logs go to `logs/usb-console/`, gitignored):
 
@@ -204,6 +205,32 @@ RAM boots only, cable to the Mac, owner present; `piano-reset-after` stays the b
 
 Fail-safe: everything is a RAM boot; without `piano-usb` the driver declines in probe(); level 1 writes nothing (the SPMI
 observer read issues a read command only); a hang or panic is a reset (watchdog, `piano-reset-after`) back to ABL/Ubuntu.
+
+### 8.1 T2, first run (2026-11-11): enumeration stops after the configuration descriptor
+
+The Mac addressed the device, read the device descriptor, strings 2/1/3 (each first with wLength 2) and the configuration
+(9, then 141 bytes), then sent nothing for ~100 s: no SET_CONFIGURATION, no reset; the last note was `DSTS 00838740` (link
+on, high speed), 54 events. Reading of it:
+- `setup 80 06 0200 0000 9 -> in 141` and `... 2 -> in 36` printed the descriptor's length, not the transfer's: the data TRB
+  was `min(wLength, length)` (9, 2 bytes). The note now says `in 9 of 141 bytes (1 packets of 64)`; the host test asserts the
+  TRB lengths (`tests/usb_gadget_host.cpp`).
+- The 141-byte read is the first multi-packet data stage (3 packets of 64); everything before it was one packet. In the
+  model every ordering of its events (data done then status not-ready, or the reverse) ends with SETUP armed again, so the
+  log alone cannot tell whether the status stage of that read completed, or the next request arrived with no SETUP armed,
+  or the host stopped by itself.
+
+The next run therefore traces (`piano-usb-trace`, default on): every controller event of the first 400 after a reset, as
+`ev <raw> ep <n> <type> … | phase <EP0 phase> busy <out>/<in> | trb <size> <ctrl> (posted <bytes>)`; a snapshot of EP0 (phase,
+both EP0 TRBs, DEPCMD0/1, DSTS, DCFG, DALEPENA, GEVNTCOUNT, the last 6 events) every 2 s while a host is attached and the
+device is not configured; and two recoveries that also act as experiments, each logged with a snapshot:
+- **EP0 watchdog**: a control transfer with no progress for 1 s is ended and SETUP armed again (`EP0 stuck 1 s`);
+- **re-enumeration**: not configured and no request for 10 s → soft disconnect / connect (RUN_STOP off, endpoints set up
+  again, the event buffer kept), at most 3 times, to see whether the Mac stops at the same request each time.
+Also new: a failed START on EP0 stalls and re-arms instead of leaving EP0 waiting; a data-stage not-ready event in the other
+direction stalls (as Linux). On the Mac, `usb-console.py --list` now also prints what macOS made of the gadget (configuration,
+drivers, interfaces) when no serial port exists: run it during T2. What to read in the trace after `setup … 141`:
+`ev … ep 1 xfer-complete … trb 00000000` (all 141 bytes went out), then `ep 0 not-ready status`, `ep 0 xfer-complete` in
+phase status, then the next `ep 0 xfer-complete` in phase setup (a new request) or only snapshots (the host is silent).
 
 ## 9. Fallback
 

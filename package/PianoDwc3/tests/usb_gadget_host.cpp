@@ -63,8 +63,10 @@ struct FakeHal {
     }
     regs[b + 12] = result;
   }
+  uint64_t now = 0;
   void barrier() {}
-  void udelay(unsigned) {}
+  void udelay(unsigned us) { now += us; }
+  uint64_t nowUs() { return now; }
   uint8_t *dma() { return mem.data(); }
   uint64_t dmaPhys() { return base; }
   unsigned txFill(unsigned port, uint8_t *dst, unsigned cap)
@@ -140,7 +142,7 @@ struct FakeHal {
 };
 
 using G = Gadget<FakeHal>;
-static void step(G &g) { while (g.poll()) {} g.pump(); }
+static void step(G &g) { while (g.poll()) {} g.pump(); g.tick(); }
 
 static std::string setupBytes(uint8_t type, uint8_t request, uint16_t value, uint16_t index, uint16_t length)
 {
@@ -205,7 +207,7 @@ int main(int argc, char **argv)
   h.quiet = argc < 2;
   (void)argv;
   G g{};
-  g.bind(&h, kPorts, kProduct);
+  g.bind(&h, kPorts, kProduct, 1000);
   h.regs[DSTS] = DSTS_DEVCTRLHLT;
   uint32_t waited = 1;
   CHECK(g.softReset(true, &waited) && waited == 0);
@@ -245,11 +247,51 @@ int main(int argc, char **argv)
   step(g);
   CHECK(g.stats.address == 7);
 
-  std::string head = controlIn(h, g, setupBytes(0x80, 6, 0x0200, 0, 9));
+  // The data stage carries min(wLength, descriptor) bytes: 9 of 141 here (the T2 log printed the descriptor's length).
+  sendSetup(h, g, setupBytes(0x80, 6, 0x0200, 0, 9));
+  CHECK(h.eps[1].active && trbResidual(h.trb(1)[2]) == 9 && !(h.trb(1)[3] & TRB_CHN));
+  std::string head = h.complete(1);
+  step(g);
+  h.epEvent(0, EPT_XFER_NOT_READY, EP0_NOTREADY_STATUS);
+  step(g);
+  h.complete(0);
+  step(g);
   CHECK(head.size() == 9);
   const unsigned total = uint8_t(head[2]) | uint8_t(head[3]) << 8;
   CHECK(total == 9 + kPorts * 66);
-  std::string config = controlIn(h, g, setupBytes(0x80, 6, 0x0200, 0, 0xffff));
+  sendSetup(h, g, setupBytes(0x80, 6, 0x0302, 0x0409, 2));
+  CHECK(h.eps[1].active && trbResidual(h.trb(1)[2]) == 2);
+  h.complete(1);
+  step(g);
+  h.epEvent(0, EPT_XFER_NOT_READY, EP0_NOTREADY_STATUS);
+  step(g);
+  h.complete(0);
+  step(g);
+  // The full configuration exactly as macOS asks for it (wLength 141: three packets, no zero-length packet).
+  std::string config = controlIn(h, g, setupBytes(0x80, 6, 0x0200, 0, uint16_t(total)));
+  CHECK(config.size() == total);
+  // The same with the status stage's not-ready event ahead of the data stage's completion: still one status, SETUP again.
+  sendSetup(h, g, setupBytes(0x80, 6, 0x0200, 0, uint16_t(total)));
+  CHECK(h.eps[1].active && trbResidual(h.trb(1)[2]) == total);
+  h.trb(1)[2] = 0;
+  h.trb(1)[3] &= ~TRB_HWO;
+  h.eps[1].active = false;
+  h.epEvent(0, EPT_XFER_NOT_READY, EP0_NOTREADY_STATUS);
+  h.epEvent(1, EPT_XFER_COMPLETE);
+  step(g);
+  CHECK(h.eps[0].active && h.trbType(0) == TRBCTL_CONTROL_STATUS3);
+  h.complete(0);
+  step(g);
+  CHECK(h.eps[0].active && h.trbType(0) == TRBCTL_CONTROL_SETUP);
+  // EP0 watchdog: a status stage that never comes; after 1 s the transfer is ended and SETUP armed again.
+  sendSetup(h, g, setupBytes(0x80, 6, 0x0100, 0, 18));
+  h.complete(1);
+  step(g);
+  CHECK(!h.eps[0].active && g.stats.ep0Timeouts == 0);
+  h.now += 1500000;
+  step(g);
+  CHECK(g.stats.ep0Timeouts == 1 && h.eps[0].active && h.trbType(0) == TRBCTL_CONTROL_SETUP);
+  config = controlIn(h, g, setupBytes(0x80, 6, 0x0200, 0, 0xffff));
   CHECK(config.size() == total);
   {
     unsigned at = 0, interfaces = 0, endpoints = 0, iads = 0;
@@ -388,6 +430,21 @@ int main(int argc, char **argv)
   h.epEvent(0, EPT_XFER_NOT_READY, EP0_NOTREADY_STATUS);
   step(g);
   CHECK(g.stats.stalls == stallsBefore + 1 && h.eps[0].active && h.trbType(0) == TRBCTL_CONTROL_SETUP);
+  // Not configured and no request for 10 s: one soft disconnect/connect (counters kept), not repeated at once.
+  {
+    const unsigned setupsBefore = g.stats.setups, startcfg = h.count(CMD_DEPSTARTCFG, 0);
+    h.now += 11000000;
+    step(g);
+    CHECK(g.stats.reconnects == 1 && g.stats.setups == setupsBefore && h.count(CMD_DEPSTARTCFG, 0) == startcfg + 1);
+    CHECK((h.regs[DCTL] & DCTL_RUN_STOP) && h.eps[0].active && h.trbType(0) == TRBCTL_CONTROL_SETUP && g.stats.address == 0);
+    step(g);
+    CHECK(g.stats.reconnects == 1);
+    h.devEvent(DEVT_RESET);
+    h.devEvent(DEVT_CONNECT_DONE);
+    step(g);
+    controlNoData(h, g, setupBytes(0x00, 5, 4, 0, 0));
+    CHECK(g.stats.address == 4);
+  }
   // One port only (a core with too few IN endpoints).
   {
     FakeHal h1;
