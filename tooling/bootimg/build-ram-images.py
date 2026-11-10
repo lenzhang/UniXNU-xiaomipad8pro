@@ -48,18 +48,19 @@ MENU_TIMEOUT = int(os.environ.get('PIANO_MENU_TIMEOUT', '0'))   # 0: boot the de
 MENU_DEFAULT = os.environ.get('PIANO_MENU_DEFAULT', 'macos-8cpu')
 EPOCH = 1262304000  # UniXNU payload timestamps (2010-01-01)
 
-# The k27 userspace arguments of the working VM boot disk (logs/adt/vm-unixnu.toml), minus the VM's devices
-# (droidvm-display-mm, vgpu-3d, droidvm-vt-paravirt, droidvm-monitor, droidvm-data-persist: virtio display, GPU tunnel,
-# video, the host monitor and the data store) and minus sheng-touch-hid (no touch driver natively yet).
-K27_ARGS = ['-v', 'debug=0x14e', 'kt_fixed_zones=120', '-no_slto_panic', 'ml-timeout-lock-panic-scale=40', 'tlto_us=0',
-            '-apfs_shared_datavolume', 'offline-apfs-load=1', 'offline-hid-input=1', 'offline-hid-home=1', 'offline-key-events=1',
-            'sheng-aks=1', 'sheng-aks-sls=3', 'owner-staged-apps=1',
+# The k27 arguments natively (docs/native-droidvm-inventory.md). From the VM's boot disk (logs/adt/vm-unixnu.toml) minus its
+# devices (droidvm-display-mm, vgpu-3d, droidvm-vt-paravirt, droidvm-monitor, droidvm-data-persist), sheng-touch-hid, and the ones
+# nothing in the native collection reads (2026-11-11: offline-hid-input, offline-hid-home, offline-key-events, sheng-aks,
+# sheng-aks-sls, ml-timeout-lock-scale, ml-timeout-lock-panic-scale; ca-triple-buffer, ca-free-wakeup: the VM's Metal plugin).
+K27_ARGS = ['-v', 'debug=0x14e', 'kt_fixed_zones=120', '-no_slto_panic', 'tlto_us=0',
+            '-apfs_shared_datavolume', 'offline-apfs-load=1', 'owner-staged-apps=1',
+            # Read by the OS image's userland (VM era, still needed natively): jobs without hardware here; the clock and time zone
+            # (settime.sh boot job: no RTC driver yet).
             'droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd',
             'mac-amfi-launch-permissive=1', 'union-hide-lower=1', 'malloc-ranges-off=1', 'arm64_maxoffset=0x7FFE000000',
-            'ml-timeout-lock-scale=40',
             # 0042: userspace sees 24 MHz over the architected counter (19.2 MHz on SM8750 as in the VM).
             'droidvm-timebase-hz=24000000',
-            'ca-triple-buffer=1', 'ca-free-wakeup=1', 'exec-env=com.apple.WebKit.WebContent:GIGACAGE_ENABLED=no',
+            'exec-env=com.apple.WebKit.WebContent:GIGACAGE_ENABLED=no',
             'rootauth=0', 'vm_compression_limit=1572864', 'droidvm-tz=Asia/Singapore',
             # Unattended native runs (k27 0055/0056, docs/bringup-debugging.md): the console mirrored into cvp@9cb00000 (retained
             # across resets, unused by Ubuntu and the firmware; Ubuntu's ramoops zone is overwritten by the firmware's demura), a reset after PIANO_RESET_AFTER s (Gunyah watchdog as the backstop), and no panic-spin, so a panic restarts
