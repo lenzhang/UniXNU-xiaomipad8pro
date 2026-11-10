@@ -1,0 +1,35 @@
+{
+  "name": "NativeSoftGpu",
+  "bundle": "com.unixnu.driver.NativeSoftGpu",
+  "version": "1.0.0",
+  "objects": "@OUT@/native-kexts/NativeSoftGpu/objects.json",
+  "start": "_native_kext_start",
+  "stop": "_native_kext_stop",
+  "libraries": {
+    "com.apple.iokit.IOGraphicsFamily": "1.0.0b1",
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  },
+  "personalities": {
+    "NativeSoftAccelerator": {
+      "CFBundleIdentifier": "com.unixnu.driver.NativeSoftGpu",
+      "IOClass": "NativeSoftAccelerator",
+      "IOProviderClass": "IOResources",
+      "IOMatchCategory": "NativeSoftAccelerator",
+      "MetalPluginName": "NativeSoftMetal",
+      "MetalPluginClassName": "NativeSoftMetalDevice"
+    }
+  },
+  "vtable": {
+    "class": "NativeSoftAccelerator",
+    "base": "IOAccelerator",
+    "base_kext": "com.apple.iokit.IOGraphicsFamily",
+    "slots": 272,
+    "ignore_slots": [
+      16
+    ]
+  }
+}
