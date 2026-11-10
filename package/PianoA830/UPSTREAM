@@ -52,6 +52,11 @@ IOAccelerator subclass carrying MetalPluginName/MetalPluginClassName, the logged
 vtable check, in board/PianoA830.cpp and tooling/k27/kext/PianoA830.json. Removed: DroidVMGpuStarter, the virtio-gpu hooks and the
 weak NativeAdreno 805c7e4 stubs. No DroidVM kext is linked (docs/PROJECT-MAP.md rule 8).
 
+This repository's own, not from upstream: board/ (BSD-2-Clause-Patent, but for the derived files above), abi/NativeAdrenoABI.h (a
+wrapper that includes Adreno830's v2 header unchanged and adds the one v1 name Turnip's darwin KMD uses; MIT like the header it
+wraps) and abi/abi_handshake.cpp (BSD-2-Clause-Patent; the KMD's call sequence, run on Adreno830's tests/hostsim by
+tooling/k27/check-a830-abi-host.py).
+
 Data (facts, not code):
   piano's boot DT out/inputs/piano-boot.dtb (sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840, the DT ABL
   hands Ubuntu's mainline kernel) and piano's live stock DT unixnu-research/Unixnu-SM8750-Piano/inputs/piano-live.dtb (sha256
