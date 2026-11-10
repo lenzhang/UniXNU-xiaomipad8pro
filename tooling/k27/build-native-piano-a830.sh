@@ -4,7 +4,8 @@
 #      (tooling/k27/gen-piano-gpu-inputs.py --check);
 #   2. the firmware: piano's own gen80000 images, pin-checked and copied into the ignored out/native-kexts/PianoA830/firmware, embedded
 #      from there (tooling/k27/stage-piano-gpu-firmware.py; PIANO_GPU_NO_FIRMWARE=1 builds without: S0 then refuses to start);
-#   3. Adreno830's host tests (ASan/UBSan) with piano's firmware pins (PIANO_A830_HOST_TESTS=0 skips them);
+#   3. Adreno830's host tests (ASan/UBSan) with piano's firmware pins, upstream and ADRENO830_MACOS (tooling/k27/run-a830-host-tests.py;
+#      PIANO_A830_HOST_TESTS=0 skips them);
 #   4. the objects with the k27 kernel recipe (-DADRENO830_MACOS: WindowServer as the render server, macOS client lists, no staged
 #      IOAcceleratorES), the weak definitions coalesced (tooling/k27/coalesce-weak.py) into out/native-kexts/PianoA830/objects.json,
 #      and every import checked against the k27 kernel's symbols (tooling/k27/check-kext-imports.py);
@@ -22,10 +23,8 @@ mkdir -p "$O" "$D/out/k27/kext"
 python3 "$D/tooling/k27/gen-piano-gpu-inputs.py" --check
 python3 "$D/tooling/k27/stage-piano-gpu-firmware.py" ${PIANO_GPU_NO_FIRMWARE:+--no-firmware}
 if [ "${PIANO_A830_HOST_TESTS:-1}" = 1 ]; then
-  FW=(); [ -n "${PIANO_GPU_NO_FIRMWARE:-}" ] || FW=(--firmware "$O/firmware" --pins "$B/piano-gpu-firmware.json")
-  python3 "$A/tests/run-host-tests.py" --unixnu "$P" "${FW[@]}" --out "$O/host-tests" > "$O/host-tests.log" 2>&1 \
-    || { tail -25 "$O/host-tests.log"; echo "Error: Adreno830 host tests failed ($O/host-tests.log)" >&2; exit 1; }
-  tail -1 "$O/host-tests.log"
+  python3 "$D/tooling/k27/run-a830-host-tests.py" ${PIANO_GPU_NO_FIRMWARE:+--no-firmware} --out "$O/host-tests" \
+    || { echo "Error: Adreno830 host tests failed ($O/host-tests/*.log)" >&2; exit 1; }
 fi
 SDK=${MACOS_SDK:-$(xcrun --sdk macosx --show-sdk-path)}
 GFX=$D/out/k27/inc-gfx   # IOKit/graphics alone, so no other Kernel.framework header comes before xnu's own
