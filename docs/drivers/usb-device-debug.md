@@ -1,14 +1,11 @@
 # USB device-mode debug channel: PianoDwc3
 
-> **Status 2026-11-11:** T1 (`piano-usb=1`) on hardware: USB core powered and clocked, DWC3 3.20a, eUSB2 PHY and repeater
-> enabled, SMMU stream 0x40 on bank 3 (kept). T2 (`piano-usb=2`): takeover runs, the Mac enumerates the device at high speed and
-> reads the device, string and configuration descriptors; every control transfer completes on the tablet (EP0 trace), but the
-> Mac leaves the device at `UsbEnumerationState = 2` with no configuration and no driver, unlike the approved fastboot device on the
-> same port: macOS's accessory approval ("Allow accessories to connect") is the likely cause. It needs the owner to approve the
-> accessory on the unlocked Mac once. Build:
-> `PIANO_EXTRA_ARGS="piano-usb=2" tooling/k27/build-native-image.sh` (PianoDwc3 is in `configs/k27-native-kexts.txt`, inert without
-> `piano-usb`); run: `tooling/native/native-loop.sh`. `build-piano-dwc3.sh` is now `build-native-piano-dwc3.sh` (no archive fallback);
-> `build-usb-test-kc.sh` and `native-run.sh` are gone.
+> **Status 2026-11-11 06:25: working.** With the Mac allowing new accessories (the owner switched "Allow accessories to connect" to
+> automatic), the Mac configures the device (AppleUSBCDCCompositeDevice, configuration 1) and creates /dev/cu.usbmodemPIANODBG1
+> (kernel console + monitor) and /dev/cu.usbmodemPIANODBG3 (user pipe); `tooling/native/usb-console.py --capture N` saved 1.5 MB of
+> live console in 3 minutes and the monitor answered `usb`. Earlier the Mac held the device at UsbEnumerationState 2 (accessory
+> approval). Build: `PIANO_EXTRA_ARGS="piano-usb=2" tooling/k27/build-native-image.sh`. The replayed boot log at connect time
+> includes the previous boot's decayed mailbox content (garbled tail): to be trimmed.
 
 
 Status: design and code, 2026-11-11. Built, host-tested and linked into a test KC (`out/k27/kc-k27-usb-test.bin`); **not

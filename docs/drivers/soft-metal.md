@@ -378,3 +378,11 @@ PIANO_EXTRA_KEXTS="$PWD/out/k27/kext/NativeSoftGpu.json" PIANO_VMM_PRESENT=0 PIA
 PIANO_EXTRA_ARGS="exec-log=1 stderr-log=1 panic_on_crash_disabled=1 soft-metal-all=1" tooling/k27/build-native-image.sh
 tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
 ```
+
+## Measured 2026-11-11 06:29 (soft-metal-all=1, Reduce Transparency in the plain domains)
+
+Still black (camera on the panel and thumbnails), the backdrop assertion unchanged, 13 WindowServer exits in 300 s. With a device for
+every client, SecurityAgent (the login UI) aborts: `RenderBox precondition failure: unable to create index buffer`. Conclusion: the
+software compositor without Metal cannot show the login UI on macOS 27: WindowServer's CA software renderer asserts on backdrop
+layers, and SwiftUI/RenderBox needs Metal buffers. Next: a real Metal device, either software (Mesa lavapipe under the VM-era
+metal2vulkan plugin) or the A830 driver (docs/drivers/gpu.md, droidvm-build/piano-patches/gpu-native-plan.md).
