@@ -229,8 +229,7 @@ class Session:
         raise Stop(f'tablet job {name} still running after {timeout} s')
 
     def region_sha(self, dev, skip, count, bs=B, name='hash'):
-        """SHA-256 of a region read from the medium (page cache dropped first)."""
-        self.t('drop-caches')
+        """SHA-256 of a region read from the medium (tablet.sh hash drops the page cache first)."""
         big = count * bs > 256 * MiB
         r = self.job(name, 'hash', dev, skip, count, bs, timeout=7200) if big else self.t('hash', dev, skip, count, bs)
         return r and r['sha256']
@@ -288,23 +287,30 @@ class Session:
         got = {}
 
         def run():
-            conn, _ = server.accept()
-            h, n = hashlib.sha256(), 0
-            files = [open(p, 'wb') for p in dests]
-            while n < total:
-                chunk = conn.recv(min(MiB, total - n))
-                if not chunk:
-                    break
+            conn, files = None, []
+            try:
+                conn, _ = server.accept()
+                h, n = hashlib.sha256(), 0
+                files = [open(p, 'wb') for p in dests]
+                while n < total:
+                    chunk = conn.recv(min(MiB, total - n))
+                    if not chunk:
+                        break
+                    for f in files:
+                        f.write(chunk)
+                    h.update(chunk)
+                    n += len(chunk)
                 for f in files:
-                    f.write(chunk)
-                h.update(chunk)
-                n += len(chunk)
-            for f in files:
-                f.flush()
-                os.fsync(f.fileno())
-                f.close()
-            conn.close()
-            got.update(bytes=n, sha256=h.hexdigest())
+                    f.flush()
+                    os.fsync(f.fileno())
+                got.update(bytes=n, sha256=h.hexdigest())
+            except OSError as e:          # the NAS or the link failed: close, so the tablet's nc ends too
+                got.update(error=str(e).replace(str(Path(dests[0]).parent.parent), '$PIANO_BACKUP_DIR'))
+            finally:
+                for f in files:
+                    f.close()
+                if conn:
+                    conn.close()
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
@@ -314,6 +320,8 @@ class Session:
             self.t('send', dev, skip, count, bs, self.a.nc_port, timeout=600)
         thread.join(4 * 3600)
         server.close()
+        if 'error' in got:
+            raise Stop(f'export of /dev/{dev} failed on the host: {got["error"]}')
         return got.get('bytes'), got.get('sha256')
 
     @staticmethod

@@ -72,7 +72,7 @@ makes them on the signing host). The FD build is not bit-reproducible: everythin
 | `persistent/gpt-head.bin` | 24576 | 8c3ab20f60226441096d4c61ea2671db605b4347163cd556e4080135eaab450e | LUN 0 LBA 0-5, new primary GPT (100 bytes differ from new-primary.bin: gpt-diff.txt) |
 | `persistent/gpt-tail.bin` | 20480 | 39da467b3c6f99100583c5a0f42350a1d3c8e014be508f1fc53941414e7aa543 | LUN 0 LBA 124552187-124552191, new backup GPT |
 | `ram/boot-piano-macos-ram-A-bundled.img` | 203726848 | c7f40f62500e36180a43883a79554f0a8b58037d18f91f1254e36e4d70b5a11a | dev RAM image with that FD (K27_ARGS, reset 45 s): `ram-precedence` |
-| `ram-dump/boot-piano-macos-ram-A-bundled.img` | 203726848 | 1a6f57d0900b6152b8d19263bd7ee7c021e4e6863cfbcf1364e3892e658e8ca0 | the loop's dump image with that FD (reset 1 s) |
+| `ram-dump/boot-piano-macos-ram-A-bundled.img` | 203726848 | 0b129dfa8eda049b5210a572ad09eeea119f47979852d7988c01f5c1d2474b33 | the loop's dump image with that FD (reset 1 s, data-persist=0) |
 
 ESP inputs: KC 415bbea57f0f6699… (8 native kexts), ADT bafbdaac91f0118f… (vmm-present 1), trust cache 2b87b2241090c905…, seed
 cb50ceac16394c9f… (seed identity 469ed4401f5b5241…, 3145728 pages, store window 3145825 blocks). ESP partition GUID

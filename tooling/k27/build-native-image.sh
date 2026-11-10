@@ -78,6 +78,8 @@ NATIVE="$NATIVE ${PIANO_EXTRA_KEXTS:-}" \
 # PIANO_TRUST / PIANO_SEED: another trust cache and Data seed for a test (e.g. tooling/k27/stage-soft-metal.py's, with a staged plugin).
 COMMON=(--fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-k27-native.bin --trust "${PIANO_TRUST:-out/inputs/kernel.macho.trustcache}"
         --seed "${PIANO_SEED:-out/inputs/scratch-data.img}" --adt "${PIANO_ADT:-out/adt/piano-k27.adt}" --utc "$(date +%s)")
-PIANO_RESET_AFTER=1 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram-dump > out/k27/build-ram-dump.log 2>&1 &
+# The dump image only lets our UEFI read the previous run's log; its XNU never touches the Data store (data-persist=0), so a dump
+# image with another seed cannot reset the store of the installed system (docs/persistent-boot.md).
+PIANO_RESET_AFTER=1 PIANO_DATA_PERSIST=0 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram-dump > out/k27/build-ram-dump.log 2>&1 &
 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram | tail -1
 wait $! || { tail -3 out/k27/build-ram-dump.log; exit 1; }

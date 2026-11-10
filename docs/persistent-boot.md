@@ -146,7 +146,9 @@ NAS: the store region takes about 8 minutes to export and as long to read back; 
 `tooling/persist/maint-session.py` runs the steps (`--list` describes each; `--dry-run` prints every command and sends nothing).
 Commands reach the maintenance image's root shell through `tooling/native/maint-shell.py` (`PIANO_MAINT_HOST`); the tablet side is
 `tooling/persist/tablet.sh`, which the host serves (HTTP on the USB-link address, a fixed list of files, sha256 checked) together
-with the images. Long jobs run detached on the tablet (`setsid`) and are polled. State: `out/persistent/session/state.json`.
+with the images; exports come back to a one-shot TCP receiver on the same address (ports 8000 and 9000; the Mac's application
+firewall is off, else allow python3). Long jobs run detached on the tablet (`setsid`) and are polled. State:
+`out/persistent/session/state.json`. Expect about 4 s per tablet command (maint-shell.py's login).
 
 ```sh
 P=tooling/persist/maint-session.py
@@ -231,7 +233,8 @@ partly discharged pack charges without the DSP is unmeasured. Note also:
   `\EFI\BOOT\BOOTAA64.EFI`. If a firmware stage ever reacts to it, `build-gpt.py` can be changed to Basic Data (FatPkg mounts by
   content, not by type).
 - A dev RAM image with another Data seed resets the installed system's store (the seed identity changes): use
-  `PIANO_DATA_PERSIST=0` for such experiments.
+  `PIANO_DATA_PERSIST=0` for such experiments. The loop's dump image is now always built with `data-persist=0`
+  (`build-native-image.sh`), so it never touches the store.
 - Payload updates still need the cable: maintenance image, `backup` (new set) and `esp` with a new image. NativeUfs could later
   publish partition 37 so macOS updates its own payload.
 - The clock is the ESP build time (`droidvm-utc`), there is no RTC driver yet.

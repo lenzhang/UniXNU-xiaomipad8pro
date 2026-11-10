@@ -41,7 +41,7 @@ if [ "${RAM:-0}" = 1 ]; then
   set -- $IN
   COMMON=(--fd "$FD_FILE" --fd-name A-bundled --kc "$1" --trust "$2" --seed "$3" --adt "$4" --utc "$UTC")
   python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram | tail -1
-  PIANO_RESET_AFTER=1 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram-dump | tail -1
+  PIANO_RESET_AFTER=1 PIANO_DATA_PERSIST=0 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram-dump | tail -1
 fi
 (cd "$O" && shasum -a 256 boot-piano-*.img kernel-field.bin "esp-$PROFILE-"*.img gpt-head.bin gpt-tail.bin) > "$O/SHA256SUMS"
 cat "$O/SHA256SUMS"

@@ -242,6 +242,35 @@ def test_tablet_sh(tmp):
     (tmp / 'pp' / 'w.bin').write_bytes(b'\xab' * (2 * B))
     run('write', 'w.bin', dev, 5, B)
     check(disk.read_bytes()[5 * B:7 * B] == b'\xab' * (2 * B), 'write FILE DEV SEEK BS')
+    # map, on a fake sysfs (a copy of tablet.sh with /sys pointing there): LUN 0 by UFS target 0, partitions by PARTNAME, LUN 0's
+    # own entries (linux_*, esp) only on LUN 0 even if another LUN has a partition of the same name
+    fs = tmp / 'fs'
+    ufs = fs / 'sys/devices/platform/soc@0/1d84000.ufshc/host0'
+    for disk, lun in (('sda', 0), ('sde', 4), ('sdf', 5)):
+        target = ufs / f'target0:0:0/0:0:0:{lun}'
+        target.mkdir(parents=True)
+        (fs / f'sys/block/{disk}/queue').mkdir(parents=True)
+        (fs / f'sys/block/{disk}/queue/logical_block_size').write_text('4096\n')
+        os.symlink(target, fs / f'sys/block/{disk}/device')
+    (fs / 'sys/class/block').mkdir(parents=True)
+    for node, name, start, size in (('sda35', 'linux_rootfs', 448487424, 123731968), ('sda36', 'linux_data', 574316544, 422100952),
+                                    ('sda37', 'esp', 572219392, 2097152), ('sde13', 'boot_a', 618800, 196608),
+                                    ('sde23', 'vendor_boot_a', 970800, 196608), ('sde28', 'init_boot_a', 1438256, 16384),
+                                    ('sdf13', 'boot_b', 618800, 196608), ('sde40', 'esp', 4000000, 8)):
+        d = fs / 'sys/class/block' / node
+        d.mkdir()
+        (d / 'partition').write_text(node.lstrip('sdabcdef') + '\n')
+        (d / 'uevent').write_text(f'MAJOR=8\nPARTN=1\nDEVNAME={node}\nDEVTYPE=partition\nPARTNAME={name}\n')
+        (d / 'start').write_text(f'{start}\n')
+        (d / 'size').write_text(f'{size}\n')
+    script = tmp / 'tablet-fakesys.sh'
+    script.write_text((HERE / 'tablet.sh').read_text().replace('/sys/', f'{fs}/sys/'))
+    r = subprocess.run(['sh', str(script), 'map'], capture_output=True, text=True, env=env, cwd=tmp)
+    got = dict(line.split('=', 1) for line in r.stdout.splitlines() if '=' in line)
+    check(got.get('lun0') == 'sda' and got.get('lun0_block_size') == '4096', f'map: LUN 0 = sda, 4096-byte blocks ({got.get("lun0")})')
+    check(got.get('esp') == 'sda37 572219392 2097152', f'map: esp is LUN 0\'s partition 37, not sde40 ({got.get("esp")})')
+    check(got.get('boot_a') == 'sde13 618800 196608' and got.get('boot_b') == 'sdf13 618800 196608', 'map: boot_a, boot_b by name')
+    check(got.get('linux_rootfs') == 'sda35 448487424 123731968', 'map: linux_rootfs')
 
 
 def build_fake(tmp):

@@ -4,7 +4,7 @@
 # subcommand per telnet line. Every subcommand prints key=value lines; nothing writes unless its name says so (copy, write, job).
 # Devices are found from sysfs every time (LUN 0 = the disk on UFS target 0, partitions by PARTNAME), never assumed.
 #   map                                   LUN 0 disk, block size, size; boot_a/boot_b/vendor_boot_a/init_boot_a; linux_rootfs/esp
-#   hash DEV SKIP COUNT [BS]              sha256 of COUNT blocks of BS (default 4096) bytes at block SKIP
+#   hash DEV SKIP COUNT [BS]              sha256 of COUNT blocks of BS (default 4096) bytes at block SKIP, page cache dropped first
 #   zero-sha COUNT [BS]                   sha256 of COUNT zero blocks (to tell an all-zero region)
 #   peek DEV LBA OFFSET LENGTH            hex of LENGTH bytes at OFFSET in 4096-byte block LBA
 #   send DEV SKIP COUNT BS PORT           stream the blocks to the host's TCP PORT (maint-session.py receives and checks)
@@ -29,8 +29,8 @@ lun0() {
 		case "$(readlink -f "$b/device")" in *1d84000*:0) echo "${b##*/}" ;; esac
 	done
 }
-part_by_name() {   # print the node, start and size (512-byte units) of the partition named $1 (all disks)
-	for d in /sys/class/block/sd*[0-9]; do
+part_by_name() {   # print the node, start and size (512-byte units) of the partition named $1 (on disk $2, else on any disk)
+	for d in /sys/class/block/${2:-sd*}[0-9]*; do
 		[ -e "$d/partition" ] || continue
 		n=$(sed -n 's/^PARTNAME=//p' "$d/uevent")
 		[ "$n" = "$1" ] && echo "${d##*/} $(cat "$d/start") $(cat "$d/size")"
@@ -40,19 +40,21 @@ cmd=${1:-}; [ $# -gt 0 ] && shift
 case $cmd in
 map)
 	l=$(lun0)
-	case "$l" in ''|*' '*) die "LUN 0 not found or ambiguous: '$l'" ;; esac
+	case "$l" in ''|*[!a-z]*) die "LUN 0 not found or ambiguous: '$l'" ;; esac
 	echo "lun0=$l"
 	echo "lun0_block_size=$(cat /sys/block/$l/queue/logical_block_size)"
 	echo "lun0_bytes=$(blockdev --getsize64 /dev/$l)"
 	echo "mounted=$(grep -c '^/dev/sd' /proc/mounts)"
 	for n in boot_a boot_b vendor_boot_a init_boot_a linux_rootfs linux_data esp; do
-		set -- $(part_by_name "$n")
+		case $n in linux_*|esp) disk=$l ;; *) disk= ;; esac   # LUN 0's own entries only on LUN 0
+		set -- $(part_by_name "$n" $disk)
 		[ $# -eq 0 ] && { echo "$n=none"; continue; }
 		[ $# -ne 3 ] && die "partition name $n is not unique"
 		echo "$n=$1 $2 $3"
 	done
 	;;
-hash)
+hash)   # from the medium: the page cache is dropped first
+	sync; { echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null
 	dd if="/dev/$1" bs="${4:-4096}" skip="$2" count="$3" 2>/dev/null | sha256sum | cut -d' ' -f1 | sed 's/^/sha256=/'
 	;;
 zero-sha)
