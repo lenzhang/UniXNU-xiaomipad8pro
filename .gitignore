@@ -1,0 +1,25 @@
+# Never committed: signing keys, calibration, MACs, passwords, ECID/chip seeds.
+/private/*
+!/private/.keep
+*.pem
+*.key
+*.psk
+*thp-calibration*
+local.toml
+# Build outputs and large binaries stay out; record their SHA-256 in artifacts/ARTIFACTS.md instead.
+/out/
+/build/
+*.img
+*.fd
+*.ipsw
+*.dmg
+*.macho
+*.kc
+*.bin
+*.dtb
+!/dts/*.dtb.sha256
+
+# Bytecode and editor junk (never commit).
+__pycache__/
+*.pyc
+.DS_Store
