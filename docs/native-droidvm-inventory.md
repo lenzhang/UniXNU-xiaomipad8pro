@@ -42,7 +42,7 @@ The names stay `droidvm-*` because the kernel and the OS image know them by thos
 
 | Item | Decision | Reason |
 |---|---|---|
-| `vmm-present` | 1 → 0 | no VM natively; measured the same boot |
+| `vmm-present` | kept at 1 | tried 0: watchdogd then runs as on real hardware, exits twice (no watchdog device) and launchd panics about 150 s into the run (`watchdogd[297] exited`); with 1 a 240 s run has no panic. Revisit with a watchdog driver |
 | `model` VirtualMac2,1, `target-type` VMA2MACOS, `product-name` "Apple Virtual Machine 1", `has-virtualization` | kept | the kernel collection is Apple's vma2 one and its kexts match on this identity (plan R8) |
 | `serial-number` DVMPIANO001 | kept | made up, not a unit serial; the Data seed was made with it |
 | `/arm-io/gop-display`, compatible `paravirtualizedgraphics,gpu` | kept (now in the default ADT) | IOMobileFramebuffer.framework only looks for displays on a node with that string |
