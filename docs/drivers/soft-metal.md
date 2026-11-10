@@ -147,3 +147,11 @@ A software Metal *implementation*. Nothing is rendered by the GPU or by a CPU ra
 Animation's own software paths, which are there for machines without a usable accelerator. Expect it to be slow, and expect anything
 that insists on Metal (Safari's compositing, video, some effects) not to draw. The real driver is the plan in
 `droidvm-build/piano-patches/gpu-native-plan.md`.
+
+## Measured 2026-11-11 (d306a16a, 300 s)
+
+Abort reporter installed; 64 selectors stubbed, 0 forwarded; device made (port 0, no queue); NativeGopDisplay "display on". Every
+WindowServer after the first aborts in SkyLight `WSCompositeDestinationCreateWithIOSurface` called from
+`WS::Displays::SLCADisplay::render_update` (`UpdateDisplays` ← `CGXUpdateDisplay` ← `update_display_callback`), a plain `abort()`
+(no exception). The os_log stream showed `Display 1 current mode (0 x 0) [0 0], preferred mode (0 x 0)` from CoreAnimation, then
+stopped after ~6 s (the `log` job's output). Next: the composite destination's requirements (texture from IOSurface? display mode?).
