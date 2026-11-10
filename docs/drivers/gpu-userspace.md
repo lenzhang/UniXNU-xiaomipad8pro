@@ -215,3 +215,12 @@ To switch the plugin's ICD for a CPU fallback:
 - The bridge: metal2vulkan, GPL-2.0-or-later OR LGPL-3.0-or-later. It is linked statically into the plugin. If the bundle is ever
   published, honour the LGPL's terms for static linking.
 - Binaries are never committed. Provenance of every input: `tooling/metal/UPSTREAM`.
+
+## Measured 2026-11-11 07:45: the login screen on the A830
+
+PianoA830 (piano-gpu=2, piano-gpu-delay=20) brought the GPU up S1..S10 (an earlier full run: SMMU, FWMEM, GMU-HFI, CP, ZAP, fence
+self-test, METAL publish, DCVS, "GPU RUN 160M", 44-53 C). With Turnip on ABI v2 staged (this file's build) and the ADT's
+vmm-present 0 (8-bit framebuffers) plus panic_on_crash_disabled=1, WindowServer composited the macOS login screen (date and clock,
+the user's avatar, the password field) on the GPU and NativeGopDisplay showed it on the panel (camera, ~3.5 min after fastboot
+boot). Open: the console mailbox at 0x9cb00000 was overwritten in that run (no log); the display's present path has no GPU fence
+yet; no input to log in (touch not done; the buttons only).
