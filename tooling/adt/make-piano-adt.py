@@ -52,6 +52,9 @@ def main():
     p.add_argument('--psci-method', choices=('smc', 'hvc'))
     p.add_argument('--no-gop-display', dest='gop_display', action='store_false', help='leave out /arm-io/gop-display')
     p.add_argument('--gop-display', dest='gop_display', action='store_true', help=argparse.SUPPRESS)   # the default; kept for old commands
+    # A test ADT's /defaults vmm-present (configs/k27-adt.toml has 1; see its note). 0 is the truthful value natively: Core Animation then
+    # gives WindowServer 8-bit framebuffers instead of the half-float ones of a virtual machine (docs/drivers/soft-metal.md §9).
+    p.add_argument('--vmm-present', type=int, choices=(0, 1))
     a = p.parse_args()
     dtb = a.dtb_out or a.output.with_suffix('.hw.dtb')
     dtb.parent.mkdir(parents=True, exist_ok=True)
@@ -63,6 +66,8 @@ def main():
     board.pop('adt', None)
     board.get('payload', {}).pop('adt', None)
     config = merge(board, load_toml(DEVICE / 'configs/k27-adt.toml'))
+    if a.vmm_present is not None:
+        config['adt']['defaults']['u32']['vmm-present'] = a.vmm_present
     extra = []
     if a.gop_display:
         nodes = load_toml(DEVICE / 'configs/k27-gop-display.toml').get('arm-io', {})

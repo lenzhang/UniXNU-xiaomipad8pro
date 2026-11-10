@@ -207,3 +207,39 @@ the abort: that is decided by the format alone.
 The crash annotation names it: `Unimplemented pixel format of 1380411457 used in WSCompositeDestinationCreateWithIOSurface`
 (`'RGhA'`, half float). No FP16/CIF10 debug option was on; the only CoreAnimation option on was 203 `CA_HDR10_SET_EDR_SCALE`. So the
 FP16 framebuffer comes from the EDR or display-capability branch of `framebuffer_pixel_format()`: next, the display's properties.
+
+## 9. Where 'RGhA' comes from: the virtual-machine branch (read 2026-11-11, macOS 26.6)
+
+`IOMFBDisplay::framebuffer_pixel_format()` returns `'RGhA'` in more cases than §8 listed. After the EDR, debug-option and
+capability checks, it also returns it **whenever Core Animation considers the device virtualized** (`CADeviceIsVirtualized`, inlined:
+MobileGestalt's bool answer, and on chip ID 0x8103 the `kern.hv_vmm_present` sysctl, which the kernel reads from the ADT's
+`/defaults/vmm-present`). In that case there is no exit to `'BGRA'`; the only other one, `CA_FORCE_CIF10_FRAMEBUFFER`, gives `'w40a'`,
+which SkyLight's software compositor rejects as well.
+
+So, against the measured run:
+- `CA_HDR10_SET_EDR_SCALE` is not read by `framebuffer_pixel_format()` (on 26.6 it reads options 124, 125 and 150 only). Clearing it
+  would not change the format.
+- NativeGopDisplay's properties are not the trigger. It already publishes 8-bit SDR sRGB with no luminance, PQ or EDR, and the
+  virtual-machine branch decides alone.
+- The ADT says `vmm-present = 1`. Natively that is not true (the tablet is not a VM), and it is what gives WindowServer half-float
+  framebuffers. In the VM, Metal composited them; the software compositor cannot.
+
+**Next candidate: the truthful value.** A test ADT with `vmm-present = 0` (`make-piano-adt.py --vmm-present 0`; the shared
+`configs/k27-adt.toml` keeps 1), with the same plugin and seed. The known cost, measured earlier: watchdogd runs and exits (no
+watchdog device), and launchd panics about 150 s in. WindowServer's first display updates came well before that in every run, so one
+run answers both questions:
+- does WindowServer submit a swap with 8-bit framebuffers? (`NativeGopDisplay: first swap submitted`, no `crash message (SkyLight)`)
+- what does watchdogd fail on before it exits? (`sc-trace=watchdogd`: its failing system calls, with paths)
+
+The seed has no MobileGestalt cache (checked), so the new answer is computed on the first boot of a fresh seed.
+
+```sh
+python3 tooling/adt/make-piano-adt.py out/adt/piano-k27-vmm0.adt --unique-chip-id 47554e5941480001 --data --trust --vmm-present 0
+PIANO_ADT=out/adt/piano-k27-vmm0.adt PIANO_EXTRA_KEXTS="$PWD/out/k27/kext/NativeSoftGpu.json" \
+PIANO_SEED=out/soft-metal/scratch-data.img PIANO_TRUST=out/soft-metal/kernel.macho.trustcache PIANO_RESET_AFTER=300 \
+PIANO_EXTRA_ARGS="exec-log=1 stderr-log=1 sc-trace=watchdogd" tooling/k27/build-native-image.sh
+tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
+```
+
+If the swaps come and the panic is watchdogd's, the remaining work is a watchdog for watchdogd natively (piano has one: k27 0056
+already pets Gunyah's) or keeping watchdogd from running. That is a separate driver task, not part of this one.
