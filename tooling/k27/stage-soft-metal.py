@@ -20,9 +20,12 @@ which drops the Data changes of earlier native boots. Boot staged-seed tests wit
 The job's file is rewritten in place, so it keeps the owner the VM's staging gave it; launchd refuses a daemon plist that is not root's,
 and this Mac cannot set an owner on the seed's volume. The commands run as root after settime.sh, in the order given, and their output
 goes to the kernel log with stderr-log=1.
---log-stream PREDICATE adds the two commands that put a process's own os_log messages there: `log show --last boot` and then
-`log stream`. That is where SkyLight's and Metal's messages go, the ones the console log otherwise never shows (an abort of
-WindowServer, for instance, logs its reason through os_log and nothing else). It needs logd to run; if it does not, the job simply fails
+--log-stream PREDICATE puts a process's own os_log messages there. That is where SkyLight's and Metal's messages go, the ones the
+console log otherwise never shows (an abort of WindowServer, for instance, logs its reason through os_log). It is a loop of
+`log show --last 25s` every 20 s, not `log stream`: on 2026-11-11 a `log stream` behind the job printed its first 72 lines and then
+nothing (its stdout is a pipe, so block-buffered, or the stream died), while each `log show` exits and so flushes. Windows overlap by 5 s,
+so a line can appear twice; none is lost unless a `log show` takes longer than 5 s more than its sleep. `log show` reads what logd
+persisted: errors and faults always, info only when configured. It needs logd; without it the job's loop prints its error every 20 s
 and the rest of the boot is unchanged.
 """
 import argparse
@@ -137,8 +140,7 @@ def main():
     commands = list(a.boot_run)
     if a.log_stream:
         where = shlex.quote(a.log_stream)
-        commands += [f'log show --last boot --info --debug --style compact --predicate {where} 2>&1',
-                     f'exec log stream --level debug --style compact --predicate {where} 2>&1']
+        commands += [f'while :; do log show --last 25s --info --style compact --predicate {where} 2>&1; sleep 20; done']
     bundle = a.bundle.resolve()
     if not (bundle / 'Contents/Info.plist').is_file():
         raise SystemExit(f'{bundle}: not a bundle (Contents/Info.plist)')

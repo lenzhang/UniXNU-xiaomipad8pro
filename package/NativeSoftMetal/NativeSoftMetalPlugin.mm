@@ -31,13 +31,25 @@
 //   soft-metal-family=N   -supportsFamily:/-supportsFeatureSet: answer YES for arguments up to N (default 0: no family). A client that
 //                         insists on a GPU family can be given one without a rebuild
 //   soft-metal-report=0   do not install the abort reporter below
+//   soft-metal-fb8=0      leave Core Animation's framebuffer format alone (see "The framebuffer format" below)
 // Reports go to stderr ("NativeSoftMetal: <process>: ..."); kernel boot argument stderr-log=1 puts them in the console log, one line per
 // write and at most 160 bytes a line, so the lines here are short.
 //
 // The abort reporter: this bundle is loaded inside WindowServer, so it can say why WindowServer dies, which the console log otherwise
 // does not show (SkyLight's own asserts go to os_log, and AMFI denies the core dump). It installs an uncaught-exception handler, a C++
 // terminate handler and handlers for the fatal signals; each prints the reason and the stack as "<image>+<offset>", which names the
-// framework that aborted even without the 27.0.1 symbols.
+// framework that aborted even without the 27.0.1 symbols. Before the stack it prints every loaded image's crash-reporter message
+// (__DATA,__crash_info): SkyLight puts its abort text there before abort(), so the reason is in the console log, not only in os_log.
+//
+// The framebuffer format (2026-11-11, second run): WindowServer got past the device and died in SkyLight's
+// WSCompositeDestinationCreateWithIOSurface, which aborts with "Unimplemented pixel format of %i" for any surface SkyLight's software
+// compositor cannot write. On 26.6 it takes 'BGRA', 'RGBA', 32ARGB, 'RGfA', 'R10k', 'b64a' and 'l10r', not the half-float 'RGhA' or the
+// 10-bit 'b3a8' a display can get from Core Animation (CA::WindowServer::IOMFBDisplay::framebuffer_pixel_format). That function gives
+// 'RGhA' when debug option CA_FORCE_FP16_FRAMEBUFFER is on (26.6: option 124), 'w40a' for CA_FORCE_CIF10_FRAMEBUFFER (125), or for an
+// EDR display; else 'BGRA'. So, in WindowServer, unless soft-metal-fb8=0: those two options are found by name
+// (CAGetDebugOptionEnvVariableName, so 27.0.1's numbering is not assumed), reported, and cleared whenever they are on during the first
+// minute; and Core Animation's CAEnableDeepFramebuffer preference is set false for the process. Every debug option that is on is listed
+// once (the survey), so a run shows what else Core Animation was told.
 //
 // The IOGPU registration answers (_setAcceleratorService:, _setDeviceWrapper:, _deviceWrapper, the stub survey) follow macOS-DroidVM's
 // overlay/metal/NativeAdrenoMetalPlugin.mm (package/NativeSoftMetal/UPSTREAM).
@@ -50,6 +62,8 @@
 #include <exception>
 #include <initializer_list>
 #include <execinfo.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #include <objc/runtime.h>
 #include <signal.h>
 #include <stdio.h>
@@ -93,6 +107,18 @@ static unsigned bootArgValue(const char *name, unsigned fallback)
     return value;
 }
 
+// One line on fd 2, newline-terminated even when cut at the console's 160 bytes.
+static void writeLine(char *line, size_t size, int length)
+{
+    if (length <= 0) return;
+    size_t n = (size_t)length < size ? (size_t)length : size - 1;
+    if (n && line[n - 1] != '\n') {
+        if (n == size - 1) n--;
+        line[n++] = '\n';
+    }
+    (void)!write(2, line, n);
+}
+
 // One write(2) per line: the kernel's stderr-log logs a write at a time.
 __attribute__((format(printf, 1, 2))) static void report(const char *format, ...)
 {
@@ -101,8 +127,7 @@ __attribute__((format(printf, 1, 2))) static void report(const char *format, ...
     va_start(arguments, format);
     vsnprintf(text, sizeof text, format, arguments);
     va_end(arguments);
-    int length = snprintf(line, sizeof line, "NativeSoftMetal: %s: %s\n", getprogname(), text);
-    if (length > 0) (void)!write(2, line, (size_t)length < sizeof line ? (size_t)length : sizeof line - 1);
+    writeLine(line, sizeof line, snprintf(line, sizeof line, "NativeSoftMetal: %s: %s\n", getprogname(), text));
 }
 
 // In a signal handler: no allocation, no printf of the va kind.
@@ -128,15 +153,41 @@ static void reportFrames(void *const *frames, int count)
             offset = (unsigned long)((const char *)frames[i] - (const char *)info.dli_fbase);
         }
         char line[160];
-        int length = snprintf(line, sizeof line, "NativeSoftMetal: %s: #%d %.40s+0x%lx %.40s\n", getprogname(), i, image, offset,
-            info.dli_sname ? info.dli_sname : "");
-        if (length > 0) (void)!write(2, line, (size_t)length < sizeof line ? (size_t)length : sizeof line - 1);
+        writeLine(line, sizeof line, snprintf(line, sizeof line, "NativeSoftMetal: %s: #%d %.40s+0x%lx %.40s\n", getprogname(), i, image,
+            offset, info.dli_sname ? info.dli_sname : ""));
+    }
+}
+
+// The crash-reporter annotations of every loaded image (libsystem's crashreporter_annotations_t in __DATA,__crash_info: version, then
+// the message and, at +32, message2). abort() paths that explain themselves (SkyLight's "Unimplemented pixel format ...", assert, libobjc)
+// leave their text there. Printed in 72-byte pieces: the console takes one write of at most 160 bytes a line.
+static void reportCrashMessages()
+{
+    for (uint32_t i = 0, count = _dyld_image_count(); i < count; i++) {
+        const struct mach_header_64 *header = reinterpret_cast<const struct mach_header_64 *>(_dyld_get_image_header(i));
+        if (!header) continue;
+        for (const char *segment : {"__DATA", "__DATA_DIRTY"}) {
+            unsigned long size = 0;
+            const uint8_t *section = getsectiondata(header, segment, "__crash_info", &size);
+            if (!section || size < 40) continue;
+            for (unsigned offset : {8u, 32u}) {
+                const char *message = *reinterpret_cast<const char *const *>(section + offset);
+                if (!message || !*message) continue;
+                const char *path = _dyld_get_image_name(i), *slash = path ? strrchr(path, '/') : nullptr;
+                char line[160];
+                size_t length = strnlen(message, 600);
+                for (size_t at = 0; at < length; at += 72)
+                    writeLine(line, sizeof line, snprintf(line, sizeof line, "NativeSoftMetal: %s: crash message (%.20s): %.72s\n",
+                        getprogname(), slash ? slash + 1 : path ? path : "?", message + at));
+            }
+        }
     }
 }
 
 static void reportHere(const char *why)
 {
     reportRaw(why);
+    reportCrashMessages();
     void *frames[32];
     reportFrames(frames, backtrace(frames, 32));
 }
@@ -145,6 +196,7 @@ static void onSignal(int number, siginfo_t *, void *)
 {
     reportRaw(number == SIGABRT ? "SIGABRT" : number == SIGSEGV ? "SIGSEGV" : number == SIGBUS ? "SIGBUS" :
         number == SIGILL ? "SIGILL" : number == SIGTRAP ? "SIGTRAP" : "fatal signal");
+    reportCrashMessages();
     void *frames[32];
     reportFrames(frames, backtrace(frames, 32));
     raise(number);   // SA_RESETHAND: the default action now, so the process dies as it would have
@@ -201,6 +253,69 @@ static void installReporter()
     sigemptyset(&action.sa_mask);
     for (int number : {SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE}) sigaction(number, &action, nullptr);
     report("abort reporter installed (soft-metal-report=0 to leave it out)");
+}
+
+// ---- Core Animation's framebuffer format ------------------------------------------------------------------------------------------
+// QuartzCore's debug options, by the environment variable name each has (the numbering differs between releases).
+using GetOption = bool (*)(unsigned);
+using SetOption = void (*)(unsigned, bool);
+using OptionName = const char *(*)(unsigned);
+static const unsigned kMaxOption = 1024;   // the accessors answer 0 / NULL past their table
+
+static bool isFramebufferForce(const char *name)
+{
+    return !strcmp(name, "CA_FORCE_FP16_FRAMEBUFFER") || !strcmp(name, "CA_FORCE_CIF10_FRAMEBUFFER");
+}
+
+// Lists each option that is on (once), and with CLEAR turns the framebuffer-forcing ones off again.
+static void coreAnimationOptions(const char *when, bool clear)
+{
+    static GetOption get = reinterpret_cast<GetOption>(dlsym(RTLD_DEFAULT, "CAGetDebugOption"));
+    static SetOption set = reinterpret_cast<SetOption>(dlsym(RTLD_DEFAULT, "CASetDebugOption"));
+    static OptionName name = reinterpret_cast<OptionName>(dlsym(RTLD_DEFAULT, "CAGetDebugOptionEnvVariableName"));
+    static bool reported[kMaxOption], missing;
+    if (!get || !set || !name) {
+        if (!missing) report("QuartzCore has no CAGetDebugOption / CASetDebugOption / CAGetDebugOptionEnvVariableName");
+        missing = true;
+        return;
+    }
+    for (unsigned id = 0; id < kMaxOption; id++) {
+        const char *option = name(id);
+        if (!option || !get(id)) continue;
+        if (!reported[id]) {
+            reported[id] = true;
+            report("%s: CA option %u %.60s is on", when, id, option);
+        }
+        if (clear && isFramebufferForce(option)) {
+            set(id, false);
+            report("%s: CA option %u %.60s cleared (soft-metal-fb8=0 keeps it)", when, id, option);
+        }
+    }
+}
+
+// In WindowServer: 8-bit framebuffers, the only kind SkyLight's software compositor writes. The preference first (Core Animation reads
+// it when it makes a display's framebuffers), then the debug options now and once a second for a minute, since a display's
+// framebuffers are made after this bundle is loaded and something may set an option on the way.
+static void framebufferPolicy()
+{
+    const bool clear = bootArgValue("soft-metal-fb8", 1);
+    if (clear) {
+        CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+        report("CAEnableDeepFramebuffer set false for this process (soft-metal-fb8=0 leaves it)");
+    }
+    coreAnimationOptions("load", clear);
+    static dispatch_source_t timer;
+    static std::atomic<unsigned> ticks;
+    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    if (!timer) return;
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
+    dispatch_source_set_event_handler(timer, ^{
+        char when[16];
+        snprintf(when, sizeof when, "t+%us", ticks.load() + 1);
+        coreAnimationOptions(when, clear);
+        if (++ticks >= 60) dispatch_source_cancel(timer);
+    });
+    dispatch_resume(timer);
 }
 
 // ---- the device's answers ---------------------------------------------------------------------------------------------------------
@@ -481,5 +596,8 @@ static id deviceForPort(io_service_t port)
 // whether it is the Metal device's doing or not.
 __attribute__((constructor)) static void start()
 {
-    if (!strcmp(getprogname(), "WindowServer") || bootArgValue("soft-metal-all", 0)) installReporter();
+    if (!strcmp(getprogname(), "WindowServer") || bootArgValue("soft-metal-all", 0)) {
+        installReporter();
+        framebufferPolicy();
+    }
 }

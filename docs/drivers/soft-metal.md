@@ -72,6 +72,12 @@ Reading of that run:
   `SIGABRT`, `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGTRAP`, `SIGFPE`. Each prints the reason and up to 24 frames as `<image>+<offset>
   <nearest exported symbol>` on stderr, and the signal handler re-raises so the process still dies as it would have. This is what names
   the next cause without the 27.0.1 symbols. Checked on the build Mac against a deliberate exception and a deliberate `abort()`.
+  Before the stack it prints every loaded image's crash-reporter message (`__DATA,__crash_info`), where SkyLight, `assert()` and libobjc
+  leave their text before `abort()` (checked with a deliberate `assert`). That is the abort reason even when os_log redacts it.
+- **8-bit framebuffers** in WindowServer (§8): Core Animation's debug options `CA_FORCE_FP16_FRAMEBUFFER` and
+  `CA_FORCE_CIF10_FRAMEBUFFER` are found by name (`CAGetDebugOptionEnvVariableName`), reported, and cleared at load and once a second
+  for a minute; the `CAEnableDeepFramebuffer` preference is set false for the process. Every debug option that is on is listed once.
+  Checked on the build Mac with `CA_FORCE_FP16_FRAMEBUFFER=1` in the environment: option 124 found and cleared.
 
 Boot arguments (read through `kern.bootargs`, so none of them needs a restaging):
 
@@ -82,6 +88,7 @@ Boot arguments (read through `kern.bootargs`, so none of them needs a restaging)
 | `soft-metal-stubs=0` | on | only `kValues` and `_MTLDevice`; the rest goes to forwarding, so `-respondsToSelector:` stays NO for it (a client that asks first then takes its other path) |
 | `soft-metal-family=N` | 0 | `-supportsFamily:`/`-supportsFeatureSet:` answer YES up to N, for a client that insists on a GPU family |
 | `soft-metal-report=0` | on | no abort reporter |
+| `soft-metal-fb8=0` | on | leave Core Animation's framebuffer format alone (the options are still listed) |
 
 ## 4. Build, stage and run
 
@@ -91,7 +98,8 @@ tooling/k27/build-soft-metal-plugin.sh               # the plugin -> out/soft-me
 python3 tooling/k27/stage-soft-metal.py \
   --log-stream 'process == "WindowServer" OR process == "loginwindow"'
 # -> out/soft-metal/{scratch-data.img,kernel.macho.trustcache}: the bundle in /Library/GPUBundles, its CDHash in the trust cache, and
-#    the seed's one boot job extended with `log show --last boot` + `log stream` (rewritten in place, so it stays root's)
+#    the seed's one boot job extended with a `log show --last 25s` loop every 20 s (rewritten in place, so it stays root's; a
+#    `log stream` stopped after its first 72 lines on 2026-11-11, while each `log show` exits and flushes)
 PIANO_EXTRA_KEXTS="$PWD/out/k27/kext/NativeSoftGpu.json" \
 PIANO_SEED=out/soft-metal/scratch-data.img PIANO_TRUST=out/soft-metal/kernel.macho.trustcache \
 PIANO_RESET_AFTER=300 PIANO_EXTRA_ARGS="exec-log=1 stderr-log=1" tooling/k27/build-native-image.sh
@@ -128,7 +136,8 @@ If it aborts again, the reporter says why, and that decides the next step:
 |---|---|---|
 | `uncaught NSInvalidArgumentException` + `reason: -[NativeSoftMetalDeviceObject ...]: unrecognized selector` | a selector outside both protocols | add it to `kValues`; the reason names it |
 | `uncaught ...` from SkyLight or QuartzCore with a Metal-sounding reason | a client wanted real GPU work | the `zero`/`forwarded` lines just before name the selector; decide whether it can be answered |
-| `SIGABRT` with `#3 libsystem_c.dylib+... abort` under `SkyLight+0x...` | a SkyLight assert; its text is in the os_log stream | read the `log stream` lines in the same console log |
+| `SIGABRT` with `#3 libsystem_c.dylib+... abort` under `SkyLight+0x...` | a SkyLight abort | its text is the `crash message (SkyLight)` line just above the stack; os_log has it too, but a plain `%s` there shows as `<private>` |
+| `crash message (SkyLight): Unimplemented pixel format of N used in WSCompositeDestinationCreateWithIOSurface.` | the software compositor was handed a framebuffer it cannot write (§8) | N as a four-char code: 1380411457 `'RGhA'`, 1647534392 `'b3a8'`, 1999908961 `'w40a'` (`'BGRA'` is 1111970369 and is accepted); see §8 for which lever |
 | `SIGSEGV` inside `Metal` or `IOGPU` | an `_MTLDevice` method ran on the uninitialized object | answer that selector ourselves (`kValues`) so the base class's never runs |
 | nothing from the reporter, WindowServer still dies | it was killed from outside, not aborting itself | look at `exec:`/`exit:` lines and the log stream |
 
@@ -155,3 +164,40 @@ WindowServer after the first aborts in SkyLight `WSCompositeDestinationCreateWit
 `WS::Displays::SLCADisplay::render_update` (`UpdateDisplays` ← `CGXUpdateDisplay` ← `update_display_callback`), a plain `abort()`
 (no exception). The os_log stream showed `Display 1 current mode (0 x 0) [0 0], preferred mode (0 x 0)` from CoreAnimation, then
 stopped after ~6 s (the `log` job's output). Next: the composite destination's requirements (texture from IOSurface? display mode?).
+
+## 8. The abort in WSCompositeDestinationCreateWithIOSurface (read 2026-11-11, macOS 26.6)
+
+`WSCompositeDestinationCreateWithIOSurface` has two ways to die:
+- `assert(surface != nullptr)`. That prints "Assertion failed" on stderr, which the run did not show, so it is not this one.
+- **An unsupported pixel format:** `asprintf("Unimplemented pixel format of %i used in %s.")`, logged with a plain `%s` (shown as
+  `<private>`), stored as SkyLight's crash-reporter message, then `abort()`. This matches the run.
+
+It takes only `'BGRA'`, `'RGBA'`, 32ARGB (0x20), `'RGfA'` (float32), `'R10k'`, `'b64a'` and `'l10r'`. The half-float `'RGhA'` and the
+10-bit `'b3a8'` and `'w40a'` all abort. The Metal compositor writes those through Metal textures (`WSCompositeDestinationCreateWithMetalTexture`).
+The software compositor goes through this function. So the fix is not in the device. `newTextureWithDescriptor:iosurface:plane:` is
+not on this path at all.
+
+The surface is the display's framebuffer, and Core Animation picks its format in `CA::WindowServer::IOMFBDisplay::framebuffer_pixel_format()`:
+- `'RGhA'` when debug option `CA_FORCE_FP16_FRAMEBUFFER` is on (26.6: option 124), or for a display with EDR headroom
+  (`Display::edr_headroom()` above a threshold), or with a display capability bit set;
+- `'w40a'` when `CA_FORCE_CIF10_FRAMEBUFFER` is on (125);
+- the 10-bit forms for HDR modes or a wide gamut (the ADT already says `artwork-display-gamut` sRGB);
+- else `'BGRA'`.
+
+NativeGopDisplay publishes one 8-bit SDR sRGB colour element, no luminance and no EDR properties (`SupportsPQEOTF` false). So the EDR
+branch is unlikely, and the likeliest source is `CA_FORCE_FP16_FRAMEBUFFER`. NativeGopDisplay's own comment ties `'RGhA'` to the
+ADT's `vmm-present`, which main must keep at 1 (with 0, watchdogd exits and launchd panics). This candidate therefore works inside
+WindowServer: it clears the two forcing options by name, sets `CAEnableDeepFramebuffer` false, and logs every debug option that is
+on. It also prints the crash message, which names the format.
+
+**Reading the next run:**
+- **No abort, and `first swap submitted`:** solved. The `CA option … cleared` line says which option it was.
+- **Abort, `crash message (SkyLight): Unimplemented pixel format of 1380411457 …`, and a `… cleared` line:** the format was decided
+  before the clear. The next lever is earlier: the option set before WindowServer runs.
+- **Same abort, no option on:** the EDR or capability branch decided it. The next lever is NativeGopDisplay (what makes
+  `edr_headroom()` nonzero or sets the bit). The log loop's Core Animation lines for the display ("current mode", brightness) are the
+  evidence to read.
+- **Another N:** use the table in §5.
+
+`Display 1 current mode (0 x 0)` was logged early, before any mode was set. It is a second thing to watch in the log loop. It is not
+the abort: that is decided by the format alone.
