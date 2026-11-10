@@ -6,7 +6,7 @@ D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
 K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
 LIST=$(sed -e 's/#.*//' configs/k27-native-kexts.txt | awk 'NF {print $1}')
 for k in $LIST; do   # the kexts' objects: tooling/k27/build-native-<name>.sh
-  case $k in ARMPlatformStandIn) b=standin ;; NativeUfs) b=ufs ;; NativeRamBlock) b=ram-block ;; NativeGopDisplay) b=gop-display ;; PianoDwc3) b=piano-dwc3 ;; *) b= ;; esac
+  case $k in ARMPlatformStandIn) b=standin ;; NativeUfs) b=ufs ;; NativeRamBlock) b=ram-block ;; NativeGopDisplay) b=gop-display ;; PianoDwc3) b=piano-dwc3 ;; PianoInput) b=piano-input ;; *) b= ;; esac
   [ -n "$b" ] || { echo "no build script for $k" >&2; exit 1; }
   tooling/k27/build-native-$b.sh > out/k27/build-native-$b.log 2>&1 || { grep -E "error:|Error" out/k27/build-native-$b.log | head; exit 1; }
 done

@@ -1,0 +1,45 @@
+PianoInput is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE) around one vendored class. What it takes from other work,
+and from where:
+
+macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM; local archive droidvm-build/macOS-DroidVM, branch el1/native-variant
+11ac316b789d81fc9f734e15645456f536c05141, read only), BSD-2-Clause-Patent (SPDX header of the file):
+  overlay/kext/DroidVMInput/DroidVMInput.cpp (sha256 f05d9d9912b1ae5b57000dcc49f6a4539410e5212c34b31aa4270e31cfac8afc)
+    Taken: the class DroidVMHIDDevice as PianoHIDDevice (PianoInput.cpp): an IOHIDDevice subclass with the same overrides
+    (newReportDescriptor, newTransportString, newManufacturerString, newProductString, newVendorIDNumber, newProductIDNumber,
+    newLocationIDNumber, newPrimaryUsagePageNumber, newPrimaryUsageNumber), set up under the driver's own service the same way
+    (OSTypeAlloc, init, attach, start), reports through handleReport from a polling kernel thread, and describe()'s bring-up log
+    of who is attached to the device's IOHIDInterface (and the user clients of its event service).
+    Changed: what each device says comes from HidReports.h's DeviceInfo table (one row now: the buttons); transport "SPMI";
+    the location ID; Built-In set on the buttons; a publish notification logs IOHIDEventDriver attaching.
+    Removed: the virtio-input transport and queues, the keyboard/mouse/tablet/touch kinds, the Apple multitouch protocol
+    (getReport/setReport feature reports, path frames, DefaultMultitouchProperties, displayUUID): the touch step takes those
+    from the same file. Not taken at all: hidToLinux (a table from Linux's drivers/hid/usbhid/usbkbd.c) and the QEMU report
+    descriptors.
+  overlay/kext/DroidVMInput.json (sha256 a9f25963fb0b17376ccd27a1cef6cc864d383789afc137d000bcaf06327a9843)
+    The shape of tooling/k27/kext/PianoInput.json: com.apple.iokit.IOHIDFamily 2.0.0 as a library, the codeless IOHIDEventDriver
+    personality on IOHIDInterface (probe score 3000; PianoInput's own VendorID/ProductID pair), and the vtable check (IOHIDDevice,
+    334 slots, slot 16 ignored).
+  The IOKit/hid headers are not copied: tooling/k27/build-native-piano-input.sh includes the k27 tree's out/x12377/inc-hid (the
+  headers DroidVMInput was built with), out/x12377/inc-gfx and out/x12377/storage-abi/include (TargetConditionals.h), read only.
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoDwc3/PianoDwc3.cpp at 7860af438e035b3a5035b243b84132bb9854a59c: the SPMI arbiter v7 reads (spmiApid, spmiRead:
+  version and count check, APID map, the EE 0 owner preferred, the observer channel's one-byte read) and the MMIO helpers (rd32,
+  wr32, mapRegion), re-expressed in SpmiObserver.h over an Io so tests/buttons_host.cpp runs them on a model.
+  patches/k27/0057: the arbiter's window layout as its comment states it.
+
+piano-uefi (unixnu-research/piano-uefi, branch unixnu 31545f9392d5f5c2acae14cec2fa3a0aa1de51d4)
+  uefi/pianoPkg/Library/KeypadDeviceLib/KeypadDeviceLib.c (BSD-2-Clause; sha256 2a5deaa1321d570b93e14d44273cdc50e61670d18e3ae5e26af18c322fba5586):
+  facts only: the key registers measured on this tablet (PON PPID 0x013 register 0x10 bits 7 and 6; GPIO PPID 0x18D register
+  0x10 bit 0, active low) and the owner check. Its key state machine (from Mu-Silicium's Samsung a7 KeypadDeviceLib) is not used.
+
+UniXNU-Odin3 (unixnu-research/UniXNU-Odin3, main 6d58c09d1529fb22dba8e3d6f74d8d4c7f9f8306) modules/Pagani/drivers/PaganiInput,
+BSD-2-Clause-Patent: Buttons.h (sha256 5779464dc110d411679f8ff2af9531b7222f2715489c355d8eb7f6d6393e561a) and Reports.h
+(sha256 2c3eec41d9108b7741ce66f3fe681f8794bc5913ba1eb41541d31c9fe65bbf31): the design of a polled buttons device (a consumer
+report of Power, Volume Increment and Volume Decrement; a 32 ms debounce in which an unreadable sample counts as all keys up).
+Re-implemented in Buttons.h and HidReports.h; its key polarities are the 13T's, not piano's.
+
+Not read and not used: GPL code. piano-uefi selector/keys.c and Project-SunUEFI PianoKeys.c (GPL-2.0-only), and Linux's PON,
+pwrkey and SPMI arbiter drivers (GPL-2.0). The register facts come from the BSD sources above and from
+droidvm-build/piano-patches/touch-native-plan.md section 3; the report descriptor from the HID 1.11 specification and the HID
+Usage Tables (consumer page 0x0C).
