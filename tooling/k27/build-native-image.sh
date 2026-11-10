@@ -15,7 +15,7 @@ python3 tooling/adt/make-piano-adt.py out/adt/piano-k27.adt --unique-chip-id "${
 mkdir -p out/k27/kext; NATIVE=
 for k in $LIST; do sed "s#@OUT@#$D/out#" "tooling/k27/kext/$k.json" > "out/k27/kext/$k.json"; NATIVE="$NATIVE $D/out/k27/kext/$k.json"; done
 NATIVE="$NATIVE ${PIANO_EXTRA_KEXTS:-}" \
-  tooling/kc/build-kc-k27.sh "${K27_KERNEL:-$K/out/k27/kernel-k27-0058-native.macho}" out/k27/kc-k27-native.bin > out/k27/build-kc.log 2>&1 || { tail -5 out/k27/build-kc.log; exit 1; }
+  tooling/kc/build-kc-k27.sh "${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}" out/k27/kc-k27-native.bin > out/k27/build-kc.log 2>&1 || { tail -5 out/k27/build-kc.log; exit 1; }
 # PIANO_TRUST / PIANO_SEED: another trust cache and Data seed for a test (e.g. tooling/k27/stage-soft-metal.py's, with a staged plugin).
 COMMON=(--fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-k27-native.bin --trust "${PIANO_TRUST:-out/inputs/kernel.macho.trustcache}"
         --seed "${PIANO_SEED:-out/inputs/scratch-data.img}" --adt "${PIANO_ADT:-out/adt/piano-k27.adt}" --utc "$(date +%s)")

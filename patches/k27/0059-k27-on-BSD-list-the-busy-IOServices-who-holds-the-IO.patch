@@ -1,0 +1,55 @@
+From 5de7b0daf0181a817910c5a36e04e96d12b04494 Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Wed, 11 Nov 2026 03:16:38 +0800
+Subject: [PATCH] k27: on !BSD, list the busy IOServices (who holds the IOBSD
+ matching up)
+
+Native runs have no debugger; the list goes to the console mailbox (pstore-console).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ iokit/bsddev/IOKitBSDInit.cpp | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index cafc29f..b74a093 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -782,6 +782,34 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		OSSafeReleaseNULL(service);
+ 	} else {
+ 		IOLog("!BSD\n");
++		/* k27 0059 (piano): who holds the IOBSD matching up. Every busy service, the leaves being the ones still in
++		 * start/matching: native runs have no debugger, this goes to the console mailbox. */
++		IORegistryIterator *busyIter = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
++		if (busyIter) {
++			unsigned shown = 0;
++			while (IORegistryEntry *entry = busyIter->getNextObject()) {
++				IOService *svc = OSDynamicCast(IOService, entry);
++				if (!svc || !svc->getBusyState()) {
++					continue;
++				}
++				IOService *parent = svc->getProvider();
++				IOLog("!BSD busy %u: %s (%s) under %s\n", (unsigned)svc->getBusyState(), svc->getName(),
++				    svc->getMetaClass()->getClassName(), parent ? parent->getName() : "-");
++				/* Its clients with their state (registered 1, matched 2, first publish 4, first match 8): one that has not
++				 * reached registered/matched is still in start(). */
++				if (OSIterator *kids = svc->getClientIterator()) {
++					while (IOService *kid = OSDynamicCast(IOService, kids->getNextObject())) {
++						IOLog("!BSD   client %s (%s) state %#x busy %u%s\n", kid->getName(), kid->getMetaClass()->getClassName(),
++						    (unsigned)kid->getState(), (unsigned)kid->getBusyState(), kid->isInactive() ? " inactive" : "");
++					}
++					kids->release();
++				}
++				if (++shown >= 80) {
++					break;
++				}
++			}
++			busyIter->release();
++		}
+ 	}
+ 	matching->release();
+ 	matching = NULL;
+-- 
+2.55.0
+
