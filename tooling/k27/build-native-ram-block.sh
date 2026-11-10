@@ -1,6 +1,6 @@
 #!/bin/bash
 # NativeRamBlock (the Data disk) for native piano: as macOS-DroidVM's scripts/build-native-ram-block.py (publish once IOResources has
-# matched IOBSD), but WITHOUT the VM's DroidVMDataStore.c: the changed pages go to NativeUfs's Data store window at the end of
+# matched IOBSD, and after NativeUfs's root layout), but WITHOUT the VM's DroidVMDataStore.c: the changed pages go to NativeUfs's Data store window at the end of
 # linux_rootfs (native_ufs_store_*, boot arg data-persist=2). The KC linker takes no weak imports, so the store hooks are plain imports
 # resolved against NativeUfs (tooling/k27/kext/NativeRamBlock.json lists it as a library).
 set -euo pipefail
@@ -16,6 +16,7 @@ old = '  registerService();\n  return true;\n'
 start = 'bool NativeRamBlock::start(IOService *provider)\n'
 assert text.count(old) == 1 and text.count(start) == 1, 'the end of start() changed'
 publish = '''#include <kern/thread.h>
+extern "C" int native_ufs_store_ready(void);   // NativeUfs
 // UniXNU-piano build-native-ram-block.sh (as macOS-DroidVM build-native-ram-block.py): publish once IOResources has matched IOBSD
 static void publishWhenBSDMatched(void *argument, wait_result_t)
 {
@@ -24,8 +25,12 @@ static void publishWhenBSDMatched(void *argument, wait_result_t)
     if (IOService *resources = IOService::waitForMatchingService(matching)) resources->release();
     matching->release();
   }
-  ram->registerService();
+  // UniXNU-piano: the store is part of NativeUfs's root layout: wait for it (60 s at most), open the store, then publish the disk,
+  // so APFS never reads Data before its changed pages are attached.
+  if (native_ufs_store_mode())
+    for (unsigned i = 0; i < 600 && !native_ufs_store_ready(); ++i) IOSleep(100);
   ram->attachStore();
+  ram->registerService();
   ram->release();
 }
 

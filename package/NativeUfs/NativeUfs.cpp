@@ -1575,6 +1575,14 @@ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const
   return ok;
 }
 
+// UniXNU-piano: NativeRamBlock publishes the Data disk from a thread that can run before the root layout is read; it waits on this
+// before opening its store. 1 ready, 0 root bring-up still running, -1 it failed (the store will never open).
+extern "C" int native_ufs_store_ready (void)
+{
+  if (gStoreGeometry.valid && gHost.ready) return 1;
+  return native_ufs_root_failure ? -1 : 0;
+}
+
 // Store window commands, in mach_absolute_time ticks: count and time of reads, writes and cache flushes, and the longest single call.
 extern "C" volatile uint64_t native_ufs_store_rd_ops = 0, native_ufs_store_rd_ticks = 0, native_ufs_store_wr_ops = 0,
                              native_ufs_store_wr_ticks = 0, native_ufs_store_sync_ops = 0, native_ufs_store_sync_ticks = 0,
