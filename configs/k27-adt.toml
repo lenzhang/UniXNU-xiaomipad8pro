@@ -52,7 +52,9 @@
 
 ["adt"."defaults"."u32"]
 "sleep-disabled" = 1
-"vmm-present" = 1
+# Natively 0 (2026-11-11; the VM had 1): measured, the same boot. The vma2 identity above (VirtualMac2,1, VMA2MACOS) stays: the
+# vma2 kernel collection's kexts match on it.
+"vmm-present" = 0
 "kern.maxvnodes" = 131456
 
 ["adt"."product"."string"]
