@@ -1,0 +1,41 @@
+{
+  "name": "PianoNullEthernet",
+  "bundle": "com.unixnu.driver.PianoNullEthernet",
+  "version": "1.0.0",
+  "objects": "@OUT@/native-kexts/PianoNullEthernet/objects.json",
+  "start": "_native_kext_start",
+  "stop": "_native_kext_stop",
+  "libraries": {
+    "com.apple.iokit.IONetworkingFamily": "1.0.0b1",
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  },
+  "personalities": {
+    "PianoNullEthernet": {
+      "CFBundleIdentifier": "com.unixnu.driver.PianoNullEthernet",
+      "IOClass": "PianoNullEthernet",
+      "IOProviderClass": "IOResources",
+      "IOResourceMatch": "IOBSD",
+      "IOMatchCategory": "PianoNullEthernet"
+    }
+  },
+  "patch_personalities": {
+    "com.apple.iokit.IOTimeSyncFamily": {
+      "IOTimeSyncRootService": {
+        "IOResourceMatch": "PianoNullEthernet"
+      }
+    }
+  },
+  "vtable": {
+    "class": "PianoNullEthernet",
+    "base": "IOEthernetController",
+    "base_kext": "com.apple.iokit.IONetworkingFamily",
+    "slots": 400,
+    "ignore_slots": [
+      16
+    ]
+  }
+}

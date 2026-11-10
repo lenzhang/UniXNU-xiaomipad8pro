@@ -11,7 +11,8 @@ errors.
 | Kext | Decision | Reason / evidence |
 |---|---|---|
 | NativeVirtioBlock | removed | virtio root disk; natively the root comes from NativeUfs |
-| DroidVMEthernet, DroidVMAudio, DroidVMVideo, DroidVMInput | removed | virtio devices, absent natively; SystemOS matches in 0.5–3.9 s without them instead of 4 s. (The 30 s `!BSD` stall first blamed on one of them was a NativeUfs/APFS race, fixed in NativeUfs: windows are published only after IOBSD has matched; k27 0059 showed it) |
+| DroidVMAudio, DroidVMVideo, DroidVMInput | removed | virtio devices, absent natively. (The 30 s `!BSD` stall first blamed on one of them was a NativeUfs/APFS race, fixed in NativeUfs: windows are published only after IOBSD has matched; k27 0059 showed it) |
+| DroidVMEthernet | removed, replaced | its virtio transport is absent natively, but its built-in null `en0` is needed: TimeSync derives its clock ID from a built-in interface's MAC, and without one clocksyncd never answers, so WindowServer and the login session never come up. `package/PianoNullEthernet` is that interface without virtio (measured: TimeSync clock created, logind, loginwindow and WindowServer start, the display is turned on) |
 | DroidVMGpu | removed | a stub accelerator natively: WindowServer read its MetalPluginName, its type-0x4147 opens failed with `kIOReturnBusy` (3 slots, one reserved for iOS's backboardd) and it crash-looped. The future GPU driver keeps its WindowServer-facing contract on Adreno830 (`droidvm-build/piano-patches/gpu-native-plan.md`) |
 | DroidVMDisplay | removed, replaced | its scanout is virtio; NativeGopDisplay (`package/NativeGopDisplay`) copies to the GOP framebuffer and now carries the `AppleParavirtGPU` nub itself |
 | NativeAES | removed | nothing reads it natively (no AppleKeyStore, Data unencrypted); measured the same boot without it |

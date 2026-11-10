@@ -9,3 +9,4 @@ NativeRamBlock       # the Data disk (RAM seed + changed pages in NativeUfs's st
 NativeGopDisplay     # the display: CPU copy into the GOP framebuffer, and its AppleParavirtGPU nub
 PianoDwc3            # USB device-mode debug channel (CDC-ACM console); inert without piano-usb=N
 PianoInput           # the buttons (power, vol-, vol+) as HID consumer keys; inert without piano-input=N
+PianoNullEthernet    # a built-in en0 without hardware: TimeSync (and so WindowServer) needs a built-in interface

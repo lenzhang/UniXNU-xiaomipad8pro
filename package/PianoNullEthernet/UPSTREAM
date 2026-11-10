@@ -1,0 +1,4 @@
+PianoNullEthernet.cpp: derived from macOS-DroidVM (local archive droidvm-build/macOS-DroidVM) overlay/kext/DroidVMEthernet.cpp at
+0855e2a (BSD-2-Clause-Patent, UniXNU-droidvm contributors): the IOEthernetController with no device behind it (fixed MAC, link up,
+packets dropped), the built-in interface and the TimeSync gate. Removed: the virtio-net transport. The MAC is piano's own made-up
+locally administered address.
