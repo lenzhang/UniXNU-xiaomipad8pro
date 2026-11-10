@@ -42,7 +42,8 @@ MKBOOTIMG_SHA256 = '37d84b3d162e0bc62e36c1f4e1c63c85ea0caa9f29be023eb2f8efe006ad
 V2 = ['--header_version', '2', '--pagesize', '4096', '--base', '0', '--kernel_offset', '0x00008000',
       '--ramdisk_offset', '0x01000000', '--tags_offset', '0x00000100', '--dtb_offset', '0x01f00000']
 # piano's keys reach UEFI but do not move UniXNU's menu (2026-11-10 22:37), so the macOS image boots its default on its own.
-MENU_TIMEOUT = int(os.environ.get('PIANO_MENU_TIMEOUT', '8'))
+# 5 s: the window in which tooling/native/native-loop.sh reads the previous run's log through the UEFI's debug fastboot.
+MENU_TIMEOUT = int(os.environ.get('PIANO_MENU_TIMEOUT', '5'))
 # 1 CPU (cpus=1) panicked in recount_switch_thread on the tablet (2026-11-10 22:41); the 8-CPU entry is the default.
 MENU_DEFAULT = os.environ.get('PIANO_MENU_DEFAULT', 'macos-8cpu')
 EPOCH = 1262304000  # UniXNU payload timestamps (2010-01-01)
@@ -63,7 +64,12 @@ K27_ARGS = ['-v', 'debug=0x14e', 'kt_fixed_zones=120', '-no_slto_panic', 'ml-tim
             # Unattended native runs (k27 0055/0056, docs/bringup-debugging.md): the console mirrored into cvp@9cb00000 (retained
             # across resets, unused by Ubuntu and the firmware; Ubuntu's ramoops zone is overwritten by the firmware's demura), a reset after PIANO_RESET_AFTER s (Gunyah watchdog as the backstop), and no panic-spin, so a panic restarts
             # (PSCI) and the tablet always comes back to Ubuntu with the log in /sys/fs/pstore/console-ramoops-0.
-            'pstore-console=0x9cb00000', 'pstore-console-size=0x700000', 'piano-reset-after=' + os.environ.get('PIANO_RESET_AFTER', '50')]
+            'pstore-console=0x9cb00000', 'pstore-console-size=0x700000', 'piano-reset-after=' + os.environ.get('PIANO_RESET_AFTER', '45'),
+            # every reset of the run lands in ABL fastboot (k27 0057: PMIC SDAM restart reason), not in the installed OS
+            'piano-reset-to=bootloader',
+            # Root from UFS (package/NativeUfs): the SHNGROOT windows OS/SystemOS in linux_rootfs, read only, unverified
+            # build (no NATIVE_VERIFIED_BLOCK: development tablet); diagnostics in the console log.
+            'native-ufs-root=1', 'native-ufs-diagnostics=1']
 
 
 def sha(path):

@@ -1,0 +1,33 @@
+{
+  "name": "NativeUfs",
+  "bundle": "com.unixnu.driver.NativeUfs",
+  "version": "1.0.0",
+  "objects": "out/x12377/native-kexts/NativeUfs/objects.json",
+  "start": "_native_kext_start",
+  "stop": "_native_kext_stop",
+  "libraries": {
+    "com.apple.iokit.IOStorageFamily": "1.0.0",
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.private": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  },
+  "personalities": {
+    "NativeUfsRoot": {
+      "CFBundleIdentifier": "com.unixnu.driver.NativeUfs",
+      "IOClass": "NativeUfs",
+      "IOProviderClass": "IOPlatformExpertDevice",
+      "IOProbeScore": 1000,
+      "IOMatchCategory": "NativeUfsRoot"
+    }
+  },
+  "vtable": {
+    "class": "NativeUfsBlock",
+    "base": "IOBlockStorageDevice",
+    "base_kext": "com.apple.iokit.IOStorageFamily",
+    "slots": 326,
+    "ignore_slots": [16]
+  }
+}
