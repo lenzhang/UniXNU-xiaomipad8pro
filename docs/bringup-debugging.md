@@ -53,6 +53,11 @@ Measured 2026-11-10:
   the ring is stored 11 times, and the reader takes the bitwise majority (residual ~2e-6 per bit).
 - A hard power-off (power + volume-down) loses everything.
 
+**Live, over the USB-C cable** (not yet run on the tablet): with `piano-usb=2` in the image's arguments, `package/PianoDwc3`
+takes the USB controller over in device mode once XNU runs; the USB timeline then continues with `1209:0001 piano macOS debug`
+(two CDC-ACM ports). `tooling/native/usb-console.py` on the Mac shows the console live (the retained log first) and talks to
+a small kernel monitor. Design, levels and test steps: `docs/drivers/usb-device-debug.md`.
+
 **Getting back on its own:** k27 patch 0056 (`piano-reset-after=<s>`) resets through PSCI after N seconds and pets the
 Gunyah watchdog until then (bite 32 s after the last pet: the backstop for hangs and panics). The panic path restarts by
 itself when `panic-spin=1` is absent.

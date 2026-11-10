@@ -1,0 +1,25 @@
+PianoDwc3 is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). What it takes from other work, and from where:
+
+Project-SunUEFI 4ef87402e9d58465af871e4c4f4a5de87599d81c (unixnu-research/Project-SunUEFI; files BSD-2-Clause-Patent)
+  uefi/core/PianoDwc3Device.c  piano-measured DWC3 takeover order and values: PHY interfaces woken before DCTL.CSFTRST, the
+                               DWC_usb31/32 reset timing (20 ms steps, 200 ms, 50 ms settle), GCTL device | DSBLCLKGTNG,
+                               DCFG NUMP 16, DEPSTARTCFG + one transfer resource per endpoint, the QSCRATCH session override
+                               (0x0A6F8810 | 0x10100000, 0x0A6F8830 | 0x01000000) before RUN_STOP, DCFG.DevAddr written in the
+                               SETUP stage of SET_ADDRESS, END TRANSFER with ForceRM and the 1 ms wait. Re-implemented, not copied.
+  uefi/core/PianoUsbPhy.c      the M31 eUSB2 PHY init writes (PianoUsbHw.h kM31Init, piano-usb-phy=1) and the byte-wide
+                               register note; the order of the PHY reset.
+  docs/archive/storage-usb/usb-link-audit.md   the piano measurements cited in docs/drivers/usb-device-debug.md.
+
+QcomDwc3 e4efe95c903a737e0f5955e5b50a8fb4d2a7d718 (unixnu-research/QcomDwc3)
+  QcomDwc3.cpp (BSD-2-Clause-Patent): the SPMI v7 observer-read pattern for the eUSB2 repeater (SID 7, 0xfd), the GDSC enable
+  shape (SW_COLLAPSE off, RETAIN_FF on), the coherence note (bypass leaves the master non-coherent). Re-implemented.
+  NOT used: QcomEusb2Phy.h, QcomQmpUsb3.h (GPL-2.0-only), and its AppleUSBXDCI/AppleUSBXHCI subclasses (no such classes in the
+  macOS 27.0.1 VM kernel collection).
+
+UniXNU-sm8750-common feaa135df4763e3c19a155402e6b17b124a12e13 kits/Sm8750Platform/SmmuTakeover.h (BSD-2-Clause-Patent)
+  SmmuStream.h follows its bypass-bank shape (SCTLR 0, CBA2R VA64, CBAR 0x10000), its geometry checks and the global TLB sync
+  with a non-zero value. Written anew for SID 0x40 (redirect/keep of an existing exact entry, no panic).
+
+Specifications only (no code or text copied): mainline Linux drivers/usb/dwc3 (core.h, gadget.c, ep0.c, dwc3-qcom.c),
+drivers/clk/qcom/gcc-sm8750.c and tcsrcc-sm8750.c (register offsets), the piano DT (out/inputs/piano-boot.dtb), the USB 2.0,
+IAD and CDC 1.2 / PSTN specifications, ARM IHI 0062 (SMMUv2). Mu-Silicium's SamsungPkg UsbfnDwc3Dxe (Linux-derived) was not read.

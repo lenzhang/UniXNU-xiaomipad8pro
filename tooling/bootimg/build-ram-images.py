@@ -113,7 +113,7 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     shutil.copyfile(trust, payloads / 'kernel.macho.trustcache')
     shutil.copyfile(seed, payloads / 'scratch-data.img')
     shutil.copyfile(adt, payloads / 'kernel.macho.adt')
-    # PIANO_EXTRA_ARGS: more kernel arguments for a test image (e.g. native-gop-display=1, docs/drivers/native-gop-display.md).
+    # PIANO_EXTRA_ARGS: more kernel arguments for one test image (e.g. piano-usb=2, docs/drivers/usb-device-debug.md).
     base = K27_ARGS + [f'droidvm-utc={utc}'] + os.environ.get('PIANO_EXTRA_ARGS', '').split()
     one = ' '.join(base + ['cpus=1'])
     smp = ' '.join(base + ['sheng-smp=1'])

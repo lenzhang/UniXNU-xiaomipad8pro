@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- UniXNU-piano development tablets only: an unauthenticated root shell on PianoDwc3's USB port 1 (/dev/pianousb, kernel
+     boot argument piano-usb-shell=1). Install as /Library/LaunchDaemons/com.unixnu.pianousb-shell.plist (root:wheel 644) with
+     the binary at /usr/local/libexec/pianousb-shell (docs/drivers/usb-device-debug.md section 6). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.unixnu.pianousb-shell</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/libexec/pianousb-shell</string>
+    <string>/dev/pianousb</string>
+    <string>/bin/zsh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardErrorPath</key><string>/var/log/pianousb-shell.log</string>
+</dict>
+</plist>

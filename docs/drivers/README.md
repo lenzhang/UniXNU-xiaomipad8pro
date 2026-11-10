@@ -14,6 +14,7 @@ hardware.** Hardware tests start after M2 (XNU RAM boot) or M3 (UFS), always wit
 | 3 | [touch.md](touch.md) | NT36532E over GENI SPI (+ keyboard cover note) | login by touch (keyboard cover is the fallback) | `ShengNovatekTouch` + `QcomGeniSpi` |
 | 4 | [charging.md](charging.md) | power source / charger policy / gauges | any native session longer than the battery | UniXNU-sheng power records, Project-SunUEFI power work |
 | 5 | [gpu.md](gpu.md) | Adreno 830 KMD + Metal glue | GPU-composited desktop (M5) | `Adreno830` + `Sm8750Platform` + `AdrenoMetal` (13T Metal desktop) |
+| – | [usb-device-debug.md](usb-device-debug.md) | `PianoDwc3`: DWC3 device mode, two CDC-ACM ports (live kernel console + monitor, user pipe) | none (debugging aid for all of the above) | own gadget core; takeover order from Project-SunUEFI's piano DWC3 driver (Apple's XDCI class is not in the macOS KC) |
 
 Not covered yet (plan §4(d).6, later): Wi-Fi (`Ath12kWifi`), Bluetooth (`QcaBluetooth`), audio, sensors, keyboard
 cover as its own page (touched on in `touch.md`).
