@@ -1,0 +1,115 @@
+From f8eedf409ca2efaccb46527ef66c80420c4343d9 Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Tue, 10 Nov 2026 23:53:29 +0800
+Subject: [PATCH] k27: piano-reset-to=bootloader: the PMIC SDAM restart reason
+ set at boot, so every reset lands in ABL fastboot
+
+SPMI PMIC arbiter v7 (SM8750), SID 0 SDAM byte 0x48, reason 2 (bits 1-7). Used by unattended native runs without Ubuntu.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ osfmk/arm64/machine_routines.c | 81 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 9417e07..b839b2e 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1015,6 +1015,80 @@ piano_reset_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unuse
+ 	thread_call_enter_delayed(piano_reset_call, deadline);
+ }
+ 
++/*
++ * k27 0057: piano-reset-to=bootloader. ABL boots the installed OS after a reset unless the PMIC restart reason says
++ * otherwise; that reason is byte 0x48 of the SID 0 SDAM peripheral (PPID 0x071), bits 1-7 (2 = bootloader), bit 0 kept.
++ * It is written once at EARLY_BOOT through the SPMI PMIC arbiter (v7 on SM8750: version/count at 0x0C400000, APID map at
++ * +0x2000 with the PPID in bits 19:8, owner table at 0x0C42D000 with the APPS EE = 0, observer channels at 0x0C440000 +
++ * 0x20 * APID for reads, read/write channels at 0x0C500000 + 0x1000 * APID; command = opcode << 27 | offset << 4 | (n - 1),
++ * status bit 0 done, bits 1-3 error). So every later reset of this boot (the timed one, a panic restart, a watchdog bite)
++ * lands in ABL fastboot, where the next RAM image is waiting. Written for XNU from those register facts (the behaviour of
++ * Linux's spmi-pmic-arb and of piano-uefi's selector, read as the specification only).
++ */
++#define SPMI_CORE       0x0C400000ULL
++#define SPMI_CNFG       0x0C42D000ULL
++#define SPMI_OBSV       0x0C440000ULL
++#define SPMI_CHNL       0x0C500000ULL
++#define SDAM_PPID       0x071u
++#define SDAM_REASON     0x48u
++
++static bool
++piano_spmi_wait(volatile uint32_t *status)
++{
++	for (int i = 0; i < 100000; i++) {
++		uint32_t st = status[0];
++		if (st & 1) {
++			return (st & 0xe) == 0;
++		}
++	}
++	return false;
++}
++
++static int
++piano_set_restart_reason(uint8_t reason)
++{
++	volatile uint32_t *core = (volatile uint32_t *)ml_io_map(SPMI_CORE, 0x3000);
++	volatile uint32_t *cnfg = (volatile uint32_t *)ml_io_map(SPMI_CNFG, 0x1000);
++	if (core == NULL || cnfg == NULL) {
++		return -1;
++	}
++	uint32_t version = core[0], count = core[1] & 0x7ff;
++	if ((version >> 28) != 7 || count == 0 || count > 1024) {
++		return -2;
++	}
++	uint32_t apid = count;
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t map = core[(0x2000 >> 2) + i];
++		if (map != 0 && ((map >> 8) & 0xfff) == SDAM_PPID && (cnfg[i] & 7) == 0) {
++			apid = i;
++			break;
++		}
++	}
++	if (apid == count) {
++		return -3;
++	}
++	vm_offset_t obsv_page = ml_io_map((SPMI_OBSV + 0x20ULL * apid) & ~0xfffULL, 0x1000);
++	volatile uint32_t *obsv = (volatile uint32_t *)(obsv_page + ((0x20ULL * apid) & 0xfff));
++	volatile uint32_t *chnl = (volatile uint32_t *)ml_io_map(SPMI_CHNL + 0x1000ULL * apid, 0x1000);
++	if (obsv_page == 0 || chnl == NULL) {
++		return -4;
++	}
++	obsv[0] = (1u << 27) | (SDAM_REASON << 4);             /* read 1 byte */
++	if (!piano_spmi_wait(&obsv[2])) {
++		return -5;
++	}
++	uint8_t old = (uint8_t)obsv[6];
++	chnl[4] = (uint32_t)((old & 1) | (uint8_t)(reason << 1));
++	chnl[0] = (0u << 27) | (SDAM_REASON << 4);              /* write 1 byte */
++	if (!piano_spmi_wait(&chnl[2])) {
++		return -6;
++	}
++	obsv[0] = (1u << 27) | (SDAM_REASON << 4);
++	(void)piano_spmi_wait(&obsv[2]);
++	printf("piano-reset-to: SDAM restart reason 0x%02x -> 0x%02x (APID %u)\n", old, (uint8_t)obsv[6], apid);
++	return 0;
++}
++
+ static void
+ piano_reset_init(void)
+ {
+@@ -1023,6 +1097,13 @@ piano_reset_init(void)
+ 		return;
+ 	}
+ 	piano_reset_after_ns = (uint64_t)secs * NSEC_PER_SEC;
++	char to[16] = "";
++	if (PE_parse_boot_argn("piano-reset-to", to, sizeof(to)) && strcmp(to, "bootloader") == 0) {
++		int err = piano_set_restart_reason(2);
++		if (err != 0) {
++			printf("piano-reset-to: SDAM write failed (%d); resets return to the installed OS\n", err);
++		}
++	}
+ 	if ((int64_t)piano_smc(GH_WDT_STATUS, 0, 0) >= 0 &&
+ 	    (int64_t)piano_smc(GH_WDT_SET_TIME, 30000, 32000) == 0 && (int64_t)piano_smc(GH_WDT_CONTROL, 3, 0) == 0) {
+ 		piano_wdt_armed = true;
+-- 
+2.55.0
+
