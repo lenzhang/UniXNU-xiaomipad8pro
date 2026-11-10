@@ -18,6 +18,11 @@ struct UfsRootDiagnostics {
   uint32_t smmuId2 = 0, cba2r = 0, uic[5] = {};
   uint32_t smmuId1 = 0, smmuSlot = 0xffffffff;
   uint32_t publicationPhase = 0, publicationWindow = 0xffffffff;
+  uint64_t waitTicks = 0, elapsedTicks = 0;
+  uint32_t counterHz = 0, counterControl = 0, dmaOcs = 0xff, dmaResponse = 0;
+  uint32_t ie = 0, iacrBefore = 0, iacr = 0, memcfg = 0, tlbStatus = 0xffffffff;
+  uint32_t txBefore = 0xffffffff, txAfter = 0xffffffff, linkCommand = 0;
+  uint32_t linkResult = 0xffffffff, linkStatus = 0, linkAhit = 0;
 };
 
 static inline int formatUfsRootDiagnostics(char *buffer, size_t capacity,
@@ -31,9 +36,12 @@ static inline int formatUfsRootDiagnostics(char *buffer, size_t capacity,
     "CMD n=%u type=%02x op=%02x lun=%02x ocs=%02x rsp=%08x scsi=%04x power=%02x\n"
     "PROTOCOL reject=%u residual=%u sense=%06x SMMU slot=%u id1=%x\n"
     "QUEUE rsr=%x ahit=%x polls=%u dbSeen=%x isSeen=%x isBefore=%x contiguous=%llx\n"
+    "WAIT ticks=%llx/%llx hz=%x cntkctl=%x DMA ocs=%x rsp=%08x\n"
+    "PATH ie=%x iacr=%x->%x memcfg=%x tlb=%x\n"
+    "LINK tx=%x->%x cmd=%x rc=%x is=%x ahitBefore=%x\n"
     "FAULT global=%x->%x syn=%x cb=%x->%x syn=%x far=%llx id2=%x cba2r=%x\n"
     "UIC pa=%08x dl=%08x net=%08x tr=%08x dme=%08x\n"
-    "GPT/read lba=%llx userdata=%llx..%llx magic=%08x %08x manifest=%u\n"
+    "GPT/read lba=%llx partition=%llx..%llx magic=%08x %08x manifest=%u\n"
     "WINDOWS found=%u prepared=%u published=%u bytes=%llx policies=%llu verify=%08x\n"
     "IO reads=%llu failures=%llu pubPhase=%u window=%u\n",
     title, reason, d.stage, d.result, d.cap, d.version, d.hcs, d.hce, d.doorbell, d.interrupt,
@@ -41,6 +49,10 @@ static inline int formatUfsRootDiagnostics(char *buffer, size_t capacity,
     d.command, d.type, d.opcode, d.lun, d.ocs, d.response, d.scsi, d.power,
     d.protocol, d.residual, d.sense, d.smmuSlot, d.smmuId1,
     d.runStop, d.ahit, d.polls, d.dbSeen, d.isSeen, d.isBefore, (unsigned long long)d.contiguous,
+    (unsigned long long)d.elapsedTicks, (unsigned long long)d.waitTicks,
+    d.counterHz, d.counterControl, d.dmaOcs, d.dmaResponse,
+    d.ie, d.iacrBefore, d.iacr, d.memcfg, d.tlbStatus,
+    d.txBefore, d.txAfter, d.linkCommand, d.linkResult, d.linkStatus, d.linkAhit,
     d.gfsrBefore, d.gfsr, d.gsyn, d.fsrBefore, d.fsr, d.fsyn, (unsigned long long)d.far,
     d.smmuId2, d.cba2r, d.uic[0], d.uic[1], d.uic[2], d.uic[3], d.uic[4],
     (unsigned long long)d.lba, (unsigned long long)d.first, (unsigned long long)d.last,

@@ -1,1 +1,5 @@
 b11de87c234cf4b8f80a8160fb15e6f37a8e5d0c fix: report unmatched media below a window volume
+
+UniXNU-Odin3 6d58c09 (modules/Pagani/drivers/NativeUfs, BSD-2, blu-sharky): RootQueue.h (SM8750 link handling: MCQ guard,
+auto-hibernate off, Hibern8 exit, interrupt aggregation off) and RootDiagnostics.h (its extra fields), taken whole; RootQueue.h
+keeps ShengUfs's gUtrlPhys request-list address.

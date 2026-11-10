@@ -1,0 +1,69 @@
+From e5697adda201c4e90ba9068a97d7003ab5636ce1 Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Wed, 11 Nov 2026 00:34:52 +0800
+Subject: [PATCH] k27: pstore-console header stored 11 times too ("DBGR")
+
+One decayed bit of the single size word cut the log's last 128 bytes (2026-11-11). The 256-byte header now holds the
+signature and 11 {start, size} pairs; the reader takes their bitwise majority, as for the ring.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ osfmk/console/serial_console.c | 23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index f683e9f..07fd9f0 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -534,13 +534,14 @@ console_resume()
+ 
+ /*
+  * piano (k27 0055): pstore-console=<phys> [pstore-console-size=<bytes>, default 2 MiB; piano runs use 7 MiB, the whole cvp region] mirrors every console byte into a
+- * RAM mailbox that survives a reset (piano: cvp@9cb00000, read back from Ubuntu with /dev/mem): a 12-byte header
+- * ("DBGB" signature, start, size) and the ring 11 times over (bitwise majority against DRAM bit decay). Ubuntu's own
++ * RAM mailbox that survives a reset (piano: cvp@9cb00000, read back from Ubuntu with /dev/mem): a 256-byte header
++ * ("DBGR" signature, then {start, size} 11 times) and the ring 11 times over (bitwise majority against DRAM bit decay). Ubuntu's own
+  * ramoops zone does not work on piano (the firmware rewrites it each boot). A native boot leaves its log without a UART. Output before the mapping exists is kept in a static buffer
+  * and copied in when console_pstore_init() runs (PE_init_platform, VM initialized). No boot arg: nothing changes.
+  */
+-#define PSTORE_SIG              0x42474244u     /* "DBGB": the DBGC layout with the ring stored PSTORE_COPIES (11) times */
++#define PSTORE_SIG              0x52474244u     /* "DBGR": header and ring both stored PSTORE_COPIES (11) times */
+ #define PSTORE_COPIES           11u
++#define PSTORE_HDR_BYTES        256u            /* sig, then PSTORE_COPIES {start, size} pairs at word 4 + 2k; data after */
+ #define PSTORE_EARLY_BYTES      (32u * 1024u)
+ static volatile uint32_t *console_pstore_hdr;   /* [0] sig, [1] start, [2] size, then data */
+ static volatile uint8_t *console_pstore_data;
+@@ -573,8 +574,11 @@ console_pstore_put(const char *str, int size)
+ 		}
+ 	}
+ 	uint64_t total = at + (uint64_t)size;
+-	console_pstore_hdr[1] = (uint32_t)(total % console_pstore_cap);
+-	console_pstore_hdr[2] = (uint32_t)(total < console_pstore_cap ? total : console_pstore_cap);
++	/* The header decays like the ring (2026-11-11: one flipped bit of the size cut the log's tail): PSTORE_COPIES copies. */
++	for (uint32_t k = 0; k < PSTORE_COPIES; k++) {
++		console_pstore_hdr[4 + 2 * k] = (uint32_t)(total % console_pstore_cap);
++		console_pstore_hdr[5 + 2 * k] = (uint32_t)(total < console_pstore_cap ? total : console_pstore_cap);
++	}
+ 	__builtin_arm_dsb(0xf);
+ }
+ 
+@@ -598,11 +602,12 @@ console_pstore_init(void)
+ 		console_pstore_wanted = false;
+ 		return;
+ 	}
+-	console_pstore_cap = ((uint32_t)bytes - 16) / PSTORE_COPIES;  /* data = PSTORE_COPIES copies of the ring after the header */
+-	console_pstore_data = (volatile uint8_t *)(va + 12);
++	console_pstore_cap = ((uint32_t)bytes - PSTORE_HDR_BYTES) / PSTORE_COPIES;  /* data = PSTORE_COPIES copies of the ring after the header */
++	console_pstore_data = (volatile uint8_t *)(va + PSTORE_HDR_BYTES);
+ 	console_pstore_total = 0;
+-	((volatile uint32_t *)va)[1] = 0;
+-	((volatile uint32_t *)va)[2] = 0;
++	for (uint32_t w = 1; w < PSTORE_HDR_BYTES / 4; w++) {
++		((volatile uint32_t *)va)[w] = 0;
++	}
+ 	((volatile uint32_t *)va)[0] = PSTORE_SIG;
+ 	__builtin_arm_dsb(0xf);
+ 	console_pstore_hdr = (volatile uint32_t *)va;
+-- 
+2.55.0
+

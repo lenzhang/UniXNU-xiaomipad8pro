@@ -5,8 +5,8 @@
 #   -> the menu starts XNU -> piano-reset-after resets the tablet -> k27 0057 set the PMIC restart reason, so ABL stays in
 #   fastboot -> next round. RAM boots only; nothing is written to any partition.
 #   tooling/native/native-loop.sh IMAGE [ROUNDS]      (start with the tablet in ABL fastboot, or Ubuntu up)
-# Logs: logs/native-runs/<ts>-loop/round-N/{xnu-console.txt,dump.bin,usb.log}. ROUNDS (default 1) XNU runs, then one more
-# boot of IMAGE only to read the last log, after which the tablet is sent back with `fastboot -s piano-uefi reboot`.
+# Logs: logs/native-runs/<ts>-loop/round-N/{xnu-console.txt,dump.bin,usb.log}. ROUNDS (default 1) XNU runs whose logs are read, plus one
+# more run; the tablet always ends parked in ABL fastboot.
 set -euo pipefail
 IMG=$(cd "$(dirname "$1")" && pwd)/$(basename "$1"); ROUNDS=${2:-1}
 D=$(cd "$(dirname "$0")/../.." && pwd)
@@ -40,8 +40,11 @@ for r in $(seq 0 "$ROUNDS"); do
     else log "round $r: $(cat "$R/reader.txt")"; fi
   else log "round $r: dump failed (menu window missed?)"; fi
   if [ "$r" = "$ROUNDS" ]; then
-    log "last round: sending the tablet back (fastboot -s piano-uefi reboot)"
-    fastboot -s piano-uefi reboot > /dev/null 2>&1 || true
+    # Ubuntu's root is gone (linux_rootfs holds the macOS root): instead of a normal reboot the last round's XNU runs too and
+    # resets into ABL fastboot (k27 0057), where the tablet waits for the next loop; its log is read by that loop's round 0.
+    log "last round: XNU runs again and parks the tablet in ABL fastboot"
+    wait_for "eval ! uefi" 30 || true
+    wait_for abl 240 && log "parked in ABL fastboot" || log "not back in ABL fastboot within 240 s"
     break
   fi
   wait_for "eval ! uefi" 30 || true

@@ -42,6 +42,13 @@ extern const uint8_t verified_root_key[];
 #include "SmmuTakeover.h"
 
 static UfsRootDiagnostics gRootDiagnostic;
+// UniXNU-piano: every bring-up stage also goes to the console (the native-run log mailbox), so a stall shows where it is.
+static inline void rootStage (const char *stage)
+{
+  gRootDiagnostic.stage = stage;
+  IOLog ("NativeUfs: stage %s\n", stage);
+}
+
 static bool gRootDiagnosticEnabled;
 static void rootDiagnosticFailure (const char *reason);
 
@@ -400,12 +407,35 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
   if (!smmu) {
     panic ("NATIVE_UFS smmu: map failed");
   }
+#if defined(NATIVE_UFS_SM8750) && NATIVE_UFS_SM8750
+  // UniXNU-piano: piano's firmware leaves SID 0x60's exact entry (mask 0) on translation bank 1 (s2cr 1, 2026-11-11); the planner
+  // accepts only PKX110's bank 0 (s2cr 0) for it. Present piano's entry as that one, so it is redirected to the bypass bank the same way.
+  auto planRead = [smmu, stream](unsigned offset) {
+    uint32_t value = read32 (smmu, offset);
+    if (stream == 0x60 && offset >= 0xc00 && offset < 0xe00 && (value & ~0xffU) == 0 &&
+        read32 (smmu, 0x800 + (offset - 0xc00)) == 0x80000060U) {
+      static bool logged;
+      if (!logged && value) {
+        const unsigned pages = 1U << (((read32 (smmu, 0x24) >> 28) & 7) + 1);
+        IOLog ("NativeUfs: SID 0x60 found on bank %u (sctlr %x cbar %x cba2r %x); redirecting it\n", value, read32 (smmu, (pages + value) * 4096),
+               read32 (smmu, 0x1000 + 4 * value), read32 (smmu, 0x1800 + 4 * value));
+        logged = true;
+      }
+      return 0U;
+    }
+    return value;
+  };
+  UfsSmmuPlan plan = planUfsSmmu (stream, dma, bytes, planRead);
+#else
   UfsSmmuPlan plan = planUfsSmmu (stream, dma, bytes, [smmu](unsigned offset) { return read32 (smmu, offset); });
+#endif
   gRootDiagnostic.smmuId1 = read32 (smmu, 0x24);
   gRootDiagnostic.smmuId2 = read32 (smmu, 0x28);
   gRootDiagnostic.smmuSlot = plan.slot;
   if (plan.error) {
-    gRootDiagnostic.stage = "SMMU planning";
+    rootStage ("SMMU planning");
+    IOLog ("NativeUfs: SMMU plan for stream %#x: %s (slot %u smr %x s2cr %x idr0 %x idr1 %x)\n", stream, plan.error, plan.slot,
+           plan.smr, plan.s2cr, read32 (smmu, 0x20), read32 (smmu, 0x24));
     gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnNotReady);
     gRootDiagnostic.smr = plan.smr; gRootDiagnostic.s2cr = plan.s2cr;
     rootDiagnosticFailure (plan.error);
@@ -436,12 +466,14 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
 #endif
   uint32_t smr = read32 (smmu, 0x800 + 4 * index), s2cr = read32 (smmu, 0xc00 + 4 * index);
   uint32_t cbar = read32 (smmu, 0x1000 + 4 * bank), sctlr = read32 (cb, 0x0);
+  IOLog ("NativeUfs: SMMU stream %#x -> slot %u bank %u: smr %x s2cr %x cbar %x sctlr %x%s%s\n", stream, index, bank, smr, s2cr, cbar, sctlr,
+         failure ? ": " : "", failure ? failure : "");
   gRootDiagnostic.smr = smr; gRootDiagnostic.s2cr = s2cr;
   gRootDiagnostic.cbar = cbar; gRootDiagnostic.sctlr = sctlr;
   gRootDiagnostic.smmuId2 = read32 (smmu, 0x28);
   gRootDiagnostic.cba2r = read32 (smmu, 0x1800 + 4 * bank);
   if (failure) {
-    gRootDiagnostic.stage = "SMMU readback";
+    rootStage ("SMMU readback");
     gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnNotReady);
     rootDiagnosticFailure (failure);
     panic ("NATIVE_UFS smmu: %s idx=%u bank=%u cba2r=%x", failure, index, bank,
@@ -1178,19 +1210,40 @@ static bool hostBringUp (const char **why)
   if (gHost.ready) {
     return true;
   }
-  gRootDiagnostic.stage = "controller map";
+#if defined(NATIVE_UFS_SM8750) && NATIVE_UFS_SM8750
+  // UniXNU-piano: never touch the controller with its power domain or bus clocks off (a stalled bus access hangs the CPU).
+  {
+    rootStage ("GCC power and clocks");
+    OSSharedPtr<IOMemoryMap> gccMap;
+    uintptr_t gcc = mapPhys (GCC_BASE + 0x77000, 0x1000, gccMap);
+    if (!gcc) {
+      *why = "GCC map";
+      return false;
+    }
+    uint32_t gdsc = read32 (gcc, GCC_UFS_PHY_GDSCR - 0x77000), axi = read32 (gcc, GCC_UFS_PHY_AXI_ENABLE - 0x77000);
+    uint32_t ahb = read32 (gcc, GCC_UFS_PHY_AHB_ENABLE - 0x77000), aggre = read32 (gcc, GCC_AGGRE_UFS_PHY_AXI_ENABLE - 0x77000);
+    IOLog ("NativeUfs: GCC gdsc=%08x axi=%08x ahb=%08x aggre=%08x\n", gdsc, axi, ahb, aggre);
+    if (!ufsBusClocksOn (gdsc, axi, ahb, aggre)) {
+      *why = "UFS power/clocks off after the firmware; cold initialization required";
+      return false;
+    }
+  }
+#endif
+  rootStage ("controller map");
   gHost.hc = mapPhys (UFS_HC_BASE, UFS_HC_SIZE, gHost.hcMap);
   if (!gHost.hc) {
     *why = "controller map";
     return false;
   }
+  IOLog ("NativeUfs: HC cap=%08x ver=%08x hcs=%08x hce=%08x is=%08x\n", read32 (gHost.hc, 0x00), read32 (gHost.hc, 0x08),
+         read32 (gHost.hc, 0x30), read32 (gHost.hc, 0x34), read32 (gHost.hc, 0x20));
   if (gRootDiagnosticEnabled) {
     gRootDiagnostic.cap = read32 (gHost.hc, 0x00);
     gRootDiagnostic.version = read32 (gHost.hc, 0x08);
     gRootDiagnostic.hcs = read32 (gHost.hc, 0x30);
     gRootDiagnostic.hce = read32 (gHost.hc, 0x34);
   }
-  gRootDiagnostic.stage = "DMA allocation";
+  rootStage ("DMA allocation");
   // All kSlots command slots when the region is physically contiguous and addressable, else slot 0's original layout alone. The
   // request list must also have entries for them (CAP.NUTRS, entries 0, 2, ...).
   const bool wide = read32 (gHost.hc, 0) & 0x01000000;
@@ -1203,6 +1256,7 @@ static bool hostBringUp (const char **why)
   for (unsigned attempt = 0; attempt < 3 && !gHost.virt; ++attempt) {
     const uint32_t bytes = sizes[attempt];
     if (counts[attempt] > slots && counts[attempt] > 1) continue;
+    IOLog ("NativeUfs: DMA attempt %u: %u bytes (slots %u, wide %d)\n", attempt, bytes, slots, wide);
     IOBufferMemoryDescriptor *dma = IOBufferMemoryDescriptor::inTaskWithOptions (
       kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
       static_cast<IOOptionBits> (kIOMemoryMapperNone),
@@ -1211,6 +1265,7 @@ static bool hostBringUp (const char **why)
     uint8_t *virt = static_cast<uint8_t *> (dma->getBytesNoCopy ());
     IOByteCount contiguous = 0;
     uint64_t phys = dma->getPhysicalSegment (0, &contiguous, kIOMemoryMapperNone);
+    IOLog ("NativeUfs: DMA virt=%p phys=%llx contiguous=%llx\n", virt, (unsigned long long) phys, (unsigned long long) contiguous);
     gRootDiagnostic.dma = phys;
     gRootDiagnostic.contiguous = contiguous;
     if (!virt || !phys || (phys & 4095) || contiguous < bytes || (!wide && phys + bytes > 0x100000000ULL)) {
@@ -1224,13 +1279,17 @@ static bool hostBringUp (const char **why)
     return false;
   }
   const unsigned regionSlots = gHost.dmaBytes == kDmaBytes ? slots : gHost.dmaBytes == kDmaBytesEightSlots ? (slots < 8 ? slots : 8) : 1;
+  IOLog ("NativeUfs: DMA region %u bytes, %u slots\n", gHost.dmaBytes, regionSlots);
   hostSlotGeometryRegionA (regionSlots);
   hostSlotsInit (regionSlots, gHost.lock);
   native_ufs_slots = gSlotCount;
+  IOLog ("NativeUfs: slots initialised (%u)\n", gSlotCount);
   bzero (gHost.virt, gHost.dmaBytes);
+  IOLog ("NativeUfs: DMA region cleared\n");
   cacheCivac (gHost.virt, gHost.dmaBytes);
+  IOLog ("NativeUfs: DMA region cleaned to PoC\n");
   uint32_t report[3] = { 0, 0, 0 };
-  gRootDiagnostic.stage = "SMMU and request list";
+  rootStage ("SMMU and request list");
   if (!hostStopQueue (why)) return false;
   smmuBypassStream (0x60, gHost.smmuMap, report, gHost.phys, gHost.dmaBytes);
   gHost.smmu = gHost.smmuMap->getVirtualAddress ();
@@ -1380,7 +1439,7 @@ static bool hostBringUp (const char **why)
   }
   hostSlotsUpgrade (regionSlots, entries, wide);
   if (!hostStartQueue (why)) return false;
-  gRootDiagnostic.stage = "NOP OUT";
+  rootStage ("NOP OUT");
   // NOP OUT proves the transport before touching the SCSI layer.
   if (hostNop () != kIOReturnSuccess) {
     gHost.ready = false;
@@ -1388,7 +1447,7 @@ static bool hostBringUp (const char **why)
     return false;
   }
   uint32_t power = 0;
-  gRootDiagnostic.stage = "power mode query";
+  rootStage ("power mode query");
   if (hostQueryRead (0x03, 0x02, &power) != kIOReturnSuccess) {
     gHost.ready = false;
     *why = "power mode query";
@@ -1396,7 +1455,7 @@ static bool hostBringUp (const char **why)
   }
   gRootDiagnostic.power = power;
   if ((power & 0xff) != 0x11) {
-    gRootDiagnostic.stage = "device wake";
+    rootStage ("device wake");
     // START STOP UNIT, power condition ACTIVE, to the UFS Device well-known LU (as Linux resumes).
     uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
     uint32_t scsi = 0;
@@ -1407,7 +1466,7 @@ static bool hostBringUp (const char **why)
     }
     IOSleep (50);
   }
-  gRootDiagnostic.stage = "LUN ready";
+  rootStage ("LUN ready");
   for (unsigned attempt = 0; attempt < 20; attempt++) {
     uint8_t tur[6] = { 0, 0, 0, 0, 0, 0 };
     uint32_t scsi = 0;
@@ -1927,12 +1986,15 @@ static void rootDiagnosticFailure (const char *reason)
 {
   // Kept even when the panic diagnostic is off, so the boot page can say why nothing was published.
   native_ufs_root_failure = reason;
+  IOLog ("NativeUfs: FAILED at %s: %s\n", gRootDiagnostic.stage ? gRootDiagnostic.stage : "?", reason ? reason : "?");
   if (!gRootDiagnosticEnabled) return;
   gRootDiagnostic.published = native_ufs_blocks_published;
   gRootDiagnostic.reads = native_ufs_block_reads;
   gRootDiagnostic.failures = native_ufs_block_failures;
   formatUfsRootDiagnostics (gRootDiagnosticText, sizeof (gRootDiagnosticText), gRootDiagnostic, reason);
   strlcat (gRootDiagnosticText, gRootMediaText, sizeof (gRootDiagnosticText));
+  IOLog ("%s\n", gRootDiagnosticText);   // UniXNU-piano: the panic text does not reach the pstore mailbox yet
+  IOSleep (200);
   panic ("%s", gRootDiagnosticText);
 }
 
@@ -1997,7 +2059,7 @@ volatile uint32_t native_ufs_integrity_failures = 0;
 
 bool NativeUfsBlock::configureVerification ()
 {
-  gRootDiagnostic.stage = "policy selection";
+  rootStage ("policy selection");
   gRootDiagnostic.windowBytes = bytes;
   gRootDiagnostic.policyCount = verified_root_policy_count;
   gRootDiagnostic.verify = 0xffffffff;
@@ -2005,13 +2067,13 @@ bool NativeUfsBlock::configureVerification ()
   const uint8_t *manifest = nullptr;
   uint64_t manifestBytes = 0;
   if (!verified_root_policy_count || verified_root_policy_count > 16) {
-    gRootDiagnostic.stage = "policy count invalid";
+    rootStage ("policy count invalid");
     return false;
   }
   for (uint64_t index = 0; index < verified_root_policy_count; ++index) {
     const NativeVerifiedBlockPolicy &policy = verified_root_policies[index];
     if (!policy.manifest || policy.manifestBytes < VR_HEADER_BYTES + VR_SIGNATURE_BYTES) {
-      gRootDiagnostic.stage = "policy envelope invalid";
+      rootStage ("policy envelope invalid");
       return false;
     }
     uint64_t imageBytes = 0;
@@ -2022,14 +2084,14 @@ bool NativeUfsBlock::configureVerification ()
       continue;
     }
     if (manifest) {
-      gRootDiagnostic.stage = "duplicate capacity-matching policy";
+      rootStage ("duplicate capacity-matching policy");
       return false;
     }
     manifest = policy.manifest;
     manifestBytes = policy.manifestBytes;
   }
   if (!manifest) {
-    gRootDiagnostic.stage = "no capacity-matching policy";
+    rootStage ("no capacity-matching policy");
     return false;
   }
   // A header-only policy carries its hash table in the root image instead of the boot image.
@@ -2039,27 +2101,27 @@ bool NativeUfsBlock::configureVerification ()
     uint64_t count = 0;
     for (unsigned i = 0; i < 8; ++i) count |= static_cast<uint64_t> (manifest[32 + i]) << (8 * i);
     if (!count || count > (UINT64_MAX - manifestBytes) / 32) {
-      gRootDiagnostic.stage = "policy header block count";
+      rootStage ("policy header block count");
       return false;
     }
     hashBytes = count * 32;
     manifestBytes += hashBytes;
   }
-  gRootDiagnostic.stage = "policy storage";
+  rootStage ("policy storage");
   vm_size_t tableBytes = round_page (static_cast<vm_size_t> (manifestBytes));
   if (tableBytes < manifestBytes || tableBytes > UINT64_MAX - 4096) {
-    gRootDiagnostic.stage = "policy size overflow";
+    rootStage ("policy size overflow");
     return false;
   }
   verifiedStorageBytes = tableBytes + 4096;
-  gRootDiagnostic.stage = "policy allocation";
+  rootStage ("policy allocation");
   if (kmem_alloc (kernel_map, &verifiedStorage, verifiedStorageBytes,
                   static_cast<kma_flags_t> (KMA_KOBJECT | KMA_DATA), VM_KERN_MEMORY_SECURITY) != KERN_SUCCESS) {
     return false;
   }
   if (headerOnly) {
     memcpy (reinterpret_cast<void *> (verifiedStorage), manifest, VR_HEADER_BYTES + VR_SIGNATURE_BYTES);
-    gRootDiagnostic.stage = "policy table object read";
+    rootStage ("policy table object read");
     if (!readPolicyTable (label, reinterpret_cast<uint8_t *> (verifiedStorage) + VR_HEADER_BYTES + VR_SIGNATURE_BYTES,
                           hashBytes)) {
       return false;
@@ -2069,12 +2131,12 @@ bool NativeUfsBlock::configureVerification ()
   }
   uint8_t *key = reinterpret_cast<uint8_t *> (verifiedStorage + tableBytes);
   memcpy (key, verified_root_key, VR_KEY_BYTES);
-  gRootDiagnostic.stage = "policy read-only protection";
+  rootStage ("policy read-only protection");
   if (mach_vm_protect (kernel_map, verifiedStorage, verifiedStorageBytes,
                        TRUE, VM_PROT_READ) != KERN_SUCCESS) {
     return false;
   }
-  gRootDiagnostic.stage = "owner signature and hash table";
+  rootStage ("owner signature and hash table");
   int status = vr_open (reinterpret_cast<const uint8_t *> (verifiedStorage), manifestBytes, key, 1,
                         &vr_xnu_crypto, &verified);
   gRootDiagnostic.verify = static_cast<uint32_t> (status);
@@ -2183,7 +2245,7 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
       int status = vr_verify_block (view, index, data, length, &vr_xnu_crypto);
       __atomic_fetch_add (&native_ufs_verify_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
       if (status != VR_OK) {
-        gRootDiagnostic.stage = "read block integrity";
+        rootStage ("read block integrity");
         gRootDiagnostic.verify = static_cast<uint32_t> (status);
         __atomic_fetch_add (&native_ufs_integrity_failures, 1, __ATOMIC_RELAXED);
         return kIOReturnNotPrivileged;
@@ -2319,7 +2381,7 @@ static void publishThread (void *, wait_result_t)
   struct Operations {
     bool start (unsigned index) {
       NativeUfsBlock *device = gPendingDevice[index];
-      gRootDiagnostic.stage = "root window service start";
+      rootStage ("root window service start");
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Start);
       gRootDiagnostic.publicationWindow = index;
       if (!device->start (gPendingProvider)) return false;
@@ -2330,10 +2392,18 @@ static void publishThread (void *, wait_result_t)
     bool wait (unsigned index) {
       NativeUfsBlock *device = gPendingDevice[index];
       const char *uuid = gPendingUuid[index];
-      gRootDiagnostic.stage = "media publication";
+      rootStage ("media publication");
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Media);
       gRootDiagnostic.publicationWindow = index;
       bool ready = false;
+#if defined(NATIVE_UFS_UNVERIFIED_ROOT) && NATIVE_UFS_UNVERIFIED_ROOT && !(defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK)
+      if (!uuid[0]) {
+        unsigned tick = 0;
+        for (; tick < 300 && (tick < 5 || device->getBusyState ()); ++tick) IOSleep (100);
+        IOLog ("NativeUfs: %s matched after %u ms (busy %u, unverified)\n", device->windowLabel (), tick * 100, device->getBusyState ());
+        return true;
+      }
+#endif
       // Diagnostic mode affects reporting only, never the dependency gate.
       for (unsigned tick = 0; tick <= 300; ++tick) {
         ready = mediaWithUuidExists (uuid, device);
@@ -2450,6 +2520,7 @@ bool NativeUfs::start (IOService *provider)
   unsigned probe = 0, rootMode = 0;
   PE_parse_boot_argn ("native-ufs-probe", &probe, sizeof (probe));
   PE_parse_boot_argn ("native-ufs-root", &rootMode, sizeof (rootMode));
+  IOLog ("NativeUfs: start on %s probe=%u root=%u\n", provider ? provider->getName () : "?", probe, rootMode);
   native_ufs_probe_requested = probe != 0;
   // Default: match for observability only, never touch the controller. Hardware work runs once,
   // from the root-device personality; the ufshc nub match stays observation-only.
@@ -2621,7 +2692,7 @@ bool NativeUfs::startRoot (IOService *provider)
     NativeUfs *owner;
     RootLayout *layout;
     bool prepare (unsigned index) {
-      gRootDiagnostic.stage = "root window allocation/configuration";
+      rootStage ("root window allocation/configuration");
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Prepare);
       gRootDiagnostic.publicationWindow = index;
       gRootDiagnostic.windowBytes = layout->window[index].size;
@@ -2632,7 +2703,7 @@ bool NativeUfs::startRoot (IOService *provider)
       uint64_t absolute = layout->userdataFirst * 4096ULL + layout->window[index].offset;
       if (!device || !device->init (static_cast<OSDictionary *> (nullptr)) ||
           !device->configure (layout->window[index].name, absolute, layout->window[index].size)) return false;
-      gRootDiagnostic.stage = "root window attachment";
+      rootStage ("root window attachment");
       if (!device->attach (owner)) return false;
       gPendingAttached[index] = true;
       ++gPending;
@@ -2640,7 +2711,7 @@ bool NativeUfs::startRoot (IOService *provider)
       return true;
     }
     bool validate () {
-      gRootDiagnostic.stage = "signed window identities";
+      rootStage ("signed window identities");
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Identity);
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
       for (unsigned i = 0; i < gPending; ++i) {
@@ -2649,12 +2720,17 @@ bool NativeUfs::startRoot (IOService *provider)
         for (unsigned j = 0; j < i; ++j) if (!strcmp (gPendingUuid[i], gPendingUuid[j])) return false;
       }
       return true;
+#elif defined(NATIVE_UFS_UNVERIFIED_ROOT) && NATIVE_UFS_UNVERIFIED_ROOT
+      // UniXNU-piano development build: the windows are published unverified, as k27's NativeVirtioBlock disks are in the VM.
+      // No identity: wait() takes the window's own matching as its readiness. Owner-signed policies replace this before release.
+      IOLog ("NativeUfs: UNVERIFIED development root: %u windows published without owner policies\n", gPending);
+      return true;
 #else
       return false; // Root publication requires owner verification in every build.
 #endif
     }
     bool schedule () {
-      gRootDiagnostic.stage = "root publisher thread";
+      rootStage ("root publisher thread");
       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Schedule);
       gRootDiagnostic.publicationWindow = 0xffffffff;
       thread_t thread = nullptr;

@@ -12,5 +12,5 @@ cd "$K"
 python3 scripts/build-native-kext.py NativeUfs "$D/package/NativeUfs/NativeUfs.cpp" overlay/kext/NativeKextGlue.cpp \
   -I "$D/package/NativeUfs" -I "$INC" -I "$U/kits/VerifiedRoot/include" -I "$U/drivers/NativeVirtioBlock" \
   -I "$K/out/x12377/storage-abi/include" -I "$K/out/x12377/xnu-m/osfmk" \
-  -D U:TARGET_OS_OSX -D TARGET_OS_OSX=1 -D NATIVE_UFS_SM8750=1 -D 'UFS_ROOT_PARTITION="linux_rootfs"' -D NATIVE_UFS_POLL_ONLY=1 \
+  -D U:TARGET_OS_OSX -D TARGET_OS_OSX=1 -D NATIVE_UFS_SM8750=1 -D 'UFS_ROOT_PARTITION="linux_rootfs"' -D NATIVE_UFS_POLL_ONLY=1 -D NATIVE_UFS_UNVERIFIED_ROOT=1 \
   --obj "${K27_OBJ:-k27-native-obj}"

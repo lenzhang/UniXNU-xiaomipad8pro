@@ -20,13 +20,20 @@ else:
         print('cleared'); sys.exit(0)
     raw = b''.join(struct.pack('<Q', q[i]) for i in range(size // 8))
 sig, start, used = struct.unpack_from('<III', raw, 0)
+base = 12
 # k27 0055: "DBGB" header + the ring 11 times ("DBG3": three) (bitwise majority against DRAM bit decay); "DBGC" = one copy.
 dist = lambda a, b: bin(a ^ b).count('1')
-copies = {0x42474244: 11, 0x33474244: 3}   # "DBGB": 11 copies, "DBG3": 3
+copies = {0x52474244: 11, 0x42474244: 11, 0x33474244: 3}   # "DBGR": header and ring 11 times; "DBGB": ring 11 times; "DBG3": 3
 best = min(copies, key=lambda c: dist(sig, c))
+def majority_word(words):
+    return sum(1 << b for b in range(32) if sum((w >> b) & 1 for w in words) * 2 > len(words))
+if dist(sig, best) <= 3 and best == 0x52474244:
+    # k27 0058: 256-byte header, {start, size} at words 4 + 2k (k < 11), the ring copies from byte 256.
+    hdr = struct.unpack_from('<64I', raw, 0)
+    start = majority_word(hdr[4:26:2]); used = majority_word(hdr[5:26:2]); base = 256
 if dist(sig, best) <= 3:
-    n = copies[best]; cap = (size - 16) // n
-    cs = [raw[12 + k * cap:12 + (k + 1) * cap] for k in range(n)]
+    n = copies[best]; cap = (size - (256 if base == 256 else 16)) // n
+    cs = [raw[base + k * cap:base + (k + 1) * cap] for k in range(n)]
     # Bitwise majority without numpy: a bit-sliced 4-bit counter over big integers (n <= 15).
     b0 = b1 = b2 = b3 = 0
     for x in cs:
@@ -51,6 +58,9 @@ elif dist(sig, 0x43474244) <= 3:
     cap = size - 12; data = raw[12:12 + cap]; fixed = 0
 else:
     sys.stderr.write(f'no XNU log (signature {sig:#x})\n'); sys.exit(1)
+# The header is stored once, so DRAM decay can flip a bit of start or size (seen 2026-11-11: size 8013 vs start 8141, the
+# log's last 128 bytes cut). Before the ring wraps both hold the byte count: take their bitwise OR (decay clears bits).
+if base == 12 and used != start and max(used, start) < cap: used = start = used | start
 start %= cap; used = min(used, cap)
 out = data[:used] if used < cap else data[start:] + data[:start]
 sys.stderr.write(f'XNU log: {used} bytes (start {start}, capacity {cap}, {fixed} bytes corrected by majority)\n')
