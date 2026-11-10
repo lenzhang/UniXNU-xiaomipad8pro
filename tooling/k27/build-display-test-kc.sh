@@ -5,7 +5,9 @@
 # out/ram, out/ram-dump) are not touched.
 #   tooling/k27/build-display-test-kc.sh [OUTPUT.bin]     default out/k27/kc-k27-display-test.bin
 # Environment: K27_TREE (macOS-DroidVM), K27_KERNEL (default $K27_TREE/out/k27/kernel-k27-0058-native.macho),
-#   NATIVE_BASE (the kext JSONs before NativeGopDisplay; default: build-native-image.sh's set, see below).
+#   NATIVE_BASE (the kext JSONs before NativeGopDisplay; default: build-native-image.sh's set, see below),
+#   PIANO_DROP_KEXTS (names left out of that set, as in build-native-image.sh: e.g. "DroidVMGpu"; DroidVMDisplay is the display's nub,
+#   so keep it with NativeGopDisplay).
 # Output: OUTPUT.bin and, from tooling/kc/build-kc-k27.sh, OUTPUT.log / .natives.json / .nm / .sha256; OUTPUT.kext.log (the compile).
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
@@ -23,6 +25,8 @@ else
   BASE="$HEAD overlay/kext/NativeRamBlock.json $TAIL $KEXTS/NativeUfs.json"
 fi
 BASE=${NATIVE_BASE:-$BASE}
+for k in ${PIANO_DROP_KEXTS:-}; do BASE=$(for spec in $BASE; do [ "$(basename "$spec")" = "$k.json" ] || printf '%s ' "$spec"; done); done
+case " ${PIANO_DROP_KEXTS:-} " in *" DroidVMDisplay "*) echo "note: without DroidVMDisplay nothing provides AppleParavirtGPU, NativeGopDisplay's nub" >&2 ;; esac
 for spec in $BASE; do   # every other kext must already be built: this script compiles none of them
   case $spec in /*) json=$spec ;; *) json=$K/$spec ;; esac
   objects=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("objects", ""))' "$json")

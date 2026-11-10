@@ -7,8 +7,8 @@ colour elements, the power states and the swap info notifications.
 Removed: the virtio-gpu scanout (stage 2), the waits for the virtio GPU's 3D work, the AppleParavirtGPU nub class (the nub stays
 DroidVMDisplay's), ParavirtDisplayPrefs and the AppleParavirtDisplay registry name (DroidVMDisplay's kext, loaded for its nub, owns
 that name).
-Changed: class and registry name NativeGopDisplay; probe() gate (boot-arg native-gop-display=1, ADT marker native-gop-display, no
-/arm-io/virtio-gpu); piano defaults (239x163 mm, 60 Hz) and the ADT's panel-*/refresh-hz/framebuffer-* properties; integer dot pitch;
+Changed: class and registry name NativeGopDisplay; probe() gate (the ADT marker native-gop-display, boot-arg native-gop-display=0/1
+over it, never with /arm-io/virtio-gpu); piano defaults (239x163 mm, 60 Hz) and the ADT's panel-*/refresh-hz/framebuffer-* properties; integer dot pitch;
 "NativeGopDisplay: ..." logs at every init step; optional colour bars (native-gop-display-bars=1); product attributes.
 
 IOMobileFramebufferABI.h is not copied: tooling/k27/build-native-gop-display.sh generates it at build time with macOS-DroidVM's

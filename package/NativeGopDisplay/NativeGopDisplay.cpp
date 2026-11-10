@@ -12,9 +12,10 @@
 // AppleParavirtGPU services when an /arm-io node is compatible "paravirtualizedgraphics,gpu", and waits for that many framebuffers.
 // The native ADT gets such a node with tooling/adt/make-piano-adt.py --gop-display (configs/k27-gop-display.toml), DroidVMDisplay's
 // AppleParavirtGPU (in every k27 collection) is its nub, and this class is a second candidate for the nub's display with a higher
-// probe score. It takes the nub only with boot-arg native-gop-display=1, on a node marked native-gop-display, and not in the VM
-// (no /arm-io/virtio-gpu). Otherwise DroidVMDisplay's own display (AppleParavirtDisplay) starts on the nub, which on piano is its CPU
-// copy into the same framebuffer. One display is published either way: WindowServer never has two to choose from.
+// probe score. It takes the nub only on a node marked native-gop-display (that opt-in ADT's own node), not with boot-arg
+// native-gop-display=0, and not in the VM (no /arm-io/virtio-gpu). Otherwise DroidVMDisplay's own display (AppleParavirtDisplay)
+// starts on the nub, which on piano is its CPU copy into the same framebuffer. One display is published either way: WindowServer
+// never has two to choose from.
 //
 // Every step logs "NativeGopDisplay: ..." (IOLog), so the pstore console mailbox of a headless boot tells how far it got.
 #include "IOMobileFramebufferABI.h"
@@ -237,15 +238,19 @@ static bool adtNumber(IORegistryEntry *node, const char *key, uint64_t *value)
     return true;
 }
 
+// Whether this display takes the nub: the ADT node's native-gop-display marker (configs/k27-gop-display.toml, only in the ADT made with
+// make-piano-adt.py --gop-display) says yes, boot-arg native-gop-display overrides it (0: DroidVMDisplay's display instead, 1: take
+// it), and never in the VM.
 IOService *NativeGopDisplay::probe(IOService *provider, SInt32 *score)
 {
-    unsigned enabled = 0;
-    PE_parse_boot_argn("native-gop-display", &enabled, sizeof(enabled));
     IORegistryEntry *node = adtNode(provider);
+    uint64_t marker = 0;
+    unsigned enabled = adtNumber(node, "native-gop-display", &marker) && marker;
+    PE_parse_boot_argn("native-gop-display", &enabled, sizeof(enabled));
     IORegistryEntry *virtio = IORegistryEntry::fromPath("/arm-io/virtio-gpu", gIODTPlane);
-    const char *refusal = !enabled ? "off (boot-arg native-gop-display=1 selects it; DroidVMDisplay's display takes the nub)"
-                        : !node || !node->getProperty("native-gop-display") ? "the nub's ADT node is not marked native-gop-display"
-                        : virtio ? "a virtio-gpu is present (the VM): DroidVMDisplay's display takes the nub"
+    const char *refusal = virtio ? "a virtio-gpu is present (the VM): DroidVMDisplay's display takes the nub"
+                        : !enabled ? (marker ? "off (boot-arg native-gop-display=0): DroidVMDisplay's display takes the nub"
+                                             : "the nub's ADT node is not marked native-gop-display: DroidVMDisplay's display takes the nub")
                         : nullptr;
     OSSafeReleaseNULL(virtio);
     IOLog("NativeGopDisplay: probe on %s (ADT %s): %s\n", provider ? provider->getName() : "?", node ? node->getName() : "?",

@@ -4,8 +4,8 @@
 # compatible "paravirtualizedgraphics,gpu", exactly as the VM's /arm-io/display (macOS-DroidVM scripts/run-macos-vm.py MACOS_DISPLAY):
 # IOMobileFramebuffer.framework (iomfb_populate_all_display_infos) counts the DisplayPortCount of the AppleParavirtGPU services only
 # when an /arm-io child is compatible with that string, and DroidVMDisplay's AppleParavirtGPU (in every k27 collection) matches it
-# by name. Its display is then DroidVMDisplay's (CPU copy into the boot framebuffer: virtio-gpu is absent natively), or NativeGopDisplay
-# with boot-arg native-gop-display=1 (it requires the native-gop-display marker below).
+# by name. Its display is then NativeGopDisplay when the KC has it (the native-gop-display marker below says so; boot-arg
+# native-gop-display=0 declines), else DroidVMDisplay's own (CPU copy into the boot framebuffer: virtio-gpu is absent natively).
 #
 # The framebuffer-* values describe ABL's splash region as dts/piano.dts and docs/drivers/display.md have it; the driver takes the
 # boot console's (PE_state.video, DarwinBoot's GOP) and only logs a mismatch. No reg: the node is no MMIO device and must not widen
