@@ -2,7 +2,10 @@
 
 > **Status 2026-11-11:** T1 (`piano-usb=1`) on hardware: USB core powered and clocked, DWC3 3.20a, eUSB2 PHY and repeater
 > enabled, SMMU stream 0x40 on bank 3 (kept). T2 (`piano-usb=2`): takeover runs, the Mac enumerates the device at high speed and
-> reads the device, string and configuration descriptors, then sends no SET_CONFIGURATION (being fixed). Build:
+> reads the device, string and configuration descriptors; every control transfer completes on the tablet (EP0 trace), but the
+> Mac leaves the device at `UsbEnumerationState = 2` with no configuration and no driver, unlike the approved fastboot device on the
+> same port: macOS's accessory approval ("Allow accessories to connect") is the likely cause. It needs the owner to approve the
+> accessory on the unlocked Mac once. Build:
 > `PIANO_EXTRA_ARGS="piano-usb=2" tooling/k27/build-native-image.sh` (PianoDwc3 is in `configs/k27-native-kexts.txt`, inert without
 > `piano-usb`); run: `tooling/native/native-loop.sh`. `build-piano-dwc3.sh` is now `build-native-piano-dwc3.sh` (no archive fallback);
 > `build-usb-test-kc.sh` and `native-run.sh` are gone.
