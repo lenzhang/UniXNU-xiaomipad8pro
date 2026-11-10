@@ -442,10 +442,10 @@ void PianoPower::startCharger()
     stage(-4, "no PMIC_RTR_ADSP_APPS channel slot");
     return;
   }
-  note("level 2: starting the DSP; until the input limit write takes, its firmware limits the input to 100 mA (watch for "
-       "'mca: write input limit ... ok')");
+  note("level 2: starting the DSP after piano-power-delay (default 30 s); once it runs, its firmware limits the input to 100 mA until "
+       "the input limit write takes (watch for 'mca: write input limit ... ok')");
   piano_adsp_start();
-  fReadyWarnDue = nowMs() + 180000;
+  fReadyWarnDue = nowMs() + 180000 + uint64_t(bootArg("piano-power-delay", 30)) * 1000;   // 3 minutes after the bring-up began
   stage(4, "DSP start requested, PMIC_RTR_ADSP_APPS registered");
 }
 
@@ -553,7 +553,7 @@ void PianoPower::run()
     if (fReadyWarnDue && now >= fReadyWarnDue) {
       fReadyWarnDue = 0;
       if (fMca.icl_set == 0 && gArgs.write)
-        note("WARNING: 3 minutes after the DSP start no input limit write has taken: the charger may be held at the firmware's "
+        note("WARNING: 3 minutes into the DSP bring-up no input limit write has taken: the charger may be held at the firmware's "
              "100 mA; reboot (or boot Ubuntu/Android) if the battery drains");
     }
     // Sleep until the next deadline or a message.

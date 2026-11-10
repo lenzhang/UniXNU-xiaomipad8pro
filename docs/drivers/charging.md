@@ -5,11 +5,14 @@ Status 2026-11-11: `package/PianoPower` built and linked into a test KC (host te
 
 ## 0. The answer
 
-- **Charging control on SM8750/piano needs the audio DSP (ADSP).** The buck charger is a block of the PMIH010x PMIC (SID 7) whose
-  SPMI channels belong to the DSP's execution environment; this processor only gets the arbiter's read-only observer channel.
-  Mu-Silicium's piano DXE list drops the stock PmicDxe because it "faults in SPMI on channel 690, which ABL no longer gives the
-  apps EE" (`Mu-Silicium-piano/Platforms/Xiaomi/pianoPkg/Include/DXE.inc:61`). So design (a), a kext that writes charger
-  registers over SPMI, is not available; PianoPower level 1 logs the owner EE of every SID 7 peripheral to confirm it.
+- **Charging control on SM8750/piano is the audio DSP's (ADSP) job in every stock and Linux stack.** The buck charger is a block
+  of the PMIH010x PMIC (SID 7) driven by the DSP's charger firmware. Mu-Silicium's piano DXE list drops the stock PmicDxe because
+  it "faults in SPMI on channel 690, which ABL no longer gives the apps EE" (`Mu-Silicium-piano/Platforms/Xiaomi/pianoPkg/Include/DXE.inc:61`).
+  **Correction from the level 1 measurement (end of this page):** the charger, DCDC, USBIN and Type-C blocks have write owner
+  **EE 0, which is this processor** (the arbiter node's `qcom,ee = <0>`, the EE PianoInput and PianoDwc3 read as), not the DSP.
+  So design (a), writing the charger over the arbiter's write channel, is not ruled out by ownership; what it lacks is the
+  PMIH010x charger register map (no BSD or mainline source: Linux on piano left the charger to the DSP). Until that map exists,
+  (b) stays the path; with the DSP running, its firmware and such writes would also fight.
 - **The DSP is not running when our UEFI hands over.** Linux started it itself (remoteproc PAS, `auto_boot`). The stock XBL
   charger driver loads the DSP's charger firmware only to charge a dead battery and then reboots ("Chg Fw Load not required boot
   to HLOS", "Device Will Reboot After ADSP Charging", strings of `piano-binaries-own303/.../QcomChargerDxeLA.efi`). Our FD
@@ -65,10 +68,11 @@ levels (9 V opt-in), charge current conservative, battery state on the console; 
   Type-C state (attached, source Rp seen = charger present) with the raw Type-C/USBIN/DCDC/charger status bytes; the DSP's
   SMP2P bits. Writes: none to any PMIC register; the SPMI observer channel's command; the four gauge pins' TLMM configuration
   (GPIO, pull-up, output value 0, output enable toggled: open drain, never driven high), restored after each read.
-- **Level 2, charging.** Level 1 plus `piano_adsp_start` (sheng's order: firmware from modem_a via NativeUfs + FAT → SMP2P item
-  429 → doorbells → AOSS `load_state adsp` → lcx/lmx at max through RSC TCS 1 → DTB image PAS 36 → DSP image PAS 1 → ready on
-  SMP2P (5 s) → votes dropped at handover → GLINK items 478/479/480 → `IPCRTR` with the locator and `PMIC_RTR_ADSP_APPS`). Doorbells
-  and the RSC done bit are polled (2 ms during bring-up, 20 ms after): the native KC has no SPI attach. SCM through Sm8750Scm.
+- **Level 2, charging.** Level 1 plus `piano_adsp_start` (after `piano-power-delay`, sheng's order in numbered steps, §5a:
+  firmware from modem_a via NativeUfs + FAT → SMP2P item 429 → doorbells → AOSS `load_state adsp` → lcx/lmx at max through an
+  idle active TCS of RSC drv-2 → DTB image PAS 36 → DSP image PAS 1 → ready on SMP2P (5 s) → votes dropped at handover → GLINK
+  items 478/479/480 → `IPCRTR` with the locator and `PMIC_RTR_ADSP_APPS`). Doorbells and the RSC completion are polled (2 ms
+  during bring-up, 20 ms after): the native KC has no SPI attach. SCM through Sm8750Scm.
   Then `PianoMca.c` reads 9–11 properties every 5 s (and on every notification), one in flight, 1 s timeout, and after each cycle
   applies the policy. Only four properties can ever be written (allowlist checked before a request is built):
 
@@ -85,7 +89,9 @@ levels (9 V opt-in), charge current conservative, battery state on the console; 
   re-sends it to stop a DSP crash on dock unplug), float voltage/termination, sleep notifications.
 
 Boot arguments: `piano-power=0|1|2` (default 0: probe declines, nothing mapped), `piano-power-period=S` (30),
-`piano-power-gauge=0`, `piano-power-write=0` (level 2 without writes), `piano-power-hv=1`, `piano-power-fw=DIR`.
+`piano-power-gauge=0`, `piano-power-write=0` (level 2 without writes), `piano-power-hv=1`, `piano-power-fw=DIR`, and for the DSP
+bring-up (§5a): `piano-power-delay=S` (30: seconds before the bring-up), `piano-power-stop=N` (stop before step N),
+`piano-power-rpmh=0` (no lcx/lmx proxy votes), `piano-power-qmp=0` (no AOSS load_state), `piano-power-trace=0`.
 
 ## 4. Build (done here) and the kernel collection
 
@@ -131,12 +137,92 @@ sha256 `ec5267bc9e40a74e…` (`com.unixnu.driver.PianoPower: linked, header at 0
 
 Fails safe: RAM boot; `piano-reset-after` resets; without `piano-power` nothing is mapped.
 
+## 5a. Level 2 hang (2026-11-11 06:22) and the bisecting build
+
+**What the log shows.** The run (`exec-log=1 piano-usb=2 piano-power=2 piano-power-write=0`) stopped after
+`adsp: rails: lcx index 7, lmx index 4` and `adsp: stage 7: lcx/lmx votes`; the tablet was back in ABL 119 s after `fastboot boot`.
+Both lines are printed only after the vote returned: the TCS reported completion (the line has no "done bit not seen" suffix) and
+its finish writes were done. So the RPMh vote and the AOSS `load_state` before it completed; the hang is in what follows, which
+logged nothing: the DTB image's metadata buffer and its UFS read, then the first PAS call (`init_image`, PAS 36), `mem_setup`, the
+carveout writes, `auth_and_reset`. PianoDwc3's takeover (`piano-usb=2`) stopped at the same moment ("core soft reset") and is the
+other candidate. k27 0056 pets the Gunyah watchdog from a high-priority thread call every 10 s, and the watchdog bites 32 s after
+the last pet, so thread calls stopped on every CPU: a whole-system stall (a CPU stuck in the secure world holding something the
+others need, or a bus access that never completes), not one blocked thread. The battery was unaffected (4476 → 4479 mV).
+
+**The questions asked, answered from the DT and the Linux drivers as the spec** (rpmh-rsc, qcom_aoss, qcom_scm, qcom_q6v5_pas):
+- RSC/DRV: `rsc@16500000` has drv-0/1/2 and `qcom,drv-id = <2>`: the HLOS's DRV is drv-2 at 0x16520000, TCS block +0xd00, done
+  interrupt SPI 5 (level). `qcom,tcs-config` = active 3, sleep 2, wake 2, control 0, active first: TCS 0–2 are ours to use.
+- TCS sequence (rpmh-rsc): an idle active TCS (DRV_STATUS non-zero), per command MSGID (8-byte length code, bit 8 = response
+  required, bit 16 = write), address, data; WAIT_FOR_CMPL and CMD_ENABLE; the TCS bit in IRQ_ENABLE; CONTROL trigger off, AMC mode
+  off, AMC mode on, AMC mode + trigger. With the response bit the RSC reports completion only after RPMh acknowledged the
+  command, so a vote can wait for an ACK; that wait was bounded (100 ms) and it completed in the failed run.
+- AOSS QMP: the message is written to the AOP's mailbox, the AOP is rung (IPCC AOP signal 0) and the sender waits for the length
+  word to go back to zero; the interrupt only wakes the waiter early, so polling (as here) is enough. Step 6 completed.
+- Do we need the votes? Linux takes lcx/lmx as proxy votes at the highest level until the DSP's handover; K90 (SM8750 Xiaomi,
+  XNU) does the same and starts its DSP. Nothing shows that the boot stages hold LCX/LMX up; `piano-power-rpmh=0` answers it.
+- Facts from the K90 port (`hackios-xnu-kernel-k90` annibale_adsp.c, APSL-2.0, read for facts only): on SM8750 XNU at EL1 under
+  Gunyah reached "ADSP authenticated and READY" with the same DTB carveout 0x9ed80000, PAS 0x24 then 1, the v3 TCS layout at
+  0x16520000 (idle TCS chosen by DRV_STATUS), `load_state adsp on`, and PAS calls issued only after the GPU's ZAP load so no two
+  secure calls overlap. So PAS from XNU is possible on this SoC; piano differs in carveout (0xb8200000), in Sm8750Scm's wait-queue
+  handling, and in running the bring-up while other drivers start.
+
+**This build** (`package/PianoPower/PianoAdsp.cpp`): the bring-up is 16 numbered steps, each announced with `step N (...): begin`
+plus a 20 ms sleep (so the console has the line before the access) and `step N done`; every secure call has `smc: ...: calling`
+and `smc: ...: ok|FAILED (status, x0, x1, SMC count, interrupted, wait-queue, busy, µs)`; with `piano-power-trace` (default on)
+every RSC and IPCC register write has a line before (`rsc: write CONTROL (AMC mode on + trigger) (+0x...) = 0x...`) and after
+(`rsc: written ..., reads 0x...`). The vote follows the Linux sequence above, picks an idle TCS (logs DRV_STATUS/CONTROL/CMD_ENABLE
+of TCS 0–2), polls IRQ_STATUS and each command's CMD_STATUS (issued/completed) for at most 100 ms, leaves a TCS that did not
+complete alone, and restores IRQ_ENABLE. The bring-up waits `piano-power-delay` (30 s) first, so the root mount and PianoDwc3's
+takeover are done before it touches anything.
+
+| Step | What | Hardware touched |
+|---|---|---|
+| 3 | firmware opened | NativeUfs reads of modem_a (FAT) |
+| 4 | SMP2P item | SMEM item 429 under TCSR mutex 3 |
+| 5 | doorbells | IPCC RECV_ENABLE ×3, SEND |
+| 6 | AOSS load_state (`piano-power-qmp`) | AOSS message RAM, IPCC |
+| 7 | lcx/lmx votes (`piano-power-rpmh`) | cmd-db read, RSC drv-2 TCS |
+| 8 / 13 | DTB / DSP metadata | contiguous buffer, UFS read, cache clean |
+| 9 / 14 | DTB / DSP PAS init_image | SMC |
+| 10 / 15 | DTB / DSP PAS mem_setup (relocatable images) | SMC |
+| 11 / 16 | DTB / DSP segments | carveout 0x9ed80000 / 0xb8200000 mapped write-combined, written |
+| 12 / 17 | DTB / DSP PAS auth_and_reset | SMC |
+| 18 | DSP ready | SMP2P polling (5 s) |
+
+Candidate images, built 2026-11-11 from main d03030d + this change (KC `e909bc79d3e03ffa…`, `com.unixnu.driver.PianoPower: linked,
+402 pointers`, `native kext rule: 8 native kexts linked, none from DroidVM`), each `exec-log=1 piano-usb=2 piano-power=2
+piano-power-write=0` plus:
+
+| Image | Extra | sha256 | Answers |
+|---|---|---|---|
+| A | `piano-power-stop=9` | `87529659a623d644…` | steps 3–8 only, no secure call: if the system keeps reporting until the reset, the hang is in a PAS call or later |
+| B | none | `da3605d9bce108db…` | the full bring-up, traced: the last `begin`/`calling`/`write` line names the hanging access |
+| C | `piano-power-rpmh=0` | `69393043511cf356…` | the same without the proxy votes |
+
+Run A first, then B; C if B hangs after step 7 or the DSP never becomes ready. Build and run (in the main checkout):
+
+```sh
+tooling/k27/build-native-image.sh                     # KC (PianoPower is in configs/k27-native-kexts.txt) + out/ram-dump
+for V in "A piano-power-stop=9" "B" "C piano-power-rpmh=0"; do set -- $V
+  PIANO_EXTRA_ARGS="exec-log=1 piano-usb=2 piano-power=2 piano-power-write=0 ${2:-}" PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300     python3 tooling/bootimg/build-ram-images.py --fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --out out/ram-power/$1     --kc out/k27/kc-k27-native.bin --trust out/inputs/kernel.macho.trustcache --seed out/inputs/scratch-data.img --adt out/adt/piano-k27.adt
+done
+tooling/native/native-loop.sh out/ram-power/A/boot-piano-macos-ram-A-bundled.img   # dump image: out/ram-dump (inert: reset after 1 s)
+grep 'PianoPower' logs/native-runs/<ts>-loop/xnu-console.txt
+```
+
+Expected in A, about 30 s after `PianoPower: stage 4: DSP start requested`: `adsp: waiting 30 s before the bring-up`, then
+`step 3 (firmware opened): begin ...` … `step 7 done: lcx/lmx votes`, `step 8 (DTB metadata): begin: DTB`, `metadata: ... bytes at
+0x...`, `step 8 done`, `step 9 (DTB PAS init_image) not started: piano-power-stop=9`, and the 30 s reports continue until
+`piano-reset-after`. In B after step 8: `smc: PAS init_image (DTB, PAS 36): calling` then either `...: ok (...)` and the next
+steps, or nothing (the secure call is the hang).
+
 ## 6. Risks
 
 - **Level 2 can charge less than no driver.** Once the DSP runs, its firmware holds the input at 100 mA until the ICL write takes
   (the 11:11 drain: about -1.8 A per cell under load). If GLINK, the locator or the properties fail, only the WARNING line shows it;
   reboot. A PMIC is not reset by a warm reset: after a failed level 2, check `battery-voltage` before trusting the next boot.
-- **PAS from XNU** is verified only for the GPU's ZAP on the 13T; a secure-world hang ends in the Gunyah watchdog reset.
+- **PAS from XNU** is verified on SM8750 for the GPU's ZAP (13T, K90) and for the DSP on the K90; on piano the first attempt
+  stalled the whole system (§5a). A secure-world hang ends in the Gunyah watchdog reset about 30 s later.
   Sm8750Scm's limit of 10000 SMC instructions per request could cut a long authentication short (logged as a status).
 - **Memory:** the top 0x50000 of the adspslpi carveout overlaps our UEFI's DXE heap range (gone after ExitBootServices); the
   images are written there only in level 2.
@@ -160,7 +246,7 @@ Gauge.h and ChargerPmic.h are written fresh.
 
 ## Measured 2026-11-11 (level 1, read only, 240 s on the Mac's USB-C port)
 
-- SPMI arbiter v7, charger PMIC SID 7 = PMIH010x model 0x56; charger/DCDC/USBIN/Type-C blocks owned by EE 0 (the DSP's EE).
+- SPMI arbiter v7, charger PMIC SID 7 = PMIH010x model 0x56; charger/DCDC/USBIN/Type-C blocks owned by EE 0, which is this processor (the arbiter node's `qcom,ee = <0>`; see §0).
 - DSP: SMEM APPS/ADSP partition present, no SMP2P state: not running, as expected natively.
 - Both gauges answer (bq27z561 on qup1_se5 gpio52/53 and qup2_se3 gpio12/13): 4480/4479 mV, 99 %, 4287/4344 and 4235/4290 mAh,
   28–30 °C, 113/114 cycles.

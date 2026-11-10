@@ -23,6 +23,13 @@
 // sleeps between doorbells (polled every 20 ms) and client sends. No lock is held across a wait. Clients (PianoAdsp.h) register
 // channels and queue sends from any thread; their callbacks run on this thread. SMEM is read only inside the APPS partitions and the
 // global one (other partitions may be closed to the HLOS: a whole-SMEM read on the 13T faulted).
+//
+// Bring-up steps (PianoAdspStage 3..18) are announced with "step N (...): begin" before they touch anything and "step N done" after,
+// with a short sleep after the announcement so the console has the line before the access; every secure call and (with
+// piano-power-trace, default on) every RSC/IPCC register write has a line before and after it, so a hang names its access.
+// Boot arguments (read by piano_adsp_start): piano-power-delay=S (seconds before the bring-up, default 30: the root mount and the
+// other drivers' bring-up are done by then), piano-power-stop=N (stop before step N; what the earlier steps did stays),
+// piano-power-qmp=0 (no AOSS load_state), piano-power-rpmh=0 (no lcx/lmx proxy votes), piano-power-trace=0.
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -55,9 +62,13 @@ constexpr uint64_t kAdspBase = 0xb8200000, kAdspSize = 0x5780000, kDtbBase = 0x9
 constexpr uint32_t kPasAdsp = 1, kPasDtb = 36, kRemotePid = 2, kItemIn = 443, kItemOut = 429, kItemCrash = 423;
 constexpr uint32_t kItemGlinkDesc = 478, kItemGlinkTx = 479, kItemGlinkRx = 480, kGlinkFifo = 0x4000;
 constexpr uint32_t kFatal = 1u << 0, kReady = 1u << 1, kHandover = 1u << 2;
-constexpr uint32_t kEvSmp2p = 1, kEvGlink = 2, kEvAop = 4, kEvRsc = 8, kEvSend = 16;
+constexpr uint32_t kEvSmp2p = 1, kEvGlink = 2, kEvAop = 4, kEvSend = 16;
 constexpr unsigned kClients = 4, kQueue = 8;
 constexpr uint32_t kBringUpSliceMs = 2, kSteadySliceMs = 20;
+
+struct Knobs {uint32_t delay, stop, qmp, rpmh, trace;};
+Knobs gKnobs = {30, 0, 1, 1, 1};
+int gCurrent;   // the step begun last
 
 struct Window {IOMemoryMap *map; volatile uint8_t *va;};
 bool mapWindow(Window &w, uint64_t base, uint64_t size, IOOptionBits cache = kIOMapInhibitCache) {
@@ -88,11 +99,24 @@ void say(const char *fmt, ...) {
     va_end(ap);
     IOLog("PianoPower: adsp: %s\n", line);
 }
-void stage(int value) {gStage = value; say("stage %d: %s", value, piano_adsp_stage_name(value));}
+void stage(int value) {gStage = value; say("step %d done: %s", value, piano_adsp_stage_name(value));}
 void fail(int step, int error) {
     gError = error;
     gStage = -step;
-    say("FAILED at stage %d (%s): error %d%s%s", step, piano_adsp_stage_name(step), error, gText[0] ? ", " : "", gText);
+    say("FAILED at step %d (%s): error %d%s%s", step, piano_adsp_stage_name(step), error, gText[0] ? ", " : "", gText);
+}
+// A step that touches hardware is announced before it starts; the sleep lets the console take the line first. false: piano-power-stop
+// asks to stop before this step (what the earlier steps did stays: votes, doorbells, SMP2P item).
+bool begin(int step, const char *detail) {
+    if (gKnobs.stop && step >= (int)gKnobs.stop) {
+        say("step %d (%s) not started: piano-power-stop=%u; the earlier steps stay as they are", step, piano_adsp_stage_name(step),
+            gKnobs.stop);
+        return false;
+    }
+    gCurrent = step;
+    say("step %d (%s): begin%s%s", step, piano_adsp_stage_name(step), detail[0] ? ": " : "", detail);
+    IOSleep(20);
+    return true;
 }
 void note(const char *prefix, const char *text) {
     size_t at = 0;
@@ -111,8 +135,7 @@ QcomQmp gQmp;
 QcomGlink gGlink;
 bool gGlinkStarted;
 QcomRscLayout gLayout;
-uint32_t gRscIrqBits;
-volatile uint32_t gPending, gRscDone;
+volatile uint32_t gPending;
 uint32_t gSliceMs = kBringUpSliceMs;
 bool gDoorbellsOn;
 
@@ -155,14 +178,6 @@ uint32_t pollHardware() {
         }
         if (bits) gDoorbells = gDoorbells + 1;
     }
-    if (gRscIrqBits) {
-        const uint32_t status = rd(gRsc, kRscTcs + gLayout.irq_status) & gRscIrqBits;
-        if (status) {
-            wr(gRsc, kRscTcs + gLayout.irq_clear, status);
-            __atomic_fetch_or(&gRscDone, status, __ATOMIC_RELEASE);
-            bits |= kEvRsc;
-        }
-    }
     return bits;
 }
 
@@ -181,6 +196,11 @@ uint32_t waitEvents(uint32_t ms) {
     }
 }
 
+void ipccWrite(uint32_t at, uint32_t value, const char *what) {
+    if (gKnobs.trace) say("ipcc: write %s (+%#x) = %#x", what, at, value);
+    wr(gIpcc, at, value);
+    if (gKnobs.trace) say("ipcc: written %s", what);
+}
 void ring(uint32_t client, uint32_t signal) {wr(gIpcc, kIpccSend, ipccId(client, signal));}
 void kickAop(void *) {ring(kClientAop, kSignalGlinkQmp);}
 void kickGlink(void *) {ring(kClientLpass, kSignalGlinkQmp);}
@@ -278,33 +298,93 @@ bool readCmdDb(uint8_t *copy) {
     return true;
 }
 QcomRpmhResource gLcx, gLmx;
-int gTcs = -1;
-uint32_t gVotes;  // lcx | lmx << 8 | (1 << 15: a request whose done bit was not seen)
+bool gVoted;
 
-// Votes both rails to the given ARC index pair through active TCS 1 and waits up to 100 ms for its done bit (polled). The active TCSs
-// are 0 to 2 (tcs-config lists the active type first); nothing else in the native kernel sends through this RSC. A request whose done
-// bit is not seen still counts (bit 15 of the votes word), as on sheng.
-int vote(uint32_t lcx, uint32_t lmx) {
-    if (gTcs < 0) {
-        gTcs = 1;
-        wr(gRsc, kRscTcs + 0, rd(gRsc, kRscTcs + 0) | (1u << gTcs));  // IRQ_ENABLE for our TCS: the done bit latches in the status
-        gRscIrqBits = 1u << gTcs;
+// apps_rsc (DT rsc@16500000, qcom,drv-id 2): the HLOS's DRV is drv-2 at 0x16520000 with its TCS block at +0xd00 (qcom,tcs-offset), done
+// interrupt SPI 5 (level); tcs-config lists the active TCSs first (3: TCS 0-2), then sleep (3-4) and wake (5-6), no control TCS. One
+// active-only request as Linux's rpmh-rsc sends it: an idle active TCS (DRV_STATUS non-zero), its commands (MSGID with the response
+// bit: the RSC waits for RPMh's acknowledgement before it reports completion; address; data), WAIT_FOR_CMPL and CMD_ENABLE, the TCS's
+// IRQ_ENABLE bit (its IRQ_STATUS bit is what completion sets), then CONTROL: trigger off, AMC mode off, AMC mode on, AMC mode + trigger.
+// Completion is polled every millisecond for at most 100 ms: the IRQ_STATUS bit and each command's CMD_STATUS (bit 8 issued, bit 16
+// completed). A completed TCS is reclaimed (CMD_ENABLE 0, IRQ_CLEAR, CONTROL off); one that did not complete is left alone (touching
+// a TCS in flight is what the hardware forbids). IRQ_ENABLE is put back as it was either way, so no later completion raises SPI 5.
+constexpr unsigned kActiveTcs = 3;
+constexpr uint32_t kAmcEnable = 1u << 16, kAmcTrigger = 1u << 24, kMsgidWriteResp = 8u | 1u << 8 | 1u << 16;
+constexpr uint32_t kCmdIssued = 1u << 8, kCmdCompleted = 1u << 16;
+bool gTcsStuck[kActiveTcs];
+
+uint32_t rscRead(uint64_t at) {return rd(gRsc, kRscTcs + at);}
+void rscWrite(uint64_t at, uint32_t value, const char *what) {
+    if (gKnobs.trace) say("rsc: write %s (+%#llx) = %#x", what, (unsigned long long)(kRscTcs + at), value);
+    wr(gRsc, kRscTcs + at, value);
+    if (gKnobs.trace) say("rsc: written %s, reads %#x", what, rd(gRsc, kRscTcs + at));
+}
+
+int vote(uint32_t lcx, uint32_t lmx, const char *why) {
+    const QcomRscLayout &l = gLayout;
+    const uint32_t id = rd(gRsc, 0), major = (id >> 16) & 0xff;
+    say("rsc: %s: lcx index %u, lmx index %u; DRV id %#x (version %u.%u: %s register layout)", why, lcx, lmx, id, major, (id >> 8) & 0xff,
+        major >= 3 ? "v3" : "v2");
+    static const unsigned kOrder[kActiveTcs] = {1, 2, 0};
+    int tcs = -1;
+    for (unsigned t = 0; t < kActiveTcs; ++t) {
+        const uint64_t base = (uint64_t)l.tcs_stride * t;
+        const uint32_t status = rscRead(base + l.status), control = rscRead(base + l.control), enable = rscRead(base + l.cmd_enable);
+        say("rsc: TCS %u: DRV_STATUS %#x (%s), CONTROL %#x, CMD_ENABLE %#x%s", t, status, status ? "idle" : "busy", control, enable,
+            gTcsStuck[t] ? ", left in flight earlier" : "");
     }
+    for (unsigned k = 0; k < kActiveTcs && tcs < 0; ++k) {
+        const unsigned t = kOrder[k];
+        if (!gTcsStuck[t] && rscRead((uint64_t)l.tcs_stride * t + l.status)) tcs = (int)t;
+    }
+    if (tcs < 0) {say("rsc: no idle active TCS: no vote sent"); return -16;}
+    const uint64_t base = (uint64_t)l.tcs_stride * (unsigned)tcs, cmdStatus = l.cmd_data + 4;
+    const uint32_t bit = 1u << tcs, irqEnable = rscRead(0), irqStatus = rscRead(l.irq_status);
+    say("rsc: using TCS %d; IRQ_ENABLE %#x, IRQ_STATUS %#x", tcs, irqEnable, irqStatus);
+    if (irqStatus & bit) rscWrite(l.irq_clear, bit, "IRQ_CLEAR (stale completion)");
     const uint32_t addresses[2] = {gLcx.address, gLmx.address}, values[2] = {lcx, lmx};
-    QcomRpmhWrite writes[16];
-    const unsigned n = qcom_rpmh_active_request(&gLayout, (unsigned)gTcs, addresses, values, 2, writes, 16);
-    if (!n) return -22;
-    __atomic_store_n(&gRscDone, 0, __ATOMIC_RELEASE);
-    for (unsigned i = 0; i < n; ++i) wr(gRsc, kRscTcs + writes[i].offset, writes[i].value);
-    uint64_t deadline;
-    clock_interval_to_deadline(100, kMillisecondScale, &deadline);
-    while (!(__atomic_load_n(&gRscDone, __ATOMIC_ACQUIRE) & gRscIrqBits) && mach_absolute_time() < deadline) service(waitEvents(20));
-    const bool done = (__atomic_load_n(&gRscDone, __ATOMIC_ACQUIRE) & gRscIrqBits) != 0;
-    const unsigned m = qcom_rpmh_finish(&gLayout, (unsigned)gTcs, writes, 16);
-    for (unsigned i = 0; i < m; ++i) wr(gRsc, kRscTcs + writes[i].offset, writes[i].value);
-    gVotes = lcx | lmx << 8 | (done ? 0 : 1u << 15);
-    say("rails: lcx index %u, lmx index %u%s", lcx, lmx, done ? "" : " (done bit not seen)");
-    return 0;
+    static const char *const kNames[2][3] = {{"cmd 0 MSGID", "cmd 0 ADDR (lcx.lvl)", "cmd 0 DATA"},
+                                             {"cmd 1 MSGID", "cmd 1 ADDR (lmx.lvl)", "cmd 1 DATA"}};
+    for (unsigned c = 0; c < 2; ++c) {
+        const uint64_t cmd = base + (uint64_t)l.cmd_stride * c;
+        rscWrite(cmd + l.cmd_msgid, kMsgidWriteResp, kNames[c][0]);
+        rscWrite(cmd + l.cmd_addr, addresses[c], kNames[c][1]);
+        rscWrite(cmd + l.cmd_data, values[c], kNames[c][2]);
+    }
+    rscWrite(base + l.wait_for_cmpl, 3, "WAIT_FOR_CMPL");
+    rscWrite(base + l.cmd_enable, 3, "CMD_ENABLE");
+    rscWrite(0, irqEnable | bit, "IRQ_ENABLE");
+    const uint32_t control = rscRead(base + l.control);
+    rscWrite(base + l.control, control & ~kAmcTrigger, "CONTROL (trigger off)");
+    rscWrite(base + l.control, control & ~(kAmcTrigger | kAmcEnable), "CONTROL (AMC mode off)");
+    rscWrite(base + l.control, kAmcEnable, "CONTROL (AMC mode on)");
+    rscWrite(base + l.control, kAmcEnable | kAmcTrigger, "CONTROL (AMC mode on + trigger)");
+    uint32_t irq = 0, s0 = 0, s1 = 0;
+    unsigned waited = 0;
+    for (;; ++waited) {
+        irq = rscRead(l.irq_status) & bit;
+        s0 = rscRead(base + cmdStatus);
+        s1 = rscRead(base + l.cmd_stride + cmdStatus);
+        if ((irq && (s0 & kCmdCompleted) && (s1 & kCmdCompleted)) || waited >= 100) break;
+        IOSleep(1);
+    }
+    const bool completed = irq || ((s0 & kCmdCompleted) && (s1 & kCmdCompleted));
+    say("rsc: %s after %u ms: IRQ_STATUS bit %s, cmd 0 status %#x (%s), cmd 1 status %#x (%s)", completed ? "completed" : "NOT completed",
+        waited, irq ? "set" : "clear", s0, s0 & kCmdCompleted ? "completed" : s0 & kCmdIssued ? "issued" : "not issued", s1,
+        s1 & kCmdCompleted ? "completed" : s1 & kCmdIssued ? "issued" : "not issued");
+    if (completed) {
+        rscWrite(base + l.cmd_enable, 0, "CMD_ENABLE (reclaim)");
+        rscWrite(l.irq_clear, bit, "IRQ_CLEAR");
+        const uint32_t now = rscRead(base + l.control);
+        rscWrite(base + l.control, now & ~kAmcTrigger, "CONTROL (trigger off)");
+        rscWrite(base + l.control, 0, "CONTROL (AMC mode off)");
+    } else {
+        gTcsStuck[tcs] = true;
+        say("rsc: TCS %d left as it is (in flight); not used again", tcs);
+    }
+    rscWrite(0, irqEnable, "IRQ_ENABLE (as it was)");
+    say("rails: lcx index %u, lmx index %u%s", lcx, lmx, completed ? "" : " (completion not seen)");
+    return completed ? 0 : -60;
 }
 
 // ---- secure world calls (Sm8750Scm: INTERRUPTED, WAITQ_SLEEP polled, EBUSY) ----
@@ -315,19 +395,29 @@ void sleepUs(void *, uint32_t us) {if (us >= 1000) IOSleep(us / 1000); else IODe
 void scmLock(void *) {IOLockLock(gScmLock);}
 void scmUnlock(void *) {IOLockUnlock(gScmLock);}
 const Sm8750ScmOps gScmOps = {nullptr, Sm8750ScmSmcInstruction, nowUs, sleepUs, scmLock, scmUnlock, nullptr, nullptr};
-bool scmDone(Sm8750ScmStatus status, const Sm8750SmcResult &r, const char *what) {
+// A secure call with a line before it (and a moment for the console) and one after it: a call the secure world does not return from
+// leaves the first line last in the log.
+template <typename F> bool secure(const char *what, F call) {
+    say("smc: %s: calling", what);
+    IOSleep(20);
+    Sm8750SmcResult r = {};
+    const uint64_t t0 = nowUs(nullptr);
+    const Sm8750ScmStatus status = call(&r);
+    const uint64_t us = nowUs(nullptr) - t0;
     gScmX0 = r.x0;
     gScmX1 = r.x1;
-    if (status == Sm8750ScmOk) return true;
-    say("%s: status %d x0 %lld x1 %#llx (calls %u, waitq %u, busy %u)", what, (int)status, (long long)r.x0, (unsigned long long)r.x1,
-        r.calls, r.waitq, r.busy);
-    return false;
+    say("smc: %s: %s (status %d, x0 %lld, x1 %#llx, %u SMCs: %u interrupted, %u wait-queue, %u busy; %llu us)", what,
+        status == Sm8750ScmOk ? "ok" : "FAILED", (int)status, (long long)r.x0, (unsigned long long)r.x1, r.calls, r.interrupted, r.waitq,
+        r.busy, (unsigned long long)us);
+    return status == Sm8750ScmOk;
 }
 void shutdownPas(uint32_t pas) {
     const uint64_t args[4] = {pas, 0, 0, 0};
-    Sm8750SmcResult r = {};
-    const Sm8750ScmStatus s = Sm8750ScmCall(&gScm, SM8750_SCM_FID(0, Sm8750ScmSvcPil, 0x06), SM8750_SCM_ARGS(1, 0, 0, 0, 0), args, &r);
-    say("PAS %u shut down: status %d x0 %lld", pas, (int)s, (long long)r.x0);
+    char what[32];
+    snprintf(what, sizeof what, "PAS %u shutdown", pas);
+    secure(what, [&](Sm8750SmcResult *out) {
+        return Sm8750ScmCall(&gScm, SM8750_SCM_FID(0, Sm8750ScmSvcPil, 0x06), SM8750_SCM_ARGS(1, 0, 0, 0, 0), args, out);
+    });
 }
 
 void cleanToPoc(const void *start, size_t length) {
@@ -359,8 +449,8 @@ int openImage(Image &image, const char *path) {
     rc = qcom_mdt_parse(&image.mdt, image.size, fileRead, image.file);
     return rc ? 1000 - rc : 0;
 }
-// init_image with the metadata in physically contiguous memory, then the memory setup of a relocatable image.
-int authenticateHeader(Image &image, uint32_t pas, uint64_t base) {
+// The metadata (ELF and program headers, then the hash segment) in physically contiguous memory, cleaned to the point of coherency.
+int prepareMetadata(Image &image, uint64_t *phys) {
     const uint64_t bytes = qcom_mdt_metadata_size(&image.mdt);
     image.meta = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, (IOOptionBits)kIODirectionInOut | (IOOptionBits)kIOMemoryPhysicallyContiguous, bytes,
                                                                  0xfffffffffffff000ull);
@@ -368,24 +458,27 @@ int authenticateHeader(Image &image, uint32_t pas, uint64_t base) {
     uint8_t *va = static_cast<uint8_t *>(image.meta->getBytesNoCopy());
     if (qcom_mdt_metadata(&image.mdt, fileRead, image.file, va, bytes)) return -5;
     cleanToPoc(va, bytes);
-    const uint64_t phys = image.meta->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
-    Sm8750SmcResult r = {};
-    if (!scmDone(Sm8750ScmPasInitImage(&gScm, pas, phys, &r), r, "PAS init_image")) return -1;
-    if (image.mdt.relocatable && !scmDone(Sm8750ScmPasMemSetup(&gScm, pas, base, qcom_mdt_span(&image.mdt), &r), r, "PAS mem_setup"))
-        return -2;
-    return 0;
+    *phys = image.meta->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    say("metadata: %llu bytes at %#llx (%s image, cleaned)", (unsigned long long)bytes, (unsigned long long)*phys,
+        image.mdt.relocatable ? "a relocatable" : "a fixed");
+    return *phys && !(*phys & 0xfff) ? 0 : -14;
 }
 int loadSegments(Image &image, uint64_t base, uint64_t size) {
     Window region = {};
+    say("carveout %#llx + %#llx: mapping write-combined", (unsigned long long)base, (unsigned long long)size);
     if (!mapWindow(region, base, size, kIOMapWriteCombineCache)) return -12;
     constexpr size_t kChunk = 256 * 1024;
     uint8_t *bounce = static_cast<uint8_t *>(IOMallocData(kChunk));
     int rc = bounce ? 0 : -12;
+    unsigned written = 0;
     for (unsigned i = 0; !rc && i < image.mdt.count; ++i) {
         const QcomMdtSegment &s = image.mdt.segment[i];
         uint64_t at = 0;
         if (!s.load) continue;
         if (qcom_mdt_place(&image.mdt, i, base, size, &at)) {rc = -7; break;}
+        if (gKnobs.trace && (written < 3 || i + 1 == image.mdt.count))
+            say("segment %u: %llu bytes from the file, %llu zero, at +%#llx", i, (unsigned long long)s.file_size,
+                (unsigned long long)(s.memory_size > s.file_size ? s.memory_size - s.file_size : 0), (unsigned long long)at);
         uint8_t *to = const_cast<uint8_t *>(region.va) + at;
         for (uint64_t done = 0; !rc && done < s.file_size;) {
             const size_t n = s.file_size - done < kChunk ? (size_t)(s.file_size - done) : kChunk;
@@ -394,11 +487,45 @@ int loadSegments(Image &image, uint64_t base, uint64_t size) {
             done += n;
         }
         if (!rc && s.memory_size > s.file_size) bzero(to + s.file_size, (size_t)(s.memory_size - s.file_size));
+        written++;
     }
     __asm__ volatile("dsb sy" ::: "memory");
     if (bounce) IOFreeData(bounce, kChunk);
     unmap(region);
+    say("carveout: %u segments written, unmapped (%d)", written, rc);
     return rc;
+}
+
+// One image: metadata, init_image, mem_setup (relocatable images), segments, auth_and_reset, each its own step (firstStep .. +4).
+// Returns 0 when started, 1 when piano-power-stop ended it, negative on a failure.
+int startImage(Image &image, const char *name, uint32_t pas, uint64_t base, uint64_t size, int firstStep) {
+    char what[64];
+    uint64_t phys = 0;
+    int rc;
+    if (!begin(firstStep, name)) return 1;
+    if ((rc = prepareMetadata(image, &phys))) return rc;
+    stage(firstStep);
+    if (!begin(firstStep + 1, name)) return 1;
+    snprintf(what, sizeof what, "PAS init_image (%s, PAS %u)", name, pas);
+    if (!secure(what, [&](Sm8750SmcResult *r) {return Sm8750ScmPasInitImage(&gScm, pas, phys, r);})) return -1;
+    stage(firstStep + 1);
+    if (image.mdt.relocatable) {
+        if (!begin(firstStep + 2, name)) return 1;
+        const uint64_t span = qcom_mdt_span(&image.mdt);
+        snprintf(what, sizeof what, "PAS mem_setup (%s, %#llx + %#llx)", name, (unsigned long long)base, (unsigned long long)span);
+        if (!secure(what, [&](Sm8750SmcResult *r) {return Sm8750ScmPasMemSetup(&gScm, pas, base, span, r);})) return -2;
+        stage(firstStep + 2);
+    } else {
+        say("step %d (%s): not needed, a fixed image", firstStep + 2, piano_adsp_stage_name(firstStep + 2));
+    }
+    if (!begin(firstStep + 3, name)) return 1;
+    if ((rc = loadSegments(image, base, size))) return rc;
+    stage(firstStep + 3);
+    if (!begin(firstStep + 4, name)) return 1;
+    snprintf(what, sizeof what, "PAS auth_and_reset (%s, PAS %u)", name, pas);
+    if (!secure(what, [&](Sm8750SmcResult *r) {return Sm8750ScmPasAuthAndReset(&gScm, pas, r);})) return -3;
+    stage(firstStep + 4);
+    return 0;
 }
 
 // ---- events ----
@@ -418,7 +545,7 @@ void serviceSmp2p() {
     if ((value & kHandover) && !gHandedOver) {
         gHandedOver = true;
         say("handover: the DSP holds its own votes now");
-        vote(0, 0);
+        if (gVoted) {vote(0, 0, "proxy votes off at handover"); gVoted = false;}
     }
 }
 
@@ -509,7 +636,8 @@ void pumpSends() {
 // ---- the bring-up ----
 void enableDoorbells() {
     const uint32_t enable[3] = {ipccId(kClientLpass, kSignalSmp2p), ipccId(kClientLpass, kSignalGlinkQmp), ipccId(kClientAop, kSignalGlinkQmp)};
-    for (uint32_t id : enable) wr(gIpcc, kIpccRecvEnable, id);
+    static const char *const kNames[3] = {"RECV_ENABLE LPASS SMP2P", "RECV_ENABLE LPASS GLINK", "RECV_ENABLE AOP QMP"};
+    for (unsigned i = 0; i < 3; ++i) ipccWrite(kIpccRecvEnable, enable[i], kNames[i]);
     gDoorbellsOn = true;
 }
 
@@ -543,11 +671,16 @@ void shutdownDsp(bool dtb, bool adsp) {
     if (dtb) shutdownPas(kPasDtb);
 }
 
+void dropVotes() {
+    if (gVoted) {vote(0, 0, "proxy votes off after a failure"); gVoted = false;}
+}
+
 bool start() {
     char dir[80] = "";
     const bool chosen = PE_parse_boot_argn("piano-power-fw", dir, sizeof dir) && dir[0];
     char path[112];
     Image &dtb = gDtbImage, &adsp = gAdspImage;
+    if (!begin(PianoAdspFirmware, chosen ? dir : "modem_a (else modem_b) image/ through NativeUfs, read only")) return false;
     int rc = openFirmware(dtb, adsp, path, sizeof path, chosen ? dir : nullptr);
     if (rc) {note("fw: ", path); fail(PianoAdspFirmware, rc); return false;}
     gAdspKib = (uint32_t)(adsp.size >> 10);
@@ -559,52 +692,86 @@ bool start() {
     }
 
     // Our SMP2P item, before the DSP starts (it looks for it at boot).
+    if (!begin(PianoAdspSmp2p, "SMEM item 429 under TCSR mutex 3 (0x1f43000)")) {release(dtb); release(adsp); return false;}
     if ((rc = allocItem(kItemOut, QCOM_SMP2P_ITEM_BYTES))) {fail(PianoAdspSmp2p, rc); release(dtb); release(adsp); return false;}
     qcom_smp2p_init_out(&gP2p, reinterpret_cast<volatile uint32_t *>(item(kItemOut, nullptr)), 0, kRemotePid);
     gStopEntry = qcom_smp2p_add_entry(&gP2p, "master-kernel");
     stage(PianoAdspSmp2p);
+    if (!begin(PianoAdspDoorbells, "IPCC 0x406000: receive LPASS SMP2P/GLINK and AOP, ring LPASS SMP2P")) {
+        release(dtb); release(adsp); return false;
+    }
     enableDoorbells();
-    kickSmp2p();
+    ipccWrite(kIpccSend, ipccId(kClientLpass, kSignalSmp2p), "SEND LPASS SMP2P");
     stage(PianoAdspDoorbells);
 
-    qcom_qmp_init(&gQmp, reinterpret_cast<volatile uint32_t *>(gAoss.va), 0x400, kickAop, nullptr);
-    for (int phase = 0; phase < 4 && qcom_qmp_step(&gQmp) > 0 && gQmp.state != QcomQmpOpen; ++phase)
-        waitUntil(1000, [] {return qcom_qmp_step(&gQmp) == QcomQmpOpen || gQmp.state < 0;});
-    if (gQmp.state != QcomQmpOpen) {fail(PianoAdspLoadState, gQmp.state); release(dtb); release(adsp); return false;}
-    qcom_qmp_send(&gQmp, "{class: image, res: load_state, name: adsp, val: on}");
-    if (!waitUntil(1000, [] {return qcom_qmp_step(&gQmp) == QcomQmpOpen;})) {
-        qcom_qmp_abandon(&gQmp);
-        fail(PianoAdspLoadState, -60); release(dtb); release(adsp); return false;
+    if (gKnobs.qmp) {
+        if (!begin(PianoAdspLoadState, "AOSS QMP 0xc300000 (polled): open, then {class: image, res: load_state, name: adsp, val: on}")) {
+            release(dtb); release(adsp); return false;
+        }
+        qcom_qmp_init(&gQmp, reinterpret_cast<volatile uint32_t *>(gAoss.va), 0x400, kickAop, nullptr);
+        for (int phase = 0; phase < 4 && qcom_qmp_step(&gQmp) > 0 && gQmp.state != QcomQmpOpen; ++phase) {
+            waitUntil(1000, [] {return qcom_qmp_step(&gQmp) == QcomQmpOpen || gQmp.state < 0;});
+            say("qmp: state %d after phase %d", gQmp.state, phase);
+        }
+        if (gQmp.state != QcomQmpOpen) {fail(PianoAdspLoadState, gQmp.state); release(dtb); release(adsp); return false;}
+        say("qmp: open; sending load_state");
+        qcom_qmp_send(&gQmp, "{class: image, res: load_state, name: adsp, val: on}");
+        if (!waitUntil(1000, [] {return qcom_qmp_step(&gQmp) == QcomQmpOpen;})) {
+            qcom_qmp_abandon(&gQmp);
+            fail(PianoAdspLoadState, -60); release(dtb); release(adsp); return false;
+        }
+        say("qmp: the AOP took the message");
+        stage(PianoAdspLoadState);
+    } else {
+        say("step %d (%s) skipped: piano-power-qmp=0", PianoAdspLoadState, piano_adsp_stage_name(PianoAdspLoadState));
     }
-    stage(PianoAdspLoadState);
 
-    // A copy of the command database, held only while the levels are looked up.
-    struct CmdDbCopy {uint8_t *bytes = static_cast<uint8_t *>(IOMallocData(kCmdDbSize)); ~CmdDbCopy() {if (bytes) IOFreeData(bytes, kCmdDbSize);}} copy;
-    uint8_t *const db = copy.bytes;
-    uint32_t lcx = 0, lmx = 0;
-    if (!db || !readCmdDb(db) || qcom_cmd_db_find(db, kCmdDbSize, "lcx.lvl", &gLcx) || qcom_cmd_db_find(db, kCmdDbSize, "lmx.lvl", &gLmx) ||
-        qcom_rpmh_level_index(&gLcx, 0xffffffffu, &lcx) || qcom_rpmh_level_index(&gLmx, 0xffffffffu, &lmx)) {
-        fail(PianoAdspRails, -2); release(dtb); release(adsp); return false;
+    if (gKnobs.rpmh) {
+        if (!begin(PianoAdspRails, "cmd-db lcx.lvl/lmx.lvl, highest level, apps RSC drv-2 active TCS")) {release(dtb); release(adsp); return false;}
+        // A copy of the command database, held only while the levels are looked up.
+        struct CmdDbCopy {uint8_t *bytes = static_cast<uint8_t *>(IOMallocData(kCmdDbSize)); ~CmdDbCopy() {if (bytes) IOFreeData(bytes, kCmdDbSize);}} copy;
+        uint8_t *const db = copy.bytes;
+        uint32_t lcx = 0, lmx = 0;
+        if (!db || !readCmdDb(db) || qcom_cmd_db_find(db, kCmdDbSize, "lcx.lvl", &gLcx) || qcom_cmd_db_find(db, kCmdDbSize, "lmx.lvl", &gLmx) ||
+            qcom_rpmh_level_index(&gLcx, 0xffffffffu, &lcx) || qcom_rpmh_level_index(&gLmx, 0xffffffffu, &lmx)) {
+            fail(PianoAdspRails, -2); release(dtb); release(adsp); return false;
+        }
+        say("cmd-db: lcx.lvl at %#x (%u levels, top %u), lmx.lvl at %#x (%u levels, top %u)", gLcx.address, gLcx.level_count,
+            gLcx.level_count ? gLcx.levels[gLcx.level_count - 1] : 0, gLmx.address, gLmx.level_count,
+            gLmx.level_count ? gLmx.levels[gLmx.level_count - 1] : 0);
+        gVoted = true;   // a vote that did not complete may still take effect: it is taken back at handover or on a failure
+        if ((rc = vote(lcx, lmx, "proxy votes for the DSP start"))) {
+            fail(PianoAdspRails, rc); dropVotes(); release(dtb); release(adsp); return false;
+        }
+        stage(PianoAdspRails);
+    } else {
+        say("step %d (%s) skipped: piano-power-rpmh=0 (the rails stay where the boot stages and the AOP left them)", PianoAdspRails,
+            piano_adsp_stage_name(PianoAdspRails));
     }
-    if ((rc = vote(lcx, lmx))) {fail(PianoAdspRails, rc); release(dtb); release(adsp); return false;}
-    stage(PianoAdspRails);
 
     // The DSP's devicetree image first, as its own authenticated image, then the DSP image.
-    Sm8750SmcResult r = {};
-    if ((rc = authenticateHeader(dtb, kPasDtb, kDtbBase)) || (rc = loadSegments(dtb, kDtbBase, kDtbSize)) ||
-        (rc = scmDone(Sm8750ScmPasAuthAndReset(&gScm, kPasDtb, &r), r, "PAS auth_and_reset (DTB)") ? 0 : -3)) {
-        fail(PianoAdspDtb, rc); vote(0, 0); release(dtb); release(adsp); return false;
+    rc = startImage(dtb, "DTB", kPasDtb, kDtbBase, kDtbSize, PianoAdspDtbMeta);
+    if (rc) {
+        if (rc < 0) {
+            const int step = gCurrent;
+            fail(step, rc);
+            if (step > PianoAdspDtbInit) shutdownDsp(true, false);
+            dropVotes();
+        }
+        release(dtb); release(adsp); return false;
     }
-    stage(PianoAdspDtb);
-    if ((rc = authenticateHeader(adsp, kPasAdsp, kAdspBase)) || (rc = loadSegments(adsp, kAdspBase, kAdspSize))) {
-        fail(PianoAdspLoaded, rc); shutdownDsp(true, false); vote(0, 0); release(dtb); release(adsp); return false;
+    rc = startImage(adsp, "DSP", kPasAdsp, kAdspBase, kAdspSize, PianoAdspMeta);
+    if (rc) {
+        if (rc < 0) {
+            const int step = gCurrent;
+            fail(step, rc);
+            shutdownDsp(true, step > PianoAdspInit);
+            dropVotes();
+        }
+        release(dtb); release(adsp); return false;
     }
-    stage(PianoAdspLoaded);
+    if (!begin(PianoAdspReady, "SMP2P slave-kernel ready (bit 1) or fatal (bit 0), at most 5 s")) {release(dtb); release(adsp); return false;}
     const uint64_t began = mach_absolute_time();
-    if (!scmDone(Sm8750ScmPasAuthAndReset(&gScm, kPasAdsp, &r), r, "PAS auth_and_reset (DSP)")) {
-        fail(PianoAdspStarted, -3); shutdownDsp(true, false); vote(0, 0); release(dtb); release(adsp); return false;
-    }
-    stage(PianoAdspStarted);
     const bool ready = waitUntil(5000, [] {return (gSlave & (kReady | kFatal)) != 0;});
     uint64_t ns = 0;
     absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
@@ -615,7 +782,7 @@ bool start() {
         noteCrash();
         fail(PianoAdspReady, ready ? -5 : -60);
         shutdownDsp(true, true);
-        if (!gHandedOver) vote(0, 0);
+        if (!gHandedOver) dropVotes();
         return false;
     }
     say("ready after %u ms", gReadyMs);
@@ -624,6 +791,7 @@ bool start() {
 }
 
 bool startGlink() {
+    say("GLINK: SMEM items 478 (descriptor) and 479 (our FIFO, %u bytes); the DSP's FIFO is item 480", kGlinkFifo);
     int rc = allocItem(kItemGlinkDesc, 32);
     if (!rc) rc = allocItem(kItemGlinkTx, kGlinkFifo);
     uint32_t size = 0;
@@ -649,6 +817,10 @@ void adspThread(void *, wait_result_t) {
         survey(&s);
     }
     stage(PianoAdspSurveyed);
+    if (gKnobs.delay) {
+        say("waiting %u s before the bring-up (piano-power-delay)", gKnobs.delay);
+        IOSleep(gKnobs.delay * 1000);
+    }
     if (!start() || !startGlink()) return;
     gSliceMs = kSteadySliceMs;
     // From here on the thread only answers doorbells and client sends; while a send waits for an intent or FIFO room it looks again
@@ -715,6 +887,14 @@ extern "C" void piano_adsp_start(void) {
     if (!gClientLock) gClientLock = IOLockAlloc();
     gScmLock = IOLockAlloc();
     if (!gClientLock || !gScmLock) {fail(PianoAdspMapped, -12); return;}
+    PE_parse_boot_argn("piano-power-delay", &gKnobs.delay, sizeof gKnobs.delay);
+    PE_parse_boot_argn("piano-power-stop", &gKnobs.stop, sizeof gKnobs.stop);
+    PE_parse_boot_argn("piano-power-qmp", &gKnobs.qmp, sizeof gKnobs.qmp);
+    PE_parse_boot_argn("piano-power-rpmh", &gKnobs.rpmh, sizeof gKnobs.rpmh);
+    PE_parse_boot_argn("piano-power-trace", &gKnobs.trace, sizeof gKnobs.trace);
+    if (gKnobs.delay > 600) gKnobs.delay = 600;
+    say("bring-up: delay %u s, stop before step %u%s, AOSS load_state %s, lcx/lmx votes %s, trace %s", gKnobs.delay, gKnobs.stop,
+        gKnobs.stop ? "" : " (none)", gKnobs.qmp ? "on" : "off", gKnobs.rpmh ? "on" : "off", gKnobs.trace ? "on" : "off");
     Sm8750ScmInit(&gScm, &gScmOps);
     gScm.budget_us = 30u * 1000u * 1000u;  // a large image's authentication takes longer than the default second
     piano_qrtr_start();                    // the router link registers before the DSP can open it
@@ -745,8 +925,10 @@ extern "C" void piano_adsp_status(PianoAdspStatus *out) {
 
 extern "C" const char *piano_adsp_stage_name(int stage) {
     static const char *const names[] = {"none", "windows mapped", "surveyed", "firmware opened", "SMP2P item", "doorbells",
-                                        "AOSS load_state", "lcx/lmx votes", "DTB image started", "DSP image loaded", "DSP started",
-                                        "DSP ready", "GLINK version agreed", "a channel up"};
+                                        "AOSS load_state", "lcx/lmx votes", "DTB metadata", "DTB PAS init_image", "DTB PAS mem_setup",
+                                        "DTB segments", "DTB PAS auth_and_reset", "DSP metadata", "DSP PAS init_image",
+                                        "DSP PAS mem_setup", "DSP segments", "DSP PAS auth_and_reset", "DSP ready",
+                                        "GLINK version agreed", "a channel up"};
     const int s = stage < 0 ? -stage : stage;
     return s < (int)(sizeof names / sizeof names[0]) ? names[s] : "?";
 }

@@ -18,9 +18,13 @@ porting.toml), package/:
       every step (survey, SMP2P item, doorbells, AOSS load_state, cmd-db + lcx/lmx votes through RSC TCS 1, DTB then DSP image
       with init_image/mem_setup/segments/auth_and_reset, ready/fatal/handover on SMP2P, GLINK descriptor and FIFOs, the client queue).
       Changed: SM8750 addresses (IPCC 0x406000, RSC drv-2 0x16520000, carveouts 0xb8200000 + 0x5780000 and 0x9ed80000 + 0x80000);
-      no interrupts (the IPCC doorbells and the RSC done bit are polled from the DSP thread: the native KC has no armcpu_spi_attach);
-      the secure calls through Sm8750Scm instead of its own SMC loop; one firmware source (modem_a, or piano-power-fw=DIR); a console
-      line per stage and a status struct instead of the native_adsp_stats arrays; the survey exported for piano-power=1.
+      no interrupts (the IPCC doorbells and the RSC completion are polled from the DSP thread: the native KC has no
+      armcpu_spi_attach); the secure calls through Sm8750Scm instead of its own SMC loop; one firmware source (modem_a, or
+      piano-power-fw=DIR); numbered steps with a console line before and after each, every secure call and RSC/IPCC register write
+      traced, piano-power-delay/stop/qmp/rpmh/trace; a status struct instead of the native_adsp_stats arrays; the survey exported for
+      piano-power=1. The lcx/lmx vote is written fresh (vote() in PianoAdsp.cpp) after Linux rpmh-rsc's request sequence (idle TCS
+      by DRV_STATUS, trigger and mode cleared in that order, CMD_STATUS checked, a TCS in flight left alone); sheng's
+      qcom_rpmh_active_request/qcom_rpmh_finish are no longer called (QcomRpmh.c still provides the cmd-db lookup and the layout).
     AdspFirmware.c (ced26abf9e7ae3033dceaa1d39ccbf85e73abc636aac41aa7e3d3b2741e67a7c) -> PianoAdspFirmware.c: the headers from
       NAME.mdt when there is no NAME.b00 (piano's modem_a), piece 0 read from that file; names piano_fw_*; strong imports of
       NativeUfs's native_ufs_part_find/native_ufs_part_read (package/NativeUfs exports them).
@@ -56,5 +60,7 @@ Specification only (GPL-2.0, read, never copied): the piano MCA property protoco
 from Project-SunUEFI patches/linux/7.3/0001-platform.patch (drivers/power/supply/piano_mca.c, GPL-2.0-only) and its
 docs/devel/linux/kernel.md; Ubuntu's piano-charging.service (xiaomipad-8pro-mainline packaging) and the shipped xiaomi_mca.ko module
 descriptions. PianoMca.c describes and implements that behaviour in its own code. The bq27z561 standard commands come from TI's
-datasheet; the SM8750 addresses from piano's live DT (out/inputs/piano-boot.dtb). Not used at all: the K90 annibale drivers
-(APSL-2.0), Linux's qcom_battmgr, pmic_glink, qcom_q6v5_pas, bq27xxx and spmi-pmic-arb sources.
+datasheet; the SM8750 addresses from piano's live DT (out/inputs/piano-boot.dtb). The K90 annibale drivers
+(unixnu-research/hackios-xnu-kernel-k90, annibale_adsp.c and annibale_adsp_fw.inc, APSL-2.0) were read for facts only (that the
+SM8750 DSP starts from XNU at EL1; its order, TCS choice and the no-overlapping-secure-calls rule; docs/drivers/charging.md §5a); no
+code is taken. Not used at all: Linux's qcom_battmgr, pmic_glink, qcom_q6v5_pas, bq27xxx and spmi-pmic-arb sources.

@@ -58,10 +58,14 @@ typedef struct {
 void piano_adsp_status(PianoAdspStatus *out);
 const char *piano_adsp_stage_name(int stage);
 
+/* The bring-up steps, in order; piano-power-stop=N stops before step N. Each image has five: metadata, init_image, mem_setup (only
+ * a relocatable image), segments, auth_and_reset. */
 enum PianoAdspStage {
     PianoAdspMapped = 1, PianoAdspSurveyed = 2, PianoAdspFirmware = 3, PianoAdspSmp2p = 4, PianoAdspDoorbells = 5,
-    PianoAdspLoadState = 6, PianoAdspRails = 7, PianoAdspDtb = 8, PianoAdspLoaded = 9, PianoAdspStarted = 10, PianoAdspReady = 11,
-    PianoAdspGlink = 12, PianoAdspChannelUp = 13,
+    PianoAdspLoadState = 6, PianoAdspRails = 7,
+    PianoAdspDtbMeta = 8, PianoAdspDtbInit = 9, PianoAdspDtbSetup = 10, PianoAdspDtbLoad = 11, PianoAdspDtbAuth = 12,
+    PianoAdspMeta = 13, PianoAdspInit = 14, PianoAdspSetup = 15, PianoAdspLoad = 16, PianoAdspAuth = 17,
+    PianoAdspReady = 18, PianoAdspGlink = 19, PianoAdspChannelUp = 20,
 };
 
 /* The IPC router's link and service locator (PianoQrtr.c): registered before the DSP starts. */
