@@ -6,7 +6,7 @@
     stage-gpu-plugin.py does), so AMFI and libsystem_sandbox's gpu_bundle_find_trusted accept the ad hoc signed plugin.
 
     stage-soft-metal.py [--seed out/inputs/scratch-data.img] [--trust out/inputs/kernel.macho.trustcache] [--out out/soft-metal]
-                        [--boot-run COMMAND]... [--log-stream PREDICATE | --log-errors PREDICATE] [BUNDLE]
+                        [--boot-run COMMAND]... [--log-stream PREDICATE | --log-errors PREDICATE] [--reduce-transparency] [BUNDLE]
 
 Then: PIANO_SEED=out/soft-metal/scratch-data.img PIANO_TRUST=out/soft-metal/kernel.macho.trustcache tooling/k27/build-native-image.sh.
 The seed is the packed DBRDISK1 disk (NativeRamBlock SeedDisk.h). It is unpacked to a sparse raw file, attached with hdiutil (no mount),
@@ -31,6 +31,10 @@ Each line is printed by its own write, cut to 150 characters: the kernel's stder
 buffered `log show` writing many lines at once would lose all but the first.
 --log-errors PREDICATE is the same for the error and fault messages only (messageType error or fault): the measured run of 2026-11-11
 with every WindowServer and loginwindow message wrapped the 7 MiB console ring, and the crash messages of the last aborts were lost.
+`log show`'s own stderr is discarded ("Invalidation reason: Connection init failed ..." from the tool itself filled the next run).
+--reduce-transparency makes the boot job write Accessibility's Reduce transparency as managed preferences, for the computer and for each
+user with a home, before settime.sh (REDUCE_TRANSPARENCY below). Files the boot job writes are root's. The first boot of a new seed
+may already be past loginwindow's read when they appear; data-persist=2 keeps them, and every later boot has them from the start.
 """
 import argparse
 import hashlib
@@ -54,6 +58,15 @@ LC_CODE_SIGNATURE = 0x1d
 GPU_BUNDLES = 'Library/GPUBundles'
 BOOT_JOB = 'Library/LaunchDaemons/org.droidvm.run.0.plist'
 SETTIME = 'sh /private/var/settime.sh'
+# Accessibility's Reduce transparency, as managed preferences for the computer and for each user with a home (what macOS-DroidVM's
+# stage-gpu-plugin.py --reduce-transparency wrote), so it holds for loginwindow before anyone logs in. Clients then draw opaque views
+# instead of backdrop layers (blur, vibrancy), which Core Animation's software renderer asserts on (§11 of docs/drivers/soft-metal.md).
+# Written by the boot job, as root, before anything else in it: the files must be root's, which this Mac cannot make on the seed.
+REDUCE_TRANSPARENCY = ("mp='/Library/Managed Preferences'; "
+                       "rt='<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>reduceTransparency</key><true/></dict></plist>'; "
+                       'mkdir -p "$mp"; printf "%s\\n" "$rt" > "$mp/com.apple.universalaccess.plist"; '
+                       'for u in /Users/*; do n=${u##*/}; [ "$n" = Shared ] && continue; mkdir -p "$mp/$n"; '
+                       'printf "%s\\n" "$rt" > "$mp/$n/com.apple.universalaccess.plist"; done; chmod -R go-w,a+rX "$mp"')
 
 
 def cdhash(path):
@@ -102,15 +115,15 @@ def run(*command, **kw):
     return subprocess.run(command, check=True, **kw)
 
 
-def set_boot_commands(job, commands):
-    """The seed's boot job, rewritten in place (same file, same owner): settime.sh first, then COMMANDS."""
+def set_boot_commands(job, commands, early=()):
+    """The seed's boot job, rewritten in place (same file, same owner): EARLY, then settime.sh, then COMMANDS."""
     if not job.is_file():
         raise SystemExit(f'{job}: the seed has no boot job to extend; a new plist would not be root\'s and launchd would refuse it')
     record = plistlib.loads(job.read_bytes())
     arguments = record.get('ProgramArguments', [])
     if len(arguments) != 3 or arguments[0] != '/bin/sh' or SETTIME not in arguments[2]:
         raise SystemExit(f'{job}: not the expected boot job ({arguments}); check it by hand')
-    script = '; '.join([SETTIME, *commands])
+    script = '; '.join([*early, SETTIME, *commands])
     record['ProgramArguments'] = ['/bin/sh', '-c', script]
     job.write_bytes(plistlib.dumps(record, fmt=plistlib.FMT_XML))
     subprocess.run(['xattr', '-c', str(job)], check=False)   # the build Mac's com.apple.provenance tag
@@ -140,9 +153,12 @@ def main():
     p.add_argument('--boot-run', metavar='COMMAND', action='append', default=[])
     p.add_argument('--log-stream', metavar='PREDICATE')
     p.add_argument('--log-errors', metavar='PREDICATE')
+    p.add_argument('--reduce-transparency', action='store_true')
     p.add_argument('bundle', nargs='?', type=Path, default=D / 'out/soft-metal/NativeSoftMetal.bundle')
     a = p.parse_args()
-    commands = list(a.boot_run)
+    commands, early = list(a.boot_run), []
+    if a.reduce_transparency:
+        early.append(REDUCE_TRANSPARENCY)
     if a.log_stream and a.log_errors:
         raise SystemExit('--log-stream or --log-errors, not both')
     if a.log_stream or a.log_errors:
@@ -150,7 +166,7 @@ def main():
         info = ' --info' if a.log_stream else ''
         # one write per line (printf, a shell builtin), the header line left out
         lines = 'while IFS= read -r line; do case $line in Timestamp*) ;; *) printf "%.150s\\n" "$line" ;; esac; done'
-        commands += [f'while :; do log show --last 25s{info} --style compact --predicate {shlex.quote(predicate)} 2>&1 | {lines}; '
+        commands += [f'while :; do log show --last 25s{info} --style compact --predicate {shlex.quote(predicate)} 2>/dev/null | {lines}; '
                      'sleep 20; done']
     bundle = a.bundle.resolve()
     if not (bundle / 'Contents/Info.plist').is_file():
@@ -193,8 +209,8 @@ def main():
                 root = run('ls', '-la', str(mount), capture_output=True, text=True).stdout
                 print(f'{volume}: /{GPU_BUNDLES}/{bundle.name}\n{listing}extended attributes left: {left or "none"}\n'
                       f'volume root:\n{root}')
-                if commands:
-                    print(f'/{BOOT_JOB} runs: ' + set_boot_commands(mount / BOOT_JOB, commands))
+                if commands or early:
+                    print(f'/{BOOT_JOB} runs: ' + set_boot_commands(mount / BOOT_JOB, commands, early))
             finally:
                 run('diskutil', 'unmount', str(mount), stdout=subprocess.DEVNULL)
         finally:

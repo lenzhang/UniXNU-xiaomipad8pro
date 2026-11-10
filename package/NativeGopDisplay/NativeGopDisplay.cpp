@@ -199,6 +199,7 @@ private:
     // mean luminance of its samples, as one of kThumbRamp's characters.
     static constexpr unsigned kThumbCols = 80, kThumbRows = 27, kSampleStep = 4;
     uint32_t fThumbPeriod;
+    uint32_t fThumbLimit, fThumbsTaken;   // boot-arg native-gop-display-thumbs=N: at most N a boot (default 3, 0: no limit)
     uint64_t fThumbNext;              // mach time the next thumbnail is due (0: on the next new frame)
     volatile bool fThumbRequested;    // a refresh copy was asked for to take it (a static screen has no new frames)
     uint32_t *fThumbLuma, *fThumbCount;
@@ -364,6 +365,8 @@ bool NativeGopDisplay::start(IOService *provider)
     fRefreshCopies = refresh != 0;
     fThumbPeriod = 30;
     PE_parse_boot_argn("native-gop-display-thumb", &fThumbPeriod, sizeof(fThumbPeriod));
+    fThumbLimit = 3;   // the console ring is 7 MiB and a thumbnail is about 3 KB: a few say what the panel showed
+    PE_parse_boot_argn("native-gop-display-thumbs", &fThumbLimit, sizeof(fThumbLimit));
     if (!readFramebuffer())
         return false;
     IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress(fVideoPhys, fVideo.v_rowBytes * fVideo.v_height,
@@ -411,8 +414,9 @@ bool NativeGopDisplay::start(IOService *provider)
         OSSafeReleaseNULL(fScanoutMap);
         return false;
     }
-    IOLog("NativeGopDisplay: started, display %ux%u at %u Hz, %ux%u mm, %s copies, thumbnail %s%u s\n", display_width(), display_height(),
-          fRefreshHz, fWidthMM, fHeightMM, fRefreshCopies ? "with refresh" : "no refresh", fThumbPeriod ? "every " : "off: ", fThumbPeriod);
+    IOLog("NativeGopDisplay: started, display %ux%u at %u Hz, %ux%u mm, %s copies, thumbnail %s%u s (at most %u, 0: no limit)\n",
+          display_width(), display_height(), fRefreshHz, fWidthMM, fHeightMM, fRefreshCopies ? "with refresh" : "no refresh",
+          fThumbPeriod ? "every " : "off: ", fThumbPeriod, fThumbLimit);
     return true;
 }
 
@@ -961,6 +965,10 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
         nanoseconds_to_absolutetime(static_cast<uint64_t>(fThumbPeriod) * 1000000000ULL, &period);
         fThumbNext = mach_absolute_time() + period;
         fThumbRequested = false;
+        if (fThumbLimit && ++fThumbsTaken >= fThumbLimit) {
+            fThumbPeriod = 0;
+            IOLog("NativeGopDisplay: %u thumbnails taken, no more this boot (native-gop-display-thumbs)\n", fThumbsTaken);
+        }
     }
     if (refresh)
         return;

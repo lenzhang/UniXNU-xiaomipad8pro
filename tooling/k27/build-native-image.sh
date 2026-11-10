@@ -18,6 +18,8 @@ python3 tooling/adt/make-piano-adt.py out/adt/piano-k27.adt --unique-chip-id "${
 # (tooling/k27/stage-soft-metal.py, out/soft-metal), which the image then takes unless PIANO_SEED / PIANO_TRUST name others. The staging
 # is redone only when its inputs change (out/soft-metal/stamp): a new seed is a new seed identity, and data-persist=2 starts its store
 # over for one. PIANO_SOFT_METAL_LOG=PREDICATE adds the error/fault log loop (stage-soft-metal.py --log-errors) to the seed's boot job.
+# Reduce transparency is staged too (--reduce-transparency: clients draw no backdrop layers, which Core Animation's software renderer
+# asserts on); PIANO_REDUCE_TRANSPARENCY=0 leaves it out.
 SOFT_METAL=${PIANO_SOFT_METAL:-}
 if [ -z "$SOFT_METAL" ]; then
   case " $LIST ${PIANO_EXTRA_KEXTS:-} " in *NativeSoftGpu*) SOFT_METAL=1 ;; *) SOFT_METAL=0 ;; esac
@@ -25,9 +27,10 @@ fi
 if [ "$SOFT_METAL" = 1 ]; then
   tooling/k27/build-soft-metal-plugin.sh > out/k27/build-soft-metal-plugin.log 2>&1 || { grep -E "error" out/k27/build-soft-metal-plugin.log | head; exit 1; }
   STAMP=$( { shasum -a 256 out/inputs/scratch-data.img out/inputs/kernel.macho.trustcache tooling/k27/stage-soft-metal.py
-             find out/soft-metal/NativeSoftMetal.bundle -type f | sort | xargs shasum -a 256; echo "log ${PIANO_SOFT_METAL_LOG:-}"; } | shasum -a 256 | cut -c1-16)
+             find out/soft-metal/NativeSoftMetal.bundle -type f | sort | xargs shasum -a 256; echo "log ${PIANO_SOFT_METAL_LOG:-} rt ${PIANO_REDUCE_TRANSPARENCY:-1}"; } | shasum -a 256 | cut -c1-16)
   if [ "$(cat out/soft-metal/stamp 2>/dev/null)" != "$STAMP" ] || [ ! -f out/soft-metal/scratch-data.img ]; then
-    python3 tooling/k27/stage-soft-metal.py ${PIANO_SOFT_METAL_LOG:+--log-errors "$PIANO_SOFT_METAL_LOG"} > out/k27/stage-soft-metal.log 2>&1 \
+    RT=; [ "${PIANO_REDUCE_TRANSPARENCY:-1}" = 1 ] && RT=--reduce-transparency
+    python3 tooling/k27/stage-soft-metal.py ${PIANO_SOFT_METAL_LOG:+--log-errors "$PIANO_SOFT_METAL_LOG"} $RT > out/k27/stage-soft-metal.log 2>&1 \
       || { tail -5 out/k27/stage-soft-metal.log; exit 1; }
     echo "$STAMP" > out/soft-metal/stamp
   fi

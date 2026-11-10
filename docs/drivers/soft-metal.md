@@ -314,3 +314,46 @@ Every thumbnail of the frames WindowServer swapped was black (`0.0% non-black, m
 CoreAnimation's software renderer: `Assertion failed: (r.update ()->_backdrop_invalidations_finalized), function
 prepare_layers_roi, file ogl-layer.cpp, line 7179` (`CA::OGL::Renderer::render` → `prepare_layers_roi` / `prepare_sublayers_`):
 backdrop (blur/vibrancy) layers. Next: no backdrop layers for the software renderer; devices for the clients too.
+
+## 11. The backdrop assertion, and the next run (2026-11-11)
+
+Measured (9a88374c): every thumbnail black (0.0% non-black), and WindowServer aborts on
+`Assertion failed: (r.update ()->_backdrop_invalidations_finalized), function prepare_layers_roi, file ogl-layer.cpp` in Core
+Animation's renderer (`CA::OGL::prepare_layers_roi` under `LayerNode::prepare_sublayers_` and `Renderer::render`), the software
+renderer WindowServer now uses. Backdrop layers are the blur and vibrancy materials; the login window and the menu bar use them.
+
+There is no switch for them in Core Animation itself. The debug options that mention backdrops (listed by name through
+`CAGetDebugOptionEnvVariableName` on 26.6: `CA_PRINT_BACKDROPS`, `CA_COLOR_BACKDROPS`, `CA_DISABLE_BACKDROP_CACHE`) only print, colour or
+uncache them. So the lever is the clients. With Accessibility's **Reduce transparency**, AppKit draws its visual-effect views opaque,
+and loginwindow's UI and the menu bar put no backdrop layer into the tree.
+
+This change:
+- **Reduce transparency staged** (`stage-soft-metal.py --reduce-transparency`, on by default in `build-native-image.sh`;
+  `PIANO_REDUCE_TRANSPARENCY=0` leaves it out). These are managed preferences, `/Library/Managed Preferences/com.apple.universalaccess.plist`
+  for the computer and `/Library/Managed Preferences/<user>/…` for each user with a home (the seed has `leo`), as macOS-DroidVM's
+  staging wrote them. The seed's root boot job writes them, before `settime.sh`, because they must be root's. On the first boot of a
+  new seed loginwindow may read before they exist; `data-persist=2` keeps them, so every later boot has them from the start. If the
+  first run still shows the assertion, run the same image again before reading anything into it.
+- **Thumbnails capped** at 3 a boot (`native-gop-display-thumbs=N`, 0 no limit), about 3 KB each.
+- **The log loop is off in this image**, and quieter when on. `log show`'s own stderr is discarded, so the "Invalidation reason:
+  Connection init failed …" lines from the tool itself are gone. Add it with `PIANO_SOFT_METAL_LOG='process == "WindowServer"'` (errors
+  and faults only). The abort reporter does not need it: it prints the crash message from inside WindowServer.
+
+**`soft-metal-all=1` by default: not yet.**
+- Every other Metal client would then get a device that refuses every queue, buffer and texture. Core Animation copes with that (no
+  queue means its software renderer, as in WindowServer). Others may not: Core Image, MPS and RenderBox expect a device that works once
+  they have one. Agents that crash at launch and are relaunched would fill the ring too.
+- With no device at all, those frameworks take their no-GPU paths. A client's own drawing (CoreGraphics into its backing store, layer
+  trees rendered by WindowServer's Core Animation) does not need Metal.
+- So the black frames more likely come from WindowServer itself: its first updates before loginwindow orders its window in, cut short
+  by the abort. The skipped "TODO: software compositor support." layers (§2) are a second suspect.
+- If the thumbnails stay black once the assertion is gone, run one image with `soft-metal-all=1` (a boot argument, no restaging) and
+  compare.
+
+```sh
+PIANO_EXTRA_KEXTS="$PWD/out/k27/kext/NativeSoftGpu.json" PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=300 \
+PIANO_EXTRA_ARGS="exec-log=1 stderr-log=1 panic_on_crash_disabled=1" tooling/k27/build-native-image.sh
+tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img     # twice: the second boot has the preference from the start
+grep -E "NativeGopDisplay: (thumb|first|[0-9]+ swaps)|NativeSoftMetal|crash message|Assertion|exit: pid [0-9]+ WindowServer" \
+  logs/native-runs/<ts>-loop/xnu-console.txt
+```
