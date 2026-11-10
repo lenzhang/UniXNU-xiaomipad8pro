@@ -1,0 +1,24 @@
+# piano, macOS 27.3 line (UniXNU core + UniXNU-sm8750-common + this repository). Not built in slice 1: the running native
+# candidate is the k27 kernel (tooling/k27/), whose options are the equivalents named on the right.
+CONFIG_XNU_BUILD_ARCHIVES=y
+CONFIG_XNU_CRYPTO_BOOTSTRAP="source"
+# k27: -DXNU_DT_PANIC_REGION=1 (pe_init.o): the BCM2837 panic buffer address is not mapped on SM8750
+CONFIG_XNU_DT_PANIC_REGION=y
+CONFIG_XNU_ARMVIRT_PLATFORM=n
+CONFIG_XNU_ARM_DT_PLATFORM=y
+CONFIG_XNU_ARMCPU=y
+# k27: -DXNU_NATIVE_ARCH_TIMER=1 (start.S)
+CONFIG_XNU_NATIVE_ARCH_TIMER=y
+# k27: -DXNU_NATIVE_PAN=1; SM8750 copyio must clear PAN around user accesses (OnePlus 13T port)
+CONFIG_XNU_NATIVE_PAN=y
+CONFIG_XNU_KERNEL_CHAINED_FIXUPS=y
+# SystemOS cryptex, boot manifest and the writable Data volume from the Data seed's RAM disk (k27: XNU_OWNER_*).
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
+# No GPU before docs/drivers/gpu.md's milestones.
+# CONFIG_XNU_NATIVE_ADRENO is not set

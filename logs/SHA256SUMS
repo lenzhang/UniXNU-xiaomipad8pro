@@ -1,0 +1,14 @@
+f74807d387e3b570039f4a5b4f5a8e5d22dda32fa89c7978e209b7d98b922f11  fd/piano-uefi-A-bundled.fd
+f88f5fcdbb99a96afad7ba43696e77b33463ab732737da5106f1ac239e190ead  fd/piano-uefi-B-own303.fd
+e12a2ad3bc50027e0e6fb91de380e1b1d637a02a93d16260cdafaaf62cbc0af0  k27/kc-k27-native.bin
+f9b45c6560e05fac3c315f3cf6f219b39cad1a729cbd67c0b6d639657c18c695  adt/piano-k27.adt
+f3efb4c6d93763f9fe29890514f640976ac68df1ebef42a50697847fab8763d2  ram/boot-piano-macos-ram-A-bundled-signed.img
+77a79f9a57e23ed715b3ea82d50f9485356008f953dba05b21281b6791a33656  ram/boot-piano-macos-ram-A-bundled.img
+977e55ee62513ae23959af6f654d60167c0300902be10ef139cb6b86e6a360b7  ram/boot-piano-macos-ram-B-own303-signed.img
+b7d36b2b2224d62a252e2e7c0c8c02c17de1ed7b41b7f66f7be6fc90be479ec3  ram/boot-piano-macos-ram-B-own303.img
+7754b8cbfa593aafb6068c8c97827770e10d6fbf45072e6ce7913b6b06e728e6  ram/boot-piano-uefi-ram-A-bundled-signed.img
+d326172ae388c191e40714c7e6ce3a4caade5544ce46fc132bb8d67b5fd60121  ram/boot-piano-uefi-ram-A-bundled.img
+4d03f3d46d112b38a3e1159d26a93b1195063d0358421163875254714cea0c08  ram/boot-piano-uefi-ram-B-own303-signed.img
+b8e01cfa00c525462a5dbf39baafe02793a345bacbf8ffb8ae32cba6e240989b  ram/boot-piano-uefi-ram-B-own303.img
+6b38a68872db145dbee63091b487a669f913574c38a8be4a8883a0019aef78b5  keys/piano-boot-signing.avbpubkey
+12b38cc79502bff4b2436cb13541f52b37184b2ec131aec666692dc50aebad3b  keys/piano-boot-signing.pub.pem

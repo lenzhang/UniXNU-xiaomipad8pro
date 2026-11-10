@@ -1,0 +1,129 @@
+"schema_version" = 2
+
+# UniXNU device repository for the Xiaomi Pad 8 Pro 12.1 (piano, SM8750): native macOS at EL1 as the HLOS, Gunyah stays at
+# EL2. Same layout as UniXNU-sheng (the macOS 27.3 template board). Nothing here is flashed: the boot images are RAM images
+# for "fastboot boot" only (docs/el1-native-plan.md section 5).
+
+["board"]
+"name" = "piano"
+"soc" = "SM8750"
+"description" = "Xiaomi Pad 8 Pro"
+"kit" = "piano"
+"soc_source" = "sm8750"
+# The native kernel line. Slice 1 boots the k27 kernel collection (xnu-12377 + macOS-DroidVM 0001-0053, macOS 27.0.1 26A434
+# kexts, VirtualMac2,1 identity) through the same firmware and payload format; tooling/k27/ builds it and
+# configs/k27-adt.toml replaces this profile's identity for it.
+"os_profile" = "macos-27.3-26C5035r"
+
+
+["kernel"]
+"defconfig" = "piano_macos_defconfig"
+"config_fragments" = ["arch:configs/common.config", "soc:configs/sm8750.config", "os:configs/macos.config"]
+"patch_series" = ["arch:patches/xnu/series", "soc:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu/series"]
+# The UniXNU kernel build of this line is not run in slice 1 (no 27.3 IPSW on this host); the archives follow sheng's
+# macOS override with the SM8750 components of the OnePlus 13T port.
+"archives" = ["build-corecrypto-14.py", "build-corecrypto-14.py --namespace", "component:ArmDTPlatform", "component:ArmCpu", "build-libpthread-kernel.py", "component:RamBlock", "component:AppleKeyStoreState", "component:SoftwareAES"]
+
+
+["firmware"]
+# Mu-Silicium e51cd877 with pianoPkg from android_device_xiaomi_piano-uefi (branch unixnu, 31545f9), set up as its
+# tools/setup-deps.sh does; tooling/firmware/setup-mu.sh makes that checkout from unixnu.lock. pianoPkg builds the UniXNU
+# modules (UniXNU.efi, UniXNUDxe, UniXNURamDiskDxe, DarwinBoot) when UNIXNU is defined.
+"config" = "piano"
+"dsc" = "Platforms/Xiaomi/pianoPkg/piano.dsc"
+"fd" = "Build/pianoPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+"submodules" = ["Common/Mu", "Common/Mu_OEM_Sample", "Silicium-ACPI", "Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl"]
+# piano-uefi's Mu_Basecore change (a timer frequency fallback when CNTFRQ_EL0 reads 0), applied for the build and reverted.
+"patches" = ["Resources/MuPatches/piano-mu-basecore.patch"]
+"packages" = ["{uefi}", "{uefi}/Platforms/Xiaomi", "{tree}/package", "{tree}/drivers/DarwinBoot", "{edk2}", "{uefi}/Common/Mu", "{uefi}/Common/Mu_OEM_Sample", "{uefi}/Silicon/Qualcomm", "{uefi}/Silicon/Silicium", "{uefi}/Silicium-ACPI", "{uefi}/Silicium-ACPI/Platforms/Xiaomi", "{uefi}/Silicium-ACPI/Silicon/Qualcomm"]
+
+["firmware"."defines"]
+# pianoPkg's DeviceBuild.py defaults (Mu's stuart build sets them; the UniXNU driver calls EDK II's build directly).
+"ENABLE_SECUREBOOT" = "0"
+"MEMORY_PROTECTION" = "TRUE"
+"SHIP_MODE" = "FALSE"
+"DEVICE_MODEL" = "piano"
+"UNIXNU" = "1"
+"BUILDID_STRING" = "piano-el1-slice1"
+
+
+["payload"]
+"volume" = "PIANOESP"
+# k27 KC (~89 MiB) + Data seed + ADT + trust cache.
+"size_mib" = 160
+"loader" = "firmware"
+"title" = "macOS (native, EL1)"
+"timeout" = 10
+"panic_screen" = false
+# The 13 GiB window 0x8c0000000..0xc00000000 of dts/piano.dts.
+"dram_size" = "0x340000000"
+# Bring-up set: verbose console on the GOP framebuffer, the k27 userspace arguments of the VM (tooling/k27/kernel-args.txt
+# adds them for the k27 image), one CPU until ArmCpu's PSCI CPU_ON has been seen on the panel.
+"kernel_args" = ["-v", "serial=0", "debug=0x14e", "cpus=1", "kt_fixed_zones=240", "-no_slto_panic", "offline-legacy-gop=1", "disable-watchdogd=1", "timebase-hz=24000000"]
+
+["payload"."adt"]
+# The VM's identity (VirtualMac2,1 board, chip 0x8011) until WindowServer is tried with another one (plan R8).
+"chip_id" = "8011"
+"unique_chip_id" = "required"
+"packed_data_ramdisk" = true
+"owned_memory_size" = "0x200000000"
+
+
+["bootimg"]
+# Packed by tooling/bootimg/build-ram-images.sh into the stock v2 container of the Ubuntu RAM set (xiaomipad-8pro-mainline
+# tools/build-boot.py): the kernel field is UniXNU's BootShim + FD + appended DTB, the DTB also sits in the v2 dtb section.
+# The prepared packaging DTB of the Ubuntu RAM set (v1.1.0 piano-boot.dtb: stock msm-id/board-id + DTBO isolation, the
+# DTB ABL has accepted), copied to out/inputs/ by hand; tooling/bootimg/build-ram-images.py --dtb.
+"dtb" = "out/inputs/piano-boot.dtb"
+"embed_payload" = true
+
+["bootimg"."image"]
+"header_version" = 2
+"base" = "0x0"
+"kernel_offset" = "0x00008000"
+"ramdisk_offset" = "0x01000000"
+"tags_offset" = "0x00000100"
+"pagesize" = 4096
+"kernel_compression" = "none"
+"os_version" = "16.0.0"
+"os_patch_level" = "2026-02"
+
+
+["device_tree"]
+"source" = "device:dts/piano.dts"
+"include_dirs" = ["soc:dts"]
+
+
+["components"]
+"include" = ["ArmDTPlatform", "ArmCpu", "XnuPrelink", "DarwinBoot", "RamBlock", "GopFramebuffer", "AppleKeyStoreState", "SoftwareAES"]
+
+
+["adt"]
+
+["adt"."chosen"."u32"]
+# No CTRR on this SoC (as sheng and the 13T).
+"kernel-ctrr-to-be-enabled" = 0
+"display-scale" = 2
+"display-rotation" = 0
+
+["adt"."defaults"."u32"]
+"sleep-disabled" = 1
+# No Apple PMGR or SEP: a virtual platform to AMFI and MobileGestalt (sheng, the VM).
+"vmm-present" = 1
+
+["adt"."product"."string"]
+"artwork-display-gamut" = "sRGB"
+
+["adt"."buttons"."string"]
+"compatible" = "buttons"
+"device_type" = "buttons"
+
+["adt"."buttons"."strings"]
+"button-names" = ["hold", "voldown", "volup"]
+
+
+["package"]
+"unixnu" = "../unixnu-research/UniXNU"
+
+["package"."defconfig"]
+"macos-27.3-26C5035r" = "piano_macos_defconfig"

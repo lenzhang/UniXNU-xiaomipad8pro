@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""The piano ADT for the k27 kernel collection, made by UniXNU's own generator (scripts/unixnu/devicetree.py generate):
+hardware from dts/piano.dts (+ UniXNU-sm8750-common's sm8750.dtsi), identity from configs/k27-adt.toml instead of the
+macos-27.3 profile, the rest of board.toml as it is.
+
+  make-piano-adt.py OUTPUT.adt --unique-chip-id HEX [--data] [--trust] [--dtb-out FILE] [--psci-method smc|hvc]
+
+--data / --trust: the payload carries a Data seed / trust cache (their /chosen/memory-map slots).
+--psci-method: override /psci method (default: the DTS's, "smc"; "hvc" only for a test inside the VM).
+Environment: UNIXNU_RESEARCH (default ~/Downloads/XiaomiPad8Pro-Ubuntu/unixnu-research).
+"""
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+DEVICE = Path(__file__).resolve().parents[2]
+RESEARCH = Path(os.environ.get('UNIXNU_RESEARCH', Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/unixnu-research'))
+sys.path.insert(0, str(RESEARCH / 'UniXNU/scripts'))
+from unixnu.config import load_toml  # noqa: E402
+from unixnu.devicetree import generate  # noqa: E402
+from unixnu.profiles import merge  # noqa: E402
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('output', type=Path)
+    p.add_argument('--unique-chip-id', required=True)
+    p.add_argument('--data', action='store_true')
+    p.add_argument('--trust', action='store_true')
+    p.add_argument('--dtb-out', type=Path)
+    p.add_argument('--psci-method', choices=('smc', 'hvc'))
+    a = p.parse_args()
+    dtb = a.dtb_out or a.output.with_suffix('.hw.dtb')
+    dtb.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(['dtc', '-q', '-I', 'dts', '-O', 'dtb', '-i', str(RESEARCH / 'UniXNU-sm8750-common/dts'),
+                    '-o', str(dtb), str(DEVICE / 'dts/piano.dts')], check=True)
+    if a.psci_method:
+        subprocess.run(['fdtput', '-t', 's', str(dtb), '/psci', 'method', a.psci_method], check=True)
+    board = load_toml(DEVICE / 'board.toml')
+    board.pop('adt', None)
+    board.get('payload', {}).pop('adt', None)
+    config = merge(board, load_toml(DEVICE / 'configs/k27-adt.toml'))
+    tree = generate(dtb, config, unique_chip_id=a.unique_chip_id, data=a.data, trust=a.trust)
+    a.output.parent.mkdir(parents=True, exist_ok=True)
+    a.output.write_bytes(tree)
+    print(f'{a.output}: {len(tree)} bytes (hardware {dtb})')
+
+
+if __name__ == '__main__':
+    main()

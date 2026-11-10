@@ -1,0 +1,128 @@
+# Pinned sources of UniXNU-piano. The [source."name"] tables are the ones UniXNU's CLI reads (feeds.toml names); the
+# [pin."name"] tables record every other checkout slice 1 was built from (local checkouts under unixnu-research/, see
+# tooling/unixnu.sh). "unixnu fetch" rewrites the [source] part only. Nothing here is a fork: deltas live in this repository
+# (firmware/patches/, configs/, dts/, patches/) or, for k27, on macOS-DroidVM's local branch el1/native-variant.
+
+[source."sm8750"]
+commit = "feaa135df4763e3c19a155402e6b17b124a12e13"
+
+[source."edk2"]
+# UniXNU's feed (microsoft/mu_basecore release/202608) = Mu-Silicium e51cd877's Mu_Basecore submodule.
+commit = "cfb93724a06ff86ff5ba971413368a7809ee42a5"
+
+[pin."UniXNU"]
+git = "https://github.com/UniXNU/UniXNU.git"
+commit = "d830d23b0d19c9322d906c21afeca1d6c54aeffe"
+role = "core: CLI, firmware/payload/bootimg/devicetree drivers, UniXNUPkg, profiles (macos-27.3-26C5035r)"
+
+[pin."UniXNU-sm8750-common"]
+git = "https://github.com/IssacL04/UniXNU-sm8750-common.git"
+commit = "feaa135df4763e3c19a155402e6b17b124a12e13"
+role = "SoC layer: sm8750.dtsi, Sm8750Platform kit, sm8750-smp.patch"
+
+[pin."Mu-Silicium"]
+git = "https://github.com/Project-Silicium/Mu-Silicium"
+commit = "e51cd877e31c8fbb322032dc4cb6715e83d25ad3"
+role = "UEFI platform base (the commit piano-uefi's setup-deps.sh tests); checkout unixnu-research/Mu-Silicium-piano"
+submodules = { "Common/Mu" = "b8d46c71610318e36a661819e1e3c0b8bdda413a", "Common/Mu_OEM_Sample" = "b70b4b7bb02c43bf9db2172dfb3ed0457e2361d6", "Silicium-ACPI" = "2d465ad77c25de908f0ec7bdfcb57f865b61233c", "Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl" = "67b5686b4419b4cb8caa502711c41815f5279751", "Mu_Basecore" = "cfb93724a06ff86ff5ba971413368a7809ee42a5" }
+
+[pin."Device-Binaries"]
+git = "https://github.com/Project-Silicium/Device-Binaries.git"
+commit = "a1501e0c2e642d6ac0d8f52c85af2a67b75a7799"
+role = "Mu-Silicium's Binaries submodule, sparse: dodge/MdeModulePkg (DevicePath/DiskIo/Partition DXEs pianoPkg uses) and the dodge QcomPkg references of patch-qcom-dxe.sh"
+
+[pin."piano-uefi"]
+git = "https://github.com/xiaomi-pad-8-pro-development/android_device_xiaomi_piano-uefi.git"
+branch = "unixnu"
+commit = "31545f9392d5f5c2acae14cec2fa3a0aa1de51d4"
+role = "pianoPkg (UniXNU modules behind UNIXNU), piano.toml (FD 0xA7100000/3 MiB), bundled DXEs, extract/patch tools; worktree unixnu-research/piano-uefi-UniXNU-piano + firmware/patches/"
+
+[pin."uefi-sheng"]
+git = "https://github.com/UniXNU/uefi-sheng.git"
+commit = "66421cb7bb5694843aec8de1ca3d1de4c20cca38"
+role = "UniXNU's BootShim.S (image size = shim + FD, cache maintenance after the copy)"
+
+[pin."DarwinBoot"]
+git = "https://github.com/UniXNU/DarwinBoot.git"
+commit = "8544957e04bdc43e2aac9243764ac16979f15c42"
+role = "XNU loader in the FD (arm64e, MH_FILESET, 256 MiB kernels, darwinboot-memory-size window <= 8 GiB)"
+
+[pin."ArmCpu"]
+git = "https://github.com/UniXNU/ArmCpu.git"
+commit = "16040839b17e55e01ab1ec0c2b0f73f431fd472b"
+
+[pin."ArmDTPlatform"]
+git = "https://github.com/UniXNU/ArmDTPlatform.git"
+commit = "e8bd8d5de395c6cbc00d762c1bef57dbd15a448d"
+
+[pin."GopFramebuffer"]
+git = "https://github.com/UniXNU/GopFramebuffer.git"
+commit = "d711e8c9de58825c9a758907cb15c409a804a537"
+
+[pin."RamBlock"]
+git = "https://github.com/UniXNU/RamBlock.git"
+commit = "60a54ce8f86161db958fd8e6edf577081b3c9ae7"
+
+[pin."XnuPrelink"]
+git = "https://github.com/UniXNU/XnuPrelink.git"
+commit = "8f4f3866545727e2dc3d2c8cb60f8a87a9539c12"
+
+[pin."AppleKeyStoreState"]
+git = "https://github.com/UniXNU/AppleKeyStoreState.git"
+commit = "58e5461ed3b751e4c91426b72d8686419abe9550"
+
+[pin."ShengUfs"]
+git = "https://github.com/UniXNU/ShengUfs.git"
+commit = "b11de87c234cf4b8f80a8160fb15e6f37a8e5d0c"
+role = "docs/drivers/ufs.md base"
+
+[pin."ShengNovatekTouch"]
+git = "https://github.com/UniXNU/ShengNovatekTouch.git"
+commit = "69fdd6223ed2572aa8bd8351e77c53a238276130"
+role = "docs/drivers/touch.md base"
+
+[pin."Adreno830"]
+git = "https://github.com/Shad0w23333/Adreno830.git"
+commit = "1a1321056ffc5428ae925f4680093718b46ca7c2"
+role = "docs/drivers/gpu.md base"
+
+[pin."AdrenoMetal"]
+git = "https://github.com/UniXNU/AdrenoMetal.git"
+commit = "c68f9a1db77961e0f7e18e48f95aeb95ac649650"
+
+[pin."QcaBluetooth"]
+git = "https://github.com/UniXNU/QcaBluetooth.git"
+commit = "b2fbab61615e0811c076b6f17df5b37c651f339d"
+
+[pin."Ath12kWifi"]
+git = "https://github.com/UniXNU/Ath12kWifi.git"
+commit = "48e23bf15fc21bbd30d5583b42b9c09ad65537db"
+
+[pin."QcomDwc3"]
+git = "https://github.com/UniXNU/QcomDwc3.git"
+commit = "e4efe95c903a737e0f5955e5b50a8fb4d2a7d718"
+
+[pin."UniXNU-sheng"]
+git = "https://github.com/UniXNU/UniXNU-sheng.git"
+commit = "00ba90984e831e4c6ce30ec3d8a56e6434e9f1af"
+role = "template board (macOS 27.3 override; ADSP/glink/battmgr, keyboard cover)"
+
+[pin."UniXNU-Pagani_SM8750"]
+git = "https://github.com/Shad0w23333/UniXNU-Pagani_SM8750.git"
+commit = "25b110978fec628cc29bf5bd1b5b5ce830156bfd"
+role = "SM8750 reference port (OnePlus 13T): watchdog, PSCI reset, GPU board"
+
+[pin."piano-unixnu"]
+git = "https://github.com/xiaomi-pad-8-pro-development/android_device_xiaomi_piano-unixnu.git"
+commit = "377ad5392858c23f0fdf16055c1bc0d545f60d73"
+role = "community piano device repo (iPadOS 17, not booted): reference only"
+
+[pin."Project-SunUEFI"]
+git = "https://github.com/slwyts/Project-SunUEFI.git"
+commit = "4ef87402e9d58465af871e4c4f4a5de87599d81c"
+role = "origin of pianoPkg's MemoryMapLib; reference"
+
+[pin."k27"]
+repo = "local: droidvm-build/macOS-DroidVM, branch el1/native-variant"
+commit = "11ac316b789d81fc9f734e15645456f536c05141"
+xnu = "xnu-12377.121.6 (ac9718fb1af618d5ce8678d0dc6e8a58f252216f) + patches/xnu-12377 0001-0054; tree out/k27/xnu at de16623d957cccff6dfb78d8eca4a79842af9702"

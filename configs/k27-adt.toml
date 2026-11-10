@@ -1,0 +1,85 @@
+# The ADT identity of the k27 kernel collection (macOS 27.0.1 26A434, VirtualMac2,1) on piano, used by
+# tooling/adt/make-piano-adt.py in place of the macos-27.3 OS profile's Mac17,11 tables. Every value below is what the VM's
+# working ADT carries today (make-droidvm-adt.py + piano-macos-boot.py, dumped in logs/adt/vm-adt.txt), minus the VM's
+# devices; the hardware part comes from dts/piano.dts. Plan R8: the vma2 identity stays until WindowServer is tried with
+# another one on real hardware.
+
+["payload"."adt"]
+"chip_id" = "8011"
+"unique_chip_id" = "required"
+"packed_data_ramdisk" = true
+# No /arm-io/data-store natively: the Data seed is a RAM disk, but /chosen must not say ephemeral-storage (usermanagerd
+# then skips its persona manager and loginwindow never launches the desktop; piano-macos-boot.py's note).
+"persistent_data" = true
+"owned_memory_size" = "0x200000000"
+# The OS volume of the VM's os.img (macOS 27.0.1); natively nothing provides it before the UFS work (M3), so the kernel waits
+# for root there. Kept so the same ADT works the moment a block device with this volume appears.
+"root_match_volume_uuid" = "C73696D4-CAC4-40A0-90CB-7D0463E4E3E6"
+
+["adt"."root"."string"]
+"model" = "VirtualMac2,1"
+"target-type" = "VMA2MACOS"
+"target-sub-type" = "VMA2MACOSAP"
+# Not a unit's serial: the made-up IOPlatformSerialNumber the VM uses (11 characters, piano-macos-boot.py MACOS_SERIAL).
+"serial-number" = "DVMPIANO001"
+
+["adt"."chosen"."string"]
+"osenvironment" = "main"
+"crypto-hash-method" = "sha2-384"
+# The SystemOS volume k27 mounts as the shared-cache carrier (the VM's systemos.img).
+"owner-systemos-uuid" = "8846FE78-2910-4297-AF97-D59BB6F8FC16"
+
+["adt"."chosen"."u32"]
+"amfi-only-platform-code" = 1
+"certificate-production-status" = 0
+"certificate-security-mode" = 1
+"effective-production-status-ap" = 0
+"effective-security-mode-sep" = 1
+"kernel-ctrr-to-be-enabled" = 0
+"display-scale" = 2
+"display-rotation" = 0
+
+["adt"."chosen"."bytes"]
+# 27's Image4 kext seeds its nonce magazine from it and panics without; there is no boot manifest, so zeros (SHA-384 size).
+"boot-manifest-hash" = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+["adt"."chosen"."asmb"."u64"]
+# SIP bits as the VM boots (MACOS_LP_SIP0=0x2).
+"lp-sip0" = 2
+
+["adt"."chosen"."asmb"."u32"]
+"lp-sip1" = 1
+
+["adt"."defaults"."u32"]
+"sleep-disabled" = 1
+"vmm-present" = 1
+"kern.maxvnodes" = 131456
+
+["adt"."product"."string"]
+"model" = "xiaomi,piano"
+"artwork-device-idiom" = "mac"
+"artwork-display-gamut" = "sRGB"
+"compatible-app-variant" = "MacFamily20,1"
+"compatible-device-fallback" = "iPad8,6"
+"fdr-product-type" = "VirtualMac2,1"
+"sub-product-type" = "VirtualMac2,1"
+"unique-model" = "VMA2MACOSAP"
+"partition-style" = "macOS"
+"product-name" = "Apple Virtual Machine 1"
+"product-description" = "virtual machine for ARM-v8.4 with Apple Silicon extensions"
+
+["adt"."product"."u32"]
+"artwork-device-subtype" = 0
+"artwork-scale-factor" = 2
+"has-virtualization" = 1
+"thin-bezel" = 1
+
+["adt"."buttons"."string"]
+"compatible" = "buttons"
+"device_type" = "buttons"
+
+["adt"."buttons"."strings"]
+"button-names" = ["hold", "voldown", "volup"]
+
+["adt"."buttons"."u32"]
+"home-button-type" = 2

@@ -1,0 +1,74 @@
+# piano (16 GiB unit) running DT, /sys/firmware/devicetree/base read-only 2026-11-10; ABL-fixed /memory + /reserved-memory
+# columns: start end size kind name flags
+0x0080000000 0x0081200000      18.00M RSV   gunyah-hyp@80000000 no-map
+0x0081200000 0x0081400000       2.00M RSV   cpucp@81200000 no-map
+0x0081400000 0x0081960000       5.38M HOLE  (not RAM, not reserved-memory: firmware-owned)
+0x0081960000 0x0081a00000       0.62M RAM   memory 
+0x0081a00000 0x0081a40000       0.25M RSV   xbl-dtlog@81a00000 no-map
+0x0081a40000 0x0081c00000       1.75M RAM   memory 
+0x0081c00000 0x0081c60000       0.38M RSV   aop-image@81c00000 no-map
+0x0081c60000 0x0081c80000       0.12M RSV   aop-cmd-db@81c60000 no-map qcom,cmd-db
+0x0081c80000 0x0081cf4000       0.45M RSV   aop-tme-uefi-merged@81c80000 no-map
+0x0081cf4000 0x0081cf4800       0.00M RSV   display-dump@81cf4000 no-map
+0x0081cf4800 0x0081d00000       0.04M RAM   memory 
+0x0081d00000 0x0081f00000       2.00M RSV   smem@81d00000 no-map qcom,smem
+0x0081f00000 0x0082000000       1.00M RSV   pdp-ns-shared@81f00000 no-map
+0x0082000000 0x0082380000       3.50M RSV   cpucp-scandump@82000000 no-map
+0x0082380000 0x00823a0000       0.12M RSV   adsp-mhi@82380000 no-map
+0x00823a0000 0x00823e0000       0.25M RSV   soccp-sdi@823a0000 no-map
+0x00823e0000 0x0082460000       0.50M RSV   pmic-minii-dump@823e0000 no-map
+0x0082460000 0x00824a0000       0.25M RAM   memory 
+0x00824a0000 0x00825a0000       1.00M RSV   pvmfw@824a0000 no-map
+0x00825a0000 0x0082600000       0.38M HOLE  (not RAM, not reserved-memory: firmware-owned)
+0x0082600000 0x0082700000       1.00M RSV   global-sync@82600000 no-map
+0x0082700000 0x0082800000       1.00M RSV   tz-stat@82700000 no-map
+0x0082800000 0x0084800000      32.00M RSV   qdss@82800000 no-map
+0x0084800000 0x0084a00000       2.00M RAM   memory 
+0x0084a00000 0x0089300000      73.00M RSV   dsm-partition-1@84a00000 no-map
+0x0089300000 0x0089d80000      10.50M RSV   dsm-partition-2@89300000 no-map
+0x0089d80000 0x009b000000     274.50M RAM   memory 
+0x008ba00000 0x009b000000     246.00M RSV   mpss@8ba00000 no-map status=disabled
+0x009b000000 0x009b080000       0.50M RSV   q6-mpss-dtb@9b000000 no-map
+0x009b080000 0x009b090000       0.06M RSV   ipa-fw@9b080000 no-map
+0x009b090000 0x009b09a000       0.04M RSV   ipa-gsi@9b090000 no-map
+0x009b09a000 0x009b09c000       0.01M RSV   gpu-micro-code@9b09a000 no-map
+0x009b09c000 0x009b0a0000       0.02M RSV   reserved@9b09c000 no-map
+0x009b0a0000 0x009b280000       1.88M RSV   spss@9b0a0000 no-map
+0x009b280000 0x009b2c0000       0.25M RSV   spu-tz-shared@9b280000 no-map
+0x009b2c0000 0x009b300000       0.25M RSV   spu-modem-shared@9b2c0000 no-map
+0x009b300000 0x009bb00000       8.00M RSV   camera@9b300000 no-map
+0x009bb00000 0x009c300000       8.00M RSV   camera-2@9bb00000 no-map
+0x009c300000 0x009cb00000       8.00M RSV   video@9c300000 no-map
+0x009cb00000 0x009d200000       7.00M RSV   cvp@9cb00000 no-map
+0x009d200000 0x009eb00000      25.00M RSV   cdsp@9d200000 no-map
+0x009eb00000 0x009eb80000       0.50M RSV   q6-cdsp-dtb@9eb00000 no-map
+0x009eb80000 0x009ec00000       0.50M RSV   reserved@9eb80000 no-map
+0x009ec00000 0x009ed80000       1.50M RSV   soccp@9ec00000 no-map
+0x009ed80000 0x009ee00000       0.50M RSV   q6-adsp-dtb@9ed80000 no-map
+0x009ee00000 0x00b8000000     402.00M RAM   memory 
+0x00a3500000 0x00a3900000       4.00M RSV   ramoops@a3500000 ramoops
+0x00b8000000 0x00b8200000       2.00M RSV   xbl-ramdump@b8000000 no-map
+0x00b8200000 0x00bd980000      87.50M RSV   adspslpi@b8200000 no-map
+0x00bd980000 0x00d4e23000     372.64M RAM   memory 
+0x00d4e23000 0x00d5100000       2.86M RSV   hwfence-shbuf@d4e23000 no-map
+0x00d5100000 0x00d8000000      47.00M RAM   memory 
+0x00d8000000 0x00d8600000       6.00M RSV   tz-merged@d8000000 no-map
+0x00d8600000 0x00e3720000     177.12M HOLE  (not RAM, not reserved-memory: firmware-owned)
+0x00e3720000 0x00f3800000     256.88M RAM   memory 
+0x00f3800000 0x00f8800000      80.00M RSV   trust-ui-vm@f3800000 no-map
+0x00f8800000 0x00fc000000      56.00M RSV   oem-vm@f8800000 no-map
+0x00fc000000 0x00fc400000       4.00M RSV   vm-shared@fc000000 no-map
+0x00fc400000 0x00fc800000       4.00M RAM   memory 
+0x00fc800000 0x00ff300000      43.00M RSV   splash_region@fc800000 no-map
+0x00ff300000 0x00ff800000       5.00M RAM   memory 
+0x00ff800000 0x0100000000       8.00M RSV   llcc-lpi@ff800000 no-map
+0x0100000000 0x0880000000   (address-space gap between DDR region0 and region1, no DRAM)
+0x0880000000 0x08af6fd000     758.99M RAM   memory 
+0x08af6fd000 0x08b0000000       9.01M HOLE  (not RAM, not reserved-memory: firmware-owned)
+0x08b0000000 0x08b5500000      85.00M RAM   memory 
+0x08b5500000 0x08b5700000       2.00M HOLE  (not RAM, not reserved-memory: firmware-owned)
+0x08b5700000 0x08b7500000      30.00M RAM   memory 
+0x08b7500000 0x08c0000000     139.00M HOLE  (not RAM, not reserved-memory: firmware-owned)
+0x08c0000000 0x0a00000000    5120.00M RAM   memory 
+0x0a00000000 0x0c00000000    8192.00M RAM   memory 
+# RAM total in /memory: 15.19 GiB; ddr-regions: 0x80000000+2G, 0x880000000+6G, 0xa00000000+8G (=16 GiB)

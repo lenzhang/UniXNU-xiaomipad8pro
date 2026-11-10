@@ -57,7 +57,7 @@ in the VM. What is new is running the same kernel as the HLOS with real devices.
 
 ## 3. Repo split
 
-- **Device repo: `lenzhang/xiaomipad-8pro-macos`.** Everything specific to piano: `board.toml`, `porting.toml`,
+- **Device repo: `UniXNU-piano`** (local, `~/Downloads/XiaomiPad8Pro-Ubuntu/UniXNU-piano`; owner decision 2026-11-10, supersedes the working name `lenzhang/xiaomipad-8pro-macos`; SoC repo name `UniXNU-sm8750-common`). Everything specific to piano: `board.toml`, `porting.toml`,
   `feeds.toml`, `dts/piano.dts` (+ the ADT generation inputs), the UEFI platform package `pianoPkg` (or a pointer to the
   Mu-Silicium tree that holds it), the Darwin drivers for piano hardware (panel/DPU bottom half, NT36532E touch, keyboard
   cover, PMIC/charging, backlight), board glue for Adreno830/Sm8750Platform, boot-image build and signing scripts (key

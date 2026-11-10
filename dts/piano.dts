@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Xiaomi Pad 8 Pro (piano, SM8750): the hardware the ADT is generated from (UniXNU devicetree.generate).
+// Facts from the running piano DT (/sys/firmware/devicetree/base, read-only, 2026-11-10; docs/hyp-evidence/) and the
+// mainline sm8750-xiaomi-piano.dts of the Ubuntu kernel (yzddmr6/linux-sm8750-piano v1.1.0). Written for UniXNU, no
+// Linux DTS text copied.
+/dts-v1/;
+/include/ "sm8750.dtsi"
+
+/ {
+    model = "Xiaomi Pad 8 Pro";
+    compatible = "xiaomi,piano", "qcom,sm8750";
+
+    // XNU takes one contiguous DRAM range. DDR region 1 (0x880000000 + 6 GiB) and region 2 (0xa00000000 + 8 GiB) meet at
+    // 0xa00000000; above 0x8c0000000 there is no hole and no reserved-memory node up to 0xc00000000: 13 GiB, the size the
+    // k27 VM kernel already runs with (0051/0052). The lower 0x880000000 window has firmware holes at 0x8af6fd000,
+    // 0x8b5500000 and 0x8b7500000 (docs/hyp-evidence/memory-map-running-dt.txt).
+    memory@8c0000000 {
+        device_type = "memory";
+        reg = <0x8 0xc0000000 0x3 0x40000000>;
+    };
+
+    reserved-memory {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+        // ABL's splash framebuffer: 3200x2136 x 4 bytes, linear, scanned out by the DPU pipeline ABL left running
+        // (simpledrm uses it on Ubuntu). The UEFI GOP and XNU's boot console draw here.
+        splash_region: framebuffer@fc800000 {
+            label = "cont_splash_region";
+            reg = <0x0 0xfc800000 0x0 0x2b00000>;
+            no-map;
+        };
+        // Gunyah's own carve-out at EL2 (18 MiB). Outside the XNU window; listed so no tool ever hands it out.
+        gunyah_hyp: gunyah-hyp@80000000 {
+            reg = <0x0 0x80000000 0x0 0x1200000>;
+            no-map;
+        };
+        aop_cmd_db_mem: cmd-db@81c60000 {
+            compatible = "qcom,cmd-db";
+            reg = <0x0 0x81c60000 0x0 0x20000>;
+            no-map;
+        };
+        smem_mem: smem@81d00000 {
+            compatible = "qcom,smem";
+            reg = <0x0 0x81d00000 0x0 0x200000>;
+            no-map;
+        };
+    };
+};
+
+// Two clusters (MPIDR Aff1 0x0-0x5 and Aff2 0x1): six Oryon cores at 3.53 GHz (capacity-dmips-mhz 1792) and two at
+// 4.32 GHz (1894). k27 schedules AMP (sched_amp) and needs an E cluster for background QoS; the six slower cores are it.
+&cpu0 { unixnu,cluster-type = "E"; status = "okay"; };
+&cpu1 { unixnu,cluster-type = "E"; status = "okay"; };
+&cpu2 { unixnu,cluster-type = "E"; status = "okay"; };
+&cpu3 { unixnu,cluster-type = "E"; status = "okay"; };
+&cpu4 { unixnu,cluster-type = "E"; status = "okay"; };
+&cpu5 { unixnu,cluster-type = "E"; status = "okay"; };
+&cpu6 { unixnu,cluster-type = "P"; status = "okay"; };
+&cpu7 { unixnu,cluster-type = "P"; status = "okay"; };
+
+// UFS, GPU, GMU and the SMMUs stay disabled until their drivers exist (docs/drivers/ufs.md, gpu.md).

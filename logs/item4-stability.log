@@ -1,0 +1,15 @@
+20:15:36
+20:15  up 3 mins, 0 users, load averages: 1.56 0.88 0.38
+loginwindow 160 
+WindowServer 157 
+launchd 
+opendirectoryd 128 
+cfprefsd 162 243 
+{ 1.56 0.88 0.38 }
+     172
+0
+0
+[2026-11-10T12:12:30.556186216+00:00 INFO  gpu_display::gpu_display_kms] kms: input event2 "gpio-keys" as keys + cover/lid switch
+[2026-11-10T12:12:30.556230069+00:00 INFO  gpu_display::gpu_display_kms] kms: input event1 "pmic_resin" as keys
+[2026-11-10T12:13:20.457545047+00:00 INFO  gpu_display::gpu_display_kms] kms: first frame on the panel (1600x1068 guest frame, dma-buf)
+active

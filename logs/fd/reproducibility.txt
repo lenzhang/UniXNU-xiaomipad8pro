@@ -1,0 +1,8 @@
+FD reproducibility (2026-11-10, this host, tooling/unixnu.sh build firmware, same sources):
+- RAM images: byte-identical across rebuilds (checked 61 s apart; mtools needs SOURCE_DATE_EPOCH, set by build-ram-images.py).
+- FDs: two consecutive builds differ only inside PcdDxe (80CF7257-87AB-47f9-A3FE-D50B76D89541), the one module EDK II relinks
+  on every build (its PCD database AutoGen is regenerated). Within PcdDxe.ffs (21282 bytes) exactly 8 bytes differ: the
+  CodeView "RSDS" GUID lld-link writes into the debug directory (e.g. b4fb918b3472b352 vs 084277d200d79fa2). Every other FFS
+  file is identical; the compressed FVMAIN_COMPACT then differs throughout. lld-link /Brepro in pianoPkg [BuildOptions]
+  did not make the GUID stable (tried, reverted). Consequence: an FD's SHA-256 identifies one build, not the sources;
+  ARTIFACTS.md records the FD of the images that were built, and the images record the FD hash they contain.

@@ -1,0 +1,15 @@
+BOOT_MEM=8192
+BOOT_CPUS=8
+BOOT_SCREEN=1600x1068
+BOOT_MEDIA=1
+BOOT_NET=1
+BOOT_SND=1
+20:11:53 switching the direct VM to the test disk
+20:11:53 macos-direct: stopping the VM that runs now
+20:12:18 macos-direct: stopping gdm (the desktop)
+20:12:18 macos-direct: starting the VM on the panel (KMS, no compositor)
+active
+active
+active
+inactive
+/home/leo/vm/runs/1110-201218-macos/

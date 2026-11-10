@@ -1,0 +1,19 @@
+# piano (7.2.15-piano58usb1), read-only over ssh 2026-11-10 ~19:28 SGT (cat of /sys/firmware/devicetree, cpufreq, dmesg grep)
+cpu@0     capacity-dmips-mhz 1792   cpu0 cpuinfo_max_freq 3532800 kHz
+cpu@100   1792
+cpu@200   1792
+cpu@300   1792
+cpu@400   1792
+cpu@500   1792
+cpu@10000 1894                      cpu6 cpuinfo_max_freq 4320000 kHz
+cpu@10100 1894
+/psci method = "smc" (73 6d 63 00), compatible "arm,psci-1.0"
+/proc/cpuinfo: CPU implementer 0x51, CPU part 0x001, 8 processors
+Features: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4
+          asimddp sha512 asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp flagm2 frint i8mm bf16 rng bti ecv afp rpres
+[    0.000000] CPU features: detected: Address authentication (architected QARMA5 algorithm)
+[    0.000000] arch_timer: cp15 timer running at 19.20MHz (virt).
+[    8.161457] systemd[1]: Using hardware watchdog /dev/watchdog0: 'Gunyah Watchdog', version 0.
+[    8.161471] systemd[1]: Watchdog running with a hardware timeout of 30s.
+[  272.695869] gunyah: Running under Gunyah hypervisor 51/v1
+live DT: no node compatible qcom,kpss-wdt / arm,sbsa-gwdt / *watchdog* at / or /soc@0
