@@ -94,7 +94,11 @@ Build outputs (`UniXNU-piano/out/`, `build/`), signing keys (`private/`), vendor
 ## 6. Hard rules
 
 1. **RAM boot only.** Use `fastboot boot`. Never `fastboot flash`, `erase`, `set_active`, `oem`, or any other command that writes a partition. Never run `flash_all_lock`.
+   One exception, approved by the owner on 2026-11-11: the persistent install of [`docs/persistent-boot.md`](persistent-boot.md), which
+   writes LUN 0's GPT, the end of `linux_rootfs` and `boot_a` by `dd` from the maintenance RAM image, after verified NAS backups of
+   every region; never `xbl`, `abl`, `tz`, `hyp`, `vbmeta`, `dtbo`, `persist` or any `_b` partition.
 2. **Never boot or flash `-signed` images** as a way to persist a new OS. Signed RAM images, if built, are a verification artifact only.
+   (Exception: the signed `boot_a` image of `docs/persistent-boot.md`, under rule 1's exception.)
 3. **Never `systemctl isolate`** on the tablet. It has stopped `piano-charging` and `piano-thp` and drained the battery / killed the touchscreen.
 4. **No secrets in files, argv, or logs.** The tablet sudo password is typed by the user in tmux (or read from a mode-600 file *outside* every repository). Do not write passwords into scripts, commit messages, or `tmux` send-keys.
 5. **No vendor blobs or Apple payloads in public repos:** Xiaomi / Qualcomm firmware, partition dumps, IPSW-derived kernelcaches, trust caches, `.img` / `.fd` / `.kc` / `.ipsw` build outputs. Record SHA-256 in `artifacts/ARTIFACTS.md` instead.
@@ -115,4 +119,5 @@ unverified, writable), Data persists in NativeUfs's store window at the end of l
 WindowServer starts (no display or GPU yet, so it restarts). Ubuntu's root is gone (owner's decision); linux_data is untouched.
 Tests run unattended with `tooling/native/native-loop.sh` (RAM boots only; see `docs/bringup-debugging.md`). Nothing in the boot
 chain is flashed: returning to the stock OS is a long-press of the power button (or power + volume-down for the vendor Fastboot
-screen).
+screen). Prepared, not yet run: the persistent install (macOS from power-on: a 1 GiB ESP as LUN 0 partition 37, `boot_a` = BootShim
++ FD), `docs/persistent-boot.md`.

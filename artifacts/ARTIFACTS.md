@@ -54,3 +54,26 @@ the private build host, where the private key stays.
 | its ADT (8 CPUs EEEEEEPP, psci hvc) | `logs/adt/vm-test-8cpu-adt.txt` |
 | 8-vCPU crosvm FDT `crosvm-piano-gpu-net-snd-media-8192m-8cpu-1600x1068.dtb` | synthesized from the 6-vCPU dump; matched by run 1110-201218's own generated.dtb |
 | accept disk backup `~/vm/images/macos27/boot.img.accept-20261110` | dcbbcc9b72d9b379303b76e4c78d6c979961f9e2210a4c03c676d6a04c2a61bd |
+
+## Persistent boot (2026-11-11, docs/persistent-boot.md)
+
+Built offline by `tooling/persist/build-all.sh` (`ESP_PROFILE=base`, `ESP_UTC=1794350126`) in an agent worktree; files under `out/`
+(ignored by git). Status: **OFFLINE_BUILD_NOT_DEVICE_TESTED**; the `-signed` images do not exist yet (`tooling/persist/sign.sh`
+makes them on the signing host). The FD build is not bit-reproducible: everything below is tied to this FD.
+
+| File | Bytes | SHA-256 | What |
+|---|---|---|---|
+| `fd/piano-uefi-A-bundled.fd` | 3145728 | 6d15f0f830e5ea4d7d456d1ffd239a62c996c51c5e91649bedd29df334f26802 | FD A + `firmware/patches/unixnu/0001` (RAM payload first; patch sha256 1be90f66…) |
+| `persistent/kernel-field.bin` | 3293356 | a1df7f145cf2d851fa2cdb3a8f8d3986bc9b4cf67d1660492e0f673c4da485ff | BootShim + that FD + boot DTB (the same field as the RAM images below) |
+| `persistent/boot-piano-macos-persistent-v4.img` | 3301376 | 605c3a60254efb3620a1a4e8843d2effb4ffadcff831efd67631bec81201f6c5 | boot_a image, v4, unsigned |
+| `persistent/boot-piano-esp-test-v2.img` | 3452928 | 04ed0d00483978e22bc67aed48558fc758148bc85c07a6d386d03c33fd5d11a6 | RAM test of the flashed path (v2, 4096-byte zero ramdisk); signed = the v2 fallback for boot_a |
+| `persistent/esp-base-diag.img` | 1073741824 | a7a2afefc6af46feb519861a8e2a8fd5c726517dfc28cdf7937cd39d9121f760 | ESP, FAT32 4 KiB sectors, default `macos-diag` (reset to fastboot after 240 s) |
+| `persistent/esp-base-macos.img` | 1073741824 | f5f4c6de3d61bed5b8337c2c964199c76e87445370c271a9a53ce99a9f301dd7 | ESP, default `macos` (daily use) |
+| `persistent/gpt-head.bin` | 24576 | 8c3ab20f60226441096d4c61ea2671db605b4347163cd556e4080135eaab450e | LUN 0 LBA 0-5, new primary GPT (100 bytes differ from new-primary.bin: gpt-diff.txt) |
+| `persistent/gpt-tail.bin` | 20480 | 39da467b3c6f99100583c5a0f42350a1d3c8e014be508f1fc53941414e7aa543 | LUN 0 LBA 124552187-124552191, new backup GPT |
+| `ram/boot-piano-macos-ram-A-bundled.img` | 203726848 | c7f40f62500e36180a43883a79554f0a8b58037d18f91f1254e36e4d70b5a11a | dev RAM image with that FD (K27_ARGS, reset 45 s): `ram-precedence` |
+| `ram-dump/boot-piano-macos-ram-A-bundled.img` | 203726848 | 1a6f57d0900b6152b8d19263bd7ee7c021e4e6863cfbcf1364e3892e658e8ca0 | the loop's dump image with that FD (reset 1 s) |
+
+ESP inputs: KC 415bbea57f0f6699… (8 native kexts), ADT bafbdaac91f0118f… (vmm-present 1), trust cache 2b87b2241090c905…, seed
+cb50ceac16394c9f… (seed identity 469ed4401f5b5241…, 3145728 pages, store window 3145825 blocks). ESP partition GUID
+3F8B0988-D851-5539-AE47-6E53C621D288.

@@ -6,6 +6,10 @@ Learned during the first native RAM boots, 2026-11-10 (`droidvm-build/piano-patc
 - `oem` goes only to our own in-RAM UEFI (`-s piano-uefi`), never to ABL.
 - Never `systemctl isolate` on the tablet.
 
+The one approved exception to the first rule is the persistent install (`docs/persistent-boot.md`). Once its ESP exists on UFS,
+every RAM image, the loop's dump image above all, must be built with FD A carrying `firmware/patches/unixnu/0001` (the boot
+image's own RAM payload wins); an older image boots the ESP's configuration instead.
+
 ## 1. The boot chain, and what each stage needs
 
 ```

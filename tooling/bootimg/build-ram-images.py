@@ -136,7 +136,8 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     return image, {'cmdline_1cpu': one, 'cmdline_8cpu': smp, 'payload_mib': size_mib}
 
 
-def pack(out, fd, dtb, ramdisk, work, name):
+def kernel_field(fd, dtb, work, name):
+    """The kernel field every piano boot image carries (RAM images and tooling/persist's flashed boot_a): BootShim + FD + DTB."""
     config = load_toml(MU / 'Resources/Configs/piano.toml')
     base, size = config['uefi_fd']['base'], config['uefi_fd']['size']
     firmware = Path(fd).read_bytes()
@@ -152,11 +153,16 @@ def pack(out, fd, dtb, ramdisk, work, name):
     shim = bytes(shim)
     kernel = work / f'{name}.kernel'
     kernel.write_bytes(shim + firmware + Path(dtb).read_bytes())
+    return kernel, {'shim_bytes': len(shim), 'fd_base': hex(base), 'fd_size': hex(size), 'kernel_sha256': sha(kernel),
+                    'kernel_bytes': kernel.stat().st_size}
+
+
+def pack(out, fd, dtb, ramdisk, work, name):
+    kernel, info = kernel_field(fd, dtb, work, name)
     image = out / f'{name}.img'
     subprocess.run(['python3', str(MKBOOTIMG), *V2, '--kernel', str(kernel), '--ramdisk', str(ramdisk),
                     '--dtb', str(dtb), '--output', str(image)], check=True)
-    return image, {'shim_bytes': len(shim), 'fd_base': hex(base), 'fd_size': hex(size), 'kernel_sha256': sha(kernel),
-                   'kernel_bytes': kernel.stat().st_size}
+    return image, info
 
 
 def main():

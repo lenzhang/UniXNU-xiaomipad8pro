@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""Host-only tests of tooling/persist (no tablet, no fastboot, no NAS):
+
+1. tablet.sh's read/write subcommands on a scratch file (hash, peek, zero-sha, copy, write, fetch, send, restore), against Python.
+2. maint-session.py's whole write path against a FAKE TABLET: a sparse 510 GB file as LUN 0 holding the real current GPT
+   (CRITICAL-BACKUP new-primary/new-backup.bin), a root manifest and a Data store bound to a test seed (window shrunk to 2049
+   blocks), a sparse LUN 4 with boot_a/vendor_boot_a/init_boot_a/boot_b, a temporary "NAS" directory, and a stand-in for
+   maint-shell.py that runs tablet.sh's subcommands in Python over those files (partitions as offset views of the disks).
+   Runs map, backup, gpt, store (move), esp, check, boot-a, check, then the rollbacks esp, store, gpt, boot-a, and checks that
+   every region is byte for byte what it was. Also checks that a changed-but-not-written region stops the session.
+  test-persist.py [--keep DIR]
+"""
+import argparse
+import hashlib
+import http.client
+import json
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import zlib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import common  # noqa: E402
+
+B = common.LBA
+MiB = 1 << 20
+LUN4 = {'boot_a': ('sde13', 316825600, 100663296), 'vendor_boot_a': ('sde23', 497049600, 100663296),
+        'init_boot_a': ('sde28', 736387072, 8388608), 'boot_b': ('sdf13', 838860800, 100663296)}
+PAGES = 2047                                   # test seed: 2047 pages -> W = 1 + 1 + 2047 = 2049 blocks
+failures = []
+
+
+def check(ok, what):
+    print(('  ok    ' if ok else '  FAIL  ') + what, flush=True)
+    if not ok:
+        failures.append(what)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# The fake tablet (this file is also the maint-shell stand-in: test-persist.py --fake-shell COMMAND TIMEOUT)
+
+def fake_nodes(root):
+    lun0 = root / 'lun0.img'
+    nodes = {'sda': (lun0, 0, common.LUN0_BLOCKS * B), 'sde': (root / 'lun4.img', 0, 1 << 30), 'sdf': (root / 'lun4.img', 0, 1 << 30)}
+    with open(lun0, 'rb') as f:
+        f.seek(2 * B)
+        entries = f.read(64 * 128)
+    for i in range(64):
+        e = entries[i * 128:(i + 1) * 128]
+        if any(e[:16]):
+            first, last = struct.unpack_from('<QQ', e, 32)
+            nodes[f'sda{i + 1}'] = (lun0, first * B, (last - first + 1) * B)
+    for name, (node, off, size) in LUN4.items():
+        nodes[node] = (root / 'lun4.img', off, size)
+    return nodes
+
+
+def fake_shell(command):
+    root = Path(os.environ['FAKE_ROOT'])
+    pp = root / 'pp'
+    pp.mkdir(exist_ok=True)
+    out = []
+    for part in [c.strip() for c in command.split(';')]:
+        if not part or part.startswith('stty') or part == 'sync':
+            continue
+        argv = part.split()
+        if argv[0] == 'sh' and argv[1] == '/run/pp/tablet.sh':
+            out.append(fake_tablet(root, pp, argv[2:]))
+        elif argv[0] == 'piano-maint':
+            out.append(f'piano-maint {" ".join(argv[1:])}: ok')
+        elif argv[:2] == ['sgdisk', '-v']:
+            out.append('No problems found. 0 free sectors (0 bytes) available in 0\nsegments, the largest of which is' if gpt_ok(root) else 'Problem: CRC')
+        elif argv[:2] == ['sgdisk', '-p']:
+            out.append('\n'.join(f'{k} {v[1] // B}-{(v[1] + v[2]) // B - 1}' for k, v in fake_nodes(root).items() if k.startswith('sda3')))
+        else:
+            out.append(f'fake shell: {part}')
+    return '\n'.join(out) + '\n'
+
+
+def gpt_ok(root):
+    with open(root / 'lun0.img', 'rb') as f:
+        head = f.read(6 * B)
+    h = bytearray(head[B:B + 92])
+    crc = struct.unpack_from('<I', h, 16)[0]
+    h[16:20] = bytes(4)
+    return zlib.crc32(h) & 0xffffffff == crc and zlib.crc32(head[2 * B:2 * B + 8192]) & 0xffffffff == struct.unpack_from('<I', head, B + 88)[0]
+
+
+def region(nodes, dev, skip, count, bs):
+    path, off, size = nodes[dev]
+    start, length = off + skip * bs, count * bs
+    if skip * bs + length > size:
+        raise ValueError(f'{dev}: beyond the end')
+    return path, start, length
+
+
+def read(path, start, length):
+    with open(path, 'rb') as f:
+        f.seek(start)
+        return f.read(length)
+
+
+def sha_region(path, start, length):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        f.seek(start)
+        left = length
+        while left:
+            chunk = f.read(min(8 * MiB, left))
+            h.update(chunk)
+            left -= len(chunk)
+    return h.hexdigest()
+
+
+def write_at(path, start, data):
+    with open(path, 'r+b') as f:
+        f.seek(start)
+        f.write(data)
+
+
+def http_get(port, name):
+    c = http.client.HTTPConnection('127.0.0.1', int(port), timeout=60)
+    c.request('GET', '/' + name)
+    r = c.getresponse()
+    if r.status != 200:
+        raise ValueError(f'GET {name}: {r.status}')
+    return r.read()
+
+
+def fake_tablet(root, pp, argv):
+    nodes = fake_nodes(root)
+    cmd, a = argv[0], argv[1:]
+    try:
+        if cmd == 'map':
+            def show(n):
+                if n not in nodes or n == 'sda':
+                    return 'none'
+                return f'{n} {nodes[n][1] // 512 if n.startswith("sda") else nodes[n][1] // 512} {nodes[n][2] // 512}'
+            lines = ['lun0=sda', 'lun0_block_size=4096', f'lun0_bytes={common.LUN0_BLOCKS * B}', 'mounted=0']
+            for name, node in (('boot_a', 'sde13'), ('boot_b', 'sdf13'), ('vendor_boot_a', 'sde23'), ('init_boot_a', 'sde28'),
+                               ('linux_rootfs', 'sda35'), ('linux_data', 'sda36'), ('esp', 'sda37')):
+                lines.append(f'{name}={show(node)}')
+            return '\n'.join(lines)
+        if cmd == 'hash':
+            bs = int(a[3]) if len(a) > 3 else B
+            return 'sha256=' + sha_region(*region(nodes, a[0], int(a[1]), int(a[2]), bs))
+        if cmd == 'zero-sha':
+            bs = int(a[1]) if len(a) > 1 else B
+            h = hashlib.sha256()
+            for _ in range(int(a[0])):
+                h.update(bytes(bs))
+            return 'sha256=' + h.hexdigest()
+        if cmd == 'peek':
+            path, start, _ = region(nodes, a[0], int(a[1]), 1, B)
+            return 'hex=' + read(path, start + int(a[2]), int(a[3])).hex()
+        if cmd == 'send':
+            path, start, length = region(nodes, a[0], int(a[1]), int(a[2]), int(a[3]))
+            s = socket.create_connection(('127.0.0.1', int(a[4])))
+            with open(path, 'rb') as f:
+                f.seek(start)
+                left = length
+                while left:
+                    chunk = f.read(min(MiB, left))
+                    s.sendall(chunk)
+                    left -= len(chunk)
+            s.close()
+            return 'sent=0'
+        if cmd == 'fetch':
+            data = http_get(a[2], a[0])
+            got = hashlib.sha256(data).hexdigest()
+            if got != a[1]:
+                return f'error={a[0]} sha256 {got}, expected {a[1]}'
+            (pp / a[0]).write_bytes(data)
+            return f'fetched={a[0]} sha256={got} bytes={len(data)}'
+        if cmd == 'copy':
+            path, src, length = region(nodes, a[0], int(a[1]), int(a[3]), B)
+            _, dst, _ = region(nodes, a[0], int(a[2]), int(a[3]), B)
+            for off in range(0, length, 256 * B):   # forward, chunk read before written, as dd
+                n = min(256 * B, length - off)
+                write_at(path, dst + off, read(path, src + off, n))
+            return f'copied={a[3]}'
+        if cmd == 'write':
+            data = (pp / a[0]).read_bytes()
+            path, start, _ = region(nodes, a[1], int(a[2]), len(data) // int(a[3]) or 1, int(a[3]))
+            write_at(path, start, data)
+            return f'written={a[0]}'
+        if cmd == 'restore':
+            data = http_get(a[4], a[0])
+            path, start, _ = region(nodes, a[1], int(a[2]), len(data) // int(a[3]), int(a[3]))
+            write_at(path, start, data)
+            return f'restored={a[0]}'
+        if cmd == 'job':
+            text = fake_tablet(root, pp, a[1:])
+            (pp / f'{a[0]}.log').write_text(text + '\n')
+            (pp / f'{a[0]}.rc').write_text('1\n' if text.startswith('error=') else '0\n')
+            return f'started={a[0]}'
+        if cmd == 'job-status':
+            if (pp / f'{a[0]}.rc').is_file():
+                return 'rc=' + (pp / f'{a[0]}.rc').read_text().strip() + '\n' + (pp / f'{a[0]}.log').read_text()
+            return 'running=1'
+        if cmd == 'drop-caches':
+            return 'dropped=1'
+        if cmd == 'rereadpt':
+            return 'reread=partx'
+        return f'error=unknown {cmd}'
+    except Exception as e:  # noqa: BLE001
+        return f'error={e}'
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+
+def test_tablet_sh(tmp):
+    print('== tablet.sh on a scratch file')
+    disk = tmp / 'disk.bin'
+    disk.write_bytes(os.urandom(64 * B))
+    env = dict(os.environ, PIANO_PP_DIR=str(tmp / 'pp'), PIANO_HOST_IP='127.0.0.1')
+    dev = '../' + str(disk).lstrip('/')    # /dev/../<path>
+
+    def run(*argv):
+        r = subprocess.run(['sh', str(HERE / 'tablet.sh'), *map(str, argv)], capture_output=True, text=True, env=env, cwd=tmp)
+        return dict(line.split('=', 1) for line in r.stdout.splitlines() if '=' in line)
+
+    data = disk.read_bytes()
+    check(run('hash', dev, 2, 3)['sha256'] == hashlib.sha256(data[2 * B:5 * B]).hexdigest(), 'hash DEV SKIP COUNT')
+    check(run('hash', dev, 1, 2, 8192)['sha256'] == hashlib.sha256(data[8192:3 * 8192]).hexdigest(), 'hash with BS')
+    check(run('peek', dev, 1, 16, 8)['hex'] == data[B + 16:B + 24].hex(), 'peek')
+    check(run('zero-sha', 2)['sha256'] == hashlib.sha256(bytes(2 * B)).hexdigest(), 'zero-sha')
+    expect = bytearray(data)
+    expect[10 * B:30 * B] = data[40 * B:60 * B]
+    run('copy', dev, 40, 10, 20)
+    # BSD dd truncates of= without conv=notrunc on a regular file; the tablet writes block devices, which do not truncate
+    got = disk.read_bytes()
+    check(got[:30 * B] == bytes(expect[:30 * B]), 'copy (forward, within the device)')
+    disk.write_bytes(data)
+    (tmp / 'pp').mkdir(exist_ok=True)
+    (tmp / 'pp' / 'w.bin').write_bytes(b'\xab' * (2 * B))
+    run('write', 'w.bin', dev, 5, B)
+    check(disk.read_bytes()[5 * B:7 * B] == b'\xab' * (2 * B), 'write FILE DEV SEEK BS')
+
+
+def build_fake(tmp):
+    root = tmp / 'tablet'
+    root.mkdir()
+    lun0 = root / 'lun0.img'
+    with open(lun0, 'wb') as f:
+        f.truncate(common.LUN0_BLOCKS * B)
+    write_at(lun0, 0, (common.BACKUP / 'new-primary.bin').read_bytes())
+    write_at(lun0, (common.LUN0_BLOCKS - 5) * B, (common.BACKUP / 'new-backup.bin').read_bytes())
+    manifest = bytearray(B)
+    manifest[:8] = b'SHNGROOT'
+    struct.pack_into('<IIQ', manifest, 8, 1, 2, 31 * 10 ** 9 // B * B)
+    write_at(lun0, common.ROOTFS_FIRST * B, bytes(manifest))
+    window = common.store_blocks(PAGES)
+    identity = hashlib.sha256(b'test seed').digest()
+    header = bytearray(B)
+    header[:8] = b'SHNGDATA'
+    struct.pack_into('<IIQ', header, 8, 1, 64, PAGES)
+    header[24:56] = identity
+    struct.pack_into('<I', header, 56, 7)
+    struct.pack_into('<I', header, 60, zlib.crc32(bytes(header[:60])) & 0xffffffff)
+    old = common.store_first(common.ROOTFS_LAST, window)
+    write_at(lun0, old * B, bytes(header) + os.urandom((window - 1) * B))
+    write_at(lun0, common.ESP_FIRST * B, os.urandom(3 * MiB))          # leftovers in the tail
+    lun4 = root / 'lun4.img'
+    with open(lun4, 'wb') as f:
+        f.truncate(1 << 30)
+    ref = common.DEVICE / 'out/persistent/ref'   # slot A's current images (build-boot.py --verify / the zstd backups)
+    for name, (_, off, size) in LUN4.items():
+        source = {'boot_a': '13-boot_a', 'vendor_boot_a': '23-vendor_boot_a', 'init_boot_a': '28-init_boot_a'}.get(name)
+        data = (ref / f'{source}.img').read_bytes() if source else os.urandom(size)
+        assert len(data) == size
+        write_at(lun4, off, data)
+    out = tmp / 'out'
+    out.mkdir()
+    real = common.DEVICE / 'out/persistent'
+    for name in ('gpt.json', 'gpt-head.bin', 'gpt-tail.bin'):
+        shutil.copyfile(real / name, out / name)
+    esp = out / 'esp-test.img'
+    with open(esp, 'wb') as f:
+        f.truncate(common.ESP_BLOCKS * B)
+    write_at(esp, 0, b'\xeb\x58\x90MTOO4050' + os.urandom(4 * MiB))
+    rec = {'image': esp.name, 'sha256': common.sha(esp), 'default': 'macos-diag', 'profile': 'test',
+           'cmdlines': {'macos-diag': 'piano-reset-after=240'}, 'seed': {'identity_sha256': identity.hex(), 'pages': PAGES},
+           'store': {'window_blocks': window}}
+    common.write_json(out / 'esp-test.json', rec)
+    boot = out / 'boot-test-signed.img'
+    boot.write_bytes(b'ANDROID!' + os.urandom(common.BOOT_PARTITION_BYTES - 8))
+    common.write_json(out / 'boot.json', {'signed': {boot.name: {'sha256': common.sha(boot)}}})
+    return root, out, window, old
+
+
+def snapshot(root, window, old):
+    lun0, lun4 = root / 'lun0.img', root / 'lun4.img'
+    new = common.store_first(common.ROOTFS_NEW_LAST, window)
+    return {'gpt-head': sha_region(lun0, 0, 6 * B), 'gpt-tail': sha_region(lun0, (common.LUN0_BLOCKS - 5) * B, 5 * B),
+            'store-region': sha_region(lun0, new * B, (old + window - new) * B),
+            'esp-region': sha_region(lun0, common.ESP_FIRST * B, common.ESP_BLOCKS * B),
+            'boot_a': sha_region(lun4, LUN4['boot_a'][1], LUN4['boot_a'][2]),
+            'boot_b': sha_region(lun4, LUN4['boot_b'][1], LUN4['boot_b'][2]),
+            'manifest': sha_region(lun0, common.ROOTFS_FIRST * B, B)}
+
+
+def test_session(tmp):
+    print('== maint-session.py against a fake tablet')
+    root, out, window, old = build_fake(tmp)
+    nas = tmp / 'nas'
+    nas.mkdir()
+    env = dict(os.environ, FAKE_ROOT=str(root), PIANO_PERSIST_OUT=str(out), PIANO_MAINT_HOST='127.0.0.1',
+               PIANO_BACKUP_DIR=str(nas), PIANO_SERIAL='test', PIANO_MAINT_SHELL=str(tmp / 'fake-shell.py'),
+               PYTHONDONTWRITEBYTECODE='1')
+    (tmp / 'fake-shell.py').write_text(f'import sys; sys.path.insert(0, {str(HERE)!r}); import importlib.util\n'
+                                       f'spec = importlib.util.spec_from_file_location("t", {str(Path(__file__).resolve())!r})\n'
+                                       'm = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n'
+                                       'sys.stdout.write(m.fake_shell(sys.argv[1]))\n')
+    base = ['python3', str(HERE / 'maint-session.py'), '--session', str(tmp / 'session'), '--esp', 'esp-test.img',
+            '--esp-final', 'esp-test.img', '--boot-image', 'boot-test-signed.img', '--http-port', '18000', '--nc-port', '19000']
+
+    def run(*steps, expect=0):
+        r = subprocess.run(base + list(steps), capture_output=True, text=True, env=env, timeout=3600)
+        log = r.stdout + r.stderr
+        (tmp / 'session-out.txt').open('a').write(log)
+        if r.returncode != expect:
+            print(log[-3000:])
+        check(r.returncode == expect, f'maint-session.py {" ".join(steps)} -> {r.returncode}')
+        return log
+
+    before = snapshot(root, window, old)
+    run('map', 'backup')
+    state = json.loads((tmp / 'session/state.json').read_text())
+    check(state.get('store_plan') == 'move', 'auto: the store is bound to the ESP seed, so it moves')
+    names = sorted(state.get('backups', {}))
+    check(names == sorted(['lun0-gpt-primary', 'lun0-gpt-backup', 'boot_a', 'boot_b', 'vendor_boot_a', 'init_boot_a',
+                           'linux_rootfs-tail-esp', 'linux_rootfs-store']), f'backups {names}')
+    bdir = nas / state['backup_name']
+    check(all(common.sha(bdir / e['file']) == e['sha256'] for e in state['backups'].values()), 'every NAS copy hashes to its record')
+    check(state['backups']['lun0-gpt-primary']['sha256'] == common.GPT_PRIMARY_SHA256, 'GPT backup = CRITICAL-BACKUP new-primary.bin')
+    run('gpt', 'store', 'esp', 'check')
+    lun0 = root / 'lun0.img'
+    gpt = json.loads((out / 'gpt.json').read_text())
+    check(sha_region(lun0, 0, 6 * B) == gpt['gpt-head.bin']['sha256'], 'GPT head on the fake disk = gpt-head.bin')
+    check(sha_region(lun0, (common.LUN0_BLOCKS - 5) * B, 5 * B) == gpt['gpt-tail.bin']['sha256'], 'GPT tail = gpt-tail.bin')
+    new = common.store_first(common.ROOTFS_NEW_LAST, window)
+    check(read(lun0, new * B, 8) == b'SHNGDATA', f'store header at the new place {new}')
+    check(sha_region(lun0, common.ESP_FIRST * B, common.ESP_BLOCKS * B) == common.sha(out / 'esp-test.img'), 'ESP region = the image')
+    run('boot-a', 'check')
+    check(sha_region(root / 'lun4.img', LUN4['boot_a'][1], LUN4['boot_a'][2]) == common.sha(out / 'boot-test-signed.img'), 'boot_a = the image')
+    run('backup')   # again, after the writes: must keep the originals as the rollback sources
+    state2 = json.loads((tmp / 'session/state.json').read_text())
+    check(state2['backups'] == state['backups'], 'a second backup run keeps the original backups')
+    run('rollback', 'esp', 'store', 'gpt', 'boot-a')
+    after = snapshot(root, window, old)
+    for key in before:
+        check(after[key] == before[key], f'after the rollbacks: {key} is as before')
+    # a region that changes without this install writing it stops the session
+    write_at(root / 'lun4.img', LUN4['boot_b'][1], b'changed')
+    log = run('map', 'backup', expect=3)
+    check('changed since its verified backup' in log, 'an unexplained change of boot_b stops the backup step')
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--fake-shell', nargs=2)
+    p.add_argument('--keep', type=Path)
+    a = p.parse_args()
+    if a.fake_shell:
+        sys.stdout.write(fake_shell(a.fake_shell[0]))
+        return
+    tmp = Path(tempfile.mkdtemp(prefix='piano-persist-test-')) if not a.keep else a.keep
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        test_tablet_sh(tmp)
+        test_session(tmp)
+    finally:
+        if not a.keep:
+            shutil.rmtree(tmp, ignore_errors=True)
+    print(f'\n{"PASS" if not failures else "FAIL"}: {len(failures)} failure(s)')
+    sys.exit(1 if failures else 0)
+
+
+if __name__ == '__main__':
+    main()

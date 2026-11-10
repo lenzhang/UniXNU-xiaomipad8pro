@@ -5,6 +5,7 @@
 #                                      UniXNU's edk2 feed is the same commit)
 #   Mu-Silicium-piano/Binaries/        Device-Binaries a1501e0c, sparse: dodge/MdeModulePkg + the dodge QcomPkg references
 #   piano-uefi-UniXNU-piano/           worktree of piano-uefi 31545f9 (branch unixnu) + firmware/patches/*.patch
+#   UniXNU/                            + firmware/patches/unixnu/*.patch (the UniXNUPkg the FD builds)
 #   links: Platforms/Xiaomi/pianoPkg, Resources/Configs/piano.toml, Binaries/piano, Resources/MuPatches/piano-mu-basecore.patch
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
@@ -32,6 +33,8 @@ fi
 for p in "$D"/firmware/patches/*.patch; do git -C "$P" apply --reverse --check "$p" 2>/dev/null || git -C "$P" apply "$p"; done
 # Mu-Silicium deltas (SEC keeps the boot loader's x0 = DT in the entry-argument HOB UniXNURamDiskDxe reads).
 for p in "$D"/firmware/patches/mu-silicium/*.patch; do git -C "$M" apply --reverse --check "$p" 2>/dev/null || git -C "$M" apply "$p"; done
+# UniXNU core deltas (UniXNULib: a boot image's RAM payload wins over a FAT ESP on UFS; docs/persistent-boot.md).
+for p in "$D"/firmware/patches/unixnu/*.patch; do git -C "$R/UniXNU" apply --reverse --check "$p" 2>/dev/null || git -C "$R/UniXNU" apply "$p"; done
 mkdir -p "$M/Resources/MuPatches"
 ln -sfn "$P/uefi/pianoPkg" "$M/Platforms/Xiaomi/pianoPkg"
 ln -sfn "$P/uefi/piano.toml" "$M/Resources/Configs/piano.toml"

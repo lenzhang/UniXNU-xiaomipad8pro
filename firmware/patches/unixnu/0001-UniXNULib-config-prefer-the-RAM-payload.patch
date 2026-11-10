@@ -1,0 +1,102 @@
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Config.c b/package/UniXNUPkg/Library/UniXNULib/Config.c
+index ed39c6b..bf9d413 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Config.c
++++ b/package/UniXNUPkg/Library/UniXNULib/Config.c
+@@ -1493,6 +1493,52 @@ ApplyRoot (
+   }
+ }
+ 
++//
++// UniXNU-piano: the vendor node of UniXNURamDiskDxe's block device, the FAT payload a boot image carries as its ramdisk
++// (UniXNURamDiskDxe.c mDevicePath). Its file system handle has this node first: the payload has no partition table.
++//
++STATIC CONST EFI_GUID  mRamPayloadVendorGuid = {
++  0xA9C6827C, 0x1BD8, 0x410C, { 0x88, 0x5A, 0xC4, 0x65, 0x00, 0xF7, 0xD8, 0x36 }
++};
++
++STATIC
++BOOLEAN
++IsRamPayloadVolume (
++  IN EFI_HANDLE  Volume
++  )
++{
++  EFI_DEVICE_PATH_PROTOCOL  *Path;
++
++  Path = DevicePathFromHandle (Volume);
++  if ((Path == NULL) || (DevicePathType (Path) != HARDWARE_DEVICE_PATH) || (DevicePathSubType (Path) != HW_VENDOR_DP) ||
++      (DevicePathNodeLength (Path) < sizeof (VENDOR_DEVICE_PATH)))
++  {
++    return FALSE;
++  }
++
++  return CompareGuid (&((VENDOR_DEVICE_PATH *)Path)->Guid, &mRamPayloadVendorGuid);
++}
++
++//
++// UniXNU-piano: name the volume the configuration came from (RAM payload or a partition) in the log.
++//
++STATIC
++VOID
++LogVolume (
++  IN EFI_HANDLE  Volume
++  )
++{
++  EFI_DEVICE_PATH_PROTOCOL  *Path;
++  CHAR16                    *Text;
++
++  Path = DevicePathFromHandle (Volume);
++  Text = (Path != NULL) ? ConvertDevicePathToText (Path, FALSE, FALSE) : NULL;
++  UniXNULog ("config: volume %s", (Text != NULL) ? Text : L"(no device path)");
++  if (Text != NULL) {
++    FreePool (Text);
++  }
++}
++
+ STATIC
+ BOOLEAN
+ TryVolume (
+@@ -1520,6 +1566,7 @@ TryVolume (
+   }
+ 
+   UniXNULog ("config: loaded %s", (CONST CHAR16 *)PcdGetPtr (PcdUniXNUConfigPath));
++  LogVolume (Volume);
+   ApplyRoot (Config, Root);
+   TomlFree (Root);
+   return TRUE;
+@@ -1536,6 +1583,7 @@ UniXNUConfigLoad (
+   EFI_HANDLE                 *Handles;
+   UINTN                      Count;
+   UINTN                      Index;
++  UINTN                      Pass;
+   BOOLEAN                    Loaded;
+   TOML_NODE                  *Root;
+   CHAR8                      Error[96];
+@@ -1545,7 +1593,7 @@ UniXNUConfigLoad (
+   Loaded = FALSE;
+ 
+   //
+-  // The volume UniXNU was started from wins; then every other volume.
++  // The volume UniXNU was started from wins; then the boot image's RAM payload; then every other volume.
+   //
+   if (!EFI_ERROR (gBS->HandleProtocol (ImageHandle, &gEfiLoadedImageProtocolGuid, (VOID **)&Self))) {
+     Loaded = TryVolume (Config, Self->DeviceHandle);
+@@ -1554,8 +1602,17 @@ UniXNUConfigLoad (
+   if (!Loaded && (Config->Error[0] == '\0')) {
+     Status = gBS->LocateHandleBuffer (ByProtocol, &gEfiSimpleFileSystemProtocolGuid, NULL, &Count, &Handles);
+     if (!EFI_ERROR (Status)) {
+-      for (Index = 0; Index < Count && !Loaded && Config->Error[0] == '\0'; Index++) {
+-        Loaded = TryVolume (Config, Handles[Index]);
++      //
++      // UniXNU-piano: pass 0 tries only the RAM payload's volume, pass 1 every other volume in firmware order. The UFS
++      // LUNs are published (UFSDxe is APRIORI) before the RAM disk, so without pass 0 a "fastboot boot" image would boot
++      // the payload of a FAT ESP on UFS instead of its own.
++      //
++      for (Pass = 0; Pass < 2 && !Loaded && Config->Error[0] == '\0'; Pass++) {
++        for (Index = 0; Index < Count && !Loaded && Config->Error[0] == '\0'; Index++) {
++          if (IsRamPayloadVolume (Handles[Index]) == (Pass == 0)) {
++            Loaded = TryVolume (Config, Handles[Index]);
++          }
++        }
+       }
+ 
+       FreePool (Handles);
