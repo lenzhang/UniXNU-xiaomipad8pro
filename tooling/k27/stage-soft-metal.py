@@ -5,7 +5,8 @@
   - a trust cache with one more module, the bundle's Mach-O CDHashes, before the input's modules (as macOS-DroidVM's
     stage-gpu-plugin.py does), so AMFI and libsystem_sandbox's gpu_bundle_find_trusted accept the ad hoc signed plugin.
 
-    stage-soft-metal.py [--seed out/inputs/scratch-data.img] [--trust out/inputs/kernel.macho.trustcache] [--out out/soft-metal] [BUNDLE]
+    stage-soft-metal.py [--seed out/inputs/scratch-data.img] [--trust out/inputs/kernel.macho.trustcache] [--out out/soft-metal]
+                        [--boot-run COMMAND]... [--log-stream PREDICATE] [BUNDLE]
 
 Then: PIANO_SEED=out/soft-metal/scratch-data.img PIANO_TRUST=out/soft-metal/kernel.macho.trustcache tooling/k27/build-native-image.sh.
 The seed is the packed DBRDISK1 disk (NativeRamBlock SeedDisk.h). It is unpacked to a sparse raw file, attached with hdiutil (no mount),
@@ -14,11 +15,21 @@ the bundle copied, the volume unmounted and the disk packed again. Nothing outsi
 
 A new seed has a new identity, so NativeRamBlock's persistent store (data-persist=2) treats the store window as stale and starts it over,
 which drops the Data changes of earlier native boots. Boot staged-seed tests with PIANO_DATA_PERSIST=0 (Data in RAM only) to keep them.
+
+--boot-run adds a command to the seed's one boot job (Library/LaunchDaemons/org.droidvm.run.0.plist, which runs settime.sh: the clock).
+The job's file is rewritten in place, so it keeps the owner the VM's staging gave it; launchd refuses a daemon plist that is not root's,
+and this Mac cannot set an owner on the seed's volume. The commands run as root after settime.sh, in the order given, and their output
+goes to the kernel log with stderr-log=1.
+--log-stream PREDICATE adds the two commands that put a process's own os_log messages there: `log show --last boot` and then
+`log stream`. That is where SkyLight's and Metal's messages go, the ones the console log otherwise never shows (an abort of
+WindowServer, for instance, logs its reason through os_log and nothing else). It needs logd to run; if it does not, the job simply fails
+and the rest of the boot is unchanged.
 """
 import argparse
 import hashlib
 import os
 import plistlib
+import shlex
 import shutil
 import struct
 import subprocess
@@ -34,6 +45,8 @@ import packed_ramdisk  # noqa: E402  (read from the k27 tree, not changed)
 
 LC_CODE_SIGNATURE = 0x1d
 GPU_BUNDLES = 'Library/GPUBundles'
+BOOT_JOB = 'Library/LaunchDaemons/org.droidvm.run.0.plist'
+SETTIME = 'sh /private/var/settime.sh'
 
 
 def cdhash(path):
@@ -82,6 +95,21 @@ def run(*command, **kw):
     return subprocess.run(command, check=True, **kw)
 
 
+def set_boot_commands(job, commands):
+    """The seed's boot job, rewritten in place (same file, same owner): settime.sh first, then COMMANDS."""
+    if not job.is_file():
+        raise SystemExit(f'{job}: the seed has no boot job to extend; a new plist would not be root\'s and launchd would refuse it')
+    record = plistlib.loads(job.read_bytes())
+    arguments = record.get('ProgramArguments', [])
+    if len(arguments) != 3 or arguments[0] != '/bin/sh' or SETTIME not in arguments[2]:
+        raise SystemExit(f'{job}: not the expected boot job ({arguments}); check it by hand')
+    script = '; '.join([SETTIME, *commands])
+    record['ProgramArguments'] = ['/bin/sh', '-c', script]
+    job.write_bytes(plistlib.dumps(record, fmt=plistlib.FMT_XML))
+    subprocess.run(['xattr', '-c', str(job)], check=False)   # the build Mac's com.apple.provenance tag
+    return script
+
+
 def data_volume(container_disk):
     """The device of the APFS volume named Data (else the first volume) of the container on CONTAINER_DISK."""
     listing = plistlib.loads(run('diskutil', 'apfs', 'list', '-plist', capture_output=True).stdout)
@@ -102,8 +130,15 @@ def main():
     p.add_argument('--seed', type=Path, default=D / 'out/inputs/scratch-data.img')
     p.add_argument('--trust', type=Path, default=D / 'out/inputs/kernel.macho.trustcache')
     p.add_argument('--out', type=Path, default=D / 'out/soft-metal')
+    p.add_argument('--boot-run', metavar='COMMAND', action='append', default=[])
+    p.add_argument('--log-stream', metavar='PREDICATE')
     p.add_argument('bundle', nargs='?', type=Path, default=D / 'out/soft-metal/NativeSoftMetal.bundle')
     a = p.parse_args()
+    commands = list(a.boot_run)
+    if a.log_stream:
+        where = shlex.quote(a.log_stream)
+        commands += [f'log show --last boot --info --debug --style compact --predicate {where} 2>&1',
+                     f'exec log stream --level debug --style compact --predicate {where} 2>&1']
     bundle = a.bundle.resolve()
     if not (bundle / 'Contents/Info.plist').is_file():
         raise SystemExit(f'{bundle}: not a bundle (Contents/Info.plist)')
@@ -145,6 +180,8 @@ def main():
                 root = run('ls', '-la', str(mount), capture_output=True, text=True).stdout
                 print(f'{volume}: /{GPU_BUNDLES}/{bundle.name}\n{listing}extended attributes left: {left or "none"}\n'
                       f'volume root:\n{root}')
+                if commands:
+                    print(f'/{BOOT_JOB} runs: ' + set_boot_commands(mount / BOOT_JOB, commands))
             finally:
                 run('diskutil', 'unmount', str(mount), stdout=subprocess.DEVNULL)
         finally:

@@ -174,12 +174,11 @@ Failure lines: `IOMobileFramebufferLegacy::start failed`, `createDisplayAttribut
      (a) the real A830 driver ([gpu.md](gpu.md), M5);
      (b) a software Vulkan device under metal2vulkan in place of Turnip, for example Mesa's lavapipe. This is user-space
      work: an arm64e build, LLVM, and JIT in WindowServer under AMFI;
-     (c) a plugin device without an accelerator port. Per the plugin's own note (`overlay/metal/NativeAdrenoMetalPlugin.mm`),
-     SkyLight then composites in software (CompositorSW, `WSGetDefaultMetalAccelerator`). Built 2026-11-11, not yet run:
-     `package/NativeSoftGpu` (the accelerator, `PIANO_EXTRA_KEXTS`) and `package/NativeSoftMetal` (the plugin: accelerator port 0,
-     no command queue, so Core Animation's display renders in software too), staged by `tooling/k27/stage-soft-metal.py`
-     (`PIANO_SEED`, `PIANO_TRUST`). The macOS 26.6 SkyLight on the build Mac agrees with the note. With no device at all,
-     WindowServer aborts after 30 s. With a device whose port is 0, the display's compositor is CompositorSW.
+     (c) a plugin device without an accelerator port, per the plugin's own note (`overlay/metal/NativeAdrenoMetalPlugin.mm`):
+     SkyLight then composites in software (CompositorSW, `WSGetDefaultMetalAccelerator`). This is the path being taken:
+     `package/NativeSoftGpu` + `package/NativeSoftMetal`, **[soft-metal.md](soft-metal.md)**, which has the evidence, the boot
+     arguments and the test recipe. Measured 2026-11-11: WindowServer opened this display (`display on`) and took the device,
+     then aborted with no swap submitted; the plugin now answers every device selector and reports the abort.
    No kernel change in this package addresses this.
 2. **'RGhA' frames.** The native ADT keeps `vmm-present = 1`, so Core Animation keeps a half-float framebuffer: 54.7 MB a
    frame, converted per pixel. The periodic line's `convert` time shows the cost. `vmm-present = 0` gives 'BGRA' (as in
