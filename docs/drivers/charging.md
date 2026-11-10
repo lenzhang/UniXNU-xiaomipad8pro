@@ -216,6 +216,53 @@ Expected in A, about 30 s after `PianoPower: stage 4: DSP start requested`: `ads
 `piano-reset-after`. In B after step 8: `smc: PAS init_image (DTB, PAS 36): calling` then either `...: ok (...)` and the next
 steps, or nothing (the secure call is the hang).
 
+## 5b. Image B: the stall is at the first access to the DTB carveout (2026-11-11)
+
+**Result.** A: steps 3–8, stopped at 9, reports to the reset. B: `smc: PAS init_image (DTB, PAS 36): ok (... 2 SMCs: 1
+interrupted ...; 16720 us)`, `PAS mem_setup (DTB, 0x9ed80000 + 0x27000): ok (812 us)`, `carveout 0x9ed80000 + 0x80000: mapping
+write-combined`, `segment 1: 159164 bytes from the file, 0 zero, at +0`, then the whole-system stall (ABL after 119 s). What ran
+after the last line: the segment's UFS read into the bounce buffer, then the memcpy into the carveout.
+
+**The questions, from the DT, the Linux drivers as the spec and the K90 port's facts:**
+- *Is 0x9ed80000 the HLOS's?* Yes by every record: `q6-adsp-dtb@9ed80000` (0x80000, `no-map`) is an ordinary HLOS reserved-memory
+  node inside the DDR range Gunyah gives the HLOS (`docs/hyp-evidence/memory-map-running-dt.txt:47`; the Gunyah-owned and VM
+  regions are listed apart); our UEFI marks it `PIL_Reserved` (0x89E00000 + 0x19700000, uncached), so no cache lines of it are
+  left; XNU's RAM is the 0x8c0000000 window. Nothing assigns it away at boot that we know of.
+- *Linux's order:* the DTB is `memory-region[1]` of `remoteproc@6800000`, mapped write-combined at probe (`ioremap_wc`); the load
+  callback runs `qcom_mdt_pas_init` (init_image, then mem_setup of the span) and then `qcom_mdt_load_no_init` (the segment
+  writes): the writes come after mem_setup, as here. There is no `qcom_scm_assign_mem` or hypervisor call for the SM8750 ADSP
+  (only for the CDSP's global sync memory, SunUEFI patch 0015). The K90 port writes the same DTB carveout (0x9ed80000) after its
+  mem_setup through a write-combined mapping, byte by byte, and its DSP becomes READY.
+- *The mapping type:* XNU's write-combined is MAIR 0x44, Normal non-cacheable (`osfmk/arm64/proc_reg.h`), the same type as
+  Linux's `ioremap_wc`; so the type matches Linux. Differences left: memcpy's wide stores (K90 stores bytes), mapping 0x80000
+  where mem_setup declared 0x27000 (a mapping makes no access, but it is now limited to the span), and the UFS read just before.
+
+**This build:** a probe of the carveout's first 8 bytes (an aligned read, then the same value written back, each announced
+and confirmed) at the end of step 8 (`probe (before init_image)`, no secure call yet) and at the start of step 11 (`probe (after
+mem_setup)`); `segment N: ... bytes read from the file; storing them` after the UFS read and `first ... bytes stored` after the
+copy; the copy and zero fill as aligned 8-byte stores (no memcpy/bzero, no DC ZVA); the mapping limited to the span;
+`piano-power-map=1|2` (Device-nGnRE / Device-nGnRnE instead of write-combined) and `piano-power-load-first=1` (segments written
+before init_image and mem_setup).
+
+| Image | Extra | sha256 | Answers |
+|---|---|---|---|
+| D | none | `e88d9228b2abbd6f…` | which access stalls: probe before init_image (read/write), probe after mem_setup (read/write), UFS read, the stores |
+| E | `piano-power-map=1` | `3759dbb8db046787…` | the same with a Device-nGnRE mapping |
+| F | `piano-power-load-first=1` | `4dd9e407b475966a…` | the segments written before any PAS call touches the region |
+
+KC `1ef0cb65d480fe4d…` (main 7457964 + this change; `native kext rule: 8 descriptors, all this repository's`, `8 native kexts
+linked, none from DroidVM`), each image `exec-log=1 piano-usb=2 piano-power=2 piano-power-write=0` plus the extra; verify PASS.
+Run D; E or F only if D stalls after `probe (after mem_setup)` passes or at its write. Build in main as in §5a with
+`"D" "E piano-power-map=1" "F piano-power-load-first=1"` as the variants. Reading D:
+
+| Last line | Meaning |
+|---|---|
+| `probe (before init_image): 8-byte read at 0x9ed80000 ...: begin` | the carveout is not readable by the HLOS at all |
+| `probe (before init_image): read ...; writing it back: begin` | readable but not writable before any PAS call |
+| `probe (after mem_setup): ... read ...: begin` / `... writing it back: begin` | mem_setup took the read / write access away (then F) |
+| `segment 1: 159164 bytes read from the file` missing after `segment 1: ...` | the UFS read stalled, not the carveout |
+| `segment 1: ... storing them` with no `first ... stored` | the stores stall although one word went through (then E) |
+
 ## 6. Risks
 
 - **Level 2 can charge less than no driver.** Once the DSP runs, its firmware holds the input at 100 mA until the ICL write takes

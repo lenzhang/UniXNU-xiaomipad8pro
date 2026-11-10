@@ -25,6 +25,8 @@ porting.toml), package/:
       piano-power=1. The lcx/lmx vote is written fresh (vote() in PianoAdsp.cpp) after Linux rpmh-rsc's request sequence (idle TCS
       by DRV_STATUS, trigger and mode cleared in that order, CMD_STATUS checked, a TCS in flight left alone); sheng's
       qcom_rpmh_active_request/qcom_rpmh_finish are no longer called (QcomRpmh.c still provides the cmd-db lookup and the layout).
+      The segments are stored with aligned 8-byte stores (no memcpy/bzero) into a mapping limited to the image's span, after a
+      read/write-back probe of the carveout; piano-power-map and piano-power-load-first choose the mapping type and the order.
     AdspFirmware.c (ced26abf9e7ae3033dceaa1d39ccbf85e73abc636aac41aa7e3d3b2741e67a7c) -> PianoAdspFirmware.c: the headers from
       NAME.mdt when there is no NAME.b00 (piano's modem_a), piece 0 read from that file; names piano_fw_*; strong imports of
       NativeUfs's native_ufs_part_find/native_ufs_part_read (package/NativeUfs exports them).

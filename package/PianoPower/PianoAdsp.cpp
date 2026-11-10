@@ -29,7 +29,9 @@
 // piano-power-trace, default on) every RSC/IPCC register write has a line before and after it, so a hang names its access.
 // Boot arguments (read by piano_adsp_start): piano-power-delay=S (seconds before the bring-up, default 30: the root mount and the
 // other drivers' bring-up are done by then), piano-power-stop=N (stop before step N; what the earlier steps did stays),
-// piano-power-qmp=0 (no AOSS load_state), piano-power-rpmh=0 (no lcx/lmx proxy votes), piano-power-trace=0.
+// piano-power-qmp=0 (no AOSS load_state), piano-power-rpmh=0 (no lcx/lmx proxy votes), piano-power-trace=0, piano-power-map=N
+// (the carveout mapping: 0 write-combined = Normal non-cacheable as Linux's ioremap_wc, 1 Device-nGnRE, 2 Device-nGnRnE),
+// piano-power-load-first=1 (an image's segments are written before its init_image and mem_setup).
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -66,8 +68,8 @@ constexpr uint32_t kEvSmp2p = 1, kEvGlink = 2, kEvAop = 4, kEvSend = 16;
 constexpr unsigned kClients = 4, kQueue = 8;
 constexpr uint32_t kBringUpSliceMs = 2, kSteadySliceMs = 20;
 
-struct Knobs {uint32_t delay, stop, qmp, rpmh, trace;};
-Knobs gKnobs = {30, 0, 1, 1, 1};
+struct Knobs {uint32_t delay, stop, qmp, rpmh, trace, map, loadFirst;};
+Knobs gKnobs = {30, 0, 1, 1, 1, 0, 0};
 int gCurrent;   // the step begun last
 
 struct Window {IOMemoryMap *map; volatile uint8_t *va;};
@@ -463,10 +465,51 @@ int prepareMetadata(Image &image, uint64_t *phys) {
         image.mdt.relocatable ? "a relocatable" : "a fixed");
     return *phys && !(*phys & 0xfff) ? 0 : -14;
 }
+IOOptionBits carveoutCache() {
+    return gKnobs.map == 1 ? kIOMapPostedWrite : gKnobs.map == 2 ? kIOMapInhibitCache : kIOMapWriteCombineCache;
+}
+const char *carveoutCacheName() {
+    return gKnobs.map == 1 ? "Device-nGnRE" : gKnobs.map == 2 ? "Device-nGnRnE" : "write-combined (Normal non-cacheable)";
+}
+// One aligned 8-byte read of the carveout's first word, then the same value written back (nothing changes), each announced before
+// and logged after: a hang names the access and the moment (before the first secure call, or after mem_setup).
+bool probeCarveout(const char *when, uint64_t base) {
+    Window page = {};
+    if (!mapWindow(page, base, 0x1000, carveoutCache())) {say("probe (%s): %#llx does not map", when, (unsigned long long)base); return false;}
+    volatile uint64_t *word = reinterpret_cast<volatile uint64_t *>(page.va);
+    say("probe (%s): 8-byte read at %#llx (%s): begin", when, (unsigned long long)base, carveoutCacheName());
+    IOSleep(20);
+    const uint64_t value = *word;
+    say("probe (%s): read %#llx; writing it back: begin", when, (unsigned long long)value);
+    IOSleep(20);
+    *word = value;
+    __asm__ volatile("dsb sy" ::: "memory");
+    say("probe (%s): written, reads back %#llx", when, (unsigned long long)*word);
+    unmap(page);
+    return true;
+}
+// Stores of 8 aligned bytes (bytes at the ends), no memcpy/bzero: the copy works on every mapping type and uses no DC ZVA.
+void copyOut(volatile uint8_t *to, const uint8_t *from, uint64_t n) {
+    while (n && (reinterpret_cast<uintptr_t>(to) & 7)) {*to++ = *from++; --n;}
+    for (; n >= 8; n -= 8, to += 8, from += 8) {
+        uint64_t v;
+        memcpy(&v, from, 8);
+        *reinterpret_cast<volatile uint64_t *>(to) = v;
+    }
+    while (n--) *to++ = *from++;
+}
+void zeroOut(volatile uint8_t *to, uint64_t n) {
+    while (n && (reinterpret_cast<uintptr_t>(to) & 7)) {*to++ = 0; --n;}
+    for (; n >= 8; n -= 8, to += 8) *reinterpret_cast<volatile uint64_t *>(to) = 0;
+    while (n--) *to++ = 0;
+}
 int loadSegments(Image &image, uint64_t base, uint64_t size) {
     Window region = {};
-    say("carveout %#llx + %#llx: mapping write-combined", (unsigned long long)base, (unsigned long long)size);
-    if (!mapWindow(region, base, size, kIOMapWriteCombineCache)) return -12;
+    // A relocatable image is mapped only as far as mem_setup declared it (its span), a fixed one as the whole carveout.
+    const uint64_t span = image.mdt.relocatable ? qcom_mdt_span(&image.mdt) : size;
+    if (span < size) size = span;
+    say("carveout %#llx + %#llx: mapping %s", (unsigned long long)base, (unsigned long long)size, carveoutCacheName());
+    if (!mapWindow(region, base, size, carveoutCache())) return -12;
     constexpr size_t kChunk = 256 * 1024;
     uint8_t *bounce = static_cast<uint8_t *>(IOMallocData(kChunk));
     int rc = bounce ? 0 : -12;
@@ -479,14 +522,17 @@ int loadSegments(Image &image, uint64_t base, uint64_t size) {
         if (gKnobs.trace && (written < 3 || i + 1 == image.mdt.count))
             say("segment %u: %llu bytes from the file, %llu zero, at +%#llx", i, (unsigned long long)s.file_size,
                 (unsigned long long)(s.memory_size > s.file_size ? s.memory_size - s.file_size : 0), (unsigned long long)at);
-        uint8_t *to = const_cast<uint8_t *>(region.va) + at;
+        const bool verbose = gKnobs.trace && (written < 3 || i + 1 == image.mdt.count);
+        volatile uint8_t *to = region.va + at;
         for (uint64_t done = 0; !rc && done < s.file_size;) {
             const size_t n = s.file_size - done < kChunk ? (size_t)(s.file_size - done) : kChunk;
             if (piano_fw_read(image.file, s.file_offset + done, bounce, n)) {rc = -5; break;}
-            memcpy(to + done, bounce, n);
+            if (verbose && !done) say("segment %u: %zu bytes read from the file; storing them", i, n);
+            copyOut(to + done, bounce, n);
+            if (verbose && !done) say("segment %u: first %zu bytes stored", i, n);
             done += n;
         }
-        if (!rc && s.memory_size > s.file_size) bzero(to + s.file_size, (size_t)(s.memory_size - s.file_size));
+        if (!rc && s.memory_size > s.file_size) zeroOut(to + s.file_size, s.memory_size - s.file_size);
         written++;
     }
     __asm__ volatile("dsb sy" ::: "memory");
@@ -504,7 +550,13 @@ int startImage(Image &image, const char *name, uint32_t pas, uint64_t base, uint
     int rc;
     if (!begin(firstStep, name)) return 1;
     if ((rc = prepareMetadata(image, &phys))) return rc;
+    probeCarveout("before init_image", base);
     stage(firstStep);
+    if (gKnobs.loadFirst) {   // piano-power-load-first: the segments before init_image and mem_setup
+        if (!begin(firstStep + 3, name)) return 1;
+        if ((rc = loadSegments(image, base, size))) return rc;
+        stage(firstStep + 3);
+    }
     if (!begin(firstStep + 1, name)) return 1;
     snprintf(what, sizeof what, "PAS init_image (%s, PAS %u)", name, pas);
     if (!secure(what, [&](Sm8750SmcResult *r) {return Sm8750ScmPasInitImage(&gScm, pas, phys, r);})) return -1;
@@ -518,9 +570,12 @@ int startImage(Image &image, const char *name, uint32_t pas, uint64_t base, uint
     } else {
         say("step %d (%s): not needed, a fixed image", firstStep + 2, piano_adsp_stage_name(firstStep + 2));
     }
-    if (!begin(firstStep + 3, name)) return 1;
-    if ((rc = loadSegments(image, base, size))) return rc;
-    stage(firstStep + 3);
+    if (!gKnobs.loadFirst) {
+        if (!begin(firstStep + 3, name)) return 1;
+        probeCarveout("after mem_setup", base);
+        if ((rc = loadSegments(image, base, size))) return rc;
+        stage(firstStep + 3);
+    }
     if (!begin(firstStep + 4, name)) return 1;
     snprintf(what, sizeof what, "PAS auth_and_reset (%s, PAS %u)", name, pas);
     if (!secure(what, [&](Sm8750SmcResult *r) {return Sm8750ScmPasAuthAndReset(&gScm, pas, r);})) return -3;
@@ -892,9 +947,13 @@ extern "C" void piano_adsp_start(void) {
     PE_parse_boot_argn("piano-power-qmp", &gKnobs.qmp, sizeof gKnobs.qmp);
     PE_parse_boot_argn("piano-power-rpmh", &gKnobs.rpmh, sizeof gKnobs.rpmh);
     PE_parse_boot_argn("piano-power-trace", &gKnobs.trace, sizeof gKnobs.trace);
+    PE_parse_boot_argn("piano-power-map", &gKnobs.map, sizeof gKnobs.map);
+    PE_parse_boot_argn("piano-power-load-first", &gKnobs.loadFirst, sizeof gKnobs.loadFirst);
     if (gKnobs.delay > 600) gKnobs.delay = 600;
-    say("bring-up: delay %u s, stop before step %u%s, AOSS load_state %s, lcx/lmx votes %s, trace %s", gKnobs.delay, gKnobs.stop,
-        gKnobs.stop ? "" : " (none)", gKnobs.qmp ? "on" : "off", gKnobs.rpmh ? "on" : "off", gKnobs.trace ? "on" : "off");
+    if (gKnobs.map > 2) gKnobs.map = 0;
+    say("bring-up: delay %u s, stop before step %u%s, AOSS load_state %s, lcx/lmx votes %s, trace %s, carveouts %s, segments %s",
+        gKnobs.delay, gKnobs.stop, gKnobs.stop ? "" : " (none)", gKnobs.qmp ? "on" : "off", gKnobs.rpmh ? "on" : "off",
+        gKnobs.trace ? "on" : "off", carveoutCacheName(), gKnobs.loadFirst ? "before init_image (load-first)" : "after mem_setup");
     Sm8750ScmInit(&gScm, &gScmOps);
     gScm.budget_us = 30u * 1000u * 1000u;  // a large image's authentication takes longer than the default second
     piano_qrtr_start();                    // the router link registers before the DSP can open it
