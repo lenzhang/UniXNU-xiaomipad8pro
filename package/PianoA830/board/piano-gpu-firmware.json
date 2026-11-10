@@ -1,0 +1,36 @@
+{
+  "comment": "Identities of piano's own gen80000 GPU firmware (stock OS3.0.303.0.WPYCNXM vendor_a and odm_a). Not the firmware: tooling/k27/build-native-piano-a830.sh copies the files from PIANO_GPU_FW (default ../xiaomipad-8pro-mainline/firmware, pinned there by piano-gpu.json) into the ignored out/native-kexts/PianoA830/firmware after checking these pins, and embeds them from there. Same layout as UniXNU-Pagani_SM8750 scripts/data/sm8750-gpu-inputs.json 'firmware', so Adreno830's tests/run-host-tests.py --pins reads it.",
+  "firmware": {
+    "directory": "out/native-kexts/PianoA830/firmware",
+    "files": {
+      "gen80000_gmu.bin": {
+        "source": "qcom/gen80000_gmu.bin",
+        "bytes": 88896,
+        "sha256": "1ad8175e6cd01ea76c64d20b83600038c52dd29844b48d57b11b769b038863a5",
+        "symbol": "native_adreno_firmware_image",
+        "header": "GMU"
+      },
+      "gen80000_sqe.fw": {
+        "source": "qcom/gen80000_sqe.fw",
+        "bytes": 111476,
+        "sha256": "30ee3301534f95799d4afaf73864f3c369baa5a5dea8481e7f0cb8cc941f396c",
+        "symbol": "native_adreno_sqe_firmware_image",
+        "header": "SQE"
+      },
+      "gen80000_aqe.fw": {
+        "source": "qcom/gen80000_aqe.fw",
+        "bytes": 25044,
+        "sha256": "67562ad5baae3a133c92a6e48a9d1b1a9a867fe2f85b49324e244e963f3b89c5",
+        "symbol": "native_adreno_aqe_firmware_image",
+        "header": "AQE"
+      },
+      "gen80000_zap.mbn": {
+        "source": "qcom/sm8750/xiaomi/piano/gen80000_zap.mbn",
+        "bytes": 12088,
+        "sha256": "bb9424138209bdee7e8e11e9a00eca7f103a4e715550be2b0f70c1a0245e0f19",
+        "symbol": "native_adreno_zap_image",
+        "header": "ZAP"
+      }
+    }
+  }
+}

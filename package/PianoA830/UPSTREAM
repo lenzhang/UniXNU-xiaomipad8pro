@@ -1,0 +1,63 @@
+PianoA830 is the Adreno830 A830 kernel GPU driver (OnePlus 13T lineage) as a k27 native kext for piano, with piano's own board glue
+(board/, BSD-2-Clause-Patent, LICENSE). What it takes from other work, and from where:
+
+Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), main 1a1321056ffc5428ae925f4680093718b46ca7c2
+(unixnu.lock pin."Adreno830"), MIT (adreno830/LICENSE, sha256 16fbc0170994a48f60938d9f0d992d3bad113383cf90882f75c206e079c2a2dc).
+  Copied into adreno830/: every file of the repository except docs/ and AGENTS.md (the design documents stay upstream; read them
+  there), 159 files unchanged (sha256 equal to the originals). Hardware-proven on the 13T: S0-S10 and a GPU-composited desktop under
+  iPadOS 17.7.11 (gpu-native-plan.md section 2). Changed, every change marked "UniXNU-piano" in a comment and compiled only with
+  -DADRENO830_MACOS (the host tests build without it, so they test the upstream code paths):
+    Adreno830Start.cpp      215e565650d176cd28c2e11e79e098195474add04ea5ae054b15e9eaa4ff0b0f -> f14a4ec706aca0a9742d8409ee3c75a526fb7747b8b09ae5cf21930bc0cb49a1
+      S9 publishMetal without the iPadOS-only staged IOAcceleratorES (no IOGPUFamily load, no static class initializer, no
+      g_kernel_kmod_info): prepare/commit report steps 4/5; the macOS accelerator is the kext's AGXAccelerator personality on the
+      NativeAdrenoGpuPublished service native_adreno_publish registers. The 128 KiB cmd-db snapshot on the heap (allocated once by
+      adreno830_start): the k27 collection's largest __DATA gap for a native kext is about 166 KiB.
+    NativeAdrenoPublish.cpp d2a85cbcb4ad29df03a05c9f4e3edc0120358ab90a731cb61b083accf93bd31f -> 6c17459b67b868874f6be56b68c17155da10abd03f52efefdca79a102aed01e7
+      the render server is WindowServer (kRenderServer/isRenderServer at the six "backboardd" sites, as UniXNU Adreno740 7487f72).
+    NativeAdrenoPublish.h   b266fa844b199254611f2bb1fc0bfca6dedd1c73535cf442838b07527e74a854 -> 9b7f30aa11694cfb44a7731b1efc4fbe5a73ebf7807acee1443aa932fb01c46b
+      macOS process lists (NativeAdrenoSandboxGrantList, NativeAdrenoLargeClientList) in place of iPadOS's.
+    NativeAdrenoMemory.cpp  ea99b5e92be53377467c830bb63e5043597e543692ec20087711ba4d67770b1c -> 28882d551523a43a27890f4ed2fb82968bcbefcfdece71cf68465a9bdf6effad
+      the pool's 128 KiB extent table on the heap, allocated with the pool (same __DATA reason).
+  Not compiled into the kext: NativeAdrenoAccelerator.cpp (the iPadOS IOAcceleratorES class), NativeAdrenoClient.cpp and
+  NativeAdrenoBoard.cpp (host-only), tests/ and scripts/ (host tools). The source lists are those of scripts/build-adreno830.py.
+  NativeAdrenoABI.h (the v2 user-client ABI Turnip's darwin KMD includes) is unchanged, byte for byte.
+
+ArmSmmu4K (github.com/UniXNU/ArmSmmu4K), 3ba92451bd44bb742d11758fbfcd3a446ecad685, MIT (kits/ArmSmmu4K/LICENSE, sha256
+7a730b868c1ff986cdfc210a7b140ab4e0a31bf7db1d15db901427973efaa70f). The revision Adreno830 1a13210 was built and tested against
+(its docs/PROGRESS.md: "ArmSmmu4K 3ba9245"); the local checkout's 83969cd (UniXNU's catalog pin) has a newer, incompatible
+ArmSmmu4KLiveArena (per-page table allocation) and the archive's 4d0d659 lacks ArmSmmu4KLiveMapContextBatchExclusive. Taken from
+GitHub's archive of that commit: the 8 sources and 8 headers, README.md and LICENSE unchanged; the kit's own tests left out.
+
+AdrenoPM4 (github.com/UniXNU/AdrenoPM4; local unixnu-research/AdrenoPM4), main 282606b528b2595bc4274ea7490b62b323f35a5f, MIT
+(kits/AdrenoPM4/LICENSE, sha256 199298ccf9aba4cfe9d364199ff19b9d0688b07d83b770b313cf80a6a3924c69): AdrenoPM4.c/.h (the PM4 packet
+encoder the ring uses), README.md and LICENSE unchanged; the A740 command helpers and tests left out.
+
+UniXNU-Pagani_SM8750 (github.com/Shad0w23333/UniXNU-Pagani_SM8750), 25b110978fec628cc29bf5bd1b5b5ce830156bfd (unixnu.lock),
+BSD-2-Clause-Patent (sha256 5b1d3d911103cb0f41641ec0964c5ac1f7e229f57aa072b6ac38bae913a1307b), the 13T's GPU board:
+  package/PaganiGpuBoard.cpp (bd3ae49476ab8b1775f3c7b35f84478a90880cd382ac89ce6890d47aed21bc72) -> board/PianoA830Board.cpp.
+    Kept: fillBoard (every field, the slot/bank policy, ACTLR 0x303, pool 512 MiB, highest bank bit 16), the firmware pins.
+    Changed: PIANO_GPU_* inputs; piano-* boot arguments through the getter (the driver's knob table untouched); piano-gpu=1 forces
+    stop=0 (S0 only), piano-gpu=2 defaults the status page to 2; the SoC id from SMEM when it is one of the DT's SoCs; started from
+    the kext's thread instead of Stage7Probe (no async knob).
+  scripts/prepare-pagani-gpu-inputs.py (8adf18e9fd404a6d8a72ef0f23c5b1342ae59e66db65a8109ee95cb52c4e895b)
+    -> tooling/k27/gen-piano-gpu-inputs.py: the FDT reader, the KGSL level-bin extraction, the JSON pin of the runtime values and the
+    header layout; (A) from piano's boot DT instead of the 13T's DTS, (B) from piano's live DT, a cross-check of both, --compare.
+  scripts/build-pagani-gpu.py (c63b3b5eb38d38476ab0781e68b85e8f9016ac24c66cd4f040073dd5583050a4)
+    -> tooling/k27/stage-piano-gpu-firmware.py: pinned, page-aligned .incbin images, the pins header; sizes as literals.
+
+macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM; local droidvm-build/macOS-DroidVM, read only), 11ac316 (branch el1/native-variant),
+BSD-2-Clause-Patent (SPDX headers): overlay/kext/DroidVMGpuKext.cpp (b312016ace4de3a69209626690234ca20ab3e25678b2a7ace1d1234b2109317b)
+and overlay/kext/DroidVMGpu.json (46b6274795be70cf55601616361b801edc8b58b7a9990104408e850e588ce7e7): the AGXAccelerator class (an
+IOAccelerator subclass carrying MetalPluginName/MetalPluginClassName, the logged property reads and opens) and its personality and
+vtable check, in board/PianoA830.cpp and tooling/k27/kext/PianoA830.json. Removed: DroidVMGpuStarter, the virtio-gpu hooks and the
+weak NativeAdreno 805c7e4 stubs. No DroidVM kext is linked (docs/PROJECT-MAP.md rule 8).
+
+Data (facts, not code):
+  piano's boot DT out/inputs/piano-boot.dtb (sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840, the DT ABL
+  hands Ubuntu's mainline kernel) and piano's live stock DT unixnu-research/Unixnu-SM8750-Piano/inputs/piano-live.dtb (sha256
+  ed6e1a3c663fda03e833297170542ad6916791999fc685a6597672a2535ce76b): board/PianoGpuInputs.h and board/piano-gpu-inputs.json.
+  The firmware identities of xiaomipad-8pro-mainline firmware/piano-gpu.json (OS3.0.303.0.WPYCNXM): board/piano-gpu-firmware.json.
+  The firmware itself is never in this repository (embedded at build time from the ignored out/native-kexts/PianoA830/firmware).
+
+Specification only (never copied): Linux drm/msm, KGSL, clk/qcom (GPL-2.0). Adreno830's A830Regs.h and the generated A830HwInit.h
+are register facts as upstream ships them; nothing was added from GPL sources.

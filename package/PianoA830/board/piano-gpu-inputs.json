@@ -1,0 +1,887 @@
+{
+  "boot_dtb": {
+    "bytes": 147436,
+    "sha256": "50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840"
+  },
+  "live_dtb": {
+    "bytes": 1111663,
+    "sha256": "ed6e1a3c663fda03e833297170542ad6916791999fc685a6597672a2535ce76b"
+  },
+  "runtime_dt": {
+    "comment": "KGSL policy values of piano's live DT (normalised; sha256 of this values object as compact sorted JSON)",
+    "sha256": "ef4925fd7370b45d8352a05bda8d2ce0ebbedc8db8950dd4b038ec0263ee5565",
+    "values": {
+      "WINDOW_GPU": [
+        63963136,
+        262144
+      ],
+      "WINDOW_RSCC": [
+        64290816,
+        65536
+      ],
+      "WINDOW_CX_DBGC": [
+        64360448,
+        12288
+      ],
+      "WINDOW_CX_MISC": [
+        64610304,
+        8192
+      ],
+      "WINDOW_GMU": [
+        64188416,
+        425984
+      ],
+      "WINDOW_GMU_AO": [
+        64225280,
+        65536
+      ],
+      "WINDOW_GPUCC": [
+        64552960,
+        38912
+      ],
+      "WINDOW_GCC": [
+        1048576,
+        2048512
+      ],
+      "WINDOW_SMMU": [
+        64618496,
+        262144
+      ],
+      "WINDOW_CMD_DB": [
+        2177236992,
+        131072
+      ],
+      "WINDOW_SMEM": [
+        2177892352,
+        2097152
+      ],
+      "WINDOW_ZAP": [
+        2601099264,
+        8192
+      ],
+      "WINDOW_QFPROM": [
+        572293120,
+        4096
+      ],
+      "WINDOW_LLCC": [
+        [
+          612368384,
+          2097152
+        ],
+        [
+          629145600,
+          2097152
+        ],
+        [
+          616562688,
+          2097152
+        ],
+        [
+          633339904,
+          2097152
+        ],
+        [
+          645922816,
+          2097152
+        ],
+        [
+          650117120,
+          2097152
+        ]
+      ],
+      "CHIP_ID": 1141178369,
+      "IRQ_GPU": 332,
+      "IRQ_CX_HOST": 112,
+      "IRQ_HFI": 336,
+      "IRQ_GMU": 337,
+      "SMMU_IRQS_ALL": [
+        706,
+        710,
+        711,
+        712,
+        713,
+        714,
+        715,
+        716,
+        717,
+        718,
+        719,
+        720,
+        454,
+        508,
+        606,
+        607,
+        608,
+        609,
+        692,
+        694,
+        697,
+        698,
+        699,
+        701,
+        702,
+        732
+      ],
+      "SID_GPU": 0,
+      "SID_LPAC": 1,
+      "SID_GMU": 5,
+      "QFPROM_SPEEDBIN_OFFSET": 312,
+      "SPEEDBIN_BITS": 9,
+      "WINDOW_RSC_DRV2": [
+        374472704,
+        65536
+      ],
+      "WINDOW_AOSS_MSGRAM": [
+        204472320,
+        1024
+      ],
+      "WINDOW_IPCC": [
+        4218880,
+        4096
+      ],
+      "WINDOW_TSENS_TM": [
+        203595776,
+        511
+      ],
+      "TSENS_NAME": "tsens2@c22a000",
+      "IRQ_SCM_WAITQ": 994,
+      "SMMU_ACTLR_DT": 811,
+      "UBWC_MODE": 5,
+      "MIN_ACCESS_LENGTH": 32,
+      "DDR_KBPS": [
+        0,
+        781250,
+        2136718,
+        5285156,
+        6074218,
+        6671875,
+        8171875,
+        10687500,
+        12449218,
+        14398437,
+        16500000,
+        18597656
+      ],
+      "CNOC_LEVELS": [
+        0,
+        100
+      ],
+      "GMU_KHZ": [
+        500000,
+        650000
+      ],
+      "GMU_VLVL": [
+        64,
+        128
+      ],
+      "SOC_IDS": [
+        618,
+        639
+      ],
+      "BINS": [
+        {
+          "name": "qcom,gpu-pwrlevels-0",
+          "speed_bin": 190,
+          "skus": [],
+          "initial": 9,
+          "levels": [
+            {
+              "khz": 160000,
+              "vlvl": 50,
+              "bus_min": 2,
+              "bus": 2,
+              "bus_max": 2,
+              "acd": 0
+            },
+            {
+              "khz": 222000,
+              "vlvl": 52,
+              "bus_min": 2,
+              "bus": 2,
+              "bus_max": 2,
+              "acd": 0
+            },
+            {
+              "khz": 342000,
+              "vlvl": 56,
+              "bus_min": 2,
+              "bus": 3,
+              "bus_max": 3,
+              "acd": 0
+            },
+            {
+              "khz": 389000,
+              "vlvl": 60,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3358089213
+            },
+            {
+              "khz": 443000,
+              "vlvl": 64,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3224264701
+            },
+            {
+              "khz": 525000,
+              "vlvl": 80,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3224264701
+            },
+            {
+              "khz": 607000,
+              "vlvl": 128,
+              "bus_min": 4,
+              "bus": 6,
+              "bus_max": 8,
+              "acd": 2821611517
+            },
+            {
+              "khz": 660000,
+              "vlvl": 144,
+              "bus_min": 4,
+              "bus": 6,
+              "bus_max": 8,
+              "acd": 2284609533
+            },
+            {
+              "khz": 734000,
+              "vlvl": 192,
+              "bus_min": 6,
+              "bus": 8,
+              "bus_max": 10,
+              "acd": 2821349373
+            },
+            {
+              "khz": 832000,
+              "vlvl": 224,
+              "bus_min": 7,
+              "bus": 10,
+              "bus_max": 10,
+              "acd": 2284478461
+            },
+            {
+              "khz": 900000,
+              "vlvl": 256,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2284478461
+            }
+          ]
+        },
+        {
+          "name": "qcom,gpu-pwrlevels-1",
+          "speed_bin": 221,
+          "skus": [],
+          "initial": 11,
+          "levels": [
+            {
+              "khz": 160000,
+              "vlvl": 50,
+              "bus_min": 2,
+              "bus": 2,
+              "bus_max": 2,
+              "acd": 0
+            },
+            {
+              "khz": 222000,
+              "vlvl": 52,
+              "bus_min": 2,
+              "bus": 2,
+              "bus_max": 2,
+              "acd": 0
+            },
+            {
+              "khz": 342000,
+              "vlvl": 56,
+              "bus_min": 2,
+              "bus": 3,
+              "bus_max": 3,
+              "acd": 0
+            },
+            {
+              "khz": 389000,
+              "vlvl": 60,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3358089213
+            },
+            {
+              "khz": 443000,
+              "vlvl": 64,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3224264701
+            },
+            {
+              "khz": 525000,
+              "vlvl": 80,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3224264701
+            },
+            {
+              "khz": 607000,
+              "vlvl": 128,
+              "bus_min": 4,
+              "bus": 6,
+              "bus_max": 8,
+              "acd": 2821611517
+            },
+            {
+              "khz": 660000,
+              "vlvl": 144,
+              "bus_min": 4,
+              "bus": 6,
+              "bus_max": 8,
+              "acd": 2284609533
+            },
+            {
+              "khz": 734000,
+              "vlvl": 192,
+              "bus_min": 6,
+              "bus": 8,
+              "bus_max": 10,
+              "acd": 2821349373
+            },
+            {
+              "khz": 832000,
+              "vlvl": 224,
+              "bus_min": 7,
+              "bus": 10,
+              "bus_max": 10,
+              "acd": 2284478461
+            },
+            {
+              "khz": 900000,
+              "vlvl": 256,
+              "bus_min": 7,
+              "bus": 10,
+              "bus_max": 10,
+              "acd": 2284478461
+            },
+            {
+              "khz": 967000,
+              "vlvl": 320,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2284478461
+            },
+            {
+              "khz": 1050000,
+              "vlvl": 416,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2821283837
+            }
+          ]
+        },
+        {
+          "name": "qcom,gpu-pwrlevels-2",
+          "speed_bin": 232,
+          "skus": [],
+          "initial": 12,
+          "levels": [
+            {
+              "khz": 160000,
+              "vlvl": 50,
+              "bus_min": 2,
+              "bus": 2,
+              "bus_max": 2,
+              "acd": 0
+            },
+            {
+              "khz": 222000,
+              "vlvl": 52,
+              "bus_min": 2,
+              "bus": 2,
+              "bus_max": 2,
+              "acd": 0
+            },
+            {
+              "khz": 342000,
+              "vlvl": 56,
+              "bus_min": 2,
+              "bus": 3,
+              "bus_max": 3,
+              "acd": 0
+            },
+            {
+              "khz": 389000,
+              "vlvl": 60,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3358089213
+            },
+            {
+              "khz": 443000,
+              "vlvl": 64,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3224264701
+            },
+            {
+              "khz": 525000,
+              "vlvl": 80,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3224264701
+            },
+            {
+              "khz": 607000,
+              "vlvl": 128,
+              "bus_min": 4,
+              "bus": 6,
+              "bus_max": 8,
+              "acd": 2821611517
+            },
+            {
+              "khz": 660000,
+              "vlvl": 144,
+              "bus_min": 4,
+              "bus": 6,
+              "bus_max": 8,
+              "acd": 2284609533
+            },
+            {
+              "khz": 734000,
+              "vlvl": 192,
+              "bus_min": 6,
+              "bus": 8,
+              "bus_max": 10,
+              "acd": 2821349373
+            },
+            {
+              "khz": 832000,
+              "vlvl": 224,
+              "bus_min": 7,
+              "bus": 10,
+              "bus_max": 10,
+              "acd": 2284478461
+            },
+            {
+              "khz": 900000,
+              "vlvl": 256,
+              "bus_min": 7,
+              "bus": 10,
+              "bus_max": 10,
+              "acd": 2284478461
+            },
+            {
+              "khz": 967000,
+              "vlvl": 320,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2284478461
+            },
+            {
+              "khz": 1050000,
+              "vlvl": 416,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2821283837
+            },
+            {
+              "khz": 1100000,
+              "vlvl": 448,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2284412925
+            }
+          ]
+        },
+        {
+          "name": "qcom,gpu-pwrlevels-3",
+          "speed_bin": null,
+          "skus": [
+            1,
+            2
+          ],
+          "initial": 12,
+          "levels": [
+            {
+              "khz": 160000,
+              "vlvl": 50,
+              "bus_min": 2,
+              "bus": 2,
+              "bus_max": 2,
+              "acd": 0
+            },
+            {
+              "khz": 222000,
+              "vlvl": 52,
+              "bus_min": 2,
+              "bus": 2,
+              "bus_max": 2,
+              "acd": 0
+            },
+            {
+              "khz": 342000,
+              "vlvl": 56,
+              "bus_min": 2,
+              "bus": 3,
+              "bus_max": 3,
+              "acd": 0
+            },
+            {
+              "khz": 389000,
+              "vlvl": 60,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3358089213
+            },
+            {
+              "khz": 443000,
+              "vlvl": 64,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3224264701
+            },
+            {
+              "khz": 525000,
+              "vlvl": 80,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3224264701
+            },
+            {
+              "khz": 607000,
+              "vlvl": 128,
+              "bus_min": 4,
+              "bus": 6,
+              "bus_max": 8,
+              "acd": 2821611517
+            },
+            {
+              "khz": 660000,
+              "vlvl": 144,
+              "bus_min": 4,
+              "bus": 6,
+              "bus_max": 8,
+              "acd": 2284609533
+            },
+            {
+              "khz": 734000,
+              "vlvl": 192,
+              "bus_min": 6,
+              "bus": 8,
+              "bus_max": 10,
+              "acd": 2821349373
+            },
+            {
+              "khz": 832000,
+              "vlvl": 224,
+              "bus_min": 7,
+              "bus": 10,
+              "bus_max": 10,
+              "acd": 2284478461
+            },
+            {
+              "khz": 900000,
+              "vlvl": 256,
+              "bus_min": 7,
+              "bus": 10,
+              "bus_max": 10,
+              "acd": 2284478461
+            },
+            {
+              "khz": 967000,
+              "vlvl": 320,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2284478461
+            },
+            {
+              "khz": 1050000,
+              "vlvl": 416,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2821283837
+            },
+            {
+              "khz": 1100000,
+              "vlvl": 448,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2284412925
+            }
+          ]
+        },
+        {
+          "name": "qcom,gpu-pwrlevels-4",
+          "speed_bin": 242,
+          "skus": [],
+          "initial": 12,
+          "levels": [
+            {
+              "khz": 160000,
+              "vlvl": 50,
+              "bus_min": 2,
+              "bus": 2,
+              "bus_max": 2,
+              "acd": 0
+            },
+            {
+              "khz": 222000,
+              "vlvl": 52,
+              "bus_min": 2,
+              "bus": 2,
+              "bus_max": 2,
+              "acd": 0
+            },
+            {
+              "khz": 342000,
+              "vlvl": 56,
+              "bus_min": 2,
+              "bus": 3,
+              "bus_max": 3,
+              "acd": 0
+            },
+            {
+              "khz": 389000,
+              "vlvl": 60,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3358089213
+            },
+            {
+              "khz": 443000,
+              "vlvl": 64,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3224264701
+            },
+            {
+              "khz": 525000,
+              "vlvl": 80,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3224264701
+            },
+            {
+              "khz": 607000,
+              "vlvl": 128,
+              "bus_min": 4,
+              "bus": 6,
+              "bus_max": 8,
+              "acd": 2821611517
+            },
+            {
+              "khz": 660000,
+              "vlvl": 144,
+              "bus_min": 4,
+              "bus": 6,
+              "bus_max": 8,
+              "acd": 2284609533
+            },
+            {
+              "khz": 734000,
+              "vlvl": 192,
+              "bus_min": 6,
+              "bus": 8,
+              "bus_max": 10,
+              "acd": 2821349373
+            },
+            {
+              "khz": 832000,
+              "vlvl": 224,
+              "bus_min": 7,
+              "bus": 10,
+              "bus_max": 10,
+              "acd": 2284478461
+            },
+            {
+              "khz": 900000,
+              "vlvl": 256,
+              "bus_min": 7,
+              "bus": 10,
+              "bus_max": 10,
+              "acd": 2284478461
+            },
+            {
+              "khz": 967000,
+              "vlvl": 320,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2284478461
+            },
+            {
+              "khz": 1050000,
+              "vlvl": 416,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2821283837
+            },
+            {
+              "khz": 1150000,
+              "vlvl": 448,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2284412925
+            }
+          ]
+        },
+        {
+          "name": "qcom,gpu-pwrlevels-5",
+          "speed_bin": null,
+          "skus": [
+            3,
+            0
+          ],
+          "initial": 13,
+          "levels": [
+            {
+              "khz": 160000,
+              "vlvl": 50,
+              "bus_min": 2,
+              "bus": 2,
+              "bus_max": 2,
+              "acd": 0
+            },
+            {
+              "khz": 222000,
+              "vlvl": 52,
+              "bus_min": 2,
+              "bus": 2,
+              "bus_max": 2,
+              "acd": 0
+            },
+            {
+              "khz": 342000,
+              "vlvl": 56,
+              "bus_min": 2,
+              "bus": 3,
+              "bus_max": 3,
+              "acd": 0
+            },
+            {
+              "khz": 389000,
+              "vlvl": 60,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3358089213
+            },
+            {
+              "khz": 443000,
+              "vlvl": 64,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3224264701
+            },
+            {
+              "khz": 525000,
+              "vlvl": 80,
+              "bus_min": 2,
+              "bus": 4,
+              "bus_max": 6,
+              "acd": 3224264701
+            },
+            {
+              "khz": 607000,
+              "vlvl": 128,
+              "bus_min": 4,
+              "bus": 6,
+              "bus_max": 8,
+              "acd": 2821611517
+            },
+            {
+              "khz": 660000,
+              "vlvl": 144,
+              "bus_min": 4,
+              "bus": 6,
+              "bus_max": 8,
+              "acd": 2284609533
+            },
+            {
+              "khz": 734000,
+              "vlvl": 192,
+              "bus_min": 6,
+              "bus": 8,
+              "bus_max": 10,
+              "acd": 2821349373
+            },
+            {
+              "khz": 832000,
+              "vlvl": 224,
+              "bus_min": 7,
+              "bus": 10,
+              "bus_max": 10,
+              "acd": 2284478461
+            },
+            {
+              "khz": 900000,
+              "vlvl": 256,
+              "bus_min": 7,
+              "bus": 10,
+              "bus_max": 10,
+              "acd": 2284478461
+            },
+            {
+              "khz": 967000,
+              "vlvl": 320,
+              "bus_min": 10,
+              "bus": 10,
+              "bus_max": 11,
+              "acd": 2284478461
+            },
+            {
+              "khz": 1050000,
+              "vlvl": 416,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2821283837
+            },
+            {
+              "khz": 1100000,
+              "vlvl": 448,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2284412925
+            },
+            {
+              "khz": 1200000,
+              "vlvl": 452,
+              "bus_min": 11,
+              "bus": 11,
+              "bus_max": 11,
+              "acd": 2284412925
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

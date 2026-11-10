@@ -1,0 +1,43 @@
+{
+  "name": "PianoA830",
+  "bundle": "com.unixnu.driver.PianoA830",
+  "version": "1.0.0",
+  "objects": "@OUT@/native-kexts/PianoA830/objects.json",
+  "start": "_native_kext_start",
+  "stop": "_native_kext_stop",
+  "libraries": {
+    "com.apple.iokit.IOGraphicsFamily": "1.0.0b1",
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.private": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  },
+  "personalities": {
+    "PianoA830": {
+      "CFBundleIdentifier": "com.unixnu.driver.PianoA830",
+      "IOClass": "PianoA830",
+      "IOProviderClass": "IOPlatformExpertDevice",
+      "IOProbeScore": 100,
+      "IOMatchCategory": "PianoA830"
+    },
+    "AGXAccelerator": {
+      "CFBundleIdentifier": "com.unixnu.driver.PianoA830",
+      "IOClass": "AGXAccelerator",
+      "IOProviderClass": "NativeAdrenoGpuPublished",
+      "IOMatchCategory": "IOAccelerator",
+      "MetalPluginName": "NativeAdrenoMetal",
+      "MetalPluginClassName": "NativeAdrenoMetalDevice"
+    }
+  },
+  "vtable": {
+    "class": "AGXAccelerator",
+    "base": "IOAccelerator",
+    "base_kext": "com.apple.iokit.IOGraphicsFamily",
+    "slots": 272,
+    "ignore_slots": [
+      16
+    ]
+  }
+}
