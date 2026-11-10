@@ -357,3 +357,24 @@ tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img     # t
 grep -E "NativeGopDisplay: (thumb|first|[0-9]+ swaps)|NativeSoftMetal|crash message|Assertion|exit: pid [0-9]+ WindowServer" \
   logs/native-runs/<ts>-loop/xnu-console.txt
 ```
+
+## 12. soft-metal-all=1 for one run (2026-11-11)
+
+Measured (f9f817c4, twice): the managed Reduce transparency changed nothing. The assertion is the same on the second boot, every
+thumbnail is black, and the owner saw the panel go black after the verbose console. Next image:
+- `soft-metal-all=1` (boot argument): loginwindow and the agents get the port-0 device too, so their Core Animation renders in software
+  as WindowServer's does, instead of finding no Metal device at all. This tests §11's question of whether the black frames are
+  clients drawing nothing. Read the `NativeSoftMetal: <process>: ...` lines for which clients take the device and what they then ask
+  for, and the `crash message` lines for any that die on it.
+- Reduce transparency is also written into the plain preference domains (`/Library/Preferences/com.apple.universalaccess` and root's
+  own, which loginwindow reads before a login), by the same root boot job.
+- No log loop, at most 3 thumbnails.
+
+If the assertion stays, its backdrop layer is not one a client preference removes. The remaining routes are outside this package's
+scope: Metal compositing (a GPU driver, gpu.md) avoids Core Animation's software renderer altogether.
+
+```sh
+PIANO_EXTRA_KEXTS="$PWD/out/k27/kext/NativeSoftGpu.json" PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=300 \
+PIANO_EXTRA_ARGS="exec-log=1 stderr-log=1 panic_on_crash_disabled=1 soft-metal-all=1" tooling/k27/build-native-image.sh
+tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
+```

@@ -66,7 +66,11 @@ REDUCE_TRANSPARENCY = ("mp='/Library/Managed Preferences'; "
                        "rt='<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>reduceTransparency</key><true/></dict></plist>'; "
                        'mkdir -p "$mp"; printf "%s\\n" "$rt" > "$mp/com.apple.universalaccess.plist"; '
                        'for u in /Users/*; do n=${u##*/}; [ "$n" = Shared ] && continue; mkdir -p "$mp/$n"; '
-                       'printf "%s\\n" "$rt" > "$mp/$n/com.apple.universalaccess.plist"; done; chmod -R go-w,a+rX "$mp"')
+                       'printf "%s\\n" "$rt" > "$mp/$n/com.apple.universalaccess.plist"; done; chmod -R go-w,a+rX "$mp"; '
+                       # 2026-11-11: the managed files alone changed nothing measurable; the plain domains too: any user, and root's
+                       # (loginwindow runs as root before a login)
+                       'defaults write /Library/Preferences/com.apple.universalaccess reduceTransparency -bool true; '
+                       'defaults write com.apple.universalaccess reduceTransparency -bool true')
 
 
 def cdhash(path):
