@@ -1,0 +1,15 @@
+diff --git a/uefi/pianoPkg/Include/DXE.inc b/uefi/pianoPkg/Include/DXE.inc
+index c1e1742..7856bd9 100644
+--- a/uefi/pianoPkg/Include/DXE.inc
++++ b/uefi/pianoPkg/Include/DXE.inc
+@@ -139,7 +139,9 @@
+   INF Binaries/piano/QcomPkg/Drivers/DisplayDxe/DisplayDxe.inf
+ !endif
+ !else
+-  INF pianoPkg/Drivers/ScaledFbDxe/ScaledFbDxe.inf
++  # UniXNU-piano: the linear BGRA GOP on the splash framebuffer (3200x2136). DarwinBoot hands XNU a linear framebuffer
++  # and refuses a Blt-only GOP (ScaledFbDxe) with EFI_UNSUPPORTED (2026-11-10 22:37 on the tablet).
++  INF SiliciumPkg/Drivers/SimpleFbDxe/SimpleFbDxe.inf
+ !endif
+ 
+ !if $(QCOM_DXE) == TRUE

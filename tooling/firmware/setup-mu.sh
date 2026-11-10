@@ -29,7 +29,9 @@ if [ ! -d "$P" ]; then
   git -C "$R/piano-uefi" worktree add -q --detach "$P" "$(pin piano-uefi commit)"
   for p in "$D"/firmware/patches/*.patch; do git -C "$P" apply "$p"; done
 fi
-for p in "$D"/firmware/patches/*.patch; do git -C "$P" apply --reverse --check "$p" 2>/dev/null || { echo "$P lacks $(basename "$p")" >&2; exit 1; }; done
+for p in "$D"/firmware/patches/*.patch; do git -C "$P" apply --reverse --check "$p" 2>/dev/null || git -C "$P" apply "$p"; done
+# Mu-Silicium deltas (SEC keeps the boot loader's x0 = DT in the entry-argument HOB UniXNURamDiskDxe reads).
+for p in "$D"/firmware/patches/mu-silicium/*.patch; do git -C "$M" apply --reverse --check "$p" 2>/dev/null || git -C "$M" apply "$p"; done
 mkdir -p "$M/Resources/MuPatches"
 ln -sfn "$P/uefi/pianoPkg" "$M/Platforms/Xiaomi/pianoPkg"
 ln -sfn "$P/uefi/piano.toml" "$M/Resources/Configs/piano.toml"

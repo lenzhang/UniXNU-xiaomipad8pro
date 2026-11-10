@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -40,6 +41,10 @@ MKBOOTIMG = Path(os.environ.get('PIANO_MKBOOTIMG', Path.home() / 'Downloads/Xiao
 MKBOOTIMG_SHA256 = '37d84b3d162e0bc62e36c1f4e1c63c85ea0caa9f29be023eb2f8efe006ad948c'   # the Ubuntu RAM set's (maintenance-manifest.json)
 V2 = ['--header_version', '2', '--pagesize', '4096', '--base', '0', '--kernel_offset', '0x00008000',
       '--ramdisk_offset', '0x01000000', '--tags_offset', '0x00000100', '--dtb_offset', '0x01f00000']
+# piano's keys reach UEFI but do not move UniXNU's menu (2026-11-10 22:37), so the macOS image boots its default on its own.
+MENU_TIMEOUT = int(os.environ.get('PIANO_MENU_TIMEOUT', '8'))
+# 1 CPU (cpus=1) panicked in recount_switch_thread on the tablet (2026-11-10 22:41); the 8-CPU entry is the default.
+MENU_DEFAULT = os.environ.get('PIANO_MENU_DEFAULT', 'macos-8cpu')
 EPOCH = 1262304000  # UniXNU payload timestamps (2010-01-01)
 
 # The k27 userspace arguments of the working VM boot disk (logs/adt/vm-unixnu.toml), minus the VM's devices
@@ -105,8 +110,8 @@ def macos_payload(work, kc, trust, seed, adt, utc):
              'initrd = "Payloads/scratch-data.img"\nargs = "{args}"\n')
     (stage / 'EFI/UniXNU/unixnu.toml').write_text(
         '# piano M2: k27 (macOS 27.0.1) natively at EL1, RAM boot. No OS volume natively yet: expect the kernel log on the panel\n'
-        '# and a wait for the root volume. The menu waits for a key (volume keys move, power selects).\n'
-        'version = 1\n[boot]\ntimeout = -1\ndefault = "macos-1cpu"\n[kits]\nautoload = false\n'
+        '# and a wait for the root volume. The menu boots the default entry after MENU_TIMEOUT s (-1: wait for a key).\n'
+        'version = 1\n[boot]\ntimeout = ' + str(MENU_TIMEOUT) + '\ndefault = "' + MENU_DEFAULT + '"\n[kits]\nautoload = false\n'
         + entry.format(id='macos-1cpu', title='macOS k27 native, 1 CPU', args=one)
         + entry.format(id='macos-8cpu', title='macOS k27 native, 8 CPUs (PSCI CPU_ON)', args=smp)
         + menu_actions())
@@ -124,6 +129,13 @@ def pack(out, fd, dtb, ramdisk, work, name):
     if len(firmware) != size:
         raise SystemExit(f'{fd} is {len(firmware):#x} bytes, piano.toml says {size:#x}')
     shim = compile_shim(SHIM_TREE, base, size, config['boot_shim']['requires_kernel_header'], work)
+    # piano's ABL places a kernel by its ARM64 header: Mu's BootShim writes the FD base into text_offset with flags 0, so ABL
+    # put it at DRAM base + 0xA7100000 (not RAM) and its jump failed (2026-11-10 22:12: OKAY, black panel, back in fastboot).
+    # A plain Linux Image header instead (as the Ubuntu kernel's: text_offset 0, flags 0xa = LE, 4 KiB, anywhere); the shim's
+    # code is position independent and copies the FD to FD_BASE itself.
+    shim = bytearray(shim)
+    struct.pack_into('<QQQ', shim, 8, 0, -(-(len(shim) + size) // 0x1000) * 0x1000, 0xa)
+    shim = bytes(shim)
     kernel = work / f'{name}.kernel'
     kernel.write_bytes(shim + firmware + Path(dtb).read_bytes())
     image = out / f'{name}.img'

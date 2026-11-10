@@ -1,9 +1,9 @@
 reference container: ubuntu-boot-ram-maintenance.img sha256 54001a50a13fe80c3bd8e926161608b71d91e57e2d6be6b83cdc2bc62b5f6fbc
-FD piano-uefi-A-bundled.fd sha256 f74807d387e3b570039f4a5b4f5a8e5d22dda32fa89c7978e209b7d98b922f11 (build record f74807d387e3b570039f4a5b4f5a8e5d22dda32fa89c7978e209b7d98b922f11)
+FD piano-uefi-A-bundled.fd sha256 ccb95d1e961ebe29766452135c9eab1e2a64d1aacc8ba043ca5643ba81e3cd8e (build record ccb95d1e961ebe29766452135c9eab1e2a64d1aacc8ba043ca5643ba81e3cd8e)
   ok    FD file is the one the build used
 boot DTB sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840
 
-== boot-piano-uefi-ram-A-bundled.img  11837440 bytes  sha256 d326172ae388c191e40714c7e6ce3a4caade5544ce46fc132bb8d67b5fd60121
+== boot-piano-uefi-ram-A-bundled.img  11837440 bytes  sha256 7b19c9c99576d4ad6d75aa1f74fb57a4ba06d0186e7a924f9a6fbbf7ae2281b0
   ok    header magic = b'ANDROID!' (Ubuntu RAM set: b'ANDROID!')
   ok    header kernel_addr = 32768 (Ubuntu RAM set: 32768)
   ok    header ramdisk_addr = 16777216 (Ubuntu RAM set: 16777216)
@@ -21,8 +21,8 @@ boot DTB sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840
   info  kernel_size 3293356  ramdisk_size 8388608  dtb_size 147436  cmdline b''
   ok    header id is the SHA-1 of the sections (mkbootimg)
   ok    kernel field starts with an ARM64 image header
-  ok    ARM64 header text offset 0xa7100000 = FD base
-  ok    ARM64 header image size 0x3000c0 = shim 0xc0 + FD 0x300000
+  ok    ARM64 header as a Linux Image (text offset 0x0, flags 0xa; Ubuntu kernel: 0, 0xa)
+  ok    ARM64 header image size 0x301000 covers shim 0xc0 + FD 0x300000
   ok    kernel field holds the exact FD after the shim
   ok    the boot DTB is appended after the FD
   ok    v2 dtb section is the boot DTB
@@ -55,7 +55,7 @@ boot DTB sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840
     | action = "tools"
   info  no AVB footer (unsigned, as the Ubuntu RAM set)
 
-== boot-piano-macos-ram-A-bundled.img  203726848 bytes  sha256 77a79f9a57e23ed715b3ea82d50f9485356008f953dba05b21281b6791a33656
+== boot-piano-macos-ram-A-bundled.img  203726848 bytes  sha256 a99703f53f2b6719598347508884aa80174235b12e5d1e1e2d9dbe622842e5bd
   ok    header magic = b'ANDROID!' (Ubuntu RAM set: b'ANDROID!')
   ok    header kernel_addr = 32768 (Ubuntu RAM set: 32768)
   ok    header ramdisk_addr = 16777216 (Ubuntu RAM set: 16777216)
@@ -73,8 +73,8 @@ boot DTB sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840
   info  kernel_size 3293356  ramdisk_size 200278016  dtb_size 147436  cmdline b''
   ok    header id is the SHA-1 of the sections (mkbootimg)
   ok    kernel field starts with an ARM64 image header
-  ok    ARM64 header text offset 0xa7100000 = FD base
-  ok    ARM64 header image size 0x3000c0 = shim 0xc0 + FD 0x300000
+  ok    ARM64 header as a Linux Image (text offset 0x0, flags 0xa; Ubuntu kernel: 0, 0xa)
+  ok    ARM64 header image size 0x301000 covers shim 0xc0 + FD 0x300000
   ok    kernel field holds the exact FD after the shim
   ok    the boot DTB is appended after the FD
   ok    v2 dtb section is the boot DTB
@@ -84,7 +84,7 @@ boot DTB sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840
         EFI/UniXNU/Payloads/kernel.macho.adt  14896  f9b45c6560e05fac3c315f3cf6f219b39cad1a729cbd67c0b6d639657c18c695
         EFI/UniXNU/Payloads/kernel.macho.trustcache  446804  2b87b2241090c90508f26c8ca33129f7540922481a102359e99cf0adf00d10d6
         EFI/UniXNU/Payloads/scratch-data.img  83967024  cb50ceac16394c9f1da7f141ce0bb0b831b5ffac6bc9eeb56a9af99b1c147c11
-        EFI/UniXNU/unixnu.toml  2314  4046cb9afafd8a28f936dc675735a40235a7e9e408dd78fd489784dec740cf9b
+        EFI/UniXNU/unixnu.toml  2329  13e61cf833cd56ed2563f258cbd9efb820d98573369d7eeb5206851b14fdddea
   ok    EFI/UniXNU/Payloads/kernel.macho is the input the build recorded
   ok    EFI/UniXNU/Payloads/kernel.macho.adt is the input the build recorded
   ok    EFI/UniXNU/Payloads/kernel.macho.trustcache is the input the build recorded
@@ -92,11 +92,11 @@ boot DTB sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840
   ok    EFI/UniXNU/unixnu.toml present
   unixnu.toml:
     | # piano M2: k27 (macOS 27.0.1) natively at EL1, RAM boot. No OS volume natively yet: expect the kernel log on the panel
-    | # and a wait for the root volume. The menu waits for a key (volume keys move, power selects).
+    | # and a wait for the root volume. The menu boots the default entry after MENU_TIMEOUT s (-1: wait for a key).
     | version = 1
     | [boot]
-    | timeout = -1
-    | default = "macos-1cpu"
+    | timeout = 8
+    | default = "macos-8cpu"
     | [kits]
     | autoload = false
     | [[entry]]

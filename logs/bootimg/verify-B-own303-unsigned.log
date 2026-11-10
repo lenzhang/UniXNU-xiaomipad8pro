@@ -3,7 +3,7 @@ FD piano-uefi-B-own303.fd sha256 f88f5fcdbb99a96afad7ba43696e77b33463ab732737da5
   ok    FD file is the one the build used
 boot DTB sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840
 
-== boot-piano-uefi-ram-B-own303.img  11837440 bytes  sha256 b8e01cfa00c525462a5dbf39baafe02793a345bacbf8ffb8ae32cba6e240989b
+== boot-piano-uefi-ram-B-own303.img  11837440 bytes  sha256 f3b9a08edf695c6ff20613041ee3f17c0c0ce0d1991bdf15a3aa904a160a73db
   ok    header magic = b'ANDROID!' (Ubuntu RAM set: b'ANDROID!')
   ok    header kernel_addr = 32768 (Ubuntu RAM set: 32768)
   ok    header ramdisk_addr = 16777216 (Ubuntu RAM set: 16777216)
@@ -21,8 +21,8 @@ boot DTB sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840
   info  kernel_size 3293356  ramdisk_size 8388608  dtb_size 147436  cmdline b''
   ok    header id is the SHA-1 of the sections (mkbootimg)
   ok    kernel field starts with an ARM64 image header
-  ok    ARM64 header text offset 0xa7100000 = FD base
-  ok    ARM64 header image size 0x3000c0 = shim 0xc0 + FD 0x300000
+  ok    ARM64 header as a Linux Image (text offset 0x0, flags 0xa; Ubuntu kernel: 0, 0xa)
+  ok    ARM64 header image size 0x301000 covers shim 0xc0 + FD 0x300000
   ok    kernel field holds the exact FD after the shim
   ok    the boot DTB is appended after the FD
   ok    v2 dtb section is the boot DTB
@@ -55,7 +55,7 @@ boot DTB sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840
     | action = "tools"
   info  no AVB footer (unsigned, as the Ubuntu RAM set)
 
-== boot-piano-macos-ram-B-own303.img  203726848 bytes  sha256 b7d36b2b2224d62a252e2e7c0c8c02c17de1ed7b41b7f66f7be6fc90be479ec3
+== boot-piano-macos-ram-B-own303.img  203726848 bytes  sha256 02f1db3c23630e474a5ae583adc63fe5458c5508549af3b16d58ca8c74ef7980
   ok    header magic = b'ANDROID!' (Ubuntu RAM set: b'ANDROID!')
   ok    header kernel_addr = 32768 (Ubuntu RAM set: 32768)
   ok    header ramdisk_addr = 16777216 (Ubuntu RAM set: 16777216)
@@ -73,8 +73,8 @@ boot DTB sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840
   info  kernel_size 3293356  ramdisk_size 200278016  dtb_size 147436  cmdline b''
   ok    header id is the SHA-1 of the sections (mkbootimg)
   ok    kernel field starts with an ARM64 image header
-  ok    ARM64 header text offset 0xa7100000 = FD base
-  ok    ARM64 header image size 0x3000c0 = shim 0xc0 + FD 0x300000
+  ok    ARM64 header as a Linux Image (text offset 0x0, flags 0xa; Ubuntu kernel: 0, 0xa)
+  ok    ARM64 header image size 0x301000 covers shim 0xc0 + FD 0x300000
   ok    kernel field holds the exact FD after the shim
   ok    the boot DTB is appended after the FD
   ok    v2 dtb section is the boot DTB
