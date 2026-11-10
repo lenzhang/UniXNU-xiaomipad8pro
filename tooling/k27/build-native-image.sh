@@ -37,6 +37,39 @@ if [ "$SOFT_METAL" = 1 ]; then
   PIANO_SEED=${PIANO_SEED:-out/soft-metal/scratch-data.img}
   PIANO_TRUST=${PIANO_TRUST:-out/soft-metal/kernel.macho.trustcache}
 fi
+# The A830 GPU path (docs/drivers/gpu-userspace.md): when PianoA830 is linked (the list or PIANO_EXTRA_KEXTS; PIANO_A830_METAL=0
+# leaves this out, =1 forces it), the VM's NativeAdrenoMetal.bundle with Turnip rebuilt on Adreno830's ABI v2
+# (tooling/metal/build-turnip-a830.sh) is staged into a copy of the Data seed and the trust cache (out/turnip-a830/stage), which the
+# image then takes unless PIANO_SEED / PIANO_TRUST name others; redone only when its inputs change (out/turnip-a830/stage/stamp).
+# PIANO_A830_TU_DEBUG (default sysmem: no GMEM for the first bring-up) is staged as /private/var/ngpu/debug/tu-debug, Turnip's
+# TU_DEBUG in every Metal process without one; PIANO_A830_TU_DEBUG= stages none. NativeSoftGpu and PianoA830 are exclusive: Metal
+# takes the first accelerator it finds, and SkyLight the first device's port.
+A830_METAL=${PIANO_A830_METAL:-}
+if [ -z "$A830_METAL" ]; then
+  case " $LIST ${PIANO_EXTRA_KEXTS:-} " in *PianoA830*) A830_METAL=1 ;; *) A830_METAL=0 ;; esac
+fi
+if [ "$A830_METAL" = 1 ]; then
+  case "$SOFT_METAL $LIST ${PIANO_EXTRA_KEXTS:-} " in 1*|*NativeSoftGpu*)
+    echo "NativeSoftGpu (or PIANO_SOFT_METAL=1) and PianoA830 together: Metal takes the first accelerator; leave NativeSoftGpu out" >&2
+    exit 1 ;; esac
+  tooling/metal/build-turnip-a830.sh > out/k27/build-turnip-a830.log 2>&1 \
+    || { grep -E "error|FAILED|^no |not ABI" out/k27/build-turnip-a830.log | head; exit 1; }
+  A830_TU_DEBUG=${PIANO_A830_TU_DEBUG-sysmem}
+  STAMP=$( { shasum -a 256 out/inputs/scratch-data.img out/inputs/kernel.macho.trustcache tooling/k27/stage-soft-metal.py
+             find out/turnip-a830/NativeAdrenoMetal.bundle -type f | sort | xargs shasum -a 256; echo "tu-debug $A830_TU_DEBUG"; } | shasum -a 256 | cut -c1-16)
+  if [ "$(cat out/turnip-a830/stage/stamp 2>/dev/null)" != "$STAMP" ] || [ ! -f out/turnip-a830/stage/scratch-data.img ]; then
+    FILES=()
+    if [ -n "$A830_TU_DEBUG" ]; then
+      printf '%s\n' "$A830_TU_DEBUG" > out/turnip-a830/tu-debug
+      FILES=(--file out/turnip-a830/tu-debug:private/var/ngpu/debug/tu-debug)
+    fi
+    python3 tooling/k27/stage-soft-metal.py --out out/turnip-a830/stage ${FILES[@]+"${FILES[@]}"} out/turnip-a830/NativeAdrenoMetal.bundle \
+      > out/k27/stage-turnip-a830.log 2>&1 || { tail -5 out/k27/stage-turnip-a830.log; exit 1; }
+    echo "$STAMP" > out/turnip-a830/stage/stamp
+  fi
+  PIANO_SEED=${PIANO_SEED:-out/turnip-a830/stage/scratch-data.img}
+  PIANO_TRUST=${PIANO_TRUST:-out/turnip-a830/stage/kernel.macho.trustcache}
+fi
 # The descriptors with their objects' absolute place (@OUT@ = this repository's out/), plus PIANO_EXTRA_KEXTS (JSON paths) for a test.
 mkdir -p out/k27/kext; NATIVE=
 for k in $LIST; do sed "s#@OUT@#$D/out#" "tooling/k27/kext/$k.json" > "out/k27/kext/$k.json"; NATIVE="$NATIVE $D/out/k27/kext/$k.json"; done

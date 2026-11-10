@@ -1,0 +1,40 @@
+turnip: on Darwin, TU_DEBUG from /private/var/ngpu/debug/tu-debug when the environment has none
+
+WindowServer's environment comes from its launchd job on the read-only system volume; the Data seed can carry this file
+(tooling/k27/build-native-image.sh PIANO_A830_TU_DEBUG, default sysmem for the first native bring-up).
+Against the VM's Mesa tree (Droid-VM/mesa cecc0e9 + UniXNU-turnip patches/mesa + macOS-DroidVM patches/mesa-macos). MIT.
+
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -7,6 +7,9 @@
+ 
+ #include <errno.h>
+ #include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "util/os_file.h"
+ #include "util/os_file_notify.h"
+@@ -129,6 +132,21 @@
+ static void
+ tu_env_init_once(void)
+ {
++#if defined(__APPLE__)
++   /* Darwin: a system daemon's environment comes from a launchd job on the read-only system volume, so without TU_DEBUG the first
++    * line of /private/var/ngpu/debug/tu-debug (on the Data volume, beside the Metal plugin's other debug switches) stands in for it. */
++   if (!getenv("TU_DEBUG")) {
++      if (FILE *file = fopen("/private/var/ngpu/debug/tu-debug", "r")) {
++         char line[128] = {};
++         if (fgets(line, sizeof(line), file)) {
++            line[strcspn(line, "\r\n")] = 0;
++            if (line[0])
++               setenv("TU_DEBUG", line, 0);
++         }
++         fclose(file);
++      }
++   }
++#endif
+    tu_env.start_debug = tu_env.debug = parse_debug_string(os_get_option("TU_DEBUG"), tu_debug_options);
+ 
+    if (TU_DEBUG(STARTUP))

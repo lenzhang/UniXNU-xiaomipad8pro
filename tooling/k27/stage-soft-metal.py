@@ -6,7 +6,13 @@
     stage-gpu-plugin.py does), so AMFI and libsystem_sandbox's gpu_bundle_find_trusted accept the ad hoc signed plugin.
 
     stage-soft-metal.py [--seed out/inputs/scratch-data.img] [--trust out/inputs/kernel.macho.trustcache] [--out out/soft-metal]
-                        [--boot-run COMMAND]... [--log-stream PREDICATE | --log-errors PREDICATE] [--reduce-transparency] [BUNDLE]
+                        [--boot-run COMMAND]... [--log-stream PREDICATE | --log-errors PREDICATE] [--reduce-transparency]
+                        [--file SOURCE:DEST]... [BUNDLE]
+
+Any Metal plugin bundle: tooling/k27/build-native-image.sh also stages the A830 GPU path's NativeAdrenoMetal.bundle with it
+(tooling/metal/build-turnip-a830.sh, --out out/turnip-a830/stage).
+--file copies a file of this Mac to DEST on the Data volume (relative to its root: private/var/ngpu/debug/tu-debug is
+/private/var/ngpu/debug/tu-debug), mode 644 and owner 99 as the bundle's, its directories made as needed.
 
 Then: PIANO_SEED=out/soft-metal/scratch-data.img PIANO_TRUST=out/soft-metal/kernel.macho.trustcache tooling/k27/build-native-image.sh.
 The seed is the packed DBRDISK1 disk (NativeRamBlock SeedDisk.h). It is unpacked to a sparse raw file, attached with hdiutil (no mount),
@@ -158,8 +164,16 @@ def main():
     p.add_argument('--log-stream', metavar='PREDICATE')
     p.add_argument('--log-errors', metavar='PREDICATE')
     p.add_argument('--reduce-transparency', action='store_true')
+    p.add_argument('--file', metavar='SOURCE:DEST', action='append', default=[])
     p.add_argument('bundle', nargs='?', type=Path, default=D / 'out/soft-metal/NativeSoftMetal.bundle')
     a = p.parse_args()
+    files = []
+    for item in a.file:
+        source, _, dest = item.partition(':')
+        dest = dest.lstrip('/')
+        if not source or not dest or '..' in Path(dest).parts or not Path(source).is_file():
+            raise SystemExit(f'--file {item}: SOURCE must be a file here, DEST a path on the Data volume')
+        files.append((Path(source), dest))
     commands, early = list(a.boot_run), []
     if a.reduce_transparency:
         early.append(REDUCE_TRANSPARENCY)
@@ -213,6 +227,13 @@ def main():
                 root = run('ls', '-la', str(mount), capture_output=True, text=True).stdout
                 print(f'{volume}: /{GPU_BUNDLES}/{bundle.name}\n{listing}extended attributes left: {left or "none"}\n'
                       f'volume root:\n{root}')
+                for source, dest in files:
+                    target_file = mount / dest
+                    target_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target_file)
+                    os.chmod(target_file, 0o644)
+                    subprocess.run(['xattr', '-c', str(target_file)], check=False)
+                    print(f'{volume}: /{dest} <- {source} ({target_file.stat().st_size} bytes)')
                 if commands or early:
                     print(f'/{BOOT_JOB} runs: ' + set_boot_commands(mount / BOOT_JOB, commands, early))
             finally:

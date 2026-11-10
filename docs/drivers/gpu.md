@@ -47,6 +47,10 @@ macOS 27.3 `gpu-metal=1` path is the 27.3 reference).
 IOGPUFamily / IOAccelerator (`AGXAccelerator` publication as Adreno830 S9 does), Metal plugin bundle in
 `/Library/GPUBundles` (UniXNU 27.3's GPU addon), user client ABI `NativeAdrenoABI.h` v2.
 
+The userspace half is built: the VM's `NativeAdrenoMetal.bundle` with Turnip on ABI v2, checked offline against Adreno830's host
+kernel stack and staged by `build-native-image.sh` when PianoA830 is linked. [gpu-userspace.md](gpu-userspace.md) §4 lists what the
+kernel side must provide (2026-11-11).
+
 ## 6. Boot args
 
 UniXNU 27.3 names (sheng): `gpu-power=9`, `gpu-metal=1`, `fb-gpu=1`, `fb-bgra=1`, `gpu-dcvs=1`, `gpu-addon=1`; Adreno830's

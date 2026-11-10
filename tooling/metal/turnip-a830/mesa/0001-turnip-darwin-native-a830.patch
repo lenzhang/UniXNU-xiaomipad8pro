@@ -1,0 +1,80 @@
+turnip: darwin backend for piano's A830 natively (Adreno830's NativeAdrenoABI.h v2)
+
+- the virtio-gpu backend only with TU_DARWIN_VIRTGPU=1 (=probe: the VM board's probe); unset, the native kernel client, and no
+  Metal process opens the accelerator with type 0x4149;
+- dsb sy before each Submit and at the end of vkEndCommandBuffer: command streams are CPU writes into write-combined BO views,
+  possibly recorded on another core (the OnePlus 13T's fix D1 on the same A830);
+- gpu_id 830 for chip 0x44050001 (the decode formula gives 6850).
+Against the VM's Mesa tree (Droid-VM/mesa cecc0e9 + UniXNU-turnip patches/mesa + macOS-DroidVM patches/mesa-macos). MIT.
+
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -1,5 +1,6 @@
+ /*
+- * Native Darwin kernel backend for Turnip: talks to the NativeAdreno IOKit user client (NativeAdrenoABI.h, version 1).
++ * Native Darwin kernel backend for Turnip: talks to the NativeAdreno IOKit user client (NativeAdrenoABI.h, the version of the
++ * header it is built with: 1 for the VM's NativeAdreno 805c7e4, 2 for Adreno830 natively; the kernel's Query must answer the same).
+  * Modelled on tu_knl_kgsl.cc (no libdrm) and tu_knl_drm_msm.cc (the client chooses GPU addresses).
+  * SPDX-License-Identifier: MIT
+  */
+@@ -1425,6 +1426,12 @@
+    for (unsigned i = 0; i < count; i++)
+       req.buffers[i] = entries[i];
+ 
++#if defined(__aarch64__)
++   /* The command streams are CPU writes into write-combined BO views (the native kernel's BOs are not IO-coherent), and the thread
++    * that recorded them may have run on another core: drain this core's write buffer before the kernel kicks the CP (the OnePlus
++    * 13T's fix D1 on the same A830; tu_EndCommandBuffer drains the recording core's). */
++   __asm__ volatile("dsb sy" ::: "memory");
++#endif
+    for (;;) {
+       NativeAdrenoAbiSubmitReply reply = {};
+       kern_return_t kr = dw_call(NativeAdrenoMethodSubmit, &req, sizeof(req), &reply, sizeof(reply));
+@@ -1687,6 +1694,9 @@
+     * chip id (0x43050a01) alone. */
+    if (info->chip_id == 0x43050a01)
+       device->dev_id.gpu_id = 740;
++   /* Gen8 ids do not decode either (0x44050001 would read as 6850): the A830 of SM8750, which Adreno830 reports. */
++   if (info->chip_id == 0x44050001)
++      device->dev_id.gpu_id = 830;
+    device->gmem_size = debug_get_num_option("TU_GMEM", info->gmem_bytes);
+    device->gmem_base = info->gmem_base;
+    device->uche_trap_base = info->uche_trap_base;
+--- a/src/freedreno/vulkan/tu_knl_darwin_virtgpu.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin_virtgpu.cc
+@@ -125,14 +125,18 @@
+    return answer;
+ }
+ 
+-/* TU_DARWIN_VIRTGPU=1 or 0 chooses the backend; unset, the board does (dwv_board_default). */
++/* TU_DARWIN_VIRTGPU=1 or 0 chooses the backend; =probe lets the board decide (dwv_board_default). Unset: the native kernel client
++ * (piano natively: Adreno830's user client, which has no virtio GPU behind it). The board probe is an extra open of the accelerator
++ * (type 0x4149) in every Metal process, which a native kernel must refuse without taking a connection slot. */
+ bool
+ dwv_enabled(void)
+ {
+    const char *text = getenv("TU_DARWIN_VIRTGPU");
++   if (text && !strcmp(text, "probe"))
++      return dwv_board_default();
+    if (text && *text)
+       return strcmp(text, "0") != 0;
+-   return dwv_board_default();
++   return false;
+ }
+ 
+ static kern_return_t
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -5445,6 +5445,12 @@
+       }
+    }
+ 
++#if defined(__APPLE__) && defined(__aarch64__)
++   /* Darwin's native kernel client maps BOs write-combined: the streams just written may still sit in this core's write buffer
++    * while another thread, on another core, submits them. Drain it here (the OnePlus 13T's fix D1 on the same A830; the darwin
++    * backend's submit drains the submitting core's). */
++   __asm__ volatile("dsb sy" ::: "memory");
++#endif
+    return vk_command_buffer_end(&cmd_buffer->vk);
+ }
+ TU_GENX(tu_EndCommandBuffer);
