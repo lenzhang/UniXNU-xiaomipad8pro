@@ -201,3 +201,9 @@ on. It also prints the crash message, which names the format.
 
 `Display 1 current mode (0 x 0)` was logged early, before any mode was set. It is a second thing to watch in the log loop. It is not
 the abort: that is decided by the format alone.
+
+## Measured 2026-11-11 (d6601e49, 300 s)
+
+The crash annotation names it: `Unimplemented pixel format of 1380411457 used in WSCompositeDestinationCreateWithIOSurface`
+(`'RGhA'`, half float). No FP16/CIF10 debug option was on; the only CoreAnimation option on was 203 `CA_HDR10_SET_EDR_SCALE`. So the
+FP16 framebuffer comes from the EDR or display-capability branch of `framebuffer_pixel_format()`: next, the display's properties.
