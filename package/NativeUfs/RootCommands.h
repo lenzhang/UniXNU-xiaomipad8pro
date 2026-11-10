@@ -510,8 +510,26 @@ static bool hostLogOpen (uint64_t first, uint64_t blocks)
   return true;
 }
 
+#if defined(NATIVE_UFS_UNVERIFIED_ROOT) && NATIVE_UFS_UNVERIFIED_ROOT
+// UniXNU-piano development build: the root windows are written in place, as k27's virtio disks are in the VM.
+struct UfsDevWritable { uint64_t first, blocks; };
+static UfsDevWritable gDevWritable[4];
+static unsigned gDevWritableCount = 0;
+static bool hostDevWritableOpen (uint64_t first, uint64_t blocks)
+{
+  if (gDevWritableCount >= 4 || !blocks || first > 0xffffffffULL || blocks > 0xffffffffULL - first) return false;
+  gDevWritable[gDevWritableCount++] = { first, blocks };
+  return true;
+}
+#endif
+
 static bool hostInWindow (uint64_t lba, uint32_t blocks)
 {
+#if defined(NATIVE_UFS_UNVERIFIED_ROOT) && NATIVE_UFS_UNVERIFIED_ROOT
+  for (unsigned i = 0; i < gDevWritableCount; ++i)
+    if (lba >= gDevWritable[i].first && lba - gDevWritable[i].first < gDevWritable[i].blocks &&
+        blocks <= gDevWritable[i].blocks - (lba - gDevWritable[i].first)) return true;
+#endif
   if (gStoreOpen && lba >= gStoreFirst && lba - gStoreFirst < gStoreBlocks && blocks <= gStoreBlocks - (lba - gStoreFirst)) return true;
   return gLogOpen && lba >= gLogFirst && lba - gLogFirst < gLogBlocks && blocks <= gLogBlocks - (lba - gLogFirst);
 }
@@ -561,7 +579,11 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
 // SYNCHRONIZE CACHE(10) for the whole LUN: every write that completed before this call is on the medium when it returns.
 static IOReturn hostSyncCache (void)
 {
+#if defined(NATIVE_UFS_UNVERIFIED_ROOT) && NATIVE_UFS_UNVERIFIED_ROOT
+  if (!gHost.ready || (!gStoreOpen && !gLogOpen && !gDevWritableCount)) return kIOReturnNotReady;
+#else
   if (!gHost.ready || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;
+#endif
   bool pooled;
   const UfsSlot slot = hostSlotTake (&pooled);
   uint8_t cdb[10] = { 0x35 };

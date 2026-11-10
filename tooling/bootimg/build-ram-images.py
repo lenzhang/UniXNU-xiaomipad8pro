@@ -43,7 +43,7 @@ V2 = ['--header_version', '2', '--pagesize', '4096', '--base', '0', '--kernel_of
       '--ramdisk_offset', '0x01000000', '--tags_offset', '0x00000100', '--dtb_offset', '0x01f00000']
 # piano's keys reach UEFI but do not move UniXNU's menu (2026-11-10 22:37), so the macOS image boots its default on its own.
 # 5 s: the window in which tooling/native/native-loop.sh reads the previous run's log through the UEFI's debug fastboot.
-MENU_TIMEOUT = int(os.environ.get('PIANO_MENU_TIMEOUT', '5'))
+MENU_TIMEOUT = int(os.environ.get('PIANO_MENU_TIMEOUT', '0'))   # 0: boot the default at once (UniXNU Menu.c); the loop's log dump still fits before ExitBootServices
 # 1 CPU (cpus=1) panicked in recount_switch_thread on the tablet (2026-11-10 22:41); the 8-CPU entry is the default.
 MENU_DEFAULT = os.environ.get('PIANO_MENU_DEFAULT', 'macos-8cpu')
 EPOCH = 1262304000  # UniXNU payload timestamps (2010-01-01)
@@ -69,7 +69,9 @@ K27_ARGS = ['-v', 'debug=0x14e', 'kt_fixed_zones=120', '-no_slto_panic', 'ml-tim
             'piano-reset-to=bootloader',
             # Root from UFS (package/NativeUfs): the SHNGROOT windows OS/SystemOS in linux_rootfs, read only, unverified
             # build (no NATIVE_VERIFIED_BLOCK: development tablet); diagnostics in the console log.
-            'native-ufs-root=1', 'native-ufs-diagnostics=1']
+            'native-ufs-root=1', 'native-ufs-diagnostics=1',
+            # NativeRamBlock's changed Data pages in NativeUfs's store window at the end of linux_rootfs (2: read and write)
+            'data-persist=' + os.environ.get('PIANO_DATA_PERSIST', '2')]
 
 
 def sha(path):

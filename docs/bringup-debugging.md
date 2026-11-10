@@ -20,9 +20,12 @@ ABL (fastboot boot) ─► BootShim (kernel field) ─► Mu-Silicium UEFI (FD a
 | UEFI → UniXNU payload | SEC must keep x0 (the DT from ABL) in the entry-argument HOB: `firmware/patches/mu-silicium/0001` | Piano_Log: `UNIXNURAMDISK: no entry argument HOB`; the menu has only the built-in entries and falls through to the UEFI shell |
 | DarwinBoot → XNU | A linear BGRA GOP: `firmware/patches/0002` (SimpleFbDxe instead of piano-uefi's Blt-only ScaledFbDxe) | console: `DARWINBOOT: boot refused: Unsupported; firmware retained`; the menu redraws (looks like a flash) |
 | XNU CPUs | Boot with all 8 ADT CPUs (`sheng-smp=1`), **not** `cpus=1` | `cpus=1`: `Kernel data abort` in `recount_switch_thread+0x84` (far 0xfffffff36ee62004, esr 0x96000007) |
-| XNU root | An OS volume with UUID C73696D4-… (the VM's); none natively before UFS | `Waiting on <dict> IOMedia … UUID C73696D4…` (expected stop) |
+| XNU root | NativeUfs (`package/NativeUfs`, `native-ufs-root=1`): the SHNGROOT windows OS + SystemOS in linux_rootfs (`tooling/native/make-root-manifest.py`); Data = the RAM seed with its changed pages in NativeUfs's store window at the end of linux_rootfs (`data-persist=2`, `tooling/k27/build-native-ram-block.sh`) | `Waiting on <dict> IOMedia … UUID C73696D4…` |
+| UFS: SMMU | piano's firmware leaves SID 0x60 on context bank 1 (PKX110: bank 0); the entry is redirected to the bypass bank | `SMMU plan for stream 0x60: conflicting UFS stream mapping (slot 1 smr 80000060 s2cr 1)` |
+| UFS: link | the link is in Hibern8 when XNU starts: UniXNU-Odin3's SM8750 link handling (AHIT off, Hibern8 exit, IACR off) | `FAILED at NOP OUT` (LINK tx=1) |
+| UFS: writes | the development build writes the windows in place (`NATIVE_UFS_UNVERIFIED_ROOT`); without it APFS's writes fail | `disk5s1: device is not ready.` by the hundred |
 
-Menu input: volume keys move, the power key is Enter. Images auto-boot their default after 8 s (`PIANO_MENU_TIMEOUT`,
+Menu input: volume keys move, the power key is Enter. Images boot their default at once (`PIANO_MENU_TIMEOUT`, default 0; -1 waits for a key;
 `PIANO_MENU_DEFAULT`, default `macos-8cpu`).
 
 ## 2. Seeing what happened without a camera
@@ -58,23 +61,29 @@ itself when `panic-spin=1` is absent.
 character. DarwinBoot loads the kernel at its link address (no slide), so pc/lr look up directly in
 `out/k27/kc-k27-native.nm` (+ the KC's `natives.json`).
 
-## 3. The unattended loop
+## 3. The unattended loop (no Ubuntu, 2026-11-11)
 
 ```sh
-tooling/native/native-run.sh out/ram/boot-piano-macos-ram-A-bundled.img [WAIT_SECONDS]
+tooling/k27/build-native-image.sh                                    # kexts -> KC -> out/ram (test) + out/ram-dump (reset after 1 s)
+tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
 ```
 
-It runs Ubuntu → `sudo piano-reboot-bootloader` → `fastboot boot` → XNU → reset → Ubuntu, then writes
-`logs/native-runs/<ts>/{run.log,usb.log,xnu-console.txt}`. The tablet's sudo password comes from
-`~/.config/piano/tablet-sudo` (mode 600, outside every repository) and goes to sudo on stdin only.
+The tablet waits in ABL fastboot. One test: `fastboot boot` the image → XNU runs until `piano-reset-after`
+(`PIANO_RESET_AFTER`, default 45) resets it; k27 0057 set the PMIC restart reason, so ABL stays in fastboot → `fastboot boot` the
+dump image → while its UEFI runs, `fastboot -s piano-uefi oem dump 9cb00000 700000` + `get_staged` pull the test's log → the
+dump image's XNU resets at once → parked in ABL fastboot again. About reset time + 70 s per test; results in
+`logs/native-runs/<ts>-loop/{loop.log,xnu-console.txt}`. The UniXNU menu boots its default at once (`PIANO_MENU_TIMEOUT=0`).
 
-A person is needed only when the tablet is parked (no reset, no Ubuntu): power + volume-down for 15–20 s; a plain
-10-second power press does nothing to a parked kernel.
+Ubuntu's root is gone (linux_rootfs holds the macOS windows), so the old Ubuntu-based `native-run.sh` no longer applies. The
+maintenance RAM image of the Ubuntu release (USB NCM, telnet root shell: `tooling/native/maint-shell.py`) is the way to write
+partitions from the tablet itself.
+
+A person is needed only when the tablet is parked (no reset, no fastboot): power + volume-down for 15–20 s.
 
 ## 4. Rebuild after a change
 
 ```sh
-K27_VARIANT=native ../droidvm-build/macOS-DroidVM/build-k27-piano.sh            # kernel (patches 0001-0056)
+K27_VARIANT=native ../droidvm-build/macOS-DroidVM/build-k27-piano.sh            # kernel (patches 0001-0058)
 tooling/kc/build-kc-k27.sh ../droidvm-build/macOS-DroidVM/out/x12377/build/xnu/k27-native-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped out/k27/kc-k27-native.bin
 tooling/unixnu.sh build firmware --skip-preflight                                   # FD (A: Binaries/piano -> the bundled set)
 python3 tooling/bootimg/build-ram-images.py --fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --out out/ram \

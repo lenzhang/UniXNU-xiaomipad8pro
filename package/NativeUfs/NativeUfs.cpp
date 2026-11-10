@@ -1898,6 +1898,8 @@ class NativeUfsBlock : public IOBlockStorageDevice {
   uint32_t bounceFree = 0;
   IOLock *windowLock = nullptr;   // guards bounceFree
   bool online = false;
+  bool writable = false;      // development build only (NATIVE_UFS_UNVERIFIED_ROOT)
+  IOReturn writeWindow (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, uint64_t *done);
   uint8_t *takeBounce ()
   {
     IOLockLock (windowLock);
@@ -1943,8 +1945,11 @@ public:
     *present = online; if (changed) *changed = false; return kIOReturnSuccess;
   }
   IOReturn reportRemovability (bool *value) override { *value = false; return kIOReturnSuccess; }
-  IOReturn reportWriteProtection (bool *value) override { *value = true; return kIOReturnSuccess; }
-  IOReturn doSynchronizeCache () override { return online ? kIOReturnSuccess : kIOReturnNotReady; }
+  IOReturn reportWriteProtection (bool *value) override { *value = !writable; return kIOReturnSuccess; }
+  IOReturn doSynchronizeCache () override {
+    if (!online) return kIOReturnNotReady;
+    return writable ? hostSyncCache () : kIOReturnSuccess;
+  }
   IOReturn doSynchronize (UInt64, UInt64, IOOptionBits) override { return doSynchronizeCache (); }
   IOReturn getWriteCacheState (bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn setWriteCacheState (bool) override { return kIOReturnUnsupported; }
@@ -2021,6 +2026,11 @@ bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint6
   // policy; without a matching policy the device is never published.
   return configureVerification ();
 #else
+#if defined(NATIVE_UFS_UNVERIFIED_ROOT) && NATIVE_UFS_UNVERIFIED_ROOT
+  // Development build: the windows are writable in place (the OS volume is the live root, as on the VM's virtio disk).
+  writable = !(absolute % 4096) && !(bytes % 4096) && hostDevWritableOpen (absolute / 4096, bytes / 4096);
+  IOLog ("NativeUfs: %s window %s\n", label, writable ? "writable (development build)" : "read-only");
+#endif
   return true;
 #endif
 }
@@ -2220,11 +2230,21 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
       count > bytes / 512 - block || buffer->getLength () < count * 512) {
     return kIOReturnBadArgument;
   }
-  if (buffer->getDirection () != kIODirectionIn) {
-    return kIOReturnNotWritable;
-  }
   if (!online) {
     return kIOReturnNotReady;
+  }
+  if (buffer->getDirection () == kIODirectionOut && writable) {
+    uint64_t written = 0;
+    IOReturn status = writeWindow (buffer, block, count, &written);
+    if (status != kIOReturnSuccess) {
+      __atomic_fetch_add (&native_ufs_block_failures, 1, __ATOMIC_RELAXED);
+      IOLog ("NativeUfs: %s write of %llu sectors at %llu failed: %x\n", label, count, block, status);
+    }
+    completion->action (completion->target, completion->parameter, status, written);
+    return kIOReturnSuccess;
+  }
+  if (buffer->getDirection () != kIODirectionIn) {
+    return kIOReturnNotWritable;
   }
   struct Operations {
     IOMemoryDescriptor *buffer;
@@ -2283,6 +2303,34 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
   }
   completion->action (completion->target, completion->parameter, result, done);
   return kIOReturnSuccess;
+}
+
+// Development build: 512-byte sectors written onto 4 KiB UFS blocks; partial blocks at the edges are read first.
+IOReturn NativeUfsBlock::writeWindow (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, uint64_t *done)
+{
+  uint8_t *bounce = takeBounce ();
+  const uint64_t start = absolute + block * 512;
+  uint64_t remaining = count * 512;
+  IOReturn status = kIOReturnSuccess;
+  *done = 0;
+  while (remaining) {
+    const uint64_t pos = start + *done, lba = pos / 4096, skip = pos % 4096;
+    uint64_t blocks = (skip + remaining + 4095) / 4096;
+    if (blocks > kDataMax / 4096) blocks = kDataMax / 4096;
+    uint64_t usable = blocks * 4096 - skip;
+    if (usable > remaining) usable = remaining;
+    if (skip || (skip + usable) % 4096) {
+      status = hostRead4k (0, lba, static_cast<uint32_t> (blocks), bounce);
+      if (status != kIOReturnSuccess) break;
+    }
+    if (buffer->readBytes (*done, bounce + skip, usable) != usable) { status = kIOReturnIOError; break; }
+    status = hostWrite4k (0, lba, static_cast<uint32_t> (blocks), bounce);
+    if (status != kIOReturnSuccess) break;
+    *done += usable;
+    remaining -= usable;
+  }
+  giveBounce (bounce);
+  return status;
 }
 
 void NativeUfsBlock::free ()
