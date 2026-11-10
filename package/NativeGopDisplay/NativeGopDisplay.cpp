@@ -10,9 +10,9 @@
 //
 // Discovery is DroidVMDisplay's: IOMobileFramebuffer.framework (iomfb_populate_all_display_infos) counts the DisplayPortCount of the
 // AppleParavirtGPU services when an /arm-io node is compatible "paravirtualizedgraphics,gpu", and waits for that many framebuffers.
-// The native ADT gets such a node with tooling/adt/make-piano-adt.py --gop-display (configs/k27-gop-display.toml), DroidVMDisplay's
-// AppleParavirtGPU (in every k27 collection) is its nub, and this class is a second candidate for the nub's display with a higher
-// probe score. It takes the nub only on a node marked native-gop-display (that opt-in ADT's own node), not with boot-arg
+// The native ADT has such a node (tooling/adt/make-piano-adt.py, configs/k27-gop-display.toml); this kext also provides the nub,
+// AppleParavirtGPU (end of this file), so DroidVMDisplay is not linked natively. In a collection that still has DroidVMDisplay this
+// class is a second candidate for the nub's display with a higher probe score. It takes the nub only on a node marked native-gop-display (that opt-in ADT's own node), not with boot-arg
 // native-gop-display=0, and not in the VM (no /arm-io/virtio-gpu). Otherwise DroidVMDisplay's own display (AppleParavirtDisplay)
 // starts on the nub, which on piano is its CPU copy into the same framebuffer. One display is published either way: WindowServer
 // never has two to choose from.
@@ -1144,3 +1144,24 @@ IOReturn NativeGopDisplay::do_swap_info_notify_gated(IOMFBNotifyRequest *request
 }
 IOReturn NativeGopDisplay::notify_crc_ready_gated(unsigned int) {return kIOReturnSuccess;}
 bool NativeGopDisplay::are_timings_enabled() const {return false;}
+
+// UniXNU-piano (2026-11-11): the display's nub, here so the native collection needs no DroidVMDisplay. IOMobileFramebuffer.framework
+// counts the DisplayPortCount of the AppleParavirtGPU services (it matches the class name) when an /arm-io node is compatible
+// "paravirtualizedgraphics,gpu" (make-piano-adt.py's /arm-io/gop-display). The same nub as DroidVMDisplay's.
+class AppleParavirtGPU : public IOService {
+    OSDeclareDefaultStructors(AppleParavirtGPU)
+public:
+    bool start(IOService *provider) override;
+};
+
+OSDefineMetaClassAndStructors(AppleParavirtGPU, IOService)
+
+bool AppleParavirtGPU::start(IOService *provider)
+{
+    if (!IOService::start(provider))
+        return false;
+    setProperty("DisplayPortCount", 1ULL, 32);
+    registerService();
+    IOLog("NativeGopDisplay: AppleParavirtGPU nub on %s, 1 display port\n", provider->getName());
+    return true;
+}

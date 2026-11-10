@@ -1,8 +1,10 @@
 # The native kexts linked into piano's k27 kernel collection (tooling/k27/build-native-image.sh). One JSON per line:
 # "droidvm:" = a descriptor in the macOS-DroidVM tree (K27_TREE, frozen archive: read only), "piano:" = this repository.
 # Not linked natively (2026-11-11, docs/native-droidvm-inventory.md): NativeVirtioBlock (virtio root), DroidVMEthernet,
-# DroidVMAudio, DroidVMVideo, DroidVMInput (virtio devices), DroidVMGpu (stub accelerator: WindowServer dies on it).
+# DroidVMAudio, DroidVMVideo, DroidVMInput (virtio devices), DroidVMGpu (stub accelerator: WindowServer dies on it),
+# DroidVMDisplay (virtio scanout; NativeGopDisplay has its own nub).
 droidvm:overlay/kext/NativeAES.json            # UniXNU's software AES (AppleKeyStore stand-in, sheng-aks)
 droidvm:overlay/kext/ARMPlatformStandIn.json   # symbols the vma2 collection's kexts import from Apple's ARM platform kext
 piano:tooling/k27/kext/NativeUfs.json          # UFS root windows + Data store
 piano:tooling/k27/kext/NativeRamBlock.json     # the Data disk (RAM seed + changed pages in NativeUfs's store)
+piano:tooling/k27/kext/NativeGopDisplay.json   # the display: CPU copy into the GOP framebuffer, and its AppleParavirtGPU nub

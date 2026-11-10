@@ -22,6 +22,13 @@
       "IOClass": "NativeGopDisplay",
       "IOProviderClass": "AppleParavirtGPU",
       "IOProbeScore": 5000
+    },
+    "AppleParavirtGPU": {
+      "CFBundleIdentifier": "com.unixnu.driver.NativeGopDisplay",
+      "IOClass": "AppleParavirtGPU",
+      "IOProviderClass": "IOPlatformDevice",
+      "IONameMatch": "paravirtualizedgraphics,gpu",
+      "IOProbeScore": 1000
     }
   },
   "vtable": {

@@ -3,12 +3,12 @@
 hardware from dts/piano.dts (+ UniXNU-sm8750-common's sm8750.dtsi), identity from configs/k27-adt.toml instead of the
 macos-27.3 profile, the rest of board.toml as it is.
 
-  make-piano-adt.py OUTPUT.adt --unique-chip-id HEX [--data] [--trust] [--dtb-out FILE] [--psci-method smc|hvc] [--gop-display]
+  make-piano-adt.py OUTPUT.adt --unique-chip-id HEX [--data] [--trust] [--dtb-out FILE] [--psci-method smc|hvc] [--no-gop-display]
 
 --data / --trust: the payload carries a Data seed / trust cache (their /chosen/memory-map slots).
 --psci-method: override /psci method (default: the DTS's, "smc"; "hvc" only for a test inside the VM).
---gop-display: add the [arm-io.*] nodes of configs/k27-gop-display.toml under /arm-io: /arm-io/gop-display, the display nub of
-  DroidVMDisplay / NativeGopDisplay on the boot framebuffer (docs/drivers/native-gop-display.md). Off by default.
+The [arm-io.*] nodes of configs/k27-gop-display.toml go under /arm-io: /arm-io/gop-display, the display nub of NativeGopDisplay on
+  the boot framebuffer (docs/drivers/native-gop-display.md). --no-gop-display leaves them out (the ADT without a display).
 Environment: UNIXNU_RESEARCH (default ~/Downloads/XiaomiPad8Pro-Ubuntu/unixnu-research).
 """
 import argparse
@@ -50,7 +50,8 @@ def main():
     p.add_argument('--trust', action='store_true')
     p.add_argument('--dtb-out', type=Path)
     p.add_argument('--psci-method', choices=('smc', 'hvc'))
-    p.add_argument('--gop-display', action='store_true', help='add /arm-io/gop-display (configs/k27-gop-display.toml)')
+    p.add_argument('--no-gop-display', dest='gop_display', action='store_false', help='leave out /arm-io/gop-display')
+    p.add_argument('--gop-display', dest='gop_display', action='store_true', help=argparse.SUPPRESS)   # the default; kept for old commands
     a = p.parse_args()
     dtb = a.dtb_out or a.output.with_suffix('.hw.dtb')
     dtb.parent.mkdir(parents=True, exist_ok=True)

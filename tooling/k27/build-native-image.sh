@@ -1,11 +1,13 @@
 #!/bin/bash
-# One command after a NativeUfs/NativeRamBlock or k27 change: native kexts -> KC -> the macOS RAM image (FD A) in out/ram, and the
+# One command after a NativeUfs/NativeRamBlock or k27 change: native kexts -> KC, the ADT -> the macOS RAM image (FD A) in out/ram, and the
 # loop's dump image in out/ram-dump (the same with piano-reset-after=1: it only lets our UEFI read the previous run's log).
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
 K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
 tooling/k27/build-native-ufs.sh > out/k27/build-native-ufs.log 2>&1 || { grep error: out/k27/build-native-ufs.log | head; exit 1; }
 tooling/k27/build-native-ram-block.sh > out/k27/build-native-ram-block.log 2>&1 || { grep error: out/k27/build-native-ram-block.log | head; exit 1; }
+tooling/k27/build-native-gop-display.sh > out/k27/build-native-gop-display.log 2>&1 || { grep error: out/k27/build-native-gop-display.log | head; exit 1; }
+python3 tooling/adt/make-piano-adt.py out/adt/piano-k27.adt --unique-chip-id "${UNIQUE_CHIP_ID:-47554e5941480001}" --data --trust > /dev/null
 # The linked set: configs/k27-native-kexts.txt, plus PIANO_EXTRA_KEXTS (absolute JSON paths) for a test.
 NATIVE=$(sed -e 's/#.*//' configs/k27-native-kexts.txt | awk 'NF {print $1}' | sed -e "s#^droidvm:#$K/#" -e "s#^piano:#$D/#" | tr '\n' ' ')
 NATIVE="$NATIVE ${PIANO_EXTRA_KEXTS:-}" \
