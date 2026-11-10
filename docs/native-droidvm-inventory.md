@@ -8,6 +8,9 @@ errors.
 
 ## Kernel collection (`configs/k27-native-kexts.txt`)
 
+Rule (2026-11-11): no DroidVM kext loads in a native boot, enforced by `tooling/kc/build-kc-k27.sh` (`check-native-kexts.py`);
+see `docs/bringup-debugging.md` §5 and `docs/PROJECT-MAP.md` rule 8.
+
 | Kext | Decision | Reason / evidence |
 |---|---|---|
 | NativeVirtioBlock | removed | virtio root disk; natively the root comes from NativeUfs |

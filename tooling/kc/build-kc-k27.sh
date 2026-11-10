@@ -13,6 +13,7 @@
 # Output: OUTPUT.bin, OUTPUT.natives.json, OUTPUT.log, OUTPUT.nm (llvm-nm -n of KERNEL), OUTPUT.sha256.
 # No password, no ssh: copying the KC anywhere is the caller's business.
 set -euo pipefail
+PIANO_REPO=$(cd "$(dirname "$0")/../.." && pwd)   # before any cd
 [ $# = 2 ] || { echo "usage: $0 KERNEL OUTPUT.bin" >&2; exit 2; }
 KERNEL=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 OUT=$(mkdir -p "$(dirname "$2")" && cd "$(dirname "$2")" && pwd)/$(basename "$2")
@@ -26,9 +27,13 @@ if python3 k27/kc27-layout.py "$KC_BASE" "$KERNEL" | grep -q CONFLICT; then
 fi
 DI="com.apple.driver.DiskImages com.apple.driver.DiskImages.FileBackingStore com.apple.driver.DiskImages.KernelBacked com.apple.driver.DiskImages.RAMBackingStore com.apple.driver.DiskImages.ReadWriteDiskImage com.apple.driver.DiskImages.UDIFDiskImage"
 [ -n "${NATIVE:-}" ] || { echo "NATIVE (the kext descriptors) is required: tooling/k27/build-native-image.sh sets it from configs/k27-native-kexts.txt" >&2; exit 2; }
+# The native line's rule: no DroidVM kext in a native collection (tooling/k27/check-native-kexts.py, docs/bringup-debugging.md).
+# shellcheck disable=SC2086
+python3 "$PIANO_REPO/tooling/k27/check-native-kexts.py" "$PIANO_REPO" $NATIVE >&2 || exit 2
 # shellcheck disable=SC2046,SC2086
 python3 k27/kc-build27-piano.py "$KC_BASE" "$KERNEL" "$OUT" --keep $(cat configs/kc-keep.txt) $DI --native $NATIVE > "${OUT%.bin}.log" 2>&1 \
   || { tail -20 "${OUT%.bin}.log"; exit 1; }
 grep -E "problem|wrote" "${OUT%.bin}.log" | cut -c1-120
+python3 "$PIANO_REPO/tooling/k27/check-native-kexts.py" "$PIANO_REPO" --kc-log "${OUT%.bin}.log" || { rm -f "$OUT"; exit 2; }
 "$NM" -n "$KERNEL" > "${OUT%.bin}.nm"
 shasum -a 256 "$KERNEL" "$OUT" | tee "${OUT%.bin}.sha256"

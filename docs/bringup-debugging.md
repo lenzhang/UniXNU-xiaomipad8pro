@@ -96,3 +96,23 @@ python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
 
 `tooling/build-slice1.sh` runs all of it. The native kext set is `configs/k27-native-kexts.txt`; what is left of the VM era and why:
 `docs/native-droidvm-inventory.md`.
+
+## 5. No DroidVM kexts natively (rule, 2026-11-11)
+
+The native boot loads no DroidVM kext: the native kernel collection links only this repository's kexts
+(`configs/k27-native-kexts.txt`; descriptors in `tooling/k27/kext/`, sources in `package/`, objects in `out/native-kexts/`).
+`tooling/kc/build-kc-k27.sh` refuses any other descriptor and checks the linked collection again
+(`tooling/k27/check-native-kexts.py`), so `PIANO_EXTRA_KEXTS` / `PIANO_KEXT_LIST` cannot bring an archive kext back either.
+VM-era code native piano needs is taken over as a package of this repository with an `UPSTREAM` file (NativeGopDisplay,
+PianoNullEthernet, ARMPlatformStandIn, NativeRamBlock, PianoInput's HID layer).
+
+What the DroidVM kexts did in native boots (runs in `logs/native-runs/`, 2026-11-11):
+
+| Kext(s) natively | Effect |
+|---|---|
+| DroidVMDisplay (as the display, or as NativeGopDisplay's nub), with the VM's virtio kexts | IOBSD matching did not finish in 30 s (`!BSD`), both UFS windows stayed busy, **the root never mounted**. The mechanism (k27 0059's busy dump): a window published before IOBSD had matched let AppleAPFSContainer::start take APFS's module lock while com_apple_filesystems_apfs::start waited for it. NativeUfs now publishes only after IOBSD has matched, but the DroidVM kexts' start timing is what triggered it |
+| DroidVMGpu | a stub accelerator: WindowServer read its MetalPluginName, its type-0x4147 opens failed (`kIOReturnBusy`, slots reserved for iOS's backboardd) and WindowServer crash-looped every 30–40 s |
+| DroidVMEthernet, DroidVMAudio, DroidVMVideo, DroidVMInput, NativeVirtioBlock | start with no virtio device behind them; without them SystemOS matches in 0.5 s instead of 4 s |
+| DroidVMEthernet | its no-device `en0` turned out to be needed (TimeSync takes its clock ID from a built-in interface; without one WindowServer and the login session never start): replaced by `package/PianoNullEthernet`, not by linking the DroidVM kext |
+
+The inventory of every VM-era piece and its fate is `docs/native-droidvm-inventory.md`.

@@ -10,6 +10,7 @@
 - Ubuntu 的修复继续提交到上游 [`yzddmr6/xiaomipad-8pro-mainline`](https://github.com/yzddmr6/xiaomipad-8pro-mainline)（内核 [`yzddmr6/linux-sm8750-piano`](https://github.com/yzddmr6/linux-sm8750-piano)），不另建仓库。
 - 权威备份在 NAS 上（具体路径只记在本机，不进公开仓库）。其他机器上的副本不是权威副本。
 - 密码不要写进文件、命令行参数或日志；需要 sudo 时在 tmux 里手工输入。厂商固件、分区镜像、Apple 内核 / KC / IPSW 派生产物不得进入公开仓库。
+- 原生启动里**不加载任何 DroidVM kext**（DroidVMDisplay、DroidVMGpu、DroidVMEthernet 等）：原生内核集合只链接本仓库 `package/` 里的驱动，构建时由 `check-native-kexts.py` 强制检查。2026-11-11 的实测证据见 `docs/bringup-debugging.md` 第 5 节。
 
 ---
 
@@ -99,6 +100,13 @@ Build outputs (`UniXNU-piano/out/`, `build/`), signing keys (`private/`), vendor
 5. **No vendor blobs or Apple payloads in public repos:** Xiaomi / Qualcomm firmware, partition dumps, IPSW-derived kernelcaches, trust caches, `.img` / `.fd` / `.kc` / `.ipsw` build outputs. Record SHA-256 in `artifacts/ARTIFACTS.md` instead.
 6. **No home-LAN inventory in public repos:** private LAN addresses, the owner's machine and NAS hostnames, NAS backup paths, and machine-local author emails. Local working copies may keep operational defaults; public history must not.
 7. Push only to the repositories named in this document (and Ubuntu upstream).
+8. **No DroidVM kexts in a native boot.** The native kernel collection links only this repository's kexts (descriptors in
+   `tooling/k27/kext/`, sources in `package/`, objects in `out/native-kexts/`, the set in `configs/k27-native-kexts.txt`).
+   Nothing from the frozen DroidVM archive (`droidvm-build/macOS-DroidVM/overlay/kext`: DroidVMDisplay, DroidVMGpu,
+   DroidVMEthernet, DroidVMAudio, DroidVMVideo, DroidVMInput, NativeVirtioBlock, ...) is linked, not even for one test.
+   VM-era code that native piano needs is taken over as this repository's own package (with `UPSTREAM`), never by linking the
+   archive's kext. `tooling/kc/build-kc-k27.sh` enforces this (`tooling/k27/check-native-kexts.py`, before and after the link).
+   Evidence and history: `docs/bringup-debugging.md` §5.
 
 ## 7. Current bring-up note (2026-11-11)
 
