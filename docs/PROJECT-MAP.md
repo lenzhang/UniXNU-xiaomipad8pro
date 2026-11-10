@@ -100,6 +100,11 @@ Build outputs (`UniXNU-piano/out/`, `build/`), signing keys (`private/`), vendor
 6. **No home-LAN inventory in public repos:** private LAN addresses, the owner's machine and NAS hostnames, NAS backup paths, and machine-local author emails. Local working copies may keep operational defaults; public history must not.
 7. Push only to the repositories named in this document (and Ubuntu upstream).
 
-## 7. Current bring-up note (2026-11-10)
+## 7. Current bring-up note (2026-11-11)
 
-Native RAM boot on piano has reached XNU at EL1 and progressed as far as waiting for a root filesystem. Work continues in the `pad-el1` tmux session on the owner's Mac. Returning to the stock OS is a long-press of the power button (or power + volume-down to get back to the vendor Fastboot screen). Nothing is flashed.
+Native macOS on piano boots from UFS: NativeUfs publishes the OS and SystemOS windows of linux_rootfs (development build:
+unverified, writable), Data persists in NativeUfs's store window at the end of linux_rootfs, launchd runs its boot tasks and
+WindowServer starts (no display or GPU yet, so it restarts). Ubuntu's root is gone (owner's decision); linux_data is untouched.
+Tests run unattended with `tooling/native/native-loop.sh` (RAM boots only; see `docs/bringup-debugging.md`). Nothing in the boot
+chain is flashed: returning to the stock OS is a long-press of the power button (or power + volume-down for the vendor Fastboot
+screen).

@@ -42,7 +42,21 @@ if dist(sig, best) <= 3:
         c1 = b1 & c0; b1 ^= c0
         c2 = b2 & c1; b2 ^= c1
         b3 ^= c2
-    need = n // 2 + 1                          # count >= need
+    need = n // 2 + 1                          # count >= need: plain majority, unless the histogram says otherwise
+    # Adaptive threshold (2026-11-11): the DRAM decays mostly 1 -> 0, so a bit that was 1 often survives in only 4-5 of the 11
+    # copies, while a 0 rarely shows up as 1 in more than 2. Count, over the used bytes, how many bits have each number k of
+    # copies at 1, and put the threshold just above the valley between the two populations.
+    used_bits = (1 << (8 * min(max(used, start), cap))) - 1 if 0 < max(used, start) else (1 << (8 * cap)) - 1
+    if n == 11:
+        hist = []
+        for k in range(n + 1):
+            m = used_bits
+            for j, bit in enumerate((b0, b1, b2, b3)):
+                m &= bit if (k >> j) & 1 else ~bit
+            hist.append(bin(m).count('1'))
+        valley = min(range(2, n - 1), key=lambda k: hist[k])
+        need = valley + 1
+        sys.stderr.write(f'copies-at-1 histogram {hist}, threshold {need} of {n}\n')
     count_bits = (b0, b1, b2, b3)
     # count >= need, compared bitwise from the top: gt | eq-chain
     ge = 0; eq = (1 << (8 * cap)) - 1
