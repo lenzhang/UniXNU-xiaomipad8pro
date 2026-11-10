@@ -301,3 +301,12 @@ Gauge.h and ChargerPmic.h are written fresh.
   from the USB input without draining the pack. Whether a partly discharged pack charges without the DSP is still to be measured
   (needs a lower charge level); level 2 (DSP start) is for an owner-attended session.
 - ABL `getvar battery-voltage` before/after: 4478 / 4477 mV.
+
+## Measured 2026-11-11 07:15 (level 2, image D, piano-power-write=0, owner present)
+
+The full DSP bring-up works from native macOS: DTB and DSP segments stored (aligned 8-byte stores; the earlier image B hang
+writing segment 1 did not recur), `PAS auth_and_reset (DSP, PAS 1): ok` (229 ms, 21 SMCs), SMP2P ready, GLINK version agreed, a
+channel up, the IPC router hello from node 5 (servreg/pddump/pdr lookups answered), `PMIC_RTR_ADSP_APPS up`, and the first charger
+reading: `bus 5236 mV 0 mA, type CDP, input limit 100 mA (set 0), charge current set 0 mA, tbat 29 C, charge enable 1, status 0x7`.
+Next: the same with writes (input limit 1500 mA). Do not combine piano-power>=2 with piano-gpu=2 yet (both use RPMh DRV-2 TCS
+slots; the A830 driver takes the DRV-2 owner lock, PianoPower does not).
