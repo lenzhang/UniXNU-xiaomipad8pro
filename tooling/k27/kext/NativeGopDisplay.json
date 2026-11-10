@@ -1,0 +1,36 @@
+{
+  "name": "NativeGopDisplay",
+  "bundle": "com.unixnu.driver.NativeGopDisplay",
+  "version": "1.0.0",
+  "objects": "out/x12377/native-kexts/NativeGopDisplay/objects.json",
+  "start": "_native_kext_start",
+  "stop": "_native_kext_stop",
+  "libraries": {
+    "com.apple.iokit.IOAVFamily": "1.0.0",
+    "com.apple.iokit.IOMobileGraphicsFamily": "1.0.0",
+    "com.apple.iokit.IOSurface": "1.0",
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.private": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  },
+  "personalities": {
+    "NativeGopDisplay": {
+      "CFBundleIdentifier": "com.unixnu.driver.NativeGopDisplay",
+      "IOClass": "NativeGopDisplay",
+      "IOProviderClass": "AppleParavirtGPU",
+      "IOProbeScore": 5000
+    }
+  },
+  "vtable": {
+    "class": "NativeGopDisplay",
+    "base": "IOMobileFramebufferLegacy",
+    "base_kext": "com.apple.iokit.IOMobileGraphicsFamily",
+    "slots": 483,
+    "ignore_slots": [
+      16
+    ]
+  }
+}

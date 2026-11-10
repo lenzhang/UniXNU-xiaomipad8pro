@@ -1,0 +1,29 @@
+# /arm-io/gop-display: the display node of the native k27 boot, added by tooling/adt/make-piano-adt.py --gop-display (docs/drivers/
+# native-gop-display.md). Not part of the default ADT.
+#
+# compatible "paravirtualizedgraphics,gpu", exactly as the VM's /arm-io/display (macOS-DroidVM scripts/run-macos-vm.py MACOS_DISPLAY):
+# IOMobileFramebuffer.framework (iomfb_populate_all_display_infos) counts the DisplayPortCount of the AppleParavirtGPU services only
+# when an /arm-io child is compatible with that string, and DroidVMDisplay's AppleParavirtGPU (in every k27 collection) matches it
+# by name. Its display is then DroidVMDisplay's (CPU copy into the boot framebuffer: virtio-gpu is absent natively), or NativeGopDisplay
+# with boot-arg native-gop-display=1 (it requires the native-gop-display marker below).
+#
+# The framebuffer-* values describe ABL's splash region as dts/piano.dts and docs/drivers/display.md have it; the driver takes the
+# boot console's (PE_state.video, DarwinBoot's GOP) and only logs a mismatch. No reg: the node is no MMIO device and must not widen
+# the arm-io window.
+["arm-io"."gop-display"."string"]
+"compatible" = "paravirtualizedgraphics,gpu"
+"framebuffer-format" = "x8r8g8b8"
+
+["arm-io"."gop-display"."u32"]
+"native-gop-display" = 1
+"panel-width-mm" = 239
+"panel-height-mm" = 163
+# What WindowServer is told (and the VBL timer's rate); the panel keeps ABL's 120 Hz mode either way.
+"refresh-hz" = 60
+"framebuffer-width" = 3200
+"framebuffer-height" = 2136
+"framebuffer-stride" = 12800
+
+["arm-io"."gop-display"."u64"]
+"framebuffer-base" = 0xfc800000
+"framebuffer-size" = 0x2b00000

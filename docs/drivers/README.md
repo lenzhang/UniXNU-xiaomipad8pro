@@ -9,6 +9,7 @@ hardware.** Hardware tests start after M2 (XNU RAM boot) or M3 (UFS), always wit
 | # | Page | Driver(s) | Gate | UniXNU base |
 |---|---|---|---|---|
 | 1 | [display.md](display.md) | IOMFB top half (from DroidVMDisplay) + GOP/splash bottom half, then DPU address-only flips, backlight | M2: first frame and the login window on the panel | `GopFramebuffer`, `dpu-scanout=2` pipe adoption (`docs/porting/display.md`), UniXNU-sheng backlight |
+| 1a | [native-gop-display.md](native-gop-display.md) | `NativeGopDisplay`: display.md's GOP step as a k27 native kext (DroidVMDisplay's CPU copy), `/arm-io/gop-display` | M2a: WindowServer's frames on the panel (built and linked 2026-11-11; Metal is the open blocker) | macOS-DroidVM `DroidVMDisplay` (GopFramebuffer read) |
 | 2 | [ufs.md](ufs.md) | `NativeUfs` for `qcom,sm8750-ufshc` | M3: real root/Data instead of the RAM seed | `ShengUfs` (13T host-verified) |
 | 3 | [touch.md](touch.md) | NT36532E over GENI SPI (+ keyboard cover note) | login by touch (keyboard cover is the fallback) | `ShengNovatekTouch` + `QcomGeniSpi` |
 | 4 | [charging.md](charging.md) | power source / charger policy / gauges | any native session longer than the battery | UniXNU-sheng power records, Project-SunUEFI power work |

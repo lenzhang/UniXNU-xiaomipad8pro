@@ -1,6 +1,7 @@
 # Display: GOP adoption first, then DPU address-only flips
 
-Status: design, 2026-11-10. Nothing built or run. Template: `README.md`.
+Status: design, 2026-11-10. Nothing built or run. Template: `README.md`. The GOP step (1. below) is built for the k27
+collection as `NativeGopDisplay`: [native-gop-display.md](native-gop-display.md) (2026-11-11, not run).
 
 ## 1. Purpose and gate
 
