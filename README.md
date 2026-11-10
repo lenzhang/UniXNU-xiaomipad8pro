@@ -1,12 +1,16 @@
 # UniXNU-piano
 
 Native macOS at EL1 on the Xiaomi Pad 8 Pro (`piano`, SM8750), as a [UniXNU](https://github.com/UniXNU/UniXNU) device
-repository (same convention as UniXNU-sheng; SoC layer `UniXNU-sm8750-common`). Gunyah stays at EL2; XNU runs as the
-HLOS at EL1. UniXNU core, UniXNU-sm8750-common, Mu-Silicium, piano-uefi's `pianoPkg`, DarwinBoot and the driver
-components are pinned dependencies (`unixnu.lock`), not forks. Formerly the working name `xiaomipad-8pro-macos`.
+repository (same convention as UniXNU-sheng). Public repository: [lenzhang/UniXNU-piano](https://github.com/lenzhang/UniXNU-piano).
 
-Local repository only (no remote). Nothing here is flashed: the boot images are RAM images for `fastboot boot`, built and
-verified offline until the USB-C cable and the rollback set are ready (`docs/el1-native-plan.md` §5).
+**Start here for the repo split and conventions:** [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md).
+
+姊妹仓库：[UniXNU-sm8750-common](https://github.com/lenzhang/UniXNU-sm8750-common)（SM8750 公共层，目前仅占位，代码尚未从本仓库拆出）；已冻结的 Gunyah 客户机路线见 [veil](https://github.com/lenzhang/veil)。Ubuntu 修复仍提交到上游 [yzddmr6/xiaomipad-8pro-mainline](https://github.com/yzddmr6/xiaomipad-8pro-mainline)。
+
+Gunyah stays at EL2; XNU runs as the HLOS at EL1. UniXNU core, the SoC module pinned in `feeds.toml`, Mu-Silicium, piano-uefi's `pianoPkg`, DarwinBoot and the driver components are pinned dependencies (`unixnu.lock`), not forks. Formerly the working name `xiaomipad-8pro-macos`.
+
+Nothing here is flashed: the boot images are RAM images for `fastboot boot`, built and
+verified offline (`docs/el1-native-plan.md` §5). Hard rules (RAM boot only, no partition writes, no secrets in the tree) are in the project map.
 
 | Path | What |
 | --- | --- |
