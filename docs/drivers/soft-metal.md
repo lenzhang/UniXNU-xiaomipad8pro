@@ -307,3 +307,10 @@ PIANO_EXTRA_ARGS="exec-log=1 stderr-log=1 panic_on_crash_disabled=1" tooling/k27
 tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
 grep -E "NativeGopDisplay: (thumb|first|[0-9]+ swaps)|NativeSoftMetal|crash message|WindowServer" logs/native-runs/<ts>-loop/xnu-console.txt
 ```
+
+## Measured 2026-11-11 05:57 (thumbnails)
+
+Every thumbnail of the frames WindowServer swapped was black (`0.0% non-black, mean #000000`). WindowServer's abort is now
+CoreAnimation's software renderer: `Assertion failed: (r.update ()->_backdrop_invalidations_finalized), function
+prepare_layers_roi, file ogl-layer.cpp, line 7179` (`CA::OGL::Renderer::render` → `prepare_layers_roi` / `prepare_sublayers_`):
+backdrop (blur/vibrancy) layers. Next: no backdrop layers for the software renderer; devices for the clients too.
