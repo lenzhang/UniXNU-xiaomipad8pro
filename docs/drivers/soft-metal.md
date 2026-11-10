@@ -252,3 +252,58 @@ and the staged seed: WindowServer composites in software into NativeGopDisplay. 
 about 38 ms each (prepare 2.3, read 33.7, write 1.4 ms); `swap layers 0x3: 0: 3200x2136 BGRA 1: 128x128 BGRA` (the cursor). WindowServer
 still aborts now and then (status 0x6; the console ring wrapped, so the messages were lost). What is on the panel is not known yet
 (next: a frame thumbnail in the log).
+
+## 10. First frames, and what becomes the default (2026-11-11)
+
+Measured (built in main with 9422a8b's ADT, `panic_on_crash_disabled=1`, 300 s): WindowServer composites in software into
+NativeGopDisplay. The framebuffers are 'BGRA' (`swap layers 0x7: 0: 3200x2136 0x42475241`; `0x3` adds a 128x128 cursor-size layer,
+which is not copied to the panel). `38 swaps submitted, 20 shown`; a copy takes about 38 ms, almost all of it reading the surface
+(33.7 ms). WindowServer still aborts now and then. The console ring wrapped (the log loop wrote every WindowServer message), so
+those aborts' reasons were lost.
+
+This change:
+- **Thumbnail** (`native-gop-display-thumb=N`, default 30 s): what the panel showed, as 80x27 characters, plus the share of non-black
+  pixels, the mean colour and the centre pixel ([native-gop-display.md](native-gop-display.md) §5). The 10 s line's
+  `last frame 0 lit centre 0` was only ever counted for converted formats, so on 'BGRA' it meant "not measured". It now gives the same
+  sampled figures for every format.
+- **Smaller log loop:** `stage-soft-metal.py --log-errors PREDICATE` keeps errors and faults only (`messageType error/fault`), and
+  prints one line per write, cut to 150 characters. The kernel's `stderr-log` keeps only the first 159 bytes of each write, so a
+  buffered `log show` lost every line after the first in each write.
+- **Staging inside `build-native-image.sh`:** whenever NativeSoftGpu is linked (the list or `PIANO_EXTRA_KEXTS`; `PIANO_SOFT_METAL=0`
+  turns it off), the plugin is built and staged into `out/soft-metal`. That is only redone when the input seed, the input trust cache,
+  the stage script, the bundle's files or `PIANO_SOFT_METAL_LOG` change (`out/soft-metal/stamp`). The plugin build is byte for byte
+  reproducible, so the staged seed keeps its identity from build to build, and `data-persist=2`'s store stays valid. Checked: two
+  builds in a row, same seed, not rewritten.
+- `PIANO_VMM_PRESENT=0|1` passes `--vmm-present` to the ADT for one build.
+
+**The aborts still to expect** (from 26.6 SkyLight; the abort reporter and the error loop will say which):
+- `CGXSoftwareComposite: destination bitmap format not supported on this architecture`, from the software compositor's tile blitter
+  (`CompositorSW::CompositeLayersToDestination`). This one is os_log and `abort()` with no crash message, so it shows as the
+  reporter's stack plus the error loop's line. A capture or effect destination that is not 8-bit would hit it.
+- The two "TODO: software compositor support." sub-paths in `SLCADisplay::present_update` / `render_update` only log (error type, so
+  the loop shows them) and skip that layer: pieces missing on screen, not an abort.
+- Metal-only paths in SkyLight (`MetalShader::CopyPipelineState`, the Metal display-stream states) abort if reached, but should not
+  be with accelerator port 0.
+- Anything in Core Animation: the crash message usually names it (assert text).
+
+**Native defaults — recommendation:**
+- **`vmm-present = 0` in `configs/k27-adt.toml`: yes.** It is the truthful value natively, and it is what gives WindowServer 8-bit
+  framebuffers.
+- **`panic_on_crash_disabled=1` in `K27_ARGS`: yes for now, as a stopgap.** watchdogd has no watchdog driver natively and exits, and
+  without this tunable launchd panics. Two costs: any process launchd marks as critical can now die without the kernel noticing, and
+  the reset after a crash comes only from `piano-reset-after` or the Gunyah watchdog. The real fix is a native watchdog for watchdogd
+  (piano has one, and k27 0056 already pets Gunyah's), or keeping watchdogd from running. Then remove the tunable.
+- **NativeSoftGpu in `configs/k27-native-kexts.txt`: yes, until there is a GPU driver.** It does nothing without its plugin (no bundle
+  means no device, as before). With the list entry, `build-native-image.sh` stages the plugin by itself; `native-soft-gpu=0` and
+  `soft-metal=0` turn it off at boot. When a real accelerator comes (Adreno830), NativeSoftGpu must leave the list: Metal takes the
+  first device it finds, and SkyLight takes the first device's port.
+- **The log loop and `stderr-log=1`: not in the defaults.** They are for test images (`PIANO_SOFT_METAL_LOG`, `PIANO_EXTRA_ARGS`).
+
+```sh
+# this candidate (worktree): automatic staging, vmm-present 0, crash panics off, error-only log loop
+PIANO_EXTRA_KEXTS="$PWD/out/k27/kext/NativeSoftGpu.json" PIANO_VMM_PRESENT=0 \
+PIANO_SOFT_METAL_LOG='process == "WindowServer" OR process == "loginwindow"' PIANO_RESET_AFTER=300 \
+PIANO_EXTRA_ARGS="exec-log=1 stderr-log=1 panic_on_crash_disabled=1" tooling/k27/build-native-image.sh
+tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
+grep -E "NativeGopDisplay: (thumb|first|[0-9]+ swaps)|NativeSoftMetal|crash message|WindowServer" logs/native-runs/<ts>-loop/xnu-console.txt
+```

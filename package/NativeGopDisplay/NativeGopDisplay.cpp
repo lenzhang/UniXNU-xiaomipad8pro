@@ -150,6 +150,10 @@ private:
     bool clean_queue_gated();
     void program_hardware_gated();
     void copySurface(IOSurface *, bool refresh = false);
+    struct FrameStats;
+    void sampleRow(const uint32_t *line, const uint8_t *source, unsigned pixelBytes, uint64_t y, uint64_t width, uint64_t height,
+                   FrameStats &stats, bool thumb);
+    void logThumbnail(const FrameStats &stats, uint64_t width, uint64_t height, uint32_t format, bool refresh);
     void requestCopy(IOSurface *, bool refresh);
     void copyLoop();
     static void copyThreadMain(void *, wait_result_t);
@@ -183,7 +187,21 @@ private:
     bool fRefreshCopies;      // boot-arg native-gop-display-refresh (default 1): copy the surface on screen again after a swap
     uint64_t fFrames;
     uint64_t fLayerShape;             // the layers of the last swap, logged when they change
-    uint64_t fLastLit, fLastCenter;   // lit pixels and centre pixel of the last converted frame
+    // What the last new frame copied to the panel looked like, from every 4th pixel of every 4th row of the copied (BGRA) rows, in any
+    // source format: the share of non-black pixels in per mille, the mean colour and the centre pixel (0xRRGGBB).
+    struct FrameStats {
+        uint64_t samples, lit, raw, red, green, blue;
+        uint32_t centre;
+    };
+    uint64_t fLastLitPerMille, fLastMean, fLastCenter;
+    // The thumbnail (boot-arg native-gop-display-thumb=SECONDS, default 30, 0 off): a coarse picture of a frame as copied, logged on the
+    // first frame and then every period, so a run without a camera shows what the panel showed. kThumbCols x kThumbRows cells, each the
+    // mean luminance of its samples, as one of kThumbRamp's characters.
+    static constexpr unsigned kThumbCols = 80, kThumbRows = 27, kSampleStep = 4;
+    uint32_t fThumbPeriod;
+    uint64_t fThumbNext;              // mach time the next thumbnail is due (0: on the next new frame)
+    volatile bool fThumbRequested;    // a refresh copy was asked for to take it (a static screen has no new frames)
+    uint32_t *fThumbLuma, *fThumbCount;
     uint64_t fTicks, fDropped, fReported;
     uint64_t fWaitFailures, fWaitReleased;
     uint64_t fCopies, fCopyNs, fCopyMaxNs, fReadNs, fConvertNs, fWriteNs, fPrepareNs;
@@ -344,6 +362,8 @@ bool NativeGopDisplay::start(IOService *provider)
     unsigned refresh = 1;
     PE_parse_boot_argn("native-gop-display-refresh", &refresh, sizeof(refresh));
     fRefreshCopies = refresh != 0;
+    fThumbPeriod = 30;
+    PE_parse_boot_argn("native-gop-display-thumb", &fThumbPeriod, sizeof(fThumbPeriod));
     if (!readFramebuffer())
         return false;
     IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress(fVideoPhys, fVideo.v_rowBytes * fVideo.v_height,
@@ -391,8 +411,8 @@ bool NativeGopDisplay::start(IOService *provider)
         OSSafeReleaseNULL(fScanoutMap);
         return false;
     }
-    IOLog("NativeGopDisplay: started, display %ux%u at %u Hz, %ux%u mm, %s copies\n", display_width(), display_height(), fRefreshHz,
-          fWidthMM, fHeightMM, fRefreshCopies ? "with refresh" : "no refresh");
+    IOLog("NativeGopDisplay: started, display %ux%u at %u Hz, %ux%u mm, %s copies, thumbnail %s%u s\n", display_width(), display_height(),
+          fRefreshHz, fWidthMM, fHeightMM, fRefreshCopies ? "with refresh" : "no refresh", fThumbPeriod ? "every " : "off: ", fThumbPeriod);
     return true;
 }
 
@@ -411,6 +431,11 @@ void NativeGopDisplay::stop(IOService *provider)
     fHalfToByte = nullptr;
     fRow = nullptr;
     fLine = nullptr;
+    if (fThumbLuma)
+        IOFree(fThumbLuma, kThumbCols * kThumbRows * sizeof(uint32_t));
+    if (fThumbCount)
+        IOFree(fThumbCount, kThumbCols * kThumbRows * sizeof(uint32_t));
+    fThumbLuma = fThumbCount = nullptr;
     if (fShown)
         reinterpret_cast<OSObject *>(fShown)->release();
     fShown = nullptr;
@@ -510,13 +535,20 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         if (!(elapsed & (elapsed - 1)) || !fRefreshLeft)
             requestCopy(fShown, true);
     }
+    // A thumbnail that is due while no new frame comes: one refresh copy of the surface on screen takes it.
+    if (fThumbPeriod && fThumbNext && fShown && !fThumbRequested && mach_absolute_time() >= fThumbNext) {
+        fThumbRequested = true;
+        requestCopy(fShown, true);
+    }
     if (at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))
         fStalled++;
     if (++fTicks % (10 * fRefreshHz) == 0 && fSubmitted + fFrames + fDropped + fStalled != fReported) {   // about every 10 s while swaps arrive
         fReported = fSubmitted + fFrames + fDropped + fStalled;
-        IOLog("NativeGopDisplay: %llu swaps submitted, %llu shown, %llu dropped, %llu ticks stalled (current %p), last frame %llu lit "
-              "centre %#llx; %llu copies mean %llu us (prepare %llu read %llu convert %llu write %llu) max %llu us, %llu waits released\n",
-              fSubmitted, fFrames, fDropped, fStalled, at<IOMFBSwapIORequest *>(this, kCurrentSwap), fLastLit, fLastCenter,
+        IOLog("NativeGopDisplay: %llu swaps submitted, %llu shown, %llu dropped, %llu ticks stalled (current %p), last frame %llu.%llu%% "
+              "non-black mean #%06llx centre #%06llx; %llu copies mean %llu us (prepare %llu read %llu convert %llu write %llu) max %llu us, "
+              "%llu waits released\n",
+              fSubmitted, fFrames, fDropped, fStalled, at<IOMFBSwapIORequest *>(this, kCurrentSwap), fLastLitPerMille / 10,
+              fLastLitPerMille % 10, fLastMean, fLastCenter,
               fCopies, fCopies ? fCopyNs / fCopies / 1000 : 0, fCopies ? fPrepareNs / fCopies / 1000 : 0,
               fCopies ? fReadNs / fCopies / 1000 : 0, fCopies ? fConvertNs / fCopies / 1000 : 0, fCopies ? fWriteNs / fCopies / 1000 : 0,
               fCopyMaxNs / 1000, fWaitReleased);
@@ -846,14 +878,42 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
         IOLog("NativeGopDisplay: cannot map a %llux%llu surface\n", width, height);
         return;
     }
-    uint64_t lit = 0, raw = 0, center = 0;
-    bool sample = !refresh;
+    // Each new frame's statistics, and the thumbnail when one is due: the first new frame, then once every fThumbPeriod s, on a new
+    // frame or on the refresh copy swap_begin_gated asked for. Both come from every kSampleStep-th pixel of every kSampleStep-th row of
+    // the rows as written to the panel (after conversion), so they describe what the panel shows, in any source format. The sampling
+    // time is counted as conversion.
+    FrameStats stats = {};
+    bool thumb = fThumbPeriod && (fThumbNext ? mach_absolute_time() >= fThumbNext : !refresh);
+    if (thumb && !fThumbLuma) {
+        fThumbLuma = static_cast<uint32_t *>(IOMalloc(kThumbCols * kThumbRows * sizeof(uint32_t)));
+        fThumbCount = static_cast<uint32_t *>(IOMalloc(kThumbCols * kThumbRows * sizeof(uint32_t)));
+        if (!fThumbLuma || !fThumbCount) {
+            if (fThumbLuma)
+                IOFree(fThumbLuma, kThumbCols * kThumbRows * sizeof(uint32_t));
+            if (fThumbCount)
+                IOFree(fThumbCount, kThumbCols * kThumbRows * sizeof(uint32_t));
+            fThumbLuma = fThumbCount = nullptr;
+            fThumbPeriod = 0;
+            IOLog("NativeGopDisplay: no memory for the thumbnail; thumbnails off\n");
+            thumb = false;
+        }
+    }
+    if (thumb) {
+        bzero(fThumbLuma, kThumbCols * kThumbRows * sizeof(uint32_t));
+        bzero(fThumbCount, kThumbCols * kThumbRows * sizeof(uint32_t));
+    }
+    const bool sample = !refresh || thumb;
     for (uint64_t y = 0; y < copyHeight; y++) {
         uint8_t *line = fScanout + y * fVideo.v_rowBytes;
         const uint8_t *source = bytes + base + y * rowBytes;
+        const bool sampled = sample && y % kSampleStep == 0;
         if (format == kFormatBGRA) {
             memcpy(fLine, source, copyWidth * 4);
             lap(fReadNs);
+            if (sampled) {
+                sampleRow(fLine, nullptr, 4, y, copyWidth, copyHeight, stats, thumb);
+                lap(fConvertNs);
+            }
             memcpy(line, fLine, copyWidth * 4);
             lap(fWriteNs);
             continue;
@@ -864,13 +924,9 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
             for (uint64_t x = 0; x < copyWidth; x++) {
                 uint32_t bgr = fLine[x];
                 fLine[x] = 0xff000000u | fXr10ToByte[bgr >> 20 & 1023] << 16 | fXr10ToByte[bgr >> 10 & 1023] << 8 | fXr10ToByte[bgr & 1023];
-                if (sample) {
-                    lit += (fLine[x] & 0xffffff) != 0;
-                    raw += bgr != 0;
-                    if (y == copyHeight / 2 && x == copyWidth / 2)
-                        center = bgr;
-                }
             }
+            if (sampled)   // converted in place: the nonzero count is of the converted pixels
+                sampleRow(fLine, nullptr, 4, y, copyWidth, copyHeight, stats, thumb);
             lap(fConvertNs);
             memcpy(line, fLine, copyWidth * 4);
             lap(fWriteNs);
@@ -883,13 +939,9 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
             uint64_t rgba = pixels[x];
             fLine[x] = 0xff000000u | fHalfToByte[rgba >> 2 & 0x3fff] << 16 | fHalfToByte[rgba >> 18 & 0x3fff] << 8 |
                        fHalfToByte[rgba >> 34 & 0x3fff];
-            if (sample) {
-                lit += (fLine[x] & 0xffffff) != 0;
-                raw += rgba != 0;
-                if (y == copyHeight / 2 && x == copyWidth / 2)
-                    center = rgba;
-            }
         }
+        if (sampled)
+            sampleRow(fLine, reinterpret_cast<const uint8_t *>(fRow), 8, y, copyWidth, copyHeight, stats, thumb);
         lap(fConvertNs);
         memcpy(line, fLine, copyWidth * 4);
         lap(fWriteNs);
@@ -903,12 +955,77 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
         fCopyMaxNs = ns;
     if (first)
         IOLog("NativeGopDisplay: first copy %llux%llu format %#x into the framebuffer in %llu us\n", copyWidth, copyHeight, format, ns / 1000);
+    if (thumb) {
+        logThumbnail(stats, copyWidth, copyHeight, format, refresh);
+        uint64_t period;
+        nanoseconds_to_absolutetime(static_cast<uint64_t>(fThumbPeriod) * 1000000000ULL, &period);
+        fThumbNext = mach_absolute_time() + period;
+        fThumbRequested = false;
+    }
     if (refresh)
         return;
-    fLastLit = lit;
-    fLastCenter = center;
+    const uint64_t samples = stats.samples ? stats.samples : 1;
+    fLastLitPerMille = stats.lit * 1000 / samples;
+    fLastMean = (stats.red / samples) << 16 | (stats.green / samples) << 8 | stats.blue / samples;
+    fLastCenter = stats.centre;
     if (format != kFormatBGRA && (fFrames <= 8 || fFrames % 50 == 0))
-        IOLog("NativeGopDisplay: frame %llu: %llu pixels lit, %llu nonzero, centre %#llx\n", fFrames, lit, raw, center);
+        IOLog("NativeGopDisplay: frame %llu: %llu of %llu sampled pixels non-black, %llu nonzero in the source, centre #%06x\n", fFrames,
+              stats.lit, stats.samples, stats.raw, stats.centre);
+}
+
+// One sampled row (every kSampleStep-th pixel of LINE, 0xAARRGGBB as written to the panel) into STATS, and into the thumbnail's cells.
+// SOURCE, when given, is the row before conversion (PIXELBYTES a pixel), for the count of nonzero source pixels; else LINE's own.
+void NativeGopDisplay::sampleRow(const uint32_t *line, const uint8_t *source, unsigned pixelBytes, uint64_t y, uint64_t width,
+                                 uint64_t height, FrameStats &stats, bool thumb)
+{
+    const uint64_t centreY = height / 2 / kSampleStep * kSampleStep, centreX = width / 2 / kSampleStep * kSampleStep;
+    const uint64_t cellRow = y * kThumbRows / height;
+    for (uint64_t x = 0; x < width; x += kSampleStep) {
+        const uint32_t pixel = line[x];
+        const uint32_t red = pixel >> 16 & 255, green = pixel >> 8 & 255, blue = pixel & 255;
+        stats.samples++;
+        stats.red += red;
+        stats.green += green;
+        stats.blue += blue;
+        const uint32_t brightest = red > green ? (red > blue ? red : blue) : (green > blue ? green : blue);
+        stats.lit += brightest > 8;   // "non-black": any channel above 8 of 255
+        if (source)
+            stats.raw += pixelBytes == 8 ? *reinterpret_cast<const uint64_t *>(source + x * 8) != 0
+                                         : *reinterpret_cast<const uint32_t *>(source + x * 4) != 0;
+        else
+            stats.raw += (pixel & 0xffffff) != 0;
+        if (y == centreY && x == centreX)
+            stats.centre = pixel & 0xffffff;
+        if (thumb) {
+            const uint64_t cell = cellRow * kThumbCols + x * kThumbCols / width;
+            fThumbLuma[cell] += (54 * red + 183 * green + 19 * blue) >> 8;   // Rec. 709 luma weights, sum 256
+            fThumbCount[cell]++;
+        }
+    }
+}
+
+// The thumbnail: a header with what the frame is, then kThumbRows lines of kThumbCols characters, each cell's mean luma (0..255) as
+// one of " .:-=+*#%@" (dark to bright). The panel's cursor is not in it: only the main layer is copied.
+void NativeGopDisplay::logThumbnail(const FrameStats &stats, uint64_t width, uint64_t height, uint32_t format, bool refresh)
+{
+    static const char kRamp[] = " .:-=+*#%@";
+    const uint64_t samples = stats.samples ? stats.samples : 1, perMille = stats.lit * 1000 / samples;
+    const uint64_t mean = (stats.red / samples) << 16 | (stats.green / samples) << 8 | stats.blue / samples;
+    const char code[5] = {static_cast<char>(format >> 24), static_cast<char>(format >> 16), static_cast<char>(format >> 8),
+                          static_cast<char>(format), 0};
+    IOLog("NativeGopDisplay: thumb frame %llu%s: %llux%llu '%s', %llu.%llu%% non-black, mean #%06llx, centre #%06x, %ux%u cells of "
+          "%llux%llu px, ramp \" .:-=+*#%%@\"\n", fFrames, refresh ? " (screen unchanged)" : "", width, height, code, perMille / 10,
+          perMille % 10, mean, stats.centre, kThumbCols, kThumbRows, width / kThumbCols, height / kThumbRows);
+    char text[kThumbCols + 1];
+    for (unsigned row = 0; row < kThumbRows; row++) {
+        for (unsigned column = 0; column < kThumbCols; column++) {
+            const unsigned cell = row * kThumbCols + column;
+            const uint32_t luma = fThumbCount[cell] ? fThumbLuma[cell] / fThumbCount[cell] : 0;
+            text[column] = kRamp[luma * 10 / 256];
+        }
+        text[kThumbCols] = 0;
+        IOLog("NativeGopDisplay: thumb %02u |%s|\n", row, text);
+    }
 }
 
 static bool appendNumber(OSDictionary *dictionary, const char *key, uint64_t value, unsigned bits = 32)

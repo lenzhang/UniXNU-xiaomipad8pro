@@ -10,7 +10,30 @@ for k in $LIST; do   # the kexts' objects: tooling/k27/build-native-<name>.sh
   [ -n "$b" ] || { echo "no build script for $k" >&2; exit 1; }
   tooling/k27/build-native-$b.sh > out/k27/build-native-$b.log 2>&1 || { grep -E "error:|Error" out/k27/build-native-$b.log | head; exit 1; }
 done
-python3 tooling/adt/make-piano-adt.py out/adt/piano-k27.adt --unique-chip-id "${UNIQUE_CHIP_ID:-47554e5941480001}" --data --trust > /dev/null
+# PIANO_VMM_PRESENT=0|1: the ADT's /defaults vmm-present for this build (else configs/k27-adt.toml's; docs/drivers/soft-metal.md §9).
+python3 tooling/adt/make-piano-adt.py out/adt/piano-k27.adt --unique-chip-id "${UNIQUE_CHIP_ID:-47554e5941480001}" --data --trust \
+  ${PIANO_VMM_PRESENT:+--vmm-present "$PIANO_VMM_PRESENT"} > /dev/null
+# The software Metal path (docs/drivers/soft-metal.md): when NativeSoftGpu is linked (the list or PIANO_EXTRA_KEXTS; PIANO_SOFT_METAL=0
+# leaves this out, =1 forces it), the NativeSoftMetal plugin is built and staged into a copy of the Data seed and the trust cache
+# (tooling/k27/stage-soft-metal.py, out/soft-metal), which the image then takes unless PIANO_SEED / PIANO_TRUST name others. The staging
+# is redone only when its inputs change (out/soft-metal/stamp): a new seed is a new seed identity, and data-persist=2 starts its store
+# over for one. PIANO_SOFT_METAL_LOG=PREDICATE adds the error/fault log loop (stage-soft-metal.py --log-errors) to the seed's boot job.
+SOFT_METAL=${PIANO_SOFT_METAL:-}
+if [ -z "$SOFT_METAL" ]; then
+  case " $LIST ${PIANO_EXTRA_KEXTS:-} " in *NativeSoftGpu*) SOFT_METAL=1 ;; *) SOFT_METAL=0 ;; esac
+fi
+if [ "$SOFT_METAL" = 1 ]; then
+  tooling/k27/build-soft-metal-plugin.sh > out/k27/build-soft-metal-plugin.log 2>&1 || { grep -E "error" out/k27/build-soft-metal-plugin.log | head; exit 1; }
+  STAMP=$( { shasum -a 256 out/inputs/scratch-data.img out/inputs/kernel.macho.trustcache tooling/k27/stage-soft-metal.py
+             find out/soft-metal/NativeSoftMetal.bundle -type f | sort | xargs shasum -a 256; echo "log ${PIANO_SOFT_METAL_LOG:-}"; } | shasum -a 256 | cut -c1-16)
+  if [ "$(cat out/soft-metal/stamp 2>/dev/null)" != "$STAMP" ] || [ ! -f out/soft-metal/scratch-data.img ]; then
+    python3 tooling/k27/stage-soft-metal.py ${PIANO_SOFT_METAL_LOG:+--log-errors "$PIANO_SOFT_METAL_LOG"} > out/k27/stage-soft-metal.log 2>&1 \
+      || { tail -5 out/k27/stage-soft-metal.log; exit 1; }
+    echo "$STAMP" > out/soft-metal/stamp
+  fi
+  PIANO_SEED=${PIANO_SEED:-out/soft-metal/scratch-data.img}
+  PIANO_TRUST=${PIANO_TRUST:-out/soft-metal/kernel.macho.trustcache}
+fi
 # The descriptors with their objects' absolute place (@OUT@ = this repository's out/), plus PIANO_EXTRA_KEXTS (JSON paths) for a test.
 mkdir -p out/k27/kext; NATIVE=
 for k in $LIST; do sed "s#@OUT@#$D/out#" "tooling/k27/kext/$k.json" > "out/k27/kext/$k.json"; NATIVE="$NATIVE $D/out/k27/kext/$k.json"; done

@@ -6,7 +6,7 @@
     stage-gpu-plugin.py does), so AMFI and libsystem_sandbox's gpu_bundle_find_trusted accept the ad hoc signed plugin.
 
     stage-soft-metal.py [--seed out/inputs/scratch-data.img] [--trust out/inputs/kernel.macho.trustcache] [--out out/soft-metal]
-                        [--boot-run COMMAND]... [--log-stream PREDICATE] [BUNDLE]
+                        [--boot-run COMMAND]... [--log-stream PREDICATE | --log-errors PREDICATE] [BUNDLE]
 
 Then: PIANO_SEED=out/soft-metal/scratch-data.img PIANO_TRUST=out/soft-metal/kernel.macho.trustcache tooling/k27/build-native-image.sh.
 The seed is the packed DBRDISK1 disk (NativeRamBlock SeedDisk.h). It is unpacked to a sparse raw file, attached with hdiutil (no mount),
@@ -27,6 +27,10 @@ nothing (its stdout is a pipe, so block-buffered, or the stream died), while eac
 so a line can appear twice; none is lost unless a `log show` takes longer than 5 s more than its sleep. `log show` reads what logd
 persisted: errors and faults always, info only when configured. It needs logd; without it the job's loop prints its error every 20 s
 and the rest of the boot is unchanged.
+Each line is printed by its own write, cut to 150 characters: the kernel's stderr-log logs the first 159 bytes of each write only, so a
+buffered `log show` writing many lines at once would lose all but the first.
+--log-errors PREDICATE is the same for the error and fault messages only (messageType error or fault): the measured run of 2026-11-11
+with every WindowServer and loginwindow message wrapped the 7 MiB console ring, and the crash messages of the last aborts were lost.
 """
 import argparse
 import hashlib
@@ -135,12 +139,19 @@ def main():
     p.add_argument('--out', type=Path, default=D / 'out/soft-metal')
     p.add_argument('--boot-run', metavar='COMMAND', action='append', default=[])
     p.add_argument('--log-stream', metavar='PREDICATE')
+    p.add_argument('--log-errors', metavar='PREDICATE')
     p.add_argument('bundle', nargs='?', type=Path, default=D / 'out/soft-metal/NativeSoftMetal.bundle')
     a = p.parse_args()
     commands = list(a.boot_run)
-    if a.log_stream:
-        where = shlex.quote(a.log_stream)
-        commands += [f'while :; do log show --last 25s --info --style compact --predicate {where} 2>&1; sleep 20; done']
+    if a.log_stream and a.log_errors:
+        raise SystemExit('--log-stream or --log-errors, not both')
+    if a.log_stream or a.log_errors:
+        predicate = a.log_stream or f'({a.log_errors}) AND (messageType == error OR messageType == fault)'
+        info = ' --info' if a.log_stream else ''
+        # one write per line (printf, a shell builtin), the header line left out
+        lines = 'while IFS= read -r line; do case $line in Timestamp*) ;; *) printf "%.150s\\n" "$line" ;; esac; done'
+        commands += [f'while :; do log show --last 25s{info} --style compact --predicate {shlex.quote(predicate)} 2>&1 | {lines}; '
+                     'sleep 20; done']
     bundle = a.bundle.resolve()
     if not (bundle / 'Contents/Info.plist').is_file():
         raise SystemExit(f'{bundle}: not a bundle (Contents/Info.plist)')

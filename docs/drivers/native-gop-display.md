@@ -71,6 +71,7 @@ WindowServer launched once and stayed up.
 | `native-gop-display-mm=WxH` | ADT, else 239x163 | physical size, so the density and macOS's HiDPI ("looks like 1600x1068") modes |
 | `native-gop-display-bars=1` | off | 8 colour bars instead of the solid colour until the first frame (left to right: white, yellow, cyan, green, magenta, red, blue, black) to check channel order |
 | `native-gop-display-refresh=0` | 1 | stop re-copying the shown surface on ticks 1, 2, 4, 8, 16 and 30 after a swap (only useful for a GPU renderer) |
+| `native-gop-display-thumb=N` | 30 | a thumbnail of the frame on the panel (see §5) on the first frame and then every N s; 0: none |
 
 No boot arg is needed for Path B. Everything else is the native set as it is (`K27_ARGS` in
 `tooling/bootimg/build-ram-images.py`). For a log of the WindowServer stage, give the run more than the default 45 s
@@ -140,8 +141,18 @@ NativeGopDisplay: swap layers 0x1: 0: 3200x2136 0x52476841                      
 NativeGopDisplay: first frame (swap N); boot console released from the screen
 NativeGopDisplay: surface 3200x2136 row ... offset ... format ... memory ...
 NativeGopDisplay: first copy 3200x2136 format ... into the framebuffer in N us
-NativeGopDisplay: N swaps submitted, N shown, ... copies mean N us (... convert N write N) ...   (every ~10 s while swaps arrive)
+NativeGopDisplay: N swaps submitted, N shown, ..., last frame P% non-black mean #RRGGBB centre #RRGGBB; N copies mean N us (... convert N write N) ...
+                                                                                  (every ~10 s while swaps arrive)
+NativeGopDisplay: thumb frame N: 3200x2136 'BGRA', P% non-black, mean #RRGGBB, centre #RRGGBB, 80x27 cells of 40x79 px, ramp " .:-=+*#%@"
+NativeGopDisplay: thumb 00 |....80 characters, one per cell: its mean luma, dark to bright, as " .:-=+*#%@"....|   (27 rows)
+                                                                                  (on the first frame, then every native-gop-display-thumb s)
 ```
+
+The "last frame" figures and the thumbnail come from every 4th pixel of every 4th row as written to the panel, after conversion, in
+any source format. "Non-black" means a channel above 8 of 255. Before 2026-11-11 the line said `last frame N lit centre X`, and that
+was counted only for converted formats ('RGhA', 'b3a8'): on a 'BGRA' display it always read 0, meaning "not measured", not black.
+The thumbnail shows only the main layer. A cursor layer (`swap layers 0x3: ... 1: 128x128`) is not copied to the panel, so it is not in
+the thumbnail either.
 
 Reading a run: up to `started, display ...` is the kernel side alone. `first swap submitted` means WindowServer composited
 a frame. A WindowServer that exits about 30 s after `started` with no swap is the Metal wait (§6.1).
