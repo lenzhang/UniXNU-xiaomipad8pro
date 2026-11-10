@@ -243,3 +243,12 @@ tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
 
 If the swaps come and the panic is watchdogd's, the remaining work is a watchdog for watchdogd natively (piano has one: k27 0056
 already pets Gunyah's) or keeping watchdogd from running. That is a separate driver task, not part of this one.
+
+## Measured 2026-11-11 05:41 (first frames)
+
+ADT `vmm-present = 0` (`make-piano-adt.py --vmm-present 0`) plus the stock XNU boot argument `panic_on_crash_disabled=1`
+(kern_exit.c `proc_should_trigger_panic`: watchdogd, which has no hardware watchdog natively, exits without a panic), NativeSoftGpu
+and the staged seed: WindowServer composites in software into NativeGopDisplay. `38 swaps submitted, 20 shown, 0 dropped`, copies
+about 38 ms each (prepare 2.3, read 33.7, write 1.4 ms); `swap layers 0x3: 0: 3200x2136 BGRA 1: 128x128 BGRA` (the cursor). WindowServer
+still aborts now and then (status 0x6; the console ring wrapped, so the messages were lost). What is on the panel is not known yet
+(next: a frame thumbnail in the log).
