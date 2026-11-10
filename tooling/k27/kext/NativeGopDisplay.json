@@ -2,7 +2,7 @@
   "name": "NativeGopDisplay",
   "bundle": "com.unixnu.driver.NativeGopDisplay",
   "version": "1.0.0",
-  "objects": "out/x12377/native-kexts/NativeGopDisplay/objects.json",
+  "objects": "@OUT@/native-kexts/NativeGopDisplay/objects.json",
   "start": "_native_kext_start",
   "stop": "_native_kext_stop",
   "libraries": {

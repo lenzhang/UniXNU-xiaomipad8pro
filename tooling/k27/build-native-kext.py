@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Compile a driver as a relocatable arm64e kext object against the xnu-12377 build (same flags as the kernel's IOPlatformExpert.cpo).
+
+    build-native-kext.py NAME SOURCE.cpp [SOURCE.cpp ...] [-I DIR ...] [--obj-link ios-obj-e]
+
+Objects go to out/native-kexts/NAME/ (--out). The k27 KC builder (tooling/kc/build-kc-k27.sh) --native links them into the kernel collection (the driver refers to
+classes of kexts of the collection, so it cannot be linked into the kernel).
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+# UniXNU-piano: vendored from macOS-DroidVM scripts/build-native-kext.py (11ac316, BSD-2-Clause-Patent). The k27 tree is only read
+# (the kernel objects' compile recipes); the objects go to this repository's out/native-kexts/NAME (--out), never into the archive.
+ROOT = Path(os.environ.get('K27_TREE', Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM'))
+X = ROOT / 'out/x12377'
+PIANO = Path(__file__).resolve().parents[2]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('name')
+parser.add_argument('sources', nargs='+')
+parser.add_argument('-I', dest='includes', action='append', default=[])
+parser.add_argument('-D', dest='defines', action='append', default=[], help='NAME[=VALUE], or U:NAME to undefine')
+parser.add_argument('--out', type=Path, help='output directory (default: out/native-kexts/NAME of this repository)')
+parser.add_argument('--obj', default='k27-native-obj', help='kernel object tree under out/x12377/build/xnu')
+parser.add_argument('--c-recipe', default='bsd/DEVELOPMENT/bsd_init.o.json',
+                    help="the kernel C file whose flags the C sources take (osfmk/DEVELOPMENT/startup.o.json for osfmk's private headers)")
+args = parser.parse_args()
+tree = X / 'build/xnu' / args.obj / 'DEVELOPMENT_ARM64_BCM2837'
+recipes = {suffix: json.JSONDecoder().raw_decode((tree / name).read_text())[0]   # C sources build like the kernel's C files
+           for suffix, name in (('.cpp', 'iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'), ('.c', args.c_recipe))}
+out = args.out or PIANO / 'out/native-kexts' / args.name
+out.mkdir(parents=True, exist_ok=True)
+objects = []
+for source in args.sources:
+    source = Path(source).resolve()
+    destination = out / (source.stem + '.o')
+    record = recipes['.c' if source.suffix == '.c' else '.cpp']
+    command, arguments, index = [], record['arguments'], 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value == record['file']:
+            command.append(str(source))
+        elif value == '-o':
+            command += ['-o', str(destination)]
+            index += 1
+        elif value in ('-MF', '-MJ', '-MT', '-MQ'):
+            index += 1
+        elif value == '-Xclang' and arguments[index + 1].startswith('-W'):
+            index += 1
+        elif value not in ('-MD', '-MMD', '-MP', '-g') and not value.startswith('-W'):
+            command.append(value)
+        index += 1
+    for include in args.includes:
+        command += ['-I', include]
+    for define in args.defines:
+        command += ['-U', define[2:]] if define.startswith('U:') else ['-D', define]
+    command += ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-c99-designator', '-Wno-reorder-init-list',
+                '-Wno-deprecated-enum-enum-conversion', '-Wno-unnecessary-virtual-specifier', '-Wno-missing-designated-field-initializers']
+    env = dict(os.environ, CCC_OVERRIDE_OPTIONS='+-Wno-error=missing-designated-field-initializers')
+    result = subprocess.run(command, cwd=record['directory'], capture_output=True, text=True, env=env)
+    if result.returncode:
+        sys.exit(result.stdout + result.stderr)
+    objects.append(str(destination))
+(out / 'objects.json').write_text(json.dumps(objects, indent=1) + '\n')
+print(f'{args.name}: {len(objects)} object(s) in {out}')

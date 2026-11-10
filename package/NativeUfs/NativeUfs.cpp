@@ -14,8 +14,10 @@
 #include <mach/mach_vm.h>
 #include <sys/param.h>
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK   // UniXNU-piano: the development build needs neither
 #include "verified_root.h"
 #include "VerifiedBlockPolicy.h"
+#endif
 extern "C" {
 extern const struct vr_crypto vr_xnu_crypto;
 extern const uint8_t verified_root_key[];

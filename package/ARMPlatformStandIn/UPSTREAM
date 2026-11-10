@@ -1,0 +1,3 @@
+ARMPlatformStandIn.cpp: macOS-DroidVM (local archive droidvm-build/macOS-DroidVM, branch el1/native-variant 11ac316)
+overlay/kext/ARMPlatformStandIn.cpp, unchanged (BSD-2-Clause-Patent, UniXNU-droidvm contributors). Natively it is still needed: the
+vma2 collection's IOMobileGraphicsFamily (NativeGopDisplay's family) and the kexts it needs link against AppleARMPlatform's classes.

@@ -4,12 +4,16 @@
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
 K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
-tooling/k27/build-native-ufs.sh > out/k27/build-native-ufs.log 2>&1 || { grep error: out/k27/build-native-ufs.log | head; exit 1; }
-tooling/k27/build-native-ram-block.sh > out/k27/build-native-ram-block.log 2>&1 || { grep error: out/k27/build-native-ram-block.log | head; exit 1; }
-tooling/k27/build-native-gop-display.sh > out/k27/build-native-gop-display.log 2>&1 || { grep error: out/k27/build-native-gop-display.log | head; exit 1; }
+LIST=$(sed -e 's/#.*//' configs/k27-native-kexts.txt | awk 'NF {print $1}')
+for k in $LIST; do   # the kexts' objects: tooling/k27/build-native-<name>.sh
+  case $k in ARMPlatformStandIn) b=standin ;; NativeUfs) b=ufs ;; NativeRamBlock) b=ram-block ;; NativeGopDisplay) b=gop-display ;; *) b= ;; esac
+  [ -n "$b" ] || { echo "no build script for $k" >&2; exit 1; }
+  tooling/k27/build-native-$b.sh > out/k27/build-native-$b.log 2>&1 || { grep -E "error:|Error" out/k27/build-native-$b.log | head; exit 1; }
+done
 python3 tooling/adt/make-piano-adt.py out/adt/piano-k27.adt --unique-chip-id "${UNIQUE_CHIP_ID:-47554e5941480001}" --data --trust > /dev/null
-# The linked set: configs/k27-native-kexts.txt, plus PIANO_EXTRA_KEXTS (absolute JSON paths) for a test.
-NATIVE=$(sed -e 's/#.*//' configs/k27-native-kexts.txt | awk 'NF {print $1}' | sed -e "s#^droidvm:#$K/#" -e "s#^piano:#$D/#" | tr '\n' ' ')
+# The descriptors with their objects' absolute place (@OUT@ = this repository's out/), plus PIANO_EXTRA_KEXTS (JSON paths) for a test.
+mkdir -p out/k27/kext; NATIVE=
+for k in $LIST; do sed "s#@OUT@#$D/out#" "tooling/k27/kext/$k.json" > "out/k27/kext/$k.json"; NATIVE="$NATIVE $D/out/k27/kext/$k.json"; done
 NATIVE="$NATIVE ${PIANO_EXTRA_KEXTS:-}" \
   tooling/kc/build-kc-k27.sh "${K27_KERNEL:-$K/out/k27/kernel-k27-0058-native.macho}" out/k27/kc-k27-native.bin > out/k27/build-kc.log 2>&1 || { tail -5 out/k27/build-kc.log; exit 1; }
 COMMON=(--fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-k27-native.bin --trust out/inputs/kernel.macho.trustcache

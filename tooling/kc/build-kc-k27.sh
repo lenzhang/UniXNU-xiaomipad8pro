@@ -6,8 +6,9 @@
 #   build-kc-k27.sh KERNEL OUTPUT.bin
 #
 # Environment:
-#   K27_TREE   the macOS-DroidVM checkout (default ~/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM)
-#   NATIVE     the native kext JSONs linked into the KC (default: the piano VM's full set, as iterate-k27-piano.sh)
+#   K27_TREE   the k27 build tree: its KC builder, KC base and layout are read, nothing is written there
+#              (default ~/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM)
+#   NATIVE     the native kext JSONs linked into the KC (required; the native set is configs/k27-native-kexts.txt)
 #   KC_BASE    the Apple 27.0.1 (26A434) vma2 kernelcache the KC is built from (default $K27_TREE/out/kc/kc27.bin)
 # Output: OUTPUT.bin, OUTPUT.natives.json, OUTPUT.log, OUTPUT.nm (llvm-nm -n of KERNEL), OUTPUT.sha256.
 # No password, no ssh: copying the KC anywhere is the caller's business.
@@ -24,7 +25,7 @@ if python3 k27/kc27-layout.py "$KC_BASE" "$KERNEL" | grep -q CONFLICT; then
   echo "layout CONFLICT: run k27/kc27-layout.py $KC_BASE $KERNEL --write k27/segaddrs.sh and link again" >&2; exit 1
 fi
 DI="com.apple.driver.DiskImages com.apple.driver.DiskImages.FileBackingStore com.apple.driver.DiskImages.KernelBacked com.apple.driver.DiskImages.RAMBackingStore com.apple.driver.DiskImages.ReadWriteDiskImage com.apple.driver.DiskImages.UDIFDiskImage"
-NATIVE=${NATIVE:-overlay/kext/NativeVirtioBlock.json overlay/kext/NativeAES.json overlay/kext/NativeRamBlock.json overlay/kext/ARMPlatformStandIn.json overlay/kext/DroidVMDisplay.json overlay/kext/DroidVMEthernet.json overlay/kext/DroidVMInput.json overlay/kext/DroidVMGpu.json overlay/kext/DroidVMAudio.json overlay/kext/DroidVMVideo.json}
+[ -n "${NATIVE:-}" ] || { echo "NATIVE (the kext descriptors) is required: tooling/k27/build-native-image.sh sets it from configs/k27-native-kexts.txt" >&2; exit 2; }
 # shellcheck disable=SC2046,SC2086
 python3 k27/kc-build27-piano.py "$KC_BASE" "$KERNEL" "$OUT" --keep $(cat configs/kc-keep.txt) $DI --native $NATIVE > "${OUT%.bin}.log" 2>&1 \
   || { tail -20 "${OUT%.bin}.log"; exit 1; }

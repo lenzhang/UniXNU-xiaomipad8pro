@@ -2,7 +2,7 @@
   "name": "NativeUfs",
   "bundle": "com.unixnu.driver.NativeUfs",
   "version": "1.0.0",
-  "objects": "out/x12377/native-kexts/NativeUfs/objects.json",
+  "objects": "@OUT@/native-kexts/NativeUfs/objects.json",
   "start": "_native_kext_start",
   "stop": "_native_kext_stop",
   "libraries": {
@@ -28,6 +28,8 @@
     "base": "IOBlockStorageDevice",
     "base_kext": "com.apple.iokit.IOStorageFamily",
     "slots": 326,
-    "ignore_slots": [16]
+    "ignore_slots": [
+      16
+    ]
   }
 }
