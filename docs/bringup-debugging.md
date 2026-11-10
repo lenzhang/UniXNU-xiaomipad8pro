@@ -74,7 +74,7 @@ dump image → while its UEFI runs, `fastboot -s piano-uefi oem dump 9cb00000 70
 dump image's XNU resets at once → parked in ABL fastboot again. About reset time + 70 s per test; results in
 `logs/native-runs/<ts>-loop/{loop.log,xnu-console.txt}`. The UniXNU menu boots its default at once (`PIANO_MENU_TIMEOUT=0`).
 
-Ubuntu's root is gone (linux_rootfs holds the macOS windows), so the old Ubuntu-based `native-run.sh` no longer applies. The
+Ubuntu's root is gone (linux_rootfs holds the macOS windows), so the old Ubuntu-based `native-run.sh` was removed. The
 maintenance RAM image of the Ubuntu release (USB NCM, telnet root shell: `tooling/native/maint-shell.py`) is the way to write
 partitions from the tablet itself.
 
@@ -83,10 +83,11 @@ A person is needed only when the tablet is parked (no reset, no fastboot): power
 ## 4. Rebuild after a change
 
 ```sh
-K27_VARIANT=native ../droidvm-build/macOS-DroidVM/build-k27-piano.sh            # kernel (patches 0001-0058)
-tooling/kc/build-kc-k27.sh ../droidvm-build/macOS-DroidVM/out/x12377/build/xnu/k27-native-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped out/k27/kc-k27-native.bin
-tooling/unixnu.sh build firmware --skip-preflight                                   # FD (A: Binaries/piano -> the bundled set)
-python3 tooling/bootimg/build-ram-images.py --fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --out out/ram \
-  --kc out/k27/kc-k27-native.bin --trust out/inputs/kernel.macho.trustcache --seed out/inputs/scratch-data.img --adt out/adt/piano-k27.adt
+K27_VARIANT=native ../droidvm-build/macOS-DroidVM/build-k27-piano.sh   # kernel (k27 tree: patches 0001-0052 + patches/k27 0053-0058)
+tooling/unixnu.sh build firmware --skip-preflight                          # FD (A: Binaries/piano -> the bundled set)
+tooling/k27/build-native-image.sh                                          # kexts (package/) -> KC -> ADT -> out/ram + out/ram-dump
 python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
 ```
+
+`tooling/build-slice1.sh` runs all of it. The native kext set is `configs/k27-native-kexts.txt`; what is left of the VM era and why:
+`docs/native-droidvm-inventory.md`.

@@ -20,7 +20,7 @@ verified offline (`docs/el1-native-plan.md` §5). Hard rules (RAM boot only, no 
 | `configs/k27-adt.toml` | ADT identity of the k27 kernel collection (VirtualMac2,1) used by slice 1 |
 | `firmware/patches/` | deltas to piano-uefi's `pianoPkg` (applied to a worktree by `tooling/firmware/setup-mu.sh`) |
 | `patches/xnu/` | device patch series of the 27.3 line (empty; the k27 native variant is macOS-DroidVM 0053/0054) |
-| `tooling/` | `unixnu.sh` (CLI on this device with the pinned checkouts), `build-slice1.sh` (everything), `firmware/`, `kc/`, `adt/`, `bootimg/` |
+| `tooling/` | `unixnu.sh` (CLI on this device with the pinned checkouts), `build-slice1.sh` (everything), `k27/build-native-image.sh` (kexts, KC, ADT, RAM images), `firmware/`, `kc/`, `adt/`, `bootimg/` |
 | `docs/` | plan, `el1-hyp-notes.md`, driver design pages (`drivers/`), upstream notes, evidence (`hyp-evidence/`) |
 | `logs/` | committed verification logs (ADT diff, image verification, FD notes, SHA256SUMS) |
 | `artifacts/ARTIFACTS.md` | SHA-256 of every built artifact and input |

@@ -1,5 +1,13 @@
 # NativeGopDisplay: macOS 27's display on the GOP framebuffer (k27 native kext)
 
+> **Status 2026-11-11 (DroidVM cleanup):** the native path is NativeGopDisplay alone. It now carries its own `AppleParavirtGPU`
+> nub, the default ADT has `/arm-io/gop-display` (`make-piano-adt.py --no-gop-display` leaves it out), and the native KC links
+> neither DroidVMDisplay nor DroidVMGpu (`configs/k27-native-kexts.txt`). Build and run: `tooling/k27/build-native-image.sh`, then
+> `tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img`. Measured: nub, display started on the boot
+> framebuffer, root and Data unchanged. What follows is the original design note: Path A, `PIANO_DROP_KEXTS`,
+> `build-display-test-kc.sh` and `native-run.sh` are gone.
+
+
 Status: built and linked, 2026-11-11 (`out/k27/kc-k27-display-test.bin`, vtable check 0 problem slots). Not run on the
 tablet. First step of [display.md](display.md) (M2a, GOP adoption); no DPU register is written.
 
