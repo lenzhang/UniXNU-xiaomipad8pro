@@ -195,7 +195,11 @@ extern "C" IOReturn piano_a830_board_start(unsigned level)
   piano_a830_note("board: knobs stop=%d status=%u profile=%u trace=%u irq=%u dcvs=%u va=%u kopt=%#x actlr=%#x pool=%u MiB", int(board.knobs.stop),
                   board.knobs.status, board.knobs.profile, board.knobs.trace, board.knobs.irq, board.knobs.dcvs, board.knobs.va, board.knobs.kopt,
                   board.knobs.actlr, board.pool_mib);
-  return adreno830_start(&board);
+  piano_a830_note("board: adreno830_start (S0%s; the trace's lines follow as \"t ...\", printed by the logger thread)",
+                  level < 2 ? " only" : board.knobs.stop == Adreno830StopNever ? "..S10" : "..S<piano-gpu-stop>");
+  const IOReturn result = adreno830_start(&board);
+  piano_a830_note("board: adreno830_start returned %#x", result);
+  return result;
 }
 
 extern "C" const Adreno830Board *piano_a830_board(void) { return &board; }

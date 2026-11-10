@@ -12,13 +12,17 @@
 //    AGXDeviceUserClient (NativeAdrenoABI.h v2, open type 0x4147). Taken from macOS-DroidVM overlay/kext/DroidVMGpuKext.cpp (11ac316,
 //    BSD-2-Clause-Patent) without its DroidVMGpuStarter and the virtio-gpu paths.
 //  - The BootProgress hooks the driver calls (strong definitions; tooling/k27/coalesce-weak.py drops the driver's weak defaults):
-//    status rows and stage results as console lines, the bring-up register trace (piano-gpu-trace) as "PianoA830: t ..." lines.
+//    status rows and stage results, the bring-up register trace (piano-gpu-trace) as "PianoA830: t ..." lines, all through a line
+//    ring that a logger thread prints (the hooks run with interrupts off; see the ring below).
+//  piano-gpu-delay=<s> (default 0): the survey or bring-up thread waits that long first (after the root is up, say), so a hang there
+//  does not also stop the boot.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/graphics/IOAccelerator.h>
 #include <kern/thread.h>
+#include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include <string.h>
@@ -30,7 +34,6 @@
 extern "C" void proc_selfname(char *, int);
 extern "C" IOReturn native_adreno_new_user_client(IOService *, task_t, void *, uint32_t, OSDictionary *, IOUserClient **, unsigned);
 extern "C" void native_adreno_note_property_read(const char *);
-extern "C" int printf(const char *, ...) __attribute__((format(printf, 1, 2)));
 extern "C" int vsnprintf(char *, size_t, const char *, va_list) __attribute__((format(printf, 3, 0)));
 
 namespace {
@@ -63,26 +66,107 @@ extern "C" void piano_a830_note(const char *format, ...)
   IOLog("PianoA830: %s\n", line);
 }
 
-// ---- BootProgress hooks (Adreno830Status.h) --------------------------------------------------------------------------------------
-// The overlay rows: each row whose text changed, as a line (row 0 is the summary, rows 1-3 the diagnostic page of piano-gpu-status=2).
+// ---- the line ring ----------------------------------------------------------------------------------------------------------------
+// The driver calls its BootProgress hooks in contexts where nothing may be printed: the register trace inside its tracer lock with
+// this CPU's interrupts off (A830TraceLock), the status rows under the status block's spin lock. Kernel printf/IOLog end in
+// os_log_with_args, which must not run with interrupts off: piano-gpu=2's first run printed the trace's first line and hung the
+// system right after it (2026-11-11 07:20). So the hooks only copy their line into this ring (a short spin lock with interrupts off,
+// a bounded memcpy, nothing else), and the logger thread prints it with IOLog from plain thread context, polling every millisecond.
+// A full ring drops lines and counts them; the logger says how many. The trace line of an access is in the ring before the access
+// is made, and the logger runs on another CPU, so a hung access is still named on the console.
+namespace {
+enum : unsigned { RingLines = 2048, RingBytes = 160 };
+struct LineRing {
+  char (*text)[RingBytes];
+  uint32_t head, tail, drops, lock;
+};
+LineRing gRing;
+
+uintptr_t ringLock()
+{
+  const uintptr_t irq = uintptr_t(ml_set_interrupts_enabled(FALSE));
+  while (__atomic_exchange_n(&gRing.lock, 1u, __ATOMIC_ACQUIRE)) {
+  }
+  return irq;
+}
+void ringUnlock(uintptr_t irq)
+{
+  __atomic_store_n(&gRing.lock, 0u, __ATOMIC_RELEASE);
+  ml_set_interrupts_enabled(boolean_t(irq));
+}
+
+// Any context but a primary interrupt handler; never blocks, never prints.
+void ringPush(const char *prefix, const char *text, size_t length)
+{
+  if (!gRing.text) return;
+  const uintptr_t irq = ringLock();
+  if (gRing.head - gRing.tail >= RingLines) {
+    gRing.drops++;
+  } else {
+    char *line = gRing.text[gRing.head % RingLines];
+    size_t n = 0;
+    while (prefix[n] && n < RingBytes - 1) {
+      line[n] = prefix[n];
+      n++;
+    }
+    for (size_t i = 0; i < length && text[i] && n < RingBytes - 1; ++i) line[n++] = text[i];
+    line[n] = 0;
+    gRing.head++;
+  }
+  ringUnlock(irq);
+}
+
+bool ringPop(char *out, uint32_t *drops)
+{
+  const uintptr_t irq = ringLock();
+  const bool any = gRing.tail != gRing.head;
+  if (any) {
+    memcpy(out, gRing.text[gRing.tail % RingLines], RingBytes);
+    gRing.tail++;
+  }
+  *drops = gRing.drops;
+  gRing.drops = 0;
+  ringUnlock(irq);
+  return any;
+}
+
+void logger(void *, wait_result_t)
+{
+  char line[RingBytes];
+  for (;;) {
+    uint32_t drops = 0;
+    while (ringPop(line, &drops)) {
+      if (drops) IOLog("PianoA830: (%u lines dropped: the ring was full)\n", drops);
+      IOLog("PianoA830: %s\n", line);
+    }
+    if (drops) IOLog("PianoA830: (%u lines dropped: the ring was full)\n", drops);
+    IOSleep(1);
+  }
+}
+}  // namespace
+
+// ---- BootProgress hooks (Adreno830Status.h): into the ring only ------------------------------------------------------------------
+// The overlay rows: each row whose text changed (row 0 the summary, rows 1-3 the diagnostic page of piano-gpu-status=2).
 extern "C" void boot_progress_gpu_rows(const char (*rows)[Adreno830StatusRowBytes], unsigned count)
 {
-  for (unsigned i = 0; i < count && i < Adreno830StatusRows; ++i) {
+  static const char *const prefixes[] = {"row0 ", "row1 ", "row2 ", "row3 "};
+  for (unsigned i = 0; i < count && i < Adreno830StatusRows && i < 4; ++i) {
     if (!memcmp(gRows[i], rows[i], Adreno830StatusRowBytes)) continue;
     memcpy(gRows[i], rows[i], Adreno830StatusRowBytes);
     gRows[i][Adreno830StatusRowBytes - 1] = 0;
-    IOLog("PianoA830: row%u %s\n", i, gRows[i]);
+    ringPush(prefixes[i], gRows[i], Adreno830StatusRowBytes);
   }
 }
 extern "C" void boot_progress_display_status(const char *detail, uint64_t value)
 {
-  IOLog("PianoA830: status %s %#llx\n", detail ? detail : "-", value);
+  char text[96];
+  snprintf(text, sizeof text, "%s %#llx", detail ? detail : "-", value);
+  ringPush("status ", text, sizeof text);
 }
-// The register trace: called before each traced access with this CPU's interrupts off (the tracer's lock), so the console printf
-// (synchronous, spin-locked) rather than IOLog; the pstore console mirror and the USB console keep every byte.
+// The register trace: called before each traced access, inside the tracer's lock with interrupts off.
 extern "C" void boot_progress_trace(const char *text)
 {
-  if (gTrace && text) printf("PianoA830: t %s\n", text);
+  if (gTrace && text) ringPush("t ", text, RingBytes);
 }
 extern "C" int boot_progress_trace_enabled(void) { return gTrace ? 1 : 0; }
 
@@ -107,6 +191,11 @@ extern "C" void piano_a830_report(IOReturn result)
 namespace {
 void run(void *, wait_result_t)
 {
+  const uint32_t delay = bootArg("piano-gpu-delay", 0);
+  if (delay) {
+    piano_a830_note("piano-gpu-delay=%u: waiting %u s before the %s", delay, delay, gLevel == 1 ? "survey" : "bring-up");
+    IOSleep(delay * 1000);
+  }
   const uint32_t defaultMask = gLevel == 1 ? uint32_t(PianoA830SurveyDefault) : 0u;
   const uint32_t mask = bootArg("piano-gpu-survey", defaultMask);
   if (gLevel == 1) {
@@ -157,6 +246,17 @@ bool PianoA830::start(IOService *provider)
   setProperty("piano-gpu", gLevel, 32);
   piano_a830_note("start: piano-gpu=%u (A830 chip %#x, k27 native kext, polled)", gLevel, 0x44050001u);
   thread_t thread = nullptr;
+  gRing.text = static_cast<char (*)[RingBytes]>(IOMallocZero(size_t(RingLines) * RingBytes));
+  if (!gRing.text || kernel_thread_start(logger, nullptr, &thread) != KERN_SUCCESS) {
+    piano_a830_note("FAILED: no line ring or logger thread (%u KiB); the trace stays off", RingLines * RingBytes / 1024);
+    if (gRing.text) IOFree(gRing.text, size_t(RingLines) * RingBytes);
+    gRing.text = nullptr;
+    gTrace = 0;
+  } else {
+    thread_deallocate(thread);
+    piano_a830_note("line ring %u x %u bytes, logger thread running", RingLines, RingBytes);
+  }
+  thread = nullptr;
   if (kernel_thread_start(run, nullptr, &thread) != KERN_SUCCESS) {
     piano_a830_note("FAILED: no kernel thread");
     return true;
