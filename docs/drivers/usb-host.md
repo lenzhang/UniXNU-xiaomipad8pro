@@ -421,7 +421,9 @@ stores: device role (PianoDwc3's takeover programs the rest)` before the summary
 takeover lines (`usb-device-debug.md`). H5c adds, per connected USB 2 port, `port 1: reset: PORTSC … -> … in N ms: enabled,
 high speed` (`full`/`low` for those devices) and `+T s:` lines in the watch.
 
-Reading the failures: `FAILED at stage 10` with `DCTL.CSFTRST did not clear` (no PIPE clock: `-utmi` was 0 or the selection did not
+Reading the failures: `FAILED at stage 10` with `the core is not powered/clocked: nothing written` (the gate reads the GDSC and
+four branches, the sleep clock included, which PianoDwc3's own gate does not: the survey's `GCC usb30` line shows which is off;
+level 5 switches no clock on), `DCTL.CSFTRST did not clear` (no PIPE clock: `-utmi` was 0 or the selection did not
 take), `GSTS.CURMOD does not read host` (the role did not change: try `-csr=1`); stage 13 `CNR stays set` / `HCRST does not clear`
 (the host block is not clocked or not out of reset; Ubuntu v1.1.0 saw the same without UTMI-as-PIPE in DP-only modes); stage 16
 `HSE` (a DMA the bus refused: the SMMU route; `-smmu=0` to compare); stage 17 `no command completion` (the event ring's address or
