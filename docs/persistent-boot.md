@@ -38,8 +38,8 @@ The ESP's unique GUID is derived from the disk GUID (uuid5): `3F8B0988-D851-5539
 
 Why the store moves: NativeUfs puts the store at `partition end + 1 - 1 GiB reserve - W` (`native_ufs_store_open`), so shrinking
 `linux_rootfs` by 1 GiB moves its place by 262144 blocks. With `--store fresh` (or when the store on the tablet was made for
-another seed, which `--store auto` detects from the store header's seed identity) nothing is copied and the first boot starts a new
-store at the new place (`Data store state 3`). The plan's in-device scratch copy (its S2) is not used: the verified NAS backup of
+another seed, which `--store auto` detects from the store header's seed identity; a self-contained store, [data-store.md](data-store.md),
+is moved whatever its seed) nothing is copied and the first boot starts a new store at the new place (`Data store state 3`). The plan's in-device scratch copy (its S2) is not used: the verified NAS backup of
 the whole store region replaces it, and the move is one forward `dd` within `linux_rootfs` (the destination lies below the source,
 so every block is read before it is overwritten).
 
@@ -239,15 +239,23 @@ partly discharged pack charges without the DSP is unmeasured. Note also:
 - The partition type is the EFI system GUID; the stock XBL/ABL ignore LUN 0's partitions beyond their own, and the ESP has no
   `\EFI\BOOT\BOOTAA64.EFI`. If a firmware stage ever reacts to it, `build-gpt.py` can be changed to Basic Data (FatPkg mounts by
   content, not by type).
-- A dev RAM image with another Data seed resets the installed system's store (the seed identity changes): use
-  `PIANO_DATA_PERSIST=0` for such experiments. The loop's dump image is now always built with `data-persist=0`
-  (`build-native-image.sh`), so it never touches the store.
+- A dev RAM image with another Data seed: with the store guard ([data-store.md](data-store.md), 2026-11-11) its NativeRamBlock
+  keeps the installed store untouched and runs Data volatile, and `build-ram-images.py` gives such an image `data-persist=0` by
+  default anyway (`PIANO_INSTALLED_SEED`). Images built before the guard, and the installed ESP's own collection until it is
+  rebuilt, still replace another seed's store. The loop's dump image is always built with `data-persist=0`.
 - Payload updates still need the cable: maintenance image, `backup` (new set) and `esp` with a new image. NativeUfs could later
   publish partition 37 so macOS updates its own payload.
 - The clock is the ESP build time (`droidvm-utc`) unless the ESP is built with `--rtc-offset` on a k27 0060 kernel: then the
   calendar starts from the PMIC RTC (`docs/drivers/rtc.md`; built, not yet run on the tablet).
 - Watchdog: not armed without `piano-reset-after`; panics restart (no `panic-spin`) into macOS again; the escape is power +
   volume-down.
+
+## 10. The Data store after the install
+
+The store's format, the store guard (another seed's store is kept and Data runs volatile; `data-store-replace` starts it over), flatten
+(`data-store-flatten=1`: a self-contained store that every later seed resumes), the plugin staging plan, the tooling
+(`PIANO_INSTALLED_SEED`, `build-esp.py --replace-data/--flatten-data`, `store-test-images.py`) and the RAM test procedure that proves
+the guard without risking the installed store: [data-store.md](data-store.md).
 
 ## Done 2026-11-11 (sessions 1-3)
 

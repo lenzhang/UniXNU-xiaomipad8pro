@@ -20,7 +20,7 @@ see `docs/bringup-debugging.md` §5 and `docs/PROJECT-MAP.md` rule 8.
 | DroidVMDisplay | removed, replaced | its scanout is virtio; NativeGopDisplay (`package/NativeGopDisplay`) copies to the GOP framebuffer and now carries the `AppleParavirtGPU` nub itself |
 | NativeAES | removed | nothing reads it natively (no AppleKeyStore, Data unencrypted); measured the same boot without it |
 | ARMPlatformStandIn | kept, vendored (`package/ARMPlatformStandIn`) | the vma2 collection's IOMobileGraphicsFamily (the display's family) and its kexts link against AppleARMPlatform's classes |
-| NativeRamBlock | kept, vendored (`package/NativeRamBlock`, Droid-VM/UniXNU 2e61915) | the Data disk; its VM data store (`DroidVMDataStore.c`, virtio) is gone, NativeUfs's store window serves it (`data-persist=2`) |
+| NativeRamBlock | kept, vendored (`package/NativeRamBlock`, Droid-VM/UniXNU 2e61915) | the Data disk; its VM data store (`DroidVMDataStore.c`, virtio) is gone, NativeUfs's store window serves it (`data-persist=2`). Changed natively (2026-11-11, [data-store.md](data-store.md)): another seed's store is kept instead of re-initialised (the VM's seed never changed under a store), a large seed has a volatile write path, and `data-store-flatten=1` makes a store self-contained |
 | NativeUfs, NativeGopDisplay | piano | — |
 
 ## Boot arguments (`tooling/bootimg/build-ram-images.py`)
@@ -78,6 +78,7 @@ patch series) is a separate change.
 These stay, because they are the macOS install the tablet now runs. Replacing them means reinstalling from Apple's 27.0.1 restore
 image with our own customisation:
 - `out/inputs/kernel.macho.trustcache`: the OS image's binaries.
-- `out/inputs/scratch-data.img`: the Data seed.
+- `out/inputs/scratch-data.img`: the Data seed. Once the tablet's store is flattened ([data-store.md](data-store.md)) the seed only
+  starts new stores; the installed Data no longer depends on it.
 - the OS and SystemOS windows on linux_rootfs (the VM's `os.img` and `systemos.img`). They include the VM-era userland changes,
   such as `settime.sh` and the staged Metal plugin.

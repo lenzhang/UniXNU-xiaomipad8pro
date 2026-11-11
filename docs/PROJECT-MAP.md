@@ -118,7 +118,8 @@ Native macOS is installed on piano and boots by itself: boot_a = BootShim + FD (
 partition 37, carved from linux_rootfs), the macOS root and Data on linux_rootfs (NativeUfs). The A830 GPU (PianoA830 + Turnip on
 ABI v2) composites the login screen. Dev work continues with RAM boots (`fastboot boot`, which take priority over the installed
 copy); verified backups of every written region are on the NAS and `tooling/persist/maint-session.py rollback ...` restores them.
-See `docs/persistent-boot.md`.
+See `docs/persistent-boot.md`. The Data store (its format, the store guard that keeps the installed store from RAM images with
+another seed, flatten, the test procedure): `docs/data-store.md`.
 
 Drivers and their state (each inert without its boot argument; pages in `docs/drivers/`):
 
