@@ -87,11 +87,17 @@ levels (9 V opt-in), charge current conservative, battery state on the console; 
 
   Refused limit writes are tried 3 times in a row, then left until the next attach. USB-C port notifications are acknowledged.
   If no input limit write has taken 3 minutes after the DSP start, a WARNING line says the input may be held at 100 mA.
+  **With `piano-power-policy=1`** ChargePolicy replaces this table ([charging-policy.md](charging-policy.md) §8): after charger_pd is
+  up and the board configuration is through, the class rows (CDP 900 mA, DCP 1500, PD its 5 V offer), the charge current by class
+  with −300 mA/°C above 38 °C, PianoThermal's board thermistors, re-sent on a new generation and after a wake, the sleep and
+  shutdown handovers; `piano-power-rp=1` the Type-C Rp current (≤ 1600 mA), `piano-power-health=1` stop at 80 %, resume at 75 %.
 - Not done (later): IOPMPowerSource, the SC8541 pump and PPS, MiPPS authentication, the OTG config write 0x201a (stock
   re-sends it to stop a DSP crash on dock unplug), float voltage/termination, sleep notifications.
 
 Boot arguments: `piano-power=0|1|2` (default 0: probe declines, nothing mapped), `piano-power-period=S` (30),
-`piano-power-gauge=0`, `piano-power-write=0` (level 2 without writes), `piano-power-hv=1`, `piano-power-fw=DIR`, and for the DSP
+`piano-power-gauge=0`, `piano-power-write=0` (level 2 without writes), `piano-power-hv=1`, `piano-power-fw=DIR`,
+`piano-power-policy=1` (with `piano-power-rp=1`, `piano-power-health=1`, `-health-stop=N`, `-health-resume=N`: charging-policy.md
+§8), and for the DSP
 bring-up (§5a): `piano-power-delay=S` (30: seconds before the bring-up), `piano-power-stop=N` (stop before step N),
 `piano-power-rpmh=0` (no lcx/lmx proxy votes), `piano-power-qmp=0` (no AOSS load_state), `piano-power-trace=0`.
 
@@ -580,3 +586,23 @@ channel up, the IPC router hello from node 5 (servreg/pddump/pdr lookups answere
 reading: `bus 5236 mV 0 mA, type CDP, input limit 100 mA (set 0), charge current set 0 mA, tbat 29 C, charge enable 1, status 0x7`.
 Next: the same with writes (input limit 1500 mA). Do not combine piano-power>=2 with piano-gpu=2 yet (both use RPMh DRV-2 TCS
 slots; the A830 driver takes the DRV-2 owner lock, PianoPower does not).
+
+## Measured 2026-11-11 evening (the Mac's USB-C port, level 1 then level 2 without writes)
+
+From the USB console log of the 20:22 run (local, not published; `grep PianoPower`) and the level 1 run before it (the day's
+short record: [results-2026-11-11.md](../results-2026-11-11.md)):
+
+| What | Level 1 (no DSP) | Level 2, image G2 (DSP running, no writes) |
+|---|---|---|
+| Battery (gauges, both packs) | **+477 mA at 97 %**: the PMIC charges by itself on the boot stages' configuration | 0 mA at 98 % before the DSP; −1.2 A at its start; **−1.6 to −1.7 A at the login screen** (4.35 V, 97 %, packs up to 37.7 °C) |
+| Input | not readable (no DSP) | bus 5208 mV, **397 mA** (0x20004; 287–397), type **CDP**, 0x2008 reads **100 mA** (the request, not the limit in force) |
+| Input path | — | input suspend 0x2019 = 0, AICL enable 0x2012 = **0**, AICL status 0x2029 = 0x64, charge enable 1, status 0x7, float 5200 (4400 mV), verify 0, PD state 1, data role 1 (UFP) |
+| DSP services | — | charger_pd up (registration answer), port owner 0x800c answered the enable, UCSI owner 0x800b answered (version 1.10, CCI 0, 48-byte buffer) |
+| Type-C (PMIC) | a source on CC1, sink status 0x02 | the same: **Rp 3.0 A** (the run still printed the old decode, "500 mA") |
+
+Reading: the input path is open with the DSP running (unlike the 07:28 run), the firmware holds it near 400 mA, and with the
+system drawing about 9 W (2.1 W in, 7.1 W from the packs) the battery drains. Without the DSP the same port charged. So level 2 needs
+its input limit written, and the limit is now worth writing: [charging-policy.md](charging-policy.md) §13 (the CDP row by default,
+the Rp current opt-in, and the budget: 900 mA in is about −1.1 A on the packs at 9 W, 1600 mA about −0.4 A) and §14 (images P1 and
+P2 with their expected lines: the input limit write ok, the bus current above 397 mA, the packs' current toward 0). P1 asks image
+I's question (the board configuration, then 900 mA on the CDP) through ChargePolicy; either answers it.
