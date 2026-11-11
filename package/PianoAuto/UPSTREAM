@@ -1,0 +1,12 @@
+PianoAuto is UniXNU-piano's own code (BSD-2-Clause-Patent, LICENSE), written for this repository. Nothing is copied from elsewhere.
+
+Uses, unchanged and from their own package (compiled from package/PianoSensors, not copied): SensorsPolicy.c/.h (ps_rotation_step,
+ps_rotation_defaults, the edges), SensorsOrient.c/.h and SensorsFixed.c/.h (which SensorsPolicy.c needs), tests/check.h (the CHECK macro).
+
+Facts, from public headers of the macOS SDK only:
+  CoreGraphics CGDisplayConfiguration.h: CGDisplayRotation ("the rotation angle of a display in degrees clockwise. A display rotation of
+    90 degrees implies the display is rotated clockwise 90 degrees, such that what was the physical bottom of the display is now the
+    left side, and what was the physical top is now the right side"): TouchRotation.h's table and AutoRotate.h's degrees follow it.
+
+Behaviour taken as a specification (no code or text): Ubuntu's rotation rule (GNOME rotates only with the keyboard cover detached;
+iio-sensor-proxy 3.9 as docs/drivers/sensors.md section 3 describes it).
