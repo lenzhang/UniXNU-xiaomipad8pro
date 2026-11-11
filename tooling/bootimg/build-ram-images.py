@@ -13,11 +13,18 @@ the FAT payload (UniXNU payload layout, written with UniXNU's payload.write_volu
 (sign-on-remote.sh); verify-ram-images.py checks everything offline.
 
   build-ram-images.py --fd FD --fd-name NAME --out DIR [--kc KC --trust T --seed S --adt ADT] [--utc SECONDS]
+
+The Data store (docs/data-store.md): a macOS image opens the tablet's store (data-persist=2) only when its seed is the installed one
+(PIANO_INSTALLED_SEED in ~/.config/piano/env, or out/persistent/installed.json), else it runs Data volatile (data-persist=0), with a
+note on stderr either way. PIANO_DATA_PERSIST=0|1|2 overrides that (2 with another seed: the RAM test of the store guard, which keeps
+the store); PIANO_DATA_STORE_REPLACE=1|<8 hex> and PIANO_DATA_STORE_FLATTEN=1 add data-store-replace / data-store-flatten=1.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -72,7 +79,8 @@ K27_ARGS = ['-v', 'debug=0x14e', 'kt_fixed_zones=120', '-no_slto_panic', 'tlto_u
             # Root from UFS (package/NativeUfs): the SHNGROOT windows OS/SystemOS in linux_rootfs, read only, unverified
             # build (no NATIVE_VERIFIED_BLOCK: development tablet); diagnostics in the console log.
             'native-ufs-root=1', 'native-ufs-diagnostics=1',
-            # NativeRamBlock's changed Data pages in NativeUfs's store window at the end of linux_rootfs (2: read and write)
+            # NativeRamBlock's changed Data pages in NativeUfs's store window at the end of linux_rootfs (2: read and write). A RAM image
+            # takes the value data_store_args gives (PIANO_DATA_PERSIST, else from the installed seed); build-esp.py sets its own.
             'data-persist=' + os.environ.get('PIANO_DATA_PERSIST', '2')]
 
 # PIANO_FAST_BOOT=1|2 (docs/boot-time.md): the boot-time test switch, off (0) by default, so K27_ARGS above stays what boots today.
@@ -107,6 +115,79 @@ def fast_boot(args, extra=(), level=None):
             raise SystemExit('PIANO_FAST_BOOT=2 denies watchdogd: it needs panic_on_crash_disabled=1 too')
         out.append(FAST_BOOT_DENY_EXEC)
     return out
+
+
+def persist_common():
+    """tooling/persist/common.py (seed identity, installed seed, store guard), loaded by path."""
+    spec = importlib.util.spec_from_file_location('persist_common', DEVICE / 'tooling/persist/common.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def loud(text):
+    print('\n'.join(['', '*' * 100, *[f'*  {line}' for line in text.splitlines()], '*' * 100, '']), file=sys.stderr, flush=True)
+
+
+def data_store_args(seed, kc):
+    """The Data store arguments of a RAM test image (docs/data-store.md): (arguments, record).
+    PIANO_DATA_PERSIST=0|1|2 when set; else 2 only when the image's seed is the installed one (PIANO_INSTALLED_SEED, or
+    out/persistent/installed.json), 0 when it is another seed's, and when the installed seed is unknown 2 with a kernel collection that
+    has the store guard (another seed's store is then kept and Data runs volatile) or 0 without it. A collection without the guard
+    replaces another seed's store: data-persist=2 is refused for it unless the seed is known to be the installed one.
+    PIANO_DATA_STORE_REPLACE=1|<8 hex>: data-store-replace (start the installed store over for this seed: drops the owner's Data).
+    PIANO_DATA_STORE_FLATTEN=1: data-store-flatten=1 (make this seed's store self-contained; only under the store's own seed)."""
+    common = persist_common()
+    identity = common.seed_info(seed)['identity_sha256']
+    installed, source = common.installed_seed()
+    same = common.same_seed(identity, installed)
+    guard = common.kc_has_store_guard(kc)
+    explicit = os.environ.get('PIANO_DATA_PERSIST')
+    replace = os.environ.get('PIANO_DATA_STORE_REPLACE', '').strip().lower().removeprefix('0x')
+    flatten = os.environ.get('PIANO_DATA_STORE_FLATTEN', '') == '1'
+    if explicit is not None and explicit not in ('0', '1', '2'):
+        raise SystemExit(f'PIANO_DATA_PERSIST={explicit}: 0, 1 or 2')
+    if replace and replace != '1' and not re.fullmatch(r'[0-9a-f]{8}', replace):
+        raise SystemExit(f'PIANO_DATA_STORE_REPLACE={replace}: 1 (any other seed\'s store) or the store\'s 8 hex digits')
+    mode = explicit if explicit is not None else '2' if same or (installed is None and guard) else '0'
+    this, theirs = identity[:8], (installed or '')[:8]
+    if (replace or flatten) and mode != '2':
+        raise SystemExit('PIANO_DATA_STORE_REPLACE / PIANO_DATA_STORE_FLATTEN need data-persist=2 (PIANO_DATA_PERSIST=2)')
+    if (replace or flatten) and not guard:
+        raise SystemExit(f'{kc}: no store guard in this kernel collection (NativeRamBlock before docs/data-store.md): it knows neither '
+                         'data-store-replace nor data-store-flatten')
+    if mode == '2' and not same and not guard and not replace:
+        raise SystemExit(f'data-persist=2 with seed {this} and a kernel collection WITHOUT the store guard: its NativeRamBlock would '
+                         f'replace a store of any other seed (installed: {theirs or "unknown"}, {source}), dropping the owner\'s Data. '
+                         'PIANO_DATA_PERSIST=0, or a collection built from this tree, or PIANO_INSTALLED_SEED if this is the installed seed')
+    if mode == '2' and same:
+        note = f'data-persist=2: seed {this} is the installed seed ({source}): this image resumes the owner\'s Data store and writes into it'
+    elif mode == '2' and installed is None:
+        note = (f'data-persist=2: the installed seed is unknown ({source}). This collection has the store guard: a store of another seed '
+                'is kept and Data runs volatile ("kept; Data is volatile this boot"); a self-contained store (flattened) is resumed and '
+                'written')
+    elif mode == '2':
+        note = (f'data-persist=2 (asked for) with seed {this}, NOT the installed seed {theirs} ({source}). The store guard keeps that '
+                'store untouched and runs Data volatile ("NativeRamBlock: the store belongs to seed ...: kept"); if the store is '
+                'self-contained (flattened), this image resumes it and writes into the owner\'s Data')
+    elif explicit is None:
+        note = (f'data-persist=0: seed {this} is not the installed seed {theirs} ({source}), so this image leaves the store alone and '
+                'Data is volatile. PIANO_DATA_PERSIST=2 opens the store (the guard keeps another seed\'s store: the RAM test of the guard)')
+    else:
+        note = f'data-persist={mode} (asked for): seed {this}'
+    if replace:
+        note += (f'\nPIANO_DATA_STORE_REPLACE={replace}: data-store-replace: a store of another seed is STARTED OVER for seed {this}: '
+                 'the owner\'s Data changes of that store are dropped')
+    if flatten:
+        note += f'\nPIANO_DATA_STORE_FLATTEN=1: data-store-flatten=1: the store of seed {this} is made self-contained (only that seed\'s)'
+    loud(note)
+    args = [f'data-persist={mode}']
+    if replace:
+        args.append('data-store-replace=' + ('1' if replace == '1' else '0x' + replace))
+    if flatten:
+        args.append('data-store-flatten=1')
+    return args, {'data_persist': int(mode), 'seed_identity': identity, 'installed_seed': installed, 'installed_seed_from': source,
+                  'same_seed': same, 'kc_has_store_guard': guard, 'replace': replace or None, 'flatten': flatten}
 
 
 def sha(path):
@@ -149,7 +230,12 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     shutil.copyfile(adt, payloads / 'kernel.macho.adt')
     # PIANO_EXTRA_ARGS: more kernel arguments for one test image (e.g. piano-usb=2, docs/drivers/usb-device-debug.md).
     extra = os.environ.get('PIANO_EXTRA_ARGS', '').split()
-    base = fast_boot(K27_ARGS, extra) + [f'droidvm-utc={utc}'] + extra
+    store = {'data-persist', 'data-store-replace', 'data-store-flatten'} & {x.split('=', 1)[0] for x in extra}
+    if store:
+        raise SystemExit(f'PIANO_EXTRA_ARGS: {", ".join(sorted(store))}: use PIANO_DATA_PERSIST / PIANO_DATA_STORE_REPLACE / '
+                         'PIANO_DATA_STORE_FLATTEN (checked against the installed seed, docs/data-store.md)')
+    persist, store_record = data_store_args(seed, kc)
+    base = [x for x in fast_boot(K27_ARGS, extra) if not x.startswith('data-persist=')] + persist + [f'droidvm-utc={utc}'] + extra
     one = ' '.join(base + ['cpus=1'])
     smp = ' '.join(base + ['sheng-smp=1'])
     for line in (one, smp):
@@ -168,7 +254,8 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     size_mib = max(64, -(-int(content * 1.08) // (1 << 20)) + 8)
     image = work / 'payload-macos.img'
     payload(stage, image, 'PIANOESP', size_mib)
-    return image, {'cmdline_1cpu': one, 'cmdline_8cpu': smp, 'payload_mib': size_mib, 'fast_boot': fast_boot_level()}
+    return image, {'cmdline_1cpu': one, 'cmdline_8cpu': smp, 'payload_mib': size_mib, 'fast_boot': fast_boot_level(),
+                   'data_store': store_record}
 
 
 def kernel_field(fd, dtb, work, name):

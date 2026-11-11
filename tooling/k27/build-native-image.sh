@@ -29,8 +29,10 @@ python3 tooling/adt/make-piano-adt.py out/adt/piano-k27.adt --unique-chip-id "${
 # The software Metal path (docs/drivers/soft-metal.md): when NativeSoftGpu is linked (the list or PIANO_EXTRA_KEXTS; PIANO_SOFT_METAL=0
 # leaves this out, =1 forces it), the NativeSoftMetal plugin is built and staged into a copy of the Data seed and the trust cache
 # (tooling/k27/stage-soft-metal.py, out/soft-metal), which the image then takes unless PIANO_SEED / PIANO_TRUST name others. The staging
-# is redone only when its inputs change (out/soft-metal/stamp): a new seed is a new seed identity, and data-persist=2 starts its store
-# over for one. PIANO_SOFT_METAL_LOG=PREDICATE adds the error/fault log loop (stage-soft-metal.py --log-errors) to the seed's boot job.
+# is redone only when its inputs change (out/soft-metal/stamp): a new seed is a new seed identity, which the installed Data store was not
+# made for (docs/data-store.md: the store guard keeps that store and runs Data volatile; build-ram-images.py gives such an image
+# data-persist=0 unless PIANO_DATA_PERSIST says otherwise). PIANO_SOFT_METAL_LOG=PREDICATE adds the error/fault log loop
+# (stage-soft-metal.py --log-errors) to the seed's boot job.
 # Reduce transparency is staged too (--reduce-transparency: clients draw no backdrop layers, which Core Animation's software renderer
 # asserts on); PIANO_REDUCE_TRANSPARENCY=0 leaves it out.
 SOFT_METAL=${PIANO_SOFT_METAL:-}
@@ -94,6 +96,9 @@ for k in $LIST; do sed "s#@OUT@#$D/out#" "tooling/k27/kext/$k.json" > "out/k27/k
 NATIVE="$NATIVE $EXTRA" \
   tooling/kc/build-kc-k27.sh "${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}" out/k27/kc-k27-native.bin > out/k27/build-kc.log 2>&1 || { tail -5 out/k27/build-kc.log; exit 1; }
 # PIANO_TRUST / PIANO_SEED: another trust cache and Data seed for a test (e.g. tooling/k27/stage-soft-metal.py's, with a staged plugin).
+# The Data store (docs/data-store.md): out/ram opens it (data-persist=2) only when its seed is the installed one (PIANO_INSTALLED_SEED in
+# ~/.config/piano/env), else Data is volatile; build-ram-images.py prints which on stderr. PIANO_DATA_PERSIST=0|1|2 overrides it,
+# PIANO_DATA_STORE_REPLACE=1|<8 hex> and PIANO_DATA_STORE_FLATTEN=1 add data-store-replace / data-store-flatten=1.
 COMMON=(--fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-k27-native.bin --trust "${PIANO_TRUST:-out/inputs/kernel.macho.trustcache}"
         --seed "${PIANO_SEED:-out/inputs/scratch-data.img}" --adt "${PIANO_ADT:-out/adt/piano-k27.adt}" --utc "$(date +%s)")
 # The dump image only lets our UEFI read the previous run's log; its XNU never touches the Data store (data-persist=0), so a dump

@@ -5,7 +5,10 @@ Nothing here touches a device."""
 import hashlib
 import importlib.util
 import json
+import os
+import re
 import struct
+import zlib
 from pathlib import Path
 
 DEVICE = Path(__file__).resolve().parents[2]
@@ -104,6 +107,81 @@ def seed_info(path):
     pages = size // 4096
     return {'file_sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data), 'logical_bytes': size, 'extents': count,
             'pages': pages, 'store_blocks': store_blocks(pages), 'identity_sha256': h.hexdigest()}
+
+
+SELF_CONTAINED = 1   # PersistOverlay.h kSelfContained
+
+
+def store_header(raw):
+    """Block 0 of a Data store window (PersistOverlay.h; at least its first 128 bytes): the version 1 header and the UniXNU-piano
+    extension. state: 'blank' (no SHNGDATA), 'damaged' (version, size or CRC), 'valid'. A self-contained store (data-store-flatten)
+    holds every page of its seed: NativeRamBlock uses it with any seed of its page count."""
+    raw = bytes(raw)
+    if raw[:8] != b'SHNGDATA':
+        return {'state': 'blank', 'magic': raw[:8].decode(errors='replace')}
+    version, header_bytes, pages = struct.unpack_from('<IIQ', raw, 8)
+    generation, crc = struct.unpack_from('<II', raw, 56)
+    if version != 1 or header_bytes != 64 or zlib.crc32(raw[:60]) & 0xffffffff != crc:
+        return {'state': 'damaged', 'magic': 'SHNGDATA'}
+    info = {'state': 'valid', 'magic': 'SHNGDATA', 'pages': pages, 'identity': raw[24:56].hex(), 'generation': generation,
+            'flags': 0, 'self_contained': False, 'flattened': 0}
+    if len(raw) >= 128 and raw[64:72] == b'SHNGEXT1' and \
+            struct.unpack_from('<I', raw, 124)[0] == zlib.crc32(raw[64:124], zlib.crc32(raw[:60])) & 0xffffffff:
+        flags, = struct.unpack_from('<I', raw, 72)
+        info.update(flags=flags, self_contained=bool(flags & SELF_CONTAINED), flattened=struct.unpack_from('<Q', raw, 80)[0])
+    return info
+
+
+def store_usable(header, seed):
+    """Does NativeRamBlock (with the store guard) resume this store with SEED (seed_info)? Else it keeps it (another seed's store,
+    Data volatile) or, for a blank or damaged window, starts a new one."""
+    return header.get('state') == 'valid' and header.get('pages') == seed['pages'] and \
+        (header.get('identity') == seed['identity_sha256'] or header.get('self_contained', False))
+
+
+def piano_env():
+    """~/.config/piano/env as a dict, the PIANO_* variables of the environment on top (they win)."""
+    env = {}
+    path = Path.home() / '.config/piano/env'
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            if '=' in line and not line.lstrip().startswith('#'):
+                k, v = line.split('=', 1)
+                env[k.strip().removeprefix('export ').strip()] = v.strip().strip('"\'')
+    env.update({k: v for k, v in os.environ.items() if k.startswith('PIANO_')})
+    return env
+
+
+def installed_seed(out=None):
+    """The seed identity of the installed ESP (what the tablet's Data store was made for), as (hex or None, where it came from).
+    PIANO_INSTALLED_SEED (environment or ~/.config/piano/env): the identity (at least 8 hex digits), or an ESP build record (.json); else
+    OUT/installed.json (tooling/persist/maint-session.py writes it with every ESP it installs), OUT = out/persistent of this checkout."""
+    value = piano_env().get('PIANO_INSTALLED_SEED', '').strip()
+    if value:
+        if value.endswith('.json'):
+            path = Path(value).expanduser()
+            if not path.is_file():
+                raise SystemExit(f'PIANO_INSTALLED_SEED={value}: no such ESP record')
+            return json.loads(path.read_text())['seed']['identity_sha256'], f'PIANO_INSTALLED_SEED ({path.name})'
+        if not re.fullmatch(r'[0-9a-fA-F]{8,64}', value):
+            raise SystemExit(f'PIANO_INSTALLED_SEED={value}: the seed identity (8 to 64 hex digits) or an ESP record (.json)')
+        return value.lower(), 'PIANO_INSTALLED_SEED'
+    record = Path(out or os.environ.get('PIANO_PERSIST_OUT', DEVICE / 'out/persistent')) / 'installed.json'
+    if record.is_file():
+        seed = (json.loads(record.read_text()).get('seed') or {}).get('identity_sha256')
+        if seed:
+            return seed, f'{record.parent.name}/installed.json'
+    return None, 'unknown (set PIANO_INSTALLED_SEED in ~/.config/piano/env)'
+
+
+def same_seed(identity, installed):
+    """INSTALLED may be a prefix (at least 8 hex digits) of the full identity."""
+    return bool(installed) and identity.lower().startswith(installed.lower())
+
+
+def kc_has_store_guard(kc):
+    """Does this kernel collection's NativeRamBlock keep another seed's store (docs/data-store.md)? Earlier ones replace it."""
+    return b'data-store-replace' in Path(kc).read_bytes()
 
 
 # ---------------------------------------------------------------------------------------------------------------------------

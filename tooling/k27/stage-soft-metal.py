@@ -19,8 +19,10 @@ The seed is the packed DBRDISK1 disk (NativeRamBlock SeedDisk.h). It is unpacked
 its APFS volume mounted with diskutil (no sudo: the volume then ignores ownership, so the copies are stored as uid/gid 99, mode 755/644),
 the bundle copied, the volume unmounted and the disk packed again. Nothing outside --out is written.
 
-A new seed has a new identity, so NativeRamBlock's persistent store (data-persist=2) treats the store window as stale and starts it over,
-which drops the Data changes of earlier native boots. Boot staged-seed tests with PIANO_DATA_PERSIST=0 (Data in RAM only) to keep them.
+A new seed has a new identity, which the tablet's Data store was not made for (docs/data-store.md). NativeRamBlock with the store guard
+keeps such a store untouched and runs Data volatile for that boot (earlier kernels started it over, dropping the Data changes of
+earlier native boots); build-ram-images.py gives an image whose seed is not the installed one data-persist=0 by default. A
+self-contained (flattened) store ignores the seed entirely: files staged here then reach only a store started from this seed.
 
 --boot-run adds a command to the seed's one boot job (Library/LaunchDaemons/org.droidvm.run.0.plist, which runs settime.sh: the clock).
 The job's file is rewritten in place, so it keeps the owner the VM's staging gave it; launchd refuses a daemon plist that is not root's,

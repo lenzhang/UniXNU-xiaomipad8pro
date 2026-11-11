@@ -576,18 +576,23 @@ def map_step(s):
         s.need(image_bytes + 1024 * B <= room, f'root image ({image_bytes} bytes) + 1024 blocks below the new store place (NativeUfs rule)')
         s.save(image_bytes=image_bytes)
     for where, first in (('old', store_old(s)), ('new', store_new(s))):
-        h = s.t('peek', rootfs, rel(first), 0, 64)
+        h = s.t('peek', rootfs, rel(first), 0, 128)   # the version 1 header and its extension (docs/data-store.md)
         if h:
             raw = bytes.fromhex(h['hex'])
             info = {'first_lba': first, 'magic': raw[:8].decode(errors='replace'), 'pages': int.from_bytes(raw[16:24], 'little'),
                     'identity': raw[24:56].hex(), 'generation': int.from_bytes(raw[56:60], 'little')}
+            header = common.store_header(raw)
+            info.update(state=header['state'], self_contained=header.get('self_contained', False), flags=header.get('flags', 0))
             s.log(f'  info  store header at the {where} place (LBA {first}): {info}')
             s.save(**{f'store_{where}': info})
     old = s.state.get('store_old') or {}
     if s.esp and old:
-        same = old.get('magic') == 'SHNGDATA' and old.get('identity') == s.esp['seed']['identity_sha256'] and old.get('pages') == s.esp['seed']['pages']
-        s.log(f'  info  Data store {"IS" if same else "is NOT"} bound to the ESP\'s seed (identity {s.esp["seed"]["identity_sha256"][:16]}): '
-              f'--store auto will {"move it" if same else "let it start fresh"}')
+        # A store the ESP's NativeRamBlock resumes: made for its seed, or self-contained (flattened: any seed of its size).
+        same = old.get('magic') == 'SHNGDATA' and old.get('pages') == s.esp['seed']['pages'] and \
+            (old.get('identity') == s.esp['seed']['identity_sha256'] or old.get('self_contained', False))
+        s.log(f'  info  Data store {"IS" if same else "is NOT"} usable with the ESP\'s seed (identity {s.esp["seed"]["identity_sha256"][:16]}'
+              f'{", the store is self-contained" if old.get("self_contained") else ""}): --store auto will '
+              f'{"move it" if same else "let it start fresh"}')
         s.save(store_matches_esp=same)
 
 
@@ -740,6 +745,9 @@ def write_esp(s, image_name):
            f'ESP read back through /dev/{esp} and /dev/{lun0}: {got} / {got2} = {record["sha256"][:16]}')
     if s.execute:
         s.save(esp_written=record['image'], esp_sha256=record['sha256'])
+        # The installed ESP's seed, which build-ram-images.py and build-esp.py compare theirs with (common.installed_seed).
+        common.write_json(OUT / 'installed.json', {'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'],
+                                                   'written': time.strftime('%Y-%m-%d %H:%M:%S')})
 
 
 @step('esp', 'maintenance, WRITE partition 37 (test-phase ESP)', writes='LUN 0 LBA 71527424-71789567')
@@ -756,6 +764,7 @@ def esp_back(s):
     s.restore('linux_rootfs-tail-esp', s.nodes['lun0'], common.ESP_FIRST, B)
     if s.execute:
         s.save(esp_written=None, esp_sha256=None)
+        (OUT / 'installed.json').unlink(missing_ok=True)   # the region holds what it held before this install
 
 
 @step('check', 'maintenance, read only')
@@ -858,8 +867,9 @@ def ram_test(s, image, expect_uefi, reset_after):
         for line in r.stdout.splitlines():
             if re.search(r'NativeRamBlock: Data store|NativeUfs:.*(root|window|store)|panic\(|launchd\[1\]', line):
                 s.log('        | ' + line[:200])
-        # state 0 = data-persist=0 (no store: the precedence image); 4 = refused, first LBA 0 (a failure worth stopping on)
-        lbas = re.findall(r'Data store state [1-4] .*?first LBA (\d+)', r.stdout)
+        # state 0 = data-persist=0 (no store: the precedence image); 4 = refused, first LBA 0 (a failure worth stopping on);
+        # 7 = another seed's store, kept (the store guard, docs/data-store.md): opened at its place, not used
+        lbas = re.findall(r'Data store state [1-47] .*?first LBA (\d+)', r.stdout)
         if lbas:
             s.need(all(int(x) == store_new(s) for x in lbas), f'the Data store opened at LBA {lbas[-1]} = {store_new(s)}')
         else:

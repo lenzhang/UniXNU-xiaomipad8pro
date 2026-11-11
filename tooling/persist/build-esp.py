@@ -18,8 +18,16 @@ watchdog is not armed without them) plus the profile's and --arg's additions. En
   fastboot     the seed, no UFS root, data-persist=0, no pstore console (the last run's log stays): reset into ABL fastboot after 1 s
   reset, shutdown, tools
   build-esp.py --profile base|softgpu|gpu|daily [--default macos|macos-diag] [--arg NAME=VALUE ...] [--rtc-offset N|sdam] [--from REPO]
-               [--fast-boot 0|1|2]
+               [--fast-boot 0|1|2] [--replace-data [1|HEX8]] [--flatten-data]
                [--kc K --adt A --trust T --seed S] [--name esp-diag] [--out out/persistent]
+
+The Data store (docs/data-store.md): the macos entries open it read-write (data-persist=2). When the installed seed is known
+(PIANO_INSTALLED_SEED, or out/persistent/installed.json) and differs from this ESP's seed, the first boot of this ESP finds another
+seed's store: with the store guard in the collection it keeps it and runs Data volatile (unless the store is self-contained, which any
+seed resumes); --replace-data adds data-store-replace (=1: any other seed's store; =HEX8: only the store of that seed) for an intended
+one-time switch that starts the store over (the owner's Data changes are dropped). A collection without the guard would replace the
+store silently: refused then, unless --replace-data says so. --flatten-data adds data-store-flatten=1 (the store of this ESP's seed
+becomes self-contained at its next boot; a no-op once it is).
 
 The clock (docs/drivers/rtc.md): droidvm-utc=<--utc> is always there, the OS image's settime.sh sets it when the calendar is still
 near 1970. --rtc-offset N (measured once: tooling/native/rtc-offset.py) adds piano-rtc=1 piano-rtc-offset=N, --rtc-offset sdam only
@@ -77,6 +85,55 @@ PROFILES = {
 # Profile arguments the menu's "fastboot" entry (a reset after 1 s) leaves out.
 NOT_IN_FASTBOOT = ('piano-gpu', 'piano-gpu-delay', 'piano-power', 'piano-usb', 'piano-usb-hid')
 DROPPED = ('piano-reset-after', 'piano-reset-to', 'data-persist', 'droidvm-utc')
+# Set only by their own options (--replace-data, --flatten-data; data-persist is always 2 here), so the intent is explicit and recorded.
+STORE_ARGS = ('data-persist', 'data-store-replace', 'data-store-flatten')
+
+
+def store_args(a):
+    """The macos entries' Data store arguments beyond data-persist=2 (docs/data-store.md)."""
+    out = []
+    if a.replace_data:
+        value = a.replace_data.lower().removeprefix('0x')
+        if value != '1' and not re.fullmatch(r'[0-9a-f]{8}', value):
+            raise SystemExit(f'--replace-data {a.replace_data}: 1 (any other seed\'s store) or the store\'s seed as 8 hex digits')
+        out.append('data-store-replace=' + ('1' if value == '1' else '0x' + value))
+    if a.flatten_data:
+        out.append('data-store-flatten=1')
+    return out
+
+
+def loud(text):
+    print('\n'.join(['', '*' * 100, *[f'*  {line}' for line in text.splitlines()], '*' * 100, '']), file=sys.stderr, flush=True)
+
+
+def check_store(a, seed, kc):
+    """This ESP's seed against the installed one, and the collection's store guard: a record, a loud note, or a refusal."""
+    installed, source = common.installed_seed(a.out)
+    same = common.same_seed(seed['identity_sha256'], installed)
+    guard = common.kc_has_store_guard(kc)
+    this, theirs = seed['identity_sha256'][:8], (installed or '')[:8]
+    if a.flatten_data and not guard:
+        raise SystemExit(f'--flatten-data: {kc} has no store guard (NativeRamBlock before docs/data-store.md): it cannot flatten')
+    if installed and not same:
+        if not guard and not a.replace_data:
+            raise SystemExit(f'this ESP\'s seed {this} is not the installed seed {theirs} ({source}), and {kc} has no store guard: its '
+                             'first boot would replace the store and drop the owner\'s Data. Build the collection from this tree, or '
+                             'say --replace-data if that is the intent')
+        if a.replace_data:
+            loud(f'--replace-data: this ESP\'s first boot STARTS THE STORE OVER for seed {this} (installed seed {theirs}, {source}): the '
+                 'owner\'s Data changes are dropped' + ('' if guard else ' (this collection has no store guard: it would anyway)'))
+        else:
+            loud(f'this ESP\'s seed {this} is not the installed seed {theirs} ({source}). With the store guard its boots keep that store '
+                 'untouched and run Data VOLATILE ("the store belongs to seed ...: kept"), unless the store is self-contained '
+                 '(flattened: then any seed resumes it). --replace-data starts the store over for this seed instead')
+    elif installed is None:
+        loud(f'the installed seed is unknown ({source}); this ESP\'s seed is {this}. '
+             + ('With the store guard another seed\'s store is kept (Data volatile) and a self-contained one resumed.' if guard else
+                f'{kc} has NO store guard: if the store is another seed\'s, its first boot replaces it and drops the owner\'s Data.'))
+    elif a.replace_data:
+        loud(f'--replace-data with the installed seed {this}: inert (data-store-replace only acts on another seed\'s store)')
+    return {'installed_seed': installed, 'installed_seed_from': source, 'same_seed': same, 'kc_has_store_guard': guard,
+            'replace': a.replace_data, 'flatten': a.flatten_data}
 
 
 def adt_vmm_present(path):
@@ -119,13 +176,17 @@ def args_of(a, profile, utc):
         raise SystemExit('--rtc-offset and --arg piano-rtc...: one of them')
     extra = profile['args'] + a.arg + rtc_args(a.rtc_offset)
     names = {x.split('=', 1)[0] for x in extra}
+    if names & set(STORE_ARGS):
+        raise SystemExit(f'--arg {", ".join(sorted(names & set(STORE_ARGS)))}: the Data store arguments come from --replace-data / '
+                         '--flatten-data (data-persist is always 2 on the macos entries)')
     # --fast-boot N: build-ram-images.py's PIANO_FAST_BOOT=N (docs/boot-time.md), given here explicitly so that an environment
     # variable left set for a RAM test never changes an installed ESP.
     base = ram.fast_boot(base, extra, a.fast_boot)
     base = [x for x in base if x.split('=', 1)[0] not in names] + extra
     base += ['data-persist=2', f'droidvm-utc={utc}']
-    macos = base + ['sheng-smp=1']
-    diag = base + [f'piano-reset-after={a.diag_reset_after}', 'piano-reset-to=bootloader', 'sheng-smp=1']
+    store = store_args(a)
+    macos = base + store + ['sheng-smp=1']
+    diag = base + store + [f'piano-reset-after={a.diag_reset_after}', 'piano-reset-to=bootloader', 'sheng-smp=1']
     # The way back to ABL fastboot from the menu: no UFS root, no store, no console mirror (the previous run's log stays in cvp).
     quiet = ('native-ufs-root', 'native-ufs-diagnostics', 'pstore-console', 'pstore-console-size') + NOT_IN_FASTBOOT
     fastboot = [x for x in base if x.split('=', 1)[0] not in quiet + ('data-persist',)] + [
@@ -193,6 +254,13 @@ def main():
     p.add_argument('--fast-boot', type=int, choices=(0, 1, 2), default=0,
                    help='build-ram-images.py PIANO_FAST_BOOT: 1 no -v (no console text drawn) and no droidvm-disable-jobs; '
                    '2 also k27-deny-exec for watchdogd (docs/boot-time.md)')
+    p.add_argument('--replace-data', nargs='?', const='1', metavar='1|HEX8',
+                   help='data-store-replace on the macos entries: an intended one-time switch to this seed that STARTS THE DATA STORE '
+                   'OVER when it belongs to another seed (1: any other seed\'s store; HEX8: only the store of that seed, the 8 hex '
+                   'digits NativeRamBlock prints). Without it another seed\'s store is kept and Data runs volatile (store guard)')
+    p.add_argument('--flatten-data', action='store_true',
+                   help='data-store-flatten=1 on the macos entries: the store of this ESP\'s seed becomes self-contained at the next '
+                   'boot (docs/data-store.md); then every later seed boots it')
     p.add_argument('--name', help='output base name (default esp-<profile>-<default>)')
     p.add_argument('--out', type=Path, default=common.DEVICE / 'out/persistent')
     a = p.parse_args()
@@ -222,6 +290,7 @@ def main():
         prev = {'kc': a.prev_kc.resolve(), 'adt': (a.prev_adt or inputs['adt']).resolve(), 'trust': (a.prev_trust or inputs['trust']).resolve()}
     seed = common.seed_info(inputs['seed'])
     window = seed['store_blocks']
+    data_store = check_store(a, seed, inputs['kc'])
     lines = args_of(a, profile, a.utc)
     config = config_text(a, lines, prev)
     name = a.name or f'esp-{a.profile}-{a.default}'
@@ -281,7 +350,7 @@ def main():
         'inputs': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in inputs.items()},
         'previous': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in prev.items()} if prev else None,
         'kc_natives': natives, 'adt_vmm_present': vmm,
-        'seed': seed,
+        'seed': seed, 'data_store': data_store,
         'store': {'window_blocks': window,
                   'first_lba_now': common.store_first(common.ROOTFS_LAST, window),
                   'first_lba_after': common.store_first(common.ROOTFS_NEW_LAST, window)},
