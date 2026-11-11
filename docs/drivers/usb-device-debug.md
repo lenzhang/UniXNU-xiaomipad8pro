@@ -19,6 +19,13 @@
 > **2026-11-11, system sleep** (host-tested, linked, not run): in the power tree at `piano-usb=2`; a configured Mac keeps the
 > console across a suspend (`piano-sleep-usb=1`, default), else a soft disconnect; no QSCRATCH write while asleep or with the glue
 > unclocked (Ubuntu's SoC reset, K:7dffd78b342d). §16.
+>
+> **2026-11-12, the normal boot path: a cold start** (host-tested, linked, **not run**). The installed ESP ran for hours with the
+> console at `no-host ... link state 3, configuration 0`: on the normal power-on path (no ABL fastboot) the takeover had trusted a
+> state only ABL fastboot leaves. `piano-usb-cold=auto` (default) now reads the inherited state first and, when it is not a running
+> device controller, brings the GDSC/clocks, the rails (RPMh), the eUSB2 repeater and the M31 PHY up from this driver's own tables;
+> a link watch does the same when no host comes within 15 s. `piano-usb-cold-sim=MASK` proves it from ABL fastboot. §17;
+> tests C0-C8 in [`../forensics-2026-11-11.md`](../forensics-2026-11-11.md) §7.
 
 
 Status: design and code, 2026-11-11. Built, host-tested and linked into a test KC (`out/k27/kc-k27-usb-test.bin`); **not
@@ -112,7 +119,8 @@ IOPlatformExpertDevice ── PianoDwc3 (start, matching thread)   read-only pro
                   monitor (port 0 command lines)   notes (IOLog off the USB thread)   shell (/dev/pianousb after IOBSD)
 ```
 
-- **Takeover** (`takeover()`, stages 10–20 in the log): clocks checked (or switched on, `piano-usb=3`) → GSNPSID → halt
+- **Takeover** (`takeover()`, stages 10–20 in the log; since 2026-11-12 the cold start of §17 first, stage 11, when the inherited
+  state is not a running device controller): clocks checked (or switched on, `piano-usb=3`) → GSNPSID → halt
   (RUN_STOP off) → 64 KiB contiguous DMA region → [M31 PHY init] → UTMI clock as PIPE clock → PHY suspend bits off +
   `DCTL.CSFTRST` → device role, high speed, event buffer (masked line), EP0 → QSCRATCH VBUS/session override → SETUP armed,
   RUN_STOP. The QMP PHY and the SuperSpeed lanes, UCSI, the FSA4480 and the charger are not touched.
@@ -166,6 +174,10 @@ IOPlatformExpertDevice ── PianoDwc3 (start, matching thread)   read-only pro
 | `piano-usb-handoff=1` | 0 | PianoUsbHost (levels 3/4 with `piano-usbhost-handoff=5\|6`) may borrow the controller for host mode: on its ask the USB thread stops the device controller, masks its event interrupt and parks; on its reclaim the clocks are re-read and the whole takeover runs again (`UsbHandoff.h`, `usb-host.md` §6.6). The service is registered for it. 0: the controller is PianoDwc3's for the whole boot |
 | `piano-wake-log=S` | 60 | the `idle: N wakeups in S s` line every S seconds (0 none; shared with PianoInput and PianoTouch) |
 | `piano-sleep-usb=0` | 1 | a system sleep disconnects the gadget even with the Mac attached (§16); 1: a configured host keeps it (the console survives) |
+| `piano-usb-cold=0\|1\|auto` | auto | the cold start (§17): `0` the inherited state only (the takeover of before, no cold start, no link watch; the inherited state is still read and reported), `1` always, `auto` when the inherited state is not a running device controller, plus the link watch |
+| `piano-usb-cold-steps=MASK` | 0x17 | the cold start's optional parts: 0x1 the rails, 0x2 the repeater, 0x4 the M31 PHY, 0x8 the controller's block reset (opt-in), 0x10 the RCG rates, 0x20 the repeater's DT tuning even when it was on (opt-in) |
+| `piano-usb-cold-wait=S` | 15 | the link watch: no bus reset from a host S s after RUN_STOP: a cold start (the wait doubles; 3 cold starts a boot at most); 0 no watch |
+| `piano-usb-cold-sim=MASK` | 0 | test hook (needs `piano-usb=2`): before the decision, leave 0x1 the repeater off, 0x2 the M31 uninitialised, 0x4 the core in the host role, 0x8 the clocks and the GDSC off, 0x10 the rails' votes withdrawn (§17.4) |
 
 On the Mac (no root, standard library only; logs go to `logs/usb-console/`, gitignored):
 
@@ -265,8 +277,9 @@ included). If the takeover fails, the driver logs the stage and leaves the contr
 ## 10. Risks
 
 - **UEFI powered USB down at ExitBootServices** (UsbConfigDxe's handler): then level 2 refuses (clocks) or the link never
-  comes up (PHY/repeater in low power). Level 3 and `piano-usb-phy=1` cover clocks and the M31 PHY only; RPMh rail votes and
-  the repeater are **not** implemented (the full cold path: SunUEFI `PianoUsbPhy.c` PowerStart + repeater, later).
+  comes up (PHY/repeater in low power). Seen on the normal boot path (2026-11-11: no host for 2.4 h). Since 2026-11-12 the cold
+  start covers it (§17: GDSC, clocks, RPMh rail votes, the repeater, the M31 PHY); level 3 and `piano-usb-phy=1` stay as they were
+  for `piano-usb-cold=0`.
 - **SMMU access under Gunyah**: a read that never returns was seen on sheng from another thread; PianoDwc3 touches the SMMU
   only on the matching thread after NativeUfs. A hang there is caught by the watchdog; `piano-usb-smmu=0` skips it.
 - **Core soft reset without PHY clocks**: CSFTRST times out (logged, stage −16); the UTMI select exists to avoid the PIPE
@@ -278,7 +291,9 @@ included). If the takeover fails, the driver logs the stage and leaves the contr
 
 ## 11. Open questions
 
-1. What do piano-uefi's Qualcomm DXEs leave on at ExitBootServices (GDSC, clocks, M31, repeater, RUN_STOP, QSCRATCH)? → T1.
+1. What do piano-uefi's Qualcomm DXEs leave on at ExitBootServices (GDSC, clocks, M31, repeater, RUN_STOP, QSCRATCH)? → T1
+   answered it for the fastboot path (everything on, RUN_STOP off). The normal path: the cold start's `cold: inherited ...` lines
+   (§17.5) answer it on the first installed boot with this driver.
 2. Where is SID 0x40 after the firmware (no entry, an exact entry on which bank, VA64)? → T1 SMMU line.
 3. DWC3 version, IN endpoint count (2 ports need ≥ 5), TX FIFO sizes → T1.
 4. Does the HS link come up without re-initialising the M31 PHY / repeater, and with the FSA4480 and EUD as the firmware left
@@ -604,3 +619,131 @@ glue clocked; kept: the console goes on` or `wake N: the glue clocked: connected
 Failure lines: `sleep: the USB thread did not answer within 500 ms`, `wake N: the glue is NOT clocked (GDSC ..., master ..., ...)`,
 `QSCRATCH 0x10 = ... not written now (...): recorded for the wake`. The cable to a host keeps the HS PHY out of its low-power state
 (power.md §4): a suspend measurement is made without it (`piano-sleep-usb` then decides nothing: no host is configured).
+
+## 17. The cold start (`piano-usb-cold`, 2026-11-12)
+
+Status: built, host-tested (`tests/usb_cold_host.cpp` against a model of the hardware), linked into the native kernel collection;
+**not run on the tablet**. Code: `package/PianoDwc3/UsbCold.h` (portable: the inspection, the decision, the steps, the test hook, the
+link watch) and its kernel side in `PianoDwc3.cpp` (`ColdHal`, `coldDecide`, `takeover(cold)`, `coldRestart`). Test plan:
+[`../forensics-2026-11-11.md`](../forensics-2026-11-11.md) §7.
+
+### 17.1 Why
+
+Every console so far followed ABL fastboot. ABL ran the controller as a device for the Mac, and the FD stopped it at
+ExitBootServices with power, clocks, the M31 PHY and the repeater still on. The probe of `20261111-201656` reads GDSC `fa22f800`,
+the branches `08000001`, the master RCG `00100105`, GCTL `00102005` (device role), the firmware's event buffer at `0xd359f000`,
+DEVTEN `0x1277`, M31 `[54] 6b` and repeater `fd08/fd46 = 80/80`. The takeover kept all of that.
+
+The installed daily ESP (the normal path) got to `stage 20 running`: the core was clocked, since the takeover passed stage 10. It
+then saw no host for 2.4 h. Its minute lines say `passes ... no-host 22x; polled; link state 3, configuration 0`
+(`logs/native-runs/20261111-232127-installed-dump`). Link state 3 is USB 2 suspend: the device sees an idle bus and no reset ever
+comes, which is how a D+ pull-up that the Mac never sees looks. Likely causes are the eUSB2 repeater (its 3.1 V side drives the USB 2
+lines), the M31 PHY, or their rails not being voted, on a path where ABL never ran USB. The probe's own lines of that boot had been
+overwritten in the ring by then. The cold start does not need to know which it was.
+
+### 17.2 What runs
+
+| Step | What | Shared resource, rule | On failure |
+|---|---|---|---|
+| inspect (every mode, read only) | GCC: the USB30 GDSC, the five branches, the master/mock_utmi RCG configuration, GPLL0's mode and vote word; the TCSR USB2 reference clock; the core while clocked (GSNPSID, GCTL role, GEVNTADR/DEVTEN: did the firmware run it as a device, DCTL/DSTS/DCFG); the M31 while clocked, with its reference clock on and its vdd not off; the repeater (status, enable, `force_en_5`/`force_val_5`); the three rails (STATUS1, set point, MODE, EN_CTL, each LDO found by the page rule and its TYPE); GPIO61 (the Type-C orientation, read through TLMM); the PMIC's Type-C block only with `piano-power=0` and `piano-usbhost=0` (one observer reader per peripheral: otherwise PianoPower's `usb:` line has it) | none written | unknown reads never count as a reason |
+| decision | `piano-usb-cold=auto`: cold when any of the 11 reasons holds: the GDSC collapsed, a branch off, an RCG not at 200 MHz / 19.2 MHz, the USB2 reference clock off, the core not answering, not in the device role, never run as a device by the firmware, the M31 not initialised, the repeater not enabled/ready, its host-mode clock forced, a rail off | — | — |
+| c1 power | the GDSC on (SW_COLLAPSE off, RETAIN_FF, the waits 2/2/15); GPLL0's enable vote (GCC `0x52020` bit 0); the branches cfg_noc, aggre, master, sleep, mock_utmi; the RCGs at 200 MHz (GPLL0 / 3) and 19.2 MHz (TCXO), root forced on around the update; the TCSR USB2 reference clock | the vote word only under PianoA830's `sm8750_gcc_vote_owner` (tag `DWC3`, 50 ms, then set anyway: bits only ever set) | hard: the GDSC or a branch that does not come on stops it (`cold c1 FAILED`) |
+| c2 stop | the event interrupt masked; whatever runs stopped (a running device controller halted, or a running xHCI's run bit cleared and HCH awaited); with steps bit 0x8 the controller's block reset `USB30_PRIM_BCR` (20 us, 1 ms settle) | — | hard: a core that does not answer as a DWC_usb3x |
+| c3 rails | `vreg_l2d_0p88` (`ldod2`: the M31's vdd, the QMP's vdda-phy), `vreg_l15b_1p8` (`ldob15`) and `vreg_l5b_3p1` (`ldob5`: the repeater's vdd18 and vdd3): one VRM transaction each on apps DRV-2 (mode 7, set point = the PMIC's when within the DT's range else the DT minimum, enable), 5 ms, read back over SPMI. `vreg_l3g_1p2` (the M31's vdda12) is never voted: it is the UFS PHY's PLL rail too | DRV-2 only under PianoA830's `sm8750_rpmh_drv2_owner` (tag `DWC3`, at most 2 s, else not sent); PianoBluetooth's `vrmSend` (TCS 2, 1, 0; a TCS that does not complete is never used again) | soft |
+| c4 repeater | only when PPID `0x7fd`'s APID belongs to EE 0: EN_CTL1 = 0x80; the board's tuning when the repeater was found off (piano's DT: `0x51`=0x0e, `0x52`=0x01, `0x53`=0x07, `0x54`=0x03, `0x57`=0x06), else the firmware's kept (steps bit 0x20: always); device mode (`0xe8`/`0xed` = 0); status bit 7 awaited (10 ms) | SPMI write channel of that APID | soft |
+| c5 PHY | not while its vdd reads off: the TCSR reference clock on, `QUSB2PHY_PRIM_BCR` pulsed, `kM31Init` (the stock firmware's sequence, `piano-usb-phy=1`'s), read back against its end state (`01 00 6b 07 00`) | — | soft |
+
+The takeover then goes on as before: 12 halt, 13 DMA, 15 the UTMI clock as PIPE clock, 16 the core soft reset (it needs the PHY's
+UTMI clock, so it is the first proof that the PHY runs), 17 device mode (PRTCAPDIR 2, high speed), 18 the VBUS/session override
+(QSCRATCH, through the sleep guard), 19 RUN_STOP. Not touched: the ADSP (charging, audio and the sensor hub live there), the QMP PHY
+and the DIO4485 mux (high speed needs neither: both D+/D- pairs meet in the receptacle), the CX/MX levels and the interconnect votes.
+Those are RPMh resources shared on DRV-2, which keeps one vote per DRV, so a second writer would replace another kext's vote.
+
+### 17.3 Timeouts, retries, the link watch
+
+- Every poll is bounded: the GDSC and each branch 10 ms, an RCG 1 ms, a halt 100 ms, the repeater 10 ms, an SPMI access 1 ms, a TCS
+  100 ms, the DRV-2 lock 2 s, the GCC vote lock 50 ms. c1 and c2 fail hard and return at once. c3-c5 failures are logged and the
+  start goes on. No core, QSCRATCH or M31 access happens with the glue unclocked, and no M31 access with its vdd known off.
+- A takeover that fails (modes 1 and auto) gets another cold start 2 s later, up to 3 cold starts per boot. After that the old
+  failure path applies: the controller is left as it is and the boot goes on.
+- The **link watch** (modes 1 and auto, `piano-usb-cold-wait=15`): if no bus reset has come 15 s after RUN_STOP, it runs a cold
+  restart. That restart stops the device controller, reports the state again, does the cold start and the takeover. Each further
+  wait doubles (30, 60 s), and the 3-per-boot limit applies (the boot's first cold start counts). A bus reset ends the watch for the
+  boot. A hand-off to PianoUsbHost disarms it. It acts only while the system is awake. If the auto decision took a state as running
+  that was not, the watch catches it. Without a cable it costs at most three cold starts in the first 2 minutes.
+
+### 17.4 Proving it from ABL fastboot: the test hook and `usb cold`
+
+`piano-usb-cold-sim=MASK` (with `piano-usb=2`) runs on the USB thread before the decision. It changes only what it can change
+safely: the core only while clocked (halted first), the repeater only when its APID is EE 0's.
+
+| Bit | Leaves the hardware with | The decision then reads |
+|---|---|---|
+| 0x1 | the repeater disabled (EN_CTL1 0) and its host clock forced (0x40/0x40) | the repeater not enabled/ready; its host clock forced |
+| 0x2 | the M31 reset (BCR) and left at its reset values, its TCSR reference clock off | the USB2 reference clock off (the M31 is then not read) |
+| 0x4 | the core in the host role (PRTCAPDIR 1), the VBUS/session override cleared | not in the device role |
+| 0x8 | the RCGs parked on TCXO, the five branches off, the GDSC collapsed | the GDSC collapsed, an RCG not at its rate (the core not read) |
+| 0x10 | the three rails' DRV-2 votes withdrawn (enable 0) | a rail off if nothing else votes it (the M31 not read unless its vdd reads on) |
+
+With `piano-usb-cold=0` the same masks show the old takeover's behaviour on such a state, which is the control experiment. The
+monitor's `usb cold [sim MASK]` does the same live: the reply goes out, 0.5 s later the link drops, the Mac enumerates again, and
+`usb-console.py` reconnects and shows the lines in its replay. `usb` prints a `cold:` line with the mode, the steps, the reasons
+found at the takeover, the cold starts so far, the breadcrumb and the watch.
+
+### 17.5 Lines
+
+In this order (`grep 'PianoDwc3: cold'`), here from the fastboot path's values. The normal path shows its own:
+
+```
+PianoDwc3: start: piano-usb-cold=auto steps=0x17 sim=0 wait=15 s (the cold start, UsbCold.h: when the inherited state is not ...)
+PianoDwc3: cold: inherited GCC: gdsc fa22f800 cfg_noc 08000001 aggre 08000001 master 08000001 sleep 08000001 mock_utmi 08000001; RCG cfg master 00100105 mock_utmi 00100001; GPLL0 mode ... vote ...; TCSR usb2 clkref 00000001
+PianoDwc3: cold: inherited core 33313130 GCTL 00102005 (role 2: device) GEVNTADR 00000000d359f000 DEVTEN 00001277 DCTL 10f00000 DSTS 00d34554 DCFG 0048080c; M31 ready [3c] 01 [50] 00 [54] 6b [64] 07 [94] 00
+PianoDwc3: cold: inherited repeater (SID 7 0xfd00): ready and enabled, status 80 enable 80 force_en_5 00 force_val_5 00 (APID owner EE 0)
+PianoDwc3: cold: inherited rail vreg_l2d_0p88 (ldod2, M31 vdd, QMP vdda-phy): PPID 0x... status 80 enable 80 mode .. NNN mV: on      (and l15b, l5b)
+PianoDwc3: cold: Type-C orientation normal (CC1) (GPIO61 level 0, cfg ...): high speed needs no lane mux; the PMIC's Type-C block is PianoPower's to read
+PianoDwc3: cold: verdict (piano-usb-cold=auto): the inherited state is a running device controller (none): taken as it is (the takeover of before)
+     or: ... is NOT a running device controller (the repeater is not enabled/ready; a rail is off): the cold start runs
+PianoDwc3: stage takeover: cold start (piano-usb-cold: power, stop, rails, repeater, M31 PHY)
+PianoDwc3: cold: start (steps 0x17: rails 1, repeater 1, M31 PHY 1, block reset 0, RCGs 1, tuning always 0)
+PianoDwc3: cold c1 power: GDSC ...; GPLL0 mode ... vote ... (voted already); branches ... (0 switched on); RCG cfg master 00100105 mock_utmi 00100001; usb2 clkref 00000001
+PianoDwc3: cold c2 stop: core 33313130, was role 2 (GCTL 00102005): nothing ran; no block reset (...); now GCTL ... GUSB2PHYCFG ... DSTS ...
+PianoDwc3: cold: cmd-db: ldod2 0x..., ldob15 0x..., ldob5 0x...
+PianoDwc3: cold: rsc: apps DRV-2 id 0x... (version 3.0), TCS block +0xd00
+PianoDwc3: cold: rsc: ldod2 (0x...) mode 7, set point, enable 1: TCS 2 completed after 1 ms (status ...; DRV-2 lock after 0 waits of 10 us)
+PianoDwc3: cold c3 rail vreg_l2d_0p88 (ldod2, M31 vdd, QMP vdda-phy): PPID 0x... before status 80 enable 80 880 mV (on); voted 880 mV, mode 7, enable: done; after ...: on
+PianoDwc3: cold c4 repeater: before status 80 enable 80 force 00/00 tune [51] .. ; enable, the tuning kept (it was on), device mode: written; after status 80 enable 80 ...: ready
+PianoDwc3: cold c5 PHY (M31: reset, the stock init): before [3c] 01 [50] 00 [54] 6b [64] 07 [94] 00, after 01 00 6b 07 00: ready
+PianoDwc3: cold: done: 3 rail votes, repeater ready, M31 ready; soft failures 0 (bit n: step cn)
+PianoDwc3: ... the takeover's stages 12-20 as before ...
+PianoDwc3: cold: link watch: no bus reset from a host within 15 s: a cold start (the wait doubles; at most 3 cold starts this boot, 1 so far)
+PianoDwc3: cold: link watch: a host reset the device: the watch ends (1 cold starts this boot)
+```
+
+### 17.6 Failure signs
+
+| Sign | Meaning, next step |
+|---|---|
+| `cold c1 FAILED: the USB30 GDSC does not power on` / `a USB branch clock does not come on` | GCC refuses (a vote elsewhere, a parent off): the `GCC branch ... stays off (...)` line names it; the boot goes on without the console |
+| `cold c2 FAILED: the core does not answer` | the core is unclocked behind a branch that reads on, or the block reset (bit 0x8) did not release it |
+| `cold c3 rail ...: NOT done` / `after ...: OFF` | the DRV-2 lock was held (the `rsc:` line names the holder), cmd-db has no such name, or the VRM refused: the repeater and the PHY then show it too |
+| `cold c4 repeater: its APID belongs to another execution environment` | the repeater cannot be written from EE 0: the inherited tuning and enable stay; report the line |
+| `cold c4 ...: NOT ready within 10 ms` | the repeater's supplies (c3) or its enable: compare the before/after bytes |
+| `cold c5 PHY ...: NOT ready` | the init's readback differs from its end state; stage 16 (soft reset) will tell whether its UTMI clock runs |
+| `FAILED at takeover: core soft reset` after a cold start | no UTMI clock from the PHY: c3 (l2d) and c5 are the suspects |
+| `cold: link watch: still no host after 3 cold starts` | the controller side is up; the path to the Mac is not: the DIO4485 (not touched), the cable, the Mac's accessory approval |
+
+### 17.7 Shared resources, power, sources
+
+- **Locks**: the GCC vote word `0x52020` (only GPLL0's bit, only ever set) under PianoA830's `sm8750_gcc_vote_owner`, and apps
+  DRV-2 under `sm8750_rpmh_drv2_owner`, both with this kext's tag `DWC3`. These are the words PianoTouch, PianoKeyboard, PianoWifi
+  and PianoBluetooth already take, and no new lock word was added. PianoA830 is now a library of `PianoDwc3.json` (it already linked
+  first). The three VRM resources are USB's alone (piano's DT has no other consumer). The repeater's SPMI writes need EE 0's APID.
+- **Power**: the rails' votes are never withdrawn (PianoWifi's rule). The three LDOs stay on while the boot runs, as they are after
+  ABL fastboot. A boot without the console (`piano-usb=0`) runs none of this.
+- **Sources** (nothing copied): the register facts and the order of the steps come from the Ubuntu piano kernel's
+  `phy-qcom-eusb2-repeater.c` (registers, init order, device/host mode), `phy-qcom-m31-eusb2.c` (bit names; rails, then repeater,
+  then reference clock, then reset, then tables), `dwc3-qcom.c` (the glue's block reset at probe), `gdsc.c` and `clk-rcg2.c` (bits)
+  and `gcc-sm8750.c` (offsets, GPLL0's vote, the GDSC's waits). All of these are GPL-2.0 and were read as the specification only.
+  The tables are this repository's: `kM31Init` (Project-SunUEFI's stock sequence, BSD-2-Clause-Patent, `UPSTREAM`), the repeater
+  tuning and the rails from piano's DT (board facts, the same on every unit). Reused from this repository: PianoBluetooth's
+  `BtRpmh.h`, PianoKeyboard's `CmdDb.h`, PianoPower's `ChargerPmic.h`/`SpmiObserver.h` (`UPSTREAM`).

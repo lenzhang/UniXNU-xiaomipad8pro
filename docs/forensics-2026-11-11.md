@@ -9,6 +9,11 @@ Status: an offline reading of the logs; nothing has run on the tablet since. Two
   equivalent (`out/ram-daily2`: the same kernel collection and seed, `data-persist=0`, a reset after 300 s) had passed 10 minutes
   earlier.
 
+**Update 2026-11-12.** (B) is settled as §6's first row. The installed ESP's console log, read back after the night, shows the
+system running for 2.4 h, while PianoDwc3 never saw a host (`no-host`, `link state 3, configuration 0`). The ESP stays. The fix is
+PianoDwc3's cold start (§7; `docs/drivers/usb-device-debug.md` §17), built and host-tested. It is to be proven from ABL fastboot by
+the RAM images C0-C8 (§7.3) before the ESP is rebuilt.
+
 Short answer: (A) is **not** a hang on the GPU_CC read. The bring-up had already returned successfully; the GPU_CC lines are a
 logger backlog. The system stopped about 1 s after the bring-up, at a place the asynchronous trace cannot show. For (B) the leading
 suspect is new: this was the first boot ever of PianoDwc3 and PianoPower on the normal (non-fastboot) boot path. The diagnostic
@@ -262,3 +267,96 @@ Store note: R0 writes nothing. R1, R1e and R3 open the installed store's window 
 | R3 stops with a `[<uptime>] t` access in flight for seconds, heartbeats going on | (A): a hung GPU access, now named | GPU fix at that step; keep any ESP without `piano-gpu=2` until then |
 | R3 stops with heartbeats stopping at the same time and the starter "inside IOLog" | (A): a system-level stall in or under the console path | console or system fix (`-v` off as a test: `PIANO_FAST_BOOT=1`); the ESP decision follows R1/R2 |
 | Everything passes (R1, R2, R3) and R4 shows the login screen | (B) 1a | keep; schedule the PianoDwc3 cold path |
+
+Result (2026-11-11, late): the first row. The installed system ran; only the console was missing (`results-2026-11-11.md`, "Later the
+same night"). The ESP is kept, and the cold path is §7.
+
+## 7. The fix (2026-11-12): PianoDwc3's cold start, proven from ABL fastboot
+
+### 7.1 What changed
+
+PianoDwc3 no longer trusts the state ABL fastboot happens to leave. Design, steps, lines and failure signs are in
+`docs/drivers/usb-device-debug.md` §17; the code is `package/PianoDwc3/UsbCold.h`, host-tested by `tests/usb_cold_host.cpp`.
+
+- **Inspection** (read only, every boot, every mode). Before the takeover the USB thread reads GCC (GDSC, branches, RCG rates,
+  GPLL0), the USB2 reference clock, the core (its role, and whether the firmware ever ran it as a device), the M31 PHY, the eUSB2
+  repeater, the three USB rails over SPMI, and the Type-C orientation (GPIO61; the PMIC's Type-C block only without PianoPower). It
+  prints `cold: inherited ...` lines and a verdict. On the next installed boot these lines answer what the normal path leaves.
+- **Decision** (`piano-usb-cold=auto`, the default): the cold start runs when the inherited state is not a running device
+  controller (11 named reasons). Every check is derived from the fastboot path's probe values, so on the fastboot path the verdict
+  is "a running device controller" and the takeover of before runs unchanged.
+- **Cold start** c1-c5: power (GDSC, GPLL0's vote under PianoA830's GCC vote lock, branches, RCGs, reference clock), stop (a running
+  device controller or xHCI; an opt-in block reset), rails (`ldod2`, `ldob15`, `ldob5` through RPMh DRV-2 under PianoA830's DRV-2
+  lock), the repeater (enable, the board's DT tuning when it was off, device mode), and the M31 PHY (reset plus the stock init). Then
+  the old takeover runs (UTMI as PIPE, soft reset, device role, VBUS/session override, RUN_STOP). The ADSP, the QMP PHY, the DIO4485
+  and the shared CX/MX and bandwidth votes are not touched.
+- **No hang, retries**: every poll is bounded. A failed takeover gets another cold start 2 s later, up to 3 per boot. The link
+  watch runs a cold start when no host resets the device within 15 s of RUN_STOP (then 30 and 60 s).
+- **Test hook and monitor**: `piano-usb-cold-sim=MASK` leaves the hardware the way the normal path may leave it before the decision
+  is taken. `usb cold [sim MASK]` does the same live from the console.
+- Arguments: `piano-usb-cold=0|1|auto` (auto), `piano-usb-cold-steps=MASK` (0x17), `piano-usb-cold-wait=S` (15),
+  `piano-usb-cold-sim=MASK` (0). `piano-usb-cold=0` is the takeover of before, plus the read-only `cold:` lines.
+
+### 7.2 The suspects on the normal path, and what covers each
+
+| # | Suspect | Evidence | Covered by | Reproduced from fastboot by |
+|---|---|---|---|---|
+| 1 | The repeater's rails (`vreg_l5b_3p1` drives the USB 2 side, `vreg_l15b_1p8`) and the M31's `vreg_l2d_0p88` never voted when ABL does not run USB | link state 3: the device sees an idle bus and the Mac never resets it, which is how a pull-up that does not reach the connector looks; the takeover passed the soft reset, so the M31 had a clock | c3 (votes, read back), then c4, c5 | `sim=16` |
+| 2 | The repeater disabled, or left in host mode (its 19.2 MHz clock forced) | as 1 | c4 | `sim=1` |
+| 3 | The M31 PHY not initialised (VBUS-valid/suspend bits) | a PHY without its UTMI clock would have failed stage 16; a configured clock with other bits off would not | c5 | `sim=2` |
+| 4 | The core left in the host role | the old takeover sets PRTCAPDIR itself: not the cause alone | reported (reason), c2 stops a running xHCI | `sim=4` |
+| 5 | Clocks or the GDSC off | excluded for this boot (stage 20 needs them); the worst case anyway | c1 | `sim=8` |
+| 6 | The DIO4485 mux, the EUD, the cable | not readable without an I2C transaction (writes to pins and QUP) | not covered: the link watch's `given up` line points here | — |
+
+### 7.3 The test session (RAM boots from ABL fastboot; nothing is written to any partition)
+
+Build the collection once (this tree), then one image per row. Data is volatile (`PIANO_DATA_PERSIST=0`), there is no GPU, and
+each image resets to ABL fastboot after 300 s (`piano-reset-to=bootloader` is added by `build-ram-images.py`):
+
+```sh
+tooling/k27/build-native-image.sh                     # out/k27/kc-k27-native.bin with this PianoDwc3 (out/ram itself is not used)
+cold_img() {   # cold_img NAME "ARGUMENTS"
+  PIANO_EXTRA_ARGS="piano-usb=2 piano-usb-hid=1 $2" PIANO_DATA_PERSIST=0 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300 \
+  python3 tooling/bootimg/build-ram-images.py --fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-k27-native.bin \
+    --trust out/inputs/kernel.macho.trustcache --seed out/inputs/scratch-data.img --adt out/adt/piano-k27.adt --utc "$(date +%s)" \
+    --out "out/ram-cold-$1"
+}
+cold_img C0  "piano-usb-cold=0"
+cold_img C1  ""
+cold_img C2a "piano-usb-cold=0 piano-usb-cold-sim=1"
+cold_img C2b "piano-usb-cold=0 piano-usb-cold-sim=16"
+cold_img C3  "piano-usb-cold-sim=1"
+cold_img C4  "piano-usb-cold-sim=16"
+cold_img C5  "piano-usb-cold-sim=2"
+cold_img C6  "piano-usb-cold-sim=31"
+cold_img C7  "piano-usb-cold=1 piano-usb-cold-steps=31"
+# each run: the capture first, then the loop (it reads the mailbox after the reset)
+python3 tooling/native/usb-console.py --capture 300 &
+tooling/native/native-loop.sh out/ram-cold-C3/boot-piano-macos-ram-A-bundled.img
+```
+
+| Step | Arguments (besides `piano-usb=2 piano-usb-hid=1`) | Expect | Meaning |
+|---|---|---|---|
+| C0 | `piano-usb-cold=0` | `cold: verdict (piano-usb-cold=0): ... a running device controller (none): taken as it is`, `cold: no link watch (piano-usb-cold=0)`, then enumeration as before | no regression, and the fastboot path's inherited values (the rails' PPIDs and set points, the repeater's `force_en_5`, GPIO61) recorded for the comparison with the normal path |
+| C1 | none (`auto`) | verdict `none`, the old takeover, enumeration, `link watch: a host reset the device: the watch ends (0 cold starts this boot)` | the default changes nothing on the fastboot path |
+| C2a | `piano-usb-cold=0 piano-usb-cold-sim=1` | `stage 20 running`, then no host: `idle: ... no-host ...; link state 3 (or 4), configuration 0` | the control: does a disabled repeater reproduce the installed ESP's symptom? |
+| C2b | `piano-usb-cold=0 piano-usb-cold-sim=16` | no host as in C2a, or `FAILED at takeover: core soft reset` (no M31 vdd); or enumeration if another master keeps the rails on (then the `inherited rail` lines read on) | the control for the rails |
+| C3 | `piano-usb-cold-sim=1` | verdict `the repeater is not enabled/ready; the repeater has the host-mode clock forced`, `cold c4 repeater: ... the board's tuning (DT) ... ready`, enumeration | the repeater step works |
+| C4 | `piano-usb-cold-sim=16` | verdict `a rail is off` (when nothing else votes them), `cold c3 rail ...: on` for all three, enumeration | the rails step works |
+| C5 | `piano-usb-cold-sim=2` | verdict `the USB2 reference clock is off`, `cold c5 PHY ...: ready`, `soft reset done`, enumeration | the PHY step works |
+| C6 | `piano-usb-cold-sim=31` | every reason; `cold c1 ...: the USB30 GDSC is collapsed`, `(5 switched on)`, both RCGs updated; c3-c5 ready; enumeration | the whole cold start from the worst state |
+| C7 | `piano-usb-cold=1 piano-usb-cold-steps=31` | `block reset (USB30_PRIM_BCR) done`, then the takeover and enumeration | the opt-in block reset works (the step for a controller the normal path left wedged) |
+| C8 | boot C1, then on the Mac `python3 tooling/native/usb-console.py --send 'usb cold sim 31' --capture 120` | the link drops, the Mac enumerates again within seconds, the replay has `cold restart (asked on the console)` and the c-lines | the live restart path, which the link watch also takes |
+
+C0-C1 are unattended. C2-C7 too: if an image does not enumerate, it still resets at 300 s, and `native-loop.sh` reads its mailbox.
+C8 needs the console attached. A hang in any of them shows the step: each c-line is printed before that step's writes.
+
+### 7.4 Decision after the session
+
+| Outcome | Next |
+|---|---|
+| C0, C1 enumerate; C3-C7 enumerate; C2a or C2b shows "no host" | the cause is reproduced and fixed: rebuild the daily ESP from this tree (`build-esp.py --profile daily`, `USING.md` §5), install it, and on its first boot run `usb-console.py --capture 600` (as R4). Expect `verdict ... NOT a running device controller (...)` or the link watch's cold start, then enumeration. Its `cold: inherited` lines record the normal path's state |
+| C0, C1, C3-C7 enumerate; neither C2 reproduces | the normal path's cause is not modelled. Rebuild anyway: the cold start and the watch cover more than before, and the installed boot's `cold: inherited` lines and verdict will name its state. If the console still fails there, the watch's `given up` line points at the DIO4485 / EUD path (§7.2 row 6) |
+| C1 fails where C0 enumerates | the auto decision or the watch misfires on the fastboot path; its verdict line names the reason. Fix that before any ESP |
+| C3-C7: a `cold cN FAILED` or `NOT ready`, or no enumeration | fix that step first. The installed ESP stays as it is (its system runs; only the console is missing) |
+| an image stops early (no reset at 300 s, a parked tablet) | button reset; the last `cold` line names the step and its access. Images go back to `piano-usb-cold=0` until it is fixed |
