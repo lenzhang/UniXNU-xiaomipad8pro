@@ -34,3 +34,29 @@ Specifications read, never copied:
     layouts), drivers/thermal/gov_step_wise.c (the shape of the thermal limit);
   - XNU (APSL-2.0, the k27 tree): processor_info's PROCESSOR_CPU_LOAD_INFO, thread_bind, reboot_kernel, IOPMrootDomain (why the
     thermal emergency sleep and the root domain's thermal warning are not used: docs/drivers/thermal.md section 5).
+
+B6, the board thermistors on the PMIC ADC (Ntc.h, AdcChannels.h, PmicAdc.h, BoardTemps.h, PianoThermalAdc.cpp,
+tests/adc_host.cpp, package/include/PianoBoardTemps.h, tooling/k27/check-adc-map.py, tooling/k27/check-ntc-curve.py; 2026-11-11):
+new code, no source file copied. Specifications only (no code, comment or table copied; GPL-2.0): the Ubuntu piano kernel
+(unixnu-research/ubuntu-ref/kernel, branch piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01):
+  - drivers/iio/adc/qcom-spmi-adc5-gen3.c (sha256 05eed2b8ff996ecc1f454fcf55f6fc2cef2a28af2fca6fac3b5b35ea96fc81bf) and
+    include/linux/iio/adc/qcom-adc5-gen3-common.h (sha256 1589c9d7fa861c7c04966cab55ee64a3d42a77c755f39d57b95fea1704bc09f4): the SDAM
+    byte layout, the immediate conversion on SDAM 0 channel 0, the handshake wait (150 x 100 us), the 501 ms conversion bound, the
+    status clear, the decimation and settle encodings, Gen4's SID/bus layout and its 0x8000-is-valid rule (Ubuntu's K:5812ec75bb03);
+  - drivers/iio/adc/qcom-vadc-common.c (sha256 a196dd0eb63dfee153284b60c4ea56ab4cf8ef64755f93b76b5149f6b53d4613): code -> resistance
+    (R = Rpu * code / (full scale - code), full scale 2^14 for Gen3, 0xffff for Gen4), the 100 kOhm pull-up, the part's name
+    (NTCG104EF104). Its adcmap7_100k table is not copied or stored: tooling/k27/check-ntc-curve.py reads it from a Linux tree at run
+    time to compare (docs/drivers/thermal.md 12.3: its temperatures are degrees C * 1024);
+  - drivers/spmi/spmi-pmic-arb.c (sha256 320e71b64915eb4e32be90b49fd65f12da2241e877bf4f68f0c0c1eb4ab3e28d): the v7 channel offsets,
+    command word, status bits, write data registers, the owner table, the 1000 x 1 us transaction wait, EE 0's choice among APIDs;
+  - drivers/nvmem/qcom-spmi-sdam.c (sha256 a684073c3d139e6a22fc5be1e1530f1c774dc6d2546a30594ec50c9a1f75eebb): SDAM memory from
+    0x40, the size register 0x44, the PBS trigger 0xe5;
+  - drivers/pinctrl/qcom/pinctrl-spmi-gpio.c (sha256 546efbe1601c05b7739b8c1fecd317b228a348699637a85aa59951eedaf87f51): PMIC GPIO
+    TYPE 0x10, MODE_CTL 0x40, EN_CTL 0x46 bit 7 (high-impedance when clear);
+  - arch/arm64/boot/dts/qcom/sm8750-xiaomi-piano.dts (sha256 79fe7c8009621e4fe00423a10218eacee6b92294ee978a5044026d0e05d127dd): the
+    thermistor pins, and that charger1_therm is on PMIH0108 GPIO 12, another EE's pin left high-impedance by the firmware.
+  The channel map itself is the piano boot DT's (out/inputs/piano-boot.dtb, sha256
+  50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840), checked by tooling/k27/check-adc-map.py at every build.
+  The thermistor curve is computed from the part's published parameters (R25 100 kOhm, B25/50 4250 K, B25/85 4311 K, the TDK
+  NTCG / Murata NCP 100 kOhm class) by a Steinhart-Hart fit (Ntc.h; tests/adc_host.cpp repeats the derivation); the SPMI facts are
+  also those of package/PianoPower/SpmiObserver.h and k27 0057 (this repository).
