@@ -29,7 +29,7 @@ The firmware (docs/kc-space.md, package/include/PianoFirmware.h): a macOS image 
 for both: PianoSensors takes only its entry, the firmware loader only its own), taken from PIANO_FW_DIR (default out/firmware, staged
 by the kexts' build scripts) after their size and SHA-256 are checked. The payload's ADT has the GpuAddon slot exactly when the
 payload has the addon: the input ADT's (made with --addon for PIANO_SENSOR_PACK), or added to the payload's copy when only firmware
-is carried. A collection without pins adds nothing, so the image is as before. PIANO_FW_ADDON=0 leaves the firmware out (the kexts
+is carried. A collection without pins adds nothing, so the image is as before. PIANO_FW_ADDON=1 carries the firmware (default 0 until proven on the tablet: the kexts
 then read the tablet's ESP); a pin whose file is not staged is left out with a note.
 """
 import argparse
@@ -171,7 +171,8 @@ def firmware_addon(payloads, kc, adt, addon):
         if problems:
             loud('pinned firmware not staged, left out of this image (the kexts then try the tablet\'s ESP):\n'
                  + '\n'.join(f'{fw.ESP_DIR}/{pin["path"]}: {why}' for pin, why in problems))
-        if found and os.environ.get('PIANO_FW_ADDON', '1') == '0':
+        # Opt-in (PIANO_FW_ADDON=1) until a tablet boot has shown DarwinBoot takes the addon with its ADT slot (video.md T0).
+        if found and os.environ.get('PIANO_FW_ADDON', '0') == '0':
             loud('PIANO_FW_ADDON=0: no firmware in this image\'s addon; the kexts read their files from the tablet\'s ESP')
             found = []
     if found:
