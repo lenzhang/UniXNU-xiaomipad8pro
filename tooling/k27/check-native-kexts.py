@@ -3,7 +3,7 @@
 loads in a native piano boot. Every descriptor linked into the native kernel collection must be this repository's (resolved from
 tooling/k27/kext/ into out/k27/kext/), its objects must be built from package/ into out/native-kexts/, and no bundle may be a
 DroidVM one. Code taken over from the VM era is allowed only as this repository's own package (with UPSTREAM), never by linking the
-archive's kext.
+archive's kext. A descriptor without objects is a codeless bundle: only personalities for classes of its com.apple.* libraries.
 
     check-native-kexts.py REPO DESCRIPTOR.json [...]          before the link: refuses the list
     check-native-kexts.py REPO --kc-log OUTPUT.log            after the link: refuses a collection with a DroidVM bundle in it
@@ -38,6 +38,14 @@ for name in args:
     bundle, objects = spec.get('bundle', ''), Path(spec.get('objects', ''))
     if BAD.search(bundle) or BAD.search(spec.get('name', '')) or any(BAD.search(p.get('IOClass', '')) for p in spec.get('personalities', {}).values()):
         fail(f'{path.name}: {bundle} is a DroidVM kext')
+    if 'objects' not in spec:
+        # A codeless bundle (kc-build.py: personalities for classes of the collection's own kexts, e.g. PianoUsbHostStack.json): no
+        # code of its own, so nothing to build; its personalities must name a collection kext (com.apple.*), never DroidVM's or ours.
+        for name_, personality in spec.get('personalities', {}).items():
+            owner = personality.get('CFBundleIdentifier', '')
+            if not owner.startswith('com.apple.') or BAD.search(owner) or owner not in spec.get('libraries', {}):
+                fail(f'{path.name}: codeless personality {name_!r} names {owner!r}, not one of its com.apple.* libraries')
+        continue
     if not objects.is_absolute() or not objects.resolve().is_relative_to(repo / 'out/native-kexts'):
         fail(f'{path.name}: its objects ({objects}) are not built from package/ into out/native-kexts')
 print(f'native kext rule: {len(args)} descriptors, all this repository\'s')

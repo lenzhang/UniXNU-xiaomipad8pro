@@ -1,0 +1,22 @@
+{
+  "name": "PianoUsbHostStandIn",
+  "bundle": "com.unixnu.driver.PianoUsbHostStandIn",
+  "version": "1.0.0",
+  "objects": "@OUT@/native-kexts/PianoUsbHostStandIn/objects.json",
+  "start": "_native_kext_start",
+  "stop": "_native_kext_stop",
+  "stands_in_for": [
+    "com.apple.driver.AppleSMC",
+    "com.apple.driver.RTBuddy",
+    "com.apple.driver.AppleA7IOP",
+    "com.apple.driver.AppleARMPMU",
+    "com.apple.driver.AppleEmbeddedTempSensor",
+    "com.apple.driver.AppleOnboardSerial",
+    "com.apple.iokit.IOSlowAdaptiveClockingFamily"
+  ],
+  "libraries": {
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0"
+  },
+  "personalities": {}
+}

@@ -1,0 +1,11 @@
+PianoUsbHostStandIn is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE): the stand-in for seven Apple SoC kexts Apple's USB
+host stack reaches through its libraries (docs/drivers/usb-host.md section 5.2). What it takes from other work, and from where:
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent: package/ARMPlatformStandIn/ARMPlatformStandIn.cpp (itself macOS-DroidVM's, see its
+UPSTREAM): the shape of a stand-in (classes no object belongs to, derived from IOService, and nothing else), re-written for these two.
+
+The kernel collection (Apple's 27.0.1 26A434 vma2 kernelcache): only kext names, their OSBundleLibraries, Info.plist matching
+dictionaries, and the link report of tooling/kc/build-kc-k27.sh (kc-build27-piano.py "stand-ins lack:" and "stand-ins for ...: N
+pointers and M branches rebound") give the names of the seven kexts and of the two metaclass symbols (AppleSMCFamily::metaClass,
+AppleOnboardSerialSync::metaClass). Their real superclasses, sizes and code are unknown and not needed: the kept kexts reference only
+the metaclasses (31 pointers, 0 branches rebound across both stand-ins). No Apple binary was disassembled or otherwise analysed.

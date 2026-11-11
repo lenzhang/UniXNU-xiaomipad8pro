@@ -5,8 +5,21 @@ set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
 K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
 LIST=$(sed -e 's/#.*//' "${PIANO_KEXT_LIST:-configs/k27-native-kexts.txt}" | awk 'NF {print $1}')
+# PIANO_USBHOST_STACK=1: Apple's USB host stack in the collection for PianoUsbHost level 6 (docs/drivers/usb-host.md H6, path A1):
+# PianoUsbHostStandIn (the seven Apple SoC kexts the stack reaches) and the codeless PianoUsbHostStack (its libraries keep AppleUSBXHCI,
+# IOUSBHostFamily, the hub, HID, mass storage and USB Ethernet; AppleUSBXHCI's personality on PianoUsbHostNub; the stack's IOResources
+# personalities behind the gate resource PianoUsbHostStack, which only piano-usbhost=6 publishes), ARMPlatformStandIn with
+# AppleARMPlatform's cable keys. The stack's kexts keep their collection addresses, which leaves no __DATA_CONST gap for PianoTouch
+# (485 KiB) after PianoA830 (it links first: PianoTouch imports its lock word), so PIANO_USBHOST_STACK_DROP (default PianoTouch: inert
+# without piano-touch=N) is left out. Checked after the link: tooling/k27/check-usbhost-stack.py.
+if [ "${PIANO_USBHOST_STACK:-0}" = 1 ]; then
+  export PIANO_USBHOST_STACK
+  KEPT=
+  for k in $LIST; do case " ${PIANO_USBHOST_STACK_DROP-PianoTouch} " in *" $k "*) echo "PIANO_USBHOST_STACK=1: $k left out" >&2 ;; *) KEPT="$KEPT $k" ;; esac; done
+  LIST="$KEPT PianoUsbHostStandIn PianoUsbHostStack"
+fi
 for k in $LIST; do   # the kexts' objects: tooling/k27/build-native-<name>.sh
-  case $k in ARMPlatformStandIn) b=standin ;; NativeUfs) b=ufs ;; NativeRamBlock) b=ram-block ;; NativeGopDisplay) b=gop-display ;; PianoDwc3) b=piano-dwc3 ;; PianoInput) b=piano-input ;; PianoNullEthernet) b=null-ethernet ;; PianoPower) b=piano-power ;; NativeSoftGpu) b=soft-gpu ;; PianoA830) b=piano-a830 ;; PianoBacklight) b=piano-backlight ;; PianoKeyboard) b=piano-keyboard ;; PianoWifi) b=piano-wifi ;; PianoAudio) b=piano-audio ;; PianoTouch) b=piano-touch ;; PianoThermal) b=piano-thermal ;; PianoUsbHost) b=piano-usbhost ;; PianoDpu) b=piano-dpu ;; PianoVideo) b=piano-video ;; PianoTorch) b=piano-torch ;; PianoSensors) b=piano-sensors ;; PianoBluetooth) b=piano-bluetooth ;; PianoPolicy) b=piano-policy ;; *) b= ;; esac
+  case $k in ARMPlatformStandIn) b=standin ;; NativeUfs) b=ufs ;; NativeRamBlock) b=ram-block ;; NativeGopDisplay) b=gop-display ;; PianoDwc3) b=piano-dwc3 ;; PianoInput) b=piano-input ;; PianoNullEthernet) b=null-ethernet ;; PianoPower) b=piano-power ;; NativeSoftGpu) b=soft-gpu ;; PianoA830) b=piano-a830 ;; PianoBacklight) b=piano-backlight ;; PianoKeyboard) b=piano-keyboard ;; PianoWifi) b=piano-wifi ;; PianoAudio) b=piano-audio ;; PianoTouch) b=piano-touch ;; PianoThermal) b=piano-thermal ;; PianoUsbHost) b=piano-usbhost ;; PianoDpu) b=piano-dpu ;; PianoVideo) b=piano-video ;; PianoTorch) b=piano-torch ;; PianoSensors) b=piano-sensors ;; PianoBluetooth) b=piano-bluetooth ;; PianoPolicy) b=piano-policy ;; PianoUsbHostStandIn) b=usbhost-standin ;; *) b= ;; esac
   [ -n "$b" ] || { echo "no build script for $k" >&2; exit 1; }
   tooling/k27/build-native-$b.sh > out/k27/build-native-$b.log 2>&1 || { grep -E "error:|Error" out/k27/build-native-$b.log | head; exit 1; }
 done
@@ -95,6 +108,10 @@ mkdir -p out/k27/kext; NATIVE=
 for k in $LIST; do sed "s#@OUT@#$D/out#" "tooling/k27/kext/$k.json" > "out/k27/kext/$k.json"; NATIVE="$NATIVE $D/out/k27/kext/$k.json"; done
 NATIVE="$NATIVE $EXTRA" \
   tooling/kc/build-kc-k27.sh "${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}" out/k27/kc-k27-native.bin > out/k27/build-kc.log 2>&1 || { tail -5 out/k27/build-kc.log; exit 1; }
+# Apple's USB host stack (PIANO_USBHOST_STACK=1) must be inert without piano-usbhost=6: gated personalities only.
+if [ "${PIANO_USBHOST_STACK:-0}" = 1 ]; then
+  python3 tooling/k27/check-usbhost-stack.py out/k27/kc-k27-native.bin >&2 || { rm -f out/k27/kc-k27-native.bin; exit 1; }
+fi
 # PIANO_TRUST / PIANO_SEED: another trust cache and Data seed for a test (e.g. tooling/k27/stage-soft-metal.py's, with a staged plugin).
 # The Data store (docs/data-store.md): out/ram opens it (data-persist=2) only when its seed is the installed one (PIANO_INSTALLED_SEED in
 # ~/.config/piano/env), else Data is volatile; build-ram-images.py prints which on stderr. PIANO_DATA_PERSIST=0|1|2 overrides it,
