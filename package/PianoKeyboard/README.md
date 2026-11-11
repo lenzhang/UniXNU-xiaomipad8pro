@@ -9,3 +9,6 @@ Status (2026-11-11): level 1 ran on the tablet once (logs/usb-console/20261111-0
 message)"), keyboard power / Caps LED / touchpad-on commands acknowledged, the 12 s keyboard-power keepalive running, the
 authentication request left unanswered. Nobody typed or touched the touchpad in that run, so no key or touchpad report has been
 seen yet; level 2 (macOS HID devices), the hall sensor and the DRV-2 lock have not run. Tonight's test: docs/drivers/keyboard.md §8.
+2026-11-12, offline and host-tested only: the touchpad tuned for macOS (declared resolutions, fine natural scrolling with an axis
+lock, taps, a typing guard, three-finger swipes off by default) and battery work (adaptive latch polling, the hall sensor at 500 ms,
+backlight off unless asked): keyboard.md §6a, §6b.

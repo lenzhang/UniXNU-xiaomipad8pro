@@ -2,8 +2,9 @@
 
 Status, 2026-11-11: built and linked (inert without `piano-keyboard`). Level 1 ran once on the tablet (240 s, nobody typed):
 MCU booted, cover attached, commands acknowledged. No key or touchpad report seen yet; level 2, the hall sensor and the
-DRV-2 lock not run. Sources: `package/PianoKeyboard` (design and boot arguments at the top of `PianoKeyboard.cpp`, the
-codec in `Wn8030Piano.h`, provenance in `UPSTREAM`). Template: `README.md`.
+DRV-2 lock not run. 2026-11-12 (offline, host-tested, not run): the touchpad tuned for macOS (§6a) and the battery work (§6b).
+Sources: `package/PianoKeyboard` (design and boot arguments at the top of `PianoKeyboard.cpp`, the codec in `Wn8030Piano.h`, the
+descriptors in `HidDescriptors.h`, provenance in `UPSTREAM`). Template: `README.md`.
 
 ## 1. Purpose and gate
 
@@ -52,9 +53,11 @@ PianoInput's IOHIDDevice pattern; PianoPower's software I2C and RPMh vote; Piano
 ## 5. IOKit family / ABI
 
 Two `PianoKeyboardHID` (IOHIDDevice) under the service, vendor 0x1af4 product 0x504b: "Piano Keyboard Cover" (keyboard report 5
-+ consumer report 6, LED output report 5 → Caps LED) and "Piano Keyboard Touchpad" (7-byte relative mouse: buttons, X, Y, wheel,
-AC Pan). `tooling/k27/kext/PianoKeyboard.json`'s codeless IOHIDEventDriver personality binds them. The DRV-2 owner word comes
-from PianoA830 (a library of the descriptor).
++ consumer report 6, LED output report 5 → Caps LED; also the gestures' Control + arrow) and "Piano Keyboard Touchpad" (7-byte
+relative mouse: three buttons, X, Y, wheel, AC Pan, with physical extents that declare its resolutions, §6a).
+`tooling/k27/kext/PianoKeyboard.json`'s codeless IOHIDEventDriver personality binds them. The DRV-2 owner word comes from PianoA830
+(a library of the descriptor). PianoDwc3's USB keyboard/pointer share `HidDescriptors.h`'s keyboard and plain pointer descriptors,
+which are unchanged.
 
 ## 6. Boot args
 
@@ -68,8 +71,56 @@ from PianoA830 (a library of the descriptor).
 | `piano-keyboard-hall=0` | 1 | do not read gpio80 |
 | `piano-keyboard-lid=1` / `2` | 0 | tell IOPMrootDomain the hall state as a clamshell: 1 with clamshell sleep disabled first, 2 with it allowed |
 | `piano-keyboard-touchpad=V` | 1 | touchpad command value on attach (2: not sent) |
-| `piano-keyboard-backlight=P` | 50 | backlight on attach (over 100: not sent) |
-| `piano-keyboard-raw=0`, `-tap=0`, `-invert=B`, `-divide=D`, `-mouse=0`, `-halfbit=US`, `-poll=MS`, `-rails=0` | | see `PianoKeyboard.cpp` |
+| `piano-keyboard-dpi=N` | 400 | pointer resolution declared to macOS (120..4000); lower = faster |
+| `piano-keyboard-divide=D` | 1 | touchpad counts per pointer count |
+| `piano-keyboard-scroll=C` | 5 | touchpad counts per wheel / AC Pan count; higher = slower scrolling |
+| `piano-keyboard-scroll-res=R` | 90 | scroll resolution declared to macOS (10..900; 0 none: macOS's 9) |
+| `piano-keyboard-scroll-invert=1` | 0 | scroll against macOS's natural setting |
+| `piano-keyboard-gestures=1` | 0 | three-finger swipes as Control + arrow (Mission Control, App Exposé, Spaces) |
+| `piano-keyboard-tap=0` | 1 | no tap-to-click (on: 1 finger left, 2 right, 3 middle; no drag lock) |
+| `piano-keyboard-typing=MS` | 250 | touches starting within MS of a key going down are ignored (0: off) |
+| `piano-keyboard-backlight=P` | 0 | keyboard backlight on attach, 0..100 (over 100: not sent) |
+| `piano-keyboard-backlight-idle=S` | 0 | backlight off after S s without a key or touch, back at the next |
+| `piano-keyboard-poll=MS` / `-idle-poll=MS` / `-slow-poll=MS` | 4 / 30 / 200 | latch poll while reports flow / idle / detached or closed |
+| `piano-keyboard-raw=0`, `-invert=B`, `-mouse=0`, `-halfbit=US`, `-rails=0` | | see `PianoKeyboard.cpp` |
+
+## 6a. The touchpad on macOS (2026-11-12)
+
+macOS (IOHIDFamily, read as a reference) takes a HID pointer's resolutions from the descriptor: `IOHIDEventService::
+determineResolution` divides the relative X element's and the Wheel's logical range by their physical range (counts per inch;
+400 and 9 when no extents are given), and the HID event system's pointer and scroll acceleration work in those units.
+`IOHIDEventDriver` reads Wheel and AC Pan as whole counts and does not implement the Resolution Multiplier feature. So:
+- **Speed.** One pointer count per touchpad count (865 per inch of finger travel) declared as 400 dpi: macOS's mouse
+  acceleration with 2.2 times a mouse's travel, for a 94 mm pad. System Settings' tracking speed applies; boot-time tuning is
+  `piano-keyboard-dpi` (lower = faster).
+- **Scrolling.** Two fingers; one wheel count per 5 touchpad counts (~0.15 mm) declared at 90 per inch: macOS's former line
+  step comes in ten parts at the same speed (smooth, not line-by-line). Direction: fingers up = wheel up, which under macOS's
+  "natural scrolling" (on by default, one setting for every device) moves content with the fingers, as a Mac trackpad does; with
+  natural scrolling off it is the traditional direction, again as on a Mac. `piano-keyboard-scroll-invert=1` flips both axes. The
+  axis locks after 1.2 mm when one is at least twice the other (straight vertical scrolling, no sideways drift); a diagonal start
+  stays free. No inertia (the risk of a runaway scroll without a way to stop it).
+- **Clicks.** Taps on: one finger left, two right, three middle; a press is left, or right when it starts with two fingers; the
+  pad's second button right. No drag lock. 50 ms without motion after a press changes (a clickpad moves under the press).
+- **Typing.** A touch that starts within 250 ms of a key going down is ignored (palm or thumb while typing); its press still clicks.
+- **Gestures.** Three fingers moving 9 mm along one axis, once per touch: up Mission Control (Control+Up), down App Exposé
+  (Control+Down), left the Space to the right (Control+Right), right the Space to the left (Control+Left), sent through the
+  keyboard device (Control, Control+arrow, Control, release). **Off by default**: the touchpad has sent no frame yet, so whether
+  its contact count is reliable is only inferred (Linux's hid-multitouch needs it to be). With gestures off three fingers
+  scroll, and every touch line still names a recognised swipe (`three-finger swipe up (...)`): when tonight's (a) shows three
+  fingers counted cleanly, `piano-keyboard-gestures=1` (and later the default) is safe. Four fingers: not done (three slots).
+
+## 6b. Battery (2026-11-12)
+
+The serving loop has no interrupt; it sleeps, then reads gpio97's latch, which keeps an edge that comes during the sleep. It
+sleeps 4 ms while reports flow (2 s after the last frame or edge), 30 ms while the cover is attached and open (the first
+keystroke after a pause waits at most that), 200 ms while it is detached or the hall sensor says closed; the insurance read
+without an edge goes to 5 s / 10 s idle / slow. A minute of the model with 10 s of typing: ~4,600 wakeups instead of 15,000;
+detached: 300. `PianoKeyboard: idle: N wakeups in 60 s (...)` every minute for five minutes, then every tenth. The wait is one
+function (`waitForEdge`), so a GPIO interrupt (a shared TLMM helper) replaces only it. A read without an edge now needs gpio97
+seen low at the previous wakeup (a line that idles high made every 4 ms poll an I2C read). The hall sensor is sampled every
+500 ms. The backlight is off unless `piano-keyboard-backlight=P` (Linux's `nanosic::kbd_backlight`, 0..100); the cover's
+keyboard-brightness keys, if it sends consumer 0x79/0x7a/0x7c, step it by 10; `piano-keyboard-backlight-idle=S` turns it off when
+idle. Display sleep is not used (natively only NativeGopDisplay knows it). The mic-mute LED stays off (nothing in macOS drives it).
 
 ## 7. Build, kernel collection, RAM image
 
@@ -97,11 +148,16 @@ PIANO_EXTRA_KEXTS=$KB PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=1200 \
   PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-power=1 piano-keyboard=2 piano-keyboard-auth=1" \
   tooling/k27/build-native-image.sh && python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
 rm -rf out/ram-kbd-auth && cp -R out/ram out/ram-kbd-auth
+# (d) the login image with the three-finger gestures on (2026-11-12 touchpad and battery work)
+PIANO_EXTRA_KEXTS=$KB PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=1200 \
+  PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-power=1 piano-keyboard=2 piano-keyboard-gestures=1" \
+  tooling/k27/build-native-image.sh && python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
+rm -rf out/ram-kbd-touchpad && cp -R out/ram out/ram-kbd-touchpad
 ```
 
 Each run: terminal 1 `python3 tooling/native/usb-console.py --capture 1500` (live log, saved in `logs/usb-console/`);
 terminal 2 `tooling/native/native-loop.sh out/ram-kbd-raw/boot-piano-macos-ram-A-bundled.img` (then `ram-kbd-login`,
-`ram-kbd-auth`). Afterwards `grep -a PianoKeyboard logs/usb-console/<newest>-port0.txt`.
+`ram-kbd-auth`, `ram-kbd-touchpad`). Afterwards `grep -a PianoKeyboard logs/usb-console/<newest>-port0.txt`.
 
 **(a) level 1.** After "cover ATTACHED" (~10 s after the kext starts): type `a`, Shift+`a`, `1`, Caps Lock, a volume/brightness
 key, Right Ctrl+`1`; then one-finger swipes left/right/up/down, a tap, a two-finger tap, a two-finger scroll, a press; close the
@@ -124,7 +180,15 @@ DRV-2 lock taken (tag 'KBRD') after N waits` (a wait for `0x41383330 ('A830')` i
 
 **(c) auth.** `auth request (answered as Linux with its helper)`, `auth: sent auth init (MIAUTH): ok`; if the cover goes on:
 `auth init ... (not logged)`, `auth: sent auth s3t1 ...`, `auth challenge ...`, `auth: the cover's challenge ...: not sent`.
-Pass = keys and pointer still work after it (the exchange ends unanswered; compare the backlight with (b)).
+Pass = keys and pointer still work after it (the exchange ends unanswered).
+
+**(d) the touchpad features** (in (b), or an image with `piano-keyboard-gestures=1` added to (b)'s `PIANO_EXTRA_ARGS`): the
+start line `touchpad: 400 dpi declared (1 counts per pointer count), scroll 5 counts per wheel count at 90 per inch, natural
+scrolling, taps on, typing guard 250 ms, ...`; a two-finger scroll moves page content with the fingers in small steps; three
+fingers up/down/left/right give `touch gesture N: 3 fingers, ... three-finger swipe up (Mission Control, Control+Up)` and, with
+gestures on, `gesture N: three-finger swipe up (...): sent` and Mission Control on the panel; a tap clicks, two fingers right-click;
+touching while typing gives `ignored (typing)`. Battery: `idle: N wakeups in 60 s (... idle at 30 ms ...)` with N about 2,000
+while idle and about 300 with the cover detached or closed (15,000 before).
 
 Failure lines and what they mean:
 - `rails: ldob11: the DRV-2 lock stayed held by 0x... ('A830') for 2 s` → the GPU kept the lock (its own hang); run (a) first.
@@ -154,6 +218,10 @@ volume/power keys (PianoInput). A hang is a reset (`piano-reset-after`, the Guny
 3. The hall sensor's level and polarity, and whether a closed folio presses keys: (a).
 4. Kinds a4, 28, 01 and bit 1 of the attach byte: more captures.
 5. Clamshell (`piano-keyboard-lid`) and Linux's input-off-while-closed policy: after native sleep exists.
+6. Whether 400 dpi / 5 counts per wheel count feel right, and the scroll direction under natural scrolling: (d), then the
+   defaults move.
+7. Whether the contact count is clean enough for gestures on by default: (a)'s three-finger lines.
+8. Whether the cover sends keyboard-brightness consumer usages at all: (a)'s `consumer` lines.
 
 ## 11. Licence note
 

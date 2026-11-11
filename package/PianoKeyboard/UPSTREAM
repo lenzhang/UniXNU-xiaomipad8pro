@@ -53,6 +53,13 @@ sum of bytes 2..66, each vendor message's own sum, the ack (kind 0xf0) and state
 piano's boot DT (v1.1.0 piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840): gpio-keys
 switch-lid on TLMM gpio80, EV_SW/SW_LID, GPIO_ACTIVE_LOW (the hall sensor).
 
+Read as a reference only (Apple Public Source License; nothing copied): IOHIDFamily as fetched by UniXNU
+(unixnu-research/UniXNU/out/feeds/IOHIDFamily-f53ac321): IOHIDEventService::determineResolution and its defaults (400 dpi, 9 for
+scrolling), IOHIDEventDriver::handleScrollReport (whole Wheel / AC Pan counts, AC Pan negated, no Resolution Multiplier), the HID
+event system's pointer and scroll accelerators (IOHIDPointerScrollFilter, IOHIDAcceleration*: resolution-normalised): the facts
+behind HidDescriptors.h's makeTouchpadDescriptor and the Pointer defaults. Behaviour only, from libinput's documentation (MIT):
+disable-while-typing and tap button mapping (one, two, three fingers: left, right, middle), as the typing guard and the taps.
+
 The MCU image (MCU_Upgrade.bin, stock OS3.0.303.0 odm_a, 83,436 bytes, sha256
 c03d6b650cb85a983359c6686d831875df10ee1206fd31afc1403baefeb7e407) is Xiaomi/Nanosic's and is never committed: the build copies the
 pinned file into the ignored out/native-kexts/PianoKeyboard/firmware and embeds it from there.
