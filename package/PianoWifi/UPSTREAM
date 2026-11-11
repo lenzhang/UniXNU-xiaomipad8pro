@@ -1,5 +1,5 @@
-PianoWifi is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1 only: a read-only survey. What it takes from other
-work, and from where:
+PianoWifi is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Levels 1 (read-only survey), 2 (power), 3 (the PCIe0 link)
+and 4 (the firmware over MHI). What it takes from other work, and from where:
 
 UniXNU-sheng (unixnu-research/UniXNU-sheng, main 00ba90984e831e4c6ce30ec3d8a56e6434e9f1af), BSD-2-Clause-Patent (LICENSE sha256
 5b1d3d911103cb0f41641ec0964c5ac1f7e229f57aa072b6ac38bae913a1307b; SM8550 + WCN7850, the Wi-Fi path hardware-verified there per its
@@ -17,7 +17,39 @@ bb40a62361e06870348cd66eecca0634fb0e48d36a60afcb3f3acb0035ab3cd2):
   Facts only, cross-checked against mainline Linux (below) where mainline has them: the SM8750 PCIe0 GDSC, collapse vote, branch
   CBCR / vote bit / hardware-gating table, BCRs, RCGs and pipe mux; the v7 PHY layout; the LDO page rule 0xc0 + n on SM8750's
   PMICs (its running DT's OCP notifier names); the PMK8550 gpio3 sleep clock pin; gpio19 / 202 / 203; the cmd-db names of the
-  supplies and the PCIe NoC BCM (SN4). Board values of the 13T (its rails, PPIDs, PHY sequence) are not piano's and are not used.
+  supplies and the PCIe NoC BCM (SN4); the PARF offsets of the SM8550 programming model, the BDF-to-SID hash rule (CRC-8,
+  polynomial 7, high byte first) and the chip's BAR0 remap window register (0x3278 for 0x110e). Board values of the 13T (its rails,
+  PPIDs, pin states) are not piano's and are not used: every rail, voltage range and pin of levels 2 and 3 comes from piano's own
+  boot DT.
+  Also taken, with its provenance question recorded in WifiPhySeq.h and docs/drivers/wifi.md section 10.4:
+    PaganiWifiTables.h phy::kSequence (the 128 writes of the QMP v7 PHY initialisation, which PaganiWifi read out of the 13T's
+    running device tree property qcom,phy-sequence) -> WifiPhySeq.h kPhySequence, the same offsets and values in the same order.
+    It is not mainline's GPL table (it differs in five writes, which PaganiWifi lists), it reached this repository through
+    BSD-licensed code, and each entry is a register value; whether a vendor DT sequence and Qualcomm's own driver tables are
+    "independent" cannot be settled from here, and the alternative (reading the sequence from piano's own stock DT at run time) is
+    written down in wifi.md.
+  Design re-expressed, no code copied (the structures and names are ours; the steps and their order are theirs):
+    WifiBringup.cpp powerOn / linkUp / endpoint (sha256 bb40a62361e06870348cd66eecca0634fb0e48d36a60afcb3f3acb0035ab3cd2)
+      -> WifiBringup.h powerUp / linkUp: the order rails -> WLAN_EN -> GDSC -> clocks -> resets -> PARF -> PHY -> BDF-to-SID ->
+      root port -> PERST# -> LTSSM -> L0 -> configuration window -> memory window -> BAR0, the "a vote only adds" rule for the
+      rails, the pin-write order (level, configuration, level again, from sheng's setPin), PERST# low for at least 100 ms, and the
+      idea of a portable sequence over callbacks so that a host model checks the order and the values.
+    MhiBoot.c / MhiBoot.h (sha256 32b78ccb4e127b52296d34f4be4b431b9d311c105296b66c799d6d247b653b92,
+      0a5bbf7c07cd2022e2e5e8e219526540a009d37743ddd381936169baf63634e6; themselves ported from UniXNU-sheng package/MhiBoot.c,
+      sha256 9743ba00f26520b9322eba71ff3721d77216e3882dedbec23757d20b645f3c67) -> WifiMhi.h: the BHI/BHIe phase machine (PBL check,
+      reset on a system error, the image doorbell, READY, the contexts, M0, the vector table, mission mode), the firmware file's
+      split rule (a second ELF at the boot loader's size), and the register and bit facts.
+    WifiMhiLoad.c (sha256 947df29b8f0cf3c158f528dae86ab8e58abcca631627fe2133a4bd72fb65d15d) -> WifiMhi.h mhiContextsPlan /
+      mhiContextsProgram / mhiEventAck: 128 channel contexts left disabled, two event rings (32 on vector 1, 256 on vector 2), the
+      primary command ring, the host address range 0..2^36-1, and giving the device its contexts both before the boot loader starts
+      and again after it resets the registers.
+    WifiDma.c / WifiDma.h (sha256 6e7f0311e724d424723c7edc0117fdb85c7ba41931b42eb0a2fef1aad57c2115) -> WifiMhi.h Arena: one
+      contiguous window, every buffer aligned to its own size rounded up to a power of two (sheng saw the boot loader refuse an
+      image buffer that was only page aligned). Ours is a bump allocator, not their first-fit list with merging: level 4 never
+      frees a buffer.
+    PaganiWifi.cpp dmaWindow / cleanToPoc / chipAt (part of sha256 of the file in that tree) -> PianoWifi.cpp dmaWindow,
+      cleanToPoc, chipRead: a 36-bit contiguous buffer whose cacheable alias is cleaned once and then only reached through a
+      write-combined mapping, and the chip's register window arithmetic.
 
 UniXNU-piano (this repository), BSD-2-Clause-Patent:
   package/PianoPower/SpmiObserver.h (sha256 4805d4fb7af91c210d75b9791e125f3789b7671e895afe6f80af27a36a849b07) -> SpmiObserver.h:
@@ -25,12 +57,28 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
   package/PianoKeyboard/CmdDb.h (sha256 794cf39c76e2c903d79cc1146ae25d946946862daa9b8848d616e9ad8107c716): cmdDbFind re-expressed
     in WifiSurvey.h (same layout, 64-bit sizes), and its way of reading cmd-db (one mapping, copied out word by word).
   package/PianoDwc3/SmmuStream.h (sha256 8f566938f259730d15407aa2d84abb3f6ec3b06c7bf3dabaef78c7e7fbb930a3): the SMMU geometry
-    checks and the stream-match decode, re-expressed read-only in surveySmmu (no plan, no write).
+    checks and the stream-match decode, re-expressed read-only in surveySmmu (no plan, no write); and copied byte for byte as
+    SmmuStream.h but for its first three lines (the namespace pianousb -> pianowifi and one provenance line), which level 3 uses for
+    stream 0x1401. PianoDwc3 is not modified.
+  package/PianoPower/FatVolume.c (sha256 6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779) and FatVolume.h
+    (sha256 a438bcc5519bacfbfa6b6c55646fe4a3f7787f37a50c52103d8094c6871b67e7) -> FatVolume.c / FatVolume.h: copied byte for byte but
+    for two added provenance lines each (the build script checks they have not drifted). PianoPower is not modified.
+  package/PianoPower/PianoAdspFirmware.c (sha256 85dade1f9003e9acd80c1bfeb9799c57350f57b73df2267fe52d27fb38f78793): how the
+    firmware partition is read (NativeUfs's GPT lookup, 4096-byte block reads, one block cached for the ends of a range, FatVolume
+    over them), re-expressed in WifiFirmware.c for the Wi-Fi files; nothing of the MDT / segment logic is used.
+  package/PianoKeyboard/PianoKeyboard.cpp and package/PianoPower/PianoAdsp.cpp (the DRV-2 lock and the active-TCS transaction, both
+    hardware-verified on piano): the same protocol in PianoWifi.cpp vrmLocked / hwVrm (up to three commands of one VRM resource per
+    transaction), and PianoTouch.cpp's protocol for the GCC vote lock word in hwVoteLock. The lock words themselves are
+    PianoA830's (adreno830/platform/sm8750/Sm8750Rpmh.h, Sm8750GpuPower.c); PianoWifi only declares them, as those drivers do.
 
 Specifications only (no code, comment or table copied): mainline Linux drivers/clk/qcom/gcc-sm8750.c and tcsrcc-sm8750.c,
 include/dt-bindings/clock/qcom,sm8750-gcc.h, drivers/pci/controller/dwc/pcie-qcom.c and pcie-designware.h,
 drivers/phy/qualcomm/phy-qcom-qmp-pcie.c and phy-qcom-qmp-pcs-v7.h, drivers/pinctrl/qcom/pinctrl-sm8750.c (register offsets, bit
 positions, the DesignWare LTSSM L0 value); Project-SunUEFI (unixnu-research/Project-SunUEFI) patches/linux/7.3/0001-platform.patch,
 a GPL-2.0 kernel patch read for facts only (the WCN7861 supply voltage ranges in WifiHw.h's comment); the piano boot DT
-(out/inputs/piano-boot.dtb); ARM IHI 0062 (SMMUv2: SMR, S2CR, IDR0/IDR1). Not read and not used for anything: any Qualcomm
-binary (no reverse engineering of vendor firmware or drivers).
+(out/inputs/piano-boot.dtb), which is where every rail, voltage range, pin, window and stream of levels 2 to 4 comes from; ARM IHI
+0062 (SMMUv2: SMR, S2CR, IDR0/IDR1); the MHI specification's register and state names as mainline drivers/bus/mhi and the vendor
+MHI host use them (behaviour only, no code, comment or table). Not read and not used for anything: any Qualcomm binary (no reverse
+engineering of vendor firmware or drivers). The firmware itself is never part of this repository: level 4 reads
+image/peach/amss20.bin out of the tablet's own modem_a partition at run time (LicenseRef-Proprietary-Firmware, no
+redistribution).

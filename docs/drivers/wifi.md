@@ -1,8 +1,11 @@
 # Wi-Fi: Qualcomm WCN7860 ("peach", PCI 17cb:110e) on PCIe0: PianoWifi
 
-Status: design + level 1 code, 2026-11-11. `package/PianoWifi` level 1 (read-only survey) is built, host-tested and linked into the
-native KC (kernel 0059: "10 native kexts linked, none from DroidVM", PianoWifi 360 pointers), inert without `piano-wifi`; the §8.1
-test image verifies PASS; **not run on hardware**. Levels 2 and up are design only. Template: `README.md`.
+Status: design + levels 1–4 code, 2026-11-11. `package/PianoWifi` carries level 1 (read-only survey), level 2 (power sequencing),
+level 3 (PCIe0 root-complex bring-up to a config-space read of `17cb:110e`, BAR0 and the SMMU stream) and level 4 (MHI: the
+firmware over BHI/BHIe to mission mode). All four are built, host-tested (`tests/wifi_host.cpp`, `tests/bringup_host.cpp`) and
+linked into the native KC (kernel 0060: "12 native kexts linked, none from DroidVM", PianoWifi 471 pointers), inert without
+`piano-wifi`; **nothing above level 1 has run on hardware**, and each level must be read from a boot's log before the next one is
+tried (§8.2–§8.5). Levels 5 and up (QMI, WMI, scan, join, the macOS side) are design only. Template: `README.md`.
 
 ## 1. Purpose and gate
 
@@ -33,7 +36,7 @@ chip); SUN = Project-SunUEFI `patches/linux/7.3/` (GPL patches, facts only); INV
 | Resets | `PCIE_0_BCR` `0x6b000`, `PCIE_0_PHY_BCR` `0x6c01c` (+ link_down, nocsr, phy 0x6f000.. for the record) | GCC | verified (source) |
 | Pins (TLMM) | WLAN_EN gpio16 (pull-down, output low in `wlan-en-state`), SW_CTRL gpio18 (input from the chip), PERST# gpio102 (active low, pull-down), CLKREQ# gpio103 (`pcie0_clk_req_n`, pull-up), WAKE# gpio104 (active low, pull-up); BT_EN is PMIC gpio3 of `pmic@5` (pm8550ve "f") | DT | verified (DT); levels: needs-boot |
 | PMU supplies | `qcom,wcn7860-pmu`: vddio `vreg_l3f_1p8`, vddio1p2 `vreg_l2f_1p2`, vddaon `vreg_s5f_0p88`, vdddig `vreg_s4d_0p88`, vddrfa1p2 `vreg_s7i_1p31`, vddrfa1p8 `vreg_s3g_1p86` (RPMh: ldof3, ldof2, smpf5, smpd4, smpi7, smpg3); no other consumer of the six in piano's DT. The PMU's 10 LDO outputs feed the chip's vddaon/wlcx/wlmx/rfa/pcie inputs | DT | verified |
-| Voltages the chip needs | S5F 876–1000 mV, S4D 876–1036 mV, S7I 1312–1340 mV, S3G 1860–2000 mV; the stock RPMh minimums are lower (500/500/1224 mV): level 2 votes voltages, not just enables | SUN 0001 | inferred (other board, same chip) |
+| Voltages the chip needs | piano's own DT ranges of the four SMPSs: S5F 876–1000 mV, S4D 876–1036 mV, S7I 1312–1340 mV, S3G 1864–2000 mV (the two LDOs are fixed at 1800 and 1200); SUN's WCN7861 votes agree but for S3G (1860). Level 2 asks for the range's minimum, which is what the chip needs, and never for more than its maximum | DT, SUN 0001 | verified (DT ranges); the chip's own need: inferred |
 | PHY supplies | vdda-phy `vreg_l1f_0p88` (always-on), vdda-pll `vreg_l3g_1p2` (also the UFS PHY's PLL supply: on while NativeUfs runs) | DT | verified |
 | Reference / sleep clock | piano's DT names no clock for the PMU; mainline's MTP DT names `RPMH_RF_CLK1`; PAGANI and sheng drive PMK8550 gpio3 (32 kHz "alt_sleep_clk") | DT, mainline, PAGANI | **needs-boot** (open question 3) |
 | SMMU | `iommu-map`: requester 0 → SID `0x1400`, requester `0x100` (the chip) → `0x1401`; apps SMMU `0x15000000` (83 banks, 128 pages); the PARF's BDF-to-SID table (`0x2000`, CRC-8 hash, bypass bit `0x2c00`[0]) must route RID 0x100 | DT, PCI, SUN docs | verified (DT); firmware's entries: needs-boot (level 1) |
@@ -62,15 +65,15 @@ Ubuntu tree (SUN's 0003 has the same shape). Behaviour only; GPL-2.0, nothing co
 | Piece | Where | Licence | Use |
 |---|---|---|---|
 | Stage ladder `wifi=1..6`: survey, rails + WLAN_EN + domains + clocks + PHY + PERST# + LTSSM, endpoint/BAR/MHI, firmware over MHI, the stack | UniXNU-sheng `package/WifiProbe.cpp` 00ba909 (SM8550; on iPadOS 27 hardware-verified through scan, WPA2 association, DHCP and traffic) | BSD-2-Clause-Patent | the shape of the ladder and the read gates (level 1 re-implements them); its SM8550 addresses are not piano's |
-| The same ladder for **SM8750 + 0x110e**: GCC/PARF/PHY offsets, the 128-write v7 PHY sequence of the 13T's vendor, BDF-to-SID, DMA window, BAR placement, own MHI boot, RDDM | PaganiWifi 3d570b7 (`PaganiWifiTables.h`, `WifiBringup.cpp`, `MhiBoot.c`, `WifiMhiLoad.c`, `WifiDma.c`) | BSD-2-Clause-Patent | **the main donor for levels 2–5** (with UPSTREAM); every value re-checked against piano's DT (its rails/PPIDs/pins are the 13T's) |
-| MHI BHI/BHIe boot state machine | sheng `MhiBoot.c/h`, PaganiWifi `MhiBoot.c` | BSD | level 5 |
-| QRTR v1 + QMI header/TLV codec, name service | `package/PianoPower/QcomQrtr.c/h` (from sheng, hardware-verified on piano's ADSP path) | BSD | level 6 (copied into PianoWifi with UPSTREAM; PianoPower is not modified); the WLFW messages are written fresh |
+| The same ladder for **SM8750 + 0x110e**: GCC/PARF/PHY offsets, the 128-write v7 PHY sequence of the 13T's vendor, BDF-to-SID, DMA window, BAR placement, own MHI boot, RDDM | PaganiWifi 3d570b7 (`PaganiWifiTables.h`, `WifiBringup.cpp`, `MhiBoot.c`, `WifiMhiLoad.c`, `WifiDma.c`) | BSD-2-Clause-Patent | **the main donor for levels 2–4** (with UPSTREAM; what was taken and what was re-expressed: `package/PianoWifi/UPSTREAM`); every value re-checked against piano's DT (its rails/PPIDs/pins are the 13T's) |
+| MHI BHI/BHIe boot state machine | sheng `MhiBoot.c/h`, PaganiWifi `MhiBoot.c` | BSD | level 4 (`WifiMhi.h`, re-expressed in this namespace) |
+| QRTR v1 + QMI header/TLV codec, name service | `package/PianoPower/QcomQrtr.c/h` (from sheng, hardware-verified on piano's ADSP path) | BSD | level 5 (copied into PianoWifi with UPSTREAM; PianoPower is not modified); the WLFW messages are written fresh |
 | cmd-db lookup, RSC layout, RPMh active request | PianoKeyboard `CmdDb.h`, PianoPower `QcomRpmh.c`, PianoA830 `Sm8750Rpmh.h` | BSD / MIT (Adreno830) | level 2 rail votes, **inside the DRV-2 lock `sm8750_rpmh_drv2_owner`** (f53192b) |
 | GCC vote lock for `0x52000`/`0x52008` | PianoA830 `Sm8750GpuPower.c` `sm8750_gcc_vote_owner` (weak word, the SoC kit's protocol) | MIT (Adreno830) | level 2: every read-modify-write of the vote words under it (A830 votes GPLL0 in `0x52000`) |
-| SMMU bypass bank for a stream | NativeUfs (`SmmuTakeover.h`), PianoDwc3 `SmmuStream.h` | BSD | level 4: stream 0x1401 |
-| Firmware read in place from `modem_a` (FAT, read-only through NativeUfs) | PianoPower `PianoAdspFirmware.c` + `FatVolume.c` | BSD | level 5: `image/peach/*` at run time; nothing staged in any repository |
-| Linux ath12k + mac80211 + cfg80211 on XNU, wpa_supplicant 2.12 control path, board callbacks (`nw_abi.h`: platform clock/sleep/log/alloc/DMA/firmware, board BAR/config/MSI) | `unixnu-research/Ath12kWifi` 48e23bf | **GPL-2.0 sources fetched at build time; the repository has no LICENSE** | levels 7–9 only by owner decision (§5.2, §11); WCN7850-only today (no peach) |
-| macOS 27 presentation: `ShengEthernet` (an IOEthernetController en0 carrying the Wi-Fi module, vtable-checked) | sheng `package/ShengEthernet.cpp`, `board.toml` macOS 27.3 profile | BSD | level 10, the same model as `PianoNullEthernet` (already vtable-safe in our KC) |
+| SMMU bypass bank for a stream | NativeUfs (`SmmuTakeover.h`), PianoDwc3 `SmmuStream.h` | BSD | level 3's tail: stream 0x1401 (`SmmuStream.h`, PianoDwc3's copied with its namespace changed) |
+| Firmware read in place from `modem_a` (FAT, read-only through NativeUfs) | PianoPower `PianoAdspFirmware.c` + `FatVolume.c` | BSD | level 4: `image/peach/amss20.bin` at run time (`WifiFirmware.c` + a copy of `FatVolume.c`); nothing staged in any repository |
+| Linux ath12k + mac80211 + cfg80211 on XNU, wpa_supplicant 2.12 control path, board callbacks (`nw_abi.h`: platform clock/sleep/log/alloc/DMA/firmware, board BAR/config/MSI) | `unixnu-research/Ath12kWifi` 48e23bf | **GPL-2.0 sources fetched at build time; the repository has no LICENSE** | levels 6–8 only by owner decision (§5.2, §11); WCN7850-only today (no peach) |
+| macOS 27 presentation: `ShengEthernet` (an IOEthernetController en0 carrying the Wi-Fi module, vtable-checked) | sheng `package/ShengEthernet.cpp`, `board.toml` macOS 27.3 profile | BSD | level 9, the same model as `PianoNullEthernet` (already vtable-safe in our KC) |
 
 ## 5. IOKit family / ABI: the macOS side
 
@@ -106,7 +109,16 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 
 | Boot arg | Default | Effect |
 |---|---|---|
-| `piano-wifi=N` | 0 (probe() declines, nothing mapped) | 1: the read-only survey (loads only); ≥ 2: not implemented, runs level 1 |
+| `piano-wifi=N` | 0 (probe() declines, nothing mapped) | 1: the read-only survey (loads only); 2: + the power sequence; 3: + the link, BAR0 and the SMMU stream; 4: + the firmware over MHI; above 4: runs level 4 |
+| `piano-wifi-gen=N` | 2 | the root port's target link speed (1–3). Gen3 needs cx/mx at NOM, which nothing here votes |
+| `piano-wifi-physeq=0` | 1 | apply only the PHY sequence's frame writes (power-down, reset release, start), not the 128-write table: tells "the table is wrong for piano" from "the PHY does not come up at all" |
+| `piano-wifi-rcg=0` | 1 | leave the aux / rchng RCG sources as the boot stages left them |
+| `piano-wifi-blind=1` | 0 | vote a rail whose PMIC state could not be read (by default level 2 refuses: a voltage sent blind could be below what another consumer holds) |
+| `piano-wifi-release=1` | 0 | on a failure, withdraw the enable of the rails this driver enabled itself (and nothing else); by default the votes stay, since a disable could cut a rail Bluetooth needs |
+| `piano-wifi-stop=N` | 0 | return after step N (201–205 level 2, 301–311 level 3), so a boot can stop just before the step being studied |
+| `piano-wifi-dma=M` | 24 | the level 4 DMA window in MiB (12–64) |
+| `piano-wifi-fwtimeout=MS` | 20000 | the deadline of each MHI phase |
+| `piano-wifi-smmu=N` | 1 | 0: the SMMU is left alone (level 4 then needs stream 0x1401 to bypass already); 1: the endpoint's stream 0x1401 through a bypass context bank; 2: also the root port's 0x1400 |
 | `piano-wifi-spmi=1` | 0 | add the eight supplies' PMIC regulators and the BT_EN / sleep clock pins over the SPMI observer (the only stores: the observer's read commands) |
 | `piano-wifi-hwcg=1` | 0 | count a hardware-gated branch that reads CLK_OFF while voted and under HW_CTL as running for the read gates |
 | `piano-wifi-smmu=0`, `piano-wifi-cmddb=0` | 1 | skip the SMMU stream scan / the cmd-db lookup |
@@ -115,9 +127,24 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 
 ## 7. Build, kernel collection
 
-`tooling/k27/build-native-piano-wifi.sh` (host tests `package/PianoWifi/tests/wifi_host.cpp`, the objects in
-`out/native-kexts/PianoWifi`, the import check), descriptor `tooling/k27/kext/PianoWifi.json` (`com.unixnu.driver.PianoWifi`),
-listed in `configs/k27-native-kexts.txt`, so `tooling/k27/build-native-image.sh` links it into every native KC (inert).
+`tooling/k27/build-native-piano-wifi.sh` (host tests `package/PianoWifi/tests/wifi_host.cpp` and `tests/bringup_host.cpp`, the
+`FatVolume.c` drift check, the objects in `out/native-kexts/PianoWifi`, the import check), descriptor
+`tooling/k27/kext/PianoWifi.json` (`com.unixnu.driver.PianoWifi`), listed in `configs/k27-native-kexts.txt`, so
+`tooling/k27/build-native-image.sh` links it into every native KC (inert). The descriptor names two libraries, which is why
+PianoWifi comes after them in the list: `PianoA830` for the two lock words (`sm8750_rpmh_drv2_owner`, `sm8750_gcc_vote_owner`) and
+`NativeUfs` for `native_ufs_part_find` / `native_ufs_part_read` (level 4's firmware read). The four unresolved symbols the import
+check reports are exactly those; the KC link resolves them (kernel 0060: PianoWifi 471 pointers).
+
+| File | What |
+|---|---|
+| `WifiHw.h` | the register facts of all four levels, each with its source |
+| `WifiSurvey.h` | level 1: what is read and the gates that keep it off unpowered blocks (no store in the file) |
+| `WifiPhySeq.h` | the 128-write QMP v7 PHY sequence (PaganiWifi's, from the 13T's vendor device tree) with its provenance note |
+| `WifiBringup.h` | levels 2 and 3 as one portable sequence over callbacks: the writes, their order, read-backs, waits and timeouts |
+| `WifiMhi.h` | level 4: the firmware file's layout, the DMA arena, the BHIe vector table, the BHI/BHIe boot state machine, the MHI contexts |
+| `WifiFirmware.c/.h` | the firmware read in place from `modem_a` through NativeUfs (ranges only; no file is ever held whole) |
+| `FatVolume.c/.h`, `SmmuStream.h`, `SpmiObserver.h` | copies of PianoPower's and PianoDwc3's (`UPSTREAM`; those packages are not modified) |
+| `PianoWifi.cpp` | the IOService: the windows, the logged writes, the RPMh transactions, the SPMI reads, the DMA window, BAR0, the levels' reports |
 
 ## 8. Bring-up ladder, test plan and effort
 
@@ -127,17 +154,18 @@ level's log was read. Effort = agent work + owner boots, assuming the PaganiWifi
 | Level | What | Pass | Effort |
 |---|---|---|---|
 | 1 (built) | survey: GCC/TCSR/TLMM, PARF/DBI/iATU and PHY only behind their gates, SMMU 0x1400/0x1401, cmd-db; with `-spmi=1` the eight regulators, BT_EN, sleep clock | the log below; nothing written | done; 1 boot |
-| 2 power | the six PMU rails by RPMh (mode, voltage in the SUN ranges, enable; DRV-2 lock), the sleep clock / RF_CLK1 as level 1 shows, PERST# low, WLAN_EN low 150 ms then high + 50 ms | SW_CTRL rises; PMIC read-back enabled at the voted voltages | 2–3 days; 1–2 boots |
-| 3 link | GDSC votes, RCGs, branch votes (GCC vote lock), TCSR clkref, BCR pulses, PARF set-up, the v7 PHY sequence (PaganiWifi's), PHYSTATUS, BDF-to-SID, root port, PERST# high ≥ 100 ms later, LTSSM, L0 (Gen2 cap), iATU 0, config read | `17cb:110e` from the endpoint | 1–2 weeks; 3–5 boots |
-| 4 BAR/MHI | memory window, BAR0 sizing and placement, bus master, SMMU stream 0x1401 → bypass bank + a DMA arena, MHI registers, MSI to SPI 141 or polled | MHIVER/BHI offset sane, EE PBL | 3–5 days; 1–2 boots |
-| 5 firmware | amss.bin from `modem_a` in place; BHI (SBL), BHIe (full image), mission mode; RDDM dump on a crash | EE mission mode (AMSS) | 1–2 weeks; 2–4 boots |
-| 6 QMI | MHI channels/events, IPCR 20/21, QRTR, WLFW: host cap, memory regions (MiBs, in the arena), board.bin / regdb / M3 / aux_ucode / TME-L, cal, wlan_cfg, mission mode | firmware "ready" indication | 2–4 weeks; 4–8 boots |
-| 7 WMI | copy engines, HTC, WMI init/ready, HTT, data-path rings | WMI ready event, MAC/caps | fresh: 4–8 weeks; via Ath12kWifi: 1–2 weeks of board glue |
-| 8 scan | WMI scan, management RX | the AP list | fresh 1–2 weeks |
-| 9 join | open + WPA2-PSK (supplicant), peer/vdev, keys, TX/RX | DHCP lease, ping | fresh 4–8 weeks; Ath12kWifi + peach deltas 2–4 weeks |
-| 10 macOS | §5.2 B: IOEthernetController en1 + control socket + CLI | Safari loads a page | 1–2 weeks |
+| 2 (built) power | the six PMU rails by RPMh (mode NPM, the voltage piano's DT asks for, enable; DRV-2 lock), PERST# low, CLKREQ# to its function, WLAN_EN low 150 ms then high + 50 ms, SW_CTRL read. No sleep clock pin is driven (§10.3) | the rails read back enabled at the voted voltages, the UFS PHY's supplies unchanged | done; 1–2 boots |
+| 3 (built) link | GDSC release (GCC vote lock), RCGs, branch votes, TCSR clkref, BCR pulses, PARF set-up, the v7 PHY sequence, PHYSTATUS, BDF-to-SID, root port + memory window, PERST# high ≥ 100 ms later, LTSSM, L0 (Gen2 cap), iATU 0 and 1, config read, BAR0, SMMU stream 0x1401 | `17cb:110e` from the endpoint, BAR0 placed | done; 3–5 boots |
+| 4 (built) MHI firmware | the DMA window (24 MiB, 36-bit, write-combined), BAR0's MHI block, `image/peach/amss20.bin` read at run time from `modem_a`, BHI (the boot loader), the MHI contexts, BHIe (the second ELF), mission mode; polled, no MSI | EE mission mode (AMSS) | done; 2–4 boots |
+| 5 QMI | MHI channels/events, IPCR 20/21, QRTR, WLFW: host cap, memory regions (MiBs, in the arena), board.bin / regdb / M3 / aux_ucode / TME-L, cal, wlan_cfg, mission mode; RDDM dump on a crash | firmware "ready" indication | 2–4 weeks; 4–8 boots |
+| 6 WMI | copy engines, HTC, WMI init/ready, HTT, data-path rings | WMI ready event, MAC/caps | fresh: 4–8 weeks; via Ath12kWifi: 1–2 weeks of board glue |
+| 7 scan | WMI scan, management RX | the AP list | fresh 1–2 weeks |
+| 8 join | open + WPA2-PSK (supplicant), peer/vdev, keys, TX/RX | DHCP lease, ping | fresh 4–8 weeks; Ath12kWifi + peach deltas 2–4 weeks |
+| 9 macOS | §5.2 B: IOEthernetController en1 + control socket + CLI | Safari loads a page | 1–2 weeks |
 
-Totals: about 2–3 months to a working station with Ath12kWifi for levels 7–9 (20–30 owner boots); 6–9 months fully licence-clean.
+Totals: about 2–3 months to a working station with Ath12kWifi for levels 6–8 (20–30 owner boots); 6–9 months fully licence-clean.
+The numbering of the levels above 4 shifted by one when levels 4 (BAR/MHI) and 5 (firmware) of the first plan became one level:
+the firmware load needs the BAR and the contexts in the same run, and splitting them meant two boots that each proved nothing.
 
 ### 8.1 Level 1 test image
 
@@ -189,6 +217,142 @@ rails' current set points and enables against §2's ranges, the LDO page rule (a
 regulator found" settles it), and the sleep clock pin's mode. A hang right after "stage 2" or "stage 3" would mean a gate let a read
 through to an unclocked block: rerun with `piano-wifi=1` only (no PARF/PHY reads happen when the domain reads off).
 
+Level 1 also feeds the levels above it: `piano-wifi>=2` runs the cmd-db and SPMI stages whatever `piano-wifi-cmddb` /
+`piano-wifi-spmi` say, because level 2 needs each rail's RPMh address **and** the PPID its regulator answered on. A rail with
+either missing is never voted (`level 2: FAILED at step 201`).
+
+### 8.2 Level 2 (power): one RAM boot
+
+```sh
+tooling/k27/build-native-image.sh
+PIANO_EXTRA_ARGS="piano-usb=2 piano-wifi=2" PIANO_RESET_AFTER=300 python3 tooling/bootimg/build-ram-images.py \
+  --fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-k27-native.bin \
+  --trust out/inputs/kernel.macho.trustcache --seed out/inputs/scratch-data.img --adt out/adt/piano-k27.adt --utc "$(date +%s)" \
+  --out out/ram-wifi-l2
+python3 tooling/bootimg/verify-ram-images.py out/ram-wifi-l2/build-A-bundled.json
+```
+
+What it writes: 18 RPMh commands at most (mode, voltage, enable per rail, one transaction each, under the DRV-2 lock) and six TLMM
+words (PERST#, CLKREQ#, WLAN_EN). Nothing else; no clock, no domain, no PCIe register. Expected (the lines that matter):
+
+```
+PianoWifi: levels: 1 survey, 2 power, 3 link (gen 2, physeq 1, rcg 1, blind 0, release 0, stop 0, dma 24 MiB, phase timeout 20000 ms)
+PianoWifi: rsc: apps DRV-2 id 00030003 (version 3.3: v3 layout), TCS block +0xd00
+PianoWifi: step 201: the rails as the PMIC has them (SPMI observer reads)
+PianoWifi: step 202: the six PMU rails by RPMh: mode NPM, voltage, enable (DRV-2 lock per transaction)
+PianoWifi: rsc: ldof3 (0x.....): 3 commands through TCS 2 completed after 0 ms (status 00010100 00010100 00010100)
+   (six such lines, in the order ldof3, ldof2, smpf5, smpd4, smpi7, smpg3)
+PianoWifi: step 203: the rails after the votes; the UFS PHY's supplies unchanged
+PianoWifi: rail pmu vddaon vreg_s5f_0p88 (smpf5) 0x.....: before read 500 mV mode .. en 00 -> sent mode 7, voltage, enable -> after read 876 mV mode 07 en 80 (rc 0)
+PianoWifi: rail phy vdda-pll vreg_l3g_1p2 (ldog3): 1200 mV en 80 -> 1200 mV en 80; never voted (the UFS PHY's and the DSI PHY's PLL: never voted, never lowered)
+PianoWifi: step 204: PERST# low, CLKREQ# to its PCIe function
+PianoWifi: step 205: WLAN_EN low, then high; the PMU's power-up time; SW_CTRL read
+PianoWifi: pins: WLAN_EN cfg 00000201 io 00000002, PERST# cfg 00000201 io 00000000, CLKREQ# cfg 00000007 io ........, SW_CTRL io ........ (in 1)
+PianoWifi: level 2: 24 writes (9 kinds, 0 refused); repeated: ...
+PianoWifi: level 2: done (rails voted, WLAN_EN high, PERST# low, SW_CTRL in 1)
+```
+
+**What the first level 2 boot must show before level 3 is tried**: every rail line reading back `en 80` at a voltage at least the
+one voted; the two PHY LDOs unchanged (a `level 2: FAILED at step 203` means one of them, or a PMU rail, came back lower — stop and
+read why before any further boot); `WLAN_EN cfg ... io 00000002`; and the system still alive after the run (NativeUfs keeps
+writing: the log reaching the end is the proof the UFS path survived the rail votes). `SW_CTRL in 1` is the chip's PMU saying it
+came up, which no boot has shown yet on piano: `in 0` is **not** a failure of level 2 (no board documentation says the pin must
+rise), but it is the first thing to suspect if level 3's PHY or link step then fails.
+
+Failure meanings: step 201 `a rail's PMIC state could not be read` — the SPMI survey found no regulator at that PPID (the LDO page
+rule, §2); `a rail vote was refused` at 201 — no cmd-db resource of that name. Step 202 — the TCS did not complete, or the DRV-2
+lock was held for 2 s by PianoA830 / PianoPower (their lines say so); nothing after that rail is voted. Step 203 — a rail dropped.
+Step 204/205 — a TLMM word did not read back, which would mean the pin is owned elsewhere (a `qcom,protected-pins` entry).
+
+### 8.3 Level 3 (the link): one RAM boot
+
+`PIANO_EXTRA_ARGS="piano-usb=2 piano-wifi=3"`, everything else as §8.2 (`--out out/ram-wifi-l3`). What it writes, beyond level 2's:
+the GCC collapse word (two bits cleared, under the vote lock), the aux and rchng RCG CFG + update bits, the pipe mux (twice: TCXO,
+then the PHY), the two branch vote words (bits only set), the TCSR reference gate, two BCR pulses, 12 PARF words, the 128-write PHY
+sequence, 256 cleared BDF-to-SID words plus one entry, the root port's bus numbers / memory window / command / link control 2, one
+PERST# release, the LTSSM enable, two iATU regions, the endpoint's BAR0 and command, and one SMMU group + bank.
+
+```
+PianoWifi: step 301: the PCIe0 and PCIe0 PHY power domains out of collapse
+PianoWifi: step 302: the aux/rchng sources, the pipe mux on TCXO, the branch votes, the TCSR reference gate
+PianoWifi: step 303: the PCIe0 and PCIe0 PHY block resets, pulsed
+PianoWifi: step 304: PARF: root complex, PHY test power-down off, DBI/iATU bases, slave space, PM bits
+PianoWifi: step 305: the QMP v7 PHY sequence, the pipe clock from the PHY, PHYSTATUS
+PianoWifi: PHY: 128 writes, PCS status1 ........ (ready) after N polls of 100 us
+PianoWifi: step 306: PARF BDF-to-SID: requester 0x100 to stream 0x1401
+PianoWifi: step 307: the root port: bus numbers, memory window, target link speed
+PianoWifi: step 308: PERST# released (>= 100 ms low), then the LTSSM enabled
+PianoWifi: step 309: link training to L0
+PianoWifi: link: debug0 ........ (LTSSM 0x11 L0) debug1 ........ (up) status ........ (Gen2 x2) after N ms
+PianoWifi: step 310: iATU region 0 (configuration window), then the endpoint's identity
+PianoWifi: endpoint: id 110e17cb (17cb:110e, the WCN7860) class 02800002 subsystem ........ pcie cap 0x.. msi cap 0x.. after N polls
+PianoWifi: step 311: iATU region 1 (the memory window), BAR0's size and address, the endpoint's command
+PianoWifi: BAR0: mask ffe00004 -> 2048 KiB at 0x40400000 (value 40400004), command 00100006; iATU ctrl2 80000000/80000000, memory base/limit 43f04030
+PianoWifi: SMMU stream 0x1401: ... -> bypass bank N
+PianoWifi: level 3: done (L0 at Gen2 x2, the endpoint answers 17cb:110e, BAR0 2048 KiB at 0x40400000)
+```
+
+**What the first level 3 boot must show before level 4 is tried**: `PCS status1 ... (ready)`, `LTSSM 0x11 L0` with `debug1 ... (up)`,
+`id 110e17cb`, a BAR0 size that is a power of two inside the 61 MiB window (2 MiB is what sheng's WCN7850 had; another size is fine
+as long as it is placed), `command ...6` (memory space and bus master), and the SMMU line ending in `bypass bank N` or `left as it
+was`. Anything less and level 4 must not be tried: it is the first level that lets the chip read our memory.
+
+Failure meanings: 301 `a power domain did not come up` — the collapse vote is not the whole story on this SoC (an AOP/CESTA owner);
+302 `a branch clock did not start` (a vote did not stick, or the root of the RCG is off) / `an RCG update did not finish` (try
+`piano-wifi-rcg=0`) / `the PHY reference clock gate did not set`; 304 `a PARF register did not read back` — the window is not
+mapped for EL1 by Gunyah (open question 1), and that is the first boot that can tell; 305 `the PHY did not report ready` — the
+donor's table is not piano's (try `piano-wifi-physeq=0`, which should then fail the same way: if it does, the fault is before the
+PHY — the reference clock or the rails); 309 `no L0 within the timeout` — PERST#/CLKREQ#, the PMU (SW_CTRL in §8.2), or Gen2 being
+too fast for what cx/mx are voted at (`piano-wifi-gen=1`); 310 `the endpoint did not answer 17cb:110e` — all ones means the link is
+up but configuration requests do not reach the chip (the iATU or the BDF-to-SID entry), `0001` in the low half means it is still
+asking for a retry; 311 `BAR0 could not be sized or placed`. A hang (no line after a step) is a bus stall or an EL2 abort: the
+breadcrumb `piano_wifi_stage` holds the step number, and the next boot should use `piano-wifi-stop=N` to stop just before it.
+
+### 8.4 Level 4 (the firmware over MHI): one RAM boot
+
+`PIANO_EXTRA_ARGS="piano-usb=2 piano-wifi=4"` (`--out out/ram-wifi-l4`). This level is the first one where the chip reads host
+memory. What it writes: the DMA window's contents (the boot loader, the image's 512 KiB segments, the vector table, the MHI
+contexts — all in our own 24 MiB buffer), and in BAR0 the MHI context pointers, the host address range, BHI's image address /
+size / doorbell, BHIe's vector address / size / doorbell, MHICTRL (M0), and the event ring doorbells.
+
+```
+PianoWifi: SMMU stream 0x1401: bypass set (slot N: smr 80001401 s2cr 000000NN)
+PianoWifi: dma: 24 MiB at 0x........ (write-combined mapping 0x........), the endpoint's bus addresses are physical (stream 0x1401 bypasses)
+PianoWifi: level 4: BAR0 mapped (0x40400000 + 0x200000); MHI version ........, BHIOFF ........, BHIEOFF ........, MHISTATUS ........
+PianoWifi: level 4: BHI at 0x..., BHIe at 0x..., EE PBL, state 0x7; chip TCSR version ........ (major 2)
+PianoWifi: firmware partition modem_a (LUN 4, NNNNN blocks of 4 KiB)
+PianoWifi: firmware: image/peach/amss20.bin on modem_a, 6930496 bytes: boot loader 524288 bytes, a second ELF image 6406208 bytes at 524288
+PianoWifi: firmware: in the window: boot loader at 0x........, 13 segments, vector table at 0x........ (13 entries)
+PianoWifi: level 4: contexts at 0x........ (channels 128, event rings 2: control at ..., data at ..., command ring at ...)
+PianoWifi: level 4: boot begun in phase boot loader over BHI (EE PBL)
+PianoWifi: level 4: waiting for READY after N ms (EE PBL, state 0x7)
+PianoWifi: level 4: contexts needed after N ms (EE PBL, state 0x1)
+PianoWifi: level 4: waiting for the boot loader to run after N ms (EE PBL, state 0x2)
+PianoWifi: level 4: image over BHIe after N ms (EE SBL, state 0x2)
+PianoWifi: level 4: mission mode after N ms (EE AMSS (mission mode), state 0x2)
+PianoWifi: level 4: mission mode after N ms, M steps, 2 context writes, K event acknowledgements; EE AMSS (mission mode), ...
+```
+
+**What the first level 4 boot must show before level 5 is designed against it**: `EE PBL` at the start (the chip is in its primary
+boot loader — `EE AMSS` already there would mean something else booted it), the firmware line with the 6930496-byte file split at
+512 KiB (that is the peach shape: a boot loader and a second ELF), `boot loader over BHI` → `contexts needed` → `image over BHIe`
+→ `mission mode`, and the tablet still alive afterwards.
+
+Failure meanings: `the MHI register layout is not usable` — BAR0 does not carry the MHI block where sheng and PAGANI have it;
+`no partition` — NativeUfs had not published `modem_a` yet (level 4 does not wait: rerun, or add `piano-wifi-delay=20`);
+`BHI reported an error` with an error code — the boot loader refused the image (its address alignment, or the wrong file);
+`BHIe reported an error` — the vector table or a segment; `the device reported a system error` / `went to its crash dump
+environment` — the firmware started and died (level 5 adds the RDDM dump that says where); `a phase timed out` — the device stopped
+answering, which with `MHISTATUS ffffffff` means its PCIe core restarted under us (PAGANI re-applies BAR0 and the decode bits
+there; this driver does not yet).
+
+### 8.5 After any failure
+
+Every level leaves the hardware at WLAN_EN low and PERST# asserted, rails still voted (a disable could cut Bluetooth's supply;
+`piano-wifi-release=1` withdraws only the enables this driver added). The GCC votes and the SMMU entry are not withdrawn either:
+they cost nothing and the next boot is a fresh SoC. Nothing retries in a loop, so a failed boot ends with the log and an idle
+tablet, and `piano-reset-after=300` is the backstop.
+
 ## 9. Fallback
 
 `piano-wifi=0` (the default): nothing runs. Network meanwhile: PianoNullEthernet's `en0` (no traffic) and, once built, the USB-C
@@ -200,26 +364,46 @@ network (§5.2 C).
    EL2. Level 1 touches them only when powered, so the first real test is level 3. (needs-boot)
 2. SMMU: stream 0x1401 → a bypass bank, and the PARF's BDF-to-SID table must route RID 0x100 there; DMA is non-coherent through the
    bypass bank (the NativeUfs/PianoDwc3 write-combined pattern) although the DT says `dma-coherent`. The firmware's memory requests
-   (several MiB) and BHI's power-of-two alignment shape the arena (sheng). (level 1 shows the entries; level 4)
-3. Which clock the PMU needs on piano: RF_CLK1 (RPMh), PMK8550 gpio3's 32 kHz, or neither (piano's DT names none). (level 1 reads the
-   pin; level 2 tries)
-4. The v7 PHY sequence: mainline's table is GPL (not copyable); PaganiWifi's 13T vendor sequence (BSD) is the source to borrow and
-   differs from mainline in a few writes; one PHY, so it should be piano's too. Gen3 needs cx/mx at NOM: start at Gen2.
+   (several MiB) and BHI's power-of-two alignment shape the arena (sheng). (level 1 shows the entries; level 3 sets the stream up and level 4 is the first DMA)
+3. Which clock the PMU needs on piano: RF_CLK1 (RPMh), PMK8550 gpio3's 32 kHz, or neither (piano's DT names none). Level 2 as built
+   **drives no clock at all**: switching the PMK8550 pin on means a PMIC register write, and PianoWifi's only SPMI access is the
+   read-only observer channel (its single kind of store is a read command), so that would mean adding a write path to a PMIC this
+   driver otherwise only reads. If level 3's PHY or link step fails and SW_CTRL reads 0, this is the first suspect, and the step to
+   add then is an `RPMH_RF_CLK1` vote — a cmd-db resource through the VRM path level 2 already has, cheaper and safer than a PMIC
+   GPIO write. (level 1 reads the pin, level 2 reports it, nothing drives it)
+4. The v7 PHY sequence (`package/PianoWifi/WifiPhySeq.h`): mainline's table is GPL (not copyable); the 128 writes come from
+   PaganiWifi (BSD), which took them from the 13T's **running device tree** (`qcom,phy-sequence`), and they differ from mainline's
+   tables in five places (both lanes' RX_MODE_01/10_HIGH4 0x8f against 0x9c, 0x5e4 = 0x0f instead of EQ_CONFIG2 at 0x5e0, and two
+   writes mainline does not make). Provenance question, left open on purpose: a vendor device tree's sequence and Qualcomm's own
+   driver tables share an ancestor at Qualcomm, so "independent of the GPL tables" cannot be established from here. What can be
+   said: it is not a copy of them, it reached this repository through BSD-licensed code, and every entry is a register value, a
+   hardware fact. If the owner wants the question closed, the sequence can be read at run time from piano's own stock device tree
+   instead, and then no repository carries it. `piano-wifi-physeq=0` applies only the frame writes. Gen3 needs cx/mx at NOM, which
+   nothing here votes: the target speed stays Gen2.
 5. Peach-specific firmware steps: TME-L (`tmel_peach_20.elf` was refused on the 13T: QMI error 83), aux_ucode, board API 1 with the
    China-region `bd_p81.elf` (other regions use another stock board file); Ubuntu's kernel is the behavioural spec.
-6. Shared state: the DRV-2 lock for every RPMh vote, the GCC vote lock for `0x52000`/`0x52008` (PianoA830 holds GPLL0 votes there),
-   the SPMI observer channel per APID (PianoWifi's APIDs are none of PianoInput's/PianoPower's/PianoDwc3's), the PMU with Bluetooth
-   (BT_EN on a PMIC GPIO; a later QcaBluetooth must share the rail votes, as sheng's `WcnPower.h` does). Never switch off `vreg_l3g_1p2`
-   (the UFS PHY's PLL).
-7. Licensing of Ath12kWifi (GPL code compiled into an XNU kext, no LICENSE in its repository): an owner decision before levels 7–9
+6. The UFS path. S7I (`vreg_s7i_1p31`, the chip's vddrfa1p2) is **not** piano's UFS vccq parent, although it is the 13T's: piano's
+   `ufs@1d84000` takes `vcc` from `vreg_l17b_2p5` and `vccq` from `vreg_l1d_1p2`, neither of them the Wi-Fi chip's. The rails this
+   driver must never move are the two PCIe PHY LDOs: `vreg_l1f_0p88` (always-on; also UFS refgen, USB, CSI) and `vreg_l3g_1p2` (the
+   UFS **and** DSI PHY PLL supply). Level 2 sends them no command at all, reads both before and after its votes, and fails the level
+   if either moved; `piano-wifi-release=1` never touches them either. (verified from piano's DT)
+7. Shared state: the DRV-2 lock for every RPMh vote, the GCC vote lock for `0x52000`/`0x52008` and the collapse word (PianoA830
+   holds GPLL0 votes there, PianoTouch the QUP branches), the SPMI observer channel per APID (PianoWifi's APIDs are none of
+   PianoInput's/PianoPower's/PianoDwc3's), the PMU with Bluetooth (BT_EN on a PMIC GPIO; a later QcaBluetooth must share the rail
+   votes, as sheng's `WcnPower.h` does). Every vote of ours only ever adds.
+8. Licensing of Ath12kWifi (GPL code compiled into an XNU kext, no LICENSE in its repository): an owner decision before levels 6–8
    use it; it would stay an external build input, never in this repository (§11).
-8. Heat and power: Wi-Fi at full power with no thermal driver; sessions stay attended.
+9. Heat and power: Wi-Fi at full power with no thermal driver; sessions stay attended.
+10. Level 4's DMA window is 24 MiB of XNU memory below 2^36, mapped write-combined, and it is **never freed**: once the chip has
+   been given those addresses, nothing but a reset guarantees it has stopped writing to them. A failed level 4 therefore ends with
+   WLAN_EN low, PERST# asserted and the window still held for the rest of the session.
 
 ## 11. Licence note
 
 This repository's packages are BSD-2-Clause-Patent. Linux (`pcie-qcom`, `phy-qcom-qmp-pcie`, `pwrseq-qcom-wcn`, `mhi`, `qrtr`, ath12k,
 mac80211) and SUN's kernel patches are GPL-2.0: specification only (behaviour, register offsets and bit positions as facts);
-no code, comment or table is copied, and the PHY init sequence will come from PaganiWifi (BSD) with attribution, not from mainline.
+no code, comment or table is copied. The PHY init sequence comes from PaganiWifi (BSD) with attribution, not from mainline, and the
+provenance question that leaves open is §10.4 and the header comment of `package/PianoWifi/WifiPhySeq.h`.
 UniXNU-sheng and PaganiWifi (BSD-2-Clause-Patent) and this repository's own packages are reused with `UPSTREAM` records. Ath12kWifi
 compiles GPL sources at build time; if the owner chooses it, it is consumed as an external, pinned build input and its kext is
 not distributed. No Qualcomm binary is reverse engineered. Firmware (`LicenseRef-Proprietary-Firmware`, no redistribution) is read
