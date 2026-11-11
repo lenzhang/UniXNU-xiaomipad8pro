@@ -677,8 +677,8 @@ bool xhciProbe(Probe &pr)
 
 void portLine(const Xhci &x, unsigned port, uint32_t v, const char *what)
 {
-  note("port %u (USB %u) %s PORTSC %08x: connected %u enabled %u power %u reset %u over-current %u, link state %u, speed %s, changes %03x",
-       port, portMajor(x, port), what, v, (v & kPortCcs) != 0, (v & kPortPed) != 0, (v & kPortPp) != 0, (v & kPortPr) != 0,
+  note("port %u (USB %u)%s%s PORTSC %08x: connected %u enabled %u power %u reset %u over-current %u, link state %u, speed %s, changes %03x",
+       port, portMajor(x, port), *what ? " " : "", what, v, (v & kPortCcs) != 0, (v & kPortPed) != 0, (v & kPortPp) != 0, (v & kPortPr) != 0,
        (v & kPortOca) != 0, portLinkState(v), speedName(portSpeed(v)), (v & kPortChangeBits) >> 17);
 }
 
