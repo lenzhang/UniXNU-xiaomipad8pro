@@ -1,0 +1,40 @@
+PianoUsbHost is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1 only: a read-only survey. What it takes from other
+work, and from where:
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoAudio/PianoAudio.cpp (sha256 cb0499f7fa02dec2919101843c70a1d3d7b9eed389c77625ac032782321f6a8a): the kext's shape (probe
+    gate on the boot argument, a survey thread, the post-mortem stage word, MMIO pages mapped on demand and loaded with an explicit ldr,
+    one summary property), re-written for this driver; its decodePin / pullName copied into this namespace.
+  package/PianoAudio/tests/audio_host.cpp (sha256 dfe2b7d81ac2cbe4a0633bf4441107c192a352cb448e0df663a74e0709298833): the register-model
+    harness (Soc, CHECK), re-used in tests/usbhost_host.cpp.
+  package/PianoDwc3/PianoUsbHw.h (sha256 3c07c280fdd57d4c2cff068bca75f59b6d9a4c1f3b6302a2b77f0c3de97240d6): included, not copied (GCC
+    clock and power-domain offsets, QSCRATCH, the repeater's PPID, the DWC3 base); the core-clocked rule is PianoDwc3's clocksOn().
+  package/PianoPower/SpmiObserver.h (sha256 4805d4fb7af91c210d75b9791e125f3789b7671e895afe6f80af27a36a849b07) and ChargerPmic.h (sha256
+    46fc0c720f26d0323fd4145cd6cbd3c0349043164c601e96852341b8819b94d4): included, not copied (the SPMI observer read, the charger and
+    Type-C block discovery). The Type-C bit meanings here follow Linux's register descriptions (below), which order the sink-status
+    Rp bits the other way round from ChargerPmic.h's inferred decode (docs/drivers/usb-host.md section 2.4).
+
+QcomDwc3 (unixnu-research/QcomDwc3, main e4efe95c903a737e0f5955e5b50a8fb4d2a7d718; BSD-2-Clause-Patent except QcomEusb2Phy.h and
+QcomQmpUsb3.h, which are GPL-2.0-only and were not read for this), facts and design only, no code: QcomDwc3.cpp (sha256
+4b29c0aa6ed893c9b11b1c129795a2c1ddd9bf44e39ad79e2294de61113250f2) runs Apple's AppleUSBXHCI on SM8550 behind a hand-made nub (an
+IODeviceMemory of 0x8000 bytes at the core, name usb-host0, a bus-number property, the interrupt over armcpu_spi_attach), with a core
+soft reset and GCTL.PRTCAPDIR between the roles and the roles from UCSI; QcomUcsi.h (sha256
+5c688feeddd335ddc3e2f06baa9909fc7fbd1712285b6216d23bb85a60cf94b3) is the UCSI client a later level derives from
+(docs/drivers/usb-host.md sections 4 and 9).
+
+Project-SunUEFI (unixnu-research/Project-SunUEFI, main 4ef87402e9d58465af871e4c4f4a5de87599d81c), BSD-2-Clause-Patent, facts only:
+docs/archive/storage-usb/usb-host-port-plan.md (sha256 8f6e2f6b57d3f9cd9b1adb1edc8d25daaa6610a908a904bac438ab40550df512) and
+docs/devel/boot/uefi-console.md (sha256 cf929a24a8053ec04d5a924e176d6a717ff7057b084b49d9ff3f32de4a92d193): the xHCI window
+(0xa600000, 32 KiB), the hi-lo 64-bit write order of the DWC3 xHCI, the Type-C block's MODE_CFG reading 0x02 (sink only) when UEFI
+starts, the repeater's host tuning overrides, DP_COM TYPEC_CTRL at 0x088e8010, no VBUS control in the stock UEFI.
+
+The piano boot DT (out/inputs/piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840; the running
+Ubuntu DT): every address, pin, bus address and power domain of UsbHostHw.h.
+
+Specifications only (no code, comment or table copied): the Ubuntu piano kernel (piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01;
+GPL-2.0): drivers/usb/dwc3/{core.h,core.c,drd.c,host.c,dwc3-qcom.c}, drivers/phy/qualcomm/{phy-qcom-qmp-combo.c,
+phy-qcom-qmp-dp-com-v3.h,phy-qcom-qmp-pcs-v8.h,phy-qcom-eusb2-repeater.c}, drivers/usb/typec/tcpm/qcom/qcom_pmic_typec_port.c,
+drivers/usb/typec/ucsi/{ucsi.h,ucsi.c,ucsi_glink.c}, drivers/soc/qcom/{pmic_glink.c,pmic_glink_altmode.c}, drivers/usb/typec/mux/
+fsa4480.c, drivers/power/supply/{xiaomi_mca.c,sc8541_charger.c}; the xHCI 1.2 specification (register layout). Not read and not used
+for anything: any Apple binary beyond the kernel collection's kext names, class names and Info.plist matching dictionaries
+(docs/drivers/usb-host.md section 5), any Qualcomm binary.

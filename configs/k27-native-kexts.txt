@@ -17,3 +17,4 @@ PianoThermal         # SoC temperatures (TSENS), protection, CPU frequency over 
 PianoTouch           # the NT36532E touch screen (docs/drivers/touch.md); inert without piano-touch=N; after PianoA830 (its GCC lock word)
 PianoWifi            # the WCN7860 Wi-Fi on PCIe0 (docs/drivers/wifi.md): 1 survey, 2 power, 3 link, 4 MHI firmware; inert without piano-wifi=N; after PianoA830 (its lock words) and NativeUfs (level 4 reads modem_a)
 PianoAudio           # speakers (4 x FS19xx, TDM) and DMICs via the ADSP, level 1 (read-only survey) only; inert without piano-audio=N (docs/drivers/audio.md)
+PianoUsbHost         # USB host / Type-C (docs/drivers/usb-host.md): level 1 only, a read-only survey (Type-C state, orientation, DWC3 role, xHCI caps, QMP mux); inert without piano-usbhost=N; PianoDwc3 keeps the controller
