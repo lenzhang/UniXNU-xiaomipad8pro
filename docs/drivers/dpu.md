@@ -114,7 +114,7 @@ first). Supplies, reset and MDSS stay on (no GDSC collapse, no CTL reset while a
 1.62–8.1 Gbit/s), AUX + link training (DPCD), HPD and orientation from the DSP's altmode service and the Type-C mux (B7, PianoPower's
 DSP), DISPCC's DPTX link/pixel clocks from the PHY's PLL, a second CTL with its own LM pair (+ MERGE_3D for widths above 2560, i.e.
 4K) and pipes, a from-scratch INTF0 timing (nothing is left by ABL), a second IOMFB display, the same SMMU windows (stream 0x800),
-and DDR/MDP votes for 4K60 (+2 GB/s). B1b's flip machinery and SMMU windows are its base.
+and DDR/MDP votes for 4K60 (+2 GB/s). B1b's flip machinery and SMMU windows are its base. The B8 design: `displayport.md`.
 
 **4.7 Power estimate** (*inferred*: no measurement on piano yet; core and DDR energy are generic SM8750-class figures).
 
