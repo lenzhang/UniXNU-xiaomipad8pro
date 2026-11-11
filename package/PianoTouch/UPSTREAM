@@ -1,0 +1,66 @@
+PianoTouch is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). What it takes from other work, and from where:
+
+NativeGeniSpi (droidvm-build/UniXNU drivers/NativeGeniSpi, b5399b5646c4d7415deec6d887fd51715a97a024; the UniXNU catalog's QcomGeniSpi
+lineage), BSD-2-Clause-Patent:
+  GeniSpi.c (sha256 2042cfc9647391e24d5a558202046425ac62a05adfc73afe769367b8374e3f91), GeniSpi.h (sha256
+  e73891e4571c5323bca27aaf987bafa002856dfa1dcee156ff31b119e2d3ae3c) and Test/geni-spi.c as tests/geni_spi_host.c (sha256
+  a5b8a9ab217590064fc8ce701ceee5f2dcfbc0b3f0b0d8907505bae25fb2c113): copied unchanged. The GENI SPI master (FIFO and SE DMA modes,
+  polled), its register model test.
+
+Project-SunUEFI (unixnu-research/Project-SunUEFI, main 4ef87402e9d58465af871e4c4f4a5de87599d81c), BSD-2-Clause-Patent (file headers):
+  uefi/components/touch-product/PianoTouchService.c (sha256 f1ba8aba2e2e7abd80b32586c5c807fe8d7a7e972c66aa537b8de8dcd2bcead1)
+    piano's bring-up order (engine reset, the trim loop over three hw-register tables, the download with the hardware CRC, reset
+    state 0xa0..0xaf, calibration 0xa3, the operating-mode command, the GPIO162 edge latch), the pins (MISO/MOSI/CLK/CS on
+    GPIO40-43, lcd-id GPIO100: 0 CSOT, 1 BOE; IRQ GPIO162), SPI by hand on those pins (mode 0, pull/drive settings, 64-byte read
+    windows), the handshake (0x77) and watchdog (0xfd/0xfe) transport blocks and the re-download after ten of the latter.
+    Re-expressed in Nt36532.h and PianoTouch.cpp; its EFI clock protocol, AbsolutePointer and release paths are not taken.
+  uefi/components/touch-product/PianoTouchNvt.c (sha256 291511315d1ae227c881772a459db48a45ee5ad8ff858c82e490490ae8185ea9) and .h
+    (sha256 16840ba55ffe0776db89a588a1de5a878325801fdbdfaa2e508e3d7bfec9425d): the image layout (the NVT/MOD sector, the version
+    byte, ILM/DLM/info/overlay records, the word CRC) and the chip tables (trim IDs, memory maps): parseImage, crc32Words, kHwRegs.
+  uefi/components/touch-product/PianoTouchMatrix.c (sha256 d407e60639253aa973db7e6dd93f2f17201206c8e6c1068bcb4c76d89cb30950) and .h
+    (sha256 6d080362e3e46bf796b3d406bfaf6809143d785a995a013aabaa1aca0aa3e567): the matrix decoder (type lock, median reference, line
+    noise, peaks, centroid, tracking, the panel mapping with Y flipped) and the packet checksum, ported to TouchMatrix.h /
+    Nt36532.h; the tip debounce on top is new. Its physical evidence (SunUEFI tools/prepare_product.py backend_status): firmware
+    loaded and an idle baseline established over GPIO SPI on piano; touching broke the frame checksums (GPIO SPI too slow).
+
+UniXNU-Odin3 (unixnu-research/UniXNU-Odin3, main 6d58c09d1529fb22dba8e3d6f74d8d4c7f9f8306), BSD-2-Clause-Patent:
+  modules/Pagani/drivers/PaganiInput/PaganiInput.cpp (sha256 d6363b9fde015a70f9741aa3a175f49243935e306e94adba5e970385aade68c3)
+    the OnePlus 13T's SPI touch on SM8750 QUP1 (SE4): SE DMA with the FIFO disabled through QUP1's stream 0xa3, the contiguous DMA
+    buffers and their cache maintenance (dmaCache), the engine's interrupt outputs kept on while polled (piano-touch-seirq=2), the
+    pins to the QUP function, the 0x52008 votes. Re-expressed in PianoTouch.cpp.
+UniXNU-sm8750-common (unixnu-research/UniXNU-sm8750-common, main feaa135df4763e3c19a155402e6b17b124a12e13), BSD-2-Clause-Patent:
+  kits/Sm8750Platform/PeripheralIO.h (sha256 d014288207411510edaf12d5b2a16a45413d7183d81b80f7bac56d7facc5c8ce): the 0x52008 lock
+    word protocol (sm8750_gcc_vote_owner; natively PianoA830's copy, see package/PianoA830/adreno830/platform/sm8750/Sm8750GpuPower.c),
+    the QUP1 wrapper branch registers, the RCG/DFS decoding of sm8750_touch_clock (Se2Bus.h se2Clock).
+
+ShengNovatekTouch (unixnu-research/ShengNovatekTouch, main 69fdd6223ed2572aa8bd8351e77c53a238276130), Apache-2.0:
+  NvtProtocol.c (sha256 6c641cce6e6edd320042a7c29fc44722e596e9c212d278ae3f02afed1faa66ba) and .h (sha256
+  c64465269b7a2ebf97b3c426505db91d77170e88a7cc8281e3916b166a0c9ed5): read to cross-check the protocol (framing, the frame buffer
+  layout with frame[0] = 0, the memory maps of the E/cascade variants) and taken for the start sequence after the download (firmware
+  info, the idle-baseline command 0x19, the host-command handshake: 35 ms, five tries of write, 20 ms, read back 0) in Nt36532.h
+  start/hostCommand, written anew. Its NOTICE: "The NT36xxx bus protocol facts (register framing, reset values, event-buffer layout)
+  were derived from reading the Linux driver drivers/input/touchscreen/nt36532e (GPL-2.0-or-later, Novatek, Inc.). No code is
+  copied from it." Its tracker (NvtTouchCore.c, multi-contact, sheng's sensor constants) is not used in this pass.
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoDwc3/SmmuStream.h: included as it is (-I package/PianoDwc3) for stream 0xa3's bypass context bank.
+  package/PianoKeyboard (PianoKeyboardHID, itself DroidVMInput's DroidVMHIDDevice from macOS-DroidVM overlay/kext/DroidVMInput,
+    sha256 f05d9d9912b1ae5b57000dcc49f6a4539410e5212c34b31aa4270e31cfac8afc): the IOHIDDevice subclass, its publication from start
+    and the event-service notification, the codeless IOHIDEventDriver personality and the vtable check of
+    tooling/k27/kext/PianoTouch.json; the TLMM pin handling (eGPIO claim, the rising-edge latch with the GIC delivery off), the step
+    and boot-argument layout. The tablet report's shape (absolute X/Y 0..32767 and buttons) is DroidVMInput's tablet mode, which
+    logged in by tap in the piano VM; TouchHid.h's descriptor is written from the HID 1.11 specification and the Usage Tables.
+
+Facts only, no code (their licences do not allow reuse here):
+  hackios-xnu-kernel-k90 (unixnu-research, k90-port 0e0f19bbba27da57c1845bc16d2415cd38046cab)
+    xnu/files/bsd/dev/annibale/annibale_touch_bus_private.h (sha256 4aaeb3984f6d690c60efaefc0a5c8b3bb08efbdb5965d082f578373739a491bd):
+    Redmi K90's touch on the same SE of the same SoC: vote bit 24 for wrap1 s2, its branch 0x1827c, divider 0x1828c, the QSPI
+    reference RCG at 0x188c0 and its parents (Se2Bus.h).
+  Linux spi-geni-qcom.c, qcom-geni-se.c, gcc-sm8750.c, nt36532e / nt36xxx (GPL-2.0): as quoted by the sources above; not read here.
+  droidvm-build/piano-patches/touch-native-plan.md: the hardware chain of piano's touch (DT, sizes, SIDs, payload 5192 for BOE).
+
+The panel images (novatek_nt36532_piano_fw_boe.bin, sha256 b7999389d49decb14019e24ce68c6fbb0a388e26391b9b0ab913e285c5e44c6b;
+novatek_nt36532_piano_fw_csot.bin, sha256 14b30bb7799d273f6c5d967376694c2cbd3056f3939135ceda70ebec64abfa7a; 245,760 bytes each, the
+stock OS3.0.303.0 odm_a files as xiaomipad-8pro-mainline firmware/piano-input.json pins them) are Novatek's/Xiaomi's and never
+committed: the build copies them into the ignored out/native-kexts/PianoTouch/firmware and embeds them from there. Only their sizes,
+hashes, version byte and partition table are ever logged. No per-unit calibration (thp-calibration.json) is used.

@@ -1,0 +1,44 @@
+{
+  "name": "PianoTouch",
+  "bundle": "com.unixnu.driver.PianoTouch",
+  "version": "1.0.0",
+  "objects": "@OUT@/native-kexts/PianoTouch/objects.json",
+  "start": "_native_kext_start",
+  "stop": "_native_kext_stop",
+  "libraries": {
+    "com.apple.iokit.IOHIDFamily": "2.0.0",
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.private": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0",
+    "com.unixnu.driver.PianoA830": "1.0.0"
+  },
+  "personalities": {
+    "PianoTouch": {
+      "CFBundleIdentifier": "com.unixnu.driver.PianoTouch",
+      "IOClass": "PianoTouch",
+      "IOProviderClass": "IOPlatformExpertDevice",
+      "IOProbeScore": 100,
+      "IOMatchCategory": "PianoTouch"
+    },
+    "PianoTouchHIDEventDriver": {
+      "CFBundleIdentifier": "com.apple.iokit.IOHIDFamily",
+      "IOClass": "IOHIDEventDriver",
+      "IOProviderClass": "IOHIDInterface",
+      "VendorID": 6900,
+      "ProductID": 20564,
+      "IOProbeScore": 3000
+    }
+  },
+  "vtable": {
+    "class": "PianoTouchHID",
+    "base": "IOHIDDevice",
+    "base_kext": "com.apple.iokit.IOHIDFamily",
+    "slots": 334,
+    "ignore_slots": [
+      16
+    ]
+  }
+}
