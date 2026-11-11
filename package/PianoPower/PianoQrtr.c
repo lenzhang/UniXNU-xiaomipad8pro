@@ -40,11 +40,18 @@ static void pdState(uint32_t state, const char *how)
     IOLog("PianoPower: servreg: %s is %s (%#x, %s)\n", SERVREG_CHARGER_PD, servreg_state_name(state), state, how);
 }
 
+/* The ADSP's notifier among the announced services (another domain's notifier may be announced first): its index, or -1. */
+static int notifier(void)
+{
+    for (uint32_t i = 0; i < gQrtr.remote_count; ++i)
+        if (gQrtr.remote[i].service == SERVREG_NOTIFIER_SERVICE && (gQrtr.remote[i].instance >> 8) == SERVREG_ADSP_INSTANCE) return (int)i;
+    return -1;
+}
+
 static void servregRegister(void)
 {
-    const int i = qcom_qrtr_find_remote(&gQrtr, SERVREG_NOTIFIER_SERVICE);
+    const int i = notifier();
     if (gRegistered || i < 0) return;
-    if ((gQrtr.remote[i].instance >> 8) != SERVREG_ADSP_INSTANCE) return;
     uint8_t message[96];
     const uint32_t n = servreg_register_listener(message, sizeof message, gTxn++, SERVREG_CHARGER_PD);
     gNotifierNode = gQrtr.remote[i].node;
@@ -135,13 +142,13 @@ static void linkState(void *context, int up)
 static void linkReceive(void *context, const uint8_t *data, uint32_t length)
 {
     (void)context;
-    const int had = qcom_qrtr_find_remote(&gQrtr, SERVREG_NOTIFIER_SERVICE) >= 0;
+    const int had = notifier() >= 0;
     qcom_qrtr_receive(&gQrtr, data, length);
     if (gQrtr.hello_received && gStage == 2) {
         gStage = 3;
         IOLog("PianoPower: qrtr: the DSP said hello (node %u)\n", gQrtr.remote_node);
     }
-    const int has = qcom_qrtr_find_remote(&gQrtr, SERVREG_NOTIFIER_SERVICE) >= 0;
+    const int has = notifier() >= 0;
     if (had && !has) {   /* the notifier is gone (its domain restarts): register again when it is back */
         gRegistered = 0;
         if (gPdState) pdState(0, "notifier gone");
