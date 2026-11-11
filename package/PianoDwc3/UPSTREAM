@@ -23,3 +23,12 @@ UniXNU-sm8750-common feaa135df4763e3c19a155402e6b17b124a12e13 kits/Sm8750Platfor
 Specifications only (no code or text copied): mainline Linux drivers/usb/dwc3 (core.h, gadget.c, ep0.c, dwc3-qcom.c),
 drivers/clk/qcom/gcc-sm8750.c and tcsrcc-sm8750.c (register offsets), the piano DT (out/inputs/piano-boot.dtb), the USB 2.0,
 IAD and CDC 1.2 / PSTN specifications, ARM IHI 0062 (SMMUv2). Mu-Silicium's SamsungPkg UsbfnDwc3Dxe (Linux-derived) was not read.
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent, for the HID input (piano-usb-hid=1):
+  package/PianoKeyboard/HidDescriptors.h and Wn8030Piano.h: included as they are (build -I package/PianoKeyboard), not copied: the
+  keyboard (+ consumer) and pointer report descriptors the PianoUsbHID devices declare, and the report sizes/IDs HidInput.h's reports
+  are checked against (tests/hid_input_host.cpp, static_asserts and a descriptor walk).
+  package/PianoInput/PianoInput.cpp, package/PianoKeyboard/PianoKeyboard.cpp: the IOHIDDevice subclass pattern (DroidVMInput's
+  DroidVMHIDDevice, see their UPSTREAM): the same overrides, OSTypeAlloc/init/Built-In/attach/start under the driver's service from
+  start(), handleReport from a kernel thread, the IOHIDEventService publish notification, the codeless IOHIDEventDriver personality
+  and the 334-slot vtable check in the kext descriptor. Re-written for PianoUsbHID (own product ID 0x5055 and names).

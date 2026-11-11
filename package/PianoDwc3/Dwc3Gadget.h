@@ -22,9 +22,9 @@
 
 namespace pianousb {
 
-// One physically contiguous, non-cacheable region (64 KiB).
+// One physically contiguous, non-cacheable region (128 KiB: three ports).
 struct Layout {
-  static constexpr uint32_t kBytes = 0x10000;
+  static constexpr uint32_t kBytes = 0x20000;
   static constexpr uint32_t kEvents = 0x0000, kEventBytes = 0x1000;     // event buffer 0
   static constexpr uint32_t kTrbs = 0x1000;                             // physical endpoint n: two TRBs at kTrbs + 32 n
   static constexpr uint32_t kSetup = 0x1800;                            // SETUP packet (8 bytes)

@@ -9,11 +9,14 @@
 
 namespace pianousb {
 
-constexpr unsigned kPorts = 2;
+// At most three ports: 0 kernel console, 1 user pipe, 2 input (only with piano-usb-hid=1; without it the device has two, exactly
+// as before the input port existed).
+constexpr unsigned kPorts = 3, kPortConsole = 0, kPortPipe = 1, kPortInput = 2;
 // pid.codes test VID/PID (1209:0001, "for private testing"); piano-usb-pid=<n> overrides the PID.
 constexpr uint16_t kVendor = 0x1209, kProduct = 0x0001, kRelease = 0x0100;
-// Fixed strings only: no unit serial (docs/drivers/README.md privacy rule).
-constexpr const char *kStrings[] = {nullptr, "UniXNU", "piano macOS debug", "PIANODBG", "piano kernel console", "piano user pipe"};
+// Fixed strings only: no unit serial (docs/drivers/README.md privacy rule). Port p's functions are named by string 4 + p.
+constexpr const char *kStrings[] = {nullptr, "UniXNU", "piano macOS debug", "PIANODBG", "piano kernel console", "piano user pipe",
+                                    "piano input"};
 constexpr unsigned kStringCount = sizeof kStrings / sizeof kStrings[0];
 
 // Logical endpoints of port p: notification IN (1 + 2p), bulk IN/OUT (2 + 2p).

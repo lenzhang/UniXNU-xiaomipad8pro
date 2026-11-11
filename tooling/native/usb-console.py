@@ -27,7 +27,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 PRODUCT = 'piano macOS debug'
-INTERFACES = {0: 'piano kernel console', 1: 'piano user pipe'}
+INTERFACES = {0: 'piano kernel console', 1: 'piano user pipe', 2: 'piano input'}   # 2: piano-usb-hid=1 (tooling/native/piano-input.py)
 TIOCMBIS = getattr(termios, 'TIOCMBIS', 0x8004746c)
 TIOCM_DTR = getattr(termios, 'TIOCM_DTR', 0x2)
 TIOCM_RTS = getattr(termios, 'TIOCM_RTS', 0x4)
@@ -95,13 +95,16 @@ def open_port(path):
     attrs[2] &= ~getattr(termios, 'CRTSCTS', 0)
     attrs[4] = attrs[5] = termios.B115200
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
-    fcntl.ioctl(fd, TIOCMBIS, struct.pack('I', TIOCM_DTR | TIOCM_RTS))   # DTR: PianoDwc3 starts streaming
+    try:
+        fcntl.ioctl(fd, TIOCMBIS, struct.pack('I', TIOCM_DTR | TIOCM_RTS))   # DTR: PianoDwc3 starts streaming
+    except OSError:
+        pass   # a tty without modem lines (a pty in tests); macOS raises DTR on open anyway
     return fd
 
 
 def main():
     a = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    a.add_argument('--port', type=int, default=0, choices=(0, 1))
+    a.add_argument('--port', type=int, default=0, choices=(0, 1, 2))
     a.add_argument('--device', help='a /dev/cu.* node instead of the ioreg lookup')
     a.add_argument('--capture', type=float, metavar='SECONDS', help='save for this long, no keyboard')
     a.add_argument('--send', action='append', default=[], help='a line to send once the port is open')

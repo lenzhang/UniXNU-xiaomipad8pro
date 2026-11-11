@@ -39,10 +39,13 @@
 #include <sys/select.h>
 #include <sys/msgbuf.h>
 #include <miscfs/devfs/devfs.h>
+#include <IOKit/hid/IOHIDDevice.h>
 #include <stdarg.h>
 #include "PianoUsbHw.h"
 #include "Dwc3Gadget.h"
 #include "SmmuStream.h"
+#include "HidInput.h"
+#include "HidDescriptors.h"   // package/PianoKeyboard: the keyboard (+ consumer) and pointer report descriptors, shared
 
 using namespace pianousb;
 
@@ -50,6 +53,8 @@ extern "C" {
 // Post-mortem breadcrumbs (also in the console log): the last takeover stage reached, negative when it failed there.
 volatile int32_t piano_dwc3_stage = 0;
 }
+
+class PianoUsbHID;   // the HID input devices (piano-usb-hid=1), below
 
 namespace {
 
@@ -67,6 +72,8 @@ struct Args {
   uint32_t spmi;      // piano-usb-spmi: 1 (default) read the repeater over SPMI in the probe
   uint32_t pid;       // piano-usb-pid: USB product ID
   uint32_t trace;     // piano-usb-trace: events logged one by one after each bus reset (default 400, 0 off)
+  uint32_t hid;       // piano-usb-hid=1: a keyboard and a pointer for macOS, driven from the Mac over a third port (piano input)
+  uint32_t hidHold;   // piano-usb-hid-hold=MS: keys/buttons still down this long after the last command are released (default 3000)
 };
 Args gArgs;
 
@@ -91,6 +98,8 @@ void readArgs()
   gArgs.spmi = bootArg("piano-usb-spmi", 1);
   gArgs.pid = bootArg("piano-usb-pid", kProduct) & 0xffff;
   gArgs.trace = bootArg("piano-usb-trace", 400);
+  gArgs.hid = bootArg("piano-usb-hid", 0);
+  gArgs.hidHold = bootArg("piano-usb-hid-hold", 3000);
 }
 
 // -------------------------------------------------------------------------------------------------------------------- MMIO
@@ -175,7 +184,13 @@ struct Ring {
     return n;
   }
 };
-Ring gTx[kPorts], gRx1, gNotes;
+Ring gTx[kPorts], gRx1, gRx2, gNotes;   // gRx2: the input port's command bytes (piano-usb-hid=1)
+volatile bool gHidReleaseWanted;        // the input port closed or the bus reset: the HID thread releases everything
+PianoUsbHID *gHidDevice[2];             // keyboard, pointer (piano-usb-hid=1)
+struct HidCounters {                    // counts only: what was typed is never kept or logged
+  uint32_t commands, keyboard, consumer, pointer, releases, autoReleases, errors, sendErrors;
+};
+HidCounters gHid;
 uint16_t gLines[kPorts];
 bool gLive = true, gEcho = true;
 volatile bool gAbort;
@@ -673,9 +688,9 @@ struct KernelHal {
   }
   unsigned rxSpace(unsigned port)
   {
-    if (port == 0) return 1u << 20;
+    if (port == kPortConsole) return 1u << 20;
     IOLockLock(gLock);
-    const unsigned n = gRx1.space();
+    const unsigned n = port == kPortInput ? gRx2.space() : gRx1.space();
     IOLockUnlock(gLock);
     return n;
   }
@@ -686,12 +701,17 @@ struct KernelHal {
       const unsigned n = len - at < sizeof tmp ? len - at : unsigned(sizeof tmp);
       for (unsigned i = 0; i < n; ++i) tmp[i] = src[at + i];   // out of the DMA buffer first
       at += n;
-      if (port == 0) { consoleInput(tmp, n); continue; }
+      if (port == kPortConsole) { consoleInput(tmp, n); continue; }
       IOLockLock(gLock);
-      if (gUserOpen) gRx1.put(tmp, n);
+      if (port == kPortInput) {   // commands for the HID thread; never logged
+        gRx2.put(tmp, n);
+        IOLockWakeup(gLock, &gRx2, false);
+      } else if (gUserOpen) {
+        gRx1.put(tmp, n);
+      }
       IOLockUnlock(gLock);
     }
-    if (port == 1) {
+    if (port == kPortPipe) {
       wakeup(&gRx1);
       selwakeup(&gSelRead);
     }
@@ -710,7 +730,13 @@ struct KernelHal {
       logRewind(gArgs.replay != 0);
       gLive = true;
     }
-    if (port == 1) {
+    if (port == kPortInput && !(state & 1)) {   // nothing stays pressed once the Mac's end is gone
+      IOLockLock(gLock);
+      gHidReleaseWanted = true;
+      IOLockWakeup(gLock, &gRx2, false);
+      IOLockUnlock(gLock);
+    }
+    if (port == kPortPipe) {
       wakeup(&gTx[1]);
       selwakeup(&gSelWrite);
       if (opened && !gArgs.shell) {
@@ -984,9 +1010,11 @@ bool takeover()
   const uint32_t ip = gSnpsId >> 16;
   if (ip != 0x5533 && ip != 0x3331 && ip != 0x3332) { stage(-11, "takeover: GSNPSID is not a DWC_usb3x core"); return false; }
   const bool dwc31 = ip != 0x5533;
+  // Port p uses IN endpoints 2p+1 and 2p+2 (EP0 IN is the first): two ports need 5, the input port 7.
   const uint32_t inEps = (gHal.rd(GHWPARAMS3) >> 18) & 0x1fu;
-  const unsigned ports = inEps >= 5 ? kPorts : 1;
-  note("core %s, %u IN endpoints: %u ACM port(s)", dwc31 ? "DWC_usb31/32" : "DWC_usb3", inEps, ports);
+  const unsigned wanted = gArgs.hid ? 3 : 2, ports = inEps >= 2 * wanted + 1 ? wanted : inEps >= 5 ? 2 : 1;
+  note("core %s, %u IN endpoints: %u ACM port(s)%s", dwc31 ? "DWC_usb31/32" : "DWC_usb3", inEps, ports,
+       gArgs.hid && ports < 3 ? " (no input port: it needs 7 IN endpoints)" : gArgs.hid ? " (port 2: piano input)" : "");
   stage(12, "takeover: halt");
   if (gHal.rd(DCTL) & DCTL_RUN_STOP) note("the firmware left RUN_STOP set (DSTS %08x)", gHal.rd(DSTS));
   gGadget.bind(&gHal, ports, uint16_t(gArgs.pid), gArgs.trace);
@@ -1010,6 +1038,10 @@ bool takeover()
   }
   note("soft reset done in %u us: GCTL %08x GUSB2PHYCFG %08x GUSB3PIPECTL %08x DSTS %08x", waited, gHal.rd(GCTL), gHal.rd(GUSB2PHYCFG),
        gHal.rd(GUSB3PIPECTL), gHal.rd(DSTS));
+  // IN endpoint n sends from TX FIFO n: their sizes after the reset (the input port's endpoints 5 and 6 use FIFOs 5 and 6).
+  note("TX FIFOs after the reset: %08x %08x %08x %08x %08x %08x %08x %08x", gHal.rd(GTXFIFOSIZ0), gHal.rd(GTXFIFOSIZ0 + 4),
+       gHal.rd(GTXFIFOSIZ0 + 8), gHal.rd(GTXFIFOSIZ0 + 12), gHal.rd(GTXFIFOSIZ0 + 16), gHal.rd(GTXFIFOSIZ0 + 20), gHal.rd(GTXFIFOSIZ0 + 24),
+       gHal.rd(GTXFIFOSIZ0 + 28));
   stage(17, "takeover: device mode, event buffer, EP0");
   if (!gGadget.init()) { stage(-17, "takeover: endpoint commands"); return false; }
   stage(18, "takeover: VBUS/session override");
@@ -1038,6 +1070,10 @@ void usbStatus()
           gTx[1].dropped);
   cprintf("log: %s capacity %u avail %u; /dev/pianousb %s\n", !gLog.ok ? "none" : gLog.msgbuf ? "msgbuf" : "pstore", gLog.cap, gLog.avail,
           gDevNode ? "present" : "absent");
+  if (gArgs.hid)
+    cprintf("hid: keyboard %s pointer %s; port 2 DTR %x; %u commands (keyboard %u consumer %u pointer %u), %u releases, %u auto-releases, "
+            "%u bad lines, %u send errors\n", gHidDevice[0] ? "up" : "absent", gHidDevice[1] ? "up" : "absent", gLines[kPortInput],
+            gHid.commands, gHid.keyboard, gHid.consumer, gHid.pointer, gHid.releases, gHid.autoReleases, gHid.errors, gHid.sendErrors);
 }
 
 void usbThread(void *, wait_result_t)
@@ -1072,6 +1108,209 @@ void usbThread(void *, wait_result_t)
 
 }  // namespace
 
+// ---------------------------------------------------------------------------------------------- HID input (piano-usb-hid=1)
+// A keyboard (+ consumer keys) and a relative pointer for macOS, fed by the Mac's commands on port 2 (HidInput.h). The class is the
+// pattern PianoInput's PianoHIDDevice and PianoKeyboard's PianoKeyboardHID took from DroidVMInput (the IOHIDDevice subclass proven on
+// this kernel collection, vtable checked at link time); the report descriptors are PianoKeyboard's (HidDescriptors.h: kind 0 the
+// keyboard, 1 the pointer), so the reports are the cover's. Own product ID and names; nothing typed is ever logged, only counts.
+namespace {
+constexpr uint32_t kHidProductId = 0x5055;   // 'PU'; vendor 0x1AF4 as PianoInput/PianoKeyboard (tooling/k27/kext/PianoDwc3.json)
+const char *const kHidProducts[2] = {"Piano USB Keyboard", "Piano USB Pointer"};
+inline const pianokeyboard::DeviceInfo &hidShape(uint8_t kind) { return pianokeyboard::deviceInfo(pianokeyboard::Kind(kind)); }
+}  // namespace
+
+class PianoUsbHID : public IOHIDDevice {
+  OSDeclareDefaultStructors(PianoUsbHID)
+
+public:
+  uint8_t fKind = 0;
+
+  IOReturn newReportDescriptor(IOMemoryDescriptor **descriptor) const override
+  {
+    *descriptor = IOBufferMemoryDescriptor::withBytes(hidShape(fKind).descriptor, hidShape(fKind).descriptorBytes, kIODirectionNone);
+    return *descriptor ? kIOReturnSuccess : kIOReturnNoMemory;
+  }
+  OSString *newTransportString() const override { return OSString::withCString("USB"); }
+  OSString *newManufacturerString() const override { return OSString::withCString("UniXNU"); }
+  OSString *newProductString() const override { return OSString::withCString(kHidProducts[fKind]); }
+  OSNumber *newVendorIDNumber() const override { return OSNumber::withNumber(pianokeyboard::kVendorId, 32); }
+  OSNumber *newProductIDNumber() const override { return OSNumber::withNumber(kHidProductId, 32); }
+  OSNumber *newLocationIDNumber() const override { return OSNumber::withNumber(0x50550000u | fKind, 32); }
+  OSNumber *newPrimaryUsagePageNumber() const override { return OSNumber::withNumber(hidShape(fKind).usagePage, 32); }
+  OSNumber *newPrimaryUsageNumber() const override { return OSNumber::withNumber(hidShape(fKind).usage, 32); }
+  // The keyboard's LED report (Caps Lock and the rest): taken and dropped, so macOS sees no error.
+  IOReturn setReport(IOMemoryDescriptor *report, IOHIDReportType reportType, IOOptionBits options) override
+  {
+    return report && reportType == kIOHIDReportTypeOutput && fKind == 0 ? kIOReturnSuccess : kIOReturnUnsupported;
+  }
+};
+
+OSDefineMetaClassAndStructors(PianoUsbHID, IOHIDDevice)
+
+namespace {
+IONotifier *gHidPublished;
+
+bool hidSend(uint8_t kind, const uint8_t *bytes, unsigned length)
+{
+  PianoUsbHID *hid = gHidDevice[kind];
+  if (!hid) return false;
+  IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(bytes, length, kIODirectionNone);
+  const IOReturn rc = report ? hid->handleReport(report) : kIOReturnNoMemory;
+  OSSafeReleaseNULL(report);
+  if (rc != kIOReturnSuccess && ++gHid.sendErrors <= 5) {
+    char line[96];
+    snprintf(line, sizeof line, "hid: %s handleReport %#x", kHidProducts[kind], rc);
+    noteLater(line);
+  }
+  return rc == kIOReturnSuccess;
+}
+
+void hidReleaseAll()
+{
+  const uint8_t keyboard[kKeyboardReportBytes] = {kReportKeyboard}, consumer[kConsumerReportBytes] = {kReportConsumer};
+  const uint8_t pointer[kPointerReportBytes] = {};
+  hidSend(0, keyboard, sizeof keyboard);
+  hidSend(0, consumer, sizeof consumer);
+  hidSend(1, pointer, sizeof pointer);
+}
+
+// One reply line to the Mac (port 2), dropped while the Mac does not have the port open. Never carries what was sent.
+void hidReply(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void hidReply(const char *fmt, ...)
+{
+  char line[96];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(line, sizeof line - 1, fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  if (n > int(sizeof line) - 2) n = int(sizeof line) - 2;
+  line[n++] = '\n';
+  IOLockLock(gLock);
+  if (gLines[kPortInput] & 1) gTx[kPortInput].put(reinterpret_cast<const uint8_t *>(line), uint32_t(n));
+  IOLockUnlock(gLock);
+}
+
+void hidCounts(const char *why)
+{
+  char line[200];
+  snprintf(line, sizeof line, "hid: %s: %u commands (keyboard %u, consumer %u, pointer %u), %u releases, %u auto-releases, %u bad lines, "
+           "%u send errors", why, gHid.commands, gHid.keyboard, gHid.consumer, gHid.pointer, gHid.releases, gHid.autoReleases, gHid.errors,
+           gHid.sendErrors);
+  noteLater(line);
+}
+
+// The commands, off the USB thread: what handleReport costs never delays EP0 or the console.
+void hidThread(void *, wait_result_t)
+{
+  LineAssembler lines;
+  bool keys = false, consumer = false, buttons = false;
+  uint64_t last = nowNs(), reported = 0;
+  uint32_t reportedCommands = 0;
+  for (;;) {
+    uint8_t buf[256];
+    IOLockLock(gLock);
+    if (!gRx2.used() && !gHidReleaseWanted) {
+      uint64_t deadline = 0;
+      clock_interval_to_deadline(100, kMillisecondScale, &deadline);
+      IOLockSleepDeadline(gLock, &gRx2, deadline, THREAD_UNINT);
+    }
+    const uint32_t n = gRx2.get(buf, sizeof buf);
+    const bool release = gHidReleaseWanted;
+    gHidReleaseWanted = false;
+    IOLockUnlock(gLock);
+    if (release) {
+      if (keys || consumer || buttons) { hidReleaseAll(); ++gHid.releases; }
+      keys = consumer = buttons = false;
+      lines = LineAssembler();
+      hidCounts("port closed");
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+      const int r = lines.push(char(buf[i]));
+      if (r < 0) { ++gHid.errors; hidReply("err long"); }
+      if (r <= 0) continue;
+      const HidCommand c = parseHidCommand(lines.line());
+      last = nowNs();
+      bool sent = true;
+      switch (c.op) {
+      case HidOp::keyboard: sent = hidSend(0, c.report, c.bytes); keys = c.keysDown; ++gHid.keyboard; break;
+      case HidOp::consumer: sent = hidSend(0, c.report, c.bytes); consumer = c.keysDown; ++gHid.consumer; break;
+      case HidOp::pointer: sent = hidSend(1, c.report, c.bytes); buttons = c.keysDown; ++gHid.pointer; break;
+      case HidOp::release: hidReleaseAll(); keys = consumer = buttons = false; ++gHid.releases; break;
+      case HidOp::status:
+        hidReply("status keyboard %u pointer %u commands %u errors %u", gHidDevice[0] != nullptr, gHidDevice[1] != nullptr, gHid.commands,
+                 gHid.errors + gHid.sendErrors);
+        continue;
+      default:
+        ++gHid.errors;
+        hidReply("err %s", c.error ? c.error : "?");
+        continue;
+      }
+      ++gHid.commands;
+      if (sent) hidReply("ok %u", gHid.commands);
+      else hidReply("err hid");
+    }
+    const uint64_t now = nowNs();
+    if ((keys || consumer || buttons) && now - last > uint64_t(gArgs.hidHold) * 1000000ull) {
+      hidReleaseAll();
+      keys = consumer = buttons = false;
+      ++gHid.autoReleases;
+      hidCounts("held past piano-usb-hid-hold, released");
+    }
+    if (gHid.commands != reportedCommands && now - reported > 10000000000ull) {   // counts only, at most every 10 s
+      reported = now;
+      reportedCommands = gHid.commands;
+      hidCounts("activity");
+    }
+  }
+}
+
+bool hidEventServicePublished(void *, void *, IOService *service, IONotifier *)
+{
+  for (IOService *provider = service->getProvider(); provider; provider = provider->getProvider())
+    if (PianoUsbHID *hid = OSDynamicCast(PianoUsbHID, provider)) {
+      note("hid: event service %s published on %s: macOS has it", service->getMetaClass()->getClassName(), kHidProducts[hid->fKind]);
+      break;
+    }
+  return true;
+}
+
+// Both devices under the PianoDwc3 service, as PianoInput and PianoKeyboard attach and start theirs.
+bool publishHid(IOService *owner)
+{
+  for (uint8_t k = 0; k < 2; ++k) {
+    PianoUsbHID *hid = OSTypeAlloc(PianoUsbHID);
+    if (hid) hid->fKind = k;
+    if (!hid || !hid->init(nullptr)) {
+      OSSafeReleaseNULL(hid);
+      note("hid: %s: init failed", kHidProducts[k]);
+      return false;
+    }
+    hid->setProperty(kIOHIDBuiltInKey, true);
+    if (!hid->attach(owner)) {
+      OSSafeReleaseNULL(hid);
+      note("hid: %s: attach failed", kHidProducts[k]);
+      return false;
+    }
+    if (!hid->start(owner)) {
+      hid->detach(owner);
+      OSSafeReleaseNULL(hid);
+      note("hid: %s: IOHIDDevice::start failed", kHidProducts[k]);
+      return false;
+    }
+    gHidDevice[k] = hid;
+    note("hid: %s: vendor %#x product %#x, usage %#x/%#x, %u-byte descriptor (PianoKeyboard's), registry ID %#llx", kHidProducts[k],
+         pianokeyboard::kVendorId, kHidProductId, hidShape(k).usagePage, hidShape(k).usage, hidShape(k).descriptorBytes,
+         hid->getRegistryEntryID());
+  }
+  if (OSDictionary *matching = IOService::serviceMatching("IOHIDEventService")) {
+    gHidPublished = IOService::addMatchingNotification(gIOFirstPublishNotification, matching, hidEventServicePublished, nullptr, nullptr);
+    matching->release();
+  }
+  return true;
+}
+}  // namespace
+
 // ------------------------------------------------------------------------------------------------------------- the service
 class PianoDwc3 : public IOService {
   OSDeclareDefaultStructors(PianoDwc3)
@@ -1092,8 +1331,9 @@ IOService *PianoDwc3::probe(IOService *provider, SInt32 *score)
 bool PianoDwc3::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
-  note("start: piano-usb=%u phy=%u smmu=%u utmi=%u delay=%u shell=%u (DWC3 %#llx, SMMU stream %#x, polled)", gArgs.level, gArgs.phy,
-       gArgs.smmu, gArgs.utmi, gArgs.delay, gArgs.shell, pianohw::kDwc3, pianohw::kUsbStream);
+  note("start: piano-usb=%u phy=%u smmu=%u utmi=%u delay=%u shell=%u hid=%u (DWC3 %#llx, SMMU stream %#x, polled)", gArgs.level,
+       gArgs.phy, gArgs.smmu, gArgs.utmi, gArgs.delay, gArgs.shell, gArgs.hid, pianohw::kDwc3, pianohw::kUsbStream);
+  if (gArgs.hid && gArgs.level < 2) note("piano-usb-hid needs piano-usb=2: no HID input");
   setProperty("piano-usb", gArgs.level, 32);
   gLock = IOLockAlloc();
   if (!gLock) return false;
@@ -1137,6 +1377,20 @@ bool PianoDwc3::start(IOService *provider)
   else gNotes.buf = nullptr;   // notes stay synchronous
   if (kernel_thread_start(monitorThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
   if (gArgs.shell && kernel_thread_start(shellThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+  // piano-usb-hid=1: the keyboard and the pointer (as PianoInput publishes its device: from start), their command thread, and so the
+  // third port. Without the rings or the thread the device keeps its two ports.
+  if (gArgs.hid) {
+    stage(7, "HID input: keyboard and pointer (piano-usb-hid=1)");
+    if (!ringAlloc(gTx[kPortInput], 4096) || !ringAlloc(gRx2, 16 * 1024) ||
+        kernel_thread_start(hidThread, nullptr, &thread) != KERN_SUCCESS) {
+      note("hid: no rings or thread: the input port is left out");
+      gArgs.hid = 0;
+    } else {
+      thread_deallocate(thread);
+      if (!publishHid(this)) note("hid: the devices are not there; the input port answers \"err hid\"");
+      registerService();
+    }
+  }
   if (kernel_thread_start(usbThread, nullptr, &thread) != KERN_SUCCESS) { stage(-8, "USB thread"); return true; }
   thread_deallocate(thread);
   return true;

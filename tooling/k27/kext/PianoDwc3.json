@@ -6,6 +6,7 @@
   "start": "_native_kext_start",
   "stop": "_native_kext_stop",
   "libraries": {
+    "com.apple.iokit.IOHIDFamily": "2.0.0",
     "com.apple.kpi.bsd": "18.0.0",
     "com.apple.kpi.iokit": "18.0.0",
     "com.apple.kpi.libkern": "18.0.0",
@@ -20,6 +21,23 @@
       "IOProviderClass": "IOPlatformExpertDevice",
       "IOProbeScore": 100,
       "IOMatchCategory": "PianoDwc3"
+    },
+    "PianoUsbHIDEventDriver": {
+      "CFBundleIdentifier": "com.apple.iokit.IOHIDFamily",
+      "IOClass": "IOHIDEventDriver",
+      "IOProviderClass": "IOHIDInterface",
+      "VendorID": 6900,
+      "ProductID": 20565,
+      "IOProbeScore": 3000
     }
+  },
+  "vtable": {
+    "class": "PianoUsbHID",
+    "base": "IOHIDDevice",
+    "base_kext": "com.apple.iokit.IOHIDFamily",
+    "slots": 334,
+    "ignore_slots": [
+      16
+    ]
   }
 }

@@ -201,13 +201,13 @@ static bool stalls(FakeHal &h, G &g, const std::string &s)
   return h.count(CMD_SETSTALL, 0) == before + 1 && h.eps[0].active && h.trbType(0) == TRBCTL_CONTROL_SETUP;
 }
 
-int main(int argc, char **argv)
+// The whole scenario for a device of P ports (2: piano-usb-hid off, the device as it has always been; 3: with the input port).
+static void scenario(unsigned P, bool quiet)
 {
   FakeHal h;
-  h.quiet = argc < 2;
-  (void)argv;
+  h.quiet = quiet;
   G g{};
-  g.bind(&h, kPorts, kProduct, 1000);
+  g.bind(&h, P, kProduct, 1000);
   h.regs[DSTS] = DSTS_DEVCTRLHLT;
   uint32_t waited = 1;
   CHECK(g.softReset(true, &waited) && waited == 0);
@@ -217,7 +217,7 @@ int main(int argc, char **argv)
   CHECK(h.regs[GEVNTADRLO] == uint32_t(h.base) && h.regs[GEVNTADRHI] == uint32_t(h.base >> 32));
   CHECK(h.regs[GEVNTSIZ] == (GEVNTSIZ_INTMASK | 4096));
   CHECK(h.count(CMD_DEPSTARTCFG, 0) == 1 && h.count(CMD_SETEPCONFIG, 0) == 1 && h.count(CMD_SETEPCONFIG, 1) == 1);
-  for (unsigned phys = 0; phys < kPhys; ++phys) CHECK(h.count(CMD_SETTRANSFRESOURCE, phys) == 1);
+  for (unsigned phys = 0; phys < kPhys; ++phys) CHECK(h.count(CMD_SETTRANSFRESOURCE, phys) == (phys < 2 + 4 * P ? 1u : 0u));
   CHECK(h.regs[DALEPENA] == 3);
   CHECK(g.run(10));
   CHECK((h.regs[DCTL] & DCTL_RUN_STOP) && !(h.regs[DSTS] & DSTS_DEVCTRLHLT));
@@ -258,7 +258,7 @@ int main(int argc, char **argv)
   step(g);
   CHECK(head.size() == 9);
   const unsigned total = uint8_t(head[2]) | uint8_t(head[3]) << 8;
-  CHECK(total == 9 + kPorts * 66);
+  CHECK(total == 9 + P * 66);
   sendSetup(h, g, setupBytes(0x80, 6, 0x0302, 0x0409, 2));
   CHECK(h.eps[1].active && trbResidual(h.trb(1)[2]) == 2);
   h.complete(1);
@@ -310,9 +310,12 @@ int main(int argc, char **argv)
       }
       at += len;
     }
-    CHECK(at == config.size() && interfaces == 2 * kPorts && iads == kPorts && endpoints == 3 * kPorts);
-    CHECK(addresses.size() == 6 && addresses[0] == 0x81 && addresses[1] == 0x02 && addresses[2] == 0x82 && addresses[3] == 0x83 &&
+    CHECK(at == config.size() && interfaces == 2 * P && iads == P && endpoints == 3 * P);
+    CHECK(addresses.size() == 3 * P && addresses[0] == 0x81 && addresses[1] == 0x02 && addresses[2] == 0x82 && addresses[3] == 0x83 &&
           addresses[4] == 0x04 && addresses[5] == 0x84);
+    if (P == 3) CHECK(addresses[6] == 0x85 && addresses[7] == 0x06 && addresses[8] == 0x86);
+    // The input port's functions are named "piano input" (string 6).
+    if (P == 3) CHECK(uint8_t(config[9 + 2 * 66 + 7]) == 6 && uint8_t(config[9 + 2 * 66 + 8 + 8]) == 6);
   }
   std::string lang = controlIn(h, g, setupBytes(0x80, 6, 0x0300, 0, 255));
   CHECK(lang.size() == 4 && uint8_t(lang[2]) == 0x09 && uint8_t(lang[3]) == 0x04);
@@ -334,7 +337,7 @@ int main(int argc, char **argv)
 
   // SET_CONFIGURATION(1): endpoints configured before the status stage, the OUT transfers queued after it.
   sendSetup(h, g, setupBytes(0x00, 9, 1, 0, 0));
-  for (unsigned p = 0; p < kPorts; ++p) {
+  for (unsigned p = 0; p < P; ++p) {
     const unsigned notify = physOf(notifyEp(p), true), out = physOf(bulkEp(p), false), in = physOf(bulkEp(p), true);
     const FakeHal::Cmd *n = h.last(CMD_SETEPCONFIG, notify), *o = h.last(CMD_SETEPCONFIG, out), *i = h.last(CMD_SETEPCONFIG, in);
     CHECK(n && ((n->p0 >> 1) & 3) == EP_INTERRUPT && ((n->p0 >> 17) & 0x1f) == notifyEp(p) && ((n->p1 >> 25) & 0x1f) == notify);
@@ -350,6 +353,7 @@ int main(int argc, char **argv)
   CHECK(g.configured());
   for (unsigned p = 0; p < kPorts; ++p) {
     const unsigned out = physOf(bulkEp(p), false);
+    if (p >= P) { CHECK(!h.eps[out].active && !(h.regs[DALEPENA] & 1u << out)); continue; }
     CHECK(h.eps[out].active && h.trbType(out) == TRBCTL_NORMAL && trbResidual(h.trb(out)[2]) == Layout::kOutBytes);
   }
 
@@ -363,7 +367,16 @@ int main(int argc, char **argv)
   CHECK(h.lines[1] == 3 && h.lines[0] == 0);
   controlNoData(h, g, setupBytes(0x21, 0x22, 3, 0, 0));
   CHECK(h.lines[0] == 3);
-  CHECK(stalls(h, g, setupBytes(0x21, 0x22, 3, 2 * kPorts, 0)));   // no such interface
+  CHECK(stalls(h, g, setupBytes(0x21, 0x22, 3, 2 * P, 0)));   // no such interface
+  if (P == 3) {   // the input port: DTR, and a command line arriving on its bulk OUT
+    controlNoData(h, g, setupBytes(0x21, 0x22, 1, 4, 0));
+    CHECK(h.lines[2] == 1);
+    const unsigned out2 = physOf(bulkEp(2), false);
+    CHECK(h.eps[out2].active);
+    h.complete(out2, "K 0 4\n");
+    step(g);
+    CHECK(h.rx[2] == "K 0 4\n" && h.eps[out2].active);
+  }
 
   // Bulk IN: a short transfer, then one ending on a packet boundary (chained zero-length packet).
   h.tx[0] = "hello";
@@ -460,7 +473,15 @@ int main(int argc, char **argv)
     CHECK(c1.size() == 9 + 66 && uint8_t(c1[4]) == 2);
   }
   CHECK(g.stats.cmdErrors == 0 && g.stats.cmdTimeouts == 0 && g.stats.startErrors == 0);
-  std::printf("%s: %d failure(s); %u events, %u setups, %u stalls, %llu bytes in, %llu out\n", failures ? "FAILED" : "ok", failures,
-              g.stats.events, g.stats.setups, g.stats.stalls, (unsigned long long)g.stats.inBytes, (unsigned long long)g.stats.outBytes);
+  std::printf("%u ports: %u events, %u setups, %u stalls, %llu bytes in, %llu out\n", P, g.stats.events, g.stats.setups, g.stats.stalls,
+              (unsigned long long)g.stats.inBytes, (unsigned long long)g.stats.outBytes);
+}
+
+int main(int argc, char **argv)
+{
+  (void)argv;
+  scenario(2, argc < 2);
+  scenario(3, argc < 2);
+  std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "ok", failures);
   return failures ? 1 : 0;
 }

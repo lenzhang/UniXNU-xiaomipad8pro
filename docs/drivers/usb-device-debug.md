@@ -22,6 +22,7 @@ Mac sees a composite USB device with two CDC-ACM serial ports (no driver to inst
 |---|---|---|
 | 0 "piano kernel console" | `/dev/cu.usbmodem…` | the console log streamed live; on open, the whole retained log (the pstore ring, ~650 KB) is replayed first; a line-based kernel monitor (`help`, `usb`, `ioreg`, `peek`, `args`, `uptime`, `reset`, `panic`, `log`, `live`) |
 | 1 "piano user pipe" | `/dev/cu.usbmodem…` | `/dev/pianousb` (`piano-usb-shell=1`): a byte pipe to user space for a root shell (`tooling/native/pianousb-shell`) or `log stream > /dev/pianousb` |
+| 2 "piano input" (only with `piano-usb-hid=1`) | `/dev/cu.usbmodemPIANODBG5` (expected) | keyboard and mouse input from the Mac (`tooling/native/piano-input.py`) into two HID devices, §12 |
 
 It gates nothing in M1–M5; it shortens every later loop (UFS, display, touch, GPU) from "reset, Ubuntu, read the mailbox"
 to watching the log and asking the kernel questions while it runs.
@@ -142,6 +143,8 @@ IOPlatformExpertDevice ── PianoDwc3 (start, matching thread)   read-only pro
 | `piano-usb-phyread=0`, `piano-usb-spmi=0` | 1 | skip the M31 / repeater reads of the probe |
 | `piano-usb-pid=N` | 1 (`1209:0001`, pid.codes test PID) | another USB product ID |
 | `piano-usb-trace=N` | 400 | log the first N controller events after each bus reset one by one (raw word, EP0 phase, TRB words); 0 off |
+| `piano-usb-hid=1` | 0 | (needs `piano-usb=2`) a keyboard and a pointer HID device for macOS and the third port that drives them (§12); without it the USB device is the two-port one, unchanged |
+| `piano-usb-hid-hold=MS` | 3000 | a key or button still down this long after the last input command is released |
 
 On the Mac (no root, standard library only; logs go to `logs/usb-console/`, gitignored):
 
@@ -263,7 +266,74 @@ included). If the takeover fails, the driver logs the stage and leaves the contr
    `IOEthernetController` on this gadget core? Decide after T2; the ECM path needs no private ABI.
 7. Panic output over USB: a polled gadget path from the panic handler (the core already polls) — after T3.
 
-## 12. Licence note
+## 12. Keyboard and mouse from the Mac (`piano-usb-hid=1`)
+
+Debug only: to type the login password and click through the first screens while no touch or keyboard driver is in use.
+Not run on hardware yet (2026-11-11).
+
+- **Transport: a third CDC-ACM port**, "piano input". It exists only with `piano-usb-hid=1`, so the default device (two ports) is
+  byte-for-byte the one that works. The console port is not touched: no echo, no log tail and no replay mix with the input, and
+  the input never has to share a tty with `usb-console.py`. The core needs 7 IN endpoints for it (logged; with fewer the input port
+  is left out). Port 2's endpoints are EP5 IN (notification), EP6 OUT/IN, which use TX FIFOs 5 and 6; their sizes after the reset
+  are logged (`TX FIFOs after the reset: …`).
+- **Protocol** (`package/PianoDwc3/HidInput.h`): one ASCII line per command, answered by one line that never repeats it:
+  `K <mods> [<usage>…]` (keyboard report: modifiers, up to six usages, hex), `C <usage>` (consumer key), `P <buttons> <dx> <dy>
+  [<wheel> [<pan>]]` (relative pointer), `R` (release all), `?` (status) → `ok <n>` / `err <what>` / `status …`.
+- **HID devices**: `PianoUsbHID` (vendor 0x1AF4, product 0x5055 'PU'), a keyboard with consumer keys and a relative pointer, with
+  **package/PianoKeyboard's report descriptors** (`HidDescriptors.h`, the cover's layouts; included, not copied) in the
+  `IOHIDDevice` subclass pattern of PianoInput/PianoKeyboard (DroidVMInput's, the one proven on this KC): same overrides, Built-In set,
+  attached to the PianoDwc3 service and started from `start()` as PianoInput does; codeless `IOHIDEventDriver` personality
+  `PianoUsbHIDEventDriver` (VendorID 6900, ProductID 20565) in `tooling/k27/kext/PianoDwc3.json`, vtable checked (334 slots).
+- **Off the USB thread**: the bytes go to a ring; a HID thread parses lines and calls `handleReport`, so input never delays EP0 or
+  the console. Nothing pressed survives: the port closing (DTR off), a bus reset or `piano-usb-hid-hold` ms without a command
+  releases everything.
+- **Never logged**: the kernel logs counts only (`hid: activity: N commands (keyboard k, consumer c, pointer p), …`); the
+  replies carry a counter, never content; `piano-input.py` prints counts (`typed 8 characters (40 reports)`), writes no file, and
+  names no character in its errors. `type --secret` reads the text with getpass, so it is not in argv, the shell history or `ps`.
+
+On the Mac (standard library only; the port is found by its interface name, `--device` overrides):
+
+```sh
+tooling/native/piano-input.py status                       # status keyboard 1 pointer 1 commands N errors 0
+tooling/native/piano-input.py type --secret --enter        # the login password, not echoed anywhere
+tooling/native/piano-input.py type "hello world"           # US layout, shift for capitals and symbols
+tooling/native/piano-input.py key return | tab | esc | up | cmd+space | shift+tab | volumeup  [--repeat N]
+tooling/native/piano-input.py move 200 -50 [--steps 10]   # relative; positive right / down
+tooling/native/piano-input.py click [left|right|middle] [--double]
+tooling/native/piano-input.py scroll 3 [DX]                # wheel notches
+tooling/native/piano-input.py drag 100 0 | release | keys | raw "K 0 4"
+```
+
+Build and test (host tests run in the build script; the Python tests on their own):
+
+```sh
+package/PianoDwc3/tests/run.sh                             # gadget core (2 and 3 ports), SMMU planner, input parser
+python3 tooling/native/test_piano_input.py                 # layout, keys, pointer, protocol (+ the kernel parser), fake-tablet run
+PIANO_EXTRA_ARGS="piano-usb=2 piano-usb-hid=1" PIANO_RESET_AFTER=300 tooling/k27/build-native-image.sh
+```
+
+Expected log lines (`grep PianoDwc3`), in this order:
+
+```
+PianoDwc3: start: piano-usb=2 phy=0 smmu=1 utmi=1 delay=0 shell=0 hid=1 (DWC3 0xa600000, SMMU stream 0x40, polled)
+PianoDwc3: stage 7 HID input: keyboard and pointer (piano-usb-hid=1)
+PianoDwc3: hid: Piano USB Keyboard: vendor 0x1af4 product 0x5055, usage 0x1/0x6, 92-byte descriptor (PianoKeyboard's), registry ID 0x…
+PianoDwc3: hid: Piano USB Pointer: vendor 0x1af4 product 0x5055, usage 0x1/0x2, 79-byte descriptor (PianoKeyboard's), registry ID 0x…
+PianoDwc3: hid: event service IOHIDEventDriver published on Piano USB Keyboard: macOS has it      (and on Piano USB Pointer)
+PianoDwc3: core DWC_usb31/32, <n> IN endpoints: 3 ACM port(s) (port 2: piano input)
+PianoDwc3: TX FIFOs after the reset: …                     (FIFOs 5 and 6 non-zero for port 2's IN endpoints)
+PianoDwc3: setup 21 22 0003 0004 0 -> status only          (piano-input.py opened port 2: DTR; if within the first 48 requests)
+PianoDwc3: port 2 opened (DTR/RTS 3)
+PianoDwc3: hid: activity: 40 commands (keyboard 40, consumer 0, pointer 0), 0 releases, 0 auto-releases, 0 bad lines, 0 send errors
+PianoDwc3: port 2 closed (DTR/RTS 0)
+PianoDwc3: hid: port closed: …
+```
+
+Failure signs: no `event service … published` (IOHIDEventDriver did not attach: nothing reaches macOS); `hid: … handleReport 0x…`
+(a report refused); `(no input port: it needs 7 IN endpoints)`; on the Mac `piano-input.py` saying `no answer from the tablet` (the
+port's IN endpoint, e.g. a TX FIFO 5/6 of size 0: `--no-ack` still sends). The monitor's `usb` command prints the HID counters.
+
+## 13. Licence note
 
 New code under BSD-2-Clause-Patent (`package/PianoDwc3/LICENSE`). Taken from BSD-2-Clause-Patent sources with attribution
 (`UPSTREAM`): Project-SunUEFI (takeover order, quirks, M31 init values), QcomDwc3's `QcomDwc3.cpp` (SPMI read and GDSC
