@@ -186,7 +186,7 @@ int piano_audio_levels(const PianoAudioLevelArgs *a, char *summary, size_t size)
     audio_session_init(&gSession, &c, &ops, c.dsp ? &gLink.guard : nullptr);
     // A budget well beyond what the levels need (level 6's silence and level 7's walk are seconds; every command is answered or
     // times out in 2 s): past it the session is stopped, with its undo commands first, then without.
-    const uint32_t start = nowMs(), budget = 180000u + c.silence_ms;
+    const uint32_t start = nowMs(), budget = 180000u + (c.silence_ms < AUDIO_SILENCE_MAX_MS ? c.silence_ms : AUDIO_SILENCE_MAX_MS);
     uint32_t aborted = 0;
     uint8_t in[AUDIO_INBOX_BYTES];
     PianoAdspHealth h;
