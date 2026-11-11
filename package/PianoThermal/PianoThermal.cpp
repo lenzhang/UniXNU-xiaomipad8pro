@@ -23,6 +23,8 @@
 // piano-cpufreq >= 1 implies the level 1 readout (its thermal input). No clock, regulator or GDSC is voted by this kext.
 // Suspend hooks (piano_thermal_suspend_prepare/finish, below): the threshold interrupt masks across system suspend, the only TSENS
 // writes, and only when the suspend driver calls them.
+// piano-thermal-adc=1|2 (B6, PianoThermalAdc.cpp; implies piano-thermal=1): the eleven board thermistors on the PMIC ADC, on a thread
+// of their own, and piano_thermal_board_temps() for charging safety. Its only writes: the ADC SDAM's conversion bytes.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -44,6 +46,7 @@
 #include <stdarg.h>
 #include "Cluster.h"
 #include "Governor.h"
+#include "PianoThermalAdc.h"
 #include "Policy.h"
 #include "Scmi.h"
 #include "Tsens.h"
@@ -96,6 +99,7 @@ void readArgs()
   if (gArgs.cpufreq > 3) gArgs.cpufreq = 3;
   if (gArgs.level > 2) gArgs.level = 2;
   if (gArgs.cpufreq && !gArgs.level) gArgs.level = 1;
+  if (adc::hookLevel() && !gArgs.level) gArgs.level = 1;   // B6: the board thermistors come with the level 1 readout
   gArgs.shutdown = bootArg("piano-thermal-shutdown", 0);
   gArgs.pollMs = clampU(bootArg("piano-thermal-poll-ms", 1000), 100, 10000);
   gArgs.logS = clampU(bootArg("piano-thermal-log-s", 30), 5, 3600);
@@ -518,6 +522,8 @@ IOReturn PianoThermal::callPlatformFunction(const OSSymbol *functionName, bool w
     piano_thermal_suspend_finish();
     return kIOReturnSuccess;
   }
+  if (functionName && functionName->isEqualTo("piano-thermal-board-temps"))   // B6: param1 = struct piano_board_temps *
+    return adc::hookBoardTemps(param1) ? kIOReturnSuccess : kIOReturnBadArgument;
   return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
 }
 
@@ -547,6 +553,7 @@ bool PianoThermal::start(IOService *provider)
   setProperty("piano-thermal", gArgs.level, 32);
   setProperty("piano-cpufreq", gArgs.cpufreq, 32);
   registerService();
+  adc::hookStart(this, adc::hookLevel(), gArgs.logS, gArgs.delay);   // B6 (PianoThermalAdc.cpp): nothing without piano-thermal-adc
   thread_t t = nullptr;
   if (kernel_thread_start(&PianoThermal::thread, this, &t) != KERN_SUCCESS) {
     note("FAILED: no thread");
