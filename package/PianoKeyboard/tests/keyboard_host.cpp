@@ -1073,6 +1073,37 @@ static void testPollPlan()
   CHECK(r.sleepMs(PollMode::idle) == 50 && r.sleepMs(PollMode::slow) == 500 && r.sleepMs(PollMode::active) == 4);
 }
 
+// The interrupt wait (piano-keyboard-irq=1): its timeout and how it ended.
+static void testIrqWait()
+{
+  PollPlan p;
+  // Polled: the mode's sleep. With the interrupt: 500 ms (the hall sensor's period) in every mode; a burst never waits; errors 1 s.
+  CHECK(p.waitMs(PollMode::active, false, false, false) == 4 && p.waitMs(PollMode::idle, false, false, false) == 30 &&
+        p.waitMs(PollMode::slow, false, false, false) == 200);
+  CHECK(p.waitMs(PollMode::active, true, false, false) == 500 && p.waitMs(PollMode::idle, true, false, false) == 500 &&
+        p.waitMs(PollMode::slow, true, false, false) == 500);
+  CHECK(p.waitMs(PollMode::idle, true, true, false) == 0 && p.waitMs(PollMode::idle, false, true, false) == 0);
+  CHECK(p.waitMs(PollMode::idle, true, false, true) == 1000 && p.waitMs(PollMode::idle, false, false, true) == 1000);
+  PollConfig slowHall;
+  slowHall.hallMs = 2000;
+  p.configure(slowHall);
+  CHECK(p.waitMs(PollMode::active, true, false, false) == 1000 && p.waitMs(PollMode::idle, true, false, false) == 2000);
+  // At rest with the interrupt: two wakeups a second instead of 33.
+  PollPlan q;
+  uint64_t t = 0;
+  unsigned wakes = 0;
+  while (t < 60000) {
+    t += q.waitMs(q.mode(t, true, false), true, false, false);
+    ++wakes;
+  }
+  CHECK(wakes == 120);
+  // The outcomes.
+  CHECK(waitEnd(true, true, false) == WaitEnd::irq && waitEnd(true, true, true) == WaitEnd::irq);
+  CHECK(waitEnd(true, false, true) == WaitEnd::kick && waitEnd(false, true, false) == WaitEnd::miss);
+  CHECK(waitEnd(false, false, false) == WaitEnd::timeout && waitEnd(true, false, false) == WaitEnd::timeout);
+  CHECK(waitEnd(false, true, true) == WaitEnd::miss);   // a kick that came too late does not hide a miss
+}
+
 int main(int argc, char **argv)
 {
   bool noFirmware = false;
@@ -1099,6 +1130,7 @@ int main(int argc, char **argv)
   testTapsAndTyping();
   testBacklight();
   testPollPlan();
+  testIrqWait();
   if (failures) {
     std::printf("keyboard_host: %d failure(s)\n", failures);
     return 1;

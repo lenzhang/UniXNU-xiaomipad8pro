@@ -58,6 +58,10 @@
 //   piano-keyboard-backlight-idle=S  backlight off after S s without a key or touch, back at the next (default 0: never)
 //   piano-keyboard-poll=MS      the latch poll while reports flow (default 4)       piano-keyboard-idle-poll=MS  idle (default 30)
 //   piano-keyboard-slow-poll=MS detached or closed (default 200); the hall sensor every 500 ms
+//   piano-keyboard-irq=1        wait for gpio97's edge by the TLMM summary interrupt (SPI 208, package/common/PianoIrq.h) instead of
+//                               sleeping: the wait then times out after 500 ms (the hall sensor's period) at most; back to polling
+//                               after 3 waits that timed out with the edge latched, or when the line's storm guard trips. Default 0
+
 //   piano-keyboard-fnrow=1      Right Ctrl + 1..0 - = are F1..F12 (Wn8030Piano.h Keys; default 0: keys as the cover sends them)
 //   piano-keyboard-hall=0       do not read gpio80 at all
 //   piano-keyboard-lid=1        tell IOPMrootDomain the hall state (kIOPMClamshellClosed/Opened), with clamshell sleep disabled
@@ -83,6 +87,7 @@
 #include "BitI2c.h"
 #include "HidDescriptors.h"
 #include "CmdDb.h"
+#include "../common/PianoIrq.h"                      // the TLMM summary interrupt (docs/power-irq.md)
 
 using namespace pianokeyboard;
 
@@ -98,7 +103,7 @@ namespace {
 
 struct Args {
   uint32_t level, stop, trace, halfUs, pollMs, rails, touchpad, backlight, tap, invert, divide, mouse, auth, raw, fnrow, hall, lid;
-  uint32_t dpi, scrollRes, scroll, scrollInvert, gestures, typing, backlightIdle, idlePoll, slowPoll;
+  uint32_t dpi, scrollRes, scroll, scrollInvert, gestures, typing, backlightIdle, idlePoll, slowPoll, irq;
 };
 Args gArgs;
 
@@ -138,6 +143,7 @@ void readArgs()
   gArgs.backlightIdle = clampArg(bootArg("piano-keyboard-backlight-idle", 0), 0, 3600);
   gArgs.idlePoll = clampArg(bootArg("piano-keyboard-idle-poll", 30), 1, 200);
   gArgs.slowPoll = clampArg(bootArg("piano-keyboard-slow-poll", 200), 10, 1000);
+  gArgs.irq = bootArg("piano-keyboard-irq", 0);
 }
 
 // The touchpad's report descriptor with the declared resolutions of the boot arguments (made in start()).
@@ -458,6 +464,13 @@ class PianoKeyboard : public IOService {
   uint32_t fSwipesSent = 0;
   uint64_t fNextWakeLog = 0;
   unsigned fWakeLogs = 0;
+  // the gpio97 interrupt (piano-keyboard-irq=1)
+  pianoirq::tlmm::Pin fPin = {};
+  pianoirq::MissGuard fMiss = pianoirq::missGuard(3);
+  bool fIrqLive = false;
+  volatile uint32_t fKickPending = 0;
+  uint32_t fIrqWakes = 0, fKickWakes = 0, fIrqWakesAtMinute = 0;
+
   uint8_t fFrame[kFrameBytes];
   uint8_t fWire[kDataWire];
   // serving state (the thread's own)
@@ -554,6 +567,7 @@ bool PianoKeyboard::start(IOService *provider)
        gArgs.scrollInvert ? "scrolling inverted" : "natural scrolling", gArgs.tap ? "on" : "off", gArgs.typing,
        gArgs.gestures ? "ON" : "off (recognised for the log only)", gArgs.backlight,
        gArgs.backlightIdle ? ", off when idle" : "", gArgs.pollMs, gArgs.idlePoll, gArgs.slowPoll);
+  note("interrupt: piano-keyboard-irq=%u (%s)", gArgs.irq, gArgs.irq ? "gpio97 on the TLMM summary when it opens" : "polled");
   thread_t thread = nullptr;
   if (kernel_thread_start(threadMain, this, &thread) != KERN_SUCCESS) {
     stage(-1, "kernel_thread_start");
@@ -868,6 +882,17 @@ void PianoKeyboard::armIrq()
   note("serving: gpio97 INTR_CFG %08x (rising edge latched, not enabled), level %u; status gpio95 %u", rd32(pinVa(kIrq) + kIntrCfg),
        level(kIrq), level(kStatus));
   fStatusLevel = level(kStatus);
+  if (!gArgs.irq) return;
+  // The same latch, and its interrupt on the TLMM summary line, enabled only while the loop waits (open() writes INTR_CFG again,
+  // latched and not enabled, with the PDC wake bit cleared: gpio97 is never a wake source).
+  char why[160] = {};
+  fIrqLive = fPin.open("PianoKeyboard", 97, pinVa(kIrq), pianoirq::tlmm::Trigger::rising, why, sizeof why);
+  if (fIrqLive)
+    note("serving: gpio97 interrupt on the TLMM summary (SPI %u, INTID %u): slot %u, INTR_CFG armed %08x masked %08x; waits end on the "
+         "edge, else after at most %u ms", pianoirq::kSpiTlmmSummary, pianoirq::intid(pianoirq::kSpiTlmmSummary), fPin.slot, fPin.armed,
+         fPin.masked, fPoll.config().hallMs);
+  else
+    note("serving: gpio97 interrupt NOT used (%s): polled", why);
 }
 
 // --------------------------------------------------------------------------------------------------------------- HID (level 2)
@@ -925,6 +950,11 @@ void PianoKeyboard::ledRequest(void *self, uint8_t leds)
   PianoKeyboard *k = static_cast<PianoKeyboard *>(self);
   __atomic_store_n(&k->fLedWanted, uint32_t(leds), __ATOMIC_RELEASE);
   __atomic_fetch_add(&k->fLedRequests, 1, __ATOMIC_RELEASE);
+  // With the interrupt the serving thread may wait up to 500 ms: wake it so the Caps Lock LED follows at once.
+  if (k->fIrqLive && k->fPin.ok) {
+    __atomic_store_n(&k->fKickPending, 1u, __ATOMIC_RELEASE);
+    pianoirq::kick(&k->fPin.s->gen[k->fPin.slot]);
+  }
 }
 
 IOReturn PianoKeyboard::send(Kind kind, const uint8_t *bytes, unsigned length)
@@ -1183,14 +1213,46 @@ void PianoKeyboard::dispatch(const Report &r)
   }
 }
 
-// The serving loop's one wait: sleep ms, then whether gpio97's rising edge was latched meanwhile (the latch is cleared here). TLMM
-// keeps an edge that comes while the loop sleeps, so a longer sleep only delays the frame by at most that long. With a GPIO
-// interrupt (a shared TLMM helper) this becomes a wait for that interrupt with the same timeout; nothing else changes.
+// The serving loop's one wait, then whether gpio97's rising edge was latched meanwhile (the latch is cleared here). Polled: sleep
+// ms (TLMM keeps an edge that comes during the sleep, so a sleep only delays the frame). With the interrupt live (docs/power-irq.md
+// §6): arm, wait for the handler (it masks the pin again) or the timeout, mask; an LED request also ends the wait (ledRequest). A
+// wait that timed out with the edge latched is a miss: three in a row and the loop polls from then on, as it does when the summary
+// line goes away (its storm guard).
 bool PianoKeyboard::waitForEdge(uint32_t ms)
 {
-  if (ms) IOSleep(ms);
+  bool woke = false;
+  if (fIrqLive && fPin.live() && ms) {
+    const uint32_t seen = fPin.gen();
+    fPin.arm();
+    woke = fPin.wait(seen, ms);
+    fPin.mask();   // the handler masked it already when it fired; after a timeout or a kick it is still armed
+    if (!woke && fPin.gen() != seen) woke = true;   // the edge came between the timeout and the mask
+  } else if (ms) {
+    IOSleep(ms);
+  }
+  const bool kicked = __atomic_exchange_n(&fKickPending, 0u, __ATOMIC_ACQ_REL);
   const bool edge = rd32(pinVa(kIrq) + kIntrStatus) & 1;
   if (edge) wr32(pinVa(kIrq) + kIntrStatus, 0);
+  if (fIrqLive && ms) {
+    switch (waitEnd(woke, edge, kicked)) {
+    case WaitEnd::irq:
+      ++fIrqWakes;
+      fMiss.delivered();
+      break;
+    case WaitEnd::kick: ++fKickWakes; break;
+    case WaitEnd::miss:
+      if (fMiss.miss()) {
+        fIrqLive = false;
+        note("serving: gpio97 latched but no interrupt in %u waits in a row: polled from now on", fMiss.limit);
+      }
+      break;
+    case WaitEnd::timeout: break;
+    }
+    if (fIrqLive && !fPin.live()) {
+      fIrqLive = false;
+      note("serving: the TLMM summary line went away (state %u): polled from now on", fPin.s ? fPin.s->state : 0u);
+    }
+  }
   return edge;
 }
 
@@ -1257,10 +1319,13 @@ void PianoKeyboard::serve()
     fPoll.wake(now, mode);
     PollPlan::Minute minute;
     if (fPoll.takeMinute(&minute) && (++fWakeLogs <= 5 || fWakeLogs % 10 == 0))
-      note("idle: %u wakeups in %u s (%u active at %u ms, %u idle at %u ms, %u slow at %u ms), now %s; %u reads, %u frames so far",
-           minute.wakes, minute.ms / 1000, minute.inMode[0], fPoll.config().activeMs, minute.inMode[1], fPoll.config().idleMs,
-           minute.inMode[2], fPoll.config().slowMs, pollModeName(mode), fReads, fFrames);
-    edge = waitForEdge(fReadAgain ? 0 : fConsecutiveErrors >= 50 ? 1000 : fPoll.sleepMs(mode));
+      note("idle: %u wakeups in %u s, irq %u (%u active at %u ms, %u idle at %u ms, %u slow at %u ms%s), now %s; %u reads, %u frames "
+           "so far%s", minute.wakes, minute.ms / 1000, fIrqWakes - fIrqWakesAtMinute, minute.inMode[0], fPoll.config().activeMs,
+           minute.inMode[1], fPoll.config().idleMs, minute.inMode[2], fPoll.config().slowMs,
+           fIrqLive ? "; the interrupt is live: waits up to 500 ms" : "", pollModeName(mode), fReads, fFrames,
+           gArgs.irq && !fIrqLive ? "; interrupt off (polled)" : "");
+    if (minute.wakes) fIrqWakesAtMinute = fIrqWakes;
+    edge = waitForEdge(fPoll.waitMs(mode, fIrqLive && fPin.live(), fReadAgain, fConsecutiveErrors >= 50));
   }
 }
 

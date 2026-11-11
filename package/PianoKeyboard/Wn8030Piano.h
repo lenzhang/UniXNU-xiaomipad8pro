@@ -716,6 +716,19 @@ class Backlight {
 // keystroke after a pause waits at most that) while the cover is attached and open; `slowMs` (piano-keyboard-slow-poll, 200) while
 // it is detached or the hall sensor says closed. The read the loop makes without an edge (insurance against a lost one) follows the
 // mode too: every 1, 5 or 10 s. The hall sensor is sampled every `hallMs` (500). Wakeups are counted per minute for the log.
+// With piano-keyboard-irq=1 and the TLMM summary interrupt live (package/common/PianoIrq.h) the loop waits for the edge itself:
+// waitMs() below.
+// How an interrupt wait ended: woken with the edge latched (the interrupt), woken by an LED request (a kick), timed out with the
+// edge latched (a miss: the interrupt did not come), or none of these (a plain timeout, or the line went away).
+enum class WaitEnd : uint8_t { timeout, irq, kick, miss };
+inline WaitEnd waitEnd(bool woke, bool edge, bool kicked)
+{
+  if (woke && edge) return WaitEnd::irq;
+  if (woke && kicked) return WaitEnd::kick;
+  if (!woke && edge) return WaitEnd::miss;
+  return WaitEnd::timeout;
+}
+
 enum class PollMode : uint8_t { active, idle, slow };
 inline const char *pollModeName(PollMode m) { return m == PollMode::active ? "active" : m == PollMode::idle ? "idle" : "slow"; }
 struct PollConfig {
@@ -741,6 +754,17 @@ class PollPlan {
   }
   uint32_t sleepMs(PollMode m) const { return m == PollMode::active ? cfg_.activeMs : m == PollMode::idle ? cfg_.idleMs : cfg_.slowMs; }
   uint32_t readEveryMs(PollMode m) const { return m == PollMode::active ? 1000 : m == PollMode::idle ? 5000 : 10000; }
+  // How long the loop waits for gpio97 (docs/power-irq.md §6). Polled: the mode's sleep. With the interrupt live the wait ends
+  // early on the edge, so its timeout only bounds the bookkeeping: the read-every interval, at most the hall sensor's period
+  // (500 ms), in every mode; a burst (a frame with reports just read) never waits; after 50 read errors in a row 1 s.
+  uint32_t waitMs(PollMode m, bool irqLive, bool burst, bool erroring) const
+  {
+    if (burst) return 0;
+    if (erroring) return 1000;
+    if (!irqLive) return sleepMs(m);
+    const uint32_t every = readEveryMs(m);
+    return every < cfg_.hallMs ? every : cfg_.hallMs;
+  }
   // One wakeup of the loop in mode m. Every 60 s (from the first wakeup) a minute's summary is ready for takeMinute().
   void wake(uint64_t now, PollMode m)
   {
