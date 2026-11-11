@@ -243,7 +243,9 @@ never sleeps without `piano-sleep=1`, and the power tree's first `on` (at the jo
 | PianoThermal | yes | off: the thread parked at the top of a poll (no SCMI request, no TSENS read in flight); with `piano-thermal-sleep-mask=1` also the threshold-interrupt masks (its hooks); on: the masks back, the thread on (power source re-read) | park always; masks opt-in (no TSENS interrupt is taken natively) | `drivers/thermal.md` §5 |
 | PianoTorch | at `piano-torch=2` | as built before (torch off) | – | `drivers/torch.md` |
 | PianoTouch | yes | its own change (the row above, `drivers/touch.md` §16); it reads `piano-display-power`, which NativeGopDisplay now always publishes | – | `drivers/touch.md` |
-| PianoA830, NativeUfs, PianoWifi, PianoAudio | not part of this change | see their pages | – | – |
+| NativeUfs | at `native-ufs-suspend=1`, once the root windows are prepared | off: the queue held and drained (≤ 1 s), SYNCHRONIZE CACHE, AHIT 0, the link into Hibern8; any failure undone (link up and proven by a NOP OUT, the queue released) and the sleep goes on with UFS up; on: Hibern8 exit, NOP OUT, AHIT back, the queue released (5 logged attempts, then a panic); an off before the first on is ignored; clocks/GDSCs/RPMh stay UEFI's | opt-in; `native-ufs-ahit=MS` (run-time auto-hibernate) separately | `drivers/ufs.md` §12 |
+| NativeRamBlock | with NativeUfs's, and only with the Data store open read-write (NativeUfs's power child) | off: the store synced under the disk's gate, new requests held (a failed sync vetoes NativeUfs's suspend); on: released | opt-in | `drivers/ufs.md` §12.3 |
+| PianoA830, PianoWifi, PianoAudio | not part of this change | see their pages | – | – |
 
 ## 5. Policy defaults
 
