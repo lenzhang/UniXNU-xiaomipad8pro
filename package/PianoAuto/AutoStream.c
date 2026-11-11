@@ -87,12 +87,13 @@ void pas_response(PasStream *s, int ok, uint64_t now_ms)
     const int was = s->outstanding;
     if (was == PAS_ACT_NONE) return;           /* late (after its timeout) or not ours */
     s->outstanding = PAS_ACT_NONE;
+    if (s->state == PAS_FAILED) return;        /* an error event ended it while the request was out */
     if (was == PAS_ACT_ENABLE) {
         if (ok) {
             s->state = PAS_ON;
             s->on_ms = now_ms;
-            s->waiting = !s->got_event;          /* the first event may have come before the answer */
-            success(s);
+            s->waiting = !s->got_event && !s->dirty;   /* the first event may have come before the answer */
+            if (!s->dirty) success(s);           /* an error event while it was out keeps its backoff */
         } else {
             s->state = PAS_OFF;
             failure(s, now_ms);
@@ -110,7 +111,7 @@ int pas_event(PasStream *s, uint64_t now_ms)
 {
     (void)now_ms;
     ++s->events;
-    if (!s->want || (s->state != PAS_ENABLING && s->state != PAS_ON)) {
+    if (!s->want || s->dirty || (s->state != PAS_ENABLING && s->state != PAS_ON)) {
         ++s->dropped;
         return PAS_EV_DROP;
     }
@@ -121,6 +122,15 @@ int pas_event(PasStream *s, uint64_t now_ms)
         return PAS_EV_FIRST;
     }
     return PAS_EV_USE;
+}
+
+void pas_error(PasStream *s, uint64_t now_ms)
+{
+    if (s->state == PAS_FAILED) return;
+    s->dirty = 1;
+    s->rearm = s->waiting = 0;
+    if (s->outstanding == PAS_ACT_NONE) s->state = PAS_OFF;
+    failure(s, now_ms);
 }
 
 void pas_tick(PasStream *s, uint64_t now_ms)

@@ -3,7 +3,7 @@
 // Included by auto_host.c:
 //   stream   AutoStream.c: one request outstanding, no nested close, the first event never dropped (also before the enable's answer),
 //            readings resume after every off/on (Ubuntu v1.1.1's bug, 20 cycles), re-arm on a missing first event, timeouts and late
-//            answers, backoff and giving up, deadlines
+//            answers, the hub's error events, backoff and giving up, deadlines
 //   light    AutoLight.c over SensorsPolicy's ps_als_step: the first sample at once, smoothing to the curve with ticks only while moving,
 //            the stream off with the display or the lid, and the fresh start at wake (no fade from the level before the sleep)
 #ifndef PIANO_AUTO_STREAM_TESTS_H
@@ -123,6 +123,43 @@ static void test_stream(void)
     pas_response(&st, 1, 3020);
     CHECK(pas_event(&st, 3030) == PAS_EV_FIRST);
 
+    // an error event of the hub while on: a failure, its events dropped, a disable after the backoff, then a fresh session
+    pas_init(&st, &c);
+    pas_want(&st, 1, 0);
+    send_now(&st, 0);
+    pas_response(&st, 1, 10);
+    CHECK(pas_event(&st, 20) == PAS_EV_FIRST);
+    pas_error(&st, 30);
+    CHECK(st.state == PAS_OFF && st.dirty && st.fails == 1 && st.retry_at == 1030 && pas_event(&st, 40) == PAS_EV_DROP);
+    CHECK(send_now(&st, 1029) == PAS_ACT_NONE && pas_deadline(&st, 500) == 1030 && send_now(&st, 1030) == PAS_ACT_DISABLE);
+    pas_response(&st, 1, 1040);
+    CHECK(!st.dirty && st.state == PAS_OFF && send_now(&st, 1040) == PAS_ACT_ENABLE);
+    pas_response(&st, 1, 1050);
+    CHECK(pas_event(&st, 1060) == PAS_EV_FIRST && st.sessions == 2);
+    // ... while the enable is out: the answer ends it, its success keeps the error's backoff, the disable follows after it
+    pas_init(&st, &c);
+    pas_want(&st, 1, 0);
+    send_now(&st, 0);
+    CHECK(pas_event(&st, 5) == PAS_EV_FIRST);
+    pas_error(&st, 10);
+    CHECK(st.state == PAS_ENABLING && st.outstanding == PAS_ACT_ENABLE && pas_event(&st, 15) == PAS_EV_DROP);
+    pas_response(&st, 1, 20);
+    CHECK(st.state == PAS_ON && st.dirty && st.fails == 1 && !st.waiting && send_now(&st, 21) == PAS_ACT_NONE);
+    CHECK(send_now(&st, 1010) == PAS_ACT_DISABLE);
+    pas_response(&st, 1, 1020);
+    CHECK(send_now(&st, 1020) == PAS_ACT_ENABLE);
+    // errors in a row end it; a late answer then changes nothing
+    pas_init(&st, &c);
+    pas_want(&st, 1, 0);
+    for (unsigned i = 0; i < c.failures; ++i) pas_error(&st, 0);
+    CHECK(st.state == PAS_FAILED);
+    pas_init(&st, &c);
+    pas_want(&st, 1, 0);
+    send_now(&st, 0);
+    for (unsigned i = 0; i < c.failures; ++i) pas_error(&st, 0);
+    pas_response(&st, 1, 10);
+    CHECK(st.state == PAS_FAILED && st.outstanding == PAS_ACT_NONE && send_now(&st, 100000) == PAS_ACT_NONE);
+
     // refused enables: backoff 1, 2, 4, 8, 16 s, then failed for the boot
     pas_init(&st, &c);
     pas_want(&st, 1, 0);
@@ -154,7 +191,7 @@ static void test_stream(void)
     CHECK(st.sessions == 20 && st.errors == 0 && st.rearmed == 0);
     CHECK(!strcmp(pas_state_name(PAS_DISABLING), "disabling") && !strcmp(pas_action_name(PAS_ACT_ENABLE), "enable"));
     printf("PASS stream: one request at a time, no nested close, first events kept, 20 off/on cycles resume, re-arm, timeouts, "
-           "backoff and failure\n");
+           "error events, backoff and failure\n");
 }
 
 static PalLight light;

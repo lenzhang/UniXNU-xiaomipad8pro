@@ -18,6 +18,8 @@
  *     stream is wanted (an on-change sensor reports its current value on enable; a missed one would leave the consumer waiting);
  *   - a request unanswered within response_ms has failed and leaves the hub's state unknown: a disable goes out first (a clean state)
  *     before the next enable; a late answer is ignored;
+ *   - an error event of the hub about the stream (message 130) is a failure that also leaves the hub's state unknown: its events are
+ *     dropped, and once no request is out a disable goes out first (after the backoff), then a fresh enable;
  *   - failures back off (retry_first_ms doubling to retry_max_ms); failures in a row end the stream for the boot (PAS_FAILED), and the
  *     guard (SensorsGuard) still counts each one.
  * Portable C, integer only, no allocation, no C library; host-tested (tests/stream_tests.h). */
@@ -67,6 +69,10 @@ void pas_sent(PasStream *s, int action, uint64_t now_ms);
 void pas_response(PasStream *s, int ok, uint64_t now_ms);
 /* An event (an indication with this client's samples): PAS_EV_DROP, PAS_EV_USE, PAS_EV_FIRST. */
 int pas_event(PasStream *s, uint64_t now_ms);
+/* An error event of the hub about this stream (message 130): a failure (backoff, counted toward PAS_FAILED), the hub's state unknown
+ * (events dropped; a disable before the next enable). An enable out stays out: its answer ends it, and a success then does not reset
+ * the backoff the error started. */
+void pas_error(PasStream *s, uint64_t now_ms);
 /* Time: response timeouts and the first-event watchdog. Call at pas_deadline (and whenever convenient). */
 void pas_tick(PasStream *s, uint64_t now_ms);
 /* When pas_tick or pas_action has something to do next (absolute ms), 0 when only an input can change anything. */
