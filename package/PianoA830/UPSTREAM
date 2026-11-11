@@ -80,7 +80,8 @@ encoder the ring uses), README.md and LICENSE unchanged; the A740 command helper
 UniXNU-Pagani_SM8750 (github.com/Shad0w23333/UniXNU-Pagani_SM8750), 25b110978fec628cc29bf5bd1b5b5ce830156bfd (unixnu.lock),
 BSD-2-Clause-Patent (sha256 5b1d3d911103cb0f41641ec0964c5ac1f7e229f57aa072b6ac38bae913a1307b), the 13T's GPU board:
   package/PaganiGpuBoard.cpp (bd3ae49476ab8b1775f3c7b35f84478a90880cd382ac89ce6890d47aed21bc72) -> board/PianoA830Board.cpp.
-    Kept: fillBoard (every field, the slot/bank policy, ACTLR 0x303, pool 512 MiB, highest bank bit 16), the firmware pins.
+    Kept: fillBoard (every field, the slot/bank policy, ACTLR 0x303, highest bank bit 16), the firmware pins. The pool's default:
+    an eighth of the RAM in 256 MiB steps, 512..1536 MiB (piano_a830_pool_default, PianoA830.h; 1536 on piano), not the 13T's 512.
     Changed: PIANO_GPU_* inputs; piano-* boot arguments through the getter (the driver's knob table untouched); piano-gpu=1 forces
     stop=0 (S0 only), piano-gpu=2 defaults the status page to 2; the SoC id from SMEM when it is one of the DT's SoCs; started from
     the kext's thread instead of Stage7Probe (no async knob).

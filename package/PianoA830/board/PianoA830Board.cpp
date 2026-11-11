@@ -15,6 +15,7 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <pexpert/pexpert.h>
+#include <mach/vm_param.h>   // max_mem: the pool's default
 #include <string.h>
 #include "Adreno830Board.h"
 #include "Sm8750SocInfo.h"
@@ -101,7 +102,7 @@ void fillBoard(Adreno830Board *b)
   b->cb_gpu = 0;
   b->cb_gmu = 2;
   b->smmu_actlr = 0x303;   // the 13T measured that of the DT's PIANO_GPU_SMMU_ACTLR_DT only 0x303 sticks under Gunyah; piano: needs-boot
-  b->pool_mib = 512;
+  b->pool_mib = piano_a830_pool_default(max_mem);   // the 13T's 512 MiB was 95 % used by the login screen alone (PianoA830.h)
   b->qfprom_speedbin_offset = PIANO_GPU_QFPROM_SPEEDBIN_OFFSET;
   b->speedbin_bits = PIANO_GPU_SPEEDBIN_BITS;
   const uint32_t speed[] = PIANO_GPU_BIN_SPEED, skuCount[] = PIANO_GPU_BIN_SKU_COUNT, sku[][Adreno830BinSkus] = PIANO_GPU_BIN_SKU,
@@ -192,6 +193,8 @@ extern "C" IOReturn piano_a830_board_start(unsigned level)
   piano_a830_note("board: SMEM socinfo id %u, board soc_id %u (boot DT %u, DT SoCs " PIANO_GPU_SOC_IDS_TEXT ")", smemId, board.soc_id,
                   PIANO_GPU_SOC_ID);
   Adreno830ParseKnobs(&board, bootArgument, nullptr);
+  piano_a830_note("board: BO pool %u MiB (%s; RAM %llu MiB)", board.pool_mib,
+                  (board.flags & Adreno830BoardFlagPool) ? "piano-gpu-pool" : "an eighth of the RAM, 512..1536", (unsigned long long)(max_mem >> 20));
   piano_a830_note("board: knobs stop=%d status=%u profile=%u trace=%u irq=%u dcvs=%u va=%u kopt=%#x actlr=%#x pool=%u MiB", int(board.knobs.stop),
                   board.knobs.status, board.knobs.profile, board.knobs.trace, board.knobs.irq, board.knobs.dcvs, board.knobs.va, board.knobs.kopt,
                   board.knobs.actlr, board.pool_mib);

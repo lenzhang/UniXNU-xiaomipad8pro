@@ -72,7 +72,8 @@ kernel side must provide (2026-11-11).
 | `piano-gpu-stop=N` | none | stop after S_N (N=1 forces 0) |
 | `piano-gpu-trace=0/1/2` | 1 at N=2 | the register trace: every access and SMC before it is made, counted / verbatim / off |
 | `piano-gpu-status=0..3` | 2 at N=2 | status rows (2: the diagnostic page) |
-| other `piano-gpu-*`, `piano-screenoff`, `piano-diag` | driver's | Adreno830's `pagani-*` knobs renamed (README of `package/PianoA830/adreno830`), e.g. `piano-gpu-pool=<MiB>`, `piano-gpu-profile`, `piano-gpu-dcvs-max` |
+| other `piano-gpu-*`, `piano-screenoff`, `piano-diag` | driver's | Adreno830's `pagani-*` knobs renamed (README of `package/PianoA830/adreno830`), e.g. `piano-gpu-profile`, `piano-gpu-dcvs-max` |
+| `piano-gpu-pool=<MiB>` | an eighth of the RAM, 512..1536 (1536 on piano) | the write-combined BO pool S3 reserves (halved until it succeeds, 64..2048); §8, "The BO pool" |
 | `piano-gpu-metal-opens=<n>` | 0 (no limit) | connections ever granted to the plugin |
 | `piano-gpu-hang-ms=<ms>` | 0 (2000) | the time without progress (fence, ring read pointer, BR's IB1) the fence and recovery watchdogs call a hang, 1000..60000; 10000 for the first desktop sessions ([gpu-userspace.md](gpu-userspace.md), desktop section) |
 | `piano-gpu-idle=0/1/2` | 1 | the GPU's idle power (§8, "GPU idle power"): 0 as before; 1 the DCVS floor (no wake boost, a 250 ms window while idle at 160 MHz, no touch pre-wake); 2 also the boot DDR vote dropped to the display's floor at S10, the host CX/MX votes lowered after `piano-gpu-idle-ms` quiet, and P1's full slumber |
@@ -139,7 +140,8 @@ each means, and what the first desktop session must show: [gpu-userspace.md](gpu
 **Default-on.** PianoA830 is listed (inert). `PIANO_GPU=2 tooling/k27/build-native-image.sh` adds `piano-gpu=2
 piano-gpu-delay=${PIANO_GPU_DELAY:-20}`; make that the default once the plugin is staged in the default seed (and NativeSoftGpu stays
 out): an accelerator without its MetalPluginName bundle would put WindowServer back into the crash loop of the VM-era stub. The
-bring-up takes about 1.1 s (S3's 512 MiB pool reservation is 1.0 s of it), so `piano-gpu-delay=0` would publish the accelerator before
+bring-up took about 1.1 s with the 512 MiB pool (S3's reservation 1.0 s of it; the 1536 MiB default, three times the pages, is to be
+measured), so `piano-gpu-delay=0` would publish the accelerator before
 WindowServer starts; try it once before making it the default. DCVS: keep the annibale default (at most 342 MHz, 160 MHz held from
 70 C until below 60 C): the login run sat at 342 MHz and 56-57 C with no cooling and no charging control (PianoPower is read-only so
 far), and until `piano-gpu-idle=2` has passed its A/B (below) the GPU never slumbers (P0) while host CX/MX stay at their top
@@ -228,6 +230,17 @@ first, and put back on resume, through the same `Sm8750RpmhHost` calls; the entr
 the power contract when it lands (kernel.md §3.2). The thermal ceiling PianoThermal asks for at its passive trip
 (`callPlatformFunction("piano-gpu-ceiling", kHz)`, [thermal.md](thermal.md) §10.5) is in: `adreno830_dcvs_set_ceiling`, a line per
 change (`gpu ceiling N MHz (...)`, `gpu ceiling cleared`); macOS Low Power Mode will use the same call (BACKLOG B5).
+
+**The BO pool (2026-11-11).** The write-combined pool S3 reserves while memory is unfragmented holds the BOs Turnip allocates
+(`BoAlloc`; imported IOSurfaces are not in it): a pooled BO is one span of the GPU's table and needs no page attribute change. What
+does not fit is, as before, a contiguous attempt and then scattered pages: 3 ms a BO and 90-130 ms a surface-sized one of attribute
+changes, one span per 4 KiB page out of the VM's 262144 (int-137 ran out at 65536). The login run used 486 MiB of the 13T board's
+512 MiB with 6 clients (WindowServer 446 MiB); the desktop adds 15-25 Metal clients (Dock, Finder, SystemUIServer, ControlCenter,
+NotificationCenter, WindowManager, Spotlight, ...) of tens of MiB each and WindowServer's surfaces for them, so most of it would have
+been scattered. The default is now an eighth of the RAM in 256 MiB steps, 512..1536 MiB (`piano_a830_pool_default`, compile-time
+checked): 1536 MiB with piano's 13 GiB, so the desktop's BOs stay pooled and the rest of the RAM stays the system's
+(`board: BO pool 1536 MiB (an eighth of the RAM, 512..1536; RAM N MiB)`; S3 halves it until a reservation succeeds, as before;
+`piano-gpu-pool=<MiB>` wins, 64..2048). The `MEM` row shows pool and use; S3's time grows with the pool (1.0 s for 512 MiB).
 
 ## 9. Fallback
 

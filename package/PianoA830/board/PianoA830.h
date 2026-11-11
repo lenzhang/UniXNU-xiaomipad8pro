@@ -24,8 +24,26 @@ unsigned piano_a830_smmu_routes(const char *when);
 }
 #endif
 
+// The write-combined BO pool's default (piano-gpu-pool=<MiB> wins; S0 keeps it in 64..2048, S3 halves it until a reservation succeeds):
+// an eighth of the RAM in 256 MiB steps, 512..1536 MiB. piano's XNU has 13 GiB: 1536. The login screen alone used 486 MiB of the
+// 13T board's 512 (6 clients, WindowServer 446 MiB); a desktop adds 15-25 Metal clients of tens of MiB each, and what does not fit is
+// a scattered BO: 3 ms a BO and 90-130 ms a surface-sized one of page attribute changes, a span of the GPU table per page
+// (docs/drivers/gpu.md §8, "The BO pool").
+#ifdef __cplusplus
+constexpr uint32_t piano_a830_pool_default(uint64_t ram_bytes)
+{
+  const uint64_t mib = (ram_bytes >> 20) / 8 / 256 * 256;
+  return mib < 512 ? 512u : mib > 1536 ? 1536u : uint32_t(mib);
+}
+static_assert(piano_a830_pool_default(13ull << 30) == 1536 && piano_a830_pool_default(12ull << 30) == 1536 &&
+              piano_a830_pool_default(10ull << 30) == 1280 && piano_a830_pool_default(8ull << 30) == 1024 &&
+              piano_a830_pool_default(6ull << 30) == 768 && piano_a830_pool_default(4ull << 30) == 512 &&
+              piano_a830_pool_default(0) == 512 && piano_a830_pool_default(64ull << 30) == 1536,
+              "the pool default's steps");
+#endif
+
 enum : uint32_t {
-  PianoA830SurveyInputs = 1u << 0,     // board windows and interrupts, the embedded firmware against its pins (no hardware)
+  PianoA830SurveyInputs = 1u << 0,    // board windows and interrupts, the embedded firmware against its pins (no hardware)
   PianoA830SurveyGcc = 1u << 1,        // GCC's GPU clocks and votes (always-on block)
   PianoA830SurveyGpuCc = 1u << 2,      // GPU_CC: PLL0, RCGs, branches, CX GDSC (only when GCC's GPU config AHB clock is enabled)
   PianoA830SurveySmmu = 1u << 3,       // the GPU SMMU's global space, stream-match table, the banks in use (CX on + SMMU clock)
