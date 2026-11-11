@@ -43,6 +43,7 @@ struct Dpu {
   DbHw dbHw = DbHw::sunuefi;
   bool blockDma = true;                 // TRIG_CTRL bit 12 as the boot stages left it
   bool dmaHang[2] = {false, false};     // a link's command DMA never finishes
+  int dmaBudget[2] = {-1, -1};          // >= 0: this many more transfers finish, then the link hangs
   bool engineStuck[2] = {false, false}; // EN = 0 does not stop INTF1 / INTF2
   bool engineDead[2] = {false, false};  // EN = 1 does not start it
   bool flushStuck = false;              // CTL_FLUSH never latches
@@ -190,8 +191,11 @@ struct Dpu {
     const uint32_t ctrl = regs[dsiReg(l, kDsiCtrl)], tpg = regs[dsiReg(l, kDsiTpgCtrl)], dma = regs[dsiReg(l, kDsiCmdDmaCtrl)];
     if (!(ctrl & 1u) || !(ctrl & 4u) || tpg != 0x30006u || !(dma & (1u << 28)) || !regs[dsiReg(l, kDsiDmaLength)] || d.fifo.empty())
       return;   // not a FIFO transfer the engine takes: nothing happens
-    if (dmaHang[l]) {
-      d.dmaPending = false;
+    if (dmaBudget[l] == 0) dmaHang[l] = true;
+    if (dmaBudget[l] > 0) --dmaBudget[l];
+    if (dmaHang[l]) {   // the engine took it and never finishes: busy for good
+      d.dmaPending = true;
+      d.dmaAt = UINT64_MAX;
       return;
     }
     const unsigned i = l + 1;
@@ -265,11 +269,15 @@ struct Dpu {
           intf[i].stopPending = false;
           intf[i].start = ns;
           startNs[i] = ns;
-          if (intf[1].on && intf[2].on) {
-            const uint64_t d = startNs[1] > startNs[2] ? startNs[1] - startNs[2] : startNs[2] - startNs[1];
-            if (d > 2 * kLineNs) ++desync;
-            latchCtl();
-            for (unsigned k = 1; k <= 2; ++k) intf[k].cur = intf[k].period;
+          const unsigned other = 3 - i;
+          if (intf[other].on) {   // started beside a running engine: in phase with its frame start, or the halves tear
+            const uint64_t phase = (ns - intf[other].start) % frameNs(other);
+            if (phase > 4 * kLineNs && phase + 4 * kLineNs < frameNs(other)) ++desync;
+            if (i == 2 && ns - intf[1].start < 4 * kLineNs) {   // the pair started together: one frame start, one latch
+              latchCtl();
+              for (unsigned k = 1; k <= 2; ++k) intf[k].cur = intf[k].period;
+              intf[2].start = intf[1].start;
+            }
           }
         }
         if (v) intf[i].stopPending = false;
