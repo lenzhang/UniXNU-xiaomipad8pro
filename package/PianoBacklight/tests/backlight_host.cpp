@@ -484,6 +484,84 @@ static void testLid()
   checkWhitelist(n, 128);
 }
 
+// A system sleep (setPowerState off / on, docs/power.md 4): dark whatever the display says, then back to what the display and the
+// lid want; the code kept or the newest one; a failed off retried; nothing but BL_EN and the code ever written.
+static void testSleep()
+{
+  Model m;
+  m.setFound(0, 812, true);
+  m.setFound(1, 812, true);
+  Controller c(m);
+  c.configure(config(45, false, true));
+  c.survey();
+  c.start();
+  c.display(true, 1, 1);
+  CHECK(m.lit(0) && m.lit(1));
+  // off: BL_EN cleared on both, the code kept
+  c.sleep(true);
+  CHECK(!m.lit(0) && !m.lit(1) && m.code(0) == 812 && m.code(1) == 812 && c.asleep() && !c.pending());
+  CHECK(m.logged("system sleep: the backlight off on both ICs (BL_EN cleared, the code kept; HWEN untouched)"));
+  const size_t writes = m.writes().size();
+  c.sleep(true);   // a second off: nothing
+  CHECK(m.writes().size() == writes);
+  // while asleep: the display path, a step and the lid light nothing (the step's code is kept for the wake)
+  c.display(true, 1, 1);
+  c.lid(1);
+  c.step(1, "test keys");
+  CHECK(!m.lit(0) && !m.lit(1) && m.writes().size() == writes && c.code() == 1024);
+  // on: the newest code first, then BL_EN, on both
+  c.sleep(false);
+  CHECK(m.lit(0) && m.lit(1) && m.code(0) == 1024 && m.code(1) == 1024 && !c.asleep());
+  CHECK(m.logged("system wake: the backlight as before the sleep"));
+  // the display went off during the sleep (IOMFB's system power state): the wake leaves it dark until the display's on
+  c.sleep(true);
+  c.display(false, 0, 0);
+  c.sleep(false);
+  CHECK(!m.lit(0) && !m.lit(1) && m.logged("system wake: the backlight stays off (the display or the lid wants it so)"));
+  c.display(true, 1, 1);
+  CHECK(m.lit(0) && m.lit(1));
+  // the lid closed during the sleep (piano-backlight-lid=1): dark after the wake too
+  c.sleep(true);
+  c.lid(0);
+  c.sleep(false);
+  CHECK(!m.lit(0) && !m.lit(1));
+  c.lid(1);
+  CHECK(m.lit(0) && m.lit(1));
+  // an IC that refuses the off write: pending, a retry takes it (the kext retries twice before acknowledging)
+  m.failWrites[1] = 1;
+  c.sleep(true);
+  CHECK(!m.lit(0) && m.lit(1) && c.pending());
+  c.retry();
+  CHECK(!m.lit(1) && !c.pending());
+  c.sleep(false);
+  CHECK(m.lit(0) && m.lit(1));
+  // the wake before the first display on (a sleep during boot): the boot screen's rule holds, lit as found
+  Model b;
+  b.setFound(0, 812, true);
+  b.setFound(1, 812, true);
+  Controller cb(b);
+  cb.configure(config());
+  cb.survey();
+  cb.start();
+  cb.sleep(true);
+  CHECK(!b.lit(0) && !b.lit(1));
+  cb.display(false, 0, 0);   // before the first on: ignored
+  cb.sleep(false);
+  CHECK(b.lit(0) && b.lit(1));
+  checkWhitelist(m, 128);
+  checkWhitelist(b, 128);
+  // not controlling (a missing IC): a sleep writes nothing
+  Model x;
+  x.present[1] = false;
+  Controller cx(x);
+  cx.configure(config());
+  cx.survey();
+  cx.start();
+  cx.sleep(true);
+  cx.sleep(false);
+  CHECK(x.writes().empty());
+}
+
 static void testFailures()
 {
   // The secondary refuses one write: the primary goes dark, the secondary stays lit until a retry.
@@ -692,6 +770,7 @@ int main()
   testBootLevel();
   testDisplayAndSteps();
   testLid();
+  testSleep();
   testFailures();
   testStack();
   testKeys();

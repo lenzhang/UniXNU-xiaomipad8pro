@@ -17,6 +17,9 @@
 //              "piano-keyboard-hall" property, polled; acted on only with piano-backlight-lid=1), "piano-backlight-percent" /
 //              "piano-backlight-step" set as properties by an administrator; a failed access retried every second
 // Every write is logged ("PianoBacklight: write ..."), at most 24 such lines per 10 s (the rest counted).
+// System sleep (docs/power.md 4, PianoPowerContract.h): at level 2 the service is in the power tree. setPowerState(off) has the
+// thread clear BL_EN on both ICs (whatever the display path said; retried twice) and waits for it (at most 800 ms); on has the
+// thread restore what the display and the lid want. HWEN (gpio2) stays untouched: it is read once, never written.
 //
 // Boot arguments (default: inert, the service does not even probe):
 //   piano-backlight=1           the survey (pins, both ICs read back, the found brightness); writes nothing
@@ -56,6 +59,7 @@
 #include "BitI2c.h"
 #include "Ktz8866.h"
 #include "PianoBacklightClient.h"
+#include <PianoPowerContract.h>
 
 using namespace pianobacklight;
 
@@ -275,9 +279,13 @@ struct Pending {
   const char *ambientSource;
   int32_t automatic;         // the property piano-backlight-auto: -1 none, 0 off, 1 on
   uint32_t ambientCalls;
+  int32_t sleep;             // setPowerState: -1 none, 1 off (a system sleep), 0 on (the wake)
 };
 IOLock *gLock;
-Pending gPending = {false, false, false, 0, 0, 0, -1, "?", 0, 0, false, -1, 0, "?", -1, 0};
+Pending gPending = {false, false, false, 0, 0, 0, -1, "?", 0, 0, false, -1, 0, "?", -1, 0, -1};
+// The thread's answer to a sleep request: the requests taken, and whether the ICs were dark after the last one.
+uint32_t gSleepAsked, gSleepTaken;
+bool gServing, gDarkForSleep;
 
 }  // namespace
 
@@ -310,6 +318,7 @@ class PianoBacklight : public IOService {
   bool start(IOService *provider) override;
   IOReturn callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4) override;
   IOReturn setProperties(OSObject *properties) override;
+  IOReturn setPowerState(unsigned long state, IOService *device) override;
 };
 
 OSDefineMetaClassAndStructors(PianoBacklight, IOService)
@@ -348,6 +357,7 @@ bool PianoBacklight::start(IOService *provider)
   }
   thread_deallocate(thread);
   registerService();   // NativeGopDisplay (piano-backlight>=2) and the key producers find the service by its class
+  if (gArgs.level >= 2) note("system sleep: in the power tree (%#x): off clears BL_EN on both ICs, on restores it", pianopower::join(this));
   return true;
 }
 
@@ -491,6 +501,9 @@ IOService *PianoBacklight::sibling(const char *className)
 
 void PianoBacklight::serve()
 {
+  IOLockLock(gLock);
+  gServing = true;
+  IOLockUnlock(gLock);
   uint64_t nextPoll = 0, nextSlow = 0, nextAlive = nowMs() + 60000;
   bool lastLit = fCtl.lit(0);
   uint16_t lastCode = fCtl.code();
@@ -505,8 +518,22 @@ void PianoBacklight::serve()
     p = gPending;
     gPending.any = gPending.display = gPending.ambient = false;
     gPending.steps = 0;
-    gPending.percent = gPending.automatic = -1;
+    gPending.percent = gPending.automatic = gPending.sleep = -1;
+    const uint32_t asked = gSleepAsked;
     IOLockUnlock(gLock);
+
+    if (p.sleep >= 0) {
+      fCtl.sleep(p.sleep == 1);
+      for (unsigned retry = 0; p.sleep == 1 && fCtl.pending() && retry < 2; ++retry) {   // the off must take before the freeze
+        IOSleep(20);
+        fCtl.retry();
+      }
+      IOLockLock(gLock);
+      gDarkForSleep = !fCtl.lit(0) && !fCtl.lit(1);
+      gSleepTaken = asked;
+      IOLockWakeup(gLock, &gSleepTaken, false);
+      IOLockUnlock(gLock);
+    }
 
     if (p.display) {
       fDisplayKnown = true;
@@ -591,6 +618,37 @@ IOReturn PianoBacklight::callPlatformFunction(const OSSymbol *name, bool wait, v
   IOLockWakeup(gLock, &gPending, false);
   IOLockUnlock(gLock);
   return kIOReturnSuccess;
+}
+
+// docs/power.md 4: off = the backlight dark before the system freezes (the thread clears BL_EN; this waits for it, at most 800 ms, so
+// the answer is synchronous), on = the thread lights it again if the display and the lid want it (asynchronous). Not controlling
+// (level 1, control off): nothing.
+IOReturn PianoBacklight::setPowerState(unsigned long state, IOService *)
+{
+  if (!gLock) return pianopower::kAckNow;
+  IOLockLock(gLock);
+  if (!gServing) {
+    IOLockUnlock(gLock);
+    return pianopower::kAckNow;
+  }
+  gPending.sleep = state == pianopower::kOff ? 1 : 0;
+  gPending.any = true;
+  const uint32_t ask = ++gSleepAsked;
+  IOLockWakeup(gLock, &gPending, false);
+  bool taken = true, dark = true;
+  if (state == pianopower::kOff) {
+    uint64_t deadline = 0;
+    clock_interval_to_deadline(800, kMillisecondScale, &deadline);
+    while (gSleepTaken != ask && IOLockSleepDeadline(gLock, &gSleepTaken, deadline, THREAD_UNINT) != THREAD_TIMED_OUT) {
+    }
+    taken = gSleepTaken == ask;
+    dark = gDarkForSleep;
+  }
+  IOLockUnlock(gLock);
+  if (state == pianopower::kOff && (!taken || !dark))
+    note("system sleep: %s", !taken ? "the thread did not answer within 800 ms (the backlight may stay lit while suspended)"
+                                    : "an IC did not take BL_EN off (the backlight may stay lit while suspended)");
+  return pianopower::kAckNow;
 }
 
 // An administrator's request (IORegistryEntrySetCFProperties): "piano-backlight-percent" = 0..100 of the range, "piano-backlight-step"

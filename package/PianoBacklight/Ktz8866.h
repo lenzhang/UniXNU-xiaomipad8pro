@@ -255,6 +255,18 @@ class Controller {
     displayOn_ = on;
     apply();
   }
+  // A system sleep (docs/power.md 4; setPowerState off / on): asleep -> BL_EN cleared on both ICs whatever the display says (the
+  // code stays); awake -> back to what the display and the lid want (the newest code first, then BL_EN). HWEN is never touched.
+  void sleep(bool asleep)
+  {
+    if (asleep == asleep_) return;
+    asleep_ = asleep;
+    note("system %s: %s", asleep ? "sleep" : "wake",
+         asleep ? "the backlight off on both ICs (BL_EN cleared, the code kept; HWEN untouched)"
+         : wantLit() ? "the backlight as before the sleep" : "the backlight stays off (the display or the lid wants it so)");
+    apply();
+  }
+  bool asleep() const { return asleep_; }
   // The cover's hall sensor: 1 open, 0 closed, anything else unknown (treated as open).
   void lid(int state)
   {
@@ -358,7 +370,7 @@ class Controller {
   const pianoauto::Ambient &ambientState() const { return ambient_; }
 
   bool controlling() const { return control_; }
-  bool wantLit() const { return displayOn_ && !(cfg_.lidWatch && lid_ == 0); }
+  bool wantLit() const { return displayOn_ && !asleep_ && !(cfg_.lidWatch && lid_ == 0); }
   bool lit(unsigned i) const { return ic_[i].lit; }
   uint16_t code() const { return code_; }
   const IcState &ic(unsigned i) const { return ic_[i]; }
@@ -539,7 +551,7 @@ class Controller {
   Summary summary_;
   bool quiet_ = false;
   LogLimit limit_{24, 10000};
-  bool control_ = false, exponential_ = false, armed_ = false, displayOn_ = true;
+  bool control_ = false, exponential_ = false, armed_ = false, displayOn_ = true, asleep_ = false;
   bool rawSeen_ = false, rawOn_ = false;
   uint32_t rawSystem_ = 0, rawApi_ = 0;
   int lid_ = -1;

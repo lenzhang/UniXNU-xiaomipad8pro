@@ -4,7 +4,8 @@ Status, 2026-11-11: built, host-tested and in the kext list (inert without `pian
 `package/PianoBacklight` (design and boot arguments at the top of `PianoBacklight.cpp`, register facts and the state machine in
 `Ktz8866.h`, the interface for other drivers in `PianoBacklightClient.h`, provenance in `UPSTREAM`). Template: `README.md`.
 Automatic brightness (2026-11-11, host-tested, default off): `piano-backlight-auto=1` takes the ambient light policy's targets
-(§5, [sensors.md](sensors.md) §5a.4); nothing of it runs without the argument.
+(§5, [sensors.md](sensors.md) §5a.4); nothing of it runs without the argument. System sleep (2026-11-11, host-tested, linked, not
+run): at level 2 the service is in the power tree and the backlight is dark before the system freezes (§5).
 
 ## 1. Purpose and gate
 
@@ -101,6 +102,20 @@ first target says `automatic brightness: on (PianoSensors): ...`, a key `step +1
 NativeGopDisplay computes on = both non-zero (AppleParavirtDisplay's rule) and tells WindowServer (`powerstate_notify`). That is the
 hook. An "off" before the first "on" (the display not yet taken by WindowServer during boot) is ignored, so the boot screen stays lit.
 
+**System sleep** (2026-11-11; [power.md](../power.md) §4; `Ktz8866.h` `Controller::sleep`, host-tested `testSleep`). The display
+hook above also sees a system sleep (IOMFB's `setPowerState`), but it only records a request for this driver's thread, which may
+not run before the kernel freezes: the backlight could stay lit through the whole suspend. So at level 2 PianoBacklight joins the
+power tree itself (`pianopower::join`). `setPowerState(off)` hands the thread the sleep and waits for its answer (at most 800 ms):
+BL_EN cleared on both ICs whatever the display path says, the code kept, a failed write retried twice. While asleep nothing lights
+(display calls, steps, the lid and ambient targets are recorded; a step's code is used at the wake). `on` (asynchronous): back to
+what the display and the lid want, the newest code first, then BL_EN; a display that went off during the sleep stays dark until
+its on, and the boot screen's rule (an off before the first on is ignored) holds. HWEN is never written (gpio2 is read once in the
+survey); the LCD bias, the panel's reset and every register but 0x04/0x05/0x08 bit 6 are untouched. Lines: `system sleep: in the
+power tree (0): ...` at start, then per suspend `system sleep: the backlight off on both ICs (BL_EN cleared, the code kept; HWEN
+untouched)` with the two `write ...: BL_EN 0x08 = 0x3f (was 0x7f): backlight OFF` lines (or none when the display hook already
+darkened them), and `system wake: the backlight as before the sleep` / `... stays off (the display or the lid wants it so)`.
+Failure lines: `system sleep: the thread did not answer within 800 ms ...`, `... an IC did not take BL_EN off ...`.
+
 **Idle dim: not reachable.** k27 is built with `NO_KERNEL_HID`, so IOPMrootDomain's display wrangler (`DISPLAY_WRANGLER_PRESENT`) and
 its dim state do not exist; on Apple silicon the dim before display sleep is CoreBrightness's, for a built-in panel with a backlight
 service. The display power reaching the kernel is IOMFB's on/off. PianoBacklight logs the raw system/API values of every call, so a
@@ -194,6 +209,10 @@ preceded by an ignored "off ... before the first on"). Then:
 - every 10 minutes `alive: controlling, code ..., lit; N writes, 0 failed accesses; calls: display N, steps N`.
 
 **(c)** Close the folio: `lid closed`, both `BL_EN ... backlight OFF`; open: `lid open`, both `backlight ON`.
+
+**(d) System sleep** (with power.md §6 S1-S3 or the policy images, `piano-backlight=2`): each suspend `system sleep: the backlight
+off on both ICs ...` before `IOCPUSleepKernel enter`, the panel black during the suspend (it still scans until PianoDpu's panel
+sleep), and after `IOCPUSleepKernel exit` `system wake: ...` with the backlight back at the same code once the display is on.
 
 Failure lines and what they mean:
 - `bus ...: NOT used: a line is low as found` → the bus is held (the QUP engine mid-transfer, or no pull-up): nothing is tried on it.
