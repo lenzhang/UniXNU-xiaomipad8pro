@@ -11,8 +11,8 @@
 //   their consumers thermal-sensor-* ("generic-adc-thermal") and those sensors' thermal zones (no trips: monitoring only).
 // The ADC channel numbers: 0x44..0x49 AMUX1..6_THM_100K_PU, 0x4a..0x4d AMUX1..4_GPIO_100K_PU, a 100 kOhm pull-up inside the PMIC
 // and the thermistor to ground on an AMUX or a GPIO pin (Linux include/linux/iio/adc/qcom-adc5-gen3-common.h, read as the
-// specification only). PM8550 GPIOs 2-4 and PMIH0108 GPIO 6 carry thermistors and must be high-impedance (the ADC node's
-// pinctrl "therm-default-state": bias-high-impedance); PmicAdc.h reads, never writes, their state.
+// specification only). PM8550 GPIOs 2-4 and PMIH0108 GPIOs 6 and 12 carry thermistors and must be high-impedance (the ADC node's
+// pinctrl "therm-default-state": bias-high-impedance; GPIO 12 is the firmware's, below); PmicAdc.h reads, never writes, their state.
 // Encodings (the same file and drivers/iio/adc/qcom-spmi-adc5-gen3.c, specification only): decimation index into {85, 340, 1360};
 // hardware settle index into {15, 100, 200, 300, 400, 500, 600, 700, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000} us;
 // fast average 1 sample (index 0); calibration 1 = ratiometric. Gen3's ratiometric result is code = 2^14 * R / (R + Rpu); Gen4's is
@@ -106,13 +106,17 @@ constexpr bool mapValid()
 }
 static_assert(mapValid(), "a channel's settings are not encodable");
 
-// The thermistor pins that must be high-impedance (PMIC GPIO n at peripheral 0x88 + n - 1; EN_CTL 0x46 bit 7 clear = high-Z).
+// The thermistor pins that must be high-impedance (PMIC GPIO n at peripheral 0x88 + n - 1; EN_CTL 0x46 bit 7 clear = high-Z): the
+// DT's therm-default-state pins, and PMIH0108 GPIO 12, which carries charger1_therm but belongs to another EE, so the DT leaves it
+// to the firmware that keeps it high-impedance (the Ubuntu kernel's sm8750-xiaomi-piano.dts says so). All only read here.
 struct ThermPin {
   const char *pmic;
   uint8_t sid, gpio;
+  bool inDt;   // in the ADC node's pinctrl state (checked against the DT); false: the firmware's pin
 };
-constexpr unsigned kThermPinCount = 4;
-constexpr ThermPin kThermPins[kThermPinCount] = {{"pm8550", 1, 2}, {"pm8550", 1, 3}, {"pm8550", 1, 4}, {"pmih0108", 7, 6}};
+constexpr unsigned kThermPinCount = 5;
+constexpr ThermPin kThermPins[kThermPinCount] = {
+    {"pm8550", 1, 2, true}, {"pm8550", 1, 3, true}, {"pm8550", 1, 4, true}, {"pmih0108", 7, 6, true}, {"pmih0108", 7, 12, false}};
 
 }  // namespace pianothermal::adc
 #endif

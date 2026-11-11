@@ -22,11 +22,11 @@
 
 #define PIANO_BOARD_TEMPS_VERSION 1u
 
-enum piano_board_temp_index {
-  PIANO_BOARD_TEMP_BATTERY = 0,      // pmih010x_batt_therm (PMIH0108 SID 7, AMUX1 100k): the battery pack's thermistor
-  PIANO_BOARD_TEMP_CHARGER = 1,      // pmih010x_charger1_therm (PMIH0108, AMUX4 GPIO): next to the charger
-  PIANO_BOARD_TEMP_CONNECTOR = 2,    // pmih010x_conn_therm (PMIH0108, AMUX4 100k): the USB-C connector
-  PIANO_BOARD_TEMP_CONNECTOR2 = 3,   // pm8550_conn_therm2 (PM8550 SID 1, AMUX2 GPIO): a second connector thermistor
+enum piano_board_temp_index {   // the DT labels (where on the board each sits is not documented beyond them)
+  PIANO_BOARD_TEMP_BATTERY = 0,      // pmih010x_batt_therm (PMIH0108 SID 7, AMUX1 100k pull-up)
+  PIANO_BOARD_TEMP_CHARGER = 1,      // pmih010x_charger1_therm (PMIH0108, AMUX4 GPIO = its GPIO 12)
+  PIANO_BOARD_TEMP_CONNECTOR = 2,    // pmih010x_conn_therm (PMIH0108, AMUX4 100k pull-up)
+  PIANO_BOARD_TEMP_CONNECTOR2 = 3,   // pm8550_conn_therm2 (PM8550 SID 1, AMUX2 GPIO)
   PIANO_BOARD_TEMP_COUNT = 4
 };
 

@@ -203,7 +203,8 @@ struct Model {
     add(80, 0x189, 0);    // PM8550 GPIO 2, 3, 4
     add(81, 0x18a, 0);
     add(82, 0x18b, 0);
-    add(150, 0x78d, 3);   // PMIH0108 GPIO 6 (another EE's: reads still work)
+    add(150, 0x78d, 3);   // PMIH0108 GPIO 6 and 12 (another EE's: reads still work)
+    add(152, 0x793, 3);
     add(151, 0x7a0, 3);
     adcApid = 40;
     auto &sdam = pages[0x090];
@@ -426,10 +427,14 @@ static void testRound()
   CHECK(std::abs(b.ch[0].last.milliC - 45500) <= 20 && std::abs(b.ch[3].last.milliC + 5000) <= 20 && b.ch[3].last.milliC < 0);
   // the pins: three high-Z, one driven
   m.pages[0x18a][kGpioRegEn] = kGpioMasterEn;
-  const PinState p2 = b.adc.readPin(kThermPins[0]), p3 = b.adc.readPin(kThermPins[1]), p6 = b.adc.readPin(kThermPins[3]);
+  const PinState p2 = b.adc.readPin(kThermPins[0]), p3 = b.adc.readPin(kThermPins[1]), p6 = b.adc.readPin(kThermPins[3]),
+                 p12 = b.adc.readPin(kThermPins[4]);
   CHECK(p2.err == Err::none && p2.apid == 80 && p2.type == kGpioType && p2.highZ());
   CHECK(p3.err == Err::none && !p3.highZ());
   CHECK(p6.err == Err::none && p6.apid == 150 && p6.highZ());   // another EE's GPIO: observer reads work
+  CHECK(p12.err == Err::none && p12.apid == 152 && p12.highZ() && !kThermPins[4].inDt && gpioPpid(7, 12) == 0x793);
+  m.map[152] = 0;
+  CHECK(b.adc.readPin(kThermPins[4]).err == Err::noApid);
   CHECK(m.auditClean());
 }
 
@@ -663,7 +668,8 @@ static void printMap()
   for (const ChannelDesc &c : kChannels)
     std::printf("channel %#x label %s zone %s gen %u decimation %u settle %u ratiometric 1 prescale 1/1\n", c.reg, c.label, c.zone,
                 c.gen == Gen::gen4 ? 4u : 3u, c.decimation, c.settleUs);
-  for (const ThermPin &p : kThermPins) std::printf("pin sid %u gpio %u\n", p.sid, p.gpio);
+  for (const ThermPin &p : kThermPins)
+    if (p.inDt) std::printf("pin sid %u gpio %u\n", p.sid, p.gpio);   // the firmware's pin is not in the DT
 }
 
 static void printNtc()
