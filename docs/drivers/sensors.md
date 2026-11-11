@@ -1,11 +1,12 @@
 # Sensors: ambient light, accelerometer, gyroscope, proximity through the ADSP's sensor hub: PianoSensors
 
-Status: design + host-tested protocol code, 2026-11-11 (backlog B3 and B13). `package/PianoSensors` holds portable C only: the FastRPC
-reverse file service, the QMI/SNS client codecs, the read-only file pack and its builder, a safety governor and the macOS-side policies,
-all host-tested (`tests/run-host-tests.py`: ASan/UBSan, synthetic inputs, the kernel's no-FP/no-libc compile). **No kext, no boot
-argument, nothing linked, nothing run on hardware.** The macOS-side consumers (the rotation agent `piano-rotated`, PianoTouch's
-transform, PianoBacklight's automatic mode, the streams' off/on lifecycle) are `package/PianoAuto`, host-tested too (§5a). Template:
-`README.md`.
+Status: levels 1-3 built, 2026-11-11 (backlog B3 and B13). `package/PianoSensors` is a k27 native kext on PianoPower's client
+contract (`package/include/PianoAdspContract.h`, `charging.md` §9): level 1 a read-only survey, level 2 the FastRPC reverse file service
+serving the owner's sensor pack from the ESP, level 3 the SNS client's sensor list. Host-tested (`tests/run-host-tests.py`: ASan/UBSan,
+synthetic inputs only, a simulated DSP and hub, the pack on an mtools FAT32 image, the kernel's no-FP/no-libc compile), compiled with the
+kernel's flags and **linked into the KC** (`configs/k27-native-kexts.txt`, after PianoPower and NativeUfs; the 2026-11-11 link with main's list:
+PianoSensors 384 pointers), inert without `piano-sensors`. **Not run on hardware.** Template: `README.md`. The macOS-side consumers (the rotation agent `piano-rotated`, PianoTouch's transform, PianoBacklight's
+automatic mode, the streams' off/on lifecycle) are `package/PianoAuto`, host-tested (§5a).
 
 ## 1. Purpose and gate
 
@@ -68,9 +69,11 @@ the v1.1.1 "light stops after off/on" fix: a nested close cancelled an open's fi
 **PaganiSensors** (UniXNU-Pagani-Drivers 3d570b7, BSD-2-Clause-Patent; OnePlus 13T, SM8750, iOS; host-tested only): taken unchanged
 (sha256 in `UPSTREAM`): `SensorsPb` (protobuf), `SensorsSsc` (QMI + SNS), `SensorsRpc` (the reverse file service: attach, listener,
 read-only `apps_std`, `apps_mem` heap pages, link loss), `SensorsPack` (the read-only file tree), `SensorsFixed`, `SensorsOrient`, and
-their tests. Derived: the pack builder (piano's ODM archive, a soc0 allowlist, never written into a repository). Its manager
-(`SensorsCore`: lookups, attributes, streams, retries) is the template of levels S2-S4, taken once PianoPower's router ports exist.
-New: `SensorsGuard` (section 7), `SensorsPolicy` (section 5), `tests/piano.c`.
+their tests. Derived: the pack builder (piano's ODM archive, a soc0 allowlist, never written into a repository) and `SensorsRpc` (an
+`admit` hook: a call the guard declines is answered at once with `SSR_EUNSUPPORTED`, counted as `declined`). PAG's manager
+(`SensorsCore`: streams, retries, iOS units) stays the template of level 4's streams. New: `SensorsGuard` and `SensorsHealth.h`
+(section 7), `SensorsPolicy` (section 5), `SensorsClient` (level 3: one connection, lookups then attributes, the guard asked for each
+request), `SensorsLoad` (the pack from the ESP), `PianoSensors.cpp` (the kext), `tests/piano.c` and `tests/load.c`.
 
 Cross-checks written here from the other sources, not from PAG (`tests/piano.c`): the SNS request bytes against libssc's messages, the
 QMI frames against libqmi (also parsed by PianoPower's own `qcom_qmi_parse`), and the file service's whole bring-up against FRPC and the
@@ -85,9 +88,9 @@ layout is a contained change in `SensorsRpc.c`'s `invoke()`.
 
 ```
 PianoPower (owns the DSP: PAS, SMP2P, GLINK, IPCRTR, locator, servreg; never touched by sensors)
-  |-- GLINK "fastrpcglink-apps-dsp" (existing client API) --> file service: attach PD 2, listener, apps_std from the pack (read only)
-  |-- QRTR client ports (requested, 10.1 B) -------------> SNS client: service 400, a port per sensor
-  '-- health: fatal bit, crash text, charger generation --> SensorsGuard (section 7) gates both
+  |-- GLINK "fastrpcglink-apps-dsp" (contract) ----------> file service: attach PD 2, listener, apps_std from the pack (read only)
+  |-- one QRTR client port following service 400 --------> SNS client: lookups, attributes (level 3); streams (level 4)
+  '-- piano_adsp_health / piano_adsp_quiet --------------> SensorsGuard (section 7) gates both
 PianoSensors : IOService on IOPlatformExpertDevice (not HID: no macOS consumer reads sensor HID services for this display)
   |-- ambient_light (514, on change; AutoLight) -> SensorsPolicy curve -> PianoBacklight "PianoBacklightAmbient" (requested, §5a.4)
   |-- accel (513, 10 Hz, only while the cover is detached; AutoStream) -> SensorsOrient -> property piano-sensors-edge (§5a.5)
@@ -97,11 +100,12 @@ PianoSensors : IOService on IOPlatformExpertDevice (not HID: no macOS consumer r
 
 **The files.** One pack (`SensorsPack.h`) built on the host by `tools/make-sensor-pack.py` from archives of this tablet's own trees
 (vendor and odm sensor directories, persist's `sensors/` mounted `ro,noload`, the allowlisted soc0 values), kept under the ignored
-`out/` or `private/` and copied by the maintenance session to the ESP (partition 37, FAT32) as `\piano\sensors\pack.bin`, never into a
-published image. The
-kext reads it through NativeUfs's `native_ufs_part_find`/`native_ufs_part_read` and PianoPower's `FatVolume` (as PianoPower's firmware and
-PianoWifi do) and **loads it whole into memory before the attach** (a few hundred KiB; refused above 4 MiB), so no DSP file call ever
-waits for UFS. Writes (`fwrite`, `fremove`, `frename`, `ftrunc`) are declined with an error: persist stays pristine and nothing written by
+`out/` or `private/` and put on the ESP (partition 37, FAT32, 4096-byte sectors) as `EFI/UniXNU/piano-sensors.pack` by
+`build-esp.py --sensor-pack` (section 5b), never into a published image. The kext (`SensorsLoad.c`) finds partition `esp` through
+NativeUfs's `native_ufs_part_find`/`native_ufs_part_read`, reads it with its copy of PianoPower's `FatVolume` (as PianoPower's firmware
+and PianoWifi do) and **loads the pack whole into memory and checks it before the attach** (a few hundred KiB; refused above 4 MiB), so
+no DSP file call ever waits for UFS. Level 2 does not start without a valid pack (`piano-sensors-nopack=1` serves an empty one: every
+open fails and is logged, the way a first run learns what the pack must hold). Writes (`fwrite`, `fremove`, `frename`, `ftrunc`) are declined with an error: persist stays pristine and nothing written by
 the DSP can wedge the next boot (#3's cause). Ubuntu's V4 run sampled with an unchanged pristine registry. If S3 shows the PD retrying
 writes in a loop, a volatile RAM overlay (fstempfile + frename, lost at reboot) is the next step. B13 at run time: a read-only ext4
 reader for persist's `sensors/registry` (extents, linear directories, no journal replay) replacing the pack's copy (level S6).
@@ -112,6 +116,29 @@ up): the same question as `audio.md` §10.4 (candidates: the UEFI's former "Kern
 of conventional low memory). The alternative is a translating context bank with our own page tables (UniXNU's ArmSmmu4K): on piano the
 HLOS programs the compute-cb banks (Linux does), unlike the audio streams sheng found to be the hypervisor's. 2 MiB of calls plus up to
 6 MiB of heap pages (PAG's split); mapped write-combined, published with a barrier before each send.
+
+**Properties** of the `PianoSensors` service (class `PianoSensors` on IOPlatformExpertDevice; match it by class name). They are the
+interface for the consumers (the auto-brightness and rotation work) and stay as named here; values are set with `setProperty` (no
+notification: poll at most 4 times a second, or the kernel consumer reads them on its own thread).
+
+| Property | Type | Set by | Meaning |
+|---|---|---|---|
+| `piano-sensors` | number | all levels | the level running (1..3) |
+| `piano-sensors-guard` / `-guard-reason` | string | level 1+ | `wait`, `run`, `backoff`, `off` / `none` or why it is off (`sg_reason_name`) |
+| `piano-sensors-dsp` | string | level 1+ | PianoPower's health: stage, up, fatal/reports, link and charger generations, quiet, crash reason |
+| `piano-sensors-channel` / `-channel-ups` | number | level 1+ | 1 while `fastrpcglink-apps-dsp` is up / how often it came up |
+| `piano-sensors-sns` | string | level 1+ | where service 400 is announced (node, port, instance, generation), or not announced |
+| `piano-sensors-pack` | string | level 1+ | the pack's verdict: `ok: N entries, B bytes;` and which of sns_reg_config, json.lst, registry, soc0 it holds, or the error |
+| `piano-sensors-smmu`, `-arena` | string | level 1+ | the four streams' entries (planned at 1, set at 2); the arena's address and verdict |
+| `piano-sensors-rpc` | string | level 1+ | the file service: stage, attaches, calls, opens, missing, reads, refused (writes), declined (guard), bytes, first missing path |
+| `piano-sensors-types` | dictionary | level 3 | data type (`registry`, `accel`, `gyro`, `mag`, `ambient_light`, `proximity`) -> `pending`, `none`, `no answer`, or `found N: name (vendor), available A, streaming/on change, rates L-H Hz` |
+| `piano-sensors-lux` | number | level 4 (reserved) | the front light sensor's last reading, integer lux |
+| `piano-sensors-light-target` | number | level 4 (reserved) | the backlight target, permille 0..1000 (`ps_als_step`) |
+| `piano-sensors-edge` | string | level 4 (reserved) | the panel edge that is up: `top`, `left`, `bottom`, `right`, `none` (`ps_edge_name` of `ps_edge_of`, after SensorsOrient's hold) |
+| `piano-sensors-seq` | number | level 4 (reserved) | moves with every change of the three above |
+
+The rotation agent applies `ps_rotation_step` itself (SensorsPolicy.c is plain C and links into user space) with PianoKeyboard's
+`piano-keyboard-attached` and the user's lock; the backlight takes `piano-sensors-light-target`.
 
 **macOS consumers** (all of it in §5a, code in `package/PianoAuto`).
 - Ambient light: the curve (`ps_als_curve`: 0 lux 4 %, 100 lux 24 %, 300 lux 37 %, 1000 lux 57 %, 10000 lux 100 %, battery first),
@@ -281,30 +308,73 @@ PIANO_SEED=out/rotated/stage/scratch-data.img PIANO_TRUST=out/rotated/stage/kern
 7. Sensors (S4): the hub's first event on enable is inferred (the re-arm covers it); an under-display light sensor sees the panel
    (question 9); the edge's axes are inferred (`piano-rotate-map`, `piano-sensors-axes`).
 
+### 5b. The pack, step by step (the owner's own tablet; nothing private is committed)
+
+On the tablet, under Ubuntu (read only; `persist` is never mounted writable; the archives' member names are the DSP's paths):
+
+```sh
+mkdir -p ~/piano-sensor-dump && cd ~/piano-sensor-dump
+sudo mkdir -p /mnt/persist-ro && sudo mount -o ro,noload /dev/disk/by-partlabel/persist /mnt/persist-ro
+sudo tar -C /mnt/persist-ro --transform 's,^,mnt/vendor/persist/,' -cf persist-sensors.tar sensors
+sudo umount /mnt/persist-ro
+# the ROM's sensor configuration as Ubuntu's piano-sensors package installed it (the same for every unit of that ROM build)
+tar -C /usr/share/piano/sensors --transform 's,^vendor/,vendor/etc/sensors/,' -cf vendor-etc-sensors.tar vendor
+tar -C /usr/share/piano/sensors --transform 's,^odm/,odm/etc/sensors/,' -cf odm-etc-sensors.tar odm
+for n in soc_id revision machine family platform_subtype platform_subtype_id platform_version hw_platform; do
+  [ -r /sys/devices/soc0/$n ] && echo "$n=$(cat /sys/devices/soc0/$n)"; done > soc0.txt
+sudo chown "$USER" *.tar && chmod 600 *
+```
+
+Copy the directory to the Mac into the checkout's ignored `out/sensors/dump/` (USB or the owner's usual private path), then:
+
+```sh
+python3 package/PianoSensors/tools/make-sensor-pack.py --dump out/sensors/dump --out out/sensors/pack.bin --list
+python3 tooling/persist/build-esp.py --profile base --sensor-pack out/sensors/pack.bin    # plus the usual --arg/--default options
+```
+
+`--list` prints sizes and paths only (no contents). The tool refuses a serial number in soc0.txt and any output inside the repository
+but `out/`/`private/`; it warns when sns_reg_config, json.lst or the persist registry is missing (without the registry the DSP falls back
+to the ROM's generic calibration). `build-esp.py --sensor-pack` checks the pack (magic, size, at most 4 MiB), puts it at
+`EFI/UniXNU/piano-sensors.pack` and records only its sha256 in `out/persistent/<name>.json`; the ESP image then holds this unit's
+calibration (keep it local, never share it). Writing the ESP to the tablet is the maintenance session's step (`maint-session.py`,
+`persistent-boot.md`), done by the owner. A RAM-image boot reads the pack from the installed ESP as well. Alternatives for the vendor/odm
+trees: the tablet's own `vendor_a`/`odm_a` from `super` (`lpunpack`, then `fsck.erofs --extract`), archived with the same member names.
+
 ## 6. Boot args
 
 | Argument | Default | Values |
 |---|---|---|
-| `piano-sensors=N` | 0 | 0 nothing; 1 read-only survey (no DSP traffic); 2 + SNS lookups/attributes; 3 + the file service; 4 + streams and the consumers |
-| `piano-sensors-axes=a..` | `a+y+x+z` | the accelerometer map (SensorsFixed text), for the four-edge test |
-| `piano-sensors-bank=N` / `-rpc-pa=ADDR` | 3 / none | the context bank (3..8); the arena's physical address (S3 refuses to run without one) |
-| `piano-sensors-settle=S` | 20 | seconds of a healthy charger domain before the first request |
-| `piano-sensors-als=0`, `-rotate=0`, `-log=0..2` | 1, 1, 1 | consumers off; log volume |
+| `piano-sensors=N` | 0 | 0 nothing (probe declines); 1 read-only survey; 2 + the FastRPC file service; 3 + the SNS sensor list (built); 4 + streams and the consumers (next) |
+| `piano-sensors-rpc-pa=ADDR` | none | the arena's physical address (8 MiB, below 4 GiB, outside the known owners: `ps_arena_check`); level 2 runs no file service without one |
+| `piano-sensors-bank=N` | 3 | the context bank (3..8); its streams 0x1000+N, +0x80, +0x40, +0x60 |
+| `piano-sensors-smmu=0` | 1 | leave the SMMU alone at level 2 (the streams must bypass already) |
+| `piano-sensors-settle=S` | 20 | seconds of the charger's newest generation before the first request |
+| `piano-sensors-nopack=1` | 0 | level 2 with an empty pack (every open fails and is logged) |
+| `piano-sensors-channel=0` | 1 | level 1 does not register the FastRPC channel |
+| `piano-sensors-delay=S`, `-log=0..2` | 0, 1 | wait first; log volume (2: every SNS line) |
+| `piano-sensors-axes=a..` (level 4) | `a+y+x+z` | the accelerometer map (SensorsFixed text), for the four-edge test |
 
 The consumers' own arguments: `piano-rotate*` (the agent, §5a.2) and `piano-backlight-auto=1` (PianoBacklight, §5a.4).
 
 ## 7. Kernel component, and the safety story
 
-Component `PianoSensors` (`com.unixnu.driver.PianoSensors`), listed after PianoPower in `configs/k27-native-kexts.txt` once level 1
-exists, inert without `piano-sensors`, imports PianoPower's client functions by name. Rules (`SensorsGuard.c`, host-tested):
+Component `PianoSensors` (`com.unixnu.driver.PianoSensors`, `tooling/k27/kext/PianoSensors.json` naming `com.unixnu.driver.PianoPower`
+and `com.unixnu.driver.NativeUfs` as libraries), listed after both in `configs/k27-native-kexts.txt`; built by
+`tooling/k27/build-native-piano-sensors.sh` (host tests, the copies of FatVolume and SmmuStream checked against their originals, the
+objects, the import check: 335 kernel imports, 8 from the libraries). Two threads (`piano-sensors`: health, guard, SNS client,
+properties; `piano-sensors-rpc`: the file service); PianoPower's callbacks only record and wake them. Rules (`SensorsGuard.c` and
+`SensorsHealth.h`, host-tested):
 
 1. A client only: never start, stop or restart the DSP, never vote its rails or touch RPMh/AOSS; no re-attach after a failed attach in
    the same boot (Ubuntu's `Restart=no`).
 2. Charger first: nothing is sent until the DSP is up, `charger_pd` is up and its newest generation has been up for 20 s, and while
    PianoPower asks for quiet.
-3. One strike: the SMP2P fatal bit, any SMEM crash reason, a new charger generation, the charger domain down, or a new GLINK link
-   generation turns the sensors off for the rest of the boot.
-4. Rate: 8 requests at once, 4 per second; a failure backs off 1, 2, 4 ... 64 s; 6 failures in 10 minutes: off.
+3. One strike: the SMP2P fatal bit now or any fatal report since the start (`fatal_reports`), any SMEM crash reason, a new charger
+   generation or the charger domain not up, a new link generation or the DSP not up once we started, or a health report of another
+   contract version turns the sensors off for the rest of the boot. Before the first request a charger restart only starts the
+   settling over.
+4. Rate: 8 requests at once, 4 per second (each bring-up call of the file service and each SNS request takes one); a failure (a
+   refused or unanswered attach, a refused, unanswered or erroring SNS request) backs off 1, 2, 4 ... 64 s; 6 failures in 10 minutes: off.
 5. The DSP's file calls are answered at once from memory; when off, each is still answered, with an error (a silent listener blocks a
    PD thread, which `sns_watchdog` kills the DSP for); more than 3000 file calls in a minute (a PD in a loop): off.
 6. Read only: persist and the pack are never written; no per-unit value is logged at default levels; only the allowlisted soc0 names
@@ -312,17 +382,19 @@ exists, inert without `piano-sensors`, imports PianoPower's client functions by 
 
 ## 8. Hardware test plan (after PianoPower level 2 is healthy; attended, RAM boot, charged battery, cable attached)
 
-| Level | What runs | Pass | Effort |
-|---|---|---|---|
-| S0 | (done offline) design, codecs, guard, policy, pack tool | `run-host-tests.py` PASS | done |
-| S1 survey | `=1`: the router's services (0x190 there? instance), the `open:` list, SMMU entries of 0x1003..0x1008/0x1043.. (loads only), the pack found and valid on the ESP, the arena candidate's map type; no message to the DSP | all listed; nothing written; charger unchanged | 1-2 days, 1 boot |
-| S2 SNS | `=2`: SUID lookups (`registry`, accel, gyro, ambient_light, proximity, mag) and attributes, no file service, no stream | answers parse; expected without files: `registry` maybe, no accel (SUN saw that with incomplete files); no fatal for 10 min, `charger_pd` generation and charge current unchanged | PianoPower ports (owner) + 2-3 days, 1-2 boots |
-| S3 files | `=3`: attach (bank 3, then 4), listener, the pack served, writes declined, every path logged | attach retval 0; `sns_reg_config`, `json.lst`, the registry read; S2's lookups now find accel/gyro/light; no fatal for 15 min, charger unchanged | 3-5 days, 2-4 boots |
-| S4 streams | `=4`: light on change -> PianoBacklight (`AutoLight`, `piano-backlight-auto=1`); accel 10 Hz -> the edge (`AutoStream`); 20 light off/on cycles | lux follows a lamp, the backlight within 2 s; readings after every cycle (v1.1.1); the four edges named right (fix `-axes` if not) | 3-4 days, 2 boots |
-| S5 rotation | `piano-rotated` (§5a.8: R0-R2 can run before S4, with the test edge), the cover lock, touch rotation | each edge upright with touch at the four corners (Ubuntu's table); attached -> normal | 2-4 days, 2-3 boots |
-| S6 B13 | persist's registry read at run time (ext4 reader), or the RAM overlay if S3 asked for it | readings identical with the pack's registry; at rest 9.81 +- 0.1 m/s^2 on each face; light within 10 % of Ubuntu's under one lamp | 3-5 days, 1-2 boots |
+Every run with `piano-power=2` (PianoPower starts the DSP; the sensors never do), after the pack is on the ESP (section 5b).
 
-About 3-4 weeks of work and 9-14 attended boots. Fails safe: everything stops at the first guard event; a reboot returns to Ubuntu.
+| Level | What runs | Pass | State, effort |
+|---|---|---|---|
+| S1 survey | `piano-sensors=1`: health through the guard, the channel registered, the SNS port, the pack loaded and checked, the SMMU entries of 0x1003/0x1083/0x1043/0x1063 planned (loads only), the arena address checked (not mapped); no message to the DSP | `piano-sensors-dsp` up with `charger_pd 0x1fffffff`; `-guard run` 20 s after; `-channel 1` (the DSP's open answered); `-sns` announced; `-pack ok` with all four items; `-smmu` and `-arena` listed; no fatal and the charger generation unchanged for 10 min | built; 1 boot |
+| S2 files | `=2 piano-sensors-rpc-pa=ADDR`: the arena mapped, the streams bypassed, attach (bank 3, then `-bank=4`), listener, every DSP call answered from the pack, writes declined | `rpc: attached to the sensors PD`, `listening`, `first call of the DSP`, `rpc open` lines for sns_reg_config, json.lst and the registry; `-rpc` declined 0; the refused writes counted; no fatal for 15 min, charger unchanged | built; 2-4 boots |
+| S3 sensor list | `=3 piano-sensors-rpc-pa=ADDR`: + SUID lookups and attributes, no stream | `-types`: registry, accel, gyro, ambient_light, proximity, mag found with names and rates (without the file service, as SUN saw: accel none); guard `run` all along | built; 1-2 boots |
+| S4 streams | `=4`: light on change -> `piano-sensors-light-target` / PianoBacklight; accel 10 Hz while the cover is detached -> `piano-sensors-edge`; 20 light off/on cycles | lux follows a lamp, the backlight within 2 s; readings after every cycle (v1.1.1); the four edges named right (fix `-axes` if not) | next: 2-3 days, 2 boots |
+| S5 rotation | the agent (staged and signed like the GPU plugin), the cover lock, touch rotation (the consumers' work) | each edge upright with touch at the four corners (Ubuntu's table); attached -> normal | 3-5 days, 2-3 boots |
+| S6 B13 | persist's registry read at run time (ext4 reader), or the RAM overlay if S2 asked for it | readings identical with the pack's registry; at rest 9.81 +- 0.1 m/s^2 on each face; light within 10 % of Ubuntu's under one lamp | 3-5 days, 1-2 boots |
+
+What is left: S4-S6, about 2-3 weeks, and 9-14 attended boots for all six. Fails safe: everything stops at the first guard event; a
+reboot returns to Ubuntu.
 
 ## 9. Fallback
 
@@ -331,7 +403,13 @@ entry, if it exists for this display) or none. Ubuntu keeps its own sensor stack
 
 ## 10. Open questions and risks
 
-### 10.1 The API asked of PianoPower (its owner adds it; PianoSensors does not edit PianoPower) and of the other drivers
+### 10.1 The API asked of PianoPower and of the other drivers
+
+Delivered (2026-11-11): A-C as PianoPower's client contract (`package/include/PianoAdspContract.h`, `charging.md` §9: 6 GLINK slots,
+8 QRTR client ports with callbacks, 2048-byte IPCRTR receive buffers, `piano_adsp_health` with the fatal bit and count, its own crash
+string and the link and charger generations, `piano_adsp_quiet`, and GLINK keeping a DSP-side open that precedes the registration);
+PianoKeyboard publishes `piano-keyboard-attached`. PianoSensors uses one channel and one port. Still open: D (the arena), PianoBacklight's
+and PianoTouch's inputs (for level 4), NativeGopDisplay's transform (R2 only). The original request, for the record:
 
 - A. Existing, used as is: `piano_adsp_channel("fastrpcglink-apps-dsp", 512, 8, 0 /* the DSP opens it */, ...)` and `piano_adsp_send`
   (40-byte invokes; answers of 12-16 bytes). Asked: `kClients` from 4 to 6 (IPCRTR, PMIC_RTR_ADSP_APPS, audio's adsp_apps and this one
@@ -355,17 +433,17 @@ entry, if it exists for this display) or none. Ubuntu keeps its own sensor stack
 
 1. Does the sensor PD stay quiet for hours with nobody attached (215 s seen)? (S1, a long charging run)
 2. Which bank the DSP accepts for PD 2 (3 is Linux's first session on piano, 4 the 13T's) and whether 0x1003 is in bypass, fault or
-   translation when the boot hands over. (S1, S3)
+   translation when the boot hands over. (S1, S2)
 3. The arena's location (10.1 D). (S1 + owner decision with audio)
-4. Whether the PD asks for `apps_mem` pages, socinfo, DSP libraries (`/usr/lib/qcom/adsp`, empty on Ubuntu) or files outside the pack. (S3 log)
-5. Whether declined writes are harmless (Ubuntu's V4 says yes) or the PD loops (then the RAM overlay). (S3)
-6. One QMI client per sensor (libssc, Android) or one for all: ports needed. (S2)
+4. Whether the PD asks for `apps_mem` pages, socinfo, DSP libraries (`/usr/lib/qcom/adsp`, empty on Ubuntu) or files outside the pack. (S2 log)
+5. Whether declined writes are harmless (Ubuntu's V4 says yes) or the PD loops (then the RAM overlay). (S2)
+6. One QMI client for the lookups and attributes (level 3 uses one) is enough; whether streams want one each (libssc, Android) at S4.
 7. The rotation path (verdict R1, §5a.1): does WindowServer answer `canChangeOrientation` yes for NativeGopDisplay's panel, and does a
    rotated desktop come through its CPU copy unchanged (composited rotated) or as transposed swaps? (§5a.8 R0, no sensor needed)
 8. The physical axes (left/right) (S4, S5: Ubuntu's four-edge table). macOS's sense of "90 deg" is public: clockwise, the panel's left
    edge up (CGDisplayConfiguration.h, §5a.1).
 9. The front sensor's placement (bezel or under the panel: an under-display sensor would see the screen's own light). (S4, lamp off/on)
-10. Jumbo reports: requested as "small" (TLV 0x10 = 0) to fit the intents; whether the hub then splits or drops large ones. (S2)
+10. Jumbo reports: not requested (no TLV 0x10) to fit the router's 2048-byte buffers; whether the hub then splits or drops large ones. (S3)
 
 ## 11. Licence note
 
