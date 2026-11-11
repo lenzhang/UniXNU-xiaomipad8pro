@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- UniXNU-piano: the recommended pmset timers (docs/policy.md section 7), set once per power source unless the owner set them
+     first (tooling/userland/piano-pmset-defaults.sh). Install as /Library/LaunchDaemons/com.unixnu.piano-pmset-defaults.plist
+     (root:wheel 644) with the script at /usr/local/libexec/piano-pmset-defaults (root:wheel 755): configs/userland.toml,
+     docs/userland.md. One run per boot (LaunchOnlyOnce); it returns at once when both power sources are settled. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.unixnu.piano-pmset-defaults</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>/usr/local/libexec/piano-pmset-defaults</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>LaunchOnlyOnce</key><true/>
+</dict>
+</plist>

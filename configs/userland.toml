@@ -1,0 +1,123 @@
+# The userland of native macOS on piano (docs/userland.md): every program and launchd job this repository puts on the tablet, where
+# it goes, with which owner and mode, and whether its job runs in the installed profile. tooling/userland/stage.py builds the files,
+# signs the Mach-Os ad hoc (the linker's signature), puts them into a copy of the Data seed (or a live update's bundle) under
+# `staging`, adds the Mach-Os' CDHashes to the trust cache and writes the record; the seed's boot job then runs the staged
+# install.sh, which installs them with these owners and modes.
+#
+# [[unit]]       one piece: name, about, default_on (its launchd job runs in the installed profile: loaded at install; false: the
+#                job file is installed with Disabled and the owner turns it on with launchctl enable), status = "planned" (listed,
+#                not built or staged). A unit has at most one launchd job; a unit without one is a command-line tool and is always
+#                installed (default_on must be true).
+# [[unit.file]]  one installed file:
+#   dest         its path on the tablet: /Library/LaunchDaemons/<Label>.plist, /Library/LaunchAgents/<Label>.plist (a launchd job,
+#                root:wheel 0644: launchd refuses any other), /usr/local/bin/<name> (commands), /usr/local/libexec/<name> (helpers)
+#   owner, mode  default "root:wheel"; mode in octal ("0755" programs and scripts, "0644" job files)
+#   build        "copy": `source` as it is
+#                "cc": xcrun clang for `arch` (arm64, or arm64e), macOS `min_os` (default 14.0), -O2 -Wall -Wextra -Werror, `cflags`,
+#                      `frameworks`; `source` (or `sources`) compiled and linked in one step, output named as dest (the linker's ad
+#                      hoc signature names the file, so the CDHash is the installed file's)
+#                "script": `command` (an argv, run from the repository root) builds `output`; `inputs` (globs) are what the build
+#                      stamp covers: unchanged inputs, no rebuild, the same bytes and the same CDHash
+#   trust        a Mach-O's CDHash goes into the trust cache (default true; a script or plist has none)
+
+format = 1
+staging = "/private/var/piano/userland"
+
+[[unit]]
+name = "pianousb-shell"
+about = "the root shell on PianoDwc3's user pipe (docs/drivers/usb-device-debug.md section 6); exits at once without the kernel argument piano-usb-shell=1"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/pianousb-shell/pianousb-shell.c"
+build = "cc"
+arch = "arm64"
+dest = "/usr/local/libexec/pianousb-shell"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/native/pianousb-shell/com.unixnu.pianousb-shell.plist"
+build = "copy"
+dest = "/Library/LaunchDaemons/com.unixnu.pianousb-shell.plist"
+mode = "0644"
+
+[[unit]]
+name = "piano-policy-agent"
+about = "PianoPolicy's agent (docs/policy.md section 4): Low Power Mode into machdep.piano_policy_lpm, display sleep on a cover closed without sleep; event driven"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-policy-agent/piano-policy-agent.sh"
+build = "copy"
+dest = "/usr/local/libexec/piano-policy-agent"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/native/piano-policy-agent/com.unixnu.piano-policy-agent.plist"
+build = "copy"
+dest = "/Library/LaunchDaemons/com.unixnu.piano-policy-agent.plist"
+mode = "0644"
+
+[[unit]]
+name = "piano-rotated"
+about = "PianoAuto's display rotation agent (docs/drivers/sensors.md section 5a); exits at once without the kernel argument piano-rotate"
+default_on = true
+
+[[unit.file]]
+build = "script"
+command = ["tooling/k27/build-piano-rotated.sh"]
+output = "out/piano-rotated/piano-rotated"
+inputs = ["tooling/k27/build-piano-rotated.sh", "package/PianoAuto/*.[ch]", "package/PianoAuto/daemon/*", "package/PianoAuto/tests/*",
+          "package/PianoSensors/*.[ch]", "package/PianoBacklight/*.h", "package/include/*.h"]
+dest = "/usr/local/libexec/piano-rotated"
+mode = "0755"
+
+[[unit.file]]
+source = "package/PianoAuto/daemon/com.unixnu.piano-rotated.plist"
+build = "copy"
+dest = "/Library/LaunchAgents/com.unixnu.piano-rotated.plist"
+mode = "0644"
+
+[[unit]]
+name = "piano-torch"
+about = "the rear torch from macOS (docs/drivers/torch.md section 5): sudo piano-torch on|off|toggle|status; needs PianoTorch at piano-torch=2"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-torch/piano-torch.c"
+build = "cc"
+arch = "arm64"
+frameworks = ["IOKit", "CoreFoundation"]
+dest = "/usr/local/bin/piano-torch"
+mode = "0755"
+
+[[unit]]
+name = "piano-pmset-defaults"
+about = "the recommended pmset timers (docs/policy.md section 7) set once per power source, unless the owner set that source's timers first"
+default_on = true
+
+[[unit.file]]
+source = "tooling/userland/piano-pmset-defaults.sh"
+build = "copy"
+dest = "/usr/local/libexec/piano-pmset-defaults"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/userland/com.unixnu.piano-pmset-defaults.plist"
+build = "copy"
+dest = "/Library/LaunchDaemons/com.unixnu.piano-pmset-defaults.plist"
+mode = "0644"
+
+[[unit]]
+name = "piano-wifi"
+about = "the Wi-Fi command-line tool of docs/drivers/wifi.md section 13.1 (scan, join, status over PianoWifi's control socket); not written yet"
+status = "planned"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-wifi/piano-wifi.c"
+build = "cc"
+arch = "arm64"
+frameworks = ["CoreFoundation"]
+dest = "/usr/local/bin/piano-wifi"
+mode = "0755"
