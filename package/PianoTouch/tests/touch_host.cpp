@@ -14,6 +14,7 @@
 #include "TouchMatrix.h"
 #include "TouchHid.h"
 #include "Se2Bus.h"
+#include "TouchPace.h"
 #ifdef PIANO_TOUCH_SYNTHETIC_HEADER
 #include PIANO_TOUCH_SYNTHETIC_HEADER   // tests/synthetic-calibration.json through tooling/k27/gen-touch-calibration.py
 #endif
@@ -681,6 +682,86 @@ void testClock()
   CHECK(kVoteBits == 0x013c0000u && kGpio[kMiso] == 40 && kGpio[kCs] == 43 && kGpio[kIrq] == 162 && kGpio[kLcdId] == 100);
 }
 
+// TouchPace in a model of PianoTouch::serve's loop (times in us): frames every 8333 us, a read takes 4500 us and sees the finger
+// if it is down at the read; the panel is busy while the last frame had the finger. irq: the edge wait is one wake-up (the
+// interrupt), else 1 ms polls. Returns the wake-ups and reads in [from, to), and the first read with the finger after fingerOn.
+struct PaceRun {
+  unsigned wakeups = 0, reads = 0;
+  uint64_t firstSeenUs = 0;
+};
+static PaceRun simulatePace(uint32_t idleMs, bool irq, uint64_t fingerOn, uint64_t fingerOff, uint64_t from, uint64_t to)
+{
+  constexpr uint64_t kFrameUs = 8333, kReadUs = 4500;
+  TouchPace pace = touchPace(idleMs, 0);
+  PaceRun r;
+  uint64_t t = 0, lastEdgeTaken = 0, lastReadUs = 0;
+  bool touching = false;
+  auto lastEdgeAt = [&](uint64_t at) { return at / kFrameUs * kFrameUs; };
+  auto count = [&](uint64_t at) { if (at >= from && at < to) ++r.wakeups; };
+  while (t < to) {
+    const uint64_t edge = lastEdgeAt(t);
+    if (edge > lastEdgeTaken && edge > 0) {   // latched: read (1 ms polls see an edge at most 1 ms late)
+      lastEdgeTaken = edge;
+      if (t >= from && t < to) ++r.reads;
+      touching = t >= fingerOn && t < fingerOff;
+      if (touching && !r.firstSeenUs) r.firstSeenUs = t;
+      lastReadUs = t;
+      t += kReadUs;
+    }
+    const bool idle = pace.idle(t / 1000, touching);
+    if (idle) {
+      const uint32_t sleep = pace.sleepMs(t / 1000, lastReadUs / 1000);
+      if (sleep) {
+        t += uint64_t(sleep) * 1000;
+        count(t);
+        lastEdgeTaken = lastEdgeAt(t);   // the latch dropped
+        continue;
+      }
+      if (irq) {   // armed: the interrupt at the next edge
+        t = lastEdgeAt(t) + kFrameUs + 50;
+        count(t);
+        continue;
+      }
+    }
+    t += 1000;
+    count(t);
+  }
+  return r;
+}
+
+static void testPace()
+{
+  CHECK(TouchPace::clampIdle(0) == 0 && TouchPace::clampIdle(1) == kIdleReadMinMs && TouchPace::clampIdle(9999) == kIdleReadMaxMs);
+  {   // the old loop (idle 0): 1000 wake-ups and ~120 reads a second at rest
+    const PaceRun r = simulatePace(0, false, ~0ull, ~0ull, 10000000, 20000000);
+    CHECK(r.wakeups >= 3000 && r.wakeups <= 10000 && r.reads >= 1190 && r.reads <= 1210);   // 1 ms polls between the reads
+  }
+  {   // idle 50 ms, polled: about 20 reads and well under 150 wake-ups a second
+    const PaceRun r = simulatePace(kIdleReadMs, false, ~0ull, ~0ull, 10000000, 20000000);
+    std::printf("pace: idle %u ms, polled: %u wake-ups, %u reads in 10 s\n", kIdleReadMs, r.wakeups, r.reads);
+    CHECK(r.reads >= 170 && r.reads <= 210 && r.wakeups <= 1500);
+  }
+  {   // idle 50 ms, interrupt: two wake-ups a read
+    const PaceRun r = simulatePace(kIdleReadMs, true, ~0ull, ~0ull, 10000000, 20000000);
+    std::printf("pace: idle %u ms, interrupt: %u wake-ups, %u reads in 10 s\n", kIdleReadMs, r.wakeups, r.reads);
+    CHECK(r.reads >= 170 && r.reads <= 210 && r.wakeups <= 2 * r.reads + 10);
+  }
+  // A finger at any phase is read at most an idle period and a frame (plus a poll) late, then every frame while it stays and for
+  // kHoldMs after it lifts.
+  for (bool irq : {false, true})
+    for (uint64_t phase = 0; phase < 60000; phase += 1777) {
+      const uint64_t on = 20000000 + phase, off = on + 500000;
+      const PaceRun seen = simulatePace(kIdleReadMs, irq, on, off, 0, on + 200000);
+      CHECK(seen.firstSeenUs && seen.firstSeenUs - on <= (kIdleReadMs + 9 + 1) * 1000ull);
+      const PaceRun busy = simulatePace(kIdleReadMs, irq, on, off, on + 100000, off);
+      CHECK(busy.reads >= 45);   // every frame of the last 400 ms (48 frames)
+      const PaceRun hold = simulatePace(kIdleReadMs, irq, on, off, off + 100000, off + kHoldMs * 1000ull - 100000);
+      CHECK(hold.reads >= 150);   // still every frame
+      const PaceRun after = simulatePace(kIdleReadMs, irq, on, off, off + kHoldMs * 1000ull + 200000, off + kHoldMs * 1000ull + 1200000);
+      CHECK(after.reads <= 24);   // idle again
+    }
+}
+
 int main(int argc, char **argv)
 {
   testParse();
@@ -692,6 +773,7 @@ int main(int argc, char **argv)
   testOrientation();
   testHid();
   testClock();
+  testPace();
   if (failures) {
     std::printf("PianoTouch host tests: %d FAILED\n", failures);
     return 1;

@@ -16,9 +16,11 @@
 //   4 identify   engine reset, the trim-ID loop, the memory map (Nt36532.h)
 //   5 firmware   GPIO100 picks the image; the host download with the hardware CRC check (three attempts)
 //   6 start      payload length, firmware info, calibration wait, idle-baseline update, operating mode
-//   7 frames     GPIO162's rising edges latched in TLMM (raw status, never routed to the GIC), polled every piano-touch-poll ms; a
-//                frame read per edge; checksum, transport kind, counter, type; the matrix decoder and the tip; at level 2 the
-//                tablet pointer (TouchHid.h). Ten watchdog frames in a row: the download again (at most three times)
+//   7 frames     GPIO162's rising edges latched in TLMM (raw status), polled every piano-touch-poll ms while the panel is busy
+//                and a frame read per edge; at rest one frame per piano-touch-idle ms (TouchPace.h), its edge waited for by
+//                polling or, with piano-touch-irq=1, by the TLMM summary interrupt (package/common/PianoIrq.h); checksum,
+//                transport kind, counter, type; the matrix decoder and the tip; at level 2 the tablet pointer (TouchHid.h). Ten
+//                watchdog frames in a row: the download again (at most three times)
 //
 // Boot arguments (default: inert, the service does not even probe):
 //   piano-touch=1            steps 1-7; frame statistics and contacts in the log; nothing goes to macOS
@@ -37,7 +39,10 @@
 //   piano-touch-threshold=T  the contact threshold of the decoder (default 200)
 //   piano-touch-flip=B       auto (default: by the panel, BOE as processor Y, CSOT Y reversed; the calibration's panel wins over
 //                            gpio100 for this, and its invert_y over both); 0..3 explicit: bit 0 X, bit 1 Y flipped
-//   piano-touch-poll=MS      edge polling (default 1)
+//   piano-touch-poll=MS      edge polling while busy (default 1)
+//   piano-touch-idle=MS      one frame per MS at rest (default 50; 0: every frame, the old loop; 20..500)
+//   piano-touch-irq=1        the idle frames' edge by the TLMM interrupt (gpio162 on the summary SPI 208) instead of 1 ms polls
+//   piano-wake-log=S         the "idle: N wakeups" line every S seconds (default 60, 0 none; shared with the other drivers)
 //   piano-touch-trace=1      more frame headers, and contact positions at level 2
 // Never: a flash write (the controller has none for the touch firmware), a panel command, a regulator vote, a GPIO other than
 // 40-43, 100 and 162.
@@ -60,6 +65,8 @@
 #include "Se2Bus.h"
 #include "PianoTouchCalibration.h"   // generated (tooling/k27/gen-touch-calibration.py) into the ignored out/ tree
 #include "SmmuStream.h"
+#include "TouchPace.h"
+#include "../common/PianoIrq.h"
 extern "C" {
 #include "GeniSpi.h"
 }
@@ -80,7 +87,7 @@ extern volatile uint32_t sm8750_gcc_vote_owner;
 namespace {
 
 struct Args {
-  uint32_t level, stop, bus, khz, seirq, smmu, loopback, mode, baseline, threshold, flip, pollMs, trace;
+  uint32_t level, stop, bus, khz, seirq, smmu, loopback, mode, baseline, threshold, flip, pollMs, trace, idleMs, irq;
 };
 Args gArgs;
 
@@ -114,6 +121,8 @@ void readArgs()
   }
   gArgs.pollMs = clampArg(bootArg("piano-touch-poll", 1), 1, 50);
   gArgs.trace = bootArg("piano-touch-trace", 0);
+  gArgs.idleMs = TouchPace::clampIdle(bootArg("piano-touch-idle", kIdleReadMs));
+  gArgs.irq = bootArg("piano-touch-irq", 0);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -320,6 +329,11 @@ class PianoTouch : public IOService {
   uint16_t fLastCounter = 0;
   uint8_t fWdtState = 0;
   bool fHaveCounter = false, fEdgeSeen = false, fEdgePending = false;
+  // The pace and the interrupt (TouchPace.h, PianoIrq.h): the edge after an idle sleep by the TLMM interrupt (piano-touch-irq=1).
+  pianoirq::tlmm::Pin fPin = {};
+  pianoirq::MissGuard fMiss = pianoirq::missGuard(3);
+  bool fIrqLive = false, fEdgeByIrq = false, fPollNextEdge = false;
+  uint32_t fIdleSleeps = 0, fIrqEdges = 0, fIrqReads = 0, fIrqBadReads = 0;
   uint32_t fRateKhz = 0;   // the SPI rate the GENI divider gives
   int fPanel = kPanelUnknown;   // gpio100: the firmware image's panel
 
@@ -378,10 +392,11 @@ bool PianoTouch::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
   note("start: piano-touch=%u (%s), stop %u, bus %u (%s), %u kHz, seirq %u, smmu %u, loopback %u, mode %u, baseline %u, "
-       "threshold %u, flip %s, poll %u ms; firmware BOE %llu bytes, CSOT %llu bytes",
+       "threshold %u, flip %s, poll %u ms, idle %u ms (%s), irq %u; firmware BOE %llu bytes, CSOT %llu bytes",
        gArgs.level, gArgs.level >= 2 ? "HID tablet pointer for macOS" : "log only, nothing for macOS", gArgs.stop, gArgs.bus,
        gArgs.bus == 0 ? "GENI, else by hand" : gArgs.bus == 1 ? "GENI only" : "by hand only", gArgs.khz, gArgs.seirq, gArgs.smmu,
-       gArgs.loopback, gArgs.mode, gArgs.baseline, gArgs.threshold, kFlipNames[gArgs.flip], gArgs.pollMs,
+       gArgs.loopback, gArgs.mode, gArgs.baseline, gArgs.threshold, kFlipNames[gArgs.flip], gArgs.pollMs, gArgs.idleMs,
+       gArgs.idleMs ? "one frame per idle period at rest" : "every frame", gArgs.irq,
        (unsigned long long)piano_touch_firmware_boe_size, (unsigned long long)piano_touch_firmware_csot_size);
   setProperty("piano-touch", gArgs.level, 32);
   // The unit's calibration (built in from the private Ubuntu file; its arrays are never logged), checked again here.
@@ -884,6 +899,15 @@ void PianoTouch::armIrq()
   fIrqArmed = true;
   note("frames: gpio162 CTL %08x INTR_CFG %08x (rising edge latched, not enabled), level %u", rd32(pinVa(kIrq) + kCtl),
        rd32(pinVa(kIrq) + kIntrCfg), level(kIrq));
+  if (!gArgs.irq || !gArgs.idleMs) return;
+  // The same latch, and its interrupt on the TLMM summary line (enabled only while an idle frame's edge is waited for).
+  char why[160] = {};
+  fIrqLive = fPin.open("PianoTouch", 162, pinVa(kIrq), pianoirq::tlmm::Trigger::rising, why, sizeof why);
+  if (fIrqLive)
+    note("frames: gpio162 interrupt on the TLMM summary (SPI %u, INTID %u): slot %u, INTR_CFG armed %08x masked %08x; idle frames' edges by "
+         "interrupt", pianoirq::kSpiTlmmSummary, pianoirq::intid(pianoirq::kSpiTlmmSummary), fPin.slot, fPin.armed, fPin.masked);
+  else
+    note("frames: gpio162 interrupt NOT used (%s): idle frames' edges by 1 ms polls", why);
 }
 
 // --------------------------------------------------------------------------------------------------------------- HID (level 2)
@@ -1061,6 +1085,11 @@ void PianoTouch::serve()
   fLastReadMs = fLastStatsMs = begin;
   // The GPIO transport reads at most 10 frames a second (each takes ~45 ms of a CPU); GENI one per edge.
   const uint64_t minGapMs = fBus == BusKind::gpio ? 100 : 0, noEdgeMs = fBus == BusKind::gpio ? 100 : 200;
+  // Paced over GENI only (SPI by hand reads at most 10 frames a second anyway).
+  const bool paced = gArgs.idleMs && fBus == BusKind::geni;
+  TouchPace pace = touchPace(gArgs.idleMs, begin);
+  pianoirq::WakeStats wakes = pianoirq::wakeStats(pianoirq::wakeLogMs());
+  uint32_t readsAtWindow = 0, sleepsAtWindow = 0;
   note("frames: serving over %s, %s", fBus == BusKind::geni ? "GENI" : "SPI by hand",
        gArgs.level >= 2 ? "the tip goes to macOS" : "contacts are logged only (piano-touch=2 gives them to macOS)");
   for (;;) {
@@ -1080,6 +1109,7 @@ void PianoTouch::serve()
       ++fReads;
       ++fReadsSinceStats;
       const uint64_t t0 = nowUs();
+      const uint32_t badBefore = fBad + fInconsistent;
       const int rc = readFrame(fChip, fFrame);
       const uint32_t us = uint32_t(nowUs() - t0);
       fReadUsSum += us;
@@ -1094,6 +1124,16 @@ void PianoTouch::serve()
       } else {
         fConsecutive = 0;
         frame(us);
+      }
+      // A read on an edge the interrupt reported: a CPU that left a deep idle state late may have started it mid-frame (bad
+      // checksum); then the next idle edge is polled for.
+      if (fEdgeByIrq) {
+        ++fIrqReads;
+        fPollNextEdge = rc || fBad + fInconsistent != badBefore;
+        if (fPollNextEdge) ++fIrqBadReads;
+        fEdgeByIrq = false;
+      } else {
+        fPollNextEdge = false;
       }
       if (fWdtRun > 10) {
         contact(tipCancel(fTip));
@@ -1114,6 +1154,50 @@ void PianoTouch::serve()
     }
     const uint64_t age = now - begin;
     if (now - fLastStatsMs >= (age < 30000 ? 5000 : 60000)) stats(now);
+    pianoirq::WakeStats::Window w;
+    if (wakes.due(now, &w)) {
+      note("idle: %u wakeups in %u s, irq %u (%u frame reads; %u idle sleeps; %u reads on an interrupt's edge, %u of them bad; %u "
+           "missed; pace %s)", w.wakeups, w.seconds, w.irqs, fReads - readsAtWindow, fIdleSleeps - sleepsAtWindow, fIrqReads, fIrqBadReads,
+           fMiss.total, paced ? (pace.idle(nowMs(), false) ? "idle" : "every frame") : "every frame (not paced)");
+      readsAtWindow = fReads;
+      sleepsAtWindow = fIdleSleeps;
+    }
+    // The pace (TouchPace.h): every frame while the panel is busy, one per idle period at rest.
+    const bool busy = fMatrix->touching || fTip.down || fTip.seen || !fMatrix->haveReference || fWdtRun;
+    if (paced && fEdgeSeen && pace.idle(nowMs(), busy) && !fEdgePending) {
+      const uint32_t sleep = pace.sleepMs(nowMs(), fLastReadMs);
+      if (sleep) {
+        IOSleep(sleep);
+        wakes.count(pianoirq::Woke::timeout);
+        ++fIdleSleeps;
+        wr32(pinVa(kIrq) + kIntrStatus, 0);   // the latched edge came mid-sleep: the next fresh one starts a frame
+        dsb();
+        continue;
+      }
+      if (fIrqLive && fPin.live() && !fPollNextEdge) {
+        const uint32_t seen = fPin.gen();
+        fPin.arm();   // the handler masks it again when the edge comes
+        if (fPin.wait(seen, 20)) {
+          wakes.count(pianoirq::Woke::irq);
+          ++fIrqEdges;
+          fMiss.delivered();
+          fEdgeByIrq = fPin.live();
+        } else {
+          wakes.count(pianoirq::Woke::timeout);
+          fPin.mask();
+          if (fPin.latched() && fMiss.miss()) {
+            fIrqLive = false;
+            note("frames: gpio162 latched but no interrupt in 3 waits in a row: idle edges by 1 ms polls from now on");
+          }
+        }
+        if (fIrqLive && !fPin.live()) {
+          fIrqLive = false;
+          note("frames: the TLMM summary line went away (state %u): idle edges by 1 ms polls from now on", fPin.s->state);
+        }
+        continue;
+      }
+    }
     IOSleep(gArgs.pollMs);
+    wakes.count(pianoirq::Woke::timeout);
   }
 }

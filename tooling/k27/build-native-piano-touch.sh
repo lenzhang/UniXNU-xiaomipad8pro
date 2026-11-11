@@ -2,7 +2,7 @@
 # Build package/PianoTouch (the NT36532E touch screen on QUP1 SE2: GENI SPI with SE DMA, or SPI by hand; the host download; the
 # matrix decoder; a tablet pointer for macOS) as a k27 native kext: the host tests first (tests/geni_spi_host.c: GeniSpi.c against
 # its register model; tests/touch_host.cpp: the protocol against an NT36532E model, the staged images downloaded into it, the
-# decoder, the HID report, the clock decoding), then the panel images staged and embedded, then the objects in
+# decoder, the HID report, the clock decoding, the frame pace), then the panel images staged and embedded, then the objects in
 # out/native-kexts/PianoTouch for tooling/k27/kext/PianoTouch.json. Prints out/k27/kext/PianoTouch.json (resolved) last.
 # Inert without the boot argument piano-touch (package/PianoTouch/PianoTouch.cpp, docs/drivers/touch.md).
 #   environment: K27_TREE (the k27 build tree, read only: compile recipes, out/x12377/inc-hid), K27_OBJ (default k27-native-obj),
@@ -55,6 +55,7 @@ python3 "$D/tooling/k27/gen-touch-calibration.py" --out "$O/gen/PianoTouchCalibr
 python3 "$P/tests/calibration_gen_test.py" >&2 || { echo "Error: calibration generator tests failed" >&2; exit 1; }
 python3 "$D/tooling/k27/gen-touch-calibration.py" --out "$O/host-tests/SyntheticCalibration.h" --name kSynthetic \
   "$P/tests/synthetic-calibration.json" 2> /dev/null
+"$D/package/common/tests/run.sh" >&2   # PianoIrq.h: the TLMM INTR_CFG encoding and the guards the frame loop uses
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror "$P/tests/geni_spi_host.c" "$P/GeniSpi.c" -o "$O/host-tests/geni_spi_host"
 "$O/host-tests/geni_spi_host" >&2 || { echo "Error: GeniSpi host tests failed" >&2; exit 1; }
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/PianoDwc3" -I "$O/host-tests" -I "$O/gen" \
