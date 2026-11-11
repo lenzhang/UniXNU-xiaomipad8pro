@@ -7,6 +7,7 @@
 #ifndef PIANO_TOUCH_HID_H
 #define PIANO_TOUCH_HID_H
 #include <stdint.h>
+#include "../PianoAuto/TouchRotation.h"
 
 namespace pianotouch {
 
@@ -61,6 +62,16 @@ inline void tabletReport(bool tip, int32_t x, int32_t y, int32_t panelW, int32_t
   out[2] = uint8_t(hx >> 8);
   out[3] = uint8_t(hy);
   out[4] = uint8_t(hy >> 8);
+}
+
+// The same under the display's rotation (piano-touch-rotate=1; package/PianoAuto/TouchRotation.h, docs/drivers/sensors.md 5a.3):
+// degrees as CGDisplayRotation reports them (90 = the panel's left edge up), the contact mapped into the rotated desktop and scaled
+// over its size. At 0 the bytes are tabletReport's for the same contact (pat_rotate clamps as tabletReport does).
+inline void rotatedTabletReport(bool tip, int32_t x, int32_t y, int32_t panelW, int32_t panelH, uint32_t degrees,
+                                uint8_t out[kReportBytes])
+{
+  const PatPoint p = pat_rotate(degrees, x, y, panelW, panelH);
+  tabletReport(tip, p.x, p.y, p.width, p.height, out);
 }
 
 }  // namespace pianotouch

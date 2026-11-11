@@ -44,6 +44,10 @@
 //   piano-touch-irq=1        the idle frames' edge by the TLMM interrupt (gpio162 on the summary SPI 208) instead of 1 ms polls
 //   piano-wake-log=S         the "idle: N wakeups" line every S seconds (default 60, 0 none; shared with the other drivers)
 //   piano-touch-trace=1      more frame headers, and contact positions at level 2
+//   piano-touch-rotate=1     follow the display's rotation (package/PianoAuto/TouchRotation.h, docs/drivers/sensors.md 5a.3): the
+//                            platform function "PianoTouchRotation" (param1 = degrees) and the property "piano-touch-rotation"
+//                            (0/90/180/270; root or the console user: piano-rotated) are taken, and each contact is mapped into the
+//                            rotated desktop from its touch-down on. Without it both are refused and the reports are as before
 // Never: a flash write (the controller has none for the touch firmware), a panel command, a regulator vote, a GPIO other than
 // 40-43, 100 and 162.
 #include <IOKit/IOService.h>
@@ -51,7 +55,11 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/hid/IOHIDDevice.h>
+#ifndef kIOClientPrivilegeConsoleUser
+#define kIOClientPrivilegeConsoleUser "console"   // xnu IOKitKeysPrivate.h: the caller's user has the session on the console
+#endif
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/libkern.h>
@@ -87,7 +95,7 @@ extern volatile uint32_t sm8750_gcc_vote_owner;
 namespace {
 
 struct Args {
-  uint32_t level, stop, bus, khz, seirq, smmu, loopback, mode, baseline, threshold, flip, pollMs, trace, idleMs, irq;
+  uint32_t level, stop, bus, khz, seirq, smmu, loopback, mode, baseline, threshold, flip, pollMs, trace, idleMs, irq, rotate;
 };
 Args gArgs;
 
@@ -123,6 +131,7 @@ void readArgs()
   gArgs.trace = bootArg("piano-touch-trace", 0);
   gArgs.idleMs = TouchPace::clampIdle(bootArg("piano-touch-idle", kIdleReadMs));
   gArgs.irq = bootArg("piano-touch-irq", 0);
+  gArgs.rotate = bootArg("piano-touch-rotate", 0);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -336,6 +345,10 @@ class PianoTouch : public IOService {
   uint32_t fIdleSleeps = 0, fIrqEdges = 0, fIrqReads = 0, fIrqBadReads = 0;
   uint32_t fRateKhz = 0;   // the SPI rate the GENI divider gives
   int fPanel = kPanelUnknown;   // gpio100: the firmware image's panel
+  // The display's rotation (piano-touch-rotate=1): requested by callPlatformFunction / setProperties, taken by the frame thread at a
+  // touch-down (TouchRotation.h). Without the argument it stays 0 and every report is as before.
+  PatRotation fRotation = {0, 0, 0};
+  const char *volatile fRotationSource = "none";
 
   static void threadMain(void *self, wait_result_t);
   static bool eventServicePublished(void *target, void *refCon, IOService *service, IONotifier *notifier);
@@ -365,8 +378,11 @@ class PianoTouch : public IOService {
   void stats(uint64_t now);
 
 public:
+  using IOService::callPlatformFunction;
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  IOReturn callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4) override;
+  IOReturn setProperties(OSObject *properties) override;
 };
 
 OSDefineMetaClassAndStructors(PianoTouch, IOService)
@@ -399,6 +415,11 @@ bool PianoTouch::start(IOService *provider)
        gArgs.idleMs ? "one frame per idle period at rest" : "every frame", gArgs.irq,
        (unsigned long long)piano_touch_firmware_boe_size, (unsigned long long)piano_touch_firmware_csot_size);
   setProperty("piano-touch", gArgs.level, 32);
+  if (gArgs.rotate) {
+    setProperty(PAT_PROPERTY, 0ull, 32);
+    note("rotation: following the display's (piano-touch-rotate=1): %s and the property %s taken (0/90/180/270); 0 until told",
+         PAT_FUNCTION, PAT_PROPERTY);
+  }
   // The unit's calibration (built in from the private Ubuntu file; its arrays are never logged), checked again here.
   if (kUnitCalibrationPresent && calibrationValid(kUnitCalibration))
     note("calibration: unit file (panel %s, sha256 %s), electrode maps, edge %d px%s",
@@ -951,11 +972,37 @@ bool PianoTouch::eventServicePublished(void *, void *, IOService *service, IONot
   return true;
 }
 
+// The display's rotation (piano-touch-rotate=1), from a kernel caller: param1 = degrees (uintptr_t), param2 = the caller's name. Only
+// recorded; the frame thread takes it at the next touch-down.
+IOReturn PianoTouch::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4)
+{
+  if (!name || !name->isEqualTo(PAT_FUNCTION)) return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
+  if (!gArgs.rotate) return kIOReturnUnsupported;
+  if (!pat_request(&fRotation, uint32_t(uintptr_t(p1)))) return kIOReturnBadArgument;
+  fRotationSource = p2 ? static_cast<const char *>(p2) : "a kernel caller";
+  return kIOReturnSuccess;
+}
+
+// The same from user space (IORegistryEntrySetCFProperty): "piano-touch-rotation" = 0/90/180/270, from root or the console user (the
+// rotation agent runs as the logged-in user; a user process can choose only among the four rotations).
+IOReturn PianoTouch::setProperties(OSObject *properties)
+{
+  OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+  OSNumber *degrees = d ? OSDynamicCast(OSNumber, d->getObject(PAT_PROPERTY)) : nullptr;
+  if (!degrees || !gArgs.rotate) return IOService::setProperties(properties);   // as before this override (unsupported)
+  if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess &&
+      IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeConsoleUser) != kIOReturnSuccess)
+    return kIOReturnNotPrivileged;
+  if (degrees->unsigned64BitValue() > 270 || !pat_request(&fRotation, degrees->unsigned32BitValue())) return kIOReturnBadArgument;
+  fRotationSource = "setProperties";
+  return kIOReturnSuccess;
+}
+
 void PianoTouch::send(bool tip, int32_t x, int32_t y)
 {
   if (!fHid) return;
   uint8_t r[kReportBytes];
-  tabletReport(tip, x, y, kPanelW, kPanelH, r);
+  rotatedTabletReport(tip, x, y, kPanelW, kPanelH, fRotation.shown, r);
   IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(r, sizeof r, kIODirectionNone);
   const IOReturn rc = report ? fHid->handleReport(report) : kIOReturnNoMemory;
   OSSafeReleaseNULL(report);
@@ -968,6 +1015,14 @@ void PianoTouch::contact(TipEvent e)
   if (e == TipEvent::none) return;
   const uint64_t now = nowMs();
   const bool show = gArgs.level < 2 || gArgs.trace;
+  if (e == TipEvent::down && gArgs.rotate) {   // a new rotation from this contact on, never in the middle of one
+    const uint32_t was = fRotation.shown;
+    if (pat_latch(&fRotation, 1) != was) {
+      note("rotation: %u degrees from this touch on (was %u; from %s, change %u)", fRotation.shown, was, fRotationSource,
+           fRotation.changes);
+      setProperty(PAT_PROPERTY, uint64_t(fRotation.shown), 32);
+    }
+  }
   if (e == TipEvent::down) {
     fTipDownMs = fLastHeldLogMs = now;
     if (fContactsLogged < 200 || fTip.downs % 20 == 0) {

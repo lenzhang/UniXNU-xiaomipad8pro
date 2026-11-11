@@ -663,6 +663,43 @@ void testHid()
   CHECK(le16(r + 1) == uint16_t(1600ll * kHidMax / (kPanelW - 1)) && le16(r + 3) == kHidMax);
 }
 
+// piano-touch-rotate=1 (TouchRotation.h, sensors.md 5a.3): at 0 the bytes are tabletReport's for every contact, in range or not; at
+// 90/180/270 the panel's corners land on the rotated desktop's (CGDisplayRotation: 90 = the panel's left edge up); a request takes
+// effect at the next touch-down only.
+void testRotation()
+{
+  uint8_t a[kReportBytes], b[kReportBytes];
+  bool same = true;
+  for (int32_t y = -40; y < kPanelH + 40; y += 7)
+    for (int32_t x = -40; x < kPanelW + 40; x += 13)
+      for (int tip = 0; tip < 2; ++tip) {
+        tabletReport(tip, x, y, kPanelW, kPanelH, a);
+        rotatedTabletReport(tip, x, y, kPanelW, kPanelH, 0, b);
+        same = same && !std::memcmp(a, b, kReportBytes);
+      }
+  CHECK(same);
+  const struct { uint32_t deg; int32_t x, y; uint16_t hx, hy; } corner[] = {
+    {90, 0, kPanelH - 1, 0, 0},           // the panel's bottom-left corner is the desktop's top-left
+    {90, 0, 0, kHidMax, 0},               // top-left -> top-right
+    {90, kPanelW - 1, 0, kHidMax, kHidMax},
+    {180, 0, 0, kHidMax, kHidMax},        {180, kPanelW - 1, kPanelH - 1, 0, 0},
+    {270, kPanelW - 1, 0, 0, 0},          // the panel's top-right corner is the desktop's top-left
+    {270, 0, 0, 0, kHidMax},
+  };
+  for (const auto &c : corner) {
+    rotatedTabletReport(true, c.x, c.y, kPanelW, kPanelH, c.deg, b);
+    CHECK(b[0] == 1 && le16(b + 1) == c.hx && le16(b + 3) == c.hy);
+  }
+  rotatedTabletReport(false, kPanelW / 2, kPanelH / 2, kPanelW, kPanelH, 90, b);   // the centre stays the centre (within 1.5 px)
+  CHECK(le16(b + 1) + 16 >= kHidMax / 2 && le16(b + 1) <= kHidMax / 2 + 16 && le16(b + 3) + 16 >= kHidMax / 2 && le16(b + 3) <= kHidMax / 2 + 16);
+  rotatedTabletReport(true, 100, 100, kPanelW, kPanelH, 45, b);                    // not a rotation: as 0
+  tabletReport(true, 100, 100, kPanelW, kPanelH, a);
+  CHECK(!std::memcmp(a, b, kReportBytes));
+  PatRotation r;
+  pat_init(&r);
+  CHECK(pat_request(&r, 90) && pat_latch(&r, 0) == 0 && pat_latch(&r, 1) == 90 && !pat_request(&r, 91) && pat_latch(&r, 1) == 90);
+}
+
 void testClock()
 {
   CHECK(rcgRate(0, 0, 0) == 19200000);                                  // XO, divider bypassed: the reset state
@@ -772,6 +809,7 @@ int main(int argc, char **argv)
   testCalibration();
   testOrientation();
   testHid();
+  testRotation();
   testClock();
   testPace();
   if (failures) {
@@ -779,6 +817,6 @@ int main(int argc, char **argv)
     return 1;
   }
   std::printf("PASS: PianoTouch host tests (NT36532E model over whole transfers and by hand, %d real image(s), matrix, calibration, "
-              "orientation, tip, HID, clocks)\n", argc - 1);
+              "orientation, tip, HID, rotation, clocks)\n", argc - 1);
   return 0;
 }
