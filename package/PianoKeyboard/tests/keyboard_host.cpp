@@ -5,7 +5,8 @@
 // (swipes, scrolling, taps, the contact count, the press button, the axes' scale; with the defaults: fine natural scrolling and its
 // axis lock, three-finger swipes, the typing guard, press settling), the touchpad descriptor's declared resolutions, the backlight,
 // the poll plan and the interrupt wait's timeouts and outcomes, the panel's brightness keys as PianoBacklightClient.h's KeyWatch
-// sees the cover's reports,
+// sees the cover's reports, CoverPower.h (the closed-cover input gate, gpio95's sleep latch and its decision, the MCU's power
+// following the display and the system sleep, the unblank's wait for gpio97),
 // BitI2c.h against a bit-level I2C target model
 // (START/STOP, ACK/NACK, repeated START reads, clock stretching), CmdDb.h on a small database, and HidDescriptors.h (parsed item by
 // item: each report is as long as the driver sends it).
@@ -14,6 +15,7 @@
 #include "BitI2c.h"
 #include "CmdDb.h"
 #include "HidDescriptors.h"
+#include "CoverPower.h"
 #include "../PianoBacklight/PianoBacklightClient.h"
 #include <cstdio>
 #include <cstring>
@@ -1132,6 +1134,103 @@ static void testBrightnessKeys()
   CHECK(w.keyboard(ctrl1.data()) == -1);
 }
 
+// The power policy parts (CoverPower.h): the gate, the latch, the MCU's power.
+static void testCoverPower()
+{
+  {   // the gate: off by default; on, a closed cover drops reports (released once at the closing), an open one passes them
+    InputGate g;
+    CHECK(!g.hall(0) && g.pass() && !g.closed());
+    g.configure(true);
+    CHECK(g.hall(1) == false && g.pass());
+    CHECK(g.hall(0) == true && g.closed());          // closing: the caller releases every key and button
+    CHECK(g.hall(0) == false);                       // still closed: not again
+    CHECK(!g.pass() && !g.pass() && g.dropped() == 2 && g.droppedNow() == 2);
+    CHECK(!g.hall(1) && g.pass() && !g.closed());
+    CHECK(g.hall(0) && g.droppedNow() == 0 && !g.pass() && g.dropped() == 3);
+    CHECK(!g.hall(-1) && g.pass());                  // not read (piano-keyboard-hall=0): open
+    CHECK(g.changes() == 4);
+  }
+  {   // gpio95's latch word: armed = raw status, rising edge, polarity high, enable off; the other bits (target, bit 7) as found
+    const uint32_t found = 0x000002e1;   // target 2, wakeup bits 7/6 set, detection level, enable on
+    const uint32_t armed = latchCfg(found, true);
+    CHECK((armed & kIntrRaw) && (armed & kIntrEdge) && (armed & kIntrPolarityHigh) && !(armed & kIntrEnable));
+    CHECK((armed & kIntrDetectMask) == kIntrEdge && (armed & ~0x1fu) == (found & ~0x1fu));
+    const uint32_t off = latchCfg(armed, false);
+    CHECK(!(off & kIntrRaw) && !(off & kIntrEnable) && (off & ~(kIntrRaw | kIntrEnable)) == (armed & ~(kIntrRaw | kIntrEnable)));
+    CHECK(latchCfg(0, true) == 0x16 && latchCfg(0x1f, false) == 0x0e);
+  }
+  {   // the decision: PianoPolicy's when it acts, else the own rule; never without the MCU running
+    CHECK(!latchDecision(false, true, true, 1, true).arm);
+    CHECK(latchDecision(true, true, true, 0, false).arm);    // PianoPolicy decides (its own inputs), whatever ours say
+    CHECK(!latchDecision(true, true, false, 1, true).arm);
+    CHECK(latchDecision(true, false, false, 1, true).arm && latchDecision(true, false, false, -1, true).arm);
+    CHECK(!latchDecision(true, false, false, 0, true).arm && !latchDecision(true, false, false, 1, false).arm);
+    CHECK(wakeNow(true, true, 0, false) && !wakeNow(true, false, 1, true));
+    CHECK(wakeNow(false, false, 1, true) && wakeNow(false, false, -1, true) && !wakeNow(false, false, 0, true) &&
+          !wakeNow(false, false, 1, false));
+  }
+  using Step = CoverPower::Step;
+  {   // off (the default): the MCU always runs, whatever the display or a sleep does
+    CoverPower c;
+    CHECK(c.display(0, 0) == Step::none && c.sleep(true, 0) == Step::none && c.running());
+    CHECK(c.wakeRequest(true, 0) == Step::none && c.sleep(false, 0) == Step::none && c.running());
+  }
+  {   // on: the display's blank and unblank
+    CoverPower c;
+    c.configure(true);
+    CHECK(c.display(1, 0) == Step::none && c.running());
+    CHECK(c.display(0, 100) == Step::blank && !c.running());
+    CHECK(c.display(0, 200) == Step::none);
+    CHECK(c.display(1, 300) == Step::unblank && c.running());
+    CHECK(c.display(-1, 400) == Step::none && c.running());   // the display not known: running
+    CHECK(c.blanks() == 1 && c.unblanks() == 1);
+  }
+  {   // a system sleep with the display on: blank at off; the wake unblanks (display on), as the panel's enable would
+    CoverPower c;
+    c.configure(true);
+    c.display(1, 0);
+    CHECK(c.sleep(true, 10) == Step::blank && c.asleep());
+    CHECK(c.display(0, 20) == Step::none);   // IOMFB's system power state off during the sleep: still blanked, nothing new
+    CHECK(c.sleep(false, 30) == Step::none && !c.running());   // display off recorded: a resume without a display-on sends nothing
+    CHECK(c.display(1, 40) == Step::unblank && c.running());
+    // the display already off before the sleep: blanked already, nothing at off or on
+    c.display(0, 50);
+    CHECK(!c.running() && c.sleep(true, 60) == Step::none && c.sleep(false, 70) == Step::none && !c.running());
+    // no NativeGopDisplay (-1): the wake unblanks at once
+    CoverPower u;
+    u.configure(true);
+    CHECK(u.sleep(true, 0) == Step::blank && u.sleep(false, 10) == Step::unblank && u.running());
+  }
+  {   // gpio95's wake request while blanked: the MCU wakes early only when the display may wake; back to blank after 10 s
+      // without the display coming on; no early wake while suspended (the kernel's) or when not allowed
+    CoverPower c;
+    c.configure(true);
+    c.display(0, 0);
+    CHECK(!c.running());
+    CHECK(c.wakeRequest(false, 100) == Step::none && !c.running());
+    CHECK(c.wakeRequest(true, 200) == Step::unblank && c.running() && c.earlyWakes() == 1);
+    CHECK(c.tick(200 + CoverPower::kEarlyWakeMs - 1) == Step::none && c.running());
+    CHECK(c.display(1, 5000) == Step::none && c.running());   // the display came on: no blank later
+    CHECK(c.tick(50000) == Step::none && c.running());
+    CHECK(c.display(0, 60000) == Step::blank);
+    CHECK(c.wakeRequest(true, 61000) == Step::unblank);
+    CHECK(c.tick(61000 + CoverPower::kEarlyWakeMs) == Step::blank && !c.running() && c.earlyTimeouts() == 1);
+    CHECK(c.sleep(true, 80000) == Step::none && c.wakeRequest(true, 80001) == Step::none && !c.running());
+    CHECK(c.sleep(false, 90000) == Step::none && !c.running());
+    CHECK(c.wakeRequest(true, 90001) == Step::unblank && c.sleep(true, 90002) == Step::blank);   // a sleep ends the early wake
+    CHECK(c.sleep(false, 90003) == Step::none && !c.running());
+  }
+  {   // the unblank's wait: high at once (no settle), after 3 ms (3 + 5), never (101: given up after 100 ms)
+    unsigned slept = 0, polls = 0;
+    auto sleep = [&](unsigned ms) { slept += ms; };
+    CHECK(ReadyWait::run([&] { return true; }, sleep) == 0 && slept == 0);
+    polls = 0;
+    CHECK(ReadyWait::run([&] { return ++polls > 3; }, sleep) == 3 && slept == 3 + ReadyWait::kSettleMs);
+    slept = 0;
+    CHECK(ReadyWait::run([&] { return false; }, sleep) == ReadyWait::kMaxMs + 1 && slept == ReadyWait::kMaxMs);
+  }
+}
+
 int main(int argc, char **argv)
 {
   bool noFirmware = false;
@@ -1160,6 +1259,7 @@ int main(int argc, char **argv)
   testPollPlan();
   testIrqWait();
   testBrightnessKeys();
+  testCoverPower();
   if (failures) {
     std::printf("keyboard_host: %d failure(s)\n", failures);
     return 1;

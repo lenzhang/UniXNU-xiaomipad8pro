@@ -72,8 +72,21 @@
 //   piano-keyboard-lid=1        tell IOPMrootDomain the hall state (kIOPMClamshellClosed/Opened), with clamshell sleep disabled
 //                               first (kIOPMDisableClamshell); =2 the same with clamshell sleep allowed (kIOPMEnableClamshell).
 //                               Default 0: nothing is sent (native sleep is untested and could hang)
-// Not done: the hall sensor's effect on input (Linux turns the touchpad, LEDs and reports off while the cover is closed), the
-// authentication token, the backlight/mic LED beyond the boot arguments, suspend.
+// Power (docs/policy.md 5.4, docs/power.md 4; CoverPower.h, host-tested):
+//   piano-keyboard-lid-drop=1   key and touchpad reports dropped while the hall sensor reads closed (Linux's input-off-while-
+//                               closed; everything released at the closing). Default 0 until the hall polarity is verified
+//   piano-keyboard-blank=1      the MCU's power follows the display (NativeGopDisplay's piano-display-power): off -> 0x25 = 0 and
+//                               the sleep line asserted, no keep-alive, no frame read; on -> the sleep line released, gpio97
+//                               awaited, frames drained, 0x25 = 1, LEDs and backlight; gpio95 rising while blanked wakes the MCU
+//                               early when the display may wake now (PianoPolicy's answer, else cover open and attached). A system
+//                               sleep blanks too; its wake unblanks only with the display on or not known. Default 0
+//   With PianoPolicy, piano-keyboard-lid stays 0 (PianoPolicy tells IOPMrootDomain the clamshell; this driver keeps publishing the
+//   hall, the attach bit and gpio95 with a message per change).
+// System sleep: in the power tree; off parks the serving thread (no I2C; with piano-keyboard-blank=1 the MCU blanked first), masks
+// gpio97 when its interrupt is live, and sets gpio95's latch for k27 0062's keyboard wake (bit 16) only when an acting PianoPolicy
+// says so ("piano-policy-keyboard-wake"), else by the own rule (attached, the cover not read closed); on clears gpio95's latch,
+// puts its INTR_CFG back as found, reads the hall again and serves on. Never gpio97 as a wake.
+// Not done: the authentication token, the backlight/mic LED beyond the boot arguments.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -92,9 +105,12 @@
 #include "BitI2c.h"
 #include "HidDescriptors.h"
 #include "CmdDb.h"
+#include "CoverPower.h"                              // the closed-cover gate, gpio95's sleep latch, the MCU following the display
 #include "../common/PianoIrq.h"                      // the TLMM summary interrupt (docs/power-irq.md)
 #include "../PianoBacklight/PianoBacklightClient.h"  // the panel's brightness keys (piano-backlight-keys=1)
 #include <IOKit/IOMessage.h>
+#include <libkern/c++/OSBoolean.h>
+#include <PianoPowerContract.h>
 
 using namespace pianokeyboard;
 
@@ -111,6 +127,7 @@ namespace {
 struct Args {
   uint32_t level, stop, trace, halfUs, pollMs, rails, touchpad, backlight, tap, invert, divide, mouse, auth, raw, fnrow, hall, lid;
   uint32_t dpi, scrollRes, scroll, scrollInvert, gestures, typing, backlightIdle, idlePoll, slowPoll, irq;
+  uint32_t blank, lidDrop;
 };
 Args gArgs;
 
@@ -151,6 +168,8 @@ void readArgs()
   gArgs.idlePoll = clampArg(bootArg("piano-keyboard-idle-poll", 30), 1, 200);
   gArgs.slowPoll = clampArg(bootArg("piano-keyboard-slow-poll", 200), 10, 1000);
   gArgs.irq = bootArg("piano-keyboard-irq", 0);
+  gArgs.blank = bootArg("piano-keyboard-blank", 0);
+  gArgs.lidDrop = bootArg("piano-keyboard-lid-drop", 0);
 }
 
 // The touchpad's report descriptor with the declared resolutions of the boot arguments (made in start()).
@@ -498,6 +517,18 @@ class PianoKeyboard : public IOService {
   // the LED request from IOHIDFamily's side
   volatile uint32_t fLedRequests = 0, fLedWanted = 0;
   uint32_t fLedSeen = 0;
+  // power (CoverPower.h): the closed-cover gate, the MCU following the display, PianoPolicy's and NativeGopDisplay's services
+  InputGate fGate;
+  CoverPower fCover;
+  IOService *fPolicy = nullptr, *fDisplay = nullptr;   // found by class, kept (kexts of the collection never unload)
+  IONotifier *fDisplayInterest = nullptr;
+  volatile uint32_t fDisplayChanged = 0;
+  uint64_t fPolicyLookupMs = 0, fDisplayLookupMs = 0, fDisplayReadMs = 0;
+  // system sleep: the serving thread parks between kOff and kOn
+  IOLock *fSleepLock = nullptr;
+  volatile bool fServing = false;
+  bool fSleepWanted = false, fParked = false;
+  uint32_t fSleeps = 0, fStatusCfg = 0;
 
   static void threadMain(void *self, wait_result_t);
   static bool eventServicePublished(void *target, void *refCon, IOService *service, IONotifier *notifier);
@@ -525,6 +556,15 @@ class PianoKeyboard : public IOService {
   void pollHall(uint64_t now);
   void hallOnly();
   void lidNotify(bool closed);
+  void acceptHall(int level, uint64_t now, const char *when);
+  bool policyAnswer(bool *latch, bool *now);
+  void readDisplay(uint64_t now);
+  void applyCover(CoverPower::Step step, const char *why);
+  void blank(const char *why);
+  void unblank(const char *why);
+  void sleepPark();
+  void kickServe();
+  static IOReturn displayInterest(void *target, void *ref, UInt32 type, IOService *provider, void *arg, vm_size_t size);
   void releaseAll();
   void describe(uint64_t seconds);
   bool romWrite(uint8_t value);
@@ -533,6 +573,7 @@ class PianoKeyboard : public IOService {
 public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  IOReturn setPowerState(unsigned long state, IOService *device) override;
 };
 
 OSDefineMetaClassAndStructors(PianoKeyboard, IOService)
@@ -579,13 +620,22 @@ bool PianoKeyboard::start(IOService *provider)
        gArgs.backlightIdle ? ", off when idle" : "", gArgs.pollMs, gArgs.idlePoll, gArgs.slowPoll);
   note("interrupt: piano-keyboard-irq=%u (%s); panel brightness keys %s (piano-backlight-keys)", gArgs.irq,
        gArgs.irq ? "gpio97 on the TLMM summary when it opens" : "polled", pianobacklight::keysEnabled() ? "on" : "off");
+  fGate.configure(gArgs.lidDrop != 0);
+  fCover.configure(gArgs.blank != 0);
+  note("power: piano-keyboard-blank=%u (%s), piano-keyboard-lid-drop=%u (%s); lid %u (%s)", gArgs.blank,
+       gArgs.blank ? "the MCU's power follows the display: 0x25 = 0 and the sleep line while it is off" : "the MCU always runs",
+       gArgs.lidDrop, gArgs.lidDrop ? "key and touchpad input dropped while the cover is closed" : "input kept with the cover closed",
+       gArgs.lid, gArgs.lid ? "this driver tells IOPMrootDomain the clamshell" : "the clamshell is PianoPolicy's (piano-policy-lid=1)");
+  fSleepLock = IOLockAlloc();
   thread_t thread = nullptr;
-  if (kernel_thread_start(threadMain, this, &thread) != KERN_SUCCESS) {
+  if (!fSleepLock || kernel_thread_start(threadMain, this, &thread) != KERN_SUCCESS) {
     stage(-1, "kernel_thread_start");
     return true;   // stays attached and does nothing more
   }
   thread_deallocate(thread);
   registerService();
+  note("system sleep: in the power tree (%#x): the serving thread parks while suspended; gpio95 latched for the kernel's keyboard "
+       "wake only as PianoPolicy says (else cover open and attached)", pianopower::join(this));
   return true;
 }
 
@@ -698,13 +748,25 @@ void PianoKeyboard::pollHall(uint64_t now)
   const bool agreed = sample == fHallSample;
   fHallSample = sample;
   if (!agreed || sample == fHall) return;
-  fHall = sample;
+  acceptHall(sample, now, "");
+}
+
+// A new accepted hall level: logged, published (with its message), the clamshell (piano-keyboard-lid), the input gate.
+void PianoKeyboard::acceptHall(int level, uint64_t now, const char *when)
+{
+  fHall = level;
   ++fHallChanges;
-  note("hall: cover %s (gpio80 %d, change %u, %llu s after start)", fHall ? "open" : "closed", fHall, fHallChanges,
+  note("hall: cover %s%s (gpio80 %d, change %u, %llu s after start)", fHall ? "open" : "closed", when, fHall, fHallChanges,
        (unsigned long long)(fStartMs ? (now - fStartMs) / 1000 : 0));
   setProperty("piano-keyboard-hall", uint64_t(fHall), 32);
   published("piano-keyboard-hall");
   lidNotify(!fHall);
+  if (fGate.hall(fHall)) {
+    releaseAll();
+    note("hall: cover closed: key and touchpad input dropped until it opens (piano-keyboard-lid-drop=1); everything released");
+  } else if (fGate.enabled() && fHall && fGate.changes()) {
+    note("hall: cover open: input again (%u reports dropped while it was closed)", fGate.droppedNow());
+  }
 }
 
 // piano-keyboard-lid=1/2 only: the hall state to IOPMrootDomain as a clamshell (an asynchronous power event there). =1 first
@@ -1046,7 +1108,7 @@ void PianoKeyboard::published(const char *what)
 // A backlight value from Backlight (-1: nothing to send).
 void PianoKeyboard::backlight(int value, const char *why)
 {
-  if (value < 0 || !fAttached) return;
+  if (value < 0 || !fAttached || !fCover.running()) return;   // blanked: the unblank sends the level
   sendCommand(kCmdBacklight, uint8_t(value), why);
 }
 
@@ -1143,6 +1205,7 @@ void PianoKeyboard::dispatch(const Report &r)
   case kIdKeyboard: {
     ++fKeys;
     if (!fAttached) coverAttached(true, "a key report without an attach message");
+    if (!fGate.pass()) return;   // the cover closed (piano-keyboard-lid-drop=1)
     uint8_t out[kKeyboardBytes];
     const uint32_t rollovers = fKeyFilter.rollovers();
     const uint64_t now = nowMs();
@@ -1162,6 +1225,7 @@ void PianoKeyboard::dispatch(const Report &r)
   }
   case kIdConsumer: {
     ++fConsumer;
+    if (!fGate.pass()) return;
     const IOReturn rc = send(Kind::keyboard, r.bytes, kConsumerBytes);
     backlight(fBacklight.consumer(le16(r.bytes + 1), nowMs()), "backlight (keyboard-brightness key)");
     if (pianobacklight::keysEnabled()) pianobacklight::step(fBrightness.consumer(le16(r.bytes + 1)), "the cover");
@@ -1174,6 +1238,7 @@ void PianoKeyboard::dispatch(const Report &r)
     if (!fTouchSeen) note("touchpad detected (first report 0x19): a cover with a touchpad");
     fTouchSeen = true;
     ++fTouch;
+    if (!fGate.pass()) return;
     if (show && (fTouch <= 120 || fTouch % 25 == 0)) note("touch %u: %s", fTouch, hex(r.bytes, r.length, line, sizeof line));
     uint8_t out[2][kPointerBytes];
     const uint64_t now = nowMs();
@@ -1207,6 +1272,7 @@ void PianoKeyboard::dispatch(const Report &r)
   }
   case kIdMouse: {
     ++fMouse;
+    if (!fGate.pass()) return;
     if (show && (fMouse <= 40 || fMouse % 50 == 0)) note("mouse %u: %s", fMouse, hex(r.bytes, r.length, line, sizeof line));
     if (!gArgs.mouse || fTouchSeen) return;
     uint8_t out[kPointerBytes];
@@ -1290,16 +1356,26 @@ void PianoKeyboard::serve()
   uint64_t nextDescribe = 15000;
   note("serving: %s", gArgs.level >= 2 ? "reports go to macOS" : "reports are logged only (piano-keyboard=2 gives them to macOS)");
   lidNotify(!fHall);
+  if (fGate.hall(fHall)) note("hall: the cover is closed at start: key and touchpad input dropped until it opens (piano-keyboard-lid-drop=1)");
+  __atomic_store_n(&fServing, true, __ATOMIC_RELEASE);
   bool edge = waitForEdge(0);
   for (;;) {
+    if (__atomic_load_n(&fSleepWanted, __ATOMIC_ACQUIRE)) {   // a system sleep: parked until the wake
+      sleepPark();
+      edge = false;
+    }
     const uint64_t now = nowMs();
+    if (fCover.enabled()) {   // piano-keyboard-blank=1: the display's power, on its message or every 2 s
+      if (__atomic_exchange_n(&fDisplayChanged, 0u, __ATOMIC_ACQ_REL) || now >= fDisplayReadMs) readDisplay(now);
+      applyCover(fCover.tick(now), "the display stayed off after the early wake");
+    }
     if (edge) {
       if (!fEdgeSeen) note("first gpio97 edge after %llu ms", (unsigned long long)(now - fStartMs));
       fEdgeSeen = true;
       ++fEdges;
       fPoll.activity(now);
     }
-    const PollMode before = fPoll.mode(now, fAttached, fHall == 0);
+    const PollMode before = fPoll.mode(now, fAttached, fHall == 0 || !fCover.running());
     // A frame per edge; after a frame with reports one more read (edges coalesce while a read runs). Until an edge is seen every
     // 100 ms, then every 1 / 5 / 10 s (active / idle / slow) a read anyway (an edge lost before arming leaves the MCU waiting).
     // gpio97 seen low at the last wakeup and high now without a latched edge is a missed edge: a frame is waiting.
@@ -1311,7 +1387,10 @@ void PianoKeyboard::serve()
     if (levelDue) ++fLevelReads;
     const bool due = edge || levelDue || fReadAgain || now - fLastReadMs >= (fEdgeSeen ? fPoll.readEveryMs(before) : 100u);
     unsigned burst = 0;
-    if (due) {
+    if (due && !fCover.running()) {   // blanked: the MCU sleeps, nothing is read (an edge is dropped)
+      fReadAgain = false;
+      fLastReadMs = now;
+    } else if (due) {
       do fReadAgain = readFrame();
       while (fReadAgain && ++burst < 8);
       if (fReadAgain || burst) fPoll.activity(now);   // reports came
@@ -1323,6 +1402,14 @@ void PianoKeyboard::serve()
         note("status gpio95 now %u (change %u, %s)", status, fStatusChanges, fAttached ? "attached" : "no cover");
       setProperty("piano-keyboard-status", uint64_t(status), 32);
       published("piano-keyboard-status");
+      if (status && !fCover.running()) {   // the MCU's wake request while blanked: wake it early if the display may wake now
+        bool latch = false, wake = false;
+        const bool answered = policyAnswer(&latch, &wake);
+        const bool allowed = wakeNow(answered, wake, fHall, fAttached);
+        if (fCover.earlyWakes() < 50 || !allowed) note("status gpio95 rising while blanked: %s (%s)", allowed ? "the MCU wakes" : "the MCU stays asleep",
+                                                       answered ? "PianoPolicy's answer" : "own rule: cover open and attached");
+        applyCover(fCover.wakeRequest(allowed, nowMs()), "gpio95 rising, the display may wake");
+      }
     }
     const uint32_t requests = __atomic_load_n(&fLedRequests, __ATOMIC_ACQUIRE);
     if (requests != fLedSeen) {
@@ -1330,10 +1417,10 @@ void PianoKeyboard::serve()
       const bool caps = __atomic_load_n(&fLedWanted, __ATOMIC_ACQUIRE) & kLedCapsLock;
       if (caps != fCaps) {
         fCaps = caps;
-        if (fAttached) sendCommand(kCmdIndicator, caps ? kLedCapsOn : kLedCapsOff, "caps lock LED");
+        if (fAttached && fCover.running()) sendCommand(kCmdIndicator, caps ? kLedCapsOn : kLedCapsOff, "caps lock LED");   // else at the unblank
       }
     }
-    if (fAttached && now >= fKeepaliveMs) {
+    if (fAttached && fCover.running() && now >= fKeepaliveMs) {
       sendCommand(kCmdKeyboardPower, 1, "keyboard power (every 12 s)");
       fKeepaliveMs = now + 12000;
     }
@@ -1345,7 +1432,7 @@ void PianoKeyboard::serve()
       nextDescribe = nextDescribe < 60000 ? nextDescribe + 15000 : nextDescribe < 120000 ? nextDescribe + 30000 : nextDescribe + 300000;
     }
     // How long to sleep: no sleep while a burst goes on; 1 s after 50 read errors in a row; else the poll plan's period.
-    const PollMode mode = fPoll.mode(nowMs(), fAttached, fHall == 0);
+    const PollMode mode = fPoll.mode(nowMs(), fAttached, fHall == 0 || !fCover.running());
     fPoll.wake(now, mode);
     PollPlan::Minute minute;
     if (fPoll.takeMinute(&minute) && (++fWakeLogs <= 5 || fWakeLogs % 10 == 0))
@@ -1359,6 +1446,186 @@ void PianoKeyboard::serve()
   }
 }
 
+// An acting PianoPolicy's answer (docs/policy.md 5.4): latch (arm gpio95 for a system sleep) and now (gpio95 may wake the display
+// now). False without one (absent, or at level 1: decisions only): then the own rule. Looked up by class every 2 s until found.
+bool PianoKeyboard::policyAnswer(bool *latch, bool *now)
+{
+  const uint64_t t = nowMs();
+  if (!fPolicy && t >= fPolicyLookupMs) {
+    fPolicyLookupMs = t + 2000;
+    OSDictionary *match = IOService::serviceMatching("PianoPolicy");
+    fPolicy = match ? IOService::copyMatchingService(match) : nullptr;
+    OSSafeReleaseNULL(match);
+    if (fPolicy) note("PianoPolicy found: its \"piano-policy-keyboard-wake\" decides gpio95's latch and the early MCU wake when it acts");
+  }
+  if (!fPolicy) return false;
+  OSObject *o = fPolicy->copyProperty("piano-policy");
+  OSNumber *level = OSDynamicCast(OSNumber, o);
+  const bool acting = level && level->unsigned32BitValue() >= 2;
+  OSSafeReleaseNULL(o);
+  if (!acting) return false;
+  bool l = false, n = false;
+  if (fPolicy->callPlatformFunction("piano-policy-keyboard-wake", false, &l, &n, nullptr, nullptr) != kIOReturnSuccess) return false;
+  *latch = l;
+  *now = n;
+  return true;
+}
+
+// NativeGopDisplay's message (any context, inside its gated power change): only noted for the serving thread.
+IOReturn PianoKeyboard::displayInterest(void *target, void *, UInt32 type, IOService *, void *, vm_size_t)
+{
+  if (type != kIOMessageServicePropertyChange) return kIOReturnUnsupported;
+  PianoKeyboard *k = static_cast<PianoKeyboard *>(target);
+  __atomic_store_n(&k->fDisplayChanged, 1u, __ATOMIC_RELEASE);
+  k->kickServe();
+  return kIOReturnSuccess;
+}
+
+// Ends the serving thread's wait early when it waits for gpio97's interrupt (polled waits are at most piano-keyboard-slow-poll).
+void PianoKeyboard::kickServe()
+{
+  if (fIrqLive && fPin.ok) {
+    __atomic_store_n(&fKickPending, 1u, __ATOMIC_RELEASE);
+    pianoirq::kick(&fPin.s->gen[fPin.slot]);
+  }
+}
+
+// piano-keyboard-blank=1: NativeGopDisplay's piano-display-power (looked up every 2 s until found, then its message, and a read
+// every 2 s as a fallback) to the MCU's power.
+void PianoKeyboard::readDisplay(uint64_t now)
+{
+  fDisplayReadMs = now + 2000;
+  if (!fDisplay && now >= fDisplayLookupMs) {
+    fDisplayLookupMs = now + 2000;
+    OSDictionary *match = IOService::serviceMatching("NativeGopDisplay");
+    fDisplay = match ? IOService::copyMatchingService(match) : nullptr;
+    OSSafeReleaseNULL(match);
+    if (fDisplay) {
+      fDisplayInterest = fDisplay->registerInterest(gIOGeneralInterest, &PianoKeyboard::displayInterest, this, nullptr);
+      note("found NativeGopDisplay: the MCU's power follows its piano-display-power%s", fDisplayInterest ? " (and its messages)" : "");
+    }
+  }
+  int state = -1;
+  if (fDisplay) {
+    OSObject *o = fDisplay->copyProperty("piano-display-power");
+    if (OSBoolean *b = OSDynamicCast(OSBoolean, o)) state = b->isTrue() ? 1 : 0;
+    OSSafeReleaseNULL(o);
+  }
+  applyCover(fCover.display(state, now), state == 1 ? "display on" : state == 0 ? "display off" : "display not known");
+}
+
+void PianoKeyboard::applyCover(CoverPower::Step step, const char *why)
+{
+  if (step == CoverPower::Step::blank) blank(why);
+  else if (step == CoverPower::Step::unblank) unblank(why);
+}
+
+// Ubuntu's panel blank (the stock offsets): keyboard power 0x25 = 0, then the sleep line (gpio3, active low) asserted.
+void PianoKeyboard::blank(const char *why)
+{
+  const bool sent = sendCommand(kCmdKeyboardPower, 0, "keyboard power off (blank)");
+  drive(kSleep, false);
+  note("blank %u (%s): keyboard power 0x25 = 0 %s, sleep line asserted; no keep-alive and no frame read until the unblank",
+       fCover.blanks(), why, sent ? "sent" : "NOT acknowledged");
+}
+
+// Ubuntu's unblank: the sleep line released, gpio97 high awaited (<= 100 ms, 1 ms polls, 5 ms more if it had to wait), the pending
+// frames drained (dispatched as always: a key that woke it reaches macOS), keyboard power 0x25 = 1, then LEDs and the backlight
+// as at an attach.
+void PianoKeyboard::unblank(const char *why)
+{
+  drive(kSleep, true);
+  const unsigned waited = ReadyWait::run([] { return level(kIrq); }, [](unsigned ms) { IOSleep(ms); });
+  unsigned drained = 0;
+  while (drained < 8 && readFrame()) ++drained;
+  bool sent = true;
+  if (fAttached) {
+    fBacklight.detach();
+    const int light = fBacklight.attach(nowMs());
+    Command list[5];
+    const unsigned n = attachCommands(fCaps, gArgs.touchpad, light < 0 ? 101u : uint32_t(light), list);
+    for (unsigned i = 0; i < n; ++i) sent = sendCommand(list[i].cmd, list[i].value, list[i].what) && sent;
+  } else {
+    sent = sendCommand(kCmdKeyboardPower, 1, "keyboard power on (unblank)");
+  }
+  fKeepaliveMs = nowMs() + 12000;
+  fPoll.activity(nowMs());
+  note("unblank %u (%s): sleep line released, gpio97 %s, %u frames drained, keyboard power 0x25 = 1 %s%s", fCover.unblanks(), why,
+       waited > ReadyWait::kMaxMs ? "NOT high after 100 ms" : waited ? "high after a wait" : "high at once", drained,
+       sent ? "sent" : "NOT acknowledged", fAttached ? " (with the LEDs and the backlight)" : "");
+}
+
+// docs/power.md 4, on the serving thread (the bus and the pins are its): off's steps, parked until on, on's steps.
+void PianoKeyboard::sleepPark()
+{
+  const uint32_t n = ++fSleeps;
+  applyCover(fCover.sleep(true, nowMs()), "system sleep");
+  if (fIrqLive && fPin.live()) fPin.mask();   // gpio97's enable off (never a wake source)
+  bool latch = false, wake = false;
+  const bool answered = policyAnswer(&latch, &wake);
+  const LatchDecision d = latchDecision(true, answered, latch, fHall, fAttached);
+  const uintptr_t status = pinVa(kStatus);
+  fStatusCfg = rd32(status + kIntrCfg);
+  wr32(status + kIntrCfg, latchCfg(fStatusCfg, d.arm));
+  wr32(status + kIntrStatus, 0);
+  note("sleep %u: scanning stopped, MCU %s; gpio95 latch %s (%s): INTR_CFG %08x -> %08x", n,
+       fCover.running() ? "running (piano-keyboard-blank=0)" : "blanked", d.arm ? "ARMED" : "off", d.why, fStatusCfg,
+       rd32(status + kIntrCfg));
+  IOLockLock(fSleepLock);
+  fParked = true;
+  IOLockWakeup(fSleepLock, &fParked, false);
+  while (fSleepWanted) IOLockSleep(fSleepLock, &fSleepWanted, THREAD_UNINT);
+  fParked = false;
+  IOLockUnlock(fSleepLock);
+  // the wake: gpio95's latch read and cleared, its configuration as found, the hall and the display read again
+  const bool latched = rd32(status + kIntrStatus) & 1;
+  wr32(status + kIntrStatus, 0);
+  wr32(status + kIntrCfg, fStatusCfg);
+  const uint64_t now = nowMs();
+  if (fHall >= 0) {
+    const int level = int(rd32(gHall.page.va + kIo) & 1);
+    fHallSample = level;
+    fHallNextMs = now + fPoll.config().hallMs;
+    if (level != fHall) acceptHall(level, now, " after the wake");
+  }
+  if (fCover.enabled()) readDisplay(now);
+  applyCover(fCover.sleep(false, now), "system wake, the display on or not known");
+  fLastReadMs = now;
+  fPoll.activity(now);
+  note("wake %u: serving again; gpio95 %s while suspended, now %u; cover %s; MCU %s", n, latched ? "rose" : "did not rise",
+       level(kStatus), fHall < 0 ? "not read" : fHall ? "open" : "closed", fCover.running() ? "running" : "blanked (the display is off)");
+}
+
+// off: the serving thread parks (at most 900 ms away: one wait); before serving (or with the bring-up stopped) nothing of ours is
+// powered. on: asynchronous, the thread does the rest.
+IOReturn PianoKeyboard::setPowerState(unsigned long state, IOService *)
+{
+  if (!fSleepLock || !__atomic_load_n(&fServing, __ATOMIC_ACQUIRE)) return pianopower::kAckNow;
+  IOLockLock(fSleepLock);
+  if (state == pianopower::kOff) {
+    if (!fSleepWanted) {
+      __atomic_store_n(&fSleepWanted, true, __ATOMIC_RELEASE);
+      IOLockUnlock(fSleepLock);
+      kickServe();
+      IOLockLock(fSleepLock);
+      uint64_t deadline = 0;
+      clock_interval_to_deadline(900, kMillisecondScale, &deadline);
+      while (!fParked && IOLockSleepDeadline(fSleepLock, &fParked, deadline, THREAD_UNINT) != THREAD_TIMED_OUT) {
+      }
+    }
+    const bool parked = fParked;
+    IOLockUnlock(fSleepLock);
+    if (!parked) note("sleep: the serving thread did not park within 900 ms (it parks at its next pass)");
+    return pianopower::kAckNow;
+  }
+  if (fSleepWanted) {
+    __atomic_store_n(&fSleepWanted, false, __ATOMIC_RELEASE);
+    IOLockWakeup(fSleepLock, &fSleepWanted, false);
+  }
+  IOLockUnlock(fSleepLock);
+  return pianopower::kAckNow;
+}
+
 void PianoKeyboard::describe(uint64_t seconds)
 {
   note("alive at %llu s: %s, %u reads (%u frames, %u empty, %u errors, %u bad, %u checksum mismatches), %u edges%s, %u level reads, irq high in %u of %u "
@@ -1368,5 +1635,9 @@ void PianoKeyboard::describe(uint64_t seconds)
        fEdgeSeen ? "" : " (none yet: polled every 100 ms)", fLevelReads, fIrqHigh, fPolls, fKeys, fKeyFilter.rollovers(), fConsumer,
        fTouch, fPointer.gestures(), fPointer.taps(), fPointer.swipes(), fSwipesSent, fMouse, fVendor, fAccel, fAuth, fAcks, fAttaches,
        fCommands, fCommandErrors, fSent, fSendErrors, level(kIrq), level(kStatus), fHall < 0 ? "not read" : fHall ? "open" : "closed",
-       pollModeName(fPoll.mode(nowMs(), fAttached, fHall == 0)));
+       pollModeName(fPoll.mode(nowMs(), fAttached, fHall == 0 || !fCover.running())));
+  if (fGate.enabled() || fCover.enabled() || fSleeps)
+    note("power at %llu s: input %s (%u reports dropped while closed); MCU %s (%u blanks, %u unblanks, %u early wakes, %u timed out); "
+         "%u system sleeps", seconds, fGate.closed() ? "DROPPED (cover closed)" : "passed", fGate.dropped(),
+         fCover.running() ? "running" : "blanked", fCover.blanks(), fCover.unblanks(), fCover.earlyWakes(), fCover.earlyTimeouts(), fSleeps);
 }

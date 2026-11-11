@@ -3,7 +3,8 @@
 Status, 2026-11-11: built and linked (inert without `piano-keyboard`). Level 1 ran once on the tablet (240 s, nobody typed):
 MCU booted, cover attached, commands acknowledged. No key or touchpad report seen yet; level 2, the hall sensor and the
 DRV-2 lock not run. 2026-11-12 (offline, host-tested, not run): the touchpad tuned for macOS (§6a), the battery work (§6b), the
-gpio97 interrupt (opt-in, §6b), the panel's brightness keys and the state other drivers watch (§6c).
+gpio97 interrupt (opt-in, §6b), the panel's brightness keys and the state other drivers watch (§6c). 2026-11-11 (host-tested,
+linked, not run): the power policy parts of `docs/policy.md` §5.4 and the system-sleep contract of `docs/power.md` §4 (§6d).
 Sources: `package/PianoKeyboard` (design and boot arguments at the top of `PianoKeyboard.cpp`, the codec in `Wn8030Piano.h`, the
 descriptors in `HidDescriptors.h`, provenance in `UPSTREAM`). Template: `README.md`.
 
@@ -84,6 +85,8 @@ which are unchanged.
 | `piano-keyboard-backlight-idle=S` | 0 | backlight off after S s without a key or touch, back at the next |
 | `piano-keyboard-poll=MS` / `-idle-poll=MS` / `-slow-poll=MS` | 4 / 30 / 200 | latch poll while reports flow / idle / detached or closed |
 | `piano-keyboard-irq=1` | 0 | wait for gpio97 by the TLMM summary interrupt (§6b); polled again after 3 misses or a storm |
+| `piano-keyboard-lid-drop=1` | 0 | key and touchpad reports dropped while the hall reads closed (§6d); only after the hall polarity is verified (§10.3) |
+| `piano-keyboard-blank=1` | 0 | the MCU's power follows the display and a system sleep (0x25 = 0 + the sleep line; §6d) |
 | `piano-backlight-keys=1` | 0 | (PianoBacklight's) the cover's 0x6F/0x70 and Right Ctrl + 1 / 2 also step the panel backlight |
 | `piano-keyboard-raw=0`, `-invert=B`, `-mouse=0`, `-halfbit=US`, `-rails=0` | | see `PianoKeyboard.cpp` |
 
@@ -150,6 +153,45 @@ Ubuntu's rules (`docs/ubuntu-history/kernel.md`): the keyboard wakes on gpio95 r
 off and the lid open; never gpio97; the lid (gpio80, PDC 122 → SPI 633) wakes on opening only; the keyboard power sequence follows
 the panel's blank / unblank; check the PDC's SPI-interface bit for SPI 639 first (it caused Ubuntu's early wakes). Ubuntu also
 dropped the community 12 s keep-alive (`docs/power-irq.md` §6.11): a candidate once the cover's behaviour without it is measured.
+
+## 6d. Power: the closed cover, the MCU following the display, system sleep (2026-11-11)
+
+`CoverPower.h` (portable, host-tested in `tests/keyboard_host.cpp` `testCoverPower`), wired in `PianoKeyboard.cpp`:
+
+- **With PianoPolicy** (`docs/policy.md` §5.4): `piano-keyboard-lid` stays 0, so PianoPolicy is the only clamshell controller
+  (`piano-policy-lid=1`); this driver keeps publishing `piano-keyboard-hall`, `-attached` and `-status` with a property-change
+  message each (PianoPolicy counts gpio95's rises from them). Its lid mode stays for tests without PianoPolicy.
+- **The closed cover** (`piano-keyboard-lid-drop=1`, default 0 until the hall polarity is verified): while the hall reads closed,
+  key, consumer, touchpad and mouse reports are dropped (Linux's input-off-while-closed: a closed cover pressed in a bag neither types
+  nor wakes the display through HID); at the closing every key and button is released once; attach messages and acks still pass.
+  Lines: `hall: cover closed: key and touchpad input dropped until it opens ...`, `hall: cover open: input again (N reports dropped
+  while it was closed)`.
+- **The MCU's power follows the display** (`piano-keyboard-blank=1`, default 0; Ubuntu's driver, the stock offsets, K:64f228ab0389):
+  NativeGopDisplay's `piano-display-power` (its message, a read every 2 s as the fallback) off → `0x25 = 0`, then the sleep line
+  (gpio3, active low) asserted, no 12 s keep-alive, no frame read, LED and backlight changes kept for later, the loop at its slow
+  tier; on → the sleep line released, gpio97 high awaited (polled every 1 ms for at most 100 ms, 5 ms more if it had to wait), the
+  pending frames drained (dispatched as always, so the key that woke it reaches macOS), then the attach set (`0x25 = 1`, Caps LED,
+  touchpad, mic LED, backlight). gpio95 rising while blanked (the MCU's wake request) wakes the MCU early only when the display may
+  wake now: an acting PianoPolicy's `now` (`"piano-policy-keyboard-wake"`, param2), else the own rule (attached, the cover not read
+  closed); if the display is still off 10 s later, the MCU is blanked again. The display wake itself is PianoPolicy's (from the
+  `-status` message) or macOS's own (the drained key as HID input). Lines: `blank N (display off): keyboard power 0x25 = 0 sent, sleep
+  line asserted; ...`, `unblank N (display on): sleep line released, gpio97 high at once, K frames drained, keyboard power 0x25 = 1
+  sent (with the LEDs and the backlight)`, `status gpio95 rising while blanked: the MCU wakes (PianoPolicy's answer)`.
+- **System sleep** ([power.md](../power.md) §4): PianoKeyboard is in the power tree (`pianopower::join`). `setPowerState(off)`
+  asks the serving thread to park (at most 900 ms away: one wait; the gpio97 interrupt wait is kicked) and the thread, which owns the
+  bus and the pins: with `piano-keyboard-blank=1` blanks the MCU (if the display had not); masks gpio97 when its interrupt is live
+  (never a wake source); sets gpio95's INTR_CFG for k27 0062's keyboard wake (bit 16): armed (raw status, rising edge, polarity
+  high, enable off, the other bits as found) only when an acting PianoPolicy says so (`"piano-policy-keyboard-wake"`, param1; at
+  level 1 its answer is not taken), else by the own rule (attached, the cover not read closed); not armed = raw status off, so the
+  kernel leaves bit 16 out; INTR_STATUS cleared. Then no I2C until the wake. `on`: gpio95's latch read and cleared, its INTR_CFG put
+  back as found, the hall read again (a change while frozen is accepted at once, published, and given to the gate), the display read
+  again, and with `piano-keyboard-blank=1` the MCU unblanked only when the display is on or not known (a resume without a display-on
+  sends nothing; the display-on that follows the full wake unblanks it). Lines: `sleep N: scanning stopped, MCU running
+  (piano-keyboard-blank=0) | blanked; gpio95 latch ARMED | off (<why>): INTR_CFG ... -> ...`, `wake N: serving again; gpio95 rose |
+  did not rise while suspended, now L; cover open; MCU running | blanked (the display is off)`. Every few minutes, when any of this
+  is on: `power at N s: input passed | DROPPED (...); MCU running | blanked (...); N system sleeps`.
+- Without these arguments and without a system sleep nothing changes: no lookup of PianoPolicy or NativeGopDisplay, no gpio95
+  write; the power-tree join only answers.
 
 ## 7. Build, kernel collection, RAM image
 
@@ -254,13 +296,17 @@ volume/power keys (PianoInput). A hang is a reset (`piano-reset-after`, the Guny
 2. Whether the cover needs authentication for anything (backlight?): (c).
 3. The hall sensor's level and polarity, and whether a closed folio presses keys: (a).
 4. Kinds a4, 28, 01 and bit 1 of the attach byte: more captures.
-5. Clamshell (`piano-keyboard-lid`) and Linux's input-off-while-closed policy: after native sleep exists.
+5. Clamshell (`piano-keyboard-lid`) and Linux's input-off-while-closed policy: PianoPolicy owns the clamshell; the input gate is
+   `piano-keyboard-lid-drop=1` (§6d), opt-in until the hall polarity (3) is known.
 6. Whether 400 dpi / 5 counts per wheel count feel right, and the scroll direction under natural scrolling: (d), then the
    defaults move.
 7. Whether the contact count is clean enough for gestures on by default: (a)'s three-finger lines.
 8. Whether the cover sends keyboard-brightness consumer usages at all: (a)'s `consumer` lines.
 9. Native interrupt delivery on the summary line, and whether gpio97's edges ever miss it: (e), then `piano-keyboard-irq` on.
-10. What gpio95 does while the cover is in use (its transitions in (a)/(b)), before B2 arms it as a wake.
+10. What gpio95 does while the cover is in use (its transitions in (a)/(b)), and whether it rises on a key press with the MCU blanked
+    (`piano-keyboard-blank=1`) and with it running: the keyboard wake (0062 bit 16, §6d) depends on it.
+11. Does the MCU come back from the sleep line with its RAM image (no firmware reload) and answer `0x25 = 1` after the unblank? (§6d,
+    the first `piano-keyboard-blank=1` run: `unblank ... gpio97 high ..., keyboard power 0x25 = 1 sent`, then keys.)
 
 ## 11. Licence note
 
