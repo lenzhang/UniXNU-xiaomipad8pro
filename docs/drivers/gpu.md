@@ -74,6 +74,8 @@ kernel side must provide (2026-11-11).
 | `piano-gpu-status=0..3` | 2 at N=2 | status rows (2: the diagnostic page) |
 | other `piano-gpu-*`, `piano-screenoff`, `piano-diag` | driver's | Adreno830's `pagani-*` knobs renamed (README of `package/PianoA830/adreno830`), e.g. `piano-gpu-pool=<MiB>`, `piano-gpu-profile`, `piano-gpu-dcvs-max` |
 | `piano-gpu-metal-opens=<n>` | 0 (no limit) | connections ever granted to the plugin |
+| `piano-gpu-hang-ms=<ms>` | 0 (2000) | the time without progress (fence, ring read pointer, BR's IB1) the fence and recovery watchdogs call a hang, 1000..60000; 10000 for the first desktop sessions ([gpu-userspace.md](gpu-userspace.md), desktop section) |
+| `piano-metal-report=0/1/2` | 1 | the plugin's abort reporter: off / the desktop's system processes / every process that loads the plugin (userspace, read through kern.bootargs) |
 | `native-gop-display-gpu-fence=0/1` | 1 | NativeGopDisplay waits for the GPU's fence before a swap's copy (§8) |
 
 ## 7. Kernel archive / component
@@ -120,6 +122,13 @@ gives the newest fence handed out and the newest the CP wrote. NativeGopDisplay 
 it with `callPlatformFunction("native-adreno-fences")` (no link dependency either way: the KC resolves a native kext's imports only
 from natives linked before it): a swap records the newest fence handed out when it is programmed, and its copy waits until the GPU
 retired it, at most 50 ms (then it copies anyway); `native-gop-display-gpu-fence=0` turns it off. Its 10 s line reports the waits.
+
+**The session's GPU events (2026-11-11).** Besides the status rows (since then at most every 10 s once the GPU runs, at once when row
+0's state, fault or hang count changes) and the minute's meter line, the publish shell prints `PianoA830: gpu ...` lines whatever
+`piano-gpu-trace` says, the first time and then every 10th, 100th, ...: `call failed: <proc>[pid] slot N <ABI method> -> 0x...`, `open
+refused: ... <why>`, `recovery: culprit ...`, `hang snapshot 1/3..3/3`, `recovery done`, `DEVICE LOST`, `page fault at 0x...: <proc>'s
+window`, and `clients N (peak P, ...)` with every live connection's slot, process and MiB when they change (at most every 10 s). What
+each means, and what the first desktop session must show: [gpu-userspace.md](gpu-userspace.md), "Desktop readiness, 2026-11-11".
 
 **Default-on.** PianoA830 is listed (inert). `PIANO_GPU=2 tooling/k27/build-native-image.sh` adds `piano-gpu=2
 piano-gpu-delay=${PIANO_GPU_DELAY:-20}`; make that the default once the plugin is staged in the default seed (and NativeSoftGpu stays

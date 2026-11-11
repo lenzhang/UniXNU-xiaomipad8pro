@@ -1,7 +1,9 @@
 # GPU userspace on the A830: the VM's Metal plugin, Turnip on Adreno830's ABI v2
 
-Status: built and checked offline, 2026-11-11. Nothing has run on the tablet yet. The kernel half (package/PianoA830: board inputs,
-firmware, bring-up) is a separate task, see [gpu.md](gpu.md). Plan: `droidvm-build/piano-patches/gpu-native-plan.md` §4 steps 2 and 3.
+Status 2026-11-11: the macOS login screen ran on the A830 with this userspace at 07:45 (end of this file); nobody has logged in yet.
+The changes for the first desktop session and tonight's run are in [Desktop readiness, 2026-11-11](#desktop-readiness-2026-11-11). The
+kernel half (package/PianoA830: board inputs, firmware, bring-up) is in [gpu.md](gpu.md). Plan: `droidvm-build/piano-patches/gpu-native-plan.md`
+§4 steps 2 and 3.
 
 ## 1. Purpose
 
@@ -12,8 +14,8 @@ Natively it uses its NativeAdreno backend (open type 0x4147) on Adreno830's user
 
 | Piece | Natively | Source |
 |---|---|---|
-| `Contents/MacOS/NativeAdrenoMetal` (plugin + frontend + bridge) | **byte-identical to the VM's** (CDHash `ea549d13…`): its objects rebuild byte for byte, so the VM's linked executable is taken (ld 27106.1 does not link it reproducibly) | macOS-DroidVM `overlay/metal`, UniXNU-turnip `drivers/AdrenoMetal`, bridge `out/metal/bridge` |
-| `Contents/MacOS/libvulkan_freedreno.dylib` (Turnip) | rebuilt: the VM's Mesa tree, `NativeAdrenoABI.h` v2, 2 patches (CDHash `eaa367a2…` on 2026-11-11; two cold builds byte-identical) | Droid-VM Mesa `cecc0e9` + 23 VM patches + `tooling/metal/turnip-a830/mesa/` |
+| `Contents/MacOS/NativeAdrenoMetal` (plugin + frontend + bridge) | the VM's plugin and bridge, its frontend with one patch, plus an abort reporter, linked here (CDHash `9c42e844…` since the evening of 2026-11-11; the login run had the VM's binary, `ea549d13…`). The objects are compiled without objc_msgSend selector stubs, which makes the link reproducible | macOS-DroidVM `overlay/metal`, UniXNU-turnip `drivers/AdrenoMetal` + `tooling/metal/turnip-a830/frontend/`, `tooling/metal/turnip-a830/abort_reporter.mm`, bridge `out/metal/bridge` |
+| `Contents/MacOS/libvulkan_freedreno.dylib` (Turnip) | rebuilt: the VM's Mesa tree, `NativeAdrenoABI.h` v2, 3 patches (CDHash `031df58a…`; `eaa367a2…` with 2 patches in the login run; cold builds byte-identical) | Droid-VM Mesa `cecc0e9` + 23 VM patches + `tooling/metal/turnip-a830/mesa/` |
 | `Contents/Info.plist` | the VM's (`org.droidvm.NativeAdrenoMetal`, principal class `NativeAdrenoMetalDevice`) | |
 
 The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
@@ -25,6 +27,15 @@ The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
   - `gpu_id` 830 for chip `0x44050001`. The decode formula would give 6850.
 - `0002-turnip-darwin-tu-debug-file.patch`: without `TU_DEBUG`, the first line of `/private/var/ngpu/debug/tu-debug` stands in for
   it. A system daemon's environment comes from a launchd job on the read-only system volume.
+- `0003-turnip-darwin-failures-on-stderr.patch`: a release build's `vk_log` is silent, so nothing of a lost device or a refused
+  allocation reached any log. A lost device's reason is now written once per device and queue (`MESA: error: device lost
+  (tu_knl_darwin.cc:<line>): <what> failed: 0x…`), and every failing kernel method the first time per method and status, then at the
+  10th, 100th, … (`TU: error: NativeAdreno: kernel BoAlloc failed: 0x… (1 time)`). The answers the backend expects are left out.
+
+The frontend patch (`tooling/metal/turnip-a830/frontend/0001-…patch`, applied after macOS-DroidVM's `piano-frontend-patch.py`): the
+stderr copy of its `NBLOG` lines is rate-limited per call site (8 lines, then the 16th, 32nd, … with the count); `no device answer`
+goes to the unified log only; `computeCommandEncoderWithDispatchType:` with a concurrent type returns the serial encoder instead of
+failing the command buffer. The abort reporter (`abort_reporter.mm`, ours) is NativeSoftMetal's, see the desktop section.
 
 ABI: `NativeAdrenoABI.h` from `package/PianoA830/` when the kernel side has it, else Adreno830 `1a13210`'s
 (sha256 `20ac9298…70d2`, pinned in the build script; a different header is used but noted). The backend also uses one name v2
@@ -35,7 +46,7 @@ lacks, `NativeAdrenoParamsOwnedCoherent` (Adreno740's v2 flag for IO-coherent BO
 
 ```sh
 tooling/metal/build-turnip-a830.sh           # -> out/turnip-a830/NativeAdrenoMetal.bundle (about 50 s cold on the M1 Pro, seconds after)
-python3 tooling/metal/check-turnip-a830-host.py   # the offline ABI handshake (§3), about 15 s
+python3 tooling/metal/check-turnip-a830-host.py   # the offline ABI handshake and the plugin checks (§3), about a minute
 # staging alone (build-native-image.sh does it by itself when PianoA830 is linked):
 python3 tooling/k27/stage-soft-metal.py --out out/turnip-a830/stage \
   --file out/turnip-a830/tu-debug:private/var/ngpu/debug/tu-debug out/turnip-a830/NativeAdrenoMetal.bundle
@@ -45,8 +56,9 @@ python3 tooling/k27/stage-soft-metal.py --out out/turnip-a830/stage \
 `PIANO_EXTRA_KEXTS`. `PIANO_A830_METAL=0|1` overrides that. The result goes to `out/turnip-a830/stage/{scratch-data.img,kernel.macho.trustcache}`,
 and the image takes those files unless `PIANO_SEED` / `PIANO_TRUST` name others. The staging is redone only when the input seed, the
 input trust cache, the stage script, the bundle's files or `PIANO_A830_TU_DEBUG` change (`out/turnip-a830/stage/stamp`).
-Builds are byte for byte the same, cold ones included: Mesa's generators run with `PYTHONHASHSEED=0`, and the plugin is the VM's
-binary. So the staged seed keeps its identity across rebuilds.
+Builds are byte for byte the same, cold ones included: Mesa's generators run with `PYTHONHASHSEED=0`, and the plugin's objects are
+compiled without objc_msgSend selector stubs (ld-1267 orders the stubs it makes differently from link to link; without them ten links
+were identical). So the staged seed keeps its identity across rebuilds (the login run of 2026-11-11 had the VM's binary).
 `PIANO_A830_TU_DEBUG` defaults to `sysmem` (no GMEM rendering, the plan's first bring-up setting); `PIANO_A830_TU_DEBUG=` stages none.
 NativeSoftGpu and PianoA830 together are refused: Metal takes the first accelerator and SkyLight the first device's port.
 
@@ -76,6 +88,12 @@ Result 2026-11-11, all pass:
   opens the device on this Turnip. The bridge's AIR fixtures are translated (AIR → SPIR-V → NIR → ir3), then a compute dispatch, a
   render pass into an IOSurface and a blit run. All 3 command buffers complete, with 3 kernel submissions and 1 BoImport (the path of
   WindowServer's framebuffers).
+- Added in the evening (all pass): `plugin_host` also runs a desktop session's extras (a heap with placed resources, a 4x MSAA pass
+  with resolve, a concurrent compute encoder, a shared event signalled by a command buffer, 24 panel-sized 3200x2136 IOSurfaces
+  rendered into and released one after another with no kernel object left behind, an 8192x4096 texture), also as a small-slot client
+  (`plugin_host-slot4`: `HOSTSIM_SLOT=4`, a 124 MiB window, so every import's GPU range must come back); `abort_reporter-abort`,
+  `-exception` and `-fault` (`reporter_host.mm`): the plugin's abort reporter reports and the process still dies with SIGABRT, SIGABRT
+  and SIGSEGV.
 
 Kits: Adreno830 `1a13210` is written against ArmSmmu4K `e923329` and AdrenoPM4 `282606b`. The check fetches both as GitHub archives
 into `out/turnip-a830/kits`. The standalone ArmSmmu4K checkout in `unixnu-research` is too new: its arena takes page callbacks, from
@@ -157,8 +175,8 @@ The success lines, in order (`stderr-log=1` keeps the first 159 bytes of each wr
 | `… no external-method selector is admitted for this process` | no selector answered the tunnel probe |
 | `… NativeAdreno query failed: 0xe00002c7` | Query's `abi_version` is not 2 |
 | `NativeAdreno: tu_physical_device_init failed` | GetDeviceInfo: a chip id or GMEM Turnip does not know |
-| `BoAlloc failed` / `BoMap failed` / `BoImport failed: 0x…` | memory; BoImport refused means WindowServer cannot render into its framebuffers |
-| `submit failed: 0x…`, `GPU faulted or hung` | device lost: the kernel's fault and status rows say why |
+| `TU: error: NativeAdreno: kernel BoAlloc failed: 0x… (N times)` (also BoMap, BoImport, …), with the kernel's `PianoA830: gpu call failed: <proc>[pid] slot N BoAlloc -> 0x…` | memory or a refused argument; BoImport refused means WindowServer cannot render into its framebuffers. Turnip 0003 and the kernel's event lines (2026-11-11); before them these were silent |
+| `MESA: error: device lost (tu_knl_darwin.cc:N): submit failed: 0x…` / `wait fence failed: 0x…` / `GPU faulted or hung` | device lost for that process: the kernel's `gpu recovery` and `gpu hang snapshot` lines say why (Turnip 0003; silent before) |
 | `NativeAdrenoMetal: <proc>: no Turnip beside the plugin` | the bundle is incomplete in the seed |
 
 ## 6. Performance to expect
@@ -201,9 +219,11 @@ To switch the plugin's ICD for a CPU fallback:
 ## 8. Open items
 
 1. `max-download-size` of piano's ABL against the 245 MB image (§2).
-2. The real Metal client count under macOS against the 32 slots (plan risk R4): count the `NativeAdrenoMetal: <proc>: device` lines.
-3. Surface sync. In the VM, the frontend's surface tickets (op `0x7200+11` through the tunnel) let IOSurface locks wait for the GPU;
-   WebKit canvases needed them. Natively they are off (§4.2). If canvas artifacts appear, the kernel side should serve them on its
+2. The real Metal client count under macOS against the 32 slots (plan risk R4): the login screen had 7 Metal processes and 6 live
+   connections; after the login the kernel's `PianoA830: gpu clients N (peak P, …)` lines give it (desktop section).
+3. Surface sync: not needed for the desktop, decided 2026-11-11 (desktop section). The frontend's surface tickets (op `0x7200+11`)
+   need an `IOAcceleratorES` service and open type 0x4149, which macOS never had: the VM's desktop ran without them too. Their known
+   user is WebKit's canvases (putImageData read back half-drawn). If canvas artifacts appear, the kernel side should serve them on its
    own connection type and the frontend should look for `AGXAccelerator`.
 4. `TU_DEBUG=sysmem` first. Drop it (`PIANO_A830_TU_DEBUG=`) once frames are right, and compare frame times.
 
@@ -223,4 +243,180 @@ self-test, METAL publish, DCVS, "GPU RUN 160M", 44-53 C). With Turnip on ABI v2 
 vmm-present 0 (8-bit framebuffers) plus panic_on_crash_disabled=1, WindowServer composited the macOS login screen (date and clock,
 the user's avatar, the password field) on the GPU and NativeGopDisplay showed it on the panel (camera, ~3.5 min after fastboot
 boot). Open: the console mailbox at 0x9cb00000 was overwritten in that run (no log); the display's present path has no GPU fence
-yet; no input to log in (touch not done; the buttons only).
+yet; no input to log in (touch not done; the buttons only). Later the same day: the mailbox was decayed, not overwritten, and decodes
+(gpu.md §8); NativeGopDisplay waits for the GPU's fence (gpu.md §8); a USB HID keyboard from the Mac and the keyboard cover give input.
+The run's log, read for the desktop: next section.
+
+## Desktop readiness, 2026-11-11
+
+Offline work (no boot) so that the first desktop session after a login on the A830 works and can be read from the console. The
+input of tonight's run is a login: a password typed from the Mac (`piano-usb-hid=1`) or the keyboard cover.
+
+### What the login run showed (07:44:43, 300 s)
+
+The run's console mailbox decodes with the fixed reader (`tooling/native/xnu-log.py decode logs/native-runs/20261111-074440-loop/dump.bin`,
+5653 lines, gpu.md §8). Bits are still wrong after the vote (threshold 3 of 11), so a word is sometimes garbled and the counts below
+come from fuzzy matching (± a few lines). No USB console was recorded for it. The plugin's lines are there because the image had
+`exec-log=1 stderr-log=1`.
+
+| Line (on the console) | Count | Where / reading |
+|---|---|---|
+| `NativeAdrenoMetal: <proc>: device Adreno (TM) 830 (raytracing disabled)` | 6 + 1 | WindowServer, Installer Progress, loginwindow, SecurityAgent, iconservicesagent, VTDecoderXPCService, and MenuBarAgent (its line garbled). The meter says `conn 6/6`: 6 connections live at most, no slot refused (`nos 0`) |
+| `native-metal: no device answer: the device has no answer for <selector>` | ~24 | 3-6 per client (maxVertexAmplificationCount, supportsComputeCompressedTextureWrite, supportsConditionalLoadStore, gpuCoreCount, maxComputeThreadgroupMemory, isLargeMRTSupported). Harmless (`harmlessProblem`); the frontend patch keeps them off the console now |
+| `native-metal: heap N bytes type 0 options 0x220 -> N` | 11 | WindowServer and SecurityAgent; an information line per heap. Rate-limited now |
+| `native-metal: surface texture refused: 4096x2160 YCbCr format 501/503 converts on the CPU` | 4 (the frontend's own cap) | WindowServer, from about the time the login screen appears: the wallpaper video's frames. Only formats 500/505 (4:2:0) have the planes-only path (`METAL2VULKAN_YCBCR_PLANES_ONLY`); these Core Animation converts on the CPU. As in the VM |
+| `native-metal: binary archive refused: BinaryArchive(InvalidFile …RenderBox…)` | 1 | SecurityAgent: pipelines compile from source. Harmless, as in the VM |
+| `NativeAdrenoMetal: SecurityAgent: stubbed NBTexture allocatedSize` | 1 | the stub survey; answers 0 |
+| `setBackgroundGPUPriority:2` / `setGPUPriority:1` | 2 | iconservicesagent; kept, nothing schedules by them |
+| `PianoA830: <proc> opens the accelerator, type 0x5: 0xe00002c7`, `type 0x4147: 0` | 1, 11 | IOGPU's type-5 open is refused without taking a slot; two 0x4147 opens per Metal process (enumeration, device) |
+| `PianoA830: row3 IRQ 0 wait 3838 to 1850 late 1330 …` (at the end) | — | `to`: WaitFence calls that ended with kIOReturnTimeout, zero-timeout status polls included; `late`: completions seen after a poll slice (polled fences, annibale). Not errors |
+| `PianoA830: row0 GPU RUN 160M/342M … f0 h0 … 42-57C` | ~2 a second | no fault and no hang for the whole run; DCVS residency 53 % at 160 MHz, 47 % at 342 MHz |
+| `PianoA830: row2 MEM pool 512 used 488 imp 772 … vm 622 sc9 WindowServer:410+86` | — | the 512 MiB BO pool was 95 % used at the login screen. BOs past it come from contiguous or scattered pages (`sc9`: 9 MiB outside the pool), by design. WindowServer: 360-410 MiB own, 86 MiB imported |
+| `PianoA830: t gpu meter rs 622 2.5/11.5ms … conn 6/6 nos 0 ovf 0 … pf 0/0/0/0` | 4 (a minute each) | steady state: about 10 render-server jobs a second, 2.5 ms mean and 11.5 ms longest GPU time; no slot refusal, no window overflow, no page fault |
+| `NativeGopDisplay: N swaps submitted, …; copies mean 19.7 ms (read 17.4) …, N waits released`, `at most 9-10 frames in a second` | every ~10 s | WindowServer composited about 10 frames a second; every copy waited for its GPU fence and none ran into the 50 ms limit |
+| `crash message`, `Assertion failed`, `exit: pid N WindowServer`, `device lost`, `GPU faulted or hung`, `Bo… failed`, `submit failed`, `noslot`, `LOST` | 0 | none. Turnip could not have printed its own failures anyway: a release build's `vk_log` is silent (fixed by Turnip 0003) |
+| `AMFI: Denying core dump for pid N (watchdogd)` | ~8 | watchdogd's crash loop (no watchdog driver natively), not the GPU |
+| `airportd: AssertMacros: !eachConnection.isLocal`, `VTDecoderXPCService: unrecognised property key` | a few | Wi-Fi and VideoToolbox, not the GPU path |
+
+Timeline. Kernel time T counts from XNU's start, 20 s after the `fastboot boot` command (the loop's "XNU started"). Sources: the
+bring-up trace's microsecond stamps, the meter line once a minute after S10, the display's line every ~10 s while swaps arrive, the
+1970 calendar of launchd's own lines; ±10 s after T 60 s.
+
+| T | What |
+|---|---|
+| -20 s | `fastboot boot` (241960 KB, 5.6 s download), ABL, our UEFI, DarwinBoot |
+| 0 | XNU starts |
+| ~7 s | PianoA830 starts and waits 20 s (`piano-gpu-delay=20`) |
+| 27.3-28.4 s | S0..S10 in 1.07 s (S3's 512 MiB pool reservation 1.02 s); AGXAccelerator published |
+| ~48 s | launchd (`1970-01-01 07:30:48`) |
+| ~65 s | WindowServer (pid 102): MetalPluginName, two 0x4147 opens, `device Adreno (TM) 830`, then GPU jobs (2 in the first meter minute) |
+| ~90-100 s | first swaps; frames black (WindowServer up, no login window yet) |
+| ~100-145 s | the seed's boot job (settime, bind mounts), Installer Progress, then loginwindow, SecurityAgent, iconservicesagent and VTDecoderXPCService get devices |
+| ~150-160 s | the first non-black frame: the login screen (`100.0% non-black, mean #9f9f9f`), ~10 frames a second from then on |
+| 300 s | `piano-reset-after` |
+
+What the ~3 min go to, and what to cut: the GPU path is not on the critical path. The accelerator is published 37 s before WindowServer
+starts, so `piano-gpu-delay=20` costs nothing here (0 would save nothing either; gpu.md §8 wants one try of it before it becomes the
+default). The GPU does 2.5 ms a frame, so `TU_DEBUG=sysmem` is no limit and stays for tonight (GMEM is untested natively). The time goes
+to macOS's own boot until WindowServer (~65 s), then ~85 s until loginwindow has its window (boot tasks, the seed's boot job, first-use
+shader translation in every process with a cold m2v cache), then the camera. At the login screen the frame rate (~10 a second) is
+WindowServer's CPU: the 4096x2160 wallpaper video, decoded in software by VTDecoderXPCService, converted to RGB on the CPU (formats
+501/503 above). Nothing is cut tonight.
+
+### After the login: what changes
+
+Metal clients. At the login screen 7 processes had a device. After it, expect the Dock (a large slot), Finder, SystemUIServer, Control
+Centre, Notification Centre and its widget renderer (chronod), WindowManager, Spotlight, WallpaperAgent (large), TextInput and
+accessibility agents, screencaptureui on a screenshot, Safari's `com.apple.WebKit.GPU` when Safari opens, and background daemons that
+use Metal for Core ML and video (media and photo analysis, more VTDecoderXPCService instances): 15-25 live connections. The kernel has
+32 slots in the 16 GiB table (`va=16`): slot 0 WindowServer's 1.5 GiB window (446 MiB used at the login screen), slots 1-3 large
+(512 MiB: Dock, WallpaperAgent, iconservicesagent), 28 small (448 MiB) for everyone else; a process on neither list gets a small slot
+only while more than 4 are free. Each connection holds up to 4096 objects (16384 for WindowServer, 8192 for a large client). Memory
+beyond the 512 MiB pool comes from contiguous or scattered pages; one BO is at most 256 MiB (Query's `max_bo_bytes`, which Turnip does
+not take as its allocation limit: an 8192x8192 RGBA8 texture is refused with BadArgument, found by the host check).
+
+Metal features the login screen did not use, and where each stands:
+
+| Feature | Natively |
+|---|---|
+| Blur, backdrop layers (Dock, menu bar, Control Centre) | the login screen already blurs its wallpaper. The desktop's window effects go through MPS: the plugin's fixes from the VM (userDictionary, gpuCoreCount, protocol conformances) are in this plugin |
+| IOSurface sharing across processes (window backing stores) | 976 imports at the login screen, read-only imports coherent (`coh 1`); the host check churns 24 panel-sized surfaces with no import left behind, also in a 124 MiB window |
+| Argument buffers, heaps | the VM's frontend and bridge, unchanged; SecurityAgent made heaps at the login screen; heaps checked offline |
+| MTLSharedEvent | checked offline (signalled by a command buffer, read back) |
+| MSAA | 4x with resolve checked offline |
+| Compute | MPS's serial encoders as in the VM; a concurrent compute encoder (Core ML, MPSGraph) failed its whole command buffer, now it runs serially (frontend patch) |
+| Large textures | 3200x2136 and 4096x2160 at the login screen; 8192x4096 checked offline; above 256 MiB per BO refused |
+
+Surface sync (§8.3): not needed for the desktop. The frontend's tickets need `IOAcceleratorES` and open type 0x4149, which macOS never
+had, so the VM's desktop (Dock, Finder, Safari, Settings) ran without them. Their known user is WebKit's canvases (putImageData read
+back half-drawn); a CPU reader in the same process already waits for the GPU (`waitForResource`). Not implemented.
+
+The VM's unexplained hang. At 3200x2136 the VM hung about a minute after every login (3 of 3 runs), and its login transition had passes
+that ran several seconds at 1.1 GHz, past Linux's 2 s hang check. Here the A830 runs at 160-342 MHz and both watchdogs call 2 s
+without progress a hang. A long full-panel pass can therefore be taken for a hang during the transition: the recovery fails that job,
+WindowServer loses its device and the session falls back to the login window. Hence `piano-gpu-hang-ms=10000` tonight (the VM's
+setting that let the login through). A genuine hang then freezes the panel 10 s before the recovery; two recoveries a minute are
+allowed, the third gives the GPU up for the boot.
+
+### What changed
+
+- Kernel (PianoA830, `ADRENO830_MACOS` only): the session's GPU events as `PianoA830: gpu …` lines whatever `piano-gpu-trace` says,
+  the first time and then every 10th, 100th, …: `call failed: <proc>[pid] slot N <method> -> 0x… (<IOReturn>)` for every failed call
+  but the answers Turnip expects; `open refused: <proc>[pid] -> 0x…: <why>`; `recovery: culprit slot N <proc>; jobs in flight fail: …`,
+  `hang snapshot 1/3..3/3` (cause, fences, RBBM, RPTR/WPTR, BR IB1/IB2, the pipes' fault and protect status, the GPU bank's FSR/FAR),
+  `recovery done`, `DEVICE LOST`; `page fault at 0x…: <proc>'s window (slot N)`; `clients N (peak P, refused …): 0:WindowServer 446M
+  1:Dock 60M …` when the set changes, at most every 10 s. The status rows: at most every 10 s once the GPU runs, at once when row 0's
+  state, fault or hang count changes (they were two lines a second). The first 160 opens and 96 MetalPluginName reads are logged.
+  `piano-gpu-hang-ms` (gpu.md §6).
+- Turnip `0003-turnip-darwin-failures-on-stderr.patch` (§1): device lost and failed kernel calls on stderr.
+- Frontend patch (§1): `NBLOG` rate-limited per call site on stderr, `no device answer` off the console, concurrent compute serial.
+- Abort reporter (`tooling/metal/turnip-a830/abort_reporter.mm`, ours: NativeSoftMetal's): in WindowServer, Dock, Finder,
+  SystemUIServer, ControlCenter, NotificationCenter, WindowManager, Spotlight, loginwindow, SecurityAgent and the other desktop system
+  processes, an abort, an uncaught exception, a C++ terminate or a fatal signal prints `NativeAdrenoMetal: <proc>: SIGABRT`, the
+  `crash message (<image>)` lines (SkyLight's and assert()'s text), `uncaught <name>`/`reason: …` and the stack as `#N <image>+0x…`,
+  then the process ends as it would have (its own handlers chained). `piano-metal-report=0` leaves it out, `=2` puts it in every
+  process that loads the plugin. Without it a WindowServer that dies after the login left only `exit: pid N WindowServer status 0x6`.
+- `PIANO_A830_LOG=PREDICATE` (build-native-image.sh): the seed's boot job also prints those processes' os_log errors and faults
+  (`stage-soft-metal.py --log-errors`), for SkyLight's and Core Animation's reasons that never reach stderr. Off by default.
+- Host checks (§3): the desktop extras and the reporter; `run-a830-host-tests.py` adds `macos_events`.
+
+Built (offline, 2026-11-11 evening): Turnip CDHash `031df58ae7cacc6ccb317155eb293afe55b8f632`, plugin `9c42e84423bb5be3ad7f76b4451b6c2f6226a325`
+(both twice from scratch, the same); bundle files sha256 `cead9f7c…5222` (Turnip), `d4ffaf27…d4d6` (plugin), `9595a4d2…f86b`
+(Info.plist). Staged with `tu-debug` sysmem into the morning's input seed: `scratch-data.img` 124657792 bytes packed, identity
+`262446fdd2ce3d8e` (the login run's was `aced5bf9794b42f3`), trust cache sha256 `5768d31c…e291`. A new seed identity: `data-persist=2`'s
+store starts over at the first boot of the new image (the Data changes of earlier native boots are dropped; the account is in the seed).
+Checks: `check-turnip-a830-host.py` all PASS (17 runs), `run-a830-host-tests.py` upstream 43 and macOS 42 pass with the known
+exceptions as before, `macos_lists` and `macos_events` PASS, `check-a830-abi-host.py` PASS, the kext links (20 weak symbols coalesced,
+0 unresolved imports).
+
+### Tonight's run
+
+```sh
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=1200 \
+PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-power=1 exec-log=1 stderr-log=1 piano-gpu-hang-ms=10000" \
+  tooling/k27/build-native-image.sh
+tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img     # with the USB console recording (piano-usb=2)
+```
+
+New against the given command: `exec-log=1 stderr-log=1` (without `stderr-log=1` no line of the plugin, the frontend, Turnip or the
+reporter reaches the console; the login run had both) and `piano-gpu-hang-ms=10000`. The command line is 846 characters (DarwinBoot
+takes 1023). Optional: `PIANO_A830_LOG='process == "WindowServer" OR process == "Dock" OR process == "Finder" OR process == "loginwindow"'`
+in front of it, for the os_log errors of those processes (a new seed again). The installed ESP (`tooling/persist/build-esp.py --profile
+daily`) has none of this until it is rebuilt from this tree with `--arg exec-log=1 --arg stderr-log=1 --arg piano-gpu-hang-ms=10000`.
+stderr-log costs console lines: about 760 in the login run's 5 minutes (2.5 a second, most of them not the GPU's).
+
+What the run must show, in order:
+1. `PianoA830: bring-up done: the GPU runs`, then `fd2: pid N WindowServer: NativeAdrenoMetal: WindowServer: abort reporter installed …`
+   and `… device Adreno (TM) 830 (raytracing disabled)`, then `PianoA830: gpu clients 1 (…): 0:WindowServer …M`.
+2. The login screen as in the morning: `NativeGopDisplay: thumb frame N: 3200x2136 'BGRA', 100.0% non-black …`, `gpu clients 6 …`.
+3. After the password: `loginwindow` stays, new `… device Adreno (TM) 830` lines for Dock, Finder, SystemUIServer, ControlCenter,
+   NotificationCenter and the rest, and `gpu clients N (peak P, refused for want of a slot 0): …` lines with 15-25 of them.
+4. A desktop thumbnail: a bright menu-bar band in row 00, the Dock's band in the bottom rows, the wallpaper in between; swaps keep
+   coming (`N swaps submitted`), `waits released` close to the copies.
+5. None of: `gpu call failed`, `gpu open refused`, `gpu recovery`, `gpu hang snapshot`, `gpu DEVICE LOST`, `gpu page fault`,
+   `MESA: error: device lost`, `TU: error: NativeAdreno: kernel`, `NativeAdrenoMetal: <proc>: SIGABRT` / `crash message` / `uncaught`,
+   `exit: pid N WindowServer`, a growing `f`/`h` count in `row0`.
+6. `row0 … NNC`: the temperature with a desktop at 342 MHz (the login run reached 57 C; the DCVS holds 160 MHz from 70 C).
+
+Reading a failure: `exit: pid N <proc> status 0x6` (SIGABRT) or `0xb` (SIGSEGV) comes right after the reporter's lines of that
+process, which name the framework; a `gpu call failed` names the process, the ABI method and the IOReturn, and Turnip's `TU: error:
+NativeAdreno: kernel <method> failed` / `MESA: error: device lost (…): <reason>` and the frontend's `<proc>: native-metal: <what>
+refused: <why>` come from the same process just before or after; a `gpu recovery` line with its three `hang snapshot` lines places a
+hang (culprit, where BR's IB1/IB2 stood); `gpu open refused … no free slot, N connections live` is the slot table. A WindowServer
+restart puts the session back at the login window; after a third recovery within a minute (`DEVICE LOST`) the GPU is gone until the
+next boot.
+
+Open risks:
+1. The VM's post-login hang at 3200x2136 (root cause never found) may come back natively; the snapshot lines are what to read then.
+2. The wallpaper video costs CPU (software HEVC decode plus Core Animation's CPU conversion of formats 501/503) and held the login
+   screen to ~10 frames a second; the same holds for the desktop if its wallpaper is a video: a still wallpaper (System Settings,
+   Wallpaper) is the lever.
+3. Memory: the BO pool was 95 % used at the login screen; a desktop lives on the fallback pages, which no native run has used in
+   volume yet.
+4. Thermal: no cooling or charging control (PianoPower read-only); watch `row0`'s temperature, keep the session within the 20 min
+   reset.
+5. No surface sync: WebKit canvases may show stale or half-drawn pixels.
+6. stderr-log=1 puts every process's stderr on the console; a chatty daemon after the login can add lines (the GPU path's own are
+   rate-limited).
+7. A new seed identity: the store of earlier boots is dropped, and every shader cache is cold on the first boot (first-use stalls per
+   client).
