@@ -4,9 +4,10 @@
 // There is no store anywhere in this file, so the survey cannot write to the hardware.
 //
 // Order: (1) the clock gate: GCC's display AHB branch, then DISPCC's MDSS GDSC and the MDSS AHB / MDP branches. A load from an
-// unclocked MDSS block can stall the bus (UniXNU's SM8750 tablet ports hung or reset on exactly that), so nothing of MDSS, the DPU
+// unclocked MDSS block can stall the bus (UniXNU's SM8750 phone ports hung or reset on exactly that), so nothing of MDSS, the DPU
 // or the DSI controllers is loaded unless the gate passes. (2) MDSS top, DPU top, the 10 pipes, the 6 CTLs, the 8 LMs, the 4 DSPPs'
-// PCC/GC words, MERGE_3D, the 4 DSC cores, the 4 INTFs, both DSI controllers. (3) The panel ID pin (TLMM, always readable). (4) The
+// PCC/GC words, MERGE_3D, the 4 DSC cores, INTF1 and INTF2 (the panel's; the DP INTFs 0 and 3 are not read), each DSI controller
+// only with its own byte and pixel clocks on. (3) The panel ID pin (TLMM, always readable). (4) The
 // apps SMMU's entries for the DPU's streams and their context banks. (5) Optionally (smmu level 3), the bank's own translation of
 // the splash framebuffer, walked in its page tables: loads from the table memory the boot loader left, which XNU does not own.
 #pragma once
@@ -67,6 +68,7 @@ struct Survey {
   DscRegs dscs[kDscCount]{};
   IntfRegs intfs[kIntfCount]{};
   DsiRegs dsi[2]{};
+  bool dsiRead[2] = {false, false};   // a controller is read only with its byte and pixel clocks on
   uint32_t panelIdCfg = 0, panelIdIo = 0;
   unsigned loads = 0;
 };
@@ -77,6 +79,8 @@ constexpr uint32_t kGccDispAhb = 0x27004, kGccDispHfAxi = 0x27008;   // msm gcc-
 constexpr uint32_t kCcNonGdscAhb = 0xc004;                          // msm dispcc-sm8750: disp_cc_mdss_non_gdsc_ahb_clk
 inline bool branchOn(uint32_t cbcr) { return !(cbcr >> 31); }       // CBCR bit 31: CLK_OFF
 inline bool gdscOn(uint32_t gdscr) { return (gdscr >> 31) & 1u; }   // GDSCR bit 31: PWR_ON
+// The INTFs read: INTF1 and INTF2 (the panel's). INTF0/INTF3 drive DP, which nothing runs: not read.
+constexpr bool intfSurveyed(unsigned i) { return i == 1 || i == 2; }
 
 template <class Load>
 ClockGate surveyClocks(Load load, unsigned *loads)
@@ -219,6 +223,7 @@ void surveyDpu(Survey &s, Load load)
     }
   }
   for (unsigned i = 0; i < kIntfCount; ++i) {
+    if (!intfSurveyed(i)) continue;
     const uint64_t b = kMdp + kIntfBase + kIntfStride * i;
     IntfRegs &f = s.intfs[i];
     const uint32_t at[] = {kIntfEn, kIntfConfig, kIntfHsyncCtl, kIntfVsyncPeriod, kIntfVsyncWidth, kIntfDispVStart, kIntfDispVEnd,
@@ -234,6 +239,10 @@ void surveyDpu(Survey &s, Load load)
     for (unsigned k = 0; k < sizeof at / sizeof at[0]; ++k) *to[k] = rd(b + at[k]);
   }
   for (unsigned i = 0; i < 2; ++i) {
+    // A DSI controller's registers are read only while its link clocks run (an unclocked DSI1 read hung an SM8650 under the same
+    // hypervisor: UniXNU-sm8750-common PeripheralIO.h).
+    if (!branchOn(s.clocks.byte[i]) || !branchOn(s.clocks.pclk[i])) continue;
+    s.dsiRead[i] = true;
     const uint64_t b = kDsi[i];
     DsiRegs &d = s.dsi[i];
     const uint32_t at[] = {kDsiHwVersion, kDsiCtrl, kDsiStatus0, kDsiFifoStatus, kDsiVidCfg0, kDsiVidCfg1, kDsiActiveH, kDsiActiveV,

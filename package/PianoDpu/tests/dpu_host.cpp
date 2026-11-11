@@ -42,6 +42,7 @@ struct Soc {
     set(kDispCc + kCcAhb, 0x00000001);
     set(kDispCc + kCcMdp, 0x00000001);
   }
+  void clockOff(uint32_t cbcr) { set(kDispCc + cbcr, 0x80000000); }
 };
 
 // One INTF's timing in msm's encoding (per INTF, compressed active width).
@@ -173,8 +174,26 @@ static void testGate()
     CHECK(soc.in(kRegDma, 0x7000) == 0);
     CHECK(soc.in(kDsiPhy[0], 0x1000) == 0 && soc.in(kDsiPhy[1], 0x1000) == 0);
     CHECK(soc.in(0x0af54000, 0x4000) == 0);
+    CHECK(soc.in(kMdp + kIntfBase, kIntfStride) == 0);                       // INTF0 (DP)
+    CHECK(soc.in(kMdp + kIntfBase + 3 * kIntfStride, kIntfStride) == 0);     // INTF3 (DP)
+    CHECK(soc.in(kMdp + kIntfBase + kIntfStride, kIntfStride) > 20);         // INTF1
+    CHECK(s.dsiRead[0] && s.dsiRead[1] && soc.in(kDsi[1], kDsiBytes) > 20);
     CHECK(s.loads == soc.loads.size());
-    CHECK(soc.loads.size() > 900 && soc.loads.size() < 1200);
+    CHECK(soc.loads.size() > 850 && soc.loads.size() < 1200);
+  }
+  {   // DSI1's byte clock off: DSI1 not read, DSI0 and the DPU still are
+    Soc soc;
+    bootState(soc);
+    soc.clockOff(kCcByte1);
+    Survey s;
+    survey(s, [&](uint64_t pa) { return soc.load(pa); });
+    CHECK(s.clocks.readable && s.dsiRead[0] && !s.dsiRead[1]);
+    CHECK(soc.in(kDsi[1], kDsiBytes) == 0 && soc.in(kDsi[0], kDsiBytes) > 20);
+    soc.loads.clear();
+    soc.clockOff(kCcPclk0);
+    Survey s2;
+    survey(s2, [&](uint64_t pa) { return soc.load(pa); });
+    CHECK(!s2.dsiRead[0] && soc.in(kDsi[0], kDsiBytes) == 0);
   }
 }
 

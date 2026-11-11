@@ -145,7 +145,7 @@ the 27.0.1 ABI generated at build time).
 ## 7. Kernel collection
 
 `tooling/k27/build-native-piano-dpu.sh` (host tests `tests/dpu_host.cpp`: the gate and what is never loaded (VBIF, REGDMA, DSI
-PHYs, DP), the decoders, a modelled ABL path, the SMMU scan, the walk; then the objects and the import check). PianoDpu is in
+PHYs, the DP controller and INTF0/3, a DSI controller whose byte or pixel clock is off), the decoders, a modelled ABL path, the SMMU scan, the walk; then the objects and the import check). PianoDpu is in
 `configs/k27-native-kexts.txt`, so every `build-native-image.sh` links it.
 
 ## 8. Hardware test plan (RAM boots; B1a unattended, B1b–B1e attended)
@@ -171,6 +171,7 @@ PianoDpu: ctl0: video mode, group 15, intf INTF1+INTF2 (master 00000002), lm LM0
 PianoDpu: lm0: out 1600x2136 ...; stage N: VIG0 rect 0 ...     lm1: ... (right of a split pair) ...
 PianoDpu: dspp0: pcc off|on ... ; gc off|on ...                (dspp1 the same)
 PianoDpu: dsc0 enc0: ... (video) conf ... (bpc 10, bpp 8.0, block-pred on, v1.1) picture 1600x2136 slice 800x24, input pingpong ...
+PianoDpu: intf0 and intf3 (DP): not read (nothing drives DP)
 PianoDpu: intf1 INTF1 (DSI0): engine on; htotal 576 (hsync 16 hbp 16 active 427 hfp 117) vtotal 2310 (vsync 2 vbp 104 active 2136 vfp 68); ...
 PianoDpu: dsi0: ctrl ........ (on, video, 4 lanes, clock lane) ...: Ubuntu's 120 Hz mode (full-panel HFP 234, vtotal 2310); compression on ...
 PianoDpu: panel id gpio100: cfg ... io ... -> p81 42-02-0a (rate-group registers B3 then B2)     (or 35-02-0b, B2 then B3)
@@ -187,7 +188,8 @@ PianoDpu: done: N MMIO loads, 0 stores; P pages mapped, 0 map failures
 ```
 The pipe names, alpha, timing numbers and route are what B1a is for: the INTF's compressed width (427) and wide-bus split are
 inferred from Linux and may read differently. Failure lines: `gate: MDSS AHB clock off: ...` (nothing of MDSS read: the next image
-adds a one-register AHB vote before the survey, attended), `refresh: intf1 frame counter did not move ... disabled` (counters
+adds a one-register AHB vote before the survey, attended), `dsi1: not read (its byte clock ... or pixel clock ... is off)` (the
+slave link's clocks are not where Linux has them: record the CBCRs), `refresh: intf1 frame counter did not move ... disabled` (counters
 off: the refresh then comes from B1b's vsync interrupt), a hang before `stage 2` lines (an ungated block: report the last line).
 With a `bank-on` route, run once more with `piano-dpu-smmu=3`: `walk: iova 0xfc800000 -> pa 0xfc800000 ... (identity)`.
 

@@ -5,7 +5,7 @@
 //   piano-dpu=1  a read-only survey of what the boot stages left driving the panel, logged as "PianoDpu: ..." lines: the display
 //                clocks (the gate: nothing of MDSS is loaded while its AHB or core clock is off), every pipe's source address,
 //                size, position, stride and format, the CTL paths, the layer mixers' blend stages, the DSPPs' PCC/GC enables and
-//                matrix, MERGE_3D, the DSC encoders, the four INTFs' timing and counters, both DSI controllers' mode and timing,
+//                matrix, MERGE_3D, the DSC encoders, INTF1/INTF2's timing and counters, both DSI controllers' mode and timing,
 //                the panel ID pin, the apps SMMU's entries for the DPU's streams 0x800-0x803 and their context bank; then the
 //                refresh, measured from INTF1/INTF2's frame counters read twice; then the path and what a zero-copy flip would
 //                write. Nothing is written: every MMIO access of this level is a load (DpuSurvey.h has no store at all).
@@ -309,7 +309,9 @@ void reportDsc(const Survey &s)
 
 void reportIntfs(const Survey &s)
 {
+  note("intf0 and intf3 (DP): not read (nothing drives DP)");
   for (unsigned i = 0; i < kIntfCount; ++i) {
+    if (!intfSurveyed(i)) continue;
     const IntfRegs &f = s.intfs[i];
     const IntfTiming t = viewIntf(f);
     if (!t.enabled && !f.hsyncCtl) {
@@ -333,6 +335,10 @@ void reportDsi(const Survey &s)
 {
   const bool bonded = viewDsi(s.dsi[0]).enabled && viewDsi(s.dsi[1]).enabled;
   for (unsigned i = 0; i < 2; ++i) {
+    if (!s.dsiRead[i]) {
+      note("dsi%u: not read (its byte clock %08x or pixel clock %08x is off)", i, s.clocks.byte[i], s.clocks.pclk[i]);
+      continue;
+    }
     const DsiRegs &d = s.dsi[i];
     const DsiTiming t = viewDsi(d);
     const int m = matchMode(t, bonded);
