@@ -26,6 +26,7 @@
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/clock.h>
 #include <libkern/c++/OSArray.h>
@@ -34,6 +35,7 @@
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
 #include <pexpert/device_tree.h>
+#include "../PianoDpu/PianoDpuFlipClient.h"   // the zero-copy flip's request (native-gop-display-flip=1)
 
 extern "C" task_t kernel_task;
 
@@ -154,7 +156,7 @@ private:
     void sampleRow(const uint32_t *line, const uint8_t *source, unsigned pixelBytes, uint64_t y, uint64_t width, uint64_t height,
                    FrameStats &stats, bool thumb);
     void logThumbnail(const FrameStats &stats, uint64_t width, uint64_t height, uint32_t format, bool refresh);
-    void requestCopy(IOSurface *, bool refresh, bool fenced = false, uint32_t fence = 0);
+    void requestCopy(IOSurface *, bool refresh, bool fenced = false, uint32_t fence = 0, bool flip = false);
     void copyLoop();
     static void copyThreadMain(void *, wait_result_t);
     const uint8_t *surfaceBytes(IOSurface *, IOMemoryDescriptor *, bool *cached);
@@ -243,6 +245,24 @@ private:
     bool fBacklightCallout;
     IOService *fBacklight;            // retained once found
     void backlightCallout(bool on);
+    // Zero-copy flips (boot-arg native-gop-display-flip=1, with PianoDpu's piano-dpu=2 piano-dpu-flip=4; docs/drivers/dpu.md §4.1;
+    // without the argument nothing of this runs): the copy thread hands a swap's surface, after the GPU fence wait, to PianoDpu's
+    // "PianoDpuFlip" (package/PianoDpu/PianoDpuFlipClient.h), found by class like the GPU; refused, it copies the surface as before
+    // and asks for the boot framebuffer back. The swap completes only then (on the work loop, fFlipDone): the surface it replaces is
+    // free once the new one latched. A flipped swap needs no refresh copies (the DPU reads the surface every frame), and the VBL timer
+    // runs only while refresh copies or a stalled queue need it.
+    bool fFlipMode;
+    IOService *fDpu;                  // retained once found
+    const OSSymbol *fDpuFlipSymbol;
+    uint64_t fDpuLookupNext;          // mach time of the next lookup while none was found
+    IOInterruptEventSource *fFlipDone;   // the copy thread -> the work loop: the deferred swap is on the panel
+    IOMFBSwapIORequest *fFlipSwap;    // the swap whose completion waits (the current swap then)
+    bool fCopyFlip;                   // with fCopyNext: a swap's surface to flip rather than copy
+    volatile bool fFlipShown;         // the last deferred swap was flipped (not copied)
+    uint64_t fFlips, fFlipCopies;
+    bool dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request);
+    void flipOrCopy(IOSurface *surface);
+    static void flipDoneAction(OSObject *, IOInterruptEventSource *, int);
     // The copy's cost (boot-arg native-gop-display-copy=BITS, default 0: nothing of this runs). A copy is ~39 ms for 3200x2136 BGRA,
     // 34 of them reading the surface (uncached), and each swap is followed by up to six refresh copies (ticks 1, 2, 4, 8, 16, 30).
     //   bit 0: a swap whose copy waited for the GPU's fence and saw it retired needs no refresh copies but the last (tick 30)
@@ -409,6 +429,15 @@ bool NativeGopDisplay::start(IOService *provider)
         IOLog("NativeGopDisplay: copy mode %#x:%s%s (native-gop-display-copy)\n", fCopyMode,
               fCopyMode & kCopyFencedRefresh ? " refresh copies only when no GPU fence covered the swap (and the last one)" : "",
               fCopyMode & kCopyCachedRead ? " cached surface reads with DC CIVAC first" : "");
+    unsigned flip = 0;
+    PE_parse_boot_argn("native-gop-display-flip", &flip, sizeof(flip));
+    fFlipMode = flip != 0;
+    if (fFlipMode) {
+        fDpuFlipSymbol = OSSymbol::withCString(kPianoDpuFlipFunction);
+        fFlipMode = fDpuFlipSymbol != nullptr;
+        IOLog("NativeGopDisplay: flip mode (native-gop-display-flip): each swap's surface to PianoDpu's flip (piano-dpu=2 "
+              "piano-dpu-flip=4), copied when refused; a swap completes once on the panel\n");
+    }
     if (!readFramebuffer())
         return false;
     IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress(fVideoPhys, fVideo.v_rowBytes * fVideo.v_height,
@@ -489,6 +518,8 @@ void NativeGopDisplay::stop(IOService *provider)
     fScanout = nullptr;
     OSSafeReleaseNULL(fGpu);
     OSSafeReleaseNULL(fGpuFenceSymbol);
+    OSSafeReleaseNULL(fDpu);
+    OSSafeReleaseNULL(fDpuFlipSymbol);
 }
 
 // Called by IOMobileFramebufferLegacy::start before it creates the default surface and registers the service (it tests bit 0).
@@ -503,6 +534,14 @@ bool NativeGopDisplay::start_hardware()
         IOLog("NativeGopDisplay: Failed to create VBL timer\n");
         OSSafeReleaseNULL(fVBL);
         return false;
+    }
+    if (fFlipMode) {   // the flip completions, on the same work loop
+        fFlipDone = IOInterruptEventSource::interruptEventSource(this, flipDoneAction);
+        if (!fFlipDone || getWorkLoop()->addEventSource(fFlipDone) != kIOReturnSuccess) {
+            OSSafeReleaseNULL(fFlipDone);
+            fFlipMode = false;
+            IOLog("NativeGopDisplay: flip mode off: no work-loop source for the flip completions; copies\n");
+        }
     }
     fVBL->enable();
     at<uint8_t>(this, kHardwareStarted) = 1;
@@ -522,6 +561,10 @@ IOReturn NativeGopDisplay::stop_hardware_gated()
         fVBL->cancelTimeout();
         getWorkLoop()->removeEventSource(fVBL);
         OSSafeReleaseNULL(fVBL);
+    }
+    if (fFlipDone) {
+        getWorkLoop()->removeEventSource(fFlipDone);
+        OSSafeReleaseNULL(fFlipDone);
     }
     return kIOReturnSuccess;
 }
@@ -607,6 +650,9 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         if (fCopiesSkipped)
             IOLog("NativeGopDisplay: %llu copies skipped for newer ones\n", fCopiesSkipped);
         IOLog("NativeGopDisplay: at most %llu frames in a second\n", fPeakFps);
+        if (fFlipMode)
+            IOLog("NativeGopDisplay: flip mode: %llu swaps flipped (no copy, no refresh copies), %llu copied (PianoDpu refused them or "
+                  "is not serving)\n", fFlips, fFlipCopies);
         if (fFenceWaits)
             IOLog("NativeGopDisplay: %llu swaps from submit to programmed mean %llu us max %llu us\n", fFenceWaits,
                   fFenceWaitNs / fFenceWaits / 1000, fFenceWaitMaxNs / 1000);
@@ -628,6 +674,11 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         fPeakFps = 0;
         fWakeLate = fWakeMaxNs = fVBLLate = fVBLLateMaxNs = 0;
         fCopies = fCopyNs = fCopyMaxNs = fPrepareNs = fReadNs = fConvertNs = fWriteNs = 0;
+    }
+    // Flip mode: no tick while nothing needs one (a deferred swap completes from flipDoneAction, a submitted one calls this anyway).
+    if (fFlipMode && !fRefreshLeft && (fFlipSwap || !at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))) {
+        fVBLDue = 0;
+        return kIOReturnSuccess;
     }
     uint64_t period;
     nanoseconds_to_absolutetime(1000000000ULL / fRefreshHz, &period);
@@ -758,16 +809,94 @@ void NativeGopDisplay::program_hardware_gated()
         fSecondFrames++;
         uint32_t fence = 0;
         const bool fenced = gpuFence(&fence);
-        requestCopy(surface, false, fenced, fence);
+        requestCopy(surface, false, fenced, fence, fFlipMode);
         if (surface != fShown) {
             reinterpret_cast<OSObject *>(surface)->retain();
             if (fShown)
                 reinterpret_cast<OSObject *>(fShown)->release();
             fShown = surface;
         }
-        fRefreshLeft = kRefreshTicks;
+        fRefreshLeft = fFlipMode ? 0 : kRefreshTicks;   // flip mode: set by flipDoneAction, once flipped or copied
+        if (fFlipMode) {
+            fFlipSwap = swap;   // completed by flipDoneAction
+            return;
+        }
     }
     swap_complete_gated();
+}
+
+// Flip mode, the copy thread: the swap's surface to PianoDpu; refused, copied into the boot framebuffer (not on the panel while a
+// surface is) and the boot framebuffer then put back, so the copy never shows half done. Then the work loop completes the swap.
+void NativeGopDisplay::flipOrCopy(IOSurface *surface)
+{
+    PianoDpuFlipRequest request;
+    const bool flipped = dpuFlip(surface, &request);
+    if (flipped) {
+        fFlips++;
+    } else {
+        copySurface(surface, false);
+        dpuFlip(nullptr, &request);
+        fFlipCopies++;
+    }
+    __atomic_store_n(&fFlipShown, flipped, __ATOMIC_RELEASE);
+    fFlipDone->interruptOccurred(nullptr, nullptr, 0);
+}
+
+// PianoDpu's "PianoDpuFlip" (the copy thread only): surface on the panel, or with nullptr the boot framebuffer back. True once the
+// hardware latched it. PianoDpu's service is looked up once a second until found (it registers only with piano-dpu=2).
+bool NativeGopDisplay::dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request)
+{
+    if (!fDpu) {
+        const uint64_t now = mach_absolute_time();
+        if (now < fDpuLookupNext)
+            return false;
+        uint64_t second = 0;
+        nanoseconds_to_absolutetime(1000000000ull, &second);
+        fDpuLookupNext = now + second;
+        OSDictionary *match = IOService::serviceMatching(kPianoDpuServiceClass);
+        IOService *dpu = match ? IOService::copyMatchingService(match) : nullptr;
+        OSSafeReleaseNULL(match);
+        if (!dpu)
+            return false;
+        fDpu = dpu;
+        IOLog("NativeGopDisplay: flips through %s: a 'BGRA' swap is shown by the DPU itself, the others are copied\n", dpu->getName());
+    }
+    *request = {};
+    request->size = sizeof(*request);
+    request->version = kPianoDpuFlipVersion;
+    if (surface) {
+        request->surface = surface;
+        request->memory = ioSurfaceMemory(surface);
+        request->offset = ioSurfaceBaseOffset(surface);
+        request->rowBytes = ioSurfaceBytesPerRow(surface);
+        request->width = ioSurfaceWidth(surface);
+        request->height = ioSurfaceHeight(surface);
+        request->format = ioSurfacePixelFormat(surface);
+        request->planes = ioSurfacePlaneCount(surface);
+        request->copyUs = fCopies ? static_cast<uint32_t>(fCopyNs / fCopies / 1000) : 0;
+    }
+    if (fDpu->callPlatformFunction(fDpuFlipSymbol, false, request, nullptr, nullptr, nullptr) != kIOReturnSuccess)
+        return false;
+    static unsigned refusals;
+    if (surface && request->result != kPianoDpuFlipShown && refusals++ < 8)
+        IOLog("NativeGopDisplay: flip refused (%s): %llux%llu row %llu format %#x; copied\n", pianoDpuFlipResultName(request->result),
+              request->width, request->height, request->rowBytes, request->format);
+    return request->result == kPianoDpuFlipShown;
+}
+
+// Flip mode, on the work loop: the deferred swap is on the panel (flipped, or copied with the boot framebuffer back): complete it (the
+// surface it replaces is free only now), then take the next queued swap.
+void NativeGopDisplay::flipDoneAction(OSObject *owner, IOInterruptEventSource *, int)
+{
+    auto *display = static_cast<NativeGopDisplay *>(owner);
+    IOMFBSwapIORequest *swap = display->fFlipSwap;
+    if (!swap)
+        return;
+    display->fFlipSwap = nullptr;
+    display->fRefreshLeft = __atomic_load_n(&display->fFlipShown, __ATOMIC_ACQUIRE) ? 0 : kRefreshTicks;
+    if (at<IOMFBSwapIORequest *>(display, kCurrentSwap) == swap)
+        display->swap_complete_gated();
+    display->swap_begin_gated();
 }
 
 // 8-bit BGRA, 16-bit half-float RGBA ('RGhA': Core Animation's framebuffer on a virtual device, the ADT's vmm-present), and 'b3a8':
@@ -846,7 +975,7 @@ bool NativeGopDisplay::waitGpuFence(uint32_t fence)
     return retiredInTime;
 }
 
-void NativeGopDisplay::requestCopy(IOSurface *surface, bool refresh, bool fenced, uint32_t fence)
+void NativeGopDisplay::requestCopy(IOSurface *surface, bool refresh, bool fenced, uint32_t fence, bool flip)
 {
     reinterpret_cast<OSObject *>(surface)->retain();
     IOLockLock(fCopyLock);
@@ -860,6 +989,7 @@ void NativeGopDisplay::requestCopy(IOSurface *surface, bool refresh, bool fenced
     fCopyRefresh = refresh;
     fCopyFenced = fenced;
     fCopyFence = fence;
+    fCopyFlip = flip;
     if (!skipped)
         fCopyRequestTime = mach_absolute_time();
     IOLockWakeup(fCopyLock, &fCopyNext, true);
@@ -888,8 +1018,10 @@ void NativeGopDisplay::copyLoop()
         bool refresh = fCopyRefresh;
         const bool fenced = fCopyFenced;
         const uint32_t fence = fCopyFence;
+        const bool flip = fCopyFlip;
         fCopyNext = nullptr;
         fCopyFenced = false;
+        fCopyFlip = false;
         uint64_t waited = 0;
         absolutetime_to_nanoseconds(mach_absolute_time() - fCopyRequestTime, &waited);
         IOLockUnlock(fCopyLock);
@@ -901,7 +1033,10 @@ void NativeGopDisplay::copyLoop()
         const bool covered = fenced && waitGpuFence(fence);
         if (!refresh)   // a swap's copy: whether its refresh copies are needed (native-gop-display-copy bit 0)
             __atomic_store_n(&fFenceCovered, covered, __ATOMIC_RELEASE);
-        copySurface(surface, refresh);
+        if (flip)       // native-gop-display-flip: shown by the DPU, else copied
+            flipOrCopy(surface);
+        else
+            copySurface(surface, refresh);
         reinterpret_cast<OSObject *>(surface)->release();
         IOLockLock(fCopyLock);
     }
