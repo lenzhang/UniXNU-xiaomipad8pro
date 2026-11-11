@@ -226,6 +226,10 @@ What each driver adds (their owners' work; nothing here changes their packages):
 
 ## 5. Policy defaults
 
+The policy on top of this (the cover closed on battery or on power, the keyboard's wake, the power key, macOS Low Power Mode → the
+power profile) is **PianoPolicy's: [`policy.md`](policy.md)** (`piano-policy=N`, backlog B2/B5); it replaces the lid and power-key
+routes below (`piano-keyboard-lid`, PianoInput's direct `kIOPMSleepNow`) once its tests pass.
+
 | What | Default | How |
 |---|---|---|
 | System sleep possible | off | `piano-sleep=1` (kernel; images built with it). Daily profile: only after §6 S1-S4 passed |
