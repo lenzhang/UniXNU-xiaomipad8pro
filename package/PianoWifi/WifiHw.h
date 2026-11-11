@@ -386,6 +386,7 @@ constexpr uint32_t kDstRingHpAddrLo = 0x14, kDstRingHpAddrHi = 0x18, kDstRingPro
 // base_msb: the address's high bits (7:0) and the ring's size in 32-bit words (27:8). id: the ring's identifier (15:8) and the
 // descriptor's size in words (7:0). misc: bit 6 enables the ring, bit 1 switches the loop count off (source rings).
 constexpr uint32_t kRingBaseMsbAddrHi = 0xffu, kRingBaseMsbSizeShift = 8, kRingBaseMsbSizeMask = 0xfffffu;
+constexpr uint32_t kCeRingSizeMaxWords = 0xffffu;   // what a copy-engine ring's size field takes, narrower than the field
 constexpr uint32_t kRingIdEntrySizeMask = 0xffu, kRingIdRingIdShift = 8;
 constexpr uint32_t kRingMiscEnable = 1u << 6, kRingMiscLoopCountDisable = 1u << 1;
 constexpr uint32_t kRingAddrLowMask = 0xffffffffu, kRingAddrHiShift = 32;
@@ -440,7 +441,8 @@ constexpr uint32_t kHtcConnStatusSuccess = 0;
 // The trailer's records: an identifier, a length, two padding bytes, then the records themselves; a credit report is one
 // endpoint and one credit count per four bytes.
 constexpr uint32_t kHtcRecordCredits = 1, kHtcRecordHeaderBytes = 4, kHtcCreditReportBytes = 4;
-constexpr unsigned kHtcEndpoints = 8, kHtcMaxControlMessage = 256, kHtcMaxMessage = 4096;
+// Nine endpoints, 0 to 8: the firmware may hand out the last one, and a credit report may name it.
+constexpr unsigned kHtcEndpoints = 9, kHtcMaxControlMessage = 256, kHtcMaxMessage = 4096;
 
 // ---- the firmware's own message interface (WMI) ----
 // A command is a 4-byte header (the command identifier in bits 23:0) and then TLVs; an event is TLVs alone. A TLV's header is one
@@ -466,6 +468,7 @@ enum WmiTag : uint32_t {
   kWmiTagPdevSetParamCmd = 0x052, kWmiTagVdevCreateCmd = 0x056, kWmiTagVdevDeleteCmd = 0x057,
   kWmiTagVdevTxrxStreams = 0x19b, kWmiTagServiceReadyExtEvent = 0x1ac, kWmiTagVdevDeleteRespEvent = 0x1c2,
   kWmiTagPdevSetHwModeCmd = 0x203, kWmiTagServiceAvailableEvent = 0x22f, kWmiTagPdevBandToMac = 0x24b,
+  kWmiTagServiceReadyExt2Event = 0x334,
 };
 // The resource configuration this chip's firmware wants (its own entry's values; the structure is 72 words after the TLV header,
 // and a firmware of another version may read more of them, which is why the whole structure is written and the words this driver
@@ -485,7 +488,6 @@ constexpr uint32_t kWmiCfgNumVdevs = 4, kWmiCfgNumPeers = 16, kWmiCfgNumTids = 3
 constexpr uint32_t kWmiCfgFlag1 = (1u << 5) | (1u << 18);
 constexpr uint32_t kWmiCfgFlags2 = (1u << 9) | (1u << 18);
 constexpr uint32_t kWmiMaxMemRequests = 32;       // how many the firmware may ask for in its service-ready event
-constexpr uint32_t kWmiHwModeMax = 0xf;           // "no hardware mode in this init": this chip has a single one
 constexpr uint32_t kWmiPdevIdSoc = 0;
 // A station virtual device, and the scan this level runs on it.
 constexpr uint32_t kWmiVdevTypeStation = 2, kWmiVdevSubtypeNone = 0;
@@ -494,10 +496,15 @@ constexpr uint32_t kWmiVdevStatsIdInvalid = 0xff;
 constexpr uint32_t kWmiStartScanWords = 39;       // the start-scan structure's words after its TLV header
 constexpr uint32_t kWmiStopScanOne = 0;           // stop the scan of this identifier (and not every scan of the radio)
 constexpr uint32_t kWmiScanId = 0xa000, kWmiScanRequestorId = 1;
-constexpr uint32_t kWmiScanPriorityLow = 1;
+// The priority field: this firmware's own host sets it in its own structure and never writes it into the command, so the
+// firmware reads a zero there, and so does this driver (the same wire bytes).
+constexpr uint32_t kWmiScanPriorityZero = 0;
 constexpr uint32_t kWmiScanFlagPassive = 0x1, kWmiScanFlagChanStatEvent = 0x10, kWmiScanFlagFilterProbeReq = 0x20;
 constexpr uint32_t kWmiScanDwellActiveMs = 50, kWmiScanDwellPassiveMs = 150, kWmiScanMinRestMs = 50,
                    kWmiScanMaxRestMs = 500, kWmiScanProbeDelayMs = 5, kWmiScanMaxTimeMs = 20000;
+// The per-band dwell times of the same structure's last words: none for the 2.4 GHz band (it takes the general one) and
+// 70 ms for the 6 GHz band's two, which this scan never reaches.
+constexpr uint32_t kWmiScanDwellActive2GhzMs = 0, kWmiScanDwell6GhzMs = 70;
 enum WmiScanEventType : uint32_t {
   kWmiScanEvStarted = 1u << 0, kWmiScanEvCompleted = 1u << 1, kWmiScanEvBssChannel = 1u << 2,
   kWmiScanEvForeignChannel = 1u << 3, kWmiScanEvDequeued = 1u << 4, kWmiScanEvPreempted = 1u << 5,
@@ -516,6 +523,14 @@ constexpr unsigned kScanChannelCount5 = sizeof kScanChannels5 / sizeof kScanChan
 constexpr unsigned kScanChannelMax = kScanChannelCount24 + kScanChannelCount5;
 constexpr unsigned kScanEntriesMax = 32;          // how many networks one scan keeps (the rest are counted, not kept)
 constexpr unsigned kSsidMax = 32;                 // 802.11: a service set identifier is at most 32 bytes
+// A management frame's status word: a frame with one of these bits set is thrown away, as this firmware's own host does (a
+// frame that failed its check may carry any bytes at all, and a network's address must never come from one).
+constexpr uint32_t kWmiRxStatusErrCrc = 0x01, kWmiRxStatusErrDecrypt = 0x08, kWmiRxStatusErrMic = 0x10,
+                   kWmiRxStatusErrKeyCacheMiss = 0x20;
+constexpr uint32_t kWmiRxStatusBad = kWmiRxStatusErrCrc | kWmiRxStatusErrDecrypt | kWmiRxStatusErrKeyCacheMiss;
+// The signal strength of a received management frame is the signal-to-noise ratio the firmware reports plus the noise floor,
+// which is what its own host uses when it has measured none of its own.
+constexpr int32_t kNoiseFloorDbm = -95;
 // 802.11 management frames the scan delivers: the frame control's type and subtype, and where the addresses are.
 constexpr uint32_t kDot11FcTypeMask = 0x0c, kDot11FcSubtypeMask = 0xf0, kDot11FcTypeManagement = 0x00;
 constexpr uint32_t kDot11SubtypeProbeResponse = 0x50, kDot11SubtypeBeacon = 0x80;

@@ -50,17 +50,19 @@ inline void wmiBegin(WmiWriter &w, uint8_t *buffer, uint32_t capacity, uint32_t 
 
 inline uint32_t wmiEnd(const WmiWriter &w) { return w.overflow ? 0 : w.length; }
 
-// A TLV of `bytes` (the value's length, padded up to a word): the value, zeroed, or null when it would not fit.
+// A TLV of `bytes` (the value's length): the value, zeroed, or null when it would not fit. The length the header carries is
+// the padded one, which is what the firmware's own host writes and what lets a reader that walks by the header's length land
+// on the next TLV (a value that is not a whole number of words is padded with zeros).
 inline uint8_t *wmiTlv(WmiWriter &w, uint32_t tag, uint32_t bytes)
 {
   if (w.overflow) return nullptr;
   const uint32_t padded = (bytes + 3u) & ~3u;
-  if (bytes > kWmiTlvLenMask || padded + kWmiTlvHeaderBytes > w.capacity - w.length) {
+  if (padded > kWmiTlvLenMask || padded + kWmiTlvHeaderBytes > w.capacity - w.length) {
     w.overflow = true;
     return nullptr;
   }
   uint8_t *at = w.buffer + w.length;
-  const uint32_t header = (bytes & kWmiTlvLenMask) | (tag & 0xffffu) << kWmiTlvTagShift;
+  const uint32_t header = (padded & kWmiTlvLenMask) | (tag & 0xffffu) << kWmiTlvTagShift;
   for (unsigned i = 0; i < 4; ++i) at[i] = uint8_t(header >> (8 * i));
   for (uint32_t i = 0; i < padded; ++i) at[kWmiTlvHeaderBytes + i] = 0;
   w.length += kWmiTlvHeaderBytes + padded;
@@ -93,17 +95,19 @@ struct WmiTlvRef {
 };
 
 // The TLVs of an event's payload, one call each. False when there is nothing left or the next header lies about its length.
+// The walk advances by exactly the length the header carries, as the firmware's own host does: a firmware that does not pad a
+// value is then still read correctly, and one that does pad it counts the padding in the length.
 inline bool wmiNext(const uint8_t *&at, uint32_t &left, WmiTlvRef &out)
 {
   if (!at || left < kWmiTlvHeaderBytes) return false;
   const uint32_t header = wmiGet(at, 0);
-  const uint32_t length = header & kWmiTlvLenMask, padded = (length + 3u) & ~3u;
-  if (padded + kWmiTlvHeaderBytes > left) return false;
+  const uint32_t length = header & kWmiTlvLenMask;
+  if (length + kWmiTlvHeaderBytes > left) return false;
   out.tag = header >> kWmiTlvTagShift;
   out.length = length;
   out.value = at + kWmiTlvHeaderBytes;
-  at += kWmiTlvHeaderBytes + padded;
-  left -= kWmiTlvHeaderBytes + padded;
+  at += kWmiTlvHeaderBytes + length;
+  left -= kWmiTlvHeaderBytes + length;
   return true;
 }
 
@@ -314,7 +318,7 @@ inline uint32_t wmiBuildStartScan(WmiWriter &w, uint8_t *buffer, uint32_t capaci
     wmiPut(cmd, 0, request.scanId);
     wmiPut(cmd, 1, request.requestorId);
     wmiPut(cmd, 2, request.vdevId);
-    wmiPut(cmd, 3, kWmiScanPriorityLow);
+    wmiPut(cmd, 3, kWmiScanPriorityZero);
     wmiPut(cmd, 4, kWmiScanEvStarted | kWmiScanEvCompleted | kWmiScanEvBssChannel | kWmiScanEvForeignChannel |
                        kWmiScanEvDequeued);
     wmiPut(cmd, 5, request.dwellActiveMs);
@@ -330,9 +334,9 @@ inline uint32_t wmiBuildStartScan(WmiWriter &w, uint8_t *buffer, uint32_t capaci
     wmiPut(cmd, 18, 0);                        // and no network asked for by name: a passive scan listens to every one
     wmiPut(cmd, 19, 0);                        // no elements added to a probe
     wmiPut(cmd, 20, 0);                        // and no probe repeats
-    wmiPut(cmd, 35, request.dwellActiveMs);    // the 2.4 GHz band's own dwell time
-    wmiPut(cmd, 36, request.dwellActiveMs);    // and the 6 GHz band's two, which this scan never reaches
-    wmiPut(cmd, 37, request.dwellPassiveMs);
+    wmiPut(cmd, 35, kWmiScanDwellActive2GhzMs);   // none of its own for the 2.4 GHz band: it takes the general one
+    wmiPut(cmd, 36, kWmiScanDwell6GhzMs);         // and the 6 GHz band's two, which this scan never reaches
+    wmiPut(cmd, 37, kWmiScanDwell6GhzMs);
   }
   uint8_t *channels = wmiTlv(w, kWmiTagArrayUint32, request.channelCount * 4);
   if (channels)
@@ -350,10 +354,12 @@ inline uint32_t wmiBuildStopScan(WmiWriter &w, uint8_t *buffer, uint32_t capacit
   wmiBegin(w, buffer, capacity, kWmiCmdStopScan);
   uint8_t *cmd = wmiStruct(w, kWmiTagStopScanCmd, 5);
   if (cmd) {
-    wmiPut(cmd, 0, request.requestorId);
+    // The firmware matches the scan by its identifier and the "this one" kind; the requestor and the virtual device are zero
+    // in what its own host sends, and the same bytes go out here.
+    wmiPut(cmd, 0, 0);
     wmiPut(cmd, 1, request.scanId);
     wmiPut(cmd, 2, kWmiStopScanOne);
-    wmiPut(cmd, 3, request.vdevId);
+    wmiPut(cmd, 3, 0);
     wmiPut(cmd, 4, kWmiPdevIdSoc);
   }
   return wmiEnd(w);
@@ -407,12 +413,14 @@ struct ScanEntry {
 struct ScanList {
   ScanEntry entries[kScanEntriesMax];
   uint32_t count = 0;
-  uint32_t frames = 0, beacons = 0, probes = 0, ignored = 0, dropped = 0;   // dropped: no room left in the list
+  // dropped: no room left in the list. badFrames: the firmware's own checks failed on the frame.
+  uint32_t frames = 0, beacons = 0, probes = 0, ignored = 0, dropped = 0, badFrames = 0;
 };
 
 struct WmiMgmtRx {
   uint32_t channel = 0, snr = 0, rate = 0, phyMode = 0, bytes = 0, status = 0, flags = 0, freq = 0;
-  int32_t rssi = 0;
+  int32_t rssi = 0;          // the header's own word, kept for the log
+  int32_t signalDbm = 0;     // the signal-to-noise ratio plus the noise floor: what a list shows
   const uint8_t *frame = nullptr;
 };
 
@@ -431,6 +439,7 @@ inline bool wmiParseMgmtRx(WmiMgmtRx &out, const uint8_t *payload, uint32_t leng
   out.flags = wmiGet(hdr, 10);
   out.rssi = int32_t(wmiGet(hdr, 11));
   out.freq = size >= 4 * 17 ? wmiGet(hdr, 16) : 0;
+  out.signalDbm = int32_t(out.snr) + kNoiseFloorDbm;
   uint32_t frameBytes = 0;
   const uint8_t *frame = wmiFind(payload, length, kWmiTagArrayByte, &frameBytes);
   if (!frame || !out.bytes || out.bytes > frameBytes) return false;
@@ -472,10 +481,15 @@ inline bool wmiParseBeacon(ScanEntry &out, const uint8_t *frame, uint32_t length
 }
 
 // A frame into the list: a network already there is updated (the strongest signal and the counters), a new one is added while
-// there is room. Returns the entry, or null when the list is full or the frame is not a scan result.
+// there is room. Returns the entry, or null when the list is full, the frame did not pass the firmware's own checks, or it is
+// not a scan result.
 inline ScanEntry *scanAdd(ScanList &list, const WmiMgmtRx &rx)
 {
   ++list.frames;
+  if (rx.status & kWmiRxStatusBad) {   // a frame whose check failed may carry any bytes at all: nothing of it is believed
+    ++list.badFrames;
+    return nullptr;
+  }
   ScanEntry found;
   bool isProbe = false;
   if (!wmiParseBeacon(found, rx.frame, rx.bytes, isProbe)) {
@@ -486,7 +500,7 @@ inline ScanEntry *scanAdd(ScanList &list, const WmiMgmtRx &rx)
   // the header's channel is a channel number, not a frequency, so the two are never mixed).
   found.freq = rx.freq;
   if (!found.channel && rx.channel && rx.channel <= 233) found.channel = uint8_t(rx.channel);
-  found.rssi = rx.rssi;
+  found.rssi = rx.signalDbm;
   if (isProbe) ++list.probes;
   else ++list.beacons;
   for (uint32_t i = 0; i < list.count; ++i) {

@@ -136,7 +136,7 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-qmitimeout=MS` | 10000 | the deadline of each level 5 step (the service's own request timeout) |
 | `piano-wifi-iova=1` | 0 | give the endpoint's stream 0x1401 a translating context bank whose 32-bit window (`0x20000000` + the window's size, 2 MiB blocks) maps the DMA window, and hand the chip those addresses instead of physical ones. The only way to give this chip a 32-bit address, which its own driver uses for the data path's rings (§10.11); the page table is a buffer of its own, outside the window the chip can reach |
 | `piano-wifi-mode=1` | 0 | level 5 also sends the firmware's options (logging), the host's copy-engine configuration and the mode — the three messages that start the radio and open level 6. By default level 5 stops at the ready indication |
-| `piano-wifi-shadow=1` | 0 | put the shadow register list in that configuration (40 addresses computed from the chip's register map for the rings level 8's data path will create; level 6 writes the real registers through the window instead, §10.17) |
+| `piano-wifi-shadow=1` | 0 | put the shadow register list in that configuration (40 addresses computed from the chip's register map for the rings level 8's data path will create; level 6 writes the real registers through the window instead, §10.18, and §10.19 is what to try if that turns out to be the wrong path) |
 | `piano-wifi-smmu=N` | 1 | 0: the SMMU is left alone (level 4 then needs stream 0x1401 to bypass already); 1: the endpoint's stream 0x1401 through a bypass context bank; 2: also the root port's 0x1400 |
 | `piano-wifi-spmi=1` | 0 | add the eight supplies' PMIC regulators and the BT_EN / sleep clock pins over the SPMI observer (the only stores: the observer's read commands) |
 | `piano-wifi-hwcg=1` | 0 | count a hardware-gated branch that reads CLK_OFF while voted and under HW_CTL as running for the read gates |
@@ -498,7 +498,7 @@ PianoWifi: level 6: the firmware is ready: status 0x0, NN peer(s), 0 extra addre
 PianoWifi: level 6: the scan: 22 channel(s) asked for, started 1, N scan event(s), M channel visit(s), completed
 PianoWifi: level 6: network 0: ssid "..." bssid xx:xx:xx:**:**:** channel 6 (2437 MHz) signal -NN dBm, N beacon(s) 0 probe(s)
    (one line per network, at most 32; the identifier is printed, the address masked unless piano-wifi-bssid=1)
-PianoWifi: level 6: N commands, M events, K management frames, 0 unexpected messages, 0 credit waits; the copy engine: N out (B bytes), M in (B bytes), N completions, 0 refused claims, 0 dropped
+PianoWifi: level 6: N commands, M events (2 extended capability), K management frames (0 refused by the firmware's own checks, 0 unreadable), 0 unexpected messages, 0 messages dropped, 0 credit waits; the copy engine: N out (B bytes), M in (B bytes), N completions, 0 refused claims, 0 dropped
 PianoWifi: level 6: the scan is done after NNNN ms (step 611: done)
 PianoWifi: level 6: the teardown: the scan ended by itself, the virtual device deleted, the rings disabled
 PianoWifi: level 6: 24 writes (6 kinds, 0 refused accesses in all); repeated: ...
@@ -510,7 +510,7 @@ PianoWifiEthernet: en1 published (built in, link down: the station of levels 7 a
 **What the first level 6 boot must show before level 7 is designed against it**: the transport's ready with a credit count and a
 credit size that are not zero (without them nothing can be sent, and the level stops at step 601); `our endpoint 2 (pipes 3 out,
 2 in)`, which is the proof that the service tables level 5 sent are the ones the firmware uses; `0 memory request(s)` in the
-capability line (a firmware that does ask for memory ends the level: §10.15); the firmware's ready event; `started 1` with the
+capability line (a firmware that does ask for memory ends the level: §10.16); the firmware's ready event; `started 1` with the
 scan's events; **at least one network** in the scan lines (the owner knows which ones should be there, which is the real
 measurement of this level); `0 unexpected messages`, `0 dropped` and `0 refused claims`; the teardown line; and `en1` in
 `ifconfig` with `status: inactive`, which `tooling/native/piano-wifi status` prints as well.
@@ -522,16 +522,18 @@ addresses, `piano-wifi status` what the ladder reached and whether `en1` is ther
 Failure meanings: `the DMA window has no room for the copy engine's rings and buffers` — `piano-wifi-dma` is too small (the
 default at this level is level 5's 64 MiB, of which level 6 needs about 200 KiB). `a step timed out` at 601 — the firmware never
 sent the transport's ready: the rings are not where the chip reads them (the pointer words and the register writes are in the
-line above), or its radio was not started (`piano-wifi-mode=0`). At 602 with `the firmware refused the service` — the message
+line above), its radio was not started (`piano-wifi-mode=0`), or the pointer writes have to go through the shadow registers
+after all (§10.19). At 602 with `the firmware refused the service` — the message
 interface is not service `0x100` on this build. At 604 — the host's set-up complete was not accepted, or the service-ready event
 does not parse (`a message did not parse`). At 606 — the initialisation was refused: the resource configuration is the suspect,
 and its 72 words are in `WifiHw.h` with the values of this chip's own entry. `the firmware asked for memory this level does not
-hand out` at 604 — the firmware wants host memory chunks in the initialisation, which this level does not answer (§10.15). At
+hand out` at 604 — the firmware wants host memory chunks in the initialisation, which this level does not answer (§10.16). At
 609 with `the scan did not run` — the firmware reported a start failure, and the reason is in the scan line. A scan that starts
 and then stops answering is **not** a failure: what it found stands, the teardown runs, and the line says "after this driver
 stopped waiting for it". `the copy engine refused the message` — a source ring was full with no completion coming back, which
-means the chip is not reading the ring (compare the counters). `a message whose header does not fit its buffer` — the transport's
-header does not match what the copy engine delivered, which would mean the status entry's length and the message disagree.
+means the chip is not reading the ring (compare the counters). A message the transport cannot read is **not** a failure: it is dropped and
+counted in the level's line (`N messages dropped`), as this firmware's own host does, and the step's deadline is what decides
+if they are all there is.
 
 ### 8.7 After any failure
 
@@ -649,23 +651,34 @@ network (§5.2 C).
    leaves the rings alone and only the pins are taken down. Stopping it takes longer than the one second a synchronous power
    answer may take, so `setPowerState` answers with a four-second deadline and acknowledges when it is done, on a thread of its
    own (`docs/power.md` §4). (needs-boot: boot 10 of §8.8)
-15. **The firmware's memory requests at level 6.** Its service-ready event may ask the host for memory chunks, which the
+15. **Two words of the resource configuration are left zero on purpose.** The peer-metadata version (bits 5:4 of the second
+   flag word) and the "extended regulatory event" bit (bit 4 of the host service flags) are what this chip's own host sets from
+   its service bitmap. Level 6 reads no service bits and sets neither: the first decides how a peer identifier is packed in the
+   data path's descriptors (level 8), and the second only chooses which of two regulatory events the firmware sends (level 7
+   reads either). Both must be set from the bitmap before the data path is built.
+16. **The firmware's memory requests at level 6.** Its service-ready event may ask the host for memory chunks, which the
    initialisation command would have to carry. This chip's own driver never allocates any (its count is always zero, which is
    why the array this driver sends is empty), so a firmware build that does ask ends level 6 at step 604 with "the firmware
    asked for memory this level does not hand out" rather than sending it an address it never planned for. If a boot shows a
    non-zero count, the regions go in the window the way level 5's do, and the command's array grows by one structure each.
    (needs-boot)
-16. **The regulatory domain and the channel list.** Level 6 sends the channel list inside the scan request and never sends
+17. **The regulatory domain and the channel list.** Level 6 sends the channel list inside the scan request and never sends
    `WMI_SCAN_CHAN_LIST`, which is what a driver normally does after the firmware's regulatory event. The firmware is free to
    skip a channel its domain does not allow, so a passive scan may come back with the 2.4 GHz band only (boot 8 of §8.8 is
    exactly that measurement). Level 7 reads the regulatory event and sends the channel list before it starts anything.
-17. **The chip's registers through one window.** The copy engine's rings live above BAR0's direct range, so every pointer write
+18. **The chip's registers through one window.** The copy engine's rings live above BAR0's direct range, so every pointer write
    goes through the window register at BAR0 + `0x3278`: two accesses, which are only safe because this driver has exactly one
    thread and no interrupt. The shadow registers of §12 would make each pointer write a single access to a BAR0 offset, and
    `piano-wifi-shadow=1` already sends the list — but the list it sends describes the rings of level 8's data path, not level
    6's four pipes, so level 6 writes the real registers. A level that adds the data path should send a list that matches what it
    actually creates and then use the shadows.
-18. **No data path at level 6, and the firmware knows it.** The firmware's initialisation tells it how many peers and traffic
+19. **The shadow registers are the fallback for step 601.** This chip's own driver, when the firmware has been given the
+   shadow list, writes a ring's pointer to BAR0 + `0x8fc` + 4·index instead of the ring's own register — including for the copy
+   engine's rings. Level 6 writes the real registers through the window instead (§10.18), which is the documented path for
+   every other register of this chip. If the first boot's step 601 times out with the ring lines looking right, the next thing
+   to try is a shadow list that describes **level 6's** four pipes (level 5's `piano-wifi-shadow` list describes level 8's data
+   path, not these rings) and pointer writes through it. (needs-boot)
+20. **No data path at level 6, and the firmware knows it.** The firmware's initialisation tells it how many peers and traffic
    identifiers the host has room for, but no receive ring of the data path exists: a frame that is not a management frame has
    nowhere to go. The scan needs none (its results are management frames on the message interface), and nothing was observed to
    stall at the host test's level — but on hardware the firmware may log about the missing data interface (HTT), and a level 6
@@ -730,7 +743,7 @@ firmware's own copies both ways (16 KiB), 7 host to host, 8 the data accelerator
 0 and 2, the firmware's four traffic classes and its control service to pipes 3 and 2, and the host's data service to pipes 4
 and 1. The shadow registers are 40 words from BAR0 + `0x8fc`, each standing for one ring's head pointer (a destination ring's tail
 pointer is its head pointer's offset plus four); the list is built from the register map of the rings level 8's data path will
-create, which is why `piano-wifi-shadow` is off by default and why level 6 writes the real registers through the window (§10.17).
+create, which is why `piano-wifi-shadow` is off by default and why level 6 writes the real registers through the window (§10.18).
 
 ## 13. Level 6 as built, and what levels 7 and 8 need
 
@@ -747,15 +760,18 @@ model of the copy engine's registers and a firmware that speaks both protocols):
    **destination-status ring** (the chip writes one descriptor per buffer it filled, with the length). Both pointers of every
    ring count 32-bit words. The host's pointer lives in the chip's register space (the units at `0x01b80000` and up, through
    BAR0's window register); the chip's lives in the window, in a block of its own, at an address the host programs into the
-   ring — so a poll reads host memory and never a register. No MSI, no interrupt threshold: one thread polls (§10.17).
+   ring — so a poll reads host memory and never a register. No MSI, no interrupt threshold: one thread polls (§10.18).
 2. **The host transport.** The firmware speaks first: a "ready" message on endpoint 0 with its credit count and credit size.
    Then one service is connected — the firmware's message interface, `0x0100` — and its answer gives the endpoint number and the
    largest message it takes; the pipes are **not** negotiated, they are the service table level 5 already sent. Then "set-up
-   complete". Every message after that carries the 8-byte header of section 14, and every message on that endpoint costs
+   complete". The firmware has nine endpoints and may name any of them, the last included. Every message after that carries
+   the 8-byte header of section 14, and every message on that endpoint costs
    credits, which the firmware gives back in the trailer of what it sends (a credit wait is not a failure; the step's deadline
    decides).
 3. **The firmware's message interface.** Its service-ready event says how many radio chains and scan channels it has and how
-   much host memory it wants (none on this chip: §10.15). The host answers with the initialisation command: the 72-word resource
+   much host memory it wants (none on this chip: §10.16), and one or two **extended** capability events follow it — which its
+   own host waits for before it says anything, and so does this driver (half a second at most, or less when the second of them
+   arrives). The host then answers with the initialisation command: the 72-word resource
    configuration of this chip's own entry (four virtual devices, sixteen peers, thirty-two traffic identifiers, native-Wi-Fi
    decapsulation, the two flag words its own host always sends) and an empty memory-chunk array. The firmware then sends its
    ready event, with its own MAC address and its status.
@@ -764,15 +780,16 @@ model of the copy engine's registers and a firmware that speaks both protocols):
 5. **A passive scan.** The channel list of `WifiHw.h` (the 2.4 GHz band's 13 channels and the 5 GHz band's 9 non-radar ones;
    `piano-wifi-band=0` leaves the upper band out), the dwell times its own host uses, and the passive flag. The firmware answers
    with a "started" event, then one management-frame event per beacon or probe answer — each with the frame, its channel and its
-   signal strength — and finally "completed". The frames are parsed where a frame from the air must be: the third address is the
-   network's, element 0 its name and element 3 its channel, and an element that runs past the frame ends the walk. The list
-   keeps at most 32 networks, merges repeats (the strongest signal wins) and counts what it dropped.
+   signal strength — and finally "completed". A frame whose own checks failed (the status word's check, decryption or key bits)
+   is thrown away whole: a network's address must never come from one. The rest are parsed where a frame from the air must be:
+   the third address is the network's, element 0 its name and element 3 its channel, and an element that runs past the frame
+   ends the walk. The list keeps at most 32 networks, merges repeats (the strongest signal wins) and counts what it dropped.
 6. **The teardown.** The scan stopped if it still runs, the virtual device deleted, the chip's completions waited for, and only
    then the rings disabled — in that order (§8.7).
 7. **What level 6 does not do.** No association, no keys, no data path: those are levels 7 and 8.
 
 **Level 7 (association), what it needs**: the firmware's regulatory event read and the channel list sent
-(`WMI_SCAN_CHAN_LIST`, §10.16); the virtual device started on the owner's channel; a peer created for the access point; the
+(`WMI_SCAN_CHAN_LIST`, §10.17); the virtual device started on the owner's channel; a peer created for the access point; the
 four-way handshake run by a **user-space supplicant** over a control endpoint, with the keys installed by
 `WMI_VDEV_INSTALL_KEY`; and the management frames the handshake needs sent through `WMI_MGMT_TX`. **Level 8 (traffic)**: the
 data path's rings (the transmit-command, reorder and buffer-manager units whose head pointers §12's shadow list already names),
@@ -847,8 +864,8 @@ and an array of structures with no headers of their own is tag `0x13`.
 | 605 | the host's initialisation | `0x00001` (command) | `0x04a` + `0x04b` + `0x12` | the fixed structure (7 words: six of interface version, then the number of memory chunks = 0), then the **resource configuration** (tag `0x04b`, 72 words: 4 virtual devices, 16 peers, 3 offload peers and reorder buffers, 2 peer keys, 32 traffic identifiers, an address-table skid limit of 16, the chain masks, four receive timeouts (100, 100, 100, 40), native-Wi-Fi decapsulation, 4 pending scans, 3 beacon-miss and roam devices, 8 roam profiles, a 1024-entry debug log, 2 group-key devices, 0x400 message descriptors, 10 fragment entries, 1 direct-link device with 8 table entries, 2 beacon-offload devices, 0x20 multicast filters, 0x16 wake filters, the two flag words `0x40020` and `0x40200`, "use a radio identifier" and peer-map version 1), then an empty array of memory chunks |
 | 606 | ready | `0x00002` (event) | `0x023` | 15 words: six of interface version, **the chip's own MAC address** (words 6-7), the status (8), the traffic-class tables (9), extra addresses (10), peers (11, 12), the address-table index (13) and a log checksum (14) |
 | 607 | a virtual device | `0x05001` (command) | `0x056` + `0x12` | 11 words: the identifier (0), the type (1) = 2 a station, the subtype (2) = 0, the MAC address (3-4), how many stream entries follow (5) = 2, the radio (6) = 0, two words of multiple-network flags, and a statistics identifier marked invalid (9, 10). Then an array of two stream entries, each 4 words with its own header (tag `0x19b`): the band (0 is 2.4 GHz, 1 is 5 GHz), the transmit streams, the receive streams |
-| 608 | a scan | `0x03001` (command) | `0x04d` + `0x10` + `0x13` + `0x13` + `0x11` | 39 words: the scan identifier (0) = `0xa000`, the requestor (1) = 1, the virtual device (2), the priority (3), which events to send (4), the active and passive dwell times (5, 6) = 50 and 150 ms, the rest times (7, 8) = 50 and 500 ms, the largest scan time (12) = 20 s, the probe delay (13) = 5 ms, **the flags (14)**: bit 0 passive, bit 4 "report each channel"; how many channels (16), addresses (17) = 1 and names (18) = 0; then the channel list as words, an empty array of names, one address entry (the broadcast one, as this firmware's own host always sends), and an empty array of elements to add to a probe |
+| 608 | a scan | `0x03001` (command) | `0x04d` + `0x10` + `0x13` + `0x13` + `0x11` | 39 words: the scan identifier (0) = `0xa000`, the requestor (1) = 1, the virtual device (2), the priority (3), which events to send (4), the active and passive dwell times (5, 6) = 50 and 150 ms, the rest times (7, 8) = 50 and 500 ms, the largest scan time (12) = 20 s, the probe delay (13) = 5 ms, **the flags (14)**: bit 0 passive, bit 4 "report each channel"; how many channels (16), addresses (17) = 1 and names (18) = 0; the priority (3) = 0 and the per-band dwell times (35, 36, 37) = 0, 70 and 70 ms, which are the bytes this firmware's own host puts there; then the channel list as words, an empty array of names, one address entry (the broadcast one, as its host always sends), and an empty array of elements to add to a probe |
 | 609 | a scan event | `0x03001` (event) | `0x024` | 7 words: the event type (bit 0 started, 1 completed, 2 on its own channel, 3 on a foreign channel, 4 dequeued, 6 start failed), the reason (0 completed, 1 cancelled, 2 preempted, 3 timed out, 4 an internal failure), the channel, the requestor, the scan identifier and the virtual device |
-| 609 | a management frame | `0x07001` (event) | `0x02c` + `0x11` | 17 words: the channel (0), the signal-to-noise ratio (1), the rate (2), the radio mode (3), **the frame's length (4)**, the status (5), four per-chain strengths (6-9), the flags (10), **the signal strength in dBm (11, signed)**, a timestamp delta and two timestamp words (12-14), the radio (15) and **the frequency (16)**. Then the frame itself as bytes: a beacon (subtype `0x80`) or a probe answer (`0x50`), whose third address is the network's and whose body is a timestamp, a beacon interval, a capability word and then the elements |
-| 610 | stop the scan | `0x03002` (command) | `0x04e` | 5 words: the requestor, the scan identifier, the kind (0 = this scan only), the virtual device, the radio |
+| 609 | a management frame | `0x07001` (event) | `0x02c` + `0x11` | 17 words: the channel (0, a channel number), **the signal-to-noise ratio (1)** — the strength a list shows is it plus the noise floor of -95 dBm, as this firmware's own host works it out — the rate (2), the radio mode (3), **the frame's length (4)**, **the status (5)**: a frame with the check, decryption or key bits set (`0x01`, `0x08`, `0x20`) is thrown away whole, four per-chain strengths (6-9), the flags (10), a strength word of its own (11, signed, logged but not used), a timestamp delta and two timestamp words (12-14), the radio (15) and **the frequency (16)**. Then the frame itself as bytes: a beacon (subtype `0x80`) or a probe answer (`0x50`), whose third address is the network's and whose body is a timestamp, a beacon interval, a capability word and then the elements |
+| 610 | stop the scan | `0x03002` (command) | `0x04e` | 5 words: the requestor (0), the scan identifier, the kind (0 = this scan only), the virtual device (0) and the radio — the firmware matches the scan by its identifier and the kind, and zero is what its own host sends in the other two |
 | 610 | delete the device | `0x05002` (command) | `0x057` | one word: the identifier |

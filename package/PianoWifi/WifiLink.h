@@ -8,7 +8,8 @@
 //   601 the transport's ready       <- the firmware speaks first: its credits and its credit size
 //   602 the message interface       -> connect that service, and take the endpoint its answer gives
 //   603 set-up complete             -> the handshake's last control message
-//   604 the chip's capability       <- the service-ready event: radio chains, bands, how much memory it wants (none here)
+//   604 the chip's capability       <- the service-ready event (radio chains, bands, how much memory it wants: none here) and
+//                                      the one or two extended ones behind it, which this firmware's own host waits for too
 //   605 the host's initialisation   -> the resource configuration
 //   606 the firmware is ready       <- the ready event, with the chip's own MAC address
 //   607 a station virtual device    -> created, never started (a scan needs no started device on this chip)
@@ -88,6 +89,7 @@ struct LinkOptions {
   bool with5GHz = true;
   bool passive = true;
   uint32_t settleMs = 100;        // between the virtual device and the scan, as this firmware's own host leaves it
+  uint32_t extWaitMs = 500;       // after the chip's capability, for the extended ones that follow it (step 604)
 };
 
 struct Link {
@@ -102,17 +104,30 @@ struct Link {
   int step = kLinkIdle, error = kLinkErrNone, failedStep = 0;
   int endpoint = -1;                               // the endpoint the firmware's message interface got
   uint32_t pending = kLinkSendNothing;
-  uint64_t deadline = 0, settle = 0, began = 0;
+  uint64_t deadline = 0, settle = 0, extSettle = 0, began = 0;
+  bool ext2Seen = false;          // the second extended capability event: the last the firmware sends before it waits
   bool scanStarted = false, scanCompleted = false, scanTimedOut = false, stopped = false, deleted = false;
   uint32_t scanReason = 0, scanChannels = 0, scanEventsSeen = 0;
   // counters for the log
-  uint32_t commands = 0, events = 0, unexpected = 0, mgmtFrames = 0, controlMessages = 0, creditWaits = 0;
+  uint32_t commands = 0, events = 0, unexpected = 0, mgmtFrames = 0, controlMessages = 0, creditWaits = 0,
+           badMessages = 0, extEvents = 0;
   uint32_t lastEvent = 0;
   void (*note)(void *ctx, int step, const char *what) = nullptr;
   void *noteCtx = nullptr;
 };
 
 namespace linkdetail {
+
+// The chain mask the resource configuration and a virtual device take, out of the chain count the firmware reported: a count
+// that is not between one and eight is not believed (it would shift a word off its end), and the chip's two chains are what
+// the mask falls back to.
+inline uint32_t chainMaskOf(uint32_t chains)
+{
+  if (!chains || chains > 8) return 0x3u;
+  return (1u << chains) - 1u;
+}
+
+inline uint32_t chainCountOf(uint32_t chains) { return (!chains || chains > 8) ? 2u : chains; }
 
 inline int fail(Link &link, int error)
 {
@@ -173,7 +188,9 @@ inline int send(Link &link, uint8_t endpoint, Build build)
   }
   const uint32_t total = htcPrepare(link.htc, endpoint, va, payload);
   const int pipe = ceIndexOf(link.htc.ep[endpoint].ulPipe);
-  if (pipe < 0 || !ceSend(*link.ce, link.io, unsigned(pipe), unsigned(buffer), total, 0)) {
+  // The descriptor's own identifier is the endpoint, which is what the firmware's host puts there and what comes back in the
+  // completion's status entry.
+  if (pipe < 0 || !ceSend(*link.ce, link.io, unsigned(pipe), unsigned(buffer), total, endpoint)) {
     ceRelease(*link.ce, uint32_t(buffer));
     return fail(link, kLinkErrSend), -1;
   }
@@ -201,7 +218,7 @@ inline bool sendPending(Link &link, uint64_t nowMs)
     if (rc == 1) enter(link, kLinkCapability, nowMs);
     break;
   case kLinkSendInit: {
-    const uint32_t chains = link.caps.rfChains ? (1u << link.caps.rfChains) - 1u : 3u;
+    const uint32_t chains = chainMaskOf(link.caps.rfChains);
     rc = send(link, uint8_t(link.endpoint), [&](uint8_t *at, uint32_t capacity) {
       WmiWriter w;
       return wmiBuildInit(w, at, capacity, chains);
@@ -210,7 +227,7 @@ inline bool sendPending(Link &link, uint64_t nowMs)
     break;
   }
   case kLinkSendVdev: {
-    const uint32_t chains = link.caps.rfChains ? link.caps.rfChains : 1u;
+    const uint32_t chains = chainCountOf(link.caps.rfChains);
     const uint8_t *mac = link.ready.mac;
     rc = send(link, uint8_t(link.endpoint), [&](uint8_t *at, uint32_t capacity) {
       WmiWriter w;
@@ -317,8 +334,9 @@ inline void onEvent(Link &link, const uint8_t *message, uint32_t length, uint64_
       fail(link, kLinkErrMemory);
       return;
     }
-    enter(link, kLinkInit, nowMs);
-    link.pending = kLinkSendInit;
+    // The firmware sends one or two extended capability events after this one, and its own host sends the initialisation only
+    // once they are in. The step stands until the second of them arrives or the short wait of the options runs out.
+    link.extSettle = nowMs + link.options.extWaitMs;
     return;
   case kWmiEvtReady:
     if (link.step != kLinkReadyWait) {
@@ -371,9 +389,12 @@ inline void onEvent(Link &link, const uint8_t *message, uint32_t length, uint64_
     (void)scanAdd(link.scan, rx);
     return;
   }
-  case kWmiEvtServiceAvailable:
   case kWmiEvtServiceReadyExt:
   case kWmiEvtServiceReadyExt2:
+    ++link.extEvents;
+    if (id == uint32_t(kWmiEvtServiceReadyExt2)) link.ext2Seen = true;
+    return;
+  case kWmiEvtServiceAvailable:
   case kWmiEvtRegChanListCc:
   case kWmiEvtRegChanListCcExt:
   case kWmiEvtChanInfo:
@@ -431,7 +452,9 @@ inline void linkReceive(Link &link, const uint8_t *data, uint32_t length, uint64
     onEvent(link, rx.payload, rx.length, nowMs);
     return;
   case kHtcBad:
-    fail(link, kLinkErrMessage);
+    // A message the transport cannot read is dropped and counted, never acted on and never fatal: this firmware's own host
+    // does the same, and a link that only ever sends rubbish runs into the step's deadline anyway.
+    ++link.badMessages;
     return;
   default:
     return;
@@ -452,6 +475,15 @@ inline int linkRun(Link &link, uint64_t nowMs)
   if (link.pending != kLinkSendNothing) {
     sendPending(link, nowMs);
     if (link.step == kLinkStopped) return link.step;
+  }
+  // The initialisation follows the chip's capability once its extended events are in (or the short wait is over).
+  if (link.step == kLinkCapability && link.caps.seen && link.pending == kLinkSendNothing && link.extSettle &&
+      (link.ext2Seen || nowMs >= link.extSettle)) {
+    link.extSettle = 0;
+    enter(link, kLinkInit, nowMs);
+    link.pending = kLinkSendInit;
+    sendPending(link, nowMs);
+    return link.step;
   }
   // The scan follows the virtual device once the settle time has passed.
   if (link.step == kLinkVdev && link.pending == kLinkSendNothing && link.settle && nowMs >= link.settle) {

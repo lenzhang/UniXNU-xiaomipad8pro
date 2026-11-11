@@ -186,7 +186,7 @@ struct Firmware {
   uint8_t connectStatus = 0;
   uint32_t memRequests = 0;
   bool answerScanStarted = true, answerScanCompleted = true, sendBeacons = true, badFrameLength = false,
-       shortBeacon = false, manyNetworks = false, wrongStepEvent = false;
+       shortBeacon = false, manyNetworks = false, wrongStepEvent = false, sendExtended = true, badStatus = false;
   uint32_t creditsGivenBack = 0;
 
   // A message to the host on pipe 2, with the transport's header and (for the message interface's endpoint) a credit report.
@@ -274,6 +274,13 @@ struct Firmware {
     put32(at + 4, 0x1);
     at += 4 + 16;
     event(kWmiEvtServiceReady, buffer, uint32_t(at - buffer));
+    if (!sendExtended) return;
+    // What the firmware really sends behind it, and what its own host waits for before the initialisation.
+    uint8_t ext[32] = {};
+    put32(ext, 16u | uint32_t(kWmiTagServiceReadyExtEvent) << kWmiTlvTagShift);
+    event(kWmiEvtServiceReadyExt, ext, 4 + 16);
+    put32(ext, 16u | uint32_t(kWmiTagServiceReadyExt2Event) << kWmiTlvTagShift);
+    event(kWmiEvtServiceReadyExt2, ext, 4 + 16);
   }
 
   void sendReadyEvent()
@@ -326,7 +333,9 @@ struct Firmware {
     const uint32_t words = 17;
     put32(buffer, (words * 4) | uint32_t(kWmiTagMgmtRxHeader) << kWmiTlvTagShift);
     put32(buffer + 4 + 4 * 0, channel);
+    put32(buffer + 4 + 4 * 1, uint32_t(rssi - kNoiseFloorDbm));   // the ratio the firmware reports, not the strength
     put32(buffer + 4 + 4 * 4, badFrameLength ? uint32_t(frame.size() + 64) : uint32_t(frame.size()));
+    put32(buffer + 4 + 4 * 5, badStatus ? uint32_t(kWmiRxStatusErrCrc) : 0u);
     put32(buffer + 4 + 4 * 11, uint32_t(rssi));
     put32(buffer + 4 + 4 * 16, freq);
     uint32_t length = 4 + words * 4;
@@ -413,6 +422,9 @@ struct Firmware {
       CHECK(wmiGet(cmd, 2) == 0);
       CHECK(wmiGet(cmd, 5) == kWmiScanDwellActiveMs && wmiGet(cmd, 6) == kWmiScanDwellPassiveMs);
       CHECK(wmiGet(cmd, 12) == kWmiScanMaxTimeMs);
+      CHECK(wmiGet(cmd, 3) == kWmiScanPriorityZero);
+      CHECK(wmiGet(cmd, 35) == kWmiScanDwellActive2GhzMs && wmiGet(cmd, 36) == kWmiScanDwell6GhzMs);
+      CHECK(wmiGet(cmd, 37) == kWmiScanDwell6GhzMs);
       scanFlags = wmiGet(cmd, 14);
       scanChannels = wmiGet(cmd, 16);
       scanBssids = wmiGet(cmd, 17);
@@ -433,6 +445,7 @@ struct Firmware {
       const uint8_t *cmd = wmiFind(tlvs, left, kWmiTagStopScanCmd, &size);
       CHECK(cmd && size == 5 * 4);
       if (cmd) CHECK(wmiGet(cmd, 1) == kWmiScanId && wmiGet(cmd, 2) == kWmiStopScanOne);
+      if (cmd) CHECK(wmiGet(cmd, 0) == 0 && wmiGet(cmd, 3) == 0 && wmiGet(cmd, 4) == kWmiPdevIdSoc);
       sendScanEvent(kWmiScanEvCompleted, kWmiScanReasonCancelled, 0);
       return;
     }
@@ -787,6 +800,39 @@ static void testFaults()
     CHECK(h.run() == kLinkDone);
     CHECK(h.link.unexpected == 1);
   }
+  {   // a firmware that sends no extended capability event: the initialisation goes out when the short wait is over
+    Host h;
+    CHECK(h.start());
+    h.firmware.sendExtended = false;
+    LinkOptions options;
+    options.extWaitMs = 40;
+    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run() == kLinkDone);
+    CHECK(h.link.extEvents == 0 && h.firmware.initSeen && h.link.error == kLinkErrNone);
+  }
+  {   // frames the firmware's own checks failed on: counted, and no network of theirs is believed
+    Host h;
+    CHECK(h.start());
+    h.firmware.badStatus = true;
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run() == kLinkDone);
+    CHECK(h.link.scan.count == 0 && h.link.scan.badFrames == 4 && h.link.scan.ignored == 0);
+  }
+  {   // a message the transport cannot read is dropped and counted, and the ladder goes on
+    Host h;
+    CHECK(h.start());
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    for (unsigned i = 0; i < 400 && h.link.step != kLinkScanning; ++i) h.turn();
+    std::vector<uint8_t> rubbish(kHtcHeaderBytes + 4, 0);
+    put32(rubbish.data(), 2u | 4096u << kHtcHdrLengthShift);   // a header that does not fit its buffer
+    h.device.toHost.push_back({2, rubbish});
+    h.turn();
+    CHECK(h.link.badMessages == 1 && h.link.error == kLinkErrNone);
+    CHECK(h.run() == kLinkDone);   // and the ladder finishes all the same
+  }
   {   // the owner gives up in the middle: the scan is stopped, the device deleted, the rings disabled
     Host h;
     CHECK(h.start());
@@ -890,9 +936,9 @@ static void testCodec()
   WmiWriter w;
   wmiBegin(w, buffer, sizeof buffer, kWmiCmdStartScan);
   CHECK((get32(buffer) & kWmiCmdIdMask) == uint32_t(kWmiCmdStartScan));
-  uint8_t *one = wmiTlv(w, kWmiTagChannel, 6);     // a value that is not a whole number of words is padded
-  CHECK(one && (w.length % 4) == 0);
-  CHECK((get32(one - 4) & kWmiTlvLenMask) == 6);
+  uint8_t *one = wmiTlv(w, kWmiTagChannel, 6);     // a value that is not a whole number of words is padded, and the
+  CHECK(one && (w.length % 4) == 0);                // header carries the padded length, so a walk by it lands on the next
+  CHECK((get32(one - 4) & kWmiTlvLenMask) == 8);
   CHECK((get32(one - 4) >> kWmiTlvTagShift) == uint32_t(kWmiTagChannel));
   uint8_t *two = wmiStruct(w, kWmiTagStopScanCmd, 3);
   CHECK(two && (get32(two - 4) & kWmiTlvLenMask) == 12);
@@ -904,7 +950,7 @@ static void testCodec()
   const uint8_t *at = buffer + kWmiCmdHeaderBytes;
   uint32_t left = length - kWmiCmdHeaderBytes;
   WmiTlvRef tlv;
-  CHECK(wmiNext(at, left, tlv) && tlv.tag == uint32_t(kWmiTagChannel) && tlv.length == 6);
+  CHECK(wmiNext(at, left, tlv) && tlv.tag == uint32_t(kWmiTagChannel) && tlv.length == 8);
   CHECK(wmiNext(at, left, tlv) && tlv.tag == uint32_t(kWmiTagStopScanCmd) && tlv.length == 12);
   CHECK(!wmiNext(at, left, tlv));
   uint32_t size = 0;
@@ -958,13 +1004,14 @@ static void testCodec()
   put32(event, (12u * 4) | uint32_t(kWmiTagMgmtRxHeader) << kWmiTlvTagShift);
   put32(event + 4 + 4 * 0, 36);                        // the channel, as a channel number
   put32(event + 4 + 4 * 4, uint32_t(sizeof frame));
+  put32(event + 4 + 4 * 1, uint32_t(-61 - kNoiseFloorDbm));   // the ratio: the strength is it plus the noise floor
   put32(event + 4 + 4 * 11, uint32_t(int32_t(-61)));
   uint32_t cursor = 4 + 12 * 4;
   put32(event + cursor, uint32_t(sizeof frame) | uint32_t(kWmiTagArrayByte) << kWmiTlvTagShift);
   std::memcpy(event + cursor + 4, frame, sizeof frame);
   cursor += 4 + ((uint32_t(sizeof frame) + 3u) & ~3u);
   CHECK(wmiParseMgmtRx(mgmt, event, cursor));
-  CHECK(mgmt.freq == 0 && mgmt.channel == 36 && mgmt.rssi == -61);
+  CHECK(mgmt.freq == 0 && mgmt.channel == 36 && mgmt.rssi == -61 && mgmt.signalDbm == -61);
   ScanList list;
   const ScanEntry *entry = scanAdd(list, mgmt);
   CHECK(entry && list.count == 1);

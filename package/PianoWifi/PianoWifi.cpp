@@ -1577,10 +1577,12 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
        gLink.scanCompleted ? wmiScanReasonName(gLink.scanReason) : "it did not report an end",
        gLink.scanTimedOut ? " (after this driver stopped waiting for it)" : "");
   publishScan(owner, gLink.scan, gArgs.bssid != 0);
-  note("level 6: %u commands, %u events, %u management frames, %u unexpected messages, %u credit waits; the copy engine: "
-       "%u out (%u bytes), %u in (%u bytes), %u completions, %u refused claims, %u dropped",
-       gLink.commands, gLink.events, gLink.mgmtFrames, gLink.unexpected, gLink.creditWaits, gCe.sent, gCe.bytesOut,
-       gCe.received, gCe.bytesIn, gCe.completions, gCe.refused, gCe.dropped);
+  note("level 6: %u commands, %u events (%u extended capability), %u management frames (%u refused by the firmware's own "
+       "checks, %u unreadable), %u unexpected messages, %u messages dropped, %u credit waits; the copy engine: %u out "
+       "(%u bytes), %u in (%u bytes), %u completions, %u refused claims, %u dropped",
+       gLink.commands, gLink.events, gLink.extEvents, gLink.mgmtFrames, gLink.scan.badFrames, gLink.scan.ignored,
+       gLink.unexpected, gLink.badMessages, gLink.creditWaits, gCe.sent, gCe.bytesOut, gCe.received, gCe.bytesIn,
+       gCe.completions, gCe.refused, gCe.dropped);
   const bool done = gLink.step == kLinkDone;
   note("level 6: %s after %llu ms (step %d: %s%s%s)", done ? "the scan is done" : "stopped",
        (unsigned long long)(nowMs() - started), done ? gLink.step : gLink.failedStep,

@@ -86,7 +86,16 @@ inline uint32_t get32(const uint8_t *at)
   for (unsigned i = 0; i < 4; ++i) v |= uint32_t(at[i]) << (8 * i);
   return v;
 }
-inline uint32_t load(const volatile uint32_t *at) { return at ? *at : 0; }
+// The chip's own pointer, and then the descriptors it points past: the two loads must not be reordered, or a descriptor could
+// be read before the write that filled it (this firmware's own host puts a read barrier in exactly this place). An acquire
+// fence is a `dmb ishld` on this processor and costs nothing on the host the tests run on.
+inline uint32_t load(const volatile uint32_t *at)
+{
+  if (!at) return 0;
+  const uint32_t value = *at;
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  return value;
+}
 
 inline void chipWrite(Ce &ce, const ChipIo &io, uint32_t address, uint32_t value)
 {
@@ -99,9 +108,10 @@ inline bool planRing(CeRing &r, Arena &arena, uint32_t entries, uint32_t words, 
                      uint8_t *pointers, uint64_t pointersBus, uint32_t &pointerIndex)
 {
   const uint32_t bytes = entries * words * 4;
+  if (!entries || (entries & (entries - 1)) || entries * words > kCeRingSizeMaxWords) return false;
   uint64_t bus = 0;
   uint8_t *va = arenaAlloc(arena, bytes, &bus);
-  if (!va || !entries || (entries & (entries - 1))) return false;
+  if (!va) return false;
   r.va = va;
   r.bus = bus;
   r.entries = entries;
@@ -119,9 +129,14 @@ inline bool planRing(CeRing &r, Arena &arena, uint32_t entries, uint32_t words, 
 
 // The registers of one ring. A ring the host produces into (the source and the destination rings) tells the chip where to write
 // its tail pointer; a ring the chip produces into (the destination-status ring) tells it where to write its head pointer.
-inline void programRing(Ce &ce, const ChipIo &io, const CeRing &r, bool hostProduces)
+inline void programRing(Ce &ce, const ChipIo &io, CeRing &r, bool hostProduces)
 {
   const uint32_t sizeWords = r.entries * r.words;
+  // The host's two indexes and the word the chip writes its own pointer into all start at zero, so that a ring programmed
+  // again (after a teardown, say) cannot leave the two sides disagreeing about where they are.
+  r.ours = 0;
+  r.taken = 0;
+  if (r.theirs) *r.theirs = 0;
   chipWrite(ce, io, r.r0, uint32_t(r.bus & kRingAddrLowMask));
   chipWrite(ce, io, r.r0 + kRingBaseMsb,
             uint32_t((r.bus >> kRingAddrHiShift) & kRingBaseMsbAddrHi) | (sizeWords & kRingBaseMsbSizeMask) << kRingBaseMsbSizeShift);
@@ -315,10 +330,13 @@ inline unsigned cePoll(Ce &ce, const ChipIo &io, Deliver deliver)
   unsigned seen = 0;
   for (unsigned i = 0; i < kCeHostPipeCount; ++i) {
     CePipe &pipe = ce.pipes[i];
-    // the messages the chip has sent for us: the source ring's entries up to its own pointer are free again
+    // The messages the chip has sent for us: the source ring's entries up to its own pointer are free again — but never more
+    // of them than the host actually wrote, so that a pointer the chip has not moved (or has moved too far) cannot free a
+    // buffer that is still being filled.
     if (pipe.hasSrc) {
       const uint32_t theirs = slotOf(pipe.src, load(pipe.src.theirs));
-      while (pipe.src.taken != theirs) {
+      uint32_t inFlight = (pipe.src.ours + pipe.src.entries - pipe.src.taken) % pipe.src.entries;
+      while (pipe.src.taken != theirs && inFlight--) {
         const uint32_t buffer = pipe.txSlot[pipe.src.taken];
         pipe.src.taken = (pipe.src.taken + 1) % pipe.src.entries;
         if (buffer < kCeSendBuffers && ce.tx[buffer].busy) {
@@ -345,7 +363,9 @@ inline unsigned cePoll(Ce &ce, const ChipIo &io, Deliver deliver)
       const uint32_t slot = pipe.dst.taken;
       pipe.dst.taken = (pipe.dst.taken + 1) % pipe.dst.entries;
       const uint32_t buffer = pipe.slot[slot];
-      if (buffer >= pipe.rxCount || !pipe.rx[buffer].busy || length > pipe.rx[buffer].bytes) {
+      // A length of zero, or one larger than the buffer, is the chip or the status entry disagreeing with the host: the
+      // buffer is given back and nothing of it is delivered.
+      if (buffer >= pipe.rxCount || !pipe.rx[buffer].busy || !length || length > pipe.rx[buffer].bytes) {
         ++ce.dropped;
         if (buffer < pipe.rxCount) pipe.rx[buffer].busy = false;
         continue;
