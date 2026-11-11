@@ -33,6 +33,18 @@ extern "C" {
  * cover-docked position (SSC +x up) is the normal one. Inferred: Ubuntu never ran the four-edge test either (piano-sensors-axes). */
 #define PS_ACCEL_AXES "a+y+x+z"
 
+/* ---- the DSP-addressable arena (sensors.md section 5): physical, page aligned, below 4 GiB (the DSP's 32-bit addresses through a
+ * bypassed stream), in DRAM and outside every range known to be someone else's. XNU's own memory is above 4 GiB, so the owner
+ * names the range (piano-sensors-rpc-pa); this only refuses what is certainly wrong. ---- */
+typedef struct {
+    uint64_t base, bytes;
+    const char *owner;
+} PsRange;
+extern const PsRange ps_reserved[];
+extern const unsigned ps_reserved_count;
+/* 0 when [pa, pa + bytes) may be the arena; else -1 and *why. */
+int ps_arena_check(uint64_t pa, uint64_t bytes, const char **why);
+
 /* ---- ambient light -> backlight (the curve, smoothing and hysteresis; PianoBacklight adds the user's offset and its ramps) ---- */
 typedef struct {
     uint32_t lux, permille;              /* permille of PianoBacklight's percent scale */

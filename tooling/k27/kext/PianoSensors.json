@@ -1,0 +1,27 @@
+{
+  "name": "PianoSensors",
+  "bundle": "com.unixnu.driver.PianoSensors",
+  "version": "1.0.0",
+  "objects": "@OUT@/native-kexts/PianoSensors/objects.json",
+  "start": "_native_kext_start",
+  "stop": "_native_kext_stop",
+  "libraries": {
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.private": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0",
+    "com.unixnu.driver.NativeUfs": "1.0.0",
+    "com.unixnu.driver.PianoPower": "1.0.0"
+  },
+  "personalities": {
+    "PianoSensors": {
+      "CFBundleIdentifier": "com.unixnu.driver.PianoSensors",
+      "IOClass": "PianoSensors",
+      "IOProviderClass": "IOPlatformExpertDevice",
+      "IOProbeScore": 100,
+      "IOMatchCategory": "PianoSensors"
+    }
+  }
+}

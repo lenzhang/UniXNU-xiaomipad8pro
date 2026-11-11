@@ -3,6 +3,30 @@
 /* Piano's sensor policies: see SensorsPolicy.h. */
 #include "SensorsPolicy.h"
 
+/* Known owners of low DRAM (el1-hyp-notes.md §3, charging.md §2, the live DT). The VM regions' sizes are not all recorded: their
+ * whole span up to the splash is refused. */
+const PsRange ps_reserved[] = {
+    {0x80000000ull, 0x1200000ull, "gunyah-hyp"},
+    {0x9ed80000ull, 0x80000ull, "q6-adsp-dtb (the DSP's)"},
+    {0xa7100000ull, 0x300000ull, "the UEFI firmware volume"},
+    {0xb8200000ull, 0x5780000ull, "adspslpi (the DSP's image)"},
+    {0xf3800000ull, 0x9000000ull, "trust-ui-vm, oem-vm, pvmfw, vm-shared"},
+    {0xfc800000ull, 0x2b00000ull, "the splash framebuffer"},
+};
+const unsigned ps_reserved_count = sizeof ps_reserved / sizeof ps_reserved[0];
+
+int ps_arena_check(uint64_t pa, uint64_t bytes, const char **why)
+{
+    const char *reason = 0;
+    if (!bytes || (pa & 0xfff) || (bytes & 0xfff)) reason = "not whole 4 KiB pages";
+    else if (pa < 0x80000000ull) reason = "below DRAM";
+    else if (pa + bytes > 0x100000000ull || pa + bytes < pa) reason = "not below 4 GiB (the DSP takes 32-bit addresses)";
+    for (unsigned i = 0; !reason && i < ps_reserved_count; ++i)
+        if (pa < ps_reserved[i].base + ps_reserved[i].bytes && ps_reserved[i].base < pa + bytes) reason = ps_reserved[i].owner;
+    if (why) *why = reason;
+    return reason ? -1 : 0;
+}
+
 /* Battery first (the owner's priority, backlight.md): a dark room near the panel's floor, an office (300-500 lux) around 40 %, full
  * scale only in daylight. Owner-tunable later through PianoBacklight's offset (the brightness keys shift the curve). */
 const PsCurvePoint ps_als_curve[] = {

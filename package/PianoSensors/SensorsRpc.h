@@ -88,6 +88,9 @@ typedef struct {
     int (*pack_read)(void *context, uint64_t offset, void *to, uint32_t length);
     /* Memory for the pack's table, never freed. */
     void *(*alloc)(void *context, uint32_t bytes);
+    /* PianoSensors (UPSTREAM): asked once for each call of the DSP before it is served; 0 declines it, answered at once with
+     * SSR_EUNSUPPORTED and no out buffers (SensorsGuard.h: a call is never left unanswered). Null: every call is served. */
+    int (*admit)(void *context);
 } SsrOps;
 
 typedef struct {
@@ -113,7 +116,7 @@ typedef struct {
 
 typedef struct {
     int32_t stage, error;
-    uint32_t attaches, calls, opens, missing, reads, refused, unknown;
+    uint32_t attaches, calls, opens, missing, reads, refused, unknown, declined;   /* declined: PianoSensors' admit said no */
     uint64_t bytes;
     uint32_t heap_used;
     char note[80];                     /* the first path that was missing */

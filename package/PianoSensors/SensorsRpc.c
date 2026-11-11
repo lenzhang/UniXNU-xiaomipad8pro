@@ -858,6 +858,13 @@ static int serve_one(SsrCore *c)
             end(c);
         }
     }
+    if (c->ops->admit && !c->ops->admit(CTX)) {   /* PianoSensors: declined, but answered (UPSTREAM) */
+        c->status.declined++;
+        c->out_length = 0;
+        c->result = SSR_EUNSUPPORTED;
+        c->summary_due = 1;
+        return 1;
+    }
     c->result = call(c, handle, sc, length);
     if (c->result) c->out_length = 0;
     c->summary_due = 1;

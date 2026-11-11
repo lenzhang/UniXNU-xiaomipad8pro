@@ -271,7 +271,7 @@ static int op_prepare(void *x)
     return prepare_error;
 }
 
-static const SsrOps ops = {0, op_now, op_send, op_wait, op_trace, op_publish, op_prepare, op_pack_size, op_pack_read, op_alloc};
+static const SsrOps ops = {0, op_now, op_send, op_wait, op_trace, op_publish, op_prepare, op_pack_size, op_pack_read, op_alloc, 0};
 
 /* ---- the service's thread ---- */
 static int service_stopped;

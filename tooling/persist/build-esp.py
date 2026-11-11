@@ -18,7 +18,7 @@ watchdog is not armed without them) plus the profile's and --arg's additions. En
   fastboot     the seed, no UFS root, data-persist=0, no pstore console (the last run's log stays): reset into ABL fastboot after 1 s
   reset, shutdown, tools
   build-esp.py --profile base|softgpu|gpu|daily [--default macos|macos-diag] [--arg NAME=VALUE ...] [--rtc-offset N|sdam] [--from REPO]
-               [--fast-boot 0|1|2] [--replace-data [1|HEX8]] [--flatten-data]
+               [--fast-boot 0|1|2] [--replace-data [1|HEX8]] [--flatten-data] [--sensor-pack PACK]
                [--kc K --adt A --trust T --seed S] [--name esp-diag] [--out out/persistent]
 
 The Data store (docs/data-store.md): the macos entries open it read-write (data-persist=2). When the installed seed is known
@@ -33,6 +33,10 @@ The clock (docs/drivers/rtc.md): droidvm-utc=<--utc> is always there, the OS ima
 near 1970. --rtc-offset N (measured once: tooling/native/rtc-offset.py) adds piano-rtc=1 piano-rtc-offset=N, --rtc-offset sdam only
 piano-rtc=1 (the offset from the PMIC's SDAM cell): the kernel (k27 0060, checked in the collection) then starts the calendar from the
 PMIC RTC, settime.sh sees a set clock and leaves it, and droidvm-utc only matters when the RTC gives no date.
+The sensors (docs/drivers/sensors.md section 5): --sensor-pack PACK puts this tablet's own sensor pack (made by
+package/PianoSensors/tools/make-sensor-pack.py under the ignored out/ or private/) at EFI/UniXNU/piano-sensors.pack, where PianoSensors
+level 2 reads it. The image then holds this unit's calibration: keep it local, never publish or share it, and never use another
+unit's pack.
 """
 import argparse
 import os
@@ -251,6 +255,19 @@ def mtools(*command, capture=True):
     return subprocess.run(list(command), check=True, env=env, capture_output=capture, text=True)
 
 
+def check_sensor_pack(path):
+    """The sensor pack as PianoSensors' loader takes it (SensorsLoad.h / SensorsPack.h): \"SSCPACK1\", its own size, at most 4 MiB."""
+    path = path.resolve()
+    if not path.is_file():
+        raise SystemExit(f'--sensor-pack: {path} is missing')
+    data = path.read_bytes()
+    if len(data) < 32 or data[:8] != b'SSCPACK1' or int.from_bytes(data[16:24], 'little') != len(data):
+        raise SystemExit(f'--sensor-pack: {path} is not a sensor pack (package/PianoSensors/tools/make-sensor-pack.py)')
+    if len(data) > 4 << 20:
+        raise SystemExit(f'--sensor-pack: {path} has {len(data)} bytes; PianoSensors takes at most 4 MiB')
+    return path
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--profile', choices=sorted(PROFILES), required=True)
@@ -279,6 +296,8 @@ def main():
                    'boot (docs/data-store.md); then every later seed boots it')
     p.add_argument('--installed-trust', type=Path, help='the installed ESP\'s trust cache, for the self-contained store\'s plugin check '
                    '(default: from PIANO_INSTALLED_SEED=<record>.json or out/persistent/installed.json)')
+    p.add_argument('--sensor-pack', type=Path, metavar='PACK',
+                   help="this tablet's sensor pack (make-sensor-pack.py) -> EFI/UniXNU/piano-sensors.pack (holds the unit's calibration)")
     p.add_argument('--name', help='output base name (default esp-<profile>-<default>)')
     p.add_argument('--out', type=Path, default=common.DEVICE / 'out/persistent')
     a = p.parse_args()
@@ -287,6 +306,7 @@ def main():
     for n, path in inputs.items():
         if not path.is_file():
             raise SystemExit(f'{n}: {path} is missing')
+    pack = check_sensor_pack(a.sensor_pack) if a.sensor_pack else None
     natives, droidvm, kc_rtc = kc_bundles(inputs['kc'])
     if droidvm:
         raise SystemExit(f'{inputs["kc"]} links {droidvm}: no DroidVM kext natively (docs/PROJECT-MAP.md rule 8)')
@@ -324,6 +344,8 @@ def main():
         shutil.copyfile(inputs['adt'], payloads / 'kernel.macho.adt')
         shutil.copyfile(inputs['trust'], payloads / 'kernel.macho.trustcache')
         shutil.copyfile(inputs['seed'], payloads / 'scratch-data.img')
+        if pack:   # a long name (FAT keeps its case): PianoSensors' SensorsLoad.h SL_PATH
+            shutil.copyfile(pack, stage / 'EFI/UniXNU/piano-sensors.pack')
         if prev:
             (payloads / 'previous').mkdir()
             shutil.copyfile(prev['kc'], payloads / 'previous/kernel.macho')
@@ -369,6 +391,7 @@ def main():
         'inputs': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in inputs.items()},
         'previous': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in prev.items()} if prev else None,
         'kc_natives': natives, 'adt_vmm_present': vmm,
+        'sensor_pack': {'sha256': common.sha(pack), 'bytes': pack.stat().st_size, 'private': 'this unit only'} if pack else None,
         'seed': seed, 'data_store': data_store,
         'store': {'window_blocks': window,
                   'first_lba_now': common.store_first(common.ROOTFS_LAST, window),

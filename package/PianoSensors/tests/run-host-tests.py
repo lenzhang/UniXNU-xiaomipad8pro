@@ -8,7 +8,9 @@
   orient   the orientation state machine (PaganiSensors' test)
   rpc      the FastRPC file service against PaganiSensors' simulated DSP, then a pack made by tools/make-sensor-pack.py
   pack     the pack tool: piano's archives, soc0 allowlist, unsafe names, no pack inside a repository's tracked tree
-  piano    SensorsGuard, SensorsPolicy and the independent cross-checks against libqmi, libssc, Linux fastrpc.c and qualcomm/fastrpc
+  piano    SensorsGuard, SensorsPolicy, SensorsClient against a simulated hub, SensorsHealth (PianoPower's report), the arena check, a
+           declined DSP call, and the independent cross-checks against libqmi, libssc, Linux fastrpc.c and qualcomm/fastrpc
+  load     SensorsLoad + FatVolume on a FAT32 image made by mtools as build-esp.py makes the ESP (skipped without mtools)
   kernel   every portable file compiles freestanding with AArch64 general registers only (no C library, no floating point)
 
 Synthetic inputs only: no vendor file, no registry, no calibration of any unit is read or written. Host tests do not establish that the
@@ -16,6 +18,7 @@ sensor hub or the DSP answers."""
 import argparse
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -26,7 +29,8 @@ HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
 POWER = PKG.parent / 'PianoPower'
 PORTABLE = ('SensorsGuard.c', 'SensorsPolicy.c', 'SensorsPb.c', 'SensorsSsc.c', 'SensorsRpc.c', 'SensorsPack.c', 'SensorsFixed.c',
-            'SensorsOrient.c')
+            'SensorsOrient.c', 'SensorsClient.c', 'SensorsLoad.c', 'FatVolume.c')
+INCLUDE = PKG.parent / 'include'   # PianoAdspContract.h
 CFLAGS = ['-std=c11', '-Wall', '-Wextra', '-Werror', '-O1', '-g', '-fsanitize=address,undefined', '-fno-sanitize-recover=all']
 
 
@@ -106,11 +110,33 @@ def pack_checks(d):
     return pack
 
 
+def esp_image(out, pack):
+    """A FAT32 volume as build-esp.py formats the ESP (4096-byte sectors, one per cluster), the pack at SensorsLoad.h's SL_PATH,
+    a damaged copy, a short file and one too big. None (and a note) without mtools."""
+    tools = [shutil.which(t) for t in ('mformat', 'mmd', 'mcopy')]
+    if not all(tools):
+        print('SKIP pack loader: no mtools (brew install mtools)')
+        return None
+    image = out / 'esp.img'
+    mtools = lambda *a: subprocess.run(list(a), check=True, capture_output=True)
+    mtools('mformat', '-C', '-F', '-S', '5', '-M', '4096', '-T', '70000', '-h', '1', '-s', '1', '-c', '1', '-i', str(image), '::')
+    mtools('mmd', '-i', str(image), '::/EFI', '::/EFI/UniXNU')
+    data = pack.read_bytes()
+    bad = bytearray(data)
+    bad[40] ^= 0xff                                   # inside the table: the sum no longer holds
+    files = {'piano-sensors.pack': data, 'bad-sensors.pack': bytes(bad), 'short-sensors.pack': data[:16],
+             'big-sensors.pack': data[:32] + bytes(5 << 20)}
+    for name, body in files.items():
+        (out / name).write_bytes(body)
+        mtools('mcopy', '-i', str(image), str(out / name), f'::/EFI/UniXNU/{name}')
+    return image
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--only', action='append', default=[], choices=['wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'kernel'])
+    parser.add_argument('--only', action='append', default=[], choices=['wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'load', 'kernel'])
     args = parser.parse_args()
-    want = set(args.only) or {'wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'kernel'}
+    want = set(args.only) or {'wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'load', 'kernel'}
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
         src = lambda *names: [PKG / n for n in names]
@@ -121,21 +147,26 @@ def main():
         if 'orient' in want:
             run(build(out, 'orient', [HERE / 'orient.c', *src('SensorsOrient.c')], ['-lm']))
         pack = None
-        if 'pack' in want or 'rpc' in want:
+        if 'pack' in want or 'rpc' in want or 'load' in want:
             (out / 'dump').mkdir()
             pack = pack_checks(out / 'dump')
         if 'rpc' in want:
             run(build(out, 'rpc', [HERE / 'rpc.c', *src('SensorsRpc.c', 'SensorsPack.c')], ['-D_DARWIN_C_SOURCE', '-lpthread']), pack)
         if 'piano' in want:
             run(build(out, 'piano', [HERE / 'piano.c', *src('SensorsGuard.c', 'SensorsPolicy.c', 'SensorsFixed.c', 'SensorsOrient.c',
-                                                           'SensorsSsc.c', 'SensorsPb.c', 'SensorsRpc.c', 'SensorsPack.c'),
-                                     POWER / 'QcomQrtr.c'], ['-lm']))
+                                                           'SensorsSsc.c', 'SensorsPb.c', 'SensorsRpc.c', 'SensorsPack.c',
+                                                           'SensorsClient.c'),
+                                     POWER / 'QcomQrtr.c'], ['-lm', '-I', str(INCLUDE)]))
+        if 'load' in want:
+            image = esp_image(out, pack)
+            if image:
+                run(build(out, 'load', [HERE / 'load.c', *src('SensorsLoad.c', 'SensorsPack.c', 'FatVolume.c')]), image)
         if 'kernel' in want:
             # the kernel's constraints: no C library, no floating point registers (AArch64 -mgeneral-regs-only)
             for name in PORTABLE:
                 subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-target', 'arm64-apple-macos13', '-ffreestanding', '-fno-builtin',
-                                '-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror', '-c', str(PKG / name), '-o', str(out / 'k.o')],
-                               check=True)
+                                '-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror', '-I', str(INCLUDE), '-c', str(PKG / name),
+                                '-o', str(out / 'k.o')], check=True)
             print(f'PASS kernel constraints: {len(PORTABLE)} portable files freestanding, general registers only')
     print('PASS PianoSensors host tests')
 

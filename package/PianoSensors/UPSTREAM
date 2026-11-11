@@ -8,7 +8,6 @@ sources (qualcomm/sensinghub, qualcomm/fastrpc), Linux and hexagonrpc read for f
   Taken unchanged (sha256 of the copies here = of the originals):
     SensorsPb.c      fb20086114de8fb2c48399c2082f2f1f3d65cc5640d9129baff15146490f7dda   SensorsPb.h      a3b60ae40dc924efad16e0b461809b61fd96f3b2beb07488b6918b44e0231a8e
     SensorsSsc.c     0e7e2e60532463fcdfa9b37fa194f8e4ad76ca3964c0c2e38d726f82b7c8fd47   SensorsSsc.h     7dc21d2824c2f0dcbb531133769dfe7d1b8d4301369a5ab9c5527b9c70abddef
-    SensorsRpc.c     ea11dc684c4196c860a07f0d44a2af9d7f832682cc01d43e0ea4106ce95e1def   SensorsRpc.h     b8bf81c2a885182e9e73c815d35f00d4913bcd198dbd5720b04edaac79d5274d
     SensorsPack.c    92359204eafd700e1110ccd6864bbecb389f153fa59b222e37ba29e278ab7964   SensorsPack.h    5bb9342cadb2b2873573ab9b15e34534f2a9e8fa8ee95d7a7f0cd4e949583553
     SensorsFixed.c   dba273ef2b9bc3fb8e01089612e7800bedcf5a75bd77dd36353db748915b8d15   SensorsFixed.h   81d537c44e495d09aab63e01a949908de191f8ab2582591116137ad8cd7e2f2d
     SensorsOrient.c  6f65dd1610942d138632388099aadfe59a0de5d46858dbc966530f18a02ca66f   SensorsOrient.h  bf9103d67dab911350cffbbb4be5f214357f546ec2e220173f013a977f72079c
@@ -16,10 +15,15 @@ sources (qualcomm/sensinghub, qualcomm/fastrpc), Linux and hexagonrpc read for f
     Test/check.h     c38141454396cdd38796b45bf66dd2689c907014b3ac3a7b481a6ec2edff404d   -> tests/check.h
     Test/fixed.c     7b249a076b911425ee4067868e19fb997a3dad1ef5dd714188bfd3915b5fa492   -> tests/fixed.c
     Test/orient.c    7ff25d3f170e206c343958822e801399563ba995388fe819d2acb665776770df   -> tests/orient.c
-    Test/rpc.c       dd1a71762a127d344fbc65248cc011f538ef9feff812c7a791175f73e1381edc   -> tests/rpc.c
   Their comments still speak of the 13T and iOS (units, context bank 4, the RAM Data seed); piano's values are SensorsPolicy.h's and
   sensors.md's, passed through SsrConfig / SnsConfig, not edited into these files.
   Derived:
+    SensorsRpc.c (ea11dc684c4196c860a07f0d44a2af9d7f832682cc01d43e0ea4106ce95e1def) and SensorsRpc.h
+      (b8bf81c2a885182e9e73c815d35f00d4913bcd198dbd5720b04edaac79d5274d): one op added at the end of SsrOps, admit(), asked once for
+      each call of the DSP before it is served (0: answered at once with SSR_EUNSUPPORTED and no out buffers), and a declined counter at
+      the end of SsrStatus; the rest unchanged. PianoSensors' guard declines every call once it is off, so the DSP never waits.
+    Test/rpc.c (dd1a71762a127d344fbc65248cc011f538ef9feff812c7a791175f73e1381edc) -> tests/rpc.c: its SsrOps initializer gains the
+      admit field (0: every call served); the test is otherwise unchanged.
     Test/wire.c (56299949030a17abdddf0541c932e145c7ff4c779abaa3a9f9769c312be62fae) -> tests/wire.c: one include changed; vector 4 (the
       QRTR data packet around an SNS request) is framed by PianoPower's QcomQrtr.c through tests/qrtr_frame.h (new) instead of
       PaganiAdsp's qcom_qrtr_frame, so the vector checks the router piano really uses.
@@ -32,8 +36,20 @@ sources (qualcomm/sensinghub, qualcomm/fastrpc), Linux and hexagonrpc read for f
     depend on PaganiSensors.h's iOS kinds and PaganiAdsp's router ports; they are the template of the kext's level S2..S4
     (docs/drivers/sensors.md section 8), derived once PianoPower's router-port API exists. SensorsHid.c, PaganiSensors*.cpp: iOS only.
 
-New here (UniXNU-piano): SensorsGuard.c/.h (the safety governor), SensorsPolicy.c/.h (piano's facts, the light curve, the rotation
-policy), tests/piano.c (their tests and the independent cross-checks), tests/qrtr_frame.h, tests/run-host-tests.py.
+This repository's own packages, copied because their owners do not change them for this one:
+  package/PianoPower/FatVolume.c (sha256 6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779) and FatVolume.h
+    (sha256 a438bcc5519bacfbfa6b6c55646fe4a3f7787f37a50c52103d8094c6871b67e7) -> FatVolume.c / FatVolume.h: byte for byte but for their
+    first lines (the SPDX line kept, a provenance comment added), as PianoWifi's copies; tooling/k27/build-native-piano-sensors.sh fails
+    when they drift.
+  package/PianoDwc3/SmmuStream.h (sha256 8f566938f259730d15407aa2d84abb3f6ec3b06c7bf3dabaef78c7e7fbb930a3) -> SmmuStream.h: the namespace
+    pianousb -> pianosensors and a provenance comment, as PianoWifi's copy; the build checks it the same way.
+  The partition reader in PianoSensors.cpp is PianoWifi's WifiFirmware.c partitionRead (NativeUfs's 4096-byte block reads, one block
+  cached for the ends of a range), the wait/wake pattern PianoPower's PianoAdsp.cpp waitEvents.
+
+New here (UniXNU-piano): PianoSensors.cpp (the kext: levels 1-3 on PianoPower's client contract), SensorsGuard.c/.h (the safety
+governor), SensorsHealth.h (PianoPower's health report as the guard's observation), SensorsPolicy.c/.h (piano's facts, the arena check,
+the light curve, the rotation policy), SensorsClient.c/.h (level 3's SNS client: lookups and attributes), SensorsLoad.c/.h (the pack from
+the ESP), tests/piano.c and tests/load.c (their tests and the independent cross-checks), tests/qrtr_frame.h, tests/run-host-tests.py.
 
 Specification only, no code or text taken (facts as in docs/drivers/sensors.md section 3): Linux drivers/misc/fastrpc.c and the SM8750
 devicetree (GPL-2.0, the piano kernel tree v1.1.0); linux-msm/hexagonrpc 598b591a and the Ubuntu project's seven patches to it (LGPL-3.0 /
