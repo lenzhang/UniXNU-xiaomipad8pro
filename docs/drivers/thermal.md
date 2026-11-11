@@ -1,8 +1,8 @@
 # Thermal and CPU frequency: TSENS, protection, SCMI performance: PianoThermal
 
 Status: code, 2026-11-11. `package/PianoThermal` is built, host-tested (`thermal_host: all passed`; the sensor map checked against
-the DT: 47 sensors) and linked into the native KC (kernel 0059: `com.unixnu.driver.PianoThermal: linked`, 12 native kexts, none from
-DroidVM), inert without `piano-thermal` / `piano-cpufreq`; **not run on hardware**. Template: `README.md`.
+the DT: 47 sensors) and linked into the native KC (kernel 0059: `com.unixnu.driver.PianoThermal: linked, ... 374 pointers`, none
+from DroidVM), inert without `piano-thermal` / `piano-cpufreq`; **not run on hardware**. Template: `README.md`.
 
 ## 1. Purpose and gate
 
