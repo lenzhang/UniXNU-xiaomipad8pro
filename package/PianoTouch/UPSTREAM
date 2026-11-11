@@ -42,6 +42,23 @@ ShengNovatekTouch (unixnu-research/ShengNovatekTouch, main 69fdd6223ed2572aa8bd8
   were derived from reading the Linux driver drivers/input/touchscreen/nt36532e (GPL-2.0-or-later, Novatek, Inc.). No code is
   copied from it." Its tracker (NvtTouchCore.c, multi-contact, sheng's sensor constants) is not used in this pass.
 
+xiaomipad-8pro-mainline (main 4b853f8ae9770bc6fa9f9eec3bcc996e9bc86dbf), device/piano-thp, piano's Ubuntu THP processing:
+  src/nvt_touch_core.cpp (sha256 ae2c6c1993446cab016053eb4e5dbee4573783e49450fda145f8e414f6f1b466), Apache-2.0, "Modified from
+    xiaomi-sheng-thp src/nvt_touch_core.cpp by ianchb" (xiaomi-sheng-thp 34046210932d654a4c0df0121ecc31c008f8148c, author ianchb;
+    the repository's NOTICE: "Novatek touch userspace"): domainContact (the electrode maps weighted by max(delta - 25, 0), x 10,
+    rounded), mapEdgeAxis / mapContactEdges (the edge stretch, the low-edge bias of Y) and Calibration::validate, re-written in
+    TouchMatrix.h (calibratedCentroid, mapEdgeAxis, calibrationValid) and tooling/k27/gen-touch-calibration.py. Its domain search,
+    filters and multi-slot tracker are not used.
+  src/calibration.cpp (sha256 604b50bbd0d20863bcdaffee842b0848a6d157fe87a908cc81443329ff283679), MIT: the calibration file's
+    schema (schema 1, 40 x 60, 10 units per pixel, the field names, project_vendor_id, invert_y), checked by the generator.
+  src/orientation.hpp (sha256 6f238f8d7dc479960406828bdec5a9889a656dafedcead7e2b3e0de538118212), MIT, its BOE case after
+    liisoya/xiaomipad-8pro-mainline 8bbc68239c17 (MIT), and src/panel.cpp (sha256
+    1e869d48874237a3529f04dce8fa4610f56ad83b9e3761a7d788402d9de59cb6), MIT: the orientation (X never flipped; BOE as processor Y,
+    CSOT rowMaximum - 1 - Y; invert_y overrides), the project_vendor_id of each panel (26 BOE, 4 CSOT), CSOT without a panel report.
+  tools/extract-thp-calibration.py (sha256 a8845a8ee56b3ad31bf7077c62c70c923d38c47fb7f5009bedba3a707a05d0a0), MIT: makes the
+    private calibration file from the vendor piano_nova_<panel>_thp_config.ini; not run here. The file itself (per unit) is never
+    committed, its arrays never printed: the build embeds it from the ignored out/ tree and logs its panel and an 8-digit hash prefix.
+
 UniXNU-piano (this repository), BSD-2-Clause-Patent:
   package/PianoDwc3/SmmuStream.h: included as it is (-I package/PianoDwc3) for stream 0xa3's bypass context bank.
   package/PianoKeyboard (PianoKeyboardHID, itself DroidVMInput's DroidVMHIDDevice from macOS-DroidVM overlay/kext/DroidVMInput,
@@ -63,4 +80,4 @@ The panel images (novatek_nt36532_piano_fw_boe.bin, sha256 b7999389d49decb14019e
 novatek_nt36532_piano_fw_csot.bin, sha256 14b30bb7799d273f6c5d967376694c2cbd3056f3939135ceda70ebec64abfa7a; 245,760 bytes each, the
 stock OS3.0.303.0 odm_a files as xiaomipad-8pro-mainline firmware/piano-input.json pins them) are Novatek's/Xiaomi's and never
 committed: the build copies them into the ignored out/native-kexts/PianoTouch/firmware and embeds them from there. Only their sizes,
-hashes, version byte and partition table are ever logged. No per-unit calibration (thp-calibration.json) is used.
+hashes, version byte and partition table are ever logged.

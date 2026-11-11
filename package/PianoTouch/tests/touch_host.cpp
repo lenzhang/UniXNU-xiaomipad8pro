@@ -14,6 +14,12 @@
 #include "TouchMatrix.h"
 #include "TouchHid.h"
 #include "Se2Bus.h"
+#ifdef PIANO_TOUCH_SYNTHETIC_HEADER
+#include PIANO_TOUCH_SYNTHETIC_HEADER   // tests/synthetic-calibration.json through tooling/k27/gen-touch-calibration.py
+#endif
+#ifdef PIANO_TOUCH_UNIT_HEADER
+#include PIANO_TOUCH_UNIT_HEADER        // the unit's private calibration (out/ only): properties checked, nothing printed
+#endif
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -393,7 +399,9 @@ int32_t drift(uint32_t, uint32_t) { return 40; }
 void testMatrix()
 {
   auto m = std::make_unique<Matrix>();
-  matrixReset(*m, MatrixConfig());
+  MatrixConfig flipped;
+  flipped.flipY = true;   // the CSOT orientation (Project-SunUEFI's test case)
+  matrixReset(*m, flipped);
   uint16_t no = 0;
   auto feed = [&](uint8_t type, int32_t (*extra)(uint32_t, uint32_t), bool bad = false) {
     const std::vector<uint8_t> p = packet(type, no++, extra, bad);
@@ -409,13 +417,12 @@ void testMatrix()
   CHECK(feed(1, blobAndNoisyRow) == Feed::decoded && m->touching);
   const int32_t x = int32_t((45 * 1024 + 512) * 3200ll / (60 * 1024)), y = 2136 - int32_t((10 * 1024 + 512) * 2136ll / (40 * 1024));
   CHECK(m->x >= x - 2 && m->x <= x + 2 && m->y >= y - 2 && m->y <= y + 2);
-  CHECK(y > 2136 / 2);   // row 10 of 40 is the lower part of the panel: the raw Y runs up
+  CHECK(y > 2136 / 2 && !m->calibrated);   // reversed: row 10 of 40 lands in the lower half
   CHECK(feed(2, blob) == Feed::otherType && m->touching);
   CHECK(feed(1, nullptr) == Feed::decoded && !m->touching);
   for (unsigned n = 0; n < 20; ++n) CHECK(feed(1, drift) == Feed::decoded && !m->touching);   // a uniform shift is no touch
-  // No flip: Y along the rows as they come.
+  // No flip (the default, BOE): Y along the rows as they come.
   MatrixConfig cfg;
-  cfg.flipY = false;
   matrixReset(*m, cfg);
   for (unsigned n = 0; n < kProbeFrames + kRefFrames; ++n) feed(1, nullptr);
   CHECK(feed(1, blob) == Feed::decoded && m->touching && m->y >= 2136 - y - 2 && m->y <= 2136 - y + 2);
@@ -432,6 +439,194 @@ void testMatrix()
   CHECK(tipUpdate(t, true, 10, 10) == TipEvent::none && tipUpdate(t, false, 0, 0) == TipEvent::none);   // one noisy frame: no click
   CHECK(tipUpdate(t, true, 10, 10) == TipEvent::none && tipUpdate(t, true, 10, 10) == TipEvent::down);
   CHECK(tipCancel(t) == TipEvent::up && tipCancel(t) == TipEvent::none && t.downs == 2 && t.ups == 2);
+}
+
+// ------------------------------------------------------------------------------------------------------------- calibration
+// The synthetic calibration (tests/synthetic-calibration.json uses the same formulas): non-uniform steps of 51..55 px.
+Calibration synthetic()
+{
+  Calibration c{};
+  c.present = true;
+  for (int i = 0; i < 40; ++i) c.rowMap[i] = 26 + 53 * i + (i % 3 == 0 ? 1 : 0);
+  for (int i = 0; i < 60; ++i) c.columnMap[i] = 26 + 53 * i + (i * 2) % 3;
+  c.rowMaximum = 21360;
+  c.columnMaximum = 32000;
+  c.edgeBase = 2700;
+  c.edgeSize = 600;
+  c.edgeGain = 4350;
+  c.projectVendorId = kVendorBoe;
+  c.invertY = -1;
+  return c;
+}
+// piano-thp's domainContact over a blob's 3 x 3 nodes (weights delta - 25), computed here independently, pixels x 10.
+int32_t weighted(const int32_t *map, const int32_t weights[3], int first)
+{
+  int64_t sum = 0, w = 0;
+  for (int k = 0; k < 3; ++k) {
+    sum += int64_t(weights[k]) * map[first + k] * 10;
+    w += weights[k];
+  }
+  return int32_t((2 * sum + w) / (2 * w));
+}
+int32_t blobAt(uint32_t r, uint32_t c, uint32_t r0, uint32_t c0)
+{
+  if (r == r0 && c == c0) return 600;
+  return int32_t(r) >= int32_t(r0) - 1 && r <= r0 + 1 && int32_t(c) >= int32_t(c0) - 1 && c <= c0 + 1 ? 300 : 0;
+}
+
+void testCalibration()
+{
+  const Calibration c = synthetic();
+  CHECK(calibrationValid(c));
+  {
+    Calibration bad = c;
+    bad.rowMap[7] = bad.rowMap[6];
+    CHECK(!calibrationValid(bad));
+    bad = c;
+    bad.columnMap[59] = 3200;
+    CHECK(!calibrationValid(bad));
+    bad = c;
+    bad.edgeSize = 10680;
+    CHECK(!calibrationValid(bad));
+    bad = c;
+    bad.present = false;
+    CHECK(!calibrationValid(bad));
+  }
+  // The edge mapping: identity inside, stretched to the ends, monotonic, the low edge of Y one unit lower.
+  CHECK(mapEdgeAxis(5000, 32000, false, c) == 5000 && mapEdgeAxis(600, 32000, false, c) == 600 && mapEdgeAxis(31400, 32000, false, c) == 31400);
+  CHECK(mapEdgeAxis(0, 32000, false, c) == 1 && mapEdgeAxis(0, 21360, true, c) == 0 && mapEdgeAxis(31999, 32000, false, c) == 31999);
+  CHECK(mapEdgeAxis(400, 32000, false, c) == 600 - 4350 * 200 / 2700 && mapEdgeAxis(400, 32000, false, c) < 400);
+  CHECK(mapEdgeAxis(31700, 32000, false, c) == 31400 + 4350 * 300 / 2700 && mapEdgeAxis(31700, 32000, false, c) > 31700);
+  int32_t last = -1;
+  bool monotonic = true;
+  for (int32_t v = 0; v < 21360; v += 7) {
+    const int32_t m = mapEdgeAxis(v, 21360, true, c);
+    monotonic = monotonic && m >= last;
+    last = m;
+  }
+  CHECK(monotonic);
+#ifdef PIANO_TOUCH_SYNTHETIC_HEADER
+  // The generator's round trip: the JSON file through the header equals the formulas.
+  CHECK(kSyntheticCalibrationPresent && calibrationValid(kSyntheticCalibration) && kSyntheticCalibration.invertY == -1 &&
+        kSyntheticCalibration.projectVendorId == kVendorBoe && kSyntheticCalibration.edgeGain == c.edgeGain);
+  CHECK(std::memcmp(kSyntheticCalibration.rowMap, c.rowMap, sizeof c.rowMap) == 0 &&
+        std::memcmp(kSyntheticCalibration.columnMap, c.columnMap, sizeof c.columnMap) == 0);
+#endif
+  // The centroid exactly, on an asymmetric blob without noise: the weights are delta - 25 (corners of 30 count 5, not 30).
+  {
+    std::vector<int32_t> d(2400, 0);
+    auto at = [&](int r, int cc) -> int32_t & { return d[size_t(r * 60 + cc)]; };
+    at(10, 45) = 600; at(10, 44) = 300; at(10, 46) = 40; at(9, 45) = at(11, 45) = 200;
+    at(9, 44) = at(11, 44) = at(9, 46) = at(11, 46) = 30;
+    int32_t x10 = 0, y10 = 0;
+    calibratedCentroid(c, d.data(), 10, 45, &x10, &y10);
+    const int64_t wx[3] = {275 + 5 + 5, 575 + 175 + 175, 15 + 5 + 5}, wy[3] = {175 + 5 + 5, 275 + 575 + 15, 175 + 5 + 5};
+    int64_t sx = 0, sy = 0, w = 0;
+    for (int k = 0; k < 3; ++k) {
+      sx += wx[k] * c.columnMap[44 + k] * 10;
+      sy += wy[k] * c.rowMap[9 + k] * 10;
+      w += wx[k];
+    }
+    CHECK(x10 == int32_t((2 * sx + w) / (2 * w)) && y10 == int32_t((2 * sy + w) / (2 * w)));
+    at(10, 45) = 20; at(10, 44) = at(10, 46) = at(9, 45) = at(11, 45) = 0;
+    at(9, 44) = at(11, 44) = at(9, 46) = at(11, 46) = 0;
+    calibratedCentroid(c, d.data(), 10, 45, &x10, &y10);
+    CHECK(x10 == c.columnMap[45] * 10 && y10 == c.rowMap[10] * 10);   // nothing above the offset: the peak's own electrode
+  }
+  // Contacts through the matrix with the calibration: interior (no edge mapping), at an edge, reversed Y, and the fallback.
+  auto m = std::make_unique<Matrix>();
+  auto learn = [&](MatrixConfig cfg) {
+    matrixReset(*m, cfg);
+    for (uint16_t no = 0; no < kProbeFrames + kRefFrames; ++no) {
+      const std::vector<uint8_t> p = packet(1, no, nullptr);
+      matrixFeed(*m, p.data(), uint32_t(p.size()));
+    }
+  };
+  auto touch = [&](uint32_t r0, uint32_t c0) {
+    ChipModel model;
+    model.counter = 200;
+    model.produce(1, [r0, c0](uint32_t r, uint32_t cc) { return blobAt(r, cc, r0, c0); });
+    std::vector<uint8_t> p(model.payload);
+    for (uint32_t i = 0; i < model.payload; ++i) p[i] = model.get(model.eventBuf() + 256 + i);
+    return matrixFeed(*m, p.data(), uint32_t(p.size())) == Feed::decoded && m->touching;
+  };
+  const int32_t sides[3] = {3 * 275, 2 * 275 + 575, 3 * 275};   // column (or row) weights of the 3 x 3 blob
+  MatrixConfig cfg;
+  cfg.cal = &c;
+  learn(cfg);
+  CHECK(m->calibrated);
+  CHECK(touch(10, 45));
+  int32_t ex = weighted(c.columnMap, sides, 44) / 10, ey = weighted(c.rowMap, sides, 9) / 10;
+  CHECK(m->x >= ex - 1 && m->x <= ex + 1 && m->y >= ey - 1 && m->y <= ey + 1);
+  const int32_t linearX = int32_t((45 * 1024 + 512) * 3200ll / (60 * 1024)), linearY = int32_t((10 * 1024 + 512) * 2136ll / (40 * 1024));
+  CHECK(ex != linearX && ey != linearY);   // the non-uniform maps move the contact off the linear node centre
+  // Row 20, column 0: X inside the edge band (stretched toward 0), Y interior. The blob's columns 0 and 1 weigh 1125 and 825.
+  CHECK(touch(20, 0));
+  const int32_t rawX = int32_t((2 * (1125ll * c.columnMap[0] * 10 + 825ll * c.columnMap[1] * 10) + 1950) / (2 * 1950));
+  CHECK(rawX < 600 && m->x >= mapEdgeAxis(rawX, 32000, false, c) / 10 - 1 && m->x <= mapEdgeAxis(rawX, 32000, false, c) / 10 + 1);
+  CHECK(m->x < rawX / 10);
+  // Reversed Y (CSOT): rowMaximum - 1 - y, in tenths of a pixel.
+  cfg.flipY = true;
+  learn(cfg);
+  CHECK(touch(10, 45));
+  const int32_t fy = (21360 - 1 - weighted(c.rowMap, sides, 9)) / 10;
+  CHECK(m->y >= fy - 1 && m->y <= fy + 1 && m->x >= ex - 1 && m->x <= ex + 1);
+  // An invalid calibration: the linear map, as without one.
+  Calibration broken = c;
+  broken.rowMap[3] = 0;
+  cfg.cal = &broken;
+  cfg.flipY = false;
+  learn(cfg);
+  CHECK(!m->calibrated && touch(10, 45) && m->x >= linearX - 2 && m->x <= linearX + 2 && m->y >= linearY - 2 && m->y <= linearY + 2);
+#ifdef PIANO_TOUCH_UNIT_HEADER
+  if (kUnitCalibrationPresent) {
+    // The unit's file: valid, a piano panel, 40..70 px electrode pitch, a centred contact inside the panel. Nothing printed.
+    const Calibration &u = kUnitCalibration;
+    bool pitch = true;
+    for (int i = 1; i < 40; ++i) pitch = pitch && u.rowMap[i] - u.rowMap[i - 1] >= 40 && u.rowMap[i] - u.rowMap[i - 1] <= 70;
+    for (int i = 1; i < 60; ++i) pitch = pitch && u.columnMap[i] - u.columnMap[i - 1] >= 40 && u.columnMap[i] - u.columnMap[i - 1] <= 70;
+    CHECK(calibrationValid(u) && (u.projectVendorId == kVendorBoe || u.projectVendorId == kVendorCsot) && pitch);
+    cfg.cal = &u;
+    learn(cfg);
+    CHECK(m->calibrated && touch(20, 30) && m->x > 1200 && m->x < 2000 && m->y > 700 && m->y < 1400);
+    std::printf("  unit calibration: valid, panel %s, a centred contact lands mid-panel\n", u.projectVendorId == kVendorBoe ? "BOE" : "CSOT");
+  }
+#endif
+}
+
+void testOrientation()
+{
+  const Calibration boe = synthetic();
+  Calibration csot = boe, invert = boe, unknown = boe, broken = boe;
+  csot.projectVendorId = kVendorCsot;
+  invert.invertY = 1;
+  unknown.projectVendorId = -1;
+  broken.edgeBase = 0;
+  constexpr uint32_t kAuto = 4;
+  Orientation o = chooseOrientation(kPanelBoe, nullptr, kAuto);
+  CHECK(!o.flipX && !o.flipY && o.panel == kPanelBoe && !o.mismatch);
+  o = chooseOrientation(kPanelCsot, nullptr, kAuto);
+  CHECK(!o.flipX && o.flipY && o.panel == kPanelCsot);
+  o = chooseOrientation(kPanelBoe, &boe, kAuto);
+  CHECK(!o.flipY && !o.mismatch && o.calibrationPanel == kPanelBoe);
+  o = chooseOrientation(kPanelBoe, &csot, kAuto);   // they disagree: the calibration decides the orientation
+  CHECK(o.mismatch && o.panel == kPanelCsot && o.flipY);
+  o = chooseOrientation(kPanelCsot, &boe, kAuto);
+  CHECK(o.mismatch && o.panel == kPanelBoe && !o.flipY);
+  o = chooseOrientation(kPanelUnknown, &boe, kAuto);
+  CHECK(!o.mismatch && o.panel == kPanelBoe && !o.flipY);
+  o = chooseOrientation(kPanelUnknown, nullptr, kAuto);   // nothing known: CSOT, as piano-thp without a panel report
+  CHECK(o.panel == kPanelCsot && o.flipY);
+  o = chooseOrientation(kPanelBoe, &invert, kAuto);
+  CHECK(o.flipY && !o.flipX);
+  o = chooseOrientation(kPanelCsot, &unknown, kAuto);
+  CHECK(!o.mismatch && o.panel == kPanelCsot && o.flipY);
+  o = chooseOrientation(kPanelBoe, &broken, kAuto);   // an invalid calibration counts as none
+  CHECK(o.calibrationPanel == kPanelUnknown && !o.flipY);
+  for (uint32_t f = 0; f < 4; ++f) {
+    o = chooseOrientation(kPanelBoe, &csot, f);
+    CHECK(o.flipX == bool(f & 1) && o.flipY == bool(f & 2));
+  }
 }
 
 // ------------------------------------------------------------------------------------------------------------- HID, clocks
@@ -493,13 +688,15 @@ int main(int argc, char **argv)
   testBringUpBits();
   testRealImages(argc, argv);
   testMatrix();
+  testCalibration();
+  testOrientation();
   testHid();
   testClock();
   if (failures) {
     std::printf("PianoTouch host tests: %d FAILED\n", failures);
     return 1;
   }
-  std::printf("PASS: PianoTouch host tests (NT36532E model over whole transfers and by hand, %d real image(s), matrix, tip, HID, clocks)\n",
-              argc - 1);
+  std::printf("PASS: PianoTouch host tests (NT36532E model over whole transfers and by hand, %d real image(s), matrix, calibration, "
+              "orientation, tip, HID, clocks)\n", argc - 1);
   return 0;
 }

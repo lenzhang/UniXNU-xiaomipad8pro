@@ -2,6 +2,8 @@ Copyright (c) 2026, the macOS-DroidVM contributors (DroidVMInput, from which Pia
 Copyright (c) 2026, NativeGeniSpi contributors (GeniSpi.c, GeniSpi.h, tests/geni_spi_host.c).
 Copyright (c) 2026, UniXNU contributors (Project-SunUEFI's piano touch producer, UniXNU-Odin3's SM8750 touch transport).
 Copyright (c) 2026, the UniXNU-piano contributors.
+TouchMatrix.h's calibrated position, edge mapping and calibration check follow piano-thp's nvt_touch_core.cpp (Apache-2.0,
+modified from xiaomi-sheng-thp by ianchb) and its orientation (MIT); see UPSTREAM.
 All rights reserved.
 
 SPDX-License-Identifier: BSD-2-Clause-Patent

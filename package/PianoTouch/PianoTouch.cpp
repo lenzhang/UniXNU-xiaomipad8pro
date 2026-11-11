@@ -35,7 +35,8 @@
 //   piano-touch-mode=V       the operating-mode command's value (default 2; 65536: not sent)
 //   piano-touch-baseline=0   no idle-baseline update command
 //   piano-touch-threshold=T  the contact threshold of the decoder (default 200)
-//   piano-touch-flip=B       bit 0 X, bit 1 Y flipped (default 2: Y, piano's raw Y runs up the panel)
+//   piano-touch-flip=B       auto (default: by the panel, BOE as processor Y, CSOT Y reversed; the calibration's panel wins over
+//                            gpio100 for this, and its invert_y over both); 0..3 explicit: bit 0 X, bit 1 Y flipped
 //   piano-touch-poll=MS      edge polling (default 1)
 //   piano-touch-trace=1      more frame headers, and contact positions at level 2
 // Never: a flash write (the controller has none for the touch firmware), a panel command, a regulator vote, a GPIO other than
@@ -57,6 +58,7 @@
 #include "TouchMatrix.h"
 #include "TouchHid.h"
 #include "Se2Bus.h"
+#include "PianoTouchCalibration.h"   // generated (tooling/k27/gen-touch-calibration.py) into the ignored out/ tree
 #include "SmmuStream.h"
 extern "C" {
 #include "GeniSpi.h"
@@ -102,7 +104,14 @@ void readArgs()
   gArgs.mode = bootArg("piano-touch-mode", 2);
   gArgs.baseline = bootArg("piano-touch-baseline", 1);
   gArgs.threshold = clampArg(bootArg("piano-touch-threshold", 200), 20, 5000);
-  gArgs.flip = bootArg("piano-touch-flip", 2) & 3;
+  // piano-touch-flip=auto (or absent, or anything but 0..3) is 4. A string value lands in the buffer as text, a number as an int64.
+  char flip[16] = {};
+  gArgs.flip = 4;
+  if (PE_parse_boot_argn("piano-touch-flip", flip, sizeof flip - 1) && strncmp(flip, "auto", 4) != 0) {
+    uint64_t v = 0;
+    for (unsigned i = 0; i < 8; ++i) v |= uint64_t(uint8_t(flip[i])) << (8 * i);
+    if (v <= 3) gArgs.flip = uint32_t(v);
+  }
   gArgs.pollMs = clampArg(bootArg("piano-touch-poll", 1), 1, 50);
   gArgs.trace = bootArg("piano-touch-trace", 0);
 }
@@ -151,6 +160,7 @@ uint64_t nowUs()
   return ns / 1000;
 }
 uint64_t nowMs() { return nowUs() / 1000; }
+const char *const kFlipNames[5] = {"0 (none)", "1 (X)", "2 (Y)", "3 (X and Y)", "auto"};
 
 // Explicit ldr/str, as PianoDwc3 does: every store from a general register (Qualcomm's trapped SMMU registers need that).
 inline uint32_t rd32(uintptr_t a)
@@ -311,6 +321,7 @@ class PianoTouch : public IOService {
   uint8_t fWdtState = 0;
   bool fHaveCounter = false, fEdgeSeen = false, fEdgePending = false;
   uint32_t fRateKhz = 0;   // the SPI rate the GENI divider gives
+  int fPanel = kPanelUnknown;   // gpio100: the firmware image's panel
 
   static void threadMain(void *self, wait_result_t);
   static bool eventServicePublished(void *target, void *refCon, IOService *service, IONotifier *notifier);
@@ -367,12 +378,22 @@ bool PianoTouch::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
   note("start: piano-touch=%u (%s), stop %u, bus %u (%s), %u kHz, seirq %u, smmu %u, loopback %u, mode %u, baseline %u, "
-       "threshold %u, flip %u, poll %u ms; firmware BOE %llu bytes, CSOT %llu bytes",
+       "threshold %u, flip %s, poll %u ms; firmware BOE %llu bytes, CSOT %llu bytes",
        gArgs.level, gArgs.level >= 2 ? "HID tablet pointer for macOS" : "log only, nothing for macOS", gArgs.stop, gArgs.bus,
        gArgs.bus == 0 ? "GENI, else by hand" : gArgs.bus == 1 ? "GENI only" : "by hand only", gArgs.khz, gArgs.seirq, gArgs.smmu,
-       gArgs.loopback, gArgs.mode, gArgs.baseline, gArgs.threshold, gArgs.flip, gArgs.pollMs,
+       gArgs.loopback, gArgs.mode, gArgs.baseline, gArgs.threshold, kFlipNames[gArgs.flip], gArgs.pollMs,
        (unsigned long long)piano_touch_firmware_boe_size, (unsigned long long)piano_touch_firmware_csot_size);
   setProperty("piano-touch", gArgs.level, 32);
+  // The unit's calibration (built in from the private Ubuntu file; its arrays are never logged), checked again here.
+  if (kUnitCalibrationPresent && calibrationValid(kUnitCalibration))
+    note("calibration: unit file (panel %s, sha256 %s), electrode maps, edge %d px%s",
+         kUnitCalibration.projectVendorId == kVendorBoe ? "BOE" : kUnitCalibration.projectVendorId == kVendorCsot ? "CSOT" : "unknown",
+         kUnitCalibrationSha, kUnitCalibration.edgeSize / kUnits,
+         kUnitCalibration.invertY < 0 ? "" : kUnitCalibration.invertY ? ", invert_y true" : ", invert_y false");
+  else if (kUnitCalibrationPresent)
+    note("calibration: unit file (sha256 %s) INVALID: none (linear map)", kUnitCalibrationSha);
+  else
+    note("calibration: none (linear map)");
   if (!step(1, "survey (read only): pins, SE2 clocks and registers, SMMU stream 0xa3, firmware images")) return true;
   survey();
   // Step 2 here, on the matching thread: the SMMU's stream-match registers are not safe to touch later from another thread
@@ -806,6 +827,7 @@ bool PianoTouch::firmware()
       panel = level(kLcdId);
       setCtl(kLcdId, id.ctl);
     }
+    fPanel = panel == 1 ? kPanelBoe : panel == 0 ? kPanelCsot : kPanelUnknown;
     const bool boe = panel == 1;
     fFw = boe ? piano_touch_firmware_boe : piano_touch_firmware_csot;
     fFwBytes = uint32_t(boe ? piano_touch_firmware_boe_size : piano_touch_firmware_csot_size);
@@ -1022,8 +1044,17 @@ void PianoTouch::serve()
 {
   MatrixConfig mc;
   mc.threshold = int32_t(gArgs.threshold);
-  mc.flipX = gArgs.flip & 1;
-  mc.flipY = gArgs.flip & 2;
+  const Calibration *cal = kUnitCalibrationPresent && calibrationValid(kUnitCalibration) ? &kUnitCalibration : nullptr;
+  mc.cal = cal;
+  const Orientation o = chooseOrientation(fPanel, cal, gArgs.flip);
+  mc.flipX = o.flipX;
+  mc.flipY = o.flipY;
+  if (o.mismatch)
+    note("WARNING: lcd-id gpio100 says %s but the calibration's project_vendor_id %d is %s: orientation follows the calibration, "
+         "the firmware image gpio100", panelName(fPanel), cal->projectVendorId, panelName(o.calibrationPanel));
+  note("orientation: flip X %u, Y %u (%s; panel %s by %s), position %s", o.flipX, o.flipY, o.why, panelName(o.panel),
+       o.calibrationPanel != kPanelUnknown ? "the calibration" : fPanel != kPanelUnknown ? "gpio100" : "default",
+       cal ? "from the unit's electrode maps and edge mapping" : "linear over the matrix");
   matrixReset(*fMatrix, mc);
   fTip = Tip();
   const uint64_t begin = nowMs();

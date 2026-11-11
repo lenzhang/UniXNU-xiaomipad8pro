@@ -8,7 +8,11 @@
 #   environment: K27_TREE (the k27 build tree, read only: compile recipes, out/x12377/inc-hid), K27_OBJ (default k27-native-obj),
 #                CC/CXX (host compilers for the tests), PIANO_TOUCH_FW_DIR (the directory with novatek_nt36532_piano_fw_{boe,csot}.bin;
 #                default ../xiaomipad-8pro-mainline's firmware/novatek/piano), PIANO_TOUCH_NO_FIRMWARE=1 (build without them: step 5
-#                then stops with "no usable image")
+#                then stops with "no usable image"), PIANO_TOUCH_CALIBRATION (this unit's Ubuntu touchscreen calibration, from the
+#                environment or ~/.config/piano/env; PIANO_TOUCH_CALIBRATION= in the environment does not read the file)
+# The calibration (private: made by xiaomipad-8pro-mainline tools/extract-thp-calibration.py from the vendor thp_config.ini) is
+# checked and turned into out/native-kexts/PianoTouch/gen/PianoTouchCalibration.h by tooling/k27/gen-touch-calibration.py, which
+# prints which one is used; absent or invalid: the linear map. Neither the file, its path nor its hash is in any committed file.
 # The images (the stock OS3.0.303.0 odm_a files, pinned below as xiaomipad-8pro-mainline firmware/piano-input.json pins them) are
 # Novatek's/Xiaomi's and never committed: they are copied into the ignored out/native-kexts/PianoTouch/firmware and .incbin'd from
 # there. A missing one is left out (with a warning); one that is not the pinned file stops the build.
@@ -42,12 +46,23 @@ for PANEL in boe:b7999389d49decb14019e24ce68c6fbb0a388e26391b9b0ab913e285c5e44c6
   fi
 done
 cmp -s "$GEN.tmp" "$GEN" && rm -f "$GEN.tmp" || mv "$GEN.tmp" "$GEN"
+# The calibration: PIANO_TOUCH_CALIBRATION set (even empty) in the environment wins over ~/.config/piano/env.
+CAL_ARGS=()
+if [ "${PIANO_TOUCH_CALIBRATION+set}" = set ]; then
+  [ -n "$PIANO_TOUCH_CALIBRATION" ] && CAL_ARGS=("$PIANO_TOUCH_CALIBRATION") || CAL_ARGS=(--none)
+fi
+python3 "$D/tooling/k27/gen-touch-calibration.py" --out "$O/gen/PianoTouchCalibration.h" ${CAL_ARGS[@]+"${CAL_ARGS[@]}"} >&2
+python3 "$P/tests/calibration_gen_test.py" >&2 || { echo "Error: calibration generator tests failed" >&2; exit 1; }
+python3 "$D/tooling/k27/gen-touch-calibration.py" --out "$O/host-tests/SyntheticCalibration.h" --name kSynthetic \
+  "$P/tests/synthetic-calibration.json" 2> /dev/null
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror "$P/tests/geni_spi_host.c" "$P/GeniSpi.c" -o "$O/host-tests/geni_spi_host"
 "$O/host-tests/geni_spi_host" >&2 || { echo "Error: GeniSpi host tests failed" >&2; exit 1; }
-"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/PianoDwc3" "$P/tests/touch_host.cpp" -o "$O/host-tests/touch_host"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/PianoDwc3" -I "$O/host-tests" -I "$O/gen" \
+  -DPIANO_TOUCH_SYNTHETIC_HEADER='"SyntheticCalibration.h"' -DPIANO_TOUCH_UNIT_HEADER='"PianoTouchCalibration.h"' \
+  "$P/tests/touch_host.cpp" -o "$O/host-tests/touch_host"
 "$O/host-tests/touch_host" ${STAGED[@]+"${STAGED[@]}"} >&2 || { echo "Error: PianoTouch host tests failed" >&2; exit 1; }
 python3 "$D/tooling/k27/build-native-kext.py" PianoTouch "$P/PianoTouch.cpp" "$P/GeniSpi.c" "$D/tooling/k27/NativeKextGlue.cpp" "$GEN" \
-  -I "$P" -I "$D/package/PianoDwc3" -I "$HID" -I "$K/out/x12377/inc-gfx" -I "$K/out/x12377/storage-abi/include" \
+  -I "$P" -I "$O/gen" -I "$D/package/PianoDwc3" -I "$HID" -I "$K/out/x12377/inc-gfx" -I "$K/out/x12377/storage-abi/include" \
   -D U:TARGET_OS_OSX -D TARGET_OS_OSX=1 --obj "${K27_OBJ:-k27-native-obj}" >&2
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 # IOHIDDevice's symbols come from IOHIDFamily, the GCC lock word from PianoA830 (both libraries of the descriptor), resolved by the KC link.

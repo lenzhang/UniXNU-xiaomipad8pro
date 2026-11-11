@@ -9,10 +9,16 @@
 //   - peaks: nodes >= threshold (200) that no 3 x 3 neighbour beats (ties to the first in scan order), each the weighted centroid
 //     of its positive 3 x 3 neighbourhood (1/1024 node);
 //   - the contact nearest the last one (within 400 px) while touching, else the strongest peak;
-//   - screen: X along the 60 columns (3200 px), Y along the 40 rows (2136 px), Y flipped (piano's raw Y runs up the panel).
+//   - panel position: X along the 60 columns (3200 px), Y along the 40 rows (2136 px).
+// The position, with this unit's calibration (Calibration, generated at build time from the private Ubuntu file, never committed):
+// piano-thp's (xiaomipad-8pro-mainline device/piano-thp, Apache-2.0, "Modified from xiaomi-sheng-thp by ianchb"; UPSTREAM)
+// domainContact over the peak's 3 x 3 nodes: the average of column_map / row_map (electrode centres, pixels x 10) weighted by
+// max(delta - 25, 0), rounded; then mapEdgeAxis on each axis (the edge stretch: edge_size, edge_gain / edge_base; Y with its low
+// edge bias), then the orientation, then / 10 to pixels. Without one: linear over the matrix (node centres at (i + 1/2) / n).
+// Orientation (piano-thp orientation.hpp, MIT): X never flipped; Y as processor Y on a BOE panel, reversed on a CSOT one, unless
+// the calibration says otherwise (invert_y); the caller picks flipX / flipY (PianoTouch.cpp: piano-touch-flip=auto).
 // The tip on top: down after `confirm` frames in a row with a contact (ShengNovatekTouch confirms on the second scan), up after
-// `hold` frames in a row without one, so a single noisy frame neither clicks nor breaks a drag. No calibration maps (the per-unit
-// edge compensation of piano's Ubuntu THP stays private and is not used here): the mapping is linear over the matrix.
+// `hold` frames in a row without one, so a single noisy frame neither clicks nor breaks a drag.
 #ifndef PIANO_TOUCH_MATRIX_H
 #define PIANO_TOUCH_MATRIX_H
 #include <stdint.h>
@@ -23,9 +29,78 @@ namespace pianotouch {
 constexpr uint32_t kMaxNodes = 4096, kRefFrames = 32, kProbeFrames = 16, kMaxPoints = 10;
 constexpr int32_t kPanelW = 3200, kPanelH = 2136;
 
+// This unit's electrode calibration (the private Ubuntu file's fields, pixels x 10). Aggregate: the generated header initialises it.
+struct Calibration {
+  bool present;
+  int32_t rowMap[40], columnMap[60];   // electrode centres, panel pixels (x 10 in the formulas)
+  int32_t rowMaximum, columnMaximum;   // pixels x 10 (21360, 32000 on piano)
+  int32_t edgeBase, edgeSize, edgeGain;
+  int32_t projectVendorId;             // the stock thp_config.ini's: 26 BOE, 4 CSOT; -1 not recorded
+  int32_t invertY;                     // -1 the panel's default, 0 / 1 the file's override
+};
+constexpr int32_t kUnits = 10, kCoordinateReduce = 25, kVendorBoe = 26, kVendorCsot = 4;
+
+// piano-thp's Calibration::validate: maxima in 1..32767, strictly increasing maps inside them, edge sanity.
+inline bool calibrationValid(const Calibration &c)
+{
+  if (!c.present) return false;
+  auto axis = [](const int32_t *map, unsigned n, int32_t maximum) {
+    if (maximum <= 0 || maximum > 32767) return false;
+    for (unsigned i = 0; i < n; ++i) {
+      if (map[i] < 0 || int64_t(map[i]) * kUnits >= maximum) return false;
+      if (i && map[i] <= map[i - 1]) return false;
+    }
+    return true;
+  };
+  return axis(c.rowMap, 40, c.rowMaximum) && axis(c.columnMap, 60, c.columnMaximum) && c.edgeBase > 0 && c.edgeSize > 0 &&
+         c.edgeGain >= 0 && int64_t(c.edgeSize) * 2 < (c.rowMaximum < c.columnMaximum ? c.rowMaximum : c.columnMaximum);
+}
+
+// piano-thp's mapEdgeAxis: within edge_size of either end the position is stretched toward that end.
+inline int32_t mapEdgeAxis(int32_t value, int32_t maximum, bool lowEdgeBias, const Calibration &c)
+{
+  if (value < c.edgeSize) {
+    int64_t mapped = int64_t(c.edgeGain) * (c.edgeSize - value) / c.edgeBase;
+    if (mapped > c.edgeSize - 1) mapped = c.edgeSize - 1;
+    return c.edgeSize - int32_t(mapped) - (lowEdgeBias ? 1 : 0);
+  }
+  const int32_t start = maximum - c.edgeSize;
+  if (value > start) {
+    int64_t mapped = int64_t(c.edgeGain) * (value - start) / c.edgeBase;
+    if (mapped > c.edgeSize - 1) mapped = c.edgeSize - 1;
+    return start + int32_t(mapped);
+  }
+  return value;
+}
+
+// piano-thp's domainContact over the 3 x 3 nodes around a peak at (r, c) of a 40 x 60 row-major delta matrix: the electrode
+// positions (pixels x 10) weighted by max(delta - 25, 0), rounded to the nearest unit; a peak at or below the offset gives its own
+// electrode. Before the edge mapping and the orientation.
+inline void calibratedCentroid(const Calibration &cal, const int32_t *delta, int32_t r, int32_t c, int32_t *x10, int32_t *y10)
+{
+  int64_t w = 0, sx = 0, sy = 0;
+  for (int32_t rr = r - 1; rr <= r + 1; ++rr)
+    for (int32_t cc = c - 1; cc <= c + 1; ++cc) {
+      if (rr < 0 || cc < 0 || rr >= 40 || cc >= 60 || delta[rr * 60 + cc] <= kCoordinateReduce) continue;
+      const int64_t k = delta[rr * 60 + cc] - kCoordinateReduce;
+      w += k;
+      sx += k * cal.columnMap[cc] * kUnits;
+      sy += k * cal.rowMap[rr] * kUnits;
+    }
+  if (!w) {
+    *x10 = cal.columnMap[c] * kUnits;
+    *y10 = cal.rowMap[r] * kUnits;
+    return;
+  }
+  const int64_t x = (2 * sx + w) / (2 * w), y = (2 * sy + w) / (2 * w);
+  *x10 = int32_t(x >= cal.columnMaximum ? cal.columnMaximum - 1 : x);
+  *y10 = int32_t(y >= cal.rowMaximum ? cal.rowMaximum - 1 : y);
+}
+
 struct MatrixConfig {
   int32_t threshold = 200, trackPx = 400;
-  bool flipX = false, flipY = true;
+  bool flipX = false, flipY = false;
+  const Calibration *cal = nullptr;   // used when present and valid, else the linear map
 };
 
 enum class Feed : uint8_t { badChecksum, skipped, learning, otherType, decoded };
@@ -40,6 +115,7 @@ struct Matrix {
   int32_t maxDelta = 0, peaks = 0;
   bool touching = false;
   int32_t x = 0, y = 0;            // panel pixels
+  bool calibrated = false;         // cfg.cal is used
   uint32_t frames = 0, badChecksum = 0, skipped = 0, otherType = 0;
   uint16_t lastFrameNo = 0;
 };
@@ -50,6 +126,7 @@ inline void matrixReset(Matrix &m, const MatrixConfig &cfg)
   for (size_t i = 0; i < sizeof m; ++i) p[i] = 0;
   m.cfg = cfg;
   m.refType = -1;
+  m.calibrated = cfg.cal && calibrationValid(*cfg.cal);
 }
 
 namespace detail {
@@ -63,16 +140,27 @@ inline void sort(int32_t *v, uint32_t n)
   }
 }
 struct Point {
-  int64_t x, y;   // 1/1024 node
+  int64_t x, y;     // 1/1024 node (the linear map)
   int32_t peak;
+  int32_t cx, cy;   // with a calibration: pixels x 10, before the edge mapping and the orientation
 };
+inline int32_t clampTo(int64_t v, int32_t size) { return int32_t(v < 0 ? 0 : v >= size ? size - 1 : v); }
 inline void toPanel(const Matrix &m, const Point &p, int32_t *x, int32_t *y)
 {
+  if (m.calibrated) {
+    const Calibration &c = *m.cfg.cal;
+    int32_t u = mapEdgeAxis(p.cx, c.columnMaximum, false, c), v = mapEdgeAxis(p.cy, c.rowMaximum, true, c);
+    if (m.cfg.flipX) u = c.columnMaximum - 1 - u;
+    if (m.cfg.flipY) v = c.rowMaximum - 1 - v;
+    *x = clampTo(u / kUnits, kPanelW);
+    *y = clampTo(v / kUnits, kPanelH);
+    return;
+  }
   int64_t u = p.x * kPanelW / (int64_t(m.cols) * 1024), v = p.y * kPanelH / (int64_t(m.rows) * 1024);
   if (m.cfg.flipX) u = kPanelW - u;
   if (m.cfg.flipY) v = kPanelH - v;
-  *x = int32_t(u < 0 ? 0 : u >= kPanelW ? kPanelW - 1 : u);
-  *y = int32_t(v < 0 ? 0 : v >= kPanelH ? kPanelH - 1 : v);
+  *x = clampTo(u, kPanelW);
+  *y = clampTo(v, kPanelH);
 }
 }  // namespace detail
 
@@ -95,7 +183,12 @@ inline Feed matrixFeed(Matrix &m, const uint8_t *p, uint32_t len)
   }
   if (int32_t(type) != m.refType) { ++m.otherType; return Feed::otherType; }
   if (!m.haveReference) {
-    if (!m.refCount) { m.rows = rows; m.cols = cols; m.nodes = nodes; }
+    if (!m.refCount) {
+      m.rows = rows;
+      m.cols = cols;
+      m.nodes = nodes;
+      if (rows != 40 || cols != 60) m.calibrated = false;   // the maps are piano's 40 x 60
+    }
     if (rows != m.rows || cols != m.cols) { ++m.skipped; return Feed::skipped; }
     for (uint32_t n = 0; n < nodes; ++n) m.samples[m.refCount][n] = int16_t(le16(p + 64 + n * 2));
     if (++m.refCount >= kRefFrames) {
@@ -155,7 +248,11 @@ inline Feed matrixFeed(Matrix &m, const uint8_t *p, uint32_t len)
           sx += int64_t(w) * (cc * 1024 + 512);
           sy += int64_t(w) * (rr * 1024 + 512);
         }
-      if (count < kMaxPoints && sw > 0) pts[count++] = Point{sx / sw, sy / sw, v};
+      if (count < kMaxPoints && sw > 0) {
+        Point pt{sx / sw, sy / sw, v, 0, 0};
+        if (m.calibrated) calibratedCentroid(*m.cfg.cal, m.delta, r, c, &pt.cx, &pt.cy);
+        pts[count++] = pt;
+      }
     }
   ++m.frames;
   m.peaks = int32_t(count);
@@ -183,6 +280,39 @@ inline Feed matrixFeed(Matrix &m, const uint8_t *p, uint32_t len)
   m.x = bestX;
   m.y = bestY;
   return Feed::decoded;
+}
+
+// ----------------------------------------------------------------------------------------------------------- orientation
+// piano-touch-flip: 0..3 explicit (bit 0 X, bit 1 Y); anything else is auto. Auto follows the panel (piano-thp orientation.hpp:
+// BOE as processor Y, CSOT reversed, X never flipped) or the calibration's invert_y. The panel for orientation is the calibration's
+// (project_vendor_id 26 BOE, 4 CSOT), else the gpio100 one, else CSOT (piano-thp's assumption without a panel report); the
+// firmware image always follows gpio100. mismatch: gpio100 and the calibration name different panels.
+enum : int { kPanelUnknown = -1, kPanelCsot = 0, kPanelBoe = 1 };
+struct Orientation {
+  bool flipX = false, flipY = false, mismatch = false;
+  int panel = kPanelCsot, calibrationPanel = kPanelUnknown;
+  const char *why = "";
+};
+inline const char *panelName(int panel) { return panel == kPanelBoe ? "BOE" : panel == kPanelCsot ? "CSOT" : "unknown"; }
+inline Orientation chooseOrientation(int gpioPanel, const Calibration *cal, uint32_t flipArg)
+{
+  Orientation o;
+  const bool valid = cal && calibrationValid(*cal);
+  if (valid) o.calibrationPanel = cal->projectVendorId == kVendorBoe ? kPanelBoe : cal->projectVendorId == kVendorCsot ? kPanelCsot : kPanelUnknown;
+  o.mismatch = gpioPanel != kPanelUnknown && o.calibrationPanel != kPanelUnknown && gpioPanel != o.calibrationPanel;
+  o.panel = o.calibrationPanel != kPanelUnknown ? o.calibrationPanel : gpioPanel != kPanelUnknown ? gpioPanel : kPanelCsot;
+  if (flipArg <= 3) {
+    o.flipX = flipArg & 1;
+    o.flipY = flipArg & 2;
+    o.why = "piano-touch-flip";
+  } else if (valid && cal->invertY >= 0) {
+    o.flipY = cal->invertY != 0;
+    o.why = "the calibration's invert_y";
+  } else {
+    o.flipY = o.panel != kPanelBoe;
+    o.why = o.panel == kPanelBoe ? "BOE panel: as processor Y" : "CSOT panel: Y reversed";
+  }
+  return o;
 }
 
 // ----------------------------------------------------------------------------------------------------------------- the tip
