@@ -20,6 +20,12 @@
 //  piano-gpu-hang-ms=<ms> (default 0: 2000): the time without progress the fence and recovery watchdogs call a hang (1000..60000).
 //  The session's GPU events (NativeAdrenoPublish.cpp: failed calls, refused opens, recoveries and their snapshot, page faults, the
 //  device lost, the clients) are printed as "PianoA830: gpu ..." through the same ring, whatever piano-gpu-trace says.
+//  2026-11-11 (docs/drivers/gpu.md "System suspend", "The LLCC island", "Ceiling slots"):
+//  - the LLCC ISLAND1 slice (PianoLlccIsland.h): read at the start of every GPU boot (read only), programmed with
+//    piano-llcc-island=1 at piano-gpu=2, asked through "piano-llcc-island-ready" / piano_a830_llcc_island_ready();
+//  - piano-gpu-suspend=1 (A830Suspend.h): in the power tree once the GPU runs; kOff powers it down (the full slumber), the platform
+//    sleep action lowers its host votes, the wake action puts them back, kOn wakes it;
+//  - "piano-gpu-ceiling" with one slot per caller (PianoGpuCeiling.h), the lowest wins; piano-gpu-ceiling-clients.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -38,9 +44,16 @@
 #include "Adreno830Device.h"
 #include "NativeAdrenoPublish.h"
 #include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOLocks.h>
 #include <kern/clock.h>
+#include <kern/thread_call.h>
 #define PIANO_SCM_LOCK_KERNEL 1
 #include <PianoScmLock.h>
+#include <PianoPowerContract.h>
+#include "A830Suspend.h"
+#include "A830PowerState.h"
+#include "PianoLlccIsland.h"
+#include "PianoGpuCeiling.h"
 
 extern "C" const Adreno830Board *piano_a830_board(void);
 
@@ -467,6 +480,11 @@ __attribute__((format(printf, 1, 2))) void gpuLine(const char *format, ...)
 }
 }  // namespace
 
+// The display's DDR floor level as the idle policy computed it (5 on piano): the suspend keeps it while the panel still scans.
+namespace {
+uint8_t gDisplayFloorLevel = 5;
+}  // namespace
+
 // The GPU's idle policy (adreno830/A830Idle.h):
 //   piano-gpu-idle=0|1|2 (default 1): 0 as before; 1 the DCVS floor (no wake boost, the idle window); 2 + the idle votes and slumber;
 //   piano-gpu-idle-ms=<ms> (1000, 100..60000): quiet this long -> the idle votes and slumber;
@@ -495,6 +513,7 @@ extern "C" void adreno830_board_idle(A830IdleConfig *config)
   const uint32_t asked = bootArg("piano-gpu-idle-ddr", 0xff);
   if (asked != 0xff && board && asked < board->ddr_levels) floor = uint8_t(asked);
   config->ddrLevel = floor;
+  gDisplayFloorLevel = floor;   // the system suspend's display floor too (A830Suspend.h)
   gpuLine("idle: piano-gpu-idle=%u (slumber %u, after %u ms); idle DDR level %u (%u MB/s; %ux%u scanout %u MB/s at 120 Hz), "
           "rails vlvl %#x", config->mode, config->mode >= 2 && config->slumber ? 1u : 0u, config->idleMs, floor,
           board && board->ddr_kbps && floor < board->ddr_levels ? board->ddr_kbps[floor] / 1000 : 0, width, height, scanout / 1000,
@@ -574,6 +593,338 @@ extern "C" void piano_a830_report(IOReturn result)
     if (s.rows[i][0]) piano_a830_note("row%u %.*s", i, int(Adreno830StatusRowBytes), s.rows[i]);
 }
 
+// ---- the LLCC island slice (PianoLlccIsland.h) -------------------------------------------------------------------------------------
+// Read at the start of every GPU boot (read only), programmed with piano-llcc-island=1 at piano-gpu=2, asked by others through
+// "piano-llcc-island-ready" (PianoPowerContract.h pianopower::llccIslandReady) and piano_a830_llcc_island_ready(). One uncached page per
+// register group, mapped by the starter thread only; the ready query maps nothing (it reads through the ATTR page or answers false).
+namespace {
+struct LlccPage {
+  uint64_t phys;
+  IOMemoryMap *map;
+  uintptr_t va;
+};
+LlccPage gLlccPages[6];
+uint32_t gLlccArmed;       // the ATTR page is mapped and its first reading done (release/acquire)
+uint8_t gIslandState;      // pianollcc::State of the last reading
+bool gIslandProgrammed;
+
+uintptr_t llccVa(uint64_t phys, bool mayMap)
+{
+  const uint64_t page = phys & ~0xfffull;
+  for (const LlccPage &p : gLlccPages)
+    if (p.va && p.phys == page) return p.va + uintptr_t(phys & 0xfff);
+  if (!mayMap) return 0;
+  for (LlccPage &p : gLlccPages)
+    if (!p.va) {
+      IODeviceMemory *memory = IODeviceMemory::withRange(page, 0x1000);
+      IOMemoryMap *map = memory ? memory->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+      if (memory) memory->release();
+      if (!map) return 0;
+      p = {page, map, uintptr_t(map->getVirtualAddress())};
+      return p.va + uintptr_t(phys & 0xfff);
+    }
+  return 0;
+}
+// context: non-null = the starter thread (may map); null = any context (mapped pages only).
+bool llccRead(void *context, pianollcc::Block block, uint32_t offset, uint32_t *value)
+{
+  const uintptr_t va = llccVa(pianollcc::kBlockPhys[block] + offset, context != nullptr);
+  if (!va) return false;
+  uint32_t v;
+  __asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(va) : "memory");
+  *value = v;
+  return true;
+}
+bool llccWrite(void *context, pianollcc::Block block, uint32_t offset, uint32_t value)
+{
+  const uintptr_t va = llccVa(pianollcc::kBlockPhys[block] + offset, context != nullptr);
+  if (!va) return false;
+  __asm__ volatile("str %w0, [%1]\n\tdsb sy" : : "r"(value), "r"(va) : "memory");
+  return true;
+}
+int gMayMap;
+const pianollcc::Io kLlccThread = {&gMayMap, llccRead, llccWrite};
+const pianollcc::Io kLlccAny = {nullptr, llccRead, llccWrite};
+
+void islandLine(const char *what, const pianollcc::Reading &r, pianollcc::State state)
+{
+  piano_a830_note("llcc: ISLAND1 (SCID 12) %s: ATTR0 %#x (0x26841300, expect 0x7fffffff) ATTR1 %#x (0x26841308, expect 0) ATTR2 %#x "
+                  "ATTR3 %#x; TRP_STATUS %#x (%s); hw-info %#x: %s", what, r.attr[0], r.attr[1], r.attr[2], r.attr[3], r.status,
+                  r.status & pianollcc::kActive ? "active" : "not active", r.hwInfo, pianollcc::stateName(state));
+}
+
+void islandPublish(IOService *service)
+{
+  if (!service) return;
+  const pianollcc::State s = pianollcc::State(gIslandState);
+  char text[64];
+  snprintf(text, sizeof text, "%s%s", pianollcc::stateName(s), gIslandProgrammed ? " (programmed by PianoA830)" : "");
+  service->setProperty("piano-llcc-island", text);
+}
+
+// The starter thread, after piano-gpu-delay and before the survey or the bring-up: the read-only line, then with
+// piano-llcc-island=1 (piano-gpu=2) the programming.
+void islandStart(IOService *service, unsigned level)
+{
+  piano_a830_note("llcc: reading the ISLAND1 slice, read only (0x26864000 hw-info, 0x26841300..0x26841314 ATTR0..3, 0x2680c004 status)");
+  const pianollcc::Reading r = pianollcc::read(kLlccThread);
+  pianollcc::State state = pianollcc::judge(r);
+  islandLine("as found", r, state);
+  gIslandState = uint8_t(state);
+  __atomic_store_n(&gLlccArmed, 1u, __ATOMIC_RELEASE);
+  const uint32_t want = bootArg("piano-llcc-island", 0);
+  if (want == 1 && level < 2) piano_a830_note("llcc: piano-llcc-island=1 needs piano-gpu=2 (piano-gpu=1 writes nothing): not programmed");
+  if (want == 1 && level >= 2) {
+    piano_a830_note("llcc: piano-llcc-island=1: reserving ISLAND1's ways (ATTR0 0x7fffffff, ATTR1 0; ATTR2/ATTR3 only where 0)");
+    const pianollcc::Program p = pianollcc::program(kLlccThread);
+    state = pianollcc::judge(p.after);
+    if (p.outcome == pianollcc::Outcome::programmed) gIslandProgrammed = true;
+    piano_a830_note("llcc: piano-llcc-island=1: %s; ATTR0 %#x (AND view %#x) ATTR1 %#x ATTR2 %#x%s ATTR3 %#x%s; %u writes, %u banks%s",
+                    pianollcc::outcomeName(p.outcome), p.after.attr[0], p.andAttr0, p.after.attr[1], p.after.attr[2],
+                    p.wroteAttr2 ? " (written)" : "", p.after.attr[3], p.wroteAttr3 ? " (written)" : "", p.writes, p.banks,
+                    p.outcome == pianollcc::Outcome::readbackFailed ? (p.restored ? "; restored as found" : "; NOT restored") : "");
+    if (p.outcome == pianollcc::Outcome::readbackFailed)
+      piano_a830_note("llcc: the first mismatch: +%#x read %#x, expected %#x (LLCC writes do not reach the slice here)", p.badOffset,
+                      p.badValue, p.badExpect);
+    gIslandState = uint8_t(state);
+  } else if (want > 1) {
+    piano_a830_note("llcc: piano-llcc-island=%u: unknown (1 programs); nothing written", want);
+  }
+  piano_a830_note("llcc: island %s", state == pianollcc::State::reserved ? "ready (reserved ways 0x7fffffff, no bonus ways)"
+                                                                         : "NOT ready: CX-off sleep must stay off (docs/power.md §3.6)");
+  islandPublish(service);
+}
+}  // namespace
+
+// For kexts linked after PianoA830 (their descriptors name it as a library) and the platform function: the two words read again.
+extern "C" bool piano_a830_llcc_island_ready(void)
+{
+  if (!__atomic_load_n(&gLlccArmed, __ATOMIC_ACQUIRE)) return false;
+  return pianollcc::ready(kLlccAny);
+}
+
+// ---- the GPU's ceiling slots (PianoGpuCeiling.h) ---------------------------------------------------------------------------------
+namespace {
+IOLock *gCeilingLock;
+pianogpu::CeilingSlots gCeiling;
+uint32_t gCeilingChanges;
+
+IOReturn ceilingSet(unsigned client, uint32_t khz)
+{
+  if (client >= pianogpu::kCeilingClients) return kIOReturnBadArgument;
+  if (gCeilingLock) IOLockLock(gCeilingLock);
+  bool changed = false;
+  gCeiling.set(client, khz, &changed);
+  const pianogpu::CeilingSlots now = gCeiling;
+  if (changed) adreno830_dcvs_set_ceiling(now.effective);
+  const uint32_t n = changed ? ++gCeilingChanges : 0;
+  if (gCeilingLock) IOLockUnlock(gCeilingLock);
+  if (changed && A830IdleLogged(n)) {
+    if (now.effective)
+      gpuLine("ceiling %u MHz (%s's; slots thermal %u, power profile %u, %u, %u MHz; the lowest wins; #%u)", now.effective / 1000,
+              pianogpu::ceilingClientName(now.holder()), now.khz[0] / 1000, now.khz[1] / 1000, now.khz[2] / 1000, now.khz[3] / 1000, n);
+    else
+      gpuLine("ceiling cleared (no slot holds one; #%u)", n);
+  }
+  return kIOReturnSuccess;
+}
+}  // namespace
+
+// ---- the system suspend (A830Suspend.h, piano-gpu-suspend=1) --------------------------------------------------------------------
+// kOff and kOn on a thread call (acknowledgeSetPowerState when done: the wait for quiet and a recovery can take seconds); the host
+// votes in the platform sleep and wake actions (IOPlatformSleepAction / IOPlatformWakeAction, installed from the service's properties:
+// IOCPUSleepKernel runs them after every driver's kOff and before any kOn). Lines through piano_a830_note: all of it is thread context
+// and the logger thread may not run again before the CPUs park.
+namespace {
+A830SuspendConfig gSuspendConfig;
+A830SuspendMachine gSuspend;
+IOService *gService;            // the PianoA830 instance
+IOService *gDpu;                // PianoDpu, looked up at kOff (retained until kOn)
+thread_call_t gPmCall;
+unsigned long gPmTarget;
+bool gJoined;
+uint32_t gStartDone;
+constexpr uint32_t kActionPriority = 100000;   // late in PreSleep, early in PostResume (the wake queue runs in reverse)
+constexpr uint32_t kPmBudgetUs = 10 * 1000 * 1000;
+
+const char *scanoutName(pianopower::Scanout s)
+{
+  return s == pianopower::Scanout::stopped ? "stopped" : s == pianopower::Scanout::running ? "running" : "unknown (running)";
+}
+
+void suspendPublish()
+{
+  if (!gService) return;
+  char text[160];
+  snprintf(text, sizeof text, "suspends %u, refused %u%s, votes down %u, vote failures %u, wakes %u (failed %u, over %u ms: %u), longest %u us",
+           gSuspend.suspends, gSuspend.refusals, gSuspend.blocked ? " (off for this boot)" : "", gSuspend.voteDowns,
+           gSuspend.voteFailures, gSuspend.wakes, gSuspend.wakeFailures, gSuspendConfig.wakeBoundMs, gSuspend.overBound,
+           gSuspend.maxWakeUs);
+  gService->setProperty("piano-gpu-suspend", text);
+}
+
+void suspendGpu()
+{
+  const unsigned n = gSuspend.suspends + gSuspend.refusals + 1;
+  if (!gSuspend.sleepWanted()) {
+    piano_a830_note("gpu suspend #%u: not taking part (%s): the GPU and its votes stay as they are", n,
+                    gSuspend.blocked ? "off for this boot after a failed entry" : "its votes are still down");
+    return;
+  }
+  if (gDpu) gDpu->release();
+  gDpu = IOService::copyMatchingService(IOService::serviceMatching("PianoDpu"));
+  A830SuspendReport r{};
+  const IOReturn result = adreno830_suspend_gpu(gSuspendConfig.idleWaitMs, &r);
+  uint8_t outcome = A830SuspendOk;
+  if (result == kIOReturnSuccess) outcome = A830SuspendOk;
+  else if (result == kIOReturnNotReady) outcome = A830SuspendOff;
+  else if (result == kIOReturnBusy) outcome = A830SuspendBusy;
+  else if (result == kIOReturnIOError) outcome = A830SuspendFailed;
+  else outcome = r.powerPhase == A830PowerLost ? A830SuspendLost : A830SuspendBusy;   // still being recovered after the wait
+  gSuspend.sleepDone(outcome);
+  switch (outcome) {
+  case A830SuspendOk:
+    piano_a830_note("gpu suspend #%u: GPU down in %u.%03u ms (quiet after %u us; %s; %s): submissions wait for the resume", n,
+                    r.waitedUs / 1000, r.waitedUs % 1000, r.waitedUs - r.entryUs,
+                    r.alreadyAsleep ? "already in its full slumber" : "full slumber entered",
+                    r.cxCollapsed || r.alreadyAsleep ? "CX GDSC collapsed" : "CX STILL ON: another voter keeps the GDSC");
+    break;
+  case A830SuspendOff:
+    piano_a830_note("gpu suspend #%u: not taking part (the GPU is not running): its votes stay as they are", n);
+    break;
+  case A830SuspendBusy:
+    piano_a830_note("gpu suspend #%u: REFUSED: still busy after %u ms (work in flight, a holder or a recovery): the GPU stays up as it "
+                    "was, its votes too; the suspend goes on without the GPU's share", n, gSuspendConfig.idleWaitMs);
+    break;
+  case A830SuspendLost:
+    piano_a830_note("gpu suspend #%u: REFUSED: the GPU is lost: nothing of it is touched, its votes stay", n);
+    break;
+  default: {
+    // The recovery has the GPU: wait for it here, so the suspend never freezes a GPU half down.
+    uint32_t waited = 0;
+    A830PowerState *power = adreno830_power_state();
+    while (power && waited < 3000 && power->phase() != A830PowerActive && power->phase() != A830PowerLost) {
+      IOSleep(10);
+      waited += 10;
+    }
+    const A830PowerPhase phase = power ? power->phase() : A830PowerLost;
+    piano_a830_note("gpu suspend #%u: REFUSED: the slumber entry failed; the recovery %s after %u ms; no GPU suspend for the rest of the "
+                    "boot; the suspend goes on without the GPU's share", n, phase == A830PowerActive ? "brought it back" :
+                    phase == A830PowerLost ? "lost it" : "is STILL RUNNING", waited);
+    break;
+  }
+  }
+  suspendPublish();
+}
+
+void votesDown()
+{
+  if (!gSuspend.votesDownWanted()) return;
+  pianopower::Scanout scanout = pianopower::displayScanout(gDpu);
+  // PianoDpu's panel sleep runs on its own thread after the display went off: give it displayWaitMs to finish.
+  uint32_t waited = 0;
+  while (gDpu && scanout == pianopower::Scanout::running && waited < gSuspendConfig.displayWaitMs) {
+    IOSleep(10);
+    waited += 10;
+    scanout = pianopower::displayScanout(gDpu);
+  }
+  A830SuspendReport r{};
+  const IOReturn result = adreno830_suspend_votes(uint8_t(scanout), &gSuspendConfig, &r);
+  gSuspend.votesDownDone(result == kIOReturnSuccess);
+  if (result == kIOReturnSuccess)
+    piano_a830_note("gpu suspend: votes down in %u us (scanout %s%s): DDR %u -> %u MB/s%s, CX %#x -> %#x, MX %#x -> %#x%s", r.votesUs,
+                    scanoutName(scanout), waited ? " after waiting for the panel" : "", r.ddrBefore / 1000, r.ddrAfter / 1000,
+                    r.ddrAfter ? " (the display's floor)" : " (keepalive minimum)", r.cxBefore, r.cxAfter, r.mxBefore, r.mxAfter,
+                    r.cxAfter ? "" : " (the rails' votes gone)");
+  else
+    piano_a830_note("gpu suspend: votes NOT lowered (rpmh %d, %#x): put back as they were; the GPU stays down", r.rpmh, unsigned(result));
+  suspendPublish();
+}
+
+void votesUp(const char *where)
+{
+  if (!gSuspend.votesUpWanted()) return;
+  A830SuspendReport r{};
+  const IOReturn result = adreno830_resume_votes(&r);
+  gSuspend.votesUpDone(result == kIOReturnSuccess);
+  if (result == kIOReturnSuccess)
+    piano_a830_note("gpu resume: votes back in %u us (%s): CX %#x MX %#x, DDR %u MB/s", r.votesUs, where, r.cxAfter, r.mxAfter,
+                    r.ddrAfter / 1000);
+  else
+    piano_a830_note("gpu resume: votes NOT back (%s, rpmh %d): %s", where, r.rpmh,
+                    strcmp(where, "kOn") ? "kOn tries again" : "the GPU stays asleep (its gate shut) until a later kOn");
+  suspendPublish();
+}
+
+void resumeGpu()
+{
+  votesUp("kOn");
+  if (gSuspend.votesUpWanted() || !gSuspend.wakeWanted()) {
+    suspendPublish();
+    return;
+  }
+  A830SuspendReport r{};
+  const IOReturn result = adreno830_resume_gpu(gSuspendConfig.eagerWake, &r);
+  gSuspend.wakeDone(result == kIOReturnSuccess, r.wakeUs, gSuspendConfig.eagerWake ? gSuspendConfig.wakeBoundMs : 0);
+  if (result != kIOReturnSuccess)
+    piano_a830_note("gpu resume #%u: the WAKE FAILED (%#x): the recovery has the GPU", gSuspend.wakes + gSuspend.wakeFailures, unsigned(result));
+  else if (gSuspendConfig.eagerWake)
+    piano_a830_note("gpu resume #%u: GPU awake in %u.%03u ms (%s the %u ms bound): the first frame waits for nothing", gSuspend.wakes,
+                    r.wakeUs / 1000, r.wakeUs % 1000, r.wakeUs > gSuspendConfig.wakeBoundMs * 1000 ? "OVER" : "within",
+                    gSuspendConfig.wakeBoundMs);
+  else
+    piano_a830_note("gpu resume #%u: the gate open, the GPU left asleep (piano-gpu-suspend-wake=0): the first submission wakes it",
+                    gSuspend.wakes);
+  if (gDpu) {
+    gDpu->release();
+    gDpu = nullptr;
+  }
+  suspendPublish();
+}
+
+void pmWork(thread_call_param_t, thread_call_param_t)
+{
+  if (gPmTarget == pianopower::kOff) suspendGpu();
+  else resumeGpu();
+  if (gService) gService->acknowledgeSetPowerState();
+}
+
+void suspendConfigure(unsigned level)
+{
+  A830SuspendConfig &c = gSuspendConfig;
+  c = A830SuspendConfig{};
+  c.enabled = level >= 2 && bootArg("piano-gpu-suspend", 0) == 1;
+  const uint32_t idle = bootArg("piano-gpu-suspend-idle-ms", 500);
+  c.idleWaitMs = idle < 50 ? 50 : idle > 2000 ? 2000 : idle;
+  c.railVlvl = bootArg("piano-gpu-suspend-rails", 0x140);
+  c.eagerWake = bootArg("piano-gpu-suspend-wake", 1) != 0;
+  const uint32_t bound = bootArg("piano-gpu-suspend-wake-ms", 100);
+  c.wakeBoundMs = bound < 1 ? 1 : bound > 10000 ? 10000 : bound;
+  const uint32_t display = bootArg("piano-gpu-suspend-display-ms", 300);
+  c.displayWaitMs = display > 2000 ? 2000 : display;
+}
+
+// The starter thread, once the GPU runs: into the power tree (the contract's two states), so IOPMrootDomain takes the GPU down
+// before a system sleep and up after it.
+void suspendJoin()
+{
+  if (!gSuspendConfig.enabled || !gService || gJoined) return;
+  for (unsigned i = 0; i < 500 && !__atomic_load_n(&gStartDone, __ATOMIC_ACQUIRE); ++i) IOSleep(10);   // start() returned
+  gSuspendConfig.ddrFloorLevel = gDisplayFloorLevel;
+  gPmCall = thread_call_allocate_with_options(pmWork, nullptr, THREAD_CALL_PRIORITY_KERNEL_HIGH, 0);
+  gJoined = true;
+  const IOReturn r = pianopower::join(gService);
+  piano_a830_note("gpu suspend: piano-gpu-suspend=1: %s the power tree (%#x): kOff waits up to %u ms for quiet, then the full slumber; "
+                  "PreSleep: DDR to the keepalive minimum (the display's floor, level %u, while it scans), CX/MX to %#x%s; PostResume "
+                  "puts them back; kOn %s (bound %u ms)", r == kIOReturnSuccess ? "joined" : "COULD NOT JOIN", unsigned(r),
+                  gSuspendConfig.idleWaitMs, gSuspendConfig.ddrFloorLevel, gSuspendConfig.railVlvl,
+                  gSuspendConfig.railVlvl ? " (at least NOM_L1 while the panel scans)" : " (the votes gone; NOM_L1 while the panel scans)",
+                  gSuspendConfig.eagerWake ? "wakes the GPU" : "opens the gate (the first submission wakes it)", gSuspendConfig.wakeBoundMs);
+  if (r != kIOReturnSuccess) gJoined = false;
+  suspendPublish();
+}
+}  // namespace
+
 // ---- the starter ------------------------------------------------------------------------------------------------------------------
 namespace {
 void run(void *, wait_result_t)
@@ -586,6 +937,9 @@ void run(void *, wait_result_t)
     piano_a830_note("piano-gpu-delay=%u: waiting %u s before the %s", delay, delay, gLevel == 1 ? "survey" : "bring-up");
     IOSleep(delay * 1000);
   }
+  // The LLCC island first (read only at any GPU boot; piano-llcc-island=1 programs it at piano-gpu=2), after the delay like
+  // everything of the GPU's, so a fault there does not stop the boot before its root.
+  islandStart(gService, gLevel);
   const uint32_t defaultMask = gLevel == 1 ? uint32_t(PianoA830SurveyDefault) : 0u;
   const uint32_t mask = bootArg("piano-gpu-survey", defaultMask);
   if (gLevel == 1) {
@@ -612,6 +966,8 @@ void run(void *, wait_result_t)
   runPhase(RunReport);
   piano_a830_report(result);
   piano_a830_note("bring-up %s", adreno830_running() ? "done: the GPU runs" : result == kIOReturnSuccess ? "stopped (piano-gpu-stop)" : "failed");
+  if (adreno830_running()) suspendJoin();   // piano-gpu-suspend=1: the GPU's part of a system sleep (A830Suspend.h)
+  else if (gSuspendConfig.enabled) piano_a830_note("gpu suspend: piano-gpu-suspend=1 but the GPU does not run: not in the power tree");
   // Where the GPU-side streams go, once S3 programmed the SMMU, and again once the session's Metal clients are up. Only while the GPU
   // stays on: piano-gpu-slumber would collapse CX, and an unclocked SMMU read can hang the bus.
   const Adreno830Board *board = piano_a830_board();
@@ -641,8 +997,10 @@ class PianoA830 : public IOService {
 public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  IOReturn setPowerState(unsigned long state, IOService *device) override;
   IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3,
                                 void *param4) override;
+  using IOService::callPlatformFunction;
 };
 
 OSDefineMetaClassAndStructors(PianoA830, IOService)
@@ -669,6 +1027,15 @@ bool PianoA830::start(IOService *provider)
   gTraceSync = gLevel >= 2 && traceArg == 3;   // the driver gets 1 (PianoA830Board.cpp)
   nanoseconds_to_absolutetime(10ull * 1000000000ull, &gRowEvery);
   setProperty("piano-gpu", gLevel, 32);
+  gService = this;
+  gCeilingLock = IOLockAlloc();
+  setProperty("piano-gpu-ceiling-clients", pianogpu::kCeilingClients, 32);   // docs/policy.md §5.3: one slot per caller
+  suspendConfigure(gLevel);
+  if (gSuspendConfig.enabled) {
+    // The platform sleep and wake actions (the host votes): installed from these properties when start() returns.
+    setProperty("IOPlatformSleepAction", kActionPriority, 32);
+    setProperty("IOPlatformWakeAction", kActionPriority, 32);
+  }
   piano_a830_note("start: piano-gpu=%u (A830 chip %#x, k27 native kext, polled)", gLevel, 0x44050001u);
   if (gTraceSync) {
     gRing.stamp = static_cast<uint64_t *>(IOMallocZero(size_t(RingLines) * sizeof(uint64_t)));
@@ -701,8 +1068,26 @@ bool PianoA830::start(IOService *provider)
     return true;
   }
   thread_deallocate(thread);
-  if (gLevel >= 2) registerService();   // for the display's fence lookup (callPlatformFunction below)
+  // For the display's fence lookup, the thermal and power-profile ceilings and the LLCC island query (callPlatformFunction below).
+  // At piano-gpu=1 too since 2026-11-11 (the island query): the fences answer NotReady and a ceiling waits for a DCVS that never starts.
+  registerService();
+  __atomic_store_n(&gStartDone, 1u, __ATOMIC_RELEASE);
   return true;
+}
+
+// The contract's two states (PianoPowerContract.h), only once the GPU runs and piano-gpu-suspend=1 (suspendJoin): the work on a
+// thread call, acknowledged when done.
+IOReturn PianoA830::setPowerState(unsigned long state, IOService *)
+{
+  if (!gJoined) return pianopower::kAckNow;
+  gPmTarget = state;
+  if (gPmCall) {
+    thread_call_enter(gPmCall);   // (one already queued takes the new target: IOPM never overlaps two changes of one driver)
+    return kPmBudgetUs;
+  }
+  if (state == pianopower::kOff) suspendGpu();
+  else resumeGpu();
+  return pianopower::kAckNow;
 }
 
 IOReturn PianoA830::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3,
@@ -712,20 +1097,26 @@ IOReturn PianoA830::callPlatformFunction(const OSSymbol *functionName, bool wait
     if (!param1 || !param2) return kIOReturnBadArgument;
     return native_adreno_fences(static_cast<uint32_t *>(param1), static_cast<uint32_t *>(param2)) ? kIOReturnSuccess : kIOReturnNotReady;
   }
-  // PianoThermal's passive trip (docs/drivers/thermal.md §10.5), later macOS Low Power Mode (BACKLOG B5): a reversible DCVS ceiling,
-  // param1 = kHz, 0 clears (adreno830_dcvs_set_ceiling; one set before S10 applies when the DCVS starts). A line per change, the first
-  // 8 then every 10th, 100th, ...
-  if (functionName && functionName->isEqualTo("piano-gpu-ceiling")) {
-    const uint32_t khz = uint32_t(uintptr_t(param1));
-    static uint32_t last = 0, changes = 0;
-    if (__atomic_exchange_n(&last, khz, __ATOMIC_ACQ_REL) != khz) {
-      adreno830_dcvs_set_ceiling(khz);
-      const uint32_t n = __atomic_add_fetch(&changes, 1u, __ATOMIC_ACQ_REL);
-      if (A830IdleLogged(n)) {
-        if (khz) gpuLine("ceiling %u MHz (an external limit: thermal, power mode; #%u)", khz / 1000, n);
-        else gpuLine("ceiling cleared (#%u)", n);
-      }
-    }
+  // PianoThermal's passive trip (docs/drivers/thermal.md §10.5) and the power profile (PianoPolicy, docs/policy.md §5.3): a reversible
+  // DCVS ceiling, param1 = kHz (0 clears), param2 = the caller's slot (null: 0, thermal; 1 the power profile; 2..3 free). The lowest
+  // non-zero slot is the ceiling (PianoGpuCeiling.h, adreno830_dcvs_set_ceiling; one set before S10 applies when the DCVS starts). A line
+  // per change of the ceiling in force, the first 8 then every 10th, 100th, ...
+  if (functionName && functionName->isEqualTo("piano-gpu-ceiling"))
+    return ceilingSet(unsigned(uintptr_t(param2)), uint32_t(uintptr_t(param1)));
+  // The LLCC island (PianoPowerContract.h pianopower::llccIslandReady): param1 = bool *, the two words read again. Any thread.
+  if (functionName && functionName->isEqualTo("piano-llcc-island-ready")) {
+    if (!param1) return kIOReturnBadArgument;
+    if (!__atomic_load_n(&gLlccArmed, __ATOMIC_ACQUIRE)) return kIOReturnNotReady;
+    *static_cast<bool *>(param1) = piano_a830_llcc_island_ready();
+    return kIOReturnSuccess;
+  }
+  // The system suspend's host votes (piano-gpu-suspend=1): IOCPUSleepKernel's PreSleep and PostResume platform actions.
+  if (functionName && functionName->isEqualTo("IOPlatformSleepAction")) {
+    if (gJoined) votesDown();
+    return kIOReturnSuccess;
+  }
+  if (functionName && functionName->isEqualTo("IOPlatformWakeAction")) {
+    if (gJoined) votesUp("PostResume");
     return kIOReturnSuccess;
   }
   return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);

@@ -16,6 +16,7 @@ reported as KNOWN and not as failures:
   test_userclient (ADRENO830_MACOS pass only): asserts iPadOS's process names in the client lists; the macOS lists get their own
       structural check instead (macos_lists below: every entry matches as proc_selfname gives it, at 16 and 19 characters; the large
       list is part of the grant list; WindowServer is granted and is not a large client; iPadOS's names are absent).
+Then the board's own portable tests (package/PianoA830/board/tests: the LLCC island slice, the GPU ceiling slots).
 Exit 1 on any other failure.
 """
 import argparse
@@ -167,6 +168,24 @@ def macos_lists(root, out, name='macos_lists', text=MACOS_LISTS):
     return ran.returncode == 0, ran.stdout.strip()
 
 
+def board_tests(out):
+    """The board's portable pieces (package/PianoA830/board/tests/test_*.cpp: the LLCC island, the ceiling slots), each built with
+    ASan/UBSan against the board headers alone and run; each prints its PASS line."""
+    results = []
+    out.mkdir(parents=True, exist_ok=True)
+    for source in sorted((PACKAGE / 'board/tests').glob('test_*.cpp')):
+        binary = out / source.stem
+        command = ['xcrun', 'clang++', '-std=c++20', '-O1', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
+                   '-I', str(PACKAGE / 'board'), str(source), '-o', str(binary)]
+        built = subprocess.run(command, capture_output=True, text=True)
+        if built.returncode:
+            results.append((source.stem, False, built.stderr[-2000:]))
+            continue
+        ran = subprocess.run([str(binary)], capture_output=True, text=True)
+        results.append((source.stem, ran.returncode == 0 and ran.stdout.startswith('PASS'), (ran.stdout + ran.stderr).strip()))
+    return results
+
+
 def stage(out, adreno_firmware):
     src = out / 'src'
     shutil.rmtree(src, ignore_errors=True)
@@ -220,6 +239,10 @@ def main():
             bad += 0 if ok else 1
             ok, text = macos_lists(root, args.out, 'macos_events', MACOS_EVENTS)
             print(f'macos_events: {text}')
+            bad += 0 if ok else 1
+    if not args.names:
+        for name, ok, text in board_tests(args.out / 'board'):
+            print(f'board {name}: {text}' if ok else f'FAIL board {name}: {text}')
             bad += 0 if ok else 1
     return 1 if bad else 0
 
