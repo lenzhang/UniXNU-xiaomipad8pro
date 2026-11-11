@@ -247,6 +247,27 @@ seed): the race of 2026-11-11 reproduced. A slow GPU (frames of 30-90 ms against
 no frame in progress is ever read, and the finished frame ends on the panel. Flip mode never leaves a flipped frame on the panel while a
 cursor is on it.
 
+**The next attended run** (the desktop run of gpu-userspace.md, "The next desktop run (2026-11-12)": no argument of this
+section is needed, all is default):
+
+```sh
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=1200 \
+PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-power=1 piano-keyboard=2 piano-keyboard-gestures=1 piano-backlight=2 piano-backlight-keys=1 exec-log=1 stderr-log=1 piano-gpu-hang-ms=10000" \
+  tooling/k27/build-native-image.sh && rm -rf out/ram-attend5 && cp -R out/ram out/ram-attend5
+tooling/native/native-loop.sh out/ram-attend5/boot-piano-macos-ram-A-bundled.img
+```
+
+What the owner should see: the pointer at the login screen (an arrow over the wallpaper; it follows the cover's touchpad and
+the click lands under its tip, so the password field can be clicked); typing the password without the screen flickering and
+without white bands; the login transition without a garbled phase (a frame the GPU has not finished stays off the panel, so a
+slow frame shows as a short pause, not as bands). The console: `composition: ...` once, `layer 1: 128x128 'BGRA' at (X, Y) ...:
+the cursor, blended ...`, `cursor: surface 128x128, glyph ..., hot spot (HX, HY) ...` (record the hot spot and whether clicks
+land under the tip), in each 10 s block `cursor: N updates ... mean N us` (expected well under 1 ms), `N swaps completed once the
+copy thread was done ..., mean N us` (about one copy, ~20-40 ms), the fence line's `0 gave up after 1000 ms`, and `jobs left undrawn` only
+if the GPU stalled. If the pointer is off by a fixed offset, its hot spot is the likely amount (risk 9); drawn only in part:
+`native-gop-display-cursor=2`; the desktop at about 10 frames a second: `native-gop-display-defer=1`, then `=0` (risk 10), each
+added to `PIANO_EXTRA_ARGS`.
+
 ## 6. Risks
 
 1. **WindowServer needs a Metal device. Natively there is none, and this blocks the desktop, not the display.** In the

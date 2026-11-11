@@ -500,4 +500,9 @@ The new Turnip makes a new seed identity: a `data-persist=2` store of another se
 store guard does). What to look for: `board: BO pool 2048 MiB` (or `1024` if S3 had to halve it), no `gpu call failed: ... BoMap`;
 if one comes, the `gpu BoMap refused ...` line after it names the limit or the argument; the `gpu va/map` lines' ranges and each
 window's `pk` against its size, at the login screen and as apps open; in the processes that had slot 5, a `TU: error: NativeAdreno:
-this device's GPU window ...` note at most, and a device; NativeGopDisplay's `N gave up after 50 ms` (the flicker's source, gpu.md §8).
+this device's GPU window ...` note at most, and a device. The display (native-gop-display.md §5a, since 2026-11-12): the pointer drawn
+(`layer 1: 128x128 'BGRA' at ...: the cursor, blended ...`, `cursor: surface 128x128, glyph ..., hot spot ...`, and in the 10 s block
+`cursor: N updates of its old and new rectangles ...`), no flicker or white bands while typing at the login, and the clicks landing
+under the pointer's tip; `0 gave up after 1000 ms` in the fence line, and if a `jobs left undrawn` line comes, its count (each was a
+frame the GPU had not finished: the previous one stayed). Fallbacks, added to `PIANO_EXTRA_ARGS`: `native-gop-display-cursor=2`
+(the pointer drawn in part or with a frame around it), `native-gop-display-defer=1` (the desktop slow, about 10 frames a second).

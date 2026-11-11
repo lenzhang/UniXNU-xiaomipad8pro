@@ -137,7 +137,10 @@ IOMFB's IOSurface fences do not see the A830's work. `native_adreno_fences(submi
 gives the newest fence handed out and the newest the CP wrote. NativeGopDisplay finds PianoA830's registered service by class and asks
 it with `callPlatformFunction("native-adreno-fences")` (no link dependency either way: the KC resolves a native kext's imports only
 from natives linked before it): a swap records the newest fence handed out when it is programmed, and its copy waits until the GPU
-retired it, at most 50 ms (then it copies anyway); `native-gop-display-gpu-fence=0` turns it off. Its 10 s line reports the waits.
+retired it; since 2026-11-12 a frame the GPU has not finished is never copied (the previous one stays; after the hang guard,
+`native-gop-display-gpu-fence-ms`, 1000 ms, the swap completes and the ticks retry), and a swap completes only once its copy is done
+(native-gop-display.md §5a; before: at most 50 ms, then copied anyway); `native-gop-display-gpu-fence=0` turns it off. Its 10 s line
+reports the waits.
 
 **The session's GPU events (2026-11-11).** Besides the status rows (since then at most every 10 s once the GPU runs, at once when row
 0's state, fault or hang count changes) and the minute's meter line, the publish shell prints `PianoA830: gpu ...` lines whatever
@@ -379,7 +382,11 @@ bands in a sysmem render pass that draws top to bottom. The ring is in order, so
 wallpaper's decoder, an app) and the frames run at 160-342 MHz (the annibale ceiling). From the GPU side the fix belongs to the copy:
 never show a frame whose fence has not passed (keep the previous one and copy at the next tick, or wait longer), and hand a swap's
 surface back to WindowServer only after its copy (a buffer re-rendered while it is being read gives the same bands). Faster frames
-help too: GMEM rendering (`piano-tu-debug=none`, gpu-userspace.md) and a higher ceiling once thermals allow.
+help too: GMEM rendering (`piano-tu-debug=none`, gpu-userspace.md) and a higher ceiling once thermals allow. Done on the copy side
+(2026-11-12, native-gop-display.md §5a): a job is drawn only once its swap's fence passed (the hang guard is 1000 ms; a job still
+unfinished then is left undrawn and the ticks retry: `the GPU had not finished a frame after 1000 ms ...`), and a swap completes only
+once its own job is done (`native-gop-display-defer=2`), so a surface goes back to WindowServer only after the copy of the frame that
+replaced it.
 
 ## 9. Fallback
 
