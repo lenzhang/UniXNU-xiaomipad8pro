@@ -1,0 +1,6 @@
+build-native-kext.py, NativeKextGlue.cpp: macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM) 11ac316b789d81fc9f734e15645456f536c05141,
+scripts/build-native-kext.py and overlay/kext/NativeKextGlue.cpp, BSD-2-Clause-Patent.
+  NativeKextGlue.cpp: unchanged.
+  build-native-kext.py: the k27 tree from PIANO_K27_TREE (k27_tree.py) instead of the script's own tree; objects in this repository's
+  out/native-kexts/NAME (--out) instead of the tree's out/x12377/native-kexts; the default object tree k27-native-obj; package/include
+  on every include path.

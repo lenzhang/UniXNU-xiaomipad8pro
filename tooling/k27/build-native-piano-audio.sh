@@ -10,11 +10,11 @@
 # Then the import check (PianoPower's client functions, package/include/PianoAdspContract.h, are the library imports) and
 # tooling/k27/check-audio2-family.py: IOAudio2Family's classes in the KC base, which the macOS devices are linked under at run time.
 # No firmware, amplifier preset or topology is needed or read.
-#   environment: K27_TREE (the k27 build tree, read only: its compile recipes, its KC base), K27_OBJ (default k27-native-obj), CC/CXX
+#   environment: PIANO_K27_TREE (the k27 tree, read only: its compile recipes, its KC base), K27_OBJ (default k27-native-obj), CC/CXX
 #                (host compilers for the tests, default cc/c++), K27_KERNEL (for the import check; skipped when absent), KC_BASE
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
-K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
+. "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 P=$D/package/PianoAudio; O=$D/out/native-kexts/PianoAudio; T=$O/host-tests
 mkdir -p "$T"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/audio_host.cpp" -o "$T/audio_host"

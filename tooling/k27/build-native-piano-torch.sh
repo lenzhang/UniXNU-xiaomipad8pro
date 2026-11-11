@@ -5,12 +5,12 @@
 # headers, then the objects in out/native-kexts/PianoTorch for tooling/k27/kext/PianoTorch.json, and on a Mac the user-space tool
 # (tooling/native/piano-torch) compiled for the host as a build check. Inert without the boot argument piano-torch
 # (docs/drivers/torch.md). PianoPower's SPMI observer header is included, not copied.
-#   environment: K27_TREE (the k27 build tree, read only: its compile recipes), K27_OBJ (default k27-native-obj), CXX (host compiler
+#   environment: PIANO_K27_TREE (the k27 tree, read only: its compile recipes), K27_OBJ (default k27-native-obj), CXX (host compiler
 #                for the tests, default c++), CC (host compiler for the tool, default cc), K27_KERNEL (for the import check; skipped
 #                when absent)
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
-K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
+. "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 P=$D/package/PianoTorch; O=$D/out/native-kexts/PianoTorch
 INC=(-I "$P" -I "$D/package/PianoPower")
 mkdir -p "$O/host-tests"

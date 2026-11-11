@@ -3,12 +3,12 @@
 # keyboard/pointer HID devices, with piano-usb-net=1 the CDC-NCM network function and its PianoUsbNet Ethernet controller;
 # docs/drivers/usb-device-debug.md) as a k27 native kext: the host tests first (package/PianoDwc3/tests/run.sh), then the objects in
 # out/native-kexts/PianoDwc3 for tooling/k27/kext/PianoDwc3.json. Inert without the boot argument piano-usb.
-#   environment: K27_TREE (the k27 build tree, read only: compile recipes, out/x12377/inc-hid, the IOKit/hid headers PianoInput and
+#   environment: PIANO_K27_TREE (the k27 tree, read only: compile recipes, out/x12377/inc-hid, the IOKit/hid headers PianoInput and
 #                PianoKeyboard build with, and out/x12377/inc-net-piano, the IOKit/network headers PianoNullEthernet builds with),
 #                K27_OBJ (default k27-native-obj), K27_KERNEL (for the import check)
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
-K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
+. "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 HID=$K/out/x12377/inc-hid NET=$K/out/x12377/inc-net-piano
 [ -f "$HID/IOKit/hid/IOHIDDevice.h" ] || { echo "Error: no IOKit/hid headers at $HID" >&2; exit 1; }
 [ -f "$NET/IOKit/network/IOEthernetController.h" ] || { echo "Error: no IOKit/network headers at $NET" >&2; exit 1; }

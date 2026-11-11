@@ -10,25 +10,26 @@
 # and its CDHashes into a trust cache; tooling/k27/build-native-image.sh does both by itself when PianoA830 is linked.
 #
 # Inputs, all read only (nothing is written outside out/turnip-a830):
-#   - Mesa: the VM's work tree $TURNIP_TREE/.cache/mesa-work (Droid-VM/mesa cecc0e9 + UniXNU-turnip's 21 patches/mesa + macOS-DroidVM's
-#     patches/mesa-macos), copied to out/turnip-a830/mesa, then tooling/metal/turnip-a830/mesa/*.patch;
+#   - Mesa: the VM-era work tree $TURNIP_TREE/.cache/mesa-work (Mesa cecc0e9 + UniXNU-turnip's 21 patches/mesa + the k27 tree's
+#     patches/mesa-macos; tooling/metal/UPSTREAM), copied to out/turnip-a830/mesa, then tooling/metal/turnip-a830/mesa/*.patch;
 #   - the ABI: package/PianoA830/NativeAdrenoABI.h when the kernel side has it, else $ADRENO830_TREE/NativeAdrenoABI.h, plus
 #     tooling/metal/turnip-a830/NativeAdrenoABICompat.h for the one v1/Adreno740 name the backend uses and v2 lacks;
-#   - the plugin: $K27_TREE/overlay/metal/NativeAdrenoMetalPlugin.mm, the frontend $TURNIP_TREE/drivers/AdrenoMetal through
-#     $K27_TREE/scripts/piano-frontend-patch.py and then tooling/metal/turnip-a830/frontend/*.patch (2026-11-11: the console after a
-#     login; with them the plugin is linked here, no longer the VM's binary), the prebuilt bridge $K27_TREE/out/metal/bridge/libnative_metal_bridge.a (metal2vulkan,
-#     GPL-2.0+/LGPL-3.0+, built on the private build host by $K27_TREE/scripts/build-metal-bridge-macos.py), as $K27_TREE/build-metal-plugin-piano.sh;
+#   - the plugin: $PIANO_K27_TREE/overlay/metal/NativeAdrenoMetalPlugin.mm, the frontend $TURNIP_TREE/drivers/AdrenoMetal through
+#     $PIANO_K27_TREE/scripts/piano-frontend-patch.py and then tooling/metal/turnip-a830/frontend/*.patch (2026-11-11: the console after a
+#     login; with them the plugin is linked here, no longer the VM's binary), the prebuilt bridge $PIANO_K27_TREE/out/metal/bridge/libnative_metal_bridge.a (metal2vulkan,
+#     GPL-2.0+/LGPL-3.0+, built on the private build host by $PIANO_K27_TREE/scripts/build-metal-bridge-macos.py), as $PIANO_K27_TREE/build-metal-plugin-piano.sh;
 #   - $TURNIP_TREE/scripts/macho-weak-self-binds.py (dyld's flat lookups of Mesa's weak entry points).
 # Provenance and licences: tooling/metal/UPSTREAM.
 #
-#   environment: DEVELOPER_DIR (default /Applications/Xcode.app/Contents/Developer), K27_TREE, TURNIP_TREE, ADRENO830_TREE,
+#   environment: DEVELOPER_DIR (default /Applications/Xcode.app/Contents/Developer), PIANO_K27_TREE (tooling/k27/k27-tree.sh),
+#                TURNIP_TREE (default: UniXNU-turnip next to the k27 tree), ADRENO830_TREE,
 #                PIANO_A830_ABI (another NativeAdrenoABI.h), PYTHON315 (the venv's interpreter), JOBS (ninja -j)
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
 export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
 H=$HOME/Downloads/XiaomiPad8Pro-Ubuntu
-K=${K27_TREE:-$H/droidvm-build/macOS-DroidVM}
-T=${TURNIP_TREE:-$H/droidvm-build/UniXNU-turnip}
+. "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
+T=${TURNIP_TREE:-$(dirname "$K")/UniXNU-turnip}   # default: the UniXNU-turnip checkout next to the k27 tree
 A=${ADRENO830_TREE:-$H/unixnu-research/Adreno830}
 P=$D/tooling/metal/turnip-a830
 O=$D/out/turnip-a830
@@ -50,8 +51,8 @@ stale() {   # stale OUT IN...: OUT is missing or older than one of IN
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
 # 1. The ABI directory Turnip's darwin backend is built with (-Dtu-darwin-abi-dir): the kernel's header as it is, a wrapper of the
-#    name the backend includes, the compat names, and the VM's DroidVMVirtgpuABI.h (the virtgpu backend still compiles, unused: it
-#    runs only with TU_DARWIN_VIRTGPU=1).
+#    name the backend includes, the compat names, and the k27 tree's virtgpu ABI header (DroidVMVirtgpuABI.h, the name the backend
+#    includes; the virtgpu backend still compiles, unused: it runs only with TU_DARWIN_VIRTGPU=1).
 ABI=${PIANO_A830_ABI:-}
 if [ -z "$ABI" ]; then
   ABI=$A/NativeAdrenoABI.h

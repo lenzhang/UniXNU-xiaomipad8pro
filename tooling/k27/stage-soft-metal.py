@@ -2,8 +2,8 @@
 """Stage a Metal plugin bundle (default out/soft-metal/NativeSoftMetal.bundle) for a native test, on the Mac:
   - a copy of the Data seed with the bundle in /Library/GPUBundles (the first directory IOGPU searches for <MetalPluginName>.bundle;
     /Library is a firmlink into the Data volume), and
-  - a trust cache with one more module, the bundle's Mach-O CDHashes, before the input's modules (as macOS-DroidVM's
-    stage-gpu-plugin.py does), so AMFI and libsystem_sandbox's gpu_bundle_find_trusted accept the ad hoc signed plugin.
+  - a trust cache with one more module, the bundle's Mach-O CDHashes, before the input's modules (as the VM-era
+    stage-gpu-plugin.py did), so AMFI and libsystem_sandbox's gpu_bundle_find_trusted accept the ad hoc signed plugin.
 
     stage-soft-metal.py [--seed out/inputs/scratch-data.img] [--trust out/inputs/kernel.macho.trustcache] [--out out/soft-metal]
                         [--boot-run COMMAND]... [--log-stream PREDICATE | --log-errors PREDICATE] [--reduce-transparency]
@@ -58,7 +58,8 @@ import uuid
 from pathlib import Path
 
 D = Path(__file__).resolve().parents[2]
-K27 = Path(os.environ.get('K27_TREE', Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM'))
+from k27_tree import k27_tree  # noqa: E402  (tooling/k27/k27_tree.py: PIANO_K27_TREE)
+K27 = k27_tree()
 sys.path.insert(0, str(K27 / 'sources/UniXNU/drivers/DarwinBoot/Test'))
 import packed_ramdisk  # noqa: E402  (read from the k27 tree, not changed)
 
@@ -66,7 +67,7 @@ LC_CODE_SIGNATURE = 0x1d
 GPU_BUNDLES = 'Library/GPUBundles'
 BOOT_JOB = 'Library/LaunchDaemons/org.droidvm.run.0.plist'
 SETTIME = 'sh /private/var/settime.sh'
-# Accessibility's Reduce transparency, as managed preferences for the computer and for each user with a home (what macOS-DroidVM's
+# Accessibility's Reduce transparency, as managed preferences for the computer and for each user with a home (what the VM-era
 # stage-gpu-plugin.py --reduce-transparency wrote), so it holds for loginwindow before anyone logs in. Clients then draw opaque views
 # instead of backdrop layers (blur, vibrancy), which Core Animation's software renderer asserts on (§11 of docs/drivers/soft-metal.md).
 # Written by the boot job, as root, before anything else in it: the files must be root's, which this Mac cannot make on the seed.
@@ -83,7 +84,7 @@ REDUCE_TRANSPARENCY = ("mp='/Library/Managed Preferences'; "
 
 def cdhash(path):
     """The CDHash of a thin Mach-O: SHA-256 (truncated to 20 bytes) of its SHA-256 CodeDirectory, or None when it is not Mach-O.
-    As macOS-DroidVM's stage-gpu-plugin.py."""
+    As the VM-era stage-gpu-plugin.py computed it."""
     data = path.read_bytes()
     if data[:4] != b'\xcf\xfa\xed\xfe':
         return None

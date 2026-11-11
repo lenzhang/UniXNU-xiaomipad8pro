@@ -3,11 +3,11 @@
 # tests first (package/common's; tests/buttons_host.cpp: SPMI observer reads, key decoding, debounce, the adaptive polling, the
 # report descriptor), then the objects in out/native-kexts/PianoInput for tooling/k27/kext/PianoInput.json. Inert without the
 # boot argument piano-input.
-#   environment: K27_TREE (the k27 build tree, read only: its compile recipes and out/x12377/inc-hid, the IOKit/hid headers
-#                DroidVMInput was built with), K27_OBJ (default k27-native-obj), CXX (host compiler for the tests, default c++)
+#   environment: PIANO_K27_TREE (the k27 tree, read only: its compile recipes and out/x12377/inc-hid, the IOKit/hid headers
+#                the VM-era HID kext was built with), K27_OBJ (default k27-native-obj), CXX (host compiler for the tests, default c++)
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
-K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
+. "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 HID=$K/out/x12377/inc-hid
 [ -f "$HID/IOKit/hid/IOHIDDevice.h" ] || { echo "Error: no IOKit/hid headers at $HID" >&2; exit 1; }
 T=$D/out/native-kexts/PianoInput/host-tests; mkdir -p "$T"

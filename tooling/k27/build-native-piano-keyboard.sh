@@ -5,14 +5,14 @@
 # tooling/k27/kext/PianoKeyboard.json. Prints out/k27/kext/PianoKeyboard.json (resolved) last, for a test KC:
 #   PIANO_EXTRA_KEXTS=$(tooling/k27/build-native-piano-keyboard.sh | tail -1) PIANO_EXTRA_ARGS="piano-keyboard=1" tooling/k27/build-native-image.sh
 # Inert without the boot argument piano-keyboard (package/PianoKeyboard/PianoKeyboard.cpp).
-#   environment: K27_TREE (the k27 build tree, read only: compile recipes, out/x12377/inc-hid), K27_OBJ (default k27-native-obj),
+#   environment: PIANO_K27_TREE (the k27 tree, read only: compile recipes, out/x12377/inc-hid), K27_OBJ (default k27-native-obj),
 #                CXX (host compiler for the tests), PIANO_KEYBOARD_FW (MCU_Upgrade.bin; default ../xiaomipad-8pro-mainline's
 #                firmware/nanosic/piano/MCU_Upgrade.bin), PIANO_KEYBOARD_NO_FIRMWARE=1 (build without it: step 5 then stops)
 # The image (the stock OS3.0.303.0 odm_a MCU_Upgrade.bin, 83,436 bytes, pinned below as xiaomipad-8pro-mainline firmware/piano-input.json
 # pins it) is never committed: it is copied into the ignored out/native-kexts/PianoKeyboard/firmware and .incbin'd from there.
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
-K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
+. "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 HID=$K/out/x12377/inc-hid
 P=$D/package/PianoKeyboard; O=$D/out/native-kexts/PianoKeyboard
 [ -f "$HID/IOKit/hid/IOHIDDevice.h" ] || { echo "Error: no IOKit/hid headers at $HID" >&2; exit 1; }

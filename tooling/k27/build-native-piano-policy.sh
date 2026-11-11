@@ -4,11 +4,11 @@
 # source x display x Low Power Mode x sleep combination, the notification sequences, the GPU ceiling slot shared with PianoThermal),
 # then the objects in out/native-kexts/PianoPolicy for tooling/k27/kext/PianoPolicy.json. Inert without the boot argument
 # piano-policy. No hardware is touched.
-#   environment: K27_TREE (the k27 build tree, read only: its compile recipes), K27_OBJ (default k27-native-obj), CXX (host compiler
+#   environment: PIANO_K27_TREE (the k27 tree, read only: its compile recipes), K27_OBJ (default k27-native-obj), CXX (host compiler
 #                for the tests, default c++), K27_KERNEL (for the import check; skipped when absent)
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
-K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
+. "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 P=$D/package/PianoPolicy; O=$D/out/native-kexts/PianoPolicy
 mkdir -p "$O/host-tests"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/policy_host.cpp" -o "$O/host-tests/policy_host"

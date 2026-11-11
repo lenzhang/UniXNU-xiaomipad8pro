@@ -3,7 +3,7 @@
 # loop's dump image in out/ram-dump (the same with piano-reset-after=1: it only lets our UEFI read the previous run's log).
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
-K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
+. "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 LIST=$(sed -e 's/#.*//' "${PIANO_KEXT_LIST:-configs/k27-native-kexts.txt}" | awk 'NF {print $1}')
 # PIANO_USBHOST_STACK=1: Apple's USB host stack in the collection for PianoUsbHost level 6 (docs/drivers/usb-host.md H6, path A1):
 # PianoUsbHostStandIn (the seven Apple SoC kexts the stack reaches) and the codeless PianoUsbHostStack (its libraries keep AppleUSBXHCI,

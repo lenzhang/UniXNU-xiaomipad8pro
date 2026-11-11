@@ -13,9 +13,10 @@ from pathlib import Path
 import subprocess
 import sys
 
-# UniXNU-piano: vendored from macOS-DroidVM scripts/build-native-kext.py (11ac316, BSD-2-Clause-Patent). The k27 tree is only read
-# (the kernel objects' compile recipes); the objects go to this repository's out/native-kexts/NAME (--out), never into the archive.
-ROOT = Path(os.environ.get('K27_TREE', Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM'))
+# UniXNU-piano: provenance in tooling/k27/UPSTREAM. The k27 tree (PIANO_K27_TREE, tooling/k27/k27_tree.py) is only read (the kernel
+# objects' compile recipes); the objects go to this repository's out/native-kexts/NAME (--out), never into that tree.
+from k27_tree import k27_tree
+ROOT = k27_tree()
 X = ROOT / 'out/x12377'
 PIANO = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description=__doc__)

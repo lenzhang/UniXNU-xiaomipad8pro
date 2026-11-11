@@ -13,11 +13,11 @@ codeless bundle com.unixnu.driver.PianoUsbHostStack pulls in (its libraries' clo
 Exit 0 when the stack is gated, 1 otherwise. With no PianoUsbHostStack bundle in the collection: nothing to check (exit 0).
 """
 import plistlib
-import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(os.environ.get('K27_TREE', Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM')) / 'scripts'))
+from k27_tree import k27_tree  # noqa: E402  (tooling/k27/k27_tree.py: PIANO_K27_TREE)
+sys.path.insert(0, str(k27_tree() / 'scripts'))
 import fileset_kc  # noqa: E402
 
 GATE = 'PianoUsbHostStack'

@@ -5,7 +5,7 @@
 # decoder, the HID report, the clock decoding, the frame pace), then the panel images staged and embedded, then the objects in
 # out/native-kexts/PianoTouch for tooling/k27/kext/PianoTouch.json. Prints out/k27/kext/PianoTouch.json (resolved) last.
 # Inert without the boot argument piano-touch (package/PianoTouch/PianoTouch.cpp, docs/drivers/touch.md).
-#   environment: K27_TREE (the k27 build tree, read only: compile recipes, out/x12377/inc-hid), K27_OBJ (default k27-native-obj),
+#   environment: PIANO_K27_TREE (the k27 tree, read only: compile recipes, out/x12377/inc-hid), K27_OBJ (default k27-native-obj),
 #                CC/CXX (host compilers for the tests), PIANO_TOUCH_FW_DIR (the directory with novatek_nt36532_piano_fw_{boe,csot}.bin;
 #                default ../xiaomipad-8pro-mainline's firmware/novatek/piano), PIANO_TOUCH_NO_FIRMWARE=1 (build without them: step 5
 #                then stops with "no usable image"), PIANO_TOUCH_CALIBRATION (this unit's Ubuntu touchscreen calibration, from the
@@ -18,7 +18,7 @@
 # there. A missing one is left out (with a warning); one that is not the pinned file stops the build.
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
-K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
+. "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 HID=$K/out/x12377/inc-hid
 P=$D/package/PianoTouch; O=$D/out/native-kexts/PianoTouch
 [ -f "$HID/IOKit/hid/IOHIDDevice.h" ] || { echo "Error: no IOKit/hid headers at $HID" >&2; exit 1; }

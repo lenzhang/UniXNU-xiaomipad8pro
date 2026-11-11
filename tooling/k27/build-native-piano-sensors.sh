@@ -5,11 +5,11 @@
 # mtools FAT32 image, the kernel's no-FP/no-libc compile), the copies checked against their originals, then the objects in
 # out/native-kexts/PianoSensors for tooling/k27/kext/PianoSensors.json. Inert without the boot argument piano-sensors
 # (docs/drivers/sensors.md). No pack, registry or vendor file is in the build: level 2 reads the owner's pack from the ESP at run time.
-#   environment: K27_TREE (the k27 build tree, read only: its compile recipes), K27_OBJ (default k27-native-obj), CC (host compiler
+#   environment: PIANO_K27_TREE (the k27 tree, read only: its compile recipes), K27_OBJ (default k27-native-obj), CC (host compiler
 #                for the tests, default cc), K27_KERNEL (for the import check; skipped when absent)
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
-K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
+. "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 P=$D/package/PianoSensors; O=$D/out/native-kexts/PianoSensors
 mkdir -p "$O"
 python3 "$P/tests/run-host-tests.py" > "$O/host-tests.log" 2>&1 \

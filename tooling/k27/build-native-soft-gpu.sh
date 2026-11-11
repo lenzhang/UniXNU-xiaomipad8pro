@@ -2,7 +2,7 @@
 # Build package/NativeSoftGpu (a registry IOAccelerator that only advertises the NativeSoftMetal plugin: WindowServer without a GPU driver)
 # as a k27 native kext: objects in out/native-kexts/NativeSoftGpu, and out/k27/kext/NativeSoftGpu.json (the descriptor with @OUT@
 # filled in) for a test KC: PIANO_EXTRA_KEXTS=out/k27/kext/NativeSoftGpu.json tooling/k27/build-native-image.sh.
-#   environment: K27_TREE (the k27 build tree, read only), K27_OBJ (default k27-native-obj), MACOS_SDK (the macOS SDK whose
+#   environment: PIANO_K27_TREE (the k27 tree, read only), K27_OBJ (default k27-native-obj), MACOS_SDK (the macOS SDK whose
 #                Kernel.framework has IOKit/graphics/IOAccelerator.h; default: xcrun's macosx SDK)
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)

@@ -23,11 +23,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+from k27_tree import k27_tree   # tooling/k27/k27_tree.py
+
 REPO = Path(__file__).resolve().parents[2]
 P = REPO / 'package/PianoA830'
 A, SIM, SMMU, PM4 = P / 'adreno830', P / 'adreno830/tests/hostsim', P / 'kits/ArmSmmu4K', P / 'kits/AdrenoPM4'
-VM_TURNIP = Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/UniXNU-turnip/build/mesa-tu-macos/src/freedreno/vulkan/libvulkan_freedreno.dylib'
-VK_INCLUDE = Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/UniXNU-turnip/.cache/mesa-work/include'
+# The VM-era Turnip build and its Mesa tree: TURNIP_TREE, else the UniXNU-turnip checkout next to the k27 tree (PIANO_K27_TREE).
+_K27 = k27_tree(required=False)
+TURNIP_TREE = Path(os.environ['TURNIP_TREE']) if os.environ.get('TURNIP_TREE') else (_K27.parent / 'UniXNU-turnip' if _K27 else None)
+VM_TURNIP = TURNIP_TREE / 'build/mesa-tu-macos/src/freedreno/vulkan/libvulkan_freedreno.dylib' if TURNIP_TREE else None
+VK_INCLUDE = TURNIP_TREE / '.cache/mesa-work/include' if TURNIP_TREE else None
 
 
 def sh(*command, **kw):
@@ -87,12 +92,14 @@ def main():
               '(-Dtu-darwin-abi-dir=package/PianoA830/abi) for this check')
         return 0
     smoke = out / 'vulkan_smoke'
+    if not args.vulkan_include:
+        sys.exit('check-a830-abi-host: --vulkan-include (or TURNIP_TREE / PIANO_K27_TREE) is needed with --turnip')
     sh('xcrun', 'clang', '-std=c11', '-O1', '-I', args.vulkan_include, SIM / 'vulkan_smoke.c', '-o', smoke)
     run = subprocess.run([str(smoke), str(args.turnip)], env=dict(env, TU_DEBUG='startup'), capture_output=True, text=True, timeout=300)
     text = (run.stdout + run.stderr).strip()
     (out / 'vulkan_smoke.log').write_text(text + '\n')
     passed = run.returncode == 0 and 'PASS' in run.stdout
-    expect = args.expect_turnip or ('fail' if args.turnip.resolve() == VM_TURNIP.resolve() else 'pass')
+    expect = args.expect_turnip or ('fail' if VM_TURNIP and args.turnip.resolve() == VM_TURNIP.resolve() else 'pass')
     print(f'vulkan_smoke with {args.turnip}: {"PASS" if passed else "FAIL"} (expected {expect})')
     print('\n'.join(text.splitlines()[-12:]))
     return 0 if passed == (expect == 'pass') else 1

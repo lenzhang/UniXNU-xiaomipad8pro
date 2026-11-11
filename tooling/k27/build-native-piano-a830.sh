@@ -12,13 +12,13 @@
 #   5. out/k27/kext/PianoA830.json (tooling/k27/kext/PianoA830.json with @OUT@ filled in), printed last, for a test KC:
 #      PIANO_EXTRA_KEXTS=$(tooling/k27/build-native-piano-a830.sh | tail -1) tooling/k27/build-native-image.sh
 # Inert without the boot argument piano-gpu (1 read-only survey, 2 staged bring-up S1..S10 polled).
-#   environment: K27_TREE (the k27 build tree, read only: compile recipes, kernel), K27_OBJ (default k27-native-obj), MACOS_SDK (the
+#   environment: PIANO_K27_TREE (the k27 tree, read only: compile recipes, kernel), K27_OBJ (default k27-native-obj), MACOS_SDK (the
 #                SDK whose Kernel.framework has IOKit/graphics/IOAccelerator.h), PIANO_GPU_FW (the firmware source directory)
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
 P=$D/package/PianoA830; A=$P/adreno830; B=$P/board; K=$P/kits
 O=$D/out/native-kexts/PianoA830
-K27=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
+. "$D/tooling/k27/k27-tree.sh"; K27=$PIANO_K27_TREE
 mkdir -p "$O" "$D/out/k27/kext"
 python3 "$D/tooling/k27/gen-piano-gpu-inputs.py" --check
 "$D/package/include/tests/run.sh" >&2   # PianoScmLock.h: the secure-call lock the board takes (docs/scm-lock.md)

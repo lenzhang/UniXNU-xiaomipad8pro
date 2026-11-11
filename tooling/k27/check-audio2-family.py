@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 """PianoAudio's macOS devices are C++ subclasses of IOService and IOUserClient whose metaclasses are linked, at run time, under
-IOAudio2Family's IOAudio2Device and IOAudio2DeviceUserClient (package/PianoAudio/PianoAudioDevice.cpp, DroidVMAudio's scheme). The KC
+IOAudio2Family's IOAudio2Device and IOAudio2DeviceUserClient (package/PianoAudio/PianoAudioDevice.cpp, the VM-era audio kext's scheme). The KC
 builder's vtable check covers subclasses of a kept kext's class; these derive from kernel classes, so this checks what the run-time
 link relies on instead, in the KC base the collection is built from:
 
@@ -10,15 +10,16 @@ link relies on instead, in the KC base the collection is built from:
   - their superClass pointers point exactly at IOService's and IOUserClient's metaclasses in the kernel: the C++ bases of PianoAudio's
     classes, so every cast the C++ classes allow stays true after the link.
 
-    check-audio2-family.py KC_BASE [--kc-log KC.log] [--tree K27_TREE]
+    check-audio2-family.py KC_BASE [--kc-log KC.log] [--tree DIR (default: the k27 tree, PIANO_K27_TREE)]
 
 Exit 0 and one summary line when all hold; 1 with the reason otherwise; 2 when an input is missing.
 """
 import argparse
-import os
 import re
 import sys
 from pathlib import Path
+
+from k27_tree import k27_tree   # tooling/k27/k27_tree.py: PIANO_K27_TREE
 
 FAMILY = 'com.apple.iokit.IOAudio2Family'
 CLASSES = (('IOAudio2Device', 'IOService'), ('IOAudio2DeviceUserClient', 'IOUserClient'))
@@ -32,9 +33,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('kc', type=Path)
     parser.add_argument('--kc-log', type=Path)
-    parser.add_argument('--tree', type=Path, default=Path(os.environ.get(
-        'K27_TREE', Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM')))
+    parser.add_argument('--tree', type=Path, help='the k27 tree (default PIANO_K27_TREE, tooling/k27/k27_tree.py)')
     args = parser.parse_args()
+    args.tree = args.tree or k27_tree()
     if not args.kc.is_file():
         print(f'check-audio2-family: no KC base at {args.kc}', file=sys.stderr)
         return 2
