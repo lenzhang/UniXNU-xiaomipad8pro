@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- UniXNU-piano: PianoPolicy's userland agent (docs/policy.md section 4): Low Power Mode into machdep.piano_policy_lpm, display
+     sleep when the cover closes without sleep. Install as /Library/LaunchDaemons/com.unixnu.piano-policy-agent.plist
+     (root:wheel 644) with the script at /usr/local/libexec/piano-policy-agent (root:wheel 755): configs/userland.toml,
+     docs/userland.md. Event driven (one notifyutil -w); launchd starts it again when notifyutil ends. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.unixnu.piano-policy-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>/usr/local/libexec/piano-policy-agent</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+</dict>
+</plist>

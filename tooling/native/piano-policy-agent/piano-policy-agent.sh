@@ -11,10 +11,11 @@
 # Event driven: one notifyutil process waits on both names (no polling); stock tools only (notifyutil, sysctl, ioreg, pmset,
 # logger). Runs as root. Lines go to the system log under piano-policy-agent (log show --predicate 'process == "logger"').
 #
-# Install into the Data seed and start it from the seed's boot job (tooling/k27/stage-soft-metal.py, docs/policy.md section 4):
-#   --file tooling/native/piano-policy-agent/piano-policy-agent.sh:private/var/piano/piano-policy-agent.sh
-#   --boot-run "launchctl submit -l com.unixnu.piano-policy-agent -- /bin/sh /private/var/piano/piano-policy-agent.sh"
-# By hand (root shell): the same launchctl submit; stop it with launchctl remove com.unixnu.piano-policy-agent.
+# Installed by the userland pipeline (configs/userland.toml, tooling/userland/stage.py, docs/userland.md) as
+# /usr/local/libexec/piano-policy-agent with its LaunchDaemon com.unixnu.piano-policy-agent.plist (next to this file).
+# By hand (root shell), without the pipeline:
+#   launchctl submit -l com.unixnu.piano-policy-agent -- /bin/sh /path/to/piano-policy-agent.sh
+# and launchctl remove com.unixnu.piano-policy-agent to stop it.
 set -u
 LPM=com.apple.system.lowpowermode
 LID=com.apple.system.powermanagement.clamshellstate
