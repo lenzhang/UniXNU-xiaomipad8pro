@@ -154,7 +154,7 @@ private:
     void sampleRow(const uint32_t *line, const uint8_t *source, unsigned pixelBytes, uint64_t y, uint64_t width, uint64_t height,
                    FrameStats &stats, bool thumb);
     void logThumbnail(const FrameStats &stats, uint64_t width, uint64_t height, uint32_t format, bool refresh);
-    void requestCopy(IOSurface *, bool refresh);
+    void requestCopy(IOSurface *, bool refresh, bool fenced = false, uint32_t fence = 0);
     void copyLoop();
     static void copyThreadMain(void *, wait_result_t);
     const uint8_t *surfaceBytes(IOSurface *, IOMemoryDescriptor *);
@@ -225,6 +225,21 @@ private:
     IOSurface *fCopyNext;             // retained; the next surface to copy
     bool fCopyRefresh, fCopyStop, fCopyThreadDone;
     uint64_t fCopiesSkipped;
+    // The GPU's fence rule (PianoA830, docs/drivers/gpu.md): WindowServer swaps a frame when its command buffer is scheduled, not when
+    // the GPU finished it, and the family's IOSurface fences do not see the A830's work. So a swap records the newest fence the GPU
+    // had handed out when it was programmed, and its copy first waits until the GPU retired that fence (at most kGpuFenceWaitMs, then
+    // it copies anyway). PianoA830's registered service is found by class and asked with callPlatformFunction("native-adreno-fences"),
+    // so neither kext links against the other; without it, or with boot-arg native-gop-display-gpu-fence=0, nothing waits.
+    static constexpr unsigned kGpuFenceWaitMs = 50;
+    bool fGpuFences;
+    IOService *fGpu;                  // retained once found (written once, by the swap path)
+    const OSSymbol *fGpuFenceSymbol;
+    uint64_t fGpuLookupNext;          // mach time of the next lookup while none was found
+    uint32_t fCopyFence;              // with fCopyNext: the fence its swap waits for, when fCopyFenced
+    bool fCopyFenced;
+    uint64_t fGpuWaits, fGpuWaitNs, fGpuWaitMaxNs, fGpuTimeouts;
+    bool gpuFence(uint32_t *fence);
+    void waitGpuFence(uint32_t fence);
     SwapInfo fSwapInfo[kSwapInfoRing];   // held while kSwapInfoHeld is set, sent in order afterwards
     // The surface on screen, copied again on a few ticks after its swap (1, 2, 4, 8, 16, 30): a renderer that swapped before its work
     // was done (a GPU) is shown complete once it finishes. WindowServer does not draw into the surface on screen.
@@ -367,6 +382,10 @@ bool NativeGopDisplay::start(IOService *provider)
     PE_parse_boot_argn("native-gop-display-thumb", &fThumbPeriod, sizeof(fThumbPeriod));
     fThumbLimit = 3;   // the console ring is 7 MiB and a thumbnail is about 3 KB: a few say what the panel showed
     PE_parse_boot_argn("native-gop-display-thumbs", &fThumbLimit, sizeof(fThumbLimit));
+    unsigned gpuFence = 1;
+    PE_parse_boot_argn("native-gop-display-gpu-fence", &gpuFence, sizeof(gpuFence));
+    fGpuFences = gpuFence != 0;
+    fGpuFenceSymbol = OSSymbol::withCStringNoCopy("native-adreno-fences");
     if (!readFramebuffer())
         return false;
     IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress(fVideoPhys, fVideo.v_rowBytes * fVideo.v_height,
@@ -445,6 +464,8 @@ void NativeGopDisplay::stop(IOService *provider)
     fShown = nullptr;
     OSSafeReleaseNULL(fScanoutMap);
     fScanout = nullptr;
+    OSSafeReleaseNULL(fGpu);
+    OSSafeReleaseNULL(fGpuFenceSymbol);
 }
 
 // Called by IOMobileFramebufferLegacy::start before it creates the default surface and registers the service (it tests bit 0).
@@ -564,6 +585,10 @@ IOReturn NativeGopDisplay::swap_begin_gated()
                   fFenceWaitNs / fFenceWaits / 1000, fFenceWaitMaxNs / 1000);
         IOLog("NativeGopDisplay: scheduling: %llu copy wakeups over 20 ms (longest %llu ms), %llu VBL ticks over 20 ms late (latest by %llu ms)\n",
               fWakeLate, fWakeMaxNs / 1000000, fVBLLate, fVBLLateMaxNs / 1000000);
+        if (fGpuWaits)
+            IOLog("NativeGopDisplay: %llu copies waited for the GPU's fence, mean %llu us max %llu us, %llu gave up after %u ms\n", fGpuWaits,
+                  fGpuWaitNs / fGpuWaits / 1000, fGpuWaitMaxNs / 1000, fGpuTimeouts, kGpuFenceWaitMs);
+        fGpuWaits = fGpuWaitNs = fGpuWaitMaxNs = fGpuTimeouts = 0;
         fFenceWaits = fFenceWaitNs = fFenceWaitMaxNs = 0;
         fPeakFps = 0;
         fWakeLate = fWakeMaxNs = fVBLLate = fVBLLateMaxNs = 0;
@@ -672,7 +697,9 @@ void NativeGopDisplay::program_hardware_gated()
             fSecondFrames = 0;
         }
         fSecondFrames++;
-        requestCopy(surface, false);
+        uint32_t fence = 0;
+        const bool fenced = gpuFence(&fence);
+        requestCopy(surface, false, fenced, fence);
         if (surface != fShown) {
             reinterpret_cast<OSObject *>(surface)->retain();
             if (fShown)
@@ -701,7 +728,61 @@ static uint8_t halfToByte(uint16_t half)
     return static_cast<uint8_t>((scaled + (1u << (shift - 1))) >> shift);
 }
 
-void NativeGopDisplay::requestCopy(IOSurface *surface, bool refresh)
+// The newest fence the GPU handed out (the swap path only: it also looks PianoA830's service up, once a second until found).
+bool NativeGopDisplay::gpuFence(uint32_t *fence)
+{
+    if (!fGpuFences || !fGpuFenceSymbol)
+        return false;
+    if (!fGpu) {
+        const uint64_t now = mach_absolute_time();
+        if (now < fGpuLookupNext)
+            return false;
+        uint64_t second = 0;
+        nanoseconds_to_absolutetime(1000000000ull, &second);
+        fGpuLookupNext = now + second;
+        OSDictionary *match = IOService::serviceMatching("PianoA830");
+        IOService *gpu = match ? IOService::copyMatchingService(match) : nullptr;
+        if (match)
+            match->release();
+        if (!gpu)
+            return false;
+        __atomic_store_n(&fGpu, gpu, __ATOMIC_RELEASE);
+        IOLog("NativeGopDisplay: GPU fences from %s: a swap's copy waits for the GPU work handed out before it (at most %u ms)\n",
+              gpu->getName(), kGpuFenceWaitMs);
+    }
+    uint32_t retired = 0;
+    return fGpu->callPlatformFunction(fGpuFenceSymbol, false, fence, &retired, nullptr, nullptr) == kIOReturnSuccess;
+}
+
+// The copy thread: until the GPU retired fence (32-bit sequence numbers), bounded; a GPU that stops answering is not waited for.
+void NativeGopDisplay::waitGpuFence(uint32_t fence)
+{
+    IOService *gpu = __atomic_load_n(&fGpu, __ATOMIC_ACQUIRE);
+    if (!gpu)
+        return;
+    const uint64_t start = mach_absolute_time();
+    uint64_t waited = 0;
+    for (;;) {
+        uint32_t submitted = 0, retired = 0;
+        if (gpu->callPlatformFunction(fGpuFenceSymbol, false, &submitted, &retired, nullptr, nullptr) != kIOReturnSuccess)
+            break;
+        if (static_cast<int32_t>(retired - fence) >= 0)
+            break;
+        absolutetime_to_nanoseconds(mach_absolute_time() - start, &waited);
+        if (waited >= kGpuFenceWaitMs * 1000000ull) {
+            fGpuTimeouts++;
+            break;
+        }
+        IOSleep(1);
+    }
+    absolutetime_to_nanoseconds(mach_absolute_time() - start, &waited);
+    fGpuWaits++;
+    fGpuWaitNs += waited;
+    if (waited > fGpuWaitMaxNs)
+        fGpuWaitMaxNs = waited;
+}
+
+void NativeGopDisplay::requestCopy(IOSurface *surface, bool refresh, bool fenced, uint32_t fence)
 {
     reinterpret_cast<OSObject *>(surface)->retain();
     IOLockLock(fCopyLock);
@@ -713,6 +794,8 @@ void NativeGopDisplay::requestCopy(IOSurface *surface, bool refresh)
     }
     fCopyNext = surface;
     fCopyRefresh = refresh;
+    fCopyFenced = fenced;
+    fCopyFence = fence;
     if (!skipped)
         fCopyRequestTime = mach_absolute_time();
     IOLockWakeup(fCopyLock, &fCopyNext, true);
@@ -739,7 +822,10 @@ void NativeGopDisplay::copyLoop()
             continue;
         }
         bool refresh = fCopyRefresh;
+        const bool fenced = fCopyFenced;
+        const uint32_t fence = fCopyFence;
         fCopyNext = nullptr;
+        fCopyFenced = false;
         uint64_t waited = 0;
         absolutetime_to_nanoseconds(mach_absolute_time() - fCopyRequestTime, &waited);
         IOLockUnlock(fCopyLock);
@@ -748,6 +834,8 @@ void NativeGopDisplay::copyLoop()
             if (waited > fWakeMaxNs)
                 fWakeMaxNs = waited;
         }
+        if (fenced)
+            waitGpuFence(fence);
         copySurface(surface, refresh);
         reinterpret_cast<OSObject *>(surface)->release();
         IOLockLock(fCopyLock);

@@ -1,8 +1,9 @@
 # GPU: Adreno 830 (PianoA830 = Adreno830 + piano's board glue; Metal side = AdrenoMetal plugin + Turnip on ABI v2)
 
-Status 2026-11-11: `package/PianoA830` built and linked into the k27 KC (`PIANO_EXTRA_KEXTS`, not in the default list); inert
-unless `piano-gpu=N`. **piano-gpu=1 (read-only survey) ran on the tablet** (§8, no hang). piano-gpu=2 (staged bring-up): the
-first run hung in my log hook (fixed in 6cda571, §8); the S1..S10 ladder is being walked. Plan: `droidvm-build/piano-patches/gpu-native-plan.md`.
+Status 2026-11-11: `package/PianoA830` is in the native kext list (`configs/k27-native-kexts.txt`), inert unless `piano-gpu=N`.
+On the tablet: the read-only survey (piano-gpu=1, 07:12), S1..S10 all ok on the first full run (`GPU RUN 160M`, 44-53 C), and with
+the NativeAdrenoMetal plugin (Turnip on ABI v2) in the seed **the macOS login screen composited by WindowServer on the A830**
+(camera, about 3.5 min into the boot). Plan: `droidvm-build/piano-patches/gpu-native-plan.md`.
 
 ## 1. Purpose and gate
 
@@ -73,6 +74,7 @@ kernel side must provide (2026-11-11).
 | `piano-gpu-status=0..3` | 2 at N=2 | status rows (2: the diagnostic page) |
 | other `piano-gpu-*`, `piano-screenoff`, `piano-diag` | driver's | Adreno830's `pagani-*` knobs renamed (README of `package/PianoA830/adreno830`), e.g. `piano-gpu-pool=<MiB>`, `piano-gpu-profile`, `piano-gpu-dcvs-max` |
 | `piano-gpu-metal-opens=<n>` | 0 (no limit) | connections ever granted to the plugin |
+| `native-gop-display-gpu-fence=0/1` | 1 | NativeGopDisplay waits for the GPU's fence before a swap's copy (§8) |
 
 ## 7. Kernel archive / component
 
@@ -100,6 +102,35 @@ ladder: `tooling/k27/build-gpu-ladder.sh` (out/ram-gpu/s1..s9, full).
 3. Then a Metal probe (plan step 5) with WindowServer kept on software, then WindowServer on Metal.
 Fails safe: RAM boot, `piano-reset-after`, no partition is written; without `piano-gpu` nothing happens.
 
+**The console mailbox after the login run (07:50, "no XNU log (signature 0x10054044)") was not overwritten.** XNU's DRAM is only
+0x8c0000000-0xc00000000 (dts/piano.dts), so no kernel or GPU allocation can have a physical address in cvp@9cb00000, and PianoA830
+maps nothing near it (MMIO, cmd-db, SMEM, ZAP at 0x9b09a000). The signature 0x10054044 is "DBGR" 0x52474244 with five 1-bits cleared
+and no 0-bit set: DRAM retention decay across the reset (heavier after a hot run: the GPU at 56-57 C before the reset), which the
+single-copy signature word and the reader's thresholds did not survive; the ring itself is printable log text in all 11 copies, no
+foreign block. `tooling/native/xnu-log.py` now accepts a signature that only lost bits, and takes the vote threshold from the
+1-population's own peak for the ring and the 11 header copies: the dump decodes (5653 lines, to "piano-reset-after: 300 s reached").
+Guards in PianoA830 all the same: the logger watches the mailbox's signature word once a second ("CONSOLE MAILBOX OVERWRITTEN ..."
+if it changes while XNU runs, when nothing decays), and after the bring-up and 60 s later `piano_a830_smmu_routes` logs where every
+GPU-side stream ID 0..15 goes, flagging any that reaches memory untranslated (an S2CR bypass, a bank with SCTLR.M = 0, or no entry
+with sCR0.USFCFG = 0): the only way the GPU could write memory XNU does not own, since every client window lies below 0x8c0000000.
+
+**The display's fence rule.** WindowServer swaps a frame when its command buffer is scheduled, not when the A830 finished it, and
+IOMFB's IOSurface fences do not see the A830's work. `native_adreno_fences(submitted, retired)` (NativeAdrenoPublish.cpp, lock-free)
+gives the newest fence handed out and the newest the CP wrote. NativeGopDisplay finds PianoA830's registered service by class and asks
+it with `callPlatformFunction("native-adreno-fences")` (no link dependency either way: the KC resolves a native kext's imports only
+from natives linked before it): a swap records the newest fence handed out when it is programmed, and its copy waits until the GPU
+retired it, at most 50 ms (then it copies anyway); `native-gop-display-gpu-fence=0` turns it off. Its 10 s line reports the waits.
+
+**Default-on.** PianoA830 is listed (inert). `PIANO_GPU=2 tooling/k27/build-native-image.sh` adds `piano-gpu=2
+piano-gpu-delay=${PIANO_GPU_DELAY:-20}`; make that the default once the plugin is staged in the default seed (and NativeSoftGpu stays
+out): an accelerator without its MetalPluginName bundle would put WindowServer back into the crash loop of the VM-era stub. The
+bring-up takes about 1.1 s (S3's 512 MiB pool reservation is 1.0 s of it), so `piano-gpu-delay=0` would publish the accelerator before
+WindowServer starts; try it once before making it the default. DCVS: keep the annibale default (at most 342 MHz, 160 MHz held from
+70 C until below 60 C): the login run sat at 342 MHz and 56-57 C with no cooling and no charging control (PianoPower is read-only so
+far), and the GPU never slumbers (P0) while host CX/MX stay at their top votes and DDR at level 11. Raise it
+(`piano-gpu-dcvs-max=607 piano-gpu-maxlevel=7`) only after a 10-minute desktop soak with the temperatures logged; slumber
+(`piano-gpu-slumber=2`) is untested on piano.
+
 ## 9. Fallback
 
 `piano-gpu` absent: software compositing (soft-metal.md). After S9 the accelerator exists; a failed stage publishes nothing.
@@ -111,7 +142,7 @@ Fails safe: RAM boot, `piano-reset-after`, no partition is written; without `pia
 3. DRV-2 sharing with PianoPower: PianoPower sends on TCS 1 without `sm8750_rpmh_drv2_owner`; do not run `piano-power>=2` with
    `piano-gpu=2` until both take the lock.
 4. Real Metal client count on macOS (32 slots); the 3200x2136 hang seen under virgl.
-5. `native_adreno_fences()` for the display's present (plan step 6): not exported yet.
+5. Whether the 50 ms fence wait is ever reached (NativeGopDisplay's 10 s line), and the real frame time on the panel.
 
 ## 11. Licence note
 

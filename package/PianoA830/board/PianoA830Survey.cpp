@@ -325,6 +325,77 @@ void survey_zap()
 }
 }  // namespace
 
+// After the bring-up (the GPU on, its SMMU clocked): where each GPU-side stream goes. The only way the GPU or the GMU could write
+// memory XNU does not own (everything below 0x8c0000000 on piano: firmware carve-outs, the console mailbox cvp@9cb00000) is a
+// stream that reaches memory untranslated, IOVA = PA: an S2CR bypass entry, a translating entry whose bank has SCTLR.M = 0, or no
+// entry at all while sCR0.USFCFG = 0 (unmatched streams bypass). Every GPU client window (0x20000000 .. 0x3ffffe000) lies below
+// XNU's DRAM, so such a stream would write there. Read only; one line per stream ID 0..15 and a verdict.
+extern "C" unsigned piano_a830_smmu_routes(const char *when)
+{
+  Win w;
+  const Adreno830Window smmu = PIANO_GPU_WINDOW_SMMU;
+  if (!mapWin(w, smmu)) return ~0u;
+  const uint32_t scr0 = rd(w, A830_SMMU_GR0_SCR0), idr0 = rd(w, A830_SMMU_GR0_IDR0), idr1 = rd(w, A830_SMMU_GR0_IDR1);
+  unsigned groups = A830_SMMU_IDR0_NUMSMRG(idr0), banks = A830_SMMU_IDR1_NUMCB(idr1);
+  const unsigned pages = A830_SMMU_GLOBAL_PAGES(idr1);
+  if (groups > 128) groups = 128;
+  if (banks > 64) banks = 64;
+  const bool clientpd = scr0 & A830_SMMU_SCR0_CLIENTPD, usfcfg = scr0 & A830_SMMU_SCR0_USFCFG;
+  piano_a830_note("SMMU routes (%s): sCR0 %#x (CLIENTPD %u: %s; USFCFG %u: unmatched streams %s), %u groups, %u banks", when, scr0,
+                  clientpd, clientpd ? "EVERY stream bypasses" : "translation on", usfcfg, usfcfg ? "fault" : "BYPASS", groups, banks);
+  unsigned danger = 0;
+  for (uint32_t sid = 0; sid < 16; ++sid) {
+    unsigned matches = 0, slot = 0;
+    uint32_t s2cr = 0;
+    for (unsigned i = 0; i < groups; ++i) {
+      const uint32_t smr = rd(w, A830_SMMU_GR0_SMR(i));
+      if (!(smr & 0x80000000u) || ((smr ^ sid) & 0x7fffu & ~((smr >> 16) & 0x7fffu))) continue;
+      if (!matches) {
+        slot = i;
+        s2cr = rd(w, A830_SMMU_GR0_S2CR(i));
+      }
+      ++matches;
+    }
+    const char *route;
+    char detail[96] = "";
+    bool untranslated = false;
+    if (clientpd) {
+      route = "bypass (CLIENTPD)";
+      untranslated = true;
+    } else if (!matches) {
+      route = usfcfg ? "unmatched: fault" : "unmatched: BYPASS";
+      untranslated = !usfcfg;
+    } else {
+      const unsigned type = (s2cr >> 16) & 3u, bank = s2cr & 0xffu;
+      if (type == 1) {
+        route = "S2CR BYPASS";
+        untranslated = true;
+      } else if (type == 2) {
+        route = "S2CR fault";
+      } else if (bank >= banks || A830_SMMU_CB_OFF(pages, bank) + 0x1000 > w.bytes) {
+        route = "bank out of range";
+      } else {
+        const uint32_t sctlr = rd(w, A830_SMMU_CB_OFF(pages, bank) + A830_SMMU_CB_SCTLR), cbar = rd(w, A830_SMMU_GR1_CBAR(bank));
+        untranslated = !(sctlr & 1u);
+        route = untranslated ? "bank with SCTLR.M=0: UNTRANSLATED" : "translated";
+        snprintf(detail, sizeof detail, " bank %u SCTLR %#x CBAR %#x TTBR0 %#x%08x", bank, sctlr, cbar,
+                 rd(w, A830_SMMU_CB_OFF(pages, bank) + A830_SMMU_CB_TTBR0_HI), rd(w, A830_SMMU_CB_OFF(pages, bank) + A830_SMMU_CB_TTBR0));
+      }
+      if (matches > 1) route = "MULTIPLE stream-match entries (unpredictable)";
+    }
+    if (matches || untranslated || sid < 8)
+      piano_a830_note("SMMU sid %u: %s%s%s (slot %u, %u match%s, S2CR %#x)", sid, route, detail, untranslated ? " <- IOVA = PA" : "",
+                      slot, matches, matches == 1 ? "" : "es", s2cr);
+    danger += untranslated;
+  }
+  piano_a830_note("SMMU routes (%s): %s", when,
+                  danger ? "a GPU-side stream reaches memory UNTRANSLATED: its writes at a client IOVA land at that physical address "
+                           "(below 0x8c0000000: firmware memory, the console mailbox)"
+                         : "every GPU-side stream that has an entry is translated or faults; nothing reaches memory as IOVA = PA");
+  unmapWin(w);
+  return danger;
+}
+
 extern "C" void piano_a830_survey(uint32_t mask)
 {
   if (mask & PianoA830SurveyInputs) survey_inputs();

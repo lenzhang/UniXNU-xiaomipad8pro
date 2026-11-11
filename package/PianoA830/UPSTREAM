@@ -12,8 +12,9 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       g_kernel_kmod_info): prepare/commit report steps 4/5; the macOS accelerator is the kext's AGXAccelerator personality on the
       NativeAdrenoGpuPublished service native_adreno_publish registers. The 128 KiB cmd-db snapshot on the heap (allocated once by
       adreno830_start): the k27 collection's largest __DATA gap for a native kext is about 166 KiB.
-    NativeAdrenoPublish.cpp d2a85cbcb4ad29df03a05c9f4e3edc0120358ab90a731cb61b083accf93bd31f -> 6c17459b67b868874f6be56b68c17155da10abd03f52efefdca79a102aed01e7
-      the render server is WindowServer (kRenderServer/isRenderServer at the six "backboardd" sites, as UniXNU Adreno740 7487f72).
+    NativeAdrenoPublish.cpp d2a85cbcb4ad29df03a05c9f4e3edc0120358ab90a731cb61b083accf93bd31f -> 18c0dda18777736bb00d310f691588b1dc59c002e2057465c19711cca6c8b0f3
+      the render server is WindowServer (kRenderServer/isRenderServer at the six "backboardd" sites, as UniXNU Adreno740 7487f72);
+      native_adreno_fences() for the display's fence rule (as Adreno740's, over the ring's lastSubmitted and the memptrs fence word).
     NativeAdrenoPublish.h   b266fa844b199254611f2bb1fc0bfca6dedd1c73535cf442838b07527e74a854 -> 9b7f30aa11694cfb44a7731b1efc4fbe5a73ebf7807acee1443aa932fb01c46b
       macOS process lists (NativeAdrenoSandboxGrantList, NativeAdrenoLargeClientList) in place of iPadOS's.
     NativeAdrenoMemory.cpp  ea99b5e92be53377467c830bb63e5043597e543692ec20087711ba4d67770b1c -> 28882d551523a43a27890f4ed2fb82968bcbefcfdece71cf68465a9bdf6effad

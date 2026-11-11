@@ -1482,3 +1482,24 @@ extern "C" IOService *native_adreno_published_service()
 {
     return g.service;
 }
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (macOS 27): the fence rule of a display that reads the compositor's surface itself (NativeGopDisplay's CPU copy into
+ * the GOP framebuffer; UniXNU Adreno740 NativeAdrenoPublish.cpp native_adreno_fences): WindowServer swaps a frame when its command
+ * buffer is scheduled, not when the GPU finished it, so before copying the display waits until every fence handed out before the swap
+ * arrived has retired. *submitted: the newest fence the ring handed out; *retired: the newest the CP wrote (the memptrs completed-fence
+ * word, read fresh, or the ring's own record if that is newer). Fences are 32-bit sequence numbers: compare with
+ * (int32_t)(retired - fence) >= 0. Lock-free (atomic reads of the ring and one uncached word), any thread context, no interrupt
+ * handler; false before S9 published the GPU or after a global device loss (then nothing will retire: do not wait). */
+extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired)
+{
+    if(!submitted || !retired)return false;
+    *submitted=*retired=0;
+    if(!__atomic_load_n(&g.published,__ATOMIC_ACQUIRE) || !g.ring || lost())return false;
+    const uint32_t handed=g.ring->lastSubmitted(),recorded=g.ring->completedFence();
+    const volatile uint32_t *memptrs=g.ring->memptrs();
+    const uint32_t written=memptrs?memptrs[1]:recorded;   /* +4: the completed fence the CP writes (struct msm_rbmemptrs) */
+    *submitted=handed;
+    *retired=int32_t(written-recorded)>=0?written:recorded;
+    return true;
+}
+#endif

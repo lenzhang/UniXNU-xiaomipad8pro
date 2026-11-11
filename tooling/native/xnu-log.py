@@ -24,14 +24,18 @@ base = 12
 # k27 0055: "DBGB" header + the ring 11 times ("DBG3": three) (bitwise majority against DRAM bit decay); "DBGC" = one copy.
 dist = lambda a, b: bin(a ^ b).count('1')
 copies = {0x52474244: 11, 0x42474244: 11, 0x33474244: 3}   # "DBGR": header and ring 11 times; "DBGB": ring 11 times; "DBG3": 3
-best = min(copies, key=lambda c: dist(sig, c))
-def majority_word(words):
-    return sum(1 << b for b in range(32) if sum((w >> b) & 1 for w in words) * 2 > len(words))
-if dist(sig, best) <= 3 and best == 0x52474244:
-    # k27 0058: 256-byte header, {start, size} at words 4 + 2k (k < 11), the ring copies from byte 256.
-    hdr = struct.unpack_from('<64I', raw, 0)
-    start = majority_word(hdr[4:26:2]); used = majority_word(hdr[5:26:2]); base = 256
-if dist(sig, best) <= 3:
+# The signature word is stored once. DRAM decay clears bits (1 -> 0) and almost never sets one, and after a hot run it cleared
+# 5 of the 11 one-bits of "DBGR" (2026-11-11 07:50, 0x10054044, the GPU at 56 C: the log itself was intact). So a signature with
+# no bit outside a known one and at most 8 of its bits lost is that one, as is one within 3 flips either way.
+def matches(c):
+    return dist(sig, c) <= 3 or (not (sig & ~c & 0xffffffff) and bin(c & ~sig).count('1') <= 8)
+best = next((c for c in copies if matches(c)), min(copies, key=lambda c: dist(sig, c)))
+def vote_word(words, need):
+    return sum(1 << b for b in range(32) if sum((w >> b) & 1 for w in words) >= need)
+if matches(best) and best == 0x52474244:
+    # k27 0058: 256-byte header, {start, size} at words 4 + 2k (k < 11), the ring copies from byte 256; voted below.
+    hdr = struct.unpack_from('<64I', raw, 0); base = 256
+if matches(best):
     n = copies[best]; cap = (size - (256 if base == 256 else 16)) // n
     cs = [raw[base + k * cap:base + (k + 1) * cap] for k in range(n)]
     # Bitwise majority without numpy: a bit-sliced 4-bit counter over big integers (n <= 15).
@@ -44,19 +48,23 @@ if dist(sig, best) <= 3:
         b3 ^= c2
     need = n // 2 + 1                          # count >= need: plain majority, unless the histogram says otherwise
     # Adaptive threshold (2026-11-11): the DRAM decays mostly 1 -> 0, so a bit that was 1 often survives in only 4-5 of the 11
-    # copies, while a 0 rarely shows up as 1 in more than 2. Count, over the used bytes, how many bits have each number k of
-    # copies at 1, and put the threshold just above the valley between the two populations.
-    used_bits = (1 << (8 * min(max(used, start), cap))) - 1 if 0 < max(used, start) else (1 << (8 * cap)) - 1
+    # copies, while a 0 rarely shows up as 1 in more than 2. Count how many bits have each number k of copies at 1 and put the
+    # threshold just above the valley between the two populations: the minimum between k = 2 and the peak of the 1-population
+    # (not the global minimum: after heavy decay the 1-population peaks at 5-6 and its tail at 9-10 is smaller than the valley).
+    # The histogram covers the whole capacity: unused zero bytes only add to k = 0.
     if n == 11:
         hist = []
         for k in range(n + 1):
-            m = used_bits
+            m = (1 << (8 * cap)) - 1
             for j, bit in enumerate((b0, b1, b2, b3)):
                 m &= bit if (k >> j) & 1 else ~bit
             hist.append(bin(m).count('1'))
-        valley = min(range(2, n - 1), key=lambda k: hist[k])
+        peak = max(range(3, n + 1), key=lambda k: hist[k])
+        valley = min(range(2, peak), key=lambda k: hist[k]) if peak > 2 else n // 2
         need = valley + 1
         sys.stderr.write(f'copies-at-1 histogram {hist}, threshold {need} of {n}\n')
+    if base == 256:                            # the header's 11 {start, size} copies decay like the ring: the same threshold
+        start = vote_word(hdr[4:26:2], need); used = vote_word(hdr[5:26:2], need)
     count_bits = (b0, b1, b2, b3)
     # count >= need, compared bitwise from the top: gt | eq-chain
     ge = 0; eq = (1 << (8 * cap)) - 1

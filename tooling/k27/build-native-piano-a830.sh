@@ -5,7 +5,7 @@
 #   2. the firmware: piano's own gen80000 images, pin-checked and copied into the ignored out/native-kexts/PianoA830/firmware, embedded
 #      from there (tooling/k27/stage-piano-gpu-firmware.py; PIANO_GPU_NO_FIRMWARE=1 builds without: S0 then refuses to start);
 #   3. Adreno830's host tests (ASan/UBSan) with piano's firmware pins, upstream and ADRENO830_MACOS (tooling/k27/run-a830-host-tests.py;
-#      PIANO_A830_HOST_TESTS=0 skips them);
+#      PIANO_A830_HOST_TESTS=0 skips them, =1 forces them, default: when the sources changed);
 #   4. the objects with the k27 kernel recipe (-DADRENO830_MACOS: WindowServer as the render server, macOS client lists, no staged
 #      IOAcceleratorES), the weak definitions coalesced (tooling/k27/coalesce-weak.py) into out/native-kexts/PianoA830/objects.json,
 #      and every import checked against the k27 kernel's symbols (tooling/k27/check-kext-imports.py);
@@ -22,9 +22,15 @@ K27=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM
 mkdir -p "$O" "$D/out/k27/kext"
 python3 "$D/tooling/k27/gen-piano-gpu-inputs.py" --check
 python3 "$D/tooling/k27/stage-piano-gpu-firmware.py" ${PIANO_GPU_NO_FIRMWARE:+--no-firmware}
-if [ "${PIANO_A830_HOST_TESTS:-1}" = 1 ]; then
+# PIANO_A830_HOST_TESTS: 1 always, 0 never, auto (default) when the driver sources, the kits or the test runner changed since the last
+# pass (out/native-kexts/PianoA830/host-tests/stamp): the image build links PianoA830 every time.
+HT=${PIANO_A830_HOST_TESTS:-auto}
+STAMP=$( { find "$A" "$K" -type f | sort | xargs shasum -a 256; shasum -a 256 "$D/tooling/k27/run-a830-host-tests.py" "$B/piano-gpu-firmware.json"; } \
+         | shasum -a 256 | cut -c1-16)
+if [ "$HT" = 1 ] || { [ "$HT" = auto ] && [ "$(cat "$O/host-tests/stamp" 2>/dev/null)" != "$STAMP" ]; }; then
   python3 "$D/tooling/k27/run-a830-host-tests.py" ${PIANO_GPU_NO_FIRMWARE:+--no-firmware} --out "$O/host-tests" \
     || { echo "Error: Adreno830 host tests failed ($O/host-tests/*.log)" >&2; exit 1; }
+  echo "$STAMP" > "$O/host-tests/stamp"
 fi
 SDK=${MACOS_SDK:-$(xcrun --sdk macosx --show-sdk-path)}
 GFX=$D/out/k27/inc-gfx   # IOKit/graphics alone, so no other Kernel.framework header comes before xnu's own

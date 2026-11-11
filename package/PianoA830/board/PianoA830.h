@@ -18,6 +18,8 @@ IOReturn piano_a830_board_start(unsigned level);
 void piano_a830_survey(uint32_t mask);
 // adreno830_start's outcome as console lines (status block, the last failure, stage times).
 void piano_a830_report(IOReturn result);
+// The GPU SMMU's route of every GPU-side stream ID (read only, the GPU must be on); returns how many reach memory untranslated.
+unsigned piano_a830_smmu_routes(const char *when);
 #ifdef __cplusplus
 }
 #endif

@@ -10,6 +10,19 @@ for k in $LIST; do   # the kexts' objects: tooling/k27/build-native-<name>.sh
   [ -n "$b" ] || { echo "no build script for $k" >&2; exit 1; }
   tooling/k27/build-native-$b.sh > out/k27/build-native-$b.log 2>&1 || { grep -E "error:|Error" out/k27/build-native-$b.log | head; exit 1; }
 done
+# A descriptor of a kext the list already links (e.g. PIANO_EXTRA_KEXTS=.../PianoA830.json from before PianoA830 was listed) is not
+# linked twice.
+EXTRA=
+for e in ${PIANO_EXTRA_KEXTS:-}; do
+  case " $LIST " in *" $(basename "$e" .json) "*) echo "PIANO_EXTRA_KEXTS: $(basename "$e" .json) is in the kext list already" >&2 ;; *) EXTRA="$EXTRA $e" ;; esac
+done
+# PIANO_GPU=N (default 0): piano-gpu=N and piano-gpu-delay=${PIANO_GPU_DELAY:-20} in the images' arguments (docs/drivers/gpu.md §6).
+# PianoA830 is in the kext list and inert without them. A GPU session also needs the NativeAdrenoMetal plugin in the Data seed (the
+# userspace side's staging) and NativeSoftGpu out of the list; while the default seed lacks the plugin this default stays 0 (an
+# accelerator whose MetalPluginName bundle is missing sends WindowServer back into the crash loop of the VM-era stub).
+if [ "${PIANO_GPU:-0}" != 0 ]; then
+  export PIANO_EXTRA_ARGS="piano-gpu=$PIANO_GPU piano-gpu-delay=${PIANO_GPU_DELAY:-20} ${PIANO_EXTRA_ARGS:-}"
+fi
 # PIANO_VMM_PRESENT=0|1: the ADT's /defaults vmm-present for this build (else configs/k27-adt.toml's; docs/drivers/soft-metal.md §9).
 python3 tooling/adt/make-piano-adt.py out/adt/piano-k27.adt --unique-chip-id "${UNIQUE_CHIP_ID:-47554e5941480001}" --data --trust \
   ${PIANO_VMM_PRESENT:+--vmm-present "$PIANO_VMM_PRESENT"} > /dev/null
@@ -73,7 +86,7 @@ fi
 # The descriptors with their objects' absolute place (@OUT@ = this repository's out/), plus PIANO_EXTRA_KEXTS (JSON paths) for a test.
 mkdir -p out/k27/kext; NATIVE=
 for k in $LIST; do sed "s#@OUT@#$D/out#" "tooling/k27/kext/$k.json" > "out/k27/kext/$k.json"; NATIVE="$NATIVE $D/out/k27/kext/$k.json"; done
-NATIVE="$NATIVE ${PIANO_EXTRA_KEXTS:-}" \
+NATIVE="$NATIVE $EXTRA" \
   tooling/kc/build-kc-k27.sh "${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}" out/k27/kc-k27-native.bin > out/k27/build-kc.log 2>&1 || { tail -5 out/k27/build-kc.log; exit 1; }
 # PIANO_TRUST / PIANO_SEED: another trust cache and Data seed for a test (e.g. tooling/k27/stage-soft-metal.py's, with a staged plugin).
 COMMON=(--fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-k27-native.bin --trust "${PIANO_TRUST:-out/inputs/kernel.macho.trustcache}"

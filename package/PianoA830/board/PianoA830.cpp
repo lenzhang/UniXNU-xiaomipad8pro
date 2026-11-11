@@ -30,6 +30,10 @@
 #include "Adreno830Status.h"
 #include "Adreno830Device.h"
 #include "NativeAdrenoPublish.h"
+#include <IOKit/IODeviceMemory.h>
+#include <kern/clock.h>
+
+extern "C" const Adreno830Board *piano_a830_board(void);
 
 extern "C" void proc_selfname(char *, int);
 extern "C" IOReturn native_adreno_new_user_client(IOService *, task_t, void *, uint32_t, OSDictionary *, IOUserClient **, unsigned);
@@ -130,16 +134,58 @@ bool ringPop(char *out, uint32_t *drops)
   return any;
 }
 
+// The console mailbox canary (2026-11-11): k27 0055/0058 mirror the console into pstore-console=<addr> (cvp@9cb00000, outside XNU's
+// DRAM). Across a reset its DRAM decays (1 -> 0, worse when hot), which a dump shows as a damaged signature; during the run nothing
+// decays, so a signature word that changes while XNU runs is a real overwrite (by a device, a GPU stream reaching memory untranslated
+// above all: piano_a830_smmu_routes). The logger reads the word once a second through its own read-only uncached mapping.
+struct Canary {
+  IOMemoryMap *map;
+  volatile const uint32_t *word;
+  uint64_t phys;
+  uint32_t expected, changes;
+};
+Canary gCanary;
+
+void canaryStart()
+{
+  uint64_t base = 0;
+  if (!PE_parse_boot_argn("pstore-console", &base, sizeof base) || !base || (base & 0xfff)) return;
+  IODeviceMemory *memory = IODeviceMemory::withRange(base, 0x1000);
+  gCanary.map = memory ? memory->map(kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+  if (memory) memory->release();
+  if (!gCanary.map) return;
+  gCanary.word = reinterpret_cast<volatile const uint32_t *>(gCanary.map->getVirtualAddress());
+  gCanary.phys = base;
+  gCanary.expected = *gCanary.word;
+  IOLog("PianoA830: console mailbox canary at %#llx: signature %#x (watched once a second; a change while XNU runs is an overwrite)\n",
+        base, gCanary.expected);
+}
+
+void canaryCheck()
+{
+  if (!gCanary.word) return;
+  const uint32_t now = *gCanary.word;
+  if (now == gCanary.expected) return;
+  gCanary.changes++;
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+  IOLog("PianoA830: CONSOLE MAILBOX OVERWRITTEN at %#llx while running (t=%llu s, change %u): signature %#x -> %#x; GPU %s\n", gCanary.phys,
+        ns / 1000000000ull, gCanary.changes, gCanary.expected, now, adreno830_running() ? "running" : "not running");
+  gCanary.expected = now;
+}
+
 void logger(void *, wait_result_t)
 {
   char line[RingBytes];
-  for (;;) {
+  canaryStart();
+  for (unsigned tick = 0;; ++tick) {
     uint32_t drops = 0;
     while (ringPop(line, &drops)) {
       if (drops) IOLog("PianoA830: (%u lines dropped: the ring was full)\n", drops);
       IOLog("PianoA830: %s\n", line);
     }
     if (drops) IOLog("PianoA830: (%u lines dropped: the ring was full)\n", drops);
+    if (tick % 1000 == 0) canaryCheck();
     IOSleep(1);
   }
 }
@@ -212,15 +258,34 @@ void run(void *, wait_result_t)
   if (mask) piano_a830_survey(mask);   // piano-gpu-survey=<mask>: the read-only survey first
   const IOReturn result = piano_a830_board_start(2);
   piano_a830_report(result);
-  piano_a830_note("bring-up %s", result == kIOReturnSuccess ? "done: the GPU runs" : "stopped");
+  piano_a830_note("bring-up %s", adreno830_running() ? "done: the GPU runs" : result == kIOReturnSuccess ? "stopped (piano-gpu-stop)" : "failed");
+  // Where the GPU-side streams go, once S3 programmed the SMMU, and again once the session's Metal clients are up. Only while the GPU
+  // stays on: piano-gpu-slumber would collapse CX, and an unclocked SMMU read can hang the bus.
+  const Adreno830Board *board = piano_a830_board();
+  if (result == kIOReturnSuccess && adreno830_status.stage >= A830SSmmu && board && !board->knobs.slumber) {
+    piano_a830_smmu_routes("after the bring-up");
+    if (adreno830_running()) {
+      IOSleep(60000);
+      piano_a830_smmu_routes("60 s later");
+    }
+  }
 }
 }  // namespace
+
+// The display's fence rule without a link dependency either way (the KC resolves a native kext's imports only from the natives linked
+// before it, and NativeGopDisplay comes first): NativeGopDisplay finds this registered service by class (serviceMatching("PianoA830"))
+// and calls callPlatformFunction("native-adreno-fences", false, uint32_t *submitted, uint32_t *retired), which answers with
+// native_adreno_fences() (NativeAdrenoPublish.cpp): kIOReturnSuccess with both, kIOReturnNotReady before S9 or after a device loss.
+// Lock-free, any thread context.
+extern "C" bool native_adreno_fences(uint32_t *submitted, uint32_t *retired);
 
 class PianoA830 : public IOService {
   OSDeclareDefaultStructors(PianoA830)
 public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3,
+                                void *param4) override;
 };
 
 OSDefineMetaClassAndStructors(PianoA830, IOService)
@@ -262,7 +327,18 @@ bool PianoA830::start(IOService *provider)
     return true;
   }
   thread_deallocate(thread);
+  if (gLevel >= 2) registerService();   // for the display's fence lookup (callPlatformFunction below)
   return true;
+}
+
+IOReturn PianoA830::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3,
+                                         void *param4)
+{
+  if (functionName && functionName->isEqualTo("native-adreno-fences")) {
+    if (!param1 || !param2) return kIOReturnBadArgument;
+    return native_adreno_fences(static_cast<uint32_t *>(param1), static_cast<uint32_t *>(param2)) ? kIOReturnSuccess : kIOReturnNotReady;
+  }
+  return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
 }
 
 // ---- the macOS accelerator --------------------------------------------------------------------------------------------------------
