@@ -529,7 +529,7 @@ Gauge.h and ChargerPmic.h are written fresh. Xiaomi's own charger modules (the `
 property ids or register maps from them by disassembly is outside what this repository derives from. Property ids come from the
 GPL driver's text and the APSL K90 port's notes, both read as descriptions, and are confirmed or refuted on the device.
 
-## 9. The DSP client contract (PianoAudio, PianoSensors, PianoUsbHost)
+## 9. The DSP client contract (PianoAudio, PianoSensors, PianoUsbHost, PianoDp)
 
 The DSP that charges also hosts the audio and sensor domains, and natively nothing restarts it: one DSP crash ends charging until
 the reboot. So PianoPower stays its only owner and offers the other kexts a client interface,
@@ -542,6 +542,7 @@ listed after PianoPower in `configs/k27-native-kexts.txt`, so the KC links the f
 | QRTR client ports | `piano_qrtr_open(service, instance, client, ctx)` with `server(up, node, port, instance)` and `receive(node, port, data, len)` callbacks; `piano_qrtr_server` (with a generation); `piano_qrtr_send` (queued, ≤ 1024 bytes); `piano_qrtr_close` (DEL_CLIENT to the DSP). Up to 8 ports, numbered from 16; a reopened slot gets a new number. A port can be opened before the DSP runs. IPCRTR now has **2048-byte receive buffers** (8 of them). | B |
 | Health | `piano_adsp_health(&h)`: stage, `dsp_up` (ready, not fatal, GLINK agreed and not broken, router hello), the fatal bit, the fatal-report count, the **link generation** (moves when a channel that was up goes down, or the transport breaks), `charger_pd` state and generation, the quiet bits, and **its own crash-reason string** (no longer shared with the `open:` notes). | C |
 | Quiet | `piano_adsp_quiet()`: `PIANO_ADSP_QUIET_CHARGER`, set while a charger generation is configured. It runs from the codec's link until a whole cycle ends with nothing left to write and the port enable is answered or timed out (board configuration and first policy writes included), at most 60 s. It is advisory: clients still answer what the DSP waits for. | C |
+| Port events | `piano_port_events(client, ctx)` with `event(ctx, PianoPortEvent *)`, `piano_port_seen()` (`PortEvents.c`, 2026-11-11, for PianoDp's D2): every USB-C port notification (owner 0x800c, opcode 0x16) handed to up to **4 clients** as the bytes received (≤ 32 kept, with the real length and a sequence), on PianoPower's thread after the acknowledgement is queued; read only: nothing goes back to the DSP, PianoPower stays the port owner's only correspondent. Without a client: one atomic load. Clients taking more than 20 ms are logged. Host test `tests/port_events_host.cpp` | — |
 
 **What protects the charger from a client.**
 - Every channel has its own buffers.

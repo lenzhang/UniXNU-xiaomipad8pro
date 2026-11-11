@@ -3,8 +3,9 @@
 # k27 native kext: the host tests first (tests/power_host.cpp: the PMIC RTC readout and its date math (PmicRtc.h, RtcReadout.h), the
 # charger PMIC discovery over an SPMI model, the software I2C bus against a bq27z561 model, the MCA codec and charging policy against a
 # model of the DSP, and ChargePolicy wired to the codec (ChargeLink.h, piano-power-policy=1) against the same model; tests/policy_host.cpp:
-# ChargePolicy.c alone against a firmware and source model), then the objects in out/native-kexts/PianoPower
-# for tooling/k27/kext/PianoPower.json. Inert without the boot argument piano-power (docs/drivers/charging.md).
+# ChargePolicy.c alone against a firmware and source model; tests/port_events_host.cpp: the USB-C port events' fan-out), then the
+# objects in out/native-kexts/PianoPower for tooling/k27/kext/PianoPower.json. Inert without the boot argument piano-power
+# (docs/drivers/charging.md).
 #   environment: PIANO_K27_TREE (the k27 tree, read only: its compile recipes), K27_OBJ (default k27-native-obj), CC/CXX (host compilers
 #                for the tests, default cc/c++)
 set -euo pipefail
@@ -29,6 +30,12 @@ T=$D/out/native-kexts/PianoPower/host-tests; mkdir -p "$T"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/ports_host.cpp" "$T/QrtrPorts.o" "$T/QcomQrtr.o" \
   "$T/PianoMca.o" "$T/QcomGlink.o" -o "$T/ports_host"
 "$T/ports_host" || { echo "Error: PianoPower client-contract host tests failed" >&2; exit 1; }
+# The USB-C port events' read-only fan-out (PortEvents.c, the contract's "USB-C port events"; PianoDp's D2): registration, delivery,
+# and the charger codec's side of the hook.
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -DPIANO_PORT_EVENTS_TEST -I "$D/package/include" -c "$P/PortEvents.c" -o "$T/PortEvents.o"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/port_events_host.cpp" "$T/PortEvents.o" \
+  "$T/PianoMca.o" -o "$T/port_events_host"
+"$T/port_events_host" || { echo "Error: PianoPower port-event host tests failed" >&2; exit 1; }
 # The kernel's calendar uses the same arithmetic: k27 0060 adds PmicRtc.h unchanged as osfmk/arm64/piano_rtc.h.
 for p in "$D"/patches/k27/0060-*.patch; do
   [ -f "$p" ] || continue
@@ -37,7 +44,7 @@ for p in "$D"/patches/k27/0060-*.patch; do
 done
 python3 "$D/tooling/k27/build-native-kext.py" PianoPower "$P/PianoPower.cpp" "$P/PianoAdsp.cpp" "$P/PianoBattery.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
   "$P/PianoMca.c" "$P/ChargePolicy.c" "$P/PianoQrtr.c" "$P/PianoAdspFirmware.c" "$P/QcomSmem.c" "$P/QcomSmp2p.c" "$P/QcomGlink.c" "$P/QcomQmp.c" \
-  "$P/QcomRpmh.c" "$P/QcomMdt.c" "$P/QcomQrtr.c" "$P/QrtrPorts.c" "$P/FatVolume.c" "$P/Sm8750Scm.c" \
+  "$P/QcomRpmh.c" "$P/QcomMdt.c" "$P/QcomQrtr.c" "$P/QrtrPorts.c" "$P/PortEvents.c" "$P/FatVolume.c" "$P/Sm8750Scm.c" \
   -I "$P" --obj "${K27_OBJ:-k27-native-obj}"
 # The imports the KC resolves from the libraries PianoPower.json names: NativeUfs's partition reads, PianoA830's DRV-2 and secure-call
 # lock words (package/include/PianoScmLock.h, docs/scm-lock.md); anything else the kernel must define.

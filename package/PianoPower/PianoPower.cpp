@@ -12,7 +12,8 @@
 //                  locator, then the charger properties are read every 5 s and the conservative policy of PianoMca.c is applied: input
 //                  current limit by charger type (at most 1.5 A at 5 V), charge current 1.0 A between 15 and 38 degC (0.5 A outside or
 //                  without a temperature), the charger's enable bit set if it is clear, back to the firmware's own 100 mA / 500 mA on
-//                  detach. USB-C port notifications are acknowledged. Nothing else is written.
+//                  detach. USB-C port notifications are acknowledged (and handed, read only, to the port-event clients:
+//                  PortEvents.c, PianoDp). Nothing else is written.
 // Further boot arguments: piano-power-period=S (report interval, default 30), piano-power-gauge=0 (no gauge reads),
 // piano-power-write=0 (level 2 without the charger writes: the DSP runs on its own defaults), piano-power-hv=1 (level 2 also asks a PD
 // source with a fixed 9 V PDO for 9 V and then allows 1.6 A), piano-power-fw=DIR (the DSP's images as DIR/adsp.mbn and
@@ -48,6 +49,7 @@ extern "C" {
 #include "PianoAdsp.h"
 #include "AdspHealth.h"
 #include "PianoMca.h"
+#include "PortEvents.h"
 }
 #include "ChargeLink.h"
 
@@ -846,7 +848,14 @@ void PianoPower::serviceMca(uint64_t now)
       fUcsiNotesLogged++;
       note("ucsi: notification from owner 0x800b (%u so far; nothing is sent back: we run no UCSI client)", fMca.ucsi_notifies);
     }
-    if (r == McaPanNotified) note("mca: USB-C port notification (port %u): acknowledged", data[12]);
+    if (r == McaPanNotified) {
+      note("mca: USB-C port notification (port %u): acknowledged", data[12]);
+      // Read only: the notification to the port-event clients (PortEvents.c, PianoAdspContract.h; PianoDp's D2), the acknowledgement
+      // already queued. Nothing to do without a client.
+      const uint64_t t0 = nowMs();
+      if (piano_port_publish(data, length) && nowMs() - t0 > 20)
+        note("port events: the clients took %llu ms (the charger waited)", (unsigned long long)(nowMs() - t0));
+    }
     if (r == McaCycleDone) {
       char line[520];
       if (fMca.cycles == 1) {

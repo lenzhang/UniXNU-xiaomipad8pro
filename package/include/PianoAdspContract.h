@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* The piano audio DSP (ADSP) client contract: what PianoPower offers the other native kexts that talk to the running DSP (PianoAudio's
- * adsp_apps, PianoSensors' fastrpcglink-apps-dsp and its sensor QMI client), and the rules they keep. Include it as
+ * adsp_apps, PianoSensors' fastrpcglink-apps-dsp and its sensor QMI client, PianoDp's USB-C port events), and the rules they keep. Include it as
  * <PianoAdspContract.h> (tooling/k27/build-native-kext.py puts package/include on every kext's include path); name
  * "com.unixnu.driver.PianoPower" among the libraries of the client's descriptor and list the client after PianoPower in
  * configs/k27-native-kexts.txt, so the KC links these functions by name to PianoPower's single copy. docs/drivers/charging.md §9.
@@ -99,6 +99,32 @@ uint32_t piano_adsp_quiet(void);
 
 /* The charger domain's state (as in the health): 0 unknown, 0x1fffffff up, ...; *ups (optional) its transitions to up. */
 uint32_t piano_qrtr_charger_pd(uint32_t *ups);
+
+/* ---- USB-C port events (read only; package/PianoPower/PortEvents.c, docs/drivers/displayport.md D2) ----
+ * The DSP's port notifications (PMIC GLINK owner 0x800c, opcode 0x16: the Type-C/PD state machine's attach, orientation, mux, alt
+ * mode SVID, DP pin assignment and HPD), as PianoPower receives them on PMIC_RTR_ADSP_APPS at level 2 after it enabled them. PianoPower
+ * does not decode them and stays their only owner: it acknowledges every one (the firmware holds its state machine until then); a
+ * client only watches (the decoder is the client's: package/PianoDp/DpPort.h). Each notification is handed to every registered client
+ * as the bytes that arrived (the GLINK
+ * header and payload; 32 bytes for the DisplayPort notifications Linux decodes, pmic_glink_altmode.c), after PianoPower queued its
+ * acknowledgement. The event() callback runs on PianoPower's thread ("piano-power", which also runs the charger), no lock held, with
+ * rule 2 above: copy, wake your own thread, return (PianoPower logs clients that took more than 20 ms). The event pointer is valid
+ * during the call only. Nothing is sent to the DSP through this interface. */
+#define PIANO_PORT_EVENT_MAX 32u        /* bytes kept of one notification (a longer one is cut; length says how many came) */
+#define PIANO_PORT_CLIENTS 4u
+typedef struct {
+    uint32_t sequence;                 /* 1, 2, ...: the notifications PianoPower received this boot */
+    uint32_t length;                   /* the notification's length as received */
+    uint8_t data[PIANO_PORT_EVENT_MAX];/* its first min(length, 32) bytes: owner, type, opcode (SVID in bits 31:16), payload */
+} PianoPortEvent;
+typedef struct {
+    void (*event)(void *context, const PianoPortEvent *event);
+} PianoPortClient;
+/* Registers a client for the rest of the boot (any time, before or after the DSP is up): its slot (>= 0), -1 all taken, -2 bad
+ * arguments. Notifications that came before are not replayed; piano_port_seen tells whether any did. */
+int piano_port_events(const PianoPortClient *client, void *context);
+/* The port notifications PianoPower received this boot so far (0 while the DSP is not up, below level 2, or nothing was plugged). */
+uint32_t piano_port_seen(void);
 
 #ifdef __cplusplus
 }
