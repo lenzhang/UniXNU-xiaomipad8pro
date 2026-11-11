@@ -52,7 +52,9 @@ catalog `dpu_12_0_sm8750.h`, `phy-qcom-qmp-combo.c`, `dispcc-sm8750.c`, `pmic_gl
 
 **4.1 Owners.** A new kext **PianoDp** owns the DP controller, the DP half of the QMP PHY and the DIO4485's DP states. **PianoDpu**
 owns every DPU register (dpu.md §4.1) and grows an "external path" API. **PianoPower** owns the DSP and decodes PAN (B7 H2) and hands
-PianoDp each port event (`callPlatformFunction "PianoPowerPortEvent"`, a struct copy; no link dependency). The combo PHY's shared
+PianoDp each port event through the DSP client contract (`package/include/PianoAdspContract.h`: a new port-event callback next
+to its channels and QRTR ports, under its rules: called on PianoPower's DSP thread, the client copies the event and wakes its own
+thread; PianoDp listed after PianoPower). The combo PHY's shared
 DP_COM block (mode, orientation, reset, power-down) gets **one** owner shared by PianoUsbHost's USB3 mode (B7 H7) and PianoDp: a small
 header-level "combo PHY" state machine in PianoUsbHost that PianoDp calls (mode USB3 / USB3+DP / DP, orientation), so a mode change
 never races. NativeGopDisplay grows the second IOMFB instance (4.5).
