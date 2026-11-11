@@ -358,4 +358,170 @@ constexpr uint32_t kDmaWindowBytesL5 = 64u << 20;
 constexpr uint32_t kIovaWindowBase = 0x20000000;   // 512 MiB: inside the first 1 GiB of a 32-bit input space
 constexpr uint32_t kIovaBlockBytes = 2u << 20;
 
+// ================================================== level 6: the copy engine, the host transport and the firmware's messages
+// Facts of the chip and of the three protocols on top of it, read from the Ubuntu kernel of section 3 for the wire shapes only
+// (`ce.c`, `hal*.c`, `htc.[ch]`, `wmi.[ch]`, `hw.c`, `core.c`); no code, comment or table of it is here. wifi.md section 14 has
+// the message table.
+//
+// ---- the copy engine's rings (the chip's register map, through the BAR0 window of level 4) ----
+// Three rings per pipe, each a contiguous array of 32-bit descriptors in the DMA window:
+//   the source ring (host writes a buffer to send, the chip reads it),
+//   the destination ring (host writes an empty buffer, the chip fills it) — also a *source*-direction ring: the host produces,
+//   the destination-status ring (the chip writes one entry per filled buffer, with its length) — a destination-direction ring.
+// Each ring has two pointers. The host's own pointer lives in the chip's register space (the R2 group below); the chip's lives in
+// host memory, at an address the host programs into the ring (so no register has to be read to poll).
+// Both pointers of every ring count 32-bit words (so does the size field of its base register), not bytes and not descriptors.
+constexpr uint32_t kCeUnitStride = 0x2000;        // between pipe n's and pipe n+1's source (and destination) unit
+constexpr uint32_t kCeStatusRingBase = 0x58;      // the destination-status ring's register block, in the destination unit
+constexpr uint32_t kCeR2Hp = 0x400, kCeR2Tp = 0x404;             // the host's pointer, in the unit's register block
+constexpr uint32_t kCeStatusR2Hp = 0x408, kCeStatusR2Tp = 0x40c;  // the destination-status ring's, in the destination unit
+constexpr uint32_t kCeDstRingCtrl = 0xb0;         // in the destination unit: the largest buffer the chip may fill (bits 15:0)
+constexpr uint32_t kCeDstRingCtrlMaxLen = 0xffffu;
+// The register block of one ring (R0): base address low at +0, then these offsets. A source-direction ring (the source ring and
+// the destination ring) and a destination-direction ring (the destination-status ring) differ in two of them, which is why both
+// sets are here: they are the deltas of this chip's transmit-command and reorder ring blocks.
+constexpr uint32_t kRingBaseMsb = 0x04, kRingId = 0x08, kRingMisc = 0x10;
+constexpr uint32_t kSrcRingTpAddrLo = 0x1c, kSrcRingTpAddrHi = 0x20, kSrcRingConsumerInt0 = 0x30, kSrcRingConsumerInt1 = 0x34;
+constexpr uint32_t kDstRingHpAddrLo = 0x14, kDstRingHpAddrHi = 0x18, kDstRingProducerInt = 0x24;
+// base_msb: the address's high bits (7:0) and the ring's size in 32-bit words (27:8). id: the ring's identifier (15:8) and the
+// descriptor's size in words (7:0). misc: bit 6 enables the ring, bit 1 switches the loop count off (source rings).
+constexpr uint32_t kRingBaseMsbAddrHi = 0xffu, kRingBaseMsbSizeShift = 8, kRingBaseMsbSizeMask = 0xfffffu;
+constexpr uint32_t kRingIdEntrySizeMask = 0xffu, kRingIdRingIdShift = 8;
+constexpr uint32_t kRingMiscEnable = 1u << 6, kRingMiscLoopCountDisable = 1u << 1;
+constexpr uint32_t kRingAddrLowMask = 0xffffffffu, kRingAddrHiShift = 32;
+// The ring identifiers this chip gives its copy-engine rings (a destination-direction ring carries its own in its register).
+constexpr uint32_t kRingIdCe0Src = 64, kRingIdCe0Dst = 81, kRingIdCe0DstStatus = 100;
+// A source descriptor is four words, a destination descriptor two, a destination-status descriptor four.
+constexpr uint32_t kCeSrcDescWords = 4, kCeDstDescWords = 2, kCeStatusDescWords = 4;
+// source: word0 address low, word1 address high (7:0) | byte swap (9) | gather (11) | length (31:16), word2 an identifier the
+// status entry carries back (15:0), word3 the ring identifier (27:20) and the loop count (31:28).
+constexpr uint32_t kCeDescAddrHiMask = 0xffu, kCeDescLenShift = 16, kCeDescLenMask = 0xffffu;
+constexpr uint32_t kCeDescGather = 1u << 11, kCeDescByteSwap = 1u << 9;
+constexpr uint32_t kCeDescMetaMask = 0xffffu, kCeDescRingIdShift = 20;
+// status: word0 length (31:16) and the same flags, word3 the identifier (15:0) the source descriptor carried.
+constexpr uint32_t kCeStatusLenShift = 16, kCeStatusLenMask = 0xffffu;
+// The host's own ring sizes (ours, not the firmware's: the two sides of a pipe are sized independently; the firmware's are the
+// nine entries of kCePipes, which level 5 sends). Only the four pipes the host transport uses are created: 0 and 3 out, 1 and 2
+// in. Every ring is a power of two, as the chip's index arithmetic needs.
+struct CeHostPipe { uint8_t pipe; uint32_t srcEntries, dstEntries, bufferBytes; };
+constexpr CeHostPipe kCeHostPipes[] = {
+  {0, 16, 0, 0},        // the transport's control messages out
+  {1, 0, 32, 2048},     // the firmware's data messages in (unused before level 7, kept so a copy cannot stall)
+  {2, 0, 64, 2048},     // the firmware's and the transport's messages in
+  {3, 32, 0, 0},        // the host's messages out
+};
+constexpr unsigned kCeHostPipeCount = sizeof kCeHostPipes / sizeof kCeHostPipes[0];
+constexpr unsigned kCePipeCtrlOut = 0, kCePipeDataIn = 1, kCePipeMsgIn = 2, kCePipeMsgOut = 3;
+constexpr uint32_t kCeSendBuffers = 8;            // ours: the messages in flight on the two outbound pipes
+constexpr uint32_t kCeSendBufferBytes = 2048;     // the largest message either outbound pipe carries
+constexpr uint32_t kCeDstKeepFree = 2;            // elements of a destination ring left without a buffer
+
+// ---- the host transport (HTC) ----
+// Every message carries an 8-byte header: word0 endpoint (7:0) | flags (15:8) | payload length (31:16); word1 trailer length
+// (7:0) | sequence (15:8). The control endpoint is 0; the firmware answers on the pipe the service's entry names.
+constexpr uint32_t kHtcHeaderBytes = 8;
+constexpr uint32_t kHtcHdrEndpointMask = 0xffu, kHtcHdrFlagsShift = 8, kHtcHdrLengthShift = 16;
+constexpr uint32_t kHtcFlagNeedCreditUpdate = 0x01, kHtcFlagTrailerPresent = 0x02;
+constexpr uint32_t kHtcCtrlTrailerShift = 0, kHtcCtrlSequenceShift = 8;
+enum HtcMessage : uint16_t {
+  kHtcMsgReady = 1, kHtcMsgConnectService = 2, kHtcMsgConnectServiceResp = 3, kHtcMsgSetupComplete = 4,
+  kHtcMsgSetupCompleteEx = 5, kHtcMsgSuspendComplete = 6, kHtcMsgNackSuspend = 7, kHtcMsgWakeFromSuspend = 8,
+};
+// The ready message: word0 message id (15:0) | credit count (31:16); word1 credit size (15:0) | endpoints (23:16). The extended
+// form adds word2: version (7:0) | messages per bundle (15:8).
+// The connect request: word0 message id (15:0) | service (31:16); word1 connection flags (15:0) | metadata length (23:16).
+// Its answer: word0 message id (15:0) | service (31:16); word1 status (7:0) | endpoint (15:8) | largest message (31:16).
+constexpr uint32_t kHtcReadyCreditCountShift = 16, kHtcReadyCreditSizeMask = 0xffffu, kHtcReadyEndpointsShift = 16;
+constexpr uint32_t kHtcMsgIdMask = 0xffffu, kHtcServiceShift = 16;
+constexpr uint32_t kHtcConnFlagsMask = 0xffffu, kHtcConnRecvAllocShift = 8;
+constexpr uint32_t kHtcConnFlagDisableCreditFlow = 1u << 3;
+constexpr uint32_t kHtcRespStatusMask = 0xffu, kHtcRespEndpointShift = 8, kHtcRespMaxMessageShift = 16;
+constexpr uint32_t kHtcConnStatusSuccess = 0;
+// The trailer's records: an identifier, a length, two padding bytes, then the records themselves; a credit report is one
+// endpoint and one credit count per four bytes.
+constexpr uint32_t kHtcRecordCredits = 1, kHtcRecordHeaderBytes = 4, kHtcCreditReportBytes = 4;
+constexpr unsigned kHtcEndpoints = 8, kHtcMaxControlMessage = 256, kHtcMaxMessage = 4096;
+
+// ---- the firmware's own message interface (WMI) ----
+// A command is a 4-byte header (the command identifier in bits 23:0) and then TLVs; an event is TLVs alone. A TLV's header is one
+// 32-bit word: length (15:0) and tag (31:16), and its value is padded to a whole number of words.
+constexpr uint32_t kWmiCmdHeaderBytes = 4, kWmiTlvHeaderBytes = 4;
+constexpr uint32_t kWmiCmdIdMask = 0xffffffu;
+constexpr uint32_t kWmiTlvLenMask = 0xffffu, kWmiTlvTagShift = 16;
+enum WmiCommand : uint32_t {
+  kWmiCmdInit = 0x00001, kWmiCmdStartScan = 0x03001, kWmiCmdStopScan = 0x03002, kWmiCmdScanChanList = 0x03003,
+  kWmiCmdPdevSetParam = 0x04003, kWmiCmdPdevSetHwMode = 0x0401e, kWmiCmdVdevCreate = 0x05001, kWmiCmdVdevDelete = 0x05002,
+};
+enum WmiEvent : uint32_t {
+  kWmiEvtServiceReady = 0x00001, kWmiEvtReady = 0x00002, kWmiEvtServiceAvailable = 0x00003, kWmiEvtScan = 0x03001,
+  kWmiEvtChanInfo = 0x04002, kWmiEvtServiceReadyExt = 0x04009, kWmiEvtPdevSetHwModeResp = 0x04010,
+  kWmiEvtServiceReadyExt2 = 0x04022, kWmiEvtVdevDeleteResp = 0x05006, kWmiEvtMgmtRx = 0x07001, kWmiEvtDebugMessage = 0x1d003,
+  kWmiEvtDiag = 0x1d011, kWmiEvtRegChanListCc = 0x3a001, kWmiEvtRegChanListCcExt = 0x3a003,
+};
+enum WmiTag : uint32_t {
+  kWmiTagArrayUint32 = 0x010, kWmiTagArrayByte = 0x011, kWmiTagArrayStruct = 0x012, kWmiTagArrayFixedStruct = 0x013,
+  kWmiTagServiceReadyEvent = 0x020, kWmiTagHalRegCapabilities = 0x021, kWmiTagHostMemRequest = 0x022, kWmiTagReadyEvent = 0x023,
+  kWmiTagScanEvent = 0x024, kWmiTagMgmtRxHeader = 0x02c, kWmiTagInitCmd = 0x04a, kWmiTagResourceConfig = 0x04b,
+  kWmiTagHostMemoryChunk = 0x04c, kWmiTagStartScanCmd = 0x04d, kWmiTagStopScanCmd = 0x04e, kWmiTagChannel = 0x050,
+  kWmiTagPdevSetParamCmd = 0x052, kWmiTagVdevCreateCmd = 0x056, kWmiTagVdevDeleteCmd = 0x057,
+  kWmiTagVdevTxrxStreams = 0x19b, kWmiTagServiceReadyExtEvent = 0x1ac, kWmiTagVdevDeleteRespEvent = 0x1c2,
+  kWmiTagPdevSetHwModeCmd = 0x203, kWmiTagServiceAvailableEvent = 0x22f, kWmiTagPdevBandToMac = 0x24b,
+};
+// The resource configuration this chip's firmware wants (its own entry's values; the structure is 72 words after the TLV header,
+// and a firmware of another version may read more of them, which is why the whole structure is written and the words this driver
+// does not set are left zero).
+constexpr uint32_t kWmiResourceConfigWords = 72;
+constexpr uint32_t kWmiCfgNumVdevs = 4, kWmiCfgNumPeers = 16, kWmiCfgNumTids = 32, kWmiCfgNumOffloadPeers = 3,
+                   kWmiCfgNumOffloadReorderBuffs = 3, kWmiCfgNumPeerKeys = 2, kWmiCfgAstSkidLimit = 16,
+                   kWmiCfgRxTimeoutLoPri = 100, kWmiCfgRxTimeoutHiPri = 40, kWmiCfgDecapModeNativeWifi = 1,
+                   kWmiCfgScanMaxPending = 4, kWmiCfgBmissOffloadMaxVdev = 3, kWmiCfgRoamOffloadMaxVdev = 3,
+                   kWmiCfgRoamOffloadMaxApProfiles = 8, kWmiCfgTxDbgLogSize = 1024, kWmiCfgVowConfig = 0,
+                   kWmiCfgGtkOffloadMaxVdev = 2, kWmiCfgNumMsduDesc = 0x400, kWmiCfgMaxFragEntries = 0xa,
+                   kWmiCfgNumTdlsVdevs = 1, kWmiCfgNumTdlsConnTableEntries = 8, kWmiCfgBeaconTxOffloadMaxVdev = 2,
+                   kWmiCfgNumMulticastFilterEntries = 0x20, kWmiCfgNumWowFilters = 0x16, kWmiCfgRxBatchmode = 1,
+                   kWmiCfgPeerMapUnmapVersion = 1, kWmiCfgUsePdevId = 1;
+// The two flag words of that structure, as this firmware's own host always sends them: the 64-bit channel-information form and
+// the acknowledgement signal strength in flag1; "work out the next beacon count" and "no address-table indications" in flags2.
+constexpr uint32_t kWmiCfgFlag1 = (1u << 5) | (1u << 18);
+constexpr uint32_t kWmiCfgFlags2 = (1u << 9) | (1u << 18);
+constexpr uint32_t kWmiMaxMemRequests = 32;       // how many the firmware may ask for in its service-ready event
+constexpr uint32_t kWmiHwModeMax = 0xf;           // "no hardware mode in this init": this chip has a single one
+constexpr uint32_t kWmiPdevIdSoc = 0;
+// A station virtual device, and the scan this level runs on it.
+constexpr uint32_t kWmiVdevTypeStation = 2, kWmiVdevSubtypeNone = 0;
+constexpr uint32_t kWmiBandCount = 2;             // the stream entries a virtual device carries: 2.4 GHz and 5 GHz
+constexpr uint32_t kWmiVdevStatsIdInvalid = 0xff;
+constexpr uint32_t kWmiStartScanWords = 39;       // the start-scan structure's words after its TLV header
+constexpr uint32_t kWmiStopScanOne = 0;           // stop the scan of this identifier (and not every scan of the radio)
+constexpr uint32_t kWmiScanId = 0xa000, kWmiScanRequestorId = 1;
+constexpr uint32_t kWmiScanPriorityLow = 1;
+constexpr uint32_t kWmiScanFlagPassive = 0x1, kWmiScanFlagChanStatEvent = 0x10, kWmiScanFlagFilterProbeReq = 0x20;
+constexpr uint32_t kWmiScanDwellActiveMs = 50, kWmiScanDwellPassiveMs = 150, kWmiScanMinRestMs = 50,
+                   kWmiScanMaxRestMs = 500, kWmiScanProbeDelayMs = 5, kWmiScanMaxTimeMs = 20000;
+enum WmiScanEventType : uint32_t {
+  kWmiScanEvStarted = 1u << 0, kWmiScanEvCompleted = 1u << 1, kWmiScanEvBssChannel = 1u << 2,
+  kWmiScanEvForeignChannel = 1u << 3, kWmiScanEvDequeued = 1u << 4, kWmiScanEvPreempted = 1u << 5,
+  kWmiScanEvStartFailed = 1u << 6, kWmiScanEvRestarted = 1u << 7, kWmiScanEvForeignChannelExit = 1u << 8,
+};
+enum WmiScanReason : uint32_t {
+  kWmiScanReasonCompleted = 0, kWmiScanReasonCancelled = 1, kWmiScanReasonPreempted = 2, kWmiScanReasonTimedOut = 3,
+  kWmiScanReasonInternalFailure = 4,
+};
+// The channels a passive scan of this level visits: the 2.4 GHz band's 13 channels and the 5 GHz band's non-radar ones, as
+// centre frequencies in MHz (the firmware's regulatory domain decides which it really visits, and its regulatory event says so).
+constexpr uint32_t kScanChannels24[] = {2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472};
+constexpr uint32_t kScanChannels5[] = {5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825};
+constexpr unsigned kScanChannelCount24 = sizeof kScanChannels24 / sizeof kScanChannels24[0];
+constexpr unsigned kScanChannelCount5 = sizeof kScanChannels5 / sizeof kScanChannels5[0];
+constexpr unsigned kScanChannelMax = kScanChannelCount24 + kScanChannelCount5;
+constexpr unsigned kScanEntriesMax = 32;          // how many networks one scan keeps (the rest are counted, not kept)
+constexpr unsigned kSsidMax = 32;                 // 802.11: a service set identifier is at most 32 bytes
+// 802.11 management frames the scan delivers: the frame control's type and subtype, and where the addresses are.
+constexpr uint32_t kDot11FcTypeMask = 0x0c, kDot11FcSubtypeMask = 0xf0, kDot11FcTypeManagement = 0x00;
+constexpr uint32_t kDot11SubtypeProbeResponse = 0x50, kDot11SubtypeBeacon = 0x80;
+constexpr uint32_t kDot11HeaderBytes = 24, kDot11BeaconFixedBytes = 12;   // timestamp, interval, capability
+constexpr uint32_t kDot11ElementSsid = 0, kDot11ElementDsParams = 3;
+constexpr uint32_t kWmiTimeoutMs = 10000;         // the deadline of each level 6 step (the firmware's own is five seconds)
+constexpr uint32_t kScanWaitMsDefault = 12000;    // how long the scan itself may take before the level gives up on it
+
 }  // namespace pianowifi

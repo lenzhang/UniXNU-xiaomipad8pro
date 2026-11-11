@@ -1,6 +1,7 @@
 PianoWifi is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Levels 1 (read-only survey), 2 (power), 3 (the PCIe0 link),
-4 (the firmware over MHI) and 5 (the IPC router's channels, QRTR and the WLAN firmware's QMI service). What it takes from other
-work, and from where:
+4 (the firmware over MHI), 5 (the IPC router's channels, QRTR and the WLAN firmware's QMI service) and 6 (the copy engine, the
+host transport, the firmware's message interface and a passive scan), with the macOS side of level 6 in PianoWifiEthernet.cpp.
+What it takes from other work, and from where:
 
 UniXNU-sheng (unixnu-research/UniXNU-sheng, main 00ba90984e831e4c6ce30ec3d8a56e6434e9f1af), BSD-2-Clause-Patent (LICENSE sha256
 5b1d3d911103cb0f41641ec0964c5ac1f7e229f57aa072b6ac38bae913a1307b; SM8550 + WCN7850, the Wi-Fi path hardware-verified there per its
@@ -104,6 +105,40 @@ a string inside a structure and a string of its own are encoded), drivers/bus/mh
 context and ring-element layouts and the doorbell order), net/qrtr (the version 1 header and the control messages). Not read and not
 used: any Qualcomm binary.
 
+Specifications only for level 6 (behaviour and wire facts; no code, comment or table copied), the same Ubuntu kernel and commit,
+read for what the chip and the firmware expect and in which order; every fact landed in WifiHw.h, and the writers, parsers and
+the step machine on top of them (WifiCe.h, WifiHtc.h, WifiWmi.h, WifiLink.h) are this repository's own:
+  ath12k/htc.c and htc.h: the transport's 8-byte header and its fields, the four control messages (ready, connect a service,
+    its answer, set-up complete) with each word's layout, the connection flags (the receive allocation, "no credit flow
+    control"), the connect statuses, the trailer's records and the credit report's shape, that only a message interface keeps
+    credit flow control, and that a message costs ceil(length / credit size) credits.
+  ath12k/wmi.c and wmi.h: the command and event identifiers level 6 uses, the 4-byte command header, the TLV form (length in
+    the low half, tag in the high half, the value padded to a word) and the four array tags; the field order of the
+    service-ready, ready, scan and management-frame events; the initialisation command's three TLVs and the field order of the
+    resource configuration's 72 words with the two flag words its host always sends; the start-scan structure's 39 words, the
+    scan flags and the dwell times its host uses, the five TLVs that follow it and that the address array carries the broadcast
+    address; the stop-scan and virtual-device commands; the scan event types and reasons.
+  ath12k/wifi7/wmi.c and hw.h: the resource-configuration values of this chip's own entry (four virtual devices, sixteen peers,
+    thirty-two traffic identifiers, the receive timeouts, native-Wi-Fi decapsulation, the message-descriptor count, peer-map
+    version 1, "use a radio identifier") and the target constants behind them.
+  ath12k/ce.c, ce.h, hal.c, wifi7/hal.c, wifi7/hal.h, wifi7/hal_wcn7850.c, wifi7/hal_qcc2072.c, wifi7/hal_desc.h: that a pipe is
+    a source ring, a destination ring and a destination-status ring; that both the source and the destination ring are producer
+    rings of the host's while the status ring is the chip's; the three descriptor layouts and their fields (the address's high
+    bits, the length, the identifier that comes back in the status entry, the ring identifier); the register block of a ring
+    (base low and high with the size in words, the identifier with the descriptor's size, the pointer-address pair, the
+    interrupt set-up, the enable bit in the misc register), the R2 block at +0x400 with the host's pointer, the
+    destination-status ring's own block at +0x58 and its pointer at +0x408, the largest-buffer register of a destination ring,
+    the units at 0x01b80000 and 0x2000 apart, the ring identifiers (64, 81 and 100 plus the pipe), **that both pointers count
+    32-bit words**, and that the chip writes its own pointer into a host-memory block the ring names.
+  ath12k/wifi7/pci.c and wifi7/hw.c: that 0x110e is this chip, its hardware entry (the board size, the auxiliary microcode, the
+    internal sleep clock, nine copy engines, fourteen service entries, shadow registers supported) and the window register
+    0x3278 it shares with the QCC2072.
+  ath12k/core.c: the order the whole start-up runs in (the transport up, its ready awaited, the services connected, set-up
+    complete, the service-ready event, the initialisation, the ready event) and that the host memory chunks are always none.
+  ath12k/mac.c: what a scan needs (a created virtual device, which this chip does not have to start), the scan identifier, and
+    that a passive scan asks for no network by name.
+Not read and not used: any Qualcomm binary.
+
 Specifications only (no code, comment or table copied): mainline Linux drivers/clk/qcom/gcc-sm8750.c and tcsrcc-sm8750.c,
 include/dt-bindings/clock/qcom,sm8750-gcc.h, drivers/pci/controller/dwc/pcie-qcom.c and pcie-designware.h,
 drivers/phy/qualcomm/phy-qcom-qmp-pcie.c and phy-qcom-qmp-pcs-v7.h, drivers/pinctrl/qcom/pinctrl-sm8750.c (register offsets, bit
@@ -115,3 +150,10 @@ MHI host use them (behaviour only, no code, comment or table). Not read and not 
 engineering of vendor firmware or drivers). The firmware itself is never part of this repository: level 4 reads
 image/peach/amss20.bin out of the tablet's own modem_a partition at run time (LicenseRef-Proprietary-Firmware, no
 redistribution).
+
+PianoWifiEthernet.cpp (the macOS side of level 6) is new code for this repository, with the same shape as this repository's
+package/PianoNullEthernet/PianoNullEthernet.cpp (whose own provenance is that package's UPSTREAM): an IOEthernetController with
+no device behind it — the medium published, the interface attached and marked built in, every frame dropped, the BSD wait
+disabled — re-expressed here with its link left **down**, the scan list of level 6 copied onto it, and an address of this
+driver's own. PianoNullEthernet is not modified, and no kext from outside this repository is linked (the native kext rule,
+tooling/k27/check-native-kexts.py).
