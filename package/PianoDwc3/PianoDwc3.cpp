@@ -78,6 +78,7 @@ struct Args {
   uint32_t hid;       // piano-usb-hid=1: a keyboard and a pointer for macOS, driven from the Mac over a third port (piano input)
   uint32_t hidHold;   // piano-usb-hid-hold=MS: keys/buttons still down this long after the last command are released (default 3000)
   uint32_t net;       // piano-usb-net=1: a CDC-NCM network function after the ports, an Ethernet interface for macOS (PianoUsbNet)
+  uint32_t netFifo;   // piano-usb-net-fifo: 1 (default) the TX FIFO plan for the endpoints in use, 0 keep the sizes the reset left
 };
 Args gArgs;
 
@@ -105,6 +106,7 @@ void readArgs()
   gArgs.hid = bootArg("piano-usb-hid", 0);
   gArgs.hidHold = bootArg("piano-usb-hid-hold", 3000);
   gArgs.net = bootArg("piano-usb-net", 0);
+  gArgs.netFifo = bootArg("piano-usb-net-fifo", 1);
 }
 
 // -------------------------------------------------------------------------------------------------------------------- MMIO
@@ -1118,8 +1120,10 @@ bool takeover()
        gHal.rd(GTXFIFOSIZ0 + 8), gHal.rd(GTXFIFOSIZ0 + 12), gHal.rd(GTXFIFOSIZ0 + 16), gHal.rd(GTXFIFOSIZ0 + 20), gHal.rd(GTXFIFOSIZ0 + 24),
        gHal.rd(GTXFIFOSIZ0 + 28));
   // The network function: its IN endpoints' TX FIFOs (7, 8) and the ports' are laid out after EP0's (TxFifoPlan.h), as the reset
-  // values of FIFOs past the firmware's own are not known. Without piano-usb-net no FIFO is written.
-  if (net) {
+  // values of FIFOs past the firmware's own are not known. Without piano-usb-net no FIFO is written; piano-usb-net-fifo=0 keeps the
+  // reset's sizes (a first-run experiment: is it the plan or the function).
+  if (net && !gArgs.netFifo) note("net: piano-usb-net-fifo=0: the TX FIFOs stay as the reset left them");
+  if (net && gArgs.netFifo) {
     uint8_t packets[TxFifoPlan::kMax] = {};
     for (unsigned p = 0; p < ports; ++p) {
       packets[notifyEp(p)] = 1;

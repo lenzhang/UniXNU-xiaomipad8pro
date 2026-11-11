@@ -713,6 +713,9 @@ private:
         if (recipient == 2 && value == 0) {   // ENDPOINT_HALT
           const unsigned phys = physFromAddress(index);
           if (phys >= kPhys || (phys >= 2 && !ep[phys].configured)) return stall;
+          // The network function's endpoints: no stall command under a queued transfer (a host's driver may clear the halt of
+          // the bulk pair right after selecting alternate 1); the transfer ends, pump() queues the next.
+          if (phys >= kNetNotifyPhys) endXfer(phys);
           if (phys >= 2) cmd(phys, request == 0x01 ? CMD_CLEARSTALL : CMD_SETSTALL, 0, 0, 0, nullptr);
           return none;
         }
@@ -904,10 +907,12 @@ private:
       }
     } else {
       netStats.ntbInSize = ncm::kNtbMax;
+      endXfer(kNetNotifyPhys);   // a "connected" the host has not read yet is not true any more
     }
     h->wr(DALEPENA, enable);
     netSeq = 0;
     netAltNew = alt;
+    netNotifyPending = 0;   // alternate 1 asks for them again once its status stage is done
     return ok;
   }
 

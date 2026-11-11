@@ -419,6 +419,18 @@ static void netScenario(FakeHal &h, G &g, unsigned P)
   CHECK(n2.size() == 8 && uint8_t(n2[0]) == 0xa1 && n2[1] == 0 && get16(n2, 2) == 1 && get16(n2, 4) == comm && get16(n2, 6) == 0);
   CHECK(!h.eps[kNetNotifyPhys].active && g.netStats.notifications == 2);
 
+  // A host clearing the halt of the bulk pair with the OUT transfer queued: END TRANSFER first, then CLEARSTALL, then queued again.
+  CHECK(h.eps[kNetOutPhys].active);
+  {
+    const auto lastIndex = [&](uint32_t command, unsigned phys) {
+      for (size_t k = h.cmds.size(); k-- > 0;) if (h.cmds[k].command == command && h.cmds[k].phys == phys) return long(k);
+      return -1L;
+    };
+    const unsigned ends = h.count(CMD_ENDTRANSFER, kNetOutPhys);
+    controlNoData(h, g, setupBytes(0x02, 1, 0, kNetBulkEp, 0));
+    CHECK(h.count(CMD_ENDTRANSFER, kNetOutPhys) == ends + 1 && lastIndex(CMD_ENDTRANSFER, kNetOutPhys) < lastIndex(CMD_CLEARSTALL, kNetOutPhys));
+    CHECK(h.eps[kNetOutPhys].active);
+  }
   // From the host: an NTB of three frames; the OUT transfer is a whole NTB (16 KiB) and is queued again.
   CHECK(h.eps[kNetOutPhys].active && trbResidual(h.trb(kNetOutPhys)[2]) == ncm::kNtbMax);
   const std::vector<std::string> in = {bytes(98, 1), bytes(1514, 2), bytes(42, 3)};
@@ -502,6 +514,16 @@ static void netScenario(FakeHal &h, G &g, unsigned P)
   step(g);
   frames.clear();
   CHECK(deviceNtb(block, frames, &sequence) && sequence == 0 && frames.size() == 1 && g.netStats.notifications == 4);
+  // Alternate 0 while a notification is still unread: it is withdrawn (a stale "connected"), nothing more is sent; back to 1.
+  controlNoData(h, g, setupBytes(0x01, 0x0b, 0, data, 0));
+  controlNoData(h, g, setupBytes(0x01, 0x0b, 1, data, 0));
+  CHECK(h.eps[kNetNotifyPhys].active && h.linkUp);
+  controlNoData(h, g, setupBytes(0x01, 0x0b, 0, data, 0));
+  CHECK(!h.eps[kNetNotifyPhys].active && !h.linkUp);
+  step(g);
+  CHECK(!h.eps[kNetNotifyPhys].active);
+  controlNoData(h, g, setupBytes(0x01, 0x0b, 1, data, 0));
+  CHECK(h.linkUp && h.eps[kNetNotifyPhys].active);
   // The ACM ports kept working throughout: port 0's bulk OUT is still queued.
   CHECK(h.eps[physOf(bulkEp(0), false)].active);
 }
