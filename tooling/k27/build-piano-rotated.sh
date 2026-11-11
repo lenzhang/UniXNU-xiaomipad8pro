@@ -15,5 +15,5 @@ xcrun clang -arch arm64 -mmacosx-version-min="${MACOSX_MIN:-14.0}" -fobjc-arc -O
 cp "$P/daemon/com.unixnu.piano-rotated.plist" "$P/daemon/install-piano-rotated.sh" "$O/"
 chmod 755 "$O/install-piano-rotated.sh"
 plutil -lint "$O/com.unixnu.piano-rotated.plist" >&2
-codesign -dv "$O/piano-rotated" 2>&1 | grep -E "^(Signature|CDHash)" >&2 || true
+codesign -dvvv "$O/piano-rotated" 2>&1 | grep -E "^(Signature|CDHash)=" >&2 || true
 echo "$O"
