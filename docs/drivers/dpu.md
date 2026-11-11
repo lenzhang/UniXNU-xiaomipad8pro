@@ -414,7 +414,9 @@ B1c, B1d, B1e: below (§8.1-8.3).
 
 Every image of B1c-B1e is built like B1a's, with its arguments in `PIANO_EXTRA_ARGS` after `piano-dpu=1`, and copied away (each build
 rewrites `out/ram`); `build-ram-images.py` refuses a command line over DarwinBoot's 1023 bytes, so keep each image to its own slice.
-The survey's lines (B1a above) come first in every run; the slices start after its `stage 5: done`. `...` = values to record.
+The survey's lines (B1a above) come first in every run; the slices start after its `stage 5: done`. `...` = values to record. They
+are tested at `piano-dpu=1`, apart from B1b's ladder: with `piano-dpu=2` the slices' thread runs beside B1b's (each waits for its own
+CTL_FLUSH bits; B1c clears the INTF underrun bits B1b watches), so the two are combined only after both passed alone.
 
 ```sh
 img() { PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=${2:-300} PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-dpu=1 $3" \
