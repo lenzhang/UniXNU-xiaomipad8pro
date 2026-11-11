@@ -32,3 +32,16 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent, for the HID input (piano-us
   DroidVMHIDDevice, see their UPSTREAM): the same overrides, OSTypeAlloc/init/Built-In/attach/start under the driver's service from
   start(), handleReport from a kernel thread, the IOHIDEventService publish notification, the codeless IOHIDEventDriver personality
   and the 334-slot vtable check in the kext descriptor. Re-written for PianoUsbHID (own product ID 0x5055 and names).
+
+The network function (piano-usb-net=1):
+  Ncm.h, the NCM parts of UsbDescriptors.h and Dwc3Gadget.h: written from the public USB CDC NCM 1.0 (NTH16/NDP16, alignment, the
+  NTB parameters, the requests and notifications, alternate settings) and CDC ECM 1.2 (the Ethernet networking functional
+  descriptor) specifications. Linux's drivers/usb/gadget/function/f_ncm.c and u_ether.c (GPL-2.0) were not copied or used as
+  text; nothing of them is in this package.
+  TxFifoPlan.h: the DWC3 TX FIFO rules (GTXFIFOSIZn layout, k packets = k * (MaxPacket/word + 1) + 1 words, RAM1 / single-port RAM0
+  depth, MDWIDTH) from the controller's programming model as mainline Linux drivers/usb/dwc3 (core.h, gadget.c TX FIFO resizing)
+  describes it: specification only, as above. The numbers are piano's, from the T1 probe.
+  PianoUsbNet.cpp: this repository's package/PianoNullEthernet (DroidVMEthernet's IOEthernetController pattern, see its UPSTREAM):
+  the same overrides and __PRIVATE_SPI__ include, no output queue with outputPacket under a lock, inputPacket from one thread
+  (DroidVMEthernet's receive loop), the 400-slot vtable check. Re-written: not built-in, link from the USB side, own work loop,
+  own MAC.

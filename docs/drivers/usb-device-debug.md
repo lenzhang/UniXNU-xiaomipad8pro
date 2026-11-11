@@ -6,6 +6,10 @@
 > live console in 3 minutes and the monitor answered `usb`. Earlier the Mac held the device at UsbEnumerationState 2 (accessory
 > approval). Build: `PIANO_EXTRA_ARGS="piano-usb=2" tooling/k27/build-native-image.sh`. The replayed boot log at connect time
 > includes the previous boot's decayed mailbox content (garbled tail): to be trimmed.
+>
+> **2026-11-11, later: a network link over the same cable**, opt-in with `piano-usb-net=1`: a CDC-NCM function after the serial
+> ports, which the Mac's own NCM driver shows as an Ethernet interface, and on the tablet `PianoUsbNet`, an IOEthernetController
+> (not built-in; en0 stays PianoNullEthernet's). Built, host-tested, linked; **not run on hardware yet**. §14.
 
 
 Status: design and code, 2026-11-11. Built, host-tested and linked into a test KC (`out/k27/kc-k27-usb-test.bin`); **not
@@ -23,6 +27,7 @@ Mac sees a composite USB device with two CDC-ACM serial ports (no driver to inst
 | 0 "piano kernel console" | `/dev/cu.usbmodem…` | the console log streamed live; on open, the whole retained log (the pstore ring, ~650 KB) is replayed first; a line-based kernel monitor (`help`, `usb`, `ioreg`, `peek`, `args`, `uptime`, `reset`, `reset fastboot` (PMIC restart reason bootloader: ABL fastboot after this reset, also on an installed system), `panic`, `log`, `live`) |
 | 1 "piano user pipe" | `/dev/cu.usbmodem…` | `/dev/pianousb` (`piano-usb-shell=1`): a byte pipe to user space for a root shell (`tooling/native/pianousb-shell`) or `log stream > /dev/pianousb` |
 | 2 "piano input" (only with `piano-usb-hid=1`) | `/dev/cu.usbmodemPIANODBG5` (expected) | keyboard and mouse input from the Mac (`tooling/native/piano-input.py`) into two HID devices, §12 |
+| "piano network" (only with `piano-usb-net=1`; not a serial port) | an Ethernet interface `en…`, MAC 02:50:49:41:4e:03 | `PianoUsbNet`, an Ethernet interface `en…` (configd names it), MAC 02:50:49:41:4e:02: IP over the cable, §14 |
 
 It gates nothing in M1–M5; it shortens every later loop (UFS, display, touch, GPU) from "reset, Ubuntu, read the mailbox"
 to watching the log and asking the kernel questions while it runs.
@@ -85,9 +90,9 @@ From the KC's `__PRELINK_INFO` (`droidvm-build/macOS-DroidVM/out/kc/kc27.bin`, t
    collection is not ABI-safe.
 3. **Own minimal gadget + CDC-ACM (chosen)**: ~2000 lines with no private Apple ABI (an IOService and BSD char-device KPI
    only), no Mac-side driver, a log stream even when user space never comes up.
-4. **Own gadget + CDC-ECM/NCM + IOEthernetController** (next step, §11): the gadget core takes more functions; the
-   IOEthernetController side follows `DroidVMEthernet` (already vtable-checked in this KC). Useful once user space has a
-   network configuration and sshd; the ACM console stays the fallback.
+4. **Own gadget + CDC-ECM/NCM + IOEthernetController**: done as CDC-NCM with `piano-usb-net=1` (§14); the
+   IOEthernetController side follows PianoNullEthernet / `DroidVMEthernet` (vtable-checked in this KC). The ACM console stays
+   the fallback.
 5. A vendor-class bulk pipe: no advantage over ACM, needs a Mac tool.
 
 ### 4.3 What runs
@@ -145,6 +150,8 @@ IOPlatformExpertDevice ── PianoDwc3 (start, matching thread)   read-only pro
 | `piano-usb-trace=N` | 400 | log the first N controller events after each bus reset one by one (raw word, EP0 phase, TRB words); 0 off |
 | `piano-usb-hid=1` | 0 | (needs `piano-usb=2`) a keyboard and a pointer HID device for macOS and the third port that drives them (§12); without it the USB device is the two-port one, unchanged |
 | `piano-usb-hid-hold=MS` | 3000 | a key or button still down this long after the last input command is released |
+| `piano-usb-net=1` | 0 | (needs `piano-usb=2`) the CDC-NCM network function after the ports and its Ethernet interface on the tablet (§14); without it the USB device is exactly the ACM-only one |
+| `piano-usb-net-fifo=0` | 1 | with `piano-usb-net=1`: keep the TX FIFO sizes the core reset left instead of the plan of §14.2 (a first-run experiment) |
 
 On the Mac (no root, standard library only; logs go to `logs/usb-console/`, gitignored):
 
@@ -263,7 +270,7 @@ included). If the takeover fails, the driver logs the stage and leaves the contr
    them (SunUEFI did not touch either)? → T2.
 5. macOS host behaviour with this composite ACM device (expected: AppleUSBCDC* → two `cu.usbmodem*`) → T2.
 6. Network next: Apple's NCM via an IOUSBDeviceController subclass (RE of `AppleVirtIOUSBDeviceController`) or our own ECM +
-   `IOEthernetController` on this gadget core? Decide after T2; the ECM path needs no private ABI.
+   `IOEthernetController` on this gadget core? Decided: our own CDC-NCM + `IOEthernetController`, no private ABI (§14).
 7. Panic output over USB: a polled gadget path from the panic handler (the core already polls) — after T3.
 
 ## 12. Keyboard and mouse from the Mac (`piano-usb-hid=1`)
@@ -338,4 +345,192 @@ port's IN endpoint, e.g. a TX FIFO 5/6 of size 0: `--no-ack` still sends). The m
 New code under BSD-2-Clause-Patent (`package/PianoDwc3/LICENSE`). Taken from BSD-2-Clause-Patent sources with attribution
 (`UPSTREAM`): Project-SunUEFI (takeover order, quirks, M31 init values), QcomDwc3's `QcomDwc3.cpp` (SPMI read and GDSC
 pattern), UniXNU-sm8750-common `SmmuTakeover.h` (bypass bank shape). Not used: QcomDwc3's GPL-2.0 PHY headers, any Linux code
-(Linux files were read as the specification only).
+(Linux files were read as the specification only). The network function (§14) is written from the public USB CDC NCM 1.0 and
+ECM 1.2 specifications; Linux's `f_ncm` / `u_ether` (GPL) were not copied, and the DWC3 TX FIFO rules come from the controller's
+programming model as Linux's `gadget.c` describes it (specification only). PianoUsbNet follows this repository's
+PianoNullEthernet (DroidVMEthernet's pattern, BSD-2-Clause-Patent).
+
+## 14. A network link to the Mac (`piano-usb-net=1`)
+
+Status 2026-11-11: built, host-tested (`package/PianoDwc3/tests/run.sh`), linked into the native KC with its vtable checked; **not
+run on hardware** (the owner is away). Goal: IP between the tablet and the Mac over the cable that already carries the console,
+for NTP time, file transfer and ssh, with Internet Sharing for the rest.
+
+### 14.1 What the Mac and the tablet see
+
+- **USB:** with `piano-usb-net=1` (and `piano-usb=2`) the composite device gets one more function after the serial ports:
+  **CDC-NCM 1.0** ("piano network"): an IAD, a communications interface (header, union, Ethernet networking descriptor with
+  `iMACAddress` = string 8 and `wMaxSegmentSize` 1514, NCM functional descriptor: NCM 1.0, SetEthernetPacketFilter only) with a
+  notification IN endpoint, and a data interface whose alternate 0 has no endpoints and alternate 1 the bulk pair (NTB protocol).
+  The Mac's own NCM driver takes it; nothing to install. Interface numbers: 4 and 5 (two ports), 6 and 7 (with `piano-usb-hid=1`).
+- **NCM, NTB16 only:** `GET_NTB_PARAMETERS` says 16 KiB both ways, datagrams and NDPs 4-byte aligned, no datagram limit; the host
+  may lower the IN size (`SET_NTB_INPUT_SIZE`, clamped to 2048..16384). No CRC, no NTB32. After the host selects alternate 1
+  the function sends ConnectionSpeedChange (480 Mb/s at high speed, 12 Mb/s at full) then NetworkConnection (connected).
+  Alternate 0 resets the function (input size, sequence numbers). The optional requests a host may still send (multicast
+  filters, `SET_NET_ADDRESS`, `SET_MAX_DATAGRAM_SIZE`) are taken and ignored; statistics and encapsulated commands stall.
+- **Frames:** to the Mac, the frames queued at each round go into one NTB (NTH16, the datagrams, then the NDP16 that lists them;
+  up to 32 frames; padding zeroed; frames under 60 bytes zero-padded to 60); a block that ends on a packet boundary below the
+  host's input size gets a zero-length packet. From the Mac, every NTB is parsed (an NDP chain of up to 8, each datagram checked
+  against the block and against 14..1514 bytes); a refused block is counted and its first five logged with the reason, never its
+  bytes.
+- **MACs** (locally administered, fixed per build, derived from nothing on the tablet): the tablet's interface
+  **02:50:49:41:4e:02**, the Mac's end **02:50:49:41:4e:03** (PianoNullEthernet's en0 is 02:50:49:41:4e:01).
+- **Tablet:** `PianoUsbNet`, an `IOEthernetController` (`package/PianoDwc3/PianoUsbNet.cpp`) under the PianoDwc3 service,
+  published from a thread once IOBSD is up, **not built-in and not primary**: configd's InterfaceNamer names it (en1, or the next
+  free `en` unit its database gives a new MAC). Link down until the Mac selects alternate 1, then up at 480 Mb/s.
+
+Why **not** replace PianoNullEthernet's en0: IOTimeSyncClockManager reads the built-in interfaces' MAC **once, at its start**
+(`docs/native-droidvm-inventory.md`, PianoNullEthernet's comment), and PianoNullEthernet's descriptor gates IOTimeSyncRootService
+on its resource. The NCM interface exists only after IOBSD and the takeover, and a cable, a host and an enumeration are not
+guaranteed at boot; nothing shows it would be there in time on every boot, so en0 stays the null built-in interface and TimeSync
+is unchanged. Why **NCM rather than ECM**: both need the same three endpoints, so the budget below does not force ECM; NCM
+aggregates frames per USB transfer (fewer, larger transfers for a polled controller) and the Mac has a native driver for it.
+
+### 14.2 Endpoints and TX FIFOs
+
+piano's core (T1 probe): DWC_usb31 (GSNPSID 0x33313130), GHWPARAMS3 0x90420086 = **32 endpoints, 16 IN**; GHWPARAMS0 MDWIDTH 64
+bits (8-byte FIFO words); GHWPARAMS1 bit 23 clear (dual-port RAM), so the TX FIFOs live in RAM1: GHWPARAMS7 = **3462 words**
+(27 KiB). The firmware left GTXFIFOSIZ0..4 at 0043, 0043/030d, 0350/0083, 03d3/030d, 06e0/0083 (start/depth); what the soft reset
+leaves for FIFOs 5..15 has not been read yet (`TX FIFOs after the reset:` prints 0..7).
+
+| Function | Endpoints (IN endpoint n uses TX FIFO n) | IN endpoints needed |
+|---|---|---|
+| EP0 | 0 OUT/IN | 1 |
+| port 0 console, port 1 user pipe | notify 1 IN, bulk 2 OUT/IN; notify 3 IN, bulk 4 OUT/IN | up to EP4: 5 |
+| port 2 input (`piano-usb-hid=1`) | notify 5 IN, bulk 6 OUT/IN | up to EP6: 7 |
+| network (`piano-usb-net=1`) | notify **7** IN (interrupt, 16 bytes, 32 ms), bulk **8** OUT/IN (512 bytes at high speed) | up to EP8: **9** |
+
+The endpoint count fits with room to spare (9 of 16 IN, 5 of 16 OUT): **nothing is dropped** for the network function, neither
+the user pipe nor the input port. The network function takes endpoints 7/8 whatever the port count, so its numbering does not
+depend on `piano-usb-hid`. A core with fewer than 9 IN endpoints gets no network function (logged); the ports stay.
+
+TX FIFO plan (`package/PianoDwc3/TxFifoPlan.h`, only with `piano-usb-net=1`): FIFO 0 (EP0) is kept as it is; the FIFOs of the IN
+endpoints in use are laid out after it, k packets of 512 bytes taking k x 65 + 1 words: notifications 1 packet (66 words), the
+ports' bulk IN 4 (261), the network bulk IN 12 (781); FIFOs of unused endpoints are not written. With FIFO 0 at 0x43 words:
+
+| FIFO | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | used of 3462 |
+|---|---|---|---|---|---|---|---|---|---|
+| two ports + net | 00430042 | 00850105 | 018a0042 | 01cc0105 | – | – | 02d10042 | 0313030d | 1568 words |
+| three ports + net | 00430042 | 00850105 | 018a0042 | 01cc0105 | 02d10042 | 03130105 | 04180042 | 045a030d | 1895 words |
+
+High speed only (the UTMI clock as PIPE clock, `DCFG` high speed): at SuperSpeed a packet would be 1024 bytes (129 words) and
+bursts would want more, still inside 3462 words, but the SS PHY is not used. If the plan does not fit (another core), the network
+function is left out with a note and the ports keep the reset's FIFOs. DMA: the network function's buffers sit in the unused top
+of the existing 128 KiB region (notification at 0x15000, NTB IN at 0x16000, NTB OUT at 0x1a000, 16 KiB each), with the same
+non-cacheable mapping and SMMU bypass as the ports; the allocation does not change.
+
+### 14.3 What changes for the existing ports
+
+- **Without `piano-usb-net`: nothing.** Device, configuration (both speeds), other-speed and string descriptors are byte for
+  byte those of the ACM-only device (FNV-1a sums of the pre-network bytes in `tests/usb_gadget_host.cpp`), no TX FIFO register is
+  written, no endpoint beyond the ports' is touched, no thread or queue is created.
+- **With it:** the ports keep their interface numbers, endpoints and names (so `/dev/cu.usbmodemPIANODBG1/3/5` and the host
+  tools' lookups by interface name stay); the configuration descriptor is 85 bytes longer with two more interfaces; strings 7 and
+  8 exist; the ports' IN FIFOs get the plan's sizes instead of the reset's (`piano-usb-net-fifo=0` keeps the reset's, to tell a
+  FIFO problem from an NCM one). The device descriptor and the VID:PID are unchanged.
+
+### 14.4 Data path and logging
+
+```
+macOS stack -> PianoUsbNet::outputPacket (copy into a 64 KiB frame queue; dropped when the link is down or the queue full)
+            -> USB thread: NtbWriter into the NTB IN buffer -> bulk IN 8 -> the Mac's NCM driver
+the Mac     -> bulk OUT 8 (16 KiB, queued while an NTB's worth of frames fits) -> USB thread: parseNtb16 -> 64 KiB frame queue
+            -> the net thread: allocatePacket + inputPacket (one thread: the family wants inputPacket serialized)
+```
+
+One NTB in flight each way, polled with the rest (1 ms when idle). Expected throughput: a few MB/s, enough for ssh and file
+copies; not measured. Logged (`grep "PianoDwc3: net:"`): link changes, the interface's name, refused NTBs (the first five), and
+one line of counters at most every 10 s while they change; never frame contents. The monitor's `usb` prints the same counters
+plus the NCM state (alternate, NTB input size, packet filter, notifications, zero-length packets).
+
+### 14.5 Bring-up
+
+Build the test image (all native kexts, the KC, the RAM image in `out/ram`; RAM boot only):
+
+```sh
+package/PianoDwc3/tests/run.sh                                         # host tests (the build runs them too)
+PIANO_EXTRA_ARGS="piano-usb=2 piano-usb-net=1" PIANO_RESET_AFTER=600 tooling/k27/build-native-image.sh
+# add piano-usb-shell=1 for the root shell on port 1 (the helper in the root image, §6) to configure the tablet's side;
+# add piano-usb-hid=1 for the keyboard/pointer port as well (the network function's endpoints do not change).
+```
+
+**On the Mac** (the tablet attached, the accessory allowed):
+
+```sh
+tooling/native/usb-console.py --list      # the gadget, its interfaces and drivers, the serial ports, and the network interface:
+                                          #   network: en7 (MAC 02:50:49:41:4e:03), status active, inet ...
+ifconfig en7                              # the name --list printed; "status: active" once the Mac selected alternate 1
+```
+
+Then either
+
+- **Internet Sharing** (the tablet gets an address, DNS and the Internet through the Mac): System Settings > General > Sharing >
+  Internet Sharing: share the connection from Wi-Fi (or Ethernet) to devices using the piano's interface (listed under the name
+  macOS gives the NCM interface, e.g. "piano network" or "piano macOS debug"), then turn it on. The Mac bridges it (`bridge100`)
+  and runs DHCP there; `ifconfig bridge100` shows the Mac's address. Or
+- **a static pair** (no Internet, no DHCP; documentation addresses here, use any free private /24):
+  `sudo ifconfig en7 inet 192.0.2.1 netmask 255.255.255.0` on the Mac.
+
+**On the tablet** (the root shell of `piano-usb-shell=1`: `tooling/native/usb-console.py --port 1`). The tools are the standard
+macOS userland of the system volume (`/sbin/ifconfig`, `/usr/sbin/ipconfig`, `/usr/bin/sntp`, `/usr/sbin/sshd`; not yet looked at
+on this image: `ls -l` them first):
+
+```sh
+for i in $(ifconfig -l); do ifconfig $i | grep -q 02:50:49:41:4e:02 && echo $i; done     # which en is ours (say en1)
+ipconfig set en1 DHCP && ipconfig waitall && ipconfig getifaddr en1     # with Internet Sharing
+ifconfig en1 inet 192.0.2.2 netmask 255.255.255.0 up                    # or the static pair
+ping -c 3 192.0.2.1                                                     # (static) or the router of `ipconfig getpacket en1`
+sntp -sS time.apple.com                                                 # NTP time (Internet Sharing: DNS and NAT through the Mac)
+launchctl load -w /System/Library/LaunchDaemons/ssh.plist               # sshd; then ssh from the Mac (an account with a key)
+```
+
+Set to DHCP with no server, both ends fall back to self-assigned 169.254.x.x addresses (`ipconfig set en1 DHCP` here, "Using
+DHCP" for the interface on the Mac), enough for ssh/scp by address. Files without sshd: on the Mac
+`python3 -m http.server 8000 --bind 192.0.2.1`, on the tablet `curl -O http://192.0.2.1:8000/<file>`.
+
+### 14.6 Expected log lines and failure signs
+
+In this order (`grep PianoDwc3` in the console log; `usb-console.py` shows them live):
+
+```
+PianoDwc3: start: piano-usb=2 ... hid=0 net=1 (DWC3 0xa600000, SMMU stream 0x40, polled)
+PianoDwc3: net: CDC-NCM network function requested (piano-usb-net=1): MAC 02:50:49:41:4e:02 here, 02:50:49:41:4e:03 on the Mac
+PianoDwc3: core DWC_usb31/32, 16 IN endpoints: 2 ACM port(s) + the CDC-NCM network function (interfaces after the ports, endpoints 7 and 8)
+PianoDwc3: TX FIFOs after the reset: 00000043 ...                 (what the reset left, FIFO 0 first)
+PianoDwc3: net: TX FIFO plan: words 67..1568 of 3462 (8 bytes each): 1 00430042 2 00850105 3 018a0042 4 01cc0105 5 00000000 6 00000000 7 02d10042 8 0313030d
+PianoDwc3: net: TX FIFOs now: 00000043 00430042 00850105 018a0042 01cc0105 <5 as reset> <6 as reset> 02d10042 0313030d
+PianoDwc3: net: interface published (MAC 02:50:49:41:4e:02, not built-in; configd names it), registry ID 0x...
+PianoDwc3: net: link down
+PianoDwc3: net: the Mac selected the NCM data interface
+PianoDwc3: net: link up: the Mac runs the NCM data interface (480 Mb/s)
+PianoDwc3: net: macOS named the interface en1 (en0 stays PianoNullEthernet's built-in one)
+PianoDwc3: net: link up, en1 up; to the Mac 12 frames 1480 bytes (9 NTBs), from the Mac 30 frames 4100 bytes (22 NTBs); NTB errors 0, bad datagrams 0; drops: send 0 (+0 bad length), receive 0 (queue) 0 (no mbuf) 0 (not up)
+```
+
+(The FIFO numbers assume FIFO 0 at 0x43 after the reset, as the firmware left it; the plan starts after whatever FIFO 0 is.)
+
+| Sign | Meaning, next step |
+|---|---|
+| `(no network function: it needs 9 IN endpoints)` / `TX FIFO plan: ... left out` | not the core measured in T1; the ports still work |
+| the console port fails only with `piano-usb-net=1` | the FIFO plan: retry with `piano-usb-net-fifo=0`; compare `TX FIFOs after the reset` and `now` |
+| `--list`: `piano network/no driver` | the Mac did not take the NCM function: the `setup ...` lines (which requests, what was stalled) |
+| no `the Mac selected the NCM data interface` | the Mac's driver never chose alternate 1: the `setup 01 0b 0001 ...` line and the requests before it |
+| link up here, `status: inactive` on the Mac | the notifications: `usb` shows 2 notifications per selection; an interrupt read the Mac never completes |
+| `NTB from the host refused (<reason>)` | the Mac's NTBs differ from the parser's reading of NCM 1.0: the reason names the field |
+| no `macOS named the interface` | configd has not named it (user space not up yet, or InterfaceNamer skipped it): `ioreg -c PianoUsbNet` in the shell |
+| `drops: send N` growing | the link is down, the interface is down (`ifconfig en1 up`), or the queue is full (the Mac is not reading) |
+
+### 14.7 Risks
+
+- **The Mac's NCM driver** has only been reasoned about from the spec: its request sequence, whether it takes each notification
+  as one interrupt transfer (16 bytes = one packet of the 16-byte endpoint, no zero-length packet after it), and whether it takes
+  NTBs with the NDP after the datagrams (a valid NTB16 layout, the one Linux gadgets send) are first-run questions. The parser
+  takes both NDP-first and NDP-last NTBs from the Mac.
+- **AppleUSBCDCCompositeDevice with an NCM function in the same composite**: expected to hand each IAD to its class driver as it
+  does the ACM ports; not seen yet.
+- **TX FIFO writes** change the ports' FIFOs too (only with `piano-usb-net=1`); `piano-usb-net-fifo=0` is the way back.
+- **Naming**: the interface is not built-in, so it depends on configd's InterfaceNamer; a Data volume whose
+  `NetworkInterfaces.plist` lists VM-era interfaces may give it a higher unit than en1. en0 and TimeSync are untouched by design.
+- **Throughput**: one 16 KiB NTB in flight each way on a polled loop; fine for ssh and NTP, slow for large copies.
+- **Security**: whatever the tablet serves on this link (sshd, a shell) is reachable from the Mac (and with Internet Sharing from
+  nothing else: NAT); development tablets only, as the user pipe.

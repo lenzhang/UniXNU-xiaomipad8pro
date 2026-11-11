@@ -4,7 +4,7 @@
   usb-console.py                 wait for the tablet, open port 0 (kernel console + monitor), type commands; Ctrl-] quits
   usb-console.py --port 1        the user pipe (/dev/pianousb on the tablet: pianousb-shell, log stream)
   usb-console.py --capture 300   no keyboard: save what arrives for 300 s (reconnects across reboots), then exit
-  usb-console.py --list          what is attached
+  usb-console.py --list          what is attached (also the Mac's network interface of piano-usb-net=1, by its fixed MAC)
   usb-console.py --send 'usb'    send one monitor command after opening (repeatable), e.g. with --capture
 
 Every byte received is also written to logs/usb-console/<time>-port<N>.txt (gitignored), and every complete line once more to
@@ -30,6 +30,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 PRODUCT = 'piano macOS debug'
 INTERFACES = {0: 'piano kernel console', 1: 'piano user pipe', 2: 'piano input'}   # 2: piano-usb-hid=1 (tooling/native/piano-input.py)
+# piano-usb-net=1: the MAC of the Mac's end of the CDC-NCM link (the function's iMACAddress, package/PianoDwc3/UsbDescriptors.h
+# kNetHostMac); the tablet's end is 02:50:49:41:4e:02. Both fixed per build, locally administered.
+HOST_MAC = '02:50:49:41:4e:03'
 TIOCMBIS = getattr(termios, 'TIOCMBIS', 0x8004746c)
 TIOCM_DTR = getattr(termios, 'TIOCM_DTR', 0x2)
 TIOCM_RTS = getattr(termios, 'TIOCM_RTS', 0x4)
@@ -89,6 +92,30 @@ def describe_gadgets():
     return lines
 
 
+def parse_ifconfig(text, mac=HOST_MAC):
+    """(name, status, [inet ...]) of the interface with this MAC in `ifconfig -a` output, or None."""
+    blocks, name = {}, None
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            name = line.split(':', 1)[0]
+            blocks[name] = []
+        elif name:
+            blocks[name].append(line.strip())
+    for name, lines in blocks.items():
+        if f'ether {mac}' in lines:
+            status = next((entry.split(':', 1)[1].strip() for entry in lines if entry.startswith('status:')), '?')
+            return name, status, [entry.split()[1] for entry in lines if entry.startswith('inet ')]
+    return None
+
+
+def find_network():
+    """The Mac's network interface of the gadget (piano-usb-net=1), from ifconfig (no root needed)."""
+    try:
+        return parse_ifconfig(subprocess.run(['ifconfig', '-a'], capture_output=True, text=True, check=True).stdout)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def open_port(path):
     fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     tty.setraw(fd)
@@ -134,6 +161,11 @@ def main():
         others = sorted(str(p) for p in Path('/dev').glob('cu.usbmodem*'))
         if others:
             print('all /dev/cu.usbmodem*:', ' '.join(others))
+        net = find_network()
+        if net:
+            print(f'network: {net[0]} (MAC {HOST_MAC}), status {net[1]}, inet {" ".join(net[2]) or "none"}')
+        else:
+            print(f'network: no interface with MAC {HOST_MAC} (piano-usb-net=1 on the tablet, and the Mac allowed the accessory?)')
         return 0
     args.log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
