@@ -17,6 +17,8 @@
 // piano-power-write=0 (level 2 without the charger writes: the DSP runs on its own defaults), piano-power-hv=1 (level 2 also asks a PD
 // source with a fixed 9 V PDO for 9 V and then allows 1.6 A), piano-power-fw=DIR (the DSP's images as DIR/adsp.mbn and
 // DIR/adsp_dtb.mbn instead of modem_a). Every step logs "PianoPower: ...".
+// At both levels the PMIC RTC is read with the report (RtcReadout.h, docs/drivers/rtc.md): its count, enable bit and the date with
+// the offset of piano-rtc-offset=N or else the SDAM cell. Read only; the kernel's calendar from it is k27 0060 (piano-rtc=1).
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -30,6 +32,7 @@
 #include "ChargerPmic.h"
 #include "Gauge.h"
 #include "PianoBattery.h"
+#include "RtcReadout.h"
 extern "C" {
 #include "PianoAdsp.h"
 #include "PianoMca.h"
@@ -46,6 +49,8 @@ namespace {
 
 struct Args {
   uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor;
+  bool hasRtcOffset;
+  uint32_t rtcOffset;
 };
 Args gArgs;
 
@@ -69,6 +74,8 @@ void readArgs()
   gArgs.ps = bootArg("piano-power-ps", 0);            // the battery for macOS (PianoBattery.cpp)
   gArgs.psFloor = bootArg("piano-power-ps-floor", 0); // the lowest percentage shown on battery (BatteryMap.h)
   if (gArgs.psFloor > 50) gArgs.psFloor = 50;
+  gArgs.rtcOffset = 0;
+  gArgs.hasRtcOffset = PE_parse_boot_argn("piano-rtc-offset", &gArgs.rtcOffset, sizeof gArgs.rtcOffset);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -189,6 +196,8 @@ class PianoPower : public IOService {
   Arbiter fArbiter;
   ChargerLayout fCharger;
   bool fSpmi = false;
+  RtcReading fRtc;
+  bool fRtcProbed = false;
   // gauges
   bool fGauges = false;
   GaugeReading fPack[2];
@@ -207,6 +216,7 @@ class PianoPower : public IOService {
   uint64_t fStartMs = 0;
 
   bool probeSpmi();
+  void readRtcLine(char *line, size_t size);
   void surveyAdsp();
   void probeGauges();
   void sampleGauges();
@@ -283,6 +293,13 @@ bool PianoPower::probeSpmi()
     stage(-1, "SPMI arbiter");
     return false;
   }
+  fRtcProbed = true;
+  char line[200];
+  readRtcLine(line, sizeof line);
+  note("%s", line);
+  note("rtc: RTC_RW APID %d (owner EE %u) type %#x subtype %#x EN_CTL %#x; SDAM APID %d (owner EE %u), offset cell %s %u (%#x)",
+       fRtc.rtc.apid, fRtc.rtc.owner, fRtc.type, fRtc.subtype, fRtc.enCtl, fRtc.sdam.apid, fRtc.sdam.owner,
+       fRtc.sdamOk ? "reads" : "does not read:", fRtc.sdamOffset, fRtc.sdamOffset);
   fCharger = discoverCharger(gIo, fArbiter);
   note("charger PMIC (SID 7): %u peripherals, owned by EE0 %u, EE1 %u, EE2 %u, EE3 %u, others %u", fCharger.peripherals,
        fCharger.ownedBy[0], fCharger.ownedBy[1], fCharger.ownedBy[2], fCharger.ownedBy[3],
@@ -302,6 +319,28 @@ bool PianoPower::probeSpmi()
   fSpmi = true;
   stage(1, "SPMI");
   return true;
+}
+
+// "rtc: COUNT (DATE UTC, offset N from SOURCE), enabled E": tooling/native/rtc-offset.py pairs these lines with the Mac's clock.
+void PianoPower::readRtcLine(char *line, size_t size)
+{
+  fRtc = readRtc(gIo, fArbiter, gArgs.hasRtcOffset, gArgs.rtcOffset, &fRtc);
+  const RtcReading &r = fRtc;
+  if (!r.ok) {
+    snprintf(line, size, "rtc: not read (%s)", r.why);
+    return;
+  }
+  struct piano_rtc_date d;
+  piano_rtc_civil(r.utc, &d);
+  if (r.source == RtcOffsetSource::none)
+    snprintf(line, size, "rtc: %u (no offset: the SDAM cell does not read and there is no piano-rtc-offset), enabled %u", r.count,
+             r.enabled ? 1u : 0u);
+  else if (!r.dated)
+    snprintf(line, size, "rtc: %u (+ offset %u from %s = %u, year %u: not a date, measure piano-rtc-offset), enabled %u", r.count,
+             r.offset, rtcSourceName(r.source), r.utc, d.year, r.enabled ? 1u : 0u);
+  else
+    snprintf(line, size, "rtc: %u (%04u-%02u-%02u %02u:%02u:%02u UTC, offset %u from %s), enabled %u", r.count, d.year, d.month,
+             d.day, d.hour, d.minute, d.second, r.offset, rtcSourceName(r.source), r.enabled ? 1u : 0u);
 }
 
 void PianoPower::surveyAdsp()
@@ -424,6 +463,11 @@ void PianoPower::report()
            fPack[1].status);
     else
       note("[%llus] battery: no gauge answers (A: %s, B: %s)", t, i2cName(fPack[0].error), i2cName(fPack[1].error));
+  }
+  if (fRtcProbed) {
+    char line[200];
+    readRtcLine(line, sizeof line);
+    note("[%llus] %s", t, line);
   }
   PortState p;
   const bool havePort = fSpmi && fCharger.found;

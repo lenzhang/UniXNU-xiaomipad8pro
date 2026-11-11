@@ -11,6 +11,9 @@
 #include "SpmiObserver.h"
 #include "ChargerPmic.h"
 #include "Gauge.h"
+#include "RtcReadout.h"
+#include <algorithm>
+#include <ctime>
 extern "C" {
 #include "PianoMca.h"
 }
@@ -626,8 +629,116 @@ static void testMcaHv()
   CHECK(g.count(PIANO_MCA_PD_FIXED) == 0);
 }
 
+// ------------------------------------------------------------------------------------------------------------- PMIC RTC
+// The count as RDATA shows it during a read: `ticks` lists the counter value at each register read (the four bytes of one
+// read come from the value current when that byte is read, so a carry between them tears the value).
+struct TickingRtc {
+  std::vector<uint32_t> perByte;   // the counter's value when byte k of all reads so far is read
+  unsigned bytesRead = 0, reads = 0;
+  bool fail = false;
+  static int rd(void *ctx, uint8_t reg, uint8_t *value, unsigned n)
+  {
+    TickingRtc *t = static_cast<TickingRtc *>(ctx);
+    t->reads++;
+    if (t->fail || reg != PIANO_RTC_RDATA || n == 0 || n > 4) return -1;
+    for (unsigned b = 0; b < n; ++b) {
+      const uint32_t v = t->perByte[std::min<size_t>(t->bytesRead++, t->perByte.size() - 1)];
+      value[b] = uint8_t(v >> (8 * b));
+    }
+    return 0;
+  }
+};
+
+static void testRtc()
+{
+  // Dates against the host's gmtime_r: the edges, the leap days, 2100 (no leap day), the last second of 2^32, and a sweep.
+  auto same = [](uint32_t utc) {
+    piano_rtc_date d;
+    piano_rtc_civil(utc, &d);
+    const time_t t = time_t(utc);
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    return d.year == uint32_t(tm.tm_year + 1900) && d.month == uint32_t(tm.tm_mon + 1) && d.day == uint32_t(tm.tm_mday) &&
+           d.hour == uint32_t(tm.tm_hour) && d.minute == uint32_t(tm.tm_min) && d.second == uint32_t(tm.tm_sec);
+  };
+  const uint32_t edges[] = {0u, 59u, 60u, 86399u, 86400u, 68255999u, 68256000u, 951782399u, 951782400u, 951868800u, 1767225599u,
+                            1767225600u, 1794355200u, 4102444799u, 4102444800u, 4107542399u, 4107542400u, 0xfffffffeu, 0xffffffffu};
+  for (uint32_t e : edges) CHECK(same(e));
+  unsigned mismatches = 0;
+  for (uint64_t u = 0; u <= 0xffffffffull; u += 65521) mismatches += !same(uint32_t(u));
+  CHECK(mismatches == 0);
+  piano_rtc_date d;
+  piano_rtc_civil(951782400u, &d);
+  CHECK(d.year == 2000 && d.month == 2 && d.day == 29 && d.hour == 0);
+  piano_rtc_civil(0xffffffffu, &d);
+  CHECK(d.year == 2106 && d.month == 2 && d.day == 7 && d.hour == 6 && d.minute == 28 && d.second == 15);
+
+  // UTC = count + offset modulo 2^32; the plausible window.
+  CHECK(piano_rtc_utc(1000u, 1794354000u) == 1794355000u);
+  CHECK(piano_rtc_utc(0xffffff00u, 0x200u) == 0x100u);                 // an offset "below zero" (count ahead of UTC)
+  CHECK(piano_rtc_utc(1794355000u, uint32_t(-1000)) == 1794354000u);
+  CHECK(!piano_rtc_plausible(0) && !piano_rtc_plausible(1767225599u) && piano_rtc_plausible(1767225600u));
+  CHECK(piano_rtc_plausible(4102444799u) && !piano_rtc_plausible(4102444800u));
+  const uint8_t le[4] = {0x78, 0x56, 0x34, 0x12};
+  CHECK(piano_rtc_le32(le) == 0x12345678u);
+
+  // The read: no carry, two register reads; a carry between the bytes (0x1ff -> 0x200 after byte 0), the low byte read again is
+  // smaller, the third read gives the settled count; a failing channel.
+  TickingRtc still;
+  still.perByte = {0x01020304u};
+  uint32_t count = 0;
+  CHECK(piano_rtc_read_count(TickingRtc::rd, &still, &count) == 0 && count == 0x01020304u && still.reads == 2);
+  TickingRtc torn;
+  torn.perByte = {0x1ffu, 0x200u};   // byte 0 of the first read sees 0x1ff, everything after sees 0x200
+  CHECK(piano_rtc_read_count(TickingRtc::rd, &torn, &count) == 0 && count == 0x200u && torn.reads == 3);
+  TickingRtc fullCarry;
+  fullCarry.perByte = {0x00ffffffu, 0x01000000u};
+  CHECK(piano_rtc_read_count(TickingRtc::rd, &fullCarry, &count) == 0 && count == 0x01000000u && fullCarry.reads == 3);
+  TickingRtc broken;
+  broken.perByte = {1u};
+  broken.fail = true;
+  CHECK(piano_rtc_read_count(TickingRtc::rd, &broken, &count) != 0);
+
+  // The readout over the arbiter model: RTC_RW at SID 0 0x6100 (an APID owned elsewhere first, EE 0's wins), the SDAM at 0x7100.
+  Arb a;
+  a.add(7, 0x2200, 0x02, 0xba, 0);
+  a.add(0, 0x6100, 0x0b, 0x07, 3);
+  const int rtc = a.add(0, 0x6100, 0x0b, 0x07, 0);
+  a.add(0, 0x6200, 0x0b, 0x08, 0);
+  const int sdam = a.add(0, 0x7100, 0x2e, 0x00, 0);
+  const uint32_t raw = 85432100u, cell = 1794355200u - raw;
+  a.apids[rtc].regs[PIANO_RTC_EN_CTL] = 0x80;
+  for (unsigned b = 0; b < 4; ++b) {
+    a.apids[rtc].regs[PIANO_RTC_RDATA + b] = uint8_t(raw >> (8 * b));
+    a.apids[sdam].regs[PIANO_RTC_SDAM_OFFSET + b] = uint8_t(cell >> (8 * b));
+  }
+  const Io io = a.io();
+  const Arbiter arb = spmiArbiter(io);
+  RtcReading r = readRtc(io, arb, false, 0);
+  CHECK(r.ok && r.rtc.apid == rtc && r.rtc.owner == 0 && r.sdam.apid == sdam && r.type == 0x0b && r.subtype == 0x07);
+  CHECK(r.enabled && r.count == raw && r.sdamOk && r.sdamOffset == cell);
+  CHECK(r.source == RtcOffsetSource::sdam && r.offset == cell && r.utc == 1794355200u && r.dated);
+  // The argument wins over the cell; an offset that gives no date is reported as such; the counter stopped.
+  r = readRtc(io, arb, true, 1794355200u - raw + 7, &r);
+  CHECK(r.source == RtcOffsetSource::arg && r.utc == 1794355207u && r.dated);
+  for (unsigned b = 0; b < 4; ++b) a.apids[sdam].regs[PIANO_RTC_SDAM_OFFSET + b] = 0;
+  r = readRtc(io, arb, false, 0, &r);
+  CHECK(r.ok && r.source == RtcOffsetSource::sdam && r.offset == 0 && r.utc == raw && !r.dated);
+  a.apids[rtc].regs[PIANO_RTC_EN_CTL] = 0x00;
+  r = readRtc(io, arb, false, 0, &r);
+  CHECK(r.ok && !r.enabled);
+  CHECK(a.writesOutsideCommands == 0);   // nothing but observer commands
+  // No RTC in the map.
+  Arb none;
+  none.add(7, 0x2200, 0x02, 0xba, 0);
+  const Io io2 = none.io();
+  r = readRtc(io2, spmiArbiter(io2), false, 0);
+  CHECK(!r.ok && r.rtc.apid < 0);
+}
+
 int main()
 {
+  testRtc();
   testCharger();
   testGauge();
   testMcaCodec();
