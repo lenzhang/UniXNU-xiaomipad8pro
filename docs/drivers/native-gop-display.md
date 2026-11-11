@@ -61,6 +61,7 @@ relaunched 6 times in 240 s. Without it and without a display, WindowServer laun
 | `piano-dpu-pcc=1\|2` | off | (PianoDpu's, [dpu.md](dpu.md) §4.4) `swap_set_color_matrix` and `set_gamma_table` log each new matrix / table (raw words: B1d-0) and hand it to PianoDpu's PCC; without it both stay stubs |
 | `piano-dpu-panel=1` | off | (PianoDpu's, §4.5) each display power change also goes to PianoDpu (`PianoDpuPanel`: the panel's light sleep), after the backlight's request |
 | `piano-dpu-refresh=auto` | off | (PianoDpu's, §4.3) each frame shown is reported to PianoDpu (`PianoDpuSwap`: its 60/120 Hz policy) |
+| `piano-dp=1` + `piano-dp-fake=S` / `piano-dp-fake-boot=1` | off | (PianoDp's D6, [displayport.md](displayport.md) §8.1) the nub reports 2 display ports and a second instance (`NativeGopDisplayExternal`, lines `NativeGopDisplay-ext:`) with a RAM surface, hot-plugged S s after its start (or connected from it); `-unplug`, `-cycles`, `-mode`, `-mm`, `-primary` shape it. No hardware; the panel's instance is unchanged |
 
 **The display power for other drivers** (2026-11-11, `docs/policy.md` §5.6; built and linked, not run): every power change call
 publishes `piano-display-power` (boolean: on while both the system and WindowServer want the display on), whatever the boot
@@ -191,7 +192,9 @@ VM-era display kext's name, kept in the binary); natively no other display is li
 
 - `package/NativeGopDisplay/{NativeGopDisplay.cpp,UPSTREAM,LICENSE}` (BSD-2-Clause-Patent; provenance in `UPSTREAM`)
 - `tooling/k27/kext/NativeGopDisplay.json`: personality `IOClass NativeGopDisplay`, `IOProviderClass AppleParavirtGPU`,
-  `IOProbeScore 5000`; vtable check of all 483 IOMobileFramebufferLegacy slots
+  `IOProbeScore 5000`; D6's second personality `NativeGopDisplayExternal` (its own `IOMatchCategory`, `NativeGopDisplayRole`
+  "piano-dp-fake"; refused without `piano-dp-fake`); vtable check of all 483 IOMobileFramebufferLegacy slots
+- `package/PianoDp/DpFake.h` (included): D6's arguments and plug schedule, host-tested in PianoDp's `tests/dp_host.cpp`
 - `tooling/k27/build-native-gop-display.sh`
 - `tooling/adt/make-piano-adt.py` (`--no-gop-display` leaves the node out), `configs/k27-gop-display.toml`
 - `tooling/bootimg/build-ram-images.py`: `PIANO_EXTRA_ARGS`

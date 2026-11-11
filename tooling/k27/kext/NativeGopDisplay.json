@@ -23,6 +23,14 @@
       "IOProviderClass": "AppleParavirtGPU",
       "IOProbeScore": 5000
     },
+    "NativeGopDisplayExternal": {
+      "CFBundleIdentifier": "com.unixnu.driver.NativeGopDisplay",
+      "IOClass": "NativeGopDisplay",
+      "IOProviderClass": "AppleParavirtGPU",
+      "IOProbeScore": 5000,
+      "IOMatchCategory": "NativeGopDisplayExternal",
+      "NativeGopDisplayRole": "piano-dp-fake"
+    },
     "AppleParavirtGPU": {
       "CFBundleIdentifier": "com.unixnu.driver.NativeGopDisplay",
       "IOClass": "AppleParavirtGPU",

@@ -13,9 +13,13 @@
 // this file), so no other display kext is linked natively. probe() takes the nub only on a node marked native-gop-display (that
 // opt-in ADT's own node), not with boot-arg native-gop-display=0, and not when an /arm-io/virtio-gpu exists (a virtual machine's
 // ADT, where another display driver owns the nub); the refusal strings below still name the VM-era display kext of that case. One
-// display is published either way: WindowServer never has two to choose from.
+// display is published either way, unless PianoDp's D6 probe is armed (piano-dp=1 with piano-dp-fake=S or piano-dp-fake-boot=1,
+// package/PianoDp/DpFake.h, docs/drivers/displayport.md D6): then the nub reports two display ports and a second instance of this
+// class, matched by the personality NativeGopDisplayExternal, is a test display backed by a RAM surface, disconnected until its plug
+// schedule connects it, that touches no hardware. Without those arguments its probe refuses silently and nothing of it runs.
 //
-// Every step logs "NativeGopDisplay: ..." (IOLog), so the pstore console mailbox of a headless boot tells how far it got.
+// Every step logs "NativeGopDisplay: ..." (IOLog), so the pstore console mailbox of a headless boot tells how far it got; the second
+// display's lines say "NativeGopDisplay-ext: ...".
 #include "IOMobileFramebufferABI.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceTreeSupport.h>
@@ -35,8 +39,12 @@
 #include <libkern/c++/OSString.h>
 #include <pexpert/device_tree.h>
 #include "../PianoDpu/PianoDpuFlipClient.h"   // the zero-copy flip's request (native-gop-display-flip=1)
+#include "../PianoDp/DpFake.h"                 // D6: the second, RAM-backed test display (piano-dp-fake)
 
 extern "C" task_t kernel_task;
+
+// Every line of an instance names it: "NativeGopDisplay: " (the panel), "NativeGopDisplay-ext: " (D6's second display).
+#define GOPLOG(fmt, ...) IOLog("NativeGopDisplay%s: " fmt, logTag(), ##__VA_ARGS__)
 
 // macOS 27.0.1's (26A434, the k27 collection's) offsets, each read from AppleParavirtDisplay's code (provenance: UPSTREAM).
 // IOMobileFramebufferLegacy (instance 0x1dd8)
@@ -300,6 +308,19 @@ private:
     IOSurface *fShown;
     unsigned fRefreshLeft;
     unsigned fSwapInfoRead, fSwapInfoWrite;
+    // D6 (docs/drivers/displayport.md, package/PianoDp/DpFake.h): the second instance, matched by the personality whose
+    // NativeGopDisplayRole is "piano-dp-fake". It has no framebuffer: a RAM surface stands in (its copies and thumbnails go there,
+    // nothing scans it out), none of the panel's callouts run (backlight, PianoDpu), and it starts disconnected until the plug
+    // schedule connects it (connected from the start with piano-dp-fake-boot=1). Its VBL timer stops while it is disconnected.
+    bool fExternal;                   // this instance is D6's second display
+    bool fPlugged;                    // its hot-plug state as last notified
+    pianodp::FakeConfig fFake;
+    uint32_t fPlugStep;               // the next step of the schedule
+    IOBufferMemoryDescriptor *fRamSurface;
+    IOTimerEventSource *fPlugTimer;
+    const char *logTag() const {return fExternal ? "-ext" : "";}
+    bool setupRamSurface();
+    static void plugFired(OSObject *, IOTimerEventSource *);
 };
 
 OSDefineMetaClassAndStructors(NativeGopDisplay, IOMobileFramebufferLegacy)
@@ -325,11 +346,38 @@ static bool adtNumber(IORegistryEntry *node, const char *key, uint64_t *value)
     return true;
 }
 
+// D6's boot arguments as one configuration (package/PianoDp/DpFake.h): armed only with piano-dp >= 1 and piano-dp-fake=S or
+// piano-dp-fake-boot=1.
+static pianodp::FakeConfig fakeFromBootArgs()
+{
+    pianodp::FakeArgs a;
+    PE_parse_boot_argn("piano-dp", &a.dp, sizeof(a.dp));
+    PE_parse_boot_argn("piano-dp-fake", &a.plug, sizeof(a.plug));
+    PE_parse_boot_argn("piano-dp-fake-boot", &a.boot, sizeof(a.boot));
+    PE_parse_boot_argn("piano-dp-fake-unplug", &a.unplug, sizeof(a.unplug));
+    PE_parse_boot_argn("piano-dp-fake-cycles", &a.cycles, sizeof(a.cycles));
+    PE_parse_boot_argn("piano-dp-fake-primary", &a.primary, sizeof(a.primary));
+    char mode[32] = {}, mm[32] = {};
+    if (PE_parse_boot_arg_str("piano-dp-fake-mode", mode, sizeof(mode)))
+        a.mode = mode;
+    if (PE_parse_boot_arg_str("piano-dp-fake-mm", mm, sizeof(mm)))
+        a.mm = mm;
+    return pianodp::fakeConfig(a);
+}
+
 // Whether this display takes the nub: the ADT node's native-gop-display marker (configs/k27-gop-display.toml, only in the ADT made with
 // make-piano-adt.py --gop-display) says yes, boot-arg native-gop-display overrides it (0: leave the nub to another display driver,
 // 1: take it), and never when an /arm-io/virtio-gpu exists.
 IOService *NativeGopDisplay::probe(IOService *provider, SInt32 *score)
 {
+    // D6's personality (NativeGopDisplayExternal) is probed on every boot: silent and refused without its arguments.
+    OSString *role = OSDynamicCast(OSString, getProperty("NativeGopDisplayRole"));
+    fExternal = role && role->isEqualTo("piano-dp-fake");
+    if (fExternal) {
+        fFake = fakeFromBootArgs();
+        if (!fFake.armed)
+            return nullptr;
+    }
     IORegistryEntry *node = adtNode(provider);
     uint64_t marker = 0;
     unsigned enabled = adtNumber(node, "native-gop-display", &marker) && marker;
@@ -340,7 +388,7 @@ IOService *NativeGopDisplay::probe(IOService *provider, SInt32 *score)
                                              : "the nub's ADT node is not marked native-gop-display: DroidVMDisplay's display takes the nub")
                         : nullptr;
     OSSafeReleaseNULL(virtio);
-    IOLog("NativeGopDisplay: probe on %s (ADT %s): %s\n", provider ? provider->getName() : "?", node ? node->getName() : "?",
+    GOPLOG("probe on %s (ADT %s): %s\n", provider ? provider->getName() : "?", node ? node->getName() : "?",
           refusal ? refusal : "taking it");
     if (refusal)
         return nullptr;
@@ -359,13 +407,13 @@ bool NativeGopDisplay::readFramebuffer()
     memset(&fVideo, 0, sizeof(fVideo));
     if (getPlatform()->getConsoleInfo(&fVideo) == kIOReturnSuccess && fVideo.v_baseAddr) {
         fVideoPhys = fVideo.v_baseAddr & ~3UL;
-        IOLog("NativeGopDisplay: boot framebuffer %#llx %lux%lu row %lu depth %lu\n", fVideoPhys, fVideo.v_width, fVideo.v_height,
+        GOPLOG("boot framebuffer %#llx %lux%lu row %lu depth %lu\n", fVideoPhys, fVideo.v_width, fVideo.v_height,
               fVideo.v_rowBytes, fVideo.v_depth);
         if (described && (base != fVideoPhys || width != fVideo.v_width || height != fVideo.v_height || stride != fVideo.v_rowBytes))
-            IOLog("NativeGopDisplay: the ADT describes %#llx %llux%llu row %llu instead; the boot framebuffer stands\n", base, width,
+            GOPLOG("the ADT describes %#llx %llux%llu row %llu instead; the boot framebuffer stands\n", base, width,
                   height, stride);
     } else if (described) {
-        IOLog("NativeGopDisplay: no console info; the ADT's framebuffer %#llx %llux%llu row %llu\n", base, width, height, stride);
+        GOPLOG("no console info; the ADT's framebuffer %#llx %llux%llu row %llu\n", base, width, height, stride);
         fVideoPhys = base;
         fVideo.v_baseAddr = base;
         fVideo.v_width = width;
@@ -373,17 +421,17 @@ bool NativeGopDisplay::readFramebuffer()
         fVideo.v_rowBytes = stride;
         fVideo.v_depth = 32;
     } else {
-        IOLog("NativeGopDisplay: no boot framebuffer (no console info, no ADT framebuffer-* description)\n");
+        GOPLOG("no boot framebuffer (no console info, no ADT framebuffer-* description)\n");
         return false;
     }
     if (fVideo.v_depth != 32 || !fVideo.v_width || !fVideo.v_height || fVideo.v_width > 16384 || fVideo.v_height > 16384 ||
         fVideo.v_rowBytes < fVideo.v_width * 4) {
-        IOLog("NativeGopDisplay: unusable framebuffer: depth %lu, %lux%lu row %lu (needs 32-bit linear)\n", fVideo.v_depth,
+        GOPLOG("unusable framebuffer: depth %lu, %lux%lu row %lu (needs 32-bit linear)\n", fVideo.v_depth,
               fVideo.v_width, fVideo.v_height, fVideo.v_rowBytes);
         return false;
     }
     if (size && fVideo.v_rowBytes * fVideo.v_height > size)
-        IOLog("NativeGopDisplay: the framebuffer (%lu bytes) is larger than the ADT's region (%llu bytes)\n",
+        GOPLOG("the framebuffer (%lu bytes) is larger than the ADT's region (%llu bytes)\n",
               fVideo.v_rowBytes * fVideo.v_height, size);
     return true;
 }
@@ -402,7 +450,7 @@ void NativeGopDisplay::drawBars()
 bool NativeGopDisplay::start(IOService *provider)
 {
     IORegistryEntry *node = adtNode(provider);
-    IOLog("NativeGopDisplay: start on %s (ADT %s)\n", provider->getName(), node ? node->getName() : "?");
+    GOPLOG("start on %s (ADT %s)\n", provider->getName(), node ? node->getName() : "?");
     uint64_t number = 0;
     fRefreshHz = adtNumber(node, "refresh-hz", &number) ? static_cast<uint32_t>(number) : 60;
     PE_parse_boot_argn("native-gop-display-hz", &fRefreshHz, sizeof(fRefreshHz));
@@ -439,48 +487,66 @@ bool NativeGopDisplay::start(IOService *provider)
     PE_parse_boot_argn("native-gop-display-gpu-fence", &gpuFence, sizeof(gpuFence));
     fGpuFences = gpuFence != 0;
     fGpuFenceSymbol = OSSymbol::withCStringNoCopy("native-adreno-fences");
+    PE_parse_boot_argn("native-gop-display-copy", &fCopyMode, sizeof(fCopyMode));
+    if (fExternal) {   // D6: its own timing and size; nothing scans the RAM surface, so no refresh copies; none of the panel's callouts
+        fRefreshHz = fFake.hz;
+        fWidthMM = fFake.widthMm;
+        fHeightMM = fFake.heightMm;
+        fRefreshCopies = false;
+        GOPLOG("D6 (piano-dp-fake): a second display %ux%u@%u, %ux%u mm, primary %u, %s; RAM-backed, no hardware touched%s%s\n",
+               fFake.width, fFake.height, fFake.hz, fFake.widthMm, fFake.heightMm, fFake.primary,
+               fFake.atBoot ? "connected from its start" : "disconnected until its plug timer", *fFake.note ? "; " : "", fFake.note);
+    }
     unsigned backlight = 0;
     PE_parse_boot_argn("piano-backlight", &backlight, sizeof(backlight));
-    fBacklightCallout = backlight >= 2;
-    PE_parse_boot_argn("native-gop-display-copy", &fCopyMode, sizeof(fCopyMode));
-    PE_parse_boot_argn("piano-dpu-pcc", &fDpuPcc, sizeof(fDpuPcc));
+    fBacklightCallout = backlight >= 2 && !fExternal;
+    if (!fExternal)
+        PE_parse_boot_argn("piano-dpu-pcc", &fDpuPcc, sizeof(fDpuPcc));
     unsigned dpuPanel = 0;
     PE_parse_boot_argn("piano-dpu-panel", &dpuPanel, sizeof(dpuPanel));
-    fDpuPanel = dpuPanel != 0;
+    fDpuPanel = dpuPanel != 0 && !fExternal;
     char dpuRefresh[16] = {};
-    fDpuSwaps = PE_parse_boot_arg_str("piano-dpu-refresh", dpuRefresh, sizeof(dpuRefresh)) && !strcmp(dpuRefresh, "auto");
+    fDpuSwaps = !fExternal && PE_parse_boot_arg_str("piano-dpu-refresh", dpuRefresh, sizeof(dpuRefresh)) && !strcmp(dpuRefresh, "auto");
     if (fDpuPcc || fDpuPanel || fDpuSwaps) {
         fDpuSwapSymbol = OSSymbol::withCStringNoCopy("PianoDpuSwap");
-        IOLog("NativeGopDisplay: PianoDpu callouts:%s%s%s\n", fDpuPcc ? " colour matrices and gamma tables (piano-dpu-pcc)" : "",
+        GOPLOG("PianoDpu callouts:%s%s%s\n", fDpuPcc ? " colour matrices and gamma tables (piano-dpu-pcc)" : "",
               fDpuPanel ? " display power (piano-dpu-panel)" : "", fDpuSwaps ? " frames shown (piano-dpu-refresh=auto)" : "");
     }
     if (fCopyMode)
-        IOLog("NativeGopDisplay: copy mode %#x:%s%s (native-gop-display-copy)\n", fCopyMode,
+        GOPLOG("copy mode %#x:%s%s (native-gop-display-copy)\n", fCopyMode,
               fCopyMode & kCopyFencedRefresh ? " refresh copies only when no GPU fence covered the swap (and the last one)" : "",
               fCopyMode & kCopyCachedRead ? " cached surface reads with DC CIVAC first" : "");
     unsigned flip = 0;
     PE_parse_boot_argn("native-gop-display-flip", &flip, sizeof(flip));
-    fFlipMode = flip != 0;
+    fFlipMode = flip != 0 && !fExternal;
     if (fFlipMode) {
         fDpuFlipSymbol = OSSymbol::withCString(kPianoDpuFlipFunction);
         fFlipMode = fDpuFlipSymbol != nullptr;
-        IOLog("NativeGopDisplay: flip mode (native-gop-display-flip): each swap's surface to PianoDpu's flip (piano-dpu=2 "
+        GOPLOG("flip mode (native-gop-display-flip): each swap's surface to PianoDpu's flip (piano-dpu=2 "
               "piano-dpu-flip=4), copied when refused; a swap completes once on the panel\n");
     }
-    if (!readFramebuffer())
-        return false;
-    IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress(fVideoPhys, fVideo.v_rowBytes * fVideo.v_height,
-                                                                         kIODirectionInOut);
-    if (memory) {
-        fScanoutMap = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
-        memory->release();
+    if (fExternal) {
+        if (!setupRamSurface()) {
+            provider->setProperty("DisplayPortCount", 1ULL, 32);   // WindowServer then waits for the panel alone
+            GOPLOG("not published: the nub reports 1 display port again\n");
+            return false;
+        }
+    } else {
+        if (!readFramebuffer())
+            return false;
+        IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress(fVideoPhys, fVideo.v_rowBytes * fVideo.v_height,
+                                                                             kIODirectionInOut);
+        if (memory) {
+            fScanoutMap = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+            memory->release();
+        }
+        if (!fScanoutMap) {
+            GOPLOG("cannot map the framebuffer at %#llx\n", fVideoPhys);
+            return false;
+        }
+        fScanout = reinterpret_cast<uint8_t *>(fScanoutMap->getVirtualAddress());
+        GOPLOG("framebuffer mapped write-combined at %p (%lu bytes)\n", fScanout, fVideo.v_rowBytes * fVideo.v_height);
     }
-    if (!fScanoutMap) {
-        IOLog("NativeGopDisplay: cannot map the framebuffer at %#llx\n", fVideoPhys);
-        return false;
-    }
-    fScanout = reinterpret_cast<uint8_t *>(fScanoutMap->getVirtualAddress());
-    IOLog("NativeGopDisplay: framebuffer mapped write-combined at %p (%lu bytes)\n", fScanout, fVideo.v_rowBytes * fVideo.v_height);
     // A solid colour until the first frame (or the bars): the screen shows that this mapping reaches the panel. The boot console keeps
     // drawing its text over it until WindowServer's first frame.
     unsigned bars = 0;
@@ -494,27 +560,35 @@ bool NativeGopDisplay::start(IOService *provider)
                 row[x] = 0xff203050;
         }
     }
-    IOLog("NativeGopDisplay: framebuffer %s\n", bars ? "shows the colour bars" : "cleared");
+    GOPLOG("framebuffer %s\n", bars ? "shows the colour bars" : "cleared");
     fCopyLock = IOLockAlloc();
     thread_t copier = nullptr;
     if (!fCopyLock || kernel_thread_start(copyThreadMain, this, &copier) != KERN_SUCCESS) {
-        IOLog("NativeGopDisplay: no copy thread\n");
+        GOPLOG("no copy thread\n");
         if (fCopyLock)
             IOLockFree(fCopyLock);
         fCopyLock = nullptr;
         OSSafeReleaseNULL(fScanoutMap);
+        OSSafeReleaseNULL(fRamSurface);
+        fScanout = nullptr;
+        if (fExternal)
+            provider->setProperty("DisplayPortCount", 1ULL, 32);
         return false;
     }
     thread_deallocate(copier);
-    IOLog("NativeGopDisplay: copy thread started\n");
+    GOPLOG("copy thread started\n");
     // IOMobileFramebufferLegacy::start waits for IOSurfaceRoot, calls start_hardware, creates the default surface and registers.
     if (!IOMobileFramebufferLegacy::start(provider)) {
-        IOLog("NativeGopDisplay: IOMobileFramebufferLegacy::start failed\n");
+        GOPLOG("IOMobileFramebufferLegacy::start failed\n");
         stopCopies();
         OSSafeReleaseNULL(fScanoutMap);
+        OSSafeReleaseNULL(fRamSurface);
+        fScanout = nullptr;
+        if (fExternal)
+            provider->setProperty("DisplayPortCount", 1ULL, 32);
         return false;
     }
-    IOLog("NativeGopDisplay: started, display %ux%u at %u Hz, %ux%u mm, %s copies, thumbnail %s%u s (at most %u, 0: no limit)\n",
+    GOPLOG("started, display %ux%u at %u Hz, %ux%u mm, %s copies, thumbnail %s%u s (at most %u, 0: no limit)\n",
           display_width(), display_height(), fRefreshHz, fWidthMM, fHeightMM, fRefreshCopies ? "with refresh" : "no refresh",
           fThumbPeriod ? "every " : "off: ", fThumbPeriod, fThumbLimit);
     return true;
@@ -522,7 +596,7 @@ bool NativeGopDisplay::start(IOService *provider)
 
 void NativeGopDisplay::stop(IOService *provider)
 {
-    IOLog("NativeGopDisplay: stop\n");
+    GOPLOG("stop\n");
     IOMobileFramebufferLegacy::stop(provider);
     stopCopies();
     releaseSurfaceMaps();
@@ -544,7 +618,9 @@ void NativeGopDisplay::stop(IOService *provider)
         reinterpret_cast<OSObject *>(fShown)->release();
     fShown = nullptr;
     OSSafeReleaseNULL(fScanoutMap);
+    OSSafeReleaseNULL(fRamSurface);
     fScanout = nullptr;
+    OSSafeReleaseNULL(fPlugTimer);
     OSSafeReleaseNULL(fGpu);
     OSSafeReleaseNULL(fGpuFenceSymbol);
     OSSafeReleaseNULL(fDpu);
@@ -559,11 +635,11 @@ bool NativeGopDisplay::start_hardware()
 {
     if (!createDisplayAttributes())
         return false;
-    IOLog("NativeGopDisplay: display attributes published (one %lux%lu@%u timing, 8-bit SDR sRGB)\n", fVideo.v_width, fVideo.v_height,
+    GOPLOG("display attributes published (one %lux%lu@%u timing, 8-bit SDR sRGB)\n", fVideo.v_width, fVideo.v_height,
           fRefreshHz);
     fVBL = IOTimerEventSource::timerEventSource(this, vblFired);
     if (!fVBL || getWorkLoop()->addEventSource(fVBL) != kIOReturnSuccess) {   // the work loop of the family's command gate
-        IOLog("NativeGopDisplay: Failed to create VBL timer\n");
+        GOPLOG("Failed to create VBL timer\n");
         OSSafeReleaseNULL(fVBL);
         return false;
     }
@@ -572,7 +648,14 @@ bool NativeGopDisplay::start_hardware()
         if (!fFlipDone || getWorkLoop()->addEventSource(fFlipDone) != kIOReturnSuccess) {
             OSSafeReleaseNULL(fFlipDone);
             fFlipMode = false;
-            IOLog("NativeGopDisplay: flip mode off: no work-loop source for the flip completions; copies\n");
+            GOPLOG("flip mode off: no work-loop source for the flip completions; copies\n");
+        }
+    }
+    if (fExternal) {   // D6: the plug schedule's timer, on the same work loop
+        fPlugTimer = IOTimerEventSource::timerEventSource(this, plugFired);
+        if (!fPlugTimer || getWorkLoop()->addEventSource(fPlugTimer) != kIOReturnSuccess) {
+            OSSafeReleaseNULL(fPlugTimer);
+            GOPLOG("no plug timer: the second display stays as it starts\n");
         }
     }
     fVBL->enable();
@@ -580,10 +663,24 @@ bool NativeGopDisplay::start_hardware()
     PMinit();
     getPlatform()->PMRegisterDevice(getProvider(), this);   // the provider is no power-managed AppleARMIODevice here
     registerPowerDriver(this, gPowerStates, 2);
+    if (fExternal) {   // D6: disconnected (or connected with piano-dp-fake-boot=1) until the schedule's first step
+        fPlugged = fFake.atBoot;
+        hotPlug_notify(fPlugged ? 1 : 0);
+        const pianodp::PlugStep first = pianodp::plugStep(fFake, 0);
+        if (fPlugTimer && first.valid)
+            fPlugTimer->setTimeoutMS(first.atS * 1000);
+        if (first.valid)
+            GOPLOG("hardware started (VBL timer %u Hz while connected, power states registered, hot plug %u; %s in %u s)\n", fRefreshHz,
+                   fPlugged ? 1u : 0u, first.connect ? "plugged" : "unplugged", first.atS);
+        else
+            GOPLOG("hardware started (VBL timer %u Hz, power states registered, hot plug %u; no change scheduled)\n", fRefreshHz,
+                   fPlugged ? 1u : 0u);
+        return true;
+    }
     // The panel is always there: report it plugged in (the digital out state IOMobileFramebufferGetDigitalOutState answers). Unplugged
     // (0), WindowServer kept the display disabled and composited a virtual one as the main display.
     hotPlug_notify(1);
-    IOLog("NativeGopDisplay: hardware started (VBL timer %u Hz, power states registered, hot plug 1)\n", fRefreshHz);
+    GOPLOG("hardware started (VBL timer %u Hz, power states registered, hot plug 1)\n", fRefreshHz);
     return true;
 }
 
@@ -596,7 +693,52 @@ IOReturn NativeGopDisplay::stop_hardware_gated()
     }
     if (fFlipDone)   // released in stop(), once the copy thread (which fires it) has ended
         getWorkLoop()->removeEventSource(fFlipDone);
+    if (fPlugTimer) {   // released in stop()
+        fPlugTimer->cancelTimeout();
+        getWorkLoop()->removeEventSource(fPlugTimer);
+    }
     return kIOReturnSuccess;
+}
+
+// D6: the second display's frame store, RAM only this kext writes (its copies and thumbnails) and nothing scans out.
+bool NativeGopDisplay::setupRamSurface()
+{
+    memset(&fVideo, 0, sizeof(fVideo));
+    fVideo.v_width = fFake.width;
+    fVideo.v_height = fFake.height;
+    fVideo.v_rowBytes = fFake.width * 4;
+    fVideo.v_depth = 32;
+    fVideoPhys = 0;
+    const uint64_t bytes = static_cast<uint64_t>(fVideo.v_rowBytes) * fVideo.v_height;
+    fRamSurface = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, bytes, 4096);
+    fScanout = fRamSurface ? static_cast<uint8_t *>(fRamSurface->getBytesNoCopy()) : nullptr;
+    if (!fScanout) {
+        OSSafeReleaseNULL(fRamSurface);
+        GOPLOG("no RAM surface of %llu bytes\n", bytes);
+        return false;
+    }
+    GOPLOG("RAM surface %lux%lu row %lu (%llu bytes): frames are copied there and never scanned out\n", fVideo.v_width,
+           fVideo.v_height, fVideo.v_rowBytes, bytes);
+    return true;
+}
+
+// D6, on the work loop: the plug schedule's next step (hot plug 1 or 0), then the timer for the one after it.
+void NativeGopDisplay::plugFired(OSObject *owner, IOTimerEventSource *timer)
+{
+    auto *display = static_cast<NativeGopDisplay *>(owner);
+    const pianodp::PlugStep step = pianodp::plugStep(display->fFake, display->fPlugStep);
+    if (!step.valid)
+        return;
+    display->fPlugStep++;
+    display->fPlugged = step.connect;
+    display->hotPlug_notify(step.connect ? 1 : 0);
+    const pianodp::PlugStep next = pianodp::plugStep(display->fFake, display->fPlugStep);
+    IOLog("NativeGopDisplay-ext: hot plug %u, %u s after the start (piano-dp-fake: connection %u of %u)%s\n", step.connect ? 1u : 0u,
+          step.atS, step.plugNumber, display->fFake.cycles, next.valid ? "" : "; the schedule is done");
+    if (next.valid)
+        timer->setTimeoutMS((next.atS - step.atS) * 1000);
+    if (step.connect)
+        display->swap_begin_gated();   // the VBL ticks again (they stop while disconnected)
 }
 
 void NativeGopDisplay::vblFired(OSObject *owner, IOTimerEventSource *)
@@ -669,7 +811,7 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         fStalled++;
     if (++fTicks % (10 * fRefreshHz) == 0 && fSubmitted + fFrames + fDropped + fStalled != fReported) {   // about every 10 s while swaps arrive
         fReported = fSubmitted + fFrames + fDropped + fStalled;
-        IOLog("NativeGopDisplay: %llu swaps submitted, %llu shown, %llu dropped, %llu ticks stalled (current %p), last frame %llu.%llu%% "
+        GOPLOG("%llu swaps submitted, %llu shown, %llu dropped, %llu ticks stalled (current %p), last frame %llu.%llu%% "
               "non-black mean #%06llx centre #%06llx; %llu copies mean %llu us (prepare %llu read %llu convert %llu write %llu) max %llu us, "
               "%llu waits released\n",
               fSubmitted, fFrames, fDropped, fStalled, at<IOMFBSwapIORequest *>(this, kCurrentSwap), fLastLitPerMille / 10,
@@ -678,22 +820,22 @@ IOReturn NativeGopDisplay::swap_begin_gated()
               fCopies ? fReadNs / fCopies / 1000 : 0, fCopies ? fConvertNs / fCopies / 1000 : 0, fCopies ? fWriteNs / fCopies / 1000 : 0,
               fCopyMaxNs / 1000, fWaitReleased);
         if (fCopiesSkipped)
-            IOLog("NativeGopDisplay: %llu copies skipped for newer ones\n", fCopiesSkipped);
-        IOLog("NativeGopDisplay: at most %llu frames in a second\n", fPeakFps);
+            GOPLOG("%llu copies skipped for newer ones\n", fCopiesSkipped);
+        GOPLOG("at most %llu frames in a second\n", fPeakFps);
         if (fFlipMode)
-            IOLog("NativeGopDisplay: flip mode: %llu swaps flipped (no copy, no refresh copies), %llu copied (PianoDpu refused them or "
+            GOPLOG("flip mode: %llu swaps flipped (no copy, no refresh copies), %llu copied (PianoDpu refused them or "
                   "is not serving)\n", fFlips, fFlipCopies);
         if (fFenceWaits)
-            IOLog("NativeGopDisplay: %llu swaps from submit to programmed mean %llu us max %llu us\n", fFenceWaits,
+            GOPLOG("%llu swaps from submit to programmed mean %llu us max %llu us\n", fFenceWaits,
                   fFenceWaitNs / fFenceWaits / 1000, fFenceWaitMaxNs / 1000);
-        IOLog("NativeGopDisplay: scheduling: %llu copy wakeups over 20 ms (longest %llu ms), %llu VBL ticks over 20 ms late (latest by %llu ms)\n",
+        GOPLOG("scheduling: %llu copy wakeups over 20 ms (longest %llu ms), %llu VBL ticks over 20 ms late (latest by %llu ms)\n",
               fWakeLate, fWakeMaxNs / 1000000, fVBLLate, fVBLLateMaxNs / 1000000);
         if (fGpuWaits)
-            IOLog("NativeGopDisplay: %llu copies waited for the GPU's fence, mean %llu us max %llu us, %llu gave up after %u ms\n", fGpuWaits,
+            GOPLOG("%llu copies waited for the GPU's fence, mean %llu us max %llu us, %llu gave up after %u ms\n", fGpuWaits,
                   fGpuWaitNs / fGpuWaits / 1000, fGpuWaitMaxNs / 1000, fGpuTimeouts, kGpuFenceWaitMs);
         if (fCopyMode) {   // what the copy mode saved: refresh copies not made (at this period's mean copy time), the reads' cost
             const uint64_t mean = fCopies ? fCopyNs / fCopies : 0;
-            IOLog("NativeGopDisplay: copy mode %#x: %llu refresh copies skipped (about %llu ms of copying saved, mean copy %llu us); "
+            GOPLOG("copy mode %#x: %llu refresh copies skipped (about %llu ms of copying saved, mean copy %llu us); "
                   "%llu cache invalidations mean %llu us%s\n", fCopyMode, fRefreshSkipped, fRefreshSkipped * mean / 1000000, mean / 1000,
                   fInvalidates, fInvalidates ? fInvalidateNs / fInvalidates / 1000 : 0,
                   fCachedMapRefused ? " (a cacheable mapping was refused: those surfaces read uncached)" : "");
@@ -704,6 +846,11 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         fPeakFps = 0;
         fWakeLate = fWakeMaxNs = fVBLLate = fVBLLateMaxNs = 0;
         fCopies = fCopyNs = fCopyMaxNs = fPrepareNs = fReadNs = fConvertNs = fWriteNs = 0;
+    }
+    // D6: no tick while the second display is disconnected and nothing is queued (a submitted swap calls this anyway).
+    if (fExternal && !fPlugged && !at<IOMFBSwapIORequest *>(this, kSwapQueueFirst)) {
+        fVBLDue = 0;
+        return kIOReturnSuccess;
     }
     // Flip mode: no tick while nothing needs one (a deferred swap completes from flipDoneAction, a submitted one calls this anyway).
     if (fFlipMode && !fRefreshLeft && (fFlipSwap || !at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))) {
@@ -728,7 +875,7 @@ IOReturn NativeGopDisplay::swap_wait(IOMobileFramebufferUserClient *client, unsi
         return kIOReturnSuccess;
     }
     if (result != kIOReturnSuccess && (++fWaitFailures <= 20 || fWaitFailures % 1000 == 0))
-        IOLog("NativeGopDisplay: swap_wait(%u, 0x%x, %u) = 0x%x (%llu failures): last %u power %u/%u powered %u started 0x%x current %p queue %p\n",
+        GOPLOG("swap_wait(%u, 0x%x, %u) = 0x%x (%llu failures): last %u power %u/%u powered %u started 0x%x current %p queue %p\n",
               swapID, options, timeout, result, fWaitFailures, at<uint32_t>(this, kLastCompletedSwap), at<uint32_t>(this, kSystemPowerState),
               at<uint32_t>(this, kAPIPowerState), at<uint32_t>(this, kHardwarePowered), at<uint8_t>(this, kHardwareStarted),
               at<IOMFBSwapIORequest *>(this, kCurrentSwap), at<IOMFBSwapIORequest *>(this, kSwapQueueFirst));
@@ -757,13 +904,13 @@ IOReturn NativeGopDisplay::do_power_state_change_gated()
         return kIOReturnSuccess;
     fDisplayOn = on;
     at<uint32_t>(this, kHardwarePowered) = on;
-    IOLog("NativeGopDisplay: display %s\n", on ? "on" : "off");
+    GOPLOG("display %s\n", on ? "on" : "off");
     if (fDpuPanel) {   // the panel's light sleep (PianoDpu's thread; the backlight's request above goes first)
         IOService *dpu = dpuService(true);
         if (dpu)
             dpu->callPlatformFunction("PianoDpuPanel", false, reinterpret_cast<void *>(uintptr_t(on)), nullptr, nullptr, nullptr);
         else
-            IOLog("NativeGopDisplay: display %s: no PianoDpu service (piano-dpu-panel needs piano-dpu=1)\n", on ? "on" : "off");
+            GOPLOG("display %s: no PianoDpu service (piano-dpu-panel needs piano-dpu=1)\n", on ? "on" : "off");
     }
     powerstate_notify(true, on);
     return kIOReturnSuccess;
@@ -791,7 +938,7 @@ IOService *NativeGopDisplay::dpuService(bool now)
         dpu->release();
         return found;
     }
-    IOLog("NativeGopDisplay: PianoDpu service found: %s\n", dpu->getName());
+    GOPLOG("PianoDpu service found: %s\n", dpu->getName());
     return dpu;
 }
 
@@ -817,7 +964,7 @@ void NativeGopDisplay::backlightCallout(bool on)
         if (match)
             match->release();
         if (!backlight) {
-            IOLog("NativeGopDisplay: display %s: no PianoBacklight service yet (it reads piano-display-power when it starts)\n",
+            GOPLOG("display %s: no PianoBacklight service yet (it reads piano-display-power when it starts)\n",
                   on ? "on" : "off");
             return;
         }
@@ -859,7 +1006,7 @@ void NativeGopDisplay::program_hardware_gated()
     }
     if (shape != fLayerShape) {   // each new combination of layers
         fLayerShape = shape;
-        IOLog("NativeGopDisplay: swap layers %#x:", layers);
+        GOPLOG("swap layers %#x:", layers);
         for (unsigned layer = 0; layer < kSwapLayerCount; layer++) {
             IOSurface *candidate = (layers >> layer & 1) ? at<IOSurface *>(swap, kSwapMainSurface + 8 * layer) : nullptr;
             if (candidate)
@@ -869,8 +1016,10 @@ void NativeGopDisplay::program_hardware_gated()
     }
     if (surface && area * 4 >= static_cast<uint64_t>(fVideo.v_width) * fVideo.v_height) {   // a quarter of the screen at least
         if (!fFrames++) {   // WindowServer's first frame: the verbose boot console stops drawing over the framebuffer
-            PE_initialize_console(nullptr, kPEDisableScreen);
-            IOLog("NativeGopDisplay: first frame (swap %u); boot console released from the screen\n", at<uint32_t>(swap, kSwapID));
+            if (!fExternal)
+                PE_initialize_console(nullptr, kPEDisableScreen);
+            GOPLOG("first frame (swap %u)%s\n", at<uint32_t>(swap, kSwapID),
+                   fExternal ? ": WindowServer draws on the second display" : "; boot console released from the screen");
         }
         uint64_t now = mach_absolute_time(), second = 0;
         fLastFrameTime = now;
@@ -939,7 +1088,7 @@ bool NativeGopDisplay::dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request)
         if (!dpu)
             return false;
         fDpu = dpu;
-        IOLog("NativeGopDisplay: flips through %s: a 'BGRA' swap is shown by the DPU itself, the others are copied\n", dpu->getName());
+        GOPLOG("flips through %s: a 'BGRA' swap is shown by the DPU itself, the others are copied\n", dpu->getName());
     }
     *request = {};
     request->size = sizeof(*request);
@@ -959,7 +1108,7 @@ bool NativeGopDisplay::dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request)
         return false;
     static unsigned refusals;
     if (surface && request->result != kPianoDpuFlipShown && refusals++ < 8)
-        IOLog("NativeGopDisplay: flip refused (%s): %llux%llu row %llu format %#x; copied\n", pianoDpuFlipResultName(request->result),
+        GOPLOG("flip refused (%s): %llux%llu row %llu format %#x; copied\n", pianoDpuFlipResultName(request->result),
               request->width, request->height, request->rowBytes, request->format);
     return request->result == kPianoDpuFlipShown;
 }
@@ -1015,7 +1164,7 @@ bool NativeGopDisplay::gpuFence(uint32_t *fence)
         if (!gpu)
             return false;
         __atomic_store_n(&fGpu, gpu, __ATOMIC_RELEASE);
-        IOLog("NativeGopDisplay: GPU fences from %s: a swap's copy waits for the GPU work handed out before it (at most %u ms)\n",
+        GOPLOG("GPU fences from %s: a swap's copy waits for the GPU work handed out before it (at most %u ms)\n",
               gpu->getName(), kGpuFenceWaitMs);
     }
     uint32_t retired = 0;
@@ -1148,7 +1297,7 @@ const uint8_t *NativeGopDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescri
         map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly | kIOMapCopybackCache);
         if (!map && !fCachedMapRefused) {
             fCachedMapRefused = true;
-            IOLog("NativeGopDisplay: a cacheable mapping of a %llux%llu surface was refused: it is read uncached\n", ioSurfaceWidth(surface),
+            GOPLOG("a cacheable mapping of a %llux%llu surface was refused: it is read uncached\n", ioSurfaceWidth(surface),
                   ioSurfaceHeight(surface));
         }
     }
@@ -1214,9 +1363,9 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
     IOMemoryDescriptor *memory = ioSurfaceMemory(surface);
     const bool first = !fCopies && !refresh && fSurfaceFormat == 0;
     if (format != fSurfaceFormat) {
-        IOLog("NativeGopDisplay: surface %llux%llu row %llu offset %llu format %#x memory %p\n", width, height, rowBytes, base, format, memory);
+        GOPLOG("surface %llux%llu row %llu offset %llu format %#x memory %p\n", width, height, rowBytes, base, format, memory);
         for (uint32_t plane = 0, planes = ioSurfacePlaneCount(surface); plane < planes; plane++)
-            IOLog("NativeGopDisplay:  plane %u: %llux%llu offset %llu row %llu element %llu\n", plane, ioSurfacePlaneWidth(surface, plane),
+            GOPLOG(" plane %u: %llux%llu offset %llu row %llu element %llu\n", plane, ioSurfacePlaneWidth(surface, plane),
                   ioSurfacePlaneHeight(surface, plane), ioSurfacePlaneOffset(surface, plane), ioSurfacePlaneBytesPerRow(surface, plane),
                   ioSurfacePlaneBytesPerElement(surface, plane));
         fSurfaceFormat = format;
@@ -1231,7 +1380,7 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
     if (!memory || !fScanout || rowBytes < width * pixelBytes || (format != kFormatBGRA && format != kFormatRGhA && format != kFormatB3A8)) {
         static unsigned refused;
         if (refused++ < 8)
-            IOLog("NativeGopDisplay: surface format %#x (row %llu for %llu pixels) is not copied\n", format, rowBytes, width);
+            GOPLOG("surface format %#x (row %llu for %llu pixels) is not copied\n", format, rowBytes, width);
         return;
     }
     uint64_t copyWidth = width < fVideo.v_width ? width : fVideo.v_width;
@@ -1251,7 +1400,7 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
             fRow = nullptr;
             fLine = nullptr;
             fHalfToByte = nullptr;
-            IOLog("NativeGopDisplay: no memory for the row buffers\n");
+            GOPLOG("no memory for the row buffers\n");
             return;
         }
         // Indexed by the half float >> 2 (16 KiB): 8 bits of mantissa left, finer than a byte's step anywhere in [0, 1].
@@ -1275,7 +1424,7 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
     lap(fPrepareNs);
     if (!bytes) {
         memory->complete();
-        IOLog("NativeGopDisplay: cannot map a %llux%llu surface\n", width, height);
+        GOPLOG("cannot map a %llux%llu surface\n", width, height);
         return;
     }
     if (cached) {   // native-gop-display-copy bit 1: the rows about to be read, from memory rather than stale cache lines
@@ -1299,7 +1448,7 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
                 IOFree(fThumbCount, kThumbCols * kThumbRows * sizeof(uint32_t));
             fThumbLuma = fThumbCount = nullptr;
             fThumbPeriod = 0;
-            IOLog("NativeGopDisplay: no memory for the thumbnail; thumbnails off\n");
+            GOPLOG("no memory for the thumbnail; thumbnails off\n");
             thumb = false;
         }
     }
@@ -1359,7 +1508,7 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
     if (ns > fCopyMaxNs)
         fCopyMaxNs = ns;
     if (first)
-        IOLog("NativeGopDisplay: first copy %llux%llu format %#x into the framebuffer in %llu us\n", copyWidth, copyHeight, format, ns / 1000);
+        GOPLOG("first copy %llux%llu format %#x into the framebuffer in %llu us\n", copyWidth, copyHeight, format, ns / 1000);
     if (thumb) {
         logThumbnail(stats, copyWidth, copyHeight, format, refresh);
         uint64_t period;
@@ -1368,7 +1517,7 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
         fThumbRequested = false;
         if (fThumbLimit && ++fThumbsTaken >= fThumbLimit) {
             fThumbPeriod = 0;
-            IOLog("NativeGopDisplay: %u thumbnails taken, no more this boot (native-gop-display-thumbs)\n", fThumbsTaken);
+            GOPLOG("%u thumbnails taken, no more this boot (native-gop-display-thumbs)\n", fThumbsTaken);
         }
     }
     if (refresh)
@@ -1378,7 +1527,7 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
     fLastMean = (stats.red / samples) << 16 | (stats.green / samples) << 8 | stats.blue / samples;
     fLastCenter = stats.centre;
     if (format != kFormatBGRA && (fFrames <= 8 || fFrames % 50 == 0))
-        IOLog("NativeGopDisplay: frame %llu: %llu of %llu sampled pixels non-black, %llu nonzero in the source, centre #%06x\n", fFrames,
+        GOPLOG("frame %llu: %llu of %llu sampled pixels non-black, %llu nonzero in the source, centre #%06x\n", fFrames,
               stats.lit, stats.samples, stats.raw, stats.centre);
 }
 
@@ -1422,7 +1571,7 @@ void NativeGopDisplay::logThumbnail(const FrameStats &stats, uint64_t width, uin
     const uint64_t mean = (stats.red / samples) << 16 | (stats.green / samples) << 8 | stats.blue / samples;
     const char code[5] = {static_cast<char>(format >> 24), static_cast<char>(format >> 16), static_cast<char>(format >> 8),
                           static_cast<char>(format), 0};
-    IOLog("NativeGopDisplay: thumb frame %llu%s: %llux%llu '%s', %llu.%llu%% non-black, mean #%06llx, centre #%06x, %ux%u cells of "
+    GOPLOG("thumb frame %llu%s: %llux%llu '%s', %llu.%llu%% non-black, mean #%06llx, centre #%06x, %ux%u cells of "
           "%llux%llu px, ramp \" .:-=+*#%%@\"\n", fFrames, refresh ? " (screen unchanged)" : "", width, height, code, perMille / 10,
           perMille % 10, mean, stats.centre, kThumbCols, kThumbRows, width / kThumbCols, height / kThumbRows);
     char text[kThumbCols + 1];
@@ -1433,7 +1582,7 @@ void NativeGopDisplay::logThumbnail(const FrameStats &stats, uint64_t width, uin
             text[column] = kRamp[luma * 10 / 256];
         }
         text[kThumbCols] = 0;
-        IOLog("NativeGopDisplay: thumb %02u |%s|\n", row, text);
+        GOPLOG("thumb %02u |%s|\n", row, text);
     }
 }
 
@@ -1509,8 +1658,9 @@ bool NativeGopDisplay::createDisplayAttributes()
             break;
         ioavTimingSetColorElements(timing, timingColors);
         // The serial number is the size: WindowServer keeps the chosen mode per display identity.
-        if (!(appendString(product, "ManufacturerID", "XMI") && appendNumber(product, "ProductID", 0x8750) &&
-              appendNumber(product, "SerialNumber", width << 16 | height) && appendString(product, "ProductName", "Xiaomi Pad 8 Pro") &&
+        if (!(appendString(product, "ManufacturerID", "XMI") && appendNumber(product, "ProductID", fExternal ? pianodp::kFakeProductId : 0x8750) &&
+              appendNumber(product, "SerialNumber", width << 16 | height) &&
+              appendString(product, "ProductName", fExternal ? pianodp::kFakeProductName : "Xiaomi Pad 8 Pro") &&
               appendNumber(product, "WeekOfManufacture", 1) && appendNumber(product, "YearOfManufacture", 2025)))
             break;
         if (!(appendDictionary(chromaticity, "Red", point(41943, 21627)) && appendDictionary(chromaticity, "Green", point(19661, 39322)) &&
@@ -1535,10 +1685,12 @@ bool NativeGopDisplay::createDisplayAttributes()
             break;
         if (!(appendNumber(scalingLimits, "RGBLayer_MinScaleFraction", 4) && appendNumber(scalingLimits, "RGBLayer_MaxScale", 4)))
             break;
-        setProperty("IOMFBUUID", "4E474F50-4449-5350-0000-000000008750");
-        // External, display index 0: the attributes macOS 27's WindowServer accepted on the VM-era display (UPSTREAM).
+        setProperty("IOMFBUUID", fExternal ? pianodp::kFakeUuid : "4E474F50-4449-5350-0000-000000008750");
+        // External, display index 0: the attributes macOS 27's WindowServer accepted on the VM-era display (UPSTREAM). D6's display:
+        // external too, "primary" as piano-dp-fake-primary says (default 0, the panel's value; what WindowServer makes of it is D6's
+        // question).
         setProperty("external", true);
-        setProperty("primary", 0ULL, 32);
+        setProperty("primary", fExternal ? static_cast<unsigned long long>(fFake.primary) : 0ULL, 32);
         done = setProperty("DisplayAttributes", attributes) && setProperty("Transport", transport) &&
             setProperty("ColorElements", colors) && setProperty("TimingElements", timings) &&
             setProperty("IOMFBMaxSrcPixels", sourceLimits) && setProperty("IOMFBScalingLimits", scalingLimits);
@@ -1556,7 +1708,7 @@ bool NativeGopDisplay::createDisplayAttributes()
     OSSafeReleaseNULL(color);
     OSSafeReleaseNULL(timing);
     if (!done || set_digital_out_mode(kColorID, kTimingID) != kIOReturnSuccess) {
-        IOLog("NativeGopDisplay: createDisplayAttributes failed (%s)\n", done ? "set_digital_out_mode" : "an element or a property");
+        GOPLOG("createDisplayAttributes failed (%s)\n", done ? "set_digital_out_mode" : "an element or a property");
         return false;
     }
     return true;
@@ -1588,7 +1740,7 @@ IOReturn NativeGopDisplay::get_dot_pitch(unsigned int *pitch)
 IOReturn NativeGopDisplay::verify_swap(IOMFBSwapIORequest *)   // AppleParavirtDisplay returns 1 (IOMobileFramebufferLegacy: 0)
 {
     if (!fSubmitted++)
-        IOLog("NativeGopDisplay: first swap submitted\n");
+        GOPLOG("first swap submitted\n");
     return 1;
 }
 IOReturn NativeGopDisplay::swap_layer_map(IOMFBSwapIORequest *, unsigned int) {return kIOReturnSuccess;}
@@ -1614,7 +1766,7 @@ IOReturn NativeGopDisplay::set_gamma_table(IOMFBGammaTable *table)
         return kIOReturnSuccess;
     fGammaHash = hash;
     if (++fGammaChanges <= 8 || fGammaChanges % 100 == 0)
-        IOLog("NativeGopDisplay: set_gamma_table #%u (call %u): %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x%s\n",
+        GOPLOG("set_gamma_table #%u (call %u): %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x%s\n",
               fGammaChanges, fGammaCalls, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13], w[14],
               w[15], fDpuPcc >= 2 ? " (771 words handed over)" : "");
     IOService *dpu = dpuService(true);
@@ -1650,7 +1802,7 @@ IOReturn NativeGopDisplay::swap_set_color_matrix(IOMFBColorFixedMatrix *matrix, 
     fColorFunction[slot] = f;
     memcpy(fColorLast[slot], raw, sizeof(raw));
     if (++fColorChanges <= 16 || fColorChanges % 100 == 0)
-        IOLog("NativeGopDisplay: swap_set_color_matrix #%u (call %u): function %u arg %#x: %016llx %016llx %016llx | %016llx %016llx %016llx | "
+        GOPLOG("swap_set_color_matrix #%u (call %u): function %u arg %#x: %016llx %016llx %016llx | %016llx %016llx %016llx | "
               "%016llx %016llx %016llx\n", fColorChanges, fColorCalls, f, arg, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
               raw[8]);
     IOService *dpu = dpuService(true);
@@ -1724,7 +1876,8 @@ bool NativeGopDisplay::are_timings_enabled() const {return false;}
 
 // UniXNU-piano (2026-11-11): the display's nub, here so the native collection needs no other display kext. IOMobileFramebuffer.framework
 // counts the DisplayPortCount of the AppleParavirtGPU services (it matches the class name) when an /arm-io node is compatible
-// "paravirtualizedgraphics,gpu" (make-piano-adt.py's /arm-io/gop-display). One display port, as the VM-era nub (UPSTREAM).
+// "paravirtualizedgraphics,gpu" (make-piano-adt.py's /arm-io/gop-display). One display port, as the VM-era nub (UPSTREAM); two with
+// D6's arguments.
 class AppleParavirtGPU : public IOService {
     OSDeclareDefaultStructors(AppleParavirtGPU)
 public:
@@ -1737,8 +1890,11 @@ bool AppleParavirtGPU::start(IOService *provider)
 {
     if (!IOService::start(provider))
         return false;
-    setProperty("DisplayPortCount", 1ULL, 32);
+    // D6 (piano-dp-fake, DpFake.h): a second display port for NativeGopDisplay's second instance, so WindowServer waits for both.
+    const bool fake = fakeFromBootArgs().armed;
+    setProperty("DisplayPortCount", fake ? 2ULL : 1ULL, 32);
     registerService();
-    IOLog("NativeGopDisplay: AppleParavirtGPU nub on %s, 1 display port\n", provider->getName());
+    IOLog("NativeGopDisplay: AppleParavirtGPU nub on %s, %s\n", provider->getName(),
+          fake ? "2 display ports (piano-dp-fake: the second is D6's RAM-backed test display)" : "1 display port");
     return true;
 }

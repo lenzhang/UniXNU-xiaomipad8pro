@@ -23,3 +23,12 @@ UniXNU-piano (2026-11-11): the PianoDpu callouts (docs/drivers/dpu.md §4.3-4.5)
 piano-dpu-pcc (swap_set_color_matrix / set_gamma_table logged and handed to PianoDpuColorMatrix / PianoDpuGammaTable; without it both
 stay the stubs AppleParavirtDisplay has), piano-dpu-panel (each display power change to PianoDpuPanel), piano-dpu-refresh=auto (each
 frame shown to PianoDpuSwap). The service is found by class, as PianoBacklight's.
+
+UniXNU-piano (2026-11-11): PianoDp's D6 probe (docs/drivers/displayport.md D6), new code, off without its boot arguments (piano-dp=1
+with piano-dp-fake=S or piano-dp-fake-boot=1; package/PianoDp/DpFake.h, included): a second instance of the class on the same nub
+(the personality NativeGopDisplayExternal, its own match category, NativeGopDisplayRole "piano-dp-fake"; the nub's DisplayPortCount
+2), backed by a RAM surface instead of the boot framebuffer, with its own timing, size, IOMFBUUID and product attributes, none of the
+panel's callouts, starting disconnected (hotPlug_notify(0)) and hot-plugged by a work-loop timer on the schedule DpFake.h computes;
+its VBL timer stops while it is disconnected. Every log line names its instance (GOPLOG: "NativeGopDisplay: " for the panel, unchanged,
+"NativeGopDisplay-ext: " for the second display). Without the arguments the second personality's probe refuses silently and the panel's
+behaviour and lines are as before.
