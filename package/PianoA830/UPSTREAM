@@ -7,7 +7,7 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
   there), 148 files unchanged (sha256 equal to the originals). Hardware-proven on the 13T: S0-S10 and a GPU-composited desktop under
   iPadOS 17.7.11 (gpu-native-plan.md section 2). Changed, every change marked "UniXNU-piano" in a comment and compiled only with
   -DADRENO830_MACOS (the host tests build without it, so they test the upstream code paths):
-    Adreno830Start.cpp      215e565650d176cd28c2e11e79e098195474add04ea5ae054b15e9eaa4ff0b0f -> fd611a6036d9205fd1d32dac288f512189d910b3ea941e95db75830592d46526
+    Adreno830Start.cpp      215e565650d176cd28c2e11e79e098195474add04ea5ae054b15e9eaa4ff0b0f -> 96ce2e8e7189bd500fab30e67c2088eac5b8e3bb4b68ec3c94610cab624faba9
       S9 publishMetal without the iPadOS-only staged IOAcceleratorES (no IOGPUFamily load, no static class initializer, no
       g_kernel_kmod_info): prepare/commit report steps 4/5; the macOS accelerator is the kext's AGXAccelerator personality on the
       NativeAdrenoGpuPublished service native_adreno_publish registers. The 128 KiB cmd-db snapshot on the heap (allocated once by
@@ -57,7 +57,7 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       DRV-2 lock). 2026-11-11: Sm8750RpmhHostRailsSet, the rails at given levels (the suspend's, hlvl 0 included; mx first when
       either rises, cx first when both fall; one TCS, the same lock).
     tests/A830PowerFakes.h  2993b53b13f77646b43ca807861e77083d16050ff3e4e3774e3688c3a0fdd040 -> 39d3da9e3549693516d59f9e0ba6e4e310c917591e632778cd639214ad638ed2
-    tests/test_start.cpp    83099b66827778ab36df93100fe1301c3c8dd284108bb2c2e06ec265ee986a47 -> 4928f5d385e7aff69951db42dc027a71769a21ba06e3f5cd309c713d5b2c274f
+    tests/test_start.cpp    83099b66827778ab36df93100fe1301c3c8dd284108bb2c2e06ec265ee986a47 -> eaeeaf8ab526f44a09c57a21df25137420ed753e7f1f40b50e2791cf6c33e241
     tests/test_sm8750_rpmh.c be1c38fb9ada8dbb8ee084d9e13331640092d0883452feceff293abbdb226cc5 -> aba4c2af9df5b9744a5697c5f68916ff49007022e93d0add78473ecfab7253bc
     tests/test_a830idle.cpp (new)                                                            -> 94e91269cf6394b33297b022eccc0ddce0ccec2bbfc3cc10f0db0e8d39743ae9
       2026-11-11, the ADRENO830_MACOS pass only where the code is: the idle ops field in the fakes' table, the RPMh double and the

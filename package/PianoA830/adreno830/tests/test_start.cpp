@@ -1014,7 +1014,8 @@ void A830PowerState::start(uint8_t level,uint8_t bus)
     powerLevel=level;powerBus=bus;powerStarted=true;
     hit("A830PowerState::start");
 }
-void A830PowerState::setFaultSink(void (*sink)(void *,uint8_t,uint64_t),void *) {CHECK(sink);}
+static void (*powerSink)(void *,uint8_t,uint64_t);   /* UniXNU-piano: the orchestrator's fault sink, for the suspend's cases */
+void A830PowerState::setFaultSink(void (*sink)(void *,uint8_t,uint64_t),void *) {CHECK(sink);powerSink=sink;}
 /* The GMU AO counter read (timeRead) holds the GPU awake through the power state, which the S0-S10 doubles never start. */
 extern "C" A830PowerState *adreno830_power_state(void) {return nullptr;}
 IOReturn A830PowerState::acquire() {return kIOReturnSuccess;}
@@ -1049,7 +1050,12 @@ IOReturn A830Recovery::init(const A830RecoveryConfig &config,const A830PowerIo &
     recoveryOps=ops;
     return hit("A830Recovery::init");
 }
-void A830Recovery::report(uint8_t cause,uint64_t) {recoveredCause=cause;hit("A830Recovery::report");}
+static bool reportPends;   /* UniXNU-piano: a report leaves the recovery pending (A830Recovery::pending), as the real one does */
+void A830Recovery::report(uint8_t cause,uint64_t)
+{
+    recoveredCause=cause;hit("A830Recovery::report");
+    if(reportPends)__atomic_store_n(&pendingCause_,cause,__ATOMIC_RELEASE);
+}
 IOReturn A830Recovery::recover(uint8_t cause,uint64_t) {recoveredCause=cause;return hit("A830Recovery::recover");}
 IOReturn A830Dcvs::init(const A830DcvsConfig &config,const A830DcvsTable &table,const A830PowerIo &,const A830PowerEnv &,
                         const A830DcvsOps &ops,A830PowerState *power,A830Recovery *recovery,const Sm8750TsensIo *)
@@ -2156,12 +2162,14 @@ int main()
         ++suspendCases;
         /* Busy: the gate stays open, nothing else. */
         suspendResult=kIOReturnBusy;suspendInfo={500000,0,0,false};
-        CHECK(adreno830_suspend_gpu(500,&r)==kIOReturnBusy && suspendWaitUs==500000 && r.waitedUs==500000 && !r.cxCollapsed);
+        /* (the host clock moves 100 us a reading: what the pending-recovery check took comes off the power state's budget) */
+        CHECK(adreno830_suspend_gpu(500,&r)==kIOReturnBusy && suspendWaitUs>=499000 && suspendWaitUs<=500000 && r.waitedUs>=500000 &&
+              r.waitedUs<501000 && !r.cxCollapsed);
         CHECK(adreno830_suspend_votes(A830ScanoutRunning,&config,&r)==kIOReturnNotReady && ddrVotes.empty());
         ++suspendCases;
         /* Down: the gate shut. The idle tick and a DCVS floor raise stand aside. */
         suspendResult=kIOReturnSuccess;suspendInfo={3000,1200,0,false};
-        CHECK(adreno830_suspend_gpu(500,&r)==kIOReturnSuccess && r.entryUs==1200 && r.waitedUs==3000);
+        CHECK(adreno830_suspend_gpu(500,&r)==kIOReturnSuccess && r.entryUs==1200 && r.waitedUs>=3000 && r.waitedUs<4000);
         CHECK(lastDcvsOps.idleTick && lastDcvsOps.hostDdr);
         idleEvents.clear();
         CHECK(lastDcvsOps.idleTick(nullptr,90000000000ull,true,1000000000ull)==0 && idleEvents.empty() && ddrVotes.empty() &&
@@ -2217,12 +2225,18 @@ int main()
         CHECK(lastDcvsOps.hostDdr(nullptr,10687500)==kIOReturnSuccess && ddrVotes.back()==10687500);
         CHECK(adreno830_resume_gpu(false,&r)==kIOReturnSuccess && called("A830PowerState::resume")==1);
         ++suspendCases;
+        /* A recovery reported and not yet run: waited out within the quiet time, then refused without touching the GPU. */
+        CHECK(powerSink);
+        reportPends=true;powerSink(nullptr,A830FaultGmu,0);reportPends=false;
+        const unsigned asked=called("A830PowerState::suspend");
+        CHECK(adreno830_suspend_gpu(500,&r)==kIOReturnBusy && called("A830PowerState::suspend")==asked && r.waitedUs>=500000);
+        ++suspendCases;
         testIdle=A830IdleConfig{};suspendResult=resumeResult=kIOReturnSuccess;
     }
     std::printf("PASS: piano-gpu-suspend (UniXNU-piano): %u orchestrator cases (kOff's gate busy or down, the idle votes and floor "
                 "raises standing aside while it is shut, PreSleep's DDR to the display's floor or the keepalive minimum and the rails "
                 "to NOM_L1 or 0, never up, DDR before rails; PostResume's rails then DDR as found, once; a failed vote undone; kOn's "
-                "resume with and without the wake)\n",suspendCases);
+                "resume with and without the wake; a pending recovery waited out and refused)\n",suspendCases);
     std::printf("PASS: piano-gpu-idle (UniXNU-piano): %u full runs (modes 0, 1, 2 with and without its slumber, pagani-gpu-slumber's "
                 "choice kept; mode 2 drops the boot DDR vote to the display's floor at S10, a failed drop keeps it, a chosen "
                 "pagani-gpu-ddr-floor is kept) and the idle votes through the DCVS hook (down after 1 s quiet to DDR level 5 and "

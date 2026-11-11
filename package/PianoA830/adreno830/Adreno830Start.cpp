@@ -2635,6 +2635,8 @@ bool adreno830_running(void) {return __atomic_load_n(&g830.running,__ATOMIC_ACQU
 namespace {
 /* The host votes as the suspend found them at PreSleep, put back at PostResume (or kOn). */
 struct SuspendSaved {bool valid;uint32_t held,mx,cx,ddr;} gSaved;
+/* (os() here, inside the unnamed namespace: at file scope the kernel's namespace os makes the name ambiguous) */
+void suspendSleepUs(uint32_t us) {os().sleep_us(us);}
 void reportVotes(A830SuspendReport *r,bool after)
 {
     const Sm8750RpmhHost &h=g830.host;
@@ -2653,8 +2655,23 @@ extern "C" int32_t adreno830_suspend_gpu(uint32_t idleWaitMs,A830SuspendReport *
     A830SuspendReport *r=report?report:&local;
     *r=A830SuspendReport{};
     if(!g830.power_bound || !adreno830_running()) {r->result=kIOReturnNotReady;return r->result;}
+    /* A recovery reported and not yet run (the DCVS thread runs it, and it would bring the GPU up again under the shut gate): waited
+     * out first, within the same quiet time. */
+    const uint64_t begin=nowUs(),budgetUs=uint64_t(idleWaitMs)*1000u;
+    while(g830.recovery.pending() && nowUs()-begin<budgetUs)suspendSleepUs(1000);
+    const uint64_t spent=nowUs()-begin;
+    if(g830.recovery.pending()) {
+        r->result=kIOReturnBusy;r->waitedUs=uint32_t(spent);r->powerPhase=g830.power_state.phase();
+        return r->result;
+    }
     A830PowerState::SuspendInfo info{};
-    const IOReturn result=g830.power_state.suspend(idleWaitMs*1000u,&info);
+    IOReturn result=g830.power_state.suspend(uint32_t(budgetUs>spent?budgetUs-spent:1000u),&info);
+    if(result==kIOReturnSuccess && g830.recovery.pending()) {
+        /* Reported while the GPU went down: the gate open again and the recovery's turn; this suspend goes on without the GPU. */
+        (void)g830.power_state.resume(false,nullptr);
+        result=kIOReturnBusy;
+    }
+    info.waitedUs+=uint32_t(spent);
     r->result=result;r->waitedUs=info.waitedUs;r->entryUs=info.entryUs;r->warnings=info.warnings;
     r->alreadyAsleep=info.alreadyAsleep;
     r->cxCollapsed=result==kIOReturnSuccess && !g830.power_state.cxOn() && !(info.warnings&Sm8750GpuOffCxStillOn);
