@@ -1,0 +1,57 @@
+PianoDp is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE): USB-C DisplayPort Alt Mode (backlog B8), the first slices D1
+(the read-only survey), D2 (the port events) and D6's shared part (DpFake.h, used by NativeGopDisplay). What it takes from other work,
+and from where:
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoDpu/PianoDpu.cpp (sha256 af3789dff806aa010f68c38067f60fc6d27f7d930445bfd7434e4f204f76e7b3): the kext's shape (probe
+    gate on the boot argument, a survey thread, the post-mortem stage word, MMIO pages mapped on demand and loaded with an explicit
+    ldr, one summary property), re-written for this driver.
+  package/PianoDpu/DpuHw.h (sha256 be332abd06fb2312a39241093846ec8fbf898f52decb067848979fc8edb3c01a) and DpuSurvey.h (sha256
+    500323975dbba4d7baa0bb5a06750793a9530f9e1e0a943f599769c5ba5ef979): included, not copied (the MDP base and the CTL/LM/INTF/
+    MERGE_3D/TOP offsets, DISPCC's MDSS words, the display gate surveyClocks, the CTL/LM/INTF records and their views).
+  package/PianoDpu/tests/dpu_host.cpp (sha256 46fae81bb9545f22ac355e32a4490396237d0e4f4e695539fd9e05c0e929c5cd): the register-model
+    harness (Soc, CHECK), re-used in tests/dp_host.cpp.
+  package/PianoUsbHost/UsbHostHw.h (sha256 a86fa90a288608221fbd5cd99cc6ace779eded28e48d6615226e24f293cc59f3), UsbHostSurvey.h (sha256
+    78049f7fb188a96f68db720027c71be33bfbee40363807574afa890c2d5abb10) and package/PianoDwc3/PianoUsbHw.h (sha256
+    3c07c280fdd57d4c2cff068bca75f59b6d9a4c1f3b6302a2b77f0c3de97240d6): included, not copied (the QMP base and DP_COM offsets, the GCC
+    PHY clocks and the phyOn rule, surveyQmp, the TLMM pins and decodePin, the DIO4485's bus address).
+  package/PianoPower/PianoMca.c (sha256 bfd610da27b34536b29601aec35b21c55d620186c1d4869e373cb26b3444ae64): the port owner's
+    enable/acknowledge exchange stays there; PortEvents.c (new, in PianoPower) hands the notifications on.
+
+The piano boot DT (out/inputs/piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840):
+displayport-controller@af54000 (its five register blocks, clocks and names, power domain, link-frequencies, data-lanes),
+clock-controller@af00000, phy@88e8000, pmic-glink (connector@0, orientation-gpios).
+
+Specifications only (no code, comment or table copied): the Ubuntu piano kernel (piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01;
+GPL-2.0):
+  drivers/gpu/drm/msm/dp/dp_reg.h (sha256 a7da1521cf1b280967f599344d2078d1298989b01c25d5e210bacb27a5ea783b): register offsets and
+    bit names of the ahb, aux, link and p0 blocks;
+  drivers/gpu/drm/msm/dp/dp_ctrl.c (sha256 113668369bec83fd48567995310f8c87a73947a234be5119758f9cf49a901786): the core / link /
+    stream clock groups and their order, where the version is read;
+  drivers/gpu/drm/msm/dp/dp_display.c (sha256 149f13db7bf066ccaf8bb07e5be4b5a15ba381047e7c16e3a5662ec53eb4f3d9): msm_dp_snapshot's
+    refusal of unclocked reads;
+  drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c (sha256 4953c2d35534f91c59bf062eee2324afd1f0e354fe7d0cc73b6a1f24bf1de324):
+    dpu_kms_mdp_snapshot (every CTL, DSPP, INTF and LM read with only the MDSS clocks on);
+  drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_12_0_sm8750.h (sha256 114e33e2b01d55edeaf7940c16742327babb3bf9780e910596f61944fb999e82):
+    INTF0/INTF3 as DP, their interrupt bits, PINGPONG blocks without registers, MERGE_3D;
+  drivers/gpu/drm/msm/disp/dpu1/dpu_hw_top.c (sha256 6589d7676e5bb6721ab2d11104dd7ba0a03d128367565581109df15ec5e3dcd4):
+    DP_PHY_INTF_SEL;
+  drivers/phy/qualcomm/phy-qcom-qmp-combo.c (sha256 a8e8384679f6445e25d049267046b9766ad8aee2dd6b80bffb1411aaaaa92457): the v8
+    offsets, sm8750_usb3dpphy_cfg's register layout, the DP_COM bits, the mux mapping by pin assignment (qmp_combo_typec_mux_set), the
+    status polls (qmp_v456_configure_dp_phy, qmp_v4_configure_dp_phy); its serdes/TX tables and AUX init words are NOT taken (an
+    owner decision, docs/BACKLOG-hardware.md section 4);
+  drivers/phy/qualcomm/phy-qcom-qmp-dp-phy.h (sha256 727ff7bc45b642ea5db00f54c6590a0957454ec3c3a55ce428b578fea0731b7c),
+    phy-qcom-qmp-dp-phy-v6.h (sha256 6db2c0f7e6c8f3790b104fd17b81eb4dd696f59beb229553c4f38a9e7a05a6c9), phy-qcom-qmp-qserdes-com-v8.h
+    (sha256 89110804b8524cd37438fbfc67982700ab1473715f33a9de4b67dcaa8777076d), phy-qcom-qmp-dp-com-v3.h (sha256
+    e6c545a6cfb121fea9ff120c7e56d704cc5f9ae536e6d34788fea2071f767864): DP_PHY and serdes status offsets, PD_CTL bit names;
+  drivers/clk/qcom/dispcc-sm8750.c (sha256 ce65c2221a238143767b9176e1324dd4d4f5cbc993df09400ca8b60f39b8f482) and clk-rcg2.c (sha256
+    4a1c8f29e2d4a80ef14f5c58f14de7a3576ea591c84f091b59cf5257e303f947): the DPTX0 branch and RCG offsets, the RCG register layout;
+  drivers/soc/qcom/pmic_glink_altmode.c (sha256 663a550a9d4c6312562b61e07288c300a4bb8a0c5c7307a275176beb761f1129): struct usbc_notify's
+    layout and the exact-length check, the SVID in the opcode word, mux_ctrl's values, the DP pin/HPD/IRQ bits, the orientation
+    values, the worker's order (orientation, SVID and mux, HPD; the safe state), three ports;
+  drivers/usb/typec/mux/fsa4480.c (sha256 a22b79d2d64eef959b993e6b1fc216e0cdd13c115fb98e1e39b104fb589e3ae1): the SWITCH_ENABLE /
+    SWITCH_SELECT bits per state and pin assignment, A/B refused, the SBU delays.
+
+General knowledge (no source text): DisplayPort's 8b/10b payload (rate x 8 / 10 per lane); the CTA-861 pixel clocks of 3840x2160@30
+(297 MHz) and 1920x1080@60 (148.5 MHz) and the CVT reduced-blanking ones of 3840x2160@60 (533.25 MHz) and 2560x1440@60 (241.5 MHz).
+No Apple binary was read for this package.
