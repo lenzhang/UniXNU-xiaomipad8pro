@@ -240,9 +240,15 @@ class Session:
         if not tablet:
             raise Stop('PIANO_MAINT_HOST is not set (environment or ~/.config/piano/env)')
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect((tablet, 9))
-        ip = s.getsockname()[0]
-        s.close()
+        try:
+            s.connect((tablet, 9))
+            ip = s.getsockname()[0]
+        except OSError:
+            if self.execute:
+                raise Stop('no route to PIANO_MAINT_HOST (is the USB NCM link up?)')
+            ip = '<host-ip>'        # dry run without the link
+        finally:
+            s.close()
         return ip
 
     def serve(self, files):
@@ -801,12 +807,23 @@ def ram_test(s, image, expect_uefi, reset_after):
     s.fastboot('boot', str(image), timeout=180)
     if not s.wait('piano-uefi', True, 40):
         raise Stop('our UEFI did not appear: ABL refused the image? (fastboot reboot bootloader; docs/persistent-boot.md, v2 fallback)')
-    s.fastboot('oem', 'dump', 'D7F00000', '100000', serial='piano-uefi', check=False)
-    s.fastboot('get_staged', f'{name}-uefi.bin', serial='piano-uefi', check=False)
-    if s.execute:
+    # The DEBUG log is dumped repeatedly: right after the UEFI's fastboot appears, UniXNU has not read its configuration yet (seen
+    # 2026-11-11: only the UNIXNURAMDISK lines). Until the expected line shows, or the UEFI is gone (DarwinBoot has taken over).
+    lines = []
+    for attempt in range(25 if s.execute else 1):
+        s.fastboot('oem', 'dump', 'D7F00000', '100000', serial='piano-uefi', check=False)
+        s.fastboot('get_staged', f'{name}-uefi.bin', serial='piano-uefi', check=False)
+        if not s.execute:
+            break
         path = s.dir / f'{name}-uefi.bin'
         raw = path.read_bytes() if path.is_file() else b''
-        lines = [m.decode(errors='replace') for m in re.findall(rb'UNIXNU[A-Z]*: [ -~]{0,200}', raw)]
+        got = [m.decode(errors='replace') for m in re.findall(rb'UNIXNU[A-Z]*: [ -~]{0,200}', raw)]
+        if len(got) >= len(lines):
+            lines = got
+        if any('config: volume' in line for line in lines) or not s.wait('piano-uefi', True, 1):
+            break
+        time.sleep(0.5)
+    if s.execute:
         for line in lines[:60]:
             s.log('        | ' + line)
         if lines:
