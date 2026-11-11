@@ -60,7 +60,8 @@ at 30 mW (Ubuntu's CX-off) over a month. §6.4 is the measurement that replaces 
   it) asks for `cl5` when every CPU of the cluster has 9144 µs before its deadline; with `N = 3`, the one that completes the
   system asks for `ss3` (10150 µs), only when the LLCC island is reserved (§3.6). An idle mask and per-CPU deadlines are the
   bookkeeping; a DENIED (a sibling woke) retries at once with the CPU state; a state rejected as invalid 16 times in a row is
-  turned off for that CPU and the summary says so.
+  turned off for that CPU and the summary says so, and so is one that returns at once with nothing pending 64 times in a row
+  (`last error 1`: a CPU_SUSPEND that does not suspend would make the idle loop a spin of SMCs; WFI then blocks again).
 - **Mode:** OS-initiated, set once at boot from the boot CPU before any CPU_SUSPEND (Gunyah's mode switch checks vCPU 0) when
   FEATURES(CPU_SUSPEND) has bit 0 and N >= 2; `piano-cpuidle-pc=1` keeps platform-coordinated (domain states as votes).
 - **Power-down states:** none on this platform (Gunyah hides any physical collapse; the guest's context survives). For the test of
@@ -79,7 +80,7 @@ at 30 mW (Ubuntu's CX-off) over a month. §6.4 is the measurement that replaces 
 | Argument | Default | Meaning |
 |---|---|---|
 | `piano-cpuidle=N` | 0 | 0 WFI as before; 1 `ret`; 2 + `cl5`; 3 + `ss3` (refused unless the LLCC island is reserved) |
-| `piano-cpuidle-period=S` | 60 | the console summary's period; 0 none |
+| `piano-cpuidle-period=S` | 60 | the console summary's period; 0 none (the daily profile: 0 or 600) |
 | `piano-cpuidle-pc=1` | 0 | no OS-initiated mode (domain states as platform-coordinated votes) |
 | `piano-cpuidle-pd=1` | 0 | experimental: `ret` as a power-down, the reset-vector path |
 | `piano-pm-probe=1` | 0 | only the probe lines (PSCI, RSC, RPMh, LLCC), nothing changes |
@@ -282,8 +283,8 @@ K27_KERNEL=$K/out/k27/kernel-k27-0062-native.macho PIANO_GPU=2 PIANO_VMM_PRESENT
 tooling/k27/build-pm-test-images.sh            # out/ram-pm-{base,probe,idle1,idle2,idle1pd,idle3,sleep0,sleep1,sleep2,sleepkey,measure}
 ```
 (`$K` = `droidvm-build/macOS-DroidVM`. Built offline here from an APFS clone of the k27 tree with its own object directory: kernel
-sha256 `49509110023a9362…`, KC with the 14 native kexts `5e533841c0713749…`, layout check passed; images `ram-pm-probe`
-`7b503858fd23abb7…`, `ram-pm-idle2` `2ba7ca553954da7d…`, `ram-pm-sleep1` `87152fa3277de8a7…` — rebuild in the main checkout before a
+sha256 `24940c6dd10bee7d…`, KC with the 14 native kexts `f0a92af1f3696fc4…`, layout check passed; images `ram-pm-probe`
+`6581b37722ae39d9…`, `ram-pm-idle2` `f0332cca1569821f…`, `ram-pm-sleep1` `c6e3492ac15a9597…` — rebuild in the main checkout before a
 run. For `sleepkey` with the cover: `PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/PianoKeyboard.json` in the KC build.)
 
 | # | Image | Risk | Run | Pass | On failure |

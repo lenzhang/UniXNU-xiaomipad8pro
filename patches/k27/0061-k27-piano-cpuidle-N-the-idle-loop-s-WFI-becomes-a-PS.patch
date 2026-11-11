@@ -1,4 +1,4 @@
-From 4ec78cc87332975153f3ed6349f4c462f561bc0c Mon Sep 17 00:00:00 2001
+From e642bf4d5345c63226d8924b30b54ddc3ab17b66 Mon Sep 17 00:00:00 2001
 From: leozhang <zwj8727@gmail.com>
 Date: Wed, 11 Nov 2026 14:41:48 +0800
 Subject: [PATCH 61/62] k27: piano-cpuidle=N: the idle loop's WFI becomes a
@@ -35,11 +35,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  bsd/dev/arm64/sysctl.c        |  44 +++
  osfmk/arm/arm_init.c          |   8 +
  osfmk/arm64/cpu.c             |   9 +
- osfmk/arm64/piano_pm.c        | 670 ++++++++++++++++++++++++++++++++++
+ osfmk/arm64/piano_pm.c        | 684 ++++++++++++++++++++++++++++++++++
  osfmk/arm64/piano_pm.h        |  38 ++
  osfmk/arm64/piano_pm_policy.h | 209 +++++++++++
  osfmk/conf/files.arm64        |   1 +
- 7 files changed, 979 insertions(+)
+ 7 files changed, 993 insertions(+)
  create mode 100644 osfmk/arm64/piano_pm.c
  create mode 100644 osfmk/arm64/piano_pm.h
  create mode 100644 osfmk/arm64/piano_pm_policy.h
@@ -153,10 +153,10 @@ index 04ecbbc..7e5fb63 100644
  			os_atomic_add(&virt_wfi_ticks, mach_absolute_time() - before, relaxed);
 diff --git a/osfmk/arm64/piano_pm.c b/osfmk/arm64/piano_pm.c
 new file mode 100644
-index 0000000..8c5c74c
+index 0000000..cc84190
 --- /dev/null
 +++ b/osfmk/arm64/piano_pm.c
-@@ -0,0 +1,670 @@
+@@ -0,0 +1,684 @@
 +/*
 + * Copyright (c) 2026 the UniXNU-piano authors. Modifications to XNU under the Apple Public Source License 2.0.
 + *
@@ -271,6 +271,7 @@ index 0000000..8c5c74c
 +	uint64_t rejected[PIANO_IDLE_LEVELS];
 +	uint64_t denied[PIANO_IDLE_LEVELS];
 +	uint32_t consecutive[PIANO_IDLE_LEVELS];
++	uint32_t quick[PIANO_IDLE_LEVELS];      /* returns in a row too quick to have suspended */
 +	uint8_t  disabled[PIANO_IDLE_LEVELS];
 +	int64_t  last_error;
 +	uint64_t reset_resumes;
@@ -292,6 +293,7 @@ index 0000000..8c5c74c
 +static bool piano_cpuidle_pd;              /* piano-cpuidle-pd=1 */
 +static uint32_t piano_cpuidle_period = 60; /* piano-cpuidle-period=S */
 +static uint64_t piano_resume_pa;           /* the entry point for a power-down: the reset vector */
++static uint64_t piano_quick_ticks = 192;   /* 10 us of the 19.2 MHz counter (set from CNTFRQ at boot) */
 +static thread_call_t piano_cpuidle_call;
 +
 +/* The domains: the CPUs in a PSCI state (or about to enter one), their next deadlines, and the CPUs of each cluster. */
@@ -509,11 +511,13 @@ index 0000000..8c5c74c
 +			pc->pd_pending = 1;
 +			__builtin_arm_dsb(DSB_SY);
 +		}
++		uint64_t called = piano_counter();
 +		int64_t r = (int64_t)piano_pm_call(PSCI_CPU_SUSPEND64, param, piano_resume_pa, (uint64_t)cpu);
 +		if (r == PSCI_E_DENIED && level >= 2) {
 +			/* OSI: a CPU of the domain was not suspended after all; this CPU's own state instead */
 +			pc->denied[level]++;
 +			level = 1;
++			called = piano_counter();
 +			r = (int64_t)piano_pm_call(PSCI_CPU_SUSPEND64, pc->table[1].param, piano_resume_pa, (uint64_t)cpu);
 +		}
 +		pc->pd_pending = 0;
@@ -527,8 +531,17 @@ index 0000000..8c5c74c
 +			__builtin_arm_dsb(DSB_SY);
 +			__builtin_arm_wfi();
 +			level = 0;
++		} else if (piano_counter() - called < piano_quick_ticks && __builtin_arm_rsr64("ISR_EL1") == 0) {
++			/* Back at once with nothing pending: a CPU_SUSPEND that did not suspend would turn the idle loop into a spin
++			 * of SMCs, so 64 of these in a row turn the level off for this CPU (WFI blocks until an interrupt). */
++			pc->consecutive[level] = 0;
++			if (++pc->quick[level] >= 64) {
++				pc->disabled[level] = 1;
++				pc->last_error = 1;   /* "quick": shown in the summary as last error 1 */
++			}
 +		} else {
 +			pc->consecutive[level] = 0;
++			pc->quick[level] = 0;
 +		}
 +	} else {
 +		__builtin_arm_dsb(DSB_SY);
@@ -726,6 +739,7 @@ index 0000000..8c5c74c
 +		}
 +	}
 +	piano_resume_pa = ml_static_vtop((vm_offset_t)&LowResetVectorBase);
++	piano_quick_ticks = __builtin_arm_rsr64("CNTFRQ_EL0") / 100000;
 +	uint32_t pc_mode = 0;
 +	PE_parse_boot_argn("piano-cpuidle-pc", &pc_mode, sizeof(pc_mode));
 +	if (deepest < 2 || piano_osi || piano_osi_result != 1 || pc_mode == 1) {

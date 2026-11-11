@@ -1,8 +1,8 @@
-From 7218f5494363973e00263f2611148e0f439e4201 Mon Sep 17 00:00:00 2001
+From 1b7524922ce2373a5ae9887912dd917872823c40 Mon Sep 17 00:00:00 2001
 From: leozhang <zwj8727@gmail.com>
 Date: Wed, 11 Nov 2026 15:10:01 +0800
-Subject: [PATCH] k27: piano-sleep=1: macOS's system sleep as suspend-to-idle
- (CPUs parked in PSCI states, wake sources polled)
+Subject: [PATCH 62/62] k27: piano-sleep=1: macOS's system sleep as
+ suspend-to-idle (CPUs parked in PSCI states, wake sources polled)
 
 The stock arm64 sleep cannot run on this platform: ArmCpu's haltCPU spins in WFI on the calling CPU, its initCPU(false)
 panics, this board's arm64_prepare_for_sleep is a WFI loop, and Gunyah's SYSTEM_SUSPEND needs every other vCPU in CPU_OFF,
@@ -217,10 +217,10 @@ index 4b42199..94dd5e8 100644
  			if (lowBatteryCondition || thermalEmergencyState) {
  				if (lowBatteryCondition) {
 diff --git a/osfmk/arm64/piano_pm.c b/osfmk/arm64/piano_pm.c
-index 8c5c74c..566abcc 100644
+index cc84190..7b00b1f 100644
 --- a/osfmk/arm64/piano_pm.c
 +++ b/osfmk/arm64/piano_pm.c
-@@ -636,6 +636,867 @@ piano_cpuidle_init(void)
+@@ -650,6 +650,867 @@ piano_cpuidle_init(void)
  }
  STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_cpuidle_init);
  
@@ -1088,7 +1088,7 @@ index 8c5c74c..566abcc 100644
  #else /* !defined(XNU_VM_GUEST) */
  
  size_t
-@@ -667,4 +1528,47 @@ piano_cpuidle_latency_release(int handle __unused)
+@@ -681,4 +1542,47 @@ piano_cpuidle_latency_release(int handle __unused)
  {
  }
  
