@@ -50,6 +50,7 @@ extern "C" {
 #include "AdspHealth.h"
 #include "PianoMca.h"
 #include "PortEvents.h"
+#include "UsbcRelay.h"   // the USB-C owners for one client kext (package/include/PianoUsbcContract.h, PianoUsbcRelay.cpp)
 }
 #include "ChargeLink.h"
 
@@ -829,6 +830,7 @@ void PianoPower::serviceMca(uint64_t now)
     }
     IOSimpleLockUnlock(fRingLock);
     if (!length) break;
+    if (piano_usbc_relay_receive(data, length)) continue;   // the UCSI client's traffic (UsbcRelay.h): not PianoMca's
     const int r = piano_mca_receive(&fMca, data, length);
     if (r == McaAnswer || r == McaCycleDone || r == McaWritten) fRequestDue = 0;
     if (r == McaWritten && fPolicyOn) {
@@ -846,7 +848,8 @@ void PianoPower::serviceMca(uint64_t now)
     }
     if (r == McaUcsiNotified && fUcsiNotesLogged < 8) {
       fUcsiNotesLogged++;
-      note("ucsi: notification from owner 0x800b (%u so far; nothing is sent back: we run no UCSI client)", fMca.ucsi_notifies);
+      note("ucsi: notification from owner 0x800b (%u so far; nothing is sent back: %s)", fMca.ucsi_notifies,
+           piano_usbc_relay_attached() ? "the UCSI client is not ready yet" : "we run no UCSI client");
     }
     if (r == McaPanNotified) {
       note("mca: USB-C port notification (port %u): acknowledged", data[12]);
@@ -1162,6 +1165,9 @@ void PianoPower::run()
   for (;;) {
     uint64_t now = nowMs();
     serviceMca(now);
+    // The USB-C relay (UsbcRelay.h): its client is ready once the generation is linked, the quiet is down and our UCSI read is through.
+    if (fChannel)
+      piano_usbc_relay_step(fChannel, fWasUp && !fQuiet.raised && fMca.ucsi != 1 && fMca.ucsi != 2, fMca.links, this);
     // Between the sleep handover's acknowledgement and the wake: no report (the gauges' I2C idle, docs/power.md 4); after the wake
     // the one that fell due runs at once.
     if (const int q = fSleepReports.update(fPolicyOn, fHandover, fHandoverAcked))
@@ -1190,7 +1196,7 @@ void PianoPower::run()
     if (fShutdownSeen && !fPolicyEnded && fShutdownUntil < next) next = fShutdownUntil;
     const uint32_t wait = next > now ? uint32_t(next - now < 60000 ? next - now : 60000) : 1;
     assert_wait_timeout((event_t)this, THREAD_UNINT, wait, kMillisecondScale);
-    bool pending = __atomic_load_n(&fLinkChanged, __ATOMIC_ACQUIRE) != 0 || policyAsked();
+    bool pending = __atomic_load_n(&fLinkChanged, __ATOMIC_ACQUIRE) != 0 || policyAsked() || piano_usbc_relay_pending();
     IOSimpleLockLock(fRingLock);
     pending |= fRingCount != 0;
     IOSimpleLockUnlock(fRingLock);

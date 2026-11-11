@@ -92,6 +92,10 @@ UCSI buffer offsets (VERSION 0, CCI 4) are the UCSI specification's. The Type-C 
 default, bit 2 1.5 A, bit 1 3.0 A) is the register fact of Linux's drivers/usb/typec/tcpm/qcom/qcom_pmic_typec_port.c (GPL, read for
 the fact only; docs/drivers/usb-host.md §facts).
 
+UsbcRelay.c/.h and PianoUsbcRelay.cpp (the USB-C relay, package/include/PianoUsbcContract.h: the DSP's UCSI owner 0x800b for one client
+kext, docs/drivers/usb-host.md §6.6; the port notifications stay PortEvents.c's) are new code (BSD-2-Clause-Patent): the message layout
+is the one named above (ucsi_glink.c as a description); the queue, the request check, the ready rule and the hooks are this
+repository's own. Nothing copied.
 ChargePolicy.c/.h (the charging policy, backlog B4) and ChargeLink.h (its wiring into the codec, piano-power-policy=1) are new code
 (BSD-2-Clause-Patent), written fresh: the behaviour and numbers from docs/ubuntu-history/device.md and kernel.md and the GPL
 xiaomi_mca driver read as a specification (docs/drivers/charging-policy.md §12), the board-thermistor rules from

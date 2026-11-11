@@ -36,6 +36,12 @@ T=$D/out/native-kexts/PianoPower/host-tests; mkdir -p "$T"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/port_events_host.cpp" "$T/PortEvents.o" \
   "$T/PianoMca.o" -o "$T/port_events_host"
 "$T/port_events_host" || { echo "Error: PianoPower port-event host tests failed" >&2; exit 1; }
+# The USB-C relay (package/include/PianoUsbcContract.h, UsbcRelay.c): the requests a client may send, the queue, the ready transitions,
+# whose a received message is, and PianoPower's order of the relay and the charger codec.
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$D/package/include" -c "$P/UsbcRelay.c" -o "$T/UsbcRelay.o"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/usbc_host.cpp" "$T/UsbcRelay.o" "$T/PianoMca.o" \
+  -o "$T/usbc_host"
+"$T/usbc_host" || { echo "Error: PianoPower USB-C relay host tests failed" >&2; exit 1; }
 # The kernel's calendar uses the same arithmetic: k27 0060 adds PmicRtc.h unchanged as osfmk/arm64/piano_rtc.h.
 for p in "$D"/patches/k27/0060-*.patch; do
   [ -f "$p" ] || continue
@@ -44,7 +50,8 @@ for p in "$D"/patches/k27/0060-*.patch; do
 done
 python3 "$D/tooling/k27/build-native-kext.py" PianoPower "$P/PianoPower.cpp" "$P/PianoAdsp.cpp" "$P/PianoBattery.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
   "$P/PianoMca.c" "$P/ChargePolicy.c" "$P/PianoQrtr.c" "$P/PianoAdspFirmware.c" "$P/QcomSmem.c" "$P/QcomSmp2p.c" "$P/QcomGlink.c" "$P/QcomQmp.c" \
-  "$P/QcomRpmh.c" "$P/QcomMdt.c" "$P/QcomQrtr.c" "$P/QrtrPorts.c" "$P/PortEvents.c" "$P/FatVolume.c" "$P/Sm8750Scm.c" \
+  "$P/QcomRpmh.c" "$P/QcomMdt.c" "$P/QcomQrtr.c" "$P/QrtrPorts.c" "$P/PortEvents.c" "$P/FatVolume.c" "$P/Sm8750Scm.c" "$P/UsbcRelay.c" \
+  "$P/PianoUsbcRelay.cpp" \
   -I "$P" --obj "${K27_OBJ:-k27-native-obj}"
 # The imports the KC resolves from the libraries PianoPower.json names: NativeUfs's partition reads, PianoA830's DRV-2 and secure-call
 # lock words (package/include/PianoScmLock.h, docs/scm-lock.md); anything else the kernel must define.

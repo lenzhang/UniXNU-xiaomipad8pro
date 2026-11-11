@@ -543,6 +543,14 @@ listed after PianoPower in `configs/k27-native-kexts.txt`, so the KC links the f
 | Health | `piano_adsp_health(&h)`: stage, `dsp_up` (ready, not fatal, GLINK agreed and not broken, router hello), the fatal bit, the fatal-report count, the **link generation** (moves when a channel that was up goes down, or the transport breaks), `charger_pd` state and generation, the quiet bits, and **its own crash-reason string** (no longer shared with the `open:` notes). | C |
 | Quiet | `piano_adsp_quiet()`: `PIANO_ADSP_QUIET_CHARGER`, set while a charger generation is configured. It runs from the codec's link until a whole cycle ends with nothing left to write and the port enable is answered or timed out (board configuration and first policy writes included), at most 60 s. It is advisory: clients still answer what the DSP waits for. | C |
 | Port events | `piano_port_events(client, ctx)` with `event(ctx, PianoPortEvent *)`, `piano_port_seen()` (`PortEvents.c`, 2026-11-11, for PianoDp's D2): every USB-C port notification (owner 0x800c, opcode 0x16) handed to up to **4 clients** as the bytes received (≤ 32 kept, with the real length and a sequence), on PianoPower's thread after the acknowledgement is queued; read only: nothing goes back to the DSP, PianoPower stays the port owner's only correspondent. Without a client: one atomic load. Clients taking more than 20 ms are logged. Host test `tests/port_events_host.cpp` | — |
+| USB-C relay (UCSI) | `package/include/PianoUsbcContract.h` (2026-11-11 night, for PianoUsbHost's UCSI client, `usb-host.md` §6.6): the UCSI owner 0x800b lives on PMIC_RTR_ADSP_APPS, not on the router, so no QRTR port reaches it. One client: `piano_usbc_attach` (`state(ready, generation)`, `ucsi()`), `piano_usbc_send` (queued, at most 4; **only** UCSI reads and writes of owner 0x800b pass, never 0x800a, never the port owner 0x800c), `piano_usbc_detach`, `piano_usbc_status`. Ready = the generation linked, the quiet down and PianoPower's own UCSI read through; a new generation restarts the client. The port notifications reach the same client through the port events above. | — |
+
+**The relay in PianoPower** (new files `UsbcRelay.c`, `PianoUsbcRelay.cpp`; five small hooks in `PianoPower.cpp`, none in its policy
+or suspend paths): the receive loop offers each message to the relay before PianoMca (a UCSI message is the client's alone while it is
+ready; everything else, port notifications included, goes on to PianoMca and the port events), `piano_usbc_relay_step` after each pass makes the state
+call and sends the queue through PianoPower's own channel, the wait does not block while a send is pending. Without a client nothing
+changes (PianoMca sees every message as before); `tests/usbc_host.cpp` covers the request check, the queue, the ready transitions and
+the order of the two.
 
 **What protects the charger from a client.**
 - Every channel has its own buffers.
