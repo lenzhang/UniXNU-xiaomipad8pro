@@ -203,7 +203,7 @@ void reportSurvey(const Survey &s)
        s.flash && !s.fourChannel ? " (not decoded: this driver knows the four-channel layout only)" : "");
   if (!s.flash) return;
   for (const Range &r : kSurveyRanges) {
-    char line[80];
+    char line[100];   // "raw xx:" and up to 24 bytes of " xx"
     int at = snprintf(line, sizeof line, "raw %02x:", r.start);
     for (unsigned i = r.start; i < unsigned(r.start) + r.bytes && at < int(sizeof line) - 4; ++i)
       at += s.valid[i] ? snprintf(line + at, sizeof line - at, " %02x", s.reg[i]) : snprintf(line + at, sizeof line - at, " --");
