@@ -127,6 +127,7 @@ def check_store(a, seed, kc):
     same = common.same_seed(seed['identity_sha256'], installed)
     guard = common.kc_has_store_guard(kc)
     this, theirs = seed['identity_sha256'][:8], (installed or '')[:8]
+    common.check_store_size(seed)
     if a.flatten_data and not guard:
         raise SystemExit(f'--flatten-data: {kc} has no store guard (NativeRamBlock before docs/data-store.md): it cannot flatten')
     if installed and not same:

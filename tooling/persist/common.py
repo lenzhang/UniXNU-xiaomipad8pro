@@ -110,6 +110,19 @@ def seed_info(path):
 
 
 SELF_CONTAINED = 1   # PersistOverlay.h kSelfContained
+# The installed store's page count (a 12 GiB Data disk). The window's place depends on its size (store_first), so a seed of another
+# size looks for its header elsewhere, finds a "blank" window inside the installed store and initialises it over the owner's pages:
+# the store guard cannot see that. The tools refuse data-persist=2 for such a seed unless PIANO_DATA_STORE_RELAYOUT=1.
+INSTALLED_STORE_PAGES = 3145728
+
+
+def check_store_size(seed):
+    """SystemExit when SEED (seed_info) would put its store window somewhere else than the installed store's."""
+    if seed['pages'] != INSTALLED_STORE_PAGES and os.environ.get('PIANO_DATA_STORE_RELAYOUT') != '1':
+        raise SystemExit(f'this seed is {seed["logical_bytes"]} bytes ({seed["pages"]} pages), the installed store {INSTALLED_STORE_PAGES} '
+                         'pages: its store window would start elsewhere, inside the installed store, and a first boot with '
+                         'data-persist=2 would initialise it over the owner\'s pages (the store guard cannot see that). '
+                         'data-persist=0, or PIANO_DATA_STORE_RELAYOUT=1 for a deliberate re-layout (docs/data-store.md section 8)')
 
 
 def store_header(raw):

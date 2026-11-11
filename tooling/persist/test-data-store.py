@@ -134,9 +134,11 @@ def main():
           'same_seed with a prefix')
 
     print('== build-ram-images.py data_store_args')
-    seed_x = packed_seed(tmp / 'x.img', 1 << 31 << 2, {0: 1, 5: 2, 9000: 3})          # 8 GiB logical: the large-seed identity
-    seed_y = packed_seed(tmp / 'y.img', 1 << 31 << 2, {0: 1, 5: 2, 9000: 4})
+    seed_x = packed_seed(tmp / 'x.img', 12 << 30, {0: 1, 5: 2, 9000: 3})              # 12 GiB logical, as the installed store
+    seed_y = packed_seed(tmp / 'y.img', 12 << 30, {0: 1, 5: 2, 9000: 4})
+    seed_z = packed_seed(tmp / 'z.img', 8 << 30, {0: 1, 5: 2, 9000: 4})               # another size: another window place
     check(seed_x['identity_sha256'] != seed_y['identity_sha256'], 'two seeds, two identities')
+    check(seed_x['pages'] == common.INSTALLED_STORE_PAGES and seed_z['pages'] != common.INSTALLED_STORE_PAGES, 'seed sizes')
     guarded, old = tmp / 'kc-guard.bin', tmp / 'kc-old.bin'
     guarded.write_bytes(b'\xcf\xfa\xed\xfe' + b'x' * 100 + b'data-store-replace\0' + b'y' * 100)
     old.write_bytes(b'\xcf\xfa\xed\xfe' + b'x' * 300)
@@ -183,6 +185,14 @@ def main():
     check(got is None, 'replace with data-persist=0 (the default for another seed): refused')
     got, rec, note = args(x, old, PIANO_DATA_STORE_FLATTEN='1', **inst)
     check(got is None, 'flatten with an old collection: refused')
+    z = tmp / 'z.img'
+    got, rec, note = args(z, guarded, PIANO_DATA_PERSIST='2', **inst)
+    check(got is None and 'window would start elsewhere' in note, 'a seed of another size with data-persist=2: refused')
+    got, rec, note = args(z, guarded, **inst)
+    check(got == ['data-persist=0'], 'a seed of another size by default: data-persist=0')
+    got, rec, note = args(z, guarded, PIANO_DATA_PERSIST='2', PIANO_DATA_STORE_RELAYOUT='1', **inst)
+    check(got == ['data-persist=2'], '... unless PIANO_DATA_STORE_RELAYOUT=1')
+    os.environ.pop('PIANO_DATA_STORE_RELAYOUT', None)
     got, rec, note = args(x, guarded, PIANO_DATA_PERSIST='3')
     check(got is None, 'PIANO_DATA_PERSIST=3: refused')
     got, rec, note = args(x, guarded, PIANO_DATA_PERSIST='2', PIANO_DATA_STORE_REPLACE='12')
@@ -231,6 +241,7 @@ def main():
         rec = esp.check_store(a(), seed_x, old)
     check(rec['same_seed'] and not err.getvalue(), 'the installed seed: no note, even without the guard')
     check(refused(esp.check_store, a(flatten=True), seed_x, old) is not None, '--flatten-data with an old collection: refused')
+    check(refused(esp.check_store, a(replace='1'), seed_z, guarded) is not None, 'an ESP seed of another size: refused')
     check(esp.store_args(a(replace='1', flatten=True)) == ['data-store-replace=1', 'data-store-flatten=1'], 'store_args')
     check(esp.store_args(a(replace='0xACED5BF9')) == ['data-store-replace=0xaced5bf9'], 'store_args: one store')
     check(refused(esp.store_args, a(replace='aced')) is not None, 'store_args: a malformed seed refused')

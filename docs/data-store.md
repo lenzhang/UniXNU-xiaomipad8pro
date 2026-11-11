@@ -178,7 +178,7 @@ new seed.
 
 | Tool | Data store behaviour |
 |---|---|
-| `tooling/bootimg/build-ram-images.py` | `data-persist` of a RAM macOS image (`data_store_args`, note on stderr). Without `PIANO_DATA_PERSIST`: **2 only when the image's seed is the installed one**; another seed gets **0**; an unknown installed seed gets 2 with a collection that has the guard, else 0. `PIANO_DATA_PERSIST=0\|1\|2` overrides, but 2 is refused when the seed is not known to be the installed one and the collection has no guard. `PIANO_DATA_STORE_REPLACE=1\|<8 hex>` and `PIANO_DATA_STORE_FLATTEN=1` (need 2 and the guard). `data-*` in `PIANO_EXTRA_ARGS` is refused. The build record has `data_store` |
+| `tooling/bootimg/build-ram-images.py` | `data-persist` of a RAM macOS image (`data_store_args`, note on stderr). Without `PIANO_DATA_PERSIST`: **2 only when the image's seed is the installed one**; another seed gets **0**; an unknown installed seed gets 2 with a collection that has the guard, else 0. `PIANO_DATA_PERSIST=0\|1\|2` overrides, but 2 is refused when the seed is not known to be the installed one and the collection has no guard. `PIANO_DATA_STORE_REPLACE=1\|<8 hex>` and `PIANO_DATA_STORE_FLATTEN=1` (need 2 and the guard). `data-*` in `PIANO_EXTRA_ARGS` is refused, and so is 2 for a seed whose size is not the installed store's (section 8). The build record has `data_store` |
 | installed seed | `PIANO_INSTALLED_SEED` (environment or `~/.config/piano/env`): the identity (8 to 64 hex digits) or an ESP build record (`.json`); else `out/persistent/installed.json`, which `maint-session.py` writes with every ESP it installs (and removes on its rollback). For the installed ESP: `PIANO_INSTALLED_SEED=aced5bf9794b42f3c8ffeeef3078a408ff506f5b0b374e02eed6f0ab56e52616` |
 | `tooling/k27/build-native-image.sh` | `out/ram` as above; the dump image `out/ram-dump` keeps `data-persist=0` |
 | `tooling/persist/build-esp.py` | the macos entries keep `data-persist=2`. `--replace-data [1\|HEX8]` adds `data-store-replace` for an intended one-time switch; `--flatten-data` adds `data-store-flatten=1` (a no-op once the store is self-contained). A seed that is not the installed one gets a loud note (with the guard: kept, Data volatile, unless the store is self-contained). With a collection without the guard it is refused unless `--replace-data`. The installed trust cache's CDHashes are checked against the new one (`--installed-trust`). `--arg data-*` is refused. The record has `data_store` |
@@ -288,3 +288,8 @@ holds.
 - `data-store-replace=1` left in an ESP replaces any store that is not its seed's (a test image's, after a `sheng-data-reset`
   elsewhere). Prefer `--replace-data <8 hex>`, which names the one store meant.
 - A flatten error turns writes off for that boot (state 5, as any store write error). The store stays valid.
+- **A seed of another logical size** is the one case the guard cannot see. The window's place depends on its size
+  (`first = end - reserve - W`), so such a seed reads its "header" from inside the installed store. That block is blank, so the
+  first `data-persist=2` boot initialises a store there, over the owner's pages. All seeds so far are 12 GiB.
+  `build-ram-images.py` and `build-esp.py` refuse `data-persist=2` for any other size (`common.INSTALLED_STORE_PAGES`) unless
+  `PIANO_DATA_STORE_RELAYOUT=1` (a deliberate re-layout, with `maint-session.py --store fresh` and a backup first).

@@ -138,7 +138,8 @@ def data_store_args(seed, kc):
     PIANO_DATA_STORE_REPLACE=1|<8 hex>: data-store-replace (start the installed store over for this seed: drops the owner's Data).
     PIANO_DATA_STORE_FLATTEN=1: data-store-flatten=1 (make this seed's store self-contained; only under the store's own seed)."""
     common = persist_common()
-    identity = common.seed_info(seed)['identity_sha256']
+    info = common.seed_info(seed)
+    identity = info['identity_sha256']
     installed, source = common.installed_seed()
     same = common.same_seed(identity, installed)
     guard = common.kc_has_store_guard(kc)
@@ -156,6 +157,8 @@ def data_store_args(seed, kc):
     if (replace or flatten) and not guard:
         raise SystemExit(f'{kc}: no store guard in this kernel collection (NativeRamBlock before docs/data-store.md): it knows neither '
                          'data-store-replace nor data-store-flatten')
+    if mode == '2':
+        common.check_store_size(info)
     if mode == '2' and not same and not guard and not replace:
         raise SystemExit(f'data-persist=2 with seed {this} and a kernel collection WITHOUT the store guard: its NativeRamBlock would '
                          f'replace a store of any other seed (installed: {theirs or "unknown"}, {source}), dropping the owner\'s Data. '
