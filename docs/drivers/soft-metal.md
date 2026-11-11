@@ -155,7 +155,7 @@ If it aborts again, the reporter says why, and that decides the next step:
 A software Metal *implementation*. Nothing is rendered by the GPU or by a CPU rasterizer of ours: the drawing is SkyLight's and Core
 Animation's own software paths, which are there for machines without a usable accelerator. Expect it to be slow, and expect anything
 that insists on Metal (Safari's compositing, video, some effects) not to draw. The real driver is the plan in
-`droidvm-build/piano-patches/gpu-native-plan.md`.
+the local plan `gpu-native-plan.md` (not published).
 
 ## Measured 2026-11-11 (d306a16a, 300 s)
 
@@ -330,7 +330,7 @@ and loginwindow's UI and the menu bar put no backdrop layer into the tree.
 This change:
 - **Reduce transparency staged** (`stage-soft-metal.py --reduce-transparency`, on by default in `build-native-image.sh`;
   `PIANO_REDUCE_TRANSPARENCY=0` leaves it out). These are managed preferences, `/Library/Managed Preferences/com.apple.universalaccess.plist`
-  for the computer and `/Library/Managed Preferences/<user>/…` for each user with a home (the seed has `leo`), as macOS-DroidVM's
+  for the computer and `/Library/Managed Preferences/<user>/…` for each user with a home (the seed has one), as the VM-era
   staging wrote them. The seed's root boot job writes them, before `settime.sh`, because they must be root's. On the first boot of a
   new seed loginwindow may read before they exist; `data-persist=2` keeps them, so every later boot has them from the start. If the
   first run still shows the assertion, run the same image again before reading anything into it.
@@ -385,4 +385,4 @@ Still black (camera on the panel and thumbnails), the backdrop assertion unchang
 every client, SecurityAgent (the login UI) aborts: `RenderBox precondition failure: unable to create index buffer`. Conclusion: the
 software compositor without Metal cannot show the login UI on macOS 27: WindowServer's CA software renderer asserts on backdrop
 layers, and SwiftUI/RenderBox needs Metal buffers. Next: a real Metal device, either software (Mesa lavapipe under the VM-era
-metal2vulkan plugin) or the A830 driver (docs/drivers/gpu.md, droidvm-build/piano-patches/gpu-native-plan.md).
+metal2vulkan plugin) or the A830 driver (docs/drivers/gpu.md, the local plan `gpu-native-plan.md` (not published)).

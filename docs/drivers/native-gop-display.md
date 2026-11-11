@@ -1,15 +1,12 @@
 # NativeGopDisplay: macOS 27's display on the GOP framebuffer (k27 native kext)
 
-> **Status 2026-11-11 (DroidVM cleanup):** the native path is NativeGopDisplay alone. It now carries its own `AppleParavirtGPU`
-> nub, the default ADT has `/arm-io/gop-display` (`make-piano-adt.py --no-gop-display` leaves it out), and the native KC links
-> neither DroidVMDisplay nor DroidVMGpu (`configs/k27-native-kexts.txt`). Build and run: `tooling/k27/build-native-image.sh`, then
+> **Status 2026-11-11:** the native display is NativeGopDisplay alone. It carries its own `AppleParavirtGPU` nub, the default
+> ADT has `/arm-io/gop-display` (`make-piano-adt.py --no-gop-display` leaves it out), and it is in the native kext list
+> (`configs/k27-native-kexts.txt`). Build and run: `tooling/k27/build-native-image.sh`, then
 > `tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img`. Measured: nub, display started on the boot
-> framebuffer, root and Data unchanged. What follows is the original design note: Path A, `PIANO_DROP_KEXTS`,
-> `build-display-test-kc.sh` and `native-run.sh` are gone.
+> framebuffer, root and Data unchanged.
 
-
-Status: built and linked, 2026-11-11 (`out/k27/kc-k27-display-test.bin`, vtable check 0 problem slots). Not run on the
-tablet. First step of [display.md](display.md) (M2a, GOP adoption); no DPU register is written.
+First step of [display.md](display.md) (M2a, GOP adoption); no DPU register is written.
 
 ## 1. Approach and why
 
@@ -18,42 +15,29 @@ which SimpleFbDxe exposes as the GOP and DarwinBoot hands to XNU as the boot con
 draws there today. The display driver only has to give WindowServer an IOMobileFramebuffer and copy each swap's surface
 into that buffer with the CPU.
 
-The base is **macOS-DroidVM's DroidVMDisplay**. It is the display macOS 27 WindowServer already drove in the VM, on this
-same 27.0.1 collection, and its stage 1 is exactly this CPU copy into the boot framebuffer. GopFramebuffer (UniXNU, d711e8c)
-was read but not used. Its macOS display attributes come from DroidVMDisplay anyway, and it binds IOMFB through UniXNU's
-XnuPrelink fixtures for the 27.3 collection, not ours. `package/NativeGopDisplay/UPSTREAM` lists what was taken and what
-changed. In short, the virtio-gpu scanout and the GPU-work waits are gone, piano defaults are added, and every init step logs.
+The base is the VM-era display kext (provenance: `package/NativeGopDisplay/UPSTREAM`). macOS 27's WindowServer already drove
+it on this same 27.0.1 collection, and its stage 1 is exactly this CPU copy into the boot framebuffer. GopFramebuffer (UniXNU,
+d711e8c) was read but not used: its macOS display attributes follow the same kext, and it binds IOMFB through UniXNU's
+XnuPrelink fixtures for the 27.3 collection, not ours. `UPSTREAM` lists what was taken and what changed. In short, the
+virtio-gpu scanout and the GPU-work waits are gone, piano defaults are added (60 Hz, 239x163 mm, from the ADT or
+`native-gop-display-*`), every init step logs, and the `AppleParavirtGPU` nub is this package's own. It publishes **one**
+display, registry class `NativeGopDisplay`, and is the base for the later DPU flips. Its probe refuses in three cases: with
+boot-arg `native-gop-display=0`, on a node without the `native-gop-display` marker, or with a `/arm-io/virtio-gpu` node
+present (a VM's ADT); the nub then has no display.
 
-There are two ways to light the panel. Both need the same ADT node, and both publish **one** display:
-
-| | Path A: DroidVMDisplay natively | Path B: NativeGopDisplay |
-|---|---|---|
-| What runs | DroidVMDisplay's own display (`AppleParavirtDisplay`). Natively its virtio transport finds no `/arm-io/virtio-gpu` and says so, then it copies with the CPU | `NativeGopDisplay` (this package), the same copy without the virtio code |
-| Needs | the ADT node and a KC without NativeGopDisplay (any k27 KC has DroidVMDisplay) | the ADT node and a KC with NativeGopDisplay (and DroidVMDisplay, its nub) |
-| Registry class | `AppleParavirtDisplay`, as in the VM (WindowServer's paravirt-display handling applies) | `NativeGopDisplay`. The name `AppleParavirtDisplay` stays DroidVMDisplay's, because its kext is loaded for the nub |
-| Defaults | 120 Hz, 286x179 mm (`droidvm-display-hz`, `droidvm-display-mm`) | 60 Hz, 239x163 mm, from the ADT or `native-gop-display-*` |
-
-Path A needs no new code: only the ADT changes. Path B is the driver to keep. It is piano-specific, carries no VM code,
-logs every step, and is the base for the later DPU flips. NativeGopDisplay does not run beside DroidVMDisplay's display. Its
-probe score (5000) makes IOKit try it first on DroidVMDisplay's nub. Its probe refuses in three cases: with boot-arg
-`native-gop-display=0`, on a node without the `native-gop-display` marker, or with a virtio-gpu present (the VM). DroidVMDisplay's
-display then takes the nub as before.
-
-**Drop DroidVMGpu for the display tests** (`PIANO_DROP_KEXTS="DroidVMGpu"`, keep DroidVMDisplay as the nub). The native
-runs of 2026-11-11 showed what DroidVMGpu does. With it, WindowServer reads MetalPluginName and loads the plugin. The plugin
-cannot get a device (§6.1), and WindowServer exits; it was relaunched 6 times in 240 s. Without DroidVMGpu and without a display,
-WindowServer launched once and stayed up.
+A native run of 2026-11-11 with the VM-era GPU kext linked showed why a stub accelerator is worse than none: WindowServer
+read its MetalPluginName and loaded the plugin, the plugin could not get a device (§6.1), and WindowServer exited; it was
+relaunched 6 times in 240 s. Without it and without a display, WindowServer launched once and stayed up.
 
 ## 2. How WindowServer finds it
 
-1. `tooling/adt/make-piano-adt.py --gop-display` adds `/arm-io/gop-display` from `configs/k27-gop-display.toml`. Its
-   `compatible` is exactly `paravirtualizedgraphics,gpu`, as the VM's `/arm-io/display`. It also carries the marker
+1. `tooling/adt/make-piano-adt.py` adds `/arm-io/gop-display` from `configs/k27-gop-display.toml` (unless `--no-gop-display`).
+   Its `compatible` is exactly `paravirtualizedgraphics,gpu`, the string the framework looks for. It also carries the marker
    `native-gop-display`, `panel-width-mm`/`panel-height-mm`, `refresh-hz` and the `framebuffer-*` description. It has no
    `reg`, so the arm-io window does not change. Everything else is byte for byte the default ADT (checked with `adt-dump.py`).
-2. ArmDTPlatform (in the kernel) creates an IOPlatformDevice nub for every arm-io child. DroidVMDisplay's
+2. ArmDTPlatform (in the kernel) creates an IOPlatformDevice nub for every arm-io child. NativeGopDisplay's own
    `AppleParavirtGPU` personality matches the nub by `IONameMatch`, sets `DisplayPortCount = 1` and registers.
-3. IOKit matches the display on that `AppleParavirtGPU`. NativeGopDisplay (score 5000) is probed first. If it refuses,
-   DroidVMDisplay's display (score 0) is next. Both are in the default match category, so exactly one starts.
+3. IOKit matches the display on that `AppleParavirtGPU`: NativeGopDisplay (score 5000), unless its probe refuses (§1).
 4. `IOMobileFramebufferLegacy::start` waits for IOSurfaceRoot, calls `start_hardware` (the display attributes, one
    3200x2136 timing, one 8-bit SDR colour element, power states, `hotPlug_notify(1)`), creates the default surface and registers.
 5. WindowServer: IOMobileFramebuffer.framework (`iomfb_populate_all_display_infos`) walks `/arm-io`. For the child
@@ -66,7 +50,7 @@ WindowServer launched once and stayed up.
 
 | Arg | Default | Effect |
 |---|---|---|
-| `native-gop-display=0` / `=1` | the ADT marker (1 in `configs/k27-gop-display.toml`) | 0: NativeGopDisplay leaves the nub to DroidVMDisplay's display (Path A in the same KC); 1: it takes it. The opt-in is the ADT: the default ADT has no display node, so nothing changes without `--gop-display` |
+| `native-gop-display=0` / `=1` | the ADT marker (1 in `configs/k27-gop-display.toml`) | 0: NativeGopDisplay leaves the nub (no display); 1: it takes it even on a node without the marker |
 | `native-gop-display-hz=N` | ADT `refresh-hz`, else 60 | rate told to WindowServer and of the VBL timer (30..240). The panel stays at ABL's 120 Hz |
 | `native-gop-display-mm=WxH` | ADT, else 239x163 | physical size, so the density and macOS's HiDPI ("looks like 1600x1068") modes |
 | `native-gop-display-bars=1` | off | 8 colour bars instead of the solid colour until the first frame (left to right: white, yellow, cyan, green, magenta, red, blue, black) to check channel order |
@@ -78,60 +62,27 @@ WindowServer launched once and stayed up.
 | `piano-dpu-panel=1` | off | (PianoDpu's, §4.5) each display power change also goes to PianoDpu (`PianoDpuPanel`: the panel's light sleep), after the backlight's request |
 | `piano-dpu-refresh=auto` | off | (PianoDpu's, §4.3) each frame shown is reported to PianoDpu (`PianoDpuSwap`: its 60/120 Hz policy) |
 
-No boot arg is needed for Path B. Everything else is the native set as it is (`K27_ARGS` in
+No boot arg is needed for the display. Everything else is the native set as it is (`K27_ARGS` in
 `tooling/bootimg/build-ram-images.py`). For a log of the WindowServer stage, give the run more than the default 45 s
-(`PIANO_RESET_AFTER=150` or more). The extra boot args above need `PIANO_EXTRA_ARGS`, which is new on this branch.
+(`PIANO_RESET_AFTER=150` or more). The extra boot args above go in `PIANO_EXTRA_ARGS`.
 
-## 4. Build commands
+## 4. Build
 
-Shortest, with the main worktree's own tooling (it honours `PIANO_DROP_KEXTS`, `PIANO_EXTRA_KEXTS` and `PIANO_ADT`). It
-writes the default outputs `out/k27/kc-k27-native.bin` and `out/ram`, so only the session that owns them should run it.
-`B` below is this branch's checkout:
+NativeGopDisplay is in the native kext list, so `tooling/k27/build-native-image.sh` builds and links it (and the default ADT
+has its node). The objects alone: `tooling/k27/build-native-gop-display.sh` (-> `out/native-kexts/NativeGopDisplay`; it
+generates `IOMobileFramebufferABI.h` from the KC base `out/kc/kc27.bin` of the k27 tree, `PIANO_K27_TREE`, cached in
+`out/k27/iomfb-abi/`). The command line is under DarwinBoot's 1023 bytes (`build-ram-images.py` checks it).
 
-```sh
-B/tooling/k27/build-native-gop-display.sh                  # kext objects (already built 2026-11-11)
-python3 B/tooling/adt/make-piano-adt.py out/adt/piano-k27-gop-display.adt --unique-chip-id 47554e5941480001 --data --trust --gop-display
-PIANO_DROP_KEXTS="DroidVMGpu" PIANO_EXTRA_KEXTS="B/tooling/k27/kext/NativeGopDisplay.json" PIANO_ADT=out/adt/piano-k27-gop-display.adt \
-  PIANO_RESET_AFTER=150 tooling/k27/build-native-image.sh   # Path B; leave out PIANO_EXTRA_KEXTS for Path A
-```
-
-The same build without touching the default outputs, from the UniXNU-piano checkout with this branch merged
-(`K27_TREE` defaults to `droidvm-build/macOS-DroidVM`):
-
-```sh
-# kext objects only -> $K27_TREE/out/x12377/native-kexts/NativeGopDisplay (generates IOMobileFramebufferABI.h from out/kc/kc27.bin)
-tooling/k27/build-native-gop-display.sh
-# KC: build-native-image.sh's set (DroidVM defaults + NativeUfs [+ tooling/k27/kext/NativeRamBlock.json when present]) + NativeGopDisplay.
-# Compiles NativeGopDisplay itself, takes every other kext as built, never writes kc-k27-native.bin.
-PIANO_DROP_KEXTS="DroidVMGpu" tooling/k27/build-display-test-kc.sh   # -> out/k27/kc-k27-display-test.bin (+ .log .nm .sha256 .natives.json .kext.log)
-# ADT with the display node (the default out/adt/piano-k27.adt is untouched)
-python3 tooling/adt/make-piano-adt.py out/adt/piano-k27-gop-display.adt --unique-chip-id 47554e5941480001 --data --trust --gop-display
-# RAM image in its own directory (Path B; PIANO_EXTRA_ARGS="native-gop-display=0" gives Path A from the same KC)
-PIANO_RESET_AFTER=150 python3 tooling/bootimg/build-ram-images.py \
-  --fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --out out/ram-display-test --kc out/k27/kc-k27-display-test.bin \
-  --trust out/inputs/kernel.macho.trustcache --seed out/inputs/scratch-data.img --adt out/adt/piano-k27-gop-display.adt --utc "$(date +%s)"
-python3 tooling/bootimg/verify-ram-images.py out/ram-display-test/build-A-bundled.json
-# then, as for every native run (the tablet's owner session): tooling/native/native-run.sh out/ram-display-test/boot-piano-macos-ram-A-bundled.img
-```
-
-`PIANO_EXTRA_ARGS` is new on this branch (an additive line in `build-ram-images.py`). The command line is 878 bytes
-today, and DarwinBoot takes at most 1023.
-
-Built on 2026-11-11 (offline, not booted). Inputs: kernel `kernel-k27-0058-native.macho` (sha256 a5204d95…) and the main
-worktree's then-current native set, minus DroidVMGpu, plus NativeGopDisplay. That set includes `tooling/k27/kext/NativeRamBlock.json`
-and `data-persist=2`. Outputs:
-- `out/k27/kc-k27-display-test.bin`: sha256 ce373b20…
-- `out/adt/piano-k27-gop-display.adt`: sha256 c2a0ee63…
-- `out/ram-display-test/boot-piano-macos-ram-A-bundled.img`: sha256 a78c3faa…, built with `piano-reset-after=150`;
-  `verify-ram-images.py` PASS. Run it like any native image.
+First built 2026-11-11 (offline) on kernel `kernel-k27-0058-native.macho` (sha256 a5204d95…) in a display-test KC (sha256
+ce373b20…, vtable check 0 problem slots) with its ADT (c2a0ee63…); since then it is part of every native KC.
 
 ## 5. Progress in the pstore console mailbox
 
-The lines below are in order (`tooling/native/xnu-log.py`, or `xnu-console.txt` of a run). `DroidVMDisplay: AppleParavirtGPU on gop-display, 1 display port` comes first, from
-the nub. Then:
+The lines below are in order (`tooling/native/xnu-log.py`, or `xnu-console.txt` of a run). `NativeGopDisplay: AppleParavirtGPU nub on gop-display, 1 display port`
+comes first, from the nub. Then:
 
 ```
-NativeGopDisplay: probe on AppleParavirtGPU (ADT gop-display): taking it         | "...: off (boot-arg native-gop-display=0)..." -> Path A lines
+NativeGopDisplay: probe on AppleParavirtGPU (ADT gop-display): taking it         | "...: off (boot-arg native-gop-display=0)..." -> no display
 NativeGopDisplay: start on AppleParavirtGPU (ADT gop-display)
 NativeGopDisplay: boot framebuffer 0xfc800000 3200x2136 row 12800 depth 32       | "no boot framebuffer" / "unusable framebuffer"
 NativeGopDisplay: framebuffer mapped write-combined at 0x... (27340800 bytes)    -> the panel turns blue-grey (or shows the bars)
@@ -163,29 +114,25 @@ Reading a run: up to `started, display ...` is the kernel side alone. `first swa
 a frame. A WindowServer that exits about 30 s after `started` with no swap is the Metal wait (§6.1).
 
 Failure lines: `IOMobileFramebufferLegacy::start failed`, `createDisplayAttributes failed (...)`, `swap_wait(...) = 0x...`
-(the first 20), `surface format 0x... is not copied`. Path A prints the matching `DroidVMDisplay: ...` lines (`scanout ...`,
-`virtio-gpu scanout off: the transport did not start`, `hardware started`, `started, display ...`, `display on`, `first swap submitted`).
+(the first 20), `surface format 0x... is not copied`. The probe's refusal texts still end in "...'s display takes the nub" (the
+VM-era display kext's name, kept in the binary); natively no other display is linked, so the nub then has none.
 
 ## 6. Risks
 
 1. **WindowServer needs a Metal device. Natively there is none, and this blocks the desktop, not the display.** In the
    VM, a display without Metal meant WindowServer aborting every ~30 s ("No suitable Metal devices present after 30
-   seconds": macOS-DroidVM `docs/TODO-gpu.md` run 18, `k27/TODO.md` try23/24). Natively, with DroidVMGpu and no
-   display, the discovery works but ends the same way: WindowServer exits after its opens and is relaunched, 6 times in
-   240 s. Without DroidVMGpu it stays up, but there was no display in that run either. Expect it to open the display now,
-   then wait for Metal, and probably abort after 30 s as in the VM. The display test answers this. DroidVMGpu's
-   `AGXAccelerator` is found and the plugin opens it, but the opens cannot become a device:
-   - `0xe00002d5` is `kIOReturnBusy` from `native_adreno_new_user_client`. It is
-     `refusal=kIOReturnBusy` at `if(!connection->mount(kernel))` (NativeAdreno 805c7e4 + `patches/droidvm-gpu`,
-     exported to `macOS-DroidVM/out/x12377/src-gpu/drivers/NativeAdreno/NativeAdrenoPublish.cpp:703`).
-     `NativeAdrenoMaxClients` is 3 (:112), and slot 0 is kept for the process named `backboardd`, the iOS render server
-     (:231). So WindowServer can only get slots 1 and 2. Its first two type-0x4147 connections hold them, and the third
-     open finds no slot. The per-name cap (8 opens) was not reached.
-   - A third slot would not help. The type-0x4147 core sits on DroidVMGpu.cpp's never-attached NativeAdrenoVm, Ring and
-     Timer, so every map or submit answers NotReady or Unsupported. Its `gDeviceInfo` is all zeros.
-   - Type 0x4149 (virtgpu) opens with 0 because `droidvm_virtgpu_call` is linked from DroidVMDisplay's kext. Every
-     0x72xx call then returns `kIOReturnNotReady` (`DroidVMVirtioGpu3D.cpp:832`), because the transport only starts from
-     `/arm-io/virtio-gpu` (`DroidVMVirtioGpu.cpp:191`).
+   seconds", the VM-era GPU notes). Natively, with the VM-era GPU kext and no display, the discovery works but ends the same
+   way: WindowServer exits after its opens and is relaunched, 6 times in 240 s. Without it WindowServer stays up, but there
+   was no display in that run either. That kext's `AGXAccelerator` is found and the plugin opens it, but the opens cannot
+   become a device:
+   - `0xe00002d5` is `kIOReturnBusy` from `native_adreno_new_user_client`, at `if(!connection->mount(kernel))` in its
+     NativeAdreno 805c7e4 sources (`NativeAdrenoPublish.cpp:703`). `NativeAdrenoMaxClients` is 3 (:112), and slot 0 is kept
+     for the process named `backboardd`, the iOS render server (:231). So WindowServer can only get slots 1 and 2. Its first
+     two type-0x4147 connections hold them, and the third open finds no slot. The per-name cap (8 opens) was not reached.
+   - A third slot would not help. The type-0x4147 core sits on that kext's never-attached NativeAdrenoVm, Ring and Timer,
+     so every map or submit answers NotReady or Unsupported. Its `gDeviceInfo` is all zeros.
+   - Type 0x4149 (virtgpu) opens with 0, but every 0x72xx call then returns `kIOReturnNotReady`: its virtio-gpu transport
+     only starts from `/arm-io/virtio-gpu`.
    - What WindowServer needs is an MTLDevice from the plugin that can allocate and render. There are three options:
      (a) the real A830 driver ([gpu.md](gpu.md), M5);
      (b) a software Vulkan device under metal2vulkan in place of Turnip, for example Mesa's lavapipe. This is user-space
@@ -219,12 +166,11 @@ Failure lines: `IOMobileFramebufferLegacy::start failed`, `createDisplayAttribut
      before any default changes (`PIANO_EXTRA_ARGS="... native-gop-display-copy=1"`, then `=3`; compare `copies mean ... read
      ...` and the `copy mode` line with a run without it, and look for stale tiles on the panel with `=3`).
    - Left: the 60 Hz VBL timer runs while nothing is shown (60 wakeups a second at idle).
-4. **Path B is not `AppleParavirtDisplay`.** WindowServer's paravirt handling (`SLCADisplay::read_pv_preferences`,
+4. **The display is not `AppleParavirtDisplay`.** WindowServer's paravirt handling (`SLCADisplay::read_pv_preferences`,
    naming the display by `IOMFBUUID`) does not apply to it. The display UUID is then WindowServer's own, kept in the Data
-   volume, and a future touch driver cannot name the display by `IOMFBUUID` the way DroidVMInput does. If WindowServer
-   treats it differently from the VM's display, Path A is the fallback with the proven class.
-5. **The nub is DroidVMDisplay's.** A native KC without DroidVMDisplay has no `AppleParavirtGPU`. NativeGopDisplay would
-   then need its own nub class of that name: about 10 lines, plus a personality on the ADT node.
+   volume, and a touch driver cannot name the display by `IOMFBUUID` the way the VM-era HID kext did.
+5. **The nub** (resolved 2026-11-11): NativeGopDisplay carries its own `AppleParavirtGPU` class and personality on the ADT
+   node, so the native KC needs no other display kext.
 6. **Framebuffer mapping.** The splash region lies outside XNU's DRAM window (`memory@8c0000000`). It is mapped as I/O,
    write-combined, as the console maps it. The base comes from `PE_state.video`. The ADT's `framebuffer-*` values only
    cross-check it, or stand in when there is no console info.
@@ -236,15 +182,15 @@ Failure lines: `IOMobileFramebufferLegacy::start failed`, `createDisplayAttribut
 
 ## 7. Files
 
-- `package/NativeGopDisplay/{NativeGopDisplay.cpp,UPSTREAM,LICENSE}` (BSD-2-Clause-Patent, derived from DroidVMDisplay)
+- `package/NativeGopDisplay/{NativeGopDisplay.cpp,UPSTREAM,LICENSE}` (BSD-2-Clause-Patent; provenance in `UPSTREAM`)
 - `tooling/k27/kext/NativeGopDisplay.json`: personality `IOClass NativeGopDisplay`, `IOProviderClass AppleParavirtGPU`,
   `IOProbeScore 5000`; vtable check of all 483 IOMobileFramebufferLegacy slots
-- `tooling/k27/build-native-gop-display.sh`, `tooling/k27/build-display-test-kc.sh`
-- `tooling/adt/make-piano-adt.py --gop-display`, `configs/k27-gop-display.toml`
+- `tooling/k27/build-native-gop-display.sh`
+- `tooling/adt/make-piano-adt.py` (`--no-gop-display` leaves the node out), `configs/k27-gop-display.toml`
 - `tooling/bootimg/build-ram-images.py`: `PIANO_EXTRA_ARGS`
 
 ## 8. Licence note
 
-DroidVMDisplay (macOS-DroidVM) and GopFramebuffer are BSD-2-Clause-Patent. Code was taken from DroidVMDisplay only. No GPL
+The VM-era display kext (`UPSTREAM`) and GopFramebuffer are BSD-2-Clause-Patent. Code was taken from the former only. No GPL
 code, and no Linux code, was read into this package. The IOMFB declarations are generated from the collection's symbols
 at build time, not copied.

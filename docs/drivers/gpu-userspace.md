@@ -2,7 +2,7 @@
 
 Status 2026-11-11: the macOS login screen ran on the A830 with this userspace at 07:45 (end of this file); nobody has logged in yet.
 The changes for the first desktop session and tonight's run are in [Desktop readiness, 2026-11-11](#desktop-readiness-2026-11-11). The
-kernel half (package/PianoA830: board inputs, firmware, bring-up) is in [gpu.md](gpu.md). Plan: `droidvm-build/piano-patches/gpu-native-plan.md`
+kernel half (package/PianoA830: board inputs, firmware, bring-up) is in [gpu.md](gpu.md). Plan: the local plan `gpu-native-plan.md` (not published)
 §4 steps 2 and 3.
 
 ## 1. Purpose
@@ -14,9 +14,9 @@ Natively it uses its NativeAdreno backend (open type 0x4147) on Adreno830's user
 
 | Piece | Natively | Source |
 |---|---|---|
-| `Contents/MacOS/NativeAdrenoMetal` (plugin + frontend + bridge) | the VM's plugin and bridge, its frontend with one patch, plus an abort reporter, linked here (CDHash `9c42e844…` since the evening of 2026-11-11; the login run had the VM's binary, `ea549d13…`). The objects are compiled without objc_msgSend selector stubs, which makes the link reproducible | macOS-DroidVM `overlay/metal`, UniXNU-turnip `drivers/AdrenoMetal` + `tooling/metal/turnip-a830/frontend/`, `tooling/metal/turnip-a830/abort_reporter.mm`, bridge `out/metal/bridge` |
-| `Contents/MacOS/libvulkan_freedreno.dylib` (Turnip) | rebuilt: the VM's Mesa tree, `NativeAdrenoABI.h` v2, 5 patches (CDHash `205e665f…` with 0004/0005; `031df58a…` with 3, `eaa367a2…` with 2 in the login run; cold builds byte-identical) | Droid-VM Mesa `cecc0e9` + 23 VM patches + `tooling/metal/turnip-a830/mesa/` |
-| `Contents/Info.plist` | the VM's (`org.droidvm.NativeAdrenoMetal`, principal class `NativeAdrenoMetalDevice`) | |
+| `Contents/MacOS/NativeAdrenoMetal` (plugin + frontend + bridge) | the VM's plugin and bridge, its frontend with one patch, plus an abort reporter, linked here (CDHash `9c42e844…` since the evening of 2026-11-11; the login run had the VM's binary, `ea549d13…`). The objects are compiled without objc_msgSend selector stubs, which makes the link reproducible | the VM-era plugin (`overlay/metal` of the k27 tree), UniXNU-turnip `drivers/AdrenoMetal` + `tooling/metal/turnip-a830/frontend/`, `tooling/metal/turnip-a830/abort_reporter.mm`, bridge `out/metal/bridge` |
+| `Contents/MacOS/libvulkan_freedreno.dylib` (Turnip) | rebuilt: the VM's Mesa tree, `NativeAdrenoABI.h` v2, 5 patches (CDHash `205e665f…` with 0004/0005; `031df58a…` with 3, `eaa367a2…` with 2 in the login run; cold builds byte-identical) | Mesa `cecc0e9` + 23 VM-era patches (`tooling/metal/UPSTREAM`) + `tooling/metal/turnip-a830/mesa/` |
+| `Contents/Info.plist` | the VM's (`org.droidvm.NativeAdrenoMetal`, a legacy bundle identifier kept as staged; principal class `NativeAdrenoMetalDevice`) | |
 
 The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
 - `0001-turnip-darwin-native-a830.patch`:
@@ -42,7 +42,7 @@ The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
   render pass). WindowServer says which: `TU: info: TU_DEBUG=sysmem from /private/var/ngpu/debug/tu-debug` or `... from boot
   argument piano-tu-debug`. The sysmem/GMEM A/B is two boot lines over one seed (below).
 
-The frontend patch (`tooling/metal/turnip-a830/frontend/0001-…patch`, applied after macOS-DroidVM's `piano-frontend-patch.py`): the
+The frontend patch (`tooling/metal/turnip-a830/frontend/0001-…patch`, applied after the k27 tree's `scripts/piano-frontend-patch.py`): the
 stderr copy of its `NBLOG` lines is rate-limited per call site (8 lines, then the 16th, 32nd, … with the count); `no device answer`
 goes to the unified log only; `computeCommandEncoderWithDispatchType:` with a concurrent type returns the serial encoder instead of
 failing the command buffer. The abort reporter (`abort_reporter.mm`, ours) is NativeSoftMetal's, see the desktop section.
@@ -115,8 +115,8 @@ Read from Turnip's darwin backend, the plugin and the frontend. The hostsim alre
 
 1. **Discovery.** An `IOAccelerator` subclass (IOGraphicsFamily, macOS) whose C++ class is named **`AGXAccelerator`**.
    - Turnip finds it with `IOServiceMatching("AGXAccelerator")`, because the plugin sets `TU_DARWIN_SERVICE=AGXAccelerator`.
-   - Its personality carries `MetalPluginName = NativeAdrenoMetal` and `MetalPluginClassName = NativeAdrenoMetalDevice`, as macOS-DroidVM's
-     `overlay/kext/DroidVMGpu.json` does (`IOMatchCategory IOAccelerator`, vtable check against IOAccelerator's 272 slots).
+   - Its personality carries `MetalPluginName = NativeAdrenoMetal` and `MetalPluginClassName = NativeAdrenoMetalDevice`, as the VM-era GPU
+     kext's descriptor does (`IOMatchCategory IOAccelerator`, vtable check against IOAccelerator's 272 slots).
    - It is registered only when the GPU is up: before then, WindowServer must find no accelerator, or a software one.
    - Only one accelerator may be in the KC.
 2. **Connections.** `newUserClient` with type **0x4147** gives one NativeAdreno client, whose user client class is

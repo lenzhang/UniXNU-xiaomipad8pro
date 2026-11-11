@@ -7,7 +7,8 @@ Status 2026-11-11: built offline and host-tested; the kernel (K27_VARIANT=native
 ## 0. The answer
 
 - **Today** the native kernel has no clock: the calendar starts at 1970 + uptime, and the OS image's `settime.sh` boot job sets it to
-  `droidvm-utc`, the time the RAM image or ESP was built. So every boot of the installed system starts at the ESP's build time.
+  `droidvm-utc` (a legacy argument name the OS image reads), the time the RAM image or ESP was built. So every boot of the
+  installed system starts at the ESP's build time.
 - **piano's RTC** is the PMK8550's seconds counter (SID 0, `rtc@6100`), running on the battery. Every stack reads it the same way:
   UTC = count + an offset kept elsewhere; nobody sets the count. We read it only (no PMIC write anywhere in this design).
 - **Design: (a), a kernel patch.** k27 0060 makes `PEGetUTCTimeOfDay` read the counter when the platform answers 0 and
@@ -39,7 +40,7 @@ times and logs all want a real date, and there is no network time natively yet.
 | SPMI | arbiter v7 (0x70020000), 896 APIDs, observer channels at 0x0C440000 + 0x20 * APID | PianoPower level 1 log, 2026-11-11 | verified (boot) |
 | RTC/SDAM APIDs | SDAM 0x071 has an EE 0 APID (0057 needs and uses it); RTC_RW 0x061 not yet seen | 0057 runs; PianoPower's new line | needs-boot |
 | No IORTC wait | `IOKitInitializeTime` waits for IORTC only `#ifndef BCM2837`; our machine config is BCM2837 (`IOStartIOKit.cpo` has no `waitForService`) | k27 tree and objects | verified (object) |
-| No platform clock | `ArmDTPlatform` (an `IODTPlatformExpert`) does not override `getGMTTimeOfDay`, the base answers 0; AppleARMPlatform (whose PMU RTC Apple uses) is not in the KC | `macOS-DroidVM/out/k27/src/platform/ArmDTPlatform`, `configs/k27-native-kexts.txt` | verified (source) |
+| No platform clock | `ArmDTPlatform` (an `IODTPlatformExpert`) does not override `getGMTTimeOfDay`, the base answers 0; AppleARMPlatform (whose PMU RTC Apple uses) is not in the KC | the k27 tree's `out/k27/src/platform/ArmDTPlatform`, `configs/k27-native-kexts.txt` | verified (source) |
 | Today's calendar | launchd stamps `1970-01-01 ...` in native runs | `logs/native-runs/*/xnu-console.txt` | verified (boot) |
 
 ## 3. Ubuntu as the specification
@@ -68,7 +69,7 @@ APID by PPID with the EE 0 owner preferred, observer read) and PianoPower's `Spm
 | (b) a kext publishing IORTC / a platform function | does nothing here: the IORTC wait is compiled out (BCM2837) and the platform expert never asks an RTC; it would need ArmDTPlatform changed (outside the k27 tree) or a kext setting the calendar after launchd started (no KPI, a jump) |
 | (c) `settime.sh` from an ioreg property | changes the OS image, sets the time late (a jump after launchd), and needs the readout kext anyway |
 
-`settime.sh` (`droidvm-build/piano-patches/settime.sh`) sets `droidvm-utc` only while `date +%s` is below 100000000; with the
+`settime.sh` (a copy is in the local bring-up notes, not published) sets `droidvm-utc` only while `date +%s` is below 100000000; with the
 calendar from the RTC it exits, so `build-esp.py` keeps `droidvm-utc` as the fallback. Without `droidvm-utc` it only sets the
 time zone. `PESetUTCTimeOfDay` stays the platform's no-op: a time set in macOS lasts until the reboot, the RTC is never written.
 
@@ -95,9 +96,9 @@ Built offline 2026-11-11 (rebuild in the main checkout before a run; kernel sha2
 RAM image `57a9e4a067af0761…`, verify-ram-images PASS):
 
 ```sh
-# the kernel: in droidvm-build/macOS-DroidVM/out/k27/xnu: git am <this repo>/patches/k27/0060-*.patch, then
-K27_VARIANT=native ../droidvm-build/macOS-DroidVM/build-k27-piano.sh   # copy .../mach.development.bcm2837.unstripped to kernel-k27-0060-native.macho
-K27_KERNEL=$K/out/k27/kernel-k27-0060-native.macho tooling/k27/build-native-image.sh
+# the kernel: in "$PIANO_K27_TREE/out/k27/xnu": git am <this repo>/patches/k27/0060-*.patch, then
+K27_VARIANT=native "$PIANO_K27_TREE/build-k27-piano.sh"   # copy .../mach.development.bcm2837.unstripped to kernel-k27-0060-native.macho
+K27_KERNEL=$PIANO_K27_TREE/out/k27/kernel-k27-0060-native.macho tooling/k27/build-native-image.sh
 PIANO_EXTRA_ARGS="piano-usb=2 piano-power=1 piano-power-period=5 piano-rtc=1" PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300 \
   python3 tooling/bootimg/build-ram-images.py --fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --out out/ram-rtc \
   --kc out/k27/kc-k27-native.bin --trust out/inputs/kernel.macho.trustcache --seed out/inputs/scratch-data.img --adt out/adt/piano-k27.adt
@@ -119,7 +120,7 @@ PIANO_EXTRA_ARGS="piano-usb=2 piano-power=1 piano-power-period=5 piano-rtc=1" PI
 3. `python3 tooling/native/rtc-offset.py` (newest capture): prints `piano-rtc-offset=N`, the spread, and how far the SDAM cell is
    from the measurement (`last line: ... the kext used offset <cell> from the SDAM cell (...): +X s`).
 4. The installed system: a KC on the 0060 kernel (`PIANO_VMM_PRESENT=0 K27_KERNEL=$K/out/k27/kernel-k27-0060-native.macho
-   tooling/k27/build-native-image.sh`, `$K` = `droidvm-build/macOS-DroidVM`; the kext list has PianoA830, PianoPower and PianoDwc3),
+   tooling/k27/build-native-image.sh`, `$K` = `$PIANO_K27_TREE`; the kext list has PianoA830, PianoPower and PianoDwc3),
    then `tooling/persist/build-esp.py --profile daily --rtc-offset N --default macos` (it refuses a KC without 0060), installed as in
    `docs/persistent-boot.md`. `--rtc-offset sdam` instead only if step 3 showed the cell within 1-2 s. Expected:
    `piano-rtc: count ... the calendar starts there`, launchd stamps of today, the login window's clock right, and right again after a

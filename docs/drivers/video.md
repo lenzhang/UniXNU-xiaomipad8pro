@@ -12,7 +12,7 @@ not a login gate. Ubuntu uses it: H.264/HEVC/VP9 decode and H.264/H.265 encode v
 (`xiaomipad-8pro-mainline/docs/STATUS.md`, `README.en.md`; the core lists AV1, but a third-party piano report has AV1 decode failing
 at submit: `unixnu-research/hackios-redmi-k90-annibale/docs/analysis/2026-11-05-video-decode.md` §4.1). The macOS side is proven:
 in the VM, VideoToolbox decoded H.264 and HEVC (including the 4096x2160 P010 Aerial) on Ubuntu's Iris through a paravirtual decoder
-(`droidvm-build/PROGRESS-thin-macos.md`, issue 4, 2026-11-10).
+(the VM-era progress notes, local, not published: issue 4, 2026-11-10).
 
 ## 2. Hardware facts
 
@@ -79,8 +79,8 @@ interconnect `sm8750.c`; the firmware pin (`xiaomipad-8pro-mainline/firmware/pia
 
 | Piece | Base (licence) | Use |
 |---|---|---|
-| VideoToolbox side | macOS-DroidVM `k27/build-native-video.sh`: UniXNU-droidvm `706338e` `package/DroidVMVTParavirt.cpp`, `DroidVMVTHost.cpp`, `DroidVMVTWire.h` + `patches/droidvm-video` 0001–0017 (BSD-2-Clause-Patent) | vendored unchanged as `package/PianoVideo/vt/` with UPSTREAM (level 6) |
-| Its transport | `DroidVMVirtioMedia.c` (virtio-media) | **replaced** by PianoVideo's Iris backend, the same 14 functions |
+| VideoToolbox side | the VM-era VideoToolbox paravirtual files, source UniXNU-droidvm `706338e`: `package/DroidVMVTParavirt.cpp` (the service), `DroidVMVTHost.cpp` (the host), `DroidVMVTWire.h` (the wire format) + its patch series 0001–0017 (BSD-2-Clause-Patent) | vendored unchanged as `package/PianoVideo/vt/` with UPSTREAM (level 6) |
+| Its transport | its virtio-media transport file | **replaced** by PianoVideo's Iris backend, the same 14 functions |
 | PAS, MDT, firmware file | PianoPower `Sm8750Scm.c` (+ MP_VIDEO_VAR), `QcomMdt.c`, `FatVolume.c` + NativeUfs partition reads (BSD) | level 3 |
 | Rails, bandwidth | PianoA830 `Sm8750Rpmh` (cmd-db, ARC, BCM encoders; MIT): `mmcx.lvl`, `mxc.lvl`, MM1/SH0/MC0/ACV | level 2 |
 | SMMU | PianoWifi/PianoDwc3 `SmmuStream.h` (a free group + bank for a fresh stream, done on this SMMU for 0x1401), dpu.md §4.2's tables | level 4 |
@@ -90,15 +90,15 @@ The ADSP is not involved (the core runs its own firmware); PianoPower's DSP cont
 
 **4.1 The VideoToolbox verdict: reuse it, unchanged above the transport.** The VM's frontend is Apple's own: VideoToolbox's
 ParavirtualizedVideoDecoder/Encoder and `VideoToolboxParavirtualizationSupport.framework` in userspace, which open the kernel service
-`AppleVideoToolboxParavirtualizationDriver`. `DroidVMVTParavirt.cpp` *is* that service: the user client the framework expects
+`AppleVideoToolboxParavirtualizationDriver`. The service file *is* that service: the user client the framework expects
 (selector 0: send buffer + IODataQueue; 1/2: register/deregister a session UUID; 3: send a message with ≤ 5 IOSurface IDs; 4:
-drained; notification port 0). `DroidVMVTHost.cpp` is the "Mac host" half: it answers VideoToolbox's `vtpv` messages (decs/encs,
-+dec, dsta/dsts, dfrm, dfin, dinv, Dbuf/Demt; big-endian atoms, `DroidVMVTWire.h`) and runs each session as a client of a
+drained; notification port 0). The host file is the "Mac host" half: it answers VideoToolbox's `vtpv` messages (decs/encs,
++dec, dsta/dsts, dfrm, dfin, dinv, Dbuf/Demt; big-endian atoms, the wire header) and runs each session as a client of a
 **stateful V4L2 codec**. Nothing in either file is virtio-specific: the device side is 14 `extern "C"` functions
 (`droidvm_media_start/devices/caps/card/is_up/open/close/ioctl/ioctl_sg/mmap/munmap/set_sink/set_fast`). So **no new user client and
 no new userspace**: the native kernel provides those functions with V4L2 stateful-codec semantics over Iris, which is what Linux's
 iris driver gave the VM through crosvm's proxy, and the VM's 16 patches (0001–0017) come along (HEVC rated 1000, `dsts`, SEI skipping, HEIC tiles
-refused, the 4K P010 direct pool, frame thinning, session lifecycle). The subset DroidVMVTHost uses: ENUM_FMT, ENUM_FRAMESIZES,
+refused, the 4K P010 direct pool, frame thinning, session lifecycle). The subset the host file uses: ENUM_FMT, ENUM_FRAMESIZES,
 G_FMT/S_FMT (MPLANE), REQBUFS/QUERYBUF/QBUF (USERPTR only; QBUF carries the physical page list), STREAMON/OFF, G_CTRL
 MIN_BUFFERS_FOR_CAPTURE, S_CTRL display delay, SUBSCRIBE_EVENT (EOS, SOURCE_CHANGE), DECODER_CMD START/STOP (ENCODER_CMD later);
 events DQBUF/EVENT/ERROR through the sink in virtio-media's layout; card "Iris Decoder"/"Iris Encoder" (0013 matches the role);
@@ -181,7 +181,7 @@ collapsed, votes dropped; on = nothing until the next session.
 registers never loaded, no word loaded twice, the PLL/RCG/divider/OPP decoders, CTRL_STATUS and the core states, the SMMU scan with
 free groups and banks in use; then the objects and the import check: 309 kernel imports, 0 unresolved). PianoVideo is in
 `configs/k27-native-kexts.txt`, so every `build-native-image.sh` links it. Link checked 2026-11-11 on kernel 0059 with the whole
-list: `com.unixnu.driver.PianoVideo: linked, ... 320 pointers`, `native kext rule: 17 native kexts linked, none from DroidVM`.
+list: `com.unixnu.driver.PianoVideo: linked, ... 320 pointers`, `native kext rule: 17 native kexts linked, none from outside this repository`.
 
 ## 8. Hardware test plan and the ladder (RAM boots; V0 unattended, the rest attended)
 
@@ -258,6 +258,6 @@ events (software again) and powers the core off. A hang or reset returns to the 
 
 The Linux iris, Venus, clock, SCM, interconnect and SMMU drivers (GPL-2.0) are read as the specification only (offsets, fields,
 sequences, sizes); nothing is copied. PianoVideo is BSD-2-Clause-Patent; its shape comes from PianoDpu (this repository). The VT
-files to vendor are BSD-2-Clause-Patent (UniXNU-droidvm). `vpu35_4v.mbn` is the owner's data, read at run time, never committed or
+files to vendor are BSD-2-Clause-Patent (source in §4). `vpu35_4v.mbn` is the owner's data, read at run time, never committed or
 disassembled; no Apple binary is reverse engineered (public headers, class and symbol names only). Provenance:
 `package/PianoVideo/UPSTREAM`.

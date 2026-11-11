@@ -3,7 +3,7 @@
 Status: design + levels 1–4 code, 2026-11-11. `package/PianoWifi` carries level 1 (read-only survey), level 2 (power sequencing),
 level 3 (PCIe0 root-complex bring-up to a config-space read of `17cb:110e`, BAR0 and the SMMU stream) and level 4 (MHI: the
 firmware over BHI/BHIe to mission mode). All four are built, host-tested (`tests/wifi_host.cpp`, `tests/bringup_host.cpp`) and
-linked into the native KC (kernel 0060: "12 native kexts linked, none from DroidVM", PianoWifi 471 pointers), inert without
+linked into the native KC (kernel 0060: "12 native kexts linked, none from outside this repository", PianoWifi 471 pointers), inert without
 `piano-wifi`; **nothing above level 1 has run on hardware**, and each level must be read from a boot's log before the next one is
 tried (§8.2–§8.5). Levels 5 and up (QMI, WMI, scan, join, the macOS side) are design only. Template: `README.md`.
 
@@ -22,7 +22,7 @@ Ethernet-like interface plus a supplicant, and a USB-C network as the first netw
 
 Sources: DT = `out/inputs/piano-boot.dtb` (Ubuntu's running DT); GCC/TCSR/PCI/PHY = mainline `gcc-sm8750.c`, `tcsrcc-sm8750.c`,
 `pcie-qcom.c`, `phy-qcom-qmp-pcie.c` (facts only); PAGANI = UniXNU-Pagani-Drivers `drivers/PaganiWifi` 3d570b7 (BSD, same SoC and
-chip); SUN = Project-SunUEFI `patches/linux/7.3/` (GPL patches, facts only); INV = `droidvm-build/piano-patches/ubuntu-hardware-inventory.md`
+chip); SUN = Project-SunUEFI `patches/linux/7.3/` (GPL patches, facts only); INV = the local bring-up notes (`ubuntu-hardware-inventory.md`, not published)
 §11; FW = `xiaomipad-8pro-mainline/firmware/piano-wlan.json`. All register values are in `package/PianoWifi/WifiHw.h`.
 
 | Item | Value | Source | State |
@@ -99,8 +99,8 @@ with WPA2/3 key handshakes in a user-space wpa_supplicant (BSD-licensed; Ath12kW
 
 ### 5.3 en0, TimeSync and PianoNullEthernet
 
-TimeSync derives its clock ID from a **built-in** interface's MAC and looks once, at its start (`docs/native-droidvm-inventory.md`,
-`droidvm-build/piano-patches/loginwindow-launch.md`). The Wi-Fi interface appears late (firmware load takes seconds), so: keep `PianoNullEthernet` as `en0`,
+TimeSync derives its clock ID from a **built-in** interface's MAC and looks once, at its start (`docs/bringup-debugging.md` §5,
+the local notes `loginwindow-launch.md`). The Wi-Fi interface appears late (firmware load takes seconds), so: keep `PianoNullEthernet` as `en0`,
 publish Wi-Fi as `en1` with `IOBuiltin` and without `IOPrimaryInterface`, and let the service order prefer the interface with a
 link. Later, optionally, publish the Wi-Fi controller early (link down, the unit's MAC read from persist at run time) as `en0` and drop
 PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The MAC never appears in a log line or a commit.

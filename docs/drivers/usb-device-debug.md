@@ -74,7 +74,7 @@ select); `gcc-sm8750.c` / `tcsrcc-sm8750.c` for offsets. **Project-SunUEFI** (BS
 
 ### 4.1 Apple's device stack in the macOS 27.0.1 KC (vma2 26A434)
 
-From the KC's `__PRELINK_INFO` (`droidvm-build/macOS-DroidVM/out/kc/kc27.bin`, the base `tooling/kc/build-kc-k27.sh` links):
+From the KC's `__PRELINK_INFO` (`$PIANO_K27_TREE/out/kc/kc27.bin`, the base `tooling/kc/build-kc-k27.sh` links):
 
 | Piece | In the KC | Note |
 |---|---|---|
@@ -96,7 +96,7 @@ From the KC's `__PRELINK_INFO` (`droidvm-build/macOS-DroidVM/out/kc/kc27.bin`, t
 3. **Own minimal gadget + CDC-ACM (chosen)**: ~2000 lines with no private Apple ABI (an IOService and BSD char-device KPI
    only), no Mac-side driver, a log stream even when user space never comes up.
 4. **Own gadget + CDC-ECM/NCM + IOEthernetController**: done as CDC-NCM with `piano-usb-net=1` (§14); the
-   IOEthernetController side follows PianoNullEthernet / `DroidVMEthernet` (vtable-checked in this KC). The ACM console stays
+   IOEthernetController side follows PianoNullEthernet (the VM-era Ethernet kext's pattern, vtable-checked in this KC). The ACM console stays
    the fallback.
 5. A vendor-class bulk pipe: no advantage over ACM, needs a Mac tool.
 
@@ -188,7 +188,7 @@ PIANO_EXTRA_ARGS="piano-usb=1" PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300 python
 ```
 
 `build-piano-dwc3.sh` uses `tooling/k27/build-native-kext.py` (objects in `out/native-kexts/PianoDwc3`, the descriptor's
-`@OUT@` = `out/`) and falls back to macOS-DroidVM's builder where that script is not there yet. `build-usb-test-kc.sh`
+`@OUT@` = `out/`) and falls back to the k27 tree's builder where that script is not there yet. `build-usb-test-kc.sh`
 rebuilds only PianoDwc3, links the other kexts' objects as last built, resolves `@OUT@` itself and refuses to write
 `kc-k27-native.bin`. To carry the driver in the regular image instead (and add `piano-usb=N` to its arguments):
 
@@ -296,7 +296,7 @@ Not run on hardware yet (2026-11-11).
   [<wheel> [<pan>]]` (relative pointer), `R` (release all), `?` (status) → `ok <n>` / `err <what>` / `status …`.
 - **HID devices**: `PianoUsbHID` (vendor 0x1AF4, product 0x5055 'PU'), a keyboard with consumer keys and a relative pointer, with
   **package/PianoKeyboard's report descriptors** (`HidDescriptors.h`, the cover's layouts; included, not copied) in the
-  `IOHIDDevice` subclass pattern of PianoInput/PianoKeyboard (DroidVMInput's, the one proven on this KC): same overrides, Built-In set,
+  `IOHIDDevice` subclass pattern of PianoInput/PianoKeyboard (the VM-era HID class's, the one proven on this KC): same overrides, Built-In set,
   attached to the PianoDwc3 service and started from `start()` as PianoInput does; codeless `IOHIDEventDriver` personality
   `PianoUsbHIDEventDriver` (VendorID 6900, ProductID 20565) in `tooling/k27/kext/PianoDwc3.json`, vtable checked (334 slots).
 - **Off the USB thread**: the bytes go to a ring; a HID thread parses lines and calls `handleReport`, so input never delays EP0 or
@@ -356,7 +356,7 @@ pattern), UniXNU-sm8750-common `SmmuTakeover.h` (bypass bank shape). Not used: Q
 (Linux files were read as the specification only). The network function (§14) is written from the public USB CDC NCM 1.0 and
 ECM 1.2 specifications; Linux's `f_ncm` / `u_ether` (GPL) were not copied, and the DWC3 TX FIFO rules come from the controller's
 programming model as Linux's `gadget.c` describes it (specification only). PianoUsbNet follows this repository's
-PianoNullEthernet (DroidVMEthernet's pattern, BSD-2-Clause-Patent).
+PianoNullEthernet (the VM-era Ethernet kext's pattern, BSD-2-Clause-Patent; its UPSTREAM).
 
 ## 14. A network link to the Mac (`piano-usb-net=1`)
 
@@ -388,7 +388,7 @@ for NTP time, file transfer and ssh, with Internet Sharing for the rest.
   free `en` unit its database gives a new MAC). Link down until the Mac selects alternate 1, then up at 480 Mb/s.
 
 Why **not** replace PianoNullEthernet's en0: IOTimeSyncClockManager reads the built-in interfaces' MAC **once, at its start**
-(`docs/native-droidvm-inventory.md`, PianoNullEthernet's comment), and PianoNullEthernet's descriptor gates IOTimeSyncRootService
+(`docs/bringup-debugging.md` §5, PianoNullEthernet's comment), and PianoNullEthernet's descriptor gates IOTimeSyncRootService
 on its resource. The NCM interface exists only after IOBSD and the takeover, and a cable, a host and an enumeration are not
 guaranteed at boot; nothing shows it would be there in time on every boot, so en0 stays the null built-in interface and TimeSync
 is unchanged. Why **NCM rather than ECM**: both need the same three endpoints, so the budget below does not force ECM; NCM

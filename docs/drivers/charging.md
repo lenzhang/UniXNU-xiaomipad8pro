@@ -1,7 +1,7 @@
 # Charging and battery: PianoPower (fuel gauges, the charger PMIC's port, the DSP's charger firmware)
 
 Status 2026-11-11: `package/PianoPower` built and linked into a test KC (host tests pass); **not run on the tablet**. Inert unless
-`piano-power=N`. Gate for making macOS the default OS (`droidvm-build/piano-patches/persistent-boot-plan.md` §3.2 and §4).
+`piano-power=N`. Gate for making macOS the default OS (the local plan `persistent-boot-plan.md` §3.2 and §4, not published).
 
 ## 0. The answer
 
@@ -17,7 +17,7 @@ Status 2026-11-11: `package/PianoPower` built and linked into a test KC (host te
   charger driver loads the DSP's charger firmware only to charge a dead battery and then reboots ("Chg Fw Load not required boot
   to HLOS", "Device Will Reboot After ADSP Charging", strings of `piano-binaries-own303/.../QcomChargerDxeLA.efi`). Our FD
   carries a patched QcomChargerDxeLA that does nothing at run time (`IsChargingSupported Cannot locate PmicSchgProtocol: Not
-  Found`, `droidvm-build/piano-patches/logs/uefi-A-debug-222920/pianolog.txt:2001`; its config writes and watchdog enable are
+  Found`, the local bring-up logs (`uefi-A-debug-222920/pianolog.txt:2001`, not published); its config writes and watchdog enable are
   stubbed, `piano-uefi-UniXNU-piano/tools/patch-qcom-dxe.sh`), loads no DSP and pets no charger watchdog. Gunyah does not own
   the DSP: its node and carveouts are ordinary HLOS ones (`docs/hyp-evidence/`), and PAS is a plain SCM call from the HLOS.
 - **Without the DSP the PMIC keeps charging on the configuration the boot stages left**, with no software control: measured on
@@ -192,7 +192,7 @@ takeover are done before it touches anything.
 | 18 | DSP ready | SMP2P polling (5 s) |
 
 Candidate images, built 2026-11-11 from main d03030d + this change (KC `e909bc79d3e03ffa…`, `com.unixnu.driver.PianoPower: linked,
-402 pointers`, `native kext rule: 8 native kexts linked, none from DroidVM`), each `exec-log=1 piano-usb=2 piano-power=2
+402 pointers`, `native kext rule: 8 native kexts linked, none from outside this repository`), each `exec-log=1 piano-usb=2 piano-power=2
 piano-power-write=0` plus:
 
 | Image | Extra | sha256 | Answers |
@@ -253,7 +253,7 @@ before init_image and mem_setup).
 | F | `piano-power-load-first=1` | `4dd9e407b475966a…` | the segments written before any PAS call touches the region |
 
 KC `1ef0cb65d480fe4d…` (main 7457964 + this change; `native kext rule: 8 descriptors, all this repository's`, `8 native kexts
-linked, none from DroidVM`), each image `exec-log=1 piano-usb=2 piano-power=2 piano-power-write=0` plus the extra; verify PASS.
+linked, none from outside this repository`), each image `exec-log=1 piano-usb=2 piano-power=2 piano-power-write=0` plus the extra; verify PASS.
 Run D; E or F only if D stalls after `probe (after mem_setup)` passes or at its write. Build in main as in §5a with
 `"D" "E piano-power-map=1" "F piano-power-load-first=1"` as the variants. Reading D:
 
@@ -308,7 +308,7 @@ still skips our votes, which answers whether they are needed at all.
 | G (probe, no new writes) | `piano-power=2 piano-power-write=0` | `4db6e479469844fa…` |
 | H (the one write) | `piano-power=2 piano-power-unsuspend=1` | `3766b18882dc4cc0…` |
 
-KC `83cda10d09a6bd43…` (main 1774c13 + this change; `native kext rule: 9 native kexts linked, none from DroidVM`), both verify
+KC `83cda10d09a6bd43…` (main 1774c13 + this change; `native kext rule: 9 native kexts linked, none from outside this repository`), both verify
 PASS. Commands (in the main checkout):
 
 ```sh
@@ -386,7 +386,7 @@ PianoPower: [30s] ps: 99 %, ...
 Visible result: the menu bar's battery item at the gauges' percentage with the plug symbol while the Mac's cable is in (and
 Control Centre's Battery entry); unplugged, the percentage with "Power Source: Battery" and a time estimate once the current is
 steady. `ioreg -rn AppleSmartBattery` (if a shell is available) lists the properties above. Built 2026-11-11 on main 7c04081:
-KC `dba24c1a1e8d814a…` (`11 native kexts linked, none from DroidVM`, PianoPower 719 pointers), image verify PASS (its own hash
+KC `dba24c1a1e8d814a…` (`11 native kexts linked, none from outside this repository`, PianoPower 719 pointers), image verify PASS (its own hash
 changes with every build: it carries the build time as `droidvm-utc`). Not booted.
 
 ## 5e. What the Ubuntu history adds (images I and G2, 2026-11-11)
@@ -462,7 +462,7 @@ PianoPower: [45s] diag board: CP (0x201c) 1, CID (0x201b) 0x708, OTG (0x201a) 0,
 | I | `piano-power=2` | the same plus the board configuration, then the policy (ICL/FCC by type, CDP 900 mA); no 0x2019 write |
 
 Both take PianoA830's DRV-2 lock for our rail votes, so they run with `piano-gpu=2` (`PIANO_GPU=2` adds `piano-gpu=2
-piano-gpu-delay=20`). Built here on main 7d9f10e + this change (`native kext rule: 14 native kexts linked, none from DroidVM`;
+piano-gpu-delay=20`). Built here on main 7d9f10e + this change (`native kext rule: 14 native kexts linked, none from outside this repository`;
 KC `d2a8fb802274b151…`, G2 `a941253fed1c9bfe…`, I `7914e7c9889b4435…`, both verify PASS; the hashes change with every build,
 which embeds `droidvm-utc`). With `PIANO_GPU=2` the seed is the A830-staged one, not the installed seed, so main's store guard
 builds both with `data-persist=0` (Data volatile, the installed store untouched). Commands (main checkout):

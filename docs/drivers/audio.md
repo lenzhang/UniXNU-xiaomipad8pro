@@ -1,7 +1,7 @@
 # Audio: four FS19xx speakers on TDM, DMICs on the VA macro, through the ADSP's AudioReach: PianoAudio
 
 Status, 2026-11-11 (evening): `package/PianoAudio` levels 1-3 are built, host-tested and linked into the native KC (kernel 0059:
-"20 native kexts linked, none from DroidVM", PianoAudio 1081 pointers, PianoPower's client functions resolved by name), inert
+"20 native kexts linked, none from outside this repository", PianoAudio 1081 pointers, PianoPower's client functions resolved by name), inert
 without `piano-audio`; the RAM image verifies PASS; **nothing of it has run on hardware**. Level 1 is the read-only survey, level 2
 the DSP link (one readiness query through PianoPower's client contract), level 3 the macOS "Speaker" and "Mic" devices on a null
 transport (silence, no hardware). The pieces of levels 4-10 (the FS19xx core, piano's AudioReach graphs with their sequencer, the
@@ -15,14 +15,14 @@ it is the last piece of a tablet that can replace Ubuntu for media and calls. To
 `audiomxd` (11-11 07:26 run: pids 282, 292, the HAL's driver helpers) but the HAL finds no device.
 
 The finding of this page: on piano the whole path is DSP-driven and the DSP is already up natively (PianoPower level 2), every
-protocol piece has a hardware-verified BSD donor (UniXNU-sheng's GPR/AudioReach on SM8550; the VM's DroidVMAudio for the macOS
+protocol piece has a hardware-verified BSD donor (UniXNU-sheng's GPR/AudioReach on SM8550; the VM-era audio kext for the macOS
 device on this very macOS 27), and the piano-specific work is small but risky: the four FS19xx amplifiers (bus, reset, the vendor
 preset), the TDM sink instead of sheng's I2S, a DMA buffer the DSP can address, and speaker safety without any speaker protection.
 
 ## 2. Hardware facts
 
 Sources: DT = `out/inputs/piano-boot.dtb` (Ubuntu's running DT); UBU = `xiaomipad-8pro-mainline` `device/audio/` (README, m4, UCM,
-`card.json`), `firmware/piano-audio.json`, `tools/speaker-playback-check.py`; INV = `droidvm-build/piano-patches/ubuntu-hardware-inventory.md`
+`card.json`), `firmware/piano-audio.json`, `tools/speaker-playback-check.py`; INV = the local bring-up notes (`ubuntu-hardware-inventory.md`, not published)
 §8; SHENG = UniXNU-sheng `porting.toml` area "audio" (SM8550, same DSP family, same hypervisor); RUN = `logs/native-runs/20261111-072646-loop`
 (PianoPower level 2). All register values of level 1 are in `package/PianoAudio/AudioHw.h`.
 
@@ -68,7 +68,7 @@ Status (v1.1.0 README): all four speakers play, internal microphones record; "no
 | Bring-up order and the period engine: SMMU pass-through, pins, buses, amplifiers, `adsp_apps`, SPF ready, graphs, buffer map, four 10 ms periods in flight, answers copied on the DSP thread and served on its own | sheng `AudioProbe.cpp` (hardware-verified: tone 155/151 periods, capture 200/200, Voice Memos smooth) | BSD | design of levels 2-8 (`AudioSequence`'s plan and pump follow it); its CS35L43/WCD938x/MI2S specifics are not piano's |
 | The running DSP and its client interface `piano_adsp_channel()` / `piano_adsp_send()` (sheng's `ShengAdsp.h` renamed: the same interface sheng's audio uses for `adsp_apps`) | `package/PianoPower` `PianoAdsp.h`, PianoQrtr.c (the audio PD's locator entry) | BSD (this repo) | level 2+: now `package/include/PianoAdspContract.h`, imported by name, PianoPower not edited by audio (§10.1) |
 | GENI I2C master (FIFO), or the bit-banged I2C of the gauges / keyboard cover | sheng `GeniI2c.{h,c}`; PianoPower / PianoKeyboard soft I2C | BSD | level 5 (bus probe; `Fs19xxBus` takes either) |
-| macOS device: `IOAudio2Device` + `IOAudio2DeviceUserClient` shape (registry description, status page and ring memory types, selectors 0-12, hog mode, per-device period engine), UIDs "Speaker"/"Mic" | macOS-DroidVM `DroidVMAudio.cpp` (UniXNU-droidvm e29d087, 477 lines; transport `DroidVMVirtioSnd.c` 382) | BSD-2-Clause-Patent | **level 3** (done, `PianoAudioDevice.cpp`, UPSTREAM; the native rule forbids linking a DroidVM kext, not adopting its code as this repo's package); virtio-snd replaced by `AudioPcm.h` (null now, the DSP at level 8) |
+| macOS device: `IOAudio2Device` + `IOAudio2DeviceUserClient` shape (registry description, status page and ring memory types, selectors 0-12, hog mode, per-device period engine), UIDs "Speaker"/"Mic" | the VM-era audio kext (477 lines, its virtio-snd transport 382; provenance `package/PianoAudio/UPSTREAM`) | BSD-2-Clause-Patent | **level 3** (done, `PianoAudioDevice.cpp`, UPSTREAM; the native kext rule forbids linking a kext from outside this repository, not adopting its code as this repo's package); virtio-snd replaced by `AudioPcm.h` (null now, the DSP at level 8) |
 | AudioServerPlugIn `ShengAudio.driver` + `ShengAudioService` (IOUserClient, shared rings, one timeline) | sheng `hal/ShengAudioPlugIn.c`, `ShengAudioService.cpp`, `ShengAudioAbi.h` | BSD | fallback of §5 |
 | SM8750 GPR from XNU at EL1 under Gunyah: replies, WRITE_DONE 4100/4100, I2S on gpio121-124, 116 x 128-byte intents, GRAPH_OPEN 296 bytes | hackios-xnu-kernel-k90 `annibale_audio_reach.c` | APSL-2.0 | facts only (no sound confirmed there) |
 | Module/parameter IDs, payload layouts (the TDM interface parameter) | linux-msm audioreach-topology (BSD-3-Clause; the Project-SunUEFI submodule is empty here), AudioReach engine headers (BSD-3-Clause-Clear) | BSD | the topology's ids are pinned in `PianoAudioReach.h`; the TDM parameter's layout from Ubuntu's kernel (specification) |
@@ -76,7 +76,7 @@ Status (v1.1.0 README): all four speakers play, internal microphones record; "no
 Nothing in scope implements FS19xx, a TDM sink or the VA macro under a BSD licence: those are written fresh from §3.
 
 Taken over on 2026-11-11 (records in `package/PianoAudio/UPSTREAM`): sheng's GPR codec unchanged (`PianoGpr.{h,c}`), sheng's
-AudioReach writer with piano's graphs (`PianoAudioReach.{h,c}`), DroidVMAudio's IOAudio2 top half under this repository's names
+AudioReach writer with piano's graphs (`PianoAudioReach.{h,c}`), the VM-era audio kext's IOAudio2 top half under this repository's names
 (`PianoAudioDevice.cpp`); PianoPower's client interface is now the contract `package/include/PianoAdspContract.h` (charging.md §9).
 
 ## 5. IOKit family / ABI: the macOS side
@@ -91,15 +91,15 @@ Level 1 is a plain `IOService` on `IOPlatformExpertDevice` (`com.apple.kpi.*` on
 | Option | For | Against | Verdict |
 |---|---|---|---|
 | A. IOAudioFamily driver (`IOAudioDevice`/`IOAudioEngine`, KDK headers) | documented kernel API; AppleUSBAudio would come along | not in the native KC (the keep list is the k27 tree's); whether this build's HAL still drives IOAudio engines is unshown | not now (revisit for USB-C audio) |
-| B. **`IOAudio2Device` top half** (DroidVMAudio) under the stock HAL (`HALS_IOA2Manager` in audiomxd/coreaudiod, VirtualAudio's built-in Speaker/Mic classes) | **ran on this macOS 27** in the VM (sound, mic, 2 h soak), and natively it loaded and published Speaker/Mic (11-10/11 runs before the no-DroidVM rule); kernel only: no plugin bundle, no trust-cache entry, no HAL-directory overlay; host time is already 24 MHz natively (k27 0042), so none of sheng's host-clock patching | the user-client ABI is private (DroidVMAudio's notes), tied to this OS build; VirtualAudio's speaker class loads Apple's speaker DSP chain of another product (EQ/limiter, not protection for these speakers) | **recommended** |
+| B. **`IOAudio2Device` top half** (the VM-era audio kext) under the stock HAL (`HALS_IOA2Manager` in audiomxd/coreaudiod, VirtualAudio's built-in Speaker/Mic classes) | **ran on this macOS 27** in the VM (sound, mic, 2 h soak), and natively it loaded and published Speaker/Mic (11-10/11 runs before the native kext rule); kernel only: no plugin bundle, no trust-cache entry, no HAL-directory overlay; host time is already 24 MHz natively (k27 0042), so none of sheng's host-clock patching | the user-client ABI is private (the ABI notes in `PianoAudioDevice.cpp`), tied to this OS build; VirtualAudio's speaker class loads Apple's speaker DSP chain of another product (EQ/limiter, not protection for these speakers) | **recommended** |
 | C. AudioServerPlugIn (sheng's) + IOUserClient rings | public plugin API; hardware-verified on iPadOS 27 | natively: the bundle in the Data seed and its CDHash in the trust cache (the GPU plugin's staging), sheng's iOS workarounds (Thunderbolt transport type, the host-clock constant) to re-check on macOS; more parts | fallback if B misbehaves |
 | D. AudioDriverKit dext | Apple's current model | needs a dext runtime, sysextd approval and entitlements; no IOUserAudio kernel side found | no |
 
-Under B, PianoAudio publishes "Speaker" (stereo out) and "Mic" (mono or stereo in), 48 kHz S16, as DroidVMAudio does. The kernel
+Under B, PianoAudio publishes "Speaker" (stereo out) and "Mic" (mono or stereo in), 48 kHz S16, as the VM-era audio kext did. The kernel
 maps stereo to the four 32-bit slots (L -> TL + BL, R -> TR + BR in landscape; rotation-aware mapping later), applies the volume
 digitally, and owns every safety limit (§10.2) below whatever the HAL does.
 
-**Built (level 3).** `PianoAudioDevice.cpp` is DroidVMAudio's top half: `PianoAudioDevice : IOService` and `PianoAudioUserClient :
+**Built (level 3).** `PianoAudioDevice.cpp` is the VM-era audio kext's top half: `PianoAudioDevice : IOService` and `PianoAudioUserClient :
 IOUserClient`, their metaclasses linked at run time under `IOAudio2Device` / `IOAudio2DeviceUserClient` (the family's subclass
 contract is closed and its names are taken), one IOResources nub per device ("piano-audio-out", "piano-audio-in"), published once
 IOBSD is up. Below it, `AudioPcm.h`'s transport interface replaces virtio-snd: `running(output, input)`, `play(stereo, frames)`,
@@ -133,7 +133,7 @@ import check (381 kernel imports, 3 library imports from PianoPower: `piano_adsp
 0 unresolved) and `check-audio2-family.py` (§5). Descriptor `tooling/k27/kext/PianoAudio.json` (`com.unixnu.driver.PianoAudio`),
 which names `com.unixnu.driver.PianoPower` among its libraries; listed in `configs/k27-native-kexts.txt` after PianoPower, so the
 KC resolves the contract's functions by name to PianoPower's copy; `tooling/k27/build-native-image.sh` links it into every native
-KC (inert). Measured 2026-11-11: `PIANO_A830_METAL=0 tooling/k27/build-native-image.sh` links 20 native kexts (with PianoSensors, the other contract client, and PianoBluetooth), none from DroidVM,
+KC (inert). Measured 2026-11-11: `PIANO_A830_METAL=0 tooling/k27/build-native-image.sh` links 20 native kexts (with PianoSensors, the other contract client, and PianoBluetooth), none from outside this repository,
 PianoAudio 1081 pointers; `verify-ram-images.py` PASS.
 
 ### 7.1 The code (host-tested; levels 1-3 run it on the tablet, the rest waits for its level)
@@ -253,7 +253,7 @@ SPAudioDataType` lists both; Sound settings offers "Speaker" as output and "Mic"
 run to the end in their real time (silently); Voice Memos records silence. `piano_audio_dev_periods`/`_played` (kernel globals, in
 the post-mortem) grow while something plays and stop with it. A failure line `none (stage -2: ...)` means IOAudio2Family's classes
 were not found at run time (the static check passed, so the family kext did not load: `kextstat | grep IOAudio2`). Side benefit,
-known from DroidVMAudio: with a default output device WebKit's media player works.
+known from the VM-era audio kext: with a default output device WebKit's media player works.
 
 ## 9. Fallback
 
@@ -305,7 +305,7 @@ Ubuntu (reboot), or later AirPlay/Bluetooth from macOS.
 6. The i2s1 function number of gpio121-124 and whether the I2C hub's engine (its GCC clocks are not in this repo yet) or a
    bit-banged bus serves level 5 (`Fs19xxBus` takes either). (level 1 reads the pins; source read)
 7. The DMIC supply (no regulator in the VA macro's DT node) and the 150 Hz high-pass / start transient (SunUEFI's notes). (level 10)
-8. Option B's private ABI: pinned to this macOS 27 build; an OS update means re-checking DroidVMAudio's selectors, or option C.
+8. Option B's private ABI: pinned to this macOS 27 build; an OS update means re-checking the device's selectors, or option C.
 9. USB-C wired audio: whether a WCD939x is fitted (stock symbols say maybe, the DT says no) and USB host mode first. (later)
 10. **The GPR source ports.** Ubuntu's piano kernel sends APM commands from port 1, PRM requests from port 2 and data from dynamic
     ports (0x10000000 up); sheng (SM8550) and the K90 (SM8750) used 0x2001 for everything; Project-SunUEFI's patch says its piano
@@ -322,7 +322,7 @@ Ubuntu (reboot), or later AirPlay/Bluetooth from macOS.
 This repository's packages are BSD-2-Clause-Patent. Linux (q6apm, audioreach, gpr, q6prm, lpass-va-macro, the FS19xx driver, the
 piano machine driver) and Project-SunUEFI's kernel patches are GPL-2.0: specification only (behaviour, IDs and register positions
 as facts); no code, comment or table is copied. hackios-xnu-kernel-k90 is APSL-2.0: facts only. UniXNU-sheng and
-UniXNU-droidvm (DroidVMAudio) are BSD-2-Clause-Patent and are reused with `UPSTREAM` records; AudioReach's topology macros and
+the VM-era audio kext are BSD-2-Clause-Patent and are reused with `UPSTREAM` records; AudioReach's topology macros and
 engine headers (BSD-3-Clause / BSD-3-Clause-Clear) supply IDs and layouts with attribution. No Qualcomm or FourSemi binary is
 reverse engineered. The DSP firmware, the amplifier preset and any topology or ACDB file are data read at run time from the
 owner's own tablet (or a staged copy under the ignored `out/`), never committed; the host tests use a synthetic preset container

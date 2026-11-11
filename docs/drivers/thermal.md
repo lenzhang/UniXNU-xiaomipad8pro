@@ -2,7 +2,7 @@
 
 Status: code, 2026-11-11. `package/PianoThermal` is built, host-tested (`thermal_host: all passed`; the sensor map checked against
 the DT: 47 sensors) and linked into the native KC (kernel 0059: `com.unixnu.driver.PianoThermal: linked, ... 374 pointers`, none
-from DroidVM), inert without `piano-thermal` / `piano-cpufreq`; **not run on hardware**. Template: `README.md`. B6, the eleven
+from outside this repository), inert without `piano-thermal` / `piano-cpufreq`; **not run on hardware**. Template: `README.md`. B6, the eleven
 PMIC board thermistors (battery, charger, connectors, skin, ...) and `piano_thermal_board_temps()` for charging safety: §12
 (`piano-thermal-adc=1`, host-tested, linked, not run).
 
@@ -221,7 +221,7 @@ run time to compare).
 Status: code, 2026-11-11. `Ntc.h`, `AdcChannels.h`, `PmicAdc.h`, `BoardTemps.h` (portable), `PianoThermalAdc.cpp` (the kernel
 side, the kext's second object) and `package/include/PianoBoardTemps.h` (the API); host-tested (`adc_host: all passed`), the map
 checked against the DT (`check-adc-map: 11 channels, 4 thermistor pins, the arbiter EE and the SDAMs match the DT`), linked into the
-native KC (kernel 0059: `com.unixnu.driver.PianoThermal: linked, ... 435 pointers`, 17 native kexts, none from DroidVM); inert
+native KC (kernel 0059: `com.unixnu.driver.PianoThermal: linked, ... 435 pointers`, 17 native kexts, none from outside this repository); inert
 without `piano-thermal-adc`; **not run on hardware**.
 
 ### 12.1 Purpose and gate

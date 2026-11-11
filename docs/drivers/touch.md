@@ -39,7 +39,7 @@ contact work runs **in the kext** (`TouchMatrix.h`, Project-SunUEFI's decoder fo
 ## 3. Specification sources
 
 Behaviour only, nothing copied from GPL code: piano's Ubuntu (`nt36532e-thp` kernel transport, `device/piano-thp` processing)
-as described in `droidvm-build/piano-patches/touch-native-plan.md`; Project-SunUEFI's piano touch producer, which ran this
+as described in the local plan `touch-native-plan.md` (not published); Project-SunUEFI's piano touch producer, which ran this
 controller natively in UEFI over GPIO SPI (firmware loaded, idle baseline; touching broke the checksums: GPIO SPI is too slow).
 
 ## 4. Components reused (provenance in `package/PianoTouch/UPSTREAM`)
@@ -51,7 +51,7 @@ controller natively in UEFI over GPIO SPI (firmware loaded, idle baseline; touch
 | SE DMA through stream 0xa3, cache maintenance, vote bits | UniXNU-Odin3 `PaganiInput` (13T), UniXNU-sm8750-common `PeripheralIO.h` | re-expressed |
 | start sequence (fw info, idle baseline 0x19, host-command handshake) | ShengNovatekTouch 69fdd62, Apache-2.0 (NOTICE kept) | re-written |
 | bypass context bank | `package/PianoDwc3/SmmuStream.h` | included |
-| HID class, publication, personality | `package/PianoKeyboard` / DroidVMInput | same pattern |
+| HID class, publication, personality | `package/PianoKeyboard` / the VM-era HID class | same pattern |
 | calibrated position, edge mapping, calibration check | piano-thp `nvt_touch_core.cpp` (Apache-2.0, modified from xiaomi-sheng-thp by ianchb), `calibration.cpp`, `orientation.hpp`, `panel.cpp` (MIT) | re-written (`TouchMatrix.h`, `gen-touch-calibration.py`) |
 
 Not used in this pass: the multi-contact trackers (ShengNovatekTouch's, piano-thp's) and piano-thp's filters.
@@ -187,7 +187,7 @@ without SE DMA. Input meanwhile: the keyboard cover, or the Mac's keyboard and m
 2. Are the inferred clock facts right (vote bit 24, branch 0x1827c, the rate)? (step 3 lines)
 3. The orientation and the edge mapping natively (the verification step): Ubuntu's BOE no-flip and edge stretch, not yet seen here.
 4. Frame rate and checksum rate at 9.6 vs 19.2 MHz; CPU cost of the polled thread.
-5. Multi-touch (Apple's path frames to HSTouchHIDService, DroidVMInput fb07165) and palm rejection: later.
+5. Multi-touch (Apple's path frames to HSTouchHIDService, as the VM-era HID kext fb07165 did) and palm rejection: later.
 6. Charger noise (USB cable always in): the Ubuntu driver sends a charger state command; not done.
 
 ## 11. Keyboard cover

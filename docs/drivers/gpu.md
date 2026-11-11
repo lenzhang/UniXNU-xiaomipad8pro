@@ -3,7 +3,7 @@
 Status 2026-11-11: `package/PianoA830` is in the native kext list (`configs/k27-native-kexts.txt`), inert unless `piano-gpu=N`.
 On the tablet: the read-only survey (piano-gpu=1, 07:12), S1..S10 all ok on the first full run (`GPU RUN 160M`, 44-53 C), and with
 the NativeAdrenoMetal plugin (Turnip on ABI v2) in the seed **the macOS login screen composited by WindowServer on the A830**
-(camera, about 3.5 min into the boot). Plan: `droidvm-build/piano-patches/gpu-native-plan.md`.
+(camera, about 3.5 min into the boot). Plan: the local plan `gpu-native-plan.md` (not published).
 
 ## 1. Purpose and gate
 
@@ -34,8 +34,8 @@ the generated `A830HwInit.h` are register facts as upstream ships them. piano's 
 
 **Adreno830** 1a13210 (MIT), the 13T's whole A830 kernel driver (S0-S10 and a GPU desktop under iPadOS on the same SoC and Gunyah),
 with **ArmSmmu4K** 3ba9245 (the revision it was tested with) and **AdrenoPM4**; board glue derived from **UniXNU-Pagani_SM8750**
-25b1109 (`PaganiGpuBoard.cpp`, the inputs generator, the firmware embed); the macOS accelerator from macOS-DroidVM's
-`DroidVMGpuKext.cpp`. Provenance, hashes and every changed file: `package/PianoA830/UPSTREAM`.
+25b1109 (`PaganiGpuBoard.cpp`, the inputs generator, the firmware embed); the macOS accelerator from the VM-era GPU
+kext. Provenance, hashes and every changed file: `package/PianoA830/UPSTREAM`.
 
 macOS-27 deltas (compiled only with `-DADRENO830_MACOS`; host tests build both ways):
 - S9 without the iPadOS-only staged `IOAcceleratorES`: `native_adreno_publish` registers `NativeAdrenoGpuPublished`, the kext's

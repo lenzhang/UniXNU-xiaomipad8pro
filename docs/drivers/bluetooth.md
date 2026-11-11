@@ -138,7 +138,7 @@ recommendation: C for input devices, A kept open for audio if the owner accepts 
 `tooling/k27/build-native-piano-bluetooth.sh` (host tests, a store check of the survey headers, the objects, the import check: 0
 unresolved), descriptor `tooling/k27/kext/PianoBluetooth.json` (`com.unixnu.driver.PianoBluetooth`), listed in
 `configs/k27-native-kexts.txt`, so `tooling/k27/build-native-image.sh` links it (inert). Link check 2026-11-11 (kernel 0059): "20 native
-kexts linked, none from DroidVM", PianoBluetooth 326 pointers, every vtable check 0 problem slots. No library dependency yet; level 3
+kexts linked, none from outside this repository", PianoBluetooth 326 pointers, every vtable check 0 problem slots. No library dependency yet; level 3
 adds PianoWifi (§7.1) and PianoA830 (the GCC vote lock) to the descriptor, level 4 NativeUfs.
 
 ### 7.1 The shared power helper PianoWifi should expose (not built; PianoWifi is not changed here)

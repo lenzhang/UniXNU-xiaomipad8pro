@@ -36,7 +36,7 @@ panel. Two bottom halves under one IOMFB top half:
 | Coherency | MDSS is not `dma-coherent` | DT | verified |
 | Backlight | 2x KTZ8866 at I2C 0x11: primary on `i2c_hub_3` (@98c000, enable TLMM 2), secondary on `i2c8` (@880000); 400 kHz; 11-bit level, max 2047 | piano dts :971-981, :1061-1073 | verified |
 | Panel bias | VSP/VSN 5.8 V on TLMM 117/118; vddio L12B | piano dts :233-258 | verified |
-| Measured (Linux KMS) | 144 Hz mode: one plane on `sspp_8`, multirect split 2x1600x2136, `XR24`; MDSS IRQ ~137/s with vblank on, ~8/s idle | `droidvm-build/piano-patches/thin-direct-measurements.md` | verified (Linux, not ABL) |
+| Measured (Linux KMS) | 144 Hz mode: one plane on `sspp_8`, multirect split 2x1600x2136, `XR24`; MDSS IRQ ~137/s with vblank on, ~8/s idle | the local bring-up notes (`thin-direct-measurements.md`, not published) | verified (Linux, not ABL) |
 
 Which SSPP(s), CTL and LM pair ABL itself uses at 120 Hz is **needs-boot** (the `dpu=2` readout below). The sheng code
 assumes VIG0+VIG1 and CTL0; on piano that is plausible (same DPU generation offsets) but unproven.
@@ -66,7 +66,7 @@ Kernel `linux-sm8750-piano` v1.1.0 (`~/kfirst/linux`, commit d2710cd1). Read, do
 
 | Piece | Base (pin) | Change for piano |
 |---|---|---|
-| IOMFB top half | `GopFramebuffer` d711e8c, class `NativeLegacyDisplay : IOMobileFramebufferLegacy` (`NativeLegacyDisplay.cpp:183`); macOS behaviour (console release via `PE_initialize_console(.., kPEDisableScreen)` on first swap :947-952, `publishDisplayAttributes` :1037-1082, `IOMFBUUID` :1155-1163) already "follows macOS-DroidVM" | none for first light; take sheng's macOS 27.3 arg set. Cross-check slot/offset table against our `droidvm-build/macOS-DroidVM/overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h` (27.0.1) vs UniXNU's `OriginalMobileFramebufferABI.h` for 27.3 |
+| IOMFB top half | `GopFramebuffer` d711e8c, class `NativeLegacyDisplay : IOMobileFramebufferLegacy` (`NativeLegacyDisplay.cpp:183`); macOS behaviour (console release via `PE_initialize_console(.., kPEDisableScreen)` on first swap :947-952, `publishDisplayAttributes` :1037-1082, `IOMFBUUID` :1155-1163) already follows the VM-era display kext | none for first light; take sheng's macOS 27.3 arg set. Cross-check slot/offset table against the generated `IOMobileFramebufferABI.h` (27.0.1, `out/k27/iomfb-abi/`, see `package/NativeGopDisplay/UPSTREAM`) vs UniXNU's `OriginalMobileFramebufferABI.h` for 27.3 |
 | GOP copy | same, GOP via `PE_current_console`; vsync = `IOTimerEventSource` at `vsync` Hz (no hardware vblank) | `vsync=120` to match the 120 Hz UEFI mode |
 | Pipe readout | `dpu=2` (docs/porting/display.md "Read the display pipes" :73-99): reads VIG0/1 source/size/format/fetch, CTL0, both INTF tear checks, display streams in the apps SMMU | run first on piano to learn ABL's pipe set |
 | Direct flip | `NativeLegacyDisplay::startDirect`/`flip` (:296-333): writes SRC0_ADDR/YSTRIDE0 on VIG0+VIG1, `dsb`, CTL0 FLUSH=0x3, no START; 4 `DirectSlot`s; fence rule (wait until Adreno's completed fence passes the swap's submitted fence; without it the panel flickers) | **hardcoded sheng constants**: `kBootIova=0xb8000000`, `kBootStride=0x2fa0` → piano `0xFC800000`, `0x3200` (12800); flush mask from the readout; make them board properties, not constants |
