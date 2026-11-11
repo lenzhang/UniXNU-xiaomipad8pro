@@ -2,7 +2,9 @@
 // Host test of PianoKeyboard's portable parts: the WN8030 codec (Wn8030Piano.h: commands, the RAM image's header and data blocks,
 // piano's packed frames, vendor messages; the frames captured on piano 2026-11-11 and key, consumer, touchpad, attach and
 // authentication frames of the same shape), the keyboard filter (rollover, the opt-in Fn row), the pointer made of touchpad reports
-// (swipes, scrolling, taps, the contact count, the press button, the axes' scale), BitI2c.h against a bit-level I2C target model
+// (swipes, scrolling, taps, the contact count, the press button, the axes' scale; with the defaults: fine natural scrolling and its
+// axis lock, three-finger swipes, the typing guard, press settling), the touchpad descriptor's declared resolutions,
+// BitI2c.h against a bit-level I2C target model
 // (START/STOP, ACK/NACK, repeated START reads, clock stretching), CmdDb.h on a small database, and HidDescriptors.h (parsed item by
 // item: each report is as long as the driver sends it).
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. keyboard_host.cpp -o /tmp/keyboard_host && /tmp/keyboard_host [--no-firmware] [MCU_Upgrade.bin]
@@ -281,12 +283,24 @@ static void touchpad(uint8_t out[kTouchpadBytes], uint8_t buttons, std::initiali
   }
   out[26] = uint8_t(i);
 }
+// The pointer settings the first tests were written for (before 2026-11-12): 2 counts per pointer count, 50 per wheel step, no axis
+// lock, no typing guard, no press settling.
+static PointerConfig legacy()
+{
+  PointerConfig c;
+  c.divide = 2;
+  c.scrollCounts = 50;
+  c.axisLock = false;
+  c.typingMs = 0;
+  c.pressSettleMs = 0;
+  return c;
+}
 static int16_t px(const uint8_t *o) { return int16_t(le16(o + 1)); }
 static int16_t py(const uint8_t *o) { return int16_t(le16(o + 3)); }
 
 static void testPointer()
 {
-  Pointer p;
+  Pointer p(legacy());
   uint8_t tp[kTouchpadBytes], out[2][kPointerBytes];
   constexpr uint8_t kTouch = 1 | 2 | 4;
   touchpad(tp, 0, {{kTouch, 3, 1000, 1000}});
@@ -556,7 +570,7 @@ static void testSwipes()
   constexpr uint8_t kTouch = 1 | 2 | 4;
   uint8_t tp[kTouchpadBytes], out[2][kPointerBytes];
   // A one-finger swipe right: 300 X counts in 20 reports, 8 ms apart, two reports per frame as the cover may pack them.
-  Pointer p;
+  Pointer p(legacy());
   int32_t sumX = 0, sumY = 0;
   unsigned sent = 0;
   Report r[24];
@@ -579,7 +593,7 @@ static void testSwipes()
   CHECK(p.takeGesture(&g) && g.most == 1 && g.x0 == 1000 && g.x1 == 1315 && g.travel == 315 && !g.tap && g.moves == sent);
   CHECK(!p.takeGesture(&g));
   // The same distance down in Y counts moves 2/3 as far (51 counts per mm against 34).
-  Pointer q;
+  Pointer q(legacy());
   sumY = 0;
   for (unsigned i = 0; i <= 30; ++i) {
     report(tp, 0, {{kTouch, 8, 1500, uint16_t(500 + 10 * i)}});
@@ -588,7 +602,7 @@ static void testSwipes()
   }
   CHECK(sumY == 300 * 2 / 3 / 2);
   // A two-finger swipe up: wheel steps (scroll up), no pointer motion; sideways: AC Pan.
-  Pointer s;
+  Pointer s(legacy());
   int wheel = 0, pan = 0, moved = 0;
   for (unsigned i = 0; i <= 10; ++i) {
     report(tp, 0, {{kTouch, 1, 1000, uint16_t(1500 - 30 * i)}, {kTouch, 2, 1400, uint16_t(1500 - 30 * i)}});
@@ -606,7 +620,7 @@ static void testSwipes()
   s.touch(tp, 300, out);
   CHECK(s.takeGesture(&g) && g.most == 2 && g.scrolls >= 6 && g.moves == 0);
   // The contact count rules: a slot past it is not a finger, even with its tip flag left set.
-  Pointer c;
+  Pointer c(legacy());
   report(tp, 0, {{kTouch, 3, 1000, 1000}, {kTouch, 4, 2000, 1000}}, 1);
   CHECK(c.touch(tp, 0, out) == 0);
   report(tp, 0, {{kTouch, 3, 1100, 1000}, {kTouch, 4, 2500, 1000}}, 1);   // one finger moving, a stale second slot
@@ -622,13 +636,13 @@ static void testSwipes()
   c.touch(tp, 400, out);
   CHECK(c.takeGesture(&g) && g.most == 3);
   // A touchpad that never sends a count: the tip flags decide.
-  Pointer z;
+  Pointer z(legacy());
   report(tp, 0, {{kTouch, 5, 1000, 1000}}, 0);
   z.touch(tp, 0, out);
   report(tp, 0, {{kTouch, 5, 1040, 1000}}, 0);
   CHECK(z.touch(tp, 8, out) == 1 && px(out[0]) == 20);
   // A press started with two fingers stays the right button when one lifts; one started with one stays left.
-  Pointer b;
+  Pointer b(legacy());
   report(tp, 0, {{kTouch, 1, 1000, 1000}, {kTouch, 2, 1400, 1000}});
   b.touch(tp, 0, out);
   report(tp, 1, {{kTouch, 1, 1000, 1000}, {kTouch, 2, 1400, 1000}});
@@ -646,7 +660,7 @@ static void testSwipes()
   report(tp, 0, {}, 0);
   CHECK(b.touch(tp, 70, out) == 1 && out[0][0] == 0 && b.takeGesture(&g) && g.pressed && !g.tap);
   // A two-finger tap: the right button clicked; a reset (detach) keeps the counters.
-  Pointer t;
+  Pointer t(legacy());
   report(tp, 0, {{kTouch, 1, 1000, 1000}, {kTouch, 2, 1400, 1000}});
   t.touch(tp, 0, out);
   report(tp, 0, {}, 0);
@@ -728,6 +742,265 @@ static void testDescriptors()
   CHECK(depth == 0 && in.size() == 1 && out.empty() && in[0] / 8 == kPointerBytes);
 }
 
+// ------------------------------------------------------------------------------------ the touchpad as macOS sees it (2026-11-12)
+// The touchpad descriptor read item by item as IOHIDFamily would: the resolution of the relative X element and of the Wheel, as
+// IOHIDEventService::determineResolution computes it (logical range over physical range, the unit exponent's power of ten on the
+// logical side for a negative exponent, an integer quotient; none when a physical bound equals the logical one).
+struct Axis { int32_t lmin = 0, lmax = 0, pmin = 0, pmax = 0, exponent = 0; bool relative = false, seen = false; };
+static int32_t sx(uint32_t v, unsigned len) { return len == 1 ? int8_t(v) : len == 2 ? int16_t(v) : int32_t(v); }
+static void readTouchpad(const uint8_t *d, unsigned n, Axis *x, Axis *wheel, unsigned *inBits, int *depth)
+{
+  int32_t lmin = 0, lmax = 0, pmin = 0, pmax = 0, exponent = 0;
+  unsigned size = 0, count = 0, page = 0;
+  unsigned usages[8], nUsages = 0;
+  *inBits = 0;
+  *depth = 0;
+  for (unsigned i = 0; i < n;) {
+    const uint8_t item = d[i];
+    const unsigned len = (item & 3) == 3 ? 4 : item & 3;
+    uint32_t v = 0;
+    for (unsigned k = 0; k < len; ++k) v |= uint32_t(d[i + 1 + k]) << (8 * k);
+    switch (item & 0xfc) {
+    case 0x04: page = v; break;
+    case 0x08: if (nUsages < 8) usages[nUsages++] = len == 4 ? v : (page << 16 | v); break;
+    case 0x14: lmin = sx(v, len); break;
+    case 0x24: lmax = sx(v, len); break;
+    case 0x34: pmin = sx(v, len); break;
+    case 0x44: pmax = sx(v, len); break;
+    case 0x54: exponent = int32_t(v & 0x0f); break;
+    case 0x74: size = v; break;
+    case 0x94: count = v; break;
+    case 0xa0: ++*depth; nUsages = 0; break;
+    case 0xc0: --*depth; break;
+    case 0x80:
+      *inBits += size * count;
+      for (unsigned u = 0; u < nUsages; ++u) {
+        Axis a;
+        a.lmin = lmin; a.lmax = lmax; a.pmin = pmin; a.pmax = pmax; a.exponent = exponent; a.relative = v & 4; a.seen = true;
+        if (usages[u] == 0x10030) *x = a;
+        if (usages[u] == 0x10038) *wheel = a;
+      }
+      nUsages = 0;
+      break;
+    default: break;
+    }
+    i += 1 + len;
+  }
+}
+static int32_t resolution(const Axis &a)
+{
+  if (!a.relative || a.pmin == a.lmin || a.pmax == a.lmax) return 0;
+  int64_t logical = a.lmax - a.lmin, physical = a.pmax - a.pmin;
+  if (a.exponent < 8) for (int i = a.exponent; i > 0; --i) physical *= 10;
+  else for (int i = 0x10 - a.exponent; i > 0; --i) logical *= 10;
+  return int32_t(logical / physical);
+}
+static void testTouchpadDescriptor()
+{
+  struct Case { uint32_t dpi, scroll, wantDpi, wantScroll; };
+  const Case cases[] = {{400, 90, 400, 90}, {865, 90, 865, 90}, {120, 10, 120, 10}, {4000, 900, 4000, 900}, {50, 5, 120, 10},
+                        {9000, 2000, 4000, 900}, {200, 0, 200, 0}, {433, 37, 433, 37}};
+  for (const Case &c : cases) {
+    const TouchpadDescriptor d = makeTouchpadDescriptor(c.dpi, c.scroll);
+    Axis x, wheel;
+    unsigned bits = 0;
+    int depth = 0;
+    readTouchpad(d.bytes, d.length, &x, &wheel, &bits, &depth);
+    CHECK(d.length <= sizeof d.bytes && depth == 0 && bits == 8 * kPointerBytes && x.seen && wheel.seen);
+    CHECK(x.lmin == -32767 && x.lmax == 32767 && wheel.lmin == -127 && wheel.lmax == 127);
+    CHECK(resolution(x) == int32_t(c.wantDpi) && resolution(wheel) == int32_t(c.wantScroll));
+  }
+  // The default is the device's descriptor; the same report as PianoDwc3's pointer (whose descriptor is untouched).
+  CHECK(deviceInfo(Kind::touchpad).descriptor == kTouchpadDefault.bytes && deviceInfo(Kind::touchpad).descriptorBytes == kTouchpadDefault.length);
+  CHECK(deviceInfo(Kind::pointer).descriptor == kPointerDescriptor && deviceInfo(Kind::touchpad).usage == 0x02);
+  std::map<int, unsigned> in, out;
+  int depth = 0;
+  parse(kTouchpadDefault.bytes, kTouchpadDefault.length, in, out, &depth);
+  CHECK(depth == 0 && in.size() == 1 && in[0] / 8 == kPointerBytes && out.empty());
+}
+
+// Two-finger scrolling with the defaults: fine counts, natural direction, the axis lock.
+static void scroll(Pointer &p, uint64_t t0, int dx, int dy, unsigned reports, int *wheel, int *pan, unsigned *withWheel)
+{
+  constexpr uint8_t kTouch = 1 | 2 | 4;
+  uint8_t tp[kTouchpadBytes], out[2][kPointerBytes];
+  *wheel = *pan = 0;
+  *withWheel = 0;
+  for (unsigned i = 0; i <= reports; ++i) {
+    const uint16_t x = uint16_t(1200 + dx * int(i)), y = uint16_t(1200 + dy * int(i));
+    touchpad(tp, 0, {{kTouch, 1, x, y}, {kTouch, 2, uint16_t(x + 400), y}});
+    const unsigned m = p.touch(tp, t0 + 8 * i, out);
+    for (unsigned j = 0; j < m; ++j) {
+      *wheel += int8_t(out[j][5]);
+      *pan += int8_t(out[j][6]);
+      *withWheel += out[j][5] != 0;
+      CHECK(px(out[j]) == 0 && py(out[j]) == 0 && out[j][0] == 0);
+    }
+  }
+  touchpad(tp, 0, {});
+  p.touch(tp, t0 + 8 * reports + 500, out);
+}
+static void testScrolling()
+{
+  int wheel = 0, pan = 0;
+  unsigned withWheel = 0;
+  // Fingers up 300 Y counts (= 200 X counts) with a little sideways drift: 40 wheel counts up, spread over the reports, no pan.
+  Pointer p;
+  scroll(p, 0, 2, -30, 10, &wheel, &pan, &withWheel);
+  CHECK(wheel == 40 && pan == 0 && withWheel >= 8);
+  // Down: content follows the fingers the other way.
+  scroll(p, 1000, -2, 30, 10, &wheel, &pan, &withWheel);
+  CHECK(wheel == -40 && pan == 0);
+  // Sideways with a little vertical drift: AC Pan only (fingers right = pan right).
+  scroll(p, 2000, 20, 3, 10, &wheel, &pan, &withWheel);
+  CHECK(pan == 40 && wheel == 0);
+  // A diagonal start leaves both axes free.
+  scroll(p, 3000, 20, 30, 10, &wheel, &pan, &withWheel);
+  CHECK(pan == 40 && wheel == -40);
+  // scrollInvert flips both.
+  PointerConfig c;
+  c.scrollInvert = true;
+  Pointer q(c);
+  scroll(q, 0, 0, -30, 10, &wheel, &pan, &withWheel);
+  CHECK(wheel == -40);
+  scroll(q, 1000, 20, 0, 10, &wheel, &pan, &withWheel);
+  CHECK(pan == -40);
+  // Under 1.2 mm nothing scrolls yet (the axis is not decided); the pending travel comes out once it is.
+  Pointer r;
+  constexpr uint8_t kTouch = 1 | 2 | 4;
+  uint8_t tp[kTouchpadBytes], out[2][kPointerBytes];
+  touchpad(tp, 0, {{kTouch, 1, 1000, 1000}, {kTouch, 2, 1400, 1000}});
+  r.touch(tp, 0, out);
+  touchpad(tp, 0, {{kTouch, 1, 1000, 970}, {kTouch, 2, 1400, 970}});      // 20 X counts: undecided
+  CHECK(r.touch(tp, 8, out) == 0);
+  touchpad(tp, 0, {{kTouch, 1, 1000, 940}, {kTouch, 2, 1400, 940}});      // 40: vertical, 8 counts out at once
+  CHECK(r.touch(tp, 16, out) == 1 && out[0][5] == 8);
+  // One finger with the defaults: one pointer count per touchpad count.
+  Pointer m;
+  int sum = 0;
+  for (unsigned i = 0; i <= 20; ++i) {
+    touchpad(tp, 0, {{kTouch, 9, uint16_t(1000 + 15 * i), 1000}});
+    const unsigned k = m.touch(tp, 1000 + 8 * i, out);
+    for (unsigned j = 0; j < k; ++j) sum += px(out[j]);
+  }
+  CHECK(sum == 300);
+}
+
+// Three-finger swipes: recognised once per touch, sent as Control + arrow only with gestures on.
+static Swipe swipeTouch(Pointer &p, uint64_t t0, int dx, int dy, unsigned *wheelReports, Swipe *logged)
+{
+  constexpr uint8_t kTouch = 1 | 2 | 4;
+  uint8_t tp[kTouchpadBytes], out[2][kPointerBytes];
+  Swipe sent = Swipe::none;
+  *wheelReports = 0;
+  for (unsigned i = 0; i <= 12; ++i) {
+    const uint16_t x = uint16_t(1500 + dx * int(i)), y = uint16_t(1000 + dy * int(i));
+    touchpad(tp, 0, {{kTouch, 1, x, y}, {kTouch, 2, uint16_t(x + 300), y}, {kTouch, 3, uint16_t(x + 600), y}});
+    const unsigned m = p.touch(tp, t0 + 8 * i, out);
+    for (unsigned j = 0; j < m; ++j) *wheelReports += out[j][5] || out[j][6] || px(out[j]) || py(out[j]);
+    const Swipe s = p.takeSwipe();
+    if (s != Swipe::none) {
+      CHECK(sent == Swipe::none);   // once
+      sent = s;
+    }
+  }
+  touchpad(tp, 0, {});
+  p.touch(tp, t0 + 600, out);
+  Gesture g;
+  CHECK(p.takeGesture(&g) && g.most == 3);
+  *logged = g.swipe;
+  return sent;
+}
+static void testGestures()
+{
+  PointerConfig on;
+  on.gestures = true;
+  Pointer p(on);
+  unsigned moved = 0;
+  Swipe logged = Swipe::none;
+  CHECK(swipeTouch(p, 0, 0, -50, &moved, &logged) == Swipe::up && logged == Swipe::up && moved == 0);   // 600 Y = 400 X up
+  CHECK(swipeTouch(p, 1000, 0, 50, &moved, &logged) == Swipe::down && moved == 0);
+  CHECK(swipeTouch(p, 2000, -40, 0, &moved, &logged) == Swipe::left && moved == 0);
+  CHECK(swipeTouch(p, 3000, 40, 0, &moved, &logged) == Swipe::right && p.swipes() == 4);
+  CHECK(swipeTouch(p, 4000, 30, 45, &moved, &logged) == Swipe::none && logged == Swipe::none);   // diagonal: nothing
+  CHECK(swipeTouch(p, 5000, 0, -10, &moved, &logged) == Swipe::none);                            // 4 mm: too short
+  CHECK(swipeUsage(Swipe::up) == 0x52 && swipeUsage(Swipe::down) == 0x51 && swipeUsage(Swipe::left) == 0x4f &&
+        swipeUsage(Swipe::right) == 0x50 && !swipeUsage(Swipe::none));
+  // Off (the default): nothing is sent, three fingers scroll, the swipe is still in the gesture's log line.
+  Pointer q;
+  CHECK(swipeTouch(q, 0, 0, -50, &moved, &logged) == Swipe::none && logged == Swipe::up && moved > 0);
+  // A three-finger tap is the middle button.
+  Pointer t;
+  constexpr uint8_t kTouch = 1 | 2 | 4;
+  uint8_t tp[kTouchpadBytes], out[2][kPointerBytes];
+  touchpad(tp, 0, {{kTouch, 1, 1000, 1000}, {kTouch, 2, 1300, 1000}, {kTouch, 3, 1600, 1000}});
+  t.touch(tp, 0, out);
+  touchpad(tp, 0, {});
+  CHECK(t.touch(tp, 100, out) == 2 && out[0][0] == 4 && out[1][0] == 0);
+  // The shortcut through the keyboard: Control, Control + the arrow, Control, nothing, over whatever is held (Shift + a here).
+  Keys k;
+  uint8_t in[kKeyboardBytes] = {kIdKeyboard, 0x02, 0, 0x04}, sent[kKeyboardBytes], r[4][kKeyboardBytes];
+  k.filter(in, sent);
+  CHECK(k.shortcut(swipeUsage(Swipe::up), r) == 4);
+  CHECK(sentIs(r[0], 0x03, {0x04}) && sentIs(r[1], 0x03, {0x04, 0x52}) && sentIs(r[2], 0x03, {0x04}) && sentIs(r[3], 0x02, {0x04}));
+  Keys empty;
+  empty.shortcut(swipeUsage(Swipe::left), r);
+  CHECK(sentIs(r[0], 0x01, {}) && sentIs(r[1], 0x01, {0x4f}) && sentIs(r[3], 0x00, {}));
+}
+
+// Taps on by default; a touch that starts right after typing is ignored; the press settles the motion.
+static void testTapsAndTyping()
+{
+  constexpr uint8_t kTouch = 1 | 2 | 4;
+  uint8_t tp[kTouchpadBytes], out[2][kPointerBytes];
+  // Tap: one finger left, two right (defaults).
+  Pointer p;
+  touchpad(tp, 0, {{kTouch, 1, 1000, 1000}});
+  p.touch(tp, 0, out);
+  touchpad(tp, 0, {});
+  CHECK(p.touch(tp, 90, out) == 2 && out[0][0] == 1 && out[1][0] == 0);
+  // tap=0: no click.
+  PointerConfig noTap;
+  noTap.tap = false;
+  Pointer n(noTap);
+  touchpad(tp, 0, {{kTouch, 1, 1000, 1000}});
+  n.touch(tp, 0, out);
+  touchpad(tp, 0, {});
+  CHECK(n.touch(tp, 90, out) == 0 && n.taps() == 0);
+  // A key at 1000 ms: a touch at 1100 moves nothing and taps nothing; its press still clicks; one at 1400 moves.
+  p.keyTyped(1000);
+  touchpad(tp, 0, {{kTouch, 2, 1000, 1000}});
+  p.touch(tp, 1100, out);
+  touchpad(tp, 0, {{kTouch, 2, 1200, 1000}});
+  CHECK(p.touch(tp, 1110, out) == 0);
+  touchpad(tp, 1, {{kTouch, 2, 1200, 1000}});
+  CHECK(p.touch(tp, 1120, out) == 1 && out[0][0] == 1);
+  touchpad(tp, 0, {});
+  CHECK(p.touch(tp, 1150, out) == 1 && out[0][0] == 0);
+  Gesture g;
+  CHECK(p.takeGesture(&g) && g.typing && !g.tap);
+  touchpad(tp, 0, {{kTouch, 3, 1000, 1000}});
+  p.touch(tp, 1400, out);
+  touchpad(tp, 0, {{kTouch, 3, 1100, 1000}});
+  CHECK(p.touch(tp, 1410, out) == 1 && px(out[0]) == 100);
+  touchpad(tp, 0, {});
+  p.touch(tp, 1500, out);
+  // Keys::newKey: a modifier alone or a held key is no typing; a new key is.
+  const std::vector<uint8_t> a = keys(0, {0x04}), shiftA = keys(0x02, {0x04}), ab = keys(0, {0x04, 0x05}), none = keys(0, {});
+  CHECK(Keys::newKey(none.data(), a.data()) && !Keys::newKey(a.data(), shiftA.data()) && Keys::newKey(a.data(), ab.data()) &&
+        !Keys::newKey(ab.data(), a.data()));
+  // The press: for 50 ms after it changes the finger moves nothing (no jump afterwards either).
+  Pointer s;
+  touchpad(tp, 0, {{kTouch, 4, 1000, 1000}});
+  s.touch(tp, 2000, out);
+  touchpad(tp, 1, {{kTouch, 4, 1030, 1000}});
+  CHECK(s.touch(tp, 2010, out) == 1 && out[0][0] == 1 && px(out[0]) == 0);
+  touchpad(tp, 1, {{kTouch, 4, 1060, 1000}});
+  CHECK(s.touch(tp, 2040, out) == 0);
+  touchpad(tp, 1, {{kTouch, 4, 1100, 1000}});
+  CHECK(s.touch(tp, 2070, out) == 1 && px(out[0]) == 40 && out[0][0] == 1);   // a drag goes on
+}
+
 int main(int argc, char **argv)
 {
   bool noFirmware = false;
@@ -748,6 +1021,10 @@ int main(int argc, char **argv)
   testI2c();
   testCmdDb();
   testDescriptors();
+  testTouchpadDescriptor();
+  testScrolling();
+  testGestures();
+  testTapsAndTyping();
   if (failures) {
     std::printf("keyboard_host: %d failure(s)\n", failures);
     return 1;

@@ -301,7 +301,7 @@ inline AuthStep authReply(const Report &r, uint8_t wire[kCommandWire])
 //   - with fnRow: Right Ctrl (modifier bit 4) held makes 1..0, -, = (usages 0x1e..0x27, 0x2d, 0x2e) into F1..F12 (0x3a..0x45). A key
 //     so made stays an F key until it is released, whatever Ctrl does meanwhile, and Right Ctrl is not reported while any is held
 //     (no stray digit, no stuck F key, no Ctrl+F chord).
-constexpr uint8_t kModRightCtrl = 1u << 4;
+constexpr uint8_t kModLeftCtrl = 1u << 0, kModRightCtrl = 1u << 4;
 class Keys {
  public:
   bool fnRow = false;
@@ -329,8 +329,37 @@ class Keys {
     }
     if (fn_) out[1] &= uint8_t(~kModRightCtrl);
     for (unsigned i = 0; i < 6; ++i) sent_[i] = out[3 + i];
+    mods_ = out[1];
   }
-  void reset() { for (uint8_t &k : sent_) k = 0; fn_ = 0; }
+  // A shortcut, Left Control + usage, on top of what is held: Control down, the key down, the key up, Control up (four reports,
+  // so the system sees the modifier before the key). Returns 4.
+  unsigned shortcut(uint8_t usage, uint8_t out[4][kKeyboardBytes]) const
+  {
+    for (unsigned r = 0; r < 4; ++r) {
+      out[r][0] = kIdKeyboard;
+      out[r][1] = r < 3 ? uint8_t(mods_ | kModLeftCtrl) : mods_;
+      out[r][2] = 0;
+      for (unsigned i = 0; i < 6; ++i) out[r][3 + i] = sent_[i];
+    }
+    unsigned slot = 5;
+    for (unsigned i = 0; i < 6; ++i)
+      if (!sent_[i]) { slot = i; break; }
+    out[1][3 + slot] = usage;
+    return 4;
+  }
+  // Whether a report puts a key down that was not down before (a modifier alone does not count), for the typing guard.
+  static bool newKey(const uint8_t *before, const uint8_t *now)
+  {
+    for (unsigned i = 3; i < kKeyboardBytes; ++i) {
+      if (now[i] <= 3) continue;
+      bool held = false;
+      for (unsigned j = 3; j < kKeyboardBytes && !held; ++j) held = before[j] == now[i];
+      if (!held) return true;
+    }
+    return false;
+  }
+  void reset() { for (uint8_t &k : sent_) k = 0; fn_ = 0; mods_ = 0; }
+  const uint8_t *sent() const { return sent_; }
   uint32_t rollovers() const { return rollovers_; }
   uint16_t fnHeld() const { return fn_; }
 
@@ -342,43 +371,83 @@ class Keys {
     if (usage == 0x2e) return 11;                              // =
     return -1;
   }
-  uint8_t sent_[6] = {};
+  uint8_t sent_[6] = {}, mods_ = 0;
   uint16_t fn_ = 0;
   uint32_t rollovers_ = 0;
 };
 
 // ------------------------------------------------------------------------------------------------------- the pointer for macOS
 // macOS's HID event driver makes no pointer events of a touchpad's finger collections (UniXNU-sheng KeyboardCover.cpp: only Apple's
-// own trackpads have a driver), so the touchpad becomes a relative mouse (HidDescriptors.h kPointerDescriptor, 7 bytes, no report ID):
-// {buttons (bit 0 left, 1 right), X LE16, Y LE16, wheel, AC pan}. One finger moves; two or more scroll; the clickpad's press is the
-// left button, or the right one when it starts with two fingers down (kept until the press ends); its second button is the right
-// one; a short light touch is a click (tap). A touching contact without confidence (a palm) counts as lifted. Design from
-// UniXNU-sheng Wn8030.c wn8030_pointer_report, for piano's 8-byte fingers, with taps.
-// Which contacts a report holds: the first `contact count` (byte 26) of its three slots, as Linux's hid-multitouch reads this
-// touchpad (a Windows-8 digitizer: the count is accurate, a contact not reported is lifted); a count of 0 right after one over three
-// is that frame's continuation and changes nothing. Until the touchpad has sent a non-zero count the tip flags alone decide.
-// The axes have different resolutions (the touchpad's HID descriptor: X 0..3199 over 94 mm, Y 0..2135 over 42 mm, 34 and 51 counts
-// per mm), so Y counts are scaled by 2/3 into X counts before anything else: a millimetre is the same on both axes.
+// own trackpads have a driver), so the touchpad becomes a relative mouse (HidDescriptors.h makeTouchpadDescriptor, 7 bytes, no
+// report ID): {buttons (bit 0 left, 1 right, 2 middle), X LE16, Y LE16, wheel, AC pan}. macOS then accelerates it as a mouse of the
+// declared resolution (HIDPointerResolution) and scrolls by the declared scroll resolution. Design from UniXNU-sheng Wn8030.c
+// wn8030_pointer_report (one finger moves, two scroll, no jump when fingers change, palms lifted), for piano's 8-byte fingers, with:
+//   - contacts: the first `contact count` (byte 26) of the three slots, as Linux's hid-multitouch reads this Windows-8 digitizer (a
+//     contact not reported is lifted); a count of 0 right after one over three is that frame's continuation and changes nothing;
+//     until the touchpad has sent a non-zero count the tip flags alone decide. A touching contact without confidence is a palm.
+//   - scale: Y counts are scaled by 2/3 into X counts (the touchpad's HID descriptor: X 0..3199 over 94 mm, Y 0..2135 over 42 mm),
+//     so a millimetre is the same on both axes; X counts per pointer count `divide` (1: 865 counts per inch of finger travel).
+//   - scrolling: two fingers (three without gestures), one wheel / AC Pan count per `scrollCounts` X counts (5: ~0.15 mm, ten per
+//     former line step), the direction of macOS's "natural" setting like a Mac trackpad (with natural on, the default, content
+//     follows the fingers: fingers up = wheel up), `scrollInvert` flips both axes. The axis locks once 1.2 mm of travel shows one
+//     dominant (twice the other), as Mac trackpads scroll straight; a diagonal start stays free. No inertia.
+//   - the press (button 1): the left button, or the right one when it starts with two fingers down (kept until the press ends);
+//     the second button is the right one; for `pressSettleMs` after the press changes the fingers move nothing (a clickpad's press
+//     moves the contact).
+//   - taps (`tap`): a touch of at most 180 ms, 2.5 mm of travel and no press is a click: one finger left, two right, three middle.
+//   - typing (`typingMs`): a touch that starts within that time after a key went down is ignored (no motion, scroll, tap or
+//     gesture; the press still works), as libinput's disable-while-typing.
+//   - gestures (`gestures`): three fingers moving 9 mm, mostly along one axis, once per three-finger touch: up = Mission Control,
+//     down = App Exposé, left = the Space to the right, right = the Space to the left (a Mac trackpad's three-finger swipes; the
+//     kext sends Control + arrow through the keyboard device). Off: three fingers scroll; the swipe is still recognised for the log.
 constexpr unsigned kPointerBytes = 7;
 constexpr int32_t kYNum = 2, kYDen = 3;
 struct PointerConfig {
-  int32_t divide = 2;         // touchpad X counts per pointer count (3200 counts over ~94 mm: 34 per mm)
-  int32_t scrollCounts = 50;  // X counts of finger travel per wheel step (~1.5 mm)
+  int32_t divide = 1;          // touchpad X counts per pointer count
+  int32_t scrollCounts = 5;    // X counts of finger travel per wheel / AC Pan count
   bool tap = true;
-  bool invertX = false, invertY = false;
+  bool invertX = false, invertY = false, scrollInvert = false, axisLock = true, gestures = false;
+  uint32_t typingMs = 250, pressSettleMs = 50;
 };
+enum class Swipe : uint8_t { none, up, down, left, right };
+inline const char *swipeName(Swipe s)
+{
+  switch (s) {
+  case Swipe::none: return "none";
+  case Swipe::up: return "up (Mission Control, Control+Up)";
+  case Swipe::down: return "down (App Expose, Control+Down)";
+  case Swipe::left: return "left (the Space to the right, Control+Right)";
+  case Swipe::right: return "right (the Space to the left, Control+Left)";
+  }
+  return "?";
+}
+// The keyboard usage (with Left Control) a swipe sends.
+inline uint8_t swipeUsage(Swipe s)
+{
+  switch (s) {
+  case Swipe::up: return 0x52;      // Up Arrow
+  case Swipe::down: return 0x51;    // Down Arrow
+  case Swipe::left: return 0x4f;    // Right Arrow: the next Space
+  case Swipe::right: return 0x50;   // Left Arrow
+  default: return 0;
+  }
+}
 // One touch from the first finger down to the last one up, for the log.
 struct Gesture {
   uint32_t ms, travel, moves, scrolls;   // duration; finger travel in X counts; pointer reports that moved, that scrolled
   int32_t x0, y0, x1, y1;                // where it started and ended (touchpad counts; the fingers' mean)
-  uint8_t most;                          // most fingers at once
-  bool pressed, tap;                     // the pad was pressed; it was a tap (click sent)
+  uint8_t most, tap;                     // most fingers at once; the tap's button (1 left, 2 right, 4 middle; 0 none)
+  bool pressed, typing;                  // the pad was pressed; ignored as typing
+  Swipe swipe;                           // a three-finger swipe recognised (sent only with gestures on)
 };
 class Pointer {
  public:
   explicit Pointer(const PointerConfig &c = PointerConfig()) : cfg_(c) {}
   void configure(const PointerConfig &c) { cfg_ = c; }
-  // A touchpad report: up to two pointer reports (a tap: press, then release) into out; returns how many.
+  // A key went down (not a modifier alone): touches starting within typingMs are ignored.
+  void keyTyped(uint64_t ms) { lastKeyMs_ = ms; typed_ = true; }
+  // A touchpad report: up to two pointer reports (a tap: press, then release) into out; returns how many. A recognised
+  // three-finger swipe (gestures on) is left for takeSwipe().
   unsigned touch(const uint8_t *tp, uint64_t ms, uint8_t out[2][kPointerBytes])
   {
     const uint8_t count = tp[26];
@@ -404,42 +473,65 @@ class Pointer {
     if (fingers) { x /= int32_t(fingers); y /= int32_t(fingers); }
     if (cfg_.invertX) x = int32_t(kTouchXMax) - x;
     if (cfg_.invertY) y = int32_t(kTouchYMax) - y;
-    // A finger that came, went or changed places starts from where it is: no jump.
-    if (fingers && fingers == fingers_ && (fingers > 1 || contact == contact_)) {
-      const int32_t dx = x - x_, dy = y - y_;
-      if (fingers == 1) { moveX_ += dx; moveY_ += kYNum * dy; }
-      else { scrollX_ += dx; scrollY_ -= kYNum * dy; }
-      travel_ += uint32_t((dx < 0 ? -dx : dx) + ((dy < 0 ? -dy : dy) * kYNum + kYDen / 2) / kYDen);
-    }
-    if (fingers != fingers_) moveX_ = moveY_ = scrollX_ = scrollY_ = 0;
-    // Taps: a touch of at most 180 ms, 2.5 mm of travel and no press; its most fingers say which button.
+    // A touch begins: a fresh gesture; one that starts right after typing is ignored to its end.
     if (fingers && !fingers_ && !touching_) {
       touching_ = true;
       downMs_ = ms;
       travel_ = 0;
       most_ = 0;
       pressed_ = false;
+      ignored_ = cfg_.typingMs && typed_ && ms - lastKeyMs_ < cfg_.typingMs;
       g_ = Gesture();
       g_.x0 = x;
       g_.y0 = y;
+      g_.typing = ignored_;
     }
     if (fingers) { g_.x1 = x; g_.y1 = y; }
     if (fingers > most_) most_ = uint8_t(fingers);
     if (tp[1] & 3) pressed_ = true;
-    // The press (button 1): which button it is is decided when it starts.
+    // The press (button 1): which button it is is decided when it starts; motion settles after each change.
     const bool press = tp[1] & 1;
     if (press && !pressing_) pressButton_ = fingers >= 2 ? 2 : 1;
+    if (press != pressing_ || bool(tp[1] & 2) != second_) settleUntil_ = ms + cfg_.pressSettleMs;
     pressing_ = press;
+    second_ = tp[1] & 2;
     uint8_t buttons = press ? pressButton_ : 0;
     if (tp[1] & 2) buttons |= 2;
-    const bool tapped = !fingers && touching_ && cfg_.tap && !pressed_ && ms - downMs_ <= 180 && travel_ <= 85;
+    const bool threeSwipe = fingers >= 3;
+    // A finger that came, went or changed places starts from where it is: no jump.
+    if (fingers != fingers_) {
+      moveX_ = moveY_ = scrollX_ = scrollY_ = 0;
+      lockX_ = lockY_ = 0;
+      lock_ = 0;
+      swipeX0_ = x;
+      swipeY0_ = y;
+    } else if (fingers && (fingers > 1 || contact == contact_)) {
+      const int32_t dx = x - x_, dy = y - y_;
+      travel_ += uint32_t((dx < 0 ? -dx : dx) + ((dy < 0 ? -dy : dy) * kYNum + kYDen / 2) / kYDen);
+      if (!ignored_ && ms >= settleUntil_) {
+        if (threeSwipe) swipe(x, y);   // recognised either way; with gestures on three fingers do nothing else
+        if (threeSwipe && cfg_.gestures) {
+        } else if (fingers == 1) {
+          moveX_ += dx;
+          moveY_ += kYNum * dy;
+        } else {
+          const int32_t sign = cfg_.scrollInvert ? -1 : 1;
+          scrollX_ += sign * dx;
+          scrollY_ -= sign * kYNum * dy;
+          lock(dx, dy);
+        }
+      }
+    }
+    const bool tapped = !fingers && touching_ && cfg_.tap && !pressed_ && !ignored_ && ms - downMs_ <= 180 && travel_ <= 85;
+    const uint8_t tapButton = most_ >= 3 ? 4 : most_ == 2 ? 2 : 1;
     if (!fingers && touching_) {
       touching_ = false;
+      swipeDone_ = false;
       g_.ms = uint32_t(ms - downMs_);
       g_.travel = travel_;
       g_.most = most_;
       g_.pressed = pressed_;
-      g_.tap = tapped && !buttons;
+      g_.tap = tapped && !buttons ? tapButton : 0;
       ++gestures_;
       gestureDone_ = true;
     }
@@ -447,9 +539,14 @@ class Pointer {
     contact_ = contact;
     x_ = x;
     y_ = y;
+    // Until the scroll axis is decided nothing scrolls; then only the locked axis (a free one: both).
+    if (lock_ == 1) scrollX_ = 0;
+    if (lock_ == 2) scrollY_ = 0;
     unsigned n = 0;
     const int32_t mx = take(&moveX_, cfg_.divide, 32767), my = take(&moveY_, kYDen * cfg_.divide, 32767);
-    const int32_t sy = take(&scrollY_, kYDen * cfg_.scrollCounts, 127), sx = take(&scrollX_, cfg_.scrollCounts, 127);
+    const bool scrolling = !cfg_.axisLock || lock_;
+    const int32_t sy = scrolling ? take(&scrollY_, kYDen * cfg_.scrollCounts, 127) : 0;
+    const int32_t sx = scrolling ? take(&scrollX_, cfg_.scrollCounts, 127) : 0;
     if (mx || my || sy || sx || buttons != buttons_) {
       buttons_ = buttons;
       put(out[n++], buttons, mx, my, sy, sx);
@@ -457,9 +554,8 @@ class Pointer {
       if (sx || sy) ++g_.scrolls;
     }
     if (tapped && !buttons) {
-      const uint8_t click = most_ >= 2 ? 2 : 1;
       n = 0;   // nothing moves at a lift: the tap's two reports are all
-      put(out[n++], click, 0, 0, 0, 0);
+      put(out[n++], tapButton, 0, 0, 0, 0);
       put(out[n++], 0, 0, 0, 0, 0);
       ++taps_;
     }
@@ -473,6 +569,13 @@ class Pointer {
     *g = g_;
     return true;
   }
+  // A three-finger swipe to send (gestures on), once.
+  Swipe takeSwipe()
+  {
+    const Swipe s = pendingSwipe_;
+    pendingSwipe_ = Swipe::none;
+    return s;
+  }
   // The MCU's own relative mouse report (ID 2): buttons, X, Y, wheel.
   static void mouse(const uint8_t *m, uint8_t out[kPointerBytes])
   {
@@ -483,19 +586,45 @@ class Pointer {
   // A detach: nothing held, nothing pending; the counters stay.
   void reset()
   {
-    const uint32_t taps = taps_, gestures = gestures_, continuations = continuations_;
+    const uint32_t taps = taps_, gestures = gestures_, continuations = continuations_, swipes = swipes_;
     const bool countSeen = countSeen_;
     *this = Pointer(cfg_);
     taps_ = taps;
     gestures_ = gestures;
     continuations_ = continuations;
+    swipes_ = swipes;
     countSeen_ = countSeen;
   }
   uint32_t taps() const { return taps_; }
   uint32_t gestures() const { return gestures_; }
   uint32_t continuations() const { return continuations_; }
+  uint32_t swipes() const { return swipes_; }
 
  private:
+  // Three fingers: 300 X counts (~9 mm) from where three were first down, along an axis at least twice the other.
+  void swipe(int32_t x, int32_t y)
+  {
+    if (swipeDone_) return;
+    const int32_t dx = x - swipeX0_, dy = (y - swipeY0_) * kYNum / kYDen;
+    const int32_t ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+    Swipe s = Swipe::none;
+    if (ay >= 300 && ay >= 2 * ax) s = dy < 0 ? Swipe::up : Swipe::down;
+    else if (ax >= 300 && ax >= 2 * ay) s = dx < 0 ? Swipe::left : Swipe::right;
+    if (s == Swipe::none) return;
+    swipeDone_ = true;
+    g_.swipe = s;
+    ++swipes_;
+    if (cfg_.gestures) pendingSwipe_ = s;
+  }
+  // The scroll axis: decided after 40 X counts (~1.2 mm) of travel; 1 vertical, 2 horizontal, 3 free.
+  void lock(int32_t dx, int32_t dy)
+  {
+    if (!cfg_.axisLock || lock_) return;
+    lockX_ += uint32_t(dx < 0 ? -dx : dx);
+    lockY_ += uint32_t(((dy < 0 ? -dy : dy) * kYNum) / kYDen);
+    if (lockX_ + lockY_ < 40) return;
+    lock_ = lockY_ >= 2 * lockX_ ? 1 : lockX_ >= 2 * lockY_ ? 2 : 3;
+  }
   static int32_t take(int32_t *pending, int32_t unit, int32_t limit)
   {
     int32_t steps = *pending / unit;
@@ -513,12 +642,14 @@ class Pointer {
     o[6] = uint8_t(int8_t(pan));
   }
   PointerConfig cfg_;
-  uint8_t fingers_ = 0, contact_ = 0, buttons_ = 0, most_ = 0, pressButton_ = 1;
-  bool touching_ = false, pressed_ = false, pressing_ = false, continuation_ = false, countSeen_ = false, gestureDone_ = false;
-  int32_t x_ = 0, y_ = 0, moveX_ = 0, moveY_ = 0, scrollX_ = 0, scrollY_ = 0;
-  uint32_t travel_ = 0;
-  uint64_t downMs_ = 0;
-  uint32_t taps_ = 0, gestures_ = 0, continuations_ = 0;
+  uint8_t fingers_ = 0, contact_ = 0, buttons_ = 0, most_ = 0, pressButton_ = 1, lock_ = 0;
+  bool touching_ = false, pressed_ = false, pressing_ = false, second_ = false, continuation_ = false, countSeen_ = false;
+  bool gestureDone_ = false, ignored_ = false, typed_ = false, swipeDone_ = false;
+  int32_t x_ = 0, y_ = 0, moveX_ = 0, moveY_ = 0, scrollX_ = 0, scrollY_ = 0, swipeX0_ = 0, swipeY0_ = 0;
+  uint32_t travel_ = 0, lockX_ = 0, lockY_ = 0;
+  uint64_t downMs_ = 0, lastKeyMs_ = 0, settleUntil_ = 0;
+  uint32_t taps_ = 0, gestures_ = 0, continuations_ = 0, swipes_ = 0;
+  Swipe pendingSwipe_ = Swipe::none;
   Gesture g_ = {};
 };
 

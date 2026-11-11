@@ -39,8 +39,19 @@
 //   piano-keyboard-auth=1       answer the cover's authentication as Linux does with its helper open (init, offline s3t1; the
 //                               final token needs the helper's secret: not sent). Default 0, as piano's Ubuntu runs
 //   piano-keyboard-raw=0        level 1 without the raw dump of every frame that is not an accelerometer sample
-//   piano-keyboard-tap=0        no tap-to-click        piano-keyboard-invert=B  bit 0 X, bit 1 Y        piano-keyboard-divide=D (2)
 //   piano-keyboard-mouse=0      ignore the MCU's own mouse reports (ID 2; used only while no touchpad report has been seen)
+// The touchpad (Wn8030Piano.h Pointer, HidDescriptors.h makeTouchpadDescriptor):
+//   piano-keyboard-dpi=N        the pointer resolution declared to macOS, counts per inch (default 400; the pad sends 865 per inch of
+//                               finger travel with divide 1, so 400 is 2.2 times a mouse's travel; lower = faster; 120..4000)
+//   piano-keyboard-divide=D     touchpad counts per pointer count (default 1)
+//   piano-keyboard-scroll=C     touchpad counts of finger travel per wheel count (default 5: ~0.15 mm; higher = slower scrolling)
+//   piano-keyboard-scroll-res=R the scroll resolution declared to macOS, counts per inch (default 90; 0: none, macOS's 9)
+//   piano-keyboard-scroll-invert=1  scroll against macOS's natural setting (default 0: as a Mac trackpad, content follows fingers)
+//   piano-keyboard-gestures=1   three-finger swipes as Control + arrow (Mission Control, App Expose, Spaces); default 0
+//   piano-keyboard-tap=0        no tap-to-click (default 1: one finger left, two right, three middle; no drag lock)
+//   piano-keyboard-typing=MS    ignore touches that start within MS of a key going down (default 250; 0 off)
+//   piano-keyboard-invert=B     bit 0 X, bit 1 Y
+
 //   piano-keyboard-fnrow=1      Right Ctrl + 1..0 - = are F1..F12 (Wn8030Piano.h Keys; default 0: keys as the cover sends them)
 //   piano-keyboard-hall=0       do not read gpio80 at all
 //   piano-keyboard-lid=1        tell IOPMrootDomain the hall state (kIOPMClamshellClosed/Opened), with clamshell sleep disabled
@@ -81,6 +92,7 @@ namespace {
 
 struct Args {
   uint32_t level, stop, trace, halfUs, pollMs, rails, touchpad, backlight, tap, invert, divide, mouse, auth, raw, fnrow, hall, lid;
+  uint32_t dpi, scrollRes, scroll, scrollInvert, gestures, typing;
 };
 Args gArgs;
 
@@ -104,14 +116,23 @@ void readArgs()
   gArgs.backlight = bootArg("piano-keyboard-backlight", 50);
   gArgs.tap = bootArg("piano-keyboard-tap", 1);
   gArgs.invert = bootArg("piano-keyboard-invert", 0);
-  gArgs.divide = clampArg(bootArg("piano-keyboard-divide", 2), 1, 16);
+  gArgs.divide = clampArg(bootArg("piano-keyboard-divide", 1), 1, 16);
   gArgs.mouse = bootArg("piano-keyboard-mouse", 1);
   gArgs.auth = bootArg("piano-keyboard-auth", 0);
   gArgs.raw = bootArg("piano-keyboard-raw", 1);
   gArgs.fnrow = bootArg("piano-keyboard-fnrow", 0);
   gArgs.hall = bootArg("piano-keyboard-hall", 1);
   gArgs.lid = bootArg("piano-keyboard-lid", 0);
+  gArgs.dpi = touchpadDpi(bootArg("piano-keyboard-dpi", kTouchpadDpi));
+  gArgs.scrollRes = touchpadScrollResolution(bootArg("piano-keyboard-scroll-res", kTouchpadScrollResolution));
+  gArgs.scroll = clampArg(bootArg("piano-keyboard-scroll", 5), 1, 200);
+  gArgs.scrollInvert = bootArg("piano-keyboard-scroll-invert", 0);
+  gArgs.gestures = bootArg("piano-keyboard-gestures", 0);
+  gArgs.typing = clampArg(bootArg("piano-keyboard-typing", 250), 0, 2000);
 }
+
+// The touchpad's report descriptor with the declared resolutions of the boot arguments (made in start()).
+TouchpadDescriptor gTouchpad = kTouchpadDefault;
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void note(const char *fmt, ...)
@@ -394,7 +415,9 @@ OSDefineMetaClassAndStructors(PianoKeyboardHID, IOHIDDevice)
 IOReturn PianoKeyboardHID::newReportDescriptor(IOMemoryDescriptor **descriptor) const
 {
   const DeviceInfo &info = deviceInfo(fKind);
-  *descriptor = IOBufferMemoryDescriptor::withBytes(info.descriptor, info.descriptorBytes, kIODirectionNone);
+  const bool touchpad = fKind == Kind::touchpad;
+  *descriptor = IOBufferMemoryDescriptor::withBytes(touchpad ? gTouchpad.bytes : info.descriptor,
+                                                    touchpad ? gTouchpad.length : info.descriptorBytes, kIODirectionNone);
   return *descriptor ? kIOReturnSuccess : kIOReturnNoMemory;
 }
 
@@ -420,6 +443,8 @@ class PianoKeyboard : public IOService {
   BitI2c fBus;
   Pointer fPointer;
   Keys fKeyFilter;
+  uint8_t fLastKeys[kKeyboardBytes] = {kIdKeyboard};
+  uint32_t fSwipesSent = 0;
   uint8_t fFrame[kFrameBytes];
   uint8_t fWire[kDataWire];
   // serving state (the thread's own)
@@ -492,11 +517,21 @@ bool PianoKeyboard::start(IOService *provider)
   setProperty("piano-keyboard", gArgs.level, 32);
   PointerConfig pc;
   pc.divide = int32_t(gArgs.divide);
+  pc.scrollCounts = int32_t(gArgs.scroll);
   pc.tap = gArgs.tap != 0;
   pc.invertX = gArgs.invert & 1;
   pc.invertY = gArgs.invert & 2;
+  pc.scrollInvert = gArgs.scrollInvert != 0;
+  pc.gestures = gArgs.gestures != 0;
+  pc.typingMs = gArgs.typing;
   fPointer.configure(pc);
   fKeyFilter.fnRow = gArgs.fnrow != 0;
+  gTouchpad = makeTouchpadDescriptor(gArgs.dpi, gArgs.scrollRes);
+  note("touchpad: %u dpi declared (%u counts per pointer count), scroll %u counts per wheel count at %u per inch%s, %s, taps %s, "
+       "typing guard %u ms, three-finger gestures %s",
+       gArgs.dpi, gArgs.divide, gArgs.scroll, gArgs.scrollRes, gArgs.scrollRes ? "" : " (none: macOS's 9)",
+       gArgs.scrollInvert ? "scrolling inverted" : "natural scrolling", gArgs.tap ? "on" : "off", gArgs.typing,
+       gArgs.gestures ? "ON" : "off (recognised for the log only)");
   thread_t thread = nullptr;
   if (kernel_thread_start(threadMain, this, &thread) != KERN_SUCCESS) {
     stage(-1, "kernel_thread_start");
@@ -817,7 +852,7 @@ void PianoKeyboard::armIrq()
 bool PianoKeyboard::publish()
 {
   for (unsigned k = 0; k < 2; ++k) {
-    const Kind kind = Kind(k);
+    const Kind kind = k ? Kind::touchpad : Kind::keyboard;
     PianoKeyboardHID *hid = OSTypeAlloc(PianoKeyboardHID);
     if (hid) {
       hid->fKind = kind;
@@ -843,8 +878,8 @@ bool PianoKeyboard::publish()
     }
     fHid[k] = hid;
     note("HID device %s: vendor %#x product %#x, usage %#x/%#x, %u-byte descriptor, registry ID %#llx", deviceInfo(kind).product,
-         kVendorId, kProductId, deviceInfo(kind).usagePage, deviceInfo(kind).usage, deviceInfo(kind).descriptorBytes,
-         hid->getRegistryEntryID());
+         kVendorId, kProductId, deviceInfo(kind).usagePage, deviceInfo(kind).usage,
+         k ? gTouchpad.length : deviceInfo(kind).descriptorBytes, hid->getRegistryEntryID());
   }
   if (OSDictionary *matching = IOService::serviceMatching("IOHIDEventService")) {
     fPublished = IOService::addMatchingNotification(gIOFirstPublishNotification, matching, eventServicePublished, this, nullptr);
@@ -872,7 +907,7 @@ void PianoKeyboard::ledRequest(void *self, uint8_t leds)
 
 IOReturn PianoKeyboard::send(Kind kind, const uint8_t *bytes, unsigned length)
 {
-  PianoKeyboardHID *hid = fHid[unsigned(kind)];
+  PianoKeyboardHID *hid = fHid[kind == Kind::keyboard ? 0 : 1];
   if (!hid) return kIOReturnNotReady;
   IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(bytes, length, kIODirectionNone);
   const IOReturn rc = report ? hid->handleReport(report) : kIOReturnNoMemory;
@@ -890,9 +925,10 @@ void PianoKeyboard::releaseAll()
   Pointer::release(pointer);
   send(Kind::keyboard, keyboard, sizeof keyboard);
   send(Kind::keyboard, consumer, sizeof consumer);
-  send(Kind::pointer, pointer, sizeof pointer);
+  send(Kind::touchpad, pointer, sizeof pointer);
   fPointer.reset();
   fKeyFilter.reset();
+  memset(fLastKeys + 1, 0, kKeyboardBytes - 1);
 }
 
 // ------------------------------------------------------------------------------------------------------------------ step 6
@@ -1023,6 +1059,9 @@ void PianoKeyboard::dispatch(const Report &r)
     if (!fAttached) coverAttached(true, "a key report without an attach message");
     uint8_t out[kKeyboardBytes];
     const uint32_t rollovers = fKeyFilter.rollovers();
+    const uint64_t now = nowMs();
+    if (Keys::newKey(fLastKeys, r.bytes)) fPointer.keyTyped(now);   // the typing guard
+    memcpy(fLastKeys, r.bytes, kKeyboardBytes);
     fKeyFilter.filter(r.bytes, out);
     const bool rollover = fKeyFilter.rollovers() != rollovers, changed = memcmp(out, r.bytes, kKeyboardBytes) != 0;
     const IOReturn rc = send(Kind::keyboard, out, kKeyboardBytes);
@@ -1047,16 +1086,32 @@ void PianoKeyboard::dispatch(const Report &r)
     ++fTouch;
     if (show && (fTouch <= 120 || fTouch % 25 == 0)) note("touch %u: %s", fTouch, hex(r.bytes, r.length, line, sizeof line));
     uint8_t out[2][kPointerBytes];
-    const unsigned n = fPointer.touch(r.bytes, nowMs(), out);
+    const uint64_t now = nowMs();
+    const unsigned n = fPointer.touch(r.bytes, now, out);
     for (unsigned i = 0; i < n; ++i) {
-      const IOReturn rc = send(Kind::pointer, out[i], kPointerBytes);
+      const IOReturn rc = send(Kind::touchpad, out[i], kPointerBytes);
       if (fHid[1] && ++fPointerSent <= 3) note("pointer report %u to macOS: %s", fPointerSent, rc ? "handleReport FAILED" : "handleReport ok");
+    }
+    // A three-finger swipe (piano-keyboard-gestures=1): Control + the arrow through the keyboard device.
+    const Swipe swipe = fPointer.takeSwipe();
+    if (swipe != Swipe::none) {
+      uint8_t keys[4][kKeyboardBytes];
+      const unsigned k = fKeyFilter.shortcut(swipeUsage(swipe), keys);
+      IOReturn rc = kIOReturnSuccess;
+      for (unsigned i = 0; i < k; ++i) {
+        const IOReturn one = send(Kind::keyboard, keys[i], kKeyboardBytes);
+        if (one != kIOReturnSuccess) rc = one;
+      }
+      if (++fSwipesSent <= 50 || fSwipesSent % 20 == 0)
+        note("gesture %u: three-finger swipe %s: %s", fSwipesSent, swipeName(swipe), fHid[0] ? (rc ? "handleReport FAILED" : "sent") : "level 1: not sent");
     }
     Gesture g;
     if (fPointer.takeGesture(&g) && (fPointer.gestures() <= 100 || fPointer.gestures() % 20 == 0))
-      note("touch gesture %u: %u finger%s, %u ms, (%d,%d) -> (%d,%d), travel %u, %u moves, %u scrolls%s%s", fPointer.gestures(), g.most,
-           g.most == 1 ? "" : "s", g.ms, g.x0, g.y0, g.x1, g.y1, g.travel, g.moves, g.scrolls, g.pressed ? ", pressed" : "",
-           g.tap ? (g.most >= 2 ? ", TAP (right click)" : ", TAP (left click)") : "");
+      note("touch gesture %u: %u finger%s, %u ms, (%d,%d) -> (%d,%d), travel %u, %u moves, %u scrolls%s%s%s%s%s", fPointer.gestures(),
+           g.most, g.most == 1 ? "" : "s", g.ms, g.x0, g.y0, g.x1, g.y1, g.travel, g.moves, g.scrolls, g.pressed ? ", pressed" : "",
+           g.tap == 1 ? ", TAP (left click)" : g.tap == 2 ? ", TAP (right click)" : g.tap == 4 ? ", TAP (middle click)" : "",
+           g.typing ? ", ignored (typing)" : "", g.swipe != Swipe::none ? ", three-finger swipe " : "",
+           g.swipe != Swipe::none ? swipeName(g.swipe) : "");
     return;
   }
   case kIdMouse: {
@@ -1065,7 +1120,7 @@ void PianoKeyboard::dispatch(const Report &r)
     if (!gArgs.mouse || fTouchSeen) return;
     uint8_t out[kPointerBytes];
     Pointer::mouse(r.bytes, out);
-    send(Kind::pointer, out, kPointerBytes);
+    send(Kind::touchpad, out, kPointerBytes);
     return;
   }
   default: break;
@@ -1156,10 +1211,11 @@ void PianoKeyboard::serve()
 void PianoKeyboard::describe(uint64_t seconds)
 {
   note("alive at %llu s: %s, %u reads (%u frames, %u empty, %u errors, %u bad, %u checksum mismatches), %u edges%s, %u level reads, irq high in %u of %u "
-       "polls; keys %u (rollovers %u), consumer %u, touch %u (gestures %u, taps %u), mouse %u, vendor %u (accel %u, auth %u, acks "
-       "%u), attaches %u; %u commands (%u failed), %u reports to macOS (%u failed); irq %u status %u; hall %s",
+       "polls; keys %u (rollovers %u), consumer %u, touch %u (gestures %u, taps %u, swipes %u sent %u), mouse %u, vendor %u (accel %u, "
+       "auth %u, acks %u), attaches %u; %u commands (%u failed), %u reports to macOS (%u failed); irq %u status %u; hall %s; poll %s",
        seconds, fAttached ? "attached" : "no cover", fReads, fFrames, fEmpty, fReadErrors, fBadFrames, fSumBad, fEdges,
        fEdgeSeen ? "" : " (none yet: polled every 100 ms)", fLevelReads, fIrqHigh, fPolls, fKeys, fKeyFilter.rollovers(), fConsumer,
-       fTouch, fPointer.gestures(), fPointer.taps(), fMouse, fVendor, fAccel, fAuth, fAcks, fAttaches, fCommands, fCommandErrors,
-       fSent, fSendErrors, level(kIrq), level(kStatus), fHall < 0 ? "not read" : fHall ? "open" : "closed");
+       fTouch, fPointer.gestures(), fPointer.taps(), fPointer.swipes(), fSwipesSent, fMouse, fVendor, fAccel, fAuth, fAcks, fAttaches,
+       fCommands, fCommandErrors, fSent, fSendErrors, level(kIrq), level(kStatus), fHall < 0 ? "not read" : fHall ? "open" : "closed",
+       "4 ms");
 }

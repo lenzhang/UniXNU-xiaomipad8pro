@@ -3,8 +3,14 @@
 //   keyboard  the cover's keyboard (report 5, sent as the controller sends it: modifiers, a reserved byte, six usages 0..0xff; the
 //             Num/Caps/Scroll/Compose/Kana LEDs as output report 5, of which Caps Lock goes to the controller) and its consumer keys
 //             (report 6: one 16-bit usage 0..0x3ff, the first three bytes of the controller's 5-byte report)
-//   pointer   the touchpad as a relative mouse (Wn8030Piano.h Pointer): three buttons, X and Y as signed 16-bit counts, the wheel and
-//             AC Pan as signed bytes; no report ID. macOS takes HID pointers, not a touchpad's finger collections.
+//   pointer   a relative mouse: three buttons, X and Y as signed 16-bit counts, the wheel and AC Pan as signed bytes; no report ID.
+//             macOS takes HID pointers, not a touchpad's finger collections. PianoDwc3's USB pointer uses it as it is.
+//   touchpad  the same 7-byte report for the cover's touchpad (Wn8030Piano.h Pointer), with physical extents, so that macOS knows the
+//             counts' size: IOHIDEventService::determineResolution takes (logical range) / (physical range x 10^exponent) of the
+//             relative X element as HIDPointerResolution (counts per inch; 400 without extents) and of the Wheel as
+//             HIDScrollResolution (9 without), and its pointer and scroll accelerators work in those units. IOHIDEventDriver reads
+//             Wheel and AC Pan as whole counts and has no Resolution Multiplier, so smooth scrolling is finer counts with a
+//             correspondingly higher declared scroll resolution (makeTouchpadDescriptor).
 // Written for piano from the HID 1.11 specification and the HID Usage Tables (pages 0x01, 0x07, 0x08, 0x09, 0x0C).
 #ifndef PIANO_KEYBOARD_HID_DESCRIPTORS_H
 #define PIANO_KEYBOARD_HID_DESCRIPTORS_H
@@ -17,7 +23,7 @@ namespace pianokeyboard {
 // IOHIDEventDriver personality matches the pair.
 constexpr uint32_t kVendorId = 0x1af4, kProductId = 0x504b;
 
-enum class Kind : uint8_t { keyboard, pointer };
+enum class Kind : uint8_t { keyboard, pointer, touchpad };
 
 constexpr uint8_t kKeyboardDescriptor[] = {
   0x05, 0x01,         // Usage Page (Generic Desktop)
@@ -109,6 +115,55 @@ constexpr uint8_t kPointerDescriptor[] = {
   0xc0,               // End Collection
 };
 
+// The touchpad's descriptor: kPointerDescriptor's report with Physical Minimum/Maximum, Unit (inch) and Unit Exponent on X/Y
+// (exponent -2) and the Wheel (exponent -3), chosen so that determineResolution's integer quotient is exactly `dpi` and
+// `scrollResolution` (counts per inch). dpi is clamped to 120..4000, scrollResolution to 10..900 (inside those the physical extents
+// never equal the logical ones, which would make macOS ignore them); scrollResolution 0 declares none (macOS's default 9). The
+// AC Pan inherits the Wheel's extents (macOS reads only the Wheel's).
+struct TouchpadDescriptor {
+  uint8_t bytes[112];
+  unsigned length;
+};
+constexpr uint32_t touchpadDpi(uint32_t dpi) { return dpi < 120 ? 120 : dpi > 4000 ? 4000 : dpi; }
+constexpr uint32_t touchpadScrollResolution(uint32_t r) { return !r ? 0 : r < 10 ? 10 : r > 900 ? 900 : r; }
+constexpr TouchpadDescriptor makeTouchpadDescriptor(uint32_t dpi, uint32_t scrollResolution)
+{
+  TouchpadDescriptor d = {};
+  unsigned n = 0;
+  auto item = [&](uint8_t tag, int32_t value, unsigned size) {   // a short item of 1, 2 (or 0) data bytes
+    d.bytes[n++] = uint8_t(tag | (size == 2 ? 2 : size));
+    for (unsigned i = 0; i < size; ++i) d.bytes[n++] = uint8_t(uint32_t(value) >> (8 * i));
+  };
+  dpi = touchpadDpi(dpi);
+  scrollResolution = touchpadScrollResolution(scrollResolution);
+  const int32_t xy = int32_t(6553400 / (2 * dpi));                                     // 65534 x 100 / (2P) = dpi
+  const int32_t wheel = scrollResolution ? int32_t(254000 / (2 * scrollResolution)) : 127;   // 254 x 1000 / (2P) = resolution
+  item(0x04, 0x01, 1); item(0x08, 0x02, 1); item(0xa0, 0x01, 1);          // Usage Page (GD), Usage (Mouse), Collection (Application)
+  item(0x08, 0x01, 1); item(0xa0, 0x00, 1);                               //   Usage (Pointer), Collection (Physical)
+  item(0x04, 0x09, 1); item(0x18, 0x01, 1); item(0x28, 0x03, 1);          //     Usage Page (Button), Usage Minimum (1), Maximum (3)
+  item(0x14, 0x00, 1); item(0x24, 0x01, 1); item(0x74, 0x01, 1); item(0x94, 0x03, 1);
+  item(0x80, 0x02, 1);                                                    //     Input (Data, Variable, Absolute): 3 buttons
+  item(0x74, 0x05, 1); item(0x94, 0x01, 1); item(0x80, 0x01, 1);          //     Input (Constant): 5 bits
+  item(0x04, 0x01, 1); item(0x08, 0x30, 1); item(0x08, 0x31, 1);          //     Usage Page (GD), Usage (X), Usage (Y)
+  item(0x14, -32767, 2); item(0x24, 32767, 2);                            //     Logical -32767..32767
+  item(0x34, -xy, 2); item(0x44, xy, 2);                                  //     Physical -P..P
+  item(0x64, 0x13, 1); item(0x54, 0x0e, 1);                               //     Unit (inch), Unit Exponent (-2)
+  item(0x74, 0x10, 1); item(0x94, 0x02, 1); item(0x80, 0x06, 1);          //     16 bits x 2, Input (Data, Variable, Relative)
+  item(0x08, 0x38, 1);                                                    //     Usage (Wheel)
+  item(0x14, -127, 1); item(0x24, 127, 1);                                //     Logical -127..127
+  item(0x34, -wheel, 2); item(0x44, wheel, 2); item(0x54, 0x0d, 1);       //     Physical -W..W, Unit Exponent (-3)
+  item(0x74, 0x08, 1); item(0x94, 0x01, 1); item(0x80, 0x06, 1);          //     8 bits, Input (Data, Variable, Relative)
+  item(0x04, 0x0c, 1); d.bytes[n++] = 0x0a; d.bytes[n++] = 0x38; d.bytes[n++] = 0x02;   //     Usage Page (Consumer), Usage (AC Pan)
+  item(0x74, 0x08, 1); item(0x94, 0x01, 1); item(0x80, 0x06, 1);          //     8 bits, Input (Data, Variable, Relative)
+  d.bytes[n++] = 0xc0; d.bytes[n++] = 0xc0;                               //   End Collection, End Collection
+  d.length = n;
+  return d;
+}
+// The defaults: 400 dpi declared for 865 sent (Wn8030Piano.h PointerConfig: 2.2 times a 400-dpi mouse's travel at the same
+// acceleration, for a 94 mm pad), and 90 scroll counts per inch for ten counts per former wheel step.
+constexpr uint32_t kTouchpadDpi = 400, kTouchpadScrollResolution = 90;
+constexpr TouchpadDescriptor kTouchpadDefault = makeTouchpadDescriptor(kTouchpadDpi, kTouchpadScrollResolution);
+
 struct DeviceInfo {
   const char *product;
   uint32_t usagePage, usage;
@@ -117,7 +172,8 @@ struct DeviceInfo {
 };
 constexpr DeviceInfo kDevices[] = {
   {"Piano Keyboard Cover", 0x01, 0x06, kKeyboardDescriptor, sizeof kKeyboardDescriptor},    // Kind::keyboard
-  {"Piano Keyboard Touchpad", 0x01, 0x02, kPointerDescriptor, sizeof kPointerDescriptor},   // Kind::pointer
+  {"Piano Keyboard Touchpad", 0x01, 0x02, kPointerDescriptor, sizeof kPointerDescriptor},   // Kind::pointer (PianoDwc3's)
+  {"Piano Keyboard Touchpad", 0x01, 0x02, kTouchpadDefault.bytes, kTouchpadDefault.length},  // Kind::touchpad (PianoKeyboard's)
 };
 inline const DeviceInfo &deviceInfo(Kind kind) { return kDevices[unsigned(kind)]; }
 
