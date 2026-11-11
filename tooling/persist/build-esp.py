@@ -18,7 +18,7 @@ profile's and --arg's additions. Entries:
   fastboot     the seed, no UFS root, data-persist=0, no pstore console (the last run's log stays): reset into ABL fastboot after 1 s
   reset, shutdown, tools
   build-esp.py --profile base|softgpu|gpu|daily [--default macos|macos-diag] [--arg NAME=VALUE ...] [--rtc-offset N|sdam] [--from REPO]
-               [--fast-boot 0|1|2] [--boot-guard SECS] [--replace-data [1|HEX8]] [--flatten-data] [--sensor-pack PACK]
+               [--fast-boot 0|1|2] [--deny-exec PATH ...] [--boot-guard SECS] [--replace-data [1|HEX8]] [--flatten-data] [--sensor-pack PACK]
                [--audio-preset FSM [--audio-preset-any]]
                [--firmware-dir DIR] [--allow-missing-firmware]
                [--kc K --adt A --trust T|base --seed S|base] [--layer DIR] [--name esp-diag] [--out out/persistent]
@@ -43,6 +43,9 @@ The clock (docs/drivers/rtc.md, docs/k27-userland-args.md): droidvm-utc=<--utc> 
 when the calendar is still near 1970. --rtc-offset N (measured once: tooling/native/rtc-offset.py) adds piano-rtc=1
 piano-rtc-offset=N, --rtc-offset sdam only piano-rtc=1 (the offset from the PMIC's SDAM cell): the kernel (k27 0060, checked in the collection) then starts the calendar from the
 PMIC RTC, settime.sh sees a set clock and leaves it, and droidvm-utc only matters when the RTC gives no date.
+--deny-exec PATH (repeatable; docs/power.md 1.2, docs/boot-time.md section 4): k27-deny-exec for PATH too, in one argument with the
+kernel's default mobileactivationd and --fast-boot 2's watchdogd: launchd's spawn of that job then fails (retried, throttled), e.g.
+--deny-exec /usr/libexec/PerfPowerServices. Explicit, as --fast-boot: build-ram-images.py's PIANO_DENY_EXEC is never read here.
 The boot guard (docs/boot-guard.md, k27 0063): --boot-guard SECS adds piano-boot-guard=SECS to the macos entries (the daily profile
 has it at 180 s unless --boot-guard 0): every boot of the installed system holds the Gunyah watchdog from the start, with the PMIC
 restart reason bootloader until it is healthy at SECS s (launchd has run, every CPU takes interrupts), normal after. A hang or panic
@@ -316,6 +319,8 @@ def args_of(a, profile, utc):
     # --fast-boot N: build-ram-images.py's PIANO_FAST_BOOT=N (docs/boot-time.md), given here explicitly so that an environment
     # variable left set for a RAM test never changes an installed ESP.
     base = ram.fast_boot(base, extra, a.fast_boot)
+    # --deny-exec PATH: k27-deny-exec with the kernel's default (and --fast-boot 2's watchdogd) plus PATH, one argument
+    base = ram.deny_exec(base, extra, getattr(a, 'deny_exec', None) or [])
     base = [x for x in base if x.split('=', 1)[0] not in names] + extra
     base += ['data-persist=2', f'droidvm-utc={utc}']
     store = store_args(a)
@@ -466,6 +471,9 @@ def main():
     p.add_argument('--fast-boot', type=int, choices=(0, 1, 2), default=0,
                    help='build-ram-images.py PIANO_FAST_BOOT: 1 no -v (no console text drawn) and no droidvm-disable-jobs; '
                    '2 also k27-deny-exec for watchdogd (docs/boot-time.md)')
+    p.add_argument('--deny-exec', action='append', default=[], metavar='PATH',
+                   help='k27-deny-exec for PATH too (repeatable), with the kernel\'s default mobileactivationd and --fast-boot 2\'s '
+                   'watchdogd: e.g. /usr/libexec/PerfPowerServices (docs/power.md 1.2)')
     p.add_argument('--boot-guard', type=int, metavar='SECS',
                    help='piano-boot-guard=SECS on the macos entries (k27 0063, docs/boot-guard.md): the watchdog held from the start, '
                    'the restart reason bootloader until healthy at SECS s; 0 none. Default: the profile\'s (daily 180, others none)')
@@ -597,7 +605,8 @@ def main():
         'status': 'OFFLINE_BUILD_NOT_DEVICE_TESTED', 'image': image.name, 'bytes': image.stat().st_size, 'sha256': common.sha(image),
         'partition': {'lun': 0, 'index': common.ESP_INDEX + 1, 'first_lba': common.ESP_FIRST, 'blocks': common.ESP_BLOCKS,
                       'dd': f'bs=1M seek={common.ESP_FIRST * common.LBA >> 20} count={common.ESP_BLOCKS * common.LBA >> 20}'},
-        'profile': a.profile, 'about': profile['about'], 'extra_args': a.arg, 'fast_boot': a.fast_boot, 'default': a.default,
+        'profile': a.profile, 'about': profile['about'], 'extra_args': a.arg, 'fast_boot': a.fast_boot, 'deny_exec': a.deny_exec,
+        'default': a.default,
         'timeout': a.timeout,
         'utc': a.utc, 'rtc_offset': a.rtc_offset, 'kc_has_rtc_calendar': kc_rtc, 'boot_guard': guard,
         'kc_has_boot_guard': kc_guard, 'cmdlines': lines,

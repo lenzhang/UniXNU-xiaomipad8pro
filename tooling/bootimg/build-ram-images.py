@@ -31,6 +31,9 @@ by the kexts' build scripts) after their size and SHA-256 are checked. The paylo
 payload has the addon: the input ADT's (made with --addon for PIANO_SENSOR_PACK), or added to the payload's copy when only firmware
 is carried. A collection without pins adds nothing, so the image is as before. PIANO_FW_ADDON=1 carries the firmware (default 0 until proven on the tablet: the kexts
 then read the tablet's ESP); a pin whose file is not staged is left out with a note.
+PIANO_DENY_EXEC=PATH[,PATH...] (docs/power.md 1.2): those executables are denied (k27-deny-exec, with the kernel's default
+mobileactivationd and PIANO_FAST_BOOT=2's watchdogd in the same argument), e.g. /usr/libexec/PerfPowerServices for a test image
+without the daemon that spun a core in every boot of 2026-11-12. launchd keeps retrying the job, throttled.
 """
 import argparse
 import hashlib
@@ -133,6 +136,41 @@ def fast_boot(args, extra=(), level=None):
             raise SystemExit('PIANO_FAST_BOOT=2 denies watchdogd: it needs panic_on_crash_disabled=1 too')
         out.append(FAST_BOOT_DENY_EXEC)
     return out
+
+
+# k27-deny-exec (k27 0035): exec of each listed path fails with EPERM, so launchd's spawn of that job fails (its xpcproxy exits 78) and
+# launchd retries it, throttled (about every 10 s for a KeepAlive job). The kernel's own list is mobileactivationd; setting the argument
+# replaces it, so every list here starts with it. The value is at most 255 bytes (the kernel's 256-byte buffer).
+KERNEL_DENY_EXEC = '/usr/libexec/mobileactivationd'
+DENY_EXEC_MAX = 255
+
+
+def deny_exec(args, extra=(), paths=()):
+    """ARGS with PATHS (absolute executable paths: PIANO_DENY_EXEC's for a RAM image, build-esp.py --deny-exec's for an ESP) added to
+    their k27-deny-exec (fast boot 2's, else a new one with the kernel's default), as one argument. A k27-deny-exec in EXTRA (the
+    arguments added after ARGS) is the caller's own list: then PATHS must be empty. docs/boot-time.md section 4, docs/power.md 1.2."""
+    paths = [p for p in paths if p]
+    if not paths:
+        return list(args)
+    if any(x.startswith('k27-deny-exec=') for x in extra):
+        raise SystemExit('k27-deny-exec in the extra arguments and a deny list (PIANO_DENY_EXEC / --deny-exec): give one of them')
+    for path in paths:
+        if not re.fullmatch(r'/[A-Za-z0-9._/+-]+', path) or '/../' in path or path.endswith('/'):
+            raise SystemExit(f'deny list: {path!r} is not an absolute executable path (no commas, spaces or quotes)')
+    found = [x for x in args if x.startswith('k27-deny-exec=')]
+    listed = found[0].split('=', 1)[1].split(',') if found else [KERNEL_DENY_EXEC]
+    for path in paths:
+        if path not in listed:
+            listed.append(path)
+    value = ','.join(listed)
+    if len(value) > DENY_EXEC_MAX:
+        raise SystemExit(f'k27-deny-exec={value}: {len(value)} bytes, the kernel takes at most {DENY_EXEC_MAX}')
+    return [x for x in args if not x.startswith('k27-deny-exec=')] + [f'k27-deny-exec={value}']
+
+
+def deny_exec_env():
+    """PIANO_DENY_EXEC: comma- or space-separated paths for a RAM test image (never read by build-esp.py)."""
+    return [p for p in re.split(r'[\s,]+', os.environ.get('PIANO_DENY_EXEC', '')) if p]
 
 
 def persist_common():
@@ -338,7 +376,8 @@ def macos_payload(work, kc, trust, seed, adt, utc):
         raise SystemExit(f'PIANO_EXTRA_ARGS: {", ".join(sorted(store))}: use PIANO_DATA_PERSIST / PIANO_DATA_STORE_REPLACE / '
                          'PIANO_DATA_STORE_FLATTEN (checked against the installed seed, docs/data-store.md)')
     persist, store_record = data_store_args(seed, kc)
-    base = [x for x in fast_boot(K27_ARGS, extra) if not x.startswith('data-persist=')] + persist + [f'droidvm-utc={utc}'] + extra
+    base = deny_exec(fast_boot(K27_ARGS, extra), extra, deny_exec_env())
+    base = [x for x in base if not x.startswith('data-persist=')] + persist + [f'droidvm-utc={utc}'] + extra
     one = ' '.join(base + ['cpus=1'])
     smp = ' '.join(base + ['sheng-smp=1'])
     for line in (one, smp):
@@ -358,6 +397,7 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     image = work / 'payload-macos.img'
     payload(stage, image, 'PIANOESP', size_mib)
     return image, {'cmdline_1cpu': one, 'cmdline_8cpu': smp, 'payload_mib': size_mib, 'fast_boot': fast_boot_level(),
+                   'deny_exec': deny_exec_env(),
                    'data_store': store_record, 'sensor_pack': sensor_pack, 'firmware': firmware}
 
 
