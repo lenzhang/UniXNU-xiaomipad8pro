@@ -1,0 +1,1103 @@
+From 4ec78cc87332975153f3ed6349f4c462f561bc0c Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Wed, 11 Nov 2026 14:41:48 +0800
+Subject: [PATCH 61/62] k27: piano-cpuidle=N: the idle loop's WFI becomes a
+ PSCI CPU_SUSPEND vote (CPU, cluster, CPU subsystem) when it fits
+
+Under Gunyah the HLOS's WFI is trapped and blocks the vCPU; the physical CPU then runs Gunyah's idle WFI, and Gunyah calls
+the firmware's CPU_SUSPEND only when no vCPU of that CPU is active (a vCPU blocked in WFI is). A vCPU that calls CPU_SUSPEND
+votes for a state instead. piano's states (its Linux DT, read as data), all extended-format retention states (StateType
+clear, no local-timer-stop), so CPU_SUSPEND returns to the caller: ret 0x4 (cores 0-5 93/129/560 us, cores 6-7
+172/130/686), cl5 0x01000054 (2150/1983/9144), ss3 0x0200c354 (2800/4400/10150).
+
+- osfmk/arm64/piano_pm.c: piano-cpuidle=N (1 ret, 2 + cl5, 3 + ss3): at cpu_idle's WFI, the deepest level whose
+  min-residency fits before cpu_data rtcPop and whose exit latency fits every hold (piano_cpuidle_latency_hold, for
+  PianoTouch's DMA reads), else WFI. Domain states as Linux's cpuidle-psci-domain sends them (read as the specification):
+  only from the last CPU of the cluster / of all, the domain's param in place of the CPU's, every CPU of the domain clear of
+  its deadline; OS-initiated mode set at boot from the boot CPU when PSCI_FEATURES(CPU_SUSPEND) has bit 0
+  (piano-cpuidle-pc=1 keeps platform-coordinated); a DENIED falls back to the CPU state at once; a state rejected as
+  invalid 16 times in a row is disabled for that CPU. ss3 only with the LLCC island slice (SCID 12) reserved
+  (0x7fffffff, no bonus ways; read through the broadcast base), or piano-llcc-island-ok=1.
+- osfmk/arm64/piano_pm_policy.h: the decisions without hardware (state choice, wake sources and the wake calendar for
+  0062, the Type-C address, the PSCI and LLCC verdicts), host-tested in UniXNU-piano tooling/k27/piano-pm.
+- A probe at boot (also piano-pm-probe=1 alone): PSCI VERSION and FEATURES, the APPS RSC DRV2 id and solver bit, the
+  AOP's RPMh sleep counters (aosd, cxsd, ddr at 0xc3f0048), the LLCC island slice.
+- Counters per CPU and state in counter ticks; "piano-cpuidle: cpuN state X entries .. residency ..%" and the RPMh line
+  every piano-cpuidle-period s (60, 0 off); machdep.piano_cpuidle (string) and machdep.piano_cpuidle_level (read-write
+  up to N).
+- piano-cpuidle-pd=1 (experimental): ret requested as a power-down. Gunyah then warm-resets the vCPU at the reset vector:
+  resume_idle_cpu -> start_cpu -> arm_init_idle_cpu, XNU's power-gated idle path, where piano_cpuidle_reset_resume()
+  restores the GIC CPU interface ArmCpu set up once and reprograms the decrementer.
+- Native only (the /psci conduit must be SMC); inert without the boot argument.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bsd/dev/arm64/sysctl.c        |  44 +++
+ osfmk/arm/arm_init.c          |   8 +
+ osfmk/arm64/cpu.c             |   9 +
+ osfmk/arm64/piano_pm.c        | 670 ++++++++++++++++++++++++++++++++++
+ osfmk/arm64/piano_pm.h        |  38 ++
+ osfmk/arm64/piano_pm_policy.h | 209 +++++++++++
+ osfmk/conf/files.arm64        |   1 +
+ 7 files changed, 979 insertions(+)
+ create mode 100644 osfmk/arm64/piano_pm.c
+ create mode 100644 osfmk/arm64/piano_pm.h
+ create mode 100644 osfmk/arm64/piano_pm_policy.h
+
+diff --git a/bsd/dev/arm64/sysctl.c b/bsd/dev/arm64/sysctl.c
+index f380ae5..1b1acc3 100644
+--- a/bsd/dev/arm64/sysctl.c
++++ b/bsd/dev/arm64/sysctl.c
+@@ -110,6 +110,50 @@ SYSCTL_PROC(_machdep, OID_AUTO, wake_conttime,
+     0, 0, sysctl_wake_conttime, "I",
+     "Continuous Time at the last wakeup");
+ 
++#if defined(XNU_VM_GUEST)
++/* piano (k27 0061): the PSCI CPU idle counters (UniXNU-piano docs/power.md) */
++extern size_t piano_cpuidle_format(char *buf, size_t len);
++extern int piano_cpuidle_level(void);
++extern int piano_cpuidle_set_level(int level);
++
++static int
++sysctl_piano_cpuidle SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	const size_t len = 4096;
++	char *buf = kalloc_data(len, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	size_t n = piano_cpuidle_format(buf, len);
++	int error = SYSCTL_OUT(req, buf, n + 1);
++	kfree_data(buf, len);
++	return error;
++}
++
++SYSCTL_PROC(_machdep, OID_AUTO, piano_cpuidle,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_piano_cpuidle, "A",
++    "piano-cpuidle: entries and residency per CPU and state");
++
++static int
++sysctl_piano_cpuidle_level SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	int new_value = 0, changed = 0;
++	int error = sysctl_io_number(req, piano_cpuidle_level(), sizeof(int), &new_value, &changed);
++	if (error == 0 && changed) {
++		error = piano_cpuidle_set_level(new_value);
++	}
++	return error;
++}
++
++SYSCTL_PROC(_machdep, OID_AUTO, piano_cpuidle_level,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_piano_cpuidle_level, "I",
++    "piano-cpuidle: the deepest level in force (0 WFI .. the boot argument's level)");
++#endif /* defined(XNU_VM_GUEST) */
++
+ #if defined(HAS_IPI)
+ static int
+ cpu_signal_deferred_timer(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index ac1713e..6487e07 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -79,6 +79,9 @@ extern volatile unsigned long long port_crumb; /* port bring-up breadcrumb, read
+ #include <pexpert/pexpert.h>
+ 
+ #include <console/serial_protos.h>
++#if defined(XNU_VM_GUEST) && defined(__arm64__)
++#include <arm64/piano_pm.h>
++#endif
+ 
+ #if CONFIG_TELEMETRY
+ #include <kern/telemetry.h>
+@@ -904,5 +907,10 @@ arm_init_idle_cpu(
+ 
+ 	fiq_context_init(FALSE);
+ 
++#if defined(XNU_VM_GUEST) && defined(__arm64__)
++	/* piano (k27 0061): back from a power-down CPU_SUSPEND (piano-cpuidle-pd=1): the GIC CPU interface and the decrementer */
++	piano_cpuidle_reset_resume(cpu_data_ptr);
++#endif
++
+ 	cpu_idle_exit(TRUE);
+ }
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 04ecbbc..7e5fb63 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -49,6 +49,9 @@
+ #include <arm/machine_cpu.h>
+ #include <arm/rtclock.h>
+ #include <arm64/proc_reg.h>
++#if defined(XNU_VM_GUEST)
++#include <arm64/piano_pm.h>
++#endif
+ #include <mach/processor_info.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern_xnu.h>
+@@ -648,6 +651,12 @@ cpu_idle(void)
+ #if HAS_RETENTION_STATE
+ 			arm64_retention_wfi();
+ #else
++#if defined(XNU_VM_GUEST)
++			/* piano (k27 0061): piano-cpuidle=N, a PSCI CPU_SUSPEND state when the next timer is far enough off */
++			if (piano_cpuidle_on) {
++				piano_cpuidle_enter(cpu_data_ptr);
++			} else
++#endif
+ 			__builtin_arm_wfi();
+ #endif
+ 			os_atomic_add(&virt_wfi_ticks, mach_absolute_time() - before, relaxed);
+diff --git a/osfmk/arm64/piano_pm.c b/osfmk/arm64/piano_pm.c
+new file mode 100644
+index 0000000..8c5c74c
+--- /dev/null
++++ b/osfmk/arm64/piano_pm.c
+@@ -0,0 +1,670 @@
++/*
++ * Copyright (c) 2026 the UniXNU-piano authors. Modifications to XNU under the Apple Public Source License 2.0.
++ *
++ * k27 0061: piano-cpuidle=N, the idle loop through PSCI CPU_SUSPEND (UniXNU-piano docs/power.md §2).
++ *
++ * Why: under Gunyah (the hypervisor the HLOS runs under at EL1 on SM8750), the HLOS's WFI is trapped (HCR_EL2.TWI) and blocks
++ * the vCPU; the physical CPU then idles in Gunyah's idle thread, which executes a plain WFI (clock gating) and calls the
++ * firmware's CPU_SUSPEND only when no vCPU of that CPU is active, and a vCPU blocked in WFI counts as active. So XNU's WFI never
++ * reaches a retention or power-collapse state. A vCPU that calls PSCI CPU_SUSPEND votes for a state instead, and Gunyah takes
++ * the votes to the firmware. (gunyah-hypervisor, BSD-3-Clause, read as the specification: hyp/vm/vcpu/aarch64/src/wfi.c,
++ * hyp/core/idle, hyp/vm/psci*.)
++ *
++ * The states are piano's (its Linux DT, cpus/idle-states and domain-idle-states, read as data), extended StateID format,
++ * StateType (bit 30) clear in all of them: retention states, CPU_SUSPEND returns to the caller with the context intact
++ * (Gunyah returns SUCCESS; Linux calls them without saving anything); no local-timer-stop, so the arch timer wakes them.
++ *
++ *   level  name  power_state  cores 0-5 (E) entry/exit/min-residency us    cores 6-7 (P)
++ *   1      ret   0x00000004   93 / 129 / 560                                 172 / 130 / 686
++ *   2      cl5   0x01000054   2150 / 1983 / 9144 (a cluster's domain)
++ *   3      ss3   0x0200c354   2800 / 4400 / 10150 (the CPU subsystem; with no APPS vote left and the LLCC island
++ *                                                   reserved, the SoC goes on to CX collapse and DDR self-refresh)
++ *
++ * The domain states go to PSCI as Linux sends them (cpuidle-psci-domain, read as the specification): a cluster's state only
++ * from the last CPU of the cluster to idle, the system's only from the last CPU of all, the domain's param in place of the
++ * CPU's (not ORed), in OS-initiated mode, which Linux switches to at boot when PSCI_FEATURES(CPU_SUSPEND) has bit 0 (Gunyah's
++ * HLOS gets 3). Here: OSI is set at boot (PSCI_SET_SUSPEND_MODE from the boot CPU before any CPU_SUSPEND) for N >= 2 unless
++ * piano-cpuidle-pc=1; this CPU's next timer deadline and its cluster's (or every CPU's) must leave the state's min-residency;
++ * a DENIED (another CPU woke) falls back to the CPU state at once. Level 3 needs the LLCC island slice reserved
++ * (piano_llcc_island_ok). A state PSCI rejects as invalid 16 times in a row is disabled for that CPU.
++ *
++ * Choice: the deepest enabled level up to piano-cpuidle=N whose min-residency fits before the CPU's next timer deadline
++ * (cpu_data rtcPop, what XNU programmed the decrementer with) and whose exit latency fits every latency hold
++ * (piano_cpuidle_latency_hold: PianoTouch's DMA reads, 2000 us), else WFI.
++ *
++ * piano-cpuidle-pd=1 (experimental) asks for the CPU state as a power-down (StateType set). Gunyah then restarts the vCPU at the
++ * entry point with the MMU off (vcpu_warm_reset): the reset vector, resume_idle_cpu, start_cpu and arm_init_idle_cpu, XNU's path
++ * for power-gated idle, bring it back to cpu_idle_exit(TRUE); piano_cpuidle_reset_resume() restores what ArmCpu set up once (the
++ * GIC CPU interface) and the decrementer. The test of that path, not a saving: the DT offers no power-down state.
++ *
++ * Counters per CPU and state (entries, time in the state, in counter ticks) in machdep.piano_cpuidle, with the AOP's RPMh sleep
++ * counters (aosd, cxsd, ddr: the proof of CX collapse and DDR self-refresh); a line per CPU and the RPMh line on the console
++ * every piano-cpuidle-period seconds (60; 0 off). machdep.piano_cpuidle_level changes the level at run time, up to N.
++ */
++#include <kern/startup.h>
++#include <kern/thread_call.h>
++#include <kern/clock.h>
++#include <kern/cpu_number.h>
++#include <kern/simple_lock.h>
++#include <kern/misc_protos.h>
++#include <arm/cpu_data_internal.h>
++#include <arm/cpu_topology.h>
++#include <arm/machine_routines.h>
++#include <arm/rtclock.h>
++#include <arm64/proc_reg.h>
++#include <pexpert/pexpert.h>
++#include <machine/atomic.h>
++#include <sys/errno.h>
++#include <arm64/piano_pm.h>
++#include <arm64/piano_pm_policy.h>
++
++#if defined(XNU_VM_GUEST)
++
++extern uint32_t ml_psci_conduit;          /* k27 0053: 1 HVC, 2 SMC (the ADT's /psci method) */
++#define PIANO_CONDUIT_SMC       2
++
++#define PSCI_VERSION            0x84000000ULL
++#define PSCI_CPU_SUSPEND64      0xC4000001ULL
++#define PSCI_CPU_OFF            0x84000002ULL
++#define PSCI_FEATURES           0x8400000AULL
++#define PSCI_SYSTEM_SUSPEND64   0xC400000EULL
++#define PSCI_SET_SUSPEND_MODE   0x8400000FULL
++#define PSCI_STAT_COUNT64       0xC4000011ULL
++#define PSCI_E_INVALID          (-2)
++#define PSCI_E_DENIED           (-3)
++
++/* A PSCI or vendor-hypervisor call through the conduit; SMCCC lets the callee clobber x0-x17. */
++static uint64_t
++piano_pm_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	if (ml_psci_conduit == PIANO_CONDUIT_SMC) {
++		__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "x4", "x5", "x6", "x7", "x8", "x9", "x10",
++		    "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	} else {
++		__asm__ volatile ("hvc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "x4", "x5", "x6", "x7", "x8", "x9", "x10",
++		    "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	}
++	return x0;
++}
++
++/* The architected counter (19.2 MHz): what the idle statistics count in, unaffected by the timebase scaling and by k27 0062's
++ * move of mach_absolute_time() across a suspend. */
++static inline uint64_t
++piano_counter(void)
++{
++	__builtin_arm_isb(ISB_SY);
++	return __builtin_arm_rsr64("CNTVCT_EL0");
++}
++
++#define PIANO_IDLE_LEVELS       PIANO_PM_LEVELS
++#define piano_idle_e            piano_pm_states_e
++
++struct piano_idle_cpu {
++	const struct piano_pm_state *table;
++	uint32_t cluster_mask;                  /* the CPUs of this CPU's cluster */
++	uint64_t residency_abs[PIANO_IDLE_LEVELS];
++	uint64_t entries[PIANO_IDLE_LEVELS];
++	uint64_t ticks[PIANO_IDLE_LEVELS];      /* time in the state, counter ticks */
++	uint64_t rejected[PIANO_IDLE_LEVELS];
++	uint64_t denied[PIANO_IDLE_LEVELS];
++	uint32_t consecutive[PIANO_IDLE_LEVELS];
++	uint8_t  disabled[PIANO_IDLE_LEVELS];
++	int64_t  last_error;
++	uint64_t reset_resumes;
++	/* the summary's previous sample */
++	uint64_t seen_ticks[PIANO_IDLE_LEVELS], seen_entries[PIANO_IDLE_LEVELS], seen_at;
++	/* power-down (piano-cpuidle-pd): what the reset path restores, and the entry being accounted */
++	volatile uint32_t pd_pending;
++	uint32_t pd_level;
++	uint64_t pd_t0;
++	uint64_t icc_pmr, icc_bpr1, icc_ctlr, icc_igrpen1, icc_sre;
++	bool     ready;
++} __attribute__((aligned(128)));
++
++static struct piano_idle_cpu piano_idle[MAX_CPUS];
++
++bool piano_cpuidle_on;                     /* the idle loop calls piano_cpuidle_enter() */
++static int piano_cpuidle_max;              /* piano-cpuidle=N: the deepest level allowed */
++static _Atomic int piano_cpuidle_cur;      /* the level in force (machdep.piano_cpuidle_level) */
++static bool piano_cpuidle_pd;              /* piano-cpuidle-pd=1 */
++static uint32_t piano_cpuidle_period = 60; /* piano-cpuidle-period=S */
++static uint64_t piano_resume_pa;           /* the entry point for a power-down: the reset vector */
++static thread_call_t piano_cpuidle_call;
++
++/* The domains: the CPUs in a PSCI state (or about to enter one), their next deadlines, and the CPUs of each cluster. */
++static _Atomic uint32_t piano_idle_mask;
++static uint64_t piano_idle_until[MAX_CPUS];
++static uint32_t piano_all_mask;
++static bool piano_osi;                     /* OS-initiated mode in force */
++static int piano_osi_result = 1;           /* PSCI_SET_SUSPEND_MODE's answer (1: not asked) */
++
++/* Exit-latency holds (piano_cpuidle_latency_hold): the tightest one, in us. */
++#define PIANO_LATENCY_SLOTS     8
++static uint32_t piano_latency_slot[PIANO_LATENCY_SLOTS];
++static _Atomic uint32_t piano_latency_us = UINT32_MAX;
++static SIMPLE_LOCK_DECLARE(piano_latency_lock, 0);
++
++/* What PSCI and Gunyah said at boot (docs/power.md: the probe line). */
++static int64_t piano_psci_version = -1, piano_psci_suspend_features = -1, piano_psci_system_suspend = -1,
++    piano_psci_set_mode = -1, piano_psci_cpu_off = -1, piano_psci_stat = -1;
++
++#define ICC_PMR_EL1     "S3_0_C4_C6_0"
++#define ICC_BPR1_EL1    "S3_0_C12_C12_3"
++#define ICC_CTLR_EL1    "S3_0_C12_C12_4"
++#define ICC_SRE_EL1     "S3_0_C12_C12_5"
++#define ICC_IGRPEN1_EL1 "S3_0_C12_C12_7"
++
++/* ---- the hardware this reads (read only): the AOP's RPMh sleep counters, the APPS RSC, the LLCC island slice ---- */
++
++/*
++ * The RPMh sleep statistics in AOP message RAM (piano's Linux DT sram@c3f0000, qcom,rpmh-stats; the record layout of Linux's
++ * qcom_stats, read as data): three 32-byte records from 0x48, {u32 name ("aosd", "cxsd", "ddr"), u32 count, u64 last entered,
++ * u64 last exited, u64 accumulated}, the times in 19.2 MHz ticks. cxsd and ddr accumulating as fast as the time asleep is
++ * what CX collapse and DDR self-refresh look like (Ubuntu's pass criterion).
++ */
++#define PIANO_RPMH_STATS        0x0C3F0000ULL
++#define PIANO_RPMH_RECORDS      0x48
++#define PIANO_APPS_RSC_DRV2     0x16520000ULL
++
++static volatile uint32_t *piano_rpmh_stats;
++
++static uint64_t
++piano_rd64(volatile uint32_t *p)
++{
++	uint32_t hi, lo;
++	do {
++		hi = p[1];
++		lo = p[0];
++	} while (p[1] != hi);
++	return ((uint64_t)hi << 32) | lo;
++}
++
++static size_t
++piano_rpmh_line(char *buf, size_t len)
++{
++	if (piano_rpmh_stats == NULL) {
++		return (size_t)snprintf(buf, len, "not mapped");
++	}
++	size_t n = 0;
++	for (int r = 0; r < 3; r++) {
++		volatile uint32_t *rec = piano_rpmh_stats + (PIANO_RPMH_RECORDS + 32 * r) / 4;
++		uint32_t name = rec[0], count = rec[1];
++		uint64_t acc = piano_rd64(rec + 6);
++		uint64_t ms = acc / 19200;
++		char tag[5];
++		for (int c = 0; c < 4; c++) {
++			char ch = (char)((name >> (8 * c)) & 0xff);
++			tag[c] = ch >= 0x20 && ch < 0x7f ? ch : '.';
++		}
++		tag[4] = 0;
++		n += (size_t)snprintf(buf + n, len > n ? len - n : 0, "%s%s %u entries %llu.%03llu s", r ? ", " : "", tag, count,
++		    ms / 1000, ms % 1000);
++	}
++	return n;
++}
++
++/*
++ * The LLCC island check, before any ss3. Ubuntu on this tablet found that with the island slice's ways only as bonus ways (the
++ * upstream SM8750 table), every system sleep that reached CX collapse reset the SoC (PS_HOLD), and that reserving them (the
++ * downstream table) cured it (UniXNU-piano docs/ubuntu-history/kernel.md §2.2; the facts of its llcc-qcom change, GPL, read
++ * as data only). Natively nothing programs the LLCC slices, so the boot chain's table applies. LLCC v6 (SM8750): slice n's
++ * TRP_ATTR0 (reserved ways) at 0x41000 + 64 n and TRP_ATTR1 (bonus ways) at +8, through the broadcast base 0x26800000;
++ * ISLAND1 is SCID 12 and needs reserved ways 0x7fffffff and no bonus ways. Read only.
++ */
++#define PIANO_LLCC_BROADCAST    0x26800000ULL
++#define PIANO_LLCC_TRP_ATTR     0x41000ULL
++#define PIANO_LLCC_ISLAND1      12
++
++static int piano_llcc_island = -1;   /* -1 not read, 0 not reserved, 1 reserved */
++static uint32_t piano_llcc_res, piano_llcc_bonus;
++static uint32_t piano_llcc_override;  /* piano-llcc-island-ok=1: ss3 even so (an experiment that may reset the SoC) */
++
++static bool
++piano_llcc_island_ok(void)
++{
++	if (piano_llcc_island < 0) {
++		volatile uint32_t *trp = (volatile uint32_t *)ml_io_map(PIANO_LLCC_BROADCAST + PIANO_LLCC_TRP_ATTR, 0x1000);
++		if (trp == NULL) {
++			piano_llcc_island = 0;
++			printf("piano-pm: the LLCC broadcast window does not map: the island slice is not known to be reserved\n");
++		} else {
++			piano_llcc_res = trp[(PIANO_LLCC_ISLAND1 * 64) / 4];
++			piano_llcc_bonus = trp[(PIANO_LLCC_ISLAND1 * 64 + 8) / 4];
++			piano_llcc_island = piano_pm_llcc_island_ok(piano_llcc_res, piano_llcc_bonus);
++			printf("piano-pm: LLCC ISLAND1 (SCID 12): reserved ways %#x, bonus ways %#x: %s\n", piano_llcc_res, piano_llcc_bonus,
++			    piano_llcc_island ? "reserved, as CX collapse needs" :
++			    "NOT reserved: a CX collapse in sleep would reset the SoC (as Ubuntu found); ss3 stays off");
++		}
++		PE_parse_boot_argn("piano-llcc-island-ok", &piano_llcc_override, sizeof(piano_llcc_override));
++	}
++	return piano_llcc_island == 1 || piano_llcc_override == 1;
++}
++
++static void
++piano_pm_probe(void)
++{
++	if (piano_psci_version >= 0) {
++		return;
++	}
++	piano_psci_version = (int64_t)piano_pm_call(PSCI_VERSION, 0, 0, 0);
++	piano_psci_suspend_features = (int64_t)piano_pm_call(PSCI_FEATURES, PSCI_CPU_SUSPEND64, 0, 0);
++	piano_psci_system_suspend = (int64_t)piano_pm_call(PSCI_FEATURES, PSCI_SYSTEM_SUSPEND64, 0, 0);
++	piano_psci_set_mode = (int64_t)piano_pm_call(PSCI_FEATURES, PSCI_SET_SUSPEND_MODE, 0, 0);
++	piano_psci_cpu_off = (int64_t)piano_pm_call(PSCI_FEATURES, PSCI_CPU_OFF, 0, 0);
++	piano_psci_stat = (int64_t)piano_pm_call(PSCI_FEATURES, PSCI_STAT_COUNT64, 0, 0);
++	printf("piano-pm: PSCI version %#llx; FEATURES: CPU_SUSPEND %lld (%s StateID%s), SYSTEM_SUSPEND %lld, SET_SUSPEND_MODE %lld, "
++	    "CPU_OFF %lld, STAT_COUNT %lld\n", piano_psci_version, piano_psci_suspend_features,
++	    piano_psci_suspend_features >= 0 && (piano_psci_suspend_features & 2) ? "extended" : "original",
++	    piano_psci_suspend_features >= 0 && (piano_psci_suspend_features & 1) ? ", OS-initiated mode supported" : "",
++	    piano_psci_system_suspend, piano_psci_set_mode, piano_psci_cpu_off, piano_psci_stat);
++	volatile uint32_t *rsc = (volatile uint32_t *)ml_io_map(PIANO_APPS_RSC_DRV2, 0x1000);
++	piano_rpmh_stats = (volatile uint32_t *)ml_io_map(PIANO_RPMH_STATS, 0x1000);
++	char line[160];
++	piano_rpmh_line(line, sizeof(line));
++	printf("piano-pm: APPS RSC DRV2 id %#x, solver config %#x (hardware solver %s); RPMh sleep: %s\n", rsc ? rsc[0] : 0,
++	    rsc ? rsc[1] : 0, rsc && (rsc[1] & (1u << 24)) ? "on" : "off", line);
++}
++
++/* ---- the choice ---- */
++
++static void
++piano_idle_cpu_setup(cpu_data_t *cdp, struct piano_idle_cpu *pc)
++{
++	pc->table = cdp->cpu_cluster_type == CLUSTER_TYPE_P ? piano_pm_states_p : piano_pm_states_e;
++	for (int l = 0; l < PIANO_IDLE_LEVELS; l++) {
++		nanoseconds_to_absolutetime((uint64_t)pc->table[l].residency_us * NSEC_PER_USEC, &pc->residency_abs[l]);
++	}
++	const ml_topology_info_t *t = ml_get_topology_info();
++	pc->cluster_mask = 0;
++	for (unsigned i = 0; i < t->num_cpus; i++) {
++		if (t->cpus[i].cluster_id == cdp->cpu_cluster_id && t->cpus[i].cpu_id < MAX_CPUS) {
++			pc->cluster_mask |= 1u << t->cpus[i].cpu_id;
++		}
++	}
++	pc->seen_at = piano_counter();
++	pc->ready = true;
++}
++
++/* The earliest deadline of the CPUs in MASK (all in the idle mask); acquire after reading the mask. */
++static uint64_t
++piano_domain_until(uint32_t mask)
++{
++	uint64_t until = UINT64_MAX;
++	for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
++		if ((mask & (1u << cpu)) && os_atomic_load(&piano_idle_until[cpu], relaxed) < until) {
++			until = os_atomic_load(&piano_idle_until[cpu], relaxed);
++		}
++	}
++	return until;
++}
++
++/*
++ * The level for CPU, idle until UNTIL (abs), at most MAX; 0 is WFI (piano_pm_policy.h decides). With a level >= 1 the CPU's bit
++ * is set in the idle mask (piano_idle_do clears it after CPU_SUSPEND) and *param is the power_state.
++ */
++static int
++piano_idle_pick(struct piano_idle_cpu *pc, int cpu, int max, uint64_t now, uint64_t until, uint32_t *param)
++{
++	struct piano_pm_pick p = {
++		.table = pc->table, .residency = pc->residency_abs, .disabled = pc->disabled, .max = max, .now = now, .until = until,
++		.latency_us = os_atomic_load(&piano_latency_us, relaxed), .cluster_mask = pc->cluster_mask, .all_mask = piano_all_mask,
++		.ss3_ok = piano_llcc_island == 1 || piano_llcc_override == 1,
++	};
++	if (piano_pm_pick_cpu(&p) == 0) {
++		return 0;
++	}
++	os_atomic_store(&piano_idle_until[cpu], until, relaxed);
++	p.idle = os_atomic_or_orig(&piano_idle_mask, 1u << cpu, acq_rel) | (1u << cpu);
++	if (max >= 2 && (p.idle & p.cluster_mask) == p.cluster_mask) {
++		p.cluster_until = piano_domain_until(p.cluster_mask);
++		if (max >= 3 && (p.idle & p.all_mask) == p.all_mask) {
++			p.all_until = piano_domain_until(p.all_mask);
++		}
++	}
++	return piano_pm_pick_domain(&p, param);
++}
++
++/*
++ * Enter LEVEL (0: WFI) with interrupts masked, POWER_STATE its param; T0 the counter when the idle period started. Returns the
++ * level that was in force. ALLOW_PD: the idle loop only (a power-down comes back through cpu_idle_exit, into the idle thread).
++ */
++static int
++piano_idle_do(cpu_data_t *cdp, struct piano_idle_cpu *pc, int level, uint32_t power_state, uint64_t t0, bool allow_pd)
++{
++	const int cpu = cdp->cpu_number;
++	if (level > 0) {
++		uint32_t param = power_state;
++		if (allow_pd && piano_cpuidle_pd && level == 1) {
++			param |= PIANO_PM_POWER_DOWN;
++			pc->icc_pmr = __builtin_arm_rsr64(ICC_PMR_EL1);
++			pc->icc_bpr1 = __builtin_arm_rsr64(ICC_BPR1_EL1);
++			pc->icc_ctlr = __builtin_arm_rsr64(ICC_CTLR_EL1);
++			pc->icc_igrpen1 = __builtin_arm_rsr64(ICC_IGRPEN1_EL1);
++			pc->icc_sre = __builtin_arm_rsr64(ICC_SRE_EL1);
++			pc->pd_level = (uint32_t)level;
++			pc->pd_t0 = t0;
++			pc->pd_pending = 1;
++			__builtin_arm_dsb(DSB_SY);
++		}
++		int64_t r = (int64_t)piano_pm_call(PSCI_CPU_SUSPEND64, param, piano_resume_pa, (uint64_t)cpu);
++		if (r == PSCI_E_DENIED && level >= 2) {
++			/* OSI: a CPU of the domain was not suspended after all; this CPU's own state instead */
++			pc->denied[level]++;
++			level = 1;
++			r = (int64_t)piano_pm_call(PSCI_CPU_SUSPEND64, pc->table[1].param, piano_resume_pa, (uint64_t)cpu);
++		}
++		pc->pd_pending = 0;
++		os_atomic_andnot(&piano_idle_mask, 1u << cpu, release);
++		if (r != 0) {
++			pc->rejected[level]++;
++			pc->last_error = r;
++			if (r == PSCI_E_INVALID && ++pc->consecutive[level] >= 16) {
++				pc->disabled[level] = 1;
++			}
++			__builtin_arm_dsb(DSB_SY);
++			__builtin_arm_wfi();
++			level = 0;
++		} else {
++			pc->consecutive[level] = 0;
++		}
++	} else {
++		__builtin_arm_dsb(DSB_SY);
++		__builtin_arm_wfi();
++	}
++	pc->entries[level]++;
++	pc->ticks[level] += piano_counter() - t0;
++	return level;
++}
++
++void
++piano_cpuidle_enter(cpu_data_t *cdp)
++{
++	struct piano_idle_cpu *pc = &piano_idle[cdp->cpu_number];
++	if (__improbable(!pc->ready)) {
++		piano_idle_cpu_setup(cdp, pc);
++	}
++	const uint64_t t0 = piano_counter();
++	uint32_t param = 0;
++	int level = piano_idle_pick(pc, cdp->cpu_number, os_atomic_load(&piano_cpuidle_cur, relaxed), mach_absolute_time(),
++	    cdp->rtcPop, &param);
++	(void)piano_idle_do(cdp, pc, level, param, t0, true);
++}
++
++/* arm_init_idle_cpu, before cpu_idle_exit(TRUE): interrupts masked, the MMU and the stack back (start_cpu). */
++void
++piano_cpuidle_reset_resume(cpu_data_t *cdp)
++{
++	struct piano_idle_cpu *pc = &piano_idle[cdp->cpu_number];
++	if (!pc->pd_pending) {
++		return;
++	}
++	/* The GIC CPU interface as ArmCpu's initCPU left it; the timer was enabled again by fiq_context_init(). */
++	__builtin_arm_wsr64(ICC_SRE_EL1, pc->icc_sre);
++	__builtin_arm_isb(ISB_SY);
++	__builtin_arm_wsr64(ICC_PMR_EL1, pc->icc_pmr);
++	__builtin_arm_wsr64(ICC_BPR1_EL1, pc->icc_bpr1);
++	__builtin_arm_wsr64(ICC_CTLR_EL1, pc->icc_ctlr);
++	__builtin_arm_wsr64(ICC_IGRPEN1_EL1, pc->icc_igrpen1);
++	__builtin_arm_isb(ISB_SY);
++	ClearIdlePop(FALSE);   /* the decrementer again: its compare value did not survive the reset */
++	pc->pd_pending = 0;
++	os_atomic_andnot(&piano_idle_mask, 1u << cdp->cpu_number, release);
++	pc->reset_resumes++;
++	pc->entries[pc->pd_level]++;
++	pc->ticks[pc->pd_level] += piano_counter() - pc->pd_t0;
++}
++
++/* ---- latency holds ---- */
++
++int
++piano_cpuidle_latency_hold(uint32_t max_exit_us)
++{
++	int handle = -1;
++	simple_lock(&piano_latency_lock, LCK_GRP_NULL);
++	uint32_t tightest = UINT32_MAX;
++	for (int i = 0; i < PIANO_LATENCY_SLOTS; i++) {
++		if (handle < 0 && piano_latency_slot[i] == 0) {
++			piano_latency_slot[i] = max_exit_us ? max_exit_us : 1;
++			handle = i;
++		}
++		if (piano_latency_slot[i] != 0 && piano_latency_slot[i] < tightest) {
++			tightest = piano_latency_slot[i];
++		}
++	}
++	os_atomic_store(&piano_latency_us, tightest, release);
++	simple_unlock(&piano_latency_lock);
++	return handle;
++}
++
++void
++piano_cpuidle_latency_release(int handle)
++{
++	if (handle < 0 || handle >= PIANO_LATENCY_SLOTS) {
++		return;
++	}
++	simple_lock(&piano_latency_lock, LCK_GRP_NULL);
++	piano_latency_slot[handle] = 0;
++	uint32_t tightest = UINT32_MAX;
++	for (int i = 0; i < PIANO_LATENCY_SLOTS; i++) {
++		if (piano_latency_slot[i] != 0 && piano_latency_slot[i] < tightest) {
++			tightest = piano_latency_slot[i];
++		}
++	}
++	os_atomic_store(&piano_latency_us, tightest, release);
++	simple_unlock(&piano_latency_lock);
++}
++
++/* ---- the report ---- */
++
++static size_t
++piano_cpuidle_line(char *buf, size_t len, unsigned cpu, bool since_last)
++{
++	struct piano_idle_cpu *pc = &piano_idle[cpu];
++	uint64_t now = piano_counter();
++	uint64_t span = since_last ? now - pc->seen_at : now;
++	size_t n = 0;
++	if (!pc->ready || span == 0) {
++		return (size_t)snprintf(buf, len, "cpu%u not idle yet", cpu);
++	}
++	n += (size_t)snprintf(buf + n, len > n ? len - n : 0, "cpu%u", cpu);
++	int top = piano_cpuidle_max > 1 ? piano_cpuidle_max : 1;
++	for (int l = 0; l <= top && l < PIANO_IDLE_LEVELS; l++) {
++		uint64_t t = pc->ticks[l] - (since_last ? pc->seen_ticks[l] : 0);
++		uint64_t e = pc->entries[l] - (since_last ? pc->seen_entries[l] : 0);
++		uint64_t permille = t * 1000 / span;
++		n += (size_t)snprintf(buf + n, len > n ? len - n : 0, "%s state %s entries %llu residency %llu.%llu%%",
++		    l ? "," : "", pc->table[l].name, e, permille / 10, permille % 10);
++		if (since_last) {
++			pc->seen_ticks[l] = pc->ticks[l];
++			pc->seen_entries[l] = pc->entries[l];
++		}
++	}
++	uint64_t rejected = 0, denied = 0;
++	for (int l = 1; l < PIANO_IDLE_LEVELS; l++) {
++		rejected += pc->rejected[l];
++		denied += pc->denied[l];
++	}
++	n += (size_t)snprintf(buf + n, len > n ? len - n : 0, " (denied %llu, rejected %llu, last error %lld%s%s%s", denied, rejected,
++	    pc->last_error, pc->disabled[1] ? ", ret off" : "", pc->disabled[2] ? ", cl5 off" : "", pc->disabled[3] ? ", ss3 off" : "");
++	if (pc->reset_resumes) {
++		n += (size_t)snprintf(buf + n, len > n ? len - n : 0, ", %llu through the reset vector", pc->reset_resumes);
++	}
++	n += (size_t)snprintf(buf + n, len > n ? len - n : 0, ")");
++	if (since_last) {
++		pc->seen_at = now;
++	}
++	return n;
++}
++
++static void
++piano_cpuidle_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	char line[480];
++	unsigned max = (unsigned)ml_get_max_cpu_number();
++	for (unsigned cpu = 0; cpu <= max && cpu < MAX_CPUS; cpu++) {
++		piano_cpuidle_line(line, sizeof(line), cpu, true);
++		printf("piano-cpuidle: %s\n", line);
++	}
++	piano_rpmh_line(line, sizeof(line));
++	printf("piano-cpuidle: RPMh sleep %s\n", line);
++	uint64_t deadline;
++	clock_interval_to_deadline(piano_cpuidle_period, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(piano_cpuidle_call, deadline);
++}
++
++size_t
++piano_cpuidle_format(char *buf, size_t len)
++{
++	size_t n = (size_t)snprintf(buf, len, "level %d of %d, %s mode%s, latency limit %u us; psci version %#llx, CPU_SUSPEND "
++	    "features %lld\n", os_atomic_load(&piano_cpuidle_cur, relaxed), piano_cpuidle_max, piano_osi ? "OS-initiated" :
++	    "platform-coordinated", piano_cpuidle_pd ? ", ret as power-down" : "", os_atomic_load(&piano_latency_us, relaxed),
++	    piano_psci_version, piano_psci_suspend_features);
++	unsigned max = (unsigned)ml_get_max_cpu_number();
++	for (unsigned cpu = 0; cpu <= max && cpu < MAX_CPUS && n + 1 < len; cpu++) {
++		n += piano_cpuidle_line(buf + n, len - n, cpu, false);
++		n += (size_t)snprintf(buf + n, len > n ? len - n : 0, "\n");
++	}
++	if (n + 1 < len) {
++		n += (size_t)snprintf(buf + n, len - n, "rpmh ");
++		n += piano_rpmh_line(buf + n, len > n ? len - n : 0);
++		n += (size_t)snprintf(buf + n, len > n ? len - n : 0, "\n");
++	}
++	return n < len ? n : len - 1;
++}
++
++int
++piano_cpuidle_level(void)
++{
++	return os_atomic_load(&piano_cpuidle_cur, relaxed);
++}
++
++int
++piano_cpuidle_set_level(int level)
++{
++	if (!piano_cpuidle_on || level < 0 || level > piano_cpuidle_max) {
++		return EINVAL;
++	}
++	os_atomic_store(&piano_cpuidle_cur, level, relaxed);
++	printf("piano-cpuidle: level %d (machdep.piano_cpuidle_level)\n", level);
++	return 0;
++}
++
++/* ---- boot ---- */
++
++/* The domain bookkeeping and, for domain states, OS-initiated mode: from the boot CPU, before any other CPU runs (EARLY_BOOT). */
++static void
++piano_pm_domains_setup(int deepest)
++{
++	const ml_topology_info_t *t = ml_get_topology_info();
++	piano_all_mask = 0;
++	for (unsigned i = 0; i < t->num_cpus; i++) {
++		if (t->cpus[i].cpu_id < MAX_CPUS) {
++			piano_all_mask |= 1u << t->cpus[i].cpu_id;
++		}
++	}
++	piano_resume_pa = ml_static_vtop((vm_offset_t)&LowResetVectorBase);
++	uint32_t pc_mode = 0;
++	PE_parse_boot_argn("piano-cpuidle-pc", &pc_mode, sizeof(pc_mode));
++	if (deepest < 2 || piano_osi || piano_osi_result != 1 || pc_mode == 1) {
++		return;
++	}
++	if (!piano_pm_osi_supported(piano_psci_suspend_features) || piano_psci_set_mode < 0) {
++		printf("piano-pm: no OS-initiated mode (FEATURES %lld, SET_SUSPEND_MODE %lld): domain states as platform-coordinated votes\n",
++		    piano_psci_suspend_features, piano_psci_set_mode);
++		return;
++	}
++	piano_osi_result = (int)(int64_t)piano_pm_call(PSCI_SET_SUSPEND_MODE, 1, 0, 0);
++	piano_osi = piano_osi_result == 0;
++	printf("piano-pm: PSCI_SET_SUSPEND_MODE(OS-initiated) = %d: %s\n", piano_osi_result, piano_osi ?
++	    "the last CPU of a cluster or of the system asks for its domain's state" :
++	    "refused, domain states as platform-coordinated votes");
++}
++
++static void
++piano_cpuidle_init(void)
++{
++	uint32_t level = 0, probe = 0, pd = 0;
++	PE_parse_boot_argn("piano-cpuidle", &level, sizeof(level));
++	PE_parse_boot_argn("piano-pm-probe", &probe, sizeof(probe));
++	if (level == 0 && probe == 0) {
++		return;
++	}
++	if (ml_psci_conduit != PIANO_CONDUIT_SMC) {
++		printf("piano-pm: PSCI is not through SMC (ADT /psci): native only, piano-cpuidle stays off\n");
++		return;
++	}
++	piano_pm_probe();
++	if (probe != 0 || level >= 3) {
++		(void)piano_llcc_island_ok();
++	}
++	if (level == 0) {
++		return;
++	}
++	if (piano_psci_suspend_features < 0) {
++		printf("piano-cpuidle: PSCI_FEATURES(CPU_SUSPEND) = %lld: no CPU_SUSPEND, WFI as before\n", piano_psci_suspend_features);
++		return;
++	}
++	if (level > PIANO_IDLE_LEVELS - 1) {
++		level = PIANO_IDLE_LEVELS - 1;
++	}
++	if (level == 3 && !piano_llcc_island_ok()) {
++		level = 2;
++		printf("piano-cpuidle: level 3 refused (the LLCC island slice is not reserved): level 2\n");
++	}
++	PE_parse_boot_argn("piano-cpuidle-pd", &pd, sizeof(pd));
++	PE_parse_boot_argn("piano-cpuidle-period", &piano_cpuidle_period, sizeof(piano_cpuidle_period));
++	piano_cpuidle_pd = pd == 1;
++	piano_pm_domains_setup((int)level);
++	piano_cpuidle_max = (int)level;
++	os_atomic_store(&piano_cpuidle_cur, (int)level, relaxed);
++	printf("piano-cpuidle: level %u (%s%s%s, %s), the deepest state that fits before the next timer, else WFI%s; summary every %u s\n",
++	    level, "ret", level >= 2 ? ", cl5" : "", level >= 3 ? ", ss3" : "", piano_osi ? "OS-initiated" : "platform-coordinated",
++	    piano_cpuidle_pd ? "; ret requested as power-down (piano-cpuidle-pd=1)" : "", piano_cpuidle_period);
++	__builtin_arm_dmb(DMB_ISH);
++	piano_cpuidle_on = true;
++	if (piano_cpuidle_period != 0) {
++		piano_cpuidle_call = thread_call_allocate_with_options(piano_cpuidle_tick, NULL, THREAD_CALL_PRIORITY_KERNEL,
++		    THREAD_CALL_OPTIONS_ONCE);
++		uint64_t deadline;
++		clock_interval_to_deadline(piano_cpuidle_period, NSEC_PER_SEC, &deadline);
++		thread_call_enter_delayed(piano_cpuidle_call, deadline);
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_cpuidle_init);
++
++#else /* !defined(XNU_VM_GUEST) */
++
++size_t
++piano_cpuidle_format(char *buf, size_t len)
++{
++	return (size_t)snprintf(buf, len, "not built\n");
++}
++
++int
++piano_cpuidle_level(void)
++{
++	return 0;
++}
++
++int
++piano_cpuidle_set_level(int level __unused)
++{
++	return EINVAL;
++}
++
++int
++piano_cpuidle_latency_hold(uint32_t max_exit_us __unused)
++{
++	return -1;
++}
++
++void
++piano_cpuidle_latency_release(int handle __unused)
++{
++}
++
++#endif /* defined(XNU_VM_GUEST) */
+diff --git a/osfmk/arm64/piano_pm.h b/osfmk/arm64/piano_pm.h
+new file mode 100644
+index 0000000..0e7f830
+--- /dev/null
++++ b/osfmk/arm64/piano_pm.h
+@@ -0,0 +1,38 @@
++/*
++ * piano (k27 0061): CPU idle through PSCI CPU_SUSPEND, for the native k27 on the Xiaomi Pad 8 Pro (SM8750, EL1 under Gunyah).
++ * UniXNU-piano docs/power.md has the design, the facts it rests on and the test plan; nothing here runs unless piano-cpuidle
++ * (or piano-pm-probe) is set.
++ */
++#ifndef _ARM64_PIANO_PM_H_
++#define _ARM64_PIANO_PM_H_
++
++#include <sys/cdefs.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++
++#ifdef MACH_KERNEL_PRIVATE
++#include <arm/cpu_data_internal.h>
++
++/* The idle loop's hook (cpu_idle, interrupts masked) in place of its WFI, when piano_cpuidle_on. */
++extern bool piano_cpuidle_on;
++void piano_cpuidle_enter(cpu_data_t *cdp);
++/* arm_init_idle_cpu: a CPU back through the reset vector after a power-down CPU_SUSPEND (piano-cpuidle-pd=1). */
++void piano_cpuidle_reset_resume(cpu_data_t *cdp);
++#endif /* MACH_KERNEL_PRIVATE */
++
++__BEGIN_DECLS
++/* machdep.piano_cpuidle (string) and machdep.piano_cpuidle_level (int, read-write up to the boot argument's level) */
++size_t piano_cpuidle_format(char *buf, size_t len);
++int piano_cpuidle_level(void);
++int piano_cpuidle_set_level(int level);
++/*
++ * An exit-latency hold: while held, no idle state slower than MAX_EXIT_US to leave is entered (PianoTouch's DMA reads: 2000,
++ * which keeps the CPU subsystem out of ss3 and its 4400 us exit). Returns a handle for the release, -1 when the 8 slots are
++ * taken. Thread or interrupt context; cheap. Native kexts link it by name (the KC builder resolves kernel symbols).
++ */
++int piano_cpuidle_latency_hold(uint32_t max_exit_us);
++void piano_cpuidle_latency_release(int handle);
++__END_DECLS
++
++#endif /* _ARM64_PIANO_PM_H_ */
+diff --git a/osfmk/arm64/piano_pm_policy.h b/osfmk/arm64/piano_pm_policy.h
+new file mode 100644
+index 0000000..0815693
+--- /dev/null
++++ b/osfmk/arm64/piano_pm_policy.h
+@@ -0,0 +1,209 @@
++/*
++ * piano (k27 0061, 0062): the decisions of osfmk/arm64/piano_pm.c that touch no hardware, as plain inline C so that they are
++ * host-tested (UniXNU-piano tooling/k27/piano-pm: this file byte for byte, and test_piano_pm_policy.c). No kernel headers.
++ */
++#ifndef PIANO_PM_POLICY_H
++#define PIANO_PM_POLICY_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define PIANO_PM_LEVELS         4   /* 0 WFI, 1 ret (CPU), 2 cl5 (cluster), 3 ss3 (CPU subsystem) */
++
++struct piano_pm_state {
++	const char *name;
++	uint32_t    param;              /* PSCI power_state, extended StateID format */
++	uint32_t    entry_us, exit_us, residency_us;
++};
++
++/* piano's states (its Linux DT, idle-states and domain-idle-states): cores 0-5 (E) and cores 6-7 (P). */
++static const struct piano_pm_state piano_pm_states_e[PIANO_PM_LEVELS] = {
++	{ "wfi", 0, 0, 0, 0 },
++	{ "ret", 0x00000004, 93, 129, 560 },
++	{ "cl5", 0x01000054, 2150, 1983, 9144 },
++	{ "ss3", 0x0200c354, 2800, 4400, 10150 },
++};
++static const struct piano_pm_state piano_pm_states_p[PIANO_PM_LEVELS] = {
++	{ "wfi", 0, 0, 0, 0 },
++	{ "ret", 0x00000004, 172, 130, 686 },
++	{ "cl5", 0x01000054, 2150, 1983, 9144 },
++	{ "ss3", 0x0200c354, 2800, 4400, 10150 },
++};
++
++#define PIANO_PM_POWER_DOWN     (1u << 30)  /* StateType in the extended format */
++
++/* The inputs of one idle choice; times in one unit (the caller's), RESIDENCY per level in it. */
++struct piano_pm_pick {
++	const struct piano_pm_state *table;
++	const uint64_t *residency;
++	const uint8_t *disabled;
++	int      max;                   /* the deepest level allowed */
++	uint64_t now, until;            /* now, and this CPU's next deadline */
++	uint32_t latency_us;            /* the tightest exit-latency hold (UINT32_MAX: none) */
++	uint32_t idle;                  /* the CPUs in a PSCI state, this one included */
++	uint32_t cluster_mask, all_mask;
++	uint64_t cluster_until, all_until;   /* the earliest deadline of the cluster's CPUs, of all CPUs (when they are all idle) */
++	bool     ss3_ok;                /* the LLCC island is reserved (or overridden) */
++};
++
++static inline bool
++piano_pm_fits(uint64_t now, uint64_t until, uint64_t residency)
++{
++	return until > now && until - now >= residency;
++}
++
++/* Whether the CPU state (level 1) is worth entering: 1, else 0 (WFI). */
++static inline int
++piano_pm_pick_cpu(const struct piano_pm_pick *p)
++{
++	return p->max >= 1 && !p->disabled[1] && piano_pm_fits(p->now, p->until, p->residency[1]) &&
++	       p->table[1].exit_us <= p->latency_us ? 1 : 0;
++}
++
++/* With the CPU state chosen: the deepest domain level (1..3) and its param, as Linux's OSI domain idle sends it (the domain's
++ * param in place of the CPU's): a cluster's only when this CPU completes it, the system's only when all CPUs are idle. */
++static inline int
++piano_pm_pick_domain(const struct piano_pm_pick *p, uint32_t *param)
++{
++	*param = p->table[1].param;
++	if (p->max < 2 || (p->idle & p->cluster_mask) != p->cluster_mask || p->disabled[2] || p->table[2].exit_us > p->latency_us ||
++	    !piano_pm_fits(p->now, p->cluster_until, p->residency[2])) {
++		return 1;
++	}
++	*param = p->table[2].param;
++	if (p->max < 3 || !p->ss3_ok || (p->idle & p->all_mask) != p->all_mask || p->disabled[3] ||
++	    p->table[3].exit_us > p->latency_us || !piano_pm_fits(p->now, p->all_until, p->residency[3])) {
++		return 2;
++	}
++	*param = p->table[3].param;
++	return 3;
++}
++
++/* PSCI_FEATURES(CPU_SUSPEND): bit 1 extended StateID format, bit 0 OS-initiated mode. */
++static inline bool
++piano_pm_osi_supported(int64_t features)
++{
++	return features >= 0 && (features & 1) != 0;
++}
++
++/* The LLCC ISLAND1 slice (SCID 12) as CX collapse needs it: reserved ways 0x7fffffff, no bonus ways. */
++static inline bool
++piano_pm_llcc_island_ok(uint32_t reserved_ways, uint32_t bonus_ways)
++{
++	return reserved_ways == 0x7fffffffu && bonus_ways == 0;
++}
++
++/* ---- k27 0062: the wake sources ---- */
++
++#define PIANO_SRC_POWER         0x01
++#define PIANO_SRC_LID           0x02
++#define PIANO_SRC_USB           0x04
++#define PIANO_SRC_VOLUME_DOWN   0x08
++#define PIANO_SRC_KEYBOARD      0x10
++
++#define PIANO_PON_KPDPWR        0x80    /* PMK8550 PON INT_RT_STS: the power key */
++#define PIANO_PON_RESIN         0x40    /* volume-down */
++#define PIANO_TLMM_RAW_STATUS   0x10    /* INTR_CFG: edges latched into INTR_STATUS */
++
++/* What each source read before the suspend. */
++struct piano_pm_wake {
++	uint32_t src;                   /* the sources armed */
++	bool     power_down, volume_down, usb_attached;
++	uint32_t open_samples;
++};
++
++/* Arm the wanted sources from their first readings (an *_ok false: that source did not read). The cover wakes by opening only
++ * (armed when it reads closed: the hall line low); the keyboard's status line only with the cover open and its owner latching
++ * rising edges (raw status) with nothing latched yet; USB on any attach change. */
++static inline void
++piano_pm_wake_arm(struct piano_pm_wake *b, uint32_t wanted, bool pon_ok, uint8_t pon, bool hall_ok, uint32_t hall_io,
++    bool kbd_ok, uint32_t kbd_cfg, uint32_t kbd_status, bool usb_ok, uint8_t typec_misc)
++{
++	b->src = wanted;
++	b->open_samples = 0;
++	b->power_down = pon_ok && (pon & PIANO_PON_KPDPWR) != 0;
++	b->volume_down = pon_ok && (pon & PIANO_PON_RESIN) != 0;
++	b->usb_attached = usb_ok && (typec_misc & 1) != 0;
++	if (!pon_ok) {
++		b->src &= ~(uint32_t)(PIANO_SRC_POWER | PIANO_SRC_VOLUME_DOWN);
++	}
++	bool closed = hall_ok && (hall_io & 1) == 0;
++	if (!closed) {
++		b->src &= ~(uint32_t)PIANO_SRC_LID;
++	}
++	if (!hall_ok || closed || !kbd_ok || (kbd_cfg & PIANO_TLMM_RAW_STATUS) == 0 || (kbd_status & 1) != 0) {
++		b->src &= ~(uint32_t)PIANO_SRC_KEYBOARD;
++	}
++	if (!usb_ok) {
++		b->src &= ~(uint32_t)PIANO_SRC_USB;
++	}
++}
++
++#define PIANO_PM_WAKE_POWER_KEY    2
++#define PIANO_PM_WAKE_LID          3
++#define PIANO_PM_WAKE_USB          4
++#define PIANO_PM_WAKE_VOLUME_DOWN  5
++#define PIANO_PM_WAKE_KEYBOARD     8
++
++/* One poll's readings of the armed sources (the others are not read and their values ignored): a wake reason, else 0. The power
++ * key and volume-down wake on their press (released -> pressed), the cover after two open readings in a row. */
++static inline int
++piano_pm_wake_check(struct piano_pm_wake *b, bool pon_ok, uint8_t pon, uint32_t hall_io, uint32_t kbd_status, bool usb_ok,
++    uint8_t typec_misc)
++{
++	if ((b->src & (PIANO_SRC_POWER | PIANO_SRC_VOLUME_DOWN)) && pon_ok) {
++		bool power = (pon & PIANO_PON_KPDPWR) != 0, volume = (pon & PIANO_PON_RESIN) != 0;
++		int r = 0;
++		if ((b->src & PIANO_SRC_POWER) && power && !b->power_down) {
++			r = PIANO_PM_WAKE_POWER_KEY;
++		} else if ((b->src & PIANO_SRC_VOLUME_DOWN) && volume && !b->volume_down) {
++			r = PIANO_PM_WAKE_VOLUME_DOWN;
++		}
++		b->power_down = power;
++		b->volume_down = volume;
++		if (r != 0) {
++			return r;
++		}
++	}
++	if (b->src & PIANO_SRC_LID) {
++		if (hall_io & 1) {
++			if (++b->open_samples >= 2) {
++				return PIANO_PM_WAKE_LID;
++			}
++		} else {
++			b->open_samples = 0;
++		}
++	}
++	if ((b->src & PIANO_SRC_KEYBOARD) && (kbd_status & 1)) {
++		return PIANO_PM_WAKE_KEYBOARD;
++	}
++	if ((b->src & PIANO_SRC_USB) && usb_ok && ((typec_misc & 1) != 0) != b->usb_attached) {
++		return PIANO_PM_WAKE_USB;
++	}
++	return 0;
++}
++
++/* The charger PMIC (SID 7): a charger block is TYPE 0x02 with SUBTYPE 0x7f, 0xa8 or 0xba; its Type-C block is 0x600 above it,
++ * 0x900 for SUBTYPE 0xba..0xc4 (UniXNU-piano package/PianoPower/ChargerPmic.h). */
++static inline bool
++piano_pm_charger_kind(uint8_t type, uint8_t subtype)
++{
++	return type == 0x02 && (subtype == 0x7f || subtype == 0xa8 || subtype == 0xba);
++}
++
++static inline uint16_t
++piano_pm_typec_address(uint16_t charger, uint8_t subtype)
++{
++	return (uint16_t)(charger + (subtype >= 0xba && subtype <= 0xc4 ? 0x300 : 0) + 0x600);
++}
++
++/* The wall time at wake: the calendar (which did not count the suspend) plus the time suspended. */
++static inline void
++piano_pm_add_slept(unsigned long secs, unsigned int usecs, uint64_t slept_ns, unsigned long *out_secs, unsigned int *out_usecs)
++{
++	uint64_t total_us = (uint64_t)usecs + (slept_ns / 1000) % 1000000;
++	*out_secs = secs + (unsigned long)(slept_ns / 1000000000ULL) + (unsigned long)(total_us / 1000000);
++	*out_usecs = (unsigned int)(total_us % 1000000);
++}
++
++#endif /* PIANO_PM_POLICY_H */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index d24eea1..defcc37 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -69,6 +69,7 @@ osfmk/arm/machine_cpuid.c	standard
+ osfmk/arm/machine_routines_common.c		standard
+ osfmk/arm64/lock_ticket_pv.c		optional config_pv_ticket
+ osfmk/arm64/machine_routines.c		standard
++osfmk/arm64/piano_pm.c		standard
+ osfmk/arm64/machine_routines_asm.s	optional nos_arm_asm
+ osfmk/arm64/machine_task.c		standard
+ osfmk/arm/machine_routines_apple.c	optional nos_arm_asm
+-- 
+2.55.0
+
