@@ -780,19 +780,25 @@ uintptr_t gSmmuVa;
 
 uint32_t smmuRead(uint32_t off) { return rd32(gSmmuVa + off); }
 
+// Mapped on demand, by level 3's tail and by level 5's window (which needs it even with piano-wifi-smmu=0).
+bool mapSmmu()
+{
+  if (gSmmuVa) return true;
+  IODeviceMemory *m = IODeviceMemory::withRange(kSmmu, kSmmuBytes);
+  IOMemoryMap *map = m ? m->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+  if (m) m->release();
+  if (!map) {
+    note("SMMU: cannot map %#llx", (unsigned long long)kSmmu);
+    return false;
+  }
+  gSmmuMap = map;
+  gSmmuVa = uintptr_t(map->getVirtualAddress());
+  return true;
+}
+
 bool smmuStream(uint16_t stream)
 {
-  if (!gSmmuVa) {
-    IODeviceMemory *m = IODeviceMemory::withRange(kSmmu, kSmmuBytes);
-    IOMemoryMap *map = m ? m->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
-    if (m) m->release();
-    if (!map) {
-      note("SMMU: cannot map %#llx", (unsigned long long)kSmmu);
-      return false;
-    }
-    gSmmuMap = map;
-    gSmmuVa = uintptr_t(map->getVirtualAddress());
-  }
+  if (!mapSmmu()) return false;
   const SmmuPlan p = planSmmuStream(stream, kSmmuBytes, smmuRead);
   note("SMMU stream %#x: groups %u banks %u pages %u; %s slot %u (smr %08x s2cr %08x sctlr %08x cbar %08x cba2r %08x) -> %s bank %u%s%s",
        stream, p.groups, p.banks, p.pages, p.reuse ? "existing entry" : "free", p.slot, p.smr, p.s2cr, p.sctlr, p.cbar, p.cba2r,
@@ -881,10 +887,7 @@ iova::Plan gIovaPlan;
 
 bool iovaWindow()
 {
-  if (!gSmmuVa) {
-    note("iova: the SMMU window is not mapped");
-    return false;
-  }
+  if (!mapSmmu()) return false;
   IOBufferMemoryDescriptor *table = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
       kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), iova::kTableBytes,
       0x0000000ffffff000ull);   // 36 bits, 4 KiB aligned

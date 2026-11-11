@@ -188,6 +188,9 @@ struct WlfwClient {
   WlfwMemRegion regions[kWlfwMaxMemSegments];
   uint32_t regionCount = 0, regionBytes = 0, regionGiven = 0, memRequests = 0;
   bool memDelayed = false;
+  // The firmware does not have to wait for our answer before it speaks: an indication may arrive while the response of the step
+  // before it is still outstanding. Each of the three is remembered, and the step that waits for it then finds it already there.
+  bool pendingMemRequest = false, pendingMemReady = false, pendingFwReady = false;
   // the file being downloaded
   const char *fileName = nullptr;
   uint32_t fileBytes = 0, fileOffset = 0, segmentId = 0;
@@ -401,6 +404,8 @@ inline bool wlfwStart(WlfwClient &c, const WlfwIo &io, unsigned mode, unsigned s
 }
 
 // Enters the next step and sends its request (the steps that wait for an indication send nothing and simply stand).
+inline bool wlfwEnter(WlfwClient &c, int step);
+
 inline bool wlfwEnter(WlfwClient &c, int step)
 {
   using namespace wlfwdetail;
@@ -429,6 +434,7 @@ inline bool wlfwEnter(WlfwClient &c, int step)
       qmiU64(w, 0x27, kWlfwFeatureList);      // no PERST# pull on reset; the auxiliary microcode is supported
     });
   case kWlfwStepRespondMem:
+    c.pendingMemRequest = false;
     return request(c, kWlfwRespondMem, [&c](QmiWriter &w) { wlfwBuildRespondMem(w, c); });
   case kWlfwStepChipCap:
     return request(c, kWlfwCap, [](QmiWriter &) {});
@@ -453,10 +459,19 @@ inline bool wlfwEnter(WlfwClient &c, int step)
       qmiU8(w, 0x10, 0);                      // no hardware debugging
     });
   case kWlfwStepMemRequest:
+    if (!c.pendingMemRequest) return true;    // nothing to send: the firmware speaks next
+    c.pendingMemRequest = false;
+    return wlfwEnter(c, kWlfwStepRespondMem);
   case kWlfwStepMemReady:
+    if (!c.pendingMemReady) return true;
+    c.pendingMemReady = false;
+    return wlfwEnter(c, kWlfwStepChipCap);
   case kWlfwStepFwReady:
+    if (!c.pendingFwReady) return true;
+    c.pendingFwReady = false;
+    return wlfwEnter(c, c.mode ? kWlfwStepIni : kWlfwStepDone);
   case kWlfwStepDone:
-    return true;                              // nothing to send: the firmware speaks next
+    return true;
   default:
     fail(c, kWlfwErrState);
     return false;
@@ -570,32 +585,31 @@ inline int wlfwReceive(WlfwClient &c, const uint8_t *data, uint32_t length)
     ++c.indications;
     switch (m.message) {
     case kWlfwRequestMemInd:
-      if (c.step != kWlfwStepMemRequest) {   // it may also arrive while the host capability is still being answered
-        if (c.step != kWlfwStepHostCap) {
-          ++c.unexpected;
-          return c.step;
-        }
+      // Only after this host has said what it is (the firmware asks for memory in answer to that); the regions are read and
+      // answered out of the window at once, since a later request replaces an earlier one.
+      if (c.step < kWlfwStepHostCap) {
+        ++c.unexpected;
+        return c.step;
       }
       if (!readMemRequest(c, m)) return c.step;
-      wlfwEnter(c, kWlfwStepRespondMem);
+      c.pendingMemRequest = true;
+      if (c.step == kWlfwStepMemRequest) wlfwEnter(c, kWlfwStepMemRequest);
       return c.step;
     case kWlfwFwMemReadyInd:
-      if (c.step != kWlfwStepMemReady) {
+      if (c.step < kWlfwStepRespondMem) {
         ++c.unexpected;
         return c.step;
       }
-      wlfwEnter(c, kWlfwStepChipCap);
+      c.pendingMemReady = true;
+      if (c.step == kWlfwStepMemReady) wlfwEnter(c, kWlfwStepMemReady);
       return c.step;
     case kWlfwFwReadyInd:
-      if (c.step != kWlfwStepFwReady) {
+      if (c.step < kWlfwStepChipCap) {   // before the chip's capability nothing of the firmware's own start-up has happened
         ++c.unexpected;
         return c.step;
       }
-      if (c.mode) {
-        wlfwEnter(c, kWlfwStepIni);
-        return c.step;
-      }
-      wlfwEnter(c, kWlfwStepDone);
+      c.pendingFwReady = true;
+      if (c.step == kWlfwStepFwReady) wlfwEnter(c, kWlfwStepFwReady);
       return c.step;
     default:
       ++c.unexpected;
@@ -628,6 +642,7 @@ inline int wlfwReceive(WlfwClient &c, const uint8_t *data, uint32_t length)
     if (!resultOk(c, m)) {
       // The empty form is refused on purpose: the firmware comes back with smaller regions.
       if (!c.memDelayed) return fail(c, kWlfwErrResult), c.step;
+      c.memDelayed = false;
       wlfwEnter(c, kWlfwStepMemRequest);
       return c.step;
     }

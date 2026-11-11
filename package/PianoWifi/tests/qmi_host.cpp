@@ -303,7 +303,7 @@ struct Firmware {
   uint32_t mode = 0xffffffffu;
   bool iniSeen = false, cfgSeen = false, ready = false, memReadySent = false;
   bool refuseBoard = false, refuseHostCap = false, answerPhyCap = true;
-  bool wrongTransaction = false, earlyMemReady = false;
+  bool wrongTransaction = false, earlyMemReady = false, earlyMemRequest = false, earlyFwReady = false;
   uint32_t bigRegion = 0;              // a first memory request with one region this big
   uint32_t hostNode = 0, hostPort = 0;
 
@@ -456,6 +456,11 @@ struct Firmware {
         respond(m.transaction, m.message, 1, 0x10);
         return;
       }
+      if (earlyMemRequest) {   // the firmware asks for memory before it answers: the client must keep the request
+        firstMemoryRequest();
+        respond(m.transaction, m.message, kQmiResultSuccess, 0);
+        return;
+      }
       respond(m.transaction, m.message, kQmiResultSuccess, 0);
       firstMemoryRequest();
       return;
@@ -491,8 +496,14 @@ struct Firmware {
         regionAddresses.push_back(address);
         regionSizes.push_back(size);
       }
+      if (earlyMemReady) {   // "the memory is ready" before the answer it follows
+        indicate(kWlfwFwMemReadyInd);
+        respond(m.transaction, m.message, kQmiResultSuccess, 0);
+        memReadySent = true;
+        return;
+      }
       respond(m.transaction, m.message, kQmiResultSuccess, 0);
-      if (!earlyMemReady) indicate(kWlfwFwMemReadyInd);
+      indicate(kWlfwFwMemReadyInd);
       memReadySent = true;
       return;
     }
@@ -562,6 +573,11 @@ struct Firmware {
       CHECK(qmiReadU8(m, 0x13, &end) && end == (total == bytes ? 1 : 0));
       qdss.append(reinterpret_cast<const char *>(data + 2), bytes);
       ++qdssSegments;
+      if (end && earlyFwReady) {   // "ready" before the answer to the last segment
+        indicate(kWlfwFwReadyInd);
+        respond(m.transaction, m.message, kQmiResultSuccess, 0);
+        return;
+      }
       respond(m.transaction, m.message, kQmiResultSuccess, 0);
       if (end) indicate(kWlfwFwReadyInd);
       return;
@@ -891,6 +907,15 @@ static void testTransport()
     CHECK(ipcrSubmitTx(h.transport, h.device.io(), unsigned(slot), 64));
   }
   CHECK(ipcrClaimTx(h.transport) < 0 && h.transport.refused == 1);
+  // A claim holds its buffer: the next claim is another one, and a claim given back is free again.
+  Host fresh;
+  fresh.bring();
+  const int first = ipcrClaimTx(fresh.transport), second = ipcrClaimTx(fresh.transport);
+  CHECK(first == 0 && second == 1 && fresh.transport.tx[0].busy && fresh.transport.tx[1].busy);
+  ipcrReleaseTx(fresh.transport, unsigned(first));
+  CHECK(!fresh.transport.tx[0].busy && ipcrClaimTx(fresh.transport) == 0);
+  // A buffer that was never claimed is not submitted.
+  CHECK(!ipcrSubmitTx(fresh.transport, fresh.device.io(), 3, 64));
 
   // An arena with no room for the rings is refused, and nothing of it is used.
   Host tiny;
@@ -1055,6 +1080,19 @@ static void testClientFaults()
     CHECK(wlfwTimedOut(h->client) == kWlfwStepStopped && h->client.error == kWlfwErrTimeout &&
           h->client.failedStep == kWlfwStepPhyCap);
     delete h;
+  }
+  {   // the three indications arriving before the answers they follow: each is kept and the waiting step finds it there
+    for (unsigned which = 0; which < 3; ++which) {
+      Host *h = linked();
+      h->firmware.earlyMemRequest = which == 0;
+      h->firmware.earlyMemReady = which == 1;
+      h->firmware.earlyFwReady = which == 2;
+      CHECK(wlfwStart(h->client, ioOf(*h), 0, 0));
+      CHECK(h->run(128) == kWlfwStepDone);
+      CHECK(h->client.error == kWlfwErrNone && h->client.unexpected == 0);
+      CHECK(!h->client.pendingMemRequest && !h->client.pendingMemReady && !h->client.pendingFwReady);
+      delete h;
+    }
   }
   {   // an indication in the wrong step is counted, never acted on
     Host *h = linked();

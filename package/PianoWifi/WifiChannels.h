@@ -192,25 +192,40 @@ inline unsigned ipcrPostRx(Ipcr &p, const MhiIo &io)
   return posted;
 }
 
-// A free outbound buffer to build a packet in (its bus address is the chip's); -1 when all four are in flight.
+// A free outbound buffer to build a packet in (its bus address is the chip's); -1 when all four are in flight. The buffer is
+// held from here until the chip's completion event frees it, so that nothing can hand out the same buffer twice — the owner
+// builds a message in it over several calls (a download reads a file into it) while the router may need one of its own.
 inline int ipcrClaimTx(Ipcr &p)
 {
   for (unsigned i = 0; i < kIpcrOutBuffers; ++i)
-    if (!p.tx[i].busy && p.tx[i].va) return int(i);
+    if (!p.tx[i].busy && p.tx[i].va) {
+      p.tx[i].busy = true;
+      p.tx[i].length = 0;
+      return int(i);
+    }
   ++p.refused;
   return -1;
 }
 
-// The claimed buffer, `length` bytes of it, on the outbound ring; one doorbell. False when the ring is full.
+// A claim the owner decided not to use.
+inline void ipcrReleaseTx(Ipcr &p, unsigned index)
+{
+  if (index < kIpcrOutBuffers) p.tx[index].busy = false;
+}
+
+// The claimed buffer, `length` bytes of it, on the outbound ring; one doorbell. False when it was not claimed or the ring is
+// full (the claim is then given back).
 inline bool ipcrSubmitTx(Ipcr &p, const MhiIo &io, unsigned index, uint32_t length)
 {
   using namespace ipcrdetail;
-  if (index >= kIpcrOutBuffers || !p.tx[index].va || p.tx[index].busy || !length || length > p.tx[index].bytes) return false;
+  if (index >= kIpcrOutBuffers || !p.tx[index].va || !p.tx[index].busy || !length || length > p.tx[index].bytes) return false;
   const uint32_t slot = p.out.wp, next = (slot + 1) % p.out.elements;
   const uint64_t rp = get64(p.out.ctx + kChanRp);
-  if (p.out.bus + uint64_t(next) * kMhiElement == rp) return false;   // the ring would look empty to the chip again
+  if (p.out.bus + uint64_t(next) * kMhiElement == rp) {   // the ring would look empty to the chip again
+    ipcrReleaseTx(p, index);
+    return false;
+  }
   element(p.out.va + slot * kMhiElement, p.tx[index].bus, length & 0xffffu, kTreTypeTransfer << 16 | kTreIeot);
-  p.tx[index].busy = true;
   p.tx[index].length = length;
   p.out.wp = next;
   const uint64_t wp = p.out.bus + uint64_t(next) * kMhiElement;
