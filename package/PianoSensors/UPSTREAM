@@ -34,9 +34,10 @@ sources (qualcomm/sensinghub, qualcomm/fastrpc), Linux and hexagonrpc read for f
       --dump made optional, the output allowed only under this repository's out/ or private/, mode 0600, the persist-registry,
       json.lst and soc0 notes; the Data-seed wording replaced.
     Test/check-pagani-sensors-host.py (only its build lines and sample dump, re-written) -> tests/run-host-tests.py.
-  Not taken (yet): SensorsCore.c/.h (the sensor manager: SUID lookups, attributes, streams, retries) and Test/core.c, Test/stack.c: they
-    depend on PaganiSensors.h's iOS kinds and PaganiAdsp's router ports; they are the template of the kext's level S2..S4
-    (docs/drivers/sensors.md section 8), derived once PianoPower's router-port API exists. SensorsHid.c, PaganiSensors*.cpp: iOS only.
+  Not taken: SensorsCore.c/.h (the sensor manager: SUID lookups, attributes, streams, retries) and Test/core.c, Test/stack.c: they
+    depend on PaganiSensors.h's iOS kinds and PaganiAdsp's router ports. Levels 3 and 4 are written here instead (SensorsClient.c,
+    SensorsStream.c) with SensorsCore's shape as the template: one request at a time, lookups then attributes, streams by SUID.
+    SensorsHid.c, PaganiSensors*.cpp: iOS only.
 
 This repository's own packages, copied because their owners do not change them for this one:
   package/PianoPower/FatVolume.c (sha256 6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779) and FatVolume.h
@@ -48,12 +49,18 @@ This repository's own packages, copied because their owners do not change them f
   The partition reader in PianoSensors.cpp is PianoWifi's WifiFirmware.c partitionRead (NativeUfs's 4096-byte block reads, one block
   cached for the ends of a range), the wait/wake pattern PianoPower's PianoAdsp.cpp waitEvents.
 
-New here (UniXNU-piano): PianoSensors.cpp (the kext: levels 1-3 on PianoPower's client contract), SensorsGuard.c/.h (the safety
+New here (UniXNU-piano): PianoSensors.cpp (the kext: levels 1-4 on PianoPower's client contract), SensorsGuard.c/.h (the safety
 governor), SensorsHealth.h (PianoPower's health report as the guard's observation), SensorsPolicy.c/.h (piano's facts, the arena check,
-the light curve, the rotation policy), SensorsClient.c/.h (level 3's SNS client: lookups and attributes), SensorsLoad.c/.h (the pack from
-the ESP), tests/piano.c and tests/load.c (their tests and the independent cross-checks), tests/qrtr_frame.h, tests/run-host-tests.py.
+the light curve, the rotation policy), SensorsClient.c/.h (level 3's SNS client: lookups and attributes), SensorsStream.c/.h (level 4's
+streams), SensorsLoad.c/.h (the pack from the ESP), tests/piano.c, tests/streams.c and tests/load.c (their tests and the independent
+cross-checks), tests/qrtr_frame.h, tests/run-host-tests.py.
 
-Specification only, no code or text taken (facts as in docs/drivers/sensors.md section 3): Linux drivers/misc/fastrpc.c and the SM8750
-devicetree (GPL-2.0, the piano kernel tree v1.1.0); linux-msm/hexagonrpc 598b591a and the Ubuntu project's seven patches to it (LGPL-3.0 /
-GPL-3.0); libssc 54dd13e3 (GPL-3.0); iio-sensor-proxy 3.9 (GPL-3.0); libqmi's SSC service description (LGPL-2.1). qualcomm/fastrpc v1.0.7
-(BSD-3-Clause) was read for its IDL's handle, method and argument numbers; no code was taken from it either.
+This repository's own code compiled in from its package (not copied): package/PianoAuto/AutoStream.c/.h (a stream's off/on rules) and
+AutoLight.c/.h (the light chain over SensorsPolicy's ps_als_step), linked into the kext for level 4; their tests run before the build.
+
+Specification only, no code or text taken (facts as in docs/drivers/sensors.md sections 3 and 5c): Linux drivers/misc/fastrpc.c and the
+SM8750 devicetree (GPL-2.0, the piano kernel tree v1.1.0); linux-msm/hexagonrpc 598b591a and the Ubuntu project's seven patches to it
+(LGPL-3.0 / GPL-3.0); libssc 54dd13e3 (GPL-3.0): its protos' message ids and fields, its enable (514 on change, 513 with a rate) and
+disable (10) requests, one QMI client per sensor; iio-sensor-proxy 3.9 (GPL-3.0); libqmi's SSC service description (LGPL-2.1); Android's
+sensor reporting modes (the light on change, the accelerometer continuous) and its sensors HAL's one client per sensor, as behaviour.
+qualcomm/fastrpc v1.0.7 (BSD-3-Clause) was read for its IDL's handle, method and argument numbers; no code was taken from it either.

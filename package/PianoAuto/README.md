@@ -7,13 +7,14 @@ on the host now.
 
 **Status: offline, host-tested code only (2026-11-11).** PianoAuto itself is not a kext and nothing has run on the tablet. The headers
 are taken in by PianoTouch (`piano-touch-rotate=1`) and PianoBacklight (`piano-backlight-auto=1`), both linked and off by default;
-`AutoStream`/`AutoLight` wait for PianoSensors' kext at its level S4. Interfaces: `sensors.md` section 5a.
+`AutoStream`/`AutoLight` are compiled into PianoSensors' kext for its level 4 (`piano-sensors=4`, `sensors.md` section 5c).
+Interfaces: `sensors.md` section 5a.
 
 | File | What | Used by |
 |---|---|---|
 | `TouchRotation.h` | the touch coordinates under a display rotation (CGDisplayRotation's degrees), latched at touch-down | PianoTouch (`piano-touch-rotate=1`) |
 | `AutoRotate.c/.h` | the rotation agent's policy over PianoSensors' `ps_rotation_step`: the cover lock and detach hold, reading back, backoff, rotations by hand, touch | piano-rotated |
-| `AutoStream.c/.h` | one sensor stream's on/off lifecycle: one request outstanding, no nested close, first events kept, re-arm, timeouts (Ubuntu's v1.1.1 fix as a rule) | PianoSensors' kext (S4) |
+| `AutoStream.c/.h` | one sensor stream's on/off lifecycle: one request outstanding, no nested close, first events kept, re-arm, timeouts, the hub's error events (Ubuntu's v1.1.1 fix as a rule) | PianoSensors' kext (S4) |
 | `AutoLight.c/.h` | the ambient light chain: the stream with the display and the lid, `ps_als_step`'s curve and smoothing, a fresh start after each off/on, targets for PianoBacklight | PianoSensors' kext (S4) |
 | `AmbientBacklight.h` | PianoBacklight's automatic mode: targets to codes, the brightness keys as a kept offset on PianoBacklight's own step ladder, manual/automatic | PianoBacklight (`piano-backlight-auto=1`) |
 | `daemon/piano-rotated.m` | the launchd agent (login window and user sessions): PianoSensors' edge and PianoKeyboard's cover in, WindowServer's own rotation out (MonitorPanel's setter by name, read back with the public `CGDisplayRotation`), PianoTouch told; inert without the boot argument `piano-rotate` | native macOS |

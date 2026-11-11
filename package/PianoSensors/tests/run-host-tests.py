@@ -10,6 +10,9 @@
   pack     the pack tool: piano's archives, soc0 allowlist, unsafe names, no pack inside a repository's tracked tree
   piano    SensorsGuard, SensorsPolicy, SensorsClient against a simulated hub, SensorsHealth (PianoPower's report), the arena check, a
            declined DSP call, and the independent cross-checks against libqmi, libssc, Linux fastrpc.c and qualcomm/fastrpc
+  streams  level 4: SensorsStream over PianoAuto's AutoStream and AutoLight (compiled from their package) against a simulated hub
+           with the service's message shapes: the requests byte for byte, the light and the accelerometer, off/on cycles, the
+           guard, a strike, a sleep, generations, the level-3 list feeding the streams
   load     SensorsLoad + FatVolume on a FAT32 image made by mtools as build-esp.py makes the ESP (skipped without mtools)
   kernel   every portable file compiles freestanding with AArch64 general registers only (no C library, no floating point)
 
@@ -32,8 +35,9 @@ HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
 REPO_OUT = PKG.parents[1] / 'out' / 'host-tests'   # ignored; the pack tool writes only under out/ or private/
 POWER = PKG.parent / 'PianoPower'
+AUTO = PKG.parent / 'PianoAuto'   # AutoStream.c, AutoLight.c: the streams' off/on lifecycle and the light chain (level 4)
 PORTABLE = ('SensorsGuard.c', 'SensorsPolicy.c', 'SensorsPb.c', 'SensorsSsc.c', 'SensorsRpc.c', 'SensorsPack.c', 'SensorsFixed.c',
-            'SensorsOrient.c', 'SensorsClient.c', 'SensorsLoad.c', 'FatVolume.c')
+            'SensorsOrient.c', 'SensorsClient.c', 'SensorsLoad.c', 'FatVolume.c', 'SensorsStream.c')
 INCLUDE = PKG.parent / 'include'   # PianoAdspContract.h
 CFLAGS = ['-std=c11', '-Wall', '-Wextra', '-Werror', '-O1', '-g', '-fsanitize=address,undefined', '-fno-sanitize-recover=all']
 
@@ -200,9 +204,10 @@ def esp_image(out, pack):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--only', action='append', default=[], choices=['wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'load', 'kernel'])
+    parser.add_argument('--only', action='append', default=[],
+                        choices=['wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'streams', 'load', 'kernel'])
     args = parser.parse_args()
-    want = set(args.only) or {'wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'load', 'kernel'}
+    want = set(args.only) or {'wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'streams', 'load', 'kernel'}
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
         src = lambda *names: [PKG / n for n in names]
@@ -226,6 +231,11 @@ def main():
                                                            'SensorsSsc.c', 'SensorsPb.c', 'SensorsRpc.c', 'SensorsPack.c',
                                                            'SensorsClient.c'),
                                      POWER / 'QcomQrtr.c'], ['-lm', '-I', str(INCLUDE)]))
+        if 'streams' in want:
+            run(build(out, 'streams', [HERE / 'streams.c', *src('SensorsStream.c', 'SensorsSsc.c', 'SensorsPb.c', 'SensorsPolicy.c',
+                                                               'SensorsFixed.c', 'SensorsOrient.c', 'SensorsGuard.c', 'SensorsClient.c'),
+                                       AUTO / 'AutoStream.c', AUTO / 'AutoLight.c'],
+                      ['-lm', '-I', str(PKG), '-I', str(INCLUDE), '-I', str(AUTO)]))
         if 'load' in want:
             image = esp_image(out, pack)
             if image:
@@ -234,7 +244,8 @@ def main():
             # the kernel's constraints: no C library, no floating point registers (AArch64 -mgeneral-regs-only)
             for name in PORTABLE:
                 subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-target', 'arm64-apple-macos13', '-ffreestanding', '-fno-builtin',
-                                '-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror', '-I', str(INCLUDE), '-c', str(PKG / name),
+                                '-mgeneral-regs-only', '-Wall', '-Wextra', '-Werror', '-I', str(PKG), '-I', str(INCLUDE), '-I', str(AUTO),
+                                '-c', str(PKG / name),
                                 '-o', str(out / 'k.o')], check=True)
             print(f'PASS kernel constraints: {len(PORTABLE)} portable files freestanding, general registers only')
     print('PASS PianoSensors host tests')

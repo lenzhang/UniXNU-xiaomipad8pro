@@ -11,16 +11,24 @@
 //                    the sensors PD, the listener, every DSP file call answered from the pack in memory, writes declined; the guard's
 //                    tokens before each bring-up call, its strikes after, its decline mode once off.
 //   piano-sensors=3  + the SNS client (SensorsClient.c): SUID lookups and attributes, the sensor list published; no stream.
+//   piano-sensors=4  + the streams (SensorsStream.c, sensors.md §5c): the ambient light on change and the accelerometer at 10 Hz,
+//                    each on a QRTR port (a QMI client) of its own, only while a consumer needs it (the light: PianoBacklight's
+//                    automatic mode, the display on, the lid open; the accelerometer: piano-rotated, the display on, the cover
+//                    detached); piano-sensors-lux, -light-target, -edge, -seq published; joins the power tree: a system sleep
+//                    disables both first (a port closed if the hub does not answer in time); the guard's strike ends them.
 // Other arguments: piano-sensors-delay=S, -settle=S (20), -rpc-pa=ADDR (the arena; default the sensors' slice of the CDSP carveout,
 // PianoDspMemory.h; 0: no file service), -bank=N (3),
 // -smmu=0 (leave the SMMU alone), -nopack=1 (level 2 without a pack: every open fails, the paths are logged), -channel=0 (level 1
-// does not register the channel), -log=0..2 (1). Without piano-sensors the driver declines in probe() and maps nothing.
+// does not register the channel), -log=0..2 (1); level 4: -als=0|1|2 (1: follow PianoBacklight's automatic mode; 2: always; 0:
+// never), -rotate=0|1|2 (1: follow piano-rotate; 2: always; 0: never), -accel-hz=N (10), -accel-batch=MS (0), -axes=a.. (a+y+x+z).
+// Without piano-sensors the driver declines in probe() and maps nothing.
 // Properties on the PianoSensors service (stable; sensors.md §5 lists them with their units).
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOMessage.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/libkern.h>
@@ -29,6 +37,7 @@
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include <PianoAdspContract.h>
+#include <PianoPowerContract.h>
 extern "C" {
 #include "FatVolume.h"
 #include "SensorsClient.h"
@@ -37,6 +46,7 @@ extern "C" {
 #include "SensorsLoad.h"
 #include "SensorsPolicy.h"
 #include "SensorsRpc.h"
+#include "SensorsStream.h"
 #include "SensorsText.h"
 // NativeUfs (package/NativeUfs): GPT lookup by name and 4096-byte block reads of any LUN, read only.
 extern int native_ufs_part_find(const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks);
@@ -53,6 +63,12 @@ namespace {
 struct Args {
   uint32_t level, delay, settle, bank, smmu, nopack, channel, log;
   uint64_t rpcPa;
+  // level 4 (sensors.md §5c), and the consumers' own arguments it follows
+  uint32_t als, rotate, accelHz, accelBatch;
+  uint32_t backlight, backlightAuto, rotateAgent, rotateTest;
+  char axesText[32];
+  SfxAxes axes;
+  int axesGiven, axesOk;
 };
 Args gArgs;
 
@@ -66,7 +82,7 @@ uint32_t bootArg(const char *name, uint32_t fallback)
 void readArgs()
 {
   gArgs.level = bootArg("piano-sensors", 0);
-  if (gArgs.level > 3) gArgs.level = 3;
+  if (gArgs.level > 4) gArgs.level = 4;
   gArgs.delay = bootArg("piano-sensors-delay", 0);
   if (gArgs.delay > 600) gArgs.delay = 600;
   gArgs.settle = bootArg("piano-sensors-settle", 20);
@@ -80,6 +96,27 @@ void readArgs()
   uint64_t pa = 0;
   if (!PE_parse_boot_argn("piano-sensors-rpc-pa", &pa, sizeof pa)) pa = PS_ARENA_DEFAULT;   // 0 given: no arena
   gArgs.rpcPa = pa;
+  gArgs.als = bootArg("piano-sensors-als", 1);
+  gArgs.rotate = bootArg("piano-sensors-rotate", 1);
+  gArgs.accelHz = bootArg("piano-sensors-accel-hz", SS_ACCEL_HZ);
+  if (gArgs.accelHz < 1 || gArgs.accelHz > 100) gArgs.accelHz = SS_ACCEL_HZ;
+  gArgs.accelBatch = bootArg("piano-sensors-accel-batch", 0);
+  if (gArgs.accelBatch > 1000) gArgs.accelBatch = 1000;
+  gArgs.backlight = bootArg("piano-backlight", 0);         // PianoBacklight's level: its automatic mode needs 2
+  gArgs.backlightAuto = bootArg("piano-backlight-auto", 0);
+  gArgs.rotateAgent = bootArg("piano-rotate", 0);          // piano-rotated exits at 0
+  gArgs.rotateTest = bootArg("piano-rotate-test", 0);      // 1: the agent takes its edges from a preference, not from here
+  SfxAxes gyro, mag;
+  sfx_axes_identity(&gArgs.axes);
+  sfx_axes_identity(&gyro);
+  sfx_axes_identity(&mag);
+  gArgs.axesGiven = PE_parse_boot_arg_str("piano-sensors-axes", gArgs.axesText, sizeof gArgs.axesText);
+  if (!gArgs.axesGiven) strlcpy(gArgs.axesText, PS_ACCEL_AXES, sizeof gArgs.axesText);
+  gArgs.axesOk = sfx_axes_parse(gArgs.axesText, &gArgs.axes, &gyro, &mag) == 0;
+  if (!gArgs.axesOk) {
+    sfx_axes_identity(&gArgs.axes);
+    sfx_axes_parse(PS_ACCEL_AXES, &gArgs.axes, &gyro, &mag);
+  }
 }
 
 uint64_t nowMs()
@@ -109,7 +146,7 @@ void stage(int32_t value, const char *what)
 // Events of a thread: bits set by any thread (also PianoPower's DSP thread: no lock, only an atomic or and a wakeup), waited on
 // with a deadline (PianoAdsp's pattern).
 volatile uint32_t gMainEvents, gRpcEvents;
-enum : uint32_t { kEvChannel = 1, kEvResponse = 2, kEvSns = 4, kEvPacket = 8, kEvPack = 16 };
+enum : uint32_t { kEvChannel = 1, kEvResponse = 2, kEvSns = 4, kEvPacket = 8, kEvPack = 16, kEvPower = 32 };
 
 void wake(volatile uint32_t *events, uint32_t bits)
 {
@@ -421,21 +458,24 @@ bool mapArena()
   return true;
 }
 
-// ------------------------------------------------------------------------------------------------------------ the SNS port
+// ------------------------------------------------------------------------------------------------------------ the SNS ports
+// Port 0 (gPort) carries the level-3 list; at level 4 each stream has a port of its own (a QMI client of its own at the hub). Every
+// packet goes through one ring to the main thread, tagged with its port's source.
 int gPort = -1;
 struct Packet {
-  uint32_t length;
+  uint32_t length, source;   // source: 0 the list, 1 + SS_LIGHT / SS_ACCEL
   uint8_t data[2048];
 };
-constexpr unsigned kRing = 16;
+constexpr unsigned kRing = 32;
 struct Ring {
   volatile uint32_t head, tail, dropped;   // head: the DSP thread's, tail: the main thread's
   Packet slot[kRing];
 };
 Ring *gRing;
+const uint32_t kSources[1 + SS_STREAMS] = {0, 1 + SS_LIGHT, 1 + SS_ACCEL};
 
 void snsServer(void *, int, uint32_t, uint32_t, uint32_t) { wake(&gMainEvents, kEvSns); }
-void snsReceive(void *, uint32_t, uint32_t, const uint8_t *data, uint32_t length)   // the DSP thread: copy and wake
+void snsReceive(void *context, uint32_t, uint32_t, const uint8_t *data, uint32_t length)   // the DSP thread: copy and wake
 {
   if (!gRing || length > sizeof gRing->slot[0].data) return;
   const uint32_t head = __atomic_load_n(&gRing->head, __ATOMIC_RELAXED), tail = __atomic_load_n(&gRing->tail, __ATOMIC_ACQUIRE);
@@ -443,9 +483,11 @@ void snsReceive(void *, uint32_t, uint32_t, const uint8_t *data, uint32_t length
   Packet &p = gRing->slot[head % kRing];
   memcpy(p.data, data, length);
   p.length = length;
+  p.source = context ? *static_cast<const uint32_t *>(context) : 0;
   __atomic_store_n(&gRing->head, head + 1, __ATOMIC_RELEASE);
   wake(&gMainEvents, kEvPacket);
 }
+const PianoQrtrClient kSnsClient = {snsServer, snsReceive};
 
 PianoQrtrServer gSns;
 ScClient *gClient;
@@ -467,6 +509,143 @@ void scTrace(void *, const char *line)
 void scChanged(void *) {gTypesDirty = 1;}
 const ScOps kScOps = {nullptr, scNow, scSend, scMayRequest, scResult, scTrace, scChanged};
 
+// ------------------------------------------------------------------------------------------------------------ level 4: the streams
+SsEngine *gEngine;
+int gStreamPort[SS_STREAMS] = {-1, -1};
+PianoQrtrServer gStreamServer[SS_STREAMS];
+IOService *gSelf;
+
+// A stream's own port, following service 400 like the list's; the engine starts the stream afresh on it.
+void openStreamPort(int stream)
+{
+  gStreamServer[stream] = PianoQrtrServer{};
+  gStreamPort[stream] = piano_qrtr_open(PS_QMI_SNS, PIANO_QRTR_ANY, &kSnsClient, const_cast<uint32_t *>(&kSources[1 + stream]));
+  note("%s: QRTR port %d for service %#x (its own QMI client)", ss_stream_name(stream), gStreamPort[stream], PS_QMI_SNS);
+  if (gStreamPort[stream] >= 0) ss_port_opened(gEngine, stream);
+}
+
+uint64_t ssNow(void *) {return nowMs();}
+int ssSend(void *, int stream, const uint8_t *data, uint32_t length)
+{
+  const PianoQrtrServer &s = gStreamServer[stream];
+  if (gStreamPort[stream] < 0 || !s.up) return -1;
+  return piano_qrtr_send(gStreamPort[stream], s.node, s.port, data, length) ? -1 : 0;
+}
+void ssTrace(void *, const char *line) {note("%s", line);}   // the engine limits its own lines
+void ssPublish(void *, const SsOutputs *o)
+{
+  // the values first, the sequence last: a consumer that sees the new sequence reads the new values
+  gSelf->setProperty("piano-sensors-lux", uint64_t(o->lux), 32);
+  if (o->target >= 0) gSelf->setProperty("piano-sensors-light-target", uint64_t(o->target), 32);
+  gSelf->setProperty("piano-sensors-edge", ps_edge_name(o->edge));
+  gSelf->setProperty("piano-sensors-seq", o->seq, 64);
+  if (o->changed & SS_OUT_EDGE) gSelf->messageClients(kIOMessageServicePropertyChange);   // piano-rotated's interest notification
+}
+void ssClosePort(void *, int stream)
+{
+  if (gStreamPort[stream] < 0) return;
+  piano_qrtr_close(gStreamPort[stream]);   // DEL_CLIENT: the hub drops this client's requests
+  note("%s: QRTR port %d closed", ss_stream_name(stream), gStreamPort[stream]);
+  gStreamPort[stream] = -1;
+  gStreamServer[stream] = PianoQrtrServer{};
+}
+
+// The services whose properties are the streams' conditions, found by class (registered or not, as PianoBacklight finds PianoSensors):
+// looked up every 2 s for 2 minutes, then every 30 s; retained once found.
+struct Watched {
+  const char *cls;
+  IOService *service;
+  uint64_t next;
+  unsigned lookups;
+};
+Watched gDisplay = {"NativeGopDisplay", nullptr, 0, 0}, gKeyboard = {"PianoKeyboard", nullptr, 0, 0},
+        gBacklight = {"PianoBacklight", nullptr, 0, 0};
+
+IOService *watched(Watched &w, uint64_t now)
+{
+  if (w.service || now < w.next) return w.service;
+  w.next = now + (++w.lookups < 60 ? 2000 : 30000);
+  OSDictionary *matching = IOService::serviceMatching(w.cls);
+  w.service = matching ? IOService::copyMatchingService(matching) : nullptr;
+  OSSafeReleaseNULL(matching);
+  if (!w.service) {
+    IOService *provider = gSelf->getProvider();
+    OSIterator *it = provider ? provider->getChildIterator(gIOServicePlane) : nullptr;
+    while (OSObject *o = it ? it->getNextObject() : nullptr)
+      if (o->metaCast(w.cls) && (w.service = OSDynamicCast(IOService, o))) {
+        w.service->retain();
+        break;
+      }
+    OSSafeReleaseNULL(it);
+  }
+  if (w.service) note("streams: found %s (its properties are conditions of the streams)", w.cls);
+  return w.service;
+}
+
+// A number or boolean property of a watched service: its value, or fallback when absent.
+int64_t property(IOService *s, const char *key, int64_t fallback)
+{
+  OSObject *o = s ? s->copyProperty(key) : nullptr;
+  int64_t v = fallback;
+  if (OSNumber *n = OSDynamicCast(OSNumber, o)) v = int64_t(n->unsigned64BitValue());
+  else if (OSBoolean *b = OSDynamicCast(OSBoolean, o)) v = b->isTrue() ? 1 : 0;
+  OSSafeReleaseNULL(o);
+  return v;
+}
+
+const char *gLightWhy = "?", *gAccelWhy = "?";
+
+SsConditions readConditions(uint64_t now)
+{
+  SsConditions c;
+  IOService *display = watched(gDisplay, now), *keyboard = watched(gKeyboard, now);
+  c.display = int(property(display, "piano-display-power", -1));   // published with piano-backlight=2: unknown counts as on
+  c.lid = int(property(keyboard, "piano-keyboard-hall", -1));
+  c.attached = property(keyboard, "piano-keyboard-attached", 0) == 1;
+  // The light: PianoBacklight's automatic mode takes the targets (piano-backlight=2, piano-backlight-auto=1), unless the user chose a
+  // level (its published piano-backlight-auto false after a target was taken: manual by choice, until set to 1 again).
+  if (gArgs.als == 0) {
+    c.light_consumer = 0;
+    gLightWhy = "piano-sensors-als=0";
+  } else if (gArgs.als >= 2) {
+    c.light_consumer = 1;
+    gLightWhy = "piano-sensors-als=2";
+  } else if (gArgs.backlight < 2 || gArgs.backlightAuto != 1) {
+    c.light_consumer = 0;
+    gLightWhy = "no automatic brightness (piano-backlight=2 piano-backlight-auto=1)";
+  } else if (IOService *backlight = watched(gBacklight, now)) {
+    const bool manual = property(backlight, "piano-backlight-auto", -1) == 0 &&
+                        property(backlight, "piano-backlight-ambient-permille", -1) >= 0;
+    c.light_consumer = !manual;
+    gLightWhy = manual ? "PianoBacklight is in manual mode" : "PianoBacklight's automatic mode";
+  } else {
+    c.light_consumer = 0;
+    gLightWhy = "no PianoBacklight service";
+  }
+  // The accelerometer: piano-rotated reads the edge (piano-rotate>=1) unless it tests with its own edges (piano-rotate-test=1).
+  c.accel_consumer = gArgs.rotate >= 2 || (gArgs.rotate == 1 && gArgs.rotateAgent >= 1 && gArgs.rotateTest != 1);
+  gAccelWhy = gArgs.rotate == 0 ? "piano-sensors-rotate=0" : gArgs.rotate >= 2 ? "piano-sensors-rotate=2"
+              : c.accel_consumer ? "piano-rotated" : "no rotation agent (piano-rotate=0 or piano-rotate-test=1)";
+  return c;
+}
+
+// The light's consumer told to leave automatic mode (PianoBacklightAmbient -1, sensors.md 5a.4): the stream failed or the guard struck.
+void ssLeave(void *)
+{
+  IOService *backlight = watched(gBacklight, ~0ull >> 1);
+  const IOReturn r = backlight ? backlight->callPlatformFunction("PianoBacklightAmbient", false, reinterpret_cast<void *>(intptr_t(-1)),
+                                                                 const_cast<char *>("PianoSensors"), nullptr, nullptr)
+                               : kIOReturnNotFound;
+  note("light: PianoBacklight told to leave automatic mode: %#x", r);
+}
+
+const SsOps kSsOps = {nullptr, ssNow, ssSend, scMayRequest, scResult, ssTrace, ssPublish, ssLeave, ssClosePort};
+
+// The power contract (PianoPowerContract.h): kOff asks the thread to disable the streams and acknowledge (at most kSleepWaitMs, then
+// the ports of streams not off are closed); kOn lets them start again.
+volatile uint32_t gAsleep, gAckDue;
+constexpr uint32_t kSleepWaitMs = 800;
+
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------------ the service
@@ -474,6 +653,7 @@ class PianoSensors : public IOService {
   OSDeclareDefaultStructors(PianoSensors)
   void run();
   void runRpc();
+  uint32_t runStreams(uint64_t now, int state, int reason, const PianoAdspHealth &h);
   void publishTypes();
   void publishStatus(const SgDsp &d, const PianoAdspHealth &h);
   static void mainThread(void *self, wait_result_t);
@@ -482,6 +662,7 @@ class PianoSensors : public IOService {
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  IOReturn setPowerState(unsigned long state, IOService *device) override;
 };
 
 OSDefineMetaClassAndStructors(PianoSensors, IOService)
@@ -499,6 +680,12 @@ bool PianoSensors::start(IOService *provider)
   note("start: piano-sensors=%u delay=%u settle=%u bank=%u smmu=%u rpc-pa=%#llx nopack=%u channel=%u log=%u", gArgs.level,
        gArgs.delay, gArgs.settle, gArgs.bank, gArgs.smmu, (unsigned long long)gArgs.rpcPa, gArgs.nopack, gArgs.channel, gArgs.log);
   note("a client of PianoPower's DSP (PianoAdspContract.h): it never starts, stops or restarts the DSP");
+  if (gArgs.level >= 4)
+    note("level 4: als=%u rotate=%u accel-hz=%u accel-batch=%u axes=%s%s; follows piano-backlight=%u piano-backlight-auto=%u "
+         "piano-rotate=%u piano-rotate-test=%u", gArgs.als, gArgs.rotate, gArgs.accelHz, gArgs.accelBatch, gArgs.axesText,
+         gArgs.axesOk ? "" : " (not a map: the default " PS_ACCEL_AXES ")", gArgs.backlight, gArgs.backlightAuto, gArgs.rotateAgent,
+         gArgs.rotateTest);
+  gSelf = this;
   setProperty("piano-sensors", gArgs.level, 32);
   registerService();   // consumers (PianoBacklight's automatic mode, piano-rotated) find the service by matching
   gGuardLock = IOLockAlloc();
@@ -522,12 +709,24 @@ bool PianoSensors::start(IOService *provider)
     gChannel = piano_adsp_channel(PS_GLINK_CHANNEL, 512, 16, 0 /* the DSP opens it */, &client, this);
     note("channel %s: %s", PS_GLINK_CHANNEL, gChannel ? "registered (the DSP's open is answered by PianoPower)" : "NOT registered (taken or no slot)");
   }
-  static const PianoQrtrClient sns = {snsServer, snsReceive};
-  gPort = piano_qrtr_open(PS_QMI_SNS, PIANO_QRTR_ANY, &sns, this);
+  gPort = piano_qrtr_open(PS_QMI_SNS, PIANO_QRTR_ANY, &kSnsClient, const_cast<uint32_t *>(&kSources[0]));
   note("QRTR port for service %#x: %d", PS_QMI_SNS, gPort);
   if (gArgs.level >= 3) {
     gClient = static_cast<ScClient *>(IOMallocZeroData(sizeof(ScClient)));
     if (gClient) sc_init(gClient, &kScOps);
+  }
+  if (gArgs.level >= 4 && gClient && (gEngine = static_cast<SsEngine *>(IOMallocZeroData(sizeof(SsEngine))))) {
+    SsConfig sc;
+    ss_defaults(&sc);
+    sc.accel_hz = gArgs.accelHz;
+    sc.accel_batch_ms = gArgs.accelBatch;
+    sc.axes = gArgs.axes;
+    ss_init(gEngine, &kSsOps, &sc);
+    for (int i = 0; i < SS_STREAMS; ++i) openStreamPort(i);
+    setProperty("piano-sensors-edge", ps_edge_name(PS_EDGE_NONE));   // the level-4 interface from the start (sensors.md §5)
+    setProperty("piano-sensors-seq", 0ull, 64);
+  } else if (gArgs.level >= 4) {
+    note("level 4: no memory for the streams");
   }
   thread_t t = nullptr;
   if (kernel_thread_start(&PianoSensors::mainThread, this, &t) != KERN_SUCCESS) {stage(-1, "no thread"); return true;}
@@ -580,6 +779,22 @@ void PianoSensors::publishStatus(const SgDsp &d, const PianoAdspHealth &h)
            s.stage, s.error, s.attaches, s.calls, s.opens, s.missing, s.reads, s.refused, s.declined, (unsigned long long)s.bytes,
            s.note[0] ? " first missing " : "", s.note);
   setProperty("piano-sensors-rpc", line);
+  if (gEngine) {
+    if (OSDictionary *streams = OSDictionary::withCapacity(SS_STREAMS)) {
+      for (int i = 0; i < SS_STREAMS; ++i) {
+        char text[320];
+        ss_status(gEngine, i, text, sizeof text);
+        strlcat(text, "; consumer: ", sizeof text);
+        strlcat(text, i == SS_LIGHT ? gLightWhy : gAccelWhy, sizeof text);
+        if (OSString *v = OSString::withCString(text)) {
+          streams->setObject(ss_stream_name(i), v);
+          v->release();
+        }
+      }
+      setProperty("piano-sensors-streams", streams);
+      streams->release();
+    }
+  }
   (void)d;
 }
 
@@ -629,8 +844,13 @@ void PianoSensors::run()
   int lastState = -1;
   uint64_t published = 0;
   bool first = true;
+  uint32_t waitMs = gClient ? 250 : 1000;
+  if (gEngine) {   // joined once this loop runs, so that a sleep's kOff always finds the thread that acknowledges it
+    const IOReturn r = pianopower::join(this);
+    note("streams: joined the power tree (%#x): a system sleep disables them first", r);
+  }
   for (;;) {
-    waitEvents(&gMainEvents, gClient ? 250 : 1000);
+    waitEvents(&gMainEvents, waitMs);
     const uint64_t t = nowMs();
     PianoAdspHealth h;
     piano_adsp_health(&h);
@@ -661,7 +881,8 @@ void PianoSensors::run()
     if (gClient) {
       while (gRing->tail != __atomic_load_n(&gRing->head, __ATOMIC_ACQUIRE)) {
         const Packet &p = gRing->slot[gRing->tail % kRing];
-        sc_receive(gClient, p.data, p.length);
+        if (!p.source) sc_receive(gClient, p.data, p.length);
+        else if (gEngine && p.source <= SS_STREAMS) ss_receive(gEngine, int(p.source) - 1, p.data, p.length);
         __atomic_store_n(&gRing->tail, gRing->tail + 1, __ATOMIC_RELEASE);
       }
       if (state == SG_RUN || state == SG_BACKOFF) sc_tick(gClient);
@@ -671,12 +892,95 @@ void PianoSensors::run()
         if (sc_settled(gClient)) note("sensor list settled (piano-sensors-types)");
       }
     }
+    if (gEngine) waitMs = runStreams(t, state, reason, h);
     if (first || t - published >= 1000) {
       publishStatus(d, h);
       published = t;
     }
     first = false;
   }
+}
+
+// Level 4, on the main thread after the list: the guard's word, the ports, the list's sensors, the conditions, a sleep under way, then
+// the engine's tick. Returns how long the thread may wait: 250 ms while the display is on or a stream is busy (the conditions are
+// polled), 1 s at rest with the display off, shorter when the engine has a deadline, 20 ms while a sleep waits for the disables.
+uint32_t PianoSensors::runStreams(uint64_t t, int state, int reason, const PianoAdspHealth &h)
+{
+  static bool closedAfterStrike;
+  static uint32_t engineAsleep;
+  static uint64_t sleepSince, reopenAt;
+  const uint32_t asleep = __atomic_load_n(&gAsleep, __ATOMIC_ACQUIRE);
+  if (state == SG_OFF && !gEngine->off) ss_off(gEngine);
+  if (gEngine->off) {
+    // The ports that carried a request are closed (the hub forgets their streams) only while the DSP may still be told: the strike
+    // was ours or the charger's restart, the DSP is up without a fatal sign, the charger domain up again and PianoPower not asking
+    // for quiet. A dead or dying DSP is never touched.
+    const bool tellable = reason == SG_REASON_ERRORS || reason == SG_REASON_FILE_STORM || reason == SG_REASON_DISABLED ||
+                          reason == SG_REASON_CHARGER;
+    if (!closedAfterStrike && tellable && h.version == PIANO_ADSP_HEALTH_VERSION && h.dsp_up && !h.fatal && !h.fatal_reports &&
+        !h.crash[0] && !h.quiet && h.charger_pd == SG_CHARGER_UP) {
+      ss_close_all(gEngine);
+      closedAfterStrike = true;
+    }
+    if (__atomic_exchange_n(&gAckDue, 0u, __ATOMIC_ACQ_REL)) acknowledgeSetPowerState();
+    return 1000;
+  }
+  // A port the engine closed (a sleep's wait ran out, a new default sensor) is opened again, never during a sleep.
+  for (int i = 0; i < SS_STREAMS; ++i) {
+    if (gStreamPort[i] < 0 && !asleep && t >= reopenAt) {
+      openStreamPort(i);
+      if (gStreamPort[i] < 0) reopenAt = t + 5000;
+    }
+    PianoQrtrServer s;
+    if (gStreamPort[i] >= 0 && !piano_qrtr_server(gStreamPort[i], &s) &&
+        (s.generation != gStreamServer[i].generation || s.up != gStreamServer[i].up)) {
+      gStreamServer[i] = s;
+      ss_service(gEngine, i, s.up, s.generation);
+    }
+  }
+  ss_from_list(gEngine, gClient);
+  const SsConditions c = readConditions(t);
+  ss_conditions(gEngine, &c);
+  if (asleep != engineAsleep) {
+    engineAsleep = asleep;
+    sleepSince = t;
+    ss_sleep(gEngine, int(asleep));
+    note("streams: %s", asleep ? "system sleep: disabling them" : "awake");
+  }
+  ss_tick(gEngine);
+  if (asleep && __atomic_load_n(&gAckDue, __ATOMIC_ACQUIRE)) {
+    const bool idle = ss_idle(gEngine) != 0;
+    if (!idle && t - sleepSince < kSleepWaitMs) return 20;
+    // Not off in time: their ports are closed (the hub drops a gone client's requests), unless PianoPower asks for quiet (then they
+    // stay on through the sleep: nothing is sent while it configures the charger).
+    if (!idle && !h.quiet) ss_force_off(gEngine);
+    note("streams: ready for the sleep after %llu ms%s", (unsigned long long)(t - sleepSince),
+         idle ? "" : h.quiet ? " (not off: PianoPower asks for quiet)" : " (ports closed)");
+    __atomic_store_n(&gAckDue, 0u, __ATOMIC_RELEASE);
+    acknowledgeSetPowerState();
+  }
+  uint32_t wait = c.display != 0 || !ss_idle(gEngine) || !sc_settled(gClient) ? 250 : 1000;
+  const uint64_t due = ss_deadline(gEngine);
+  if (due && due <= t) wait = 10;
+  else if (due && due - t < wait) wait = due - t < 10 ? 10 : uint32_t(due - t);
+  return wait;
+}
+
+// The power contract (PianoPowerContract.h, docs/power.md §4): kOff is acknowledged by the thread once both streams are disabled (at
+// most kSleepWaitMs: then the ports of those not off are closed); kOn lets them start again (fresh sessions: the room's light at once).
+IOReturn PianoSensors::setPowerState(unsigned long state, IOService *)
+{
+  if (!gEngine) return kIOPMAckImplied;
+  if (state == pianopower::kOff) {
+    if (__atomic_load_n(&gAsleep, __ATOMIC_ACQUIRE)) return kIOPMAckImplied;
+    __atomic_store_n(&gAckDue, 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(&gAsleep, 1u, __ATOMIC_RELEASE);
+    wake(&gMainEvents, kEvPower);
+    return (kSleepWaitMs + 1200) * 1000;   // microseconds: the thread acknowledges within kSleepWaitMs
+  }
+  __atomic_store_n(&gAsleep, 0u, __ATOMIC_RELEASE);
+  wake(&gMainEvents, kEvPower);
+  return kIOPMAckImplied;
 }
 
 void PianoSensors::runRpc()
