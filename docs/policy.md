@@ -222,8 +222,8 @@ KB=$(tooling/k27/build-native-piano-keyboard.sh | tail -1)
 K27_KERNEL=$K/out/k27/kernel-k27-0062-native.macho PIANO_EXTRA_KEXTS=$KB PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh
 tooling/k27/build-policy-test-images.sh        # out/ram-pol-{observe,lock,sleep,lpm} and out/ram-pol-dump
 ```
-(Built offline here 2026-11-11 from an isolated checkout on main `f9f2352`: `build-native-image.sh` with the default 0059 kernel
-links 20 native kexts; the test KC (0062 kernel + PianoKeyboard, 21 kexts) `49f1e96da5536c8f…`; images `ram-pol-observe`
+(Built offline here 2026-11-11 from an isolated checkout: on main `9c6cf7c` `build-native-image.sh` with the default 0059 kernel
+links 21 native kexts (PianoPolicy 322 pointers); on `f9f2352` the test KC (0062 kernel + PianoKeyboard) `49f1e96da5536c8f…`; images `ram-pol-observe`
 `572e85c75e2a6358…`, `-lock` `5a43e7a3d21700d6…`, `-sleep` `6d04aea4678d0318…`, `-lpm` `599150d2fd92bbdd…`; command line 898 bytes.
 Rebuild in the main checkout before a run.) Every image: PianoKeyboard 2, PianoPower with its battery (`piano-power-ps=1`),
 PianoBacklight 2 (the display power), PianoThermal 1 + governor, the USB console. Run each with
