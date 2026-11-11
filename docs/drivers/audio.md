@@ -513,7 +513,9 @@ Ubuntu (reboot), or later AirPlay/Bluetooth from macOS.
    the kernel for one 4348-byte file. Instead `build-esp.py --audio-preset FILE` puts the owner's own copy (the Ubuntu install's, or
    one from the owner's backup; checked there for the container, the size and the SHA-256) at `EFI/UniXNU/piano-fs19xx.fsm`, and level
    5 reads it through NativeUfs and a copy of PianoPower's FatVolume (`AudioPreset.h`), as PianoSensors reads its pack. Never committed,
-   never in a published image; an odm_a reader (video, audio and sensors alike) can replace the staged copy later. (level 5)
+   never in a published image; an odm_a reader (video, audio and sensors alike) can replace the staged copy later. The RAM-image
+   carrier the sensors gained the same night (DarwinBoot's addon slot, `sensors.md` §5b, `SensorsAddon.h`) could carry the preset
+   as a second entry, so that a RAM test needs no ESP write: a later change (one owner of the slot's container first). (level 5)
 4. **A DSP-addressable buffer.** The DSP takes 32-bit addresses with the stream index above (`ar_dsp_address`; the plan refuses
    anything else); XNU's memory is above 4 GiB on piano. **Decided**: PianoDspMemory.h's audio slice (0x9da00000 + 16 MiB, the CDSP
    carveout's, `sensors.md` §5), of which the first 128 KiB are mapped write-combined at level 6 (speaker periods at +0, capture at
