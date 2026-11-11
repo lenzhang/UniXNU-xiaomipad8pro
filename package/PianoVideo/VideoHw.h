@@ -97,6 +97,9 @@ constexpr uint32_t kAonVideoCtlNocLpiCtl = 0xe002c, kAonVideoCtlNocLpiStatus = 0
 // entry (iris_platform_vpu3x.c, one for VPU 3.x) the SCM call MP_VIDEO_VAR (service 0x0c, command 0x08: SMC 0x42000c08, the SiP
 // owner and the SMC64 yielding convention of Sm8750Scm's other calls) with the content-protection ranges below; suspend/resume is
 // SET_REMOTE_STATE (service 1, command 0x0a) with (0|1, 0); unload is PAS shutdown(9).
+// Every one of these calls (from level 3; level 1 makes none) holds the kernel-wide secure-call lock (package/include/PianoScmLock.h,
+// docs/scm-lock.md, tag PianoScmTagVideo): around each request through the Sm8750Scm ops, and once from init_image through
+// auth_and_reset and MP_VIDEO_VAR. PianoVideo.json names PianoA830 (the word's owner) as a library from then on.
 constexpr uint32_t kPasId = 9;
 constexpr uint32_t kCpStart = 0, kCpSize = 0x25800000, kCpNonPixelStart = 0x01000000, kCpNonPixelSize = 0x24800000;
 constexpr uint32_t kScmMpVideoVar = 0x42000c08;
