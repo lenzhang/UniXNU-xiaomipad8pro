@@ -7,8 +7,11 @@
   c        tests/auto_host.c: TouchRotation.h (PianoTouch's transform), AutoRotate.c (piano-rotated's policy), AutoStream.c (a sensor
            stream's off/on lifecycle) and AutoLight.c (the ambient light chain) over PianoSensors' SensorsPolicy.c, which is compiled
            from its own package, unchanged
+  ambient  tests/ambient_host.cpp: AmbientBacklight.h (PianoBacklight's automatic mode) against PianoBacklight's own Ktz8866.h step
+           ladder (included read only) and end to end from lux through AutoLight.c
   kernel   every part a kernel driver includes compiles freestanding with AArch64 general registers only (no C library, no floating
-           point): AutoStream.c, AutoLight.c, TouchRotation.h in C and C++, AutoRotate.c (portable, though only piano-rotated uses it)
+           point): AutoStream.c, AutoLight.c, TouchRotation.h in C and C++, AmbientBacklight.h in C++ (no exceptions, no RTTI),
+           AutoRotate.c (portable, though only piano-rotated uses it)
 
 Synthetic inputs only; nothing here talks to a display, a sensor or a driver."""
 import argparse
@@ -21,6 +24,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
 SENSORS = PKG.parent / 'PianoSensors'
+BACKLIGHT = PKG.parent / 'PianoBacklight'
 POLICY = [SENSORS / n for n in ('SensorsPolicy.c', 'SensorsOrient.c', 'SensorsFixed.c')]
 C_FILES = ('AutoRotate.c', 'AutoStream.c', 'AutoLight.c')
 INCLUDES = ['-I', str(PKG), '-I', str(SENSORS), '-I', str(SENSORS / 'tests')]
@@ -48,7 +52,19 @@ def c_tests(out, defines=(), extra=()):
     run(exe)
 
 
-def kernel_checks(out, c_files=(), headers=()):
+def ambient_tests(out):
+    objects = []
+    for source in [PKG / 'AutoStream.c', PKG / 'AutoLight.c', *POLICY]:
+        objects.append(out / (source.stem + '.o'))
+        subprocess.run([cc(), '-std=c11', *WARN, *SANITIZE, *INCLUDES, '-c', str(source), '-o', str(objects[-1])], check=True)
+    exe = out / 'ambient_host'
+    cxx = os.environ.get('CXX', 'c++')
+    subprocess.run([cxx, '-std=c++20', *WARN, *SANITIZE, *INCLUDES, '-I', str(BACKLIGHT), str(HERE / 'ambient_host.cpp'),
+                    *map(str, objects), '-o', str(exe)], check=True)
+    run(exe)
+
+
+def kernel_checks(out, c_files=(), headers=(), cpp_headers=()):
     for source in c_files:
         subprocess.run([cc(), '-std=c11', *KERNEL, *INCLUDES, '-c', str(source), '-o', str(out / 'k.o')], check=True)
     for header in headers:
@@ -58,20 +74,28 @@ def kernel_checks(out, c_files=(), headers=()):
             compiler = cc() if language == 'c' else os.environ.get('CXX', 'c++')
             flags = ['-fno-exceptions', '-fno-rtti'] if language == 'c++' else []
             subprocess.run([compiler, f'-std={std}', *KERNEL, *flags, *INCLUDES, '-c', str(probe), '-o', str(out / 'k.o')], check=True)
-    print(f'PASS kernel constraints: {len(c_files)} C files and {len(headers)} headers freestanding, general registers only')
+    for header in cpp_headers:
+        probe = out / 'probe.cpp'
+        probe.write_text(f'#include "{header}"\nuint16_t probe(pianoauto::Ambient &a) {{ a.target(500, 1); a.step(1); return a.code(); }}\n')
+        subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', *KERNEL, '-fno-exceptions', '-fno-rtti', *INCLUDES, '-c', str(probe),
+                        '-o', str(out / 'k.o')], check=True)
+    print(f'PASS kernel constraints: {len(c_files)} C files and {len(headers) + len(cpp_headers)} headers freestanding, '
+          'general registers only')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--only', action='append', default=[], choices=['c', 'kernel'])
+    parser.add_argument('--only', action='append', default=[], choices=['c', 'ambient', 'kernel'])
     args = parser.parse_args()
-    want = set(args.only) or {'c', 'kernel'}
+    want = set(args.only) or {'c', 'ambient', 'kernel'}
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
         if 'c' in want:
             c_tests(out)
+        if 'ambient' in want:
+            ambient_tests(out)
         if 'kernel' in want:
-            kernel_checks(out, c_files=[PKG / n for n in C_FILES], headers=['TouchRotation.h'])
+            kernel_checks(out, c_files=[PKG / n for n in C_FILES], headers=['TouchRotation.h'], cpp_headers=['AmbientBacklight.h'])
     print('PASS PianoAuto host tests')
 
 

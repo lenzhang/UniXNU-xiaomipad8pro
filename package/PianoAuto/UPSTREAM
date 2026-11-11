@@ -1,12 +1,16 @@
 PianoAuto is UniXNU-piano's own code (BSD-2-Clause-Patent, LICENSE), written for this repository. Nothing is copied from elsewhere.
 
 Uses, unchanged and from their own package (compiled from package/PianoSensors, not copied): SensorsPolicy.c/.h (ps_rotation_step,
-ps_rotation_defaults, the edges), SensorsOrient.c/.h and SensorsFixed.c/.h (which SensorsPolicy.c needs), tests/check.h (the CHECK macro).
+ps_rotation_defaults, the edges; ps_als_step, ps_als_curve: the light policy), SensorsOrient.c/.h and SensorsFixed.c/.h (which
+SensorsPolicy.c needs; sfx_milli), tests/check.h (the CHECK macro). The host test tests/ambient_host.cpp includes
+package/PianoBacklight/Ktz8866.h, unchanged and read only, to check that AmbientBacklight.h's shift is PianoBacklight's own step ladder.
 
 Facts, from public headers of the macOS SDK only:
   CoreGraphics CGDisplayConfiguration.h: CGDisplayRotation ("the rotation angle of a display in degrees clockwise. A display rotation of
     90 degrees implies the display is rotated clockwise 90 degrees, such that what was the physical bottom of the display is now the
     left side, and what was the physical top is now the right side"): TouchRotation.h's table and AutoRotate.h's degrees follow it.
 
-Behaviour taken as a specification (no code or text): Ubuntu's rotation rule (GNOME rotates only with the keyboard cover detached;
+Behaviour taken as a specification (no code or text): the Ubuntu project's sensor fixes as docs/drivers/sensors.md section 3
+records them (serialized enable/disable, one request outstanding per client, the v1.1.1 "light stops after off/on" fix, 0 lux is valid
+darkness): AutoStream.h's rules; Ubuntu's rotation rule (GNOME rotates only with the keyboard cover detached;
 iio-sensor-proxy 3.9 as docs/drivers/sensors.md section 3 describes it).
