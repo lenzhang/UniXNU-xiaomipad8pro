@@ -38,6 +38,8 @@ extern const uint8_t verified_root_key[];
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 #include <kern/debug.h>
+#include <stdarg.h>
+#include <PianoPowerContract.h>   // UniXNU-piano: native-ufs-suspend=1 (RootPower.h)
 #include "GccUfs.h"
 #include "RootDiagnostics.h"
 #include "TransferPoll.h"
@@ -97,10 +99,14 @@ class NativeUfs : public IOService {
   void inspectContextBanks (void);
   bool startRoot (IOService *provider);
   static bool waitSet (uintptr_t base, unsigned offset, uint32_t mask, unsigned loops);
+  bool fPowerJoined = false;   // UniXNU-piano: in the power tree (native-ufs-suspend=1, RootPower.h)
+  bool fPowerSeenOn = false;   // the first setPowerState(on) came (an off before it is no system sleep)
+  void joinPower (void);
 public:
   IOService *probe (IOService *provider, SInt32 *score) override;
   bool start (IOService *provider) override;
   void stop (IOService *provider) override;
+  IOReturn setPowerState (unsigned long state, IOService *device) override;
 };
 
 OSDefineMetaClassAndStructors (NativeUfs, IOService)
@@ -1050,6 +1056,35 @@ static void hostWaitCompletion (unsigned slot, uint32_t seen, uint64_t started);
 static uint64_t hostDmaAddress (const void *va);
 #include "RootCommands.h"
 
+#if defined(NATIVE_UFS_SM8750) && NATIVE_UFS_SM8750
+// UniXNU-piano: the power contract's UFS side (RootPower.h: native-ufs-suspend=1, native-ufs-ahit=MS) and its port.
+static uint64_t hostPowerMicros (uint64_t ticks)
+{
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds (ticks, &ns);
+  return ns / 1000;
+}
+static void hostPowerLog (const char *format, ...) __attribute__((format(printf, 1, 2)));
+static void hostPowerLog (const char *format, ...)
+{
+  char line[400];
+  va_list ap;
+  va_start (ap, format);
+  vsnprintf (line, sizeof (line), format, ap);
+  va_end (ap);
+  IOLog ("NativeUfs: %s\n", line);
+}
+// The root disk cannot come back: say so on the console first (the mailbox keeps it), then a panic rather than a system that hangs on
+// its next file access.
+static void hostPowerPanic (const char *text)
+{
+  IOLog ("NativeUfs: %s\n", text);
+  IOSleep (200);
+  panic ("NativeUfs: %s", text);
+}
+#include "RootPower.h"
+#endif
+
 // ---- Completion interrupt ------------------------------------------------------------------------------------------
 // The controller's interrupt (GIC SPI 265, level) with only UTRCS enabled (IE bit 0), as in UFSHCI's legacy doorbell mode under Linux
 // ufshcd. The handler clears UTRCS, then, like ufshcd's completion of the requests whose doorbell bits cleared, finds the outstanding
@@ -1475,6 +1510,11 @@ static bool hostBringUp (const char **why)
     if (hostScsi (0, tur, 6, false, 0, 200000, &scsi) == kIOReturnSuccess) {
       gHost.ready = true;
       hostEnableInterrupt ();
+#if defined(NATIVE_UFS_SM8750) && NATIVE_UFS_SM8750
+      // UniXNU-piano: native-ufs-ahit=MS, the runtime auto-hibernate timer (RootPower.h); without it AHIT stays 0 as hostWakeLink left it.
+      uint32_t ahitMs = 0;
+      if (PE_parse_boot_argn ("native-ufs-ahit", &ahitMs, sizeof (ahitMs))) hostAutoHibernateStart (ahitMs);
+#endif
       return true;
     }
     if (gHost.poisoned) break;
@@ -1843,7 +1883,8 @@ extern "C" int native_ufs_dme_get (uint32_t attribute, uint32_t selector, uint32
   IOLockLock (gHost.lock);
   int ok = 0;
   *value = 0xffffffffU;
-  if (hostWaitRegister (0x30, 1U << 3, 1U << 3)) {
+  // UniXNU-piano: not while a system sleep holds the queue (the link is going into, or is in, Hibern8: RootPower.h).
+  if (!gHostHeld && hostWaitRegister (0x30, 1U << 3, 1U << 3)) {
     hostWrite (0x20, 1U << 10);                       // clear a stale UIC completion
     hostWrite (0x94, (attribute << 16) | (selector & 0xffff));
     hostWrite (0x98, 0);
@@ -2585,11 +2626,96 @@ static void mediaReportThread (void *, wait_result_t)
   panic ("%s", gMediaReport);
 }
 
+// ---- System sleep: the power tree (UniXNU-piano, native-ufs-suspend=1; RootPower.h has the sequence) ----------------------------
+// native-ufs-suspend=1 joins NativeUfs to the power tree once the root windows are prepared (startRoot), so IOPMrootDomain takes it
+// to off before a system sleep and back on after; the Data disk (NativeRamBlock) joins as its power child, so it is held and synced
+// before the link goes down and released after the link is back. 0 (the default): not in the power tree at all, as before.
+static uint32_t gPowerArg = 0;
+static volatile int gPowerJoin = 0;   // 0 root start still running, 1 joined, -1 not taking part
+static NativeUfs *gPowerOwner = nullptr;
+// UEFI's UFS clocks and power domains, read only, for the log: NativeUfs holds none of them and never writes GCC (GccUfs.h).
+static OSSharedPtr<IOMemoryMap> gPowerGccMap, gPowerPhyGdscMap;
+static uintptr_t gPowerGcc = 0, gPowerPhyGdsc = 0;
+
+static void powerClockLine (const char *when)
+{
+  if (!gPowerGcc) return;
+  const auto r = [] (unsigned offset) { return read32 (gPowerGcc, offset - 0x77000); };
+  IOLog ("NativeUfs: %s: UFS clocks and GDSCs as UEFI left them (NativeUfs holds no vote to drop): GDSC %08x, PHY GDSC %08x, AXI %08x, "
+         "AHB %08x, UniPro %08x, ICE %08x, TX symbol 0 %08x, RX symbol 0/1 %08x/%08x, PHY aux %08x, aggre AXI %08x\n", when,
+         r (GCC_UFS_PHY_GDSCR), gPowerPhyGdsc ? read32 (gPowerPhyGdsc, 0) : 0, r (GCC_UFS_PHY_AXI_ENABLE), r (GCC_UFS_PHY_AHB_ENABLE),
+         r (GCC_UFS_PHY_UNIPRO_CORE_ENABLE), r (GCC_UFS_PHY_ICE_CORE_ENABLE), r (GCC_UFS_PHY_TX_SYMBOL0_ENABLE),
+         r (GCC_UFS_PHY_RX_SYMBOL0_ENABLE), r (GCC_UFS_PHY_RX_SYMBOL1_ENABLE), r (GCC_UFS_PHY_PHY_AUX_ENABLE),
+         r (GCC_AGGRE_UFS_PHY_AXI_ENABLE));
+}
+
+void NativeUfs::joinPower (void)
+{
+#if defined(NATIVE_UFS_SM8750) && NATIVE_UFS_SM8750
+  gPowerGcc = mapPhys (GCC_BASE + 0x77000, 0x1000, gPowerGccMap);
+  gPowerPhyGdsc = mapPhys (GCC_BASE + GCC_UFS_MEM_PHY_GDSCR, 0x1000, gPowerPhyGdscMap);
+  const IOReturn r = pianopower::join (this);
+  if (r != kIOReturnSuccess) {
+    IOLog ("NativeUfs: power: native-ufs-suspend=1 but registerPowerDriver failed (%#x): no part in a system sleep\n", r);
+    PMstop ();
+    gPowerJoin = -1;
+    return;
+  }
+  fPowerJoined = true;
+  gPowerOwner = this;
+  __atomic_store_n (&gPowerJoin, 1, __ATOMIC_RELEASE);   // after gPowerOwner: native_ufs_power_parent reads them in that order
+  IOLog ("NativeUfs: power: native-ufs-suspend=1: in the power tree; a system sleep holds and drains the queue, syncs the cache, "
+         "turns auto-hibernate off and puts the link into Hibern8; any failure first undoes it and the sleep goes on with UFS up\n");
+  powerClockLine ("power");
+#else
+  IOLog ("NativeUfs: power: native-ufs-suspend=1 needs the SM8750 link handling; no part in a system sleep\n");
+  gPowerJoin = -1;
+#endif
+}
+
+IOReturn NativeUfs::setPowerState (unsigned long state, IOService *)
+{
+#if defined(NATIVE_UFS_SM8750) && NATIVE_UFS_SM8750
+  if (!fPowerJoined) return kIOPMAckImplied;
+  if (state != pianopower::kOff) {
+    fPowerSeenOn = true;   // IOKit's initial change is to on (the root domain supplies it): nothing to undo then
+    hostResume ();
+  } else if (!fPowerSeenOn) {
+    IOLog ("NativeUfs: power: an off before the first on (not a system sleep): ignored\n");
+  } else if (hostSuspend ()) {
+    powerClockLine ("suspended");
+  }
+#else
+  (void) state;
+#endif
+  return kIOPMAckImplied;
+}
+
+// For NativeRamBlock: the power parent of the Data disk (waits up to 10 s for the root start to decide); nullptr when
+// native-ufs-suspend is off or the join failed: the Data disk then takes no part either.
+extern "C" IOService *native_ufs_power_parent (void)
+{
+  for (unsigned i = 0; i < 100 && __atomic_load_n (&gPowerJoin, __ATOMIC_ACQUIRE) == 0; ++i) IOSleep (100);
+  return __atomic_load_n (&gPowerJoin, __ATOMIC_ACQUIRE) == 1 ? gPowerOwner : nullptr;
+}
+
+// From a power child's off (NativeRamBlock: its store's cache sync failed): the next suspend leaves the link up and says who.
+extern "C" void native_ufs_power_veto (const char *who)
+{
+#if defined(NATIVE_UFS_SM8750) && NATIVE_UFS_SM8750
+  gPowerVeto = who ? who : "a power child";
+#else
+  (void) who;
+#endif
+}
+
 bool NativeUfs::start (IOService *provider)
 {
   unsigned probe = 0, rootMode = 0;
   PE_parse_boot_argn ("native-ufs-probe", &probe, sizeof (probe));
   PE_parse_boot_argn ("native-ufs-root", &rootMode, sizeof (rootMode));
+  if (!PE_parse_boot_argn ("native-ufs-suspend", &gPowerArg, sizeof (gPowerArg)) || gPowerArg != 1) gPowerArg = 0;
+  if (!gPowerArg) gPowerJoin = -1;
   IOLog ("NativeUfs: start on %s probe=%u root=%u\n", provider ? provider->getName () : "?", probe, rootMode);
   native_ufs_probe_requested = probe != 0;
   // Default: match for observability only, never touch the controller. Hardware work runs once,
@@ -2600,6 +2726,7 @@ bool NativeUfs::start (IOService *provider)
   if (!gScratch) {
     gScratch = static_cast<uint8_t *> (IOMallocAligned (kDataMax, 4096));
     if (!gScratch) {
+      gPowerJoin = -1;
       return false;
     }
     bzero (gScratch, kDataMax);
@@ -2707,8 +2834,11 @@ bool NativeUfs::start (IOService *provider)
     return true;
   }
   if (rootMode && !probe) {
-    return startRoot (provider);
+    const bool started = startRoot (provider);
+    if (gPowerJoin == 0) gPowerJoin = -1;   // the root start failed before the join: NativeRamBlock stops waiting for it
+    return started;
   }
+  gPowerJoin = -1;
   return false;
 }
 
@@ -2828,11 +2958,16 @@ bool NativeUfs::startRoot (IOService *provider)
                           "root window preparation failed");
     return false;
   }
+  if (gPowerArg) joinPower ();   // UniXNU-piano: native-ufs-suspend=1, once the windows are prepared
   return true;
 }
 
 void NativeUfs::stop (IOService *provider)
 {
+  if (fPowerJoined) {
+    PMstop ();
+    fPowerJoined = false;
+  }
   fCmdDesc.reset ();
   fMap.reset ();
   IOService::stop (provider);

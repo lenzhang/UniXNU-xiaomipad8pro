@@ -58,6 +58,8 @@ static bool hostStopQueue (const char **why)
 static uint64_t gUtrlPhys = 0;
 
 #if defined(NATIVE_UFS_SM8750) && NATIVE_UFS_SM8750
+// UniXNU-piano: DME_HIBERNATE_ENTER (0x17, RootPower.h's system sleep) completes as DME_HIBERNATE_EXIT (0x18) does, with UHES (IS
+// bit 6) where the exit has UHXS (bit 5), and the same HCS.UPMCRS = PWR_LOCAL check; 0x18 and DME_GET (0x01) are unchanged.
 static bool hostLinkCommand (uint32_t command, uint32_t argument, const char **why)
 {
   gRootDiagnostic.linkCommand = command;
@@ -68,7 +70,8 @@ static bool hostLinkCommand (uint32_t command, uint32_t argument, const char **w
     *why = "UIC command not ready";
     return false;
   }
-  const uint32_t completion = command == 0x18 ? 0x420 : 0x400;
+  const uint32_t linkBit = command == 0x18 ? 0x20 : command == 0x17 ? 0x40 : 0;
+  const uint32_t completion = 0x400 | linkBit;
   hostWrite (0x20, completion); // Clear stale completion, preserving error bits.
   hostWrite (0x94, argument);
   hostWrite (0x98, 0);
@@ -76,14 +79,14 @@ static bool hostLinkCommand (uint32_t command, uint32_t argument, const char **w
   hostWrite (0x90, command);
   bool done = hostWaitRegister (0x20, 0x400, 0x400);
   gRootDiagnostic.linkResult = read32 (gHost.hc, 0x98) & 0xff;
-  // UHXS may arrive after UCCS; allow the link transition its own bounded wait.
-  if (done && !gRootDiagnostic.linkResult && command == 0x18 &&
+  // UHXS (UHES) may arrive after UCCS; allow the link transition its own bounded wait.
+  if (done && !gRootDiagnostic.linkResult && linkBit &&
       !(read32 (gHost.hc, 0x20) & (kUfsFatalStatus | 4))) {
-    done = hostWaitRegister (0x20, 0x20, 0x20, 500);
+    done = hostWaitRegister (0x20, linkBit, linkBit, 500);
   }
   gRootDiagnostic.linkStatus = read32 (gHost.hc, 0x20);
   if (!done || gRootDiagnostic.linkResult || (gRootDiagnostic.linkStatus & (kUfsFatalStatus | 4)) ||
-      (command == 0x18 && ((read32 (gHost.hc, 0x30) >> 8) & 7) != 1)) {
+      (linkBit && ((read32 (gHost.hc, 0x30) >> 8) & 7) != 1)) {
     recordTransport (done ? kIOReturnIOError : kIOReturnTimeout, 15);
     *why = "UIC link command failed";
     return false;

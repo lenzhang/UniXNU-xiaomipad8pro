@@ -365,6 +365,11 @@ static uint32_t gSpinUs = 200;
 // Set once by the panic path (native_ufs_log_panic). The CPUs that still run may hold a slot forever, so with one slot it is tried for
 // 200 ms and then used anyway. Commands only poll (TransferPoll.h), so they also run with interrupts masked.
 static bool gHostPanic = false;
+// UniXNU-piano: the queue hold of a system sleep (RootPower.h, native-ufs-suspend=1; under gSlotLock). While it is set no command
+// takes a slot: a taker waits (counted in gHoldWaits) until the link is back and the hold released, so nothing reaches the
+// controller with the link in Hibern8. The panic path does not wait. Never set without native-ufs-suspend=1.
+static bool gHostHeld = false;
+static uint64_t gHoldWaits = 0;
 
 static void hostSlotsInit (unsigned count, IOLock *lock)
 {
@@ -391,6 +396,10 @@ static UfsSlot hostSlotTake (bool *pooled)
     return ufsSlot (0);
   }
   IOLockLock (gSlotLock);
+  while (gHostHeld) {
+    ++gHoldWaits;
+    IOLockSleep (gSlotLock, &gHostHeld, THREAD_UNINT);
+  }
   unsigned index;
   if (gSlotFree) {
     index = static_cast<unsigned> (__builtin_ctz (gSlotFree));
@@ -576,16 +585,20 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
   return status;
 }
 
-// SYNCHRONIZE CACHE(10) for the whole LUN: every write that completed before this call is on the medium when it returns.
-static IOReturn hostSyncCache (void)
+// Whether any window of LUN 0 takes writes (the store, the log, the development build's root windows): what a cache sync is for.
+static bool hostAnyWritable (void)
 {
 #if defined(NATIVE_UFS_UNVERIFIED_ROOT) && NATIVE_UFS_UNVERIFIED_ROOT
-  if (!gHost.ready || (!gStoreOpen && !gLogOpen && !gDevWritableCount)) return kIOReturnNotReady;
+  return gStoreOpen || gLogOpen || gDevWritableCount;
 #else
-  if (!gHost.ready || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;
+  return gStoreOpen || gLogOpen;
 #endif
-  bool pooled;
-  const UfsSlot slot = hostSlotTake (&pooled);
+}
+
+// SYNCHRONIZE CACHE(10) for the whole LUN through `slot`, with the busy retries (RootPower.h's suspend uses slot 0 directly: the
+// pool is held and drained then).
+static IOReturn hostSyncOn (const UfsSlot &slot)
+{
   uint8_t cdb[10] = { 0x35 };
   uint32_t scsi = 0;
   IOReturn status;
@@ -593,6 +606,16 @@ static IOReturn hostSyncCache (void)
     status = hostScsiDir (slot, 0, cdb, 10, 0, 0, 10000000, &scsi);
     if (!hostRetryable (status, scsi, attempt)) break;
   }
+  return status;
+}
+
+// SYNCHRONIZE CACHE(10) for the whole LUN: every write that completed before this call is on the medium when it returns.
+static IOReturn hostSyncCache (void)
+{
+  if (!gHost.ready || !hostAnyWritable ()) return kIOReturnNotReady;
+  bool pooled;
+  const UfsSlot slot = hostSlotTake (&pooled);
+  const IOReturn status = hostSyncOn (slot);
   hostSlotGive (slot, pooled);
   return status;
 }

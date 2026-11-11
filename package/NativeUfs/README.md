@@ -74,3 +74,6 @@ ShengUfs b11de87 (`UPSTREAM`) with the piano/SM8750 deltas, built as a k27 nativ
 - Development build: no `NATIVE_VERIFIED_BLOCK` (windows published read-only without owner-signed block policies).
 - `NATIVE_UFS_POLL_ONLY=1`: k27's ArmCpu has no `armcpu_spi_attach`; completion by polling.
 - `gScratch` allocated at start (the KC has no gap for a 128 KiB `__bss`).
+- Power (`RootPower.h`, opt-in): `native-ufs-suspend=1` puts the link into Hibern8 for a system sleep and undoes everything on any
+  failure; `native-ufs-ahit=MS` the controller's auto-hibernate at run time. [docs/drivers/ufs.md](../../docs/drivers/ufs.md) §12.
+- Host tests: `tests/run-tests.sh` (the command, queue, link and power code against `tests/UfsModel.h`).

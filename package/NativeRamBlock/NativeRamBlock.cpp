@@ -21,6 +21,8 @@
 #include "PersistOverlay.h"
 #include "DirectDisk.h"
 #include "VolatileDisk.h"
+#include "PowerHold.h"
+#include <PianoPowerContract.h>   // UniXNU-piano: the Data disk's part of a system sleep (native-ufs-suspend=1, PowerHold.h)
 
 extern "C" {
 extern unsigned long gPhysBase, gPhysSize;
@@ -41,6 +43,10 @@ int native_ufs_store_read(uint64_t, uint32_t, void *);
 int native_ufs_store_write(uint64_t, uint32_t, const void *);
 int native_ufs_store_sync(void);
 unsigned native_ufs_store_gpt_check(void);
+// UniXNU-piano (NativeUfs, native-ufs-suspend=1): the Data disk's power parent (nullptr: no part in a system sleep), and the veto a
+// failed store sync sends it (its suspend then leaves the link up).
+IOService *native_ufs_power_parent(void);
+void native_ufs_power_veto(const char *who);
 // Diagnostics. state: 0 off, 1 blank (read-only probe), 2 resumed, 3 fresh, 4 refused/failed, 5 degraded after an I/O error,
 // 6 resumed read-only (probe), 7 kept (another seed's store, untouched; Data volatile). header: persist::checkHeader result.
 // flags: the header's extension flags (1 self-contained); store_tag: the first 4 bytes of the store's seed digest;
@@ -133,6 +139,10 @@ class NativeRamBlock : public IOBlockStorageDevice {
   uint8_t *overlayBits = nullptr, *stage = nullptr;   // stage: kStagePages pages, one write or read run
   static constexpr uint32_t kStagePages = 32;
   bool storeAttached = false;
+  // UniXNU-piano: a system sleep (native-ufs-suspend=1): off syncs the store and holds new requests, on releases them (PowerHold.h).
+  DataPowerHold power;
+  bool powerJoined = false, powerSeenOn = false;   // powerSeenOn: the first on came (an off before it is no system sleep)
+  uint64_t powerWaits = 0;
   // Direct mode (the store is open read-write): changed pages live in the store window only, never in RAM; reads of them go to the
   // window. A failed store write stops all further writes (a page the system was told is written must be on the medium).
   bool direct = false, directFailed = false;
@@ -357,6 +367,8 @@ public:
   bool start(IOService *) override;
   void stop(IOService *) override;
   void free() override;
+  IOReturn setPowerState(unsigned long state, IOService *device) override;
+  void joinPower();
   IOReturn doEjectMedia() override { return kIOReturnUnsupported; }
   IOReturn doFormatMedia(UInt64) override { return kIOReturnUnsupported; }
   UInt32 doGetFormatCapacities(UInt64 *, UInt32) const override { return 0; }
@@ -409,6 +421,7 @@ static void publishWhenBSDMatched(void *argument, wait_result_t)
     storeTrace("IOBSD matched; data-persist=0: no store to open");
   }
   ram->attachStore();
+  ram->joinPower();   // UniXNU-piano: native-ufs-suspend=1 with the store open read-write (PowerHold.h); else nothing
   storeTrace("registering the disk");
   ram->registerService();
   storeTrace("disk registered");
@@ -494,6 +507,8 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
   if (!gate) return kIOReturnNotReady;
   const uint64_t bytes = count * 512;
   IOLockLock(gate);
+  // UniXNU-piano: a system sleep holds new requests from the store's sync until the UFS link is back (PowerHold.h).
+  while (power.held) { ++powerWaits; IOLockSleep(gate, &power, THREAD_UNINT); }
   if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
   uint64_t actual;bool noMemory=false;
   if(isBig && !direct && !vol.dir) {
@@ -595,8 +610,67 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
 
 void NativeRamBlock::stop(IOService *provider)
 {
-  if (gate) { IOLockLock(gate); online = false; IOLockUnlock(gate); }
+  if (powerJoined) { PMstop(); powerJoined = false; }
+  if (gate) {
+    IOLockLock(gate);
+    online = false;
+    if (power.on()) IOLockWakeup(gate, &power, false);   // held requests see !online and fail
+    IOLockUnlock(gate);
+  }
   IOBlockStorageDevice::stop(provider);
+}
+
+// UniXNU-piano: native-ufs-suspend=1. With the store open read-write the disk joins the power tree below NativeUfs (its power parent),
+// so a system sleep takes it to off before the UFS link goes into Hibern8 and back on after the link is up. Without the argument, or
+// with Data volatile or read only (nothing of the disk is written to UFS), it takes no part, as before.
+void NativeRamBlock::joinPower()
+{
+  if (!gate || powerJoined || !overlay.active || overlay.readOnly) return;
+  IOService *parent = native_ufs_power_parent();
+  if (!parent) return;
+  PMinit();
+  parent->addPowerChild(this);
+  const IOReturn r = registerPowerDriver(this, pianopower::powerStates(), pianopower::kStateCount);
+  if (r != kIOReturnSuccess) {
+    IOLog("NativeRamBlock: power: registerPowerDriver failed (%#x): the Data disk takes no part in a system sleep\n", r);
+    PMstop();
+    return;
+  }
+  changePowerStateTo(pianopower::kOn);
+  powerJoined = true;
+  IOLog("NativeRamBlock: power: native-ufs-suspend=1: the Data disk is NativeUfs's power child (a sleep syncs its store and holds "
+        "its requests before the link goes down, and releases them once the link is back)\n");
+}
+
+IOReturn NativeRamBlock::setPowerState(unsigned long state, IOService *)
+{
+  if (!powerJoined || !gate) return kIOPMAckImplied;
+  struct Store {
+    bool sync() { return native_ufs_store_sync(); }
+    void veto(const char *who) { native_ufs_power_veto(who); }
+  } store;
+  IOLockLock(gate);   // waits for the request in progress: none is half done below
+  if (state != pianopower::kOff) powerSeenOn = true;
+  if (state == pianopower::kOff && !powerSeenOn) {
+    IOLog("NativeRamBlock: power: an off before the first on (not a system sleep): ignored\n");
+  } else if (state == pianopower::kOff) {
+    const bool wasHeld = power.held;
+    const uint64_t t0 = mach_absolute_time();
+    const bool held = power.off(store, overlay.active && !overlay.readOnly);
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+    if (!wasHeld && held)
+      IOLog("NativeRamBlock: suspend %u: store synced in %llu us (state %u, generation %llu, %llu pages present); new requests held\n",
+            power.holds, ns / 1000, native_data_persist_state, overlay.generation, overlay.present);
+    else if (!held)
+      IOLog("NativeRamBlock: suspend: the store's cache sync FAILED (%llu us): the Data disk keeps running and NativeUfs leaves the "
+            "link up for this sleep\n", ns / 1000);
+  } else if (power.on()) {
+    IOLockWakeup(gate, &power, false);
+    IOLog("NativeRamBlock: resume %u: requests released (%llu waits across the sleep)\n", power.holds, powerWaits);
+  }
+  IOLockUnlock(gate);
+  return kIOPMAckImplied;
 }
 
 void NativeRamBlock::free()

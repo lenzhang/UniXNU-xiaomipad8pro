@@ -24,3 +24,8 @@ UniXNU-piano changes of 2026-11-11 (docs/data-store.md):
 - native-ram-trace=1 (2026-11-11, docs/forensics-2026-11-11.md): a console line before and after each step of the store's set-up
   (the waits for IOBSD and NativeUfs's root layout, the GPT check, the window, the header and bitmap I/O, the syncs, the disk's
   registration), with the milliseconds since the publish thread started. Off without the argument; the set-up's I/O is unchanged.
+- The Data disk's part of a system sleep (2026-11-11, NativeUfs's native-ufs-suspend=1, docs/drivers/ufs.md §12): PowerHold.h
+  (new) and in NativeRamBlock.cpp joinPower / setPowerState: with the store open read-write the disk is NativeUfs's power child
+  (native_ufs_power_parent); off syncs the store under the gate and holds new requests (doAsyncReadWrite waits), a failed sync
+  vetoes NativeUfs's suspend (native_ufs_power_veto); on releases them. Without the argument (or with Data volatile) no part, as
+  before. Test/power.cpp (new): PowerHold.h on a store with a volatile write cache and power cuts.

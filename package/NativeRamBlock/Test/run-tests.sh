@@ -4,12 +4,12 @@
 #                                                          to compare with tooling/persist/common.py seed_info
 # From upstream (UniXNU drivers/NativeRamBlock/Test, see ../UPSTREAM): sparse, persist (adapted to the store guard), direct, seeddisk,
 # seed-identity. UniXNU-piano: guard (the store guard, replace, flatten with power cuts, self-contained stores, header compatibility),
-# volatile (VolatileDisk.h). Binaries go to a temporary directory.
+# volatile (VolatileDisk.h), power (PowerHold.h: the Data disk's part of a system sleep). Binaries go to a temporary directory.
 set -euo pipefail
 T=$(cd "$(dirname "$0")" && pwd)
 B=$(mktemp -d); trap 'rm -rf "$B"' EXIT
 fail=0
-for t in sparse persist direct seeddisk guard volatile; do
+for t in sparse persist direct seeddisk guard volatile power; do
   clang++ -std=c++17 -O2 -UNDEBUG -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -o "$B/$t" "$T/$t.cpp" \
     || { echo "FAIL $t: does not build"; fail=1; continue; }
   if out=$("$B/$t" 2>&1); then echo "$t: $out"; else echo "FAIL $t: $out"; fail=1; fi

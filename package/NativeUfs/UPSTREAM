@@ -3,3 +3,17 @@ b11de87c234cf4b8f80a8160fb15e6f37a8e5d0c fix: report unmatched media below a win
 UniXNU-Odin3 6d58c09 (modules/Pagani/drivers/NativeUfs, BSD-2, blu-sharky): RootQueue.h (SM8750 link handling: MCQ guard,
 auto-hibernate off, Hibern8 exit, interrupt aggregation off) and RootDiagnostics.h (its extra fields), taken whole; RootQueue.h
 keeps ShengUfs's gUtrlPhys request-list address.
+
+UniXNU-piano 2026-11-11, the power contract's storage side (docs/drivers/ufs.md §12; UFSHCI and Linux ufshcd/ufs-qcom read as the
+specification only, nothing copied):
+- RootPower.h (new): native-ufs-suspend=1 (hold, drain, SYNCHRONIZE CACHE, AHIT 0, DME_HIBERNATE_ENTER; the undo of any failure;
+  the wake's exit, NOP OUT, AHIT, release, its logged attempts and the panic) and native-ufs-ahit=MS (the run-time AHIT).
+- RootQueue.h: hostLinkCommand also takes DME_HIBERNATE_ENTER (0x17: UHES where the exit has UHXS, the same PWR_LOCAL check);
+  DME_GET and the exit unchanged.
+- RootCommands.h: the queue hold in hostSlotTake (never set without native-ufs-suspend=1); hostSyncCache split into
+  hostAnyWritable / hostSyncOn / hostSyncCache (the same command, retries and refusal).
+- NativeUfs.cpp: the power-tree join, setPowerState, native_ufs_power_parent / native_ufs_power_veto for NativeRamBlock, the AHIT
+  at the end of the bring-up, native_ufs_dme_get refused while held.
+- tests/: ShengUfs b11de87's tests/RootCommandsBridge.cpp and tests/RootCommands.cpp with UniXNU-Odin3 6d58c09's link tests and
+  fault model (BSD-2-Clause-Patent, blu-sharky), merged into Bridge.h, UfsModel.h and RootCommands.cpp; RootPower.cpp and
+  run-tests.sh new.
