@@ -219,6 +219,93 @@ void ar_speaker_defaults(ArSpeakerPlan *p)
     p->stream_id = 0x1001;
 }
 
+/* ------------------------------------------------------------------------------------------- level 4: the PRM clocks alone */
+static const ArStep kClock[] = {
+    {CMD("tdm bit clock 6.144 MHz", clock_on, AR_OP_PRM_REQUEST, ArPrmDone), UNDO(clock_off, AR_OP_PRM_RELEASE, ArPrmDone), 1},
+};
+
+const ArStep *ar_clock_steps(unsigned *count)
+{
+    *count = sizeof kClock / sizeof kClock[0];
+    return kClock;
+}
+
+static uint32_t macro_on(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_prm_vote(o, c, s->prm_port, t, AR_HW_MACRO, 1);}
+static uint32_t macro_off(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_prm_vote(o, c, s->prm_port, t, AR_HW_MACRO, 0);}
+static uint32_t dcodec_on(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_prm_vote(o, c, s->prm_port, t, AR_HW_DCODEC, 1);}
+static uint32_t dcodec_off(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_prm_vote(o, c, s->prm_port, t, AR_HW_DCODEC, 0);}
+static uint32_t va_mclk_on(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_prm_clock(o, c, s->prm_port, t, AR_CLK_TX_CORE_MCLK, AR_VA_MCLK_HZ);}
+static uint32_t va_mclk_off(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_prm_clock(o, c, s->prm_port, t, AR_CLK_TX_CORE_MCLK, 0);}
+
+#define VA_STEPS \
+    {CMD("LPASS macro vote", macro_on, AR_OP_PRM_REQUEST, ArPrmDone), UNDO(macro_off, AR_OP_PRM_RELEASE, ArPrmDone), 1}, \
+    {CMD("LPASS digital codec vote", dcodec_on, AR_OP_PRM_REQUEST, ArPrmDone), UNDO(dcodec_off, AR_OP_PRM_RELEASE, ArPrmDone), 1}, \
+    {CMD("VA macro mclk 19.2 MHz (TX core mclk)", va_mclk_on, AR_OP_PRM_REQUEST, ArPrmDone), UNDO(va_mclk_off, AR_OP_PRM_RELEASE, ArPrmDone), 1}
+static const ArStep kVa[] = {VA_STEPS};
+
+const ArStep *ar_va_steps(unsigned *count)
+{
+    *count = sizeof kVa / sizeof kVa[0];
+    return kVa;
+}
+
+/* ------------------------------------------------------------------------------------------------- the microphone plan */
+static const ArMicPlan *mic(const ArSeq *s) {return (const ArMicPlan *)s->context;}
+static uint32_t open_mic(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_open_mic_device(o, c, s->port, t);}
+static uint32_t close_mic(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_graph_command(o, c, s->port, t, AR_OP_GRAPH_CLOSE, AR_SG_MIC);}
+static uint32_t mic_dev(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_config_mic_device(o, c, s->port, t, &mic(s)->device, mic(s)->channel_mask);}
+static uint32_t mic_log(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_config_mic_logger(o, c, s->port, t);}
+static uint32_t open_cap(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_open_capture_stream(o, c, s->port, t);}
+static uint32_t close_cap(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_graph_command(o, c, s->port, t, AR_OP_GRAPH_CLOSE, AR_SG_CAPTURE);}
+static uint32_t cap_cfg(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_config_capture_stream(o, c, s->port, t, &mic(s)->stream);}
+static uint32_t cap_log(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_config_capture_logger(o, c, s->port, t);}
+static uint32_t map_cap(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t)
+{
+    const ArMicPlan *p = mic(s);
+    uint64_t address;
+    if (p->buffer_phys % 4096u || ar_dsp_address(p->buffer_phys, p->stream_id, &address)) return 0;   /* not DSP-addressable */
+    return ar_map(o, c, s->port, t, address, p->buffer_bytes);
+}
+static uint32_t prep_mic(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_graph_command(o, c, s->port, t, AR_OP_GRAPH_PREPARE, AR_SG_MIC);}
+static uint32_t prep_cap(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_graph_command(o, c, s->port, t, AR_OP_GRAPH_PREPARE, AR_SG_CAPTURE);}
+static uint32_t start_mic(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_graph_command(o, c, s->port, t, AR_OP_GRAPH_START, AR_SG_MIC);}
+static uint32_t stop_mic(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_graph_command(o, c, s->port, t, AR_OP_GRAPH_STOP, AR_SG_MIC);}
+static uint32_t start_cap(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_graph_command(o, c, s->port, t, AR_OP_GRAPH_START, AR_SG_CAPTURE);}
+static uint32_t stop_cap(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_graph_command(o, c, s->port, t, AR_OP_GRAPH_STOP, AR_SG_CAPTURE);}
+
+#define MIC_PREPARED 12u
+static const ArStep kMic[] = {
+    VA_STEPS,
+    {CMD("open mic device graph", open_mic, AR_OP_GRAPH_OPEN, ArBasicResult), UNDO(close_mic, AR_OP_GRAPH_CLOSE, ArBasicResult), 0},
+    {CMD("mic device VA TX0 codec DMA", mic_dev, AR_OP_SET_CFG, ArBasicResult), NOUNDO, 0},
+    {CMD("mic device logger", mic_log, AR_OP_SET_CFG, ArBasicResult), NOUNDO, 0},
+    {CMD("open capture stream graph", open_cap, AR_OP_GRAPH_OPEN, ArBasicResult), UNDO(close_cap, AR_OP_GRAPH_CLOSE, ArBasicResult), 0},
+    {CMD("capture MFC, converter and encoder", cap_cfg, AR_OP_SET_CFG, ArBasicResult), NOUNDO, 0},
+    {CMD("capture logger", cap_log, AR_OP_SET_CFG, ArBasicResult), NOUNDO, 0},
+    {CMD("map the capture buffer", map_cap, AR_OP_MEM_MAP, ArMapped), UNDO(unmap, AR_OP_MEM_UNMAP, ArBasicResult), 0},
+    {CMD("prepare mic device", prep_mic, AR_OP_GRAPH_PREPARE, ArBasicResult), NOUNDO, 0},
+    {CMD("prepare capture", prep_cap, AR_OP_GRAPH_PREPARE, ArBasicResult), NOUNDO, 0},
+    {CMD("start mic device", start_mic, AR_OP_GRAPH_START, ArBasicResult), UNDO(stop_mic, AR_OP_GRAPH_STOP, ArBasicResult), 0},
+    {CMD("start capture", start_cap, AR_OP_GRAPH_START, ArBasicResult), UNDO(stop_cap, AR_OP_GRAPH_STOP, ArBasicResult), 0},
+};
+_Static_assert(MIC_PREPARED < sizeof kMic / sizeof kMic[0], "the mic plan's prepared prefix");
+
+const ArStep *ar_mic_steps(unsigned *count, unsigned *prepared)
+{
+    *count = sizeof kMic / sizeof kMic[0];
+    if (prepared) *prepared = MIC_PREPARED;
+    return kMic;
+}
+
+void ar_mic_defaults(ArMicPlan *p)
+{
+    for (unsigned i = 0; i < sizeof *p; ++i) ((uint8_t *)p)[i] = 0;
+    p->device.rate = 48000; p->device.bits = 16; p->device.channels = 2;
+    p->stream.rate = 48000; p->stream.bits = 16; p->stream.channels = 2;
+    p->channel_mask = 0x3;
+    p->stream_id = 0x1001;
+}
+
 /* --------------------------------------------------------------------------------------------------------- the period pump */
 int ar_pump_init(ArPump *p, uint64_t base, uint32_t handle, uint32_t port, uint32_t slots, uint32_t period_bytes, uint32_t depth,
                  uint32_t late_ms)

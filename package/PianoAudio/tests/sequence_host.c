@@ -29,8 +29,14 @@ static void describe(const uint8_t *b, uint32_t n)
     CHECK(gpr_decode(b, n, &p) == GprOk && p.size == n && n <= GPR_MAX_PACKET);
     char s[40];
     switch (p.opcode) {
-    case AR_OP_PRM_REQUEST: snprintf(s, sizeof s, "PRM REQ %#x %u", le32(p.payload + 36), le32(p.payload + 40)); break;
-    case AR_OP_PRM_RELEASE: snprintf(s, sizeof s, "PRM REL %#x", le32(p.payload + 36)); break;
+    case AR_OP_PRM_REQUEST:
+        if (le32(p.payload + 20) == 0x08001032u) snprintf(s, sizeof s, "PRM VOTE %u", le32(p.payload + 32));
+        else snprintf(s, sizeof s, "PRM REQ %#x %u", le32(p.payload + 36), le32(p.payload + 40));
+        break;
+    case AR_OP_PRM_RELEASE:
+        if (le32(p.payload + 20) == 0x08001032u) snprintf(s, sizeof s, "PRM UNVOTE %u", le32(p.payload + 32));
+        else snprintf(s, sizeof s, "PRM REL %#x", le32(p.payload + 36));
+        break;
     case AR_OP_GRAPH_OPEN: snprintf(s, sizeof s, "OPEN %#x", le32(p.payload + 36)); break;
     case AR_OP_GRAPH_PREPARE: snprintf(s, sizeof s, "PREPARE %#x", le32(p.payload + 36)); break;
     case AR_OP_GRAPH_START: snprintf(s, sizeof s, "START %#x", le32(p.payload + 36)); break;
@@ -366,6 +372,120 @@ static void testPump(void)
     CHECK(p.next == 7 && p.in_flight == 4);
 }
 
+// ---- level 4's PRM plans and the microphone plan: the same rule, other steps. A plan's expected forward lines and the undo of each.
+struct PlanCase {const char *const *up, *const *undo; unsigned n;};
+static void run_plan(const ArStep *steps, unsigned count, void *context, uint32_t apm, uint32_t prm, const struct PlanCase *pc)
+{
+    // up and stop
+    ArSeq s;
+    ar_seq_init(&s, steps, count, apm, prm, 0x200, context);
+    lines = 0;
+    struct Dsp d = healthy();
+    drive(&s, &d);
+    CHECK(s.state == ArSeqUp && lines == count);
+    for (unsigned i = 0; i < count; ++i) CHECK(!strcmp(lg[i], pc->up[i]));
+    ar_seq_stop(&s);
+    drive(&s, &d);
+    CHECK(s.state == ArSeqDown && s.undo_errors == 0);
+    unsigned at = count;
+    for (int i = (int)count - 1; i >= 0; --i) {
+        if (!pc->undo[i]) continue;
+        CHECK(at < lines && !strcmp(lg[at], pc->undo[i]));
+        ++at;
+    }
+    CHECK(at == lines);
+    // refused and unanswered at every step
+    for (unsigned k = 0; k < count; ++k)
+        for (int timeout = 0; timeout < 2; ++timeout) {
+            ar_seq_init(&s, steps, count, apm, prm, 0x200, context);
+            lines = 0;
+            d = healthy();
+            if (timeout) d.timeout_at = (int)k; else {d.fail_at = (int)k; d.fail_status = 1;}
+            drive(&s, &d);
+            CHECK(s.state == ArSeqFailed && s.failed_step == (int)k && s.error == (timeout ? ArSeqErrTimeout : ArSeqErrStatus));
+            at = k + 1;
+            for (int i = (int)k - (timeout ? 0 : 1); i >= 0; --i) {
+                if (!pc->undo[i] || (timeout && (unsigned)i == k && !strncmp(pc->undo[i], "UNMAP", 5))) continue;
+                CHECK(at < lines && !strcmp(lg[at], pc->undo[i]));
+                ++at;
+            }
+            CHECK(at == lines);
+        }
+}
+
+// A packet of the plan leaves from the port the step names: PRM requests from the PRM port, everything else from the APM port.
+static void check_ports(const ArStep *steps, unsigned count, void *context, uint32_t apm, uint32_t prm)
+{
+    ArSeq s;
+    ar_seq_init(&s, steps, count, apm, prm, 0x200, context);
+    uint8_t pkt[GPR_MAX_PACKET], rsp[GPR_MAX_PACKET];
+    struct Dsp d = healthy();
+    for (unsigned i = 0; i < count; ++i) {
+        const uint32_t n = ar_seq_next(&s, pkt, sizeof pkt);
+        GprPacket p;
+        CHECK(n && gpr_decode(pkt, n, &p) == GprOk);
+        const int is_prm = p.opcode == AR_OP_PRM_REQUEST || p.opcode == AR_OP_PRM_RELEASE;
+        CHECK(p.src_port == (is_prm ? prm : apm) && s.pending_port == p.src_port && p.dst_port == (is_prm ? AR_PRM_IID : AR_APM_IID));
+        CHECK(ar_seq_receive(&s, rsp, answer(&d, pkt, n, rsp, 0)) == ArSeqAdvanced);
+    }
+    CHECK(ar_seq_next(&s, pkt, sizeof pkt) == 0 && s.state == ArSeqUp);
+}
+
+static void testClockPlans(void)
+{
+    unsigned count;
+    const ArStep *steps = ar_clock_steps(&count);
+    static const char *up1[] = {"PRM REQ 0x202 6144000"}, *undo1[] = {"PRM REL 0x202"};
+    const struct PlanCase clock = {up1, undo1, 1};
+    CHECK(count == 1);
+    run_plan(steps, count, 0, AR_PORT_APM, AR_PORT_PRM, &clock);
+    check_ports(steps, count, 0, 0x2001, 2);   // sheng's set
+    check_ports(steps, count, 0, 3, 7);        // SunUEFI's set
+    // the request byte for byte: attribute 1 ("couple no"), the default root
+    ArSeq s;
+    uint8_t pkt[GPR_MAX_PACKET];
+    ar_seq_init(&s, steps, count, AR_PORT_APM, AR_PORT_PRM, 0x200, 0);
+    const uint32_t n = ar_seq_next(&s, pkt, sizeof pkt);
+    CHECK(n == 24 + 16 + 16 + 4 + 16 && le32(pkt + 24 + 20) == 0x0800102Cu && le32(pkt + 24 + 32) == 1 && le32(pkt + 24 + 36) == AR_CLK_SEC_TDM_IBIT);
+    CHECK(le32(pkt + 24 + 40) == 6144000u && le32(pkt + 24 + 44) == 1 && le32(pkt + 24 + 48) == 0 && le32(pkt + 16) == 0x200);
+
+    steps = ar_va_steps(&count);
+    static const char *up2[] = {"PRM VOTE 1", "PRM VOTE 2", "PRM REQ 0x30c 19200000"};
+    static const char *undo2[] = {"PRM UNVOTE 1", "PRM UNVOTE 2", "PRM REL 0x30c"};
+    const struct PlanCase va = {up2, undo2, 3};
+    CHECK(count == 3 && !strcmp(steps[2].name, "VA macro mclk 19.2 MHz (TX core mclk)"));
+    run_plan(steps, count, 0, AR_PORT_APM, AR_PORT_PRM, &va);
+    check_ports(steps, count, 0, 0x2001, 2);
+}
+
+static void testMicPlan(void)
+{
+    ArMicPlan mp;
+    ar_mic_defaults(&mp);
+    mp.buffer_phys = 0x9da10000ull; mp.buffer_bytes = 8 * 1920;
+    CHECK(mp.device.channels == 2 && mp.device.bits == 16 && mp.stream.channels == 2 && mp.channel_mask == 3 && mp.stream_id == 0x1001);
+    unsigned count, prepared;
+    const ArStep *steps = ar_mic_steps(&count, &prepared);
+    CHECK(count == 14 && prepared == 12 && !strcmp(steps[prepared - 1].name, "prepare capture"));
+    static const char *up[] = {"PRM VOTE 1", "PRM VOTE 2", "PRM REQ 0x30c 19200000", "OPEN 0x4008", "CFG 0x6080", "CFG 0x6081",
+                               "OPEN 0x4003", "CFG 0x6021", "CFG 0x6020", "MAP 0x19da10000", "PREPARE 0x4008", "PREPARE 0x4003",
+                               "START 0x4008", "START 0x4003"};
+    static const char *undo[] = {"PRM UNVOTE 1", "PRM UNVOTE 2", "PRM REL 0x30c", "CLOSE 0x4008", 0, 0, "CLOSE 0x4003", 0, 0,
+                                 "UNMAP 0x77", 0, 0, "STOP 0x4008", "STOP 0x4003"};
+    const struct PlanCase full = {up, undo, 14}, open = {up, undo, 12};
+    run_plan(steps, prepared, &mp, AR_PORT_APM, AR_PORT_PRM, &open);   // level 6: open and prepare only
+    run_plan(steps, count, &mp, AR_PORT_APM, AR_PORT_PRM, &full);      // level 10
+    check_ports(steps, count, &mp, 1, 2);
+    // a capture buffer the DSP cannot address is never mapped
+    mp.buffer_phys = 0x8c0010000ull;
+    ArSeq s;
+    ar_seq_init(&s, steps, prepared, AR_PORT_APM, AR_PORT_PRM, 0x200, &mp);
+    lines = 0;
+    struct Dsp d = healthy();
+    drive(&s, &d);
+    CHECK(s.state == ArSeqFailed && s.error == ArSeqErrBuild && s.failed_step == 9);
+}
+
 int main(void)
 {
     testUpAndStop();
@@ -377,6 +497,8 @@ int main(void)
     testIgnored();
     testMapProblems();
     testPump();
+    testClockPlans();
+    testMicPlan();
     printf("PASS sequence: %u checks\n", checks);
     return 0;
 }

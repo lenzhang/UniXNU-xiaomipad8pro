@@ -91,6 +91,27 @@ typedef struct {
 const ArStep *ar_speaker_steps(unsigned *count);
 void ar_speaker_defaults(ArSpeakerPlan *p);
 
+/* ---- level 4: the LPASS clocks are the DSP's resources (PRM), requested and released through the sequencer (no context needed):
+ *   the TDM bit clock alone: SEC_TDM_IBIT 0x202 at 6.144 MHz, attribute 1; released by its undo
+ *   the VA macro's: the LPASS macro vote (hardware core 1), the digital codec vote (2), its mclk (TX core mclk 0x30c, 19.2 MHz,
+ *   attribute 1), in the order Ubuntu's VA macro enables them; released in reverse */
+const ArStep *ar_clock_steps(unsigned *count);
+const ArStep *ar_va_steps(unsigned *count);
+
+/* ---- the microphone plan: the VA clocks (as ar_va_steps), the mic device graph (VA TX0 codec DMA, logger) and the capture stream
+ * (logger, MFC, converter, encoder, RD_SH) opened and configured, the capture buffer mapped, both prepared, both started; undone in
+ * reverse. Level 6 runs it up to `prepared` steps (open and prepare, no start); level 10 runs it all. */
+typedef struct {
+    ArFormat device;         /* VA TX0: 48000, 16, 2 (Ubuntu's topology) */
+    ArFormat stream;         /* what the kernel reads: 48000, 16, 2 */
+    uint32_t channel_mask;   /* VA TX0's codec DMA channels: 0x3 (DEC0, DEC1) */
+    uint64_t buffer_phys;    /* the capture buffer: below 4 GiB, 4 KiB aligned */
+    uint32_t buffer_bytes;
+    uint32_t stream_id;      /* 0x1001 */
+} ArMicPlan;
+const ArStep *ar_mic_steps(unsigned *count, unsigned *prepared);
+void ar_mic_defaults(ArMicPlan *p);
+
 /* ---- the period pump: a running stream keeps up to `depth` periods queued at the DSP, each slot of the mapped buffer written by the
  * owner before its WRITE goes out, refilled as WRITE_DONE returns it. A WRITE_DONE with an error, for an unknown slot, or a period out
  * longer than late_ms is an error: the owner then zeroes, aborts the sequence and powers the amplifiers down. */

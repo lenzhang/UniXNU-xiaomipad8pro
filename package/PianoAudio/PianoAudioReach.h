@@ -148,7 +148,12 @@ int ar_dsp_address(uint64_t phys, uint32_t stream_id, uint64_t *out);
 #define AR_OP_PRM_REQUEST_DONE 0x02001002u
 #define AR_OP_PRM_RELEASE_DONE 0x02001003u
 #define AR_CLK_SEC_TDM_IBIT 0x202u   /* the secondary TDM's internal bit clock: PRM's id (the DT's index is 37 = 0x25) */
-#define AR_CLK_VA_CORE_MCLK 0x307u   /* sheng's SM8550 value; piano's: needs-boot (level 3) */
+#define AR_CLK_VA_CORE_MCLK 0x307u   /* PRM's VA core mclk: not what piano's VA macro names (below) */
+/* piano's VA macro (DT codec@7660000) names <q6prmcc 0x39 1> as its "mclk": DT index 57 = LPASS_CLK_ID_TX_CORE_MCLK, PRM's 0x30c
+ * (the same clock the TX macro names), at twice the macro's 9.6 MHz as Ubuntu's VA macro sets it, attribute 1 ("couple no"); its
+ * "macro" and "dcodec" are the votes 0x66 / 0x67 = LPASS_HW_MACRO_VOTE / _DCODEC_VOTE, PRM's hardware cores 1 and 2. */
+#define AR_CLK_TX_CORE_MCLK 0x30cu
+#define AR_VA_MCLK_HZ 19200000u
 #define AR_HW_MACRO 1u
 #define AR_HW_DCODEC 2u
 uint32_t ar_prm_clock(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t clock_id, uint32_t hz);

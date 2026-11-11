@@ -189,12 +189,68 @@ static void testLink(void)
     CHECK(l.state == AlQuerying && l.spf.ignored == 2);
 }
 
+// The GPR source ports (audio.md 10.10): the three sets, and level 2's walk over them while nobody answers.
+static void testPorts(void)
+{
+    CHECK(audio_ports(AudioPortsUbuntu)->apm == 1 && audio_ports(AudioPortsUbuntu)->prm == 2 && audio_ports(AudioPortsUbuntu)->data == 0x10000000u);
+    CHECK(audio_ports(AudioPortsSheng)->apm == 0x2001 && audio_ports(AudioPortsSheng)->prm == 2 && audio_ports(AudioPortsSheng)->data == 0x2001);
+    CHECK(audio_ports(AudioPortsSun)->apm == 3 && audio_ports(AudioPortsSun)->prm == 7 && !audio_ports(3) && !audio_ports(-1));
+    CHECK(!strcmp(audio_ports(0)->name, "Ubuntu") && !strcmp(audio_ports(1)->name, "sheng") && !strcmp(audio_ports(2)->name, "SunUEFI"));
+    AudioLink l;
+    uint8_t q[GPR_HEADER_BYTES], a[GPR_MAX_PACKET];
+    AdgObservation o = healthy();
+    // without a try mask: two silent queries from port 1, then given up (no other port is tried)
+    audio_link_init_ports(&l, AudioPortsUbuntu, 0, 2, 0);
+    uint32_t t = 0;
+    CHECK(audio_link_tick(&l, &o, t, q) == 24 && le32(q + 8) == 1 && le32(q + 12) == 1);
+    CHECK(audio_link_tick(&l, &o, t += 1000, q) == 0 && audio_link_tick(&l, &o, t += 500, q) == 24 && le32(q + 8) == 1);
+    CHECK(audio_link_tick(&l, &o, t += 1000, q) == 0 && l.state == AlGaveUp && l.set == AudioPortsUbuntu && l.switches == 0);
+    CHECK(l.queries[0] == 2 && l.queries[1] == 0);
+    // walking: Ubuntu's silent, sheng's refuses (someone listens: kept), then answers ready from 0x2001
+    audio_link_init_ports(&l, AudioPortsUbuntu, 0x7, 2, 0);
+    t = 0;
+    CHECK(audio_link_tick(&l, &o, t, q) == 24 && le32(q + 8) == 1);
+    CHECK(audio_link_tick(&l, &o, t += 1000, q) == 0 && audio_link_tick(&l, &o, t += 500, q) == 24);
+    CHECK(audio_link_tick(&l, &o, t += 1000, q) == 0 && l.state != AlGaveUp && l.set == AudioPortsSheng && l.switches == 1);
+    CHECK(audio_link_tick(&l, &o, t += 100, q) == 0);   // the retry pause first
+    CHECK(audio_link_tick(&l, &o, t += 400, q) == 24 && le32(q + 8) == 0x2001 && l.queries[1] == 1);
+    // an answer for the old port is not ours any more
+    uint32_t n = apm_answer(q, a, 1, 0);
+    a[12] = 1; a[13] = 0;   // to port 1
+    audio_link_receive(&l, a, n, t + 5);
+    CHECK(l.state == AlQuerying && l.spf.ignored == 1);
+    audio_link_receive(&l, a, apm_answer(q, a, 0, 1), t + 10);   // refused: this port is served
+    CHECK(audio_link_tick(&l, &o, t += 600, q) == 24 && le32(q + 8) == 0x2001);
+    CHECK(audio_link_tick(&l, &o, t += 1000, q) == 0 && l.state == AlGaveUp && l.set == AudioPortsSheng);   // no switch after an answer
+    // walking from Ubuntu's straight to SunUEFI's (sheng's not allowed), ready from port 3
+    audio_link_init_ports(&l, AudioPortsUbuntu, 1u << AudioPortsSun, 1, 0);
+    t = 0;
+    CHECK(audio_link_tick(&l, &o, t, q) == 24 && le32(q + 8) == 1);
+    CHECK(audio_link_tick(&l, &o, t += 1000, q) == 0 && l.set == AudioPortsSun);
+    CHECK(audio_link_tick(&l, &o, t += 500, q) == 24 && le32(q + 8) == 3);
+    audio_link_receive(&l, a, apm_answer(q, a, 1, 0), t + 3);
+    CHECK(l.state == AlReady && l.set == AudioPortsSun && l.tried == 5);
+    // every set tried once only: silence everywhere gives up after the third
+    audio_link_init_ports(&l, AudioPortsSun, 0x7, 1, 0);
+    t = 0;
+    for (int k = 0; k < 3; ++k) {
+        CHECK(audio_link_tick(&l, &o, t += 500, q) == 24);
+        CHECK(le32(q + 8) == (k == 0 ? 3u : k == 1 ? 1u : 0x2001u));
+        audio_link_tick(&l, &o, t += 1000, q);
+    }
+    CHECK(l.state == AlGaveUp && l.switches == 2 && l.tried == 7);
+    // an unknown set falls back to Ubuntu's
+    audio_link_init_ports(&l, 9, 0, 1, 0);
+    CHECK(l.set == AudioPortsUbuntu && l.spf.port == 1);
+}
+
 int main(void)
 {
     testGuardWaits();
     testGuardOff();
     testInbox();
     testLink();
+    testPorts();
     printf("PASS dsplink: %u checks\n", checks);
     return 0;
 }

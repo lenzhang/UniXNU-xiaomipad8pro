@@ -213,6 +213,61 @@ static void testOutputPeriod(void)
     CHECK(audio_output_period(&two, &r, stereo, 480, scratch) == 0);   // only a four-channel chain feeds the DSP
 }
 
+// Level 7's walk: one slot at a time in slot order, each at most -20 dBFS, gaps of zeros, the limits refused.
+static int16_t walk[4 * AUDIO_RATE * 4];
+static void testWalk(void)
+{
+    AudioWalk w;
+    CHECK(audio_walk_init(&w, 0, 600, 150, AUDIO_TEST_PEAK) == -1);                  // nothing to play
+    CHECK(audio_walk_init(&w, 0x10, 600, 150, AUDIO_TEST_PEAK) == -1);               // a fifth slot
+    CHECK(audio_walk_init(&w, 0xf, 600, 150, AUDIO_TEST_PEAK + 1) == -1);            // above -20 dBFS
+    CHECK(audio_walk_init(&w, 0xf, 800, 0, AUDIO_TEST_PEAK) == -1);                  // 3.2 s of tone in all
+    CHECK(audio_walk_init(&w, 0xf, 30, 0, AUDIO_TEST_PEAK) == -1);                   // shorter than the two ramps
+    CHECK(audio_walk_init(&w, 0x3, 1500, 1100, AUDIO_TEST_PEAK) == -1);              // 4.1 s with the gap
+    CHECK(audio_walk_init(&w, 0x1, 3000, 0, AUDIO_TEST_PEAK) == 0);                  // one slot, the full 3 s
+    CHECK(audio_walk_init(&w, 0xf, 600, 150, AUDIO_TEST_PEAK) == 0 && w.count == 4); // the default: 2.85 s
+    const uint32_t total = 4 * 600 * 48 + 3 * 150 * 48;
+    uint32_t tone = 0, at = 0;
+    while (at < total + 4800) {   // in 10 ms periods, and past the end
+        CHECK(at / 480 < (total + 4800) / 480 + 1);
+        tone += audio_walk_fill(&w, walk + at * 4, 480);
+        at += 480;
+    }
+    CHECK(tone == 4 * 600 * 48 && w.tone_total == tone && audio_walk_slot(&w) == -1 && w.done);
+    // each frame: at most one slot carries sound, the slot of its segment; never above -20 dBFS
+    int peak[4] = {0, 0, 0, 0};
+    for (uint32_t f = 0; f < at; ++f) {
+        const uint32_t seg = f / (750 * 48), within = f % (750 * 48);
+        const int expect = f < total && within < 600 * 48 ? (int)seg : -1;
+        for (int c = 0; c < 4; ++c) {
+            const int v = abs(walk[f * 4 + c]);
+            CHECK(v <= AUDIO_TEST_PEAK);
+            if (c != expect) CHECK(v == 0);
+            if (v > peak[c]) peak[c] = v;
+        }
+    }
+    for (int c = 0; c < 4; ++c) CHECK(peak[c] > AUDIO_TEST_PEAK * 99 / 100);   // each slot heard at the test level
+    // a mask of two (TR, BR) walks only those, in slot order
+    CHECK(audio_walk_init(&w, 0xa, 500, 100, 1000) == 0 && w.slots[0] == 1 && w.slots[1] == 3);
+    memset(walk, 0, sizeof walk);
+    audio_walk_fill(&w, walk, 1100 * 48);
+    for (uint32_t f = 0; f < 1100 * 48; ++f) {
+        CHECK(walk[f * 4] == 0 && walk[f * 4 + 2] == 0 && abs(walk[f * 4 + 1]) <= 1000 && abs(walk[f * 4 + 3]) <= 1000);
+        if (f < 500 * 48) CHECK(walk[f * 4 + 3] == 0);
+        if (f >= 500 * 48) CHECK(walk[f * 4 + 1] == 0);
+    }
+    CHECK(w.done && audio_walk_slot(&w) == -1);
+    // through the chain at the test ceiling: still nothing above -20 dBFS
+    AudioChain c;
+    audio_chain_init(&c, 4);
+    CHECK(audio_walk_init(&w, 0xf, 600, 150, AUDIO_TEST_PEAK) == 0);
+    for (uint32_t f = 0; f < total; f += 480) {
+        audio_walk_fill(&w, walk, 480);
+        audio_chain_run(&c, walk, 480);
+        for (int i = 0; i < 480 * 4; ++i) CHECK(abs(walk[i]) <= AUDIO_CEILING_TEST);
+    }
+}
+
 int main(void)
 {
     testMapping();
@@ -222,6 +277,7 @@ int main(void)
     testGuard();
     testRing();
     testOutputPeriod();
+    testWalk();
     printf("PASS pcm: %u checks\n", checks);
     return 0;
 }

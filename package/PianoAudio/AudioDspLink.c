@@ -86,6 +86,14 @@ uint32_t audio_inbox_get(AudioInbox *b, uint8_t *out, uint32_t capacity)
     return n;
 }
 
+static const AudioPorts kPorts[AUDIO_PORT_SETS] = {
+    {"Ubuntu", "Ubuntu's piano kernel: the DT's service ids, dynamic data ports", 1u, 2u, 0x10000000u},
+    {"sheng", "UniXNU-sheng on SM8550: 0x2001, PRM from its service id", 0x2001u, 2u, 0x2001u},
+    {"SunUEFI", "Project-SunUEFI's piano note: the downstream service ids", 3u, 7u, 0x10000000u},
+};
+
+const AudioPorts *audio_ports(int set) {return set >= 0 && set < AUDIO_PORT_SETS ? &kPorts[set] : 0;}
+
 void audio_link_init(AudioLink *l, uint32_t port, uint32_t max_queries, uint32_t settle_ms)
 {
     zero(l, sizeof *l);
@@ -94,6 +102,35 @@ void audio_link_init(AudioLink *l, uint32_t port, uint32_t max_queries, uint32_t
     l->state = AlWaiting;
     l->answer_ms = 1000;
     l->retry_ms = 500;
+    l->set = -1;
+    l->max_queries = max_queries;
+}
+
+void audio_link_init_ports(AudioLink *l, int set, uint32_t try_mask, uint32_t max_queries, uint32_t settle_ms)
+{
+    if (!audio_ports(set)) set = AudioPortsUbuntu;
+    audio_link_init(l, kPorts[set].apm, max_queries, settle_ms);
+    l->set = set;
+    l->try_mask = try_mask & ((1u << AUDIO_PORT_SETS) - 1u);
+    l->tried = 1u << set;
+}
+
+/* Out of tries on this set and nobody answered: the next set allowed takes over (1), or there is none (0). */
+static int next_set(AudioLink *l)
+{
+    if (l->set < 0 || l->spf.answers || l->spf.errors) return 0;
+    for (int i = 1; i < AUDIO_PORT_SETS; ++i) {
+        const int s = (l->set + i) % AUDIO_PORT_SETS;
+        if (!(l->try_mask >> s & 1u) || (l->tried >> s & 1u)) continue;
+        l->set = s;
+        l->tried |= 1u << s;
+        l->switches++;
+        gpr_spf_init(&l->spf, kPorts[s].apm, l->max_queries);
+        l->state = AlWaiting;
+        l->retry_armed = 0;
+        return 1;
+    }
+    return 0;
 }
 
 static int finished(const AudioLink *l) {return l->state == AlReady || l->state == AlGaveUp || l->state == AlOff;}
@@ -105,17 +142,18 @@ uint32_t audio_link_tick(AudioLink *l, const AdgObservation *o, uint32_t now_ms,
     if (finished(l)) return 0;
     if (l->spf.state == SpfWaiting) {
         if (now_ms - l->sent_at >= l->answer_ms) {
-            if (gpr_spf_timeout(&l->spf) == SpfDone) {l->state = AlGaveUp; return 0;}
+            if (gpr_spf_timeout(&l->spf) == SpfDone && !next_set(l)) {l->state = AlGaveUp; return 0;}
             l->retry_at = now_ms + l->retry_ms; l->retry_armed = 1;
         }
         return 0;
     }
-    if (l->spf.state == SpfGaveUp) {l->state = AlGaveUp; return 0;}
+    if (l->spf.state == SpfGaveUp && !next_set(l)) {l->state = AlGaveUp; return 0;}
     if (g != AdgRun || (l->retry_armed && (int32_t)(now_ms - l->retry_at) < 0)) return 0;
     const uint32_t n = gpr_spf_next(&l->spf, out);
     if (!n) {l->state = AlGaveUp; return 0;}
     l->retry_armed = 0;
     l->sent_at = now_ms;
+    if (l->set >= 0) l->queries[l->set]++;
     if (!l->first_sent) l->first_sent = now_ms ? now_ms : 1;
     l->state = AlQuerying;
     return n;
@@ -126,6 +164,7 @@ void audio_link_unsent(AudioLink *l)
     if (l->spf.state != SpfWaiting) return;
     l->spf.state = SpfIdle;
     l->spf.queries--;
+    if (l->set >= 0 && l->queries[l->set]) l->queries[l->set]--;
 }
 
 void audio_link_receive(AudioLink *l, const uint8_t *data, uint32_t length, uint32_t now_ms)

@@ -60,6 +60,23 @@ void audio_inbox_init(AudioInbox *b);
 int audio_inbox_put(AudioInbox *b, const uint8_t *data, uint32_t length);   /* 0, or -1 (full or too long: counted) */
 uint32_t audio_inbox_get(AudioInbox *b, uint8_t *out, uint32_t capacity);  /* a packet's length, or 0 */
 
+/* ---- the GPR source ports (docs/drivers/audio.md 10.10): the ports our APM commands, PRM requests and data commands leave from (the
+ * DSP answers to the port a command came from). Three stacks that ran on this DSP family disagree, so the set is a boot argument
+ * (piano-audio-ports=N, Ubuntu's by default) and level 2's readiness query can walk the others while nobody answers:
+ *   0 Ubuntu   APM 1, PRM 2, data from 0x10000000: Ubuntu's piano kernel (Linux gpr: the DT's service ids, dynamic data ports), the
+ *              one stack that plays on this tablet
+ *   1 sheng    APM and data 0x2001, PRM 2: UniXNU-sheng on SM8550 (hardware-verified there; its first PRM vote from 0x2001 was
+ *              refused with status 1, from 2 it was granted); the K90's SM8750 port used 0x2001 for the APM
+ *   2 SunUEFI  APM 3, PRM 7, data from 0x10000000: Project-SunUEFI's note that its piano ADSP answered only the static ports of the
+ *              downstream service ids and dropped port 1 */
+enum {AudioPortsUbuntu = 0, AudioPortsSheng = 1, AudioPortsSun = 2, AUDIO_PORT_SETS = 3};
+typedef struct {
+    const char *name, *source;
+    uint32_t apm, prm, data;
+} AudioPorts;
+/* The set, or null for an unknown one. */
+const AudioPorts *audio_ports(int set);
+
 /* ---- level 2: the APM readiness exchange under the guard */
 enum {AlWaiting = 0, AlQuerying, AlReady, AlGaveUp, AlOff};
 typedef struct {
@@ -69,8 +86,16 @@ typedef struct {
     uint32_t answer_ms, retry_ms;        /* 1000, 500 */
     uint32_t sent_at, retry_at, ready_at, first_sent;
     int retry_armed;
+    int set;                             /* the port set in use (audio_ports), -1 for a bare port */
+    uint32_t try_mask, tried;            /* sets that may be tried while nobody answers / sets tried (bit per set) */
+    uint32_t max_queries, switches;
+    uint32_t queries[AUDIO_PORT_SETS];   /* readiness queries sent from each set */
 } AudioLink;
 void audio_link_init(AudioLink *l, uint32_t port, uint32_t max_queries, uint32_t settle_ms);
+/* The same with a port set: the query leaves from the set's APM port; when max_queries of them go unanswered (no answer and no
+ * refusal: nobody listens on that port), the next set of try_mask after the current one (each once) takes over. An answer of any
+ * kind (ready, not ready, refused) keeps the set. */
+void audio_link_init_ports(AudioLink *l, int set, uint32_t try_mask, uint32_t max_queries, uint32_t settle_ms);
 /* One tick: returns the packet to queue now (out holds it), or 0. */
 uint32_t audio_link_tick(AudioLink *l, const AdgObservation *o, uint32_t now_ms, uint8_t out[GPR_HEADER_BYTES]);
 /* The packet the tick returned was refused by the queue: it is asked again at a later tick. */

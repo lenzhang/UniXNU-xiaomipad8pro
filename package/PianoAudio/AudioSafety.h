@@ -67,8 +67,30 @@ int audio_tone_init(AudioTone *t, int32_t peak, uint32_t frames);
 /* Fills count frames of `channels` (the same sample on each); returns the frames of tone (the rest are zeros). */
 uint32_t audio_tone_fill(AudioTone *t, int16_t *frames, uint32_t count, unsigned channels);
 
+/* ---- level 7's tone: a walk over the speakers in slot order (TL, TR, BL, BR, as many as the mask selects), one at a time: the
+ * test tone (AudioTone: 1 kHz, <= -20 dBFS, 20 ms ramps) for tone_ms in that slot alone, zeros in the others, then gap_ms of silence,
+ * so the listener hears which speaker each slot drives. The tones together last at most 3 s (AUDIO_TEST_MAX_FRAMES), the walk with
+ * its gaps at most 4 s (AUDIO_WALK_MAX_FRAMES), under the stream's 5 s watchdog. */
+#define AUDIO_WALK_MAX_FRAMES (4u * AUDIO_RATE)
+typedef struct {
+    AudioTone tone;
+    int32_t peak;
+    uint8_t slots[AUDIO_MAX_CHANNELS];
+    unsigned count, index;               /* the slots of the walk, the one playing (or next) */
+    uint32_t tone_frames, gap_frames, gap_left;
+    uint32_t tone_total, frames;         /* tone frames / frames produced so far */
+    int in_gap, done;
+} AudioWalk;
+/* 0, or -1 (nothing set): an empty mask, a peak above AUDIO_TEST_PEAK, a tone shorter than its two ramps, tones longer than 3 s in
+ * all, or a walk longer than 4 s. */
+int audio_walk_init(AudioWalk *w, unsigned mask, uint32_t tone_ms, uint32_t gap_ms, int32_t peak);
+/* Fills count four-channel frames; returns the frames that carry tone. After the walk: zeros. */
+uint32_t audio_walk_fill(AudioWalk *w, int16_t *quad, uint32_t count);
+/* The slot sounding now, -1 in a gap or when done. */
+int audio_walk_slot(const AudioWalk *w);
+
 /* ---- the stream guard: the owner checks it every period; any reason but AudioGuardOk means stop now */
-enum {AudioGuardOk = 0, AudioGuardWatchdog, AudioGuardDsp, AudioGuardLate, AudioGuardAmplifier, AudioGuardOwner};
+enum {AudioGuardOk = 0, AudioGuardWatchdog, AudioGuardDsp, AudioGuardLate, AudioGuardAmplifier, AudioGuardOwner, AudioGuardQuiet};
 typedef struct {
     uint32_t start_ms, limit_ms;         /* limit 0: no time limit (daily use) */
     int running, reason;

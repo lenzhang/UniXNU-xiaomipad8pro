@@ -113,6 +113,56 @@ uint32_t audio_tone_fill(AudioTone *t, int16_t *frames, uint32_t count, unsigned
     return tone;
 }
 
+int audio_walk_init(AudioWalk *w, unsigned mask, uint32_t tone_ms, uint32_t gap_ms, int32_t peak)
+{
+    unsigned count = 0;
+    uint8_t slots[AUDIO_MAX_CHANNELS];
+    for (unsigned s = 0; s < AUDIO_MAX_CHANNELS; ++s)
+        if (mask >> s & 1u) slots[count++] = (uint8_t)s;
+    if (!count || mask >> AUDIO_MAX_CHANNELS || tone_ms > 3000u || gap_ms > 4000u) return -1;
+    const uint32_t tone = tone_ms * (AUDIO_RATE / 1000u), gap = gap_ms * (AUDIO_RATE / 1000u);
+    if (peak < 0 || peak > AUDIO_TEST_PEAK || tone < 2 * AUDIO_FADE_FRAMES || count * tone > AUDIO_TEST_MAX_FRAMES ||
+        count * tone + (count - 1) * gap > AUDIO_WALK_MAX_FRAMES)
+        return -1;
+    AudioTone first;
+    if (audio_tone_init(&first, peak, tone)) return -1;
+    for (unsigned i = 0; i < sizeof *w; ++i) ((uint8_t *)w)[i] = 0;
+    w->tone = first;
+    w->peak = peak;
+    for (unsigned i = 0; i < count; ++i) w->slots[i] = slots[i];
+    w->count = count;
+    w->tone_frames = tone;
+    w->gap_frames = gap;
+    return 0;
+}
+
+uint32_t audio_walk_fill(AudioWalk *w, int16_t *quad, uint32_t count)
+{
+    uint32_t tone = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        int16_t *f = quad + i * AUDIO_MAX_CHANNELS;
+        f[0] = f[1] = f[2] = f[3] = 0;
+        w->frames++;
+        if (w->done) continue;
+        if (w->in_gap) {
+            if (--w->gap_left == 0) w->in_gap = 0;
+            continue;
+        }
+        int16_t s;
+        tone += audio_tone_fill(&w->tone, &s, 1, 1);
+        f[w->slots[w->index]] = s;
+        w->tone_total++;
+        if (w->tone.done < w->tone.total) continue;
+        /* this slot's tone is over: a gap, then the next slot, or the end */
+        if (++w->index == w->count) {w->done = 1; continue;}
+        (void)audio_tone_init(&w->tone, w->peak, w->tone_frames);
+        if (w->gap_frames) {w->in_gap = 1; w->gap_left = w->gap_frames;}
+    }
+    return tone;
+}
+
+int audio_walk_slot(const AudioWalk *w) {return w->done || w->in_gap ? -1 : (int)w->slots[w->index];}
+
 void audio_guard_start(AudioGuard *g, uint32_t now_ms, uint32_t limit_ms)
 {
     g->start_ms = now_ms; g->limit_ms = limit_ms; g->running = 1; g->reason = AudioGuardOk;
@@ -143,6 +193,7 @@ const char *audio_guard_reason(int reason)
     case AudioGuardLate: return "late period";
     case AudioGuardAmplifier: return "amplifier status";
     case AudioGuardOwner: return "stopped by the owner";
+    case AudioGuardQuiet: return "PianoPower asked for quiet";
     default: return "?";
     }
 }
