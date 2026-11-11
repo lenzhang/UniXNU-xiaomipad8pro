@@ -14,3 +14,4 @@ PianoNullEthernet    # a built-in en0 without hardware: TimeSync (and so WindowS
 PianoPower           # battery gauges, charger port, the DSP charger path; inert without piano-power=N
 PianoTouch           # the NT36532E touch screen (docs/drivers/touch.md); inert without piano-touch=N; after PianoA830 (its GCC lock word)
 PianoWifi            # the WCN7860 Wi-Fi on PCIe0, level 1 (read-only survey) only; inert without piano-wifi=N (docs/drivers/wifi.md)
+PianoAudio           # speakers (4 x FS19xx, TDM) and DMICs via the ADSP, level 1 (read-only survey) only; inert without piano-audio=N (docs/drivers/audio.md)
