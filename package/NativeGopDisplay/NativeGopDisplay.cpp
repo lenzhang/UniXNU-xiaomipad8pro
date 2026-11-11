@@ -157,7 +157,7 @@ private:
     void requestCopy(IOSurface *, bool refresh, bool fenced = false, uint32_t fence = 0);
     void copyLoop();
     static void copyThreadMain(void *, wait_result_t);
-    const uint8_t *surfaceBytes(IOSurface *, IOMemoryDescriptor *);
+    const uint8_t *surfaceBytes(IOSurface *, IOMemoryDescriptor *, bool *cached);
     void releaseSurfaceMaps();
     void stopCopies();
     bool createDisplayAttributes();
@@ -243,8 +243,18 @@ private:
     bool fBacklightCallout;
     IOService *fBacklight;            // retained once found
     void backlightCallout(bool on);
+    // The copy's cost (boot-arg native-gop-display-copy=BITS, default 0: nothing of this runs). A copy is ~39 ms for 3200x2136 BGRA,
+    // 34 of them reading the surface (uncached), and each swap is followed by up to six refresh copies (ticks 1, 2, 4, 8, 16, 30).
+    //   bit 0: a swap whose copy waited for the GPU's fence and saw it retired needs no refresh copies but the last (tick 30)
+    //   bit 1: surfaces mapped cacheable, their rows cleaned and invalidated by VA (DC CIVAC) before each read, so the read streams
+    //          through the cache instead of single uncached loads
+    static constexpr uint32_t kCopyFencedRefresh = 1, kCopyCachedRead = 2;
+    uint32_t fCopyMode;
+    volatile bool fFenceCovered;      // the last swap's copy waited for its fence and the GPU retired it in time
+    bool fCachedMapRefused;
+    uint64_t fRefreshSkipped, fInvalidateNs, fInvalidates;
     bool gpuFence(uint32_t *fence);
-    void waitGpuFence(uint32_t fence);
+    bool waitGpuFence(uint32_t fence);
     SwapInfo fSwapInfo[kSwapInfoRing];   // held while kSwapInfoHeld is set, sent in order afterwards
     // The surface on screen, copied again on a few ticks after its swap (1, 2, 4, 8, 16, 30): a renderer that swapped before its work
     // was done (a GPU) is shown complete once it finishes. WindowServer does not draw into the surface on screen.
@@ -394,6 +404,11 @@ bool NativeGopDisplay::start(IOService *provider)
     unsigned backlight = 0;
     PE_parse_boot_argn("piano-backlight", &backlight, sizeof(backlight));
     fBacklightCallout = backlight >= 2;
+    PE_parse_boot_argn("native-gop-display-copy", &fCopyMode, sizeof(fCopyMode));
+    if (fCopyMode)
+        IOLog("NativeGopDisplay: copy mode %#x:%s%s (native-gop-display-copy)\n", fCopyMode,
+              fCopyMode & kCopyFencedRefresh ? " refresh copies only when no GPU fence covered the swap (and the last one)" : "",
+              fCopyMode & kCopyCachedRead ? " cached surface reads with DC CIVAC first" : "");
     if (!readFramebuffer())
         return false;
     IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress(fVideoPhys, fVideo.v_rowBytes * fVideo.v_height,
@@ -565,8 +580,12 @@ IOReturn NativeGopDisplay::swap_begin_gated()
     }
     if (fFrames == frames && fShown && fRefreshLeft && fRefreshCopies) {
         unsigned elapsed = kRefreshTicks - --fRefreshLeft;
-        if (!(elapsed & (elapsed - 1)) || !fRefreshLeft)
-            requestCopy(fShown, true);
+        if (!(elapsed & (elapsed - 1)) || !fRefreshLeft) {
+            if ((fCopyMode & kCopyFencedRefresh) && fRefreshLeft && __atomic_load_n(&fFenceCovered, __ATOMIC_ACQUIRE))
+                fRefreshSkipped++;   // the GPU had finished the frame before its copy read it; the last refresh still runs
+            else
+                requestCopy(fShown, true);
+        }
     }
     // A thumbnail that is due while no new frame comes: one refresh copy of the surface on screen takes it.
     if (fThumbPeriod && fThumbNext && fShown && !fThumbRequested && mach_absolute_time() >= fThumbNext) {
@@ -596,6 +615,14 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         if (fGpuWaits)
             IOLog("NativeGopDisplay: %llu copies waited for the GPU's fence, mean %llu us max %llu us, %llu gave up after %u ms\n", fGpuWaits,
                   fGpuWaitNs / fGpuWaits / 1000, fGpuWaitMaxNs / 1000, fGpuTimeouts, kGpuFenceWaitMs);
+        if (fCopyMode) {   // what the copy mode saved: refresh copies not made (at this period's mean copy time), the reads' cost
+            const uint64_t mean = fCopies ? fCopyNs / fCopies : 0;
+            IOLog("NativeGopDisplay: copy mode %#x: %llu refresh copies skipped (about %llu ms of copying saved, mean copy %llu us); "
+                  "%llu cache invalidations mean %llu us%s\n", fCopyMode, fRefreshSkipped, fRefreshSkipped * mean / 1000000, mean / 1000,
+                  fInvalidates, fInvalidates ? fInvalidateNs / fInvalidates / 1000 : 0,
+                  fCachedMapRefused ? " (a cacheable mapping was refused: those surfaces read uncached)" : "");
+            fRefreshSkipped = fInvalidates = fInvalidateNs = 0;
+        }
         fGpuWaits = fGpuWaitNs = fGpuWaitMaxNs = fGpuTimeouts = 0;
         fFenceWaits = fFenceWaitNs = fFenceWaitMaxNs = 0;
         fPeakFps = 0;
@@ -787,19 +814,23 @@ bool NativeGopDisplay::gpuFence(uint32_t *fence)
 }
 
 // The copy thread: until the GPU retired fence (32-bit sequence numbers), bounded; a GPU that stops answering is not waited for.
-void NativeGopDisplay::waitGpuFence(uint32_t fence)
+// True when the GPU retired it.
+bool NativeGopDisplay::waitGpuFence(uint32_t fence)
 {
     IOService *gpu = __atomic_load_n(&fGpu, __ATOMIC_ACQUIRE);
     if (!gpu)
-        return;
+        return false;
     const uint64_t start = mach_absolute_time();
     uint64_t waited = 0;
+    bool retiredInTime = false;
     for (;;) {
         uint32_t submitted = 0, retired = 0;
         if (gpu->callPlatformFunction(fGpuFenceSymbol, false, &submitted, &retired, nullptr, nullptr) != kIOReturnSuccess)
             break;
-        if (static_cast<int32_t>(retired - fence) >= 0)
+        if (static_cast<int32_t>(retired - fence) >= 0) {
+            retiredInTime = true;
             break;
+        }
         absolutetime_to_nanoseconds(mach_absolute_time() - start, &waited);
         if (waited >= kGpuFenceWaitMs * 1000000ull) {
             fGpuTimeouts++;
@@ -812,6 +843,7 @@ void NativeGopDisplay::waitGpuFence(uint32_t fence)
     fGpuWaitNs += waited;
     if (waited > fGpuWaitMaxNs)
         fGpuWaitMaxNs = waited;
+    return retiredInTime;
 }
 
 void NativeGopDisplay::requestCopy(IOSurface *surface, bool refresh, bool fenced, uint32_t fence)
@@ -866,8 +898,9 @@ void NativeGopDisplay::copyLoop()
             if (waited > fWakeMaxNs)
                 fWakeMaxNs = waited;
         }
-        if (fenced)
-            waitGpuFence(fence);
+        const bool covered = fenced && waitGpuFence(fence);
+        if (!refresh)   // a swap's copy: whether its refresh copies are needed (native-gop-display-copy bit 0)
+            __atomic_store_n(&fFenceCovered, covered, __ATOMIC_RELEASE);
         copySurface(surface, refresh);
         reinterpret_cast<OSObject *>(surface)->release();
         IOLockLock(fCopyLock);
@@ -877,13 +910,14 @@ void NativeGopDisplay::copyLoop()
     IOLockUnlock(fCopyLock);
 }
 
-// The kernel address of a surface's memory, mapped once for the next copies.
-const uint8_t *NativeGopDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescriptor *memory)
+// The kernel address of a surface's memory, mapped once for the next copies. *cached: the mapping is cacheable (copy mode bit 1).
+const uint8_t *NativeGopDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescriptor *memory, bool *cached)
 {
     SurfaceMap *slot = &fSurfaceMaps[0];
     for (SurfaceMap &entry : fSurfaceMaps) {
         if (entry.surface == surface && entry.map->getMemoryDescriptor() == memory) {
             entry.used = ++fSurfaceMapClock;
+            *cached = (entry.map->getMapOptions() & kIOMapCacheMask) == kIOMapCopybackCache;
             return reinterpret_cast<const uint8_t *>(entry.map->getVirtualAddress());
         }
         if (entry.used < slot->used)
@@ -894,12 +928,38 @@ const uint8_t *NativeGopDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescri
         reinterpret_cast<OSObject *>(slot->surface)->release();
         *slot = {};
     }
-    IOMemoryMap *map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
+    IOMemoryMap *map = nullptr;
+    if (fCopyMode & kCopyCachedRead) {   // native-gop-display-copy bit 1: cacheable, invalidated before each read (copySurface)
+        map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly | kIOMapCopybackCache);
+        if (!map && !fCachedMapRefused) {
+            fCachedMapRefused = true;
+            IOLog("NativeGopDisplay: a cacheable mapping of a %llux%llu surface was refused: it is read uncached\n", ioSurfaceWidth(surface),
+                  ioSurfaceHeight(surface));
+        }
+    }
+    if (!map)
+        map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
     if (!map)
         return nullptr;
     reinterpret_cast<OSObject *>(surface)->retain();
     *slot = {surface, map, ++fSurfaceMapClock};
+    *cached = (map->getMapOptions() & kIOMapCacheMask) == kIOMapCopybackCache;
     return reinterpret_cast<const uint8_t *>(map->getVirtualAddress());
+}
+
+// Copy mode bit 1: before a cacheable read of memory others write (the GPU through the SMMU, not snooping the CPU's caches), every
+// cache line of the range is cleaned and invalidated to the point of coherency by VA (DC CIVAC: a read-permission operation, so a
+// read-only mapping takes it; this kernel is not built IO-coherent, so IOKit's incoherent-IO flush would be a set/way flush of the
+// whole cache above its bulk size). Lines this alias never dirtied are only dropped; the next loads fetch what memory holds.
+static void invalidateForRead(const uint8_t *start, uint64_t length)
+{
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    const uint64_t line = 4ull << ((ctr >> 16) & 15);   // DminLine: the smallest data cache line
+    const uintptr_t end = reinterpret_cast<uintptr_t>(start) + length;
+    for (uintptr_t p = reinterpret_cast<uintptr_t>(start) & ~(line - 1); p < end; p += line)
+        __asm__ volatile("dc civac, %0" ::"r"(p) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
 }
 
 void NativeGopDisplay::stopCopies()
@@ -995,12 +1055,18 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
     };
     if (memory->prepare() != kIOReturnSuccess)
         return;
-    const uint8_t *bytes = surfaceBytes(surface, memory);
+    bool cached = false;
+    const uint8_t *bytes = surfaceBytes(surface, memory, &cached);
     lap(fPrepareNs);
     if (!bytes) {
         memory->complete();
         IOLog("NativeGopDisplay: cannot map a %llux%llu surface\n", width, height);
         return;
+    }
+    if (cached) {   // native-gop-display-copy bit 1: the rows about to be read, from memory rather than stale cache lines
+        invalidateForRead(bytes + base, (copyHeight - 1) * rowBytes + copyWidth * pixelBytes);
+        lap(fInvalidateNs);
+        fInvalidates++;
     }
     // Each new frame's statistics, and the thumbnail when one is due: the first new frame, then once every fThumbPeriod s, on a new
     // frame or on the refresh copy swap_begin_gated asked for. Both come from every kSampleStep-th pixel of every kSampleStep-th row of

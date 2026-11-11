@@ -72,6 +72,8 @@ WindowServer launched once and stayed up.
 | `native-gop-display-bars=1` | off | 8 colour bars instead of the solid colour until the first frame (left to right: white, yellow, cyan, green, magenta, red, blue, black) to check channel order |
 | `native-gop-display-refresh=0` | 1 | stop re-copying the shown surface on ticks 1, 2, 4, 8, 16 and 30 after a swap (only useful for a GPU renderer) |
 | `native-gop-display-thumb=N` | 30 | a thumbnail of the frame on the panel (see §5) on the first frame and then every N s; 0: none |
+| `native-gop-display-copy=BITS` | 0 | the copy's cost (§6 risk 3): bit 0 skips the refresh copies of a swap whose copy waited for the GPU's fence and saw it retired (the last one, tick 30, still runs); bit 1 maps surfaces cacheable and cleans/invalidates the rows by VA before each read. Not run on the tablet yet; the periodic `copy mode ...` line says what was saved |
+| `piano-backlight=2` | off | (PianoBacklight's argument) each display power change is published as `piano-display-power` and handed to PianoBacklight ([backlight.md](backlight.md)) |
 
 No boot arg is needed for Path B. Everything else is the native set as it is (`K27_ARGS` in
 `tooling/bootimg/build-ram-images.py`). For a log of the WindowServer stage, give the run more than the default 45 s
@@ -195,7 +197,24 @@ Failure lines: `IOMobileFramebufferLegacy::start failed`, `createDisplayAttribut
    frame, converted per pixel. The periodic line's `convert` time shows the cost. `vmm-present = 0` gives 'BGRA' (as in
    the VM) but changes MobileGestalt's IsVirtualDevice.
 3. **CPU cost and tearing.** A 3200x2136 BGRA copy is 27 MB. Nothing syncs to the panel's scan (no vblank, 120 Hz
-   panel vs a 60 Hz timer), so motion can tear.
+   panel vs a 60 Hz timer), so motion can tear. Measured on the tablet (2026-11-11 runs, A830 path, BGRA): a copy takes
+   ~39 ms, of which ~34 ms read the surface (~0.8 GB/s: single uncached loads), ~1.4 ms write the framebuffer (write-combined)
+   and ~2.5 ms prepare/map. Each swap is followed by up to six refresh copies (ticks 1, 2, 4, 8, 16, 30), so even a blinking
+   text cursor (about two swaps a second) can cost 12-14 copies a second, roughly half a CPU core. Evaluation (2026-11-11), for battery life:
+   - *Damage regions:* the family's swap gives the driver whole layer surfaces; nothing in the IOMFB ABI this kext uses carries a
+     dirty region. Comparing against the previous frame per tile still needs the whole source read, which is the cost (34 of
+     39 ms); it would only save the 1.4 ms write. Not done.
+   - *Zero-copy scanout* (the DPU's source address at the swap's surface, `display.md` §4 "Direct flip"): needs the DPU pipe
+     readout (M2b, not run), the display SMMU stream's context under Gunyah (unknown) and page tables for surfaces that are not
+     physically contiguous. The facts are not solid: not done.
+   - *What is done, opt-in (`native-gop-display-copy`):* bit 0 drops the refresh copies a GPU fence already covers (the fence
+     wait guarantees the GPU finished the frame before the copy read it; the last refresh, tick 30, stays as a safety net):
+     up to five of the seven copies per swap. Bit 1 reads through a cacheable mapping after a by-VA clean+invalidate (DC CIVAC)
+     of exactly the rows read: expected several times faster reads, at the cost of the invalidation pass, measured by the
+     `copy mode ...` line (`cache invalidations mean N us`) against the read time of the periodic line. Test both on the tablet
+     before any default changes (`PIANO_EXTRA_ARGS="... native-gop-display-copy=1"`, then `=3`; compare `copies mean ... read
+     ...` and the `copy mode` line with a run without it, and look for stale tiles on the panel with `=3`).
+   - Left: the 60 Hz VBL timer runs while nothing is shown (60 wakeups a second at idle).
 4. **Path B is not `AppleParavirtDisplay`.** WindowServer's paravirt handling (`SLCADisplay::read_pv_preferences`,
    naming the display by `IOMFBUUID`) does not apply to it. The display UUID is then WindowServer's own, kept in the Data
    volume, and a future touch driver cannot name the display by `IOMFBUUID` the way DroidVMInput does. If WindowServer
