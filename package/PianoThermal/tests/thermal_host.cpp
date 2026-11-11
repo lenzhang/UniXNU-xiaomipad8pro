@@ -9,6 +9,7 @@
 //   thermal_host         run the tests
 //   thermal_host --map   print the sensor map for tooling/k27/check-thermal-map.py
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. thermal_host.cpp -o /tmp/thermal_host && /tmp/thermal_host
+#include "Cluster.h"
 #include "Governor.h"
 #include "Policy.h"
 #include "Scmi.h"
@@ -74,7 +75,8 @@ static void testMap()
   CHECK(!strcmp(kMap[1].sensors[4].name, "cpu-1-1-1") && kMap[1].sensors[4].passiveDeci == 1050);
   CHECK(!strcmp(kMap[2].sensors[1].name, "gpuss0") && kMap[2].sensors[8].passiveDeci == 1050 && !kMap[2].sensors[8].hotDeci);
   CHECK(!strcmp(kMap[3].sensors[8].name, "ddr") && passiveOf(kMap[3].sensors[8]) == 1050 && kMap[3].sensors[8].hotDeci == 1200);
-  CHECK(kMap[0].cpuFirst == 1 && kMap[0].cpuLast == 14 && kMap[1].cpuFirst == 1 && kMap[1].cpuLast == 6);
+  CHECK(kMap[0].cpuFirst == 1 && kMap[0].cpuLast == 12 && kMap[1].cpuFirst == 1 && kMap[1].cpuLast == 4);
+  CHECK(!strcmp(kMap[0].sensors[12].name, "cpu-0-5-1") && !strcmp(kMap[1].sensors[4].name, "cpu-1-1-1"));
   CHECK(kMap[2].tm == 0x0c22a000 && kMap[2].srot == 0x0c224000);
 }
 
@@ -125,7 +127,7 @@ static void testPoll()
   int32_t d = 0;
   unsigned c = 0, s = 0;
   CHECK(m.hottestAll(d, c, s) && d == 523 && c == 1 && s == 3);
-  CHECK(m.hottest(1, d, s, 1, 6) && d == 523 && s == 3);
+  CHECK(m.hottest(1, d, s, 1, 4) && d == 523 && s == 3);
   CHECK(m.hottest(0, d, s) && d == 400);
   // stale: [1][3] loses VALID for good: it stands in for kStalePolls polls, then it is out
   model.status[1][3] &= ~kStatusValid;
@@ -154,13 +156,15 @@ struct Scene {
   TsensModel model;
   Monitor m;
   Policy p;
+  uint64_t now = 100000, stepMs = 1000;
   Scene() { model.all(450); }
   PolicyEvent step(unsigned c, unsigned s, int32_t deci)
   {
     model.all(450);
     model.status[c][s] = statusWord(deci, true);
     m.poll(model.io());
-    return p.update(m);
+    now += stepMs;
+    return p.update(m, now);
   }
 };
 
@@ -185,7 +189,7 @@ static void testPolicy()
   CHECK(x.step(3, 8, 1049).after == State::warm);         // ddr has no passive trip: the SoC's lowest (105) counts
   CHECK(x.step(3, 8, 1050).after == State::passive);
   CHECK(x.step(3, 8, 999).after == State::warm);
-  // critical: 125 - 10 = 115, on two polls in a row
+  // critical: 125 - 10 = 115, for 1 s and two updates in a row
   e = x.step(2, 3, 1150);
   CHECK(e.after == State::passive && e.criticalPending);
   e = x.step(2, 3, 1149);                                  // the streak breaks
@@ -199,21 +203,31 @@ static void testPolicy()
   CHECK(x.step(2, 3, 999).after == State::warm);
   CHECK(x.step(2, 3, 600).after == State::normal);
   CHECK(x.p.peak() == State::critical);
-  // straight to critical from normal after two polls (no stop in between)
+  // straight to critical from normal after two updates 1 s apart (no stop in between)
   Scene y;
   CHECK(y.step(1, 1, 1300).after == State::passive);
   CHECK(y.step(1, 1, 1300).after == State::critical);
-  // unknown: no usable sensor on unknownPolls polls; the state is kept meanwhile
+  // fast updates (20 ms): the critical threshold must hold for 1 s, not for two updates
+  Scene f;
+  f.stepMs = 20;
+  for (unsigned i = 0; i < 50; ++i) {
+    e = f.step(1, 1, 1200);
+    CHECK(e.after == State::passive && e.criticalPending);
+  }
+  CHECK(f.step(1, 1, 1200).after == State::critical);      // 50 x 20 ms after the first
+  // unknown: no usable sensor for 5 s (and two updates); the state is kept meanwhile
   Scene z;
   CHECK(z.step(0, 5, 900).after == State::warm);
   for (bool &b : z.model.mapped) b = false;
-  for (unsigned i = 1; i < PolicyConfig().unknownPolls; ++i) {
+  for (unsigned i = 0; i < 5; ++i) {
     z.m.poll(z.model.io());
-    e = z.p.update(z.m);
+    z.now += 1000;
+    e = z.p.update(z.m, z.now);
     CHECK(!e.unknownAfter && e.after == State::warm);
   }
   z.m.poll(z.model.io());
-  e = z.p.update(z.m);
+  z.now += 1000;
+  e = z.p.update(z.m, z.now);
   CHECK(e.unknownAfter && e.changed() && e.after == State::warm);
   for (bool &b : z.model.mapped) b = true;
   e = z.step(0, 5, 500);
@@ -458,91 +472,158 @@ static void testScmi()
 static const uint32_t kNcc1[16] = {1017600, 1228800, 1440000, 1651200, 1862400, 2073600, 2284800, 2496000,
                                    2707200, 2918400, 3129600, 3340800, 3552000, 3763200, 4089600, 4320000};
 
-static TickInput tick(uint32_t busy, PowerSource p = PowerSource::battery, int32_t deci = 500, bool valid = true, bool protect = false)
-{
-  return {busy, p, valid, deci, protect};
-}
+static TickInput tick(uint32_t busy, PowerSource p = PowerSource::battery) { return {busy, p}; }
+static ThermalInput cool() { return {true, -300, -250, false}; }        // 75 C on a 105 C trip
+static ThermalInput hot() { return {true, 0, 50, false}; }             // at the trip
+static ThermalInput between() { return {true, -20, 30, false}; }       // 103 C: under the trip, over the release point
+static ThermalInput cut() { return {true, 150, 200, true}; }
 
 static void testGovernor()
 {
   CHECK(busyPermille(100, 25) == 750 && busyPermille(100, 100) == 0 && busyPermille(100, 150) == 0 && busyPermille(0, 0) == 0);
+  CHECK(capKhz(1785) == 1785999 && capKhz(0) == 0);
   GovernorConfig gc;
-  gc.capKhz = 2000000;
+  gc.capKhz = capKhz(1958);
   Governor g;
-  // fixed: the fastest level <= 2000 MHz (1862.4), whatever the load
+  // fixed: the fastest level <= 1958 MHz (1862.4 here), whatever the load or the power source
   g.init(CpuMode::fixed, gc, kNcc1, 16, 14, 15);
-  CHECK(g.tick(tick(0)) == 4 && g.tick(tick(1000)) == 4);
-  // fixed: the thermal limit: hot -> one level down per tick, release -> up one per riseTicks, cut -> slowest
-  gc.riseTicks = 2;
-  g.init(CpuMode::fixed, gc, kNcc1, 16, 14, 15);
-  CHECK(g.tick(tick(0, PowerSource::battery, 850)) == 4);     // limit 15 -> 14: still above the cap
-  for (int i = 0; i < 9; ++i) g.tick(tick(0, PowerSource::battery, 860));
-  CHECK(g.limit() == 5 && g.tick(tick(0, PowerSource::battery, 870)) == 4 && g.limit() == 4);
-  CHECK(g.tick(tick(0, PowerSource::battery, 870)) == 3);
-  CHECK(g.tick(tick(0, PowerSource::battery, 820)) == 3);     // between release and hot: held
-  CHECK(g.tick(tick(0, PowerSource::battery, 790)) == 3);     // under release: 1 of 2 ticks
-  CHECK(g.tick(tick(0, PowerSource::battery, 790)) == 4);
-  CHECK(g.tick(tick(0, PowerSource::battery, 950)) == 0);     // cut
-  CHECK(g.tick(tick(0, PowerSource::battery, 500, false)) == 0);   // no reading
-  CHECK(g.tick(tick(0, PowerSource::battery, 500, true, true)) == 0);   // PianoThermal's passive/critical
+  CHECK(g.tick(tick(0)) == 4 && g.tick(tick(1000, PowerSource::external)) == 4 && g.enforce(PowerSource::battery) == 4);
+  // the thermal limit: at the trip one level down per stepMs (20 ms), under the release point up one per riseMs (1 s)
+  uint64_t t = 1000;
+  CHECK(g.thermal(hot(), t) && g.limit() == 14);
+  CHECK(!g.thermal(hot(), t + 10) && g.limit() == 14);          // 10 ms later: not yet
+  t += 20;
+  for (int i = 0; i < 9; ++i, t += 20) g.thermal(hot(), t);
+  CHECK(g.limit() == 5 && g.enforce(PowerSource::battery) == 4);
+  g.thermal(hot(), t);
+  t += 20;
+  g.thermal(hot(), t);
+  CHECK(g.limit() == 3 && g.enforce(PowerSource::battery) == 3);
+  CHECK(!g.thermal(between(), t += 20) && g.limit() == 3);     // in between: held
+  CHECK(!g.thermal(cool(), t += 20) && g.limit() == 3);        // the cool spell starts
+  CHECK(!g.thermal(cool(), t += 500) && g.limit() == 3);
+  CHECK(g.thermal(cool(), t += 500) && g.limit() == 4 && g.enforce(PowerSource::battery) == 4);
+  CHECK(!g.thermal(between(), t += 20));                        // the spell breaks: the next rise is 1 s after the next cool
+  CHECK(!g.thermal(cool(), t += 20) && !g.thermal(cool(), t += 990) && g.thermal(cool(), t += 10) && g.limit() == 5);
+  CHECK(g.thermal(cut(), t += 1) && g.limit() == 0 && g.enforce(PowerSource::battery) == 0);
+  ThermalInput none{false, 0, 0, false};
+  g.thermal(cool(), t += 2000);
+  g.thermal(cool(), t += 2000);
+  CHECK(g.limit() == 1 && g.thermal(none, t += 1) && g.limit() == 0);   // no reading: the slowest at once
   // report: never moves
   g.init(CpuMode::report, gc, kNcc1, 16, 14, 15);
-  CHECK(g.tick(tick(1000)) == 15 && g.tick(tick(0, PowerSource::battery, 990)) == 15);
+  g.thermal(cut(), 5000);
+  CHECK(g.tick(tick(1000)) == 15 && g.enforce(PowerSource::battery) == 15);
 
-  // the governor
+  // the governor with Ubuntu's caps: Power Saver on battery (1958.4 on cluster 1), Balanced on power (4089.6, the sustained level)
   GovernorConfig gv;
-  gv.batteryKhz = 2500000;
-  gv.externalKhz = 3100000;
+  gv.batteryKhz = capKhz(1958);
+  gv.externalKhz = capKhz(4089);
   gv.hispeedKhz = 1800000;
   g.init(CpuMode::govern, gv, kNcc1, 16, 14, 15);
-  CHECK(g.ceiling(PowerSource::battery) == 7 && g.ceiling(PowerSource::unknown) == 7 && g.ceiling(PowerSource::external) == 9);
-  CHECK(g.tick(tick(0)) == 7);            // the boot level is above the battery cap: down to it at once
-  CHECK(g.tick(tick(0)) == 7);
+  CHECK(g.ceiling(PowerSource::battery) == 4 && g.ceiling(PowerSource::unknown) == 4 && g.ceiling(PowerSource::external) == 14);
+  CHECK(g.tick(tick(0)) == 4);            // the boot level (4320, boost) is above the battery cap: down to it at once
+  CHECK(g.tick(tick(0)) == 4);
   CHECK(g.tick(tick(0)) == 0);            // idle: the slowest after downTicks (3) ticks that wanted it
-  CHECK(g.tick(tick(950)) == 4);          // saturated at 1017.6: hispeed (the slowest >= 1800 = 1862.4)
-  CHECK(g.tick(tick(950)) == 6);          // 1862.4 x 0.95 / 0.8 = 2211.6 -> 2284.8
-  CHECK(g.tick(tick(1000)) == 7);         // capped at 2496 on battery
-  CHECK(g.tick(tick(1000, PowerSource::external)) == 9);   // 2496 x 1.25 = 3120 -> 3129.6, capped on power at 2918.4 (<= 3100)
-  // down hysteresis: two low ticks and a high one: no drop
-  const unsigned at = g.level();
+  CHECK(g.tick(tick(950)) == 4);          // saturated at 1017.6: hispeed (the slowest >= 1800 = 1862.4), also the battery cap
+  CHECK(g.tick(tick(950, PowerSource::external)) == 6);    // 1862.4 x 0.95 / 0.8 = 2211.6 -> 2284.8
+  CHECK(g.tick(tick(1000, PowerSource::external)) == 9);   // 2284.8 x 1.25 = 2856 -> 2918.4
+  CHECK(g.tick(tick(1000, PowerSource::external)) == 13);  // 3648 -> 3763.2
+  CHECK(g.tick(tick(1000, PowerSource::external)) == 14);  // 4704 -> capped at the sustained 4089.6 (no boost)
+  // down hysteresis: two low ticks and one at the current need: no drop
   g.tick(tick(100, PowerSource::external));
   g.tick(tick(100, PowerSource::external));
-  CHECK(g.level() == at);
-  CHECK(g.tick(tick(800, PowerSource::external)) == at);   // 80 % busy wants exactly the current level
+  CHECK(g.level() == 14);
+  CHECK(g.tick(tick(800, PowerSource::external)) == 14);   // 80 % busy wants exactly the current level
   // three low ticks: down to the fastest of what they wanted
-  g.tick(tick(300, PowerSource::external));   // 2918.4 x 0.3 / 0.8 = 1094.4 -> level 1
-  g.tick(tick(600, PowerSource::external));   // 2188.8 -> level 6
-  CHECK(g.level() == at);
-  CHECK(g.tick(tick(100, PowerSource::external)) == 6);
-  // power source back to battery while above its cap: at once
+  g.tick(tick(300, PowerSource::external));                // 4089.6 x 0.3 / 0.8 = 1533.6 -> 1651.2
+  g.tick(tick(600, PowerSource::external));                // 3067.2 -> 3129.6 (10)
+  CHECK(g.level() == 14);
+  CHECK(g.tick(tick(100, PowerSource::external)) == 10);
+  // the power source back to battery while above its cap: at once, by tick or by enforce
+  CHECK(g.enforce(PowerSource::battery) == 4);
   g.tick(tick(1000, PowerSource::external));
-  g.tick(tick(1000, PowerSource::external));
-  CHECK(g.level() > 7);
-  CHECK(g.tick(tick(1000, PowerSource::battery)) == 7);
+  CHECK(g.level() > 4 && g.tick(tick(1000, PowerSource::battery)) == 4);
   // the floor
   GovernorConfig gf = gv;
   gf.floorKhz = 1400000;
   g.init(CpuMode::govern, gf, kNcc1, 16, 14, 0);
+  CHECK(g.tick(tick(0)) == 2);
   for (int i = 0; i < 5; ++i) g.tick(tick(0));
   CHECK(g.level() == 2);
-  // thermal on top of the governor: hot steps the limit down per tick even under full load; cut at once
-  gv.riseTicks = 3;
+  // thermal on top of the governor: at the trip the limit steps down every 20 ms even under full load; cut at once; up 1 s a level
   g.init(CpuMode::govern, gv, kNcc1, 16, 14, 0);
-  for (int i = 0; i < 4; ++i) g.tick(tick(1000, PowerSource::external));
-  CHECK(g.level() == 9);
-  for (int i = 0; i < 10; ++i) g.tick(tick(1000, PowerSource::external, 880));
-  CHECK(g.limit() == 5 && g.level() == 5);
-  CHECK(g.tick(tick(1000, PowerSource::external, 960)) == 0 && g.limit() == 0);
-  for (int i = 0; i < 3; ++i) g.tick(tick(1000, PowerSource::external, 700));
-  CHECK(g.limit() == 1 && g.level() == 1);
+  for (int i = 0; i < 5; ++i) g.tick(tick(1000, PowerSource::external));
+  CHECK(g.level() == 14);
+  t = 50000;
+  for (int i = 0; i < 10; ++i, t += 20) g.thermal(hot(), t);
+  CHECK(g.limit() == 5 && g.enforce(PowerSource::external) == 5 && g.tick(tick(1000, PowerSource::external)) == 5);
+  CHECK(g.thermal(cut(), t) && g.enforce(PowerSource::external) == 0);
+  g.thermal(cool(), t += 20);
+  g.thermal(cool(), t += 1000);
+  CHECK(g.limit() == 1 && g.tick(tick(1000, PowerSource::external)) == 1);
   // a refused level: the bookkeeping follows the caller
-  g.setLevel(3);
-  CHECK(g.level() == 3);
-  // the sustained level is the top without any cap
-  GovernorConfig none;
-  g.init(CpuMode::govern, none, kNcc1, 16, 14, 0);
+  g.setLevel(0);
+  CHECK(g.level() == 0);
+  // no cap at all: the sustained level is the top (Linux: boost off)
+  GovernorConfig none2;
+  g.init(CpuMode::govern, none2, kNcc1, 16, 14, 0);
   for (int i = 0; i < 20; ++i) g.tick(tick(1000));
   CHECK(g.level() == 14);
+}
+
+// ------------------------------------------------------------------------------------------------------------- cluster
+static void testCluster()
+{
+  TsensModel model;
+  model.all(450);
+  Monitor m;
+  ClusterTrips trips;
+  m.poll(model.io());
+  ThermalInput in = clusterThermal(m, 0, trips, false);
+  CHECK(in.valid && in.hotExcessDeci == 450 - 1050 && in.releaseExcessDeci == 450 - 1000 && !in.cut);
+  CHECK(!nearTrip(m, trips));
+  // cpu-0-0-1 (118 C, hysteresis 8) at 112: under its trip, over its release point (110)
+  model.status[0][2] = statusWord(1120, true);
+  m.poll(model.io());
+  in = clusterThermal(m, 0, trips, false);
+  CHECK(in.hotExcessDeci == -60 && in.releaseExcessDeci == 20 && !in.cut);
+  CHECK(nearTrip(m, trips));
+  // cpu-0-0-0 (105 C) at 105: at its trip; cpuss-0-0 (sensor 13) does not count for the cluster
+  model.all(450);
+  model.status[0][1] = statusWord(1050, true);
+  model.status[0][13] = statusWord(1140, true);
+  m.poll(model.io());
+  in = clusterThermal(m, 0, trips, false);
+  CHECK(in.hotExcessDeci == 0 && !in.cut);
+  CHECK(clusterThermal(m, 1, trips, false).hotExcessDeci == 450 - 1050);
+  // the critical threshold (125 - 10) on a cluster sensor, or PianoThermal's critical state
+  model.status[1][4] = statusWord(1150, true);
+  m.poll(model.io());
+  CHECK(clusterThermal(m, 1, trips, false).cut && !clusterThermal(m, 0, trips, false).cut);
+  CHECK(clusterThermal(m, 0, trips, true).cut);
+  // overrides (absolute): hot 85, release 80, cut 95
+  ClusterTrips o;
+  o.hotDeci = 850;
+  o.releaseDeci = 800;
+  o.cutDeci = 950;
+  model.all(860);
+  m.poll(model.io());
+  in = clusterThermal(m, 0, o, false);
+  CHECK(in.hotExcessDeci == 10 && in.releaseExcessDeci == 60 && !in.cut);
+  // no reading on the cluster's sensors
+  model.mapped[1] = false;
+  m.poll(model.io());
+  CHECK(!clusterThermal(m, 1, trips, false).valid);
+  // near: a GPU sensor 10 C under its 105 C trip
+  model.all(450);
+  model.mapped[1] = true;
+  model.status[2][3] = statusWord(949, true);
+  m.poll(model.io());
+  CHECK(!nearTrip(m, trips));
+  model.status[2][3] = statusWord(950, true);
+  m.poll(model.io());
+  CHECK(nearTrip(m, trips));
 }
 
 static void printMap()
@@ -567,6 +648,7 @@ int main(int argc, char **argv)
   testPolicy();
   testScmi();
   testGovernor();
+  testCluster();
   if (failures) {
     std::printf("thermal_host: %d FAILED\n", failures);
     return 1;

@@ -120,7 +120,7 @@ struct Controller {
   const char *name;      // the log's name of the controller's hottest sensor
   uint64_t tm, srot;     // physical addresses (DT reg)
   uint8_t count;         // #qcom,sensors
-  uint8_t cpuFirst, cpuLast;   // the CPU cluster's sensors (cpufreq domain = controller index 0/1); 0/0 for none
+  uint8_t cpuFirst, cpuLast;   // the zones with a CPU cooling map (cpufreq domain = controller index 0/1); 0/0 for none
   const Sensor *sensors;
 };
 
@@ -161,8 +161,8 @@ inline constexpr Sensor kTsens3[9] = {
 #undef PT_GPU
 
 inline constexpr Controller kMap[kControllers] = {
-    {"cpu0", 0x0c228000, 0x0c222000, 15, 1, 14, kTsens0},   // cluster 0 (cpu0-5): cpu-0-*, cpuss-0-*
-    {"cpu1", 0x0c229000, 0x0c223000, 7, 1, 6, kTsens1},     // cluster 1 (cpu6-7): cpu-1-*, cpuss-1-*
+    {"cpu0", 0x0c228000, 0x0c222000, 15, 1, 12, kTsens0},   // cluster 0 (cpu0-5): cpu-0-* (1..12, cooling cpu0), cpuss-0-*
+    {"cpu1", 0x0c229000, 0x0c223000, 7, 1, 4, kTsens1},     // cluster 1 (cpu6-7): cpu-1-* (1..4, cooling cpu6), cpuss-1-*
     {"gpu", 0x0c22a000, 0x0c224000, 16, 0, 0, kTsens2},     // gpuss0-7 (1..8), modem, camera, video
     {"nsp", 0x0c22b000, 0x0c225000, 9, 0, 0, kTsens3},      // the NPU (nsphvx/nsphmx) and ddr
 };

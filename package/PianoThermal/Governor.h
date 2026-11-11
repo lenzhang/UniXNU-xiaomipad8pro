@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// PianoThermal: the CPU frequency policy of one SCMI performance domain (cluster 0 = cpu0-5, cluster 1 = cpu6-7), one decision per
-// tick. Portable (levels as kHz, slowest first, as scmi::Domain keeps them); host-tested by tests/thermal_host.cpp.
+// PianoThermal: the CPU frequency policy of one SCMI performance domain (cluster 0 = cpu0-5, cluster 1 = cpu6-7). Portable (levels as
+// kHz, slowest first, as scmi::Domain keeps them); host-tested by tests/thermal_host.cpp.
 //
-// piano-cpufreq=2 (fixed): the domain sits at the fastest level <= its cap (piano-cpufreq-cap0/cap1 MHz) and <= its sustained
-//   level; only the thermal limit below moves it. The A/B "battery level" against PianoPower's 30 s battery current.
-// piano-cpufreq=3 (governor), per tick (piano-cpufreq-tick-ms, 100 ms):
-//   busy   the busiest core of the cluster over the tick, per mille (XNU's per-processor idle time, PianoThermal.cpp);
-//   want   the slowest level >= current kHz x busy / target (target 80 %: schedutil's 1.25 margin); at >= 90 % busy at least the
-//          hispeed level (piano-cpufreq-hispeed0/1 MHz) so a burst does not climb 1.25x per tick from the floor; an idle cluster
-//          (busy ~0) gets the slowest level;
-//   up     at once; down only after downTicks ticks in a row that wanted less, to the fastest of what those ticks wanted;
-//   ceiling min(sustained, piano-cpufreq-cap0/1, the power cap: piano-cpufreq-bat0/1 on battery or when the power source is
-//          unknown, piano-cpufreq-ac0/1 on external power, the thermal limit); floor piano-cpufreq-min0/1. A ceiling that drops
-//          applies at once.
-// thermal limit (both modes): the cluster's hottest sensor >= hot (85.0 C) -> one level down per tick; < release (80.0 C) -> one
-//   level up per riseTicks ticks; in between held; >= cut (95.0 C), no reading, or PianoThermal's protection state passive or
-//   critical -> the slowest level at once. Stock passive is 105 C: this acts well before it.
+// piano-cpufreq=2 (fixed): the domain sits at the fastest level <= its cap (piano-cpufreq-cap0/cap1, default Ubuntu's Power Saver
+//   profile: 1785.6 / 1958.4 MHz) and <= its sustained level; only the thermal limit moves it. The A/B "battery level" against
+//   PianoPower's 30 s battery current.
+// piano-cpufreq=3 (governor), one load decision per tick (piano-cpufreq-tick-ms, 100 ms):
+//   busy    the busiest core of the cluster over the tick, per mille (XNU's per-processor idle time, PianoThermal.cpp);
+//   want    the slowest level >= current kHz x busy / target (target 80 %: schedutil's 1.25 margin); at >= 90 % busy at least the
+//           hispeed level (piano-cpufreq-hispeed0/1) so a burst does not climb 1.25x per tick from the floor; an idle cluster
+//           (busy ~0) gets the slowest level;
+//   up      at once; down only after downTicks ticks in a row that wanted less, to the fastest of what those ticks wanted;
+//   ceiling min(sustained (Linux: boost off), piano-cpufreq-cap0/1 when given, the power cap: Ubuntu's Power Saver caps on battery
+//           or when the power source is unknown (piano-cpufreq-bat0/1), its Balanced caps on external power (-ac0/1: 3532.8 /
+//           4089.6 MHz), the thermal limit); floor piano-cpufreq-min0/1. A ceiling that drops applies at once.
+// thermal limit (both modes; thermal() is called on every sensor poll, 20 ms apart while a sensor is near its trip): Linux's
+//   step_wise on the stock trips (Cluster.h): any of the cluster's cpu-* sensors at or over its passive trip (105 C, or 118 C)
+//   -> one level down per stepMs (20 ms); all under passive - hysteresis (5 or 8 C) -> one level up per riseMs (1 s); in between
+//   held; at the critical threshold (125 C - piano-thermal-margin), without a reading, or in PianoThermal's critical state ->
+//   the slowest level at once.
 #ifndef PIANO_THERMAL_GOVERNOR_H
 #define PIANO_THERMAL_GOVERNOR_H
 #include <stdint.h>
@@ -37,16 +40,20 @@ struct GovernorConfig {
   uint32_t hispeedKhz = 0;      // 0: no hispeed jump
   uint32_t targetPermille = 800, hispeedPermille = 900;
   uint32_t downTicks = 3;
-  int32_t hotDeci = 850, releaseDeci = 800, cutDeci = 950;
-  uint32_t riseTicks = 10;
+  uint32_t stepMs = 20, riseMs = 1000;
 };
 
 struct TickInput {
   uint32_t busyPermille;   // governor only
   PowerSource power;
-  bool thermalValid;
-  int32_t thermalDeci;     // the cluster's hottest sensor
-  bool protect;            // PianoThermal's state is passive or critical
+};
+
+// The cluster's temperature against its trips (Cluster.h computes it from a poll).
+struct ThermalInput {
+  bool valid;                // at least one of the cluster's sensors has a usable reading
+  int32_t hotExcessDeci;     // max over the sensors of reading - passive trip: >= 0 is at or over the trip
+  int32_t releaseExcessDeci; // max over the sensors of reading - (passive trip - hysteresis): < 0 is under the release point
+  bool cut;                  // a sensor at the critical threshold, or PianoThermal's critical state
 };
 
 class Governor {
@@ -61,14 +68,45 @@ class Governor {
     sustained_ = uint8_t(sustained < count_ ? sustained : count_ - 1u);
     level_ = uint8_t(boot < count_ ? boot : 0);
     limit_ = uint8_t(count_ - 1);
-    lowTicks_ = coolTicks_ = 0;
+    lowTicks_ = 0;
     pending_ = 0;
+    downAtMs_ = upAtMs_ = 0;
+    coolSinceMs_ = 0;
+    cooling_ = false;
   }
 
-  // One tick: the level the domain should be at (the caller sends LEVEL_SET only when it differs from what it set last).
+  // The thermal limit, from one poll of the sensors at nowMs. Returns true when the limit changed.
+  bool thermal(const ThermalInput &in, uint64_t nowMs)
+  {
+    const uint8_t before = limit_;
+    const unsigned top = count_ - 1u;
+    if (!in.valid || in.cut) {
+      limit_ = 0;
+      cooling_ = false;
+    } else if (in.hotExcessDeci >= 0) {
+      if (limit_ > 0 && (!downAtMs_ || nowMs - downAtMs_ >= config_.stepMs)) {
+        --limit_;
+        downAtMs_ = nowMs;
+      }
+      cooling_ = false;
+    } else if (in.releaseExcessDeci < 0 && limit_ < top) {
+      if (!cooling_) {
+        cooling_ = true;
+        coolSinceMs_ = nowMs;
+      } else if (nowMs - coolSinceMs_ >= config_.riseMs) {
+        ++limit_;
+        coolSinceMs_ = nowMs;
+      }
+    } else {
+      cooling_ = false;
+    }
+    return limit_ != before;
+  }
+
+  // One load decision (governor), or the fixed level (fixed); report mode never moves. The level the domain should be at (the caller
+  // sends LEVEL_SET only when it differs from what it set last).
   unsigned tick(const TickInput &in)
   {
-    updateLimit(in);
     const unsigned top = ceiling(in.power);
     const unsigned bottom = floorLevel() < top ? floorLevel() : top;
     if (mode_ == CpuMode::fixed) {
@@ -103,6 +141,17 @@ class Governor {
     return level_;
   }
 
+  // Between load decisions: the level, lowered at once to a ceiling that dropped (a thermal step, the power source); fixed mode
+  // also follows a ceiling that rose. Report mode never moves.
+  unsigned enforce(PowerSource power)
+  {
+    if (mode_ == CpuMode::fixed) return tick({0, power});
+    if (mode_ != CpuMode::govern) return level_;
+    const unsigned top = ceiling(power);
+    if (level_ > top) level_ = uint8_t(top);
+    return level_;
+  }
+
   unsigned ceiling(PowerSource power) const
   {
     unsigned top = sustained_;
@@ -112,7 +161,7 @@ class Governor {
       if (l < top) top = l;
     };
     clampTo(config_.capKhz);
-    clampTo(power == PowerSource::external ? config_.externalKhz : config_.batteryKhz);
+    if (mode_ == CpuMode::govern) clampTo(power == PowerSource::external ? config_.externalKhz : config_.batteryKhz);
     if (limit_ < top) top = limit_;
     return top;
   }
@@ -140,35 +189,18 @@ class Governor {
   {
     for (unsigned i = 0; i < count_; ++i)
       if (khz_[i] >= khz) return i;
-    return count_ - 1;
+    return count_ - 1u;
   }
 
  private:
-  void updateLimit(const TickInput &in)
-  {
-    const unsigned top = count_ - 1;
-    if (!in.thermalValid || in.protect || in.thermalDeci >= config_.cutDeci) {
-      limit_ = 0;
-      coolTicks_ = 0;
-    } else if (in.thermalDeci >= config_.hotDeci) {
-      if (limit_ > 0) --limit_;
-      coolTicks_ = 0;
-    } else if (in.thermalDeci < config_.releaseDeci && limit_ < top) {
-      if (++coolTicks_ >= config_.riseTicks) {
-        ++limit_;
-        coolTicks_ = 0;
-      }
-    } else {
-      coolTicks_ = 0;
-    }
-  }
-
   static constexpr unsigned kMax = 32;
   CpuMode mode_ = CpuMode::off;
   GovernorConfig config_{};
   uint32_t khz_[kMax] = {};
   uint8_t count_ = 1, sustained_ = 0, level_ = 0, limit_ = 0, pending_ = 0;
-  uint32_t lowTicks_ = 0, coolTicks_ = 0;
+  uint32_t lowTicks_ = 0;
+  uint64_t downAtMs_ = 0, upAtMs_ = 0, coolSinceMs_ = 0;
+  bool cooling_ = false;
 };
 
 // Per mille busy of one core over a window: wall time minus its idle time (both in the same unit), clamped.
@@ -178,6 +210,9 @@ inline uint32_t busyPermille(uint64_t wall, uint64_t idle)
   if (idle >= wall) return 0;
   return uint32_t((wall - idle) * 1000 / wall);
 }
+
+// A cap in MHz as the kHz it admits: the whole MHz, so "1785" admits the 1785.6 MHz level.
+inline uint32_t capKhz(uint32_t mhz) { return mhz ? mhz * 1000u + 999u : 0; }
 
 }  // namespace pianothermal
 

@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // PianoThermal: SoC temperatures, thermal protection and CPU frequency for piano (SM8750) under native macOS 27 at EL1. Design,
 // facts, boot arguments and the test procedure: docs/drivers/thermal.md. Inert unless piano-thermal or piano-cpufreq is set.
-//   piano-thermal=1  read only: every TSENS sensor of the four controllers (Tsens.h) each poll (piano-thermal-poll-ms, 1000), the
+//   piano-thermal=1  read only: every TSENS sensor of the four controllers (Tsens.h) each poll (piano-thermal-poll-ms, 1000; every
+//                    piano-thermal-fast-ms, 20, while a sensor is within 10 C of its trip or a cluster is thermally limited), the
 //                    hottest per controller on the console every piano-thermal-log-s (30) and as IORegistry properties; at start the
 //                    controllers' version/enable/thresholds (TM and SROT loads), the SCMI channel's status word (a load), and every 30 s
 //                    each core's clock measured with a chain of dependent adds (no device access; piano-thermal-clock=0 skips it).
 //                    Nothing is written at this level: every MMIO access is a load.
 //   piano-thermal=2  level 1 + the protection policy (Policy.h): warm (85 C) logged; at a sensor's stock passive trip the GPU is
 //                    parked at its lowest level for the rest of the boot (PianoA830's exported adreno830_dcvs_park); at the stock
-//                    critical trip - piano-thermal-margin (10 C) on two polls in a row: logged loudly every poll, and with
+//                    critical trip - piano-thermal-margin (10 C) held for 1 s: logged loudly (every 5 s), and with
 //                    piano-thermal-shutdown=1 the kernel's halt (reboot_kernel(RB_HALT): processes signalled, disks synced and
 //                    unmounted, IOKit's shutdown notifications, PSCI SYSTEM_OFF). Default: log only.
 //   piano-cpufreq=1  the CPU clusters over SCMI (Scmi.h): protocol, domains, levels, the level each cluster is at (LEVEL_GET), then
 //                    every 30 s again. Messages only, no level is set. Writes: the SCMI channel's shared memory and the doorbell.
-//   piano-cpufreq=2  fixed level per cluster: the fastest <= piano-cpufreq-cap0/cap1 (MHz, default 2000), thermal limit on top.
-//   piano-cpufreq=3  the governor (Governor.h): load-based per cluster every piano-cpufreq-tick-ms (100), caps on battery / on power
-//                    (the IOPMPowerSource's ExternalConnected; unknown = battery), thermal limit on top.
+//   piano-cpufreq=2  fixed level per cluster: the fastest <= piano-cpufreq-cap0/cap1 (MHz, default Ubuntu's Power Saver profile:
+//                    1785 / 1958), thermal limit on top (Cluster.h: Linux step_wise on the stock trips).
+//   piano-cpufreq=3  the governor (Governor.h): load-based per cluster every piano-cpufreq-tick-ms (100), caps on battery (Power Saver)
+//                    / on power (Balanced: 3532 / 4089) from the IOPMPowerSource's ExternalConnected (unknown = battery), thermal
+//                    limit on top.
 // piano-cpufreq >= 1 implies the level 1 readout (its thermal input). No clock, regulator or GDSC is voted by this kext.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -36,6 +39,7 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
+#include "Cluster.h"
 #include "Governor.h"
 #include "Policy.h"
 #include "Scmi.h"
@@ -67,7 +71,7 @@ constexpr int kRbHalt = 0x08;                                                   
 
 struct Args {
   uint32_t level, cpufreq, shutdown, pollMs, logS, clock, srot, warmC, marginC, delay;
-  uint32_t cap[2], bat[2], ac[2], minMhz[2], hispeed[2], tickMs, hotC, releaseC, cutC;
+  uint32_t cap[2], bat[2], ac[2], minMhz[2], hispeed[2], tickMs, fastMs, hotC, releaseC, cutC;
   bool capGiven[2];
 };
 Args gArgs;
@@ -79,6 +83,8 @@ uint32_t bootArg(const char *name, uint32_t fallback)
   return v;
 }
 uint32_t clampU(uint32_t v, uint32_t lo, uint32_t hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void buildTrips();
 
 void readArgs()
 {
@@ -95,29 +101,53 @@ void readArgs()
   gArgs.warmC = clampU(bootArg("piano-thermal-warm", 85), 50, 104);
   gArgs.marginC = clampU(bootArg("piano-thermal-margin", 10), 5, 30);
   gArgs.delay = clampU(bootArg("piano-thermal-delay", 0), 0, 600);
-  // piano-cpufreq-cap (both clusters) or -cap0/-cap1: the fixed level of mode 2 (default 2000 MHz); in mode 3 a hard ceiling, only
-  // when given.
-  uint32_t capBoth = 2000;
+  // Ubuntu's GNOME profiles on piano (docs/ubuntu-history/device.md 2.6): Power Saver caps cpu0-5 at 1785.6 MHz and cpu6-7 at
+  // 1958.4 MHz, Balanced at 3532.8 / 4089.6 MHz (boost off). piano-cpufreq-cap (both clusters) or -cap0/-cap1: the fixed level of
+  // mode 2 (default Power Saver's); in mode 3 a hard ceiling, only when given. A cap in MHz admits the levels of that whole MHz.
+  static const uint32_t kSaver[2] = {1785, 1958}, kBalanced[2] = {3532, 4089};
+  uint32_t capBoth = 0;
   const bool bothGiven = PE_parse_boot_argn("piano-cpufreq-cap", &capBoth, sizeof capBoth);
   for (unsigned d = 0; d < 2; ++d) {
-    uint32_t v = capBoth;
+    uint32_t v = bothGiven ? capBoth : kSaver[d];
     const bool given = PE_parse_boot_argn(d ? "piano-cpufreq-cap1" : "piano-cpufreq-cap0", &v, sizeof v);
     gArgs.cap[d] = clampU(v, 300, 5000);
     gArgs.capGiven[d] = given || bothGiven;
   }
-  gArgs.bat[0] = bootArg("piano-cpufreq-bat0", 2200);
-  gArgs.bat[1] = bootArg("piano-cpufreq-bat1", 2500);
-  gArgs.ac[0] = bootArg("piano-cpufreq-ac0", 3100);
-  gArgs.ac[1] = bootArg("piano-cpufreq-ac1", 3100);
+  gArgs.bat[0] = bootArg("piano-cpufreq-bat0", kSaver[0]);
+  gArgs.bat[1] = bootArg("piano-cpufreq-bat1", kSaver[1]);
+  gArgs.ac[0] = bootArg("piano-cpufreq-ac0", kBalanced[0]);
+  gArgs.ac[1] = bootArg("piano-cpufreq-ac1", kBalanced[1]);
   gArgs.minMhz[0] = bootArg("piano-cpufreq-min0", 0);
   gArgs.minMhz[1] = bootArg("piano-cpufreq-min1", 0);
   gArgs.hispeed[0] = bootArg("piano-cpufreq-hispeed0", 1500);
   gArgs.hispeed[1] = bootArg("piano-cpufreq-hispeed1", 1800);
   gArgs.tickMs = clampU(bootArg("piano-cpufreq-tick-ms", 100), 20, 1000);
-  gArgs.hotC = clampU(bootArg("piano-cpufreq-hot", 85), 50, 104);
-  gArgs.releaseC = clampU(bootArg("piano-cpufreq-release", gArgs.hotC - 5), 40, gArgs.hotC);
-  gArgs.cutC = clampU(bootArg("piano-cpufreq-cut", 95), gArgs.hotC, 110);
+  gArgs.fastMs = clampU(bootArg("piano-thermal-fast-ms", 20), 10, 1000);
+  // The cluster thermal limit's thresholds (Cluster.h): 0 = the stock DT's per zone (105 C or 118 C passive, 5 or 8 C hysteresis,
+  // critical 125 C - margin); given, absolute degrees C for every cpu-* zone.
+  gArgs.hotC = clampU(bootArg("piano-cpufreq-hot", 0), 0, 118);
+  gArgs.releaseC = clampU(bootArg("piano-cpufreq-release", gArgs.hotC ? gArgs.hotC - 5 : 0), 0, 118);
+  gArgs.cutC = clampU(bootArg("piano-cpufreq-cut", 0), 0, 125);
+  buildTrips();
 }
+
+ClusterTrips gTrips;
+char gTripsText[120];
+
+void buildTrips()
+{
+  gTrips.hotDeci = int32_t(gArgs.hotC) * 10;
+  gTrips.releaseDeci = int32_t(gArgs.releaseC) * 10;
+  gTrips.cutDeci = int32_t(gArgs.cutC) * 10;
+  gTrips.marginDeci = int32_t(gArgs.marginC) * 10;
+  if (gTrips.hotDeci)
+    snprintf(gTripsText, sizeof gTripsText, "one level down per %u ms at %u C, up per 1 s under %u C, slowest at %u C", 20u, gArgs.hotC,
+             gArgs.releaseC, gArgs.cutC ? gArgs.cutC : 125 - gArgs.marginC);
+  else
+    snprintf(gTripsText, sizeof gTripsText, "stock trips (cpu-* passive 105/118 C, hysteresis 5/8 C): one level down per 20 ms, up "
+             "per 1 s, slowest at %u C", gArgs.cutC ? gArgs.cutC : 125 - gArgs.marginC);
+}
+const char *tripsText() { return gTripsText; }
 
 uint64_t nowNs()
 {
@@ -351,14 +381,16 @@ class PianoThermal : public IOService {
   void publish(const Monitor &m);
   void protect(const PolicyEvent &e);
   void cpuStart();
-  void cpuTick(const Monitor &m, bool slow);
+  void cpuTick(const Monitor &m, bool slow, bool loadTick);
+  void cpuApply(unsigned d, unsigned want, uint64_t now);
   void cpuReport(uint64_t spanNs);
 
   Monitor monitor_;
   Policy policy_;
   int32_t peakDeci_ = 0;
   unsigned peakC_ = 0, peakS_ = 0;
-  bool peakValid_ = false, parked_ = false, halting_ = false;
+  bool peakValid_ = false, parked_ = false, halting_ = false, criticalPendingLogged_ = false;
+  uint64_t criticalLogNs_ = 0;
   // cpufreq
   scmi::Channel channel_;
   scmi::Protocol protocol_{};
@@ -369,7 +401,8 @@ class PianoThermal : public IOService {
   unsigned set_[kDomains] = {};          // the level last set (or found)
   uint64_t residencyNs_[kDomains][scmi::kMaxLevels] = {};
   uint64_t busySum_[kDomains] = {}, busyTicks_[kDomains] = {};
-  uint32_t busyMax_[kDomains] = {}, changes_[kDomains] = {}, refusals_[kDomains] = {};
+  uint32_t busyMax_[kDomains] = {}, changes_[kDomains] = {}, refusals_[kDomains] = {}, cuts_[kDomains] = {};
+  uint64_t limitedPolls_[kDomains] = {};
   uint64_t levelSinceNs_[kDomains] = {};
   PowerSource power_ = PowerSource::unknown;
   uint64_t powerAtNs_ = 0;
@@ -404,8 +437,6 @@ bool PianoThermal::start(IOService *provider)
   PolicyConfig pc;
   pc.warmDeci = int32_t(gArgs.warmC) * 10;
   pc.criticalMarginDeci = int32_t(gArgs.marginC) * 10;
-  pc.criticalPolls = gArgs.pollMs >= 1000 ? 2 : 2000 / gArgs.pollMs;
-  pc.unknownPolls = gArgs.pollMs >= 1000 ? 5 : 5000 / gArgs.pollMs;
   policy_ = Policy(pc);
   setProperty("piano-thermal", gArgs.level, 32);
   setProperty("piano-cpufreq", gArgs.cpufreq, 32);
@@ -542,8 +573,8 @@ void PianoThermal::protect(const PolicyEvent &e)
 {
   const Sensor &sn = kMap[e.controller].sensors[e.sensor];
   if (e.unknownAfter != e.unknownBefore) {
-    if (e.unknownAfter) note("[%us] NO READING: no TSENS sensor gave a usable reading on %u polls in a row; protection is blind", upS(),
-                             policy_.config().unknownPolls);
+    if (e.unknownAfter) note("[%us] NO READING: no TSENS sensor gave a usable reading for %u s; protection is blind", upS(),
+                             policy_.config().unknownMs / 1000);
     else note("[%us] readings are back", upS());
   }
   if (e.before != e.after)
@@ -556,13 +587,16 @@ void PianoThermal::protect(const PolicyEvent &e)
     const int32_t critical = sn.criticalDeci - int32_t(gArgs.marginC) * 10;
     const int32_t passive = passiveOf(sn) < critical - 50 ? passiveOf(sn) : critical - 50;
     note("[%us] PASSIVE: %s %s C >= %s C (stock passive %s C): GPU parked at its lowest level for the rest of the boot "
-         "(adreno830_dcvs_park)%s",
-         upS(), sn.name, Deci(e.deci).s, Deci(passive).s, Deci(passiveOf(sn)).s,
-         gArgs.cpufreq >= 2 ? "; CPU clusters to their slowest level" : "");
+         "(adreno830_dcvs_park)",
+         upS(), sn.name, Deci(e.deci).s, Deci(passive).s, Deci(passiveOf(sn)).s);
   }
-  if (e.after == State::critical) {
-    note("[%us] CRITICAL: %s %s C >= %s C (stock critical %s C - %u C margin); %s", upS(), sn.name, Deci(e.deci).s,
+  if (!e.criticalPending && e.after != State::critical) criticalPendingLogged_ = false;
+  const uint64_t now = nowNs();
+  if (e.after == State::critical && (e.before != State::critical || now - criticalLogNs_ >= 5000000000ull)) {
+    criticalLogNs_ = now;   // at entry, then every 5 s while it lasts
+    note("[%us] CRITICAL: %s %s C >= %s C (stock critical %s C - %u C margin)%s; %s", upS(), sn.name, Deci(e.deci).s,
          Deci(sn.criticalDeci - int32_t(gArgs.marginC) * 10).s, Deci(sn.criticalDeci).s, gArgs.marginC,
+         gArgs.cpufreq >= 2 ? "; CPU clusters at their slowest level" : "",
          gArgs.shutdown ? "HALTING the system (piano-thermal-shutdown=1)" : "piano-thermal-shutdown=0: NOT shutting down (log only)");
     if (gArgs.shutdown && !halting_) {
       halting_ = true;
@@ -571,8 +605,10 @@ void PianoThermal::protect(const PolicyEvent &e)
       reboot_kernel(kRbHalt, why);
       note("[%us] reboot_kernel(RB_HALT) returned: the system did not halt", upS());
     }
-  } else if (e.criticalPending) {
-    note("[%us] critical threshold met once (%s %s C): waiting for a second poll", upS(), sn.name, Deci(e.deci).s);
+  } else if (e.criticalPending && !criticalPendingLogged_) {
+    criticalPendingLogged_ = true;
+    note("[%us] critical threshold met (hottest %s s%u %s C): critical if it holds for %u ms", upS(), kMap[e.controller].name, e.sensor,
+         Deci(e.deci).s, policy_.config().criticalHoldMs);
   }
 }
 
@@ -621,29 +657,24 @@ void PianoThermal::cpuStart()
     uint32_t khz[scmi::kMaxLevels];
     for (unsigned i = 0; i < dom.count; ++i) khz[i] = dom.levels[i].khz;
     GovernorConfig gc;
-    gc.capKhz = mode == CpuMode::fixed || gArgs.capGiven[d] ? gArgs.cap[d] * 1000 : 0;
-    gc.batteryKhz = gArgs.bat[d] * 1000;
-    gc.externalKhz = gArgs.ac[d] * 1000;
+    gc.capKhz = mode == CpuMode::fixed || gArgs.capGiven[d] ? capKhz(gArgs.cap[d]) : 0;
+    gc.batteryKhz = capKhz(gArgs.bat[d]);
+    gc.externalKhz = capKhz(gArgs.ac[d]);
     gc.floorKhz = gArgs.minMhz[d] * 1000;
     gc.hispeedKhz = gArgs.hispeed[d] * 1000;
-    gc.hotDeci = int32_t(gArgs.hotC) * 10;
-    gc.releaseDeci = int32_t(gArgs.releaseC) * 10;
-    gc.cutDeci = int32_t(gArgs.cutC) * 10;
-    gc.riseTicks = mode == CpuMode::govern ? 1000 / gArgs.tickMs : 1;
-    if (!gc.riseTicks) gc.riseTicks = 1;
     governor_[d].init(dom.canSet ? mode : CpuMode::report, gc, khz, dom.count, dom.sustained, unsigned(idx));
     levelSinceNs_[d] = nowNs();
     domainOk_[d] = true;
     if (mode >= CpuMode::fixed) {
       if (!dom.canSet) note("cpufreq: domain %u: the firmware does not allow LEVEL_SET; reporting only", d);
       else if (mode == CpuMode::fixed)
-        note("cpufreq: domain %u: fixed at the fastest level <= %u MHz (and <= sustained), thermal limit %u/%u/%u C (hot/release/cut)", d,
-             gArgs.cap[d], gArgs.hotC, gArgs.releaseC, gArgs.cutC);
+        note("cpufreq: domain %u: fixed at the fastest level <= %u MHz (and <= sustained): %u MHz; thermal limit: %s", d, gArgs.cap[d],
+             dom.levels[governor_[d].ceiling(PowerSource::battery)].khz / 1000, tripsText());
       else
         note("cpufreq: domain %u: governor every %u ms, target 80 %% busy, hispeed %u MHz, floor %u MHz, caps: battery %u MHz, power %u "
-             "MHz%s, thermal %u/%u/%u C",
+             "MHz%s; thermal limit: %s",
              d, gArgs.tickMs, gArgs.hispeed[d], gArgs.minMhz[d], gArgs.bat[d], gArgs.ac[d], gc.capKhz ? ", fixed cap given" : "",
-             gArgs.hotC, gArgs.releaseC, gArgs.cutC);
+             tripsText());
     }
   }
   cpuOk_ = domainOk_[0] || domainOk_[1];
@@ -652,7 +683,32 @@ void PianoThermal::cpuStart()
   if (mode >= CpuMode::fixed) note("cpufreq: power source: %s", powerName(power_));
 }
 
-void PianoThermal::cpuTick(const Monitor &m, bool slow)
+// The level the governor wants for domain d, sent when it differs from the one set last.
+void PianoThermal::cpuApply(unsigned d, unsigned want, uint64_t now)
+{
+  Governor &g = governor_[d];
+  if (want == set_[d]) return;
+  const int32_t r = scmi::levelSet(channel_, domain_[d], d, want);
+  if (r) {
+    if (++refusals_[d] <= 3 || refusals_[d] % 100 == 0)
+      note("[%us] cpufreq: domain %u: %u MHz refused (%d, %s; %u refusals)", upS(), d, domain_[d].levels[want].khz / 1000, r,
+           scmi::statusName(r), refusals_[d]);
+    g.setLevel(set_[d]);
+    if (refusals_[d] >= 20) {
+      note("[%us] cpufreq: domain %u: 20 refusals: left at %u MHz for this boot", upS(), d, domain_[d].levels[set_[d]].khz / 1000);
+      domainOk_[d] = false;
+    }
+    return;
+  }
+  residencyNs_[d][set_[d]] += now - levelSinceNs_[d];
+  levelSinceNs_[d] = now;
+  set_[d] = want;
+  ++changes_[d];
+}
+
+// Every sensor poll: the thermal limit (fixed and governor modes) and, at most once per piano-cpufreq-tick-ms (governor) or at
+// once (fixed), the level; report mode asks LEVEL_GET at the log cadence only (slow).
+void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
 {
   if (!cpuOk_) return;
   if (channel_.lastError) {
@@ -664,29 +720,18 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow)
   const uint64_t now = nowNs();
   if (now - powerAtNs_ >= 10000000000ull) {
     const PowerSource p = readPowerSource();
-    if (p != power_ && governor_[0].mode() >= CpuMode::fixed) note("[%us] cpufreq: power source: %s -> %s", upS(), powerName(power_), powerName(p));
+    if (p != power_ && gArgs.cpufreq == 3) note("[%us] cpufreq: power source: %s -> %s", upS(), powerName(power_), powerName(p));
     power_ = p;
     powerAtNs_ = now;
   }
-  int32_t busy[kDomains];
-  domainBusy(busy);
-  const bool protectNow = policy_.state() >= State::passive && gArgs.level >= 2;
+  int32_t busy[kDomains] = {-1, -1};
+  if (loadTick) domainBusy(busy);
+  const bool critical = gArgs.level >= 2 && policy_.state() == State::critical;
   for (unsigned d = 0; d < kDomains; ++d) {
     if (!domainOk_[d]) continue;
     Governor &g = governor_[d];
-    TickInput in{};
-    in.busyPermille = busy[d] < 0 ? 0 : uint32_t(busy[d]);
-    in.power = power_;
-    unsigned s;
-    in.thermalValid = m.hottest(d, in.thermalDeci, s, kMap[d].cpuFirst, kMap[d].cpuLast);
-    in.protect = protectNow;
-    if (busy[d] >= 0) {
-      busySum_[d] += uint32_t(busy[d]);
-      ++busyTicks_[d];
-      if (uint32_t(busy[d]) > busyMax_[d]) busyMax_[d] = uint32_t(busy[d]);
-    }
     if (g.mode() == CpuMode::report) {
-      if (!slow) continue;   // the report mode asks LEVEL_GET only at the log cadence
+      if (!slow) continue;
       int idx = -1;
       if (!scmi::levelGet(channel_, domain_[d], d, idx) && idx >= 0 && unsigned(idx) != set_[d]) {
         residencyNs_[d][set_[d]] += now - levelSinceNs_[d];
@@ -696,24 +741,17 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow)
       }
       continue;
     }
-    const unsigned want = g.tick(in);
-    if (want == set_[d]) continue;
-    const int32_t r = scmi::levelSet(channel_, domain_[d], d, want);
-    if (r) {
-      if (++refusals_[d] <= 3 || refusals_[d] % 100 == 0)
-        note("[%us] cpufreq: domain %u: %u MHz refused (%d, %s; %u refusals)", upS(), d, domain_[d].levels[want].khz / 1000, r,
-             scmi::statusName(r), refusals_[d]);
-      g.setLevel(set_[d]);
-      if (refusals_[d] >= 20) {
-        note("[%us] cpufreq: domain %u: 20 refusals: left at %u MHz for this boot", upS(), d, domain_[d].levels[set_[d]].khz / 1000);
-        domainOk_[d] = false;
-      }
-      continue;
+    const unsigned limitBefore = g.limit();
+    if (g.thermal(clusterThermal(m, d, gTrips, critical), now / 1000000ull) && g.limit() < limitBefore && g.limit() == 0)
+      ++cuts_[d];
+    if (g.limit() < g.count() - 1u) ++limitedPolls_[d];
+    if (busy[d] >= 0) {
+      busySum_[d] += uint32_t(busy[d]);
+      ++busyTicks_[d];
+      if (uint32_t(busy[d]) > busyMax_[d]) busyMax_[d] = uint32_t(busy[d]);
     }
-    residencyNs_[d][set_[d]] += now - levelSinceNs_[d];
-    levelSinceNs_[d] = now;
-    set_[d] = want;
-    ++changes_[d];
+    const unsigned want = loadTick && g.mode() == CpuMode::govern ? g.tick({busy[d] < 0 ? 0u : uint32_t(busy[d]), power_}) : g.enforce(power_);
+    cpuApply(d, want, now);
   }
 }
 
@@ -736,13 +774,16 @@ void PianoThermal::cpuReport(uint64_t spanNs)
     }
     const Governor &g = governor_[d];
     if (at < int(sizeof line))
-      at = catf(line, sizeof line, at, "; %u changes; busy avg %llu%% max %u%%; ceiling %u MHz (%s), thermal limit %u MHz",
+      at = catf(line, sizeof line, at, "; %u changes; busy avg %llu%% max %u%%; ceiling %u MHz (%s), thermal limit %u MHz (%llu limited "
+               "polls, %u cuts)",
                changes_[d], (unsigned long long)(busyTicks_[d] ? busySum_[d] / busyTicks_[d] / 10 : 0), busyMax_[d] / 10,
-               g.khz(g.ceiling(power_)) / 1000, powerName(power_), g.khz(g.limit()) / 1000);
+               g.khz(g.ceiling(power_)) / 1000, powerName(power_), g.khz(g.limit()) / 1000, (unsigned long long)limitedPolls_[d], cuts_[d]);
     note("%s", line);
     changes_[d] = 0;
     busySum_[d] = busyTicks_[d] = 0;
     busyMax_[d] = 0;
+    limitedPolls_[d] = 0;
+    cuts_[d] = 0;
   }
   note("[%us] scmi: %u messages, %u failed, %llu us each on average, %u us at most", upS(), channel_.messages, channel_.failures,
        (unsigned long long)(channel_.messages ? channel_.totalUs / channel_.messages : 0), channel_.maxUs);
@@ -779,11 +820,15 @@ void PianoThermal::run()
   if (gArgs.cpufreq) cpuStart();
   else readTopology();
   const bool governing = cpuOk_ && gArgs.cpufreq == 3;
-  const uint32_t period = governing ? gArgs.tickMs : gArgs.pollMs;
-  note("running: %s every %u ms, the policy every %u ms, a report every %u s%s", governing ? "the governor and the sensors" : "the sensors",
-       period, gArgs.pollMs, gArgs.logS, gMapFailures ? " (some windows not mapped)" : "");
-  uint64_t lastPolicy = 0, lastLog = nowNs(), lastCpuLog = nowNs();
-  bool first = true;
+  // The poll period: the governor's tick (100 ms) or the policy's (1 s); fastMs (20 ms) while any sensor is within 10 C of its trip or
+  // a cluster's thermal limit holds it down (heating reaches ~200 C/s on a prime-core load: Ubuntu's history).
+  const uint32_t base = governing ? gArgs.tickMs : gArgs.pollMs;
+  note("running: %s every %u ms (every %u ms near a trip), the policy every %u ms, a report every %u s%s",
+       governing ? "the governor and the sensors" : "the sensors", base, gArgs.fastMs, gArgs.pollMs, gArgs.logS,
+       gMapFailures ? " (some windows not mapped)" : "");
+  uint64_t lastPolicy = 0, lastLoad = 0, lastLog = nowNs(), lastCpuLog = nowNs(), fastSince = 0;
+  uint64_t fastPolls = 0;
+  bool first = true, wasFast = false;
   for (;;) {
     monitor_.poll(kTsensIo);
     const uint64_t now = nowNs();
@@ -798,14 +843,27 @@ void PianoThermal::run()
         peakS_ = s;
       }
     }
-    if (first || now - lastPolicy >= uint64_t(gArgs.pollMs) * 1000000ull) {
+    bool limited = false;
+    for (unsigned k = 0; k < kDomains; ++k)
+      limited |= domainOk_[k] && governor_[k].mode() >= CpuMode::fixed && governor_[k].limit() < governor_[k].count() - 1u;
+    const bool fast = nearTrip(monitor_, gTrips) || limited;
+    if (fast != wasFast) {
+      if (fast) fastSince = now;
+      note("[%us] polling every %u ms (%s)", upS(), fast ? gArgs.fastMs : base,
+           fast ? (limited ? "a cluster's thermal limit holds it down" : "a sensor is within 10 C of its trip") : "back to normal");
+      wasFast = fast;
+    }
+    fastPolls += fast;
+    if (first || fast || now - lastPolicy >= uint64_t(gArgs.pollMs) * 1000000ull) {
       lastPolicy = now;
-      const PolicyEvent e = policy_.update(monitor_);
+      const PolicyEvent e = policy_.update(monitor_, now / 1000000ull);
       piano_thermal_state = int32_t(e.after);
-      if (e.changed() || e.after == State::critical || e.criticalPending) protect(e);
+      if (e.changed() || (e.after == State::critical && !halting_) || e.criticalPending) protect(e);
     }
     const bool slow = first || now - lastLog >= uint64_t(gArgs.logS) * 1000000000ull;
-    if (gArgs.cpufreq) cpuTick(monitor_, slow);
+    const bool loadTick = first || now - lastLoad >= uint64_t(gArgs.tickMs) * 1000000ull;
+    if (loadTick) lastLoad = now;
+    if (gArgs.cpufreq) cpuTick(monitor_, slow, loadTick);
     if (slow) {
       report(monitor_, true);
       publish(monitor_);
@@ -813,10 +871,13 @@ void PianoThermal::run()
         cpuReport(now - lastCpuLog);
         lastCpuLog = now;
       }
+      if (fastPolls) note("[%us] %llu fast polls in this window%s", upS(), (unsigned long long)fastPolls, fast ? ", still fast" : "");
+      fastPolls = 0;
       lastLog = now;
       peakValid_ = false;   // the peak is per report window
     }
     first = false;
-    IOSleep(period);
+    (void)fastSince;
+    IOSleep(fast ? gArgs.fastMs : base);
   }
 }
