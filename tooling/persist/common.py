@@ -174,6 +174,32 @@ def installed_seed(out=None):
     return None, 'unknown (set PIANO_INSTALLED_SEED in ~/.config/piano/env)'
 
 
+def installed_trust(out=None):
+    """The trust cache file the installed ESP was built with, when its build record says (PIANO_INSTALLED_SEED=<record>.json, or
+    OUT/installed.json) and the file is still there; else None."""
+    value = piano_env().get('PIANO_INSTALLED_SEED', '').strip()
+    record = Path(value).expanduser() if value.endswith('.json') else \
+        Path(out or os.environ.get('PIANO_PERSIST_OUT', DEVICE / 'out/persistent')) / 'installed.json'
+    if not record.is_file():
+        return None
+    path = ((json.loads(record.read_text()).get('inputs') or {}).get('trust') or {}).get('path')
+    return Path(path) if path and Path(path).is_file() else None
+
+
+def trust_hashes(path):
+    """The CDHashes of a trust cache bundle (count, offsets, version 2 modules: uuid, count, 20-byte hash + 4 bytes per entry)."""
+    data = Path(path).read_bytes()
+    count, = struct.unpack_from('<I', data)
+    hashes = set()
+    for offset in struct.unpack_from(f'<{count}I', data, 4):
+        version, = struct.unpack_from('<I', data, offset)
+        if version != 2:
+            raise SystemExit(f'{path}: a version {version} trust cache module')
+        entries, = struct.unpack_from('<I', data, offset + 20)
+        hashes.update(data[offset + 24 + 24 * k:offset + 44 + 24 * k] for k in range(entries))
+    return hashes
+
+
 def same_seed(identity, installed):
     """INSTALLED may be a prefix (at least 8 hex digits) of the full identity."""
     return bool(installed) and identity.lower().startswith(installed.lower())

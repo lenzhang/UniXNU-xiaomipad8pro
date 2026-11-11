@@ -106,6 +106,21 @@ def loud(text):
     print('\n'.join(['', '*' * 100, *[f'*  {line}' for line in text.splitlines()], '*' * 100, '']), file=sys.stderr, flush=True)
 
 
+def check_trust(a, trust):
+    """A self-contained (flattened) store keeps the Metal plugin the installed trust cache trusts, whatever seed a new ESP brings: a
+    trust cache without those CDHashes stops it loading (WindowServer crash loop). A note when CDHashes are missing."""
+    installed = a.installed_trust or common.installed_trust(a.out)
+    if not installed:
+        return None
+    missing = common.trust_hashes(installed) - common.trust_hashes(trust)
+    if missing:
+        loud(f'{len(missing)} CDHash(es) of the installed trust cache ({installed.name}) are NOT in this ESP\'s trust cache. If the '
+             'store is self-contained (flattened), it keeps the installed /Library/GPUBundles plugin, which would then no longer load '
+             '(WindowServer crash loop). Stage this seed\'s plugin with tooling/k27/stage-soft-metal.py --trust <the installed trust '
+             'cache> (its modules are kept), or build this ESP with --trust <the installed trust cache>')
+    return {'installed_trust': str(installed), 'missing_cdhashes': len(missing)}
+
+
 def check_store(a, seed, kc):
     """This ESP's seed against the installed one, and the collection's store guard: a record, a loud note, or a refusal."""
     installed, source = common.installed_seed(a.out)
@@ -261,6 +276,8 @@ def main():
     p.add_argument('--flatten-data', action='store_true',
                    help='data-store-flatten=1 on the macos entries: the store of this ESP\'s seed becomes self-contained at the next '
                    'boot (docs/data-store.md); then every later seed boots it')
+    p.add_argument('--installed-trust', type=Path, help='the installed ESP\'s trust cache, for the self-contained store\'s plugin check '
+                   '(default: from PIANO_INSTALLED_SEED=<record>.json or out/persistent/installed.json)')
     p.add_argument('--name', help='output base name (default esp-<profile>-<default>)')
     p.add_argument('--out', type=Path, default=common.DEVICE / 'out/persistent')
     a = p.parse_args()
@@ -291,6 +308,7 @@ def main():
     seed = common.seed_info(inputs['seed'])
     window = seed['store_blocks']
     data_store = check_store(a, seed, inputs['kc'])
+    data_store['trust'] = check_trust(a, inputs['trust'])
     lines = args_of(a, profile, a.utc)
     config = config_text(a, lines, prev)
     name = a.name or f'esp-{a.profile}-{a.default}'

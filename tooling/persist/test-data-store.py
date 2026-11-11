@@ -192,7 +192,32 @@ def main():
     print('== build-esp.py')
 
     def a(**kw):
-        return SimpleNamespace(out=tmp / 'persistent', replace_data=kw.get('replace'), flatten_data=kw.get('flatten', False))
+        return SimpleNamespace(out=tmp / 'persistent', replace_data=kw.get('replace'), flatten_data=kw.get('flatten', False),
+                               installed_trust=kw.get('trust'))
+
+    def trust(path, *modules):                      # stage-soft-metal.py trust_bundle's layout
+        blobs = [struct.pack('<I16sI', 2, bytes(16), len(m)) + b''.join(h + bytes(4) for h in m) for m in modules]
+        offsets, cursor = [], 4 + 4 * len(blobs)
+        for b in blobs:
+            offsets.append(cursor)
+            cursor += len(b)
+        path.write_bytes(struct.pack(f'<{len(blobs) + 1}I', len(blobs), *offsets) + b''.join(blobs))
+        return path
+
+    h = [hashlib.sha256(bytes([k])).digest()[:20] for k in range(5)]
+    t_old = trust(tmp / 'old.trust', [h[0], h[1]], [h[2]])                 # the installed one: plugin module + the OS
+    t_new = trust(tmp / 'new.trust', [h[3]], [h[2]])                       # a new plugin staged onto the input trust cache
+    t_union = trust(tmp / 'union.trust', [h[3]], [h[0], h[1]], [h[2]])     # staged with --trust <the installed trust cache>
+    check(common.trust_hashes(t_old) == {h[0], h[1], h[2]}, 'trust_hashes')
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        rec = esp.check_trust(a(trust=t_old), t_new)
+    check(rec['missing_cdhashes'] == 2 and 'NOT in this ESP' in err.getvalue(), 'check_trust: the installed plugin\'s CDHashes missing: a note')
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        rec = esp.check_trust(a(trust=t_old), t_union)
+    check(rec['missing_cdhashes'] == 0 and not err.getvalue(), 'check_trust: a union trust cache: no note')
+    common.write_json(tmp / 'persistent/installed.json', {'seed': {'identity_sha256': seed_x['identity_sha256']},
+                                                          'inputs': {'trust': {'path': str(t_old)}}})
+    check(common.installed_trust(tmp / 'persistent') == t_old, 'installed_trust from installed.json')
 
     for k in ('PIANO_DATA_STORE_REPLACE', 'PIANO_DATA_STORE_FLATTEN', 'PIANO_INSTALLED_SEED'):
         os.environ.pop(k, None)

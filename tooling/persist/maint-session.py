@@ -747,7 +747,7 @@ def write_esp(s, image_name):
         s.save(esp_written=record['image'], esp_sha256=record['sha256'])
         # The installed ESP's seed, which build-ram-images.py and build-esp.py compare theirs with (common.installed_seed).
         common.write_json(OUT / 'installed.json', {'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'],
-                                                   'written': time.strftime('%Y-%m-%d %H:%M:%S')})
+                                                   'inputs': record.get('inputs'), 'written': time.strftime('%Y-%m-%d %H:%M:%S')})
 
 
 @step('esp', 'maintenance, WRITE partition 37 (test-phase ESP)', writes='LUN 0 LBA 71527424-71789567')
