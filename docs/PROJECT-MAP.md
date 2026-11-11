@@ -6,11 +6,11 @@
 
 - [`UniXNU-piano`](https://github.com/lenzhang/UniXNU-piano) 是小米平板 8 Pro（代号 piano，SM8750）的**设备仓库**，也是当前主线：在 EL1 上原生启动 macOS。只做 `fastboot boot` **内存启动**，不刷写任何分区。
 - [`UniXNU-sm8750-common`](https://github.com/lenzhang/UniXNU-sm8750-common) 是骁龙 8 至尊版（SM8750）的**公共层占位仓库**。芯片通用代码暂时仍在 `UniXNU-piano` 里，稳定后再拆过来。注意：当前构建通过 `UniXNU-piano/feeds.toml` 钉住的是上游 [`IssacL04/UniXNU-sm8750-common`](https://github.com/IssacL04/UniXNU-sm8750-common)（OnePlus 13T 谱系）。这两个仓库不要混用，在拆分完成前不要改这个 pin。
-- [`veil`](https://github.com/lenzhang/veil) 存放已于 2026-11-10 冻结的精简 Linux + Gunyah 客户机路线的**公开归档**。完整的本地归档仍在本机 `droidvm-build` 的 `archive/gunyah-guest` 分支。主线请看 `UniXNU-piano`。
+- [`veil`](https://github.com/lenzhang/veil) 存放已于 2026-11-10 冻结的精简 Linux + Gunyah 客户机路线的**公开归档**。完整的本地归档仍在本机 VM 时期工作目录的 `archive/gunyah-guest` 分支。主线请看 `UniXNU-piano`。
 - Ubuntu 的修复继续提交到上游 [`yzddmr6/xiaomipad-8pro-mainline`](https://github.com/yzddmr6/xiaomipad-8pro-mainline)（内核 [`yzddmr6/linux-sm8750-piano`](https://github.com/yzddmr6/linux-sm8750-piano)），不另建仓库。
 - 权威备份在 NAS 上（具体路径只记在本机，不进公开仓库）。其他机器上的副本不是权威副本。
 - 密码不要写进文件、命令行参数或日志；需要 sudo 时在 tmux 里手工输入。厂商固件、分区镜像、Apple 内核 / KC / IPSW 派生产物不得进入公开仓库。
-- 原生启动里**不加载任何 DroidVM kext**（DroidVMDisplay、DroidVMGpu、DroidVMEthernet 等）：原生内核集合只链接本仓库 `package/` 里的驱动，构建时由 `check-native-kexts.py` 强制检查。2026-11-11 的实测证据见 `docs/bringup-debugging.md` 第 5 节。
+- 原生启动**只加载本仓库的 kext**：原生内核集合只链接本仓库 `package/` 里的驱动，VM 时期的半虚拟化 kext（显示、GPU、网卡、音频、输入、virtio 块设备等）一个也不链接，构建时由 `check-native-kexts.py` 强制检查（每次构建前先自检）。2026-11-11 的实测证据见 `docs/bringup-debugging.md` 第 5 节。
 
 ---
 
@@ -35,7 +35,7 @@ Do not create additional GitHub repositories for Ubuntu or for local trees such 
 | --- | --- |
 | piano panel, touch, charger, buttons, board identity, `dts/piano.dts`, ADT, `board.toml`, RAM-boot / packaging scripts, device docs and logs | `UniXNU-piano` |
 | SM8750 CPU topology, GIC, memory map, shared UEFI/XNU SoC drivers and SoC patches | Today: still in `UniXNU-piano`. Later: `UniXNU-sm8750-common`, then pin `feeds.toml` at the new repo |
-| Frozen Gunyah / crosvm / thin-Linux guest path | `veil` (public curated archive) and the local `droidvm-build` `archive/gunyah-guest` branch (full private copy) |
+| Frozen Gunyah / crosvm / thin-Linux guest path | `veil` (public curated archive) and the `archive/gunyah-guest` branch of the local VM-era work tree (full private copy) |
 | Ubuntu userland, flashing docs, mainline kernel fixes | Upstream `yzddmr6/xiaomipad-8pro-mainline` and `yzddmr6/linux-sm8750-piano` |
 
 **Do not confuse the two SM8750-common repositories.** `UniXNU-piano/feeds.toml` and `unixnu.lock` currently pin [IssacL04/UniXNU-sm8750-common](https://github.com/IssacL04/UniXNU-sm8750-common) (commit recorded in the lockfile) as the SoC module used to *build* piano, originally extracted for the OnePlus 13T. `lenzhang/UniXNU-sm8750-common` is our future extracted common layer. Leave the pin alone until a real split lands.
@@ -64,7 +64,7 @@ Working copy (copies on other machines are not authoritative):
   UniXNU-piano/                 # device repo (this tree). Push only a secret/blob-audited history to lenzhang/UniXNU-piano
   UniXNU-sm8750-common/         # local checkout of the placeholder SoC repo
   veil/                         # local checkout of the curated public Gunyah archive
-  droidvm-build/                # full local Gunyah / thin-Linux work; branch archive/gunyah-guest is the frozen snapshot
+  <VM-era work tree>/           # the k27 tree (PIANO_K27_TREE) and the frozen Gunyah / thin-Linux work; branch archive/gunyah-guest
   xiaomipad-8pro-mainline/      # local clone of the Ubuntu upstream (fixes go upstream, not into a new repo)
   unixnu-research/              # pinned upstream checkouts (UniXNU, Mu-Silicium, piano-uefi, DarwinBoot, …); not published as a repo
   v1.1.0/                       # Ubuntu v1.1.0 release materials
@@ -104,13 +104,14 @@ Build outputs (`UniXNU-piano/out/`, `build/`), signing keys (`private/`), vendor
 5. **No vendor blobs or Apple payloads in public repos:** Xiaomi / Qualcomm firmware, partition dumps, IPSW-derived kernelcaches, trust caches, `.img` / `.fd` / `.kc` / `.ipsw` build outputs. Record SHA-256 in `artifacts/ARTIFACTS.md` instead.
 6. **No home-LAN inventory in public repos:** private LAN addresses, the owner's machine and NAS hostnames, NAS backup paths, and machine-local author emails. Local working copies may keep operational defaults; public history must not.
 7. Push only to the repositories named in this document (and Ubuntu upstream).
-8. **No DroidVM kexts in a native boot.** The native kernel collection links only this repository's kexts (descriptors in
-   `tooling/k27/kext/`, sources in `package/`, objects in `out/native-kexts/`, the set in `configs/k27-native-kexts.txt`).
-   Nothing from the frozen DroidVM archive (`droidvm-build/macOS-DroidVM/overlay/kext`: DroidVMDisplay, DroidVMGpu,
-   DroidVMEthernet, DroidVMAudio, DroidVMVideo, DroidVMInput, NativeVirtioBlock, ...) is linked, not even for one test.
-   VM-era code that native piano needs is taken over as this repository's own package (with `UPSTREAM`), never by linking the
-   archive's kext. `tooling/kc/build-kc-k27.sh` enforces this (`tooling/k27/check-native-kexts.py`, before and after the link).
-   Evidence and history: `docs/bringup-debugging.md` §5.
+8. **Only this repository's kexts in a native boot (the native kext rule).** The native kernel collection links only this
+   repository's kexts (descriptors in `tooling/k27/kext/`, sources in `package/`, objects in `out/native-kexts/`, the set in
+   `configs/k27-native-kexts.txt`). None of the VM-era paravirtual kexts (display, GPU, Ethernet, audio, video, input, virtio
+   block) is linked, not even for one test. VM-era code that native piano needs is taken over as this repository's own package
+   (with `UPSTREAM`), never by linking the VM-era kext. `tooling/kc/build-kc-k27.sh` enforces this
+   (`tooling/k27/check-native-kexts.py`: a self-test of its denylist, then the descriptors before the link and the collection
+   after it), and `tooling/persist/build-esp.py` refuses an ESP whose collection has a VM-era bundle. Evidence, the boot
+   arguments still read under legacy names, and the ADT identity: `docs/bringup-debugging.md` §5.
 
 ## 7. Current bring-up note (2026-11-11 11:30)
 

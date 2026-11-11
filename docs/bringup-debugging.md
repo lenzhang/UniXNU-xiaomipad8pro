@@ -1,7 +1,7 @@
 # Native bring-up on piano: how to boot, debug and iterate without watching the screen
 
-Learned during the first native RAM boots, 2026-11-10 (`droidvm-build/piano-patches/el1-home-ram-boot-result.md`, session log
-`logs/home-ram-boot-session-20261110.md`). Rules that never change:
+Learned during the first native RAM boots, 2026-11-10 (the local bring-up notes `el1-home-ram-boot-result.md`, not published;
+session log `logs/home-ram-boot-session-20261110.md`). Rules that never change:
 - RAM boots only (`fastboot boot`). Never `flash`, `erase`, `set_active`, `flashing` or a partition write.
 - `oem` goes only to our own in-RAM UEFI (`-s piano-uefi`), never to ABL.
 - Never `systemctl isolate` on the tablet.
@@ -92,31 +92,76 @@ A person is needed only when the tablet is parked (no reset, no fastboot): power
 ## 4. Rebuild after a change
 
 ```sh
-K27_VARIANT=native ../droidvm-build/macOS-DroidVM/build-k27-piano.sh   # kernel (k27 tree: patches 0001-0052 + patches/k27 0053-0060)
-tooling/unixnu.sh build firmware --skip-preflight                          # FD (A: Binaries/piano -> the bundled set)
-tooling/k27/build-native-image.sh                                          # kexts (package/) -> KC -> ADT -> out/ram + out/ram-dump
+K27_VARIANT=native "$PIANO_K27_TREE/build-k27-piano.sh"   # kernel: the k27 tree with patches/k27 0053-0062 applied to its out/k27/xnu
+tooling/unixnu.sh build firmware --skip-preflight          # FD (A: Binaries/piano -> the bundled set)
+tooling/k27/build-native-image.sh                          # kexts (package/) -> KC -> ADT -> out/ram + out/ram-dump
 python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
 ```
 
-`tooling/build-slice1.sh` runs all of it. The native kext set is `configs/k27-native-kexts.txt`; what is left of the VM era and why:
-`docs/native-droidvm-inventory.md`.
+`tooling/build-slice1.sh` runs all of it. The native kext set is `configs/k27-native-kexts.txt` (§5).
 
-## 5. No DroidVM kexts natively (rule, 2026-11-11)
+**The k27 tree** is the local XNU 27.0.1 kernel tree: xnu-12377 + the baseline series 0001-0052 (pin `k27` of `unixnu.lock`),
+with this repository's `patches/k27` (0053-0062) on top. The build only reads it, and no committed file names its place: set
+`PIANO_K27_TREE` in the environment or as a line `PIANO_K27_TREE=/path` in `~/.config/piano/env`. Every script that needs it
+goes through `tooling/k27/k27-tree.sh` (shell) or `tooling/k27/k27_tree.py` (Python) and stops with what to set when it is
+missing. What the native build reads from it:
+- the kernel (`out/k27/kernel-k27-NNNN-native.macho`, `K27_KERNEL` picks another) and its objects' compile recipes
+  (`out/x12377/build/xnu/k27-native-obj`), which every kext is compiled with (`tooling/k27/build-native-kext.py`);
+- the generated headers under `out/x12377` (storage ABI, xnu's osfmk, IOKit hid/net/gfx) the kexts include;
+- the KC base, Apple's macOS 27.0.1 vma2 kernelcache (`out/kc/kc27.bin`, an Apple payload: never published);
+- the KC builder (`k27/kc-build27-piano.py`, `k27/kc27-layout.py`, `k27/segaddrs.sh`, `configs/kc-keep.txt`, `scripts/kc-build.py`,
+  `kc_native.py`, `fileset_kc.py`, `ptrauth_disc.py`) and `scripts/gen-iomfb-abi.py` (its output is cached in `out/k27/iomfb-abi/`);
+- `sources/UniXNU/drivers/DarwinBoot/Test/packed_ramdisk.py` (the Data seed's format, `tooling/k27/stage-soft-metal.py`);
+- for the A830 GPU's userspace (`tooling/metal/build-turnip-a830.sh`): the Metal plugin's sources, its link stub and the prebuilt
+  bridge (`overlay/metal`, `scripts/piano-frontend-patch.py`, `out/metal`), the virtgpu ABI header, and the UniXNU-turnip checkout
+  next to the tree (`TURNIP_TREE`). Provenance: `tooling/metal/UPSTREAM`.
 
-The native boot loads no DroidVM kext: the native kernel collection links only this repository's kexts
-(`configs/k27-native-kexts.txt`; descriptors in `tooling/k27/kext/`, sources in `package/`, objects in `out/native-kexts/`).
-`tooling/kc/build-kc-k27.sh` refuses any other descriptor and checks the linked collection again
-(`tooling/k27/check-native-kexts.py`), so `PIANO_EXTRA_KEXTS` / `PIANO_KEXT_LIST` cannot bring an archive kext back either.
-VM-era code native piano needs is taken over as a package of this repository with an `UPSTREAM` file (NativeGopDisplay,
-PianoNullEthernet, ARMPlatformStandIn, NativeRamBlock, PianoInput's HID layer).
+## 5. The native kext rule (2026-11-11)
 
-What the DroidVM kexts did in native boots (runs in `logs/native-runs/`, 2026-11-11):
+A native boot loads only this repository's kexts: the native kernel collection links the set of `configs/k27-native-kexts.txt`
+(descriptors in `tooling/k27/kext/`, sources in `package/`, objects in `out/native-kexts/`). `tooling/kc/build-kc-k27.sh`
+refuses any other descriptor and checks the linked collection again (`tooling/k27/check-native-kexts.py`), so `PIANO_EXTRA_KEXTS`
+/ `PIANO_KEXT_LIST` cannot bring a foreign kext in either; `tooling/persist/build-esp.py` refuses an ESP whose collection has
+one. The check carries the VM-era paravirtual kexts as a denylist (their bundle identifiers, their legacy name prefix and the
+virtio transport) and proves, before every collection, on synthetic descriptors that it still refuses them
+(`check-native-kexts.py --self-test`; a build log says `native kext rule: N native kexts linked, none from outside this
+repository`). Code native piano needs from the VM era is this repository's package with an `UPSTREAM` file, never the VM-era kext.
 
-| Kext(s) natively | Effect |
-|---|---|
-| DroidVMDisplay (as the display, or as NativeGopDisplay's nub), with the VM's virtio kexts | IOBSD matching did not finish in 30 s (`!BSD`), both UFS windows stayed busy, **the root never mounted**. The mechanism (k27 0059's busy dump): a window published before IOBSD had matched let AppleAPFSContainer::start take APFS's module lock while com_apple_filesystems_apfs::start waited for it. NativeUfs now publishes only after IOBSD has matched, but the DroidVM kexts' start timing is what triggered it |
-| DroidVMGpu | a stub accelerator: WindowServer read its MetalPluginName, its type-0x4147 opens failed (`kIOReturnBusy`, slots reserved for iOS's backboardd) and WindowServer crash-looped every 30–40 s |
-| DroidVMEthernet, DroidVMAudio, DroidVMVideo, DroidVMInput, NativeVirtioBlock | start with no virtio device behind them; without them SystemOS matches in 0.5 s instead of 4 s |
-| DroidVMEthernet | its no-device `en0` turned out to be needed (TimeSync takes its clock ID from a built-in interface; without one WindowServer and the login session never start): replaced by `package/PianoNullEthernet`, not by linking the DroidVM kext |
+### 5.1 The VM-era kexts in native boots
 
-The inventory of every VM-era piece and its fate is `docs/native-droidvm-inventory.md`.
+The macOS 27.0.1 install the tablet runs was first brought up under the hypervisor, with paravirtual kexts for its virtual
+devices. What they did in native boots (runs in `logs/native-runs/`, 2026-11-11), and what replaced them:
+
+| Kext(s) natively | Effect | Natively now |
+|---|---|---|
+| the virtio display kext (as the display, or as NativeGopDisplay's nub), with the other virtio kexts | IOBSD matching did not finish in 30 s (`!BSD`), both UFS windows stayed busy, **the root never mounted**. The mechanism (k27 0059's busy dump): a window published before IOBSD had matched let AppleAPFSContainer::start take APFS's module lock while com_apple_filesystems_apfs::start waited for it; the virtio kexts' start timing triggered it | NativeUfs publishes only after IOBSD has matched; `package/NativeGopDisplay` copies into the GOP framebuffer and carries the `AppleParavirtGPU` nub itself |
+| the stub GPU accelerator | WindowServer read its MetalPluginName, its type-0x4147 opens failed (`kIOReturnBusy`, slots reserved for iOS's backboardd) and WindowServer crash-looped every 30–40 s | `package/PianoA830` (the A830 GPU, its `AGXAccelerator`), or `package/NativeSoftGpu` for software Metal |
+| the virtio Ethernet, audio, video, input and block kexts | start with no virtio device behind them; without them SystemOS matches in 0.5 s instead of 4 s | the root and Data from `package/NativeUfs` and `package/NativeRamBlock` (its virtio data store gone, NativeUfs's store window serves it, `data-persist=2`); the drivers of `docs/drivers/` |
+| the virtio Ethernet kext's built-in `en0` without a device | turned out to be needed: TimeSync takes its clock ID from a built-in interface's MAC, and without one clocksyncd never answers, so WindowServer and the login session never start | `package/PianoNullEthernet`, that interface without virtio (measured: TimeSync's clock created, logind, loginwindow and WindowServer start, the display is turned on) |
+| NativeAES | nothing reads it natively (no AppleKeyStore, Data unencrypted); the same boot without it | removed |
+
+Also this repository's packages: `ARMPlatformStandIn` (the vma2 collection's IOMobileGraphicsFamily and its kexts link against
+AppleARMPlatform's classes) and PianoInput's HID class. Every removal was checked with a native run that matched the baseline on
+five points: root mounted from UFS, Data resumed from its store, the same launchd boot tasks, no panic, no I/O errors.
+
+### 5.2 The boot arguments
+
+The arguments every image carries, who reads each, and the four legacy `droidvm-*` names the k27 kernel and the OS image still
+read: [k27-userland-args.md](k27-userland-args.md).
+
+### 5.3 The ADT identity (`configs/k27-adt.toml`, `configs/k27-gop-display.toml`)
+
+| Item | Value | Why |
+|---|---|---|
+| `model`, `target-type`, `product-name`, `has-virtualization` | VirtualMac2,1, VMA2MACOS, "Apple Virtual Machine 1", set | the kernel collection is Apple's vma2 one, and its kexts match on this identity (plan R8: kept until WindowServer is tried with another one on real hardware) |
+| `vmm-present` | 1 (`PIANO_VMM_PRESENT` overrides it per build) | with 0 watchdogd runs as on real hardware, exits twice (no watchdog device) and launchd panics about 150 s into the run (`watchdogd[297] exited`); with 1 a 240 s run has no panic. Revisit with a watchdog driver |
+| `serial-number` | DVMPIANO001 | made up, not a unit serial; the Data seed was made with it |
+| `/arm-io/gop-display` | compatible `paravirtualizedgraphics,gpu` | IOMobileFramebuffer.framework only looks for displays on a node with that string (`docs/drivers/native-gop-display.md`) |
+
+### 5.4 The macOS install
+
+The OS image is the macOS 27.0.1 install of the VM era; replacing it means reinstalling from Apple's 27.0.1 restore image with
+our own customisation. It is `out/inputs/kernel.macho.trustcache` (the OS image's binaries), `out/inputs/scratch-data.img` (the
+Data seed; once the tablet's store is flattened, [data-store.md](data-store.md), it only starts new stores) and the OS and
+SystemOS windows on linux_rootfs, which carry that era's userland changes (`settime.sh` and its boot job `org.droidvm.run.0`,
+the staged Metal plugin).

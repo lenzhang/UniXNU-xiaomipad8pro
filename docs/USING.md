@@ -2,8 +2,8 @@
 
 How the installed system is used, updated and recovered day to day. The design and the install itself are in
 `docs/persistent-boot.md`; driver details in `docs/drivers/`; the debug loop in `docs/bringup-debugging.md`. Commands run from this
-repository's root on the Mac the tablet is cabled to (USB-C). `~/.config/piano/env` holds the local settings (serial, hosts, NAS);
-nothing private is in this repository.
+repository's root on the Mac the tablet is cabled to (USB-C). `~/.config/piano/env` holds the local settings (serial, hosts, NAS,
+`PIANO_K27_TREE`: the k27 tree the build reads, `docs/bringup-debugging.md` §4); nothing private is in this repository.
 
 ## 1. What runs where
 
