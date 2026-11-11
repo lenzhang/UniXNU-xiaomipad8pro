@@ -444,6 +444,7 @@ struct HostHw {
     if (++misses >= 3) irqDead = true;
   }
   void irqDelivered() { misses = 0; }
+  uint64_t irqCount() const { return handled + strays; }
   uint32_t takeIrqBits()
   {
     const uint32_t b = sticky;
@@ -529,8 +530,10 @@ struct Rig {
   Survey s;
   SmmuSurvey m;
   Flipper<HostHw> f{hw};
+  std::vector<uint64_t> pageList = std::vector<uint64_t>(sm::kSlotPages);
   explicit Rig(int variant = 0, uint32_t sctlr = 0xe0) : smmu(sctlr)
   {
+    f.pages = pageList.data();
     smmu.ram = &ram;
     dpu.smmu = &smmu;
     bootState(dpu, variant);
@@ -1211,20 +1214,25 @@ static void testCheckSurface()
 
 int main(int argc, char **argv)
 {
-  (void)argv;
-  if (argc > 1) {   // a verbose run of step 4 and a few flips: the log lines as the kernel prints them
+  if (argc > 1) {   // dpu_flip_host N: step N against the model, its log lines as the kernel prints them (docs/drivers/dpu.md §8)
     Rig r;
     r.hw.verbose = true;
-    r.ready();
-    FakeSurface a(0x8d0000000ull, 2136ull * 12800);
-    PianoDpuFlipRequest q = req(&a);
-    r.f.request(q);
-    r.hw.advance(61000000);
-    q = req(nullptr);
-    r.f.request(q);
-    q = req(&a, 12800, 0x52476841);
-    r.f.request(q);
-    r.f.summary(true);
+    r.hw.attachIrq();
+    r.f.cfg.level = unsigned(argv[1][0] - '0');
+    r.f.cfg.holdMs = 2000;
+    r.f.cfg.minuteMs = 60000;
+    r.f.ladder(r.s, r.m, false);
+    if (r.f.cfg.level == 4) {
+      FakeSurface a(0x8d0000000ull, 2136ull * 12800);
+      PianoDpuFlipRequest q = req(&a);
+      r.f.request(q);
+      r.hw.advance(61000000);
+      q = req(nullptr);
+      r.f.request(q);
+      q = req(&a, 12800, 0x52476841);
+      r.f.request(q);
+    }
+    return 0;
   }
   testTables();
   testPlan();

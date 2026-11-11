@@ -208,6 +208,7 @@ class KernelHw {
            (unsigned long long)line.count(), (unsigned long long)line.strays);
   }
   void irqDelivered() { miss.delivered(); }
+  uint64_t irqCount() const { return attached ? line.count() : 0; }
   uint32_t takeIrqBits() { return __atomic_exchange_n(&sticky, 0u, __ATOMIC_ACQ_REL); }
   void vsyncArm() { seen = waiter.now(); }
   bool waitVsync(uint32_t us)
@@ -496,6 +497,7 @@ void flipRun(IOService *owner, const Survey &s, const SmmuSurvey &m, uint32_t sm
   }
   __atomic_store_n(&gLock, lock, __ATOMIC_RELEASE);
   __atomic_store_n(&gSymbol, symbol, __ATOMIC_RELEASE);
+  gFlipper.pages = static_cast<uint64_t *>(IOMalloc(smmu::kSlotPages * sizeof(uint64_t)));   // kept for the boot
   stage(7, cfg.level == 1 ? "B1b step 1: the boot framebuffer's addresses flushed again"
            : cfg.level == 2 ? "B1b step 2: the boot framebuffer shifted by 64 rows and back"
            : cfg.level == 3 ? "B1b step 3: the DPU's SMMU bank in place and a test pattern"

@@ -520,6 +520,7 @@ void NativeGopDisplay::stop(IOService *provider)
     OSSafeReleaseNULL(fGpuFenceSymbol);
     OSSafeReleaseNULL(fDpu);
     OSSafeReleaseNULL(fDpuFlipSymbol);
+    OSSafeReleaseNULL(fFlipDone);
 }
 
 // Called by IOMobileFramebufferLegacy::start before it creates the default surface and registers the service (it tests bit 0).
@@ -562,10 +563,8 @@ IOReturn NativeGopDisplay::stop_hardware_gated()
         getWorkLoop()->removeEventSource(fVBL);
         OSSafeReleaseNULL(fVBL);
     }
-    if (fFlipDone) {
+    if (fFlipDone)   // released in stop(), once the copy thread (which fires it) has ended
         getWorkLoop()->removeEventSource(fFlipDone);
-        OSSafeReleaseNULL(fFlipDone);
-    }
     return kIOReturnSuccess;
 }
 

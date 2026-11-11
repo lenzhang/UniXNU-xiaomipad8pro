@@ -11,6 +11,7 @@
 //   void vsyncArm(); bool waitVsync(uint32_t us)   the vsync wake-up (true: the interrupt woke it; polled: false after ~1 ms)
 //   void attachIrq()                                the MDSS SPI's handler (serviceIrq), once, after setup() found the line low
 //   bool irqLive(); void irqMiss(); void irqDelivered(); uint32_t takeIrqBits()   the SPI's state, the status bits its handler cleared
+//   uint64_t irqCount()                             the SPI's entries so far (for the summary)
 //   void clean(const void *p, size_t n)            the CPU caches over [p, p + n) to the point of coherency (the tables)
 //   bool allocTables(uint64_t **cpu, uint64_t *pa); bool allocGuard(uint64_t *pa)
 //   uint64_t surfaceLength(const PianoDpuFlipRequest &)                         the memory's length
@@ -235,7 +236,7 @@ class Flipper {
   uint32_t mdssBefore = 0;    // MDSS HW_INTR_STATUS after the DPU's enables went off: another block holds the line when not 0
   const char *failure = nullptr;
   Stats st;
-  uint64_t pages[smmu::kSlotPages] = {};
+  uint64_t *pages = nullptr;   // kSlotPages entries, the caller's (64 KiB: not in the kext's __DATA, which the KC has little room for)
 
   // --------------------------------------------------------------------------------------------- the interrupt enables
   void writeEn(uint32_t v)
@@ -541,6 +542,10 @@ class Flipper {
   bool ladder(const Survey &s, const SmmuSurvey &m, bool identityVerified)
   {
     st.windowStartUs = hw.nowUs();
+    if (!pages) {
+      hw.note("B1b: no page list (%u entries)", smmu::kSlotPages);
+      return false;
+    }
     if (!setup(s)) return false;
     if (interruptWanted()) hw.attachIrq();   // the DPU's enables are off and the MDSS line is low: attaching raises nothing
     const unsigned n = cfg.level == 1 ? (cfg.reflushes ? cfg.reflushes : 1) : 1;
@@ -737,7 +742,7 @@ class Flipper {
     hw.note("flips: %llu in the last %llu s (%llu in all: latch mean %llu us max %llu us; %llu shown again; %llu maps mean %llu us; "
             "%llu cleans mean %llu us, %llu without; %llu back to the boot framebuffer); refused: format %llu planes %llu size %llu stride %llu "
             "align %llu memory %llu slots %llu clean %llu off %llu; copies avoided %llu, CPU time saved ~%llu ms (copies at %llu us mean "
-            "minus %llu ms of flip work); state %s",
+            "minus %llu ms of flip work); vsync interrupts %llu (%s); state %s",
             (unsigned long long)st.windowFlips, (unsigned long long)((now - st.windowStartUs) / 1000000), (unsigned long long)st.flips,
             (unsigned long long)(st.flips ? st.latchUs / st.flips : 0), (unsigned long long)st.latchMaxUs, (unsigned long long)st.reshows,
             (unsigned long long)st.maps, (unsigned long long)(st.maps ? st.mapUs / st.maps : 0), (unsigned long long)st.cleans,
@@ -747,7 +752,8 @@ class Flipper {
             (unsigned long long)st.refused[kPianoDpuFlipAlign], (unsigned long long)st.refused[kPianoDpuFlipMemory],
             (unsigned long long)st.refused[kPianoDpuFlipSlots], (unsigned long long)st.refused[kPianoDpuFlipClean],
             (unsigned long long)st.refused[kPianoDpuFlipOff], (unsigned long long)(st.flips + st.reshows), (unsigned long long)(saved / 1000),
-            (unsigned long long)(st.flips ? st.copyUs / st.flips : 0), (unsigned long long)(st.workUs / 1000),
+            (unsigned long long)(st.flips + st.reshows ? st.copyUs / (st.flips + st.reshows) : 0), (unsigned long long)(st.workUs / 1000),
+            (unsigned long long)hw.irqCount(), hw.irqLive() ? "live" : "polled",
             state == State::ready ? "serving" : state == State::failed ? "off for the boot (copies)" : "not serving");
     st.windowStartUs = now;
     st.windowFlips = st.windowRefused = 0;
