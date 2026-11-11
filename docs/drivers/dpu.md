@@ -1,8 +1,9 @@
 # Native DPU display path: survey (B1a), zero-copy flips (B1b), refresh (B1c), Night Light (B1d), panel off/on (B1e)
 
 Status, 2026-11-11: **B1a built and host-tested** (`package/PianoDpu`, `piano-dpu=1`, in the kext list, inert without the argument);
-not run on the tablet. B1b..B1e are design. Template: `README.md`. Supersedes `display.md` §2/§4/§8 for the DPU (that page's GOP half
-is `native-gop-display.md`). Backlog item B1 (`../BACKLOG-hardware.md`).
+not run on the tablet. **B1b built and host-tested** (`piano-dpu=2` with the ladder `piano-dpu-flip=1..4`, NativeGopDisplay's opt-in
+`native-gop-display-flip=1`; §4.2, §8); not run on the tablet. B1c..B1e are design. Template: `README.md`. Supersedes `display.md`
+§2/§4/§8 for the DPU (that page's GOP half is `native-gop-display.md`). Backlog item B1 (`../BACKLOG-hardware.md`).
 
 ## 1. Purpose and gate
 
@@ -58,33 +59,67 @@ hypervisor family, "K90" = an SM8750 phone). Every offset is in `package/PianoDp
 ## 4. Design
 
 **4.1 PianoDpu owns the DPU.** One driver writes DPU/DSI/SMMU-bank registers: PianoDpu (levels ≥ 2). NativeGopDisplay keeps the
-IOMFB side and gains an opt-in `native-gop-display-flip=1` that hands each 'BGRA' swap to PianoDpu through `callPlatformFunction`
-(`PianoDpuFlip`, no link dependency: PianoBacklight's pattern); without the argument it stays byte-identical. Any refusal →
-NativeGopDisplay copies that swap as today.
+IOMFB side and gains an opt-in `native-gop-display-flip=1` that hands each swap's main surface to PianoDpu through
+`callPlatformFunction` (`PianoDpuFlip`, `package/PianoDpu/PianoDpuFlipClient.h`, no link dependency: PianoBacklight's pattern);
+without the argument it stays byte-identical. As built: the copy thread makes the call after its GPU fence wait (the request carries
+the IOSurface, its memory descriptor, offset, row bytes, size, format, planes, and NativeGopDisplay's mean copy time for PianoDpu's
+log); the call returns once the hardware latched or refused. A refusal (not 'BGRA', not serving, a failure) → the copy thread copies
+the frame into the boot framebuffer, which is off the panel while a surface is shown, and then asks for the boot framebuffer back
+(`surface = nullptr`): the copy never shows half done. The swap completes on the work loop only after that (a provider-less
+`IOInterruptEventSource` the copy thread fires), so the surface it replaces is released to WindowServer only once the new one latched;
+a flipped swap needs no refresh copies, and NativeGopDisplay's VBL timer runs only while refresh copies or a stalled queue need it.
 
 **4.2 Zero-copy scanout (B1b).** The verdict: **feasible, through the SMMU only.** XNU owns no memory below 4 GiB and the SSPP
 address registers are 32-bit, so physically contiguous surfaces would not help: the DPU's stream needs a stage-1 translation that
 maps IOVA windows below 2 GiB onto each surface's pages (surfaces need no contiguity). The route must stay on its boot bank (moving
 the live stream reset the SoC on Linux); the bank itself is reprogrammed in place, as ShengUfs did on SM8550 (sheng i562–i564):
-1. *Table*: 4 KiB granule, T0SZ 32 (32-bit IOVA, walk from level 1), L1[2], L1[3] = 1 GiB identity blocks for 0x80000000–0xffffffff
-   (the splash at 0xfc800000 keeps scanning through the switch), L1[0] → L2 → L3 windows (slots of 32 MiB at 0x10000000 + 32 MiB·n;
-   one 3200×2136 surface is 6675 pages); MAIR0 attr 0 = normal non-cacheable (the walker is not coherent: tables written uncached);
-   TCR2 PASize ≥ 36 bits (XNU's RAM ends at 0xc00000000) and SEP = 7 (sheng: SEP 0 faulted).
-2. *Bank off* (SCTLR.M = 0, sheng's case): write TTBR0, TCR, TCR2, MAIR0, TLBIALL + sync, then SCTLR = M|CFRE|CFIE; watch FSR 50 ms;
-   on a fault undo (SCTLR back, RESUME, FSR clear) and stay on the copy. *Bank on* (ABL's tables live): `piano-dpu-smmu=3` walks them
-   first; the new table must map everything theirs maps, then TTBR0 is switched in one write at a vblank + TLBI.
-3. *Per swap*: NativeGopDisplay's existing fence wait (the GPU finished the frame) → map the surface once per IOSurface ID
-   (`prepare()`, physical segments, 4 PTEs per 16 KiB page, TLB sync; LRU over 4 slots, never the shown or pending one) → for each
-   pipe/rect the survey found on the splash: SRC address = window + the rect's origin (left half +0, right half +1600·4 unless its
-   SRC_XY already offsets it), YSTRIDE = the surface's row bytes; clear SRCC3_EN if ABL's format uses per-pixel alpha (WindowServer's
-   alpha is not guaranteed 0xff) → CTL_FLUSH with the pipes' bits only (VIG0+VIG1 would be 0x3). The hardware latches at the next
-   frame start (sheng: 5.4 ms, no START); FLUSH reads back 0 once latched. The old surface is released to WindowServer only after the
-   latch. Only 'BGRA' 8-bit (`vmm-present=0`) is flipped; 'RGhA' half-float and anything wider than 0xffff bytes per row is copied.
-4. *Vblank*: SPI 83 (INTID 115) through `armcpu_spi_attach` (`package/common/PianoIrq.h`, its storm guard); MDSS status bit 0 → DPU
-   INTR_STATUS bit 27 → INTR_CLEAR. The INTF1 vsync bit is enabled only while a swap is pending, so an idle desktop takes **no**
-   display wake-ups (today: NativeGopDisplay's 60 Hz timer, always). NativeGopDisplay's VBL timer is replaced in flip mode.
-5. *Cursor*: WindowServer's cursor layer is not shown today (the copy takes the largest layer); a free DMA pipe staged above in
-   LM0/LM1 (two rects across the split) is B1b's last step.
+1. *Table* (`DpuSmmu.h`): 4 KiB granule, T0SZ 32 (32-bit IOVA, walk from level 1), L1[2], L1[3] = 1 GiB identity blocks for
+   0x80000000–0xffffffff, read-write as the untranslated bank was (the splash at 0xfc800000 keeps scanning through the switch), L1[1]
+   and everything below 0x10000000 invalid, L1[0] → L2 → L3 windows: 4 slots of 32 MiB at 0x10000000 + 32 MiB·n, read-only, each
+   surface followed by a 4-page guard on a zeroed 16 KiB scratch page (a fetch burst past the last row reads zeros instead of
+   faulting); one 3200×2136 surface is 6675 pages. 66 table pages, physically contiguous, written through the cacheable kernel mapping
+   and cleaned by VA (DC CVAC) before every TLB sync (the walker is not coherent: TCR IRGN0/ORGN0 = 0, MAIR0 attr 0 = 0x44 normal
+   non-cacheable; MAIR0's other attributes and MAIR1 are ours too but unused, MAIR1 is not written). TCR2 PASize = IDR2's output size
+   (at least 36 bits: XNU's RAM ends at 0xc00000000; capped at 48) and SEP = 7 (sheng: SEP 0 faulted every IOVA with bit 31 set). The
+   format is decided at run time from the survey: CBAR type 1 (stage 1, stage 2 bypass) → stage-1 descriptors and TCR/TCR2/MAIR0;
+   type 0 (stage 2 only, translation off) → stage-2 descriptors (MemAttr normal NC, S2AP) and a VTCR-format TCR (SL0 level 1, PS);
+   types 2/3, an AArch32 bank (CBA2R VA64 0), IDR0 without the stage, IDR2 without 4 KiB AArch64 tables: refused (copies).
+2. *Bank off* (SCTLR.M = 0, sheng's case): TTBR0 (the found ASID kept), TCR2, MAIR0, TCR; TTBR0/TCR read back (else: "the bank
+   ignores our writes", undone); FSR cleared (RESUME when stalled); TLBIALL + TLBSYNC + TLBSTATUS (bounded, never a zero store); then
+   SCTLR = found − CFCFG + M + CFRE + CFIE (0xe0 → 0x61: a fault terminates, never stalls the display); M read back; FSR watched for
+   50 ms of the display's own fetches; a fault (with FAR/FSYNR0 logged) undoes it all to the found values. *Bank on* (ABL's tables
+   live): only with `piano-dpu-smmu=3`, after the walk of ABL's tables found the boot framebuffer mapped to itself every 2 MiB and at
+   its last page; then the same sequence, through "translation off" first (identity either way, so the panel does not change) instead
+   of a TTBR0 switch at vblank. The stream's SMR, S2CR, CBAR and CBA2R are never written; the kernel glue refuses any SMMU store
+   outside the bank's page.
+3. *Per swap* (`DpuFlip.h`, the "PianoDpuFlip" service, step 4): the request's rules: 'BGRA', 0 or 1 plane, at least 3200×2136,
+   row bytes 12800..0xffff and a multiple of 64, offset a multiple of 64, rows fitting a 32 MiB window (a policy, not a measured DPU
+   limit: the splash's 12800 and msm's 128-byte-aligned buffers meet it; anything else is copied). The window: found by (surface,
+   memory) or the LRU slot that is neither shown nor pending (its old surface unmapped, TLB synced, then released); the memory
+   `prepare()`d, its physical segments listed as 4 KiB pages (inside XNU's RAM, 4 KiB aligned), the PTEs written and cleaned, TLB
+   synced, the first/last/guard page checked through our own tables; the surface and its memory retained while mapped. The clean
+   (`piano-dpu-clean`, default 1): DC CVAC over the rows the DPU fetches through a read-only cacheable alias of the surface made once
+   per window (when XNU refuses the alias, flipped without, counted; 2: refused instead) — the CPU may have drawn the frame
+   (CompositorSW). The flip: for each pipe/rect of the survey's path, SRC = window + offset + (rect's splash offset / 12800) × row bytes
+   + (offset % 12800) (VIG1 by SRC_XY or by its own address both work; multirect: SRC0 and SRC1, both YSTRIDE0 halves), YSTRIDE0 = the
+   surface's row bytes, SRC_FORMAT with SRCC3_EN cleared when the path has per-pixel alpha (restored for the boot framebuffer); DSB,
+   CTL_FLUSH = the pipes' bits (or `piano-dpu-flush`); FLUSH polled after each vsync interrupt (or every ~1 ms) until the pipes' bits
+   read 0, at most `piano-dpu-latch` ms; then FSR and the underrun bits are checked. The previous window stays mapped (evictable) and
+   NativeGopDisplay completes the swap only after this returns. The same surface again: cleaned, no flush.
+4. *Vblank*: SPI 83 (INTID 115) through `armcpu_spi_attach` (`package/common/PianoIrq.h`'s SpiLine and storm guard), attached once
+   setup has turned the DPU's INTR_EN off and found MDSS HW_INTR_STATUS 0 (else polled: "another block holds the line"); the handler:
+   MDSS status bit 0 → DPU INTR_STATUS & INTR_EN → INTR_CLEAR, the waiter kicked (no bit: a stray for the guard). The INTF1 vsync bit
+   (27) is enabled only around a flush, so an idle desktop takes **no** display wake-ups: no MDSS interrupt, and NativeGopDisplay's
+   timer stops while nothing needs it. Three 10 ms waits in a row without an interrupt → polled for the boot. The underrun bits (26,
+   28) are read raw (setup checks that the raw status latches with its enable off; if not, they are enabled so they latch, and the
+   handler's cleared bits are kept for the check).
+5. *Safety*: a missed latch, an SMMU fault, or an underrun (at a flip, at a step, or by the watch every `piano-dpu-watch` s while a
+   surface is on the panel) → the pipes back to the boot framebuffer (as found, alpha bit included) and that latch awaited; only then
+   the bank back as found and every window let go (with a pipe that might still fetch a window, the window and its memory stay:
+   translation off would turn its IOVA into a physical address); flips off for the boot ("PianoDpuFlip" answers kPianoDpuFlipOff,
+   NativeGopDisplay copies). A revert while idle leaves the last copied frame in the boot framebuffer on the panel until the next swap.
+6. *Cursor*: WindowServer's cursor layer is not shown today (the copy takes the largest layer); a free DMA pipe staged above in
+   LM0/LM1 (two rects across the split) is B1b's last step: not built.
 
 **4.3 Refresh switching (B1c).** 120 ↔ 60 Hz is a VFP-only change: no DCS command (B2/B3 are the same), no clock change, no DSC or
 touch impact (SunUEFI ran 30/48/50/60/120 seamlessly). At a frame boundary, on both links: DSI DB_MODE = 1, TOTAL.V_TOTAL = 4620 − 1
@@ -129,8 +164,10 @@ and DDR/MDP votes for 4K60 (+2 GB/s). B1b's flip machinery and SMMU windows are 
 ## 5. IOKit family / ABI
 
 Level 1: `PianoDpu : IOService` on IOPlatformExpertDevice, registers nothing; properties `piano-dpu`, `piano-dpu-survey` (one line),
-`piano-dpu-refresh-mhz`. Later: `callPlatformFunction` entries `PianoDpuFlip` (surface, row bytes, format → accepted/refused, a
-completion at the latch), `PianoDpuRefresh` (60/120), `PianoDpuColorMatrix` (3×3), `PianoDpuPanel` (off/on), called from
+`piano-dpu-refresh-mhz`. Level 2 (B1b) registers the service and publishes `piano-dpu-b1b` ("step N passed", "step 4 serving", "off
+for the boot: why"). Built: `callPlatformFunction("PianoDpuFlip", request)` (`PianoDpuFlipClient.h`: a versioned request, synchronous
+until the latch or the refusal, the result one of shown / off / format / planes / size / stride / align / memory / slots / clean /
+latch / fault / underrun). Later: `PianoDpuRefresh` (60/120), `PianoDpuColorMatrix` (3×3), `PianoDpuPanel` (off/on), called from
 NativeGopDisplay's `swap_*`, `do_power_state_change_gated`, `swap_set_color_matrix`/`set_gamma_table` (IOMobileFramebufferLegacy,
 the 27.0.1 ABI generated at build time).
 
@@ -138,8 +175,16 @@ the 27.0.1 ABI generated at build time).
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `piano-dpu` | 0 | 1: the read-only survey (loads only); later 2 same-address flip, 3 shifted flip, 4 SMMU window (§8) |
-| `piano-dpu-smmu=N` | 2 | 0 skip the SMMU; 1 global pages; 2 also the bank's registers; 3 also walk the bank's translation (loads from the boot loader's table memory: opt-in) |
+| `piano-dpu` | 0 | 1: the read-only survey (loads only); 2: the survey, then B1b's ladder (`piano-dpu-flip`) |
+| `piano-dpu-flip=N` | 1 | B1b's steps (§8): 1 the boot framebuffer's addresses flushed again ×3; 2 + shifted 64 rows for 2 s and back; 3 + the DPU's SMMU bank in place, a test pattern through window 0 for 2 s, the fault status after a minute, the bank back as found; 4 the bank in place and flips served to NativeGopDisplay |
+| `piano-dpu-irq=0` | 1 | CTL_FLUSH polled every ~1 ms instead of the vsync interrupt (SPI 83) |
+| `piano-dpu-clean=N` | 1 | a surface's fetched rows cleaned from the CPU caches before each flip: 0 never, 1 through a cacheable alias when XNU makes one, 2 refuse a surface without one |
+| `piano-dpu-flush=MASK` | 0 | the CTL_FLUSH bits of a flip instead of the pipes' own (0x3 for VIG0+VIG1); e.g. 0x20003 adds the CTL's bit 17 if the pipes' bits alone do not latch |
+| `piano-dpu-underrun=0` | 1 | an underrun neither stops the ladder nor reverts |
+| `piano-dpu-latch=MS` | 50 | the latch timeout (10..500): past it, a revert and flips off for the boot |
+| `piano-dpu-watch=S` | 10 | the fault/underrun check while a surface is on the panel (0 off; nothing wakes while the boot framebuffer is) |
+| `native-gop-display-flip=1` | 0 | (NativeGopDisplay's) each swap's surface to PianoDpu's flip, the copy when refused; needs `piano-dpu=2 piano-dpu-flip=4` |
+| `piano-dpu-smmu=N` | 2 | 0 skip the SMMU; 1 global pages; 2 also the bank's registers (B1b steps 3-4 need them); 3 also walk the bank's translation (loads from the boot loader's table memory: opt-in; with it B1b may take over a bank the boot loader translates) |
 | `piano-dpu-measure=MS` | 1000 | the frame-counter interval (20..10000) |
 | `piano-dpu-delay=S`, `piano-dpu-repeat=S`, `piano-dpu-samples=N` | 0, 0, 3 | wait first; re-measure every S s, N times (after WindowServer starts, across display sleep) |
 
@@ -147,7 +192,14 @@ the 27.0.1 ABI generated at build time).
 
 `tooling/k27/build-native-piano-dpu.sh` (host tests `tests/dpu_host.cpp`: the gate and what is never loaded (VBIF, REGDMA, DSI
 PHYs, the DP controller and INTF0/3, a DSI controller whose byte or pixel clock is off), the decoders, a modelled ABL path, the SMMU scan, the walk; then the objects and the import check). PianoDpu is in
-`configs/k27-native-kexts.txt`, so every `build-native-image.sh` links it.
+`configs/k27-native-kexts.txt`, so every `build-native-image.sh` links it. B1b: `DpuSmmu.h` (the bank, the table, the windows),
+`DpuFlip.h` (the engine), `DpuFlip.cpp` (the kernel side), `PianoDpuFlipClient.h` (NativeGopDisplay's interface); host tests
+`tests/dpu_flip_host.cpp` against models of the DPU (shadow and latched pipe registers, CTL_FLUSH pending to the next frame, TOP
+INTR, the frame counter, every rect's first and last pixel fetched through the SMMU each frame), the SMMU (bank registers, a TLB only
+TLBIALL empties, the walk of DRAM, SEP and level-0 faults, FSR/FAR) and RAM (only cleaned lines reach the walker): the table layout
+and descriptors (both stages), the plan for every route and bank kind, the enable and its undo, the bank-on take-over, all four
+steps, the service (windows, LRU, TLB invalidation on eviction, every refusal, the clean policy, the alpha bit, multirect, a VIG1 by
+address), the reverts, the interrupt, the summary; mutations (no TLB sync on eviction, no clean of a table) fail them.
 
 ## 8. Hardware test plan (RAM boots; B1a unattended, B1b–B1e attended)
 
@@ -194,13 +246,106 @@ slave link's clocks are not where Linux has them: record the CBCRs), `refresh: i
 off: the refresh then comes from B1b's vsync interrupt), a hang before `stage 2` lines (an ungated block: report the last line).
 With a `bank-on` route, run once more with `piano-dpu-smmu=3`: `walk: iova 0xfc800000 -> pa 0xfc800000 ... (identity)`.
 
-**B1b ladder** (each a separate image, owner present): (1) `piano-dpu=2`: rewrite the splash pipes' SRC with their own value +
-CTL_FLUSH; pass: FLUSH clears within one frame (< 8.3 ms), frame counter keeps counting, no underrun bit (TOP INTR 26/28), panel
-unchanged. (2) `=3`: flip to the splash + 64 rows and back (visible jolt; no SMMU involved). (3) `=4`: bank translation on with the
-identity table; pass: FSR 0 for 50 ms and after a minute, panel unchanged; then a kernel test buffer at IOVA 0x10000000 shown for
-2 s and back. (4) `native-gop-display-flip=1`: the desktop via flips; pass: cursor blinks, a dragged window does not tear, the
-periodic NativeGopDisplay line shows ~0 copies, CPU idle near 0 with a blinking cursor, MDSS IRQs only while animating, 30 minutes
-with no SMMU fault, the copy fallback counted for 'RGhA'. **B1c**: `piano-dpu-hz=60` then the idle policy; pass: B1a's counter reads
+**B1b ladder** (built and host-tested 2026-11-11, not run; each step a separate RAM image, owner present, in order: a step runs
+only after the previous one passed). Every step starts with B1a's lines (the survey is the path's source), then runs within a second
+or two of PianoDpu's start, long before WindowServer; steps 1-3 change nothing after they end. The images:
+```sh
+# N = 1, 2, 3 (5 minutes is plenty)
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=300 PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-dpu=2 piano-dpu-flip=N" \
+  tooling/k27/build-native-image.sh && rm -rf out/ram-dpu2-N && cp -R out/ram out/ram-dpu2-N
+# step 4: the desktop through flips, 30 minutes ('BGRA' frames need vmm-present 0)
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=2100 \
+  PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-dpu=2 piano-dpu-flip=4 native-gop-display-flip=1" \
+  tooling/k27/build-native-image.sh && rm -rf out/ram-dpu2-4 && cp -R out/ram out/ram-dpu2-4
+grep -a "PianoDpu\|NativeGopDisplay: flip" logs/usb-console/<newest>-port0.txt
+```
+(`...` = values to record; the latch times are anywhere from a few µs to one frame, 8.3 ms at 120 Hz.)
+
+*Step 1* (`piano-dpu-flip=1`): the boot framebuffer's own addresses written again and flushed, three times a second apart. Pass:
+"latched in" below ~8400 us each time, the frame counter moving, no underrun, the panel unchanged.
+```
+PianoDpu: stage 6: B1b: zero-copy flips (docs/drivers/dpu.md section 8)
+PianoDpu: B1b: piano-dpu-flip=1 irq=1 clean=1 flush=0 underrun=1 latch=50 ms watch=10 s smmu=2
+PianoDpu: stage 7: B1b step 1: the boot framebuffer's addresses flushed again
+PianoDpu: B1b: path VIG0+VIG1, ctl0 flush 00000003, alpha on|off...; dpu intr en was ........ (now 00000000), status in 20 ms 28......
+          (vsync latches with its enable off, underrun clear), mdss status 00000000; intf1 frames A -> A+2
+PianoDpu: vsync: SPI 83 (INTID 115, level) attached (0): readback 0xa003 (group 1 1, enabled 1, edge 0, priority 0xa0), router 0x...;
+          INTF1's vsync wakes a latch wait, enabled only while a flush is pending
+PianoDpu: flip 1: reflush 1/3: ctl0 flush 00000003 latched in .... us (1 vsync interrupts, 1 waits), frames B -> B+1, underrun none: pass
+PianoDpu: flip 1: reflush 2/3: ...: pass
+PianoDpu: flip 1: reflush 3/3: ...: pass
+PianoDpu: B1b step 1 passed: 3 reflushes latched; the next image takes piano-dpu-flip=2
+PianoDpu: B1b: N DPU stores, 0 SMMU stores (all to bank page 0), 0 refused stores
+PianoDpu: stage 8: B1b: done
+```
+Failure lines: `reflush 1/3: ... did NOT latch ...: FAIL` (the pipes' bits alone do not latch on DPU 12: the next image adds the
+CTL's own bit, `piano-dpu-flush=0x20003`; or the flush register reads back differently: record `flush ........`), `vsync does NOT
+latch with its enable off` (the underruns then latch through their enables; nothing else changes), `mdss status ........ (another
+block holds the line: no interrupt)` (polled: the step still runs), `vsync: ... NOT attached` (polled), `B1b: not flippable: ...`
+(the survey's path is not what §2 expects: the B1a lines say why), `an underrun before any flip` (`piano-dpu-underrun=0` to go on).
+
+*Step 2* (`piano-dpu-flip=2`): after one reflush, the boot framebuffer shown 64 rows lower for 2 s (the picture jumps up by 64 rows,
+whatever follows the framebuffer in the splash region at the bottom), then back. No SMMU. Pass: both latched, no underrun, the panel
+as before afterwards.
+```
+PianoDpu: flip 2: the boot framebuffer + 64 rows (address fc8c8000): latched in .... us; held 2000 ms
+PianoDpu: flip 2: back to the boot framebuffer: latched in .... us; underrun none: pass
+PianoDpu: B1b step 2 passed; the next image takes piano-dpu-flip=3
+```
+
+*Step 3* (`piano-dpu-flip=3`): after one reflush, the DPU's bank in place (translation on with the identity blocks, the display's
+own fetches watched for 50 ms), a kernel test pattern (8 colour bars white..black as `native-gop-display-bars`, a 16-pixel white
+border, a black-and-white checker at the top left) through window 0 for 2 s, back, the fault status after a minute, the bank back as
+found. Pass: the pattern visible for 2 s, every `fsr 00000000`, no underrun, the panel unchanged otherwise.
+```
+PianoDpu: smmu: bank 2 (group N, stage 1, cbar 0001.... cba2r 00000001) as found: sctlr 000000e0 tcr ........ tcr2 ........ ttbr0 ...
+          mair0 ........; idr0 ........ idr2 ........ (output NN bits); our table at 0x8........ (66 pages): identity
+          0x80000000-0xffffffff, windows 0x10000000 + 4 x 32 MiB
+PianoDpu: smmu: translation on in place: sctlr 00000061 tcr 00800020 tcr2 0003800N ttbr0 ........ mair0 00000044; fsr 0 for 50000 us of
+          the display's own fetches
+PianoDpu: flip 3: the test pattern (8 colour bars, a white border, a checker at the top left) at iova 0x10000000 (6676 pages): latched
+          in .... us, fsr 00000000, underrun none; held 2000 ms
+PianoDpu: flip 3: back to the boot framebuffer: latched in .... us; fsr 00000000, underrun none while shown
+PianoDpu: flip 3: translation stays on with the identity blocks for 60 s, then the fault status again
+PianoDpu: flip 3: after 60 s: fsr 00000000, underrun none: pass
+PianoDpu: smmu: translation back as found (step 3 done): done (sctlr 000000e0 ttbr0 ... tcr ...)
+PianoDpu: B1b step 3 passed; the next image takes piano-dpu-flip=4 with native-gop-display-flip=1
+PianoDpu: B1b: N DPU stores, M SMMU stores (all to bank page 0x82000), 0 refused stores
+```
+(bank page 0x82000 = (128 pages + bank 2) × 4 KiB; another bank number moves it.) Failure lines: `smmu: translation NOT on: a fault
+while the display fetched through the new table; fsr ... far ... fsynr0 ...` (FSYNR0's level field 0 means the walk started at
+level 0 as on SM8550 before SEP 7: record it; a self-referencing L1 is the fallback, not built), `the bank ignores our writes (TTBR0/TCR
+readback)` (the hypervisor owns the bank: B1b stops at the copy), `smmu: not taken: ...` (the route or the bank kind: the reason
+says which; a bank with translation on needs `piano-dpu-smmu=3` and the walk's `map the boot framebuffer to itself` line), `revert:
+...` lines (a fault or an underrun on the pattern: the boot framebuffer is back, the bank as found).
+
+*Step 4* (`piano-dpu-flip=4 native-gop-display-flip=1`): the bank in place as in step 3, then the flips served; NativeGopDisplay
+finds PianoDpu at its first swaps. Pass: the desktop shows (login, cursor), the cursor blinks, a dragged window does not tear,
+NativeGopDisplay's periodic line shows `N swaps flipped ..., 0 copied` and its copy count near 0, CPU idle near 0 with a blinking
+cursor, the summary's vsync interrupt count grows only while something moves, 30 minutes without a `revert:` line. Then once with
+`PIANO_VMM_PRESENT=1`: every swap refused as `format` and copied, the desktop as before.
+```
+PianoDpu: B1b: serving flips (NativeGopDisplay with native-gop-display-flip=1): 4 windows, clean 1, latch timeout 50 ms, watch 10 s,
+          vsync interrupt
+NativeGopDisplay: flip mode (native-gop-display-flip): each swap's surface to PianoDpu's flip (piano-dpu=2 piano-dpu-flip=4), copied
+          when refused; a swap completes once on the panel
+NativeGopDisplay: flips through PianoDpu: a 'BGRA' swap is shown by the DPU itself, the others are copied
+PianoDpu: flip 1: 3200x2136 row 12800 -> window 0 iova 0x10000000 (mapped now), clean .... us, ctl0 flush 00000003 latched in .... us
+          (1 vsync interrupts)                                                     (the first 8 flips, then:)
+PianoDpu: flips: N in the last 60 s (N in all: latch mean ... us max ... us; ... shown again; ... maps mean ... us; ... cleans mean ...
+          us, 0 without; ... back to the boot framebuffer); refused: format 0 planes 0 size 0 stride 0 align 0 memory 0 slots 0 clean 0
+          off 0; copies avoided N, CPU time saved ~... ms (copies at ... us mean minus ... ms of flip work); vsync interrupts N (live);
+          state serving                                                            (at most once a minute, when anything happened)
+NativeGopDisplay: flip mode: N swaps flipped (no copy, no refresh copies), M copied (PianoDpu refused them or is not serving)
+```
+Record: the latch mean/max, the clean mean (the CPU cost of a flip: a 27 MB clean by VA), `without` (a cacheable alias refused:
+then the CPU's caches were not cleaned; a stale tile on the panel would say the frame needs it: `piano-dpu-clean=2`), the maps count
+(WindowServer's swap chain length). Failure lines: `NativeGopDisplay: flip refused (...)` (the first 8, with the reason), `revert:
+...` then `B1b off for the boot: ...` (the copy from then on), `flip: SMMU fault: fsr ... far ...` / `flip: underrun ...` / `watch:
+...`, `vsync: 3 waits of 10 ms in a row with no interrupt ...: polled from now on`. A separate cursor layer (`swap layers 0x3`) is not shown in either mode (the
+largest layer only, §4.2.6).
+
+**B1c**: `piano-dpu-hz=60` then the idle policy; pass: B1a's counter reads
 60.0/120.0 Hz, no grey screen or tearing, touch works at 60 Hz, 100 switches clean. **B1d**: identity PCC (no change), then blue
 0.5 on both DSPPs (both halves equally warm), then Night Shift's schedule; survives display sleep/wake. **B1e**: `pmset
 displaysleepnow` / wake 50 cycles; pass: no garbled frame, touch and backlight follow, MDSS IRQ 0 while asleep.
@@ -209,7 +354,11 @@ displaysleepnow` / wake 50 cycles; pass: no garbled frame, touch and backlight f
 
 Without `piano-dpu` nothing is mapped. Every later level falls back to NativeGopDisplay's copy per swap (refusal) or for the boot (a
 fault or a latch timeout re-points the pipes at the splash, which the copy keeps current). A hang or reset returns to Ubuntu (RAM
-boots, `piano-reset-after`).
+boots, `piano-reset-after`). B1b as built: without `native-gop-display-flip` NativeGopDisplay is unchanged whatever PianoDpu does;
+with it and PianoDpu absent or below step 4, every swap is refused (`off`) and copied, its completion only waiting for the copy. A
+step that fails stops the ladder with the boot framebuffer on the panel (steps 1-3 leave nothing changed: their reverts and the
+bank's undo return every register they wrote to its found value, except TOP INTR_EN, which stays off, the status bits they cleared,
+and the SPI 83 handler, which stays attached: ArmCpu has no detach); step 4's failures turn flips off for the boot (§4.2.5).
 
 ## 10. Open questions
 
@@ -222,10 +371,21 @@ boots, `piano-reset-after`).
 7. Does WindowServer accept a refresh change under one advertised timing (frames at 60 while it paces at 120)? → B1c.
 8. Panel sleep via the DSI command FIFO while video runs: does the NT36532 need LP or HS commands (XML: `dsi_hs_mode` for rate
    switches)? → B1e.
+9. Does an SSPP-only CTL_FLUSH latch on DPU 12 (sheng's DPU 9.2 did), or does it need the CTL's own bit 17? → B1b step 1
+   (`piano-dpu-flush=0x20003` is the second try).
+10. Does TOP INTR_STATUS latch the vsync and underrun bits with their enables off (msm reads it that way)? → B1b setup line.
+11. Does XNU make a read-only cacheable alias of WindowServer's surfaces (the clean), and what does a 27 MB clean by VA cost? → step 4
+    summary (`cleans mean`, `without`).
+12. Does WindowServer keep up when a swap completes only at the latch (a real display's pace) instead of at once, and does it never
+    draw into the surface on the panel (the family's in-use count, not NativeGopDisplay's `swap_wait` answer, guards that)? → step 4:
+    frames per second in NativeGopDisplay's line, no tearing.
+13. Under Gunyah, are the DPU bank's TTBR0/TCR/SCTLR the HLOS's to write (sheng: yes), and is IDR2's output size real? → step 3.
 
 ## 11. Licence note
 
 The msm DPU/DSI/SMMU and panel drivers, SunUEFI's Linux patches (GPL-2.0) and the stock panel XML are read as the specification
 only (offsets, fields, sequences, delays); nothing is copied. PianoDpu is BSD-2-Clause-Patent; its shape comes from PianoAudio
-(this repository). GopFramebuffer and ShengUfs (BSD-2-Clause-Patent) are the named donors of B1b; K90 (APSL 2.0) was read for facts
-only. Provenance: `package/PianoDpu/UPSTREAM`.
+(this repository). GopFramebuffer and ShengUfs (BSD-2-Clause-Patent) are the named donors of B1b: B1b re-expresses their address-only
+flip, latch poll, window slots and in-place bank enable (with its SEP 7, terminate-on-fault and undo facts) in new code; the SMMU
+registers and the descriptor format follow the ARM SMMU v2 architecture and VMSAv8-64 (ARM's public specifications). K90 (APSL 2.0)
+was read for facts only. Provenance: `package/PianoDpu/UPSTREAM`.

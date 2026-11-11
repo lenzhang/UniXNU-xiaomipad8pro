@@ -1,5 +1,6 @@
-PianoDpu is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1 only: a read-only survey. What it takes from other
-work, and from where:
+PianoDpu is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1: a read-only survey; level 2 (B1b): the zero-copy
+flips (DpuSmmu.h, DpuFlip.h, DpuFlip.cpp, PianoDpuFlipClient.h, tests/dpu_flip_host.cpp; provenance in the B1b paragraph at the end).
+What it takes from other work, and from where:
 
 UniXNU-piano (this repository), BSD-2-Clause-Patent:
   package/PianoAudio/PianoAudio.cpp (sha256 cb0499f7fa02dec2919101843c70a1d3d7b9eed389c77625ac032782321f6a8a): the kext's shape
@@ -46,3 +47,28 @@ facts only, not redistributed): the per-link timing, the link rate, DSC, the ter
 
 Not read and not used for anything: any Qualcomm or Xiaomi binary (the DPU/DSI firmware paths of ABL, the display DXEs), the
 calibration and demura data, Unixnu-SM8750-Piano (GPL-3.0).
+
+B1b (2026-11-11), new code; what it re-expresses (no code copied) and the facts it uses:
+  UniXNU-piano package/NativeUfs/NativeUfs.cpp (sha256 e7158292b263f8e81fc9e6861d9772f3a76a958acd1f449265d3a025ba986700), whose
+    dpuEnable / native_ufs_dpu_map / dpuTlbFlush came from ShengUfs (BSD-2-Clause-Patent): the in-place enable of the display bank
+    (translation off -> a table of 1 GiB identity blocks for 2-4 GiB plus 32 MiB windows at 0x10000000, TCR T0SZ 32 with EPD1,
+    TCR2 SEP 7 (SEP 0 faulted every IOVA with bit 31 set: sheng i564), MAIR0 attribute 0 = 0x44, SCTLR M|CFRE|CFIE so a fault
+    terminates, TLBIALL + TLBSYNC + TLBSTATUS on the bank page, a 50 ms FSR watch of the display's own fetches and the undo), measured
+    on SM8550 under the same hypervisor family. DpuSmmu.h is written anew: the stage decided from the bank, IDR2's output size, the
+    found SCTLR bits kept, a guard page per window, read-only windows, no self-referencing table, the bank-on take-over through the
+    walk, and every step host-tested.
+  GopFramebuffer NativeLegacyDisplay.cpp (sha256 e30354b7255fda259a25f3f7f22ecaff8c1c584196f8e54e6c402c03022d5770, listed above):
+    the address-only flip (SRC0 + YSTRIDE0 of the scanning pipes, CTL_FLUSH with their bits, no START in video mode), the latch seen
+    as CTL_FLUSH reading back 0 (5.4 ms on sheng), the fence before the flip, the LRU windows never evicting the shown or pending
+    one, the flip back to the boot memory when the copy runs. DpuFlip.h is written anew for DPU 12's survey path (per-rect offsets,
+    multirect, the alpha bit), a vsync interrupt instead of a timer poll, the reverts.
+  UniXNU-piano package/PianoDwc3/SmmuStream.h (sha256 8f566938f259730d15407aa2d84abb3f6ec3b06c7bf3dabaef78c7e7fbb930a3): the apps
+    SMMU's register offsets and the rule that a store comes from a general register (never wzr) with non-zero values for the TLB
+    operations (Qualcomm's trapped SMMU MMIO).
+  UniXNU-piano package/common/PianoIrq.h (sha256 ef924cd402caa63f5fe2a46dc2686c2672790f8187a830f13011ab2e6b085a60): used as is
+    (SpiLine, Waiter, MissGuard, armcpu_spi_attach): the MDSS SPI 83 and the watch's wake-up.
+  ARM IHI 0062 (ARM System Memory Management Unit Architecture Specification, SMMU v2) and the ARM ARM's VMSAv8-64 translation
+    table format: the global and context bank registers and fields, the stage 1 and stage 2 descriptors. Public specifications.
+  The Linux msm DPU driver (GPL-2.0, specification only, listed above): TOP0 INTR_EN/STATUS/CLEAR at +0x10/0x14/0x18 and that the
+  status latches whatever the enable (dpu_hw_interrupts.c), the per-rect source address and stride registers of a multirect pipe
+  (dpu_hw_sspp.c), SRCC3_EN. Nothing copied.
