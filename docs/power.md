@@ -346,6 +346,14 @@ run. For `sleepkey` with the cover: `PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/PianoKe
 | G3 | `ram-pm-gsleep3` (600 s) | high: the rails' votes gone and ss3 while suspended, the island programmed, the UFS link in Hibern8 (`native-ufs-suspend=1`; USB and PCIe have no kOff yet) | attended, only after L1 showed `island ready` and G1/G2 passed | `CX 0x... -> 0 ... (the rails' votes gone)`; the RPMh line at wake: whether `cxsd` / `ddr` moved (the keepalive BCMs and CN0 still hold the DDR without a SLEEP set) | a reset: keep `piano-gpu-suspend-rails` at its default; the mailbox has the last line |
 | GM | `ram-pm-gmeasure` (2400 s) | low (G1 passed) | as M | as M; the suspended current against M's (§6.4 step 3) | — |
 
+The GPU's rows come after S1-S2 passed without the GPU's part and after the stall right after a bring-up is understood
+(`forensics-2026-11-11.md` §5, R3): G1 adds a GPU transition at every suspend and resume. Build: `tooling/k27/build-pm-test-images.sh
+island gsleep1 gsleep2 gsleep3 gmeasure` from the same KC (its PianoA830 has the arguments; nothing changes without them). G2 needs
+B1e's own test first (`drivers/dpu.md` §8.3, image e0). Built offline here on the 0063 kernel (KC with the 21 native kexts
+`194d9df11531e4de…`, the native kext rule passed): `ram-pm-island` `63fb764808660f96…`, `ram-pm-gsleep1` `3e905a31a23aec0a…`,
+`ram-pm-gsleep2` `b0ffdee6ce89a3b4…`, `ram-pm-gsleep3` `c33688c73d62fd49…`, `ram-pm-gmeasure` `11ce4501356874a5…`; rebuild in the main
+checkout before a run.
+
 ### 6.4 The measurement (A/B)
 
 PianoPower's line every 10 s (`piano-power=1 piano-power-period=10`, all images): `[Ns] battery: V mV, I mA (discharging), P %
