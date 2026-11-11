@@ -15,14 +15,14 @@ are not modified):
     (unixnu-research/Adreno830 main 1a1321056ffc5428ae925f4680093718b46ca7c2, platform/sm8750), MIT; the notice is in LICENSE.
 
 Levels 2-4, re-expressed (nothing linked; these files are BSD-2-Clause-Patent, this repository's):
-  package/PianoA830/adreno830/platform/sm8750/Sm8750Rpmh.c (sha256 48195157ca191fe7667c491575f58bb4007393cbcabc56091f5945194a479f20)
-    and Sm8750Rpmh.h (sha256 b8f948fb6359368e79e00a7fe310b3daede1b9078b072d0cdfece469ddb4787f), MIT (Adreno830's, this repository's
+  package/PianoA830/adreno830/platform/sm8750/Sm8750Rpmh.c (sha256 2afbbe8c4b8d7fb6effa1e30bfc2a1a56fb94c6149e5af752b5bcbfa7c9692a5)
+    and Sm8750Rpmh.h (sha256 ce528d8560e0c081019fb47b61407c8f6da0648d79ec18bade06cd51b75e2f54), MIT (Adreno830's, this repository's
     copy): the cmd-db layout and lookup rules (a unique name, its slave type in the address, the aux data inside the snapshot), the
     ARC table's count up to the zero padding, the corner rule (the first hlvl whose vlvl reaches the request), the BCM command
     encoding, and Sm8750RpmhWriteActive's protocol (the DRV-2 owner word, the version-selected layout, the idle-TCS test, the
     masked IRQ_ENABLE bit, MSGID/ADDR/DATA, WAIT_FOR_CMPL, CMD_ENABLE, AMC mode, read-backs, the trigger, the completion test, the
     clean-up, a TCS that never completed left as evidence) -> VideoRpmh.h, written fresh around the video's three resources.
-  package/PianoWifi/PianoWifi.cpp (sha256 138c48f3b5841b95a070a0a5fa0a86bf7cac429e19bb880f280da2e68fbd2551) and
+  package/PianoWifi/PianoWifi.cpp (sha256 6ac47f0a6855ce7d69651446c74a194d88dfe6d2cfe6535c12b4af6ec0dad600) and
     package/PianoPower/PianoAdsp.cpp (sha256 9b90b3d9ed1f53c12baee6378f653b7143c1b0c19dca754f24aa85c52900918a): how a kext imports
     PianoA830's DRV-2 owner word and takes it (compare-exchange for its own tag, 10 us steps, at most 2 s), PianoAdsp.cpp's secure()
     wrapper (a line before each call with 20 ms for the console, one after) and its Sm8750Scm set-up (the ops lock taking the
@@ -37,7 +37,7 @@ Levels 2-4, re-expressed (nothing linked; these files are BSD-2-Clause-Patent, t
     with a 32-bit input (T0SZ 32, from level 1), TCR2 SEP 7 (SEP 0 faults bit-31 IOVAs under this hypervisor family), the
     non-cacheable walks over tables cleaned to the PoC, MAIR0 0x44, the fault registers (FSR/FAR/FSYNR0, RESUME for a stalled
     one), the software walk as a self-check -> VideoSmmu.h.
-  package/PianoSensors/PianoSensors.cpp (sha256 5525fe010130a20159b3ce6749cdecbae245237b8090198b64c930dd0e27f8de): finding the ESP
+  package/PianoSensors/PianoSensors.cpp (sha256 d8235b6b5425c0d27f0b49f2f8e4a49fccfeb62df9ce470c974627ae48a25ac4): finding the ESP
     through NativeUfs (GPT "esp") and partitionRead over native_ufs_part_read -> PianoVideo.cpp KernelHw::fwRead.
 
 UniXNU-piano (this repository), BSD-2-Clause-Patent:
