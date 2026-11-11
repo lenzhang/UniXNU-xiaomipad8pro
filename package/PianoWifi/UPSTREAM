@@ -1,5 +1,6 @@
-PianoWifi is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Levels 1 (read-only survey), 2 (power), 3 (the PCIe0 link)
-and 4 (the firmware over MHI). What it takes from other work, and from where:
+PianoWifi is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Levels 1 (read-only survey), 2 (power), 3 (the PCIe0 link),
+4 (the firmware over MHI) and 5 (the IPC router's channels, QRTR and the WLAN firmware's QMI service). What it takes from other
+work, and from where:
 
 UniXNU-sheng (unixnu-research/UniXNU-sheng, main 00ba90984e831e4c6ce30ec3d8a56e6434e9f1af), BSD-2-Clause-Patent (LICENSE sha256
 5b1d3d911103cb0f41641ec0964c5ac1f7e229f57aa072b6ac38bae913a1307b; SM8550 + WCN7850, the Wi-Fi path hardware-verified there per its
@@ -56,6 +57,25 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
     copied, namespace pianowifi and the include guard changed, one provenance line added.
   package/PianoKeyboard/CmdDb.h (sha256 794cf39c76e2c903d79cc1146ae25d946946862daa9b8848d616e9ad8107c716): cmdDbFind re-expressed
     in WifiSurvey.h (same layout, 64-bit sizes), and its way of reading cmd-db (one mapping, copied out word by word).
+  package/PianoPower/QcomQrtr.c (sha256 ac9800cc8faf6f0bdd59a95df398df3c7d996986f001f4013e8e38e043b6f257) and QcomQrtr.h
+    (sha256 d82bb7ba7ce870258c227c513e8e297cf71b6be9855b80f00e4804c0460c51fa) -> WifiQrtr.c / WifiQrtr.h: copied with the include
+    guard changed, provenance lines added, and two additions marked "PianoWifi addition" in both files (level 5's link is the
+    chip's MHI IPCR channels, not the DSP's GLINK, and its messages are far larger than the DSP's):
+      qcom_qrtr_send_buffer: a data packet whose payload the caller has already put at buffer + 32, so that the board file's and
+        the calibration data's 6144-byte segments are never copied again and never stand on a kernel stack (the copied
+        qcom_qrtr_send_data builds its packet on the stack and is bounded by QCOM_QRTR_MAX_DATA = 1024);
+      qcom_qrtr_find_service: the node and port of a remote service matched on its instance word as well, which is how the WLAN
+        firmware's service (69, version 1, instance 1) is told from another version of itself on the same link.
+    PianoPower is not modified; its own QRTR path (the DSP) keeps using its file.
+  package/PianoDpu/DpuSmmu.h (sha256 9cc7d830e27084905081222f6ab4ebe17786709dac869649e706504303f1ae30) and
+  package/PianoUsbHost/SmmuIdentity.h (sha256 d0cdab46fc2815d45895d6c652e610b0d9969b5bdbed6496aea3ecd5b4cba949) -> WifiSmmuWindow.h:
+    reused by copying, in this namespace: from DpuSmmu.h the context bank register offsets and their fields, the VMSAv8-64
+    descriptor helpers, the "non-cacheable walks, attribute 0 Normal non-cacheable" choice (our window is reached write-combined,
+    so nothing keeps caches and the device coherent), and the TLBIALL/TLBSYNC/TLBSTATUS sequence with non-zero written values and
+    bounded waits; from SmmuIdentity.h the plan/apply split for a stream with no translating bank of its own (a free group or the
+    stream's own exact entry redirected in place, a free bank found from one below the top, the whole bank programmed before the
+    one store that switches the stream to it). Ours: the 32-bit input space (T0SZ 32, the walk from level 1), the two-page table,
+    and the window's 2 MiB blocks over level 4's contiguous range. Neither package is modified.
   package/PianoDwc3/SmmuStream.h (sha256 8f566938f259730d15407aa2d84abb3f6ec3b06c7bf3dabaef78c7e7fbb930a3): the SMMU geometry
     checks and the stream-match decode, re-expressed read-only in surveySmmu (no plan, no write); and copied byte for byte as
     SmmuStream.h but for its first three lines (the namespace pianousb -> pianowifi and one provenance line), which level 3 uses for
@@ -70,6 +90,19 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
     hardware-verified on piano): the same protocol in PianoWifi.cpp vrmLocked / hwVrm (up to three commands of one VRM resource per
     transaction), and PianoTouch.cpp's protocol for the GCC vote lock word in hwVoteLock. The lock words themselves are
     PianoA830's (adreno830/platform/sm8750/Sm8750Rpmh.h, Sm8750GpuPower.c); PianoWifi only declares them, as those drivers do.
+
+Specifications only for level 5 (behaviour and wire facts; no code, comment or table copied): the Ubuntu kernel
+yzddmr6/linux-sm8750-piano piano/dev 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01 (GPL-2.0), read for what the WLAN firmware expects
+and in which order — drivers/net/wireless/ath/ath12k/qmi.c and qmi.h (the WLFW message identifiers, each field's tag and type, the
+order of the exchange, the memory-region types and the "ask again in smaller pieces" fallback, the board-file and trace-configuration
+segmentation at 6144 bytes, the host capability bits of a platform with an internal sleep clock, the feature bits of this chip's
+entry), ath12k/wifi7/mhi.c (this chip's MHI configuration: the two IPC router channels 20 and 21, 64 elements each, on the second
+event ring, 8 KiB buffers), ath12k/wifi7/ce.c and ath12k/wifi7/hw.c (the nine copy-engine pipes, the fourteen service-to-pipe
+entries and the board-file size cap of this chip's entry), ath12k/wifi7/hal.c, hal_qcc2072.c and hal.h (the ring head-pointer
+register offsets and the shadow register window at BAR0 + 0x8fc, 40 registers), drivers/soc/qcom/qmi_encdec.c (how a counted array,
+a string inside a structure and a string of its own are encoded), drivers/bus/mhi/common.h and drivers/bus/mhi/host (the register,
+context and ring-element layouts and the doorbell order), net/qrtr (the version 1 header and the control messages). Not read and not
+used: any Qualcomm binary.
 
 Specifications only (no code, comment or table copied): mainline Linux drivers/clk/qcom/gcc-sm8750.c and tcsrcc-sm8750.c,
 include/dt-bindings/clock/qcom,sm8750-gcc.h, drivers/pci/controller/dwc/pcie-qcom.c and pcie-designware.h,

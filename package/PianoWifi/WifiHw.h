@@ -219,4 +219,143 @@ constexpr const char *kAmssName = "amss20.bin";
 constexpr uint32_t kMhiSblBytes = 512 * 1024, kMhiSegBytes = 512 * 1024, kMhiMaxSegments = 32;
 constexpr uint32_t kDmaWindowBytes = 24u << 20;   // the boot loader, the segments, the vector table and the MHI contexts
 
+// ======================================================== level 5: the MHI channels, QRTR, and the WLAN firmware's QMI service
+// The MHI register block's remaining offsets (the MHI specification's names, as both the mainline host and the vendor host use
+// them; behaviour only, nothing copied): the channel doorbell array's offset, the command ring doorbell, and the element sizes.
+// A doorbell is a 64-bit value written as two words, the high half first.
+constexpr uint32_t kMhiChdbOff = 0x18, kMhiCrdbLo = 0x70, kMhiCrdbHi = 0x74;
+// A ring element (TRE) is 16 bytes: a 64-bit pointer and two words. The words' fields:
+//   transfer:  word0 = length (15:0); word1 = type 2 (23:16) | bei (10) | ieot (9) | ieob (8) | chain (0)
+//   command:   word1 = channel (31:24) | command (23:16); start channel = 18, stop = 17, reset = 16
+//   event:     word0 = code (31:24) | length (15:0) — for a state change or an execution environment event the new value is in
+//              31:24 instead; word1 = channel (31:24) | type (23:16); transfer completion 0x22, command completion 0x21,
+//              state change 0x20, execution environment change 0x40. Completion code 1 = success, 2 = end of transfer.
+constexpr uint32_t kTreTypeTransfer = 2, kTreCmdStart = 18, kTreCmdStop = 17, kTreCmdReset = 16;
+constexpr uint32_t kEvTypeTransfer = 0x22, kEvTypeCmdCompletion = 0x21, kEvTypeStateChange = 0x20, kEvTypeEeChange = 0x40;
+constexpr uint32_t kEvCodeSuccess = 1, kEvCodeEot = 2;
+constexpr uint32_t kTreIeot = 1u << 9, kTreIeob = 1u << 8, kTreChain = 1u << 0, kTreBei = 1u << 10;
+// A channel context's words: configuration (channel state 7:0, burst mode 9:8, poll configuration 15:10), type (1 outbound to the
+// device, 2 inbound), the event ring it reports on; then base, length, read and write pointers (64-bit each).
+constexpr uint32_t kChanCfg = 0, kChanType = 4, kChanErIndex = 8, kChanRBase = 12, kChanRLen = 20, kChanRp = 28, kChanWp = 36;
+constexpr uint32_t kChanStateDisabled = 0, kChanStateEnabled = 1, kChanStateRunning = 2;
+constexpr uint32_t kChanBurstDisable = 2;   // in the burst mode field (9:8)
+constexpr uint32_t kChanTypeOutbound = 1, kChanTypeInbound = 2;
+// The two IPC router channels of this chip family, and how the vendor's own host sizes them: channel 20 carries packets to the
+// device, 21 carries them back, 64 elements each, both reporting on the second event ring (the 256-element one level 4 already
+// programs), burst mode disabled, and a receive buffer of 8 KiB per element (facts of the chip's MHI configuration).
+constexpr uint32_t kChanIpcrOut = 20, kChanIpcrIn = 21;
+constexpr uint32_t kIpcrElements = 64, kIpcrBufferBytes = 8 * 1024;
+constexpr uint32_t kIpcrEventRing = 1;      // the data ring of WifiMhi.h's two
+constexpr uint32_t kIpcrOutBuffers = 4;     // ours: at most one QMI request is in flight, three spare
+// The command ring level 4 already programs has 8 elements; level 5 uses it for the two "start channel" commands.
+constexpr uint32_t kMhiCommandTimeoutMs = 2000;
+
+// QRTR on this link: our node number and the port our client binds. The router's control port is 0xfffffffe (WifiQrtr.h). The
+// firmware's node number is whatever its hello says; the service's port comes from its announcement.
+constexpr uint32_t kQrtrLocalNode = 1, kQrtrClientPort = 0x4000;   // the first port of the router's ephemeral range
+// The WLAN firmware's QMI service: id 69, version 1, instance 1 on this chip family (the announcement's instance word is
+// version | instance << 8). The service's messages level 5 uses:
+constexpr uint32_t kWlfwService = 0x45, kWlfwVersion = 1, kWlfwInstance = 1;
+constexpr uint32_t kWlfwInstanceWord = kWlfwVersion | kWlfwInstance << 8;
+enum WlfwMessage : uint16_t {
+  kWlfwIndRegister = 0x0020, kWlfwWlanMode = 0x0022, kWlfwWlanCfg = 0x0023, kWlfwCap = 0x0024, kWlfwBdfDownload = 0x0025,
+  kWlfwWlanIni = 0x002f, kWlfwHostCap = 0x0034, kWlfwRequestMemInd = 0x0035, kWlfwRespondMem = 0x0036,
+  kWlfwFwMemReadyInd = 0x0037, kWlfwFwReadyInd = 0x0038, kWlfwM3Info = 0x003c, kWlfwQdssDownload = 0x0044,
+  kWlfwPhyCap = 0x0057, kWlfwAuxUcInfo = 0x005a,
+};
+// The client identifier the host announces when it registers for indications, and the largest data payload one download message
+// carries (both facts of the service).
+constexpr uint32_t kWlfwClientId = 0x4b4e454c, kWlfwMaxDataBytes = 6144;
+// The host capability bits this platform must set: the host handles its own C-states, the chip uses its internal sleep clock
+// (piano's DT names no clock for the PMU, open question 3 in wifi.md), and the platform can reset the PCIe link globally.
+constexpr uint8_t kHostCapCstate = 0x04, kHostCapInternalSleepClock = 0x02, kHostCapPcieGlobalReset = 0x08;
+constexpr uint8_t kHostCapNmModem = kHostCapCstate | kHostCapInternalSleepClock | kHostCapPcieGlobalReset;
+// The firmware feature list this chip's entry asks for: "the host does not pull PERST# on reset" and "the auxiliary microcode is
+// supported" (bits 4 and 6 of the service's feature enumeration). The QDSS configuration miss bit is *not* set for this chip,
+// which is why the QDSS configuration is one of the downloads below.
+constexpr uint64_t kWlfwFeaturePerstNoPull = 1ull << 4, kWlfwFeatureAuxUc = 1ull << 6;
+constexpr uint64_t kWlfwFeatureList = kWlfwFeaturePerstNoPull | kWlfwFeatureAuxUc;
+constexpr uint32_t kWlfwMemCfgModeDefault = 0;   // the memory configuration mode: the full-size one
+// The firmware's memory region types, and the download types.
+enum WlfwMemType : uint32_t {
+  kMemHostDdr = 0x1, kMemBdf = 0x2, kMemM3Dump = 0x3, kMemCaldb = 0x4, kMemMloGlobal = 0x8, kMemPageable = 0x9,
+  kMemLpassShared = 0xb,
+};
+enum WlfwBdfType : uint8_t { kBdfTypeBin = 0, kBdfTypeElf = 1, kBdfTypeRegdb = 4, kBdfTypeCalibration = 5 };
+constexpr uint32_t kWlfwMaxMemSegments = 52, kWlfwMaxMemCfg = 2;
+constexpr uint32_t kWlfwChunkLimit = 2u << 20;   // a single region larger than this is answered with the "ask again smaller" form
+constexpr uint32_t kBoardFileLimit = 256 * 1024; // this chip's board-file size cap
+constexpr uint8_t kBoardIdDefault = 0xff;        // the file identifier when the firmware reports no board identifier
+constexpr uint32_t kFirmwareModeNormal = 0, kFirmwareModeOff = 4;
+constexpr const char *kHostVersionString = "WIN";   // the host version string the service expects
+constexpr uint32_t kWlfwTimeoutMs = 10000;          // the service's own request timeout
+// The firmware files level 5 reads from the same stock partition level 4 reads (never from this repository): the board file is the
+// China-region one of this unit's stock image, and the names are the stock ones (ath12k's own names in wifi.md section 2).
+constexpr const char *kBoardName = "bd_p81.elf";          // board data, an ELF: download type 1
+constexpr const char *kRegdbName = "regdb_xiaomi.bin";    // the regulatory database: download type 4
+constexpr const char *kM3Name = "phy_ucode20.elf";        // the PHY microcode, handed over by address
+constexpr const char *kAuxUcName = "aux_ucode20.elf";     // the auxiliary microcode, handed over by address
+constexpr const char *kQdssName = "qdss_trace_config_v2.cfg";   // the trace configuration, downloaded in segments
+
+// The copy engine configuration level 5 sends the firmware (the chip's own pipes, which the data path of level 6 then uses).
+// pipe direction: 1 into the host, 2 out of the host, 3 both ways, 4 host to host.
+enum CePipeDir : uint32_t { kCeDirNone = 0, kCeDirIn = 1, kCeDirOut = 2, kCeDirInOut = 3, kCeDirHostToHost = 4 };
+constexpr uint32_t kCeFlagsDefault = 0, kCeFlagNoInterrupt = 8;
+struct CePipeConfig { uint32_t pipe, dir, entries, bytesMax, flags; };
+// This chip family's nine pipes: 0 control out, 1 control/data in, 2 the firmware's messages in, 3 the host's messages out,
+// 4 the host's data out, 5 packet log in, 6 the firmware's own copies, 7 host to host, 8 reserved for the data accelerator.
+constexpr CePipeConfig kCePipes[] = {
+  {0, kCeDirOut, 32, 2048, kCeFlagsDefault},
+  {1, kCeDirIn, 32, 2048, kCeFlagsDefault},
+  {2, kCeDirIn, 32, 2048, kCeFlagsDefault},
+  {3, kCeDirOut, 32, 2048, kCeFlagsDefault},
+  {4, kCeDirOut, 256, 256, kCeFlagsDefault | kCeFlagNoInterrupt},
+  {5, kCeDirIn, 32, 2048, kCeFlagsDefault},
+  {6, kCeDirInOut, 32, 16384, kCeFlagsDefault},
+  {7, kCeDirHostToHost, 0, 0, kCeFlagsDefault | kCeFlagNoInterrupt},
+  {8, kCeDirInOut, 32, 16384, kCeFlagsDefault},
+};
+constexpr unsigned kCePipeCount = sizeof kCePipes / sizeof kCePipes[0];
+// The host transport's services and the pipes they use. A service identifier is group << 8 | index: group 0 reserved (control),
+// 1 the firmware's message interface, 3 the host's data messages.
+struct CeServiceConfig { uint32_t service, dir, pipe; };
+constexpr uint32_t kSvcCtrl = 0x0001, kSvcWmiControl = 0x0100, kSvcWmiDataBe = 0x0101, kSvcWmiDataBk = 0x0102,
+                   kSvcWmiDataVi = 0x0103, kSvcWmiDataVo = 0x0104, kSvcHttData = 0x0300;
+constexpr CeServiceConfig kCeServices[] = {
+  {kSvcWmiDataVo, kCeDirOut, 3}, {kSvcWmiDataVo, kCeDirIn, 2},
+  {kSvcWmiDataBk, kCeDirOut, 3}, {kSvcWmiDataBk, kCeDirIn, 2},
+  {kSvcWmiDataBe, kCeDirOut, 3}, {kSvcWmiDataBe, kCeDirIn, 2},
+  {kSvcWmiDataVi, kCeDirOut, 3}, {kSvcWmiDataVi, kCeDirIn, 2},
+  {kSvcWmiControl, kCeDirOut, 3}, {kSvcWmiControl, kCeDirIn, 2},
+  {kSvcCtrl, kCeDirOut, 0}, {kSvcCtrl, kCeDirIn, 2},
+  {kSvcHttData, kCeDirOut, 4}, {kSvcHttData, kCeDirIn, 1},
+};
+constexpr unsigned kCeServiceCount = sizeof kCeServices / sizeof kCeServices[0];
+// The shadow registers: a list of register offsets inside BAR0 that stand in for a ring's head or tail pointer, so that the host
+// writes one 32-bit word instead of a descriptor pointer. The chip carries 40 of them from BAR0 + 0x8fc, four bytes apart, and the
+// firmware learns which ring each stands for from the order of this list (the offsets of the rings' own head pointers; a
+// destination ring's tail pointer is its head pointer's offset plus four). The rings exist only at level 6, so level 5 sends the
+// list only with piano-wifi-shadow=1 and the builder is a host-tested function (WifiWlfw.h shadowList).
+constexpr uint32_t kShadowBase = 0x8fc, kShadowRegisters = 40, kShadowMax = 60;
+constexpr uint32_t kShadowHpToTp = 4;
+// The ring head-pointer offsets of this chip's register map (its unit's own base plus the ring's offset in it), in the order the
+// list is built: the non-copy-engine rings first, then the copy engines' source, destination and destination-status rings.
+constexpr uint32_t kUnitReo = 0x00a38000, kUnitTcl = 0x00a44000, kUnitWbm = 0x00a34000;
+constexpr uint32_t kUnitCe0Src = 0x01b80000, kUnitCe0Dst = 0x01b81000, kUnitCe1Src = 0x01b82000, kUnitCe1Dst = 0x01b83000;
+constexpr uint32_t kReo1RingHp = 0x3048, kReo2RingHp = 0x3050, kReoSw0RingHp = 0x3088, kReoCmdHp = 0x3020, kSw2ReoHp = 0x3028,
+                   kReoStatusHp = 0x30a8;
+constexpr uint32_t kTcl1RingHp = 0x2000, kTcl2RingHp = 0x2008, kTclRingHp = 0x2028, kTclStatusHp = 0x2048;
+constexpr uint32_t kWbmIdleLinkHp = 0x30b8, kWbmSwReleaseHp = 0x3010, kWbm0ReleaseHp = 0x30c8, kWbm1ReleaseHp = 0x30d0;
+constexpr uint32_t kCeDstRingHp = 0x400, kCeDstStatusRingHp = 0x408;
+
+// Level 5's own sizes: the IPC router's buffers, the firmware's memory regions and the QMI message buffer all come out of the same
+// arena as level 4's image, so the window is larger when level 5 runs (piano-wifi-dma, default 24 MiB at level 4, 64 at level 5).
+constexpr uint32_t kDmaWindowBytesL5 = 64u << 20;
+// The 32-bit question (wifi.md section 10.11): the chip's own driver gives it 36-bit addresses for the firmware's regions but
+// 32-bit ones for the rings of the data path, and XNU's memory is all above 4 GiB on piano, so a bypassing stream (level 3's) can
+// never produce a 32-bit address. piano-wifi-iova=1 therefore gives stream 0x1401 a translating context bank whose window starts
+// here and maps the arena in 2 MiB blocks (WifiSmmuWindow.h); the addresses handed to the chip are then this window's.
+constexpr uint32_t kIovaWindowBase = 0x20000000;   // 512 MiB: inside the first 1 GiB of a 32-bit input space
+constexpr uint32_t kIovaBlockBytes = 2u << 20;
+
 }  // namespace pianowifi
