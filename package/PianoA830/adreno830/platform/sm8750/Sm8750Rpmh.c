@@ -635,3 +635,33 @@ int Sm8750RpmhHostDdr(Sm8750RpmhHost *host, uint32_t kbps)
     host->held |= Sm8750RpmhHeldDdr;
     return Sm8750RpmhOk;
 }
+
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano: the idle rails (A830Idle.h). */
+static uint32_t idle_level(const Sm8750RpmhArc *arc, uint32_t held, uint32_t vlvl)
+{
+    uint32_t h = 0;
+    if (Sm8750RpmhArcLevel(arc, vlvl, &h) != Sm8750RpmhOk)
+        return held;
+    return h < held ? h : held;
+}
+
+int Sm8750RpmhHostRailsIdle(Sm8750RpmhHost *host, uint32_t vlvl)
+{
+    Sm8750RpmhRequest request;
+    int rc;
+    if (!host || !host->res)
+        return Sm8750RpmhArgument;
+    if (!(host->held & Sm8750RpmhHeldRails) || !vlvl)
+        return Sm8750RpmhOk;
+    const uint32_t mx = idle_level(&host->res->mx, host->mx_hlvl, vlvl);
+    const uint32_t cx = idle_level(&host->res->cx, host->cx_hlvl, vlvl);
+    if (mx == host->mx_hlvl && cx == host->cx_hlvl)
+        return Sm8750RpmhOk;
+    if ((rc = Sm8750RpmhRailRequest(host->res, mx, cx, 0, &request)) || (rc = host_send(host, &request)))
+        return rc;
+    host->mx_hlvl = mx;
+    host->cx_hlvl = cx;
+    return Sm8750RpmhOk;
+}
+#endif

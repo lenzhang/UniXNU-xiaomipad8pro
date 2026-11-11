@@ -305,6 +305,13 @@ int Sm8750RpmhHostCn0(Sm8750RpmhHost *host);
 /* S2: DDR boot level (pagani-gpu-ddr, kBps of DT level 11 by default); S5: the floor
  * (pagani-gpu-ddr-floor, = boot level by default, so nothing is sent; 0 = keepalive minimum). */
 int Sm8750RpmhHostDdr(Sm8750RpmhHost *host, uint32_t kbps);
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (A830Idle.h, piano-gpu-idle=2): the idle rails. Each of mx and cx at the first level of its table whose vlvl reaches
+ * `vlvl`, but never above the level held (this only lowers: cx first, then mx, waits on both, one TCS, the DRV-2 lock as for every
+ * vote); Sm8750RpmhHostRails puts them back. Sends nothing while the rails are not held, at vlvl 0, or when nothing changes; a table
+ * without such a level keeps that rail. A failed send leaves the held levels as they were. */
+int Sm8750RpmhHostRailsIdle(Sm8750RpmhHost *host, uint32_t vlvl);
+#endif
 
 #ifdef __cplusplus
 }
