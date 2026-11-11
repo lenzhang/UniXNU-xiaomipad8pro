@@ -30,6 +30,8 @@
 // level ignores it; the property piano-thermal-profile and one line per change.
 // piano-thermal-adc=1|2 (B6, PianoThermalAdc.cpp; implies piano-thermal=1): the eleven board thermistors on the PMIC ADC, on a thread
 // of their own, and piano_thermal_board_temps() for charging safety. Its only writes: the ADC SDAM's conversion bytes.
+// piano-thermal-irq=1 (PianoThermalIrq.cpp, TsensIrq.h; with piano-thermal >= 1): the TSENS upper/lower threshold interrupts; at
+// rest the base poll relaxes, an interrupt raises the tier at once; any failure: today's polling (docs/drivers/thermal.md section 13).
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -53,6 +55,7 @@
 #include "Governor.h"
 #include <PianoPowerContract.h>
 #include "PianoThermalAdc.h"
+#include "PianoThermalIrq.h"
 #include "Policy.h"
 #include "Scmi.h"
 #include "Tsens.h"
@@ -419,13 +422,15 @@ Window gSuspendTm[kControllers];
 uint32_t gSavedUpLowMask[kControllers];
 bool gSuspendSaved[kControllers];
 uint32_t gSuspendState;            // 0 idle, 1 prepared
-constexpr bool kServicesUplow = false;   // true once the uplow interrupt is PianoThermal's (section 10 of the page)
+constexpr bool kServicesUplow = false;   // this path: the uplow interrupt not serviced (piano-thermal-irq live: irq::hookSuspend*)
 }
 
 extern "C" int piano_thermal_suspend_prepare(void)
 {
   uint32_t idle = 0;
   if (!__atomic_compare_exchange_n(&gSuspendState, &idle, 1u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return -1;
+  const int uplow = irq::hookSuspendPrepare();   // piano-thermal-irq live: lower masked, upper kept armed (PianoThermalIrq.cpp)
+  if (uplow >= 0) return uplow;
   int done = 0;
   char line[200];
   int at = 0;
@@ -455,6 +460,10 @@ extern "C" int piano_thermal_suspend_prepare(void)
 extern "C" void piano_thermal_suspend_finish(void)
 {
   if (__atomic_load_n(&gSuspendState, __ATOMIC_ACQUIRE) != 1) return;
+  if (irq::hookSuspendFinish()) {   // the masks are the uplow path's: nothing of this path's to restore
+    __atomic_store_n(&gSuspendState, 0u, __ATOMIC_RELEASE);
+    return;
+  }
   int done = 0;
   for (unsigned c = 0; c < kControllers; ++c) {
     if (!gSuspendSaved[c] || !gSuspendTm[c].va) continue;
@@ -560,6 +569,7 @@ IOReturn PianoThermal::callPlatformFunction(const OSSymbol *functionName, bool w
 // The thread's wait between polls; a system sleep's park request ends it early.
 void PianoThermal::pollWait(uint32_t ms)
 {
+  if (irq::hookSleep(ms, &sleepWanted_)) return;   // piano-thermal-irq live: an uplow interrupt or the park request ends it
   IOLockLock(sleepLock_);
   if (!sleepWanted_) {
     uint64_t deadline = 0;
@@ -595,6 +605,7 @@ IOReturn PianoThermal::setPowerState(unsigned long state, IOService *)
   if (s.park && threadRunning_) {
     sleepWanted_ = true;
     IOLockWakeup(sleepLock_, &sleepWanted_, false);
+    irq::hookKick();   // and the uplow path's wait
     uint64_t deadline = 0;
     clock_interval_to_deadline(500, kMillisecondScale, &deadline);
     while (!threadParked_ && IOLockSleepDeadline(sleepLock_, &threadParked_, deadline, THREAD_UNINT) != THREAD_TIMED_OUT) {
@@ -647,7 +658,8 @@ bool PianoThermal::start(IOService *provider)
   setProperty("piano-cpufreq", gArgs.cpufreq, 32);
   if (gArgs.cpufreq >= 2) setProperty("piano-thermal-profile", 0ull, 32);
   sleepLock_ = IOLockAlloc();
-  sleep_ = SleepPlan(gArgs.sleepMask != 0);
+  // piano-thermal-irq=1 uses the threshold interrupts, so a sleep masks them (the hooks: lower only while it is live, as Linux)
+  sleep_ = SleepPlan(gArgs.sleepMask != 0 || irq::hookLevel() != 0);
   registerService();
   adc::hookStart(this, adc::hookLevel(), gArgs.logS, gArgs.delay);   // B6 (PianoThermalAdc.cpp): nothing without piano-thermal-adc
   thread_t t = nullptr;
@@ -658,7 +670,8 @@ bool PianoThermal::start(IOService *provider)
   thread_deallocate(t);
   threadRunning_ = true;
   note("system sleep: in the power tree (%#x): the thread parks while suspended%s", pianopower::join(this),
-       gArgs.sleepMask ? ", the threshold interrupts masked (piano-thermal-sleep-mask=1)" : "");
+       gArgs.sleepMask ? ", the threshold interrupts masked (piano-thermal-sleep-mask=1)"
+       : irq::hookLevel() ? ", the threshold interrupts masked (piano-thermal-irq=1: the lower ones while it is live)" : "");
   return true;
 }
 
@@ -1063,6 +1076,8 @@ void PianoThermal::run()
   note("running: %s every %u ms, %u ms from %u C, %u ms near a trip or above %u MHz; the policy every %u ms; a report every %u s%s",
        governing ? "the governor and the sensors" : "the sensors", base, pollPeriodMs(Poll::warm, base, gArgs.warmMs, gArgs.fastMs),
        gArgs.warmPollC, gArgs.fastMs, gArgs.fastMhz, gArgs.pollMs, gArgs.logS, gMapFailures ? " (some windows not mapped)" : "");
+  const uintptr_t tmVa[kControllers] = {gTm[0].va, gTm[1].va, gTm[2].va, gTm[3].va};
+  irq::hookStart(this, tmVa, base, governing, gArgs.logS, gStartNs);   // piano-thermal-irq (PianoThermalIrq.cpp): nothing without it
   uint64_t lastPolicy = 0, lastLoad = 0, lastLog = nowNs(), lastCpuLog = nowNs(), tierSince = nowNs();
   uint64_t tierNs[3] = {};
   uint32_t tierChanges = 0;
@@ -1075,6 +1090,7 @@ void PianoThermal::run()
     }
     monitor_.poll(kTsensIo);
     const uint64_t now = nowNs();
+    irq::hookPolled(monitor_, now / 1000000ull);
     int32_t d;
     unsigned c, s;
     if (monitor_.hottestAll(d, c, s)) {
@@ -1092,7 +1108,9 @@ void PianoThermal::run()
       limited |= governor_[k].mode() >= CpuMode::fixed && governor_[k].limit() < governor_[k].count() - 1u;
       clusterFast |= boot_[k] >= 0 && domain_[k].levels[set_[k]].khz > gArgs.fastMhz * 1000u;
     }
-    const Poll next = pollTier(monitor_, gTrips, limited, clusterFast, int32_t(gArgs.warmPollC) * 10);
+    // with piano-thermal-irq at rest: the same without the warm rule and the fast-clock rule (the upper interrupt stands in for them)
+    const Poll next = irq::hookTier(pollTier(monitor_, gTrips, limited, clusterFast, int32_t(gArgs.warmPollC) * 10),
+                                    pollTier(monitor_, gTrips, limited, false, 0x7fffffff), now / 1000000ull);
     if (next != tier) {
       tierNs[unsigned(tier)] += now - tierSince;
       tierSince = now;
@@ -1100,7 +1118,8 @@ void PianoThermal::run()
       if (next == Poll::fast && !fastNoted) {   // the first fast spell of a report window, with its reason
         fastNoted = true;
         note("[%us] polling every %u ms: %s", upS(), gArgs.fastMs,
-             limited ? "a cluster's thermal limit holds it down"
+             irq::hookHolding(now / 1000000ull) ? "an upper-threshold interrupt"
+             : limited ? "a cluster's thermal limit holds it down"
                      : clusterFast ? "a cluster runs above the fast-poll clock" : "a sensor is within 10 C of its trip");
       }
       tier = next;
@@ -1134,6 +1153,6 @@ void PianoThermal::run()
       peakValid_ = false;   // the peak is per report window
     }
     first = false;
-    pollWait(pollPeriodMs(tier, base, gArgs.warmMs, gArgs.fastMs));
+    pollWait(pollPeriodMs(tier, irq::hookBase(base), gArgs.warmMs, gArgs.fastMs));   // the base relaxed at rest (piano-thermal-irq)
   }
 }

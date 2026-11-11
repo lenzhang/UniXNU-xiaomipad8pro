@@ -60,3 +60,17 @@ new code, no source file copied. Specifications only (no code, comment or table 
   The thermistor curve is computed from the part's published parameters (R25 100 kOhm, B25/50 4250 K, B25/85 4311 K, the TDK
   NTCG / Murata NCP 100 kOhm class) by a Steinhart-Hart fit (Ntc.h; tests/adc_host.cpp repeats the derivation); the SPMI facts are
   also those of package/PianoPower/SpmiObserver.h and k27 0057 (this repository).
+
+The uplow interrupt, piano-thermal-irq (TsensIrq.h, PianoThermalIrq.cpp, tests/uplow_host.cpp, tooling/k27/check-tsens-irq.py;
+2026-11-11): new code, no source file copied. Specifications only (no code, comment or table copied; GPL-2.0), the same Ubuntu piano
+kernel (branch piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01):
+  - drivers/thermal/qcom/tsens.c (sha256 f95225b202ff65ac48a30355ed99d413b664544a6b4e534bfb349bbfda3422cb): v2's interrupt enable
+    (mask bit 0) and disable (mask bit 1, then the clear bit 1 and 0), the violation bits read from TM_Sn_STATUS, set_trips' order
+    (the window, then the unmasks) and its clamp, TM_INT_EN's value 7, and the piano kernel's suspend rule (every lower interrupt
+    masked before suspend, the upper ones armed: 08e750858038);
+  - drivers/thermal/qcom/tsens-v2.c (sha256 503de3da1bb24d88d982e0372e6e9d0a4ac434212db19bd599910d1cb743d23b) and tsens.h (sha256
+    c00f742c808d44161d17d284034649694be3a8eb2706ff2144a92cadf5062721): the TM offsets 0x04-0x1c, the bit of each sensor in the up/low
+    status, clear and mask registers, the threshold fields, v2's trip range -40..120 C, INT_EN's three enables.
+  The lines (SPI 771-774 "uplow", 484-487 "critical", level high, the GIC as parent) are the piano boot DT's, checked by
+  tooling/k27/check-tsens-irq.py at every build. The GIC attach, the storm guard and the wake-up word are this repository's
+  package/common/PianoIrq.h (docs/power-irq.md).
