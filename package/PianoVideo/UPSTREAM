@@ -1,0 +1,40 @@
+PianoVideo is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1 only: a read-only survey. What it takes from other
+work, and from where:
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoDpu/PianoDpu.cpp (sha256 8f6cbd007f692b3408a738b45484266196c4eae397b80e018ffbc5443764dc40): the kext's shape (probe
+    gate on the boot argument, a survey thread, the post-mortem stage word, MMIO pages mapped on demand and loaded with an explicit
+    ldr, one summary property, repeated samples), re-written for this driver.
+  package/PianoDpu/DpuSurvey.h (sha256 500323975dbba4d7baa0bb5a06750793a9530f9e1e0a943f599769c5ba5ef979): the clock-gate pattern
+    (branchOn/gdscOn) and surveySmmu / s2crType / cbarType, re-expressed for the video streams 0x1940..0x194f, with the free
+    stream-match groups, the banks in use and IDR0.CTTW added.
+  package/PianoDpu/tests/dpu_host.cpp (sha256 b768c18a2f7be03b281561cf850f85fba9b3e9cc63d7917636e50c97b656ca77): the register-model
+    harness (Soc, CHECK), re-used in tests/video_host.cpp.
+
+Specifications only (no code, comment or table copied; GPL-2.0): the Ubuntu piano kernel (unixnu-research/ubuntu-ref/kernel, branch
+piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01):
+  drivers/media/platform/qcom/iris/iris_platform_vpu3x.c (sha256 0d983ecdf084732b23f066844accc8a2380c48ae76e24c9f172a0daf7a4d9e16;
+    sm8750_data: the firmware descriptor, the clock and reset tables, the DMA limit, the content-protection ranges, the pipes),
+  iris_platform_sm8750.h, iris_vpu_register_defines.h (sha256 bb38f4f66061349f93637dccb14c9b4436edb1a373d0a934b49ac80e7e386314;
+    register offsets and fields), iris_vpu_common.c (sha256 d217c2ca61cfc0de6715b54a582820f46de4d8bf237c56f062c89dd85e14f4a5; the
+    boot, interrupt and power-collapse words), iris_vpu3x.c (sha256 f0c17bc41ec68daa070a7249af54e387ff3c4f24e3a4d2282c2c96761498b68a;
+    the VPU 3.5 power sequences and which registers belong to the controller and the codec), iris_firmware.c (sha256
+    7d4df7ede4874adaa454e0892f115ee8f43057fef6eba77bc25d232b3afefeef; PAS 9 and the SCM calls), iris_hfi_queue.h/.c,
+    iris_hfi_gen2_packet.h/.c, iris_hfi_gen2_defines.h, iris_hfi_common.h/.c, iris_hfi_gen2_command.c, iris_core.c, iris_vdec.c
+    (the HFI facts in VideoHw.h and docs/drivers/video.md);
+  drivers/clk/qcom/videocc-sm8750.c (sha256 a502e56538759790626143313acb1564fa826030ddf00a1d1a4ac82f44a3c098; VIDEO_CC offsets,
+    PLL0's configuration, the RCG tables, the GDSCs), gcc-sm8750.c (the video branches), clk-alpha-pll.c (the Taycan ELU register
+    layout and rate), clk-rcg2.c, clk-branch.c, gdsc.c (field layouts);
+  drivers/firmware/qcom/qcom_scm.c/.h (the SCM service and command numbers);
+  drivers/media/platform/qcom/venus/hfi_venus_io.h (sha256 eddecf2411a8fad132ecec02323ba8037a09360b1bc43b10746e4d3bfde68b38; the
+    wrapper version word's layout at the v6 base, inferred for VPU 3.5);
+  drivers/iommu/arm/arm-smmu/arm-smmu.h (IDR0 fields), arch/arm64/boot/dts/qcom/sm8750.dtsi and sm8750-xiaomi-piano.dts (the node,
+    the OPP table, the firmware name).
+
+Data: the piano boot DT (out/inputs/piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840): the
+Iris node (address, interrupt, streams, firmware-name, memory-region), the videocc node, the video@9c300000 carveout, the apps
+SMMU's dma-coherent property, the video thermal zone. xiaomipad-8pro-mainline firmware/piano-iris.json: the firmware's name, size
+and pin (the file itself is the owner's, read at run time, never in this repository).
+
+Not read and not used for anything: any Qualcomm or Xiaomi binary (vpu35_4v.mbn is data for the secure world's loader, never
+disassembled), Apple binaries beyond public headers and class/symbol names.
