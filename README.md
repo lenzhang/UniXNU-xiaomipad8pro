@@ -17,7 +17,10 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
 - macOS boots natively on the tablet, also by itself from power-on (an installed copy, see below); root and Data are on UFS
   (`package/NativeUfs`, `package/NativeRamBlock`).
 - The Adreno 830 GPU (`package/PianoA830` with Turnip) composites the login screen.
-- A USB-C debug console with a small kernel monitor (`package/PianoDwc3`, `tooling/native/usb-console.py`) and the buttons run.
+- A USB-C debug console with a small kernel monitor (`package/PianoDwc3`, `tooling/native/usb-console.py`) and the buttons run;
+  the monitor's `reset fastboot` returns the tablet to ABL fastboot without buttons.
+- Charging: the battery charges from a USB-C port without the DSP; the DSP charger path starts from macOS and is being tuned.
+- Touch screen level 1 (identify, firmware, calibrated frames) passed on the tablet. Latest results: [docs/results-2026-11-11.md](docs/results-2026-11-11.md).
 - Most other drivers (power and charging, touch, keyboard cover, backlight, Wi-Fi, audio, sensors, thermal, USB host, video,
   Bluetooth, display processor, ...) are built and linked but inert behind their boot arguments, waiting for their tests on the
   tablet. Per-driver state: [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md) §7 and [docs/drivers/README.md](docs/drivers/README.md).
