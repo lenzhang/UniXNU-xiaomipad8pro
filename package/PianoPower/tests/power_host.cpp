@@ -1248,6 +1248,22 @@ static void testLinkSleepShutdown()
   CHECK(r.allAllowed() && s.allAllowed());
 }
 
+// The reports' pause across a sleep (ChargeLink.h SleepReports): only with the policy, only from the handover's acknowledgement to
+// the wake; one change each way.
+static void testSleepReports()
+{
+  SleepReports q;
+  CHECK(q.update(true, false, false) == 0 && !q.quiet);           // awake
+  CHECK(q.update(true, true, false) == 0 && !q.quiet);            // handing over: the reports still run (the handover reads)
+  CHECK(q.update(true, true, true) == 1 && q.quiet);              // acknowledged: paused
+  CHECK(q.update(true, true, true) == 0 && q.quiet);
+  CHECK(q.update(true, false, true) == -1 && !q.quiet);           // the wake (fHandover cleared, the ack flag kept): again
+  CHECK(q.update(true, false, true) == 0);
+  CHECK(q.update(true, true, false) == 0 && q.update(true, true, true) == 1 && q.update(true, false, false) == -1);   // a second sleep
+  SleepReports off;
+  CHECK(off.update(false, true, true) == 0 && !off.quiet);        // without the policy PianoPower is not in the power tree
+}
+
 static void testLinkThermal()
 {
   LinkOptions o;
@@ -1456,6 +1472,7 @@ int main()
   testLinkGates();
   testLinkHealth();
   testLinkSleepShutdown();
+  testSleepReports();
   testLinkThermal();
   testLinkRandom();
   if (gFailures) {

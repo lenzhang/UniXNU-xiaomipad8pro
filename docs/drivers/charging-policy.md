@@ -217,6 +217,16 @@ Default `piano-power-policy=0`: none of this runs, PianoMca.c's built-in policy 
    codec as before, and the policy sends everything again without a resync. `systemWillShutdown` waits up to 2.5 s for
    `piano_charge_shutdown()` (a stop of ours lifted, the source back at 5 V), then the assertion is released.
    `piano-reset-after` (PSCI, k27 0056) bypasses all of this.
+   **Checked against the contract** ([power.md](../power.md) §4, 2026-11-11): off = the handover (the class's 5 V limits, 9 V back
+   to 5 V, a protected charge stopped; nothing attached or nothing reachable: at once), acknowledged within the 3 s it answers (the
+   contract allows 30 s); on = one more wake, the resync (#18) with the port read at the next decision; the initial `on` of the
+   join counts no wake; the charging hold is off during a handover; level 1 and level 2 without the policy stay out of the power
+   tree. One gap, fixed here: after the acknowledgement the thread still ran its periodic report until the freeze (the gauges'
+   bit-banged I2C, the Type-C block, the RTC), so a freeze could catch a gauge read with its pins taken as GPIOs. Now
+   `ChargeLink.h` `SleepReports` pauses the reports from the acknowledgement to the wake (`policy: reports paused until the wake
+   ...`, then `policy: reports again ...` and the overdue report at once; host-tested `testSleepReports`). Not done, on purpose: the
+   codec's DSP traffic keeps running until the freeze (Ubuntu blocks every MCA transaction until resume; here the DSP stays as it is:
+   GLINK is polled, an answer that arrives while suspended waits in its FIFO and every codec timeout counts awake time only).
 6. **The charging hold**: created on first use (`createPMAssertion(kIOPMDriverAssertionPreventSystemIdleSleepBit, Off, this,
    "com.unixnu.driver.PianoPower.charging-hold")`), set to `plan.hold_awake` after each decision (off during a handover), released at
    shutdown; on only with battery health on.

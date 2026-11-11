@@ -69,6 +69,21 @@ struct LinkOutcome {
 
 inline int32_t milliToDeci(int32_t mc) { return mc >= 0 ? mc / 100 : -((-mc + 99) / 100); }
 
+// The contract's "the gauges' I2C idle" (docs/power.md 4): from the sleep handover's acknowledgement to the wake no report runs (the
+// gauges' bit-banged I2C, the Type-C block and the RTC over SPMI), so the freeze cuts none of them in the middle; the report that
+// fell due meanwhile runs right after the wake. The codec's DSP traffic is not paused (the DSP stays as it is). update() once per
+// pass of the owner's loop: +1 when the reports stop, -1 when they run again, 0 otherwise.
+struct SleepReports {
+  bool quiet = false;
+  int update(bool policyOn, bool handover, bool acknowledged)
+  {
+    const bool q = policyOn && handover && acknowledged;
+    if (q == quiet) return 0;
+    quiet = q;
+    return q ? 1 : -1;
+  }
+};
+
 class ChargeLink {
  public:
   PianoChargeConfig cfg{};

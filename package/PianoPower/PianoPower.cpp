@@ -277,6 +277,7 @@ class PianoPower : public IOService {
   bool fHoldOn = false, fHoldFailed = false;
   volatile uint32_t fSleepAsk = 0, fShutdownAsk = 0, fShutdownDone = 0, fWakes = 0;
   bool fWentOff = false, fHandover = false, fHandoverAcked = false, fShutdownSeen = false;
+  SleepReports fSleepReports;   // no report between the sleep handover's acknowledgement and the wake (ChargeLink.h)
   uint64_t fHandoverUntil = 0, fShutdownUntil = 0;
   void stepPolicy(uint64_t now);
   void logPolicy(const LinkOutcome &o, uint64_t now);
@@ -1152,7 +1153,12 @@ void PianoPower::run()
   for (;;) {
     uint64_t now = nowMs();
     serviceMca(now);
-    if (now >= reportDue) {
+    // Between the sleep handover's acknowledgement and the wake: no report (the gauges' I2C idle, docs/power.md 4); after the wake
+    // the one that fell due runs at once.
+    if (const int q = fSleepReports.update(fPolicyOn, fHandover, fHandoverAcked))
+      note("policy: %s", q > 0 ? "reports paused until the wake (no gauge, Type-C or RTC read while the system goes to sleep)"
+                               : "reports again (the battery, the port and the RTC read afresh)");
+    if (now >= reportDue && !fSleepReports.quiet) {
       report();
       reportDue = now + uint64_t(gArgs.period) * 1000;
     }
@@ -1164,7 +1170,7 @@ void PianoPower::run()
     }
     // Sleep until the next deadline or a message.
     now = nowMs();
-    uint64_t next = reportDue;
+    uint64_t next = fSleepReports.quiet ? now + 60000 : reportDue;
     if (fChannel && fWasUp) {
       if (fCycleDue && fCycleDue < next) next = fCycleDue;
       if (fRequestDue && fRequestDue < next) next = fRequestDue;
