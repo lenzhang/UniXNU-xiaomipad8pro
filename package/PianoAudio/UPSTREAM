@@ -80,3 +80,7 @@ The FS19xx amplifiers (Fs19xx.{h,c}, tests/fs19xx_host.c) and the preset identit
   xiaomipad-8pro-mainline firmware/piano-audio.json (sha256 03160998dc346030f4bbe65ae0b7488463a82fbd2c1cc89b5e7a2f7192bee224):
   the stock preset's published size (4348) and SHA-256 (ab060b84...b90e), the one pinned in AudioSha256.c. The preset itself is
   not in this repository and was not read: tests/fs19xx_host.c builds a synthetic container with made-up register data.
+
+The speaker-safety chain, test tone, stream guard and PCM ring (AudioSafety.{h,c}, tests/pcm_host.c): new code. Limits from
+docs/drivers/audio.md 10.2 and Ubuntu's device/audio/README.md (tones <= -20 dBFS, <= 3 s, 5 s watchdog, 20 ms ramps as its
+speaker-playback-check.py writes them); the slot order FL FR LS RS from its machine driver (specification only).
