@@ -165,6 +165,18 @@ of `ExternalConnected`, as a Mac's battery manager does; PianoPolicy's mirror th
 **5.7 PianoBacklight, the kernel.** Nothing: `piano-backlight-lid=1` is the backlight off on close; 0062's wake rules already
 implement the cover-open-only and keyboard-only-when-open rules.
 
+**Status** (2026-11-11: built, host-tested, linked into the test KC with the 0063 kernel; not run on the tablet):
+
+| § | Driver | State |
+|---|---|---|
+| 5.1 | PianoInput | **done** (`PowerKey.h`, `buttons_host` `testPowerKey`): held back only while a PianoPolicy service is there and the power key is reported at all (`piano-input-mask`); still down at 1500 ms → the HID Power usage down then, up at the release; released before → `"piano-policy-power-key"` with the press in ms, `kIOReturnSuccess` = consumed, else the usage down and up at once. Without PianoPolicy exactly as before. Lines `power key: short press N ms: PianoPolicy took it` / `...: macOS's (HID Power usage)`, `power key: held 1500 ms: a long press, ...` |
+| 5.2 | PianoThermal | **done** (`Governor.h` Profile, `thermal_host` `testProfileAndSleep`): 0 / 1 / 2, else `kIOReturnBadArgument`; `kIOReturnUnsupported` without CPU frequency control (`piano-cpufreq` < 2); the governor's power source per tick, the fixed level ignores it; `cpufreq: profile Power Saver (PianoPolicy)`, the 30 s report's `(on power; profile Power Saver)`, the property `piano-thermal-profile` |
+| 5.3 | PianoA830 | not part of this change |
+| 5.4 | PianoKeyboard | **done** (`CoverPower.h`, `keyboard_host` `testCoverPower`): `piano-keyboard-lid=0` stays the default and the messages per change stay; gpio95's latch at a system sleep from an acting PianoPolicy (its `piano-policy` property 2: at level 1 the function answers success with false, which is not taken), else the own rule (attached, not closed); key and touchpad reports dropped while closed behind `piano-keyboard-lid-drop=1` (opt-in until the hall polarity is verified); power-follows-panel behind `piano-keyboard-blank=1` (gpio95 rising while blanked wakes the MCU only with `now`) |
+| 5.5 | PianoPower | not done (optional): PianoPolicy's mirror sends `kIOPMSetACAdaptorConnected`; `updateStatus()` on each change is unchanged |
+| 5.6 | NativeGopDisplay | **done**: `piano-display-power` on every power change call whatever the arguments, a `kIOMessageServicePropertyChange` on each change. PianoPolicy reads the property at each turn as before; to drop its 5 s tick and the hold-off's uncertainty it must also register interest on NativeGopDisplay (it listens only to PianoKeyboard and the power source today): PianoPolicy's change, not made here |
+| 5.7 | PianoBacklight | nothing for the policy; its system-sleep part (dark before the freeze) is `power.md` §4's |
+
 ## 6. Boot arguments
 
 | Argument | Default | Meaning |
@@ -208,7 +220,9 @@ PianoPolicy: root domain: user active requested (cover open): the display wakes
 PianoPolicy: keyboard: gpio95 rising (4): display off, cover open: wake the display
 PianoPolicy: power key: short press (180 ms), display on: the display is on: sleep now
 PianoPolicy: PianoA830: GPU ceiling 342 MHz (Power Saver's GPU ceiling)
-PianoPolicy: PianoThermal has no "piano-thermal-profile" (docs/policy.md 5.2): its CPU caps stay by the power source; ...
+PianoPolicy: PianoThermal: profile 1 (Low Power Mode: Power Saver whatever the power source)
+PianoThermal: [Ns] cpufreq: profile Power Saver (PianoPolicy)          (PianoThermal's side, §5.2)
+PianoInput: power key: short press 180 ms: PianoPolicy took it          (PianoInput's side, §5.1)
 ```
 Level 1: `root domain: would send ...`, `PianoA830: would send GPU ceiling ...`. `sysctl machdep.piano_policy`: `level 2 (acting);
 cover open, attached; battery; display on; Low Power Mode 0; sleep on, wake mask 0x13; thermal unknown; close: sleep (on battery:
@@ -216,17 +230,28 @@ sleep); profile Power Saver (on battery); GPU ceiling 0 MHz (written 0); keyboar
 
 ## 9. Test plan (RAM boots, owner present, cable for the console)
 
-**Build** (main checkout; the k27 tree at 0062):
+**Build** (main checkout; the k27 tree at 0062 or 0063, which contains it):
 ```sh
 KB=$(tooling/k27/build-native-piano-keyboard.sh | tail -1)
-K27_KERNEL=$K/out/k27/kernel-k27-0062-native.macho PIANO_EXTRA_KEXTS=$KB PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh
-tooling/k27/build-policy-test-images.sh        # out/ram-pol-{observe,lock,sleep,lpm} and out/ram-pol-dump
+K27_KERNEL=$K/out/k27/kernel-k27-0063-native.macho PIANO_EXTRA_KEXTS=$KB PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh
+tooling/k27/build-policy-test-images.sh        # out/ram-pol-{observe,lock,sleep,lpm,suspend} and out/ram-pol-dump
+tooling/k27/build-policy-test-images.sh chargesleep                  # P6 by name (PianoPower level 2)
 ```
 (Built offline here 2026-11-11 from an isolated checkout: on main `9c6cf7c` `build-native-image.sh` with the default 0059 kernel
 links 21 native kexts (PianoPolicy 322 pointers); on `f9f2352` the test KC (0062 kernel + PianoKeyboard) `49f1e96da5536c8f…`; images `ram-pol-observe`
 `572e85c75e2a6358…`, `-lock` `5a43e7a3d21700d6…`, `-sleep` `6d04aea4678d0318…`, `-lpm` `599150d2fd92bbdd…`; command line 898 bytes.
-Rebuild in the main checkout before a run.) Every image: PianoKeyboard 2, PianoPower with its battery (`piano-power-ps=1`),
-PianoBacklight 2 (the display power), PianoThermal 1 + governor, the USB console. Run each with
+Rebuild in the main checkout before a run.) Rebuilt 2026-11-11 with the drivers' parts of §5 and `power.md` §4 (an agent worktree
+on main `9867677` + those commits): the test KC (kernel 0063 `ee596f39be1ded3c…` + PianoKeyboard) `c3f214c7472605cf…`, `native
+kext rule: 22 native kexts linked, none from outside this repository`, every vtable check 0 problem slots (PianoInput 692,
+PianoDwc3 1195, PianoKeyboard 733, PianoBacklight 336, PianoThermal 435, PianoPower 782, NativeGopDisplay 851, PianoPolicy 322,
+PianoTouch 713 pointers); `check-native-kexts.py` self-test, descriptors and KC log pass; images (all `verify-ram-images.py` PASS)
+`ram-pol-observe` `903b4184c226ae2a…`, `-lock` `9caae3115e28944c…`, `-sleep` `9ddf36a5b77a5e48…`, `-lpm` `c3e366f03c0bc76a…`,
+`-suspend` `9fa2dcdba6270134…`, `-chargesleep` `55141369fa2306ad…`, `-dump` `973731b2571fcfa3…`; the longest command line
+(`-suspend`) 965 bytes. The script now gives
+PianoPower's and PianoThermal's levels per image: the kernel takes an argument's first occurrence, so P4's `piano-thermal=2` after
+BASE's `piano-thermal=1` had run PianoThermal at level 1 (its GPU ceiling share untested). Every image: PianoKeyboard 2,
+PianoPower with its battery (`piano-power-ps=1`), PianoBacklight 2 (the display power), PianoThermal 1 (P4: 2) + governor, the
+USB console. Run each with
 `tooling/native/native-loop.sh out/ram-pol-<name>/boot-piano-macos-ram-A-bundled.img` and `usb-console.py --capture`.
 Prerequisites: `keyboard.md` §8 (a)/(b) and the hall polarity (§10.3) before any `piano-policy-lid=1` image; `power.md` §6 S1-S4
 before `sleep`.
@@ -236,7 +261,9 @@ before `sleep`.
 | P1 | `ram-pol-observe` (900 s) | none: nothing sent | close and open the cover; plug and unplug a charger; root shell: `sysctl -w machdep.piano_policy_lpm=1`, `=0`, `sysctl machdep.piano_policy` | `start: piano-policy=1 (decisions only: nothing sent)`, `watching PianoKeyboard`, `watching AppleSmartBattery`, `inputs:` per change, `decision: closing the cover: lock (no system sleep ...)`, `root domain: would send kIOPMClamshellClosed`, the LPM write → `profile Power Saver (Low Power Mode)` | no `watching PianoKeyboard`: PianoKeyboard not at level 2; power `unknown`: PianoPower published no battery yet; display `unknown`: piano-backlight not 2 |
 | P2 | `ram-pol-lock` (1200 s) | low: the root domain gets the clamshell; no sleep exists | close on battery and on power, open each time | `root domain: kIOPMDisableClamshell (no system sleep ...)`, `kIOPMClamshellClosed`, `root domain says: clamshell closed, closing does not sleep`, PianoBacklight's lid line and backlight off; open: `kIOPMClamshellOpened`, `user active requested (cover open)`; with the agent: the display sleeps and opening shows the lock screen | panel lit under the cover without the agent: expected (§2.3); the display does not come back at opening: `requestUserActive` does not wake it (report; the HID path still does) |
 | P3 | `ram-pol-sleep` (1800 s) | medium: the cover sleeps the system | on battery: close, wait 30 s, open; plug in, close (stays awake), unplug while closed (sleeps), open; the Apple menu's Sleep, then the power key | `decision: closing the cover: sleep (on battery: sleep)`, `kIOPMEnableClamshell`, `kIOPMClamshellClosed`, `IOCPUSleepKernel enter (piano: suspend-to-idle)`, `woke after N s by lid`, `kIOPMClamshellOpened`; plug-in: `kIOPMDisableClamshell (on external power: lock only)` before `kIOPMSetACAdaptorConnected (connected)`; unplug while closed: `(none)`, `kIOPMEnableClamshell`, a suspend | closing on battery does not sleep: `root domain says: ... does not sleep` → powerd's own bit (`pmset -g assertions`: a lid-close assertion); a sleep right after a charger wake with the cover closed: §10 risk 3 |
-| P4 | `ram-pol-lpm` (900 s) | low | on power: `sysctl -w machdep.piano_policy_lpm=1`, 60 s, `=0`; unplug | `=1`: `PianoA830: GPU ceiling 342 MHz (Power Saver's GPU ceiling)` and PianoA830's `gpu ceiling 342 MHz (an external limit ...)`, PianoThermal's missing-call line (until §5.2); `=0`: `GPU ceiling 0 MHz (Balanced ...)`, `gpu ceiling cleared`; unplugged: 342 MHz again | `not taken (no PianoA830 service ...)`: PianoA830 inert (piano-gpu=2) |
+| P4 | `ram-pol-lpm` (900 s) | low | on power: `sysctl -w machdep.piano_policy_lpm=1`, 60 s, `=0`; unplug | `=1`: `PianoA830: GPU ceiling 342 MHz (Power Saver's GPU ceiling)` and PianoA830's `gpu ceiling 342 MHz (an external limit ...)`, `PianoThermal: profile 1 (Low Power Mode: ...)` with PianoThermal's `cpufreq: profile Power Saver (PianoPolicy)` and its next 30 s lines `ceiling 1785 MHz (on power; profile Power Saver)` (cluster 1: 1958); `=0`: `GPU ceiling 0 MHz (Balanced ...)`, `gpu ceiling cleared`, `PianoThermal: profile 0 (...)`, `cpufreq: profile by the power source (PianoPolicy)`, `ceiling 3532 MHz (on power)`; unplugged: 342 MHz again, `ceiling 1785 MHz (on battery)` | `not taken (no PianoA830 service ...)`: PianoA830 inert (piano-gpu=2); `PianoThermal has no "piano-thermal-profile"`: the KC is older than this change |
+| P5 | `ram-pol-suspend` (900 s) | medium: every driver of `power.md` §4 in the power tree takes part (power.md §6 S2 first) | unattended: three test sleeps of 30 s 150 s after boot completed (Mac cable in, console open); then by hand: the power key (sleep), the power key (wake), the cover closed on battery and opened | per suspend, before `IOCPUSleepKernel enter`: `PianoInput: sleep N: the poll thread is parked ...`, `PianoDwc3: sleep N: the Mac has the device configured: kept ...`, `PianoKeyboard: blank N (system sleep) ...` (or `(display off)` when NativeGopDisplay's off came first) and `sleep N: scanning stopped, MCU blanked; gpio95 latch ARMED (PianoPolicy: ...)` (cover open, attached), `PianoBacklight: system sleep: the backlight off on both ICs ...`, `PianoThermal: [Ns] sleep: the thread is parked (no SCMI, no TSENS); threshold interrupts as they are ...`, then `piano-sleep: suspend N: ... wake on power-key lid keyboard timer ...`; `woke after 30.0 s by timer` (or `by power-key`, `by keyboard`, `by lid`); after `IOCPUSleepKernel exit`: `PianoInput: wake N: polling again ...`, `PianoDwc3: wake N: the glue clocked; kept: the console goes on`, `PianoKeyboard: wake N: serving again; gpio95 did not rise while suspended ...`, `PianoThermal: [Ns] wake N: polling again`, `PianoBacklight: system wake: ...`, `PianoKeyboard: unblank N (display on) ...` once the display is on; the console continuous across each suspend; the power key's sleep: `PianoInput: power key: short press N ms: PianoPolicy took it` and `PianoPolicy: power key: short press ... sleep now` | a driver's `did not park/answer within ...` line: its thread was busy (report the line before); no `unblank` after a wake with the display on: `NativeGopDisplay` did not message (its `piano-display-power` in `ioreg`); the keyboard dead after a wake: rerun without `piano-keyboard-blank=1` (keyboard.md §10.11) |
+| P6 | `ram-pol-chargesleep` (900 s, by name only) | medium-high: PianoPower level 2 (the DSP), then two test sleeps of 30 s 240 s after boot | unattended on the Mac's cable | P5's lines plus `PianoPower: policy: system sleep: handing the charger over ...`, `policy: sleep handover done: acknowledged`, `policy: reports paused until the wake ...`, then `policy: awake again (wake N)`, `policy: reports again ...`, `policy: wake N: the codec is relinked and everything is sent again` | `handover not complete after 2 s`: the firmware's answers did not come (report the `mca:` lines) |
 
 ## 10. Risks
 

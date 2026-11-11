@@ -227,6 +227,23 @@ What each driver adds (their owners' work; nothing here changes their packages):
 | PianoTorch | torch off (four SPMI writes, synchronous in `setPowerState(kOff)`; also `systemWillShutdown`) | stays off (a new request lights it) | level 1: nothing |
 | NativeRamBlock, PianoNullEthernet, ARMPlatformStandIn | nothing | nothing | — |
 
+**Status of the drivers' parts** (2026-11-11; built, host-tested, linked into the KC with the 0063 kernel; **not run on the
+tablet**; each driver's page has its lines). A driver in the power tree whose off/on is not reached costs nothing: the default ADT
+never sleeps without `piano-sleep=1`, and the power tree's first `on` (at the join) is answered with nothing done.
+
+| Driver | In the power tree | off / on as built | Default / opt-in | Page |
+|---|---|---|---|---|
+| NativeGopDisplay | yes (as before) | unchanged: the VBL timer still runs in off (not part of this change); `piano-display-power` now always published with a property-change message per change | always | `drivers/native-gop-display.md` |
+| PianoBacklight | at `piano-backlight=2` | off: the thread clears BL_EN on both ICs (retried twice) and `setPowerState` waits for it (≤ 800 ms), so the backlight is dark before the freeze even when the display hook's request had not run; on: what the display and the lid want, newest code first; HWEN never written | at level 2 | `drivers/backlight.md` §5 |
+| PianoKeyboard | yes (answers only once serving) | off: the serving thread parks (no I2C), gpio97 masked when its interrupt is live, gpio95's INTR_CFG latched for bit 16 only as an acting PianoPolicy says (else attached and not closed), INTR_STATUS cleared; with `piano-keyboard-blank=1` first 0x25 = 0 and the sleep line; on: gpio95's latch cleared and its INTR_CFG as found, the hall read again, the MCU unblanked only with the display on or not known | park + latch always; the MCU's sleep `piano-keyboard-blank=1` | `drivers/keyboard.md` §6d |
+| PianoInput | yes | off: the poll thread parked between two samples (no SPMI read while the kernel polls the PON); on: the keys read afresh (debounce restarted). The power key's sleep is PianoPolicy's (`policy.md` §5.1), not a direct `kIOPMSleepNow` | always | `package/PianoInput/README.md` |
+| PianoDwc3 | at `piano-usb=2` | off: a configured host keeps the gadget (the console survives; the interrupt masked, polled until the freeze), else a soft disconnect; on: the glue's clocks read first (off: never touched again), then a reconnect; every QSCRATCH write guarded (recorded while asleep or unclocked, written after the wake) | kept by default; `piano-sleep-usb=0` always disconnects | `drivers/usb-device-debug.md` §16 |
+| PianoPower | with `piano-power-policy=1` (level 2) | as built before (the handover ≤ 2 s, acknowledged within 3 s; the resync at the wake) and now no report (gauges' I2C, Type-C, RTC) from the acknowledgement to the wake; the DSP and the codec unchanged | with the policy | `drivers/charging-policy.md` §8.5 |
+| PianoThermal | yes | off: the thread parked at the top of a poll (no SCMI request, no TSENS read in flight); with `piano-thermal-sleep-mask=1` also the threshold-interrupt masks (its hooks); on: the masks back, the thread on (power source re-read) | park always; masks opt-in (no TSENS interrupt is taken natively) | `drivers/thermal.md` §5 |
+| PianoTorch | at `piano-torch=2` | as built before (torch off) | – | `drivers/torch.md` |
+| PianoTouch | yes | its own change (the row above, `drivers/touch.md` §16); it reads `piano-display-power`, which NativeGopDisplay now always publishes | – | `drivers/touch.md` |
+| PianoA830, NativeUfs, PianoWifi, PianoAudio | not part of this change | see their pages | – | – |
+
 ## 5. Policy defaults
 
 The policy on top of this (the cover closed on battery or on power, the keyboard's wake, the power key, macOS Low Power Mode → the
@@ -239,7 +256,7 @@ routes below (`piano-keyboard-lid`, PianoInput's direct `kIOPMSleepNow`) once it
 | Display sleep after idle | macOS's default | powerd; PianoBacklight turns the backlight off with it |
 | System sleep after idle on battery | 5 min (Ubuntu's v0.8.0 choice); none on external power (stock and Ubuntu keep it awake plugged in) | `sudo pmset -b sleep 5 displaysleep 2 hibernatemode 0 standby 0 powernap 0 tcpkeepalive 0; sudo pmset -c sleep 0 displaysleep 10` (no hibernation natively: hibernatemode 0) |
 | Lid close | sleep, only after the hall polarity is verified (`drivers/keyboard.md` §10.3); cover-open wake | `piano-keyboard=2 piano-keyboard-lid=2` (PianoKeyboard tells IOPMrootDomain the clamshell; macOS sleeps on close) + `piano-sleep-wake` bit 2. Ubuntu's "closed on external power only locks" needs PianoKeyboard to send kIOPMDisableClamshell on external power (its owner, with PianoPower's source state) |
-| Power key short press | sleep / wake | wake: the kernel (bit 1, default); sleep: PianoInput (§4), until then the Apple menu or `pmset sleepnow` |
+| Power key short press | sleep / wake | wake: the kernel (bit 1, default); sleep: PianoPolicy at level 2, asked by PianoInput on the release (`policy.md` §5.1, built 2026-11-11); without it the Apple menu or `pmset sleepnow` |
 | Volume-down, keyboard, USB-C as wake sources | off | `piano-sleep-wake` bits 8, 16, 4 |
 | CPU idle | off; target `piano-cpuidle=2` (ret + cl5) in the daily profile after §6 I1-I2 | `piano-cpuidle=N` |
 
