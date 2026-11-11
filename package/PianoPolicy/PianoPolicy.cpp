@@ -14,7 +14,9 @@
 //                     hold-off's timing), and that fallback is logged once
 //   machdep.piano_policy_lpm   macOS Low Power Mode, written by root (the agent tooling/native/piano-policy-agent mirrors
 //                     com.apple.system.lowpowermode into it; by hand: sudo sysctl machdep.piano_policy_lpm=1)
-//   machdep.piano_sleep (k27 0062)   "on" = system sleep exists (piano-sleep=1), and its wake mask; read once at start
+//   machdep.piano_sleep (k27 0062)   "on" = system sleep exists (piano-sleep=1), and its wake mask; read once at start. A kernel
+//                     whose OID lacks CTLFLAG_KERN (0062-0064 before 2026-11-12) answers the read with EPERM: then the kernel's own
+//                     boot arguments piano-sleep / piano-sleep-wake (Policy.h resolveSleep)
 //   PianoA830         piano-gpu-ceiling-clients: >= 2, a ceiling slot per caller (docs/policy.md 5.3): ours is client 1
 //   piano_thermal_state (PianoThermal, a library of the descriptor)   its protection state, only while PianoA830 has no slots
 //                     (the one GPU ceiling slot shared with PianoThermal's passive trip)
@@ -62,11 +64,13 @@
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include <sys/sysctl.h>
+#include <sys/errno.h>
 #include <stdarg.h>
 #include "Policy.h"
 
 using namespace pianopolicy;
 
+static_assert(kErrPerm == EPERM && kErrNoEnt == ENOENT, "Policy.h's errno values (resolveSleep)");
 static_assert(kSleepNow == kIOPMSleepNow && kClamshellClosed == kIOPMClamshellClosed && kClamshellOpened == kIOPMClamshellOpened &&
               kDisableClamshell == kIOPMDisableClamshell && kEnableClamshell == kIOPMEnableClamshell && kSetValue == kIOPMSetValue &&
               kSetAcAdaptorConnected == kIOPMSetACAdaptorConnected, "Policy.h's IOPM message values");
@@ -84,7 +88,7 @@ namespace {
 
 struct Args {
   uint32_t level, lid, profile, gpuMhz, powerKey, kbd, holdoffMs, lpm, displayTick, keyboardLid, gpuDcvsMax, gpuMaxLevel, thermal,
-      thermalGpuMhz;
+      thermalGpuMhz, sleep, sleepWake;
   bool gpuMaxGiven;
 };
 Args gArgs;
@@ -119,6 +123,9 @@ void readArgs()
   gArgs.gpuMaxGiven = (dcvsGiven && gArgs.gpuDcvsMax > gArgs.gpuMhz) || (levelGiven && gArgs.gpuMaxLevel);
   gArgs.thermal = clampArg(bootArg("piano-thermal", 0), 0, 2);
   gArgs.thermalGpuMhz = clampArg(bootArg("piano-thermal-gpu-mhz", 160), 100, 1100);
+  // k27 0062's own (its piano_sleep_init): the system sleep state when machdep.piano_sleep refuses our read (resolveSleep).
+  gArgs.sleep = bootArg("piano-sleep", 0);
+  gArgs.sleepWake = bootArg("piano-sleep-wake", kWakePowerKey);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -312,22 +319,38 @@ bool PianoPolicy::start(IOService *provider)
   fConfig.holdoffMs = gArgs.holdoffMs;
   fConfig.displayTick = gArgs.displayTick != 0;
   fEngine = Engine(fConfig);
-  // System sleep and its wake mask, as the kernel has them (k27 0062; absent before it).
+  // System sleep and its wake mask, as the kernel has them (k27 0062; absent before it; from the boot arguments when a kernel
+  // whose OID lacks CTLFLAG_KERN refuses the read: resolveSleep).
   char sleep[640] = {};   // 0062's string is at most 512 bytes
   size_t len = sizeof sleep - 1;
   const int err = kernel_sysctlbyname("machdep.piano_sleep", sleep, &len, nullptr, 0);
-  parseSleep(err ? nullptr : sleep, &fSleepOn, &fWakeMask);
+  const SleepSource sleepFrom = resolveSleep(err, sleep, gArgs.sleep, gArgs.sleepWake, &fSleepOn, &fWakeMask);
   note("start: piano-policy=%u (%s), cover %s, profile %s, GPU ceiling %u MHz (%s), power key %s, keyboard wake %s (hold-off %u ms)",
        gArgs.level, fConfig.act ? "acting" : "decisions only: nothing sent",
        !fConfig.lid ? "not acted on (piano-policy-lid=0)" : fConfig.lidConflict ? "NOT acted on: piano-keyboard-lid is set" : "acted on",
        fConfig.profile ? "on" : "off", gArgs.gpuMhz,
        !gArgs.gpuMhz ? "none" : fConfig.gpuNeeded ? "PianoA830's own maximum is above it" : "a no-op: PianoA830's own maximum is 342 MHz",
        fConfig.powerKey ? "on" : "off", fConfig.keyboard ? "on" : "off", fConfig.holdoffMs);
-  if (err) note("system sleep: machdep.piano_sleep absent (error %d: a kernel before k27 0062): no sleep, the cover only locks", err);
-  else
-    note("system sleep: %s, wake mask %#x (%s%s%s); machdep.piano_sleep: %.120s", fSleepOn ? "on" : "off (piano-sleep=1 turns it on)",
-         fWakeMask, fWakeMask & kWakePowerKey ? "power key" : "-", fWakeMask & kWakeLid ? ", cover open" : ", NO cover-open wake",
-         fWakeMask & kWakeKeyboard ? ", keyboard" : "", sleep);
+  const char *const state = fSleepOn ? "on" : "off (piano-sleep=1 turns it on)";
+  const char *const wakeKey = fWakeMask & kWakePowerKey ? "power key" : "-";
+  const char *const wakeLid = fWakeMask & kWakeLid ? ", cover open" : ", NO cover-open wake";
+  const char *const wakeKbd = fWakeMask & kWakeKeyboard ? ", keyboard" : "";
+  switch (sleepFrom) {
+    case SleepSource::kernel:
+      note("system sleep: %s, wake mask %#x (%s%s%s); machdep.piano_sleep: %.120s", state, fWakeMask, wakeKey, wakeLid, wakeKbd, sleep);
+      break;
+    case SleepSource::bootArgs:
+      note("system sleep: %s, wake mask %#x (%s%s%s) from the boot arguments piano-sleep and piano-sleep-wake, as k27 0062 reads them: "
+           "machdep.piano_sleep exists but refused the in-kernel read (error %d, EPERM: its OID lacks CTLFLAG_KERN, a 0062-0064 kernel "
+           "built before 2026-11-12)", state, fWakeMask, wakeKey, wakeLid, wakeKbd, err);
+      break;
+    case SleepSource::absent:
+      note("system sleep: machdep.piano_sleep absent (error %d, ENOENT: a kernel before k27 0062): no sleep, the cover only locks", err);
+      break;
+    case SleepSource::unreadable:
+      note("system sleep: machdep.piano_sleep unreadable (error %d): taken as no sleep, the cover only locks", err);
+      break;
+  }
   if (fConfig.thermalOwnsGpu)
     note("PianoThermal at level 2 writes a GPU ceiling at its passive trip: with PianoA830's slots ours is client 1 (the lowest wins), "
          "without them ours is never written over its passive one");

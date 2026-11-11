@@ -5,7 +5,7 @@
 // closed, a boot with the cover closed, the PianoKeyboard conflict, the power key, gpio95 with its hold-off, Low Power Mode on and
 // off, PianoThermal's passive trip around the shared GPU ceiling, PianoA830's own slot for us (client 1: no arbitration), a missing
 // PianoThermal call), the display's messages in place of the 5 s tick (and its fallback), the profile through PianoThermal's
-// Governor.h to its CPU caps, and machdep.piano_sleep's parse.
+// Governor.h to its CPU caps, and machdep.piano_sleep's parse and its read resolved (EPERM: the boot arguments; ENOENT: absent).
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. policy_host.cpp -o /tmp/policy_host && /tmp/policy_host
 #include "Policy.h"
 #include "../../PianoThermal/Governor.h"   // PianoThermal's profile modes and caps: the end-to-end check of 5.2
@@ -603,6 +603,48 @@ static void parse()
   CHECK(on && mask == 0x1f);
 }
 
+// machdep.piano_sleep's read resolved (2026-11-12, queue5 P10: every 0062-0064 kernel answered EPERM, the OID without CTLFLAG_KERN,
+// and PianoPolicy took it for "absent": no sleep on close).
+static void resolve()
+{
+  bool on = true;
+  uint32_t mask = 99;
+  // The kernel's string wins over the boot arguments.
+  CHECK(resolveSleep(0, "on; state 1, poll 100 ms, wake mask 0x3, max 0 s", 0, 0x13, &on, &mask) == SleepSource::kernel);
+  CHECK(on && mask == 0x3);
+  CHECK(resolveSleep(0, "off; state 1, poll 100 ms, wake mask 0x1, max 0 s", 1, 0x13, &on, &mask) == SleepSource::kernel);
+  CHECK(!on && mask == 1);
+  // EPERM: the OID exists; the state is the kernel's rule from the boot arguments.
+  CHECK(resolveSleep(kErrPerm, "", 1, 0x13, &on, &mask) == SleepSource::bootArgs);
+  CHECK(on && mask == 0x13);
+  CHECK(resolveSleep(kErrPerm, "", 1, kWakePowerKey, &on, &mask) == SleepSource::bootArgs);   // piano-sleep-wake not given
+  CHECK(on && mask == kWakePowerKey);
+  CHECK(resolveSleep(kErrPerm, "", 0, 0x13, &on, &mask) == SleepSource::bootArgs);           // no piano-sleep: off, 0062's mask
+  CHECK(!on && mask == kWakePowerKey);
+  CHECK(resolveSleep(kErrPerm, "", 2, 0x13, &on, &mask) == SleepSource::bootArgs);           // 0062 takes only piano-sleep=1
+  CHECK(!on);
+  // ENOENT: a kernel before 0062. Anything else: unreadable. Neither is a system sleep, whatever the boot arguments say.
+  on = true;
+  CHECK(resolveSleep(kErrNoEnt, "", 1, 0x13, &on, &mask) == SleepSource::absent);
+  CHECK(!on && mask == 0);
+  on = true;
+  CHECK(resolveSleep(22, "", 1, 0x13, &on, &mask) == SleepSource::unreadable);
+  CHECK(!on && mask == 0);
+  // The tablet's case end to end: the cover-open wake is armed by the boot arguments, so closing on battery sleeps.
+  Config c;
+  c.act = true;
+  c.lid = true;
+  Inputs in;
+  in.lid = Lid::closed;
+  in.attached = true;
+  in.power = Power::battery;
+  in.screen = Screen::on;
+  CHECK(resolveSleep(kErrPerm, "", 1, kWakePowerKey | kWakeLid, &in.sleepOn, &in.wakeMask) == SleepSource::bootArgs);
+  CHECK(view(c, in, true).close == Close::sleep);
+  CHECK(resolveSleep(kErrNoEnt, "", 1, kWakePowerKey | kWakeLid, &in.sleepOn, &in.wakeMask) == SleepSource::absent);
+  CHECK(view(c, in, true).close == Close::lock);
+}
+
 int main()
 {
   table();
@@ -619,6 +661,7 @@ int main()
   profileReachesThermal();
   observe();
   parse();
+  resolve();
   if (failures) {
     std::printf("policy_host: %d of %d checks FAILED\n", failures, checks);
     return 1;

@@ -24,7 +24,9 @@ IOCPUSleepKernel (piano branch) runs the platform actions and piano_s2idle_enter
   wake watchdog panics into it), so a hang resets the tablet (piano-sleep-wdt=0 off; piano-reset-after keeps it).
 - piano-sleep=1 overrides the ADT's /defaults sleep-disabled (1 in every native image) at boot completion; without it
   nothing changes. piano-sleep-test=S[,piano-sleep-test-count=N]: kIOPMSleepNow S s after boot and after each wake, with
-  piano-sleep-max 30 unless given (unattended tests). machdep.piano_sleep: counts, last duration and reason, RPMh line.
+  piano-sleep-max 30 unless given (unattended tests). machdep.piano_sleep: counts, last duration and reason, RPMh line;
+  CTLFLAG_KERN, so a kext reads it with kernel_sysctlbyname (sysctl_root answers an in-kernel read of an OID without the
+  flag with EPERM: PianoPolicy's read before 2026-11-12).
 - RPMh sleep counters logged at entry and wake: whether CX and DDR got anywhere (they need the drivers' votes gone: the
   contract in UniXNU-piano package/include/PianoPowerContract.h).
 
@@ -39,7 +41,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  6 files changed, 1061 insertions(+), 3 deletions(-)
 
 diff --git a/bsd/dev/arm64/sysctl.c b/bsd/dev/arm64/sysctl.c
-index 1b1acc3..88050c8 100644
+index 1b1acc3..0069c26 100644
 --- a/bsd/dev/arm64/sysctl.c
 +++ b/bsd/dev/arm64/sysctl.c
 @@ -152,6 +152,23 @@ SYSCTL_PROC(_machdep, OID_AUTO, piano_cpuidle_level,
@@ -60,7 +62,7 @@ index 1b1acc3..88050c8 100644
 +}
 +
 +SYSCTL_PROC(_machdep, OID_AUTO, piano_sleep,
-+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_KERN | CTLFLAG_LOCKED,
 +    0, 0, sysctl_piano_sleep, "A",
 +    "piano-sleep: suspend-to-idle state and counters");
  #endif /* defined(XNU_VM_GUEST) */

@@ -359,6 +359,33 @@ inline void parseSleep(const char *s, bool *on, uint32_t *mask)
   }
 }
 
+// Where the system sleep state came from (resolveSleep).
+enum class SleepSource : uint8_t { kernel, bootArgs, absent, unreadable };
+constexpr int kErrPerm = 1, kErrNoEnt = 2;   // EPERM, ENOENT (sys/errno.h; the kext checks them)
+
+// machdep.piano_sleep's read resolved: kernel_sysctlbyname's error, the string it gave, and the two boot arguments k27 0062
+// reads itself (piano-sleep, piano-sleep-wake, the latter's default the power key).
+//   0       the kernel's string (parseSleep).
+//   ENOENT  no such OID (the name lookup failed): a kernel before 0062, no system sleep.
+//   EPERM   the OID exists (the name lookup, which is CTLFLAG_KERN, found it), but sysctl_root refuses an in-kernel read of an
+//           OID without CTLFLAG_KERN: every 0062-0064 kernel built before 2026-11-12. The state is then the kernel's own rule from
+//           the boot arguments: on with piano-sleep=1 (0062 also needs the SMC conduit, which every native boot has), the wake
+//           mask piano-sleep-wake when on, the power key when off (0062 reads the mask only when on).
+//   other   unreadable: taken as no system sleep.
+inline SleepSource resolveSleep(int err, const char *s, uint32_t argSleep, uint32_t argWake, bool *on, uint32_t *mask)
+{
+  if (err == 0) {
+    parseSleep(s, on, mask);
+    return SleepSource::kernel;
+  }
+  parseSleep(nullptr, on, mask);
+  if (err == kErrNoEnt) return SleepSource::absent;
+  if (err != kErrPerm) return SleepSource::unreadable;
+  *on = argSleep == 1;
+  *mask = *on ? argWake : kWakePowerKey;
+  return SleepSource::bootArgs;
+}
+
 inline const char *lidName(Lid l) { return l == Lid::open ? "open" : l == Lid::closed ? "closed" : "unknown"; }
 inline const char *powerName(Power p) { return p == Power::external ? "external power" : p == Power::battery ? "battery" : "unknown"; }
 inline const char *screenName(Screen s) { return s == Screen::on ? "on" : s == Screen::off ? "off" : "unknown"; }

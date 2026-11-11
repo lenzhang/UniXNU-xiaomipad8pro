@@ -37,11 +37,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 osfmk/arm64/piano_guard_policy.h
 
 diff --git a/bsd/dev/arm64/sysctl.c b/bsd/dev/arm64/sysctl.c
-index 88050c8..db8c12d 100644
+index 0069c26..22f8b0c 100644
 --- a/bsd/dev/arm64/sysctl.c
 +++ b/bsd/dev/arm64/sysctl.c
 @@ -169,6 +169,23 @@ SYSCTL_PROC(_machdep, OID_AUTO, piano_sleep,
-     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_KERN | CTLFLAG_LOCKED,
      0, 0, sysctl_piano_sleep, "A",
      "piano-sleep: suspend-to-idle state and counters");
 +
