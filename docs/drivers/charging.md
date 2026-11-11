@@ -462,7 +462,10 @@ PianoPower: [45s] diag board: CP (0x201c) 1, CID (0x201b) 0x708, OTG (0x201a) 0,
 | I | `piano-power=2` | the same plus the board configuration, then the policy (ICL/FCC by type, CDP 900 mA); no 0x2019 write |
 
 Both take PianoA830's DRV-2 lock for our rail votes, so they run with `piano-gpu=2` (`PIANO_GPU=2` adds `piano-gpu=2
-piano-gpu-delay=20`). Commands (main checkout):
+piano-gpu-delay=20`). Built here on main 7d9f10e + this change (`native kext rule: 14 native kexts linked, none from DroidVM`;
+KC `d2a8fb802274b151…`, G2 `a941253fed1c9bfe…`, I `7914e7c9889b4435…`, both verify PASS; the hashes change with every build,
+which embeds `droidvm-utc`). With `PIANO_GPU=2` the seed is the A830-staged one, not the installed seed, so main's store guard
+builds both with `data-persist=0` (Data volatile, the installed store untouched). Commands (main checkout):
 
 ```sh
 PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300 \
