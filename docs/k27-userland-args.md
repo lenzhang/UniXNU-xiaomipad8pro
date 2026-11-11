@@ -13,7 +13,7 @@ renaming one means changing the kernel (`patches/k27` or the baseline series) an
 |---|---|---|
 | `droidvm-utc`, `droidvm-tz` | the OS image's boot job (`org.droidvm.run.0`, which runs `settime.sh`) | the clock and time zone when the PMIC RTC gives no date: with k27 0060 and `piano-rtc=1` the kernel sets the calendar first and `settime.sh` leaves it (it only acts near 1970), so `droidvm-utc` (the image's build time) stays as the fallback ([drivers/rtc.md](drivers/rtc.md)) |
 | `droidvm-timebase-hz=24000000` | the k27 kernel (pexpert, baseline patch 0042) | userland expects a 24 MHz timebase over SM8750's 19.2 MHz counter |
-| `droidvm-disable-jobs` | nothing natively ([boot-time.md](boot-time.md) §4) | its reader was another kernel line's launch policy; the k27 kernel and the KC have none, and the jobs it lists run. Kept until the boot-time test; `PIANO_FAST_BOOT` drops it. Natively a daemon is kept from running by `k27-deny-exec=` (baseline 0035) or the seed's `disabled.plist` |
+| `droidvm-disable-jobs` | nothing natively ([boot-time.md](boot-time.md) §4) | its reader was another kernel line's launch policy; the k27 kernel and the KC have none, and the jobs it lists run. Kept until the boot-time test; `PIANO_FAST_BOOT` drops it. Natively a daemon is kept from running by `k27-deny-exec=` (baseline 0035; `PIANO_DENY_EXEC` / `build-esp.py --deny-exec PATH` add paths to it with the default kept, 2026-11-12) or the seed's `disabled.plist` (`tooling/k27/stage-boot-run.py --disable-job LABEL` for a test seed; `launchctl disable system/LABEL` on the installed system): [power.md](power.md) §1.2 |
 
 ## The k27 kernel's arguments
 

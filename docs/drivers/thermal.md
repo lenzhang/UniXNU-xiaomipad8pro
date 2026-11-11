@@ -70,12 +70,17 @@ wake as unsustainable), `shutdownSystem()` (kIOReturnUnsupported in k27); macOS 
 clean KPI. The shutdown is the kernel's own halt path `reboot_kernel(RB_HALT)`: processes signalled, disks synced and unmounted,
 IOKit's shutdown notifications (IOPMrootDomain `handlePlatformHaltRestart`), PSCI SYSTEM_OFF (k27 0053).
 CPU load: XNU's per-processor idle time from `processor_info(cpu_to_processor(i), PROCESSOR_CPU_LOAD_INFO)` (recount, 1/hz s ticks:
-±10 ms per 100 ms tick), busy = 1 - idle / wall, the busiest core per cluster. Power source: the `IOPMPowerSource`'s
-`ExternalConnected` (PianoPower with `piano-power-ps=1`), unknown = battery caps. Polling tiers (`Cluster.h` pollTier): base 1 s
-(the governor's 100 ms tick when it runs); 250 ms once the hottest sensor reaches 70 C; 10 ms (Linux's passive polling) while any
-sensor is within 10 C of its trip, a cluster is thermally limited, or a cluster runs above 2.5 GHz (where a prime-core load heats
-at ~200 C/s). With `piano-thermal-irq=1` the upper-threshold interrupt stands in for the warm tier and the fast-clock rule while
-every sensor is under 85 C, and the base relaxes to 5 s (§13.4). The idle states (PSCI cpuidle) are another driver's: not touched.
+±10 ms per 100 ms tick), busy = (wall - idle - PianoThermal's own time on that core) / wall, the busiest core per cluster
+(`Governor.h` CoreLoad; since 2026-11-12: the thread's polls, SCMI waits and load reads are timed and left out, the window that
+holds the per-core clock measurement makes no decision, and a tick without a busy figure is no decision instead of a 0 % one).
+Power source: the `IOPMPowerSource`'s `ExternalConnected` (PianoPower with `piano-power-ps=1`), unknown = battery caps. Polling
+tiers (`Cluster.h` pollTier): base 1 s (the governor's 100 ms tick when it runs); 250 ms once the hottest sensor reaches 70 C;
+10 ms (Linux's passive polling) while any sensor is within 10 C of its trip (cpu-* zones: of the 90 C ceiling, so from 80 C), a
+cluster is thermally limited, or a cluster runs above 2.5 GHz (where a prime-core load heats at ~200 C/s) while the hottest sensor
+is at 70 C or more; above 2.5 GHz and cooler, every 100 ms (the `clock` tier: the governor's own tick, so no wakeup of its own;
+one such period adds at most ~22 C at that rate, under 92 C from under 70 C). Before 2026-11-12 the fast-clock rule was 10 ms at any
+temperature: 100 wakeups a second whenever the governor sat above 2.5 GHz. With `piano-thermal-irq=1` the upper-threshold interrupt
+stands in for the warm tier and the fast-clock rules while every sensor is under 85 C, and the base relaxes to 5 s (§13.4). The idle states (PSCI cpuidle) are another driver's: not touched.
 **Suspend hooks** (for the suspend driver; docs/power.md's contract when it lands): `int piano_thermal_suspend_prepare(void)` masks
 every sensor's lower-threshold interrupt (`TM_UPPER_LOWER_INT_MASK` 0x10 bits 0..n-1, clears pulsed 1→0 at 0x0c; Linux
 08e750858038) and, while PianoThermal does not service the uplow interrupt itself, the upper ones (bits 16..) too; critical
@@ -116,7 +121,8 @@ once); the fixed level (mode 2) has no power caps and ignores it. One line per c
 | `piano-thermal-warm=<C>` / `-margin=<C>` | 85 / 10 | warm (a log line); critical = stock critical (125) - margin, held 1 s |
 | `piano-thermal-poll-ms` / `-log-s` / `-delay` | 1000 / 30 / 0 | base poll and policy period; report period; start delay (s) |
 | `piano-thermal-warm-poll=<C>` / `-warm-ms` | 70 / 250 | the warm tier: from this hottest reading, poll this often |
-| `piano-thermal-fast-ms` / `-fast-mhz` | 10 / 2500 | the fast tier (near a trip, limited, or a cluster above this clock); also the thermal limit's step |
+| `piano-thermal-fast-ms` / `-fast-mhz` | 10 / 2500 | the fast tier (near a trip or the ceiling, limited, or a cluster above this clock from `-fast-temp` up); also the thermal limit's step |
+| `piano-thermal-fast-temp=<C>` / `-clock-ms` | 70 / 100 | 2026-11-12: a cluster above `-fast-mhz` polls at the fast tier only from this hottest reading up, else every `-clock-ms` (5..100) |
 | `piano-thermal-gpu-mhz` | 160 | the reversible GPU ceiling at passive (when PianoA830 offers it) |
 | `piano-thermal-clock=0` / `-srot=0` | 1 / 1 | skip the per-core clock measurement / the SROT reads; since 2026-11-12 the measurement (it binds a thread onto every running core) waits while the display is off (NativeGopDisplay's `piano-display-power`), `piano-thermal-clock=2` measures then too (before) |
 | `piano-cpufreq=N` | 0 | 1 report (SCMI messages, nothing set); 2 fixed level; 3 governor. Implies `piano-thermal=1` |
@@ -124,7 +130,7 @@ once); the fixed level (mode 2) has no power caps and ignores it. One line per c
 | `piano-cpufreq-bat0/1`, `-ac0/1` | 1785/1958, 3532/4089 | mode 3 ceilings on battery or power unknown (Power Saver) / on external power (Balanced) |
 | `piano-cpufreq-hispeed0/1`, `-min0/1` | 1500/1800, 0 | mode 3: level at ≥ 90 % busy; floor |
 | `piano-cpufreq-tick-ms` | 100 | mode 3 load decision period (20..1000) |
-| `piano-cpufreq-hot` / `-release` / `-cut` | stock | cluster thermal limit (modes 2, 3): default each cpu-* zone's passive trip / trip - hysteresis / 125 - margin; given: absolute C for all |
+| `piano-cpufreq-hot` / `-release` / `-cut` | 90 / hot - 5 / 125 - margin | cluster thermal limit (modes 2, 3), absolute C for every cpu-* zone; since 2026-11-12 a 90 C ceiling by default, at every `piano-thermal` level (P9: §8 item 8), never above a zone's stock passive trip (105 / 118 C: a higher value is that trip); `-hot=0`: the stock trips with their hysteresis (the old default) |
 | `piano-thermal-adc=N` | 0 | B6 (§12): 0 off (no SPMI access); 1 the eleven board thermistors on the PMIC ADC (writes: the ADC SDAM's conversion bytes); 2 the same with each round's raw codes. Implies `piano-thermal=1` |
 | `piano-thermal-adc-s` | `-log-s` (30) | the ADC round period, 5..3600 s (the first round right after the start survey, after `-delay`) |
 | `piano-thermal-sleep-mask=1` | 0 | a system sleep also masks the threshold interrupts (the suspend hooks, §5); 0: the thread is parked only |
@@ -193,11 +199,28 @@ All RAM boots with the cable, owner present. Every level is off by default, so a
    still ends at once with these lines points at another wake source; fewer than 4 controllers: a mapping failed.
 5a. **The profile** (`docs/policy.md` §9 P4, PianoPolicy at level 2 with `piano-cpufreq=3`): on power `sysctl -w
    machdep.piano_policy_lpm=1` → `cpufreq: profile Power Saver (PianoPolicy)` and the next 30 s lines `ceiling 1785 MHz (on power;
-   profile Power Saver)` (cluster 1: 1958); `=0` → `cpufreq: profile by the power source (PianoPolicy)`, `ceiling 3532 MHz (on
-   power)`.
+   profile Power Saver)` (cluster 1: 1958); `=0` → `cpufreq: profile by the power source (PianoPolicy)`, `ceiling 2400 MHz (on
+   power)` (the policy images cap the governor at 2400 / 2438 MHz since 2026-11-12, item 8; uncapped it reads 3532).
 6. **Board thermistors** (B6): one RAM boot with `piano-thermal=1 piano-thermal-adc=1` (and `piano-power=1` for the gauges'
    temperature to compare); the procedure, the expected lines and what failures mean: §12.8.
 7. **The uplow interrupt** (`piano-thermal-irq=1`): two RAM boots, the synthetic test and the governor; §13.8.
+8. **The governor at an idle login window** (P9 of 2026-11-12). Found: `ram-pol-observe` and `ram-pol-suspend` (`piano-cpufreq=3`,
+   `piano-thermal=1`, the Mac's cable, so Balanced's 3532 / 4089 MHz ceiling) held cluster 0 at `now 3532 MHz ... 99%`, `busy avg
+   94-96% max 100%` for the whole 15 minutes, cpu0 102-103 C, peak 105.8 C, the stock 105 C trip the only limit, and the packs at
+   -620 to -987 mA on the cable (`logs/usb-console/20261112-025216`, `-030826`). Cause (**verified** against `ram-pm-idle1` and
+   fast1's profile, `power.md` §1.2): real load. PerfPowerServices spins a core in every boot, and the governor's busy figure is
+   the busiest core of the cluster, so one spinning thread anywhere on cluster 0 reads ~100 % at any clock and pins the cluster at
+   its ceiling (schedutil does the same). The governor's own work was not the cause: a 10 ms poll is 47 device loads (tens of µs,
+   **inferred**; the report now prints the measured `own work N us/s`), well under 1 % of one core against a 94-99 % reading, and
+   the clock measurement runs once in 30 s; but the 10 ms tier ran for as long as the clock was above 2.5 GHz, 100 wakeups a second. Changed
+   (host-tested, `thermal_host`): the 90 C ceiling at every level (one level down per 10 ms from 90 C, up per second under 85 C;
+   never above the stock trip), the own time left out of busy and the clock-measurement window dropped, the fast-clock rule fast
+   only from 70 C (100 ms below), and the policy images no longer run the governor uncapped (`build-policy-test-images.sh`: the
+   fixed Power Saver level, the governor only for P4/P7 and capped at 2400 / 2438 MHz). The test: `ram-p9-gov` (`power.md` §6.5:
+   the governor with the spinners off) should show cluster 0 near the bottom of its table (`384 MHz` mostly, `busy avg` a few %),
+   `own work` under a few ms/s, `polling: ... clock N ms` only while above 2.5 GHz, and with a real load the 90 C ceiling's lines
+   (`thermal limit N MHz (N limited polls ...)`) before any sensor passes 92 C; a hotter reading than that is a failure (report
+   the polling line: the tier was not fast).
 
 Failure meanings: `NOT MAPPED` (no mapping: nothing read from that controller); `NOT ENABLED` / `DIFFERS` (the boot stages left
 TSENS off or partly configured: readings will lack VALID); `ADC CODES` (result format is codes: the decode is wrong); many `without
@@ -242,7 +265,8 @@ clusters stay at the level the boot stages left (open question 1).
    temp-alarm@a00 peripherals) are still unread.
 7. Does `reboot_kernel(RB_HALT)` power the tablet off natively (PSCI SYSTEM_OFF under Gunyah)? (one deliberate test, owner present.)
 8. Is ±10 ms idle accounting enough for the governor, or does it need recount's mach-time idle (a k27 helper)? (the `gov` session's
-   residency and the touch feel.)
+   residency and the touch feel.) 2026-11-12: the 94-99 % readings of P9 were not this (§8 item 8: a real spinner); an idle core reads
+   up to 10 % from the quantisation (host-tested), harmless with the 80 % target.
 
 ## 11. Licence note
 

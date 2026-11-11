@@ -182,7 +182,11 @@ bound.
   - `k27-deny-exec=PATH[,PATH...]` (k27 0035, in the native kernel: `k27-deny-exec` and `/usr/libexec/mobileactivationd` are in
     its strings, a 256-byte value). exec fails with EPERM, so launchd's spawn fails and the job's xpcproxy exits 78 (inferred: the
     `exit ... xpcproxy status 0x4e00` lines). mobileactivationd is denied by default and never runs. **Setting the argument
-    replaces the default**, so it must list mobileactivationd again.
+    replaces the default**, so it must list mobileactivationd again. Since 2026-11-12 `PIANO_DENY_EXEC=PATH[,PATH]`
+    (`build-ram-images.py`) and `build-esp.py --deny-exec PATH` add paths and keep the default (and `PIANO_FAST_BOOT=2`'s watchdogd)
+    in the one argument (`power.md` §1.2: PerfPowerServices and audiomxd);
+  - a test seed's override database: `tooling/k27/stage-boot-run.py --disable-job LABEL` (2026-11-12) adds the label to the copy's
+    `disabled.plist`, as stage-piano.sh did; the seed's identity changes, so such images run Data volatile.
 - `PIANO_FAST_BOOT=2` denies watchdogd. It refuses to build without `panic_on_crash_disabled=1`, because the job is
   `_PanicOnCrash` and the failed spawn may count as a crash. Risk: clients that register with watchdogd
   (`com.apple.watchdogd.optin.registration`: daemons that opt in to the userspace watchdog) find its port without a server. With

@@ -6,7 +6,9 @@ programs it) joined it, built and host-tested in PianoA830, tests G1-G3 and L1 i
 not run): the kernel reads the LLCC island again at each ss3 decision (`piano-llcc-island-live=1`, §3.6) and a driver can cancel the
 suspend in progress (`piano-sleep-cancel=1`, §3.7); tests C0, C1, L2, L3 in §6. Later on 2026-11-12 (built, host-tested, not run):
 the drivers' idle wakeups audited and the cheap ones fixed (§1.1, tests W1/W2), the first callers of the cancel, opt-in (NativeUfs,
-PianoA830: §3.7, test C2). Everything here is off unless its boot argument is
+PianoA830: §3.7, test C2). Later still on 2026-11-12 (built, host-tested, not run): the idle load the night's captures showed (two
+Apple daemons spinning in every boot, §1.2; its A/B §6.5) and PianoThermal's governor made safe against it (`drivers/thermal.md` §8
+item 8). Everything here is off unless its boot argument is
 set, and the kernels with 0060 and later are themselves opt-in (§6: the default build kernel stops at 0059). The owner's priority is battery life; this page is the whole picture (what each piece saves,
 who owns it) and, in detail, the kernel/platform part: CPU idle states, a system sleep that is the closest equivalent of Linux's
 s2idle with its wake sources, and lid / power-key sleep.
@@ -63,7 +65,8 @@ Ranked by evidence (**inferred** from the code and those counters; tests W1/W2 b
 What remains unexplained after 1-4 is most of cpu6/7's 66 % busy with the display off: if each wake costs ~200 µs there (a 1 GHz
 core, Gunyah's injection, the idle path), 3000 wakes a second are that busy time, so W1's entries and residency against
 `ram-pm-idle1`'s answer it; if not, a CPU profile from the USB root shell (`top -l 2 -s 30 -o cpu -n 15 -stats
-pid,command,cpu,csw,idlew`) is the next step.
+pid,command,cpu,csw,idlew`) is the next step. Later the same day the night's captures answered most of it: two Apple daemons spin
+in every boot (§1.2), and their A/B (§6.5) measures their share against W1's.
 
 The table: every periodic source of the native kexts (two read-only audits of the sources, 2026-11-12). "Dark": whether it runs
 with the display off; every thread is frozen in a system suspend (§3.2) whatever it does. Defaults are new only where the change is
@@ -84,7 +87,7 @@ clearly safe; otherwise the switch is opt-in and the proposed flip is named.
 | PianoInput: keys | 10 ms busy, 40 ms idle | ignored the display | the SPMI arbiter's interrupt (`power-irq.md` §2.4) | **added** a dark tier: a press of MS + 42 ms always caught (host-tested), a shorter tap can be missed | `piano-input-dark=MS` (0; proposed 100 after a short-press test) |
 | PianoPower: report (level 1) | 30 s (`piano-power-period`; 10 in tests): bit-banged gauge I2C, SPMI, `updateStatus` (powerd wakes) | runs | none at level 1 | proposed: 120 s while dark on battery | - |
 | PianoPower: charger cycle, PianoAdsp IPCC slices (level 2) | 5 s (26 GLINK round trips) / 20 ms | run | port events; the IPCC receive SPI | proposed: stretch with no source or dark; attach the IPCC SPI | - |
-| PianoThermal: poll / governor / clock measure | 1 s; 100 ms (`piano-cpufreq=3`); 10 ms (fast-clock rule); the 30 s clock measure binds onto every core | ran | TSENS thresholds (`piano-thermal-irq=1`: 5 s base) | **fixed**: the clock measure waits while dark; proposed: the governor's tick relaxed dark | `piano-thermal-clock=2` (1: not dark) |
+| PianoThermal: poll / governor / clock measure | 1 s; 100 ms (`piano-cpufreq=3`); 10 ms near a trip or the 90 C ceiling, and above 2.5 GHz from 70 C (below 70 C 100 ms since 2026-11-12, P9; before: 10 ms at any temperature); the 30 s clock measure binds onto every core | ran | TSENS thresholds (`piano-thermal-irq=1`: 5 s base) | **fixed**: the clock measure waits while dark; the fast-clock rule only when warm; proposed: the governor's tick relaxed dark | `piano-thermal-clock=2` (1: not dark), `piano-thermal-fast-temp` (70), `piano-thermal-clock-ms` (100) |
 | PianoThermalAdc | 30 s, not parked in a suspend | runs | - | proposed: stretch with no charger or dark | - |
 | PianoTouch: frames | 1 ms busy, 50 ms rest (~20 reads/s), 200 ms muted (dark); display read on the loop | 5 reads/s | NativeGopDisplay's messages; `piano-touch-irq=1` | proposed: park while dark (`restart()` re-probes at unmute); the display by message | - |
 | PianoKeyboard: serve | 4 / 30 / 200 ms, hall 500 ms, keep-alive 12 s | ignores the display unless `-blank=1` | `piano-keyboard-irq=1`, gpio80/gpio95 on the TLMM summary | proposed (`power-irq.md` §6) | - |
@@ -97,6 +100,80 @@ clearly safe; otherwise the switch is opt-in and the proposed flip is named.
 The display's state for all of them comes from one place: `package/include/PianoDisplayFollow.h` (NativeGopDisplay's publish
 notification, its `piano-display-power-messages`, its property-change messages; the panel's instance preferred over D6's), used by
 PianoA830, PianoThermal and PianoInput; PianoPolicy has its own (`policy.md` §4).
+
+### 1.2 The idle load at the login window: PerfPowerServices and audiomxd (P11, 2026-11-12)
+
+Most of what §1.1 left unexplained is two Apple daemons, not the kexts. **Measured** in the night's captures
+(`logs/usb-console/20261112-*-port0.txt`):
+
+- The kernel's CPU monitor (`process PerfPowerService[N] thread T caught burning CPU! It used more than 50% CPU over 180 seconds`,
+  and the same for `audiomxd`) fires in every boot that ran 180 s past the daemons' start: 32 captures with PerfPowerServices' line,
+  nearly all with audiomxd's too. 28 of the 32 had no battery service at all (`piano-power-ps` unset: no `AppleSmartBattery
+  (IOPMPowerSource) published`), so our power source is not what PerfPowerServices reads badly; audio3 (`piano-audio=3`, Speaker and
+  Mic as IOAudio2Devices on the null transport) had audiomxd's line as well.
+- fast1 (`pc-sample=30`, `20261112-041235`, 30 s periods at the idle login window): `task PerfPowerServices kernel 0-3 user
+  12136-13163` against 13.4-15.8k user samples in all, every period but the one after its restart. **No kernel samples**: a loop that makes no system call (a retry
+  on IOKit, IOReport, the SMC or a file would show kernel time), so a computation inside the process. `pc-sample` counts timer
+  interrupts (no extra wakeups; not CPU-time weighted), so the per-CPU idle lines below are the measure of the cost.
+- audiomxd: kernel ≈ user (632-1570 / 504-1400 per period), its sampled waits spinning on a port lock in `mach_msg` receive
+  (`hw_lck_ticket_contended` ← `mach_msg_receive_results_complete`, symbolized with the 0064 kernel's table), and configd's kernel
+  samples follow audiomxd's period by period (1185/1156, 721/613, 1112/1072, 632/649, 1570/1614, 964/974, 1013/960, 851/800): a
+  message exchange with configd (inferred from the correlation), at a few kHz on the prime cores (cpu6/7's ~3000 short idle spells
+  a second in `ram-pm-idle1`).
+- PerfPowerServices' first instance (pid 87; in fast1 started before `settime.sh` set the clock) exits with status 0 after 88, 104, 190 or
+  622 s (powerI, powerP1, powerP2, `000758`; once status 1 after 12 s); launchd starts it again (KeepAlive) and the new instance
+  spins too, from 30-60 s after its start (fast1: pid 87 spinning in the period before its exit, pid 439 from the period after next).
+- pm-idle1 (`piano-cpuidle=1`, no governor, cluster 0 at 1996 MHz): cpu0-2 48-72 % idle, cpu6/7 33-34 %: about 2.5 cores busy at
+  an idle login window, which the governor then read as load (P9: cluster 0 at 3532 MHz, `drivers/thermal.md` §8 item 8). The two
+  patterns differ (**inferred**): a pure spinner keeps a core busy with few idle entries, a message loop makes thousands of short
+  idle spells. cpu0-2 (cluster 0, the ADT's E cores, where background work goes) are busy ~1.2 cores with 0.6-2.2k entries a
+  second: PerfPowerServices' spinner moving among them. cpu6/7 (P cores) are 66 % busy with ~3000 short idle spells a second
+  each: audiomxd's exchange with configd (audiomxd is an Interactive job).
+
+What the daemons are (host macOS 26.6's binaries, read with `strings` and `dyld_info`; the tablet's 27.0.1 ones are not on this
+Mac, so names, not offsets): PerfPowerServices is powerlog (`/usr/libexec/PerfPowerServices`, job `com.apple.PerfPowerServices`,
+KeepAlive, Mach services `com.apple.powerlog.plxpclogger.xpc` and `com.apple.powerlog_mover`; PowerlogCore with
+PowerlogLiteOperators' agents: battery, IOReport, SMC, CLPC, PMU, display, audio ...). audiomxd is MediaExperience's daemon
+(`/usr/libexec/audiomxd`, job `com.apple.audiomxd`, audio sessions and routing; it hosts the HAL's IOAudio2 manager,
+`drivers/audio.md` §5). The VM-era notes (the macOS 27 VM on this tablet):
+audiomxd "spun at 70 %" without E cores in the ADT and without DroidVMAudio, and idled with both; natively the ADT has the E cores
+(cpu0-5 `cluster-type E`), and CoreAudio has no working device (PianoAudio's devices are not known to reach the HAL: `drivers/audio.md` §8.3,
+attended). A VM-era seed note that PerfPowerServices needs `/Library/Managed Preferences/mobile` is iOS's path:
+macOS's powerlog has no such string (checked), and the native seed's `Managed Preferences` is as macOS makes it.
+
+Root cause, by kind:
+
+| Daemon | Evidence | Inference (to be proved by §6.5) |
+|---|---|---|
+| PerfPowerServices | pure user spin; every boot; with and without our battery; the first instance exits 0 after the clock is set, the next spins | **the clock jump**: every native boot so far starts at the 1970 calendar (no image had a usable RTC offset) and `settime.sh` moves it to `droidvm-utc` 1-2 min later, after powerlog started and stored 1970 times; powerlog keeps its own time references and buckets (`PLTimeManager`, `PLTimeReferenceDynamic checkForTimeChange...`, `Abort Tasking: monotonic time moved back`, exit reasons `PLExitReasonMonotonicTime` / `kPLExitReasonDescKernelTime`, `aggregateEntriesForKey:withBucketLength:inTimeIntervalRange:`) and would walk 56 years of them. Test: `ram-p9-rtc` |
+| audiomxd | kernel = user; a message loop with configd; with and without PianoAudio's null devices | **no CoreAudio output device** (the VM's evidence); the right fix is audio itself (PianoAudio through the HAL) |
+
+Fixes and defaults:
+
+- **The right fix for PerfPowerServices, if `ram-p9-rtc` confirms it**: the calendar from the PMIC RTC from the start (k27 0060,
+  `piano-rtc=1 piano-rtc-offset=N`, `drivers/rtc.md`; `build-esp.py --rtc-offset N`, already the daily ESP's next step). No change
+  of ours makes powerlog accept a 56-year jump, and nothing else in userland needs it either. If it does not confirm it, the reports
+  that `cpu-reports.sh` prints name the spinning function, and the fallback below holds.
+- **The fallback, both daemons: off**. Three ways, all built:
+  1. test images: `tooling/k27/stage-boot-run.py --disable-job com.apple.PerfPowerServices --disable-job com.apple.audiomxd` writes
+     them into the seed's launchd override database (`private/var/db/com.apple.xpc.launchd/disabled.plist`, as the VM-era
+     `stage-piano.sh --disable-job` did for AppSSODaemon, cryptexd, fskitd, mds, msrpc): launchd never loads the job, its Mach
+     services are not advertised, a client gets an invalid connection at once. A new seed: `data-persist=0` images only;
+  2. any image or ESP by argument: `PIANO_DENY_EXEC=/usr/libexec/PerfPowerServices,/usr/libexec/audiomxd` (`build-ram-images.py`) or
+     `build-esp.py --deny-exec PATH` (repeatable): one `k27-deny-exec` with the kernel's default `mobileactivationd` (and
+     `--fast-boot 2`'s watchdogd) kept. The exec fails with EPERM, launchd retries the KeepAlive job, throttled (an `xpcproxy` exit
+     78 about every 10 s); a client that waits for a reply from such a service waits;
+  3. the installed system, by hand (USB root shell; kept in the store's override database): `launchctl disable
+     system/com.apple.PerfPowerServices; launchctl bootout system/com.apple.PerfPowerServices` (audiomxd the same); undone by
+     `launchctl enable system/<label>` and a reboot.
+- **Defaults: none changed.** Neither daemon is proven harmless to remove natively until `ram-p9-off` boots to a working login
+  window; PerfPowerServices is telemetry (the Battery settings' history is its only visible consumer), audiomxd is media routing
+  (Safari's players need it, VM-era note) and is needed once audio works. Proposed after §6.5: the RTC calendar in the daily ESP
+  (it is planned anyway), PerfPowerServices off on the installed system only if it still spins with the right clock, audiomxd off
+  in the daily profile until PianoAudio reaches the HAL.
+- On the installed system (persistent Data) the reports of every boot are kept: `ls -l /Library/Logs/DiagnosticReports | grep -E
+  'PerfPower|audiomxd'` from the root shell, or `spindump PerfPowerServices 10 -file /tmp/pps.txt` / `sample audiomxd 10` there,
+  names the loop without any test image (attended).
 
 ## 2. CPU idle (k27 0061, `piano-cpuidle=N`)
 
@@ -411,6 +488,9 @@ routes below (`piano-keyboard-lid`, PianoInput's direct `kIOPMSleepNow`) once it
 | Power key short press | sleep / wake | wake: the kernel (bit 1, default); sleep: PianoPolicy at level 2, asked by PianoInput on the release (`policy.md` §5.1, built 2026-11-11); without it the Apple menu or `pmset sleepnow` |
 | Volume-down, keyboard, USB-C as wake sources | off | `piano-sleep-wake` bits 8, 16, 4 |
 | CPU idle | off; target `piano-cpuidle=2` (ret + cl5) in the daily profile after §6 I1-I2 | `piano-cpuidle=N` |
+| The calendar from the PMIC RTC | off (`build-esp.py --rtc-offset N` planned for the daily ESP): every boot starts at 1970 until `settime.sh` | `piano-rtc=1 piano-rtc-offset=N` (k27 0060); §1.2: likely what makes PerfPowerServices spin (`ram-p9-rtc`) |
+| PerfPowerServices, audiomxd (the idle spinners of §1.2) | on (stock) until §6.5's A/B | test images: `stage-boot-run.py --disable-job LABEL`; arguments: `PIANO_DENY_EXEC` / `build-esp.py --deny-exec PATH`; installed: `launchctl disable system/LABEL` |
+| CPU clock in unattended test images | the fixed Power Saver level (`piano-cpufreq=2`) unless the governor is what is tested, then capped (`build-policy-test-images.sh`, 2026-11-12) | `drivers/thermal.md` §8 item 8 |
 
 Boot arguments of 0062:
 
@@ -569,6 +649,40 @@ interrupt work cut the wake-ups); display off another 0.5-1.5 W; suspended, a fr
 CPUs parked), still hundreds of mW while the rails keep their votes; with §3.6 done, tens of mW and `cxsd`/`ddr` accumulating with
 the time asleep.
 
+### 6.5 The idle-load A/B (P11, P9: 2026-11-12)
+
+§1.2's question, unattended at the idle login window on the Mac's cable, 900 s each: what PerfPowerServices and audiomxd cost, and
+whether the clock jump is PerfPowerServices' cause. `tooling/k27/build-p9-test-images.sh [base off rtc deny gov diag]` (default
+`base off`) from a KC with 0061 (the 0064 kernel), the Turnip stage's seed and trust cache. Every image is pm-idle1's profile
+(`piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-power=1 piano-power-period=10 piano-usb=2 piano-input=1
+piano-cpuidle=1`) plus `pc-sample=30 exec-log=1 sample-name=PerfPowerServices,audiomxd sample-period=300`, and its seed's boot job
+runs `tooling/k27/cpu-reports.sh` (staged by `tooling/k27/stage-boot-run.py`, Data volatile): the two daemons' launchd jobs and
+overrides, the busiest processes every 5 minutes, and the CPU-resource reports spindump writes for them, all on the console as
+`cpu-reports:` lines. The order of the queue is the table's.
+
+| # | Image | Change against base | Pass (console) | On failure |
+|---|---|---|---|---|
+| A | `ram-p9-base` (required) | none: the reference | as pm-idle1: `piano-cpuidle: cpu6 ... state ret ... residency ~34%` (cpu0/1 ~50 %); `pc-sample: task PerfPowerServices kernel 0.. user 12...`; `caught burning CPU` for both; `cpu-reports: job: <pid> ... com.apple.PerfPowerServices` (the 27.0.1 label), `cpu-reports: ps 5 min:` with PerfPowerServices near 100 %; `cpu-reports: report PerfPowerServices_....cpu_resource...` and its `| ` lines: the `Path:` (the executable `deny` names) and the **heaviest stack**, the function that spins; the same for audiomxd | no `cpu-reports:` line: the boot job did not run it (`/dev/console` not mirrored: then rebuild with `stderr-log=1` and the reporter's lines arrive as `fd1:`); no report but the burning lines: spindump did not write one, `sample:` lines (pc, lr, frames, the region) are the fallback |
+| B | `ram-p9-off` (required; the fix's A/B partner) | `com.apple.PerfPowerServices` and `com.apple.audiomxd` disabled in the seed's override database | `cpu-reports: override: "com.apple.PerfPowerServices" => disabled` (and audiomxd); no `job:` line, no exec of either (`exec-log`), no `caught burning CPU`, neither in `pc-sample: task`; **per-CPU idle up**: the eight `piano-cpuidle:` lines' `ret` residency against A's (expected: cpu0-2 and cpu6/7 well above A's 30-50 %, the sum over the eight cores at least one core more idle), fewer `ret entries` on cpu6/7 if audiomxd's message loop was theirs; the login window as in A (`NativeGopDisplay: ... non-black`, 0 WindowServer exits, no new `Denying core dump` names) | the login window stops or a daemon waits (no SecurityAgent, WindowServer exits): a client of the disabled services blocks; record which, keep the daemon and try `deny` |
+| C | `ram-p9-rtc` (`P9_RTC_OFFSET` from `tooling/native/rtc-offset.py`) | `piano-rtc=1 piano-rtc-offset=N`: the calendar right from the start (k27 0060) | `piano-rtc: count N + offset M = X, 2026-... UTC: the calendar starts there`; no `settime:` change; **PerfPowerServices**: no `caught burning CPU`, small in `pc-sample` and `ps`, its first instance not exiting (no `exit: pid 87 PerfPowerService status 0`) → §1.2's clock hypothesis holds and the fix is the RTC calendar; audiomxd as in A | PerfPowerServices spins as in A: not the clock; A's report names the loop |
+| D | `ram-p9-deny` (optional) | `PIANO_DENY_EXEC=/usr/libexec/PerfPowerServices,/usr/libexec/audiomxd` | `k27-deny-exec=/usr/libexec/mobileactivationd,/usr/libexec/PerfPowerServices,/usr/libexec/audiomxd` in the boot args; `exit: pid N xpcproxy status 0x4e00` about every 10 s, no exec of either daemon; idle residency as B's (the respawn attempts are the difference) | an exec of the daemon: the 27.0.1 path differs (A's report `Path:` line): fix `EXECS` |
+| E | `ram-p9-gov` (optional; after B) | B + `piano-thermal=1 piano-cpufreq=3` | `drivers/thermal.md` §8 item 8: `cpufreq d0 NCC0: now 384 MHz ...` mostly (busy avg a few %), `own work N us/s` small, no `polling every 10 ms` at rest; `thermal limit` lines only above 90 C | cluster 0 high with B's idle figures: the governor itself (report its lines) |
+| F | `ram-p9-diag` (optional, 600 s, not a measurement) | A + `iokit-log=PerfPowerService,audiomxd sc-trace=PerfPowerService,audiomxd` | the services both daemons look up (`iokit: audiomxd services: ...`), the failing calls with their paths (`sc: audiomxd N err E ...`) | a console flood (the spin is such calls): its first lines are the answer |
+
+Capture with `usb-console.py --capture 940` per image (P7: the capture must cover `piano-reset-after` plus the boot). Reading:
+`python3 tooling/native/boot-timeline.py <capture>.times.txt --execs | grep -E 'PerfPower|audiomxd|login'`; the residency is the
+last four `piano-cpuidle:` blocks of each run (the display may sleep after ~650 s; compare like with like); `grep -a 'cpu-reports:'
+<capture>.txt` gives the reports.
+
+Built offline 2026-11-12 from an agent worktree (`PIANO_A830_METAL=0`: the main checkout's Turnip stage, `out/turnip-a830/stage`,
+seed identity `f61764674739968c`, as `ram-pm-idle1` had; KC with the 0064 kernel `01d4ef0ceaea3bfe…` and this page's PianoThermal,
+23 native kexts, the native kext rule passed, `ddce0816862755ef…`; ADT `06ebf45e26d60981…`). Seeds: `report` `bad57b99d90afae7`,
+`off` `e7cc3b928b443640` (the Turnip stage's trust cache unchanged). Images (`verify-ram-images.py` PASS, Data volatile, longest
+command line 878 bytes): `ram-p9-base` `6c144c00ec2ef0c3…`, `ram-p9-off` `ce5f9958834045ec…`, `ram-p9-rtc` `7edae69c613dd9dd…`
+(`P9_RTC_OFFSET` from that night's rtc run by `rtc-offset.py`), `ram-p9-deny` `e47cd9f67f73ed05…`, `ram-p9-gov` `d6e38357dafbcd2b…`,
+`ram-p9-diag` `2638573913752442…`, the dump image `ram-p9-dump` `855a10044d1502f5…`. The kernel's hash depends on the k27 tree's
+path: rebuild in the main checkout before a run if the queue's other images are built there.
+
 ## 7. Risks and limits
 
 - **A broken idle or suspend path hangs the tablet**: everything is opt-in; the watchdog covers the suspend path; test images
@@ -608,4 +722,7 @@ The watchdog's owner and the boot guard: `patches/k27/0063-*.patch`,
 `boot-guard.md`. The GPU's part: `package/PianoA830/adreno830/A830Suspend.h` (its host test `tests/test_a830suspend.cpp`), the gate in
 `A830PowerState`, the steps in `Adreno830Start.cpp`, `Sm8750RpmhHostRailsSet`, the IOKit side and the LLCC island in
 `package/PianoA830/board/PianoA830.cpp` with `PianoLlccIsland.h` (`board/tests/test_llcc_island.cpp`); the images L1, G1-G3, GM in
-`tooling/k27/build-pm-test-images.sh`.
+`tooling/k27/build-pm-test-images.sh`. The idle load (§1.2, §6.5): `tooling/k27/build-p9-test-images.sh`, `tooling/k27/stage-boot-run.py`
+(a staged seed with files, boot-job commands and launchd overrides added), `tooling/k27/cpu-reports.sh` (on the tablet), the deny list in
+`tooling/bootimg/build-ram-images.py` (`deny_exec`, `PIANO_DENY_EXEC`) and `tooling/persist/build-esp.py --deny-exec`; PianoThermal's
+side in `package/PianoThermal/Governor.h` (CoreLoad), `Cluster.h` (the ceiling, the clock tier) and `drivers/thermal.md` §8 item 8.

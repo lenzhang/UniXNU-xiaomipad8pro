@@ -148,6 +148,12 @@ the same script with `--live`, and `--check` changes nothing.
     plist's `Disabled`.
   - Verified on macOS 26.6 with a test agent: a plist with `Disabled` is refused by `launchctl bootstrap` and never loaded;
     without it, it loads. The override's precedence is stock launchd behaviour, needs-boot (U9).
+- **Apple's own jobs** (2026-11-12, `power.md` §1.2): the installer neither stops nor starts them. Two of them spin a core in every
+  native boot (PerfPowerServices, audiomxd). To keep one from running: on the installed system the owner's `launchctl disable
+  system/<label>` and `launchctl bootout system/<label>` (kept in the store's override database; undone with `launchctl enable` and
+  a reboot); in a test image's seed `tooling/k27/stage-boot-run.py --disable-job <label>` (the same database, written into a copy
+  of the seed, so `data-persist=0`); by kernel argument `PIANO_DENY_EXEC` / `build-esp.py --deny-exec PATH` (k27-deny-exec: no
+  seed change; launchd retries the spawn every ~10 s). None is a default yet.
 - **Removal**: `/private/var/db/piano-userland/receipt.tsv` lists what the installer put in place. A file the manifest no longer
   has is removed, its job booted out, when it is unchanged since. Anything else is left (host-tested).
 - **Files it did not put there** (2026-11-12, for the system layer of `data-store.md` §9): before the installer first takes over
@@ -391,6 +397,9 @@ Then the owner's system: section 7.5, with the owner present.
 - `configs/userland.toml`;
 - `tooling/userland/stage.py`, `install.sh`, `piano-pmset-defaults.sh`, `com.unixnu.piano-pmset-defaults.plist`, `test-stage.py`;
 - `tooling/native/piano-policy-agent/com.unixnu.piano-policy-agent.plist`;
-- `tooling/native/pianousb-shell/pianousb-shell.c` (the boot-argument check), `com.unixnu.pianousb-shell.plist`.
+- `tooling/native/pianousb-shell/pianousb-shell.c` (the boot-argument check), `com.unixnu.pianousb-shell.plist`;
+- for test seeds, outside the manifest: `tooling/k27/stage-boot-run.py` (a copy of a staged seed with `--file`, `--boot-run` and
+  `--disable-job` added; the trust cache unchanged) and `tooling/k27/cpu-reports.sh` (the CPU-resource reports and the busiest
+  processes to the console, `power.md` §6.5).
 
 The outputs are `out/userland/{build,stage,live}` (ignored).
