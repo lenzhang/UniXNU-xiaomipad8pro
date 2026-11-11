@@ -64,7 +64,8 @@ a small kernel monitor. Design, levels and test steps: `docs/drivers/usb-device-
 
 **Getting back on its own:** k27 patch 0056 (`piano-reset-after=<s>`) resets through PSCI after N seconds and pets the
 Gunyah watchdog until then (bite 32 s after the last pet: the backstop for hangs and panics). The panic path restarts by
-itself when `panic-spin=1` is absent.
+itself when `panic-spin=1` is absent. The installed system, which has no `piano-reset-after`, gets the same backstop from k27
+0063's boot guard (`piano-boot-guard=SECS`, [boot-guard.md](boot-guard.md)); a test run with `piano-reset-after` keeps 0056's.
 
 **Decoding a panic photo** (fallback): the verbose console draws every glyph twice ("ppaanniicc"); keep every second
 character. DarwinBoot loads the kernel at its link address (no slide), so pc/lr look up directly in

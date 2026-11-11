@@ -29,7 +29,7 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
 
 | Path | What |
 | --- | --- |
-| `patches/k27/` | the k27 kernel patches 0053-0062 on top of the k27 tree (xnu-12377 + the baseline series 0001-0052, XNU 27.0.1) |
+| `patches/k27/` | the k27 kernel patches 0053-0063 on top of the k27 tree (xnu-12377 + the baseline series 0001-0052, XNU 27.0.1) |
 | `patches/xnu/` | the device series of the UniXNU macOS 27.3 line (empty: none yet) |
 | `package/` | the native kexts; each is inert without its boot argument |
 | `configs/` | the native kext list (`k27-native-kexts.txt`), the ADT identity and display node (`k27-adt.toml`, `k27-gop-display.toml`), the 27.3 line's kernel config |

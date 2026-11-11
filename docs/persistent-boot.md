@@ -247,8 +247,9 @@ partly discharged pack charges without the DSP is unmeasured. Note also:
   publish partition 37 so macOS updates its own payload.
 - The clock is the ESP build time (`droidvm-utc`) unless the ESP is built with `--rtc-offset` on a k27 0060 kernel: then the
   calendar starts from the PMIC RTC (`docs/drivers/rtc.md`; built, not yet run on the tablet).
-- Watchdog: not armed without `piano-reset-after`; panics restart (no `panic-spin`) into macOS again; the escape is power +
-  volume-down.
+- Watchdog: an ESP built from a k27 0063 collection with the daily profile has the boot guard (`piano-boot-guard=180`,
+  [boot-guard.md](boot-guard.md)): a hang or panic in the first 180 s lands in ABL fastboot, a later one restarts macOS. Older ESPs
+  arm no watchdog (panics restart into macOS, a hang stays); the escape is power + volume-down.
 
 ## 10. The Data store after the install
 

@@ -176,6 +176,9 @@ is stamped (recount and the scheduler's snapshots all lie before it).
 - A CPU that does not park in 1 s, or does not stop taking interrupts in 100 ms: the suspend is aborted (a normal wake follows).
   A CPU that does not come back from the park in 0.5 s: panic, so the watchdog reboots.
 - `piano-sleep-wdt=0` disables the watchdog part (not for daily use).
+- Since k27 0063 the watchdog has one owner (`machine_routines.c` `piano_watchdog_*`): this path is a holder from the entry to the
+  end of the wake window, as 0056 and the boot guard (`boot-guard.md`) are for the whole boot; the end of the window disables it
+  only when nobody else holds it, and the loop pings it whoever holds it, `piano-sleep-wdt=0` included.
 
 ### 3.6 What this does not reach yet: CX collapse and DDR self-refresh
 
@@ -349,4 +352,5 @@ the time asleep.
 `machdep.piano_cpuidle*` in `bsd/dev/arm64/sysctl.c`), `patches/k27/0062-*.patch` (the suspend in `piano_pm.c`; `IOCPU.cpp`,
 `IOPMrootDomain.cpp`, `clock.c`, `machdep.piano_sleep`), `tooling/k27/piano-pm/` (the policy header, its host test, a contract
 check driver), `tooling/k27/test-piano-pm.sh`, `tooling/k27/build-pm-test-images.sh`, `package/include/PianoPowerContract.h`
-(on every kext's include path through `build-native-kext.py`).
+(on every kext's include path through `build-native-kext.py`). The watchdog's owner and the boot guard: `patches/k27/0063-*.patch`,
+`boot-guard.md`.

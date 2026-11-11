@@ -32,10 +32,12 @@ tablet (`docs/PROJECT-MAP.md` §7 lists their state).
 | Type the login password | `python3 tooling/native/piano-input.py type --secret --enter` (read without echo; never logged, never in argv) |
 | Keys, pointer | `piano-input.py key cmd+space`, `move 200 0`, `click`, `scroll -3` (`--help` for all) |
 | To ABL fastboot (no buttons) | `python3 tooling/native/usb-console.py --send 'reset fastboot' --capture 5` |
-| Restart into macOS | monitor command `reset` |
+| Restart into macOS | monitor command `reset` (in the first 180 s of a boot it lands in ABL fastboot: the boot guard's window, `docs/boot-guard.md`; `fastboot reboot` goes on) |
 | What is attached | `python3 tooling/native/usb-console.py --list` |
 
-Without the USB console (an older profile, or a hang): hold **power + volume-down for 15–20 s** until the fastboot screen.
+Without the USB console (an older profile, or a hang): hold **power + volume-down for 15–20 s** until the fastboot screen. With the
+boot guard (an ESP from a k27 0063 collection) a hang resets by itself: within the first 180 s into ABL fastboot (`fastboot reboot`
+goes on to macOS), later into macOS.
 
 ## 4. Test a change (RAM boot, nothing written)
 
