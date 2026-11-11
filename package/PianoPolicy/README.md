@@ -1,0 +1,17 @@
+PianoPolicy: piano's laptop-class policy for native macOS 27 (backlog B2 and B5), so that the drivers stay mechanisms. It owns no
+hardware. It reads what PianoKeyboard (cover hall, attach, gpio95), PianoPower (the power source), NativeGopDisplay (display power),
+the kernel (k27 0062's system sleep and wake mask) and a userland agent (macOS Low Power Mode) publish, decides with Policy.h, and
+tells IOPMrootDomain (clamshell, clamshell sleep, AC adaptor, sleep now, user active), PianoThermal (its profile) and PianoA830 (the
+GPU ceiling) through their public calls. Inert without the boot argument piano-policy (1: decisions logged, 2: act; the cover only
+with piano-policy-lid=1). The page is docs/policy.md; provenance in UPSTREAM. Build: tooling/k27/build-native-piano-policy.sh (host
+tests, then the objects); it is in configs/k27-native-kexts.txt.
+
+| File | What |
+|---|---|
+| `PianoPolicy.cpp` | the IOService on IOPlatformExpertDevice: inputs, the thread, actions, platform functions, `machdep.piano_policy*` |
+| `Policy.h` | portable: the rules, the order of the root domain's notifications, the GPU ceiling slot shared with PianoThermal |
+| `tests/policy_host.cpp` | host tests (every cover x power x display x Low Power Mode x sleep combination, the sequences) |
+
+The userland half (Low Power Mode, the lock on a cover closed on power): `tooling/native/piano-policy-agent/`.
+
+Status (2026-11-11): built, host-tested, linked into the KC (kernels 0059 and 0062); not run on the tablet.

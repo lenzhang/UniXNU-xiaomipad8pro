@@ -249,8 +249,8 @@ static void keyboard()
   run(u, un, 0);
   Actions unknown;
   CHECK(!u.keyboardRise(un, 99000, unknown, &why) && unknown.n == 0);
-  // The tick: while a keyboard wake can come (attached, open, display state known), every second.
-  CHECK(e.tickMs(in) == 1000);
+  // The tick: while a keyboard wake can come (attached, open, display state known), every 5 s.
+  CHECK(e.tickMs(in) == Engine::kTickMs);
   CHECK(u.tickMs(un) == 0);
 }
 
@@ -317,7 +317,7 @@ static void thermalSharedSlot()
   Inputs in = base();
   CHECK(run(e, in).find("gpu:342000") != std::string::npos);
   CHECK(e.gpuWritten() == 342000);
-  CHECK(e.tickMs(in) == 1000);   // the keyboard tick (shorter) covers the thermal one
+  CHECK(e.tickMs(in) == Engine::kTickMs);
   // PianoThermal goes passive (its 160 MHz in the slot): not written over, and a change to Balanced does not clear it.
   in.thermal = Thermal::passive;
   CHECK(run(e, in).find("gpu:") == std::string::npos);
@@ -354,7 +354,7 @@ static void thermalSharedSlot()
   Engine t(nk);
   Inputs ti = base();
   run(t, ti);
-  CHECK(t.tickMs(ti) == 5000);
+  CHECK(t.tickMs(ti) == Engine::kTickMs);
   Config nt = nk;
   nt.thermalOwnsGpu = false;
   Engine t2(nt);

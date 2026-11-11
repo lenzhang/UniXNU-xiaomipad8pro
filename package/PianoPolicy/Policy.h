@@ -252,13 +252,15 @@ class Engine {
   }
 
   // How often the shell must look again without an event, in ms (0: no tick): the display state while a keyboard wake could come
-  // (to time the hold-off), PianoThermal's state while a GPU ceiling of ours sits in the slot it shares.
+  // (NativeGopDisplay sends no message: the hold-off is timed from the turn that first saw the display off, so it is between
+  // holdoffMs and holdoffMs + kTickMs), PianoThermal's state while a GPU ceiling of ours sits in the slot it shares (PianoThermal
+  // clears the slot when it leaves passive: ours is written again within kTickMs).
+  static constexpr uint32_t kTickMs = 5000;
   uint32_t tickMs(const Inputs &in) const
   {
-    uint32_t t = 0;
-    if (c_.keyboard && in.attached && in.lid == Lid::open && in.screen != Screen::unknown) t = 1000;
-    if (c_.profile && c_.thermalOwnsGpu && (gpuWritten_ || gpuHeld_) && !t) t = 5000;
-    return t;
+    if (c_.keyboard && in.attached && in.lid == Lid::open && in.screen != Screen::unknown) return kTickMs;
+    if (c_.profile && c_.thermalOwnsGpu && (gpuWritten_ || gpuHeld_)) return kTickMs;
+    return 0;
   }
 
  private:
