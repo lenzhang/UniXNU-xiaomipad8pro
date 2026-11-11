@@ -91,8 +91,8 @@ arbiter model, no write but observer commands) and `python3 tooling/native/test_
 
 ## 8. Hardware test plan (USB-C cable to the Mac; nothing written to the PMIC; a RAM boot, back in ABL after 300 s)
 
-Built offline 2026-11-11 (rebuild in the main checkout before a run; kernel sha256 `c4c55f1a589c82a0…`, KC `b95af75c161aeebc…`,
-RAM image `d4815251a89fcb77…`, verify-ram-images PASS):
+Built offline 2026-11-11 (rebuild in the main checkout before a run; kernel sha256 `c4c55f1a589c82a0…`, KC `15a609c3e56c8a8c…`,
+RAM image `57a9e4a067af0761…`, verify-ram-images PASS):
 
 ```sh
 # the kernel: in droidvm-build/macOS-DroidVM/out/k27/xnu: git am <this repo>/patches/k27/0060-*.patch, then
