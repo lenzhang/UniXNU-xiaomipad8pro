@@ -218,10 +218,12 @@ void dmaClean(void *, void *p, size_t n) { dmaCache(p, n, 0); }
 void dmaCleanInval(void *, void *p, size_t n) { dmaCache(p, n, 1); }
 void dmaInval(void *, void *p, size_t n) { dmaCache(p, n, 2); }
 
-// The engine's register callbacks. The delay: the first polls of a transfer spin (1 us), later ones sleep (1 ms), so a frame read
-// (2-5 ms) does not hold a CPU; poll_limit then bounds a transfer at about half a second.
-constexpr unsigned kSpinPolls = 300, kPollLimit = kSpinPolls + 500;
+// The engine's register callbacks. The delay: with SE DMA the first polls of a transfer spin (1 us), later ones sleep (1 ms), so a
+// frame read (2-5 ms) does not hold a CPU; poll_limit then bounds a transfer at about half a second. In FIFO mode every poll spins
+// (the FIFO is 64 bytes: the engine waits for each refill), bounded by kFifoPollLimit.
+constexpr unsigned kSpinPolls = 300, kPollLimit = kSpinPolls + 500, kFifoPollLimit = 400000;
 unsigned gDelayCalls;
+bool gDelaySleeps;
 uint32_t seRd(void *ctx, uint32_t reg) { return rd32(static_cast<Region *>(ctx)->va + reg); }
 void seWr(void *ctx, uint32_t reg, uint32_t v)
 {
@@ -230,7 +232,7 @@ void seWr(void *ctx, uint32_t reg, uint32_t v)
 }
 void seDelay(void *, unsigned us)
 {
-  if (++gDelayCalls <= kSpinPolls) IODelay(us);
+  if (!gDelaySleeps || ++gDelayCalls <= kSpinPolls) IODelay(us);
   else IOSleep(1);
 }
 
@@ -671,7 +673,8 @@ bool PianoTouch::geniUp()
     fSpi.dma = {nullptr, dmaClean, dmaCleanInval, dmaInval, va, va + kHalf, pa, pa + kHalf, kHalf};
     note("geni: SE DMA through %#llx (+%#x TX, +%#x RX)", (unsigned long long)pa, 0u, kHalf);
   }
-  fSpi.poll_limit = kPollLimit;
+  fSpi.poll_limit = fSpi.use_dma ? kPollLimit : kFifoPollLimit;
+  gDelaySleeps = fSpi.use_dma;
   for (unsigned pass = 0; pass < 2; ++pass) {
     const bool irqOn = gArgs.seirq == 2 || (gArgs.seirq == 0 && pass == 1);
     fSpi.poll_only = irqOn ? 2 : 1;
