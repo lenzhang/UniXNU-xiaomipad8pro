@@ -54,8 +54,9 @@ EPOCH = 1262304000  # UniXNU payload timestamps (2010-01-01)
 # sheng-aks-sls, ml-timeout-lock-scale, ml-timeout-lock-panic-scale; ca-triple-buffer, ca-free-wakeup: the VM's Metal plugin).
 K27_ARGS = ['-v', 'debug=0x14e', 'kt_fixed_zones=120', '-no_slto_panic', 'tlto_us=0',
             '-apfs_shared_datavolume', 'offline-apfs-load=1', 'owner-staged-apps=1',
-            # Read by the OS image's userland (VM era, still needed natively): jobs without hardware here; the clock and time zone
-            # (settime.sh boot job: no RTC driver yet).
+            # droidvm-disable-jobs: the jobs without hardware here, but inert natively (its reader was the iPadOS line's kernel,
+            # DroidVMLaunchPolicy.c; k27 has none, and the listed jobs run: docs/boot-time.md). PIANO_FAST_BOOT drops it. The clock
+            # and time zone (droidvm-utc, droidvm-tz below) are the OS image's settime.sh boot job's.
             'droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd',
             'mac-amfi-launch-permissive=1', 'union-hide-lower=1', 'malloc-ranges-off=1', 'arm64_maxoffset=0x7FFE000000',
             # 0042: userspace sees 24 MHz over the architected counter (19.2 MHz on SM8750 as in the VM).
@@ -73,6 +74,39 @@ K27_ARGS = ['-v', 'debug=0x14e', 'kt_fixed_zones=120', '-no_slto_panic', 'tlto_u
             'native-ufs-root=1', 'native-ufs-diagnostics=1',
             # NativeRamBlock's changed Data pages in NativeUfs's store window at the end of linux_rootfs (2: read and write)
             'data-persist=' + os.environ.get('PIANO_DATA_PERSIST', '2')]
+
+# PIANO_FAST_BOOT=1|2 (docs/boot-time.md): the boot-time test switch, off (0) by default, so K27_ARGS above stays what boots today.
+#   1: no '-v'. XNU then keeps its console in graphics mode and stops drawing every console line into the boot framebuffer, which
+#      this configuration maps as Device memory (video_console.c: VM_WIMG_IO, as BCM2837 has neither HAS_UCNORMAL_MEM nor
+#      APPLEVIRTUALPLATFORM) and which it otherwise repaints line by line until WindowServer's first frame (NativeGopDisplay
+#      releases the console then). console_write mirrors every byte into the pstore mailbox before that check, so the mailbox and
+#      the USB console (piano-usb=2) keep every line. The panel shows no kernel text, and launchd prints no verbose lines.
+#      Also no droidvm-disable-jobs: nothing native reads it (0 matches in the k27 kernel and the KC; bluetoothd, locationd and
+#      watchdogd run with it in every native run).
+#   2: 1 + k27-deny-exec for watchdogd (with the kernel's default, mobileactivationd, which setting the argument replaces): exec of
+#      them fails with EPERM, so watchdogd stops its crash loop (no watchdog device; vmm-present 0). Needs panic_on_crash_disabled=1.
+FAST_BOOT_DROP = ('-v', 'droidvm-disable-jobs')
+FAST_BOOT_DENY_EXEC = 'k27-deny-exec=/usr/libexec/mobileactivationd,/usr/libexec/watchdogd'
+
+
+def fast_boot_level(value=None):
+    value = os.environ.get('PIANO_FAST_BOOT', '0') if value is None else value
+    if str(value) not in ('', '0', '1', '2'):
+        raise SystemExit(f'PIANO_FAST_BOOT={value}: 0, 1 or 2 (docs/boot-time.md)')
+    return int(value or 0)
+
+
+def fast_boot(args, extra=(), level=None):
+    """ARGS (K27_ARGS or a profile's base) for fast-boot LEVEL; EXTRA (the arguments added after them) wins over both changes."""
+    level = fast_boot_level(level)
+    names = {x.split('=', 1)[0] for x in extra}
+    out = [x for x in args if not level or x.split('=', 1)[0] not in FAST_BOOT_DROP]
+    if level >= 2 and 'k27-deny-exec' not in names and not any(x.startswith('k27-deny-exec=') for x in out):
+        # watchdogd's job is _PanicOnCrash: its xpcproxy, failing the exec, may count as its crash (kern_exit.c's panic)
+        if 'panic_on_crash_disabled=1' not in [*args, *extra]:
+            raise SystemExit('PIANO_FAST_BOOT=2 denies watchdogd: it needs panic_on_crash_disabled=1 too')
+        out.append(FAST_BOOT_DENY_EXEC)
+    return out
 
 
 def sha(path):
@@ -114,7 +148,8 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     shutil.copyfile(seed, payloads / 'scratch-data.img')
     shutil.copyfile(adt, payloads / 'kernel.macho.adt')
     # PIANO_EXTRA_ARGS: more kernel arguments for one test image (e.g. piano-usb=2, docs/drivers/usb-device-debug.md).
-    base = K27_ARGS + [f'droidvm-utc={utc}'] + os.environ.get('PIANO_EXTRA_ARGS', '').split()
+    extra = os.environ.get('PIANO_EXTRA_ARGS', '').split()
+    base = fast_boot(K27_ARGS, extra) + [f'droidvm-utc={utc}'] + extra
     one = ' '.join(base + ['cpus=1'])
     smp = ' '.join(base + ['sheng-smp=1'])
     for line in (one, smp):
@@ -133,7 +168,7 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     size_mib = max(64, -(-int(content * 1.08) // (1 << 20)) + 8)
     image = work / 'payload-macos.img'
     payload(stage, image, 'PIANOESP', size_mib)
-    return image, {'cmdline_1cpu': one, 'cmdline_8cpu': smp, 'payload_mib': size_mib}
+    return image, {'cmdline_1cpu': one, 'cmdline_8cpu': smp, 'payload_mib': size_mib, 'fast_boot': fast_boot_level()}
 
 
 def kernel_field(fd, dtb, work, name):

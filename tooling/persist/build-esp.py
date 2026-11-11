@@ -18,6 +18,7 @@ watchdog is not armed without them) plus the profile's and --arg's additions. En
   fastboot     the seed, no UFS root, data-persist=0, no pstore console (the last run's log stays): reset into ABL fastboot after 1 s
   reset, shutdown, tools
   build-esp.py --profile base|softgpu|gpu|daily [--default macos|macos-diag] [--arg NAME=VALUE ...] [--rtc-offset N|sdam] [--from REPO]
+               [--fast-boot 0|1|2]
                [--kc K --adt A --trust T --seed S] [--name esp-diag] [--out out/persistent]
 
 The clock (docs/drivers/rtc.md): droidvm-utc=<--utc> is always there, the OS image's settime.sh sets it when the calendar is still
@@ -118,6 +119,9 @@ def args_of(a, profile, utc):
         raise SystemExit('--rtc-offset and --arg piano-rtc...: one of them')
     extra = profile['args'] + a.arg + rtc_args(a.rtc_offset)
     names = {x.split('=', 1)[0] for x in extra}
+    # --fast-boot N: build-ram-images.py's PIANO_FAST_BOOT=N (docs/boot-time.md), given here explicitly so that an environment
+    # variable left set for a RAM test never changes an installed ESP.
+    base = ram.fast_boot(base, extra, a.fast_boot)
     base = [x for x in base if x.split('=', 1)[0] not in names] + extra
     base += ['data-persist=2', f'droidvm-utc={utc}']
     macos = base + ['sheng-smp=1']
@@ -148,7 +152,7 @@ def config_text(a, lines, prev):
              'initrd = "Payloads/scratch-data.img"\nargs = "{args}"\n')
     text = ('# piano persistent boot (docs/persistent-boot.md): the ESP on UFS LUN 0, partition 37. boot_a holds only BootShim + FD; a\n'
             '# "fastboot boot" image with its own payload still wins (firmware/patches/unixnu/0001).\n'
-            f'# profile {a.profile}; clock: {clock_text(a)}\n'
+            f'# profile {a.profile}{f"; fast boot {a.fast_boot}" if a.fast_boot else ""}; clock: {clock_text(a)}\n'
             'version = 1\n[boot]\ntimeout = ' + str(a.timeout) + '\ndefault = "' + a.default + '"\n[kits]\nautoload = false\n')
     text += entry.format(id='macos', title='macOS (native)', dir='', args=lines['macos'])
     text += entry.format(id='macos-diag', title=f'macOS, reset to fastboot after {a.diag_reset_after} s', dir='', args=lines['macos-diag'])
@@ -186,6 +190,9 @@ def main():
     p.add_argument('--utc', type=int, default=int(time.time()), help='droidvm-utc: the clock when the RTC gives none')
     p.add_argument('--rtc-offset', metavar='N|sdam', help='the calendar from the PMIC RTC (k27 0060): piano-rtc=1 and '
                    'piano-rtc-offset=N (tooling/native/rtc-offset.py), or "sdam" for the PMIC\'s own offset cell')
+    p.add_argument('--fast-boot', type=int, choices=(0, 1, 2), default=0,
+                   help='build-ram-images.py PIANO_FAST_BOOT: 1 no -v (no console text drawn) and no droidvm-disable-jobs; '
+                   '2 also k27-deny-exec for watchdogd (docs/boot-time.md)')
     p.add_argument('--name', help='output base name (default esp-<profile>-<default>)')
     p.add_argument('--out', type=Path, default=common.DEVICE / 'out/persistent')
     a = p.parse_args()
@@ -268,7 +275,8 @@ def main():
         'status': 'OFFLINE_BUILD_NOT_DEVICE_TESTED', 'image': image.name, 'bytes': image.stat().st_size, 'sha256': common.sha(image),
         'partition': {'lun': 0, 'index': common.ESP_INDEX + 1, 'first_lba': common.ESP_FIRST, 'blocks': common.ESP_BLOCKS,
                       'dd': f'bs=1M seek={common.ESP_FIRST * common.LBA >> 20} count={common.ESP_BLOCKS * common.LBA >> 20}'},
-        'profile': a.profile, 'about': profile['about'], 'extra_args': a.arg, 'default': a.default, 'timeout': a.timeout,
+        'profile': a.profile, 'about': profile['about'], 'extra_args': a.arg, 'fast_boot': a.fast_boot, 'default': a.default,
+        'timeout': a.timeout,
         'utc': a.utc, 'rtc_offset': a.rtc_offset, 'kc_has_rtc_calendar': kc_rtc, 'cmdlines': lines,
         'inputs': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in inputs.items()},
         'previous': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in prev.items()} if prev else None,
