@@ -168,7 +168,7 @@ python3 $P maint-boot map backup gpt store esp check maint-exit
 # session 2, RAM tests (nothing written; each takes ~240 s + the dump):
 python3 $P ram-esp-test         # boot-piano-esp-test-v2.img: UEFI log "config: volume VenHw(860845C1-…)/HD(37,GPT,3F8B0988-…"
 python3 $P ram-v4-signed        # the exact boot_a bytes; ABL takes vendor_boot_a/init_boot_a from the partitions
-python3 $P ram-precedence       # a dev RAM image: "config: volume VenHw(A9C6827C-…)", its own payload wins
+python3 $P ram-precedence       # out/ram-precedence (patched FD, data-persist=0): "config: volume VenHw(A9C6827C-…)", its own payload wins
 # session 3, maintenance RAM image:
 python3 $P maint-boot map backup boot-a check maint-exit     # + esp-final for daily use (default macos), + slot-success if needed
 # ABL fastboot:

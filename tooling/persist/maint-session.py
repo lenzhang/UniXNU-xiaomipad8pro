@@ -852,7 +852,8 @@ def ram_test(s, image, expect_uefi, reset_after):
         for line in r.stdout.splitlines():
             if re.search(r'NativeRamBlock: Data store|NativeUfs:.*(root|window|store)|panic\(|launchd\[1\]', line):
                 s.log('        | ' + line[:200])
-        lbas = re.findall(r'Data store state \d.*?first LBA (\d+)', r.stdout)
+        # state 0 = data-persist=0 (no store: the precedence image); 4 = refused, first LBA 0 (a failure worth stopping on)
+        lbas = re.findall(r'Data store state [1-4] .*?first LBA (\d+)', r.stdout)
         if lbas:
             s.need(all(int(x) == store_new(s) for x in lbas), f'the Data store opened at LBA {lbas[-1]} = {store_new(s)}')
         else:
@@ -1007,7 +1008,8 @@ def main():
     p.add_argument('--esp-final', default='esp-base-macos.img', help='the ESP image of step esp-final')
     p.add_argument('--boot-image', default='boot-piano-macos-persistent-v4-signed.img', help='the boot_a image (out/persistent)')
     p.add_argument('--dump-image', default=str(D / 'out/ram-dump/boot-piano-macos-ram-A-bundled.img'))
-    p.add_argument('--dev-image', default=str(D / 'out/ram/boot-piano-macos-ram-A-bundled.img'))
+    # ram-precedence's image: patched FD, data-persist=0 (another seed must not reset the installed system's store), reset 45 s
+    p.add_argument('--dev-image', default=str(D / 'out/ram-precedence/boot-piano-macos-ram-A-bundled.img'))
     p.add_argument('--session', type=Path, default=OUT / 'session')
     p.add_argument('--new-backup', action='store_true', help='start a new NAS backup set (the old one stays on the NAS)')
     p.add_argument('--http-port', type=int, default=8000)

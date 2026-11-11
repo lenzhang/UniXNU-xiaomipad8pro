@@ -86,3 +86,4 @@ seed df5579ddb4a1d9ec… (seed identity aced5bf9794b42f3…), `ESP_UTC=179435427
 |---|---|---|---|
 | `persistent/esp-gpu-diag.img` | 1073741824 | 97fecadfb84cc91ff5d64c6c7d99e9906de907e3c593d03c7cb80734716a5b18 | default `macos-diag` (session 1, RAM tests) |
 | `persistent/esp-gpu-macos.img` | 1073741824 | 1120f7d86ce688f9e122f863f59f71e50a5865e17227fa999824e2d331970615 | default `macos` (session 3, `esp-final`) |
+| `ram-precedence/boot-piano-macos-ram-A-bundled.img` | 203726848 | 7f8c2d6194d8c8c11f005572d107de6dbb495122ff14638c4e8557458faa4846 | `ram-precedence`'s dev image: patched FD, base inputs, reset 45 s, data-persist=0 (cannot reset the installed store) |
