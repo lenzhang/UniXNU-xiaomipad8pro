@@ -7,7 +7,7 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
   there), 148 files unchanged (sha256 equal to the originals). Hardware-proven on the 13T: S0-S10 and a GPU-composited desktop under
   iPadOS 17.7.11 (gpu-native-plan.md section 2). Changed, every change marked "UniXNU-piano" in a comment and compiled only with
   -DADRENO830_MACOS (the host tests build without it, so they test the upstream code paths):
-    Adreno830Start.cpp      215e565650d176cd28c2e11e79e098195474add04ea5ae054b15e9eaa4ff0b0f -> e4a432ac25417736258758740517c29ecbcfd89007af6d8d919584e3ddcf8b80
+    Adreno830Start.cpp      215e565650d176cd28c2e11e79e098195474add04ea5ae054b15e9eaa4ff0b0f -> fd611a6036d9205fd1d32dac288f512189d910b3ea941e95db75830592d46526
       S9 publishMetal without the iPadOS-only staged IOAcceleratorES (no IOGPUFamily load, no static class initializer, no
       g_kernel_kmod_info): prepare/commit report steps 4/5; the macOS accelerator is the kext's AGXAccelerator personality on the
       NativeAdrenoGpuPublished service native_adreno_publish registers. The 128 KiB cmd-db snapshot on the heap (allocated once by
@@ -26,10 +26,17 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       2026-11-11, the synchronous trace (piano-gpu-trace=3, docs/forensics-2026-11-11.md): traceAccess gives the tracer's lock back
       before it returns (as before) and then, when the access got a line of its own, calls the board hook boot_progress_trace_sync
       (weak no-op here), so the board can print that line from the caller's context before the access is made. Nothing else changes:
-      the tracer, its lock and the line format are upstream's.
+      the tracer, its lock and the line format are upstream's. 2026-11-11, the system suspend (A830Suspend.h, piano-gpu-suspend=1
+      through the board): a host-vote mutex (bindPower) the DCVS thread's idle votes and floor raises (dcvsIdleTick, dcvsHostDdr) take
+      and stand aside under while the suspend gate is shut; adreno830_suspend_gpu (A830PowerState::suspend), adreno830_suspend_votes
+      (the DDR to the display's floor or the keepalive minimum, then the rails through Sm8750RpmhHostRailsSet, a failure put back),
+      adreno830_resume_votes (rails, then DDR, as found), adreno830_resume_gpu (A830PowerState::resume) and adreno830_host_votes.
     A830Idle.h              (new)                                                            -> b90f05f80501078f9de1429a51d73b9644278b35ae8fcd167c15abc738848512
       2026-11-11, MIT, this repository's: the idle policy's configuration, the scanout's DDR floor, the idle votes' state machine, the
       transitions' line rule and the board hooks' declarations.
+    A830Suspend.h           (new)                                                            -> 4dd88c84392497ac4539bd4ddc9f9862a1f1aa93e70dbcdab3a683268443c019
+      2026-11-11, MIT, this repository's: the system suspend's configuration, the DDR and rail targets, the four-step machine, the
+      report and the orchestrator's entry points.
     A830Dcvs.h              2e3cfc36d1cedc7c912d42b5fdb743ca44326b7876f30379f0c9dabebd1944fa -> f2b18a507774a1beda67863c8d0dad5cd67e1100ddcde506de6efd8be4348ab3
     A830Dcvs.cpp            6e457f98e72fe052b4b7fb0057ea2a8003e78fbaa3cc8784b291270690a0f016 -> 661f3cdcc621bd83c26577085578765913d1915f7910a8645c08b83b88db6d51
       2026-11-11: A830DcvsConfig::idleWindowMs (the window while the governor idles at the floor; the first submission still wakes
@@ -37,22 +44,30 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       2026-11-11, docs/drivers/thermal.md §10.5: adreno830_dcvs_set_ceiling(khz), a reversible external ceiling (0 clears) below
       the knob and thermal ones, taken by init and every service tick (one wake per change); the board's "piano-gpu-ceiling"
       platform function calls it (PianoThermal's passive trip, later Low Power Mode). Without a caller nothing changes.
-    A830PowerState.h        0d0f10c3940e0be938714024fea1d13d51e311c0e8c45a8d8e8884a82adcb856 -> c85750d26c2b474ede32e7d9c750c360ed62cc5017d70a62ccd8cadd8e4bd478
-    A830PowerState.cpp      4ee2dc29829d0dacd6cf1e774a1a511a4ad91b1293e2664431ca8e8b4c15199c -> 19de8eacf5a3b57c4a876e1230ffdf39d0b19bbb9239e4148356572e43d8114b
+    A830PowerState.h        0d0f10c3940e0be938714024fea1d13d51e311c0e8c45a8d8e8884a82adcb856 -> 6260101645217ccc368ed7c5d00e40b196477b91143ce4fac624562805db6f03
+    A830PowerState.cpp      4ee2dc29829d0dacd6cf1e774a1a511a4ad91b1293e2664431ca8e8b4c15199c -> 7ca609f1ada2c3e0a835b070fcc76917f3b1b7fba3ad403fcf219529c7fd8940
       2026-11-11: A830PowerStats::slumberBlocked: a failed P1 slumber entry or wake ends P1 for the boot (as the screen rule's
-      screenBlocked; the recovery takes the GPU back as before).
-    platform/sm8750/Sm8750Rpmh.h a39f9324d152faf7b83063d71784555031d5c4e4f142b359478ccf656562843f -> b8f948fb6359368e79e00a7fe310b3daede1b9078b072d0cdfece469ddb4787f
-    platform/sm8750/Sm8750Rpmh.c 5ef9d62301c3519eb447da85b475cf477367b9dc53b12ad1f1ef1ac82a1a7f1d -> 48195157ca191fe7667c491575f58bb4007393cbcabc56091f5945194a479f20
+      screenBlocked; the recovery takes the GPU back as before). 2026-11-11, the system suspend's gate (A830Suspend.h): suspend()
+      shuts it (acquire() then waits for resume() without the mutex, up to A830PowerConfig::suspendWaitMs, instead of waking the GPU;
+      wakeLocked refuses every reason but the new A830WakeSuspend; tick() does nothing), waits for quiet and enters the full slumber
+      through the existing enterLocked (from a CX-keeping slumber through a wake); resume() opens it and optionally wakes the GPU.
+    platform/sm8750/Sm8750Rpmh.h a39f9324d152faf7b83063d71784555031d5c4e4f142b359478ccf656562843f -> ce528d8560e0c081019fb47b61407c8f6da0648d79ec18bade06cd51b75e2f54
+    platform/sm8750/Sm8750Rpmh.c 5ef9d62301c3519eb447da85b475cf477367b9dc53b12ad1f1ef1ac82a1a7f1d -> 2afbbe8c4b8d7fb6effa1e30bfc2a1a56fb94c6149e5af752b5bcbfa7c9692a5
       2026-11-11: Sm8750RpmhHostRailsIdle, the idle rails (lowering only, cx first, one TCS through Sm8750RpmhWriteActive and its
-      DRV-2 lock).
+      DRV-2 lock). 2026-11-11: Sm8750RpmhHostRailsSet, the rails at given levels (the suspend's, hlvl 0 included; mx first when
+      either rises, cx first when both fall; one TCS, the same lock).
     tests/A830PowerFakes.h  2993b53b13f77646b43ca807861e77083d16050ff3e4e3774e3688c3a0fdd040 -> 39d3da9e3549693516d59f9e0ba6e4e310c917591e632778cd639214ad638ed2
-    tests/test_start.cpp    83099b66827778ab36df93100fe1301c3c8dd284108bb2c2e06ec265ee986a47 -> f2b02bf5e4a2be90a0bcb6b9cd3ff5c5a9017215ad2842b9b0dffea6f8ee0905
-    tests/test_sm8750_rpmh.c be1c38fb9ada8dbb8ee084d9e13331640092d0883452feceff293abbdb226cc5 -> 75f7aa75ae9722e10de3c41c8dc1c959a057b061fa8fdbea77995db8e03758ec
+    tests/test_start.cpp    83099b66827778ab36df93100fe1301c3c8dd284108bb2c2e06ec265ee986a47 -> 4928f5d385e7aff69951db42dc027a71769a21ba06e3f5cd309c713d5b2c274f
+    tests/test_sm8750_rpmh.c be1c38fb9ada8dbb8ee084d9e13331640092d0883452feceff293abbdb226cc5 -> aba4c2af9df5b9744a5697c5f68916ff49007022e93d0add78473ecfab7253bc
     tests/test_a830idle.cpp (new)                                                            -> 94e91269cf6394b33297b022eccc0ddce0ccec2bbfc3cc10f0db0e8d39743ae9
       2026-11-11, the ADRENO830_MACOS pass only where the code is: the idle ops field in the fakes' table, the RPMh double and the
       board hooks of test_start (mode 0 unless a case sets it; the pinned PASS line unchanged, a line of its own for piano-gpu-idle),
       the idle rails' TCS order, lock and refusals in test_sm8750_rpmh; test_a830idle (both passes): the scanout floor, the idle
       votes' state machine and line rule, the DCVS floor and idle window, the idle hook, the external ceiling, slumberBlocked.
+    tests/test_a830suspend.cpp (new)                                                         -> ed876b04e4bf319ddc34f5a71fbbc8ef61b8f47ab37a3785f2d21cd5e2b87d2d
+      2026-11-11, the system suspend: test_a830suspend (both passes: the targets and the four-step machine; ADRENO830_MACOS: the gate
+      on the register model), the suspend/resume and RailsSet doubles and the orchestrator's cases in test_start (a PASS line of its
+      own), RailsSet's TCS order, lock and refusals in test_sm8750_rpmh.
     NativeAdrenoPublish.cpp d2a85cbcb4ad29df03a05c9f4e3edc0120358ab90a731cb61b083accf93bd31f -> 4d31149ca8ffdb359d6261ddfcb38fd032064624822c7d2cbf23d6ff310d5607
       the render server is WindowServer (kRenderServer/isRenderServer at the six "backboardd" sites, as UniXNU Adreno740 7487f72);
       native_adreno_fences() for the display's fence rule (as Adreno740's, over the ring's lastSubmitted and the memptrs fence word).
@@ -117,5 +132,6 @@ Data (facts, not code):
   The firmware identities of xiaomipad-8pro-mainline firmware/piano-gpu.json (OS3.0.303.0.WPYCNXM): board/piano-gpu-firmware.json.
   The firmware itself is never in this repository (embedded at build time from the ignored out/native-kexts/PianoA830/firmware).
 
-Specification only (never copied): Linux drm/msm, KGSL, clk/qcom (GPL-2.0). Adreno830's A830Regs.h and the generated A830HwInit.h
-are register facts as upstream ships them; nothing was added from GPL sources.
+Specification only (never copied): Linux drm/msm, KGSL, clk/qcom, soc/qcom llcc-qcom (GPL-2.0; llcc-qcom for the LLCC v6 slice
+layout and ISLAND1's entry behind board/PianoLlccIsland.h, the facts in docs/ubuntu-history/kernel.md §2.2). Adreno830's A830Regs.h
+and the generated A830HwInit.h are register facts as upstream ships them; nothing was added from GPL sources.
