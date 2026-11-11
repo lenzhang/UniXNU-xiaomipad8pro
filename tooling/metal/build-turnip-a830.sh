@@ -112,6 +112,25 @@ export PATH="/opt/homebrew/opt/bison/bin:$O/venv/bin:/opt/homebrew/bin:$PATH" CC
 # identity, and data-persist=2's store with it, then survives a rebuild).
 export PYTHONHASHSEED=0
 OPTS_ID=$(printf '%s\n' "${OPTS[@]}" | shasum -a 256 | cut -c1-16)
+# The build directory must be meson's for this checkout's $O/mesa and $O/build. Mesa's vk_error/mesa_log macros embed __FILE__, the
+# source path as the compile command names it, relative to the build directory: ../mesa/src/... (src/... for generated files), the
+# same from every checkout. A build directory copied from another checkout (cp -R of out/turnip-a830, as on 2026-11-12) keeps that
+# checkout's source directory in its coredata; `meson configure` below (the abi-dir option names this checkout) then regenerates it
+# against the other tree, every command names the sources as ../../../../../../out/turnip-a830/mesa/..., and the longer strings make
+# another libvulkan_freedreno.dylib: another CDHash, another staged seed. Such a directory is set up again here.
+if [ -f "$O/build/build.ninja" ] && ! python3 - "$O/build/meson-info/meson-info.json" "$O/mesa" "$O/build" <<'EOF'
+import json, os, sys
+info, source, build = sys.argv[1:]
+try:
+    d = json.load(open(info))['directories']
+except (OSError, ValueError, KeyError):
+    sys.exit(1)
+sys.exit(0 if os.path.realpath(d['source']) == os.path.realpath(source) and os.path.realpath(d['build']) == os.path.realpath(build) else 1)
+EOF
+then
+  echo "mesa: $O/build was configured for another source or build directory (copied from another checkout?): set up again"
+  rm -rf "$O/build" "$O/options.stamp"
+fi
 if [ ! -f "$O/build/build.ninja" ]; then
   meson setup "$O/build" "$O/mesa" --wrap-mode=nodownload --cross-file "$O/cross.ini" "${OPTS[@]}" > "$O/configure.log" 2>&1 \
     || { tail -20 "$O/configure.log" >&2; exit 1; }
@@ -220,4 +239,8 @@ for f in NativeAdrenoMetal libvulkan_freedreno.dylib; do
   echo "$f: $(codesign -dv --verbose=4 "$B/MacOS/$f" 2>&1 | sed -n 's/^CDHash=//p' | head -1) $(lipo -archs "$B/MacOS/$f") $(stat -f %z "$B/MacOS/$f") bytes"
 done
 grep -h 'frontend edit skipped' "$O/plugin/frontend-patch.log" || true
+# 7. The bundle must not depend on where this checkout is: its CDHashes go into the installed trust cache and its files into the
+#    system layer (docs/data-store.md section 9), so main and every worktree have to build the same bytes. A path of this checkout, a
+#    worktree's, or a source path that climbs out of out/turnip-a830 (the copied build directory of step 4) stops the build here.
+python3 "$D/tooling/metal/check-bundle-paths.py" "$O/NativeAdrenoMetal.bundle" --checkout "$D" || exit 1
 echo "$O/NativeAdrenoMetal.bundle (Turnip on $(basename "$(dirname "$ABI")")/NativeAdrenoABI.h v2)"
