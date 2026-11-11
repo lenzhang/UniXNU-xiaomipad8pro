@@ -29,9 +29,9 @@ one-time switch that starts the store over (the owner's Data changes are dropped
 store silently: refused then, unless --replace-data says so. --flatten-data adds data-store-flatten=1 (the store of this ESP's seed
 becomes self-contained at its next boot; a no-op once it is).
 
-The clock (docs/drivers/rtc.md): droidvm-utc=<--utc> is always there, the OS image's settime.sh sets it when the calendar is still
-near 1970. --rtc-offset N (measured once: tooling/native/rtc-offset.py) adds piano-rtc=1 piano-rtc-offset=N, --rtc-offset sdam only
-piano-rtc=1 (the offset from the PMIC's SDAM cell): the kernel (k27 0060, checked in the collection) then starts the calendar from the
+The clock (docs/drivers/rtc.md, docs/k27-userland-args.md): droidvm-utc=<--utc> is always there, the OS image's settime.sh sets it
+when the calendar is still near 1970. --rtc-offset N (measured once: tooling/native/rtc-offset.py) adds piano-rtc=1
+piano-rtc-offset=N, --rtc-offset sdam only piano-rtc=1 (the offset from the PMIC's SDAM cell): the kernel (k27 0060, checked in the collection) then starts the calendar from the
 PMIC RTC, settime.sh sees a set clock and leaves it, and droidvm-utc only matters when the RTC gives no date.
 The sensors (docs/drivers/sensors.md section 5): --sensor-pack PACK puts this tablet's own sensor pack (made by
 package/PianoSensors/tools/make-sensor-pack.py under the ignored out/ or private/) at EFI/UniXNU/piano-sensors.pack, where PianoSensors
@@ -168,14 +168,19 @@ def adt_vmm_present(path):
     return None
 
 
+# The VM-era kexts' bundle identifiers (the native kext rule's denylist, tooling/k27/check-native-kexts.py): their legacy
+# "DroidVM" name and the virtio block kext. None may be in an installed collection.
+VM_ERA_BUNDLE = re.compile(rb'com\.[A-Za-z0-9.]*[Dd]roid[Vv][Mm][A-Za-z0-9.]*|com\.unixnu\.driver\.NativeVirtioBlock')
+
+
 def kc_bundles(path):
     data = Path(path).read_bytes()
     if data[:4] != b'\xcf\xfa\xed\xfe' or int.from_bytes(data[12:16], 'little') != 12:
         raise SystemExit(f'{path}: not an MH_FILESET kernel collection')
     natives = sorted({m.decode() for m in re.findall(rb'com\.unixnu\.driver\.[A-Za-z0-9]+', data)})
-    droidvm = sorted({m.decode() for m in re.findall(rb'com\.[A-Za-z0-9.]*[Dd]roid[Vv][Mm][A-Za-z0-9.]*', data)})
+    vm_era = sorted({m.decode() for m in re.findall(VM_ERA_BUNDLE, data)})
     rtc = b'piano-rtc: count %u + offset %u' in data   # the kernel has k27 0060
-    return natives, droidvm, rtc
+    return natives, vm_era, rtc
 
 
 def rtc_args(value):
@@ -307,9 +312,10 @@ def main():
         if not path.is_file():
             raise SystemExit(f'{n}: {path} is missing')
     pack = check_sensor_pack(a.sensor_pack) if a.sensor_pack else None
-    natives, droidvm, kc_rtc = kc_bundles(inputs['kc'])
-    if droidvm:
-        raise SystemExit(f'{inputs["kc"]} links {droidvm}: no DroidVM kext natively (docs/PROJECT-MAP.md rule 8)')
+    natives, vm_era, kc_rtc = kc_bundles(inputs['kc'])
+    if vm_era:
+        raise SystemExit(f'{inputs["kc"]} links {vm_era}: the native kext rule allows only this repository\'s kexts '
+                         '(docs/PROJECT-MAP.md rule 8)')
     if a.rtc_offset is not None and not kc_rtc:
         raise SystemExit(f'--rtc-offset: the kernel in {inputs["kc"]} has no k27 0060 (build the collection with '
                          'K27_KERNEL=<kernel-k27-0060-native.macho> tooling/k27/build-native-image.sh)')
