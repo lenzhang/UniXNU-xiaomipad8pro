@@ -48,8 +48,8 @@ hypervisor family, "K90" = an SM8750 phone). Every offset is in `package/PianoDp
 - Refresh: modes and rate registers in `panel-novatek-nt36532.c` (§2); Ubuntu switches by full modeset; SunUEFI's
   `0002-display.patch` (`msm_dsi_host_update_vfp`, `dpu_hw_intf_update_vtotal`) is the seamless VFP path to follow.
 - Panel off (K:72cfce4c86e5, "use the P81 stock shutdown timing"): DCS display-off 0x28, 20 ms, sleep-in 0x10, 100 ms, reset
-  asserted, supplies off in reverse with post-off waits avee 2 ms, avdd 3 ms, vddio 2 ms. On: supplies, reset 1/10, 0/3, 1/3,
-  0/15 ms (active low), the init (vendor block, DSC PPS, B2/B3), sleep-out 0x11, 120 ms, display-on 0x29. Teardown (K:c55958fa09dd,
+  asserted, supplies off in reverse with post-off waits avee 2 ms, avdd 3 ms, vddio 2 ms. On: supplies, reset pin (active low)
+  physically 0 for 10 ms, 1 for 3, 0 for 3, 1 for 15, the init (vendor block, DSC PPS, B2/B3), sleep-out 0x11, 120 ms, display-on 0x29. Teardown (K:c55958fa09dd,
   K:b7a813e2245c, K:608ff1b238a0): stop the slave INTF timing engine, then the master; reset the shared CTL only after both stopped;
   DSI host 1 off before host 0, PHYs after; never reset MDSS while the panel scans (v0.3.1: 42 clean DPMS cycles).
 - Night Light: GNOME's gamma LUT through GC v2 over REGDMA (`dpu_hw_gcv2.c`); `dpu_crtc.c` maps a CTM to the PCC (S3.15).
@@ -89,7 +89,8 @@ the live stream reset the SoC on Linux); the bank itself is reprogrammed in plac
 **4.3 Refresh switching (B1c).** 120 ↔ 60 Hz is a VFP-only change: no DCS command (B2/B3 are the same), no clock change, no DSC or
 touch impact (SunUEFI ran 30/48/50/60/120 seamlessly). At a frame boundary, on both links: DSI DB_MODE = 1, TOTAL.V_TOTAL = 4620 − 1
 (2310 − 1 back), TIMING_FLUSH = 1; INTF1/INTF2 VSYNC_PERIOD_F0 = 4620·htotal; CTL_INTF_FLUSH (INTF1|INTF2) + CTL_FLUSH b31; DB_MODE =
-0 after the latch. Programmable fetch must stay off (it is on the 120 Hz family: VBP+VSYNC 106 ≥ 24 lines). Policy: 60 Hz after
+0 after the latch. Programmable fetch stays off (the 120 Hz family has 106 lines of VSYNC+VBP, more than the 24-line worst case, so
+none is needed; a moving prefetch offset would need its own update). Policy: 60 Hz after
 ~1 s without swaps, 120 Hz on the next swap burst; WindowServer keeps seeing one 120 Hz timing (frames simply take two periods
 while idle) or, later, a 60/120 pair. 90/144 change HFP and the panel's rate group (B2/B3 over the DSI command path while video runs):
 a full modeset in both Linux ports, and more power, so not planned. Risks: a missed DSI/INTF pairing shows a grey or torn screen
