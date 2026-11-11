@@ -317,9 +317,9 @@ K27_KERNEL=$PIANO_K27_TREE/out/k27/kernel-k27-0063-native.macho PIANO_GPU=2 PIAN
 tooling/k27/build-pm-test-images.sh ufssleep0 ufssleep1 ufsahit ufsahitsleep ufsmeasure     # out/ram-pm-<name>, out/ram-pm-dump
 ```
 Built offline 2026-11-11 in a worktree (inputs cloned from the main checkout; the Turnip stage's seed `8f333110`, so Data volatile by
-the store guard): KC with the 21 native kexts `97cded32da2dab22…` (vtable checks clean, the native kext rule passed); images
-`ram-pm-ufssleep0` `91059b08…`, `ufssleep1` `ee2793a0…`, `ufsahit` `dd4fa718…`, `ufsahitsleep` `7870d245…`, `ufsmeasure`
-`365ff938…`. Rebuild in the main checkout before a run.
+the store guard; main at `9867677`): KC with the 21 native kexts `ec08b6ec615c3a58…` (kernel `ee596f39be1ded3c…`, vtable checks
+clean, the native kext rule passed); images `ram-pm-ufssleep0` `c9911d1c…`, `ufssleep1` `21ce6e8b…`, `ufsahit` `fbff2d53…`,
+`ufsahitsleep` `0cb35956…`, `ufsmeasure` `66dc3682…`. Rebuild in the main checkout before a run.
 
 ### 12.8 The tablet tests (batched; in the order of risk, after `../power.md` §6 S1 and S2 passed)
 
