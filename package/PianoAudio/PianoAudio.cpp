@@ -1,16 +1,24 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // PianoAudio: the speakers and microphones of piano (SM8750: four FourSemi FS19xx amplifiers on the I2C hub's SE0 and the LPAIF
 // secondary TDM interface, DMICs on the LPASS VA macro, all driven through the audio DSP's AudioReach graph manager) for macOS 27,
-// native at EL1. Design, ladder and test plan: docs/drivers/audio.md. Facts and their sources: AudioHw.h. This is level 1 only:
+// native at EL1. Design, ladder and test plan: docs/drivers/audio.md. Facts and their sources: AudioHw.h. The levels (each runs the
+// ones below it):
 //   piano-audio=1  a read-only survey of what the boot stages left of the audio path, logged as "PianoAudio: ..." lines: the main
 //                  TLMM's configuration and level of the amplifiers' bus (gpio64/65), reset (gpio129/108/128/107) and interrupt
 //                  (gpio84/67/66/81) pins and of the TDM pins (gpio121-124), and the apps SMMU's stream-match entries of the DSP's
-//                  PCM streams 0x1001/0x1041. Nothing is written: every MMIO access of this level is a load (AudioSurvey.h has no
-//                  store at all). Not read: the amplifiers (a bus transaction needs writes), the I2C hub's engine, every LPASS block
-//                  (their clocks are the DSP's), the DSP. No firmware, preset or topology file is read.
+//                  PCM streams 0x1001/0x1041. Every MMIO access of this level is a load (AudioSurvey.h has no store at all).
+//   piano-audio=2  the DSP link (AudioDsp.cpp), only with piano-power=2 in the same boot (PianoPower owns and starts the DSP; this
+//                  driver never starts, stops or restarts it and votes nothing): the channel adsp_apps registered through PianoPower's
+//                  client contract, its health watched, and one question asked of the DSP's graph manager: is it ready. Nothing else.
+//   piano-audio=3  also the macOS devices (PianoAudioDevice.cpp): "Speaker" and "Mic" as IOAudio2Devices on the null transport (their
+//                  own clock, silence both ways: nothing reaches any hardware).
+// Not run by any level yet (host-tested only): the amplifiers (Fs19xx.c), the graphs and their unwinding (AudioSequence.c), the
+// speaker-safety chain (AudioSafety.c). No firmware, preset or topology file is read.
 // Other arguments: piano-audio-delay=S (wait S seconds first, default 0), piano-audio-repeat=S with piano-audio-samples=N (resample
-// the pins every S s, N times, default 3, one summary line each), piano-audio-smmu=0 (skip the SMMU reads). Without piano-audio the
-// driver declines in probe() and maps nothing. Levels above 1 are not implemented; they run level 1.
+// the pins every S s, N times, default 3, one summary line each), piano-audio-smmu=0 (skip the SMMU reads), piano-audio-dsp=0 (skip
+// the DSP link), piano-audio-dsp-wait=S (give it up after S seconds, default 300), piano-audio-settle=S (the charger domain up this
+// long before the first packet, default 20), piano-audio-device=0 (no macOS devices). Without piano-audio the driver declines in
+// probe() and maps nothing.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -21,6 +29,8 @@
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include "AudioSurvey.h"
+#include "AudioLog.h"
+#include "AudioPcm.h"
 
 using namespace pianoaudio;
 
@@ -32,7 +42,7 @@ volatile int32_t piano_audio_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, smmu, delay, repeat, samples;
+  uint32_t level, smmu, delay, repeat, samples, dsp, dspWait, settle, device, power;
 };
 Args gArgs;
 
@@ -53,6 +63,13 @@ void readArgs()
   if (gArgs.repeat > 3600) gArgs.repeat = 3600;
   gArgs.samples = bootArg("piano-audio-samples", 3);
   if (gArgs.samples > 100) gArgs.samples = 100;
+  gArgs.dsp = bootArg("piano-audio-dsp", 1);
+  gArgs.dspWait = bootArg("piano-audio-dsp-wait", 300);
+  if (gArgs.dspWait > 3600) gArgs.dspWait = 3600;
+  gArgs.settle = bootArg("piano-audio-settle", 20);
+  if (gArgs.settle > 600) gArgs.settle = 600;
+  gArgs.device = bootArg("piano-audio-device", 1);
+  gArgs.power = bootArg("piano-power", 0);   // PianoPower's level: the DSP runs only with 2 or more
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -65,6 +82,20 @@ void note(const char *fmt, ...)
   va_end(ap);
   IOLog("PianoAudio: %s\n", line);
 }
+
+}  // namespace
+
+extern "C" void piano_audio_log(const char *fmt, ...)
+{
+  char line[400];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(line, sizeof line, fmt, ap);
+  va_end(ap);
+  IOLog("PianoAudio: %s\n", line);
+}
+
+namespace {
 
 void stage(int32_t value, const char *what)
 {
@@ -209,7 +240,9 @@ void summary(const Summary &m, const char *smmu, char *line, size_t size)
 class PianoAudio : public IOService {
   OSDeclareDefaultStructors(PianoAudio)
   void run();
+  void devices();
   static void thread(void *self, wait_result_t);
+  static void devicesThread(void *self, wait_result_t);
 
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
@@ -230,8 +263,9 @@ bool PianoAudio::start(IOService *provider)
   if (!IOService::start(provider)) return false;
   note("start: piano-audio=%u smmu=%u delay=%u repeat=%u samples=%u (4 x FS19xx on i2c hub 0 %#x, secondary TDM on gpio121-124)",
        gArgs.level, gArgs.smmu, gArgs.delay, gArgs.repeat, gArgs.samples, 0x980000u);
-  if (gArgs.level > 1) note("piano-audio=%u: only level 1 exists (docs/drivers/audio.md section 8); running level 1", gArgs.level);
-  note("level 1: loads only, nothing written");
+  if (gArgs.level > 3) note("piano-audio=%u: levels 4 and up are host-tested code only (docs/drivers/audio.md section 8); running 1-3", gArgs.level);
+  note("level 1: loads only, nothing written%s%s", gArgs.level >= 2 ? "; level 2: the DSP link (one readiness query)" : "",
+       gArgs.level >= 3 && gArgs.device ? "; level 3: the macOS devices on the null transport" : "");
   setProperty("piano-audio", gArgs.level, 32);
   thread_t t = nullptr;
   if (kernel_thread_start(&PianoAudio::thread, this, &t) != KERN_SUCCESS) {
@@ -239,7 +273,42 @@ bool PianoAudio::start(IOService *provider)
     return true;
   }
   thread_deallocate(t);
+  if (gArgs.level >= 3 && gArgs.device) {
+    if (kernel_thread_start(&PianoAudio::devicesThread, this, &t) == KERN_SUCCESS) thread_deallocate(t);
+    else note("devices: no thread");
+  }
   return true;
+}
+
+void PianoAudio::devicesThread(void *self, wait_result_t)
+{
+  thread_set_thread_name(current_thread(), "piano-audio-devices");
+  static_cast<PianoAudio *>(self)->devices();
+}
+
+// Level 3: the macOS devices once IOBSD is up (DroidVMAudio's starter matched IOResources' IOBSD for the same reason: the family's
+// kext load and the HAL's matching come after it).
+void PianoAudio::devices()
+{
+  OSDictionary *bsd = IOService::resourceMatching("IOBSD");
+  IOService *matched = bsd ? IOService::waitForMatchingService(bsd, 120ull * 1000 * 1000 * 1000) : nullptr;
+  OSSafeReleaseNULL(bsd);
+  if (!matched) {
+    note("devices: IOBSD not up within 120 s; no devices");
+    return;
+  }
+  matched->release();
+  const PianoPcmTransport *transport = piano_pcm_null();
+  const int r = piano_audio_devices_attach(transport);
+  char line[160];
+  if (r < 0)
+    snprintf(line, sizeof line, "none (stage %d: %s)", piano_audio_devices_stage(),
+             piano_audio_devices_stage() == -2 ? "IOAudio2Family's IOAudio2Device / IOAudio2DeviceUserClient not found" : "publishing failed");
+  else
+    snprintf(line, sizeof line, "%s%s%s as IOAudio2Devices on the %s transport (silence: nothing reaches the hardware)",
+             r & 1 ? "Speaker" : "", r == 3 ? " and " : "", r & 2 ? "Mic" : "", transport->name);
+  setProperty("piano-audio-devices", line);
+  note("devices: %s", line);
 }
 
 void PianoAudio::thread(void *self, wait_result_t)
@@ -279,7 +348,22 @@ void PianoAudio::run()
     summary(summarize(again), smmu, line, sizeof line);
     note("sample %u (+%u s): %s", i, i * gArgs.repeat, line);
   }
-  stage(4, "done");
-  note("done: %llu MMIO loads, 0 stores; %u pages mapped, %u map failures", (unsigned long long)gLoads, gPageCount, gMapFailures);
+  stage(4, "survey done");
+  note("survey done: %llu MMIO loads, 0 stores; %u pages mapped, %u map failures", (unsigned long long)gLoads, gPageCount, gMapFailures);
   unmapAll();
+  if (gArgs.level < 2) return;
+  if (!gArgs.dsp) {
+    note("level 2: the DSP link skipped (piano-audio-dsp=0)");
+    return;
+  }
+  if (gArgs.power < 2) {
+    note("level 2: piano-power=%u: the DSP does not run in this boot (PianoPower starts it at 2); no channel registered", gArgs.power);
+    setProperty("piano-audio-dsp", "not run: piano-power below 2");
+    return;
+  }
+  stage(5, "the DSP link: adsp_apps, PianoPower's health, the APM readiness query (nothing else is sent)");
+  char summary[200];
+  const int r = piano_audio_dsp_link(gArgs.dspWait, gArgs.settle * 1000, summary, sizeof summary);
+  setProperty("piano-audio-dsp", summary);
+  stage(r ? -5 : 6, r ? "the DSP link did not reach APM ready" : "the DSP link: APM ready");
 }
