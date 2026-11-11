@@ -3,7 +3,7 @@
  * engine thread hands it one period at a time, interleaved S16 at 48 kHz (the speaker's stereo out, the microphone's mono in).
  *   null  (this file): takes every output period and gives no input, so the devices run on their own clock into silence (the HAL
  *         still has a default output; nothing reaches any hardware)
- *   dsp   (level 7, not written yet): play() is audio_output_period (AudioSafety.h: slots, DC blocker, gain, fade, ceiling) into the
+ *   dsp   (level 8, not written yet): play() is audio_output_period (AudioSafety.h: slots, DC blocker, gain, fade, ceiling) into the
  *         ring the DSP pump (AudioSequence.h ArPump) drains in 10 ms periods; running() starts and stops the speaker plan
  * running() is called with the engine thread stopped; play() and capture() from that thread only. */
 #ifndef PIANO_AUDIO_PCM_H

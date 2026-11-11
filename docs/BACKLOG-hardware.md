@@ -32,7 +32,7 @@ Standing constraints for every item:
 | CPU frequency, power modes, thermal | PianoThermal (`piano-thermal`, `piano-cpufreq=1..3`: Ubuntu's Power Saver/Balanced caps) | macOS Low Power Mode mapping → B5; PMIC board thermistors → B6 |
 | GPU acceleration | PianoA830 + Turnip | idle power: `piano-gpu-idle` (1 the default, 2 to A/B on the tablet: gpu.md §8) |
 | Suspend (s2idle, CX off) | k27 cpuidle/s2idle patch + power contract (in flight) | lid/keyboard/charging policies → B2, B4 |
-| Speakers, microphones | PianoAudio levels 1-3 built (survey; DSP link on PianoPower's contract; Speaker/Mic IOAudio2Devices on a null transport) + host-tested FS19xx core, AudioReach graphs and sequencer, speaker-safety chain (`audio.md` §7.1) | tablet: levels 2 and 3 (`audio.md` §8.2-8.3); then 4-10 (5–8 weeks) |
+| Speakers, microphones | PianoAudio levels 1-7 built and host-tested (survey; DSP link with selectable GPR ports; Speaker/Mic IOAudio2Devices on a null transport; the LPASS clocks through PRM; the four amplifiers on a bit-banged bus with the owner's preset from the ESP; the speaker and mic graphs with silence; the tone walk behind `piano-audio-tone=1`) (`audio.md` §7.1) | tablet: the batch of `audio.md` §8.8 (6-8 boots, the last attended); then 8-10 (3-5 weeks) |
 | Boot time (Ubuntu: ~13 s to login) | `docs/boot-time.md`, `PIANO_FAST_BOOT` | ours ~150 s; keep cutting |
 
 ## 2. Backlog (new tasks)
