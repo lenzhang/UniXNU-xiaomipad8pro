@@ -10,6 +10,11 @@
 > **2026-11-11, later: a network link over the same cable**, opt-in with `piano-usb-net=1`: a CDC-NCM function after the serial
 > ports, which the Mac's own NCM driver shows as an Ethernet interface, and on the tablet `PianoUsbNet`, an IOEthernetController
 > (not built-in; en0 stays PianoNullEthernet's). Built, host-tested, linked; **not run on hardware yet**. §14.
+>
+> **2026-11-11, battery: the USB thread no longer wakes every 1 ms.** Its wait follows the link (1 ms only while something
+> moves, 20 ms with a port open, 50 ms configured, 250 ms with no host); `piano-usb-irq=1` adds the core's interrupt (SPI 133).
+> Default on for the adaptive wait, the interrupt opt-in; `piano-usb-idle=0` is the old loop. Not run yet. §15 and
+> [`../power-irq.md`](../power-irq.md).
 
 
 Status: design and code, 2026-11-11. Built, host-tested and linked into a test KC (`out/k27/kc-k27-usb-test.bin`); **not
@@ -37,7 +42,7 @@ to watching the log and asking the kernel questions while it runs.
 | Item | Value | Source | State |
 |---|---|---|---|
 | Controller | `usb@a600000`, `qcom,sm8750-dwc3` + `qcom,snps-dwc3`, reg `0xa600000` + `0xfc100` (flattened qcom binding: QSCRATCH inside), `dr_mode = "otg"`, `maximum-speed = "super-speed"`, `usb-role-switch`, `dma-coherent`, quirks `snps,dis_u2_susphy_quirk`, `snps,dis_enblslpm_quirk`, `snps,usb2-gadget-lpm-disable`, `snps,dis-u1/u2-entry-quirk` | piano DT (`out/inputs/piano-boot.dtb`) | verified |
-| Interrupts | `dwc_usb3` GIC SPI 133 level-high; `pwr_event` SPI 130, `hs_phy_irq` SPI 131; dp/dm/ss on the PDC (14/15/17) | DT | verified; **not used** (polled, `GEVNTSIZ.INTMASK`) |
+| Interrupts | `dwc_usb3` GIC SPI 133 (INTID 165) level-high; `pwr_event` SPI 130, `hs_phy_irq` SPI 131; dp/dm/ss on the PDC (14/15/17 → SPI 759/760/762) | DT | verified; SPI 133 used with `piano-usb-irq=1` (§15), else polled (`GEVNTSIZ.INTMASK` set) |
 | SMMU | `iommus = <&apps_smmu 0x40 0x0>`; apps SMMU `0x15000000` + 1 MiB (`qcom,sm8750-smmu-500`); piano's SMMU: IDR1 `0x60000053` (83 banks, 128 pages), NativeUfs puts SID 0x60 on bank 82 | DT; `logs/native-runs/20261111-004859-loop` | verified |
 | Power domains | `USB30_PRIM_GDSC` GCC `0x39004` (DT power-domains gcc 4), `USB3_PHY_GDSC` `0x50018` | gcc-sm8750.c; OnePlus 13 DT | verified (source); state after ExitBootServices: needs-boot |
 | Clocks (GCC base `0x100000`) | master `0x39018` (RCG `0x39030`, 200 MHz assigned), sleep `0x39028`, mock_utmi `0x3902c` (RCG `0x39048`, 19.2 MHz), cfg_noc_usb3_axi `0x3908c` and aggre_usb3_axi `0x39090` (voted), phy aux/com_aux/pipe `0x39064/68/6c` | gcc-sm8750.c (offsets), DT `assigned-clock-rates` | verified (source) |
@@ -152,6 +157,9 @@ IOPlatformExpertDevice ── PianoDwc3 (start, matching thread)   read-only pro
 | `piano-usb-hid-hold=MS` | 3000 | a key or button still down this long after the last input command is released |
 | `piano-usb-net=1` | 0 | (needs `piano-usb=2`) the CDC-NCM network function after the ports and its Ethernet interface on the tablet (§14); without it the USB device is exactly the ACM-only one |
 | `piano-usb-net-fifo=0` | 1 | with `piano-usb-net=1`: keep the TX FIFO sizes the core reset left instead of the plan of §14.2 (a first-run experiment) |
+| `piano-usb-idle=0` | 1 | the old USB loop (1 ms after every quiet pass) instead of the adaptive wait of §15 |
+| `piano-usb-irq=1` | 0 | the core's interrupt (SPI 133) ends the USB thread's waits (§15); falls back to polling by itself |
+| `piano-wake-log=S` | 60 | the `idle: N wakeups in S s` line every S seconds (0 none; shared with PianoInput and PianoTouch) |
 
 On the Mac (no root, standard library only; logs go to `logs/usb-console/`, gitignored):
 
@@ -534,3 +542,28 @@ PianoDwc3: net: link up, en1 up; to the Mac 12 frames 1480 bytes (9 NTBs), from 
 - **Throughput**: one 16 KiB NTB in flight each way on a polled loop; fine for ssh and NTP, slow for large copies.
 - **Security**: whatever the tablet serves on this link (sshd, a shell) is reachable from the Mac (and with Internet Sharing from
   nothing else: NAT); development tablets only, as the user pipe.
+
+## 15. Power: the USB thread's wait (`piano-usb-idle`, `piano-usb-irq`)
+
+Until 2026-11-11 the USB thread slept 1 ms after every pass without events, forever: about 1000 wake-ups a second even with
+no cable. Now (`UsbIdle.h`, host-tested by `tests/usb_idle_host.cpp`) each pass picks a tier: **busy** 1 ms (an event, log
+bytes moved or a kick within 200 ms, a control transfer past its SETUP, bytes waiting for a free IN endpoint), **open** 20 ms
+(configured with a port's DTR or the NCM link: the kernel-log pump), **configured** 50 ms, **no host** 250 ms (nothing
+configured and no event for 3 s, or the link in suspend / disconnected / early suspend). The console and pipe writers, the
+pipe, HID and network readers and the network output queue kick the thread, so their data never waits for a period. The HID
+thread waits 100 ms only while a key or button is held (the auto-release), 60 s otherwise.
+
+`piano-usb-irq=1`: `armcpu_spi_attach(165, level)`; the handler masks the event buffer's interrupt (GEVNTSIZ bit 31) when
+GEVNTCOUNT is non-zero and kicks the thread; the thread takes the events and unmasks before each wait, so events that came in
+between raise the line at once. The periods become 10 / 20 / 200 / 1000 ms (bookkeeping: EP0 watchdog, log pump, DSTS). A
+storm (more than 2000 entries in 100 ms with nothing to mask) disables the line at the GIC; three timed-out waits in a row
+with events pending and the line unmasked mean it is not delivered; either way the thread masks it for good and polls
+(`irq: off (...)`). Opt-in until a run shows delivery (the first native SPI; [`../power-irq.md`](../power-irq.md) §2).
+
+Lines: `wait: polled, adaptive (busy 1 ms, port open 20 ms, configured 50 ms, no host 250 ms); piano-usb-irq=1 for the core's
+interrupt` or `irq: SPI 133 (INTID 165, level) attached (0): readback 0xa003 (...), router 0x...; events wake the USB thread`, then
+every minute `idle: N wakeups in 60 s, irq M (kick K, timer T; passes busy b open o configured c no-host n; polled|interrupt;
+link state L, configuration C; SPI 133 count X)`; the monitor's `usb` adds `wait: <mode>, tier <tier>; SPI 133: <state>, N
+handled, S strays, M missed`. Expected at rest: no cable ~240/min (polled) or ~60/min (interrupt); Mac attached with the console
+open ~3000/min (open tier, the log pump). A cable plugged in after more than 3 s without a host may lose the first SETUP in poll
+mode (the Mac re-enumerates within seconds). Test plan and images: [`../power-irq.md`](../power-irq.md) §5.

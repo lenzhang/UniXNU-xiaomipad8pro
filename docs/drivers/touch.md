@@ -3,6 +3,8 @@
 Status 2026-11-11: **built, host-tested and linked** (`package/PianoTouch`, listed in `configs/k27-native-kexts.txt`, inert
 without `piano-touch=N`). **Not run on the tablet**: every hardware fact marked *inferred* or *needs-boot* below is open until
 the first run. First deliverable: a **single-touch absolute pointer** (tap = click, drag = drag). Multi-touch is not done.
+Battery (2026-11-11): at rest the frame loop reads one frame per 50 ms instead of every frame and a 1 ms poll (§13,
+[`../power-irq.md`](../power-irq.md)); `piano-touch-irq=1` takes those frames' edge from the TLMM interrupt.
 
 ## 1. Purpose and gate
 
@@ -21,7 +23,7 @@ contact work runs **in the kext** (`TouchMatrix.h`, Project-SunUEFI's decoder fo
 | SE firmware | SPI protocol, FIFO interface disabled ("GSI only"): SE DMA or GPI DMA, no FIFO | SunUEFI `docs/devel/boot/uefi-console.md`; plan §1 | verified elsewhere; read again in step 1 |
 | SE DMA with the FIFO off | works on SM8750 QUP1 SE4 (OnePlus 13T) | UniXNU-Odin3 `PaganiInput.cpp` | **needs-boot** on SE2 |
 | Pins | GPIO40 MISO, 41 MOSI, 42 CLK, 43 CS; function `qup1_se2` (1), 6 mA, no bias | DT `qup-spi2-*-state` | verified (function number inferred) |
-| IRQ | GPIO162 rising edge = frame ready (latched in TLMM INTR_STATUS, never routed to the GIC) | DT `interrupts = <162 1>` | verified (DT) |
+| IRQ | GPIO162 rising edge = frame ready (latched in TLMM INTR_STATUS; with `piano-touch-irq=1` also on the TLMM summary SPI 208, INTID 240, while an idle frame's edge is waited for). Its PDC line (PDC 109 → SPI 620) is not used | DT `interrupts = <162 1>`; `../power-irq.md` §2.3 | verified (DT); summary delivery needs-boot |
 | Panel ID | GPIO100 (`novatek,lcd-id-gpios`): 0 CSOT, 1 BOE; this unit is BOE | DT; plan §1 | verified (DT) / needs-boot (level) |
 | Power, reset | none of its own: powered with the panel (lit by ABL/UEFI); reset and boot over SPI | DT (no supply, no reset GPIO); SunUEFI | verified (DT) |
 | Clocks | GCC vote 0x52008 bits 18-21 (QUP1 wrapper) + 24 (`wrap1_s2`); CBCRs 0x23140/0x23144/0x23148/0x2315c, SE2 0x1827c; rate: QSPI-ref RCG 0x188c0 through the divider 0x1828c | K90 (same SE, same SoC), 13T QUP1 S4 code, mainline names | **inferred** |
@@ -73,7 +75,10 @@ by tap in the piano VM), matched by a codeless `IOHIDEventDriver` personality; t
 | `piano-touch-baseline=0` | 1 | no idle-baseline command |
 | `piano-touch-threshold=T` | 200 | contact threshold of the decoder |
 | `piano-touch-flip=B` | auto | auto: by the panel (BOE none, CSOT Y reversed; the calibration's panel wins over gpio100 here, its `invert_y` over both); 0..3: bit 0 X, bit 1 Y flipped |
-| `piano-touch-poll=MS` | 1 | edge polling interval |
+| `piano-touch-poll=MS` | 1 | edge polling interval while the panel is busy |
+| `piano-touch-idle=MS` | 50 | at rest one frame per MS (20..500); 0: every frame, the old loop (§13) |
+| `piano-touch-irq=1` | 0 | the idle frames' edge by the TLMM summary interrupt instead of 1 ms polls (§13) |
+| `piano-wake-log=S` | 60 | the `idle: N wakeups in S s` line every S seconds (0 none; shared) |
 | `piano-touch-trace=1` | 0 | more frame headers; contact positions also at level 2 |
 
 ## 7. Build and kernel collection
@@ -121,7 +126,9 @@ cascade, event buffer 0x11c400`; `step 5`, `firmware: lcd-id gpio100 = 1: BOE pa
 0xa0..0xaf`; `step 6`, `start: scanning ...; payload 5192 ...; ... calibrated ...; baseline command taken, mode 2 taken`; `step 7`, `frames: first gpio162 edge`, three
 `frame N ... checksum ok` lines, `orientation: flip X 0, Y 0 (BOE panel: as processor Y; panel BOE by the calibration),
 position from the unit's electrode maps and edge mapping`, `matrix: reference of 32 frames ...`, `frames at 5 s: ~120 reads/s, ~120 edges/s ...` every 5 s
-for 30 s then every 60 s, and per touch `touch N down at (x, y) px` / `touch N up ... after T ms`. Pass: checksum ok >= 99 %;
+for 30 s then every 60 s (at rest, once the reference is learned and 1.5 s after the last contact: ~20 reads/s, and the edges/s the
+loop takes, ~20; while touching ~120), and per touch `touch N down at (x, y) px` / `touch N up ... after T ms`; every minute
+`idle: N wakeups in 60 s, irq M (R frame reads; S idle sleeps; ...)` (~3600 at rest polled, ~2400 with `piano-touch-irq=1`). Pass: checksum ok >= 99 %;
 the corner presses land within about 10 px of the panel's corners, (0, 0), (3199, 0), (0, 2135), (3199, 2135) (the edge stretch
 reaches the border), the middle one near (1600, 1068), Y growing downward. A corner on the wrong side means the orientation is
 wrong (`piano-touch-flip=2` reverses Y, `=1` X, `=3` both); corners 20-60 px short of the border mean the edge mapping is not in
@@ -176,3 +183,22 @@ New code under BSD-2-Clause-Patent; reused pieces under their own licences as li
 Apache-2.0 source, NOTICE kept). Linux `nt36532e`/`spi-geni-qcom` (GPL-2.0) were not read for this work; K90's code is facts only.
 The panel images and the unit's calibration stay out of every repository: the calibration is read at build time from the path in
 `PIANO_TOUCH_CALIBRATION` and only its panel and an 8-digit hash prefix are logged.
+
+## 13. Battery: the frame pace (`piano-touch-idle`, `piano-touch-irq`)
+
+The controller streams a frame about every 8.3 ms whether or not a finger is on the panel. The loop now reads every frame
+(1 ms latch polls, as before) only while the panel is busy: a contact in the last frame, the tip confirming or down, the decoder
+still learning its type or reference, watchdog frames, and for 1.5 s after the last of these. At rest (`TouchPace.h`) it sleeps
+until 2 ms before the next read is due (one per `piano-touch-idle`, default 50 ms), drops the latch (that edge came mid-sleep,
+mid-frame) and reads on the next fresh edge. A finger is read at most one idle period and a frame late, then every frame. The
+host test's model: ~20 reads and ~60 wake-ups a second at rest instead of ~120 and ~1000. SPI by hand is not paced (it reads at
+most 10 frames a second anyway).
+
+With `piano-touch-irq=1` the wait for that fresh edge is the TLMM interrupt: gpio162 on the summary line SPI 208
+(`package/common/PianoIrq.h` `tlmm::Pin`, the table shared with PianoKeyboard), enabled only for that wait (the handler masks
+it), with INTR_CFG's PDC bit cleared. Ubuntu measured touch reads 43-51 % slow while the system idle state (4.4 ms exit) was
+entered and held a 2000 µs CPU latency limit per transfer (`../ubuntu-history/kernel.md` top finding 8): the busy state therefore
+stays on 1 ms polls, and a bad checksum on a read after an interrupt (a late wake) makes the next idle edge polled. Three
+timed-out waits in a row with the latch set turn the interrupt off (`no interrupt in 3 waits in a row`); a storm on the line
+(its guard) too. Lines: `frames: gpio162 interrupt on the TLMM summary (SPI 208, INTID 240): slot N, INTR_CFG armed ... masked
+...` or `... NOT used (why)`. Test images and the A/B: `../power-irq.md` §5.

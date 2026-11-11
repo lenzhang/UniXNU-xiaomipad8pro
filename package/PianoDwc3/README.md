@@ -23,8 +23,11 @@ Design, hardware facts, boot arguments, test plan and the Mac-side commands: `do
 | `TxFifoPlan.h` | the TX FIFO layout of the IN endpoints in use (with the network function), portable |
 | `HidInput.h` | the input port's line protocol (K/C/P/R/?) and line framing, portable |
 | `SmmuStream.h` | SID 0x40 through a VA64 bypass context bank of the apps SMMU |
+| `UsbIdle.h` | the USB thread's wait tiers (busy / open / configured / no host) and the core interrupt handler's decision, portable (`docs/power-irq.md`) |
 | `Dwc3Regs.h`, `PianoUsbHw.h` | register facts, with their sources |
-| `tests/` | host tests: the gadget core (2 and 3 ports, without and with the network function; the ACM-only descriptors against their pre-network bytes), NTB16 and the TX FIFO plan, the SMMU planner, the input parser (`tests/run.sh`) |
+| `tests/` | host tests: the gadget core (2 and 3 ports, without and with the network function; the ACM-only descriptors against their pre-network bytes), NTB16 and the TX FIFO plan, the SMMU planner, the input parser, the wait tiers (`tests/run.sh`) |
 
 Build: `tooling/k27/build-native-piano-dwc3.sh` (host tests, the objects, the import check, the PianoUsbNet vtable check). PianoDwc3 is in
 `configs/k27-native-kexts.txt` and inert without `piano-usb`. Sources and licences: `UPSTREAM`, `LICENSE` (BSD-2-Clause-Patent).
+Battery: the USB thread's wait adapts to the link (`piano-usb-idle=0`: the old 1 ms loop); `piano-usb-irq=1` adds the core's
+interrupt, SPI 133, through `package/common/PianoIrq.h` (`docs/drivers/usb-device-debug.md` section 15, `docs/power-irq.md`).
