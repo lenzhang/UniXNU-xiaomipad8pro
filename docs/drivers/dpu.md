@@ -127,8 +127,10 @@ the live stream reset the SoC on Linux); the bank itself is reprogrammed in plac
    the bank back as found and every window let go (with a pipe that might still fetch a window, the window and its memory stay:
    translation off would turn its IOVA into a physical address); flips off for the boot ("PianoDpuFlip" answers kPianoDpuFlipOff,
    NativeGopDisplay copies). A revert while idle leaves the last copied frame in the boot framebuffer on the panel until the next swap.
-6. *Cursor*: WindowServer's cursor layer is not shown today (the copy takes the largest layer); a free DMA pipe staged above in
-   LM0/LM1 (two rects across the split) is B1b's last step: not built.
+6. *Cursor*: since 2026-11-12 NativeGopDisplay composes WindowServer's cursor layer over the frame in the boot framebuffer
+   (native-gop-display.md §5a); in flip mode a frame is offered to the DPU only while no cursor is on the panel, else composed and
+   the boot framebuffer put back (flips resume once the cursor hides). A free DMA pipe staged above in LM0/LM1 (two rects across the
+   split) for the cursor, so the frame can stay flipped under it, is B1b's last step: not built.
 
 **4.3 Refresh switching (B1c).** 120 ↔ 60 Hz is a VFP-only change: no DCS command (B2/B3 are the same), no clock change, no DSC or
 touch impact (SunUEFI ran 30/48/50/60/120 seamlessly). At a frame boundary, on both links: DSI DB_MODE = 1, TOTAL.V_TOTAL = 4620 − 1
@@ -407,8 +409,9 @@ Record: the latch mean/max, the clean mean (the CPU cost of a flip: a 27 MB clea
 then the CPU's caches were not cleaned; a stale tile on the panel would say the frame needs it: `piano-dpu-clean=2`), the maps count
 (WindowServer's swap chain length). Failure lines: `NativeGopDisplay: flip refused (...)` (the first 8, with the reason), `revert:
 ...` then `B1b off for the boot: ...` (the copy from then on), `flip: SMMU fault: fsr ... far ...` / `flip: underrun ...` / `watch:
-...`, `vsync: 3 waits of 10 ms in a row with no interrupt ...: polled from now on`. A separate cursor layer (`swap layers 0x3`) is not shown in either mode (the
-largest layer only, §4.2.6).
+...`, `vsync: 3 waits of 10 ms in a row with no interrupt ...: polled from now on`. A cursor on the panel makes NativeGopDisplay
+copy instead of flip (since 2026-11-12, §4.2.6: `flip mode: a cursor is on the panel: ...` once, and the periodic line's `or a cursor
+was on the panel: N`); macOS hides the pointer while typing, which is when the flips show.
 
 B1c, B1d, B1e: below (§8.1-8.3).
 
