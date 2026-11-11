@@ -10,19 +10,38 @@
 //   piano-wifi-spmi=1  adds the supplies' PMIC regulators and the BT_EN / sleep clock pins over the SPMI arbiter's observer channel:
 //                  the only stores are the observer channel's read commands (as PianoPower's and PianoInput's read-only levels),
 //                  never a PMIC register. Off by default, so piano-wifi=1 alone stores nothing at all.
-// Other arguments: piano-wifi-delay=S (wait S seconds first, default 0), piano-wifi-repeat=S with piano-wifi-samples=N (resample the
-// MMIO part every S s, N times, default 3, one summary line each), piano-wifi-hwcg=1 (count a hardware-gated, voted branch under
-// HW_CTL that reads CLK_OFF as running), piano-wifi-smmu=0 / piano-wifi-cmddb=0 (skip those reads). Without piano-wifi the driver
-// declines in probe() and maps nothing. Levels above 1 are not implemented; they run level 1.
+//   piano-wifi=2   power: the six PMU rails by RPMh (mode NPM, the voltage piano's DT asks for, enable) with the PMIC read back
+//                  before and after, PERST# low, CLKREQ# to its PCIe function, WLAN_EN low 150 ms then high, the PMU's 50 ms,
+//                  SW_CTRL read. The PHY's two LDOs (one of them the UFS PHY's PLL) are read, never voted.
+//   piano-wifi=3   the link: the GDSCs, the RCG sources, the branch votes (under PianoA830's GCC vote lock), the TCSR reference
+//                  gate, the block resets, the PARF set-up, the QMP v7 PHY sequence, the BDF-to-SID entry of the endpoint, the root
+//                  port, PERST# released, the LTSSM, L0, the configuration window, `17cb:110e`, the memory window, BAR0, and the
+//                  SMMU stream 0x1401 through a bypass context bank.
+//   piano-wifi=4   MHI: the DMA window, the MHI registers in BAR0, `image/peach/amss20.bin` read at run time from the tablet's own
+//                  modem_a, BHI (the boot loader), the MHI contexts, BHIe (the rest of the image), mission mode. Stops there.
+// Levels are cumulative and each one stops the ladder where it fails, leaving WLAN_EN low and PERST# asserted. Other arguments:
+// piano-wifi-delay=S (wait S seconds first, default 0), piano-wifi-repeat=S with piano-wifi-samples=N (resample the MMIO part every
+// S s, N times, default 3, one summary line each), piano-wifi-hwcg=1 (count a hardware-gated, voted branch under HW_CTL that reads
+// CLK_OFF as running), piano-wifi-smmu=0 / piano-wifi-cmddb=0 (skip those reads), piano-wifi-gen=N (the target link speed, default
+// 2), piano-wifi-physeq=0 (only the PHY sequence's frame writes), piano-wifi-rcg=0 (leave the aux/rchng sources alone),
+// piano-wifi-blind=1 (vote a rail whose PMIC state could not be read), piano-wifi-release=1 (on a failure withdraw the enable of
+// the rails this driver enabled), piano-wifi-stop=N (return after step N), piano-wifi-dma=M (the DMA window in MiB, default 24),
+// piano-wifi-fwtimeout=MS (the deadline of each MHI phase, default 20000). Without piano-wifi the driver declines in probe() and
+// maps nothing.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
 #include <libkern/libkern.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
+#include "SmmuStream.h"
+#include "WifiBringup.h"
+#include "WifiFirmware.h"
+#include "WifiMhi.h"
 #include "WifiSurvey.h"
 
 using namespace pianowifi;
@@ -36,6 +55,7 @@ namespace {
 
 struct Args {
   uint32_t level, spmi, smmu, cmddb, hwcg, delay, repeat, samples;
+  uint32_t gen, physeq, rcg, blind, release, stop, dmaMib, fwTimeoutMs;
 };
 Args gArgs;
 
@@ -59,6 +79,17 @@ void readArgs()
   if (gArgs.repeat > 3600) gArgs.repeat = 3600;
   gArgs.samples = bootArg("piano-wifi-samples", 3);
   if (gArgs.samples > 100) gArgs.samples = 100;
+  gArgs.gen = bootArg("piano-wifi-gen", kDefaultGen);
+  if (!gArgs.gen || gArgs.gen > kMaxGen) gArgs.gen = kDefaultGen;
+  gArgs.physeq = bootArg("piano-wifi-physeq", 1);
+  gArgs.rcg = bootArg("piano-wifi-rcg", 1);
+  gArgs.blind = bootArg("piano-wifi-blind", 0);
+  gArgs.release = bootArg("piano-wifi-release", 0);
+  gArgs.stop = bootArg("piano-wifi-stop", 0);
+  gArgs.dmaMib = bootArg("piano-wifi-dma", kDmaWindowBytes >> 20);
+  if (gArgs.dmaMib < 12 || gArgs.dmaMib > 64) gArgs.dmaMib = kDmaWindowBytes >> 20;
+  gArgs.fwTimeoutMs = bootArg("piano-wifi-fwtimeout", 20000);
+  if (gArgs.fwTimeoutMs < 1000 || gArgs.fwTimeoutMs > 60000) gArgs.fwTimeoutMs = 20000;
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -155,6 +186,9 @@ void spmiWr(void *, Window w, uint32_t off, uint32_t value)
 }
 void spmiDelay(void *, unsigned us) { IODelay(us); }
 const Io gSpmi = {nullptr, spmiRd, spmiWr, spmiDelay};
+// The arbiter as the survey read it, kept for levels 2 and up (one regulator read at a time through the same channel).
+Arbiter gArbiter;
+bool gArbiterReady;
 
 // ------------------------------------------------------------------------------------------------------------- the report
 const char *onOff(bool on) { return on ? "on" : "off"; }
@@ -241,6 +275,11 @@ void reportSmmu()
   }
 }
 
+// What levels 2 and up need from level 1: each rail's RPMh address (cmd-db) and the PPID its regulator answered on (the SPMI
+// survey, which also settles the LDO page rule). 0 means "not found", and a rail without both is never voted.
+uint32_t gRailAddress[kRailCount];
+uint16_t gRailPpid[kRailCount];
+
 void reportCmdDb()
 {
   uint8_t *copy = static_cast<uint8_t *>(IOMallocData(kCmdDbBytes));
@@ -270,6 +309,7 @@ void reportCmdDb()
     const char *name = i < kRailCount ? kRails[i].cmdDb : kExtra[i - kRailCount];
     uint32_t address = 0;
     const int rc = cmdDbFind(copy, kCmdDbBytes, name, &address);
+    if (i < kRailCount) gRailAddress[i] = rc ? 0 : address;
     n += size_t(rc ? snprintf(line + n, sizeof line - n, "%s%s none (%d)", i ? ", " : "", name, rc)
                    : snprintf(line + n, sizeof line - n, "%s%s %#x", i ? ", " : "", name, address));
   }
@@ -277,10 +317,13 @@ void reportCmdDb()
   note("cmd-db: %s", line);
 }
 
+// Also keeps the arbiter for levels 2 and up (hwPmic reads one regulator through the same observer channel).
 void reportPmic()
 {
   PmicSurvey s;
   surveyPmic(gSpmi, s);
+  gArbiter = s.arbiter;
+  gArbiterReady = s.arbiter.v7;
   if (!s.arbiter.v7) {
     note("SPMI: arbiter version %08x, %u peripherals: not v7, not read", s.arbiter.version, s.arbiter.count);
     return;
@@ -295,6 +338,7 @@ void reportPmic()
            r.ldo ? (st.alternate.present ? ", alternate present" : ", alternate absent") : "");
       continue;
     }
+    gRailPpid[i] = p->ppid;
     note("rail %s %s (%s): ppid %03x apid %d owner %u type %02x/%02x status %02x (%s) %u mV mode %02x en %02x (%s), DT %u mV%s",
          r.supply, r.regulator, r.cmdDb, p->ppid, p->apid, p->owner, p->type, p->subtype, p->status, p->ready() ? "ready" : "not ready",
          p->millivolts(), p->regs40[5], p->regs40[6], p->enabled() ? "enabled" : "disabled", r.millivolts,
@@ -326,6 +370,664 @@ void summary(const Survey &s, char *line, size_t size)
            s.phy.read ? ((s.phy.status1 & kPcsPhyStatus) ? "not-ready" : "ready") : "unread");
 }
 
+// ================================================================================= levels 2 and up: the windows and the writes
+inline void wr32(uintptr_t a, uint32_t v) { __asm__ volatile("str %w0, [%1]" ::"r"(v), "r"(a) : "memory"); }
+inline void dsb() { __asm__ volatile("dsb sy" ::: "memory"); }
+
+uint64_t nowMs()
+{
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+  return ns / 1000000;
+}
+
+// Levels above 1 write, so each block is mapped as one window (level 1's page-at-a-time loads stay for the survey). hwRead and
+// hwWrite refuse an offset outside the window: an offset that came from the hardware (all ones while the endpoint does not answer)
+// must never reach Device memory unaligned or out of range, which is a panic.
+struct WindowMap {
+  uint64_t pa;
+  uint32_t bytes;
+  const char *name;
+  IOMemoryMap *map;
+  uintptr_t va;
+};
+WindowMap gWin[kWinCount] = {
+  {kGcc, 0x80000, "gcc", nullptr, 0},
+  {kTlmm, 0x70000, "tlmm", nullptr, 0},
+  {kTcsrPcie0ClkRef & ~0xfffull, 0x1000, "tcsr", nullptr, 0},
+  {kParf, uint32_t(kParfBytes), "parf", nullptr, 0},
+  {kPhy, uint32_t(kPhyBytes), "phy", nullptr, 0},
+  {kDbi, uint32_t(kDbiBytes), "dbi", nullptr, 0},
+  {kAtu, uint32_t(kAtuBytes), "atu", nullptr, 0},
+  {kConfig, 0x1000, "cfg", nullptr, 0},
+};
+
+bool mapWindow(WindowMap &w)
+{
+  if (w.va) return true;
+  IODeviceMemory *m = IODeviceMemory::withRange(w.pa, w.bytes);
+  IOMemoryMap *map = m ? m->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+  if (m) m->release();
+  if (!map) return false;
+  w.map = map;
+  w.va = uintptr_t(map->getVirtualAddress());
+  return true;
+}
+
+bool mapWindows()
+{
+  for (unsigned i = 0; i < kWinCount; ++i)
+    if (!mapWindow(gWin[i])) {
+      note("cannot map the %s window (%#llx + %#x)", gWin[i].name, (unsigned long long)gWin[i].pa, gWin[i].bytes);
+      return false;
+    }
+  return true;
+}
+
+void unmapWindows()
+{
+  for (unsigned i = 0; i < kWinCount; ++i)
+    if (gWin[i].map) {
+      gWin[i].map->release();
+      gWin[i].map = nullptr;
+      gWin[i].va = 0;
+    }
+}
+
+// Every write is logged once with what it is and why; a repeat of the same kind (the 126 PHY sequence writes, the 256 cleared
+// BDF-to-SID words) is counted instead of logged again.
+unsigned gWrites, gBadAccess;
+const char *gSeen[64];
+unsigned gSeenCount, gSeenRepeats[64];
+
+uint32_t hwRead(void *, unsigned win, uint32_t off)
+{
+  if (win >= kWinCount || !gWin[win].va || (off & 3) || off + 4 > gWin[win].bytes) {
+    ++gBadAccess;
+    return 0xffffffffu;
+  }
+  return rd32(gWin[win].va + off);
+}
+
+void hwWrite(void *, unsigned win, uint32_t off, uint32_t value, const char *what)
+{
+  if (win >= kWinCount || !gWin[win].va || (off & 3) || off + 4 > gWin[win].bytes) {
+    ++gBadAccess;
+    note("refused a write outside the %s window: +%#x = %08x (%s)", win < kWinCount ? gWin[win].name : "?", off, value, what);
+    return;
+  }
+  wr32(gWin[win].va + off, value);
+  dsb();
+  ++gWrites;
+  for (unsigned i = 0; i < gSeenCount; ++i)
+    if (gSeen[i] == what) {
+      ++gSeenRepeats[i];
+      return;
+    }
+  if (gSeenCount < 64) {
+    gSeen[gSeenCount] = what;
+    gSeenRepeats[gSeenCount++] = 0;
+  }
+  note("write %s+%#x = %08x: %s", gWin[win].name, off, value, what);
+}
+
+void writeSummary(const char *level)
+{
+  char line[360];
+  size_t n = 0;
+  for (unsigned i = 0; i < gSeenCount && n + 40 < sizeof line; ++i)
+    if (gSeenRepeats[i]) n += size_t(snprintf(line + n, sizeof line - n, "%s%s x%u", n ? ", " : "", gSeen[i], gSeenRepeats[i] + 1));
+  note("%s: %u writes (%u kinds, %u refused)%s%s", level, gWrites, gSeenCount, gBadAccess, n ? "; repeated: " : "", n ? line : "");
+}
+
+void hwUdelay(void *, unsigned us) { IODelay(us); }
+void hwMsleep(void *, unsigned ms) { IOSleep(ms); }
+uint64_t hwNow(void *) { return nowMs(); }
+void hwStep(void *, int step, const char *what)
+{
+  piano_wifi_stage = step;
+  note("step %d: %s", step, what);
+}
+
+// ---- PianoA830's lock words (package/PianoA830/adreno830/platform/sm8750/Sm8750Rpmh.h and Sm8750GpuPower.c): one 32-bit word
+// each, 0 = free, else the holder's tag. PianoA830 is listed before PianoWifi in configs/k27-native-kexts.txt and is named as a
+// library in PianoWifi.json, so the KC linker (no weak imports) resolves both to A830's single copy, the way PianoPower,
+// PianoKeyboard (DRV-2) and PianoTouch (the GCC vote words) do.
+extern "C" {
+extern volatile uint32_t sm8750_gcc_vote_owner;
+extern volatile uint32_t sm8750_rpmh_drv2_owner;
+}
+constexpr uint32_t kTag = 0x57494649;   // "WIFI"
+constexpr unsigned kLockSteps = 200000, kLockStepUs = 10;
+
+bool lockAcquire(volatile uint32_t *word, uint32_t *waits, unsigned steps)
+{
+  for (uint32_t n = 0;; ++n) {
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n(word, &expected, kTag, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      *waits = n;
+      return true;
+    }
+    if (n >= steps) {
+      *waits = n;
+      return false;
+    }
+    IODelay(kLockStepUs);
+  }
+}
+void lockRelease(volatile uint32_t *word)
+{
+  uint32_t expected = kTag;
+  __atomic_compare_exchange_n(word, &expected, 0u, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+
+// The GCC vote words and the collapse word are read-modify-written under A830's lock word (PianoTouch's protocol: 10 us steps, at
+// most 50 ms; a holder that keeps it longer than that is reported and the update goes ahead, as the bits are only ever set).
+int hwVoteLock(void *, int take)
+{
+  if (!take) {
+    lockRelease(&sm8750_gcc_vote_owner);
+    return 0;
+  }
+  uint32_t waits = 0;
+  if (lockAcquire(&sm8750_gcc_vote_owner, &waits, 5000)) {
+    if (waits) note("GCC vote lock taken after %u waits of %u us", waits, kLockStepUs);
+    return 0;
+  }
+  note("GCC vote lock held by %#x for 50 ms: the votes are set anyway (bits are only ever set)",
+       __atomic_load_n(&sm8750_gcc_vote_owner, __ATOMIC_ACQUIRE));
+  return 0;
+}
+
+// ---- one RPMh VRM transaction on apps DRV-2, under the DRV-2 lock (the protocol of PianoA830's Sm8750Rpmh.h, as PianoPower and
+// PianoKeyboard run it): an idle ACTIVE TCS, its commands, the trigger, completion polled for at most 100 ms, the TCS reclaimed.
+// A TCS that did not complete is left alone and never used again.
+struct RscLayout {
+  uint32_t tcsStride, cmdStride, irqStatus, irqClear, waitForCmpl, control, status, cmdEnable, cmdMsgid, cmdAddr, cmdData;
+};
+constexpr RscLayout rscLayoutFor(uint32_t drvId)
+{
+  return ((drvId >> 16) & 0xff) >= 3 ? RscLayout{672, 24, 0x04, 0x08, 0x20, 0x24, 0x28, 0x2c, 0x34, 0x38, 0x3c}
+                                     : RscLayout{672, 20, 0x04, 0x08, 0x10, 0x14, 0x18, 0x1c, 0x30, 0x34, 0x38};
+}
+constexpr uint32_t kAmcEnable = 1u << 16, kAmcTrigger = 1u << 24, kMsgidWriteResp = 8u | 1u << 8 | 1u << 16,
+                   kCmdCompleted = 1u << 16;
+IOMemoryMap *gRscMap;
+uintptr_t gRscVa;
+RscLayout gRsc;
+uint32_t gRscId;
+bool gTcsStuck[3];
+
+uint32_t rscRd(uint32_t at) { return rd32(gRscVa + kRscTcsBlock + at); }
+void rscWr(uint32_t at, uint32_t v)
+{
+  wr32(gRscVa + kRscTcsBlock + at, v);
+  dsb();
+}
+
+bool mapRsc()
+{
+  if (gRscVa) return true;
+  IODeviceMemory *m = IODeviceMemory::withRange(kRscDrv2, kRscDrv2Bytes);
+  IOMemoryMap *map = m ? m->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+  if (m) m->release();
+  if (!map) {
+    note("rsc: cannot map apps DRV-2 (%#llx)", (unsigned long long)kRscDrv2);
+    return false;
+  }
+  gRscMap = map;
+  gRscVa = uintptr_t(map->getVirtualAddress());
+  gRscId = rd32(gRscVa);
+  gRsc = rscLayoutFor(gRscId);
+  note("rsc: apps DRV-2 id %#x (version %u.%u: %s layout), TCS block +%#x", gRscId, (gRscId >> 16) & 0xff, (gRscId >> 8) & 0xff,
+       ((gRscId >> 16) & 0xff) >= 3 ? "v3" : "v2", kRscTcsBlock);
+  return true;
+}
+
+int vrmLocked(const char *resource, uint32_t base, const VrmCmd *cmds, unsigned count)
+{
+  const RscLayout &l = gRsc;
+  static const unsigned kOrder[3] = {2, 1, 0};
+  int tcs = -1;
+  for (unsigned k = 0; k < 3 && tcs < 0; ++k)
+    if (!gTcsStuck[kOrder[k]] && rscRd(l.tcsStride * kOrder[k] + l.status)) tcs = int(kOrder[k]);
+  if (tcs < 0) {
+    note("rsc: %s: no idle ACTIVE TCS, nothing sent", resource);
+    return -16;
+  }
+  const uint32_t at = l.tcsStride * unsigned(tcs), bit = 1u << tcs, irqEnable = rscRd(0), mask = (1u << count) - 1;
+  if (rscRd(l.irqStatus) & bit) rscWr(l.irqClear, bit);
+  for (unsigned c = 0; c < count; ++c) {
+    const uint32_t cmd = at + l.cmdStride * c;
+    rscWr(cmd + l.cmdMsgid, kMsgidWriteResp);
+    rscWr(cmd + l.cmdAddr, base + cmds[c].reg);
+    rscWr(cmd + l.cmdData, cmds[c].value);
+  }
+  rscWr(at + l.waitForCmpl, mask);
+  rscWr(at + l.cmdEnable, mask);
+  rscWr(0, irqEnable | bit);
+  const uint32_t control = rscRd(at + l.control);
+  rscWr(at + l.control, control & ~kAmcTrigger);
+  rscWr(at + l.control, control & ~(kAmcTrigger | kAmcEnable));
+  rscWr(at + l.control, kAmcEnable);
+  rscWr(at + l.control, kAmcEnable | kAmcTrigger);
+  bool done = false;
+  unsigned waited = 0;
+  uint32_t status[3] = {0, 0, 0};
+  for (;; ++waited) {
+    uint32_t all = kCmdCompleted;
+    for (unsigned c = 0; c < count; ++c) {
+      status[c] = rscRd(at + l.cmdStride * c + l.cmdData + 4);
+      all &= status[c];
+    }
+    done = (rscRd(l.irqStatus) & bit) || all == kCmdCompleted;
+    if (done || waited >= 100) break;
+    IOSleep(1);
+  }
+  if (done) {
+    rscWr(at + l.cmdEnable, 0);
+    rscWr(l.irqClear, bit);
+    rscWr(at + l.control, rscRd(at + l.control) & ~kAmcTrigger);
+    rscWr(at + l.control, 0);
+  } else {
+    gTcsStuck[tcs] = true;
+  }
+  rscWr(0, irqEnable);
+  note("rsc: %s (%#x): %u commands through TCS %d %s after %u ms (status %#x %#x %#x)", resource, base, count, tcs,
+       done ? "completed" : "NOT completed (left in flight, not used again)", waited, status[0], status[1], status[2]);
+  return done ? 0 : -60;
+}
+
+int hwVrm(void *, const char *resource, const VrmCmd *cmds, unsigned count, uint32_t *address)
+{
+  if (!gRscVa || !cmds || !count || count > 3) return -22;
+  uint32_t base = 0;
+  for (unsigned i = 0; i < kRailCount; ++i) {
+    const char *a = kRails[i].cmdDb, *b = resource;
+    unsigned k = 0;
+    while (k < 8 && a[k] && a[k] == b[k]) ++k;
+    if (k < 8 && a[k] == b[k]) base = gRailAddress[i];
+  }
+  if (address) *address = base;
+  if (!base) {
+    note("rsc: %s: no RPMh resource of that name in cmd-db, nothing sent", resource);
+    return -19;
+  }
+  uint32_t waits = 0;
+  const uint32_t held = __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE);
+  if (held) note("rsc: the DRV-2 lock is held by %#x; waiting (at most 2 s)", held);
+  if (!lockAcquire(&sm8750_rpmh_drv2_owner, &waits, kLockSteps)) {
+    note("rsc: the DRV-2 lock stayed held by %#x for 2 s: %s not voted",
+         __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE), resource);
+    return -16;
+  }
+  const int rc = vrmLocked(resource, base, cmds, count);
+  lockRelease(&sm8750_rpmh_drv2_owner);
+  return rc;
+}
+
+// ---- one regulator over the SPMI observer channel (reads only, the same channel level 1 uses)
+int hwPmic(void *, uint16_t ppid, uint8_t *status, uint8_t *enable, uint8_t *mode, uint16_t *millivolts)
+{
+  if (!gArbiterReady || !ppid) return -19;
+  const Apid found = spmiFindApid(gSpmi, gArbiter, ppid);
+  if (found.apid < 0) return -19;
+  uint8_t regs[7] = {};
+  if (spmiRead(gSpmi, found.apid, 0x08, status, 1) != ReadResult::ok) return -5;
+  if (spmiRead(gSpmi, found.apid, 0x40, regs, 7) != ReadResult::ok) return -5;
+  if (millivolts) *millivolts = uint16_t(uint16_t(regs[0]) | uint16_t(regs[1]) << 8);
+  if (mode) *mode = regs[5];
+  if (enable) *enable = regs[6];
+  return 0;
+}
+
+const Hw gHw = {nullptr, hwRead, hwWrite, hwUdelay, hwMsleep, hwNow, hwVoteLock, hwVrm, hwPmic, hwStep};
+
+Options options()
+{
+  Options o;
+  o.level = gArgs.level;
+  o.gen = gArgs.gen;
+  o.physeq = gArgs.physeq;
+  o.rcg = gArgs.rcg;
+  o.blind = gArgs.blind;
+  o.release = gArgs.release;
+  o.stopAfter = int(gArgs.stop);
+  return o;
+}
+
+// ------------------------------------------------------------------------------------------------------ the levels' reports
+void reportPower(const PowerState &p)
+{
+  for (unsigned i = 0; i < kRailCount; ++i) {
+    const Rail &rail = kRails[i];
+    const RailVote &r = p.rails[i];
+    if (!rail.order) {
+      note("rail %s %s (%s): %u mV en %02x -> %u mV en %02x; never voted (%s)", rail.supply, rail.regulator, rail.cmdDb,
+           r.millivolts, r.enable, r.millivoltsAfter, r.enableAfter, rail.shared);
+      continue;
+    }
+    note("rail %s %s (%s) %#x: before %s %u mV mode %02x en %02x -> sent mode %u%s%s -> after %s %u mV mode %02x en %02x (rc %d)",
+         rail.supply, rail.regulator, rail.cmdDb, r.address, r.read ? "read" : "unread", r.millivolts, r.mode, r.enable,
+         kVrmModeNpm, r.voted ? ", voltage" : " (voltage kept)", r.sentEnable ? ", enable" : "",
+         r.readAfter ? "read" : "unread", r.millivoltsAfter, r.modeAfter, r.enableAfter, r.rc);
+  }
+  note("pins: WLAN_EN cfg %08x io %08x, PERST# cfg %08x io %08x, CLKREQ# cfg %08x io %08x, SW_CTRL io %08x (in %u)", p.wlanEnCfg,
+       p.wlanEnIo, p.perstCfg, p.perstIo, p.clkreqCfg, p.clkreqIo, p.swCtrlIo, p.swCtrlIo & 1u);
+  note("level 2: %u rails with a voltage, %u left at theirs; step %d (%s)", p.voted, p.kept, p.step,
+       p.error ? errorName(p.error) : "done");
+}
+
+void reportLink(const LinkState &l)
+{
+  note("GCC: collapse %08x -> %08x, pcie0 gdsc %08x cfg %08x, phy gdsc %08x cfg %08x after %u polls", l.collapseBefore,
+       l.collapseAfter, l.gdsc, l.gdscCfg, l.phyGdsc, l.phyGdscCfg, l.gdscPolls);
+  note("GCC: votes 0x52008 %08x 0x52000 %08x, aux rcg %08x/%08x rchng rcg %08x/%08x pipe mux %08x, clkref %08x, branches-off %03x",
+       l.vote8, l.vote0, l.auxRcg, l.auxCfg, l.rchngRcg, l.rchngCfg, l.pipeMux, l.clkref, l.branchOff);
+  note("GCC: resets pcie0 %08x pcie0_phy %08x; pipe cbcr %08x", l.bcr[0], l.bcr[1], l.pipeCbcr);
+  note("PARF: device type %08x phy_ctrl %08x dbi base %08x atu base %08x slave space hi %08x sys %08x ltssm %08x", l.parfDeviceType,
+       l.parfPhyCtrl, l.parfDbiBase, l.parfAtuBase, l.parfSlvSpaceHi, l.parfSysCtrl, l.parfLtssm);
+  note("PHY: %u writes, PCS status1 %08x (%s) after %u polls of 100 us", l.phyWrites, l.pcsStatus,
+       (l.pcsStatus & kPcsPhyStatus) ? "not ready" : "ready", l.phyPolls);
+  note("PARF: BDF-to-SID hash of %#x is %u, entry %08x, cfg %08x (%s)", kEndpointRid, l.sidHash, l.sidEntry, l.sidCfg,
+       (l.sidCfg & kParfBdfToSidBypass) ? "bypass" : "table");
+  note("root port: id %08x buses %08x command %08x pcie cap %#x link ctl2 %08x; PERST# low %u ms", l.rootId, l.busNumbers,
+       l.rootCommand, l.expCap, l.linkCtl2, l.perstLowMs);
+  note("link: debug0 %08x (LTSSM %#x %s) debug1 %08x (%s) status %08x (Gen%u x%u) after %u ms", l.debug0, l.debug0 & kLtssmMask,
+       ltssmName(l.debug0), l.debug1, (l.debug1 & kPortDebug1LinkUp) ? "up" : "down", l.linkStatus, (l.linkStatus >> 16) & 0xfu,
+       (l.linkStatus >> 20) & 0x3fu, l.linkMs);
+  note("endpoint: id %08x (%s) class %08x subsystem %08x pcie cap %#x msi cap %#x after %u polls", l.endpointId,
+       idIsEndpoint(l.endpointId) ? "17cb:110e, the WCN7860" : "not the WCN7860", l.endpointClass, l.endpointSubsys,
+       l.endpointCap, l.endpointMsiCap, l.endpointPolls);
+  note("BAR0: mask %08x -> %llu KiB at %#llx (value %08x), command %08x; iATU ctrl2 %08x/%08x, memory base/limit %08x", l.barMask,
+       (unsigned long long)(l.barBytes / 1024), (unsigned long long)l.barAddress, l.barValue, l.command, l.atuCtrl2[0],
+       l.atuCtrl2[1], l.memBaseLimit);
+  note("level 3: step %d (%s)", l.step, l.error ? errorName(l.error) : "done");
+}
+
+// =========================================================================================== level 3's tail: the SMMU stream
+// The endpoint's stream (0x1401) through a bypass context bank, exactly as PianoDwc3 gives stream 0x40 and NativeUfs the UFS one
+// (SmmuStream.h): a free group and a free bank, nothing of an existing UFS / GPU / USB entry touched, and an entry the firmware
+// already left that bypasses is kept as it is. piano-wifi-smmu=2 does the root port's stream (0x1400) as well; 0 skips both.
+IOMemoryMap *gSmmuMap;
+uintptr_t gSmmuVa;
+
+uint32_t smmuRead(uint32_t off) { return rd32(gSmmuVa + off); }
+
+bool smmuStream(uint16_t stream)
+{
+  if (!gSmmuVa) {
+    IODeviceMemory *m = IODeviceMemory::withRange(kSmmu, kSmmuBytes);
+    IOMemoryMap *map = m ? m->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+    if (m) m->release();
+    if (!map) {
+      note("SMMU: cannot map %#llx", (unsigned long long)kSmmu);
+      return false;
+    }
+    gSmmuMap = map;
+    gSmmuVa = uintptr_t(map->getVirtualAddress());
+  }
+  const SmmuPlan p = planSmmuStream(stream, kSmmuBytes, smmuRead);
+  note("SMMU stream %#x: groups %u banks %u pages %u; %s slot %u (smr %08x s2cr %08x sctlr %08x cbar %08x cba2r %08x) -> %s bank %u%s%s",
+       stream, p.groups, p.banks, p.pages, p.reuse ? "existing entry" : "free", p.slot, p.smr, p.s2cr, p.sctlr, p.cbar, p.cba2r,
+       p.keep ? "keep" : "bypass", p.bank, p.error ? ": " : "", p.error ? p.error : "");
+  if (p.error) return false;
+  const uint64_t deadline = nowMs() + 100;
+  const char *failure = applySmmuStream(p, stream, smmuRead, [](uint32_t off, uint32_t v) { wr32(gSmmuVa + off, v); dsb(); },
+                                        [deadline] { return nowMs() >= deadline; });
+  note("SMMU stream %#x: %s (slot %u: smr %08x s2cr %08x)", stream, failure ? failure : p.keep ? "left as it was" : "bypass set",
+       p.slot, smmuRead(0x800 + 4 * p.slot), smmuRead(0xc00 + 4 * p.slot));
+  return failure == nullptr;
+}
+
+// ================================================================================================== level 4: DMA, BAR0, MHI
+// The DMA window: one physically contiguous range below 2^36 (what ath12k and the 13T's cnss2 both allow this chip), the cacheable
+// alias cleaned out of the caches once and then only ever reached through a write-combined mapping, as PianoDwc3's gadget memory
+// is: the endpoint's stream bypasses the SMMU, so a bus address is a physical address and nothing keeps the two views coherent.
+IOBufferMemoryDescriptor *gDmaBuffer;
+IOMemoryMap *gDmaMap;
+Arena gArena;
+
+void cleanToPoc(const void *start, size_t length)
+{
+  uint64_t ctr = 0;
+  __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+  const uintptr_t line = uintptr_t(4) << ((ctr >> 16) & 15);
+  for (uintptr_t a = uintptr_t(start) & ~(line - 1); a < uintptr_t(start) + length; a += line)
+    __asm__ volatile("dc civac, %0" ::"r"(a) : "memory");
+  dsb();
+}
+
+bool dmaWindow()
+{
+  if (gArena.va) return true;
+  const uint64_t bytes = uint64_t(gArgs.dmaMib) << 20;
+  IOBufferMemoryDescriptor *buffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+      kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), bytes,
+      0x0000000fffe00000ull);   // 36 bits, 2 MiB aligned
+  if (!buffer) {
+    note("dma: no %llu MiB contiguous below 2^36", (unsigned long long)gArgs.dmaMib);
+    return false;
+  }
+  if (buffer->prepare() != kIOReturnSuccess) {
+    buffer->release();
+    note("dma: the window could not be prepared");
+    return false;
+  }
+  IOByteCount contiguous = 0;
+  const uint64_t pa = buffer->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
+  uint8_t *cached = static_cast<uint8_t *>(buffer->getBytesNoCopy());
+  if (!pa || !cached || contiguous < bytes || pa + bytes > (1ull << 36)) {
+    buffer->complete();
+    buffer->release();
+    note("dma: the window is not usable (pa %#llx contiguous %llu)", (unsigned long long)pa, (unsigned long long)contiguous);
+    return false;
+  }
+  bzero(cached, size_t(bytes));
+  cleanToPoc(cached, size_t(bytes));
+  gDmaMap = buffer->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+  uint8_t *va = gDmaMap ? reinterpret_cast<uint8_t *>(gDmaMap->getVirtualAddress()) : nullptr;
+  if (!va) {
+    buffer->complete();
+    buffer->release();
+    note("dma: no write-combined mapping of the window");
+    return false;
+  }
+  gDmaBuffer = buffer;
+  arenaInit(gArena, va, pa, uint32_t(bytes));
+  note("dma: %llu MiB at %#llx (write-combined mapping %p), the endpoint's bus addresses are physical (stream 0x1401 bypasses)",
+       (unsigned long long)gArgs.dmaMib, (unsigned long long)pa, va);
+  return true;
+}
+
+IOMemoryMap *gBarMap;
+uintptr_t gBarVa;
+uint32_t gBarBytes;
+
+bool mapBar(uint64_t pa, uint32_t bytes)
+{
+  if (gBarVa) return true;
+  if (!pa || !bytes || bytes > 0x400000) return false;
+  IODeviceMemory *m = IODeviceMemory::withRange(pa, bytes);
+  IOMemoryMap *map = m ? m->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+  if (m) m->release();
+  if (!map) return false;
+  gBarMap = map;
+  gBarVa = uintptr_t(map->getVirtualAddress());
+  gBarBytes = bytes;
+  return true;
+}
+
+uint32_t barRd(void *, uint32_t off)
+{
+  if ((off & 3) || off + 4 > gBarBytes) {
+    ++gBadAccess;
+    return 0xffffffffu;
+  }
+  return rd32(gBarVa + off);
+}
+void barWr(void *, uint32_t off, uint32_t value)
+{
+  if ((off & 3) || off + 4 > gBarBytes) {
+    ++gBadAccess;
+    return;
+  }
+  wr32(gBarVa + off, value);
+  dsb();
+}
+const MhiIo gMhiIo = {nullptr, barRd, barWr};
+
+// The chip's own registers above 0x80000 through its remap window; level 4 reads only the SoC version, for the log.
+uint32_t chipRead(uint32_t address)
+{
+  if (address < kChipWindowStart) return barRd(nullptr, address);
+  barWr(nullptr, kChipWindowReg, kChipWindowEnable | ((address >> kChipWindowShift) & kChipWindowMask));
+  (void)barRd(nullptr, kChipWindowReg);
+  return barRd(nullptr, kChipWindowStart + (address & kChipWindowRange));
+}
+
+struct FirmwarePlan {
+  FwLayout layout;
+  uint32_t bytes = 0, segments = 0, tableEntries = 0;
+  uint64_t sblBus = 0, tableBus = 0, contextBus = 0, segmentBus[kMhiMaxSegments] = {};
+  const char *partition = nullptr;
+  const char *directory = nullptr;
+  int rc = 0;
+};
+
+// The image straight from the tablet's own modem_a into the DMA window: the boot loader into its buffer, each 512 KiB segment into
+// its own, then the BHIe vector table. The file is never held whole in the heap and nothing of it is logged.
+bool loadFirmware(FirmwarePlan &plan)
+{
+  plan.rc = piano_wifi_firmware_open(&plan.partition);
+  if (plan.rc) {
+    note("firmware: no partition (%d: %s)", plan.rc,
+         plan.rc == PianoWifiFwNotReady ? "NativeUfs has not published it yet" : "not mounted");
+    return false;
+  }
+  plan.rc = piano_wifi_firmware_stat(kAmssName, &plan.bytes, &plan.directory);
+  if (plan.rc) {
+    note("firmware: %s not found on %s (%d)", kAmssName, plan.partition, plan.rc);
+    return false;
+  }
+  uint8_t magic[kElfMagicBytes] = {};
+  const bool haveMagic = plan.bytes > kMhiSblBytes &&
+                         !piano_wifi_firmware_read(kAmssName, kMhiSblBytes, magic, sizeof magic);
+  if (!firmwareLayoutFromMagic(haveMagic ? magic : nullptr, plan.bytes, kMhiSblBytes, plan.layout)) {
+    note("firmware: %s (%u bytes) has no usable layout", kAmssName, plan.bytes);
+    return false;
+  }
+  note("firmware: %s/%s on %s, %u bytes: boot loader %u bytes, %s image %u bytes at %u", plan.directory, kAmssName,
+       plan.partition, plan.bytes, plan.layout.sblBytes, plan.layout.split ? "a second ELF" : "the whole file",
+       plan.layout.imageBytes, plan.layout.imageOffset);
+  plan.segments = (plan.layout.imageBytes + kMhiSegBytes - 1) / kMhiSegBytes;
+  if (plan.segments > kMhiMaxSegments) {
+    note("firmware: %u segments of 512 KiB is more than the %u this driver plans for", plan.segments, kMhiMaxSegments);
+    return false;
+  }
+  uint8_t *sbl = arenaAlloc(gArena, kMhiSblBytes, &plan.sblBus);
+  if (!sbl) return note("firmware: the DMA window has no room for the boot loader"), false;
+  if (piano_wifi_firmware_read(kAmssName, plan.layout.sblOffset, sbl, plan.layout.sblBytes))
+    return note("firmware: the boot loader could not be read"), false;
+  uint64_t addresses[kMhiMaxSegments] = {};
+  for (uint32_t i = 0; i < plan.segments; ++i) {
+    uint8_t *segment = arenaAlloc(gArena, kMhiSegBytes, &plan.segmentBus[i]);
+    if (!segment) return note("firmware: the DMA window has no room for segment %u", i), false;
+    const uint32_t done = i * kMhiSegBytes, left = plan.layout.imageBytes - done;
+    if (piano_wifi_firmware_read(kAmssName, plan.layout.imageOffset + done, segment, left < kMhiSegBytes ? left : kMhiSegBytes))
+      return note("firmware: segment %u could not be read", i), false;
+    addresses[i] = plan.segmentBus[i];
+  }
+  BhieEntry *table = reinterpret_cast<BhieEntry *>(arenaAlloc(gArena, 4096, &plan.tableBus));
+  if (!table) return note("firmware: the DMA window has no room for the vector table"), false;
+  plan.tableEntries = bhieTable(table, 4096 / sizeof(BhieEntry), addresses, plan.layout.imageBytes, kMhiSegBytes);
+  if (!plan.tableEntries) return note("firmware: the vector table does not fit"), false;
+  dsb();
+  note("firmware: in the window: boot loader at %#llx, %u segments, vector table at %#llx (%u entries)",
+       (unsigned long long)plan.sblBus, plan.segments, (unsigned long long)plan.tableBus, plan.tableEntries);
+  return true;
+}
+
+int level4(const LinkState &link, PowerState &power, const Options &opt)
+{
+  if (!mapBar(link.barAddress, link.barBytes > kBar0BytesExpected ? kBar0BytesExpected : link.barBytes)) {
+    note("level 4: BAR0 (%#llx + %u) could not be mapped", (unsigned long long)link.barAddress, link.barBytes);
+    return -14;
+  }
+  note("level 4: BAR0 mapped (%#llx + %#x); MHI version %08x, BHIOFF %08x, BHIEOFF %08x, MHISTATUS %08x",
+       (unsigned long long)link.barAddress, gBarBytes, barRd(nullptr, kMhiRegLen), barRd(nullptr, kMhiBhiOff),
+       barRd(nullptr, kMhiBhieOff), barRd(nullptr, kMhiStatus));
+  MhiBoot boot;
+  if (!mhiOpen(boot, gMhiIo, gBarBytes)) {
+    note("level 4: the MHI register layout is not usable (reglen %08x bhi %08x bhie %08x): %s", boot.reglen, boot.bhi, boot.bhie,
+         mhiFailName(boot.error));
+    safeOff(gHw, power, opt);
+    return -5;
+  }
+  const uint32_t version = chipRead(kChipTcsrSocHwVersion);
+  note("level 4: BHI at %#x, BHIe at %#x, EE %s, state %#x; chip TCSR version %08x (major %u)", boot.bhi, boot.bhie,
+       mhiEeName(mhiEeRead(boot)), mhiStateRead(boot), version, (version >> 8) & 0xfu);
+  FirmwarePlan plan;
+  if (!loadFirmware(plan)) {
+    piano_wifi_firmware_close();
+    safeOff(gHw, power, opt);
+    return -2;
+  }
+  piano_wifi_firmware_close();
+  MhiContexts contexts;
+  uint64_t contextBus = 0;
+  uint8_t *contextVa = arenaAlloc(gArena, kMhiContextBytes, &contextBus);
+  if (!contextVa || !mhiContextsPlan(contexts, contextVa, contextBus, kMhiContextBytes)) {
+    note("level 4: no room for the MHI contexts");
+    safeOff(gHw, power, opt);
+    return -12;
+  }
+  dsb();
+  mhiContextsProgram(contexts, gMhiIo, boot.reglen);
+  note("level 4: contexts at %#llx (channels %u, event rings %u: control at %#llx, data at %#llx, command ring at %#llx)",
+       (unsigned long long)contextBus, kMhiChannels, kMhiEventRings, (unsigned long long)contexts.eventBus[0],
+       (unsigned long long)contexts.eventBus[1], (unsigned long long)contexts.commandBus);
+  uint32_t phase = mhiBegin(boot, 0, plan.sblBus, plan.layout.sblBytes, plan.tableBus,
+                            plan.tableEntries * uint32_t(sizeof(BhieEntry)), uint32_t(nowMs()) | 1u);
+  note("level 4: boot begun in phase %s (EE %s)", mhiPhaseName(phase), mhiEeName(boot.ee));
+  const uint64_t started = nowMs();
+  uint64_t since = started;
+  uint32_t last = phase, steps = 0;
+  while (phase != kMhiDone && phase != kMhiFailed) {
+    if (phase == kMhiNeedContexts) {
+      dsb();
+      mhiContextsProgram(contexts, gMhiIo, boot.reglen);
+      phase = mhiContextsDone(boot);
+    } else {
+      phase = mhiStep(boot);
+      if (phase != kMhiNeedContexts && phase != kMhiDone && phase != kMhiFailed) mhiEventAck(contexts, gMhiIo, boot.reglen);
+    }
+    ++steps;
+    const uint64_t now = nowMs();
+    if (phase != last) {
+      note("level 4: %s after %llu ms (EE %s, state %#x)", mhiPhaseName(phase), (unsigned long long)(now - started),
+           mhiEeName(boot.ee), boot.state);
+      last = phase;
+      since = now;
+      continue;
+    }
+    if (now - since > gArgs.fwTimeoutMs) {
+      phase = mhiTimedOut(boot);
+      break;
+    }
+    IOSleep(5);
+  }
+  note("level 4: %s after %llu ms, %u steps, %u context writes, %u event acknowledgements; EE %s, state %#x, BHI status %08x, "
+       "error code %08x (%s)",
+       phase == kMhiDone ? "mission mode" : "stopped", (unsigned long long)(nowMs() - started), steps, contexts.writes,
+       contexts.acks, mhiEeName(mhiEeRead(boot)), boot.state, boot.lastStatus, boot.errcode, mhiFailName(boot.error));
+  if (phase != kMhiDone) {
+    safeOff(gHw, power, opt);
+    return -1;
+  }
+  return 0;
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------------ the service
@@ -354,8 +1056,14 @@ bool PianoWifi::start(IOService *provider)
   note("start: piano-wifi=%u spmi=%u smmu=%u cmddb=%u hwcg=%u delay=%u repeat=%u samples=%u (WCN7860 %04x:%04x on PCIe0 %#llx)",
        gArgs.level, gArgs.spmi, gArgs.smmu, gArgs.cmddb, gArgs.hwcg, gArgs.delay, gArgs.repeat, gArgs.samples, kEndpointVendor,
        kEndpointDevice, (unsigned long long)kParf);
-  if (gArgs.level > 1) note("piano-wifi=%u: only level 1 exists (docs/drivers/wifi.md section 4); running level 1", gArgs.level);
-  note("level 1: loads only, nothing written%s", gArgs.spmi ? "; SPMI observer read commands for the PMIC part" : "");
+  if (gArgs.level >= 2)
+    note("levels: 1 survey, 2 power, 3 link%s (gen %u, physeq %u, rcg %u, blind %u, release %u, stop %u, dma %u MiB, "
+         "phase timeout %u ms)",
+         gArgs.level >= 4 ? ", 4 MHI firmware" : "", gArgs.gen, gArgs.physeq, gArgs.rcg, gArgs.blind, gArgs.release, gArgs.stop,
+         gArgs.dmaMib, gArgs.fwTimeoutMs);
+  if (gArgs.level > 4) note("piano-wifi=%u: levels above 4 are not implemented; running up to level 4", gArgs.level);
+  note("level 1: loads only, nothing written%s", gArgs.spmi || gArgs.level >= 2 ? "; SPMI observer read commands for the PMIC part"
+                                                                               : "");
   setProperty("piano-wifi", gArgs.level, 32);
   thread_t t = nullptr;
   if (kernel_thread_start(&PianoWifi::thread, this, &t) != KERN_SUCCESS) {
@@ -394,11 +1102,12 @@ void PianoWifi::run()
     stage(4, "SMMU streams 0x1400/0x1401 (read only)");
     reportSmmu();
   }
-  if (gArgs.cmddb) {
+  // Levels 2 and up need both: the rails' RPMh addresses and the PPIDs their regulators answer on.
+  if (gArgs.cmddb || gArgs.level >= 2) {
     stage(5, "AOP command database: the supplies' RPMh resources (read only)");
     reportCmdDb();
   }
-  if (gArgs.spmi) {
+  if (gArgs.spmi || gArgs.level >= 2) {
     stage(6, "the supplies' PMIC regulators and the BT_EN / sleep clock pins over SPMI (observer reads)");
     reportPmic();
   }
@@ -418,8 +1127,95 @@ void PianoWifi::run()
     summary(again, line, sizeof line);
     note("sample %u (+%u s): %s", i, i * gArgs.repeat, line);
   }
-  stage(7, "done");
-  note("done: %llu MMIO loads, %u SPMI observer commands, 0 other stores; %u pages mapped, %u map failures",
+  stage(7, "the survey is done");
+  note("level 1: %llu MMIO loads, %u SPMI observer commands, 0 other stores; %u pages mapped, %u map failures",
        (unsigned long long)gLoads, gSpmiStores, gPageCount, gMapFailures);
+  if (gArgs.level < 2) {
+    unmapAll();
+    return;
+  }
+
+  // ---- level 2 and up: the first writes of this driver -----------------------------------------------------------------
+  const Options opt = options();
+  PowerState power;
+  for (unsigned i = 0; i < kRailCount; ++i) {
+    power.rails[i].ppid = gRailPpid[i];
+    power.rails[i].address = gRailAddress[i];
+  }
+  if (!mapWindows() || !mapRsc()) {
+    stage(-8, "level 2: the windows or apps DRV-2 could not be mapped; nothing was written");
+    unmapWindows();
+    unmapAll();
+    return;
+  }
+  note("level 2: the six PMU rails, PERST# low, WLAN_EN; the PHY's two LDOs are read only (one is the UFS PHY's PLL)");
+  int rc = powerUp(power, gHw, opt);
+  reportPower(power);
+  writeSummary("level 2");
+  if (rc) {
+    stage(power.step, "level 2 stopped here");
+    note("level 2: FAILED at step %d (%s): WLAN_EN is low and PERST# asserted; nothing above this level ran", power.step,
+         errorName(power.error));
+    unmapWindows();
+    unmapAll();
+    return;
+  }
+  note("level 2: done (rails voted, WLAN_EN high, PERST# low, SW_CTRL in %u)", power.swCtrlIo & 1u);
+  if (gArgs.level < 3) {
+    unmapAll();
+    return;
+  }
+
+  // ---- level 3 ---------------------------------------------------------------------------------------------------------
+  LinkState link;
+  rc = linkUp(link, power, gHw, opt);
+  reportLink(link);
+  writeSummary("level 3");
+  char state[200];
+  snprintf(state, sizeof state, "level %u step %d%s%s link %s gen %u bar %llu KiB at %#llx", gArgs.level, link.step,
+           link.error ? " error " : "", link.error ? errorName(link.error) : "",
+           (link.debug1 & kPortDebug1LinkUp) ? "up" : "down", (link.linkStatus >> 16) & 0xfu,
+           (unsigned long long)(link.barBytes / 1024), (unsigned long long)link.barAddress);
+  setProperty("piano-wifi-link", state);
+  if (rc) {
+    stage(link.step, "level 3 stopped here");
+    note("level 3: FAILED at step %d (%s): WLAN_EN is low and PERST# asserted", link.step, errorName(link.error));
+    unmapWindows();
+    unmapAll();
+    return;
+  }
+  note("level 3: done (L0 at Gen%u x%u, the endpoint answers 17cb:110e, BAR0 %llu KiB at %#llx)", (link.linkStatus >> 16) & 0xfu,
+       (link.linkStatus >> 20) & 0x3fu, (unsigned long long)(link.barBytes / 1024), (unsigned long long)link.barAddress);
+  if (gArgs.smmu) {
+    stage(kStepBar + 1, "the SMMU: the endpoint's stream through a bypass context bank");
+    if (!smmuStream(kStreamEndpoint)) {
+      stage(-(kStepBar + 1), "level 3: the endpoint's SMMU stream was not set up; no DMA is started");
+      unmapWindows();
+      unmapAll();
+      return;
+    }
+    if (gArgs.smmu >= 2) (void)smmuStream(kStreamRoot);
+  } else {
+    note("level 3: piano-wifi-smmu=0: the SMMU is untouched (level 4 then needs stream 0x1401 to bypass already)");
+  }
+  if (gArgs.level < 4) {
+    unmapAll();
+    return;
+  }
+
+  // ---- level 4 ---------------------------------------------------------------------------------------------------------
+  stage(400, "level 4: the DMA window, BAR0's MHI registers, the firmware over BHI/BHIe");
+  if (!dmaWindow()) {
+    stage(-400, "level 4: no DMA window; nothing was given to the endpoint");
+    safeOff(gHw, power, opt);
+    unmapWindows();
+    unmapAll();
+    return;
+  }
+  rc = level4(link, power, opt);
+  writeSummary("level 4");
+  stage(rc ? -401 : 401, rc ? "level 4 stopped before mission mode" : "level 4: the firmware runs (mission mode)");
+  note("level 4: %s; the ladder ends here (QMI, WMI and the station are levels 5 and up)",
+       rc ? "the chip did not reach mission mode" : "the chip is in mission mode");
   unmapAll();
 }
