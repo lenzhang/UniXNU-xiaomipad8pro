@@ -35,7 +35,7 @@ Kept, with their readers:
 | Argument | Read by | Why natively |
 |---|---|---|
 | `droidvm-utc`, `droidvm-tz` | the OS image's `settime.sh` boot job | the clock when the PMIC RTC gives none: with k27 0060 and `piano-rtc=1` the kernel sets the calendar first and `settime.sh` leaves it (it only acts near 1970), so it stays as the fallback (`docs/drivers/rtc.md`) |
-| `droidvm-disable-jobs` | the OS image's userland | the jobs listed have no hardware here (watchdogd, CommCenter, locationd, bluetoothd, identityservicesd) |
+| `droidvm-disable-jobs` | nothing natively (corrected 2026-11-11, [boot-time.md](boot-time.md) §4) | the jobs listed have no hardware here (watchdogd, CommCenter, locationd, bluetoothd, identityservicesd), but its reader was the iPadOS line's kernel (`DroidVMLaunchPolicy.c`): the k27 kernel and the KC have no reader, and bluetoothd, locationd and watchdogd run. Kept until the boot-time test; `PIANO_FAST_BOOT` drops it. Natively a daemon is kept from running by `k27-deny-exec=` (k27 0035) or the seed's `disabled.plist` |
 | `droidvm-timebase-hz=24000000` | k27 0042 (pexpert) | userland expects a 24 MHz timebase over SM8750's 19.2 MHz counter |
 | `offline-apfs-load`, `owner-staged-apps`, `union-hide-lower`, `malloc-ranges-off`, `mac-amfi-launch-permissive`, `rootauth=0`, `exec-env`, `kt_fixed_zones`, `tlto_us`, `-no_slto_panic`, `vm_compression_limit`, `arm64_maxoffset` | the k27 kernel (DroidVM series) | they make the same macOS 27.0.1 userland run on a non-Apple machine; not VM-specific |
 | `-apfs_shared_datavolume` | Apple's APFS (not verified) | kept until shown unused |
