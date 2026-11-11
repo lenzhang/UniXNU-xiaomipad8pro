@@ -471,13 +471,18 @@ void hwWrite(void *, unsigned win, uint32_t off, uint32_t value, const char *wha
   note("write %s+%#x = %08x: %s", gWin[win].name, off, value, what);
 }
 
+// The writes of the level just finished (the counts are deltas, so each level's line stands on its own).
+unsigned gWritesBefore, gKindsBefore;
 void writeSummary(const char *level)
 {
   char line[360];
   size_t n = 0;
-  for (unsigned i = 0; i < gSeenCount && n + 40 < sizeof line; ++i)
+  for (unsigned i = gKindsBefore; i < gSeenCount && n + 40 < sizeof line; ++i)
     if (gSeenRepeats[i]) n += size_t(snprintf(line + n, sizeof line - n, "%s%s x%u", n ? ", " : "", gSeen[i], gSeenRepeats[i] + 1));
-  note("%s: %u writes (%u kinds, %u refused)%s%s", level, gWrites, gSeenCount, gBadAccess, n ? "; repeated: " : "", n ? line : "");
+  note("%s: %u writes (%u kinds, %u refused accesses in all)%s%s", level, gWrites - gWritesBefore, gSeenCount - gKindsBefore,
+       gBadAccess, n ? "; repeated: " : "", n ? line : "");
+  gWritesBefore = gWrites;
+  gKindsBefore = gSeenCount;
 }
 
 void hwUdelay(void *, unsigned us) { IODelay(us); }
@@ -646,7 +651,7 @@ int hwVrm(void *, const char *resource, const VrmCmd *cmds, unsigned count, uint
     const char *a = kRails[i].cmdDb, *b = resource;
     unsigned k = 0;
     while (k < 8 && a[k] && a[k] == b[k]) ++k;
-    if (k < 8 && a[k] == b[k]) base = gRailAddress[i];
+    if (k == 8 || a[k] == b[k]) base = gRailAddress[i];   // equal, or equal in the eight characters RPMh names have
   }
   if (address) *address = base;
   if (!base) {
