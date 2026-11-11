@@ -1,0 +1,29 @@
+PianoAudio is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1 only: a read-only survey. What it takes from other
+work, and from where:
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent, package/PianoWifi:
+  PianoWifi.cpp (sha256 9aacfb5b5c598856c6584e27347c32310030d849a8ee46f1a7ca407a2cdfe19c): the kext's shape (probe gate on the boot
+    argument, a survey thread, the post-mortem stage word, MMIO pages mapped on demand and loaded with an explicit ldr, one summary
+    property, repeated samples), re-written for this driver.
+  WifiSurvey.h (sha256 41a9703bf079dfd4f86fe5073399c788725d43e7dc0ad4306b36ffd16c9aa219): decodePin / pullName (the TLMM decode)
+    copied into this namespace; surveySmmu / s2crType re-expressed without the context-bank read and with an overflow count.
+  tests/wifi_host.cpp (sha256 b712b9a4d938d6867aa02d5a5e9d76025fdff2be1314edd6ea8c3024c25f992f): the register-model harness
+    (Soc, CHECK), re-used in tests/audio_host.cpp.
+
+UniXNU-sheng (unixnu-research/UniXNU-sheng, main 00ba90984e831e4c6ce30ec3d8a56e6434e9f1af), BSD-2-Clause-Patent (LICENSE sha256
+5b1d3d911103cb0f41641ec0964c5ac1f7e229f57aa072b6ac38bae913a1307b; SM8550, its audio path hardware-verified there),
+porting.toml (sha256 8f3d462ea12a78e90ca6ee8ed182e3f6573178841589305b0a49142631598894) area "audio": facts only, no code: the audio
+streams' SMMU context banks belong to the hypervisor (programming one reset that board), which is why this survey reads no context
+bank. Its GPR / AudioReach / audio service code is the donor of later levels (docs/drivers/audio.md section 4), not used here.
+
+xiaomipad-8pro-mainline (main 4b853f8ae9770bc6fa9f9eec3bcc996e9bc86dbf; MIT, the topology files BSD-3-Clause), facts only:
+device/audio/README.md (sha256 1a0de4bf2ad1d3a261df258dbaef043318f7e6d0b44d31e7140ca3f41905db3d) and card.json (sha256
+f91d237112702e386a14684051cfe810a5f16a4c4e8116b81abfa71e2166a7f8): the TDM frame and the slot order; tools/speaker-playback-check.py
+(sha256 4263391b8b631598029b3f5f6d422b6c63a696592e7a4f242de3e6f9d163fe4c): the amplifiers' DEVID 0x2900 and STATUS bit names.
+
+The piano boot DT (out/inputs/piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840; the
+running Ubuntu DT): every address, pin, bus address, stream ID and DSP service of AudioHw.h.
+
+Specifications only (no code, comment or table copied): none at this level beyond the DT. Later levels read Linux's q6apm, gpr,
+q6prm, lpass-va-macro and the FS19xx driver (GPL-2.0) as specifications only (docs/drivers/audio.md section 11). Not read and not
+used for anything: any Qualcomm or FourSemi binary, the amplifier preset (fs19xx.fsm), the DSP firmware, the ACDB, the topology.
