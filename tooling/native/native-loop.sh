@@ -18,7 +18,7 @@ log() { echo "$(date +%T) $*" | tee -a "$L/loop.log"; }
 abl() { fastboot devices | grep -q "^$SERIAL"; }
 uefi() { fastboot devices | grep -q "^piano-uefi"; }
 wait_for() { local what=$1 secs=$2; for i in $(seq $((secs * 2))); do $what && return 0; sleep 0.5; done; return 1; }
-RESET=$(strings "$IMG" | grep -o 'piano-reset-after=[0-9][0-9]*' | head -1 | cut -d= -f2); RESET=${RESET:-45}
+RESET=$(strings "$IMG" | grep -o 'piano-reset-after=[0-9][0-9]*' | head -1 | cut -d= -f2 || true); RESET=${RESET:-45}
 log "image $(shasum -a 256 "$IMG" | cut -c1-16), reset after ${RESET} s; dump image $(shasum -a 256 "$DUMP" | cut -c1-16)"
 wait_for abl 240 || { log "no ABL fastboot (parked kernel? power + volume-down 15-20 s)"; exit 1; }
 t0=$(date +%s)

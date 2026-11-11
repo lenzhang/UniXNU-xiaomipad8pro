@@ -9,8 +9,16 @@ is `package/PianoWifi/PianoWifiEthernet.cpp`: an `IOEthernetController` publishi
 (`tooling/native/piano-wifi` prints it). All six are built, host-tested (`tests/wifi_host.cpp`, `tests/bringup_host.cpp`,
 `tests/qmi_host.cpp`, `tests/wmi_host.cpp`) and linked into the native KC ("23 native kexts linked, none from outside this
 repository", PianoWifi 604 pointers, PianoWifiEthernet 442 pointers with its vtable check at 0 problem slots), inert without
-`piano-wifi`; **nothing above level 1 has run on hardware**, and each level must be read from a boot's log before the next one is
-tried (§8.2–§8.6, the batched list in §8.8). Association, keys and the data path (levels 7 and 8) are design only (§12 has level
+`piano-wifi`; each level must be read from a boot's log before the next one is tried (§8.2–§8.6, the batched list in §8.8).
+
+**On the tablet (2026-11-12, unattended RAM boots):** level 2 passed (six PMU rails voted through RPMh and read back, `SW_CTRL in 1`:
+the PMU came up, 10 writes, none refused); level 3 passed (PHY ready after 6 polls, LTSSM L0 Gen2 x2 after 13 ms, endpoint
+`17cb:110e` class 02800001, BAR0 2 MiB, SMMU stream 0x1401 in bypass; 441 writes, none refused). Level 4 and 5 stopped before
+the chip was written: `mhiOpen` took the 2 MiB BAR mapping as the register length and refused anything over 1 MiB (BHIOFF 0x100,
+BHIEOFF 0x224 were fine): fixed, the mapping now bounds the space (host test added). With `piano-wifi-iova=1` the translating
+context bank did not read back what was written (`context bank readback`, before the stream pointed at it): the failure now logs
+every register read back against its written value and turns the bank off again. Level 3 held PERST# low 6-18 s (the GCC votes
+waited while PianoA830 came up): harmless for the link. Next: level 4 again, then 5. Association, keys and the data path (levels 7 and 8) are design only (§12 has level
 5's message table, §14 level 6's, §13 what levels 7 and 8 need and the macOS side's remaining plan). Template: `README.md`.
 
 ## 1. Purpose and gate

@@ -223,7 +223,8 @@ inline bool mhiOpen(MhiBoot &m, const MhiIo &io, uint32_t space)
   m.reglen = space ? space : mhidetail::rd(m, kMhiRegLen);
   m.bhi = mhidetail::rd(m, kMhiBhiOff);
   m.bhie = mhidetail::rd(m, kMhiBhieOff);
-  const bool good = m.reglen >= 0x100 && m.reglen <= 0x100000 && m.bhi >= 0x100 && m.bhi + kBhiErrCode + 4 <= m.reglen &&
+  // The owner's mapping bounds the space (piano's BAR0 is 2 MiB, wifi-l4 2026-11-12); MHIREGLEN alone is trusted up to 1 MiB.
+  const bool good = m.reglen >= 0x100 && m.reglen <= (space ? 0x1000000u : 0x100000u) && m.bhi >= 0x100 && m.bhi + kBhiErrCode + 4 <= m.reglen &&
                     m.bhie >= 0x100 && m.bhie + kBhieTxVecStatus + 4 <= m.reglen && !(m.bhi & 3) && !(m.bhie & 3);
   if (!good) {
     m.phase = kMhiFailed;

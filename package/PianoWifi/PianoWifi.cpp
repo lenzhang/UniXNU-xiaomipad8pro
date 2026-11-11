@@ -983,6 +983,16 @@ bool iovaWindow()
                                     [deadline] { return nowMs() >= deadline; });
   if (failure) {
     note("iova: stream %#x did not take the window: %s", kStreamEndpoint, failure);
+    // wifi-l5i (2026-11-12) stopped at the bank's readback: what each register holds against what was written.
+    const uint32_t cb = gIovaPlan.cb;
+    note("iova: bank %u read back: sctlr %08x (wrote %08x) cba2r %08x (1) cbar %08x (%08x) ttbr0 %08x:%08x (%08llx) tcr %08x (%08x) "
+         "tcr2 %08x fsr %08x",
+         gIovaPlan.bank, smmuRead(cb + iova::kCbSctlr), iova::kSctlrWindow, smmuRead(iova::cba2rOffset(gIovaPlan.bank)),
+         smmuRead(iova::cbarOffset(gIovaPlan.bank)), iova::kCbarStage1, smmuRead(cb + iova::kCbTtbr0Hi),
+         smmuRead(cb + iova::kCbTtbr0Lo), (unsigned long long)tablePa, smmuRead(cb + iova::kCbTcr), iova::kTcrWindow,
+         smmuRead(cb + iova::kCbTcr2), smmuRead(cb + iova::kCbFsr));
+    wr32(gSmmuVa + cb + iova::kCbSctlr, 0);   // the bank off again: the stream never pointed at it
+    dsb();
     return false;
   }
   note("iova: stream %#x translates through bank %u (smr %08x s2cr %08x sctlr %08x)", kStreamEndpoint, gIovaPlan.bank,
@@ -1123,7 +1133,7 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
     note("level 4: BAR0 (%#llx + %u) could not be mapped", (unsigned long long)link.barAddress, link.barBytes);
     return -14;
   }
-  note("level 4: BAR0 mapped (%#llx + %#x); MHI version %08x, BHIOFF %08x, BHIEOFF %08x, MHISTATUS %08x",
+  note("level 4: BAR0 mapped (%#llx + %#x); MHIREGLEN %08x, BHIOFF %08x, BHIEOFF %08x, MHISTATUS %08x",
        (unsigned long long)link.barAddress, gBarBytes, barRd(nullptr, kMhiRegLen), barRd(nullptr, kMhiBhiOff),
        barRd(nullptr, kMhiBhieOff), barRd(nullptr, kMhiStatus));
   MhiBoot boot;

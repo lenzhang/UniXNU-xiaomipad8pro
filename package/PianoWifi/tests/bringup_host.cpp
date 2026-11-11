@@ -722,6 +722,13 @@ static void testMhiBoot()
   CHECK(d.contextWrites >= 2);   // again after the boot loader reset the registers
   CHECK(d.regs[kMhiCtrlLimit] == uint32_t(kMhiHostLimit) && d.regs[kMhiDataLimit] == uint32_t(kMhiHostLimit));
 
+  {   // piano's BAR0: the owner maps 2 MiB (wifi-l4, 2026-11-12: MHIREGLEN 0x100, BHIOFF 0x100, BHIEOFF 0x224)
+    Device bar;
+    MhiBoot b;
+    CHECK(mhiOpen(b, bar.io(), 0x200000) && b.reglen == 0x200000 && b.phase == kMhiIdle);
+    MhiBoot huge;
+    CHECK(!mhiOpen(huge, bar.io(), 0x2000000) && huge.error == kMhiErrLayout);
+  }
   {   // a register layout that makes no sense
     Device bad;
     bad.regs[kMhiBhiOff] = 4;
