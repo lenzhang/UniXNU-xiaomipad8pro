@@ -1,0 +1,949 @@
+From 1ea6b5a720b11f24554d8aef27b4bd024a75f4ad Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Wed, 11 Nov 2026 21:34:36 +0800
+Subject: [PATCH] k27: piano-boot-guard=SECS: the installed system's boot
+ guarded by the Gunyah watchdog (restart reason bootloader until healthy)
+
+Booted from the ESP (no piano-reset-after), nothing armed the Gunyah watchdog: a hang in the boot (one seen in the GPU bring-up)
+left the tablet stuck until power + volume-down. piano-boot-guard=SECS (nothing changes without it):
+
+- EARLY_BOOT: the PMIC SDAM restart reason bootloader (0057's byte) and the watchdog held (32 s bite), pinged every 10 s by a
+  thread call. Each tick also sends every other running CPU a nop IPI and checks that its interrupt count moved since the tick
+  before: a CPU quiet for two ticks (masked, stalled on the bus) ends the pings and the guard resets through PSCI
+  (piano-boot-guard-cpus=0 skips the check). So a hang, a stuck CPU or a panic restart in the boot lands in ABL fastboot.
+- At SECS of uptime, in that thread call: healthy when the exec of piano-boot-guard-exec (launchd unless given; "none": the
+  uptime alone) has been seen. Healthy: the restart reason back to normal, the pings and checks go on, so a later hang restarts
+  the installed system. Not healthy: a PSCI reset into ABL fastboot.
+- piano-reset-after set: the guard stays off (0056 keeps the watchdog and the reason); piano-reset-to=bootloader without it keeps
+  the reason at bootloader after health.
+- The watchdog has one owner now (machine_routines.c piano_watchdog_hold/release/ping/enabled): 0056, the guard and 0062's
+  suspend path are its holders and the last one out disables it, so the end of 0062's wake window no longer turns off a watchdog
+  the guard holds, and 0062's loop pings it whoever holds it (piano-sleep-wdt=0 included).
+- Tests: piano-boot-guard-ping=0 (armed, never pinged: the bite must land in ABL fastboot), piano-boot-guard-test=hang-at=N
+  (every CPU masked at N s: before SECS ABL fastboot, after it the installed system).
+- machdep.piano_boot_guard (string): armed/healthy, the restart reason, the milestone, the watchdog's holders, pings.
+- The decisions are osfmk/arm64/piano_guard_policy.h = UniXNU-piano tooling/k27/piano-guard/piano_guard_policy.h (host-tested).
+- 0057's restart reason write checks its read-back; the line names the writer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bsd/dev/arm64/sysctl.c           |  17 ++
+ bsd/kern/kern_exec.c             |   7 +
+ osfmk/arm64/machine_routines.c   | 383 +++++++++++++++++++++++++++++--
+ osfmk/arm64/piano_guard_policy.h | 233 +++++++++++++++++++
+ osfmk/arm64/piano_pm.c           |  51 ++--
+ osfmk/arm64/piano_pm.h           |  17 +-
+ 6 files changed, 655 insertions(+), 53 deletions(-)
+ create mode 100644 osfmk/arm64/piano_guard_policy.h
+
+diff --git a/bsd/dev/arm64/sysctl.c b/bsd/dev/arm64/sysctl.c
+index 88050c8..db8c12d 100644
+--- a/bsd/dev/arm64/sysctl.c
++++ b/bsd/dev/arm64/sysctl.c
+@@ -169,6 +169,23 @@ SYSCTL_PROC(_machdep, OID_AUTO, piano_sleep,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_piano_sleep, "A",
+     "piano-sleep: suspend-to-idle state and counters");
++
++/* piano (k27 0063): the boot guard: armed or healthy, the restart reason, the watchdog (UniXNU-piano docs/boot-guard.md) */
++extern size_t piano_boot_guard_format(char *buf, size_t len);
++
++static int
++sysctl_piano_boot_guard SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	char buf[384];
++	size_t n = piano_boot_guard_format(buf, sizeof(buf));
++	return SYSCTL_OUT(req, buf, n + 1);
++}
++
++SYSCTL_PROC(_machdep, OID_AUTO, piano_boot_guard,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_piano_boot_guard, "A",
++    "piano-boot-guard: armed/healthy, the restart reason, the watchdog and its pings");
+ #endif /* defined(XNU_VM_GUEST) */
+ 
+ #if defined(HAS_IPI)
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 49765bc..5d02523 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2794,6 +2794,13 @@ cleanup_rosetta_fp:
+ 			printf("exec: pid %d %s\n", proc_getpid(p), p->p_comm);
+ 		}
+ 	}
++#if defined(XNU_VM_GUEST) && defined(__arm64__)
++	/* piano (k27 0063): piano-boot-guard's milestone, the exec of piano-boot-guard-exec (launchd unless given) */
++	{
++		extern void piano_boot_guard_exec(const char *comm);
++		piano_boot_guard_exec(p->p_comm);
++	}
++#endif
+ 
+ #if CONFIG_DTRACE
+ 	dtrace_proc_exec(p);
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 77739ff..d015c6c 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -967,9 +967,13 @@ ml_read_psci_conduit(void)
+  * 10 s and, once the uptime passes the limit, logs and resets through PSCI SYSTEM_RESET on the ADT's conduit (a warm
+  * reset: the pstore-console zone survives for Ubuntu to read). The watchdog (Gunyah SMCCC vendor-hyp service, SET_TIME
+  * bark/bite in ms <= 32768, CONTROL 3 = enable) is the backstop for hangs and panics that stop the timer: no pet for 32 s
+- * resets the tablet. Off without the boot arg (the VM never sets it).
++ * resets the tablet. Off without the boot arg (the VM never sets it). Since k27 0063 the watchdog has one owner (below), and
++ * this is one of its holders.
+  */
+ #include <kern/thread_call.h>
++#include <kern/processor.h>
++#include <arm64/piano_pm.h>
++#include "piano_guard_policy.h"
+ #define GH_WDT_CONTROL  0x86000005ULL
+ #define GH_WDT_STATUS   0x86000006ULL
+ #define GH_WDT_PING     0x86000007ULL
+@@ -977,7 +981,6 @@ ml_read_psci_conduit(void)
+ 
+ static uint64_t piano_reset_after_ns;
+ static thread_call_t piano_reset_call;
+-static bool piano_wdt_armed;
+ 
+ static uint64_t
+ piano_smc(uint64_t fn, uint64_t a1, uint64_t a2)
+@@ -991,6 +994,79 @@ piano_smc(uint64_t fn, uint64_t a1, uint64_t a2)
+ 	return x0;
+ }
+ 
++/*
++ * k27 0063: the Gunyah watchdog has one owner, here. Its holders (piano_guard_policy.h PIANO_WDT_*): piano-reset-after (0056) and
++ * piano-boot-guard (0063) for the whole boot, piano-sleep (0062) from a suspend's entry to 240 s after its wake. The first holder
++ * enables it (STATUS, SET_TIME bark 30 s / bite 32 s, CONTROL 3), the last one out disables it (CONTROL 2), so 0062's end of its
++ * wake window no longer turns off a watchdog another holder still needs. Anyone may ping it (0056's and the guard's thread calls,
++ * 0062's loop while the thread calls are frozen); a ping is a no-op while it is off. Native only (the SMC conduit).
++ */
++static SIMPLE_LOCK_DECLARE(piano_wdt_lock, 0);
++static uint32_t piano_wdt_holders;
++static uint32_t piano_wdt_on;              /* 1: enabled in Gunyah */
++
++bool
++piano_watchdog_hold(uint32_t who)
++{
++	if (ml_psci_conduit != ML_PSCI_CONDUIT_SMC) {
++		return false;
++	}
++	simple_lock(&piano_wdt_lock, LCK_GRP_NULL);
++	piano_wdt_holders |= who;
++	bool on = os_atomic_load(&piano_wdt_on, relaxed) != 0;
++	if (piano_wdt_change(piano_wdt_holders, on) == 1) {
++		on = (int64_t)piano_smc(GH_WDT_STATUS, 0, 0) >= 0 && (int64_t)piano_smc(GH_WDT_SET_TIME, 30000, 32000) == 0 &&
++		    (int64_t)piano_smc(GH_WDT_CONTROL, 3, 0) == 0;
++		os_atomic_store(&piano_wdt_on, on ? 1u : 0u, relaxed);
++	}
++	simple_unlock(&piano_wdt_lock);
++	return on;
++}
++
++void
++piano_watchdog_release(uint32_t who)
++{
++	simple_lock(&piano_wdt_lock, LCK_GRP_NULL);
++	piano_wdt_holders &= ~who;
++	if (piano_wdt_change(piano_wdt_holders, os_atomic_load(&piano_wdt_on, relaxed) != 0) == -1) {
++		(void)piano_smc(GH_WDT_CONTROL, 2, 0);
++		os_atomic_store(&piano_wdt_on, 0u, relaxed);
++	}
++	simple_unlock(&piano_wdt_lock);
++}
++
++void
++piano_watchdog_ping(void)
++{
++	if (os_atomic_load(&piano_wdt_on, relaxed) != 0) {
++		(void)piano_smc(GH_WDT_PING, 0, 0);
++	}
++}
++
++bool
++piano_watchdog_enabled(void)
++{
++	return os_atomic_load(&piano_wdt_on, relaxed) != 0;
++}
++
++uint32_t
++piano_watchdog_holders(void)
++{
++	return os_atomic_load(&piano_wdt_holders, relaxed);
++}
++
++/* PSCI SYSTEM_RESET on the ADT's conduit (a warm reset); returns only if the firmware refused. */
++static void
++piano_psci_reset(void)
++{
++	register uint64_t x0 __asm__("x0") = 0x84000009ULL;
++	if (ml_psci_conduit == ML_PSCI_CONDUIT_SMC) {
++		__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	} else {
++		__asm__ volatile ("hvc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	}
++}
++
+ static void
+ piano_reset_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
+ {
+@@ -999,17 +1075,10 @@ piano_reset_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unuse
+ 	if (now >= piano_reset_after_ns) {
+ 		printf("piano-reset-after: %llu s reached, PSCI SYSTEM_RESET\n", piano_reset_after_ns / NSEC_PER_SEC);
+ 		delay(200000);
+-		register uint64_t x0 __asm__("x0") = 0x84000009ULL;
+-		if (ml_psci_conduit == ML_PSCI_CONDUIT_SMC) {
+-			__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+-		} else {
+-			__asm__ volatile ("hvc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+-		}
++		piano_psci_reset();
+ 		return;   /* still here: the watchdog (no more pets) takes the tablet down within 32 s */
+ 	}
+-	if (piano_wdt_armed) {
+-		(void)piano_smc(GH_WDT_PING, 0, 0);
+-	}
++	piano_watchdog_ping();
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline(10, NSEC_PER_SEC, &deadline);
+ 	thread_call_enter_delayed(piano_reset_call, deadline);
+@@ -1023,7 +1092,9 @@ piano_reset_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unuse
+  * 0x20 * APID for reads, read/write channels at 0x0C500000 + 0x1000 * APID; command = opcode << 27 | offset << 4 | (n - 1),
+  * status bit 0 done, bits 1-3 error). So every later reset of this boot (the timed one, a panic restart, a watchdog bite)
+  * lands in ABL fastboot, where the next RAM image is waiting. Written for XNU from those register facts (the behaviour of
+- * Linux's spmi-pmic-arb and of piano-uefi's selector, read as the specification only).
++ * Linux's spmi-pmic-arb and of piano-uefi's selector, read as the specification only). k27 0063's boot guard writes the same
++ * byte: bootloader at EARLY_BOOT, normal again once the boot is healthy; WHO names the writer in the line, and the read-back
++ * must say REASON.
+  */
+ #define SPMI_CORE       0x0C400000ULL
+ #define SPMI_CNFG       0x0C42D000ULL
+@@ -1045,7 +1116,7 @@ piano_spmi_wait(volatile uint32_t *status)
+ }
+ 
+ static int
+-piano_set_restart_reason(uint8_t reason)
++piano_set_restart_reason(uint8_t reason, const char *who)
+ {
+ 	volatile uint32_t *core = (volatile uint32_t *)ml_io_map(SPMI_CORE, 0x3000);
+ 	volatile uint32_t *cnfg = (volatile uint32_t *)ml_io_map(SPMI_CNFG, 0x1000);
+@@ -1085,8 +1156,9 @@ piano_set_restart_reason(uint8_t reason)
+ 	}
+ 	obsv[0] = (1u << 27) | (SDAM_REASON << 4);
+ 	(void)piano_spmi_wait(&obsv[2]);
+-	printf("piano-reset-to: SDAM restart reason 0x%02x -> 0x%02x (APID %u)\n", old, (uint8_t)obsv[6], apid);
+-	return 0;
++	uint8_t now = (uint8_t)obsv[6];
++	printf("%s: SDAM restart reason 0x%02x -> 0x%02x (APID %u)\n", who, old, now, apid);
++	return (now >> 1) == reason ? 0 : -7;                    /* k27 0063: the read-back must say it */
+ }
+ 
+ static void
+@@ -1099,21 +1171,290 @@ piano_reset_init(void)
+ 	piano_reset_after_ns = (uint64_t)secs * NSEC_PER_SEC;
+ 	char to[16] = "";
+ 	if (PE_parse_boot_argn("piano-reset-to", to, sizeof(to)) && strcmp(to, "bootloader") == 0) {
+-		int err = piano_set_restart_reason(2);
++		int err = piano_set_restart_reason(2, "piano-reset-to");
+ 		if (err != 0) {
+ 			printf("piano-reset-to: SDAM write failed (%d); resets return to the installed OS\n", err);
+ 		}
+ 	}
+-	if ((int64_t)piano_smc(GH_WDT_STATUS, 0, 0) >= 0 &&
+-	    (int64_t)piano_smc(GH_WDT_SET_TIME, 30000, 32000) == 0 && (int64_t)piano_smc(GH_WDT_CONTROL, 3, 0) == 0) {
+-		piano_wdt_armed = true;
+-	}
+-	printf("piano-reset-after: reset at %u s, Gunyah watchdog %s\n", secs, piano_wdt_armed ? "armed (32 s bite)" : "not available");
++	bool wdt = piano_watchdog_hold(PIANO_WDT_RESET_AFTER);
++	printf("piano-reset-after: reset at %u s, Gunyah watchdog %s\n", secs, wdt ? "armed (32 s bite)" : "not available");
+ 	piano_reset_call = thread_call_allocate_with_options(piano_reset_tick, NULL, THREAD_CALL_PRIORITY_KERNEL_HIGH, THREAD_CALL_OPTIONS_ONCE);
+ 	piano_reset_tick(NULL, NULL);
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_reset_init);
+ 
++/*
++ * k27 0063: piano-boot-guard=SECS, the installed system's way back from a hang (UniXNU-piano docs/boot-guard.md). Booted from the
++ * ESP (no piano-reset-after) nothing armed the watchdog, so a hang in the boot (a stall in the GPU bring-up, say) stayed until
++ * power + volume-down. With the argument:
++ *   - at EARLY_BOOT the PMIC restart reason becomes bootloader (2, 0057's SDAM byte) and the guard holds the watchdog (32 s
++ *     bite), pinged every 10 s by a thread call. Each tick also sends every other running CPU a nop IPI and checks that its
++ *     interrupt count moved since the tick before (piano-boot-guard-cpus=0 skips this): a CPU that took none across two ticks
++ *     (masked, or stalled on the bus) ends the pings and the guard resets through PSCI. So a whole-system hang (no tick), a stuck
++ *     CPU or a panic restart lands in ABL fastboot, where the Mac takes over;
++ *   - at SECS of uptime the health decision: healthy when the exec of piano-boot-guard-exec (launchd unless given; "none": the
++ *     uptime alone) has been seen by then. It runs in the pinging thread call, so it also says that this still runs. Healthy:
++ *     the restart reason goes back to normal (0) and the pings and CPU checks go on, so a later hang restarts the installed
++ *     system. Not healthy: a PSCI reset into ABL fastboot (a boot that never reached userland does not sit there);
++ *   - with piano-reset-after (0056) the guard stays off: that run owns the watchdog and the reason. piano-reset-to=bootloader
++ *     without it: the guard runs and keeps the reason at bootloader when healthy;
++ *   - tests: piano-boot-guard-ping=0 arms and never pings (the bite about 32 s later must land in ABL fastboot);
++ *     piano-boot-guard-test=hang-at=N masks interrupts on every CPU at N s of uptime (before SECS: ABL fastboot; after: the
++ *     installed system).
++ * The decisions are piano_guard_policy.h (UniXNU-piano tooling/k27/piano-guard, host-tested); machdep.piano_boot_guard shows the
++ * state. While 0062's suspend freezes the thread calls, its loop pings the watchdog.
++ */
++#define PIANO_GUARD_PERIOD_S    10u
++
++static int piano_guard_state = PIANO_GUARD_OFF;
++static uint32_t piano_guard_secs, piano_guard_reset_after, piano_guard_hang_at;
++static bool piano_guard_ping = true, piano_guard_cpus = true, piano_guard_keep_reason;
++static bool piano_guard_need_exec;          /* the exec hook looks for the milestone */
++static volatile bool piano_guard_silent;    /* no more pings from here: a stuck CPU, a failed decision, a test hang */
++static char piano_guard_exec_name[PIANO_GUARD_COMLEN + 1] = "launchd";
++static uint64_t piano_guard_milestone_ns;   /* the uptime of the milestone's exec, 0 not seen */
++static int piano_guard_reason = -1, piano_guard_reason_err, piano_guard_stuck = -1;
++static uint64_t piano_guard_decided_ns, piano_guard_last_ns, piano_guard_max_gap_ns, piano_guard_pings;
++static uint32_t piano_guard_irqs[MAX_CPUS];
++static uint8_t piano_guard_quiet[MAX_CPUS];
++static bool piano_guard_poked[MAX_CPUS];
++static thread_call_t piano_guard_call, piano_guard_test_call;
++static uint32_t piano_guard_spin_sync;
++
++static uint64_t
++piano_guard_uptime_ns(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
++/* kern_exec, every image activation: the milestone is the first exec whose p_comm is its name. */
++void
++piano_boot_guard_exec(const char *comm)
++{
++	if (!piano_guard_need_exec || os_atomic_load(&piano_guard_milestone_ns, relaxed) != 0 ||
++	    !piano_guard_comm_is(comm, piano_guard_exec_name)) {
++		return;
++	}
++	uint64_t now = piano_guard_uptime_ns();
++	if (os_atomic_cmpxchg(&piano_guard_milestone_ns, 0ULL, now != 0 ? now : 1, relaxed)) {
++		printf("piano-boot-guard: exec of %s at %llu s (the milestone)\n", piano_guard_exec_name, now / NSEC_PER_SEC);
++	}
++}
++
++size_t
++piano_boot_guard_format(char *buf, size_t len)
++{
++	struct piano_guard_view v = {
++		.state = piano_guard_state, .secs = piano_guard_secs, .reset_after = piano_guard_reset_after,
++		.now_ms = piano_guard_uptime_ns() / NSEC_PER_MSEC, .decided_ms = piano_guard_decided_ns / NSEC_PER_MSEC,
++		.milestone_ms = os_atomic_load(&piano_guard_milestone_ns, relaxed) / NSEC_PER_MSEC,
++		.exec = piano_guard_need_exec ? piano_guard_exec_name : "", .reason = piano_guard_reason,
++		.reason_err = piano_guard_reason_err, .keep_reason = piano_guard_keep_reason, .wdt_on = piano_watchdog_enabled(),
++		.holders = piano_watchdog_holders(), .pinging = piano_guard_ping && !piano_guard_silent, .pings = piano_guard_pings,
++		.max_gap_ms = piano_guard_max_gap_ns / NSEC_PER_MSEC, .cpu_check = piano_guard_cpus, .stuck_cpu = piano_guard_stuck,
++		.hang_at = piano_guard_hang_at,
++	};
++	if (v.milestone_ms == 0 && os_atomic_load(&piano_guard_milestone_ns, relaxed) != 0) {
++		v.milestone_ms = 1;
++	}
++	return piano_guard_format(buf, len, &v);
++}
++
++static void
++piano_guard_log(void)
++{
++	char line[384];
++	(void)piano_boot_guard_format(line, sizeof(line));
++	printf("piano-boot-guard: %s", line);
++}
++
++/* Every other running CPU took an interrupt since the last tick (each gets a nop IPI per tick): -1, else the first one stuck. */
++static int
++piano_guard_check_cpus(void)
++{
++	int stuck = -1;
++	disable_preemption();
++	const int self = cpu_number();
++	for (int cpu = 0; cpu <= ml_get_max_cpu_number() && cpu < MAX_CPUS; cpu++) {
++		cpu_data_t *cdp = cpu_datap(cpu);
++		processor_t proc = cdp != NULL ? cpu_to_processor(cpu) : PROCESSOR_NULL;
++		bool up = cpu != self && proc != PROCESSOR_NULL && proc->state >= PROCESSOR_IDLE &&
++		    (os_atomic_load(&cdp->cpu_flags, relaxed) & (InitState | StartedState)) == (InitState | StartedState);
++		uint32_t irqs = up ? (uint32_t)os_atomic_load(&cdp->cpu_stat.irq_ex_cnt, relaxed) : 0;
++		if (piano_guard_cpu_quiet(irqs, &piano_guard_irqs[cpu], &piano_guard_quiet[cpu], piano_guard_poked[cpu], up) && stuck < 0) {
++			stuck = cpu;
++		}
++		piano_guard_poked[cpu] = up && cpu_signal(cdp, SIGPnop, NULL, NULL) == KERN_SUCCESS;
++	}
++	enable_preemption();
++	return stuck;
++}
++
++static void
++piano_guard_healthy(uint64_t now)
++{
++	piano_guard_decided_ns = now;
++	piano_guard_state = PIANO_GUARD_HEALTHY;
++	if (piano_guard_keep_reason) {
++		printf("piano-boot-guard: healthy after %u s, restart reason stays bootloader (piano-reset-to)\n", piano_guard_secs);
++	} else {
++		int err = piano_set_restart_reason(0, "piano-boot-guard");
++		piano_guard_reason_err = err;
++		if (err == 0) {
++			piano_guard_reason = 0;
++			printf("piano-boot-guard: healthy after %u s, restart reason normal\n", piano_guard_secs);
++		} else {
++			printf("piano-boot-guard: healthy after %u s, but the restart reason write failed (%d): it stays %s\n",
++			    piano_guard_secs, err, piano_guard_reason_name(piano_guard_reason));
++		}
++	}
++	piano_guard_log();
++}
++
++static void
++piano_guard_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	const uint64_t now = piano_guard_uptime_ns(), deadline = (uint64_t)piano_guard_secs * NSEC_PER_SEC;
++	const char *into = piano_guard_reason == 2 ? "ABL fastboot" : "the installed system";
++	if (piano_guard_last_ns != 0 && now - piano_guard_last_ns > piano_guard_max_gap_ns) {
++		piano_guard_max_gap_ns = now - piano_guard_last_ns;
++	}
++	piano_guard_last_ns = now;
++	if (piano_guard_cpus && !piano_guard_silent) {
++		int stuck = piano_guard_check_cpus();
++		if (stuck >= 0) {
++			piano_guard_stuck = stuck;
++			piano_guard_silent = true;
++			printf("piano-boot-guard: CPU %d took no interrupt across %u ticks (a nop IPI each): hung; no more pings, PSCI reset "
++			    "into %s\n", stuck, PIANO_GUARD_QUIET_TICKS, into);
++			delay(200000);
++			piano_psci_reset();
++			return;   /* still here: no more pings, the watchdog bites within 32 s */
++		}
++	}
++	switch (piano_guard_decide(piano_guard_state, now, deadline, os_atomic_load(&piano_guard_milestone_ns, relaxed),
++	    piano_guard_need_exec)) {
++	case PIANO_GUARD_GO_HEALTHY:
++		piano_guard_healthy(now);
++		break;
++	case PIANO_GUARD_GO_FAILED:
++		piano_guard_decided_ns = now;
++		piano_guard_state = PIANO_GUARD_FAILED;
++		piano_guard_silent = true;
++		printf("piano-boot-guard: not healthy after %u s (no exec of %s yet): PSCI reset into %s\n", piano_guard_secs,
++		    piano_guard_exec_name, into);
++		piano_guard_log();
++		delay(200000);
++		piano_psci_reset();
++		return;   /* still here: no more pings, the watchdog bites within 32 s */
++	default:
++		break;
++	}
++	if (piano_guard_ping && !piano_guard_silent && piano_watchdog_enabled()) {
++		piano_watchdog_ping();
++		piano_guard_pings++;
++	}
++	uint64_t next = piano_guard_next(piano_guard_state, now, deadline, (uint64_t)PIANO_GUARD_PERIOD_S * NSEC_PER_SEC), delta;
++	nanoseconds_to_absolutetime(next - now, &delta);
++	thread_call_enter_delayed(piano_guard_call, mach_absolute_time() + delta);
++}
++
++/* piano-boot-guard-test=hang-at=N: what a hang is to the watchdog, on every CPU (cpu_broadcast_xcall, this one too). */
++__attribute__((noreturn))
++static void
++piano_guard_spin(void *arg __unused)
++{
++	(void)ml_set_interrupts_enabled(FALSE);
++	for (;;) {
++		__builtin_arm_wfe();
++	}
++}
++
++static void
++piano_guard_hang(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	if (!piano_watchdog_enabled()) {
++		printf("piano-boot-guard: test: the watchdog is off, so no CPU is stopped (nothing would reset the tablet)\n");
++		return;
++	}
++	piano_guard_silent = true;
++	printf("piano-boot-guard: test: every CPU stops now with interrupts masked (piano-boot-guard-test=hang-at=%u): the watchdog "
++	    "resets into %s within 32 s\n", piano_guard_hang_at, piano_guard_reason == 2 ? "ABL fastboot" : "the installed system");
++	delay(300000);
++	(void)cpu_broadcast_xcall(&piano_guard_spin_sync, TRUE, piano_guard_spin, &piano_guard_spin_sync);
++	piano_guard_spin(NULL);
++}
++
++static void
++piano_boot_guard_init(void)
++{
++	uint32_t secs = 0, ping = 1, cpus = 1, reset_after = 0;
++	if (!PE_parse_boot_argn("piano-boot-guard", &secs, sizeof(secs)) || secs == 0) {
++		return;
++	}
++	piano_guard_secs = secs;
++	if (PE_parse_boot_argn("piano-reset-after", &reset_after, sizeof(reset_after)) && reset_after != 0) {
++		piano_guard_state = PIANO_GUARD_DEFERRED;
++		piano_guard_reset_after = reset_after;
++		printf("piano-boot-guard: piano-reset-after=%u owns the watchdog and the restart reason: the guard stays off\n", reset_after);
++		return;
++	}
++	if (ml_psci_conduit != ML_PSCI_CONDUIT_SMC) {
++		piano_guard_state = PIANO_GUARD_NOT_NATIVE;
++		printf("piano-boot-guard: PSCI is not through SMC (ADT /psci): native only, the guard stays off\n");
++		return;
++	}
++	PE_parse_boot_argn("piano-boot-guard-ping", &ping, sizeof(ping));
++	PE_parse_boot_argn("piano-boot-guard-cpus", &cpus, sizeof(cpus));
++	piano_guard_ping = ping != 0;
++	piano_guard_cpus = cpus != 0;
++	char name[PIANO_GUARD_COMLEN + 1] = "";
++	if (PE_parse_boot_arg_str("piano-boot-guard-exec", name, (int)sizeof(name))) {
++		strlcpy(piano_guard_exec_name, name, sizeof(piano_guard_exec_name));
++	}
++	char to[16] = "";
++	piano_guard_keep_reason = PE_parse_boot_arg_str("piano-reset-to", to, (int)sizeof(to)) && strcmp(to, "bootloader") == 0;
++	char test[32] = "";
++	if (PE_parse_boot_arg_str("piano-boot-guard-test", test, (int)sizeof(test)) &&
++	    piano_guard_parse_test(test, &piano_guard_hang_at) != 0) {
++		printf("piano-boot-guard: piano-boot-guard-test=%s is not hang-at=N (N 1..86400 s): no test\n", test);
++	}
++	int err = piano_set_restart_reason(2, "piano-boot-guard");
++	piano_guard_reason_err = err;
++	if (err == 0) {
++		piano_guard_reason = 2;
++	} else {
++		printf("piano-boot-guard: the restart reason write failed (%d): a hang in the boot restarts the installed system\n", err);
++	}
++	const bool wdt = piano_watchdog_hold(PIANO_WDT_GUARD);
++	piano_guard_call = thread_call_allocate_with_options(piano_guard_tick, NULL, THREAD_CALL_PRIORITY_KERNEL_HIGH,
++	    THREAD_CALL_OPTIONS_ONCE);
++	piano_guard_need_exec = !piano_guard_exec_none(piano_guard_exec_name);
++	piano_guard_state = PIANO_GUARD_ARMED;
++	printf("piano-boot-guard: armed: restart reason %s until healthy, Gunyah watchdog %s, CPU check %s; health at %u s: %s%s, "
++	    "else a PSCI reset into ABL fastboot\n", piano_guard_reason_name(piano_guard_reason),
++	    wdt ? (piano_guard_ping ? "armed (32 s bite), pinged every 10 s" : "armed (32 s bite)") : "not available",
++	    piano_guard_cpus ? "on" : "off", secs, piano_guard_need_exec ? "the exec of " : "the uptime alone",
++	    piano_guard_need_exec ? piano_guard_exec_name : "");
++	if (wdt && !piano_guard_ping) {
++		printf("piano-boot-guard: test: no pings (piano-boot-guard-ping=0): the watchdog bites about 32 s from now, into %s\n",
++		    piano_guard_reason == 2 ? "ABL fastboot" : "the installed system");
++	}
++	if (piano_guard_hang_at != 0) {
++		piano_guard_test_call = thread_call_allocate_with_options(piano_guard_hang, NULL, THREAD_CALL_PRIORITY_KERNEL_HIGH,
++		    THREAD_CALL_OPTIONS_ONCE);
++		uint64_t now = piano_guard_uptime_ns(), when = (uint64_t)piano_guard_hang_at * NSEC_PER_SEC, delta;
++		nanoseconds_to_absolutetime(when > now ? when - now : 0, &delta);
++		thread_call_enter_delayed(piano_guard_test_call, mach_absolute_time() + delta);
++		printf("piano-boot-guard: test: every CPU stops at %u s (piano-boot-guard-test), %s the health decision\n",
++		    piano_guard_hang_at, piano_guard_hang_at < secs ? "before" : "after");
++	}
++	piano_guard_tick(NULL, NULL);
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_boot_guard_init);
++
+ /*
+  * k27 0060: piano-rtc=1: the calendar starts from the PMIC RTC (UniXNU-piano docs/drivers/rtc.md). XNU sets the calendar once,
+  * in clock_initialize_calendar() at bsd_init, from PEGetUTCTimeOfDay(). The platform expert here (ArmDTPlatform, an
+diff --git a/osfmk/arm64/piano_guard_policy.h b/osfmk/arm64/piano_guard_policy.h
+new file mode 100644
+index 0000000..ea846e8
+--- /dev/null
++++ b/osfmk/arm64/piano_guard_policy.h
+@@ -0,0 +1,233 @@
++/*
++ * piano (k27 0063): the boot guard's decisions that touch no hardware (osfmk/arm64/machine_routines.c), as plain inline C so
++ * that they are host-tested (UniXNU-piano tooling/k27/piano-guard: this file byte for byte, and test_piano_guard_policy.c).
++ * No kernel headers; the includer declares snprintf (the kernel's <kern/misc_protos.h>, the host's <stdio.h>).
++ */
++#ifndef PIANO_GUARD_POLICY_H
++#define PIANO_GUARD_POLICY_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* The Gunyah watchdog's holders. machine_routines.c owns the watchdog: it is enabled while anyone holds it. */
++#define PIANO_WDT_RESET_AFTER   0x1u    /* k27 0056, piano-reset-after: the whole boot */
++#define PIANO_WDT_GUARD         0x2u    /* k27 0063, piano-boot-guard: the whole boot */
++#define PIANO_WDT_SLEEP         0x4u    /* k27 0062, piano-sleep: from a suspend's entry to 240 s after its wake */
++
++/* After a hold or a release (HOLDERS now, ENABLED the watchdog's state): 1 enable it (also a retry after a failed enable),
++ * -1 disable it (the last holder left), 0 leave it. */
++static inline int
++piano_wdt_change(uint32_t holders, bool enabled)
++{
++	if (holders != 0 && !enabled) {
++		return 1;
++	}
++	if (holders == 0 && enabled) {
++		return -1;
++	}
++	return 0;
++}
++
++#define PIANO_GUARD_OFF         0   /* no piano-boot-guard */
++#define PIANO_GUARD_DEFERRED    1   /* piano-reset-after (k27 0056) owns the watchdog and the restart reason */
++#define PIANO_GUARD_NOT_NATIVE  2   /* the PSCI conduit is not SMC (a VM): nothing to guard */
++#define PIANO_GUARD_ARMED       3   /* restart reason bootloader, the watchdog pinged, the health decision still due */
++#define PIANO_GUARD_HEALTHY     4   /* restart reason normal again (unless kept), still pinged */
++#define PIANO_GUARD_FAILED      5   /* not healthy at the decision: reset into ABL fastboot */
++
++#define PIANO_GUARD_WAIT        0   /* nothing to decide: ping (when pinging) and tick again */
++#define PIANO_GUARD_GO_HEALTHY  1
++#define PIANO_GUARD_GO_FAILED   2
++
++/* The health decision at uptime NOW: due at DEADLINE (piano-boot-guard's seconds), healthy when the milestone (the exec of
++ * piano-boot-guard-exec, at uptime MILESTONE, 0 not seen) was reached or NEED says none is needed. One unit for all times. */
++static inline int
++piano_guard_decide(int state, uint64_t now, uint64_t deadline, uint64_t milestone, bool need)
++{
++	if (state != PIANO_GUARD_ARMED || now < deadline) {
++		return PIANO_GUARD_WAIT;
++	}
++	return !need || milestone != 0 ? PIANO_GUARD_GO_HEALTHY : PIANO_GUARD_GO_FAILED;
++}
++
++/* The tick after one at NOW: PERIOD later, or at the deadline when the decision is still due and comes first. */
++static inline uint64_t
++piano_guard_next(int state, uint64_t now, uint64_t deadline, uint64_t period)
++{
++	uint64_t next = now + period;
++	if (state == PIANO_GUARD_ARMED && deadline > now && deadline < next) {
++		next = deadline;
++	}
++	return next;
++}
++
++#define PIANO_GUARD_QUIET_TICKS 2   /* a CPU that took no interrupt across this many pokes in a row is stuck */
++
++/* One CPU at a tick: IRQS its interrupt count now (cpu_stat.irq_ex_cnt, the low 32 bits), *LAST the count at the last tick,
++ * *QUIET the ticks in a row it stayed there although POKED (the last tick's nop IPI reached it); ELIGIBLE false for a CPU that
++ * is not up (or the ticking CPU itself). Updates both; true when the CPU is stuck (an interrupt-masked hang, a bus stall). */
++static inline bool
++piano_guard_cpu_quiet(uint32_t irqs, uint32_t *last, uint8_t *quiet, bool poked, bool eligible)
++{
++	if (!eligible || !poked || irqs != *last) {
++		*quiet = 0;
++	} else if (*quiet < 255) {
++		(*quiet)++;
++	}
++	*last = irqs;
++	return *quiet >= PIANO_GUARD_QUIET_TICKS;
++}
++
++/* piano-boot-guard-test: "hang-at=N", every CPU stops at N s of uptime (1..86400): *HANG_AT = N and 0; anything else -1. */
++static inline int
++piano_guard_parse_test(const char *s, uint32_t *hang_at)
++{
++	static const char key[] = "hang-at=";
++	for (size_t i = 0; i < sizeof(key) - 1; i++) {
++		if (s[i] != key[i]) {
++			return -1;
++		}
++	}
++	s += sizeof(key) - 1;
++	uint32_t n = 0;
++	int digits = 0;
++	for (; *s >= '0' && *s <= '9'; s++, digits++) {
++		if (n > 86400) {
++			return -1;
++		}
++		n = n * 10 + (uint32_t)(*s - '0');
++	}
++	if (*s != '\0' || digits == 0 || n == 0 || n > 86400) {
++		return -1;
++	}
++	*hang_at = n;
++	return 0;
++}
++
++#define PIANO_GUARD_COMLEN      16  /* MAXCOMLEN: an exec's p_comm keeps the first 16 characters of the file name */
++
++/* Whether an exec's p_comm COMM is the milestone NAME (compared as p_comm keeps it: at most 16 characters). */
++static inline bool
++piano_guard_comm_is(const char *comm, const char *name)
++{
++	for (int i = 0; i < PIANO_GUARD_COMLEN; i++) {
++		if (comm[i] != name[i]) {
++			return false;
++		}
++		if (comm[i] == '\0') {
++			return true;
++		}
++	}
++	return true;
++}
++
++/* "none" (or an empty value) as piano-boot-guard-exec: no milestone, the decision is the uptime and a running pinger alone. */
++static inline bool
++piano_guard_exec_none(const char *name)
++{
++	return name[0] == '\0' || (name[0] == 'n' && name[1] == 'o' && name[2] == 'n' && name[3] == 'e' && name[4] == '\0');
++}
++
++static inline const char *
++piano_guard_reason_name(int reason)
++{
++	return reason == 0 ? "normal" : reason == 2 ? "bootloader" : "not written";
++}
++
++/* What machdep.piano_boot_guard shows. Times are uptimes in ms (decided 0: not yet; milestone 0: not seen). */
++struct piano_guard_view {
++	int         state;              /* PIANO_GUARD_* */
++	uint32_t    secs;               /* piano-boot-guard */
++	uint32_t    reset_after;        /* piano-reset-after, when deferred */
++	uint64_t    now_ms, decided_ms, milestone_ms;
++	const char *exec;               /* the milestone process ("" none) */
++	int         reason;             /* the restart reason as last written (2, 0), -1 never written */
++	int         reason_err;         /* the last SDAM write's error, 0 none */
++	bool        keep_reason;        /* piano-reset-to=bootloader: it stays bootloader */
++	bool        wdt_on;             /* the watchdog is enabled */
++	uint32_t    holders;            /* PIANO_WDT_* */
++	bool        pinging;            /* the guard pings (not piano-boot-guard-ping=0, no test hang) */
++	uint64_t    pings, max_gap_ms;  /* the guard's pings, the longest time between two of its ticks */
++	bool        cpu_check;          /* piano-boot-guard-cpus (default 1): every CPU must keep taking interrupts */
++	int         stuck_cpu;          /* the CPU found stuck, -1 none */
++	uint32_t    hang_at;            /* piano-boot-guard-test=hang-at, 0 none */
++};
++
++/* One line, NUL-terminated; the length without the NUL (at most LEN - 1). */
++static inline size_t
++piano_guard_format(char *buf, size_t len, const struct piano_guard_view *v)
++{
++	size_t n = 0;
++	if (len == 0) {
++		return 0;
++	}
++	buf[0] = '\0';
++#define PIANO_GUARD_PUT(...) do { if (n < len) { int k_ = snprintf(buf + n, len - n, __VA_ARGS__); if (k_ > 0) { n += (size_t)k_; } } } while (0)
++	switch (v->state) {
++	case PIANO_GUARD_OFF:
++		PIANO_GUARD_PUT("off\n");
++		break;
++	case PIANO_GUARD_NOT_NATIVE:
++		PIANO_GUARD_PUT("off: native only (the PSCI conduit is not SMC)\n");
++		break;
++	case PIANO_GUARD_DEFERRED:
++		PIANO_GUARD_PUT("deferred: piano-reset-after=%u owns the watchdog and the restart reason\n", v->reset_after);
++		break;
++	default:
++		PIANO_GUARD_PUT("%s; restart reason %s", v->state == PIANO_GUARD_HEALTHY ? "healthy" : v->state == PIANO_GUARD_ARMED ?
++		    "armed" : "not healthy (reset into ABL fastboot)", piano_guard_reason_name(v->reason));
++		if (v->keep_reason) {
++			PIANO_GUARD_PUT(" (kept: piano-reset-to)");
++		}
++		if (v->reason_err != 0) {
++			PIANO_GUARD_PUT(" (SDAM write error %d)", v->reason_err);
++		}
++		PIANO_GUARD_PUT("; health at %u s", v->secs);
++		if (v->decided_ms != 0) {
++			PIANO_GUARD_PUT(" (decided at %llu s)", (unsigned long long)(v->decided_ms / 1000));
++		} else {
++			PIANO_GUARD_PUT(" (now %llu s)", (unsigned long long)(v->now_ms / 1000));
++		}
++		if (v->exec[0] == '\0') {
++			PIANO_GUARD_PUT(": no milestone");
++		} else if (v->milestone_ms != 0) {
++			PIANO_GUARD_PUT(": exec of %s at %llu s", v->exec, (unsigned long long)(v->milestone_ms / 1000));
++		} else {
++			PIANO_GUARD_PUT(": exec of %s not yet", v->exec);
++		}
++		PIANO_GUARD_PUT("; watchdog %s, holders", v->wdt_on ? "on (32 s bite)" : "off");
++		if (v->holders == 0) {
++			PIANO_GUARD_PUT(" none");
++		}
++		if (v->holders & PIANO_WDT_RESET_AFTER) {
++			PIANO_GUARD_PUT(" reset-after");
++		}
++		if (v->holders & PIANO_WDT_GUARD) {
++			PIANO_GUARD_PUT(" guard");
++		}
++		if (v->holders & PIANO_WDT_SLEEP) {
++			PIANO_GUARD_PUT(" sleep");
++		}
++		PIANO_GUARD_PUT("; %llu pings, longest gap %llu.%llu s", (unsigned long long)v->pings,
++		    (unsigned long long)(v->max_gap_ms / 1000), (unsigned long long)(v->max_gap_ms % 1000 / 100));
++		if (!v->cpu_check) {
++			PIANO_GUARD_PUT("; CPU check off");
++		}
++		if (v->stuck_cpu >= 0) {
++			PIANO_GUARD_PUT("; CPU %d took no interrupt", v->stuck_cpu);
++		}
++		if (!v->pinging) {
++			PIANO_GUARD_PUT("; not pinging");
++		}
++		if (v->hang_at != 0) {
++			PIANO_GUARD_PUT("; test: every CPU stops at %u s", v->hang_at);
++		}
++		PIANO_GUARD_PUT("\n");
++		break;
++	}
++#undef PIANO_GUARD_PUT
++	return n < len ? n : len - 1;
++}
++
++#endif /* PIANO_GUARD_POLICY_H */
+diff --git a/osfmk/arm64/piano_pm.c b/osfmk/arm64/piano_pm.c
+index 7b00b1f..e8a21b2 100644
+--- a/osfmk/arm64/piano_pm.c
++++ b/osfmk/arm64/piano_pm.c
+@@ -672,7 +672,10 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_cpuidle_init);
+  *      Mac; the calendar is advanced by clock_wakeup_calendar through piano_s2idle_take_wake_utc), the others released and
+  *      their timers resynced, and IOPMrootDomain's normal wake (drivers up, a full wake for a user wake source).
+  * The Gunyah watchdog (32 s bite) is armed from entry, pinged by the loop every 5 s, and kept for 240 s after wake: a hang
+- * anywhere in that path resets the tablet instead of leaving it dark (piano-sleep-wdt=0 turns this off).
++ * anywhere in that path resets the tablet instead of leaving it dark (piano-sleep-wdt=0 turns this off). Since k27 0063 the
++ * watchdog has one owner (machine_routines.c piano_watchdog_*): this path holds it from the entry to the end of the wake
++ * window, and the loop pings it whoever holds it (0056's piano-reset-after, 0063's piano-boot-guard), as their thread calls
++ * are frozen with everything else.
+  *
+  * What this does not do: the RPMh sleep votes. CX collapse and DDR self-refresh need every APPS vote dropped by its driver
+  * before the system state (the RSC replays its sleep set only when the CPU subsystem goes down), and the LLCC island slice
+@@ -685,11 +688,7 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_cpuidle_init);
+ #include <kern/timer_queue.h>
+ #include <arm/cpu_internal.h>
+ #include <arm/commpage/commpage.h>
+-
+-#define GH_WDT_CONTROL          0x86000005ULL
+-#define GH_WDT_PING             0x86000007ULL
+-#define GH_WDT_SET_TIME         0x86000008ULL
+-
++#include <arm64/piano_guard_policy.h>
+ 
+ #define ICC_IAR1_EL1            "S3_0_C12_C12_0"
+ #define ICC_EOIR1_EL1           "S3_0_C12_C12_1"
+@@ -713,7 +712,6 @@ static uint32_t piano_sleep_wake = PIANO_SRC_POWER; /* piano-sleep-wake */
+ static uint32_t piano_sleep_max_s;                /* piano-sleep-max: wake after S s (0 never) */
+ static uint32_t piano_sleep_wdt = 1;              /* piano-sleep-wdt */
+ static uint32_t piano_sleep_test_s, piano_sleep_test_count = 1;
+-static bool piano_sleep_reset_after;              /* piano-reset-after (k27 0056) owns the watchdog */
+ 
+ static volatile uint32_t *piano_spmi_core, *piano_spmi_cnfg, *piano_spmi_obsv;
+ static uint32_t piano_spmi_count;
+@@ -913,35 +911,26 @@ piano_wake_poll(struct piano_pm_wake *b)
+ 	    (b->src & PIANO_SRC_KEYBOARD) ? piano_kbd_status[3] : 0, usb_ok, misc);
+ }
+ 
+-/* ---- the Gunyah watchdog across the suspend (SMCCC vendor-hypervisor calls, as k27 0056) ---- */
++/* ---- the Gunyah watchdog across the suspend: a holder of k27 0063's owner (machine_routines.c piano_watchdog_*) ---- */
+ 
++/* At the entry: this path's hold (unless piano-sleep-wdt=0); the watchdog is on for the suspend when anyone holds it. */
+ static void
+ piano_wdt_arm(void)
+ {
+-	if (piano_wdt_on) {
+-		return;
+-	}
+-	if (piano_sleep_reset_after) {
+-		piano_wdt_on = true;   /* k27 0056 armed it at boot and pings it from a thread call, which does not run while frozen */
+-		return;
+-	}
+-	if (!piano_sleep_wdt) {
+-		return;
+-	}
+-	if ((int64_t)piano_pm_call(GH_WDT_SET_TIME, 30000, 32000, 0) == 0 && (int64_t)piano_pm_call(GH_WDT_CONTROL, 3, 0, 0) == 0) {
+-		piano_wdt_on = true;
++	if (piano_sleep_wdt) {
++		(void)piano_watchdog_hold(PIANO_WDT_SLEEP);
+ 	}
++	piano_wdt_on = piano_watchdog_enabled();
+ }
+ 
++/* Any context (the loop pings with interrupts masked); a no-op while nobody holds it. */
+ static inline void
+ piano_wdt_ping(void)
+ {
+-	if (piano_wdt_on) {
+-		(void)piano_pm_call(GH_WDT_PING, 0, 0, 0);
+-	}
++	piano_watchdog_ping();
+ }
+ 
+-/* After a wake: pinged every 10 s for 240 s, then off again unless piano-reset-after keeps it (and pings it itself). */
++/* After a wake: pinged every 10 s for 240 s, then this path's hold ends; the watchdog stays on while 0056 or the guard hold it. */
+ static void
+ piano_wdt_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
+ {
+@@ -952,10 +941,11 @@ piano_wdt_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
+ 		thread_call_enter_delayed(piano_wdt_call, deadline);
+ 		return;
+ 	}
+-	if (piano_wdt_on && !piano_sleep_reset_after) {
+-		(void)piano_pm_call(GH_WDT_CONTROL, 2, 0, 0);
++	if (piano_wdt_on) {
++		piano_watchdog_release(PIANO_WDT_SLEEP);
+ 		piano_wdt_on = false;
+-		printf("piano-sleep: the wake went through: the Gunyah watchdog is off again\n");
++		printf("piano-sleep: the wake went through: %s\n", piano_watchdog_enabled() ?
++		    "the Gunyah watchdog stays on (held by piano-reset-after or piano-boot-guard)" : "the Gunyah watchdog is off again");
+ 	}
+ }
+ 
+@@ -1246,16 +1236,16 @@ piano_s2idle_enter(void (*quiesce)(void), void (*active)(void))
+ 	const int level = (int)piano_sleep_level();
+ 	struct piano_pm_wake base;
+ 	piano_wake_baseline(&base);
++	piano_wdt_arm();
+ 	printf("piano-sleep: suspend %u: CPUs down to %s, wake on%s%s%s%s%s%s, poll %u ms, watchdog %s\n", n,
+ 	    piano_idle_e[level].name, base.src & PIANO_SRC_POWER ? " power-key" : "", base.src & PIANO_SRC_LID ? " cover-open" : "",
+ 	    base.src & PIANO_SRC_KEYBOARD ? " keyboard" : "", base.src & PIANO_SRC_USB ? " usb" : "",
+ 	    base.src & PIANO_SRC_VOLUME_DOWN ? " volume-down" : "", piano_sleep_max_s ? " timer" : "", piano_sleep_poll_ms,
+-	    piano_sleep_wdt ? "armed (32 s bite)" : "off");
++	    piano_wdt_on ? "armed (32 s bite)" : "off");
+ 	if (piano_sleep_max_s) {
+ 		printf("piano-sleep: automatic wake after %u s (piano-sleep-max)\n", piano_sleep_max_s);
+ 	}
+ 	piano_rpmh_log("entry", n);
+-	piano_wdt_arm();
+ 
+ 	/* 1. park the others */
+ 	uint32_t want = 0;
+@@ -1473,7 +1463,7 @@ piano_sleep_format(char *buf, size_t len)
+ static void
+ piano_sleep_init(void)
+ {
+-	uint32_t on = 0, reset_after = 0;
++	uint32_t on = 0;
+ 	if (!PE_parse_boot_argn("piano-sleep", &on, sizeof(on)) || on != 1) {
+ 		return;
+ 	}
+@@ -1488,7 +1478,6 @@ piano_sleep_init(void)
+ 	PE_parse_boot_argn("piano-sleep-wdt", &piano_sleep_wdt, sizeof(piano_sleep_wdt));
+ 	PE_parse_boot_argn("piano-sleep-test", &piano_sleep_test_s, sizeof(piano_sleep_test_s));
+ 	PE_parse_boot_argn("piano-sleep-test-count", &piano_sleep_test_count, sizeof(piano_sleep_test_count));
+-	piano_sleep_reset_after = PE_parse_boot_argn("piano-reset-after", &reset_after, sizeof(reset_after)) && reset_after != 0;
+ 	if (piano_sleep_poll_ms < 20) {
+ 		piano_sleep_poll_ms = 20;
+ 	} else if (piano_sleep_poll_ms > 1000) {
+diff --git a/osfmk/arm64/piano_pm.h b/osfmk/arm64/piano_pm.h
+index dd64d13..0126f85 100644
+--- a/osfmk/arm64/piano_pm.h
++++ b/osfmk/arm64/piano_pm.h
+@@ -1,7 +1,8 @@
+ /*
+  * piano (k27 0061, 0062): CPU idle through PSCI CPU_SUSPEND, and system sleep as suspend-to-idle, for the native k27 on the
+  * Xiaomi Pad 8 Pro (SM8750, EL1 under Gunyah). UniXNU-piano docs/power.md has the design, the facts it rests on and the test
+- * plan; nothing here runs unless piano-cpuidle, piano-sleep (or piano-pm-probe) is set.
++ * plan; nothing here runs unless piano-cpuidle, piano-sleep (or piano-pm-probe) is set. k27 0063 adds the watchdog's owner and
++ * the boot guard (machine_routines.c, UniXNU-piano docs/boot-guard.md).
+  */
+ #ifndef _ARM64_PIANO_PM_H_
+ #define _ARM64_PIANO_PM_H_
+@@ -45,6 +46,20 @@ int piano_s2idle_last_reason(void);
+ bool piano_s2idle_take_wake_utc(unsigned long *secs, unsigned int *usecs);
+ /* IOPMrootDomain, once boot completed and after every wake: the park threads, piano-sleep-test's next request. */
+ void piano_sleep_system_up(void (*request_sleep)(void));
++
++/*
++ * k27 0063: the Gunyah watchdog's one owner (machine_routines.c). WHO is a PIANO_WDT_* of piano_guard_policy.h; the first holder
++ * enables it (bite 32 s after the last ping), the last one out disables it. hold returns whether it is enabled; ping is a
++ * no-op while it is off and safe with interrupts masked. Native only (the SMC conduit).
++ */
++bool piano_watchdog_hold(uint32_t who);
++void piano_watchdog_release(uint32_t who);
++void piano_watchdog_ping(void);
++bool piano_watchdog_enabled(void);
++uint32_t piano_watchdog_holders(void);
++/* k27 0063: piano-boot-guard. kern_exec's hook for its milestone (every exec's p_comm); machdep.piano_boot_guard (string). */
++void piano_boot_guard_exec(const char *comm);
++size_t piano_boot_guard_format(char *buf, size_t len);
+ __END_DECLS
+ 
+ #define PIANO_WAKE_NONE         0
+-- 
+2.55.0
+
