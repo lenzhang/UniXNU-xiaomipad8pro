@@ -20,15 +20,17 @@ static void testIntrCfg()
 {
   using namespace tlmm;
   // The word PianoTouch's armIrq and PianoKeyboard's armIrq wrote for a rising edge, latched, not enabled, target 3.
-  const uint32_t founds[] = {0x0u, 0x0e2u, 0x7ffu, 0xffffffffu, 0x00c0u, 0x0300u};
+  // The same word with wakeup enable (bit 7) also cleared: the summary route never feeds the PDC.
+  const uint32_t founds[] = {0x0u, 0x0e2u, 0x7ffu, 0xffffffffu, 0x00c0u, 0x0300u, 0x0040u};
   for (uint32_t found : founds) {
     const uint32_t old = (found & ~(0x1fu | (7u << 8))) | (1u << 4) | (1u << 2) | (1u << 1) | (3u << 8);
-    CHECK(intrCfg(found, Trigger::rising, false) == old);
-    CHECK(intrCfg(found, Trigger::rising, true) == (old | 1u));
-    // Bits outside the owned ones (wakeup present/enable among them) are kept.
+    CHECK(intrCfg(found, Trigger::rising, false) == (old & ~kCfgWakeupEnable));
+    CHECK(intrCfg(found, Trigger::rising, true) == ((old | 1u) & ~kCfgWakeupEnable));
+    if (!(found & kCfgWakeupEnable)) CHECK(intrCfg(found, Trigger::rising, false) == old);
+    // Bits outside the owned ones (wakeup present among them) are kept; wakeup enable is always cleared.
     CHECK((intrCfg(found, Trigger::both, true) & ~kCfgOwned) == (found & ~kCfgOwned));
-    CHECK((intrCfg(found, Trigger::levelLow, false) & (kCfgWakeupPresent | kCfgWakeupEnable)) ==
-          (found & (kCfgWakeupPresent | kCfgWakeupEnable)));
+    CHECK((intrCfg(found, Trigger::levelLow, false) & kCfgWakeupPresent) == (found & kCfgWakeupPresent));
+    CHECK(!(intrCfg(found, Trigger::levelHigh, true) & kCfgWakeupEnable));
   }
   // Detection and polarity per trigger (width-2 detection field).
   CHECK((intrCfg(0, Trigger::levelLow, false) & (kCfgDetectMask | kCfgPolarity)) == 0);
@@ -67,6 +69,9 @@ static void testFacts()
   CHECK(pdcSpi(109) == 620);   // gpio162 (touch)
   CHECK(pdcSpi(100) == 611);   // gpio97 (keyboard)
   CHECK(pdcSpi(122) == 633);   // gpio80 (hall)
+  CHECK(pdcSpi(128) == 639);   // gpio95 (keyboard status: its wake request)
+  CHECK(pdcSpi(76) == 552);    // gpio11 (table hall)
+  CHECK(kPdcSpiCfg + kPdcSpiCfgBytes == 0x16440154ull && kPdcSpiCfgBytes * 8 == 800);   // one bit per SPI 0..799
   CHECK(pdcIrqCfg(109) == 0x110 + 4 * 109);
 }
 

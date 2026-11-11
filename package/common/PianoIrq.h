@@ -43,6 +43,7 @@ constexpr uint32_t kSpiDwc3PwrEvent = 130;  // "pwr_event" (QSCRATCH)
 constexpr uint32_t kSpiDwc3HsPhy = 131;     // "hs_phy_irq"
 constexpr uint32_t kSpiTlmmSummary = 208;   // pinctrl@f100000: every TLMM GPIO whose INTR_CFG targets the apps processor (KPSS)
 constexpr uint32_t kSpiQup1Se2 = 355;       // spi@a88000 (the touch controller's serial engine)
+constexpr uint32_t kSpiQup1Se6 = 363;       // i2c@a98000 (the keyboard cover's serial engine; PianoKeyboard bit-bangs the pins)
 
 // PDC (interrupt-controller@b220000, qcom,pdc-ranges <pin spi count>): a PDC input pin becomes GIC SPI `spi + (pin - first)`,
 // as level-high or rising edge (the PDC inverts falling edges and active-low levels).
@@ -57,16 +58,22 @@ constexpr int pdcSpi(unsigned pin)
   return -1;
 }
 constexpr unsigned kPdcSpmiArbiter = 1;   // spmi@c400000 "periph_irq" (the PMIC arbiter's summary): PDC pin 1, level-high
-// TLMM GPIOs with a PDC input (the SoC's wake map), the ones piano's drivers use: hall sensor, keyboard, touch.
+// TLMM GPIOs with a PDC input (the SoC's wake map), the ones piano's drivers use: table hall, lid hall, keyboard status (its
+// wake request), keyboard data, touch (docs/ubuntu-history/kernel.md §2.3, §3.3).
 struct TlmmWake {
   uint16_t gpio, pdcPin;
 };
-constexpr TlmmWake kTlmmWake[] = {{80, 122}, {97, 100}, {162, 109}};
+constexpr TlmmWake kTlmmWake[] = {{11, 76}, {80, 122}, {95, 128}, {97, 100}, {162, 109}};
 // PDC registers (its DRV region at 0x0b220000), for a later direct route; nothing here programs the PDC: IRQ_i_CFG at
 // 0x110 + 4 i, type bits 2:0 (level low 0, falling 2, level high 4, rising 6, both 7), enable bit 3 from version 3.2 on (VERSION
 // at 0x1000), before that IRQ_ENABLE_BANK at 0x10 + 4 (i / 32) bit i % 32.
 constexpr uint64_t kPdc = 0x0b220000;
 constexpr uint32_t pdcIrqCfg(unsigned pin) { return 0x110 + 4 * pin; }
+// The PDC's "SPI interface" region (the DT's second reg, 0x64 bytes): one bit per GIC SPI below 800, 1 level, 0 edge, kept by
+// firmware; Ubuntu's early wakes on GPIO80/95 came from its level bits (their fix was withdrawn). The summary route below never
+// needs it; a direct PDC route would have to read it first.
+constexpr uint64_t kPdcSpiCfg = 0x164400f0;
+constexpr uint32_t kPdcSpiCfgBytes = 0x64;
 
 namespace tlmm {
 // pinctrl@f100000 (sm8750-tlmm, 216 GPIOs, 0x1000 per GPIO): CTL, IO, INTR_CFG, INTR_STATUS.
@@ -76,18 +83,21 @@ constexpr uint32_t kCtl = 0x0, kIo = 0x4, kIntrCfg = 0x8, kIntrStatus = 0xc;
 // INTR_CFG: bit 0 enable (to the target's line), 1 polarity, 3:2 detection (0 level, 1 rising, 2 falling, 3 both; every edge
 // mode with the polarity bit set), 4 raw status (latch into INTR_STATUS even while not enabled), 6 wakeup present (read only),
 // 7 wakeup enable (the PDC route), 10:8 target (3: the apps processor, whose line is the summary SPI). INTR_STATUS bit 0 is the
-// latch, cleared by writing 0. Bits not named here are kept as found.
+// latch, cleared by writing 0. Bits not named here are kept as found; the summary route also clears wakeup enable (bit 7), as
+// Linux does for a GPIO it does not take through the PDC: the pin then reaches only the summary line, never the PDC (so it is
+// no wake source; keyboard data gpio97 must not be one).
 constexpr uint32_t kCfgEnable = 1u << 0, kCfgPolarity = 1u << 1, kCfgDetectShift = 2, kCfgDetectMask = 3u << 2, kCfgRawStatus = 1u << 4,
                    kCfgWakeupPresent = 1u << 6, kCfgWakeupEnable = 1u << 7, kCfgTargetShift = 8, kCfgTargetMask = 7u << 8,
                    kTargetKpss = 3;
-constexpr uint32_t kCfgOwned = kCfgEnable | kCfgPolarity | kCfgDetectMask | kCfgRawStatus | kCfgTargetMask;
+constexpr uint32_t kCfgOwned = kCfgEnable | kCfgPolarity | kCfgDetectMask | kCfgRawStatus | kCfgWakeupEnable | kCfgTargetMask;
 enum class Trigger : uint8_t { levelLow, levelHigh, rising, falling, both };
 constexpr bool isEdge(Trigger t) { return t == Trigger::rising || t == Trigger::falling || t == Trigger::both; }
 constexpr uint32_t detection(Trigger t)
 {
   return t == Trigger::rising ? 1u : t == Trigger::falling ? 2u : t == Trigger::both ? 3u : 0u;
 }
-// The INTR_CFG word for `t`, from the word found: latched (raw status), targeting the apps processor, enabled or not.
+// The INTR_CFG word for `t`, from the word found: latched (raw status), targeting the apps processor, not to the PDC, enabled or
+// not.
 constexpr uint32_t intrCfg(uint32_t found, Trigger t, bool enable)
 {
   const bool polarity = t != Trigger::levelLow;   // every edge mode and level-high: polarity 1
