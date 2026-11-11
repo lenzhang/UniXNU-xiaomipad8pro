@@ -1,0 +1,194 @@
+turnip: darwin backend failures reach stderr in a release build (piano natively, tooling/metal)
+
+- A release build's vk_log is silent (no debug messenger, MESA_VK_LOG 0, !MESA_DEBUG): a lost device said nothing, so a native Metal
+  client's loss had no reason anywhere. _vk_device_set_lost and _vk_queue_set_lost now also write the reason (with the kernel call
+  and its IOReturn the backend puts in it) once per device / queue with mesa_loge, on stderr: with the kernel's stderr-log=1 it is a
+  console line "fd2: pid N <process>: MESA: error: device lost (<file>:<line>): <reason>". Apple builds only.
+- Every kernel method that fails is named on stderr, the first time per method and status in the process and then at the 10th,
+  100th, ... failure ("NativeAdreno: kernel BoAlloc failed: 0xe00002bd (1 time)"); the answers the backend expects are left out
+  (a WaitFence slice's kIOReturnTimeout, Submit/BoFree kIOReturnBusy, GetStatus kIOReturnUnsupported). The virtio-gpu path is
+  untouched.
+- "darwin: no GPU address range" (a full client window) is written the first time and then every 10th, 100th, ... time.
+Against the tree after 0001 and 0002. MIT, as the files.
+
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -141,12 +141,74 @@
+    pthread_mutex_unlock(&retire->lock);
+ }
+ 
++static const char *
++dw_method_name(uint32_t method)
++{
++   switch (method) {
++   case NativeAdrenoMethodQuery: return "Query";
++   case NativeAdrenoMethodBoAlloc: return "BoAlloc";
++   case NativeAdrenoMethodBoMap: return "BoMap";
++   case NativeAdrenoMethodBoFree: return "BoFree";
++   case NativeAdrenoMethodSubmit: return "Submit";
++   case NativeAdrenoMethodWaitFence: return "WaitFence";
++   case NativeAdrenoMethodGetTimestamp: return "GetTimestamp";
++   case NativeAdrenoMethodGetStatus: return "GetStatus";
++   case NativeAdrenoMethodSetMetadata: return "SetMetadata";
++   case NativeAdrenoMethodGetMetadata: return "GetMetadata";
++   case NativeAdrenoMethodCreateQueue: return "CreateQueue";
++   case NativeAdrenoMethodCloseQueue: return "CloseQueue";
++   case NativeAdrenoMethodBoCpuMap: return "BoCpuMap";
++   case NativeAdrenoMethodBoCpuUnmap: return "BoCpuUnmap";
++   case NativeAdrenoMethodGetDeviceInfo: return "GetDeviceInfo";
++   case NativeAdrenoMethodBoImport: return "BoImport";
++   default: return NULL;
++   }
++}
++
++/* The first failure of each kernel method and status in this process on stderr, then its 10th, 100th, ... (a call that keeps failing
++ * stays visible without a line per call), where a Metal client's line reaches the kernel console (stderr-log=1): the release build's
++ * vk_log says nothing, and a refused allocation is otherwise only an out-of-memory answer to the runtime. The answers the backend
++ * expects are left out: a fence wait's slice that timed out, a full ring or a BO still busy (both retried), no status counters. */
++static void
++dw_note_failure(uint32_t method, kern_return_t kr)
++{
++   if ((method == NativeAdrenoMethodWaitFence && kr == kIOReturnTimeout) ||
++       ((method == NativeAdrenoMethodSubmit || method == NativeAdrenoMethodBoFree) && kr == kIOReturnBusy) ||
++       (method == NativeAdrenoMethodGetStatus && kr == kIOReturnUnsupported))
++      return;
++   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++   static struct { uint32_t method; kern_return_t kr; uint64_t count; } seen[32];
++   static uint64_t others;
++   uint64_t count;
++   pthread_mutex_lock(&lock);
++   unsigned i = 0;
++   while (i < 32 && seen[i].count && (seen[i].method != method || seen[i].kr != kr))
++      i++;
++   if (i < 32) {
++      seen[i].method = method;
++      seen[i].kr = kr;
++      count = ++seen[i].count;
++   } else {
++      count = ++others;
++   }
++   pthread_mutex_unlock(&lock);
++   uint64_t mark = 1;
++   while (mark < count)
++      mark *= 10;
++   if (mark != count)
++      return;
++   const char *name = dw_method_name(method);
++   if (name)
++      mesa_loge("NativeAdreno: kernel %s failed: 0x%x (%llu time%s)", name, kr, (unsigned long long)count, count == 1 ? "" : "s");
++   else
++      mesa_loge("NativeAdreno: kernel method %u failed: 0x%x (%llu time%s)", method, kr, (unsigned long long)count,
++                count == 1 ? "" : "s");
++}
++
+ static kern_return_t
+-dw_call(uint32_t method, const void *in, size_t in_size, void *out,
+-        size_t out_size)
++dw_call_native(uint32_t method, const void *in, size_t in_size, void *out,
++               size_t out_size)
+ {
+-   if (dw.virtgpu)
+-      return dwv_call(method, in, in_size, out, out_size);
+    size_t out_bytes = out_size;
+    if (!dw.tunnel)
+       return IOConnectCallStructMethod(dw.conn, method, in, in_size, out_size ? out : NULL,
+@@ -162,6 +224,18 @@
+                                     out_size ? &out_bytes : NULL);
+ }
+ 
++static kern_return_t
++dw_call(uint32_t method, const void *in, size_t in_size, void *out,
++        size_t out_size)
++{
++   if (dw.virtgpu)
++      return dwv_call(method, in, in_size, out, out_size);
++   const kern_return_t kr = dw_call_native(method, in, in_size, out, out_size);
++   if (kr != KERN_SUCCESS)
++      dw_note_failure(method, kr);
++   return kr;
++}
++
+ /* Finds an admitted selector: the driver answers a tunnel probe (method 0xffffffff) with success for every selector the sandbox lets through. */
+ static bool
+ dw_probe_selector(void)
+@@ -522,9 +596,16 @@
+     * slice of the host GPU's address space, 2 GiB): say so, with what the range holds, so a lost device is traced to it. */
+    const uint64_t used = va->used, holes = va->holes;
+    mtx_unlock(&dev->vma_mutex);
+-   if (!*iova)
+-      mesa_loge("darwin: no GPU address range of %llu bytes: %llu of %llu bytes in use, %llu holes", (unsigned long long)size,
+-                (unsigned long long)used, (unsigned long long)dev->physical_device->va_size, (unsigned long long)holes);
++   /* The first of these and then every 10th, 100th, ... (a full window refuses every allocation after it). */
++   static uint64_t refusals;
++   const uint64_t refused = *iova ? 0 : p_atomic_inc_return(&refusals);
++   uint64_t mark = 1;
++   while (refused && mark < refused)
++      mark *= 10;
++   if (refused && mark == refused)
++      mesa_loge("darwin: no GPU address range of %llu bytes: %llu of %llu bytes in use, %llu holes (%llu refusal%s)", (unsigned long long)size,
++                (unsigned long long)used, (unsigned long long)dev->physical_device->va_size, (unsigned long long)holes,
++                (unsigned long long)refused, refused == 1 ? "" : "s");
+    return *iova ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ }
+ 
+--- a/src/vulkan/runtime/vk_device.c
++++ b/src/vulkan/runtime/vk_device.c
+@@ -37,7 +37,10 @@
+ #include "util/compiler.h"
+ #include "util/detect_os.h"
+ #include "util/u_debug.h"
++#include "util/log.h"
+ #include "util/hash_table.h"
++#include <stdio.h>
++#include <string.h>
+ #include "util/perf/cpu_trace.h"
+ #include "util/ralloc.h"
+ #include "util/timespec.h"
+@@ -436,6 +439,19 @@
+ 
+    va_list ap;
+    va_start(ap, msg);
++#if DETECT_OS_APPLE
++   /* A release build's vk_log is silent (no debug messenger, MESA_VK_LOG 0): the loss and its reason, the kernel call and its
++    * status, once per device on stderr, where a Metal client's line reaches the kernel console (stderr-log=1). */
++   {
++      va_list copy;
++      va_copy(copy, ap);
++      char reason[200];
++      vsnprintf(reason, sizeof(reason), msg, copy);
++      va_end(copy);
++      const char *base = strrchr(file, '/');
++      mesa_loge("device lost (%s:%d): %s", base ? base + 1 : file, line, reason);
++   }
++#endif
+    __vk_errorv(device, VK_ERROR_DEVICE_LOST, file, line, msg, ap);
+    va_end(ap);
+ 
+--- a/src/vulkan/runtime/vk_queue.c
++++ b/src/vulkan/runtime/vk_queue.c
+@@ -25,7 +25,10 @@
+ 
+ #include "util/perf/cpu_trace.h"
+ #include "util/u_debug.h"
++#include "util/log.h"
++#include "util/detect_os.h"
+ #include <inttypes.h>
++#include <string.h>
+ 
+ #include "vk_alloc.h"
+ #include "vk_command_buffer.h"
+@@ -127,6 +130,14 @@
+    va_start(ap, msg);
+    vsnprintf(queue->_lost.error_msg, sizeof(queue->_lost.error_msg), msg, ap);
+    va_end(ap);
++
++#if DETECT_OS_APPLE
++   /* As _vk_device_set_lost: a release build reports the loss nowhere else, so once per queue on stderr. */
++   {
++      const char *base = strrchr(file, '/');
++      mesa_loge("device lost (queue, %s:%d): %s", base ? base + 1 : file, line, queue->_lost.error_msg);
++   }
++#endif
+ 
+    p_atomic_inc(&queue->base.device->_lost.lost);
+ 

@@ -15,7 +15,8 @@
 #   - the ABI: package/PianoA830/NativeAdrenoABI.h when the kernel side has it, else $ADRENO830_TREE/NativeAdrenoABI.h, plus
 #     tooling/metal/turnip-a830/NativeAdrenoABICompat.h for the one v1/Adreno740 name the backend uses and v2 lacks;
 #   - the plugin: $K27_TREE/overlay/metal/NativeAdrenoMetalPlugin.mm, the frontend $TURNIP_TREE/drivers/AdrenoMetal through
-#     $K27_TREE/scripts/piano-frontend-patch.py, the prebuilt bridge $K27_TREE/out/metal/bridge/libnative_metal_bridge.a (metal2vulkan,
+#     $K27_TREE/scripts/piano-frontend-patch.py and then tooling/metal/turnip-a830/frontend/*.patch (2026-11-11: the console after a
+#     login; with them the plugin is linked here, no longer the VM's binary), the prebuilt bridge $K27_TREE/out/metal/bridge/libnative_metal_bridge.a (metal2vulkan,
 #     GPL-2.0+/LGPL-3.0+, built on the private build host by $K27_TREE/scripts/build-metal-bridge-macos.py), as $K27_TREE/build-metal-plugin-piano.sh;
 #   - $TURNIP_TREE/scripts/macho-weak-self-binds.py (dyld's flat lookups of Mesa's weak entry points).
 # Provenance and licences: tooling/metal/UPSTREAM.
@@ -131,18 +132,33 @@ if stale "$TURNIP" "$LIB"; then
   mv "$TURNIP.new" "$TURNIP"
 fi
 
-# 5. The plugin, as the VM's build-metal-plugin-piano.sh makes it: its plugin and patched frontend over the prebuilt bridge.
+# 5. The plugin, as the VM's build-metal-plugin-piano.sh makes it: its plugin and patched frontend over the prebuilt bridge, then this
+#    repository's frontend patches (tooling/metal/turnip-a830/frontend/*.patch, applied in order after piano-frontend-patch.py).
+#    With frontend patches the objects are compiled without objc_msgSend selector stubs (-fno-objc-msgsend-selector-stubs): ld 27106.1
+#    (ld-1267) lays the linker-made __objc_stubs out in a different order from link to link (2 outcomes in 8 links of the same
+#    objects, -reproducible or not), and without them ten links in a row were byte for byte the same. The calls are the classic
+#    objc_msgSend ones.
 U=$T/drivers/AdrenoMetal
 BRIDGE=$K/out/metal/bridge/libnative_metal_bridge.a
 [ -f "$BRIDGE" ] || { echo "no bridge at $BRIDGE" >&2; exit 1; }
 [ "$(sha "$BRIDGE")" = "$BRIDGE_PIN" ] || echo "note: $BRIDGE is not the bridge this was checked with (sha256 $(sha "$BRIDGE"))"
+FRONTEND_PATCHES=()
+for p in "$P"/frontend/*.patch; do [ -f "$p" ] && FRONTEND_PATCHES+=("$p"); done
 CXX=(xcrun clang++ -target arm64e-apple-macos14.0 -isysroot "$SDK" -fobjc-arc -O2 -std=c++17 -Wno-deprecated-declarations -c
      -x objective-c++ -I "$U")
+if [ ${#FRONTEND_PATCHES[@]} -gt 0 ]; then CXX+=(-fno-objc-msgsend-selector-stubs); fi
+# A change of the compile flags recompiles both objects.
+printf '%s\n' "${CXX[@]}" > "$O/plugin/flags.new"
+if ! cmp -s "$O/plugin/flags.new" "$O/plugin/flags"; then rm -f "$O/plugin/plugin.o" "$O/plugin/frontend.o"; mv "$O/plugin/flags.new" "$O/plugin/flags"
+else rm -f "$O/plugin/flags.new"; fi
 if stale "$O/plugin/plugin.o" "$K/overlay/metal/NativeAdrenoMetalPlugin.mm" "$U/NativeBridgeMetalFrontend.h"; then
   "${CXX[@]}" "$K/overlay/metal/NativeAdrenoMetalPlugin.mm" -o "$O/plugin/plugin.o"
 fi
 python3 "$K/scripts/piano-frontend-patch.py" "$U/NativeBridgeMetalFrontend.mm" "$O/plugin/frontend.mm.new" 2> "$O/plugin/frontend-patch.log"
-put "$O/plugin/frontend.mm.new" "$O/plugin/frontend.mm"; rm -f "$O/plugin/frontend.mm.new"
+for p in ${FRONTEND_PATCHES[@]+"${FRONTEND_PATCHES[@]}"}; do
+  patch -s "$O/plugin/frontend.mm.new" < "$p" || { echo "frontend patch $p does not apply" >&2; exit 1; }
+done
+put "$O/plugin/frontend.mm.new" "$O/plugin/frontend.mm"; rm -f "$O/plugin/frontend.mm.new" "$O/plugin/frontend.mm.new.orig"
 if stale "$O/plugin/frontend.o" "$O/plugin/frontend.mm" "$U/NativeBridgeMetalFrontend.h" "$U/bridge/NativeMetalObjects.h"; then
   "${CXX[@]}" "$O/plugin/frontend.mm" -o "$O/plugin/frontend.o"
 fi

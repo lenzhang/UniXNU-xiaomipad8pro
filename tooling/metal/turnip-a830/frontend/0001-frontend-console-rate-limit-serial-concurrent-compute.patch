@@ -1,0 +1,56 @@
+frontend (AdrenoMetal NativeBridgeMetalFrontend.mm as macOS-DroidVM's piano-frontend-patch.py leaves it): the console after a login
+
+- NBLOG's stderr copy (NMB_LOG_STDERR, which the kernel's stderr-log=1 puts on the console) is rate-limited per call site: the first
+  8 lines, then the 16th, 32nd, 64th, ... with the count ("[#64] ..."). The unified log and the problem notes still get every line.
+- "native-metal: no device answer: ..." (harmlessProblem; five or six per Metal process) goes to the unified log only.
+- computeCommandEncoderWithDispatchType: with MTLDispatchTypeConcurrent returns the serial encoder (as computeCommandEncoderWithDescriptor:
+  already did for a concurrent pass) instead of refusing the command buffer; one line per process says so.
+Applied by tooling/metal/build-turnip-a830.sh to out/turnip-a830/plugin/frontend.mm. MIT, as the file.
+
+--- a/frontend.mm
++++ b/frontend.mm
+@@ -653,9 +653,14 @@
+ #define GLOG(...) do{if(logGpuOn())NSLog(__VA_ARGS__);}while(0)
+ // NBLOG lines (refusals and other problems, rare) stay in the unified log whatever log-gpu says, and public: NSLog(@"%@") stored
+ // every line as <private>, so a refusal's reason was unreadable in a log archive.
++// UniXNU-piano (tooling/metal/turnip-a830/frontend): on stderr, which the kernel's stderr-log=1 puts on the console, each call site
++// writes its first 8 lines and then its 16th, 32nd, 64th, ... with the count: a refusal a client repeats every frame (a feature it
++// uses and this device has not got) stays visible without flooding the console. The unified log and the problem notes get every one.
+ #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];os_log(OS_LOG_DEFAULT,"%{public}s",nbText.UTF8String?:"?");\
+  noteProblem(nbText);\
+- if(logToStderr())fprintf(stderr,"%s: %.140s\n",getprogname(),nbText.UTF8String?:"?");}while(0)
++ if(logToStderr()){static std::atomic<uint32_t> nbSiteLines{0};const uint32_t nbLine=++nbSiteLines;\
++  if(nbLine<=8)fprintf(stderr,"%s: %.140s\n",getprogname(),nbText.UTF8String?:"?");\
++  else if(!(nbLine&(nbLine-1)))fprintf(stderr,"%s: [#%u] %.130s\n",getprogname(),nbLine,nbText.UTF8String?:"?");}}while(0)
+ // The render server does not get past the loss of its GPU context: CoreAnimation keeps submitting to the dead context and
+ // the display shows the surfaces it composed last until backboardd restarts (the hang's evidence is in the host's KGSL log
+ // and the context's loss mask, not here). End it once its completed handlers have seen the error; launchd starts it
+@@ -3402,7 +3407,13 @@
+  return [self encoder:[NBComputeEncoder new] make:^{return nmb_compute_encoder_new(handle);} what:@"computeCommandEncoder"];
+ }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type {
+- if(type!=MTLDispatchTypeSerial){[self refuse:@"concurrent compute dispatch"];return nil;}
++ // UniXNU-piano: a concurrent encoder's dispatches run serially, as computeCommandEncoderWithDescriptor: already runs a concurrent
++ // pass: serial keeps every ordering a concurrent encoder promises (its memoryBarrier calls order nothing more). Refusing it failed the
++ // whole command buffer of the clients that ask for one (Core ML, MPSGraph) and gave RenderBox-style callers a nil encoder.
++ if(type!=MTLDispatchTypeSerial) {
++  static std::atomic<bool> told{false};
++  if(!told.exchange(true))NBLOG(@"native-metal: a concurrent compute encoder runs serially");
++ }
+  return [self computeCommandEncoder];
+ }
+ - (id<MTLBlitCommandEncoder>)blitCommandEncoder {
+@@ -5051,7 +5062,12 @@
+   SEL sel=sel_registerName(name);uint64_t value=0;
+   switch(kind) {
+   case NMB_ANSWER_COUNT: case NMB_ANSWER_FLAG:
+-   if(!nmb_device_answer(gDevice,name,0,&value)){NBLOG(@"native-metal: no device answer: %@",lastError());continue;}
++   // UniXNU-piano: the unified log and the problem notes only (harmlessProblem): five such lines from every Metal process filled the
++   // console after a login with nothing the process draws depending on them.
++   if(!nmb_device_answer(gDevice,name,0,&value)){
++    NSString *nbText=[NSString stringWithFormat:@"native-metal: no device answer: %@",lastError()];
++    os_log(OS_LOG_DEFAULT,"%{public}s",nbText.UTF8String?:"?");noteProblem(nbText);continue;
++   }
+    // Extended-range 10-bit (XR10) framebuffers are withheld: this display chain presents 8-bit BGRX scanout only. The render server picks its
+    // wide-gamut 64-bit (and Apple-compressed) framebuffer when a device offers them, and the display driver could not show it (int-089: the
+    // swap's surface was '&w4a', 8 bytes per pixel, and every swap was refused).

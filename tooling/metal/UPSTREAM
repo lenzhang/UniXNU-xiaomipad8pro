@@ -4,7 +4,9 @@ changed; build products go to out/turnip-a830 and are never committed.
 Mesa (MIT): https://github.com/Droid-VM/mesa cecc0e96d7193c72356a31abb0cc589e4fc0415e (26.3.0-devel), as the VM built it: the work tree
   droidvm-build/UniXNU-turnip/.cache/mesa-work with UniXNU-turnip's patches/mesa (21, Droid-VM/UniXNU 527b8b7a3119) and macOS-DroidVM's
   patches/mesa-macos (0001 log allocation failures, 0002 virtgpu accelerator class) applied. Our changes on top:
-  tooling/metal/turnip-a830/mesa/0001-turnip-darwin-native-a830.patch, 0002-turnip-darwin-tu-debug-file.patch (MIT, as the files).
+  tooling/metal/turnip-a830/mesa/0001-turnip-darwin-native-a830.patch, 0002-turnip-darwin-tu-debug-file.patch,
+  0003-turnip-darwin-failures-on-stderr.patch (2026-11-11: a lost device's reason and the kernel calls that fail on stderr in a
+  release build, rate-limited) (MIT, as the files).
   Build options: UniXNU-turnip build-turnip-macos-piano.py's, with -Dtu-darwin-abi-dir pointing at the ABI below.
 Kernel ABI (MIT): https://github.com/Shad0w23333/Adreno830 1a1321056ffc5428ae925f4680093718b46ca7c2, NativeAdrenoABI.h
   (sha256 20ac9298bb390d86788c1fc58155e1f9581ffa942e222752efc95c67cb5670d2), or package/PianoA830/NativeAdrenoABI.h when present.
@@ -16,6 +18,10 @@ Plugin (BSD-2-Clause-Patent): https://github.com/Droid-VM/macOS-DroidVM 11ac316b
   build-metal-plugin-piano.sh; the linked executable out/metal/plugin/NativeAdrenoMetal.bundle/Contents/MacOS/NativeAdrenoMetal
   (taken when the objects rebuild byte-identical: ld does not link it reproducibly).
 Frontend (MIT): UniXNU-turnip drivers/AdrenoMetal (NativeMetal fb063de per the VM's recipe; upstream https://github.com/UniXNU/AdrenoMetal).
+  Our change on top, after macOS-DroidVM's scripts/piano-frontend-patch.py: tooling/metal/turnip-a830/frontend/
+  0001-frontend-console-rate-limit-serial-concurrent-compute.patch (2026-11-11, MIT as the file: NBLOG's stderr copy rate-limited per
+  call site, "no device answer" to the unified log only, a concurrent compute encoder run serially instead of refused). With it the
+  plugin executable is linked here (objects without objc_msgSend selector stubs, so the link is reproducible), not taken from the VM.
 Bridge (GPL-2.0-or-later OR LGPL-3.0-or-later): macOS-DroidVM out/metal/bridge/libnative_metal_bridge.a
   (sha256 81d46fae51eea467eac152cbc7817658986c9d7bb25ae54fa40cba0c3b516d4d), built on the private build host by macOS-DroidVM
   scripts/build-metal-bridge-macos.py: UniXNU drivers/NativeMetal/bridge/NativeMetalBridge.rs over https://github.com/steelbrain/metal2vulkan
