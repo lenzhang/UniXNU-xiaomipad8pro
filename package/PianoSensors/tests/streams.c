@@ -992,11 +992,13 @@ static void test_service(void)
     report(SS_ACCEL, &kLight, &ev, 1);           // another sensor's report on this client
     CHECK(eng.ch[SS_ACCEL].malformed >= m0 + 3 && eng.ch[SS_ACCEL].unexpected >= u0 + 2);
     ss_receive(&eng, 7, junk, sizeof junk);      // no such stream
-    // an unavailable sensor (attributes: available false) is not taken (and the list's accel, kAccel again, replaces "other": its
-    // streaming client's port is closed as above)
+    // an unavailable sensor (attributes: available false) is not taken: its stream restarts without a sensor (nothing is sent, its
+    // port stays); the list's accel, kAccel again, replaces "other" while it streams: that client's port is closed as above
     list.sensor[SC_LIGHT].attrs.available = 0;
+    const uint32_t light_sent = hub[SS_LIGHT].requests;
     ss_from_list(&eng, &list);
-    CHECK(!eng.ch[SS_LIGHT].found && closes[SS_LIGHT] == 1 && closes[SS_ACCEL] == 2);
+    run(1000);
+    CHECK(!eng.ch[SS_LIGHT].found && closes[SS_LIGHT] == 0 && closes[SS_ACCEL] == 2 && hub[SS_LIGHT].requests == light_sent);
     printf("PASS service: the level-3 list feeding both streams, generations, the service gone and back, a new default sensor, an "
            "unavailable one, junk\n");
 }

@@ -220,7 +220,10 @@ void ss_sensor(SsEngine *e, int i, int found, const SscSuid *suid, int64_t strea
     const uint32_t rate = i == SS_ACCEL ? sfx_float_from_ratio(e->cfg.accel_hz, 1) : on_change ? 0 : lowest_rate_bits;
     if (found == ch->found && (!found || ssc_suid_equal(suid, &ch->suid)) && on_change == ch->on_change && rate == ch->rate_bits) return;
     const PasStream *s = stream_of(e, i);
-    const int active = ch->found && (s->state != PAS_OFF || s->outstanding != PAS_ACT_NONE || s->dirty);
+    /* another default sensor while this one streams: the hub keeps the old one's request on this client, so the client goes (its
+     * port closed) and a new port starts clean; a list that only forgot it (the service moved) restarts it here */
+    const int replaced = ch->found && found && !ssc_suid_equal(suid, &ch->suid) &&
+                         (s->state != PAS_OFF || s->outstanding != PAS_ACT_NONE || s->dirty);
     ch->found = found;
     if (found) ch->suid = *suid;
     ch->on_change = on_change;
@@ -240,7 +243,7 @@ void ss_sensor(SsEngine *e, int i, int found, const SscSuid *suid, int64_t strea
         }
     }
     emit(e, i, &txt, t, 0);
-    if (active) close_port(e, i);   /* the hub keeps the old sensor's request: its client goes, a new port starts clean */
+    if (replaced) close_port(e, i);
     else restart(e, i, t);
 }
 
