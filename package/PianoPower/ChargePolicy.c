@@ -359,6 +359,7 @@ static uint32_t hv_step(const PianoChargeConfig *c, const PianoChargeInput *in, 
                                                                                           * PDO read is no change of offer */
     /* the source has to keep offering 9 V the way it was asked for */
     if (s->hv != PIANO_CHG_HV_OFF && s->hv != PIANO_CHG_HV_BLOCKED && pps != s->hv_pps) ma = 0;
+    if (!c->writes) return 0;   /* nothing is sent: the machine stays at 5 V rather than log requests that never go out */
     if (!c->hv || !charge_ok) {
         if (volt_raised(s)) want_5v(s);
         return 0;

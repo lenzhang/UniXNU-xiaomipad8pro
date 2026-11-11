@@ -69,7 +69,7 @@ enum {
 #define PIANO_CHG_FV_FFC 4540u        /* fast-charge float, only within a direct-charging session (not planned by decide) */
 
 typedef struct {
-    uint8_t writes;        /* 0: plan nothing (piano-power-write=0); the decisions are still made, for the log */
+    uint8_t writes;        /* 0: plan nothing (piano-power-write=0); the 5 V decisions are still made, for the log (9 V never) */
     uint8_t hv;            /* 0 5 V only; 1 also a fixed 9 V PDO; 2 also a PPS APDO covering 9 V (piano-power-hv) */
     uint8_t full_charge;   /* the float voltage of the stock tables (piano-power-fv) */
     uint8_t limit;         /* Preserve Battery Health (piano-power-limit, IORegistry) */

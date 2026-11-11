@@ -349,6 +349,14 @@ static void testFiveVolt()
     s.cfg.limit = 1;
     for (int i = 0; i < 10; ++i) { s.step(); CHECK(s.plan.writes == 0 && !s.plan.hold_awake); }
     CHECK(s.plan.icl_ma == 1500);
+    Sim t;
+    t.cfg.writes = 0;
+    t.cfg.hv = 1;
+    t.pd(kPd5and9);
+    for (int i = 0; i < 10; ++i) {
+      t.step();
+      CHECK(t.plan.writes == 0 && !(t.plan.events & (PIANO_CHG_EV_HV_ASKED | PIANO_CHG_EV_HV_BLOCKED)) && t.plan.hv == PIANO_CHG_HV_OFF);
+    }
   }
   // the type changes while attached: new limits
   {
