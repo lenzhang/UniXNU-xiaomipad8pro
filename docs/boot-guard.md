@@ -10,7 +10,8 @@ the specification only; nothing copied), **inferred** or **needs-boot**.
 ## 1. Why
 
 The installed system boots from the ESP without `piano-reset-after`, and nothing else arms the Gunyah watchdog. On 2026-11-11 a
-hang in the GPU bring-up (stage S1, one boot in three) left the tablet stuck on the console until someone held power +
+hang during a GPU boot (one boot in three; the console showed stage S1, which with the asynchronous trace is the logger's
+backlog rather than the hang: `forensics-2026-11-11.md` §2) left the tablet stuck on the console until someone held power +
 volume-down for 15-20 s. The RAM test images never had that problem: 0056 pings the watchdog and resets on time, and 0057 sends
 every reset to ABL fastboot. The boot guard gives the installed system the same backstop, but with an end: once the boot is
 healthy the restart reason goes back to normal, so a later hang restarts macOS rather than parking the tablet in fastboot.
@@ -21,7 +22,7 @@ healthy the restart reason goes back to normal, so a later hang restarts macOS r
 |---|---|---|
 | The hypervisor watchdog is a Gunyah SMCCC vendor-hypervisor service: CONTROL 0x86000005 (3 enable, 2 disable), STATUS 0x86000006, PING 0x86000007, SET_TIME 0x86000008 (bark, bite in ms, at most 0x8000) | verified (source) | `el1-hyp-notes.md` §1 |
 | It is not armed when the HLOS starts | inferred | `el1-hyp-notes.md` §1; every installed boot without `piano-reset-after` that hung stayed hung |
-| A bite resets the tablet: a secure-world stall during a test with 0056 armed ended in a reset about 30 s later, and so did the GPU bring-up hang at S1.7 (a GPU_CC read) in a RAM test of the evening: there the whole system stopped, 0056's pings included | verified (runs) | `drivers/charging.md` §6; `results-2026-11-11.md` |
+| A bite resets the tablet: a secure-world stall during a test with 0056 armed ended in a reset about 30 s later, and so did the evening's "power1" stall in a RAM test (first read as a GPU_CC read at S1.7; the bring-up had in fact returned about 1 s before the system stopped, and the reset's timing fits a bite only if a ping 3 s before the bring-up already failed: `forensics-2026-11-11.md` §2.3): the whole system stopped, 0056's pings included | verified (runs) | `drivers/charging.md` §6; `results-2026-11-11.md` |
 | The restart reason is bits 1-7 of byte 0x48 of the SID 0 SDAM (PPID 0x071), 2 = bootloader; after 0057 wrote 2, every PSCI reset of a RAM test landed in ABL fastboot | verified (runs) | k27 0057; `bringup-debugging.md` §3 |
 | That the byte survives a watchdog bite (not a PSCI reset) and ABL honours it then | **needs-boot** | §7 test `ping0` |
 | `fastboot reboot` from ABL fastboot boots the installed system | verified (a run) | `persistent-boot.md` (session of 09:05) |
