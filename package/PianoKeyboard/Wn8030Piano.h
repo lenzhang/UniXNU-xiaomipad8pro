@@ -17,7 +17,8 @@
 //     relative}; touchpad {0x19, buttons (bit 0 left, 1 right), three fingers of {flags (bit 0 tip, 1 in range, 2 confidence), contact
 //     id, 2 unused bytes, X LE16 0..3199, Y LE16 0..2135}, contact count}   (the module's piano HID descriptors, decoded; spec)
 //   vendor messages: {id, ?, 0x38, 0x80, kind, ...}: kind 0xa2 attach (byte 9 bit 0: the cover is on), 0x64 accelerometer, 0x24 / 0x31 /
-//     0x32 authentication (left unanswered here, as UniXNU-sheng does: input works without it)
+//     0x32 authentication (unanswered by default, as piano's Ubuntu and UniXNU-sheng run; authInit/authS3t1 below on request); the
+//     cover also sends kinds it echoes for commands (0x21, 0x25), 0xa4, 0x28 and 0xf0 (seen on piano 2026-11-11, meaning unknown)
 #ifndef PIANO_KEYBOARD_WN8030_H
 #define PIANO_KEYBOARD_WN8030_H
 #include <stddef.h>
@@ -112,15 +113,40 @@ inline unsigned dataCommand(uint8_t out[kDataWire], const uint8_t *image, uint32
   return n;
 }
 
-// A runtime command with its register byte: 67 bytes to write.
-inline void command(uint8_t out[kCommandWire], uint8_t cmd, uint8_t value)
+// A runtime message with its register byte, 67 bytes to write: {0x32, 0, channel, 0x31, 0x80, 0x38, cmd, length, payload, the byte
+// sum of bytes 2.. up to the payload's end}. Channel 0x4e carries the control commands, 0x4f the authentication messages. Returns
+// false for a payload over 57 bytes.
+constexpr uint8_t kChannelControl = 0x4e, kChannelAuth = 0x4f;
+inline bool message(uint8_t out[kCommandWire], uint8_t channel, uint8_t cmd, const uint8_t *payload, unsigned length)
 {
+  if (length > kCommandWire - 10) return false;
   zero(out, kCommandWire);
   out[0] = kRegRuntime;
   uint8_t *f = out + 1;
-  f[0] = 0x32; f[2] = 0x4e; f[3] = 0x31; f[4] = 0x80; f[5] = 0x38;
-  f[6] = cmd; f[7] = 1; f[8] = value;
-  f[9] = sum8(f + 2, 7);
+  f[0] = 0x32; f[2] = channel; f[3] = 0x31; f[4] = 0x80; f[5] = 0x38;
+  f[6] = cmd; f[7] = uint8_t(length);
+  for (unsigned i = 0; i < length; ++i) f[8 + i] = payload[i];
+  f[8 + length] = sum8(f + 2, 6 + length);
+  return true;
+}
+// A control command of one value byte.
+inline void command(uint8_t out[kCommandWire], uint8_t cmd, uint8_t value) { message(out, kChannelControl, cmd, &value, 1); }
+
+// Authentication, as the Linux driver answers when its userspace helper has /dev/nanosic_auth open (without it, as on piano's Ubuntu
+// v1.1.0, it answers nothing): the cover's request (vendor kind 0x24) gets the init {0x31, "MIAUTH"}; the cover's init reply (0x31,
+// its 16-byte UID at +8) gets {0x32: key meta 00 00 00 02, a fixed 16-byte host challenge} ("offline auth"); the cover's challenge
+// (0x32, 16 bytes at +22) needs a 16-byte token {0x33} that only the helper computes (a secret this driver does not have).
+enum : uint8_t { kAuthInit = 0x31, kAuthS3t1 = 0x32, kAuthS5t1 = 0x33 };
+inline void authInit(uint8_t out[kCommandWire])
+{
+  static const uint8_t miauth[6] = {'M', 'I', 'A', 'U', 'T', 'H'};
+  message(out, kChannelAuth, kAuthInit, miauth, sizeof miauth);
+}
+inline void authS3t1(uint8_t out[kCommandWire])
+{
+  static const uint8_t payload[20] = {0x00, 0x00, 0x00, 0x02, 0x80, 0x3d, 0x84, 0x36, 0x29, 0x82, 0xde, 0x6a,
+                                      0x0e, 0x68, 0x1d, 0x3d, 0x6b, 0x32, 0xa5, 0xa6};
+  message(out, kChannelAuth, kAuthS3t1, payload, sizeof payload);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------- frames

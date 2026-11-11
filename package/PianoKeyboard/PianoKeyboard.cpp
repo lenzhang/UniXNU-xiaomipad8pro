@@ -27,11 +27,14 @@
 //   piano-keyboard-halfbit=US   I2C half-bit time (default 2 us; 1..50)        piano-keyboard-poll=MS  edge polling (default 4)
 //   piano-keyboard-rails=0      no RPMh votes (the rails as the boot stages left them)
 //   piano-keyboard-touchpad=V   the touchpad command's value on attach (default 1; 2: not sent)
-//   piano-keyboard-backlight=P  backlight 0..100 sent on attach (default: not sent)
+//   piano-keyboard-backlight=P  backlight 0..100 sent on attach (default 50: a visible sign that commands reach the cover; >100 none)
+//   piano-keyboard-auth=1       answer the cover's authentication as Linux does with its helper open (init, offline s3t1; the
+//                               final token needs the helper's secret: not sent). Default 0, as piano's Ubuntu runs
+//   piano-keyboard-raw=0        level 1 without the raw dump of every frame that is not an accelerometer sample
 //   piano-keyboard-tap=0        no tap-to-click        piano-keyboard-invert=B  bit 0 X, bit 1 Y        piano-keyboard-divide=D (2)
 //   piano-keyboard-mouse=0      ignore the MCU's own mouse reports (ID 2; used only while no touchpad report has been seen)
-// Not done: the hall sensors (keys still pass with the cover folded back), authentication (unanswered, as UniXNU-sheng), the
-// backlight/mic LED beyond the boot arguments, suspend.
+// Not done: the hall sensors (keys still pass with the cover folded back), the authentication token, the backlight/mic LED beyond
+// the boot arguments, suspend.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -63,7 +66,7 @@ extern const uint64_t piano_keyboard_firmware_size;
 namespace {
 
 struct Args {
-  uint32_t level, stop, trace, halfUs, pollMs, rails, touchpad, backlight, tap, invert, divide, mouse;
+  uint32_t level, stop, trace, halfUs, pollMs, rails, touchpad, backlight, tap, invert, divide, mouse, auth, raw;
 };
 Args gArgs;
 
@@ -84,11 +87,13 @@ void readArgs()
   gArgs.pollMs = clampArg(bootArg("piano-keyboard-poll", 4), 1, 50);
   gArgs.rails = bootArg("piano-keyboard-rails", 1);
   gArgs.touchpad = bootArg("piano-keyboard-touchpad", 1);
-  gArgs.backlight = bootArg("piano-keyboard-backlight", 0xffffffffu);
+  gArgs.backlight = bootArg("piano-keyboard-backlight", 50);
   gArgs.tap = bootArg("piano-keyboard-tap", 1);
   gArgs.invert = bootArg("piano-keyboard-invert", 0);
   gArgs.divide = clampArg(bootArg("piano-keyboard-divide", 2), 1, 16);
   gArgs.mouse = bootArg("piano-keyboard-mouse", 1);
+  gArgs.auth = bootArg("piano-keyboard-auth", 0);
+  gArgs.raw = bootArg("piano-keyboard-raw", 1);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -344,7 +349,8 @@ class PianoKeyboard : public IOService {
   uint64_t fStartMs = 0, fLastReadMs = 0, fKeepaliveMs = 0;
   uint32_t fReads = 0, fFrames = 0, fEmpty = 0, fReadErrors = 0, fBadFrames = 0, fEdges = 0, fCommands = 0, fCommandErrors = 0;
   uint32_t fKeys = 0, fConsumer = 0, fTouch = 0, fMouse = 0, fVendor = 0, fAccel = 0, fAuth = 0, fAttaches = 0, fSent = 0, fSendErrors = 0;
-  uint32_t fConsecutiveErrors = 0;
+  uint32_t fConsecutiveErrors = 0, fRawLogged = 0, fEmptyLogged = 0, fLevelReads = 0, fIrqHigh = 0, fPolls = 0;
+  bool fIrqWasLow = false;
   // the LED request from IOHIDFamily's side
   volatile uint32_t fLedRequests = 0, fLedWanted = 0;
   uint32_t fLedSeen = 0;
@@ -366,6 +372,7 @@ class PianoKeyboard : public IOService {
   void dispatch(const Report &r);
   void coverAttached(bool on, const char *why);
   bool sendCommand(uint8_t cmd, uint8_t value, const char *what);
+  void authAnswer(Vendor v, const Report &r);
   void send(Kind kind, const uint8_t *bytes, unsigned length);
   void releaseAll();
   void describe(uint64_t seconds);
@@ -389,9 +396,11 @@ IOService *PianoKeyboard::probe(IOService *provider, SInt32 *score)
 bool PianoKeyboard::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
-  note("start: piano-keyboard=%u (%s), stop %u, I2C half-bit %u us, poll %u ms, rails %u, touchpad cmd %u, firmware %llu bytes",
+  note("start: piano-keyboard=%u (%s), stop %u, I2C half-bit %u us, poll %u ms, rails %u, touchpad cmd %u, backlight %u, auth %u, "
+       "raw %u, firmware %llu bytes",
        gArgs.level, gArgs.level >= 2 ? "HID devices for macOS" : "raw reports logged, nothing for macOS", gArgs.stop, gArgs.halfUs,
-       gArgs.pollMs, gArgs.rails, gArgs.touchpad, (unsigned long long)piano_keyboard_firmware_size);
+       gArgs.pollMs, gArgs.rails, gArgs.touchpad, gArgs.backlight, gArgs.auth, gArgs.raw,
+       (unsigned long long)piano_keyboard_firmware_size);
   setProperty("piano-keyboard", gArgs.level, 32);
   PointerConfig pc;
   pc.divide = int32_t(gArgs.divide);
@@ -723,8 +732,34 @@ bool PianoKeyboard::sendCommand(uint8_t cmd, uint8_t value, const char *what)
   const I2c r = fBus.write(kAddress, wire, kCommandWire);
   ++fCommands;
   if (r != I2c::ok) ++fCommandErrors;
-  if (r != I2c::ok || fCommands <= 12) note("command %#04x %s = %u: %s", cmd, what, value, i2cName(r));
+  if (r != I2c::ok || fCommands <= 20) note("command %#04x %s = %u: %s", cmd, what, value, i2cName(r));
   return r == I2c::ok;
+}
+
+// piano-keyboard-auth=1: the Linux driver's answers (Wn8030Piano.h authInit/authS3t1); the cover's challenge is only logged.
+void PianoKeyboard::authAnswer(Vendor v, const Report &r)
+{
+  uint8_t wire[kCommandWire];
+  char line[100];
+  const char *what = nullptr;
+  if (v == Vendor::authRequest) {
+    authInit(wire);
+    what = "auth init (MIAUTH)";
+  } else if (v == Vendor::authInit && r.length >= 24) {
+    note("auth: cover UID %s", hex(r.bytes + 8, 16, line, sizeof line));
+    authS3t1(wire);
+    what = "auth s3t1 (offline: key meta 00 00 00 02, fixed host challenge)";
+  } else if (v == Vendor::authChallenge && r.length >= 38) {
+    note("auth: cover challenge %s; the token (s5t1) needs the Linux helper's secret: not sent", hex(r.bytes + 22, 16, line, sizeof line));
+    return;
+  } else {
+    note("auth: %s of %u bytes: too short to answer", vendorName(v), r.length);
+    return;
+  }
+  const I2c rc = fBus.write(kAddress, wire, kCommandWire);
+  ++fCommands;
+  if (rc != I2c::ok) ++fCommandErrors;
+  note("auth: sent %s: %s (%s)", what, i2cName(rc), hex(wire + 1, 12, line, sizeof line));
 }
 
 void PianoKeyboard::coverAttached(bool on, const char *why)
@@ -737,10 +772,12 @@ void PianoKeyboard::coverAttached(bool on, const char *why)
     return;
   }
   ++fAttaches;
-  // As Linux does on attach: keyboard power, the Caps Lock LED as it is, the touchpad on; the backlight only when asked for.
+  // As Linux (v1.1.0) does on attach: keyboard power, the Caps Lock LED, the touchpad; then its input-state work: the touchpad, the
+  // Caps Lock and mic LEDs, the backlight.
   sendCommand(kCmdKeyboardPower, 1, "keyboard power");
   sendCommand(kCmdIndicator, fCaps ? kLedCapsOn : kLedCapsOff, "caps lock LED");
   if (gArgs.touchpad != 2) sendCommand(kCmdTouchpad, uint8_t(gArgs.touchpad), "touchpad");
+  sendCommand(kCmdIndicator, kLedMicOff, "mic LED");
   if (gArgs.backlight <= 100) sendCommand(kCmdBacklight, uint8_t(gArgs.backlight), "backlight");
   fKeepaliveMs = nowMs() + 12000;
 }
@@ -761,13 +798,23 @@ bool PianoKeyboard::readFrame()
   Report reports[24];
   unsigned count = 0;
   const Frame f = unpackFrame(fFrame, reports, 24, &count);
-  if (f == Frame::empty) {
-    ++fEmpty;
-    return false;
-  }
   // Raw bytes may hold keys: at level 2 (the login password) only with piano-keyboard-trace=1.
   const bool show = gArgs.level < 2 || gArgs.trace;
   char line[220];
+  if (f == Frame::empty) {
+    ++fEmpty;
+    if (show && gArgs.raw && fEmptyLogged < 3)
+      note("empty frame %u (read %u), raw: %s", ++fEmptyLogged, fReads, hex(fFrame, 24, line, sizeof line));
+    return false;
+  }
+  // Every frame that is more than an accelerometer sample, raw (the first 300, then every 50th): what the MCU sends is not all known.
+  bool onlyAccel = f == Frame::reports;
+  for (unsigned i = 0; i < count && onlyAccel; ++i) {
+    int attached = -1;
+    onlyAccel = vendorKind(reports[i], &attached) == Vendor::accel;
+  }
+  if (show && gArgs.raw && !onlyAccel && (++fRawLogged <= 300 || fRawLogged % 50 == 0))
+    note("frame %u (read %u, %u reports), raw: %s", fFrames + 1, fReads, count, hex(fFrame, kFrameBytes, line, sizeof line));
   if (f != Frame::reports) {
     if (++fBadFrames <= 20 || fBadFrames % 100 == 0)
       note("frame %u: %s (%u reports before it): %s", fReads, frameName(f), count, hex(fFrame, show ? 24 : 3, line, sizeof line));
@@ -819,12 +866,16 @@ void PianoKeyboard::dispatch(const Report &r)
   const Vendor v = vendorKind(r, &attached);
   ++fVendor;
   if (v == Vendor::attach) {
-    note("attach message: %s", hex(r.bytes, r.length < 16 ? r.length : 16, line, sizeof line));
+    note("attach message: state byte %#04x (bit 0 %u, bit 1 %u)%s: %s", r.bytes[9], r.bytes[9] & 1, (r.bytes[9] >> 1) & 1,
+         fAttached && attached == 1 ? ", already attached" : "", hex(r.bytes, r.length < 16 ? r.length : 16, line, sizeof line));
     coverAttached(attached == 1, "attach message");
   } else if (v == Vendor::accel) {
     if (++fAccel <= 3 || fAccel % 500 == 0) note("accelerometer %u: %s", fAccel, hex(r.bytes, 16, line, sizeof line));
   } else if (v == Vendor::authRequest || v == Vendor::authInit || v == Vendor::authChallenge) {
-    if (++fAuth <= 5) note("%s (left unanswered): %s", vendorName(v), hex(r.bytes, r.length < 24 ? r.length : 24, line, sizeof line));
+    if (++fAuth <= 20 || gArgs.auth)
+      note("%s (%s): %s", vendorName(v), gArgs.auth ? "answered as Linux with its helper" : "unanswered: piano-keyboard-auth=0",
+           hex(r.bytes, r.length < 40 ? r.length : 40, line, sizeof line));
+    if (gArgs.auth) authAnswer(v, r);
   } else if (fVendor <= 30) {
     note("vendor %#04x (%s): %s", r.id, vendorName(v), hex(r.bytes, r.length < 24 ? r.length : 24, line, sizeof line));
   }
@@ -847,7 +898,14 @@ void PianoKeyboard::serve()
     }
     // A frame per edge; after a frame with reports one more read (edges coalesce while a read runs). Until an edge is seen, and
     // every second after that, a read anyway (an edge lost before arming leaves the MCU waiting).
-    const bool due = edge || fReadAgain || now - fLastReadMs >= (fEdgeSeen ? 1000u : 100u);
+    // gpio97 held high without a latched edge (a level the MCU keeps while it has data) also means a frame is waiting.
+    ++fPolls;
+    const bool high = level(kIrq);
+    if (high) ++fIrqHigh;
+    else fIrqWasLow = true;
+    const bool levelDue = !edge && !fReadAgain && high && fIrqWasLow;
+    if (levelDue) ++fLevelReads;
+    const bool due = edge || levelDue || fReadAgain || now - fLastReadMs >= (fEdgeSeen ? 1000u : 100u);
     unsigned burst = 0;
     if (due) {
       do fReadAgain = readFrame();
@@ -874,7 +932,7 @@ void PianoKeyboard::serve()
     const uint64_t elapsed = now - fStartMs;
     if (elapsed >= nextDescribe) {
       describe(elapsed / 1000);
-      nextDescribe = nextDescribe < 60000 ? 60000 : nextDescribe + 300000;
+      nextDescribe = nextDescribe < 60000 ? nextDescribe + 15000 : nextDescribe < 120000 ? nextDescribe + 30000 : nextDescribe + 300000;
     }
     if (!fReadAgain) IOSleep(fConsecutiveErrors >= 50 ? 1000 : gArgs.pollMs);
   }
@@ -882,9 +940,10 @@ void PianoKeyboard::serve()
 
 void PianoKeyboard::describe(uint64_t seconds)
 {
-  note("alive at %llu s: %s, %u reads (%u frames, %u empty, %u errors, %u bad), %u edges%s; keys %u, consumer %u, touch %u, mouse %u, "
-       "vendor %u (accel %u, auth %u), attaches %u, taps %u; %u commands (%u failed), %u reports to macOS (%u failed); irq %u status %u",
+  note("alive at %llu s: %s, %u reads (%u frames, %u empty, %u errors, %u bad), %u edges%s, %u level reads, irq high in %u of %u "
+       "polls; keys %u, consumer %u, touch %u, mouse %u, vendor %u (accel %u, auth %u), attaches %u, taps %u; %u commands (%u "
+       "failed), %u reports to macOS (%u failed); irq %u status %u",
        seconds, fAttached ? "attached" : "no cover", fReads, fFrames, fEmpty, fReadErrors, fBadFrames, fEdges,
-       fEdgeSeen ? "" : " (none yet: polled every 100 ms)", fKeys, fConsumer, fTouch, fMouse, fVendor, fAccel, fAuth, fAttaches,
-       fPointer.taps(), fCommands, fCommandErrors, fSent, fSendErrors, level(kIrq), level(kStatus));
+       fEdgeSeen ? "" : " (none yet: polled every 100 ms)", fLevelReads, fIrqHigh, fPolls, fKeys, fConsumer, fTouch, fMouse, fVendor,
+       fAccel, fAuth, fAttaches, fPointer.taps(), fCommands, fCommandErrors, fSent, fSendErrors, level(kIrq), level(kStatus));
 }

@@ -154,6 +154,15 @@ static void testCommands()
   bool rest = true;
   for (unsigned i = sizeof head; i < kCommandWire; ++i) rest = rest && !w[i];
   CHECK(rest);
+  // The Linux driver's authentication answers (channel 0x4f).
+  authInit(w);
+  const uint8_t init[15] = {0x4c, 0x32, 0x00, 0x4f, 0x31, 0x80, 0x38, 0x31, 0x06, 'M', 'I', 'A', 'U', 'T', 'H'};
+  CHECK(std::memcmp(w, init, sizeof init) == 0 && w[15] == sum8(w + 3, 12) && !w[16]);
+  authS3t1(w);
+  const uint8_t s3t1[29] = {0x4c, 0x32, 0x00, 0x4f, 0x31, 0x80, 0x38, 0x32, 0x14, 0x00, 0x00, 0x00, 0x02, 0x80, 0x3d,
+                            0x84, 0x36, 0x29, 0x82, 0xde, 0x6a, 0x0e, 0x68, 0x1d, 0x3d, 0x6b, 0x32, 0xa5, 0xa6};
+  CHECK(std::memcmp(w, s3t1, sizeof s3t1) == 0 && w[29] == sum8(w + 3, 26) && !w[30]);
+  CHECK(!message(w, kChannelControl, 0x99, init, 58));
 }
 
 static void testImage(const char *path, bool noFirmware)
