@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Host test of PianoInput's portable parts: SpmiObserver.h on an SPMI arbiter v7 model (APID map, owner table, observer
-// channels), Buttons.h's decoding and debounce, and HidReports.h's buttons descriptor (parsed item by item: the bits it
-// declares are the bits the driver sends).
+// channels), Buttons.h's decoding and debounce, PowerKey.h (the power key held back for PianoPolicy, through the debounce at the
+// 10 ms rate, and its reset after a wake), and HidReports.h's buttons descriptor (parsed item by item: the bits it declares are
+// the bits the driver sends).
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. buttons_host.cpp -o /tmp/buttons_host && /tmp/buttons_host
 #include "SpmiObserver.h"
 #include "Buttons.h"
 #include "HidReports.h"
+#include "PowerKey.h"
 #include <cstdio>
 #include <map>
 #include <vector>
@@ -224,6 +226,136 @@ static void testAdaptivePolling()
   }
 }
 
+// The poll loop's power-key path as PianoInput.cpp runs it: raw samples every 10 ms through Debounce, PowerKey on its output, the
+// report to macOS per sample, PianoPolicy's answer. Records every report change and every question to PianoPolicy.
+struct KeyRun {
+  struct Ask { uint64_t at; uint32_t heldMs; };
+  std::vector<std::pair<uint64_t, uint8_t>> reports;   // (ms, report) at each change, a pulse as two entries
+  std::vector<Ask> asks;
+  Debounce d;
+  PowerKey k;
+  uint8_t sent = 0;
+  bool policyThere = true, policyTakes = true;
+  uint8_t mask = kKeysAll;
+  void sample(uint8_t raw, uint64_t t)
+  {
+    const uint8_t down = d.update(true, raw, t);
+    const bool power = down & kKeyPower;
+    const bool hold = k.starts(power) && (mask & kKeyPower) && policyThere;
+    uint32_t held = 0;
+    const PowerStep step = k.update(power, hold, t, &held);
+    const uint8_t report = k.report(down, mask);
+    if (step == PowerStep::ask) {
+      asks.push_back({t, held});
+      if (!policyTakes) {
+        reports.push_back({t, uint8_t(report | kKeyPower)});
+        reports.push_back({t, report});
+        sent = report;
+      }
+    }
+    if (report != sent) {
+      reports.push_back({t, report});
+      sent = report;
+    }
+  }
+  // raw: the power key down from `from` for `length` ms (plus `other` held throughout), sampled every 10 ms until `until`
+  void press(uint64_t from, uint64_t length, uint64_t until, uint8_t other = 0, uint64_t start = 0)
+  {
+    for (uint64_t t = start; t < until; t += kPollMs) sample(uint8_t(other | (t >= from && t < from + length ? kKeyPower : 0)), t);
+  }
+};
+
+static void testPowerKey()
+{
+  {   // no PianoPolicy: reported as it happens (as before), nobody asked
+    KeyRun r;
+    r.policyThere = false;
+    r.press(1000, 300, 3000);
+    CHECK(r.asks.empty());
+    CHECK(r.reports.size() == 2 && r.reports[0].second == kKeyPower && r.reports[1].second == 0);
+    CHECK(r.reports[0].first >= 1000 + kDebounceMs && r.reports[0].first <= 1000 + kDebounceMs + kPollMs);
+    CHECK(r.reports[1].first >= 1300 + kDebounceMs && r.reports[1].first <= 1300 + kDebounceMs + kPollMs);
+  }
+  {   // PianoPolicy takes a short press: nothing reaches macOS; asked once, on the release, with the press's length
+    KeyRun r;
+    r.press(1000, 300, 3000);
+    CHECK(r.reports.empty());
+    CHECK(r.asks.size() == 1 && r.asks[0].heldMs >= 290 && r.asks[0].heldMs <= 310);
+    CHECK(r.asks[0].at >= 1300 + kDebounceMs && r.asks[0].at <= 1300 + kDebounceMs + kPollMs);
+    CHECK(r.k.shortPresses() == 1 && r.k.longPresses() == 0 && !r.k.reported());
+  }
+  {   // PianoPolicy does not take it (level 1, no system sleep, powerkey=0): the Power usage down and up at the release
+    KeyRun r;
+    r.policyTakes = false;
+    r.press(1000, 200, 3000);
+    CHECK(r.asks.size() == 1);
+    CHECK(r.reports.size() == 2 && r.reports[0].second == kKeyPower && r.reports[1].second == 0 && r.reports[0].first == r.asks[0].at &&
+          r.reports[1].first == r.asks[0].at);
+  }
+  {   // a long press: down at 1.5 s, up at the release; PianoPolicy is not asked
+    KeyRun r;
+    r.press(1000, 2500, 5000);
+    CHECK(r.asks.empty());
+    CHECK(r.reports.size() == 2 && r.reports[0].second == kKeyPower && r.reports[1].second == 0);
+    const uint64_t pressed = r.reports[0].first - kLongPressMs;   // the debounced press
+    CHECK(pressed >= 1000 + kDebounceMs && pressed <= 1000 + kDebounceMs + kPollMs);
+    CHECK(r.reports[1].first >= 3500 + kDebounceMs && r.reports[1].first <= 3500 + kDebounceMs + kPollMs);
+    CHECK(r.k.longPresses() == 1 && r.k.shortPresses() == 0);
+  }
+  {   // the threshold: 1490 ms debounced is short; a press seen down 1500 ms after its debounced start is long
+    KeyRun s;
+    s.press(1000, 1490, 4000);
+    CHECK(s.asks.size() == 1 && s.asks[0].heldMs == 1490 && s.reports.empty());
+    KeyRun l;
+    l.press(1000, 1510, 4000);
+    CHECK(l.asks.empty() && l.reports.size() == 2);
+  }
+  {   // the other keys pass while the power key is held back; a volume key held with it stays reported
+    KeyRun r;
+    for (uint64_t t = 0; t < 4000; t += kPollMs)
+      r.sample(uint8_t((t >= 500 && t < 3000 ? kKeyVolumeUp : 0) | (t >= 1000 && t < 1400 ? kKeyPower : 0)), t);
+    CHECK(r.asks.size() == 1);
+    CHECK(r.reports.size() == 2 && r.reports[0].second == kKeyVolumeUp && r.reports[1].second == 0);
+  }
+  {   // the power key masked (piano-input-mask): never held back, never reported, never asked
+    KeyRun r;
+    r.mask = kKeyVolumeUp | kKeyVolumeDown;
+    r.press(1000, 300, 3000);
+    CHECK(r.asks.empty() && r.reports.empty());
+  }
+  {   // PianoPolicy appears during a press that started reported: it stays reported until its release
+    KeyRun r;
+    r.policyThere = false;
+    for (uint64_t t = 0; t < 3000; t += kPollMs) {
+      if (t == 1100) r.policyThere = true;
+      r.sample(t >= 1000 && t < 1500 ? kKeyPower : 0, t);
+    }
+    CHECK(r.asks.empty() && r.reports.size() == 2);
+    r.press(3500, 200, 5000, 0, 3000);   // the next press is held back
+    CHECK(r.asks.size() == 1 && r.reports.size() == 2);
+  }
+  {   // a system sleep during a long press (reported down): after the wake the filter and the key are reset; the key read up
+      // gives the release at once; a key still down after the wake is reported only after it has been up once
+    KeyRun r;
+    r.press(1000, 3000, 2800);   // long press reported at ~2540 ms, still down at 2800
+    CHECK(r.reports.size() == 1 && r.reports[0].second == kKeyPower);
+    r.d = Debounce();
+    r.k.reset();
+    r.press(0, 0, 3200, 0, 2800);   // after the wake: up
+    CHECK(r.reports.size() == 2 && r.reports[1].second == 0 && r.reports[1].first == 2800);
+    KeyRun h;
+    h.press(1000, 3000, 2800);
+    h.d = Debounce();
+    h.k.reset();
+    for (uint64_t t = 2800; t < 5000; t += kPollMs) h.sample(kKeyPower, t);   // held through the wake: not reported, not asked
+    CHECK(h.asks.empty() && h.reports.size() == 2 && h.reports[1].second == 0);
+    for (uint64_t t = 5000; t < 6000; t += kPollMs) h.sample(0, t);
+    CHECK(h.asks.empty() && h.reports.size() == 2);
+    h.press(6000, 200, 7000, 0, 6000);   // the next real press goes to PianoPolicy
+    CHECK(h.asks.size() == 1);
+  }
+}
+
 // A HID 1.11 short-item walk of the buttons descriptor: the input bits in order with their (page, usage).
 static void testDescriptor()
 {
@@ -276,6 +408,7 @@ int main()
   testDecode();
   testDebounce();
   testAdaptivePolling();
+  testPowerKey();
   testDescriptor();
   if (failures) {
     std::printf("buttons_host: %d failure(s)\n", failures);

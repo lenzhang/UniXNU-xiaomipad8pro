@@ -16,6 +16,13 @@
 //   piano-input-mask=N   the keys reported to macOS (bit 0 power, bit 1 vol+, bit 2 vol-; default 7); masked keys are still logged
 //   piano-input-idle=MS  the poll period while no key is busy (default 40; 0: every 10 ms always, as before; at most 200)
 //   piano-wake-log=S     the "idle: N wakeups" line every S seconds (default 60, 0 none; shared with the other converted drivers)
+// The power key with PianoPolicy (docs/policy.md 5.1, PowerKey.h): while a PianoPolicy service is there (piano-policy=N), a press is
+// not reported at once: still down after 1.5 s it is a long press (the HID Power usage down then, up at the release); released
+// before, PianoPolicy is asked on the release (callPlatformFunction "piano-policy-power-key", the press in ms): taken, macOS gets
+// nothing; not taken, the HID Power usage down and up at once. Without PianoPolicy the key is reported as it happens, as before.
+// System sleep (docs/power.md 4, PianoPowerContract.h): in the power tree; setPowerState(off) parks the poll thread between two
+// samples (no SPMI read while the kernel polls the power key through the same observer channel), on reads the keys afresh (a key
+// down then is reported only after it has been up once, as at start; the press that woke the tablet the kernel held until released).
 // Every step logs "PianoInput: ...": stage 1-6 of start, the raw PMIC registers once, the event driver attaching, and an
 // "alive" line with counters 15 s and 60 s after start, then every 5 minutes.
 #include <IOKit/IOService.h>
@@ -36,6 +43,8 @@
 #include "SpmiObserver.h"
 #include "Buttons.h"
 #include "HidReports.h"
+#include "PowerKey.h"
+#include <PianoPowerContract.h>
 
 using namespace pianoinput;
 
@@ -168,11 +177,22 @@ class PianoInput : public IOService {
   uint8_t fDown = 0, fSent = 0, fPon = 0, fGpio = 0;
   uint64_t fSamples = 0, fStartMs = 0;
   uint32_t fReadErrors = 0, fEdges = 0, fReports = 0, fSendErrors = 0;
+  // the power key with PianoPolicy (PowerKey.h)
+  PowerKey fPower;
+  IOService *fPolicy = nullptr;   // PianoPolicy, looked up at each power key press until found, then kept
+  uint32_t fPolicyTaken = 0, fPolicyPassed = 0;
+  // system sleep: the poll thread parks between kOff and kOn
+  IOLock *fLock = nullptr;
+  bool fRunning = false, fSleepWanted = false, fParked = false, fWentOff = false;
+  uint32_t fSleeps = 0;
 
   bool probeKeys();
   bool publishButtons();
   void poll();
   void send(uint8_t keys);
+  IOService *policy();
+  void askPolicy(uint32_t heldMs, uint8_t report);
+  bool park();
   void describe(uint64_t seconds);
   static void pollThread(void *self, wait_result_t);
   static bool eventServicePublished(void *target, void *refCon, IOService *service, IONotifier *notifier);
@@ -180,6 +200,7 @@ class PianoInput : public IOService {
 public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  IOReturn setPowerState(unsigned long state, IOService *device) override;
 };
 
 OSDefineMetaClassAndStructors(PianoInput, IOService)
@@ -203,15 +224,22 @@ bool PianoInput::start(IOService *provider)
   }
   stage(5, "poll thread");
   fStartMs = nowMs();
+  fLock = IOLockAlloc();
   thread_t thread = nullptr;
-  if (kernel_thread_start(pollThread, this, &thread) != KERN_SUCCESS) {
+  if (!fLock || kernel_thread_start(pollThread, this, &thread) != KERN_SUCCESS) {
     stage(-5, "poll thread: kernel_thread_start");
     return true;
   }
   thread_deallocate(thread);
+  fRunning = true;
   registerService();
   stage(6, "running: the keys go to macOS as consumer usages Power 0x30, Volume Increment 0xE9, Volume Decrement 0xEA");
   setProperty("piano-input-stage", uint64_t(uint32_t(piano_input_stage)), 32);
+  note("power key: %s; system sleep: the poll thread parks while suspended (power tree joined: %#x)",
+       gArgs.mask & kKeyPower ? "held back for PianoPolicy while its service is there (a press under 1.5 s goes to it on the release, "
+                                "a longer one to macOS), else reported as it happens"
+                              : "masked (piano-input-mask): neither macOS nor PianoPolicy gets it",
+       pianopower::join(this));
   return true;
 }
 
@@ -364,6 +392,13 @@ void PianoInput::pollThread(void *self, wait_result_t)
   pianoirq::WakeStats wakes = pianoirq::wakeStats(pianoirq::wakeLogMs());
   uint32_t fastWakes = 0;
   for (;;) {
+    if (input->park()) {   // woken from a system sleep: the keys read afresh, as at start
+      input->fFilter = Debounce();
+      input->fPower.reset();
+      plan = PollPlan(gArgs.idle);
+      note("wake %u: polling again; the keys are read afresh (a key down now is reported only after it has been up once)",
+           input->fSleeps);
+    }
     input->poll();
     const uint64_t now = nowMs(), elapsed = now - input->fStartMs;
     if (elapsed >= nextDescribe) {
@@ -412,7 +447,93 @@ void PianoInput::poll()
              gArgs.mask & bit ? "" : ", masked: not reported");
     }
   }
-  if (uint8_t(down & gArgs.mask) != fSent) send(uint8_t(down & gArgs.mask));   // also retries a report that failed
+  // The power key (PowerKey.h): with PianoPolicy there at the press it is held back; a short press is PianoPolicy's to take.
+  const bool power = down & kKeyPower;
+  const bool hold = fPower.starts(power) && (gArgs.mask & kKeyPower) && policy();
+  uint32_t heldMs = 0;
+  const uint64_t at = nowMs();
+  const uint32_t longs = fPower.longPresses();
+  const PowerStep step = fPower.update(power, hold, at, &heldMs);
+  const uint8_t report = fPower.report(down, gArgs.mask);
+  if (step == PowerStep::ask) askPolicy(heldMs, report);
+  else if (fPower.longPresses() != longs)
+    note("power key: held %u ms: a long press, macOS's (HID Power usage down now, up at the release)", kLongPressMs);
+  if (report != fSent) send(report);   // also retries a report that failed
+}
+
+// PianoPolicy's service by class (no link dependency): looked up at a power key press until found, then kept (a kext of the
+// collection never unloads). Absent (piano-policy=0: it does not probe), the power key is reported as it happens.
+IOService *PianoInput::policy()
+{
+  if (fPolicy) return fPolicy;
+  OSDictionary *match = IOService::serviceMatching("PianoPolicy");
+  fPolicy = match ? IOService::copyMatchingService(match) : nullptr;
+  OSSafeReleaseNULL(match);
+  if (fPolicy) note("power key: PianoPolicy found: a press under %u ms is asked of it on the release (docs/policy.md 5.1)", kLongPressMs);
+  return fPolicy;
+}
+
+// A held-back short press ended: PianoPolicy takes it (sleep now, or a display wake), else macOS gets the Power usage down and up now.
+void PianoInput::askPolicy(uint32_t heldMs, uint8_t report)
+{
+  const IOReturn r = fPolicy ? fPolicy->callPlatformFunction("piano-policy-power-key", false, reinterpret_cast<void *>(uintptr_t(heldMs)),
+                                                             nullptr, nullptr, nullptr)
+                             : kIOReturnUnsupported;
+  if (r == kIOReturnSuccess) {
+    ++fPolicyTaken;
+    note("power key: short press %u ms: PianoPolicy took it", heldMs);
+    return;
+  }
+  ++fPolicyPassed;
+  note("power key: short press %u ms: macOS's (HID Power usage)", heldMs);
+  send(uint8_t(report | kKeyPower));
+  send(report);
+}
+
+// setPowerState(kOff) asks the poll thread to stop; it parks here, between two samples, until kOn. True after a park (a wake).
+bool PianoInput::park()
+{
+  if (!__atomic_load_n(&fSleepWanted, __ATOMIC_ACQUIRE)) return false;
+  IOLockLock(fLock);
+  const bool parking = fSleepWanted;
+  if (parking) {
+    fParked = true;
+    IOLockWakeup(fLock, &fParked, false);
+    while (fSleepWanted) IOLockSleep(fLock, &fSleepWanted, THREAD_UNINT);
+    fParked = false;
+  }
+  IOLockUnlock(fLock);
+  return parking;
+}
+
+// docs/power.md 4: off = the poll thread parked (nothing of this driver is powered: the PMIC keys are the kernel's while suspended);
+// on = the thread polls again. Synchronous both ways: the park is at most one poll period away (piano-input-idle, <= 200 ms).
+IOReturn PianoInput::setPowerState(unsigned long state, IOService *)
+{
+  if (!fRunning) return pianopower::kAckNow;
+  if (state == pianopower::kOff) {
+    IOLockLock(fLock);
+    __atomic_store_n(&fSleepWanted, true, __ATOMIC_RELEASE);
+    uint64_t deadline = 0;
+    clock_interval_to_deadline(500, kMillisecondScale, &deadline);
+    while (!fParked && IOLockSleepDeadline(fLock, &fParked, deadline, THREAD_UNINT) != THREAD_TIMED_OUT) {
+    }
+    const bool parked = fParked;
+    IOLockUnlock(fLock);
+    fWentOff = true;
+    note("sleep %u: %s; power key presses %u short (PianoPolicy took %u, macOS %u), %u long", ++fSleeps,
+         parked ? "the poll thread is parked (the kernel reads the power key while suspended)"
+                : "the poll thread did not park within 500 ms (it parks at its next sample)",
+         fPower.shortPresses(), fPolicyTaken, fPolicyPassed, fPower.longPresses());
+    return pianopower::kAckNow;
+  }
+  if (!fWentOff) return pianopower::kAckNow;   // the power tree's first kOn (pianopower::join)
+  fWentOff = false;
+  IOLockLock(fLock);
+  __atomic_store_n(&fSleepWanted, false, __ATOMIC_RELEASE);
+  IOLockWakeup(fLock, &fSleepWanted, false);
+  IOLockUnlock(fLock);
+  return pianopower::kAckNow;
 }
 
 void PianoInput::send(uint8_t keys)
