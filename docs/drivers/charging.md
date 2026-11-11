@@ -29,8 +29,9 @@ Status 2026-11-11: `package/PianoPower` built and linked into a test KC (host te
   `charge_policy` to 1; stop sets `charge_policy=0`. The driver then talks to the DSP: input limit by charger type (CDP 900 mA,
   DCP/QC/PD at 5 V 1500 mA, 9 V PD 1600 mA, 9 V PPS/verified 2500 mA, 100 mA on detach), charge current by type with thermal
   derating (500 mA below 15 °C, -300 mA/°C above 38 °C), 9 V from a fixed PDO after a 15 s wait, the SC8541 pump from PPS
-  sources, and acknowledges the DSP's USB-C port notifications. The DSP itself keeps a 4350 mV float voltage and a 0–55 °C
-  JEITA window. Measured: 8.8 V / 1.59 A in, +1.2–1.34 A per cell at light load (`streamC-charging-report.md`).
+  sources, and acknowledges the DSP's USB-C port notifications. The DSP itself keeps a 4400 mV float voltage (0x2007 reads
+  2·mV − 3600, so 5200; stock full is 4480 mV, 4060 mV from 48 °C) and a 0–55 °C JEITA window (`docs/ubuntu-history/device.md`
+  §2.5). Measured: 8.8 V / 1.59 A in, +1.2–1.34 A per cell at light load (`streamC-charging-report.md`).
 - **What the VM path did.** macOS was a crosvm guest; the Ubuntu host kernel (pmic_glink + xiaomi_mca + piano-charging) charged
   the tablet and the guest saw no battery (`gunyah-guest-SWITCHBACK.md`; 48 → 64 % in 25 min with the VM running).
 - **Design chosen: (b)**, the DSP path, with one difference from the plan: piano's DSP firmware does not speak the Qualcomm
@@ -387,6 +388,70 @@ Control Centre's Battery entry); unplugged, the percentage with "Power Source: B
 steady. `ioreg -rn AppleSmartBattery` (if a shell is available) lists the properties above. Built 2026-11-11 on main 7c04081:
 KC `dba24c1a1e8d814a…` (`11 native kexts linked, none from DroidVM`, PianoPower 719 pointers), image verify PASS (its own hash
 changes with every build: it carries the build time as `droidvm-utc`). Not booted.
+
+## 5e. What the Ubuntu history adds (images I and G2, 2026-11-11)
+
+`docs/ubuntu-history/device.md` §2.5, §2.14 and §3.1 (the Ubuntu device and kernel history, GPL kernel read for facts only) change
+how the 07:28 drain reads and what level 2 sends:
+
+- **Linux never wrote 0x2019 or 0x2012**, and never saw 0 mA input with the DSP running (≥ 394 mA with no host write). So the H
+  image stays opt-in; image I does not write 0x2019.
+- **0x2008 reads back the requested limit, not the one in force** (Linux read 100 with 394 mA flowing), and **0x20004 reads 0
+  once the firmware considers charging done**. Our run was at 98 %. The verdict is the gauges' summed current, now in the diag
+  line; next runs should be at 40–90 % and on a wall DCP/PD charger as well as the Mac's port: Ubuntu has **no SDP/CDP charging
+  result at all**.
+- **The stock board configuration**, sent by Linux on every charger generation before any policy (as the stock subpmic driver
+  does): 0x201c = 1 byte 1 (charge pump present), 0x201a = 16 bytes (words 0, 1, 0xffffffff, 0xffffffff: the charger boost and
+  the PMIC GPIO controller, no external GPIOs), 0x201b = 0x708 (the firmware sets up cable-insertion detection from it). Now
+  sent the same way (`PianoMca.c` board(): before any policy write, read back in the diag line, retried for five cycles, again on
+  every new generation); the allowlist takes exactly these three values. `piano-power-board=0` leaves it out.
+- **Every client waits for `msm/adsp/charger_pd` to report up**: PianoQrtr.c now registers a listener with the DSP's service
+  registry notifier (QMI service 0x42, instance 74; `Servreg.h`, layout from Linux's pdr messages) and acknowledges every state
+  change; the charger codec, the port enable and the policy start only on "up" (or 60 s after the channel without an answer,
+  logged), and a new "up" sends everything again (the firmware is back on its defaults; Ubuntu #18 recovered only by re-sending).
+- **USB-C port notifications**: our encoding already matches Linux (enable = write request opcode 0x15 with cmd 0x10, ack = opcode
+  0x15 cmd 0x11 arg = port, notifications opcode 0x16); what differed is the timing: we enabled them before charger_pd was up,
+  and the 07:28 run counted no reply. The enable now goes after "up".
+- **The firmware's port view in a second diag line**: 0x21002 verify (an interrupted adapter authentication left 5 V on the bus with
+  both cells slowly discharging, Ubuntu #20), 0x200d OTG boost, 0x200e OTG gate, 0x21015 Type-C mode, 0x21022 sink/source mode,
+  0x20001 usb type, 0x2007 float (decoded), the board readbacks, the charger_pd state and generation, the gauges' current.
+- **DSP restarts**: a FATAL on SMP2P and a lost "ready" are logged with a count and the crash reason (Ubuntu #3: a
+  sensor-framework loop restarted the ADSP about 8 times a minute; natively nothing serves the sensors' files). Nothing restarts
+  the DSP natively yet; a FATAL means the charger is back on its defaults.
+
+Expected new lines (level 2):
+
+```
+PianoPower: servreg: the notifier is at 5:N (instance 0x4a01); registering a listener for msm/adsp/charger_pd: sent
+PianoPower: servreg: msm/adsp/charger_pd is up (0x1fffffff, registration answer)
+PianoPower: mca: msm/adsp/charger_pd is up: reading the charger properties
+PianoPower: mca: write CP state (0x201c) = 1: ok (0)          (image I only)
+PianoPower: mca: write OTG configuration (0x201a) = 0: ok (0)  (the 16-byte constant)
+PianoPower: mca: write CID configuration (0x201b) = 1800: ok (0)
+PianoPower: mca: board configuration taken (CP state, OTG configuration, CID): the policy follows
+PianoPower: [45s] diag port: verify (0x21002) 0, OTG boost (0x200d) 0, ..., float (0x2007) 5200 = 4400 mV; board: CP state
+  (0x201c) 1, CID (0x201b) 0x708, OTG (0x201a) word 0 0, sent 0x7; charger_pd up (generation 1); battery (gauges) ... mA
+```
+
+| Image | Arguments (plus `exec-log=1 piano-usb=2`, built with `PIANO_GPU=2 PIANO_VMM_PRESENT=0`) | What it answers |
+|---|---|---|
+| G2 | `piano-power=2 piano-power-write=0` | read only: the charger_pd wait, the port enable after "up", both diag lines; no write at all |
+| I | `piano-power=2` | the same plus the board configuration, then the policy (ICL/FCC by type, CDP 900 mA); no 0x2019 write |
+
+Both take PianoA830's DRV-2 lock for our rail votes, so they run with `piano-gpu=2`. Commands (main checkout):
+
+```sh
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300 \
+  PIANO_EXTRA_ARGS="exec-log=1 piano-usb=2 piano-power=2 piano-power-write=0" tooling/k27/build-native-image.sh
+mkdir -p out/ram-power/G2 && cp out/ram/boot-piano-macos-ram-A-bundled.img out/ram/build-A-bundled.json out/ram-power/G2/
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300 \
+  PIANO_EXTRA_ARGS="exec-log=1 piano-usb=2 piano-power=2" tooling/k27/build-native-image.sh
+mkdir -p out/ram-power/I && cp out/ram/boot-piano-macos-ram-A-bundled.img out/ram/build-A-bundled.json out/ram-power/I/
+tooling/native/native-loop.sh out/ram-power/G2/boot-piano-macos-ram-A-bundled.img out/ram-dump/boot-piano-macos-ram-A-bundled.img
+grep -E 'PianoPower: (servreg|mca|\[[0-9]+s\] (diag|battery|mca))' logs/native-runs/<ts>-loop/xnu-console.txt
+```
+
+Run G2, then I, each at 40–90 % and once on a wall charger; the battery current on the `battery:` line is the verdict.
 
 ## 6. Risks
 
