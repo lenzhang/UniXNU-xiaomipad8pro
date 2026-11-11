@@ -150,7 +150,7 @@ void stage(int32_t value, const char *what)
 // Events of a thread: bits set by any thread (also PianoPower's DSP thread: no lock, only an atomic or and a wakeup), waited on
 // with a deadline (PianoAdsp's pattern).
 volatile uint32_t gMainEvents, gRpcEvents;
-enum : uint32_t { kEvChannel = 1, kEvResponse = 2, kEvSns = 4, kEvPacket = 8, kEvPack = 16, kEvPower = 32 };
+enum : uint32_t { kEvChannel = 1, kEvResponse = 2, kEvSns = 4, kEvPacket = 8, kEvPack = 16, kEvPower = 32, kEvConditions = 64 };
 
 void wake(volatile uint32_t *events, uint32_t bits)
 {
@@ -653,15 +653,24 @@ void ssClosePort(void *, int stream)
 }
 
 // The services whose properties are the streams' conditions, found by class (registered or not, as PianoBacklight finds PianoSensors):
-// looked up every 2 s for 2 minutes, then every 30 s; retained once found.
+// looked up every 2 s for 2 minutes, then every 30 s; retained once found. Their property-change messages (NativeGopDisplay's
+// piano-display-power, PianoKeyboard's cover and hall) wake the main thread at once; the properties are read on each of its passes.
 struct Watched {
   const char *cls;
   IOService *service;
   uint64_t next;
   unsigned lookups;
+  IONotifier *interest;
 };
-Watched gDisplay = {"NativeGopDisplay", nullptr, 0, 0}, gKeyboard = {"PianoKeyboard", nullptr, 0, 0},
-        gBacklight = {"PianoBacklight", nullptr, 0, 0};
+Watched gDisplay = {"NativeGopDisplay", nullptr, 0, 0, nullptr}, gKeyboard = {"PianoKeyboard", nullptr, 0, 0, nullptr},
+        gBacklight = {"PianoBacklight", nullptr, 0, 0, nullptr};
+
+// Runs in the sender's context (NativeGopDisplay's gated power change, PianoKeyboard's thread): only wakes the main thread.
+IOReturn conditionChanged(void *, void *, UInt32 type, IOService *, void *, vm_size_t)
+{
+  if (type == kIOMessageServicePropertyChange) wake(&gMainEvents, kEvConditions);
+  return kIOReturnSuccess;
+}
 
 IOService *watched(Watched &w, uint64_t now)
 {
@@ -680,7 +689,10 @@ IOService *watched(Watched &w, uint64_t now)
       }
     OSSafeReleaseNULL(it);
   }
-  if (w.service) note("streams: found %s (its properties are conditions of the streams)", w.cls);
+  if (w.service) {
+    w.interest = w.service->registerInterest(gIOGeneralInterest, conditionChanged, nullptr, nullptr);
+    note("streams: found %s (its properties are conditions of the streams%s)", w.cls, w.interest ? ", its changes wake the thread" : "");
+  }
   return w.service;
 }
 
@@ -701,7 +713,7 @@ SsConditions readConditions(uint64_t now)
 {
   SsConditions c;
   IOService *display = watched(gDisplay, now), *keyboard = watched(gKeyboard, now);
-  c.display = int(property(display, "piano-display-power", -1));   // published with piano-backlight=2: unknown counts as on
+  c.display = int(property(display, "piano-display-power", -1));   // unknown (not yet published) counts as on
   c.lid = int(property(keyboard, "piano-keyboard-hall", -1));
   c.attached = property(keyboard, "piano-keyboard-attached", 0) == 1;
   // The light: PianoBacklight's automatic mode takes the targets (piano-backlight=2, piano-backlight-auto=1), unless the user chose a
