@@ -106,12 +106,19 @@ Outputs in `out/persistent/` (all gitignored; hashes in `artifacts/ARTIFACTS.md`
 |---|---|---|
 | `base` | `k27/kc-k27-native.bin`, `adt/piano-k27.adt` (vmm-present 1), `inputs/kernel.macho.trustcache`, `inputs/scratch-data.img` (`cb50ceac…`) | `K27_ARGS` without `piano-reset-after`/`-to` |
 | `softgpu` | a KC with NativeSoftGpu (checked), `adt/piano-k27-vmm0.adt` (vmm-present 0, checked), `soft-metal/` seed and trust cache | + `panic_on_crash_disabled=1` (docs/drivers/soft-metal.md §10) |
+| `gpu` | a KC with PianoA830 and without NativeSoftGpu (checked), `adt/piano-k27.adt` built with `PIANO_VMM_PRESENT=0` (checked), `turnip-a830/stage/` seed and trust cache (the Turnip plugin) | + `piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1` (the A830 run that showed the login screen, 2026-11-11 07:45, without its reset and log arguments) |
 
 `--arg NAME=VALUE` adds or replaces one argument (for example `--arg piano-power=1`: battery gauges in the log, read only). Every
 line is checked against DarwinBoot's 1000-byte limit. For `softgpu`, first build its inputs in the source checkout:
 `PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/NativeSoftGpu.json PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh` with
 `PIANO_SOFT_METAL_LOG` unset (a staged log loop does not belong in a daily seed), then
-`ESP_PROFILE=softgpu ESP_FROM=<that checkout> tooling/persist/build-all.sh`.
+`ESP_PROFILE=softgpu ESP_FROM=<that checkout> tooling/persist/build-all.sh`. For `gpu` the inputs come from
+`PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/PianoA830.json PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh` (it stages the
+Turnip plugin itself); copy them aside first (`cp -c`) if that checkout keeps building, and pass the copy as `--from`.
+
+The RAM tests of session 2 need an ESP whose default resets into ABL fastboot (`-diag`); the step refuses a `-macos` one, which would
+never come back by itself. So with `gpu`: `esp --esp esp-gpu-diag.img` in session 1 and `esp-final --esp-final esp-gpu-macos.img`
+in session 3, and the same `--esp` on every invocation (step `map` compares the store's seed with that ESP's).
 
 The ESP image is reproducible (same inputs and `ESP_UTC` give the same bytes; checked twice). It is made by mtools (`mformat -F -S 5
 -M 4096 -c 1 -H 71527424 -v PIANOESP -N 50494e4f`, file times 2010-01-01) and checked twice: by mtools (minfo, copy back) and by an

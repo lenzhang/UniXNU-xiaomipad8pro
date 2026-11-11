@@ -17,7 +17,7 @@ watchdog is not armed without them) plus the profile's and --arg's additions. En
   macos-prev   only with --prev-kc (Payloads/previous/)
   fastboot     the seed, no UFS root, data-persist=0, no pstore console (the last run's log stays): reset into ABL fastboot after 1 s
   reset, shutdown, tools
-  build-esp.py --profile base|softgpu [--default macos|macos-diag] [--arg NAME=VALUE ...] [--from REPO] [--kc K --adt A --trust T
+  build-esp.py --profile base|softgpu|gpu [--default macos|macos-diag] [--arg NAME=VALUE ...] [--from REPO] [--kc K --adt A --trust T
                --seed S] [--name esp-diag] [--out out/persistent]
 """
 import argparse
@@ -49,7 +49,17 @@ PROFILES = {
         'kc': 'out/k27/kc-k27-native.bin', 'adt': 'out/adt/piano-k27-vmm0.adt',
         'trust': 'out/soft-metal/kernel.macho.trustcache', 'seed': 'out/soft-metal/scratch-data.img',
         'args': ['panic_on_crash_disabled=1'], 'vmm_present': 0, 'kexts': ['com.unixnu.driver.NativeSoftGpu']},
+    'gpu': {
+        'about': 'the A830 path that showed the login screen on 2026-11-11 07:45: PianoA830 in the collection '
+                 '(PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/PianoA830.json tooling/k27/build-native-image.sh, with PIANO_VMM_PRESENT=0), '
+                 'the Turnip plugin staged into the seed and trust cache (out/turnip-a830/stage), ADT vmm-present 0',
+        'kc': 'out/k27/kc-k27-native.bin', 'adt': 'out/adt/piano-k27.adt',
+        'trust': 'out/turnip-a830/stage/kernel.macho.trustcache', 'seed': 'out/turnip-a830/stage/scratch-data.img',
+        'args': ['piano-gpu=2', 'piano-gpu-delay=20', 'panic_on_crash_disabled=1'], 'vmm_present': 0,
+        'kexts': ['com.unixnu.driver.PianoA830'], 'kexts_absent': ['com.unixnu.driver.NativeSoftGpu']},
 }
+# Profile arguments the menu's "fastboot" entry (a reset after 1 s) leaves out.
+NOT_IN_FASTBOOT = ('piano-gpu', 'piano-gpu-delay')
 DROPPED = ('piano-reset-after', 'piano-reset-to', 'data-persist', 'droidvm-utc')
 
 
@@ -84,7 +94,7 @@ def args_of(a, profile, utc):
     macos = base + ['sheng-smp=1']
     diag = base + [f'piano-reset-after={a.diag_reset_after}', 'piano-reset-to=bootloader', 'sheng-smp=1']
     # The way back to ABL fastboot from the menu: no UFS root, no store, no console mirror (the previous run's log stays in cvp).
-    quiet = ('native-ufs-root', 'native-ufs-diagnostics', 'pstore-console', 'pstore-console-size')
+    quiet = ('native-ufs-root', 'native-ufs-diagnostics', 'pstore-console', 'pstore-console-size') + NOT_IN_FASTBOOT
     fastboot = [x for x in base if x.split('=', 1)[0] not in quiet + ('data-persist',)] + [
         'data-persist=0', 'piano-reset-after=1', 'piano-reset-to=bootloader', 'sheng-smp=1']
     lines = {'macos': ' '.join(macos), 'macos-diag': ' '.join(diag), 'fastboot': ' '.join(fastboot)}
@@ -151,7 +161,10 @@ def main():
     for bundle in profile['kexts']:
         if bundle not in natives:
             raise SystemExit(f'profile {a.profile} needs {bundle} in the kernel collection; {inputs["kc"]} has {natives} '
-                             f'(build it with PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/NativeSoftGpu.json tooling/k27/build-native-image.sh)')
+                             f'(build it with PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/<kext>.json tooling/k27/build-native-image.sh)')
+    for bundle in profile.get('kexts_absent', []):
+        if bundle in natives:
+            raise SystemExit(f'profile {a.profile}: {inputs["kc"]} links {bundle}, which this profile excludes')
     vmm = adt_vmm_present(inputs['adt'])
     if profile['vmm_present'] is not None and vmm != profile['vmm_present']:
         raise SystemExit(f'profile {a.profile} needs an ADT with vmm-present {profile["vmm_present"]}; {inputs["adt"]} has {vmm}')

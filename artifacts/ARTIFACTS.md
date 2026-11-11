@@ -77,3 +77,12 @@ makes them on the signing host). The FD build is not bit-reproducible: everythin
 ESP inputs: KC 415bbea57f0f6699… (8 native kexts), ADT bafbdaac91f0118f… (vmm-present 1), trust cache 2b87b2241090c905…, seed
 cb50ceac16394c9f… (seed identity 469ed4401f5b5241…, 3145728 pages, store window 3145825 blocks). ESP partition GUID
 3F8B0988-D851-5539-AE47-6E53C621D288.
+
+ESP profile `gpu` (built 07:56 from a copy of the main checkout's 07:44 build, the one that showed the login screen on the A830 at
+07:45: KC 68fd4487e36bff02… with PianoA830, ADT f441d8b108478d24… vmm-present 0, Turnip-staged trust cache 97fb617d9c274035… and
+seed df5579ddb4a1d9ec… (seed identity aced5bf9794b42f3…), `ESP_UTC=1794354270`):
+
+| File | Bytes | SHA-256 | What |
+|---|---|---|---|
+| `persistent/esp-gpu-diag.img` | 1073741824 | 97fecadfb84cc91ff5d64c6c7d99e9906de907e3c593d03c7cb80734716a5b18 | default `macos-diag` (session 1, RAM tests) |
+| `persistent/esp-gpu-macos.img` | 1073741824 | 1120f7d86ce688f9e122f863f59f71e50a5865e17227fa999824e2d331970615 | default `macos` (session 3, `esp-final`) |
