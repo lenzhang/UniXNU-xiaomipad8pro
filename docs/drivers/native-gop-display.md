@@ -57,10 +57,17 @@ relaunched 6 times in 240 s. Without it and without a display, WindowServer laun
 | `native-gop-display-refresh=0` | 1 | stop re-copying the shown surface on ticks 1, 2, 4, 8, 16 and 30 after a swap (only useful for a GPU renderer) |
 | `native-gop-display-thumb=N` | 30 | a thumbnail of the frame on the panel (see §5) on the first frame and then every N s; 0: none |
 | `native-gop-display-copy=BITS` | 0 | the copy's cost (§6 risk 3): bit 0 skips the refresh copies of a swap whose copy waited for the GPU's fence and saw it retired (the last one, tick 30, still runs); bit 1 maps surfaces cacheable and cleans/invalidates the rows by VA before each read. Not run on the tablet yet; the periodic `copy mode ...` line says what was saved |
-| `piano-backlight=2` | off | (PianoBacklight's argument) each display power change is published as `piano-display-power` and handed to PianoBacklight ([backlight.md](backlight.md)) |
+| `piano-backlight=2` | off | (PianoBacklight's argument) each display power change is also handed to PianoBacklight ([backlight.md](backlight.md)) |
 | `piano-dpu-pcc=1\|2` | off | (PianoDpu's, [dpu.md](dpu.md) §4.4) `swap_set_color_matrix` and `set_gamma_table` log each new matrix / table (raw words: B1d-0) and hand it to PianoDpu's PCC; without it both stay stubs |
 | `piano-dpu-panel=1` | off | (PianoDpu's, §4.5) each display power change also goes to PianoDpu (`PianoDpuPanel`: the panel's light sleep), after the backlight's request |
 | `piano-dpu-refresh=auto` | off | (PianoDpu's, §4.3) each frame shown is reported to PianoDpu (`PianoDpuSwap`: its 60/120 Hz policy) |
+
+**The display power for other drivers** (2026-11-11, `docs/policy.md` §5.6; built and linked, not run): every power change call
+publishes `piano-display-power` (boolean: on while both the system and WindowServer want the display on), whatever the boot
+arguments, and a change of it sends `kIOMessageServicePropertyChange` (argument: the property's name) to the service's interested
+clients (PianoPolicy, PianoKeyboard's `piano-keyboard-blank=1`). Before WindowServer's first call the property is absent, as before.
+Nothing else changed: the backlight callout still needs `piano-backlight=2`, the DPU's `piano-dpu-panel=1`. The clients' handlers
+run inside the framebuffer's gated power change, so they only record it (none may call back into this service there).
 
 No boot arg is needed for the display. Everything else is the native set as it is (`K27_ARGS` in
 `tooling/bootimg/build-ram-images.py`). For a log of the WindowServer stage, give the run more than the default 45 s

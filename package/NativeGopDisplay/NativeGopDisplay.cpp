@@ -25,6 +25,7 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOInterruptEventSource.h>
+#include <IOKit/IOMessage.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/clock.h>
 #include <libkern/c++/OSArray.h>
@@ -237,10 +238,14 @@ private:
     uint32_t fCopyFence;              // with fCopyNext: the fence its swap waits for, when fCopyFenced
     bool fCopyFenced;
     uint64_t fGpuWaits, fGpuWaitNs, fGpuWaitMaxNs, fGpuTimeouts;
-    // The backlight callout (boot-arg piano-backlight=2 only; without it nothing here runs): each display power change is published
-    // as "piano-display-power" and handed to PianoBacklight (package/PianoBacklight/PianoBacklightClient.h), found by class like the GPU.
+    // The display power for other drivers (docs/policy.md 5.6): every power change call publishes "piano-display-power" (boolean),
+    // and a change of it is messaged to the interested clients (kIOMessageServicePropertyChange, the property's name), always.
+    // The backlight callout (boot-arg piano-backlight=2 only; without it nothing more runs): each call is then also handed to
+    // PianoBacklight (package/PianoBacklight/PianoBacklightClient.h), found by class like the GPU.
     bool fBacklightCallout;
     IOService *fBacklight;            // retained once found
+    bool fPowerPublished, fPowerPublishedOn;   // what "piano-display-power" was last messaged as
+    void publishDisplayPower(bool on);
     void backlightCallout(bool on);
     // Zero-copy flips (boot-arg native-gop-display-flip=1, with PianoDpu's piano-dpu=2 piano-dpu-flip=4; docs/drivers/dpu.md §4.1;
     // without the argument nothing of this runs): the copy thread hands a swap's surface, after the GPU fence wait, to PianoDpu's
@@ -745,6 +750,7 @@ IOReturn NativeGopDisplay::swap_submit(IOMFBSwapRec *rec, IOUserClient *client, 
 IOReturn NativeGopDisplay::do_power_state_change_gated()
 {
     bool on = at<uint32_t>(this, kSystemPowerState) && at<uint32_t>(this, kAPIPowerState);
+    publishDisplayPower(on);
     if (fBacklightCallout)
         backlightCallout(on);
     if (on == fDisplayOn)
@@ -789,11 +795,22 @@ IOService *NativeGopDisplay::dpuService(bool now)
     return dpu;
 }
 
+// Every call: "piano-display-power" (PianoPolicy, PianoBacklight, PianoKeyboard read it), and on a change of it a property-change
+// message to the interested clients. Their handlers run here, inside the framebuffer's gated power change: they only record it.
+void NativeGopDisplay::publishDisplayPower(bool on)
+{
+    setProperty("piano-display-power", on);
+    if (fPowerPublished && on == fPowerPublishedOn)
+        return;
+    fPowerPublished = true;
+    fPowerPublishedOn = on;
+    messageClients(kIOMessageServicePropertyChange, const_cast<char *>("piano-display-power"));
+}
+
 // piano-backlight=2: every call, with both power states as they are (PianoBacklight logs their raw values, so an intermediate state
 // WindowServer might use for dimming shows up), only records a request there: nothing waits for the backlight's I2C.
 void NativeGopDisplay::backlightCallout(bool on)
 {
-    setProperty("piano-display-power", on);
     if (!fBacklight) {
         OSDictionary *match = IOService::serviceMatching("PianoBacklight");
         IOService *backlight = match ? IOService::copyMatchingService(match) : nullptr;
