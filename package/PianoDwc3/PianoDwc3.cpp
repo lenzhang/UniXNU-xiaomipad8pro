@@ -15,6 +15,8 @@
 //
 // Default off. piano-usb=1 only reads (power, clocks, core, PHY, SMMU, repeater state into the console log); 2 takes the
 // controller over; 3 also switches on GDSC/branch clocks it finds off. Every step is logged as "PianoDwc3: ...".
+// The USB thread's wait between passes follows the link (UsbIdle.h, docs/power-irq.md): 1 ms only while something moves, up to
+// 250 ms with no host; piano-usb-irq=1 lets the core's interrupt (SPI 133) end a wait; piano-usb-idle=0 is the old 1 ms loop.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -50,6 +52,8 @@
 #include "HidDescriptors.h"   // package/PianoKeyboard: the keyboard (+ consumer) and pointer report descriptors, shared
 #include "UsbNet.h"           // the network function's macOS side (PianoUsbNet.cpp)
 #include "PianoBacklightClient.h"   // package/PianoBacklight: brightness keys to the backlight (piano-backlight-keys=1)
+#include "UsbIdle.h"          // the USB thread's wait tiers
+#include "../common/PianoIrq.h"
 
 using namespace pianousb;
 
@@ -80,6 +84,8 @@ struct Args {
   uint32_t hidHold;   // piano-usb-hid-hold=MS: keys/buttons still down this long after the last command are released (default 3000)
   uint32_t net;       // piano-usb-net=1: a CDC-NCM network function after the ports, an Ethernet interface for macOS (PianoUsbNet)
   uint32_t netFifo;   // piano-usb-net-fifo: 1 (default) the TX FIFO plan for the endpoints in use, 0 keep the sizes the reset left
+  uint32_t irq;       // piano-usb-irq=1: the core's interrupt (SPI 133) wakes the USB thread (default 0: polled, adaptive)
+  uint32_t idle;      // piano-usb-idle: 1 (default) the adaptive wait (UsbIdle.h), 0 the old loop (1 ms after every quiet pass)
 };
 Args gArgs;
 
@@ -108,6 +114,9 @@ void readArgs()
   gArgs.hidHold = bootArg("piano-usb-hid-hold", 3000);
   gArgs.net = bootArg("piano-usb-net", 0);
   gArgs.netFifo = bootArg("piano-usb-net-fifo", 1);
+  gArgs.irq = bootArg("piano-usb-irq", 0);
+  gArgs.idle = bootArg("piano-usb-idle", 1);
+  if (!gArgs.idle) gArgs.irq = 0;   // the old loop is the old loop
 }
 
 // -------------------------------------------------------------------------------------------------------------------- MMIO
@@ -170,6 +179,17 @@ IOMemoryMap *gDmaMap;
 uint8_t *gDmaVa;
 uint64_t gDmaPa;
 IOLock *gLock;
+
+// The USB thread's wake-up word (docs/power-irq.md): it waits on it between passes; the core's interrupt (piano-usb-irq=1) and every
+// producer (console and pipe writers, the pipe and HID readers freeing room, the network queues) kick it.
+pianoirq::Waiter gWake;
+void usbKick() { gWake.kick(); }
+// The core's interrupt (below, at the USB thread) and the wait's state, for the monitor's `usb` command too.
+pianoirq::SpiLine gIrqLine;
+pianoirq::MissGuard gIrqMiss = pianoirq::missGuard(3);
+volatile uint32_t gIrqTaken;   // entries that masked events: the thread tells an interrupt from a kick by it
+bool gIrqMode;
+UsbTier gTier = UsbTier::busy;
 
 struct Ring {
   uint8_t *buf;
@@ -263,8 +283,10 @@ void consoleWrite(const char *s, size_t n, bool wait)
       IOSleep(2);
       IOLockLock(gLock);
     }
-    if (gLines[0] & 1) gTx[0].put(chunk, c);
+    const bool open = gLines[0] & 1;
+    if (open) gTx[0].put(chunk, c);
     IOLockUnlock(gLock);
+    if (open) usbKick();
   }
 }
 
@@ -363,13 +385,15 @@ void logRewind(bool replay)
   gLog.rdPos = (s + gLog.cap - gLog.avail) % gLog.cap;
 }
 
-void logPump()
+// True when it moved bytes (the USB thread's activity).
+bool logPump()
 {
   if (const int request = gRewindRequest) {
     gRewindRequest = 0;
     logRewind(request == 1);
   }
-  if (!gLog.ok || !(gLines[0] & 1) || !gLive) return;
+  if (!gLog.ok || !(gLines[0] & 1) || !gLive) return false;
+  bool moved = false;
   const uint32_t s = gLog.start(), delta = (s + gLog.cap - gLog.lastStart) % gLog.cap;
   gLog.lastStart = s;
   gLog.avail = gLog.avail + delta > gLog.cap ? gLog.cap : gLog.avail + delta;
@@ -378,7 +402,7 @@ void logPump()
     IOLockLock(gLock);
     const uint32_t room = gTx[0].space();
     IOLockUnlock(gLock);
-    if (room < 2 * sizeof chunk) return;   // '\n' may double
+    if (room < 2 * sizeof chunk) return moved;   // '\n' may double
     uint32_t n = 0, taken = 0;
     while (taken < gLog.avail && n < sizeof chunk) {
       const uint8_t c = gLog.at(gLog.rdPos);
@@ -388,7 +412,9 @@ void logPump()
     }
     gLog.avail -= taken;
     consoleWrite(chunk, n, false);
+    moved = true;
   }
+  return moved;
 }
 
 // ------------------------------------------------------------------------------------------------------------ the monitor
@@ -662,6 +688,7 @@ int puRead(dev_t, struct uio *uio, int ioflag)
     IOLockLock(gLock);
   }
   IOLockUnlock(gLock);
+  usbKick();   // room for the next bulk OUT transfer
   return error;
 }
 
@@ -679,7 +706,7 @@ int puWrite(dev_t, struct uio *uio, int ioflag)
     while (done < n) {
       if (!(gLines[1] & 1)) { gTx[1].dropped += n - done; break; }
       const uint32_t room = gTx[1].space(), k = room < n - done ? room : n - done;
-      if (k) { gTx[1].put(tmp + done, k); done += k; continue; }
+      if (k) { gTx[1].put(tmp + done, k); done += k; usbKick(); continue; }
       if (ioflag & IO_NDELAY) { gTx[1].dropped += n - done; break; }
       error = msleep(&gTx[1], IOLockGetMachLock(gLock), PZERO | PCATCH, "pianousb", nullptr);
       if (error) break;
@@ -1180,6 +1207,10 @@ void usbStatus()
           gTx[1].dropped);
   cprintf("log: %s capacity %u avail %u; /dev/pianousb %s\n", !gLog.ok ? "none" : gLog.msgbuf ? "msgbuf" : "pstore", gLog.cap, gLog.avail,
           gDevNode ? "present" : "absent");
+  cprintf("wait: %s, tier %s; SPI 133: %s, %llu handled, %llu strays, %u missed\n",
+          !gArgs.idle ? "1 ms loop (piano-usb-idle=0)" : gIrqMode ? "interrupt" : "polled, adaptive", tierName(gTier),
+          gIrqLine.up ? (gIrqLine.tripped ? "disabled (storm)" : "attached") : "not attached", (unsigned long long)gIrqLine.count(),
+          (unsigned long long)gIrqLine.strays, gIrqMiss.total);
   if (gArgs.hid)
     cprintf("hid: keyboard %s pointer %s; port 2 DTR %x; %u commands (keyboard %u consumer %u pointer %u), %u releases, %u auto-releases, "
             "%u bad lines, %u send errors\n", gHidDevice[0] ? "up" : "absent", gHidDevice[1] ? "up" : "absent", gLines[kPortInput],
@@ -1196,6 +1227,51 @@ void usbStatus()
   }
 }
 
+// ------------------------------------------------------------------------------- the core's interrupt (piano-usb-irq=1)
+// dwc_usb3, GIC SPI 133, level-high: up while the event buffer holds events (GEVNTCOUNT) and GEVNTSIZ.INTMASK is clear. The
+// primary handler masks it (the line drops) and kicks the thread; the thread takes the events and unmasks before it waits. A storm
+// (entries with nothing to mask) disables the line at the GIC; three timed-out waits in a row with events pending and the line
+// unmasked mean it never arrives. Either way the thread masks it for good and polls (UsbIdle.h's polled periods).
+void coreInterrupt(void *)
+{
+  using namespace dwc3;
+  const uint32_t size = rd32(gDwc.va + GEVNTSIZ), count = rd32(gDwc.va + GEVNTCOUNT);
+  if (dwc3IrqAction(count, size) == IrqAction::mask) {
+    wr32(gDwc.va + GEVNTSIZ, size | GEVNTSIZ_INTMASK);
+    dsb();
+    __atomic_add_fetch(&gIrqTaken, 1, __ATOMIC_RELEASE);
+    gWake.kick();
+    return;
+  }
+  if (gIrqLine.stray()) {
+    wr32(gDwc.va + GEVNTSIZ, size | GEVNTSIZ_INTMASK);
+    dsb();
+    gWake.kick();
+  }
+}
+
+bool attachCoreInterrupt()
+{
+  const uint32_t id = pianoirq::intid(pianoirq::kSpiDwc3);
+  const IOReturn r = gIrqLine.attach(id, false, coreInterrupt, nullptr);
+  const uint32_t rb = gIrqLine.readback;
+  gHal.note("irq: SPI %u (INTID %u, level) %s (%#x): readback %#x (group 1 %u, enabled %u, edge %u, priority %#x), router %#llx; %s",
+            pianoirq::kSpiDwc3, id, r == kIOReturnSuccess ? "attached" : "NOT attached", r, rb, rb & 1, (rb >> 1) & 1, (rb >> 2) & 1,
+            (rb >> 8) & 0xff, (unsigned long long)gIrqLine.router,
+            r == kIOReturnSuccess ? "events wake the USB thread (periods: busy 10 ms, port open 20 ms, configured 200 ms, no host 1 s)"
+                                  : "polled instead");
+  return r == kIOReturnSuccess;
+}
+
+void irqOff(const char *why)
+{
+  gIrqMode = false;
+  gHal.wr(dwc3::GEVNTSIZ, dwc3::GEVNTSIZ_INTMASK | Layout::kEventBytes);
+  gHal.barrier();
+  gHal.note("irq: off (%s): %llu handled, %llu strays, %u missed; polled from now on", why, (unsigned long long)gIrqLine.count(),
+            (unsigned long long)gIrqLine.strays, gIrqMiss.total);
+}
+
 void usbThread(void *, wait_result_t)
 {
   if (gArgs.delay) {
@@ -1207,26 +1283,88 @@ void usbThread(void *, wait_result_t)
     return;
   }
   gRunning = true;
+  gIrqMode = gArgs.irq && attachCoreInterrupt();
+  if (!gArgs.idle) gHal.note("wait: 1 ms after every quiet pass (piano-usb-idle=0, the old loop)");
+  else if (!gIrqMode)
+    gHal.note("wait: polled, adaptive (busy %u ms, port open %u ms, configured %u ms, no host %u ms)%s", kPolledPeriods.busy, kPolledPeriods.open,
+              kPolledPeriods.attached, kPolledPeriods.idle, gArgs.irq ? "" : "; piano-usb-irq=1 for the core's interrupt");
   uint64_t lastReport = nowNs();
+  const uint64_t begin = lastReport / 1000000;
+  uint64_t lastActivity = begin, lastEvent = begin;
+  pianoirq::WakeStats wakes = pianoirq::wakeStats(pianoirq::wakeLogMs());
+  uint32_t passes[4] = {};
+  bool kicked = false;
   for (;;) {
+    const uint32_t seen = gWake.now();   // before the pass: a kick during it ends the wait at once
     const unsigned events = gGadget.poll();
-    logPump();
+    const bool moved = logPump();
     gGadget.pump();
     gGadget.tick();
-    const uint64_t now = nowNs();
-    if (now - lastReport > 1000000000ull) {   // DSTS once a second while it changes (link state before the first reset)
-      lastReport = now;
+    const uint64_t ns = nowNs();
+    if (ns - lastReport > 1000000000ull) {   // DSTS once a second while it changes (link state before the first reset)
+      lastReport = ns;
       const uint32_t dsts = gHal.rd(dwc3::DSTS);
       if ((dsts & ~0x3fff8u) != (gLastDsts & ~0x3fff8u))   // ignore the frame number
         gHal.note("DSTS %08x (link state %u, connected speed %u), %u events so far", dsts, dwc3::dstsLinkState(dsts), dsts & 7u,
              gGadget.stats.events);
       gLastDsts = dsts;
     }
-    if (!events) IOSleep(1);
+    if (!gArgs.idle) {   // the old loop, for the A/B
+      if (!events) IOSleep(1);
+      continue;
+    }
+    const uint64_t now = ns / 1000000;
+    if (events) lastEvent = now;
+    if (events || moved || kicked) lastActivity = now;
+    kicked = false;
+    if (events) continue;   // as before: more may have come meanwhile
+    if (gIrqMode && !gIrqLine.live()) irqOff("storm: the line stayed up with nothing to mask; disabled at the GIC");
+    UsbActivity a{};
+    a.configured = gGadget.configured();
+    a.netUp = gGadget.netLinkUp();
+    a.ep0Active = gGadget.ep0Active();
+    for (unsigned p = 0; p < gGadget.ports(); ++p)
+      if (gLines[p] & 1) {
+        a.portOpen = true;
+        if (gTx[p].used() && !gGadget.inBusy(p)) a.txPending = true;
+      }
+    a.linkState = dwc3::dstsLinkState(gHal.rd(dwc3::DSTS));
+    a.sinceActivityMs = now - lastActivity;
+    a.sinceEventMs = now - lastEvent;
+    gTier = usbTier(a);
+    ++passes[unsigned(gTier)];
+    const uint32_t period = periodMs(gTier, gIrqMode ? kIrqPeriods : kPolledPeriods);
+    if (gIrqMode) {   // unmask: events already pending raise the line at once
+      gHal.wr(dwc3::GEVNTSIZ, Layout::kEventBytes);
+      gHal.barrier();
+    }
+    const uint32_t taken = __atomic_load_n(&gIrqTaken, __ATOMIC_ACQUIRE);
+    const bool woke = gWake.wait(seen, period);
+    const bool byIrq = __atomic_load_n(&gIrqTaken, __ATOMIC_ACQUIRE) != taken;
+    kicked = woke && !byIrq;
+    wakes.count(byIrq ? pianoirq::Woke::irq : woke ? pianoirq::Woke::kick : pianoirq::Woke::timeout);
+    if (gIrqMode) {
+      if (byIrq) {
+        gIrqMiss.delivered();
+      } else if (!woke && (gHal.rd(dwc3::GEVNTCOUNT) & 0xffffu) && !(gHal.rd(dwc3::GEVNTSIZ) & dwc3::GEVNTSIZ_INTMASK) &&
+                 gIrqMiss.miss()) {
+        irqOff("events pending with the line unmasked after 3 waits in a row: no interrupt arrives");
+      }
+    }
+    pianoirq::WakeStats::Window w;
+    if (wakes.due(nowNs() / 1000000, &w)) {
+      gHal.note("idle: %u wakeups in %u s, irq %u (kick %u, timer %u; passes busy %u open %u configured %u no-host %u; %s; link state %u, "
+                "configuration %u; SPI 133 count %llu)", w.wakeups, w.seconds, w.irqs, w.kicks, w.timeouts, passes[0], passes[1], passes[2],
+                passes[3], gIrqMode ? "interrupt" : "polled", a.linkState, gGadget.stats.configuration, (unsigned long long)gIrqLine.count());
+      for (uint32_t &n : passes) n = 0;
+    }
   }
 }
 
 }  // namespace
+
+// UsbNet.h: PianoUsbNet.cpp's queues wake the USB thread.
+void pianonet::usbKick() { gWake.kick(); }
 
 // ---------------------------------------------------------------------------------------------- HID input (piano-usb-hid=1)
 // A keyboard (+ consumer keys) and a relative pointer for macOS, fed by the Mac's commands on port 2 (HidInput.h). The class is the
@@ -1309,6 +1447,7 @@ void hidReply(const char *fmt, ...)
   IOLockLock(gLock);
   if (gLines[kPortInput] & 1) gTx[kPortInput].put(reinterpret_cast<const uint8_t *>(line), uint32_t(n));
   IOLockUnlock(gLock);
+  usbKick();
 }
 
 void hidCounts(const char *why)
@@ -1332,14 +1471,18 @@ void hidThread(void *, wait_result_t)
     uint8_t buf[256];
     IOLockLock(gLock);
     if (!gRx2.used() && !gHidReleaseWanted) {
+      // 100 ms only while something is held (the auto-release); commands and a closed port wake the thread themselves, so
+      // otherwise it sleeps (it used to wake 10 times a second for nothing; docs/power-irq.md).
+      const uint32_t waitMs = keys || consumer || buttons ? 100 : gHid.commands != reportedCommands ? 1000 : 60000;
       uint64_t deadline = 0;
-      clock_interval_to_deadline(100, kMillisecondScale, &deadline);
+      clock_interval_to_deadline(waitMs, kMillisecondScale, &deadline);
       IOLockSleepDeadline(gLock, &gRx2, deadline, THREAD_UNINT);
     }
     const uint32_t n = gRx2.get(buf, sizeof buf);
     const bool release = gHidReleaseWanted;
     gHidReleaseWanted = false;
     IOLockUnlock(gLock);
+    if (n) usbKick();   // room for the input port's next bulk OUT transfer
     if (release) {
       if (keys || consumer || buttons) { hidReleaseAll(); ++gHid.releases; }
       keys = consumer = buttons = false;
@@ -1459,8 +1602,9 @@ IOService *PianoDwc3::probe(IOService *provider, SInt32 *score)
 bool PianoDwc3::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
-  note("start: piano-usb=%u phy=%u smmu=%u utmi=%u delay=%u shell=%u hid=%u net=%u (DWC3 %#llx, SMMU stream %#x, polled)", gArgs.level,
-       gArgs.phy, gArgs.smmu, gArgs.utmi, gArgs.delay, gArgs.shell, gArgs.hid, gArgs.net, pianohw::kDwc3, pianohw::kUsbStream);
+  note("start: piano-usb=%u phy=%u smmu=%u utmi=%u delay=%u shell=%u hid=%u net=%u irq=%u idle=%u (DWC3 %#llx, SMMU stream %#x, %s)",
+       gArgs.level, gArgs.phy, gArgs.smmu, gArgs.utmi, gArgs.delay, gArgs.shell, gArgs.hid, gArgs.net, gArgs.irq, gArgs.idle,
+       pianohw::kDwc3, pianohw::kUsbStream, gArgs.irq ? "interrupt, else polled" : gArgs.idle ? "polled, adaptive" : "polled every 1 ms");
   if (gArgs.hid && gArgs.level < 2) note("piano-usb-hid needs piano-usb=2: no HID input");
   if (gArgs.net && gArgs.level < 2) note("piano-usb-net needs piano-usb=2: no network function");
   setProperty("piano-usb", gArgs.level, 32);

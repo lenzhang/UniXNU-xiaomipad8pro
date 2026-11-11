@@ -147,6 +147,7 @@ UInt32 PianoUsbNet::outputPacket(mbuf_t packet, void *)
   }
   IOLockUnlock(gNetLock);
   freePacket(packet);
+  if (queued) pianonet::usbKick();
   return queued ? kIOReturnOutputSuccess : kIOReturnOutputDropped;
 }
 
@@ -237,7 +238,8 @@ void netThread(void *arg, wait_result_t)
       gNet->applyLink(up, bps);
       IOLog("PianoDwc3: net: link %s%s\n", up ? "up: the Mac runs the NCM data interface" : "down", up ? (bps > 100000000 ? " (480 Mb/s)" : " (12 Mb/s)") : "");
     }
-    for (unsigned k = 0; k < 256; ++k) {   // a batch, then the link again
+    unsigned taken = 0;
+    for (unsigned k = 0; k < 256; ++k, ++taken) {   // a batch, then the link again
       IOLockLock(gNetLock);
       const uint32_t n = gFromHost.get(gFrame, ncm::kMaxFrame);
       IOLockUnlock(gNetLock);
@@ -245,6 +247,7 @@ void netThread(void *arg, wait_result_t)
       if (gNet) gNet->deliver(gFrame, n);
       else ++gCount.notUp;
     }
+    if (taken) pianonet::usbKick();   // room for the next NTB from the Mac
     if (!named && bsdName()) {
       named = true;
       IOLog("PianoDwc3: net: macOS named the interface %s (en0 stays PianoNullEthernet's built-in one)\n", bsdName());

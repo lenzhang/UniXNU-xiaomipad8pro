@@ -12,7 +12,8 @@ K=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
 HID=$K/out/x12377/inc-hid NET=$K/out/x12377/inc-net-piano
 [ -f "$HID/IOKit/hid/IOHIDDevice.h" ] || { echo "Error: no IOKit/hid headers at $HID" >&2; exit 1; }
 [ -f "$NET/IOKit/network/IOEthernetController.h" ] || { echo "Error: no IOKit/network headers at $NET" >&2; exit 1; }
-"$D/package/PianoDwc3/tests/run.sh"   # host tests: gadget core (+ NCM), NTB16, TX FIFO plan, SMMU planner, input parser (a few seconds)
+"$D/package/common/tests/run.sh"      # PianoIrq.h: the interrupt helpers' facts and state machines
+"$D/package/PianoDwc3/tests/run.sh"   # host tests: gadget core (+ NCM), NTB16, TX FIFO plan, SMMU planner, input parser, wait tiers
 python3 "$D/tooling/k27/build-native-kext.py" PianoDwc3 "$D/package/PianoDwc3/PianoDwc3.cpp" "$D/package/PianoDwc3/PianoUsbNet.cpp" \
   "$D/tooling/k27/NativeKextGlue.cpp" \
   -I "$D/package/PianoDwc3" -I "$D/package/PianoKeyboard" -I "$D/package/PianoBacklight" -I "$HID" -I "$NET" -I "$K/out/x12377/inc-gfx" -I "$K/out/x12377/storage-abi/include" \

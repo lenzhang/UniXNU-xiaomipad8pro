@@ -30,4 +30,7 @@ void link(bool up, uint32_t bitsPerSecond);
 // The monitor's `usb` command: one line.
 void status(char *line, unsigned size);
 
+// PianoDwc3.cpp: wakes the USB thread (a frame queued for the Mac, room made for the Mac's frames).
+void usbKick();
+
 }  // namespace pianonet

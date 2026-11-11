@@ -242,6 +242,8 @@ public:
   }
 
   bool inBusy(unsigned port) const { return ep[physOf(bulkEp(port), true)].busy; }
+  // A control transfer past its SETUP (data or status stage): the host is waiting for us (UsbIdle.h keeps the loop fast).
+  bool ep0Active() const { return phase == kData || phase == kWaitStatus || phase == kStatus; }
 
   // Call from the poll loop. EP0 watchdog: a control transfer that has not moved for 1 s (no event for its data or status
   // stage) is logged with the whole EP0 state, ended, and SETUP is armed again, so the host's retry gets through. While a host
