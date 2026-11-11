@@ -1,13 +1,17 @@
 # Wi-Fi: Qualcomm WCN7860 ("peach", PCI 17cb:110e) on PCIe0: PianoWifi
 
-Status: design + levels 1–5 code, 2026-11-11. `package/PianoWifi` carries level 1 (read-only survey), level 2 (power sequencing),
+Status: design + levels 1–6 code, 2026-11-11. `package/PianoWifi` carries level 1 (read-only survey), level 2 (power sequencing),
 level 3 (PCIe0 root-complex bring-up to a config-space read of `17cb:110e`, BAR0 and the SMMU stream), level 4 (MHI: the firmware
-over BHI/BHIe to mission mode) and level 5 (the chip's IPC router channels, QRTR, and the WLAN firmware's QMI service to its ready
-indication). All five are built, host-tested (`tests/wifi_host.cpp`, `tests/bringup_host.cpp`, `tests/qmi_host.cpp`) and linked
-into the native KC ("21 native kexts linked, none from outside this repository", PianoWifi 527 pointers), inert without
+over BHI/BHIe to mission mode), level 5 (the chip's IPC router channels, QRTR, and the WLAN firmware's QMI service to its ready
+indication) and level 6 (the copy engine's rings over BAR0, the host transport's handshake, the firmware's message interface with
+the host's initialisation, and a **passive scan** whose results become the property `piano-wifi-scan`). The macOS side of level 6
+is `package/PianoWifi/PianoWifiEthernet.cpp`: an `IOEthernetController` publishing `en1` **link down** with that list
+(`tooling/native/piano-wifi` prints it). All six are built, host-tested (`tests/wifi_host.cpp`, `tests/bringup_host.cpp`,
+`tests/qmi_host.cpp`, `tests/wmi_host.cpp`) and linked into the native KC ("22 native kexts linked, none from outside this
+repository", PianoWifi 568 pointers, PianoWifiEthernet 442 pointers with its vtable check at 0 problem slots), inert without
 `piano-wifi`; **nothing above level 1 has run on hardware**, and each level must be read from a boot's log before the next one is
-tried (§8.2–§8.5, the batched list in §8.7). Level 6 and up (WMI, scan, join, the macOS side) are design only (§12 has level 5's
-message table, §13 level 6's design and the macOS side's plan). Template: `README.md`.
+tried (§8.2–§8.6, the batched list in §8.8). Association, keys and the data path (levels 7 and 8) are design only (§12 has level
+5's message table, §14 level 6's, §13 what levels 7 and 8 need and the macOS side's remaining plan). Template: `README.md`.
 
 ## 1. Purpose and gate
 
@@ -66,7 +70,7 @@ its commit is pinned here and in `package/PianoWifi/UPSTREAM`: `drivers/pci/cont
 `qmi.h` (the message set of §12 with every tag, the order of the exchange, the memory types and the "ask again smaller" fallback),
 `wifi7/mhi.c` (this chip's channel and event configuration), `wifi7/ce.c`, `wifi7/hw.c`, `wifi7/hal*.c` (the copy engine's pipes,
 the services' pipes, the board-file cap, the shadow registers and the ring register map), `drivers/soc/qcom/qmi_encdec.c` (how a
-counted array and a string are encoded), `htc.c`/`wmi.c`/`dp*.c` (level 6's shape, §13), and the peach deltas of the Ubuntu tree
+counted array and a string are encoded), `htc.c`/`wmi.c`/`ce.c`/`hal*.c`/`mac.c` (level 6's wire facts, §14) and `dp*.c` (level 8's shape, §13), and the peach deltas of the Ubuntu tree
 (SUN's 0003 has the same shape). Behaviour only; GPL-2.0, nothing copied (§11). Ubuntu's status: Wi-Fi works, stable
 2.4 GHz and 5 GHz 80 MHz links (`xiaomipad-8pro-mainline/README.en.md`).
 
@@ -83,8 +87,8 @@ counted array and a string are encoded), `htc.c`/`wmi.c`/`dp*.c` (level 6's shap
 | GCC vote lock for `0x52000`/`0x52008` | PianoA830 `Sm8750GpuPower.c` `sm8750_gcc_vote_owner` (weak word, the SoC kit's protocol) | MIT (Adreno830) | level 2: every read-modify-write of the vote words under it (A830 votes GPLL0 in `0x52000`) |
 | SMMU bypass bank for a stream | NativeUfs (`SmmuTakeover.h`), PianoDwc3 `SmmuStream.h` | BSD | level 3's tail: stream 0x1401 (`SmmuStream.h`, PianoDwc3's copied with its namespace changed) |
 | Firmware read in place from `modem_a` (FAT, read-only through NativeUfs) | PianoPower `PianoAdspFirmware.c` + `FatVolume.c` | BSD | level 4: `image/peach/amss20.bin` at run time (`WifiFirmware.c` + a copy of `FatVolume.c`); nothing staged in any repository |
-| Linux ath12k + mac80211 + cfg80211 on XNU, wpa_supplicant 2.12 control path, board callbacks (`nw_abi.h`: platform clock/sleep/log/alloc/DMA/firmware, board BAR/config/MSI) | `unixnu-research/Ath12kWifi` 48e23bf | **GPL-2.0 sources fetched at build time; the repository has no LICENSE** | levels 6–8 only by owner decision (§5.2, §11); WCN7850-only today (no peach) |
-| macOS 27 presentation: `ShengEthernet` (an IOEthernetController en0 carrying the Wi-Fi module, vtable-checked) | sheng `package/ShengEthernet.cpp`, `board.toml` macOS 27.3 profile | BSD | level 9, the same model as `PianoNullEthernet` (already vtable-safe in our KC) |
+| Linux ath12k + mac80211 + cfg80211 on XNU, wpa_supplicant 2.12 control path, board callbacks (`nw_abi.h`: platform clock/sleep/log/alloc/DMA/firmware, board BAR/config/MSI) | `unixnu-research/Ath12kWifi` 48e23bf | **GPL-2.0 sources fetched at build time; the repository has no LICENSE** | levels 7 and 8 only by owner decision (§5.2, §11); WCN7850-only today (no peach); levels 1-6 need none of it |
+| macOS 27 presentation: `ShengEthernet` (an IOEthernetController en0 carrying the Wi-Fi module, vtable-checked) | sheng `package/ShengEthernet.cpp`, `board.toml` macOS 27.3 profile | BSD | the shape of `PianoWifiEthernet` (§13.1), which is the same model as `PianoNullEthernet` (already vtable-safe in our KC) |
 
 ## 5. IOKit family / ABI: the macOS side
 
@@ -102,7 +106,7 @@ Skywalk channels whose layouts change per release.
 | Option | macOS Wi-Fi UI | Effort | Verdict |
 |---|---|---|---|
 | A. A real IO80211 driver (subclass the Skywalk controller/interface, answer airportd's apple80211 requests) | full: Wi-Fi menu, Settings › Wi-Fi, CoreWLAN, Location | months of reverse engineering a private, per-release ABI; sheng's narrower binding (its own `IO80211Controller`/`IO80211Interface`, `SIOC[SG]A80211`, structs tied to iPadOS 24A446) shows the cost even for wifid; third-party Intel drivers that took this road (AirportItlwm) depend on reverse-engineered headers redone at each major release | not now |
-| B. **Ethernet-like**: an `IOEthernetController` (`en1`, built in) whose frames are the station's 802.3 view; scan/join through a control endpoint (kern_control) driven by a supplicant and a small CLI (`pianowifi scan / join SSID`), profile under `private/var/...` (mode 600, never in a repository) | none: macOS shows an Ethernet service; DHCP, DNS, routing, Safari, updates all work; no Wi-Fi menu, no AirDrop/Handoff/Location-by-Wi-Fi, no system Wi-Fi password prompt | small on the macOS side (PianoNullEthernet + a control socket; the model of sheng's macOS profile and of itlwm + HeliPort) | **recommended** |
+| B. **Ethernet-like**: an `IOEthernetController` (`en1`, built in) whose frames are the station's 802.3 view; scan/join through a control endpoint (kern_control) driven by a supplicant and a small CLI (`piano-wifi`, `join SSID`), profile under `private/var/...` (mode 600, never in a repository) | none: macOS shows an Ethernet service; DHCP, DNS, routing, Safari, updates all work; no Wi-Fi menu, no AirDrop/Handoff/Location-by-Wi-Fi, no system Wi-Fi password prompt | small on the macOS side (PianoNullEthernet + a control socket; the model of sheng's macOS profile and of itlwm + HeliPort) | **recommended; its skeleton is built** (`PianoWifiEthernet`, §13.1: `en1` link down with level 6's scan list, no frame yet) |
 | C. USB-C network first: CDC-NCM/ECM function on PianoDwc3's gadget + an IOEthernetController, the Mac's Internet Sharing upstream | none (wired) | about a week, no firmware, no PCIe (`usb-device-debug.md` §4.2 option 4) | **do first**, as the network while the Wi-Fi ladder is walked |
 
 Under B, the 802.11 station logic lives where the chip stack lives: in the kernel stack (Linux's mac80211 via Ath12kWifi, or our own)
@@ -120,7 +124,7 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 
 | Boot arg | Default | Effect |
 |---|---|---|
-| `piano-wifi=N` | 0 (probe() declines, nothing mapped) | 1: the read-only survey (loads only); 2: + the power sequence; 3: + the link, BAR0 and the SMMU stream; 4: + the firmware over MHI; 5: + the IPC router channels, QRTR and the firmware's QMI service; above 5: runs level 5 |
+| `piano-wifi=N` | 0 (probe() declines, nothing mapped) | 1: the read-only survey (loads only); 2: + the power sequence; 3: + the link, BAR0 and the SMMU stream; 4: + the firmware over MHI; 5: + the IPC router channels, QRTR and the firmware's QMI service; 6: + the copy engine, the host transport, the firmware's message interface and a passive scan (and `piano-wifi-mode` defaults to 1, since level 6 needs the firmware's radio running); above 6: runs level 6 |
 | `piano-wifi-gen=N` | 2 | the root port's target link speed (1–3). Gen3 needs cx/mx at NOM, which nothing here votes |
 | `piano-wifi-physeq=0` | 1 | apply only the PHY sequence's frame writes (power-down, reset release, start), not the 128-write table: tells "the table is wrong for piano" from "the PHY does not come up at all" |
 | `piano-wifi-rcg=0` | 1 | leave the aux / rchng RCG sources as the boot stages left them |
@@ -132,24 +136,37 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-qmitimeout=MS` | 10000 | the deadline of each level 5 step (the service's own request timeout) |
 | `piano-wifi-iova=1` | 0 | give the endpoint's stream 0x1401 a translating context bank whose 32-bit window (`0x20000000` + the window's size, 2 MiB blocks) maps the DMA window, and hand the chip those addresses instead of physical ones. The only way to give this chip a 32-bit address, which its own driver uses for the data path's rings (§10.11); the page table is a buffer of its own, outside the window the chip can reach |
 | `piano-wifi-mode=1` | 0 | level 5 also sends the firmware's options (logging), the host's copy-engine configuration and the mode — the three messages that start the radio and open level 6. By default level 5 stops at the ready indication |
-| `piano-wifi-shadow=1` | 0 | put the shadow register list in that configuration (40 addresses computed from the chip's register map for the rings level 6 will create; until those rings exist a shadow register stands for nothing) |
+| `piano-wifi-shadow=1` | 0 | put the shadow register list in that configuration (40 addresses computed from the chip's register map for the rings level 8's data path will create; level 6 writes the real registers through the window instead, §10.17) |
 | `piano-wifi-smmu=N` | 1 | 0: the SMMU is left alone (level 4 then needs stream 0x1401 to bypass already); 1: the endpoint's stream 0x1401 through a bypass context bank; 2: also the root port's 0x1400 |
 | `piano-wifi-spmi=1` | 0 | add the eight supplies' PMIC regulators and the BT_EN / sleep clock pins over the SPMI observer (the only stores: the observer's read commands) |
 | `piano-wifi-hwcg=1` | 0 | count a hardware-gated branch that reads CLK_OFF while voted and under HW_CTL as running for the read gates |
 | `piano-wifi-smmu=0`, `piano-wifi-cmddb=0` | 1 | skip the SMMU stream scan / the cmd-db lookup |
 | `piano-wifi-delay=S` | 0 | wait S seconds before the survey |
 | `piano-wifi-repeat=S`, `piano-wifi-samples=N` | 0, 3 | resample the MMIO part every S seconds, N times (one summary line each) |
+| `piano-wifi-wmitimeout=MS` | 10000 | the deadline of each level 6 step (the firmware's own service-ready timeout is five seconds) |
+| `piano-wifi-scanwait=MS` | 12000 | how long the scan itself may take. When it runs out and the scan had started, what it found stands and the teardown runs; when it had not started, the level fails |
+| `piano-wifi-band=N` | 1 | 1: the scan visits the 2.4 GHz band's 13 channels and the 5 GHz band's 9 non-radar ones; 0: only 2.4 GHz (the shorter boot, and the one that needs no regulatory answer for the upper band) |
+| `piano-wifi-bssid=1` | 0 | print a network's whole address in the log. By default only its first three bytes are printed and the rest is `**:**:**`, so that a pasted log cannot carry the owner's environment (§11). The registry property always carries the whole address, which is what a later join needs |
 
 ## 7. Build, kernel collection
 
-`tooling/k27/build-native-piano-wifi.sh` (host tests `package/PianoWifi/tests/wifi_host.cpp`, `tests/bringup_host.cpp` and
-`tests/qmi_host.cpp`, the `FatVolume.c` drift check, the objects in `out/native-kexts/PianoWifi`, the import check), descriptor
-`tooling/k27/kext/PianoWifi.json` (`com.unixnu.driver.PianoWifi`), listed in `configs/k27-native-kexts.txt`, so
-`tooling/k27/build-native-image.sh` links it into every native KC (inert). The descriptor names two libraries, which is why
-PianoWifi comes after them in the list: `PianoA830` for the two lock words (`sm8750_rpmh_drv2_owner`, `sm8750_gcc_vote_owner`) and
-`NativeUfs` for `native_ufs_part_find` / `native_ufs_part_read` (level 4's firmware read). The four unresolved symbols the import
-check reports are exactly those; the KC link resolves them (PianoWifi 527 pointers, 21 native kexts, none from outside this
-repository).
+`tooling/k27/build-native-piano-wifi.sh` (host tests `package/PianoWifi/tests/wifi_host.cpp`, `tests/bringup_host.cpp`,
+`tests/qmi_host.cpp` and `tests/wmi_host.cpp`, the `FatVolume.c` drift check, the objects in `out/native-kexts/PianoWifi`, the
+import check), descriptor `tooling/k27/kext/PianoWifi.json` (`com.unixnu.driver.PianoWifi`), listed in
+`configs/k27-native-kexts.txt`, so `tooling/k27/build-native-image.sh` links it into every native KC (inert). The descriptor names
+two libraries, which is why PianoWifi comes after them in the list: `PianoA830` for the two lock words
+(`sm8750_rpmh_drv2_owner`, `sm8750_gcc_vote_owner`) and `NativeUfs` for `native_ufs_part_find` / `native_ufs_part_read` (level 4's
+firmware read). The four unresolved symbols the import check reports are exactly those; the KC link resolves them.
+
+The macOS side is a second kext of the same package: `tooling/k27/build-native-piano-wifi-ethernet.sh` builds
+`package/PianoWifi/PianoWifiEthernet.cpp` against `IONetworkingFamily` (and the k27 tree's networking headers, as
+PianoNullEthernet is built), descriptor `tooling/k27/kext/PianoWifiEthernet.json` with the same vtable check PianoNullEthernet
+has. It owns no hardware: its personality matches the **resource** `PianoWifiLink`, which PianoWifi publishes only when level 6
+came up, so without `piano-wifi=6` macOS never sees `en1`. Both are in the kext list, after PianoWifi.
+
+The link: `22 native kexts linked, none from outside this repository`; PianoWifi 568 pointers, PianoWifiEthernet 442 pointers,
+`vtable check PianoWifiEthernet vs IOEthernetController: 0 problem slots`; `tooling/k27/check-native-kexts.py` passes on both
+descriptors and on the collection's log.
 
 | File | What |
 |---|---|
@@ -164,8 +181,13 @@ repository).
 | `WifiSmmuWindow.h` | level 5: the 32-bit window for stream 0x1401 — a translating context bank and its two-page table (§10.11) |
 | `WifiQrtr.c/.h` | the IPC router and the QMI header/TLV parse: a copy of PianoPower's with two additions (`UPSTREAM`) |
 | `WifiFirmware.c/.h` | the firmware read in place from `modem_a` through NativeUfs (ranges only; no file is ever held whole) |
+| `WifiCe.h` | level 6: the copy engine — the three rings of a pipe in the window, the registers that describe them, a send, the receive buffers, the event walk and the teardown |
+| `WifiHtc.h` | level 6: the host transport — the header, the ready message, a service connected, set-up complete, the trailer's credit records |
+| `WifiWmi.h` | level 6: the firmware's message interface — the codec, the initialisation command with this chip's resource configuration, the capability and ready events, a virtual device, the scan and its events, the management-frame parse and the scan list |
+| `WifiLink.h` | level 6: the ladder over those three, as one step machine with a clock and one outstanding command |
+| `PianoWifiEthernet.cpp` | the macOS side: the `IOEthernetController` publishing `en1` link down with the scan list (§13.1), its own kext, gated on the resource `PianoWifiLink` |
 | `FatVolume.c/.h`, `SmmuStream.h`, `SpmiObserver.h` | copies of PianoPower's and PianoDwc3's (`UPSTREAM`; those packages are not modified) |
-| `PianoWifi.cpp` | the IOService: the windows, the logged writes, the RPMh transactions, the SPMI reads, the DMA window, BAR0, the levels' reports |
+| `PianoWifi.cpp` | the IOService: the windows, the logged writes, the RPMh transactions, the SPMI reads, the DMA window, BAR0, the chip's register window, the levels' reports, the scan's registry properties and the power contract's suspend hook |
 
 ## 8. Bring-up ladder, test plan and effort
 
@@ -179,15 +201,17 @@ level's log was read. Effort = agent work + owner boots, assuming the PaganiWifi
 | 3 (built) link | GDSC release (GCC vote lock), RCGs, branch votes, TCSR clkref, BCR pulses, PARF set-up, the v7 PHY sequence, PHYSTATUS, BDF-to-SID, root port + memory window, PERST# high ≥ 100 ms later, LTSSM, L0 (Gen2 cap), iATU 0 and 1, config read, BAR0, SMMU stream 0x1401 | `17cb:110e` from the endpoint, BAR0 placed | done; 3–5 boots |
 | 4 (built) MHI firmware | the DMA window (24 MiB, 36-bit, write-combined), BAR0's MHI block, `image/peach/amss20.bin` read at run time from `modem_a`, BHI (the boot loader), the MHI contexts, BHIe (the second ELF), mission mode; polled, no MSI | EE mission mode (AMSS) | done; 2–4 boots |
 | 5 (built) QMI | the MHI channels 20/21 and their events, QRTR, and the WLFW service: the radio's and the chip's capability, the indication registration, the host capability, the firmware's memory regions out of the window, regdb and the China-region board file in 6 KiB segments, the PHY and auxiliary microcodes by address, the trace configuration; `piano-wifi-mode=1` also the options, the copy-engine configuration and the mode | the firmware's "ready" indication | done; 2–4 boots |
-| 6 WMI | copy engines, HTC, WMI init/ready, HTT, data-path rings (§13) | WMI ready event, MAC/caps | fresh: 4–8 weeks; via Ath12kWifi: 1–2 weeks of board glue |
-| 7 scan | WMI scan, management RX | the AP list | fresh 1–2 weeks |
-| 8 join | open + WPA2-PSK (supplicant), peer/vdev, keys, TX/RX | DHCP lease, ping | fresh 4–8 weeks; Ath12kWifi + peach deltas 2–4 weeks |
-| 9 macOS | §5.2 B: IOEthernetController en1 + control socket + CLI | Safari loads a page | 1–2 weeks |
+| 6 (built) the pipe and the scan | the copy engine's rings (four pipes), the host transport (ready, the message interface connected, set-up complete), the service-ready and ready events, the host's initialisation, a station virtual device, a **passive scan** and its results; the macOS side's skeleton (`en1` link down with the list) | the firmware's ready event, then the scan's networks (§8.6) | done; 2–4 boots |
+| 7 join | association: the regulatory answer read, the channel list sent, the virtual device started, a peer, the four-way handshake in a user-space supplicant, the keys installed | a link to the owner's access point | fresh 4–8 weeks; Ath12kWifi + peach deltas 2–4 weeks |
+| 8 traffic | the data path: the reorder, transmit and buffer-manager rings, the firmware's data interface (HTT), frames in and out, `en1` up and routed | a DHCP lease and Safari loading a page | fresh 4–8 weeks |
 
-Totals: about 2–3 months to a working station with Ath12kWifi for levels 6–8 (20–30 owner boots); 6–9 months fully licence-clean.
-Levels 1–5 are written; what is left is level 6 and up, and the owner boots of §8.7.
-The numbering of the levels above 4 shifted by one when levels 4 (BAR/MHI) and 5 (firmware) of the first plan became one level:
-the firmware load needs the BAR and the contexts in the same run, and splitting them meant two boots that each proved nothing.
+Totals: about 2–3 months to a working station with Ath12kWifi for levels 7 and 8 (20–30 owner boots); 6–9 months fully
+licence-clean. Levels 1–6 are written; what is left is association, the data path, and the owner boots of §8.8.
+The numbering of the levels above 4 shifted twice. First when levels 4 (BAR/MHI) and 5 (firmware) of the first plan became one
+level: the firmware load needs the BAR and the contexts in the same run, and splitting them meant two boots that each proved
+nothing. Then when the transport, the message interface and the scan became one level 6: the scan is the only proof that the
+transport and the initialisation were right, and the macOS side needs something to publish. What was 7 (scan), 8 (join) and 9
+(macOS) is now part of 6, 7 and 8.
 
 ### 8.1 Level 1 test image
 
@@ -440,7 +464,76 @@ asked for` — a region this driver must answer did not fit and was too small fo
 memory line says how much was asked for); `a step timed out` — the firmware stopped answering, and the transport counters say
 whether anything came back at all; `the chip went to its crash dump environment` — the firmware started and died, and the step's name says where (level 5 does not dump it: that is the RDDM work of §10.13).
 
-### 8.6 After any failure
+### 8.6 Level 6 (the copy engine, the transport and a passive scan): one RAM boot
+
+`PIANO_EXTRA_ARGS="piano-usb=2 piano-wifi=6 piano-wifi-iova=1"` (`--out out/ram-wifi-l6`), everything else as §8.2.
+`piano-wifi=6` switches `piano-wifi-mode` on by itself (the firmware's radio has to be running), so this boot does everything
+boot 6 of §8.8 did but the shadow list, and then level 6. Useful variations: `piano-wifi-band=0` (the 2.4 GHz band only: a shorter scan that needs no
+regulatory answer for the upper band), `piano-wifi-scanwait=20000` (a slow scan), `piano-wifi-bssid=1` (whole addresses in the
+log — **not** for a document).
+
+What it writes, beyond level 5's: in the DMA window the four pipes' rings (a source ring of 16 elements for pipe 0, one of 32 for
+pipe 3, a destination ring and a destination-status ring of 32 for pipe 1 and of 64 for pipe 2) and their buffers (92 of 2 KiB),
+one word per ring for the chip's own pointer, and eight send buffers of 2 KiB; in the chip's register space (through BAR0's
+window register) each ring's base, size, descriptor size, pointer address and enable bit, the largest buffer of each destination
+ring, and then one pointer write per submission; and on the wire the transport's two control messages, the host's initialisation,
+a station virtual device, the scan and the two teardown commands.
+
+```
+PianoWifi: level 6: 4 pipes: 0, 1, 2 and 3; 92 receive buffers posted, NNN register writes
+PianoWifi: step 601: waiting for the transport's ready
+PianoWifi: step 602: connecting the firmware's message interface
+PianoWifi: step 603: the transport's set-up complete
+PianoWifi: step 604: waiting for the chip's capability
+PianoWifi: step 605: the host's initialisation
+PianoWifi: step 606: waiting for the firmware to be ready
+PianoWifi: step 607: a station virtual device
+PianoWifi: step 608: a passive scan
+PianoWifi: step 609: the scan's results
+PianoWifi: step 610: the teardown
+PianoWifi: step 611: done
+PianoWifi: level 6: the transport: N credits of M bytes, 8 endpoints, version 0x...; our endpoint 2 (pipes 3 out, 2 in), K credit reports (K credits), 3 control messages
+PianoWifi: level 6: the chip: 2 radio chain(s), board 0x.., high-throughput 0x..... very-high-throughput 0x....., system 0x...., NN scan channel(s), 1 radio(s), chain mask 0x3, 0 memory request(s)
+PianoWifi: level 6: the firmware is ready: status 0x0, NN peer(s), 0 extra address(es); the chip's own address is all zeros (this chip's firmware reports none: the unit's own is in the persist partition, section 13.1)
+PianoWifi: level 6: the scan: 22 channel(s) asked for, started 1, N scan event(s), M channel visit(s), completed
+PianoWifi: level 6: network 0: ssid "..." bssid xx:xx:xx:**:**:** channel 6 (2437 MHz) signal -NN dBm, N beacon(s) 0 probe(s)
+   (one line per network, at most 32; the identifier is printed, the address masked unless piano-wifi-bssid=1)
+PianoWifi: level 6: N commands, M events, K management frames, 0 unexpected messages, 0 credit waits; the copy engine: N out (B bytes), M in (B bytes), N completions, 0 refused claims, 0 dropped
+PianoWifi: level 6: the scan is done after NNNN ms (step 611: done)
+PianoWifi: level 6: the teardown: the scan ended by itself, the virtual device deleted, the rings disabled
+PianoWifi: level 6: 24 writes (6 kinds, 0 refused accesses in all); repeated: ...
+PianoWifi: level 6: the scan is done; association, keys and the data path are levels 7 and 8 (docs/drivers/wifi.md section 13)
+PianoWifi: level 6: the resource PianoWifiLink is published: PianoWifiEthernet's en1 may come up (link down, the scan list in the property piano-wifi-scan; tooling/native/piano-wifi prints it)
+PianoWifiEthernet: en1 published (built in, link down: the station of levels 7 and 8 is what brings it up); the scan list is the property piano-wifi-scan (tooling/native/piano-wifi prints it)
+```
+
+**What the first level 6 boot must show before level 7 is designed against it**: the transport's ready with a credit count and a
+credit size that are not zero (without them nothing can be sent, and the level stops at step 601); `our endpoint 2 (pipes 3 out,
+2 in)`, which is the proof that the service tables level 5 sent are the ones the firmware uses; `0 memory request(s)` in the
+capability line (a firmware that does ask for memory ends the level: §10.15); the firmware's ready event; `started 1` with the
+scan's events; **at least one network** in the scan lines (the owner knows which ones should be there, which is the real
+measurement of this level); `0 unexpected messages`, `0 dropped` and `0 refused claims`; the teardown line; and `en1` in
+`ifconfig` with `status: inactive`, which `tooling/native/piano-wifi status` prints as well.
+
+On the tablet afterwards: `tooling/native/piano-wifi` prints the table (addresses masked), `piano-wifi --full` the whole
+addresses, `piano-wifi status` what the ladder reached and whether `en1` is there. Nothing of that list belongs in a commit
+(§11).
+
+Failure meanings: `the DMA window has no room for the copy engine's rings and buffers` — `piano-wifi-dma` is too small (the
+default at this level is level 5's 64 MiB, of which level 6 needs about 200 KiB). `a step timed out` at 601 — the firmware never
+sent the transport's ready: the rings are not where the chip reads them (the pointer words and the register writes are in the
+line above), or its radio was not started (`piano-wifi-mode=0`). At 602 with `the firmware refused the service` — the message
+interface is not service `0x100` on this build. At 604 — the host's set-up complete was not accepted, or the service-ready event
+does not parse (`a message did not parse`). At 606 — the initialisation was refused: the resource configuration is the suspect,
+and its 72 words are in `WifiHw.h` with the values of this chip's own entry. `the firmware asked for memory this level does not
+hand out` at 604 — the firmware wants host memory chunks in the initialisation, which this level does not answer (§10.15). At
+609 with `the scan did not run` — the firmware reported a start failure, and the reason is in the scan line. A scan that starts
+and then stops answering is **not** a failure: what it found stands, the teardown runs, and the line says "after this driver
+stopped waiting for it". `the copy engine refused the message` — a source ring was full with no completion coming back, which
+means the chip is not reading the ring (compare the counters). `a message whose header does not fit its buffer` — the transport's
+header does not match what the copy engine delivered, which would mean the status entry's length and the message disagree.
+
+### 8.7 After any failure
 
 Every level leaves the hardware at WLAN_EN low and PERST# asserted, rails still voted (a disable could cut Bluetooth's supply;
 `piano-wifi-release=1` withdraws only the enables this driver added). The GCC votes and the SMMU entry are not withdrawn either:
@@ -453,8 +546,13 @@ both for the rest of the session, since nothing but a reset guarantees the chip 
 running: a failed step does not stop them, because stopping a channel the firmware is using is itself a write this driver has no
 reason to be sure of.
 
+Level 6 cleans up after itself as far as it can, which is more than level 5: the scan is stopped if it was running, the virtual
+device is deleted, and only then are the copy engine's rings disabled — in that order, and only once the chip has taken the two
+commands (a ring disabled with a descriptor the chip has not read loses that message). The window and its buffers stay where
+they are, as at level 5. What a failed level 6 leaves running is the firmware's radio, which level 5's mode message started:
+nothing here switches it off again, and a boot that fails above step 604 should not be left idle for long.
 
-### 8.7 The batched tablet test list
+### 8.8 The batched tablet test list
 
 One session, the owner present, cable to the Mac, RAM boots only, `piano-reset-after=300` as the backstop. Each boot is read before
 the next is built: a level that fails is not retried at a higher level, and nothing is raised past the first failure.
@@ -467,10 +565,16 @@ the next is built: a level that fails is not retried at a higher level, and noth
 | 4 | `piano-usb=2 piano-wifi=5` | both channels running, the firmware's service announced, the memory request answered, the four files read, `3 indications`, `0 unexpected messages`, the ready line with step 518 (§8.5) | §8.5 |
 | 5 | `piano-usb=2 piano-wifi=5 piano-wifi-iova=1` | the two `iova:` lines, then everything boot 4 showed: the chip works with 32-bit addresses, which level 6's rings need (§10.11) | if the `iova:` lines are there but a step then times out, the translating bank is the suspect: bank, table and fault registers are in the line, and boot 4's result stands as the comparison |
 | 6 | `piano-usb=2 piano-wifi=5 piano-wifi-iova=1 piano-wifi-mode=1 piano-wifi-shadow=1` | the three extra steps (515, 516, 517), `40 shadow registers`, step 518, and the tablet alive for a minute afterwards with the firmware's radio running | a refusal at 516 means the copy-engine tables or the shadow list are not what this firmware wants (§12); at 517 it means the mode itself was refused |
+| 7 | `piano-usb=2 piano-wifi=6 piano-wifi-iova=1 piano-wifi-band=0` | the transport's ready with credits that are not zero, `our endpoint 2 (pipes 3 out, 2 in)`, `0 memory request(s)`, the firmware's ready event, `started 1`, **at least one network the owner recognises** on the 2.4 GHz band, `0 unexpected messages`, `0 dropped`, step 611, the teardown line, and `en1` with `status: inactive` (§8.6) | §8.6's failure meanings. A timeout at 601 is the ring programming or the radio; a refusal at 606 is the resource configuration; a scan that starts and finds nothing is the regulatory domain (boot 8 reads it) |
+| 8 | `piano-usb=2 piano-wifi=6 piano-wifi-iova=1` | the same, with 22 channels: the 5 GHz networks appear as well, and the channel-visit count is higher | if only the 2.4 GHz networks appear, the firmware's regulatory domain is not letting the upper band be scanned passively: level 7's first job is the regulatory event and the channel list (§13) |
+| 9 | `piano-usb=2 piano-wifi=6 piano-wifi-iova=0` | the same as boot 7, with physical addresses instead of the window's: whether this firmware's message interface needs 32-bit addresses at all (§10.11) | a timeout at 601 here with boot 7 working is the answer: the rings must be in the 32-bit window, and `piano-wifi-iova=1` stays the default for level 7 |
+| 10 | `piano-usb=2 piano-wifi=6 piano-wifi-iova=1 piano-sleep=1 piano-sleep-test=60` | after the scan: `suspend: stopping the radio`, `WLAN_EN is low and PERST# asserted`, the tablet asleep and awake again with the rest of the system intact, and `en1` still there (down) | the suspend hook is the only power state this driver has; a tablet that does not come back is a power bug of the suspend path, not of this driver (compare a boot with `piano-wifi=0`) |
 
 Boots 1–3 are each a level's own gate and must be read in order; 4 is level 5's gate; 5 and 6 answer the two questions level 6
-needs settled before it is written (32-bit addresses, and whether the firmware accepts this host's copy-engine description). Every
-boot ends with WLAN_EN low and PERST# asserted on a failure, the rails still voted (§8.6).
+needed settled (32-bit addresses, and whether the firmware accepts this host's copy-engine description); 7 is level 6's own gate
+and 8–10 are the three questions level 7 needs settled (the upper band, whether the 32-bit window is required, and that a
+suspend leaves the tablet healthy). Every boot ends with WLAN_EN low and PERST# asserted on a failure, the rails still voted
+(§8.7).
 
 ## 9. Fallback
 
@@ -510,7 +614,7 @@ network (§5.2 C).
    holds GPLL0 votes there, PianoTouch the QUP branches), the SPMI observer channel per APID (PianoWifi's APIDs are none of
    PianoInput's/PianoPower's/PianoDwc3's), the PMU with Bluetooth (BT_EN on a PMIC GPIO; a later QcaBluetooth must share the rail
    votes, as sheng's `WcnPower.h` does). Every vote of ours only ever adds.
-8. Licensing of Ath12kWifi (GPL code compiled into an XNU kext, no LICENSE in its repository): an owner decision before levels 6–8
+8. Licensing of Ath12kWifi (GPL code compiled into an XNU kext, no LICENSE in its repository): an owner decision before levels 7 and 8
    use it; it would stay an external build input, never in this repository (§11).
 9. Heat and power: Wi-Fi at full power with no thermal driver; sessions stay attended.
 10. Level 4's DMA window is 24 MiB of XNU memory below 2^36 (64 MiB at level 5), mapped write-combined, and it is **never
@@ -524,27 +628,64 @@ network (§5.2 C).
    (a free group, or the bypass entry level 3 left for the same stream redirected in place; a free bank from one below the top),
    its two-page table is a buffer of its own so that the chip cannot reach its own translation tables, and every block is checked
    to translate back to the window before the chip is told anything. What is not settled from here: whether this firmware insists
-   on 32-bit addresses for the regions it asks for at level 5 as well (boots 4 and 5 of §8.7 answer exactly that), and whether the
+   on 32-bit addresses for the regions it asks for at level 5 as well (boots 4 and 5 of §8.8 answer exactly that), and whether the
    hypervisor lets EL1 program that bank at all — level 3's bypass bank is the precedent, and a refusal shows as a read-back
    failure, not a hang. (needs-boot)
 12. **What level 5 starts.** Without `piano-wifi-mode=1` the level stops at the ready indication and the firmware's radio is not
    started; with it, the last three messages describe the host's copy engine and set the mode, and the firmware then expects the
    host transport's control messages on those pipes — which level 6 provides and level 5 does not. The chip is left in that state
-   until the session ends (boot 6 of §8.7 is attended for exactly that reason), and nothing in level 5 writes a ring the firmware
+   until the session ends (boot 6 of §8.8 is attended for exactly that reason), and nothing in level 5 writes a ring the firmware
    could follow into host memory other than the regions it asked for.
 13. The crash dump (RDDM) is not read. Level 5 reports the environment change and stops; what the firmware's own log would say
    needs the dump regions and the vector interface that reads them back, which is its own piece of work (the donor has it;
    `UPSTREAM` records it as design read, not taken).
+14. **The suspend hook is one way.** The power contract (`package/include/PianoPowerContract.h`) is answered from level 2 on, and
+   the only state change this driver makes is `kOff`: the scan is stopped, the virtual device deleted, the rings disabled,
+   WLAN_EN taken low and PERST# asserted — and **nothing is brought back on the wake**. The rails stay voted (Bluetooth shares
+   them, §10.7) and the Wi-Fi path is off until the next boot; `en1` stays published and down. That is deliberate at a
+   bring-up level: it is the safe thing for the battery (a radio the owner cannot see is not left running), and a resume path
+   would have to redo levels 2 to 6 from a thread the suspend woke. The hook also asks the ladder's own thread to stop and
+   waits up to two seconds for it, rather than touching the hardware under it; a thread that does not finish in that time
+   leaves the rings alone and only the pins are taken down. Stopping it takes longer than the one second a synchronous power
+   answer may take, so `setPowerState` answers with a four-second deadline and acknowledges when it is done, on a thread of its
+   own (`docs/power.md` §4). (needs-boot: boot 10 of §8.8)
+15. **The firmware's memory requests at level 6.** Its service-ready event may ask the host for memory chunks, which the
+   initialisation command would have to carry. This chip's own driver never allocates any (its count is always zero, which is
+   why the array this driver sends is empty), so a firmware build that does ask ends level 6 at step 604 with "the firmware
+   asked for memory this level does not hand out" rather than sending it an address it never planned for. If a boot shows a
+   non-zero count, the regions go in the window the way level 5's do, and the command's array grows by one structure each.
+   (needs-boot)
+16. **The regulatory domain and the channel list.** Level 6 sends the channel list inside the scan request and never sends
+   `WMI_SCAN_CHAN_LIST`, which is what a driver normally does after the firmware's regulatory event. The firmware is free to
+   skip a channel its domain does not allow, so a passive scan may come back with the 2.4 GHz band only (boot 8 of §8.8 is
+   exactly that measurement). Level 7 reads the regulatory event and sends the channel list before it starts anything.
+17. **The chip's registers through one window.** The copy engine's rings live above BAR0's direct range, so every pointer write
+   goes through the window register at BAR0 + `0x3278`: two accesses, which are only safe because this driver has exactly one
+   thread and no interrupt. The shadow registers of §12 would make each pointer write a single access to a BAR0 offset, and
+   `piano-wifi-shadow=1` already sends the list — but the list it sends describes the rings of level 8's data path, not level
+   6's four pipes, so level 6 writes the real registers. A level that adds the data path should send a list that matches what it
+   actually creates and then use the shadows.
+18. **No data path at level 6, and the firmware knows it.** The firmware's initialisation tells it how many peers and traffic
+   identifiers the host has room for, but no receive ring of the data path exists: a frame that is not a management frame has
+   nowhere to go. The scan needs none (its results are management frames on the message interface), and nothing was observed to
+   stall at the host test's level — but on hardware the firmware may log about the missing data interface (HTT), and a level 6
+   boot should not be left running for long (§8.7).
 
 ## 11. Licence note
 
 This repository's packages are BSD-2-Clause-Patent. Linux (`pcie-qcom`, `phy-qcom-qmp-pcie`, `pwrseq-qcom-wcn`, `mhi`, `qrtr`, ath12k,
 mac80211) and SUN's kernel patches are GPL-2.0: specification only (behaviour, register offsets and bit positions as facts);
-no code, comment or table is copied. Level 5 rests on that rule more than any level before it: the message identifiers, each
-field's tag and type, the order of the exchange and the two tables of section 12 are wire facts read from the Ubuntu kernel
-(`yzddmr6/linux-sm8750-piano` `piano/dev` `7f8d6be`) and from the MHI and router headers, and were written fresh here as a writer,
-a reader, a step machine and two tables of this repository's own shape; `package/PianoWifi/UPSTREAM` lists each file that was read
-and for which fact. Ath12kWifi is **not** used and no decision about it was made here: levels 1-5 need none of it. The QRTR codec
+no code, comment or table is copied. Levels 5 and 6 rest on that rule more than any level before them: the message identifiers,
+each field's tag and type, the order of the exchange, the ring and descriptor layouts and the tables of sections 12 and 14 are
+wire facts read from the Ubuntu kernel (`yzddmr6/linux-sm8750-piano` `piano/dev` `7f8d6be`) and from the MHI and router headers,
+and were written fresh here as writers, readers, step machines and tables of this repository's own shape;
+`package/PianoWifi/UPSTREAM` lists each file that was read and for which fact. Level 6 added `htc.c`/`htc.h` (the transport's
+header, its four messages, the credit records), `wmi.c`/`wmi.h` (the command and event identifiers, the TLV form, the resource
+configuration's field order and this chip's values, the scan request's fields, the scan and management-frame events), `ce.c`,
+`hal.c`, `wifi7/hal.c`, `wifi7/hal_wcn7850.c`, `wifi7/hal_qcc2072.c`, `wifi7/ce.c`, `wifi7/hw.c`, `hw.h` and `core.c` (the ring
+registers and their units, the descriptor fields, the pointer units, the host and target pipe tables, the order the whole
+start-up runs in) and `mac.c` (what a scan needs: a created virtual device, the dwell times, the flags) to that list — read for
+those facts, nothing copied. Ath12kWifi is **not** used and no decision about it was made here: levels 1-6 need none of it. The QRTR codec
 and the two SMMU pieces are copies of this repository's own BSD files, with `UPSTREAM` records and no change to the packages they
 came from. The PHY init sequence comes from PaganiWifi (BSD) with attribution, not from mainline, and the
 provenance question that leaves open is §10.4 and the header comment of `package/PianoWifi/WifiPhySeq.h`.
@@ -588,50 +729,126 @@ firmware's and the host's messages, 4 out the host's data (256 entries of 256 by
 firmware's own copies both ways (16 KiB), 7 host to host, 8 the data accelerator's; the services map the control service to pipes
 0 and 2, the firmware's four traffic classes and its control service to pipes 3 and 2, and the host's data service to pipes 4
 and 1. The shadow registers are 40 words from BAR0 + `0x8fc`, each standing for one ring's head pointer (a destination ring's tail
-pointer is its head pointer's offset plus four); the list is built from the register map of the rings level 6 will create, which is
-why `piano-wifi-shadow` is off by default.
+pointer is its head pointer's offset plus four); the list is built from the register map of the rings level 8's data path will
+create, which is why `piano-wifi-shadow` is off by default and why level 6 writes the real registers through the window (§10.17).
 
-## 13. Level 6: the design
+## 13. Level 6 as built, and what levels 7 and 8 need
 
-Level 6 is the host transport and the firmware's own message interface on top of the copy engine, and it is the first level that
-needs rings in host memory - which is why section 10.11's 32-bit window is settled at level 5. The pieces, in the order they come up:
+Level 6 is the host transport and the firmware's own message interface on top of the copy engine, and the scan that proves both.
+It is the first level with rings of its own in host memory — which is why section 10.11's 32-bit window is settled at level 5.
+The pieces as they are written (`WifiCe.h`, `WifiHtc.h`, `WifiWmi.h`, `WifiLink.h`; host-tested in `tests/wmi_host.cpp` against a
+model of the copy engine's registers and a firmware that speaks both protocols):
 
-1. **The copy engine's rings.** Nine pipes as section 12 describes them; per pipe a source ring, a destination ring and a
-   destination-status ring, each a contiguous array of descriptors in the window, with the chip's head and tail pointers in BAR0
-   (the register map's unit bases are in `WifiHw.h`: the copy engines at `0x01b80000` and up, reached through the chip's window
-   register). The host writes a descriptor and rings the pipe's head-pointer register - or its shadow register, if the list of
-   section 12 was sent.
-2. **The host transport (the control protocol).** A connect for each service, each answered with its pipe pair and an endpoint
-   number; then the firmware's "ready" message, which carries the credit counts the host must respect. Three messages to write
-   (connect, connect answer, ready) and one header (endpoint, flags, length) in front of every message after that.
-3. **The firmware's message interface, initialisation.** One large initialisation message that hands the firmware the host's
-   capabilities and the addresses of the data path's rings, answered by a "ready" event with the chip's MAC addresses, its bands
-   and its channel list. This is the message with the most fields in the whole stack; its shape is a fact of the firmware's
-   version, and the version is what level 5's step 508 reports (which is why that line matters).
-4. **A scan.** A start-scan message (a scan identifier, the channel list, dwell times, the flags for an active or passive scan),
-   then scan events: started, a found network per beacon or probe answer (the frame itself, its channel, its signal strength),
-   and completed. The found networks are what a user interface would list; at this level they are log lines and a property.
-5. **What level 6 does not do.** No association, no keys, no data path beyond what the scan needs: those are levels 7 and 8, and
-   the frames they carry are the reason the receive rings and the reorder unit of section 12's register map exist.
+1. **The copy engine's rings.** Four of the nine pipes section 12 describes, which are all the transport needs: 0 out (the
+   transport's own control messages), 3 out (the host's messages), 2 in (the firmware's messages and the transport's answers),
+   and 1 in (the firmware's data messages — unused before level 8, but given a ring and buffers so that a copy cannot stall).
+   Per pipe a **source ring** (the host writes a descriptor naming a buffer to send), a **destination ring** (the host writes a
+   descriptor naming an empty buffer; it is a producer ring of the host's just like the source ring) and a
+   **destination-status ring** (the chip writes one descriptor per buffer it filled, with the length). Both pointers of every
+   ring count 32-bit words. The host's pointer lives in the chip's register space (the units at `0x01b80000` and up, through
+   BAR0's window register); the chip's lives in the window, in a block of its own, at an address the host programs into the
+   ring — so a poll reads host memory and never a register. No MSI, no interrupt threshold: one thread polls (§10.17).
+2. **The host transport.** The firmware speaks first: a "ready" message on endpoint 0 with its credit count and credit size.
+   Then one service is connected — the firmware's message interface, `0x0100` — and its answer gives the endpoint number and the
+   largest message it takes; the pipes are **not** negotiated, they are the service table level 5 already sent. Then "set-up
+   complete". Every message after that carries the 8-byte header of section 14, and every message on that endpoint costs
+   credits, which the firmware gives back in the trailer of what it sends (a credit wait is not a failure; the step's deadline
+   decides).
+3. **The firmware's message interface.** Its service-ready event says how many radio chains and scan channels it has and how
+   much host memory it wants (none on this chip: §10.15). The host answers with the initialisation command: the 72-word resource
+   configuration of this chip's own entry (four virtual devices, sixteen peers, thirty-two traffic identifiers, native-Wi-Fi
+   decapsulation, the two flag words its own host always sends) and an empty memory-chunk array. The firmware then sends its
+   ready event, with its own MAC address and its status.
+4. **A station virtual device.** One, created and never started: a scan does not need a started device on this chip family
+   (its own driver defers the start to the association). It carries one stream entry per band.
+5. **A passive scan.** The channel list of `WifiHw.h` (the 2.4 GHz band's 13 channels and the 5 GHz band's 9 non-radar ones;
+   `piano-wifi-band=0` leaves the upper band out), the dwell times its own host uses, and the passive flag. The firmware answers
+   with a "started" event, then one management-frame event per beacon or probe answer — each with the frame, its channel and its
+   signal strength — and finally "completed". The frames are parsed where a frame from the air must be: the third address is the
+   network's, element 0 its name and element 3 its channel, and an element that runs past the frame ends the walk. The list
+   keeps at most 32 networks, merges repeats (the strongest signal wins) and counts what it dropped.
+6. **The teardown.** The scan stopped if it still runs, the virtual device deleted, the chip's completions waited for, and only
+   then the rings disabled — in that order (§8.7).
+7. **What level 6 does not do.** No association, no keys, no data path: those are levels 7 and 8.
 
-Expected effort: 4-8 weeks written fresh, or 1-2 weeks of board glue if the owner decides for Ath12kWifi (section 10.8 - the
-decision is still open, and nothing in levels 1-5 depends on it).
+**Level 7 (association), what it needs**: the firmware's regulatory event read and the channel list sent
+(`WMI_SCAN_CHAN_LIST`, §10.16); the virtual device started on the owner's channel; a peer created for the access point; the
+four-way handshake run by a **user-space supplicant** over a control endpoint, with the keys installed by
+`WMI_VDEV_INSTALL_KEY`; and the management frames the handshake needs sent through `WMI_MGMT_TX`. **Level 8 (traffic)**: the
+data path's rings (the transmit-command, reorder and buffer-manager units whose head pointers §12's shadow list already names),
+the firmware's data interface (HTT) connected as a second transport service, and the receive and transmit paths wired to the
+Ethernet interface below — which is where `en1` gains its link.
 
-### 13.1 The macOS side (the recommendation of 5.2 B)
+Expected effort: 4-8 weeks each written fresh, or 1-2 weeks of board glue if the owner decides for Ath12kWifi (section 10.8 —
+the decision is still open, and nothing in levels 1-6 depends on it).
+
+### 13.1 The macOS side: `en1` as built, and the association design
 
 The station the levels above build has to appear to macOS as something it can route over, and section 5.2 settles what that is:
-**an Ethernet-like interface**, not a Wi-Fi one. The plan, in the order it would be built:
+**an Ethernet-like interface**, not a Wi-Fi one. What is built, and what is still design:
 
-1. `PianoWifiEthernet`, an `IOEthernetController` publishing `en1` with `IOBuiltin` and without `IOPrimaryInterface`, exactly the
-   shape `PianoNullEthernet` already has in the collection (so the vtable question is answered). Its frames are the station's
-   802.3 view: the 802.11 header and the security handling stay below it, in the driver.
-2. The interface's MAC is this unit's own, read at run time from the `persist` partition by the same read-only path levels 4 and 5
-   use for `modem_a`. It is never logged and never committed (section 11); the firmware itself reports zeros.
-3. A control endpoint (a kernel control socket) and a small command-line tool beside it: `scan` lists what level 6's scan found,
-   `join SSID` hands a profile down, `status` prints the link. The supplicant's handshakes run in user space (BSD-licensed), which
-   keeps the key material out of the kernel and out of this repository.
-4. `en0` stays `PianoNullEthernet` until the clock identity question of section 5.3 is answered: TimeSync derives its identity from
-   a built-in interface's MAC at its start, and the Wi-Fi interface appears seconds later. Once a boot shows the identity stays
-   stable, the Wi-Fi controller can be published early (link down) as `en0` and `PianoNullEthernet` dropped.
-5. No Wi-Fi menu, no AirDrop, no location by Wi-Fi: section 5.2 is where that trade is written down, and the USB-C network
+1. **Built**: `package/PianoWifi/PianoWifiEthernet.cpp`, an `IOEthernetController` publishing `en1` with `IOBuiltin` and without
+   `IOPrimaryInterface` — exactly the shape `PianoNullEthernet` has in the collection, and its vtable check passes the same way.
+   Its link status is **valid but not active** (macOS shows the interface down and routes nothing over it), every frame handed
+   to it is dropped and counted, and it carries level 6's scan list as the property `piano-wifi-scan` (one dictionary per
+   network: name, address, channel, frequency, signal strength, beacon and probe counts, and whether the network says its name).
+   It owns no hardware: its personality matches the resource `PianoWifiLink`, which PianoWifi publishes only when level 6 came
+   up, so `piano-wifi=0..5` leaves macOS with `en0` alone.
+2. **Built**: `tooling/native/piano-wifi` on the tablet — `piano-wifi` prints the table with every address masked to its first
+   three bytes, `--full` prints them whole, `status` prints what the ladder reached and whether `en1` is there, `--raw` the
+   property as `ioreg` gives it. It reads the registry and nothing else.
+3. The interface's address: this unit's own is in the `persist` partition and is read by the same read-only path levels 4 and 5
+   use for `modem_a` — **still design**. Until then `en1` takes a locally administered address of piano's own (not the unit's),
+   or the one the firmware's ready event reports when that is not all zeros (the property `piano-wifi-mac`). Neither is ever
+   logged whole or committed (section 11).
+4. **Design — the association path.** A kernel control socket (`kern_control`, a name of this driver's) is the control endpoint:
+   a user-space supplicant opens it, reads the scan list, and asks for a join with a profile (the network's name, its address,
+   the security it wants). WPA2-PSK and WPA3-SAE both run their handshakes **in user space** — wpa_supplicant 2.12 is
+   BSD-licensed, and its `driver_*.c` shape is what the control messages mirror — so the key material never enters this
+   repository and never enters a log: the kernel side is given the pairwise and group keys only as opaque bytes to install, and
+   the driver logs that a key of N bytes was installed for a peer, never the bytes. The profile lives under
+   `/private/var/db/piano-wifi/` (mode 600, never in a repository), and the CLI gains `join NAME`, `leave` and `status` over the
+   same socket. What the kernel side owes the supplicant: the scan list, the management frames of the handshake in both
+   directions, the association state, and the keys' installation — nothing more.
+5. `en0` stays `PianoNullEthernet` until the clock identity question of section 5.3 is answered: TimeSync derives its identity
+   from a built-in interface's MAC at its start, and this interface appears seconds later (level 6 takes tens of seconds). Once
+   a boot shows the identity stays stable, the Wi-Fi controller can be published early (link down) as `en0` and
+   PianoNullEthernet dropped.
+6. No Wi-Fi menu, no AirDrop, no location by Wi-Fi: section 5.2 is where that trade is written down, and the USB-C network
    (section 5.2 C) stays the first network while this is built.
+
+## 14. Level 6's message table
+
+Three protocols, one on top of the other, all of them little endian. The copy engine's descriptors and ring registers are in
+`package/PianoWifi/WifiHw.h` with their units; what follows is what goes **on** the pipes (host-tested in `tests/wmi_host.cpp`).
+
+**The host transport (HTC).** Every message carries an 8-byte header: word 0 is the endpoint (7:0), the flags (15:8) and the
+payload's length (31:16); word 1 is the trailer's length (7:0) and a sequence number (15:8). Flag `0x01` asks the firmware for a
+credit update, flag `0x02` says a trailer follows the payload. A trailer is a sequence of records — an identifier, a length and
+two padding bytes — of which this driver acts on one: a **credit report**, four bytes per endpoint (the endpoint, the credits).
+
+| Step | Message | Id | Direction | What is in it |
+|---|---|---|---|---|
+| 601 | ready | 1 | from the firmware | word 0 the identifier (15:0) and the credit count (31:16); word 1 the credit size (15:0) and how many endpoints it has (23:16); the extended form adds its version (7:0) and a bundle limit (15:8). Nothing may be sent before it, and a count or size of zero ends the level |
+| 602 | connect a service | 2 | request | word 0 the identifier (15:0) and the service (31:16) = `0x0100`, the firmware's message interface; word 1 the connection flags (15:0): how many of its receive buffers the service may have (15:8) and, for everything but a message interface, "no credit flow control" (bit 3) |
+| 602 | its answer | 3 | from the firmware | word 0 the identifier and the service; word 1 the status (7:0, 0 success, 1 not found, 2 failed, 3 no resources, 4 no endpoints left), the endpoint it gave (15:8) and the largest message it takes (31:16) |
+| 603 | set-up complete | 5 | request | word 0 the identifier; two words of set-up flags and a bundle limit, both zero here (no message bundling) |
+
+**The firmware's message interface (WMI).** A command is a 4-byte header — the command identifier in its low 24 bits — and then
+TLVs; an event is the same header and then TLVs. A TLV's header is one word: the value's length (15:0) and the tag (31:16), and
+the value is padded to a whole number of words. A structure inside a TLV is its members in order, one word each (a MAC address
+is six bytes and two of padding), and a structure that stands on its own begins with its own TLV header. An array of structures
+is a TLV of tag `0x12` whose value is those structures, each with its header; an array of words is tag `0x10`, of bytes `0x11`,
+and an array of structures with no headers of their own is tag `0x13`.
+
+| Step | Message | Id | Tag | What is in it |
+|---|---|---|---|---|
+| 604 | service ready | `0x00001` (event) | `0x020` | 32 words: the firmware's build, its interface versions, the radio chains (word 9), the high- and very-high-throughput capabilities (10, 11), the system capability (15), **how much host memory it wants (18)**, the channels it can scan (19), the board identifier (20), the radios (26), the hardware modes (28) and the chain mask (29). A second TLV (`0x10`) carries its service bitmap |
+| 605 | the host's initialisation | `0x00001` (command) | `0x04a` + `0x04b` + `0x12` | the fixed structure (7 words: six of interface version, then the number of memory chunks = 0), then the **resource configuration** (tag `0x04b`, 72 words: 4 virtual devices, 16 peers, 3 offload peers and reorder buffers, 2 peer keys, 32 traffic identifiers, an address-table skid limit of 16, the chain masks, four receive timeouts (100, 100, 100, 40), native-Wi-Fi decapsulation, 4 pending scans, 3 beacon-miss and roam devices, 8 roam profiles, a 1024-entry debug log, 2 group-key devices, 0x400 message descriptors, 10 fragment entries, 1 direct-link device with 8 table entries, 2 beacon-offload devices, 0x20 multicast filters, 0x16 wake filters, the two flag words `0x40020` and `0x40200`, "use a radio identifier" and peer-map version 1), then an empty array of memory chunks |
+| 606 | ready | `0x00002` (event) | `0x023` | 15 words: six of interface version, **the chip's own MAC address** (words 6-7), the status (8), the traffic-class tables (9), extra addresses (10), peers (11, 12), the address-table index (13) and a log checksum (14) |
+| 607 | a virtual device | `0x05001` (command) | `0x056` + `0x12` | 11 words: the identifier (0), the type (1) = 2 a station, the subtype (2) = 0, the MAC address (3-4), how many stream entries follow (5) = 2, the radio (6) = 0, two words of multiple-network flags, and a statistics identifier marked invalid (9, 10). Then an array of two stream entries, each 4 words with its own header (tag `0x19b`): the band (0 is 2.4 GHz, 1 is 5 GHz), the transmit streams, the receive streams |
+| 608 | a scan | `0x03001` (command) | `0x04d` + `0x10` + `0x13` + `0x13` + `0x11` | 39 words: the scan identifier (0) = `0xa000`, the requestor (1) = 1, the virtual device (2), the priority (3), which events to send (4), the active and passive dwell times (5, 6) = 50 and 150 ms, the rest times (7, 8) = 50 and 500 ms, the largest scan time (12) = 20 s, the probe delay (13) = 5 ms, **the flags (14)**: bit 0 passive, bit 4 "report each channel"; how many channels (16), addresses (17) = 1 and names (18) = 0; then the channel list as words, an empty array of names, one address entry (the broadcast one, as this firmware's own host always sends), and an empty array of elements to add to a probe |
+| 609 | a scan event | `0x03001` (event) | `0x024` | 7 words: the event type (bit 0 started, 1 completed, 2 on its own channel, 3 on a foreign channel, 4 dequeued, 6 start failed), the reason (0 completed, 1 cancelled, 2 preempted, 3 timed out, 4 an internal failure), the channel, the requestor, the scan identifier and the virtual device |
+| 609 | a management frame | `0x07001` (event) | `0x02c` + `0x11` | 17 words: the channel (0), the signal-to-noise ratio (1), the rate (2), the radio mode (3), **the frame's length (4)**, the status (5), four per-chain strengths (6-9), the flags (10), **the signal strength in dBm (11, signed)**, a timestamp delta and two timestamp words (12-14), the radio (15) and **the frequency (16)**. Then the frame itself as bytes: a beacon (subtype `0x80`) or a probe answer (`0x50`), whose third address is the network's and whose body is a timestamp, a beacon interval, a capability word and then the elements |
+| 610 | stop the scan | `0x03002` (command) | `0x04e` | 5 words: the requestor, the scan identifier, the kind (0 = this scan only), the virtual device, the radio |
+| 610 | delete the device | `0x05002` (command) | `0x057` | one word: the identifier |
