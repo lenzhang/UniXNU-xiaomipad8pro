@@ -233,12 +233,13 @@ struct Overlay {
   // blocks that gained bits, each run durable before the next), so the disk reads the same at every point of the pass. When every
   // seed page is present the header is rewritten with kSelfContained, last; its first 64 bytes are the ones already on the medium.
   // A cut anywhere leaves a valid store of this seed with more pages present; the next flatten skips them and finishes.
+  // `stage`: stagePages (at least 2) * kBlock bytes, also used for the header blocks.
   // Returns 1 done (the store is self-contained, *written pages written now), 0 nothing to do (not this seed's store, read-only, or
   // already self-contained: *written 0), -1 a store error (stop writing; the store stays valid for this seed).
   template <class Ops, class Seed> int flatten (Ops &ops, const Seed &seed, uint8_t *stage, uint32_t stagePages, uint64_t *written)
   {
     *written = 0;
-    if (readOnly || !active || !sameSeed || selfContained || !stagePages) return 0;
+    if (readOnly || !active || !sameSeed || selfContained || stagePages < 2) return 0;
     for (uint64_t i = 0; i < pages;) {
       if (has (i) || !seed.find (i)) { ++i; continue; }
       uint32_t n = 0;
@@ -253,7 +254,7 @@ struct Overlay {
       i += n;
     }
     for (uint64_t i = 0; i < pages; ++i) if (!has (i) && seed.find (i)) return -1;   // never claim what is not there
-    uint8_t now[kBlock], block[kBlock];
+    uint8_t *now = stage, *block = stage + kBlock;           // the run buffer (no 8 KiB on the kernel stack)
     if (!ops.read (0, 1, now)) return -1;
     encodeHeader (block, pages, storeSeed, generation);
     if (memcmp (now, block, kHeaderBytes)) return -1;        // the header on the medium is not the one this store was opened with
