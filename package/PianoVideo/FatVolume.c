@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* package/PianoPower/FatVolume.c of this repository, copied byte for byte but for this line (UPSTREAM has its sha256):
- * PianoPower is not modified, so level 3's firmware reader (the ESP) carries its own copy. */
+ * PianoPower is not modified, so the shared firmware loader's ESP source (level 3) has its own copy here. */
 #include "FatVolume.h"
 
 static uint16_t le16(const uint8_t *p) {return (uint16_t)(p[0] | (uint16_t)p[1] << 8);}

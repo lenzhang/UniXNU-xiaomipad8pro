@@ -2,7 +2,7 @@
 // PianoVideo levels 2-4 (the ladder's V1-V3, docs/drivers/video.md sections 8 and 12) as one portable sequence over the owner's Hw:
 //   piano-video=2  V1: N power cycles (piano-video-cycles, default 1; the test plan's 20): on (VideoPower.h), the level 1 readout
 //                  with the gate open and its verdict, hold (piano-video-hold-ms), off; every cycle must pass
-//   piano-video=3  V2: N cycles of on, the firmware (VideoFirmware.h: the ESP copy, the pin, PAS 9, MP_VIDEO_VAR), hold, PAS
+//   piano-video=3  V2: N cycles of on, the firmware (VideoFirmware.h: the pinned file, PAS 9, MP_VIDEO_VAR), hold, PAS
 //                  shutdown, off
 //   piano-video=4  V3: the SMMU bank (VideoSmmu.h) and the UC region, on, the firmware, the boot words, MVS0 to hardware mode, the
 //                  handshake (SYS_INIT, IMAGE_VERSION, interframe power collapse; the answers within 1 s; the version string), no
@@ -226,8 +226,8 @@ class Bringup {
   // ----------------------------------------------------------------------------------------------------------------- V2
   int v2()
   {
-    hw.note("V2: %u cycle(s): power on, PAS 9 from the ESP copy, MP_VIDEO_VAR, %u ms, PAS shutdown, power off", opt.cycles,
-            opt.holdMs);
+    hw.note("V2: %u cycle(s): power on, PAS 9 with the pinned file (the boot's addon or the ESP), MP_VIDEO_VAR, %u ms, PAS shutdown, "
+            "power off", opt.cycles, opt.holdMs);
     for (unsigned c = 1; c <= opt.cycles; ++c) {
       ++rep.cycles;
       int rc = on();

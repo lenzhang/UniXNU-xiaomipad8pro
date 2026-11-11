@@ -1232,7 +1232,7 @@ static void testV2Refusals()
     Run x(3);
     x.m->f.noFile = true;
     CHECK(x.go() == kErrFwFile && x.b->rep.failedStep == kStepFwFile && x.m->calls.empty() && x.m->allOff());
-    CHECK(x.m->logged("build-esp.py --video-firmware"));
+    CHECK(x.m->logged("PianoVideo/vpu35_4v.mbn not loaded") && x.m->logged("stage the owner's copy"));
   }
 }
 

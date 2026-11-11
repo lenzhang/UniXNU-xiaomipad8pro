@@ -215,11 +215,11 @@ constexpr uint32_t kBcmMm1On = 0x60000001, kBcmMm1Off = 0x40000000;
 constexpr uint32_t kDrv2Tag = 0x56494445;                           // "VIDE": PianoVideo in sm8750_rpmh_drv2_owner
 
 // ------------------------------------------------------------------------------------------------- the firmware file (V2)
-// Read at run time from the ESP (GPT "esp", partition 37 on LUN 0, FAT32 with 4 KiB sectors: docs/persistent-boot.md), where
-// tooling/persist/build-esp.py --video-firmware puts the owner's copy after checking it against the pin below. Never in this
-// repository or a build output; never disassembled.
-constexpr const char *kEspPartition = "esp";
-constexpr const char *kEspFirmwarePath = "EFI/UniXNU/firmware/qcom/sm8750/vpu35_4v.mbn";
+// Read at run time through the shared firmware loader (package/include/PianoFirmware.h, docs/kc-space.md §6) against the pin the
+// build writes (tooling/persist/firmware.py stage: PianoVideoFirmwarePins.h): from the boot's addon (a RAM image carries the staged
+// file) or the ESP's EFI/UniXNU/firmware/PianoVideo/vpu35_4v.mbn (build-esp.py places it). The staged copy lives only in the
+// ignored out/firmware/PianoVideo/; never in this repository; never disassembled. The pin's values are these:
+constexpr const char *kFirmwarePinPath = "PianoVideo/vpu35_4v.mbn";   // below EFI/UniXNU/firmware
 constexpr uint8_t kFirmwareSha256[32] = {   // xiaomipad-8pro-mainline firmware/piano-iris.json
     0x95, 0xc5, 0x88, 0x2f, 0x9b, 0x66, 0xb9, 0x3a, 0xd2, 0x63, 0x56, 0x04, 0xb7, 0xdb, 0x56, 0x3c,
     0xc3, 0x10, 0x48, 0x1e, 0x01, 0x7f, 0xa6, 0xb8, 0x2e, 0x0c, 0xe6, 0xcb, 0xb9, 0xea, 0xe0, 0x1b};

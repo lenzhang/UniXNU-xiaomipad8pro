@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* package/PianoPower/FatVolume.h of this repository, copied byte for byte but for this line (UPSTREAM has its sha256):
- * PianoPower is not modified, so level 3's firmware reader (the ESP) carries its own copy. */
+ * PianoPower is not modified, so the shared firmware loader's ESP source (level 3) has its own copy here. */
 /* A read-only FAT16/FAT32 volume over a byte read callback: enough to find a file by its long or short (8.3) name in a directory path and read
  * any range of it. Used to take the device's own firmware files from its firmware partition in place. No allocation: the one sector of
  * the allocation table in use is cached in the volume. The volume's metadata is untrusted: every cluster number and chain is bounds

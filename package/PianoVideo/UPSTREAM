@@ -6,7 +6,7 @@ Levels 2-4, copied byte for byte but for their provenance lines (tooling/k27/bui
 are not modified):
   package/PianoPower/FatVolume.c (sha256 6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779) and FatVolume.h
     (sha256 a438bcc5519bacfbfa6b6c55646fe4a3f7787f37a50c52103d8094c6871b67e7) -> FatVolume.c / FatVolume.h (BSD-2-Clause-Patent;
-    PianoPower took them unchanged from UniXNU-sheng, its UPSTREAM): the ESP's FAT32 for the firmware file.
+    PianoPower took them unchanged from UniXNU-sheng, its UPSTREAM): the ESP's FAT32 for the shared firmware loader.
   package/PianoPower/QcomMdt.c (sha256 706f4a86624d119282683287bf408ae679275368f9bcc28d6f4ba652d3ad377a) and QcomMdt.h
     (sha256 22d8e567b285e254becf1af41f8ba0c9c1cfcc5295f6246b4b9d09e5fef88477) -> QcomMdt.c / QcomMdt.h (BSD-2-Clause-Patent; the
     same origin): the signed image's headers, metadata, span and segment places.
@@ -22,7 +22,7 @@ Levels 2-4, re-expressed (nothing linked; these files are BSD-2-Clause-Patent, t
     encoding, and Sm8750RpmhWriteActive's protocol (the DRV-2 owner word, the version-selected layout, the idle-TCS test, the
     masked IRQ_ENABLE bit, MSGID/ADDR/DATA, WAIT_FOR_CMPL, CMD_ENABLE, AMC mode, read-backs, the trigger, the completion test, the
     clean-up, a TCS that never completed left as evidence) -> VideoRpmh.h, written fresh around the video's three resources.
-  package/PianoWifi/PianoWifi.cpp (sha256 6ac47f0a6855ce7d69651446c74a194d88dfe6d2cfe6535c12b4af6ec0dad600) and
+  package/PianoWifi/PianoWifi.cpp (sha256 a33ceb1d998a28b8c6ba597e42f49731b19f3b57caed07533d828f0b7fa51308) and
     package/PianoPower/PianoAdsp.cpp (sha256 9b90b3d9ed1f53c12baee6378f653b7143c1b0c19dca754f24aa85c52900918a): how a kext imports
     PianoA830's DRV-2 owner word and takes it (compare-exchange for its own tag, 10 us steps, at most 2 s), PianoAdsp.cpp's secure()
     wrapper (a line before each call with 20 ms for the console, one after) and its Sm8750Scm set-up (the ops lock taking the
@@ -37,8 +37,9 @@ Levels 2-4, re-expressed (nothing linked; these files are BSD-2-Clause-Patent, t
     with a 32-bit input (T0SZ 32, from level 1), TCR2 SEP 7 (SEP 0 faults bit-31 IOVAs under this hypervisor family), the
     non-cacheable walks over tables cleaned to the PoC, MAIR0 0x44, the fault registers (FSR/FAR/FSYNR0, RESUME for a stalled
     one), the software walk as a self-check -> VideoSmmu.h.
-  package/PianoSensors/PianoSensors.cpp (sha256 d8235b6b5425c0d27f0b49f2f8e4a49fccfeb62df9ce470c974627ae48a25ac4): finding the ESP
-    through NativeUfs (GPT "esp") and partitionRead over native_ufs_part_read -> PianoVideo.cpp KernelHw::fwRead.
+  package/common/PianoFirmware.cpp, PianoFirmwareCore.c, PianoFirmwareZlib.c and package/include/PianoFirmware.h: the shared
+    run-time firmware loader, compiled into the kext as they are (not copied; docs/kc-space.md section 6) -> PianoVideo.cpp
+    KernelHw::fwRead (one piano_fw_load with the pin tooling/persist/firmware.py stage generates).
 
 UniXNU-piano (this repository), BSD-2-Clause-Patent:
   package/PianoDpu/PianoDpu.cpp (sha256 8f6cbd007f692b3408a738b45484266196c4eae397b80e018ffbc5443764dc40): the kext's shape (probe

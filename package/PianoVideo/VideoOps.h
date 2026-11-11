@@ -154,7 +154,7 @@ inline const char *errorName(int e)
   case kErrGdsc: return "a GDSC did not power up";
   case kErrReadout: return "the powered core's words are not sane";
   case kErrOffCheck: return "a GDSC is still on after the power-off";
-  case kErrFwFile: return "the firmware file could not be read from the ESP";
+  case kErrFwFile: return "the firmware file was not found (the boot's addon, the ESP)";
   case kErrFwPin: return "the firmware file is not the pinned vpu35_4v.mbn";
   case kErrFwImage: return "the firmware image does not parse or does not fit the carveout";
   case kErrNoMemory: return "no memory";

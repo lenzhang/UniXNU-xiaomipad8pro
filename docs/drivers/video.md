@@ -84,7 +84,7 @@ interconnect `sm8750.c`; the firmware pin (`xiaomipad-8pro-mainline/firmware/pia
 |---|---|---|
 | VideoToolbox side | the VM-era VideoToolbox paravirtual files, source UniXNU-droidvm `706338e`: `package/DroidVMVTParavirt.cpp` (the service), `DroidVMVTHost.cpp` (the host), `DroidVMVTWire.h` (the wire format) + its patch series 0001–0017 (BSD-2-Clause-Patent) | vendored unchanged as `package/PianoVideo/vt/` with UPSTREAM (level 6) |
 | Its transport | its virtio-media transport file | **replaced** by PianoVideo's Iris backend, the same 14 functions |
-| PAS, MDT, firmware file | PianoPower `Sm8750Scm.c` (MIT, copied; MP_VIDEO_VAR and PAS shutdown through its generic call), `QcomMdt.c`, `FatVolume.c` (copied) + NativeUfs partition reads, the ESP as PianoSensors reads it | level 3: built (`VideoFirmware.h`, §12.2) |
+| PAS, MDT, firmware file | PianoPower `Sm8750Scm.c` (MIT, copied; MP_VIDEO_VAR and PAS shutdown through its generic call), `QcomMdt.c`, `FatVolume.c` (copied); the shared run-time firmware loader (`package/common`, [kc-space.md](../kc-space.md) §6: a pin in the kext, the file from a RAM image's addon or the ESP) | level 3: built (`VideoFirmware.h`, §12.2) |
 | Rails, bandwidth | PianoA830 `Sm8750Rpmh` (MIT): its cmd-db layout, corner rule and TCS protocol re-expressed in `VideoRpmh.h` under its DRV-2 owner word: `mxc.lvl`, `mmcx.lvl`, MM1 (not SH0/MC0/ACV: §12.1) | level 2: built (§12.1) |
 | SMMU | PianoUsbHost `SmmuIdentity.h` (plan/apply, bank search, TLB maintenance) and PianoDpu `DpuSmmu.h` (the 32-bit-input table, SEP 7, faults), re-expressed in `VideoSmmu.h` | level 4: built (§12.3) |
 | IRQ, power | `package/common/PianoIrq.h`, `package/include/PianoPowerContract.h` | levels 4, 7 |
@@ -128,10 +128,11 @@ sync, fault readout) for PianoDpu (B1b) and PianoVideo, and one registry with a 
 (PianoWifi already takes a free group for 0x1401: two kexts must never take the same one).
 
 **4.3 Firmware at run time** (built: §12.2). The owner's own `vpu35_4v.mbn` (the stock odm_a file, the copy the Ubuntu project
-pins) goes onto the ESP at `EFI/UniXNU/firmware/qcom/sm8750/vpu35_4v.mbn` with `build-esp.py --video-firmware` (pin-checked);
-PianoVideo reads it through NativeUfs + FatVolume (PianoPower's reader), checks size and SHA-256 against the pin and refuses a
-mismatch. Never in this repository or a build output; never disassembled (data for the secure world's loader). Later, an odm_a
-reader would serve video, audio and sensors alike. The load is PianoPower's sequence with PAS 9, holding the **kernel-wide
+pins) is pinned in the kext as `PianoVideo/vpu35_4v.mbn` and loaded at run time by the shared firmware loader
+([kc-space.md](../kc-space.md) §6): from a RAM image's addon, or the installed ESP's `EFI/UniXNU/firmware/PianoVideo/vpu35_4v.mbn`,
+size and SHA-256 checked against the pin. The build stages the file into the ignored `out/firmware/PianoVideo/` and the image
+builders place it; never in this repository or in the kext; never disassembled (data for the secure world's loader). Later, an
+odm_a reader would serve video, audio and sensors alike. The load is PianoPower's sequence with PAS 9, holding the **kernel-wide
 secure-call lock** (`../scm-lock.md`, tag `VIDE`) from init_image through auth_and_reset and MP_VIDEO_VAR, and around every other
 request (no two secure calls at once: the K90's rule, `charging.md` §5a's stall); PianoVideo.json then names PianoA830 as a library.
 
@@ -187,17 +188,19 @@ collapsed, votes dropped; on = nothing until the next session.
 
 ## 7. Kernel collection
 
-`tooling/k27/build-native-piano-video.sh`: the secure-call lock's own tests (`package/include/tests/run.sh`), the copies checked
-byte for byte against their originals (FatVolume, QcomMdt, Sm8750Scm: PianoPower's), host tests `tests/video_host.cpp` (level 1:
-the gate at each step, the allowlist of loads, the two registers never loaded, no word loaded twice, the PLL/RCG/divider/OPP
-decoders, CTRL_STATUS and the core states, the SMMU scan with free groups and banks in use) and `tests/bringup_host.cpp` (levels
-2-4, §12.7; with the owner's `vpu35_4v.mbn` when it is on this Mac, its pin and headers too) and `tests/esp_host.cpp` (the ESP
-read on mtools FAT32 images, §12.2), then the objects (`PianoVideo.cpp`,
-`FatVolume.c`, `QcomMdt.c`, `Sm8750Scm.c`, the glue) and the import check: 330 kernel imports, 4 from the libraries
-(`_native_ufs_part_find`, `_native_ufs_part_read` from NativeUfs; `_sm8750_rpmh_drv2_owner`, `_sm8750_scm_owner` from PianoA830),
-0 unresolved. `PianoVideo.json` names `com.unixnu.driver.NativeUfs` and `com.unixnu.driver.PianoA830` as libraries; both are
-linked before PianoVideo in `configs/k27-native-kexts.txt`, so every `build-native-image.sh` links it. The link with the whole list
-and its result: §12.7.
+`tooling/k27/build-native-piano-video.sh`: the secure-call lock's own tests (`package/include/tests/run.sh`), the shared firmware
+loader's tests (`package/common/tests/run-firmware-tests.py`), the copies checked byte for byte against their originals
+(FatVolume, QcomMdt, Sm8750Scm: PianoPower's), host tests `tests/video_host.cpp` (level 1: the gate at each step, the allowlist of
+loads, the two registers never loaded, no word loaded twice, the PLL/RCG/divider/OPP decoders, CTRL_STATUS and the core states,
+the SMMU scan with free groups and banks in use) and `tests/bringup_host.cpp` (levels 2-4, §12.7; with the owner's
+`vpu35_4v.mbn` when it is on this Mac, its pin and headers too), then the pin (`tooling/persist/firmware.py stage --kext
+PianoVideo`: the generated pins header and source; with the owner's copy here, the file staged into the ignored
+`out/firmware/PianoVideo/`), the objects (`PianoVideo.cpp`, `FatVolume.c`, `QcomMdt.c`, `Sm8750Scm.c`, the shared loader's
+`PianoFirmware.cpp`/`PianoFirmwareCore.c`/`PianoFirmwareZlib.c`, the generated pins, the glue) and the import check: 340 kernel
+imports, 4 from the libraries (`_native_ufs_part_find`, `_native_ufs_part_read` from NativeUfs for the loader's ESP source;
+`_sm8750_rpmh_drv2_owner`, `_sm8750_scm_owner` from PianoA830), 0 unresolved. `PianoVideo.json` names
+`com.unixnu.driver.NativeUfs` and `com.unixnu.driver.PianoA830` as libraries; both are linked before PianoVideo in
+`configs/k27-native-kexts.txt`, so every `build-native-image.sh` links it. The link with the whole list and its result: §12.7.
 
 ## 8. Hardware test plan and the ladder (RAM boots; V0 unattended, the rest attended)
 
@@ -239,7 +242,7 @@ SMMU (`piano-video-smmu=0`; PianoDpu and PianoWifi read the same pages). A `core
 | V0 | `piano-video=1` | survey (built) | the lines above, no hang, `0 stores` | done offline; 1 boot |
 | V0b | a test image | the vendored transport + VTHost with a stub backend listing H.264/HEVC and refusing `dsta` | with `vmm-present = 0`: a process opens the service and a `decs` arrives (the transport's open and message counters, logged to the USB console), playback falls back to software cleanly | 1–2 days; 1 boot |
 | V1 | `=2` | power (built offline, §12.1): MXC svs + MMCX at the display floor + BCM MM1, GCC AXI0/1, PLL0 720 MHz, MVS0C then MVS0 GDSC + clocks at 240 MHz; the survey's core readout with the gate open; off in Linux's order | CORE_POWER_STATUS bit 1, sane words, CTRL_STATUS 0; GDSCs off again; 20 cycles; the panel unaffected (§12.8 T1, T2) | 1–2 boots |
-| V2 | `=3` | firmware (built offline, §12.2): the pin from the ESP, MDT, PAS 9 init/mem_setup/segments/auth_and_reset, MP_VIDEO_VAR under one hold of the secure-call lock; PAS shutdown | every SMC `ok`, no stall, 3 repeats (§12.8 T3) | 1–2 boots |
+| V2 | `=3` | firmware (built offline, §12.2): the pinned file (the RAM image's addon, else the ESP), MDT, PAS 9 init/mem_setup/segments/auth_and_reset, MP_VIDEO_VAR under one hold of the secure-call lock; PAS shutdown | every SMC `ok`, no stall, 3 repeats (§12.8 T3) | 1–2 boots |
 | V3 | `=4` | SMMU groups + bank, UC region, boot words, CTRL_INIT; INIT + IMAGE_VERSION; PC prep, collapse, resume (built offline, §12.3) | init without error, INIT answered with success, the version string, FSR 0; 10 collapse/resume cycles (§12.8 T4, T5) | 2–4 boots |
 | V4 | `=5` | one H.264 clip in the kernel (our own 320x240, 10 frames, from ffmpeg's test source), the whole session of §3 | every NV12 frame's MD5 = the Mac's `framemd5`; no SMMU fault; close + collapse | 2–3 weeks (buffer sizes, the state machine); 5–10 boots |
 | V5 | `=6` | the V4L2-semantics backend under the vendored VT files | `vtread.js`: `dinv: in 300 out 300 dropped 0`, frames equal to the source, UsingHardwareAcceleratedVideoDecoder true; QuickTime/Safari H.264; HEIC still Apple's; 30 min, no leak | 1–2 weeks; 3–6 boots |
@@ -301,7 +304,7 @@ disassembled; no Apple binary is reverse engineered (public headers, class and s
 | `VideoSmmu.h` | V3: two stream-match groups and a fresh stage-1 bank, our table for the UC region, the teardown |
 | `VideoHfi.h` | V3: the queue table and queues, HFI gen2 packets, answers, the boot words |
 | `VideoBringup.h` | the levels as one sequence over the owner's Hw (§12.5's rules) |
-| `PianoVideo.cpp` | the kernel's Hw: MMIO pages on demand (explicit `ldr`/`str`), the cmd-db copy, the DRV-2 word, the ESP reader, SHA-256, the metadata buffer, the carveout and UC-region mappings, the secure calls (`Sm8750Scm`) |
+| `PianoVideo.cpp` | the kernel's Hw: MMIO pages on demand (explicit `ldr`/`str`), the cmd-db copy, the DRV-2 word, the firmware through `piano_fw_load` (the generated pin), SHA-256, the metadata buffer, the carveout and UC-region mappings, the secure calls (`Sm8750Scm`) |
 
 The gate: the kext runs levels 2-4 only for `piano-video=2..4`, after level 1's survey (unchanged); `Bringup::run` refuses any
 other level before its first access, so nothing is read or written by them below 2 (host-tested).
@@ -345,18 +348,20 @@ two GDSC words with bit 11 set once more and from cycle 3 on no new pair is logg
 
 ### 12.2 V2: the firmware (`piano-video=3`)
 
-**Where the file comes from: the ESP.** The owner stages his own `vpu35_4v.mbn` once with `build-esp.py --video-firmware` (pinned:
-2 409 160 bytes, SHA-256 `95c5882f9b66b93ad2635604b7db563cc310481e017fa6b82e0ce6cbb9eae01b`; refused otherwise) at
-`EFI/UniXNU/firmware/qcom/sm8750/vpu35_4v.mbn`; PianoVideo finds GPT `esp` through NativeUfs (waiting up to 60 s for it), mounts it
-with FatVolume (PianoSensors' path) and reads the file whole into kernel memory (freed after the load). Not the vendor/odm
-partition: `odm_a` is a logical partition inside `super` (LP metadata) holding an EROFS image, which nothing native reads (an LP
-parser plus an EROFS reader, compression included, for one file); the FAT `modem_a` does not hold the video firmware on piano
-(the pin's source is odm). The ESP is FAT32, already read the same way, and its staging is one checked step. Checked offline:
-`tests/esp_host.cpp` reads a stand-in at the path from mtools FAT32 images of 4096-byte sectors (and refuses the file missing, a
-directory, an empty file, a volume that is not FAT); and the real `build-esp.py --profile base --video-firmware` image (1 GiB,
-built into /tmp and deleted) read back by the same code gave the owner's file byte for byte. That run found `build-esp.py`'s
-independent FAT reader ignoring the 8.3 case flags (mtools stores `firmware`, `qcom`, `vpu35_4v.mbn` as lowercase 8.3 names
-without long names, like `previous` of `--prev-kc`): `tooling/persist/common.py` now honours them as EDK2's FatPkg does.
+**Where the file comes from: the shared run-time loader** ([kc-space.md](../kc-space.md) §6). The kext carries only the pin
+`PianoVideo/vpu35_4v.mbn` (2 409 160 bytes, SHA-256 `95c5882f9b66b93ad2635604b7db563cc310481e017fa6b82e0ce6cbb9eae01b`, the
+Ubuntu project's `firmware/piano-iris.json`; committed in the build script and in `VideoHw.h`). `build-native-piano-video.sh`
+stages the owner's copy (`PIANO_VIDEO_FW`, default `../xiaomipad-8pro-mainline/firmware/qcom/sm8750/vpu35_4v.mbn`) into the
+ignored `out/firmware/PianoVideo/`; `build-ram-images.py` finds the pin in the collection and puts the checked file into the RAM
+image's addon (`Payloads/kernel.macho.gpuaddon`, entry `EFI/UniXNU/firmware/PianoVideo/vpu35_4v.mbn`), and `build-esp.py` places
+it at the same path on an installed ESP. At stage 30 PianoVideo calls `piano_fw_load` (the boot's addon first, else GPT `esp`
+through NativeUfs and FatVolume, waiting up to 60 s for it), which returns the file only when its size and SHA-256 match the pin;
+stage 31 checks the pin again with the kext's own SHA-256 (the two facts of `VideoHw.h`), and the memory is released after the
+load. Not the vendor/odm partition: `odm_a` is a logical partition inside `super` (LP metadata) holding an EROFS image, which
+nothing native reads (an LP parser plus an EROFS reader, compression included, for one file); the FAT `modem_a` does not hold the
+video firmware on piano (the pin's source is odm). PianoVideo is the loader's first user in the collection (kc-space.md §7 plans
+the same for PianoTouch, PianoA830 and PianoKeyboard); the loader's own tests (`package/common/tests/run-firmware-tests.py`, run
+by the build) cover the pins, the addon, an mtools ESP image and the damaged cases.
 
 **The image** (checked offline against the owner's file by the build when it is on this Mac): ELF32, 22 program headers, 15
 loadable, the hash segment last, relocatable, span 0x800000 from 0xf500000 (exactly the carveout), metadata 5564 bytes, 1 354 984
@@ -424,7 +429,7 @@ negative at the failed step (`PianoVideo: FAILED at stage N: <reason>`), and `pi
 ### 12.5 What every level keeps
 
 Every register write logged once; every wait bounded (the brackets above; the DRV-2 lock 2 s; the secure-call lock its 30 s
-bound; a TCS 100 ms; the ESP 60 s); no store from the zero register; nothing written below `piano-video=2`; `piano-video-stop=STEP`
+bound; a TCS 100 ms; the loader's wait for the ESP 60 s, only when the boot has no addon); no store from the zero register; nothing written below `piano-video=2`; `piano-video-stop=STEP`
 powers everything down after that step (§12.6).
 
 ### 12.6 Step numbers
@@ -466,22 +471,21 @@ buffers across the queue's end, a full queue, oversized and zero-size packets, b
 malformed, session, error and version messages; cmd-db lookups, the corner rule, the TCS layout, a busy and a stuck TCS; the SMMU
 plan's refusals and the table's walk. With the owner's file on this Mac, also its pin and headers (§12.2).
 
-Built 2026-11-11 (k27 kernel 0059): `check-kext-imports: 330 imports from the kernel, 4 from the libraries (_native_ufs_part_find,
-_native_ufs_part_read, _sm8750_rpmh_drv2_owner, _sm8750_scm_owner), 0 unresolved`; `build-native-image.sh` with the whole list:
-`com.unixnu.driver.PianoVideo: linked, ... 392 pointers`, `native kext rule: 21 native kexts linked, none from outside this
-repository`.
+Built 2026-11-12 (k27 kernel 0059, on main 45493f4): `check-kext-imports: 340 imports from the kernel, 4 from the libraries
+(_native_ufs_part_find, _native_ufs_part_read, _sm8750_rpmh_drv2_owner, _sm8750_scm_owner), 0 unresolved`; `build-native-image.sh`
+with the whole list: `com.unixnu.driver.PianoVideo: linked, ... 414 pointers`, `native kext rule: 23 native kexts linked, none
+from outside this repository`, `firmware: 1 of 1 pinned file(s) in the addon` (the container 899 728 bytes);
+`verify-ram-images.py`: the addon present and recorded, the ADT's `GpuAddon` slot, the entry
+`EFI/UniXNU/firmware/PianoVideo/vpu35_4v.mbn` matching its pin in the payload's own collection, `PASS: 0 failure(s)`.
 
-### 12.8 The batched tablet test list (one ESP update, then RAM boots; V0 first)
+### 12.8 The batched tablet test list (RAM boots only; V0 first)
 
 Prerequisites: V0 (§8) passed: VIDEO_CC was readable, the core cold, no SMMU entry for 0x1940-0x194f (if V0 needed
-`piano-video-cc=0`, add it to every line below). One ESP update for V2/V3 (USING.md §5, with the firmware added):
-
-```sh
-python3 tooling/persist/build-esp.py --profile daily --default macos --name esp-daily-macos --out out/persistent \
-  --video-firmware ../xiaomipad-8pro-mainline/firmware/qcom/sm8750/vpu35_4v.mbn      # + the usual --kc/--adt/--trust/--seed
-python3 tooling/persist/maint-session.py maint-boot map backup esp-final check maint-exit --esp esp-daily-macos.img \
-  --esp-final esp-daily-macos.img        # then abl-final reboot
-```
+`piano-video-cc=0`, add it to every line below). No ESP update: the firmware travels in each RAM image's addon
+([kc-space.md](../kc-space.md) §6). `build-native-image.sh` runs `build-native-piano-video.sh`, which stages the owner's copy into
+`out/firmware/PianoVideo/` (`PIANO_VIDEO_FW` when it is not next to this repository); `build-ram-images.py` then prints
+`firmware: 1 of 1 pinned file(s) in the addon` (about 0.9 MB compressed) and gives the payload's ADT the `GpuAddon` slot. If it
+prints `pinned firmware not staged`, the copy was not found and stage 30 fails with `addon: none in this boot; esp: not found`.
 
 Each test is one RAM boot (`tooling/native/native-loop.sh`, the USB console captured as in §8), built as
 `PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=300 PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 <args>"
@@ -490,6 +494,7 @@ tooling/k27/build-native-image.sh && cp -R out/ram out/ram-video<T>`; read with 
 
 | T | `<args>` | Pass |
 |---|---|---|
+| T0 | (none) | the image with the addon boots as before (the first firmware addon on piano: DarwinBoot refusing it stops before XNU with `EFI_COMPROMISED_DATA`; then `PIANO_FW_ADDON=0` and the ESP, §12.9); PianoVideo inert: no `PianoVideo:` line (it declines in `probe()`) and no `PianoFirmware:` line |
 | T1 | `piano-video=2` | V1, one cycle: the lines below, the panel undisturbed, `stage 59: done` |
 | T2 | `piano-video=2 piano-video-cycles=20` | V1, twenty cycles: `V1: cycle 20/20 ok`, the write count grows, the logged count stops after cycle 2 |
 | T3 | `piano-video=3 piano-video-cycles=3` | V2: every `smc: ... ok`, three cycles, no stall |
@@ -536,9 +541,11 @@ off, rails down; MMCX rides only the first); in cycle 2 the two GDSC words once 
 
 **T3 expected** (V1's power-on lines, then per cycle):
 ```
-PianoVideo: V2: 3 cycle(s): power on, PAS 9 from the ESP copy, MP_VIDEO_VAR, 50 ms, PAS shutdown, power off
-PianoVideo: stage 30: the firmware file from the ESP
-PianoVideo: firmware: EFI/UniXNU/firmware/qcom/sm8750/vpu35_4v.mbn on the ESP (LUN 0, 262144 blocks): ok, 2409160 bytes
+PianoVideo: V2: 3 cycle(s): power on, PAS 9 with the pinned file (the boot's addon or the ESP), MP_VIDEO_VAR, 50 ms, PAS shutdown, power off
+PianoVideo: stage 30: the firmware file (the boot's addon or the ESP)
+PianoFirmware: EFI/UniXNU/firmware/PianoVideo/vpu35_4v.mbn: the boot's addon, 2409160 bytes (addon: ok)
+PianoVideo: firmware: EFI/UniXNU/firmware/PianoVideo/vpu35_4v.mbn: ok from the boot's addon (addon: ok)
+PianoVideo: stage 31: the pin: size and SHA-256
 PianoVideo: firmware: 2409160 bytes, sha256 95c5882f9b66b93a...: the pinned vpu35_4v.mbn (OS3.0.303.0)
 PianoVideo: firmware: ELF32, 22 program headers, 15 loadable, hash at 21, relocatable, span 0x800000 at 0xf500000, metadata 5564 bytes
 PianoVideo: firmware: metadata 5564 bytes at 0x........
@@ -588,7 +595,7 @@ video streams released`, `bring-up: V3 ok: ...; collapse/resume 10/10; fsr 00000
 What a failure line means and the next boot: `FAILED at stage 10/11` (`rpmh: ...` before it): DRV-2 busy or a TCS that never
 completed: nothing was powered; record the TCS words. A hang right after a `stage 13`/`14` line: VIDEO_CC or the GDSC at these
 rails: rerun with `piano-video-stop=13` and then `=14`. `FAILED at stage 15` with `mvs0 divider`: the divider is not /3: record
-it (the rails must then be voted for that OPP). `FAILED at stage 31`: the ESP copy is not the pinned file (rebuild the ESP). A hang
+it (the rails must then be voted for that OPP). `FAILED at stage 30`: the loader's trail says which source failed (`addon: none in this boot`: the image was built without the staged copy; `another SHA-256 than the pin's`: a different file was staged); `FAILED at stage 31`: the loader returned a file the kext's own SHA-256 does not match (record both lines). A hang
 after `smc: ...: calling`: the secure world did not return (the Gunyah watchdog resets the board; the RAM boot returns); rerun T3
 with `piano-video-stop=33` to separate the file from the calls. `FAILED at stage 45` with `error 0x4`: the UC region refused
 (record UC/QTBL/SFR words: the alignment or the SMMU); `no answer after 1000 polls`: the firmware did not start its HFI.
@@ -614,3 +621,8 @@ with `piano-video-stop=33` to separate the file from the calls. `FAILED at stage
    V3's lines record the real times (open question 13).
 8. **The steady state** keeps 3 MiB of wired memory and the bank after V3 when `piano-video-unload=0`, with nobody using them
    until V5: deliberate (the first session's resume costs no PAS), released by `piano-video-unload=1`.
+9. **The first pin in the collection**: PianoVideo is the first kext that pins a file, so from now on every RAM image
+   `build-native-image.sh` makes carries a firmware addon (about 0.9 MB) and its ADT the `GpuAddon` slot, whatever the boot
+   arguments; no addon has booted on piano yet (kc-space.md §9). T0 checks it first; `PIANO_FW_ADDON=0` builds images without it
+   (V2/V3 then read the ESP). `build-esp.py` with this collection needs the staged copy (or `--allow-missing-firmware`, after which
+   stage 30 reports `not found` on that system).

@@ -2,13 +2,14 @@
 // PianoVideo V2 (piano-video=3): the firmware. Portable (host tests in tests/bringup_host.cpp with a synthetic signed-image layout
 // and a secure-world model; tooling/k27/build-native-piano-video.sh also parses the owner's own file when it is on this Mac).
 //
-// Where the file comes from (docs/drivers/video.md section 12.2): the owner's vpu35_4v.mbn on the ESP (GPT "esp", FAT32), at
-// EFI/UniXNU/firmware/qcom/sm8750/vpu35_4v.mbn, put there by tooling/persist/build-esp.py --video-firmware after the same pin check;
-// read whole at run time through NativeUfs's partition reader and FatVolume, never in this repository or a build output. Not from
-// odm_a: that is a logical partition inside "super" (LP metadata) holding an EROFS image, which nothing native reads.
+// Where the file comes from (docs/drivers/video.md section 12.2): the owner's vpu35_4v.mbn through the shared run-time firmware
+// loader (package/include/PianoFirmware.h, docs/kc-space.md §6) against the pin PianoVideo/vpu35_4v.mbn the build writes: from a
+// RAM image's addon or the installed system's ESP (EFI/UniXNU/firmware/PianoVideo/vpu35_4v.mbn), staged by the build into the
+// ignored out/firmware/PianoVideo/ and placed by build-ram-images.py / build-esp.py; never in this repository. Not from odm_a: that
+// is a logical partition inside "super" (LP metadata) holding an EROFS image, which nothing native reads.
 //
 // The sequence (Linux iris_firmware.c iris_fw_load and drivers/soc/qcom/mdt_loader.c qcom_mdt_load as the specification):
-//   30 the file (the owner's fwRead)          31 the pin: exactly 2 409 160 bytes and its SHA-256, else refused
+//   30 the file (the owner's fwRead)          31 the pin once more (the loader checked it): 2 409 160 bytes and its SHA-256
 //   32 the image: an ELF with a hash segment, every loadable segment inside the 8 MiB carveout (relocatable: the span; fixed: the
 //      addresses)                              33 the metadata (headers + hash segment) in contiguous memory, cleaned to the PoC
 //   then, holding the kernel-wide secure-call lock once (package/include/PianoScmLock.h, tag VIDE) across all of it:
@@ -28,40 +29,10 @@
 // the Hw logs every call before and after it).
 #pragma once
 #include <stdint.h>
-#include "FatVolume.h"
 #include "QcomMdt.h"
 #include "VideoOps.h"
 
 namespace pianovideo {
-
-// ------------------------------------------------------------------------------------------------------- the file on the ESP
-// The firmware file of a FAT volume (the ESP partition, read through the caller's FatRead): mounted, opened at kEspFirmwarePath
-// (any case), its size checked (not empty, at most 4 MiB: the pin's 2.4 MB with room), read whole into alloc(size). Host-tested
-// against an mtools FAT32 image formatted as build-esp.py formats the ESP (tests/esp_host.cpp).
-enum EspError : int { kEspOk = 0, kEspNotFat = 1, kEspNotFound = 2, kEspSize = 3, kEspNoMemory = 4, kEspRead = 5 };
-constexpr uint64_t kEspFirmwareMaxBytes = 4u * 1024 * 1024;
-inline const char *espErrorName(int e)
-{
-  return e == kEspOk ? "ok" : e == kEspNotFat ? "not a FAT volume" : e == kEspNotFound ? "no such file" : e == kEspSize ? "empty or over 4 MiB"
-       : e == kEspNoMemory ? "no memory" : e == kEspRead ? "a read error" : "?";
-}
-template <class Alloc, class Free>
-int espRead(FatVolume *v, uint64_t partitionBytes, FatRead read, void *context, Alloc alloc, Free release, uint8_t **bytes, uint64_t *size)
-{
-  if (fat_mount(v, partitionBytes, read, context)) return kEspNotFat;
-  FatFile f;
-  if (fat_open(v, kEspFirmwarePath, &f) || f.directory) return kEspNotFound;
-  if (!f.size || f.size > kEspFirmwareMaxBytes) return kEspSize;
-  uint8_t *b = alloc(uint64_t(f.size));
-  if (!b) return kEspNoMemory;
-  if (fat_read(v, &f, 0, b, f.size)) {
-    release(b, uint64_t(f.size));
-    return kEspRead;
-  }
-  *bytes = b;
-  *size = f.size;
-  return kEspOk;
-}
 
 struct FwState {
   bool initDone = false;   // init_image accepted: a failure from here on is followed by PAS shutdown
@@ -155,13 +126,13 @@ class Firmware {
   {
     auto &hw = ops.hw;
     st.error = kOk;
-    ops.hw.stage(kStepFwFile, "the firmware file from the ESP");
+    ops.hw.stage(kStepFwFile, "the firmware file (the boot's addon or the ESP)");
     const uint8_t *bytes = nullptr;
     uint64_t size = 0;
     const int rc = hw.fwRead(&bytes, &size);
     if (rc || !bytes) {
-      hw.note("firmware: %s not read from the ESP (error %d): put the owner's copy there with build-esp.py --video-firmware",
-              kEspFirmwarePath, rc);
+      hw.note("firmware: %s not loaded (error %d): stage the owner's copy (build-native-piano-video.sh, PIANO_VIDEO_FW) before "
+              "building the RAM image or the ESP", kFirmwarePinPath, rc);
       return fail(kStepFwFile, kErrFwFile);
     }
     st.size = size;
