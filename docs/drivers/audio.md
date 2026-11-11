@@ -1,7 +1,7 @@
 # Audio: four FS19xx speakers on TDM, DMICs on the VA macro, through the ADSP's AudioReach: PianoAudio
 
 Status, 2026-11-11 (evening): `package/PianoAudio` levels 1-3 are built, host-tested and linked into the native KC (kernel 0059:
-"17 native kexts linked, none from DroidVM", PianoAudio 1081 pointers, PianoPower's client functions resolved by name), inert
+"20 native kexts linked, none from DroidVM", PianoAudio 1081 pointers, PianoPower's client functions resolved by name), inert
 without `piano-audio`; the RAM image verifies PASS; **nothing of it has run on hardware**. Level 1 is the read-only survey, level 2
 the DSP link (one readiness query through PianoPower's client contract), level 3 the macOS "Speaker" and "Mic" devices on a null
 transport (silence, no hardware). The pieces of levels 4-10 (the FS19xx core, piano's AudioReach graphs with their sequencer, the
@@ -133,7 +133,7 @@ import check (381 kernel imports, 3 library imports from PianoPower: `piano_adsp
 0 unresolved) and `check-audio2-family.py` (§5). Descriptor `tooling/k27/kext/PianoAudio.json` (`com.unixnu.driver.PianoAudio`),
 which names `com.unixnu.driver.PianoPower` among its libraries; listed in `configs/k27-native-kexts.txt` after PianoPower, so the
 KC resolves the contract's functions by name to PianoPower's copy; `tooling/k27/build-native-image.sh` links it into every native
-KC (inert). Measured 2026-11-11: `PIANO_A830_METAL=0 tooling/k27/build-native-image.sh` links 17 native kexts, none from DroidVM,
+KC (inert). Measured 2026-11-11: `PIANO_A830_METAL=0 tooling/k27/build-native-image.sh` links 20 native kexts (with PianoSensors, the other contract client, and PianoBluetooth), none from DroidVM,
 PianoAudio 1081 pointers; `verify-ram-images.py` PASS.
 
 ### 7.1 The code (host-tested; levels 1-3 run it on the tablet, the rest waits for its level)
