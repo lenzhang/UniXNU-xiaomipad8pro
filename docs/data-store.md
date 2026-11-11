@@ -74,10 +74,56 @@ States (`native_data_persist_state`): 0 off, 1 blank, 2 resumed, 3 fresh, 4 refu
 
 Volatile mode for the 12 GiB disk is new (`VolatileDisk.h`). Before this change, a seed above 2 GiB had no write path without the
 store: its writes failed with `kIOReturnNotReady`, so `data-persist=0` or a refused store meant a Data volume that could not be
-written. Pages written now go into RAM: a directory of one pointer per 2 MiB of disk (48 KiB), plus 4 KiB leaves and pages
-allocated on first write. They are gone at the next boot. A long volatile session costs RAM in proportion to what it writes.
-The read-only probe (`data-persist=1`) of a large disk also used to dereference the missing sparse page array once the store was
-valid. It now reports the store and applies nothing (state 6).
+written. Pages written now go into RAM: a directory of one pointer per 2 MiB of disk (48 KiB), plus 4 KiB leaves and pages taken
+on first write. They are gone at the next boot. The read-only probe (`data-persist=1`) of a large disk also used to dereference
+the missing sparse page array once the store was valid. It now reports the store and applies nothing (state 6).
+
+**The volatile disk's memory (`VolatilePool.h`, fixed 2026-11-12).**
+
+The problem. The first version took every page with `IOMallocZero(4096)` inside `doAsyncReadWrite`, with the disk's lock held.
+Three attended `data-persist=0` runs on 2026-11-11 hard-reset the tablet 1 to 2 minutes after the login, under Spotlight's first
+import: every kernel line stopped at once, and the Gunyah watchdog reset the tablet. The cause:
+- That allocation is a kalloc zone allocation, and this kernel's zone maps are bounded (`zone_init: map DATA 2457M`, 1843M per
+  general map).
+- A zalloc that finds no free page waits for the pageout daemon, and the daemon's writeback of dirty Data pages needs this disk's
+  lock.
+- Nothing ever failed a write: the system stopped.
+
+`Test/volatile-stress.cpp` part C reproduces that deadlock in a model.
+
+Now:
+- **Allocation.** The pages come from 2 MiB chunks (`IOMallocAligned`, which is `kernel_memory_allocate` into the kernel map's
+  data range, not a zone). A refill thread allocates them with no lock held and may wait for memory as long as the VM needs. It
+  keeps 16 MiB ready, more while a write waits.
+- **Writes.** The I/O path takes only pages that are already there. A write first admits every page it may take (its data pages
+  and leaves):
+  - past the **budget** it is refused at once with `kIOReturnNoSpace`;
+  - otherwise it waits at most **2 s** for the refill thread, the lock released, then is refused with `kIOReturnNoMemory`.
+  Reads and overwrites of resident pages need nothing.
+- **What happens at N GiB.** The disk holds at most the budget: writes needing new pages fail with an error and never wait without
+  a bound. What APFS makes of a refused write is APFS's: an error to the writer, possibly a forced unmount or a panic. Either way
+  the boot does not hang.
+- **Unmap.** The disk advertises `Unmap` (only when volatile; it is decided before the disk is published). APFS's freed blocks
+  then go back to the pool, so the disk holds about the live data, not every block APFS ever wrote. Copy-on-write metadata and
+  Spotlight's index churn a lot of blocks.
+
+| Boot argument | Default | Meaning |
+|---|---|---|
+| `data-volatile-mib=N` | a quarter of the memory XNU manages (about 1.9 GiB here), within 256 MiB to 4 GiB | the budget (64 to 65536) |
+| `data-volatile-unmap=0` | 1 | do not advertise unmap |
+
+Lines:
+
+```
+NativeRamBlock: volatile: budget 1966 MiB (data-volatile-mib), in 2 MiB chunks; writes past it are refused (no space), a write that waits 2000 ms for pages is refused (no memory); unmap on
+NativeRamBlock: volatile: N pages, M MiB resident (H MiB held in chunks, peak P MiB, budget B MiB); U pages unmapped; writes refused: X no space, Y no memory; W waits, F chunk failures
+```
+
+The second line comes from the refill thread, never from the I/O path. It appears at most every 10 s while the numbers move, and
+within a second of a new refusal.
+
+What this does not cover: small seeds (up to 2 GiB: `SparseDisk.h ramSparseIO`) still take a zone page per written page in the lock.
+No current seed is that small (all are 12 GiB).
 
 Console lines (`grep NativeRamBlock`):
 
@@ -198,7 +244,7 @@ new seed.
 Host tests (offline, about 10 s in all):
 
 ```sh
-package/NativeRamBlock/Test/run-tests.sh [SEED.img]   # sparse, persist, direct, seeddisk, guard, volatile (+ the seed's identity)
+package/NativeRamBlock/Test/run-tests.sh [SEED.img]   # sparse, persist, direct, seeddisk, guard, volatile, volatile-stress, power (+ the seed's identity)
 python3 tooling/persist/test-data-store.py            # header reader vs the driver's encoder, installed seed, every tooling decision
 python3 tooling/persist/test-persist.py               # the install session against a fake tablet (needs out/persistent's inputs)
 ```
@@ -286,10 +332,32 @@ out/installed/scratch-data.img --trust out/installed/kernel.macho.trustcache`, t
 (docs/persistent-boot.md). Once the store is self-contained, the ESP's seed may change; the trust cache rule of section 4 still
 holds.
 
+**V1, the volatile disk under load (after the 2026-11-11 hangs).** Use the attended desktop image (`ram-attend3`'s arguments:
+`data-persist=0`, GPU, USB console) built from a collection with `VolatilePool.h`:
+
+```sh
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=1200 PIANO_DATA_PERSIST=0 \
+PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-power=1 piano-keyboard=2 piano-keyboard-gestures=1 piano-backlight=2 piano-backlight-keys=1 exec-log=1 stderr-log=1 piano-touch-flip=2" \
+  tooling/k27/build-native-image.sh && rm -rf out/ram-volatile1 && cp -R out/ram out/ram-volatile1
+tooling/native/native-loop.sh out/ram-volatile1/boot-piano-macos-ram-A-bundled.img     # with tooling/native/usb-console.py --capture 1500
+```
+
+Log in and use the desktop as in the hung runs (let Spotlight import). Expected in the console:
+- `NativeRamBlock: volatile: budget … MiB …; unmap on` once at boot.
+- `NativeRamBlock: volatile: N pages, M MiB resident …` every 10 s while Data is written. M should level off below the budget,
+  with `U pages unmapped` growing if APFS trims.
+- No hard reset over at least 10 minutes. The kernel's periodic lines (PianoDwc3, PianoTouch) keep coming.
+
+If the budget is reached, the line shows `writes refused: X no space` and APFS reports write errors. That is the designed limit,
+not a hang. To see the limit on purpose, add `data-volatile-mib=512` to `PIANO_EXTRA_ARGS` for a second image.
+
 ## 8. Risks and open items
 
 - Nothing here has run on the tablet. The volatile large disk is new code on the boot path of every boot without the store
-  (test images, `data-persist=0`). The host test covers it against an oracle; a long volatile session can exhaust RAM.
+  (test images, `data-persist=0`). Its first version hung the tablet under load (section 3). The pool version is host-tested:
+  sustained writes, budget, low memory, unmap, threads and the hang's own model (`Test/volatile-stress.cpp`).
+  - At the budget, APFS gets write errors.
+  - Whether APFS actually sends unmaps to this disk is not yet seen on the tablet. The `pages unmapped` count will tell.
 - Until the ESP has the new collection (T5), the installed system itself has no guard. Any RAM image **built before this change**
   with `data-persist=2` and another seed still wipes the store: the installed system's kernel does not protect it, the test image's
   does.
