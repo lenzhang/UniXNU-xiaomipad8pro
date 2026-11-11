@@ -29,7 +29,7 @@ entropy) and PcdDxe's CodeView GUID inside the FD (`logs/fd/reproducibility.txt`
 
 Signing: SHA256_RSA4096, partition `boot`, rollback index 1769904000, the three `com.android.build.boot.*` properties of
 `boot-profile.json` (OS3.0.303 fingerprint), exactly as `build-persistent-boot.py` signs the installed set; done on
-the private build host, where the private key stays.
+the signing host, where the private key stays.
 
 ## Inputs
 
@@ -41,19 +41,10 @@ the private build host, where the private key stays.
 | `inputs/scratch-data.img` (83967024 B) | cb50ceac16394c9f1da7f141ce0bb0b831b5ffac6bc9eeb56a9af99b1c147c11 | the VM accept boot disk (Data seed; = tablet data-store.seed) |
 | AOSP `mkbootimg.py` | 37d84b3d162e0bc62e36c1f4e1c63c85ea0caa9f29be023eb2f8efe006ad948c | v1.1.0 host-tools (the Ubuntu RAM set's) |
 | `avbtool.py` 1.3.0 | e5a664a38db623da00f080219bc0ee60a640a9dc4a872803616fae4938ac749b | xiaomipad-8pro-mainline `tools/aosp-avb.json` pin |
-| k27 kernel `kernel-k27-0054-native.macho` | 20a5b4fdcf54b6ac6e8f1878856b6049fc800591d6936c204545e15c53ebbfae | macOS-DroidVM el1/native-variant 11ac316, `K27_VARIANT=native` |
+| k27 kernel `kernel-k27-0054-native.macho` | 20a5b4fdcf54b6ac6e8f1878856b6049fc800591d6936c204545e15c53ebbfae | the k27 tree at 11ac316 (pin `k27` of unixnu.lock), `K27_VARIANT=native` |
 | k27 kernel `kernel-k27-0054-vm.macho` | a8de3ece88b0477aa01e4bdfbdd8132b3ab04a5e4754ee212a63b3fbb6b74cf6 | same tree, `K27_VARIANT=vm` (not deployed) |
 | tablet `uefi_a` (OS3.0.303, BOOT.MXF.2.5.1-00265) | cee5757c034be1d5d656ace60d5f43fd242c19c511bbf52907655d2edf333a00 | 2026-11-10 backup `sde/1-uefi_a.img.zst`; source of FD B's DXEs (kept outside every repo) |
 | piano hardware DTB `adt/piano-k27.hw.dtb` | 3e8ec34e612242bb93182713c77b8209890407b6497fc71042fac16e5ad5760d | dtc of dts/piano.dts + sm8750.dtsi |
-
-## Item 4 test disk (VM only, on the tablet and the private build host, not in out/)
-
-| File | SHA-256 |
-|---|---|
-| the private build host `~/droidvm/work/macos27/boot-native-test/boot.img` = tablet `~/vm/images/macos27/boot-native-test.img` | f27e87daf43eb1f7f855ccccd2213a005a0bd79da34e0c928f875678e65f0311 |
-| its ADT (8 CPUs EEEEEEPP, psci hvc) | `logs/adt/vm-test-8cpu-adt.txt` |
-| 8-vCPU crosvm FDT `crosvm-piano-gpu-net-snd-media-8192m-8cpu-1600x1068.dtb` | synthesized from the 6-vCPU dump; matched by run 1110-201218's own generated.dtb |
-| accept disk backup `~/vm/images/macos27/boot.img.accept-20261110` | dcbbcc9b72d9b379303b76e4c78d6c979961f9e2210a4c03c676d6a04c2a61bd |
 
 ## Persistent boot (2026-11-11, docs/persistent-boot.md)
 
