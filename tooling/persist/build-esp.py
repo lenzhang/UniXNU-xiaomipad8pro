@@ -21,7 +21,15 @@ profile's and --arg's additions. Entries:
                [--fast-boot 0|1|2] [--boot-guard SECS] [--replace-data [1|HEX8]] [--flatten-data] [--sensor-pack PACK]
                [--audio-preset FSM [--audio-preset-any]]
                [--firmware-dir DIR] [--allow-missing-firmware]
-               [--kc K --adt A --trust T --seed S] [--name esp-diag] [--out out/persistent]
+               [--kc K --adt A --trust T|base --seed S|base] [--layer DIR] [--name esp-diag] [--out out/persistent]
+
+The Data store's base (docs/data-store.md section 9): --seed base / --trust base take the pinned base of the installed seed
+(tooling/persist/base-seed.py pin --esp <the installed ESP image>), the seed the store was made for, byte for byte; the daily profile
+takes both by default, so an installed ESP keeps the owner's Data whatever else it changes. The files that change (the Metal plugin,
+our userland) are the system layer: --layer DIR (tooling/userland/stage.py --live DIR --gpu-bundle BUNDLE --installed-trust <the
+base's trust cache>) takes DIR's trust cache, the base's with one more module of the layer's CDHashes; the layer's files go onto the
+running system as files (docs/userland.md section 7). An ESP whose seed is the installed one refuses a trust cache that lacks any of
+the base's CDHashes: the resumed Data still has the base's plugin, which would no longer load.
 
 The Data store (docs/data-store.md): the macos entries open it read-write (data-persist=2). When the installed seed is known
 (PIANO_INSTALLED_SEED, or out/persistent/installed.json) and differs from this ESP's seed, the first boot of this ESP finds another
@@ -57,6 +65,8 @@ private pin (this unit's own data) is recorded without its hash. The ESP never c
 the same files travel), so an ADT with the GpuAddon slot is refused (above).
 """
 import argparse
+import contextlib
+import json
 import os
 import re
 import shutil
@@ -98,8 +108,9 @@ PROFILES = {
         'about': 'the installed configuration from 2026-11-11 evening: gpu + PianoPower level 1 (battery and Type-C readout, no writes, '
                  'the DSP not started) + the USB debug console (PianoDwc3: kernel console, monitor with "reset fastboot", user pipe) '
                  '+ the keyboard and pointer from the Mac (piano-usb-hid=1)',
-        'kc': 'out/k27/kc-k27-native.bin', 'adt': 'out/adt/piano-k27.adt',
-        'trust': 'out/turnip-a830/stage/kernel.macho.trustcache', 'seed': 'out/turnip-a830/stage/scratch-data.img',
+        # the Data store's base (base-seed.py): the installed seed and its trust cache, never a restaged seed (docs/data-store.md
+        # section 9); the Metal plugin and our userland come as the system layer (--layer), not in the seed
+        'kc': 'out/k27/kc-k27-native.bin', 'adt': 'out/adt/piano-k27.adt', 'trust': 'base', 'seed': 'base',
         'args': ['piano-gpu=2', 'piano-gpu-delay=20', 'panic_on_crash_disabled=1', 'piano-power=1', 'piano-usb=2', 'piano-usb-hid=1'],
         'vmm_present': 0,
         'kexts': ['com.unixnu.driver.PianoA830', 'com.unixnu.driver.PianoPower', 'com.unixnu.driver.PianoDwc3'],
@@ -133,13 +144,25 @@ def loud(text):
     print('\n'.join(['', '*' * 100, *[f'*  {line}' for line in text.splitlines()], '*' * 100, '']), file=sys.stderr, flush=True)
 
 
-def check_trust(a, trust):
-    """A self-contained (flattened) store keeps the Metal plugin the installed trust cache trusts, whatever seed a new ESP brings: a
-    trust cache without those CDHashes stops it loading (WindowServer crash loop). A note when CDHashes are missing."""
+def check_trust(a, trust, base=None, resumes=False):
+    """A resumed store keeps the Metal plugin the installed trust cache trusts: the base's (a store of the installed seed), or, for a
+    self-contained (flattened) store, whatever seed a new ESP brings. A trust cache without those CDHashes stops it loading (WindowServer
+    crash loop). RESUMES (this ESP's seed is the installed one): refused; else a note when CDHashes are missing. The installed trust
+    cache: --installed-trust, the installed ESP's record, else the pinned base's (BASE, or the one pinned for the installed seed)."""
     installed = a.installed_trust or common.installed_trust(a.out)
+    if not installed and base is None:
+        with contextlib.suppress(SystemExit):
+            base = common.pinned_base()
+    if not installed and base is not None:
+        installed = base['trust']
     if not installed:
         return None
     missing = common.trust_hashes(installed) - common.trust_hashes(trust)
+    if missing and resumes:
+        raise SystemExit(f'{len(missing)} CDHash(es) of the installed trust cache ({installed.name}) are NOT in this ESP\'s trust cache '
+                         f'({trust.name}), and this ESP resumes the installed store, whose Data has the plugin they trust: WindowServer '
+                         'could no longer load it. Take --trust base, or a layer\'s trust cache made with --installed-trust <the base\'s> '
+                         '(stage.py --live, --layer)')
     if missing:
         loud(f'{len(missing)} CDHash(es) of the installed trust cache ({installed.name}) are NOT in this ESP\'s trust cache. If the '
              'store is self-contained (flattened), it keeps the installed /Library/GPUBundles plugin, which would then no longer load '
@@ -177,6 +200,50 @@ def check_store(a, seed, kc):
         loud(f'--replace-data with the installed seed {this}: inert (data-store-replace only acts on another seed\'s store)')
     return {'installed_seed': installed, 'installed_seed_from': source, 'same_seed': same, 'kc_has_store_guard': guard,
             'replace': a.replace_data, 'flatten': a.flatten_data}
+
+
+BASE = 'base'
+
+
+def resolve_inputs(a, profile):
+    """The kc, adt, trust and seed files: --NAME, else the profile's (relative to --from). 'base' for the seed or the trust cache is
+    the pinned base of the installed seed (base-seed.py; common.pinned_base checks its files). --layer DIR (stage.py --live) gives the
+    trust cache: DIR/kernel.macho.trustcache, the base's plus the layer's CDHashes, or the base's own when the layer added none; the
+    layer must have been made against the trust cache it extends. Returns (inputs, base or None, layer record or None)."""
+    base, inputs = None, {}
+    for n in ('kc', 'adt', 'trust', 'seed'):
+        given = getattr(a, n)
+        value = str(given) if given is not None else profile[n]
+        if value == BASE:
+            if n not in ('trust', 'seed'):
+                raise SystemExit(f'--{n} base: only the seed and the trust cache come from the pinned base')
+            base = base or common.pinned_base()
+            inputs[n] = base[n]
+        else:
+            inputs[n] = (Path(given) if given is not None else a.source / value).resolve()
+    layer = None
+    if a.layer:
+        if a.trust is not None and str(a.trust) != BASE:
+            raise SystemExit('--layer and --trust FILE: the layer\'s trust cache is the one (it extends the base\'s)')
+        live = a.layer / 'live.json'
+        if not live.is_file():
+            raise SystemExit(f'--layer {a.layer}: no live.json (tooling/userland/stage.py --live {a.layer} --gpu-bundle ... '
+                             '--installed-trust <the base\'s trust cache>)')
+        report = json.loads(live.read_text())
+        extends = report.get('installed_trust_sha256')
+        if extends != common.sha(inputs['trust']):
+            raise SystemExit(f'--layer {a.layer}: made against the trust cache {str(extends)[:16]}, this ESP\'s is '
+                             f'{common.sha(inputs["trust"])[:16]} ({inputs["trust"].name}): stage it again with --installed-trust '
+                             f'{inputs["trust"]}')
+        layer_trust = a.layer / 'kernel.macho.trustcache'
+        if report.get('untrusted'):
+            if not layer_trust.is_file() or common.sha(layer_trust) != report['trust']['sha256']:
+                raise SystemExit(f'--layer {a.layer}: its trust cache is missing or not the one live.json records')
+            inputs['trust'] = layer_trust.resolve()
+        layer = {'dir': a.layer.name, 'archive_sha256': report['archive_sha256'], 'files': len(report['files']),
+                 'units': sorted({f['unit'] for f in report['files']}), 'new_cdhashes': report.get('untrusted', []),
+                 'extends_trust_sha256': extends, 'trust_sha256': common.sha(inputs['trust'])}
+    return inputs, base, layer
 
 
 def adt_vmm_present(path):
@@ -381,7 +448,11 @@ def main():
     p.add_argument('--profile', choices=sorted(PROFILES), required=True)
     p.add_argument('--from', dest='source', type=Path, default=common.DEVICE, help='repository checkout whose out/ holds the inputs')
     for name in ('kc', 'adt', 'trust', 'seed'):
-        p.add_argument('--' + name, type=Path, help=f'override the profile\'s {name}')
+        p.add_argument('--' + name, type=Path, help=f'override the profile\'s {name}' +
+                       (' ("base": the pinned base of the installed seed, base-seed.py)' if name in ('trust', 'seed') else ''))
+    p.add_argument('--layer', type=Path, metavar='DIR', help='the system layer (tooling/userland/stage.py --live DIR --gpu-bundle ... '
+                   '--installed-trust <the base\'s trust cache>): its trust cache, the base\'s plus the layer\'s CDHashes '
+                   '(docs/data-store.md section 9)')
     p.add_argument('--prev-kc', type=Path, help='a previous kernel collection for "macos-prev" (with --prev-adt, --prev-trust)')
     p.add_argument('--prev-adt', type=Path)
     p.add_argument('--prev-trust', type=Path)
@@ -419,7 +490,7 @@ def main():
     p.add_argument('--out', type=Path, default=common.DEVICE / 'out/persistent')
     a = p.parse_args()
     profile = PROFILES[a.profile]
-    inputs = {n: (getattr(a, n) or a.source / profile[n]).resolve() for n in ('kc', 'adt', 'trust', 'seed')}
+    inputs, base, layer = resolve_inputs(a, profile)
     for n, path in inputs.items():
         if not path.is_file():
             raise SystemExit(f'{n}: {path} is missing')
@@ -461,7 +532,10 @@ def main():
     seed = common.seed_info(inputs['seed'])
     window = seed['store_blocks']
     data_store = check_store(a, seed, inputs['kc'])
-    data_store['trust'] = check_trust(a, inputs['trust'])
+    data_store['trust'] = check_trust(a, inputs['trust'], base, resumes=data_store['same_seed'])
+    data_store['base'] = {'identity_sha256': base['record']['identity_sha256'], 'dir': base['dir'].name,
+                          'source': base['record']['source']} if base else None
+    data_store['layer'] = layer
     lines = args_of(a, profile, a.utc)
     config = config_text(a, lines, prev, guard)
     name = a.name or f'esp-{a.profile}-{a.default}'
@@ -543,7 +617,8 @@ def main():
     }
     common.write_json(a.out / f'{name}.json', record)
     print(f'{image.name}: {record["bytes"]} bytes sha256 {record["sha256"]} (profile {a.profile}, default {a.default}, '
-          f'seed identity {seed["identity_sha256"][:16]})')
+          f'seed identity {seed["identity_sha256"][:16]}' + (', the pinned base' if base and inputs['seed'] == base['seed'] else '') +
+          (f', layer {layer["archive_sha256"][:16]}' if layer else '') + ')')
 
 
 if __name__ == '__main__':

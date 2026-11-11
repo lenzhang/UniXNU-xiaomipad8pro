@@ -227,6 +227,41 @@ def installed_trust(out=None):
     return Path(path) if path and Path(path).is_file() else None
 
 
+def base_dir():
+    """Where the pinned bases live (tooling/persist/base-seed.py, docs/data-store.md section 9): PIANO_BASE_DIR (environment or
+    ~/.config/piano/env), else out/base of this checkout. One directory per base, named by its identity's first 16 hex digits."""
+    value = piano_env().get('PIANO_BASE_DIR', '').strip()
+    return Path(os.path.expanduser(value)) if value else DEVICE / 'out/base'
+
+
+def pinned_base(identity=None):
+    """The pinned base whose identity starts with IDENTITY (default: the installed seed, installed_seed()): a dict with 'seed' and
+    'trust' (paths), 'record' (its base.json) and 'dir'. Both files are checked against the record (sha256) and the seed's identity is
+    computed again, so a base that changed since it was pinned is refused. SystemExit when there is none, or more than one."""
+    if identity is None:
+        identity, source = installed_seed()
+        if not identity:
+            raise SystemExit(f'the installed seed is unknown ({source}): no base to take (base-seed.py pin --expect HEX)')
+    identity = identity.lower()
+    root = base_dir()
+    found = sorted(d for d in root.glob('*') if (d / 'base.json').is_file() and
+                   json.loads((d / 'base.json').read_text())['identity_sha256'].startswith(identity)) if root.is_dir() else []
+    if not found:
+        raise SystemExit(f'no pinned base for seed {identity[:16]} in {root}: pin it from the installed ESP image first '
+                         '(python3 tooling/persist/base-seed.py pin --esp <the installed ESP image>)')
+    if len(found) > 1:
+        raise SystemExit(f'{len(found)} pinned bases start with {identity}: give more hex digits')
+    d = found[0]
+    record = json.loads((d / 'base.json').read_text())
+    seed, trust = d / 'scratch-data.img', d / 'kernel.macho.trustcache'
+    for path, want in ((seed, record['seed']['file_sha256']), (trust, record['trust']['sha256'])):
+        if not path.is_file() or sha(path) != want:
+            raise SystemExit(f'{path}: not the file pinned as base {record["identity_sha256"][:16]} (sha256 differs or missing)')
+    if seed_info(seed)['identity_sha256'] != record['identity_sha256']:
+        raise SystemExit(f'{seed}: its identity is no longer {record["identity_sha256"][:16]}')
+    return {'seed': seed, 'trust': trust, 'record': record, 'dir': d}
+
+
 def trust_hashes(path):
     """The CDHashes of a trust cache bundle (count, offsets, version 2 modules: uuid, count, 20-byte hash + 4 bytes per entry)."""
     data = Path(path).read_bytes()

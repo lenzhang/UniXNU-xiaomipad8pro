@@ -7,12 +7,17 @@
 3. build-ram-images.py data_store_args: which data-persist a RAM image gets for the installed seed, another seed, an unknown one,
    with and without the store guard in the kernel collection; PIANO_DATA_PERSIST, PIANO_DATA_STORE_REPLACE / _FLATTEN; refusals.
 4. build-esp.py: check_store's refusals and records, store_args, and --arg data-store-* refused.
+5. The store's base (docs/data-store.md section 9): base-seed.py pin from files and from an ESP image (mtools), its refusals, a
+   pinned base that changed; build-esp.py resolve_inputs (the daily profile's base, --seed base, --layer and its checks), check_trust
+   for an ESP that resumes the store; base-seed.py diff on two seeds with an APFS container superblock.
   test-data-store.py
 """
 import contextlib
 import hashlib
 import io
+import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -49,6 +54,15 @@ def packed_seed(path, logical, pages):
     head = b'DBRDISK1' + struct.pack('<IIQQ', 1, 4096, logical, len(extents))
     table = b''.join(struct.pack('<QQ', i * 4096, 4096) for i, _ in extents)
     path.write_bytes(head + table + b''.join(bytes([v]) * 4096 for _, v in extents))
+    return common.seed_info(path)
+
+
+def packed_pages(path, logical, pages):
+    """A DBRDISK1 seed with one extent per {page index: 4096 bytes}."""
+    extents = sorted(pages.items())
+    head = b'DBRDISK1' + struct.pack('<IIQQ', 1, 4096, logical, len(extents))
+    table = b''.join(struct.pack('<QQ', i * 4096, 4096) for i, _ in extents)
+    path.write_bytes(head + table + b''.join(page for _, page in extents))
     return common.seed_info(path)
 
 
@@ -274,8 +288,141 @@ def main():
     check('piano-boot-guard-exec=loginwindow' in lines['macos'].split() and 'piano-boot-guard=180' in lines['macos'].split() and
           'piano-boot-guard' not in lines['fastboot'], '--arg piano-boot-guard-exec with the default guard; neither on fastboot')
 
+    base_tests(tmp, esp, a, trust, h, (x, y, z), (seed_x, seed_y), (t_old, t_new, t_union))
+
     print(f'\n{"PASS" if not failures else "FAIL"}: {len(failures)} failure(s)')
     sys.exit(1 if failures else 0)
+
+
+def base_tests(tmp, esp, a, trust, h, seeds, infos, trusts):
+    x, y, z = seeds
+    seed_x, seed_y = infos
+    t_old, t_new, t_union = trusts
+    bs = load('base_seed', HERE / 'base-seed.py')
+    out = io.StringIO()
+
+    def q(fn, *args):
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            return fn(*args)
+
+    print('== the store\'s base: base-seed.py pin')
+    os.environ['PIANO_BASE_DIR'] = str(tmp / 'base')
+    os.environ['PIANO_INSTALLED_SEED'] = seed_x['identity_sha256'][:16]
+    d = q(bs.pin_files, x, t_old, None)
+    base = common.pinned_base()
+    check(base['dir'] == d and base['seed'].read_bytes() == x.read_bytes() and base['trust'].read_bytes() == t_old.read_bytes() and
+          d.name == seed_x['identity_sha256'][:16], 'pin: the installed seed and its trust cache, found again by the installed identity')
+    check(oct(base['seed'].stat().st_mode & 0o777) == '0o444' and oct(base['trust'].stat().st_mode & 0o777) == '0o444', 'pin: read only')
+    check(q(bs.pin_files, x, t_old, None) == d, 'pin again with the same files: a no-op')
+    check(refused(bs.pin_files, x, t_new, None) is not None, 'pin: other files under a pinned identity refused (a base is never replaced)')
+    check(refused(bs.pin_files, y, t_old, None) is not None, 'pin: a seed that is not the installed one refused')
+    q(bs.pin_files, y, t_old, 'any')
+    check(common.pinned_base(seed_y['identity_sha256'][:8])['seed'].read_bytes() == y.read_bytes() and
+          common.pinned_base()['seed'] == base['seed'], '--expect any: another base beside it, each found by its identity')
+    check(refused(bs.pin_files, z, t_old, 'any') is not None, 'pin: a seed of another size refused (another store window)')
+    os.chmod(base['seed'], 0o644)
+    changed = bytearray(x.read_bytes())
+    changed[-1] ^= 1
+    base['seed'].write_bytes(changed)
+    check(refused(common.pinned_base) is not None, 'a pinned base whose file changed is refused')
+    base['seed'].write_bytes(x.read_bytes())
+    os.chmod(base['seed'], 0o444)
+    check(common.pinned_base()['seed'] == base['seed'], '... and taken again once it is the pinned file')
+    (tmp / 'persistent/installed.json').unlink(missing_ok=True)
+    del os.environ['PIANO_INSTALLED_SEED']
+    check(refused(common.pinned_base) is not None, 'no installed seed: no base to take')
+    os.environ['PIANO_INSTALLED_SEED'] = seed_x['identity_sha256'][:16]
+    if shutil.which('mformat') and shutil.which('mcopy'):
+        image, stage = tmp / 'esp.img', tmp / 'esp-stage/EFI/UniXNU'
+        (stage / 'Payloads').mkdir(parents=True)
+        shutil.copyfile(x, stage / 'Payloads/scratch-data.img')
+        shutil.copyfile(t_old, stage / 'Payloads/kernel.macho.trustcache')
+        (stage / 'unixnu.toml').write_text('version = 1\n')
+        env = dict(os.environ, MTOOLS_SKIP_CHECK='1')
+        subprocess.run(['mformat', '-C', '-F', '-T', '70000', '-h', '1', '-s', '1', '-c', '1', '-m', '0xf8', '-v', 'PIANOESP', '-i',
+                        str(image), '::'], env=env, check=True, capture_output=True)
+        subprocess.run(['mcopy', '-i', str(image), '-s', '-Q', '-m', str(tmp / 'esp-stage/EFI'), '::/'], env=env, check=True, capture_output=True)
+        os.environ['PIANO_BASE_DIR'] = str(tmp / 'base-esp')
+        d = q(bs.pin_esp, image, None)
+        record = json.loads((d / 'base.json').read_text())
+        check(record['source']['kind'] == 'ESP image' and record['source']['sha256'] == common.sha(image) and
+              common.pinned_base()['seed'].read_bytes() == x.read_bytes() and common.pinned_base()['trust'].read_bytes() == t_old.read_bytes(),
+              'pin --esp: the seed and trust cache of an ESP image, through the independent FAT32 reader')
+        os.environ['PIANO_INSTALLED_SEED'] = seed_y['identity_sha256'][:16]
+        check(refused(bs.pin_esp, image, None) is not None, 'pin --esp: an ESP whose seed is not the installed one refused')
+        os.environ['PIANO_INSTALLED_SEED'] = seed_x['identity_sha256'][:16]
+        os.environ['PIANO_BASE_DIR'] = str(tmp / 'base')
+    else:
+        print('  skip  pin --esp (no mtools)')
+
+    print('== build-esp.py: the base and the layer')
+
+    def ns(**kw):
+        return SimpleNamespace(**{'kc': None, 'adt': None, 'trust': None, 'seed': None, 'layer': None, 'source': tmp / 'src', **kw})
+
+    daily = esp.PROFILES['daily']
+    inputs, base, layer = esp.resolve_inputs(ns(), daily)
+    check(inputs['seed'] == base['seed'] and inputs['trust'] == base['trust'] and layer is None and
+          inputs['kc'] == (tmp / 'src/out/k27/kc-k27-native.bin').resolve(), 'daily: the pinned base\'s seed and trust cache by default')
+    inputs, base, _ = esp.resolve_inputs(ns(seed=Path('base')), esp.PROFILES['gpu'])
+    check(inputs['seed'] == base['seed'] and inputs['trust'] == (tmp / 'src/out/turnip-a830/stage/kernel.macho.trustcache').resolve(),
+          '--seed base with another profile: the seed only')
+    check(refused(esp.resolve_inputs, ns(kc=Path('base')), daily) is not None, '--kc base refused')
+    check(esp.resolve_inputs(ns(seed=y), daily)[0]['seed'] == y.resolve(), '--seed FILE still overrides the base')
+    layer_dir = tmp / 'layer'
+    layer_dir.mkdir()
+    union = trust(layer_dir / 'kernel.macho.trustcache', [h[3]], [h[0], h[1]], [h[2]])
+    report = {'archive_sha256': 'ab' * 32, 'files': [{'unit': 'gpu-t'}, {'unit': 'pianousb-shell'}],
+              'installed_trust_sha256': common.sha(t_old), 'untrusted': ['/Library/GPUBundles/T.bundle/Contents/MacOS/T'],
+              'trust': {'sha256': common.sha(union)}}
+
+    def live(**kw):
+        (layer_dir / 'live.json').write_text(json.dumps({**report, **kw}))
+
+    live()
+    inputs, base, layer = esp.resolve_inputs(ns(layer=layer_dir), daily)
+    check(inputs['trust'] == union.resolve() and inputs['seed'] == base['seed'] and layer['units'] == ['gpu-t', 'pianousb-shell'] and
+          layer['extends_trust_sha256'] == common.sha(t_old), '--layer: its trust cache (the base\'s plus the layer\'s), the base\'s seed')
+    live(installed_trust_sha256=common.sha(t_new))
+    check(refused(esp.resolve_inputs, ns(layer=layer_dir), daily) is not None, '--layer made against another trust cache: refused')
+    live()
+    check(refused(esp.resolve_inputs, ns(layer=layer_dir, trust=t_new), daily) is not None, '--layer with --trust FILE: refused')
+    live(trust={'sha256': '00' * 32})
+    check(refused(esp.resolve_inputs, ns(layer=layer_dir), daily) is not None, '--layer whose trust cache is not the recorded one: refused')
+    live(untrusted=[])
+    check(esp.resolve_inputs(ns(layer=layer_dir), daily)[0]['trust'] == base['trust'], '--layer that adds no CDHash: the base\'s trust cache')
+    check(refused(esp.resolve_inputs, ns(layer=tmp / 'nolayer'), daily) is not None, '--layer without live.json: refused')
+    installed = tmp / 'persistent/installed.json'
+    installed.unlink(missing_ok=True)
+    with contextlib.redirect_stderr(io.StringIO()):
+        rec = esp.check_trust(a(), t_union, None, True)
+    check(rec['missing_cdhashes'] == 0 and rec['installed_trust'] == str(base['trust']), 'check_trust: the pinned base\'s trust cache when no record names one')
+    check(refused(esp.check_trust, a(), t_new, None, True) is not None,
+          'check_trust: an ESP that resumes the store with a trust cache lacking the base\'s CDHashes: refused')
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        rec = esp.check_trust(a(), t_new, None, False)
+    check(rec['missing_cdhashes'] == 2 and 'NOT in this ESP' in err.getvalue(), 'check_trust: another seed (a self-contained store): the note as before')
+
+    print('== base-seed.py diff')
+
+    def nx(xid):
+        page = bytearray(b'\x01' * 4096)
+        page[32:36] = b'NXSB'
+        struct.pack_into('<Q', page, 96, xid)
+        struct.pack_into('<IIQQ', page, 104, 4, 8, 1, 5)    # descriptors: 4 blocks at 1; data: 8 blocks at 5
+        return bytes(page)
+
+    old = packed_pages(tmp / 'old.img', 12 << 30, {0: nx(10), 2: b'a' * 4096, 6: b'b' * 4096, 7: b'c' * 4096, 20: b'd' * 4096})
+    new = packed_pages(tmp / 'new.img', 12 << 30, {0: nx(11), 2: b'A' * 4096, 6: b'b' * 4096, 7: b'C' * 4096, 20: b'D' * 4096,
+                                                   30: b'e' * 4096})
+    with contextlib.redirect_stdout(io.StringIO()) as text:
+        report = bs.diff(tmp / 'old.img', tmp / 'new.img')
+    check(report['changed_pages'] == 5 and report['where'] == {'superblock (page 0)': 1, 'checkpoint descriptor area': 1,
+                                                                'checkpoint data area': 1, 'pages zero in OLD (copy-on-write targets)': 1,
+                                                                'other pages': 1} and report['old']['apfs']['next_xid'] == 10 and
+          old['identity_sha256'] != new['identity_sha256'] and 'only as files' in text.getvalue(),
+          f'diff: the changed pages by APFS structure ({report["where"]})')
+    check(refused(bs.diff, tmp / 'old.img', z) is not None, 'diff: seeds of two sizes refused')
 
 
 if __name__ == '__main__':
