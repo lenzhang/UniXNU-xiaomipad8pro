@@ -18,3 +18,8 @@ overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h at 11ac316 (sha256 78fd6269
 Read, not copied: UniXNU GopFramebuffer d711e8c9de58825c9a758907cb15c409a804a537 (BSD-2-Clause-Patent). Its macOS display attributes
 already follow DroidVMDisplay (its README), and its macOS build binds IOMobileFramebufferLegacy through UniXNU's XnuPrelink ABI fixtures of
 the 27.3 (26C5035r) collection, not the 27.0.1 collection this KC uses. Its DPU direct-flip path (dpu-scanout=2) is the later step.
+
+UniXNU-piano (2026-11-11): the PianoDpu callouts (docs/drivers/dpu.md §4.3-4.5), new code, each off without its boot argument:
+piano-dpu-pcc (swap_set_color_matrix / set_gamma_table logged and handed to PianoDpuColorMatrix / PianoDpuGammaTable; without it both
+stay the stubs AppleParavirtDisplay has), piano-dpu-panel (each display power change to PianoDpuPanel), piano-dpu-refresh=auto (each
+frame shown to PianoDpuSwap). The service is found by class, as PianoBacklight's.

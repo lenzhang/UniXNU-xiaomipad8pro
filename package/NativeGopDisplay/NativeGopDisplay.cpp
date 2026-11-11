@@ -263,6 +263,22 @@ private:
     bool dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request);
     void flipOrCopy(IOSurface *surface);
     static void flipDoneAction(OSObject *, IOInterruptEventSource *, int);
+    // The PianoDpu callouts (docs/drivers/dpu.md §4.3-4.5), each off without its boot argument (and then nothing of this runs):
+    //   piano-dpu-pcc=1|2       swap_set_color_matrix / set_gamma_table: logged (their raw bytes, B1d-0) and handed to PianoDpu's
+    //                           PCC (PianoDpuColorMatrix / PianoDpuGammaTable); 2 also lets PianoDpu read a whole 0xc0c-byte table
+    //   piano-dpu-panel=1       each display power change handed to PianoDpu (PianoDpuPanel: the panel's light sleep)
+    //   piano-dpu-refresh=auto  each frame shown handed to PianoDpu (PianoDpuSwap: its 60/120 Hz policy)
+    // The service is found by class like the backlight's (no link dependency), retained once found, in fields of their own.
+    static constexpr unsigned kColorFunctions = 16, kGammaWords = 771;
+    uint32_t fDpuPcc;
+    bool fDpuPanel, fDpuSwaps;
+    IOService *fDpuSlices;            // retained once found (the flip's fDpu is the copy thread's)
+    const OSSymbol *fDpuSwapSymbol;
+    uint64_t fDpuSlicesLookupNext;
+    uint32_t fColorCalls, fColorChanges, fColorSeen, fGammaCalls, fGammaChanges, fGammaHash;
+    uint32_t fColorFunction[kColorFunctions];
+    uint64_t fColorLast[kColorFunctions][9];
+    IOService *dpuService(bool now);
     // The copy's cost (boot-arg native-gop-display-copy=BITS, default 0: nothing of this runs). A copy is ~39 ms for 3200x2136 BGRA,
     // 34 of them reading the surface (uncached), and each swap is followed by up to six refresh copies (ticks 1, 2, 4, 8, 16, 30).
     //   bit 0: a swap whose copy waited for the GPU's fence and saw it retired needs no refresh copies but the last (tick 30)
@@ -425,6 +441,17 @@ bool NativeGopDisplay::start(IOService *provider)
     PE_parse_boot_argn("piano-backlight", &backlight, sizeof(backlight));
     fBacklightCallout = backlight >= 2;
     PE_parse_boot_argn("native-gop-display-copy", &fCopyMode, sizeof(fCopyMode));
+    PE_parse_boot_argn("piano-dpu-pcc", &fDpuPcc, sizeof(fDpuPcc));
+    unsigned dpuPanel = 0;
+    PE_parse_boot_argn("piano-dpu-panel", &dpuPanel, sizeof(dpuPanel));
+    fDpuPanel = dpuPanel != 0;
+    char dpuRefresh[16] = {};
+    fDpuSwaps = PE_parse_boot_arg_str("piano-dpu-refresh", dpuRefresh, sizeof(dpuRefresh)) && !strcmp(dpuRefresh, "auto");
+    if (fDpuPcc || fDpuPanel || fDpuSwaps) {
+        fDpuSwapSymbol = OSSymbol::withCStringNoCopy("PianoDpuSwap");
+        IOLog("NativeGopDisplay: PianoDpu callouts:%s%s%s\n", fDpuPcc ? " colour matrices and gamma tables (piano-dpu-pcc)" : "",
+              fDpuPanel ? " display power (piano-dpu-panel)" : "", fDpuSwaps ? " frames shown (piano-dpu-refresh=auto)" : "");
+    }
     if (fCopyMode)
         IOLog("NativeGopDisplay: copy mode %#x:%s%s (native-gop-display-copy)\n", fCopyMode,
               fCopyMode & kCopyFencedRefresh ? " refresh copies only when no GPU fence covered the swap (and the last one)" : "",
@@ -521,6 +548,8 @@ void NativeGopDisplay::stop(IOService *provider)
     OSSafeReleaseNULL(fDpu);
     OSSafeReleaseNULL(fDpuFlipSymbol);
     OSSafeReleaseNULL(fFlipDone);
+    OSSafeReleaseNULL(fDpuSlices);
+    OSSafeReleaseNULL(fDpuSwapSymbol);
 }
 
 // Called by IOMobileFramebufferLegacy::start before it creates the default surface and registers the service (it tests bit 0).
@@ -726,8 +755,41 @@ IOReturn NativeGopDisplay::do_power_state_change_gated()
     fDisplayOn = on;
     at<uint32_t>(this, kHardwarePowered) = on;
     IOLog("NativeGopDisplay: display %s\n", on ? "on" : "off");
+    if (fDpuPanel) {   // the panel's light sleep (PianoDpu's thread; the backlight's request above goes first)
+        IOService *dpu = dpuService(true);
+        if (dpu)
+            dpu->callPlatformFunction("PianoDpuPanel", false, reinterpret_cast<void *>(uintptr_t(on)), nullptr, nullptr, nullptr);
+        else
+            IOLog("NativeGopDisplay: display %s: no PianoDpu service (piano-dpu-panel needs piano-dpu=1)\n", on ? "on" : "off");
+    }
     powerstate_notify(true, on);
     return kIOReturnSuccess;
+}
+
+// The PianoDpu service (piano-dpu-pcc / -panel / -refresh=auto only), looked up at once (now) or at most once a second (the swap
+// path), retained once found.
+IOService *NativeGopDisplay::dpuService(bool now)
+{
+    IOService *found = __atomic_load_n(&fDpuSlices, __ATOMIC_ACQUIRE);
+    if (found)
+        return found;
+    const uint64_t t = mach_absolute_time();
+    if (!now && t < fDpuSlicesLookupNext)
+        return nullptr;
+    uint64_t second = 0;
+    nanoseconds_to_absolutetime(1000000000ull, &second);
+    fDpuSlicesLookupNext = t + second;
+    OSDictionary *match = IOService::serviceMatching("PianoDpu");
+    IOService *dpu = match ? IOService::copyMatchingService(match) : nullptr;
+    OSSafeReleaseNULL(match);
+    if (!dpu)
+        return nullptr;
+    if (!__atomic_compare_exchange_n(&fDpuSlices, &found, dpu, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {   // another caller was first
+        dpu->release();
+        return found;
+    }
+    IOLog("NativeGopDisplay: PianoDpu service found: %s\n", dpu->getName());
+    return dpu;
 }
 
 // piano-backlight=2: every call, with both power states as they are (PianoBacklight logs their raw values, so an intermediate state
@@ -809,6 +871,11 @@ void NativeGopDisplay::program_hardware_gated()
         uint32_t fence = 0;
         const bool fenced = gpuFence(&fence);
         requestCopy(surface, false, fenced, fence, fFlipMode);
+        if (fDpuSwaps && fDpuSwapSymbol) {   // PianoDpu's refresh policy: a frame is shown
+            IOService *dpu = dpuService(false);
+            if (dpu)
+                dpu->callPlatformFunction(fDpuSwapSymbol, false, nullptr, nullptr, nullptr, nullptr);
+        }
         if (surface != fShown) {
             reinterpret_cast<OSObject *>(surface)->retain();
             if (fShown)
@@ -1515,7 +1582,33 @@ IOReturn NativeGopDisplay::surface_layer_map(IOMFB::AP::DisplayedData *, unsigne
 IOReturn NativeGopDisplay::surface_layer_unmap(IOMFB::AP::DisplayedData *, unsigned int) {return kIOReturnSuccess;}
 IOReturn NativeGopDisplay::set_display_device(unsigned int) {return kIOReturnSuccess;}
 IOReturn NativeGopDisplay::get_gamma_table(IOMFBGammaTable *) {return kIOReturnUnsupported;}
-IOReturn NativeGopDisplay::set_gamma_table(IOMFBGammaTable *) {return kIOReturnSuccess;}
+
+// piano-dpu-pcc: the gamma table's first 16 words logged when it changes (its layout is what B1d-0 is for) and the table handed to
+// PianoDpu; with piano-dpu-pcc=2 PianoDpu reads 771 words (3 x 257, the 0xc0c-byte layout DpuPcc.h assumes) and fits a diagonal.
+// Without the argument this is the stub it was (success, nothing done).
+IOReturn NativeGopDisplay::set_gamma_table(IOMFBGammaTable *table)
+{
+    if (!fDpuPcc || !table)
+        return kIOReturnSuccess;
+    const uint32_t *w = reinterpret_cast<const uint32_t *>(table);
+    const unsigned words = fDpuPcc >= 2 ? kGammaWords : 16;
+    uint32_t hash = 2166136261u;
+    for (unsigned i = 0; i < words; i++)
+        hash = (hash ^ w[i]) * 16777619u;
+    fGammaCalls++;
+    if (fGammaChanges && hash == fGammaHash)
+        return kIOReturnSuccess;
+    fGammaHash = hash;
+    if (++fGammaChanges <= 8 || fGammaChanges % 100 == 0)
+        IOLog("NativeGopDisplay: set_gamma_table #%u (call %u): %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x%s\n",
+              fGammaChanges, fGammaCalls, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13], w[14],
+              w[15], fDpuPcc >= 2 ? " (771 words handed over)" : "");
+    IOService *dpu = dpuService(true);
+    if (dpu)
+        dpu->callPlatformFunction("PianoDpuGammaTable", false, const_cast<uint32_t *>(w), reinterpret_cast<void *>(uintptr_t(fDpuPcc >= 2 ? kGammaWords : 0)),
+                                  nullptr, nullptr);
+    return kIOReturnSuccess;
+}
 IOReturn NativeGopDisplay::set_color_remap_mode(DisplayColorRemapMode mode)
 {
     fColorRemapMode = mode;
@@ -1526,7 +1619,32 @@ IOReturn NativeGopDisplay::get_color_remap_mode(DisplayColorRemapMode *mode) con
     *mode = fColorRemapMode;
     return kIOReturnSuccess;
 }
-IOReturn NativeGopDisplay::swap_set_color_matrix(IOMFBColorFixedMatrix *, IOMFBColorMatrixFunction, unsigned int) {return kIOReturnSuccess;}
+// piano-dpu-pcc: each new matrix of a function logged as its nine 64-bit words (taken to be S31.32, DpuPcc.h; B1d-0 checks that) and
+// handed to PianoDpu's PCC; the same matrix again (it may come with every swap) is only counted. Without the argument this is the
+// stub it was.
+IOReturn NativeGopDisplay::swap_set_color_matrix(IOMFBColorFixedMatrix *matrix, IOMFBColorMatrixFunction function, unsigned int arg)
+{
+    if (!fDpuPcc || !matrix)
+        return kIOReturnSuccess;
+    uint64_t raw[9];
+    memcpy(raw, matrix, sizeof(raw));
+    const uint32_t f = static_cast<uint32_t>(function), slot = f % kColorFunctions;
+    fColorCalls++;
+    if ((fColorSeen >> slot & 1) && fColorFunction[slot] == f && !memcmp(fColorLast[slot], raw, sizeof(raw)))
+        return kIOReturnSuccess;
+    fColorSeen |= 1u << slot;
+    fColorFunction[slot] = f;
+    memcpy(fColorLast[slot], raw, sizeof(raw));
+    if (++fColorChanges <= 16 || fColorChanges % 100 == 0)
+        IOLog("NativeGopDisplay: swap_set_color_matrix #%u (call %u): function %u arg %#x: %016llx %016llx %016llx | %016llx %016llx %016llx | "
+              "%016llx %016llx %016llx\n", fColorChanges, fColorCalls, f, arg, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+              raw[8]);
+    IOService *dpu = dpuService(true);
+    if (dpu)
+        dpu->callPlatformFunction("PianoDpuColorMatrix", false, raw, reinterpret_cast<void *>(uintptr_t(f)), reinterpret_cast<void *>(uintptr_t(arg)),
+                                  nullptr);
+    return kIOReturnSuccess;
+}
 
 // The slots IOMobileFramebufferLegacy leaves pure, as AppleParavirtDisplay implements them.
 IOReturn NativeGopDisplay::set_notify_tag_mask_gated(IOMFB_NotificationType type, IOMFBNotifyRequest *request, unsigned int mask)
