@@ -4,7 +4,7 @@
 
 三个公开仓库都在 GitHub 账号 [lenzhang](https://github.com/lenzhang) 下，全部公开。
 
-- [`UniXNU-piano`](https://github.com/lenzhang/UniXNU-piano) 是小米平板 8 Pro（代号 piano，SM8750）的**设备仓库**，也是当前主线：在 EL1 上原生启动 macOS。只做 `fastboot boot` **内存启动**，不刷写任何分区。
+- [`UniXNU-piano`](https://github.com/lenzhang/UniXNU-xiaomipad8pro) 是小米平板 8 Pro（代号 piano，SM8750）的**设备仓库**，也是当前主线：在 EL1 上原生启动 macOS。只做 `fastboot boot` **内存启动**，不刷写任何分区。
 - [`UniXNU-sm8750-common`](https://github.com/lenzhang/UniXNU-sm8750-common) 是骁龙 8 至尊版（SM8750）的**公共层占位仓库**。芯片通用代码暂时仍在 `UniXNU-piano` 里，稳定后再拆过来。注意：当前构建通过 `UniXNU-piano/feeds.toml` 钉住的是上游 [`IssacL04/UniXNU-sm8750-common`](https://github.com/IssacL04/UniXNU-sm8750-common)（OnePlus 13T 谱系）。这两个仓库不要混用，在拆分完成前不要改这个 pin。
 - [`veil`](https://github.com/lenzhang/veil) 存放已于 2026-11-10 冻结的精简 Linux + Gunyah 客户机路线的**公开归档**。完整的本地归档仍在本机 VM 时期工作目录的 `archive/gunyah-guest` 分支。主线请看 `UniXNU-piano`。
 - Ubuntu 的修复继续提交到上游 [`yzddmr6/xiaomipad-8pro-mainline`](https://github.com/yzddmr6/xiaomipad-8pro-mainline)（内核 [`yzddmr6/linux-sm8750-piano`](https://github.com/yzddmr6/linux-sm8750-piano)），不另建仓库。
@@ -18,7 +18,7 @@
 
 | Repository | Role | Status |
 | --- | --- | --- |
-| [lenzhang/UniXNU-piano](https://github.com/lenzhang/UniXNU-piano) | UniXNU **device** repository for the Xiaomi Pad 8 Pro (`piano`, SM8750). Panel, touch, charging, keys, DTS/ADT, boot-image packaging, RAM-boot scripts, and device docs. Current **main line**: native macOS at EL1 (Gunyah remains at EL2). | Active |
+| [lenzhang/UniXNU-xiaomipad8pro](https://github.com/lenzhang/UniXNU-xiaomipad8pro) | UniXNU **device** repository for the Xiaomi Pad 8 Pro (`piano`, SM8750). Panel, touch, charging, keys, DTS/ADT, boot-image packaging, RAM-boot scripts, and device docs. Current **main line**: native macOS at EL1 (Gunyah remains at EL2). | Active |
 | [lenzhang/UniXNU-sm8750-common](https://github.com/lenzhang/UniXNU-sm8750-common) | SM8750 **SoC common layer** (CPU topology, GIC/AIC, memory map, UEFI SoC drivers, XNU SoC patches), following the UniXNU-sm8550-common / UniXNU-sheng split. | Placeholder (README + layout only). Code still lives in `UniXNU-piano` until the split is stable. |
 | [lenzhang/veil](https://github.com/lenzhang/veil) | Thin Linux + Gunyah host / guest path (crosvm VM, macOS 27 guest on the Ubuntu host). | **FROZEN / ARCHIVED** as of 2026-11-10. Not the main line. |
 
@@ -61,7 +61,7 @@ Working copy (copies on other machines are not authoritative):
 
 ```
 ~/Downloads/XiaomiPad8Pro-Ubuntu/
-  UniXNU-piano/                 # device repo (this tree). Push only a secret/blob-audited history to lenzhang/UniXNU-piano
+  UniXNU-piano/                 # device repo (this tree). Push only a secret/blob-audited history to lenzhang/UniXNU-xiaomipad8pro
   UniXNU-sm8750-common/         # local checkout of the placeholder SoC repo
   veil/                         # local checkout of the curated public Gunyah archive
   <VM-era work tree>/           # the k27 tree (PIANO_K27_TREE) and the frozen Gunyah / thin-Linux work; branch archive/gunyah-guest
@@ -85,7 +85,7 @@ Build outputs (`UniXNU-piano/out/`, `build/`), signing keys (`private/`), vendor
 ## 5. Commit and push conventions
 
 - Commit device work in `UniXNU-piano` (the local tree on the owner's Mac). Prefer small, indicative subject lines in English (what changed, not “WIP”).
-- The GitHub `main` branch of `lenzhang/UniXNU-piano` is a **cleaned export**: home-LAN addresses and machine-local author emails were removed from history before the first public push. The original local `main` was not rewritten. Do not force-push the uncleaned local history to GitHub.
+- The GitHub `main` branch of `lenzhang/UniXNU-xiaomipad8pro` is a **cleaned export**: home-LAN addresses and machine-local author emails were removed from history before the first public push. The original local `main` was not rewritten. Do not force-push the uncleaned local history to GitHub.
 - Before every push to a public repository, audit the outgoing commits (worktree and history) for: passwords, tokens, keys, `private/`, SSH/NAS credentials, home-LAN IPs and hostnames, vendor firmware, partition dumps, Apple KC / IPSW payloads, and large `out/` artifacts. If a secret or blob is already in history, publish a cleaned export; never rewrite the original local repository.
 - Push only to the three repositories listed above (plus Ubuntu **upstream**). Do not publish `unixnu-research/`, backups, or rollback packs.
 - SoC-common code is not split yet. When it is, move it to `lenzhang/UniXNU-sm8750-common` in a dedicated change and then update `feeds.toml` / `unixnu.lock`.

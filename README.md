@@ -1,7 +1,8 @@
 # UniXNU-piano
 
 Native macOS 27 on the Xiaomi Pad 8 Pro (`piano`, Snapdragon 8 Elite SM8750), as a [UniXNU](https://github.com/UniXNU/UniXNU)
-device repository: https://github.com/lenzhang/UniXNU-piano. The k27 XNU kernel (XNU 27.0.1) runs as the HLOS at EL1, with
+device repository: https://github.com/lenzhang/UniXNU-xiaomipad8pro (formerly lenzhang/UniXNU-piano; the local
+checkout keeps the name UniXNU-piano). The k27 XNU kernel (XNU 27.0.1) runs as the HLOS at EL1, with
 Gunyah staying at EL2. Boot chain: ABL → BootShim → Mu-Silicium UEFI (the FD, piano-uefi's `pianoPkg` with this repository's
 deltas) → the UniXNU payload and menu → DarwinBoot → XNU. UniXNU core, Mu-Silicium, piano-uefi, DarwinBoot and the SoC module
 are pinned dependencies (`unixnu.lock`, `feeds.toml`), not forks.
