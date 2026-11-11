@@ -118,5 +118,30 @@ constexpr unsigned kThermPinCount = 5;
 constexpr ThermPin kThermPins[kThermPinCount] = {
     {"pm8550", 1, 2, true}, {"pm8550", 1, 3, true}, {"pm8550", 1, 4, true}, {"pmih0108", 7, 6, true}, {"pmih0108", 7, 12, false}};
 
+// A channel whose thermistor is on the firmware's pin counts only while that pin reads high-impedance, checked before each of its
+// conversions (reads only): the charger's (AMUX4_GPIO = PMIH0108 GPIO 12). Why (2026-11-12, queue5 P12): with the DSP's charger
+// firmware not started (piano-power below 2) the channel read 0x2f3e-0x2ded (22.6-21.8 kOhm, 59.5-60.8 C) at an idle board the
+// whole run, while the battery thermistor read the gauges' 32-35 C; with piano-power=2 the same channel read 60.4 C in the rounds
+// before the DSP booted and 32.3 C from the first round after it (the battery's 33.5 C). The decode is right (the battery's code
+// gives the gauges' temperature); the node is loaded until that firmware takes its pin. Inferred, not yet read (the console cut
+// the pin's state off the start line): the pin's reset state, e.g. an enabled digital input with a 10 uA pull-down, which with the
+// thermistor at the battery's 70 kOhm and a 1.8 V reference would read within 1 % of the code seen.
+struct PinGate {
+  const char *channel;   // kChannels name
+  unsigned pin;          // kThermPins index
+};
+constexpr unsigned kPinGateCount = 1;
+constexpr PinGate kPinGates[kPinGateCount] = {{"charger", 4}};
+// The kThermPins index that gates channel `ch`, or -1.
+constexpr int gatePin(unsigned ch)
+{
+  for (const PinGate &g : kPinGates)
+    if (channelIndex(g.channel) == int(ch)) return int(g.pin);
+  return -1;
+}
+static_assert(gatePin(unsigned(roleIndex(Role::charger))) == 4 && kThermPins[4].sid == 7 && kThermPins[4].gpio == 12 &&
+                  !kThermPins[4].inDt && kChannels[roleIndex(Role::charger)].channel() == 0x4d,
+              "the charger thermistor is on PMIH0108 GPIO 12 (AMUX4_GPIO), the firmware's pin");
+
 }  // namespace pianothermal::adc
 #endif

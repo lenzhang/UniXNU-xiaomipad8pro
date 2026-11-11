@@ -78,10 +78,11 @@ constexpr bool writable(unsigned reg, unsigned bytes)
   return true;
 }
 
-// The thermistor pins (read only): PMIC GPIO n is peripheral 0x88 + n - 1; TYPE 0x04 = 0x10; MODE_CTL 0x40; EN_CTL 0x46, bit 7 the
-// master enable (clear = high-impedance, the DT's bias-high-impedance; Linux pinctrl-spmi-gpio.c, the specification only).
-constexpr uint8_t kGpioPeriphBase = 0x88, kGpioRegType = 0x04, kGpioRegMode = 0x40, kGpioRegEn = 0x46, kGpioType = 0x10,
-                  kGpioMasterEn = 0x80;
+// The thermistor pins (read only): PMIC GPIO n is peripheral 0x88 + n - 1; TYPE 0x04 = 0x10; MODE_CTL 0x40; DIG_PULL_CTL 0x42 (shown
+// only); EN_CTL 0x46, bit 7 the master enable (clear = high-impedance, the DT's bias-high-impedance; Linux pinctrl-spmi-gpio.c, the
+// specification only).
+constexpr uint8_t kGpioPeriphBase = 0x88, kGpioRegType = 0x04, kGpioRegMode = 0x40, kGpioRegPull = 0x42, kGpioRegEn = 0x46,
+                  kGpioType = 0x10, kGpioMasterEn = 0x80;
 constexpr uint16_t gpioPpid(uint8_t sid, uint8_t gpio) { return uint16_t(uint16_t(sid) << 8 | uint16_t(kGpioPeriphBase + gpio - 1)); }
 
 // The plausible range of a board reading: the part's rated range. Outside: the channel is disabled (a broken or absent sensor).
@@ -283,8 +284,14 @@ struct Survey {
 struct PinState {
   int apid = -1;
   Err err = Err::none;
-  uint8_t type = 0, mode = 0, en = 0;
+  uint8_t type = 0, mode = 0, pull = 0, en = 0;
   bool highZ() const { return !(en & kGpioMasterEn); }
+  // A reading on this pin counts: it read, and it is high-impedance.
+  bool clear() const { return err == Err::none && highZ(); }
+  bool same(const PinState &o) const
+  {
+    return apid == o.apid && err == o.err && type == o.type && mode == o.mode && pull == o.pull && en == o.en;
+  }
 };
 
 class Adc {
@@ -341,6 +348,7 @@ class Adc {
     }
     if ((s.err = bus.readApid(a.apid, kGpioRegType, &s.type, 1)) != Err::none) return s;
     if ((s.err = bus.readApid(a.apid, kGpioRegMode, &s.mode, 1)) != Err::none) return s;
+    if ((s.err = bus.readApid(a.apid, kGpioRegPull, &s.pull, 1)) != Err::none) return s;
     s.err = bus.readApid(a.apid, kGpioRegEn, &s.en, 1);
     return s;
   }
@@ -454,12 +462,19 @@ class Adc {
 struct ChannelState {
   bool enabled = true, valid = false;
   Err err = Err::none;     // why it is disabled
-  Reading last{};          // the last good reading (valid), or what the failing conversion read
+  Reading last{};          // the last good reading (valid), or what the failing conversion read (or the one its pin held out)
   uint64_t atUs = 0;       // when `last` was taken
   uint32_t ok = 0;
+  // A channel on the firmware's pin (AdcChannels.h gatePin): the pin as read before this round's conversion, whether that read
+  // differs from the round before (the first read counts as a change), and how many good conversions the pin held out.
+  PinState pin{};
+  bool pinRead = false, pinChanged = false, pinHeld = false;
+  uint32_t held = 0;
 };
 
-// Every enabled channel once. A channel error disables that channel; a global error stops the ADC and so disables them all.
+// Every enabled channel once. A channel error disables that channel; a global error stops the ADC and so disables them all. A
+// channel on the firmware's pin is converted as any other, but its reading counts (valid) only while that pin, read just before,
+// is high-impedance; otherwise it stays enabled, not valid, and is tried again next round.
 class Board {
  public:
   Adc adc;
@@ -495,13 +510,22 @@ class Board {
         stopAll(adc.stopped);
         break;
       }
+      const int g = gatePin(i);
+      if (g >= 0) {
+        const PinState p = adc.readPin(kThermPins[g]);
+        s.pinChanged = !s.pinRead || !p.same(s.pin);
+        s.pin = p;
+        s.pinRead = true;
+      }
       Reading r;
       const Err e = adc.convert(kChannels[i], r);
       if (e == Err::none) {
         s.last = r;
-        s.valid = true;
+        s.pinHeld = g >= 0 && !s.pin.clear();
+        s.valid = !s.pinHeld;
         s.atUs = adc.bus.io.nowUs(adc.bus.io.ctx);
-        ++s.ok;
+        if (s.pinHeld) ++s.held;
+        else ++s.ok;
         continue;
       }
       s.enabled = s.valid = false;

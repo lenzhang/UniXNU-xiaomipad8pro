@@ -276,6 +276,10 @@ class PianoPower : public IOService {
   uint64_t fThermalLookupMs = 0;
   bool fThermalNoted = false;
   uint32_t fBoardStateShown = ~0u, fBoardValidShown = ~0u;
+  uint64_t fPdUpMs = 0;                       // when charger_pd was seen coming up (the charger thermistor counts from then)
+  uint64_t fChargerEarlyNotedMs = ~0ull;      // the fPdUpMs whose too-early charger reading was logged
+  uint32_t fPdUpsSeen = 0;
+  bool fPdWasUp = false;
   IOPMDriverAssertionID fHoldId = 0;
   bool fHoldOn = false, fHoldFailed = false;
   volatile uint32_t fSleepAsk = 0, fShutdownAsk = 0, fShutdownDone = 0, fWakes = 0;
@@ -1114,6 +1118,10 @@ void PianoPower::stepPolicy(uint64_t now)
   v.nowMs = now;
   uint32_t ups = 0;
   v.chargerPdUp = reachable && piano_qrtr_charger_pd(&ups) == SERVREG_STATE_UP;
+  if (v.chargerPdUp && (!fPdWasUp || ups != fPdUpsSeen)) fPdUpMs = now;   // up now, or up again since (a DSP restart)
+  fPdWasUp = v.chargerPdUp;
+  fPdUpsSeen = ups;
+  v.chargerPdUpMs = fPdUpMs;
   v.packs = fPack;
   v.packsFresh = fGauges && fPackMs && now - fPackMs <= 3ull * gArgs.period * 1000;
   v.wakes = __atomic_load_n(&fWakes, __ATOMIC_ACQUIRE);
@@ -1128,6 +1136,13 @@ void PianoPower::stepPolicy(uint64_t now)
       v.port = &port;
     }
     if (boardTemps(board, now)) v.board = &board;
+    if (v.board && (board.valid & (1u << PIANO_BOARD_TEMP_CHARGER)) && v.chargerPdUp && !ChargeLink::chargerReadingCounts(v) &&
+        fPdUpMs != fChargerEarlyNotedMs) {
+      fChargerEarlyNotedMs = fPdUpMs;
+      note("policy: the charger thermistor's reading (%d C) was taken %u ms before charger_pd came up: not used until a reading after "
+           "it (the DSP firmware's pin)", int(board.milli_c[PIANO_BOARD_TEMP_CHARGER] / 1000),
+           unsigned(board.age_ms[PIANO_BOARD_TEMP_CHARGER] > now - fPdUpMs ? board.age_ms[PIANO_BOARD_TEMP_CHARGER] - (now - fPdUpMs) : 0));
+    }
   }
   LinkOutcome o;
   if (reachable) fLink.step(fMca, v, o);

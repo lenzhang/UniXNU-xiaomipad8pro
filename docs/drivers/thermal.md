@@ -280,9 +280,9 @@ the specification only.
 | ADC | PMK8550 (SID 0) `adc@9000` "qcom,spmi-adc5-gen3", reg <0x9000 0x9100>: two SDAMs; SDAM 0 = PPID 0x090, its channel 0 does the immediate conversions; interrupts on peripherals 0x90/0x91 (not used: polled) | DT, G3 | verified (DT, source); needs-boot |
 | SDAM 0 bytes | 0x45 HS (0x01 ready, bit 7 busy), 0x46 STATUS1 (bit 7 fault, bit 0 EOC), 0x4a EOC_STS (bit 0 channel 0), 0x4b EOC_CLR, 0x4e CONV_ERR_CLR, 0x4f SID (bus [6:5], SID [4:0]), 0x50 PERPH_CH (bit 7 a conversion, else a status clear), 0x51 TIMER_SEL (1 immediate), 0x52 DIG_PARAM (calibration [5:4], decimation [3:2]), 0x53 FAST_AVG (bit 7 enable), 0x54 the ADC channel, 0x55 DELAY_CTL ([3:0] settle), 0x5c/0x5d the result, 0xe5 CONV_REQ (the SDAM's PBS trigger) | G3, `qcom-spmi-sdam.c` | verified (source) |
 | Encodings | decimation {85, 340, 1360} → 0..2; settle {15, 100, 200, 300, 400, 500, 600, 700, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000} µs → 0..15; one sample; calibration 1 = ratiometric | G3 | verified (source) |
-| Codes | Gen3 ratiometric: code = 2^14·R/(R + 100 k), 0x8000 = no data; Gen4: code = 0xffff·R/(R + 100 k), 0x8000 valid (mid-scale) | G3, VC (Gen4: Ubuntu's own K:5812ec75bb03) | Gen3 source-verified; **Gen4 needs-boot** |
+| Codes | Gen3 ratiometric: code = 2^14·R/(R + 100 k), 0x8000 = no data; Gen4: code = 0xffff·R/(R + 100 k), 0x8000 valid (mid-scale) | G3, VC (Gen4: Ubuntu's own K:5812ec75bb03) | Gen3 source-verified; Gen4 verified on the tablet 2026-11-12 (adc1: batt 0x699c = 70.2 kΩ = 32.6 °C against the gauges' 33.0 °C) |
 | Thermistors | 100 kΩ NTC to ground on a 100 kΩ pull-up inside the PMIC (the `*_100K_PU` channels), ratiometric, 1:1; Linux's curve is "NTCG104EF104" | DT, VC | verified (DT); the part from Linux |
-| Pins | PM8550 GPIO 2, 3, 4 and PMIH0108 GPIO 6 high-impedance (the ADC node's pinctrl); PMIH0108 GPIO 12 carries charger1_therm but belongs to another EE, which keeps it high-Z (KD's comment) | DT, KD | verified (source); read at start |
+| Pins | PM8550 GPIO 2, 3, 4 and PMIH0108 GPIO 6 high-impedance (the ADC node's pinctrl); PMIH0108 GPIO 12 carries charger1_therm but belongs to another EE, which keeps it high-Z (KD's comment) once its firmware runs: before the DSP's charger firmware starts the channel reads the pin's load, not the board (§12.10) | DT, KD; tablet 2026-11-12 | verified (source); the reading's dependence on the DSP verified on the tablet; the pin's state needs-boot (read at start and before each charger conversion) |
 | Zones | battery, charger1, conn, conn2, skin-msm, skin-quiet, xo, wifi, display, backlight, flash: `generic-adc-thermal`, no trips | DT | verified |
 
 The channel map (`AdcChannels.h`, in the board line's order; `check-adc-map.py` compares every column but the role with the DT):
@@ -414,9 +414,11 @@ Expected (numbers are examples; the codes match the temperatures shown):
 PianoThermal: adc: piano-thermal-adc=1: the PMIC ADC5 gen3 (PMK8550 SDAM 0x9000, PBS) for the 11 board thermistors, a round every 30 s; writes: ...
 PianoThermal: adc: spmi arbiter version 0x7..., N APIDs; SDAM 0x9000 (PPID 0x90): APID n (1 map entries), owner EE 0 (ours)
 PianoThermal: adc: SDAM 0x9000: type 0x.. subtype 0x.., size register 0x..; HS 0x1, STATUS1 0x0, EOC_STS 0x0, CONV_REQ 0x0; command bytes ... (idle)
-PianoThermal: adc: thermistor pins: pm8550 gpio2 high-Z (type 0x10, mode 0x.., en 0); ...; pmih0108 gpio12 (firmware's) high-Z (...);
+PianoThermal: adc: thermistor pins (DT): pm8550 gpio2 high-Z (mode 0, en 0); pm8550 gpio3 high-Z (mode 0, en 0); pm8550 gpio4 high-Z (mode 0, en 0); pmih0108 gpio6 high-Z (mode 0, en 0);
+PianoThermal: adc: thermistor pin (the firmware's): pmih0108 gpio12 high-Z (type 0x10, mode 0x.., pull 0x.., en 0); a reading on it counts only while it reads high-Z
 PianoThermal: adc: channels (DT reg, ADC): batt 0x744 g4, charger 0x74d g4, conn 0x747 g4, conn2 0x14b g3, msm 0x144 g3, ...
 PianoThermal: adc: running: a round every 30 s
+PianoThermal: [0s] adc: charger: pmih0108 gpio12 (the firmware's) high-Z (type 0x10, mode 0x.., pull 0x.., en 0): its thermistor counts
 PianoThermal: [0s] board: batt 31.2 C, charger 33.0 C, conn 30.1 C, conn2 30.4 C, msm 35.2 C, quiet 31.0 C, xo 36.0 C, wifi 34.1 C, display 33.3 C, backlight 33.8 C, flash 32.9 C
 PianoThermal: [0s] adc raw (code, kOhm): batt 0x6db6 74.9 charger 0x689f 69.1 conn 0x70e1 78.8 conn2 0x1c01 77.7 msm 0x18a5 62.6 ...
 PianoThermal: [0s] adc: round 1: 11 conversions, 0 failed, N us each on average, N us at most; 11 of 11 channels on; 0 stale status clears; N SPMI reads, 55 writes
@@ -438,7 +440,8 @@ interrupt); Gen4 channels far from their Gen3 neighbours while those are sane (t
 
 ### 12.9 Risks and open questions
 
-1. Gen4's full scale (0xffff) and 0x8000-is-valid come only from Ubuntu's own Gen4 patch; the first raw codes settle it.
+1. Gen4's full scale (0xffff) and 0x8000-is-valid come only from Ubuntu's own Gen4 patch. The full scale is settled (2026-11-12:
+   the batt code gives the gauges' temperature); 0x8000 as valid has not been seen yet.
 2. Polling instead of the interrupt: the PBS is expected to set EOC_STS whatever the interrupt enables (Linux's handler reads the
    same bit); unproven. Fallbacks: poll STATUS1 bit 0 as well (one line in `convert`), or the SDAM interrupt once the PDC/GIC
    helper lands. The SDAM may raise its interrupt at every EOC: nothing enables that APID's interrupt in the arbiter natively, and
@@ -454,6 +457,43 @@ interrupt); Gen4 channels far from their Gen3 neighbours while those are sane (t
    write rule; GPIO 12 is another EE's anyway).
 7. The PMICs' temp-alarm stages and the ADC's own threshold monitoring (ADC_TM, SDAM 1) stay unused; the latter would let the PBS
    watch a threshold without polling (a later step, after one good run).
+
+### 12.10 The charger thermistor and the DSP's pin (2026-11-12, queue5 P12)
+
+**Seen** (USB console, read only): with `piano-power=1` (the DSP's charger firmware never started; adc1) the charger channel read
+0x2f3e-0x2ded, 22.6-21.8 kΩ, **59.5-60.8 °C** at an idle board for the whole run, while batt read 32.6-34.6 °C against the gauges'
+33.0-36.7 °C. With `piano-power=2` (powerP2) the same channel read 60.4 °C in the [7s] and [37s] rounds, the DSP booted right after
+the [37s] round, and the [67s] round read **32.3 °C** (batt 33.5 °C), 32-33 °C from then on. PianoPower's `board temperatures
+running, valid 0xf: ... charger 32` line came after the [67s] round: both drivers read the same snapshot and agreed at every
+moment; what looked like a disagreement was the time of the reading. The decode, pull-up and scaling are right (the batt channel,
+same ADC and pull-up, gives the gauges' temperature); the channel map matches the DT (`check-adc-map.py`).
+
+**Inferred:** PMIH0108 GPIO 12 (another EE's, left out of the DT's pinctrl) is set high-impedance by the DSP's charger firmware when
+it starts; before that the pin loads the thermistor node, e.g. in its reset state as an enabled digital input with a 10 µA
+pull-down, which with the thermistor at the battery's 70 kΩ and a 1.8 V reference reads within 1 % of the code seen. The pin's
+state was never on the console: the start line listed five pins and the console cuts a line at 255 characters, right before
+GPIO 12's state.
+
+**Fix:**
+- PianoThermal (`AdcChannels.h` `kPinGates`, `PmicAdc.h` `Board::round`): GPIO 12 is read (TYPE, MODE_CTL, DIG_PULL_CTL, EN_CTL; reads
+  only) before each charger conversion, and the reading counts only while the pin reads high-Z; otherwise the channel stays
+  enabled, not valid (the API's valid bit 1 clear, `BoardAdc` `held: ...`, the board line `charger - (gpio12)`, the raw line the
+  code with `(pin)`), tried again next round. Each change of the pin's state is a line. The firmware's pin has its own start line.
+  Host-tested (`adc_host`: the pin enabled with the tablet's code 0x2f3e held out, then high-Z counted, then unreadable held out).
+- PianoPower (`ChargeLink.h` `chargerReadingCounts`): the charger thermistor joins the rules only from a reading taken after
+  charger_pd came up (each up again moves the mark): independent of the pin inference. A dropped reading is logged once per up
+  (`policy: the charger thermistor's reading (N C) was taken N ms before charger_pd came up: not used ...`). Host-tested
+  (`power_host`: an 86 °C reading older than the up does not cut the input, the next one does).
+
+Lines:
+```
+PianoThermal: adc: thermistor pin (the firmware's): pmih0108 gpio12 ENABLED (type 0x10, mode 0x.., pull 0x.., en 0x80); a reading on it counts only while it reads high-Z
+PianoThermal: [7s] adc: charger: pmih0108 gpio12 (the firmware's) ENABLED (...): its thermistor reads the pin's load, not the board: not valid (the DSP's charger firmware takes the pin)
+PianoThermal: [7s] board: batt 33.7 C, charger - (gpio12), conn 27.4 C, ...
+PianoThermal: [67s] adc: charger: pmih0108 gpio12 (the firmware's) high-Z (...): its thermistor counts
+```
+A pin that reads high-Z while the channel still reads ~60 °C before the DSP is up disproves the inference (then PianoPower's mark
+is what keeps the rule off it; report the pin line and the raw codes).
 
 ## 13. The uplow interrupt: `piano-thermal-irq=1`
 

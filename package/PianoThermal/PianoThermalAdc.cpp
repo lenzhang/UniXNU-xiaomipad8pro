@@ -6,6 +6,8 @@
 //                        round: one conversion of each of the eleven board thermistors (AdcChannels.h, PmicAdc.h), the console
 //                        line "[Ns] board: batt 31.2 C, charger 33.0 C, ...", the properties BoardTemperaturesDeciC, BoardAdc and
 //                        BoardAdcState, and the snapshot piano_thermal_board_temps() answers from. The first round logs raw codes.
+//                        The charger's reading counts only while its pin, the firmware's PMIH0108 GPIO 12, reads high-impedance
+//                        (read before each of its conversions; a line at each change of it: AdcChannels.h kPinGates).
 //   piano-thermal-adc=2  the same, the raw codes every round.
 // Writes: PmicAdc.h's allowlist (SDAM 0's conversion bytes) through the read/write channel page of that SDAM's APID, mapped only
 // after the owner table gave that APID to EE 0. No other PMIC register and no arbiter core/cnfg register is ever stored to.
@@ -192,7 +194,10 @@ void boardLine()
   for (unsigned i = 0; i < kChannelCount; ++i) {
     const ChannelState &c = gBoard.ch[i];
     if (c.valid) at = catf(line, sizeof line, at, "%s %s %s C", i ? "," : "", kChannels[i].name, Tenths(c.last.milliC).s);
-    else at = catf(line, sizeof line, at, "%s %s off", i ? "," : "", kChannels[i].name);
+    else if (c.enabled && c.pinHeld) {   // a reading of the pin's own load, not the board's: not shown as a temperature
+      const int g = gatePin(i);
+      at = catf(line, sizeof line, at, "%s %s - (gpio%u)", i ? "," : "", kChannels[i].name, g >= 0 ? kThermPins[g].gpio : 0u);
+    } else at = catf(line, sizeof line, at, "%s %s off", i ? "," : "", kChannels[i].name);
   }
   note("%s", line);
 }
@@ -203,12 +208,37 @@ void rawLine()
   int at = snprintf(line, sizeof line, "[%us] adc raw (code, kOhm):", upS());
   for (unsigned i = 0; i < kChannelCount; ++i) {
     const ChannelState &c = gBoard.ch[i];
-    if (c.valid)
-      at = catf(line, sizeof line, at, " %s %#x %llu.%llu", kChannels[i].name, c.last.code, (unsigned long long)(c.last.ohms / 1000),
-                (unsigned long long)(c.last.ohms % 1000 / 100));
+    if (c.valid || (c.enabled && c.pinHeld))
+      at = catf(line, sizeof line, at, " %s %#x %llu.%llu%s", kChannels[i].name, c.last.code, (unsigned long long)(c.last.ohms / 1000),
+                (unsigned long long)(c.last.ohms % 1000 / 100), c.valid ? "" : "(pin)");
     else at = catf(line, sizeof line, at, " %s %#x(off)", kChannels[i].name, c.last.code);
   }
   note("%s", line);
+}
+
+// A pin's state as "high-Z (type 0x10, mode 0, pull 0x5, en 0)" (or its read error).
+int pinText(char *line, size_t size, int at, const PinState &p)
+{
+  if (p.err != Err::none) return catf(line, size, at, "not readable (%s)", errName(p.err));
+  return catf(line, size, at, "%s (type %#x, mode %#x, pull %#x, en %#x)", p.highZ() ? "high-Z" : "ENABLED", p.type, p.mode, p.pull, p.en);
+}
+
+// The firmware's pin under a channel, when the round found it changed (the first round always): whether that channel counts now.
+void pinLines()
+{
+  for (unsigned i = 0; i < kChannelCount; ++i) {
+    const ChannelState &c = gBoard.ch[i];
+    const int g = gatePin(i);
+    if (g < 0 || !c.pinRead || !c.pinChanged) continue;
+    char line[480];
+    int at = snprintf(line, sizeof line, "[%us] adc: %s: %s gpio%u (the firmware's) ", upS(), kChannels[i].name, kThermPins[g].pmic,
+                      kThermPins[g].gpio);
+    at = pinText(line, sizeof line, at, c.pin);
+    catf(line, sizeof line, at, "%s", c.pin.clear() ? ": its thermistor counts"
+         : c.pin.err != Err::none ? ": its thermistor is not valid while the pin does not read"
+         : ": its thermistor reads the pin's load, not the board: not valid (the DSP's charger firmware takes the pin)");
+    note("%s", line);
+  }
 }
 
 void eventLines()
@@ -251,7 +281,8 @@ void publishProperties(uint32_t state)
         }
       }
       char why[96];
-      if (c.enabled) snprintf(why, sizeof why, "%s", c.valid ? "ok" : "no reading yet");
+      if (c.enabled && c.pinHeld) snprintf(why, sizeof why, "held: its pin (the firmware's) is not high-impedance");
+      else if (c.enabled) snprintf(why, sizeof why, "%s", c.valid ? "ok" : "no reading yet");
       else snprintf(why, sizeof why, "off: %s", errName(c.err));
       if (OSString *s = OSString::withCString(why)) {
         status->setObject(kChannels[i].name, s);
@@ -308,20 +339,30 @@ bool attach()
        s.type, s.subtype, s.size, s.hs, s.status1, s.eoc, s.convReq, s.command[0], s.command[1], s.command[2], s.command[3],
        s.command[4], s.command[5], s.command[6],
        s.hs == kHsReady && !s.convReq ? " (idle)" : " (BUSY or not an ADC SDAM: the first conversion waits up to 20 ms)");
+  // The DT's pins on one line, the firmware's on its own (the console cuts a line at 255 characters: before 2026-11-12 GPIO 12's
+  // state never showed). The firmware's pin is read again before each conversion on it (pinLines).
   char line[480];
-  int at = snprintf(line, sizeof line, "adc: thermistor pins:");
+  int at = snprintf(line, sizeof line, "adc: thermistor pins (DT):");
   unsigned driven = 0;
   for (unsigned i = 0; i < kThermPinCount; ++i) {
+    if (!kThermPins[i].inDt) continue;
     const PinState p = a.readPin(kThermPins[i]);
     if (p.err != Err::none) at = catf(line, sizeof line, at, " %s gpio%u %s;", kThermPins[i].pmic, kThermPins[i].gpio, errName(p.err));
     else {
       driven += !p.highZ();
-      at = catf(line, sizeof line, at, " %s gpio%u%s %s (type %#x, mode %#x, en %#x);", kThermPins[i].pmic, kThermPins[i].gpio,
-                kThermPins[i].inDt ? "" : " (firmware's)", p.highZ() ? "high-Z" : "ENABLED", p.type, p.mode, p.en);
+      at = catf(line, sizeof line, at, " %s gpio%u %s (mode %#x, en %#x);", kThermPins[i].pmic, kThermPins[i].gpio,
+                p.highZ() ? "high-Z" : "ENABLED", p.mode, p.en);
     }
   }
-  if (driven) catf(line, sizeof line, at, " %u pin(s) not high-impedance: the thermistor on it may read wrong (not changed)", driven);
+  if (driven) catf(line, sizeof line, at, " %u not high-Z (not changed)", driven);
   note("%s", line);
+  for (unsigned i = 0; i < kThermPinCount; ++i) {
+    if (kThermPins[i].inDt) continue;
+    at = snprintf(line, sizeof line, "adc: thermistor pin (the firmware's): %s gpio%u ", kThermPins[i].pmic, kThermPins[i].gpio);
+    at = pinText(line, sizeof line, at, a.readPin(kThermPins[i]));
+    catf(line, sizeof line, at, "; a reading on it counts only while it reads high-Z");
+    note("%s", line);
+  }
   at = snprintf(line, sizeof line, "adc: channels (DT reg, ADC):");
   for (unsigned i = 0; i < kChannelCount; ++i)
     at = catf(line, sizeof line, at, "%s %s %#x %s", i ? "," : "", kChannels[i].name, kChannels[i].reg,
@@ -348,6 +389,7 @@ void adcThread(void *, wait_result_t)
     }
     const uint64_t t0 = nowNs();
     gBoard.round();
+    pinLines();
     boardLine();
     if (gBoard.rounds == 1 || gHook.level >= 2) rawLine();
     eventLines();

@@ -824,7 +824,7 @@ struct LinkRig {
   piano_board_temps board{};
   bool havePort = true, haveBoard = false, pdUp = true, packsFresh = true, sleep = false, shutdown = false;
   uint32_t wakes = 0;
-  uint64_t now = 0;
+  uint64_t now = 0, pdUpMs = 0;       // pdUpMs: when charger_pd came up (LinkView.chargerPdUpMs)
   unsigned relinks = 0, handoverReady = 0, refused = 0, waitingPd = 0, waitingBoard = 0;
   uint32_t events = 0;              // every decision's events since the last take()
   std::vector<LinkReadback> readbacks;
@@ -879,6 +879,7 @@ struct LinkRig {
     LinkView v;
     v.nowMs = now;
     v.chargerPdUp = pdUp;
+    v.chargerPdUpMs = pdUpMs;
     v.packs = packs;
     v.packsFresh = packsFresh;
     v.port = havePort ? &port : nullptr;
@@ -1282,8 +1283,16 @@ static void testLinkThermal()
   r.temps(30, 33, 45, 44);
   r.period();
   CHECK((r.take() & PIANO_CHG_EV_CONN_COOL) && r.d.last(PIANO_MCA_ICL) == 1600);
-  // the charger at 86 C: 500 mA at most until below 75
+  // a charger reading taken before charger_pd came up (the DSP firmware's pin not yet set: queue5 P12) is not used, however hot;
+  // the next one, after it, is
+  r.pdUpMs = r.now;
   r.temps(30, 86, 40, 40);
+  r.board.age_ms[PIANO_BOARD_TEMP_CHARGER] = 60000;
+  r.period();
+  CHECK(!(r.take() & PIANO_CHG_EV_CHGR_HOT) && r.d.last(PIANO_MCA_ICL) == 1600 && r.link.plan.icl_why != PIANO_CHG_ICL_CHGR);
+  CHECK(!(r.link.in.valid & PIANO_CHG_IN_CHGR) && (r.link.in.valid & PIANO_CHG_IN_CONN1));   // only the charger's is left out
+  // the charger at 86 C: 500 mA at most until below 75
+  r.board.age_ms[PIANO_BOARD_TEMP_CHARGER] = 0;
   r.period();
   CHECK((r.take() & PIANO_CHG_EV_CHGR_HOT) && r.d.last(PIANO_MCA_ICL) == 500);
   r.temps(30, 76, 40, 40);

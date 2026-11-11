@@ -38,6 +38,7 @@ struct LinkOptions {
 struct LinkView {
   uint64_t nowMs = 0;
   bool chargerPdUp = false;                   // msm/adsp/charger_pd reports up (PianoQrtr.c's servreg listener)
+  uint64_t chargerPdUpMs = 0;                 // when it was seen coming up (nowMs's clock; each up again moves it)
   const GaugeReading *packs = nullptr;        // the two packs' last reading, or none
   bool packsFresh = false;                    // that reading is recent enough to decide with
   const PortState *port = nullptr;            // the charger PMIC's Type-C block, or not readable
@@ -106,6 +107,14 @@ class ChargeLink {
     piano_mca_use_external_policy(&m, cfg.limit, cfg.hv >= 2);
   }
 
+  // The charger thermistor's reading was taken while charger_pd was up (at or after it came up this time).
+  static bool chargerReadingCounts(const LinkView &v)
+  {
+    if (!v.chargerPdUp || !v.board) return false;
+    const uint64_t age = v.board->age_ms[PIANO_BOARD_TEMP_CHARGER];
+    return age <= v.nowMs && v.nowMs - age >= v.chargerPdUpMs;
+  }
+
   static void fill(PianoChargeInput &x, const PianoMca &m, const LinkView &v)
   {
     x = PianoChargeInput();
@@ -143,7 +152,10 @@ class ChargeLink {
       x.typec_source = v.port->sourceSeen ? 1 : 0;
       x.rp_ma = v.port->sourceSeen ? rpMilliamps(v.port->rpBits) : 0;
     }
-    // PianoThermal's: each temperature only with its valid bit (missing = unknown, never cool)
+    // PianoThermal's: each temperature only with its valid bit (missing = unknown, never cool). The charger thermistor only from a
+    // reading taken after charger_pd came up: its pin is the DSP firmware's, and before that firmware runs the channel reads the
+    // pin's load (59.5-60.8 C at an idle board, 2026-11-12 queue5 P12; PianoThermal also holds it out while the pin is not
+    // high-impedance, AdcChannels.h kPinGates).
     if (v.board && v.board->version == PIANO_BOARD_TEMPS_VERSION) {
       static const struct {unsigned index; uint32_t bit;} kMap[] = {
           {PIANO_BOARD_TEMP_BATTERY, PIANO_CHG_IN_NTC}, {PIANO_BOARD_TEMP_CHARGER, PIANO_CHG_IN_CHGR},
@@ -151,6 +163,7 @@ class ChargeLink {
       int32_t *const dst[] = {&x.t_ntc_dc, &x.t_chgr_dc, &x.t_conn1_dc, &x.t_conn2_dc};
       for (unsigned i = 0; i < 4; ++i) {
         if (!(v.board->valid & (1u << kMap[i].index))) continue;
+        if (kMap[i].index == PIANO_BOARD_TEMP_CHARGER && !chargerReadingCounts(v)) continue;
         x.valid |= kMap[i].bit;
         *dst[i] = milliToDeci(v.board->milli_c[kMap[i].index]);
       }

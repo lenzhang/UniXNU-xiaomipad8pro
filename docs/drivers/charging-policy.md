@@ -62,7 +62,7 @@ bit; a missing one is unknown, never cool. They only ever make charging more con
 |---|---|---|
 | battery (`batt`) | joins t above as a third reading (the warmest and the coolest of all); more than 10 °C from the packs: `NTC_APART`, logged once per episode | — |
 | connector (`conn`, `conn2`) | either at 60 °C or more: input limit **100 mA** (the input current heats the contact) | both read below 50 °C (one that stops reading keeps the hold) |
-| charger (`charger1`) | 85 °C or more: input limit **500 mA** at most | it reads below 75 °C |
+| charger (`charger1`) | 85 °C or more: input limit **500 mA** at most; only a reading taken after charger_pd came up (its pin is the DSP firmware's: before it runs the channel reads ~60 °C at an idle board, [thermal.md](thermal.md) §12.10) | it reads below 75 °C |
 
 **The Type-C current** (`piano-power-rp=1`, §13): a source without a PD contract (SDP, CDP, DCP, float, Type-C) whose Rp advertises
 1.5 A or 3.0 A gets min(Rp, ceiling) when that is above its row; only while a connector thermistor reads and every one that reads is

@@ -661,6 +661,57 @@ static void testBoardTemps()
   CHECK(fillBoardTemps(snapshotOf(b, 30000), m.now, &t) == 0 && t.state == PIANO_BOARD_TEMPS_STOPPED && t.disabled == 0xf);
 }
 
+// The charger thermistor on the firmware's pin (PMIH0108 GPIO 12): counted only while the pin reads high-Z (queue5 P12: 22.6 kOhm,
+// "59.5 C", until the DSP's charger firmware took the pin).
+static void testPinGate()
+{
+  CHECK(gatePin(unsigned(channelIndex("charger"))) == 4 && gatePin(unsigned(channelIndex("batt"))) < 0 &&
+        gatePin(unsigned(channelIndex("conn2"))) < 0);
+  Model m;
+  Board b;
+  CHECK(attach(b, m) == Err::none);
+  const unsigned chg = unsigned(channelIndex("charger"));
+  const uint16_t chgKey = Model::key(kChannels[chg]);
+  piano_board_temps t{};
+  t.version = PIANO_BOARD_TEMPS_VERSION;
+  // the pin enabled (its reset state, inferred): the code of the tablet's idle board, a reading that does not count
+  m.pages[0x793][kGpioRegEn] = kGpioMasterEn;
+  m.pages[0x793][kGpioRegPull] = 0x4;
+  m.forcedCode[chgKey] = 0x2f3e;
+  b.round();
+  const ChannelState &c = b.ch[chg];
+  CHECK(b.eventCount == 0 && b.enabledCount() == kChannelCount && c.enabled && !c.valid && c.pinHeld && c.held == 1 && c.ok == 0);
+  CHECK(c.pinRead && c.pinChanged && c.pin.err == Err::none && !c.pin.highZ() && c.pin.pull == 0x4 && c.pin.type == kGpioType);
+  CHECK(c.last.code == 0x2f3e && c.last.ohms > 22500 && c.last.ohms < 22700 && c.last.milliC > 59000 && c.last.milliC < 60000);
+  Snapshot s = snapshotOf(b, 30000);
+  CHECK(!(s.validMask & (1u << chg)) && !(s.disabledMask & (1u << chg)));
+  CHECK(fillBoardTemps(s, m.now, &t) == 3 && !(t.valid & (1u << PIANO_BOARD_TEMP_CHARGER)) && t.milli_c[PIANO_BOARD_TEMP_CHARGER] == 0);
+  CHECK(!(t.disabled & (1u << PIANO_BOARD_TEMP_CHARGER)));   // held, not broken: tried again every round
+  for (unsigned i = 0; i < kChannelCount; ++i)
+    if (i != chg) CHECK(b.ch[i].valid && !b.ch[i].pinHeld && !b.ch[i].pinRead);   // only the gated channel reads a pin
+  // the same pin state again: no change to report
+  b.round();
+  CHECK(!c.valid && c.pinHeld && !c.pinChanged && c.held == 2);
+  // the firmware takes the pin (high-Z, no pull): the thermistor counts from this round
+  m.pages[0x793][kGpioRegEn] = 0;
+  m.pages[0x793][kGpioRegPull] = 0;
+  m.forcedCode.erase(chgKey);
+  m.temperature[chgKey] = 32300;
+  b.round();
+  CHECK(c.valid && !c.pinHeld && c.pinChanged && c.ok == 1 && c.held == 2 && std::abs(c.last.milliC - 32300) <= 20);
+  s = snapshotOf(b, 30000);
+  CHECK(fillBoardTemps(s, m.now, &t) == 4 && (t.valid & (1u << PIANO_BOARD_TEMP_CHARGER)) &&
+        std::abs(t.milli_c[PIANO_BOARD_TEMP_CHARGER] - 32300) <= 20);
+  b.round();
+  CHECK(c.valid && !c.pinChanged && c.ok == 2);
+  // the pin unreadable (no APID): not valid, still enabled, and a change to report
+  m.map[152] = 0;
+  b.round();
+  CHECK(c.enabled && !c.valid && c.pinHeld && c.pinChanged && c.pin.err == Err::noApid && b.eventCount == 0);
+  CHECK(fillBoardTemps(snapshotOf(b, 30000), m.now, &t) == 3 && !(t.valid & (1u << PIANO_BOARD_TEMP_CHARGER)));
+  CHECK(m.auditClean());   // the pin is only read
+}
+
 // ------------------------------------------------------------------------------------------------------------- printers
 static void printMap()
 {
@@ -705,6 +756,7 @@ int main(int argc, char **argv)
   testAdcErrors();
   testCodes();
   testBoardTemps();
+  testPinGate();
   if (failures) {
     std::printf("adc_host: %d FAILED\n", failures);
     return 1;
