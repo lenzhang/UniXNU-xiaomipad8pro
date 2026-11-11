@@ -7,7 +7,7 @@ level 4 the streams: the ambient light on change and the accelerometer at 10 Hz,
 consumer needs it, published as the properties §5 reserved (§5c). Host-tested (`tests/run-host-tests.py`: ASan/UBSan, synthetic inputs
 only, a simulated DSP and hub, the pack on an mtools FAT32 image and in a RAM image's addon, the kernel's no-FP/no-libc compile), compiled
 with the kernel's flags and **linked into the KC** (`configs/k27-native-kexts.txt`, after PianoPower and NativeUfs; the 2026-11-11
-link with level 4: PianoSensors 460 pointers among 21 native kexts, the native kext rule passed), inert without
+link with level 4: PianoSensors 461 pointers among 21 native kexts, the native kext rule passed), inert without
 `piano-sensors` (and level 4's parts below `piano-sensors=4`). **Not run on hardware.** Template: `README.md`. The macOS-side consumers
 (the rotation agent `piano-rotated`, PianoTouch's transform, PianoBacklight's automatic mode) and the streams' off/on lifecycle, which the
 kext now runs itself, are `package/PianoAuto`, host-tested (§5a).
@@ -444,18 +444,19 @@ own. Inert below `piano-sensors=4`: no stream port is opened, the kext does not 
 
 | Stream | Wanted while | Read from |
 |---|---|---|
-| light | a consumer (`piano-sensors-als`: 1, the default, PianoBacklight's automatic mode: `piano-backlight=2 piano-backlight-auto=1` and not manual by the user's choice, i.e. not its published `piano-backlight-auto` false once it has taken a target; 2 always; 0 never), the display on, the lid open, no system sleep | the boot arguments, PianoBacklight's properties, NativeGopDisplay's `piano-display-power` (published with `piano-backlight=2`; unknown counts as on), PianoKeyboard's `piano-keyboard-hall` (unknown counts as open) |
+| light | a consumer (`piano-sensors-als`: 1, the default, PianoBacklight's automatic mode: `piano-backlight=2 piano-backlight-auto=1` and not manual by the user's choice, i.e. not its published `piano-backlight-auto` false once it has taken a target; 2 always; 0 never), the display on, the lid open, no system sleep | the boot arguments, PianoBacklight's properties, NativeGopDisplay's `piano-display-power` (always published; unknown before the first counts as on), PianoKeyboard's `piano-keyboard-hall` (unknown counts as open) |
 | accel | a consumer (`piano-sensors-rotate`: 1, the default, piano-rotated reads the edge: `piano-rotate>=1` and not `piano-rotate-test=1`; 2 always; 0 never), the display on, the cover detached (`piano-keyboard-attached` not 1), no system sleep | the boot arguments, NativeGopDisplay, PianoKeyboard |
 
 The services are found by class (registered or not) every 2 s for two minutes, then every 30 s; their properties are read on each pass
-of the main thread. The rules are AutoStream's (Ubuntu's v1.1.1 fix as a rule, §3): one request outstanding per client; an enable
-never followed by a disable before its answer, nor a disable by an enable; the first event kept also when it overtakes the enable's
-answer, and marked so that the light starts afresh from it; events while off, while a disable is out or while the hub's state is
-unknown are dropped; no first event within 3 s: re-armed (disable, enable), at most twice per period of wanting; no answer within 2 s,
-or an error event (130): a failure and the hub's state unknown, so a disable goes first, then a fresh enable; failures back off 1 s
-doubling to 32 s, six in a row end the stream for the boot. Every request takes a token of the guard (§7 rule 4) and every outcome is
-told to it (a refusal at the port or by the hub, a missing answer and an error event are failures), so the guard's backoff paces the
-retries and its strikes end them; the guard itself is unchanged.
+of the main thread, and their property-change messages (NativeGopDisplay's display power, PianoKeyboard's cover and hall) wake it at
+once, so a wake's first light sample does not wait for the next poll. The rules are AutoStream's (Ubuntu's v1.1.1 fix as a rule, §3):
+one request outstanding per client; an enable never followed by a disable before its answer, nor a disable by an enable; the first event
+kept also when it overtakes the enable's answer, and marked so that the light starts afresh from it; events while off, while a disable
+is out or while the hub's state is unknown are dropped; no first event within 3 s: re-armed (disable, enable), at most twice per period
+of wanting; no answer within 2 s, or an error event (130): a failure and the hub's state unknown, so a disable goes first, then a fresh
+enable; failures back off 1 s doubling to 32 s, six in a row end the stream for the boot. Every request takes a token of the guard (§7
+rule 4) and every outcome is told to it (a refusal at the port or by the hub, a missing answer and an error event are failures), so the
+guard's backoff paces the retries and its strikes end them; the guard itself is unchanged.
 
 Outputs (§5's table): each light sample through `ps_als_step` (AutoLight: the first sample of every session at once, then the
 smoothing at most every 250 ms and only while it moves) into `piano-sensors-light-target`, the lux into `piano-sensors-lux` (with each
@@ -473,7 +474,8 @@ piano-rotated reads the edge on each sequence move or notification (§5a.2).
   disabled at the main thread's next pass after its condition goes.
 - Before every system sleep both are off (§5c.4); after the wake they start afresh only if wanted.
 - The main thread polls the conditions every 250 ms while the display is on or a stream is busy, every second at rest with the display
-  off; the engine itself keeps no timer at rest (a deadline only for an answer due, a first event due, a smoothing step).
+  off (the display's and the cover's change messages wake it at once); the engine itself keeps no timer at rest (a deadline only for an
+  answer due, a first event due, a smoothing step).
 - Stream on/off and failure lines go through a limiter per stream (8 lines, then one per 30 s, the lines left out counted in the next
   one); `piano-sensors-streams` keeps the complete counters.
 
@@ -531,7 +533,7 @@ The consumers' own arguments: `piano-rotate*` (the agent, §5a.2) and `piano-bac
 Component `PianoSensors` (`com.unixnu.driver.PianoSensors`, `tooling/k27/kext/PianoSensors.json` naming `com.unixnu.driver.PianoPower`
 and `com.unixnu.driver.NativeUfs` as libraries), listed after both in `configs/k27-native-kexts.txt`; built by
 `tooling/k27/build-native-piano-sensors.sh` (host tests, the copies of FatVolume and SmmuStream checked against their originals, the
-objects, the import check: 353 kernel imports, 9 from the libraries). Two threads (`piano-sensors`: health, guard, SNS client, the
+objects, the import check: 354 kernel imports, 9 from the libraries). Two threads (`piano-sensors`: health, guard, SNS client, the
 streams, properties; `piano-sensors-rpc`: the file service); PianoPower's callbacks only record and wake them. At level 4 the kext
 joins the power tree once its main thread runs (`setPowerState`, §5c.4). Rules (`SensorsGuard.c` and `SensorsHealth.h`, host-tested;
 level 4 adds none: its requests take the same tokens and count as the same failures, and after a strike it sends nothing more):
@@ -659,8 +661,7 @@ and `piano_qrtr_close` (§5c). Still open: NativeGopDisplay's transform (R2 only
    refused, until PianoBacklight publishes its last target; bounded, and shown as the consumer in `piano-sensors-streams`.
 2. Without PianoKeyboard the cover reads detached and the lid open: the accelerometer streams whenever the agent runs and the display
    is on; the batched test links PianoKeyboard.
-3. `piano-display-power` comes with `piano-backlight=2` only; without it the display counts as on (both streams then stop only with
-   their other conditions and the system sleep).
+3. Before NativeGopDisplay's first power change `piano-display-power` is absent and the display counts as on (as it is at boot).
 4. The sleep's fallback closes a port (DEL_CLIENT) when a disable is not answered within 800 ms; with PianoPower asking for quiet it
    does not, and the stream stays on through the sleep (logged): the hub's reports then wait in GLINK until the wake.
 5. The edge's axes and the light's placement are inferred (5a.9 risk 7); the rates the hub chooses are logged, not checked.
