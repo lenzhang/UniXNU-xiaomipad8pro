@@ -21,7 +21,11 @@
 //                    1785 / 1958), thermal limit on top (Cluster.h: Linux step_wise on the stock trips).
 //   piano-cpufreq=3  the governor (Governor.h): load-based per cluster every piano-cpufreq-tick-ms (100), caps on battery (Power Saver)
 //                    / on power (Balanced: 3532 / 4089) from the IOPMPowerSource's ExternalConnected (unknown = battery), thermal
-//                    limit on top.
+//                    limit on top. Its busy figure leaves out this thread's own time on each core (2026-11-12, P9), and the window
+//                    holding the per-core clock measurement makes no decision.
+// The thermal limit of modes 2 and 3 (Cluster.h) works on a hard ceiling since 2026-11-12: one level down per 10 ms while any cpu-*
+// sensor of the cluster is at piano-cpufreq-hot (default 90 C, never above the zone's stock passive trip; 0 = the stock trips),
+// whatever piano-thermal says.
 // piano-cpufreq >= 1 implies the level 1 readout (its thermal input). No clock, regulator or GDSC is voted by this kext.
 // Suspend hooks (piano_thermal_suspend_prepare/finish, below): the threshold interrupt masks across system suspend, the only TSENS
 // writes, and only when a caller asks: this service's setPowerState (in the power tree, docs/power.md 4) with
@@ -89,7 +93,8 @@ constexpr int kRbHalt = 0x08;                                                   
 
 struct Args {
   uint32_t level, cpufreq, shutdown, pollMs, logS, clock, srot, warmC, marginC, delay, sleepMask;
-  uint32_t cap[2], bat[2], ac[2], minMhz[2], hispeed[2], tickMs, fastMs, warmMs, warmPollC, fastMhz, gpuMhz, hotC, releaseC, cutC;
+  uint32_t cap[2], bat[2], ac[2], minMhz[2], hispeed[2], tickMs, fastMs, warmMs, warmPollC, fastMhz, fastTempC, clockMs, gpuMhz, hotC,
+      releaseC, cutC;
   bool capGiven[2];
 };
 // The panel's display power, followed through NativeGopDisplay's messages (package/include/PianoDisplayFollow.h): the clock line's rule.
@@ -149,17 +154,24 @@ void readArgs()
   gArgs.warmMs = clampU(bootArg("piano-thermal-warm-ms", 250), 10, 10000);
   gArgs.warmPollC = clampU(bootArg("piano-thermal-warm-poll", 70), 30, 104);
   gArgs.fastMhz = clampU(bootArg("piano-thermal-fast-mhz", 2500), 300, 5000);
+  // Above the fast-poll clock: 10 ms only from piano-thermal-fast-temp (70 C) up, else every piano-thermal-clock-ms (100: one tick of
+  // the governor, so no wakeup of its own while it governs). Cluster.h pollTier has the arithmetic.
+  gArgs.fastTempC = clampU(bootArg("piano-thermal-fast-temp", 70), 30, 104);
+  gArgs.clockMs = clampU(bootArg("piano-thermal-clock-ms", 100), 5, 100);
   gArgs.gpuMhz = clampU(bootArg("piano-thermal-gpu-mhz", 160), 100, 1100);   // the GPU ceiling at passive (160: the A830's floor)
-  // The cluster thermal limit's thresholds (Cluster.h): 0 = the stock DT's per zone (105 C or 118 C passive, 5 or 8 C hysteresis,
-  // critical 125 C - margin); given, absolute degrees C for every cpu-* zone.
-  gArgs.hotC = clampU(bootArg("piano-cpufreq-hot", 0), 0, 118);
-  gArgs.releaseC = clampU(bootArg("piano-cpufreq-release", gArgs.hotC ? gArgs.hotC - 5 : 0), 0, 118);
+  // The cluster thermal limit's thresholds (Cluster.h): the ceiling piano-cpufreq-hot, absolute degrees C for every cpu-* zone,
+  // default 90 C (2026-11-12, P9), each zone's stock passive trip (105 C or 118 C) when that is lower; 0 = the stock DT's per zone
+  // (105 C or 118 C passive, 5 or 8 C hysteresis). The release point piano-cpufreq-release (default: 5 C under the ceiling, or the
+  // zone's hysteresis with the stock trips); critical 125 C - margin unless piano-cpufreq-cut.
+  gArgs.hotC = clampU(bootArg("piano-cpufreq-hot", 90), 0, 118);
+  if (gArgs.hotC && gArgs.hotC < 40) gArgs.hotC = 40;
+  gArgs.releaseC = clampU(bootArg("piano-cpufreq-release", 0), 0, 118);
   gArgs.cutC = clampU(bootArg("piano-cpufreq-cut", 0), 0, 125);
   buildTrips();
 }
 
 ClusterTrips gTrips;
-char gTripsText[120];
+char gTripsText[160];
 
 void buildTrips()
 {
@@ -168,8 +180,9 @@ void buildTrips()
   gTrips.cutDeci = int32_t(gArgs.cutC) * 10;
   gTrips.marginDeci = int32_t(gArgs.marginC) * 10;
   if (gTrips.hotDeci)
-    snprintf(gTripsText, sizeof gTripsText, "one level down per %u ms at %u C, up per 1 s under %u C, slowest at %u C", gArgs.fastMs, gArgs.hotC,
-             gArgs.releaseC, gArgs.cutC ? gArgs.cutC : 125 - gArgs.marginC);
+    snprintf(gTripsText, sizeof gTripsText, "one level down per %u ms at %u C (the stock 105/118 C if lower), up per 1 s under %u C, "
+             "slowest at %u C", gArgs.fastMs, gArgs.hotC, gArgs.releaseC ? gArgs.releaseC : gArgs.hotC - 5,
+             gArgs.cutC ? gArgs.cutC : 125 - gArgs.marginC);
   else
     snprintf(gTripsText, sizeof gTripsText, "stock trips (cpu-* passive 105/118 C, hysteresis 5/8 C): one level down per %u ms, up "
              "per 1 s, slowest at %u C", gArgs.fastMs, gArgs.cutC ? gArgs.cutC : 125 - gArgs.marginC);
@@ -280,11 +293,25 @@ struct Cpu {
   unsigned id, domain;
   uint32_t phys;
   processor_t processor;
-  uint64_t idleTicks, atNs;
-  bool loadOk;
+  uint64_t selfNs;           // this thread's own time on the core (noteSelf), cumulative
+  CoreLoad load;             // the load window (Governor.h): idle and own time at the last reading
 };
 Cpu gCpus[kMaxCpus];
 unsigned gCpuCount;
+uint64_t gSelfNsTotal;       // this thread's own time on all cores, for the report
+bool gRebase;                // the next load reading only starts a window (the clock measurement ran in the last one)
+
+// This thread's own time (a poll's work, measured around it) on the core it ran on: taken out of that core's busy figure.
+void noteSelf(uint64_t ns)
+{
+  gSelfNsTotal += ns;
+  const unsigned me = unsigned(cpu_number());
+  for (unsigned i = 0; i < gCpuCount; ++i)
+    if (gCpus[i].id == me) {
+      gCpus[i].selfNs += ns;
+      return;
+    }
+}
 
 void readTopology()
 {
@@ -296,9 +323,8 @@ void readTopology()
     c.phys = t->cpus[i].phys_id;
     c.domain = (c.phys >> 16) & 0xff;   // MPIDR Aff2: cluster 0 = cpu0-5 (domain 0), cluster 1 = cpu6-7 (domain 1)
     c.processor = cpu_to_processor(int(c.id));
-    c.idleTicks = 0;
-    c.atNs = 0;
-    c.loadOk = false;
+    c.selfNs = 0;
+    c.load = CoreLoad();
   }
 }
 
@@ -322,7 +348,8 @@ bool idleNs(processor_t p, uint64_t &ns)
   return true;
 }
 
-// Busiest core of each domain since the last call, per mille; -1 where no core of the domain could be read.
+// Busiest core of each domain since the last call, per mille, this thread's own time on each core left out; -1 where no core of the
+// domain could be read, and for every domain right after the clock measurement (its window is dropped, gRebase).
 void domainBusy(int32_t busy[kDomains])
 {
   for (unsigned d = 0; d < kDomains; ++d) busy[d] = -1;
@@ -331,18 +358,13 @@ void domainBusy(int32_t busy[kDomains])
     Cpu &c = gCpus[i];
     uint64_t idle = 0;
     if (c.domain >= kDomains || !idleNs(c.processor, idle)) {
-      c.loadOk = false;
+      c.load.fail();
       continue;
     }
-    if (c.loadOk && now > c.atNs) {
-      const uint64_t di = idle >= c.idleTicks ? idle - c.idleTicks : 0;
-      const int32_t b = int32_t(busyPermille(now - c.atNs, di));
-      if (b > busy[c.domain]) busy[c.domain] = b;
-    }
-    c.idleTicks = idle;
-    c.atNs = now;
-    c.loadOk = true;
+    const int32_t b = c.load.read(now, idle, c.selfNs, gRebase);
+    if (b > busy[c.domain]) busy[c.domain] = b;
   }
+  gRebase = false;
 }
 
 // About the core's clock in MHz: 200000 dependent adds (one cycle each on an in-order chain), the fastest of three runs; no device
@@ -362,9 +384,11 @@ uint32_t chainMhz()
   return ns ? uint32_t(200000ull * 1000ull / ns) : 0;
 }
 
-// Each running core's clock, measured on that core (thread_bind + thread_block, as the kernel's own per-CPU loops do).
+// Each running core's clock, measured on that core (thread_bind + thread_block, as the kernel's own per-CPU loops do). It runs on
+// every core, so the governor's next load window would count it as load there: that window is dropped (gRebase).
 void measureClocks(uint32_t mhz[kMaxCpus], bool on[kMaxCpus])
 {
+  gRebase = true;
   for (unsigned i = 0; i < gCpuCount; ++i) {
     mhz[i] = 0;
     on[i] = false;
@@ -979,6 +1003,8 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
   const PowerSource power = profilePower(power_, Profile(__atomic_load_n(&profile_, __ATOMIC_ACQUIRE)));
   int32_t busy[kDomains] = {-1, -1};
   if (loadTick) domainBusy(busy);
+  // A load decision needs a busy figure: none on the first reading (it only starts the window), after the clock measurement, or
+  // when no core of the domain could be read. Before 2026-11-12 such a tick counted as 0 % busy, a step toward the slowest level.
   const bool critical = gArgs.level >= 2 && policy_.state() == State::critical;
   for (unsigned d = 0; d < kDomains; ++d) {
     if (!domainOk_[d]) continue;
@@ -1003,7 +1029,8 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
       ++busyTicks_[d];
       if (uint32_t(busy[d]) > busyMax_[d]) busyMax_[d] = uint32_t(busy[d]);
     }
-    const unsigned want = loadTick && g.mode() == CpuMode::govern ? g.tick({busy[d] < 0 ? 0u : uint32_t(busy[d]), power}) : g.enforce(power);
+    const unsigned want =
+        loadTick && busy[d] >= 0 && g.mode() == CpuMode::govern ? g.tick({uint32_t(busy[d]), power}) : g.enforce(power);
     cpuApply(d, want, now);
   }
 }
@@ -1047,8 +1074,10 @@ void PianoThermal::cpuReport(uint64_t spanNs)
     limitedPolls_[d] = 0;
     cuts_[d] = 0;
   }
-  note("[%us] scmi: %u messages, %u failed, %llu us each on average, %u us at most", upS(), channel_.messages, channel_.failures,
-       (unsigned long long)(channel_.messages ? channel_.totalUs / channel_.messages : 0), channel_.maxUs);
+  note("[%us] scmi: %u messages, %u failed, %llu us each on average, %u us at most; own work %llu us/s (left out of busy)", upS(),
+       channel_.messages, channel_.failures, (unsigned long long)(channel_.messages ? channel_.totalUs / channel_.messages : 0),
+       channel_.maxUs, (unsigned long long)(spanNs >= 1000000000ull ? gSelfNsTotal / (spanNs / 1000000000ull) / 1000 : 0));
+  gSelfNsTotal = 0;
   OSDictionary *dict = OSDictionary::withCapacity(4);
   if (dict) {
     for (unsigned d = 0; d < kDomains; ++d) {
@@ -1082,16 +1111,19 @@ void PianoThermal::run()
   if (gArgs.cpufreq) cpuStart();
   else readTopology();
   const bool governing = cpuOk_ && gArgs.cpufreq == 3;
-  // The poll period by tier (Cluster.h pollTier): base = the governor's tick (100 ms) or 1 s; warm (hottest >= 70 C) 250 ms; fast
-  // (10 ms) within 10 C of a trip, while a cluster is thermally limited, or while a cluster runs above piano-thermal-fast-mhz.
+  // The poll period by tier (Cluster.h pollTier): base = the governor's tick (100 ms) or 1 s; warm (hottest >= 70 C) 250 ms; clock
+  // (a cluster above piano-thermal-fast-mhz, every sensor under piano-thermal-fast-temp) 100 ms; fast (10 ms) within 10 C of a trip
+  // or of the ceiling, while a cluster is thermally limited, or above the fast-poll clock from the fast-poll temperature up.
   const uint32_t base = governing ? gArgs.tickMs : gArgs.pollMs;
-  note("running: %s every %u ms, %u ms from %u C, %u ms near a trip or above %u MHz; the policy every %u ms; a report every %u s%s",
+  note("running: %s every %u ms, %u ms from %u C, %u ms above %u MHz (%u ms from %u C), %u ms near a trip; the policy every %u ms; a "
+       "report every %u s%s",
        governing ? "the governor and the sensors" : "the sensors", base, pollPeriodMs(Poll::warm, base, gArgs.warmMs, gArgs.fastMs),
-       gArgs.warmPollC, gArgs.fastMs, gArgs.fastMhz, gArgs.pollMs, gArgs.logS, gMapFailures ? " (some windows not mapped)" : "");
+       gArgs.warmPollC, pollPeriodMs(Poll::clock, base, gArgs.warmMs, gArgs.fastMs, gArgs.clockMs), gArgs.fastMhz, gArgs.fastMs,
+       gArgs.fastTempC, gArgs.fastMs, gArgs.pollMs, gArgs.logS, gMapFailures ? " (some windows not mapped)" : "");
   const uintptr_t tmVa[kControllers] = {gTm[0].va, gTm[1].va, gTm[2].va, gTm[3].va};
   irq::hookStart(this, tmVa, base, governing, gArgs.logS, gStartNs);   // piano-thermal-irq (PianoThermalIrq.cpp): nothing without it
   uint64_t lastPolicy = 0, lastLoad = 0, lastLog = nowNs(), lastCpuLog = nowNs(), tierSince = nowNs();
-  uint64_t tierNs[3] = {};
+  uint64_t tierNs[kPollTiers] = {};
   uint32_t tierChanges = 0;
   Poll tier = Poll::base;
   bool first = true, fastNoted = false;
@@ -1100,6 +1132,7 @@ void PianoThermal::run()
       powerAtNs_ = 0;
       note("[%us] wake %u: polling again", upS(), sleep_.wakes());
     }
+    const uint64_t workStart = mach_absolute_time();   // this poll's own work, up to the wait: noteSelf, left out of busy
     monitor_.poll(kTsensIo);
     const uint64_t now = nowNs();
     irq::hookPolled(monitor_, now / 1000000ull);
@@ -1121,7 +1154,8 @@ void PianoThermal::run()
       clusterFast |= boot_[k] >= 0 && domain_[k].levels[set_[k]].khz > gArgs.fastMhz * 1000u;
     }
     // with piano-thermal-irq at rest: the same without the warm rule and the fast-clock rule (the upper interrupt stands in for them)
-    const Poll next = irq::hookTier(pollTier(monitor_, gTrips, limited, clusterFast, int32_t(gArgs.warmPollC) * 10),
+    const Poll next = irq::hookTier(pollTier(monitor_, gTrips, limited, clusterFast, int32_t(gArgs.warmPollC) * 10,
+                                             int32_t(gArgs.fastTempC) * 10),
                                     pollTier(monitor_, gTrips, limited, false, 0x7fffffff), now / 1000000ull);
     if (next != tier) {
       tierNs[unsigned(tier)] += now - tierSince;
@@ -1132,7 +1166,8 @@ void PianoThermal::run()
         note("[%us] polling every %u ms: %s", upS(), gArgs.fastMs,
              irq::hookHolding(now / 1000000ull) ? "an upper-threshold interrupt"
              : limited ? "a cluster's thermal limit holds it down"
-                     : clusterFast ? "a cluster runs above the fast-poll clock" : "a sensor is within 10 C of its trip");
+                     : clusterFast ? "a cluster runs above the fast-poll clock, a sensor at the fast-poll temperature"
+                                   : "a sensor is within 10 C of its trip or of the ceiling");
       }
       tier = next;
     }
@@ -1155,16 +1190,21 @@ void PianoThermal::run()
       }
       tierNs[unsigned(tier)] += now - tierSince;
       tierSince = now;
-      if (tierNs[1] || tierNs[2])
-        note("[%us] polling: base %llu ms, warm %llu ms, fast %llu ms; %u changes", upS(), (unsigned long long)(tierNs[0] / 1000000),
-             (unsigned long long)(tierNs[1] / 1000000), (unsigned long long)(tierNs[2] / 1000000), tierChanges);
-      tierNs[0] = tierNs[1] = tierNs[2] = 0;
+      if (tierNs[1] || tierNs[2] || tierNs[3])
+        note("[%us] polling: base %llu ms, warm %llu ms, clock %llu ms, fast %llu ms; %u changes", upS(),
+             (unsigned long long)(tierNs[0] / 1000000), (unsigned long long)(tierNs[1] / 1000000),
+             (unsigned long long)(tierNs[2] / 1000000), (unsigned long long)(tierNs[3] / 1000000), tierChanges);
+      for (unsigned k = 0; k < kPollTiers; ++k) tierNs[k] = 0;
       tierChanges = 0;
       fastNoted = false;
       lastLog = now;
       peakValid_ = false;   // the peak is per report window
     }
     first = false;
-    pollWait(pollPeriodMs(tier, irq::hookBase(base), gArgs.warmMs, gArgs.fastMs));   // the base relaxed at rest (piano-thermal-irq)
+    uint64_t workNs = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - workStart, &workNs);
+    noteSelf(workNs);
+    // the base relaxed at rest (piano-thermal-irq)
+    pollWait(pollPeriodMs(tier, irq::hookBase(base), gArgs.warmMs, gArgs.fastMs, gArgs.clockMs));
   }
 }

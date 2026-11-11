@@ -15,11 +15,13 @@
 //           or when the power source is unknown (piano-cpufreq-bat0/1), its Balanced caps on external power (-ac0/1: 3532.8 /
 //           4089.6 MHz), the thermal limit); floor piano-cpufreq-min0/1. A ceiling that drops applies at once.
 // thermal limit (both modes; thermal() is called on every sensor poll, 10 ms apart while a sensor is near its trip): Linux's
-//   step_wise on the stock trips (Cluster.h): any of the cluster's cpu-* sensors at or over its passive trip (105 C, or 118 C)
-//   -> one level down per stepMs (10 ms, Linux's passive polling); all under passive - hysteresis (5 or 8 C) -> one level up per
-//   riseMs (1 s); in between
+//   step_wise (Cluster.h), since 2026-11-12 on a hard ceiling under the stock trips: any of the cluster's cpu-* sensors at or over
+//   piano-cpufreq-hot (default 90 C; never above the zone's stock passive trip, 105 C or 118 C; 0 = the stock trips)
+//   -> one level down per stepMs (10 ms, Linux's passive polling); all under the release point (piano-cpufreq-release, default
+//   5 C under the ceiling) -> one level up per riseMs (1 s); in between
 //   held; at the critical threshold (125 C - piano-thermal-margin), without a reading, or in PianoThermal's critical state ->
-//   the slowest level at once.
+//   the slowest level at once. The ceiling holds at every piano-thermal level (piano-cpufreq implies the level 1 readout).
+// busy excludes PianoThermal's own work (busyPermilleExcluding); a window with the per-core clock measurement in it is dropped.
 #ifndef PIANO_THERMAL_GOVERNOR_H
 #define PIANO_THERMAL_GOVERNOR_H
 #include <stdint.h>
@@ -263,13 +265,42 @@ class Governor {
   bool cooling_ = false;
 };
 
-// Per mille busy of one core over a window: wall time minus its idle time (both in the same unit), clamped.
-inline uint32_t busyPermille(uint64_t wall, uint64_t idle)
+// Per mille busy of one core over a window: wall time minus its idle time and minus the time PianoThermal's own thread ran on that
+// core in the window (its sensor polls, SCMI waits and load reads: P9 of 2026-11-12, the governor must not count its own work as
+// load), all in the same unit, clamped.
+inline uint32_t busyPermilleExcluding(uint64_t wall, uint64_t idle, uint64_t self)
 {
   if (!wall) return 0;
   if (idle >= wall) return 0;
-  return uint32_t((wall - idle) * 1000 / wall);
+  const uint64_t used = wall - idle;
+  if (self >= used) return 0;
+  return uint32_t((used - self) * 1000 / wall);
 }
+inline uint32_t busyPermille(uint64_t wall, uint64_t idle) { return busyPermilleExcluding(wall, idle, 0); }
+
+// One core's load window between two readings (PianoThermal.cpp domainBusy): its idle time and PianoThermal's own time on it, both
+// cumulative, in ns. read() returns the window's busy per mille with the own time left out, or -1 when there is no window: the
+// first reading, a reading after a failed one, or one with rebase set (the per-core clock measurement ran on every core in the
+// window, so the window is dropped and the reading only starts the next).
+struct CoreLoad {
+  uint64_t idleNs = 0, selfNs = 0, atNs = 0;
+  bool ok = false;
+  int32_t read(uint64_t nowNs, uint64_t idleNow, uint64_t selfNow, bool rebase)
+  {
+    int32_t busy = -1;
+    if (ok && !rebase && nowNs > atNs) {
+      const uint64_t di = idleNow >= idleNs ? idleNow - idleNs : 0;
+      const uint64_t ds = selfNow >= selfNs ? selfNow - selfNs : 0;
+      busy = int32_t(busyPermilleExcluding(nowNs - atNs, di, ds));
+    }
+    idleNs = idleNow;
+    selfNs = selfNow;
+    atNs = nowNs;
+    ok = true;
+    return busy;
+  }
+  void fail() { ok = false; }
+};
 
 // A cap in MHz as the kHz it admits: the whole MHz, so "1785" admits the 1785.6 MHz level.
 inline uint32_t capKhz(uint32_t mhz) { return mhz ? mhz * 1000u + 999u : 0; }

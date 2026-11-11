@@ -5,9 +5,10 @@
 //   - Policy.h: the protection state machine (thresholds from the stock trips, hysteresis, the critical debounce, unknown);
 //   - Scmi.h: the message header, the shared-memory transport and the perf protocol against a model of the CPUCP (v4 with level
 //     indexing and v3 with scaled values, paged DESCRIBE_LEVELS, LEVEL_GET/SET, busy/timeout/error/wrong-answer channels);
-//   - Governor.h: fixed and governor modes, hispeed, down hysteresis, battery/power caps, floor, the thermal limit.
-//   - Cluster.h: a cluster against its stock trips, the near-trip test, the poll tiers; Tsens.h's interrupt encoders and the
-//     suspend mask.
+//   - Governor.h: fixed and governor modes, hispeed, down hysteresis, battery/power caps, floor, the thermal limit; the load window
+//     without PianoThermal's own work and without the clock measurement's window (P9, 2026-11-12).
+//   - Cluster.h: a cluster against its stock trips and against the 90 C ceiling (capped at each zone's stock trip), the near-trip
+//     test, the poll tiers (the fast-clock rule fast only when warm); Tsens.h's interrupt encoders and the suspend mask.
 //   thermal_host         run the tests
 //   thermal_host --map   print the sensor map for tooling/k27/check-thermal-map.py
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. thermal_host.cpp -o /tmp/thermal_host && /tmp/thermal_host
@@ -480,6 +481,37 @@ static ThermalInput hot() { return {true, 0, 50, false}; }             // at the
 static ThermalInput between() { return {true, -20, 30, false}; }       // 103 C: under the trip, over the release point
 static ThermalInput cut() { return {true, 150, 200, true}; }
 
+// P9 (2026-11-12): the load window leaves PianoThermal's own time out, and the window with the clock measurement makes no decision.
+static void testLoadWindow()
+{
+  CHECK(busyPermilleExcluding(100, 25, 0) == 750 && busyPermilleExcluding(100, 25, 25) == 500);
+  CHECK(busyPermilleExcluding(100, 25, 75) == 0 && busyPermilleExcluding(100, 25, 200) == 0);   // own time >= used: 0, no wrap
+  CHECK(busyPermilleExcluding(100, 100, 5) == 0 && busyPermilleExcluding(0, 0, 0) == 0);
+  const uint64_t ms = 1000000;
+  CoreLoad c;
+  CHECK(c.read(0, 0, 0, false) == -1);                               // the first reading only starts the window
+  // a core idle but for the governor's own 10 ms polls (100 us each over 100 ms: 1 ms): 0 busy, not 1 %
+  CHECK(c.read(100 * ms, 99 * ms, 1 * ms, false) == 0);
+  // the same core with a spinner for half the window, plus the polls: 50 %, the polls not counted
+  CHECK(c.read(200 * ms, 99 * ms + 49 * ms, 2 * ms, false) == 500);
+  // the clock measurement ran on every core (2 ms of adds here, outside the own-time count): the window is dropped
+  CHECK(c.read(300 * ms, 147 * ms + 98 * ms, 2 * ms, true) == -1);
+  CHECK(c.read(400 * ms, 245 * ms + 100 * ms, 2 * ms, false) == 0);   // the next window is a normal one again
+  // a failed reading: the next reading starts a window instead of spanning the gap
+  c.fail();
+  CHECK(c.read(500 * ms, 345 * ms + 10 * ms, 2 * ms, false) == -1 && c.read(600 * ms, 355 * ms + 100 * ms, 2 * ms, false) == 0);
+  // the 10 ms scheduler-tick quantisation of the idle time (PianoThermal.cpp idleNs) shows as up to 10 % on an idle core; no wrap when
+  // a later reading's idle exceeds the wall time
+  CHECK(c.read(700 * ms, 455 * ms + 90 * ms, 2 * ms, false) == 100 && c.read(800 * ms, 545 * ms + 110 * ms, 2 * ms, false) == 0);
+  // the governor: a tick without a busy figure is no decision (enforce only); the old code made it a 0 % tick, a step down
+  GovernorConfig gv;
+  gv.externalKhz = capKhz(4089);
+  Governor g;
+  g.init(CpuMode::govern, gv, kNcc1, 16, 14, 14);
+  for (int i = 0; i < 2; ++i) CHECK(g.enforce(PowerSource::external) == 14);
+  CHECK(g.tick({1000, PowerSource::external}) == 14 && g.level() == 14);
+}
+
 static void testGovernor()
 {
   CHECK(busyPermille(100, 25) == 750 && busyPermille(100, 100) == 0 && busyPermille(100, 150) == 0 && busyPermille(0, 0) == 0);
@@ -698,6 +730,62 @@ static void testCluster()
   model.status[2][3] = statusWord(950, true);
   m.poll(model.io());
   CHECK(nearTrip(m, trips));
+
+  // The 90 C ceiling (PianoThermal.cpp's default piano-cpufreq-hot since 2026-11-12, P9): one cpu-* sensor at 90 C trips the
+  // cluster; the release point 85 C; the cut still 115 C. The stock trips are only the ceiling's upper bound.
+  ClusterTrips ceiling;
+  ceiling.hotDeci = kCeilingDeci;
+  model.all(450);
+  model.status[0][5] = statusWord(899, true);
+  m.poll(model.io());
+  in = clusterThermal(m, 0, ceiling, false);
+  CHECK(in.hotExcessDeci == -1 && in.releaseExcessDeci == 899 - 850 && !in.cut);
+  CHECK(nearTrip(m, ceiling) && !nearTrip(m, trips));                 // 80 C and up is near the ceiling, not near 105 C
+  model.status[0][5] = statusWord(900, true);
+  m.poll(model.io());
+  CHECK(clusterThermal(m, 0, ceiling, false).hotExcessDeci == 0);
+  model.status[0][5] = statusWord(849, true);
+  m.poll(model.io());
+  CHECK(clusterThermal(m, 0, ceiling, false).releaseExcessDeci < 0);   // under the release point: the limit may rise again
+  model.status[0][5] = statusWord(799, true);
+  m.poll(model.io());
+  CHECK(!nearTrip(m, ceiling));
+  // a ceiling above a zone's stock trip is capped at that trip: 110 C asked, the 105 C zones trip at 105 (release 100), the 118 C
+  // zone cpu-0-0-1 at 110 (release 105)
+  ClusterTrips high;
+  high.hotDeci = 1100;
+  model.all(450);
+  model.status[0][1] = statusWord(1050, true);                        // cpu-0-0-0, stock 105 C
+  m.poll(model.io());
+  in = clusterThermal(m, 0, high, false);
+  CHECK(in.hotExcessDeci == 0 && in.releaseExcessDeci == 50);
+  CHECK(sensorHot(kMap[0].sensors[1], high) == 1050 && sensorRelease(kMap[0].sensors[1], high) == 1000);
+  CHECK(sensorHot(kMap[0].sensors[2], high) == 1100 && sensorRelease(kMap[0].sensors[2], high) == 1050);
+  // the stock trips (piano-cpufreq-hot=0) and a ceiling with its own release point
+  CHECK(sensorHot(kMap[0].sensors[2], trips) == 1180 && sensorRelease(kMap[0].sensors[2], trips) == 1100);
+  ClusterTrips own;
+  own.hotDeci = 900;
+  own.releaseDeci = 870;
+  CHECK(sensorHot(kMap[1].sensors[1], own) == 900 && sensorRelease(kMap[1].sensors[1], own) == 870);
+  own.releaseDeci = 950;                                              // a release point at or above the trip: the zone's hysteresis
+  CHECK(sensorRelease(kMap[1].sensors[1], own) == 850);
+  // the governor on the ceiling: a cluster at its top level with a sensor at 91 C steps down one level per 10 ms
+  GovernorConfig gv;
+  gv.externalKhz = capKhz(3532);
+  gv.stepMs = 10;
+  Governor g;
+  g.init(CpuMode::govern, gv, kNcc1, 16, 14, 14);
+  model.all(450);
+  model.status[1][2] = statusWord(910, true);
+  m.poll(model.io());
+  uint64_t t = 10000;
+  for (int i = 0; i < 5; ++i, t += 10) g.thermal(clusterThermal(m, 1, ceiling, false), t);
+  CHECK(g.limit() == 10 && g.enforce(PowerSource::external) == 10);
+  // with the stock trips the same reading changes nothing (the old behaviour)
+  Governor old;
+  old.init(CpuMode::govern, gv, kNcc1, 16, 14, 14);
+  for (int i = 0; i < 5; ++i, t += 10) old.thermal(clusterThermal(m, 1, trips, false), t);
+  CHECK(old.limit() == 15);
 }
 
 // ------------------------------------------------------------------------------------------------------------- interrupts, polling
@@ -723,16 +811,34 @@ static void testInterruptsAndPolling()
   m.poll(model.io());
   CHECK(pollTier(m, trips, false, false, 700) == Poll::base);
   CHECK(pollTier(m, trips, true, false, 700) == Poll::fast);    // a cluster thermally limited
-  CHECK(pollTier(m, trips, false, true, 700) == Poll::fast);    // a cluster above the fast-poll clock
+  // a cluster above the fast-poll clock: every 100 ms while every sensor is under the fast-poll temperature (P9: before 2026-11-12
+  // this was the 10 ms tier at any temperature), 10 ms from it up
+  CHECK(pollTier(m, trips, false, true, 700) == Poll::clock && pollTier(m, trips, false, true, 700, 700) == Poll::clock);
   model.status[2][6] = statusWord(700, true);
   m.poll(model.io());
   CHECK(pollTier(m, trips, false, false, 700) == Poll::warm);
+  CHECK(pollTier(m, trips, false, true, 700) == Poll::fast && pollTier(m, trips, false, true, 700, 750) == Poll::clock);
   model.status[1][1] = statusWord(950, true);                   // 10 C under cpu-1-0-0's 105 C trip
   m.poll(model.io());
   CHECK(pollTier(m, trips, false, false, 700) == Poll::fast);
+  // the 90 C ceiling: fast from 80 C on a cpu-* sensor
+  ClusterTrips ceiling;
+  ceiling.hotDeci = kCeilingDeci;
+  model.all(450);
+  model.status[0][3] = statusWord(800, true);
+  m.poll(model.io());
+  CHECK(pollTier(m, ceiling, false, false, 900) == Poll::fast && pollTier(m, trips, false, false, 900) == Poll::base);
+  // no reading at all with a fast cluster: fast (blind is not cool)
+  model.all(450);
+  for (unsigned c = 0; c < kControllers; ++c) model.mapped[c] = false;
+  m.poll(model.io());
+  CHECK(pollTier(m, trips, false, true, 700) == Poll::fast);
   CHECK(pollPeriodMs(Poll::base, 1000, 250, 10) == 1000 && pollPeriodMs(Poll::warm, 1000, 250, 10) == 250);
   CHECK(pollPeriodMs(Poll::warm, 100, 250, 10) == 100 && pollPeriodMs(Poll::fast, 100, 250, 10) == 10);
   CHECK(pollPeriodMs(Poll::fast, 5, 250, 10) == 5);
+  CHECK(pollPeriodMs(Poll::clock, 100, 250, 10) == 100 && pollPeriodMs(Poll::clock, 1000, 250, 10) == 100);   // the governor's tick
+  CHECK(pollPeriodMs(Poll::clock, 1000, 250, 10, 50) == 50 && pollPeriodMs(Poll::clock, 20, 250, 10) == 20);
+  CHECK(!strcmp(pollName(Poll::clock), "clock") && !strcmp(pollName(Poll::fast), "fast") && kPollTiers == 4);
 }
 
 static void printMap()
@@ -756,6 +862,7 @@ int main(int argc, char **argv)
   testPoll();
   testPolicy();
   testScmi();
+  testLoadWindow();
   testGovernor();
   testProfileAndSleep();
   testCluster();
