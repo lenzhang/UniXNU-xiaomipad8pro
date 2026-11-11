@@ -393,6 +393,11 @@ bool traceHere()
     return !__atomic_load_n(&traceQuiet,__ATOMIC_RELAXED);
 }
 void traceSink(const char *line) {boot_progress_trace(line);}
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano: the board's synchronous trace (piano-gpu-trace=3, board/PianoA830.cpp) prints the lines the sink took here, after the
+ * tracer's lock is given back (interrupts as the caller had them) and before the access is made. Weak no-op without a board. */
+extern "C" __attribute__((weak)) void boot_progress_trace_sync(void) {}
+#endif
 /* The tracer's lock: interrupts off on this CPU (the holder is never preempted), a bounded spin, the line dropped after. */
 class TraceLock {
     uintptr_t irq_;
@@ -419,11 +424,18 @@ A830TraceToken traceAccess(unsigned block,char op,uint64_t address,uint64_t valu
                            uint64_t arg3=0)
 {
     if((block<A830WinCount && (TraceQuietWindows>>block&1u)) || !traceHere())return {};   /* cmd-db: 32768 reads in S0 */
-    TraceLock lock;
-    if(!lock.held())return {};
-    const uint8_t stage=adreno830_status.stage;
-    const uint16_t now=step<0?adreno830_status.step:uint16_t(step);
-    return tracer.access(stage,now,uint8_t(block),op,address,value,arg2,arg3);
+    A830TraceToken token={};
+    {
+        TraceLock lock;
+        if(!lock.held())return {};
+        const uint8_t stage=adreno830_status.stage;
+        const uint16_t now=step<0?adreno830_status.step:uint16_t(step);
+        token=tracer.access(stage,now,uint8_t(block),op,address,value,arg2,arg3);
+    }
+#ifdef ADRENO830_MACOS
+    if(token.logged)boot_progress_trace_sync();   /* UniXNU-piano: the access's line on the console before the access */
+#endif
+    return token;
 }
 void traceValue(const A830TraceToken &token,uint64_t value,uint64_t result1=0,uint64_t result2=0)
 {

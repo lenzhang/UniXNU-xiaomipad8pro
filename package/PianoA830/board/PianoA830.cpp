@@ -13,7 +13,8 @@
 //    ../UPSTREAM).
 //  - The BootProgress hooks the driver calls (strong definitions; tooling/k27/coalesce-weak.py drops the driver's weak defaults):
 //    status rows and stage results, the bring-up register trace (piano-gpu-trace) as "PianoA830: t ..." lines, all through a line
-//    ring that a logger thread prints (the hooks run with interrupts off; see the ring below).
+//    ring that a logger thread prints (the hooks run with interrupts off; see the ring below). piano-gpu-trace=3 prints the trace
+//    synchronously instead, from the thread that makes the access, before it (see "the synchronous trace" below).
 //  piano-gpu-delay=<s> (default 0): the survey or bring-up thread waits that long first (after the root is up, say), so a hang there
 //  does not also stop the boot.
 //  piano-gpu-hang-ms=<ms> (default 0: 2000): the time without progress the fence and recovery watchdogs call a hang (1000..60000).
@@ -47,10 +48,14 @@ extern "C" void proc_selfname(char *, int);
 extern "C" IOReturn native_adreno_new_user_client(IOService *, task_t, void *, uint32_t, OSDictionary *, IOUserClient **, unsigned);
 extern "C" void native_adreno_note_property_read(const char *);
 extern "C" int vsnprintf(char *, size_t, const char *, va_list) __attribute__((format(printf, 3, 0)));
+extern "C" int get_preemption_level(void);
 
 namespace {
 uint32_t gLevel;    // piano-gpu
 uint32_t gTrace;    // the trace hook writes lines (piano-gpu=2 and piano-gpu-trace != 0)
+uint32_t gTraceSync;   // piano-gpu-trace=3: the trace printed synchronously (below)
+thread_t gRunThread;   // the starter thread (run below); piano-gpu-trace=3's heartbeat reports its IOLog in progress
+uint64_t gRunNoteSince;   // mach_absolute_time at which the starter entered piano_a830_note's IOLog (0: not inside one)
 char gRows[Adreno830StatusRows][Adreno830StatusRowBytes];
 
 uint32_t bootArg(const char *name, uint32_t fallback)
@@ -75,7 +80,10 @@ extern "C" void piano_a830_note(const char *format, ...)
   va_start(ap, format);
   vsnprintf(line, sizeof line, format, ap);
   va_end(ap);
+  const bool starter = gTraceSync && gRunThread && current_thread() == gRunThread;
+  if (starter) __atomic_store_n(&gRunNoteSince, mach_absolute_time(), __ATOMIC_RELAXED);
   IOLog("PianoA830: %s\n", line);
+  if (starter) __atomic_store_n(&gRunNoteSince, 0ull, __ATOMIC_RELAXED);
 }
 
 // ---- the line ring ----------------------------------------------------------------------------------------------------------------
@@ -85,11 +93,15 @@ extern "C" void piano_a830_note(const char *format, ...)
 // system right after it (2026-11-11 07:20). So the hooks only copy their line into this ring (a short spin lock with interrupts off,
 // a bounded memcpy, nothing else), and the logger thread prints it with IOLog from plain thread context, polling every millisecond.
 // A full ring drops lines and counts them; the logger says how many. The trace line of an access is in the ring before the access
-// is made, and the logger runs on another CPU, so a hung access is still named on the console.
+// is made, but the console shows it only once the logger has printed every line before it: with -v each console line is drawn
+// (tens of ms), so the logger can be many seconds and the whole bring-up behind the driver (2026-11-11 "power1": S1's lines 5 s
+// after adreno830_start had returned, docs/forensics-2026-11-11.md). The last printed line is then where the logger was, not the
+// access in flight; piano-gpu-trace=3 (below) prints each line before its access instead.
 namespace {
 enum : unsigned { RingLines = 2048, RingBytes = 160 };
 struct LineRing {
   char (*text)[RingBytes];
+  uint64_t *stamp;   // piano-gpu-trace=3: mach_absolute_time of each line's push (else null)
   uint32_t head, tail, drops, lock;
 };
 LineRing gRing;
@@ -123,17 +135,19 @@ void ringPush(const char *prefix, const char *text, size_t length)
     }
     for (size_t i = 0; i < length && text[i] && n < RingBytes - 1; ++i) line[n++] = text[i];
     line[n] = 0;
+    if (gRing.stamp) gRing.stamp[gRing.head % RingLines] = mach_absolute_time();
     gRing.head++;
   }
   ringUnlock(irq);
 }
 
-bool ringPop(char *out, uint32_t *drops)
+bool ringPop(char *out, uint32_t *drops, uint64_t *stamp = nullptr)
 {
   const uintptr_t irq = ringLock();
   const bool any = gRing.tail != gRing.head;
   if (any) {
     memcpy(out, gRing.text[gRing.tail % RingLines], RingBytes);
+    if (stamp) *stamp = gRing.stamp ? gRing.stamp[gRing.tail % RingLines] : 0;
     gRing.tail++;
   }
   *drops = gRing.drops;
@@ -184,17 +198,139 @@ void canaryCheck()
 
 void flushHeldRows();   // the status rows held back (below)
 
+// ---- the synchronous trace (piano-gpu-trace=3, 2026-11-11) ------------------------------------------------------------------------
+// Every trace line is printed by the thread that pushed it, after the tracer's lock is given back and before the access the line
+// names: Adreno830Start.cpp's traceAccess calls boot_progress_trace_sync once its line is in the ring, and that drains the ring
+// (this line and every line before it) with IOLog. So the console's last "t" line is the access in flight or the one just made,
+// whatever the logger was doing. Each line carries the uptime of its push: "PianoA830: [27.612] t g1.7 GPUCC w 3d99010 8000001".
+// Printing only happens in thread context with interrupts on and preemption enabled (never with interrupts off: the 07:20 hang of
+// 2026-11-11); a line pushed anywhere else (a caller that masked interrupts) stays in the ring for the logger, as with 1, and the
+// heartbeat counts it. The driver itself gets piano-gpu-trace=1 (PianoA830Board.cpp): runs are counted, so a poll costs a few lines.
+// The cost is the console's: with -v every line is drawn into the boot framebuffer, so the bring-up takes tens of seconds instead of
+// one, and the time between two accesses grows to milliseconds (a sequence that only fails when it is slow fails here, see the
+// forensics page). The driver's polls are all bounded already (iteration or time budgets); what cannot be bounded is one access
+// or one SMC that never returns, and the heartbeat names that one instead of a guard.
+// The heartbeat (the logger, once a second; every 30 s from 120 s after the bring-up returned): the uptime, the lines pushed and
+// printed, what the bring-up thread is doing (printing a line, or past it: its access) and the starter thread's phase and whether it
+// is inside an IOLog, each with how long. A stall then shows whether the rest of the system still ran, and where the thread stopped.
+IOLock *gPrintLock;            // one printer at a time (the bring-up thread or the logger), so the lines keep their order
+uint32_t gPrinted, gPrintedSync, gSyncSkipped;   // (lines pushed: gRing.head)
+uint32_t gSyncState;           // 0 none yet, 1 printing a line, 2 past its print (the access), 3 adreno830_start returned
+uint64_t gSyncSince;           // mach_absolute_time of the state's start
+uint32_t gSyncLineNo;          // the number of the line the bring-up thread printed last
+char gSyncLast[RingBytes];     // and its text (copied under gSyncSeq: even = stable)
+uint32_t gSyncSeq;
+uint32_t gRunPhase;            // RunPhase
+uint64_t gRunSince;            // the phase's start
+enum RunPhase : uint32_t { RunInit, RunDelay, RunSurvey, RunBringUp, RunReport, RunRoutes, RunWait, RunDone };
+const char *const kRunPhases[] = {"starting", "piano-gpu-delay", "survey", "bring-up", "report", "SMMU routes", "waiting 60 s", "done"};
+
+uint64_t msOf(uint64_t abs)
+{
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(abs, &ns);
+  return ns / 1000000ull;
+}
+
+void runPhase(uint32_t phase)
+{
+  __atomic_store_n(&gRunSince, mach_absolute_time(), __ATOMIC_RELAXED);
+  __atomic_store_n(&gRunPhase, phase, __ATOMIC_RELEASE);
+}
+
+void printLine(const char *line, uint64_t stamp)
+{
+  if (gTraceSync && stamp) {
+    const uint64_t ms = msOf(stamp);
+    IOLog("PianoA830: [%llu.%03llu] %s\n", ms / 1000, ms % 1000, line);
+  } else {
+    IOLog("PianoA830: %s\n", line);
+  }
+}
+
+// Drains the ring with IOLog; the caller holds gPrintLock. bringUp: the bring-up thread's drain (its state and last line kept).
+void drainRing(bool bringUp)
+{
+  char line[RingBytes];
+  uint32_t drops = 0;
+  uint64_t stamp = 0;
+  while (ringPop(line, &drops, &stamp)) {
+    if (drops) IOLog("PianoA830: (%u lines dropped: the ring was full)\n", drops);
+    const uint32_t number = __atomic_add_fetch(&gPrinted, 1u, __ATOMIC_RELAXED);
+    if (bringUp) {
+      __atomic_add_fetch(&gSyncSeq, 1u, __ATOMIC_ACQ_REL);   // odd: being written
+      memcpy(gSyncLast, line, RingBytes);
+      gSyncLineNo = number;
+      __atomic_add_fetch(&gSyncSeq, 1u, __ATOMIC_ACQ_REL);
+      __atomic_store_n(&gSyncSince, mach_absolute_time(), __ATOMIC_RELAXED);
+      __atomic_store_n(&gSyncState, 1u, __ATOMIC_RELEASE);
+      __atomic_add_fetch(&gPrintedSync, 1u, __ATOMIC_RELAXED);
+    }
+    printLine(line, stamp);
+  }
+  if (drops) IOLog("PianoA830: (%u lines dropped: the ring was full)\n", drops);
+}
+
+void heartbeat()
+{
+  const uint64_t now = mach_absolute_time();
+  char last[RingBytes] = "-";
+  uint32_t lineNo = 0;
+  for (unsigned attempt = 0; attempt < 3; ++attempt) {   // the bring-up thread may be copying it right now
+    const uint32_t before = __atomic_load_n(&gSyncSeq, __ATOMIC_ACQUIRE);
+    if (before & 1) continue;
+    memcpy(last, gSyncLast, RingBytes);
+    lineNo = gSyncLineNo;
+    if (__atomic_load_n(&gSyncSeq, __ATOMIC_ACQUIRE) == before) break;
+    strlcpy(last, "(changing)", sizeof last);
+  }
+  last[RingBytes - 1] = 0;
+  const uint32_t state = __atomic_load_n(&gSyncState, __ATOMIC_ACQUIRE);
+  const uint64_t stateMs = msOf(now - __atomic_load_n(&gSyncSince, __ATOMIC_RELAXED));
+  const uint32_t phase = __atomic_load_n(&gRunPhase, __ATOMIC_ACQUIRE);
+  const uint64_t noteSince = __atomic_load_n(&gRunNoteSince, __ATOMIC_RELAXED);
+  const uint64_t ms = msOf(now);
+  const uint32_t head = __atomic_load_n(&gRing.head, __ATOMIC_RELAXED), tail = __atomic_load_n(&gRing.tail, __ATOMIC_RELAXED);
+  char what[RingBytes + 64], note[48] = "";
+  if (state == 1) snprintf(what, sizeof what, "printing line %u for %llu ms (%s)", lineNo, stateMs, last);
+  else if (state == 2) snprintf(what, sizeof what, "past line %u for %llu ms: its access (%s)", lineNo, stateMs, last);
+  else if (state == 3) snprintf(what, sizeof what, "adreno830_start returned %llu ms ago", stateMs);
+  else snprintf(what, sizeof what, "no line printed yet");
+  if (noteSince) snprintf(note, sizeof note, ", inside IOLog for %llu ms", msOf(now - noteSince));
+  IOLog("PianoA830: hb %llu.%03llu s: bring-up thread %s; starter: %s for %llu ms%s; lines pushed %u, printed %u (%u by the bring-up "
+        "thread), sync prints skipped %u, backlog %u\n", ms / 1000, ms % 1000, what,
+        phase < sizeof kRunPhases / sizeof kRunPhases[0] ? kRunPhases[phase] : "?",
+        msOf(now - __atomic_load_n(&gRunSince, __ATOMIC_RELAXED)), note, head, __atomic_load_n(&gPrinted, __ATOMIC_RELAXED),
+        __atomic_load_n(&gPrintedSync, __ATOMIC_RELAXED), __atomic_load_n(&gSyncSkipped, __ATOMIC_RELAXED), head - tail);
+}
+
 void logger(void *, wait_result_t)
 {
   char line[RingBytes];
   canaryStart();
+  uint64_t second = 0, lastBeat = 0;
+  nanoseconds_to_absolutetime(1000000000ull, &second);
   for (unsigned tick = 0;; ++tick) {
-    uint32_t drops = 0;
-    while (ringPop(line, &drops)) {
+    if (gTraceSync && gPrintLock) {
+      // Never wait for the bring-up thread's print: if it is stuck inside IOLog, the heartbeat must still come.
+      if (IOLockTryLock(gPrintLock)) {
+        drainRing(false);
+        IOLockUnlock(gPrintLock);
+      }
+      const uint64_t now = mach_absolute_time();
+      const bool late = __atomic_load_n(&gSyncState, __ATOMIC_ACQUIRE) == 3 && now - gSyncSince > 120 * second;
+      if (now - lastBeat >= (late ? 30 * second : second)) {
+        lastBeat = now;
+        heartbeat();
+      }
+    } else {
+      uint32_t drops = 0;
+      while (ringPop(line, &drops)) {
+        if (drops) IOLog("PianoA830: (%u lines dropped: the ring was full)\n", drops);
+        IOLog("PianoA830: %s\n", line);
+      }
       if (drops) IOLog("PianoA830: (%u lines dropped: the ring was full)\n", drops);
-      IOLog("PianoA830: %s\n", line);
     }
-    if (drops) IOLog("PianoA830: (%u lines dropped: the ring was full)\n", drops);
     if (tick % 1000 == 0) {
       canaryCheck();
       flushHeldRows();
@@ -203,6 +339,21 @@ void logger(void *, wait_result_t)
   }
 }
 }  // namespace
+
+// piano-gpu-trace=3: called by traceAccess (Adreno830Start.cpp) after the tracer's lock, before the access (see above).
+extern "C" void boot_progress_trace_sync(void)
+{
+  if (!gTraceSync || !gPrintLock || !gRing.text) return;
+  if (!ml_get_interrupts_enabled() || ml_at_interrupt_context() || get_preemption_level() != 0) {
+    __atomic_add_fetch(&gSyncSkipped, 1u, __ATOMIC_RELAXED);   // the logger prints it
+    return;
+  }
+  IOLockLock(gPrintLock);
+  drainRing(true);
+  __atomic_store_n(&gSyncSince, mach_absolute_time(), __ATOMIC_RELAXED);
+  __atomic_store_n(&gSyncState, 2u, __ATOMIC_RELEASE);
+  IOLockUnlock(gPrintLock);
+}
 
 // ---- BootProgress hooks (Adreno830Status.h): into the ring only ------------------------------------------------------------------
 // The overlay rows: each row whose text changed (row 0 the summary, rows 1-3 the diagnostic page of piano-gpu-status=2). Once the GPU
@@ -427,38 +578,54 @@ extern "C" void piano_a830_report(IOReturn result)
 namespace {
 void run(void *, wait_result_t)
 {
+  gRunThread = current_thread();
+  runPhase(RunInit);
   const uint32_t delay = bootArg("piano-gpu-delay", 0);
   if (delay) {
+    runPhase(RunDelay);
     piano_a830_note("piano-gpu-delay=%u: waiting %u s before the %s", delay, delay, gLevel == 1 ? "survey" : "bring-up");
     IOSleep(delay * 1000);
   }
   const uint32_t defaultMask = gLevel == 1 ? uint32_t(PianoA830SurveyDefault) : 0u;
   const uint32_t mask = bootArg("piano-gpu-survey", defaultMask);
   if (gLevel == 1) {
+    runPhase(RunSurvey);
     piano_a830_note("piano-gpu=1: read-only survey (mask %#x) around the driver's S0; nothing is written, nothing is published", mask);
     piano_a830_survey(mask & PianoA830SurveyInputs);
     piano_a830_note("S0 (board inputs, read only): adreno830_start with piano-gpu-stop=0");
     piano_a830_report(piano_a830_board_start(1));
     piano_a830_survey(mask & ~uint32_t(PianoA830SurveyInputs));
     piano_a830_note("survey done (piano-gpu=1)");
+    runPhase(RunDone);
     return;
   }
-  piano_a830_note("piano-gpu=2: staged bring-up S1..S10, polled (piano-gpu-stop=%d, trace %u)", int(bootArg("piano-gpu-stop", ~0u)),
-                  gTrace);
-  if (mask) piano_a830_survey(mask);   // piano-gpu-survey=<mask>: the read-only survey first
+  piano_a830_note("piano-gpu=2: staged bring-up S1..S10, polled (piano-gpu-stop=%d, trace %u%s)", int(bootArg("piano-gpu-stop", ~0u)),
+                  gTrace, gTraceSync ? ", synchronous: piano-gpu-trace=3, a heartbeat every second" : "");
+  if (mask) {
+    runPhase(RunSurvey);
+    piano_a830_survey(mask);   // piano-gpu-survey=<mask>: the read-only survey first
+  }
+  runPhase(RunBringUp);
   const IOReturn result = piano_a830_board_start(2);
+  __atomic_store_n(&gSyncSince, mach_absolute_time(), __ATOMIC_RELAXED);
+  __atomic_store_n(&gSyncState, 3u, __ATOMIC_RELEASE);
+  runPhase(RunReport);
   piano_a830_report(result);
   piano_a830_note("bring-up %s", adreno830_running() ? "done: the GPU runs" : result == kIOReturnSuccess ? "stopped (piano-gpu-stop)" : "failed");
   // Where the GPU-side streams go, once S3 programmed the SMMU, and again once the session's Metal clients are up. Only while the GPU
   // stays on: piano-gpu-slumber would collapse CX, and an unclocked SMMU read can hang the bus.
   const Adreno830Board *board = piano_a830_board();
   if (result == kIOReturnSuccess && adreno830_status.stage >= A830SSmmu && board && !board->knobs.slumber) {
+    runPhase(RunRoutes);
     piano_a830_smmu_routes("after the bring-up");
     if (adreno830_running()) {
+      runPhase(RunWait);
       IOSleep(60000);
+      runPhase(RunRoutes);
       piano_a830_smmu_routes("60 s later");
     }
   }
+  runPhase(RunDone);
 }
 }  // namespace
 
@@ -497,10 +664,24 @@ bool PianoA830::start(IOService *provider)
     piano_a830_note("piano-gpu=%u: unknown level (1 survey, 2 bring-up); nothing done", gLevel);
     return true;
   }
-  gTrace = gLevel >= 2 && bootArg("piano-gpu-trace", 1) != 0;
+  const uint32_t traceArg = bootArg("piano-gpu-trace", 1);
+  gTrace = gLevel >= 2 && traceArg != 0;
+  gTraceSync = gLevel >= 2 && traceArg == 3;   // the driver gets 1 (PianoA830Board.cpp)
   nanoseconds_to_absolutetime(10ull * 1000000000ull, &gRowEvery);
   setProperty("piano-gpu", gLevel, 32);
   piano_a830_note("start: piano-gpu=%u (A830 chip %#x, k27 native kext, polled)", gLevel, 0x44050001u);
+  if (gTraceSync) {
+    gRing.stamp = static_cast<uint64_t *>(IOMallocZero(size_t(RingLines) * sizeof(uint64_t)));
+    gPrintLock = IOLockAlloc();
+    if (!gRing.stamp || !gPrintLock) {
+      piano_a830_note("piano-gpu-trace=3: no memory for the stamps or the print lock; the trace stays asynchronous (as 1)");
+      if (gRing.stamp) IOFree(gRing.stamp, size_t(RingLines) * sizeof(uint64_t));
+      if (gPrintLock) IOLockFree(gPrintLock);
+      gRing.stamp = nullptr;
+      gPrintLock = nullptr;
+      gTraceSync = 0;
+    }
+  }
   thread_t thread = nullptr;
   gRing.text = static_cast<char (*)[RingBytes]>(IOMallocZero(size_t(RingLines) * RingBytes));
   if (!gRing.text || kernel_thread_start(logger, nullptr, &thread) != KERN_SUCCESS) {
@@ -508,9 +689,11 @@ bool PianoA830::start(IOService *provider)
     if (gRing.text) IOFree(gRing.text, size_t(RingLines) * RingBytes);
     gRing.text = nullptr;
     gTrace = 0;
+    gTraceSync = 0;
   } else {
     thread_deallocate(thread);
-    piano_a830_note("line ring %u x %u bytes, logger thread running", RingLines, RingBytes);
+    piano_a830_note("line ring %u x %u bytes, logger thread running%s", RingLines, RingBytes,
+                    gTraceSync ? "; piano-gpu-trace=3: each trace line printed before its access by the thread making it" : "");
   }
   thread = nullptr;
   if (kernel_thread_start(run, nullptr, &thread) != KERN_SUCCESS) {

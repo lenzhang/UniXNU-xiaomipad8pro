@@ -145,7 +145,11 @@ bool bootArgument(void *, const char *name, uint32_t *value)
     *value = 0;
     return true;
   }
-  if (PE_parse_boot_argn(name, value, sizeof *value)) return true;
+  if (PE_parse_boot_argn(name, value, sizeof *value)) {
+    // piano-gpu-trace=3 is the board's synchronous printing (PianoA830.cpp); the driver's trace counts runs as with 1.
+    if (!strcmp(name, "piano-gpu-trace") && *value == 3) *value = 1;
+    return true;
+  }
   if (runLevel >= 2 && !strcmp(name, "piano-gpu-status")) {   // the diagnostic page rows in the log by default
     *value = 2;
     return true;

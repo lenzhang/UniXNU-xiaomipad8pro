@@ -7,7 +7,7 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
   there), 148 files unchanged (sha256 equal to the originals). Hardware-proven on the 13T: S0-S10 and a GPU-composited desktop under
   iPadOS 17.7.11 (gpu-native-plan.md section 2). Changed, every change marked "UniXNU-piano" in a comment and compiled only with
   -DADRENO830_MACOS (the host tests build without it, so they test the upstream code paths):
-    Adreno830Start.cpp      215e565650d176cd28c2e11e79e098195474add04ea5ae054b15e9eaa4ff0b0f -> 456d4df656aebec3b2c2ac82a9d329e1ad25441ebcfd20f812b8ceefb3eea19d
+    Adreno830Start.cpp      215e565650d176cd28c2e11e79e098195474add04ea5ae054b15e9eaa4ff0b0f -> e4a432ac25417736258758740517c29ecbcfd89007af6d8d919584e3ddcf8b80
       S9 publishMetal without the iPadOS-only staged IOAcceleratorES (no IOGPUFamily load, no static class initializer, no
       g_kernel_kmod_info): prepare/commit report steps 4/5; the macOS accelerator is the kext's AGXAccelerator personality on the
       NativeAdrenoGpuPublished service native_adreno_publish registers. The 128 KiB cmd-db snapshot on the heap (allocated once by
@@ -23,6 +23,10 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       kernel-wide secure-call lock (package/include/PianoScmLock.h, docs/scm-lock.md) through the board hook adreno830_board_scm_hold
       (weak no-op here): scmLock/scmUnlock take and give one hold after/before the driver's SCM mutex, and stageZap holds it across
       the ZAP's load (PAS 13 init_image .. auth_and_reset); the board (PianoA830.cpp) defines the word sm8750_scm_owner.
+      2026-11-11, the synchronous trace (piano-gpu-trace=3, docs/forensics-2026-11-11.md): traceAccess gives the tracer's lock back
+      before it returns (as before) and then, when the access got a line of its own, calls the board hook boot_progress_trace_sync
+      (weak no-op here), so the board can print that line from the caller's context before the access is made. Nothing else changes:
+      the tracer, its lock and the line format are upstream's.
     A830Idle.h              (new)                                                            -> b90f05f80501078f9de1429a51d73b9644278b35ae8fcd167c15abc738848512
       2026-11-11, MIT, this repository's: the idle policy's configuration, the scanout's DDR floor, the idle votes' state machine, the
       transitions' line rule and the board hooks' declarations.

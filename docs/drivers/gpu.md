@@ -70,7 +70,7 @@ kernel side must provide (2026-11-11).
 | `piano-gpu-survey=<bits>` | 0x7f at N=1, 0 at N=2 | 1 inputs/firmware, 2 GCC, 4 GPU_CC, 8 SMMU, 0x10 GMU/RSCC/CX_MISC, 0x20 DRV-2, 0x40 ZAP region, 0x80 GX GDSC (opt-in) |
 | `piano-gpu-delay=<s>` | 0 | the survey/bring-up thread starts that late (ladder images: 20, after the root) |
 | `piano-gpu-stop=N` | none | stop after S_N (N=1 forces 0) |
-| `piano-gpu-trace=0/1/2` | 1 at N=2 | the register trace: every access and SMC before it is made, counted / verbatim / off |
+| `piano-gpu-trace=0/1/2/3` | 1 at N=2 | the register trace: every access and SMC before it is made; 0 off, 1 runs counted, 2 verbatim, both printed by the logger thread from a ring (with `-v` it can lag the driver by the whole bring-up); 3 runs counted and printed synchronously by the thread making the access, before it, with each line's uptime, plus a heartbeat line every second ([../forensics-2026-11-11.md](../forensics-2026-11-11.md)); slow with `-v` (tens of seconds for S1..S10) |
 | `piano-gpu-status=0..3` | 2 at N=2 | status rows (2: the diagnostic page) |
 | other `piano-gpu-*`, `piano-screenoff`, `piano-diag` | driver's | Adreno830's `pagani-*` knobs renamed (README of `package/PianoA830/adreno830`), e.g. `piano-gpu-profile`, `piano-gpu-dcvs-max` |
 | `piano-gpu-pool=<MiB>` | an eighth of the RAM, 512..1536 (1536 on piano) | the write-combined BO pool S3 reserves (halved until it succeeds, 64..2048); §8, "The BO pool" |
