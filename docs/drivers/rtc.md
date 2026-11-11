@@ -15,7 +15,8 @@ Status 2026-11-11: built offline and host-tested; the kernel (K27_VARIANT=native
   `piano-rtc-offset=N`, measured once against the Mac's clock, else the SDAM cell Linux keeps it in. `settime.sh` then finds a set
   clock and does nothing; `droidvm-utc` stays as the fallback for a boot where the RTC gives no date.
 - **Readout:** PianoPower (level 1 is in the installed `daily` profile) logs `rtc: COUNT (DATE UTC, offset N from SOURCE), enabled E`
-  at start and with every report, with the current kernel too. Those lines plus the Mac's arrival times give N
+  with every report from the first one after IOBSD is published (so never at the same time as the kernel's read), with the
+  current kernel too. Those lines plus the Mac's arrival times give N
   (`tooling/native/rtc-offset.py`).
 
 ## 1. Purpose and gate
@@ -90,8 +91,8 @@ arbiter model, no write but observer commands) and `python3 tooling/native/test_
 
 ## 8. Hardware test plan (USB-C cable to the Mac; nothing written to the PMIC; a RAM boot, back in ABL after 300 s)
 
-Built offline 2026-11-11 (rebuild in the main checkout before a run; kernel sha256 `c4c55f1a589c82a0…`, KC `a9c439a8f301a636…`,
-RAM image `7f44f1546f5ae905…`, verify-ram-images PASS):
+Built offline 2026-11-11 (rebuild in the main checkout before a run; kernel sha256 `c4c55f1a589c82a0…`, KC `b95af75c161aeebc…`,
+RAM image `d4815251a89fcb77…`, verify-ram-images PASS):
 
 ```sh
 # the kernel: in droidvm-build/macOS-DroidVM/out/k27/xnu: git am <this repo>/patches/k27/0060-*.patch, then
@@ -109,9 +110,9 @@ PIANO_EXTRA_ARGS="piano-usb=2 piano-power=1 piano-power-period=5 piano-rtc=1" PI
    piano-rtc: RTC_RW APID <a> (owner EE <e>), EN_CTL 0x80, offset <cell> from the SDAM cell
    piano-rtc: count <C> + offset <cell> = <U>, 2026-11-.. ..:..:.. UTC: the calendar starts there
          (or: ... = <U> (year <y>) is not a date: the calendar is not set from the RTC   -> settime.sh's droidvm-utc as today)
-   PianoPower: rtc: <C> (2026-11-.. UTC, offset <cell> from the SDAM cell), enabled 1
+   PianoPower: [<s>s] rtc: <C> (2026-11-.. ..:..:.. UTC, offset <cell> from the SDAM cell), enabled 1   (the first report after IOBSD)
    PianoPower: rtc: RTC_RW APID <a> (owner EE <e>) type <t> subtype <s> EN_CTL 0x80; SDAM APID <b> (owner EE 0), offset cell reads <cell> (0x...)
-   PianoPower: [5s] rtc: <C+5> (...), enabled 1          every 5 s
+   PianoPower: [<s+5>s] rtc: <C+5> (...), enabled 1     every 5 s
    ```
    Pass: the count grows 5 per line, `enabled 1`. `rtc: not read (RTC_RW (PPID 0x061) is not in the arbiter's map)` or
    `EN_CTL read failed` means the RTC is not reachable from EE 0 (open question 1); `enabled 0` means the counter is stopped.

@@ -17,11 +17,13 @@
 // piano-power-write=0 (level 2 without the charger writes: the DSP runs on its own defaults), piano-power-hv=1 (level 2 also asks a PD
 // source with a fixed 9 V PDO for 9 V and then allows 1.6 A), piano-power-fw=DIR (the DSP's images as DIR/adsp.mbn and
 // DIR/adsp_dtb.mbn instead of modem_a). Every step logs "PianoPower: ...".
-// At both levels the PMIC RTC is read with the report (RtcReadout.h, docs/drivers/rtc.md): its count, enable bit and the date with
-// the offset of piano-rtc-offset=N or else the SDAM cell. Read only; the kernel's calendar from it is k27 0060 (piano-rtc=1).
+// At both levels the PMIC RTC is read with every report from the first one after IOBSD is published (RtcReadout.h,
+// docs/drivers/rtc.md): its count, enable bit and the date with the offset of piano-rtc-offset=N or else the SDAM cell. Read only;
+// the kernel's calendar from it is k27 0060 (piano-rtc=1).
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOBSD.h>
 #include <IOKit/IODeviceMemory.h>
 #include <libkern/libkern.h>
 #include <kern/clock.h>
@@ -293,13 +295,6 @@ bool PianoPower::probeSpmi()
     stage(-1, "SPMI arbiter");
     return false;
   }
-  fRtcProbed = true;
-  char line[200];
-  readRtcLine(line, sizeof line);
-  note("%s", line);
-  note("rtc: RTC_RW APID %d (owner EE %u) type %#x subtype %#x EN_CTL %#x; SDAM APID %d (owner EE %u), offset cell %s %u (%#x)",
-       fRtc.rtc.apid, fRtc.rtc.owner, fRtc.type, fRtc.subtype, fRtc.enCtl, fRtc.sdam.apid, fRtc.sdam.owner,
-       fRtc.sdamOk ? "reads" : "does not read:", fRtc.sdamOffset, fRtc.sdamOffset);
   fCharger = discoverCharger(gIo, fArbiter);
   note("charger PMIC (SID 7): %u peripherals, owned by EE0 %u, EE1 %u, EE2 %u, EE3 %u, others %u", fCharger.peripherals,
        fCharger.ownedBy[0], fCharger.ownedBy[1], fCharger.ownedBy[2], fCharger.ownedBy[3],
@@ -464,10 +459,18 @@ void PianoPower::report()
     else
       note("[%llus] battery: no gauge answers (A: %s, B: %s)", t, i2cName(fPack[0].error), i2cName(fPack[1].error));
   }
-  if (fRtcProbed) {
+  // The RTC from the first report after IOBSD is published: the kernel's calendar (k27 0060, IOKitInitializeTime) reads the same
+  // observer channels earlier in bsd_init, and IOKitBSDInit publishes IOBSD after it, so the two never share a channel.
+  const IOService *resources = IOService::getResourceService();
+  if (fArbiter.v7 && (fRtcProbed || (resources && resources->getProperty(kIOBSDKey)))) {
     char line[200];
     readRtcLine(line, sizeof line);
     note("[%llus] %s", t, line);
+    if (!fRtcProbed)
+      note("rtc: RTC_RW APID %d (owner EE %u) type %#x subtype %#x EN_CTL %#x; SDAM APID %d (owner EE %u), offset cell %s %u (%#x)",
+           fRtc.rtc.apid, fRtc.rtc.owner, fRtc.type, fRtc.subtype, fRtc.enCtl, fRtc.sdam.apid, fRtc.sdam.owner,
+           fRtc.sdamOk ? "reads" : "does not read:", fRtc.sdamOffset, fRtc.sdamOffset);
+    fRtcProbed = true;
   }
   PortState p;
   const bool havePort = fSpmi && fCharger.found;
