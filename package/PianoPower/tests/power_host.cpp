@@ -104,6 +104,12 @@ static void testCharger()
   t[0x06] = 0x04; t[0x08] = 0x00; t[0x0b] = 0x03;
   PortState p = readPort(io, l);
   CHECK(p.ok && p.attached && p.sourceSeen && !p.sinkSeen && p.cc == 2 && rpMilliamps(p.rpBits) == 1500);
+  // The Rp bit order (Linux's register facts): bit 1 3.0 A (the Mac's port read 0x02), bit 2 1.5 A, bit 3 the default, bit 0 alone none.
+  CHECK(rpMilliamps(0x02) == 3000 && rpMilliamps(0x04) == 1500 && rpMilliamps(0x08) == 500 && rpMilliamps(0x00) == 0);
+  CHECK(rpMilliamps(0x01) == 0);
+  t[0x06] = 0x02;
+  p = readPort(io, l);
+  CHECK(p.sourceSeen && rpMilliamps(p.rpBits) == 3000);
   t[0x06] = 0x00; t[0x08] = 0x08; t[0x0b] = 0x01;
   p = readPort(io, l);
   CHECK(p.attached && !p.sourceSeen && p.sinkSeen && p.cc == 1);

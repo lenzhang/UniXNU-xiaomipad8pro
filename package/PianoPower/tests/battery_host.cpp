@@ -72,7 +72,7 @@ int main()
     const PortState port = source(0x2);
     const BatteryValues v = mapBattery(g, 2, p, &port, 0);
     CHECK(v.external && !v.charging && !v.full && v.percent == 99);
-    CHECK(v.timeRemaining == kTimeUnknown && v.adapterMa == 500);
+    CHECK(v.timeRemaining == kTimeUnknown && v.adapterMa == 3000 && v.adapterWatts == 15);   // the Mac's port: Rp 0x2 is 3.0 A
   }
   // Full: both packs report FC on power.
   {
@@ -80,7 +80,7 @@ int main()
     const PackReading p = combinePacks(g, 2);
     const PortState port = source(0x8);
     const BatteryValues v = mapBattery(g, 2, p, &port, 0);
-    CHECK(v.full && v.percent == 100 && v.adapterMa == 3000 && v.adapterWatts == 15);
+    CHECK(v.full && v.percent == 100 && v.adapterMa == 500);   // Rp bit 3: the default USB current
   }
   // The floor: on battery the percentage shown never goes under it; on power, and with no floor, the true value.
   {

@@ -32,7 +32,7 @@ struct BatteryValues {
   int temperatureCenti = 0;    // 0.01 degC
   bool temperatureValid = false;
   unsigned timeRemaining = kTimeUnknown, timeToEmpty = kTimeUnknown, timeToFull = kTimeUnknown;  // minutes
-  // the adapter, when a source is seen on the Type-C port (its Rp current is inferred, ChargerPmic.h)
+  // the adapter, when a source is seen on the Type-C port (its Rp current, ChargerPmic.h)
   bool adapter = false;
   unsigned adapterMv = 0, adapterMa = 0, adapterWatts = 0;
   uint32_t adapterFamily = 0;  // kIOPSFamilyCode value: 0xe0004009 USB Type-C (UniXNU-sheng ShengBattmgr.c's table)

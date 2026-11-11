@@ -7,8 +7,9 @@
 //   it, each moved by 0x300 for SUBTYPE 0xba..0xc4: DCDC +0x100, USBIN +0x300, Type-C +0x600;
 //   Type-C +0x06 sink status (a source's Rp seen: bits 1..3), +0x08 source status (a sink's Rd: bits 3, 2), +0x0b bit 0 attached,
 //   bit 1 the CC line (0 CC1, 1 CC2), +0x44 the port mode; DCDC/USBIN/Type-C +0x10 the real-time interrupt status.
-// Which Rp bit means which current is not in those facts: the log shows the bits, decoded as Qualcomm's SCHG sink status usually
-// orders them (bit 1 default USB, bit 2 1.5 A, bit 3 3.0 A), marked as inferred.
+// The Rp bits of the sink status (Linux's qcom_pmic_typec_port.c register facts, GPL, read for facts only; docs/drivers/usb-host.md
+// §facts): bit 3 default USB current, bit 2 1.5 A, bit 1 3.0 A (bit 0 a shorted CC). Until 2026-11-11 this file had the order
+// reversed (inferred), so the level-1 run's "Rp 0x2 = 500 mA" on the Mac's port was 3.0 A.
 #ifndef PIANO_POWER_CHARGER_PMIC_H
 #define PIANO_POWER_CHARGER_PMIC_H
 #include <stdint.h>
@@ -114,8 +115,9 @@ struct PortState {
   uint8_t rpBits = 0;           // sink status bits 3:1
 };
 
-// The source's advertised current from the Rp bits (inferred bit order, see the header comment): 0 none, else mA.
-inline unsigned rpMilliamps(uint8_t rpBits) { return rpBits & 0x8 ? 3000 : rpBits & 0x4 ? 1500 : rpBits & 0x2 ? 500 : 0; }
+// The source's advertised current from the Rp bits (bit 1 3.0 A, bit 2 1.5 A, bit 3 the default: 500 mA, a USB 2.0 port's; a USB 3
+// port's default is 900 mA, which Rp does not tell): 0 none, else mA.
+inline unsigned rpMilliamps(uint8_t rpBits) { return rpBits & 0x2 ? 3000 : rpBits & 0x4 ? 1500 : rpBits & 0x8 ? 500 : 0; }
 
 inline PortState readPort(const Io &io, const ChargerLayout &l)
 {
