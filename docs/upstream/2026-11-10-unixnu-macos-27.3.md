@@ -14,9 +14,10 @@ Checkouts under `~/Downloads/XiaomiPad8Pro-Ubuntu/unixnu-research/`, fast-forwar
     `target = "macosx"` (defines `XNU_TARGET_OS_OSX`: padded vtables, macOS paths) plus a 26-patch macOS series:
     Darwin 26 syscalls/KPIs, 8 GiB arm64 shared region, 47-bit user VA, union one-volume root, owner Data firmlinks,
     read-only system volume + apfs boot shim, kqworkloop limits, exec-log, verbose text console (`vc-text=1`),
-    app cryptex (Safari), swap files, and **`macos-droidvm-k27-parity.patch`**. README: "The macOS 27 profile
-    follows macOS-DroidVM … for its kernel patches (union root, 4K code-signature pages, 24 MHz timebase, realtime and
-    mmap fixes, exec denial) and for the account setup in the Data seed." Our k27 work is now upstream in spirit.
+    app cryptex (Safari), swap files, and **`macos-droidvm-k27-parity.patch`**. README: the macOS 27 profile
+    follows the earlier VM-based port for its kernel patches (union root, 4K code-signature pages, 24 MHz timebase, realtime
+    and mmap fixes, exec denial) and for the account setup in the Data seed. The k27 baseline series' changes are now
+    upstream in spirit.
   - Payload: macOS Data seed with accounts/auto-login/home, GPU bundle layout + prime list, addon `/usr/sbin` and
     `/usr/lib` overlays, `/chosen/asmb` local boot policy, boot volume named in `/chosen`.
   - Boot args lost the `sheng-` prefix (`dpu-scanout=2`, `fb-bgra=1`, `touch=4`, …).

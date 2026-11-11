@@ -32,7 +32,7 @@ and measured: `ubuntu-history/kernel.md`, `ubuntu-history/device.md`), **inferre
 | attach: INTID 32..1019 (= SPI + 32), ICENABLER, wait RWP, Group 1, priority 0xa0, ICFGR edge/level, IROUTER = the boot CPU, ISENABLER; one handler per INTID (second: `kIOReturnExclusiveAccess`), 16 slots | verified | same disassembly; ArmCpu source |
 | The handler runs in ArmCpu's IRQ loop in primary interrupt context, before the EOI; an SPI with no handler is disabled at the GIC and counted (`armcpu_spi_unhandled`) | verified (source) | ArmCpu.cpp `interrupt()` |
 | No SPI-level `IOInterruptController` is registered (only ArmCpu's per-CPU `IOCPUInterruptController`), so `registerInterrupt`/`IOInterruptSpecifiers` on a nub reach nothing; the Apple vma2 KC keeps no AIC/GIC kext | verified | `kc-keep.txt`; ArmDTPlatform publishes plain nubs |
-| The VM's virtio kexts (DroidVMInput, DroidVMEthernet, NativeVirtioBlock) used no interrupts at all: they polled (NO_INTERRUPT rings) | verified | droidvm-build overlay sources (read only) |
+| The VM-era virtio kexts (input, Ethernet, virtio block) used no interrupts at all: they polled (NO_INTERRUPT rings) | verified | the VM-era kext sources (read only) |
 | No native SPI has been taken yet: PianoA830 links weak refusing `armcpu_spi_*` and polls; NativeUfs is built `NATIVE_UFS_POLL_ONLY`. PianoDwc3 `piano-usb-irq=1` is the first | verified (source) / **needs-boot** | `A830Irq.cpp`, `build-native-ufs.sh` |
 | The KC links `_armcpu_spi_attach` from the kernel for our kexts (`resolve()` takes the kernel's symbol first; PianoA830's weak copy stays its own) | verified | `kc-build.py resolve()`; the KC link of this change |
 

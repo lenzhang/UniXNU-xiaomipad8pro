@@ -17,7 +17,7 @@ run on the tablet.** Every saving below is an estimate until the test in §6 has
   and the USB console still get every line. Estimated saving: 15-40 s.
 - **loginwindow waits 5.0 s** in MobileGestalt for an IOKit match that never comes ("giving up waiting for match"), on every
   launch (measured in the 05:40 run's unified log). The fix needs the matched service, which is still unknown (§3.3).
-- **`droidvm-disable-jobs` does nothing natively.** Its reader was the iPadOS line's kernel (`DroidVMLaunchPolicy.c`). The k27
+- **`droidvm-disable-jobs` does nothing natively.** Its reader was the iPadOS line's kernel launch policy (VM-era sources, not in this repository). The k27
   kernel and the KC contain no reader (0 matches), and bluetoothd, locationd and watchdogd run in every native run. The native way
   to keep a daemon from running is k27's `k27-deny-exec=PATH[,PATH...]`. Its default is `/usr/libexec/mobileactivationd`, and
   setting the argument replaces that default. `PIANO_FAST_BOOT=2` adds watchdogd to it, which ends watchdogd's crash loop (about 8
@@ -116,9 +116,9 @@ bound.
 ### 3.3 WindowServer → loginwindow → SecurityAgent → the lit frame (T 66 to ~150)
 
 - logind (pid 88) starts the console session, and launchd spawns the `loginwindow console` instance on its request
-  (`droidvm-build/piano-patches/loginwindow-launch.md` §2). In the 07:44 run loginwindow came 84 pids after WindowServer. In the
-  05:22 run it came 4 pids after. The trigger is not in doubt; what delays the request is not visible in the console. The
-  diagnostic run (§6, run D) samples logind and loginwindow.
+  (the local bring-up notes, `loginwindow-launch.md` §2, not published). In the 07:44 run loginwindow came 84 pids after
+  WindowServer. In the 05:22 run it came 4 pids after. The trigger is not in doubt; what delays the request is not visible in the
+  console. The diagnostic run (§6, run D) samples logind and loginwindow.
 - **loginwindow's MobileGestalt wait** (05:40 run, `logs/native-runs/20261111-054010-loop`, its log loop printed loginwindow's
   unified log). For loginwindow 616, a warm relaunch:
   - 39.347 `Login Window Application Started`; 39.509 `WindowServerConnectionMade`;
@@ -169,7 +169,7 @@ bound.
 
 ## 4. droidvm-disable-jobs and watchdogd
 
-- Reader: `droidvm-build/UniXNU-droidvm/package/DroidVMLaunchPolicy.c` (the iPadOS line's kernel, `XNU_BOARD_LAUNCH_POLICY`)
+- Reader: the iPadOS line's kernel launch policy (`XNU_BOARD_LAUNCH_POLICY`; VM-era sources, not in this repository)
   writes the listed labels into launchd's `disabled.plist` before launchd starts. k27's patches (0001-0060) have no such hook:
   `droidvm-disable-jobs` has 0 matches in `kernel-k27-0059-native.macho`, `kernel-k27-0060-native.macho` and
   `out/k27/kc-k27-native.bin`. The only userland that touches it is settime.sh's `sysctl kern.bootargs | tr` (seen in stderr-log).

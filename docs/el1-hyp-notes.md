@@ -10,7 +10,7 @@ read-only (`cat`, `dmesg`, cpufreq sysfs); evidence files are in `hyp-evidence/`
 | Fact | State | Evidence |
 |---|---|---|
 | Linux runs at EL1 ("All CPU(s) started at EL1"), Gunyah 51/v1 at EL2, `/dev/gunyah` present, no `/dev/kvm` | verified | plan §2 (tablet dmesg) |
-| arm64e k27 (xnu-12377 + 0001-0054) already runs the macOS 27.0.1 userland at EL1 under this Gunyah, as a VM guest | verified | macOS-DroidVM, VM accept path |
+| arm64e k27 (xnu-12377 + 0001-0054) already runs the macOS 27.0.1 userland at EL1 under this Gunyah, as a VM guest | verified | the earlier VM-based port's accept path |
 | UniXNU ports on SM8750 (OnePlus 13T, Ace 6, Odin 3) run XNU at EL1 as the HLOS under the same hypervisor | verified (their records) | `UniXNU/devices.toml`, `UniXNU-Pagani_SM8750` |
 
 ## 1. Watchdogs
@@ -56,7 +56,7 @@ Full table: `hyp-evidence/memory-map-running-dt.txt` (16 GiB unit; ABL-fixed `/m
 | MPIDRs: 0x0, 0x100, 0x200, 0x300, 0x400, 0x500 (cluster 0, core in Aff1) and 0x10000, 0x10100 (cluster 1 in Aff2) | verified | live DT `cpu@*`; `UniXNU-sm8750-common/dts/sm8750.dtsi` |
 | Capacities 1792 (cores 0-5, 3.53 GHz) and 1894 (cores 6-7, 4.32 GHz) | verified | `hyp-evidence/cpus-psci-watchdog-running.txt` |
 | ADT cluster types: cores 0-5 **E**, cores 6-7 **P** (k27 is AMP and needs an E cluster for background QoS; the six slower cores are it) | decision | `dts/piano.dts`; `logs/adt/piano-k27-adt.txt` |
-| k27 masked MPIDR Aff1/Aff0 only in the reset handler (`and x0, x15, #0xFFFF`) and `ml_get_cpu_number`, so cpu6/cpu7 would have taken cpu0's/cpu1's cpu_data: **fixed** in k27 patch 0054 (Aff2|Aff1|Aff0; neutral in the VM where Aff2 = 0), as UniXNU-sm8750-common's `sm8750-smp.patch` does for UniXNU kernels | verified (source, disassembly) | macOS-DroidVM `patches/xnu-12377/0054-*`; `llvm-objdump` shows `and x0, x15, #0xffffff` and `and w8, w8, #0xffffff` |
+| k27 masked MPIDR Aff1/Aff0 only in the reset handler (`and x0, x15, #0xFFFF`) and `ml_get_cpu_number`, so cpu6/cpu7 would have taken cpu0's/cpu1's cpu_data: **fixed** in k27 patch 0054 (Aff2|Aff1|Aff0; neutral in the VM where Aff2 = 0), as UniXNU-sm8750-common's `sm8750-smp.patch` does for UniXNU kernels | verified (source, disassembly) | `patches/k27/0054-k27-SM8750-MPIDRs-Affinity2-in-the-reset-handler-s-and-ml_ge.patch`; `llvm-objdump` shows `and x0, x15, #0xffffff` and `and w8, w8, #0xffffff` |
 | ArmCpu (CPU_ON over the ADT /psci method, SGIs with Aff2 encoded in ICC_SGI1R) handles these MPIDRs | inferred (source) | `ArmCpu/ArmCpu.cpp` (sgi1r encoding, start check on the low 16 bits) |
 | Bring-up order: 1 CPU first (`cpus=1` entry), 8 CPUs as the second menu entry | decision | `out/ram` macOS image menu |
 | 8 CPUs with two cluster types under k27 | VM test (item 4) / needs-boot | `el1-slice1-report.md` item 4 |

@@ -106,7 +106,7 @@ piano-cpuidle: RPMh sleep aosd 0 entries 0.000 s, cxsd 0 entries 0.000 s, ddr 0 
 | Fact | State | Source |
 |---|---|---|
 | IOPMrootDomain sleeps through `IOPlatformExpert::sleepKernel → IOCPUSleepKernel` (this board has no `USE_APPLEARMSMP`): `haltCPU()` per CPU, then `processor_sleep`; the boot CPU ends in `ml_arm_sleep → arm64_prepare_for_sleep`, which on this board is a WFI loop (a Mac's SoC powers off there and comes back through the reset vector) | verified | `iokit/Kernel/IOCPU.cpp`, `osfmk/arm64/cpu.c`, `machine_routines_asm.s` |
-| ArmCpu's `haltCPU` runs on the caller: it masks DAIF and spins in WFI. The first `haltCPU` (for a secondary, on the boot CPU) would hang the tablet. Its `initCPU(false)` panics ("secondary resume is unsupported"); `quiesceCPU` returns, which ends in "zombie processor" | verified | ArmCpu.cpp, the copy linked into k27 (`droidvm-build/macOS-DroidVM/out/k27/src/platform/ArmCpu`) |
+| ArmCpu's `haltCPU` runs on the caller: it masks DAIF and spins in WFI. The first `haltCPU` (for a secondary, on the boot CPU) would hang the tablet. Its `initCPU(false)` panics ("secondary resume is unsupported"); `quiesceCPU` returns, which ends in "zombie processor" | verified | ArmCpu.cpp, the copy linked into k27 (`$PIANO_K27_TREE/out/k27/src/platform/ArmCpu`) |
 | Gunyah's SYSTEM_SUSPEND is DENIED unless every other vCPU is CPU_OFF (ArmCpu cannot bring one back); Linux on this tablet never uses PSCI system suspend either: s2idle (`SuspendState=freeze`) | spec; Ubuntu | `psci_osi`; device.md §2.1 |
 | Every native ADT says `/defaults sleep-disabled = 1`; IOPMrootDomain reads it at boot completion and refuses every sleep (`kPMConfigPreventSystemSleep`) | verified | `configs/k27-adt.toml`, `IOPMrootDomain.cpp` |
 
@@ -280,14 +280,14 @@ A stuck tablet: power + volume-down for 15-20 s.
 
 **Build** (main checkout; the k27 tree at 0060):
 ```sh
-# kernel: in droidvm-build/macOS-DroidVM/out/k27/xnu: git am <this repo>/patches/k27/0061-*.patch <this repo>/patches/k27/0062-*.patch
-K27_VARIANT=native ../droidvm-build/macOS-DroidVM/build-k27-piano.sh      # then copy .../mach.development.bcm2837.unstripped
+# kernel: in $PIANO_K27_TREE/out/k27/xnu: git am <this repo>/patches/k27/0061-*.patch <this repo>/patches/k27/0062-*.patch
+K27_VARIANT=native "$PIANO_K27_TREE/build-k27-piano.sh"                 # then copy .../mach.development.bcm2837.unstripped
                                                                            #   to out/k27/kernel-k27-0062-native.macho there
 tooling/k27/test-piano-pm.sh                                               # host tests (add --kext with K27_KERNEL=... for the contract)
 K27_KERNEL=$K/out/k27/kernel-k27-0062-native.macho PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh   # KC + ADT
 tooling/k27/build-pm-test-images.sh            # out/ram-pm-{base,probe,idle1,idle2,idle1pd,idle3,sleep0,sleep1,sleep2,sleepkey,measure}
 ```
-(`$K` = `droidvm-build/macOS-DroidVM`. Built offline here from an APFS clone of the k27 tree with its own object directory: kernel
+(`$K` = `$PIANO_K27_TREE`. Built offline here from an APFS clone of the k27 tree with its own object directory: kernel
 sha256 `24940c6dd10bee7d…`, KC with the 14 native kexts `f0a92af1f3696fc4…`, layout check passed; images `ram-pm-probe`
 `6581b37722ae39d9…`, `ram-pm-idle2` `f0332cca1569821f…`, `ram-pm-sleep1` `c6e3492ac15a9597…` — rebuild in the main checkout before a
 run. For `sleepkey` with the cover: `PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/PianoKeyboard.json` in the KC build.)

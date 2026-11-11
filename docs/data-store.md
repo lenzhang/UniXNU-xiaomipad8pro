@@ -139,7 +139,7 @@ After a flatten:
 How macOS finds the plugin:
 - PianoA830's `AGXAccelerator` publishes `MetalPluginName NativeAdrenoMetal`.
 - IOGPU looks for `<name>.bundle` first in `/Library/GPUBundles`, then in `/System/Library/Extensions` (`stage-soft-metal.py`,
-  macOS-DroidVM's `stage-gpu-plugin.py`). `/Library` is a firmlink into the **Data** volume.
+  as the VM-era `stage-gpu-plugin.py` did). `/Library` is a firmlink into the **Data** volume.
 - The plugin's Mach-Os are ad hoc signed. They load only while their CDHashes are in the static trust cache, the ESP's
   `kernel.macho.trustcache`, which AMFI and libsystem_sandbox's `gpu_bundle_find_trusted` consult.
 

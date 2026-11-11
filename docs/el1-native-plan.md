@@ -67,15 +67,15 @@ in the VM. What is new is running the same kernel as the HLOS with real devices.
   work and are not UniXNU upstream: the k27 XNU patch set and build scripts (`build-k27-piano.sh` generalised), the
   kernel-collection tooling (`k27/kc-build27*.py`, `kc27-layout.py`, `segaddrs`), the macOS DarwinBoot variant and
   payload tooling (`scripts/build-darwinboot.py`, `piano-macos-boot.py` make_adt/kernel_args), the IOMFB "top half"
-  display driver (DroidVMDisplay minus virtio), the Metal plugin/bridge/Turnip build for macOS 27, the owner-root and Data
-  seed staging (`stage-piano.sh`, `stage-gpu-plugin.py`, systemos/os image recipes). The name does not block anything:
+  display driver (the VM-era display kext minus virtio), the Metal plugin/bridge/Turnip build for macOS 27, the owner-root
+  and Data seed staging (`stage-piano.sh`, `stage-gpu-plugin.py`, systemos/os image recipes). The name does not block anything:
   start it as a directory in the device repo (`tooling/`) and split when a second board needs it.
 - **Upstream dependencies, not forks:** `UniXNU/UniXNU` (core, kits, `XnuPrelink`), `UniXNU-sm8750-common`,
   `Adreno830`, `AdrenoMetal`, `ShengUfs`, `QcomDwc3`, `ShengNovatekTouch`, `Ath12kWifi`, `QcaBluetooth`, Mu-Silicium
   (`hackios-mu-silicium` `annibalePkg` as the SM8750 Xiaomi template). Pin commits in `unixnu.lock`.
 
 Git for this session: none. The follow-up implementation session creates the repos. If it wants to snapshot the frozen
-guest path first, a local archive branch in `droidvm-build/` is fine as long as it touches no remote and no boot chain.
+guest path first, a local archive branch of the VM-era work tree is fine as long as it touches no remote and no boot chain.
 
 ---
 
@@ -86,7 +86,7 @@ Each workstream has an owner-independent input set and a verifiable output. None
 ### (a) Read-only hypervisor / exception-level notes
 
 Mostly done (section 2). Produce `el1-hyp-notes.md` in the device repo with the verified table above plus answers to
-these, from sources that need no tablet access (the piano kernel source `~/kfirst/linux` v1.1.0 on the private build host, the
+these, from sources that need no tablet access (the piano kernel source `~/kfirst/linux` v1.1.0 on the signing host, the
 tablet's `/proc/config.gz` copy, the live DT dump already used for `PIANO-XNU-PLAN.zh-CN.md`, the backups):
 
 1. **Watchdogs.** Does the HLOS have to pet anything to stay alive? Check `GUNYAH_WATCHDOG=y` in the piano config and
@@ -118,11 +118,11 @@ read-only (`cat`, `zcat`, `dmesg`); the owner has already captured the dmesg lin
 ### (b) Boot-chain scaffolding: UEFI, BootShim, DarwinBoot, boot image (build and verify artifacts only)
 
 Inputs: `hackios-mu-silicium` (`Platforms/Xiaomi/annibalePkg`, Redmi K90, Xiaomi SM8750), `uefi-sheng` (UniXNU
-integration), the stock `uefi`/`xbl_config`/`imagefv` partition images from the 2026-11-10 backup (the private build host
-`~/piano-backup-20261110/`, Mac subset `droidvm-build/piano-backup-20261110/`), the merged piano DTB (Ubuntu set's
-`vendor_boot` base DTB + `dtbo`, or the mainline `sm8750-xiaomi-piano.dtb`), `boot-profile.json` (header fields of the
-stock v2 container) and `tools/aosp-avb.json`, `tools/build-boot.py` from `xiaomipad-8pro-mainline` (how the Ubuntu set
-is packaged and signed with `boot-signing.pem`).
+integration), the stock `uefi`/`xbl_config`/`imagefv` partition images from the 2026-11-10 backup (the signing host
+`~/piano-backup-20261110/`, Mac subset in the local partition backup, `PIANO_PARTITION_BACKUP`), the merged piano DTB
+(Ubuntu set's `vendor_boot` base DTB + `dtbo`, or the mainline `sm8750-xiaomi-piano.dtb`), `boot-profile.json` (header
+fields of the stock v2 container) and `tools/aosp-avb.json`, `tools/build-boot.py` from `xiaomipad-8pro-mainline` (how
+the Ubuntu set is packaged and signed with `boot-signing.pem`).
 
 Steps:
 1. `pianoPkg` from `annibalePkg`: `Resources/Configs/piano.toml` (FD base/size, check `0xA7100000`/3 MiB against piano's
@@ -133,11 +133,11 @@ Steps:
    `UniXNURamDiskDxe`, DiskIo, Fat, `UniXNU.inf`, `DarwinBoot.inf`, a `PianoBootMemoryDxe`.
 2. BootShim built with `-DFD_BASE -DFD_SIZE -DREQUIRES_KERNEL_HEADER=1`; kernel field = gzip(BootShim ‖ FD), DTB
    appended; ramdisk = the FAT payload (`UniXNU.efi` config, `DarwinBoot.efi`, k27 kernel collection, ADT, trust caches,
-   Data seed). Reuse `macOS-DroidVM/scripts/build-darwinboot.py` and the `darwinboot-reclaim-memory-and-512mb-kernel`
+   Data seed). Reuse the k27 tree's `scripts/build-darwinboot.py` and the `darwinboot-reclaim-memory-and-512mb-kernel`
    patch; the macOS DarwinBoot variant already loads our KC.
 3. Package two images with the stock v2 container exactly as the Ubuntu set is built: `boot-piano-uefi-ram.img`
    (for `fastboot boot`, UniXNU menu only) and `boot-piano-macos-ram.img` (menu + DarwinBoot + KC). Sign with the same
-   key and tooling as the Ubuntu set (the key never leaves the tablet/the private build host `private-install-work/`).
+   key and tooling as the Ubuntu set (the key never leaves the tablet/the signing host `private-install-work/`).
 4. Verify offline: header fields equal `boot-profile.json` except sizes; `avbtool verify_image` with the public key;
    the gzip stream unpacks to BootShim+FD with the expected FD base; the appended DTB is the piano DTB; the FAT payload
    mounts and lists the files; SHA-256 of every artifact recorded in `ARTIFACTS.md`. For UEFI itself there is no
@@ -148,7 +148,7 @@ nothing flashed. The images wait for the cable.
 
 ### (c) XNU: 4 KiB pages, EL1 without Apple's EL2/SPTM contract, device tree / ADT
 
-Inputs: `macOS-DroidVM/patches/xnu-12377/0001..0052`, `build-k27-piano.sh`, `k27/`, the KDK recipe (memory
+Inputs: the k27 tree (xnu-12377 + the baseline series 0001-0052, XNU 27.0.1), `build-k27-piano.sh`, `k27/`, the KDK recipe (memory
 `piano-macos-k27-build`), `scripts/piano-macos-boot.py` (make_adt from an FDT), UniXNU `docs/xnu/four-k-page-tables.md`
 and `docs/porting/arm64e.md`, `UniXNU-sm8750-common/patches/xnu/sm8750-smp.patch`, `drivers/ArmDTPlatform`, `ArmCpu`.
 
@@ -163,7 +163,7 @@ Work:
    0050's 16-bit ASIDs (harmless), keep 0051 bootstrap-table sizing and 0052 zone VA. Add a build flag for
    `XNU_NATIVE_ARCH_TIMER` already in `start.S` and check the 24 MHz timebase patch (0042) against the real
    `cntfrq` (Linux reports it; usually 19.2 MHz on this SoC: the VM's 24 MHz came from crosvm).
-2. **ADT from the real DTB.** Extend `piano-macos-boot.py`'s make_adt (or UniXNU's `make-droidvm-adt.py`) to take the
+2. **ADT from the real DTB.** Extend `piano-macos-boot.py`'s make_adt (or UniXNU's VM ADT generator) to take the
    piano FDT: `/cpus` with 8 entries and `cluster-type`, `/arm-io` children for GIC, timer, the SPMI/PMIC, GENI SE for
    touch (`spi@a88000`) and keyboard (`i2c@a98000`), UFS `0x1d84000`, DWC3 `0xa600000`, MDSS `0xae00000`, GPU
    `0x3d00000` + GMU `0x3d6c000`, `/defaults`, `/options`, `/chosen` with the NVRAM proxy, `dram-base`/`dram-size` from
@@ -176,8 +176,8 @@ Work:
 4. **Drivers in the kernel, UniXNU style.** Natively, drivers are static archives linked into the kernel
    (`[kernel] archives`), gated by boot args and started by `Stage7Probe`. Plan the archive list for piano:
    ArmDTPlatform, ArmCpu, NativeAES, NativeRamBlock, NativeUfs, the IOMFB display top half, GopFramebuffer, QcomGeniSpi,
-   touch, keyboard, PMIC/charging, Adreno830 + Sm8750Platform + the macOS AdrenoMetal glue (`DroidVMGpuKext.cpp`
-   becomes the AGXAccelerator publisher for the real KMD).
+   touch, keyboard, PMIC/charging, Adreno830 + Sm8750Platform + the macOS AdrenoMetal glue (the VM-era GPU kext's
+   AGXAccelerator becomes the publisher for the real KMD).
 5. **Logging without a UART.** Decide the bring-up console: UniXNU's on-panel log window (`sheng-log`) plus a panic
    region (`XNU_DT_PANIC_REGION=1` already in the build) that Ubuntu can read back after a reboot if the region survives
    (test with a marker). The DockChannel serial dext stays for a later USB gadget console.
@@ -190,8 +190,8 @@ the mainline DTB with a diff against the VM ADT reviewed; the native KC boots to
 
 Order by what gates a login: display first frame → storage → input → charging → GPU → Wi-Fi → audio.
 
-1. **Display.** Keep DroidVMDisplay's IOMFB top half (swap queue, timing/colour elements, `IOMobileFramebufferABI.h`
-   for 27.0.1) and give it two bottom halves:
+1. **Display.** Keep the VM-era display kext's IOMFB top half (swap queue, timing/colour elements,
+   `IOMobileFramebufferABI.h` for 27.0.1) and give it two bottom halves:
    - **GOP/splash adoption** (first light): write the composited frame into the ABL splash framebuffer (CPU copy, as
      the VM's simplefb stage did). UniXNU `GopFramebuffer` / `NativeMobileDisplay` with `sheng-dpu-scanout=2` style
      pipe readout is the template (`docs/porting/display.md`).
@@ -278,7 +278,7 @@ owner present. Rules from `xiaomipad-8pro-mainline/docs/FLASHING.en.md`: never w
 |---|---|
 | k27 kernel + patches 0001–0052, build recipe, KDK handling, KC tooling | workstream (c), shared tooling |
 | macOS DarwinBoot variant, payload/FAT tooling, ADT generator (`piano-macos-boot.py` make_adt) | (b), (c) |
-| DroidVMDisplay IOMFB top half + `IOMobileFramebufferABI.h`; the 8-bit scanout design (format selection patch, DPU format/scaler/pitch table, fence and lifetime rules, R1–R10 risks) | (d.1) |
+| the VM-era display kext's IOMFB top half + `IOMobileFramebufferABI.h`; the 8-bit scanout design (format selection patch, DPU format/scaler/pitch table, fence and lifetime rules, R1–R10 risks) | (d.1) |
 | Metal plugin, bridge, metal2vulkan, macOS Turnip build, render-barrier fix, `TU_DEBUG=sysmem` knowledge | (d.5) userspace unchanged |
 | Owner root policies, systemos/os image recipes, Data seed staging (`stage-piano.sh`, disabled daemons list: fskitd, AppSSODaemon, cryptexd), VirtualMac2,1 identity, E-core AMP finding, en0 seeding idea | (d.2), (c) |
 | KMS/evdev measurements: panel modes/IRQs/power (`thin-direct-measurements.md`), touch ranges/calibration/letterbox math in `crosvm-kms/display_kms.c`, keyboard/touchpad/lid device facts (`streamB-input-report.md`) | (d.1), (d.3) as specification |
@@ -293,7 +293,7 @@ owner present. Rules from `xiaomipad-8pro-mainline/docs/FLASHING.en.md`: never w
 | crosvm-mmio tree, `crosvm-kms/`, every crosvm/virgl/virtio-media patch and `.py` patcher | VM only |
 | ghk.ko, crosvm-ghk anchor, tiny guest, `kernel-first/` | VM only; stage 4 passed, vhost-net+ghk not rerun |
 | Thin roots (`/home/thin/thin-{2..5}.sqfs`), `99thin` dracut picker, `thin/`, `thin-direct/` scripts | VM only; still need the cable to bake into a boot image |
-| DroidVM virtio kexts: Ethernet, Audio, Video (VT paravirt), VirtioBlock, Input, Gpu tunnel | replaced natively by real drivers |
+| the VM-era virtio kexts: Ethernet, Audio, Video (VT paravirt), VirtioBlock, Input, Gpu tunnel | replaced natively by real drivers |
 | The 3200x2136 GPU-hang investigation under virgl | restart natively if it reappears |
 | `macos-direct.sh`, `direct.sh`, `direct-ended.sh`, `macos-vm-*` units | documented in `gunyah-guest-SWITCHBACK.md` |
 
