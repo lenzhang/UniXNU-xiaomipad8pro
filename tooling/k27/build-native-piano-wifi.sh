@@ -1,11 +1,15 @@
 #!/bin/bash
 # Build package/PianoWifi (the WCN7860 Wi-Fi on PCIe0: level 1 a read-only survey, level 2 the power sequence, level 3 the PCIe0
-# root complex and the link, level 4 the firmware over MHI) as a k27 native kext: the host tests first (tests/wifi_host.cpp: the
-# level 1 read gates, the decoders, the SMMU scan, the cmd-db lookup and the PMIC survey; tests/bringup_host.cpp: the rail votes,
-# the pin and PHY sequence order, the link polls and their timeouts, the configuration space and BAR sizing, the MHI boot state
-# machine, each with its injected faults), then the objects in out/native-kexts/PianoWifi for tooling/k27/kext/PianoWifi.json.
-# Inert without the boot argument piano-wifi (docs/drivers/wifi.md). No firmware is in the build: level 4 reads it at run time from
-# the tablet's own modem_a partition.
+# root complex and the link, level 4 the firmware over MHI, level 5 the firmware's QMI service, level 6 the copy engine, the host
+# transport and a passive scan) as a k27 native kext: the host tests first (tests/wifi_host.cpp: the level 1 read gates, the
+# decoders, the SMMU scan, the cmd-db lookup and the PMIC survey; tests/bringup_host.cpp: the rail votes, the pin and PHY sequence
+# order, the link polls and their timeouts, the configuration space and BAR sizing, the MHI boot state machine;
+# tests/qmi_host.cpp: the QMI codec, the router, the MHI channels and the WLAN firmware's service; tests/wmi_host.cpp: the copy
+# engine's registers and rings, the transport's handshake and credits, the firmware's message interface, the scan and its list —
+# each with its injected faults), then the objects in out/native-kexts/PianoWifi for tooling/k27/kext/PianoWifi.json. The macOS
+# side of level 6 (en1) is its own kext: tooling/k27/build-native-piano-wifi-ethernet.sh. Inert without the boot argument
+# piano-wifi (docs/drivers/wifi.md). No firmware is in the build: levels 4 and 5 read it at run time from the tablet's own
+# modem_a partition.
 #   environment: PIANO_K27_TREE (the k27 tree, read only: its compile recipes), K27_OBJ (default k27-native-obj), CXX (host compiler
 #                for the tests, default c++), K27_KERNEL (for the import check; skipped when absent)
 set -euo pipefail
@@ -15,7 +19,7 @@ P=$D/package/PianoWifi; O=$D/out/native-kexts/PianoWifi
 mkdir -p "$O/host-tests"
 # WifiQrtr.c (the copy of PianoPower's QRTR codec) is a C source: the level 5 test links its object.
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/WifiQrtr.c" -o "$O/host-tests/WifiQrtr.o"
-for t in wifi_host bringup_host qmi_host; do
+for t in wifi_host bringup_host qmi_host wmi_host; do
   EXTRA=; [ "$t" = qmi_host ] && EXTRA="$O/host-tests/WifiQrtr.o"
   "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/$t.cpp" $EXTRA -o "$O/host-tests/$t"
   "$O/host-tests/$t" || { echo "Error: PianoWifi host tests failed ($t)" >&2; exit 1; }

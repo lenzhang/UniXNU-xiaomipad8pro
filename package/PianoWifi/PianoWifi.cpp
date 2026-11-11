@@ -23,7 +23,16 @@
 //                  radio's and the chip's capability, the indication registration, the host capability, the firmware's memory
 //                  regions answered out of the same window, the regulatory database and the China-region board file in 6 KiB
 //                  segments, the PHY and auxiliary microcodes by address, the trace configuration, and the firmware's ready
-//                  indication. Every file is read at run time from the tablet's own modem_a. Stops there.
+//                  indication. Every file is read at run time from the tablet's own modem_a.
+//   piano-wifi=6   the station's first half: the copy engine's rings over BAR0 (the pipes level 5 described to the firmware),
+//                  the host transport's handshake (its ready message, the firmware's message interface connected, set-up
+//                  complete), that interface's service-ready and ready events, the host's initialisation with this chip's
+//                  resource configuration, a station virtual device, and then a **passive scan**: the networks it finds are
+//                  logged (the address masked unless piano-wifi-bssid=1) and published as the property piano-wifi-scan, which
+//                  PianoWifiEthernet's en1 and tooling/native/piano-wifi read. The scan is stopped and the virtual device
+//                  deleted before the level ends. No association, no keys and no data path: those are levels 7 and 8.
+//                  piano-wifi=6 implies the mode message of level 5 (the firmware's radio must be running), so it switches
+//                  piano-wifi-mode on by itself.
 // Levels are cumulative and each one stops the ladder where it fails, leaving WLAN_EN low and PERST# asserted. Other arguments:
 // piano-wifi-delay=S (wait S seconds first, default 0), piano-wifi-repeat=S with piano-wifi-samples=N (resample the MMIO part every
 // S s, N times, default 3, one summary line each), piano-wifi-hwcg=1 (count a hardware-gated, voted branch under HW_CTL that reads
@@ -35,8 +44,17 @@
 // step, default 10000), piano-wifi-iova=1 (give the endpoint's stream a translating context bank whose 32-bit window maps the DMA
 // window, instead of the bypass bank of level 3: the only way to hand this chip a 32-bit address, since piano's XNU memory is all
 // above 4 GiB), piano-wifi-mode=1 (level 5 also sends the firmware's options, the host's copy-engine configuration and the mode,
-// which is level 6's doorway), piano-wifi-shadow=1 (the shadow register list in that configuration). Without piano-wifi the driver declines in probe() and
-// maps nothing.
+// which is level 6's doorway), piano-wifi-shadow=1 (the shadow register list in that configuration),
+// piano-wifi-wmitimeout=MS (the deadline of each level 6 step, default 10000), piano-wifi-scanwait=MS (how long the scan itself
+// may take, default 12000), piano-wifi-band=N (1 both bands, 0 only 2.4 GHz), piano-wifi-bssid=1 (print a network's whole
+// address in the log instead of its first three bytes). Without piano-wifi the driver declines in probe() and maps nothing.
+//
+// Power (package/include/PianoPowerContract.h): the radio is off unless piano-wifi>=2, since nothing below that level votes a
+// rail or releases PERST#. From level 2 on the driver joins the power tree, and its only power state change is to stop the
+// radio on a suspend: the scan is stopped, the virtual device deleted, the copy engine's rings disabled, WLAN_EN taken low and
+// PERST# asserted. The rails stay voted (Bluetooth shares them) and nothing is brought back on the wake: the Wi-Fi path is off
+// until the next boot, which is what an attended bring-up level should do to the battery. The stop waits for the ladder's own
+// thread instead of racing it, so setPowerState answers with a deadline and acknowledges when it is done.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -47,10 +65,12 @@
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
+#include <PianoPowerContract.h>
 #include "SmmuStream.h"
 #include "WifiBringup.h"
 #include "WifiChannels.h"
 #include "WifiFirmware.h"
+#include "WifiLink.h"
 #include "WifiMhi.h"
 #include "WifiSmmuWindow.h"
 #include "WifiSurvey.h"
@@ -69,6 +89,7 @@ struct Args {
   uint32_t level, spmi, smmu, cmddb, hwcg, delay, repeat, samples;
   uint32_t gen, physeq, rcg, blind, release, stop, dmaMib, fwTimeoutMs;
   uint32_t iova, mode, shadow, qmiTimeoutMs;
+  uint32_t wmiTimeoutMs, scanWaitMs, band, bssid;
 };
 Args gArgs;
 
@@ -107,10 +128,17 @@ void readArgs()
   gArgs.fwTimeoutMs = bootArg("piano-wifi-fwtimeout", 20000);
   if (gArgs.fwTimeoutMs < 1000 || gArgs.fwTimeoutMs > 60000) gArgs.fwTimeoutMs = 20000;
   gArgs.iova = bootArg("piano-wifi-iova", 0);
-  gArgs.mode = bootArg("piano-wifi-mode", 0);
+  // Level 6 needs the firmware's radio running, which is what level 5's last three messages do.
+  gArgs.mode = bootArg("piano-wifi-mode", gArgs.level >= 6 ? 1 : 0);
   gArgs.shadow = bootArg("piano-wifi-shadow", 0);
   gArgs.qmiTimeoutMs = bootArg("piano-wifi-qmitimeout", kWlfwTimeoutMs);
   if (gArgs.qmiTimeoutMs < 1000 || gArgs.qmiTimeoutMs > 60000) gArgs.qmiTimeoutMs = kWlfwTimeoutMs;
+  gArgs.wmiTimeoutMs = bootArg("piano-wifi-wmitimeout", kWmiTimeoutMs);
+  if (gArgs.wmiTimeoutMs < 1000 || gArgs.wmiTimeoutMs > 60000) gArgs.wmiTimeoutMs = kWmiTimeoutMs;
+  gArgs.scanWaitMs = bootArg("piano-wifi-scanwait", kScanWaitMsDefault);
+  if (gArgs.scanWaitMs < 1000 || gArgs.scanWaitMs > 60000) gArgs.scanWaitMs = kScanWaitMsDefault;
+  gArgs.band = bootArg("piano-wifi-band", 1);
+  gArgs.bssid = bootArg("piano-wifi-bssid", 0);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -983,7 +1011,9 @@ void barWr(void *, uint32_t off, uint32_t value)
 }
 const MhiIo gMhiIo = {nullptr, barRd, barWr};
 
-// The chip's own registers above 0x80000 through its remap window; level 4 reads only the SoC version, for the log.
+// The chip's own registers above 0x80000 through its remap window; level 4 reads only the SoC version, for the log, and level 6
+// reaches the copy engine's rings the same way. One thread owns the window (this driver polls and never takes an interrupt), so
+// the two accesses of a windowed read or write are never interleaved with another's.
 uint32_t chipRead(uint32_t address)
 {
   if (address < kChipWindowStart) return barRd(nullptr, address);
@@ -991,6 +1021,19 @@ uint32_t chipRead(uint32_t address)
   (void)barRd(nullptr, kChipWindowReg);
   return barRd(nullptr, kChipWindowStart + (address & kChipWindowRange));
 }
+void chipWrite(uint32_t address, uint32_t value)
+{
+  if (address < kChipWindowStart) {
+    barWr(nullptr, address, value);
+    return;
+  }
+  barWr(nullptr, kChipWindowReg, kChipWindowEnable | ((address >> kChipWindowShift) & kChipWindowMask));
+  (void)barRd(nullptr, kChipWindowReg);
+  barWr(nullptr, kChipWindowStart + (address & kChipWindowRange), value);
+}
+uint32_t chipIoRead(void *, uint32_t address) { return chipRead(address); }
+void chipIoWrite(void *, uint32_t address, uint32_t value) { chipWrite(address, value); }
+const ChipIo gChipIo = {nullptr, chipIoRead, chipIoWrite};
 
 MhiContexts gContexts;
 uint32_t gMhiRegLen;
@@ -1375,6 +1418,212 @@ int level5(PowerState &power, const Options &opt)
   return 0;
 }
 
+// ============================================== level 6: the copy engine, the host transport and the firmware's messages
+// The rings come out of the same window as levels 4 and 5 (the firmware's regions are already in it), the pipes are the ones
+// level 5 described to the firmware, and everything is polled from this one thread: no MSI, no interrupt, no allocation after
+// the window. Every wait is bounded by piano-wifi-wmitimeout (and piano-wifi-scanwait for the scan).
+Ce gCe;
+Link gLink;
+volatile bool gLinkRunning;         // the ladder's thread is inside level 6: the power hook asks it to stop instead of racing
+volatile uint32_t gStopRequested;   // set by the power hook, read by the ladder each turn
+
+void linkNote(void *, int step, const char *what)
+{
+  piano_wifi_stage = step;
+  note("step %d: %s", step, what);
+}
+
+// The scan's result in the registry: one entry per network, and a line for the log. The addresses are published whole (the
+// macOS side needs them to join later) and masked in the log unless piano-wifi-bssid=1 (docs/drivers/wifi.md section 11).
+void publishScan(IOService *owner, const ScanList &list, bool full)
+{
+  OSArray *array = OSArray::withCapacity(list.count ? list.count : 1);
+  if (!array) return;
+  for (uint32_t i = 0; i < list.count; ++i) {
+    const ScanEntry &entry = list.entries[i];
+    OSDictionary *one = OSDictionary::withCapacity(8);
+    if (!one) break;
+    char bssid[24] = {};
+    scanFormatBssid(entry, true, bssid, sizeof bssid);
+    OSString *ssid = OSString::withCString(entry.ssidLength ? entry.ssid : "");
+    OSString *address = OSString::withCString(bssid);
+    OSNumber *channel = OSNumber::withNumber(uint64_t(entry.channel), 32);
+    OSNumber *freq = OSNumber::withNumber(uint64_t(entry.freq), 32);
+    OSNumber *rssi = OSNumber::withNumber(uint64_t(uint32_t(entry.rssi)), 32);
+    OSNumber *beacons = OSNumber::withNumber(uint64_t(entry.beacons), 32);
+    OSNumber *probes = OSNumber::withNumber(uint64_t(entry.probes), 32);
+    if (ssid) one->setObject("ssid", ssid);
+    if (address) one->setObject("bssid", address);
+    if (channel) one->setObject("channel", channel);
+    if (freq) one->setObject("freq", freq);
+    if (rssi) one->setObject("rssi", rssi);
+    if (beacons) one->setObject("beacons", beacons);
+    if (probes) one->setObject("probes", probes);
+    one->setObject("hidden", entry.hidden ? kOSBooleanTrue : kOSBooleanFalse);
+    OSSafeReleaseNULL(ssid);
+    OSSafeReleaseNULL(address);
+    OSSafeReleaseNULL(channel);
+    OSSafeReleaseNULL(freq);
+    OSSafeReleaseNULL(rssi);
+    OSSafeReleaseNULL(beacons);
+    OSSafeReleaseNULL(probes);
+    array->setObject(one);
+    one->release();
+  }
+  owner->setProperty("piano-wifi-scan", array);
+  array->release();
+  char line[200];
+  snprintf(line, sizeof line, "%u network(s), %u frame(s) (%u beacon, %u probe), %u ignored, %u dropped", list.count,
+           list.frames, list.beacons, list.probes, list.ignored, list.dropped);
+  owner->setProperty("piano-wifi-scan-summary", line);
+  for (uint32_t i = 0; i < list.count; ++i) {
+    const ScanEntry &entry = list.entries[i];
+    char bssid[24] = {};
+    scanFormatBssid(entry, full, bssid, sizeof bssid);
+    note("level 6: network %u: ssid \"%s\"%s bssid %s channel %u (%u MHz) signal %d dBm, %u beacon(s) %u probe(s)", i,
+         entry.ssidLength ? entry.ssid : "", entry.hidden ? " (it does not say its name)" : "", bssid, entry.channel,
+         entry.freq, int(entry.rssi), entry.beacons, entry.probes);
+  }
+}
+
+// The teardown: the scan stopped and the virtual device deleted, waited for (bounded), then the rings disabled.
+void linkTeardown()
+{
+  const uint64_t deadline = nowMs() + 1000;
+  bool idle = false;
+  while (!idle && nowMs() < deadline) {
+    idle = linkStopRequest(gLink, nowMs());
+    if (!idle) IOSleep(5);
+  }
+  linkDisable(gLink);
+  note("level 6: the teardown: the scan %s, the virtual device %s, the rings disabled%s",
+       !gLink.scanStarted ? "was not running" : gLink.scanTimedOut ? "was stopped by this driver" : "ended by itself",
+       gLink.deleted ? "deleted" : "was not created",
+       idle ? "" : " (the chip had not taken everything: the rings were disabled anyway)");
+}
+
+int level6(IOService *owner, PowerState &power, const Options &opt)
+{
+  stage(600, "level 6: the copy engine, the host transport and the firmware's messages");
+  if (!cePlan(gCe, gArena)) {
+    stage(-600, "level 6: the DMA window has no room for the copy engine's rings and buffers");
+    safeOff(gHw, power, opt);
+    return -1;
+  }
+  ceProgram(gCe, gChipIo);
+  unsigned posted = 0;
+  for (unsigned i = 0; i < kCeHostPipeCount; ++i) posted += cePostRx(gCe, gChipIo, i);
+  note("level 6: %u pipes: %u, %u, %u and %u; %u receive buffers posted, %u register writes", kCeHostPipeCount,
+       kCeHostPipes[0].pipe, kCeHostPipes[1].pipe, kCeHostPipes[2].pipe, kCeHostPipes[3].pipe, posted, gCe.writes);
+  LinkOptions options;
+  options.timeoutMs = gArgs.wmiTimeoutMs;
+  options.scanWaitMs = gArgs.scanWaitMs;
+  options.with5GHz = gArgs.band != 0;
+  options.passive = true;
+  gLink.note = linkNote;
+  gLink.noteCtx = nullptr;
+  const uint64_t started = nowMs();
+  linkBegin(gLink, gCe, gChipIo, options, started);
+  gLinkRunning = true;
+  const uint64_t overall = started + uint64_t(gArgs.wmiTimeoutMs) * 6 + gArgs.scanWaitMs;
+  int step = gLink.step;
+  while (step != kLinkDone && step != kLinkStopped) {
+    if (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE)) {
+      note("level 6: a suspend asked the radio to stop during %s", linkStepName(step));
+      break;
+    }
+    step = linkRun(gLink, nowMs());
+    if (nowMs() > overall) {
+      note("level 6: the ladder as a whole ran out of time during %s", linkStepName(step));
+      break;
+    }
+    if (step != kLinkDone && step != kLinkStopped) IOSleep(2);
+  }
+  // What the firmware said, and what the scan found.
+  note("level 6: the transport: %u credits of %u bytes, %u endpoints, version %#x; our endpoint %d (pipes %u out, %u in), "
+       "%u credit reports (%u credits), %u control messages",
+       gLink.htc.credits, gLink.htc.creditSize, gLink.htc.endpoints, gLink.htc.version, gLink.endpoint,
+       gLink.endpoint > 0 ? gLink.htc.ep[gLink.endpoint].ulPipe : 0u,
+       gLink.endpoint > 0 ? gLink.htc.ep[gLink.endpoint].dlPipe : 0u, gLink.htc.creditReports, gLink.htc.creditsGiven,
+       gLink.controlMessages);
+  note("level 6: the chip: %u radio chain(s), board %#x, high-throughput %#x very-high-throughput %#x, system %#x, "
+       "%u scan channel(s), %u radio(s), chain mask %#x, %u memory request(s)",
+       gLink.caps.rfChains, gLink.caps.boardId, gLink.caps.htCaps, gLink.caps.vhtCaps, gLink.caps.sysCaps,
+       gLink.caps.scanChannels, gLink.caps.supportedMacs, gLink.caps.chainMask, gLink.caps.memRequests);
+  if (gLink.ready.seen) {
+    char mac[24] = {};
+    ScanEntry asAddress;
+    bool zero = true;
+    for (unsigned i = 0; i < 6; ++i) {
+      asAddress.bssid[i] = gLink.ready.mac[i];
+      zero = zero && gLink.ready.mac[i] == 0;
+    }
+    scanFormatBssid(asAddress, gArgs.bssid != 0, mac, sizeof mac);
+    note("level 6: the firmware is ready: status %#x, %u peer(s), %u extra address(es); the chip's own address %s%s",
+         gLink.ready.status, gLink.ready.totalPeers, gLink.ready.extraMacs, zero ? "is all zeros" : mac,
+         zero ? " (this chip's firmware reports none: the unit's own is in the persist partition, section 13.1)" : "");
+    // An address the firmware does report is what the macOS side's en1 takes (PianoWifiEthernet); it is never logged whole
+    // unless piano-wifi-bssid=1, and never committed (section 11).
+    if (!zero) {
+      OSData *bytes = OSData::withBytes(gLink.ready.mac, sizeof gLink.ready.mac);
+      if (bytes) {
+        owner->setProperty("piano-wifi-mac", bytes);
+        bytes->release();
+      }
+    }
+  }
+  note("level 6: the scan: %u channel(s) asked for, started %u, %u scan event(s), %u channel visit(s), %s%s",
+       gLink.request.channelCount, gLink.scanStarted ? 1u : 0u, gLink.scanEventsSeen, gLink.scanChannels,
+       gLink.scanCompleted ? wmiScanReasonName(gLink.scanReason) : "it did not report an end",
+       gLink.scanTimedOut ? " (after this driver stopped waiting for it)" : "");
+  publishScan(owner, gLink.scan, gArgs.bssid != 0);
+  note("level 6: %u commands, %u events, %u management frames, %u unexpected messages, %u credit waits; the copy engine: "
+       "%u out (%u bytes), %u in (%u bytes), %u completions, %u refused claims, %u dropped",
+       gLink.commands, gLink.events, gLink.mgmtFrames, gLink.unexpected, gLink.creditWaits, gCe.sent, gCe.bytesOut,
+       gCe.received, gCe.bytesIn, gCe.completions, gCe.refused, gCe.dropped);
+  const bool done = gLink.step == kLinkDone;
+  note("level 6: %s after %llu ms (step %d: %s%s%s)", done ? "the scan is done" : "stopped",
+       (unsigned long long)(nowMs() - started), done ? gLink.step : gLink.failedStep,
+       linkStepName(done ? gLink.step : gLink.failedStep), done ? "" : ", ", done ? "" : linkErrorName(gLink.error));
+  linkTeardown();
+  gLinkRunning = false;
+  char state[200];
+  snprintf(state, sizeof state, "step %d %s%s%s; %u network(s), endpoint %d, %u credits", done ? gLink.step : gLink.failedStep,
+           linkStepName(done ? gLink.step : gLink.failedStep), done ? "" : ": ", done ? "" : linkErrorName(gLink.error),
+           gLink.scan.count, gLink.endpoint, gLink.htc.credits);
+  owner->setProperty("piano-wifi-level6", state);
+  if (!done) {
+    safeOff(gHw, power, opt);
+    return -2;
+  }
+  return 0;
+}
+
+// The power contract (package/include/PianoPowerContract.h): on a suspend the radio stops. The ladder's own thread owns the
+// hardware, so the hook asks it to stop and waits for it (bounded); then the scan and the virtual device are gone, the rings
+// are disabled, and WLAN_EN goes low with PERST# asserted. Nothing is brought back on the wake.
+PowerState gPowerStorage;       // the rails and pins as level 2 left them: what safeOff needs, from any thread
+PowerState *gPowerState;
+Options gPowerOptions;
+bool gRadioStopped;
+
+void stopRadio(const char *why)
+{
+  if (gRadioStopped || gArgs.level < 2) return;
+  gRadioStopped = true;
+  __atomic_store_n(&gStopRequested, 1u, __ATOMIC_RELEASE);
+  const uint64_t deadline = nowMs() + 2000;
+  while (gLinkRunning && nowMs() < deadline) IOSleep(10);
+  note("%s: stopping the radio (the ladder's thread %s)", why, gLinkRunning ? "did not finish in 2 s" : "is done");
+  if (!gLinkRunning && gLink.ce) linkTeardown();
+  if (gPowerState && gWin[kWinTlmm].va) {
+    safeOff(gHw, *gPowerState, gPowerOptions);
+    note("%s: WLAN_EN is low and PERST# asserted; the rails stay voted (Bluetooth shares them) and the Wi-Fi path stays off "
+         "until the next boot",
+         why);
+  }
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------------ the service
@@ -1383,9 +1632,13 @@ class PianoWifi : public IOService {
   void run();
   static void thread(void *self, wait_result_t);
 
+  static void stopThread(void *self, wait_result_t);
+
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  IOReturn setPowerState(unsigned long state, IOService *device) override;
+  void systemWillShutdown(IOOptionBits specifier) override;
 };
 
 OSDefineMetaClassAndStructors(PianoWifi, IOService)
@@ -1404,15 +1657,23 @@ bool PianoWifi::start(IOService *provider)
        gArgs.level, gArgs.spmi, gArgs.smmu, gArgs.cmddb, gArgs.hwcg, gArgs.delay, gArgs.repeat, gArgs.samples, kEndpointVendor,
        kEndpointDevice, (unsigned long long)kParf);
   if (gArgs.level >= 2)
-    note("levels: 1 survey, 2 power, 3 link%s%s (gen %u, physeq %u, rcg %u, blind %u, release %u, stop %u, dma %u MiB, "
-         "phase timeout %u ms, qmi timeout %u ms, iova %u, mode %u, shadow %u)",
-         gArgs.level >= 4 ? ", 4 MHI firmware" : "", gArgs.level >= 5 ? ", 5 QMI" : "", gArgs.gen, gArgs.physeq, gArgs.rcg,
+    note("levels: 1 survey, 2 power, 3 link%s%s%s (gen %u, physeq %u, rcg %u, blind %u, release %u, stop %u, dma %u MiB, "
+         "phase timeout %u ms, qmi timeout %u ms, iova %u, mode %u, shadow %u, wmi timeout %u ms, scan wait %u ms, band %u, "
+         "bssid %u)",
+         gArgs.level >= 4 ? ", 4 MHI firmware" : "", gArgs.level >= 5 ? ", 5 QMI" : "",
+         gArgs.level >= 6 ? ", 6 the copy engine, the transport and a scan" : "", gArgs.gen, gArgs.physeq, gArgs.rcg,
          gArgs.blind, gArgs.release, gArgs.stop, gArgs.dmaMib, gArgs.fwTimeoutMs, gArgs.qmiTimeoutMs, gArgs.iova, gArgs.mode,
-         gArgs.shadow);
-  if (gArgs.level > 5) note("piano-wifi=%u: levels above 5 are not implemented; running up to level 5", gArgs.level);
+         gArgs.shadow, gArgs.wmiTimeoutMs, gArgs.scanWaitMs, gArgs.band, gArgs.bssid);
+  if (gArgs.level > 6) note("piano-wifi=%u: levels above 6 are not implemented; running up to level 6", gArgs.level);
   note("level 1: loads only, nothing written%s", gArgs.spmi || gArgs.level >= 2 ? "; SPMI observer read commands for the PMIC part"
                                                                                : "");
   setProperty("piano-wifi", gArgs.level, 32);
+  // From level 2 on something is powered, so the driver joins the power tree: its kOff stops the radio (the power contract,
+  // package/include/PianoPowerContract.h). Below level 2 nothing of the chip is on and there is nothing to do.
+  if (gArgs.level >= 2) {
+    const IOReturn rc = pianopower::join(this);
+    if (rc != kIOReturnSuccess) note("the power tree refused this driver (%#x): a suspend will not stop the radio", rc);
+  }
   thread_t t = nullptr;
   if (kernel_thread_start(&PianoWifi::thread, this, &t) != KERN_SUCCESS) {
     stage(-1, "no thread");
@@ -1426,6 +1687,36 @@ void PianoWifi::thread(void *self, wait_result_t)
 {
   thread_set_thread_name(current_thread(), "piano-wifi");
   static_cast<PianoWifi *>(self)->run();
+}
+
+// The power contract: kOff stops the radio (and nothing comes back on the wake, §10.14). Stopping it waits for the ladder's own
+// thread (at most 2 s) and then for the chip to take the two commands (at most 1 s), which is longer than the one second a
+// synchronous answer may take — so the answer is a deadline in microseconds and an acknowledgement when it is done
+// (docs/power.md §4), and the waiting happens on a thread of its own.
+IOReturn PianoWifi::setPowerState(unsigned long state, IOService *)
+{
+  if (state != pianopower::kOff || gArgs.level < 2 || gRadioStopped) return pianopower::kAckNow;
+  thread_t t = nullptr;
+  if (kernel_thread_start(&PianoWifi::stopThread, this, &t) != KERN_SUCCESS) {
+    stopRadio("suspend");   // no thread to be had: do it here, late acknowledgement and all
+    return pianopower::kAckNow;
+  }
+  thread_deallocate(t);
+  return 4000000;
+}
+
+void PianoWifi::stopThread(void *self, wait_result_t)
+{
+  thread_set_thread_name(current_thread(), "piano-wifi-stop");
+  PianoWifi *driver = static_cast<PianoWifi *>(self);
+  stopRadio("suspend");
+  driver->acknowledgeSetPowerState();
+}
+
+void PianoWifi::systemWillShutdown(IOOptionBits specifier)
+{
+  if (specifier == kIOMessageSystemWillPowerOff || specifier == kIOMessageSystemWillRestart) stopRadio("shutdown");
+  IOService::systemWillShutdown(specifier);
 }
 
 void PianoWifi::run()
@@ -1485,11 +1776,13 @@ void PianoWifi::run()
 
   // ---- level 2 and up: the first writes of this driver -----------------------------------------------------------------
   const Options opt = options();
-  PowerState power;
+  PowerState &power = gPowerStorage;   // a file-scope state, so that the power hook's safeOff has it on its own thread
   for (unsigned i = 0; i < kRailCount; ++i) {
     power.rails[i].ppid = gRailPpid[i];
     power.rails[i].address = gRailAddress[i];
   }
+  gPowerOptions = opt;
+  gPowerState = &power;
   if (!mapWindows() || !mapRsc()) {
     stage(-8, "level 2: the windows or apps DRV-2 could not be mapped; nothing was written");
     unmapWindows();
@@ -1583,6 +1876,30 @@ void PianoWifi::run()
   writeSummary("level 5");
   stage(rc ? -504 : 504, rc ? "level 5 stopped before the firmware was ready" : "level 5: the firmware is ready");
   note("level 5: %s; %s", rc ? "the firmware did not become ready" : "the firmware is ready",
-       rc ? "the ladder ends here" : "WMI, the scan and the station are levels 6 and up (docs/drivers/wifi.md section 13)");
+       rc ? "the ladder ends here"
+          : gArgs.level < 6 ? "the copy engine, the transport and the scan are level 6 (docs/drivers/wifi.md section 13)"
+                            : "level 6 follows: the copy engine, the transport and a passive scan");
+  if (rc || gArgs.level < 6) {
+    unmapAll();
+    return;
+  }
+  if (!gArgs.mode) {
+    note("level 6: not run: the firmware's radio was not started (piano-wifi-mode=0); piano-wifi=6 needs it");
+    unmapAll();
+    return;
+  }
+
+  // ---- level 6 ---------------------------------------------------------------------------------------------------------
+  rc = level6(this, power, opt);
+  writeSummary("level 6");
+  stage(rc ? -613 : 613, rc ? "level 6 stopped before the scan was done" : "level 6: the scan is done");
+  note("level 6: %s; %s", rc ? "the scan did not finish" : "the scan is done",
+       rc ? "the ladder ends here" : "association, keys and the data path are levels 7 and 8 (docs/drivers/wifi.md section 13)");
+  if (!rc) {
+    // The gate PianoWifiEthernet waits for: en1 appears (link down, with the scan list) only when level 6 came up.
+    publishResource("PianoWifiLink");
+    note("level 6: the resource PianoWifiLink is published: PianoWifiEthernet's en1 may come up (link down, the scan list in "
+         "the property piano-wifi-scan; tooling/native/piano-wifi prints it)");
+  }
   unmapAll();
 }
