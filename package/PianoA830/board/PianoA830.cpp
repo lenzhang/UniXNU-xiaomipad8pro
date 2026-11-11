@@ -468,6 +468,14 @@ extern "C" void adreno830_board_scm_hold(int take)
   else piano_scm_kernel_give(&gScmLock);
 }
 
+// The WCN7860 PMU's shared rails (package/include/PianoWcnRails.h, docs/drivers/bluetooth.md §7.1): the state and lock words of the
+// two radios' drivers (PianoWifi, PianoBluetooth), kept here for the same reason as the words above: PianoA830 links before both,
+// which import this single copy. PianoA830 itself never touches them.
+extern "C" volatile uint32_t piano_wcn_rails_state;
+volatile uint32_t piano_wcn_rails_state = 0;
+extern "C" volatile uint32_t piano_wcn_pmu_owner;
+volatile uint32_t piano_wcn_pmu_owner = 0;
+
 namespace {
 __attribute__((format(printf, 1, 2))) void gpuLine(const char *format, ...)
 {
