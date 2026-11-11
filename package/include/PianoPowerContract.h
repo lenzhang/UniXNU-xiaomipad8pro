@@ -45,7 +45,8 @@ void piano_cpuidle_latency_release(int handle);
 
 // piano-sleep=1: system sleep is suspend-to-idle (false: the ADT's sleep-disabled holds and macOS never sleeps).
 bool piano_sleep_enabled(void);
-// The last wake's source, as a name ("power-key", "lid", "usb", "volume-down", "timer", "irq", "keyboard", "aborted").
+// The last wake's source, as a name ("power-key", "lid", "usb", "volume-down", "timer", "irq", "keyboard", "aborted"; with 0064
+// "cancelled": a driver cancelled the suspend).
 int piano_s2idle_last_reason(void);
 const char *piano_s2idle_reason_name(int reason);
 }
@@ -89,10 +90,12 @@ constexpr IOReturn kAckNow = kIOPMAckImplied;
 // PreSleep, after every driver of the power tree acknowledged kOff), puts them back in its IOPlatformWakeAction (PostResume, before any
 // driver's kOn), and keeps CX/MX at NOM_L1 unless told otherwise (piano-gpu-suspend-rails): a driver that needs CX while suspended is
 // covered by that floor; at 0 the rails' votes go and only blocks already off in their kOff are safe.
-// Refusing a suspend: k27 0062 has no cancel a driver can ask for (its aborts are its own: a CPU that does not park). A driver that
-// cannot go down puts itself back up as it was (never half down: no gated clock with its users still running, no vote dropped that its
-// hardware still needs) and acknowledges; the suspend goes on without its saving. PianoA830 does so and stops taking part for the boot
-// after a failed entry.
+// Refusing a suspend: a driver that cannot go down puts itself back up as it was (never half down: no gated clock with its users still
+// running, no vote dropped that its hardware still needs) and acknowledges; the suspend goes on without its saving (PianoA830 does so
+// and stops taking part for the boot after a failed entry). With k27 0064 and piano-sleep-cancel=1 it may also cancel the whole suspend
+// (cancelSystemSleep below, from its kOff or its PreSleep platform action): nothing is suspended, PostResume and every driver's kOn
+// follow at once (a normal wake, reason "piano.cancelled"). Only for a state the system must not sleep in (a disk link that would not
+// come back, data not yet safe), not for a lost saving: a cancelled sleep costs the whole suspend.
 
 // The display's scanout (who reads the framebuffer from DDR while suspended): stopped only when PianoDpu's panel slice put the panel to
 // sleep with the timing engines stopped (its "piano-dpu-panel" property "asleep", and piano-dpu-panel-engines not 0); running when the
@@ -126,7 +129,8 @@ displayScanout(IOService *dpu)
 // The LLCC ISLAND1 slice (SCID 12) as CX collapse needs it (reserved ways 0x7fffffff, no bonus ways; docs/power.md §3.6): PianoA830
 // owns the LLCC. It reads the slice at every GPU boot and programs it with piano-llcc-island=1; this asks it, reading the two words
 // again (lock-free, any thread). False without PianoA830 or before its first reading. PianoAudio's release of the LPASS votes waits
-// for it; k27 0061/0062 read the slice themselves at boot (their own probe, before any kext) and do not see a later programming.
+// for it; k27 0061/0062 read the slice themselves at boot (their own probe, before any kext) and do not see a later programming
+// unless 0064's piano-llcc-island-live=1 is set (then they read the two words again at each ss3 decision).
 inline bool
 llccIslandReady()
 {
@@ -138,6 +142,22 @@ llccIslandReady()
 	const IOReturn r = a830->callPlatformFunction("piano-llcc-island-ready", false, &ready, nullptr, nullptr, nullptr);
 	a830->release();
 	return r == kIOReturnSuccess && ready;
+}
+
+// k27 0064: cancel the system sleep in progress (piano-sleep-cancel=1; docs/power.md §3.7). From the driver's kOff (setPowerState) or
+// its IOPlatformSleepAction (PreSleep), thread context; WHO (its class name is fine, at most 31 bytes shown) and WHY (at most 95) go to
+// the console. Through IOPMrootDomain's platform function, so a kext calling it links with any kernel: kIOReturnSuccess this suspend
+// will not happen (asked now or by an earlier driver); kIOReturnUnsupported refused (piano-sleep-cancel=0, no piano-sleep, or a kernel
+// before 0064): the sleep goes on, so the driver must still be in a state it can sleep in; kIOReturnNotReady no system sleep in
+// progress; kIOReturnBusy too late.
+inline IOReturn
+cancelSystemSleep(const char *who, const char *why)
+{
+	IOService *root = IOService::getPMRootDomain();
+	if (root == nullptr) {
+		return kIOReturnNotReady;
+	}
+	return root->callPlatformFunction("piano-sleep-cancel", false, const_cast<char *>(who), const_cast<char *>(why), nullptr, nullptr);
 }
 
 // The keyboard's wake line (PianoKeyboard): before acknowledging kOff with the cover open, set TLMM gpio95 INTR_CFG to latch

@@ -1,0 +1,832 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: UniXNU-piano <noreply@unixnu-piano.invalid>
+Date: Thu, 12 Nov 2026 02:15:02 +0800
+Subject: [PATCH] k27: piano-llcc-island-live=1 (the LLCC island read at each
+ ss3 decision) and piano-sleep-cancel=1 (a driver's cancel of the suspend in
+ progress)
+
+Two follow-ups of 0061/0062 (UniXNU-piano docs/power.md §3.6, §7), each off unless its argument is set:
+
+- piano-llcc-island-live=1: 0061 read the LLCC ISLAND1 words (TRP_ATTR0 0x26841300, ATTR1 0x26841308, through the broadcast
+  base) once at boot, before any kext, so a slice PianoA830 programs later (piano-llcc-island=1) stayed "NOT reserved" and ss3
+  needed piano-llcc-island-ok=1. Live, ss3 is decided on the two words read at that decision: the idle loop reads them only when
+  every other condition of ss3 already holds (the last CPU of all, its deadline, the latency holds; piano_pm_pick_domain_island),
+  a suspend reads them at its entry for its level (and logs the reading). Read only, the boot reading's two loads through the
+  window it mapped. piano-cpuidle=3 is no longer refused at boot in this mode (ss3 waits for the slice); the cpuidle summary and
+  each suspend's entry say when the verdict changes; machdep.piano_cpuidle / piano_sleep show the live reads.
+- piano-sleep-cancel=1: a driver that cannot take part in this sleep asks piano_s2idle_cancel(who, why), or IOPMrootDomain's
+  callPlatformFunction("piano-sleep-cancel", who, why) without linking this kernel (an older kernel answers Unsupported), during
+  its kOff or its PreSleep platform action. The window opens at willNotifyPowerChildren (the sleep state), is opened again
+  (keeping what was asked) when IOCPUSleepKernel starts, and shuts at the freeze. Cancelled, the suspend returns before the
+  park, or abandons the park the way a CPU that does not park does: nothing is suspended, PostResume runs, a normal full wake
+  with the reason "piano.cancelled". The first caller's name and reason are logged and kept; refusals (argument off, no sleep in
+  progress, too late) are logged (the first 16, then every 64th) and the sleep goes on as before.
+  piano-sleep-cancel-test=N: the kernel's own test caller asks, through IOPMrootDomain's function, at PreSleep of suspend N.
+- The decisions are osfmk/arm64/piano_s2idle_policy.h = UniXNU-piano tooling/k27/piano-pm/piano_s2idle_policy.h (host-tested).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ iokit/Kernel/IOCPU.cpp            |    9 +++++++++
+ iokit/Kernel/IOPMrootDomain.cpp   |   22 ++++++++++++++++++++++
+ osfmk/arm64/piano_pm.c            |  327 ++++++++++++++++++++++++++++++++++++++++++++++++++----------
+ osfmk/arm64/piano_pm.h            |   14 ++++++++++++++
+ osfmk/arm64/piano_s2idle_policy.h |  183 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 544 insertions(+), 11 deletions(-)
+ create mode 100644 osfmk/arm64/piano_s2idle_policy.h
+
+diff --git a/iokit/Kernel/IOCPU.cpp b/iokit/Kernel/IOCPU.cpp
+index 59b30b8..381c057 100644
+--- a/iokit/Kernel/IOCPU.cpp
++++ b/iokit/Kernel/IOCPU.cpp
+@@ -265,6 +265,9 @@ OSMetaClassDefineReservedUnused(IOCPU, 7);
+ extern "C" bool piano_sleep_enabled(void);
+ extern "C" int piano_s2idle_enter(void (*quiesce)(void), void (*active)(void));
+ extern "C" const char *piano_s2idle_reason_name(int reason);
++/* k27 0064: a driver's cancel of this suspend (osfmk/arm64/piano_pm.c), its window and piano-sleep-cancel-test */
++extern "C" void piano_s2idle_cancel_window(bool fresh);
++extern "C" bool piano_s2idle_cancel_test_due(void);
+ 
+ static void
+ piano_quiesce_actions(void)
+@@ -282,8 +285,14 @@ static void
+ piano_sleep_kernel(IOPMrootDomain *rootDomain)
+ {
+ 	printf("IOCPUSleepKernel enter (piano: suspend-to-idle)\n");
++	piano_s2idle_cancel_window(false);   /* k27 0064: the drivers' PreSleep may cancel (a cancel from their kOff stays) */
+ 	rootDomain->tracePoint( kIOPMTracePointSleepPlatformActions );
+ 	IOPlatformActionsPreSleep();
++	if (piano_s2idle_cancel_test_due()) {
++		/* piano-sleep-cancel-test=N: this suspend cancelled at PreSleep, the way a driver asks (IOPMrootDomain's function) */
++		(void)static_cast<IOService *>(rootDomain)->callPlatformFunction("piano-sleep-cancel", false, (void *)"piano-sleep-cancel-test",
++		    (void *)"the test argument names this suspend", NULL, NULL);
++	}
+ 	rootDomain->tracePoint( kIOPMTracePointSleepCPUs );
+ 
+ 	thread_t self = current_thread();
+diff --git a/iokit/Kernel/IOPMrootDomain.cpp b/iokit/Kernel/IOPMrootDomain.cpp
+index 94dd5e8..1e6ca94 100644
+--- a/iokit/Kernel/IOPMrootDomain.cpp
++++ b/iokit/Kernel/IOPMrootDomain.cpp
+@@ -536,6 +536,9 @@ extern "C" bool piano_sleep_enabled(void);
+ extern "C" int piano_s2idle_last_reason(void);
+ extern "C" const char *piano_s2idle_reason_name(int reason);
+ extern "C" void piano_sleep_system_up(void (*request_sleep)(void));
++/* k27 0064: a driver's cancel of the suspend in progress (piano-sleep-cancel=1) */
++extern "C" int piano_s2idle_cancel(const char *who, const char *why);
++extern "C" void piano_s2idle_cancel_window(bool fresh);
+ 
+ /* piano-sleep-test: the timed sleep request, as a "Sleep Now" from a power controller would be */
+ static void
+@@ -4549,6 +4552,10 @@ void
+ IOPMrootDomain::willNotifyPowerChildren( IOPMPowerStateIndex newPowerState )
+ {
+ 	if (SLEEP_STATE == newPowerState) {
++#if defined(XNU_VM_GUEST) && defined(__arm64__)
++		/* piano (k27 0064): the drivers go down next; from here until the freeze one of them may cancel this suspend */
++		piano_s2idle_cancel_window(true);
++#endif
+ 		notifierThread = current_thread();
+ 
+ #if HIBERNATION
+@@ -9976,6 +9983,21 @@ IOPMrootDomain::callPlatformFunction(
+ 
+ 		return kIOReturnSuccess;
+ 	}
++#if defined(XNU_VM_GUEST) && defined(__arm64__)
++	/*
++	 * piano (k27 0064): a driver's cancel of the suspend in progress, without linking the kernel's piano_s2idle_cancel:
++	 * param1 = its name, param2 = the reason (C strings). Success: this suspend will not happen; Unsupported: refused
++	 * (piano-sleep-cancel=0, the sleep goes on); NotReady: no system sleep in progress; Busy: too late.
++	 */
++	else if (functionName && functionName->isEqualTo("piano-sleep-cancel")) {
++		switch (piano_s2idle_cancel((const char *) param1, (const char *) param2)) {
++		case 0: return kIOReturnSuccess;
++		case 1: return kIOReturnUnsupported;
++		case 2: return kIOReturnNotReady;
++		default: return kIOReturnBusy;
++		}
++	}
++#endif
+ #if HIBERNATION
+ 	else if (functionName &&
+ 	    functionName->isEqualTo(kIOPMInstallSystemSleepPolicyHandlerKey)) {
+diff --git a/osfmk/arm64/piano_pm.c b/osfmk/arm64/piano_pm.c
+index e8a21b2..a0cb23e 100644
+--- a/osfmk/arm64/piano_pm.c
++++ b/osfmk/arm64/piano_pm.c
+@@ -55,8 +55,10 @@
+ #include <pexpert/pexpert.h>
+ #include <machine/atomic.h>
+ #include <sys/errno.h>
++#include <string.h>
+ #include <arm64/piano_pm.h>
+ #include <arm64/piano_pm_policy.h>
++#include <arm64/piano_s2idle_policy.h>   /* k27 0064 */
+ 
+ #if defined(XNU_VM_GUEST)
+ 
+@@ -224,12 +226,15 @@ piano_rpmh_line(char *buf, size_t len)
+ static int piano_llcc_island = -1;   /* -1 not read, 0 not reserved, 1 reserved */
+ static uint32_t piano_llcc_res, piano_llcc_bonus;
+ static uint32_t piano_llcc_override;  /* piano-llcc-island-ok=1: ss3 even so (an experiment that may reset the SoC) */
++static volatile uint32_t *piano_llcc_trp;   /* k27 0064: the TRP_ATTR page, kept for the readings at each decision */
+ 
++/* The boot reading (thread context: the first call maps the window and logs it). */
+ static bool
+ piano_llcc_island_ok(void)
+ {
+ 	if (piano_llcc_island < 0) {
+ 		volatile uint32_t *trp = (volatile uint32_t *)ml_io_map(PIANO_LLCC_BROADCAST + PIANO_LLCC_TRP_ATTR, 0x1000);
++		piano_llcc_trp = trp;
+ 		if (trp == NULL) {
+ 			piano_llcc_island = 0;
+ 			printf("piano-pm: the LLCC broadcast window does not map: the island slice is not known to be reserved\n");
+@@ -246,6 +251,104 @@ piano_llcc_island_ok(void)
+ 	return piano_llcc_island == 1 || piano_llcc_override == 1;
+ }
+ 
++/* ==== k27 0064 begin: the LLCC island at each decision ==== */
++/*
++ * piano-llcc-island-live=1: ss3 is decided on the two words read at that decision, not on the boot reading above (which comes
++ * before any kext, so a slice PianoA830 programs later, piano-llcc-island=1, stayed "NOT reserved" here). The idle loop reads
++ * them only when every other condition of ss3 holds (piano_s2idle_policy.h piano_pm_pick_domain_island), a suspend at its entry.
++ * Read only, the same two loads as the boot reading, through the window it mapped. Off (the default): the boot reading, as 0061.
++ */
++static uint32_t piano_llcc_live;                  /* piano-llcc-island-live=1 */
++static _Atomic uint64_t piano_llcc_live_reads, piano_llcc_live_reserved;
++static _Atomic uint32_t piano_llcc_live_res, piano_llcc_live_bonus;
++static _Atomic int piano_llcc_live_seen = -1;     /* the last reading's verdict: -1 none, 0 not reserved, 1 reserved */
++static int piano_llcc_live_said = -1;             /* the verdict last put on the console */
++
++/* The two words now (any context, interrupts masked included: two loads); the verdict for ss3. */
++static bool
++piano_llcc_island_now(void)
++{
++	volatile uint32_t *trp = piano_llcc_trp;
++	uint32_t res = 0, bonus = 0;
++	if (trp != NULL) {
++		res = trp[(PIANO_LLCC_ISLAND1 * 64) / 4];
++		bonus = trp[(PIANO_LLCC_ISLAND1 * 64 + 8) / 4];
++	}
++	const bool reserved = trp != NULL && piano_pm_llcc_island_ok(res, bonus);
++	os_atomic_inc(&piano_llcc_live_reads, relaxed);
++	if (reserved) {
++		os_atomic_inc(&piano_llcc_live_reserved, relaxed);
++	}
++	os_atomic_store(&piano_llcc_live_res, res, relaxed);
++	os_atomic_store(&piano_llcc_live_bonus, bonus, relaxed);
++	os_atomic_store(&piano_llcc_live_seen, reserved ? 1 : 0, relaxed);
++	return piano_llcc_ss3_verdict(piano_llcc_override == 1, trp != NULL, res, bonus);
++}
++
++static bool
++piano_llcc_island_cb(void *ctx __unused)
++{
++	return piano_llcc_island_now();
++}
++
++/* ss3's island condition for a decision in thread context (a suspend's level): live, the reading now; else the boot reading. */
++static bool
++piano_llcc_ss3_ok(void)
++{
++	if (piano_llcc_live) {
++		(void)piano_llcc_island_ok();      /* the window (mapped once, with the boot line) */
++		return piano_llcc_island_now();
++	}
++	return piano_llcc_island_ok();
++}
++
++/* Boot: the argument (1 only), and the window mapped first, while that is still allowed (the idle loop cannot map). */
++static void
++piano_llcc_live_init(void)
++{
++	uint32_t on = 0;
++	if (piano_llcc_live || !PE_parse_boot_argn("piano-llcc-island-live", &on, sizeof(on)) || on != 1) {
++		return;
++	}
++	(void)piano_llcc_island_ok();
++	piano_llcc_live = 1;
++	printf("piano-pm: LLCC ISLAND1 read again at each ss3 decision (piano-llcc-island-live=1): ss3 follows the slice as it is "
++	    "then (a programming by PianoA830 counts), not the boot reading above%s\n", piano_llcc_trp ? "" : "; the window did not map: never");
++}
++
++/* Thread context (the cpuidle summary, a suspend's entry): a line when the live verdict changed since the last one. */
++static void
++piano_llcc_live_log(const char *who)
++{
++	if (!piano_llcc_live) {
++		return;
++	}
++	const int seen = os_atomic_load(&piano_llcc_live_seen, relaxed);
++	if (!piano_llcc_live_due(seen, &piano_llcc_live_said)) {
++		return;
++	}
++	printf("%s: LLCC ISLAND1 (SCID 12) now %s: reserved ways %#x, bonus ways %#x (read at an ss3 decision; %llu reads, %llu of them "
++	    "reserved): %s\n", who, seen ? "reserved" : "NOT reserved", os_atomic_load(&piano_llcc_live_res, relaxed),
++	    os_atomic_load(&piano_llcc_live_bonus, relaxed), os_atomic_load(&piano_llcc_live_reads, relaxed),
++	    os_atomic_load(&piano_llcc_live_reserved, relaxed), seen ? "ss3 allowed" : "ss3 stays off until it is");
++}
++
++static size_t
++piano_llcc_line(char *buf, size_t len)
++{
++	if (!piano_llcc_live) {
++		return (size_t)snprintf(buf, len, "LLCC island %s", piano_llcc_island < 0 ? "not read" :
++		           piano_llcc_island ? "reserved" : "not reserved");
++	}
++	const int seen = os_atomic_load(&piano_llcc_live_seen, relaxed);
++	return (size_t)snprintf(buf, len, "LLCC island %s (live: %llu reads, %llu reserved, last %#x/%#x; boot %s)", seen < 0 ?
++	           "not read yet" : seen ? "reserved" : "not reserved", os_atomic_load(&piano_llcc_live_reads, relaxed),
++	           os_atomic_load(&piano_llcc_live_reserved, relaxed), os_atomic_load(&piano_llcc_live_res, relaxed),
++	           os_atomic_load(&piano_llcc_live_bonus, relaxed), piano_llcc_island < 0 ? "not read" : piano_llcc_island ? "reserved" :
++	           "not reserved");
++}
++/* ==== k27 0064 end ==== */
++
+ static void
+ piano_pm_probe(void)
+ {
+@@ -327,6 +430,10 @@ piano_idle_pick(struct piano_idle_cpu *pc, int cpu, int max, uint64_t now, uint6
+ 			p.all_until = piano_domain_until(p.all_mask);
+ 		}
+ 	}
++	if (max >= 3 && piano_llcc_live) {
++		/* k27 0064: the island read at the ss3 decision itself, and only there */
++		return piano_pm_pick_domain_island(&p, param, piano_llcc_island_cb, NULL);
++	}
+ 	return piano_pm_pick_domain(&p, param);
+ }
+ 
+@@ -524,6 +631,7 @@ piano_cpuidle_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unu
+ 	}
+ 	piano_rpmh_line(line, sizeof(line));
+ 	printf("piano-cpuidle: RPMh sleep %s\n", line);
++	piano_llcc_live_log("piano-cpuidle");   /* k27 0064 */
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline(piano_cpuidle_period, NSEC_PER_SEC, &deadline);
+ 	thread_call_enter_delayed(piano_cpuidle_call, deadline);
+@@ -546,6 +654,10 @@ piano_cpuidle_format(char *buf, size_t len)
+ 		n += piano_rpmh_line(buf + n, len > n ? len - n : 0);
+ 		n += (size_t)snprintf(buf + n, len > n ? len - n : 0, "\n");
+ 	}
++	if (n + 1 < len && piano_cpuidle_max >= 3) {   /* k27 0064 */
++		n += piano_llcc_line(buf + n, len - n);
++		n += (size_t)snprintf(buf + n, len > n ? len - n : 0, "\n");
++	}
+ 	return n < len ? n : len - 1;
+ }
+ 
+@@ -615,6 +727,7 @@ piano_cpuidle_init(void)
+ 	if (probe != 0 || level >= 3) {
+ 		(void)piano_llcc_island_ok();
+ 	}
++	piano_llcc_live_init();   /* k27 0064 */
+ 	if (level == 0) {
+ 		return;
+ 	}
+@@ -626,8 +739,13 @@ piano_cpuidle_init(void)
+ 		level = PIANO_IDLE_LEVELS - 1;
+ 	}
+ 	if (level == 3 && !piano_llcc_island_ok()) {
+-		level = 2;
+-		printf("piano-cpuidle: level 3 refused (the LLCC island slice is not reserved): level 2\n");
++		if (piano_llcc_live) {
++			printf("piano-cpuidle: level 3 with the LLCC island slice not reserved now: ss3 waits for it (read at each ss3 decision, "
++			    "piano-llcc-island-live=1)\n");
++		} else {
++			level = 2;
++			printf("piano-cpuidle: level 3 refused (the LLCC island slice is not reserved): level 2\n");
++		}
+ 	}
+ 	PE_parse_boot_argn("piano-cpuidle-pd", &pd, sizeof(pd));
+ 	PE_parse_boot_argn("piano-cpuidle-period", &piano_cpuidle_period, sizeof(piano_cpuidle_period));
+@@ -747,8 +865,10 @@ _Static_assert(PIANO_WAKE_POWER_KEY == PIANO_PM_WAKE_POWER_KEY && PIANO_WAKE_LID
+     PIANO_WAKE_KEYBOARD == PIANO_PM_WAKE_KEYBOARD, "piano_pm.h and piano_pm_policy.h name the wake reasons alike");
+ 
+ static const char *const piano_wake_names[] = {
+-	"none", "aborted", "power-key", "lid", "usb", "volume-down", "timer", "irq", "keyboard",
++	"none", "aborted", "power-key", "lid", "usb", "volume-down", "timer", "irq", "keyboard", "cancelled",
+ };
++_Static_assert(sizeof(piano_wake_names) / sizeof(piano_wake_names[0]) == PIANO_WAKE_CANCELLED + 1 &&
++    PIANO_WAKE_CANCELLED < 10, "a name and a counter (piano_sleep_reasons) per wake reason");
+ 
+ const char *
+ piano_s2idle_reason_name(int reason)
+@@ -1103,7 +1223,7 @@ static uint32_t
+ piano_sleep_level(void)
+ {
+ 	uint32_t level = piano_sleep_state < PIANO_IDLE_LEVELS ? piano_sleep_state : PIANO_IDLE_LEVELS - 1;
+-	if (level == 3 && !piano_llcc_island_ok()) {
++	if (level == 3 && !piano_llcc_ss3_ok()) {   /* k27 0064: live, the island as it is now */
+ 		level = 2;
+ 	}
+ 	if (level > 0 && piano_psci_suspend_features < 0) {
+@@ -1213,6 +1333,108 @@ piano_wait_power_release(bool *ipi)
+ 	}
+ }
+ 
++/* ==== k27 0064 begin: a driver's cancel of the suspend in progress ==== */
++/*
++ * piano-sleep-cancel=1: a driver that cannot take part in this sleep (its hardware would not go down, or not come back) asks
++ * piano_s2idle_cancel(who, why), or IOPMrootDomain's callPlatformFunction("piano-sleep-cancel", who, why) without linking this
++ * kernel, during its kOff (setPowerState) or its PreSleep platform action. The suspend then does not happen: it returns before
++ * the park (or abandons the park, as for a CPU that does not park), the platform wake actions run, every driver is taken up
++ * again and the wake reason is "piano.cancelled". The window (piano_s2idle_policy.h) opens when the root domain starts taking
++ * the drivers down and shuts at the freeze; outside it, or without the argument, the request is refused, logged, and the sleep
++ * goes on as before. piano-sleep-cancel-test=N: the kernel itself asks, as a driver would, at PreSleep of suspend N.
++ */
++static uint32_t piano_sleep_cancel_on;            /* piano-sleep-cancel=1 */
++static uint32_t piano_sleep_cancel_test;          /* piano-sleep-cancel-test=N */
++static struct piano_cancel piano_cancel;
++static SIMPLE_LOCK_DECLARE(piano_cancel_lock, 0);
++
++static boolean_t
++piano_cancel_lock_take(void)
++{
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	simple_lock(&piano_cancel_lock, LCK_GRP_NULL);
++	return istate;
++}
++
++static void
++piano_cancel_lock_drop(boolean_t istate)
++{
++	simple_unlock(&piano_cancel_lock);
++	ml_set_interrupts_enabled(istate);
++}
++
++void
++piano_s2idle_cancel_window(bool fresh)
++{
++	if (!piano_sleep_on) {
++		return;
++	}
++	boolean_t istate = piano_cancel_lock_take();
++	piano_cancel_open(&piano_cancel, piano_sleep_count + 1, fresh);
++	piano_cancel_lock_drop(istate);
++}
++
++bool
++piano_s2idle_cancel_test_due(void)
++{
++	return piano_sleep_on && piano_cancel_test_due(piano_sleep_cancel_test, piano_sleep_count + 1);
++}
++
++int
++piano_s2idle_cancel(const char *who, const char *why)
++{
++	char w[PIANO_CANCEL_WHO], y[PIANO_CANCEL_WHY], first[PIANO_CANCEL_WHO], first_why[PIANO_CANCEL_WHY];
++	piano_cancel_copy(w, sizeof(w), who);
++	piano_cancel_copy(y, sizeof(y), why);
++	if (!piano_sleep_on) {
++		return PIANO_CANCEL_OFF;
++	}
++	boolean_t istate = piano_cancel_lock_take();
++	const int r = piano_cancel_request(&piano_cancel, piano_sleep_cancel_on == 1, w, y);
++	const uint32_t attempt = piano_cancel.attempt, callers = piano_cancel.callers;
++	const uint64_t refused = piano_cancel.refused;
++	memcpy(first, piano_cancel.who, sizeof(first));
++	memcpy(first_why, piano_cancel.why, sizeof(first_why));
++	piano_cancel_lock_drop(istate);
++	if (r == PIANO_CANCEL_TAKEN) {
++		if (callers == 1) {
++			printf("piano-sleep: suspend %u cancelled by %s: %s (piano-sleep-cancel=1): nothing is suspended, the system wakes\n",
++			    attempt, first, first_why);
++		} else {
++			printf("piano-sleep: suspend %u: %s also asks to cancel (%s); already cancelled by %s\n", attempt, w, y, first);
++		}
++	} else if (piano_cancel_refusal_logged(refused)) {
++		printf("piano-sleep: %s asks to cancel the suspend (%s): %s (refusal %llu)\n", w, y, r == PIANO_CANCEL_OFF ?
++		    "not honoured (piano-sleep-cancel=0): the sleep goes on" : r == PIANO_CANCEL_LATE ? "too late (the CPUs are frozen)" :
++		    "no system sleep in progress", refused);
++	}
++	return r;
++}
++
++/* The suspend's own look at the window: SHUT also shuts it (the freeze, or a return before it). True when it is cancelled;
++ * then the first caller's name and reason in WHO / WHY. */
++static bool
++piano_cancel_take(bool shut, char *who, char *why)
++{
++	boolean_t istate = piano_cancel_lock_take();
++	const bool cancelled = shut ? piano_cancel_shut(&piano_cancel) : piano_cancel_pending(&piano_cancel);
++	if (cancelled) {
++		memcpy(who, piano_cancel.who, PIANO_CANCEL_WHO);
++		memcpy(why, piano_cancel.why, PIANO_CANCEL_WHY);
++	}
++	piano_cancel_lock_drop(istate);
++	return cancelled;
++}
++
++static void
++piano_cancel_end(void)
++{
++	boolean_t istate = piano_cancel_lock_take();
++	piano_cancel_close(&piano_cancel);
++	piano_cancel_lock_drop(istate);
++}
++/* ==== k27 0064 end ==== */
++
+ static void
+ piano_rpmh_log(const char *when, uint32_t n)
+ {
+@@ -1233,7 +1455,34 @@ piano_s2idle_enter(void (*quiesce)(void), void (*active)(void))
+ 	thread_block(THREAD_CONTINUE_NULL);
+ 	const int boot = cpu_number();
+ 	const uint32_t n = ++piano_sleep_count;
++	/* k27 0064: cancelled already (a driver's kOff or PreSleep): nothing is suspended, nothing armed */
++	char cancel_who[PIANO_CANCEL_WHO], cancel_why[PIANO_CANCEL_WHY];
++	if (piano_cancel_take(true, cancel_who, cancel_why)) {
++		piano_sleep_last_ms = 0;
++		piano_sleep_last_reason = PIANO_WAKE_CANCELLED;
++		piano_sleep_reasons[PIANO_WAKE_CANCELLED]++;
++		printf("piano-sleep: suspend %u cancelled before the park by %s (%s): nothing suspended, a normal wake follows\n", n,
++		    cancel_who, cancel_why);
++		piano_cancel_end();
++		thread_bind(prev);
++		thread_block(THREAD_CONTINUE_NULL);
++		return PIANO_WAKE_CANCELLED;
++	}
+ 	const int level = (int)piano_sleep_level();
++	if (piano_llcc_live) {
++		/* k27 0064: the island as this suspend found it (read for its level with piano-sleep-state=3, else read now) */
++		if (piano_sleep_state < 3) {
++			(void)piano_llcc_island_now();
++		}
++		const bool reserved = os_atomic_load(&piano_llcc_live_seen, relaxed) == 1;
++		printf("piano-sleep: suspend %u: LLCC ISLAND1 read at the entry: reserved ways %#x, bonus ways %#x: %s (boot reading: %s)\n",
++		    n, os_atomic_load(&piano_llcc_live_res, relaxed), os_atomic_load(&piano_llcc_live_bonus, relaxed),
++		    piano_sleep_state < 3 ? (reserved ? "reserved (piano-sleep-state < 3: ss3 not asked)" : "NOT reserved") :
++		    level == 3 ? (reserved ? "reserved: ss3 allowed" : "NOT reserved (piano-llcc-island-ok=1: ss3 anyway)") :
++		    reserved ? "reserved (no CPU_SUSPEND: WFI)" : "NOT reserved: cl5 at most", piano_llcc_island < 0 ? "not read" :
++		    piano_llcc_island ? "reserved" : "NOT reserved");
++		piano_llcc_live_log("piano-sleep");
++	}
+ 	struct piano_pm_wake base;
+ 	piano_wake_baseline(&base);
+ 	piano_wdt_arm();
+@@ -1268,6 +1517,10 @@ piano_s2idle_enter(void (*quiesce)(void), void (*active)(void))
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
+ 	while ((os_atomic_load(&piano_parked, acquire) & want) != want) {
++		if (piano_cancel_take(false, cancel_who, cancel_why)) {   /* k27 0064: a driver's cancel while the others park */
++			abort_why = "cancelled";
++			break;
++		}
+ 		if (mach_absolute_time() > deadline) {
+ 			missing = want & ~os_atomic_load(&piano_parked, acquire);
+ 			abort_why = "did not park within 1 s";
+@@ -1280,6 +1533,11 @@ piano_s2idle_enter(void (*quiesce)(void), void (*active)(void))
+ 	disable_preemption();
+ 	boolean_t istate = ml_set_interrupts_enabled(FALSE);
+ 	const uint64_t frq = __builtin_arm_rsr64("CNTFRQ_EL0");
++	/* k27 0064: the cancel window shuts here; from now on no other thread runs before the wake */
++	const bool cancelled = piano_cancel_take(true, cancel_who, cancel_why);
++	if (cancelled && abort_why == NULL) {
++		abort_why = "cancelled";
++	}
+ 	if (abort_why == NULL) {
+ 		piano_park_frozen = 1;
+ 		piano_park_signal(want);
+@@ -1302,14 +1560,21 @@ piano_s2idle_enter(void (*quiesce)(void), void (*active)(void))
+ 		for (int i = 0; i < 10000 && os_atomic_load(&piano_parked, acquire) != 0; i++) {
+ 			delay(100);
+ 		}
+-		piano_sleep_aborts++;
+-		piano_sleep_last_reason = PIANO_WAKE_ABORTED;
+-		piano_sleep_reasons[PIANO_WAKE_ABORTED]++;
+-		printf("piano-sleep: suspend %u aborted: CPUs %#x %s\n", n, missing, abort_why);
++		const int why = cancelled ? PIANO_WAKE_CANCELLED : PIANO_WAKE_ABORTED;
++		if (cancelled) {
++			printf("piano-sleep: suspend %u cancelled during the park by %s (%s): the CPUs released, nothing suspended\n", n,
++			    cancel_who, cancel_why);
++		} else {
++			piano_sleep_aborts++;
++			printf("piano-sleep: suspend %u aborted: CPUs %#x %s\n", n, missing, abort_why);
++		}
++		piano_sleep_last_reason = why;
++		piano_sleep_reasons[why]++;
++		piano_cancel_end();
+ 		thread_bind(prev);
+ 		thread_block(THREAD_CONTINUE_NULL);
+ 		piano_wdt_window();
+-		return PIANO_WAKE_ABORTED;
++		return why;
+ 	}
+ 	if (quiesce != NULL) {
+ 		quiesce();
+@@ -1385,6 +1650,7 @@ piano_s2idle_enter(void (*quiesce)(void), void (*active)(void))
+ 	if (stuck != 0) {
+ 		panic("piano-sleep: CPUs %#x did not come back from the park after suspend %u", stuck, n);
+ 	}
++	piano_cancel_end();   /* k27 0064 */
+ 	piano_wdt_window();
+ 	return reason;
+ }
+@@ -1423,6 +1689,7 @@ piano_sleep_system_up(void (*request_sleep)(void))
+ 		return;
+ 	}
+ 	piano_sleep_request = request_sleep;
++	piano_cancel_end();   /* k27 0064: awake: no suspend in progress */
+ 	piano_park_setup();
+ 	if (piano_sleep_test_s == 0 || piano_sleep_tests >= piano_sleep_test_count) {
+ 		return;
+@@ -1447,9 +1714,15 @@ piano_sleep_format(char *buf, size_t len)
+ 	for (int r = 2; r < (int)(sizeof(piano_wake_names) / sizeof(piano_wake_names[0])) && n < len; r++) {
+ 		n += (size_t)snprintf(buf + n, len - n, " %s %llu", piano_wake_names[r], piano_sleep_reasons[r]);
+ 	}
++	if (n < len) {   /* k27 0064: the drivers' cancels; the island live or as read at boot */
++		n += (size_t)snprintf(buf + n, len - n, "; driver cancels %s (%llu cancelled, %llu refused); ", piano_sleep_cancel_on == 1 ?
++		    "on" : "off", piano_cancel.total, piano_cancel.refused);
++	}
+ 	if (n < len) {
+-		n += (size_t)snprintf(buf + n, len - n, "; LLCC island %s; rpmh ", piano_llcc_island < 0 ? "not read" :
+-		    piano_llcc_island ? "reserved" : "not reserved");
++		n += piano_llcc_line(buf + n, len - n);
++	}
++	if (n < len) {
++		n += (size_t)snprintf(buf + n, len - n, "; rpmh ");
+ 	}
+ 	if (n < len) {
+ 		n += piano_rpmh_line(buf + n, len - n);
+@@ -1478,6 +1751,8 @@ piano_sleep_init(void)
+ 	PE_parse_boot_argn("piano-sleep-wdt", &piano_sleep_wdt, sizeof(piano_sleep_wdt));
+ 	PE_parse_boot_argn("piano-sleep-test", &piano_sleep_test_s, sizeof(piano_sleep_test_s));
+ 	PE_parse_boot_argn("piano-sleep-test-count", &piano_sleep_test_count, sizeof(piano_sleep_test_count));
++	PE_parse_boot_argn("piano-sleep-cancel", &piano_sleep_cancel_on, sizeof(piano_sleep_cancel_on));            /* k27 0064 */
++	PE_parse_boot_argn("piano-sleep-cancel-test", &piano_sleep_cancel_test, sizeof(piano_sleep_cancel_test));
+ 	if (piano_sleep_poll_ms < 20) {
+ 		piano_sleep_poll_ms = 20;
+ 	} else if (piano_sleep_poll_ms > 1000) {
+@@ -1487,6 +1762,7 @@ piano_sleep_init(void)
+ 		piano_sleep_max_s = 30;                   /* an unattended test always comes back */
+ 	}
+ 	piano_pm_probe();
++	piano_llcc_live_init();   /* k27 0064 */
+ 	const uint32_t level = piano_sleep_level();
+ 	piano_pm_domains_setup((int)level);
+ 	piano_wdt_call = thread_call_allocate_with_options(piano_wdt_tick, NULL, THREAD_CALL_PRIORITY_KERNEL_HIGH,
+@@ -1496,6 +1772,17 @@ piano_sleep_init(void)
+ 	    "2 cover open, 4 usb, 8 volume-down, 16 keyboard), poll %u ms%s\n", piano_idle_e[level].name,
+ 	    piano_osi ? "OS-initiated" : "platform-coordinated", piano_sleep_wake, piano_sleep_poll_ms,
+ 	    piano_sleep_test_s ? ", test sleeps (piano-sleep-test)" : "");
++	if (piano_llcc_live && piano_sleep_state >= 3 && level < 3) {
++		printf("piano-sleep: ss3 while suspended once the LLCC island reads reserved at a suspend's entry (piano-llcc-island-live=1)\n");
++	}
++	if (piano_sleep_cancel_on == 1) {   /* k27 0064 */
++		printf("piano-sleep: a driver may cancel the suspend in progress (piano-sleep-cancel=1): during its kOff or PreSleep, "
++		    "IOPMrootDomain's \"piano-sleep-cancel\" or piano_s2idle_cancel()\n");
++	}
++	if (piano_sleep_cancel_test != 0) {
++		printf("piano-sleep: piano-sleep-cancel-test=%u: suspend %u is cancelled at its PreSleep by the kernel's test caller%s\n",
++		    piano_sleep_cancel_test, piano_sleep_cancel_test, piano_sleep_cancel_on == 1 ? "" : " (refused: piano-sleep-cancel=0)");
++	}
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_sleep_init);
+ /* ==== k27 0062 end ==== */
+@@ -1574,4 +1861,22 @@ piano_sleep_system_up(void (*request_sleep)(void) __unused)
+ }
+ /* ==== k27 0062 stubs end ==== */
+ 
++/* ==== k27 0064 stubs ==== */
++int
++piano_s2idle_cancel(const char *who __unused, const char *why __unused)
++{
++	return 1;   /* PIANO_CANCEL_OFF */
++}
++
++void
++piano_s2idle_cancel_window(bool fresh __unused)
++{
++}
++
++bool
++piano_s2idle_cancel_test_due(void)
++{
++	return false;
++}
++
+ #endif /* defined(XNU_VM_GUEST) */
+diff --git a/osfmk/arm64/piano_pm.h b/osfmk/arm64/piano_pm.h
+index 0126f85..bc05d9d 100644
+--- a/osfmk/arm64/piano_pm.h
++++ b/osfmk/arm64/piano_pm.h
+@@ -46,6 +46,19 @@ int piano_s2idle_last_reason(void);
+ bool piano_s2idle_take_wake_utc(unsigned long *secs, unsigned int *usecs);
+ /* IOPMrootDomain, once boot completed and after every wake: the park threads, piano-sleep-test's next request. */
+ void piano_sleep_system_up(void (*request_sleep)(void));
++/*
++ * k27 0064: a driver's cancel of the suspend in progress (piano-sleep-cancel=1; arm64/piano_s2idle_policy.h). During its kOff or
++ * its PreSleep platform action; thread context. WHO / WHY (copied, at most 31 / 95 bytes) go to the console. Returns 0 when this
++ * suspend will not happen (asked now or before), 1 refused (piano-sleep-cancel=0 or no piano-sleep: the sleep goes on), 2 no
++ * system sleep in progress, 3 too late. Kexts that must not depend on this kernel ask IOPMrootDomain's callPlatformFunction(
++ * "piano-sleep-cancel", false, who, why, NULL, NULL) instead (kIOReturnSuccess, kIOReturnUnsupported, kIOReturnNotReady,
++ * kIOReturnBusy; an older kernel answers kIOReturnUnsupported).
++ */
++int piano_s2idle_cancel(const char *who, const char *why);
++/* IOPMrootDomain (FRESH: the drivers about to go down) and IOCPUSleepKernel (before PreSleep): the window for the next suspend. */
++void piano_s2idle_cancel_window(bool fresh);
++/* IOCPUSleepKernel: piano-sleep-cancel-test names the suspend about to happen. */
++bool piano_s2idle_cancel_test_due(void);
+ 
+ /*
+  * k27 0063: the Gunyah watchdog's one owner (machine_routines.c). WHO is a PIANO_WDT_* of piano_guard_policy.h; the first holder
+@@ -71,5 +84,6 @@ __END_DECLS
+ #define PIANO_WAKE_TIMER        6   /* piano-sleep-max */
+ #define PIANO_WAKE_IRQ          7   /* an interrupt other than the poll timer was pending */
+ #define PIANO_WAKE_KEYBOARD     8   /* the keyboard's status line (gpio95, latched by PianoKeyboard) */
++#define PIANO_WAKE_CANCELLED    9   /* k27 0064: a driver cancelled it (piano-sleep-cancel=1): nothing was suspended */
+ 
+ #endif /* _ARM64_PIANO_PM_H_ */
+diff --git a/osfmk/arm64/piano_s2idle_policy.h b/osfmk/arm64/piano_s2idle_policy.h
+new file mode 100644
+index 0000000..943de85
+--- /dev/null
++++ b/osfmk/arm64/piano_s2idle_policy.h
+@@ -0,0 +1,183 @@
++/*
++ * piano (k27 0064): the decisions 0064 adds to osfmk/arm64/piano_pm.c that touch no hardware, as plain inline C so that they are
++ * host-tested (UniXNU-piano tooling/k27/piano-pm: this file byte for byte, and test_piano_s2idle_policy.c). No kernel headers.
++ *
++ * 1. The LLCC ISLAND1 slice at each decision (piano-llcc-island-live=1). 0061 read its two words (TRP_ATTR0 0x26841300, ATTR1
++ *    0x26841308, through the broadcast base) once at boot, before any kext, so a slice PianoA830 programs later stayed "NOT
++ *    reserved" to the kernel. Live, the system state (ss3) is decided on a reading taken at that decision: the idle loop reads
++ *    the two words only when every other condition of ss3 already holds (the last CPU of all, its deadline, the latency holds),
++ *    and a suspend reads them at its entry for its level. A slice not reserved at the decision keeps ss3 out (cl5 instead).
++ * 2. A driver's cancel of the system sleep in progress (piano-sleep-cancel=1). The window opens when IOPMrootDomain starts to
++ *    take the drivers down (willNotifyPowerChildren, the sleep state) and is opened again, keeping what was asked, when
++ *    IOCPUSleepKernel starts (before the platform sleep actions, the drivers' PreSleep); it shuts at the freeze, the last point
++ *    where another thread can run. A cancel inside the window makes 0062's suspend return at once (before the park), or abort
++ *    its park, exactly as a CPU that does not park does: nothing is suspended, the platform wake actions run, a normal wake.
++ *    The first caller's name and reason are kept and logged; later callers are counted. Outside the window, or with the
++ *    argument off, the request is refused and the sleep goes on as before.
++ */
++#ifndef PIANO_S2IDLE_POLICY_H
++#define PIANO_S2IDLE_POLICY_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include "piano_pm_policy.h"
++
++/* ---- 1. the LLCC island at each decision ---- */
++
++/*
++ * The idle choice of piano_pm_pick_domain with the island asked only at an ss3 decision: P's ss3_ok is set here (true, then
++ * false when ISLAND(CTX) says the slice is not reserved now); ISLAND is called at most once, and only when the system state is
++ * what would be chosen with the slice reserved.
++ */
++static inline int
++piano_pm_pick_domain_island(struct piano_pm_pick *p, uint32_t *param, bool (*island)(void *ctx), void *ctx)
++{
++	p->ss3_ok = true;
++	int level = piano_pm_pick_domain(p, param);
++	if (level == 3 && !island(ctx)) {
++		p->ss3_ok = false;
++		level = piano_pm_pick_domain(p, param);
++	}
++	return level;
++}
++
++/* One reading's verdict for ss3: OVERRIDE (piano-llcc-island-ok=1) always; else the slice reserved (MAPPED: the window was). */
++static inline bool
++piano_llcc_ss3_verdict(bool override, bool mapped, uint32_t reserved_ways, uint32_t bonus_ways)
++{
++	return override || (mapped && piano_pm_llcc_island_ok(reserved_ways, bonus_ways));
++}
++
++/* What the console has said about the live verdict: SEEN the verdict of the last reading (-1 none), SAID the one last logged.
++ * True (and SAID updated) when a line is due: the first reading, then each change. */
++static inline bool
++piano_llcc_live_due(int seen, int *said)
++{
++	if (seen < 0 || seen == *said) {
++		return false;
++	}
++	*said = seen;
++	return true;
++}
++
++/* ---- 2. a driver's cancel of the suspend in progress ---- */
++
++#define PIANO_CANCEL_WHO        32
++#define PIANO_CANCEL_WHY        96
++
++#define PIANO_WINDOW_CLOSED     0   /* no system sleep in progress */
++#define PIANO_WINDOW_OPEN       1   /* the drivers' kOff, the platform sleep actions, the park */
++#define PIANO_WINDOW_SHUT       2   /* the freeze: nothing else runs any more */
++
++/* A request's answer (piano_s2idle_cancel; IOPMrootDomain's "piano-sleep-cancel" maps them to IOReturns). */
++#define PIANO_CANCEL_TAKEN      0   /* this suspend will not happen (asked now or by an earlier caller) */
++#define PIANO_CANCEL_OFF        1   /* piano-sleep-cancel is not 1: the sleep goes on */
++#define PIANO_CANCEL_NONE       2   /* no system sleep in progress */
++#define PIANO_CANCEL_LATE       3   /* the CPUs are frozen */
++
++struct piano_cancel {
++	uint32_t window;                /* PIANO_WINDOW_* */
++	uint32_t attempt;               /* the suspend the window is for (its number in machdep.piano_sleep) */
++	bool     cancelled;
++	uint32_t callers;               /* the requests taken in this window */
++	char     who[PIANO_CANCEL_WHO]; /* the first caller's, printable, always terminated */
++	char     why[PIANO_CANCEL_WHY];
++	uint64_t total;                 /* suspends cancelled this boot */
++	uint64_t refused;               /* requests refused this boot (off, none, late) */
++};
++
++/* A caller's string into DST (N > 0): at most N - 1 bytes, unprintable bytes as '?', NULL as "?". */
++static inline void
++piano_cancel_copy(char *dst, size_t n, const char *src)
++{
++	size_t i = 0;
++	if (src == NULL) {
++		src = "?";
++	}
++	for (; i + 1 < n && src[i] != '\0'; i++) {
++		char ch = src[i];
++		dst[i] = ch >= 0x20 && ch < 0x7f ? ch : '?';
++	}
++	dst[i] = '\0';
++}
++
++/* The window for suspend ATTEMPT. FRESH (IOPMrootDomain, the drivers about to go down): a new window, any earlier request
++ * forgotten. Not FRESH (IOCPUSleepKernel, before PreSleep): opened only when not open yet, so a cancel asked in a driver's kOff
++ * stays. */
++static inline void
++piano_cancel_open(struct piano_cancel *c, uint32_t attempt, bool fresh)
++{
++	if (!fresh && c->window == PIANO_WINDOW_OPEN) {
++		return;
++	}
++	c->window = PIANO_WINDOW_OPEN;
++	c->attempt = attempt;
++	c->cancelled = false;
++	c->callers = 0;
++	c->who[0] = '\0';
++	c->why[0] = '\0';
++}
++
++/* A driver's request. ENABLED: piano-sleep-cancel=1. */
++static inline int
++piano_cancel_request(struct piano_cancel *c, bool enabled, const char *who, const char *why)
++{
++	if (!enabled) {
++		c->refused++;
++		return PIANO_CANCEL_OFF;
++	}
++	if (c->window != PIANO_WINDOW_OPEN) {
++		c->refused++;
++		return c->window == PIANO_WINDOW_SHUT ? PIANO_CANCEL_LATE : PIANO_CANCEL_NONE;
++	}
++	c->callers++;
++	if (!c->cancelled) {
++		c->cancelled = true;
++		piano_cancel_copy(c->who, sizeof(c->who), who);
++		piano_cancel_copy(c->why, sizeof(c->why), why);
++	}
++	return PIANO_CANCEL_TAKEN;
++}
++
++/* Whether the suspend in progress is cancelled (the entry, the park's wait). */
++static inline bool
++piano_cancel_pending(const struct piano_cancel *c)
++{
++	return c->window == PIANO_WINDOW_OPEN && c->cancelled;
++}
++
++/* The freeze, or the suspend's return before it: the window shuts; true when the suspend is cancelled (counted once). */
++static inline bool
++piano_cancel_shut(struct piano_cancel *c)
++{
++	bool cancelled = piano_cancel_pending(c);
++	c->window = PIANO_WINDOW_SHUT;
++	if (cancelled) {
++		c->total++;
++	}
++	return cancelled;
++}
++
++/* After the suspend (woken, aborted or cancelled) and at every system-up: closed until the next sleep. */
++static inline void
++piano_cancel_close(struct piano_cancel *c)
++{
++	c->window = PIANO_WINDOW_CLOSED;
++}
++
++/* A refusal's console line is due: the first 16 of the boot, then every 64th (a driver asking in a loop cannot flood it). */
++static inline bool
++piano_cancel_refusal_logged(uint64_t refused)
++{
++	return refused <= 16 || refused % 64 == 0;
++}
++
++/* piano-sleep-cancel-test=N: the kernel's own test caller cancels suspend N (1-based) of the boot, 0 never. */
++static inline bool
++piano_cancel_test_due(uint32_t test, uint32_t attempt)
++{
++	return test != 0 && attempt == test;
++}
++
++#endif /* PIANO_S2IDLE_POLICY_H */
+-- 
+2.55.0
+

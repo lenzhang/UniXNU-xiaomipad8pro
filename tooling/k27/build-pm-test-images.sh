@@ -1,8 +1,8 @@
 #!/bin/bash
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 # The power test images of docs/power.md §6 (k27 0061 CPU idle, 0062 suspend-to-idle; the ufs* images: the storage side,
-# docs/drivers/ufs.md §12.8; island, gsleep*, gmeasure: the GPU's part, L1, G1-G3, GM), in the order of risk, from a KC whose
-# kernel has 0061 and 0062. Each is a RAM image of the GPU profile (as the installed system boots: PianoA830 and Turnip,
+# docs/drivers/ufs.md §12.8; island, gsleep*, gmeasure: the GPU's part, L1, G1-G3, GM; cancel0, cancel, llccsleep, llccidle3: k27
+# 0064's C0, C1, L2, L3, built only from a 0064 kernel), in the order of risk, from a KC whose kernel has 0061 and 0062. Each is a RAM image of the GPU profile (as the installed system boots: PianoA830 and Turnip,
 # vmm-present 0) plus PianoPower's battery lines every 10 s, the USB console and the buttons, with piano-reset-after as the
 # backstop and every reset into ABL fastboot (build-ram-images.py's K27_ARGS). Data: build-ram-images.py's store guard decides
 # (another seed than the installed one: data-persist=0).
@@ -31,6 +31,10 @@ BASE="piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-power=1 pia
 CYCLES="piano-sleep-test=150 piano-sleep-test-count=3 piano-sleep-max=30"
 ORDER="base probe idle1 idle2 idle1pd idle3 sleep0 sleep1 sleep2 sleepkey measure ufssleep0 ufssleep1 ufsahit ufsahitsleep ufsmeasure"
 ORDER="$ORDER island gsleep1 gsleep2 gsleep3 gmeasure"
+# k27 0064 (power.md §3.6, §3.7; tests C0, C1, L2, L3): the cancel (refused by default, then honoured) and the LLCC island read at each
+# decision. Only with a 0064 kernel in the KC (checked below for the images that need it).
+ORDER="$ORDER cancel0 cancel llccsleep llccidle3"
+K64="cancel0 cancel llccsleep llccidle3"
 # The storage side (docs/drivers/ufs.md §12): native-ufs-suspend=1 (NativeUfs's link into Hibern8 for each sleep, the Data disk held
 # and synced first when its store is open read-write) and native-ufs-ahit=MS (auto-hibernate at run time). The store follows
 # build-ram-images.py's guard like every image here: with another seed than the installed one Data is volatile and only the root
@@ -70,12 +74,21 @@ image() {
               A="$A piano-dpu-panel=1 piano-llcc-island=1 piano-llcc-island-ok=1 $UFS"; R=600 ;;   # G3 (attended): rails 0, ss3, island
     gmeasure) A="piano-cpuidle=2 piano-sleep=1 piano-sleep-state=2 piano-sleep-test=240 piano-sleep-test-count=1"
               A="$A piano-sleep-max=1800 $GSUS";                R=2400 ;;   # GM: M with the GPU's part
+    cancel0)  A="piano-sleep=1 piano-sleep-state=1 $CYCLES piano-sleep-cancel-test=2"; R=600 ;;   # C0: the cancel refused (default)
+    cancel)   A="piano-sleep=1 piano-sleep-state=1 $CYCLES piano-sleep-cancel=1 piano-sleep-cancel-test=2"; R=600 ;;   # C1: 2 of 3 cancelled
+    llccsleep) A="piano-sleep=1 piano-sleep-state=1 $CYCLES piano-llcc-island=1 piano-llcc-island-live=1"; R=600 ;;   # L2: the
+              # island programmed by PianoA830, read again at each suspend's entry (no ss3: state 1)
+    llccidle3) A="piano-cpuidle=3 piano-llcc-island=1 piano-llcc-island-live=1"; R=300 ;;   # L3 (after L2, I1, I2): ss3 at run time
+              # once the programmed island reads reserved at an ss3 decision (no piano-llcc-island-ok)
     *) return 1 ;;
   esac
 }
 COMMON=(--fd "$FD" --fd-name A-bundled --kc "$KC" --trust "$TRUST" --seed "$SEED" --adt "$ADT" --utc "$(date +%s)")
 for n in ${*:-$ORDER}; do
   image "$n" || { echo "build-pm-test-images: no image $n (one of: $ORDER)" >&2; exit 2; }
+  case " $K64 " in *" $n "*)
+    grep -a -q piano_s2idle_cancel_window "$KC" || { echo "build-pm-test-images: $n needs k27 0064 ($KC's kernel lacks it): skipped" >&2; continue; } ;;
+  esac
   PIANO_FAST_BOOT=1 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=$R PIANO_EXTRA_ARGS="$BASE $A" \
     python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out "out/ram-pm-$n" | tail -1
 done
