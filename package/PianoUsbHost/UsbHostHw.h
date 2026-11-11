@@ -63,7 +63,8 @@ constexpr uint32_t kXcapLegacy = 1, kXcapProtocol = 2, kXcapPower = 3, kXcapMsi 
 // which clears itself; DWC_usb31 1.90a and later may take > 50 ms, before 1.90a 50 ms more are needed before the PHY is touched);
 // GCTL.CORESOFTRESET is pulsed for 100 ms on a role change only for DWC_usb3 and DWC_usb31 before 1.90a (GVERSION 0x3139302a);
 // GUSB2PHYCFG.SUSPHY/ENBLSLPM and GUSB3PIPECTL.SUSPHY off (snps,dis_u2_susphy_quirk, snps,dis_enblslpm_quirk on piano); then
-// GCTL.PRTCAPDIR = 1; GUCTL.HSTINAUTORETRY for host and OTG (LNX core init; SUN found it in the stock Usb30InitHost too).
+// GCTL.PRTCAPDIR = 1. GUCTL.HSTINAUTORETRY (bit 14, a non-terminating retry on IN transaction errors): SUN's host session sets it
+// with the stock UsbConfigDxe values, after mainline dwc3's host/OTG core init; the Ubuntu tree read here has no such write.
 constexpr uint32_t kGsbusCfg0 = 0xc100, kGctl = 0xc110, kGsts = 0xc118, kGsnpsid = 0xc120, kGuctl = 0xc12c, kGversion = 0xc1a0,
                    kGusb2PhyCfg = 0xc200, kGusb3PipeCtl = 0xc2c0, kGevntSiz = 0xc408, kDctl = 0xc704, kDsts = 0xc70c;
 constexpr uint32_t kDctlRunStop = 1u << 31, kDctlCsftrst = 1u << 30, kDctlUlstChngReqMask = 0xfu << 5;

@@ -64,7 +64,7 @@ inline bool utmiAsPipeBits(uint32_t general)
 struct HostPolicy {
   unsigned coreSoftReset = 2;   // GCTL.CORESOFTRESET on the role change: 0 never, 1 always, 2 as Linux (DWC_usb3, DWC_usb31 < 1.90a)
   bool utmiAsPipe = true;       // QSCRATCH: the UTMI clock as the PIPE clock (high speed only; the QMP PHY stays off: H7)
-  bool autoRetry = true;        // GUCTL.HSTINAUTORETRY (Linux sets it for host and OTG)
+  bool autoRetry = true;        // GUCTL.HSTINAUTORETRY (SUN's host session, after mainline dwc3's host/OTG init)
 };
 inline bool needsGctlSoftReset(uint32_t gsnpsid, uint32_t gversion)
 {
