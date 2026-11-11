@@ -68,3 +68,12 @@ Not in scope (Ubuntu does not support them either): stylus, fingerprint, hiberna
 Offline design started 2026-11-11: B1a (DPU survey + design), B3 (sensors design), B7 (USB host/Type-C design), B8 (DisplayPort
 design), B10 (video design + survey), B11 (camera design), B12 (torch, built). Each item's page
 lives in `docs/drivers/`; this table is updated when an item moves.
+
+## 4. Decisions waiting for the owner (nothing proceeds on these without his word)
+
+| Item | Question | Default meanwhile |
+|---|---|---|
+| B7 USB host, path A2 | binary analysis of `AppleUSBXHCI`'s vtable for our KC build (a subclass fixture) | path A1 only (codeless personality on our own nub) |
+| PianoWifi upper levels | use Ath12kWifi (GPL sources, no LICENSE) as an external build input | levels 1-4 from BSD sources only |
+| B11 cameras | the sensors' register tables exist only in GPL drivers: accept them as specification data, capture the I2C writes on a running stock system, or leave cameras out | design only |
+| B8 DisplayPort | the DP PHY tuning tables: same question (or dump the PHY registers while a stock system drives a monitor) | design only |
