@@ -215,7 +215,7 @@ struct Stats {
 template <class Hw>
 class Flipper {
  public:
-  explicit Flipper(Hw &h) : hw(h) {}
+  constexpr explicit Flipper(Hw &h) : hw(h) {}   // constant-initialized as a kernel global: no static constructor
 
   Hw &hw;
   Config cfg;
@@ -235,7 +235,7 @@ class Flipper {
   uint32_t mdssBefore = 0;    // MDSS HW_INTR_STATUS after the DPU's enables went off: another block holds the line when not 0
   const char *failure = nullptr;
   Stats st;
-  uint64_t pages[smmu::kSlotPages];
+  uint64_t pages[smmu::kSlotPages] = {};
 
   // --------------------------------------------------------------------------------------------- the interrupt enables
   void writeEn(uint32_t v)

@@ -16,7 +16,7 @@ mkdir -p "$O/host-tests"
 # B1b (zero-copy flips): the SMMU bank in place, the windows, the flip engine and its safety, against DPU/SMMU/RAM models.
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/dpu_flip_host.cpp" -o "$O/host-tests/dpu_flip_host"
 "$O/host-tests/dpu_flip_host" || { echo "Error: PianoDpu B1b host tests failed" >&2; exit 1; }
-python3 "$D/tooling/k27/build-native-kext.py" PianoDpu "$P/PianoDpu.cpp" "$D/tooling/k27/NativeKextGlue.cpp" -I "$P" \
+python3 "$D/tooling/k27/build-native-kext.py" PianoDpu "$P/PianoDpu.cpp" "$P/DpuFlip.cpp" "$D/tooling/k27/NativeKextGlue.cpp" -I "$P" \
   --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" | cut -c1-160 >&2

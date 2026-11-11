@@ -15,6 +15,8 @@
 // piano-dpu-repeat=S with piano-dpu-samples=N (re-measure every S s, N times, default 3: one line each, to see a change after
 // WindowServer starts or the display sleeps). Without piano-dpu the driver declines in probe() and maps nothing. NativeGopDisplay is
 // not touched: this driver never registers a display.
+//   piano-dpu=2  level 1, then B1b, the zero-copy flips (DpuFlip.cpp: piano-dpu-flip=N, the ladder of docs/drivers/dpu.md section 8);
+//                the service is registered so that NativeGopDisplay (native-gop-display-flip=1) finds its "PianoDpuFlip" function.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -25,6 +27,7 @@
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include "DpuSurvey.h"
+#include "DpuFlipKernel.h"
 
 using namespace pianodpu;
 
@@ -481,8 +484,10 @@ class PianoDpu : public IOService {
   static void thread(void *self, wait_result_t);
 
  public:
+  using IOService::callPlatformFunction;
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  IOReturn callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4) override;
 };
 
 OSDefineMetaClassAndStructors(PianoDpu, IOService)
@@ -500,9 +505,10 @@ bool PianoDpu::start(IOService *provider)
   note("start: piano-dpu=%u smmu=%u measure=%u ms delay=%u repeat=%u samples=%u (MDSS %#llx, DPU %#llx, DSI %#llx/%#llx)", gArgs.level,
        gArgs.smmu, gArgs.measure, gArgs.delay, gArgs.repeat, gArgs.samples, (unsigned long long)kMdss, (unsigned long long)kMdp,
        (unsigned long long)kDsi[0], (unsigned long long)kDsi[1]);
-  if (gArgs.level > 1) note("piano-dpu=%u: only level 1 exists (docs/drivers/dpu.md section 8); running level 1", gArgs.level);
-  note("level 1: loads only, nothing written");
+  if (gArgs.level > 2) note("piano-dpu=%u: levels 1 and 2 exist (docs/drivers/dpu.md section 8); running level 2", gArgs.level);
+  note("level 1: loads only, nothing written%s", gArgs.level >= 2 ? "; then B1b (piano-dpu=2): the flips of piano-dpu-flip" : "");
   setProperty("piano-dpu", gArgs.level, 32);
+  if (gArgs.level >= 2) registerService();   // NativeGopDisplay finds the flip function by this class
   thread_t t = nullptr;
   if (kernel_thread_start(&PianoDpu::thread, this, &t) != KERN_SUCCESS) {
     stage(-1, "no thread");
@@ -510,6 +516,13 @@ bool PianoDpu::start(IOService *provider)
   }
   thread_deallocate(t);
   return true;
+}
+
+IOReturn PianoDpu::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4)
+{
+  IOReturn result = kIOReturnUnsupported;
+  if (flipFunction(name, p1, &result)) return result;
+  return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
 }
 
 void PianoDpu::thread(void *self, wait_result_t)
@@ -580,4 +593,5 @@ void PianoDpu::run()
   stage(5, "done");
   note("done: %llu MMIO loads, 0 stores; %u pages mapped, %u map failures", (unsigned long long)gLoads, gPageCount, gMapFailures);
   unmapAll();
+  if (gArgs.level >= 2) flipRun(this, s, m, gArgs.smmu);   // B1b: DpuFlip.cpp, its own mappings and stores
 }
