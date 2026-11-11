@@ -112,10 +112,24 @@ Build outputs (`UniXNU-piano/out/`, `build/`), signing keys (`private/`), vendor
    archive's kext. `tooling/kc/build-kc-k27.sh` enforces this (`tooling/k27/check-native-kexts.py`, before and after the link).
    Evidence and history: `docs/bringup-debugging.md` §5.
 
-## 7. Current bring-up note (2026-11-11 09:05)
+## 7. Current bring-up note (2026-11-11 11:30)
 
 Native macOS is installed on piano and boots by itself: boot_a = BootShim + FD (signed v4), the UniXNU payload on an ESP (LUN 0
 partition 37, carved from linux_rootfs), the macOS root and Data on linux_rootfs (NativeUfs). The A830 GPU (PianoA830 + Turnip on
-ABI v2) composites the login screen. Input is still missing (keyboard cover driver in progress, touch later). Dev work continues with
-RAM boots (`fastboot boot`, which take priority over the installed copy); verified backups of every written region are on the NAS
-and `tooling/persist/maint-session.py rollback ...` restores them. See `docs/persistent-boot.md`.
+ABI v2) composites the login screen. Dev work continues with RAM boots (`fastboot boot`, which take priority over the installed
+copy); verified backups of every written region are on the NAS and `tooling/persist/maint-session.py rollback ...` restores them.
+See `docs/persistent-boot.md`.
+
+Drivers and their state (each inert without its boot argument; pages in `docs/drivers/`):
+
+| Driver | State |
+|---|---|
+| PianoDwc3 (USB console, monitor incl. `reset fastboot`, the Mac's keyboard/pointer) | runs on the tablet |
+| PianoPower (gauges, Type-C; DSP charger path) | level 1 runs; level 2 starts the DSP but the input stays at 0 mA (diagnostic images G/H pending) |
+| PianoKeyboard (WN8030 cover + touchpad, hall gpio80) | MCU boots and the cover attaches; key/touchpad reports not yet seen with someone typing |
+| PianoTouch (NT36532E on QUP1 SE2) | built and linked, not run |
+| PianoWifi (WCN7860 on PCIe0) | level 1 read-only survey built, not run; the full ladder is months of work (`wifi.md`) |
+| PianoInput (buttons) | runs on the tablet |
+
+The installed profile (`build-esp.py --profile daily`: GPU + PianoPower level 1 + the USB console and the Mac's keyboard/pointer)
+replaces the first install's GPU-only profile at the next install session.
