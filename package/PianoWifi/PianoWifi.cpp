@@ -75,6 +75,8 @@
 #include "WifiSmmuWindow.h"
 #include "WifiSurvey.h"
 #include "WifiWlfw.h"
+#define PIANO_WCN_RAILS_KERNEL
+#include <PianoWcnRails.h>   // the PMU's six rails, shared with PianoBluetooth (docs/drivers/bluetooth.md section 7)
 
 using namespace pianowifi;
 
@@ -736,6 +738,21 @@ int hwPmic(void *, uint16_t ppid, uint8_t *status, uint8_t *enable, uint8_t *mod
 }
 
 const Hw gHw = {nullptr, hwRead, hwWrite, hwUdelay, hwMsleep, hwNow, hwVoteLock, hwVrm, hwPmic, hwStep};
+
+// The rails helper both radios run (PianoWcnRails.h; its words are PianoA830's): this driver's own VRM transaction (hwVrm, under
+// the DRV-2 lock) and regulator read (hwPmic, the observer channel); the PPIDs from level 1's survey. The PMU lock also keeps
+// PianoBluetooth's SPMI reads of the same peripherals out of ours.
+int wcnVrm(void *, const char *resource, const PianoWcnVrmCmd *cmds, unsigned count)
+{
+  VrmCmd c[3];
+  if (!cmds || !count || count > 3) return -22;
+  for (unsigned i = 0; i < count; ++i) c[i] = {cmds[i].reg, cmds[i].value};
+  return hwVrm(nullptr, resource, c, count, nullptr);
+}
+PIANO_WCN_KERNEL_RAILS(gWcn, PianoWcnTagWifi, "PianoWifi", wcnVrm, hwPmic, nullptr);
+// Wi-Fi no longer runs on the rails: its owner bit back (with piano-wifi-release=1 the last owner withdraws the helper's enables).
+unsigned wcnPutOwners() { return piano_wcn_rails_put(&gWcn.rails, PIANO_WCN_WLAN | (gArgs.release ? unsigned(PIANO_WCN_RELEASE) : 0u)); }
+void wcnPut() { (void)wcnPutOwners(); }
 
 Options options()
 {
@@ -1620,9 +1637,12 @@ void stopRadio(const char *why)
   if (!gLinkRunning && gLink.ce) linkTeardown();
   if (gPowerState && gWin[kWinTlmm].va) {
     safeOff(gHw, *gPowerState, gPowerOptions);
-    note("%s: WLAN_EN is low and PERST# asserted; the rails stay voted (Bluetooth shares them) and the Wi-Fi path stays off "
+    // The chip is given up for good, so the rails are given back: Bluetooth keeps them up if it is running, and with
+    // piano-wifi-release=1 the last owner withdraws the enables this driver added.
+    const unsigned left = wcnPutOwners();
+    note("%s: WLAN_EN is low and PERST# asserted; the rails are given back (owners left %#x) and the Wi-Fi path stays off "
          "until the next boot",
-         why);
+         why, left);
   }
 }
 
@@ -1750,7 +1770,10 @@ void PianoWifi::run()
   }
   if (gArgs.spmi || gArgs.level >= 2) {
     stage(6, "the supplies' PMIC regulators and the BT_EN / sleep clock pins over SPMI (observer reads)");
+    // Under the PMU lock: PianoBluetooth reads the same peripherals through the same observer channel.
+    const bool held = !piano_wcn_pmu_lock(&gWcn.rails, 1);
     reportPmic();
+    if (held) piano_wcn_pmu_lock(&gWcn.rails, 0);
   }
   char line[200];
   summary(s, line, sizeof line);
@@ -1792,7 +1815,27 @@ void PianoWifi::run()
     return;
   }
   note("level 2: the six PMU rails, PERST# low, WLAN_EN; the PHY's two LDOs are read only (one is the UFS PHY's PLL)");
-  int rc = powerUp(power, gHw, opt);
+  // The rails through the shared helper first (PianoBluetooth may hold them already: then only a read-back), then level 2's own
+  // steps, the PMU lock across both: BT_EN never rises between our rails and WLAN_EN. powerUp's steps 201..203 then find the
+  // rails up and send the same votes again (apps DRV-2 holds one vote per resource), and enable nothing of their own.
+  for (unsigned i = 0; i < kRailCount && i < PIANO_WCN_RAIL_COUNT; ++i) gWcn.rails.ppid[i] = gRailPpid[i];
+  gWcn.rails.blind = int(gArgs.blind);
+  int rc = piano_wcn_pmu_lock(&gWcn.rails, 1);
+  if (!rc) {
+    rc = piano_wcn_rails_get(&gWcn.rails, PIANO_WCN_WLAN);
+    if (rc) {
+      power.step = gWcn.rails.step ? gWcn.rails.step : -kStepRailsRead;
+      power.error = rc == PianoWcnBusy ? kErrRailVote : rc;
+    } else {
+      rc = powerUp(power, gHw, opt);
+      if (rc) wcnPut();
+    }
+    piano_wcn_pmu_lock(&gWcn.rails, 0);
+  } else {
+    power.step = -kStepRailsRead;
+    power.error = kErrRailVote;
+    note("level 2: the PMU lock stayed held by %#x (PianoBluetooth): nothing written", piano_wcn_load(&piano_wcn_pmu_owner));
+  }
   reportPower(power);
   writeSummary("level 2");
   if (rc) {
@@ -1823,6 +1866,7 @@ void PianoWifi::run()
   if (rc) {
     stage(link.step, "level 3 stopped here");
     note("level 3: FAILED at step %d (%s): WLAN_EN is low and PERST# asserted", link.step, errorName(link.error));
+    wcnPut();
     unmapWindows();
     unmapAll();
     return;
@@ -1833,6 +1877,8 @@ void PianoWifi::run()
     stage(kStepBar + 1, "the SMMU: the endpoint's stream through a bypass context bank");
     if (!smmuStream(kStreamEndpoint)) {
       stage(-(kStepBar + 1), "level 3: the endpoint's SMMU stream was not set up; no DMA is started");
+      safeOff(gHw, power, opt);
+      wcnPut();
       unmapWindows();
       unmapAll();
       return;
@@ -1851,6 +1897,7 @@ void PianoWifi::run()
   if (!dmaWindow()) {
     stage(-400, "level 4: no DMA window; nothing was given to the endpoint");
     safeOff(gHw, power, opt);
+    wcnPut();
     unmapWindows();
     unmapAll();
     return;
@@ -1858,6 +1905,7 @@ void PianoWifi::run()
   if (gArgs.iova && !iovaWindow()) {
     stage(-400, "level 4: the window's 32-bit addresses were not set up; nothing was given to the endpoint");
     safeOff(gHw, power, opt);
+    wcnPut();
     unmapWindows();
     unmapAll();
     return;
@@ -1867,6 +1915,7 @@ void PianoWifi::run()
   stage(rc ? -401 : 401, rc ? "level 4 stopped before mission mode" : "level 4: the firmware runs (mission mode)");
   note("level 4: %s%s", rc ? "the chip did not reach mission mode" : "the chip is in mission mode",
        rc ? "" : gArgs.level < 5 ? "; the ladder ends here (QMI is level 5, WMI and the station levels 6 and up)" : "");
+  if (rc) wcnPut();   // level 4's failures end in safeOff: WLAN_EN low
   if (rc || gArgs.level < 5) {
     unmapAll();
     return;
@@ -1875,6 +1924,7 @@ void PianoWifi::run()
   // ---- level 5 ---------------------------------------------------------------------------------------------------------
   rc = level5(power, opt);
   piano_wifi_firmware_close();
+  if (rc) wcnPut();   // level 5's failures end in safeOff too
   writeSummary("level 5");
   stage(rc ? -504 : 504, rc ? "level 5 stopped before the firmware was ready" : "level 5: the firmware is ready");
   note("level 5: %s; %s", rc ? "the firmware did not become ready" : "the firmware is ready",
@@ -1893,6 +1943,7 @@ void PianoWifi::run()
 
   // ---- level 6 ---------------------------------------------------------------------------------------------------------
   rc = level6(this, power, opt);
+  if (rc) wcnPut();   // level 6's failures end in safeOff as well
   writeSummary("level 6");
   stage(rc ? -613 : 613, rc ? "level 6 stopped before the scan was done" : "level 6: the scan is done");
   note("level 6: %s; %s", rc ? "the scan did not finish" : "the scan is done",

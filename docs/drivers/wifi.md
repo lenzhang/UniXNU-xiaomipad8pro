@@ -7,8 +7,8 @@ indication) and level 6 (the copy engine's rings over BAR0, the host transport's
 the host's initialisation, and a **passive scan** whose results become the property `piano-wifi-scan`). The macOS side of level 6
 is `package/PianoWifi/PianoWifiEthernet.cpp`: an `IOEthernetController` publishing `en1` **link down** with that list
 (`tooling/native/piano-wifi` prints it). All six are built, host-tested (`tests/wifi_host.cpp`, `tests/bringup_host.cpp`,
-`tests/qmi_host.cpp`, `tests/wmi_host.cpp`) and linked into the native KC ("22 native kexts linked, none from outside this
-repository", PianoWifi 568 pointers, PianoWifiEthernet 442 pointers with its vtable check at 0 problem slots), inert without
+`tests/qmi_host.cpp`, `tests/wmi_host.cpp`) and linked into the native KC ("23 native kexts linked, none from outside this
+repository", PianoWifi 604 pointers, PianoWifiEthernet 442 pointers with its vtable check at 0 problem slots), inert without
 `piano-wifi`; **nothing above level 1 has run on hardware**, and each level must be read from a boot's log before the next one is
 tried (§8.2–§8.6, the batched list in §8.8). Association, keys and the data path (levels 7 and 8) are design only (§12 has level
 5's message table, §14 level 6's, §13 what levels 7 and 8 need and the macOS side's remaining plan). Template: `README.md`.
@@ -156,7 +156,10 @@ import check), descriptor `tooling/k27/kext/PianoWifi.json` (`com.unixnu.driver.
 `configs/k27-native-kexts.txt`, so `tooling/k27/build-native-image.sh` links it into every native KC (inert). The descriptor names
 two libraries, which is why PianoWifi comes after them in the list: `PianoA830` for the two lock words
 (`sm8750_rpmh_drv2_owner`, `sm8750_gcc_vote_owner`) and `NativeUfs` for `native_ufs_part_find` / `native_ufs_part_read` (level 4's
-firmware read). The four unresolved symbols the import check reports are exactly those; the KC link resolves them.
+firmware read), and from 2026-11-12 also the two words of the shared rails helper (`piano_wcn_rails_state`,
+`piano_wcn_pmu_owner`, which PianoA830 defines: `drivers/bluetooth.md` §7). The six symbols the import check reports are
+exactly those ("6 from the libraries … 0 unresolved"); the KC link resolves them. The build script also runs
+`package/include/tests/run.sh`, the helper's own host tests.
 
 The macOS side is a second kext of the same package: `tooling/k27/build-native-piano-wifi-ethernet.sh` builds
 `package/PianoWifi/PianoWifiEthernet.cpp` against `IONetworkingFamily` (and the k27 tree's networking headers, as
@@ -164,7 +167,7 @@ PianoNullEthernet is built), descriptor `tooling/k27/kext/PianoWifiEthernet.json
 has. It owns no hardware: its personality matches the **resource** `PianoWifiLink`, which PianoWifi publishes only when level 6
 came up, so without `piano-wifi=6` macOS never sees `en1`. Both are in the kext list, after PianoWifi.
 
-The link: `22 native kexts linked, none from outside this repository`; PianoWifi 568 pointers, PianoWifiEthernet 442 pointers,
+The link: `23 native kexts linked, none from outside this repository`; PianoWifi 604 pointers, PianoWifiEthernet 442 pointers,
 `vtable check PianoWifiEthernet vs IOEthernetController: 0 problem slots`; `tooling/k27/check-native-kexts.py` passes on both
 descriptors and on the collection's log.
 
@@ -197,7 +200,7 @@ level's log was read. Effort = agent work + owner boots, assuming the PaganiWifi
 | Level | What | Pass | Effort |
 |---|---|---|---|
 | 1 (built) | survey: GCC/TCSR/TLMM, PARF/DBI/iATU and PHY only behind their gates, SMMU 0x1400/0x1401, cmd-db; with `-spmi=1` the eight regulators, BT_EN, sleep clock | the log below; nothing written | done; 1 boot |
-| 2 (built) power | the six PMU rails by RPMh (mode NPM, the voltage piano's DT asks for, enable; DRV-2 lock), PERST# low, CLKREQ# to its function, WLAN_EN low 150 ms then high + 50 ms, SW_CTRL read. No sleep clock pin is driven (§10.3) | the rails read back enabled at the voted voltages, the UFS PHY's supplies unchanged | done; 1–2 boots |
+| 2 (built) power | the six PMU rails **through the shared helper** (`package/include/PianoWcnRails.h`: the PMU lock, then a read-back when Bluetooth holds them already, else the votes — mode NPM, the voltage piano's DT asks for, enable; DRV-2 lock), then this level's own steps inside the same lock, PERST# low, CLKREQ# to its function, WLAN_EN low 150 ms then high + 50 ms, SW_CTRL read. No sleep clock pin is driven (§10.3) | the rails read back enabled at the voted voltages, the UFS PHY's supplies unchanged | done; 1–2 boots |
 | 3 (built) link | GDSC release (GCC vote lock), RCGs, branch votes, TCSR clkref, BCR pulses, PARF set-up, the v7 PHY sequence, PHYSTATUS, BDF-to-SID, root port + memory window, PERST# high ≥ 100 ms later, LTSSM, L0 (Gen2 cap), iATU 0 and 1, config read, BAR0, SMMU stream 0x1401 | `17cb:110e` from the endpoint, BAR0 placed | done; 3–5 boots |
 | 4 (built) MHI firmware | the DMA window (24 MiB, 36-bit, write-combined), BAR0's MHI block, `image/peach/amss20.bin` read at run time from `modem_a`, BHI (the boot loader), the MHI contexts, BHIe (the second ELF), mission mode; polled, no MSI | EE mission mode (AMSS) | done; 2–4 boots |
 | 5 (built) QMI | the MHI channels 20/21 and their events, QRTR, and the WLFW service: the radio's and the chip's capability, the indication registration, the host capability, the firmware's memory regions out of the window, regdb and the China-region board file in 6 KiB segments, the PHY and auxiliary microcodes by address, the trace configuration; `piano-wifi-mode=1` also the options, the copy-engine configuration and the mode | the firmware's "ready" indication | done; 2–4 boots |
@@ -284,6 +287,8 @@ words (PERST#, CLKREQ#, WLAN_EN). Nothing else; no clock, no domain, no PCIe reg
 ```
 PianoWifi: levels: 1 survey, 2 power, 3 link (gen 2, physeq 1, rcg 1, blind 0, release 0, stop 0, dma 24 MiB, phase timeout 20000 ms)
 PianoWifi: rsc: apps DRV-2 id 00030003 (version 3.3: v3 layout), TCS block +0xd00
+PianoWifi: wcn rails (ours 0x57494649): the six rails voted and read back (6 with a voltage): state 0x80003f01
+   (or, when PianoBluetooth already has them: "the six rails were up and read back enabled: owners now 0x80003f03")
 PianoWifi: step 201: the rails as the PMIC has them (SPMI observer reads)
 PianoWifi: step 202: the six PMU rails by RPMh: mode NPM, voltage, enable (DRV-2 lock per transaction)
 PianoWifi: rsc: ldof3 (0x.....): 3 commands through TCS 2 completed after 0 ms (status 00010100 00010100 00010100)
@@ -561,7 +566,7 @@ the next is built: a level that fails is not retried at a higher level, and noth
 
 | # | Boot args | Gate: what the log must show | If it fails |
 |---|---|---|---|
-| 1 | `piano-usb=2 piano-wifi=2` | every PMU rail `en 80` at or above the voted voltage; the two PHY LDOs unchanged; `WLAN_EN cfg ... io 00000002`; the log reaching `level 2: done`; the tablet alive afterwards (§8.2) | read §8.2's failure meanings; `SW_CTRL in 0` is not itself a failure but is the first suspect at boot 2 |
+| 1 | `piano-usb=2 piano-wifi=2` | the helper's `wcn rails … voted and read back` line, then every PMU rail `en 80` at or above the voted voltage; the two PHY LDOs unchanged; `WLAN_EN cfg ... io 00000002`; the log reaching `level 2: done`; the tablet alive afterwards (§8.2) | read §8.2's failure meanings; `SW_CTRL in 0` is not itself a failure but is the first suspect at boot 2 |
 | 2 | `piano-usb=2 piano-wifi=3` | `PCS status1 ... (ready)`, `LTSSM 0x11 L0` with `debug1 ... (up)`, `id 110e17cb`, a BAR0 placed inside the window, `command ...6`, the SMMU line (§8.3) | §8.3; `piano-wifi-gen=1`, `piano-wifi-physeq=0` and `piano-wifi-stop=N` are the next boots' tools |
 | 3 | `piano-usb=2 piano-wifi=4` | `EE PBL` at the start, the 6930496-byte file split at 512 KiB, `boot loader over BHI` → `contexts needed` → `image over BHIe` → `mission mode`, the tablet alive (§8.4) | §8.4; `piano-wifi-delay=20` when `modem_a` was not published yet |
 | 4 | `piano-usb=2 piano-wifi=5` | both channels running, the firmware's service announced, the memory request answered, the four files read, `3 indications`, `0 unexpected messages`, the ready line with step 518 (§8.5) | §8.5 |
@@ -614,8 +619,11 @@ network (§5.2 C).
    if either moved; `piano-wifi-release=1` never touches them either. (verified from piano's DT)
 7. Shared state: the DRV-2 lock for every RPMh vote, the GCC vote lock for `0x52000`/`0x52008` and the collapse word (PianoA830
    holds GPLL0 votes there, PianoTouch the QUP branches), the SPMI observer channel per APID (PianoWifi's APIDs are none of
-   PianoInput's/PianoPower's/PianoDwc3's), the PMU with Bluetooth (BT_EN on a PMIC GPIO; a later QcaBluetooth must share the rail
-   votes, as sheng's `WcnPower.h` does). Every vote of ours only ever adds.
+   PianoInput's/PianoPower's/PianoDwc3's). The PMU is **shared with Bluetooth** through
+   `package/include/PianoWcnRails.h` (`drivers/bluetooth.md` §7): its two words are PianoA830's, the PMU lock orders the two
+   radios' power changes, level 1's PMIC survey and level 2's rails run under it, and every path where this driver gives the
+   chip up (a level 2 to 6 failure, or the suspend hook) gives its owner bit back — with the enables withdrawn only at
+   `piano-wifi-release=1` and only when no owner is left. Every vote of ours still only ever adds.
 8. Licensing of Ath12kWifi (GPL code compiled into an XNU kext, no LICENSE in its repository): an owner decision before levels 7 and 8
    use it; it would stay an external build input, never in this repository (§11).
 9. Heat and power: Wi-Fi at full power with no thermal driver; sessions stay attended.

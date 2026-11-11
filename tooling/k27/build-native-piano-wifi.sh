@@ -17,6 +17,7 @@ D=$(cd "$(dirname "$0")/../.." && pwd)
 . "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 P=$D/package/PianoWifi; O=$D/out/native-kexts/PianoWifi
 mkdir -p "$O/host-tests"
+"$D/package/include/tests/run.sh"   # PianoWcnRails.h: the rails shared with PianoBluetooth (docs/drivers/bluetooth.md section 7)
 # WifiQrtr.c (the copy of PianoPower's QRTR codec) is a C source: the level 5 test links its object.
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/WifiQrtr.c" -o "$O/host-tests/WifiQrtr.o"
 for t in wifi_host bringup_host qmi_host wmi_host; do
@@ -35,4 +36,4 @@ KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 # PianoA830's lock words and NativeUfs's partition reader come from those kexts (libraries in PianoWifi.json, both linked before
 # PianoWifi in configs/k27-native-kexts.txt), resolved by the KC link.
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" --library-prefix _sm8750_rpmh_drv2_owner \
-  --library-prefix _sm8750_gcc_vote_owner --library-prefix _native_ufs_part_ | cut -c1-160 >&2
+  --library-prefix _sm8750_gcc_vote_owner --library-prefix _piano_wcn_ --library-prefix _native_ufs_part_ | cut -c1-160 >&2
