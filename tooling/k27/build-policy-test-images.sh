@@ -3,7 +3,7 @@
 # The test images of docs/policy.md section 9 (PianoPolicy: the cover, the power key, the keyboard's display wake, Low Power Mode),
 # in the order of risk, from a KC with the 0062 kernel and PianoKeyboard. Each is a RAM image of the GPU profile with the drivers the
 # policy watches (PianoKeyboard level 2 with piano-keyboard-lid=0, PianoPower's battery as macOS's power source, PianoBacklight level
-# 2 for the display power, PianoThermal's governor), the USB console, the buttons and piano-reset-after as the backstop.
+# 2 for the display power, PianoThermal's CPU frequency control), the USB console, the buttons and piano-reset-after as the backstop.
 #
 #   build-policy-test-images.sh [NAME ...]    default: all of observe lock sleep lpm suspend gpuslot; out/ram-pol-<NAME>/ and out/ram-pol-dump/
 #                                             (chargesleep only by name: it starts the DSP, PianoPower level 2)
@@ -11,7 +11,8 @@
 # Inputs (this repository's out/ unless set): POL_KC (out/k27/kc-k27-native.bin, built by
 #   K27_KERNEL=<kernel-k27-0062-native.macho> PIANO_EXTRA_KEXTS=$(tooling/k27/build-native-piano-keyboard.sh | tail -1) \
 #   PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh), POL_ADT (out/adt/piano-k27.adt), POL_FD, POL_SEED, POL_TRUST
-# (the Turnip stage), POL_EXTRA (added to every image). The KC is checked for PianoPolicy, PianoKeyboard and the 0062 kernel.
+# (the Turnip stage), POL_EXTRA (added to every image), POL_CPUFREQ (PianoThermal's CPU frequency arguments for every image, instead
+# of the per-image choice below). The KC is checked for PianoPolicy, PianoKeyboard and the 0062 kernel.
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
 KC=${POL_KC:-out/k27/kc-k27-native.bin}
@@ -24,23 +25,33 @@ for s in com.unixnu.driver.PianoPolicy com.unixnu.driver.PianoKeyboard piano_s2i
   grep -a -q "$s" "$KC" || { echo "build-policy-test-images: $KC has no $s (PianoPolicy, PianoKeyboard and the 0062 kernel are needed)" >&2; exit 1; }
 done
 # The drivers the policy reads, at the levels that publish what it reads. PIANO_FAST_BOOT=1 keeps the command line under 1023 bytes.
-# PW, TH: PianoPower's and PianoThermal's levels, per image (the kernel takes the first occurrence of an argument, so an image cannot
-# raise a level BASE already gives).
+# PW, TH, CF: PianoPower's and PianoThermal's levels and the CPU frequency mode, per image (the kernel takes the first occurrence of
+# an argument, so an image cannot raise a level BASE already gives).
+# CF (2026-11-12, P9 of that night's queue): the fixed Power Saver level (piano-cpufreq=2: 1785 / 1958 MHz, the thermal limit on top)
+# for every image but the two that test the profile's hand-off to the governor. Before, every image ran the governor (piano-cpufreq=3)
+# on the Mac's cable, where its ceiling is Balanced's 3532 / 4089 MHz: with that night's idle load (PerfPowerServices spinning,
+# docs/power.md 1.2) it held cluster 0 at 3532 MHz and 102-105 C for 15 minutes unattended, and the packs discharged on the cable.
+# These images test PianoPolicy's decisions and the suspend path, not the CPU clock: the fixed level is the same in every run
+# (comparable battery lines), cool, and cannot run away. lpm and gpuslot keep the governor, because their check is the profile's
+# ceiling, which only mode 3 takes, but under a hard cap (2400 / 2438 MHz, under the 2500 MHz fast-poll clock): Balanced then reads
+# `ceiling 2400 MHz` and Power Saver `ceiling 1785 MHz`, so the profile's step stays visible.
 BASE="piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-usb=2 piano-input=1 piano-power-ps=1"
-BASE="$BASE piano-power-period=10 piano-keyboard=2 piano-backlight=2 piano-cpufreq=3 ${POL_EXTRA:-}"
+BASE="$BASE piano-power-period=10 piano-keyboard=2 piano-backlight=2 ${POL_EXTRA:-}"
+CF_FIXED="piano-cpufreq=2"
+CF_GOVERN="piano-cpufreq=3 piano-cpufreq-cap0=2400 piano-cpufreq-cap1=2438"
 ORDER="observe lock sleep lpm suspend gpuslot"
 image() {
-  PW="piano-power=1" TH="piano-thermal=1"
+  PW="piano-power=1" TH="piano-thermal=1" CF=$CF_FIXED
   case $1 in
     observe) A="piano-policy=1 piano-policy-lid=1";                                      R=900 ;;    # decisions only
     lock)    A="piano-policy=2 piano-policy-lid=1 piano-backlight-lid=1";                R=1200 ;;   # no system sleep: closing locks
     sleep)   A="piano-policy=2 piano-policy-lid=1 piano-backlight-lid=1 piano-sleep=1 piano-sleep-state=1"
              A="$A piano-sleep-wake=19 piano-sleep-max=600";                             R=1800 ;;   # closing on battery sleeps
-    lpm)     TH="piano-thermal=2"
+    lpm)     TH="piano-thermal=2" CF=$CF_GOVERN
              A="piano-policy=2 piano-gpu-dcvs-max=607";                                  R=900 ;;    # the profile and the ceiling
     # P7, unattended (the Mac's cable: external power): Low Power Mode from boot, so Power Saver on power: PianoThermal's profile 1 and
     # the GPU ceiling in PianoA830's slot 1 next to PianoThermal's (level 2) slot 0 (docs/policy.md 5.2, 5.3)
-    gpuslot) TH="piano-thermal=2"
+    gpuslot) TH="piano-thermal=2" CF=$CF_GOVERN
              A="piano-policy=2 piano-gpu-dcvs-max=607 piano-policy-lpm=1";               R=600 ;;
     # every driver of power.md 4 that joins the power tree in a suspend: PianoInput, PianoDwc3 (the Mac kept), PianoKeyboard (the
     # MCU blanked, gpio95 latched), PianoBacklight, PianoThermal, NativeGopDisplay's display power; 3 test sleeps of 30 s, then by hand
@@ -56,7 +67,7 @@ image() {
 COMMON=(--fd "$FD" --fd-name A-bundled --kc "$KC" --trust "$TRUST" --seed "$SEED" --adt "$ADT" --utc "$(date +%s)")
 for n in ${*:-$ORDER}; do
   image "$n" || { echo "build-policy-test-images: no image $n (one of: $ORDER)" >&2; exit 2; }
-  PIANO_FAST_BOOT=1 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=$R PIANO_EXTRA_ARGS="$PW $TH $BASE $A" \
+  PIANO_FAST_BOOT=1 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=$R PIANO_EXTRA_ARGS="$PW $TH ${POL_CPUFREQ:-$CF} $BASE $A" \
     python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out "out/ram-pol-$n" | tail -1
 done
 PIANO_FAST_BOOT=1 PIANO_RESET_AFTER=1 PIANO_DATA_PERSIST=0 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram-pol-dump \
