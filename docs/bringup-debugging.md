@@ -111,7 +111,8 @@ missing. What the native build reads from it:
 - the generated headers under `out/x12377` (storage ABI, xnu's osfmk, IOKit hid/net/gfx) the kexts include;
 - the KC base, Apple's macOS 27.0.1 vma2 kernelcache (`out/kc/kc27.bin`, an Apple payload: never published);
 - the KC builder (`k27/kc-build27-piano.py`, `k27/kc27-layout.py`, `k27/segaddrs.sh`, `configs/kc-keep.txt`, `scripts/kc-build.py`,
-  `kc_native.py`, `fileset_kc.py`, `ptrauth_disc.py`) and `scripts/gen-iomfb-abi.py` (its output is cached in `out/k27/iomfb-abi/`);
+  `kc_native.py`, `fileset_kc.py`, `ptrauth_disc.py`; its placement patches, applied there by hand: `patches/k27-kc`,
+  [kc-space.md](kc-space.md)) and `scripts/gen-iomfb-abi.py` (its output is cached in `out/k27/iomfb-abi/`);
 - `sources/UniXNU/drivers/DarwinBoot/Test/packed_ramdisk.py` (the Data seed's format, `tooling/k27/stage-soft-metal.py`);
 - for the A830 GPU's userspace (`tooling/metal/build-turnip-a830.sh`): the Metal plugin's sources, its link stub and the prebuilt
   bridge (`overlay/metal`, `scripts/piano-frontend-patch.py`, `out/metal`), the virtgpu ABI header, and the UniXNU-turnip checkout

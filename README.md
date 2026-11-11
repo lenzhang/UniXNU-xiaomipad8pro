@@ -33,6 +33,7 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
 | Path | What |
 | --- | --- |
 | `patches/k27/` | the k27 kernel patches 0053-0063 on top of the k27 tree (xnu-12377 + the baseline series 0001-0052, XNU 27.0.1) |
+| `patches/k27-kc/` | the KC builder's native placement (best fit, relocation-free constants in `__TEXT`), applied by hand to the k27 tree ([docs/kc-space.md](docs/kc-space.md)) |
 | `patches/xnu/` | the device series of the UniXNU macOS 27.3 line (empty: none yet) |
 | `package/` | the native kexts; each is inert without its boot argument |
 | `configs/` | the native kext list (`k27-native-kexts.txt`), the ADT identity and display node (`k27-adt.toml`, `k27-gop-display.toml`), the 27.3 line's kernel config |
@@ -78,6 +79,7 @@ enforces it on every build, before and after the link: no descriptor from elsewh
 - [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md): repositories, local layout, hard rules.
 - [docs/bringup-debugging.md](docs/bringup-debugging.md): the boot chain, debugging without a screen, the test loop, rebuilding.
 - [docs/BACKLOG-hardware.md](docs/BACKLOG-hardware.md): the hardware still to bring up.
+- [docs/kc-space.md](docs/kc-space.md): the kernel collection's room for native kexts, the run-time firmware loader.
 
 ## Licence and contents
 
