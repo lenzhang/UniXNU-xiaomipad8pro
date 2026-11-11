@@ -173,6 +173,8 @@ struct Chip {
   uint8_t fwVersion = 0, xNum = 0, yNum = 0, calibrated = 0;
   bool fwInfoValid = false;
   int baselineRc = 1, modeRc = 1;   // 1: not sent; else the host command's result
+  // probeState: what it read last
+  uint8_t probeVersion = 0, probeComplement = 0, probeReset = 0;
 };
 
 inline void sleepMs(Chip &c, unsigned ms) { if (c.bus.sleepMs && ms) c.bus.sleepMs(c.bus.ctx, ms); }
@@ -398,6 +400,22 @@ inline int start(Chip &c, bool baseline, uint32_t mode)
   c.baselineRc = c.modeRc = 1;
   if (baseline && (c.baselineRc = hostCommand(c, kCmdIdleBaseline, 0)) == kErrBus) return kErrBus;
   if (mode <= 0xffff && (c.modeRc = hostCommand(c, kCmdOpMode, uint16_t(mode))) == kErrBus) return kErrBus;
+  return kOk;
+}
+
+// After a suspend, or the display back on (TouchPower.h): whether the controller still runs the image start() saw, by reads only:
+// the firmware info valid (version + complement = 0xff) with start()'s version and x / y counts, and the reset state in
+// 0xa0..0xaf. kOk with *kept; a bus error as it came.
+inline int probeState(Chip &c, bool *kept)
+{
+  *kept = false;
+  uint8_t b[4] = {};
+  if (int r = read(c, c.eventBuf + kEvFwInfo, b, 4)) return r;
+  if (int r = resetState(c, &c.probeReset)) return r;
+  c.probeVersion = b[0];
+  c.probeComplement = b[1];
+  *kept = c.fwInfoValid && uint8_t(b[0] + b[1]) == 0xff && b[0] == c.fwVersion && b[2] == c.xNum && b[3] == c.yNum &&
+          c.probeReset >= kResetStateInit && c.probeReset <= kResetStateMax;
   return kOk;
 }
 

@@ -12,15 +12,21 @@
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. -I../../PianoDwc3 touch_host.cpp -o /tmp/touch_host && /tmp/touch_host [IMAGE.bin ...]
 #include "Nt36532.h"
 #include "TouchMatrix.h"
+#include "TouchTrack.h"
+#include "TouchGesture.h"
 #include "TouchHid.h"
 #include "Se2Bus.h"
 #include "TouchPace.h"
+#include "TouchPower.h"
 #ifdef PIANO_TOUCH_SYNTHETIC_HEADER
 #include PIANO_TOUCH_SYNTHETIC_HEADER   // tests/synthetic-calibration.json through tooling/k27/gen-touch-calibration.py
 #endif
 #ifdef PIANO_TOUCH_UNIT_HEADER
 #include PIANO_TOUCH_UNIT_HEADER        // the unit's private calibration (out/ only): properties checked, nothing printed
 #endif
+#include <algorithm>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -335,6 +341,29 @@ void testBringUpBytes()
     r.m.id[3] = 0x00;
     CHECK(identify(r.c) == kErrChip && r.c.tries == 15);
   }
+  // After a suspend or the display's return (TouchPower.h): the probe reads the firmware info and the reset state only. Kept after
+  // the start; a controller that lost its SRAM (the panel's power went) reads as lost; the download brings it back; another image
+  // (a different version) is not the one start() saw.
+  {
+    Rig r(false);
+    const std::vector<uint8_t> fw = syntheticImage(true, 13);
+    CHECK(bringUp(r, fw, "probe"));
+    const unsigned transfers = r.m.transfers, hostCmds = unsigned(r.m.hostCmds.size());
+    bool kept = false;
+    CHECK(probeState(r.c, &kept) == kOk && kept && r.c.probeVersion == 0x21 && r.c.probeReset >= kResetStateInit);
+    CHECK(r.m.hostCmds.size() == hostCmds && r.m.transfers > transfers && r.m.bootChecks == 1);   // reads only: no command, no boot
+    r.m.st = ChipModel::St::rom;
+    for (uint32_t i = 0; i < 4; ++i) r.m.mem.erase(r.m.eventBuf() + kEvFwInfo + i);
+    r.m.mem[r.m.eventBuf() + kEvResetComplete] = 0;
+    CHECK(probeState(r.c, &kept) == kOk && !kept);
+    Image im;
+    parseImage(fw.data(), uint32_t(fw.size()), im);
+    CHECK(download(r.c, im, fw.data(), uint32_t(fw.size())) == kOk && start(r.c, true, 2) == kOk);
+    CHECK(probeState(r.c, &kept) == kOk && kept);
+    r.m.mem[r.m.eventBuf() + kEvFwInfo] = 0x22;
+    r.m.mem[r.m.eventBuf() + kEvFwInfo + 1] = 0xdd;
+    CHECK(probeState(r.c, &kept) == kOk && !kept);
+  }
   // A corrupt SRAM write (the model drops the CRC on): three attempts, then the reset state is never reached.
   {
     Rig r(false);
@@ -631,36 +660,135 @@ void testOrientation()
 }
 
 // ------------------------------------------------------------------------------------------------------------- HID, clocks
-void testHid()
+// The descriptor read item by item as IOHIDFamily would: per report ID the input bits, each input field's usage, ranges, unit
+// exponent and relative flag; the Wheel's resolution as IOHIDEventService::determineResolution computes it (logical range over
+// physical range, a negative exponent's power of ten on the logical side, an integer quotient; none when a physical bound equals the
+// logical one), as PianoKeyboard's host test reads its touchpad descriptor.
+struct HidField {
+  uint32_t usage = 0, usageMax = 0;   // page << 16 | usage (a range for the buttons and the modifiers)
+  int32_t lmin = 0, lmax = 0, pmin = 0, pmax = 0, exponent = 0;
+  uint32_t unit = 0, bits = 0, count = 0;
+  bool relative = false, constant = false;
+  uint8_t reportId = 0;
+};
+struct HidParse {
+  std::vector<HidField> fields;
+  std::map<uint8_t, unsigned> inputBits;
+  unsigned collections = 0, applications = 0;
+  int depth = 0;
+};
+static int32_t signedItem(uint32_t v, unsigned len) { return len == 1 ? int8_t(v) : len == 2 ? int16_t(v) : int32_t(v); }
+static HidParse parseHid(const uint8_t *d, unsigned n)
 {
-  // Walk the items: global report size/count, the input items' bits.
-  unsigned size = 0, count = 0, inputBits = 0, collections = 0, ends = 0;
-  int32_t logicalMax = 0;
-  for (size_t i = 0; i < sizeof kTabletDescriptor;) {
-    const uint8_t prefix = kTabletDescriptor[i];
-    const unsigned n = prefix & 3 ? 1u << ((prefix & 3) - 1) : 0;
+  HidParse out;
+  int32_t lmin = 0, lmax = 0, pmin = 0, pmax = 0, exponent = 0;
+  uint32_t unit = 0, size = 0, count = 0, page = 0, umin = 0, umax = 0;
+  uint8_t id = 0;
+  std::vector<uint32_t> usages;
+  for (unsigned i = 0; i < n;) {
+    const uint8_t item = d[i];
+    const unsigned len = (item & 3) == 3 ? 4 : item & 3;
     uint32_t v = 0;
-    for (unsigned k = 0; k < n; ++k) v |= uint32_t(kTabletDescriptor[i + 1 + k]) << (8 * k);
-    switch (prefix & 0xfc) {
+    for (unsigned k = 0; k < len; ++k) v |= uint32_t(d[i + 1 + k]) << (8 * k);
+    switch (item & 0xfc) {
+    case 0x04: page = v; break;
+    case 0x08: usages.push_back(len == 4 ? v : page << 16 | v); break;
+    case 0x18: umin = page << 16 | v; break;
+    case 0x28: umax = page << 16 | v; break;
+    case 0x14: lmin = signedItem(v, len); break;
+    case 0x24: lmax = signedItem(v, len); break;
+    case 0x34: pmin = signedItem(v, len); break;
+    case 0x44: pmax = signedItem(v, len); break;
+    case 0x54: exponent = int32_t(v & 0x0f); break;
+    case 0x64: unit = v; break;
     case 0x74: size = v; break;
+    case 0x84: id = uint8_t(v); break;
     case 0x94: count = v; break;
-    case 0x80: inputBits += size * count; break;
-    case 0xa0: ++collections; break;
-    case 0xc0: ++ends; break;
-    case 0x24: logicalMax = int32_t(v); break;
+    case 0xa0:
+      ++out.depth;
+      ++out.collections;
+      out.applications += v == 1;
+      usages.clear();
+      break;
+    case 0xc0: --out.depth; break;
+    case 0x80: {
+      out.inputBits[id] += size * count;
+      HidField f;
+      f.lmin = lmin; f.lmax = lmax; f.pmin = pmin; f.pmax = pmax; f.exponent = exponent; f.unit = unit; f.bits = size;
+      f.count = count; f.relative = v & 4; f.constant = v & 1; f.reportId = id;
+      if (!f.constant && usages.empty()) {
+        f.usage = umin;
+        f.usageMax = umax;
+        out.fields.push_back(f);
+      }
+      for (uint32_t u : usages) {
+        f.usage = f.usageMax = u;
+        out.fields.push_back(f);
+      }
+      usages.clear();
+      umin = umax = 0;
+      break;
+    }
     default: break;
     }
-    i += 1 + n;
+    i += 1 + len;
   }
-  CHECK(inputBits == kReportBytes * 8 && collections == 2 && ends == 2 && logicalMax == kHidMax);
-  CHECK(kTabletDescriptor[0] == 0x05 && kTabletDescriptor[1] == 0x01 && kTabletDescriptor[3] == 0x02);
-  uint8_t r[kReportBytes];
+  return out;
+}
+static const HidField *hidField(const HidParse &h, uint32_t usage)
+{
+  for (const HidField &f : h.fields)
+    if (f.usage == usage) return &f;
+  return nullptr;
+}
+static int32_t hidResolution(const HidField &a)
+{
+  if (!a.relative || a.pmin == a.lmin || a.pmax == a.lmax) return 0;
+  int64_t logical = a.lmax - a.lmin, physical = a.pmax - a.pmin;
+  if (a.exponent < 8) for (int i = a.exponent; i > 0; --i) physical *= 10;
+  else for (int i = 0x10 - a.exponent; i > 0; --i) logical *= 10;
+  return int32_t(logical / physical);
+}
+
+void testHid()
+{
+  for (bool keyboard : {false, true})
+    for (uint32_t res : {45u, 10u, 90u, 900u, 3u, 5000u}) {
+      const TouchDescriptor d = makeTouchDescriptor(res, keyboard);
+      CHECK(d.length <= sizeof d.bytes);
+      const HidParse h = parseHid(d.bytes, d.length);
+      const uint8_t pid = keyboard ? kPointerReportId : 0;
+      CHECK(h.depth == 0 && h.applications == (keyboard ? 2u : 1u) && h.collections == (keyboard ? 3u : 2u));
+      CHECK(h.inputBits.size() == (keyboard ? 2u : 1u) && h.inputBits.at(pid) == kPointerBytes * 8);
+      const HidField *buttons = hidField(h, 0x090001), *x = hidField(h, 0x010030), *y = hidField(h, 0x010031);
+      const HidField *wheel = hidField(h, 0x010038), *pan = hidField(h, 0x0c0238);
+      CHECK(buttons && buttons->usageMax == 0x090003 && buttons->count == 3 && !buttons->relative && buttons->reportId == pid);
+      CHECK(x && y && !x->relative && !y->relative && x->lmin == 0 && x->lmax == kHidMax && y->lmax == kHidMax && x->bits == 16);
+      CHECK(x && x->pmax == x->lmax);   // positions: no resolution
+      CHECK(wheel && pan && wheel->relative && pan->relative && wheel->lmin == -127 && wheel->lmax == 127 && pan->bits == 8);
+      CHECK(wheel && hidResolution(*wheel) == int32_t(touchScrollResolution(res)) && wheel->unit == 0x13);
+      if (keyboard) {
+        CHECK(h.inputBits.at(kKeyboardReportId) == 8);
+        const HidField *mods = hidField(h, 0x0700e0);
+        CHECK(mods && mods->usageMax == 0x0700e7 && mods->count == 8 && mods->reportId == kKeyboardReportId && mods->unit == 0 &&
+              mods->exponent == 0);
+      }
+    }
+  // The default the HID device starts from: 45 counts an inch, no keyboard; its first byte the GD page, the mouse usage.
+  CHECK(kTouchDescriptorDefault.length == makeTouchDescriptor(kTouchScrollResolution, false).length);
+  CHECK(kTouchDescriptorDefault.bytes[0] == 0x05 && kTouchDescriptorDefault.bytes[1] == 0x01 && kTouchDescriptorDefault.bytes[3] == 0x02);
+  // The reports: corners scale to 0 and 32767, counts clamp to a signed byte, the report ID first when there are two reports.
+  uint8_t r[kMaxReportBytes];
+  CHECK(pointerReport(PointerReport{kButtonLeft, 0, 0, 0, 0, 0}, kPanelW, kPanelH, false, r) == kPointerBytes);
+  CHECK(r[0] == 1 && le16(r + 1) == 0 && le16(r + 3) == 0 && r[5] == 0 && r[6] == 0);
+  CHECK(pointerReport(PointerReport{kButtonRight, kPanelW - 1, kPanelH - 1, 5, -3, 0}, kPanelW, kPanelH, false, r) == kPointerBytes);
+  CHECK(r[0] == 2 && le16(r + 1) == kHidMax && le16(r + 3) == kHidMax && int8_t(r[5]) == 5 && int8_t(r[6]) == -3);
+  CHECK(pointerReport(PointerReport{0, 1600, 5000, 900, -900, 0}, kPanelW, kPanelH, true, r) == kPointerBytes + 1);
+  CHECK(r[0] == kPointerReportId && r[1] == 0 && le16(r + 2) == uint16_t(1600ll * kHidMax / (kPanelW - 1)) && le16(r + 4) == kHidMax);
+  CHECK(int8_t(r[6]) == 127 && int8_t(r[7]) == -127);
+  CHECK(modifierReport(kModifierCommand, r) == 2 && r[0] == kKeyboardReportId && r[1] == 0x08);
   tabletReport(true, 0, 0, kPanelW, kPanelH, r);
   CHECK(r[0] == 1 && r[1] == 0 && r[2] == 0 && r[3] == 0 && r[4] == 0);
-  tabletReport(false, kPanelW - 1, kPanelH - 1, kPanelW, kPanelH, r);
-  CHECK(r[0] == 0 && le16(r + 1) == kHidMax && le16(r + 3) == kHidMax);
-  tabletReport(true, 1600, 5000, kPanelW, kPanelH, r);
-  CHECK(le16(r + 1) == uint16_t(1600ll * kHidMax / (kPanelW - 1)) && le16(r + 3) == kHidMax);
 }
 
 // piano-touch-rotate=1 (TouchRotation.h, sensors.md 5a.3): at 0 the bytes are tabletReport's for every contact, in range or not; at
@@ -668,14 +796,14 @@ void testHid()
 // effect at the next touch-down only.
 void testRotation()
 {
-  uint8_t a[kReportBytes], b[kReportBytes];
+  uint8_t a[kTabletBytes], b[kTabletBytes];
   bool same = true;
   for (int32_t y = -40; y < kPanelH + 40; y += 7)
     for (int32_t x = -40; x < kPanelW + 40; x += 13)
       for (int tip = 0; tip < 2; ++tip) {
         tabletReport(tip, x, y, kPanelW, kPanelH, a);
         rotatedTabletReport(tip, x, y, kPanelW, kPanelH, 0, b);
-        same = same && !std::memcmp(a, b, kReportBytes);
+        same = same && !std::memcmp(a, b, kTabletBytes);
       }
   CHECK(same);
   const struct { uint32_t deg; int32_t x, y; uint16_t hx, hy; } corner[] = {
@@ -694,10 +822,685 @@ void testRotation()
   CHECK(le16(b + 1) + 16 >= kHidMax / 2 && le16(b + 1) <= kHidMax / 2 + 16 && le16(b + 3) + 16 >= kHidMax / 2 && le16(b + 3) <= kHidMax / 2 + 16);
   rotatedTabletReport(true, 100, 100, kPanelW, kPanelH, 45, b);                    // not a rotation: as 0
   tabletReport(true, 100, 100, kPanelW, kPanelH, a);
-  CHECK(!std::memcmp(a, b, kReportBytes));
+  CHECK(!std::memcmp(a, b, kTabletBytes));
   PatRotation r;
   pat_init(&r);
   CHECK(pat_request(&r, 90) && pat_latch(&r, 0) == 0 && pat_latch(&r, 1) == 90 && !pat_request(&r, 91) && pat_latch(&r, 1) == 90);
+}
+
+// ------------------------------------------------------------------------------------------------------- contacts and gestures
+// Synthetic scenes: contacts as Gaussian blobs at panel positions (pixels; the linear map, node centres at (i + 1/2) / n of the
+// panel) on the model's baseline and its +-4 noise, made straight into a THP packet (the ChipModel's layout and checksum).
+struct Spot {
+  double x, y, amp = 600, sigma = 0.8;   // panel pixels; the peak's delta; the spread in nodes
+};
+constexpr double kNodeW = double(kPanelW) / 60, kNodeH = double(kPanelH) / 40;
+static std::vector<uint8_t> scenePacket(uint16_t counter, const std::vector<Spot> &spots, uint8_t type = 1)
+{
+  constexpr uint32_t payload = 5192;
+  std::vector<uint8_t> p(payload, 0);
+  p[0] = 0xa5;
+  put16(&p[2], counter);
+  p[24] = 2;
+  put16(&p[28], counter);
+  p[48] = 60;
+  p[49] = 40;
+  p[56] = type;
+  for (uint32_t r = 0; r < 40; ++r)
+    for (uint32_t c = 0; c < 60; ++c) {
+      double v = 0;
+      for (const Spot &s : spots) {
+        const double dx = ((c + 0.5) * kNodeW - s.x) / kNodeW, dy = ((r + 0.5) * kNodeH - s.y) / kNodeH;
+        v += s.amp * std::exp(-(dx * dx + dy * dy) / (2 * s.sigma * s.sigma));
+      }
+      put16(&p[64 + (r * 60 + c) * 2], uint16_t(1000 + int((r * 7 + c * 13 + counter * 5) % 9) - 4 + int(v)));
+    }
+  const uint32_t words = (payload - 20) / 4;
+  uint32_t sum = 0;
+  for (uint32_t i = 0; i < words * 2; ++i) sum += le16(&p[20 + i * 2]);
+  const uint16_t check = uint16_t(~sum + 1);
+  put16(&p[4], check);
+  put32(&p[8], words);
+  put16(&p[12], uint16_t(~check));
+  put32(&p[16], ~words);
+  return p;
+}
+static Spot finger(double x, double y, double amp = 600) { return Spot{x, y, amp, 0.8}; }
+static Spot palmSpot(double x, double y) { return Spot{x, y, 500, 3.0}; }
+static double nodeX(double c) { return (c + 0.5) * kNodeW; }
+static double nodeY(double r) { return (r + 0.5) * kNodeH; }
+
+// The frame loop's portable half on synthetic frames: matrix, tracker, the rotation, gestures, as PianoTouch::frame/gestures run
+// them, a frame every 8 ms. Everything the gestures send is kept (and the frame it came in), the notes too.
+struct Pipeline {
+  std::unique_ptr<Matrix> m = std::make_unique<Matrix>();
+  Tracker tr;
+  Gesture g;
+  uint16_t counter = 0;
+  uint64_t now = 100000;
+  uint32_t rotation = 0, frame = 0;
+  struct Sent {
+    PointerReport r;
+    uint32_t frame;
+    uint64_t ms;
+  };
+  std::vector<Sent> sent;
+  std::vector<GestureNote> notes;
+  std::vector<TrackNote> trackNotes;
+  explicit Pipeline(TrackConfig tc = TrackConfig(), GestureConfig gc = GestureConfig(), MatrixConfig mc = MatrixConfig())
+  {
+    matrixReset(*m, mc);
+    trackerReset(tr, tc);
+    gestureReset(g, gc);
+    for (unsigned n = 0; n < kProbeFrames + kRefFrames; ++n) {
+      const std::vector<uint8_t> p = scenePacket(counter++, {});
+      matrixFeed(*m, p.data(), uint32_t(p.size()));
+    }
+  }
+  void take(const GestureOut &o)
+  {
+    for (unsigned i = 0; i < o.n; ++i) sent.push_back(Sent{o.r[i], frame, now});
+    for (unsigned i = 0; i < o.noteCount; ++i) notes.push_back(o.notes[i]);
+  }
+  void step(const std::vector<Spot> &spots, uint64_t dtMs = 8)
+  {
+    now += dtMs;
+    ++frame;
+    const std::vector<uint8_t> p = scenePacket(counter++, spots);
+    CHECK(matrixFeed(*m, p.data(), uint32_t(p.size())) == Feed::decoded);
+    trackerUpdate(tr, m->points, m->pointCount, now);
+    for (unsigned i = 0; i < tr.noteCount; ++i) trackNotes.push_back(tr.notes[i]);
+    GestureContact c[kMaxTracks];
+    unsigned n = 0;
+    for (const Track &t : tr.t) {
+      if (t.state != TrackState::active) continue;
+      const PatPoint q = pat_rotate(rotation, t.x, t.y, kPanelW, kPanelH);
+      c[n++] = GestureContact{t.id, t.palm, q.x, q.y, t.frames};
+    }
+    GestureOut o;
+    gestureUpdate(g, c, n, now, o);
+    take(o);
+  }
+  void hold(const std::vector<Spot> &spots, unsigned frames)
+  {
+    for (unsigned i = 0; i < frames; ++i) step(spots);
+  }
+  void none(unsigned frames = 6) { hold({}, frames); }
+  void lose()
+  {
+    trackerCancel(tr);
+    GestureOut o;
+    gestureCancel(g, o, now);
+    take(o);
+  }
+  bool any(uint8_t buttonBits) const
+  {
+    for (const Sent &s : sent)
+      if (s.r.buttons & buttonBits) return true;
+    return false;
+  }
+  unsigned noted(GestureKind k) const
+  {
+    unsigned n = 0;
+    for (const GestureNote &x : notes) n += x.kind == k;
+    return n;
+  }
+  int32_t wheel() const
+  {
+    int32_t w = 0;
+    for (const Sent &s : sent) w += s.r.wheel;
+    return w;
+  }
+  int32_t pan() const
+  {
+    int32_t w = 0;
+    for (const Sent &s : sent) w += s.r.pan;
+    return w;
+  }
+  // Every press is released, every modifier let go, by the end.
+  bool clean() const { return sent.empty() || (sent.back().r.buttons == 0 && sent.back().r.modifiers == 0); }
+  // The clicks: each press (after a report without one) released at once at the same place.
+  std::vector<PointerReport> clicks() const
+  {
+    std::vector<PointerReport> out;
+    for (size_t i = 0; i + 1 < sent.size(); ++i)
+      if (sent[i].r.buttons && !sent[i + 1].r.buttons && sent[i].r.x == sent[i + 1].r.x && sent[i].r.y == sent[i + 1].r.y &&
+          (i == 0 || !sent[i - 1].r.buttons))
+        out.push_back(sent[i].r);
+    return out;
+  }
+};
+static bool near(double a, double b, double tolerance) { return std::fabs(a - b) <= tolerance; }
+// Positions: the 3 x 3 centroid of the linear map lands within about 8 px (0.6 mm) of a Gaussian's centre.
+constexpr double kPx = 12;
+
+// The matrix's points: two fingers apart are two points, a ridge with no dip one, a palm one large blob with its peaks counted, a
+// weak peak kept (below the threshold, above the low level) but not strong; the single contact unchanged among them.
+static void testPoints()
+{
+  Pipeline p;
+  Matrix &m = *p.m;
+  auto feed = [&](const std::vector<Spot> &spots) {
+    const std::vector<uint8_t> pk = scenePacket(p.counter++, spots);
+    return matrixFeed(m, pk.data(), uint32_t(pk.size())) == Feed::decoded;
+  };
+  CHECK(feed({finger(nodeX(20), nodeY(10)), finger(nodeX(40), nodeY(25), 700)}));
+  CHECK(m.pointCount == 2 && m.points[0].strong && m.points[1].strong && m.peaks == 2);
+  CHECK(m.points[0].peak > m.points[1].peak && near(m.points[0].x, nodeX(40), 3) && near(m.points[0].y, nodeY(25), 3));
+  CHECK(m.points[0].area >= 5 && m.points[0].area <= 16 && m.points[0].blobPeaks == 1 && m.touching);
+  CHECK(near(m.x, nodeX(40), 3));   // the single contact: the strongest
+  // Two fingers three nodes apart (fingertips side by side): still two, neither pulled toward the other by the widened window.
+  CHECK(feed({finger(nodeX(20), nodeY(20)), finger(nodeX(23), nodeY(20))}) && m.pointCount == 2);
+  for (uint32_t i = 0; i < m.pointCount; ++i)
+    CHECK(near(m.points[i].x, nodeX(20), kPx) || near(m.points[i].x, nodeX(23), kPx));
+  // A finger resting exactly between two electrodes (its peak node flickers between them with the noise): one position, steady.
+  {
+    int32_t lo = INT32_MAX, hi = INT32_MIN, ylo = INT32_MAX, yhi = INT32_MIN;
+    for (int k = 0; k < 40; ++k) {
+      CHECK(feed({finger(nodeX(29.5), nodeY(19.5))}) && m.pointCount == 1);
+      lo = std::min(lo, m.points[0].x);
+      hi = std::max(hi, m.points[0].x);
+      ylo = std::min(ylo, m.points[0].y);
+      yhi = std::max(yhi, m.points[0].y);
+    }
+    CHECK(hi - lo <= 3 && yhi - ylo <= 3 && near(lo, nodeX(29.5), kPx) && near(ylo, nodeY(19.5), kPx));
+  }
+  // The widened window across a sweep: the position follows the finger monotonically, within the tolerance everywhere.
+  {
+    int32_t last = -1;
+    bool monotonic = true, close = true;
+    for (double x = nodeX(20); x <= nodeX(24); x += 2) {
+      CHECK(feed({finger(x, nodeY(10.3))}) && m.pointCount == 1);
+      monotonic = monotonic && m.points[0].x >= last - 2;
+      close = close && near(m.points[0].x, x, kPx);
+      last = m.points[0].x;
+    }
+    CHECK(monotonic && close);
+  }
+  // A ridge: two maxima two nodes apart with the node between almost as high: one contact (merged).
+  const uint32_t mergedBefore = m.merged;
+  CHECK(feed({Spot{nodeX(30), nodeY(20), 500, 0.6}, Spot{nodeX(31), nodeY(20), 260, 0.6}, Spot{nodeX(32), nodeY(20), 520, 0.6}}));
+  CHECK(m.pointCount == 1 && m.merged == mergedBefore + 1);
+  // A palm: one blob of many nodes; a hand's ridges (three bumps on it) count as its peaks.
+  CHECK(feed({palmSpot(nodeX(15), nodeY(20))}) && m.pointCount >= 1 && m.points[0].area >= 48);
+  CHECK(feed({palmSpot(nodeX(15), nodeY(20)), Spot{nodeX(11), nodeY(17), 250, 0.7}, Spot{nodeX(19), nodeY(17), 250, 0.7},
+              Spot{nodeX(15), nodeY(25), 250, 0.7}}));
+  CHECK(m.pointCount >= 1 && m.points[0].blobPeaks >= 3 && m.pointCount <= kBlobPoints);
+  // A weak peak (above 60 % of the threshold, below it): a point, not strong, and no single contact.
+  CHECK(feed({finger(nodeX(30), nodeY(30), 150)}) && m.pointCount == 1 && !m.points[0].strong && !m.touching && m.peaks == 0);
+  CHECK(feed({finger(nodeX(30), nodeY(30), 90)}) && m.pointCount == 0);
+  // A palm's peaks cannot crowd out a finger: kBlobPoints a blob at most, the finger still listed.
+  std::vector<Spot> crowd = {palmSpot(nodeX(15), nodeY(20)), finger(nodeX(50), nodeY(10), 300)};
+  for (int k = 0; k < 12; ++k) crowd.push_back(Spot{nodeX(10 + (k % 4) * 3), nodeY(15 + (k / 4) * 4), 300, 0.6});
+  CHECK(feed(crowd));
+  bool fingerListed = false;
+  for (uint32_t i = 0; i < m.pointCount; ++i) fingerListed = fingerListed || (near(m.points[i].x, nodeX(50), kPx) && m.points[i].area < 30);
+  CHECK(fingerListed && m.pointCount <= 1 + kBlobPoints);
+}
+
+// The tracker alone: stable IDs while fingers move and pass each other, a dropout under `hold` frames kept, the hysteresis, the
+// first-frame confirmation of a strong peak, palms (by size, by peaks, a finger that flattens, the remnant of a lifting palm).
+static void testTracker()
+{
+  {   // two fingers crossing in X on rows 200 px apart: each keeps its ID
+    Pipeline p;
+    p.step({finger(800, 900), finger(2400, 1100)});
+    CHECK(trackerActive(p.tr, true) == 2);
+    uint8_t left = 0, right = 0;
+    for (const Track &t : p.tr.t)
+      if (t.state == TrackState::active) (t.x < 1600 ? left : right) = t.id;
+    for (int k = 1; k <= 40; ++k) p.step({finger(800 + 40 * k, 900), finger(2400 - 40 * k, 1100)});
+    bool same = true;
+    for (const Track &t : p.tr.t)
+      if (t.state == TrackState::active) same = same && (t.y < 1000 ? t.id == left && t.x > 2300 : t.id == right && t.x < 900);
+    CHECK(same && trackerActive(p.tr, true) == 2 && p.tr.downs == 2 && p.tr.ups == 0);
+  }
+  {   // a dropout: two frames missing keep the ID, three end the contact
+    Pipeline p;
+    p.hold({finger(1000, 1000)}, 5);
+    const uint8_t id = p.tr.t[0].id;
+    p.none(2);
+    CHECK(trackerActive(p.tr, false) == 1);
+    p.hold({finger(1010, 1000)}, 3);
+    CHECK(p.tr.t[0].id == id && p.tr.downs == 1 && p.tr.ups == 0);
+    p.none(3);
+    CHECK(trackerLive(p.tr) == 0 && p.tr.ups == 1);
+    p.hold({finger(1010, 1000)}, 2);
+    CHECK(p.tr.downs == 2 && p.tr.t[0].id != id);
+  }
+  {   // frames 200 ms apart (no edge and the old fixed fallback): the lift is seen at the first frame without the contact, not 3
+    Pipeline p;
+    p.step({finger(1000, 1000)}, 200);
+    p.step({finger(1000, 1000)}, 200);
+    p.step({}, 200);
+    CHECK(trackerLive(p.tr) == 0 && p.tr.ups == 1 && p.clicks().size() == 1);
+  }
+  {   // hysteresis: a contact fading to below the threshold continues; the same weak blob alone starts nothing
+    Pipeline p;
+    p.hold({finger(1500, 700)}, 3);
+    for (int a = 600; a >= 140; a -= 40) p.step({finger(1500, 700, a)});
+    CHECK(trackerActive(p.tr, false) == 1 && p.tr.downs == 1);
+    p.none(3);
+    p.hold({finger(1500, 700, 150)}, 10);
+    CHECK(trackerLive(p.tr) == 0 && p.tr.downs == 1);
+  }
+  {   // confirmation: a strong first peak counts in its first frame, a weaker one in its second; one weak frame is nothing
+    Pipeline p;
+    p.step({finger(600, 600, 600)});
+    CHECK(trackerActive(p.tr, false) == 1);
+    p.none(3);
+    p.step({finger(600, 600, 300)});
+    CHECK(trackerActive(p.tr, false) == 0 && trackerLive(p.tr) == 1);
+    p.step({});
+    CHECK(trackerLive(p.tr) == 0 && p.tr.downs == 1);
+    p.step({finger(600, 600, 300)});
+    p.step({finger(600, 600, 300)});
+    CHECK(trackerActive(p.tr, false) == 1 && p.tr.downs == 2);
+  }
+  {   // palms: a large blob never starts a contact; neither do its peaks
+    Pipeline p;
+    p.hold({palmSpot(1200, 1200)}, 20);
+    CHECK(trackerActive(p.tr, true) == 0 && p.tr.palmPoints > 0 && p.tr.downs == 0);
+    // its remnant as it lifts (a fingertip-sized blob where it was) is the palm's, for as long as it stays
+    p.hold({finger(1250, 1150)}, 80);
+    CHECK(trackerActive(p.tr, true) == 0 && trackerActive(p.tr, false) == 1 && p.tr.palms == 1);
+    p.none(3);
+    // 500 ms later the place is free again: a finger there is a finger
+    p.none(70);
+    p.hold({finger(1250, 1150)}, 3);
+    CHECK(trackerActive(p.tr, true) == 1);
+  }
+  {   // a finger that flattens into a palm is a palm until it lifts; a palm away from a finger leaves the finger alone
+    Pipeline p;
+    p.hold({finger(1000, 1000)}, 3);
+    p.hold({palmSpot(1000, 1000)}, 3);
+    p.hold({finger(1000, 1000)}, 3);
+    CHECK(trackerActive(p.tr, false) == 1 && trackerActive(p.tr, true) == 0 && p.tr.palms == 1);
+    Pipeline q;
+    q.hold({palmSpot(900, 1300), finger(2500, 500)}, 10);
+    CHECK(trackerActive(q.tr, true) == 1);
+  }
+  {   // palm by peaks: three bumps in one blob of modest size
+    TrackConfig tc;
+    tc.palmNodes = 0;   // size off: the peaks alone decide
+    Pipeline p(tc);
+    p.hold({Spot{nodeX(20), nodeY(20), 450, 1.3}, Spot{nodeX(17), nodeY(20), 450, 1.0}, Spot{nodeX(23), nodeY(20), 450, 1.0}}, 5);
+    CHECK(p.m->pointCount >= 1 && p.m->points[0].blobPeaks >= 3 && trackerActive(p.tr, true) == 0);
+  }
+}
+
+// The gestures on synthetic frames, end to end (matrix, tracker, gestures).
+static void testGestures()
+{
+  const double X = 1100, Y = 900;
+  {   // tap: the pointer there in the contact's first frame (a strong peak), the click at the lift, where it landed
+    Pipeline p;
+    p.hold({finger(X, Y)}, 10);
+    CHECK(p.sent.size() == 1 && p.sent[0].frame == 1 && p.sent[0].r.buttons == 0);
+    CHECK(near(p.sent[0].r.x, X, kPx) && near(p.sent[0].r.y, Y, kPx));
+    p.none();
+    const std::vector<PointerReport> c = p.clicks();
+    CHECK(c.size() == 1 && c[0].buttons == kButtonLeft && c[0].x == p.sent[0].r.x && c[0].y == p.sent[0].r.y);
+    CHECK(p.sent.size() == 3 && p.noted(GestureKind::tap) == 1 && p.clean() && p.g.mode == GestureMode::idle);
+    CHECK(p.sent.size() == 3 && p.sent[1].frame == 13);   // the lift is seen after `hold` (3) frames without the contact
+    if (p.sent.size() == 3)
+      std::printf("gestures: tap -> pointer in the contact's first frame, click %llu ms after the lift (8 ms frames)\n",
+                  (unsigned long long)(p.sent[1].ms - p.sent[0].ms - 9 * 8));
+  }
+  {   // at the blind busy rate (a frame per 12 ms, no edges): the same tap, the drag and the scroll
+    Pipeline p;
+    p.step({finger(X, Y)}, 12);
+    for (int k = 0; k < 8; ++k) p.step({finger(X, Y)}, 12);
+    for (int k = 0; k < 4; ++k) p.step({}, 12);
+    CHECK(p.clicks().size() == 1 && p.sent[0].frame == 1);
+    for (int k = 1; k <= 30; ++k) p.step({finger(X + 15 * k, Y)}, 12);
+    for (int k = 0; k < 4; ++k) p.step({}, 12);
+    CHECK(p.noted(GestureKind::dragEnd) == 1 && p.clean());
+  }
+  {   // the first report one frame later without the fast confirmation; a tap all the same
+    TrackConfig tc;
+    tc.fastPeak = 0;
+    Pipeline p(tc);
+    p.hold({finger(X, Y)}, 10);
+    CHECK(!p.sent.empty() && p.sent[0].frame == 2);
+    p.none();
+    CHECK(p.clicks().size() == 1);
+  }
+  {   // a resting finger moving by a pixel or so sends nothing between the pointer move and the click (no jitter)
+    Pipeline p;
+    for (int k = 0; k < 38; ++k) p.step({finger(X + (k % 3) - 1, Y + (k % 2))});
+    CHECK(p.sent.size() == 1);
+    p.none();
+    CHECK(p.clicks().size() == 1 && p.sent.size() == 3);
+  }
+  {   // hold: a right click at 500 ms where it landed, nothing at the lift, never a left button
+    Pipeline p;
+    p.hold({finger(X, Y)}, 80);
+    p.none();
+    const std::vector<PointerReport> c = p.clicks();
+    CHECK(c.size() == 1 && c[0].buttons == kButtonRight && !p.any(kButtonLeft) && p.noted(GestureKind::holdRight) == 1);
+    unsigned at = 0;
+    while (at < p.sent.size() && !p.sent[at].r.buttons) ++at;
+    CHECK(at < p.sent.size() && p.sent[at].ms - 100008 >= 500 && p.sent[at].ms - 100008 <= 510);
+    if (at < p.sent.size()) std::printf("gestures: hold -> right click %llu ms after the landing\n", (unsigned long long)(p.sent[at].ms - 100008));
+    CHECK(p.clean() && p.sent.size() == 3);
+  }
+  {   // hold, then moving: the right click, then the pointer follows without a button
+    Pipeline p;
+    p.hold({finger(X, Y)}, 70);
+    for (int k = 1; k <= 20; ++k) p.step({finger(X + 15 * k, Y)});
+    p.none();
+    CHECK(p.clicks().size() == 1 && !p.any(kButtonLeft) && p.sent.back().r.x > X + 200 && p.clean());
+  }
+  {   // drag: pressed where it landed, following the finger, released at the lift; never a right click even past 500 ms
+    Pipeline p;
+    p.hold({finger(800, 1000)}, 2);
+    for (int k = 1; k <= 80; ++k) p.step({finger(800 + 10 * k, 1000)});
+    p.hold({finger(1600, 1000)}, 5);
+    p.none();
+    CHECK(!p.any(kButtonRight) && p.noted(GestureKind::dragStart) == 1 && p.noted(GestureKind::dragEnd) == 1 && p.clean());
+    unsigned first = 0;
+    while (first < p.sent.size() && !p.sent[first].r.buttons) ++first;
+    CHECK(first < p.sent.size() && p.sent[first].r.buttons == kButtonLeft && p.sent[first].r.x == p.sent[0].r.x);   // at the landing
+    bool forward = true;
+    for (size_t i = first + 1; i + 1 < p.sent.size(); ++i)
+      forward = forward && p.sent[i].r.buttons == kButtonLeft && p.sent[i].r.x >= p.sent[i - 1].r.x;
+    CHECK(forward && near(p.sent.back().r.x, 1600, kPx) && p.sent.back().r.buttons == 0);
+  }
+  {   // a second finger during a drag changes nothing: the drag goes on, no scroll
+    Pipeline p;
+    p.hold({finger(800, 1000)}, 2);
+    for (int k = 1; k <= 10; ++k) p.step({finger(800 + 10 * k, 1000)});
+    for (int k = 11; k <= 30; ++k) p.step({finger(800 + 10 * k, 1000), finger(2000, 600 - 5 * k)});
+    p.none();
+    CHECK(p.wheel() == 0 && p.noted(GestureKind::dragEnd) == 1 && !p.any(kButtonRight) && p.clean());
+  }
+  {   // two-finger tap: the pointer between them, a right click there, no left click
+    Pipeline p;
+    p.hold({finger(1200, 1000), finger(1500, 1000)}, 12);
+    p.none();
+    const std::vector<PointerReport> c = p.clicks();
+    CHECK(c.size() == 1 && c[0].buttons == kButtonRight && near(c[0].x, 1350, kPx) && near(c[0].y, 1000, kPx));
+    CHECK(!p.any(kButtonLeft) && p.noted(GestureKind::twoTap) == 1 && p.clean());
+  }
+  {   // the second finger 80 ms after the first, the first lifting a little before the second: still a two-finger tap
+    Pipeline p;
+    p.hold({finger(1200, 1000)}, 10);
+    p.hold({finger(1200, 1000), finger(1500, 1000)}, 10);
+    p.hold({finger(1500, 1000)}, 2);
+    p.none();
+    const std::vector<PointerReport> c = p.clicks();
+    CHECK(c.size() == 1 && c[0].buttons == kButtonRight && !p.any(kButtonLeft));
+  }
+  {   // two fingers held long and lifted: nothing
+    Pipeline p;
+    p.hold({finger(1200, 1000), finger(1500, 1000)}, 90);
+    p.none();
+    CHECK(p.clicks().empty() && p.clean());
+  }
+  auto scroll = [](double dx, double dy, GestureConfig gc) {
+    Pipeline p(TrackConfig(), gc);
+    p.hold({finger(1300, 1300), finger(1600, 1300)}, 3);
+    for (int k = 1; k <= 50; ++k) p.step({finger(1300 + dx * k / 50, 1300 + dy * k / 50), finger(1600 + dx * k / 50, 1300 + dy * k / 50)});
+    p.none();
+    return p;
+  };
+  {   // two fingers up 400 px: wheel up by 400 / 4 (the content follows the fingers under natural scrolling), no pan, no button,
+      // the pointer fixed between the fingers where they started
+    const Pipeline p = scroll(0, -400, GestureConfig());
+    CHECK(p.wheel() >= 96 && p.wheel() <= 101 && p.pan() == 0 && !p.any(7) && p.clean());
+    std::printf("gestures: two fingers up 400 px -> wheel %+d, AC Pan %+d in %zu reports, pointer fixed between them\n", p.wheel(), p.pan(),
+                p.sent.size() - 2);
+    CHECK(p.noted(GestureKind::scrollStart) == 1 && p.noted(GestureKind::scrollEnd) == 1 && p.clicks().empty());
+    bool fixed = true;
+    for (size_t i = 1; i < p.sent.size(); ++i) fixed = fixed && p.sent[i].r.x == p.sent[1].r.x && p.sent[i].r.y == p.sent[1].r.y;
+    CHECK(p.sent.size() > 2 && fixed && near(p.sent[1].r.x, 1450, kPx) && near(p.sent[1].r.y, 1300, kPx));
+    bool small = true;
+    for (size_t i = 3; i < p.sent.size(); ++i) small = small && p.sent[i].r.wheel >= 0 && p.sent[i].r.wheel <= 6;   // a few counts a frame
+    CHECK(small);
+  }
+  {   // down, right, left; the axis lock; a diagonal both; inverted; a coarser count
+    CHECK(scroll(0, 400, GestureConfig()).wheel() <= -96);
+    const Pipeline r = scroll(400, 30, GestureConfig());
+    CHECK(r.pan() >= 96 && r.wheel() == 0);
+    CHECK(scroll(-400, 0, GestureConfig()).pan() <= -96);
+    const Pipeline d = scroll(300, -300, GestureConfig());
+    CHECK(d.pan() >= 70 && d.wheel() >= 70);
+    GestureConfig inv;
+    inv.scrollInvert = true;
+    CHECK(scroll(0, -400, inv).wheel() <= -96);
+    GestureConfig coarse;
+    coarse.scrollPx = 10;
+    CHECK(near(scroll(0, -400, coarse).wheel(), 40, 2));
+  }
+  {   // pinch: by default recognised and nothing sent (no wheel, no button, no modifier)
+    auto pinch = [](GestureConfig gc, double from, double to) {
+      Pipeline p(TrackConfig(), gc);
+      p.hold({finger(1600 - from / 2, 1000), finger(1600 + from / 2, 1000)}, 3);
+      for (int k = 1; k <= 40; ++k) {
+        const double s = from + (to - from) * k / 40;
+        p.step({finger(1600 - s / 2, 1000), finger(1600 + s / 2, 1000)});
+      }
+      p.none();
+      return p;
+    };
+    const Pipeline skip = pinch(GestureConfig(), 300, 900);
+    CHECK(skip.wheel() == 0 && !skip.any(7) && skip.noted(GestureKind::pinchStart) == 1 && skip.noted(GestureKind::pinchEnd) == 1);
+    bool noModifier = true;
+    for (const auto &s : skip.sent) noModifier = noModifier && !s.r.modifiers;
+    CHECK(noModifier && skip.noted(GestureKind::scrollStart) == 0);
+    GestureConfig cmd;
+    cmd.pinch = 1;
+    const Pipeline in = pinch(cmd, 300, 900);
+    bool held = true;
+    for (const auto &s : in.sent) held = held && (!s.r.wheel || s.r.modifiers == kModifierCommand);
+    CHECK(held && in.wheel() >= 34 && in.wheel() <= 38 && in.clean() && in.sent.back().r.modifiers == 0);
+    GestureConfig ctrl;
+    ctrl.pinch = 2;
+    const Pipeline out = pinch(ctrl, 900, 300);
+    CHECK(out.wheel() <= -34 && out.clean());
+    for (const auto &s : out.sent) CHECK(!s.r.wheel || s.r.modifiers == kModifierControl);
+  }
+  {   // three fingers: nothing after the first pointer move
+    Pipeline p;
+    p.hold({finger(1000, 800), finger(1300, 800), finger(1600, 800)}, 10);
+    for (int k = 1; k <= 20; ++k) p.step({finger(1000, 800 - 10 * k), finger(1300, 800 - 10 * k), finger(1600, 800 - 10 * k)});
+    p.none();
+    CHECK(p.sent.size() <= 1 && p.clicks().empty() && p.wheel() == 0);
+  }
+  {   // a palm alone: nothing at all; a palm resting while a finger taps elsewhere: the tap clicks
+    Pipeline p;
+    p.hold({palmSpot(800, 1500)}, 30);
+    p.none();
+    CHECK(p.sent.empty());
+    Pipeline q;
+    q.hold({palmSpot(800, 1500)}, 10);
+    q.hold({palmSpot(800, 1500), finger(2400, 600)}, 10);
+    q.hold({palmSpot(800, 1500)}, 10);
+    q.none();
+    const std::vector<PointerReport> c = q.clicks();
+    CHECK(c.size() == 1 && c[0].buttons == kButtonLeft && near(c[0].x, 2400, kPx));
+  }
+  {   // a palm landing (small, then large) and lifting (large, then small) where it is: no click
+    Pipeline p;
+    for (double sg = 0.8; sg < 3.0; sg += 0.4) p.step({Spot{1500, 1200, 500, sg}});
+    p.hold({palmSpot(1500, 1200)}, 20);
+    for (double sg = 3.0; sg > 0.7; sg -= 0.4) p.step({Spot{1500, 1200, 500, sg}});
+    p.hold({finger(1520, 1180, 400)}, 4);
+    p.none();
+    CHECK(p.clicks().empty() && !p.any(7) && p.clean());
+    CHECK(p.noted(GestureKind::cancelPalm) <= 1);
+  }
+  {   // noise: one strong frame moves the pointer at most, never clicks; one frame at the threshold sends nothing
+    Pipeline p;
+    p.step({finger(X, Y, 900)});
+    p.none();
+    CHECK(p.clicks().empty() && p.sent.size() <= 1);
+    Pipeline q;
+    q.step({finger(X, Y, 300)});
+    q.none();
+    CHECK(q.sent.empty());
+  }
+  {   // a double tap: the second tap near the first (within 48 px, 500 ms) clicks exactly where the first did; later, its own place
+    Pipeline p;
+    p.hold({finger(X, Y)}, 8);
+    p.none();
+    p.hold({finger(X + 20, Y + 12)}, 8);
+    p.none();
+    std::vector<PointerReport> c = p.clicks();
+    CHECK(c.size() == 2 && c[0].x == c[1].x && c[0].y == c[1].y);
+    p.none(70);
+    p.hold({finger(X + 20, Y + 12)}, 8);
+    p.none();
+    c = p.clicks();
+    CHECK(c.size() == 3 && c[2].x != c[0].x);
+    Pipeline q;   // farther than 48 px: its own place
+    q.hold({finger(X, Y)}, 8);
+    q.none();
+    q.hold({finger(X + 100, Y)}, 8);
+    q.none();
+    c = q.clicks();
+    CHECK(c.size() == 2 && near(c[1].x, X + 100, kPx));
+  }
+  {   // frames lost during a drag: released at once; during a pinch with Command: Command released
+    Pipeline p;
+    p.hold({finger(800, 1000)}, 2);
+    for (int k = 1; k <= 10; ++k) p.step({finger(800 + 10 * k, 1000)});
+    CHECK(p.g.buttons == kButtonLeft);
+    p.lose();
+    CHECK(p.clean() && p.noted(GestureKind::cancelLost) == 1 && p.g.mode == GestureMode::idle && trackerLive(p.tr) == 0);
+    GestureConfig cmd;
+    cmd.pinch = 1;
+    Pipeline q(TrackConfig(), cmd);
+    q.hold({finger(1400, 1000), finger(1700, 1000)}, 3);
+    for (int k = 1; k <= 10; ++k) q.step({finger(1400 - 10 * k, 1000), finger(1700 + 10 * k, 1000)});
+    CHECK(q.g.modifiers == kModifierCommand);
+    q.lose();
+    CHECK(q.clean() && q.g.modifiers == 0 && q.noted(GestureKind::pinchEnd) == 1);
+  }
+  {   // the plain pointer of before (piano-touch-gestures=0): down presses, moves drag, up releases
+    GestureConfig plain;
+    plain.gestures = false;
+    Pipeline p(TrackConfig(), plain);
+    p.hold({finger(X, Y)}, 3);
+    CHECK(p.sent.size() == 2 && p.sent[0].r.buttons == 0 && p.sent[1].r.buttons == kButtonLeft);
+    for (int k = 1; k <= 5; ++k) p.step({finger(X + 20 * k, Y)});
+    p.none();
+    CHECK(p.clean() && p.noted(GestureKind::plainUp) == 1 && near(p.sent.back().r.x, X + 100, kPx));
+  }
+  {   // the corners: positions stay on the panel, the HID values reach both ends
+    Pipeline p;
+    p.hold({finger(nodeX(0), nodeY(0))}, 8);
+    p.none();
+    Pipeline q;
+    q.hold({finger(nodeX(59), nodeY(39))}, 8);
+    q.none();
+    CHECK(p.clicks().size() == 1 && q.clicks().size() == 1);
+    if (p.clicks().size() == 1 && q.clicks().size() == 1) {
+      uint8_t r[kMaxReportBytes];
+      pointerReport(p.clicks()[0], kPanelW, kPanelH, false, r);
+      CHECK(le16(r + 1) < 600 && le16(r + 3) < 900);
+      pointerReport(q.clicks()[0], kPanelW, kPanelH, false, r);
+      CHECK(le16(r + 1) > kHidMax - 600 && le16(r + 3) > kHidMax - 900);
+    }
+  }
+}
+
+// piano-touch-rotate=1 with the gestures: the contacts mapped into the rotated desktop before the gestures, so a tap lands under the
+// finger and a scroll follows the desktop's directions (CGDisplayRotation 90: the panel's left edge up).
+static void testGestureRotation()
+{
+  for (uint32_t deg : {0u, 90u, 180u, 270u}) {
+    Pipeline p;
+    p.rotation = deg;
+    p.hold({finger(700, 500)}, 8);
+    p.none();
+    const std::vector<PointerReport> c = p.clicks();
+    const PatPoint want = pat_rotate(deg, 700, 500, kPanelW, kPanelH);
+    CHECK(c.size() == 1 && near(c[0].x, want.x, kPx) && near(c[0].y, want.y, kPx));
+    if (c.size() == 1) {   // the bytes: scaled over the rotated desktop (h x w at 90 and 270)
+      uint8_t r[kMaxReportBytes];
+      pointerReport(c[0], want.width, want.height, false, r);
+      CHECK(near(le16(r + 1), double(want.x) * kHidMax / (want.width - 1), 60) &&
+            near(le16(r + 3), double(want.y) * kHidMax / (want.height - 1), 60));
+    }
+  }
+  // At 90 the desktop's up is the panel's left edge: fingers moving toward it (panel x falling) scroll up; toward the panel's top
+  // edge (panel y falling) is the desktop's right: AC Pan right.
+  auto swipe = [](uint32_t deg, double dx, double dy) {
+    Pipeline p;
+    p.rotation = deg;
+    p.hold({finger(1500, 900), finger(1500, 1200)}, 3);
+    for (int k = 1; k <= 40; ++k) p.step({finger(1500 + dx * k / 40, 900 + dy * k / 40), finger(1500 + dx * k / 40, 1200 + dy * k / 40)});
+    p.none();
+    return std::pair<int32_t, int32_t>(p.wheel(), p.pan());
+  };
+  auto w = swipe(90, -320, 0);
+  CHECK(w.first >= 76 && w.second == 0);
+  w = swipe(90, 0, -320);
+  CHECK(w.second >= 76 && w.first == 0);
+  w = swipe(270, -320, 0);
+  CHECK(w.first <= -76 && w.second == 0);
+  w = swipe(180, 0, -320);
+  CHECK(w.first <= -76);
+  w = swipe(0, 0, -320);
+  CHECK(w.first >= 76);
+  // A drag at 90: it follows the finger in desktop coordinates (panel y falling = desktop x rising).
+  Pipeline p;
+  p.rotation = 90;
+  p.hold({finger(1000, 1500)}, 2);
+  for (int k = 1; k <= 30; ++k) p.step({finger(1000, 1500 - 20 * k)});
+  p.none();
+  CHECK(p.noted(GestureKind::dragEnd) == 1 && p.sent.back().r.x > p.sent[0].r.x + 500 && near(p.sent.back().r.y, p.sent[0].r.y, 8));
+}
+
+// The power states (TouchPower.h): the display off mutes (frames still read, slowly), the system off suspends (no frames) from
+// either, resume returns to what the display is; an unknown display counts as on; piano-touch-display=0 ignores it. The restart
+// plan: kept, go on (after a suspend with the reference learned again); lost, at most two downloads, then give up.
+static void testPower()
+{
+  TouchPower p;
+  CHECK(p.step(false, -1) == PowerStep::none && p.reporting() && p.reading());
+  CHECK(p.step(false, 1) == PowerStep::none);
+  CHECK(p.step(false, 0) == PowerStep::mute && p.muted() && !p.reporting() && p.reading());
+  CHECK(p.step(false, 0) == PowerStep::none && p.muted());
+  CHECK(p.step(true, 0) == PowerStep::suspend && !p.reading() && !p.reporting());
+  CHECK(p.step(true, 1) == PowerStep::none && !p.reading());
+  CHECK(p.step(false, 0) == PowerStep::resume && p.muted());       // back into a dark display: still muted
+  CHECK(p.step(false, -1) == PowerStep::unmute && p.reporting());  // not published any more: on
+  CHECK(p.step(true, 1) == PowerStep::suspend && p.step(false, 1) == PowerStep::resume && p.reporting());
+  CHECK(p.suspends == 2 && p.resumes == 2 && p.mutes == 1 && p.unmutes == 1);
+  TouchPower q;
+  q.followDisplay = false;
+  CHECK(q.step(false, 0) == PowerStep::none && q.reporting() && q.step(true, 0) == PowerStep::suspend && q.step(false, 0) == PowerStep::resume &&
+        q.reporting());
+  CHECK(restartPlan(true, true, 0) == Restart::relearn && restartPlan(false, true, 0) == Restart::keep);
+  CHECK(restartPlan(true, false, 0) == Restart::download && restartPlan(false, false, 1) == Restart::download);
+  CHECK(restartPlan(true, false, kResumeDownloads) == Restart::giveUp);
+  // The gestures across a mute: a drag in progress is released, the next touch after the display's return starts afresh.
+  Pipeline g;
+  g.hold({finger(800, 1000)}, 2);
+  for (int k = 1; k <= 10; ++k) g.step({finger(800 + 10 * k, 1000)});
+  CHECK(g.g.buttons == kButtonLeft);
+  g.lose();   // PianoTouch::lost at the mute: tracker and gestures cancelled
+  CHECK(g.clean() && g.g.buttons == 0);
+  trackerReset(g.tr, TrackConfig());
+  gestureReset(g.g, GestureConfig());
+  g.sent.clear();
+  g.hold({finger(1200, 700)}, 8);
+  g.none();
+  CHECK(g.clicks().size() == 1);
+}
+
+// The CPU latency hold of a read burst: taken at the first busy pass, kept through the burst and 1.5 s after, then released.
+static void testBurstHold()
+{
+  BurstHold h;
+  CHECK(h.step(1000, false) == 0 && !h.held);
+  CHECK(h.step(1001, true) == 1 && h.held && h.takes == 1);
+  CHECK(h.step(1009, true) == 0 && h.step(1500, false) == 0 && h.held);
+  CHECK(h.step(1009 + kHoldMs - 1, false) == 0 && h.step(1009 + kHoldMs, false) == -1 && !h.held);
+  CHECK(h.step(5000, false) == 0 && h.step(5001, true) == 1 && h.takes == 2);
 }
 
 void testClock()
@@ -726,18 +1529,22 @@ struct PaceRun {
   unsigned wakeups = 0, reads = 0;
   uint64_t firstSeenUs = 0;
 };
-static PaceRun simulatePace(uint32_t idleMs, bool irq, uint64_t fingerOn, uint64_t fingerOff, uint64_t from, uint64_t to)
+// edges = false: gpio162 never latches (the first run's rest: about one edge in two seconds); reads then come from the no-edge
+// interval (TouchPace::noEdgeMs), and the finger is seen if it is down at the read.
+static PaceRun simulatePace(uint32_t idleMs, bool irq, uint64_t fingerOn, uint64_t fingerOff, uint64_t from, uint64_t to, bool edges = true)
 {
   constexpr uint64_t kFrameUs = 8333, kReadUs = 4500;
   TouchPace pace = touchPace(idleMs, 0);
   PaceRun r;
   uint64_t t = 0, lastEdgeTaken = 0, lastReadUs = 0;
-  bool touching = false;
+  bool touching = false, rest = false;
   auto lastEdgeAt = [&](uint64_t at) { return at / kFrameUs * kFrameUs; };
   auto count = [&](uint64_t at) { if (at >= from && at < to) ++r.wakeups; };
   while (t < to) {
     const uint64_t edge = lastEdgeAt(t);
-    if (edge > lastEdgeTaken && edge > 0) {   // latched: read (1 ms polls see an edge at most 1 ms late)
+    const bool latched = edges && edge > lastEdgeTaken && edge > 0;   // 1 ms polls see an edge at most 1 ms late
+    if (latched || t - lastReadUs >= uint64_t(pace.noEdgeMs(rest)) * 1000) {
+      if (idleMs) pace.read(latched);
       lastEdgeTaken = edge;
       if (t >= from && t < to) ++r.reads;
       touching = t >= fingerOn && t < fingerOff;
@@ -746,15 +1553,17 @@ static PaceRun simulatePace(uint32_t idleMs, bool irq, uint64_t fingerOn, uint64
       t += kReadUs;
     }
     const bool idle = pace.idle(t / 1000, touching);
+    rest = idle;
     if (idle) {
       const uint32_t sleep = pace.sleepMs(t / 1000, lastReadUs / 1000);
       if (sleep) {
         t += uint64_t(sleep) * 1000;
         count(t);
         lastEdgeTaken = lastEdgeAt(t);   // the latch dropped
+        if (edges) pace.edgeSeen();       // (an edge latched during the sleep)
         continue;
       }
-      if (irq) {   // armed: the interrupt at the next edge
+      if (irq && edges) {   // armed (after a first edge): the interrupt at the next edge
         t = lastEdgeAt(t) + kFrameUs + 50;
         count(t);
         continue;
@@ -797,6 +1606,34 @@ static void testPace()
       const PaceRun after = simulatePace(kIdleReadMs, irq, on, off, off + kHoldMs * 1000ull + 200000, off + kHoldMs * 1000ull + 1200000);
       CHECK(after.reads <= 24);   // idle again
     }
+  // No edge at all (the first run at rest): blind after three reads, one read and about one wake-up per idle period (~20 a second),
+  // a finger seen within the idle period, then about 80 frames a second under it; the old fixed 200 ms gave 5 a second and a touch
+  // up to 200 ms late.
+  {
+    const PaceRun r = simulatePace(kIdleReadMs, false, ~0ull, ~0ull, 10000000, 20000000, false);
+    std::printf("pace: idle %u ms, no edges: %u wake-ups, %u reads in 10 s\n", kIdleReadMs, r.wakeups, r.reads);
+    CHECK(r.reads >= 190 && r.reads <= 210 && r.wakeups <= 2 * r.reads);
+  }
+  uint64_t worst = 0;
+  unsigned fewest = ~0u;
+  for (bool irq : {false, true})
+    for (uint64_t phase = 0; phase < 60000; phase += 1777) {
+      const uint64_t on = 20000000 + phase, off = on + 500000;
+      const PaceRun seen = simulatePace(kIdleReadMs, irq, on, off, 0, on + 200000, false);
+      CHECK(seen.firstSeenUs && seen.firstSeenUs - on <= (kIdleReadMs + kNoEdgeRestMarginMs + 2) * 1000ull);
+      if (seen.firstSeenUs) worst = std::max(worst, seen.firstSeenUs - on);
+      const PaceRun busy = simulatePace(kIdleReadMs, irq, on, off, on + 100000, off, false);
+      CHECK(busy.reads >= 30);   // 400 ms at one read per 12 ms: 33
+      fewest = std::min(fewest, busy.reads);
+    }
+  std::printf("pace: no edges: a touch read at most %llu ms after it landed, then %u+ reads in 400 ms (old: 200 ms, 2)\n",
+              (unsigned long long)(worst / 1000), fewest);
+  {   // not paced (piano-touch-idle=0, the old loop): 200 ms without an edge, as before
+    const PaceRun r = simulatePace(0, false, ~0ull, ~0ull, 10000000, 20000000, false);
+    CHECK(r.reads >= 49 && r.reads <= 51);
+  }
+  CHECK(touchPace(50, 0).noEdgeMs(false) == kNoEdgeBusyMs && touchPace(50, 0).noEdgeMs(true) == 60 && touchPace(0, 0).noEdgeMs(false) == 200);
+  CHECK(touchPace(50, 0, 1).noEdgeMs(false) == 4 && touchPace(50, 0, 999).noEdgeMs(false) == kNoEdgeOldMs);
 }
 
 int main(int argc, char **argv)
@@ -810,6 +1647,12 @@ int main(int argc, char **argv)
   testOrientation();
   testHid();
   testRotation();
+  testPoints();
+  testTracker();
+  testGestures();
+  testGestureRotation();
+  testBurstHold();
+  testPower();
   testClock();
   testPace();
   if (failures) {
@@ -817,6 +1660,7 @@ int main(int argc, char **argv)
     return 1;
   }
   std::printf("PASS: PianoTouch host tests (NT36532E model over whole transfers and by hand, %d real image(s), matrix, calibration, "
-              "orientation, tip, HID, rotation, clocks)\n", argc - 1);
+              "orientation, tip, HID, rotation, points, tracker, palms, gestures, gestures under rotation, burst hold, clocks, "
+              "pace, power states, the probe)\n", argc - 1);
   return 0;
 }

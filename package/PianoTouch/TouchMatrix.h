@@ -7,18 +7,26 @@
 //   - each later frame: delta = raw - reference, then the per-column median and the per-row median removed (line noise);
 //     while no node is near the threshold the reference follows the raw values by 1/8 (drift);
 //   - peaks: nodes >= threshold (200) that no 3 x 3 neighbour beats (ties to the first in scan order), each the weighted centroid
-//     of its positive 3 x 3 neighbourhood (1/1024 node);
+//     of its positive 3 x 3 neighbourhood (1/1024 node), widened toward a stronger neighbour's side (centroidWindow, new here);
 //   - the contact nearest the last one (within 400 px) while touching, else the strongest peak;
 //   - panel position: X along the 60 columns (3200 px), Y along the 40 rows (2136 px).
 // The position, with this unit's calibration (Calibration, generated at build time from the private Ubuntu file, never committed):
 // piano-thp's (xiaomipad-8pro-mainline device/piano-thp, Apache-2.0, "Modified from xiaomi-sheng-thp by ianchb"; UPSTREAM)
-// domainContact over the peak's 3 x 3 nodes: the average of column_map / row_map (electrode centres, pixels x 10) weighted by
-// max(delta - 25, 0), rounded; then mapEdgeAxis on each axis (the edge stretch: edge_size, edge_gain / edge_base; Y with its low
-// edge bias), then the orientation, then / 10 to pixels. Without one: linear over the matrix (node centres at (i + 1/2) / n).
+// domainContact over the peak's 3 x 3 nodes (here centroidWindow's): the average of column_map / row_map (electrode centres,
+// pixels x 10) weighted by max(delta - 25, 0), rounded; then mapEdgeAxis on each axis (the edge stretch: edge_size, edge_gain /
+// edge_base; Y with its low edge bias), then the orientation, then / 10 to pixels. Without one: linear over the matrix (node
+// centres at (i + 1/2) / n).
 // Orientation (piano-thp orientation.hpp, MIT): X never flipped; Y as processor Y on a BOE panel, reversed on a CSOT one, unless
 // the calibration says otherwise (invert_y); the caller picks flipX / flipY (PianoTouch.cpp: piano-touch-flip=auto).
 // The tip on top: down after `confirm` frames in a row with a contact (ShengNovatekTouch confirms on the second scan), up after
 // `hold` frames in a row without one, so a single noisy frame neither clicks nor breaks a drag.
+// Every contact of the frame as well (points, new for the multi-contact tracker TouchTrack.h): the peaks down to lowPercent of the
+// threshold (a contact already followed continues on them, only one at the threshold starts one: the hysteresis); two peaks two
+// nodes apart with no dip between them (the node between at saddlePercent of the weaker or more) are one contact; each peak's blob,
+// the 8-connected nodes at blobPercent of the threshold around it, gives the contact's size (nodes), its peak count and its
+// bounding box, which the palm rejection uses. At most kMaxPoints points, the strongest first and at most kBlobPoints per blob (a
+// palm's many peaks cannot crowd out a finger). The single contact above is unchanged: the strongest or nearest of the points at
+// the threshold.
 #ifndef PIANO_TOUCH_MATRIX_H
 #define PIANO_TOUCH_MATRIX_H
 #include <stdint.h>
@@ -26,7 +34,8 @@
 
 namespace pianotouch {
 
-constexpr uint32_t kMaxNodes = 4096, kRefFrames = 32, kProbeFrames = 16, kMaxPoints = 10;
+constexpr uint32_t kMaxNodes = 4096, kRefFrames = 32, kProbeFrames = 16, kMaxPoints = 16, kMaxCandidates = 64, kBlobPoints = 4;
+constexpr uint32_t kMaxBlobs = 254;   // blob labels 1..254; 255 collects every blob past them (counted as one, large)
 constexpr int32_t kPanelW = 3200, kPanelH = 2136;
 
 // This unit's electrode calibration (the private Ubuntu file's fields, pixels x 10). Aggregate: the generated header initialises it.
@@ -73,15 +82,44 @@ inline int32_t mapEdgeAxis(int32_t value, int32_t maximum, bool lowEdgeBias, con
   return value;
 }
 
-// piano-thp's domainContact over the 3 x 3 nodes around a peak at (r, c) of a 40 x 60 row-major delta matrix: the electrode
-// positions (pixels x 10) weighted by max(delta - 25, 0), rounded to the nearest unit; a peak at or below the offset gives its own
-// electrode. Before the edge mapping and the orientation.
+// The centroid's window around a peak at (r, c): its 3 x 3 nodes, widened on each axis by one node toward the strictly stronger
+// neighbour when that node is at most half of the neighbour (this contact's own tail, not the flank of another one beside it). A
+// contact between two electrodes, whose peak node flickers between them from frame to frame, so keeps one window and one position
+// (with the plain 3 x 3 window it jumped by about 15 px each time); on a node, and at the matrix's border, the window is the 3 x 3.
+struct CentroidWindow {
+  int32_t r0, r1, c0, c1;
+};
+inline CentroidWindow centroidWindow(const int32_t *delta, int32_t rows, int32_t cols, int32_t r, int32_t c)
+{
+  auto at = [&](int32_t rr, int32_t cc) { return delta[rr * cols + cc]; };
+  CentroidWindow w{r - 1, r + 1, c - 1, c + 1};
+  if (c > 0 && c + 1 < cols) {
+    const int32_t left = at(r, c - 1), right = at(r, c + 1);
+    if (right > left && c + 2 < cols && 2 * int64_t(at(r, c + 2)) <= right) w.c1 = c + 2;
+    else if (left > right && c >= 2 && 2 * int64_t(at(r, c - 2)) <= left) w.c0 = c - 2;
+  }
+  if (r > 0 && r + 1 < rows) {
+    const int32_t up = at(r - 1, c), down = at(r + 1, c);
+    if (down > up && r + 2 < rows && 2 * int64_t(at(r + 2, c)) <= down) w.r1 = r + 2;
+    else if (up > down && r >= 2 && 2 * int64_t(at(r - 2, c)) <= up) w.r0 = r - 2;
+  }
+  if (w.r0 < 0) w.r0 = 0;
+  if (w.c0 < 0) w.c0 = 0;
+  if (w.r1 >= rows) w.r1 = rows - 1;
+  if (w.c1 >= cols) w.c1 = cols - 1;
+  return w;
+}
+
+// piano-thp's domainContact over the nodes around a peak at (r, c) of a 40 x 60 row-major delta matrix (its 3 x 3 nodes, here in
+// centroidWindow's window): the electrode positions (pixels x 10) weighted by max(delta - 25, 0), rounded to the nearest unit; a
+// peak at or below the offset gives its own electrode. Before the edge mapping and the orientation.
 inline void calibratedCentroid(const Calibration &cal, const int32_t *delta, int32_t r, int32_t c, int32_t *x10, int32_t *y10)
 {
   int64_t w = 0, sx = 0, sy = 0;
-  for (int32_t rr = r - 1; rr <= r + 1; ++rr)
-    for (int32_t cc = c - 1; cc <= c + 1; ++cc) {
-      if (rr < 0 || cc < 0 || rr >= 40 || cc >= 60 || delta[rr * 60 + cc] <= kCoordinateReduce) continue;
+  const CentroidWindow win = centroidWindow(delta, 40, 60, r, c);
+  for (int32_t rr = win.r0; rr <= win.r1; ++rr)
+    for (int32_t cc = win.c0; cc <= win.c1; ++cc) {
+      if (delta[rr * 60 + cc] <= kCoordinateReduce) continue;
       const int64_t k = delta[rr * 60 + cc] - kCoordinateReduce;
       w += k;
       sx += k * cal.columnMap[cc] * kUnits;
@@ -99,11 +137,32 @@ inline void calibratedCentroid(const Calibration &cal, const int32_t *delta, int
 
 struct MatrixConfig {
   int32_t threshold = 200, trackPx = 400;
+  int32_t lowPercent = 60;      // points down to this share of the threshold (continuing contacts only, TouchTrack.h)
+  int32_t blobPercent = 50;     // a blob: the connected nodes at this share of the threshold
+  int32_t saddlePercent = 80;   // two peaks two nodes apart: one contact unless the node between dips below this share of the weaker
   bool flipX = false, flipY = false;
   const Calibration *cal = nullptr;   // used when present and valid, else the linear map
 };
+inline int32_t lowLevel(const MatrixConfig &c) { const int32_t v = c.threshold * c.lowPercent / 100; return v < 1 ? 1 : v > c.threshold ? c.threshold : v; }
+inline int32_t blobLevel(const MatrixConfig &c) { const int32_t v = c.threshold * c.blobPercent / 100; return v < 1 ? 1 : v; }
 
 enum class Feed : uint8_t { badChecksum, skipped, learning, otherType, decoded };
+
+// One contact of the last decoded frame (Matrix::points), TouchTrack.h's input.
+struct MatrixPoint {
+  int32_t x, y;               // panel pixels, as the single contact's
+  int32_t peak;               // the peak's delta
+  uint16_t row, col;          // the peak's node
+  uint16_t area;              // nodes of its blob (0xffff at most)
+  uint8_t blobPeaks;          // peaks in that blob (after the saddle merge)
+  bool strong;                // peak >= threshold: may start a contact
+  uint8_t r0, c0, r1, c1;     // the blob's bounding box (nodes)
+};
+struct MatrixBlob {
+  uint16_t area;
+  uint8_t peaks, taken;
+  uint8_t r0, c0, r1, c1;
+};
 
 struct Matrix {
   MatrixConfig cfg;
@@ -118,6 +177,12 @@ struct Matrix {
   bool calibrated = false;         // cfg.cal is used
   uint32_t frames = 0, badChecksum = 0, skipped = 0, otherType = 0;
   uint16_t lastFrameNo = 0;
+  // Every contact of the last decoded frame (strongest first), and its blobs.
+  MatrixPoint points[kMaxPoints];
+  uint32_t pointCount = 0, blobCount = 0, blobNodes = 0, merged = 0;   // merged: peaks merged since the reset
+  MatrixBlob blobs[kMaxBlobs + 2];
+  uint8_t label[kMaxNodes];
+  uint16_t queue[kMaxNodes];
 };
 
 inline void matrixReset(Matrix &m, const MatrixConfig &cfg)
@@ -222,41 +287,135 @@ inline Feed matrixFeed(Matrix &m, const uint8_t *p, uint32_t len)
     if (m.delta[n] > m.maxDelta) m.maxDelta = m.delta[n];
   if (m.maxDelta < m.cfg.threshold / 2)
     for (uint32_t n = 0; n < nodes; ++n) m.reference[n] += (int16_t(le16(p + 64 + n * 2)) - m.reference[n]) / 8;
-  Point pts[kMaxPoints];
-  uint32_t count = 0;
-  for (int32_t r = 0; r < int32_t(rows); ++r)
-    for (int32_t c = 0; c < int32_t(cols); ++c) {
-      const int32_t v = m.delta[r * int32_t(cols) + c];
-      if (v < m.cfg.threshold) continue;
+  const int32_t R = int32_t(rows), C = int32_t(cols);
+  auto at = [&](int32_t r, int32_t c) { return m.delta[r * C + c]; };
+  auto inside = [&](int32_t r, int32_t c) { return r >= 0 && c >= 0 && r < R && c < C; };
+  // Blobs: the 8-connected nodes at blobLevel, labelled in scan order (breadth first through m.queue).
+  const int32_t low = lowLevel(m.cfg), level = blobLevel(m.cfg);
+  m.blobCount = m.blobNodes = 0;
+  m.blobs[kMaxBlobs + 1] = MatrixBlob{};
+  for (uint32_t n = 0; n < nodes; ++n) m.label[n] = 0;
+  for (uint32_t n = 0; n < nodes; ++n) {
+    if (m.label[n] || m.delta[n] < level) continue;
+    const uint8_t id = m.blobCount < kMaxBlobs ? uint8_t(++m.blobCount) : uint8_t(kMaxBlobs + 1);
+    MatrixBlob &b = m.blobs[id];
+    if (id <= kMaxBlobs || !b.area) b = MatrixBlob{0, 0, 0, uint8_t(n / cols), uint8_t(n % cols), uint8_t(n / cols), uint8_t(n % cols)};
+    uint32_t head = 0, tail = 0;
+    m.label[n] = id;
+    m.queue[tail++] = uint16_t(n);
+    while (head < tail) {
+      const uint32_t node = m.queue[head++];
+      const int32_t r = int32_t(node / cols), c = int32_t(node % cols);
+      if (b.area < 0xffff) ++b.area;
+      ++m.blobNodes;
+      if (r < b.r0) b.r0 = uint8_t(r);
+      if (r > b.r1) b.r1 = uint8_t(r);
+      if (c < b.c0) b.c0 = uint8_t(c);
+      if (c > b.c1) b.c1 = uint8_t(c);
+      for (int32_t dr = -1; dr <= 1; ++dr)
+        for (int32_t dc = -1; dc <= 1; ++dc) {
+          const int32_t rr = r + dr, cc = c + dc;
+          if (!inside(rr, cc) || m.label[rr * C + cc] || at(rr, cc) < level) continue;
+          m.label[rr * C + cc] = id;
+          m.queue[tail++] = uint16_t(rr * C + cc);
+        }
+    }
+  }
+  // Peaks: nodes at the low level that no 3 x 3 neighbour beats (ties to the first in scan order).
+  struct Candidate { int32_t r, c, v; bool dropped; };
+  Candidate cand[kMaxCandidates];
+  uint32_t nc = 0;
+  for (int32_t r = 0; r < R; ++r)
+    for (int32_t c = 0; c < C; ++c) {
+      const int32_t v = at(r, c);
+      if (v < low) continue;
       bool peak = true;
       for (int32_t dr = -1; dr <= 1 && peak; ++dr)
         for (int32_t dc = -1; dc <= 1; ++dc) {
           const int32_t rr = r + dr, cc = c + dc;
-          if ((!dr && !dc) || rr < 0 || cc < 0 || rr >= int32_t(rows) || cc >= int32_t(cols)) continue;
-          const int32_t w = m.delta[rr * int32_t(cols) + cc];
+          if ((!dr && !dc) || !inside(rr, cc)) continue;
+          const int32_t w = at(rr, cc);
           if (w > v || (w == v && (dr < 0 || (dr == 0 && dc < 0)))) { peak = false; break; }
         }
-      if (!peak) continue;
-      int64_t sw = 0, sx = 0, sy = 0;
-      for (int32_t dr = -1; dr <= 1; ++dr)
-        for (int32_t dc = -1; dc <= 1; ++dc) {
-          const int32_t rr = r + dr, cc = c + dc;
-          if (rr < 0 || cc < 0 || rr >= int32_t(rows) || cc >= int32_t(cols)) continue;
-          const int32_t w = m.delta[rr * int32_t(cols) + cc];
-          if (w <= 0) continue;
-          sw += w;
-          sx += int64_t(w) * (cc * 1024 + 512);
-          sy += int64_t(w) * (rr * 1024 + 512);
-        }
-      if (count < kMaxPoints && sw > 0) {
-        Point pt{sx / sw, sy / sw, v, 0, 0};
-        if (m.calibrated) calibratedCentroid(*m.cfg.cal, m.delta, r, c, &pt.cx, &pt.cy);
-        pts[count++] = pt;
-      }
+      if (peak && nc < kMaxCandidates) cand[nc++] = Candidate{r, c, v, false};
     }
+  // Two peaks two nodes apart without a dip between them are one contact (the weaker goes; m.merged counts them).
+  for (uint32_t i = 0; i < nc; ++i)
+    for (uint32_t j = i + 1; j < nc && !cand[i].dropped; ++j) {
+      if (cand[j].dropped) continue;
+      const int32_t dr = cand[j].r - cand[i].r, dc = cand[j].c - cand[i].c;
+      const int32_t ar = dr < 0 ? -dr : dr, ac = dc < 0 ? -dc : dc;
+      if ((ar > ac ? ar : ac) != 2) continue;
+      // The nodes between them: the middle row (two rows apart) or both rows (one apart), the same for the columns.
+      const int32_t rA = ar == 2 ? cand[i].r + dr / 2 : cand[i].r, rB = ar == 2 ? rA : cand[j].r;
+      const int32_t cA = ac == 2 ? cand[i].c + dc / 2 : cand[i].c, cB = ac == 2 ? cA : cand[j].c;
+      const int32_t rs[2] = {rA, rB}, cs[2] = {cA, cB};
+      int32_t between = INT32_MIN;
+      for (unsigned a = 0; a < 2; ++a)
+        for (unsigned b = 0; b < 2; ++b) {
+          const int32_t r = rs[a], c = cs[b];
+          if (!(r == cand[i].r && c == cand[i].c) && !(r == cand[j].r && c == cand[j].c) && at(r, c) > between) between = at(r, c);
+        }
+      const int32_t weaker = cand[i].v < cand[j].v ? cand[i].v : cand[j].v;
+      if (int64_t(between) * 100 < int64_t(m.cfg.saddlePercent) * weaker) continue;
+      (cand[j].v > cand[i].v ? cand[i] : cand[j]).dropped = true;
+      ++m.merged;
+    }
+  for (uint32_t i = 0; i < nc; ++i) {
+    const uint8_t id = m.label[cand[i].r * C + cand[i].c];
+    if (!cand[i].dropped && id && m.blobs[id].peaks < 0xff) ++m.blobs[id].peaks;
+  }
+  // The strongest first (insertion sort of indices, stable), at most kBlobPoints a blob.
+  uint8_t order[kMaxCandidates];
+  uint32_t no = 0;
+  for (uint32_t i = 0; i < nc; ++i) {
+    if (cand[i].dropped) continue;
+    uint32_t k = no++;
+    while (k > 0 && cand[order[k - 1]].v < cand[i].v) { order[k] = order[k - 1]; --k; }
+    order[k] = uint8_t(i);
+  }
+  Point pts[kMaxPoints];
+  uint32_t count = 0, strong = 0;
+  for (uint32_t k = 0; k < no && count < kMaxPoints; ++k) {
+    const Candidate &cd = cand[order[k]];
+    const int32_t r = cd.r, c = cd.c, v = cd.v;
+    const uint8_t id = m.label[r * C + c];
+    if (id && m.blobs[id].taken >= kBlobPoints) continue;
+    int64_t sw = 0, sx = 0, sy = 0;
+    const CentroidWindow win = centroidWindow(m.delta, R, C, r, c);
+    for (int32_t rr = win.r0; rr <= win.r1; ++rr)
+      for (int32_t cc = win.c0; cc <= win.c1; ++cc) {
+        const int32_t w = at(rr, cc);
+        if (w <= 0) continue;
+        sw += w;
+        sx += int64_t(w) * (cc * 1024 + 512);
+        sy += int64_t(w) * (rr * 1024 + 512);
+      }
+    if (sw <= 0) continue;
+    if (id) ++m.blobs[id].taken;
+    Point pt{sx / sw, sy / sw, v, 0, 0};
+    if (m.calibrated) calibratedCentroid(*m.cfg.cal, m.delta, r, c, &pt.cx, &pt.cy);
+    MatrixPoint &mp = m.points[count];
+    toPanel(m, pt, &mp.x, &mp.y);
+    mp.peak = v;
+    mp.row = uint16_t(r);
+    mp.col = uint16_t(c);
+    mp.strong = v >= m.cfg.threshold;
+    const MatrixBlob b = id ? m.blobs[id] : MatrixBlob{1, 1, 0, uint8_t(r), uint8_t(c), uint8_t(r), uint8_t(c)};
+    mp.area = b.area;
+    mp.blobPeaks = b.peaks;
+    mp.r0 = b.r0;
+    mp.c0 = b.c0;
+    mp.r1 = b.r1;
+    mp.c1 = b.c1;
+    pts[count++] = pt;
+    strong += mp.strong;
+  }
+  m.pointCount = count;
   ++m.frames;
-  m.peaks = int32_t(count);
-  if (!count) {
+  // The single contact: of the points at the threshold, the nearest to the last one while touching, else the strongest.
+  m.peaks = int32_t(strong);
+  if (!strong) {
     m.touching = false;
     return Feed::decoded;
   }
@@ -264,8 +423,8 @@ inline Feed matrixFeed(Matrix &m, const uint8_t *p, uint32_t len)
   bool found = false;
   int64_t bestD = int64_t(m.cfg.trackPx) * m.cfg.trackPx;
   for (uint32_t i = 0; i < count; ++i) {
-    int32_t x, y;
-    toPanel(m, pts[i], &x, &y);
+    if (!m.points[i].strong) continue;
+    const int32_t x = m.points[i].x, y = m.points[i].y;
     if (m.touching) {
       const int64_t d = int64_t(x - m.x) * (x - m.x) + int64_t(y - m.y) * (y - m.y);
       if (d < bestD) { bestD = d; bestX = x; bestY = y; found = true; }
@@ -275,7 +434,7 @@ inline Feed matrixFeed(Matrix &m, const uint8_t *p, uint32_t len)
   }
   if (!found)
     for (uint32_t i = 0; i < count; ++i)
-      if (pts[i].peak > bestPeak) { bestPeak = pts[i].peak; toPanel(m, pts[i], &bestX, &bestY); found = true; }
+      if (m.points[i].strong && pts[i].peak > bestPeak) { bestPeak = pts[i].peak; bestX = m.points[i].x; bestY = m.points[i].y; found = true; }
   m.touching = found;
   m.x = bestX;
   m.y = bestY;

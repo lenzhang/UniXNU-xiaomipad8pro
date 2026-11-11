@@ -1,15 +1,18 @@
 #!/bin/bash
 # Build package/PianoTouch (the NT36532E touch screen on QUP1 SE2: GENI SPI with SE DMA, or SPI by hand; the host download; the
-# matrix decoder; a tablet pointer for macOS) as a k27 native kext: the host tests first (tests/geni_spi_host.c: GeniSpi.c against
-# its register model; tests/touch_host.cpp: the protocol against an NT36532E model, the staged images downloaded into it, the
-# decoder, the HID report, the clock decoding, the frame pace), then the panel images staged and embedded, then the objects in
+# matrix decoder, the contacts and their gestures; a HID pointer for macOS) as a k27 native kext: the host tests first
+# (tests/geni_spi_host.c: GeniSpi.c against its register model; tests/touch_host.cpp: the protocol against an NT36532E model, the
+# staged images downloaded into it, the decoder, the tracker, palms and every gesture on synthetic frames, the HID descriptor and
+# reports, the clock decoding, the frame pace), then the panel images staged and embedded, then the objects in
 # out/native-kexts/PianoTouch for tooling/k27/kext/PianoTouch.json. Prints out/k27/kext/PianoTouch.json (resolved) last.
 # Inert without the boot argument piano-touch (package/PianoTouch/PianoTouch.cpp, docs/drivers/touch.md).
 #   environment: PIANO_K27_TREE (the k27 tree, read only: compile recipes, out/x12377/inc-hid), K27_OBJ (default k27-native-obj),
 #                CC/CXX (host compilers for the tests), PIANO_TOUCH_FW_DIR (the directory with novatek_nt36532_piano_fw_{boe,csot}.bin;
 #                default ../xiaomipad-8pro-mainline's firmware/novatek/piano), PIANO_TOUCH_NO_FIRMWARE=1 (build without them: step 5
 #                then stops with "no usable image"), PIANO_TOUCH_CALIBRATION (this unit's Ubuntu touchscreen calibration, from the
-#                environment or ~/.config/piano/env; PIANO_TOUCH_CALIBRATION= in the environment does not read the file)
+#                environment or ~/.config/piano/env; PIANO_TOUCH_CALIBRATION= in the environment does not read the file),
+#                K27_KERNEL (the kernel the KC will link, default the 0059 one: the import check, and the CPU latency hold compiled
+#                in when it exports piano_cpuidle_latency_hold), LLVM_NM
 # The calibration (private: made by xiaomipad-8pro-mainline tools/extract-thp-calibration.py from the vendor thp_config.ini) is
 # checked and turned into out/native-kexts/PianoTouch/gen/PianoTouchCalibration.h by tooling/k27/gen-touch-calibration.py, which
 # prints which one is used; absent or invalid: the linear map. Neither the file, its path nor its hash is in any committed file.
@@ -62,10 +65,18 @@ python3 "$D/tooling/k27/gen-touch-calibration.py" --out "$O/host-tests/Synthetic
   -DPIANO_TOUCH_SYNTHETIC_HEADER='"SyntheticCalibration.h"' -DPIANO_TOUCH_UNIT_HEADER='"PianoTouchCalibration.h"' \
   "$P/tests/touch_host.cpp" -o "$O/host-tests/touch_host"
 "$O/host-tests/touch_host" ${STAGED[@]+"${STAGED[@]}"} >&2 || { echo "Error: PianoTouch host tests failed" >&2; exit 1; }
+KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
+# The CPU latency hold of a read burst (k27 0061's piano_cpuidle_latency_hold, docs/power.md §2) is compiled in only when the kernel
+# the KC links exports it: the KC linker takes no weak imports, so a call into a kernel without it would not link.
+HOLD=0
+NM=${LLVM_NM:-/opt/homebrew/opt/llvm/bin/llvm-nm}; [ -x "$NM" ] || NM=nm
+# grep -c reads to the end (grep -q would stop early and fail the pipe under pipefail).
+if [ -f "$KERNEL" ] && [ "$("$NM" "$KERNEL" 2>/dev/null | grep -c ' _piano_cpuidle_latency_hold$' || true)" -gt 0 ]; then HOLD=1; fi
+if [ "$HOLD" = 1 ]; then echo "PianoTouch: CPU latency hold compiled in ($(basename "$KERNEL") exports piano_cpuidle_latency_hold)" >&2
+else echo "PianoTouch: no CPU latency hold ($(basename "$KERNEL") has no piano_cpuidle_latency_hold; K27_KERNEL=... a 0061+ kernel)" >&2; fi
 python3 "$D/tooling/k27/build-native-kext.py" PianoTouch "$P/PianoTouch.cpp" "$P/GeniSpi.c" "$D/tooling/k27/NativeKextGlue.cpp" "$GEN" \
   -I "$P" -I "$O/gen" -I "$D/package/PianoDwc3" -I "$HID" -I "$K/out/x12377/inc-gfx" -I "$K/out/x12377/storage-abi/include" \
-  -D U:TARGET_OS_OSX -D TARGET_OS_OSX=1 --obj "${K27_OBJ:-k27-native-obj}" >&2
-KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
+  -D U:TARGET_OS_OSX -D TARGET_OS_OSX=1 -D PIANO_TOUCH_LATENCY_HOLD=$HOLD --obj "${K27_OBJ:-k27-native-obj}" >&2
 # IOHIDDevice's symbols come from IOHIDFamily, the GCC lock word from PianoA830 (both libraries of the descriptor), resolved by the KC link.
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" --library-prefix __ZN11IOHIDDevice \
   --library-prefix __ZNK11IOHIDDevice --library-prefix __ZTV11IOHIDDevice --library-prefix _sm8750_gcc_vote_owner | cut -c1-160 >&2

@@ -3,7 +3,9 @@
 // (SM8750), native at EL1. The controller sits on QUP1 serial engine 2 (spi@a88000, chip select 0, GPIO40-43), raises GPIO162 for
 // every frame, and is powered with the panel (no rail of its own: nothing is voted). It has no flash for its touch firmware: the host
 // downloads the panel's image (BOE or CSOT by GPIO100, staged by tooling/k27/build-native-piano-touch.sh from an ignored out/ copy,
-// never committed) into its SRAM at every start; it then streams raw 40 x 60 matrices that TouchMatrix.h turns into one contact.
+// never committed) into its SRAM at every start; it then streams raw 40 x 60 matrices that TouchMatrix.h turns into contacts,
+// TouchTrack.h follows them (stable IDs, palms rejected) and TouchGesture.h turns them into what macOS understands from a HID pointer
+// (tap = click, hold = right click, drag, two-finger scroll, two-finger tap = right click; TouchHid.h's absolute pointer with a wheel).
 //
 // Steps (each logs "PianoTouch: step N ..." before it touches anything; "FAILED at step N" when it stops there):
 //   1 survey     read only: the six pins, the GCC votes/branches/rate of SE2, SE2's registers when its clocks run, the SMMU entry
@@ -19,13 +21,28 @@
 //   7 frames     GPIO162's rising edges latched in TLMM (raw status), polled every piano-touch-poll ms while the panel is busy
 //                and a frame read per edge; at rest one frame per piano-touch-idle ms (TouchPace.h), its edge waited for by
 //                polling or, with piano-touch-irq=1, by the TLMM summary interrupt (package/common/PianoIrq.h); checksum,
-//                transport kind, counter, type; the matrix decoder and the tip; at level 2 the tablet pointer (TouchHid.h). Ten
-//                watchdog frames in a row: the download again (at most three times)
+//                transport kind, counter, type; the matrix decoder, the contacts (TouchTrack.h) and the gestures (TouchGesture.h);
+//                at level 2 their reports to the HID pointer (TouchHid.h). While the panel is busy a CPU latency hold (k27 0061's
+//                piano_cpuidle_latency_hold, compiled in when the kernel the build links has it). Ten watchdog frames in a row:
+//                the download again (at most three times)
 //
 // Boot arguments (default: inert, the service does not even probe):
-//   piano-touch=1            steps 1-7; frame statistics and contacts in the log; nothing goes to macOS
-//   piano-touch=2            the same and the HID tablet pointer (a tap clicks, a drag drags); contact positions are then only
-//                            counted (piano-touch-trace=1 logs them)
+//   piano-touch=1            steps 1-7; frame statistics, contacts and the gestures they make in the log; nothing goes to macOS
+//   piano-touch=2            the same and the HID pointer (docs/drivers/touch.md §14: tap = click, hold = right click, drag = drag,
+//                            two fingers scroll, two-finger tap = right click); positions are then not logged (taps at the login
+//                            window could spell a password on an on-screen keyboard); piano-touch-trace=1 logs them
+//   piano-touch-gestures=0   level 2 as before the gestures: the first contact is the tip (down presses, up releases)
+//   piano-touch-hold=MS      still this long: a right click (default 500; 0: never; 200..3000)
+//   piano-touch-slop=PX      movement (panel pixels) that makes a drag, a scroll or a pinch (default 32; 4..200)
+//   piano-touch-scroll=PX    finger travel per wheel count (default 4; 1..64)
+//   piano-touch-scroll-res=N the scroll resolution the descriptor declares, counts per inch (default 45; 10..900)
+//   piano-touch-scroll-invert=1  scroll against macOS's natural direction setting (both axes)
+//   piano-touch-pinch=N      0 a pinch sends nothing (default); 1 Command + wheel; 2 Control + wheel (Accessibility Zoom); 1 and 2
+//                            add the keyboard modifiers to the descriptor (report IDs)
+//   piano-touch-palm=N       a blob of N nodes or more is a palm (default 48; 0: no palm rejection by size)
+//   piano-touch-confirm=N    frames a new contact needs (default 2; 1..5); piano-touch-fast=P: a first peak of P counts at once
+//                            (default twice the threshold; 0: never)
+//   piano-touch-cpu-hold=US  the CPU latency hold while the panel is busy (default 2000; 0: none)
 //   piano-touch-stop=N       stop before step N (2: the read-only survey alone; 4: the bus up and tested, the controller untouched)
 //   piano-touch-bus=N        0 GENI, falling back to SPI by hand (default); 1 GENI only; 2 SPI by hand only
 //   piano-touch-khz=K        the GENI SPI rate (default 9600; 1000..19200, the DT's maximum)
@@ -42,6 +59,8 @@
 //   piano-touch-poll=MS      edge polling while busy (default 1)
 //   piano-touch-idle=MS      one frame per MS at rest (default 50; 0: every frame, the old loop; 20..500)
 //   piano-touch-irq=1        the idle frames' edge by the TLMM interrupt (gpio162 on the summary SPI 208) instead of 1 ms polls
+//   piano-touch-noedge=MS    while busy a frame is read anyway MS after the last one when no gpio162 edge came (default 12; 4..200;
+//                            at rest the idle period + 10 ms; TouchPace.h)
 //   piano-wake-log=S         the "idle: N wakeups" line every S seconds (default 60, 0 none; shared with the other drivers)
 //   piano-touch-trace=1      more frame headers, and contact positions at level 2
 //   piano-touch-rotate=1     follow the display's rotation (package/PianoAuto/TouchRotation.h, docs/drivers/sensors.md 5a.3): the
@@ -62,6 +81,7 @@
 #endif
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSBoolean.h>
 #include <libkern/libkern.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -69,12 +89,22 @@
 #include <stdarg.h>
 #include "Nt36532.h"
 #include "TouchMatrix.h"
+#include "TouchTrack.h"
+#include "TouchGesture.h"
 #include "TouchHid.h"
 #include "Se2Bus.h"
 #include "PianoTouchCalibration.h"   // generated (tooling/k27/gen-touch-calibration.py) into the ignored out/ tree
 #include "SmmuStream.h"
 #include "TouchPace.h"
+#include "TouchPower.h"
 #include "../common/PianoIrq.h"
+// The power contract (docs/power.md §4): the two power states and pianopower::join. PIANO_TOUCH_LATENCY_HOLD:
+// tooling/k27/build-native-piano-touch.sh sets it to 1 when the kernel the KC links (K27_KERNEL) exports
+// piano_cpuidle_latency_hold (k27 0061); the KC linker takes no weak imports, so without it the call is not compiled in.
+#include <PianoPowerContract.h>
+#ifndef PIANO_TOUCH_LATENCY_HOLD
+#define PIANO_TOUCH_LATENCY_HOLD 0
+#endif
 extern "C" {
 #include "GeniSpi.h"
 }
@@ -96,6 +126,8 @@ namespace {
 
 struct Args {
   uint32_t level, stop, bus, khz, seirq, smmu, loopback, mode, baseline, threshold, flip, pollMs, trace, idleMs, irq, rotate;
+  uint32_t gestures, holdMs, slopPx, scrollPx, scrollRes, scrollInvert, pinch, palmNodes, confirm, fastPeak, cpuHoldUs, noEdgeMs;
+  uint32_t pm, display;
 };
 Args gArgs;
 
@@ -131,7 +163,47 @@ void readArgs()
   gArgs.trace = bootArg("piano-touch-trace", 0);
   gArgs.idleMs = TouchPace::clampIdle(bootArg("piano-touch-idle", kIdleReadMs));
   gArgs.irq = bootArg("piano-touch-irq", 0);
+  gArgs.noEdgeMs = clampArg(bootArg("piano-touch-noedge", kNoEdgeBusyMs), 4, kNoEdgeOldMs);
   gArgs.rotate = bootArg("piano-touch-rotate", 0);
+  // The gestures (TouchGesture.h) and the contacts (TouchTrack.h); 0 turns off what has an "off".
+  gArgs.gestures = bootArg("piano-touch-gestures", 1);
+  const uint32_t hold = bootArg("piano-touch-hold", 500);
+  gArgs.holdMs = hold ? clampArg(hold, 200, 3000) : 0;
+  gArgs.slopPx = clampArg(bootArg("piano-touch-slop", 32), 4, 200);
+  gArgs.scrollPx = clampArg(bootArg("piano-touch-scroll", 4), 1, 64);
+  gArgs.scrollRes = touchScrollResolution(bootArg("piano-touch-scroll-res", kTouchScrollResolution));
+  gArgs.scrollInvert = bootArg("piano-touch-scroll-invert", 0);
+  gArgs.pinch = clampArg(bootArg("piano-touch-pinch", 0), 0, 2);
+  const uint32_t palm = bootArg("piano-touch-palm", 48);
+  gArgs.palmNodes = palm ? clampArg(palm, 8, 2400) : 0;
+  gArgs.confirm = clampArg(bootArg("piano-touch-confirm", 2), 1, 5);
+  gArgs.fastPeak = clampArg(bootArg("piano-touch-fast", 2 * gArgs.threshold), 0, 30000);
+  const uint32_t cpuHold = bootArg("piano-touch-cpu-hold", 2000);
+  gArgs.cpuHoldUs = cpuHold ? clampArg(cpuHold, 100, 10000) : 0;
+  // The power contract (TouchPower.h): the power tree (system sleep, restart), and the display's state.
+  gArgs.pm = bootArg("piano-touch-pm", 1);
+  gArgs.display = bootArg("piano-touch-display", 1);
+}
+
+TrackConfig trackConfig()
+{
+  TrackConfig c;
+  c.confirm = gArgs.confirm;
+  c.fastPeak = int32_t(gArgs.fastPeak);
+  c.palmNodes = gArgs.palmNodes;
+  c.palmPeaks = gArgs.palmNodes ? 3 : 0;
+  return c;
+}
+GestureConfig gestureConfig()
+{
+  GestureConfig c;
+  c.gestures = gArgs.gestures != 0;
+  c.holdMs = gArgs.holdMs;
+  c.slopPx = int32_t(gArgs.slopPx);
+  c.scrollPx = int32_t(gArgs.scrollPx);
+  c.scrollInvert = gArgs.scrollInvert != 0;
+  c.pinch = uint8_t(gArgs.pinch);
+  return c;
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -179,6 +251,7 @@ uint64_t nowUs()
 }
 uint64_t nowMs() { return nowUs() / 1000; }
 const char *const kFlipNames[5] = {"0 (none)", "1 (X)", "2 (Y)", "3 (X and Y)", "auto"};
+const char *const kPinchNames[3] = {"recognised, nothing sent", "Command + wheel", "Control + wheel"};
 
 // Explicit ldr/str, as PianoDwc3 does: every store from a general register (Qualcomm's trapped SMMU registers need that).
 inline uint32_t rd32(uintptr_t a)
@@ -283,11 +356,12 @@ uint32_t smmuRead(uint32_t off) { return rd32(gSmmu.va + off); }
 
 // --------------------------------------------------------------------------------------------------------------- the HID device
 // The IOHIDDevice subclass of package/PianoInput's PianoHIDDevice and PianoKeyboard's PianoKeyboardHID (UPSTREAM) with the
-// tablet descriptor of TouchHid.h.
+// pointer descriptor of TouchHid.h (made for the scroll resolution and the pinch's modifiers before start).
 class PianoTouchHID : public IOHIDDevice {
   OSDeclareDefaultStructors(PianoTouchHID)
 
 public:
+  TouchDescriptor fDescriptor = kTouchDescriptorDefault;
   IOReturn newReportDescriptor(IOMemoryDescriptor **descriptor) const override;
   OSString *newTransportString() const override { return OSString::withCString("SPI"); }
   OSString *newManufacturerString() const override { return OSString::withCString("UniXNU"); }
@@ -303,7 +377,7 @@ OSDefineMetaClassAndStructors(PianoTouchHID, IOHIDDevice)
 
 IOReturn PianoTouchHID::newReportDescriptor(IOMemoryDescriptor **descriptor) const
 {
-  *descriptor = IOBufferMemoryDescriptor::withBytes(kTabletDescriptor, sizeof kTabletDescriptor, kIODirectionNone);
+  *descriptor = IOBufferMemoryDescriptor::withBytes(fDescriptor.bytes, fDescriptor.length, kIODirectionNone);
   return *descriptor ? kIOReturnSuccess : kIOReturnNoMemory;
 }
 
@@ -325,13 +399,31 @@ class PianoTouch : public IOService {
   const char *fFwName = "none";
   uint8_t *fFrame = nullptr;
   Matrix *fMatrix = nullptr;
-  Tip fTip;
+  // The contacts and their gestures (TouchTrack.h, TouchGesture.h); at level 2 the reports go to fHid.
+  Tracker fTracker;
+  Gesture fGesture;
+  bool fReportIds = false;              // the pinch's modifiers are in the descriptor
+  uint8_t fSentModifiers = 0;
+  uint32_t fContactLines = 0, fGestureLines = 0, fLastGestureStats = 0;
+  // The CPU latency hold of a read burst (TouchPace.h BurstHold; piano_cpuidle_latency_hold when compiled in).
+  BurstHold fBurst;
+  int fCpuHold = -1;
+  uint32_t fCpuHoldFailures = 0;
+  // The power states (TouchPower.h): setPowerState writes fSystemOff and kicks fWake; the frame thread acts on it, parks (fParked)
+  // while off, restarts on its own. The display's state from NativeGopDisplay's piano-display-power (fDisplay, retained once found).
+  TouchPower fPower;
+  pianoirq::Waiter fWake = {};
+  volatile bool fSystemOff = false, fParked = false, fServing = false, fFramesStopped = false;
+  bool fJoined = false;
+  IOService *fDisplay = nullptr;
+  uint64_t fDisplayReadMs = 0, fDisplayLookupMs = 0;
+  int fDisplayState = -1;
   // transfer statistics
   uint32_t fXfers = 0, fXferErrors = 0;
   // serving statistics
-  uint64_t fStartMs = 0, fLastReadMs = 0, fLastStatsMs = 0, fTipDownMs = 0, fLastHeldLogMs = 0;
+  uint64_t fStartMs = 0, fLastReadMs = 0, fLastStatsMs = 0;
   uint32_t fEdges = 0, fReads = 0, fData = 0, fGood = 0, fBad = 0, fInconsistent = 0, fHand = 0, fWdt = 0, fReadErrors = 0;
-  uint32_t fConsecutive = 0, fWdtRun = 0, fDownloads = 0, fGaps = 0, fShown = 0, fContactsLogged = 0, fSent = 0, fSendErrors = 0;
+  uint32_t fConsecutive = 0, fWdtRun = 0, fDownloads = 0, fGaps = 0, fShown = 0, fSent = 0, fSendErrors = 0;
   uint32_t fTypes[8] = {}, fTypeCount[8] = {};
   uint64_t fReadUsSum = 0;
   uint32_t fReadUsMax = 0, fReadsSinceStats = 0, fEdgesSinceStats = 0;
@@ -373,8 +465,17 @@ class PianoTouch : public IOService {
   bool publish();
   void serve();
   void frame(uint32_t readUs);
-  void contact(TipEvent e);
-  void send(bool tip, int32_t x, int32_t y);
+  void contacts(uint64_t now);
+  void gestures(uint64_t now);
+  void lost(uint64_t now);
+  void deliver(const GestureOut &out);
+  void send(const PointerReport &r);
+  void sendBytes(const uint8_t *bytes, unsigned length);
+  void burst(uint64_t now, bool busy, bool end = false);
+  int displayState(uint64_t now);
+  bool powerStep(PowerStep step, const MatrixConfig &mc, uint64_t now);
+  bool restart(bool fromSuspend, const MatrixConfig &mc);
+  void park();
   void stats(uint64_t now);
 
 public:
@@ -383,6 +484,7 @@ public:
   bool start(IOService *provider) override;
   IOReturn callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4) override;
   IOReturn setProperties(OSObject *properties) override;
+  IOReturn setPowerState(unsigned long state, IOService *device) override;
 };
 
 OSDefineMetaClassAndStructors(PianoTouch, IOService)
@@ -415,6 +517,22 @@ bool PianoTouch::start(IOService *provider)
        gArgs.idleMs ? "one frame per idle period at rest" : "every frame", gArgs.irq,
        (unsigned long long)piano_touch_firmware_boe_size, (unsigned long long)piano_touch_firmware_csot_size);
   setProperty("piano-touch", gArgs.level, 32);
+  if (gArgs.gestures)
+    note("gestures: tap = click, held %u ms = right click%s, moved past %u px = drag, two-finger tap = right click, two-finger "
+         "scroll %u px a count (declared %u/inch, %s), pinch %s", gArgs.holdMs, gArgs.holdMs ? "" : " (never)", gArgs.slopPx,
+         gArgs.scrollPx, gArgs.scrollRes, gArgs.scrollInvert ? "inverted" : "the content follows the fingers under natural scrolling",
+         kPinchNames[gArgs.pinch]);
+  else
+    note("gestures: off (piano-touch-gestures=0): the first contact is the tip, down presses, up releases");
+  char fast[48] = "", palm[96] = "off (piano-touch-palm=0)";
+  if (gArgs.fastPeak) snprintf(fast, sizeof fast, ", at once from a peak of %u", gArgs.fastPeak);
+  if (gArgs.palmNodes) snprintf(palm, sizeof palm, "a blob of %u nodes or 3 peaks, and where one was for 500 ms", gArgs.palmNodes);
+  note("contacts: up to %u followed; one counts after %u frames%s, ends after 3 without; palm: %s", kMaxTracks, gArgs.confirm, fast, palm);
+  if (PIANO_TOUCH_LATENCY_HOLD && gArgs.cpuHoldUs)
+    note("latency: while the panel is busy no CPU idle state slower than %u us to leave (piano_cpuidle_latency_hold)", gArgs.cpuHoldUs);
+  else
+    note("latency: no CPU latency hold (%s)", PIANO_TOUCH_LATENCY_HOLD ? "piano-touch-cpu-hold=0" :
+         "built for a kernel without piano_cpuidle_latency_hold");
   if (gArgs.rotate) {
     setProperty(PAT_PROPERTY, 0ull, 32);
     note("rotation: following the display's (piano-touch-rotate=1): %s and the property %s taken (0/90/180/270); 0 until told",
@@ -441,7 +559,7 @@ bool PianoTouch::start(IOService *provider)
     if (gArgs.stop == 3 || !smmuStep) note("stopped before step 3 (bus): piano-touch-stop=%u", gArgs.stop);
     return true;
   }
-  // The HID device from start, as PianoInput and PianoDwc3 publish theirs; it sends nothing until a tip comes.
+  // The HID device from start, as PianoInput and PianoDwc3 publish theirs; it sends nothing until a contact comes.
   if (gArgs.level >= 2 && !publish()) return true;
   fChip.txBytes = 63 * 1024 + 8;
   fChip.rxBytes = kMaxFrame + 8;
@@ -460,6 +578,13 @@ bool PianoTouch::start(IOService *provider)
   }
   thread_deallocate(thread);
   registerService();
+  // The power tree (docs/power.md §4): setPowerState(off) before a system sleep, a restart or a shutdown stops the frames, on
+  // restarts them (piano-touch-pm=0: not joined, as before).
+  if (gArgs.pm) {
+    fJoined = pianopower::join(this) == kIOReturnSuccess;
+    note("power: %s the power tree: system off stops the frames and masks gpio162's interrupt, on restarts them; the display %s",
+         fJoined ? "joined" : "NOT joined", gArgs.display ? "followed (piano-display-power: off mutes touch)" : "ignored (piano-touch-display=0)");
+  }
   return true;
 }
 
@@ -576,6 +701,7 @@ void PianoTouch::run()
   armIrq();
   setProperty("piano-touch-stage", uint64_t(uint32_t(piano_touch_stage)), 32);
   serve();
+  __atomic_store_n(&fServing, false, __ATOMIC_RELEASE);   // setPowerState(off) no longer waits for a frame thread
 }
 
 int PianoTouch::busXfer(void *self, const uint8_t *tx, uint8_t *rx, uint32_t len)
@@ -940,6 +1066,8 @@ bool PianoTouch::publish()
     stage(-3, "HID device: init");
     return false;
   }
+  fReportIds = gArgs.gestures && gArgs.pinch;
+  hid->fDescriptor = makeTouchDescriptor(gArgs.scrollRes, fReportIds);
   hid->setProperty(kIOHIDBuiltInKey, true);
   if (!hid->attach(this)) {
     OSSafeReleaseNULL(hid);
@@ -953,8 +1081,9 @@ bool PianoTouch::publish()
     return false;
   }
   fHid = hid;
-  note("HID device: tablet pointer, vendor %#x product %#x, %u-byte descriptor, registry ID %#llx", kVendorId, kProductId,
-       unsigned(sizeof kTabletDescriptor), hid->getRegistryEntryID());
+  note("HID device: touch screen pointer (absolute X/Y, 3 buttons, wheel and AC Pan at %u counts/inch%s), vendor %#x product %#x, "
+       "%u-byte descriptor, registry ID %#llx", gArgs.scrollRes, fReportIds ? "; the keyboard modifiers as report 2" : "", kVendorId,
+       kProductId, hid->fDescriptor.length, hid->getRegistryEntryID());
   if (OSDictionary *matching = IOService::serviceMatching("IOHIDEventService")) {
     fPublished = IOService::addMatchingNotification(gIOFirstPublishNotification, matching, eventServicePublished, this, nullptr);
     matching->release();
@@ -998,24 +1127,67 @@ IOReturn PianoTouch::setProperties(OSObject *properties)
   return kIOReturnSuccess;
 }
 
-void PianoTouch::send(bool tip, int32_t x, int32_t y)
+void PianoTouch::sendBytes(const uint8_t *bytes, unsigned length)
 {
-  if (!fHid) return;
-  uint8_t r[kReportBytes];
-  rotatedTabletReport(tip, x, y, kPanelW, kPanelH, fRotation.shown, r);
-  IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(r, sizeof r, kIODirectionNone);
+  IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(bytes, length, kIODirectionNone);
   const IOReturn rc = report ? fHid->handleReport(report) : kIOReturnNoMemory;
   OSSafeReleaseNULL(report);
   ++fSent;
   if (rc != kIOReturnSuccess && (++fSendErrors <= 5 || fSendErrors % 1000 == 0)) note("HID: handleReport %#x (%u failures)", rc, fSendErrors);
 }
 
-void PianoTouch::contact(TipEvent e)
+// One report of the gestures (level 2): its position is the rotated desktop's (gestures() mapped the contacts through the rotation
+// in use), scaled over that desktop's size. With the pinch's modifiers in the descriptor a change of them goes first, as report 2.
+void PianoTouch::send(const PointerReport &r)
 {
-  if (e == TipEvent::none) return;
-  const uint64_t now = nowMs();
+  if (!fHid) return;
+  uint8_t b[kMaxReportBytes];
+  if (fReportIds && r.modifiers != fSentModifiers) {
+    const unsigned n = modifierReport(r.modifiers, b);
+    sendBytes(b, n);
+    fSentModifiers = r.modifiers;
+  }
+  const PatPoint desktop = pat_rotate(fRotation.shown, 0, 0, kPanelW, kPanelH);
+  const unsigned n = pointerReport(r, desktop.width, desktop.height, fReportIds, b);
+  sendBytes(b, n);
+}
+
+// The tracker's notes of this frame (TouchTrack.h): the first 200 lines, then about every 20th contact. Positions only at level 1
+// or with piano-touch-trace=1.
+void PianoTouch::contacts(uint64_t now)
+{
   const bool show = gArgs.level < 2 || gArgs.trace;
-  if (e == TipEvent::down && gArgs.rotate) {   // a new rotation from this contact on, never in the middle of one
+  for (unsigned i = 0; i < fTracker.noteCount; ++i) {
+    const TrackNote &n = fTracker.notes[i];
+    const Track &t = n.track;
+    if (fContactLines >= 200 && t.id % 20) continue;
+    ++fContactLines;
+    const char *palm = t.palm ? " (a palm's)" : "";
+    switch (n.kind) {
+    case TrackNoteKind::down:
+      if (show) note("contact %u down at (%d, %d) px, peak %d, area %u nodes%s, frame %u", t.id, t.x, t.y, t.peak, t.area, palm, fMatrix->lastFrameNo);
+      else note("contact %u down, peak %d, area %u nodes%s", t.id, t.peak, t.area, palm);
+      break;
+    case TrackNoteKind::up:
+      if (show)
+        note("contact %u up at (%d, %d) px after %llu ms (%u frames, peak up to %d, area up to %u nodes)%s", t.id, t.x, t.y,
+             (unsigned long long)(now - t.downMs), t.frames, t.maxPeak, t.maxArea, palm);
+      else
+        note("contact %u up after %llu ms (%u frames, peak up to %d, area up to %u nodes)%s", t.id, (unsigned long long)(now - t.downMs),
+             t.frames, t.maxPeak, t.maxArea, palm);
+      break;
+    case TrackNoteKind::palm:
+      note("contact %u is a palm (area %u nodes, %u peaks in its blob): no gesture from it", t.id, t.area, t.blobPeaks);
+      break;
+    }
+  }
+}
+
+// The gestures of this frame: the active contacts in the desktop (the rotation is latched when a gesture begins, never in the
+// middle of one), the engine, then the reports and the notes.
+void PianoTouch::gestures(uint64_t now)
+{
+  if (gArgs.rotate && gestureIdle(fGesture) && trackerActive(fTracker, true)) {
     const uint32_t was = fRotation.shown;
     if (pat_latch(&fRotation, 1) != was) {
       note("rotation: %u degrees from this touch on (was %u; from %s, change %u)", fRotation.shown, was, fRotationSource,
@@ -1023,28 +1195,206 @@ void PianoTouch::contact(TipEvent e)
       setProperty(PAT_PROPERTY, uint64_t(fRotation.shown), 32);
     }
   }
-  if (e == TipEvent::down) {
-    fTipDownMs = fLastHeldLogMs = now;
-    if (fContactsLogged < 200 || fTip.downs % 20 == 0) {
-      ++fContactsLogged;
-      if (show) note("touch %u down at (%d, %d) px, peak %d, frame %u", fTip.downs, fTip.x, fTip.y, fMatrix->maxDelta, fMatrix->lastFrameNo);
-      else note("touch %u down", fTip.downs);
-    }
-    send(false, fTip.x, fTip.y);   // the pointer there first, then the button
-    send(true, fTip.x, fTip.y);
-  } else if (e == TipEvent::move) {
-    if (show && fContactsLogged < 200 && now - fLastHeldLogMs >= 250) {
-      fLastHeldLogMs = now;
-      note("touch %u at (%d, %d) px, peak %d", fTip.downs, fTip.x, fTip.y, fMatrix->maxDelta);
-    }
-    send(true, fTip.x, fTip.y);
-  } else {
-    if (fContactsLogged < 200 || fTip.ups % 20 == 0) {
-      if (show) note("touch %u up at (%d, %d) px after %llu ms", fTip.ups, fTip.x, fTip.y, (unsigned long long)(now - fTipDownMs));
-      else note("touch %u up after %llu ms", fTip.ups, (unsigned long long)(now - fTipDownMs));
-    }
-    send(false, fTip.x, fTip.y);
+  GestureContact c[kMaxTracks];
+  unsigned n = 0;
+  for (const Track &t : fTracker.t) {
+    if (t.state != TrackState::active) continue;
+    const PatPoint p = pat_rotate(fRotation.shown, t.x, t.y, kPanelW, kPanelH);
+    c[n++] = GestureContact{t.id, t.palm, p.x, p.y, t.frames};
   }
+  GestureOut out;
+  gestureUpdate(fGesture, c, n, now, out);
+  deliver(out);
+}
+
+// Frames lost (a read error, the watchdog): every contact ends, a held button or modifier is released.
+void PianoTouch::lost(uint64_t now)
+{
+  trackerCancel(fTracker);
+  contacts(now);
+  GestureOut out;
+  gestureCancel(fGesture, out, now);
+  deliver(out);
+}
+
+void PianoTouch::deliver(const GestureOut &out)
+{
+  for (unsigned i = 0; i < out.n; ++i) send(out.r[i]);
+  const bool show = gArgs.level < 2 || gArgs.trace;
+  const uint32_t made = fGesture.taps + fGesture.rights + fGesture.drags + fGesture.scrolls + fGesture.pinches + fGesture.cancels;
+  for (unsigned i = 0; i < out.noteCount; ++i) {
+    const GestureNote &g = out.notes[i];
+    if (fGestureLines >= 200 && made % 20) continue;
+    ++fGestureLines;
+    char at[40] = "";
+    if (show) snprintf(at, sizeof at, " at (%d, %d)", g.x, g.y);
+    static const char *const kAxis[3] = {"both axes", "vertical", "horizontal"};
+    switch (g.kind) {
+    case GestureKind::tap: note("gesture: tap%s -> click (%u ms)", at, g.ms); break;
+    case GestureKind::holdRight: note("gesture: held %u ms%s -> right click", g.ms, at); break;
+    case GestureKind::dragStart: note("gesture: drag%s, left button down (%u ms after the touch)", at, g.ms); break;
+    case GestureKind::dragEnd: note("gesture: drag ends%s after %u ms, %d px from its start", at, g.ms, g.a); break;
+    case GestureKind::twoTap: note("gesture: two-finger tap%s -> right click (%u ms)", at, g.ms); break;
+    case GestureKind::scrollStart: note("gesture: two-finger scroll%s, %s", at, kAxis[g.a < 0 || g.a > 2 ? 0 : g.a]); break;
+    case GestureKind::scrollEnd: note("gesture: scroll ends after %u ms: wheel %d, AC Pan %d counts", g.ms, g.a, g.b); break;
+    case GestureKind::pinchStart: note("gesture: pinch%s: %s", at, kPinchNames[g.a < 0 || g.a > 2 ? 0 : g.a]); break;
+    case GestureKind::pinchEnd:
+      note("gesture: pinch ends after %u ms: spread %d px, %d zoom counts%s", g.ms, g.a, g.b, gArgs.pinch ? "" : " (not sent)");
+      break;
+    case GestureKind::cancelPalm: note("gesture: cancelled (a contact turned out a palm); nothing until every finger is up"); break;
+    case GestureKind::cancelFingers: note("gesture: three or more fingers: nothing until every finger is up"); break;
+    case GestureKind::cancelLost: note("gesture: cancelled (frames lost): released"); break;
+    case GestureKind::plainDown: note("touch down%s (the tip)", at); break;
+    case GestureKind::plainUp: note("touch up%s after %u ms", at, g.ms); break;
+    }
+  }
+}
+
+// The CPU latency hold of a read burst (TouchPace.h BurstHold): taken when the panel turns busy, released 1.5 s after it was last
+// busy, or at once (end) when the frame loop stops.
+void PianoTouch::burst(uint64_t now, bool busy, bool end)
+{
+#if PIANO_TOUCH_LATENCY_HOLD
+  if (!gArgs.cpuHoldUs) return;
+  const int s = end ? (fBurst.held ? -1 : 0) : fBurst.step(now, busy);
+  if (end) fBurst.held = false;
+  if (s > 0 && fCpuHold < 0) {
+    fCpuHold = piano_cpuidle_latency_hold(gArgs.cpuHoldUs);
+    if (fCpuHold < 0 && ++fCpuHoldFailures <= 3) note("latency: no free hold slot (piano_cpuidle_latency_hold -1): this burst without");
+  } else if (s < 0 && fCpuHold >= 0) {
+    piano_cpuidle_latency_release(fCpuHold);
+    fCpuHold = -1;
+  }
+#else
+  (void)now;
+  (void)busy;
+  (void)end;
+#endif
+}
+
+// ------------------------------------------------------------------------------------------------------------- power
+// The power contract (docs/power.md §4, TouchPower.h): off before a system sleep (and a restart or shutdown), on after it. Here only
+// recorded and the frame thread kicked: it ends the contacts, releases the latency hold, masks its interrupt and parks. Off waits
+// for that, at most 600 ms (an idle wait is woken at once, a frame read takes ~5 ms), and acknowledges in any case (the kernel's
+// freeze stops the thread wherever it is). On returns at once: the thread restarts asynchronously (Ubuntu: a faster wake).
+IOReturn PianoTouch::setPowerState(unsigned long state, IOService *)
+{
+  const bool off = state == pianopower::kOff;
+  __atomic_store_n(&fSystemOff, off, __ATOMIC_RELEASE);
+  fWake.kick();
+  if (!off || !__atomic_load_n(&fServing, __ATOMIC_ACQUIRE)) return pianopower::kAckNow;
+  unsigned waited = 0;
+  while (!__atomic_load_n(&fParked, __ATOMIC_ACQUIRE) && waited < 600) {
+    IOSleep(1);
+    ++waited;
+  }
+  note("power: system off %s after %u ms", __atomic_load_n(&fParked, __ATOMIC_ACQUIRE) ? "taken, frames stopped" :
+       "NOT taken yet (the frame thread parks at its next pass)", waited);
+  return pianopower::kAckNow;
+}
+
+// NativeGopDisplay's piano-display-power (1 on, 0 off; -1 not published: it publishes it with piano-backlight=2), read every
+// kDisplayPollMs; the service is found by class (no link to it), looked up at most every 5 s until found, retained.
+int PianoTouch::displayState(uint64_t now)
+{
+  if (!gArgs.display) return -1;
+  if (fDisplayReadMs && now - fDisplayReadMs < kDisplayPollMs) return fDisplayState;
+  fDisplayReadMs = now;
+  if (!fDisplay && (!fDisplayLookupMs || now - fDisplayLookupMs >= 5000)) {
+    fDisplayLookupMs = now;
+    if (OSDictionary *match = IOService::serviceMatching("NativeGopDisplay")) {
+      fDisplay = IOService::copyMatchingService(match);
+      match->release();
+    }
+  }
+  int state = -1;
+  if (fDisplay) {
+    OSObject *v = fDisplay->copyProperty("piano-display-power");
+    if (OSBoolean *b = OSDynamicCast(OSBoolean, v)) state = b->isTrue() ? 1 : 0;
+    else if (OSNumber *n = OSDynamicCast(OSNumber, v)) state = n->unsigned64BitValue() ? 1 : 0;
+    OSSafeReleaseNULL(v);
+  }
+  if (state >= 0 && fDisplayState < 0) note("display: following NativeGopDisplay's piano-display-power (%s now)", state ? "on" : "off");
+  fDisplayState = state;
+  return state;
+}
+
+// The frame thread while the system is off: until setPowerState(on) (the kernel freezes it in between).
+void PianoTouch::park()
+{
+  __atomic_store_n(&fParked, true, __ATOMIC_RELEASE);
+  for (;;) {
+    const uint32_t seen = fWake.now();
+    if (!__atomic_load_n(&fSystemOff, __ATOMIC_ACQUIRE)) break;
+    fWake.wait(seen, 1000);
+  }
+  __atomic_store_n(&fParked, false, __ATOMIC_RELEASE);
+}
+
+// After a suspend or the display's return: the controller probed by reads; kept, the frames go on (after a suspend the reference is
+// learned again: the time asleep is unknown); lost, the download again, at most kResumeDownloads times, then the reference. The
+// latch, the contacts and the gestures start afresh. False: the controller did not come back (frames stopped until the next
+// resume or display return).
+bool PianoTouch::restart(bool fromSuspend, const MatrixConfig &mc)
+{
+  bool kept = false;
+  int rc = probeState(fChip, &kept);
+  if (rc && fBus == BusKind::geni) {   // the engine itself may have lost its setup: once more from its clocks and loopback
+    note("%s: the probe's read failed (rc %d): the GENI engine set up again", fromSuspend ? "power" : "display", rc);
+    if (geniUp()) rc = probeState(fChip, &kept);
+  }
+  note("%s: the controller %s: firmware info %#04x/%#04x (started with %#04x), reset state %#04x%s", fromSuspend ? "power" : "display",
+       rc == kOk && kept ? "kept its state" : "lost its state", fChip.probeVersion, fChip.probeComplement, fChip.fwVersion,
+       fChip.probeReset, rc ? " (the probe's read failed)" : "");
+  unsigned tried = 0;
+  Restart plan = restartPlan(fromSuspend, rc == kOk && kept, tried);
+  while (plan == Restart::download) {
+    ++tried;
+    plan = firmware() && startScanning() ? Restart::relearn : restartPlan(fromSuspend, false, tried);
+  }
+  fFramesStopped = plan == Restart::giveUp;
+  if (plan == Restart::relearn) matrixReset(*fMatrix, mc);
+  trackerReset(fTracker, trackConfig());
+  gestureReset(fGesture, gestureConfig());
+  fWdtRun = fConsecutive = 0;
+  if (fIrqArmed) {
+    wr32(pinVa(kIrq) + kIntrStatus, 0);
+    dsb();
+  }
+  fEdgePending = false;
+  return !fFramesStopped;
+}
+
+bool PianoTouch::powerStep(PowerStep s, const MatrixConfig &mc, uint64_t now)
+{
+  switch (s) {
+  case PowerStep::none:
+    return true;
+  case PowerStep::suspend:
+    lost(now);
+    burst(now, false, true);
+    if (fIrqLive) fPin.mask();
+    note("power: system off (suspend %u): frames stopped, contacts released, CPU latency hold released, gpio162 interrupt masked",
+         fPower.suspends);
+    park();
+    return true;
+  case PowerStep::mute:
+    lost(now);
+    burst(now, false, true);
+    note("display off: touch muted (nothing reported), one frame per %u ms (piano-touch-display=0 ignores the display)", kIdleReadMaxMs);
+    return true;
+  case PowerStep::resume:
+  case PowerStep::unmute: {
+    const uint64_t t0 = nowMs();
+    const bool back = restart(s == PowerStep::resume, mc);
+    note("%s: %s after %llu ms%s", s == PowerStep::resume ? "power: system on" : "display on",
+         back ? "touch back" : "the controller did not come back: frames stopped until the next resume", (unsigned long long)(nowMs() - t0),
+         fPower.muted() ? " (the display is off: muted)" : "");
+    fLastReadMs = nowMs();
+    return true;
+  }
+  }
+  return true;
 }
 
 // ------------------------------------------------------------------------------------------------------------- step 7
@@ -1097,7 +1447,11 @@ void PianoTouch::frame(uint32_t readUs)
   if (fMatrix->frames == 1)
     note("matrix: reference of %u frames of type %d (%u x %u) after %u good frames; decoding", kRefFrames, fMatrix->refType, fMatrix->rows,
          fMatrix->cols, fGood);
-  contact(tipUpdate(fTip, fMatrix->touching, fMatrix->x, fMatrix->y));
+  if (!fPower.reporting()) return;   // the display off: the reference follows the drift, nothing is tracked or reported
+  const uint64_t now = nowMs();
+  trackerUpdate(fTracker, fMatrix->points, fMatrix->pointCount, now);
+  contacts(now);
+  gestures(now);
 }
 
 void PianoTouch::stats(uint64_t now)
@@ -1108,14 +1462,24 @@ void PianoTouch::stats(uint64_t now)
   types[0] = 0;
   for (unsigned k = 0; k < 8 && fTypeCount[k]; ++k) append(types, sizeof types, used, "%s%u:%u", used ? " " : "", fTypes[k], fTypeCount[k]);
   note("frames at %llu s: %llu reads/s, %llu edges/s; edges %u, reads %u (data %u: checksum ok %u, bad %u, inconsistent %u; handshake %u, "
-       "watchdog %u), read errors %u, counter gaps %u; types {%s}; read %llu us avg, %u max; matrix %s, decoded %u, peak %d; touches %u",
+       "watchdog %u), read errors %u, counter gaps %u; types {%s}; read %llu us avg, %u max; matrix %s, decoded %u, peak %d; contacts %u",
        (unsigned long long)((now - fStartMs) / 1000), (unsigned long long)(fReadsSinceStats * 1000ull / span),
        (unsigned long long)(fEdgesSinceStats * 1000ull / span), fEdges, fReads, fData, fGood, fBad, fInconsistent, fHand, fWdt,
        fReadErrors, fGaps, types, (unsigned long long)(fReads ? fReadUsSum / fReads : 0), fReadUsMax,
        fMatrix->haveReference ? "referenced" : fMatrix->refType >= 0 ? "learning the reference" : "learning the type", fMatrix->frames,
-       fMatrix->maxDelta, fTip.downs);
+       fMatrix->maxDelta, fTracker.downs);
   fLastStatsMs = now;
   fReadsSinceStats = fEdgesSinceStats = 0;
+  // The gestures, when there were new ones.
+  const Gesture &g = fGesture;
+  const uint32_t made = g.taps + g.rights + g.drags + g.scrolls + g.pinches + g.cancels + fTracker.palms;
+  if (made != fLastGestureStats) {
+    fLastGestureStats = made;
+    note("gestures at %llu s: %u taps, %u right clicks, %u drags, %u scrolls, %u pinches, %u cancelled; contacts %u (%u palms, %u palm "
+         "points, %u without a slot), %u merged peaks; %u reports sent, %u failed; CPU latency holds %u",
+         (unsigned long long)((now - fStartMs) / 1000), g.taps, g.rights, g.drags, g.scrolls, g.pinches, g.cancels, fTracker.downs,
+         fTracker.palms, fTracker.palmPoints, fTracker.noSlot, fMatrix->merged, fSent, fSendErrors, fBurst.takes);
+  }
   setProperty("piano-touch-frames", uint64_t(fGood), 32);
 }
 
@@ -1135,20 +1499,47 @@ void PianoTouch::serve()
        o.calibrationPanel != kPanelUnknown ? "the calibration" : fPanel != kPanelUnknown ? "gpio100" : "default",
        cal ? "from the unit's electrode maps and edge mapping" : "linear over the matrix");
   matrixReset(*fMatrix, mc);
-  fTip = Tip();
+  trackerReset(fTracker, trackConfig());
+  gestureReset(fGesture, gestureConfig());
   const uint64_t begin = nowMs();
   fLastReadMs = fLastStatsMs = begin;
   // The GPIO transport reads at most 10 frames a second (each takes ~45 ms of a CPU); GENI one per edge.
-  const uint64_t minGapMs = fBus == BusKind::gpio ? 100 : 0, noEdgeMs = fBus == BusKind::gpio ? 100 : 200;
+  const uint64_t minGapMs = fBus == BusKind::gpio ? 100 : 0;
   // Paced over GENI only (SPI by hand reads at most 10 frames a second anyway).
   const bool paced = gArgs.idleMs && fBus == BusKind::geni;
-  TouchPace pace = touchPace(gArgs.idleMs, begin);
+  TouchPace pace = touchPace(gArgs.idleMs, begin, gArgs.noEdgeMs);
+  bool rest = false;   // the pace's state after the last pass
   pianoirq::WakeStats wakes = pianoirq::wakeStats(pianoirq::wakeLogMs());
   uint32_t readsAtWindow = 0, sleepsAtWindow = 0;
   note("frames: serving over %s, %s", fBus == BusKind::geni ? "GENI" : "SPI by hand",
-       gArgs.level >= 2 ? "the tip goes to macOS" : "contacts are logged only (piano-touch=2 gives them to macOS)");
+       gArgs.level >= 2 ? "the gestures go to macOS" : "contacts and gestures are logged only (piano-touch=2 gives them to macOS)");
+  if (paced)
+    note("frames: without a gpio162 edge a frame is read anyway %u ms after the last one while busy, %u ms at rest", pace.noEdgeMs(false),
+         pace.noEdgeMs(true));
+  fPower.followDisplay = gArgs.display != 0;
+  __atomic_store_n(&fServing, true, __ATOMIC_RELEASE);
   for (;;) {
     const uint64_t now = nowMs();
+    // The power states (TouchPower.h): the system's (setPowerState; a suspend parks the thread in powerStep) and the display's.
+    powerStep(fPower.step(__atomic_load_n(&fSystemOff, __ATOMIC_ACQUIRE), displayState(now)), mc, now);
+    if (fPower.muted() || fFramesStopped) {
+      // The display off: a frame per kIdleReadMaxMs, decoded for the reference's drift only (frame() reports nothing); read errors
+      // and watchdog frames only counted (the panel's TDDI may have stopped). A controller that did not come back: no reads.
+      if (!fFramesStopped && now - fLastReadMs >= kIdleReadMaxMs) {
+        fLastReadMs = now;
+        ++fReads;
+        ++fReadsSinceStats;
+        const uint64_t t0 = nowUs();
+        if (readFrame(fChip, fFrame)) ++fReadErrors;
+        else frame(uint32_t(nowUs() - t0));
+        fWdtRun = 0;
+      }
+      if (now - fLastStatsMs >= (now - begin < 30000 ? 5000 : 60000)) stats(now);
+      const uint32_t seen = fWake.now();
+      if (!__atomic_load_n(&fSystemOff, __ATOMIC_ACQUIRE)) fWake.wait(seen, kDisplayPollMs);
+      wakes.count(pianoirq::Woke::timeout);
+      continue;
+    }
     if (fIrqArmed && (rd32(pinVa(kIrq) + kIntrStatus) & 1)) {
       wr32(pinVa(kIrq) + kIntrStatus, 0);
       dsb();
@@ -1158,7 +1549,9 @@ void PianoTouch::serve()
       ++fEdgesSinceStats;
     }
     const uint64_t since = now - fLastReadMs;
+    const uint64_t noEdgeMs = fBus == BusKind::gpio ? 100 : paced ? pace.noEdgeMs(rest) : kNoEdgeOldMs;
     if (since >= minGapMs && (fEdgePending || since >= noEdgeMs)) {
+      if (paced) pace.read(fEdgePending);
       fEdgePending = false;
       fLastReadMs = now;
       ++fReads;
@@ -1171,8 +1564,9 @@ void PianoTouch::serve()
       if (us > fReadUsMax) fReadUsMax = us;
       if (rc) {
         ++fReadErrors;
-        contact(tipCancel(fTip));
+        lost(nowMs());
         if (++fConsecutive >= 50) {
+          burst(nowMs(), false, true);
           stage(-7, "frames: 50 frame reads in a row failed");
           return;
         }
@@ -1191,8 +1585,9 @@ void PianoTouch::serve()
         fPollNextEdge = false;
       }
       if (fWdtRun > 10) {
-        contact(tipCancel(fTip));
+        lost(nowMs());
         if (fDownloads >= 4) {
+          burst(nowMs(), false, true);
           stage(-7, "frames: the controller's watchdog again after three re-downloads");
           return;
         }
@@ -1203,7 +1598,10 @@ void PianoTouch::serve()
         }
         note("frames: watchdog (state %#04x): the download again", fWdtState);
         fWdtRun = 0;
-        if (!firmware() || !startScanning()) return;
+        if (!firmware() || !startScanning()) {
+          burst(nowMs(), false, true);
+          return;
+        }
         matrixReset(*fMatrix, mc);
       }
     }
@@ -1218,18 +1616,24 @@ void PianoTouch::serve()
       sleepsAtWindow = fIdleSleeps;
     }
     // The pace (TouchPace.h): every frame while the panel is busy, one per idle period at rest.
-    const bool busy = fMatrix->touching || fTip.down || fTip.seen || !fMatrix->haveReference || fWdtRun;
-    if (paced && fEdgeSeen && pace.idle(nowMs(), busy) && !fEdgePending) {
+    const bool busy = trackerLive(fTracker) || !gestureIdle(fGesture) || !fMatrix->haveReference || fWdtRun;
+    burst(nowMs(), busy);
+    rest = paced && pace.idle(nowMs(), busy);
+    if (rest && !fEdgePending) {
       const uint32_t sleep = pace.sleepMs(nowMs(), fLastReadMs);
       if (sleep) {
-        IOSleep(sleep);
+        const uint32_t seen = fWake.now();   // a power change (setPowerState) ends the sleep at once
+        if (!__atomic_load_n(&fSystemOff, __ATOMIC_ACQUIRE)) fWake.wait(seen, sleep);
         wakes.count(pianoirq::Woke::timeout);
         ++fIdleSleeps;
-        wr32(pinVa(kIrq) + kIntrStatus, 0);   // the latched edge came mid-sleep: the next fresh one starts a frame
-        dsb();
+        if (fIrqArmed) {   // (gpio162 mapped; without it the rest is blind)
+          if (rd32(pinVa(kIrq) + kIntrStatus) & 1) pace.edgeSeen();   // edges come: wait for the next fresh one
+          wr32(pinVa(kIrq) + kIntrStatus, 0);   // the latched edge came mid-sleep: the next fresh one starts a frame
+          dsb();
+        }
         continue;
       }
-      if (fIrqLive && fPin.live() && !fPollNextEdge) {
+      if (fEdgeSeen && fIrqLive && fPin.live() && !fPollNextEdge) {
         const uint32_t seen = fPin.gen();
         fPin.arm();   // the handler masks it again when the edge comes
         if (fPin.wait(seen, 20)) {

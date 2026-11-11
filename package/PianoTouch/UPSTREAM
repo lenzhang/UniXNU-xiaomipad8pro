@@ -48,7 +48,9 @@ xiaomipad-8pro-mainline (main 4b853f8ae9770bc6fa9f9eec3bcc996e9bc86dbf), device/
     the repository's NOTICE: "Novatek touch userspace"): domainContact (the electrode maps weighted by max(delta - 25, 0), x 10,
     rounded), mapEdgeAxis / mapContactEdges (the edge stretch, the low-edge bias of Y) and Calibration::validate, re-written in
     TouchMatrix.h (calibratedCentroid, mapEdgeAxis, calibrationValid) and tooling/k27/gen-touch-calibration.py. Its domain search,
-    filters and multi-slot tracker are not used.
+    filters and multi-slot tracker are not used. Changed here (2026-11-11): the 3 x 3 window around the peak is widened on each axis
+    by one node toward the stronger neighbour when that node is this contact's tail (TouchMatrix.h centroidWindow), so a contact
+    between two electrodes keeps one position when its peak node flickers between them.
   src/calibration.cpp (sha256 604b50bbd0d20863bcdaffee842b0848a6d157fe87a908cc81443329ff283679), MIT: the calibration file's
     schema (schema 1, 40 x 60, 10 units per pixel, the field names, project_vendor_id, invert_y), checked by the generator.
   src/orientation.hpp (sha256 6f238f8d7dc479960406828bdec5a9889a656dafedcead7e2b3e0de538118212), MIT, its BOE case after
@@ -67,6 +69,16 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
     tooling/k27/kext/PianoTouch.json; the TLMM pin handling (eGPIO claim, the rising-edge latch with the GIC delivery off), the step
     and boot-argument layout. The tablet report's shape (absolute X/Y 0..32767 and buttons) is the source HID class's tablet mode
     (the same file); TouchHid.h's descriptor is written from the HID 1.11 specification and the Usage Tables.
+  package/PianoKeyboard/HidDescriptors.h (makeTouchpadDescriptor) and docs/drivers/keyboard.md §6a: the scroll resolution declared
+    through the Wheel's physical extents (Unit inch, Unit Exponent -3, the integer quotient IOHIDEventService takes) and fine counts
+    in place of a Resolution Multiplier, re-used in TouchHid.h makeTouchDescriptor; the scroll direction convention (fingers up =
+    wheel up, right = AC Pan right) and the axis lock rule (one axis at least twice the other).
+  package/include/PianoPowerContract.h: the two power states and pianopower::join (the contract of docs/power.md §4), included.
+  New for this package (2026-11-11), no outside source: TouchTrack.h (the multi-contact tracker, the hysteresis, the palm rejection),
+  TouchGesture.h (the gestures), TouchPower.h (suspend and the display off), TouchPace.h's no-edge reads and BurstHold, Nt36532.h's
+  probeState. Facts behind TouchPower.h: piano's Ubuntu (docs/ubuntu-history/device.md §2.10, kernel.md: the THP stream after
+  panel enable and stopped at disable, touch transfers stopped before the SPI bus suspends, an asynchronous restart, touch no wake
+  source).
 
 Facts only, no code (their licences do not allow reuse here):
   hackios-xnu-kernel-k90 (unixnu-research, k90-port 0e0f19bbba27da57c1845bc16d2415cd38046cab)
