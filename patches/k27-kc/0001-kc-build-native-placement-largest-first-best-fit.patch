@@ -1,0 +1,120 @@
+KC builder (k27 tree scripts/kc-build.py): native kext placement largest first, best fit (KC_NATIVE_PLACEMENT=best-fit)
+
+UniXNU-piano patches/k27-kc/0001, applied to the local k27 tree by hand (patches/k27-kc/README.md); docs/kc-space.md has the
+measurements. With KC_NATIVE_PLACEMENT unset the builder places as before (first fit in link order) and its output is byte for
+byte the same. KC_NATIVE_PLACEMENT=best-fit sizes every native kext's four segments with a dry link first, then places each
+kind's segments largest first, each into the smallest gap that holds it. Either way the log ends the link with one "native
+placement" line per segment kind (the headroom left), and a refusal names the kext. tooling/kc/build-kc-k27.sh sets
+KC_NATIVE_PLACEMENT=best-fit.
+
+Measured (k27 0059 kernel, the 26A434 KC base): main's 21 kexts: __DATA's largest gap 63.9 -> 81.9 KiB, __TEXT_EXEC's 2931.8 ->
+3791.1 KiB, the rest unchanged; with Apple's USB host stack kept (PIANO_USBHOST_STACK=1) PianoTouch's 485.7 KiB __DATA_CONST,
+refused by first fit (largest gap 470.2 KiB), links.
+
+diff --git a/scripts/kc-build.py b/scripts/kc-build.py
+--- a/scripts/kc-build.py
++++ b/scripts/kc-build.py
+@@ -14,6 +14,7 @@
+ import argparse
+ import hmac
+ import json
++import os
+ import plistlib
+ import uuid
+ import struct
+@@ -284,8 +285,72 @@
+         regions = {'__TEXT': (0x4000, seg_end_of(kc, '__PRELINK_TEXT', old_off)), '__TEXT_EXEC': (seg_start_of(kc, '__TEXT_EXEC', old_off), kernel_exec),
+                    '__DATA_CONST': (new_off(kernel.segment('__LASTDATA_CONST')['va']) + kernel.segment('__LASTDATA_CONST')['size'], seg_end_of(kc, '__DATA_CONST', old_off)),
+                    '__DATA': (new_off(kernel.segment('__PRELINK_DATA')['va']), seg_end_of(kc, '__DATA', old_off))}
++
++        def gaps_of(segment, taken):
++            """The free (start, end) spans of SEGMENT's region outside TAKEN."""
++            low, high = regions[segment]
++            out, at = [], low
++            for start, end in sorted(taken) + [(high, high)]:
++                start, end = min(max(start, low), high), min(max(end, low), high)
++                if start > at:
++                    out.append((at, start))
++                at = max(at, end)
++            return out
++
++        def room(segment, taken):
++            free = [end - start for start, end in gaps_of(segment, taken)]
++            return f'largest gap {max(free, default=0):#x}, {sum(free):#x} free in {len(free)} gaps'
++
++        # KC_NATIVE_PLACEMENT=best-fit: each kind's native segments largest first, each into the smallest gap that holds it, instead of
++        # first fit in link order (the default, as before), so that the large segments get the large gaps before the small ones split
++        # them. The sizes come from a dry link that stops at its fourth allocation (kc_native.link allocates the four segments before
++        # it resolves anything).
++        placement = os.environ.get('KC_NATIVE_PLACEMENT', 'first-fit')
++        if placement not in ('best-fit', 'first-fit'):
++            raise SystemExit(f'KC_NATIVE_PLACEMENT={placement}: best-fit or first-fit')
++        plan = {}
++        if placement == 'best-fit':
++            class Sized(Exception):
++                pass
++
++            sizes = {}
++            for spec in natives:
++                got = sizes[id(spec)] = {}
++
++                def measure(segment, size, align, got=got):
++                    got[segment] = (size, align)
++                    if len(got) == len(kc_native.SEGMENT_ORDER):
++                        raise Sized()
++                    return NEW_BASE
++
++                try:
++                    kc_native.link(json.loads(Path(spec['objects']).read_text()), lambda name: None, measure, NATIVE_HEADER_RESERVE, 0xd0,
++                                   spec['start'], spec['stop'])
++                except Sized:
++                    pass
++                except kc_native.LinkError as problem:
++                    raise SystemExit(f'{spec["bundle"]}: {problem}')
++            taken = list(used)
++            for segment in kc_native.SEGMENT_ORDER:
++                for _, spec in sorted(enumerate(natives), key=lambda item: (-sizes[id(item[1])][segment][0], item[0])):
++                    size, align = sizes[id(spec)][segment]
++                    best = None
++                    for start, end in gaps_of(segment, taken):
++                        at = (start + align - 1) // align * align
++                        if at + size <= end and (best is None or end - at < best[0]):
++                            best = (end - at, at)
++                    if best is None:
++                        raise SystemExit(f'{spec["bundle"]}: no room for its {size:#x}-byte native {segment} ({room(segment, taken)})')
++                    plan[(id(spec), segment)] = (best[1], size)
++                    taken.append((best[1], best[1] + size))
+ 
+         def allocate(segment, size, align):
++            if (id(current), segment) in plan:
++                at, planned = plan[(id(current), segment)]
++                if size != planned:
++                    raise SystemExit(f'{current["bundle"]}: its {segment} is {size:#x} bytes, the dry link gave {planned:#x}')
++                used.append((at, at + size))
++                return NEW_BASE + at
+             low, high = regions[segment]
+             cursor = low
+             for start, end in sorted(used):
+@@ -295,12 +360,7 @@
+                     break
+                 cursor = (max(cursor, end) + align - 1) // align * align
+             if cursor + size > high:
+-                gaps, at = [], low
+-                for start, end in sorted(used) + [(high, high)]:
+-                    if start > at:
+-                        gaps.append(min(start, high) - at)
+-                    at = max(at, end)
+-                raise SystemExit(f'no room for a {size:#x}-byte native kext {segment} (largest gap {max(gaps, default=0):#x})')
++                raise SystemExit(f'{current["bundle"]}: no room for its {size:#x}-byte native {segment} ({room(segment, used)})')
+             used.append((cursor, cursor + size))
+             return NEW_BASE + cursor
+ 
+@@ -339,6 +399,8 @@
+                 '_PrelinkExecutableSize': len(segs['__TEXT']['data']), '_PrelinkKmodInfo': to_signed(data_va)})
+             print(f'{spec["bundle"]}: linked, header at {text_va:#x}, {len(linked["sites"])} pointers')
+             spec['_symbols'] = linked['symbols']
++        for segment in kc_native.SEGMENT_ORDER:   # the headroom this collection leaves (UniXNU-piano tooling/k27/kc-space.py has more)
++            print(f'native placement ({placement}) {segment}: {room(segment, used)}')
+         stand_in(kc, image, keep, stand_ins, kext_sites, kext_targets, shift, old_off)
+ 
+     # 4. Chains: every pointer of the collection is a format-8 chained rebase, encoded per page.

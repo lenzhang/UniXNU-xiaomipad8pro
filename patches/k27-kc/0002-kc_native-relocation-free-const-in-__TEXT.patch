@@ -1,0 +1,61 @@
+KC builder (k27 tree scripts/kc_native.py): relocation-free constant sections of a native kext in its __TEXT
+(KC_NATIVE_CONST_TO_TEXT=1)
+
+UniXNU-piano patches/k27-kc/0002, applied to the local k27 tree by hand (patches/k27-kc/README.md); docs/kc-space.md has the
+measurements. Off by default (byte for byte the same output). KC_NATIVE_CONST_TO_TEXT=1: an object's __DATA,__const or
+__DATA_CONST,__const section without relocations (an .incbin firmware image, a table of numbers) goes to the kext's __TEXT,__const
+instead of its __DATA_CONST,__const: it needs no chained fixup and stays read only.
+
+Measured (main's 21 kexts): the natives' __DATA_CONST 833.7 -> 111.6 KiB (PianoTouch's two panel images and PianoA830's four GPU
+images move to __TEXT), the collection's free __DATA_CONST 3190.5 -> 3912.6 KiB, its free __TEXT 4723.5 -> 4002.8 KiB.
+
+diff --git a/scripts/kc_native.py b/scripts/kc_native.py
+--- a/scripts/kc_native.py
++++ b/scripts/kc_native.py
+@@ -6,6 +6,7 @@
+ Handles the relocation kinds clang emits for kernel code: BRANCH26, PAGE21,
+ PAGEOFF12, GOT_LOAD_PAGE21/PAGEOFF12, ADDEND, UNSIGNED and AUTHENTICATED_POINTER.
+ """
++import os
+ import struct
+ 
+ UNSIGNED, SUBTRACTOR, BRANCH26, PAGE21, PAGEOFF12, GOT_PAGE21, GOT_PAGEOFF12, POINTER_TO_GOT, TLVP_PAGE21, TLVP_PAGEOFF12, ADDEND, AUTH = range(12)
+@@ -32,8 +33,20 @@
+     ('__DATA', '__common'): ('__DATA', '__common'),
+ }
+ SEGMENT_ORDER = ['__TEXT', '__TEXT_EXEC', '__DATA_CONST', '__DATA']
++# KC_NATIVE_CONST_TO_TEXT=1: constant data without relocations (a firmware image, a table of numbers) needs no chained fixup, so it
++# goes to the kext's __TEXT,__const (read only, as __DATA_CONST is after boot) instead of __DATA_CONST,__const, where a collection
++# keeps little room. Off by default (as before).
++CONST_TO_TEXT = os.environ.get('KC_NATIVE_CONST_TO_TEXT', '0') == '1'
+ 
+ 
++def kext_section(sect):
++    """(segment, section) of the kext that an object's section goes to."""
++    seg, name = PLACEMENT[(sect['segment'], sect['name'])]
++    if CONST_TO_TEXT and (seg, name) == ('__DATA_CONST', '__const') and not sect['nreloc']:
++        return '__TEXT', '__const'
++    return seg, name
++
++
+ class LinkError(Exception):
+     pass
+ 
+@@ -79,7 +92,7 @@
+     layout = {seg: [] for seg in SEGMENT_ORDER}               # segment -> [(section name, [(obj, section)])]
+     for obj in objs:
+         for sect in obj.placed():
+-            seg, name = PLACEMENT[(sect['segment'], sect['name'])]
++            seg, name = kext_section(sect)
+             entries = layout[seg]
+             slot = next((e for e in entries if e[0] == name), None)
+             if slot is None:
+@@ -175,7 +188,7 @@
+     sites = []
+     for obj in objs:
+         for sect in obj.placed():
+-            seg, name = PLACEMENT[(sect['segment'], sect['name'])]
++            seg, name = kext_section(sect)
+             info = segments[seg]
+             base = placement[(id(obj), sect['index'])]
+             buf, origin = info['data'], base - info['va']

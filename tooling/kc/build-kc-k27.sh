@@ -10,7 +10,12 @@
 #              layout are read, nothing is written there
 #   NATIVE     the native kext JSONs linked into the KC (required; the native set is configs/k27-native-kexts.txt)
 #   KC_BASE    the Apple 27.0.1 (26A434) vma2 kernelcache the KC is built from (default $PIANO_K27_TREE/out/kc/kc27.bin)
-# Output: OUTPUT.bin, OUTPUT.natives.json, OUTPUT.log, OUTPUT.nm (llvm-nm -n of KERNEL), OUTPUT.sha256.
+#   KC_NATIVE_PLACEMENT  best-fit (the default here): the native kexts' segments largest first into the smallest gaps that hold
+#              them, with patches/k27-kc/0001 applied to the tree's builder (without it: first fit in link order, and a note);
+#              first-fit: as the unpatched builder. KC_NATIVE_CONST_TO_TEXT=1 (patches/k27-kc/0002): relocation-free constant
+#              data of a native kext in its __TEXT instead of __DATA_CONST. docs/kc-space.md.
+# Output: OUTPUT.bin, OUTPUT.natives.json, OUTPUT.log, OUTPUT.nm (llvm-nm -n of KERNEL), OUTPUT.sha256; the headroom left per
+# segment kind (tooling/k27/kc-space.py --brief) on stdout.
 # No password, no ssh: copying the KC anywhere is the caller's business.
 set -euo pipefail
 PIANO_REPO=$(cd "$(dirname "$0")/../.." && pwd)   # before any cd
@@ -32,10 +37,14 @@ DI="com.apple.driver.DiskImages com.apple.driver.DiskImages.FileBackingStore com
 python3 "$PIANO_REPO/tooling/k27/check-native-kexts.py" --self-test >&2 || exit 2
 # shellcheck disable=SC2086
 python3 "$PIANO_REPO/tooling/k27/check-native-kexts.py" "$PIANO_REPO" $NATIVE >&2 || exit 2
+export KC_NATIVE_PLACEMENT=${KC_NATIVE_PLACEMENT:-best-fit}
 # shellcheck disable=SC2046,SC2086
 python3 k27/kc-build27-piano.py "$KC_BASE" "$KERNEL" "$OUT" --keep $(cat configs/kc-keep.txt) $DI --native $NATIVE > "${OUT%.bin}.log" 2>&1 \
   || { tail -20 "${OUT%.bin}.log"; exit 1; }
 grep -E "problem|wrote" "${OUT%.bin}.log" | cut -c1-120
+grep -q "^native placement ($KC_NATIVE_PLACEMENT)" "${OUT%.bin}.log" \
+  || echo "note: the k27 tree's KC builder lacks patches/k27-kc/0001: native kexts placed first fit in link order (patches/k27-kc/README.md)"
+python3 "$PIANO_REPO/tooling/k27/kc-space.py" "$OUT" --brief || true
 python3 "$PIANO_REPO/tooling/k27/check-native-kexts.py" "$PIANO_REPO" --kc-log "${OUT%.bin}.log" || { rm -f "$OUT"; exit 2; }
 "$NM" -n "$KERNEL" > "${OUT%.bin}.nm"
 shasum -a 256 "$KERNEL" "$OUT" | tee "${OUT%.bin}.sha256"

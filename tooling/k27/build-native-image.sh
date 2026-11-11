@@ -10,12 +10,15 @@ LIST=$(sed -e 's/#.*//' "${PIANO_KEXT_LIST:-configs/k27-native-kexts.txt}" | awk
 # IOUSBHostFamily, the hub, HID, mass storage and USB Ethernet; AppleUSBXHCI's personality on PianoUsbHostNub; the stack's IOResources
 # personalities behind the gate resource PianoUsbHostStack, which only piano-usbhost=6 publishes), ARMPlatformStandIn with
 # AppleARMPlatform's cable keys. The stack's kexts keep their collection addresses, which leaves no __DATA_CONST gap for PianoTouch
-# (485 KiB) after PianoA830 (it links first: PianoTouch imports its lock word), so PIANO_USBHOST_STACK_DROP (default PianoTouch: inert
-# without piano-touch=N) is left out. Checked after the link: tooling/k27/check-usbhost-stack.py.
+# (485 KiB) after PianoA830 (it links first: PianoTouch imports its lock word) with first-fit placement, so PIANO_USBHOST_STACK_DROP
+# (default PianoTouch: inert without piano-touch=N) is left out; with patches/k27-kc/0001 in the k27 tree's KC builder (best-fit
+# placement, docs/kc-space.md) it fits, and the default is to drop nothing. Checked after the link: tooling/k27/check-usbhost-stack.py.
 if [ "${PIANO_USBHOST_STACK:-0}" = 1 ]; then
   export PIANO_USBHOST_STACK
+  DROP_DEFAULT=PianoTouch
+  if grep -q KC_NATIVE_PLACEMENT "$K/scripts/kc-build.py" && [ "${KC_NATIVE_PLACEMENT:-best-fit}" = best-fit ]; then DROP_DEFAULT=; fi
   KEPT=
-  for k in $LIST; do case " ${PIANO_USBHOST_STACK_DROP-PianoTouch} " in *" $k "*) echo "PIANO_USBHOST_STACK=1: $k left out" >&2 ;; *) KEPT="$KEPT $k" ;; esac; done
+  for k in $LIST; do case " ${PIANO_USBHOST_STACK_DROP-$DROP_DEFAULT} " in *" $k "*) echo "PIANO_USBHOST_STACK=1: $k left out" >&2 ;; *) KEPT="$KEPT $k" ;; esac; done
   LIST="$KEPT PianoUsbHostStandIn PianoUsbHostStack"
 fi
 for k in $LIST; do   # the kexts' objects: tooling/k27/build-native-<name>.sh
