@@ -172,6 +172,7 @@ struct Chip {
   uint32_t payload = kDefaultPayload, payloadReported = 0;
   uint8_t fwVersion = 0, xNum = 0, yNum = 0, calibrated = 0;
   bool fwInfoValid = false;
+  int baselineRc = 1, modeRc = 1;   // 1: not sent; else the host command's result
 };
 
 inline void sleepMs(Chip &c, unsigned ms) { if (c.bus.sleepMs && ms) c.bus.sleepMs(c.bus.ctx, ms); }
@@ -369,8 +370,10 @@ inline int hostCommand(Chip &c, uint8_t cmd, uint16_t value)
   return kErrTimeout;
 }
 
-// After the download: the payload length, the firmware info, the calibration wait (reset state 0xa3; not fatal), then the idle
-// baseline update (baseline) and the operating mode (mode <= 0xffff; > 0xffff: not sent). kOk, or the first bus/command error.
+// After the download: the payload length, the firmware info, the calibration wait (reset state 0xa3), then the idle baseline
+// update (baseline) and the operating mode (mode <= 0xffff; > 0xffff: not sent). Neither the calibration nor a command that is
+// not taken stops it (Project-SunUEFI, the sequence that ran on piano, sends no baseline command): their results are in c.
+// kOk, or the first bus error.
 inline int start(Chip &c, bool baseline, uint32_t mode)
 {
   uint8_t b[40] = {};
@@ -392,10 +395,9 @@ inline int start(Chip &c, bool baseline, uint32_t mode)
     if (c.resetState >= kResetStateCalibrated && c.resetState <= kResetStateMax) { c.calibrated = 1; break; }
     sleepMs(c, 10);
   }
-  if (baseline)
-    if (int r = hostCommand(c, kCmdIdleBaseline, 0)) return r;
-  if (mode <= 0xffff)
-    if (int r = hostCommand(c, kCmdOpMode, uint16_t(mode))) return r;
+  c.baselineRc = c.modeRc = 1;
+  if (baseline && (c.baselineRc = hostCommand(c, kCmdIdleBaseline, 0)) == kErrBus) return kErrBus;
+  if (mode <= 0xffff && (c.modeRc = hostCommand(c, kCmdOpMode, uint16_t(mode))) == kErrBus) return kErrBus;
   return kOk;
 }
 

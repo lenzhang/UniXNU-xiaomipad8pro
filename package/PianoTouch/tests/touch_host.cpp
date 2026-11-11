@@ -35,7 +35,7 @@ struct ChipModel {
   unsigned answerTable = 0;                     // the hw-register table whose reset makes the trim ID readable
   uint8_t id[6] = {0x0e, 0x01, 0x02, 0x32, 0x65, 0x03};
   uint8_t enbCasc = 0x00;                       // bit 0 clear: cascade
-  bool crcOn = false;
+  bool crcOn = false, takeCommands = true;
   int autoCopyLeft = 0, resetReads = 0;
   uint32_t payload = 5192;
   uint16_t counter = 0;
@@ -94,7 +94,7 @@ struct ChipModel {
     if (a == eventBuf() + kEvHostCmd && v == 0xae) crcOn = true;
     if (a == eventBuf() + kEvHostCmd && v == 0xbf && n >= 5) {
       hostCmds.push_back({in[2], uint16_t(in[4] | in[5] << 8)});
-      mem[eventBuf() + kEvHostCmd] = 0;   // taken
+      if (takeCommands) mem[eventBuf() + kEvHostCmd] = 0;   // taken
     }
     if (a == kBootRdy && v == 1) boot();
   }
@@ -283,7 +283,7 @@ bool bringUp(Rig &r, const std::vector<uint8_t> &fw, const char *what)
                       r.m.bootChecks, r.m.bootFails);
   CHECK(rc == kOk && r.m.st == ChipModel::St::running && r.c.resetState >= 0xa0);
   CHECK(r.c.attempt == 1 && r.m.bootFails == 0);
-  CHECK(start(r.c, true, 2) == kOk);
+  CHECK(start(r.c, true, 2) == kOk && r.c.baselineRc == kOk && r.c.modeRc == kOk);
   CHECK(r.c.payload == 5192 && r.c.payloadReported == 5192 && r.c.fwInfoValid && r.c.fwVersion == 0x21 && r.c.calibrated);
   CHECK(r.m.hostCmds.size() == 2 && r.m.hostCmds[0].first == kCmdIdleBaseline && r.m.hostCmds[1].first == kCmdOpMode &&
         r.m.hostCmds[1].second == 2);
@@ -311,6 +311,17 @@ void testBringUpBytes()
       r.m.produce(3, [](uint32_t, uint32_t) { return 0; }, false, 0xfd);
       CHECK(readFrame(r.c, f.data()) == kOk && frameKind(f.data()) == FrameKind::watchdog);
     }
+  // Commands never taken: start still completes, the results say so (5 tries each).
+  {
+    Rig r(false);
+    r.m.takeCommands = false;
+    const std::vector<uint8_t> fw = syntheticImage(false, 9);
+    Image im;
+    parseImage(fw.data(), uint32_t(fw.size()), im);
+    CHECK(identify(r.c) == kOk && download(r.c, im, fw.data(), uint32_t(fw.size())) == kOk);
+    CHECK(start(r.c, true, 2) == kOk && r.c.baselineRc == kErrTimeout && r.c.modeRc == kErrTimeout && r.m.hostCmds.size() == 10);
+    CHECK(start(r.c, false, 0x10000) == kOk && r.c.baselineRc == 1 && r.c.modeRc == 1);
+  }
   // No controller: the trim never matches.
   {
     Rig r(false);
@@ -471,6 +482,7 @@ void testClock()
   CHECK(se2Clock([&](uint32_t off) { return g.count(off) ? g[off] : 0u; }).seHz == 9600000);
   CHECK(geniDivider(19200000, 9600000) == 2 && geniDivider(19200000, 19200000) == 1 && geniDivider(100000000, 9600000) == 11);
   CHECK(geniDivider(0, 9600000) == 0 && geniDivider(19200000000u / 10, 1) == 0);
+  CHECK(branchOn(0x00000001) && branchOn(0x80000002) && !branchOn(0x80000001) && branchOn(0));
   CHECK(kVoteBits == 0x013c0000u && kGpio[kMiso] == 40 && kGpio[kCs] == 43 && kGpio[kIrq] == 162 && kGpio[kLcdId] == 100);
 }
 

@@ -64,7 +64,7 @@ by tap in the piano VM), matched by a codeless `IOHIDEventDriver` personality; t
 | `piano-touch-stop=N` | 0 | stop before step N (2: survey only; 4: bus up and self-tested, controller untouched) |
 | `piano-touch-bus=N` | 0 | 0 GENI, else SPI by hand; 1 GENI only; 2 SPI by hand only (no SMMU access then) |
 | `piano-touch-khz=K` | 9600 | GENI SPI rate, 1000..19200 |
-| `piano-touch-seirq=N` | 0 | engine interrupt outputs while polled: 0 off, on if the DMA loopback times out; 1 off; 2 on (13T) |
+| `piano-touch-seirq=N` | 2 | engine interrupt outputs while polled: 2 on (13T and K90 keep them on, their status bits follow them; ArmCpu keeps unused SPIs disabled at the GIC); 1 off; 0 off, then on if the DMA loopback times out |
 | `piano-touch-smmu=0` | 1 | do not write the SMMU (read only) |
 | `piano-touch-loopback=0` | 1 | skip the engine's loopback self-test |
 | `piano-touch-mode=V` | 2 | operating-mode command value (65536: not sent) |
@@ -98,12 +98,13 @@ During the run, once the login window shows: tap ~1 cm in from the top-left, top
 drag left to right. Level 2: the same build with `piano-touch=2`; tap the user icon, drag; do not tap Sleep/Restart/Shut Down.
 
 Level 1, expected in order: `start: piano-touch=1 ...`; `step 1` with six `pins:` lines, `gcc: vote 0x52008 = ...`,
-`gcc: SE2 clock: ...`, `se2: FW_REVISION ... (protocol 1: SPI) IF_DISABLE 00000001 (FIFO disabled: SE DMA)` (or `registers not
+`gcc: SE2 clock: ...` (a hardware-gated AHB branch reads `hw-gated`, which counts as running), `se2: FW_REVISION ... (protocol 1: SPI) IF_DISABLE 00000001 (FIFO disabled: SE DMA)` (or `registers not
 read (a QUP1/SE2 clock is off)`), two `firmware CSOT|BOE: 245760 bytes ... parsed`; `step 2`, `smmu: ... bypass set`; `step 3`,
-`geni: votes ... branches on`, `geni: SE2 clock N Hz ... divider ...`, `geni: SE DMA through ...`, `geni: init ...: 0`,
+`geni: votes ... (set under the lock | already set) ... branches on`, `geni: SE2 clock N Hz ... divider ...`, `geni: SE DMA through ...`,
+`geni: init (SE DMA, engine interrupt outputs on): 0; ... DELAY 00000000`,
 `geni: loopback PASSED`, `geni: pins qup1_se2`; `step 4`, `identify (GENI): NT36532 ... id 0e .. .. 32 65 03, table 0 (E),
 cascade, event buffer 0x11c400`; `step 5`, `firmware: lcd-id gpio100 = 1: BOE panel`, `firmware: download 1 done ... reset state
-0xa0..0xaf`; `step 6`, `start: scanning ...; payload 5192 ...; ... calibrated ...`; `step 7`, `frames: first gpio162 edge`, three
+0xa0..0xaf`; `step 6`, `start: scanning ...; payload 5192 ...; ... calibrated ...; baseline command taken, mode 2 taken`; `step 7`, `frames: first gpio162 edge`, three
 `frame N ... checksum ok` lines, `matrix: reference of 32 frames ...`, `frames at 5 s: ~120 reads/s, ~120 edges/s ...` every 5 s
 for 30 s then every 60 s, and per touch `touch N down at (x, y) px` / `touch N up ... after T ms`. Pass: checksum ok >= 99 %,
 corners about 125 px (1 cm) in from each edge: near (125, 125), (3075, 125), (125, 2010), (3075, 2010) px, Y growing downward
@@ -117,17 +118,18 @@ corners about 125 px (1 cm) in from each edge: near (125, 125), (3075, 125), (12
 | `geni: ... branches NOT all on` | the 0x52008 bits do not start the SE2 clocks (inferred bit/branch wrong): fallback |
 | `geni: the SE2 clock rate is unknown` | RCG source not decoded (raw values in the line before): fallback |
 | `geni: the engine holds no SPI firmware` / `a command is running` | SE2 not usable as SPI here: fallback |
-| `geni: loopback FAILED (rc -110 ...) ... moved 0/0`, then a retry | DMA status never latched with the outputs off; the retry turns them on (13T). Both fail: SE DMA does not run on SE2 (GPI DMA is the next step) |
+| `geni: loopback FAILED (rc -110 ...) ... moved 0/0` | the DMA never completed: SE DMA does not run on SE2 this way (try `piano-touch-seirq=0`/`1` once; else GPI DMA is the next step); fallback |
 | `geni: loopback FAILED (rc 0 ...): k/64 bytes back` | bytes move but wrong: packing or cache maintenance |
 | `bus: GENI not usable: SPI by hand ...` | the fallback ran: steps 4-6 still answer the controller questions; frames then ~10/s, checksums break while touching |
 | `identify (GENI): NO NT36532 ... id ff ff ...` (or `00 ...`) then `identify (by hand)` | the engine does not reach the controller (pins, rate, CS) |
 | `FAILED at step 4: identify ...` | no answer by hand either: controller unpowered or not on these pins |
 | `firmware: lcd-id gpio100 = 0: CSOT` | unexpected for this unit: check the pin before trusting the image choice |
 | `firmware: download N FAILED: attempt 3, stage S (rc R)` | stage 1/2/4 with rc -5: transfers fail; 5: auto copy never ends; 8: reset state never 0xa0..0xaf (CRC mismatch, data corrupted: try `piano-touch-khz=4800`) |
-| `start: FAILED (rc -110)` | a host command was never taken: the firmware is not running properly |
+| `baseline command NOT taken` / `mode 2 NOT taken (continuing)` | the firmware did not clear the command byte; frames may still come (SunUEFI sends no baseline command): look at the frame lines |
+| `geni: transfer N: the engine is still busy` | a command still running 2 ms after the previous DMA completed: the engine hangs |
 | no `first gpio162 edge`, ~5 reads/s, 0 edges/s | GPIO162 does not latch; frames are polled every 200 ms, torn |
 | many `checksum BAD` | reads not synced to the edge, or slower than a frame: `piano-touch-khz=19200` |
-| `N watchdog frames in a row` | controller firmware crashed: the driver downloads again (at most 3 times) |
+| `N watchdog frames in a row`, `watchdog (state S): the download again` | controller firmware crashed: idled first when S is 0xfe (swrst <- 0xaa), then downloaded again (at most 3 times) |
 | `FAILED at step 7: frames: 50 frame reads in a row failed` | the transport died mid-run |
 | level 2 without `event service ... published` | IOHIDEventDriver did not attach (personality/IDs) |
 

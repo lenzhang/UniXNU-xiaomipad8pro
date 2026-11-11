@@ -28,6 +28,9 @@ struct Branch {
 };
 constexpr Branch kBranches[5] = {{"wrap1 m-ahb", 0x23140}, {"wrap1 s-ahb", 0x23144}, {"wrap1 0x23148", 0x23148},
                                  {"wrap1 0x2315c", 0x2315c}, {"wrap1 s2", 0x1827c}};
+// A branch runs when its CLK_OFF bit is clear, or when it is hardware-gated (HW_CTL, bit 1: CLK_OFF then reads 1 while the bus
+// idles), as the 13T's QUP1 code polls these same registers.
+inline bool branchOn(uint32_t cbcr) { return (cbcr & 2) || !(cbcr & kClockOff); }
 // The pins, in the engine's order.
 enum PinIndex : unsigned { kMiso, kMosi, kClk, kCs, kIrq, kLcdId, kPins };
 constexpr unsigned kGpio[kPins] = {40, 41, 42, 43, 162, 100};

@@ -27,8 +27,9 @@
 //   piano-touch-stop=N       stop before step N (2: the read-only survey alone; 4: the bus up and tested, the controller untouched)
 //   piano-touch-bus=N        0 GENI, falling back to SPI by hand (default); 1 GENI only; 2 SPI by hand only
 //   piano-touch-khz=K        the GENI SPI rate (default 9600; 1000..19200, the DT's maximum)
-//   piano-touch-seirq=N      the engine's interrupt outputs while polled: 0 off, then on if DMA status never comes (default);
-//                            1 always off; 2 always on (as the 13T's SE DMA code; only the GIC's mask keeps them from the CPU)
+//   piano-touch-seirq=N      the engine's interrupt outputs while polled: 2 on (default: the 13T's SE DMA code and K90's driver on
+//                            this SE keep them on, their status bits follow them; ArmCpu leaves every unused SPI disabled at the
+//                            GIC); 1 off; 0 off, then on if the DMA loopback times out
 //   piano-touch-smmu=0       leave the SMMU alone (SE DMA then needs stream 0xa3 to bypass already)
 //   piano-touch-loopback=0   no loopback self-test of the engine
 //   piano-touch-mode=V       the operating-mode command's value (default 2; 65536: not sent)
@@ -95,7 +96,7 @@ void readArgs()
   gArgs.stop = bootArg("piano-touch-stop", 0);
   gArgs.bus = clampArg(bootArg("piano-touch-bus", 0), 0, 2);
   gArgs.khz = clampArg(bootArg("piano-touch-khz", 9600), 1000, 19200);
-  gArgs.seirq = clampArg(bootArg("piano-touch-seirq", 0), 0, 2);
+  gArgs.seirq = clampArg(bootArg("piano-touch-seirq", 2), 0, 2);
   gArgs.smmu = bootArg("piano-touch-smmu", 1);
   gArgs.loopback = bootArg("piano-touch-loopback", 1);
   gArgs.mode = bootArg("piano-touch-mode", 2);
@@ -129,6 +130,18 @@ const char *hex(const uint8_t *p, unsigned n, char *out, size_t size)
   out[0] = 0;
   for (unsigned i = 0; i < n && used + 3 < size; ++i) used += size_t(snprintf(out + used, size - used, "%s%02x", i ? " " : "", p[i]));
   return out;
+}
+
+// snprintf into line[used..], never past its end (used stays < size).
+void append(char *line, size_t size, size_t &used, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+void append(char *line, size_t size, size_t &used, const char *fmt, ...)
+{
+  if (used + 1 >= size) return;
+  va_list ap;
+  va_start(ap, fmt);
+  const int n = vsnprintf(line + used, size - used, fmt, ap);
+  va_end(ap);
+  if (n > 0) used = used + size_t(n) < size ? used + size_t(n) : size - 1;
 }
 
 uint64_t nowUs()
@@ -219,9 +232,9 @@ void dmaCleanInval(void *, void *p, size_t n) { dmaCache(p, n, 1); }
 void dmaInval(void *, void *p, size_t n) { dmaCache(p, n, 2); }
 
 // The engine's register callbacks. The delay: with SE DMA the first polls of a transfer spin (1 us), later ones sleep (1 ms), so a
-// frame read (2-5 ms) does not hold a CPU; poll_limit then bounds a transfer at about half a second. In FIFO mode every poll spins
-// (the FIFO is 64 bytes: the engine waits for each refill), bounded by kFifoPollLimit.
-constexpr unsigned kSpinPolls = 300, kPollLimit = kSpinPolls + 500, kFifoPollLimit = 400000;
+// frame read (2-5 ms) does not hold a CPU. In FIFO mode every poll spins (the FIFO is 64 bytes: the engine waits for each refill).
+// poll_limit is set per transfer from its length and the rate (PianoTouch::pollLimit): twice the time on the wire, plus a margin.
+constexpr unsigned kSpinPolls = 300;
 unsigned gDelayCalls;
 bool gDelaySleeps;
 uint32_t seRd(void *ctx, uint32_t reg) { return rd32(static_cast<Region *>(ctx)->va + reg); }
@@ -295,7 +308,9 @@ class PianoTouch : public IOService {
   uint64_t fReadUsSum = 0;
   uint32_t fReadUsMax = 0, fReadsSinceStats = 0, fEdgesSinceStats = 0;
   uint16_t fLastCounter = 0;
+  uint8_t fWdtState = 0;
   bool fHaveCounter = false, fEdgeSeen = false, fEdgePending = false;
+  uint32_t fRateKhz = 0;   // the SPI rate the GENI divider gives
 
   static void threadMain(void *self, wait_result_t);
   static bool eventServicePublished(void *target, void *refCon, IOService *service, IONotifier *notifier);
@@ -309,6 +324,8 @@ class PianoTouch : public IOService {
   bool geniUp();
   bool geniClocks();
   bool geniLoopback();
+  bool engineIdle();
+  unsigned pollLimit(uint32_t len) const;
   bool gpioUp();
   void pinsToGpio();
   bool identify();
@@ -419,8 +436,8 @@ void PianoTouch::survey()
     bool on = true;
     for (const Branch &b : kBranches) {
       const uint32_t v = gcc(b.cbcr);
-      on = on && !(v & kClockOff);
-      used += size_t(snprintf(line + used, sizeof line - used, "%s%s %08x (%s)", used ? ", " : "", b.name, v, v & kClockOff ? "off" : "on"));
+      on = on && branchOn(v);
+      append(line, sizeof line, used, "%s%s %08x (%s)", used ? ", " : "", b.name, v, !branchOn(v) ? "off" : v & 2 ? "hw-gated" : "on");
     }
     const uint32_t vote = gcc(kGccVote);
     note("gcc: vote %#x = %08x (wanted bits %08x %s); %s", kGccVote, vote, kVoteBits, (vote & kVoteBits) == kVoteBits ? "set" : "NOT all set",
@@ -510,8 +527,15 @@ int PianoTouch::busXfer(void *self, const uint8_t *tx, uint8_t *rx, uint32_t len
   ++t->fXfers;
   int rc = 0;
   if (t->fBus == BusKind::geni) {
+    // With SE DMA the transfer returns on DMA done, the engine's command can still be shifting out: the next one waits for it.
+    if (!t->engineIdle()) {
+      if (++t->fXferErrors <= 10 || t->fXferErrors % 100 == 0)
+        note("geni: transfer %u: the engine is still busy (STATUS %08x, %u errors)", t->fXfers, seRd(&gSe, SE_GENI_STATUS), t->fXferErrors);
+      return -16;
+    }
     gDelayCalls = 0;
     t->fSpi.snap_valid = 0;
+    t->fSpi.poll_limit = t->pollLimit(len);
     rc = geni_spi_transfer(&t->fSpi, tx, rx, len, 0);
     if (rc && (++t->fXferErrors <= 10 || t->fXferErrors % 100 == 0))
       note("geni: transfer %u (%u bytes) %d (%u errors); M_IRQ %08x STATUS %08x DMA tx %08x rx %08x, moved %u/%u", t->fXfers, len, rc,
@@ -529,6 +553,24 @@ int PianoTouch::busXfer(void *self, const uint8_t *tx, uint8_t *rx, uint32_t len
 }
 
 // ------------------------------------------------------------------------------------------------------------- step 3
+// The engine has no command running (M_ACTIVE clear), within 2 ms.
+bool PianoTouch::engineIdle()
+{
+  for (unsigned n = 0; n < 2000; ++n) {
+    if (!(seRd(&gSe, SE_GENI_STATUS) & GENI_STATUS_M_ACTIVE)) return true;
+    IODelay(1);
+  }
+  return false;
+}
+
+// Polls for a transfer of len bytes: twice its time on the wire (in ms with SE DMA, where polls past the first kSpinPolls sleep
+// 1 ms; in us in FIFO mode, where every poll spins about 1 us), plus a margin.
+unsigned PianoTouch::pollLimit(uint32_t len) const
+{
+  const uint64_t wireUs = uint64_t(len) * 8 * 1000 / (fRateKhz ? fRateKhz : 1000);
+  return fSpi.use_dma ? unsigned(kSpinPolls + 100 + 2 * wireUs / 1000) : unsigned(100000 + 2 * wireUs);
+}
+
 bool PianoTouch::busUp()
 {
   if (gArgs.bus != 2) {
@@ -544,16 +586,12 @@ bool PianoTouch::busUp()
 
 bool PianoTouch::geniClocks()
 {
-  bool on = true;
-  for (const Branch &b : kBranches) on = on && !(gcc(b.cbcr) & kClockOff);
-  if (on) {
-    note("geni: QUP1/SE2 clocks already on");
-    return true;
-  }
-  // The votes, under PianoA830's lock word (a holder that keeps it for 50 ms does not stop us: the update goes ahead, counted).
+  // Our votes even when the clocks already run (on someone else's vote they could stop later and stall the next SE2 access), under
+  // PianoA830's lock word (a holder that keeps it for 50 ms does not stop us: the update goes ahead). Bits are only ever set.
   uint32_t waits = 0;
+  const bool needed = (gcc(kGccVote) & kVoteBits) != kVoteBits;
   bool locked = false;
-  for (; waits < 5000 && !locked; ++waits) {
+  for (; needed && waits < 5000 && !locked; ++waits) {
     uint32_t expected = 0;
     locked = __atomic_compare_exchange_n(&sm8750_gcc_vote_owner, &expected, kGccVoteTag, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
     if (!locked) IODelay(10);
@@ -564,25 +602,25 @@ bool PianoTouch::geniClocks()
     dsb();
   }
   const uint32_t after = gcc(kGccVote);
-  if (locked) {
+  if (needed && locked) {
     uint32_t expected = kGccVoteTag;
     __atomic_compare_exchange_n(&sm8750_gcc_vote_owner, &expected, 0u, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
   }
   char line[200];
   size_t used = 0;
-  on = true;
+  bool on = true;
   for (const Branch &b : kBranches) {
     uint32_t v = 0;
     for (unsigned n = 0; n < 200; ++n) {
       v = gcc(b.cbcr);
-      if (!(v & kClockOff)) break;
+      if (branchOn(v)) break;
       IODelay(10);
     }
-    on = on && !(v & kClockOff);
-    used += size_t(snprintf(line + used, sizeof line - used, "%s%s %08x", used ? ", " : "", b.name, v));
+    on = on && branchOn(v);
+    append(line, sizeof line, used, "%s%s %08x", used ? ", " : "", b.name, v);
   }
-  note("geni: votes %08x -> %08x (%s, %u lock waits); branches %s: %s", before, after, locked ? "locked" : "lock held elsewhere: written anyway",
-       waits, on ? "on" : "NOT all on", line);
+  note("geni: votes %08x -> %08x (%s, %u lock waits); branches %s: %s", before, after,
+       !needed ? "already set" : locked ? "set under the lock" : "lock held elsewhere: written anyway", waits, on ? "on" : "NOT all on", line);
   return on;
 }
 
@@ -598,6 +636,7 @@ bool PianoTouch::geniLoopback()
   geni_spi_setup(&fSpi, GENI_SPI_LOOP, 0);
   gDelayCalls = 0;
   fSpi.snap_valid = 0;
+  fSpi.poll_limit = pollLimit(sizeof tx);
   const uint64_t t0 = nowUs();
   const int rc = geni_spi_transfer(&fSpi, tx, rx, sizeof tx, 0);
   const uint64_t us = nowUs() - t0;
@@ -673,16 +712,23 @@ bool PianoTouch::geniUp()
     fSpi.dma = {nullptr, dmaClean, dmaCleanInval, dmaInval, va, va + kHalf, pa, pa + kHalf, kHalf};
     note("geni: SE DMA through %#llx (+%#x TX, +%#x RX)", (unsigned long long)pa, 0u, kHalf);
   }
-  fSpi.poll_limit = fSpi.use_dma ? kPollLimit : kFifoPollLimit;
   gDelaySleeps = fSpi.use_dma;
+  fRateKhz = (c.seHz / div) / 1000;
   for (unsigned pass = 0; pass < 2; ++pass) {
     const bool irqOn = gArgs.seirq == 2 || (gArgs.seirq == 0 && pass == 1);
     fSpi.poll_only = irqOn ? 2 : 1;
+    if (pass && !engineIdle()) {
+      note("geni: the engine stays busy after the failed loopback (STATUS %08x): not retried", seRd(&gSe, SE_GENI_STATUS));
+      return false;
+    }
     int rc = geni_spi_init(&fSpi);
     if (!rc) rc = geni_spi_setup(&fSpi, 0, 0);
     if (!rc) rc = geni_spi_set_clock(&fSpi, want, c.seHz, 0);
-    note("geni: init (%s, engine interrupt outputs %s): %d; M_CLK_CFG %08x DMA_MODE %08x SE_IRQ_EN %08x", fSpi.use_dma ? "SE DMA" : "FIFO",
-         irqOn ? "on" : "off", rc, seRd(&gSe, GENI_SER_M_CLK_CFG), seRd(&gSe, SE_GENI_DMA_MODE_EN), seRd(&gSe, SE_IRQ_EN));
+    // No chip-select or inter-word delays (K90's driver on this SE writes 0; what the boot chain left would slow every byte).
+    if (!rc) seWr(&gSe, 0x278, 0);
+    note("geni: init (%s, engine interrupt outputs %s): %d; M_CLK_CFG %08x DMA_MODE %08x SE_IRQ_EN %08x DELAY %08x",
+         fSpi.use_dma ? "SE DMA" : "FIFO", irqOn ? "on" : "off", rc, seRd(&gSe, GENI_SER_M_CLK_CFG), seRd(&gSe, SE_GENI_DMA_MODE_EN),
+         seRd(&gSe, SE_IRQ_EN), seRd(&gSe, 0x278));
     if (rc) return false;
     if (!gArgs.loopback) break;
     if (geniLoopback()) break;
@@ -783,16 +829,18 @@ bool PianoTouch::firmware()
   return true;
 }
 
+static const char *command(int rc) { return rc == 1 ? "not sent" : rc == 0 ? "taken" : "NOT taken (continuing)"; }
+
 bool PianoTouch::startScanning()
 {
   const int rc = pianotouch::start(fChip, gArgs.baseline != 0, gArgs.mode);
   note("start: %s (rc %d); payload %u bytes (reported %u), frame %u bytes; firmware info version %#x %s, x %u y %u; reset state %#04x "
-       "(%s after %u polls); baseline %s, mode %u%s",
+       "(%s after %u polls); baseline command %s, mode %u %s",
        rc ? "FAILED" : "scanning", rc, fChip.payload, fChip.payloadReported, frameBytes(fChip), fChip.fwVersion,
        fChip.fwInfoValid ? "(valid)" : "(NOT valid)", fChip.xNum, fChip.yNum, fChip.resetState, fChip.calibrated ? "calibrated" : "NOT calibrated",
-       fChip.polls, gArgs.baseline ? "sent" : "not sent", gArgs.mode, gArgs.mode > 0xffff ? " (not sent)" : " sent");
+       fChip.polls, command(fChip.baselineRc), gArgs.mode, command(fChip.modeRc));
   if (rc) {
-    stage(-6, "start: a host command was not taken");
+    stage(-6, "start: the bus failed during the start sequence");
     return false;
   }
   return true;
@@ -911,7 +959,8 @@ void PianoTouch::frame(uint32_t readUs)
   }
   if (kind == FrameKind::watchdog) {
     ++fWdt;
-    if (++fWdtRun == 11) note("frames: %u watchdog frames in a row (state %#04x)", fWdtRun, fFrame[1]);
+    fWdtState = fFrame[1];
+    if (++fWdtRun == 11) note("frames: %u watchdog frames in a row (state %#04x)", fWdtRun, fWdtState);
     return;
   }
   fWdtRun = 0;
@@ -956,8 +1005,7 @@ void PianoTouch::stats(uint64_t now)
   char types[96];
   size_t used = 0;
   types[0] = 0;
-  for (unsigned k = 0; k < 8 && fTypeCount[k]; ++k)
-    used += size_t(snprintf(types + used, sizeof types - used, "%s%u:%u", used ? " " : "", fTypes[k], fTypeCount[k]));
+  for (unsigned k = 0; k < 8 && fTypeCount[k]; ++k) append(types, sizeof types, used, "%s%u:%u", used ? " " : "", fTypes[k], fTypeCount[k]);
   note("frames at %llu s: %llu reads/s, %llu edges/s; edges %u, reads %u (data %u: checksum ok %u, bad %u, inconsistent %u; handshake %u, "
        "watchdog %u), read errors %u, counter gaps %u; types {%s}; read %llu us avg, %u max; matrix %s, decoded %u, peak %d; touches %u",
        (unsigned long long)((now - fStartMs) / 1000), (unsigned long long)(fReadsSinceStats * 1000ull / span),
@@ -1022,7 +1070,12 @@ void PianoTouch::serve()
           stage(-7, "frames: the controller's watchdog again after three re-downloads");
           return;
         }
-        note("frames: watchdog: the download again");
+        // As the vendor flow: a controller that reports 0xfe is idled first (swrst <- 0xaa, 15 ms), then the download again.
+        if (fWdtState == 0xfe) {
+          writeByte(fChip, kSwrst, 0xaa);
+          IOSleep(15);
+        }
+        note("frames: watchdog (state %#04x): the download again", fWdtState);
         fWdtRun = 0;
         if (!firmware() || !startScanning()) return;
         matrixReset(*fMatrix, mc);
