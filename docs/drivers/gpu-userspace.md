@@ -15,7 +15,7 @@ Natively it uses its NativeAdreno backend (open type 0x4147) on Adreno830's user
 | Piece | Natively | Source |
 |---|---|---|
 | `Contents/MacOS/NativeAdrenoMetal` (plugin + frontend + bridge) | the VM's plugin and bridge, its frontend with one patch, plus an abort reporter, linked here (CDHash `9c42e844…` since the evening of 2026-11-11; the login run had the VM's binary, `ea549d13…`). The objects are compiled without objc_msgSend selector stubs, which makes the link reproducible | macOS-DroidVM `overlay/metal`, UniXNU-turnip `drivers/AdrenoMetal` + `tooling/metal/turnip-a830/frontend/`, `tooling/metal/turnip-a830/abort_reporter.mm`, bridge `out/metal/bridge` |
-| `Contents/MacOS/libvulkan_freedreno.dylib` (Turnip) | rebuilt: the VM's Mesa tree, `NativeAdrenoABI.h` v2, 3 patches (CDHash `031df58a…`; `eaa367a2…` with 2 patches in the login run; cold builds byte-identical) | Droid-VM Mesa `cecc0e9` + 23 VM patches + `tooling/metal/turnip-a830/mesa/` |
+| `Contents/MacOS/libvulkan_freedreno.dylib` (Turnip) | rebuilt: the VM's Mesa tree, `NativeAdrenoABI.h` v2, 5 patches (CDHash `205e665f…` with 0004/0005; `031df58a…` with 3, `eaa367a2…` with 2 in the login run; cold builds byte-identical) | Droid-VM Mesa `cecc0e9` + 23 VM patches + `tooling/metal/turnip-a830/mesa/` |
 | `Contents/Info.plist` | the VM's (`org.droidvm.NativeAdrenoMetal`, principal class `NativeAdrenoMetalDevice`) | |
 
 The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
@@ -31,6 +31,16 @@ The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
   allocation reached any log. A lost device's reason is now written once per device and queue (`MESA: error: device lost
   (tu_knl_darwin.cc:<line>): <what> failed: 0x…`), and every failing kernel method the first time per method and status, then at the
   10th, 100th, … (`TU: error: NativeAdreno: kernel BoAlloc failed: 0x… (1 time)`). The answers the backend expects are left out.
+- `0004-turnip-darwin-max-bo-size-limits.patch`: the kernel refuses a BO or import past Query's `max_bo_bytes` (256 MiB) with
+  BadArgument, while Turnip advertised 4 GiB: an 8192x8192 RGBA8 texture reached the kernel and its client saw out-of-memory. Now
+  `maxMemoryAllocationSize`, `maxBufferSize` and images' `maxResourceSize` are capped at it, and a larger BO is refused before any
+  kernel call (`NativeAdreno: a BO of N MiB is past the kernel's per-object limit of 256 MiB (maxMemoryAllocationSize); refused (1
+  time)`). Metal follows: `MTLDevice.maxBufferLength` is 256 MiB (was 4095), a buffer of exactly that is made, one byte more and an
+  8192x8192 RGBA8 texture are refused by the frontend without a kernel call (`check-turnip-a830-host.py`, plugin_host section 5).
+- `0005-turnip-darwin-tu-debug-boot-arg.patch`: `piano-tu-debug=<flags>` on the boot line (read through `kern.bootargs`) stands in for
+  `TU_DEBUG` and wins over the seed's `tu-debug` file; `piano-tu-debug=none` means none at all (Turnip picks GMEM or sysmem per
+  render pass). WindowServer says which: `TU: info: TU_DEBUG=sysmem from /private/var/ngpu/debug/tu-debug` or `... from boot
+  argument piano-tu-debug`. The sysmem/GMEM A/B is two boot lines over one seed (below).
 
 The frontend patch (`tooling/metal/turnip-a830/frontend/0001-…patch`, applied after macOS-DroidVM's `piano-frontend-patch.py`): the
 stderr copy of its `NBLOG` lines is rate-limited per call site (8 lines, then the 16th, 32nd, … with the count); `no device answer`
@@ -367,7 +377,8 @@ Built (offline, 2026-11-11 evening): Turnip CDHash `031df58ae7cacc6ccb317155eb29
 store starts over at the first boot of the new image (the Data changes of earlier native boots are dropped; the account is in the seed).
 Checks: `check-turnip-a830-host.py` all PASS (17 runs), `run-a830-host-tests.py` upstream 43 and macOS 42 pass with the known
 exceptions as before, `macos_lists` and `macos_events` PASS, `check-a830-abi-host.py` PASS, the kext links (20 weak symbols coalesced,
-0 unresolved imports).
+0 unresolved imports). Since then Turnip 0004/0005 (§1): CDHash `205e665f594c6b33c13369cdee1fc4863ce00f68`, the plugin unchanged
+(`9c42e844…`); the next `build-native-image.sh` restages the seed (a new identity again).
 
 ### Tonight's run
 
@@ -411,8 +422,8 @@ Open risks:
 2. The wallpaper video costs CPU (software HEVC decode plus Core Animation's CPU conversion of formats 501/503) and held the login
    screen to ~10 frames a second; the same holds for the desktop if its wallpaper is a video: a still wallpaper (System Settings,
    Wallpaper) is the lever.
-3. Memory: the BO pool was 95 % used at the login screen; a desktop lives on the fallback pages, which no native run has used in
-   volume yet.
+3. Memory: the BO pool was 95 % used at the login screen; the pool is 1536 MiB now (an eighth of the RAM, gpu.md §8 "The BO
+   pool"), and what still does not fit lives on the fallback pages, which no native run has used in volume yet.
 4. Thermal: no cooling or charging control (PianoPower read-only); watch `row0`'s temperature, keep the session within the 20 min
    reset.
 5. No surface sync: WebKit canvases may show stale or half-drawn pixels.
@@ -420,3 +431,46 @@ Open risks:
    rate-limited).
 7. A new seed identity: the store of earlier boots is dropped, and every shader cache is cold on the first boot (first-use stalls per
    client).
+
+### A/B: sysmem against GMEM rendering
+
+The seed stages `tu-debug` = `sysmem` (`PIANO_A830_TU_DEBUG`'s default: no GMEM for the first bring-up). Turnip 0005 lets the boot
+line override it, so both images share one seed (one seed identity: a `data-persist=2` store survives the switch):
+
+```sh
+A="panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-power=1 exec-log=1 stderr-log=1 piano-gpu-hang-ms=10000"
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=1200 PIANO_EXTRA_ARGS="$A" tooling/k27/build-native-image.sh &&
+  rm -rf out/ram-sysmem && cp -R out/ram out/ram-sysmem
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=1200 PIANO_EXTRA_ARGS="$A piano-tu-debug=none" tooling/k27/build-native-image.sh &&
+  rm -rf out/ram-gmem && cp -R out/ram out/ram-gmem
+tooling/native/native-loop.sh out/ram-sysmem/boot-piano-macos-ram-A-bundled.img   # then out/ram-gmem/...
+```
+
+`piano-tu-debug=gmem` instead of `none` forces GMEM on every pass (a stress run once `none` is clean). First check that the mode took:
+WindowServer's `TU: info: TU_DEBUG=... from boot argument piano-tu-debug` (or `... (none: Turnip picks GMEM or sysmem per render
+pass)`); a sandboxed client that cannot read `kern.bootargs` falls back to the seed's file, i.e. sysmem, so only WindowServer's line
+is proof. What GMEM trouble looks like here: GMEM is the GPU address window at 64 MiB (`A830_GMEM_BASE`, 0x4000000..0x4c00000 for
+12 MiB; Query's `gmem_base`/`gmem_bytes`, which Turnip takes as they are), so a `gpu page fault at 0x04xxxxxx` names a GMEM address
+gone to the SMMU (a wrong base or size); a `gpu recovery` whose `hang snapshot 3/3` has a non-zero BR `prot` word (a protected
+register or range the pass touched; RB_GC_GMEM_PROTECT is 0x0C000000 after the secure exit) or BV's status words busy while BR waits
+(the binning pipe stuck) is a GMEM pass the hardware refused; `MESA: error: device lost` follows either. Without any of those: tile-shaped garbage or stale tiles in the thumbnails
+(`NativeGopDisplay: thumb frame N`: rectangles of a bin's size, typically 96 or 128 pixels, in otherwise sane rows) is a resolve or
+load/store-op bug; and the DCVS row's busy share should drop with GMEM on a desktop of overlapping layers, since sysmem renders
+every blend through DDR. Same order of checks as tonight's list; a GMEM failure is a reason to stay on sysmem,
+not to stop the session.
+
+### The VM's post-login hang, natively
+
+In the VM (virgl to the host's msm, 3200x2136, 2026-11-10/11), about one to two minutes after the login the GPU hung for real (the
+host's hangcheck fired with no ring progress, also at 10 s), WindowServer lost its device and the session went back to the login
+window; three of three runs at 3200x2136, none at 1600x1068. `TU_DEBUG=sysmem,nocb` did not change it; with the host's GPU
+diagnostics or metal2vulkan's pipeline log on it did not happen in the runs tried (timing-sensitive), and the root cause was never
+found. The login transition itself had multi-second single passes at 1.1 GHz, which a 2 s hangcheck called hangs: hence
+`piano-gpu-hang-ms=10000` here, where the DCVS runs at most 342 MHz. Natively the same hang shows as, in this order: the status
+row's `h` count rising, `PianoA830: gpu recovery: culprit slot N <proc>; jobs in flight fail: ...`, `gpu hang snapshot 1/3..3/3`
+(cause, the fences, RBBM status, RPTR/WPTR, BR's IB1/IB2, the pipes' status and protect words, the GPU bank's FSR/FAR),
+`gpu recovery done`, then in the culprit's process `MESA: error: device lost (tu_knl_darwin.cc:N): ...`; a third recovery within a
+minute is `gpu DEVICE LOST` (the GPU stays off until the next boot). A WindowServer that loses its device restarts (`exit: pid N
+WindowServer ...`, then the login window). What to keep from such a run: the three snapshot lines (where BR stood: the same IB1 in
+every hang points at one pass), the culprit's process, the `clients` line before it, and whether it came with `piano-tu-debug=none`
+or with sysmem. Not a hang: a long pass that ends before 10 s (no recovery line); a page fault (its own line, the process's window).
