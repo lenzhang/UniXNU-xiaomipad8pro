@@ -2,8 +2,10 @@
 
 Status 2026-11-11: **built, host-tested, linked into a KC with the current kext set; not run on the tablet.** Late that day the
 GPU's part of the contract (§4: `piano-gpu-suspend=1`) and the LLCC island slice (§3.6: read at every GPU boot, `piano-llcc-island=1`
-programs it) joined it, built and host-tested in PianoA830, tests G1-G3 and L1 in §6. Everything here is
-off unless its boot argument is set. The owner's priority is battery life; this page is the whole picture (what each piece saves,
+programs it) joined it, built and host-tested in PianoA830, tests G1-G3 and L1 in §6. 2026-11-12: k27 0064 (built, host-tested,
+not run): the kernel reads the LLCC island again at each ss3 decision (`piano-llcc-island-live=1`, §3.6) and a driver can cancel the
+suspend in progress (`piano-sleep-cancel=1`, §3.7); tests C0, C1, L2, L3 in §6. Everything here is off unless its boot argument is
+set, and the kernels with 0060 and later are themselves opt-in (§6: the default build kernel stops at 0059). The owner's priority is battery life; this page is the whole picture (what each piece saves,
 who owns it) and, in detail, the kernel/platform part: CPU idle states, a system sleep that is the closest equivalent of Linux's
 s2idle with its wake sources, and lid / power-key sleep.
 
@@ -61,7 +63,8 @@ at 30 mW (Ubuntu's CX-off) over a month. §6.4 is the measurement that replaces 
   the decrementer was just programmed with) is at least its min-residency and its exit latency fits every latency hold, else WFI.
   Domain states as Linux sends them: with `N >= 2`, the CPU that completes its cluster (all its CPUs in CPU_SUSPEND or entering
   it) asks for `cl5` when every CPU of the cluster has 9144 µs before its deadline; with `N = 3`, the one that completes the
-  system asks for `ss3` (10150 µs), only when the LLCC island is reserved (§3.6). An idle mask and per-CPU deadlines are the
+  system asks for `ss3` (10150 µs), only when the LLCC island is reserved (§3.6: the boot reading; with 0064's
+  `piano-llcc-island-live=1` the two words read at that very decision, and only then). An idle mask and per-CPU deadlines are the
   bookkeeping; a DENIED (a sibling woke) retries at once with the CPU state; a state rejected as invalid 16 times in a row is
   turned off for that CPU and the summary says so, and so is one that returns at once with nothing pending 64 times in a row
   (`last error 1`: a CPU_SUSPEND that does not suspend would make the idle loop a spin of SMCs; WFI then blocks again).
@@ -82,12 +85,13 @@ at 30 mW (Ubuntu's CX-off) over a month. §6.4 is the measurement that replaces 
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `piano-cpuidle=N` | 0 | 0 WFI as before; 1 `ret`; 2 + `cl5`; 3 + `ss3` (refused unless the LLCC island is reserved) |
+| `piano-cpuidle=N` | 0 | 0 WFI as before; 1 `ret`; 2 + `cl5`; 3 + `ss3` (refused at boot unless the LLCC island is reserved; with `piano-llcc-island-live=1` accepted, and ss3 waits for the slice) |
 | `piano-cpuidle-period=S` | 60 | the console summary's period; 0 none (the daily profile: 0 or 600) |
 | `piano-cpuidle-pc=1` | 0 | no OS-initiated mode (domain states as platform-coordinated votes) |
 | `piano-cpuidle-pd=1` | 0 | experimental: `ret` as a power-down, the reset-vector path |
 | `piano-pm-probe=1` | 0 | only the probe lines (PSCI, RSC, RPMh, LLCC), nothing changes |
-| `piano-llcc-island-ok=1` | 0 | ss3 even with the island not reserved: an experiment that can reset the SoC |
+| `piano-llcc-island-ok=1` | 0 | ss3 even with the island not reserved: an experiment that can reset the SoC. Not needed for a slice PianoA830 programmed when `piano-llcc-island-live=1` is set |
+| `piano-llcc-island-live=1` (0064) | 0 | ss3 (idle level 3, `piano-sleep-state=3`) decided on ATTR0/ATTR1 read at each ss3 decision and at each suspend's entry, not on the boot reading (§3.6); read only |
 
 ### 2.4 Lines
 
@@ -100,7 +104,16 @@ piano-cpuidle: level 2 (ret, cl5, OS-initiated), the deepest state that fits bef
 piano-cpuidle: cpu3 state wfi entries 812 residency 1.2%, state ret entries 4410 residency 71.0%, state cl5 entries 120 residency 18.3% (denied 4, rejected 0, last error 0)
 piano-cpuidle: RPMh sleep aosd 0 entries 0.000 s, cxsd 0 entries 0.000 s, ddr 0 entries 0.000 s
 ```
-(The values in the first line are what the Gunyah source predicts; the probe is there to find out.)
+(The values in the first line are what the Gunyah source predicts; the probe is there to find out.) With 0064's
+`piano-llcc-island-live=1`:
+```
+piano-pm: LLCC ISLAND1 read again at each ss3 decision (piano-llcc-island-live=1): ss3 follows the slice as it is then (a programming by PianoA830 counts), not the boot reading above
+piano-cpuidle: level 3 with the LLCC island slice not reserved now: ss3 waits for it (read at each ss3 decision, piano-llcc-island-live=1)
+piano-cpuidle: LLCC ISLAND1 (SCID 12) now reserved: reserved ways 0x7fffffff, bonus ways 0 (read at an ss3 decision; 812 reads, 40 of them reserved): ss3 allowed
+```
+(the last one at the next summary after the verdict changed: the first reading, then each change; `NOT reserved ...: ss3 stays off
+until it is` the other way; `machdep.piano_cpuidle` ends with `LLCC island reserved (live: N reads, M reserved, last 0x7fffffff/0;
+boot not reserved)` at level 3).
 
 ## 3. Suspend-to-idle (k27 0062, `piano-sleep=1`)
 
@@ -196,12 +209,59 @@ goes down, and any active vote left in place persists through sleep), the **LLCC
   `piano-llcc-island=1` (at `piano-gpu=2`) reserves its ways: ATTR0 0x7fffffff and ATTR1 0 for every bank, ATTR2/ATTR3 only where 0,
   verified through the OR and AND views, refused with nothing written when the LLCC does not answer as v6 or the slice is active,
   put back as found when a write does not read back (`drivers/gpu.md` "The LLCC island"). Kexts ask it with
-  `pianopower::llccIslandReady()`; the kernel's own reading is taken once at boot, before any kext, so ss3 after a programming needs
-  `piano-llcc-island-ok=1` until 0061/0062 re-read the two words at each decision (a kernel follow-up);
+  `pianopower::llccIslandReady()`; the kernel's own reading is taken once at boot, before any kext. **k27 0064,
+  `piano-llcc-island-live=1`** (default off: the boot reading as before): the same two words (ATTR0 0x26841300, ATTR1 0x26841308,
+  broadcast base, read only, through the window the boot reading mapped) are read again at each ss3 decision instead: in the idle
+  loop only when every other condition of ss3 already holds (the last CPU of all, its deadline, the latency holds: two loads at most
+  once per ss3 candidate, `piano_s2idle_policy.h` `piano_pm_pick_domain_island`), and at each suspend's entry for its level (logged:
+  `piano-sleep: suspend N: LLCC ISLAND1 read at the entry: ...`). So after PianoA830's programming ss3 is allowed without
+  `piano-llcc-island-ok=1`, and a slice that reads not reserved at a decision keeps ss3 out there (cl5 instead). `piano-cpuidle=3` is
+  then accepted at boot even with the slice not reserved yet;
 - the RPMh counters are logged at every suspend entry and wake: the proof, when the votes are gone;
 - the votes are the drivers' (§4); a kernel `rpmh_flush` equivalent (sleep set 0 / wake set restore in the SLEEP/WAKE TCSes,
   refused while an active TCS is busy) is only needed for votes a driver must keep while awake, and only if DRV2's solver bit is
   clear (probe line).
+
+### 3.7 A driver's cancel of the suspend in progress (k27 0064, `piano-sleep-cancel=1`)
+
+Until 0064 a driver could not stop a sleep (0062's only aborts are its own: a CPU that does not park); a driver that could not go down
+put itself back up and the suspend went on without its saving (§4, `PianoPowerContract.h`). 0064 adds a cancel, **off unless
+`piano-sleep-cancel=1`**:
+
+- **The call.** `pianopower::cancelSystemSleep(who, why)` (`PianoPowerContract.h`): IOPMrootDomain's `callPlatformFunction(
+  "piano-sleep-cancel", false, who, why, NULL, NULL)`, so the kext links with any kernel (before 0064 the root domain answers
+  `kIOReturnUnsupported`); or `piano_s2idle_cancel(who, why)` by name with a 0064 kernel. Thread context, from the driver's kOff
+  (`setPowerState`) or its PreSleep platform action (`IOPlatformSleepAction`). Answers: `kIOReturnSuccess` (0) this suspend will not
+  happen (asked now, or already by an earlier driver: the first one's name and reason are kept, later ones counted);
+  `kIOReturnUnsupported` (1) refused, the sleep goes on (`piano-sleep-cancel` not 1, or no `piano-sleep`); `kIOReturnNotReady` (2) no
+  system sleep in progress; `kIOReturnBusy` (3) too late (frozen; cannot happen from a running driver).
+- **The window** (`piano_s2idle_policy.h`, host-tested): opened by IOPMrootDomain's `willNotifyPowerChildren` for the sleep state (the
+  drivers go down next; any earlier request is forgotten), opened again when IOCPUSleepKernel starts, before PreSleep (keeping a
+  cancel from a kOff), shut at the freeze (the last point where another thread can run), closed after the suspend and at every
+  system-up, so a stale request never reaches the next sleep.
+- **What a cancel does**: at the suspend's entry it returns at once (no park, no watchdog armed, no wake source read); during the
+  park it releases the parked CPUs exactly as a CPU that does not park does. Then, as for that abort: PostResume (the platform wake
+  actions: PianoA830's votes back), every driver's kOn, a full wake with the reason `piano.cancelled` (`machdep.piano_sleep` counts
+  it under `cancelled`). Nothing was suspended, so nothing of the drivers' hardware state was lost beyond their own kOff.
+- **When to use it**: only for a state the system must not sleep in (a disk link that would not come back, data not yet safe),
+  not for a saving lost: a cancel costs the whole suspend (the idle timer sleeps again later). No driver calls it yet; NativeUfs
+  (`drivers/ufs.md` §12.1) and PianoA830's failed entry are the candidates, their owners' choice.
+- **Test**: `piano-sleep-cancel-test=N` makes the kernel ask, through IOPMrootDomain's function as a driver would, at PreSleep of
+  suspend N (C0 refused without `piano-sleep-cancel=1`, C1 honoured; §6).
+
+Lines:
+```
+piano-sleep: a driver may cancel the suspend in progress (piano-sleep-cancel=1): during its kOff or PreSleep, IOPMrootDomain's "piano-sleep-cancel" or piano_s2idle_cancel()
+piano-sleep: piano-sleep-cancel-test=2: suspend 2 is cancelled at its PreSleep by the kernel's test caller
+IOCPUSleepKernel enter (piano: suspend-to-idle)
+piano-sleep: suspend 2 cancelled by piano-sleep-cancel-test: the test argument names this suspend (piano-sleep-cancel=1): nothing is suspended, the system wakes
+piano-sleep: suspend 2 cancelled before the park by piano-sleep-cancel-test (the test argument names this suspend): nothing suspended, a normal wake follows
+IOCPUSleepKernel exit (piano: cancelled)
+```
+(during the park instead: `piano-sleep: suspend N cancelled during the park by WHO (WHY): the CPUs released, nothing suspended`);
+refused: `piano-sleep: WHO asks to cancel the suspend (WHY): not honoured (piano-sleep-cancel=0): the sleep goes on (refusal N)`
+(or `no system sleep in progress`, `too late (the CPUs are frozen)`; the first 16 of a boot, then every 64th). `machdep.piano_sleep`:
+`...; wakes: ... keyboard 0 cancelled 1; driver cancels on (1 cancelled, 0 refused); LLCC island ...; rpmh ...`.
 
 ## 4. The driver contract (`package/include/PianoPowerContract.h`)
 
@@ -213,7 +273,8 @@ to a block whose clocks it gated, GIC lines it attached masked at their source (
 wake line. In **on**: back as before, hardware state read again (the cover, USB-C, the charger may have changed while frozen).
 While suspended nothing of the driver runs and `mach_absolute_time()` stands still. The kernel offers
 `piano_cpuidle_latency_hold/_release`, `piano_sleep_enabled()`, `piano_s2idle_last_reason()` (linked by name: a kext calling
-them needs a 0061/0062 kernel, which `build-native-image.sh` pins with `K27_KERNEL`).
+them needs a 0061/0062 kernel, which `build-native-image.sh` pins with `K27_KERNEL`), and since 0064 the cancel of §3.7
+(`pianopower::cancelSystemSleep`, through IOPMrootDomain: no link dependency).
 
 What each driver adds (their owners' work; nothing here changes their packages):
 
@@ -287,6 +348,8 @@ Boot arguments of 0062:
 | `piano-sleep-wdt=0` | 1 | no Gunyah watchdog across the suspend |
 | `piano-sleep-test=S` | 0 | kIOPMSleepNow S s after boot completed and after each wake ... |
 | `piano-sleep-test-count=N` | 1 | ... N times |
+| `piano-sleep-cancel=1` (0064) | 0 | a driver's cancel of the suspend in progress is honoured (§3.7); else refused and logged |
+| `piano-sleep-cancel-test=N` (0064) | 0 | the kernel's test caller asks to cancel suspend N at its PreSleep (as a driver would) |
 
 Lines (0062): `piano-sleep: system sleep is suspend-to-idle: CPUs down to ret while suspended (OS-initiated), wake mask 0x1 (...),
 poll 100 ms`; at boot completion `piano-sleep: the ADT's sleep-disabled is overridden (piano-sleep=1): system sleep is
@@ -313,15 +376,23 @@ with `piano-reset-after` as the backstop and every reset into ABL fastboot (0057
 (`tooling/native/usb-console.py --capture S`, or the mailbox through `tooling/native/native-loop.sh IMAGE out/ram-pm-dump/...`).
 A stuck tablet: power + volume-down for 15-20 s.
 
-**Build** (main checkout; the k27 tree at 0060):
+**Kernel levels.** `tooling/k27/build-native-image.sh` (and every `build-native-*.sh` import check) links the KC with
+`$PIANO_K27_TREE/out/k27/kernel-k27-0059-native.macho` unless `K27_KERNEL` names another: **the default build kernel stops at
+0059**, and 0060 (RTC), 0061 (CPU idle), 0062 (sleep), 0063 (boot guard) and 0064 (this page's §3.6 live island, §3.7 cancel) are
+opt-in by kernel, then each again by its boot argument (all default off). `tooling/persist/build-esp.py` checks the KC's kernel for
+what an ESP asks of it (0060 for `--rtc-offset`, 0063 for the daily profile's boot guard unless `--boot-guard 0`). The test images
+here need 0061/0062; C0, C1, L2, L3 need 0064 (`build-pm-test-images.sh` skips them on an older kernel).
+
+**Build** (main checkout; the k27 tree at 0063 for 0064, at 0060 for 0061/0062):
 ```sh
-# kernel: in $PIANO_K27_TREE/out/k27/xnu: git am <this repo>/patches/k27/0061-*.patch <this repo>/patches/k27/0062-*.patch
+# kernel: in $PIANO_K27_TREE/out/k27/xnu: git am <this repo>/patches/k27/0061-*.patch ... 0064-*.patch (the tree carries 0053-0063)
 K27_VARIANT=native "$PIANO_K27_TREE/build-k27-piano.sh"                 # then copy .../mach.development.bcm2837.unstripped
-                                                                           #   to out/k27/kernel-k27-0062-native.macho there
+                                                                           #   to out/k27/kernel-k27-0064-native.macho there
 tooling/k27/test-piano-pm.sh                                               # host tests (add --kext with K27_KERNEL=... for the contract)
 K27_KERNEL=$K/out/k27/kernel-k27-0062-native.macho PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh   # KC + ADT
 tooling/k27/build-pm-test-images.sh            # out/ram-pm-{base,probe,idle1,idle2,idle1pd,idle3,sleep0,sleep1,sleep2,sleepkey,measure}
                                                #   and the storage side's {ufssleep0,ufssleep1,ufsahit,ufsahitsleep,ufsmeasure}
+tooling/k27/build-pm-test-images.sh cancel0 cancel llccsleep llccidle3   # 0064's C0, C1, L2, L3 (a 0064 kernel in the KC)
 ```
 (`$K` = `$PIANO_K27_TREE`. Built offline here from an APFS clone of the k27 tree with its own object directory: kernel
 sha256 `24940c6dd10bee7d…`, KC with the 14 native kexts `f0a92af1f3696fc4…`, layout check passed; images `ram-pm-probe`
@@ -347,6 +418,10 @@ run. For `sleepkey` with the cover: `PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/PianoKe
 | G2 | `ram-pm-gsleep2` (600 s) | as G1, plus PianoDpu's panel sleep (B1e) | unattended | as G1 with `scanout stopped` and `DDR ... -> 0 MB/s (keepalive minimum)`; the panel back after each wake | `scanout running` after the wait: B1e's own lines (`panel: sleep ...`); raise `piano-gpu-suspend-display-ms` |
 | G3 | `ram-pm-gsleep3` (600 s) | high: the rails' votes gone and ss3 while suspended, the island programmed, the UFS link in Hibern8 (`native-ufs-suspend=1`; USB and PCIe have no kOff yet) | attended, only after L1 showed `island ready` and G1/G2 passed | `CX 0x... -> 0 ... (the rails' votes gone)`; the RPMh line at wake: whether `cxsd` / `ddr` moved (the keepalive BCMs and CN0 still hold the DDR without a SLEEP set) | a reset: keep `piano-gpu-suspend-rails` at its default; the mailbox has the last line |
 | GM | `ram-pm-gmeasure` (2400 s) | low (G1 passed) | as M | as M; the suspended current against M's (§6.4 step 3) | — |
+| C0 | `ram-pm-cancel0` (600 s, 0064) | as S2 | unattended: 3 test sleeps of 30 s, `piano-sleep-cancel-test=2` without `piano-sleep-cancel=1` | `piano-sleep: piano-sleep-cancel-test=2: ... (refused: piano-sleep-cancel=0)` at boot; at suspend 2 `piano-sleep: piano-sleep-cancel-test asks to cancel the suspend (...): not honoured (piano-sleep-cancel=0): the sleep goes on (refusal 1)` followed by that suspend's usual lines and `woke after 30.0 s by timer`; three timer wakes, `sysctl machdep.piano_sleep` `cancelled 0; driver cancels off (0 cancelled, 1 refused)` | the suspend does not happen: the default is not off (report the lines) |
+| C1 | `ram-pm-cancel` (600 s, 0064) | as S2 (a cancelled suspend parks nothing) | unattended, as C0 with `piano-sleep-cancel=1` | suspends 1 and 3 as S2; suspend 2: `IOCPUSleepKernel enter (piano: suspend-to-idle)`, `piano-sleep: suspend 2 cancelled by piano-sleep-cancel-test: ...: nothing is suspended, the system wakes`, `piano-sleep: suspend 2 cancelled before the park by piano-sleep-cancel-test (...)`, no `CPUs down to` / RPMh / `woke after` line for it, `IOCPUSleepKernel exit (piano: cancelled)`, the drivers' wake lines (PianoInput, PianoDwc3, PianoThermal ... `wake N`), `piano-sleep: test sleep 3 of 3 in 150 s`; the console continuous; `machdep.piano_sleep` `suspends 3 (aborted 0) ... cancelled 1; driver cancels on (1 cancelled, 0 refused)`; IOPMrootDomain's `piano-wake-reason` `cancelled` (`ioreg -r -n IOPMrootDomain -d 1`) | no wake after the cancel (the console stops): the watchdog is not armed on this path, `piano-reset-after` resets; report the last line |
+| L2 | `ram-pm-llccsleep` (600 s, 0064) | L1's (the island's writes) + S2's | unattended: 3 test sleeps of 30 s; `piano-llcc-island=1 piano-llcc-island-live=1`, `piano-sleep-state=1` (no ss3) | the boot line `piano-pm: LLCC ISLAND1 (SCID 12): reserved ways X, bonus ways Y: ...` (the boot reading, before PianoA830), `piano-pm: LLCC ISLAND1 read again at each ss3 decision (piano-llcc-island-live=1) ...`; PianoA830's `llcc: piano-llcc-island=1: programmed and read back ...` (or `already reserved`); at each suspend `piano-sleep: suspend N: LLCC ISLAND1 read at the entry: reserved ways 0x7fffffff, bonus ways 0: reserved (piano-sleep-state < 3: ss3 not asked) (boot reading: NOT reserved)` and the first time `piano-sleep: LLCC ISLAND1 (SCID 12) now reserved: ...`; `machdep.piano_sleep` `LLCC island reserved (live: 3 reads, 3 reserved, last 0x7fffffff/0; boot not reserved)` | the entry reading equals the boot one although PianoA830 says programmed: the kernel reads another view than PianoA830 (report both lines); `REFUSED`/`READ-BACK FAILED` from PianoA830: as L1 |
+| L3 | `ram-pm-llccidle3` (300 s, 0064) | medium-high (I4's: ss3 at run time) | unattended, only after L2 showed the entry reading reserved, and I1/I2 passed | `piano-cpuidle: level 3 with the LLCC island slice not reserved now: ss3 waits for it ...` (or, if already reserved at boot, the usual level-3 line), the first summary's `LLCC ISLAND1 (SCID 12) now NOT reserved ...` then, after PianoA830's programming, `now reserved: ... ss3 allowed`; per-CPU lines with `state ss3 entries N` growing, `rejected 0`; RPMh `aosd` may move; no `piano-llcc-island-ok` in the image | reset or stall: keep N = 2 (as I4); ss3 entries stay 0 with `now reserved`: the system state never fits (busy CPUs, PianoTouch's 2000 µs hold): run at the idle login window |
 
 The GPU's rows come after S1-S2 passed without the GPU's part and after the stall right after a bring-up is understood
 (`forensics-2026-11-11.md` §5, R3): G1 adds a GPU transition at every suspend and resume. Build: `tooling/k27/build-pm-test-images.sh
@@ -355,6 +430,34 @@ B1e's own test first (`drivers/dpu.md` §8.3, image e0). Built offline here on t
 `194d9df11531e4de…`, the native kext rule passed): `ram-pm-island` `63fb764808660f96…`, `ram-pm-gsleep1` `3e905a31a23aec0a…`,
 `ram-pm-gsleep2` `b0ffdee6ce89a3b4…`, `ram-pm-gsleep3` `c33688c73d62fd49…`, `ram-pm-gmeasure` `11ce4501356874a5…`; rebuild in the main
 checkout before a run.
+
+**The next unattended queue (2026-11-12; these follow the pol-*/pm-* images already queued).** One KC: `K27_KERNEL=<kernel-k27-0064-native.macho>
+PIANO_EXTRA_KEXTS=$(tooling/k27/build-native-piano-keyboard.sh | tail -1) PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh`,
+then `tooling/k27/build-policy-test-images.sh gpuslot` and `tooling/k27/build-pm-test-images.sh cancel0 cancel llccsleep llccidle3`.
+Each image's own arguments (on top of its script's BASE; `piano-reset-after` is the run's length, every reset into ABL fastboot):
+
+| Order | Image | Its arguments | Proof (console) |
+|---|---|---|---|
+| 1 | `ram-pol-gpuslot` (600 s) | `piano-power=1 piano-thermal=2 piano-policy=2 piano-gpu-dcvs-max=607 piano-policy-lpm=1` | `policy.md` §9 P7: `PianoPolicy: PianoA830: 4 GPU ceiling slots ...: Power Saver's ceiling is client 1 ...`, `PianoPolicy: PianoA830: GPU ceiling 342 MHz (Power Saver's GPU ceiling; client 1, the power profile's slot)`, `PianoA830: gpu ceiling 342 MHz (power profile's; slots thermal 0, power profile 342, 0, 0 MHz; the lowest wins; #1)`, `PianoThermal: [Ns] cpufreq: profile Power Saver (PianoPolicy)`, then `ceiling 1785 MHz (on power; profile Power Saver)` |
+| 2 | `ram-pm-cancel0` (600 s) | `piano-sleep=1 piano-sleep-state=1 piano-sleep-test=150 piano-sleep-test-count=3 piano-sleep-max=30 piano-sleep-cancel-test=2` | C0: `... asks to cancel the suspend (...): not honoured (piano-sleep-cancel=0): the sleep goes on (refusal 1)`, three `woke after 30.0 s by timer` |
+| 3 | `ram-pm-cancel` (600 s) | as 2 plus `piano-sleep-cancel=1` | C1: `piano-sleep: suspend 2 cancelled before the park by piano-sleep-cancel-test (...)`, `IOCPUSleepKernel exit (piano: cancelled)`, `test sleep 3 of 3 in 150 s`, suspends 1 and 3 `woke after 30.0 s by timer` |
+| 4 | `ram-pm-llccsleep` (600 s; after `ram-pm-island`, L1) | `piano-sleep=1 piano-sleep-state=1 piano-sleep-test=150 piano-sleep-test-count=3 piano-sleep-max=30 piano-llcc-island=1 piano-llcc-island-live=1` | L2: `piano-pm: LLCC ISLAND1 read again at each ss3 decision ...`, PianoA830's `llcc: piano-llcc-island=1: programmed and read back`, each suspend's `LLCC ISLAND1 read at the entry: reserved ways 0x7fffffff, bonus ways 0: reserved (piano-sleep-state < 3: ss3 not asked) (boot reading: NOT reserved)` |
+| 5 | `ram-pm-llccidle3` (300 s; after 4, `ram-pm-idle1`, `ram-pm-idle2`) | `piano-cpuidle=3 piano-llcc-island=1 piano-llcc-island-live=1` | L3: `piano-cpuidle: level 3 with the LLCC island slice not reserved now: ss3 waits for it ...`, then `piano-cpuidle: LLCC ISLAND1 (SCID 12) now reserved: ... ss3 allowed` and `state ss3 entries N` (N > 0) in the per-CPU lines |
+
+The BASEs: pm images `piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-power=1 piano-power-period=10 piano-usb=2
+piano-input=1`; the policy image `piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-usb=2 piano-input=1 piano-power-ps=1
+piano-power-period=10 piano-keyboard=2 piano-backlight=2 piano-cpufreq=3`. A failure row of each is in its table above (`policy.md`
+§9 for 1).
+
+Built offline 2026-11-12 from an agent worktree, the kernel in a scratch APFS copy of the k27 tree (0053-0063 as the tree has them,
+plus `patches/k27/0064`, which `patch -p1` and `git apply --check` take cleanly and which reproduces the built sources byte for byte;
+the k27 tree itself untouched): `test-piano-pm.sh --kext` passes against that kernel (the contract's `cancelSystemSleep` compiles as a
+kext, 304 imports resolved); `build-native-image.sh` with it and PianoKeyboard: `native kext rule: 24 native kexts linked, none from
+outside this repository`, every vtable check 0 problem slots, KC `26489b3f440305cb…`; with the default 0059 kernel 23 kexts link as
+before. Images (`verify-ram-images.py` PASS): `ram-pol-gpuslot` `593e2fd733b9335a…`, `ram-pm-cancel0` `9f51ce9959314141…`,
+`ram-pm-cancel` `ddb15c2bf07c95e8…`, `ram-pm-llccsleep` `d997ad089a283d63…`, `ram-pm-llccidle3` `40ab2f76044a1c46…`; the longest
+command line 824 bytes. The kernel's hash depends on the tree's path (its `__FILE__` strings): build 0064 in the k27 tree and rebuild
+the images in the main checkout before a run.
 
 ### 6.4 The measurement (A/B)
 
@@ -393,18 +496,22 @@ the time asleep.
 - Time: an RTC alarm wake (Linux's rtcwake) is not offered: `piano-sleep-max` is the timer.
 - The GPU's suspend (§4): its host votes are the system's only CX/MX/DDR votes, lowered at PreSleep while drivers outside the power
   tree may still run and while UFS (its link in Hibern8 at most, its clocks on: `drivers/ufs.md` §12.2), USB and PCIe stay clocked:
-  the rails' default floor is NOM_L1 for that reason, and `piano-gpu-suspend-rails=0` is safe only once those are gated. A driver cannot cancel a 0062 suspend: a GPU that cannot go down
-  stays up and the sleep goes on without its share.
+  the rails' default floor is NOM_L1 for that reason, and `piano-gpu-suspend-rails=0` is safe only once those are gated. A GPU that
+  cannot go down stays up and the sleep goes on without its share (0064's cancel, §3.7, is there for a driver whose state must not
+  sleep; PianoA830 does not use it).
 - Not done: RPMh sleep/wake sets (kernel; SH0/MC0/CN0's keepalive minimum persists through the sleep without them), PDC wake
-  routing, PSCI SYSTEM_SUSPEND (needs CPU_OFF/ON in ArmCpu), macOS dark wakes (every wake is full), a kernel re-read of the LLCC
-  island after PianoA830 programmed it, a driver-initiated cancel of a suspend.
+  routing, PSCI SYSTEM_SUSPEND (needs CPU_OFF/ON in ArmCpu), macOS dark wakes (every wake is full; a cancelled suspend wakes fully
+  too). Built, not run (0064, opt-in): the kernel's re-read of the LLCC island at each ss3 decision (§3.6, tests L2/L3) and a
+  driver-initiated cancel of a suspend (§3.7, C0/C1); no driver calls the cancel yet.
 
 ## 8. Files
 
 `patches/k27/0061-*.patch` (`osfmk/arm64/piano_pm.c`, `piano_pm.h`, `piano_pm_policy.h`; hooks in `cpu.c`, `arm_init.c`;
 `machdep.piano_cpuidle*` in `bsd/dev/arm64/sysctl.c`), `patches/k27/0062-*.patch` (the suspend in `piano_pm.c`; `IOCPU.cpp`,
-`IOPMrootDomain.cpp`, `clock.c`, `machdep.piano_sleep`), `tooling/k27/piano-pm/` (the policy header, its host test, a contract
-check driver), `tooling/k27/test-piano-pm.sh`, `tooling/k27/build-pm-test-images.sh`, `package/include/PianoPowerContract.h`
+`IOPMrootDomain.cpp`, `clock.c`, `machdep.piano_sleep`), `patches/k27/0064-*.patch` (the live island and the cancel in
+`piano_pm.c`/`piano_pm.h`, `osfmk/arm64/piano_s2idle_policy.h`; the window's hooks in `IOCPU.cpp` and `IOPMrootDomain.cpp`, its
+platform function there), `tooling/k27/piano-pm/` (the policy headers `piano_pm_policy.h` and `piano_s2idle_policy.h`, their host
+tests, a contract check driver), `tooling/k27/test-piano-pm.sh`, `tooling/k27/build-pm-test-images.sh`, `package/include/PianoPowerContract.h`
 (on every kext's include path through `build-native-kext.py`). The watchdog's owner and the boot guard: `patches/k27/0063-*.patch`,
 `boot-guard.md`. The GPU's part: `package/PianoA830/adreno830/A830Suspend.h` (its host test `tests/test_a830suspend.cpp`), the gate in
 `A830PowerState`, the steps in `Adreno830Start.cpp`, `Sm8750RpmhHostRailsSet`, the IOKit side and the LLCC island in

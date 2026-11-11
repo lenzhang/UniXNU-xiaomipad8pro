@@ -182,7 +182,7 @@ shared with the host harness), `NativeUfs.cpp` (the power-tree join, `setPowerSt
 | MPHY TX_FSM_STATE (attribute 0x41, TX lane 0) = 1: the lane is in HIBERN8; ufs-qcom checks exactly this of a hibernated link | spec | `ufs-qcom.c` `ufs_qcom_check_hibern8` |
 | Before any driver's off, IOPMrootDomain syncs the file systems (`disk_sync_callout` → `sync_internal`) and suspends the user tasks (`tasks_system_suspend`, then `vm_pageout_wait` up to 10 s): little I/O is left to meet the hold | verified | k27 `IOPMrootDomain.cpp` |
 | Children in the power tree go to off before their parent and come back after it (the parent's will-change notifies the children and waits for them; the did-change of a power rise notifies them after the parent's `setPowerState`); siblings run in parallel | verified | k27 `IOServicePM.cpp` (`notifyRootDomain`, `notifyChildren`) |
-| `setPowerState` returning an error is treated as an acknowledgement (`(result == IOPMAckImplied) \|\| (result < 0)`): a driver cannot cancel a system sleep that way, and k27 0062 has no driver veto (its only abort is a CPU that does not park) | verified | k27 `IOServicePM.cpp` `driverSetPowerState`; `patches/k27/0062-*` |
+| `setPowerState` returning an error is treated as an acknowledgement (`(result == IOPMAckImplied) \|\| (result < 0)`): a driver cannot cancel a system sleep that way, and k27 0062 has no driver veto (its only abort is a CPU that does not park); k27 0064 adds one, opt-in (`piano-sleep-cancel=1`, `pianopower::cancelSystemSleep` from kOff or PreSleep, `power.md` §3.7), not used by NativeUfs yet | verified | k27 `IOServicePM.cpp` `driverSetPowerState`; `patches/k27/0062-*`, `0064-*` |
 
 ### 12.2 What NativeUfs holds, and what stays on (the votes are UEFI's)
 

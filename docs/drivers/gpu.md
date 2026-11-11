@@ -277,8 +277,9 @@ minimum and CN0 go to 0 only through a SLEEP set, which is the kernel's (`../pow
 
 Failures never leave the GPU half down: busy after the wait (work in flight, a holder, an unfinished recovery) or lost: nothing
 changed, the GPU and its votes stay as they were; a failed slumber entry: the recovery takes the GPU (kOff waits up to 3 s for it)
-and the GPU takes no part in a suspend for the rest of the boot. In both cases the suspend goes on without the GPU's share: k27 0062
-has no cancel a driver can ask for (its own aborts are for CPUs that do not park). A vote that fails at PreSleep puts back what went
+and the GPU takes no part in a suspend for the rest of the boot. In both cases the suspend goes on without the GPU's share (k27
+0064's driver cancel, `../power.md` §3.7, opt-in with `piano-sleep-cancel=1`, is not used here: a GPU left up is a lost saving, not a
+state the system must not sleep in). A vote that fails at PreSleep puts back what went
 down (the GPU stays down); one that fails at PostResume is tried again at kOn, and if it still fails the GPU stays asleep with its gate
 shut (no power-up on missing rails). The service's `piano-gpu-suspend` property counts suspends, refusals, vote failures, wakes and the
 longest wake. The GPU joins the power tree only once it runs (`bring-up done`); a sleep before that finds it outside the tree, as
@@ -319,8 +320,9 @@ reserved ways). PianoA830 owns the LLCC, so `board/PianoLlccIsland.h`:
   thread: the two words read again), `piano_a830_llcc_island_ready()` for kexts linked after PianoA830, and the contract's
   `pianopower::llccIslandReady()`; the service property `piano-llcc-island` says what was found and whether PianoA830 programmed it.
   PianoAudio's release of the LPASS votes waits for it. k27 0061/0062 read the slice themselves once at boot (their probe, before any
-  kext starts) and do not see a later programming: until a kernel follow-up re-reads the two words at each decision (or asks this
-  service), ss3 after a successful programming needs `piano-llcc-island-ok=1`, and the kernel's line still says "NOT reserved".
+  kext starts) and do not see a later programming; with k27 0064's `piano-llcc-island-live=1` (`../power.md` §3.6) they read the same
+  two words again at each ss3 decision and at each suspend's entry, so ss3 after a successful programming needs no
+  `piano-llcc-island-ok=1` (the kernel's boot line still says what the boot found; its later lines say `now reserved`).
 
 **Ceiling slots (2026-11-11, `../policy.md` §5.3).** `callPlatformFunction("piano-gpu-ceiling", false, (void *)kHz, (void *)client)`:
 one slot per caller, client 0 (param2 null: PianoThermal's passive trip and every caller before the slots), 1 the power profile
@@ -328,7 +330,8 @@ one slot per caller, client 0 (param2 null: PianoThermal's passive trip and ever
 (`board/PianoGpuCeiling.h`, `adreno830_dcvs_set_ceiling`), so no caller lifts another's limit and clearing one leaves the others. The
 service publishes `piano-gpu-ceiling-clients` = 4; a client past it is refused (kIOReturnBadArgument). A line per change of the
 ceiling in force: `gpu ceiling 160 MHz (thermal's; slots thermal 160, power profile 342, 0, 0 MHz; the lowest wins; #n)`, `gpu
-ceiling cleared (no slot holds one; #n)`. PianoPolicy can now pass client 1 and drop its interim arbitration (its owners' change).
+ceiling cleared (no slot holds one; #n)`. PianoPolicy is client 1 since 2026-11-12 (it reads `piano-gpu-ceiling-clients` on this service
+and, with it, drops its interim arbitration: `../policy.md` §5.3); PianoThermal stays client 0.
 
 **The BO pool (2026-11-11).** The write-combined pool S3 reserves while memory is unfragmented holds the BOs Turnip allocates
 (`BoAlloc`; imported IOSurfaces are not in it): a pooled BO is one span of the GPU's table and needs no page attribute change. What
