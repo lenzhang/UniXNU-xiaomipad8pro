@@ -106,7 +106,7 @@ piano-cpuidle: RPMh sleep aosd 0 entries 0.000 s, cxsd 0 entries 0.000 s, ddr 0 
 | Fact | State | Source |
 |---|---|---|
 | IOPMrootDomain sleeps through `IOPlatformExpert::sleepKernel → IOCPUSleepKernel` (this board has no `USE_APPLEARMSMP`): `haltCPU()` per CPU, then `processor_sleep`; the boot CPU ends in `ml_arm_sleep → arm64_prepare_for_sleep`, which on this board is a WFI loop (a Mac's SoC powers off there and comes back through the reset vector) | verified | `iokit/Kernel/IOCPU.cpp`, `osfmk/arm64/cpu.c`, `machine_routines_asm.s` |
-| ArmCpu's `haltCPU` runs on the caller: it masks DAIF and spins in WFI. The first `haltCPU` (for a secondary, on the boot CPU) would hang the tablet. Its `initCPU(false)` panics ("secondary resume is unsupported"); `quiesceCPU` returns, which ends in "zombie processor" | verified | ArmCpu.cpp (the copy linked into k27) |
+| ArmCpu's `haltCPU` runs on the caller: it masks DAIF and spins in WFI. The first `haltCPU` (for a secondary, on the boot CPU) would hang the tablet. Its `initCPU(false)` panics ("secondary resume is unsupported"); `quiesceCPU` returns, which ends in "zombie processor" | verified | ArmCpu.cpp, the copy linked into k27 (`droidvm-build/macOS-DroidVM/out/k27/src/platform/ArmCpu`) |
 | Gunyah's SYSTEM_SUSPEND is DENIED unless every other vCPU is CPU_OFF (ArmCpu cannot bring one back); Linux on this tablet never uses PSCI system suspend either: s2idle (`SuspendState=freeze`) | spec; Ubuntu | `psci_osi`; device.md §2.1 |
 | Every native ADT says `/defaults sleep-disabled = 1`; IOPMrootDomain reads it at boot completion and refuses every sleep (`kPMConfigPreventSystemSleep`) | verified | `configs/k27-adt.toml`, `IOPMrootDomain.cpp` |
 
