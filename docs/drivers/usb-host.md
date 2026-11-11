@@ -8,6 +8,15 @@
 > interrupt 0 over SPI 133 or polled (§6.5a). Apple's host stack links natively with `PIANO_USBHOST_STACK=1` (§5.2a: a new
 > stand-in, the cable keys in ARMPlatformStandIn for that build only, the stack's boot-time personalities gated; PianoTouch is left
 > out of that build for want of a `__DATA_CONST` gap). The default collection is unchanged but for PianoUsbHost's own objects.
+> **Levels 3 and 4 (H3/H4, built and host-tested, 2026-11-11 night):** the port manager on PianoPower's new USB-C relay
+> (`package/include/PianoUsbcContract.h`: the DSP's UCSI owner 0x800b for one client kext) and its port events (the port
+> notifications 0x800c, read only, `PianoAdspContract.h`): level 4
+> runs our UCSI client (`UcsiClient.h`: PPM_RESET, the notification enable, GET_CAPABILITY, GET_CONNECTOR_CAPABILITY,
+> GET_CONNECTOR_STATUS, every connector change), decides the role (device with nothing attached, host for a UFP: an OTG adapter, a
+> stick, a dock after its swap), reports whether we source VBUS (the DSP's own boost after PianoPower's board configuration) and the
+> orientation from three witnesses (the port notification, UCSI 2.x, gpio61), all as properties, event-driven (§6.6). The switch
+> between PianoDwc3's device mode and our host mode is **default off** (`piano-usbhost-handoff=5|6` plus PianoDwc3's
+> `piano-usb-handoff=1`). Tablet list with expected lines: §8.3.
 > Test images and expected lines: §8. Template: `README.md`.
 
 ## 1. Purpose and gate
@@ -52,8 +61,8 @@ is a daily-use feature (backlog tier 3), and B8 (DisplayPort Alt Mode) builds on
 |---|---|---|---|
 | PMIC Type-C block (PMIH010x SID 7, charger + 0x600) | +0x06 sink status (b3 default Rp, b2 1.5 A, b1 3.0 A), +0x08 source status (b3 Rd/open = a USB device, b2 Rd/Ra, b0 Ra/Ra audio, b4 debug), +0x0b misc (b0 attached, b1 CC2, b5 VBUS, b6 **we source**), +0x0a vSafe5V/0V, +0x44 port mode (b1 sink only, b2 source only, 0 dual role) | SPMI observer read (PianoPower's) | verified (source: LNX qcom_pmic_typec_port.c offsets = SUN's); no Linux driver binds it on piano (no DT node) |
 | gpio61 | `pmic-glink orientation-gpios`, input with pull-down; ucsi_glink reads it on every connector status: high = reverse | TLMM read | verified (DT, LNX) |
-| UCSI (owner 0x800b) | READ_BUF 0x11 / WRITE_BUF 0x12 / NOTIFY 0x13; v1 48-byte buffer; init PPM_RESET → SET_NOTIFICATION_ENABLE → GET_CAPABILITY → per connector GET_CONNECTOR_CAPABILITY, GET_ALTERNATE_MODES, GET_CONNECTOR_STATUS; CONNECTOR_STATUS: b19 connected, b20 we source, b31:29 partner type (1 DFP, 2 UFP, 3 cable, 4 cable + UFP, 5 debug, 6 audio), b86 orientation (UCSI ≥ 2.0); UFP → host, DFP → device | the DSP up (PianoPower level 2) | verified (source) |
-| Port notifications (owner 0x800c) | opcode 0x16, SVID in bits 31:16; @12 port, @13 orientation (0 normal, 1 reverse), @14 mux (0 none, 1 USB3 only, 2 DP 4 lanes, 3 USB3 + DP, 4 tunnel), @20 DP pin assignment/HPD; enable 0x10 and ack 0x11 as write requests 0x15 | the DSP up; PianoPower already enables and acks PAN (`PianoMca.c`), payload not decoded | verified (source) |
+| UCSI (owner 0x800b) | READ_BUF 0x11 / WRITE_BUF 0x12 / NOTIFY 0x13; v1 48-byte buffer; init PPM_RESET → SET_NOTIFICATION_ENABLE → GET_CAPABILITY → per connector GET_CONNECTOR_CAPABILITY, GET_ALTERNATE_MODES, GET_CONNECTOR_STATUS; CONNECTOR_STATUS: b19 connected, b20 we source, b31:29 partner type (1 DFP, 2 UFP, 3 cable, 4 cable + UFP, 5 debug, 6 audio), b86 orientation (UCSI ≥ 2.0); UFP → host, DFP → device | the DSP up (PianoPower level 2) | verified (source); **served natively** (image G2, 2026-11-11 evening: PianoPower's read of the buffer answered **version 1.10, CCI 0, 48-byte buffer**): so no orientation bit (1.x), the 48-byte write image. Whether the DSP notifies command completions, and what GET_CONNECTOR_STATUS says for each partner: **needs-boot** (§8.3, level 4) |
+| Port notifications (owner 0x800c) | opcode 0x16, SVID in bits 31:16; @12 port, @13 orientation (0 normal, 1 reverse), @14 mux (0 none, 1 USB3 only, 2 DP 4 lanes, 3 USB3 + DP, 4 tunnel), @16 VID, @18 SVID, @20 DP pin assignment (5:0)/HPD (6, 7); 32 bytes; enable 0x10 and ack 0x11 as write requests 0x15 | the DSP up; PianoPower enables and acks them (`PianoMca.c`); the relay hands a copy to PianoUsbHost, which decodes it (`Ucsi.h decodePort`) | verified (source); **the enable answered natively** (image G2); the payload per plug: **needs-boot** (§8.3) |
 
 **Rp bit order.** Linux orders the sink-status bits b3 default, b2 1.5 A, b1 3.0 A; PianoPower's `ChargerPmic.h` decodes the
 reverse as *inferred*. Its level 1 measurement on the Mac's port read `0x02`, which is **3.0 A** in Linux's order (the usual for a
@@ -70,7 +79,7 @@ natively since 2026-11-11 07:15, charging.md).
 |---|---|---|---|
 | DIO4485 | `dioo,dio4485` @0x42 on `i2c@a8c000` (QUP1 SE3, gpio44/45 with pull-ups), the connector's SBU endpoint; ID reg 0x00 = 0xf6; 0x04 enable (b7 device, b6:5 SBU, b4:3 USB, ...), 0x05 select; USB/safe state 0x04 = 0x98, 0x05 = 0x18; DP+USB 0xf8 (+0x78 select reversed); DP-only (pin C/E) switches USB off | DT; LNX fsa4480.c | verified (source); power-on defaults and whether D+/D- pass through it: unknown (inferred yes, FSA4480 family; device mode works with the firmware's state) |
 | VBUS for OTG | supplied by the DSP's charger firmware itself once it has the board configuration (CP_STATE 0x201c = 1 byte, OTG_CFG 0x201a = 16 bytes `0, 1, 0xffffffff, 0xffffffff`, CID_CFG 0x201b = 0x708, once per DSP generation); notification 10 hands the SC8541 to reverse (OTG), 3 boost; **Linux never enables VBUS itself**; 0x200d/0x200e boost/gate status, 0x21015 Type-C mode, 0x21020 OTG plug-in, 0x21022 sink/source mode (encodings not in the source) | LNX xiaomi_mca.c, sc8541; kernel.md §2.11 | verified (source), inferred (who switches VBUS) |
-| OTG config natively | **not in PianoPower**: charging.md lists "the OTG config write 0x201a" as later and PianoPower's write allowlist refuses 0x201a (`tests/power_host.cpp`); the stock UEFI's PmicDxe VBUS function is empty (SUN) | repo; SUN | verified |
+| OTG config natively | **in PianoPower since image I** (charging.md §5e): `PianoMca.c board()` sends the stock board configuration on every charger generation before any policy write, at level 2 with writes (`piano-power=2`, `piano-power-board=1` the default; not with `piano-power-write=0`, image G2): 0x201c = 1, 0x201a = the 16-byte constant, 0x201b = 0x708, read back on the `diag board:` line; the allowlist takes these values only. The stock UEFI's PmicDxe VBUS function is empty (SUN) | repo; SUN | verified (source); the DSP sourcing VBUS after it: **needs-boot** (§8.3 H3) |
 | eUSB2 repeater | pmih0108 @0xfd00: host mode forces the 19.2 MHz clock (FORCE_EN_5 0xe8 b6, FORCE_VAL_5 0xed b6), device clears them; SUN: stock host tuning 0x51/54/56/57 = 0f/01/03/05 vs 0a/03/03 in device mode | LNX phy-qcom-eusb2-repeater.c; SUN | verified (source); the owner EE of the repeater's APID: needs-boot (survey) |
 | **Hazard K:7dffd78b342d** | a QSCRATCH VBUS-override write from the UCSI role switch while the glue clocks were off (s2idle) reset the SoC; Ubuntu defers it while suspended and shares one role lock with suspend and the Type-C clock updates (K:9834284b801f) | kernel.md §2.11 | verified |
 | SPI 133 | one line for both roles; our ArmCpu has `armcpu_spi_attach` (one handler per INTID) but no detach and no mask | power-irq.md §2.1 | verified |
@@ -96,8 +105,8 @@ Kernel `piano/dev` (`unixnu-research/ubuntu-ref/kernel`, 7f8d6bedde47; v1.1.0 = 
 | Piece | Base | Licence | Delta for piano |
 |---|---|---|---|
 | Apple's xHCI on a Qualcomm DWC3 | **QcomDwc3** (`unixnu-research/QcomDwc3` e4efe95, SM8550, iPadOS 27 24A446; UniXNU-sheng keeps AppleUSBXHCI ABI fixtures for 24A446 and macOS 27.3 26C5035r, `scripts/usb-xhci-*.json`): `QcomDwc3Xhci : AppleUSBXHCI` with three overrides (always-on desired power; hi-lo 64-bit read/write) on a `QcomDwc3Nub : IOService` (an IODeviceMemory of 0x8000 at the core, name `usb-host0`, `bus-number`, `registerInterrupt` over `armcpu_spi_attach`, one line routed to the active role's nub); role switch = core soft reset 100 ms + PRTCAPDIR + SUSPHY bits + repeater host flag; host mode "runs and completes commands, enumeration not verified" | BSD-2-Clause-Patent (its two PHY headers are GPL: not used) | our KC is the vma2 27.0.1 (26A434) collection: neither fixture applies (§5.3); our ArmCpu has no `armcpu_spi_mask` |
-| UCSI client | QcomDwc3 `QcomUcsi.h` (message layout and command order after Linux, no I/O) | BSD-2-Clause-Patent | on PianoPower's GLINK channel (owner 0x800b next to 0x800a/0x800c) |
-| DSP, GLINK, PAN | PianoPower level 2 (DSP start, MCA, PAN enable/ack) | this repo | add UCSI, decode the PAN payload, the OTG board configuration (opt-in write) |
+| UCSI client | QcomDwc3 `QcomUcsi.h` (message layout and command order after Linux, no I/O) | BSD-2-Clause-Patent | **done** as `UcsiClient.h` + `Ucsi.h` (written anew from the UCSI specification, the full init, connector changes, the poll fallback, failures and retries; QcomUcsi.h's framing facts), on PianoPower's PMIC_RTR_ADSP_APPS channel through the relay (§6.6) |
+| DSP, GLINK, PAN | PianoPower level 2 (DSP start, MCA, PAN enable/ack, the board configuration) | this repo | **done**: the USB-C relay (`PianoUsbcRelay.cpp`, `UsbcRelay.c`: UCSI for one client) and PianoPower's port events (`PortEvents.c`, PianoDp's D2: each port notification, read only), the PAN payload decoded in PianoUsbHost |
 | Controller bring-up, SMMU, coherency | PianoDwc3 (takeover order, SMMU stream 0x40, UTMI-as-PIPE) and QcomDwc3's coherence note: Apple's USB code does no cache maintenance, so stream 0x40 gets its own stage-1 context with an identity map of DRAM in write-back inner-shareable 1 GiB blocks (a bypass bank leaves the master non-coherent) | this repo; BSD | PianoDwc3's bypass bank is fine for its own WC rings (and level 5's), not for Apple's xHCI: **done** as `SmmuIdentity.h` (QcomDwc3's `smmuIdentity()` adapted, host-tested), level 6's default |
 | Host-mode facts measured on piano | Project-SunUEFI `PianoUsbHost.c` / host plan (stock `Usb30InitHost` values + GCTL.DSBLCLKGTNG + GUCTL.HSTINAUTORETRY, the No-Op command acceptance test, hi-lo writes, PMIC Rd detection twice 250 ms apart) | BSD-2-Clause-Patent | compiled there, not verified on the tablet |
 
@@ -252,11 +261,31 @@ High speed needs no orientation (both D+/D- pairs meet in the receptacle; the DI
 the PHY in USB3-only mode with TYPEC_CTRL = software select | (reverse ? 1 : 0); reverse from the PMIC's CC bit, gpio61 and later
 UCSI/PAN — the survey's three witnesses must agree on the tablet first. The DIO4485 is touched only for DP (B8).
 
-### 6.4 VBUS
+### 6.4 VBUS (H3)
 
-Host for a bus-powered device needs: the DSP up (PianoPower level 2), the port in dual-role mode (the DSP's, 0x21015 to read),
-the OTG board configuration (opt-in write `0x201c`, `0x201a`, `0x201b`; PianoPower's allowlist change), then the DSP sources VBUS
-by itself (boost status 0x200d, notification 3/10). No native code switches a boost. A powered dock needs none of this.
+Host for a bus-powered device needs the DSP up (PianoPower level 2) with its board configuration (`piano-power=2`, writes on: the
+default; PianoMca's `board()` sends 0x201c, 0x201a, 0x201b on every charger generation, §2.4). The DSP's firmware then sources VBUS by
+itself when it sees a sink's Rd (an OTG adapter, a bus-powered stick); its Type-C state machine also needs its port notifications
+acknowledged (PianoPower does that) and is a dual-role port once it runs (the sink-only `0x02` SUN read was the port before the DSP).
+**No native code switches a boost, and none is planned**: no VBUS write exists anywhere (the relay refuses anything but UCSI reads and
+writes; UCSI's SET_PDR, the only power-role command, exists in the codec only and nothing sends it). A powered dock needs none of
+this (it sources).
+
+What "we source VBUS" looks like, the witnesses to read on the tablet (all read only, none of them new writes):
+
+| Line | Sourcing (an OTG adapter or a stick on the port) | Sinking (the Mac, a charger) | Source |
+|---|---|---|---|
+| PianoUsbHost `ucsi: connector 1 status …` (level 4) | `connected, partner UFP …, we are the provider (we source VBUS)` | `partner DFP …, we are the consumer (we sink)` | UCSI b20 |
+| PianoUsbHost `piano-usbhost-vbus` property | `source` | `sink` | the same |
+| PianoPower `[Ns] usb: …` (every report) | `a device is attached (we source)`, misc b6 set, b5 VBUS | `a source is attached (charger present)` | PMIC Type-C block, Linux's offsets |
+| PianoPower `[Ns] diag port: …` | OTG boost (0x200d) and gate (0x200e) **non-zero**, plug-in (0x21020) non-zero, sink/source (0x21022) the source value, Type-C mode (0x21015) the source value | 0, 0, 0, the sink value | xiaomi_mca names; **encodings not in the source: the tablet's two readings are the table** |
+| PianoPower `[Ns] mca: bus … mV` | about 5000 mV (our own boost) with the bus current our load | the source's | 0x20002 |
+| the device | a stick's LED, a keyboard's LEDs at power-up | — | eyes |
+
+A gap to know: PianoPower's built-in policy sees a bus above 4 V and counts it as a source attached; with our own 5 V on the bus it
+would write its input limit and charge current for "a source" of unknown type (500 mA in, the 5 V row). Harmless for the boost as far
+as the source says (the firmware's reverse mode does not take input), but it is a policy decision for PianoPower's owner (charging.md):
+ignore the bus while 0x200d reads boosting, or while UCSI says we are the provider.
 
 ### 6.5 Debugging while the port is a host
 
@@ -291,11 +320,89 @@ the linked set) for `log stream` and ssh. NCM over device mode (`piano-usb-net=1
   with the last one's idVendor:idProduct; a line per change and every 30 s. `-back=S`: the nub terminated (Apple's family stops its
   devices and the controller), RS 0 + HCRST, back to device mode.
 
+### 6.6 Levels 3 and 4: the port manager (H3/H4, built and host-tested)
+
+**The path to the DSP.** UCSI is not a QRTR service: the DSP serves it as owner 0x800b on the GLINK channel PMIC_RTR_ADSP_APPS,
+which PianoPower owns (its charger owner 0x800a and the port owner 0x800c are there too), so no `PianoAdspContract.h` port reaches it.
+The smallest extension that does is PianoPower's **USB-C relay** for UCSI, new files only plus five small hooks in `PianoPower.cpp`:
+- `package/include/PianoUsbcContract.h`: `piano_usbc_attach(client, ctx)` (one client: `state(ready, generation)` and `ucsi(data)`
+  callbacks), `piano_usbc_send(data, len)` (queued, at most 4; **only** a 12-byte UCSI read or a 64/544-byte UCSI write of owner 0x800b
+  passes: never the charger's owner, never the port owner), `piano_usbc_detach`, `piano_usbc_status`. The port notifications come
+  through PianoPower's port events (`PianoAdspContract.h` `piano_port_events`, `PortEvents.c`, read only, shared with PianoDp's D2).
+- `package/PianoPower/UsbcRelay.c` (the portable core, `tests/usbc_host.cpp`) and `PianoUsbcRelay.cpp` (the kernel glue: one spin
+  lock, callbacks on PianoPower's thread with it dropped, counted for a detach).
+- The hooks: the receive loop offers every message to the relay first (a UCSI message is the client's alone while it is ready, so
+  PianoMca's counters do not move; everything else, port notifications included, goes on to PianoMca and the port events); after each pass
+  `piano_usbc_relay_step(channel, ready, generation, this)` makes the state call and sends the queue; the wait does not block while a
+  send is pending; PianoPower's "we run no UCSI client" note says "not ready yet" when a client is attached.
+- **Ready** = the charger generation linked (charger_pd up or the 60 s fallback) **and** PianoPower's quiet down (board configuration
+  and port enable through) **and** its own UCSI buffer read of that generation answered or given up. A DSP or charger_pd restart is
+  ready 0, then ready 1 with a new generation: the client starts over from PPM_RESET; requests of the old generation are dropped.
+  PianoPower's other code (its suspend path included) is untouched.
+
+**The UCSI client** (`UcsiClient.h`, Linux's ucsi.c/ucsi_glink.c read as behaviour, the UCSI 1.2/2.0 specification for the layouts):
+- Init: a read (VERSION, CCI; a latched RESET_COMPLETE is cleared with SET_NOTIFICATION_ENABLE 0 first); PPM_RESET with the CCI polled
+  every 20 ms until RESET_COMPLETE (re-sent while the CCI shows anything else; notifications are off after a reset); SET_NOTIFICATION_
+  ENABLE (command complete, error); GET_CAPABILITY; GET_CONNECTOR_CAPABILITY(1); GET_CONNECTOR_STATUS(1); SET_NOTIFICATION_ENABLE with
+  every notification the optional features allow (Linux's rule); a last read for a change that came early. Writes use the 48-byte image
+  for 1.x, 528 for 2.x.
+- A command: the write, its answer (5 s), the completion: a notification → a read whose CCI has COMMAND_COMPLETE (busy CCIs ignored)
+  and carries MESSAGE_IN; then ACK_CC_CI (command complete, plus the connector change for a change's status without error) until
+  ACK_COMPLETE. An ERROR is followed by GET_ERROR_STATUS (logged). **Poll fallback**: with no notification, a read 250 ms after the
+  write's answer, then every 500 ms, up to 10 s; the `ucsi: ready` line counts completions *notified* and *polled*, which answers
+  whether the DSP notifies at all.
+- Ready: **nothing is sent and nothing polls**. A notification → a read → the CCI's connector field → GET_CONNECTOR_STATUS with the
+  change acknowledged → a status line and the role decision. A PPM that keeps reporting changes (more than 10 in 10 s) is not followed
+  until a later notification (no timer). A connector number above the capability's count is logged and ignored.
+- Failures (a timeout, a refused read or write, an init command refused): logged with the step, a new attempt after 10 s, three per
+  generation, then nothing until the next generation.
+- SET_UOR (`piano-usbhost-uor=1` DFP, `=2` UFP, once per generation at the first connected status) is a test switch, off by default:
+  with the Mac it would ask the Mac for a data-role swap. SET_PDR exists in the codec only.
+
+**Witnesses and decision** (`PortRole.h`): the role is `decideRole()`'s (§6.1) from UCSI's partner type: UFP or powered cable + UFP →
+host, DFP → device, debug → device, audio → none, **nothing attached → device**. Level 3 has no UCSI: it publishes the connection and
+orientation from the port notification and gpio61, and its role is always device. Power direction: UCSI b20 (provider = we source
+VBUS). Orientation: UCSI's b86 (2.x only: not on this 1.10 PPM), the port notification's orientation byte (when its mux is not "no
+connection"), gpio61 read at each status (high = reverse, as ucsi_glink reads it; only with a cable in), the PMIC's CC bit when SPMI
+is ours (not with PianoPower running); the first known one is published, any disagreement flagged. Published on the PianoUsbHost
+service (`ioreg -rc PianoUsbHost -l | grep piano-usbhost`): `piano-usbhost-ucsi`, `-port`, `-role`, `-role-why`, `-vbus`,
+`-orientation`, `-handoff`, `-summary`; a `port:` line on every change of the summary.
+
+**Battery.** The port manager's thread sleeps with no timeout while nothing is in flight (`portWait(seen, 0)`): with nothing
+attached, after the init, it never wakes unless the DSP sends something. The only timers are a command's completion and answer
+timeouts, the reset's 20 ms polls (at most 10 s per generation), the failure retry (three per generation), the switch's debounce and,
+during a host session only, the port watch every `piano-usbhost-period` ms. PianoPower's own 5 s charger cycle is unchanged (not ours).
+
+**The switch** (`RoleSwitch`, default off: `piano-usbhost-handoff=0` publishes "would switch to host" and writes nothing). With
+`piano-usbhost-handoff=5` (host with our own probe: §6.2a's switch, the No-Op, the root ports, the port watch; `piano-usbhost-reset=1`
+for the USB 2 port reset) or `=6` (Apple's xHCI on the nub, §6.5a; needs `PIANO_USBHOST_STACK=1`): host once the decision has read host
+for `piano-usbhost-debounce` ms (1000: a dock's data-role swap settles first), device **at once** when it reads anything else (an
+unplug gives the port back to the debug cable). A failed host attempt leaves device mode and is not repeated until the partner goes
+away. The SMMU route for stream 0x40 is set in `start()` only when the switch is on (bypass for 5, identity for 6).
+
+**The hand-off with PianoDwc3** (`package/PianoDwc3/UsbHandoff.h`, default off on PianoDwc3's side too: `piano-usb-handoff=1`).
+PianoUsbHost finds the registered PianoDwc3 service by class and calls its platform function `piano-usb-handoff` (no link
+dependency): **release** → PianoDwc3's USB thread, between passes, stops its device controller (RUN_STOP 0, the halt awaited), masks
+its event interrupt (and leaves interrupt mode: SPI 133 may be Apple's xHCI's next), parks; then our host switch. **Reclaim** (after
+our way back: the xHCI halted and reset, PRTCAPDIR device, the override as found) → PianoDwc3 re-reads the core's GDSC and branch clocks
+and only when they read on runs its whole takeover again; its replay of the retained log then shows the host session on the Mac.
+`state` answers starting (asked too early: we ask again in 2 s), device, released, failed, and withdraws a pending ask. With PianoDwc3 owning the controller
+(`piano-usb>=2`) and no `piano-usb-handoff=1`, PianoUsbHost refuses the switch at `start()` and PianoDwc3 answers "unsupported" anyway.
+
+**Never a VBUS-override store with the clocks off** (K:7dffd78b342d): our glue stores are XhciHost.h's, each right after its five-clock
+gate read on; PianoDwc3's QSCRATCH writes (the override, the UTMI select) go through its sleep guard (`UsbSleep.h`'s `qsWrite`: to the
+glue only while awake with its clocks read on just then, else recorded and written after the wake), and its reclaim waits out a sleep
+and refuses the takeover when the clocks read off. PianoDwc3 releases only while awake (never in a sleep's kept state); while it is
+parked `gRunning` is false, so a system sleep is answered by its `setPowerState` without touching the core. A release PianoDwc3 did not
+take within 2 s is withdrawn (`state` withdraws a pending ask), so it can never be parked with nobody to reclaim it. What is **not** there
+yet is H9's side for our host session: PianoUsbHost is not in the power tree, so a sleep entered during a host session does not stop
+our probe or Apple's xHCI first (the switch is default off; do not combine it with sleep tests).
+
 ## 7. Boot args and component
 
 | Boot arg | Default | Effect |
 |---|---|---|
-| `piano-usbhost=N` | 0 (probe declines, nothing mapped) | 1 read-only survey; 2 survey + watch of the port; **5** the survey, then host mode with our own xHCI probe (§6.2a); **6** the survey, the switch, then Apple's xHCI on our nub (§6.5a); 3, 4 and others run as 2 |
+| `piano-usbhost=N` | 0 (probe declines, nothing mapped) | 1 read-only survey; 2 survey + watch of the port; **3** the survey, then the port manager with the port notifications only; **4** the same with our UCSI client (§6.6; both need `piano-power=2`); **5** the survey, then host mode with our own xHCI probe (§6.2a); **6** the survey, the switch, then Apple's xHCI on our nub (§6.5a); others run as 2 |
 | `piano-usbhost-delay=S` | 0 | wait S s first |
 | `piano-usbhost-xhci=0/1/2` | 1 | 1: capability words when clocked, the rest in host/OTG mode; 2: the rest in device mode too; 0 none |
 | `piano-usbhost-qmp=0` | 1 | skip the QMP PHY |
@@ -309,16 +416,24 @@ the linked set) for `log stream` and ssh. NCM over device mode (`piano-usb-net=1
 | `piano-usbhost-slots=N` | 8 | MaxSlotsEn of our probe |
 | `piano-usbhost-attach=0/1/2` | 1 | level 6: the nub only, the codeless personality, an allocation by name |
 | `piano-usbhost-irq=0/1` | 1 | level 6: polled every 1 ms, SPI 133 (polled anyway when the INTID is taken) |
-| `piano-usbhost-probe=0/1` | 1 | level 6: our No-Op probe before Apple's driver |
+| `piano-usbhost-probe=0/1` | 1 | level 6: our No-Op probe before Apple's driver (and in `-handoff=6`'s host sessions) |
+| `piano-usbhost-handoff=0/5/6` | 0 | levels 3/4: **the role switch**: 0 the decision published only ("would switch"); 5 host sessions with our probe; 6 with Apple's xHCI on the nub (`PIANO_USBHOST_STACK=1`). With `piano-usb>=2` it also needs PianoDwc3's `piano-usb-handoff=1`, else refused at start |
+| `piano-usbhost-debounce=MS` | 1000 | levels 3/4: how long the decision must read host before the switch (at most 10000); device is at once |
+| `piano-usbhost-uor=0/1/2` | 0 | level 4, a test switch: SET_UOR once per generation at the first connected status: 1 ask for DFP (we host), 2 for UFP |
+| `piano-usb-handoff=0/1` (PianoDwc3) | 0 | PianoDwc3 answers PianoUsbHost's release/reclaim (UsbHandoff.h) and registers its service for it; 0: the controller is PianoDwc3's for the whole boot |
 
 Levels 5 and 6 refuse (and run the level 1 survey) while PianoDwc3 owns the controller (`piano-usb>=2`). The one exception is level
 5's **hand-off by time**: `piano-usbhost-back=S` and `piano-usb-delay >= piano-usbhost-delay + S + 30`: the host session ends, the core
 is back in device mode, and PianoDwc3's takeover (its own halt, soft reset and device programming) starts later; its replay of the
-retained log then shows the host session on the Mac. No PianoDwc3 code is involved (H8 adds a real hand-off).
+retained log then shows the host session on the Mac. No PianoDwc3 code is involved. Levels 3/4 with `piano-usbhost-handoff=5|6` are
+the real hand-off (§6.6): PianoDwc3 released and reclaimed through its platform function, both sides default off.
 
 Component: `PianoUsbHost` in `configs/k27-native-kexts.txt` (`tooling/k27/kext/PianoUsbHost.json`, bundle
-`com.unixnu.driver.PianoUsbHost`, IOService on `IOPlatformExpertDevice`, kpi libraries only); build
-`tooling/k27/build-native-piano-usbhost.sh` (three host tests). Level 6 also needs the collection from `PIANO_USBHOST_STACK=1`
+`com.unixnu.driver.PianoUsbHost`, IOService on `IOPlatformExpertDevice`, kpi libraries and `com.unixnu.driver.PianoPower` for the
+relay's `piano_usbc_*` and the port events' `piano_port_*` functions, listed after PianoPower); build
+`tooling/k27/build-native-piano-usbhost.sh` (four host tests,
+`ucsi_host` the simulated PPM). The relay is PianoPower's (`build-native-piano-power.sh`, `usbc_host`); the hand-off decision is
+PianoDwc3's (`tests/usb_handoff_host.cpp`). Level 6 also needs the collection from `PIANO_USBHOST_STACK=1`
 (`package/PianoUsbHostStandIn`, `tooling/k27/kext/PianoUsbHostStack.json`, §5.2a); on the default collection it logs the class as
 not registered and attaches nothing.
 
@@ -331,8 +446,8 @@ RAM boots, owner present, Ubuntu returns on reboot. Each step is opt-in by boot 
 | H1 survey | `piano-usbhost=1` (+ `piano-usb=2` for the console, or alone) with the Mac cable | the lines below, no hang; facts: PRTCAPDIR, IP version, xHCI caps and ports if clocked, PHY mode/orientation, port mode, repeater owner | built; 1 session |
 | H1b watch | `piano-usbhost=2`: plug Mac, charger, OTG adapter with a keyboard, both orientations; again with `piano-power=2 piano-usbhost-spmi=1` | changes logged; DSP off: no attach for the OTG adapter (sink-only); DSP on: source mode + Rd; witnesses agree | 1 session |
 | H2 DSP view | PianoPower: read 0x21015/0x21022/0x200d/0x200e/0x21020, decode the PAN payload, UCSI READ_BUF (VERSION, CCI) only | values for each plug case | 1–2 d + 1 session |
-| H3 OTG power | opt-in board configuration writes | VBUS on an OTG adapter (keyboard LED), boost status non-zero, no charging regression | 1 d + 1 session |
-| H4 UCSI | PPM_RESET … GET_CONNECTOR_STATUS, notifications (from QcomUcsi.h) | partner UFP for the adapter, DFP for the Mac, dock UFP after its swap | 2–3 d + 1 session |
+| H3 OTG power | PianoPower's board configuration (level 2 with writes, the default); the witnesses of §6.4; the PianoDwc3 ↔ PianoUsbHost hand-off (default off) | VBUS on an OTG adapter (the stick's LED, `we are the provider`), boost status non-zero, no charging regression | **built and host-tested** (§6.4, §6.6; images A1/A2 §8.3); 1 attended session |
+| H4 UCSI | `piano-usbhost=4`: the UCSI client over PianoPower's USB-C relay (PPM_RESET … GET_CONNECTOR_STATUS, every change), the decision and the witnesses as properties | partner UFP for the adapter, DFP for the Mac, dock UFP after its swap; the orientation witnesses agree | **built and host-tested** against a simulated PPM (`tests/ucsi_host.cpp`); U0/U1 unattended, A1 attended (§8.3) |
 | H5 host core | `piano-usb=0`, our own xHCI probe: role switch, UTMI-as-PIPE, HCRST, rings in a WC region, a No-Op command (completion code 1, the right TRB pointer: SUN's acceptance), PORTSC.CCS with a keyboard, port reset → enabled + speed; back to device | all of it, and device mode works after `piano-usbhost-back` | **built and host-tested** (`piano-usbhost=5`, §6.2a); 2 sessions (H5a/H5h below; H5c needs VBUS: H3 first) |
 | H6 Apple stack | the KC keep-list + stand-in extension (§5.2), `PianoUsbHostNub`, coherent stream 0x40, A1 then A2/B | IOUSBHostDevice in ioreg, typed keys, a stick mounts, a USB-Ethernet dongle up | **A1 prepared** (`piano-usbhost=6`, `PIANO_USBHOST_STACK=1`, §5.2a, §6.5a): links, gated; 1–2 sessions to learn whether A1 runs, then 1–2 weeks |
 | H7 SuperSpeed | QMP USB3-only init (Linux's tables as specification), orientation select | a USB3 stick at 5 Gbit/s (PORTSC speed 4) in both orientations | 1–1.5 weeks |
@@ -468,10 +583,115 @@ controller on: also A2). DCBAAP/ERSTBA above 4 GiB with `HSE` or no events → t
 low half first): our own 32-bit IOMapper on stream 0x40 (no Apple ABI) or A2's 64-bit write override. A device on the port (with
 VBUS, as H5c) counted under `USB devices` with its idVendor:idProduct is the H6 pass's first half (ioreg: IOUSBHostDevice).
 
+### 8.3 H3/H4 test images and the batched tablet list (`piano-usbhost=3|4`)
+
+Built like image G2 (charging.md §5e), in the main checkout (`PIANO_K27_TREE` from `~/.config/piano/env`): RAM boots through
+`tooling/native/native-loop.sh IMAGE out/ram-dump/boot-piano-macos-ram-A-bundled.img`; the logs from the pstore mailbox
+(`logs/native-runs/<ts>-loop/xnu-console.txt`) and, while the Mac cable is in, the USB console (`python3 tooling/native/usb-console.py
+--capture 1000 &`). Every image runs PianoPower at level 2 **with writes** (the board configuration is the H3 prerequisite; it also
+writes the input limit and charge current, as image I / P1 do). Common prefix:
+
+```sh
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=420 \
+  PIANO_EXTRA_ARGS="exec-log=1 piano-usb=2 piano-power=2 <the image's arguments>" tooling/k27/build-native-image.sh
+mkdir -p out/ram-usbc/<image> && cp out/ram/boot-piano-macos-ram-A-bundled.img out/ram/build-A-bundled.json out/ram-usbc/<image>/
+grep -E 'PianoUsbHost: (level|port|ucsi|role|hand-off|stage 4|host|No-Op|port [0-9])|PianoPower: (ucsi|mca: (USB-C|board|write)|\[[0-9]+s\] (usb|diag port))|PianoDwc3: hand-off' \
+  logs/native-runs/<ts>-loop/xnu-console.txt
+```
+
+| # | Image | Arguments | Attended? | Plugs | What it answers |
+|---|---|---|---|---|---|
+| U0 | `out/ram-usbc/U0` | `piano-usbhost=3` | **unattended** (the Mac cable stays in) | the Mac's USB-C port | the relay under PianoPower (ready after the quiet), the port notification's payload for the Mac (orientation, mux), gpio61 against it; no UCSI command at all (the lowest-risk image) |
+| U1 | `out/ram-usbc/U1` | `piano-usbhost=4` | **unattended** (the Mac cable stays in) | the Mac | the UCSI init on the real PPM (does it notify completions: `notified` vs `polled`), the Mac as **DFP**, we **sink**, its power mode (the 3.0 A Rp: `Type-C 3.0 A`, or PD), role **device**, the console unaffected; idle afterwards (no line until a plug) |
+| A1 | `out/ram-usbc/A1` | `piano-usbhost=4` (switch off) | attended | Mac → out (+60 s) → OTG adapter + USB stick (+75 s, 45 s) → out → OTG adapter + keyboard (+30 s) → out → Mac (by +300 s); then the same with the plug flipped | **H3**: VBUS from the DSP for the stick (its LED; `we are the provider`; PianoPower's `usb:` and `diag port:` lines; the boost values); **H4**: partner **UFP** → role **host** (`would switch`), unplug → device, the Mac again → DFP; the three orientation witnesses in both orientations |
+| A2 | `out/ram-usbc/A2` | `piano-usb-handoff=1 piano-usbhost=4 piano-usbhost-handoff=5 piano-usbhost-reset=1` | attended | as A1 (stick, keyboard, the Mac last) | the live switch: PianoDwc3 released, our host switch and probe, the stick's port connected, reset, **enabled, high speed**; the unplug: back to device, PianoDwc3's takeover again; the Mac's console enumerates afterwards and its replay shows the session |
+| A3 | `out/ram-usbc/A3` (`PIANO_USBHOST_STACK=1`) | as A2 with `piano-usbhost-handoff=6` | attended, after A2 passes | stick | Apple's xHCI on the nub inside a live session: `USB devices 1`, the stick's idVendor:idProduct, a mount (H6's question, §8.2) |
+
+Expected lines, U1 (values to be measured; `…` elides the survey of §8):
+
+```
+PianoUsbHost: start: piano-usbhost=4 delay=0 xhci=1 qmp=1 spmi=0 watch=300 period=1000 (DWC3 0xa600000, QMP 0x88e8000, orientation gpio61)
+PianoUsbHost: level 4: the UCSI client (PPM_RESET, notifications, GET_CAPABILITY, GET_CONNECTOR_STATUS) and the port notifications from PianoPower (its USB-C relay and port events; needs piano-power=2); the role, power direction and orientation published; role switch off (debounce 1000 ms)
+…
+PianoUsbHost: stage 40: port manager: the UCSI client over PianoPower's USB-C relay, the port notifications from its port events
+PianoUsbHost: port: attached to PianoPower's USB-C relay (the UCSI owner 0x800b) and its port events (slot taken, 0 seen before); the role switch is off (piano-usbhost-handoff=0: the decision is published, nothing is switched)
+PianoUsbHost: stage 41: port manager: running (event-driven)
+PianoUsbHost: role: device: no Type-C state: device mode (the debug cable's default)
+PianoUsbHost: port: ucsi waiting | port ? | orientation - | vbus - | role device | hand-off off
+PianoPower: mca: msm/adsp/charger_pd is up: reading the charger properties
+PianoPower: ucsi: reading the buffer of owner 0x800b (read only)
+PianoPower: ucsi: owner 0x800b answers: version 1.10, CCI 0, 48-byte buffer (UCSI 1.x), return code 0
+PianoPower: mca: USB-C port notifications enabled: owner 0x800c answered the enable (opcode 0x15, cmd 0x10)
+PianoUsbHost: port: notification: port 0, orientation 0 (normal), mux 1 (USB3 only), SVID 0x0000, 32 bytes        (if the DSP reports the state after the enable)
+PianoPower: mca: board configuration taken (CP state, OTG configuration, CID): the policy follows
+PianoPower: quiet: released: the charger is configured
+PianoUsbHost: port: the DSP's USB-C owners are ready (generation 1): the UCSI client starts (PPM_RESET first)
+PianoUsbHost: ucsi: connector 1 status XXXXXXXX XXXXXXXX XX: connected, partner DFP (flags 0x1), we are the consumer (we sink), power mode Type-C 3.0 A, changes 0x…, RDO 0x…, battery charging N (the init's)
+PianoUsbHost: ucsi: ready: UCSI 1.10, 48-byte mailbox, 1 connector(s) (attributes 0x…, features 0x…, N alternate modes, BC …, PD …, Type-C …); connector 1 capability 0x… (DRP, USB3, alt modes, provider, swaps to DFP); notifications 0x…; 5 commands, completions 5 notified 0 polled, 0 busy
+PianoUsbHost: role: device: UCSI: the partner is a DFP (a computer)
+PianoUsbHost: port: ucsi ready | port DFP | orientation normal | vbus sink | role device | hand-off off
+```
+
+Then nothing more from PianoUsbHost until a plug (the thread sleeps without a timer). `ioreg -rc PianoUsbHost -l | grep piano-usbhost`
+over the console's shell shows the same in the properties. U0 has no `ucsi:` lines; its summary reads `ucsi off | port connected
+| orientation …` from the notification and gpio61, role device.
+
+A1, the stick (H3 + H4, nothing switched):
+
+```
+PianoUsbHost: ucsi: connector 1 status …: nothing attached, partner none (flags 0), -, power mode none, changes 0x4000, …      (the Mac out)
+PianoUsbHost: role: device: UCSI: nothing connected (device mode stays armed for the debug cable)
+PianoUsbHost: port: notification: port 0, orientation 2 (none), mux 0 (no connection), SVID 0x0000, 32 bytes
+PianoUsbHost: ucsi: connector 1 status …: connected, partner UFP (flags 0x1), we are the provider (we source VBUS), power mode USB default, changes 0x5000, …
+PianoUsbHost: role: host: UCSI: the partner is a UFP (a peripheral, a hub or a dock's data side) (would switch to host: piano-usbhost-handoff=0)
+PianoUsbHost: port: notification: port 0, orientation 1 (reverse), mux 1 (USB3 only), SVID 0x0000, 32 bytes
+PianoUsbHost: port: ucsi ready | port UFP | orientation reverse | vbus source | role host | hand-off off
+PianoPower: [Ns] usb: a device is attached (we source) on CC2, …
+PianoPower: [Ns] diag port: verify (0x21002) 0, PD state (0x2100d) …, data role (0x2100c) 2?, OTG boost (0x200d) NONZERO, gate (0x200e) NONZERO, plug-in (0x21020) 1?, Type-C mode (0x21015) …, CC toggle …, sink/source (0x21022) …, online …
+```
+
+Pass H3: the stick's LED, `we are the provider (we source VBUS)`, PianoPower's `a device is attached (we source)`, the boost values
+non-zero (note them: they are the encodings §2.4 lacks); no charging regression once the Mac is back (the gauges' current as before).
+Pass H4: UFP / host for the stick and the keyboard, DFP / device for the Mac, nothing / device in between; the witnesses agree in both
+orientations (`orientation reverse` with the plug flipped, no `DISAGREE`). A dock, if one is at hand: DFP first, then a partner
+change to UFP (`changes 0x0800`) and role host after its swap, `we are the consumer` (it powers us).
+
+A2, the switch (after the UFP status, 1 s debounce):
+
+```
+PianoUsbHost: hand-off: PianoDwc3 asked to release the controller: released
+PianoDwc3: hand-off: released to PianoUsbHost (1): DCTL … DSTS … (halted); the console keeps its log for the replay
+PianoUsbHost: hand-off: host session 1: the switch, then our xHCI probe
+PianoUsbHost: stage 10: host switch: …                                   (§8.1's H5a lines: the switch, HCRST, rings, run)
+PianoUsbHost: No-Op: event …: type 33 code 1 for TRB 0x… (expected 0x…) after N us, …: PASS
+PianoUsbHost: port 1 (USB 2) PORTSC 00000203…: connected 1 enabled 0 power 1 …
+PianoUsbHost: port 1: reset: PORTSC … -> … in N ms: enabled, high speed
+PianoUsbHost: hand-off: host ports 1:high 2:-
+PianoUsbHost: hand-off: host mode
+…  (the unplug)
+PianoUsbHost: ucsi: connector 1 status …: nothing attached …
+PianoUsbHost: role: device: UCSI: nothing connected (device mode stays armed for the debug cable)
+PianoUsbHost: hand-off: host session 1 ends after N s (M port changes): back to device mode
+PianoUsbHost: back: GCTL …2… (PRTCAPDIR 2) …; override restored 1; N stores: device role (PianoDwc3's takeover programs the rest)
+PianoUsbHost: hand-off: PianoDwc3 reclaims the controller: device (PianoDwc3 runs the controller)
+PianoDwc3: hand-off: reclaim 1: the core is back from PianoUsbHost: the takeover again
+PianoDwc3: stage 10: takeover: power and clocks … stage 19: takeover: run
+PianoUsbHost: hand-off: device mode
+```
+
+Pass: the same for the keyboard (`enabled, low|full speed`), the Mac's console enumerates when it is plugged back and its replay holds
+every line above. Reading the failures: `PianoDwc3 keeps the controller` → the image lacks `piano-usb-handoff=1`;
+`released` never comes (`device`) → PianoDwc3's thread did not take the ask within 2 s (its log); a stage 10–17 failure → §8.1's
+reading; `reclaim … clocks read off` → the core lost its clocks in the session (no takeover was tried, by design: reboot).
+
+Risks of the batch (also §6.6): U1/A1/A2 send UCSI commands to the DSP's PPM for the first time (PPM_RESET included): a firmware that
+handles them badly could stall its Type-C state machine (charging included) until the next DSP start, which natively is the next boot;
+U0 first isolates that. A2 writes the controller (as H5) and hands it between two kexts for the first time.
+
 ## 9. Fallback
 
 Without `piano-usbhost` nothing changes: PianoDwc3 owns the port in device mode (console, HID, NCM), PianoPower reads the Type-C
-state for charging; without `PIANO_USBHOST_STACK=1` the collection is the usual one, and with it nothing of Apple's stack loads
+state for charging (and its relay has no client: PianoMca sees every message as before); without `PIANO_USBHOST_STACK=1` the collection is the usual one, and with it nothing of Apple's stack loads
 unless `piano-usbhost=6` opens the gate. At levels 5 and 6 a failed step stops the session where it failed (logged with its stage);
 with `piano-usbhost-back=S` the core is returned to device mode, else it stays as left until the next boot (the firmware resets the
 controller for its own device mode). Later, the role manager (H8) returns the core to device mode itself.
@@ -482,7 +702,7 @@ controller for its own device mode). Later, the role manager (H8) returns the co
 2. Does the PMIC's CC bit agree with gpio61 (high = reverse) and the PHY's select in both orientations? → H1b.
 3. Who owns the repeater's and the Type-C block's APIDs for writes (EE 0?) → H1 `spmi:` line.
 4. Does the DSP switch the port to dual role and source VBUS by itself after the board configuration, and what do 0x21015 /
-   0x21022 / 0x200d read? → H2/H3.
+   0x21022 / 0x200d read? → H3: images A1/A2 (§8.3; the two readings, sourcing and sinking, are the encodings).
 5. Is `AppleUSBXHCI` instantiable through a codeless personality, does its base class write 64-bit registers low first, and does
    it take its provider's IOMapper? → H6a/H6b (`attach:` lines; DCBAAP/ERSTBA read from our side; no mapper is offered yet).
 6. The `gAppleARMUSBCable*` values IOAccessoryManager and IOUSBHostFamily expect → H6 (`stack: resource AppleUSBCableType`); the
@@ -498,6 +718,15 @@ controller for its own device mode). Later, the role manager (H8) returns the co
     values (GSBUSCFG1, RXTHRCFG, GUCTL1, GUCTL3, DSBLCLKGTNG) for transfers (not for a No-Op)? → H5c/H6 with a device.
 11. Does host mode need the eUSB2 repeater's 19.2 MHz clock force (Linux's host-mode workaround) for connection or only for L2? → H5c.
 12. A largest-first placement in the KC builder (k27 tree) would let PianoTouch stay in the stack build (§5.2a).
+13. Does the DSP's PPM notify command completions (or only connector changes), and does it take PPM_RESET from us with charging
+    unaffected? → U1's `ucsi: ready … completions N notified M polled` and the gauges' current before/after (§8.3); U0 first.
+14. Does GET_CONNECTOR_STATUS give UFP for an OTG adapter with a stick, a keyboard, and for a dock after its swap (and DFP for the
+    Mac), with the power direction right? → A1.
+15. The port notification's payload on piano (32 bytes? orientation with nothing attached? the mux value for a USB 2 device: "USB3
+    only" or "none"?), and does its orientation agree with gpio61 in both plug orientations? → U0/A1 `port: notification` lines.
+16. Does PianoDwc3's takeover run cleanly a second time after a host session (event buffer, FIFOs, the UTMI selection kept), and
+    does the Mac's CDC-ACM driver enumerate it again? → A2.
+17. PianoPower's built-in policy counts our own 5 V as a source attached while we source (§6.4): its owner's decision.
 
 ## 11. Licence note
 
@@ -507,3 +736,7 @@ Project-SunUEFI are BSD-2-Clause-Patent: `SmmuIdentity.h` adapts QcomDwc3's `smm
 QcomDwc3's nub as facts and shape; otherwise only facts and design are taken (their GPL PHY headers are not used, nor QcomDwc3's
 AppleUSBXHCI subclass: path A2). From Apple's kernel collection only kext names, class names, OSBundleLibraries, Info.plist matching
 dictionaries and the link report's symbol names are used (§5); no Apple binary was disassembled, and no vtable fixture exists.
+The UCSI client (`Ucsi.h`, `UcsiClient.h`) is written from the UCSI specification's layouts and command set; Linux's ucsi.c,
+ucsi_glink.c and pmic_glink_altmode.c (GPL-2.0) were read as described behaviour (the init order, the reset's polling, the
+acknowledgements, the supported-notifications rule, the GLINK framing and the port notification's layout), nothing pasted; QcomDwc3's
+`QcomUcsi.h` (BSD-2-Clause-Patent) gave the framing facts. PianoPower's relay and PianoDwc3's hand-off are this repository's own.
