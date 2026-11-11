@@ -29,7 +29,8 @@ contact work runs **in the kext** (`TouchMatrix.h`, Project-SunUEFI's decoder fo
 | Protocol | trim ID `0e .. .. 32 65 03`; cascade: event buffer 0x11c400, poll info 0x1093d8; reset state 0xa0..0xaf, calibrated 0xa3 | SunUEFI, ShengNovatekTouch | verified on piano by SunUEFI (download, idle frames) |
 | Frame | 257-byte transport block + THP packet (checksum, 40 x 60 int16); BOE payload 5192 B (frame 5449 B); 120 Hz | plan §1; Ubuntu | verified (Ubuntu) |
 | Images | `novatek_nt36532_piano_fw_{boe,csot}.bin`, 245,760 B each (sha256 `b7999389…` / `14b30bb7…`) | xiaomipad-8pro-mainline `firmware/piano-input.json` | verified; both download byte-exact into the host model |
-| Orientation | X along the 60 columns (3200 px), Y along the 40 rows, raw Y runs up the panel (flipped by default) | SunUEFI touch-view port; Ubuntu udev flip | inferred: the corner test settles it |
+| Orientation | X along the 60 columns (3200 px), Y along the 40 rows (row-major matrix); BOE: panel Y = processor Y (no flip), CSOT: reversed; X never flipped | piano-thp `frame.cpp`, `orientation.hpp`; this BOE unit ran so on Ubuntu | verified (Ubuntu); the verification step confirms it natively |
+| Calibration | per unit, private: electrode centres `row_map[40]`, `column_map[60]` (52-54 px steps, not uniform), maxima 21360 / 32000 (pixels x 10), edge band 600 (60 px), gain 4350 / base 2700; `project_vendor_id` 26 = BOE | the unit's Ubuntu file (§7) | verified (file); its arrays are never written down here |
 
 ## 3. Specification sources
 
@@ -47,8 +48,9 @@ controller natively in UEFI over GPIO SPI (firmware loaded, idle baseline; touch
 | start sequence (fw info, idle baseline 0x19, host-command handshake) | ShengNovatekTouch 69fdd62, Apache-2.0 (NOTICE kept) | re-written |
 | bypass context bank | `package/PianoDwc3/SmmuStream.h` | included |
 | HID class, publication, personality | `package/PianoKeyboard` / DroidVMInput | same pattern |
+| calibrated position, edge mapping, calibration check | piano-thp `nvt_touch_core.cpp` (Apache-2.0, modified from xiaomi-sheng-thp by ianchb), `calibration.cpp`, `orientation.hpp`, `panel.cpp` (MIT) | re-written (`TouchMatrix.h`, `gen-touch-calibration.py`) |
 
-Not used in this pass: ShengNovatekTouch's multi-contact tracker, the per-unit calibration (`thp-calibration.json`, private).
+Not used in this pass: the multi-contact trackers (ShengNovatekTouch's, piano-thp's) and piano-thp's filters.
 
 ## 5. IOKit family / ABI
 
@@ -70,7 +72,7 @@ by tap in the piano VM), matched by a codeless `IOHIDEventDriver` personality; t
 | `piano-touch-mode=V` | 2 | operating-mode command value (65536: not sent) |
 | `piano-touch-baseline=0` | 1 | no idle-baseline command |
 | `piano-touch-threshold=T` | 200 | contact threshold of the decoder |
-| `piano-touch-flip=B` | 2 | bit 0 X, bit 1 Y flipped |
+| `piano-touch-flip=B` | auto | auto: by the panel (BOE none, CSOT Y reversed; the calibration's panel wins over gpio100 here, its `invert_y` over both); 0..3: bit 0 X, bit 1 Y flipped |
 | `piano-touch-poll=MS` | 1 | edge polling interval |
 | `piano-touch-trace=1` | 0 | more frame headers; contact positions also at level 2 |
 
@@ -81,6 +83,16 @@ real images downloaded into the model with its CRC check; decoder, tip debounce,
 the ignored `out/native-kexts/PianoTouch/firmware` and `.incbin`'d, the objects. `tooling/k27/build-native-image.sh` builds it
 with the list; PianoTouch links after PianoA830 (it takes A830's `sm8750_gcc_vote_owner` around the 0x52008 write). Without the
 images the build warns and step 5 stops on the target ("no usable image").
+
+**Calibration.** The unit's Ubuntu touchscreen calibration is a private JSON file (schema 1), made by xiaomipad-8pro-mainline
+`tools/extract-thp-calibration.py` from the vendor `piano_nova_<panel>_thp_config.ini`. Its path is `PIANO_TOUCH_CALIBRATION`, in
+the environment or `~/.config/piano/env`; no path, hash or value of it is in this repository. The build passes it through
+`tooling/k27/gen-touch-calibration.py`, which checks it as piano-thp does (40 x 60, 10 units per pixel, strictly increasing maps
+inside their maxima, edge band below half an axis) and writes `out/native-kexts/PianoTouch/gen/PianoTouchCalibration.h` (ignored).
+The build prints `calibration: unit file (panel BOE, sha256 xxxxxxxx), electrode maps, edge 60 px`, or `calibration: none (...):
+linear map` when the file is absent, unset (`PIANO_TOUCH_CALIBRATION=` in the environment) or invalid (with the reason). With it, a
+contact's position is piano-thp's: the electrode positions weighted by max(delta - 25, 0) over the peak's 3 x 3 nodes, then the
+edge stretch, then the orientation, then / 10 to pixels. Without it, the linear map over node centres.
 
 ## 8. Hardware test plan
 
@@ -94,10 +106,12 @@ tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
 grep 'PianoTouch:' logs/native-runs/*-loop/xnu-console.txt | tail -80      # or live: tooling/native/usb-console.py
 ```
 
-During the run, once the login window shows: tap ~1 cm in from the top-left, top-right, bottom-left, bottom-right corners, then
-drag left to right. Level 2: the same build with `piano-touch=2`; tap the user icon, drag; do not tap Sleep/Restart/Shut Down.
+During the run, once the login window shows (verification, not calibration: the unit's maps are built in): press a fingertip as
+far into each corner as it goes (top-left, top-right, bottom-left, bottom-right), then once in the middle, then drag left to right.
+Level 2: the same build with `piano-touch=2`; tap the user icon and small targets, drag; do not tap Sleep/Restart/Shut Down.
 
-Level 1, expected in order: `start: piano-touch=1 ...`; `step 1` with six `pins:` lines, `gcc: vote 0x52008 = ...`,
+Level 1, expected in order: `start: piano-touch=1 ... flip auto ...`; `calibration: unit file (panel BOE, sha256 xxxxxxxx),
+electrode maps, edge 60 px`; `step 1` with six `pins:` lines, `gcc: vote 0x52008 = ...`,
 `gcc: SE2 clock: ...` (a hardware-gated AHB branch reads `hw-gated`, which counts as running), `se2: FW_REVISION ... (protocol 1: SPI) IF_DISABLE 00000001 (FIFO disabled: SE DMA)` (or `registers not
 read (a QUP1/SE2 clock is off)`), two `firmware CSOT|BOE: 245760 bytes ... parsed`; `step 2`, `smmu: ... bypass set`; `step 3`,
 `geni: votes ... (set under the lock | already set) ... branches on`, `geni: SE2 clock N Hz ... divider ...`, `geni: SE DMA through ...`,
@@ -105,15 +119,20 @@ read (a QUP1/SE2 clock is off)`), two `firmware CSOT|BOE: 245760 bytes ... parse
 `geni: loopback PASSED`, `geni: pins qup1_se2`; `step 4`, `identify (GENI): NT36532 ... id 0e .. .. 32 65 03, table 0 (E),
 cascade, event buffer 0x11c400`; `step 5`, `firmware: lcd-id gpio100 = 1: BOE panel`, `firmware: download 1 done ... reset state
 0xa0..0xaf`; `step 6`, `start: scanning ...; payload 5192 ...; ... calibrated ...; baseline command taken, mode 2 taken`; `step 7`, `frames: first gpio162 edge`, three
-`frame N ... checksum ok` lines, `matrix: reference of 32 frames ...`, `frames at 5 s: ~120 reads/s, ~120 edges/s ...` every 5 s
-for 30 s then every 60 s, and per touch `touch N down at (x, y) px` / `touch N up ... after T ms`. Pass: checksum ok >= 99 %,
-corners about 125 px (1 cm) in from each edge: near (125, 125), (3075, 125), (125, 2010), (3075, 2010) px, Y growing downward
-(Y upside down: `piano-touch-flip=0`; X mirrored: `=3`; both: `=1`). Level 2 adds `HID device: tablet pointer ...` and
-`event service IOHIDEventDriver published on the touch screen`; the pointer follows the finger and taps click.
+`frame N ... checksum ok` lines, `orientation: flip X 0, Y 0 (BOE panel: as processor Y; panel BOE by the calibration),
+position from the unit's electrode maps and edge mapping`, `matrix: reference of 32 frames ...`, `frames at 5 s: ~120 reads/s, ~120 edges/s ...` every 5 s
+for 30 s then every 60 s, and per touch `touch N down at (x, y) px` / `touch N up ... after T ms`. Pass: checksum ok >= 99 %;
+the corner presses land within about 10 px of the panel's corners, (0, 0), (3199, 0), (0, 2135), (3199, 2135) (the edge stretch
+reaches the border), the middle one near (1600, 1068), Y growing downward. A corner on the wrong side means the orientation is
+wrong (`piano-touch-flip=2` reverses Y, `=1` X, `=3` both); corners 20-60 px short of the border mean the edge mapping is not in
+use (`calibration: none` in the log). Level 2 adds `HID device: tablet pointer ...` and `event service IOHIDEventDriver published on
+the touch screen`; the pointer lands under the fingertip (within about 10 px, under a millimetre) and taps click.
 
 | Line | Meaning, next step |
 |---|---|
 | no `PianoTouch: start` | KC without PianoTouch, or no `piano-touch` argument |
+| `calibration: none (linear map)` / `... INVALID: none` | the KC was built without the unit's file (or with an invalid one): positions are linear, the edges fall short |
+| `WARNING: lcd-id gpio100 says X but the calibration's project_vendor_id N is Y` | the pin and the file disagree on the panel: orientation follows the file, the firmware image the pin; one of them is wrong (check the panel, re-extract the file) |
 | `smmu: no bypass ...` / `... did not take` | SE DMA impossible this boot; GENI falls back to SPI by hand |
 | `geni: ... branches NOT all on` | the 0x52008 bits do not start the SE2 clocks (inferred bit/branch wrong): fallback |
 | `geni: the SE2 clock rate is unknown` | RCG source not decoded (raw values in the line before): fallback |
@@ -142,7 +161,7 @@ without SE DMA. Input meanwhile: the keyboard cover, or the Mac's keyboard and m
 
 1. Does SE DMA run on SE2 with the FIFO disabled, and do its status bits latch with the interrupt outputs off? (step 3's loopback)
 2. Are the inferred clock facts right (vote bit 24, branch 0x1827c, the rate)? (step 3 lines)
-3. Y (and X) orientation, edge accuracy without the private calibration maps (the corner test).
+3. The orientation and the edge mapping natively (the verification step): Ubuntu's BOE no-flip and edge stretch, not yet seen here.
 4. Frame rate and checksum rate at 9.6 vs 19.2 MHz; CPU cost of the polled thread.
 5. Multi-touch (Apple's path frames to HSTouchHIDService, DroidVMInput fb07165) and palm rejection: later.
 6. Charger noise (USB cable always in): the Ubuntu driver sends a charger state command; not done.
@@ -155,4 +174,5 @@ Its own page: [keyboard.md](keyboard.md) (`package/PianoKeyboard`, WN8030 over s
 
 New code under BSD-2-Clause-Patent; reused pieces under their own licences as listed in `package/PianoTouch/UPSTREAM` (one
 Apache-2.0 source, NOTICE kept). Linux `nt36532e`/`spi-geni-qcom` (GPL-2.0) were not read for this work; K90's code is facts only.
-The panel images and any calibration stay out of every repository.
+The panel images and the unit's calibration stay out of every repository: the calibration is read at build time from the path in
+`PIANO_TOUCH_CALIBRATION` and only its panel and an 8-digit hash prefix are logged.
