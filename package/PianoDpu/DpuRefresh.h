@@ -86,15 +86,43 @@ struct Switch {
   Rate rate;
 };
 
+// The stores of one switch: inside the window (in this order), and after the latch.
+struct Store {
+  uint64_t pa;
+  uint32_t v;
+};
+struct Plan {
+  Store frame[10];
+  unsigned frameCount = 0;
+  Store after[2];
+  unsigned afterCount = 0;
+};
+inline Plan plan(const LivePath &p, unsigned vtotal, Db d)
+{
+  Plan r;
+  const DbWords db = dbWords(d);
+  for (unsigned l = 0; l < 2; ++l) {
+    if (db.mode) r.frame[r.frameCount++] = {dsiReg(l, db.mode), 1};
+    r.frame[r.frameCount++] = {dsiReg(l, kDsiTotal), (vtotal - 1) << 16 | (p.link[l].dsiTotal & 0xffffu)};
+    if (db.flush) r.frame[r.frameCount++] = {dsiReg(l, db.flush), 1};
+  }
+  for (unsigned i = 0; i < 2; ++i) r.frame[r.frameCount++] = {intfReg(i + 1, kIntfVsyncPeriod), vtotal * p.link[i].htotal};
+  r.frame[r.frameCount++] = {ctlReg(unsigned(p.ctl), kCtlIntfFlush), kIntfFlushDsi};
+  r.frame[r.frameCount++] = {ctlReg(unsigned(p.ctl), kCtlFlush), kFlushIntf};
+  if (db.mode)   // after the latch (SunUEFI: at the commit's completion)
+    for (unsigned l = 0; l < 2; ++l) r.after[r.afterCount++] = {dsiReg(l, db.mode), 0};
+  return r;
+}
+
 // Steps 1-3 for one total, no verification. Returns the anomaly or nullptr.
 template <class Io>
 const char *stage(Io &io, const LivePath &p, unsigned vtotal, const Options &o, Switch &s)
 {
-  const DbWords db = dbWords(o.db);
+  const Plan pl = plan(p, vtotal, o.db);
   const unsigned from = p.link[0].vtotal ? p.link[0].vtotal : kVtotal120;
-  auto wr = [&](uint64_t pa, uint32_t v) {
+  auto wr = [&](const Store &st) {
     ++s.stores;
-    if (!io.wr(pa, v)) ++s.refused;
+    if (!io.wr(st.pa, st.v)) ++s.refused;
   };
   bool inWindow = false;
   for (s.tries = 1; s.tries <= 3 && !inWindow; ++s.tries) {
@@ -102,22 +130,13 @@ const char *stage(Io &io, const LivePath &p, unsigned vtotal, const Options &o, 
     const uintptr_t irq = io.irqOff();
     const uint32_t line = io.rd(intfReg(1, kIntfLineCount));
     inWindow = line >= kWindowLo && line <= kWindowHi;
-    if (inWindow) {
-      for (unsigned l = 0; l < 2; ++l) {
-        if (db.mode) wr(dsiReg(l, db.mode), 1);
-        wr(dsiReg(l, kDsiTotal), (vtotal - 1) << 16 | (p.link[l].dsiTotal & 0xffffu));
-        if (db.flush) wr(dsiReg(l, db.flush), 1);
-      }
-      for (unsigned i = 0; i < 2; ++i) wr(intfReg(i + 1, kIntfVsyncPeriod), vtotal * p.link[i].htotal);
-      wr(ctlReg(unsigned(p.ctl), kCtlIntfFlush), kIntfFlushDsi);
-      wr(ctlReg(unsigned(p.ctl), kCtlFlush), kFlushIntf);
-    }
+    if (inWindow)
+      for (unsigned k = 0; k < pl.frameCount; ++k) wr(pl.frame[k]);
     io.irqRestore(irq);
   }
   if (!inWindow) return "the window passed three times before the stores";
   s.latchUs = waitFlush(io, unsigned(p.ctl), kFlushIntf, kLatchTimeoutUs);
-  if (db.mode)
-    for (unsigned l = 0; l < 2; ++l) wr(dsiReg(l, db.mode), 0);   // after the latch (SunUEFI: at the commit's completion)
+  for (unsigned k = 0; k < pl.afterCount; ++k) wr(pl.after[k]);
   if (s.refused) return "the store guard refused a store";
   if (s.latchUs < 0) return "CTL_FLUSH bit 31 did not clear within 60 ms";
   return nullptr;
@@ -190,7 +209,7 @@ struct PolicyConfig {
 class Policy {
  public:
   static constexpr unsigned kRing = 8;
-  explicit Policy(const PolicyConfig &c = PolicyConfig()) : c_(c)
+  constexpr explicit Policy(const PolicyConfig &c = PolicyConfig()) : c_(c)
   {
     if (c_.burstSwaps < 1) c_.burstSwaps = 1;
     if (c_.burstSwaps > kRing) c_.burstSwaps = kRing;

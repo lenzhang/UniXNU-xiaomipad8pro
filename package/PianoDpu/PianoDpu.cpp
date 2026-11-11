@@ -17,6 +17,9 @@
 // not touched: this driver never registers a display.
 //   piano-dpu=2  level 1, then B1b, the zero-copy flips (DpuFlip.cpp: piano-dpu-flip=N, the ladder of docs/drivers/dpu.md section 8);
 //                the service is registered so that NativeGopDisplay (native-gop-display-flip=1) finds its "PianoDpuFlip" function.
+// The writing slices B1c (piano-dpu-refresh), B1d (piano-dpu-pcc) and B1e (piano-dpu-panel) are DpuSlices.cpp's: their own thread,
+// page maps and store guard, started here after the survey's thread and waiting for it (at any level >= 1); their platform functions
+// come through callPlatformFunction below. Without their arguments nothing of them runs.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -30,6 +33,11 @@
 #include "DpuFlipKernel.h"
 
 using namespace pianodpu;
+
+// The writing slices (DpuSlices.cpp).
+bool dpuSlicesWanted();
+void dpuSlicesStart(IOService *dpu);
+bool dpuSlicesPlatformFunction(const OSSymbol *name, void *p1, void *p2, void *p3, IOReturn *result);
 
 extern "C" {
 // Post-mortem breadcrumb (also in the console log): the last stage reached, negative when it failed there.
@@ -515,6 +523,7 @@ bool PianoDpu::start(IOService *provider)
     return true;
   }
   thread_deallocate(t);
+  dpuSlicesStart(this);
   return true;
 }
 
@@ -522,6 +531,7 @@ IOReturn PianoDpu::callPlatformFunction(const OSSymbol *name, bool wait, void *p
 {
   IOReturn result = kIOReturnUnsupported;
   if (flipFunction(name, p1, &result)) return result;
+  if (dpuSlicesPlatformFunction(name, p1, p2, p3, &result)) return result;
   return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
 }
 

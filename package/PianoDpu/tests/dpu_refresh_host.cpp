@@ -90,6 +90,10 @@ static void testSwitch()
   }
   CHECK(m.stores[before + 10].frame > m.stores[before].frame);   // DB mode dropped after the frame start that latched
   CHECK(s.stores == 12);
+  const Plan pl = plan(path(m), kVtotal120, Db::sunuefi);   // the logged plan is the list written
+  CHECK(pl.frameCount == 10 && pl.afterCount == 2 && pl.frame[1].v == (2309u << 16 | 575) && pl.frame[9].v == kFlushIntf);
+  for (unsigned k = 0; k < 10; ++k) CHECK(pl.frame[k].pa == expect[k]);
+  CHECK(plan(path(m), kVtotal60, Db::direct).frameCount == 6 && plan(path(m), kVtotal60, Db::direct).afterCount == 0);
   // and back
   p = path(m);
   CHECK(p.link[0].vtotal == 4620 && refuse(p) == nullptr);
