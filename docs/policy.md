@@ -222,9 +222,10 @@ KB=$(tooling/k27/build-native-piano-keyboard.sh | tail -1)
 K27_KERNEL=$K/out/k27/kernel-k27-0062-native.macho PIANO_EXTRA_KEXTS=$KB PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh
 tooling/k27/build-policy-test-images.sh        # out/ram-pol-{observe,lock,sleep,lpm} and out/ram-pol-dump
 ```
-(Built offline here 2026-11-11 from an isolated checkout: KC with the 0062 kernel and PianoKeyboard `c72c2f2dddadc49a…`; images
-`ram-pol-observe` `424723c0f235348a…`, `-lock` `fe38abc2235c35ed…`, `-sleep` `06b2dda81e190a44…`, `-lpm` `9ff286aad2bd7ba8…`; command line
-898 bytes. Rebuild in the main checkout before a run.) Every image: PianoKeyboard 2, PianoPower with its battery (`piano-power-ps=1`),
+(Built offline here 2026-11-11 from an isolated checkout on main `f9f2352`: `build-native-image.sh` with the default 0059 kernel
+links 20 native kexts; the test KC (0062 kernel + PianoKeyboard, 21 kexts) `49f1e96da5536c8f…`; images `ram-pol-observe`
+`572e85c75e2a6358…`, `-lock` `5a43e7a3d21700d6…`, `-sleep` `6d04aea4678d0318…`, `-lpm` `599150d2fd92bbdd…`; command line 898 bytes.
+Rebuild in the main checkout before a run.) Every image: PianoKeyboard 2, PianoPower with its battery (`piano-power-ps=1`),
 PianoBacklight 2 (the display power), PianoThermal 1 + governor, the USB console. Run each with
 `tooling/native/native-loop.sh out/ram-pol-<name>/boot-piano-macos-ram-A-bundled.img` and `usb-console.py --capture`.
 Prerequisites: `keyboard.md` §8 (a)/(b) and the hall polarity (§10.3) before any `piano-policy-lid=1` image; `power.md` §6 S1-S4
@@ -245,6 +246,8 @@ before `sleep`.
    a charger wake (bit 4) with the cover closed races PianoPower's re-read and our kIOPMDisableClamshell against the root domain's
    delayed clamshell evaluation, and may sleep again while charging (harmless for the battery; B4's charge-while-awake is later).
 4. powerd's own clamshell rule (lid-close assertions, desktop mode) can keep a closed cover awake: macOS's behaviour, by design.
+   PianoPower's B4 charging hold (`ChargePolicy.h`: no idle sleep while protected charging runs below the limit) only concerns
+   idle sleep on power, where the cover never sleeps the system anyway.
 5. Low Power Mode is likely not offered on VirtualMac2,1: the sysctl is the switch.
 6. The GPU ceiling slot is shared: interim arbitration until §5.3 (a tiny race window, repaired); PianoThermal's profile call is
    missing until §5.2. With PianoA830's default maximum (342 MHz) neither matters.
