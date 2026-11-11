@@ -17,6 +17,10 @@
  *   - the sleep handover (the source type's 5 V limits, the source back at 5 V, a protected charge stopped for the sleep), the
  *     re-send of everything after a wake or a new charger generation, a re-sync when the firmware loses a source the PMIC still
  *     sees (Ubuntu issue #18), the firmware's own values back on detach (100 mA input), and a stop that never outlives the driver;
+ *   - the board thermistors PianoThermal publishes, only ever making charging more conservative: the battery's joins the pack
+ *     temperatures; a connector at or above 60 degC holds the input at 100 mA until both read below 50; the charger at or above
+ *     85 degC holds it at 500 mA at most until below 75;
+ *   - the Type-C Rp current as the 5 V input limit of a source without a PD contract (opt-in, cfg.rp), within the ceiling;
  *   - the direct-charging (SC8541) battery-current curve of an authenticated original adapter, as a specification for a later
  *     charge-pump driver (piano_charge_cp_ibat_ma; nothing calls it yet).
  * Every write passes piano_charge_write_allowed() before it is planned; the owner's own allowlist must admit the same set
@@ -77,6 +81,9 @@ typedef struct {
     uint8_t sleep_charge;  /* a demand sleep below the limit: 0 stops charging for the sleep (default), 1 charges on (the limit
                             * is not watched while the system sleeps) */
     uint16_t icl_cap_ma, fcc_cap_ma;   /* the owner's allowlist ceilings (0: the defaults above) */
+    uint8_t rp;            /* trust the Type-C Rp current (piano-power-rp): a source without a PD contract that advertises 1.5 A or
+                            * 3.0 A gets that as its 5 V input limit, within icl_cap_ma, instead of its class row; only while a
+                            * connector temperature reads and is below 50 degC, and not after the bus sagged under such a limit */
 } PianoChargeConfig;
 
 /* writes on, hv off, float off, limit off (80/75 kept for when it is turned on), sleep stop, the stage A ceilings. */
@@ -90,6 +97,9 @@ enum {
     PIANO_CHG_IN_BUS = 1u << 0, PIANO_CHG_IN_TYPE = 1u << 1, PIANO_CHG_IN_ICL = 1u << 2, PIANO_CHG_IN_ENABLE = 1u << 3,
     PIANO_CHG_IN_FV = 1u << 4, PIANO_CHG_IN_VERIFY = 1u << 5, PIANO_CHG_IN_TBAT = 1u << 6, PIANO_CHG_IN_PDOS = 1u << 7,
     PIANO_CHG_IN_GAUGES = 1u << 8, PIANO_CHG_IN_TYPEC = 1u << 9,
+    /* the board thermistors PianoThermal publishes (package/include/PianoBoardTemps.h): each only with its bit; a missing one is
+     * unknown, never cool */
+    PIANO_CHG_IN_NTC = 1u << 10, PIANO_CHG_IN_CHGR = 1u << 11, PIANO_CHG_IN_CONN1 = 1u << 12, PIANO_CHG_IN_CONN2 = 1u << 13,
 };
 enum {PIANO_CHG_AWAKE = 0, PIANO_CHG_WILL_SLEEP = 1};
 
@@ -114,8 +124,12 @@ typedef struct {
     int32_t vbat_max_mv;                /* the higher pack's voltage */
     int32_t t_warm_dc, t_cool_dc;       /* the warmest and coolest pack, 0.1 degC */
     int32_t ibat_ma;                    /* both packs, + = charging */
-    /* the charger PMIC's Type-C block (PianoPower's level 1 view): a source's Rp is seen */
+    /* the charger PMIC's Type-C block (PianoPower's level 1 view): a source's Rp is seen, and the current it advertises (0 none,
+     * 500 the default, 1500, 3000; ChargerPmic.h rpMilliamps) */
     uint8_t typec_source;
+    uint32_t rp_ma;
+    /* the board thermistors, 0.1 degC: the battery's (joins the pack temperatures), the charger's, the two connectors' */
+    int32_t t_ntc_dc, t_chgr_dc, t_conn1_dc, t_conn2_dc;
 } PianoChargeInput;
 
 /* the write slots */
@@ -158,6 +172,11 @@ typedef struct {
     uint8_t wedge_checks, wedge_resyncs, wedge_reported;
     uint64_t wedge_since_ms;
     uint32_t events;              /* from the acknowledgements, handed to the next plan */
+    /* the Type-C Rp current (cfg.rp): distrusted for the boot after a sag or two quick detaches under it */
+    uint8_t rp_distrust, rp_strikes, rp_noted;
+    uint64_t rp_taken_ms;         /* since when an input limit from the Rp is in force (0: none) */
+    /* the board thermistors: the connectors' and the charger's hot holds, the battery thermistor apart from the packs */
+    uint8_t conn_hot, chgr_hot, ntc_apart;
 } PianoChargeState;
 
 #define PIANO_CHG_MAX_WRITES 6
@@ -178,8 +197,18 @@ enum {
     PIANO_CHG_EV_WEDGE_RESYNC = 1u << 19,  /* the firmware sees no source, the PMIC does: everything sent again (#18) */
     PIANO_CHG_EV_WEDGED = 1u << 20,        /* still so after two re-syncs: replug or reboot */
     PIANO_CHG_EV_SLEEP = 1u << 21,         /* the sleep handover began */
+    PIANO_CHG_EV_RP_DISTRUST = 1u << 22,   /* the bus sagged below 4.5 V under an input limit from the Rp, or the source went twice
+                                            * within 30 s of one: the class rows for the rest of the boot */
+    PIANO_CHG_EV_RP_WITHHELD = 1u << 23,   /* cfg.rp, a 1.5/3.0 A Rp, and no connector temperature below 50 degC: the class row */
+    PIANO_CHG_EV_NTC_APART = 1u << 24,     /* the battery thermistor and the packs more than 10 degC apart (the warmer counts) */
+    PIANO_CHG_EV_CONN_HOT = 1u << 25,      /* a connector at or above 60 degC: input limit 100 mA */
+    PIANO_CHG_EV_CONN_COOL = 1u << 26,     /* both connectors read below 50 degC again */
+    PIANO_CHG_EV_CHGR_HOT = 1u << 27,      /* the charger at or above 85 degC: input limit 500 mA at most */
+    PIANO_CHG_EV_CHGR_COOL = 1u << 28,     /* the charger reads below 75 degC again */
 };
 enum {PIANO_CHG_OFF_NONE = 0, PIANO_CHG_OFF_LIMIT, PIANO_CHG_OFF_HOT, PIANO_CHG_OFF_COLD, PIANO_CHG_OFF_SLEEP};
+/* where the input limit came from (plan.icl_why) */
+enum {PIANO_CHG_ICL_ROW = 0, PIANO_CHG_ICL_RP, PIANO_CHG_ICL_9V, PIANO_CHG_ICL_CONN, PIANO_CHG_ICL_CHGR};
 
 typedef struct {
     PianoChargeWrite write[PIANO_CHG_MAX_WRITES];   /* in this order */
@@ -191,6 +220,8 @@ typedef struct {
     uint8_t sleep_ready;   /* PIANO_CHG_WILL_SLEEP: the handover is complete (or nothing is to be handed over) */
     uint8_t resync;        /* send the board configuration and read everything again (PianoMca relink), as a rebind did (#18) */
     uint32_t events;
+    uint8_t icl_why;       /* PIANO_CHG_ICL_* */
+    uint32_t rp_ma;        /* the Rp current the input limit follows (0: not from the Rp) */
 } PianoChargePlan;
 
 void piano_charge_init(PianoChargeState *s);
@@ -206,6 +237,10 @@ int piano_charge_write_allowed(const PianoChargeConfig *c, uint32_t property, ui
 int piano_charge_class(int32_t type);
 const char *piano_charge_class_name(int cls);
 uint32_t piano_charge_icl_5v(int cls, uint32_t pdo5v_ma);    /* pdo5v_ma: 0 when not known */
+/* The 5 V limit with the Type-C current trusted: a class without a PD contract (SDP, CDP, DCP, float, Type-C) whose source
+ * advertises 1.5 A or 3.0 A gets min(Rp, cap) when that is above its row (USB Type-C's precedence: a PD contract, then the Type-C
+ * current, then BC 1.2, then the default USB power); otherwise the row. */
+uint32_t piano_charge_icl_rp(int cls, uint32_t row_ma, uint32_t rp_ma, uint32_t cap_ma);
 uint32_t piano_charge_icl_9v(int cls, uint32_t source_ma);   /* 0: no 9 V row for the class */
 uint32_t piano_charge_fcc_full(int cls, int hv_on);
 uint32_t piano_charge_fcc_thermal(uint32_t full, int t_valid, int32_t t_c);

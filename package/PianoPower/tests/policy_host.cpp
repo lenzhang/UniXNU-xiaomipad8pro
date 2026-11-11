@@ -6,7 +6,7 @@
 //   cc -std=c11 -Wall -Wextra -Werror -c package/PianoPower/ChargePolicy.c -o /tmp/ChargePolicy.o
 //   c++ -std=c++20 -Wall -Wextra -Werror -I package/PianoPower package/PianoPower/tests/policy_host.cpp /tmp/ChargePolicy.o \
 //     -o /tmp/policy_host && /tmp/policy_host
-// (tooling/k27/build-native-piano-power.sh runs it once the owner adds those two lines; see the design page §8.)
+// (tooling/k27/build-native-piano-power.sh runs it before the kext; the wiring into PianoPower is tested in power_host.cpp.)
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -49,6 +49,9 @@ struct Sim {
   int verify = 0;
   // the battery
   int soc = 50, tbatC = 30, tWarmDc = 300, tCoolDc = 290, ibat = 1000, vbat = 3900;
+  // the Type-C current and PianoThermal's board thermistors (0.1 degC; boardValid: PIANO_CHG_IN_NTC..CONN2 bits)
+  uint32_t rpMa = 3000, boardValid = 0;
+  int ntcDc = 300, chgrDc = 330, conn1Dc = 310, conn2Dc = 300;
   // time and counters
   uint64_t now = 0;
   uint32_t generation = 1, wakes = 0;
@@ -76,6 +79,12 @@ struct Sim {
     in.verify = verify;
     in.tbat_c = tbatC;
     in.typec_source = source && typecSource;
+    in.rp_ma = source && typecSource ? rpMa : 0;
+    in.valid |= boardValid;
+    in.t_ntc_dc = ntcDc;
+    in.t_chgr_dc = chgrDc;
+    in.t_conn1_dc = conn1Dc;
+    in.t_conn2_dc = conn2Dc;
     if (source && pdosOk && (type == PIANO_CHG_T_PD || type == PIANO_CHG_T_PD_VERIFY || type == PIANO_CHG_T_PPS)) {
       in.valid |= PIANO_CHG_IN_PDOS;
       in.pdos = uint8_t(pdos.size());
@@ -888,6 +897,124 @@ static void testCp()
   v.cell_ma_max = 3000; v.t_valid = 0; CHECK(piano_charge_cp_ibat_ma(&v, &q) == 0);
 }
 
+// ------------------------------------------------------------------------------------------- the Type-C current, the board thermistors
+static void testRpAndBoard()
+{
+  // the row function: no PD contract, 1.5 / 3.0 A, within the ceiling, never below the row
+  CHECK(piano_charge_icl_rp(PIANO_CHG_C_CDP, 900, 3000, 1600) == 1600 && piano_charge_icl_rp(PIANO_CHG_C_CDP, 900, 1500, 1600) == 1500);
+  CHECK(piano_charge_icl_rp(PIANO_CHG_C_CDP, 900, 500, 1600) == 900 && piano_charge_icl_rp(PIANO_CHG_C_CDP, 900, 0, 1600) == 900);
+  CHECK(piano_charge_icl_rp(PIANO_CHG_C_SDP, 500, 3000, 1600) == 1600 && piano_charge_icl_rp(PIANO_CHG_C_TYPEC, 500, 1500, 1600) == 1500);
+  CHECK(piano_charge_icl_rp(PIANO_CHG_C_DCP, 1500, 1500, 1600) == 1500 && piano_charge_icl_rp(PIANO_CHG_C_DCP, 1500, 3000, 1600) == 1600);
+  CHECK(piano_charge_icl_rp(PIANO_CHG_C_FLOAT, 500, 3000, 2500) == 2500);
+  CHECK(piano_charge_icl_rp(PIANO_CHG_C_PD, 500, 3000, 1600) == 500 && piano_charge_icl_rp(PIANO_CHG_C_PD_PPS, 1200, 3000, 1600) == 1200);
+  CHECK(piano_charge_icl_rp(PIANO_CHG_C_REFUSED, 0, 3000, 1600) == 0);
+  const uint32_t conns = PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2;
+  // a CDP with Rp 3.0 A: the row without the option, 1600 with it and a connector reading, the row without one
+  {
+    Sim s;
+    s.type = PIANO_CHG_T_CDP;
+    s.boardValid = conns;
+    s.step();
+    CHECK(s.wrote(PIANO_CHG_ICL, 900) && s.plan.icl_why == PIANO_CHG_ICL_ROW && s.plan.rp_ma == 0);
+    Sim t;
+    t.type = PIANO_CHG_T_CDP;
+    t.cfg.rp = 1;
+    t.boardValid = conns;
+    t.step();
+    CHECK(t.wrote(PIANO_CHG_ICL, 1600) && t.wrote(PIANO_CHG_FCC, 900) && t.plan.icl_why == PIANO_CHG_ICL_RP && t.plan.rp_ma == 3000);
+    // asleep: the row (nothing watches the bus)
+    t.step();
+    t.sleep = PIANO_CHG_WILL_SLEEP;
+    t.step(100);
+    CHECK(t.wrote(PIANO_CHG_ICL, 900));
+    Sim u;
+    u.type = PIANO_CHG_T_CDP;
+    u.cfg.rp = 1;
+    u.step();
+    CHECK(u.wrote(PIANO_CHG_ICL, 900) && (u.plan.events & PIANO_CHG_EV_RP_WITHHELD));
+    u.step();
+    CHECK(!(u.plan.events & PIANO_CHG_EV_RP_WITHHELD));
+  }
+  // the sag ends the trust at once, for good (a new generation or a wake does not bring it back)
+  {
+    Sim s;
+    s.type = PIANO_CHG_T_CDP;
+    s.cfg.rp = 1;
+    s.boardValid = conns;
+    s.step();
+    s.step();
+    CHECK(s.plan.writes == 0 && s.icl == 1600);
+    s.busMv = 4400;
+    s.step();
+    CHECK((s.plan.events & PIANO_CHG_EV_RP_DISTRUST) && s.wrote(PIANO_CHG_ICL, 900));
+    s.busMv = 5100;
+    s.generation++;
+    s.wakes++;
+    s.step();
+    s.step();
+    CHECK(s.icl == 900 && s.st.rp_distrust);
+  }
+  // a connector at 60 degC: 100 mA; held while one reading is missing; released below 50 on both
+  {
+    Sim s;
+    s.boardValid = conns;
+    s.step();
+    CHECK(s.icl == 1500);
+    s.conn2Dc = 605;
+    s.step();
+    CHECK((s.plan.events & PIANO_CHG_EV_CONN_HOT) && s.wrote(PIANO_CHG_ICL, 100) && s.plan.icl_why == PIANO_CHG_ICL_CONN);
+    s.conn2Dc = 400;
+    s.boardValid = PIANO_CHG_IN_CONN1;
+    s.step();
+    CHECK(s.plan.writes == 0 && s.icl == 100);
+    s.boardValid = conns;
+    s.conn1Dc = 495;
+    s.step();
+    CHECK((s.plan.events & PIANO_CHG_EV_CONN_COOL) && s.wrote(PIANO_CHG_ICL, 1500));
+    // the charger at 85: 500 at most; 75 still held; 74.9 released
+    s.boardValid |= PIANO_CHG_IN_CHGR;
+    s.chgrDc = 850;
+    s.step();
+    CHECK((s.plan.events & PIANO_CHG_EV_CHGR_HOT) && s.wrote(PIANO_CHG_ICL, 500));
+    s.chgrDc = 750;
+    s.step();
+    CHECK(s.plan.writes == 0);
+    s.chgrDc = 749;
+    s.step();
+    CHECK((s.plan.events & PIANO_CHG_EV_CHGR_COOL) && s.wrote(PIANO_CHG_ICL, 1500));
+    // a 9 V PD source is capped too
+    Sim t;
+    t.cfg.hv = 1;
+    t.pd(kPd5and9);
+    t.boardValid = conns;
+    for (int i = 0; i < 6; ++i) t.step();
+    CHECK(t.icl == 1600);
+    t.conn1Dc = 700;
+    t.step();
+    CHECK(t.wrote(PIANO_CHG_ICL, 100));
+  }
+  // the battery thermistor: the warmer reading derates, a gap over 10 degC is noted once per episode
+  {
+    Sim s;
+    s.cfg.icl_cap_ma = 2500; s.cfg.fcc_cap_ma = 3500;
+    s.boardValid = PIANO_CHG_IN_NTC;
+    s.ntcDc = 405;   // 40.5 degC against packs at 30
+    s.step();
+    CHECK(s.wrote(PIANO_CHG_FCC, 1400) && !(s.plan.events & PIANO_CHG_EV_NTC_APART));
+    s.ntcDc = 455;
+    s.step();
+    CHECK((s.plan.events & PIANO_CHG_EV_NTC_APART) && s.wrote(PIANO_CHG_FCC, 500));
+    s.step();
+    CHECK(!(s.plan.events & PIANO_CHG_EV_NTC_APART));
+    // an implausible thermistor reading is not a temperature
+    Sim t;
+    t.boardValid = PIANO_CHG_IN_NTC;
+    t.ntcDc = 1200;
+    t.step();
+    CHECK(t.wrote(PIANO_CHG_FCC, 1500));
+  }
+}
+
 // ---------------------------------------------------------------------------------------------------------------- random walk
 static void testRandom()
 {
@@ -900,6 +1027,7 @@ static void testRandom()
     s.cfg.limit = uint8_t(rnd(2));
     s.cfg.sleep_charge = uint8_t(rnd(2));
     s.cfg.writes = rnd(8) != 0;
+    s.cfg.rp = uint8_t(rnd(2));
     if (rnd(2)) { s.cfg.icl_cap_ma = 2500; s.cfg.fcc_cap_ma = 3500; }
     for (int i = 0; i < 1500; ++i) {
       switch (rnd(40)) {
@@ -922,6 +1050,9 @@ static void testRandom()
       case 15: s.ignoreFv = !s.ignoreFv; break;
       case 16: { s.fill(); piano_charge_shutdown(&s.cfg, &s.in, &s.st, &s.plan); s.check();
                  for (unsigned k = 0; k < s.plan.writes; ++k) s.apply(s.plan.write[k]); } break;
+      case 17: s.rpMa = rnd(2) ? 3000 : rnd(2) ? 1500 : 500; break;
+      case 18: s.boardValid = (rnd(16) << 10) & (PIANO_CHG_IN_NTC | PIANO_CHG_IN_CHGR | PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2); break;
+      case 19: s.conn1Dc = int(rnd(800)); s.conn2Dc = int(rnd(800)); s.chgrDc = int(rnd(1000)); s.ntcDc = int(rnd(700)); break;
       default: break;
       }
       s.soc += int(rnd(3)) - 1;
@@ -930,6 +1061,12 @@ static void testRandom()
       s.step(rnd(4) ? 5000 : rnd(40000));
       if (s.sleep == PIANO_CHG_WILL_SLEEP) CHECK(!s.plan.hold_awake);
       if (!s.source && s.readsOk) CHECK(!s.plan.hold_awake);
+      // the board holds always win; an Rp limit only with the option, a connector reading below 50 degC and no PD contract
+      if (s.st.conn_hot && s.plan.cls != PIANO_CHG_C_NONE && s.plan.icl_ma) CHECK(s.plan.icl_ma <= 100);
+      if (s.plan.icl_why == PIANO_CHG_ICL_RP) {
+        CHECK(s.cfg.rp && !s.st.rp_distrust && s.plan.cls != PIANO_CHG_C_PD && s.plan.cls != PIANO_CHG_C_PD_PPS);
+        CHECK((s.in.valid & (PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2)) && s.plan.icl_ma <= (s.cfg.icl_cap_ma ? s.cfg.icl_cap_ma : 1600u));
+      }
     }
   }
 }
@@ -943,6 +1080,7 @@ int main()
   testLimit();
   testSleep();
   testCp();
+  testRpAndBoard();
   testRandom();
   if (gFailures) {
     std::fprintf(stderr, "policy_host: %d failure(s)\n", gFailures);

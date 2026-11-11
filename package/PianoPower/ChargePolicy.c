@@ -39,6 +39,21 @@
 #define WEDGE_DECISIONS 3
 #define WEDGE_RESYNCS 2
 #define UNKNOWN_ENABLE 0xffu
+/* The Type-C current (cfg.rp). The firmware's own input-current limiting (AICL) reads off on piano (0x2012 = 0), so nothing would
+ * walk a limit down that the source cannot hold: a bus below 4.5 V under an Rp limit, or two detaches within 30 s of one taking,
+ * end the trust for the boot. */
+#define RP_MIN_MA 1500u          /* above the default USB power: the 1.5 A and 3.0 A advertisements */
+#define RP_SAG_MV 4500
+#define RP_QUICK_MS 30000u
+#define RP_STRIKES 2
+/* The board thermistors (docs/drivers/thermal.md 12.7): only ever more conservative. */
+#define CONN_HOT_C 60            /* a connector at or above: the input at 100 mA (the detach value) */
+#define CONN_COOL_C 50           /* until both read below; also the most an Rp limit is allowed with */
+#define CONN_ICL_MA 100u
+#define CHGR_HOT_C 85            /* the charger at or above: the input at 500 mA at most */
+#define CHGR_COOL_C 75
+#define CHGR_ICL_MA 500u
+#define NTC_APART_C 10           /* the battery thermistor this far from the packs: logged (the warmer counts anyway) */
 
 static void zero(void *p, unsigned n) {uint8_t *b = (uint8_t *)p; while (n--) *b++ = 0;}
 static uint32_t umin(uint32_t a, uint32_t b) {return a < b ? a : b;}
@@ -103,6 +118,17 @@ uint32_t piano_charge_icl_5v(int cls, uint32_t pdo5v_ma)
     case PIANO_CHG_C_PD: case PIANO_CHG_C_PD_PPS: return pdo5v_ma ? clampu(pdo5v_ma, PIANO_CHG_ICL_DEFAULT, 1500) : 500;
     default: return 0;
     }
+}
+
+uint32_t piano_charge_icl_rp(int cls, uint32_t row_ma, uint32_t rp_ma, uint32_t cap_ma)
+{
+    switch (cls) {
+    case PIANO_CHG_C_SDP: case PIANO_CHG_C_CDP: case PIANO_CHG_C_DCP: case PIANO_CHG_C_FLOAT: case PIANO_CHG_C_TYPEC: break;
+    default: return row_ma;   /* a PD contract governs a PD source; nothing for an unknown one */
+    }
+    if (rp_ma < RP_MIN_MA) return row_ma;
+    const uint32_t ma = umin(rp_ma, cap_ma);
+    return ma > row_ma ? ma : row_ma;
 }
 
 uint32_t piano_charge_icl_9v(int cls, uint32_t source_ma)
@@ -226,6 +252,7 @@ static void forget(PianoChargeState *s, uint64_t now)
     s->type = -1;
     s->wedge_checks = 0;
     s->wedge_since_ms = 0;
+    s->rp_taken_ms = 0;   /* the trust itself and its strikes are about the source and stay */
 }
 
 void piano_charge_init(PianoChargeState *s)
@@ -325,20 +352,109 @@ static void plan_volt(const PianoChargeConfig *c, PianoChargeState *s, PianoChar
     plan_write(c, s, p, now, PIANO_CHG_S_VOLT, s->volt_want_prop, s->volt_want_value, 4);
 }
 
-/* The temperatures: the warmest and the coolest of the firmware's pack reading and the two gauges. */
+/* The temperatures: the warmest and the coolest of the firmware's pack reading, the two gauges and the battery thermistor. */
 typedef struct {int valid; int32_t warm, cool;} Temps;
+static int packs_valid(const PianoChargeInput *in)
+{
+    return (in->valid & PIANO_CHG_IN_GAUGES) && in->t_warm_dc > -400 && in->t_warm_dc < 900 && in->t_cool_dc > -400 &&
+           in->t_cool_dc <= in->t_warm_dc;
+}
+static int ntc_valid(const PianoChargeInput *in) {return (in->valid & PIANO_CHG_IN_NTC) && in->t_ntc_dc > -400 && in->t_ntc_dc < 900;}
 static Temps temps(const PianoChargeInput *in)
 {
     Temps t = {0, 0, 0};
     if ((in->valid & PIANO_CHG_IN_TBAT) && in->tbat_c > -20 && in->tbat_c < 80) {t.valid = 1; t.warm = t.cool = in->tbat_c;}
-    if ((in->valid & PIANO_CHG_IN_GAUGES) && in->t_warm_dc > -400 && in->t_warm_dc < 900 && in->t_cool_dc > -400 &&
-        in->t_cool_dc <= in->t_warm_dc) {
+    if (packs_valid(in)) {
         const int32_t w = floor_c(in->t_warm_dc), k = floor_c(in->t_cool_dc);
         if (!t.valid || w > t.warm) t.warm = w;
         if (!t.valid || k < t.cool) t.cool = k;
         t.valid = 1;
     }
+    if (ntc_valid(in)) {
+        const int32_t n = floor_c(in->t_ntc_dc);
+        if (!t.valid || n > t.warm) t.warm = n;
+        if (!t.valid || n < t.cool) t.cool = n;
+        t.valid = 1;
+    }
     return t;
+}
+
+/* A board thermistor's reading in whole degC, or 0 when its bit is off or it is outside the part's range (-40..125 degC). */
+static int board_c(const PianoChargeInput *in, uint32_t bit, int32_t dc, int32_t *c)
+{
+    if (!(in->valid & bit) || dc <= -400 || dc >= 1250) return 0;
+    *c = floor_c(dc);
+    return 1;
+}
+
+/* The board thermistors' holds. A hold starts on one reading and ends only on readings: a connector that stops reading while hot
+ * keeps the hold (unknown, never cool). */
+static void board_check(const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p)
+{
+    int32_t c1 = 0, c2 = 0, ch = 0;
+    const int v1 = board_c(in, PIANO_CHG_IN_CONN1, in->t_conn1_dc, &c1), v2 = board_c(in, PIANO_CHG_IN_CONN2, in->t_conn2_dc, &c2);
+    if ((v1 && c1 >= CONN_HOT_C) || (v2 && c2 >= CONN_HOT_C)) {
+        if (!s->conn_hot) p->events |= PIANO_CHG_EV_CONN_HOT;
+        s->conn_hot = 1;
+    } else if (s->conn_hot && v1 && v2 && c1 < CONN_COOL_C && c2 < CONN_COOL_C) {
+        s->conn_hot = 0;
+        p->events |= PIANO_CHG_EV_CONN_COOL;
+    }
+    const int vc = board_c(in, PIANO_CHG_IN_CHGR, in->t_chgr_dc, &ch);
+    if (vc && ch >= CHGR_HOT_C) {
+        if (!s->chgr_hot) p->events |= PIANO_CHG_EV_CHGR_HOT;
+        s->chgr_hot = 1;
+    } else if (s->chgr_hot && vc && ch < CHGR_COOL_C) {
+        s->chgr_hot = 0;
+        p->events |= PIANO_CHG_EV_CHGR_COOL;
+    }
+    /* the battery thermistor against the packs (else the firmware's reading): logged once per episode */
+    if (ntc_valid(in) && (packs_valid(in) || ((in->valid & PIANO_CHG_IN_TBAT) && in->tbat_c > -20 && in->tbat_c < 80))) {
+        const int32_t n = floor_c(in->t_ntc_dc), other = packs_valid(in) ? floor_c(in->t_warm_dc) : in->tbat_c;
+        const int32_t d = n > other ? n - other : other - n;
+        if (d > NTC_APART_C) {
+            if (!s->ntc_apart) p->events |= PIANO_CHG_EV_NTC_APART;
+            s->ntc_apart = 1;
+        } else {
+            s->ntc_apart = 0;
+        }
+    }
+}
+
+/* The Rp limit needs a connector that reads, every one that reads below 50 degC, and no hot hold. */
+static int conn_allows_rp(const PianoChargeInput *in, const PianoChargeState *s)
+{
+    int32_t c1 = 0, c2 = 0;
+    const int v1 = board_c(in, PIANO_CHG_IN_CONN1, in->t_conn1_dc, &c1), v2 = board_c(in, PIANO_CHG_IN_CONN2, in->t_conn2_dc, &c2);
+    return !s->conn_hot && (v1 || v2) && (!v1 || c1 < CONN_COOL_C) && (!v2 || c2 < CONN_COOL_C);
+}
+
+/* The 5 V input limit of a class: its row (a PD source's 5 V offer), or with cfg.rp (and with_rp) the Type-C current. */
+static uint32_t icl_at_5v(const PianoChargeConfig *c, const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p, int cls,
+                          int with_rp)
+{
+    const unsigned pdos = (in->valid & PIANO_CHG_IN_PDOS) ? in->pdos : 0;
+    const uint32_t row = umin(piano_charge_icl_5v(cls, piano_charge_pdo_5v_ma(in->pdo, pdos)), icl_cap(c));
+    p->icl_why = PIANO_CHG_ICL_ROW;
+    p->rp_ma = 0;
+    if (!with_rp || !c->rp || s->rp_distrust || !(in->valid & PIANO_CHG_IN_TYPEC) || !in->typec_source) return row;
+    const uint32_t rp = piano_charge_icl_rp(cls, row, in->rp_ma, icl_cap(c));
+    if (rp <= row) return row;
+    if (!conn_allows_rp(in, s)) {
+        if (!s->rp_noted) {s->rp_noted = 1; p->events |= PIANO_CHG_EV_RP_WITHHELD;}
+        return row;
+    }
+    p->icl_why = PIANO_CHG_ICL_RP;
+    p->rp_ma = in->rp_ma;
+    return rp;
+}
+
+/* The board holds on top of any limit. */
+static uint32_t board_cap(const PianoChargeState *s, PianoChargePlan *p, uint32_t icl)
+{
+    if (s->conn_hot && icl > CONN_ICL_MA) {p->icl_why = PIANO_CHG_ICL_CONN; p->rp_ma = 0; return CONN_ICL_MA;}
+    if (s->chgr_hot && icl > CHGR_ICL_MA) {p->icl_why = PIANO_CHG_ICL_CHGR; p->rp_ma = 0; return CHGR_ICL_MA;}
+    return icl;
 }
 
 static int soc_valid(const PianoChargeInput *in)
@@ -549,7 +665,13 @@ static void detached(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
         p->events |= PIANO_CHG_EV_DETACH;
         if (s->hv == PIANO_CHG_HV_ASKED && s->hv_retry_ms < now + HV_RETRY_MS) s->hv_retry_ms = now + HV_RETRY_MS;
         reset_tries(s);
+        /* gone soon after an Rp limit took (a port's over-current cut looks like this): twice ends the trust */
+        if (s->rp_taken_ms && now < s->rp_taken_ms + RP_QUICK_MS && ++s->rp_strikes >= RP_STRIKES && !s->rp_distrust) {
+            s->rp_distrust = 1;
+            p->events |= PIANO_CHG_EV_RP_DISTRUST;
+        }
     }
+    s->rp_taken_ms = 0;
     s->attached = 0;
     s->type = -1;
     s->hv = PIANO_CHG_HV_OFF;
@@ -581,8 +703,9 @@ static void handover(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
     const int cls = s->attached && s->type >= 0 ? piano_charge_class(s->type) : PIANO_CHG_C_NONE;
     p->cls = (uint8_t)cls;
     if (c->writes && cls != PIANO_CHG_C_NONE && cls != PIANO_CHG_C_REFUSED) {
-        const unsigned pdos = (in->valid & PIANO_CHG_IN_PDOS) ? in->pdos : 0;
-        const uint32_t icl = umin(piano_charge_icl_5v(cls, piano_charge_pdo_5v_ma(in->pdo, pdos)), icl_cap(c));
+        /* the row, not the Rp current: nothing watches the bus while the system is suspended */
+        const uint32_t icl = board_cap(s, p, icl_at_5v(c, in, s, p, cls, 0));
+        s->rp_taken_ms = 0;
         const uint32_t fcc = piano_charge_fcc_thermal(umin(piano_charge_fcc_full(cls, 0), fcc_cap(c)), t->valid, t->warm);
         const int stop = limit_on(c) && (s->hold || s->hot || s->cold || !c->sleep_charge);
         if (stop) {
@@ -630,6 +753,7 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
     }
     expire_pending(s, now);
     const Temps t = temps(in);
+    board_check(in, s, p);
     if (in->sleep == PIANO_CHG_WILL_SLEEP) {handover(c, in, s, p, &t, now); return;}
     s->sleeping = 0;
     p->hold_awake = s->hold_awake;
@@ -650,6 +774,8 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
         s->hv_renegs = s->hv_checks = 0;
         s->fcc_full = 0;
         s->stop_noted = s->fw_noted = 0;
+        s->rp_noted = 0;
+        s->rp_taken_ms = 0;
         reset_tries(s);
         p->events |= PIANO_CHG_EV_ATTACH;
     }
@@ -683,9 +809,27 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
     const uint32_t hv_ma = hv_step(c, in, s, p, now, cls, charge_ok);
     const int hv_on = s->hv == PIANO_CHG_HV_ON && hv_ma;
     p->hv = s->hv;
-    const unsigned pdos = (in->valid & PIANO_CHG_IN_PDOS) ? in->pdos : 0;
-    const uint32_t icl = umin(hv_on ? piano_charge_icl_9v(cls, hv_ma) : piano_charge_icl_5v(cls, piano_charge_pdo_5v_ma(in->pdo, pdos)),
-                              icl_cap(c));
+    uint32_t icl;
+    if (hv_on) {
+        icl = umin(piano_charge_icl_9v(cls, hv_ma), icl_cap(c));
+        p->icl_why = PIANO_CHG_ICL_9V;
+        p->rp_ma = 0;
+    } else {
+        icl = icl_at_5v(c, in, s, p, cls, 1);
+    }
+    icl = board_cap(s, p, icl);
+    /* an Rp limit in force: a bus that sags under it ends the trust (the row from this decision on) */
+    if (p->icl_why == PIANO_CHG_ICL_RP && s->icl_set == icl) {
+        if (!s->rp_taken_ms) s->rp_taken_ms = now ? now : 1;
+        if (in->bus_mv < RP_SAG_MV) {
+            s->rp_distrust = 1;
+            s->rp_taken_ms = 0;
+            p->events |= PIANO_CHG_EV_RP_DISTRUST;
+            icl = board_cap(s, p, icl_at_5v(c, in, s, p, cls, 0));
+        }
+    } else if (p->icl_why != PIANO_CHG_ICL_RP) {
+        s->rp_taken_ms = 0;
+    }
     const uint32_t full = umin(piano_charge_fcc_full(cls, hv_on), fcc_cap(c));
     const uint32_t fcc = fcc_target(s, full, &t, now);
     p->icl_ma = icl;
