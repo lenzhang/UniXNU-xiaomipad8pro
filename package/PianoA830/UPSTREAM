@@ -4,7 +4,7 @@ PianoA830 is the Adreno830 A830 kernel GPU driver (OnePlus 13T lineage) as a k27
 Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), main 1a1321056ffc5428ae925f4680093718b46ca7c2
 (unixnu.lock pin."Adreno830"), MIT (adreno830/LICENSE, sha256 16fbc0170994a48f60938d9f0d992d3bad113383cf90882f75c206e079c2a2dc).
   Copied into adreno830/: every file of the repository except docs/ and AGENTS.md (the design documents stay upstream; read them
-  there), 148 files unchanged (sha256 equal to the originals). Hardware-proven on the 13T: S0-S10 and a GPU-composited desktop under
+  there), 140 files unchanged (sha256 equal to the originals). Hardware-proven on the 13T: S0-S10 and a GPU-composited desktop under
   iPadOS 17.7.11 (gpu-native-plan.md section 2). Changed, every change marked "UniXNU-piano" in a comment and compiled only with
   -DADRENO830_MACOS (the host tests build without it, so they test the upstream code paths):
     Adreno830Start.cpp      215e565650d176cd28c2e11e79e098195474add04ea5ae054b15e9eaa4ff0b0f -> 96ce2e8e7189bd500fab30e67c2088eac5b8e3bb4b68ec3c94610cab624faba9
@@ -68,16 +68,22 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       2026-11-11, the system suspend: test_a830suspend (both passes: the targets and the four-step machine; ADRENO830_MACOS: the gate
       on the register model), the suspend/resume and RailsSet doubles and the orchestrator's cases in test_start (a PASS line of its
       own), RailsSet's TCS order, lock and refusals in test_sm8750_rpmh.
-    NativeAdrenoPublish.cpp d2a85cbcb4ad29df03a05c9f4e3edc0120358ab90a731cb61b083accf93bd31f -> 4d31149ca8ffdb359d6261ddfcb38fd032064624822c7d2cbf23d6ff310d5607
+    NativeAdrenoPublish.cpp d2a85cbcb4ad29df03a05c9f4e3edc0120358ab90a731cb61b083accf93bd31f -> ae9fc8e4fdb91daef5dc65cd4f3d1d2803183fd42bb6e188d1b6a7714035293a
       the render server is WindowServer (kRenderServer/isRenderServer at the six "backboardd" sites, as UniXNU Adreno740 7487f72);
       native_adreno_fences() for the display's fence rule (as Adreno740's, over the ring's lastSubmitted and the memptrs fence word).
       2026-11-11, the session's GPU events on the console (boot_progress_gpu_event, rate-limited by NativeAdrenoEventNote): a failed
       call (process, pid, slot, ABI method, IOReturn), a refused open and why, a recovery's culprit and failed jobs, the hang snapshot,
       a page fault and whose window, the device lost, and the live clients with their memory when they change (at most every 10 s).
-    NativeAdrenoPublish.h   b266fa844b199254611f2bb1fc0bfca6dedd1c73535cf442838b07527e74a854 -> c9a7be6b85289976338211267d43cd1e1298f0a974516bda96a27b3cda2899ae
+      2026-11-12, the address space (run attend4): a refused BoMap's reason in a line after its "call failed" line
+      (NativeAdrenoMapRefusalLine), and every 30 s while it changes, and at the tick after a refusal, the VM's records and ranges, the
+      BO pool and what is outside it, then each connection's mappings against its window (NativeAdrenoMapLines.h).
+    NativeAdrenoPublish.h   b266fa844b199254611f2bb1fc0bfca6dedd1c73535cf442838b07527e74a854 -> cbcd8590e938d3e3f20a0cbb644f055b532633517597d8af2e3f400248a2278b
       macOS process lists (NativeAdrenoSandboxGrantList, NativeAdrenoLargeClientList) in place of iPadOS's. 2026-11-11: the event
       lines' helpers (method and IOReturn names, the routine answers, the first-then-every-decade table), host-tested by
       tooling/k27/run-a830-host-tests.py (macos_events).
+      2026-11-12: macOS's 16 GiB window table (the render server 3.5 GiB up to 4 GiB, large 768 MiB, small 320 MiB, none across a
+      multiple of 4 GiB; the first desktop had WindowServer at 1153 of 1536 MiB and iconservicesagent at 490 of 512), checked at
+      compile time and in tests/test_vamap.cpp.
     Adreno830Status.h       9626f67c6f430b06562fa1be64598e8956929541c7954d1e1c84a394bf49df8a -> 4bc97572307f59e6a174295c0dea76dada0e971e0349ba96739499dcfc1ef6e6
     Adreno830Status.cpp     0e4e7b2b218a0df73f9c688623658302f4ce5da8fba7dc716cad6afe8993e7b1 -> 43d652bd67bcf750f277e4db052a3f6e8fb3226e293e97de37f9e1d5fcce0fc7
       2026-11-11: the board hooks boot_progress_gpu_event and adreno830_board_hang_ms, declared and given weak defaults.
@@ -85,6 +91,29 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       2026-11-11: native_adreno_note_hang_snapshot declared.
     NativeAdrenoMemory.cpp  ea99b5e92be53377467c830bb63e5043597e543692ec20087711ba4d67770b1c -> 28882d551523a43a27890f4ed2fb82968bcbefcfdece71cf68465a9bdf6effad
       the pool's 128 KiB extent table on the heap, allocated with the pool (same __DATA reason).
+    NativeAdrenoVm.h        bc1cb145ab04473c45e639b9de4508179d5c25cc855ce7077596e51f26744a30 -> f8eb5d48e5810949cb1a8c0b7b5ce119cfbb0bb03bb4361f2a0c6ce6b038cda6
+    NativeAdrenoVm.cpp      20a64d996dc2b11747c3fea2a268b03a8ed313667fd378a2476aff7dcb25b263 -> d671ef7521e99e4e89a0f44b0d14f738a8b8ddb3f913d45ac58a3049081aaf77
+      2026-11-12: the table's range capacity 524288 (NativeAdrenoVmMaxSpans, twice upstream's: WindowServer's BoMap answered
+      NoResources when the 262144 ran out, run attend4), and why a map was refused (NativeAdrenoVmWhy, lastRefusal: the records told
+      apart from the ranges, the render server's reserves, the aperture, a reserved window, an overlap, the pages, an alias), recorded
+      through VM_REFUSE, which upstream builds expand to the status alone.
+    NativeAdrenoGpuContext.cpp b7edcf828acd90deb280b8f31e410f8b9b70683bdb1c2d2e151378bb50fd8ae0 -> 1e800b309b01022178506cdcbaef402c4eb84d46806159cadacde31967300c96
+      2026-11-12: the shared VM attached with NativeAdrenoVmMaxSpans ranges.
+    NativeAdrenoUserClient.h ca1be816d370d80a8b779aec209019bc86518b59917111a7c78445365f5f8fe0 -> 9a1731fdbdcc84ae0653d68c8227da51c6f060274455dac3eac3450cbc9bbcbd
+    NativeAdrenoUserClient.cpp e64292502b73086ae8a0e460c4a9f32014b0907fe8435e54c1c5c44c172b650d -> 453abd73abf0d533d4d5b7222b6542be3ec5024af150be96c18affc94e744ec4
+      2026-11-12: why the last BoMap was refused (NativeAdrenoMapWhy, lastMapRefusal: the request's fields, the handle, already mapped,
+      outside the window with its figures, the scanout read-only, or the VM's reason) through MAP_REFUSE (upstream builds: the status
+      alone), and the live mappings' count, ranges and bytes (mapUsage) for the address-space lines.
+    NativeAdrenoMapLines.h  (new)                                                            -> 1e36af6e3e2d560bf782ce84e6452ca12de89cf010768f887e9127f3a381e647
+      2026-11-12, MIT, this repository's: the BoMap refusal line and the address-space lines as pure functions.
+    tests/test_vm.cpp       d81e652885397fbbd091f939e601c42afa4a5655d39ab21bd66fb1253ce446cd -> fc2c707d2ed7bb85b06b04466cd6f30b95c873165f933eac4e48db403130a8b0
+    tests/test_userclient.cpp 882247d5763651ac02c1ae26f676d2ffcc3457f28ee6bc1411998b16072bea54 -> c2e377cdc2df670e91740137e88fac8034b7e25b724db643e40ad19bc7c8f8d0
+    tests/test_vamap.cpp    (new)                                                            -> 603be305ba5ddcff4f8cc675ef155060fd3f9169d4d5bb1eb283cabf5beb3669
+    tests/hostsim/host_gpu_service.cpp 10a70158b87ef0c1b65de905970ad43475dcb941a3e233c20c9215520b4b3713 -> 79d72290553732901c35884e99c627f393f3d39f45e8b79395c16f4b54216c2c
+      2026-11-12: test_vm (ADRENO830_MACOS) the refusal reasons and the 524288-range capacity; test_userclient runs whole in the
+      ADRENO830_MACOS pass (iPadOS's lists and upstream's 16 GiB layout left out there) with the BoMap refusal records and mapping
+      figures; test_vamap (new) the macOS window table and the lines; hostsim HOSTSIM_SLOT_REOPEN (the device's connection in another
+      slot than the probe's, for tooling/metal/check-turnip-a830-host.py's reslot run of Turnip 0006).
   Not compiled into the kext: NativeAdrenoAccelerator.cpp (the iPadOS IOAcceleratorES class), NativeAdrenoClient.cpp and
   NativeAdrenoBoard.cpp (host-only), tests/ and scripts/ (host tools). The source lists are those of scripts/build-adreno830.py.
   NativeAdrenoABI.h (the v2 user-client ABI Turnip's darwin KMD includes) is unchanged, byte for byte.
@@ -103,7 +132,7 @@ UniXNU-Pagani_SM8750 (github.com/Shad0w23333/UniXNU-Pagani_SM8750), 25b110978fec
 BSD-2-Clause-Patent (sha256 5b1d3d911103cb0f41641ec0964c5ac1f7e229f57aa072b6ac38bae913a1307b), the 13T's GPU board:
   package/PaganiGpuBoard.cpp (bd3ae49476ab8b1775f3c7b35f84478a90880cd382ac89ce6890d47aed21bc72) -> board/PianoA830Board.cpp.
     Kept: fillBoard (every field, the slot/bank policy, ACTLR 0x303, highest bank bit 16), the firmware pins. The pool's default:
-    an eighth of the RAM in 256 MiB steps, 512..1536 MiB (piano_a830_pool_default, PianoA830.h; 1536 on piano), not the 13T's 512.
+    a quarter of the RAM in 256 MiB steps, 512..2048 MiB (piano_a830_pool_default, PianoA830.h; 2048 on piano), not the 13T's 512.
     Changed: PIANO_GPU_* inputs; piano-* boot arguments through the getter (the driver's knob table untouched); piano-gpu=1 forces
     stop=0 (S0 only), piano-gpu=2 defaults the status page to 2; the SoC id from SMEM when it is one of the DT's SoCs; started from
     the kext's thread instead of Stage7Probe (no async knob).

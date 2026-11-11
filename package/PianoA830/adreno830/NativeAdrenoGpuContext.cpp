@@ -98,7 +98,12 @@ IOReturn NativeAdrenoGpuContext::bringUp(const NativeAdrenoGpuContextConfig &con
          * windows of the 16 GiB table (2026-11-01): a heap of 448 MiB takes blocks of 16 MiB where 124 MiB took 4, and run 20261031-223924
          * was already refusing mappings at 12 clients (vmr 37, records or ranges: the line did not tell them apart then), with 98304 spans
          * left past the render server's reserve. */
+#ifdef ADRENO830_MACOS
+        /* UniXNU-piano: 524288 (NativeAdrenoVmMaxSpans): the first macOS desktop ran out of the 262144. */
+        status=vm_.attach(smmu_.binding(),&lower,nullptr,NativeAdrenoVmMaxSpans,262144);
+#else
         status=vm_.attach(smmu_.binding(),&lower,nullptr,262144,262144);
+#endif
         /* The null guard and the GMEM window are never mapped (ARCHITECTURE 4.6.2). */
         if(!status)status=vm_.reserveWindow(0,GpuNullGuardBytes);
         if(!status)status=vm_.reserveWindow(GpuGmemIova,GpuGmemBytes);

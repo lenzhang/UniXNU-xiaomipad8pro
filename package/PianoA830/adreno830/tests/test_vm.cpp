@@ -27,6 +27,9 @@ IOReturn NativeAdrenoMaintainOwnedPages(void *mapping,size_t bytes,NativeAdrenoC
 extern "C" {extern volatile uint64_t native_adreno_vm_phase_us[2][8];}
 static uint64_t nowUs() {return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 
+#ifdef ADRENO830_MACOS
+static unsigned refusalChecks;   /* UniXNU-piano */
+#endif
 static A830SmmuModel model;
 /* The board programmer as the VM uses it: the TLB I/O and the read-only verify, the FAULT of the streams. */
 struct Programmer {
@@ -173,12 +176,26 @@ static void refusals()
     CHECK(s.vm.map(&s.object,0,0x1,3,0,2,&handle)==kIOReturnBadArgument);
     CHECK(s.vm.map(&s.object,1,0x2000,3,0,2,&handle)==kIOReturnBadArgument);
     CHECK(s.vm.map(&s.object,0,0xF000,3,0,2,&handle)==kIOReturnBadArgument);   /* past the aperture */
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the refusal's reason (BoMap's console detail) */
+    CHECK(s.vm.lastRefusal().why==NativeAdrenoVmWhyAperture && s.vm.lastRefusal().a==0xF000 && s.vm.lastRefusal().b==0x2000 &&
+          s.vm.lastRefusal().c==0x10000 && s.vm.lastRefusal().memory==&s.object);
+    ++refusalChecks;
+#endif
     CHECK(s.vm.map(&s.object,0,0x2000,2,0,2,&handle)==kIOReturnBadArgument);   /* no read */
+#ifdef ADRENO830_MACOS
+    CHECK(s.vm.lastRefusal().why==NativeAdrenoVmWhyRequest && s.vm.lastRefusal().a==2);
+    ++refusalChecks;
+#endif
     CHECK(s.vm.map(&s.object,0,0x2000,3,2,2,&handle)==kIOReturnBadArgument);
     CHECK(s.vm.map(&s.object,0,0x2000,3,0,1,&handle)==kIOReturnBadArgument);
     CHECK(s.vm.map(nullptr,0,0x2000,3,0,2,&handle)==kIOReturnBadArgument);
     CHECK(s.vm.map(&s.object,0,0x0,3,0,2,&handle)==kIOReturnBadArgument);      /* window 0 */
     CHECK(s.vm.map(&s.object,0,0x5000,3,0,2,&handle)==kIOReturnBadArgument);   /* overlaps window 0x6000 */
+#ifdef ADRENO830_MACOS
+    CHECK(s.vm.lastRefusal().why==NativeAdrenoVmWhyReserved && s.vm.lastRefusal().a==0x5000);
+    ++refusalChecks;
+#endif
     CHECK(!handle && refs==s.object.deviceReferences() && spans==s.vm.spanCount() && calls==fixture.cache_calls);
     CHECK(s.vm.findAddress(0,0x4000,4096,&address)==kIOReturnSuccess && address==0x2000);
     CHECK(s.vm.findAddress(0,0x6000,4096,&address)==kIOReturnSuccess && address==0x8000);
@@ -186,6 +203,10 @@ static void refusals()
     const uint64_t mapped=handle;
     CHECK(s.vm.reserveWindow(0x2000,0x1000)==kIOReturnBusy);   /* something is mapped there */
     CHECK(s.vm.map(&s.object,0,0x2000,3,0,2,&handle)==kIOReturnBusy && !handle);
+#ifdef ADRENO830_MACOS
+    CHECK(s.vm.lastRefusal().why==NativeAdrenoVmWhyOverlap && s.vm.lastRefusal().a==0x2000 && s.vm.lastRefusal().b==0x2000);
+    ++refusalChecks;
+#endif
     CHECK(s.vm.unmap(mapped+100)==kIOReturnBadArgument && s.vm.holdJob(mapped+100)==kIOReturnBadArgument);
     CHECK(s.vm.retireJobAfterCompletion(mapped)==kIOReturnBadArgument && s.vm.noteUse(mapped,0)==kIOReturnBadArgument);
     CHECK(s.vm.unmap(mapped)==kIOReturnSuccess && !s.object.release());
@@ -214,6 +235,18 @@ static void scattered()
     CHECK(!huge.allocate(3*4096,36,false,3*4096) && huge.spanCount()==3);
     uint64_t refused=0;const unsigned writes=model.writes;
     CHECK(s.vm.map(&huge,0,0x802000,3,0,2,&refused)==kIOReturnNoResources && !refused);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the table ranges, told apart from the records: 3 needed, 2 free of 8. */
+    CHECK(s.vm.lastRefusal().why==NativeAdrenoVmWhySpans && s.vm.lastRefusal().a==3 && s.vm.lastRefusal().b==2 &&
+          s.vm.lastRefusal().c==8 && s.vm.lastRefusal().memory==&huge && s.vm.spanCapacity()==8);
+    uint64_t kept=0;
+    CHECK(s.vm.mapClient(&first,0x80c000,3,0,2,&kept,0,2)==kIOReturnNoResources &&   /* the render server's reserve of ranges */
+          s.vm.lastRefusal().why==NativeAdrenoVmWhyReserveSpans && s.vm.lastRefusal().a==1 && s.vm.lastRefusal().b==2 &&
+          s.vm.lastRefusal().c==2);
+    CHECK(s.vm.mapClient(&first,0x80c000,3,0,2,&kept,NativeAdrenoVmMaxObjects,0)==kIOReturnNoResources &&
+          s.vm.lastRefusal().why==NativeAdrenoVmWhyReserveObjects && s.vm.lastRefusal().a==3);
+    refusalChecks+=3;
+#endif
     CHECK(!huge.deviceReferences() && model.writes==writes && s.vm.spanCount()==6 && !s.vm.poisoned());
     CHECK(!s.vm.unmap(a) && !s.vm.unmap(b) && !s.vm.unmap(c) && s.vm.spanCount()==0);
     fixture.mode=Contiguous;
@@ -691,6 +724,19 @@ static unsigned concurrent()
 
 int main()
 {
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the table takes NativeAdrenoVmMaxSpans ranges (twice upstream's), not one more. */
+    {
+        Fixture s;
+        CHECK(exposed(s,NativeAdrenoVmMaxSpans+1)==kIOReturnBadArgument && !s.vm.attached());
+        CHECK(!s.tables.retireAfterQuiescence() && !s.tables.release() && fixture.live.empty());
+        Fixture t;
+        CHECK(exposed(t,NativeAdrenoVmMaxSpans)==kIOReturnSuccess && t.vm.spanCapacity()==NativeAdrenoVmMaxSpans &&
+              t.vm.freeSpans()==NativeAdrenoVmMaxSpans);
+        release(t);
+        refusalChecks+=2;
+    }
+#endif
     transactions();
     const unsigned rounds=faultsNeverPoison();
     refusals();
@@ -710,6 +756,10 @@ int main()
         "refused map, unmap unchanged, a stuck sync poisons; none without the flag)\n",synced);
     kitStreams();
     const unsigned threaded=concurrent();
+#ifdef ADRENO830_MACOS
+    std::printf("PASS: VM refusal reasons (UniXNU-piano): %u checks (the aperture, the request, a reserved window, an overlap, table ranges "
+        "told apart from records, the render server's reserves; 524288 ranges taken, not one more)\n",refusalChecks);
+#endif
     std::printf("PASS: VM over the A830 programmer: attach proves regions and routes once, %u map/unmap rounds under pending faults "
         "never poison, per-buffer fence unmap, 64-bit TLBIVAL, 4 GiB (2053), 2 GiB (1027) and 16 GiB (8209, BOs across and past 4 GiB) apertures with reserved windows, "
         "%u coherence-policy checks, coherent table walk, 3 poisoning paths, kit-stream attach, %u locked concurrent transactions\n",

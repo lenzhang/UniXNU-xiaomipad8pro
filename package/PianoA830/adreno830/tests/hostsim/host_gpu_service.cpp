@@ -162,7 +162,12 @@ int host_gpu_open() {
     /* HOSTSIM_SLOT=<n> (a830 only): the connection is mounted as NativeAdrenoPublish.cpp mounts a client in slot n, with
      * NativeAdrenoClientTermsFor's objects and render-server reserve and slot n's window of the 4 GiB table: 4 is an app's 124 MiB small
      * window, 1 a large client's 352 MiB (AdrenoMetal bridge/texture_atlas_host.mm). Unset or 0: the render server's slot 0, as before. */
-    const unsigned slot=[] {const char *s=std::getenv("HOSTSIM_SLOT");return s?unsigned(std::strtoul(s,nullptr,0)):0u;}();
+    unsigned slot=[] {const char *s=std::getenv("HOSTSIM_SLOT");return s?unsigned(std::strtoul(s,nullptr,0)):0u;}();
+    /* UniXNU-piano: HOSTSIM_SLOT_REOPEN=<n>: every open after the first is mounted in slot n instead, as when a process's device
+     * connection lands in another slot than its enumeration probe's did (run attend4: BoMap BadArgument outside the window). */
+    static unsigned opens;
+    if(const char *s=std::getenv("HOSTSIM_SLOT_REOPEN");s && opens)slot=unsigned(std::strtoul(s,nullptr,0));
+    ++opens;
     const bool large=slot>=1 && slot<=NativeAdrenoLargeSlots;
     const NativeAdrenoClientTerms terms=NativeAdrenoClientTermsFor(false,slot==0,large,slot);
     IOReturn st=client.open(NativeAdrenoAbiVersion,context->vm(),&execbuf,&ring,input_bits,context->outputBits(),

@@ -17,6 +17,13 @@ extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_a
  * coherent mappings at map, unmap, submission and completion. */
 extern "C" {volatile uint32_t native_adreno_io_coherent;volatile uint32_t native_adreno_coherent_skips[4];}
 static bool coherentMapping(unsigned writeback) {return writeback && native_adreno_io_coherent;}
+/* UniXNU-piano: a map refusal records why (NativeAdrenoVmWhy, NativeAdrenoVm::lastRefusal) in macOS builds; elsewhere the status
+ * alone, exactly as before. */
+#ifdef ADRENO830_MACOS
+#define VM_REFUSE(why,status,...) refuse(NativeAdrenoVmWhy##why,status,__VA_ARGS__)
+#else
+#define VM_REFUSE(why,status,...) (status)
+#endif
 static bool overlap(uint64_t a,uint64_t ab,uint64_t b,uint64_t bb)
 {return a<b+bb && b<a+ab;}
 /* Mappings of one cache/shareability/privilege class may share pages; only pages shared across classes refuse. */
@@ -115,7 +122,12 @@ IOReturn NativeAdrenoVm::attachCommon(const ArmSmmu4KIo *io,ArmSmmu4KContextConf
 {
     if(attached_ || ranges_ || poisoned_)return kIOReturnBusy;
     if(!io || !io->read32 || !io->write32 || !io->write64 || !io->barrier || !context || (!lower && !upper) || !capacity ||
-        capacity>262144 || !budget || budget>1048576 || (lower && !validBinding(*lower,0)) || (upper && !validBinding(*upper,1)))
+#ifdef ADRENO830_MACOS
+        capacity>NativeAdrenoVmMaxSpans ||   /* UniXNU-piano: 524288 */
+#else
+        capacity>262144 ||
+#endif
+        !budget || budget>1048576 || (lower && !validBinding(*lower,0)) || (upper && !validBinding(*upper,1)))
         return kIOReturnBadArgument;
     if(lower && (context->lower!=&lower->arena->config || context->lower_tables!=&lower->state->tables))return kIOReturnBadArgument;
     if(upper && (context->upper!=&upper->arena->config || context->upper_tables!=&upper->state->tables))return kIOReturnBadArgument;
@@ -272,33 +284,41 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
 {
     if(!memory || upper>1 || !regions_[upper].arena || !memory->backed() || memory->quarantined() ||
         !memory->bytes() || !memory->spanCount() || !(permissions&ArmSmmu4KRead) || (permissions&~15u) ||
-        writeback>1 || (shareability!=2 && shareability!=3))return kIOReturnBadArgument;
+        writeback>1 || (shareability!=2 && shareability!=3))return VM_REFUSE(Request,kIOReturnBadArgument,permissions,writeback,shareability,memory);
     const ArmSmmu4KLiveArena *a=regions_[upper].arena;
     if((iova&4095) || iova<a->iova || iova-a->iova>=a->bytes || memory->bytes()>a->bytes-(iova-a->iova))
-        return kIOReturnBadArgument;
+        return VM_REFUSE(Aperture,kIOReturnBadArgument,iova,memory->bytes(),a->iova+a->bytes,memory);
     /* The null guard and the GMEM window are never mapped (ARCHITECTURE 4.6.2). */
-    if(forbidden(iova,memory->bytes()))return kIOReturnBadArgument;
+    if(forbidden(iova,memory->bytes()))return VM_REFUSE(Reserved,kIOReturnBadArgument,iova,memory->bytes(),0,memory);
     /* Memory the GPU may only read is never mapped writable; the scanout is never mapped write-back. */
-    if((memory->readOnly() && (permissions&ArmSmmu4KWrite)) || (memory->scanout() && writeback))return kIOReturnBadArgument;
+    if((memory->readOnly() && (permissions&ArmSmmu4KWrite)) || (memory->scanout() && writeback))
+        return VM_REFUSE(ReadOnly,kIOReturnBadArgument,permissions,writeback,0,memory);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the two table limits told apart. */
+    if(objects_>=NativeAdrenoVmMaxObjects)return refuse(NativeAdrenoVmWhyObjects,kIOReturnNoResources,objects_,NativeAdrenoVmMaxObjects,0,memory);
+    if(memory->spanCount()>capacity_-spanCount())
+        return refuse(NativeAdrenoVmWhySpans,kIOReturnNoResources,memory->spanCount(),capacity_-spanCount(),capacity_,memory);
+#else
     if(objects_>=NativeAdrenoVmMaxObjects || memory->spanCount()>capacity_-spanCount())return kIOReturnNoResources;
+#endif
     {
         /* ranges_ is sorted by address: only the first range not wholly below iova can overlap (native addresses may end at 2^64,
          * so ends are compared as last bytes). A walk over every range cost each map a pass over 52609 of them (i567). */
         const size_t i=rangeAt(iova);
-        if(i<spanCount() && ranges_[i].iova<=iova+(memory->bytes()-1))return kIOReturnBusy;
+        if(i<spanCount() && ranges_[i].iova<=iova+(memory->bytes()-1))return VM_REFUSE(Overlap,kIOReturnBusy,iova,ranges_[i].iova,0,memory);
     }
-    if(a->config.output_bits<32 || a->config.output_bits>48)return kIOReturnBadArgument;
+    if(a->config.output_bits<32 || a->config.output_bits>48)return VM_REFUSE(Pages,kIOReturnBadArgument,UINT64_MAX,0,0,memory);
     uint64_t offset=0,limit=UINT64_C(1)<<a->config.output_bits;
     for(size_t j=0;j<memory->spanCount();++j) {
         const auto &span=memory->spans()[j];
         if(span.offset!=offset || !span.physical || !span.bytes || ((span.physical|span.bytes)&4095) ||
             span.bytes>memory->bytes()-offset || span.physical>=limit || span.bytes>limit-span.physical)
-            return kIOReturnBadArgument;
+            return VM_REFUSE(Pages,kIOReturnBadArgument,j,span.physical,span.bytes,memory);
         for(const auto &r:regions_)if(r.arena && overlap(span.physical,span.bytes,
-            r.arena->config.table_physical,r.arena->capacity_pages*UINT64_C(4096)))return kIOReturnBadArgument;
+            r.arena->config.table_physical,r.arena->capacity_pages*UINT64_C(4096)))return VM_REFUSE(Pages,kIOReturnBadArgument,j,span.physical,span.bytes,memory);
         offset+=span.bytes;
     }
-    if(offset!=memory->bytes())return kIOReturnBadArgument;
+    if(offset!=memory->bytes())return VM_REFUSE(Pages,kIOReturnBadArgument,memory->spanCount(),offset,memory->bytes(),memory);
     /* Only another cache/shareability/privilege class can conflict. Reuse the
      * arena's caller-owned temporary alias scratch before the table transaction
      * uses it. Index the smaller side and query the other in O(log n); neither
@@ -318,7 +338,8 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
             NativeAdrenoPhysicalIndex index(memory->spans(),order,smaller);
             for(size_t i=0;i<spanCount();++i) {
                 const auto &r=ranges_[i];
-                if(aliasClass(r.permissions,r.writeback,r.shareability)!=mine && index.overlaps(r.physical,r.bytes))return kIOReturnBadArgument;
+                if(aliasClass(r.permissions,r.writeback,r.shareability)!=mine && index.overlaps(r.physical,r.bytes))
+                    return VM_REFUSE(Alias,kIOReturnBadArgument,r.physical,r.iova,mine,memory);
             }
         } else {
             size_t n=0;
@@ -326,7 +347,8 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
                 if(aliasClass(ranges_[i].permissions,ranges_[i].writeback,ranges_[i].shareability)!=mine)order[n++]=(uint32_t)i;
             NativeAdrenoPhysicalIndex index(ranges_,order,n);
             for(size_t j=0;j<memory->spanCount();++j)
-                if(index.overlaps(memory->spans()[j].physical,memory->spans()[j].bytes))return kIOReturnBadArgument;
+                if(index.overlaps(memory->spans()[j].physical,memory->spans()[j].bytes))
+                    return VM_REFUSE(Alias,kIOReturnBadArgument,memory->spans()[j].physical,0,mine,memory);
         }
         return kIOReturnSuccess;
     }
@@ -335,7 +357,8 @@ IOReturn NativeAdrenoVm::preflight(const NativeAdrenoMemory *memory,unsigned upp
         const ArmSmmu4KRange &r=ranges_[i];
         if(aliasClass(r.permissions,r.writeback,r.shareability)==mine)continue;
         for(size_t j=0;j<memory->spanCount();++j)
-            if(overlap(memory->spans()[j].physical,memory->spans()[j].bytes,r.physical,r.bytes))return kIOReturnBadArgument;
+            if(overlap(memory->spans()[j].physical,memory->spans()[j].bytes,r.physical,r.bytes))
+                return VM_REFUSE(Alias,kIOReturnBadArgument,r.physical,r.iova,mine,memory);
     }
     return kIOReturnSuccess;
 }
@@ -432,15 +455,18 @@ IOReturn NativeAdrenoVm::mapLocked(NativeAdrenoMemory *memory,unsigned upper,uin
     unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle)
 {
     if(!handle)return kIOReturnBadArgument;*handle=0;result_={};
-    if(!attached_ || poisoned_)return kIOReturnNotReady;
+#ifdef ADRENO830_MACOS
+    refusal_={};   /* UniXNU-piano: this call's refusal only */
+#endif
+    if(!attached_ || poisoned_)return VM_REFUSE(NotReady,kIOReturnNotReady,attached_,poisoned_,0,memory);
     PhaseClock clock;
-    if(!memory)return kIOReturnBadArgument;
+    if(!memory)return VM_REFUSE(Request,kIOReturnBadArgument,permissions,writeback,shareability,memory);
     const unsigned cls=aliasClass(permissions,writeback,shareability)&15;
     const bool exclusive=exclusivePages(memory,cls);
     IOReturn checked=preflight(memory,upper,iova,permissions,writeback,shareability,exclusive);if(checked)return checked;
     if(next_handle_==UINT64_MAX)return kIOReturnNoResources;
     clock.lap(0,5);
-    checked=memory->holdForDevice();if(checked)return checked;
+    checked=memory->holdForDevice();if(checked)return VM_REFUSE(Hold,checked,uint32_t(checked),0,0,memory);
     clock.lap(0,1);
     Mapping *record=nullptr;
     for(size_t i=free_hint_;i<NativeAdrenoVmMaxObjects;++i)if(!mappings_[i].memory) {
@@ -533,21 +559,21 @@ IOReturn NativeAdrenoVm::mapClient(NativeAdrenoMemory *memory,uint64_t iova,unsi
     if(!handle)return kIOReturnBadArgument;
     *handle=0;
     if(!memory || writeback>1 || (shareability!=2 && shareability!=3) || (permissions&ArmSmmu4KPrivileged))
-        return kIOReturnBadArgument;
+        return VM_REFUSE(Request,kIOReturnBadArgument,permissions,writeback,shareability,memory);
     /* Memory the owner maps read-only could only be pinned for reading: the GPU gets the read half of what was asked. */
     if(memory->readOnly())permissions&=~unsigned(ArmSmmu4KWrite);
     unsigned wb=0,sh=2;
     attributes(*memory,permissions,writeback,shareability,&wb,&sh);
-    if(!attached_)return kIOReturnNotReady;
+    if(!attached_)return VM_REFUSE(NotReady,kIOReturnNotReady,0,0,0,memory);
     VM_LOCKED;
     /* The render server's reserve (NativeAdrenoVmRenderReserve*): another client's mapping must leave this much of both tables. */
     if(keep_objects && objects_+1+keep_objects>NativeAdrenoVmMaxObjects) {
         native_adreno_vm_reserve_refused[0]=native_adreno_vm_reserve_refused[0]+1;
-        return kIOReturnNoResources;
+        return VM_REFUSE(ReserveObjects,kIOReturnNoResources,objects_,keep_objects,0,memory);
     }
     if(keep_spans && memory->spanCount()+keep_spans>capacity_-spanCount()) {
         native_adreno_vm_reserve_refused[1]=native_adreno_vm_reserve_refused[1]+1;
-        return kIOReturnNoResources;
+        return VM_REFUSE(ReserveSpans,kIOReturnNoResources,memory->spanCount(),capacity_-spanCount(),keep_spans,memory);
     }
     return mapLocked(memory,0,iova,permissions,wb,sh,handle);
 }

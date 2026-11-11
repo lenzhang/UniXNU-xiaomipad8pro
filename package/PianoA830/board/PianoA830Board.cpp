@@ -198,7 +198,7 @@ extern "C" IOReturn piano_a830_board_start(unsigned level)
                   PIANO_GPU_SOC_ID);
   Adreno830ParseKnobs(&board, bootArgument, nullptr);
   piano_a830_note("board: BO pool %u MiB (%s; RAM %llu MiB)", board.pool_mib,
-                  (board.flags & Adreno830BoardFlagPool) ? "piano-gpu-pool" : "an eighth of the RAM, 512..1536", (unsigned long long)(max_mem >> 20));
+                  (board.flags & Adreno830BoardFlagPool) ? "piano-gpu-pool" : "a quarter of the RAM, 512..2048", (unsigned long long)(max_mem >> 20));
   piano_a830_note("board: knobs stop=%d status=%u profile=%u trace=%u irq=%u dcvs=%u va=%u kopt=%#x actlr=%#x pool=%u MiB", int(board.knobs.stop),
                   board.knobs.status, board.knobs.profile, board.knobs.trace, board.knobs.irq, board.knobs.dcvs, board.knobs.va, board.knobs.kopt,
                   board.knobs.actlr, board.pool_mib);

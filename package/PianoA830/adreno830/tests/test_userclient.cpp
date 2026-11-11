@@ -143,6 +143,9 @@ static NativeAdrenoAbiSubmit request;
 static const int *gMemoryDepth;
 static unsigned gPagesUnder,gPagesOutside;
 extern "C" volatile uint32_t native_adreno_client_stats[NativeAdrenoSubmitRanges+1][6];
+#ifdef ADRENO830_MACOS
+static unsigned macosChecks;   /* UniXNU-piano: the BoMap refusal records and the mappings' figures */
+#endif
 int main()
 {
     unsigned blocks=0,koptBlocks=0;
@@ -273,6 +276,7 @@ int main()
         uint64_t total=0;
         for(unsigned i=0;i<NativeAdrenoMaxClients;++i)total+=w4[i].bytes;
         CHECK(total==0xFFFFE000ull-0x20000000ull);   /* the whole client range of the 4 GiB aperture */
+#ifndef ADRENO830_MACOS   /* UniXNU-piano: macOS's 16 GiB table has its own layout, checked in test_vamap */
         CHECK(w16[0].start==0x20000000 && w16[0].bytes==0x60000000 && w16[1].start==0x80000000);
         for(unsigned i=1;i<NativeAdrenoMaxClients;++i) {
             /* Slots 5, 14 and 23 start on a multiple of 4 GiB, the 64 MiB under it nobody's: no window, so no BO, crosses one. */
@@ -288,6 +292,7 @@ int main()
         for(unsigned i=0;i<NativeAdrenoMaxClients;++i)total+=w16[i].bytes;
         CHECK(total==0x3FFFFE000ull-0x20000000ull-3*0x4000000ull && NativeAdrenoClientWindowsEnd(w16)==0x3FFFFE000ull &&
               NativeAdrenoClientWindowsEnd(w16)<=(UINT64_C(1)<<34) && NativeAdrenoClientWindowsEnd(w16)>(UINT64_C(1)<<33));
+#endif
         CHECK(w2[0].start==0x20000000 && w2[0].bytes==0x40000000 && w2[1].start==0x60000000 && w2[2].start==0x6AAA9000 &&
             w2[3].start==0x75552000 && w2[3].bytes==0x0AAA9000 && NativeAdrenoClientWindowsEnd(w2)==0x7FFFB000ull);
         for(unsigned i=4;i<NativeAdrenoMaxClients;++i)CHECK(!w2[i].bytes);
@@ -306,9 +311,11 @@ int main()
             NativeAdrenoClientSlotAt(w4,0xC1FFFFFF)==3 && NativeAdrenoClientSlotAt(w4,0xC2000000)==4 &&
             NativeAdrenoClientSlotAt(w4,0xFFFFDFFF)==Windows4G-1 && NativeAdrenoClientSlotAt(w4,0xFFFFE000)==NativeAdrenoMaxClients &&
             NativeAdrenoClientSlotAt(w4,0x200000000ull)==NativeAdrenoMaxClients);
+#ifndef ADRENO830_MACOS   /* UniXNU-piano: the same */
         CHECK(NativeAdrenoClientSlotAt(w16,0x3FFFFDFFFull)==NativeAdrenoMaxClients-1 && NativeAdrenoClientSlotAt(w16,0x3FFFFE000ull)==NativeAdrenoMaxClients &&
             NativeAdrenoClientSlotAt(w16,0xDFFFFFFF)==3 && NativeAdrenoClientSlotAt(w16,0xE0000000)==4 &&
             NativeAdrenoClientSlotAt(w16,0x400000000ull)==NativeAdrenoMaxClients);
+#endif
         CHECK(NativeAdrenoClientSlotAt(w2,0x7FFFFFFF)==NativeAdrenoMaxClients && NativeAdrenoClientSlotAt(w2,0x75552000)==3 &&
             NativeAdrenoClientSlotAt(w2,0)==NativeAdrenoMaxClients && NativeAdrenoClientSlotAt(w2,0xC2000000)==NativeAdrenoMaxClients);
         /* Slot choice (ARCHITECTURE 6.2): the render server takes slot 0, its second connection and the large class a free large slot
@@ -389,11 +396,13 @@ int main()
         CHECK(strlen(slotLine)<NativeAdrenoSlotLineBytes-1 && !strcmp(slotLine+strlen(slotLine)-20," 31:~WidgetRend/9999"));
         /* The first address past 4 GiB (6.2): slot 5 of the 16 GiB table starts on the line, so its client's first mapping is there; a mapping's end is
          * exclusive, so one that ends at 4 GiB, or in the gap under the line, is still below. A page of a gap belongs to no client. */
+#ifndef ADRENO830_MACOS   /* UniXNU-piano: the same: slot 1 starts on 4 GiB there */
         CHECK(w16[5].start==NativeAdrenoVa4G && w16[4].start+w16[4].bytes==NativeAdrenoVa4G-0x4000000ull);
         CHECK(NativeAdrenoClientSlotAt(w16,NativeAdrenoVa4G-0x1000)==NativeAdrenoMaxClients && NativeAdrenoClientSlotAt(w16,NativeAdrenoVa4G)==5);
         CHECK(!NativeAdrenoPast4G(0) && !NativeAdrenoPast4G(w16[4].start+w16[4].bytes) && NativeAdrenoPast4G(w16[5].start+0x2000) &&
               !NativeAdrenoPast4G(NativeAdrenoVa4G) && NativeAdrenoPast4G(NativeAdrenoVa4G+0x1000) &&
               NativeAdrenoPast4G(w16[6].start+0x1000) && NativeAdrenoPast4G(0x3FFFFE000ull));
+#endif
         for(unsigned s=0;s<NativeAdrenoMaxClients;++s)   /* no window of the smaller tables gets there */
             CHECK(!w4[s].bytes || !NativeAdrenoPast4G(w4[s].start+w4[s].bytes));
         char pastLine[NativeAdrenoPast4GLineBytes];
@@ -468,6 +477,7 @@ int main()
         }
         /* The process lists. With 17 bytes the kernel's grant (zzw-native-adreno-sandbox-grant.patch) sees 16 characters of a name: a long
          * entry matches the truncated name, a short one only the whole name. The publish shell compares 19 characters (20-byte buffer). */
+#ifndef ADRENO830_MACOS   /* UniXNU-piano: iPadOS's lists; the macOS lists have their own check (run-a830-host-tests.py macos_lists) */
         const char *granted[]={"backboardd","iconservicesagen","WidgetRenderer_D","PosterBoard","AegirPoster","KaleidoscopePost",
             "PhotosPosterProv","AmbientPhotoFram","MercuryPosterExt","MonogramPosterEx","HelloPosterExten","PridePosterExten",
             "RhizomePoster","ExtragalacticPos","EmojiPosterExten","AvatarPosterExte","WeatherPoster","LegacyPoster"};
@@ -499,6 +509,7 @@ int main()
               !NativeAdrenoListNamesProcess(NativeAdrenoLargeClientList,"backboardd",20) &&
               !NativeAdrenoListNamesProcess(NativeAdrenoLargeClientList,"AegirPoster",20) &&
               !NativeAdrenoListNamesProcess(NativeAdrenoLargeClientList,"WidgetRenderer_Def",20));
+#endif
         /* A global loss refuses; no per-process cap beyond sheng-gpu-metal-opens (the old eight per boot is gone); a name whose jobs
          * hung the GPU twice is refused (the shell never passes the render server's hangs). */
         CHECK(NativeAdrenoOpenRefusal(false,0,1000)==kIOReturnSuccess && NativeAdrenoOpenRefusal(false,40,39)==kIOReturnSuccess);
@@ -676,6 +687,25 @@ int main()
         CHECK(third.open(NativeAdrenoAbiVersion,&p.vm,&p.execbuf,&p.ring,32,36)==kIOReturnSuccess &&
             third.setScope(2*NativeAdrenoAbiMaxQueues,Base+0x8000,0x4000)==kIOReturnSuccess);
         const uint64_t h0=allocMapped(p.client,4096,Base),h1=allocMapped(second,4096,Base+0x4000),h2=allocMapped(third,4096,Base+0x8000);
+#ifdef ADRENO830_MACOS
+        /* UniXNU-piano: a mapping outside the connection's window (run attend4: a device whose connection got another slot than its
+         * probe's), refused with the window and the mapping's figures; the mappings' figures of each connection. */
+        {
+            NativeAdrenoAbiBoAlloc alloc{8192,12,0};NativeAdrenoAbiBoAllocReply outside{};
+            CHECK(second.allocBo(&alloc,&outside)==kIOReturnSuccess);
+            NativeAdrenoAbiBoMap map{outside.handle,Base+0x2000,3,0,2,0};NativeAdrenoAbiBoMapReply mapped{};
+            CHECK(second.mapBo(&map,&mapped)==kIOReturnBadArgument);
+            const NativeAdrenoMapRefusal why=second.lastMapRefusal();
+            CHECK(why.why==NativeAdrenoMapWhyWindow && why.a==Base+0x2000 && why.b==8192 && why.c==Base+0x4000 && why.d==Base+0x8000);
+            map.iova=Base+0x7000;   /* inside at its start, past the end at its last page */
+            CHECK(second.mapBo(&map,&mapped)==kIOReturnBadArgument && second.lastMapRefusal().why==NativeAdrenoMapWhyWindow);
+            NativeAdrenoMapUsage u{};second.mapUsage(&u);
+            CHECK(u.objects==1 && u.bytes==4096 && u.window_start==Base+0x4000 && u.window_bytes==0x4000 && u.window_peak==Base+0x5000);
+            NativeAdrenoAbiBoFree drop{outside.handle};
+            CHECK(second.freeBo(&drop)==kIOReturnSuccess);
+            macosChecks+=5;
+        }
+#endif
         NativeAdrenoAbiSubmitReply reply{};
         request={};request.buffer_count=NativeAdrenoAbiMaxBuffers;
         for(auto &b:request.buffers)b={h0,Base,256};
@@ -806,9 +836,35 @@ int main()
         NativeAdrenoAbiBoMapReply mapped{};
         for(const auto &r:wrong)CHECK(p.client.mapBo(&r,&mapped)==kIOReturnBadArgument);
         CHECK(!mapped.iova && !p.client.mapped(allocated.handle));
+#ifdef ADRENO830_MACOS
+        /* UniXNU-piano: each refusal's reason for the console's detail line, and the mappings' figures. */
+        {
+            const uint8_t whys[]={NativeAdrenoMapWhyHandle,NativeAdrenoMapWhyRequest,NativeAdrenoMapWhyRequest,NativeAdrenoMapWhyRequest,
+                NativeAdrenoMapWhyRequest,NativeAdrenoMapWhyRequest,NativeAdrenoMapWhyHandle};
+            static_assert(sizeof whys==sizeof wrong/sizeof wrong[0],"one reason per request");
+            for(size_t i=0;i<sizeof whys;++i)
+                CHECK(p.client.mapBo(&wrong[i],&mapped)==kIOReturnBadArgument && p.client.lastMapRefusal().why==whys[i]);
+            CHECK(p.client.lastMapRefusal().a==allocated.handle+9 && !p.client.lastMapRefusal().b);
+            CHECK(p.client.mapBo(&wrong[2],&mapped)==kIOReturnBadArgument && p.client.lastMapRefusal().d==1);   /* the iova's low bits */
+            NativeAdrenoMapUsage u{};p.client.mapUsage(&u);
+            CHECK(!u.objects && !u.spans && !u.bytes);
+            macosChecks+=sizeof whys+3;
+        }
+#endif
         NativeAdrenoAbiBoMap r{allocated.handle,Base,3,0,2,0};
         CHECK(p.client.mapBo(&r,&mapped)==kIOReturnSuccess);
+#ifdef ADRENO830_MACOS
+        {
+            NativeAdrenoMapUsage u{};p.client.mapUsage(&u);
+            CHECK(u.objects==1 && u.spans==1 && u.bytes==4096 && !p.client.lastMapRefusal().why);
+            ++macosChecks;
+        }
+#endif
         CHECK(p.client.mapBo(&r,&mapped)==kIOReturnBusy);
+#ifdef ADRENO830_MACOS
+        CHECK(p.client.lastMapRefusal().why==NativeAdrenoMapWhyMapped && p.client.lastMapRefusal().b==Base);
+        ++macosChecks;
+#endif
         NativeAdrenoAbiSubmit empty{};
         NativeAdrenoAbiSubmitReply reply{};
         CHECK(p.client.submit(&empty,&reply,&ringclock)==kIOReturnBadArgument);
@@ -830,6 +886,13 @@ int main()
         CHECK(p.client.close()==kIOReturnBusy); /* object still live */
         NativeAdrenoAbiBoFree final_free{allocated.handle};
         CHECK(p.client.freeBo(&final_free)==kIOReturnSuccess);
+#ifdef ADRENO830_MACOS
+        {
+            NativeAdrenoMapUsage u{};p.client.mapUsage(&u);   /* UniXNU-piano: the unmap took it away */
+            CHECK(!u.objects && !u.spans && !u.bytes);
+            ++macosChecks;
+        }
+#endif
         CHECK(p.client.close()==kIOReturnSuccess);
         CHECK(p.client.query(nullptr)==kIOReturnBadArgument);
         ++blocks;
@@ -1429,6 +1492,10 @@ int main()
     std::printf("PASS: %u attribution blocks: render-server connections stamp their jobs as the render server's (only while open), "
         "the page fault charged to its FAR window's connection whatever was in flight (nobody for the kernel range), the jobs in flight "
         "only counted against it (alike, apart, undecided, polled)\n",attribution);
+#ifdef ADRENO830_MACOS
+    std::printf("PASS: BoMap refusal records and mapping figures (UniXNU-piano): %u checks (every request refusal's reason, already mapped, "
+                "outside the window with its figures, mapped/unmapped counts)\n",macosChecks);
+#endif
     std::printf("PASS: %u user-client blocks over software SMMU/CP peers: transaction with wait_fence validated against the ring (no CPU "
         "wait), per-connection faults with FAR attribution, 32 slots with 4 GiB (1+3 large+8 small)/16 GiB (1+3 large+28 small)/2 GiB "
         "windows, slot classes (apps leave 3/4 small slots to the listed processes, which may borrow a large one; an app never takes a "

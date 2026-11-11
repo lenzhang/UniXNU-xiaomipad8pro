@@ -13,9 +13,10 @@ reported as KNOWN and not as failures:
       (NativeAdrenoFirmware.cpp), which is the 13T's; nothing in the driver uses that table (S0 checks the board's pins, which are
       piano's). The GMU image is identical to the 13T's and passes in full.
   test_a830regs: compares A830Regs.h with upstream's docs/inputs/regs Mesa export, which the published Adreno830 does not carry.
-  test_userclient (ADRENO830_MACOS pass only): asserts iPadOS's process names in the client lists; the macOS lists get their own
-      structural check instead (macos_lists below: every entry matches as proc_selfname gives it, at 16 and 19 characters; the large
-      list is part of the grant list; WindowServer is granted and is not a large client; iPadOS's names are absent).
+test_userclient runs whole in both passes since 2026-11-12: its iPadOS client lists and upstream's 16 GiB window layout are left out of
+the ADRENO830_MACOS pass (the macOS lists have their structural check, macos_lists below: every entry matches as proc_selfname gives
+it, at 16 and 19 characters; the large list is part of the grant list; WindowServer is granted and is not a large client; iPadOS's
+names are absent; macOS's window table has tests/test_vamap.cpp).
 Then the board's own portable tests (package/PianoA830/board/tests: the LLCC island slice, the GPU ceiling slots).
 Exit 1 on any other failure.
 """
@@ -37,7 +38,7 @@ KNOWN = {
 }
 
 
-KNOWN_MACOS = {'test_userclient': "asserts iPadOS's client lists by name (macOS lists: macos_lists)"}
+KNOWN_MACOS = {}
 MACOS_LISTS = r"""
 #include "NativeAdrenoPublish.h"
 #include <cstdio>

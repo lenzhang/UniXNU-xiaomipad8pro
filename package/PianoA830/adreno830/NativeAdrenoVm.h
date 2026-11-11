@@ -35,6 +35,31 @@ enum : size_t {NativeAdrenoVmMaxObjects=32768,NativeAdrenoVmMaxWindows=4};
  * a refusal there costs one app a VK_ERROR_OUT_OF_DEVICE_MEMORY, the render server's own refusal the whole interface (int-237).
  * backboardd held about 4000 objects for minutes (i567); all clients together held 52609 table ranges once (i568). */
 enum : size_t {NativeAdrenoVmRenderReserveObjects=8192,NativeAdrenoVmRenderReserveSpans=32768};
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (2026-11-12): the table's range capacity, twice upstream's 262144: 2 GiB of BOs even when every page is its own span. The
+ * first macOS desktop (run attend4: 24 Metal clients, 701 MiB of own BOs past a 1024 MiB pool, the render server's surfaces imported)
+ * ran out of ranges: WindowServer's BoMap answered NoResources, WindowServer aborted. 20 MiB of records, allocated once at attach. */
+enum : size_t {NativeAdrenoVmMaxSpans=524288};
+/* Why a map was refused (NativeAdrenoVm::lastRefusal, NativeAdrenoUserClient::lastMapRefusal): the code and up to three figures, named
+ * per code where it is set; memory is the object the refusal was about (a caller checks it is its own). */
+enum NativeAdrenoVmWhy : uint8_t {
+    NativeAdrenoVmWhyNone,
+    NativeAdrenoVmWhyRequest,       /* permissions/writeback/shareability (a, b, c), no memory, or an unbacked/quarantined/empty object */
+    NativeAdrenoVmWhyAperture,      /* iova a, bytes b outside the region (its end c) or not page aligned */
+    NativeAdrenoVmWhyReserved,      /* iova a, bytes b touch a reserved window (the null guard, GMEM) */
+    NativeAdrenoVmWhyReadOnly,      /* a writable mapping of memory the GPU may only read, or the scanout write-back */
+    NativeAdrenoVmWhyObjects,       /* mapping records: a in use of b */
+    NativeAdrenoVmWhySpans,         /* table ranges: a needed, b free of c */
+    NativeAdrenoVmWhyOverlap,       /* iova a overlaps the mapped range at b */
+    NativeAdrenoVmWhyPages,         /* the object's own spans (a: the bad span's index) or a span on the page tables themselves */
+    NativeAdrenoVmWhyAlias,         /* a page already mapped with another cache/shareability class */
+    NativeAdrenoVmWhyReserveObjects,/* the render server's reserve: records a in use, b kept */
+    NativeAdrenoVmWhyReserveSpans,  /* the render server's reserve: ranges a needed, b free, c kept */
+    NativeAdrenoVmWhyHold,          /* the object refused a device reference (status a) */
+    NativeAdrenoVmWhyNotReady,      /* the VM is not attached or poisoned */
+};
+struct NativeAdrenoVmRefusal {uint8_t why;uint64_t a,b,c;const NativeAdrenoMemory *memory;};
+#endif
 /* Mappings refused for the render server's reserve: [0] for objects, [1] for table ranges. */
 extern "C" volatile uint32_t native_adreno_vm_reserve_refused[2];
 /* Coherence level (ARCHITECTURE 4.14.1, 3.6 pagani-gpu-coherent): 0 every GPU mapping non-cacheable; 1 GPU-read-only imports
@@ -91,6 +116,12 @@ class NativeAdrenoVm final {
     uint64_t next_handle_=1;
     bool attached_=false,poisoned_=false,distrust_write_combined_=false,coherent_walk_=false;
     NativeAdrenoVmResult result_{};
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: why the last map was refused (written under the VM's lock, read right after the call by its caller). */
+    mutable NativeAdrenoVmRefusal refusal_{};
+    IOReturn refuse(uint8_t why,IOReturn status,uint64_t a=0,uint64_t b=0,uint64_t c=0,const NativeAdrenoMemory *memory=nullptr) const
+    {refusal_={why,a,b,c,memory};return status;}
+#endif
     ArmSmmu4KLiveRegion region(unsigned) const;
     IOReturn fail(ArmSmmu4KStatus);
     Mapping *find(uint64_t);
@@ -210,5 +241,10 @@ public:
     size_t spanCount() const {return lower_count_+upper_count_;}
     NativeAdrenoVmResult lastResult() const {return result_;}
     unsigned bank() const {return bank_;}
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the last refused map's reason (BoMap's console detail), the table's range capacity. */
+    NativeAdrenoVmRefusal lastRefusal() const {return refusal_;}
+    size_t spanCapacity() const {return capacity_;}
+#endif
 };
 #endif

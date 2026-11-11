@@ -27,6 +27,12 @@ extern "C" {volatile uint32_t native_adreno_map_fail[6][2];}
  * publish shell's connection slot). */
 extern "C" {volatile uint32_t native_adreno_window_overflow[NativeAdrenoSubmitRanges][3];}
 extern "C" int proc_selfpid(void);
+/* UniXNU-piano: a BoMap refusal records why (NativeAdrenoMapWhy, lastMapRefusal) in macOS builds; elsewhere the status alone, as before. */
+#ifdef ADRENO830_MACOS
+#define MAP_REFUSE(why,status,a,b,c,d) refuseMap(NativeAdrenoMapWhy##why,status,a,b,c,d)
+#else
+#define MAP_REFUSE(why,status,a,b,c,d) (status)
+#endif
 namespace {
 unsigned gImportNext;
 void noteImportState(uint64_t handle,uint64_t state)
@@ -132,6 +138,26 @@ void NativeAdrenoUserClient::account(const Entry &entry,bool add)
     const uint64_t bytes=memory.bytes(),now=__atomic_load_n(counter,__ATOMIC_RELAXED);
     __atomic_store_n(counter,add?now+bytes:now>=bytes?now-bytes:0,__ATOMIC_RELAXED);
 }
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano: the live mappings' figures (mapBo adds, freeBo's unmap takes away). */
+void NativeAdrenoUserClient::noteMapped(const Entry &entry,bool add)
+{
+    const uint64_t spans=entry.memory.spanCount(),bytes=entry.memory.bytes();
+    auto step=[add](uint64_t *counter,uint64_t by) {
+        const uint64_t now=__atomic_load_n(counter,__ATOMIC_RELAXED);
+        __atomic_store_n(counter,add?now+by:now>=by?now-by:0,__ATOMIC_RELAXED);
+    };
+    step(&mapped_objects_,1);step(&mapped_spans_,spans);step(&mapped_bytes_,bytes);
+}
+void NativeAdrenoUserClient::mapUsage(NativeAdrenoMapUsage *out) const
+{
+    if(!out)return;
+    out->objects=__atomic_load_n(&mapped_objects_,__ATOMIC_RELAXED);
+    out->spans=__atomic_load_n(&mapped_spans_,__ATOMIC_RELAXED);
+    out->bytes=__atomic_load_n(&mapped_bytes_,__ATOMIC_RELAXED);
+    out->window_start=window_start_;out->window_bytes=window_bytes_;out->window_peak=window_peak_;
+}
+#endif
 void NativeAdrenoUserClient::usage(uint64_t *pool,uint64_t *other,uint64_t *imported) const
 {
     if(pool)*pool=__atomic_load_n(&pool_bytes_,__ATOMIC_RELAXED);
@@ -422,13 +448,17 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
     NativeAdrenoAbiBoMapReply *reply)
 {
     if(!request || !reply)return kIOReturnBadArgument;reply->iova=0;
-    if(!open_)return kIOReturnNotReady;
+#ifdef ADRENO830_MACOS
+    map_refusal_={};   /* UniXNU-piano: this call's refusal only */
+#endif
+    if(!open_)return MAP_REFUSE(NotOpen,kIOReturnNotReady,0,0,0,0);
     if(!(request->permissions&1) || (request->permissions&~3u) || request->writeback>1 ||
         (request->shareability!=2 && request->shareability!=3) || request->reserved ||
-        (request->iova&4095))return kIOReturnBadArgument;
+        (request->iova&4095))return MAP_REFUSE(Request,kIOReturnBadArgument,request->permissions,request->writeback,request->shareability,
+                                                request->reserved?uint64_t(request->reserved):(request->iova&4095));
     Entry *entry=find(request->handle);
-    if(!entry || entry->unreleasable)return kIOReturnBadArgument;
-    if(entry->mapped_state)return kIOReturnBusy;
+    if(!entry || entry->unreleasable)return MAP_REFUSE(Handle,kIOReturnBadArgument,request->handle,entry?1:0,0,0);
+    if(entry->mapped_state)return MAP_REFUSE(Mapped,kIOReturnBusy,request->handle,entry->iova,0,0);
     const uint64_t end=request->iova+entry->memory.bytes();
     if(window_bytes_ && (request->iova<window_start_ || end<request->iova || end>window_start_+window_bytes_)) {
         /* Per window: how often a mapping fell outside it, and the last one's size and end (MiB). */
@@ -438,10 +468,10 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
             native_adreno_window_overflow[slot][1]=uint32_t(entry->memory.bytes()>>10);
             native_adreno_window_overflow[slot][2]=uint32_t(end>>20);
         }
-        return kIOReturnBadArgument;
+        return MAP_REFUSE(Window,kIOReturnBadArgument,request->iova,entry->memory.bytes(),window_start_,window_start_+window_bytes_);
     }
     /* The scanout is a GPU write target (the hand-off copy): it must be mapped writable; the VM maps it non-cacheable. */
-    if(entry->scanout && !(request->permissions&2u))return kIOReturnBadArgument;
+    if(entry->scanout && !(request->permissions&2u))return MAP_REFUSE(Scanout,kIOReturnBadArgument,request->permissions,0,0,0);
     /* Memory the owner maps read-only could only be pinned for reading: the GPU gets the read half of what was asked. */
     const unsigned permissions=entry->memory.readOnly()?(request->permissions&~2u):request->permissions;
     /* The VM chooses the attributes of ARCHITECTURE 4.14.1 for this memory at the current coherence level (NativeAdrenoVm::attributes):
@@ -450,8 +480,20 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
     uint64_t handle=0;
     const IOReturn status=vm_->mapClient(&entry->memory,request->iova,permissions,request->writeback,request->shareability,&handle,
         keep_objects_,keep_spans_);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the VM's reason, when no other connection's map came in between (its memory is this object). */
+    if(status) {
+        const NativeAdrenoVmRefusal vm=vm_->lastRefusal();
+        map_refusal_={NativeAdrenoMapWhyVm,request->iova,entry->memory.bytes(),entry->memory.spanCount(),0,vm,vm.memory==&entry->memory};
+        return status;
+    }
+#else
     if(status)return status;
+#endif
     entry->mapped=handle;entry->iova=request->iova;entry->mapped_state=true;
+#ifdef ADRENO830_MACOS
+    noteMapped(*entry,true);   /* UniXNU-piano */
+#endif
     if(end>window_peak_)window_peak_=end;
     if(window_bytes_ && window_peak_>window_start_)clientStats(queue_base_,window_bytes_)[5]=(uint32_t)((window_peak_-window_start_)>>20);
     reply->iova=request->iova;
@@ -475,6 +517,9 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
         submit_->retireCompleted();
         const IOReturn unmap=vm_->unmap(entry->mapped);   /* refused while a job holds it or its last use is not complete */
         if(unmap) {noteFreeRefused(entry->imported,entry->handle,unmap);return unmap;}
+#ifdef ADRENO830_MACOS
+        noteMapped(*entry,false);   /* UniXNU-piano */
+#endif
         entry->mapped_state=false;entry->mapped=0;entry->iova=0;
     }
     IOReturn release;

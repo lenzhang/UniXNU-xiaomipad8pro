@@ -25,20 +25,20 @@ unsigned piano_a830_smmu_routes(const char *when);
 #endif
 
 // The write-combined BO pool's default (piano-gpu-pool=<MiB> wins; S0 keeps it in 64..2048, S3 halves it until a reservation succeeds):
-// an eighth of the RAM in 256 MiB steps, 512..1536 MiB. piano's XNU has 13 GiB: 1536. The login screen alone used 486 MiB of the
-// 13T board's 512 (6 clients, WindowServer 446 MiB); a desktop adds 15-25 Metal clients of tens of MiB each, and what does not fit is
-// a scattered BO: 3 ms a BO and 90-130 ms a surface-sized one of page attribute changes, a span of the GPU table per page
-// (docs/drivers/gpu.md §8, "The BO pool").
+// a quarter of the RAM in 256 MiB steps, 512..2048 MiB. piano's XNU reports 8192 MiB (max_mem): 2048. The login screen alone used 486
+// MiB of the 13T board's 512 (6 clients, WindowServer 446 MiB); the first desktop (run attend4, 24 clients) used 936 of a 1024 MiB pool
+// and 701 MiB of own BOs outside it, scattered: 3 ms a BO and 90-130 ms a surface-sized one of page attribute changes, and a range of
+// the GPU table per page, until the table's ranges ran out (docs/drivers/gpu.md §8, "The BO pool").
 #ifdef __cplusplus
 constexpr uint32_t piano_a830_pool_default(uint64_t ram_bytes)
 {
-  const uint64_t mib = (ram_bytes >> 20) / 8 / 256 * 256;
-  return mib < 512 ? 512u : mib > 1536 ? 1536u : uint32_t(mib);
+  const uint64_t mib = (ram_bytes >> 20) / 4 / 256 * 256;
+  return mib < 512 ? 512u : mib > 2048 ? 2048u : uint32_t(mib);
 }
-static_assert(piano_a830_pool_default(13ull << 30) == 1536 && piano_a830_pool_default(12ull << 30) == 1536 &&
-              piano_a830_pool_default(10ull << 30) == 1280 && piano_a830_pool_default(8ull << 30) == 1024 &&
-              piano_a830_pool_default(6ull << 30) == 768 && piano_a830_pool_default(4ull << 30) == 512 &&
-              piano_a830_pool_default(0) == 512 && piano_a830_pool_default(64ull << 30) == 1536,
+static_assert(piano_a830_pool_default(13ull << 30) == 2048 && piano_a830_pool_default(8ull << 30) == 2048 &&
+              piano_a830_pool_default(6ull << 30) == 1536 && piano_a830_pool_default(5ull << 30) == 1280 &&
+              piano_a830_pool_default(4ull << 30) == 1024 && piano_a830_pool_default(2ull << 30) == 512 &&
+              piano_a830_pool_default(0) == 512 && piano_a830_pool_default(64ull << 30) == 2048,
               "the pool default's steps");
 #endif
 

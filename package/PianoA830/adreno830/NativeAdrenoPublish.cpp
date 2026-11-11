@@ -27,6 +27,9 @@
 #include <kern/task.h>
 #include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoPublish.h"
+#ifdef ADRENO830_MACOS
+#include "NativeAdrenoMapLines.h"   /* UniXNU-piano */
+#endif
 #include "NativeAdrenoMeter.h"
 #include "Adreno830Status.h"
 #include "A830Fence.h"
@@ -109,6 +112,9 @@ extern "C" __attribute__((weak)) void adreno830_dcvs_submit(void) {}
 enum : uint32_t {NativeAdrenoTunnelMagic=0x4e544e4c /* 'NTNL' */,NativeAdrenoExportMethod=0x7100,NativeAdrenoExportMaxPiece=3968,
                  NativeAdrenoMarkerDoorbell=0x7db0};
 extern "C" {volatile uint32_t native_adreno_export_stats[4];}   /* [0] pieces taken, [1] refused, [2] last generation, [3] its total bytes */
+#ifdef ADRENO830_MACOS
+static uint32_t native_adreno_va_due;   /* UniXNU-piano: a BoMap was refused, the address-space lines at the next tick */
+#endif
 /* Hand-off method numbers of NativeGOPWire.h (NGP_METHOD_*), as offsets from NativeAdrenoHandoffBase. */
 enum : uint32_t {HandoffWaitSwap=2,HandoffCompleteSwap=3,HandoffBand=4,HandoffWaitSwap2=5};
 
@@ -994,6 +1000,14 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
             eventTail(tail,sizeof tail,status,count);
             snprintf(line,sizeof line,"call failed: %s[%d] slot %u %s -> %#x%s",name_,proc_selfpid(),slot_,what,unsigned(status),tail);
             boot_progress_gpu_event(line);
+            /* 2026-11-12: a BoMap's reason in a line of its own (which argument, which limit), and the address-space lines at the next
+             * tick: the state at the refusal. */
+            if(method==NativeAdrenoMethodBoMap && box_) {
+                char detail[NativeAdrenoMapLineBytes];
+                NativeAdrenoMapRefusalLine(detail,sizeof detail,box_->core.lastMapRefusal());
+                boot_progress_gpu_event(detail);
+                __atomic_store_n(&native_adreno_va_due,1u,__ATOMIC_RELEASE);
+            }
         }
     return status;
 #endif
@@ -1502,7 +1516,7 @@ extern "C" unsigned native_adreno_client_tick(Adreno830StatusClients *out)
 #ifdef ADRENO830_MACOS
     /* UniXNU-piano: the live GPU connections (slot, process, MiB of own BOs and imports) on the console when the set changed, at most
      * every 10 s (this runs once a second): how many Metal clients a session has and who holds the GPU memory. */
-    struct ClientEntry {uint32_t slot,mib;char name[15];};
+    struct ClientEntry {uint32_t slot,mib;char name[15];NativeAdrenoMapUsage map;};
     ClientEntry entries[NativeAdrenoMaxClients];
     unsigned listed=0;
     uint32_t signature=2166136261u;
@@ -1515,6 +1529,7 @@ extern "C" unsigned native_adreno_client_tick(Adreno830StatusClients *out)
         ClientEntry &e=entries[listed++];
         e.slot=s;e.mib=mib(pool+other+imported);
         strlcpy(e.name,box->name,sizeof e.name);
+        box->core.mapUsage(&e.map);
         signature=(signature^s)*16777619u;
         for(const char *c=box->name;*c && c<box->name+sizeof box->name;++c)signature=(signature^uint8_t(*c))*16777619u;
     }
@@ -1540,6 +1555,35 @@ extern "C" unsigned native_adreno_client_tick(Adreno830StatusClients *out)
                 if(at>0 && size_t(at)+size_t(length)<sizeof line) {memcpy(line+at,entry,size_t(length)+1);at+=length;}
             }
             boot_progress_gpu_event(line);
+        }
+        /* 2026-11-12: the address space (NativeAdrenoMapLines.h): the VM's records and ranges, the pool and what is outside it, then
+         * every connection's mappings against its window. Every 30 s while it changes, and at the tick after a refused BoMap. */
+        static uint32_t vaAt;
+        static uint64_t vaSignature;
+        uint64_t va=0;
+        for(unsigned i=0;i<listed;++i)va=va*1099511628211ull^(entries[i].map.spans+(entries[i].map.objects<<40)+entries[i].slot);
+        const bool due=__atomic_exchange_n(&native_adreno_va_due,0u,__ATOMIC_ACQ_REL)!=0;
+        if(g.vm && listed && (due || (va!=vaSignature && (!vaAt || ticks-vaAt>=30)))) {
+            vaAt=ticks;vaSignature=va;
+            uint32_t pool_mib=0,used_mib=0;
+            NativeAdrenoMemory::usage(&pool_mib,&used_mib,nullptr);
+            char totals[NativeAdrenoMapLineBytes];
+            NativeAdrenoVaTotalsLine(totals,sizeof totals,g.vm->objectCount(),NativeAdrenoVmMaxObjects,g.vm->spanCount(),
+                g.vm->spanCapacity(),g.vm->mappedBytes()>>20,used_mib,pool_mib,mib(fallback));
+            boot_progress_gpu_event(totals);
+            char vaLine[NativeAdrenoMapLineBytes];
+            int at=snprintf(vaLine,sizeof vaLine,"va/map:");
+            for(unsigned i=0;i<listed && at>0;++i) {
+                char entry[64];
+                const int length=NativeAdrenoVaClientEntry(entry,sizeof entry,entries[i].slot,entries[i].name,entries[i].map);
+                if(length<=0)break;
+                if(size_t(at)+size_t(length)>=sizeof vaLine-1) {
+                    boot_progress_gpu_event(vaLine);
+                    at=snprintf(vaLine,sizeof vaLine,"va/map (more):");
+                }
+                if(at>0 && size_t(at)+size_t(length)<sizeof vaLine) {memcpy(vaLine+at,entry,size_t(length)+1);at+=length;}
+            }
+            boot_progress_gpu_event(vaLine);
         }
     }
 #endif

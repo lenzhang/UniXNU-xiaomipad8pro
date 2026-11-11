@@ -45,6 +45,23 @@ struct NativeAdrenoScanoutMapping {
     uint64_t start,bytes;
     IOMemoryDescriptor *memory;
 };
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (2026-11-12): why this connection's last BoMap was refused (lastMapRefusal), for the console's detail line: a check of
+ * mapBo's own, with up to four figures (named per code), or the VM's (code NativeAdrenoMapWhyVm, its NativeAdrenoVmRefusal in vm). */
+enum NativeAdrenoMapWhy : uint8_t {
+    NativeAdrenoMapWhyNone,
+    NativeAdrenoMapWhyNotOpen,
+    NativeAdrenoMapWhyRequest,   /* a permissions, b writeback, c shareability, d reserved (or the iova's low bits when only those) */
+    NativeAdrenoMapWhyHandle,    /* no live object: a the handle; b 1 when the object exists but cannot be released yet */
+    NativeAdrenoMapWhyMapped,    /* already mapped: a the handle, b its iova */
+    NativeAdrenoMapWhyWindow,    /* a iova, b bytes, c the window's start, d its end */
+    NativeAdrenoMapWhyScanout,   /* the scanout asked without write permission (a the permissions) */
+    NativeAdrenoMapWhyVm,        /* the VM's refusal (vm); vm.memory is this object's when it was captured, else another call's */
+};
+struct NativeAdrenoMapRefusal {uint8_t why;uint64_t a,b,c,d;NativeAdrenoVmRefusal vm;bool vm_captured;};
+/* The mappings one connection holds: count, table ranges, bytes, its window and the highest end any mapping reached. */
+struct NativeAdrenoMapUsage {uint64_t objects,spans,bytes,window_start,window_bytes,window_peak;};
+#endif
 class NativeAdrenoUserClient final {
     struct Queue {uint32_t id=0;bool active=false;};
     struct Entry {
@@ -77,6 +94,14 @@ class NativeAdrenoUserClient final {
      * publish shell's once-a-second tick without it (relaxed atomics). */
     uint64_t pool_bytes_=0,other_bytes_=0,import_bytes_=0;
     void account(const Entry &,bool add);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the live mappings (relaxed atomics, written under the connection's lock) and the last BoMap refusal. */
+    uint64_t mapped_objects_=0,mapped_spans_=0,mapped_bytes_=0;
+    NativeAdrenoMapRefusal map_refusal_{};
+    void noteMapped(const Entry &,bool add);
+    IOReturn refuseMap(uint8_t why,IOReturn status,uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_t d=0)
+    {map_refusal_={why,a,b,c,d,{},false};return status;}
+#endif
     Queue queues_[NativeAdrenoAbiMaxQueues]{};
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoSubmit *submit_=nullptr;
@@ -162,6 +187,12 @@ public:
     uint32_t tokenOf(uint64_t handle) const;
     /* Bytes of the live objects: own BOs from the BO pool, own BOs outside it, imports. Any thread (relaxed reads). */
     void usage(uint64_t *pool,uint64_t *other,uint64_t *imported) const;
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the mappings this connection holds (any thread, relaxed reads) and why its last BoMap was refused (read by the
+     * IOKit wrapper right after that call, under the connection's lock). */
+    void mapUsage(NativeAdrenoMapUsage *) const;
+    NativeAdrenoMapRefusal lastMapRefusal() const {return map_refusal_;}
+#endif
     IOReturn query(NativeAdrenoAbiParams *);
     /* clock (dispatch's; optional): the contiguous backoff's time and the zero fill's. Without one nothing is remembered or timed. */
     IOReturn allocBo(const NativeAdrenoAbiBoAlloc *,NativeAdrenoAbiBoAllocReply *,const NativeAdrenoRingClock *clock=nullptr);

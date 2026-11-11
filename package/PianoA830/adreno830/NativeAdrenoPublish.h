@@ -52,6 +52,22 @@ inline constexpr NativeAdrenoClientWindow NativeAdrenoClientWindows4G[NativeAdre
     {0xE1000000ull,0x07C00000ull},{0xE8C00000ull,0x07C00000ull},{0xF0800000ull,0x07C00000ull},{0xF8400000ull,0x07BFE000ull}};
 inline constexpr NativeAdrenoClientWindow NativeAdrenoClientWindows2G[NativeAdrenoMaxClients]={
     {0x20000000ull,0x40000000ull},{0x60000000ull,0x0AAA9000ull},{0x6AAA9000ull,0x0AAA9000ull},{0x75552000ull,0x0AAA9000ull}};
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (2026-11-12): macOS's 16 GiB table. The first macOS desktop (run attend4, 24 clients) had WindowServer at 1153 MiB of
+ * its 1.5 GiB window and iconservicesagent at 490 MiB of its 512 MiB large one, while no small client passed 77 MiB of its 448: slot 0
+ * is now 3.5 GiB (0x20000000 up to 4 GiB), slots 1-3 768 MiB from 4 GiB, slots 4-31 320 MiB each (5 up to 8 GiB, 12 from 8 GiB, 11
+ * from 12 GiB, the last up to 0x3FFFFE000, 896 MiB). No window crosses a multiple of 4 GiB; slot 9 starts on 8 GiB and slot 21 on
+ * 12 GiB, the space under each line nobody's. */
+inline constexpr NativeAdrenoClientWindow NativeAdrenoClientWindows16G[NativeAdrenoMaxClients]={
+    {0x20000000ull,0xE0000000ull},{0x100000000ull,0x30000000ull},{0x130000000ull,0x30000000ull},{0x160000000ull,0x30000000ull},
+    {0x190000000ull,0x14000000ull},{0x1A4000000ull,0x14000000ull},{0x1B8000000ull,0x14000000ull},{0x1CC000000ull,0x14000000ull},
+    {0x1E0000000ull,0x14000000ull},{0x200000000ull,0x14000000ull},{0x214000000ull,0x14000000ull},{0x228000000ull,0x14000000ull},
+    {0x23C000000ull,0x14000000ull},{0x250000000ull,0x14000000ull},{0x264000000ull,0x14000000ull},{0x278000000ull,0x14000000ull},
+    {0x28C000000ull,0x14000000ull},{0x2A0000000ull,0x14000000ull},{0x2B4000000ull,0x14000000ull},{0x2C8000000ull,0x14000000ull},
+    {0x2DC000000ull,0x14000000ull},{0x300000000ull,0x14000000ull},{0x314000000ull,0x14000000ull},{0x328000000ull,0x14000000ull},
+    {0x33C000000ull,0x14000000ull},{0x350000000ull,0x14000000ull},{0x364000000ull,0x14000000ull},{0x378000000ull,0x14000000ull},
+    {0x38C000000ull,0x14000000ull},{0x3A0000000ull,0x14000000ull},{0x3B4000000ull,0x14000000ull},{0x3C8000000ull,0x37FFE000ull}};
+#else
 inline constexpr NativeAdrenoClientWindow NativeAdrenoClientWindows16G[NativeAdrenoMaxClients]={
     {0x20000000ull,0x60000000ull},
     {0x80000000ull,0x20000000ull},{0xA0000000ull,0x20000000ull},{0xC0000000ull,0x20000000ull},
@@ -65,6 +81,7 @@ inline constexpr NativeAdrenoClientWindow NativeAdrenoClientWindows16G[NativeAdr
     {0x300000000ull,0x1C000000ull},{0x31C000000ull,0x1C000000ull},{0x338000000ull,0x1C000000ull},{0x354000000ull,0x1C000000ull},
     {0x370000000ull,0x1C000000ull},{0x38C000000ull,0x1C000000ull},{0x3A8000000ull,0x1C000000ull},{0x3C4000000ull,0x1C000000ull},
     {0x3E0000000ull,0x1FFFE000ull}};
+#endif
 /* Whether a table is page aligned, ordered and without overlap inside [base, end), and its slots without a window come after the
  * last one with a window. */
 constexpr bool NativeAdrenoClientWindowsValid(const NativeAdrenoClientWindow *windows,uint64_t base,uint64_t end)
@@ -85,8 +102,24 @@ static_assert(NativeAdrenoClientWindowsValid(NativeAdrenoClientWindows4G,0x20000
               NativeAdrenoClientWindows4G[11].start+NativeAdrenoClientWindows4G[11].bytes==0xFFFFE000ull &&
               NativeAdrenoClientWindows4G[0].bytes==0x60000000ull && !NativeAdrenoClientWindows4G[12].bytes &&
               NativeAdrenoClientWindows16G[NativeAdrenoMaxClients-1].start+NativeAdrenoClientWindows16G[NativeAdrenoMaxClients-1].bytes==
-              0x3FFFFE000ull && NativeAdrenoClientWindows16G[0].bytes==0x60000000ull &&
+              0x3FFFFE000ull &&
+#ifdef ADRENO830_MACOS
+              NativeAdrenoClientWindows16G[0].bytes==0xE0000000ull &&   /* UniXNU-piano */
+#else
+              NativeAdrenoClientWindows16G[0].bytes==0x60000000ull &&
+#endif
               NativeAdrenoLargeSlots<NativeAdrenoMaxClients && NativeAdrenoMaxClients<=32,"client windows");
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano: no window of a table crosses a multiple of 4 GiB (a BO across the line nobody could show running). */
+constexpr bool NativeAdrenoClientWindowsStayBelowLines(const NativeAdrenoClientWindow *windows)
+{
+    for(unsigned s=0;s<NativeAdrenoMaxClients;++s)
+        if(windows[s].bytes && windows[s].start>>32!=(windows[s].start+windows[s].bytes-1)>>32)return false;
+    return true;
+}
+static_assert(NativeAdrenoClientWindowsStayBelowLines(NativeAdrenoClientWindows16G) &&
+              NativeAdrenoClientWindowsStayBelowLines(NativeAdrenoClientWindows4G),"client windows across 4 GiB");
+#endif
 /* The table for the aperture the published DeviceInfo describes (va_start + va_size; 0 = none: the 4 GiB one): above 4 GiB the 16 GiB
  * table, above 2 GiB the 4 GiB one, else the 2 GiB one. */
 static inline const NativeAdrenoClientWindow *NativeAdrenoClientWindowsFor(uint64_t va_end)
