@@ -7,7 +7,8 @@
 // committed) at every power-up.
 //
 // One kernel thread does everything, in steps (each logs "PianoKeyboard: step N ..." before it touches anything):
-//   1 survey     read only: the six pins' TLMM registers and levels, the two rails' cmd-db addresses, the apps RSC id
+//   1 survey     read only: the six pins' TLMM registers and levels, the hall sensor (gpio80), the two rails' cmd-db addresses,
+//                the apps RSC id
 //   2 pins       reset and sleep driven low (asserted); the bus pins, gpio97 and gpio95 GPIO inputs
 //   3 rails      RPMh active votes through the apps RSC (DRV 2, an idle active TCS): L11B 1.8 V, then L14B 3.3 V (mode, mV, enable),
 //                each with PianoA830's DRV-2 owner word held (tag 'KBRD'; a wait for another owner is logged)
@@ -17,8 +18,13 @@
 //   6 serving    gpio97's rising edges latched in TLMM (no GIC interrupt: polled every piano-keyboard-poll ms), each frame read
 //                from register 0x4c and split into reports; attach messages answered as Linux does (keyboard power, Caps LED,
 //                touchpad on, mic LED, backlight: Wn8030Piano.h attachCommands), the keyboard power repeated every 12 s while
-//                attached
+//                attached; the hall sensor polled every 100 ms. A bring-up that stops early (a failed step, piano-keyboard-stop)
+//                still polls the hall sensor.
 // The I2C bus is driven in software (BitI2c.h); the QUP engine is not touched.
+//
+// The hall sensor: the folio's lid switch on TLMM gpio80 (boot DT gpio-keys switch-lid, SW_LID, active low: low = cover closed),
+// separate from the MCU's attach bit. Read only (its CTL is never written): logged at start and on each change ("hall: cover
+// closed/open"), two equal 100 ms samples make a change. macOS is told nothing unless piano-keyboard-lid=1.
 //
 // Boot arguments (default: inert, the service does not even probe):
 //   piano-keyboard=1            steps 1-6; every report is logged raw ("frame"/"key"/"touch" lines), nothing goes to macOS
@@ -36,14 +42,19 @@
 //   piano-keyboard-tap=0        no tap-to-click        piano-keyboard-invert=B  bit 0 X, bit 1 Y        piano-keyboard-divide=D (2)
 //   piano-keyboard-mouse=0      ignore the MCU's own mouse reports (ID 2; used only while no touchpad report has been seen)
 //   piano-keyboard-fnrow=1      Right Ctrl + 1..0 - = are F1..F12 (Wn8030Piano.h Keys; default 0: keys as the cover sends them)
-// Not done: the hall sensors (keys still pass with the cover folded back), the authentication token, the backlight/mic LED beyond
-// the boot arguments, suspend.
+//   piano-keyboard-hall=0       do not read gpio80 at all
+//   piano-keyboard-lid=1        tell IOPMrootDomain the hall state (kIOPMClamshellClosed/Opened), with clamshell sleep disabled
+//                               first (kIOPMDisableClamshell); =2 the same with clamshell sleep allowed (kIOPMEnableClamshell).
+//                               Default 0: nothing is sent (native sleep is untested and could hang)
+// Not done: the hall sensor's effect on input (Linux turns the touchpad, LEDs and reports off while the cover is closed), the
+// authentication token, the backlight/mic LED beyond the boot arguments, suspend.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/hid/IOHIDDevice.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/libkern.h>
@@ -69,7 +80,7 @@ extern const uint64_t piano_keyboard_firmware_size;
 namespace {
 
 struct Args {
-  uint32_t level, stop, trace, halfUs, pollMs, rails, touchpad, backlight, tap, invert, divide, mouse, auth, raw, fnrow;
+  uint32_t level, stop, trace, halfUs, pollMs, rails, touchpad, backlight, tap, invert, divide, mouse, auth, raw, fnrow, hall, lid;
 };
 Args gArgs;
 
@@ -98,6 +109,8 @@ void readArgs()
   gArgs.auth = bootArg("piano-keyboard-auth", 0);
   gArgs.raw = bootArg("piano-keyboard-raw", 1);
   gArgs.fnrow = bootArg("piano-keyboard-fnrow", 0);
+  gArgs.hall = bootArg("piano-keyboard-hall", 1);
+  gArgs.lid = bootArg("piano-keyboard-lid", 0);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -181,6 +194,8 @@ Pin gPin[kPins] = {
   {"SDA", 56, {}, 0, 0, 0}, {"SCL", 57, {}, 0, 0, 0}, {"reset", 188, {}, 0, 0, 0},
   {"sleep", 3, {}, 0, 0, 0}, {"irq", 97, {}, 0, 0, 0}, {"status", 95, {}, 0, 0, 0},
 };
+// The hall sensor, read only: never configured, only its CTL/IO/INTR_CFG read.
+Pin gHall = {"hall", 80, {}, 0, 0, 0};
 uintptr_t pinVa(PinIndex p) { return gPin[p].page.va; }
 uint32_t pinCfg(PinIndex p, uint32_t pull, bool output)
 {
@@ -415,6 +430,11 @@ class PianoKeyboard : public IOService {
   uint32_t fConsecutiveErrors = 0, fRawLogged = 0, fEmptyLogged = 0, fLevelReads = 0, fIrqHigh = 0, fPolls = 0;
   uint32_t fAcks = 0, fStates = 0, fPointerSent = 0, fSumBad = 0;
   bool fIrqWasLow = false;
+  // the hall sensor (gpio80): the accepted level (1 open, 0 closed; -1 not read), the last sample, changes, the next sample time
+  int fHall = -1, fHallSample = -1;
+  uint32_t fHallChanges = 0;
+  uint64_t fHallNextMs = 0;
+  bool fLidSetup = false;
   // the LED request from IOHIDFamily's side
   volatile uint32_t fLedRequests = 0, fLedWanted = 0;
   uint32_t fLedSeen = 0;
@@ -438,6 +458,10 @@ class PianoKeyboard : public IOService {
   bool sendCommand(uint8_t cmd, uint8_t value, const char *what);
   void authAnswer(const Report &r);
   IOReturn send(Kind kind, const uint8_t *bytes, unsigned length);
+  void surveyHall();
+  void pollHall(uint64_t now);
+  void hallOnly();
+  void lidNotify(bool closed);
   void releaseAll();
   void describe(uint64_t seconds);
   bool romWrite(uint8_t value);
@@ -461,9 +485,9 @@ bool PianoKeyboard::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
   note("start: piano-keyboard=%u (%s), stop %u, I2C half-bit %u us, poll %u ms, rails %u, touchpad cmd %u, backlight %u, auth %u, "
-       "raw %u, fnrow %u, firmware %llu bytes",
+       "raw %u, fnrow %u, hall %u, lid %u, firmware %llu bytes",
        gArgs.level, gArgs.level >= 2 ? "HID devices for macOS" : "raw reports logged, nothing for macOS", gArgs.stop, gArgs.halfUs,
-       gArgs.pollMs, gArgs.rails, gArgs.touchpad, gArgs.backlight, gArgs.auth, gArgs.raw, gArgs.fnrow,
+       gArgs.pollMs, gArgs.rails, gArgs.touchpad, gArgs.backlight, gArgs.auth, gArgs.raw, gArgs.fnrow, gArgs.hall, gArgs.lid,
        (unsigned long long)piano_keyboard_firmware_size);
   setProperty("piano-keyboard", gArgs.level, 32);
   PointerConfig pc;
@@ -500,7 +524,7 @@ bool PianoKeyboard::step(int32_t n, const char *what)
 
 void PianoKeyboard::run()
 {
-  if (!step(1, "survey (read only): pins, rails, RSC")) return;
+  if (!step(1, "survey (read only): pins, hall sensor, rails, RSC")) return;
   survey();
   const bool served = step(2, "pins: reset/sleep low (asserted), gpio56/57/97/95 GPIO inputs") && setupPins() &&
                       step(3, "rails: RPMh votes L11B 1.8 V then L14B 3.3 V") && setupRails() &&
@@ -508,9 +532,15 @@ void PianoKeyboard::run()
                       step(5, "firmware: header, data blocks, verify, boot") && loadFirmware() &&
                       step(6, "serving: gpio97 edges latched and polled, frames read from register 0x4c");
   setProperty("piano-keyboard-stage", uint64_t(uint32_t(piano_keyboard_stage)), 32);
-  if (!served) return;
+  if (!served) {
+    hallOnly();
+    return;
+  }
   armIrq();
-  if (gArgs.level >= 2 && !publish()) return;
+  if (gArgs.level >= 2 && !publish()) {
+    hallOnly();
+    return;
+  }
   setProperty("piano-keyboard-stage", uint64_t(uint32_t(piano_keyboard_stage)), 32);
   serve();
 }
@@ -531,6 +561,7 @@ void PianoKeyboard::survey()
          p.ctl & kEgpioPresent ? (p.ctl & kEgpioEnable ? ", eGPIO ours" : ", eGPIO not ours") : "", p.io, p.io & 1, (p.io >> 1) & 1,
          p.intrCfg, rd32(p.page.va + kIntrStatus));
   }
+  surveyHall();
   if (gArgs.rails && readRails()) {
     if (mapRegion(gRsc, kRscDrv, 0x10000)) {
       const uint32_t id = rd32(gRsc.va);
@@ -549,6 +580,81 @@ void PianoKeyboard::survey()
   const int image = imageCheck(piano_keyboard_firmware, uint32_t(piano_keyboard_firmware_size), &code);
   note("firmware: %llu bytes, %s (code %u bytes, %u blocks)", (unsigned long long)piano_keyboard_firmware_size,
        image ? "NOT usable" : "image checks pass", code, (code + kDataChunk - 1) / kDataChunk);
+}
+
+// ------------------------------------------------------------------------------------------------------------ the hall sensor
+// gpio80, read only. Its CTL tells whether it is a GPIO input (function 0) as the boot stages leave it; the level is read whatever
+// the function (TLMM's IO bit 0 is the pad).
+void PianoKeyboard::surveyHall()
+{
+  if (!gArgs.hall) {
+    note("hall: gpio80 not read (piano-keyboard-hall=0)");
+    return;
+  }
+  Pin &p = gHall;
+  if (!mapRegion(p.page, kTlmm + uint64_t(p.gpio) * 0x1000, 0x10)) {
+    note("hall: gpio80 does not map: no hall sensor");
+    return;
+  }
+  p.ctl = rd32(p.page.va + kCtl);
+  p.io = rd32(p.page.va + kIo);
+  p.intrCfg = rd32(p.page.va + kIntrCfg);
+  fHall = fHallSample = int(p.io & 1);
+  note("hall: gpio80 CTL %08x (function %u, pull %u, %s) IO %08x INTR_CFG %08x: cover %s at start (level %u; the DT's switch-lid "
+       "is active low: low = closed)%s",
+       p.ctl, (p.ctl >> 2) & 15, p.ctl & 3, p.ctl & kOe ? "output" : "input", p.io, p.intrCfg, fHall ? "open" : "closed", p.io & 1,
+       gArgs.lid ? "" : "; macOS is not told (piano-keyboard-lid=0)");
+  setProperty("piano-keyboard-hall", uint64_t(fHall), 32);
+}
+
+// Every 100 ms: a level that two samples in a row agree on and differs from the accepted one is a change.
+void PianoKeyboard::pollHall(uint64_t now)
+{
+  if (fHall < 0 || now < fHallNextMs) return;
+  fHallNextMs = now + 100;
+  const int sample = int(rd32(gHall.page.va + kIo) & 1);
+  const bool agreed = sample == fHallSample;
+  fHallSample = sample;
+  if (!agreed || sample == fHall) return;
+  fHall = sample;
+  ++fHallChanges;
+  note("hall: cover %s (gpio80 %d, change %u, %llu s after start)", fHall ? "open" : "closed", fHall, fHallChanges,
+       (unsigned long long)(fStartMs ? (now - fStartMs) / 1000 : 0));
+  setProperty("piano-keyboard-hall", uint64_t(fHall), 32);
+  lidNotify(!fHall);
+}
+
+// piano-keyboard-lid=1/2 only: the hall state to IOPMrootDomain as a clamshell (an asynchronous power event there). =1 first
+// disables clamshell sleep, so a close reports the state without putting the system to sleep; =2 allows it.
+void PianoKeyboard::lidNotify(bool closed)
+{
+  if (!gArgs.lid || fHall < 0) return;
+  IOPMrootDomain *root = getPMRootDomain();
+  if (!root) {
+    note("hall: no IOPMrootDomain: clamshell %s not sent", closed ? "closed" : "opened");
+    return;
+  }
+  if (!fLidSetup) {
+    fLidSetup = true;
+    root->receivePowerNotification(gArgs.lid >= 2 ? kIOPMEnableClamshell : kIOPMDisableClamshell);
+    note("hall: piano-keyboard-lid=%u: clamshell sleep %s (%s sent)", gArgs.lid, gArgs.lid >= 2 ? "ALLOWED" : "disabled",
+         gArgs.lid >= 2 ? "kIOPMEnableClamshell" : "kIOPMDisableClamshell");
+  }
+  root->receivePowerNotification(closed ? kIOPMClamshellClosed : kIOPMClamshellOpened);
+  note("hall: %s sent to IOPMrootDomain", closed ? "kIOPMClamshellClosed" : "kIOPMClamshellOpened");
+}
+
+// The bring-up stopped (a failed step, piano-keyboard-stop): the hall sensor is still polled and logged.
+void PianoKeyboard::hallOnly()
+{
+  if (fHall < 0) return;
+  note("hall: polled every 100 ms without the keyboard (the bring-up stopped at step %d)", piano_keyboard_stage);
+  fStartMs = nowMs();
+  lidNotify(!fHall);
+  for (;;) {
+    pollHall(nowMs());
+    IOSleep(100);
+  }
 }
 
 bool PianoKeyboard::setupPins()
@@ -994,6 +1100,7 @@ void PianoKeyboard::serve()
   fLastReadMs = fStartMs;
   uint64_t nextDescribe = 15000;
   note("serving: %s", gArgs.level >= 2 ? "reports go to macOS" : "reports are logged only (piano-keyboard=2 gives them to macOS)");
+  lidNotify(!fHall);
   for (;;) {
     const uint64_t now = nowMs();
     const bool edge = rd32(pinVa(kIrq) + kIntrStatus) & 1;
@@ -1036,6 +1143,7 @@ void PianoKeyboard::serve()
       sendCommand(kCmdKeyboardPower, 1, "keyboard power (every 12 s)");
       fKeepaliveMs = now + 12000;
     }
+    pollHall(now);
     const uint64_t elapsed = now - fStartMs;
     if (elapsed >= nextDescribe) {
       describe(elapsed / 1000);
@@ -1049,9 +1157,9 @@ void PianoKeyboard::describe(uint64_t seconds)
 {
   note("alive at %llu s: %s, %u reads (%u frames, %u empty, %u errors, %u bad, %u checksum mismatches), %u edges%s, %u level reads, irq high in %u of %u "
        "polls; keys %u (rollovers %u), consumer %u, touch %u (gestures %u, taps %u), mouse %u, vendor %u (accel %u, auth %u, acks "
-       "%u), attaches %u; %u commands (%u failed), %u reports to macOS (%u failed); irq %u status %u",
+       "%u), attaches %u; %u commands (%u failed), %u reports to macOS (%u failed); irq %u status %u; hall %s",
        seconds, fAttached ? "attached" : "no cover", fReads, fFrames, fEmpty, fReadErrors, fBadFrames, fSumBad, fEdges,
        fEdgeSeen ? "" : " (none yet: polled every 100 ms)", fLevelReads, fIrqHigh, fPolls, fKeys, fKeyFilter.rollovers(), fConsumer,
        fTouch, fPointer.gestures(), fPointer.taps(), fMouse, fVendor, fAccel, fAuth, fAcks, fAttaches, fCommands, fCommandErrors,
-       fSent, fSendErrors, level(kIrq), level(kStatus));
+       fSent, fSendErrors, level(kIrq), level(kStatus), fHall < 0 ? "not read" : fHall ? "open" : "closed");
 }
