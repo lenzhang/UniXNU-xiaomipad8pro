@@ -9,6 +9,7 @@
            from its own package, unchanged
   ambient  tests/ambient_host.cpp: AmbientBacklight.h (PianoBacklight's automatic mode) against PianoBacklight's own Ktz8866.h step
            ladder (included read only) and end to end from lux through AutoLight.c
+  daemon   daemon/piano-rotated.m compiles for arm64 macOS (syntax and types only; on a Mac with xcrun, else skipped)
   kernel   every part a kernel driver includes compiles freestanding with AArch64 general registers only (no C library, no floating
            point): AutoStream.c, AutoLight.c, TouchRotation.h in C and C++, AmbientBacklight.h in C++ (no exceptions, no RTTI),
            AutoRotate.c (portable, though only piano-rotated uses it)
@@ -64,6 +65,15 @@ def ambient_tests(out):
     run(exe)
 
 
+def daemon_check():
+    if subprocess.run(['xcrun', '--show-sdk-path'], capture_output=True).returncode:
+        print('SKIP daemon: no xcrun (not a Mac)')
+        return
+    subprocess.run(['xcrun', 'clang', '-arch', 'arm64', '-mmacosx-version-min=14.0', '-fobjc-arc', '-fsyntax-only', *WARN, *INCLUDES,
+                    str(PKG / 'daemon/piano-rotated.m')], check=True)
+    print('PASS daemon: piano-rotated.m compiles for arm64 macOS')
+
+
 def kernel_checks(out, c_files=(), headers=(), cpp_headers=()):
     for source in c_files:
         subprocess.run([cc(), '-std=c11', *KERNEL, *INCLUDES, '-c', str(source), '-o', str(out / 'k.o')], check=True)
@@ -85,15 +95,17 @@ def kernel_checks(out, c_files=(), headers=(), cpp_headers=()):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--only', action='append', default=[], choices=['c', 'ambient', 'kernel'])
+    parser.add_argument('--only', action='append', default=[], choices=['c', 'ambient', 'daemon', 'kernel'])
     args = parser.parse_args()
-    want = set(args.only) or {'c', 'ambient', 'kernel'}
+    want = set(args.only) or {'c', 'ambient', 'daemon', 'kernel'}
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
         if 'c' in want:
             c_tests(out)
         if 'ambient' in want:
             ambient_tests(out)
+        if 'daemon' in want:
+            daemon_check()
         if 'kernel' in want:
             kernel_checks(out, c_files=[PKG / n for n in C_FILES], headers=['TouchRotation.h'], cpp_headers=['AmbientBacklight.h'])
     print('PASS PianoAuto host tests')

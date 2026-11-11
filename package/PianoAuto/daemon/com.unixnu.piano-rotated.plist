@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- UniXNU-piano: automatic display rotation on native macOS (docs/drivers/sensors.md section 5a). A global launch agent: install as
+     /Library/LaunchAgents/com.unixnu.piano-rotated.plist (root:wheel 644) with the binary at /usr/local/libexec/piano-rotated
+     (root:wheel 755); install-piano-rotated.sh does both. It runs in the login window's session and in each user's (WindowServer's
+     display configuration is a per-session service), and does nothing unless the kernel boot argument piano-rotate is 1 or more:
+     without it the agent exits at once with status 0 and launchd does not start it again (KeepAlive SuccessfulExit false). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.unixnu.piano-rotated</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/libexec/piano-rotated</string>
+  </array>
+  <key>LimitLoadToSessionType</key>
+  <array>
+    <string>LoginWindow</string>
+    <string>Aqua</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+</dict>
+</plist>

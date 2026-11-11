@@ -10,6 +10,18 @@ Facts, from public headers of the macOS SDK only:
     90 degrees implies the display is rotated clockwise 90 degrees, such that what was the physical bottom of the display is now the
     left side, and what was the physical top is now the right side"): TouchRotation.h's table and AutoRotate.h's degrees follow it.
 
+  CoreGraphics (CGDisplayConfiguration.h, CGDirectDisplay.h, CGSession.h), IOKit (IOKitLib.h, IOMessage.h), CoreFoundation
+    preferences, notify.h, os/log.h: everything piano-rotated calls except the rotation setter below.
+
+Private interface, by name only (no Apple binary was disassembled or decompiled): the setter System Settings' display code uses,
+MonitorPanel.framework's +[MPDisplayMgr sharedMgr], -[MPDisplayMgr displayWithID:], -[MPDisplay canChangeOrientation],
+-[MPDisplay orientation], -[MPDisplay setOrientation:], -[MPDisplay hasRotationSensor]: the class and selector names and their type
+encodings as the Objective-C runtime lists them on macOS 26.6 (class_copyMethodList, method_getTypeEncoding). piano-rotated checks
+each name and encoding at run time and rotates nothing when one differs. Also seen by name only (exported symbols, dyld_info -exports;
+not called): SkyLight's SLSSetDisplayRotation and SLDisplayRotation (CGDisplayRotation re-exports the latter), CoreDisplay's
+CGXSetDisplayRotation, IOMobileFramebuffer's IOMobileFramebufferSetRenderingAngle; and in the k27 kernel collection's
+IOMobileFramebufferLegacy (the generated IOMobileFramebufferABI.h's names) setRenderingAngle(float*) and rotate_surface.
+
 Behaviour taken as a specification (no code or text): the Ubuntu project's sensor fixes as docs/drivers/sensors.md section 3
 records them (serialized enable/disable, one request outstanding per client, the v1.1.1 "light stops after off/on" fix, 0 lux is valid
 darkness): AutoStream.h's rules; Ubuntu's rotation rule (GNOME rotates only with the keyboard cover detached;
