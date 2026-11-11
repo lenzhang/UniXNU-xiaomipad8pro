@@ -97,7 +97,11 @@ inline uint8_t *arenaAlloc(Arena &a, uint32_t n, uint64_t *bus)
   ++a.allocations;
   if (bus) *bus = at;
   uint8_t *p = a.va + offset;
-  for (uint32_t i = 0; i < n; ++i) p[i] = 0;
+  // Zeroed eight bytes at a time (the start is aligned to at least 64 bytes, so only the tail is byte-wise): level 5 asks for
+  // regions of several MiB, and the window is reached through a write-combined mapping where a byte-wise loop is very slow.
+  uint32_t i = 0;
+  for (; i + 8 <= n; i += 8) *reinterpret_cast<uint64_t *>(p + i) = 0;
+  for (; i < n; ++i) p[i] = 0;
   return p;
 }
 
