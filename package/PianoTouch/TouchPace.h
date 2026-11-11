@@ -1,43 +1,38 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// PianoTouch's frame pace (docs/power-irq.md). The NT36532E streams a frame about every 8.3 ms whether or not a finger is on the
-// panel, raising gpio162 for each; the old loop polled the pin's latch every 1 ms and read every frame: ~1000 wake-ups and ~120
-// frame reads a second at rest. Now every frame only while the panel is busy (a contact, the tip debouncing or down, the decoder
-// still learning its reference, watchdog frames) and for kHoldMs after; otherwise one frame per idle period (piano-touch-idle):
-// the thread sleeps until kLeadMs before the next read is due, drops the latch (its edge came mid-sleep: reading on it would start
-// mid-frame), and takes the next fresh edge, by 1 ms polls or, with piano-touch-irq=1, by the TLMM interrupt. While busy it stays
-// on 1 ms polls: a CPU woken late from its deepest idle state (Ubuntu measured 4.4 ms to leave it) would start a frame read so
-// late that it overlaps the next frame. A finger is seen at most one idle period and two frames (the tip's confirmation) late.
-// Without an edge a frame is read anyway after noEdgeMs: the first run on the tablet (2026-11-11, level 1, nobody touching) saw
-// about one gpio162 edge in two seconds and every read without one had a good checksum (the old fixed 200 ms made it 5 frames a
-// second, and a touch at rest up to 200 ms late). Now, paced: at rest the idle period and kNoEdgeRestMarginMs after the last read;
-// once kBlindAfterReads reads in a row came without an edge the rest is blind: the thread sleeps to the due time itself and reads
-// (one wake-up a read, ~20 reads a second), until an edge latches during a sleep again. Busy: kNoEdgeBusyMs (piano-touch-noedge:
-// about 80 frames a second under a finger even with no edge at all; with edges every frame comes on its edge first). Not paced
-// (piano-touch-idle=0, the old loop and the A of the battery A/B): 200 ms as before.
-// Portable: tests/touch_host.cpp.
+// PianoTouch's frame pace (docs/power-irq.md, docs/drivers/touch.md §13). Portable: tests/touch_host.cpp.
+//
+// How the NT36532E feeds frames, from the first level-2 runs on the tablet (2026-11-11): it raises gpio162 when a frame is ready
+// and keeps it pending until the host has read that frame; it scans the next one only then. Edges equal reads, at most ~79 a second
+// (a 5.1 ms read and a ~7.5 ms scan), and a latched edge always means a frame that waits. Two ways put it into its watchdog state
+// (transport 0xfd: no frames until the download again): a read started before the next frame was ready (the 12 ms edge-less read
+// of the previous pace, inside the ~12.6 ms cycle; three downloads in a row failed that way), and a frame left unread for longer
+// than ~0.6 s (the display-off pace of 500 ms plus its 250 ms waits). The level-1 loop, which never had one, read on the edge and
+// at most 200 ms apart. So:
+//   - a latched edge is never dropped (it is the frame that waits); the latch is cleared before each read and again after it;
+//   - busy (a contact, a gesture, the decoder learning its reference, watchdog frames) and for kHoldMs after: the latch polled every
+//     piano-touch-poll ms, every frame read on its edge; no edge for kNoEdgeBusyMs (piano-touch-noedge, at least kNoEdgeMinMs: well
+//     past a cycle, so a frame waits by then): read anyway;
+//   - at rest (paced, piano-touch-idle): one frame per idle period: the thread sleeps to the due time, then reads on the latch (set
+//     during the sleep) or waits for the edge, at most to the idle period + kNoEdgeRestMs;
+//   - the display off (TouchPower.h): one frame per kMutedReadMs, the slowest tier;
+//   - never more than kMaxGapMs between two reads (the idle period is at most kIdleReadMaxMs);
+//   - not paced (piano-touch-idle=0): every frame on its edge, kNoEdgeOldMs without one (the level-1 loop).
+// The watchdog (WatchdogRecovery): the download again at once; when the watchdog comes back within kWatchdogQuietMs of a download,
+// again every kWatchdogRetryMs, never given up.
 #ifndef PIANO_TOUCH_PACE_H
 #define PIANO_TOUCH_PACE_H
 #include <stdint.h>
 
 namespace pianotouch {
 
-constexpr uint32_t kIdleReadMs = 50, kIdleReadMinMs = 20, kIdleReadMaxMs = 500, kHoldMs = 1500, kLeadMs = 2;
-constexpr uint32_t kNoEdgeBusyMs = 12, kNoEdgeRestMarginMs = 10, kNoEdgeOldMs = 200, kBlindAfterReads = 3;
+constexpr uint32_t kIdleReadMs = 50, kIdleReadMinMs = 20, kIdleReadMaxMs = 200, kHoldMs = 1500;
+constexpr uint32_t kNoEdgeBusyMs = 50, kNoEdgeMinMs = 25, kNoEdgeRestMs = 50, kNoEdgeOldMs = 200, kMutedReadMs = 200, kMaxGapMs = 250;
+constexpr uint32_t kFrameCycleUs = 12600;   // a read (5.1 ms at 9.6 MHz) and the next frame's scan (~7.5 ms), measured: ~79 a second
 
 struct TouchPace {
   uint32_t idleMs;   // 0: every frame (the old loop)
   uint64_t lastBusyMs;
   uint32_t busyNoEdgeMs = kNoEdgeBusyMs;
-  uint32_t blindReads = 0;   // reads in a row that no edge started
-  bool blind() const { return blindReads >= kBlindAfterReads; }
-  // How long after the last read a frame is read without an edge (rest: the pace's state after the last pass).
-  uint32_t noEdgeMs(bool rest) const
-  {
-    return !idleMs ? kNoEdgeOldMs : !rest ? busyNoEdgeMs : blind() ? idleMs : idleMs + kNoEdgeRestMarginMs;
-  }
-  // Each read: whether an edge started it. An edge latched during an idle sleep: edges come again.
-  void read(bool onEdge) { blindReads = onEdge ? 0 : blindReads < 255 ? blindReads + 1 : 255; }
-  void edgeSeen() { blindReads = 0; }
   static uint32_t clampIdle(uint32_t ms) { return !ms ? 0 : ms < kIdleReadMinMs ? kIdleReadMinMs : ms > kIdleReadMaxMs ? kIdleReadMaxMs : ms; }
   // After each loop pass: whether the loop paces idle frames now (busy: the panel's state after the last decoded frame).
   bool idle(uint64_t nowMs, bool busy)
@@ -45,20 +40,38 @@ struct TouchPace {
     if (busy || nowMs < lastBusyMs) lastBusyMs = nowMs;
     return idleMs && nowMs - lastBusyMs >= kHoldMs;
   }
-  // Idle: how long to sleep before waiting for the next read's edge (0: wait for it now); blind, to the due time itself.
+  // At rest: how long to sleep before the next read is due (0: due now: read on the latch or wait for the edge).
   uint32_t sleepMs(uint64_t nowMs, uint64_t lastReadMs) const
   {
-    const uint64_t due = lastReadMs + idleMs, lead = blind() ? 0 : kLeadMs;
-    return nowMs + lead < due ? uint32_t(due - lead - nowMs) : 0;
+    const uint64_t due = lastReadMs + idleMs;
+    return nowMs < due ? uint32_t(due - nowMs) : 0;
   }
+  // How long after the last read a frame is read without an edge (rest: the pace's state after the last pass).
+  uint32_t noEdgeMs(bool rest) const { return !idleMs ? kNoEdgeOldMs : rest ? idleMs + kNoEdgeRestMs : busyNoEdgeMs; }
 };
 inline TouchPace touchPace(uint32_t idleMs, uint64_t startMs, uint32_t busyNoEdgeMs = kNoEdgeBusyMs)
 {
-  return TouchPace{TouchPace::clampIdle(idleMs), startMs, busyNoEdgeMs < 4 ? 4 : busyNoEdgeMs > kNoEdgeOldMs ? kNoEdgeOldMs : busyNoEdgeMs};
+  return TouchPace{TouchPace::clampIdle(idleMs), startMs,
+                   busyNoEdgeMs < kNoEdgeMinMs ? kNoEdgeMinMs : busyNoEdgeMs > kNoEdgeOldMs ? kNoEdgeOldMs : busyNoEdgeMs};
 }
 
+// The watchdog's download again: at once, unless the last one for it was less than kWatchdogRetryMs ago (then at that time).
+// Never given up.
+constexpr uint32_t kWatchdogRun = 11, kWatchdogRetryMs = 10000;
+struct WatchdogRecovery {
+  uint64_t lastMs = 0;    // the last download for the watchdog
+  uint32_t downloads = 0;
+  // A run of watchdog frames now: whether to download now (false: wait, the loop asks again with the next watchdog frame).
+  bool due(uint64_t nowMs) const { return !downloads || nowMs - lastMs >= kWatchdogRetryMs; }
+  void downloaded(uint64_t nowMs)
+  {
+    lastMs = nowMs;
+    ++downloads;
+  }
+};
+
 // The CPU latency hold of a read burst (piano-touch-cpu-hold; piano_cpuidle_latency_hold, k27 0061, docs/power.md §2): taken at
-// the first busy pass, released kHoldMs after the last one, so frames read every 8.3 ms while a finger is on the panel are never
+// the first busy pass, released kHoldMs after the last one, so frames read on every edge while a finger is on the panel are never
 // started late by a CPU leaving a deep idle state (Ubuntu: reads 43-51 % slow without its 2000 us hold), and the idle frames
 // never hold it.
 struct BurstHold {

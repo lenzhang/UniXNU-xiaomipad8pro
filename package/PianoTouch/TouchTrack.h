@@ -71,13 +71,22 @@ struct Tracker {
   uint8_t nextId = 1;
   uint32_t downs = 0, ups = 0, palms = 0, palmPoints = 0, noSlot = 0, frames = 0;
   TrackNote notes[3 * kMaxTracks];
+  // trackerUpdate's scratch (2 KiB, here and not on a 16 KiB kernel stack): the pairs within the gate, nearest first.
+  struct Pair {
+    int64_t d2;
+    uint8_t slot, point;
+  };
+  Pair pairs[kMaxPairs];
   unsigned noteCount = 0;
 };
 
+// In place (no Tracker temporary on the kernel stack): every field's default is zero but the configuration and the next ID.
 inline void trackerReset(Tracker &tr, const TrackConfig &cfg)
 {
-  tr = Tracker();
+  uint8_t *p = reinterpret_cast<uint8_t *>(&tr);
+  for (size_t i = 0; i < sizeof tr; ++i) p[i] = 0;
   tr.cfg = cfg;
+  tr.nextId = 1;
 }
 
 // Contacts in use (pending or active), active ones, and the active ones that are not palms.
@@ -174,8 +183,7 @@ inline void trackerUpdate(Tracker &tr, const MatrixPoint *pts, unsigned n, uint6
   for (PalmZone &z : tr.zones)
     if (z.live && now - z.lastMs > tr.cfg.palmLingerMs) z.live = false;
   // The pairs within the gate, nearest first.
-  struct Pair { int64_t d2; uint8_t slot, point; };
-  Pair pairs[kMaxPairs];
+  Tracker::Pair *pairs = tr.pairs;
   unsigned np = 0;
   for (unsigned s = 0; s < kMaxTracks; ++s) {
     Track &k = tr.t[s];
@@ -189,7 +197,7 @@ inline void trackerUpdate(Tracker &tr, const MatrixPoint *pts, unsigned n, uint6
       if (d2 > gate * gate) continue;
       unsigned at = np++;
       while (at > 0 && pairs[at - 1].d2 > d2) { pairs[at] = pairs[at - 1]; --at; }
-      pairs[at] = Pair{d2, uint8_t(s), uint8_t(j)};
+      pairs[at] = Tracker::Pair{d2, uint8_t(s), uint8_t(j)};
     }
   }
   for (unsigned q = 0; q < np; ++q) {

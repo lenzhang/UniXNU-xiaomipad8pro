@@ -17,7 +17,8 @@
 // edge_base; Y with its low edge bias), then the orientation, then / 10 to pixels. Without one: linear over the matrix (node
 // centres at (i + 1/2) / n).
 // Orientation (piano-thp orientation.hpp, MIT): X never flipped; Y as processor Y on a BOE panel, reversed on a CSOT one, unless
-// the calibration says otherwise (invert_y); the caller picks flipX / flipY (PianoTouch.cpp: piano-touch-flip=auto).
+// the calibration says otherwise (invert_y) or the build gives this unit's own (PIANO_TOUCH_INVERT_Y, before both); the caller
+// picks flipX / flipY (PianoTouch.cpp: piano-touch-flip=auto).
 // The tip on top: down after `confirm` frames in a row with a contact (ShengNovatekTouch confirms on the second scan), up after
 // `hold` frames in a row without one, so a single noisy frame neither clicks nor breaks a drag.
 // Every contact of the frame as well (points, new for the multi-contact tracker TouchTrack.h): the peaks down to lowPercent of the
@@ -183,6 +184,12 @@ struct Matrix {
   MatrixBlob blobs[kMaxBlobs + 2];
   uint8_t label[kMaxNodes];
   uint16_t queue[kMaxNodes];
+  // matrixFeed's scratch (here, not on a 16 KiB kernel stack): the peak candidates.
+  struct Candidate {
+    int32_t r, c, v;
+    bool dropped;
+  };
+  Candidate cand[kMaxCandidates];
 };
 
 inline void matrixReset(Matrix &m, const MatrixConfig &cfg)
@@ -322,8 +329,8 @@ inline Feed matrixFeed(Matrix &m, const uint8_t *p, uint32_t len)
     }
   }
   // Peaks: nodes at the low level that no 3 x 3 neighbour beats (ties to the first in scan order).
-  struct Candidate { int32_t r, c, v; bool dropped; };
-  Candidate cand[kMaxCandidates];
+  using Candidate = Matrix::Candidate;
+  Candidate *cand = m.cand;
   uint32_t nc = 0;
   for (int32_t r = 0; r < R; ++r)
     for (int32_t c = 0; c < C; ++c) {
@@ -453,7 +460,10 @@ struct Orientation {
   const char *why = "";
 };
 inline const char *panelName(int panel) { return panel == kPanelBoe ? "BOE" : panel == kPanelCsot ? "CSOT" : "unknown"; }
-inline Orientation chooseOrientation(int gpioPanel, const Calibration *cal, uint32_t flipArg)
+// invertY: this unit's Y orientation from the build (gen-touch-calibration.py, PIANO_TOUCH_INVERT_Y; -1 none), taken before the
+// calibration's invert_y and the panel: piano's Ubuntu needed a per-device invert_y on a BOE unit, and this BOE unit's Y ran
+// reversed with the panel's default (2026-11-11, level 2 on the tablet).
+inline Orientation chooseOrientation(int gpioPanel, const Calibration *cal, uint32_t flipArg, int32_t invertY = -1)
 {
   Orientation o;
   const bool valid = cal && calibrationValid(*cal);
@@ -464,6 +474,9 @@ inline Orientation chooseOrientation(int gpioPanel, const Calibration *cal, uint
     o.flipX = flipArg & 1;
     o.flipY = flipArg & 2;
     o.why = "piano-touch-flip";
+  } else if (invertY >= 0) {
+    o.flipY = invertY != 0;
+    o.why = invertY ? "this unit: Y reversed (PIANO_TOUCH_INVERT_Y=1 at build)" : "this unit: as processor Y (PIANO_TOUCH_INVERT_Y=0 at build)";
   } else if (valid && cal->invertY >= 0) {
     o.flipY = cal->invertY != 0;
     o.why = "the calibration's invert_y";

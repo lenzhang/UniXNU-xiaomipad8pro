@@ -23,8 +23,8 @@
 //                polling or, with piano-touch-irq=1, by the TLMM summary interrupt (package/common/PianoIrq.h); checksum,
 //                transport kind, counter, type; the matrix decoder, the contacts (TouchTrack.h) and the gestures (TouchGesture.h);
 //                at level 2 their reports to the HID pointer (TouchHid.h). While the panel is busy a CPU latency hold (k27 0061's
-//                piano_cpuidle_latency_hold, compiled in when the kernel the build links has it). Ten watchdog frames in a row:
-//                the download again (at most three times)
+//                piano_cpuidle_latency_hold, compiled in when the kernel the build links has it). Eleven watchdog frames in a row:
+//                the download again, at once and then every 10 s while it comes back, never given up (TouchPace.h)
 //
 // Boot arguments (default: inert, the service does not even probe):
 //   piano-touch=1            steps 1-7; frame statistics, contacts and the gestures they make in the log; nothing goes to macOS
@@ -57,10 +57,10 @@
 //   piano-touch-flip=B       auto (default: by the panel, BOE as processor Y, CSOT Y reversed; the calibration's panel wins over
 //                            gpio100 for this, and its invert_y over both); 0..3 explicit: bit 0 X, bit 1 Y flipped
 //   piano-touch-poll=MS      edge polling while busy (default 1)
-//   piano-touch-idle=MS      one frame per MS at rest (default 50; 0: every frame, the old loop; 20..500)
+//   piano-touch-idle=MS      one frame per MS at rest (default 50; 0: every frame on its edge, the old loop; 20..200)
 //   piano-touch-irq=1        the idle frames' edge by the TLMM interrupt (gpio162 on the summary SPI 208) instead of 1 ms polls
-//   piano-touch-noedge=MS    while busy a frame is read anyway MS after the last one when no gpio162 edge came (default 12; 4..200;
-//                            at rest the idle period + 10 ms; TouchPace.h)
+//   piano-touch-noedge=MS    while busy a frame is read anyway MS after the last one when no edge came and the line is low (default
+//                            50; 25..200; at rest the idle period + 50 ms; TouchPace.h: never a read inside a scan)
 //   piano-wake-log=S         the "idle: N wakeups" line every S seconds (default 60, 0 none; shared with the other drivers)
 //   piano-touch-trace=1      more frame headers, and contact positions at level 2
 //   piano-touch-rotate=1     follow the display's rotation (package/PianoAuto/TouchRotation.h, docs/drivers/sensors.md 5a.3): the
@@ -163,7 +163,7 @@ void readArgs()
   gArgs.trace = bootArg("piano-touch-trace", 0);
   gArgs.idleMs = TouchPace::clampIdle(bootArg("piano-touch-idle", kIdleReadMs));
   gArgs.irq = bootArg("piano-touch-irq", 0);
-  gArgs.noEdgeMs = clampArg(bootArg("piano-touch-noedge", kNoEdgeBusyMs), 4, kNoEdgeOldMs);
+  gArgs.noEdgeMs = clampArg(bootArg("piano-touch-noedge", kNoEdgeBusyMs), kNoEdgeMinMs, kNoEdgeOldMs);
   gArgs.rotate = bootArg("piano-touch-rotate", 0);
   // The gestures (TouchGesture.h) and the contacts (TouchTrack.h); 0 turns off what has an "off".
   gArgs.gestures = bootArg("piano-touch-gestures", 1);
@@ -409,6 +409,10 @@ class PianoTouch : public IOService {
   BurstHold fBurst;
   int fCpuHold = -1;
   uint32_t fCpuHoldFailures = 0;
+  // The controller's watchdog: the download again with a back-off (TouchPace.h WatchdogRecovery); the reads no edge started.
+  WatchdogRecovery fWatchdog;
+  bool fWdtWaitNoted = false;
+  uint32_t fLevelReads = 0, fBlindReads = 0, fClockLosses = 0;
   // The power states (TouchPower.h): setPowerState writes fSystemOff and kicks fWake; the frame thread acts on it, parks (fParked)
   // while off, restarts on its own. The display's state from NativeGopDisplay's piano-display-power (fDisplay, retained once found).
   TouchPower fPower;
@@ -453,6 +457,7 @@ class PianoTouch : public IOService {
   bool busUp();
   bool geniUp();
   bool geniClocks();
+  bool se2Clocked();
   bool geniLoopback();
   bool engineIdle();
   unsigned pollLimit(uint32_t len) const;
@@ -548,6 +553,9 @@ bool PianoTouch::start(IOService *provider)
     note("calibration: unit file (sha256 %s) INVALID: none (linear map)", kUnitCalibrationSha);
   else
     note("calibration: none (linear map)");
+  if (kUnitInvertYOverride >= 0)
+    note("orientation: this unit's Y %s by the build (PIANO_TOUCH_INVERT_Y=%d): piano-touch-flip=auto takes it; an explicit "
+         "piano-touch-flip still wins", kUnitInvertYOverride ? "reversed" : "as the processor gives it", kUnitInvertYOverride);
   if (!step(1, "survey (read only): pins, SE2 clocks and registers, SMMU stream 0xa3, firmware images")) return true;
   survey();
   // Step 2 here, on the matching thread: the SMMU's stream-match registers are not safe to touch later from another thread
@@ -710,6 +718,7 @@ int PianoTouch::busXfer(void *self, const uint8_t *tx, uint8_t *rx, uint32_t len
   ++t->fXfers;
   int rc = 0;
   if (t->fBus == BusKind::geni) {
+    if (!t->se2Clocked()) return -5;   // never an SE2 access with its clock off (a bus stall)
     // With SE DMA the transfer returns on DMA done, the engine's command can still be shifting out: the next one waits for it.
     if (!t->engineIdle()) {
       if (++t->fXferErrors <= 10 || t->fXferErrors % 100 == 0)
@@ -767,28 +776,61 @@ bool PianoTouch::busUp()
   return gpioUp();
 }
 
-bool PianoTouch::geniClocks()
+// Our votes in 0x52008 (the QUP1 wrapper and SE2 branches) under PianoA830's lock word (a holder that keeps it for 50 ms does not
+// stop us: the update goes ahead). Bits are only ever set.
+struct GccVoteResult {
+  uint32_t before, after, waits;
+  bool needed, locked;
+};
+static GccVoteResult voteSe2Clocks()
 {
-  // Our votes even when the clocks already run (on someone else's vote they could stop later and stall the next SE2 access), under
-  // PianoA830's lock word (a holder that keeps it for 50 ms does not stop us: the update goes ahead). Bits are only ever set.
-  uint32_t waits = 0;
-  const bool needed = (gcc(kGccVote) & kVoteBits) != kVoteBits;
-  bool locked = false;
-  for (; needed && waits < 5000 && !locked; ++waits) {
+  GccVoteResult r = {0, 0, 0, (gcc(kGccVote) & kVoteBits) != kVoteBits, false};
+  for (; r.needed && r.waits < 5000 && !r.locked; ++r.waits) {
     uint32_t expected = 0;
-    locked = __atomic_compare_exchange_n(&sm8750_gcc_vote_owner, &expected, kGccVoteTag, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
-    if (!locked) IODelay(10);
+    r.locked = __atomic_compare_exchange_n(&sm8750_gcc_vote_owner, &expected, kGccVoteTag, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+    if (!r.locked) IODelay(10);
   }
-  const uint32_t before = gcc(kGccVote);
-  if ((before & kVoteBits) != kVoteBits) {
-    wr32(gGcc.va + kGccVote, before | kVoteBits);
+  r.before = gcc(kGccVote);
+  if ((r.before & kVoteBits) != kVoteBits) {
+    wr32(gGcc.va + kGccVote, r.before | kVoteBits);
     dsb();
   }
-  const uint32_t after = gcc(kGccVote);
-  if (needed && locked) {
+  r.after = gcc(kGccVote);
+  if (r.needed && r.locked) {
     uint32_t expected = kGccVoteTag;
     __atomic_compare_exchange_n(&sm8750_gcc_vote_owner, &expected, 0u, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
   }
+  return r;
+}
+
+// Before each GENI transfer: every QUP1/SE2 clock branch still runs (read in GCC, which is always safe). An SE2 register access
+// with a branch off stalls the bus, which can hang the CPU until the watchdog resets the tablet; so a branch found off: our votes
+// again and the transfer skipped (a transfer error: the frame is dropped, the next one retries).
+bool PianoTouch::se2Clocked()
+{
+  uint32_t off = 0;
+  bool on = true;
+  for (const Branch &b : kBranches) {
+    const uint32_t v = gcc(b.cbcr);
+    if (!branchOn(v)) {
+      on = false;
+      off = v;
+    }
+  }
+  if (on) return true;
+  const GccVoteResult r = voteSe2Clocks();
+  if (++fClockLosses <= 10 || fClockLosses % 100 == 0)
+    note("geni: a QUP1/SE2 clock branch is off (CBCR %08x; vote %08x -> %08x; %u times): voted again, the transfer skipped", off,
+         r.before, r.after, fClockLosses);
+  return false;
+}
+
+bool PianoTouch::geniClocks()
+{
+  // Our votes even when the clocks already run (on someone else's vote they could stop later and stall the next SE2 access).
+  const GccVoteResult r = voteSe2Clocks();
+  const uint32_t before = r.before, after = r.after, waits = r.waits;
+  const bool needed = r.needed, locked = r.locked;
   char line[200];
   size_t used = 0;
   bool on = true;
@@ -1343,9 +1385,16 @@ bool PianoTouch::restart(bool fromSuspend, const MatrixConfig &mc)
     note("%s: the probe's read failed (rc %d): the GENI engine set up again", fromSuspend ? "power" : "display", rc);
     if (geniUp()) rc = probeState(fChip, &kept);
   }
+  // The firmware info and the reset state survive the watchdog state (attend1: "kept its state", then 0xfd frames): one frame read
+  // too (a frame waits by then: the last read was at most 200 ms ago, or before the suspend); a watchdog block counts as lost.
+  uint8_t watchdogState = 0;
+  if (rc == kOk && kept && readFrame(fChip, fFrame) == kOk && frameKind(fFrame) == FrameKind::watchdog) {
+    watchdogState = fFrame[1];
+    kept = false;
+  }
   note("%s: the controller %s: firmware info %#04x/%#04x (started with %#04x), reset state %#04x%s", fromSuspend ? "power" : "display",
-       rc == kOk && kept ? "kept its state" : "lost its state", fChip.probeVersion, fChip.probeComplement, fChip.fwVersion,
-       fChip.probeReset, rc ? " (the probe's read failed)" : "");
+       rc == kOk && kept ? "kept its state" : watchdogState ? "is in its watchdog state" : "lost its state", fChip.probeVersion,
+       fChip.probeComplement, fChip.fwVersion, fChip.probeReset, rc ? " (the probe's read failed)" : "");
   unsigned tried = 0;
   Restart plan = restartPlan(fromSuspend, rc == kOk && kept, tried);
   while (plan == Restart::download) {
@@ -1381,7 +1430,7 @@ bool PianoTouch::powerStep(PowerStep s, const MatrixConfig &mc, uint64_t now)
   case PowerStep::mute:
     lost(now);
     burst(now, false, true);
-    note("display off: touch muted (nothing reported), one frame per %u ms (piano-touch-display=0 ignores the display)", kIdleReadMaxMs);
+    note("display off: touch muted (nothing reported), one frame per %u ms (piano-touch-display=0 ignores the display)", kMutedReadMs);
     return true;
   case PowerStep::resume:
   case PowerStep::unmute: {
@@ -1468,6 +1517,10 @@ void PianoTouch::stats(uint64_t now)
        fReadErrors, fGaps, types, (unsigned long long)(fReads ? fReadUsSum / fReads : 0), fReadUsMax,
        fMatrix->haveReference ? "referenced" : fMatrix->refType >= 0 ? "learning the reference" : "learning the type", fMatrix->frames,
        fMatrix->maxDelta, fTracker.downs);
+  // The pace's evidence (TouchPace.h): reads no edge started (by the line's level, by the timeout), the line now, the watchdog.
+  note("frames: reads %u: %u on an edge, %u on the line still high, %u without either; gpio162 now %u; watchdog frames %u, downloads "
+       "for it %u", fReads, fReads - fLevelReads - fBlindReads, fLevelReads, fBlindReads, fIrqArmed ? unsigned(level(kIrq)) : 9u, fWdt,
+       fWatchdog.downloads);
   fLastStatsMs = now;
   fReadsSinceStats = fEdgesSinceStats = 0;
   // The gestures, when there were new ones.
@@ -1489,7 +1542,7 @@ void PianoTouch::serve()
   mc.threshold = int32_t(gArgs.threshold);
   const Calibration *cal = kUnitCalibrationPresent && calibrationValid(kUnitCalibration) ? &kUnitCalibration : nullptr;
   mc.cal = cal;
-  const Orientation o = chooseOrientation(fPanel, cal, gArgs.flip);
+  const Orientation o = chooseOrientation(fPanel, cal, gArgs.flip, kUnitInvertYOverride);
   mc.flipX = o.flipX;
   mc.flipY = o.flipY;
   if (o.mismatch)
@@ -1514,32 +1567,21 @@ void PianoTouch::serve()
   note("frames: serving over %s, %s", fBus == BusKind::geni ? "GENI" : "SPI by hand",
        gArgs.level >= 2 ? "the gestures go to macOS" : "contacts and gestures are logged only (piano-touch=2 gives them to macOS)");
   if (paced)
-    note("frames: without a gpio162 edge a frame is read anyway %u ms after the last one while busy, %u ms at rest", pace.noEdgeMs(false),
-         pace.noEdgeMs(true));
+    note("frames: every frame on its gpio162 edge while busy (none for %u ms, or the line still high after %u ms: read anyway), one per "
+         "%u ms at rest (none by %u ms: read anyway), one per %u ms with the display off", pace.noEdgeMs(false), kNoEdgeMinMs, pace.idleMs,
+         pace.noEdgeMs(true), kMutedReadMs);
   fPower.followDisplay = gArgs.display != 0;
   __atomic_store_n(&fServing, true, __ATOMIC_RELEASE);
   for (;;) {
     const uint64_t now = nowMs();
     // The power states (TouchPower.h): the system's (setPowerState; a suspend parks the thread in powerStep) and the display's.
     powerStep(fPower.step(__atomic_load_n(&fSystemOff, __ATOMIC_ACQUIRE), displayState(now)), mc, now);
-    if (fPower.muted() || fFramesStopped) {
-      // The display off: a frame per kIdleReadMaxMs, decoded for the reference's drift only (frame() reports nothing); read errors
-      // and watchdog frames only counted (the panel's TDDI may have stopped). A controller that did not come back: no reads.
-      if (!fFramesStopped && now - fLastReadMs >= kIdleReadMaxMs) {
-        fLastReadMs = now;
-        ++fReads;
-        ++fReadsSinceStats;
-        const uint64_t t0 = nowUs();
-        if (readFrame(fChip, fFrame)) ++fReadErrors;
-        else frame(uint32_t(nowUs() - t0));
-        fWdtRun = 0;
-      }
-      if (now - fLastStatsMs >= (now - begin < 30000 ? 5000 : 60000)) stats(now);
+    if (fFramesStopped) {   // a controller that did not come back after a resume: no reads until the next one
       const uint32_t seen = fWake.now();
-      if (!__atomic_load_n(&fSystemOff, __ATOMIC_ACQUIRE)) fWake.wait(seen, kDisplayPollMs);
-      wakes.count(pianoirq::Woke::timeout);
+      if (!__atomic_load_n(&fSystemOff, __ATOMIC_ACQUIRE)) fWake.wait(seen, 1000);
       continue;
     }
+    // gpio162's latch (TouchPace.h): an edge is a frame that waits; it is taken here, never dropped.
     if (fIrqArmed && (rd32(pinVa(kIrq) + kIntrStatus) & 1)) {
       wr32(pinVa(kIrq) + kIntrStatus, 0);
       dsb();
@@ -1548,10 +1590,24 @@ void PianoTouch::serve()
       ++fEdges;
       ++fEdgesSinceStats;
     }
+    const bool muted = fPower.muted();
     const uint64_t since = now - fLastReadMs;
-    const uint64_t noEdgeMs = fBus == BusKind::gpio ? 100 : paced ? pace.noEdgeMs(rest) : kNoEdgeOldMs;
-    if (since >= minGapMs && (fEdgePending || since >= noEdgeMs)) {
-      if (paced) pace.read(fEdgePending);
+    // A frame waits without an edge we saw: the line still high two cycles after the last read started.
+    const bool levelPending = !fEdgePending && fIrqArmed && since >= kNoEdgeMinMs && level(kIrq);
+    bool readNow;
+    if (muted)
+      readNow = since >= kMutedReadMs;   // the display off: one frame per 200 ms, waiting by then
+    else if (fBus == BusKind::gpio)
+      readNow = since >= minGapMs && (fEdgePending || since >= 100);
+    else if (!paced)
+      readNow = fEdgePending || levelPending || since >= kNoEdgeOldMs;
+    else if (rest)
+      readNow = since >= pace.idleMs && (fEdgePending || levelPending || since >= pace.noEdgeMs(true));
+    else
+      readNow = fEdgePending || levelPending || since >= pace.noEdgeMs(false);
+    if (readNow) {
+      if (levelPending) ++fLevelReads;
+      else if (!fEdgePending) ++fBlindReads;
       fEdgePending = false;
       fLastReadMs = now;
       ++fReads;
@@ -1584,25 +1640,32 @@ void PianoTouch::serve()
       } else {
         fPollNextEdge = false;
       }
-      if (fWdtRun > 10) {
-        lost(nowMs());
-        if (fDownloads >= 4) {
-          burst(nowMs(), false, true);
-          stage(-7, "frames: the controller's watchdog again after three re-downloads");
-          return;
+      // The controller's watchdog (TouchPace.h WatchdogRecovery): the download again, at once or every 10 s while it comes back,
+      // never given up; the display off only counts it (restart() at its return does what is needed).
+      if (fWdtRun >= kWatchdogRun && !muted) {
+        if (fWatchdog.due(nowMs())) {
+          lost(nowMs());
+          // As the vendor flow: a controller that reports 0xfe is idled first (swrst <- 0xaa, 15 ms), then the download again.
+          if (fWdtState == 0xfe) {
+            writeByte(fChip, kSwrst, 0xaa);
+            IOSleep(15);
+          }
+          const bool soon = fWatchdog.downloads && nowMs() - fWatchdog.lastMs < 2 * kWatchdogRetryMs;
+          if (fWatchdog.downloads < 10 || fWatchdog.downloads % 10 == 0)
+            note("frames: watchdog (state %#04x, %u frames in a row): the download again (%u for the watchdog%s)", fWdtState, fWdtRun,
+                 fWatchdog.downloads + 1, soon ? "; it came back: every 10 s from now on, never given up" : "");
+          fWatchdog.downloaded(nowMs());
+          fWdtRun = 0;
+          fWdtWaitNoted = false;
+          if (firmware() && startScanning()) matrixReset(*fMatrix, mc);
+          else note("frames: the download for the watchdog failed: again in %u s", kWatchdogRetryMs / 1000);
+          fEdgePending = false;
+          fLastReadMs = nowMs();
+        } else if (!fWdtWaitNoted) {
+          fWdtWaitNoted = true;
+          note("frames: watchdog (state %#04x) again %llu ms after its download: the next download in %llu ms", fWdtState,
+               (unsigned long long)(nowMs() - fWatchdog.lastMs), (unsigned long long)(fWatchdog.lastMs + kWatchdogRetryMs - nowMs()));
         }
-        // As the vendor flow: a controller that reports 0xfe is idled first (swrst <- 0xaa, 15 ms), then the download again.
-        if (fWdtState == 0xfe) {
-          writeByte(fChip, kSwrst, 0xaa);
-          IOSleep(15);
-        }
-        note("frames: watchdog (state %#04x): the download again", fWdtState);
-        fWdtRun = 0;
-        if (!firmware() || !startScanning()) {
-          burst(nowMs(), false, true);
-          return;
-        }
-        matrixReset(*fMatrix, mc);
       }
     }
     const uint64_t age = now - begin;
@@ -1611,9 +1674,17 @@ void PianoTouch::serve()
     if (wakes.due(now, &w)) {
       note("idle: %u wakeups in %u s, irq %u (%u frame reads; %u idle sleeps; %u reads on an interrupt's edge, %u of them bad; %u "
            "missed; pace %s)", w.wakeups, w.seconds, w.irqs, fReads - readsAtWindow, fIdleSleeps - sleepsAtWindow, fIrqReads, fIrqBadReads,
-           fMiss.total, paced ? (pace.idle(nowMs(), false) ? "idle" : "every frame") : "every frame (not paced)");
+           fMiss.total, muted ? "display off" : paced ? (pace.idle(nowMs(), false) ? "idle" : "every frame") : "every frame (not paced)");
       readsAtWindow = fReads;
       sleepsAtWindow = fIdleSleeps;
+    }
+    if (muted) {   // the next read due in at most 200 ms; the display's state is read every 250 ms
+      const uint64_t gone = nowMs() - fLastReadMs;
+      const uint32_t wait = gone >= kMutedReadMs ? 1 : uint32_t(kMutedReadMs - gone);
+      const uint32_t seen = fWake.now();
+      if (!__atomic_load_n(&fSystemOff, __ATOMIC_ACQUIRE)) fWake.wait(seen, wait);
+      wakes.count(pianoirq::Woke::timeout);
+      continue;
     }
     // The pace (TouchPace.h): every frame while the panel is busy, one per idle period at rest.
     const bool busy = trackerLive(fTracker) || !gestureIdle(fGesture) || !fMatrix->haveReference || fWdtRun;
@@ -1626,12 +1697,7 @@ void PianoTouch::serve()
         if (!__atomic_load_n(&fSystemOff, __ATOMIC_ACQUIRE)) fWake.wait(seen, sleep);
         wakes.count(pianoirq::Woke::timeout);
         ++fIdleSleeps;
-        if (fIrqArmed) {   // (gpio162 mapped; without it the rest is blind)
-          if (rd32(pinVa(kIrq) + kIntrStatus) & 1) pace.edgeSeen();   // edges come: wait for the next fresh one
-          wr32(pinVa(kIrq) + kIntrStatus, 0);   // the latched edge came mid-sleep: the next fresh one starts a frame
-          dsb();
-        }
-        continue;
+        continue;   // the latch, set during the sleep (the frame waits), is taken at the top
       }
       if (fEdgeSeen && fIrqLive && fPin.live() && !fPollNextEdge) {
         const uint32_t seen = fPin.gen();

@@ -40,6 +40,21 @@ with tempfile.TemporaryDirectory() as tmp:
     text = gen.header(cal, '7186ba60', 'kSynthetic', 'test')
     check('kSyntheticCalibrationPresent = true' in text and ', 21360, 32000, 2700, 600, 4350, 26, -1};' in text, 'synthetic header')
     check('kUnitCalibrationPresent = false' in gen.header(None, 'none', 'kUnit', 'test'), 'fallback header')
+    # This unit's Y orientation from the build (PIANO_TOUCH_INVERT_Y): its own constant, with or without a calibration.
+    check('kSyntheticInvertYOverride = -1;' in text, 'no override by default')
+    check('kUnitInvertYOverride = 1;' in gen.header(None, 'none', 'kUnit', 'test', 1), 'override without a calibration')
+    check('kSyntheticInvertYOverride = 0;' in gen.header(cal, '7186ba60', 'kSynthetic', 'test', 0), 'override 0')
+    check(gen.invert_override('none') == (-1, '') and gen.invert_override('1')[0] == 1 and gen.invert_override('0')[0] == 0,
+          'explicit overrides')
+    import os
+    saved = os.environ.get('PIANO_TOUCH_INVERT_Y')
+    for value, want in (('1', 1), ('true', 1), ('0', 0), ('no', 0), ('', -1), ('maybe', -1)):
+        os.environ['PIANO_TOUCH_INVERT_Y'] = value
+        check(gen.invert_override('env')[0] == want, f'PIANO_TOUCH_INVERT_Y={value!r}')
+    if saved is None:
+        del os.environ['PIANO_TOUCH_INVERT_Y']
+    else:
+        os.environ['PIANO_TOUCH_INVERT_Y'] = saved
 
     def bad(mutate, why):
         doc = copy.deepcopy(synthetic)
@@ -88,4 +103,4 @@ else:
 if failures:
     print(f'calibration generator tests: {failures} FAILED')
     sys.exit(1)
-print('PASS: calibration generator (synthetic, 13 invalid kinds, fallback header)')
+print('PASS: calibration generator (synthetic, 13 invalid kinds, fallback header, the Y override)')

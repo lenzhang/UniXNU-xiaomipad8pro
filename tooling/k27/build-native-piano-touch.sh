@@ -11,6 +11,8 @@
 #                default ../xiaomipad-8pro-mainline's firmware/novatek/piano), PIANO_TOUCH_NO_FIRMWARE=1 (build without them: step 5
 #                then stops with "no usable image"), PIANO_TOUCH_CALIBRATION (this unit's Ubuntu touchscreen calibration, from the
 #                environment or ~/.config/piano/env; PIANO_TOUCH_CALIBRATION= in the environment does not read the file),
+#                PIANO_TOUCH_INVERT_Y (this unit's Y orientation, environment or ~/.config/piano/env: 1 reversed, 0 not; the
+#                default of piano-touch-flip=auto, before the calibration's invert_y and the panel; docs/drivers/touch.md §5),
 #                K27_KERNEL (the kernel the KC will link, default the 0059 one: the import check, and the CPU latency hold compiled
 #                in when it exports piano_cpuidle_latency_hold), LLVM_NM
 # The calibration (private: made by xiaomipad-8pro-mainline tools/extract-thp-calibration.py from the vendor thp_config.ini) is
@@ -56,7 +58,7 @@ if [ "${PIANO_TOUCH_CALIBRATION+set}" = set ]; then
 fi
 python3 "$D/tooling/k27/gen-touch-calibration.py" --out "$O/gen/PianoTouchCalibration.h" ${CAL_ARGS[@]+"${CAL_ARGS[@]}"} >&2
 python3 "$P/tests/calibration_gen_test.py" >&2 || { echo "Error: calibration generator tests failed" >&2; exit 1; }
-python3 "$D/tooling/k27/gen-touch-calibration.py" --out "$O/host-tests/SyntheticCalibration.h" --name kSynthetic \
+python3 "$D/tooling/k27/gen-touch-calibration.py" --out "$O/host-tests/SyntheticCalibration.h" --name kSynthetic --invert-y none \
   "$P/tests/synthetic-calibration.json" 2> /dev/null
 "$D/package/common/tests/run.sh" >&2   # PianoIrq.h: the TLMM INTR_CFG encoding and the guards the frame loop uses
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror "$P/tests/geni_spi_host.c" "$P/GeniSpi.c" -o "$O/host-tests/geni_spi_host"
