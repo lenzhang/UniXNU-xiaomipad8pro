@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build package/PianoPolicy (piano's laptop-class policy: the cover, the keyboard's display wake, the power key, the power profile
 # from macOS Low Power Mode; docs/policy.md) as a k27 native kext: the host tests first (tests/policy_host.cpp: every cover x power
-# source x display x Low Power Mode x sleep combination, the notification sequences, the GPU ceiling slot shared with PianoThermal),
+# source x display x Low Power Mode x sleep combination, the notification sequences, the GPU ceiling in PianoA830's slot 1 or, without
+# its slots, the one shared with PianoThermal; the profile through PianoThermal's Governor.h),
 # then the objects in out/native-kexts/PianoPolicy for tooling/k27/kext/PianoPolicy.json. Inert without the boot argument
 # piano-policy. No hardware is touched.
 #   environment: PIANO_K27_TREE (the k27 tree, read only: its compile recipes), K27_OBJ (default k27-native-obj), CXX (host compiler

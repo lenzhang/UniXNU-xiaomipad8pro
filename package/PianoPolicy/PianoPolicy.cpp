@@ -13,15 +13,19 @@
 //   machdep.piano_policy_lpm   macOS Low Power Mode, written by root (the agent tooling/native/piano-policy-agent mirrors
 //                     com.apple.system.lowpowermode into it; by hand: sudo sysctl machdep.piano_policy_lpm=1)
 //   machdep.piano_sleep (k27 0062)   "on" = system sleep exists (piano-sleep=1), and its wake mask; read once at start
-//   piano_thermal_state (PianoThermal, a library of the descriptor)   its protection state, for the GPU ceiling slot it shares
+//   PianoA830         piano-gpu-ceiling-clients: >= 2, a ceiling slot per caller (docs/policy.md 5.3): ours is client 1
+//   piano_thermal_state (PianoThermal, a library of the descriptor)   its protection state, only while PianoA830 has no slots
+//                     (the one GPU ceiling slot shared with PianoThermal's passive trip)
 // Outputs (level 2):
 //   IOPMrootDomain    receivePowerNotification: kIOPMClamshellClosed / Opened (with piano-policy-lid=1), kIOPMEnableClamshell /
 //                     kIOPMDisableClamshell (closing sleeps or only locks), kIOPMSetACAdaptorConnected (the power source, so its
 //                     clamshell rules see it), kIOPMSleepNow (the power key); requestUserActive (display wake: cover open, power
 //                     key with the display off, gpio95)
 //   PianoThermal      callPlatformFunction("piano-thermal-profile", mode): 1 Power Saver with Low Power Mode, 0 its own choice
-//   PianoA830         callPlatformFunction("piano-gpu-ceiling", kHz): Power Saver's ceiling (342 MHz), 0 clears; only when
-//                     PianoA830's own maximum is above it, and never over PianoThermal's passive ceiling
+//   PianoA830         callPlatformFunction("piano-gpu-ceiling", kHz, client): Power Saver's ceiling (342 MHz), 0 clears; only
+//                     when PianoA830's own maximum is above it. With PianoA830's slots client 1 (the lowest slot wins: PianoThermal's
+//                     passive ceiling stays in force by itself); without them the shared slot (param2 null), never written over
+//                     PianoThermal's passive ceiling (the breadcrumb read, a 5 s tick while ours is in, the put-back after a race)
 // Answers (platform functions on this service, any thread):
 //   "piano-policy-power-key"     param1 = the press in ms (PianoInput, on the release of a short press): kIOReturnSuccess when
 //                                consumed (sleep now, or a display wake), kIOReturnUnsupported: send macOS the HID Power usage
@@ -228,6 +232,7 @@ class PianoPolicy : public IOService {
   Inputs gather();
   void perform(const Actions &a, const Inputs &in, bool fromThread);
   Result call(const char *service, const char *function, uint32_t value);
+  Result gpuCall(uint32_t khz, uint32_t *client);
   void describe(const Inputs &in, const View &v);
   void publishView(const View &v, const Inputs &in);
 
@@ -235,7 +240,7 @@ class PianoPolicy : public IOService {
   Engine fEngine{Config()};
   IOLock *fLock = nullptr;
   uint32_t fPending = 0;
-  IOService *fKeyboard = nullptr, *fPowerSource = nullptr, *fDisplay = nullptr;   // retained once found
+  IOService *fKeyboard = nullptr, *fPowerSource = nullptr, *fDisplay = nullptr, *fGpu = nullptr;   // retained once found
   volatile uint32_t fStatusRises = 0, fRootClamshell = 0, fRootClamshellSeen = 0;
   uint32_t fStatusRisesSeen = 0;
   bool fSleepOn = false;
@@ -248,6 +253,7 @@ class PianoPolicy : public IOService {
   View fLastView;
   bool fHaveView = false;
   bool fProfileMissingLogged = false, fGpuMissingLogged = false;
+  int fGpuSlotsLogged = -1;   // the piano-gpu-ceiling-clients last named on the console
 };
 
 OSDefineMetaClassAndStructors(PianoPolicy, IOService)
@@ -303,7 +309,9 @@ bool PianoPolicy::start(IOService *provider)
     note("system sleep: %s, wake mask %#x (%s%s%s); machdep.piano_sleep: %.120s", fSleepOn ? "on" : "off (piano-sleep=1 turns it on)",
          fWakeMask, fWakeMask & kWakePowerKey ? "power key" : "-", fWakeMask & kWakeLid ? ", cover open" : ", NO cover-open wake",
          fWakeMask & kWakeKeyboard ? ", keyboard" : "", sleep);
-  if (fConfig.thermalOwnsGpu) note("PianoThermal at level 2 shares PianoA830's GPU ceiling slot: ours is never written over its passive one");
+  if (fConfig.thermalOwnsGpu)
+    note("PianoThermal at level 2 writes a GPU ceiling at its passive trip: with PianoA830's slots ours is client 1 (the lowest wins), "
+         "without them ours is never written over its passive one");
   gPolicy = this;
   fillOid(gOidStatus, "piano_policy", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, sysctlStatus, "A",
           "PianoPolicy: inputs, decisions and counters");
@@ -415,7 +423,19 @@ Inputs PianoPolicy::gather()
   in.lpm = __atomic_load_n(&gLpm, __ATOMIC_ACQUIRE) != 0;
   in.sleepOn = fSleepOn;
   in.wakeMask = fWakeMask;
-  const int32_t t = fConfig.thermalOwnsGpu ? piano_thermal_state : -1;
+  // PianoA830's slots (published before its service is: a service found has the property, or never will).
+  IOService *gpu = __atomic_load_n(&fGpu, __ATOMIC_ACQUIRE);
+  if (!gpu) {
+    if (IOService *g = copyByClass("PianoA830")) {
+      if (__atomic_exchange_n(&fGpu, g, __ATOMIC_ACQ_REL)) g->release();
+      gpu = __atomic_load_n(&fGpu, __ATOMIC_ACQUIRE);
+    }
+  }
+  const int clients = numberProperty(gpu, "piano-gpu-ceiling-clients");
+  in.gpuClients = clients > 0 ? uint32_t(clients) : 0;
+  // PianoThermal's breadcrumb only while its passive ceiling and ours share one slot.
+  const bool shared = !fEngine.gpuOwnSlot() && !gpuOwnSlot(in.gpuClients);
+  const int32_t t = fConfig.thermalOwnsGpu && shared ? piano_thermal_state : -1;
   in.thermal = t >= 0 && t <= 3 ? Thermal(t) : Thermal::unknown;
   return in;
 }
@@ -426,6 +446,20 @@ Result PianoPolicy::call(const char *service, const char *function, uint32_t val
   IOService *s = copyByClass(service);
   if (!s) return Result::absent;
   const IOReturn r = s->callPlatformFunction(function, false, reinterpret_cast<void *>(uintptr_t(value)), nullptr, nullptr, nullptr);
+  s->release();
+  return r == kIOReturnSuccess ? Result::taken : Result::unsupported;
+}
+
+// PianoA830's "piano-gpu-ceiling": the slot from the service called (its piano-gpu-ceiling-clients), so a PianoA830 published after
+// the turn's inputs were read still gets client 1; *client is the slot written (kGpuClientShared: param2 null).
+Result PianoPolicy::gpuCall(uint32_t khz, uint32_t *client)
+{
+  IOService *s = copyByClass("PianoA830");
+  if (!s) return Result::absent;
+  const int clients = numberProperty(s, "piano-gpu-ceiling-clients");
+  *client = clients >= 2 ? kGpuClientPolicy : kGpuClientShared;
+  const IOReturn r = s->callPlatformFunction("piano-gpu-ceiling", false, reinterpret_cast<void *>(uintptr_t(khz)),
+                                             reinterpret_cast<void *>(uintptr_t(*client)), nullptr, nullptr);
   s->release();
   return r == kIOReturnSuccess ? Result::taken : Result::unsupported;
 }
@@ -453,8 +487,9 @@ void PianoPolicy::perform(const Actions &a, const Inputs &in, bool fromThread)
         if (fromThread) fEngine.profileDone(x.value, r);
         if (r == Result::unsupported && !fProfileMissingLogged) {
           fProfileMissingLogged = true;
-          note("PianoThermal has no \"piano-thermal-profile\" (docs/policy.md 5.2): its CPU caps stay by the power source; Low Power "
-               "Mode on external power changes the GPU ceiling only");
+          note("PianoThermal does not take \"piano-thermal-profile\" (no CPU frequency control: piano-cpufreq < 2, or a PianoThermal "
+               "older than docs/policy.md 5.2): its CPU caps stay by the power source; Low Power Mode on external power changes the GPU "
+               "ceiling only");
         } else if (r == Result::absent) {
           note("PianoThermal profile %u (%s): no PianoThermal service (inert without piano-thermal / piano-cpufreq)", x.value, x.why);
         } else if (r == Result::taken) {
@@ -464,17 +499,21 @@ void PianoPolicy::perform(const Actions &a, const Inputs &in, bool fromThread)
       }
       case Kind::gpuCeiling: {
         ++fGpuCalls;
-        const Result r = fConfig.act ? call("PianoA830", "piano-gpu-ceiling", x.value) : Result::taken;
-        const int32_t after = fConfig.thermalOwnsGpu ? piano_thermal_state : -1;
-        if (r == Result::taken) note("PianoA830: %sGPU ceiling %u MHz (%s)", would, x.value / 1000, x.why);
+        uint32_t client = x.client;
+        const Result r = fConfig.act ? gpuCall(x.value, &client) : Result::taken;
+        // The breadcrumb right after the write: only in the shared slot (the put-back's race); our own slot needs none.
+        const int32_t after = fConfig.thermalOwnsGpu && client != kGpuClientPolicy ? piano_thermal_state : -1;
+        if (r == Result::taken)
+          note("PianoA830: %sGPU ceiling %u MHz (%s; %s)", would, x.value / 1000, x.why,
+               client == kGpuClientPolicy ? "client 1, the power profile's slot" : "the shared slot");
         else if (!fGpuMissingLogged) {
           fGpuMissingLogged = true;
           note("PianoA830: GPU ceiling %u MHz not taken (%s): asked again when PianoA830 is published",
                x.value / 1000, r == Result::absent ? "no PianoA830 service: inert without piano-gpu=2" : "no \"piano-gpu-ceiling\"");
         }
         if (!fromThread) break;
-        const Actions back = fEngine.gpuDone(x.value, r, after >= 0 && after <= 3 ? Thermal(after) : Thermal::unknown);
-        for (unsigned j = 0; j < back.n; ++j) {
+        const Actions back = fEngine.gpuDone(x.value, r, after >= 0 && after <= 3 ? Thermal(after) : Thermal::unknown, client);
+        for (unsigned j = 0; j < back.n; ++j) {   // (the shared slot only: gpuDone puts nothing back in our own)
           const Result rr = fConfig.act ? call("PianoA830", "piano-gpu-ceiling", back.a[j].value) : Result::taken;
           fEngine.gpuRestored(back.a[j].value, rr);
           note("PianoA830: %sGPU ceiling %u MHz (%s)", would, back.a[j].value / 1000, back.a[j].why);
@@ -496,7 +535,8 @@ void PianoPolicy::describe(const Inputs &in, const View &v)
            gArgs.level, fConfig.act ? "acting" : "decisions only", lidName(in.lid), in.attached ? "" : "not ", powerName(in.power),
            screenName(in.screen), in.lpm ? 1u : 0u, in.sleepOn ? "on" : "off", in.wakeMask, thermalName(in.thermal),
            closeName(v.close), v.closeWhy, profileName(v.profile), v.profileWhy, v.gpuKhz / 1000, fEngine.gpuWritten() / 1000,
-           fEngine.gpuHeld() ? ", PianoThermal holds the slot" : "", v.keyboardWake ? 1u : 0u, v.keyboardLatch ? 1u : 0u, fRootSent,
+           fEngine.gpuOwnSlot() ? ", client 1" : fEngine.gpuHeld() ? ", PianoThermal holds the slot" : ", shared slot",
+           v.keyboardWake ? 1u : 0u, v.keyboardLatch ? 1u : 0u, fRootSent,
            fUserActive, fProfileCalls, fGpuCalls, fKeys, fKbdWakes, fInputChanges);
   IOLockUnlock(gStatusLock);
 }
@@ -556,11 +596,21 @@ void PianoPolicy::run()
     const uint64_t now = nowMs();
     const Inputs in = gather();
     const bool inputsChanged = !fHaveLast || in.lid != fLast.lid || in.attached != fLast.attached || in.power != fLast.power ||
-                               in.screen != fLast.screen || in.lpm != fLast.lpm || in.thermal != fLast.thermal;
+                               in.screen != fLast.screen || in.lpm != fLast.lpm || in.thermal != fLast.thermal ||
+                               in.gpuClients != fLast.gpuClients;
     if (inputsChanged && logged(++fInputChanges))
       note("inputs: cover %s%s, %s, display %s, Low Power Mode %s, thermal %s (change %u)", lidName(in.lid),
            in.lid == Lid::unknown ? "" : in.attached ? " (attached)" : " (no cover attached)", powerName(in.power), screenName(in.screen),
-           in.lpm ? "on" : "off", thermalName(in.thermal), fInputChanges);
+           in.lpm ? "on" : "off", gpuOwnSlot(in.gpuClients) ? "not read (own GPU slot)" : thermalName(in.thermal), fInputChanges);
+    if (int(in.gpuClients) != fGpuSlotsLogged && (in.gpuClients || __atomic_load_n(&fGpu, __ATOMIC_ACQUIRE))) {
+      fGpuSlotsLogged = int(in.gpuClients);
+      if (gpuOwnSlot(in.gpuClients))
+        note("PianoA830: %u GPU ceiling slots (piano-gpu-ceiling-clients): Power Saver's ceiling is client 1, the lowest slot wins, so "
+             "PianoThermal's passive ceiling stays in force by itself: no breadcrumb read, no GPU tick, no put-back", in.gpuClients);
+      else
+        note("PianoA830 publishes no piano-gpu-ceiling-clients (one shared slot): Power Saver's ceiling is never written over "
+             "PianoThermal's passive one (breadcrumb read, a 5 s tick while ours is in, put back after a race)");
+    }
     const Actions a = fEngine.step(in, now);
     perform(a, in, true);
     fSeenOpenForCalls = fEngine.seenOpen();

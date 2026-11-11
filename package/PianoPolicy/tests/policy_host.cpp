@@ -3,9 +3,11 @@
 // system sleep (absent, on without the cover-open wake, on with it) against the rules; then the sequences IOPMrootDomain,
 // PianoThermal and PianoA830 are sent (start, close and open on battery and on power, plugging and unplugging with the cover
 // closed, a boot with the cover closed, the PianoKeyboard conflict, the power key, gpio95 with its hold-off, Low Power Mode on and
-// off, PianoThermal's passive trip around the shared GPU ceiling, a missing PianoThermal call), and machdep.piano_sleep's parse.
+// off, PianoThermal's passive trip around the shared GPU ceiling, PianoA830's own slot for us (client 1: no arbitration), a missing
+// PianoThermal call), the profile through PianoThermal's Governor.h to its CPU caps, and machdep.piano_sleep's parse.
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. policy_host.cpp -o /tmp/policy_host && /tmp/policy_host
 #include "Policy.h"
+#include "../../PianoThermal/Governor.h"   // PianoThermal's profile modes and caps: the end-to-end check of 5.2
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -25,7 +27,7 @@ static std::string str(const Actions &a)
       case Kind::root: s += std::string("root:") + rootName(x.value); break;
       case Kind::userActive: s += "user"; break;
       case Kind::thermalProfile: s += "profile:" + std::to_string(x.value); break;
-      case Kind::gpuCeiling: s += "gpu:" + std::to_string(x.value); break;
+      case Kind::gpuCeiling: s += "gpu:" + std::to_string(x.value) + (x.client ? "@" + std::to_string(x.client) : ""); break;
     }
   }
   return s;
@@ -56,7 +58,7 @@ static std::string run(Engine &e, const Inputs &in, uint64_t now = 0)
   const Actions a = e.step(in, now);
   for (unsigned i = 0; i < a.n; ++i) {
     if (a.a[i].kind == Kind::thermalProfile) e.profileDone(a.a[i].value, Result::taken);
-    if (a.a[i].kind == Kind::gpuCeiling) e.gpuDone(a.a[i].value, Result::taken, in.thermal);
+    if (a.a[i].kind == Kind::gpuCeiling) e.gpuDone(a.a[i].value, Result::taken, in.thermal, a.a[i].client);
   }
   return str(a);
 }
@@ -362,6 +364,134 @@ static void thermalSharedSlot()
   CHECK(t2.tickMs(ti) == 0);
 }
 
+static void ownGpuSlot()
+{
+  // PianoA830 with its slots (piano-gpu-ceiling-clients = 4, docs/policy.md 5.3): client 1, nothing of the interim arbitration.
+  Config c = actLid();
+  c.gpuNeeded = true;
+  c.thermalOwnsGpu = true;
+  c.keyboard = false;   // the keyboard's own tick out of the way
+  Engine e(c);
+  Inputs in = base();
+  in.gpuClients = 4;
+  CHECK(run(e, in) == "root:kIOPMSetACAdaptorConnected (none) root:kIOPMEnableClamshell root:kIOPMClamshellOpened gpu:342000@1");
+  CHECK(e.gpuOwnSlot() && e.gpuWritten() == 342000 && !e.gpuHeld());
+  CHECK(e.tickMs(in) == 0);   // no 5 s tick for the GPU
+  // PianoThermal passive (the shell no longer reads the breadcrumb; even a stale one is ignored): Balanced clears our slot, Power
+  // Saver writes it again, never held.
+  in.thermal = Thermal::passive;
+  in.power = Power::external;
+  CHECK(run(e, in).find("gpu:0@1") != std::string::npos && !e.gpuHeld());
+  in.power = Power::battery;
+  CHECK(run(e, in).find("gpu:342000@1") != std::string::npos && !e.gpuHeld());
+  CHECK(e.tickMs(in) == 0);
+  // No put-back after a write, whatever the breadcrumb says.
+  Engine r(c);
+  Inputs ri = base();
+  ri.gpuClients = 4;
+  Actions a = r.step(ri, 0);
+  CHECK(str(a).find("gpu:342000@1") != std::string::npos);
+  CHECK(r.gpuDone(342000, Result::taken, Thermal::passive, kGpuClientPolicy).n == 0);
+  CHECK(r.gpuWritten() == 342000 && !r.gpuHeld());
+  // A PianoA830 with no slots property (or one slot): the shared slot and the old arbitration, param2 null.
+  for (uint32_t clients : {0u, 1u}) {
+    Engine o(c);
+    Inputs oi = base();
+    oi.gpuClients = clients;
+    CHECK(run(o, oi).find("gpu:342000") != std::string::npos);
+    CHECK(run(o, oi).find("@") == std::string::npos);
+    CHECK(!o.gpuOwnSlot() && o.tickMs(oi) == Engine::kTickMs);
+    oi.thermal = Thermal::passive;
+    CHECK(run(o, oi).find("gpu:") == std::string::npos && o.gpuHeld());
+  }
+  // PianoA830 published between the inputs (no service yet) and the call: the shell found the slots on the service it called and
+  // wrote client 1; from then on our own slot (no put-back now, no tick, client 1 for the next writes).
+  Engine m(c);
+  Inputs mi = base();
+  Actions first = m.step(mi, 0);
+  CHECK(str(first).find("gpu:342000") != std::string::npos && str(first).find("@") == std::string::npos);
+  CHECK(m.gpuDone(342000, Result::taken, Thermal::passive, kGpuClientPolicy).n == 0);
+  CHECK(m.gpuOwnSlot() && m.gpuWritten() == 342000 && !m.gpuHeld() && m.tickMs(mi) == 0);
+  mi.power = Power::external;
+  CHECK(str(m.step(mi, 0)).find("gpu:0@1") != std::string::npos);
+  // Seen once, for the boot: an input without the property later does not bring the shared path back.
+  Engine l(c);
+  Inputs li = base();
+  li.gpuClients = 4;
+  run(l, li);
+  li.gpuClients = 0;
+  li.power = Power::external;
+  CHECK(run(l, li).find("gpu:0@1") != std::string::npos && l.gpuOwnSlot());
+  // Seen before any write (PianoA830 published first, the shared path had held for PianoThermal): the hold is dropped.
+  Engine h(c);
+  Inputs hi = base();
+  hi.thermal = Thermal::passive;
+  CHECK(run(h, hi).find("gpu:") == std::string::npos && h.gpuHeld());
+  hi.gpuClients = 4;
+  CHECK(run(h, hi).find("gpu:342000@1") != std::string::npos && !h.gpuHeld());
+  // Not acting (level 1): the same decisions, the client named.
+  Config obs = c;
+  obs.act = false;
+  Engine ob(obs);
+  Inputs oi = base();
+  oi.gpuClients = 4;
+  CHECK(run(ob, oi).find("gpu:342000@1") != std::string::npos);
+}
+
+// The power profile reaching PianoThermal's CPU caps (docs/policy.md 5.2): what PianoPolicy sends, through PianoThermal's own
+// Governor.h (profilePower, the source the governor is handed), gives the battery caps exactly when PianoPolicy decided Power Saver
+// and the external-power caps exactly when it decided Balanced. PianoThermal measures the same ExternalConnected (unknown = battery).
+static void profileReachesThermal()
+{
+  static_assert(kThermalAuto == uint32_t(pianothermal::Profile::bySource) && kThermalSaver == uint32_t(pianothermal::Profile::saver),
+                "PianoPolicy's profile modes are PianoThermal's");
+  CHECK(pianothermal::profileValid(kThermalAuto) && pianothermal::profileValid(kThermalSaver));
+  const Power powers[] = {Power::unknown, Power::battery, Power::external};
+  for (int act = 0; act < 2; ++act)
+    for (Power start : powers)
+      for (Power power : powers)
+        for (int lpm0 = 0; lpm0 < 2; ++lpm0)
+          for (int lpm = 0; lpm < 2; ++lpm) {
+            Config c = actLid();
+            c.act = act;
+            Engine e(c);
+            uint32_t mode = kThermalAuto;   // PianoThermal's at boot
+            auto turn = [&](Power p, bool l) {
+              Inputs in = base();
+              in.power = p;
+              in.lpm = l;
+              const Actions a = e.step(in, 0);
+              for (unsigned i = 0; i < a.n; ++i)
+                if (a.a[i].kind == Kind::thermalProfile) {
+                  CHECK(pianothermal::profileValid(a.a[i].value));
+                  mode = a.a[i].value;
+                  e.profileDone(a.a[i].value, Result::taken);
+                }
+              const pianothermal::PowerSource measured = p == Power::external ? pianothermal::PowerSource::external
+                                                       : p == Power::battery ? pianothermal::PowerSource::battery
+                                                                             : pianothermal::PowerSource::unknown;
+              const pianothermal::PowerSource handed = pianothermal::profilePower(measured, pianothermal::Profile(mode));
+              const View v = view(c, in, true);
+              // PianoThermal's ceilings: external caps (Balanced) only for an external source; battery and unknown: Power Saver's.
+              CHECK((handed == pianothermal::PowerSource::external) == (v.profile == Profile::balanced));
+            };
+            turn(start, lpm0);
+            turn(power, lpm);
+          }
+  // Without PianoThermal's call (unsupported: piano-cpufreq < 2): never asked again, the caps by the power source.
+  Engine u(actLid());
+  Inputs in = base();
+  in.lpm = true;
+  in.power = Power::external;
+  Actions a = u.step(in, 0);
+  CHECK(str(a).find("profile:1") != std::string::npos);
+  u.profileDone(1, Result::unsupported);
+  in.lpm = false;
+  CHECK(str(u.step(in, 0)).find("profile:") == std::string::npos);
+  in.lpm = true;
+  CHECK(str(u.step(in, 0)).find("profile:") == std::string::npos);
+}
+
 static void observe()
 {
   // Level 1: the same decisions (the shell logs them as "would"), the power key always macOS's.
@@ -402,6 +532,8 @@ int main()
   profile();
   profileUnsupported();
   thermalSharedSlot();
+  ownGpuSlot();
+  profileReachesThermal();
   observe();
   parse();
   if (failures) {

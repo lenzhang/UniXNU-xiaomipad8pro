@@ -7,7 +7,7 @@
 // power (NativeGopDisplay), macOS Low Power Mode (machdep.piano_policy_lpm, which a userland agent mirrors), whether system sleep
 // exists (k27 0062: machdep.piano_sleep "on") with its wake mask, PianoThermal's protection state.
 // Outputs: IOPMrootDomain power notifications (the clamshell, clamshell sleep allowed or not, the AC adaptor), user-active
-// requests (display wake), sleep now (the power key), PianoThermal's profile, PianoA830's GPU ceiling.
+// requests (display wake), sleep now (the power key), PianoThermal's profile, PianoA830's GPU ceiling (client 1 of its slots).
 //
 // The rules (Ubuntu's, docs/ubuntu-history/device.md 2.2-2.3 and kernel.md 2.3/2.9, as behaviour):
 //   cover closed on battery          -> system sleep, only with system sleep on, the cover-open wake armed (piano-sleep-wake bit 2)
@@ -42,6 +42,12 @@ constexpr uint32_t kSleepNow = 1u << 0, kClamshellClosed = 1u << 4, kDisableClam
 
 // PianoThermal's profile call ("piano-thermal-profile", docs/policy.md 5.2): 0 by the power source (as today), 1 Power Saver.
 constexpr uint32_t kThermalAuto = 0, kThermalSaver = 1;
+// PianoA830's ceiling slots (docs/policy.md 5.3, package/PianoA830/board/PianoGpuCeiling.h): a PianoA830 that publishes
+// piano-gpu-ceiling-clients >= 2 keeps one slot per caller and runs the GPU at the lowest; the power profile's is client 1, so
+// PianoThermal's passive ceiling (client 0) stays in force whatever is written here: no breadcrumb read, no tick, no put-back.
+// Without the property (a PianoA830 from before the slots): the one shared slot and the interim arbitration (Engine::gpu).
+constexpr uint32_t kGpuClientShared = 0, kGpuClientPolicy = 1;
+inline bool gpuOwnSlot(uint32_t clients) { return clients >= 2; }
 // Thresholds of the power key (PianoInput measures the press).
 constexpr uint32_t kLongPressMs = 1500;
 
@@ -67,7 +73,8 @@ struct Inputs {
   bool lpm = false;              // machdep.piano_policy_lpm
   bool sleepOn = false;          // machdep.piano_sleep begins with "on" (k27 0062 and piano-sleep=1)
   uint32_t wakeMask = 0;         // its "wake mask"
-  Thermal thermal = Thermal::unknown;   // PianoThermal's piano_thermal_state (with thermalOwnsGpu)
+  Thermal thermal = Thermal::unknown;   // PianoThermal's piano_thermal_state (with thermalOwnsGpu, only while the slot is shared)
+  uint32_t gpuClients = 0;       // PianoA830's piano-gpu-ceiling-clients (0: no PianoA830 seen yet, or one without the slots)
 };
 
 // What one set of inputs means (no history but whether the cover was ever seen open).
@@ -123,14 +130,15 @@ struct Action {
   Kind kind;
   uint32_t value;      // root: the message; thermalProfile: the mode; gpuCeiling: kHz (0 clears); userActive: unused
   const char *why;
+  uint32_t client;     // gpuCeiling: PianoA830's slot (kGpuClientShared: param2 null, kGpuClientPolicy: its own)
 };
 struct Actions {
   static constexpr unsigned kMax = 8;
   Action a[kMax];
   unsigned n = 0;
-  void add(Kind k, uint32_t v, const char *why)
+  void add(Kind k, uint32_t v, const char *why, uint32_t client = kGpuClientShared)
   {
-    if (n < kMax) a[n++] = Action{k, v, why};
+    if (n < kMax) a[n++] = Action{k, v, why, client};
   }
 };
 
@@ -144,6 +152,8 @@ class Engine {
   bool seenOpen() const { return seenOpen_; }
   uint32_t gpuWritten() const { return gpuWritten_; }
   bool gpuHeld() const { return gpuHeld_; }
+  // PianoA830 keeps a slot for us (seen in an input or in the slot a write went to); once seen, for the rest of the boot.
+  bool gpuOwnSlot() const { return ownSlot_; }
   bool profileUnsupported() const { return profileUnsupported_; }
 
   // After any input change (and on the tick): brings what IOPMrootDomain, PianoThermal and PianoA830 were told in line with the
@@ -158,6 +168,7 @@ class Engine {
       screen_ = in.screen;
     }
     const View v = view(c_, in, seenOpen_);
+    if (pianopolicy::gpuOwnSlot(in.gpuClients)) ownSlotSeen();
     if (v.close != Close::none) {
       // The order matters: clamshell sleep refused before the AC adaptor appears (plug-in), the AC adaptor gone before clamshell
       // sleep is allowed (unplug: IOPMrootDomain re-evaluates the closed clamshell then and sleeps), both before the clamshell state.
@@ -202,13 +213,17 @@ class Engine {
     else if (r == Result::unsupported) profileUnsupported_ = true;
   }
 
-  // The shell's answer to a gpuCeiling action, with PianoThermal's state read right after the write: a passive trip that came
-  // between the read before the write and the write itself lost its ceiling to ours, so it is put back (a further action).
-  Actions gpuDone(uint32_t khz, Result r, Thermal after)
+  // The shell's answer to a gpuCeiling action: CLIENT the slot the write went to (the shell asks the very PianoA830 it calls for
+  // piano-gpu-ceiling-clients, so a PianoA830 published between the inputs and the call still gets client 1). In the shared slot,
+  // with PianoThermal's state read right after the write: a passive trip that came between the read before the write and the
+  // write itself lost its ceiling to ours, so it is put back (a further action). In our own slot nothing is ever put back.
+  Actions gpuDone(uint32_t khz, Result r, Thermal after, uint32_t client = kGpuClientShared)
   {
     Actions out;
     if (r != Result::taken) return out;
+    if (client == kGpuClientPolicy) ownSlotSeen();
     gpuWritten_ = khz;
+    if (ownSlot_) return out;
     if (c_.thermalOwnsGpu && after >= Thermal::passive && khz != c_.thermalGpuKhz) {
       out.add(Kind::gpuCeiling, c_.thermalGpuKhz, "PianoThermal went passive during the write: its ceiling put back");
       gpuHeld_ = true;
@@ -254,18 +269,33 @@ class Engine {
   // How often the shell must look again without an event, in ms (0: no tick): the display state while a keyboard wake could come
   // (NativeGopDisplay sends no message: the hold-off is timed from the turn that first saw the display off, so it is between
   // holdoffMs and holdoffMs + kTickMs), PianoThermal's state while a GPU ceiling of ours sits in the slot it shares (PianoThermal
-  // clears the slot when it leaves passive: ours is written again within kTickMs).
+  // clears the slot when it leaves passive: ours is written again within kTickMs). With our own slot the GPU needs no tick.
   static constexpr uint32_t kTickMs = 5000;
   uint32_t tickMs(const Inputs &in) const
   {
     if (c_.keyboard && in.attached && in.lid == Lid::open && in.screen != Screen::unknown) return kTickMs;
-    if (c_.profile && c_.thermalOwnsGpu && (gpuWritten_ || gpuHeld_)) return kTickMs;
+    if (c_.profile && c_.thermalOwnsGpu && !ownSlot_ && (gpuWritten_ || gpuHeld_)) return kTickMs;
     return 0;
   }
 
  private:
+  void ownSlotSeen()
+  {
+    if (ownSlot_) return;
+    ownSlot_ = true;
+    // Whatever the shared path had noted is not our slot's: PianoThermal's ceiling is in its own slot from now on, and ours is
+    // written afresh (nothing can have been written to a PianoA830 with slots through the shared path: it publishes the property
+    // before it registers its service).
+    gpuHeld_ = false;
+    gpuWritten_ = 0;
+  }
   void gpu(Actions &out, const Inputs &in, uint32_t want)
   {
+    if (ownSlot_) {
+      if (want != gpuWritten_)
+        out.add(Kind::gpuCeiling, want, want ? "Power Saver's GPU ceiling" : "Balanced: no GPU ceiling", kGpuClientPolicy);
+      return;
+    }
     if (c_.thermalOwnsGpu && in.thermal >= Thermal::passive) {
       gpuHeld_ = true;   // PianoThermal's ceiling is in the slot: never written over (nor cleared) while it holds it
       return;
@@ -284,6 +314,7 @@ class Engine {
   bool profileUnsupported_ = false;
   uint32_t gpuWritten_ = 0;                     // no ceiling at boot
   bool gpuHeld_ = false;
+  bool ownSlot_ = false;                        // PianoA830's slot 1 is ours (kGpuClientPolicy)
   Screen screen_ = Screen::unknown;
   uint64_t screenOffMs_ = 0;
   bool keyboardWoke_ = false;

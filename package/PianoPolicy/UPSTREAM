@@ -4,7 +4,8 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
   package/PianoKeyboard: its published properties (piano-keyboard-hall, -attached, -status, kIOMessageServicePropertyChange) and
     its piano-keyboard-lid mode (kIOPMDisableClamshell / kIOPMEnableClamshell, then kIOPMClamshellClosed / Opened), whose clamshell
     part this kext takes over. package/PianoThermal: its piano_thermal_state breadcrumb, readPowerSource (ExternalConnected) and
-    gpuCeiling (callPlatformFunction on the class's service). package/PianoA830: "piano-gpu-ceiling" (one slot, 0 clears).
+    gpuCeiling (callPlatformFunction on the class's service), Governor.h's Profile and profilePower (in the host test only).
+    package/PianoA830: "piano-gpu-ceiling" (0 clears) and its slots (board/PianoGpuCeiling.h, piano-gpu-ceiling-clients).
     package/NativeGopDisplay: piano-display-power. package/PianoBacklight: the service on IOPlatformExpertDevice with one thread
     woken by an IOLock event. patches/k27/0062: machdep.piano_sleep's format and the wake sources' rules.
 
