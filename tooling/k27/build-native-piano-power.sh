@@ -12,7 +12,9 @@ T=$D/out/native-kexts/PianoPower/host-tests; mkdir -p "$T"
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/PianoMca.c" -o "$T/PianoMca.o"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/power_host.cpp" "$T/PianoMca.o" -o "$T/power_host"
 "$T/power_host" || { echo "Error: PianoPower host tests failed" >&2; exit 1; }
-python3 "$D/tooling/k27/build-native-kext.py" PianoPower "$P/PianoPower.cpp" "$P/PianoAdsp.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/battery_host.cpp" -o "$T/battery_host"   # BatteryMap.h (piano-power-ps)
+"$T/battery_host" || { echo "Error: PianoPower battery host tests failed" >&2; exit 1; }
+python3 "$D/tooling/k27/build-native-kext.py" PianoPower "$P/PianoPower.cpp" "$P/PianoAdsp.cpp" "$P/PianoBattery.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
   "$P/PianoMca.c" "$P/PianoQrtr.c" "$P/PianoAdspFirmware.c" "$P/QcomSmem.c" "$P/QcomSmp2p.c" "$P/QcomGlink.c" "$P/QcomQmp.c" \
   "$P/QcomRpmh.c" "$P/QcomMdt.c" "$P/QcomQrtr.c" "$P/FatVolume.c" "$P/Sm8750Scm.c" \
   -I "$P" --obj "${K27_OBJ:-k27-native-obj}"

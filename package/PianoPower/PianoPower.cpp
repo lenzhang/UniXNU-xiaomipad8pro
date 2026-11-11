@@ -29,6 +29,7 @@
 #include "SpmiObserver.h"
 #include "ChargerPmic.h"
 #include "Gauge.h"
+#include "PianoBattery.h"
 extern "C" {
 #include "PianoAdsp.h"
 #include "PianoMca.h"
@@ -44,7 +45,7 @@ volatile int32_t piano_power_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, period, gauge, write, hv, unsuspend;
+  uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor;
 };
 Args gArgs;
 
@@ -65,6 +66,9 @@ void readArgs()
   gArgs.write = bootArg("piano-power-write", 1);
   gArgs.hv = bootArg("piano-power-hv", 0);
   gArgs.unsuspend = bootArg("piano-power-unsuspend", 0);
+  gArgs.ps = bootArg("piano-power-ps", 0);            // the battery for macOS (PianoBattery.cpp)
+  gArgs.psFloor = bootArg("piano-power-ps-floor", 0); // the lowest percentage shown on battery (BatteryMap.h)
+  if (gArgs.psFloor > 50) gArgs.psFloor = 50;
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -213,6 +217,7 @@ class PianoPower : public IOService {
   void logMcaEvents();
   void mcaLine(char *line, size_t size);
   void diagLine(char *line, size_t size);
+  void publishBattery(uint64_t t, const PortState *port);
   void run();
   static void thread(void *self, wait_result_t);
   static void channelState(void *context, int up);
@@ -244,6 +249,10 @@ bool PianoPower::start(IOService *provider)
          gArgs.write && gArgs.hv ? ", 9 V from a PD source's fixed PDO (piano-power-hv=1, then <= 1.6 A)" : "");
   if (gArgs.level >= 2 && gArgs.write && gArgs.unsuspend)
     note("piano-power-unsuspend=1: the input-suspend flag (0x2019) is written to 0 when it reads non-zero (never to 1)");
+  if (gArgs.ps)
+    note("piano-power-ps=1: the battery is published to macOS as AppleSmartBattery (IOPMPowerSource) from the gauges and the "
+         "Type-C state, refreshed every %u s%s%s", gArgs.period, gArgs.psFloor ? "; the percentage shown on battery stays at least " : "",
+         gArgs.psFloor ? "the floor (piano-power-ps-floor)" : "");
   setProperty("piano-power", gArgs.level, 32);
   fRingLock = IOSimpleLockAlloc();
   thread_t t = nullptr;
@@ -384,6 +393,22 @@ void PianoPower::diagLine(char *line, size_t size)
 #undef HAS
 }
 
+// piano-power-ps=1: the battery for macOS (PianoBattery.cpp), from this cycle's gauge and port readings; one line per cycle.
+void PianoPower::publishBattery(uint64_t t, const PortState *port)
+{
+  const BatteryValues v = mapBattery(fPack, 2, fBattery, port, gArgs.psFloor);
+  if (!v.known) {
+    note("[%llus] ps: no gauge reading: the power source is %s", t, pianoBatteryUpdate(this, v) ? "left as it was" : "not published yet");
+    return;
+  }
+  pianoBatteryUpdate(this, v);
+  note("[%llus] ps: %u %%%s, %s, %u mV, %d mA (instant %d), %u/%u mAh (design %u), %u cycles, time remaining %u min%s", t,
+       v.percent, v.clamped ? " (floor)" : "",
+       v.external ? (v.charging ? "on power, charging" : v.full ? "on power, full" : "on power, not charging") : "on battery",
+       v.voltageMv, v.amperageMa, v.instantMa, v.rawMah, v.fullMah, v.designMah, v.cycles, v.timeRemaining,
+       v.timeRemaining == kTimeUnknown ? " (unknown)" : "");
+}
+
 void PianoPower::report()
 {
   const uint64_t t = (nowMs() - fStartMs) / 1000;
@@ -400,8 +425,10 @@ void PianoPower::report()
     else
       note("[%llus] battery: no gauge answers (A: %s, B: %s)", t, i2cName(fPack[0].error), i2cName(fPack[1].error));
   }
-  if (fSpmi && fCharger.found) {
-    const PortState p = readPort(gIo, fCharger);
+  PortState p;
+  const bool havePort = fSpmi && fCharger.found;
+  if (havePort) {
+    p = readPort(gIo, fCharger);
     if (p.ok)
       note("[%llus] usb: %s%s, Rp bits %#x (%u mA, inferred), mode %#x | typec %02x %02x %02x %02x %02x %02x rt %#x | usbin %02x %02x "
            "%02x %02x %02x %02x %02x %02x rt %#x | dcdc %02x %02x %02x %02x %02x %02x %02x %02x rt %#x | chgr %02x %02x %02x %02x %02x "
@@ -415,6 +442,7 @@ void PianoPower::report()
     else
       note("[%llus] usb: Type-C status not readable", t);
   }
+  if (gArgs.ps) publishBattery(t, havePort && p.ok ? &p : nullptr);
   if (gArgs.level >= 2) {
     PianoAdspStatus s;
     piano_adsp_status(&s);

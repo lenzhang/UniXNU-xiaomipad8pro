@@ -328,6 +328,65 @@ Run G first and read its `diag:` lines; H only if G shows `input suspend (0x2019
 stock charger modules would name it exactly, but recovering IDs from those proprietary binaries is a vendor-binary derivation this
 repository does not do (§8). `0x2019` is the candidate those sources agree on, which is why it is the one opt-in write.
 
+## 5d. The battery for macOS (`piano-power-ps=1`)
+
+**What.** With `piano-power-ps=1` (off by default) PianoPower publishes the battery to macOS: an `IOPMPowerSource` subclass named
+`AppleSmartBattery` (`package/PianoPower/PianoBattery.cpp`), attached under PianoPower and refreshed on each report cycle
+(30 s) with `updateStatus()`. It works at level 1: it needs only the two gauges and the Type-C state, no DSP, and writes no
+hardware. The values (`BatteryMap.h`, host-tested in `tests/battery_host.cpp`):
+
+| Property | From |
+|---|---|
+| `BatteryInstalled` | a gauge reading |
+| `CurrentCapacity` / `MaxCapacity` | the packs' charge as a percentage (remaining over full, weighted) / 100, as on current Macs |
+| `AppleRawCurrentCapacity`, `AppleRawMaxCapacity`, `NominalChargeCapacity`, `DesignCapacity` | mAh, both packs summed (`DesignCapacity` from bq27z561 0x3c, else the full charge) |
+| `Voltage`, `Amperage`, `InstantAmperage` | mean pack voltage; summed average and instantaneous current, negative while discharging |
+| `Temperature` | the warmer pack, hundredths of a degree Celsius |
+| `CycleCount` | the higher pack's |
+| `ExternalConnected`, `ExternalChargeCapable` | a source's Rp on the Type-C port (else, without the port view, a charging battery) |
+| `IsCharging`, `FullyCharged` | on power and the packs take current / both report FC or 100 % |
+| `TimeRemaining`, `AvgTimeToEmpty`, `AvgTimeToFull` | minutes from the charge and the average current; 65535 when it cannot be computed |
+| `AdapterDetails` | Type-C family, 5 V, the Rp current (inferred), watts |
+| `AtWarnLevel`, `AtCriticalLevel` | always false |
+
+**How macOS finds it** (xnu source, `iokit/Kernel`): `IOPMrootDomain` and powerd look for services of class `IOPMPowerSource`;
+`updateStatus()` copies the values into the registry and sends `kIOPMMessageBatteryStatusHasChanged`. The class is named
+`AppleSmartBattery`, the name a Mac's battery service has, so a lookup by that name finds it as well; the vma2 kernel collection
+has no class of that name (checked: its strings name only `IOPMPowerSource` and `IOPMPowerSourceList`). The service is published
+only after the first gauge reading, with its values already in the registry, so macOS never sees an empty battery at boot.
+
+**Low charge.** Nothing here sets the warning or critical levels; macOS's warnings follow the percentage. The kernel's own
+low-battery sleep starts from `kIOPMPowerEmergency`, which only Apple's battery manager sends, and every system sleep request
+passes `checkSystemSleepEnabled()`, which refuses it while the ADT's `/defaults sleep-disabled` is 1 (`configs/k27-adt.toml`; it
+is 1 in every native image). So a low battery gives macOS's notices but no sleep attempt; sleep stays untested natively.
+`piano-power-ps-floor=N` (at most 50) shows at least N % while on battery, for a session where even the notices are unwanted;
+the console line marks a clamped value `(floor)`. The tablet itself still cuts off at the real empty point: watch the
+`battery:` line, not the menu bar, in long sessions.
+
+**Test image** (owner present or the installed config; in the main checkout):
+
+```sh
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300 \
+  PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-power=1 piano-power-ps=1" tooling/k27/build-native-image.sh
+tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
+grep -E 'PianoPower: (piano-power-ps|battery: AppleSmartBattery|\[[0-9]+s\] ps:)' logs/native-runs/<ts>-loop/xnu-console.txt
+```
+
+Expected lines (numbers from the level 1 measurement):
+
+```
+PianoPower: piano-power-ps=1: the battery is published to macOS as AppleSmartBattery (IOPMPowerSource) from the gauges and the Type-C state, refreshed every 30 s
+PianoPower: battery: AppleSmartBattery (IOPMPowerSource) published: 99 %, on power, not charging
+PianoPower: [0s] ps: 99 %, on power, not charging, 4479 mV, 0 mA (instant 0), 8522/8634 mAh (design ...), 114 cycles, time remaining 65535 min (unknown)
+PianoPower: [30s] ps: 99 %, ...
+```
+
+Visible result: the menu bar's battery item at the gauges' percentage with the plug symbol while the Mac's cable is in (and
+Control Centre's Battery entry); unplugged, the percentage with "Power Source: Battery" and a time estimate once the current is
+steady. `ioreg -rn AppleSmartBattery` (if a shell is available) lists the properties above. Built 2026-11-11 on main 7c04081:
+KC `dba24c1a1e8d814a…` (`11 native kexts linked, none from DroidVM`, PianoPower 719 pointers), image verify PASS (its own hash
+changes with every build: it carries the build time as `droidvm-utc`). Not booted.
+
 ## 6. Risks
 
 - **Level 2 can charge less than no driver.** Once the DSP runs, its firmware holds the input at 100 mA until the ICL write takes

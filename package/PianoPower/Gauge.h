@@ -11,7 +11,7 @@
 //
 // bq27z561 standard commands (TI datasheet, two bytes little endian, Smart Battery style): 0x06 Temperature (0.1 K), 0x08 Voltage (mV),
 // 0x0a BatteryStatus, 0x0c Current (mA, signed, + charging), 0x10 RemainingCapacity (mAh), 0x12 FullChargeCapacity (mAh), 0x14
-// AverageCurrent (mA), 0x2a CycleCount, 0x2c RelativeStateOfCharge (%). BatteryStatus bit 6 DSG (discharging), bit 5 FC (fully
+// AverageCurrent (mA), 0x2a CycleCount, 0x2c RelativeStateOfCharge (%), 0x3c DesignCapacity (mAh). BatteryStatus bit 6 DSG (discharging), bit 5 FC (fully
 // charged), bit 4 FD (fully discharged), bit 7 INIT.
 #ifndef PIANO_POWER_GAUGE_H
 #define PIANO_POWER_GAUGE_H
@@ -165,7 +165,7 @@ class I2cBus {
 constexpr uint8_t kGaugeAddress = 0x55;
 enum GaugeCommand : uint8_t {
   kGaugeTemperature = 0x06, kGaugeVoltage = 0x08, kGaugeStatus = 0x0a, kGaugeCurrent = 0x0c, kGaugeRemaining = 0x10,
-  kGaugeFull = 0x12, kGaugeAverageCurrent = 0x14, kGaugeCycles = 0x2a, kGaugeSoc = 0x2c,
+  kGaugeFull = 0x12, kGaugeAverageCurrent = 0x14, kGaugeCycles = 0x2a, kGaugeSoc = 0x2c, kGaugeDesign = 0x3c,
 };
 constexpr uint16_t kGaugeDsg = 1u << 6, kGaugeFc = 1u << 5, kGaugeFd = 1u << 4, kGaugeInit = 1u << 7;
 
@@ -174,6 +174,7 @@ struct GaugeReading {
   I2cResult error = I2cResult::ok;
   uint8_t failedCommand = 0;
   int voltageMv = 0, currentMa = 0, averageMa = 0, socPct = 0, remainingMah = 0, fullMah = 0, cycles = 0;
+  int designMah = 0;      // 0 when the gauge did not answer it (read on its own: it never invalidates the reading)
   int tempDeciC = 0;      // tenths of a degree Celsius
   uint16_t status = 0;
 };
@@ -202,6 +203,8 @@ inline GaugeReading readGauge(I2cBus &bus)
   g.tempDeciC = int(v[6]) - 2732;
   g.status = v[7];
   g.cycles = v[8];
+  uint16_t design = 0;
+  if (bus.readWord(kGaugeAddress, kGaugeDesign, &design) == I2cResult::ok && design && design != 0xffff) g.designMah = design;
   // A reading no battery can have means the transaction went wrong somewhere (a stuck line reads as 0xffff).
   g.ok = g.voltageMv >= 2500 && g.voltageMv <= 5000 && g.socPct <= 100 && g.tempDeciC > -400 && g.tempDeciC < 900;
   if (!g.ok) g.failedCommand = 0xff;
