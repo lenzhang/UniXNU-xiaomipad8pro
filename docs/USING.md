@@ -44,16 +44,22 @@ tooling/k27/build-native-image.sh            # with PIANO_* variables, see docs/
 tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
 ```
 
-Data caution: a RAM image whose Data seed differs from the installed ESP's seed must not run with `data-persist=2`, or the
-installed Data store is started over (see `docs/persistent-boot.md`; a guard in NativeRamBlock is being added). Tests of a new seed
-use `PIANO_DATA_PERSIST=0`.
+Data caution (`docs/data-store.md`): set `PIANO_INSTALLED_SEED` in `~/.config/piano/env` once (the installed seed is
+`aced5bf9794b42f3c8ffeeef3078a408ff506f5b0b374e02eed6f0ab56e52616`). Then a RAM image whose Data seed is not the installed one
+gets `data-persist=0` by default (Data volatile, the store untouched), and `build-ram-images.py` says so on stderr. A kernel
+collection built from this tree also has the store guard: with `PIANO_DATA_PERSIST=2` and another seed it keeps the installed
+store and runs Data volatile ("kept"). Images built before the guard still start another seed's store over, so never boot one with
+`data-persist=2` and a new seed. After the store is flattened, every `data-persist=2` image resumes the owner's Data, whatever its seed.
 
 ## 5. Update the installed ESP
 
 1. Build and test the change as a RAM image (§4).
 2. Build the ESP from the same inputs: `python3 tooling/persist/build-esp.py --profile daily --kc ... --adt ... --trust ... --seed ...
    --default macos --name esp-daily-macos --out out/persistent` (rebuild just before installing: the clock starts from the build time
-   until the RTC is in the profile, `docs/drivers/rtc.md`).
+   until the RTC is in the profile, `docs/drivers/rtc.md`). A seed other than the installed one does not carry the owner's Data
+   over: build-esp.py prints a loud note, refuses it with a collection that has no store guard, and `--replace-data` is the
+   explicit "start Data over". The way to change the seed without losing Data is a flatten first (`docs/data-store.md` §4, T4);
+   build-esp.py also warns when the new trust cache lacks CDHashes of the installed one.
 3. Tablet to ABL fastboot (§3), then from the persist worktree (steps before options):
    `python3 tooling/persist/maint-session.py maint-boot map backup esp-final check maint-exit --esp esp-daily-macos.img --esp-final esp-daily-macos.img`
    then `abl-final reboot`. Every write is preceded by a verified NAS backup and followed by a SHA-256 read-back.

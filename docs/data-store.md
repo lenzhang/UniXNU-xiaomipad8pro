@@ -1,8 +1,8 @@
 # The Data store: format, the store guard, flatten, plugin staging
 
-Status 2026-11-11: **built and host-tested offline; nothing of it has run on the tablet.** The installed ESP (`esp-gpu-macos`, and
-`esp-daily-macos` when it is installed) still has the kernel collection from before this change: it has no store guard and no
-flatten. The guard protects the owner's store from RAM images built with the new collection; section 7 is the test procedure.
+Status 2026-11-11: **built and host-tested offline; nothing of it has run on the tablet.** The installed ESP (`esp-daily-macos`,
+docs/USING.md §2; before it `esp-gpu-macos`, the same seed `aced5bf9…`) still has the kernel collection from before this change:
+it has no store guard and no flatten. The guard protects the owner's store from RAM images built with the new collection; section 7 is the test procedure.
 
 The installed system's Data volume is `package/NativeRamBlock`: a RAM **seed** (the payload's `scratch-data.img`) plus a persistent
 **store** of the pages the system changed, in a window at the end of `linux_rootfs` served by `package/NativeUfs`
@@ -202,8 +202,10 @@ checkout's `out/persistent/`:
 grep -q PIANO_INSTALLED_SEED ~/.config/piano/env || \
   echo 'PIANO_INSTALLED_SEED=aced5bf9794b42f3c8ffeeef3078a408ff506f5b0b374e02eed6f0ab56e52616' >> ~/.config/piano/env
 PIANO_A830_METAL=0 tooling/k27/build-native-image.sh       # the collection with the guard, out/ram-dump (about 8 min)
-python3 tooling/persist/store-test-images.py --installed-esp <persist checkout>/out/persistent/esp-gpu-macos.img
+python3 tooling/persist/store-test-images.py --installed-esp <persist checkout>/out/persistent/esp-daily-macos.img
 ```
+
+(`esp-gpu-macos.img` if that is the one installed; both have seed `aced5bf9`, and the tool prints the seed it found.)
 
 The tablet waits in ABL fastboot (from macOS: power + volume-down, 15-20 s). Each run: `tooling/native/native-loop.sh IMAGE`,
 then `grep NativeRamBlock logs/native-runs/<time>-loop/xnu-console.txt`.
@@ -247,7 +249,7 @@ before.
 cheap insurance: `maint-session.py` has no standalone step for it yet.
 
 ```sh
-python3 tooling/persist/store-test-images.py --installed-esp <…>/esp-gpu-macos.img --flatten
+python3 tooling/persist/store-test-images.py --installed-esp <…>/esp-daily-macos.img --flatten
 tooling/native/native-loop.sh out/ram-store-flatten/boot-piano-macos-ram-A-bundled.img
 ```
 
