@@ -69,7 +69,8 @@ channels 3/4 off (else "someone else drives this module"). Found lit → turned 
 
 **From macOS (chosen: the least invasive, nothing else changes).** `setProperties` accepts `piano-torch-set` (mA, 0 = off, or a
 boolean) and `piano-torch-seconds` from an administrator only (`IOUserClient::clientHasPrivilege`, as PianoBacklight). The tool
-`tooling/native/piano-torch/piano-torch.c` (IOKit.framework, built on the Mac like `pianousb-shell`): `sudo piano-torch on [MA [S]]`,
+`tooling/native/piano-torch/piano-torch.c` (IOKit.framework, built on the Mac like `pianousb-shell`; installed as
+`/usr/local/bin/piano-torch` by `configs/userland.toml`, `docs/userland.md`): `sudo piano-torch on [MA [S]]`,
 `off`, `toggle`, `status`; exit 0 when the state after the request is the one asked for. Usable from the root shell over USB too.
 
 **From other drivers**: `callPlatformFunction` `PianoTorchSet` (mA, seconds, caller), `PianoTorchToggle` (caller),

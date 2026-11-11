@@ -317,7 +317,9 @@ the magnetometer has no macOS consumer, the rear light/flicker sensor (`ambient_
 
 ### 5a.8 Test plan (attended RAM boots, the GPU profile so WindowServer runs; nothing needs the sensors until R3)
 
-Staging (the A830 path's seed plus the agent; `PIANO_SEED`/`PIANO_TRUST` make build-native-image.sh take it):
+Staging (the A830 path's seed plus the agent; `PIANO_SEED`/`PIANO_TRUST` make build-native-image.sh take it). The userland
+pipeline (`configs/userland.toml`, `tooling/userland/stage.py`, `docs/userland.md`) installs the same agent with the rest; the
+recipe below stages it alone, with the log loop:
 ```sh
 tooling/metal/build-turnip-a830.sh && printf 'sysmem\n' > out/turnip-a830/tu-debug
 R=$(tooling/k27/build-piano-rotated.sh); A=private/var/piano/rotated

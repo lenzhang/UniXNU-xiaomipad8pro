@@ -176,10 +176,11 @@ tooling/native/usb-console.py --port 1               # the user shell (below)
 screen /dev/cu.usbmodem<…> 115200                    # any terminal works too (DTR on open starts the stream)
 ```
 
-User shell (development tablets only: an unauthenticated root shell): build `tooling/native/pianousb-shell/pianousb-shell.c`
-on the Mac (`clang -O2 -o pianousb-shell pianousb-shell.c`, ad-hoc signed), put it at `/usr/local/libexec/pianousb-shell`
-and `com.unixnu.pianousb-shell.plist` in `/Library/LaunchDaemons` of the root image, boot with `piano-usb-shell=1`. Without
-the helper, `/dev/pianousb` still carries anything a LaunchDaemon writes to it (e.g. `log stream --style compact`).
+User shell (development tablets only: an unauthenticated root shell): `tooling/native/pianousb-shell/pianousb-shell.c`, ad-hoc
+signed, at `/usr/local/libexec/pianousb-shell` with `com.unixnu.pianousb-shell.plist` in `/Library/LaunchDaemons` (on Data);
+`configs/userland.toml` builds and installs both (`docs/userland.md`). Boot with `piano-usb-shell=1`: without it the helper exits
+at once with status 0 and launchd leaves it stopped. Without the helper, `/dev/pianousb` still carries anything a LaunchDaemon
+writes to it (e.g. `log stream --style compact`).
 
 ## 7. Build, kernel collection, RAM image
 

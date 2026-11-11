@@ -117,12 +117,10 @@ require the password immediately). `piano-backlight-lid=1` (PianoBacklight) cuts
 - **The agent** (`tooling/native/piano-policy-agent/piano-policy-agent.sh`, root): one `notifyutil -w` on
   `com.apple.system.lowpowermode` and `com.apple.system.powermanagement.clamshellstate`; LPM → `sysctl -w machdep.piano_policy_lpm`;
   closed without sleep (root domain's `AppleClamshellCausesSleep` No) → `pmset displaysleepnow`. Stock tools, no polling.
-  Installed into the Data seed by `tooling/k27/stage-soft-metal.py` (with the A830 staging's other arguments; a new seed identity,
-  `docs/data-store.md`), or started by hand from the USB root shell with the same `launchctl submit`:
-  ```sh
-  --file tooling/native/piano-policy-agent/piano-policy-agent.sh:private/var/piano/piano-policy-agent.sh
-  --boot-run "launchctl submit -l com.unixnu.piano-policy-agent -- /bin/sh /private/var/piano/piano-policy-agent.sh"
-  ```
+  Installed by the userland pipeline (`configs/userland.toml`, `docs/userland.md`): `/usr/local/libexec/piano-policy-agent` and
+  the LaunchDaemon `com.unixnu.piano-policy-agent.plist`, on in the installed profile, through the Data seed's boot job (a new
+  seed identity, `docs/data-store.md`) or a live update. By hand from the USB root shell:
+  `launchctl submit -l com.unixnu.piano-policy-agent -- /bin/sh <the script>`.
 - Nothing to power: no power-tree membership; across a suspend the thread is frozen with the rest (contract, `power.md` §4).
 
 ## 5. What the other drivers must add (their owners; nothing here changes their packages)
@@ -203,8 +201,10 @@ sudo pmset -c sleep 0 displaysleep 10
 ```
 (no hibernation natively; plugged in never sleeps, as stock and Ubuntu). powerd picks the Battery or AC set from PianoPower's
 `ExternalConnected` (`piano-power-ps=1`). The lock: System Settings › Lock Screen › require the password immediately after the display
-turns off. In the daily profile, both through the seed's boot job (`--boot-run "pmset -b sleep 5 displaysleep 2 hibernatemode 0
-standby 0 powernap 0 tcpkeepalive 0"`, `--boot-run "pmset -c sleep 0 displaysleep 10"`), only once `power.md` §6 S1-S4 passed.
+turns off. Installed as the one-shot LaunchDaemon `piano-pmset-defaults` (`docs/userland.md` §6): each power source's timers
+set once, unless the owner set that source's timers first. The sleep timer stays inert until the profile has `piano-sleep=1`
+(the ADT keeps sleep-disabled), which waits for `power.md` §6 S1-S4. Only display sleep acts before that, and its native wake is
+`userland.md`'s test U10.
 
 ## 8. Lines
 
@@ -288,4 +288,5 @@ before `sleep`.
 
 `package/PianoPolicy/` (`PianoPolicy.cpp`, `Policy.h`, `tests/policy_host.cpp`, `README.md`, `UPSTREAM`, `LICENSE`),
 `tooling/k27/build-native-piano-policy.sh`, `tooling/k27/kext/PianoPolicy.json`, `configs/k27-native-kexts.txt`,
-`tooling/k27/build-policy-test-images.sh`, `tooling/native/piano-policy-agent/piano-policy-agent.sh`.
+`tooling/k27/build-policy-test-images.sh`, `tooling/native/piano-policy-agent/piano-policy-agent.sh` and its
+`com.unixnu.piano-policy-agent.plist` (installed by `configs/userland.toml`).

@@ -13,6 +13,7 @@ repository's root on the Mac the tablet is cabled to (USB-C). `~/.config/piano/e
 | UniXNU payload: kernel collection, ADT, trust cache, Data seed, boot arguments | ESP, LUN 0 partition 37 | `build-esp.py` + `maint-session.py esp-final` |
 | macOS root (OS + SystemOS) | windows in `linux_rootfs` | not by the daily tools |
 | Data (user changes) | the store window at the end of `linux_rootfs` over the ESP's seed | macOS itself |
+| Our userland (agents, the USB root shell, tools, the pmset defaults) | Data: `/usr/local/{bin,libexec}`, `/Library/Launch{Daemons,Agents}` | `configs/userland.toml`: the seed's boot job or a live update (`docs/userland.md`) |
 
 Power on: ABL → UEFI → UniXNU (menu timeout 0) → macOS, about 2.5 minutes to the login screen (`docs/boot-time.md`).
 A `fastboot boot` RAM image always wins over the installed copy (`firmware/patches/unixnu/0001`), which is how every test runs.
