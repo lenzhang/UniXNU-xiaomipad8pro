@@ -15,6 +15,7 @@
 //   static pianobacklight::KeyWatch gBrightnessKeys;
 //   if (pianobacklight::keysEnabled()) pianobacklight::step(gBrightnessKeys.consumer(usage), "the cover");     // report 6
 //   if (pianobacklight::keysEnabled()) pianobacklight::step(gBrightnessKeys.keyboard(report9), "the cover");  // report 5
+// (report9: the keyboard report as the cover sent it, before PianoKeyboard's Fn-row filter turns Right Ctrl + 1 into F1)
 #ifndef PIANO_BACKLIGHT_CLIENT_H
 #define PIANO_BACKLIGHT_CLIENT_H
 #include <stdint.h>
