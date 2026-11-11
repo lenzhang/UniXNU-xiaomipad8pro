@@ -7,6 +7,9 @@ Battery (2026-11-11, not run yet): the poll adapts, 10 ms while a key is down or
 piano-input-idle ms otherwise (default 40; 0: the old 10 ms); presses of 82 ms or more are still caught (Buttons.h PollPlan,
 host-tested). Stage 3 also logs the PON and GPIO6 interrupt registers once, read only. Every minute: `PianoInput: idle: N
 wakeups in 60 s, irq 0 (...)`. The PMIC-arbiter interrupt path (SPI 746 through the PDC) is described in docs/power-irq.md 2.4.
+2026-11-12 (opt-in, host-tested, not run): `piano-input-dark=MS` (at most 200) stretches the idle period while the display is off
+(NativeGopDisplay's `piano-display-power`, followed through its messages); a press of MS + 42 ms is always caught then, a shorter
+tap can fall between two samples (buttons_host `testDarkPolling`), hence 0 by default until short presses in the dark are tested.
 
 Power key and system sleep (2026-11-11, host-tested, not run; docs/policy.md 5.1, docs/power.md 4). With a PianoPolicy service
 there (`piano-policy=N`), the power key is held back (`PowerKey.h`): a press still down after 1.5 s is a long press, the HID Power

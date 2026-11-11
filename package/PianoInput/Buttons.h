@@ -78,5 +78,18 @@ struct PollPlan {
   bool fast(uint64_t nowMs) const { return backoff.tier(nowMs) == 0; }
 };
 
+// The idle period while the display is off (piano-input-dark=MS, 2026-11-12; 0, the default: as lit; docs/power.md "Idle wakeups
+// by driver"): only the idle period stretches (a busy key keeps kPollMs), at most kIdlePollMaxMs (setPowerState's park waits 500 ms
+// for the thread). A press must then be seen by one sample and held kDebounceMs: one shorter than about the period plus the debounce
+// can be missed in the dark (the shortest always reported is checked on the host: buttons_host testDarkPolling), so opt-in until a
+// test of short presses on the tablet.
+inline uint32_t clampDark(uint32_t ms) { return ms > kIdlePollMaxMs ? kIdlePollMaxMs : ms; }
+inline uint32_t darkPeriod(uint32_t period, bool dark, uint32_t darkMs)
+{
+  if (!dark || period <= kPollMs) return period;
+  const uint32_t d = clampDark(darkMs);
+  return d > period ? d : period;
+}
+
 }  // namespace pianoinput
 #endif

@@ -156,7 +156,7 @@ struct PressRun {
   uint64_t reportedAfter = 0;
   unsigned samples = 0, idleSecondSamples = 0;
 };
-static PressRun runPress(uint32_t idleMs, uint64_t start, uint64_t length, uint8_t key = kKeyVolumeUp)
+static PressRun runPress(uint32_t idleMs, uint64_t start, uint64_t length, uint8_t key = kKeyVolumeUp, uint32_t darkMs = 0)
 {
   PollPlan plan(idleMs);
   Debounce d;
@@ -171,9 +171,29 @@ static PressRun runPress(uint32_t idleMs, uint64_t start, uint64_t length, uint8
       r.reportedAfter = t - start;
     }
     if (r.reported && !(down & key)) r.released = true;
-    t += plan.next(d, t);
+    t += darkPeriod(plan.next(d, t), darkMs != 0, darkMs);
   }
   return r;
+}
+
+// piano-input-dark=MS: the display-off idle period; nothing changes lit or with 0; a busy key keeps 10 ms; capped at 200 ms; a press
+// of the period plus the debounce plus a fast poll is always reported (every phase), with about 1000/MS samples an idle second.
+static void testDarkPolling()
+{
+  CHECK(darkPeriod(kIdlePollMs, false, 100) == kIdlePollMs && darkPeriod(kIdlePollMs, true, 0) == kIdlePollMs);
+  CHECK(darkPeriod(kPollMs, true, 100) == kPollMs && darkPeriod(kIdlePollMs, true, 100) == 100);
+  CHECK(darkPeriod(kIdlePollMs, true, 20) == kIdlePollMs && darkPeriod(kIdlePollMs, true, 5000) == kIdlePollMaxMs);
+  for (uint32_t dark : {100u, 200u})
+    for (uint64_t phase = 0; phase < dark; phase += 7) {
+      const uint64_t shortest = dark + kDebounceMs + kPollMs;
+      const PressRun r = runPress(kIdlePollMs, 10000 + phase, shortest, kKeyPower, dark);
+      CHECK(r.reported && r.released && r.reportedAfter <= dark + kDebounceMs + kPollMs);
+      CHECK(r.idleSecondSamples >= 1000 / dark - 1 && r.idleSecondSamples <= 1000 / dark + 1);
+    }
+  // A tap shorter than the period can fall between two samples in the dark (lit at 40 ms it is reported): why it is opt-in.
+  bool missed = false;
+  for (uint64_t phase = 0; phase < 100 && !missed; ++phase) missed = !runPress(kIdlePollMs, 10000 + phase, 60, kKeyPower, 100).reported;
+  CHECK(missed);
 }
 
 static void testAdaptivePolling()
@@ -404,6 +424,7 @@ static void testDescriptor()
 
 int main()
 {
+  testDarkPolling();
   testSpmi();
   testDecode();
   testDebounce();

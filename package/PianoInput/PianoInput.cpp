@@ -15,6 +15,8 @@
 //   piano-input=2        the same, and log every key edge and report
 //   piano-input-mask=N   the keys reported to macOS (bit 0 power, bit 1 vol+, bit 2 vol-; default 7); masked keys are still logged
 //   piano-input-idle=MS  the poll period while no key is busy (default 40; 0: every 10 ms always, as before; at most 200)
+//   piano-input-dark=MS  the idle period while the display is off (NativeGopDisplay's piano-display-power, followed through its
+//                        messages; default 0: as lit; at most 200): opt-in until short presses in the dark are tested (Buttons.h)
 //   piano-wake-log=S     the "idle: N wakeups" line every S seconds (default 60, 0 none; shared with the other converted drivers)
 // The power key with PianoPolicy (docs/policy.md 5.1, PowerKey.h): while a PianoPolicy service is there (piano-policy=N), a press is
 // not reported at once: still down after 1.5 s it is a long press (the HID Power usage down then, up at the release); released
@@ -45,6 +47,7 @@
 #include "HidReports.h"
 #include "PowerKey.h"
 #include <PianoPowerContract.h>
+#include <PianoDisplayFollow.h>
 
 using namespace pianoinput;
 
@@ -59,8 +62,10 @@ struct Args {
   uint32_t level;   // piano-input
   uint32_t mask;    // piano-input-mask
   uint32_t idle;    // piano-input-idle
+  uint32_t dark;    // piano-input-dark
 };
 Args gArgs;
+pianodisplay::Follow gDisplay;   // with piano-input-dark only
 
 uint32_t bootArg(const char *name, uint32_t fallback)
 {
@@ -74,6 +79,7 @@ void readArgs()
   gArgs.level = bootArg("piano-input", 0);
   gArgs.mask = bootArg("piano-input-mask", kKeysAll) & kKeysAll;
   gArgs.idle = PollPlan::clampIdle(bootArg("piano-input-idle", kIdlePollMs));
+  gArgs.dark = clampDark(bootArg("piano-input-dark", 0));
 }
 
 // Explicit ldr/str, as PianoDwc3 does: every store from a general register.
@@ -222,6 +228,8 @@ bool PianoInput::start(IOService *provider)
     setProperty("piano-input-stage", uint64_t(uint32_t(piano_input_stage)), 32);
     return true;   // stays attached and does nothing more
   }
+  if (gArgs.dark > gArgs.idle && gDisplay.start(nullptr, nullptr))
+    note("piano-input-dark=%u: every %u ms while idle with the display off (NativeGopDisplay's messages)", gArgs.dark, gArgs.dark);
   stage(5, "poll thread");
   fStartMs = nowMs();
   fLock = IOLockAlloc();
@@ -405,7 +413,7 @@ void PianoInput::pollThread(void *self, wait_result_t)
       input->describe(elapsed / 1000);
       nextDescribe = nextDescribe < 60000 ? 60000 : nextDescribe + 300000;
     }
-    const uint32_t period = plan.next(input->fFilter, now);
+    const uint32_t period = darkPeriod(plan.next(input->fFilter, now), gArgs.dark > gArgs.idle && gDisplay.dark(), gArgs.dark);
     pianoirq::WakeStats::Window w;
     if (wakes.due(now, &w)) {
       note("idle: %u wakeups in %u s, irq 0 (polled: %u at %u ms while a key was busy, %u at %u ms idle)", w.wakeups, w.seconds, fastWakes,
