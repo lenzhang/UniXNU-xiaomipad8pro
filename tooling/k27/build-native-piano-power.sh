@@ -10,6 +10,7 @@ set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd)
 P=$D/package/PianoPower
 T=$D/out/native-kexts/PianoPower/host-tests; mkdir -p "$T"
+"$D/package/include/tests/run.sh"   # PianoScmLock.h: the secure-call lock around every SCM request and PAS sequence (docs/scm-lock.md)
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/PianoMca.c" -o "$T/PianoMca.o"
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/QcomQrtr.c" -o "$T/QcomQrtr.o"   # the QMI helpers Servreg.h uses
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$D/package/include" -c "$P/QrtrPorts.c" -o "$T/QrtrPorts.o"
@@ -33,3 +34,8 @@ python3 "$D/tooling/k27/build-native-kext.py" PianoPower "$P/PianoPower.cpp" "$P
   "$P/PianoMca.c" "$P/PianoQrtr.c" "$P/PianoAdspFirmware.c" "$P/QcomSmem.c" "$P/QcomSmp2p.c" "$P/QcomGlink.c" "$P/QcomQmp.c" \
   "$P/QcomRpmh.c" "$P/QcomMdt.c" "$P/QcomQrtr.c" "$P/QrtrPorts.c" "$P/FatVolume.c" "$P/Sm8750Scm.c" \
   -I "$P" --obj "${K27_OBJ:-k27-native-obj}"
+# The imports the KC resolves from the libraries PianoPower.json names: NativeUfs's partition reads, PianoA830's DRV-2 and secure-call
+# lock words (package/include/PianoScmLock.h, docs/scm-lock.md); anything else the kernel must define.
+KERNEL=${K27_KERNEL:-${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}/out/k27/kernel-k27-0059-native.macho}
+[ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$D/out/native-kexts/PianoPower/objects.json" "$KERNEL" \
+  --library-prefix _native_ufs_part_ --library-prefix _sm8750_rpmh_drv2_owner --library-prefix _sm8750_scm_owner | cut -c1-160 >&2

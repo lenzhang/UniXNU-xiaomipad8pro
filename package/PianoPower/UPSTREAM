@@ -32,7 +32,9 @@ porting.toml), package/:
       The segments are stored with aligned 8-byte stores (no memcpy/bzero) into a mapping limited to the image's span, after a
       read/write-back probe of the carveout; piano-power-map and piano-power-load-first choose the mapping type and the order. The
       rail votes hold PianoA830's DRV-2 owner word (sm8750_rpmh_drv2_owner, its documented protocol: compare-exchange 0 for our
-      tag, 10 us between tries, at most 2 s), imported by name because PianoA830 links before PianoPower.
+      tag, 10 us between tries, at most 2 s), imported by name because PianoA830 links before PianoPower. Every secure call and
+      each image's PAS sequence also hold PianoA830's secure-call lock word (sm8750_scm_owner, package/include/PianoScmLock.h,
+      docs/scm-lock.md), imported the same way.
     AdspFirmware.c (ced26abf9e7ae3033dceaa1d39ccbf85e73abc636aac41aa7e3d3b2741e67a7c) -> PianoAdspFirmware.c: the headers from
       NAME.mdt when there is no NAME.b00 (piano's modem_a), piece 0 read from that file; names piano_fw_*; strong imports of
       NativeUfs's native_ufs_part_find/native_ufs_part_read (package/NativeUfs exports them).

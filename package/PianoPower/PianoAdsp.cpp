@@ -41,6 +41,8 @@
 #include <sys/errno.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
+#define PIANO_SCM_LOCK_KERNEL 1
+#include <PianoScmLock.h>
 extern "C" {
 #include "QcomGlink.h"
 #include "QcomMdt.h"
@@ -465,8 +467,12 @@ Sm8750Scm gScm;
 IOLock *gScmLock;
 uint64_t nowUs(void *) {uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000;}
 void sleepUs(void *, uint32_t us) {if (us >= 1000) IOSleep(us / 1000); else IODelay(us);}
-void scmLock(void *) {IOLockLock(gScmLock);}
-void scmUnlock(void *) {IOLockUnlock(gScmLock);}
+// The kernel-wide secure-call lock (package/include/PianoScmLock.h, docs/scm-lock.md): PianoA830's word, imported (PianoPower.json
+// names PianoA830 as a library). Taken after our own SCM mutex around every yielding request, and once around each image's PAS
+// sequence (startImage), so no other kext's secure call runs between init_image and auth_and_reset.
+PIANO_SCM_KERNEL_LOCK(gScmShared, PianoScmTagPower, "PianoPower");
+void scmLock(void *) {IOLockLock(gScmLock); piano_scm_kernel_take(&gScmShared);}
+void scmUnlock(void *) {piano_scm_kernel_give(&gScmShared); IOLockUnlock(gScmLock);}
 const Sm8750ScmOps gScmOps = {nullptr, Sm8750ScmSmcInstruction, nowUs, sleepUs, scmLock, scmUnlock, nullptr, nullptr};
 // A secure call with a line before it (and a moment for the console) and one after it: a call the secure world does not return from
 // leaves the first line last in the log.
@@ -614,8 +620,8 @@ int loadSegments(Image &image, uint64_t base, uint64_t size) {
 }
 
 // One image: metadata, init_image, mem_setup (relocatable images), segments, auth_and_reset, each its own step (firstStep .. +4).
-// Returns 0 when started, 1 when piano-power-stop ended it, negative on a failure.
-int startImage(Image &image, const char *name, uint32_t pas, uint64_t base, uint64_t size, int firstStep) {
+// Returns 0 when started, 1 when piano-power-stop ended it, negative on a failure. startImage holds the secure-call lock across it.
+int startImageHeld(Image &image, const char *name, uint32_t pas, uint64_t base, uint64_t size, int firstStep) {
     char what[64];
     uint64_t phys = 0;
     int rc;
@@ -652,6 +658,12 @@ int startImage(Image &image, const char *name, uint32_t pas, uint64_t base, uint
     if (!secure(what, [&](Sm8750SmcResult *r) {return Sm8750ScmPasAuthAndReset(&gScm, pas, r);})) return -3;
     stage(firstStep + 4);
     return 0;
+}
+int startImage(Image &image, const char *name, uint32_t pas, uint64_t base, uint64_t size, int firstStep) {
+    piano_scm_kernel_take(&gScmShared);
+    const int rc = startImageHeld(image, name, pas, base, size, firstStep);
+    piano_scm_kernel_give(&gScmShared);
+    return rc;
 }
 
 // ---- events ----
