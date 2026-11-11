@@ -148,6 +148,144 @@ int main(int argc, char **argv)
         const unsigned submitted = submissions() - submittedBefore, imported = successes(16) - importsBefore;
         CHECK(submitted >= 3, "the kernel saw %u submissions for 3 command buffers", submitted);
         CHECK(imported >= 1, "the kernel saw no IOSurface import (BoImport)");
+
+        // 4. What a desktop session asks for beyond the login screen (2026-11-11), through the same layers: a heap and resources placed
+        //    in it, a 4x MSAA pass resolved into a texture, a concurrent compute encoder (Core ML, MPSGraph), a shared event signalled by
+        //    a command buffer, and IOSurface churn: panel-sized surfaces (3200x2136 BGRA, 26 MiB each) made, rendered into and released
+        //    one after another, as WindowServer and the apps' windows do, more of them than the client window holds at once. Every
+        //    import must be released with its surface: the kernel's live objects after the churn are those before it.
+        const char *slotText = getenv("HOSTSIM_SLOT");
+        const bool renderServer = !slotText || !strtoul(slotText, nullptr, 0);
+        MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+        hd.size = 16 << 20;
+        hd.storageMode = MTLStorageModePrivate;
+        id<MTLHeap> heap = [device newHeapWithDescriptor:hd];
+        CHECK(heap, "a 16 MiB private heap");
+        MTLTextureDescriptor *htd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:256 height:256
+                                                                                   mipmapped:NO];
+        htd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        htd.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> heapTexture = heap ? [heap newTextureWithDescriptor:htd] : nil;
+        id<MTLBuffer> heapBuffer = heap ? [heap newBufferWithLength:65536 options:MTLResourceStorageModePrivate] : nil;
+        CHECK(heapTexture && heapBuffer, "a texture and a buffer in the heap");
+        if (heapTexture && heapBuffer) {
+            MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = heapTexture;
+            pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            cb = [queue commandBuffer];
+            id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:pass];
+            [re useHeap:heap];
+            [re endEncoding];
+            id<MTLBlitCommandEncoder> hbe = [cb blitCommandEncoder];
+            [hbe fillBuffer:heapBuffer range:NSMakeRange(0, heapBuffer.length) value:1];
+            [hbe endEncoding];
+            finish(cb, "a render pass and a fill on heap resources");
+        }
+        if ([device supportsTextureSampleCount:4]) {
+            MTLRenderPipelineDescriptor *rd4 = [rd copy];
+            rd4.rasterSampleCount = 4;
+            id<MTLRenderPipelineState> render4 = [device newRenderPipelineStateWithDescriptor:rd4 error:&error];
+            CHECK(render4, "4x MSAA render pipeline: %s", error.localizedDescription.UTF8String ?: "");
+            MTLTextureDescriptor *md = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:256 height:256
+                                                                                      mipmapped:NO];
+            md.textureType = MTLTextureType2DMultisample;
+            md.sampleCount = 4;
+            md.usage = MTLTextureUsageRenderTarget;
+            md.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> msaa = [device newTextureWithDescriptor:md];
+            id<MTLTexture> resolved = [device newTextureWithDescriptor:td];
+            CHECK(msaa && resolved, "a 4x MSAA target and its resolve texture");
+            if (render4 && msaa && resolved) {
+                static const float positions[3][2] = {{-1, -1}, {1, -1}, {0, 1}};
+                static const float colors[3][4] = {{1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}};
+                MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                pass.colorAttachments[0].texture = msaa;
+                pass.colorAttachments[0].resolveTexture = resolved;
+                pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+                pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+                cb = [queue commandBuffer];
+                id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:pass];
+                [re setRenderPipelineState:render4];
+                [re setVertexBytes:positions length:sizeof positions atIndex:0];
+                [re setVertexBytes:colors length:sizeof colors atIndex:1];
+                [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                [re endEncoding];
+                finish(cb, "a 4x MSAA pass resolved");
+            }
+        } else
+            printf("note: the device reports no 4x MSAA\n");
+        cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> concurrent = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        CHECK(concurrent, "a concurrent compute encoder (run serially by the frontend)");
+        if (concurrent) {
+            [concurrent setComputePipelineState:compute];
+            [concurrent setBuffer:input offset:0 atIndex:0];
+            [concurrent setBuffer:output offset:0 atIndex:1];
+            [concurrent setBytes:&scale length:4 atIndex:2];
+            [concurrent dispatchThreads:MTLSizeMake(in.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [concurrent memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [concurrent dispatchThreads:MTLSizeMake(in.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [concurrent endEncoding];
+            finish(cb, "a concurrent compute encoder");
+        }
+        id<MTLSharedEvent> event = [device newSharedEvent];
+        CHECK(event, "a shared event");
+        if (event) {
+            cb = [queue commandBuffer];
+            [cb encodeSignalEvent:event value:7];
+            finish(cb, "a command buffer that signals a shared event");
+            if (event.signaledValue != 7)
+                printf("note: the shared event reads %llu after its command buffer completed (the software CP executes nothing)\n",
+                       (unsigned long long)event.signaledValue);
+        }
+        auto liveObjects = (Counter)dlsym(RTLD_DEFAULT, "host_gpu_live_objects");
+        const unsigned importsBeforeChurn = successes(16), liveBeforeChurn = liveObjects ? liveObjects() : 0;
+        const unsigned churn = 24;
+        unsigned churned = 0;
+        for (unsigned i = 0; i < churn; ++i) {
+            @autoreleasepool {
+                NSDictionary *big = @{(id)kIOSurfaceWidth: @3200, (id)kIOSurfaceHeight: @2136, (id)kIOSurfaceBytesPerElement: @4,
+                                      (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA')};
+                IOSurfaceRef frame = IOSurfaceCreate((__bridge CFDictionaryRef)big);
+                MTLTextureDescriptor *fd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:3200
+                                                                                            height:2136 mipmapped:NO];
+                fd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                fd.storageMode = MTLStorageModeShared;
+                id<MTLTexture> frameTexture = frame ? [device newTextureWithDescriptor:fd iosurface:frame plane:0] : nil;
+                if (frameTexture) {
+                    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                    pass.colorAttachments[0].texture = frameTexture;
+                    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+                    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    id<MTLCommandBuffer> fcb = [queue commandBuffer];
+                    [[fcb renderCommandEncoderWithDescriptor:pass] endEncoding];
+                    if (finish(fcb, "a pass into a 3200x2136 IOSurface"))
+                        ++churned;
+                }
+                frameTexture = nil;
+                if (frame)
+                    CFRelease(frame);
+            }
+        }
+        const unsigned churnImports = successes(16) - importsBeforeChurn, liveAfterChurn = liveObjects ? liveObjects() : 0;
+        CHECK(churned == churn, "%u of %u panel-sized IOSurfaces rendered into", churned, churn);
+        CHECK(churnImports >= churn, "the kernel saw %u imports for %u surfaces", churnImports, churn);
+        CHECK(!liveObjects || liveAfterChurn <= liveBeforeChurn + 2, "kernel objects live %u before the churn, %u after it: imports leak",
+              liveBeforeChurn, liveAfterChurn);
+        // A large texture in the render server's window: 8192x4096 RGBA8 (128 MiB). One kernel BO holds at most 256 MiB
+        // (NativeAdrenoAbiMaxBoBytesShift; Turnip does not take Query's max_bo_bytes as its allocation limit), so an 8192x8192 RGBA8
+        // texture, 256 MiB plus its layout's padding, is refused by BoAlloc (kIOReturnBadArgument) and the frontend answers nil.
+        if (renderServer) {
+            MTLTextureDescriptor *large = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8192
+                                                                                            height:4096 mipmapped:NO];
+            large.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+            large.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> largeTexture = [device newTextureWithDescriptor:large];
+            CHECK(largeTexture, "an 8192x4096 texture (128 MiB) in the render server's window");
+        }
+        printf("desktop: heap, 4x MSAA, concurrent compute, shared event, %u panel-sized IOSurface imports (live objects %u -> %u)%s\n",
+               churnImports, liveBeforeChurn, liveAfterChurn, renderServer ? ", an 8192x4096 texture" : "");
         for (auto &m : gMissing)
             printf("missing selector: %s\n", m.c_str());
         if (surface)
@@ -157,7 +295,8 @@ int main(int argc, char **argv)
             return 1;
         }
         printf("PASS: the plugin's frontend and bridge on Turnip (ABI v2): AIR compute and render pipelines, compute, render into an "
-               "IOSurface, blit; %u kernel submissions, %u IOSurface import(s); nothing executed (software CP)\n", submitted, imported);
+               "IOSurface, blit; heap, 4x MSAA, concurrent compute, shared event, %u panel-sized IOSurfaces churned; %u kernel submissions, "
+               "%u IOSurface import(s) before the desktop part; nothing executed (software CP)\n", churnImports, submitted, imported);
         return 0;
     }
 }

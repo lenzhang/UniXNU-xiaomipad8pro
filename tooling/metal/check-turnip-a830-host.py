@@ -25,6 +25,12 @@ Runs, each must pass:
        exactly at the test's "peer.forced" requirement (the 257th free did not wait), which is checked as such.
   3. plugin_smoke (tests/hostsim/plugin_smoke.cpp over AdrenoMetal's NativeTurnipSmoke.h): a fill, a compute pipeline and a render
      pass built (ir3 compiles them for the A830), submitted and retired. Skipped with --no-plugin-smoke or without glslangValidator.
+  4. plugin_host (tooling/metal/turnip-a830/plugin_host.mm): the staged plugin executable itself, frontend and bridge on this Turnip:
+     AIR pipelines, compute, a render into an IOSurface, a blit, then a desktop session's extras (a heap, 4x MSAA, a concurrent compute
+     encoder, a shared event, 24 panel-sized IOSurfaces churned with no import left behind, an 8192x4096 texture); with 16 KiB and
+     4 KiB pages, and in a small slot's window (HOSTSIM_SLOT=4).
+  5. abort_reporter (tooling/metal/turnip-a830/reporter_host.mm): the plugin's abort reporter on abort(), an uncaught exception and a
+     bad access: the process dies with the same signal and says why on stderr first.
 Sources are read from ADRENO830_TREE, ADRENOMETAL_TREE and the kits below, never changed; everything built goes to
 out/turnip-a830/hostsim."""
 import argparse
@@ -241,8 +247,31 @@ def main():
             device = next((l for l in lines if l.startswith('device: ')), 'no device')
             verdict = next((l for l in lines if l.startswith(('PASS', 'FAILED', 'FAIL'))), 'no verdict')
             return result.returncode == 0 and verdict.startswith('PASS'), f'{device}; {verdict}'
-        for label, extra in [('plugin_host-16k', {}), ('plugin_host-4k', {'HOSTSIM_PAGE_SIZE': '4096'})]:
+        # -slot4: the same as a process in a small slot (HOSTSIM_SLOT=4, the hostsim's 124 MiB app window, smaller than piano's 448 MiB
+        # ones): the panel-sized IOSurface churn then needs every import's GPU range back before the next one.
+        for label, extra in [('plugin_host-16k', {}), ('plugin_host-4k', {'HOSTSIM_PAGE_SIZE': '4096'}),
+                             ('plugin_host-slot4', {'HOSTSIM_PAGE_SIZE': '4096', 'HOSTSIM_SLOT': '4'})]:
             check(label, [host, executable, library, cache], extra, plugin_host_verdict)
+
+        # 5. The plugin's abort reporter (tooling/metal/turnip-a830/abort_reporter.mm): a process with it dies as it would have (the same
+        #    signal) and says why on stderr first: the reason, the crash-reporter message, the stack.
+        reporter_source = D / 'tooling/metal/turnip-a830/reporter_host.mm'
+        if (D / 'tooling/metal/turnip-a830/abort_reporter.mm').is_file() and reporter_source.is_file():
+            reporter = out / 'reporter_host'
+            if stale(reporter, reporter_source):
+                run(['xcrun', 'clang++', *ARCH, '-fobjc-arc', '-std=c++17', '-O1', '-x', 'objective-c++', reporter_source, '-o', reporter,
+                     '-framework', 'Foundation'])
+            import signal
+            for mode, number, wanted in [('abort', signal.SIGABRT, 'crash message (reporter_host): reporter check'),
+                                         ('exception', signal.SIGABRT, 'an uncaught exception'),
+                                         ('fault', signal.SIGSEGV, 'SIGSEGV')]:
+                def reporter_verdict(result, number=number, wanted=wanted):
+                    lines = result.stderr.splitlines()
+                    died = result.returncode in (-number, -signal.SIGBUS) if number == signal.SIGSEGV else result.returncode == -number
+                    ok = died and any('abort reporter installed' in l for l in lines) and any(wanted in l for l in lines) and \
+                        any(': #0 ' in l for l in lines)
+                    return ok, f'exit {result.returncode}; ' + '; '.join(l.split(': ', 2)[-1] for l in lines if wanted in l)[:150]
+                check(f'abort_reporter-{mode}', [reporter, executable, mode], {'PIANO_METAL_REPORT': '2'}, reporter_verdict)
     else:
         print(f'SKIP plugin_host: no {executable}')
 

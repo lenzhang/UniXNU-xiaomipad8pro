@@ -68,15 +68,20 @@ if [ "$A830_METAL" = 1 ]; then
   tooling/metal/build-turnip-a830.sh > out/k27/build-turnip-a830.log 2>&1 \
     || { grep -E "error|FAILED|^no |not ABI" out/k27/build-turnip-a830.log | head; exit 1; }
   A830_TU_DEBUG=${PIANO_A830_TU_DEBUG-sysmem}
+  # PIANO_A830_LOG=PREDICATE: the seed's boot job also prints the os_log errors and faults of the processes PREDICATE names
+  # (stage-soft-metal.py --log-errors, as PIANO_SOFT_METAL_LOG): a WindowServer, Dock or Finder that aborts after the login says why
+  # there (SkyLight, Core Animation, Metal), not on stderr. Off by default; a changed predicate is a new seed.
   STAMP=$( { shasum -a 256 out/inputs/scratch-data.img out/inputs/kernel.macho.trustcache tooling/k27/stage-soft-metal.py
-             find out/turnip-a830/NativeAdrenoMetal.bundle -type f | sort | xargs shasum -a 256; echo "tu-debug $A830_TU_DEBUG"; } | shasum -a 256 | cut -c1-16)
+             find out/turnip-a830/NativeAdrenoMetal.bundle -type f | sort | xargs shasum -a 256; echo "tu-debug $A830_TU_DEBUG"
+             if [ -n "${PIANO_A830_LOG:-}" ]; then echo "log $PIANO_A830_LOG"; fi; } | shasum -a 256 | cut -c1-16)
   if [ "$(cat out/turnip-a830/stage/stamp 2>/dev/null)" != "$STAMP" ] || [ ! -f out/turnip-a830/stage/scratch-data.img ]; then
     FILES=()
     if [ -n "$A830_TU_DEBUG" ]; then
       printf '%s\n' "$A830_TU_DEBUG" > out/turnip-a830/tu-debug
       FILES=(--file out/turnip-a830/tu-debug:private/var/ngpu/debug/tu-debug)
     fi
-    python3 tooling/k27/stage-soft-metal.py --out out/turnip-a830/stage ${FILES[@]+"${FILES[@]}"} out/turnip-a830/NativeAdrenoMetal.bundle \
+    python3 tooling/k27/stage-soft-metal.py --out out/turnip-a830/stage ${PIANO_A830_LOG:+--log-errors "$PIANO_A830_LOG"} \
+      ${FILES[@]+"${FILES[@]}"} out/turnip-a830/NativeAdrenoMetal.bundle \
       > out/k27/stage-turnip-a830.log 2>&1 || { tail -5 out/k27/stage-turnip-a830.log; exit 1; }
     echo "$STAMP" > out/turnip-a830/stage/stamp
   fi

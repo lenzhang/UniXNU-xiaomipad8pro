@@ -22,6 +22,8 @@ Frontend (MIT): UniXNU-turnip drivers/AdrenoMetal (NativeMetal fb063de per the V
   0001-frontend-console-rate-limit-serial-concurrent-compute.patch (2026-11-11, MIT as the file: NBLOG's stderr copy rate-limited per
   call site, "no device answer" to the unified log only, a concurrent compute encoder run serially instead of refused). With it the
   plugin executable is linked here (objects without objc_msgSend selector stubs, so the link is reproducible), not taken from the VM.
+Abort reporter (ours, BSD-2-Clause-Patent): tooling/metal/turnip-a830/abort_reporter.mm, linked into the plugin as a third object; it is
+  this repository's package/NativeSoftMetal/NativeSoftMetalPlugin.mm reporter (2026-11-11) with chaining to the process's own handlers.
 Bridge (GPL-2.0-or-later OR LGPL-3.0-or-later): macOS-DroidVM out/metal/bridge/libnative_metal_bridge.a
   (sha256 81d46fae51eea467eac152cbc7817658986c9d7bb25ae54fa40cba0c3b516d4d), built on the private build host by macOS-DroidVM
   scripts/build-metal-bridge-macos.py: UniXNU drivers/NativeMetal/bridge/NativeMetalBridge.rs over https://github.com/steelbrain/metal2vulkan
@@ -32,4 +34,4 @@ Tools: UniXNU-turnip scripts/macho-weak-self-binds.py (binds Mesa's weak entry p
 Host check (check-turnip-a830-host.py, MIT inputs): Adreno830 tests/hostsim and the kernel core it builds, https://github.com/UniXNU/AdrenoMetal
   NativeTurnipSmoke.h and shaders/smoke_*, https://github.com/UniXNU/ArmSmmu4K e923329e74f18b11e63c155e470c970ebad3b6e2 and
   https://github.com/UniXNU/AdrenoPM4 282606b528b2595bc4274ea7490b62b323f35a5f (GitHub archives into out/turnip-a830/kits).
-  tooling/metal/turnip-a830/plugin_host.mm is ours (BSD-2-Clause-Patent, as the plugin).
+  tooling/metal/turnip-a830/plugin_host.mm and reporter_host.mm are ours (BSD-2-Clause-Patent, as the plugin).

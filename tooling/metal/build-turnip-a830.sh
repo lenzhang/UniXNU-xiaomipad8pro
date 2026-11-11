@@ -134,7 +134,7 @@ fi
 
 # 5. The plugin, as the VM's build-metal-plugin-piano.sh makes it: its plugin and patched frontend over the prebuilt bridge, then this
 #    repository's frontend patches (tooling/metal/turnip-a830/frontend/*.patch, applied in order after piano-frontend-patch.py).
-#    With frontend patches the objects are compiled without objc_msgSend selector stubs (-fno-objc-msgsend-selector-stubs): ld 27106.1
+#    With frontend patches or the abort reporter the objects are compiled without objc_msgSend selector stubs (-fno-objc-msgsend-selector-stubs): ld 27106.1
 #    (ld-1267) lays the linker-made __objc_stubs out in a different order from link to link (2 outcomes in 8 links of the same
 #    objects, -reproducible or not), and without them ten links in a row were byte for byte the same. The calls are the classic
 #    objc_msgSend ones.
@@ -146,10 +146,10 @@ FRONTEND_PATCHES=()
 for p in "$P"/frontend/*.patch; do [ -f "$p" ] && FRONTEND_PATCHES+=("$p"); done
 CXX=(xcrun clang++ -target arm64e-apple-macos14.0 -isysroot "$SDK" -fobjc-arc -O2 -std=c++17 -Wno-deprecated-declarations -c
      -x objective-c++ -I "$U")
-if [ ${#FRONTEND_PATCHES[@]} -gt 0 ]; then CXX+=(-fno-objc-msgsend-selector-stubs); fi
+if [ ${#FRONTEND_PATCHES[@]} -gt 0 ] || [ -f "$P/abort_reporter.mm" ]; then CXX+=(-fno-objc-msgsend-selector-stubs); fi
 # A change of the compile flags recompiles both objects.
 printf '%s\n' "${CXX[@]}" > "$O/plugin/flags.new"
-if ! cmp -s "$O/plugin/flags.new" "$O/plugin/flags"; then rm -f "$O/plugin/plugin.o" "$O/plugin/frontend.o"; mv "$O/plugin/flags.new" "$O/plugin/flags"
+if ! cmp -s "$O/plugin/flags.new" "$O/plugin/flags"; then rm -f "$O/plugin/plugin.o" "$O/plugin/frontend.o" "$O/plugin/reporter.o"; mv "$O/plugin/flags.new" "$O/plugin/flags"
 else rm -f "$O/plugin/flags.new"; fi
 if stale "$O/plugin/plugin.o" "$K/overlay/metal/NativeAdrenoMetalPlugin.mm" "$U/NativeBridgeMetalFrontend.h"; then
   "${CXX[@]}" "$K/overlay/metal/NativeAdrenoMetalPlugin.mm" -o "$O/plugin/plugin.o"
@@ -162,18 +162,29 @@ put "$O/plugin/frontend.mm.new" "$O/plugin/frontend.mm"; rm -f "$O/plugin/fronte
 if stale "$O/plugin/frontend.o" "$O/plugin/frontend.mm" "$U/NativeBridgeMetalFrontend.h" "$U/bridge/NativeMetalObjects.h"; then
   "${CXX[@]}" "$O/plugin/frontend.mm" -o "$O/plugin/frontend.o"
 fi
+# The abort reporter (tooling/metal/turnip-a830/abort_reporter.mm, ours: NativeSoftMetal's in the desktop's Metal clients) as a third
+# object, when present; with it the plugin is always linked here.
+EXTRA_OBJECTS=()
+if [ -f "$P/abort_reporter.mm" ]; then
+  if stale "$O/plugin/reporter.o" "$P/abort_reporter.mm"; then "${CXX[@]}" "$P/abort_reporter.mm" -o "$O/plugin/reporter.o"; fi
+  EXTRA_OBJECTS=("$O/plugin/reporter.o")
+else
+  rm -f "$O/plugin/reporter.o"
+fi
 EXE=$O/plugin/NativeAdrenoMetal
 # ld 27106.1 does not link this reproducibly (two links of the same objects differ in __objc_stubs, 2026-11-11). When both objects
 # are byte for byte the VM's and the bridge is the pinned one, the VM's linked executable is taken: the plugin then is exactly the
 # one WindowServer ran in the VM (its CDHash already in the VM-era trust cache). PIANO_A830_RELINK=1 links anyway.
 VMP=$K/out/metal/plugin
-if [ "${PIANO_A830_RELINK:-0}" != 1 ] && cmp -s "$O/plugin/plugin.o" "$VMP/plugin.o" && cmp -s "$O/plugin/frontend.o" "$VMP/frontend.o" &&
+if [ "${PIANO_A830_RELINK:-0}" != 1 ] && [ ${#EXTRA_OBJECTS[@]} = 0 ] && cmp -s "$O/plugin/plugin.o" "$VMP/plugin.o" &&
+   cmp -s "$O/plugin/frontend.o" "$VMP/frontend.o" &&
    [ "$(sha "$BRIDGE")" = "$BRIDGE_PIN" ] && [ -f "$VMP/NativeAdrenoMetal.bundle/Contents/MacOS/NativeAdrenoMetal" ]; then
   put "$VMP/NativeAdrenoMetal.bundle/Contents/MacOS/NativeAdrenoMetal" "$EXE"
   PLUGIN_FROM="the VM's linked executable (plugin.o, frontend.o and the bridge byte-identical to its inputs)"
-elif stale "$EXE" "$O/plugin/plugin.o" "$O/plugin/frontend.o" "$BRIDGE" || [ "${PIANO_A830_RELINK:-0}" = 1 ]; then
+elif stale "$EXE" "$O/plugin/plugin.o" "$O/plugin/frontend.o" "$BRIDGE" ${EXTRA_OBJECTS[@]+"${EXTRA_OBJECTS[@]}"} ||
+     [ "${PIANO_A830_RELINK:-0}" = 1 ]; then
   xcrun ld -arch arm64e -platform_version macos 14.0 27.2 -syslibroot "$SDK" -F "$K/overlay/metal/frameworks" \
-    -bundle -dead_strip -o "$EXE" "$O/plugin/plugin.o" "$O/plugin/frontend.o" "$BRIDGE" \
+    -bundle -dead_strip -o "$EXE" "$O/plugin/plugin.o" "$O/plugin/frontend.o" ${EXTRA_OBJECTS[@]+"${EXTRA_OBJECTS[@]}"} "$BRIDGE" \
     -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation -framework IOGPU \
     -lobjc -lc++ -lSystem -liconv 2>&1 | { grep -v "was built for newer" || true; }
   PLUGIN_FROM="linked here"
