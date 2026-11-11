@@ -1,6 +1,9 @@
 # UFS: NativeUfs (ShengUfs lineage) for qcom,sm8750-ufshc
 
-Status: design, 2026-11-10. Nothing built or run. Template: `README.md`.
+Status: §1-§11 are the design as written on 2026-11-10; since 2026-11-11 NativeUfs is the root disk of native macOS (the
+windows on `linux_rootfs`, the Data store's window: [`../data-store.md`](../data-store.md)). §12, the power side (system sleep and
+auto-hibernate), 2026-11-11: **built, host-tested, linked into a KC; not run on the tablet**; off unless its boot argument is set.
+Template: `README.md`.
 
 ## 1. Purpose and gate
 
@@ -9,8 +12,8 @@ that native sessions stop depending on the RAM seed. Gates **M3** (plan §5). Un
 seed, and UFS is probed read-only.
 
 Scope: adopt the link that UEFI left up (no PHY/clock cold init), single-doorbell transfer requests, LUN 0 only for
-writes, named windows inside our own partitions. Out of scope: ICE/inline crypto, MCQ, runtime power management
-(hibern8 entry, clock gating), writes outside the Data window.
+writes, named windows inside our own partitions. Out of scope: ICE/inline crypto, MCQ, clock gating, writes outside the
+Data window. Hibern8 for a system sleep and the controller's auto-hibernate: §12 (opt-in).
 
 ## 2. Hardware facts
 
@@ -153,3 +156,196 @@ publish; the RAM root keeps booting.
 `ufs-qcom.c`/`ufshcd.c` (GPL-2.0) are read as the specification only; the UFSHCI register layout is the JEDEC
 standard. ShengUfs and the Odin3 fork are reused under their own licences (check `LICENSE` in each repo before
 copying). No Linux code is copied.
+
+## 12. Power: system sleep (`native-ufs-suspend=1`) and auto-hibernate (`native-ufs-ahit=MS`)
+
+Status 2026-11-11: **built, host-tested, linked into a KC with the k27 0063 kernel; not run on the tablet.** Both are off by default:
+without them NativeUfs is not in the power tree, never holds its queue and AHIT stays 0, as before. The contract this implements:
+[`../power.md`](../power.md) §4 and `package/include/PianoPowerContract.h`. Code: `package/NativeUfs/RootPower.h` (the sequence,
+shared with the host harness), `NativeUfs.cpp` (the power-tree join, `setPowerState`, the exports), `RootQueue.h`
+(`hostLinkCommand` also takes DME_HIBERNATE_ENTER), `RootCommands.h` (the hold in `hostSlotTake`), `package/NativeRamBlock/PowerHold.h`
+(the Data disk's part). Facts are marked as in `../power.md` (**verified**; **spec**: UFSHCI as JEDEC JESD223 describes it and Linux
+`ufshcd.c` / `ufs-qcom.c` read as the specification only, nothing copied; **inferred**; **needs-boot**).
+
+### 12.1 Facts
+
+| Fact | State | Source |
+|---|---|---|
+| CAP `d5c7031f`: UFSHCI 4.0 (VER `400`), bit 23 AUTOH8 set (the controller has auto-hibernate), 32 transfer slots, MCQ capable (bit 30), legacy doorbell available (bit 29 clear) | verified | `NativeUfs: HC cap=` on every boot of 2026-11-10/11 |
+| UEFI hands over with AHIT 0 and the link in Hibern8 (TX lane 0 FSM 1); RootQueue.h's DME_HIBERNATE_EXIT brings it to 5 on every boot. UEFI's driver entered Hibern8 itself: the enter and the exit both work on this link and device | verified (exit), inferred (enter) | `LINK tx=1->5 ... ahitBefore=0`; [`../bringup-debugging.md`](../bringup-debugging.md) |
+| GCC as UEFI leaves it: UFS_PHY GDSC `fa22f800` (on), AXI `08000001`, AHB `88000003` (hardware-gated), aggre AXI `08000001` | verified | `NativeUfs: GCC gdsc=` |
+| AHIT (0x18): bits 9:0 the idle timer, 12:10 its scale (0 1 µs, 1 10 µs, 2 100 µs, 3 1 ms, 4 10 ms, 5 100 ms); 0 turns auto-hibernate off | spec | UFSHCI; `ufshcd.c` (`UFSHCI_AHIBERN8_*`) |
+| With AHIT set the controller enters Hibern8 by itself when the timer runs out with no transfer, task or UIC command outstanding, and leaves it for the next doorbell. With AHIT 0 a link in Hibern8 stays there until DME_HIBERNATE_EXIT: a doorbell then never completes | spec | UFSHCI |
+| Linux's default with AUTOH8: 150 ms (`ufshcd_init`), so Ubuntu on this tablet most likely runs with auto-hibernate on (with MCQ, and with ufshcd's error handler behind it: host reset and link start-up) | spec; inferred for Ubuntu | `ufshcd.c` |
+| DME_HIBERNATE_ENTER (0x17) / EXIT (0x18): UCCS (IS bit 10) with UCMDARG2[7:0] = 0, then UHES (IS bit 6) / UHXS (bit 5), and HCS.UPMCRS (bits 10:8) = 1 PWR_LOCAL; Linux requires exactly PWR_LOCAL of both and waits 500 ms (`ufshcd_uic_pwr_ctrl`, `uic_cmd_timeout`) | spec | `ufshcd.c` |
+| Linux enters Hibern8 only with its queue quiesced (system suspend after the SCSI layer's SYNCHRONIZE CACHE; clock gating when idle) | spec | `ufshcd.c` `__ufshcd_wl_suspend`, `ufshcd_link_state_transition` |
+| MPHY TX_FSM_STATE (attribute 0x41, TX lane 0) = 1: the lane is in HIBERN8; ufs-qcom checks exactly this of a hibernated link | spec | `ufs-qcom.c` `ufs_qcom_check_hibern8` |
+| Before any driver's off, IOPMrootDomain syncs the file systems (`disk_sync_callout` → `sync_internal`) and suspends the user tasks (`tasks_system_suspend`, then `vm_pageout_wait` up to 10 s): little I/O is left to meet the hold | verified | k27 `IOPMrootDomain.cpp` |
+| Children in the power tree go to off before their parent and come back after it (the parent's will-change notifies the children and waits for them; the did-change of a power rise notifies them after the parent's `setPowerState`); siblings run in parallel | verified | k27 `IOServicePM.cpp` (`notifyRootDomain`, `notifyChildren`) |
+| `setPowerState` returning an error is treated as an acknowledgement (`(result == IOPMAckImplied) \|\| (result < 0)`): a driver cannot cancel a system sleep that way, and k27 0062 has no driver veto (its only abort is a CPU that does not park) | verified | k27 `IOServicePM.cpp` `driverSetPowerState`; `patches/k27/0062-*` |
+
+### 12.2 What NativeUfs holds, and what stays on (the votes are UEFI's)
+
+NativeUfs holds **no** clock, GDSC, regulator, RPMh or interconnect vote: it never writes GCC, TCSR, the QMP PHY or the PMIC
+(`GccUfs.h`: read-only probes; it has no RPMh client). Everything below is as UEFI's UFS driver left it and stays so through a
+sleep, with or without `native-ufs-suspend`:
+
+| Resource | What | State natively |
+|---|---|---|
+| GCC branches | `GCC_UFS_PHY_AXI` 0x77018, `_AHB` 0x77028, `_TX_SYMBOL_0` 0x7702c, `_RX_SYMBOL_0` 0x77030, `_UNIPRO_CORE` 0x7706c, `_ICE_CORE` 0x7707c, `_PHY_AUX` 0x770bc, `_RX_SYMBOL_1` 0x770d8, `GCC_AGGRE_UFS_PHY_AXI` 0x770f0 | enabled (the line at the join and at each suspend prints them) |
+| GDSCs | `GCC_UFS_PHY_GDSC` 0x77004, `GCC_UFS_MEM_PHY_GDSC` 0x9e000 | on |
+| Reference clocks | the device's `ref_clk` (RPMh `LN_BB_CLK3`), the PHY's ref (RPMh CXO), qref (`TCSR_UFS_CLKREF_EN`) | whatever UEFI requested (RPMh votes of its own session, or none) |
+| Supplies | vcc `vreg_l17b_2p5`, vccq `vreg_l1d_1p2`, PHY `vreg_l1j_0p91` / `vreg_l3g_1p2` | as UEFI set them |
+| Interconnect | `ufs-ddr`, `cpu-ufs` BCM votes | none from NativeUfs; UEFI's, if it made any |
+
+Consequence (**inferred**): Ubuntu found UFS clocks that never reached a zero reference "ultimately blocking CXO shutdown"
+(`../ubuntu-history/kernel.md` §2.1); natively every one of them stays enabled, so CXO shutdown (aosd), and possibly CX collapse,
+stay out of reach whatever NativeUfs does with the link. Hibern8 saves the link's own power (both M-PHY ends idle, the device's
+link layer down) and is the precondition of any gating. Not done here, each a later, separately gated step with its facts
+qualified first: the GCC branches and the GDSC gated with the link in Hibern8 (Linux: `ufshcd_setup_clocks` off, ufs-qcom's lane
+and device ref clock control), the PHY powered down (only with the link off), the device in UFS-Sleep (START STOP UNIT power
+condition 2 to the device well-known LU) with vcc off. Those would be the first writes NativeUfs ever makes to GCC: a gated branch
+touched again before it is ungated stalls the bus (the DWC3 lesson, `../power.md` §4).
+
+### 12.3 The system sleep
+
+```
+IOPMrootDomain: file systems synced, user tasks suspended, kIOMessageSystemWillSleep
+NativeRamBlock off (NativeUfs's power child; only with the Data store open read-write)
+  under its gate (no request half done): SYNCHRONIZE CACHE through the store (native_ufs_store_sync)
+    ok: new requests wait (held)          failed: native_ufs_power_veto, nothing held (the sleep goes on with UFS up)
+NativeUfs off (RootPower.h hostSuspend), every step bounded:
+  1 preconditions: no veto, the transport up and not quarantined, no panic          else: abort, nothing touched
+  2 hold: no command takes a slot from now on (hostSlotTake waits)
+  3 drain: every command admitted before has given its slot back (<= 1000 ms); no doorbell (0x58, 0x78); no fatal IS
+  4 SYNCHRONIZE CACHE (slot 0) when a window takes writes (the store, the development build's root windows)
+  5 auto-hibernate off: AHIT saved, 0 written and read back
+  6 DME_GET TX lane 0: 1 already (the timer's Hibern8): done; else DME_HIBERNATE_ENTER, UHES, PWR_LOCAL, DME_GET = 1
+  steps 2-5 fail: AHIT back, the queue released, the link untouched
+  step 6 fails: the link back first (as a wake does), then AHIT and the queue
+... k27 0062 suspend-to-idle ...
+NativeUfs on (hostResume): DME_GET; DME_HIBERNATE_EXIT when 1; DME_GET != 1; NOP OUT through slot 0; AHIT as saved; queue released
+  a failed attempt: logged with IS/HCS/TX, retried after 10, 50, 200, 1000 ms (5 attempts, <= ~8 s in all); a quarantined
+  transport (a command timed out: the controller may still own its buffers) ends the attempts at once; after the last: panic
+  (the root disk cannot come back; every write acknowledged before the sleep is on the medium)
+NativeRamBlock on: its held requests released
+```
+
+- **The abort is NativeUfs's part only.** No interface lets a driver cancel the system sleep (§12.1, last row): an aborted suspend
+  puts everything back as it was (queue released, AHIT, the link active and proven by a NOP OUT) and the system sleeps with UFS
+  up, which is exactly today's behaviour; the line says so. A real cancel needs a kernel hook, e.g. k27 `piano_sleep_kernel`
+  (IOCPU.cpp) skipping `piano_s2idle_enter` when a driver set a veto during its off, which then wakes as an aborted suspend does
+  (all drivers back on); not part of this change.
+- **The Data disk.** Its store's writes are FUA (`PersistOverlay.h`): every acknowledged write is on the medium before it
+  completes; the sync is belt and braces. Holding the disk at its own gate (not only in NativeUfs) keeps a multi-block request (the
+  pages, then the bitmap block) from straddling the sleep, so the store at the cut-off is exactly the acknowledged one.
+- **Requests in the sleep window** (after the holds and before the freeze, after the thaw and before the wake's on) wait; they run
+  after the link is back and never reach a hibernated link (host-tested). The panic path does not wait: a panic in that window
+  cannot write through a hibernated link (its commands time out), no loss on this board (no panic log on UFS).
+- `native_ufs_dme_get` refuses while the queue is held.
+- The order needs NativeRamBlock to be NativeUfs's power child (`native_ufs_power_parent`, `addPowerChild`); with Data volatile it
+  does not join and only the root windows are synced (the development build writes them in place).
+- Worst cases (failure paths only; the normal case takes milliseconds): off <= ~1 s drain + the sync's 10 s timeout + ~1 s of UIC
+  waits; on <= ~8 s before the panic. Both synchronous (`kIOPMAckImplied`), which IOKit allows (it only records a slow call);
+  IOPMrootDomain's sleep/wake watchdog is far above.
+
+### 12.4 Auto-hibernate at run time: the evaluation
+
+`native-ufs-ahit=MS` (10 .. 100000; AHIT rounded up to the 1, 10 or 100 ms step; refused without AUTOH8, outside the range, or when
+the value does not read back) sets AHIT once the bring-up is done (after the first TEST UNIT READY). A suspend sets it to 0 for the
+sleep and the wake restores it.
+
+- **What it saves (inferred until measured):** with the screen on the disk idles nearly all the time between bursts; the link in
+  Hibern8 instead of HS-G5 x2 idle saves both M-PHY ends' and the device link layer's power, plausibly tens of mW (1-2 % of the
+  ~3 W screen-on budget, `../power.md` §1). It is also the precondition of any later clock gating at run time.
+- **What it costs:** the first command after an idle period pays the Hibern8 exit (hundreds of µs to a few ms); the commands'
+  timeouts (200 ms and more) cover it many times over. A 1 s timer keeps the exits rare under interactive use; 150 ms is Linux's.
+- **Risks:** (1) natively there is **no error recovery**: Linux answers an auto-hibernate enter or exit error (UHES/UHXS with a bad
+  UPMCRS, a UIC error) with ufshcd's error handler (host reset, link start-up, the device initialised again); NativeUfs has none
+  (that cold path is UEFI's), so such an error makes the next command time out and the transport is quarantined: the root disk is
+  gone until a reboot. (2) A software UIC command racing the timer: NativeUfs's only run-time UIC user is `native_ufs_dme_get`
+  (local attributes, legal in Hibern8); the suspend writes AHIT 0 before its own. (3) Nothing on this board has run it: UEFI hands
+  over with AHIT 0, and Ubuntu's (presumed) use is with MCQ and the error handler. In favour: AUTOH8 is in CAP, and a Hibern8
+  enter and exit on this link happen on every boot (§12.1).
+- **Recommendation:** test `native-ufs-ahit=1000` (image `ufsahit`: idle desktop, A/B against `base`), then 150; keep it out of the
+  daily profile until a long soak (hours of mixed use, a build, a large copy) shows no timeout and the gain is measured.
+
+### 12.5 Boot arguments and lines
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `native-ufs-suspend=1` | 0 | NativeUfs (and the Data disk, with its store open read-write) in the power tree: §12.3. Exactly `1`; any other value is off |
+| `native-ufs-ahit=MS` | none (AHIT 0) | the controller's auto-hibernate after MS ms idle: §12.4 |
+
+```
+NativeUfs: power: native-ufs-suspend=1: in the power tree; a system sleep holds and drains the queue, syncs the cache, turns auto-hibernate off and puts the link into Hibern8; any failure first undoes it and the sleep goes on with UFS up
+NativeUfs: power: UFS clocks and GDSCs as UEFI left them (NativeUfs holds no vote to drop): GDSC fa22f800, PHY GDSC ..., AXI 08000001, AHB 88000003, UniPro ..., ICE ..., TX symbol 0 ..., RX symbol 0/1 .../..., PHY aux ..., aggre AXI 08000001
+NativeRamBlock: power: native-ufs-suspend=1: the Data disk is NativeUfs's power child (...)          (the store open read-write only)
+NativeUfs: auto-hibernate: on (native-ufs-ahit=1000): AHIT 00000fe8, the controller takes the link into Hibern8 after 1000 ms without a command and back at the next one
+-- per sleep --
+NativeRamBlock: suspend 1: store synced in N us (state 2, generation G, P pages present); new requests held
+NativeUfs: suspend 1: queue held and drained in 0 ms, cache synced, auto-hibernate was off, link into Hibern8 (TX lane 0 5 -> 1) in N us; N us in all
+NativeUfs: suspended: UFS clocks and GDSCs as UEFI left them (...)
+IOCPUSleepKernel enter (piano: suspend-to-idle) ... IOCPUSleepKernel exit (piano: timer)
+NativeUfs: resume 1: link out of Hibern8 (TX lane 0 1 -> 5), NOP OUT answered, auto-hibernate off, queue released (N commands had waited) in N us
+NativeRamBlock: resume 1: requests released (N waits across the sleep)
+-- failures --
+NativeUfs: suspend N ABORTED at <step>: <why> (IS ... HCS ... doorbells .../...): queue released, link untouched; this sleep goes on with UFS up
+NativeUfs: suspend N: Hibern8 enter FAILED: ...: bringing the link back     then     ... ABORTED at Hibern8 enter: ... link up again (TX lane 0 1 -> 5, NOP OUT answered) ...
+NativeUfs: resume N: attempt K of 5 FAILED at <step>: <why> (IS ... HCS ..., TX lane 0 ... -> ...); retrying
+panic: NativeUfs: the UFS link did not come back (resume N): <step>: <why>; IS ... HCS ... doorbell ...; M commands waited for it. Every write acknowledged before the sleep is on the medium.
+NativeRamBlock: suspend: the store's cache sync FAILED (N us): the Data disk keeps running and NativeUfs leaves the link up for this sleep
+```
+
+### 12.6 Host tests
+
+`package/NativeUfs/tests/run-tests.sh` (plain and ASan/UBSan) builds the production `RootCommands.h`, `RootQueue.h` and
+`RootPower.h` against the register model `tests/UfsModel.h` (ShengUfs's and UniXNU-Odin3's fault fixture, extended with Hibern8
+enter, auto-hibernate, the doorbell rule in Hibern8 and the order of events). `RootCommands.cpp`: their command, slot, quarantine,
+MCQ-guard and link tests, unchanged in what they assert, with the new code compiled in (no Hibern8 enter, no hold, no AHIT on
+today's path). `RootPower.cpp`: the AHIT encoding and refusals; suspend and wake with and without a writable window, with AHIT on
+and with the timer's Hibern8; a command issued during the sleep (it waits, runs after the link is back, never into Hibern8); every
+abort before the link; every failure at the enter (the link back before the release); an undo or a wake that cannot (five logged
+attempts, the backoff, the panic with the queue still held); the panic path. `package/NativeRamBlock/Test/run-tests.sh` `power`:
+`PowerHold.h` on a store with a volatile write cache and power cuts.
+
+### 12.7 Build
+
+```sh
+package/NativeUfs/tests/run-tests.sh && package/NativeRamBlock/Test/run-tests.sh
+K27_KERNEL=$PIANO_K27_TREE/out/k27/kernel-k27-0063-native.macho PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh
+tooling/k27/build-pm-test-images.sh ufssleep0 ufssleep1 ufsahit ufsahitsleep ufsmeasure     # out/ram-pm-<name>, out/ram-pm-dump
+```
+Built offline 2026-11-11 in a worktree (inputs cloned from the main checkout; the Turnip stage's seed `8f333110`, so Data volatile by
+the store guard): KC with the 21 native kexts `97cded32da2dab22…` (vtable checks clean, the native kext rule passed); images
+`ram-pm-ufssleep0` `91059b08…`, `ufssleep1` `ee2793a0…`, `ufsahit` `dd4fa718…`, `ufsahitsleep` `7870d245…`, `ufsmeasure`
+`365ff938…`. Rebuild in the main checkout before a run.
+
+### 12.8 The tablet tests (batched; in the order of risk, after `../power.md` §6 S1 and S2 passed)
+
+Every image is a RAM boot with `piano-reset-after` and every reset into ABL; the store follows `build-ram-images.py`'s guard
+(another seed: Data volatile, only the root windows take part). The root windows are the installed system's own `linux_rootfs`
+windows, written in place by the development build: a UFS failure here touches the real root disk, which is why the abort undoes
+everything and why U1 isolates the UFS part with the CPUs in WFI.
+
+| # | Image | Risk | Pass (lines) | On failure |
+|---|---|---|---|---|
+| U1 | `ram-pm-ufssleep0` (600 s; S1 + `native-ufs-suspend=1`) | medium: the first Hibern8 enter by our code; a wake that fails panics | at boot the two `NativeUfs: power:` lines; per cycle (3) `NativeUfs: suspend N: … link into Hibern8 (TX lane 0 5 -> 1)`, 0062's `woke after 30.0 s by timer`, `NativeUfs: resume N: link out of Hibern8 (TX lane 0 1 -> 5), NOP OUT answered`, the desktop and the USB console back; no `ABORTED`, no `FAILED` | an `ABORTED at <step>` line: the step and the registers say which fact was wrong (the sleep went on with UFS up: compare with S1); a panic or a stall after the wake: the mailbox's last `resume` line; keep `native-ufs-suspend` off |
+| U2 | `ram-pm-ufssleep1` (600 s; S2 + it) | as U1, CPUs in ret | as U1; `machdep.piano_sleep` as in S2 | as U1 |
+| U3 | `ram-pm-ufsahit` (900 s; `native-ufs-ahit=1000`, no sleep) | medium: run-time Hibern8 with no error recovery | `NativeUfs: auto-hibernate: on (native-ufs-ahit=1000): AHIT 00000fe8`; desktop as `base`, no `UFS ROOT FAILURE`, no I/O timeout; 10 min idle at the login window, then a burst (open apps, a large copy); PianoPower's lines for the A/B with `base` (minutes 2-9, cable out) | a timeout panic or a hung desktop: auto-hibernate stays off; record the last lines |
+| U4 | `ram-pm-ufsahitsleep` (600 s) | U1 + U3 | U1's lines with `auto-hibernate off for the sleep` and `auto-hibernate on again`; possibly `already in Hibern8 (auto-hibernate)` (then no enter; the wake still exits) | as U1 / U3 |
+| U5 | the installed seed (`PIANO_INSTALLED_SEED`: `build-ram-images.py` then gives `data-persist=2` by itself) with `ufssleep1`'s arguments | **the owner's Data store**: only after U1-U2 passed | U1's lines plus `NativeRamBlock: power: … power child`, per cycle `NativeRamBlock: suspend N: store synced …; new requests held` before NativeUfs's line and `resume N: requests released` after it; `Data store state 2` at the next boot, the files written before the sleep present | a `store's cache sync FAILED`: the sleep went on with UFS up (the veto); stop, keep `native-ufs-suspend` off |
+| U6 | `ram-pm-ufsmeasure` (2400 s; `measure` + it), cable out | low once U2 passed | as `measure` (`../power.md` §6.4): the mean current asleep, A/B with `ram-pm-measure`, and the RPMh line at the wake (cxsd/ddr/aosd unchanged or counting) | — |
+
+### 12.9 Risks and limits
+
+- A wake that cannot bring the link back panics after five attempts (~8 s): the root disk is gone either way, and every write
+  acknowledged before the sleep is on the medium (FUA store writes, the sync). A link that comes back but misbehaves later shows as
+  the usual command timeout (transport quarantined).
+- The undo of a failed Hibern8 enter runs the same exit; if that fails too, the same panic.
+- No system-level veto exists (§12.3): an aborted UFS suspend still sleeps, with UFS up.
+- The GCC/RPMh/ICC votes stay UEFI's (§12.2): Hibern8 alone will not show in aosd; U6 says what it is worth.
+- Auto-hibernate: no error recovery natively (§12.4); opt-in, not daily.
+- I/O that arrives in the sleep window waits; a kernel thread the sleep itself depends on that did root-disk I/O in that window
+  would deadlock the sleep (none known: user tasks are suspended and the file systems synced before the drivers' off; the panic
+  path does not wait).

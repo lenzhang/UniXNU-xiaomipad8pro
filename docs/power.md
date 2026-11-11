@@ -221,11 +221,12 @@ What each driver adds (their owners' work; nothing here changes their packages):
 | PianoDwc3 | with a host attached and `piano-sleep-usb=1` (theirs to add): nothing (the console survives; logs flow after the wake); else link to U3/suspend; **never touch QSCRATCH with the glue clocks off** (Ubuntu: SoC reset) | restore | a cable to a host keeps the HS PHY out of L2: measure without it |
 | PianoPower | hand charging back as Ubuntu v1.1.0 (the source type's 5 V limits, CP stopped) — level 2 only; the gauges' I2C idle | re-send the full charger state (#18), read the port again | level 1 (read only): nothing; built with `piano-power-policy=1` (charging-policy.md §8), joined only then |
 | PianoWifi | PCIe link down / root port D3, no RF clock vote (RPMH_RF_CLK1) | bring back | — |
-| NativeUfs | hibern8, then every UFS clock and the GDSC (no extra references, no ICE) | exit hibern8 | in-flight I/O finishes after the wake (times do not advance) |
+| NativeUfs | **built with `native-ufs-suspend=1`, host-tested, not run** (`drivers/ufs.md` §12): hold and drain the queue, SYNCHRONIZE CACHE, AHIT 0, the link into Hibern8; any failure undoes it all (link up, NOP OUT, queue released) and the sleep goes on with UFS up (no driver can cancel a system sleep: §12.1). The clocks, GDSCs, ref clocks, supplies and bandwidth votes are **UEFI's**: NativeUfs holds none and gates none yet (§12.2: they stay on) | Hibern8 exit, NOP OUT, AHIT back, queue released; a link that does not come back: 5 logged attempts, then a panic | commands of the sleep window wait and run after the wake; `native-ufs-ahit=MS`: run-time auto-hibernate, opt-in (§12.4) |
 | PianoThermal | tsens lower-threshold interrupts masked (when interrupts are used); no SCMI requests | the first zone update re-arms them | cpufreq: nothing |
 | PianoAudio | release LPASS_HW_MACRO / DCODEC votes when idle (Linux: 100 ms autosuspend) — **only after the LLCC island is confirmed reserved** | — | the island reset is about exactly this |
 | PianoTorch | torch off (four SPMI writes, synchronous in `setPowerState(kOff)`; also `systemWillShutdown`) | stays off (a new request lights it) | level 1: nothing |
-| NativeRamBlock, PianoNullEthernet, ARMPlatformStandIn | nothing | nothing | — |
+| NativeRamBlock | **built with `native-ufs-suspend=1`, host-tested, not run**, only with the Data store open read-write: NativeUfs's power child (off before the link, on after it); under its gate the store's SYNCHRONIZE CACHE (every acknowledged write is FUA already), then new requests held; a failed sync vetoes NativeUfs's suspend (the link stays up) | requests released | volatile Data: no part (nothing of it is on UFS) |
+| PianoNullEthernet, ARMPlatformStandIn | nothing | nothing | — |
 
 **Status of the drivers' parts** (2026-11-11; built, host-tested, linked into the KC with the 0063 kernel; **not run on the
 tablet**; each driver's page has its lines). A driver in the power tree whose off/on is not reached costs nothing: the default ADT
@@ -306,6 +307,7 @@ K27_VARIANT=native "$PIANO_K27_TREE/build-k27-piano.sh"                 # then c
 tooling/k27/test-piano-pm.sh                                               # host tests (add --kext with K27_KERNEL=... for the contract)
 K27_KERNEL=$K/out/k27/kernel-k27-0062-native.macho PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh   # KC + ADT
 tooling/k27/build-pm-test-images.sh            # out/ram-pm-{base,probe,idle1,idle2,idle1pd,idle3,sleep0,sleep1,sleep2,sleepkey,measure}
+                                               #   and the storage side's {ufssleep0,ufssleep1,ufsahit,ufsahitsleep,ufsmeasure}
 ```
 (`$K` = `$PIANO_K27_TREE`. Built offline here from an APFS clone of the k27 tree with its own object directory: kernel
 sha256 `24940c6dd10bee7d…`, KC with the 14 native kexts `f0a92af1f3696fc4…`, layout check passed; images `ram-pm-probe`
@@ -324,6 +326,7 @@ run. For `sleepkey` with the cover: `PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/PianoKe
 | S3 | `ram-pm-sleep2` (600 s) | cl5 while suspended + idle level 2 | unattended | as S1 | stay at S2 |
 | S4 | `ram-pm-sleepkey` (1800 s) | attended wake sources | owner: after each test sleep press power (wake within a poll), then close and open the cover (with PianoKeyboard), plug/unplug USB-C, press volume-down | `woke ... by power-key / lid / usb / volume-down`, no immediate re-sleep after the power key, no spurious HID power press | a missed short press: raise `piano-sleep-poll` resolution (lower value) |
 | M | `ram-pm-measure` (2400 s) | low (S2-S3 passed) | no cable: unplug at the login window, wait 40 min, plug back, capture | §6.4 | — |
+| U1-U6 | `ram-pm-ufssleep0`, `ufssleep1`, `ufsahit`, `ufsahitsleep`, the installed seed with `ufssleep1`'s arguments, `ufsmeasure` | medium (the root disk's link): after S1-S2 | the storage side, `native-ufs-suspend=1` / `native-ufs-ahit=1000`: `drivers/ufs.md` §12.8 has the lines | there |
 
 ### 6.4 The measurement (A/B)
 

@@ -101,6 +101,10 @@ the GPT check, the window, `header read: SHNGDATA v1, <pages> pages, seed <8 hex
 before any decision), the bitmap read or clear (first block, every 32nd, last), each cache sync, the header write, the disk's
 registration ([forensics-2026-11-11.md](forensics-2026-11-11.md) §4). A set-up that stops names its step.
 
+Across a system sleep (`native-ufs-suspend=1`, opt-in, not run yet: [drivers/ufs.md](drivers/ufs.md) §12): with the store open
+read-write the disk is NativeUfs's power child; before the link goes into Hibern8 it syncs the store (every acknowledged write is
+FUA already) and holds new requests until the link is back; a failed sync keeps the link up for that sleep.
+
 ## 4. Flatten: a store that no longer needs its seed
 
 `data-store-flatten=1` (`Overlay::flatten`, `NativeRamBlock::flattenStore`) works only on this seed's store, opened read-write
