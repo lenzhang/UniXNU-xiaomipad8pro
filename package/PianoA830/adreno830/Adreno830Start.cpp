@@ -23,6 +23,7 @@
 #include "A830Dcvs.h"
 #ifdef ADRENO830_MACOS
 #include "A830Idle.h"
+#include "A830Suspend.h"
 #endif
 #include "A830Trace.h"
 #include "NativeAdrenoABI.h"
@@ -167,6 +168,11 @@ struct Adreno830Device {
     void *power_mutex;
     char power_event;
     bool power_bound;
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the host votes' owner after S10 (A830Suspend.h): the DCVS thread's idle votes and floor raises, and the system
+     * suspend's PreSleep/PostResume votes, one at a time. */
+    void *host_mutex;
+#endif
 };
 
 extern "C" {__attribute__((weak)) volatile uint32_t sm8750_aoss_qmp_owner;}
@@ -2253,6 +2259,9 @@ void bindPower(Adreno830Device *d)
     if(d->power_bound)return;
     d->power_bound=true;
     d->power_mutex=os().mutex_alloc?os().mutex_alloc():nullptr;
+#ifdef ADRENO830_MACOS
+    if(!d->host_mutex)d->host_mutex=os().mutex_alloc?os().mutex_alloc():nullptr;
+#endif
     d->power_win={nullptr,powerWinRead,powerWinWrite,powerWinBarrier};
     d->power_env={nullptr,envNowNs,envSleepUs,envDelayUs,envLock,envUnlock,envWait,envWake,envStartThread};
     d->power_ops={nullptr,opCxPowerOn,opCxPowerOff,opSmmuRestore,opCxTimerSeed,opGmuStart,opGmuForceOff,opRsccSleep,opOobSet,
@@ -2301,8 +2310,22 @@ IOReturn dcvsPerfVote(void *,uint8_t level,uint32_t bw)
     }
     return g830.hfi.perfVote(level,bus);
 }
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (A830Suspend.h): the host-vote mutex (none in a run without the kernel's mutexes: the host tests' doubles). */
+struct HostVotes {
+    HostVotes() {if(g830.host_mutex)os().mutex_lock(g830.host_mutex);}
+    ~HostVotes() {if(g830.host_mutex)os().mutex_unlock(g830.host_mutex);}
+    HostVotes(const HostVotes &)=delete;
+    HostVotes &operator=(const HostVotes &)=delete;
+};
+bool suspendGateShut() {return g830.power_bound && g830.power_state.suspended();}
+#endif
 IOReturn dcvsHostDdr(void *,uint32_t kbps)
 {
+#ifdef ADRENO830_MACOS
+    HostVotes votes;
+    if(suspendGateShut())return kIOReturnNotReady;   /* UniXNU-piano: the suspend owns the host votes until it resumed */
+#endif
     return Sm8750RpmhHostDdr(&g830.host,kbps)==Sm8750RpmhOk?kIOReturnSuccess:kIOReturnIOError;
 }
 #ifdef ADRENO830_MACOS
@@ -2348,6 +2371,10 @@ int idleVotesUp()
 }
 uint64_t dcvsIdleTick(void *,uint64_t now,bool quiet,uint64_t lastSubmit)
 {
+    /* UniXNU-piano (A830Suspend.h): while a system suspend has the GPU (its gate shut), its votes are the suspend's: nothing here.
+     * Looked at again under the host-vote mutex, so a vote of this tick and the suspend's never interleave. */
+    HostVotes votes;
+    if(suspendGateShut())return 0;
     IdleReport &r=gIdleReport;
     if(!r.periodStart)r.periodStart=now;
     /* The slumbers and wakes A830PowerState counted since the last look (its own counters; their lines from here). */
@@ -2603,12 +2630,131 @@ uint32_t adreno830_ddr_kbps(unsigned level)
 const Adreno830Failure *adreno830_last_failure(void) {return &g830.failure;}
 bool adreno830_running(void) {return __atomic_load_n(&g830.running,__ATOMIC_ACQUIRE);}
 
+#ifdef ADRENO830_MACOS
+/* ===== UniXNU-piano: the system suspend (A830Suspend.h, piano-gpu-suspend=1) ================================================= */
+namespace {
+/* The host votes as the suspend found them at PreSleep, put back at PostResume (or kOn). */
+struct SuspendSaved {bool valid;uint32_t held,mx,cx,ddr;} gSaved;
+void reportVotes(A830SuspendReport *r,bool after)
+{
+    const Sm8750RpmhHost &h=g830.host;
+    const uint32_t ddr=h.held&Sm8750RpmhHeldDdr?h.ddr_kbps:0;
+    const uint32_t cx=h.res && (h.held&Sm8750RpmhHeldRails)?railVlvl(h.res->cx,h.cx_hlvl):0;
+    const uint32_t mx=h.res && (h.held&Sm8750RpmhHeldRails)?railVlvl(h.res->mx,h.mx_hlvl):0;
+    if(after) {r->ddrAfter=ddr;r->cxAfter=cx;r->mxAfter=mx;}
+    else {r->ddrBefore=ddr;r->cxBefore=cx;r->mxBefore=mx;}
+}
+}
+
+/* Step 1 (kOff): the gate, the quiet, the full slumber (A830PowerState::suspend). */
+extern "C" int32_t adreno830_suspend_gpu(uint32_t idleWaitMs,A830SuspendReport *report)
+{
+    A830SuspendReport local{};
+    A830SuspendReport *r=report?report:&local;
+    *r=A830SuspendReport{};
+    if(!g830.power_bound || !adreno830_running()) {r->result=kIOReturnNotReady;return r->result;}
+    A830PowerState::SuspendInfo info{};
+    const IOReturn result=g830.power_state.suspend(idleWaitMs*1000u,&info);
+    r->result=result;r->waitedUs=info.waitedUs;r->entryUs=info.entryUs;r->warnings=info.warnings;
+    r->alreadyAsleep=info.alreadyAsleep;
+    r->cxCollapsed=result==kIOReturnSuccess && !g830.power_state.cxOn() && !(info.warnings&Sm8750GpuOffCxStillOn);
+    r->powerPhase=g830.power_state.phase();
+    reportVotes(r,false);reportVotes(r,true);
+    return result;
+}
+
+/* Step 2 (PreSleep): the DDR to the keepalive minimum or the display's floor, then the rails (A830Suspend.h). Only with the GPU
+ * suspended; a failure puts back what went down. */
+extern "C" int32_t adreno830_suspend_votes(uint8_t scanout,const A830SuspendConfig *config,A830SuspendReport *report)
+{
+    A830SuspendReport local{};
+    A830SuspendReport *r=report?report:&local;
+    *r=A830SuspendReport{};
+    Sm8750RpmhHost &h=g830.host;
+    if(!config || !g830.power_bound || !h.drv2 || !h.res || !g830.power_state.suspended()) {r->result=kIOReturnNotReady;return r->result;}
+    HostVotes votes;
+    const uint64_t begin=nowUs();
+    reportVotes(r,false);
+    gSaved={true,h.held,h.mx_hlvl,h.cx_hlvl,h.ddr_kbps};
+    int rc=Sm8750RpmhOk;
+    if(h.held&Sm8750RpmhHeldDdr) {
+        const uint32_t ddr=A830SuspendDdrKbps(h.ddr_kbps,scanout,adreno830_ddr_kbps(config->ddrFloorLevel));
+        if(ddr!=h.ddr_kbps)rc=Sm8750RpmhHostDdr(&h,ddr);
+    }
+    if(!rc && (h.held&Sm8750RpmhHeldRails)) {
+        const uint32_t vlvl=A830SuspendRailVlvl(config->railVlvl,scanout);
+        const uint32_t mx=A830SuspendRailHlvl(h.res->mx.vlvl,h.res->mx.count,h.mx_hlvl,vlvl);
+        const uint32_t cx=A830SuspendRailHlvl(h.res->cx.vlvl,h.res->cx.count,h.cx_hlvl,vlvl);
+        rc=Sm8750RpmhHostRailsSet(&h,mx,cx);
+    }
+    if(rc) {
+        /* What went down comes back (rails first, then the DDR), best effort; the suspend goes on with the votes as they were. */
+        (void)Sm8750RpmhHostRailsSet(&h,gSaved.mx,gSaved.cx);
+        if((gSaved.held&Sm8750RpmhHeldDdr) && h.ddr_kbps!=gSaved.ddr)(void)Sm8750RpmhHostDdr(&h,gSaved.ddr);
+        gSaved.valid=false;
+        r->rpmh=rc;r->result=kIOReturnIOError;
+    }
+    r->votesUs=uint32_t(nowUs()-begin);
+    reportVotes(r,true);
+    r->powerPhase=g830.power_state.phase();
+    return r->result;
+}
+
+/* Step 3 (PostResume) or 4 (kOn): the rails as found, then the DDR. Nothing to do when nothing went down. */
+extern "C" int32_t adreno830_resume_votes(A830SuspendReport *report)
+{
+    A830SuspendReport local{};
+    A830SuspendReport *r=report?report:&local;
+    *r=A830SuspendReport{};
+    Sm8750RpmhHost &h=g830.host;
+    if(!gSaved.valid) {reportVotes(r,false);reportVotes(r,true);return kIOReturnSuccess;}
+    HostVotes votes;
+    const uint64_t begin=nowUs();
+    reportVotes(r,false);
+    int rc=Sm8750RpmhHostRailsSet(&h,gSaved.mx,gSaved.cx);
+    if(!rc && (gSaved.held&Sm8750RpmhHeldDdr) && h.ddr_kbps!=gSaved.ddr)rc=Sm8750RpmhHostDdr(&h,gSaved.ddr);
+    if(!rc)gSaved.valid=false;
+    r->rpmh=rc;r->result=rc?kIOReturnIOError:kIOReturnSuccess;
+    r->votesUs=uint32_t(nowUs()-begin);
+    reportVotes(r,true);
+    return r->result;
+}
+
+/* Step 4 (kOn): the gate open, the GPU woken now with `wake` (A830PowerState::resume). */
+extern "C" int32_t adreno830_resume_gpu(bool wake,A830SuspendReport *report)
+{
+    A830SuspendReport local{};
+    A830SuspendReport *r=report?report:&local;
+    *r=A830SuspendReport{};
+    if(!g830.power_bound) {r->result=kIOReturnNotReady;return r->result;}
+    uint32_t us=0;
+    r->result=g830.power_state.resume(wake,&us);
+    r->wakeUs=us;
+    r->powerPhase=g830.power_state.phase();
+    reportVotes(r,false);reportVotes(r,true);
+    return r->result;
+}
+
+extern "C" void adreno830_host_votes(uint32_t *ddrKbps,uint32_t *cxVlvl,uint32_t *mxVlvl,bool *votesDown)
+{
+    A830SuspendReport r{};
+    reportVotes(&r,true);
+    if(ddrKbps)*ddrKbps=r.ddrAfter;
+    if(cxVlvl)*cxVlvl=r.cxAfter;
+    if(mxVlvl)*mxVlvl=r.mxAfter;
+    if(votesDown)*votesDown=gSaved.valid;
+}
+#endif
+
 #ifdef ADRENO830_HOST_TEST
 /* Host tests: a fresh device (the static object is rebuilt in place) and the host's kernel services. */
 extern "C" void adreno830_start_reset(void)
 {
     g830.~Adreno830Device();
     new (&g830) Adreno830Device();
+#ifdef ADRENO830_MACOS
+    gSaved=SuspendSaved{};   /* UniXNU-piano */
+#endif
     memset(&cmdDbSnapshot,0,sizeof cmdDbSnapshot);
     traceReset();
 }

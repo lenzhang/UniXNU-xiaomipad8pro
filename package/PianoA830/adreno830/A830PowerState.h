@@ -118,7 +118,13 @@ enum A830PowerPhase : uint8_t {
     A830PowerLost,          /* permanent device loss */
 };
 enum A830SlumberMode : uint8_t {A830SlumberOff,A830SlumberFull,A830SlumberCxKeep};
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (A830Suspend.h): A830WakeSuspend is the system suspend's own wake (a CX-keeping slumber on its way to the full one),
+ * the only one a shut suspend gate lets through. */
+enum A830WakeReason : uint8_t {A830WakeSubmit,A830WakeTouch,A830WakeIfpc,A830WakeExplicit,A830WakeScreen,A830WakeSuspend};
+#else
 enum A830WakeReason : uint8_t {A830WakeSubmit,A830WakeTouch,A830WakeIfpc,A830WakeExplicit,A830WakeScreen};
+#endif
 
 /* Fault causes reported to A830Recovery (also the step of a "GPU LOST S15.<cause>" row). */
 enum A830FaultCause : uint8_t {
@@ -159,6 +165,11 @@ struct A830PowerConfig {
      * (screenBlocked; the recovery takes the GPU back as for any power failure). Off: the screen state is not looked at. */
     uint8_t screenSlumber=A830SlumberOff;
     uint32_t screenIdleMs=1000;
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (A830Suspend.h): a submission that finds the system suspend's gate shut waits this long (awake time: the
+     * suspend itself does not count) for the resume, then fails as a transition in progress does (the submit path retries). */
+    uint32_t suspendWaitMs=5000;
+#endif
 };
 
 struct A830PowerStats {
@@ -211,6 +222,21 @@ public:
     bool screenOff() const {return __atomic_load_n(&screenOff_,__ATOMIC_ACQUIRE);}
     bool screenSlept() const {return __atomic_load_n(&screenSlept_,__ATOMIC_ACQUIRE);}
     IOReturn wake(A830WakeReason reason);   /* takes the mutex; no-op when Active */
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (A830Suspend.h): the system suspend. suspend() shuts the gate (from then on acquire() waits for resume()
+     * instead of waking the GPU, no touch, screen or IFPC wake runs, tick() does nothing), waits up to waitUs for no holder and
+     * nothing in flight with the GPU up or asleep (a recovery in progress is waited out), and enters the full slumber, from a
+     * CX-keeping one through a wake. Success: asleep in the full slumber with the gate shut (*info: the wait, the entry, the
+     * CX power-off's warnings, whether it slept already). kIOReturnBusy: not quiet within waitUs, nothing changed. kIOReturnIOError:
+     * the entry (or the CX-keeping slumber's wake) failed: fail() gave the GPU to the recovery. A830ReturnNotResponding: lost,
+     * never started, or still being recovered after waitUs. On every failure the gate is open again. Thread context; takes the
+     * mutex. resume() opens the gate and, with wakeNow, wakes the GPU at once (*wakeUs: how long it took); a failed wake goes to the
+     * recovery as any wake does. */
+    struct SuspendInfo {uint32_t waitedUs,entryUs,warnings;bool alreadyAsleep;};
+    IOReturn suspend(uint32_t waitUs,SuspendInfo *info);
+    IOReturn resume(bool wakeNow,uint32_t *wakeUs);
+    bool suspended() const {return __atomic_load_n(&suspended_,__ATOMIC_SEQ_CST);}
+#endif
     IOReturn enterSlumber(uint8_t mode);    /* takes the mutex; S1..S10 (Full) or S1..S9 (CxKeep) */
     void setIfpc(bool enable);              /* applied by the next idle power cycle (the GMU must restart) */
 
@@ -265,6 +291,9 @@ public:
 private:
     IOReturn wakeLocked(A830WakeReason reason);
     IOReturn enterLocked(uint8_t mode,uint64_t now);
+#ifdef ADRENO830_MACOS
+    IOReturn suspendLocked(SuspendInfo *info);   /* UniXNU-piano: one attempt at the full slumber, mutex held */
+#endif
     bool drain(uint32_t us);
     void fail(uint16_t step,IOReturn result,uint8_t cause);
     bool poll(uint8_t window,uint32_t offset,uint32_t mask,uint32_t value,uint32_t timeoutUs,uint32_t stepUs);
@@ -290,6 +319,9 @@ private:
     /* the screen rule (config.screenSlumber) */
     bool screenOff_=false,screenSlept_=false,screenEntering_=false;
     uint64_t screenOffAt_=0;
+#ifdef ADRENO830_MACOS
+    bool suspended_=false;   /* UniXNU-piano: the system suspend's gate (A830Suspend.h) */
+#endif
 };
 
 /* The 8.3 stage (A830Stage) an A830WakeStep* belongs to: S1 power, S3 SMMU, S4 timer, S5 GMU, S6 CP, S7 secure, S8 irq. */

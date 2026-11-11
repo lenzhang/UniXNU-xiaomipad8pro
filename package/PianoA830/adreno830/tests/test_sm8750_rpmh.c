@@ -1383,6 +1383,47 @@ static void test_host_idle(void)
     check_host_rules(m, &res);
     free(m);
 }
+
+/* UniXNU-piano (A830Suspend.h, piano-gpu-suspend=1): the suspend's rails. From the top to hlvl 0 (the votes gone) cx first, back to
+ * the levels found mx first, one TCS waiting on both under the DRV-2 lock; nothing while the rails are not held or unchanged; a
+ * level past the table is refused without a TCS; a failed send keeps the levels held; a mixed change goes in the raise order. */
+static void test_host_suspend(void)
+{
+    Sm8750RpmhResources res;
+    load(&Default);
+    CHECK(!Sm8750RpmhResourcesParse(&db, &res));
+    Rsc *m = rsc_new(3, 16);
+    Sm8750RpmhIo io = rsc_io(m);
+    Sm8750RpmhHost host;
+    static const uint32_t rails_up[2] = {0x30010, 0x30000}, rails_down[2] = {0x30000, 0x30010};
+    Sm8750RpmhHostInit(&host, &io, &res);
+    CHECK(Sm8750RpmhHostRailsSet(&host, 0, 0) == Sm8750RpmhOk && m->nsent == 0 && host.held == 0);   /* not held: nothing */
+    CHECK(Sm8750RpmhHostRails(&host, 1) == Sm8750RpmhOk && host.mx_hlvl == 9 && host.cx_hlvl == 15 && m->nsent == 1);
+    CHECK(Sm8750RpmhHostRailsSet(&host, 9, 15) == Sm8750RpmhOk && m->nsent == 1);                      /* unchanged */
+    CHECK(Sm8750RpmhHostRailsSet(&host, 10, 0) == Sm8750RpmhArgument && Sm8750RpmhHostRailsSet(&host, 0, 16) == Sm8750RpmhArgument);
+    CHECK(m->nsent == 1 && host.mx_hlvl == 9 && host.cx_hlvl == 15);
+    CHECK(touch_try_exchange());
+    m->touch_release_at = m->now + 5000;
+    CHECK(Sm8750RpmhHostRailsSet(&host, 0, 0) == Sm8750RpmhOk && host.last.lock_waits == 500);
+    check_sent(&m->sent[1], 2, 3, rails_down, (const uint32_t[]){0, 0});
+    CHECK(host.mx_hlvl == 0 && host.cx_hlvl == 0 && host.held == Sm8750RpmhHeldRails && Sm8750RpmhDrv2Owner() == 0);
+    CHECK(Sm8750RpmhHostRailsSet(&host, 9, 15) == Sm8750RpmhOk);
+    check_sent(&m->sent[2], 2, 3, rails_up, (const uint32_t[]){9, 15});
+    /* NOM_L1-like levels (mx 6, cx 11) and a mixed change (mx up, cx down): mx first. */
+    CHECK(Sm8750RpmhHostRailsSet(&host, 6, 11) == Sm8750RpmhOk);
+    check_sent(&m->sent[3], 2, 3, rails_down, (const uint32_t[]){11, 6});
+    CHECK(Sm8750RpmhHostRailsSet(&host, 7, 4) == Sm8750RpmhOk);
+    check_sent(&m->sent[4], 2, 3, rails_up, (const uint32_t[]){7, 4});
+    /* A failed send: the levels held stay, the next call tries again. */
+    m->complete_ms = -1;
+    CHECK(Sm8750RpmhHostRailsSet(&host, 0, 0) == Sm8750RpmhTimeout && host.mx_hlvl == 7 && host.cx_hlvl == 4);
+    m->complete_ms = 1;
+    CHECK(Sm8750RpmhHostRailsSet(&host, 0, 0) == Sm8750RpmhOk && host.mx_hlvl == 0 && host.cx_hlvl == 0);
+    check_sent(&m->sent[m->nsent - 1], 2, 3, rails_down, (const uint32_t[]){0, 0});
+    CHECK(Sm8750RpmhHostRailsSet(NULL, 0, 0) == Sm8750RpmhArgument);
+    check_host_rules(m, &res);
+    free(m);
+}
 #endif
 
 int main(void)
@@ -1408,6 +1449,7 @@ int main(void)
     test_host_policy();
 #ifdef ADRENO830_MACOS
     test_host_idle();   /* UniXNU-piano */
+    test_host_suspend();
 #endif
     puts("PASS: SM8750 RPMh cmd-db lookups, DRV-2 ACTIVE TCS protocol, DRV-2 lock and host vote policy");
     return 0;

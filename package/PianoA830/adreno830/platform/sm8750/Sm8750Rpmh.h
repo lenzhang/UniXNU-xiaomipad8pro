@@ -311,6 +311,11 @@ int Sm8750RpmhHostDdr(Sm8750RpmhHost *host, uint32_t kbps);
  * vote); Sm8750RpmhHostRails puts them back. Sends nothing while the rails are not held, at vlvl 0, or when nothing changes; a table
  * without such a level keeps that rail. A failed send leaves the held levels as they were. */
 int Sm8750RpmhHostRailsIdle(Sm8750RpmhHost *host, uint32_t vlvl);
+/* UniXNU-piano (A830Suspend.h, piano-gpu-suspend=1): the rails at exactly these levels (each below its table's usable count;
+ * hlvl 0 is the vote gone): {mx, cx} when either goes up, {cx, mx} when both go down, one TCS waiting on both, the DRV-2 lock as
+ * for every vote. The system suspend lowers them with it and puts back the levels it found. Sends nothing while the rails are not
+ * held or when nothing changes; a failed send leaves the held levels as they were; a level past its table is Argument. */
+int Sm8750RpmhHostRailsSet(Sm8750RpmhHost *host, uint32_t mx_hlvl, uint32_t cx_hlvl);
 #endif
 
 #ifdef __cplusplus

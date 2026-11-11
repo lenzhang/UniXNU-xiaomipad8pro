@@ -36,6 +36,7 @@
 #include "A830Dcvs.h"
 #ifdef ADRENO830_MACOS
 #include "A830Idle.h"   /* UniXNU-piano */
+#include "A830Suspend.h"
 #endif
 #include "NativeAdrenoABI.h"
 #include "NativeAdrenoGmuContext.h"
@@ -261,6 +262,15 @@ int Sm8750RpmhHostRailsIdle(Sm8750RpmhHost *host,uint32_t vlvl)   /* UniXNU-pian
     if(hit("Sm8750RpmhHostRailsIdle"))return Sm8750RpmhTimeout;
     if(vlvl)counts["rails-idle"]++;
     (void)host;
+    return Sm8750RpmhOk;
+}
+/* UniXNU-piano (A830Suspend.h): the suspend's rails, recorded as {mx, cx}. */
+static std::vector<std::pair<uint32_t,uint32_t>> railSets;
+int Sm8750RpmhHostRailsSet(Sm8750RpmhHost *host,uint32_t mx_hlvl,uint32_t cx_hlvl)
+{
+    if(hit("Sm8750RpmhHostRailsSet"))return Sm8750RpmhTimeout;
+    if(!(host->held&Sm8750RpmhHeldRails) || (host->mx_hlvl==mx_hlvl && host->cx_hlvl==cx_hlvl))return Sm8750RpmhOk;
+    railSets.emplace_back(mx_hlvl,cx_hlvl);host->mx_hlvl=mx_hlvl;host->cx_hlvl=cx_hlvl;
     return Sm8750RpmhOk;
 }
 }
@@ -1009,6 +1019,27 @@ void A830PowerState::setFaultSink(void (*sink)(void *,uint8_t,uint64_t),void *) 
 extern "C" A830PowerState *adreno830_power_state(void) {return nullptr;}
 IOReturn A830PowerState::acquire() {return kIOReturnSuccess;}
 void A830PowerState::release() {}
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (A830Suspend.h): the gate of the real class (its own test: test_a830suspend), as each case asks. */
+static IOReturn suspendResult,resumeResult;
+static A830PowerState::SuspendInfo suspendInfo;
+static uint32_t suspendWaitUs;
+IOReturn A830PowerState::suspend(uint32_t waitUs,SuspendInfo *info)
+{
+    suspendWaitUs=waitUs;
+    if(info)*info=suspendInfo;
+    hit("A830PowerState::suspend");
+    if(suspendResult==kIOReturnSuccess)__atomic_store_n(&suspended_,true,__ATOMIC_SEQ_CST);
+    return suspendResult;
+}
+IOReturn A830PowerState::resume(bool wakeNow,uint32_t *wakeUs)
+{
+    hit(wakeNow?"A830PowerState::resume(wake)":"A830PowerState::resume");
+    __atomic_store_n(&suspended_,false,__ATOMIC_SEQ_CST);
+    if(wakeUs)*wakeUs=wakeNow?2345:0;
+    return resumeResult;
+}
+#endif
 bool A830PowerState::accessBegin(bool) {return true;}
 void A830PowerState::accessEnd(bool) {}
 IOReturn A830Recovery::init(const A830RecoveryConfig &config,const A830PowerIo &,const A830PowerEnv &,const A830PowerOps &,
@@ -2099,6 +2130,99 @@ int main()
         ++idleCases;
         testIdle=A830IdleConfig{};
     }
+    /* ---- UniXNU-piano: piano-gpu-suspend (A830Suspend.h) through the orchestrator: kOff's gate and full slumber (the power state's
+     * own test is test_a830suspend), PreSleep's votes (the DDR to the display's floor while it scans or to the keepalive minimum once it
+     * stopped, then the rails, NOM_L1 at least while it scans, 0 on request, never above what is held), the DCVS thread's idle votes
+     * and floor raises standing aside while the gate is shut, PostResume's restore (rails first, then the DDR, as found), a failed
+     * vote undone, kOn's resume. --- */
+    unsigned suspendCases=0;
+    {
+        testIdle=A830IdleConfig{};testIdle.mode=2;
+        b=board13t();
+        CHECK(run(&b)==kIOReturnSuccess && adreno830_running());
+        Sm8750RpmhHost *host=adreno830_rpmh_host();
+        Sm8750RpmhResources *res=const_cast<Sm8750RpmhResources *>(adreno830_rpmh_resources());
+        CHECK(host && res && host->res==res);
+        static const uint16_t vlvls[15]={0,0x10,0x30,0x40,0x80,0xc0,0x100,0x140,0x150,0x180,0x1a0,0x1c0,0x1d0,0x1e0,0x1f0};
+        for(unsigned i=0;i<15;++i)res->mx.vlvl[i]=res->cx.vlvl[i]=vlvls[i];
+        host->held|=Sm8750RpmhHeldRails;host->mx_hlvl=host->cx_hlvl=14;
+        CHECK(host->ddr_kbps==6671875);   /* mode 2: the boot vote went to the display's floor at S10 */
+        host->ddr_kbps=18597656;          /* as a chosen floor or an idle up would hold it */
+        A830SuspendConfig config;config.enabled=true;
+        A830SuspendReport r{};
+        /* Not suspended: no vote. */
+        ddrVotes.clear();railSets.clear();
+        CHECK(adreno830_suspend_votes(A830ScanoutRunning,&config,&r)==kIOReturnNotReady && ddrVotes.empty() && railSets.empty());
+        ++suspendCases;
+        /* Busy: the gate stays open, nothing else. */
+        suspendResult=kIOReturnBusy;suspendInfo={500000,0,0,false};
+        CHECK(adreno830_suspend_gpu(500,&r)==kIOReturnBusy && suspendWaitUs==500000 && r.waitedUs==500000 && !r.cxCollapsed);
+        CHECK(adreno830_suspend_votes(A830ScanoutRunning,&config,&r)==kIOReturnNotReady && ddrVotes.empty());
+        ++suspendCases;
+        /* Down: the gate shut. The idle tick and a DCVS floor raise stand aside. */
+        suspendResult=kIOReturnSuccess;suspendInfo={3000,1200,0,false};
+        CHECK(adreno830_suspend_gpu(500,&r)==kIOReturnSuccess && r.entryUs==1200 && r.waitedUs==3000);
+        CHECK(lastDcvsOps.idleTick && lastDcvsOps.hostDdr);
+        idleEvents.clear();
+        CHECK(lastDcvsOps.idleTick(nullptr,90000000000ull,true,1000000000ull)==0 && idleEvents.empty() && ddrVotes.empty() &&
+              !called("rails-idle"));
+        CHECK(lastDcvsOps.hostDdr(nullptr,10687500)==kIOReturnNotReady && ddrVotes.empty());
+        ++suspendCases;
+        /* PreSleep while the panel scans: DDR to level 5, then the rails at NOM_L1 (hlvl 7); the report says what changed. */
+        trace.clear();
+        CHECK(adreno830_suspend_votes(A830ScanoutRunning,&config,&r)==kIOReturnSuccess && r.rpmh==0);
+        CHECK(ddrVotes==std::vector<uint32_t>({6671875}) && railSets.size()==1 && railSets[0]==std::make_pair(7u,7u));
+        CHECK(trace.size()==2 && trace[0]=="Sm8750RpmhHostDdr" && trace[1]=="Sm8750RpmhHostRailsSet");
+        CHECK(r.ddrBefore==18597656 && r.ddrAfter==6671875 && r.cxBefore==0x1f0 && r.cxAfter==0x140 && r.mxAfter==0x140);
+        bool down=false;uint32_t ddrNow=0,cxNow=0,mxNow=0;
+        adreno830_host_votes(&ddrNow,&cxNow,&mxNow,&down);
+        CHECK(down && ddrNow==6671875 && cxNow==0x140 && mxNow==0x140);
+        /* PostResume: the rails as found first, then the DDR. */
+        trace.clear();
+        CHECK(adreno830_resume_votes(&r)==kIOReturnSuccess && railSets.size()==2 && railSets[1]==std::make_pair(14u,14u));
+        CHECK(ddrVotes.size()==2 && ddrVotes[1]==18597656 && trace.size()==2 && trace[0]=="Sm8750RpmhHostRailsSet" &&
+              trace[1]=="Sm8750RpmhHostDdr");
+        adreno830_host_votes(nullptr,nullptr,nullptr,&down);
+        CHECK(!down && adreno830_resume_votes(&r)==kIOReturnSuccess && railSets.size()==2 && ddrVotes.size()==2);   /* once */
+        ++suspendCases;
+        /* The scanout stopped and the rails' votes asked gone: the keepalive minimum and hlvl 0; an unknown scanout is a running one. */
+        config.railVlvl=0;
+        CHECK(adreno830_suspend_votes(A830ScanoutStopped,&config,&r)==kIOReturnSuccess && ddrVotes.back()==0 &&
+              railSets.back()==std::make_pair(0u,0u) && r.cxAfter==0 && r.ddrAfter==0);
+        CHECK(adreno830_resume_votes(&r)==kIOReturnSuccess && railSets.back()==std::make_pair(14u,14u) && ddrVotes.back()==18597656);
+        CHECK(adreno830_suspend_votes(A830ScanoutUnknown,&config,&r)==kIOReturnSuccess && ddrVotes.back()==6671875 &&
+              railSets.back()==std::make_pair(7u,7u));
+        CHECK(adreno830_resume_votes(&r)==kIOReturnSuccess);
+        ++suspendCases;
+        /* Never above what is held: rails held at hlvl 4 and the DDR at level 3 stay where they are. */
+        host->mx_hlvl=host->cx_hlvl=4;host->ddr_kbps=5285156;config.railVlvl=0x140;
+        const size_t sets=railSets.size(),votesBefore=ddrVotes.size();
+        CHECK(adreno830_suspend_votes(A830ScanoutRunning,&config,&r)==kIOReturnSuccess && railSets.size()==sets &&
+              ddrVotes.size()==votesBefore);
+        CHECK(adreno830_resume_votes(&r)==kIOReturnSuccess && railSets.size()==sets && ddrVotes.size()==votesBefore);
+        host->mx_hlvl=host->cx_hlvl=14;host->ddr_kbps=18597656;
+        ++suspendCases;
+        /* A failed rails vote: the DDR that went down comes back, the step fails, nothing is left to restore. */
+        faults["Sm8750RpmhHostRailsSet"]={kIOReturnTimeout,0,0,1};
+        counts.erase("Sm8750RpmhHostRailsSet");
+        CHECK(adreno830_suspend_votes(A830ScanoutRunning,&config,&r)==kIOReturnIOError && r.rpmh==Sm8750RpmhTimeout);
+        CHECK(ddrVotes.size()>=2 && ddrVotes[ddrVotes.size()-2]==6671875 && ddrVotes.back()==18597656 && host->cx_hlvl==14);
+        adreno830_host_votes(nullptr,nullptr,nullptr,&down);
+        CHECK(!down);
+        faults.erase("Sm8750RpmhHostRailsSet");
+        ++suspendCases;
+        /* kOn: the gate open (and the GPU woken with wake), the idle tick and the floor raise back. */
+        resumeResult=kIOReturnSuccess;
+        CHECK(adreno830_resume_gpu(true,&r)==kIOReturnSuccess && r.wakeUs==2345 && called("A830PowerState::resume(wake)")==1);
+        CHECK(lastDcvsOps.hostDdr(nullptr,10687500)==kIOReturnSuccess && ddrVotes.back()==10687500);
+        CHECK(adreno830_resume_gpu(false,&r)==kIOReturnSuccess && called("A830PowerState::resume")==1);
+        ++suspendCases;
+        testIdle=A830IdleConfig{};suspendResult=resumeResult=kIOReturnSuccess;
+    }
+    std::printf("PASS: piano-gpu-suspend (UniXNU-piano): %u orchestrator cases (kOff's gate busy or down, the idle votes and floor "
+                "raises standing aside while it is shut, PreSleep's DDR to the display's floor or the keepalive minimum and the rails "
+                "to NOM_L1 or 0, never up, DDR before rails; PostResume's rails then DDR as found, once; a failed vote undone; kOn's "
+                "resume with and without the wake)\n",suspendCases);
     std::printf("PASS: piano-gpu-idle (UniXNU-piano): %u full runs (modes 0, 1, 2 with and without its slumber, pagani-gpu-slumber's "
                 "choice kept; mode 2 drops the boot DDR vote to the display's floor at S10, a failed drop keeps it, a chosen "
                 "pagani-gpu-ddr-floor is kept) and the idle votes through the DCVS hook (down after 1 s quiet to DDR level 5 and "

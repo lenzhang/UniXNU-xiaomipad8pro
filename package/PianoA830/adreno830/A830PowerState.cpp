@@ -56,6 +56,9 @@ IOReturn A830PowerState::init(const A830PowerConfig &config,const A830PowerIo &i
     phase_=A830PowerDown;refs_=access_=gxAccess_=0;
     cxOn_=true;cxLost_=cxRestored_=false;rsccSlept_=false;ifpcActive_=false;ifpcWanted_=config.ifpc;touchPending_=false;
     screenOff_=screenSlept_=screenEntering_=false;screenOffAt_=0;
+#ifdef ADRENO830_MACOS
+    suspended_=false;
+#endif
     targetLevel_=votedLevel_=config.defaultLevel;targetBus_=votedBus_=config.defaultBus;
     submitLevel_=submitBus_=touchLevel_=touchBus_=0;
     initialized_=true;
@@ -87,12 +90,26 @@ IOReturn A830PowerState::acquire()
 {
     /* Fast path: increment, then look at the phase (a transition stores its phase, then looks at the count). */
     __atomic_fetch_add(&refs_,1u,__ATOMIC_SEQ_CST);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (A830Suspend.h): the suspend gate is a second word of the same protocol (suspend() stores it, then looks at the
+     * count): a holder either counts before the gate shut or sees it and backs off. */
+    if(__atomic_load_n(&phase_,__ATOMIC_SEQ_CST)==A830PowerActive && !__atomic_load_n(&suspended_,__ATOMIC_SEQ_CST))
+        return kIOReturnSuccess;
+    __atomic_fetch_sub(&refs_,1u,__ATOMIC_SEQ_CST);
+    /* Shut: wait for the resume without the mutex (suspend() and resume() take it), polled every millisecond. */
+    for(uint64_t waited=0;suspended() && waited<uint64_t(config_.suspendWaitMs)*1000u;waited+=1000)env_.sleepUs(env_.context,1000);
+#else
     if(__atomic_load_n(&phase_,__ATOMIC_SEQ_CST)==A830PowerActive)return kIOReturnSuccess;
     __atomic_fetch_sub(&refs_,1u,__ATOMIC_SEQ_CST);
+#endif
     lock();
     IOReturn result=kIOReturnSuccess;
     switch(phase()) {
+#ifdef ADRENO830_MACOS
+    case A830PowerActive: if(suspended())result=A830ReturnNotResponding;break;   /* still shut: as a transition in progress */
+#else
     case A830PowerActive: break;
+#endif
     case A830PowerSlumber: result=wakeLocked(A830WakeSubmit);break;
     default: result=A830ReturnNotResponding;break;   /* down, recovering, lost (transitions hold the mutex) */
     }
@@ -163,6 +180,10 @@ void A830PowerState::setScreenOff(bool off,uint64_t now)
 
 uint64_t A830PowerState::tick(uint64_t now)
 {
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the system suspend owns the GPU until resume(): no slumber, no pre-wake, no IFPC cycle. */
+    if(suspended()) {touchPending_=false;return now+NsPerS;}
+#endif
     const uint64_t idleNs=uint64_t(config_.idleMs)*NsPerMs;
     switch(phase()) {
     case A830PowerSlumber:
@@ -459,6 +480,9 @@ IOReturn A830PowerState::wakeLocked(A830WakeReason reason)
     const A830PowerPhase current=phase();
     if(current==A830PowerActive)return kIOReturnSuccess;
     if(current!=A830PowerSlumber)return A830ReturnNotResponding;
+#ifdef ADRENO830_MACOS
+    if(suspended() && reason!=A830WakeSuspend)return A830ReturnNotResponding;   /* UniXNU-piano: the suspend gate */
+#endif
     __atomic_store_n(&phase_,uint8_t(A830PowerWaking),__ATOMIC_SEQ_CST);
     const uint64_t begin=env_.nowNs(env_.context);
     uint8_t level=targetLevel(),bus=targetBus();
@@ -486,6 +510,82 @@ IOReturn A830PowerState::wakeLocked(A830WakeReason reason)
     adreno830_status_running();
     return kIOReturnSuccess;
 }
+
+#ifdef ADRENO830_MACOS
+/* ---- UniXNU-piano: the system suspend (A830Suspend.h) ---------------------------------------------------------------------- */
+
+IOReturn A830PowerState::suspendLocked(SuspendInfo *info)
+{
+    switch(phase()) {
+    case A830PowerSlumber:
+        if(slumberMode_==A830SlumberFull) {info->alreadyAsleep=true;return kIOReturnSuccess;}
+        /* CX kept (P1's CX-keeping mode, or the screen rule's): up, then down again with CX. */
+        if(wakeLocked(A830WakeSuspend)!=kIOReturnSuccess)return kIOReturnIOError;
+        break;
+    case A830PowerActive: break;
+    default: return kIOReturnBusy;   /* a transition or a recovery: the caller looks again */
+    }
+    const uint64_t begin=env_.nowNs(env_.context);
+    const IOReturn result=enterLocked(A830SlumberFull,now());
+    if(result==kIOReturnSuccess) {
+        info->entryUs=uint32_t((env_.nowNs(env_.context)-begin)/NsPerUs);
+        info->warnings=stats_.warnings;
+        return kIOReturnSuccess;
+    }
+    /* enterLocked aborts with Busy (a holder, work, a pending interrupt, a busy GPU: nothing changed); every other result came
+     * through fail(), which gave the GPU to the recovery. */
+    return result==kIOReturnBusy || result==kIOReturnNotReady?kIOReturnBusy:kIOReturnIOError;
+}
+
+IOReturn A830PowerState::suspend(uint32_t waitUs,SuspendInfo *info)
+{
+    SuspendInfo local{};
+    if(!info)info=&local;
+    *info=SuspendInfo{};
+    if(!initialized_)return A830ReturnNotResponding;
+    __atomic_store_n(&suspended_,true,__ATOMIC_SEQ_CST);
+    const uint64_t begin=env_.nowNs(env_.context);
+    IOReturn result=kIOReturnBusy;
+    for(;;) {
+        const A830PowerPhase p=phase();
+        if(p==A830PowerLost || p==A830PowerDown) {result=A830ReturnNotResponding;break;}
+        if((p==A830PowerActive || p==A830PowerSlumber) && !holders() && !inFlight()) {
+            lock();
+            result=suspendLocked(info);
+            unlock();
+            if(result!=kIOReturnBusy)break;
+        }
+        const uint64_t waited=env_.nowNs(env_.context)-begin;
+        if(waited>=uint64_t(waitUs)*NsPerUs) {
+            result=phase()==A830PowerRecovering?A830ReturnNotResponding:kIOReturnBusy;
+            break;
+        }
+        env_.sleepUs(env_.context,1000);
+    }
+    info->waitedUs=uint32_t((env_.nowNs(env_.context)-begin)/NsPerUs);
+    if(result!=kIOReturnSuccess)__atomic_store_n(&suspended_,false,__ATOMIC_SEQ_CST);
+    return result;
+}
+
+IOReturn A830PowerState::resume(bool wakeNow,uint32_t *wakeUs)
+{
+    if(wakeUs)*wakeUs=0;
+    if(!suspended())return kIOReturnSuccess;
+    lock();
+    __atomic_store_n(&suspended_,false,__ATOMIC_SEQ_CST);
+    IOReturn result=kIOReturnSuccess;
+    if(wakeNow && phase()==A830PowerSlumber) {
+        const uint64_t begin=env_.nowNs(env_.context);
+        result=wakeLocked(A830WakeExplicit);
+        if(wakeUs)*wakeUs=uint32_t((env_.nowNs(env_.context)-begin)/NsPerUs);
+    } else if(phase()==A830PowerSlumber) {
+        /* Left asleep: the quiet time counts from now (the first submission wakes it). */
+        __atomic_store_n(&lastActivity_,now(),__ATOMIC_RELEASE);
+    }
+    unlock();
+    return result;
+}
+#endif
 
 void A830PowerState::publishSlumber(uint64_t now)
 {

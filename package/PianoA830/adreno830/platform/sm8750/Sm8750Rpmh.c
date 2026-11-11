@@ -664,4 +664,25 @@ int Sm8750RpmhHostRailsIdle(Sm8750RpmhHost *host, uint32_t vlvl)
     host->cx_hlvl = cx;
     return Sm8750RpmhOk;
 }
+
+/* UniXNU-piano: the system suspend's rails (A830Suspend.h). */
+int Sm8750RpmhHostRailsSet(Sm8750RpmhHost *host, uint32_t mx_hlvl, uint32_t cx_hlvl)
+{
+    Sm8750RpmhRequest request;
+    int rc;
+    if (!host || !host->res)
+        return Sm8750RpmhArgument;
+    if (!(host->held & Sm8750RpmhHeldRails))
+        return Sm8750RpmhOk;
+    if (mx_hlvl >= host->res->mx.count || cx_hlvl >= host->res->cx.count)
+        return Sm8750RpmhArgument;
+    if (mx_hlvl == host->mx_hlvl && cx_hlvl == host->cx_hlvl)
+        return Sm8750RpmhOk;
+    const int raise = mx_hlvl > host->mx_hlvl || cx_hlvl > host->cx_hlvl;
+    if ((rc = Sm8750RpmhRailRequest(host->res, mx_hlvl, cx_hlvl, raise, &request)) || (rc = host_send(host, &request)))
+        return rc;
+    host->mx_hlvl = mx_hlvl;
+    host->cx_hlvl = cx_hlvl;
+    return Sm8750RpmhOk;
+}
 #endif
