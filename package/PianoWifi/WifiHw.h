@@ -117,14 +117,25 @@ constexpr uint16_t kStreamRoot = 0x1400, kStreamEndpoint = 0x1401;
 // point in mV, 0x45 MODE, 0x46 EN_CTL (bit 7 enabled). Observer reads only (piano-wifi-spmi=1).
 // What the chip needs (Project-SunUEFI patches/linux/7.3/0001-platform.patch, its WCN7861 votes): S5F 876-1000 mV, S4D 876-1036 mV,
 // S7I 1312-1340 mV, S3G 1860-2000 mV; the stock RPMh minimums are lower (500 / 500 / 1224 mV), so level 2 votes the voltage too.
-struct Rail { const char *supply; const char *regulator; const char *cmdDb; uint8_t sid; uint8_t smps; uint8_t ldo; uint16_t millivolts; };
+// order: the DT supply order, which is the order the rails are brought up in (level 2); 0 = never voted by this driver.
+// minMv / maxMv: piano's own DT range of that regulator (regulator-min/max-microvolt of rsc@16500000 regulators-*), so the voted
+// voltage is a fact of this board, not the 13T's: level 2 asks for minMv (what the chip needs) and never for more than maxMv.
+struct Rail {
+  const char *supply; const char *regulator; const char *cmdDb; uint8_t sid; uint8_t smps; uint8_t ldo; uint16_t millivolts;
+  uint16_t minMv; uint16_t maxMv; uint8_t order; const char *shared;
+};
 constexpr Rail kRails[] = {   // smps / ldo: the regulator's number in its kind (0: not that kind)
-  {"pmu vddio", "vreg_l3f_1p8", "ldof3", 5, 0, 3, 1800},      {"pmu vddio1p2", "vreg_l2f_1p2", "ldof2", 5, 0, 2, 1200},
-  {"pmu vddaon", "vreg_s5f_0p88", "smpf5", 5, 5, 0, 880},     {"pmu vdddig", "vreg_s4d_0p88", "smpd4", 3, 4, 0, 880},
-  {"pmu vddrfa1p2", "vreg_s7i_1p31", "smpi7", 8, 7, 0, 1310}, {"pmu vddrfa1p8", "vreg_s3g_1p86", "smpg3", 6, 3, 0, 1860},
-  {"phy vdda-phy", "vreg_l1f_0p88", "ldof1", 5, 0, 1, 880},   {"phy vdda-pll", "vreg_l3g_1p2", "ldog3", 6, 0, 3, 1200},
+  {"pmu vddio", "vreg_l3f_1p8", "ldof3", 5, 0, 3, 1800, 1800, 1800, 1, "BT vdd18-aon"},
+  {"pmu vddio1p2", "vreg_l2f_1p2", "ldof2", 5, 0, 2, 1200, 1200, 1200, 2, "BT vdd12-io"},
+  {"pmu vddaon", "vreg_s5f_0p88", "smpf5", 5, 5, 0, 880, 876, 1000, 3, "BT rfa0p75/aon"},
+  {"pmu vdddig", "vreg_s4d_0p88", "smpd4", 3, 4, 0, 880, 876, 1036, 4, "BT vdd-dig"},
+  {"pmu vddrfa1p2", "vreg_s7i_1p31", "smpi7", 8, 7, 0, 1310, 1312, 1340, 5, "BT rfa1p3 (on the 13T also the UFS vccq parent)"},
+  {"pmu vddrfa1p8", "vreg_s3g_1p86", "smpg3", 6, 3, 0, 1860, 1864, 2000, 6, "BT rfa1p8"},
+  {"phy vdda-phy", "vreg_l1f_0p88", "ldof1", 5, 0, 1, 880, 880, 920, 0, "always-on; UFS refgen, USB, CSI: never voted"},
+  {"phy vdda-pll", "vreg_l3g_1p2", "ldog3", 6, 0, 3, 1200, 1200, 1256, 0, "the UFS PHY's and the DSI PHY's PLL: never voted, never lowered"},
 };
 constexpr unsigned kRailCount = sizeof kRails / sizeof kRails[0];
+constexpr unsigned kVotedRails = 6;   // kRails[0..5]; the two PHY LDOs are read only (NativeUfs runs on one of them)
 constexpr uint8_t smpsPage(unsigned n) { return uint8_t(0x9b + 3 * (n - 1)); }
 constexpr uint8_t ldoPage(unsigned n) { return uint8_t(0xc0 + n); }
 constexpr uint8_t ldoPageAlt(unsigned n) { return uint8_t(0x40 + n - 1); }
@@ -138,5 +149,74 @@ constexpr unsigned kPmicPinCount = sizeof kPmicPins / sizeof kPmicPins[0];
 // SPMI arbiter v7 (DT spmi@c400000, qcom,ee = 0): the windows of SpmiObserver.h
 // AOP command database (DT aop-cmd-db@81c60000, 0x20000 bytes, no-map): read only, copied out word by word (PianoKeyboard's way)
 constexpr uint64_t kCmdDb = 0x81c60000, kCmdDbBytes = 0x20000;
+
+// ================================================================================================= level 2: the rails by RPMh
+// The application processor's RSC (DT rsc@16500000, qcom,drv-id 2): the HLOS's DRV is DRV-2 at 0x16520000, its TCS block at +0xd00,
+// three ACTIVE TCSes first (qcom,tcs-config). The protocol and the register layout are PianoA830's Sm8750Rpmh.h / PianoPower's
+// QcomRpmh.c (same repository): a VRM resource takes the set point in mV at +0, the enable at +4 and the mode at +8 (7 = NPM/HPM).
+constexpr uint64_t kRscDrv2 = 0x16520000, kRscDrv2Bytes = 0x10000;
+constexpr uint32_t kRscTcsBlock = 0xd00;
+constexpr uint32_t kVrmVoltage = 0, kVrmEnable = 4, kVrmMode = 8, kVrmModeNpm = 7;
+// pwrseq-qcom-wcn's wcn7850/peach entry (behaviour, not code): the rails in DT order, then WLAN_EN high and 50 ms before the chip
+// answers. SHENG held WLAN_EN low 150 ms first so that an earlier start has stopped; PAGANI does the same.
+constexpr unsigned kWlanEnLowMs = 150, kPmuPowerUpMs = 50;
+
+// ================================================================================================= level 3: the root complex
+// PARF, the SM8550 programming model (PCI = mainline pcie-qcom cfg_1_9_0; PAGANI has the same offsets from the 13T's vendor driver)
+constexpr uint32_t kParfMhiClockResetCtrl = 0x174, kParfAxiMstrWrAddrHalt = 0x1a8, kParfIntAllClear = 0x228,
+                   kParfIntAllMask = 0x22c, kParfDbiBaseHi = 0x354, kParfSlvSpaceHi = 0x35c, kParfAtuBaseHi = 0x638,
+                   kParfBdfToSidTable = 0x2000;
+constexpr uint32_t kParfDeviceTypeRc = 4, kParfPhyTestPwrDown = 1u << 0, kParfBdfToSidBypass = 1u << 0,
+                   kParfSysCtrlMstrAxiClkEnable = 1u << 29, kParfMhiClockResetCtrlBypass = 1u << 4, kParfPmCtrlReqNotEntr = 1u << 5,
+                   kParfAxiMstrWrHaltEnable = 1u << 31;
+// The BDF-to-SID hash table: 256 words of (BDF << 16 | SID offset << 8 | next), indexed by a CRC-8 (polynomial 0x07, MSB first,
+// the requester ID's high byte then its low byte) of the requester ID; used once the bypass bit is clear.
+constexpr uint8_t kBdfHashPoly = 0x07;
+constexpr uint16_t kRootRid = 0x0000, kEndpointRid = 0x0100;
+// DBI: the type 1 header's memory window, and the PCI Express capability's link control 2 (capability + 0x30)
+constexpr uint32_t kDbiMemBaseLimit = 0x20, kExpLinkCap = 0x0c, kExpLinkCtlSta = 0x10, kExpLinkCtl2 = 0x30;
+constexpr uint32_t kCommandMemory = 1u << 1, kCommandMaster = 1u << 2;
+// iATU, unrolled: control 1 (+0, the TLP type), control 2 (+4, bit 31 enable), base (+8/+0xc), limit (+0x10), target (+0x14/+0x18),
+// upper limit (+0x20)
+constexpr uint32_t kAtuCtrl1 = 0x00, kAtuCtrl2 = 0x04, kAtuBaseLo = 0x08, kAtuBaseHi = 0x0c, kAtuLimit = 0x10, kAtuTargetLo = 0x14,
+                   kAtuTargetHi = 0x18, kAtuUpperLimit = 0x20;
+constexpr uint32_t kAtuTypeMem = 0, kAtuTypeCfg0 = 4;
+// The RCG sources: aux from the TCXO (CFG 0), rchng at 100 MHz (DT assigned-clock-rates 0x5f5e100; source 6 = GPLL0_OUT_EVEN with
+// the divider field of 3, as mainline's and PAGANI's tables encode it); the pipe mux takes 0 = the PHY's pipe clock, 2 = TCXO.
+constexpr uint32_t kAuxCfgTcxo = 0, kRchngCfg100MHz = (6u << 8) | 5u, kRcgUpdate = 1u << 0;
+constexpr uint32_t kPipeMuxPhy = 0, kPipeMuxTcxo = 2, kTcsrClkRefEnable = 1u << 0;
+// The GCC branch vote bits level 3 sets (the words are shared: PianoA830 votes GPLL0 in 0x52000, PianoTouch the QUP branches)
+constexpr uint32_t kVote8Bits = 0x7f, kVote0Bits = (1u << 11) | (1u << 12) | (1u << 19) | (1u << 20) | (1u << 22);
+// Link speeds: the PHY is gen3x2, but Gen3 needs cx/mx at NOM (DT opp-table: opp-level 0x100 for the two fastest OPPs), which
+// nothing here votes, so the target link speed stays Gen2 unless piano-wifi-gen says otherwise (PAGANI's rule).
+constexpr unsigned kMaxGen = 3, kDefaultGen = 2;
+constexpr uint32_t kLinkTrainMs = 1000, kEndpointAnswerMs = 1000;
+
+// ================================================================================================= level 4: MHI and firmware
+// The endpoint's MHI registers live at the start of BAR0 (sheng, PAGANI; ath12k maps them the same way). BHI and BHIe are at the
+// offsets the device reports in BHIOFF / BHIEOFF.
+constexpr uint32_t kMhiRegLen = 0x00, kMhiBhiOff = 0x28, kMhiBhieOff = 0x2c, kMhiCtrl = 0x38, kMhiStatus = 0x48;
+constexpr uint32_t kMhiCfg = 0x10, kMhiErdbOff = 0x20, kMhiCcabap = 0x58, kMhiEcabap = 0x60, kMhiCrcbap = 0x68,
+                   kMhiCtrlBase = 0x80, kMhiCtrlLimit = 0x88, kMhiDataBase = 0x98, kMhiDataLimit = 0xa0;
+constexpr uint32_t kMhiCtrlReset = 1u << 1, kMhiStatusReady = 1u << 0, kMhiStatusSysErr = 1u << 2, kMhiStateShift = 8;
+constexpr uint32_t kBhiImgAddrLo = 0x08, kBhiImgAddrHi = 0x0c, kBhiImgSize = 0x10, kBhiImgTxDb = 0x18, kBhiIntVec = 0x20,
+                   kBhiExecEnv = 0x28, kBhiStatus = 0x2c, kBhiErrCode = 0x30;
+constexpr uint32_t kBhieTxVecAddrLo = 0x2c, kBhieTxVecAddrHi = 0x30, kBhieTxVecSize = 0x34, kBhieTxVecDb = 0x3c,
+                   kBhieTxVecStatus = 0x44;
+constexpr uint32_t kMhiSeqMask = 0x3fffffffu, kMhiXferSuccess = 2, kMhiXferError = 3;
+// The chip's register window in BAR0: offsets below 0x80000 are direct, higher ones go through the window register (PAGANI's choice
+// for 0x110e, from the 13T's cnss2: 0x3278; WCN7850 and sheng use 0x310c). Level 4 reads only the SoC version through it.
+constexpr uint32_t kChipWindowReg = 0x3278, kChipWindowEnable = 0x40000000, kChipWindowShift = 19, kChipWindowMask = 0x3f,
+                   kChipWindowStart = 0x80000, kChipWindowRange = 0x7ffff;
+constexpr uint32_t kChipTcsrSocHwVersion = 0x01b00000;
+constexpr uint32_t kBar0BytesExpected = 0x200000;   // 2 MiB on WCN7850 (sheng); needs-boot for 0x110e
+// The firmware file (never in this repository): the stock modem_a FAT, image/peach/amss20.bin = ath12k's amss.bin, 6930496 bytes.
+// BHI carries its first 512 KiB (the secondary boot loader); BHIe carries the second ELF that follows when the bytes at 512 KiB are
+// "\177ELF" (peach), else the whole file (WCN7850). Segments of 512 KiB, as the 13T's cnss2 cuts them.
+constexpr const char *const kFirmwarePartitions[] = {"modem_a", "modem_b"};
+constexpr const char *const kFirmwareDirs[] = {"image/peach", "image"};
+constexpr const char *kAmssName = "amss20.bin";
+constexpr uint32_t kMhiSblBytes = 512 * 1024, kMhiSegBytes = 512 * 1024, kMhiMaxSegments = 32;
+constexpr uint32_t kDmaWindowBytes = 24u << 20;   // the boot loader, the segments, the vector table and the MHI contexts
 
 }  // namespace pianowifi
