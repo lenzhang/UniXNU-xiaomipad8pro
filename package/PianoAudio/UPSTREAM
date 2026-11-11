@@ -100,3 +100,53 @@ The macOS devices (PianoAudioDevice.cpp, AudioPcm.{h,c}): UniXNU-droidvm (github
   prefill and Android's mixer) replaced by the transport's own, a failed engine thread start stops the transport again.
   overlay/kext/DroidVMAudio/DroidVMAudioStarter.cpp (sha256 9211cc8dd4ae163445e9ab3a8540e8c2a03c8fa7a307afcc1cdaa936759f8330): the
   reason to attach after IOBSD (PianoAudio::devices() waits for it), not its code.
+
+Levels 4-7 (2026-11-11, host-tested; nothing of it has run on hardware yet):
+
+New code, from facts: AudioSession.{h,c} (the levels as one state machine), AudioAmps.{h,c} (the four amplifiers as a group),
+  AudioPreset.{h,c} (the preset from the ESP), AudioPins.h (the pin values and the LPASS loads), AudioBoard.{h,cpp} (the kext's
+  hardware), the walk in AudioSafety.{h,c}, the PRM and microphone plans in AudioSequence.c, the GPR port sets in AudioDspLink.c,
+  tests/session_host.c, amps_host.c, preset_host.c, synthetic_fsm.h (a made-up container: no vendor data).
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent, copied byte for byte but for their provenance lines (the build script checks it):
+  package/PianoPower/FatVolume.c (sha256 6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779) and FatVolume.h (sha256
+    a438bcc5519bacfbfa6b6c55646fe4a3f7787f37a50c52103d8094c6871b67e7): FatVolume.{c,h}.
+  package/PianoDwc3/SmmuStream.h (sha256 8f566938f259730d15407aa2d84abb3f6ec3b06c7bf3dabaef78c7e7fbb930a3): SmmuStream.h, the
+    namespace changed.
+  package/PianoKeyboard/BitI2c.h (sha256 c63c87803997d89a4a09be877d7f04712e5d02e3d00bae30f41bb288beb76767): BitI2c.h, the namespace and
+    the include guard changed.
+  package/PianoBacklight/PianoBacklight.cpp: the open-drain line functions and the pins given back after each burst (re-written in
+    AudioBoard.cpp); package/PianoSensors/PianoSensors.cpp: the ESP read through NativeUfs, the slice mapped write-combined and
+    zeroed with 8-byte stores, the four exact stream ids of a masked DT entry (re-written).
+
+UniXNU-sheng (main 00ba90984e831e4c6ce30ec3d8a56e6434e9f1af), BSD-2-Clause-Patent, facts only: package/AudioProbe.cpp (sha256
+  78fd6bc2700cfa697ed4fe70ad58130a02f6b1ae3611a3690a05e1d7d3b3427b): PRM requests from the PRM's own port 2 (its first vote from
+  0x2001 refused with status 1), APM and data from 0x2001; the audio streams 0x1001/0x1081/0x1061 through a bypass bank (a translating
+  context reset that board); the TX mclk asked at 19.2 MHz "couple no".
+
+Specifications only (GPL-2.0; behaviour, ids and layouts as facts, no code, comment or table copied): yzddmr6/linux-sm8750-piano
+  (piano/v1.1.0, the tree whose sound/soc/codecs/fs19xx.c has the sha256 recorded above):
+  sound/soc/qcom/qdsp6/q6prm.c (b01d7e9a899fdebcae6d65df2277aa2f29d6619414e510aac5d348bc8f554c8d) and q6prm.h
+  (21f3eec32168bf0a8b0d2f7a6b53015aadb16d3e2740f537bfc467dbc562dc72): the PRM request and release layouts, the answer opcodes, the
+  clock ids 0x202 and 0x30c, the hardware cores 1 and 2, the source port = the service id; q6prm-clocks.c
+  (dc9545bf1db5fbcb6b0b9a6680c4a5ee3d1f92e305c729e3b484c13be4eed44c) and q6dsp-lpass-clocks.c
+  (1546704be94be6be4803bd5f9412b4211e3f34fc323b31ee8789469543d6c189): the DT index -> PRM id mapping, the attribute from the DT's
+  second cell; q6apm-lpass-dais.c (8e0159fbdfadf359ba4670999d383fb250475c49c1579115c0371f4cb00e89a4): the bit clock set and enabled at
+  hw_params; q6apm.c (406e96316c56174c8cce2048c94bbdba165993e6f7b283aa8f2fbe637f666880) and audioreach.c
+  (9888bb8885d33ea76741b529eea56bc4321016a8a8b0866043bb6db85ee54688): MEM_MAP from the APM port, WRITE/READ from the graph's dynamic
+  port; sc8280xp.c (aa12fb28614387cedf6c94e1a435cbe9f4030ba6b20ab286fc82dcc6a686d942): piano's TDM hw_params order, the slot channel
+  map, the 231 cap note; sound/soc/codecs/lpass-va-macro.c (10594293664531b7ca7135b976e3177695c5cafba5f6fe37fcece3ee591a4744): the mclk
+  at 2 x 9.6 MHz, the clock enable order, CORE_ID_0..3; drivers/pinctrl/qcom/pinctrl-sm8750.c
+  (9772d7520ee7a6271d7fd7f3ecba58d3fe86073387569604d589d8c907d5ffff): gpio64/65's and gpio121-124's first functions, the CTL field
+  positions; pinctrl-msm.c (d6638c03c09f5c0b24d9e343e19fb04ad7d483ec4f1c5fdabde4efc3570d59f8): the eGPIO claim; pinctrl-lpass-lpi.h
+  (5903891722e5cb7a80b690d966ca6b4e1086a6d5d28aaa88ef0feb5050fa6044) and pinctrl-sm8650-lpass-lpi.c
+  (9309809f079897a34db76c35143b3adb32ce4f812f692b63e68b0aae1a6f6fa8): the LPI pin layout and the DMIC pins;
+  include/dt-bindings/sound/qcom,q6dsp-lpass-ports.h (8217bc8dbedb845b65ec1bbe87c9e9099f0f21ec097026d3f3fc381dc7bb2ed0): the DT clock
+  indices 37 and 57, the votes 102/103, the attribute values; sound/soc/codecs/fs19xx.c (above): the reset hold and the DEVID poll.
+  Project-SunUEFI patches/linux/7.3/0005-audio.patch (sha256 above): its ports 3 and 7.
+The piano boot DT (out/inputs/piano-boot.dtb, sha256 above): the bclk cell <q6prmcc 0x25 1>, the VA macro's clocks
+  <q6prmcc 0x39 1> <0x66 1> <0x67 1>, the hub's clocks and interconnects, the reset lines.
+
+Not read and not used for anything: any Qualcomm or FourSemi binary, the DSP firmware, the ACDB, the topology. The stock preset was
+  only checked, on the owner's Mac, against its pinned size and SHA-256 and by this package's own parser (verdicts and counts
+  printed, nothing of its contents); it is not in this repository, a build output or a test.
