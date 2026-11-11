@@ -15,7 +15,7 @@ HID=$K/out/x12377/inc-hid NET=$K/out/x12377/inc-net-piano
 "$D/package/PianoDwc3/tests/run.sh"   # host tests: gadget core (+ NCM), NTB16, TX FIFO plan, SMMU planner, input parser (a few seconds)
 python3 "$D/tooling/k27/build-native-kext.py" PianoDwc3 "$D/package/PianoDwc3/PianoDwc3.cpp" "$D/package/PianoDwc3/PianoUsbNet.cpp" \
   "$D/tooling/k27/NativeKextGlue.cpp" \
-  -I "$D/package/PianoDwc3" -I "$D/package/PianoKeyboard" -I "$HID" -I "$NET" -I "$K/out/x12377/inc-gfx" -I "$K/out/x12377/storage-abi/include" \
+  -I "$D/package/PianoDwc3" -I "$D/package/PianoKeyboard" -I "$D/package/PianoBacklight" -I "$HID" -I "$NET" -I "$K/out/x12377/inc-gfx" -I "$K/out/x12377/storage-abi/include" \
   -D U:TARGET_OS_OSX -D TARGET_OS_OSX=1 --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 # IOHIDDevice's and IONetworkingFamily's symbols come from IOHIDFamily and IONetworkingFamily (libraries of the descriptor), resolved

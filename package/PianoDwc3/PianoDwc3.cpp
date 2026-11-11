@@ -49,6 +49,7 @@
 #include "HidInput.h"
 #include "HidDescriptors.h"   // package/PianoKeyboard: the keyboard (+ consumer) and pointer report descriptors, shared
 #include "UsbNet.h"           // the network function's macOS side (PianoUsbNet.cpp)
+#include "PianoBacklightClient.h"   // package/PianoBacklight: brightness keys to the backlight (piano-backlight-keys=1)
 
 using namespace pianousb;
 
@@ -1323,6 +1324,7 @@ void hidCounts(const char *why)
 void hidThread(void *, wait_result_t)
 {
   LineAssembler lines;
+  pianobacklight::KeyWatch brightness;
   bool keys = false, consumer = false, buttons = false;
   uint64_t last = nowNs(), reported = 0;
   uint32_t reportedCommands = 0;
@@ -1364,6 +1366,13 @@ void hidThread(void *, wait_result_t)
         ++gHid.errors;
         hidReply("err %s", c.error ? c.error : "?");
         continue;
+      }
+      // piano-backlight-keys=1: the brightness usages and Right Ctrl + 1/2 also step the panel backlight (PianoBacklightClient.h);
+      // the reports went to macOS as always.
+      if (pianobacklight::keysEnabled()) {
+        if (c.op == HidOp::release) brightness = pianobacklight::KeyWatch();
+        pianobacklight::step(c.op == HidOp::consumer ? brightness.consumer(uint16_t(c.report[1] | c.report[2] << 8))
+                             : c.op == HidOp::keyboard ? brightness.keyboard(c.report) : 0, "the Mac's keyboard (PianoDwc3 HID)");
       }
       ++gHid.commands;
       if (sent) hidReply("ok %u", gHid.commands);
