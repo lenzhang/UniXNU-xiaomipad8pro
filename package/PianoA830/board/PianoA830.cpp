@@ -666,6 +666,12 @@ void islandPublish(IOService *service)
 // piano-llcc-island=1 (piano-gpu=2) the programming.
 void islandStart(IOService *service, unsigned level)
 {
+  // Opt-in until a tablet boot has shown the reads are safe under Gunyah: without piano-llcc-island (0 = read only,
+  // 1 = read and program) the GPU boot does not touch the LLCC at all and the island stays "unknown".
+  if (bootArg("piano-llcc-island", 0xffffffffu) == 0xffffffffu) {
+    piano_a830_note("llcc: ISLAND1 not read (piano-llcc-island=0 reads it, =1 programs it)");
+    return;
+  }
   piano_a830_note("llcc: reading the ISLAND1 slice, read only (0x26864000 hw-info, 0x26841300..0x26841314 ATTR0..3, 0x2680c004 status)");
   const pianollcc::Reading r = pianollcc::read(kLlccThread);
   pianollcc::State state = pianollcc::judge(r);
