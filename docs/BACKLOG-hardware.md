@@ -21,7 +21,7 @@ Standing constraints for every item:
 |---|---|---|
 | Internal display, screen off/on | NativeGopDisplay (GOP copy) + PianoBacklight (`piano-backlight=2`: levels, sleep off/on, lid opt-in) | real DPU path → B1 |
 | Brightness | PianoBacklight steps + kernel brightness keys | auto-brightness → B3 |
-| Touch, CSOT/BOE detection | PianoTouch (gpio100 + the unit's calibration panel id, firmware per panel, auto orientation) | multi-touch/gestures (single pointer today); pen not in Ubuntu either |
+| Touch, CSOT/BOE detection | PianoTouch (gpio100 + the unit's calibration panel id, firmware per panel, auto orientation; level 2: tap, hold, drag, two-finger scroll and tap, palm rejection as a HID pointer, host-tested) | Apple's multitouch path (trackpad gestures); a run with a finger; pen not in Ubuntu either |
 | Magnetic keyboard + touchpad, key wake | PianoKeyboard (keys, touchpad, gestures, adaptive polling); hall gpio80 read | wake from screen-off/suspend → B2 |
 | Power / volume keys | PianoInput (Power 0x30, Vol± 0xE9/0xEA consumer usages, verified pressed on the tablet) | volume has no audio device to act on until audio lands; nothing else |
 | Wi-Fi | PianoWifi levels 1–4 (survey → power → PCIe → MHI firmware) | WMI/QMI/scan/join: months (`wifi.md`) |

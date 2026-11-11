@@ -129,7 +129,7 @@ Drivers and their state (each inert without its boot argument; pages in `docs/dr
 | PianoDwc3 (USB console, monitor incl. `reset fastboot`, the Mac's keyboard/pointer) | runs on the tablet; `reset fastboot` verified |
 | PianoPower (gauges, Type-C; DSP charger path) | level 1 runs and the battery charges from the Mac's port without the DSP; level 2 starts the DSP, which holds the input near 400 mA (input limit write pending: image I) |
 | PianoKeyboard (WN8030 cover + touchpad, hall gpio80) | MCU boots and the cover attaches; key/touchpad reports not yet seen with someone typing |
-| PianoTouch (NT36532E on QUP1 SE2) | level 1 passed on the tablet (identify, firmware, calibrated frames); level 2 queued |
+| PianoTouch (NT36532E on QUP1 SE2) | level 1 passed on the tablet (identify, firmware, calibrated frames); level 2 (gestures, palms, the power contract) host-tested and queued (`touch.md` §14-16) |
 | PianoWifi (WCN7860 on PCIe0) | level 1 ran (matches the design); levels 2-4 built, level 2 queued; the full ladder is months of work (`wifi.md`) |
 | PianoBacklight (2x KTZ8866: boot level, off on display sleep, key steps) | built, host-tested and linked, not run (`backlight.md`) |
 | PianoInput (buttons) | runs on the tablet |
