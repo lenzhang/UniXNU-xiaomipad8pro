@@ -1,0 +1,48 @@
+PianoDpu is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1 only: a read-only survey. What it takes from other
+work, and from where:
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoAudio/PianoAudio.cpp (sha256 cb0499f7fa02dec2919101843c70a1d3d7b9eed389c77625ac032782321f6a8a): the kext's shape
+    (probe gate on the boot argument, a survey thread, the post-mortem stage word, MMIO pages mapped on demand and loaded with an
+    explicit ldr, one summary property, repeated samples), re-written for this driver.
+  package/PianoAudio/AudioSurvey.h (sha256 a1c982501ad281c1a59b10de809cf50177d9c91b455d4bab8528fbfa256dea0e) and
+  package/PianoWifi/WifiSurvey.h (sha256 41a9703bf079dfd4f86fe5073399c788725d43e7dc0ad4306b36ffd16c9aa219): surveySmmu / s2crType
+    re-expressed for the DPU's four streams, with the bank's CBAR/CBA2R/SCTLR/TCR/TCR2/TTBR0/MAIR0/FSR (PianoWifi read a matching
+    bank's SCTLR on this SMMU) and a route verdict.
+  package/PianoAudio/tests/audio_host.cpp (sha256 dfe2b7d81ac2cbe4a0633bf4441107c192a352cb448e0df663a74e0709298833): the
+    register-model harness (Soc, CHECK), re-used in tests/dpu_host.cpp.
+
+UniXNU community code (facts only, no code copied; read for what other SM8x50 ports read and what they measured):
+  GopFramebuffer (unixnu-research/GopFramebuffer, BSD-2-Clause-Patent) NativeLegacyDisplay.cpp (sha256
+    e30354b7255fda259a25f3f7f22ecaff8c1c584196f8e54e6c402c03022d5770): the address-only flip (SRC0_ADDR + YSTRIDE0 of the scanning
+    pipes, CTL FLUSH, no START in video mode), its fence rule and IOSurface windows. The donor of B1b (docs/drivers/dpu.md section 4).
+  ShengUfs (unixnu-research/ShengUfs, BSD-2-Clause-Patent sources) NativeUfs.cpp (sha256
+    257fe82d29e80708f7eff65842d3382f3cff6d81416686452bceb776a3813132): the display stream's SMMU readout and its in-place translation
+    window (dpuEnable, native_ufs_dpu_map), measured on SM8550 under the same hypervisor family. The donor of B1b's SMMU step.
+  UniXNU-sheng (BSD-2-Clause-Patent) package/DisplayTimingProbe.cpp (sha256
+    2f65657b55a766ec18de8d1cb059ffdde7f59daefae6b6849fa0bcd93b31324f): the frame counter read twice for the refresh (its INTF engine
+    word at +0x6c is not the timing engine enable; this survey reads +0x0).
+  hackios-xnu-kernel-k90 (APSL 2.0, an SM8750 phone): facts only (the display clocks must be checked before an MDSS load; the
+    branch list), no code read into this package.
+
+Specifications only (no code, comment or table copied; GPL-2.0): the Ubuntu piano kernel (unixnu-research/ubuntu-ref/kernel, branch
+piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01): drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_12_0_sm8750.h (sha256
+114e33e2b01d55edeaf7940c16742327babb3bf9780e910596f61944fb999e82; block bases, interrupt bits), dpu_hw_sspp.c, dpu_hw_ctl.c,
+dpu_hw_lm.c, dpu_hw_dspp.c, dpu_hw_intf.c, dpu_hw_dsc_1_2.c, dpu_hw_merge3d.c, dpu_hw_interrupts.c, dpu_hwio.h, dpu_hw_catalog.c
+(register offsets and field layouts), dpu_crtc.c (the PCC's S3.15 coefficients), msm/registers/display/dsi.xml and dsi/dsi_host.c
+(the DSI 6G registers and how msm programs the bonded/DSC timing), msm_kms.c (the DPU's 32-bit address space),
+clk/qcom/dispcc-sm8750.c and gcc-sm8750.c (the display clock branches), iommu/arm/arm-smmu/arm-smmu-qcom.c (the SM8750 MDSS boot
+route kept as identity; moving it to the emulated bypass bank resets the SoC), drm/panel/panel-novatek-nt36532.c (sha256
+0e7a9692367e70493f712d0e7237c8c4e27da7886ea4134b342fddffeeb89e08; the piano modes, the rate-group registers, the off sequence).
+Project-SunUEFI (per-file licences; its docs and its GPL-2.0 Linux patches read for facts only): docs/devel/hardware/oem-refresh.md,
+display-resume.md, display-depth.md, docs/archive/display-clock/piano-display-smmu-observer.md (0x800 -> bank 2 under UEFI),
+patches/linux/7.3/0002-display.patch (the seamless VFP update: the DSI timing double buffer, INTF_VSYNC_PERIOD_F0).
+
+Data: the piano boot DT (out/inputs/piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840): every
+block address, the MDSS interrupt and its children, the SMMU streams, the splash region and the boot framebuffer's DDR vote. The stock
+panel XML (unixnu-research/piano-uefi/uefi/Binaries/piano/RawFiles/Panel_P81_42_02_0a_dualdsi_dsc_vid.xml, sha256
+64bb1cd81a9b4c669377aea9128e3d4c0fe8cd8abf66a7353253d379f7faa099; proprietary stock firmware data, read for its timing and command
+facts only, not redistributed): the per-link timing, the link rate, DSC, the term sequence.
+
+Not read and not used for anything: any Qualcomm or Xiaomi binary (the DPU/DSI firmware paths of ABL, the display DXEs), the
+calibration and demura data, Unixnu-SM8750-Piano (GPL-3.0).
