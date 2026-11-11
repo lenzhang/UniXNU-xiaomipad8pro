@@ -283,6 +283,7 @@ sleep and the wake restores it.
 |---|---|---|
 | `native-ufs-suspend=1` | 0 | NativeUfs (and the Data disk, with its store open read-write) in the power tree: §12.3. Exactly `1`; any other value is off |
 | `native-ufs-ahit=MS` | none (AHIT 0) | the controller's auto-hibernate after MS ms idle: §12.4 |
+| `native-ufs-suspend-abort-test=N` | 0 | a test's switch: suspend N is aborted as "I/O in flight" before anything is held or touched (no hold, drain, sync or UIC command), so the cancel path is proven with the link never in Hibern8 (`../power.md` §6 test C2) |
 | `native-ufs-suspend-cancel=1` | 0 | (with `native-ufs-suspend=1`) a suspend aborted for a state the system must not sleep in (Data store not synced, I/O in flight, cache not synced, the link not into Hibern8) asks the kernel to cancel the whole sleep (k27 0064, `piano-sleep-cancel=1`): §12.3 |
 
 ```

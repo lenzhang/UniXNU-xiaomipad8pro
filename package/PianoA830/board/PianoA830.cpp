@@ -830,7 +830,10 @@ void suspendGpu()
   if (gDpu) gDpu->release();
   gDpu = IOService::copyMatchingService(IOService::serviceMatching("PianoDpu"));
   A830SuspendReport r{};
-  const IOReturn result = adreno830_suspend_gpu(gSuspendConfig.idleWaitMs, &r);
+  // piano-gpu-suspend-fail-test=N (a test's switch, default 0): suspend N counts as a failed entry without touching the GPU (no gate,
+  // no wait, no slumber; no GPU suspend for the rest of the boot, as after a real failed entry), for the opt-in cancel's proof.
+  const bool failTest = gSuspendConfig.failTest && n == gSuspendConfig.failTest;
+  const IOReturn result = failTest ? kIOReturnIOError : adreno830_suspend_gpu(gSuspendConfig.idleWaitMs, &r);
   uint8_t outcome = A830SuspendOk;
   if (result == kIOReturnSuccess) outcome = A830SuspendOk;
   else if (result == kIOReturnNotReady) outcome = A830SuspendOff;
@@ -859,6 +862,12 @@ void suspendGpu()
     piano_a830_note("gpu suspend #%u: REFUSED: the GPU is lost: nothing of it is touched, its votes stay", n);
     break;
   default: {
+    if (failTest) {
+      piano_a830_note("gpu suspend #%u: REFUSED (piano-gpu-suspend-fail-test=%u: a failed entry, the GPU not touched); no GPU suspend for "
+                      "the rest of the boot; %s", n, gSuspendConfig.failTest, gSuspendConfig.cancel ?
+                      "the kernel is asked to cancel this sleep (piano-gpu-suspend-cancel=1)" : "the suspend goes on without the GPU's share");
+      break;
+    }
     // The recovery has the GPU: wait for it here, so the suspend never freezes a GPU half down.
     uint32_t waited = 0;
     A830PowerState *power = adreno830_power_state();
@@ -969,6 +978,7 @@ void suspendConfigure(unsigned level)
   const uint32_t display = bootArg("piano-gpu-suspend-display-ms", 300);
   c.displayWaitMs = display > 2000 ? 2000 : display;
   c.cancel = c.enabled && bootArg("piano-gpu-suspend-cancel", 0) == 1;
+  c.failTest = c.enabled ? bootArg("piano-gpu-suspend-fail-test", 0) : 0;
 }
 
 // The starter thread, once the GPU runs: into the power tree (the contract's two states), so IOPMrootDomain takes the GPU down

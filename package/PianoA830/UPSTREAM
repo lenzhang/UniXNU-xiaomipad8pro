@@ -34,7 +34,7 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
     A830Idle.h              (new)                                                            -> b90f05f80501078f9de1429a51d73b9644278b35ae8fcd167c15abc738848512
       2026-11-11, MIT, this repository's: the idle policy's configuration, the scanout's DDR floor, the idle votes' state machine, the
       transitions' line rule and the board hooks' declarations.
-    A830Suspend.h           (new)                                                            -> 1223ec471f73547fcfd2aa5177df13abae23f80e577f35c680611084ba4886ff
+    A830Suspend.h           (new)                                                            -> 179467c1bc8e47fcca176b12eb957fc86b909f5fe05852e4c6eca64dde066bbd
       2026-11-11, MIT, this repository's: the system suspend's configuration, the DDR and rail targets, the four-step machine, the
       report and the orchestrator's entry points. 2026-11-12: cancelWanted (a failed entry) and the config's cancel, for the board's
       opt-in cancel of the sleep (piano-gpu-suspend-cancel=1, k27 0064).

@@ -92,6 +92,7 @@ kernel side must provide (2026-11-11).
 | `piano-gpu-suspend-idle-ms=<ms>` | 500 | how long kOff waits for the GPU to be quiet (50..2000); not quiet: the suspend goes on without the GPU's share |
 | `piano-gpu-suspend-rails=<vlvl>` | 0x140 | host CX/MX while suspended (RPMh vlvl, never above what is held, at least NOM_L1 while the panel scans); 0: the votes gone (CX-collapse configuration, only once UFS/USB/PCIe are down in their own kOff) |
 | `piano-gpu-suspend-wake=0/1` | 1 | kOn wakes the GPU at once (0: the first submission wakes it) |
+| `piano-gpu-suspend-fail-test=N` | 0 | a test's switch: suspend N counts as a failed slumber entry without touching the GPU (no gate, no wait, no slumber; no GPU suspend for the rest of the boot, as after a real failure): the cancel's proof (`docs/power.md` §6 test C2) |
 | `piano-gpu-suspend-cancel=1` | 0 | (2026-11-12, host-tested, not run) a failed slumber entry (`A830SuspendFailed`: the recovery had the GPU, waited for up to 3 s, possibly still running) asks the kernel to cancel the whole sleep from kOff (k27 0064, `piano-sleep-cancel=1`; `docs/power.md` §3.7): line `gpu suspend #N: cancel of the sleep: taken, nothing is suspended (a normal wake follows)` (or `refused ...`). Busy, lost or off only lose the GPU's share: no cancel (`A830SuspendMachine::cancelWanted`, `test_a830suspend`) |
 | `piano-gpu-suspend-wake-ms=<ms>` | 100 | the first-frame bound the wake is reported against (1..10000) |
 | `piano-gpu-suspend-display-ms=<ms>` | 300 | how long PreSleep waits for PianoDpu's panel sleep to finish (0..2000) |

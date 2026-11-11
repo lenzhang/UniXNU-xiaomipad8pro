@@ -107,6 +107,7 @@ public:
   bool start (IOService *provider) override;
   void stop (IOService *provider) override;
   IOReturn setPowerState (unsigned long state, IOService *device) override;
+  void cancelSleep (void);   // UniXNU-piano: native-ufs-suspend-cancel=1 (RootPower.h ufsCancelWanted)
 };
 
 OSDefineMetaClassAndStructors (NativeUfs, IOService)
@@ -2637,6 +2638,9 @@ static uint32_t gPowerArg = 0;
 // piano-sleep-cancel=1, else refused and the sleep goes on with UFS up, as before).
 static uint32_t gCancelArg = 0;
 static uint32_t gCancels = 0, gCancelRefusals = 0;
+// native-ufs-suspend-abort-test=N (a test's switch, default 0): suspend N is aborted as "I/O in flight" before anything is held or
+// touched (no hold, no drain, no sync, no UIC command), so an unattended run proves the cancel path with the link never in Hibern8.
+static uint32_t gAbortTest = 0;
 static volatile int gPowerJoin = 0;   // 0 root start still running, 1 joined, -1 not taking part
 static NativeUfs *gPowerOwner = nullptr;
 // UEFI's UFS clocks and power domains, read only, for the log: NativeUfs holds none of them and never writes GCC (GccUfs.h).
@@ -2689,30 +2693,47 @@ IOReturn NativeUfs::setPowerState (unsigned long state, IOService *)
     hostResume ();
   } else if (!fPowerSeenOn) {
     IOLog ("NativeUfs: power: an off before the first on (not a system sleep): ignored\n");
+  } else if (gAbortTest && gPower.state == UfsPower::On && gPower.suspends + 1 == gAbortTest) {
+    ++gPower.suspends;
+    ++gPower.aborts;
+    gPower.abortKind = UfsAbort::InFlight;
+    gPower.lastStep = "test";
+    gPower.lastWhy = "native-ufs-suspend-abort-test";
+    IOLog ("NativeUfs: power: suspend %u ABORTED by native-ufs-suspend-abort-test=%u (as I/O in flight; nothing held or touched)\n",
+           gPower.suspends, gAbortTest);
+    cancelSleep ();
   } else if (hostSuspend ()) {
     powerClockLine ("suspended");
   } else if (gPower.state != UfsPower::Failed && ufsCancelWanted (gPower.abortKind)) {
-    if (!gCancelArg) {
-      IOLog ("NativeUfs: power: suspend %u aborted (%s): a sleep that should not happen; native-ufs-suspend-cancel=1 would ask the "
-             "kernel to cancel it\n", gPower.suspends, ufsAbortName (gPower.abortKind));
-    } else {
-      char why[96];
-      snprintf (why, sizeof (why), "%s (%s: %s)", ufsAbortName (gPower.abortKind), gPower.lastStep, gPower.lastWhy);
-      const IOReturn r = pianopower::cancelSystemSleep ("NativeUfs", why);
-      if (r == kIOReturnSuccess) ++gCancels;
-      else ++gCancelRefusals;
-      IOLog ("NativeUfs: power: suspend %u aborted (%s): asked the kernel to cancel this sleep (native-ufs-suspend-cancel=1): %s "
-             "(%u cancelled, %u refused)\n", gPower.suspends, why,
-             r == kIOReturnSuccess ? "cancelled, nothing is suspended" : r == kIOReturnUnsupported ?
-             "refused (piano-sleep-cancel=0, no piano-sleep, or a kernel before k27 0064): the sleep goes on with UFS up" :
-             r == kIOReturnNotReady ? "no system sleep in progress" : "too late", gCancels, gCancelRefusals);
-    }
+    cancelSleep ();
   }
 #else
   (void) state;
 #endif
   return kIOPMAckImplied;
 }
+
+#if defined(NATIVE_UFS_SM8750) && NATIVE_UFS_SM8750
+// The abort just made is one a sleep must not happen in (ufsCancelWanted): native-ufs-suspend-cancel=1 asks the kernel to cancel it.
+void NativeUfs::cancelSleep (void)
+{
+  if (!gCancelArg) {
+    IOLog ("NativeUfs: power: suspend %u aborted (%s): a sleep that should not happen; native-ufs-suspend-cancel=1 would ask the "
+           "kernel to cancel it\n", gPower.suspends, ufsAbortName (gPower.abortKind));
+  } else {
+    char why[96];
+    snprintf (why, sizeof (why), "%s (%s: %s)", ufsAbortName (gPower.abortKind), gPower.lastStep, gPower.lastWhy);
+    const IOReturn r = pianopower::cancelSystemSleep ("NativeUfs", why);
+    if (r == kIOReturnSuccess) ++gCancels;
+    else ++gCancelRefusals;
+    IOLog ("NativeUfs: power: suspend %u aborted (%s): asked the kernel to cancel this sleep (native-ufs-suspend-cancel=1): %s "
+           "(%u cancelled, %u refused)\n", gPower.suspends, why,
+           r == kIOReturnSuccess ? "cancelled, nothing is suspended" : r == kIOReturnUnsupported ?
+           "refused (piano-sleep-cancel=0, no piano-sleep, or a kernel before k27 0064): the sleep goes on with UFS up" :
+           r == kIOReturnNotReady ? "no system sleep in progress" : "too late", gCancels, gCancelRefusals);
+  }
+}
+#endif
 
 // For NativeRamBlock: the power parent of the Data disk (waits up to 10 s for the root start to decide); nullptr when
 // native-ufs-suspend is off or the join failed: the Data disk then takes no part either.
@@ -2739,6 +2760,7 @@ bool NativeUfs::start (IOService *provider)
   PE_parse_boot_argn ("native-ufs-root", &rootMode, sizeof (rootMode));
   if (!PE_parse_boot_argn ("native-ufs-suspend", &gPowerArg, sizeof (gPowerArg)) || gPowerArg != 1) gPowerArg = 0;
   if (!PE_parse_boot_argn ("native-ufs-suspend-cancel", &gCancelArg, sizeof (gCancelArg)) || gCancelArg != 1) gCancelArg = 0;
+  if (!PE_parse_boot_argn ("native-ufs-suspend-abort-test", &gAbortTest, sizeof (gAbortTest))) gAbortTest = 0;
   if (!gPowerArg) gPowerJoin = -1;
   IOLog ("NativeUfs: start on %s probe=%u root=%u\n", provider ? provider->getName () : "?", probe, rootMode);
   native_ufs_probe_requested = probe != 0;

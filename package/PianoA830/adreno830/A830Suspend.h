@@ -41,6 +41,7 @@ struct A830SuspendConfig {
     uint32_t wakeBoundMs=100;    /* piano-gpu-suspend-wake-ms: a wake slower than this is reported as over the bound */
     uint32_t displayWaitMs=300;  /* PreSleep: how long to wait for PianoDpu's panel sleep to finish (it runs on its own thread) */
     bool cancel=false;           /* piano-gpu-suspend-cancel=1 (UniXNU-piano, 2026-11-12): a failed entry cancels the sleep (0064) */
+    uint32_t failTest=0;         /* piano-gpu-suspend-fail-test=N: suspend N counts as a failed entry, the GPU untouched (a test) */
 };
 
 /* The DDR vote while suspended: 0 kBps (Sm8750RpmhHostDdr's keepalive minimum: SH0/MC0 x = y = 1, ACV off) once the scanout
