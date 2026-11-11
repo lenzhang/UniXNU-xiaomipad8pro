@@ -34,7 +34,7 @@ static void autoHibernate ()
   reset (); hostAutoHibernateStart (1000);
   assert (reg (0x18) == 0xfe8 && gPower.ahitRuntime == 0xfe8 && linesContain ("auto-hibernate: on (native-ufs-ahit=1000): AHIT 00000fe8"));
   // The controller's timer put the link into Hibern8 between commands: the next doorbell takes it out by itself.
-  m.txState = 1;
+  autoHibernated ();
   assert (hostRead4k (0, 3, 1, out.data ()) == 0 && m.autoExits == 1 && m.txState != 1 && m.doorbellInHibern8 == 0);
   assertUp (0xfe8);
   reset (); reg (0x00) &= ~(1U << 23); hostAutoHibernateStart (1000);
@@ -92,7 +92,7 @@ static void suspendAndWake ()
   assert ((m.events == Events { "ahit=0", "get", "uic17", "get", "get", "uic18", "get", "nop", "ahit=fe8" }));
   assertUp (0xfe8);
   // The timer had the link in Hibern8 already: no enter; the wake exits all the same.
-  m.txState = 1;
+  autoHibernated ();
   m.events.clear ();
   assert (hostSuspend () && !gPower.entered && m.enterCommands == 1 && (m.events == Events { "ahit=0", "get" }));
   assert (linesContain ("link already in Hibern8 (auto-hibernate)"));

@@ -37,6 +37,8 @@ static Model m;
 
 static std::string hex (uint32_t value) { char text[16]; snprintf (text, sizeof (text), "%x", value); return text; }
 static uint32_t &reg (unsigned offset) { return m.registers.at (offset / 4); }
+// The controller's timer ran out: the link in Hibern8, UHES left set in IS (a software enter or exit must clear it before its own).
+static void autoHibernated () { assert (reg (0x18)); m.txState = 1; reg (0x20) |= 0x40; }
 
 static void uic (uint32_t command)
 {
@@ -101,6 +103,7 @@ static void doorbell (uint32_t value)
     if (!reg (0x18)) { ++m.doorbellInHibern8; return; }
     m.txState = 5;
     ++m.autoExits;
+    reg (0x20) |= 0x20;   // the controller's own exit leaves UHXS set, as its own enter leaves UHES (autoHibernated)
   }
   // The entry points at this slot's command descriptor.
   const uint8_t *utrd = m.device.data () + ufsSlotUtrdOffset (slot);
