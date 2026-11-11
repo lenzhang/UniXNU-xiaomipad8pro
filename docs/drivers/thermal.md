@@ -118,7 +118,7 @@ once); the fixed level (mode 2) has no power caps and ignores it. One line per c
 | `piano-thermal-warm-poll=<C>` / `-warm-ms` | 70 / 250 | the warm tier: from this hottest reading, poll this often |
 | `piano-thermal-fast-ms` / `-fast-mhz` | 10 / 2500 | the fast tier (near a trip, limited, or a cluster above this clock); also the thermal limit's step |
 | `piano-thermal-gpu-mhz` | 160 | the reversible GPU ceiling at passive (when PianoA830 offers it) |
-| `piano-thermal-clock=0` / `-srot=0` | 1 / 1 | skip the per-core clock measurement / the SROT reads |
+| `piano-thermal-clock=0` / `-srot=0` | 1 / 1 | skip the per-core clock measurement / the SROT reads; since 2026-11-12 the measurement (it binds a thread onto every running core) waits while the display is off (NativeGopDisplay's `piano-display-power`), `piano-thermal-clock=2` measures then too (before) |
 | `piano-cpufreq=N` | 0 | 1 report (SCMI messages, nothing set); 2 fixed level; 3 governor. Implies `piano-thermal=1` |
 | `piano-cpufreq-cap=<MHz>`, `-cap0`, `-cap1` | 1785 / 1958 (Power Saver) | mode 2: each cluster at the fastest level ≤ cap (and ≤ sustained); mode 3: a hard ceiling when given. A cap admits its whole MHz (1785 admits 1785.6) |
 | `piano-cpufreq-bat0/1`, `-ac0/1` | 1785/1958, 3532/4089 | mode 3 ceilings on battery or power unknown (Power Saver) / on external power (Balanced) |

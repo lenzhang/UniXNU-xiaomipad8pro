@@ -5,7 +5,9 @@
 //                    piano-thermal-fast-ms, 20, while a sensor is within 10 C of its trip or a cluster is thermally limited), the
 //                    hottest per controller on the console every piano-thermal-log-s (30) and as IORegistry properties; at start the
 //                    controllers' version/enable/thresholds (TM and SROT loads), the SCMI channel's status word (a load), and every 30 s
-//                    each core's clock measured with a chain of dependent adds (no device access; piano-thermal-clock=0 skips it).
+//                    each core's clock measured with a chain of dependent adds (no device access; piano-thermal-clock=0 skips it;
+//                    since 2026-11-12 not while the display is off, which would wake every idle core for a log line: =2 measures
+//                    then too, as before).
 //                    Nothing is written at this level: every MMIO access is a load.
 //   piano-thermal=2  level 1 + the protection policy (Policy.h): warm (85 C) logged; at a sensor's stock passive trip the GPU is
 //                    capped (PianoA830's "piano-gpu-ceiling", reversible) or, while PianoA830 has none, parked at its lowest level
@@ -54,6 +56,7 @@
 #include "Cluster.h"
 #include "Governor.h"
 #include <PianoPowerContract.h>
+#include <PianoDisplayFollow.h>
 #include "PianoThermalAdc.h"
 #include "PianoThermalIrq.h"
 #include "Policy.h"
@@ -89,6 +92,8 @@ struct Args {
   uint32_t cap[2], bat[2], ac[2], minMhz[2], hispeed[2], tickMs, fastMs, warmMs, warmPollC, fastMhz, gpuMhz, hotC, releaseC, cutC;
   bool capGiven[2];
 };
+// The panel's display power, followed through NativeGopDisplay's messages (package/include/PianoDisplayFollow.h): the clock line's rule.
+pianodisplay::Follow gDisplay;
 Args gArgs;
 
 uint32_t bootArg(const char *name, uint32_t fallback)
@@ -661,6 +666,7 @@ bool PianoThermal::start(IOService *provider)
   // piano-thermal-irq=1 uses the threshold interrupts, so a sleep masks them (the hooks: lower only while it is live, as Linux)
   sleep_ = SleepPlan(gArgs.sleepMask != 0 || irq::hookLevel() != 0);
   registerService();
+  if (gArgs.clock == 1) gDisplay.start(nullptr, nullptr);   // the clock line waits while the display is off
   adc::hookStart(this, adc::hookLevel(), gArgs.logS, gArgs.delay);   // B6 (PianoThermalAdc.cpp): nothing without piano-thermal-adc
   thread_t t = nullptr;
   if (!sleepLock_ || kernel_thread_start(&PianoThermal::thread, this, &t) != KERN_SUCCESS) {
@@ -755,7 +761,8 @@ void PianoThermal::report(const Monitor &m, bool clock)
   note("[%us] reads: %llu polls, %llu loads, %llu without VALID, %llu implausible, %llu stale stand-ins", upS(),
        (unsigned long long)m.polls(), (unsigned long long)m.reads(), (unsigned long long)m.invalidReads(),
        (unsigned long long)m.implausible(), (unsigned long long)m.staleUses());
-  if (clock && gArgs.clock) {
+  // Not while the display is off (2026-11-12): binding a thread onto every running core wakes each idle one for a diagnostic line.
+  if (clock && gArgs.clock && (gArgs.clock >= 2 || !gDisplay.dark())) {
     uint32_t mhz[kMaxCpus];
     bool on[kMaxCpus];
     measureClocks(mhz, on);
