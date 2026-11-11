@@ -1,0 +1,984 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// Host test of PianoWifi level 6: the copy engine (WifiCe.h), the host transport (WifiHtc.h), the firmware's message interface
+// (WifiWmi.h) and the ladder that drives all three (WifiLink.h). What it holds the code to:
+//   the copy engine: the rings and buffers out of the arena; the registers the driver programs (base and size, the descriptor
+//             size, where the chip writes its own pointer, the largest buffer of a destination ring, the enable bit) read back
+//             from a model of the chip's register space; a message sent and the completion that frees its buffer; a buffer
+//             filled by the chip and the status entry that reports it; the one element a ring always leaves free; the rings
+//             disabled by the teardown;
+//   the transport: the firmware's ready message, a service connected and the endpoint its answer gives, set-up complete, the
+//             credit accounting (a command costs credits, the firmware gives them back in a trailer), a refused service, a
+//             header that does not fit its buffer, a trailer that does not fit its message;
+//   the message interface: the initialisation command's TLVs (the fixed structure, the 72-word resource configuration with this
+//             chip's own values, the empty memory-chunk array), the chip's capability and ready events, a station virtual
+//             device with its two stream entries, a passive scan request (channel list, dwell times, the passive flag), the
+//             scan's events and its management frames;
+//   the scan list: a beacon's name and address, a hidden network, a probe answer, the same network twice (the stronger signal
+//             kept), a frame that is not a scan result, a truncated frame, more networks than the list holds, and the masked
+//             form of an address for a log line;
+//   the faults: a firmware that refuses the service, one that asks for memory this level does not hand out, a scan that never
+//             starts (the step times out), a scan that starts and never ends (the results stand and the teardown runs), an
+//             event in the wrong step, and the teardown of a ladder that is given up on.
+//   c++ -std=c++20 -Wall -Wextra -Werror -I.. wmi_host.cpp -o /tmp/wmi_host && /tmp/wmi_host
+#include "WifiLink.h"
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+
+using namespace pianowifi;
+static int failures;
+#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
+
+static constexpr uint64_t kBusBase = 0x20000000;        // the window's bus address, as piano-wifi-iova=1 gives it
+static constexpr uint32_t kWindowBytes = 4u << 20;
+
+static uint32_t get32(const uint8_t *at)
+{
+  uint32_t v = 0;
+  for (unsigned i = 0; i < 4; ++i) v |= uint32_t(at[i]) << (8 * i);
+  return v;
+}
+static void put32(uint8_t *at, uint32_t v)
+{
+  for (unsigned i = 0; i < 4; ++i) at[i] = uint8_t(v >> (8 * i));
+}
+
+// ======================================================================== the chip: its register space and its copy engine
+struct Device {
+  std::vector<uint8_t> memory;                  // the DMA window as the chip sees it
+  std::map<uint32_t, uint32_t> regs;            // the chip's register space above the window's start
+  unsigned writes = 0, reads = 0;
+  std::vector<std::pair<uint8_t, std::vector<uint8_t>>> toHost;   // (pipe, message) the firmware wants to send
+  std::vector<std::pair<uint8_t, std::vector<uint8_t>>> fromHost; // what it has taken from the host
+  bool stalled = false;                         // a chip that takes nothing (for the timeout tests)
+
+  Device() : memory(kWindowBytes, 0) {}
+
+  uint8_t *at(uint64_t bus, uint32_t bytes)
+  {
+    if (bus < kBusBase || bus + bytes > kBusBase + memory.size()) return nullptr;
+    return memory.data() + (bus - kBusBase);
+  }
+  static uint32_t read(void *ctx, uint32_t address)
+  {
+    Device &d = *static_cast<Device *>(ctx);
+    ++d.reads;
+    return d.regs.count(address) ? d.regs[address] : 0;
+  }
+  static void write(void *ctx, uint32_t address, uint32_t value)
+  {
+    Device &d = *static_cast<Device *>(ctx);
+    ++d.writes;
+    d.regs[address] = value;
+  }
+  ChipIo io() { return ChipIo{this, &Device::read, &Device::write}; }
+
+  // ---- one ring as the chip reads its registers ----
+  struct Ring {
+    uint64_t base = 0, pointer = 0;
+    uint32_t entries = 0, words = 0, r2 = 0, ringId = 0;
+    bool enabled = false;
+    uint32_t own = 0;                           // the chip's own slot
+  };
+  Ring ring(uint32_t r0, uint32_t r2, bool hostProduces)
+  {
+    Ring r;
+    const uint32_t msb = regs.count(r0 + kRingBaseMsb) ? regs[r0 + kRingBaseMsb] : 0;
+    r.base = uint64_t(regs.count(r0) ? regs[r0] : 0) | uint64_t(msb & kRingBaseMsbAddrHi) << 32;
+    const uint32_t sizeWords = (msb >> kRingBaseMsbSizeShift) & kRingBaseMsbSizeMask;
+    const uint32_t id = regs.count(r0 + kRingId) ? regs[r0 + kRingId] : 0;
+    r.words = id & kRingIdEntrySizeMask;
+    r.ringId = (id >> kRingIdRingIdShift) & 0xffu;
+    r.entries = r.words ? sizeWords / r.words : 0;
+    const uint32_t lo = hostProduces ? kSrcRingTpAddrLo : kDstRingHpAddrLo;
+    const uint32_t hi = hostProduces ? kSrcRingTpAddrHi : kDstRingHpAddrHi;
+    r.pointer = uint64_t(regs.count(r0 + lo) ? regs[r0 + lo] : 0) | uint64_t(regs.count(r0 + hi) ? regs[r0 + hi] : 0) << 32;
+    r.enabled = (regs.count(r0 + kRingMisc) ? regs[r0 + kRingMisc] : 0) & kRingMiscEnable;
+    r.r2 = r2;
+    return r;
+  }
+  uint32_t hostSlot(const Ring &r, uint32_t r2) { return r.words && regs.count(r2) ? (regs[r2] / r.words) % (r.entries ? r.entries : 1) : 0; }
+  void putPointer(const Ring &r, uint32_t slot)
+  {
+    uint8_t *p = at(r.pointer, 4);
+    if (p) put32(p, slot * r.words);
+  }
+
+  // What the chip does between two polls of the driver: take what the host put on the source rings, fill buffers with what the
+  // firmware wants to send, and report each one in the destination-status ring.
+  std::map<uint8_t, uint32_t> srcOwn, dstOwn, statusOwn;
+  void run()
+  {
+    if (stalled) return;
+    for (const CeHostPipe &want : kCeHostPipes) {
+      const uint32_t srcUnit = kUnitCe0Src + want.pipe * kCeUnitStride;
+      const uint32_t dstUnit = kUnitCe0Dst + want.pipe * kCeUnitStride;
+      if (want.srcEntries) {
+        Ring src = ring(srcUnit, srcUnit + kCeR2Hp, true);
+        src.own = srcOwn[want.pipe];
+        if (src.enabled && src.entries) {
+          const uint32_t host = hostSlot(src, src.r2);
+          while (src.own != host) {
+            const uint8_t *desc = at(src.base + uint64_t(src.own) * src.words * 4, src.words * 4);
+            if (desc) {
+              const uint64_t address = uint64_t(get32(desc)) | uint64_t(get32(desc + 4) & kCeDescAddrHiMask) << 32;
+              const uint32_t length = (get32(desc + 4) >> kCeDescLenShift) & kCeDescLenMask;
+              const uint8_t *payload = at(address, length);
+              if (payload) fromHost.push_back({want.pipe, std::vector<uint8_t>(payload, payload + length)});
+            }
+            src.own = (src.own + 1) % src.entries;
+            srcOwn[want.pipe] = src.own;
+            putPointer(src, src.own);
+          }
+        }
+      }
+      if (!want.dstEntries) continue;
+      Ring dst = ring(dstUnit, dstUnit + kCeR2Hp, true);
+      Ring status = ring(dstUnit + kCeStatusRingBase, dstUnit + kCeStatusR2Hp, false);
+      dst.own = dstOwn[want.pipe];
+      status.own = statusOwn[want.pipe];
+      if (!dst.enabled || !status.enabled || !dst.entries) continue;
+      const uint32_t hostDst = hostSlot(dst, dst.r2);
+      while (!toHost.empty() && dst.own != hostDst) {
+        if (toHost.front().first != want.pipe) break;
+        const uint8_t *desc = at(dst.base + uint64_t(dst.own) * dst.words * 4, dst.words * 4);
+        if (!desc) break;
+        const uint64_t address = uint64_t(get32(desc)) | uint64_t(get32(desc + 4) & kCeDescAddrHiMask) << 32;
+        std::vector<uint8_t> message = toHost.front().second;
+        if (message.size() > want.bufferBytes) break;
+        uint8_t *buffer = at(address, uint32_t(message.size()));
+        if (!buffer) break;
+        std::memcpy(buffer, message.data(), message.size());
+        toHost.erase(toHost.begin());
+        dst.own = (dst.own + 1) % dst.entries;
+        dstOwn[want.pipe] = dst.own;
+        putPointer(dst, dst.own);
+        uint8_t *entry = at(status.base + uint64_t(status.own) * status.words * 4, status.words * 4);
+        if (entry) {
+          std::memset(entry, 0, status.words * 4);
+          put32(entry, uint32_t(message.size()) << kCeStatusLenShift);
+          put32(entry + 12, 0);
+        }
+        status.own = (status.own + 1) % status.entries;
+        statusOwn[want.pipe] = status.own;
+        putPointer(status, status.own);
+      }
+    }
+  }
+};
+
+// ==================================================================================== the firmware above the copy engine
+struct Firmware {
+  Device *device = nullptr;
+  uint32_t credits = 4, creditSize = 1024, endpoints = 8;
+  uint8_t wmiEndpoint = 2;
+  uint8_t mac[6] = {0x02, 0x50, 0x49, 0x41, 0x4e, 0x02};
+  // what it has seen, and what it checks
+  bool readySent = false, connectSeen = false, setupSeen = false, initSeen = false, vdevSeen = false, scanSeen = false,
+       stopSeen = false, deleteSeen = false;
+  uint32_t initWords = 0, scanChannels = 0, scanFlags = 0, scanBssids = 0, scanSsids = 0, vdevStreams = 0, vdevType = 0;
+  std::vector<uint32_t> channelList;
+  uint8_t vdevMac[6] = {};
+  uint32_t cfg[kWmiResourceConfigWords] = {};
+  // what it does
+  uint8_t connectStatus = 0;
+  uint32_t memRequests = 0;
+  bool answerScanStarted = true, answerScanCompleted = true, sendBeacons = true, badFrameLength = false,
+       shortBeacon = false, manyNetworks = false, wrongStepEvent = false;
+  uint32_t creditsGivenBack = 0;
+
+  // A message to the host on pipe 2, with the transport's header and (for the message interface's endpoint) a credit report.
+  void toHost(uint8_t endpoint, const uint8_t *payload, uint32_t length, bool giveCredit)
+  {
+    std::vector<uint8_t> message(kHtcHeaderBytes + length, 0);
+    const uint32_t trailerBytes = giveCredit ? kHtcRecordHeaderBytes + kHtcCreditReportBytes : 0;
+    if (trailerBytes) message.resize(kHtcHeaderBytes + length + trailerBytes, 0);
+    std::memcpy(message.data() + kHtcHeaderBytes, payload, length);
+    if (trailerBytes) {
+      uint8_t *trailer = message.data() + kHtcHeaderBytes + length;
+      trailer[0] = kHtcRecordCredits;
+      trailer[1] = kHtcCreditReportBytes;
+      trailer[kHtcRecordHeaderBytes] = wmiEndpoint;
+      trailer[kHtcRecordHeaderBytes + 1] = 1;
+      ++creditsGivenBack;
+    }
+    const uint32_t payloadLength = length + trailerBytes;
+    put32(message.data(), uint32_t(endpoint) | (trailerBytes ? uint32_t(kHtcFlagTrailerPresent) << kHtcHdrFlagsShift : 0u) |
+                              (payloadLength & 0xffffu) << kHtcHdrLengthShift);
+    put32(message.data() + 4, trailerBytes & 0xffu);
+    device->toHost.push_back({2, message});
+  }
+
+  void sendReady()
+  {
+    uint8_t payload[12] = {};
+    put32(payload, uint32_t(kHtcMsgReady) | credits << kHtcReadyCreditCountShift);
+    put32(payload + 4, creditSize | endpoints << kHtcReadyEndpointsShift);
+    put32(payload + 8, 1u | 1u << 8);
+    toHost(0, payload, sizeof payload, false);
+    readySent = true;
+  }
+
+  void onControl(const uint8_t *payload, uint32_t length)
+  {
+    CHECK(length >= 8);
+    const uint32_t word0 = get32(payload);
+    const uint16_t id = uint16_t(word0 & kHtcMsgIdMask);
+    if (id == kHtcMsgConnectService) {
+      connectSeen = true;
+      const uint16_t service = uint16_t(word0 >> kHtcServiceShift);
+      CHECK(service == kSvcWmiControl);
+      const uint32_t flags = get32(payload + 4);
+      CHECK((flags & kHtcConnFlagDisableCreditFlow) == 0);   // the message interface keeps credit flow control
+      uint8_t answer[12] = {};
+      put32(answer, uint32_t(kHtcMsgConnectServiceResp) | uint32_t(service) << kHtcServiceShift);
+      put32(answer + 4, uint32_t(connectStatus) | uint32_t(wmiEndpoint) << kHtcRespEndpointShift |
+                            uint32_t(2048) << kHtcRespMaxMessageShift);
+      toHost(0, answer, sizeof answer, false);
+      return;
+    }
+    if (id == kHtcMsgSetupCompleteEx) {
+      setupSeen = true;
+      sendServiceReady();
+      return;
+    }
+    CHECK(false);   // a control message this firmware does not know
+  }
+
+  void event(uint32_t id, const uint8_t *tlvs, uint32_t length)
+  {
+    std::vector<uint8_t> message(kWmiCmdHeaderBytes + length, 0);
+    put32(message.data(), id & kWmiCmdIdMask);
+    if (length) std::memcpy(message.data() + kWmiCmdHeaderBytes, tlvs, length);
+    toHost(wmiEndpoint, message.data(), uint32_t(message.size()), true);
+  }
+
+  void sendServiceReady()
+  {
+    uint8_t buffer[256] = {};
+    uint8_t *at = buffer;
+    const uint32_t words = 32;
+    put32(at, (words * 4) | uint32_t(kWmiTagServiceReadyEvent) << kWmiTlvTagShift);
+    put32(at + 4 + 4 * 9, 2);            // two radio chains
+    put32(at + 4 + 4 * 10, 0x11);        // the high-throughput capability
+    put32(at + 4 + 4 * 15, 0x5);         // the system capability
+    put32(at + 4 + 4 * 18, memRequests); // how much memory it wants
+    put32(at + 4 + 4 * 19, 32);          // the channels it can scan
+    put32(at + 4 + 4 * 20, 0x21);        // the board identifier
+    put32(at + 4 + 4 * 26, 1);
+    put32(at + 4 + 4 * 29, 3);           // the chain mask
+    at += 4 + words * 4;
+    put32(at, 16u | uint32_t(kWmiTagArrayUint32) << kWmiTlvTagShift);
+    put32(at + 4, 0x1);
+    at += 4 + 16;
+    event(kWmiEvtServiceReady, buffer, uint32_t(at - buffer));
+  }
+
+  void sendReadyEvent()
+  {
+    uint8_t buffer[128] = {};
+    const uint32_t words = 15;
+    put32(buffer, (words * 4) | uint32_t(kWmiTagReadyEvent) << kWmiTlvTagShift);
+    std::memcpy(buffer + 4 + 24, mac, 6);
+    put32(buffer + 4 + 4 * 8, 0);        // status: the firmware came up
+    put32(buffer + 4 + 4 * 10, 0);       // no extra addresses
+    put32(buffer + 4 + 4 * 11, 16);      // the peers it has room for
+    event(kWmiEvtReady, buffer, 4 + words * 4);
+  }
+
+  void sendScanEvent(uint32_t type, uint32_t reason, uint32_t freq)
+  {
+    uint8_t buffer[64] = {};
+    const uint32_t words = 7;
+    put32(buffer, (words * 4) | uint32_t(kWmiTagScanEvent) << kWmiTlvTagShift);
+    put32(buffer + 4, type);
+    put32(buffer + 8, reason);
+    put32(buffer + 12, freq);
+    put32(buffer + 16, kWmiScanRequestorId);
+    put32(buffer + 20, kWmiScanId);
+    put32(buffer + 24, 0);
+    event(kWmiEvtScan, buffer, 4 + words * 4);
+  }
+
+  // A beacon (or a probe answer) as the firmware hands it over: the header with the channel and the signal strength, then the
+  // frame itself.
+  void sendBeacon(const char *ssid, const uint8_t *bssid, uint32_t freq, int32_t rssi, uint8_t channel, bool probe,
+                  bool truncate = false)
+  {
+    std::vector<uint8_t> frame;
+    const uint32_t ssidLength = ssid ? uint32_t(std::strlen(ssid)) : 0;
+    frame.resize(kDot11HeaderBytes + kDot11BeaconFixedBytes + 2 + ssidLength + 3, 0);
+    frame[0] = uint8_t(probe ? kDot11SubtypeProbeResponse : kDot11SubtypeBeacon);
+    std::memcpy(frame.data() + 16, bssid, 6);                  // the third address: the network's own
+    frame[kDot11HeaderBytes + 10] = 0x11;                      // the capability, low byte
+    uint32_t at = kDot11HeaderBytes + kDot11BeaconFixedBytes;
+    frame[at] = kDot11ElementSsid;
+    frame[at + 1] = uint8_t(ssidLength);
+    if (ssidLength) std::memcpy(frame.data() + at + 2, ssid, ssidLength);
+    at += 2 + ssidLength;
+    frame[at] = kDot11ElementDsParams;
+    frame[at + 1] = 1;
+    frame[at + 2] = channel;
+    if (truncate) frame.resize(kDot11HeaderBytes + 4);         // a frame that ends in the middle of its body
+    uint8_t buffer[512] = {};
+    const uint32_t words = 17;
+    put32(buffer, (words * 4) | uint32_t(kWmiTagMgmtRxHeader) << kWmiTlvTagShift);
+    put32(buffer + 4 + 4 * 0, channel);
+    put32(buffer + 4 + 4 * 4, badFrameLength ? uint32_t(frame.size() + 64) : uint32_t(frame.size()));
+    put32(buffer + 4 + 4 * 11, uint32_t(rssi));
+    put32(buffer + 4 + 4 * 16, freq);
+    uint32_t length = 4 + words * 4;
+    put32(buffer + length, uint32_t(frame.size()) | uint32_t(kWmiTagArrayByte) << kWmiTlvTagShift);
+    std::memcpy(buffer + length + 4, frame.data(), frame.size());
+    length += 4 + ((uint32_t(frame.size()) + 3u) & ~3u);
+    event(kWmiEvtMgmtRx, buffer, length);
+  }
+
+  void runScan()
+  {
+    if (answerScanStarted) sendScanEvent(kWmiScanEvStarted, 0, 2412);
+    if (sendBeacons) {
+      const uint8_t one[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
+      const uint8_t two[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x66};
+      const uint8_t three[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x77};
+      sendBeacon("piano-test", one, 2437, -42, 6, false, shortBeacon);
+      sendBeacon("piano-test", one, 2437, -30, 6, false, shortBeacon);   // the same network, a stronger signal
+      sendBeacon(nullptr, two, 5180, -70, 36, false);                    // a network that does not say its name
+      sendBeacon("piano-probe", three, 2462, -55, 11, true);             // a probe answer
+      if (manyNetworks)
+        for (unsigned i = 0; i < kScanEntriesMax + 4; ++i) {
+          const uint8_t other[6] = {0x02, 0x11, 0x22, 0x33, 0x55, uint8_t(i)};
+          sendBeacon("piano-many", other, 2412, -80, 1, false);
+        }
+    }
+    if (wrongStepEvent) sendReadyEvent();   // a ready event long after the step that waits for one
+    if (answerScanCompleted) sendScanEvent(kWmiScanEvCompleted, kWmiScanReasonCompleted, 0);
+  }
+
+  void onCommand(const uint8_t *payload, uint32_t length)
+  {
+    CHECK(length >= kWmiCmdHeaderBytes);
+    const uint32_t id = get32(payload) & kWmiCmdIdMask;
+    const uint8_t *tlvs = payload + kWmiCmdHeaderBytes;
+    const uint32_t left = length - kWmiCmdHeaderBytes;
+    switch (id) {
+    case kWmiCmdInit: {
+      initSeen = true;
+      uint32_t size = 0;
+      const uint8_t *fixed = wmiFind(tlvs, left, kWmiTagInitCmd, &size);
+      CHECK(fixed && size == 7 * 4);
+      CHECK(fixed && wmiGet(fixed, 6) == 0);        // no memory chunks
+      const uint8_t *cfgTlv = wmiFind(tlvs, left, kWmiTagResourceConfig, &size);
+      CHECK(cfgTlv && size == kWmiResourceConfigWords * 4);
+      initWords = size / 4;
+      if (cfgTlv)
+        for (uint32_t i = 0; i < initWords && i < kWmiResourceConfigWords; ++i) cfg[i] = wmiGet(cfgTlv, i);
+      const uint8_t *chunks = wmiFind(tlvs, left, kWmiTagArrayStruct, &size);
+      CHECK(chunks && size == 0);
+      sendReadyEvent();
+      return;
+    }
+    case kWmiCmdVdevCreate: {
+      vdevSeen = true;
+      uint32_t size = 0;
+      const uint8_t *cmd = wmiFind(tlvs, left, kWmiTagVdevCreateCmd, &size);
+      CHECK(cmd && size == 11 * 4);
+      if (!cmd) return;
+      CHECK(wmiGet(cmd, 0) == 0);
+      vdevType = wmiGet(cmd, 1);
+      std::memcpy(vdevMac, cmd + 12, 6);
+      vdevStreams = wmiGet(cmd, 5);
+      CHECK(wmiGet(cmd, 6) == kWmiPdevIdSoc);
+      const uint8_t *array = wmiFind(tlvs, left, kWmiTagArrayStruct, &size);
+      CHECK(array && size == kWmiBandCount * 16);
+      if (array)
+        for (uint32_t band = 0; band < kWmiBandCount; ++band) {
+          const uint8_t *entry = array + band * 16;
+          CHECK((get32(entry) >> kWmiTlvTagShift) == uint32_t(kWmiTagVdevTxrxStreams));
+          CHECK((get32(entry) & kWmiTlvLenMask) == 12);
+          CHECK(wmiGet(entry + 4, 0) == band);
+        }
+      return;
+    }
+    case kWmiCmdStartScan: {
+      scanSeen = true;
+      uint32_t size = 0;
+      const uint8_t *cmd = wmiFind(tlvs, left, kWmiTagStartScanCmd, &size);
+      CHECK(cmd && size == kWmiStartScanWords * 4);
+      if (!cmd) return;
+      CHECK(wmiGet(cmd, 0) == kWmiScanId);
+      CHECK(wmiGet(cmd, 1) == kWmiScanRequestorId);
+      CHECK(wmiGet(cmd, 2) == 0);
+      CHECK(wmiGet(cmd, 5) == kWmiScanDwellActiveMs && wmiGet(cmd, 6) == kWmiScanDwellPassiveMs);
+      CHECK(wmiGet(cmd, 12) == kWmiScanMaxTimeMs);
+      scanFlags = wmiGet(cmd, 14);
+      scanChannels = wmiGet(cmd, 16);
+      scanBssids = wmiGet(cmd, 17);
+      scanSsids = wmiGet(cmd, 18);
+      const uint8_t *channels = wmiFind(tlvs, left, kWmiTagArrayUint32, &size);
+      CHECK(channels && size == scanChannels * 4);
+      channelList.clear();
+      if (channels)
+        for (uint32_t i = 0; i < scanChannels; ++i) channelList.push_back(wmiGet(channels, i));
+      const uint8_t *bssid = wmiFind(tlvs, left, kWmiTagArrayFixedStruct, &size);
+      CHECK(bssid && size == 0);   // the first such array is the list of names, which is empty
+      runScan();
+      return;
+    }
+    case kWmiCmdStopScan: {
+      stopSeen = true;
+      uint32_t size = 0;
+      const uint8_t *cmd = wmiFind(tlvs, left, kWmiTagStopScanCmd, &size);
+      CHECK(cmd && size == 5 * 4);
+      if (cmd) CHECK(wmiGet(cmd, 1) == kWmiScanId && wmiGet(cmd, 2) == kWmiStopScanOne);
+      sendScanEvent(kWmiScanEvCompleted, kWmiScanReasonCancelled, 0);
+      return;
+    }
+    case kWmiCmdVdevDelete: {
+      deleteSeen = true;
+      uint32_t size = 0;
+      const uint8_t *cmd = wmiFind(tlvs, left, kWmiTagVdevDeleteCmd, &size);
+      CHECK(cmd && size == 4);
+      return;
+    }
+    default:
+      CHECK(false);   // a command this firmware does not know
+      return;
+    }
+  }
+
+  // Everything the chip took from the host this turn.
+  void drain()
+  {
+    while (!device->fromHost.empty()) {
+      const std::vector<uint8_t> message = device->fromHost.front().second;
+      device->fromHost.erase(device->fromHost.begin());
+      CHECK(message.size() >= kHtcHeaderBytes);
+      const uint32_t word0 = get32(message.data());
+      const uint8_t endpoint = uint8_t(word0 & kHtcHdrEndpointMask);
+      const uint32_t payload = (word0 >> kHtcHdrLengthShift) & 0xffffu;
+      CHECK(payload + kHtcHeaderBytes <= message.size());
+      if (endpoint == 0) onControl(message.data() + kHtcHeaderBytes, payload);
+      else if (endpoint == wmiEndpoint) onCommand(message.data() + kHtcHeaderBytes, payload);
+      else CHECK(false);
+    }
+  }
+};
+
+// ========================================================================================= the driver's side of the test
+struct Host {
+  Device device;
+  Arena arena;
+  Ce ce;
+  Link link;
+  Firmware firmware;
+  uint64_t now = 1000;
+  std::vector<std::pair<int, std::string>> steps;
+
+  static void note(void *ctx, int step, const char *what)
+  {
+    Host &h = *static_cast<Host *>(ctx);
+    h.steps.push_back({step, what});
+  }
+
+  bool start()
+  {
+    arenaInit(arena, device.memory.data(), kBusBase, uint32_t(device.memory.size()));
+    if (!cePlan(ce, arena)) return false;
+    ceProgram(ce, device.io());
+    for (unsigned i = 0; i < kCeHostPipeCount; ++i) cePostRx(ce, device.io(), i);
+    firmware.device = &device;
+    link.note = &Host::note;
+    link.noteCtx = this;
+    return true;
+  }
+  // One turn: the chip, the firmware, then the driver.
+  void turn(uint32_t ms = 5)
+  {
+    device.run();
+    firmware.drain();
+    device.run();
+    now += ms;
+    linkRun(link, now);
+  }
+  int run(unsigned turns = 400)
+  {
+    for (unsigned i = 0; i < turns; ++i) {
+      turn();
+      if (link.step == kLinkDone || link.step == kLinkStopped) break;
+    }
+    settle();
+    return link.step;
+  }
+  // The chip and the firmware take what the last turn put on the rings (the driver is done, the hardware is not).
+  void settle()
+  {
+    for (unsigned i = 0; i < 2; ++i) {
+      device.run();
+      firmware.drain();
+    }
+  }
+};
+
+// ============================================================================================ the copy engine's registers
+static void testRings()
+{
+  Host h;
+  CHECK(h.start());
+  // Every pipe of kCeHostPipes has the rings its entry asks for, and nothing else.
+  for (unsigned i = 0; i < kCeHostPipeCount; ++i) {
+    const CeHostPipe &want = kCeHostPipes[i];
+    const CePipe &pipe = h.ce.pipes[i];
+    CHECK(pipe.pipe == want.pipe);
+    CHECK(pipe.hasSrc == (want.srcEntries != 0) && pipe.hasDst == (want.dstEntries != 0));
+    if (pipe.hasSrc) {
+      const uint32_t unit = kUnitCe0Src + want.pipe * kCeUnitStride;
+      Device::Ring ring = h.device.ring(unit, unit + kCeR2Hp, true);
+      CHECK(ring.base == pipe.src.bus && ring.entries == want.srcEntries && ring.words == kCeSrcDescWords);
+      CHECK(ring.enabled && ring.pointer == pipe.src.theirsBus);
+      CHECK((h.device.regs[unit + kRingMisc] & kRingMiscLoopCountDisable) != 0);
+      CHECK(h.device.regs[unit + kSrcRingConsumerInt0] == 0 && h.device.regs[unit + kSrcRingConsumerInt1] == 0);
+    }
+    if (!pipe.hasDst) continue;
+    const uint32_t unit = kUnitCe0Dst + want.pipe * kCeUnitStride;
+    Device::Ring dst = h.device.ring(unit, unit + kCeR2Hp, true);
+    CHECK(dst.base == pipe.dst.bus && dst.entries == want.dstEntries && dst.words == kCeDstDescWords && dst.enabled);
+    CHECK((h.device.regs[unit + kCeDstRingCtrl] & kCeDstRingCtrlMaxLen) == want.bufferBytes);
+    Device::Ring status = h.device.ring(unit + kCeStatusRingBase, unit + kCeStatusR2Hp, false);
+    CHECK(status.base == pipe.status.bus && status.entries == want.dstEntries && status.words == kCeStatusDescWords);
+    CHECK(status.enabled && status.pointer == pipe.status.theirsBus);
+    CHECK(status.ringId == ((kRingIdCe0DstStatus + want.pipe) & 0xffu));   // only the rings the chip produces into carry one
+    // Every buffer but the two elements a ring leaves free was posted.
+    CHECK(pipe.rxCount == want.dstEntries - kCeDstKeepFree);
+    CHECK(h.device.regs[unit + kCeR2Hp] == pipe.rxCount * kCeDstDescWords);
+  }
+  // A message out and its completion.
+  const int buffer = ceClaim(h.ce);
+  CHECK(buffer == 0);
+  std::memset(h.ce.tx[buffer].va, 0x5a, 64);
+  CHECK(ceSend(h.ce, h.device.io(), kCePipeMsgOut, unsigned(buffer), 64, 0x1234));
+  CHECK(h.ce.tx[buffer].busy);
+  h.device.run();
+  CHECK(h.device.fromHost.size() == 1 && h.device.fromHost[0].first == 3 && h.device.fromHost[0].second.size() == 64);
+  unsigned sent = 0, received = 0;
+  cePoll(h.ce, h.device.io(), [&](uint32_t kind, uint32_t, uint8_t *, uint32_t, uint32_t) {
+    if (kind == kCeSent) ++sent;
+    if (kind == kCeReceived) ++received;
+  });
+  CHECK(sent == 1 && received == 0 && !h.ce.tx[buffer].busy);
+  // A message in: the chip fills a posted buffer and reports it in the status ring.
+  std::vector<uint8_t> message(100, 0xa5);
+  h.device.toHost.push_back({2, message});
+  h.device.run();
+  uint32_t length = 0;
+  cePoll(h.ce, h.device.io(), [&](uint32_t kind, uint32_t pipe, uint8_t *va, uint32_t bytes, uint32_t) {
+    if (kind != kCeReceived) return;
+    ++received;
+    length = bytes;
+    CHECK(pipe == 2 && va[0] == 0xa5);
+  });
+  CHECK(received == 1 && length == 100);
+  CHECK(h.ce.received == 1 && h.ce.sent == 1 && h.ce.dropped == 0);
+  // The buffer is free again once it has been given back.
+  CHECK(cePostRx(h.ce, h.device.io(), kCePipeMsgIn) == 1);
+
+  // A ring never has every element filled: the last claim is refused.
+  Host full;
+  CHECK(full.start());
+  unsigned claims = 0;
+  for (;;) {
+    const int slot = ceClaim(full.ce);
+    if (slot < 0) break;
+    if (!ceSend(full.ce, full.device.io(), kCePipeCtrlOut, unsigned(slot), 16, 0)) break;
+    ++claims;
+  }
+  CHECK(claims == kCeSendBuffers);     // our own send buffers run out before pipe 0's sixteen elements do
+  CHECK(full.ce.refused >= 1);
+
+  // The teardown disables every ring.
+  ceStop(h.ce, h.device.io());
+  for (unsigned i = 0; i < kCeHostPipeCount; ++i) {
+    const CeHostPipe &want = kCeHostPipes[i];
+    if (want.srcEntries) CHECK(h.device.regs[kUnitCe0Src + want.pipe * kCeUnitStride + kRingMisc] == 0);
+    if (want.dstEntries) CHECK(h.device.regs[kUnitCe0Dst + want.pipe * kCeUnitStride + kRingMisc] == 0);
+  }
+
+  // An arena with no room is refused, and nothing of it is used.
+  Ce small;
+  Arena tiny;
+  std::vector<uint8_t> little(32 * 1024, 0);
+  arenaInit(tiny, little.data(), kBusBase, uint32_t(little.size()));
+  CHECK(!cePlan(small, tiny));
+}
+
+// ================================================================================================ the ladder, end to end
+static void testLadder()
+{
+  Host h;
+  CHECK(h.start());
+  LinkOptions options;
+  linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+  h.firmware.sendReady();
+  CHECK(h.run() == kLinkDone);
+  CHECK(h.link.error == kLinkErrNone && linkFinished(h.link));
+  // The transport's handshake.
+  CHECK(h.firmware.connectSeen && h.firmware.setupSeen);
+  CHECK(h.link.htc.credits == h.firmware.credits && h.link.htc.creditSize == h.firmware.creditSize);
+  CHECK(h.link.endpoint == int(h.firmware.wmiEndpoint));
+  CHECK(h.link.htc.ep[h.firmware.wmiEndpoint].ulPipe == 3 && h.link.htc.ep[h.firmware.wmiEndpoint].dlPipe == 2);
+  CHECK(h.link.htc.creditReports >= 1 && h.link.htc.creditsGiven >= 1);
+  // The chip's capability, as the firmware answered it.
+  CHECK(h.link.caps.seen && h.link.caps.rfChains == 2 && h.link.caps.boardId == 0x21 && h.link.caps.memRequests == 0);
+  CHECK(h.link.caps.bitmapSeen && h.link.caps.serviceBitmap[0] == 0x1);
+  // The initialisation command the firmware read back: the resource configuration of this chip's own entry.
+  CHECK(h.firmware.initSeen && h.firmware.initWords == kWmiResourceConfigWords);
+  CHECK(h.firmware.cfg[0] == kWmiCfgNumVdevs && h.firmware.cfg[1] == kWmiCfgNumPeers && h.firmware.cfg[5] == kWmiCfgNumTids);
+  CHECK(h.firmware.cfg[7] == 3 && h.firmware.cfg[8] == 3);                      // two chains: the mask is 0b11
+  CHECK(h.firmware.cfg[9] == kWmiCfgRxTimeoutLoPri && h.firmware.cfg[12] == kWmiCfgRxTimeoutHiPri);
+  CHECK(h.firmware.cfg[13] == kWmiCfgDecapModeNativeWifi && h.firmware.cfg[53] == kWmiCfgUsePdevId);
+  CHECK(h.firmware.cfg[56] == kWmiCfgPeerMapUnmapVersion);
+  CHECK(h.firmware.cfg[43] == kWmiCfgFlag1 && h.firmware.cfg[67] == kWmiCfgFlags2);
+  CHECK(h.firmware.cfg[28] == kWmiCfgNumMsduDesc && h.firmware.cfg[21] == kWmiCfgTxDbgLogSize);
+  // The ready event: the chip's own address, which the macOS side will publish.
+  CHECK(h.link.ready.seen && std::memcmp(h.link.ready.mac, h.firmware.mac, 6) == 0);
+  // The virtual device: a station, with the chip's address and one stream entry per band.
+  CHECK(h.firmware.vdevSeen && h.firmware.vdevType == kWmiVdevTypeStation && h.firmware.vdevStreams == kWmiBandCount);
+  CHECK(std::memcmp(h.firmware.vdevMac, h.firmware.mac, 6) == 0);
+  // The scan: passive, every channel of the two bands, and no network asked for by name.
+  CHECK(h.firmware.scanSeen && (h.firmware.scanFlags & kWmiScanFlagPassive));
+  CHECK(h.firmware.scanFlags & kWmiScanFlagChanStatEvent);
+  CHECK(h.firmware.scanChannels == kScanChannelMax && h.firmware.channelList.size() == kScanChannelMax);
+  CHECK(h.firmware.channelList[0] == kScanChannels24[0]);
+  CHECK(h.firmware.channelList[kScanChannelCount24] == kScanChannels5[0]);
+  CHECK(h.firmware.scanSsids == 0 && h.firmware.scanBssids == 1);
+  // What the scan found: three networks, the strongest signal of the repeated one, the one with no name marked.
+  CHECK(h.link.scanStarted && h.link.scanCompleted && h.link.scanReason == kWmiScanReasonCompleted);
+  CHECK(h.link.scan.count == 3 && h.link.scan.frames == 4 && h.link.scan.beacons == 3 && h.link.scan.probes == 1);
+  CHECK(std::string(h.link.scan.entries[0].ssid) == "piano-test" && h.link.scan.entries[0].rssi == -30);
+  CHECK(h.link.scan.entries[0].beacons == 2 && h.link.scan.entries[0].channel == 6 && h.link.scan.entries[0].freq == 2437);
+  CHECK(h.link.scan.entries[1].hidden && h.link.scan.entries[1].ssidLength == 0 && h.link.scan.entries[1].freq == 5180);
+  CHECK(std::string(h.link.scan.entries[2].ssid) == "piano-probe" && h.link.scan.entries[2].probes == 1);
+  CHECK(h.link.scan.dropped == 0 && h.link.scan.ignored == 0);
+  // The teardown: nothing to stop (the scan ended by itself), the virtual device deleted.
+  CHECK(!h.firmware.stopSeen && h.firmware.deleteSeen);
+  CHECK(h.link.unexpected == 0 && h.ce.dropped == 0 && h.ce.refused == 0);
+  // Every step was announced once, in order.
+  CHECK(h.steps.size() >= 9);
+  CHECK(h.steps.front().first == kLinkTransport && h.steps.back().first == kLinkDone);
+  int previous = 0;
+  for (const auto &step : h.steps) {
+    CHECK(step.first > previous || step.first == previous);
+    previous = step.first;
+  }
+  // The address in a log line: masked unless the owner asked for all of it.
+  char masked[32] = {}, full[32] = {};
+  scanFormatBssid(h.link.scan.entries[0], false, masked, sizeof masked);
+  scanFormatBssid(h.link.scan.entries[0], true, full, sizeof full);
+  CHECK(std::string(masked) == "02:11:22:**:**:**");
+  CHECK(std::string(full) == "02:11:22:33:44:55");
+}
+
+static void testOneBand()
+{
+  Host h;
+  CHECK(h.start());
+  LinkOptions options;
+  options.with5GHz = false;
+  linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+  h.firmware.sendReady();
+  CHECK(h.run() == kLinkDone);
+  CHECK(h.firmware.scanChannels == kScanChannelCount24);
+}
+
+static void testFaults()
+{
+  {   // the firmware refuses the service
+    Host h;
+    CHECK(h.start());
+    h.firmware.connectStatus = 1;
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run() == kLinkStopped);
+    CHECK(h.link.error == kLinkErrRefused && h.link.failedStep == kLinkConnect);
+  }
+  {   // a firmware that wants memory this level does not hand out
+    Host h;
+    CHECK(h.start());
+    h.firmware.memRequests = 3;
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run() == kLinkStopped);
+    CHECK(h.link.error == kLinkErrMemory && h.link.failedStep == kLinkCapability);
+    CHECK(!h.firmware.initSeen);
+  }
+  {   // a chip that never speaks: the first step times out and nothing was sent
+    Host h;
+    CHECK(h.start());
+    LinkOptions options;
+    options.timeoutMs = 50;
+    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    CHECK(h.run(40) == kLinkStopped);
+    CHECK(h.link.error == kLinkErrTimeout && h.link.failedStep == kLinkTransport);
+    CHECK(h.ce.sent == 0);
+  }
+  {   // a scan that is never started by the firmware: the step times out
+    Host h;
+    CHECK(h.start());
+    h.firmware.answerScanStarted = false;
+    h.firmware.sendBeacons = false;
+    h.firmware.answerScanCompleted = false;
+    LinkOptions options;
+    options.scanWaitMs = 60;
+    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run() == kLinkStopped);
+    CHECK(h.link.error == kLinkErrTimeout && h.link.failedStep == kLinkScanning);
+    CHECK(h.firmware.scanSeen && !h.link.scanStarted);
+  }
+  {   // a scan that starts, reports networks and then stops answering: what it found stands and the teardown runs
+    Host h;
+    CHECK(h.start());
+    h.firmware.answerScanCompleted = false;
+    LinkOptions options;
+    options.scanWaitMs = 60;
+    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run() == kLinkDone);
+    CHECK(h.link.error == kLinkErrNone && h.link.scanTimedOut && h.link.scanCompleted);
+    CHECK(h.link.scanReason == kWmiScanReasonCancelled);   // the firmware's own last word on it
+    CHECK(h.link.scan.count == 3 && h.firmware.stopSeen && h.firmware.deleteSeen);
+  }
+  {   // a management frame whose header lies about the frame's length: counted, never read past
+    Host h;
+    CHECK(h.start());
+    h.firmware.badFrameLength = true;
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run() == kLinkDone);
+    CHECK(h.link.scan.count == 0 && h.link.unexpected >= 4);
+  }
+  {   // a frame that ends in the middle of its body: no entry, and the frame is counted as one this driver cannot read
+    Host h;
+    CHECK(h.start());
+    h.firmware.shortBeacon = true;
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run() == kLinkDone);
+    CHECK(h.link.scan.ignored == 2 && h.link.scan.count == 2);
+  }
+  {   // more networks than the list holds: the rest are counted, nothing is overwritten
+    Host h;
+    CHECK(h.start());
+    h.firmware.manyNetworks = true;
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run() == kLinkDone);
+    CHECK(h.link.scan.count == kScanEntriesMax && h.link.scan.dropped >= 4);
+    CHECK(std::string(h.link.scan.entries[0].ssid) == "piano-test");
+  }
+  {   // an event in a step that does not wait for it: counted, never acted on
+    Host h;
+    CHECK(h.start());
+    h.firmware.wrongStepEvent = true;
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run() == kLinkDone);
+    CHECK(h.link.unexpected == 1);
+  }
+  {   // the owner gives up in the middle: the scan is stopped, the device deleted, the rings disabled
+    Host h;
+    CHECK(h.start());
+    h.firmware.answerScanCompleted = false;
+    h.firmware.sendBeacons = false;
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    for (unsigned i = 0; i < 400 && !h.link.scanStarted; ++i) h.turn();
+    CHECK(h.link.step == kLinkScanning && h.link.scanStarted);
+    // The owner's bounded wait: the two commands out and taken by the chip, and only then the rings disabled.
+    bool idle = false;
+    for (unsigned i = 0; i < 20 && !idle; ++i) {
+      idle = linkStopRequest(h.link, h.now);
+      h.now += 5;
+      h.device.run();
+      h.firmware.drain();
+    }
+    CHECK(idle && h.link.stopped && h.link.deleted);
+    CHECK(h.firmware.stopSeen && h.firmware.deleteSeen);
+    linkDisable(h.link);
+    CHECK(h.device.regs[kUnitCe0Src + 3 * kCeUnitStride + kRingMisc] == 0);
+    CHECK(h.device.regs[kUnitCe0Dst + 2 * kCeUnitStride + kRingMisc] == 0);
+  }
+}
+
+// ========================================================================================= the transport on its own
+static void testTransport()
+{
+  Htc htc;
+  htcBegin(htc);
+  CHECK(htc.ep[0].used && htc.ep[0].ulPipe == 0 && htc.ep[0].dlPipe == 2 && !htc.ep[0].creditFlow);
+  // A ready message, then its credit arithmetic.
+  uint8_t ready[12] = {};
+  put32(ready, uint32_t(kHtcMsgReady) | 4u << kHtcReadyCreditCountShift);
+  put32(ready + 4, 1024u | 8u << kHtcReadyEndpointsShift);
+  CHECK(htcParseReady(htc, ready, sizeof ready));
+  CHECK(htc.credits == 4 && htc.creditSize == 1024 && htc.ready);
+  CHECK(htcCreditsFor(htc, 100) == 1 && htcCreditsFor(htc, 1024) == 1 && htcCreditsFor(htc, 1025) == 2);
+  // A ready message with no credits at all is a failure.
+  Htc empty;
+  htcBegin(empty);
+  uint8_t none[8] = {};
+  put32(none, uint32_t(kHtcMsgReady));
+  CHECK(!htcParseReady(empty, none, sizeof none) && empty.error != nullptr);
+  // A connect answer, the endpoint it gives, and its credits.
+  uint8_t answer[12] = {};
+  put32(answer, uint32_t(kHtcMsgConnectServiceResp) | uint32_t(kSvcWmiControl) << kHtcServiceShift);
+  put32(answer + 4, 0u | 2u << kHtcRespEndpointShift | 2048u << kHtcRespMaxMessageShift);
+  HtcConnect connect;
+  CHECK(htcParseConnectResp(htc, answer, sizeof answer, connect));
+  CHECK(connect.endpoint == 2 && connect.maxMessage == 2048 && !connect.refused);
+  CHECK(htcEndpointOpen(htc, connect, 3, 2, true, htc.credits));
+  CHECK(htcEndpointOf(htc, uint16_t(kSvcWmiControl)) == 2);
+  CHECK(htc.ep[2].credits == 4);
+  // A refused service, and an answer naming an endpoint this driver cannot use.
+  uint8_t refused[12] = {};
+  put32(refused, uint32_t(kHtcMsgConnectServiceResp) | uint32_t(kSvcWmiControl) << kHtcServiceShift);
+  put32(refused + 4, 2u | 3u << kHtcRespEndpointShift | 2048u << kHtcRespMaxMessageShift);
+  HtcConnect bad;
+  CHECK(!htcParseConnectResp(htc, refused, sizeof refused, bad) && bad.refused);
+  uint8_t zero[12] = {};
+  put32(zero, uint32_t(kHtcMsgConnectServiceResp));
+  put32(zero + 4, 0);
+  HtcConnect none2;
+  CHECK(!htcParseConnectResp(htc, zero, sizeof zero, none2) && !none2.refused);
+  // Credits: four of them, then none until the firmware gives one back in a trailer.
+  for (unsigned i = 0; i < 4; ++i) CHECK(htcTakeCredits(htc, 2, 1000));
+  CHECK(!htcTakeCredits(htc, 2, 1000));
+  uint8_t message[kHtcHeaderBytes + 8] = {};
+  const uint32_t trailer = kHtcRecordHeaderBytes + kHtcCreditReportBytes;
+  htcHeader(message, 2, trailer, kHtcFlagTrailerPresent, 0);
+  message[4] = uint8_t(trailer);
+  message[kHtcHeaderBytes] = kHtcRecordCredits;
+  message[kHtcHeaderBytes + 1] = kHtcCreditReportBytes;
+  message[kHtcHeaderBytes + kHtcRecordHeaderBytes] = 2;
+  message[kHtcHeaderBytes + kHtcRecordHeaderBytes + 1] = 2;
+  const HtcRx rx = htcReceive(htc, message, sizeof message);
+  CHECK(rx.kind == kHtcNothing && htc.ep[2].credits == 2 && htc.creditsGiven == 2);
+  CHECK(htcTakeCredits(htc, 2, 1000) && htcTakeCredits(htc, 2, 1000) && !htcTakeCredits(htc, 2, 1000));
+  // A header that does not fit its buffer, and a trailer that does not fit its message.
+  uint8_t lying[kHtcHeaderBytes + 4] = {};
+  htcHeader(lying, 2, 4096, 0, 0);
+  CHECK(htcReceive(htc, lying, sizeof lying).kind == kHtcBad);
+  uint8_t badTrailer[kHtcHeaderBytes + 4] = {};
+  htcHeader(badTrailer, 2, 4, kHtcFlagTrailerPresent, 0);
+  badTrailer[4] = 200;
+  CHECK(htcReceive(htc, badTrailer, sizeof badTrailer).kind == kHtcBad);
+  CHECK(htcReceive(htc, nullptr, 0).kind == kHtcBad);
+  // A payload on an endpoint nobody connected is counted, never delivered.
+  uint8_t stray[kHtcHeaderBytes + 4] = {};
+  htcHeader(stray, 5, 4, 0, 0);
+  CHECK(htcReceive(htc, stray, sizeof stray).kind == kHtcNothing && htc.unexpected >= 1);
+  // The credits a service may be given fit one byte: a firmware that reports more cannot hand all of them to one service.
+  CHECK(htcAllocatable(4) == 4 && htcAllocatable(255) == 255 && htcAllocatable(4096) == 255);
+}
+
+// ============================================================================================ the codec on its own
+static void testCodec()
+{
+  uint8_t buffer[256];
+  WmiWriter w;
+  wmiBegin(w, buffer, sizeof buffer, kWmiCmdStartScan);
+  CHECK((get32(buffer) & kWmiCmdIdMask) == uint32_t(kWmiCmdStartScan));
+  uint8_t *one = wmiTlv(w, kWmiTagChannel, 6);     // a value that is not a whole number of words is padded
+  CHECK(one && (w.length % 4) == 0);
+  CHECK((get32(one - 4) & kWmiTlvLenMask) == 6);
+  CHECK((get32(one - 4) >> kWmiTlvTagShift) == uint32_t(kWmiTagChannel));
+  uint8_t *two = wmiStruct(w, kWmiTagStopScanCmd, 3);
+  CHECK(two && (get32(two - 4) & kWmiTlvLenMask) == 12);
+  wmiPut(two, 2, 0xdeadbeef);
+  CHECK(wmiGet(two, 2) == 0xdeadbeef);
+  const uint32_t length = wmiEnd(w);
+  CHECK(length == w.length);
+  // The reader walks what the writer wrote, and stops at a header that lies.
+  const uint8_t *at = buffer + kWmiCmdHeaderBytes;
+  uint32_t left = length - kWmiCmdHeaderBytes;
+  WmiTlvRef tlv;
+  CHECK(wmiNext(at, left, tlv) && tlv.tag == uint32_t(kWmiTagChannel) && tlv.length == 6);
+  CHECK(wmiNext(at, left, tlv) && tlv.tag == uint32_t(kWmiTagStopScanCmd) && tlv.length == 12);
+  CHECK(!wmiNext(at, left, tlv));
+  uint32_t size = 0;
+  CHECK(wmiFind(buffer + kWmiCmdHeaderBytes, length - kWmiCmdHeaderBytes, kWmiTagStopScanCmd, &size) && size == 12);
+  CHECK(!wmiFind(buffer + kWmiCmdHeaderBytes, length - kWmiCmdHeaderBytes, kWmiTagReadyEvent, &size));
+  uint8_t liar[8] = {};
+  put32(liar, 0xffu | uint32_t(kWmiTagChannel) << kWmiTlvTagShift);
+  const uint8_t *p = liar;
+  uint32_t rest = sizeof liar;
+  CHECK(!wmiNext(p, rest, tlv));
+  // A message that does not fit is refused whole.
+  uint8_t small[16];
+  WmiWriter tight;
+  wmiBegin(tight, small, sizeof small, kWmiCmdInit);
+  CHECK(wmiTlv(tight, kWmiTagInitCmd, 4) != nullptr);
+  CHECK(wmiTlv(tight, kWmiTagResourceConfig, 64) == nullptr && tight.overflow && wmiEnd(tight) == 0);
+  WmiWriter none;
+  wmiBegin(none, buffer, 2, kWmiCmdInit);
+  CHECK(none.overflow && wmiEnd(none) == 0);
+  // The scan channel list of the two bands.
+  WmiScanRequest request;
+  wmiScanChannels(request, true);
+  CHECK(request.channelCount == kScanChannelMax);
+  wmiScanChannels(request, false);
+  CHECK(request.channelCount == kScanChannelCount24);
+  // The events' parsers refuse a message that is too short.
+  WmiServiceReady caps;
+  WmiReady ready;
+  WmiScanEvent scan;
+  WmiMgmtRx mgmt;
+  uint8_t tooShort[12] = {};
+  put32(tooShort, 4u | uint32_t(kWmiTagServiceReadyEvent) << kWmiTlvTagShift);
+  CHECK(!wmiParseServiceReady(caps, tooShort, sizeof tooShort));
+  put32(tooShort, 4u | uint32_t(kWmiTagReadyEvent) << kWmiTlvTagShift);
+  CHECK(!wmiParseReady(ready, tooShort, sizeof tooShort));
+  put32(tooShort, 4u | uint32_t(kWmiTagScanEvent) << kWmiTlvTagShift);
+  CHECK(!wmiParseScanEvent(scan, tooShort, sizeof tooShort));
+  put32(tooShort, 4u | uint32_t(kWmiTagMgmtRxHeader) << kWmiTlvTagShift);
+  CHECK(!wmiParseMgmtRx(mgmt, tooShort, sizeof tooShort));
+
+  // A firmware that sends the shorter management-frame header (no frequency): the header's channel is a channel number, and
+  // the two are never mixed — the entry then carries the channel and no frequency.
+  uint8_t frame[kDot11HeaderBytes + kDot11BeaconFixedBytes + 2 + 4] = {};
+  frame[0] = uint8_t(kDot11SubtypeBeacon);
+  const uint8_t bssid[6] = {0x02, 0x33, 0x44, 0x55, 0x66, 0x77};
+  std::memcpy(frame + 16, bssid, 6);
+  frame[kDot11HeaderBytes + kDot11BeaconFixedBytes] = kDot11ElementSsid;
+  frame[kDot11HeaderBytes + kDot11BeaconFixedBytes + 1] = 4;
+  std::memcpy(frame + kDot11HeaderBytes + kDot11BeaconFixedBytes + 2, "slow", 4);
+  uint8_t event[4 + 12 * 4 + 4 + sizeof frame + 4] = {};
+  put32(event, (12u * 4) | uint32_t(kWmiTagMgmtRxHeader) << kWmiTlvTagShift);
+  put32(event + 4 + 4 * 0, 36);                        // the channel, as a channel number
+  put32(event + 4 + 4 * 4, uint32_t(sizeof frame));
+  put32(event + 4 + 4 * 11, uint32_t(int32_t(-61)));
+  uint32_t cursor = 4 + 12 * 4;
+  put32(event + cursor, uint32_t(sizeof frame) | uint32_t(kWmiTagArrayByte) << kWmiTlvTagShift);
+  std::memcpy(event + cursor + 4, frame, sizeof frame);
+  cursor += 4 + ((uint32_t(sizeof frame) + 3u) & ~3u);
+  CHECK(wmiParseMgmtRx(mgmt, event, cursor));
+  CHECK(mgmt.freq == 0 && mgmt.channel == 36 && mgmt.rssi == -61);
+  ScanList list;
+  const ScanEntry *entry = scanAdd(list, mgmt);
+  CHECK(entry && list.count == 1);
+  CHECK(entry && std::string(entry->ssid) == "slow" && entry->channel == 36 && entry->freq == 0 && entry->rssi == -61);
+}
+
+int main()
+{
+  testCodec();
+  testTransport();
+  testRings();
+  testLadder();
+  testOneBand();
+  testFaults();
+  std::printf(failures ? "wmi_host: %d check(s) failed\n" : "wmi_host: all passed\n", failures);
+  return failures ? 1 : 0;
+}
