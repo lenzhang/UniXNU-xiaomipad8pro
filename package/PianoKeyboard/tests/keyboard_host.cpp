@@ -3,7 +3,7 @@
 // piano's packed frames, vendor messages; the frames captured on piano 2026-11-11 and key, consumer, touchpad, attach and
 // authentication frames of the same shape), the keyboard filter (rollover, the opt-in Fn row), the pointer made of touchpad reports
 // (swipes, scrolling, taps, the contact count, the press button, the axes' scale; with the defaults: fine natural scrolling and its
-// axis lock, three-finger swipes, the typing guard, press settling), the touchpad descriptor's declared resolutions,
+// axis lock, three-finger swipes, the typing guard, press settling), the touchpad descriptor's declared resolutions, the backlight,
 // BitI2c.h against a bit-level I2C target model
 // (START/STOP, ACK/NACK, repeated START reads, clock stretching), CmdDb.h on a small database, and HidDescriptors.h (parsed item by
 // item: each report is as long as the driver sends it).
@@ -1001,6 +1001,78 @@ static void testTapsAndTyping()
   CHECK(s.touch(tp, 2070, out) == 1 && px(out[0]) == 40 && out[0][0] == 1);   // a drag goes on
 }
 
+// The cover's backlight.
+static void testBacklight()
+{
+  Backlight b;
+  b.configure(0, 0);                       // the default: off, sent on attach
+  CHECK(b.attach(0) == 0 && b.input(10) == -1 && b.tick(100000) == -1);
+  CHECK(b.consumer(0x79, 20) == 10 && b.consumer(0x79, 30) == 20);
+  for (unsigned i = 0; i < 12; ++i) b.consumer(0x79, 40);
+  CHECK(b.level() == 100 && b.consumer(0x79, 50) == -1 && b.consumer(0x7a, 60) == 90);
+  CHECK(b.consumer(0x7c, 70) == 0 && b.consumer(0x7c, 80) == 90 && b.consumer(0xe9, 90) == -1);
+  Backlight idle;
+  idle.configure(50, 5000);
+  CHECK(idle.attach(1000) == 50 && idle.tick(3000) == -1 && idle.tick(6000) == 0 && idle.tick(7000) == -1);
+  CHECK(idle.input(8000) == 50 && idle.input(8100) == -1 && idle.tick(12000) == -1 && idle.tick(13100) == 0);
+  idle.detach();
+  CHECK(idle.attach(20000) == 50);
+  Backlight never;
+  never.configure(101, 1000);
+  CHECK(never.attach(0) == -1 && never.tick(5000) == -1 && never.input(6000) == -1);
+  Command c[5];
+  CHECK(attachCommands(false, 1, 0, c) == 5 && c[4].cmd == kCmdBacklight && c[4].value == 0);
+}
+
+// The poll plan: fast while frames flow, then idle, slow when detached or closed; a minute's wakeups.
+static void testPollPlan()
+{
+  PollPlan p;
+  const PollConfig &c = p.config();
+  CHECK(c.activeMs == 4 && c.idleMs == 30 && c.slowMs == 200 && c.holdMs == 2000 && c.hallMs == 500);
+  // Before any frame: idle when attached and open, slow when detached or closed.
+  CHECK(p.mode(0, true, false) == PollMode::idle && p.mode(0, false, false) == PollMode::slow && p.mode(0, true, true) == PollMode::slow);
+  // A frame: 4 ms for 2 s whatever the cover's state (an attach message arrives detached), then back.
+  p.activity(10000);
+  CHECK(p.mode(10000, true, false) == PollMode::active && p.mode(11999, false, true) == PollMode::active);
+  CHECK(p.mode(12000, true, false) == PollMode::idle && p.mode(12000, false, false) == PollMode::slow);
+  CHECK(p.sleepMs(PollMode::active) == 4 && p.sleepMs(PollMode::idle) == 30 && p.sleepMs(PollMode::slow) == 200);
+  CHECK(p.readEveryMs(PollMode::active) == 1000 && p.readEveryMs(PollMode::idle) == 5000 && p.readEveryMs(PollMode::slow) == 10000);
+  // Typing: each key keeps it active; the first key after a pause waits at most one idle period.
+  p.activity(20000);
+  p.activity(21500);
+  CHECK(p.mode(23400, true, false) == PollMode::active && p.mode(23500, true, false) == PollMode::idle);
+  // A minute of the loop as it sleeps: 10 s of typing (active), the rest idle: about 2,500 + 1,666 wakeups, not 15,000.
+  PollPlan q;
+  uint64_t t = 0;
+  unsigned wakes = 0;
+  PollPlan::Minute m = {};
+  bool got = false;
+  while (!got) {
+    if (t < 10000 && t % 100 == 0) q.activity(t);   // a frame every 100 ms for 10 s
+    const PollMode mode = q.mode(t, true, false);
+    q.wake(t, mode);
+    ++wakes;
+    got = q.takeMinute(&m);
+    t += q.sleepMs(mode);
+  }
+  CHECK(m.ms >= 60000 && m.wakes == wakes && m.inMode[0] + m.inMode[1] + m.inMode[2] == m.wakes && !q.takeMinute(&m));
+  CHECK(m.inMode[0] > 2900 && m.inMode[0] < 3100 && m.inMode[1] > 1550 && m.inMode[1] < 1700 && m.inMode[2] == 0);
+  // Detached for a minute: 300 wakeups.
+  PollPlan r;
+  for (t = 0, got = false; !got; t += r.sleepMs(r.mode(t, false, false))) {
+    r.wake(t, r.mode(t, false, false));
+    got = r.takeMinute(&m);
+  }
+  CHECK(m.wakes == 301 && m.inMode[2] == 301);
+  // Tuned.
+  PollConfig tuned;
+  tuned.idleMs = 50;
+  tuned.slowMs = 500;
+  r.configure(tuned);
+  CHECK(r.sleepMs(PollMode::idle) == 50 && r.sleepMs(PollMode::slow) == 500 && r.sleepMs(PollMode::active) == 4);
+}
+
 int main(int argc, char **argv)
 {
   bool noFirmware = false;
@@ -1025,6 +1097,8 @@ int main(int argc, char **argv)
   testScrolling();
   testGestures();
   testTapsAndTyping();
+  testBacklight();
+  testPollPlan();
   if (failures) {
     std::printf("keyboard_host: %d failure(s)\n", failures);
     return 1;

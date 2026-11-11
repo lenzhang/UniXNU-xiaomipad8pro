@@ -653,5 +653,126 @@ class Pointer {
   Gesture g_ = {};
 };
 
+// ------------------------------------------------------------------------------------------------- the cover's backlight
+// The keyboard backlight (command 0x23, 0..100; Linux's nanosic::kbd_backlight): the level set at boot (piano-keyboard-backlight,
+// default 0: off, as the cover is left without the boot argument), the keyboard-brightness keys if the cover sends them (consumer
+// 0x79 up, 0x7a down, 0x7c toggle: 10 per step; they still go to macOS), and an optional idle timeout (off after idleMs without a
+// key or a touch, back at the next one). Each call returns the value to send, or -1 for nothing. A level over 100 is never sent.
+class Backlight {
+ public:
+  void configure(uint32_t level, uint32_t idleMs)
+  {
+    level_ = level;
+    idleMs_ = idleMs;
+    shown_ = -1;
+  }
+  int attach(uint64_t ms)
+  {
+    lastInputMs_ = ms;
+    if (level_ > 100) return -1;
+    return show(int(level_));
+  }
+  int input(uint64_t ms)
+  {
+    lastInputMs_ = ms;
+    if (level_ > 100 || shown_ != 0 || !level_) return -1;
+    return show(int(level_));   // back from the idle off
+  }
+  int tick(uint64_t ms)
+  {
+    if (!idleMs_ || level_ > 100 || !level_ || shown_ <= 0 || ms - lastInputMs_ < idleMs_) return -1;
+    return show(0);
+  }
+  int consumer(uint16_t usage, uint64_t ms)
+  {
+    lastInputMs_ = ms;
+    uint32_t level = level_ > 100 ? 0 : level_;
+    if (usage == 0x79) level = level + 10 > 100 ? 100 : level + 10;
+    else if (usage == 0x7a) level = level < 10 ? 0 : level - 10;
+    else if (usage == 0x7c) { if (level) { toggled_ = level; level = 0; } else level = toggled_ ? toggled_ : 50; }
+    else return -1;
+    level_ = level;
+    return show(int(level));
+  }
+  void detach() { shown_ = -1; }
+  uint32_t level() const { return level_; }
+
+ private:
+  int show(int v)
+  {
+    if (v == shown_) return -1;
+    shown_ = v;
+    return v;
+  }
+  uint32_t level_ = 0, idleMs_ = 0, toggled_ = 0;
+  int shown_ = -1;
+  uint64_t lastInputMs_ = 0;
+};
+
+// ------------------------------------------------------------------------------------------------------------ the poll plan
+// The serving loop has no interrupt: it sleeps, then looks at gpio97's latched rising edge (TLMM keeps it while the loop sleeps,
+// so a sleep only delays a frame, never loses it). How long it sleeps (battery): `activeMs` (piano-keyboard-poll, 4) while reports
+// flow, i.e. for `holdMs` (2 s) after the last frame with reports or edge; `idleMs` (piano-keyboard-idle-poll, 30: the first
+// keystroke after a pause waits at most that) while the cover is attached and open; `slowMs` (piano-keyboard-slow-poll, 200) while
+// it is detached or the hall sensor says closed. The read the loop makes without an edge (insurance against a lost one) follows the
+// mode too: every 1, 5 or 10 s. The hall sensor is sampled every `hallMs` (500). Wakeups are counted per minute for the log.
+enum class PollMode : uint8_t { active, idle, slow };
+inline const char *pollModeName(PollMode m) { return m == PollMode::active ? "active" : m == PollMode::idle ? "idle" : "slow"; }
+struct PollConfig {
+  uint32_t activeMs = 4, idleMs = 30, slowMs = 200, holdMs = 2000, hallMs = 500;
+};
+class PollPlan {
+ public:
+  struct Minute {
+    uint32_t wakes, inMode[3], ms;
+  };
+  void configure(const PollConfig &c) { cfg_ = c; }
+  const PollConfig &config() const { return cfg_; }
+  // A frame with reports, or a latched edge.
+  void activity(uint64_t now)
+  {
+    last_ = now;
+    seen_ = true;
+  }
+  PollMode mode(uint64_t now, bool attached, bool closed) const
+  {
+    if (seen_ && now - last_ < cfg_.holdMs) return PollMode::active;
+    return !attached || closed ? PollMode::slow : PollMode::idle;
+  }
+  uint32_t sleepMs(PollMode m) const { return m == PollMode::active ? cfg_.activeMs : m == PollMode::idle ? cfg_.idleMs : cfg_.slowMs; }
+  uint32_t readEveryMs(PollMode m) const { return m == PollMode::active ? 1000 : m == PollMode::idle ? 5000 : 10000; }
+  // One wakeup of the loop in mode m. Every 60 s (from the first wakeup) a minute's summary is ready for takeMinute().
+  void wake(uint64_t now, PollMode m)
+  {
+    if (!started_) {
+      started_ = true;
+      windowStart_ = now;
+    }
+    ++wakes_;
+    ++inMode_[unsigned(m)];
+    if (now - windowStart_ >= 60000) {
+      minute_ = {wakes_, {inMode_[0], inMode_[1], inMode_[2]}, uint32_t(now - windowStart_)};
+      ready_ = true;
+      windowStart_ = now;
+      wakes_ = 0;
+      inMode_[0] = inMode_[1] = inMode_[2] = 0;
+    }
+  }
+  bool takeMinute(Minute *m)
+  {
+    if (!ready_) return false;
+    ready_ = false;
+    *m = minute_;
+    return true;
+  }
+
+ private:
+  PollConfig cfg_;
+  uint64_t last_ = 0, windowStart_ = 0;
+  bool seen_ = false, ready_ = false, started_ = false;
+  uint32_t wakes_ = 0, inMode_[3] = {};
+  Minute minute_ = {};
+};
+
 }  // namespace pianokeyboard
 #endif

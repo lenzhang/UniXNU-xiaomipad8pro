@@ -18,13 +18,14 @@
 //   6 serving    gpio97's rising edges latched in TLMM (no GIC interrupt: polled every piano-keyboard-poll ms), each frame read
 //                from register 0x4c and split into reports; attach messages answered as Linux does (keyboard power, Caps LED,
 //                touchpad on, mic LED, backlight: Wn8030Piano.h attachCommands), the keyboard power repeated every 12 s while
-//                attached; the hall sensor polled every 100 ms. A bring-up that stops early (a failed step, piano-keyboard-stop)
-//                still polls the hall sensor.
+//                attached; the hall sensor polled every 500 ms. A bring-up that stops early (a failed step, piano-keyboard-stop)
+//                still polls the hall sensor. The latch is polled at 4 ms while reports flow, 30 ms idle, 200 ms detached or closed
+//                (Wn8030Piano.h PollPlan; one wait function, waitForEdge, for a later GPIO interrupt).
 // The I2C bus is driven in software (BitI2c.h); the QUP engine is not touched.
 //
 // The hall sensor: the folio's lid switch on TLMM gpio80 (boot DT gpio-keys switch-lid, SW_LID, active low: low = cover closed),
 // separate from the MCU's attach bit. Read only (its CTL is never written): logged at start and on each change ("hall: cover
-// closed/open"), two equal 100 ms samples make a change. macOS is told nothing unless piano-keyboard-lid=1.
+// closed/open"), two equal 500 ms samples make a change. macOS is told nothing unless piano-keyboard-lid=1.
 //
 // Boot arguments (default: inert, the service does not even probe):
 //   piano-keyboard=1            steps 1-6; every report is logged raw ("frame"/"key"/"touch" lines), nothing goes to macOS
@@ -51,7 +52,12 @@
 //   piano-keyboard-tap=0        no tap-to-click (default 1: one finger left, two right, three middle; no drag lock)
 //   piano-keyboard-typing=MS    ignore touches that start within MS of a key going down (default 250; 0 off)
 //   piano-keyboard-invert=B     bit 0 X, bit 1 Y
-
+// The backlight and polling:
+//   piano-keyboard-backlight=P  keyboard backlight 0..100 on attach (default 0: off; over 100: not sent); the cover's
+//                               keyboard-brightness keys (consumer 0x79/0x7a/0x7c), if it sends them, step it by 10
+//   piano-keyboard-backlight-idle=S  backlight off after S s without a key or touch, back at the next (default 0: never)
+//   piano-keyboard-poll=MS      the latch poll while reports flow (default 4)       piano-keyboard-idle-poll=MS  idle (default 30)
+//   piano-keyboard-slow-poll=MS detached or closed (default 200); the hall sensor every 500 ms
 //   piano-keyboard-fnrow=1      Right Ctrl + 1..0 - = are F1..F12 (Wn8030Piano.h Keys; default 0: keys as the cover sends them)
 //   piano-keyboard-hall=0       do not read gpio80 at all
 //   piano-keyboard-lid=1        tell IOPMrootDomain the hall state (kIOPMClamshellClosed/Opened), with clamshell sleep disabled
@@ -92,7 +98,7 @@ namespace {
 
 struct Args {
   uint32_t level, stop, trace, halfUs, pollMs, rails, touchpad, backlight, tap, invert, divide, mouse, auth, raw, fnrow, hall, lid;
-  uint32_t dpi, scrollRes, scroll, scrollInvert, gestures, typing;
+  uint32_t dpi, scrollRes, scroll, scrollInvert, gestures, typing, backlightIdle, idlePoll, slowPoll;
 };
 Args gArgs;
 
@@ -113,7 +119,7 @@ void readArgs()
   gArgs.pollMs = clampArg(bootArg("piano-keyboard-poll", 4), 1, 50);
   gArgs.rails = bootArg("piano-keyboard-rails", 1);
   gArgs.touchpad = bootArg("piano-keyboard-touchpad", 1);
-  gArgs.backlight = bootArg("piano-keyboard-backlight", 50);
+  gArgs.backlight = bootArg("piano-keyboard-backlight", 0);
   gArgs.tap = bootArg("piano-keyboard-tap", 1);
   gArgs.invert = bootArg("piano-keyboard-invert", 0);
   gArgs.divide = clampArg(bootArg("piano-keyboard-divide", 1), 1, 16);
@@ -129,6 +135,9 @@ void readArgs()
   gArgs.scrollInvert = bootArg("piano-keyboard-scroll-invert", 0);
   gArgs.gestures = bootArg("piano-keyboard-gestures", 0);
   gArgs.typing = clampArg(bootArg("piano-keyboard-typing", 250), 0, 2000);
+  gArgs.backlightIdle = clampArg(bootArg("piano-keyboard-backlight-idle", 0), 0, 3600);
+  gArgs.idlePoll = clampArg(bootArg("piano-keyboard-idle-poll", 30), 1, 200);
+  gArgs.slowPoll = clampArg(bootArg("piano-keyboard-slow-poll", 200), 10, 1000);
 }
 
 // The touchpad's report descriptor with the declared resolutions of the boot arguments (made in start()).
@@ -443,8 +452,12 @@ class PianoKeyboard : public IOService {
   BitI2c fBus;
   Pointer fPointer;
   Keys fKeyFilter;
+  Backlight fBacklight;
+  PollPlan fPoll;
   uint8_t fLastKeys[kKeyboardBytes] = {kIdKeyboard};
   uint32_t fSwipesSent = 0;
+  uint64_t fNextWakeLog = 0;
+  unsigned fWakeLogs = 0;
   uint8_t fFrame[kFrameBytes];
   uint8_t fWire[kDataWire];
   // serving state (the thread's own)
@@ -454,7 +467,7 @@ class PianoKeyboard : public IOService {
   uint32_t fKeys = 0, fConsumer = 0, fTouch = 0, fMouse = 0, fVendor = 0, fAccel = 0, fAuth = 0, fAttaches = 0, fSent = 0, fSendErrors = 0;
   uint32_t fConsecutiveErrors = 0, fRawLogged = 0, fEmptyLogged = 0, fLevelReads = 0, fIrqHigh = 0, fPolls = 0;
   uint32_t fAcks = 0, fStates = 0, fPointerSent = 0, fSumBad = 0;
-  bool fIrqWasLow = false;
+  bool fIrqWasLow = false;   // gpio97 low at the last wakeup
   // the hall sensor (gpio80): the accepted level (1 open, 0 closed; -1 not read), the last sample, changes, the next sample time
   int fHall = -1, fHallSample = -1;
   uint32_t fHallChanges = 0;
@@ -483,6 +496,8 @@ class PianoKeyboard : public IOService {
   bool sendCommand(uint8_t cmd, uint8_t value, const char *what);
   void authAnswer(const Report &r);
   IOReturn send(Kind kind, const uint8_t *bytes, unsigned length);
+  void backlight(int value, const char *why);
+  bool waitForEdge(uint32_t ms);
   void surveyHall();
   void pollHall(uint64_t now);
   void hallOnly();
@@ -527,11 +542,18 @@ bool PianoKeyboard::start(IOService *provider)
   fPointer.configure(pc);
   fKeyFilter.fnRow = gArgs.fnrow != 0;
   gTouchpad = makeTouchpadDescriptor(gArgs.dpi, gArgs.scrollRes);
+  fBacklight.configure(gArgs.backlight, gArgs.backlightIdle * 1000);
+  PollConfig poll;
+  poll.activeMs = gArgs.pollMs;
+  poll.idleMs = gArgs.idlePoll;
+  poll.slowMs = gArgs.slowPoll;
+  fPoll.configure(poll);
   note("touchpad: %u dpi declared (%u counts per pointer count), scroll %u counts per wheel count at %u per inch%s, %s, taps %s, "
-       "typing guard %u ms, three-finger gestures %s",
+       "typing guard %u ms, three-finger gestures %s; backlight %u%s; poll %u / %u / %u ms (active / idle / detached or closed)",
        gArgs.dpi, gArgs.divide, gArgs.scroll, gArgs.scrollRes, gArgs.scrollRes ? "" : " (none: macOS's 9)",
        gArgs.scrollInvert ? "scrolling inverted" : "natural scrolling", gArgs.tap ? "on" : "off", gArgs.typing,
-       gArgs.gestures ? "ON" : "off (recognised for the log only)");
+       gArgs.gestures ? "ON" : "off (recognised for the log only)", gArgs.backlight,
+       gArgs.backlightIdle ? ", off when idle" : "", gArgs.pollMs, gArgs.idlePoll, gArgs.slowPoll);
   thread_t thread = nullptr;
   if (kernel_thread_start(threadMain, this, &thread) != KERN_SUCCESS) {
     stage(-1, "kernel_thread_start");
@@ -642,11 +664,11 @@ void PianoKeyboard::surveyHall()
   setProperty("piano-keyboard-hall", uint64_t(fHall), 32);
 }
 
-// Every 100 ms: a level that two samples in a row agree on and differs from the accepted one is a change.
+// Every 500 ms (the poll plan's hallMs): a level that two samples in a row agree on and differs from the accepted one is a change.
 void PianoKeyboard::pollHall(uint64_t now)
 {
   if (fHall < 0 || now < fHallNextMs) return;
-  fHallNextMs = now + 100;
+  fHallNextMs = now + fPoll.config().hallMs;
   const int sample = int(rd32(gHall.page.va + kIo) & 1);
   const bool agreed = sample == fHallSample;
   fHallSample = sample;
@@ -683,12 +705,12 @@ void PianoKeyboard::lidNotify(bool closed)
 void PianoKeyboard::hallOnly()
 {
   if (fHall < 0) return;
-  note("hall: polled every 100 ms without the keyboard (the bring-up stopped at step %d)", piano_keyboard_stage);
+  note("hall: polled every %u ms without the keyboard (the bring-up stopped at step %d)", fPoll.config().hallMs, piano_keyboard_stage);
   fStartMs = nowMs();
   lidNotify(!fHall);
   for (;;) {
     pollHall(nowMs());
-    IOSleep(100);
+    IOSleep(fPoll.config().hallMs);
   }
 }
 
@@ -969,6 +991,13 @@ void PianoKeyboard::authAnswer(const Report &r)
   note("auth: sent %s: %s (%s)", what, i2cName(rc), hex(wire + 1, 12, line, sizeof line));
 }
 
+// A backlight value from Backlight (-1: nothing to send).
+void PianoKeyboard::backlight(int value, const char *why)
+{
+  if (value < 0 || !fAttached) return;
+  sendCommand(kCmdBacklight, uint8_t(value), why);
+}
+
 void PianoKeyboard::coverAttached(bool on, const char *why)
 {
   if (on == fAttached) return;
@@ -976,11 +1005,13 @@ void PianoKeyboard::coverAttached(bool on, const char *why)
   note("cover %s (%s)", on ? "ATTACHED" : "detached", why);
   if (!on) {
     releaseAll();   // every key, consumer key and button up; the pointer and key state forgotten
+    fBacklight.detach();
     return;
   }
   ++fAttaches;
   Command list[5];
-  const unsigned n = attachCommands(fCaps, gArgs.touchpad, gArgs.backlight, list);
+  const int light = fBacklight.attach(nowMs());
+  const unsigned n = attachCommands(fCaps, gArgs.touchpad, light < 0 ? 101u : uint32_t(light), list);
   for (unsigned i = 0; i < n; ++i) sendCommand(list[i].cmd, list[i].value, list[i].what);
   fKeepaliveMs = nowMs() + 12000;
 }
@@ -1062,6 +1093,7 @@ void PianoKeyboard::dispatch(const Report &r)
     const uint64_t now = nowMs();
     if (Keys::newKey(fLastKeys, r.bytes)) fPointer.keyTyped(now);   // the typing guard
     memcpy(fLastKeys, r.bytes, kKeyboardBytes);
+    backlight(fBacklight.input(now), "backlight (a key after idle)");
     fKeyFilter.filter(r.bytes, out);
     const bool rollover = fKeyFilter.rollovers() != rollovers, changed = memcmp(out, r.bytes, kKeyboardBytes) != 0;
     const IOReturn rc = send(Kind::keyboard, out, kKeyboardBytes);
@@ -1075,6 +1107,7 @@ void PianoKeyboard::dispatch(const Report &r)
   case kIdConsumer: {
     ++fConsumer;
     const IOReturn rc = send(Kind::keyboard, r.bytes, kConsumerBytes);
+    backlight(fBacklight.consumer(le16(r.bytes + 1), nowMs()), "backlight (keyboard-brightness key)");
     if (show || fConsumer <= 20)
       note("consumer %u: %s (usage %#x)%s", fConsumer, hex(r.bytes, r.length, line, sizeof line), le16(r.bytes + 1),
            fHid[0] ? (rc ? ", macOS refused" : ", to macOS") : "");
@@ -1087,6 +1120,7 @@ void PianoKeyboard::dispatch(const Report &r)
     if (show && (fTouch <= 120 || fTouch % 25 == 0)) note("touch %u: %s", fTouch, hex(r.bytes, r.length, line, sizeof line));
     uint8_t out[2][kPointerBytes];
     const uint64_t now = nowMs();
+    backlight(fBacklight.input(now), "backlight (a touch after idle)");
     const unsigned n = fPointer.touch(r.bytes, now, out);
     for (unsigned i = 0; i < n; ++i) {
       const IOReturn rc = send(Kind::touchpad, out[i], kPointerBytes);
@@ -1149,6 +1183,17 @@ void PianoKeyboard::dispatch(const Report &r)
   }
 }
 
+// The serving loop's one wait: sleep ms, then whether gpio97's rising edge was latched meanwhile (the latch is cleared here). TLMM
+// keeps an edge that comes while the loop sleeps, so a longer sleep only delays the frame by at most that long. With a GPIO
+// interrupt (a shared TLMM helper) this becomes a wait for that interrupt with the same timeout; nothing else changes.
+bool PianoKeyboard::waitForEdge(uint32_t ms)
+{
+  if (ms) IOSleep(ms);
+  const bool edge = rd32(pinVa(kIrq) + kIntrStatus) & 1;
+  if (edge) wr32(pinVa(kIrq) + kIntrStatus, 0);
+  return edge;
+}
+
 void PianoKeyboard::serve()
 {
   fStartMs = nowMs();
@@ -1156,29 +1201,31 @@ void PianoKeyboard::serve()
   uint64_t nextDescribe = 15000;
   note("serving: %s", gArgs.level >= 2 ? "reports go to macOS" : "reports are logged only (piano-keyboard=2 gives them to macOS)");
   lidNotify(!fHall);
+  bool edge = waitForEdge(0);
   for (;;) {
     const uint64_t now = nowMs();
-    const bool edge = rd32(pinVa(kIrq) + kIntrStatus) & 1;
     if (edge) {
-      wr32(pinVa(kIrq) + kIntrStatus, 0);
       if (!fEdgeSeen) note("first gpio97 edge after %llu ms", (unsigned long long)(now - fStartMs));
       fEdgeSeen = true;
       ++fEdges;
+      fPoll.activity(now);
     }
-    // A frame per edge; after a frame with reports one more read (edges coalesce while a read runs). Until an edge is seen, and
-    // every second after that, a read anyway (an edge lost before arming leaves the MCU waiting).
-    // gpio97 held high without a latched edge (a level the MCU keeps while it has data) also means a frame is waiting.
+    const PollMode before = fPoll.mode(now, fAttached, fHall == 0);
+    // A frame per edge; after a frame with reports one more read (edges coalesce while a read runs). Until an edge is seen every
+    // 100 ms, then every 1 / 5 / 10 s (active / idle / slow) a read anyway (an edge lost before arming leaves the MCU waiting).
+    // gpio97 seen low at the last wakeup and high now without a latched edge is a missed edge: a frame is waiting.
     ++fPolls;
     const bool high = level(kIrq);
     if (high) ++fIrqHigh;
-    else fIrqWasLow = true;
     const bool levelDue = !edge && !fReadAgain && high && fIrqWasLow;
+    fIrqWasLow = !high;
     if (levelDue) ++fLevelReads;
-    const bool due = edge || levelDue || fReadAgain || now - fLastReadMs >= (fEdgeSeen ? 1000u : 100u);
+    const bool due = edge || levelDue || fReadAgain || now - fLastReadMs >= (fEdgeSeen ? fPoll.readEveryMs(before) : 100u);
     unsigned burst = 0;
     if (due) {
       do fReadAgain = readFrame();
       while (fReadAgain && ++burst < 8);
+      if (fReadAgain || burst) fPoll.activity(now);   // reports came
     }
     const bool status = level(kStatus);
     if (status != fStatusLevel) {
@@ -1198,13 +1245,22 @@ void PianoKeyboard::serve()
       sendCommand(kCmdKeyboardPower, 1, "keyboard power (every 12 s)");
       fKeepaliveMs = now + 12000;
     }
+    backlight(fBacklight.tick(now), "backlight (idle: off)");
     pollHall(now);
     const uint64_t elapsed = now - fStartMs;
     if (elapsed >= nextDescribe) {
       describe(elapsed / 1000);
       nextDescribe = nextDescribe < 60000 ? nextDescribe + 15000 : nextDescribe < 120000 ? nextDescribe + 30000 : nextDescribe + 300000;
     }
-    if (!fReadAgain) IOSleep(fConsecutiveErrors >= 50 ? 1000 : gArgs.pollMs);
+    // How long to sleep: no sleep while a burst goes on; 1 s after 50 read errors in a row; else the poll plan's period.
+    const PollMode mode = fPoll.mode(nowMs(), fAttached, fHall == 0);
+    fPoll.wake(now, mode);
+    PollPlan::Minute minute;
+    if (fPoll.takeMinute(&minute) && (++fWakeLogs <= 5 || fWakeLogs % 10 == 0))
+      note("idle: %u wakeups in %u s (%u active at %u ms, %u idle at %u ms, %u slow at %u ms), now %s; %u reads, %u frames so far",
+           minute.wakes, minute.ms / 1000, minute.inMode[0], fPoll.config().activeMs, minute.inMode[1], fPoll.config().idleMs,
+           minute.inMode[2], fPoll.config().slowMs, pollModeName(mode), fReads, fFrames);
+    edge = waitForEdge(fReadAgain ? 0 : fConsecutiveErrors >= 50 ? 1000 : fPoll.sleepMs(mode));
   }
 }
 
@@ -1217,5 +1273,5 @@ void PianoKeyboard::describe(uint64_t seconds)
        fEdgeSeen ? "" : " (none yet: polled every 100 ms)", fLevelReads, fIrqHigh, fPolls, fKeys, fKeyFilter.rollovers(), fConsumer,
        fTouch, fPointer.gestures(), fPointer.taps(), fPointer.swipes(), fSwipesSent, fMouse, fVendor, fAccel, fAuth, fAcks, fAttaches,
        fCommands, fCommandErrors, fSent, fSendErrors, level(kIrq), level(kStatus), fHall < 0 ? "not read" : fHall ? "open" : "closed",
-       "4 ms");
+       pollModeName(fPoll.mode(nowMs(), fAttached, fHall == 0)));
 }
