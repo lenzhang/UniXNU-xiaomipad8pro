@@ -2,7 +2,7 @@ turnip: on Darwin, TU_DEBUG from /private/var/ngpu/debug/tu-debug when the envir
 
 WindowServer's environment comes from its launchd job on the read-only system volume; the Data seed can carry this file
 (tooling/k27/build-native-image.sh PIANO_A830_TU_DEBUG, default sysmem for the first native bring-up).
-Against the VM's Mesa tree (Droid-VM/mesa cecc0e9 + UniXNU-turnip patches/mesa + macOS-DroidVM patches/mesa-macos). MIT.
+Against the VM-era Mesa tree of tooling/metal/UPSTREAM (cecc0e9 + UniXNU-turnip patches/mesa + patches/mesa-macos). MIT.
 
 --- a/src/freedreno/vulkan/tu_util.cc
 +++ b/src/freedreno/vulkan/tu_util.cc

@@ -4,7 +4,7 @@
 
     coalesce-weak.py IN/objects.json OUT_DIR [--report]
 
-The KC's native linker (macOS-DroidVM scripts/kc_native.py, read only here) knows no weak definitions: every object that defines a
+The KC's native linker (the k27 tree's scripts/kc_native.py, read only here) knows no weak definitions: every object that defines a
 symbol resolves its own references to its own copy, and other objects get whichever definition came last. A driver written for a
 static link with weak defaults (Adreno830: adreno830_profile_value in ten translation units, the publish shell's weak
 adreno830_dcvs_submit next to A830Dcvs's strong one, the status hooks, the firmware images) would then run with split state and

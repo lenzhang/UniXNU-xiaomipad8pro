@@ -1,8 +1,8 @@
 # The ADT identity of the k27 kernel collection (macOS 27.0.1 26A434, VirtualMac2,1) on piano, used by
-# tooling/adt/make-piano-adt.py in place of the macos-27.3 OS profile's Mac17,11 tables. Every value below is what the VM's
-# working ADT carries today (make-droidvm-adt.py + piano-macos-boot.py, dumped in logs/adt/vm-adt.txt), minus the VM's
-# devices; the hardware part comes from dts/piano.dts. Plan R8: the vma2 identity stays until WindowServer is tried with
-# another one on real hardware.
+# tooling/adt/make-piano-adt.py in place of the macos-27.3 OS profile's Mac17,11 tables. Every value below is the VM-era ADT's
+# (the macOS 27.0.1 install was first brought up under the hypervisor), minus its virtual devices; the hardware part comes from
+# dts/piano.dts. Why this identity stays: docs/bringup-debugging.md §5.3 (plan R8: until WindowServer is tried with another one
+# on real hardware).
 
 ["payload"."adt"]
 "chip_id" = "8011"

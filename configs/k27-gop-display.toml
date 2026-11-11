@@ -1,7 +1,7 @@
 # /arm-io/gop-display: the display node of the native k27 boot, part of the ADT tooling/adt/make-piano-adt.py writes (--no-gop-display
 # leaves it out; docs/drivers/native-gop-display.md).
 #
-# compatible "paravirtualizedgraphics,gpu", exactly as the VM's /arm-io/display (macOS-DroidVM scripts/run-macos-vm.py MACOS_DISPLAY):
+# compatible "paravirtualizedgraphics,gpu", as the VM-era ADT's /arm-io/display had it:
 # IOMobileFramebuffer.framework (iomfb_populate_all_display_infos) counts the DisplayPortCount of the AppleParavirtGPU services only
 # when an /arm-io child is compatible with that string; NativeGopDisplay's AppleParavirtGPU nub matches it by name, and its display
 # takes the nub (the native-gop-display marker below; boot-arg native-gop-display=0 declines).

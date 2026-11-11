@@ -1,4 +1,4 @@
-frontend (AdrenoMetal NativeBridgeMetalFrontend.mm as macOS-DroidVM's piano-frontend-patch.py leaves it): the console after a login
+frontend (AdrenoMetal NativeBridgeMetalFrontend.mm as the k27 tree's scripts/piano-frontend-patch.py leaves it): the console after a login
 
 - NBLOG's stderr copy (NMB_LOG_STDERR, which the kernel's stderr-log=1 puts on the console) is rate-limited per call site: the first
   8 lines, then the 16th, 32nd, 64th, ... with the count ("[#64] ..."). The unified log and the problem notes still get every line.

@@ -1,7 +1,7 @@
 # Pinned sources of UniXNU-piano. The [source."name"] tables are the ones UniXNU's CLI reads (feeds.toml names); the
 # [pin."name"] tables record every other checkout slice 1 was built from (local checkouts under unixnu-research/, see
 # tooling/unixnu.sh). "unixnu fetch" rewrites the [source] part only. Nothing here is a fork: deltas live in this repository
-# (firmware/patches/, configs/, dts/, patches/) or, for k27, on macOS-DroidVM's local branch el1/native-variant.
+# (firmware/patches/, configs/, dts/, patches/; for k27, patches/k27 on top of the k27 tree of pin "k27").
 
 [source."sm8750"]
 commit = "feaa135df4763e3c19a155402e6b17b124a12e13"
@@ -123,6 +123,6 @@ commit = "4ef87402e9d58465af871e4c4f4a5de87599d81c"
 role = "origin of pianoPkg's MemoryMapLib; reference"
 
 [pin."k27"]
-repo = "local: droidvm-build/macOS-DroidVM, branch el1/native-variant"
+repo = "local: the k27 tree (PIANO_K27_TREE, tooling/k27/k27-tree.sh), branch el1/native-variant"
 commit = "11ac316b789d81fc9f734e15645456f536c05141"
 xnu = "xnu-12377.121.6 (ac9718fb1af618d5ce8678d0dc6e8a58f252216f) + patches/xnu-12377 0001-0054; tree out/k27/xnu at de16623d957cccff6dfb78d8eca4a79842af9702"

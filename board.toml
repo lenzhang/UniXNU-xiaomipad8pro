@@ -10,9 +10,9 @@
 "description" = "Xiaomi Pad 8 Pro"
 "kit" = "piano"
 "soc_source" = "sm8750"
-# The native kernel line. Slice 1 boots the k27 kernel collection (xnu-12377 + macOS-DroidVM 0001-0053, macOS 27.0.1 26A434
-# kexts, VirtualMac2,1 identity) through the same firmware and payload format; tooling/k27/ builds it and
-# configs/k27-adt.toml replaces this profile's identity for it.
+# The native kernel line. Slice 1 boots the k27 kernel collection (the k27 tree, xnu-12377 + the baseline series 0001-0052,
+# with patches/k27 0053-0062 on top; macOS 27.0.1 26A434 kexts, VirtualMac2,1 identity) through the same firmware and payload
+# format; tooling/k27/ builds it and configs/k27-adt.toml replaces this profile's identity for it.
 "os_profile" = "macos-27.3-26C5035r"
 
 

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* What Turnip's darwin backend (Droid-VM Mesa cecc0e9, written against the VM-era NativeAdreno 805c7e4 ABI v1 and Adreno740's v2)
+/* What Turnip's darwin backend (Mesa cecc0e9 of tooling/metal/UPSTREAM, written against the VM-era NativeAdreno 805c7e4 ABI v1 and Adreno740's v2)
  * names and Adreno830's NativeAdrenoABI.h v2 has not got. tooling/metal/build-turnip-a830.sh includes this after the kernel's header
  * only when that header lacks the name.
  *

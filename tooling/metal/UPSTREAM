@@ -1,8 +1,8 @@
 tooling/metal: the native A830 GPU path's Metal plugin (docs/drivers/gpu-userspace.md). Every input below is read in place, never
 changed; build products go to out/turnip-a830 and are never committed.
 
-Mesa (MIT): https://github.com/Droid-VM/mesa cecc0e96d7193c72356a31abb0cc589e4fc0415e (26.3.0-devel), as the VM built it: the work tree
-  droidvm-build/UniXNU-turnip/.cache/mesa-work with UniXNU-turnip's patches/mesa (21, Droid-VM/UniXNU 527b8b7a3119) and macOS-DroidVM's
+Mesa (MIT): https://github.com/Droid-VM/mesa cecc0e96d7193c72356a31abb0cc589e4fc0415e (26.3.0-devel), as the VM-era build used it:
+  UniXNU-turnip's work tree .cache/mesa-work with UniXNU-turnip's patches/mesa (21, Droid-VM/UniXNU 527b8b7a3119) and macOS-DroidVM's
   patches/mesa-macos (0001 log allocation failures, 0002 virtgpu accelerator class) applied. Our changes on top:
   tooling/metal/turnip-a830/mesa/0001-turnip-darwin-native-a830.patch, 0002-turnip-darwin-tu-debug-file.patch,
   0003-turnip-darwin-failures-on-stderr.patch (2026-11-11: a lost device's reason and the kernel calls that fail on stderr in a

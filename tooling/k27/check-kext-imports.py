@@ -4,7 +4,7 @@
 
     check-kext-imports.py OBJECTS.json KERNEL.macho [--library-prefix PREFIX ...]
 
-A symbol is resolved by the KC builder (macOS-DroidVM scripts/kc-build.py resolve()) from the kernel's symbol table (any section
+A symbol is resolved by the KC builder (the k27 tree's scripts/kc-build.py resolve()) from the kernel's symbol table (any section
 symbol, local or external, if its name is unique), the exports of the kept kexts the descriptor lists as libraries, and the natives
 linked before. This check covers the kernel and the objects themselves; imports of IOGraphicsFamily's classes (IOAccelerator, the
 default --library-prefix) are listed as library imports for the KC link to resolve. Exit 1 when anything else is missing.

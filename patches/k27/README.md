@@ -1,7 +1,7 @@
 # k27 patches for native piano
 
-k27 = xnu-12377.121.6 + the macOS-DroidVM series 0001-0052 (the macOS 27.0.1 VM kernel). These patches on top make
-the same kernel boot natively on piano at EL1 (all inert in the VM unless their boot argument is set):
+k27 = the k27 tree: xnu-12377.121.6 + the baseline series 0001-0052 (XNU 27.0.1, first brought up under a hypervisor). These
+patches on top make the same kernel boot natively on piano at EL1 (each inert unless its boot argument is set):
 
 | Patch | What |
 | --- | --- |
@@ -17,4 +17,5 @@ the same kernel boot natively on piano at EL1 (all inert in the VM unless their 
 | 0061 | `piano-cpuidle=N`: cpu_idle's WFI becomes a PSCI CPU_SUSPEND vote when the next timer leaves its min-residency (1 ret, 2 + cluster cl5, 3 + CPU subsystem ss3; OS-initiated mode for the domain states, last-man bookkeeping; ss3 only with the LLCC island slice reserved), exit-latency holds (`piano_cpuidle_latency_hold`), per-CPU counters (`machdep.piano_cpuidle`, a console summary every 60 s with the AOP's RPMh sleep counters), a PSCI/RSC/RPMh/LLCC probe (`piano-pm-probe=1`). Adds `osfmk/arm64/piano_pm.c`, `piano_pm.h` and `piano_pm_policy.h` = `tooling/k27/piano-pm/piano_pm_policy.h` (host-tested: `tooling/k27/test-piano-pm.sh`) (`docs/power.md` §2) |
 | 0062 | `piano-sleep=1`: macOS's system sleep as suspend-to-idle: IOCPUSleepKernel parks the other CPUs in PSCI states, freezes them, and the boot CPU idles polling the wake sources (power key, cover, keyboard, USB-C, a timer); mach_absolute_time stops across it, the calendar is advanced; full wake with the reason claimed; the Gunyah watchdog across the whole path; the ADT's sleep-disabled overridden only with the argument; `piano-sleep-test` for unattended cycles (`docs/power.md` §3) |
 
-Build: `K27_VARIANT=native build-k27-piano.sh` in the macOS-DroidVM tree (see `docs/bringup-debugging.md` §4).
+Build: `K27_VARIANT=native "$PIANO_K27_TREE/build-k27-piano.sh"` in the k27 tree with these patches applied to its `out/k27/xnu`
+(see `docs/bringup-debugging.md` §4).

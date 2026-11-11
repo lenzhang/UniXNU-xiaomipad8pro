@@ -19,7 +19,7 @@ Runs, each must pass:
      (HOSTSIM_PAGE_SIZE=4096, so the GPU address layout is the tablet's).
   2. deferred_bo (tests/hostsim/deferred_bo.cpp): BOs freed while a fence is pending, and kernel refusals of each kind (busy,
      fence, free, lease, view and map-cleanup errors), with the BO cache off so that every free reaches the kernel. Two of the
-     test's expectations are the 13T Turnip's policies, not the ABI's, and this Turnip (Droid-VM's, VM-proven) has others:
+     test's expectations are the 13T Turnip's policies, not the ABI's, and this Turnip (the VM-era build's, proven in the VM) has others:
      - its BO cache keeps a freed small BO (TU_DARWIN_BO_CACHE_SMALL_MB) instead of freeing it, so mode "normal" runs cache off;
      - its deferred-free queue grows without waiting for the GPU, where the 13T's waits at 256 entries: mode "pressure" must stop
        exactly at the test's "peer.forced" requirement (the 257th free did not wait), which is checked as such.
@@ -210,7 +210,7 @@ def main():
         stopped = [l for l in result.stderr.splitlines() if l.startswith('FAIL line')]
         ok = result.returncode == 1 and len(stopped) == 1 and stopped[0].endswith('peer.forced.load()')
         return ok, ('257 frees queued under a pending fence, none reached the kernel, the last without a GPU wait (the queue grows: '
-                    'Droid-VM policy)' if ok else (stopped[0] if stopped else f'exit {result.returncode}'))
+                    'the VM-era Turnip\'s policy)' if ok else (stopped[0] if stopped else f'exit {result.returncode}'))
     check('deferred_bo-pressure', [deferred, library, 'pressure'], {'TU_DARWIN_RETIRE_TRACE': '1', 'TU_DARWIN_BO_CACHE': '0'},
           growth_verdict)
 

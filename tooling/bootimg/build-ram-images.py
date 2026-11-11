@@ -55,14 +55,14 @@ MENU_TIMEOUT = int(os.environ.get('PIANO_MENU_TIMEOUT', '0'))   # 0: boot the de
 MENU_DEFAULT = os.environ.get('PIANO_MENU_DEFAULT', 'macos-8cpu')
 EPOCH = 1262304000  # UniXNU payload timestamps (2010-01-01)
 
-# The k27 arguments natively (docs/native-droidvm-inventory.md). From the VM's boot disk (logs/adt/vm-unixnu.toml) minus its
-# devices (droidvm-display-mm, vgpu-3d, droidvm-vt-paravirt, droidvm-monitor, droidvm-data-persist), sheng-touch-hid, and the ones
-# nothing in the native collection reads (2026-11-11: offline-hid-input, offline-hid-home, offline-key-events, sheng-aks,
-# sheng-aks-sls, ml-timeout-lock-scale, ml-timeout-lock-panic-scale; ca-triple-buffer, ca-free-wakeup: the VM's Metal plugin).
+# The k27 arguments natively and their readers: docs/k27-userland-args.md. The VM-era boot disk's set minus its virtual devices'
+# arguments, sheng-touch-hid, and the ones nothing in the native collection reads (2026-11-11: offline-hid-input, offline-hid-home,
+# offline-key-events, sheng-aks, sheng-aks-sls, ml-timeout-lock-scale, ml-timeout-lock-panic-scale; ca-triple-buffer,
+# ca-free-wakeup: the VM-era Metal plugin's). The droidvm-* names are legacy names the k27 kernel and the OS image read.
 K27_ARGS = ['-v', 'debug=0x14e', 'kt_fixed_zones=120', '-no_slto_panic', 'tlto_us=0',
             '-apfs_shared_datavolume', 'offline-apfs-load=1', 'owner-staged-apps=1',
-            # droidvm-disable-jobs: the jobs without hardware here, but inert natively (its reader was the iPadOS line's kernel,
-            # DroidVMLaunchPolicy.c; k27 has none, and the listed jobs run: docs/boot-time.md). PIANO_FAST_BOOT drops it. The clock
+            # droidvm-disable-jobs: the jobs without hardware here, but inert natively (its reader was the iPadOS line's kernel
+            # launch policy; k27 has none, and the listed jobs run: docs/boot-time.md). PIANO_FAST_BOOT drops it. The clock
             # and time zone (droidvm-utc, droidvm-tz below) are the OS image's settime.sh boot job's.
             'droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd',
             'mac-amfi-launch-permissive=1', 'union-hide-lower=1', 'malloc-ranges-off=1', 'arm64_maxoffset=0x7FFE000000',

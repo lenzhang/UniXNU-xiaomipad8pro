@@ -5,7 +5,7 @@ turnip: darwin backend for piano's A830 natively (Adreno830's NativeAdrenoABI.h 
 - dsb sy before each Submit and at the end of vkEndCommandBuffer: command streams are CPU writes into write-combined BO views,
   possibly recorded on another core (the OnePlus 13T's fix D1 on the same A830);
 - gpu_id 830 for chip 0x44050001 (the decode formula gives 6850).
-Against the VM's Mesa tree (Droid-VM/mesa cecc0e9 + UniXNU-turnip patches/mesa + macOS-DroidVM patches/mesa-macos). MIT.
+Against the VM-era Mesa tree of tooling/metal/UPSTREAM (cecc0e9 + UniXNU-turnip patches/mesa + patches/mesa-macos). MIT.
 
 --- a/src/freedreno/vulkan/tu_knl_darwin.cc
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
