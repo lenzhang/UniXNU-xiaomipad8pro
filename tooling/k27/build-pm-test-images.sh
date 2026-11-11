@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 # The power test images of docs/power.md §6 (k27 0061 CPU idle, 0062 suspend-to-idle; the ufs* images: the storage side,
-# docs/drivers/ufs.md §12.8), in the order of risk, from a KC whose
+# docs/drivers/ufs.md §12.8; island, gsleep*, gmeasure: the GPU's part, L1, G1-G3, GM), in the order of risk, from a KC whose
 # kernel has 0061 and 0062. Each is a RAM image of the GPU profile (as the installed system boots: PianoA830 and Turnip,
 # vmm-present 0) plus PianoPower's battery lines every 10 s, the USB console and the buttons, with piano-reset-after as the
 # backstop and every reset into ABL fastboot (build-ram-images.py's K27_ARGS). Data: build-ram-images.py's store guard decides
@@ -30,11 +30,16 @@ done
 BASE="piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-power=1 piano-power-period=10 piano-usb=2 piano-input=1 ${PM_EXTRA:-}"
 CYCLES="piano-sleep-test=150 piano-sleep-test-count=3 piano-sleep-max=30"
 ORDER="base probe idle1 idle2 idle1pd idle3 sleep0 sleep1 sleep2 sleepkey measure ufssleep0 ufssleep1 ufsahit ufsahitsleep ufsmeasure"
+ORDER="$ORDER island gsleep1 gsleep2 gsleep3 gmeasure"
 # The storage side (docs/drivers/ufs.md §12): native-ufs-suspend=1 (NativeUfs's link into Hibern8 for each sleep, the Data disk held
 # and synced first when its store is open read-write) and native-ufs-ahit=MS (auto-hibernate at run time). The store follows
 # build-ram-images.py's guard like every image here: with another seed than the installed one Data is volatile and only the root
 # windows take part; with the installed seed (data-persist=2) NativeRamBlock takes part too.
 UFS="native-ufs-suspend=1"
+# The GPU's part (docs/drivers/gpu.md "System suspend", "The LLCC island"; power.md §6 L1, G1-G3, GM): PianoA830 with the
+# piano-gpu-suspend / piano-llcc-island arguments on top of the same base (every GPU image prints the island's read-only line, L0).
+# G3 (the rails' votes gone) also takes the UFS link down in its own kOff ($UFS): the GPU's host votes are UFS's CX/MX too.
+GSUS="piano-gpu-suspend=1"
 # image NAME: sets A (its arguments) and R (its piano-reset-after, s)
 image() {
   case $1 in
@@ -58,6 +63,13 @@ image() {
     ufsahitsleep) A="native-ufs-ahit=1000 piano-sleep=1 piano-sleep-state=1 $CYCLES $UFS"; R=600 ;;   # both: AHIT off/on per sleep
     ufsmeasure) A="piano-cpuidle=2 piano-sleep=1 piano-sleep-state=2 piano-sleep-test=240 piano-sleep-test-count=1"
               A="$A piano-sleep-max=1800 $UFS";                 R=2400 ;;   # measure's A/B: the same with the link in Hibern8
+    island)   A="piano-pm-probe=1 piano-llcc-island=1";        R=300 ;;    # L1: ISLAND1's ways reserved, read back (DSP stopped)
+    gsleep1)  A="piano-sleep=1 piano-sleep-state=1 $CYCLES $GSUS"; R=600 ;; # G1: the GPU down, its votes at NOM_L1 / the display floor
+    gsleep2)  A="piano-sleep=1 piano-sleep-state=1 $CYCLES $GSUS piano-dpu=1 piano-dpu-panel=1"; R=600 ;;   # G2: + panel sleep: DDR 0
+    gsleep3)  A="piano-cpuidle=2 piano-sleep=1 piano-sleep-state=3 $CYCLES $GSUS piano-gpu-suspend-rails=0 piano-dpu=1"
+              A="$A piano-dpu-panel=1 piano-llcc-island=1 piano-llcc-island-ok=1 $UFS"; R=600 ;;   # G3 (attended): rails 0, ss3, island
+    gmeasure) A="piano-cpuidle=2 piano-sleep=1 piano-sleep-state=2 piano-sleep-test=240 piano-sleep-test-count=1"
+              A="$A piano-sleep-max=1800 $GSUS";                R=2400 ;;   # GM: M with the GPU's part
     *) return 1 ;;
   esac
 }

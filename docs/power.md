@@ -1,6 +1,8 @@
 # Power: the battery picture, CPU idle (k27 0061) and suspend-to-idle (k27 0062)
 
-Status 2026-11-11: **built, host-tested, linked into a KC with the current kext set; not run on the tablet.** Everything here is
+Status 2026-11-11: **built, host-tested, linked into a KC with the current kext set; not run on the tablet.** Late that day the
+GPU's part of the contract (§4: `piano-gpu-suspend=1`) and the LLCC island slice (§3.6: read at every GPU boot, `piano-llcc-island=1`
+programs it) joined it, built and host-tested in PianoA830, tests G1-G3 and L1 in §6. Everything here is
 off unless its boot argument is set. The owner's priority is battery life; this page is the whole picture (what each piece saves,
 who owns it) and, in detail, the kernel/platform part: CPU idle states, a system sleep that is the closest equivalent of Linux's
 s2idle with its wake sources, and lid / power-key sleep.
@@ -21,10 +23,11 @@ possible at that rate. Where it goes, and who is cutting it:
 | Polling → interrupts, adaptive polling | the 1 kHz loops (USB, touch) and 100 Hz ones kept every CPU out of idle: thousands of wake-ups/s down to tens | the interrupts work | merged, needs-boot | `power-irq.md` |
 | Backlight off with the display asleep | the backlight boost, the largest single load with the screen on (0.5-1.5 W) | PianoBacklight | merged, needs-boot | `drivers/backlight.md` |
 | GPU idle (slumber, IFPC, votes) | GX off between frames; CX/MX and the DDR vote at boot levels today (`drivers/gpu.md`) | PianoA830 | in flight | `drivers/gpu.md` |
+| GPU in a system suspend | the GPU powered down (CX GDSC collapsed, the GMU's votes gone) and its host votes lowered for the whole sleep instead of P0 at the top levels | PianoA830 (`piano-gpu-suspend=1`) | built, host-tested | §4, `drivers/gpu.md` |
 | CPU DVFS + thermal | the cores no longer at the clocks UEFI left; the Balanced caps | PianoThermal | merged, needs-boot | `drivers/thermal.md` |
 | **CPU idle states** (here, §2) | idle cores in C4 retention instead of WFI clock gating, a cluster in CL5, the CPU subsystem in SS3: 0.1-0.3 W at idle with eight cores | k27 0061 | built | this page |
 | **Suspend-to-idle** (here, §3) | no thread runs, no poll fires; CPUs parked in their deepest state; every driver taken to its off state | k27 0062 + every driver (§4) | built | this page |
-| RPMh votes dropped → CX collapse, DDR self-refresh | the floor of a suspended SoC: from hundreds of mW (rails at active votes) to tens (Ubuntu since v0.8.0) | every driver (§4), then a kernel RSC flush | not started; contract written | §3.6, §4 |
+| RPMh votes dropped → CX collapse, DDR self-refresh | the floor of a suspended SoC: from hundreds of mW (rails at active votes) to tens (Ubuntu since v0.8.0) | every driver (§4), then a kernel RSC flush | the GPU's votes and the LLCC island built (PianoA830); the other drivers' kOff and the SLEEP set not started | §3.6, §4 |
 | Charging control | not a saving: the battery has to fill | PianoPower | level 2 in progress | `drivers/charging.md` |
 | Panel sleep (DCS), zero-copy scanout, 60/120 Hz | the panel and the CPU copy (~39 ms a frame) | display work (B1) | design | `BACKLOG-hardware.md` |
 
@@ -189,8 +192,12 @@ goes down, and any active vote left in place persists through sleep), the **LLCC
 
 - the CPU side is done (ss3 is requested by the last CPU, OS-initiated, as Linux does);
 - the LLCC check is done (read only: `0x26841300` ATTR0 and `0x26841308` ATTR1 through the broadcast base; ss3 is refused while
-  it is not reserved; programming the slice, e.g. with PianoA830's `Sm8750Llcc` v6 writer, is the next step if the probe shows the
-  upstream table);
+  it is not reserved); PianoA830 reads the same slice at the start of every GPU boot (one line, read only) and with
+  `piano-llcc-island=1` (at `piano-gpu=2`) reserves its ways: ATTR0 0x7fffffff and ATTR1 0 for every bank, ATTR2/ATTR3 only where 0,
+  verified through the OR and AND views, refused with nothing written when the LLCC does not answer as v6 or the slice is active,
+  put back as found when a write does not read back (`drivers/gpu.md` "The LLCC island"). Kexts ask it with
+  `pianopower::llccIslandReady()`; the kernel's own reading is taken once at boot, before any kext, so ss3 after a programming needs
+  `piano-llcc-island-ok=1` until 0061/0062 re-read the two words at each decision (a kernel follow-up);
 - the RPMh counters are logged at every suspend entry and wake: the proof, when the votes are gone;
 - the votes are the drivers' (§4); a kernel `rpmh_flush` equivalent (sleep set 0 / wake set restore in the SLEEP/WAKE TCSes,
   refused while an active TCS is busy) is only needed for votes a driver must keep while awake, and only if DRV2's solver bit is
@@ -214,7 +221,7 @@ What each driver adds (their owners' work; nothing here changes their packages):
 |---|---|---|---|
 | NativeGopDisplay | already registered: stop the VBL timer (it re-arms itself every frame, even with the display off) | restart it | panel DCS off/sleep-in later (display work) |
 | PianoBacklight | already: BL_EN off through NativeGopDisplay's power-state hook (system sleep included); keep it so | already | never HWEN low |
-| PianoA830 | GMU slumber, GX/CX GDSC off, the boot bandwidth vote and the CX/MX/DDR votes dropped; mask GMU interrupts | resume (slumber exit) | the ADSP is PianoPower's: no LPASS votes |
+| PianoA830 | **built (`piano-gpu-suspend=1`, default 0; host-tested, not run)**: the submission gate shut, quiet within 500 ms, P1's full slumber (the GMU's GX/CX/DDR votes dropped through its RSC, GMU interrupts masked, CX GDSC off); its host votes only in the platform sleep action (PreSleep: after every driver's kOff): DDR to the keepalive minimum (the display's floor while the panel scans, `pianopower::displayScanout`), CX/MX to NOM_L1 (0 with `piano-gpu-suspend-rails=0`); a failure leaves the GPU up as it was (busy, lost) or recovered (a failed entry, then no GPU suspend for the boot): never half down | the platform wake action (PostResume) puts the votes back (rails first), kOn opens the gate and wakes the GPU, the wake timed against 100 ms | the ADSP is PianoPower's: no LPASS votes; the LLCC island is PianoA830's (§3.6); joins the power tree once the GPU runs |
 | PianoTouch | done 2026-11-11 (host-tested, not run; `drivers/touch.md` §16): frames stopped (the facts give the controller no sleep command), contacts released, the latency hold released, gpio162 masked at the pin, the thread parked; acknowledged within 600 ms | restart asynchronously: a read-only probe, the download again only if the firmware was lost (at most twice), the reference learned again | `piano_cpuidle_latency_hold(2000)` over each read burst (while busy); the display off (`piano-display-power`): muted, one frame per 500 ms |
 | PianoKeyboard | 0x25 = 0 and the MCU sleep line (gpio3) as on panel blank; gpio97's enable off; with the cover open and `piano-sleep-wake` bit 16: gpio95 INTR_CFG raw status + rising edge (enable off), INTR_STATUS cleared | sleep line released, ≤100 ms for gpio97, drain, 0x25 = 1; gpio95 INTR_STATUS cleared; the hall read again and reported | lid → clamshell already (`piano-keyboard-lid=2`) |
 | PianoInput | nothing to power; its thread just stops | read the keys again (the kernel swallowed the waking press) | with `piano_sleep_enabled()`: a short press (< 1.5 s, on release) → `receivePowerNotification(kIOPMSleepNow)` instead of the HID Power usage; a long press as today |
@@ -332,6 +339,12 @@ run. For `sleepkey` with the cover: `PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/PianoKe
 | S4 | `ram-pm-sleepkey` (1800 s) | attended wake sources | owner: after each test sleep press power (wake within a poll), then close and open the cover (with PianoKeyboard), plug/unplug USB-C, press volume-down | `woke ... by power-key / lid / usb / volume-down`, no immediate re-sleep after the power key, no spurious HID power press | a missed short press: raise `piano-sleep-poll` resolution (lower value) |
 | M | `ram-pm-measure` (2400 s) | low (S2-S3 passed) | no cable: unplug at the login window, wait 40 min, plug back, capture | §6.4 | — |
 | U1-U6 | `ram-pm-ufssleep0`, `ufssleep1`, `ufsahit`, `ufsahitsleep`, the installed seed with `ufssleep1`'s arguments, `ufsmeasure` | medium (the root disk's link): after S1-S2 | the storage side, `native-ufs-suspend=1` / `native-ufs-ahit=1000`: `drivers/ufs.md` §12.8 has the lines | there |
+| L0 | every image above (GPU at `piano-gpu=2`) | read only (four LLCC loads Linux also makes) | unattended | `PianoA830: llcc: ISLAND1 (SCID 12) as found: ATTR0 ... ATTR1 ...: reserved / NOT reserved` and `llcc: island ready / NOT ready`; the values next to P's kernel line | the line before it names the addresses: drop that read, report |
+| L1 | `ram-pm-island` (300 s) | medium: LLCC writes under Gunyah (an abort, or a slice changed under its user: PianoPower level 1 keeps the DSP stopped) | unattended | `llcc: piano-llcc-island=1: programmed and read back; ATTR0 0x7fffffff (AND view 0x7fffffff) ATTR1 0 ...` (or `already reserved`), `llcc: island ready` | `REFUSED ...` / `READ-BACK FAILED ... restored`: the slice stays as found, CX-off sleep off; record the line |
+| G1 | `ram-pm-gsleep1` (600 s) | medium: the GPU down and its votes lowered across S2's suspends | unattended: 3 cycles, 30 s each | per cycle `gpu suspend #n: GPU down in X ms (... CX GDSC collapsed)`, `IOPlatformSleepAction -> PianoA830`, `gpu suspend: votes down ... CX 0x... -> 0x140`, the kernel's suspend lines, `IOPlatformWakeAction -> PianoA830`, `gpu resume: votes back`, `gpu resume #n: GPU awake in X ms (within the 100 ms bound)`; after each wake the desktop draws (`row0 GPU RUN`) | `REFUSED: still busy`: a client kept the GPU busy (rerun with the screen locked); a hang in the suspend: the watchdog resets, the mailbox ends at the last `gpu` line |
+| G2 | `ram-pm-gsleep2` (600 s) | as G1, plus PianoDpu's panel sleep (B1e) | unattended | as G1 with `scanout stopped` and `DDR ... -> 0 MB/s (keepalive minimum)`; the panel back after each wake | `scanout running` after the wait: B1e's own lines (`panel: sleep ...`); raise `piano-gpu-suspend-display-ms` |
+| G3 | `ram-pm-gsleep3` (600 s) | high: the rails' votes gone and ss3 while suspended, the island programmed, the UFS link in Hibern8 (`native-ufs-suspend=1`; USB and PCIe have no kOff yet) | attended, only after L1 showed `island ready` and G1/G2 passed | `CX 0x... -> 0 ... (the rails' votes gone)`; the RPMh line at wake: whether `cxsd` / `ddr` moved (the keepalive BCMs and CN0 still hold the DDR without a SLEEP set) | a reset: keep `piano-gpu-suspend-rails` at its default; the mailbox has the last line |
+| GM | `ram-pm-gmeasure` (2400 s) | low (G1 passed) | as M | as M; the suspended current against M's (§6.4 step 3) | — |
 
 ### 6.4 The measurement (A/B)
 
@@ -368,8 +381,13 @@ the time asleep.
   command in flight before its own; during the freeze it is the only reader. A read racing PianoPower at the suspend entry can
   give one wrong value in a log line.
 - Time: an RTC alarm wake (Linux's rtcwake) is not offered: `piano-sleep-max` is the timer.
-- Not done: RPMh sleep/wake sets (kernel), LLCC slice programming, PDC wake routing, PSCI SYSTEM_SUSPEND (needs CPU_OFF/ON in
-  ArmCpu), macOS dark wakes (every wake is full).
+- The GPU's suspend (§4): its host votes are the system's only CX/MX/DDR votes, lowered at PreSleep while drivers outside the power
+  tree may still run and while UFS (its link in Hibern8 at most, its clocks on: `drivers/ufs.md` §12.2), USB and PCIe stay clocked:
+  the rails' default floor is NOM_L1 for that reason, and `piano-gpu-suspend-rails=0` is safe only once those are gated. A driver cannot cancel a 0062 suspend: a GPU that cannot go down
+  stays up and the sleep goes on without its share.
+- Not done: RPMh sleep/wake sets (kernel; SH0/MC0/CN0's keepalive minimum persists through the sleep without them), PDC wake
+  routing, PSCI SYSTEM_SUSPEND (needs CPU_OFF/ON in ArmCpu), macOS dark wakes (every wake is full), a kernel re-read of the LLCC
+  island after PianoA830 programmed it, a driver-initiated cancel of a suspend.
 
 ## 8. Files
 
@@ -378,4 +396,7 @@ the time asleep.
 `IOPMrootDomain.cpp`, `clock.c`, `machdep.piano_sleep`), `tooling/k27/piano-pm/` (the policy header, its host test, a contract
 check driver), `tooling/k27/test-piano-pm.sh`, `tooling/k27/build-pm-test-images.sh`, `package/include/PianoPowerContract.h`
 (on every kext's include path through `build-native-kext.py`). The watchdog's owner and the boot guard: `patches/k27/0063-*.patch`,
-`boot-guard.md`.
+`boot-guard.md`. The GPU's part: `package/PianoA830/adreno830/A830Suspend.h` (its host test `tests/test_a830suspend.cpp`), the gate in
+`A830PowerState`, the steps in `Adreno830Start.cpp`, `Sm8750RpmhHostRailsSet`, the IOKit side and the LLCC island in
+`package/PianoA830/board/PianoA830.cpp` with `PianoLlccIsland.h` (`board/tests/test_llcc_island.cpp`); the images L1, G1-G3, GM in
+`tooling/k27/build-pm-test-images.sh`.

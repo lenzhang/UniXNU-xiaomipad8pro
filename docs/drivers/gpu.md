@@ -1,6 +1,8 @@
 # GPU: Adreno 830 (PianoA830 = Adreno830 + piano's board glue; Metal side = AdrenoMetal plugin + Turnip on ABI v2)
 
 Status 2026-11-11: `package/PianoA830` is in the native kext list (`configs/k27-native-kexts.txt`), inert unless `piano-gpu=N`.
+Late on 2026-11-11, built and host-tested, not run: the GPU's part of a system suspend (`piano-gpu-suspend=1`), the LLCC island slice
+(read at every GPU boot; `piano-llcc-island=1` programs it), one ceiling slot per caller (§8).
 On the tablet: the read-only survey (piano-gpu=1, 07:12), S1..S10 all ok on the first full run (`GPU RUN 160M`, 44-53 C), and with
 the NativeAdrenoMetal plugin (Turnip on ABI v2) in the seed **the macOS login screen composited by WindowServer on the A830**
 (camera, about 3.5 min into the boot). Plan: the local plan `gpu-native-plan.md` (not published).
@@ -82,6 +84,13 @@ kernel side must provide (2026-11-11).
 | `piano-gpu-idle-ddr=<level>` | the scanout's (5 on piano) | the host DDR bus level of the display's floor: the lowest level holding twice the boot framebuffer's 120 Hz read rate (3.28 GB/s at 3200x2136); 5 = 6.67 GB/s |
 | `piano-gpu-idle-rails=<vlvl>` | 0x140 | the host CX/MX level while idle (RPMh vlvl; 0x140 NOM_L1), never above what is held; 0 keeps the rails |
 | `piano-gpu-ddr-floor=<level>` | the boot level (11) | the driver's S5 floor; given, level 2's S10 drop is skipped and the idle votes lower the DDR only while idle |
+| `piano-gpu-suspend=0/1` | 0 | the GPU's part of a system suspend (§8, "System suspend"): kOff powers it down (the full slumber), PreSleep lowers its host votes, PostResume puts them back, kOn wakes it; only with `piano-gpu=2`, joined once the GPU runs |
+| `piano-gpu-suspend-idle-ms=<ms>` | 500 | how long kOff waits for the GPU to be quiet (50..2000); not quiet: the suspend goes on without the GPU's share |
+| `piano-gpu-suspend-rails=<vlvl>` | 0x140 | host CX/MX while suspended (RPMh vlvl, never above what is held, at least NOM_L1 while the panel scans); 0: the votes gone (CX-collapse configuration, only once UFS/USB/PCIe are down in their own kOff) |
+| `piano-gpu-suspend-wake=0/1` | 1 | kOn wakes the GPU at once (0: the first submission wakes it) |
+| `piano-gpu-suspend-wake-ms=<ms>` | 100 | the first-frame bound the wake is reported against (1..10000) |
+| `piano-gpu-suspend-display-ms=<ms>` | 300 | how long PreSleep waits for PianoDpu's panel sleep to finish (0..2000) |
+| `piano-llcc-island=0/1` | 0 | §8, "The LLCC island": 1 reserves ISLAND1's ways (SCID 12) at the start of a `piano-gpu=2` boot, verified by read-back; the read-only line comes at every GPU boot |
 | `piano-metal-report=0/1/2` | 1 | the plugin's abort reporter: off / the desktop's system processes / every process that loads the plugin (userspace, read through kern.bootargs) |
 | `native-gop-display-gpu-fence=0/1` | 1 | NativeGopDisplay waits for the GPU's fence before a swap's copy (§8) |
 
@@ -92,7 +101,7 @@ Build: `tooling/k27/build-native-piano-a830.sh`: (1) `gen-piano-gpu-inputs.py --
 dtc'd to `out/native-kexts/PianoA830/inputs/piano-boot.dts`, plus the stock DT's recorded KGSL policy, cross-checked; `--compare` with
 the 13T's header: only digests, SoC 639 and bin 1's length differ); (2) `stage-piano-gpu-firmware.py` (pins checked, copies in the
 ignored `out/native-kexts/PianoA830/firmware`, `.incbin` from there; firmware is never committed); (3) `run-a830-host-tests.py`
-(44 upstream and 43 macOS pass with `test_a830idle`; known: `test_sha256` SQE/AQE/ZAP against the 13T's built-in pin table, `test_a830regs` needs upstream's unpublished
+(45 upstream and 44 macOS pass with `test_a830idle` and `test_a830suspend`, then the board's `test_llcc_island` and `test_gpu_ceiling`; known: `test_sha256` SQE/AQE/ZAP against the 13T's built-in pin table, `test_a830regs` needs upstream's unpublished
 `docs/inputs`, `test_userclient` asserts iPadOS names in the macOS pass, which has its own list check); (4) objects, coalescing,
 import check. Image: `PIANO_EXTRA_KEXTS=$(tooling/k27/build-native-piano-a830.sh | tail -1) PIANO_EXTRA_ARGS="piano-gpu=1" tooling/k27/build-native-image.sh`;
 ladder: `tooling/k27/build-gpu-ladder.sh` (out/ram-gpu/s1..s9, full).
@@ -224,12 +233,99 @@ summaries (an idle desktop should be down most of the time) and the longest wake
 (nearer Linux's 66 ms), `piano-gpu-ifpc=1` (P2, GX collapse between frames; Linux runs it on this GPU), `piano-gpu-idle-slumber=0`
 (the votes without the slumber, if a wake line shows trouble).
 
-Not done here: system suspend. The host votes are ACTIVE-only on DRV-2 and nothing programs its SLEEP/WAKE sets, so they survive
-into sleep: a CX-off suspend needs the GPU in P1's full slumber (the GMU's votes dropped) and every host vote lowered to its sleep minimum
-first, and put back on resume, through the same `Sm8750RpmhHost` calls; the entry point belongs to
-the power contract when it lands (kernel.md §3.2). The thermal ceiling PianoThermal asks for at its passive trip
-(`callPlatformFunction("piano-gpu-ceiling", kHz)`, [thermal.md](thermal.md) §10.5) is in: `adreno830_dcvs_set_ceiling`, a line per
-change (`gpu ceiling N MHz (...)`, `gpu ceiling cleared`); macOS Low Power Mode will use the same call (BACKLOG B5).
+The host votes are ACTIVE-only on DRV-2 and nothing programs its SLEEP/WAKE sets, so they survive into sleep: the system suspend below
+lowers them before the CPUs park and puts them back after. The thermal ceiling PianoThermal asks for at its passive trip
+(`callPlatformFunction("piano-gpu-ceiling", kHz)`, [thermal.md](thermal.md) §10.5) is in: `adreno830_dcvs_set_ceiling`, now one
+slot per caller (below); macOS Low Power Mode uses the same call with its own slot (PianoPolicy, BACKLOG B5).
+
+**System suspend (2026-11-11, `piano-gpu-suspend=1`, default 0; built and host-tested, not run).** The GPU's part of the power
+contract (`../power.md` §4, `package/include/PianoPowerContract.h`), in four steps on the threads the system gives them
+(`adreno830/A830Suspend.h`; the IOKit side `board/PianoA830.cpp`):
+
+1. **kOff** (setPowerState on a thread call, acknowledged when done; budget 10 s): A830PowerState's suspend gate shuts (from then on
+   a submission waits for the resume instead of waking the GPU, and no touch, screen or IFPC wake, no idle tick and no idle vote
+   runs), the GPU must be quiet within `piano-gpu-suspend-idle-ms` (no holder, everything retired; a recovery in progress is waited
+   out), then P1's full slumber: PREPARE_SLUMBER, the RSCC sleep (the GMU's own GX, CX and DDR votes through the GPU's RSC drop),
+   GBIF halt, the GMU interrupts masked, the CX power-off. From a CX-keeping slumber it goes up first and down again with CX; a
+   GPU already in its full slumber (`piano-gpu-idle=2`) stays as it is.
+2. **The platform sleep action** (`IOPlatformSleepAction`, IOCPUSleepKernel's PreSleep: after every driver of the power tree
+   acknowledged its kOff): the host votes, under a host-vote mutex the DCVS thread's idle votes share and the DRV-2 lock: the DDR
+   (SH0/MC0/ACV) to the keepalive minimum once the display's scanout stopped, else to the display's floor (level 5); then CX and MX
+   to `piano-gpu-suspend-rails` (default 0x140 NOM_L1; 0: hlvl 0, the votes gone), never below NOM_L1 while the panel scans and
+   never above what is held. One TCS each, cx first when lowering (`Sm8750RpmhHostRailsSet`).
+3. **The platform wake action** (`IOPlatformWakeAction`, PostResume, before any driver's kOn): the rails back as found (mx first),
+   then the DDR.
+4. **kOn**: the votes again if step 3 did not run or failed (the GPU is never powered up on rails that went to 0), the gate open,
+   and with `piano-gpu-suspend-wake=1` the GPU woken at once, so the first frame after the wake waits for nothing; the wake's time
+   is reported against `piano-gpu-suspend-wake-ms` (100). `piano-gpu-suspend-wake=0` leaves it asleep and the first submission
+   wakes it (the wake line of the idle policy then gives that frame's wait).
+
+Why the votes wait for PreSleep and why the rails stop at NOM_L1 by default: the GPU's host CX/MX/DDR votes are the only HLOS votes for
+those resources (UFS, the display and the CPU have none of their own), the power tree's drivers go down in no fixed order, and today
+no block that runs from them is gated in a sleep: NativeUfs's `native-ufs-suspend=1` takes the link to Hibern8 but keeps every UFS
+clock and GDSC as UEFI left them ([ufs.md](ufs.md) §12.2), PianoDwc3 and PianoWifi have no kOff of their own (UFS at HS-G5, USB and
+PCIe Gen3 need NOM, the lit panel's MMCX NOM_L1). `piano-gpu-suspend-rails=0` is the CX-collapse configuration, safe only once those
+blocks are gated in their own kOff. The display's
+state comes from the contract (`pianopower::displayScanout`): stopped only when PianoDpu's panel slice (B1e, `piano-dpu-panel=1`)
+reports the panel asleep with its timing engines stopped; PreSleep waits up to `piano-gpu-suspend-display-ms` (300) for that slice's
+own thread to finish; without PianoDpu's slice the boot framebuffer scans as ABL left it (unknown = running). CN0 stays (the CPU's
+config-NoC keepalive). All votes stay ACTIVE-only: what persists through the sleep is these lowered values; SH0/MC0's keepalive
+minimum and CN0 go to 0 only through a SLEEP set, which is the kernel's (`../power.md` §3.6).
+
+Failures never leave the GPU half down: busy after the wait (work in flight, a holder, an unfinished recovery) or lost: nothing
+changed, the GPU and its votes stay as they were; a failed slumber entry: the recovery takes the GPU (kOff waits up to 3 s for it)
+and the GPU takes no part in a suspend for the rest of the boot. In both cases the suspend goes on without the GPU's share: k27 0062
+has no cancel a driver can ask for (its own aborts are for CPUs that do not park). A vote that fails at PreSleep puts back what went
+down (the GPU stays down); one that fails at PostResume is tried again at kOn, and if it still fails the GPU stays asleep with its gate
+shut (no power-up on missing rails). The service's `piano-gpu-suspend` property counts suspends, refusals, vote failures, wakes and the
+longest wake. The GPU joins the power tree only once it runs (`bring-up done`); a sleep before that finds it outside the tree, as
+today.
+
+Lines (direct console lines, `PianoA830: gpu suspend ...` / `gpu resume ...`):
+```
+PianoA830: gpu suspend: piano-gpu-suspend=1: joined the power tree (0): kOff waits up to 500 ms for quiet, then the full slumber; PreSleep: DDR to the keepalive minimum (the display's floor, level 5, while it scans), CX/MX to 0x140 (at least NOM_L1 while the panel scans); PostResume puts them back; kOn wakes the GPU (bound 100 ms)
+PianoA830: gpu suspend #1: GPU down in 3.120 ms (quiet after 0 us; full slumber entered; CX GDSC collapsed): submissions wait for the resume
+IOPlatformSleepAction -> PianoA830
+PianoA830: gpu suspend: votes down in 2210 us (scanout unknown (running)): DDR 6671 -> 6671 MB/s (the display's floor), CX 0x1c0 -> 0x140, MX 0x1c0 -> 0x140
+  ... the kernel's suspend lines (power.md §5) ...
+IOPlatformWakeAction -> PianoA830
+PianoA830: gpu resume: votes back in 1830 us (PostResume): CX 0x1c0 MX 0x1c0, DDR 6671 MB/s
+PianoA830: gpu resume #1: GPU awake in 6.512 ms (within the 100 ms bound): the first frame waits for nothing
+```
+Trouble: `gpu suspend #n: REFUSED: still busy after 500 ms ...`, `REFUSED: the slumber entry failed; the recovery brought it back
+after N ms; no GPU suspend for the rest of the boot`, `REFUSED: the GPU is lost`, `CX STILL ON: another voter keeps the GDSC`, `votes
+NOT lowered (rpmh R, ...)`, `votes NOT back`, `the WAKE FAILED`, `GPU awake in X ms (OVER the 100 ms bound)`.
+
+**The LLCC island (2026-11-11).** The ADSP's ISLAND1 slice (SCID 12) must hold reserved ways 0x7fffffff and no bonus ways before any
+CX-off suspend, or the SoC resets (`../ubuntu-history/kernel.md` §2.2: 16 of 16 suspends reset with bonus ways, 6 of 6 resumed with
+reserved ways). PianoA830 owns the LLCC, so `board/PianoLlccIsland.h`:
+- **at the start of every GPU boot** (`piano-gpu=1` or `2`, after `piano-gpu-delay`, before the survey or S0; read only, always):
+  COMMON_HW_INFO (0x26864000), ATTR0..3 (0x26841300..0x26841314) and slice 12's TRP_STATUS (0x2680c004) through the broadcast-OR view, one line:
+  `PianoA830: llcc: ISLAND1 (SCID 12) as found: ATTR0 0x... (0x26841300, expect 0x7fffffff) ATTR1 0x... (0x26841308, expect 0) ATTR2 0x...
+  ATTR3 0x...; TRP_STATUS 0x... (not active); hw-info 0x...: reserved | NOT reserved | not accessible`, then `llcc: island ready (...)`
+  or `llcc: island NOT ready: CX-off sleep must stay off`. The line before it names the addresses, so an abort is attributable.
+- **`piano-llcc-island=1`** (only with `piano-gpu=2`; `piano-gpu=1` writes nothing): ATTR0 = 0x7fffffff and ATTR1 = 0 through the
+  broadcast-OR view (every bank), ATTR2 (fixed size, priority 7) and ATTR3 (7936 KiB over the banks from COMMON_STATUS0) only where
+  they read 0, as llcc-qcom programs a slice; the per-slice algorithm bits are never written. Refused with nothing written when the
+  block does not answer as LLCC v6 (all ones, a version below 6.0: not accessible under Gunyah), when ATTR3 is needed and there is no
+  bank count, and when slice 12 is active on a bank (its user has it). Verified by reading ATTR0 back through the OR and AND views
+  (every bank holds every reserved way) and ATTR1 through the OR view; a mismatch (writes the hypervisor ignores or masks) puts the
+  values found back: `llcc: piano-llcc-island=1: programmed and read back; ATTR0 0x7fffffff (AND view 0x7fffffff) ATTR1 0 ...` or
+  `READ-BACK FAILED ... restored as found` with the first mismatch.
+- **"island ready"**: `callPlatformFunction("piano-llcc-island-ready", false, bool *)` on the PianoA830 service (lock-free, any
+  thread: the two words read again), `piano_a830_llcc_island_ready()` for kexts linked after PianoA830, and the contract's
+  `pianopower::llccIslandReady()`; the service property `piano-llcc-island` says what was found and whether PianoA830 programmed it.
+  PianoAudio's release of the LPASS votes waits for it. k27 0061/0062 read the slice themselves once at boot (their probe, before any
+  kext starts) and do not see a later programming: until a kernel follow-up re-reads the two words at each decision (or asks this
+  service), ss3 after a successful programming needs `piano-llcc-island-ok=1`, and the kernel's line still says "NOT reserved".
+
+**Ceiling slots (2026-11-11, `../policy.md` §5.3).** `callPlatformFunction("piano-gpu-ceiling", false, (void *)kHz, (void *)client)`:
+one slot per caller, client 0 (param2 null: PianoThermal's passive trip and every caller before the slots), 1 the power profile
+(PianoPolicy), 2 and 3 free; kHz 0 clears that caller's slot; the DCVS ceiling is the lowest non-zero slot
+(`board/PianoGpuCeiling.h`, `adreno830_dcvs_set_ceiling`), so no caller lifts another's limit and clearing one leaves the others. The
+service publishes `piano-gpu-ceiling-clients` = 4; a client past it is refused (kIOReturnBadArgument). A line per change of the
+ceiling in force: `gpu ceiling 160 MHz (thermal's; slots thermal 160, power profile 342, 0, 0 MHz; the lowest wins; #n)`, `gpu
+ceiling cleared (no slot holds one; #n)`. PianoPolicy can now pass client 1 and drop its interim arbitration (its owners' change).
 
 **The BO pool (2026-11-11).** The write-combined pool S3 reserves while memory is unfragmented holds the BOs Turnip allocates
 (`BoAlloc`; imported IOSurfaces are not in it): a pooled BO is one span of the GPU's table and needs no page attribute change. What
@@ -257,6 +353,10 @@ checked): 1536 MiB with piano's 13 GiB, so the desktop's BOs stay pooled and the
    driver with `piano-gpu-idle=2` and `piano-power>=2` together are still to be seen.
 4. Real Metal client count on macOS (32 slots); the 3200x2136 hang seen under virgl.
 5. Whether the 50 ms fence wait is ever reached (NativeGopDisplay's 10 s line), and the real frame time on the panel.
+6. What the boot chain leaves in the LLCC ISLAND1 slice, and whether the HLOS's stores to it stick under Gunyah (Linux programs it from
+   the same VM; the read-only line of every GPU boot, then `piano-llcc-island=1`: power.md §6 L0, L1).
+7. Whether the GPU's lowered votes show in the RPMh counters while suspended (G1-G3): the keepalive BCMs (SH0/MC0 at x = y = 1, CN0)
+   persist without a SLEEP set, and UFS/USB/PCIe have no kOff yet, so `cxsd`/`ddr` may stay still until those land.
 
 ## 11. Licence note
 

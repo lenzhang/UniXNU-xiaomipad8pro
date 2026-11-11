@@ -145,7 +145,9 @@ Until then PianoPolicy logs once and the CPU caps follow the power source (Low P
 **5.3 PianoA830, a ceiling per caller.** `"piano-gpu-ceiling"` with `param2 = (void *)(uintptr_t)client`: 0 (null: today's callers,
 PianoThermal) and 1 (the power profile, PianoPolicy); the DCVS ceiling is the lowest non-zero slot (`adreno830_dcvs_set_ceiling(min)`),
 and the service publishes `piano-gpu-ceiling-clients` = 2. PianoPolicy then passes client 1 and drops its interim arbitration (the
-breadcrumb read, the 5 s tick, the put-back) when that property is there.
+breadcrumb read, the 5 s tick, the put-back) when that property is there. **Done in PianoA830 (2026-11-11, host-tested, not run):** 4
+slots (0 thermal, 1 the power profile, 2-3 free), `piano-gpu-ceiling-clients` = 4, a client past them refused with kIOReturnBadArgument
+(`package/PianoA830/board/PianoGpuCeiling.h`, `drivers/gpu.md` §8 "Ceiling slots"); PianoPolicy's switch to client 1 is its owners'.
 
 **5.4 PianoKeyboard.** With PianoPolicy, boot with `piano-keyboard-lid=0` (its lid mode stays for tests without PianoPolicy). In
 `kOff` (contract §4), arm the gpio95 latch only when `callPlatformFunction("piano-policy-keyboard-wake", false, &latch, &now, ...)`
