@@ -6,6 +6,8 @@ from outside this repository), inert without `piano-thermal` / `piano-cpufreq`; 
 PMIC board thermistors (battery, charger, connectors, skin, ...) and `piano_thermal_board_temps()` for charging safety: §12
 (`piano-thermal-adc=1`, host-tested, linked, not run). 2026-11-11 (host-tested, linked, not run): PianoPolicy's
 `"piano-thermal-profile"` (§5, `docs/policy.md` §5.2) and the power-tree join for system sleep (§5, `docs/power.md` §4).
+2026-11-11 (host-tested, linked, not run): the TSENS upper/lower threshold interrupts behind `piano-thermal-irq=1` (§13; default
+off; native SPI delivery under Gunyah unproven, the batched test §13.8 settles it).
 
 ## 1. Purpose and gate
 
@@ -24,7 +26,7 @@ only); SCMI = Arm DEN0056; A830 = Adreno830 `Sm8750Tsens` (13T, SM8750); K90 = t
 
 | Item | Value | Source | State |
 |---|---|---|---|
-| TSENS | four `qcom,sm8750-tsens` / `qcom,tsens-v2`: TM `0xc228000`/`0xc229000`/`0xc22a000`/`0xc22b000`, SROT `0xc222000`..`0xc225000` (0x1000 each), 15/7/16/9 sensors, IRQs "uplow"/"critical" (not used: polled) | DT | verified |
+| TSENS | four `qcom,sm8750-tsens` / `qcom,tsens-v2`: TM `0xc228000`/`0xc229000`/`0xc22a000`/`0xc22b000`, SROT `0xc222000`..`0xc225000` (0x1000 each), 15/7/16/9 sensors, IRQs "uplow" SPI 771-774 / "critical" SPI 484-487 (level high, the GIC; uplow only with `piano-thermal-irq=1`, §13; critical never) | DT | verified (`check-tsens-irq.py`) |
 | Sensor map | tsens0: aoss0, cpu-0-{0..5}-{0,1} (1..12), cpuss-0-{0,1}; tsens1: aoss1, cpu-1-{0,1}-{0,1} (1..4), cpuss-1-{0,1}; tsens2: aoss2, gpuss0-7 (1..8), modem0-3, camera0-1, video; tsens3: aoss3, nsphvx0-2, nsphmx0-3, ddr. Cooling maps: cpu-0-* → cpu0's policy, cpu-1-* → cpu6's, gpuss* → the GPU | DT thermal-zones | verified (`check-thermal-map.py`) |
 | Stock trips | the nine CPU hotspots (cpu-0-0-0, cpu-0-2-\*, cpu-0-4-\*, cpu-1-\*) passive 105 C / 5 C (polling 10 ms while passive), the seven others cpu-0-* 118 C / 8 C; hot 120, critical 125; gpuss* passive 105, critical 125; others hot 120, critical 125; PMIC temp-alarms passive 95, hot 115 | DT, UH | verified |
 | Heating | one prime-core load: a zone 34.5 → 91 C in 0.26 s (~200 C/s); stock (4.32 GHz) holds these zones at a median 102.4 C, never above 105.5 C | UH | measured on Ubuntu |
@@ -72,8 +74,8 @@ CPU load: XNU's per-processor idle time from `processor_info(cpu_to_processor(i)
 `ExternalConnected` (PianoPower with `piano-power-ps=1`), unknown = battery caps. Polling tiers (`Cluster.h` pollTier): base 1 s
 (the governor's 100 ms tick when it runs); 250 ms once the hottest sensor reaches 70 C; 10 ms (Linux's passive polling) while any
 sensor is within 10 C of its trip, a cluster is thermally limited, or a cluster runs above 2.5 GHz (where a prime-core load heats
-at ~200 C/s). The upper-threshold interrupt replaces the warm tier later (§10.4). The idle states (PSCI cpuidle) are another
-driver's: not touched.
+at ~200 C/s). With `piano-thermal-irq=1` the upper-threshold interrupt stands in for the warm tier and the fast-clock rule while
+every sensor is under 85 C, and the base relaxes to 5 s (§13.4). The idle states (PSCI cpuidle) are another driver's: not touched.
 **Suspend hooks** (for the suspend driver; docs/power.md's contract when it lands): `int piano_thermal_suspend_prepare(void)` masks
 every sensor's lower-threshold interrupt (`TM_UPPER_LOWER_INT_MASK` 0x10 bits 0..n-1, clears pulsed 1→0 at 0x0c; Linux
 08e750858038) and, while PianoThermal does not service the uplow interrupt itself, the upper ones (bits 16..) too; critical
@@ -89,7 +91,8 @@ tick. Default `piano-thermal-sleep-mask=0`: the threshold interrupts are left as
 (its SPI has no handler and stays disabled at the GIC); the contract's rule is "masked when interrupts are used". The ADC thread
 (§12) is not parked (a conversion in flight at the freeze is a read error after the wake, §12.5). Lines: `system sleep: in the power
 tree (0): the thread parks while suspended`, `[Ns] sleep: the thread is parked (no SCMI, no TSENS); threshold interrupts as they
-are (piano-thermal-sleep-mask=0)`, `[Ns] wake N: polling again`.
+are (piano-thermal-sleep-mask=0)`, `[Ns] wake N: polling again`. With `piano-thermal-irq=1` the interrupts are used, so a sleep
+masks as with `piano-thermal-sleep-mask=1`, and while that path is live the hooks mask only the lower ones (Linux's rule, §13.6).
 **The power profile** (2026-11-11; `docs/policy.md` §5.2, `Governor.h` Profile, host-tested): `callPlatformFunction(
 "piano-thermal-profile", false, (void *)(uintptr_t)mode, ...)` on this service, any thread: 0 the caps by the power source (as
 before), 1 Power Saver whatever the source (the `-bat0/-bat1` ceilings), 2 Balanced whatever the source (`-ac0/-ac1`); else
@@ -125,6 +128,11 @@ once); the fixed level (mode 2) has no power caps and ignores it. One line per c
 | `piano-thermal-adc=N` | 0 | B6 (§12): 0 off (no SPMI access); 1 the eleven board thermistors on the PMIC ADC (writes: the ADC SDAM's conversion bytes); 2 the same with each round's raw codes. Implies `piano-thermal=1` |
 | `piano-thermal-adc-s` | `-log-s` (30) | the ADC round period, 5..3600 s (the first round right after the start survey, after `-delay`) |
 | `piano-thermal-sleep-mask=1` | 0 | a system sleep also masks the threshold interrupts (the suspend hooks, §5); 0: the thread is parked only |
+| `piano-thermal-irq=1` | 0 | §13: the TSENS upper/lower threshold interrupts (SPI 771-774). Needs `piano-thermal` ≥ 1 (or an argument that implies it); a system sleep then masks as with `-sleep-mask=1` |
+| `piano-thermal-irq-up=<C>` / `-down=<C>` | 85 / 70 | the window of every sensor: up 50..104, down 30..up - 5 |
+| `piano-thermal-irq-poll-ms` | 5000 | the base poll at rest (1000..60000); 0: only the report's polls (`-log-s`); never the governor's tick |
+| `piano-thermal-irq-hold-ms` | 1000 | the fast tier after an upper interrupt (100..10000) |
+| `piano-thermal-irq-test=N` / `-test-s` | 0 / 120 | the synthetic test (§13.8): per controller the hottest sensor's upper threshold N tenths of a degree above its reading (1..200), for that many seconds (10..600), then its window back |
 
 ## 7. Kernel archive / component
 
@@ -132,7 +140,9 @@ Native kext `com.unixnu.driver.PianoThermal`, listed in `configs/k27-native-kext
 hooks). Build: `tooling/k27/build-native-piano-thermal.sh` (host tests, the DT map check when `out/inputs/piano-boot.dtb` and dtc
 exist, objects, import check); `build-native-image.sh` maps it. Breadcrumbs: `piano_thermal_state`, `piano_thermal_hottest_deci`.
 B6 adds `tests/adc_host.cpp` and the ADC map check (`tooling/k27/check-adc-map.py`) to that script and `PianoThermalAdc.cpp` as the
-kext's second object; it exports `piano_thermal_board_temps`.
+kext's second object; it exports `piano_thermal_board_temps`. The uplow interrupt (§13) adds `package/common/tests/run.sh`,
+`tests/uplow_host.cpp` and the interrupt table check (`tooling/k27/check-tsens-irq.py`) to that script and `PianoThermalIrq.cpp` as
+the third object (it imports `armcpu_spi_attach` / `armcpu_spi_count` from the kernel).
 
 ## 8. Hardware test plan
 
@@ -187,6 +197,7 @@ All RAM boots with the cable, owner present. Every level is off by default, so a
    power)`.
 6. **Board thermistors** (B6): one RAM boot with `piano-thermal=1 piano-thermal-adc=1` (and `piano-power=1` for the gauges'
    temperature to compare); the procedure, the expected lines and what failures mean: §12.8.
+7. **The uplow interrupt** (`piano-thermal-irq=1`): two RAM boots, the synthetic test and the governor; §13.8.
 
 Failure meanings: `NOT MAPPED` (no mapping: nothing read from that controller); `NOT ENABLED` / `DIFFERS` (the boot stages left
 TSENS off or partly configured: readings will lack VALID); `ADC CODES` (result format is codes: the decode is wrong); many `without
@@ -207,11 +218,10 @@ clusters stay at the level the boot stages left (open question 1).
 1. Which levels did the boot stages leave? (`piano-cpufreq=1`; NCC1 at 4.32 GHz would be a battery drain modes 2/3 remove.)
 2. Does the CPUCP serve SCMI natively under Gunyah at EL1 as on K90? (`piano-cpufreq=1`.)
 3. Are the TSENS hardware thresholds (critical / upper) programmed by the boot stages? (level 1's threshold line.)
-4. **The upper-threshold interrupt** (when the GIC/PDC helper lands): per CPU sensor `TM_Sn_UPPER_LOWER_THRESHOLD` = lower 70 C,
-   upper 85 C (`encodeUpperLower`, Tsens.h), their upper bits unmasked in 0x10, `TM_INT_EN` = 7; the "uplow" lines are SPI 771-774
-   (DT `0x303`-`0x306`, level high), "critical" SPI 484-487. The handler masks the sensor's upper bit, pulses its clear and wakes the
-   thread, which then polls at the fast/warm tiers until every sensor is under 70 C and re-arms. The base poll can then go to 5 s.
-   `kServicesUplow` (PianoThermal.cpp) becomes true, so the suspend hook keeps upper armed as Linux does.
+4. **The upper-threshold interrupt**: implemented 2026-11-11 behind `piano-thermal-irq=1` (§13), as proposed here (lower 70 C /
+   upper 85 C on every sensor, the handler masking and waking the thread, today's tiers until every sensor is under 70 C, a 5 s
+   base at rest, the suspend hook keeping upper armed), with the lower interrupt ending the hot phase, a proof at the start, and
+   a fallback to polling. Open: does Gunyah deliver SPI 771-774 natively (§13.8)?
 5. **PianoA830: a reversible DCVS ceiling** (implemented 2026-11-11 as proposed, host-tested in `test_a830idle`; the board logs
    `PianoA830: gpu ceiling N MHz (...)` and `gpu ceiling cleared`, the first 8 changes then every 10th, 100th, ...; a ceiling set
    before S10 applies when the DCVS starts). Behaviour without a caller:
@@ -240,7 +250,8 @@ New code, BSD-2-Clause-Patent (`package/PianoThermal/LICENSE`). Linux (GPL) and 
 was copied. The SCMI layouts are from Arm's public specification. B6 (§12): Linux's ADC5 gen3, VADC-common, SDAM, pinctrl-spmi-gpio
 and PMIC-arbiter sources were read as the specification only; the thermistor curve is computed from the part's three published
 parameters (§12.3), and Linux's resistance table is neither copied nor stored (`check-ntc-curve.py` reads it from a Linux tree at
-run time to compare).
+run time to compare). §13: Linux's `tsens.c` / `tsens-v2.c` (the interrupt fields, the enable/disable sequences, the violation bits,
+the trip clamp, the suspend rule) were read as the specification only; no code was copied.
 
 ## 12. B6: the board thermistors (PMIC ADC5 gen3)
 
@@ -443,3 +454,228 @@ interrupt); Gen4 channels far from their Gen3 neighbours while those are sane (t
    write rule; GPIO 12 is another EE's anyway).
 7. The PMICs' temp-alarm stages and the ADC's own threshold monitoring (ADC_TM, SDAM 1) stay unused; the latter would let the PBS
    watch a threshold without polling (a later step, after one good run).
+
+## 13. The uplow interrupt: `piano-thermal-irq=1`
+
+Status: code, 2026-11-11. `TsensIrq.h` (portable: the facts, the threshold encoders, the handler's decision, the state machine),
+`PianoThermalIrq.cpp` (the kernel side, the kext's third object) and a hook of a few lines in `PianoThermal.cpp`; host-tested
+(`uplow_host: all passed`, every scene under three models of the controller's status latch), the interrupt table checked against
+the DT at every build (`check-tsens-irq: 4 controllers: uplow/critical SPIs, level high, GIC parent match the DT`), linked into the
+native KC (kernel 0059: `com.unixnu.driver.PianoThermal: linked, ... 490 pointers`; `native kext rule: 21 native kexts linked, none
+from outside this repository`); default off; **not run on the tablet**: native SPI delivery under Gunyah is unproven, and the
+batched test (§13.8) is built to settle it at the first boot.
+
+### 13.1 Purpose
+
+Battery. The thread polls every TSENS sensor every 1 s at rest, every 250 ms once the hottest reaches 70 C, and every 10 ms near a
+trip or while a cluster runs above 2.5 GHz (§5); the last alone is 100 wake-ups/s for as long as the boot stages leave the prime
+cores fast (`piano-cpufreq=1` reports, sets nothing). Those tiers exist because a 1 s poll can step over a whole heating ramp
+(~200 C/s). The upper-threshold interrupt says at once when any sensor crosses 85 C, so while every sensor is under it the warm tier
+and the fast-clock rule are not needed and the base poll can be 5 s; the lower-threshold interrupt says when the hot phase is over.
+
+### 13.2 Facts
+
+Sources: DT = `out/inputs/piano-boot.dtb`; TSV2 = Linux `drivers/thermal/qcom/tsens.c` + `tsens-v2.c` (Ubuntu's tree, GPL, the
+specification only); PI = `docs/power-irq.md` §2.1.
+
+| Item | Value | Source | State |
+|---|---|---|---|
+| Lines | "uplow" tsens0..3 = SPI 771 / 772 / 773 / 774 (`<0 0x303..0x306 4>`), "critical" SPI 484-487 (`<0 0x1e4..0x1e7 4>`), level high; the nodes inherit the root's `interrupt-parent`, the GICv3 | DT | verified (`check-tsens-irq.py`) |
+| PDC | SPI 771-774 are the outputs of PDC pins 26-29 (`qcom,pdc-ranges` first range <0 745 51>); with the GIC as the nodes' parent the PDC is never programmed for them (Linux's PDC domain only sees interrupts parented to it), so the firmware's PDC setting passes them | DT | inferred; nothing here touches the PDC |
+| Interrupt registers | TM_INT_EN 0x04 [2:0]: v2's separate critical, upper and lower enables (which bit is which is not stated; Linux writes 7); TM_UPPER_LOWER_INT_STATUS 0x08, _CLEAR 0x0c, _MASK 0x10: sensor n's lower interrupt at bit n, its upper at bit 16 + n | TSV2 | spec |
+| Thresholds | TM_Sn_UPPER_LOWER_THRESHOLD 0x20 + 4n: lower [11:0], upper [23:12], signed deci-C; v2 clamps trips to -40..120 C | TSV2 | spec; the readout's decode is verified on SM8750 (§2) |
+| Semantics | a threshold is violated while TM_Sn_STATUS bit 17 (LOWER) / 18 (UPPER) is set (Linux reads those, not 0x08); enable = mask bit 0; disable = mask bit 1, then the clear bit 1 and 0; set_trips writes the window, then unmasks; before system suspend every lower interrupt masked, the upper ones armed (08e750858038) | TSV2 | spec |
+| Delivery | ArmCpu's `armcpu_spi_attach` (INTID = SPI + 32: 803-806), level, routed to the boot CPU, priority 0xa0, one handler per INTID, no detach and no mask (a storm is stopped with GICD_ICENABLER) | PI | the attach verified (kernel symbols); delivery **needs-boot** |
+
+### 13.3 Design
+
+- **The window.** Every sensor that has a reading at the first poll gets lower 70 C / upper 85 C (one TM_Sn_UPPER_LOWER_THRESHOLD
+  write each, bits [31:24] as found). An armed sensor is *low* (upper unmasked, lower masked) or *high* (the reverse): an upper
+  interrupt makes it high, a lower one low again; after the arming only the masks change. A sensor without a reading at the start
+  stays masked and is polled as today.
+- **The proof**, per controller, before anything relies on the line: every up/low interrupt masked and cleared, the SPI attached,
+  TM_INT_EN set to 7 when found otherwise, then the controller's hottest sensor gets an upper threshold 5 C under its reading and
+  must interrupt within 250 ms, then a lower threshold 5 C above it, the same; then its window. Any failure: off for the boot. The
+  proof costs two interrupts per controller at the start and shows, in the log, that the hardware compares, masks and clears as
+  read, and that the hypervisor delivers each line.
+- **The handler** (primary interrupt context, the boot CPU, under a spin lock the thread takes with interrupts off): every
+  interrupt that is up and unmasked (its TM_Sn_STATUS bit, or latched in 0x08) is masked and its clear pulsed, which drops the
+  level line; a latched status of an interrupt already masked is cleared; the bits are recorded and the thread woken. Nothing of
+  ours up: a stray for PianoIrq.h's storm guard (more than 2000 in 100 ms disable the line at the GIC).
+- **The thread**, each poll: takes the records; an upper interrupt on a low sensor makes it high and holds the fast tier (10 ms)
+  for 1 s, after which today's tiers apply until it is low again; a lower interrupt on a high sensor makes it low. An interrupt
+  against the reading (upper with the sensor under 70 C, lower with it over 85 C) is spurious and re-armed. Masks are written
+  against the register (the handler changes it on its own); a bit about to be unmasked has its clear pulsed first (a stale latch);
+  a bit recorded but not yet processed stays masked.
+- **Rest** = every armed sensor low, no unarmed sensor at 70 C or more, no fast hold, no test, nothing suspect. Safety: under 85 C
+  nothing in the policy acts (warm is 85, passive 105/118, critical 115 C); 85 C is 20 C under the lowest passive trip, and at
+  200 C/s the fast hold reaches the near-trip tier (95 C) within ~50 ms of the interrupt.
+- **Misses**: an armed sensor 2 C past its threshold with no interrupt is suspect: the fast tier at once (when it is a rise), 50 ms
+  of grace, then a miss, and the poll changes its state itself. Three misses in a row (an interrupt in between resets the run).
+- **The fallback**, logged once: three misses in a row, more than 40 interrupts in 10 s ("stormy"), a line's storm guard, a proof
+  or an attach that fails. Every up/low interrupt masked, the thresholds and TM_INT_EN written back as found, the lines disabled at
+  the GIC (ArmCpu has no detach); today's polling for the rest of the boot; the property `UplowIrq` says `off: <why>`.
+- **Never written**: the critical thresholds (0x60 + 4n), the critical interrupt registers (0x14-0x1c), SROT, the PDC. The hardware's
+  own protection stays as the boot stages left it.
+
+### 13.4 The tiers
+
+| Uplow state | Poll tier | Base |
+|---|---|---|
+| off (default), starting, fallen back | today's (§5) | today's (1 s, or the governor's 100 ms tick) |
+| at rest | fast only for a thermally limited cluster; the warm tier and the fast-clock rule stand down | 5 s (`-poll-ms`; 0: the report period), never the governor's tick |
+| an upper interrupt (or a suspect rise) | fast (10 ms) for `-hold-ms` (1 s) | today's |
+| a sensor high, a test running, a sensor suspect, an unarmed sensor at 70 C or more | today's | today's |
+
+The thread's wait at rest is the uplow path's (`PianoThermal::pollWait` hands over to it): an interrupt ends it at once, and so does
+the system-sleep park request (it also kicks that wait). The 30 s report and the policy run as before, on the iterations there are.
+
+### 13.5 Boot arguments
+
+`piano-thermal-irq=1` (needs PianoThermal running: `piano-thermal` ≥ 1, or `piano-cpufreq` / `piano-thermal-adc`, which imply it),
+`-up` / `-down` (85 / 70 C), `-poll-ms` (5000), `-hold-ms` (1000), `-test` / `-test-s` (0 / 120): §6.
+
+### 13.6 System sleep and the suspend hooks
+
+With `piano-thermal-irq=1` the power-tree sleep (§5) masks as with `piano-thermal-sleep-mask=1` (the contract's rule: masked when
+interrupts are used). While the path is live, `piano_thermal_suspend_prepare()` is the path's own: every lower interrupt masked and
+its clear pulsed, the upper ones left as the states have them (armed for every low sensor: overheating still interrupts), no lower
+interrupt unmasked until finish; a high sensor that cools meanwhile goes low by the poll, without a miss; `finish` writes the path's
+masks again. Not live (off, starting, fallen back): the hooks' own path as before (lower and upper masked, the masks found put
+back). A suspend that began while the path was starting keeps every lower interrupt masked through an arming that happens meanwhile,
+and its finish writes the path's masks instead of the older ones found. Lines: `system sleep: in the power tree (0): the thread
+parks while suspended, the threshold interrupts masked (piano-thermal-irq=1: the lower ones while it is live)`, then per sleep
+`suspend prepare: lower threshold interrupts masked on 4 controllers, the upper ones kept armed (the uplow interrupt is serviced):
+tsens0 0x7fff->0x7fff ...` and `suspend finish: the uplow interrupt masks are back (lower armed for the sensors above 85.0 C)`.
+
+### 13.7 Build and host tests
+
+`tooling/k27/build-native-piano-thermal.sh` runs `package/common/tests/run.sh` (PianoIrq.h), then `tests/uplow_host.cpp` against a
+model of the four controllers (thresholds compared with each sensor's temperature, the status bits, mask, clear, TM_INT_EN, a status
+latch that is absent, of the unmasked interrupts, or of every violated threshold) and of a level line that calls the handler while
+it is up, attached, enabled at the GIC and delivered, and never while the thread holds the lock:
+
+- the encoders (window word, clamp, the bits), the handler (masks exactly what is up and unmasked, pulses its clear; a stray; a
+  latched masked status cleared);
+- the start: the quiet masks, TM_INT_EN 0 → 7 (found 7: untouched), the proof on each controller, the windows (bits above kept,
+  an unusable sensor untouched), a hot sensor armed high, the masks; a second start refused;
+- the tiers on interrupts: rest (warm → base, the fast-clock rule gone, a limited cluster still fast, base 5000), nothing inside
+  the hysteresis, the upper interrupt (high, the fast hold, base back to 1000), today's tiers after the hold, the lower interrupt
+  (rest again); an unarmed sensor at 72 C keeps the warm tier; the governor's tick never relaxed;
+- misses: 1 C past is not suspect, 3 C past is (fast at once), the miss after the grace, a delivered interrupt resetting the run,
+  three in a row → `OFF (3 missed interrupts in a row)` once, all masked, the windows and TM_INT_EN back, lines disabled, today's
+  tiers, nothing more logged; the hooks then -1;
+- proofs that fail (a line never delivered; an attach refused; nothing mapped: no write at all);
+- storms: a line stuck up (the guard disables it; at the attach too), a status stuck at "upper" (spurious, re-armed, until
+  `OFF (stormy ...)`);
+- suspend: lower masked with upper armed, a cool-down while suspended (no interrupt, no miss), an overheat while suspended (the
+  upper interrupt, lower kept masked), finish, a fallback while suspended, the caller's own suspend around a start;
+- the synthetic test: PASS, a missed one, no crossing in time, the summary, the windows back, rest afterwards;
+- a record that lands between the step's take and its mask write stays masked and is processed next step; and in every scene
+  the model refuses any write outside TM_INT_EN, the up/low clear and mask, and the thresholds 0x20 + 4n.
+
+With the DT, `tooling/k27/check-tsens-irq.py` compares the SPI table (`uplow_host --map`) with every TSENS node (names, cells,
+trigger, inherited parent) and prints which PDC pin feeds each line. The kext's objects link with 0 unresolved imports
+(`armcpu_spi_attach`, `armcpu_spi_count`, the spin lock and wait primitives from the kernel).
+
+### 13.8 The batched tablet test (synthetic, nothing heated)
+
+Heating the SoC to 85 C is not needed and not wanted. The proof at the start already makes each line fire twice by moving a
+threshold across the reading; the synthetic test then waits for the *temperature itself* to cross a threshold set just above it:
+`piano-thermal-irq-test=N` puts, per controller, the hottest low sensor's upper threshold N tenths of a degree above its reading
+for `-test-s` seconds and then restores 85 C. The test starts at PianoThermal's first poll, early in the boot, and the rest of the
+boot (WindowServer, the GPU from `piano-gpu-delay`) is expected to warm the hottest sensors by a degree or more, so N = 10 (1.0 C)
+should cross without any load (if not, a few seconds of use at the login window will); nothing ever gets hot.
+
+Images (RAM boot only; the GPU profile's seed and trust cache as in §8.3; images are never committed):
+
+```sh
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=420 PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2" tooling/k27/build-native-image.sh
+for m in "uplow-test:piano-thermal=2 piano-thermal-irq=1 piano-thermal-irq-test=10 piano-thermal-irq-test-s=240" \
+         "uplow-report:piano-thermal=2 piano-cpufreq=1 piano-thermal-irq=1" \
+         "uplow-report-A:piano-thermal=2 piano-cpufreq=1"; do
+  PIANO_RESET_AFTER=420 PIANO_EXTRA_ARGS="piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-usb=2 piano-power=1 ${m#*:}" \
+    python3 tooling/bootimg/build-ram-images.py --fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-k27-native.bin \
+    --trust out/turnip-a830/stage/kernel.macho.trustcache --seed out/turnip-a830/stage/scratch-data.img --adt out/adt/piano-k27.adt \
+    --utc "$(date +%s)" --out "out/ram-${m%%:*}"
+done
+tooling/native/native-loop.sh out/ram-uplow-test/boot-piano-macos-ram-A-bundled.img out/ram-dump/boot-piano-macos-ram-A-bundled.img
+```
+
+Then `ram-uplow-report` and its A side `ram-uplow-report-A` (today's polling) the same way, on battery, screen on at the login
+window, no input. From `logs/native-runs/*-loop/xnu-console.txt`: `grep -E 'PianoThermal: .*(uplow|idle:|polling)|battery:'`.
+
+Built 2026-11-12 from this change on main fc86525 (KC sha256 `1fe9043ee41df7fc`, kernel `kernel-k27-0059-native` `d475f824a4f234af`;
+the GPU profile's seed and trust cache; `PIANO_VMM_PRESENT=0`; all with `panic_on_crash_disabled=1 piano-usb=2 piano-power=1
+piano-gpu=2 piano-gpu-delay=20`, reset after 420 s); the macOS RAM image of each is `boot-piano-macos-ram-A-bundled.img`:
+
+| Dir (`out/`) | Arguments added | sha256 (16) |
+|---|---|---|
+| `ram-uplow-test` | `piano-thermal=2 piano-thermal-irq=1 piano-thermal-irq-test=10 piano-thermal-irq-test-s=240` | `8b91737ed685e152` |
+| `ram-uplow-report` | `piano-thermal=2 piano-cpufreq=1 piano-thermal-irq=1` | `2bdbe89fd90f9db1` |
+| `ram-uplow-report-A` | `piano-thermal=2 piano-cpufreq=1` (today's polling) | `c706829ed03d29d6` |
+| `ram-dump` | the dump image (reset after 1 s, `data-persist=0`) for all three | `717043802bb7d69a` |
+
+Expected in `ram-uplow-test` (numbers are examples):
+
+```
+PianoThermal: system sleep: in the power tree (0): the thread parks while suspended, the threshold interrupts masked (piano-thermal-irq=1: the lower ones while it is live)
+PianoThermal: uplow: piano-thermal-irq=1: the TSENS upper/lower threshold interrupts (SPI 771-774, level), upper 85 C / lower 70 C on every sensor; at rest the base poll is 5000 ms (piano-thermal-irq-poll-ms), the warm tier and the fast-clock rule stand down; an upper interrupt polls every 10 ms for 1000 ms; a proof on each controller first, then the synthetic test (piano-thermal-irq-test)
+PianoThermal: uplow: tsens0 cpu0: SPI 771 (INTID 803, level) attached (0): readback 0xa003 (group 1 1, enabled 1, edge 0, priority 0xa0), router 0x...
+PianoThermal: uplow: tsens0 cpu0: proof on s7 cpu-0-3-0 at 41.2 C: upper 36.2 C -> interrupt in 0 ms, lower 46.2 C -> interrupt in 0 ms (found: mask 0x..., int-en 0x...)
+   ... the same for tsens1 (SPI 772), tsens2 (SPI 773), tsens3 (SPI 774)
+PianoThermal: uplow: live: 47 sensors armed on 4 controllers (upper 85.0 C, lower 70.0 C; 0 above the upper threshold); masks tsens0 0x7fff tsens1 0x7f tsens2 0xffff tsens3 0x1ff; at rest the base poll is 5000 ms, an upper interrupt polls fast for 1000 ms
+PianoThermal: uplow: test: tsens0 s7 cpu-0-3-0 at 41.2 C: upper threshold 42.2 C (piano-thermal-irq-test=10) for up to 240 s; warm the SoC a little (a short CPU load) to cross it
+   ... one per controller
+PianoThermal: [23s] uplow: test: tsens0 s7 cpu-0-3-0: upper interrupt at 42.3 C after 17.6 s (threshold 42.2 C, from 41.2 C; SPI 771 count 3): PASS; threshold back to 85.0 C
+   ... one per controller (PASS, or "no crossing in 240 s (highest ...)")
+PianoThermal: [61s] uplow: test: done: 4 passed, 0 missed, 0 without a crossing
+PianoThermal: [61s] uplow: at rest again (every sensor under 85.0 C, or back under 70.0 C after a crossing): the base poll is 5000 ms
+PianoThermal: idle: 13 wakeups in 60 s, irq 0 (timer 13, kick 0; uplow live at rest, at rest 59 s; SPI 771-774 counts 3 3 3 3; 4 interrupts, 0 misses)
+```
+
+Pass: four `attached (0)` lines with readback group 1, enabled 1, edge 0, priority 0xa0; four proof lines with interrupts in a
+few ms; `live: 47 sensors armed on 4 controllers`; at least one test PASS (a "no crossing" is the temperature's, not the path's:
+repeat with `piano-thermal-irq-test=5`); after the test `idle:` lines of about 12-13 wake-ups a minute with `at rest` near 60 s
+and 0 misses; no `uplow: OFF`; the 30 s reports as before.
+
+In `ram-uplow-report` (the boot stages' clocks kept, `piano-cpufreq=1`): if `cpufreq d1 ...: now 4320 MHz` (above 2.5 GHz), the A
+side `ram-uplow-report-A` logs `polling every 10 ms: a cluster runs above the fast-poll clock` and `[30s] polling: ... fast 30000
+ms`, the uplow side none of that (`idle:` ~12 a minute at rest); the battery current of the two (PianoPower's 30 s lines) is the
+measure of what the interrupt saves.
+
+Failure meanings:
+
+- `uplow: OFF (proof: tsensN sS ...: upper threshold ... and no interrupt in 250 ms (status 0x..., int status 0x..., mask 0x...,
+  SPI 77x count 0)) at the start`: the line was not delivered. Status bit 18 (0x40000) set means the hardware saw the crossing (the
+  write took, the comparison works) and the interrupt did not arrive: Gunyah does not forward SPI 771-774, the PDC pin is not
+  passing it, or TM_INT_EN 7 does not enable it; bit 18 clear means the threshold write did not take (compare the `found` values).
+  The int status shows whether 0x08 latches (bit 16 + S). Polled from then on: nothing else changes.
+- `NOT attached (0x...)`: no ArmCpu slot or the INTID taken (another kext); polled.
+- `uplow: OFF (storm: SPI 77x stayed up ...)`: masking does not drop the line (its level comes from elsewhere); the GIC line is off
+  and the sensors are polled.
+- `uplow: OFF (stormy: ...)` after a run of `spurious (re-armed)` lines: a status that reads violated against its reading (a stuck
+  comparator, or the window not what was written).
+- `MISSED` lines, then `OFF (3 missed interrupts in a row)`: the line stopped arriving after the proof.
+- A hang or reset right after an `attached` line: a storm the guard did not stop; drop `piano-thermal-irq`.
+- A data abort at the first proof write: the TM range is read-only to this EL1 (Linux writes these registers under the same
+  hypervisor, so not expected); drop `piano-thermal-irq`.
+
+### 13.9 Risks and open questions
+
+1. Delivery under Gunyah (SPI 771-774 are PDC outputs; the HLOS DT names them; Linux takes them): unproven natively. The proof
+   decides at each boot; without delivery the cost is one 250 ms wait at the start (the proof stops at the first failure), then
+   today's polling.
+2. TM_INT_EN's bit order is not in the specification read; the path writes Linux's value (7) only when the boot stages left it
+   otherwise, which also sets the critical interrupt's enable: its SPI (484-487) has no handler and stays disabled at the GIC, and
+   the critical *thresholds* and mask are not touched. Restored as found on a fallback.
+3. TM_UPPER_LOWER_INT_STATUS's latch semantics are not documented; the handler masks on the TM_Sn_STATUS violation bits as Linux
+   does, and the host test runs every scene with no latch, a latch of unmasked interrupts and a raw latch.
+4. The relaxed base trusts the upper interrupt for every rise under 85 C: a sensor without a reading at the start is not armed and
+   keeps today's polling from 70 C; a sensor whose reading stops (VALID lost) keeps its armed interrupt.
+5. The handler runs on the boot CPU with a spin lock the thread holds for a few register accesses with interrupts off; a storm on
+   CPU 0 is bounded by the guard (2000 entries).
+6. Suspend: the upper interrupts stay armed across a sleep while the path is live (Linux's rule); whether one wakes the SoC from a
+   deep state depends on the PDC (not programmed here) and the sleep driver.
+7. Not done: per-crossing windows (Linux's set_trips moves the window to the next trip; here the window is fixed and only the masks
+   change), the critical interrupt, and an interrupt-driven near-trip tier (the 10 ms polls above 95 C stay).

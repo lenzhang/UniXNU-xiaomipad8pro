@@ -18,6 +18,7 @@ and measured: `ubuntu-history/kernel.md`, `ubuntu-history/device.md`), **inferre
 | PianoInput (power, vol keys) | 10 ms | 10 ms while a key is busy and 1 s after, else 40 ms | `piano-input-idle=MS` | 100 → 25 |
 | PianoTouch (NT36532E) | latch polled every 1 ms, every frame read (~120/s) | every frame while busy, one frame per 50 ms at rest (`TouchPace.h`) | `piano-touch-irq=1`: gpio162 on the TLMM summary SPI | ~1000 → ~60 (polled), ~40 (IRQ) |
 | PianoKeyboard (cover) | (another change already made it adaptive: 4 / 30 / 200 ms) | – | §6: gpio97 on the TLMM summary SPI | 33 idle → ~2 with the IRQ |
+| PianoThermal (TSENS) | 1 s; 250 ms from 70 C; 10 ms near a trip or with a cluster above 2.5 GHz | unchanged | `piano-thermal-irq=1`: the four uplow SPIs 771-774, a proof at each start, at rest a 5 s base (`thermal.md` §13) | 1 (100 with a fast cluster) → 0.2 |
 
 `piano-usb-idle=0`, `piano-input-idle=0`, `piano-touch-idle=0` restore the old loops exactly (the A of the A/B).
 
@@ -45,6 +46,7 @@ and measured: `ubuntu-history/kernel.md`, `ubuntu-history/device.md`), **inferre
 | DWC3 dp/dm/ss PHY wake | PDC pins 14/15/17 → SPI 759/760/762 | both edges / level | – | DT + PDC map |
 | TLMM summary (pinctrl@f100000): any GPIO with INTR_CFG enable + target 3 and its status latched | 240 (SPI 208) | level high | PianoTouch `piano-touch-irq=1`; PianoKeyboard (§6) | DT verified; delivery **needs-boot** |
 | QUP1 SE2 (touch's SPI engine) / SE6 (keyboard's I2C, bit-banged here) | SPI 355 / 363 | level | – (polled) | DT |
+| TSENS "uplow" tsens0..3 (the PDC's outputs for its pins 26-29) / "critical" | 803-806 (SPI 771-774) / SPI 484-487 | level high | PianoThermal `piano-thermal-irq=1` (uplow only) | DT verified (`check-tsens-irq.py`); delivery **needs-boot** (the start's proof says) |
 | SPMI arbiter `periph_irq` (all PMIC interrupts: PON keys, PMIC GPIO6) | PDC pin 1 → SPI 746 | level high | – (§2.4) | DT + PDC map |
 | Gunyah: every SPI the HLOS DT names reaches the HLOS (Linux takes them all); XNU is the HLOS | – | – | – | **inferred**; nothing in `hyp-evidence` lists the HLOS's virtual interrupts |
 
@@ -248,3 +250,4 @@ Both clients share the summary line: the first `open()` owns it; up to 8 GPIOs.
    `armcpu_spi_mask`).
 3. The hall sensor (gpio80, both edges) on the summary line instead of 500 ms samples.
 4. The PMIC keys through the SPMI arbiter (§2.4), after the read-only register survey.
+5. After the uplow test (`thermal.md` §13.8): `piano-thermal-irq=1` default on if the four proofs and the test pass.
