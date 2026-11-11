@@ -1,37 +1,79 @@
 # UniXNU-piano
 
-Native macOS at EL1 on the Xiaomi Pad 8 Pro (`piano`, SM8750), as a [UniXNU](https://github.com/UniXNU/UniXNU) device
-repository (same convention as UniXNU-sheng). Public repository: [lenzhang/UniXNU-piano](https://github.com/lenzhang/UniXNU-piano).
+Native macOS 27 on the Xiaomi Pad 8 Pro (`piano`, Snapdragon 8 Elite SM8750), as a [UniXNU](https://github.com/UniXNU/UniXNU)
+device repository: https://github.com/lenzhang/UniXNU-piano. The k27 XNU kernel (XNU 27.0.1) runs as the HLOS at EL1, with
+Gunyah staying at EL2. Boot chain: ABL → BootShim → Mu-Silicium UEFI (the FD, piano-uefi's `pianoPkg` with this repository's
+deltas) → the UniXNU payload and menu → DarwinBoot → XNU. UniXNU core, Mu-Silicium, piano-uefi, DarwinBoot and the SoC module
+are pinned dependencies (`unixnu.lock`, `feeds.toml`), not forks.
 
-**Start here for the repo split and conventions:** [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md).
+Related public repositories: [UniXNU-sm8750-common](https://github.com/lenzhang/UniXNU-sm8750-common) is a placeholder for the
+SM8750 pieces to be shared later (the code still lives here, and the build pins another SM8750 module); [veil](https://github.com/lenzhang/veil)
+is the frozen archive of the earlier Linux + Gunyah guest path. The map of repositories, local trees and rules:
+[docs/PROJECT-MAP.md](docs/PROJECT-MAP.md).
 
-姊妹仓库：[UniXNU-sm8750-common](https://github.com/lenzhang/UniXNU-sm8750-common)（SM8750 公共层，目前仅占位，代码尚未从本仓库拆出）；已冻结的 Gunyah 客户机路线见 [veil](https://github.com/lenzhang/veil)。Ubuntu 修复仍提交到上游 [yzddmr6/xiaomipad-8pro-mainline](https://github.com/yzddmr6/xiaomipad-8pro-mainline)。
+## State (2026-11-11)
 
-Gunyah stays at EL2; XNU runs as the HLOS at EL1. UniXNU core, the SoC module pinned in `feeds.toml`, Mu-Silicium, piano-uefi's `pianoPkg`, DarwinBoot and the driver components are pinned dependencies (`unixnu.lock`), not forks. Formerly the working name `xiaomipad-8pro-macos`.
+- macOS boots natively on the tablet, also by itself from power-on (an installed copy, see below); root and Data are on UFS
+  (`package/NativeUfs`, `package/NativeRamBlock`).
+- The Adreno 830 GPU (`package/PianoA830` with Turnip) composites the login screen.
+- A USB-C debug console with a small kernel monitor (`package/PianoDwc3`, `tooling/native/usb-console.py`) and the buttons run.
+- Most other drivers (power and charging, touch, keyboard cover, backlight, Wi-Fi, audio, sensors, thermal, USB host, video,
+  Bluetooth, display processor, ...) are built and linked but inert behind their boot arguments, waiting for their tests on the
+  tablet. Per-driver state: [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md) §7 and [docs/drivers/README.md](docs/drivers/README.md).
 
-Nothing here is flashed: the boot images are RAM images for `fastboot boot`, built and
-verified offline (`docs/el1-native-plan.md` §5). Hard rules (RAM boot only, no partition writes, no secrets in the tree) are in the project map.
+## Layout
 
 | Path | What |
 | --- | --- |
-| `board.toml`, `feeds.toml`, `unixnu.lock` | UniXNU device description (schema 2, macos-27.3 line) and every pin |
-| `dts/piano.dts` | piano hardware for the ADT (13 GiB DRAM window, 8 CPUs E/P, splash, reserved regions) |
-| `configs/piano_macos_defconfig` | UniXNU kernel config of the 27.3 line (not built yet) |
-| `configs/k27-adt.toml` | ADT identity of the k27 kernel collection (VirtualMac2,1) used by slice 1 |
-| `firmware/patches/` | deltas to piano-uefi's `pianoPkg` (applied to a worktree by `tooling/firmware/setup-mu.sh`) |
-| `patches/xnu/` | device patch series of the 27.3 line (empty; the k27 native variant is macOS-DroidVM 0053/0054) |
-| `tooling/` | `unixnu.sh` (CLI on this device with the pinned checkouts), `build-slice1.sh` (everything), `k27/build-native-image.sh` (kexts, KC, ADT, RAM images), `firmware/`, `kc/`, `adt/`, `bootimg/` |
-| `docs/` | plan, `el1-hyp-notes.md`, driver design pages (`drivers/`), upstream notes, evidence (`hyp-evidence/`) |
-| `logs/` | committed verification logs (ADT diff, image verification, FD notes, SHA256SUMS) |
-| `artifacts/ARTIFACTS.md` | SHA-256 of every built artifact and input |
-| `private/` | ignored: signing key, calibration, seeds (never committed) |
-| `out/`, `build/` | ignored build outputs |
+| `patches/k27/` | the k27 kernel patches 0053-0062 on top of the k27 tree (xnu-12377 + the baseline series 0001-0052, XNU 27.0.1) |
+| `patches/xnu/` | the device series of the UniXNU macOS 27.3 line (empty: none yet) |
+| `package/` | the native kexts; each is inert without its boot argument |
+| `configs/` | the native kext list (`k27-native-kexts.txt`), the ADT identity and display node (`k27-adt.toml`, `k27-gop-display.toml`), the 27.3 line's kernel config |
+| `dts/piano.dts` | piano's hardware for the ADT |
+| `tooling/` | `k27/build-native-image.sh` (kexts → kernel collection → ADT → RAM images), `kc/` (the KC build), `adt/`, `bootimg/` (RAM images and their verification), `native/` (the test loop, the USB console, input), `persist/` (the installed copy), `firmware/` (the FD) |
+| `firmware/` | deltas to piano-uefi's `pianoPkg`, Mu-Silicium and UniXNU |
+| `docs/` | bring-up notes, driver pages (`drivers/`), plans and evidence |
+| `logs/`, `artifacts/ARTIFACTS.md` | committed verification logs; SHA-256 of built artifacts and inputs |
+| `private/`, `out/` | ignored: keys, per-unit calibration; build outputs |
 
-## Build (slice 1)
+## Build
+
+Inputs: the k27 tree, a local kernel tree the build only reads (its place is `PIANO_K27_TREE`, in the environment or in
+`~/.config/piano/env`), the pinned UEFI checkouts of `unixnu.lock`, and the OS image inputs of `out/inputs/` (recorded in
+`artifacts/ARTIFACTS.md`, never committed).
 
 ```sh
-tooling/build-slice1.sh          # SIGN=1 also AVB-signs on the private build host (the key stays there)
+K27_VARIANT=native "$PIANO_K27_TREE/build-k27-piano.sh"    # the kernel, with patches/k27 applied in the k27 tree
+tooling/unixnu.sh build firmware --skip-preflight           # the FD
+tooling/k27/build-native-image.sh                           # kexts -> KC -> ADT -> out/ram (test) + out/ram-dump
+python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
 ```
 
-Outputs under `out/`: `fd/piano-uefi-{A-bundled,B-own303}.fd`, `k27/kc-k27-native.bin`, `adt/piano-k27.adt`,
-`ram/boot-piano-{uefi,macos}-ram-{A-bundled,B-own303}[-signed].img`. Verification: `logs/bootimg/verify-*.log`.
+Details, the boot arguments and what is read from the k27 tree: [docs/bringup-debugging.md](docs/bringup-debugging.md) §4.
+
+## Boot and test
+
+Everyday development uses RAM boots: `fastboot boot` of a RAM image, which takes priority over the installed copy, with an
+unattended loop that boots a test, resets and reads the test's log back (`tooling/native/native-loop.sh`,
+[docs/bringup-debugging.md](docs/bringup-debugging.md) §3). The installed copy ([docs/persistent-boot.md](docs/persistent-boot.md))
+writes only the regions that document lists, after verified backups of each, with a read-back check after every write and a
+rollback for each step; it never writes firmware partitions. Do not flash boot or firmware partitions by hand.
+
+## The native kext rule
+
+The native kernel collection links only this repository's kexts (`configs/k27-native-kexts.txt`). `tooling/k27/check-native-kexts.py`
+enforces it on every build, before and after the link: no descriptor from elsewhere, none of the VM-era paravirtual kexts.
+
+## Where to read next
+
+- [docs/USING.md](docs/USING.md): using, updating and recovering the installed system.
+- [docs/drivers/README.md](docs/drivers/README.md): every driver, its levels and its state.
+- [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md): repositories, local layout, hard rules.
+- [docs/bringup-debugging.md](docs/bringup-debugging.md): the boot chain, debugging without a screen, the test loop, rebuilding.
+- [docs/BACKLOG-hardware.md](docs/BACKLOG-hardware.md): the hardware still to bring up.
+
+## Licence and contents
+
+Code here is BSD-2-Clause-Patent unless a package's `LICENSE`, a file's SPDX header or an `UPSTREAM` file says otherwise.
+Vendor firmware, partition images and Apple payloads (kernel collections, trust caches, IPSW-derived files) are never in this
+repository; neither are secrets, keys, per-unit calibration, local network or storage details, or machine names.
