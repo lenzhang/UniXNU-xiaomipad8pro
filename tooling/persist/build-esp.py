@@ -10,15 +10,15 @@ PIANOESP, serial 50494e4f; file and directory times SOURCE_DATE_EPOCH 2010-01-01
 It is checked by an independent reader (tooling/persist/common.py fat32_read: EDK2 FatPkg's BPB rules, every file's cluster chain
 hashed against its input) and by mtools (minfo, mcopy back).
 
-Configuration (selectable, see PROFILES): the k27 arguments of build-ram-images.py K27_ARGS without piano-reset-after/-to (the
-watchdog is not armed without them) plus the profile's and --arg's additions. Entries:
+Configuration (selectable, see PROFILES): the k27 arguments of build-ram-images.py K27_ARGS without piano-reset-after/-to plus the
+profile's and --arg's additions. Entries:
   macos        the arguments + sheng-smp=1
   macos-diag   the same + piano-reset-after=DIAG piano-reset-to=bootloader (a run of DIAG s, then ABL fastboot, as the loop)
   macos-prev   only with --prev-kc (Payloads/previous/)
   fastboot     the seed, no UFS root, data-persist=0, no pstore console (the last run's log stays): reset into ABL fastboot after 1 s
   reset, shutdown, tools
   build-esp.py --profile base|softgpu|gpu|daily [--default macos|macos-diag] [--arg NAME=VALUE ...] [--rtc-offset N|sdam] [--from REPO]
-               [--fast-boot 0|1|2] [--replace-data [1|HEX8]] [--flatten-data] [--sensor-pack PACK]
+               [--fast-boot 0|1|2] [--boot-guard SECS] [--replace-data [1|HEX8]] [--flatten-data] [--sensor-pack PACK]
                [--kc K --adt A --trust T --seed S] [--name esp-diag] [--out out/persistent]
 
 The Data store (docs/data-store.md): the macos entries open it read-write (data-persist=2). When the installed seed is known
@@ -33,6 +33,11 @@ The clock (docs/drivers/rtc.md, docs/k27-userland-args.md): droidvm-utc=<--utc> 
 when the calendar is still near 1970. --rtc-offset N (measured once: tooling/native/rtc-offset.py) adds piano-rtc=1
 piano-rtc-offset=N, --rtc-offset sdam only piano-rtc=1 (the offset from the PMIC's SDAM cell): the kernel (k27 0060, checked in the collection) then starts the calendar from the
 PMIC RTC, settime.sh sees a set clock and leaves it, and droidvm-utc only matters when the RTC gives no date.
+The boot guard (docs/boot-guard.md, k27 0063): --boot-guard SECS adds piano-boot-guard=SECS to the macos entries (the daily profile
+has it at 180 s unless --boot-guard 0): every boot of the installed system holds the Gunyah watchdog from the start, with the PMIC
+restart reason bootloader until it is healthy at SECS s (launchd has run, every CPU takes interrupts), normal after. A hang or panic
+in the boot then lands in ABL fastboot, a later hang restarts macOS. The kernel in the collection must have 0063 (checked); macos-diag
+keeps piano-reset-after, to which the guard defers, and the fastboot entry has none of it.
 The sensors (docs/drivers/sensors.md section 5): --sensor-pack PACK puts this tablet's own sensor pack (made by
 package/PianoSensors/tools/make-sensor-pack.py under the ignored out/ or private/) at EFI/UniXNU/piano-sensors.pack, where PianoSensors
 level 2 reads it. The image then holds this unit's calibration: keep it local, never publish or share it, and never use another
@@ -84,13 +89,17 @@ PROFILES = {
         'args': ['piano-gpu=2', 'piano-gpu-delay=20', 'panic_on_crash_disabled=1', 'piano-power=1', 'piano-usb=2', 'piano-usb-hid=1'],
         'vmm_present': 0,
         'kexts': ['com.unixnu.driver.PianoA830', 'com.unixnu.driver.PianoPower', 'com.unixnu.driver.PianoDwc3'],
-        'kexts_absent': ['com.unixnu.driver.NativeSoftGpu']},
+        'kexts_absent': ['com.unixnu.driver.NativeSoftGpu'],
+        # k27 0063 (docs/boot-guard.md): the installed system always guards its boot; --boot-guard 0 leaves it out
+        'boot_guard': 180},
 }
 # Profile arguments the menu's "fastboot" entry (a reset after 1 s) leaves out.
 NOT_IN_FASTBOOT = ('piano-gpu', 'piano-gpu-delay', 'piano-power', 'piano-usb', 'piano-usb-hid')
 DROPPED = ('piano-reset-after', 'piano-reset-to', 'data-persist', 'droidvm-utc')
 # Set only by their own options (--replace-data, --flatten-data; data-persist is always 2 here), so the intent is explicit and recorded.
 STORE_ARGS = ('data-persist', 'data-store-replace', 'data-store-flatten')
+# k27 0063's arguments (piano-boot-guard, -exec, -ping, -cpus, -test): never on the fastboot entry.
+GUARD_PREFIX = 'piano-boot-guard'
 
 
 def store_args(a):
@@ -180,7 +189,25 @@ def kc_bundles(path):
     natives = sorted({m.decode() for m in re.findall(rb'com\.unixnu\.driver\.[A-Za-z0-9]+', data)})
     vm_era = sorted({m.decode() for m in re.findall(VM_ERA_BUNDLE, data)})
     rtc = b'piano-rtc: count %u + offset %u' in data   # the kernel has k27 0060
-    return natives, vm_era, rtc
+    guard = b'piano-boot-guard: healthy after %u s' in data   # the kernel has k27 0063
+    return natives, vm_era, rtc, guard
+
+
+def boot_guard(a, profile):
+    """The boot guard's seconds for the macos entries (0: none): --boot-guard, else the profile's; --arg piano-boot-guard=N instead
+    of the option is refused, so the record always says it."""
+    named = [x for x in a.arg if x.split('=', 1)[0] == GUARD_PREFIX]
+    if named:
+        raise SystemExit(f'--arg {named[0]}: the boot guard comes from --boot-guard SECS (0: none)')
+    secs = getattr(a, 'boot_guard', None)
+    if secs is None:
+        secs = profile.get('boot_guard', 0)
+    if secs < 0 or secs > 86400:
+        raise SystemExit(f'--boot-guard {secs}: seconds 1..86400, or 0 for none')
+    if 0 < secs < 60:
+        raise SystemExit(f'--boot-guard {secs}: launchd runs about 30-50 s into a boot; under 60 s the guard would reset a sound '
+                         'boot into ABL fastboot (docs/boot-guard.md)')
+    return secs
 
 
 def rtc_args(value):
@@ -199,7 +226,8 @@ def args_of(a, profile, utc):
     base = [x for x in ram.K27_ARGS if x.split('=', 1)[0] not in DROPPED]
     if a.rtc_offset is not None and any(x.split('=', 1)[0] in ('piano-rtc', 'piano-rtc-offset') for x in a.arg):
         raise SystemExit('--rtc-offset and --arg piano-rtc...: one of them')
-    extra = profile['args'] + a.arg + rtc_args(a.rtc_offset)
+    guard = boot_guard(a, profile)
+    extra = profile['args'] + a.arg + rtc_args(a.rtc_offset) + ([f'{GUARD_PREFIX}={guard}'] if guard else [])
     names = {x.split('=', 1)[0] for x in extra}
     if names & set(STORE_ARGS):
         raise SystemExit(f'--arg {", ".join(sorted(names & set(STORE_ARGS)))}: the Data store arguments come from --replace-data / '
@@ -214,7 +242,7 @@ def args_of(a, profile, utc):
     diag = base + store + [f'piano-reset-after={a.diag_reset_after}', 'piano-reset-to=bootloader', 'sheng-smp=1']
     # The way back to ABL fastboot from the menu: no UFS root, no store, no console mirror (the previous run's log stays in cvp).
     quiet = ('native-ufs-root', 'native-ufs-diagnostics', 'pstore-console', 'pstore-console-size') + NOT_IN_FASTBOOT
-    fastboot = [x for x in base if x.split('=', 1)[0] not in quiet + ('data-persist',)] + [
+    fastboot = [x for x in base if x.split('=', 1)[0] not in quiet + ('data-persist',) and not x.startswith(GUARD_PREFIX)] + [
         'data-persist=0', 'piano-reset-after=1', 'piano-reset-to=bootloader', 'sheng-smp=1']
     lines = {'macos': ' '.join(macos), 'macos-diag': ' '.join(diag), 'fastboot': ' '.join(fastboot)}
     for name, line in lines.items():
@@ -233,12 +261,13 @@ def clock_text(a):
     return f'the PMIC RTC + {offset} (k27 0060 piano-rtc=1), else {utc}'
 
 
-def config_text(a, lines, prev):
+def config_text(a, lines, prev, guard=0):
     entry = ('[[entry]]\nid = "{id}"\ntitle = "{title}"\ntype = "xnu"\npath = "Payloads/{dir}kernel.macho"\n'
              'initrd = "Payloads/scratch-data.img"\nargs = "{args}"\n')
     text = ('# piano persistent boot (docs/persistent-boot.md): the ESP on UFS LUN 0, partition 37. boot_a holds only BootShim + FD; a\n'
             '# "fastboot boot" image with its own payload still wins (firmware/patches/unixnu/0001).\n'
-            f'# profile {a.profile}{f"; fast boot {a.fast_boot}" if a.fast_boot else ""}; clock: {clock_text(a)}\n'
+            f'# profile {a.profile}{f"; fast boot {a.fast_boot}" if a.fast_boot else ""}'
+            f'{f"; boot guard {guard} s" if guard else ""}; clock: {clock_text(a)}\n'
             'version = 1\n[boot]\ntimeout = ' + str(a.timeout) + '\ndefault = "' + a.default + '"\n[kits]\nautoload = false\n')
     text += entry.format(id='macos', title='macOS (native)', dir='', args=lines['macos'])
     text += entry.format(id='macos-diag', title=f'macOS, reset to fastboot after {a.diag_reset_after} s', dir='', args=lines['macos-diag'])
@@ -292,6 +321,9 @@ def main():
     p.add_argument('--fast-boot', type=int, choices=(0, 1, 2), default=0,
                    help='build-ram-images.py PIANO_FAST_BOOT: 1 no -v (no console text drawn) and no droidvm-disable-jobs; '
                    '2 also k27-deny-exec for watchdogd (docs/boot-time.md)')
+    p.add_argument('--boot-guard', type=int, metavar='SECS',
+                   help='piano-boot-guard=SECS on the macos entries (k27 0063, docs/boot-guard.md): the watchdog held from the start, '
+                   'the restart reason bootloader until healthy at SECS s; 0 none. Default: the profile\'s (daily 180, others none)')
     p.add_argument('--replace-data', nargs='?', const='1', metavar='1|HEX8',
                    help='data-store-replace on the macos entries: an intended one-time switch to this seed that STARTS THE DATA STORE '
                    'OVER when it belongs to another seed (1: any other seed\'s store; HEX8: only the store of that seed, the 8 hex '
@@ -312,13 +344,18 @@ def main():
         if not path.is_file():
             raise SystemExit(f'{n}: {path} is missing')
     pack = check_sensor_pack(a.sensor_pack) if a.sensor_pack else None
-    natives, vm_era, kc_rtc = kc_bundles(inputs['kc'])
+    natives, vm_era, kc_rtc, kc_guard = kc_bundles(inputs['kc'])
     if vm_era:
         raise SystemExit(f'{inputs["kc"]} links {vm_era}: the native kext rule allows only this repository\'s kexts '
                          '(docs/PROJECT-MAP.md rule 8)')
     if a.rtc_offset is not None and not kc_rtc:
         raise SystemExit(f'--rtc-offset: the kernel in {inputs["kc"]} has no k27 0060 (build the collection with '
                          'K27_KERNEL=<kernel-k27-0060-native.macho> tooling/k27/build-native-image.sh)')
+    guard = boot_guard(a, profile)
+    if guard and not kc_guard:
+        raise SystemExit(f'--boot-guard {guard} (profile {a.profile}\'s default unless given): the kernel in {inputs["kc"]} has no k27 '
+                         '0063 (build the collection with K27_KERNEL=<kernel-k27-0063-native.macho> tooling/k27/build-native-image.sh), '
+                         'or say --boot-guard 0')
     for bundle in profile['kexts']:
         if bundle not in natives:
             raise SystemExit(f'profile {a.profile} needs {bundle} in the kernel collection; {inputs["kc"]} has {natives} '
@@ -337,7 +374,7 @@ def main():
     data_store = check_store(a, seed, inputs['kc'])
     data_store['trust'] = check_trust(a, inputs['trust'])
     lines = args_of(a, profile, a.utc)
-    config = config_text(a, lines, prev)
+    config = config_text(a, lines, prev, guard)
     name = a.name or f'esp-{a.profile}-{a.default}'
     a.out.mkdir(parents=True, exist_ok=True)
     image = a.out / f'{name}.img'
@@ -393,7 +430,8 @@ def main():
                       'dd': f'bs=1M seek={common.ESP_FIRST * common.LBA >> 20} count={common.ESP_BLOCKS * common.LBA >> 20}'},
         'profile': a.profile, 'about': profile['about'], 'extra_args': a.arg, 'fast_boot': a.fast_boot, 'default': a.default,
         'timeout': a.timeout,
-        'utc': a.utc, 'rtc_offset': a.rtc_offset, 'kc_has_rtc_calendar': kc_rtc, 'cmdlines': lines,
+        'utc': a.utc, 'rtc_offset': a.rtc_offset, 'kc_has_rtc_calendar': kc_rtc, 'boot_guard': guard,
+        'kc_has_boot_guard': kc_guard, 'cmdlines': lines,
         'inputs': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in inputs.items()},
         'previous': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in prev.items()} if prev else None,
         'kc_natives': natives, 'adt_vmm_present': vmm,

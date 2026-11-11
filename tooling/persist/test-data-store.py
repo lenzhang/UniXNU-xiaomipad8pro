@@ -252,6 +252,27 @@ def main():
     lines = esp.args_of(ns, profile, 1)
     check('data-store-replace=1 data-store-flatten=1' in lines['macos'] and 'data-store-replace' in lines['macos-diag'] and
           'data-store' not in lines['fastboot'] and 'data-persist=0' in lines['fastboot'], 'the macos entries carry them, fastboot not')
+    # k27 0063's boot guard (docs/boot-guard.md): the daily profile's default on the macos entries, never on fastboot
+    ns = SimpleNamespace(arg=[], rtc_offset=None, fast_boot=0, diag_reset_after=240, replace_data=None, flatten_data=False,
+                         boot_guard=None)
+    daily = esp.PROFILES['daily']
+    lines = esp.args_of(ns, daily, 1)
+    check('piano-boot-guard=180' in lines['macos'].split() and 'piano-boot-guard=180' in lines['macos-diag'].split() and
+          'piano-boot-guard' not in lines['fastboot'], 'daily: piano-boot-guard=180 on macos and macos-diag, not on fastboot')
+    check(not any(x.startswith('piano-boot-guard') for x in esp.args_of(ns, profile, 1)['macos'].split()),
+          'base: no boot guard unless asked')
+    ns.boot_guard = 0
+    check('piano-boot-guard' not in esp.args_of(ns, daily, 1)['macos'], '--boot-guard 0: none on daily')
+    ns.boot_guard = 240
+    check('piano-boot-guard=240' in esp.args_of(ns, profile, 1)['macos'].split(), '--boot-guard 240 on base')
+    ns.boot_guard = 30
+    check(refused(esp.args_of, ns, daily, 1) is not None, '--boot-guard 30: refused (under launchd\'s time)')
+    ns.boot_guard, ns.arg = None, ['piano-boot-guard=200']
+    check(refused(esp.args_of, ns, daily, 1) is not None, '--arg piano-boot-guard=200 refused (the option says it)')
+    ns.arg = ['piano-boot-guard-exec=loginwindow']
+    lines = esp.args_of(ns, daily, 1)
+    check('piano-boot-guard-exec=loginwindow' in lines['macos'].split() and 'piano-boot-guard=180' in lines['macos'].split() and
+          'piano-boot-guard' not in lines['fastboot'], '--arg piano-boot-guard-exec with the default guard; neither on fastboot')
 
     print(f'\n{"PASS" if not failures else "FAIL"}: {len(failures)} failure(s)')
     sys.exit(1 if failures else 0)

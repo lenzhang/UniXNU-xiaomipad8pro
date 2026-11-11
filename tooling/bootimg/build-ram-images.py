@@ -82,6 +82,11 @@ K27_ARGS = ['-v', 'debug=0x14e', 'kt_fixed_zones=120', '-no_slto_panic', 'tlto_u
             # NativeRamBlock's changed Data pages in NativeUfs's store window at the end of linux_rootfs (2: read and write). A RAM image
             # takes the value data_store_args gives (PIANO_DATA_PERSIST, else from the installed seed); build-esp.py sets its own.
             'data-persist=' + os.environ.get('PIANO_DATA_PERSIST', '2')]
+# PIANO_RESET_AFTER=0: neither the timed reset nor the restart reason (k27 0056/0057 would be inert at 0 anyway), so the image boots
+# as the installed system does, e.g. for k27 0063's boot guard tests (docs/boot-guard.md, tooling/k27/build-guard-test-images.sh):
+# nothing then resets the tablet but what the image's own arguments arm.
+if os.environ.get('PIANO_RESET_AFTER', '45') == '0':
+    K27_ARGS = [x for x in K27_ARGS if x.split('=', 1)[0] not in ('piano-reset-after', 'piano-reset-to')]
 
 # PIANO_FAST_BOOT=1|2 (docs/boot-time.md): the boot-time test switch, off (0) by default, so K27_ARGS above stays what boots today.
 #   1: no '-v'. XNU then keeps its console in graphics mode and stops drawing every console line into the boot framebuffer, which
