@@ -275,30 +275,33 @@ void PianoVideo::run()
     IOSleep(gArgs.delay * 1000);
   }
   unsigned loads = 0;
-  stage(1, "GCC video branches, then VIDEO_CC behind GCC's video AHB (read only)");
-  const Clocks c = surveyClocks(load, gArgs.cc, &loads);
+  Clocks c;
+  stage(1, "GCC video branches (read only)");
+  surveyGcc(c, load, &loads);
   reportGcc(c);
+  stage(2, gArgs.cc ? "VIDEO_CC behind GCC's video AHB (read only)" : "VIDEO_CC skipped (piano-video-cc=0)");
+  surveyVideoCc(c, load, gArgs.cc, &loads);
   if (c.ccRead) reportVideoCc(c);
   note("gate: %s", c.why);
   Core r;
   if (c.controller) {
-    stage(2, "the core's controller registers (and the codec's idle words when its domain is on), read only");
+    stage(3, "the core's controller registers (and the codec's idle words when its domain is on), read only");
     r = surveyCore(c, load, &loads);
   } else {
-    stage(2, "the core skipped: its gate is closed");
+    stage(3, "the core skipped: its gate is closed");
   }
   reportCore(c, r);
   const CoreState s = coreState(c, r);
   note("core: %s: %s", coreStateName(s), coreVerdict(s));
   SmmuSurvey m;
   if (gArgs.smmu) {
-    stage(3, gArgs.smmu >= 2 ? "SMMU streams 0x1940-0x194f and their banks (read only)" : "SMMU streams 0x1940-0x194f (global pages, read only)");
+    stage(4, gArgs.smmu >= 2 ? "SMMU streams 0x1940-0x194f and their banks (read only)" : "SMMU streams 0x1940-0x194f (global pages, read only)");
     m = surveySmmu(gArgs.smmu, [](uint32_t off) { return load(kSmmu + off); });
     reportSmmu(m);
   }
   Carveout fw;
   if (gArgs.carveout) {
-    stage(4, "the firmware carveout's first words (read only; memory XNU does not own)");
+    stage(5, "the firmware carveout's first words (read only; memory XNU does not own)");
     fw = surveyCarveout(load, &loads);
     note("carveout %#llx: %08x %08x %08x %08x %08x %08x %08x %08x: %s", (unsigned long long)kCarveout, fw.words[0], fw.words[1],
          fw.words[2], fw.words[3], fw.words[4], fw.words[5], fw.words[6], fw.words[7], carveoutVerdict(fw));
@@ -314,7 +317,7 @@ void PianoVideo::run()
     note("sample %u (+%u s): gcc ahb %08x axi0 %08x axi1 %08x; mvs0c gdsc %08x mvs0 gdsc %08x pll0 mode %08x mvs0 %08x", i, i * gArgs.repeat,
          k.gccAhb, k.gccAxi0, k.gccAxi1, k.mvs0cGdsc, k.mvs0Gdsc, k.pllMode, k.mvs0);
   }
-  stage(5, "done");
+  stage(6, "done");
   note("done: %llu MMIO loads, 0 stores; %u pages mapped, %u map failures", (unsigned long long)gLoads, gPageCount, gMapFailures);
   unmapAll();
 }

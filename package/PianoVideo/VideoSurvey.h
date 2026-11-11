@@ -35,23 +35,29 @@ struct Clocks {
   const char *why = "";
 };
 
-// ccLevel 0: VIDEO_CC is not read at all (piano-video-cc=0: the fallback if a load there ever stalls).
+// (1) GCC's four video branches: always readable.
 template <class Load>
-Clocks surveyClocks(Load load, unsigned ccLevel, unsigned *loads)
+void surveyGcc(Clocks &c, Load load, unsigned *loads)
 {
-  Clocks c;
   c.gccAhb = load(kGcc + kGccVideoAhb);
   c.gccXo = load(kGcc + kGccVideoXo);
   c.gccAxi0 = load(kGcc + kGccVideoAxi0);
   c.gccAxi1 = load(kGcc + kGccVideoAxi1);
   *loads += 4;
+}
+
+// (2) VIDEO_CC behind GCC's video AHB, and the gate for the core. ccLevel 0: VIDEO_CC is not read at all (piano-video-cc=0: the
+// fallback if a load there ever stalls).
+template <class Load>
+void surveyVideoCc(Clocks &c, Load load, unsigned ccLevel, unsigned *loads)
+{
   if (!ccLevel) {
     c.why = "VIDEO_CC not read (piano-video-cc=0): the core's state is unknown";
-    return c;
+    return;
   }
   if (!branchOn(c.gccAhb)) {
     c.why = "GCC video AHB clock off: VIDEO_CC and the core not read (cold, as nothing before XNU uses the video core)";
-    return c;
+    return;
   }
   struct {
     uint32_t off;
@@ -72,16 +78,25 @@ Clocks surveyClocks(Load load, unsigned ccLevel, unsigned *loads)
   c.ccRead = true;
   if (!gdscOn(c.mvs0cGdsc)) {
     c.why = "controller GDSC (MVS0C) collapsed: the core is cold and not read (as expected before any video driver)";
-    return c;
+    return;
   }
   if (!branchOn(c.gccAxi1) || !branchOn(c.mvs0c) || !branchOn(c.mvs0cFreerun)) {
     c.why = "controller GDSC on but its clocks (GCC AXI1, MVS0C, MVS0C free-running) are not all on: the core not read";
-    return c;
+    return;
   }
   c.controller = true;
   c.codec = gdscOn(c.mvs0Gdsc) && branchOn(c.gccAxi0) && branchOn(c.mvs0) && branchOn(c.mvs0Freerun);
   c.why = c.codec ? "controller and codec powered and clocked: both read"
                   : "controller powered and clocked: its registers read; the codec (MVS0) is off or unclocked: not read";
+}
+
+// Both steps, in the kext's order.
+template <class Load>
+Clocks surveyClocks(Load load, unsigned ccLevel, unsigned *loads)
+{
+  Clocks c;
+  surveyGcc(c, load, loads);
+  surveyVideoCc(c, load, ccLevel, loads);
   return c;
 }
 

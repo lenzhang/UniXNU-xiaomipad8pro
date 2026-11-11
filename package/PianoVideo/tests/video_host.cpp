@@ -130,6 +130,12 @@ static void testGccOff()
   CHECK(soc.in(kVideoCc, kVideoCcBytes) == 0 && soc.in(kIris, kIrisBytes) == 0);
   CHECK(coreState(x.c, x.r) == CoreState::cold);
   CHECK(std::strstr(x.c.why, "GCC video AHB clock off"));
+  // The kext's first step alone: GCC's four words, nothing else.
+  Soc gcc;
+  Clocks c;
+  unsigned loads = 0;
+  surveyGcc(c, [&](uint64_t pa) { return gcc.load(pa); }, &loads);
+  CHECK(loads == 4 && gcc.loads.size() == 4 && gcc.in(kGcc, 0x40000) == 4 && !c.ccRead);
 }
 
 static void testCcSkipped()
