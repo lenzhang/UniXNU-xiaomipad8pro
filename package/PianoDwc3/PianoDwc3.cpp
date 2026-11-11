@@ -451,6 +451,56 @@ void peek(uint64_t pa, uint64_t count)
   r.map->release();
 }
 
+// ABL boots the installed OS after a reset unless the PMIC restart reason says otherwise: byte 0x48 of the SID 0 SDAM
+// (PPID 0x071), bits 1-7 (2 = bootloader), bit 0 kept. The same SPMI arbiter v7 access as k27 0057's piano-reset-to, here
+// for one reset on request, so an installed system (no piano-reset-to) can be sent to ABL fastboot from the Mac.
+bool spmiDone(uintptr_t status)
+{
+  for (int i = 0; i < 100000; i++) {
+    const uint32_t st = rd32(status);
+    if (st & 1) return (st & 0xe) == 0;
+  }
+  return false;
+}
+
+int setRestartReason(uint8_t reason)
+{
+  constexpr uint64_t kCore = 0x0C400000, kCnfg = 0x0C42D000, kObsv = 0x0C440000, kChnl = 0x0C500000;
+  constexpr uint32_t kPpid = 0x071, kOffset = 0x48;
+  Region core = {}, cnfg = {}, obsv = {}, chnl = {};
+  int err = 0;
+  uint32_t apid = 0, count = 0;
+  if (!mapRegion(core, kCore, 0x3000) || !mapRegion(cnfg, kCnfg, 0x1000)) {
+    err = -1;
+  } else if (count = rd32(core.va + 4) & 0x7ff, (rd32(core.va) >> 28) != 7 || !count || count > 1024) {
+    err = -2;
+  } else {
+    for (apid = 0; apid < count; apid++) {
+      const uint32_t map = rd32(core.va + 0x2000 + 4 * apid);
+      if (map && ((map >> 8) & 0xfff) == kPpid && (rd32(cnfg.va + 4 * apid) & 7) == 0) break;
+    }
+    if (apid == count) err = -3;
+    else if (!mapRegion(obsv, kObsv + 0x20ull * apid, 0x20) || !mapRegion(chnl, kChnl + 0x1000ull * apid, 0x20)) err = -4;
+  }
+  if (!err) {
+    wr32(obsv.va, (1u << 27) | (kOffset << 4));                 // read 1 byte
+    if (!spmiDone(obsv.va + 8)) err = -5;
+  }
+  if (!err) {
+    const uint8_t old = uint8_t(rd32(obsv.va + 24));
+    wr32(chnl.va + 16, uint32_t((old & 1) | uint8_t(reason << 1)));
+    wr32(chnl.va, (0u << 27) | (kOffset << 4));                 // write 1 byte
+    if (!spmiDone(chnl.va + 8)) err = -6;
+    wr32(obsv.va, (1u << 27) | (kOffset << 4));
+    (void)spmiDone(obsv.va + 8);
+    cprintf("SDAM restart reason %#04x -> %#04x (APID %u)\n", old, uint8_t(rd32(obsv.va + 24)), apid);
+  }
+  Region *all[] = {&core, &cnfg, &obsv, &chnl};
+  for (Region *r : all)
+    if (r->map) r->map->release();
+  return err;
+}
+
 void usbStatus();
 
 void execute(const char *line)
@@ -470,6 +520,7 @@ void execute(const char *line)
             "  args           kernel boot arguments\n"
             "  uptime         time since boot\n"
             "  reset          restart through PSCI (with piano-reset-to, back to ABL fastboot)\n"
+            "  reset fastboot restart into ABL fastboot (sets the PMIC restart reason first)\n"
             "  panic          panic on purpose\n");
   } else if (word(s, "log")) {
     gRewindRequest = 1;
@@ -504,6 +555,11 @@ void execute(const char *line)
     const uint64_t ns = nowNs();
     cprintf("%llu.%03llu s\n", ns / 1000000000ull, ns / 1000000ull % 1000);
   } else if (word(s, "reset")) {
+    if (word(s, "fastboot")) {
+      const int err = setRestartReason(2);
+      if (err) { cprintf("reset fastboot: SDAM write failed (%d); not restarting\n", err); return; }
+      cprintf("restart reason: bootloader (ABL fastboot after this reset)\n");
+    }
     cprintf("restarting\n");
     IOSleep(200);
     PEHaltRestart(kPERestartCPU);
