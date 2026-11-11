@@ -32,3 +32,17 @@ panel's callouts, starting disconnected (hotPlug_notify(0)) and hot-plugged by a
 its VBL timer stops while it is disconnected. Every log line names its instance (GOPLOG: "NativeGopDisplay: " for the panel, unchanged,
 "NativeGopDisplay-ext: " for the second display). Without the arguments the second personality's probe refuses silently and the panel's
 behaviour and lines are as before.
+
+UniXNU-piano (2026-11-12): the composition (new code, GopCompose.h, host-tested in tests/gop_host.cpp; docs/drivers/native-gop-display.md
+§5a), on by default. Every layer of a swap goes into the copy: layer 0 the frame as before, layer 1 (WindowServer's cursor, 'BGRA'
+premultiplied) blended over it at its origin, clipped at the panel's edges; a cursor-only swap redraws the cursor's old and new
+rectangles only; layers 2 and 3 are logged once per kind, not composed. The two layer-1 origin words (+97, +101) and the use of
+IOSurface::getImageOriginAndExtents were read from AppleParavirtDisplay's code in the same collection the earlier offsets came from
+(program_hardware_gated(bool) and program_hardware_cursor_gated(IOSurface *, int, int), kc27.bin, the k27 tree's scripts/kc-disasm.py),
+the addresses recorded at kSwapLayer1X/Y. The copy race closed: a swap completes once its own job is done (native-gop-display-defer=2;
+1 waits only while a read is in the way, 0 the old behaviour), and a refresh copy in a swap's way stops at its next row; the copy
+thread's request is a job (a snapshot of the layers) in one slot (newest state wins, a refresh never displaces a swap's job). The fence
+rule: a job is drawn only once the GPU retired its swap's fence (before: 50 ms, then copied anyway); native-gop-display-gpu-fence-ms
+(1000) is the hang guard, after which the job is left undrawn and the ticks retry; refresh copies after fence-covered frames only the
+last by default (native-gop-display-refresh=1; 2 the old default), and fence-checked. Flip mode offers a frame to PianoDpu only while
+no cursor is on the panel. native-gop-display-cursor=0 leaves layer 1 undrawn as before.

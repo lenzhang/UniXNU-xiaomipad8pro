@@ -7,6 +7,12 @@
 // The CPU copy of each swap's main IOSurface into the boot framebuffer, with the family hooks AppleParavirtDisplay (vma2) overrides
 // (provenance: UPSTREAM). There is no virtio-gpu scanout and no wait for a virtual GPU's 3D work; the defaults are the panel's.
 //
+// Since 2026-11-12 the copy is a composition (GopCompose.h, host-tested; docs/drivers/native-gop-display.md §5a): layer 0 (the frame)
+// with layer 1 (WindowServer's cursor, 'BGRA' premultiplied) blended over it at the layer's origin, and a cursor-only swap redraws only
+// the cursor's old and new rectangles. A swap that takes a surface off the screen while the copy thread still reads it completes only
+// once that read is done (the family hands the surface back to WindowServer at the completion, and WindowServer draws into it at once:
+// the flicker and white bands of 2026-11-11). Flip mode copies while a cursor is on the panel (no cursor pipe yet).
+//
 // Discovery: IOMobileFramebuffer.framework (iomfb_populate_all_display_infos) counts the DisplayPortCount of the AppleParavirtGPU
 // services when an /arm-io node is compatible "paravirtualizedgraphics,gpu", and waits for that many framebuffers. The native ADT has
 // such a node (tooling/adt/make-piano-adt.py, configs/k27-gop-display.toml) and this kext provides the nub, AppleParavirtGPU (end of
@@ -40,6 +46,10 @@
 #include <pexpert/device_tree.h>
 #include "../PianoDpu/PianoDpuFlipClient.h"   // the zero-copy flip's request (native-gop-display-flip=1)
 #include "../PianoDp/DpFake.h"                 // D6: the second, RAM-backed test display (piano-dp-fake)
+#include "GopCompose.h"                        // the composition and the swap pipeline (portable, tests/gop_host.cpp)
+
+using gopcompose::Job;
+using gopcompose::Rect;
 
 extern "C" task_t kernel_task;
 
@@ -68,7 +78,16 @@ static constexpr size_t kSwapDropReasons = 1004;   // programmed when nothing bu
 static constexpr size_t kSwapInfoA = 912;          // swap info words 3 and 4
 static constexpr size_t kSwapInfoB = 976;
 static constexpr size_t kSwapMainSurface = 2944;   // layer i's surface at + 8 * i
-static constexpr unsigned kSwapLayerCount = 4;
+static constexpr unsigned kSwapLayerCount = gopcompose::kLayers;
+// Layer 1's origin on the panel, two unaligned s32 (added 2026-11-12, read the same way from AppleParavirtDisplay's code, in the
+// k27 collection kc27.bin with the k27 tree's scripts/kc-disasm.py): AppleParavirtDisplay::program_hardware_gated(bool)
+// (0xfffffe000869d4f8) tests bit 1 of +984, then loads ldur w2, [x8, #97] and ldur w3, [x8, #101] (+0x28, +0x2c) and calls
+// program_hardware_cursor_gated(IOSurface *, int, int) with layer 1's surface (+2952) and the two words; that function adds the
+// surface's hot spot (IOSurface::getImageOriginAndExtents, words 4 and 5, checked to lie inside the glyph rectangle of words 0-3) to
+// them and hands the sums to program_hardware_cursor_position_gated(bool, unsigned short, unsigned short), the host cursor's hot spot
+// position. So the words are where the surface's pixel (0, 0) goes on the panel. A null layer-1 surface there hides the cursor.
+static constexpr size_t kSwapLayer1X = 97;
+static constexpr size_t kSwapLayer1Y = 101;
 static constexpr size_t kSwapNext = 3384;          // TAILQ entry of the queue
 static constexpr size_t kSwapPrev = 3392;
 // IOMFBNotifyRequest
@@ -100,6 +119,12 @@ uint64_t ioSurfacePlaneBytesPerRow(const IOSurface *, uint32_t) __asm("__ZNK9IOS
 uint64_t ioSurfacePlaneBytesPerElement(const IOSurface *, uint32_t) __asm("__ZNK9IOSurface23getPlaneBytesPerElementEj");
 uint64_t ioSurfacePlaneWidth(const IOSurface *, uint32_t) __asm("__ZNK9IOSurface13getPlaneWidthEj");
 uint64_t ioSurfacePlaneHeight(const IOSurface *, uint32_t) __asm("__ZNK9IOSurface14getPlaneHeightEj");
+// A cursor surface's glyph rectangle (x, y, width, height) and hot spot (x, y) as six words, returned through x8: AppleParavirtDisplay
+// zeroes 24 bytes and reads them so (program_hardware_cursor_gated +0xb8..+0x110). GopCompose.h's glyphRect checks them.
+struct IOSurfaceOriginAndExtents {
+    uint32_t words[6];
+};
+IOSurfaceOriginAndExtents ioSurfaceOriginAndExtents(IOSurface *) __asm("__ZN9IOSurface24getImageOriginAndExtentsEv");
 // IOAVVideoTimingData: per axis (horizontal, vertical) 32 bytes of which total +4, active +8, sync width +12, back porch +16,
 // front porch +20, sync rate +24, sync polarity +28, then the pixel clock at +68.
 OSObject *ioavTimingWithData(const void *data, uint32_t standardType, uint32_t timingStandard)
@@ -157,17 +182,30 @@ private:
     bool readFramebuffer();
     bool clean_queue_gated();
     void program_hardware_gated();
-    void copySurface(IOSurface *, bool refresh = false);
     struct FrameStats;
     void sampleRow(const uint32_t *line, const uint8_t *source, unsigned pixelBytes, uint64_t y, uint64_t width, uint64_t height,
                    FrameStats &stats, bool thumb);
     void logThumbnail(const FrameStats &stats, uint64_t width, uint64_t height, uint32_t format, bool refresh);
-    void requestCopy(IOSurface *, bool refresh, bool fenced = false, uint32_t fence = 0, bool flip = false);
     void copyLoop();
     static void copyThreadMain(void *, wait_result_t);
     const uint8_t *surfaceBytes(IOSurface *, IOMemoryDescriptor *, bool *cached);
     void releaseSurfaceMaps();
     void stopCopies();
+    // The composition (GopCompose.h): the jobs the swaps and the refresh ticks hand the copy thread, what it draws.
+    struct Mapped {                   // a surface opened for one job
+        IOMemoryDescriptor *memory;   // prepared
+        bool cached;
+    };
+    bool openSource(IOSurface *, gopcompose::RowSource *, Mapped *, bool base);
+    bool ensureBuffers();
+    void runJob(const Job &, bool retired, bool covered, bool *flipped);
+    bool overlayOf(IOSurface *, int32_t x, int32_t y, gopcompose::Overlay *);
+    bool compose(const gopcompose::Plan &, const Job &, IOSurface *base, IOSurface *cursor, const gopcompose::Overlay &, const Rect &onPanel);
+    void queueRefresh(const Job &);
+    static void retainJob(const Job &);
+    static void releaseJob(const Job &);
+    void noteLayers(const gopcompose::SwapLayers &, uint32_t swapID);
+    static void jobDoneAction(OSObject *, IOInterruptEventSource *, int);
     bool createDisplayAttributes();
     void drawBars();
     static void vblFired(OSObject *, IOTimerEventSource *);
@@ -183,18 +221,25 @@ private:
     uint64_t fVideoPhys;
     IOMemoryMap *fScanoutMap;
     uint8_t *fScanout;
-    uint8_t *fHalfToByte;     // 'RGhA' surfaces: the 8-bit value of each half float >> 2 (a channel), clamped to [0, 1]
-    uint16_t *fRow;           // one 'RGhA' row
-    uint32_t *fLine;          // one converted row, written to the scanout at once (it is write-combined)
+    gopcompose::Tables *fTables;   // the 'RGhA' and 'b3a8' conversions, made with the row buffers
+    uint8_t *fRow;            // one source row ('RGhA': 8 bytes a pixel)
+    uint32_t *fLine;          // one composed row, written to the scanout at once (it is write-combined)
+    uint32_t *fOverlayRow;    // the cursor's part of a row
     uint64_t fRowBytes;
-    uint8_t fXr10ToByte[1024];   // 'b3a8' surfaces: the 8-bit value of each 10-bit extended-range channel, clamped to [0, 1]
     IOTimerEventSource *fVBL;
     DisplayColorRemapMode fColorRemapMode;
     uint32_t fSurfaceFormat;
     bool fDisplayOn;
-    bool fRefreshCopies;      // boot-arg native-gop-display-refresh (default 1): copy the surface on screen again after a swap
     uint64_t fFrames;
-    uint64_t fLayerShape;             // the layers of the last swap, logged when they change
+    // Each new combination of layers, and each new kind of layer (its index, size and format, or off), logged once.
+    struct LayerKind {
+        uint32_t layer, width, height, format;
+        bool off;
+    };
+    static constexpr unsigned kLayerKinds = 32;
+    LayerKind fKinds[kLayerKinds];
+    unsigned fKindCount;
+    uint32_t fMasksSeen;
     // What the last new frame copied to the panel looked like, from every 4th pixel of every 4th row of the copied (BGRA) rows, in any
     // source format: the share of non-black pixels in per mille, the mean colour and the centre pixel (0xRRGGBB).
     struct FrameStats {
@@ -224,27 +269,53 @@ private:
         IOMemoryMap *map;
         uint64_t used;
     };
-    static constexpr unsigned kSurfaceMaps = 4;
+    static constexpr unsigned kSurfaceMaps = 8;   // the frames and the cursor's images
     SurfaceMap fSurfaceMaps[kSurfaceMaps];
     uint64_t fSurfaceMapClock;
-    // The copies run on a thread of their own, so the command gate WindowServer swaps through is never held for a copy. A swap completes
-    // at once; the thread copies the newest surface asked for, the ones it had no time for are skipped.
+    // The copies run on a thread of their own, so the command gate WindowServer swaps through is never held for a copy. The thread
+    // draws the newest state asked for (GopCompose.h's slot: the jobs it had no time for are merged into the next). A swap completes
+    // at once, unless the copy thread is reading a surface the swap takes off the screen (native-gop-display-defer, default 1): then
+    // once that read is done, from the work loop (fJobDone). Flip mode: once the swap's own job is done.
     IOLock *fCopyLock;
-    IOSurface *fCopyNext;             // retained; the next surface to copy
-    bool fCopyRefresh, fCopyStop, fCopyThreadDone;
+    gopcompose::Slot fSlot;           // fCopyLock: the waiting job (its base and overlay retained)
+    gopcompose::Busy fBusy;           // fCopyLock: the job the thread draws
+    uint64_t fDoneSerial;             // fCopyLock: the last job done
+    uint64_t fWaitSerial;             // fCopyLock: the job the waiting swap needs done (0: none waits)
+    bool fCopyStop, fCopyThreadDone;
     uint64_t fCopiesSkipped;
+    gopcompose::Pipeline fPipe;       // the work loop's: the layers (their surfaces retained), the refresh countdown
+    gopcompose::PanelState fPanel;    // the copy thread's: what the panel shows
+    uint32_t fDefer;                  // gopcompose::DeferMode
+    uint32_t fRefreshPolicy;          // gopcompose::RefreshPolicy (native-gop-display-refresh)
+    uint32_t fCursorMode;             // native-gop-display-cursor: 0 layer 1 not drawn, 1 its glyph rectangle, 2 the whole surface
+    IOInterruptEventSource *fJobDone; // the copy thread -> the work loop: the job a swap waits for is done
+    IOMFBSwapIORequest *fWaitingSwap; // the current swap while it waits
+    volatile bool fLastFlipped;       // the job the swap waited for was flipped (flip mode)
+    bool fFrameCovered;               // copy thread: the last frame's copy waited for its fence and saw it retired
+    bool fNeedFenced;                 // copy thread: the fence the panel's state needs (the newest swap job's), when it has one
+    uint32_t fNeedFence;
+    volatile bool fUnfinished;        // copy thread -> work loop: a swap's job was left undrawn (its fence had not passed): retry
+    volatile uint64_t fAbortSerial;   // work loop -> copy thread: the refresh with this serial stops at its next row
+    uint64_t fUnfinishedJobs, fRetries, fRefreshAborts;
+    uint64_t fDeferred, fDeferNs, fDeferMaxNs, fDeferStart;
+    uint64_t fCursorJobs, fCursorNs, fCursorMaxNs, fCursorForced;
+    int32_t fCursorX, fCursorY;       // copy thread: where the cursor was drawn last (its layer origin)
+    uint32_t fCursorLogs;
+    uint32_t fGlyphW, fGlyphH;        // copy thread: the cursor surface's size last logged
+    Rect fGlyphLogged;
     // The GPU's fence rule (PianoA830, docs/drivers/gpu.md): WindowServer swaps a frame when its command buffer is scheduled, not when
     // the GPU finished it, and the family's IOSurface fences do not see the A830's work. So a swap records the newest fence the GPU
-    // had handed out when it was programmed, and its copy first waits until the GPU retired that fence (at most kGpuFenceWaitMs, then
+    // had handed out when it was programmed, and its copy first waits until the GPU retired that fence (at most fGpuFenceWaitMs, then
     // it copies anyway). PianoA830's registered service is found by class and asked with callPlatformFunction("native-adreno-fences"),
     // so neither kext links against the other; without it, or with boot-arg native-gop-display-gpu-fence=0, nothing waits.
-    static constexpr unsigned kGpuFenceWaitMs = 50;
+    // Since 2026-11-12 a frame the GPU has not finished is never copied (50 ms before, then copied anyway: the login's white bands):
+    // native-gop-display-gpu-fence-ms (default 1000, 10..10000) is only the hang guard; a job whose wait hits it is left undrawn (the
+    // previous frame stays), its swap completes, and the ticks retry until the GPU retired the fence (GopCompose.h verdict).
+    uint32_t fGpuFenceWaitMs;
     bool fGpuFences;
     IOService *fGpu;                  // retained once found (written once, by the swap path)
     const OSSymbol *fGpuFenceSymbol;
     uint64_t fGpuLookupNext;          // mach time of the next lookup while none was found
-    uint32_t fCopyFence;              // with fCopyNext: the fence its swap waits for, when fCopyFenced
-    bool fCopyFenced;
     uint64_t fGpuWaits, fGpuWaitNs, fGpuWaitMaxNs, fGpuTimeouts;
     // The display power for other drivers (docs/policy.md 5.6): every power change call publishes "piano-display-power" (boolean),
     // and a change of it is messaged to the interested clients (kIOMessageServicePropertyChange, the property's name), always.
@@ -258,21 +329,16 @@ private:
     // Zero-copy flips (boot-arg native-gop-display-flip=1, with PianoDpu's piano-dpu=2 piano-dpu-flip=4; docs/drivers/dpu.md §4.1;
     // without the argument nothing of this runs): the copy thread hands a swap's surface, after the GPU fence wait, to PianoDpu's
     // "PianoDpuFlip" (package/PianoDpu/PianoDpuFlipClient.h), found by class like the GPU; refused, it copies the surface as before
-    // and asks for the boot framebuffer back. The swap completes only then (on the work loop, fFlipDone): the surface it replaces is
-    // free once the new one latched. A flipped swap needs no refresh copies (the DPU reads the surface every frame), and the VBL timer
-    // runs only while refresh copies or a stalled queue need it.
+    // and asks for the boot framebuffer back. The swap completes only then (native-gop-display-defer=2: on the work loop, fJobDone):
+    // the surface it replaces is free once the new one latched. A flipped swap needs no refresh copies (the DPU reads the surface every
+    // frame), and the VBL timer runs only while refresh copies or a stalled queue need it. The DPU has no cursor pipe yet: while a
+    // cursor is on the panel every frame is composed into the boot framebuffer (and that put back), flips resume once it hides.
     bool fFlipMode;
     IOService *fDpu;                  // retained once found
     const OSSymbol *fDpuFlipSymbol;
     uint64_t fDpuLookupNext;          // mach time of the next lookup while none was found
-    IOInterruptEventSource *fFlipDone;   // the copy thread -> the work loop: the deferred swap is on the panel
-    IOMFBSwapIORequest *fFlipSwap;    // the swap whose completion waits (the current swap then)
-    bool fCopyFlip;                   // with fCopyNext: a swap's surface to flip rather than copy
-    volatile bool fFlipShown;         // the last deferred swap was flipped (not copied)
     uint64_t fFlips, fFlipCopies;
     bool dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request);
-    void flipOrCopy(IOSurface *surface);
-    static void flipDoneAction(OSObject *, IOInterruptEventSource *, int);
     // The PianoDpu callouts (docs/drivers/dpu.md §4.3-4.5), each off without its boot argument (and then nothing of this runs):
     //   piano-dpu-pcc=1|2       swap_set_color_matrix / set_gamma_table: logged (their raw bytes, B1d-0) and handed to PianoDpu's
     //                           PCC (PianoDpuColorMatrix / PianoDpuGammaTable); 2 also lets PianoDpu read a whole 0xc0c-byte table
@@ -289,24 +355,23 @@ private:
     uint32_t fColorFunction[kColorFunctions];
     uint64_t fColorLast[kColorFunctions][9];
     IOService *dpuService(bool now);
-    // The copy's cost (boot-arg native-gop-display-copy=BITS, default 0: nothing of this runs). A copy is ~39 ms for 3200x2136 BGRA,
-    // 34 of them reading the surface (uncached), and each swap is followed by up to six refresh copies (ticks 1, 2, 4, 8, 16, 30).
-    //   bit 0: a swap whose copy waited for the GPU's fence and saw it retired needs no refresh copies but the last (tick 30)
-    //   bit 1: surfaces mapped cacheable, their rows cleaned and invalidated by VA (DC CIVAC) before each read, so the read streams
-    //          through the cache instead of single uncached loads
+    // The copy's cost (boot-arg native-gop-display-copy=BITS, default 0: nothing of this runs). A copy is ~20-39 ms for 3200x2136
+    // BGRA, most of it reading the surface (uncached).
+    //   bit 0: (since 2026-11-12 the default, native-gop-display-refresh=1) a frame whose copy waited for the GPU's fence and saw it
+    //          retired needs no refresh copies but the last (tick 30); with native-gop-display-refresh=2 it brings that back
+    //   bit 1: surfaces mapped cacheable, the rows each job reads cleaned and invalidated by VA (DC CIVAC) after the fence wait and
+    //          before the read, so the read streams through the cache instead of single uncached loads
     static constexpr uint32_t kCopyFencedRefresh = 1, kCopyCachedRead = 2;
     uint32_t fCopyMode;
-    volatile bool fFenceCovered;      // the last swap's copy waited for its fence and the GPU retired it in time
     bool fCachedMapRefused;
     uint64_t fRefreshSkipped, fInvalidateNs, fInvalidates;
     bool gpuFence(uint32_t *fence);
-    bool waitGpuFence(uint32_t fence);
+    bool waitGpuFence(uint32_t fence, bool *answered);
+    bool gpuRetired(uint32_t fence);
     SwapInfo fSwapInfo[kSwapInfoRing];   // held while kSwapInfoHeld is set, sent in order afterwards
-    // The surface on screen, copied again on a few ticks after its swap (1, 2, 4, 8, 16, 30): a renderer that swapped before its work
-    // was done (a GPU) is shown complete once it finishes. WindowServer does not draw into the surface on screen.
-    static constexpr unsigned kRefreshTicks = 30;
-    IOSurface *fShown;
-    unsigned fRefreshLeft;
+    // The frame on screen (fPipe's layer 0) is composed again on a few ticks after its swap (1, 2, 4, 8, 16, 30): a renderer that
+    // swapped before its work was done (a GPU) is shown complete once it finishes. Only while the family keeps it on screen (it does
+    // not hand a surface on a layer back to WindowServer); a frame whose fence wait saw the GPU done needs only the last.
     unsigned fSwapInfoRead, fSwapInfoWrite;
     // D6 (docs/drivers/displayport.md, package/PianoDp/DpFake.h): the second instance, matched by the personality whose
     // NativeGopDisplayRole is "piano-dp-fake". It has no framebuffer: a RAM surface stands in (its copies and thumbnails go there,
@@ -476,9 +541,27 @@ bool NativeGopDisplay::start(IOService *provider)
         fWidthMM = 239;
         fHeightMM = 163;
     }
-    unsigned refresh = 1;
-    PE_parse_boot_argn("native-gop-display-refresh", &refresh, sizeof(refresh));
-    fRefreshCopies = refresh != 0;
+    // native-gop-display-refresh: 0 none, 1 (default) all six after a frame no fence covered and only the last after one it did,
+    // 2 all six after every frame (the default before 2026-11-12; native-gop-display-copy bit 0 brings it back to 1).
+    fRefreshPolicy = gopcompose::kRefreshUncovered;
+    PE_parse_boot_argn("native-gop-display-refresh", &fRefreshPolicy, sizeof(fRefreshPolicy));
+    if (fRefreshPolicy > gopcompose::kRefreshAlways)
+        fRefreshPolicy = gopcompose::kRefreshUncovered;
+    // native-gop-display-defer: 0 a swap completes at once (before 2026-11-12), 1 at once unless the copy thread reads a surface it
+    // takes off the screen, 2 (default) once its own job is done (flip mode's rule): a surface goes back to WindowServer only after
+    // the copy of the frame that replaced it.
+    fDefer = gopcompose::kDeferAlways;
+    PE_parse_boot_argn("native-gop-display-defer", &fDefer, sizeof(fDefer));
+    if (fDefer > gopcompose::kDeferAlways)
+        fDefer = gopcompose::kDeferAlways;
+    // native-gop-display-cursor: 0 layer 1 (the cursor) not drawn (before 2026-11-12), 1 (default) its glyph rectangle blended at the
+    // layer's origin, 2 the whole cursor surface (should IOSurface's extents ever be wrong).
+    fCursorMode = 1;
+    PE_parse_boot_argn("native-gop-display-cursor", &fCursorMode, sizeof(fCursorMode));
+    fGpuFenceWaitMs = 1000;
+    PE_parse_boot_argn("native-gop-display-gpu-fence-ms", &fGpuFenceWaitMs, sizeof(fGpuFenceWaitMs));
+    if (fGpuFenceWaitMs < 10 || fGpuFenceWaitMs > 10000)
+        fGpuFenceWaitMs = 1000;
     fThumbPeriod = 30;
     PE_parse_boot_argn("native-gop-display-thumb", &fThumbPeriod, sizeof(fThumbPeriod));
     fThumbLimit = 3;   // the console ring is 7 MiB and a thumbnail is about 3 KB: a few say what the panel showed
@@ -492,7 +575,7 @@ bool NativeGopDisplay::start(IOService *provider)
         fRefreshHz = fFake.hz;
         fWidthMM = fFake.widthMm;
         fHeightMM = fFake.heightMm;
-        fRefreshCopies = false;
+        fRefreshPolicy = gopcompose::kRefreshOff;
         GOPLOG("D6 (piano-dp-fake): a second display %ux%u@%u, %ux%u mm, primary %u, %s; RAM-backed, no hardware touched%s%s\n",
                fFake.width, fFake.height, fFake.hz, fFake.widthMm, fFake.heightMm, fFake.primary,
                fFake.atBoot ? "connected from its start" : "disconnected until its plug timer", *fFake.note ? "; " : "", fFake.note);
@@ -515,9 +598,11 @@ bool NativeGopDisplay::start(IOService *provider)
         GOPLOG("PianoDpu callouts:%s%s%s\n", fDpuPcc ? " colour matrices and gamma tables (piano-dpu-pcc)" : "",
               fDpuPanel ? " display power (piano-dpu-panel)" : "", fDpuSwaps ? " frames shown (piano-dpu-refresh=auto)" : "");
     }
+    if ((fCopyMode & kCopyFencedRefresh) && fRefreshPolicy == gopcompose::kRefreshAlways)
+        fRefreshPolicy = gopcompose::kRefreshUncovered;
     if (fCopyMode)
         GOPLOG("copy mode %#x:%s%s (native-gop-display-copy)\n", fCopyMode,
-              fCopyMode & kCopyFencedRefresh ? " refresh copies only when no GPU fence covered the swap (and the last one)" : "",
+              fCopyMode & kCopyFencedRefresh ? " refresh copies only when no GPU fence covered the frame (and the last one)" : "",
               fCopyMode & kCopyCachedRead ? " cached surface reads with DC CIVAC first" : "");
     unsigned flip = 0;
     PE_parse_boot_argn("native-gop-display-flip", &flip, sizeof(flip));
@@ -525,9 +610,20 @@ bool NativeGopDisplay::start(IOService *provider)
     if (fFlipMode) {
         fDpuFlipSymbol = OSSymbol::withCString(kPianoDpuFlipFunction);
         fFlipMode = fDpuFlipSymbol != nullptr;
+        fDefer = gopcompose::kDeferAlways;
         GOPLOG("flip mode (native-gop-display-flip): each swap's surface to PianoDpu's flip (piano-dpu=2 "
-              "piano-dpu-flip=4), copied when refused; a swap completes once on the panel\n");
+              "piano-dpu-flip=4), copied when refused or while a cursor is on the panel; a swap completes once on the panel\n");
     }
+    static const char *const deferNames[3] = {"at once (native-gop-display-defer=0)",
+                                              "at once unless the copy thread reads a surface it takes off the screen",
+                                              "once its frame or cursor is on the panel"};
+    static const char *const refreshNames[3] = {"none", "after frames no GPU fence covered (the last only after covered ones)",
+                                                "after every frame"};
+    GOPLOG("composition: layer 0 the frame, layer 1 the cursor %s; a swap completes %s; refresh copies %s; a frame is copied only "
+           "once the GPU retired its fence (hang guard %u ms)\n",
+           fCursorMode == 0 ? "not drawn (native-gop-display-cursor=0)" : fCursorMode == 2 ? "blended, its whole surface" :
+                                                                                            "blended (its glyph rectangle, premultiplied alpha)",
+           deferNames[fDefer], refreshNames[fRefreshPolicy], fGpuFenceWaitMs);
     if (fExternal) {
         if (!setupRamSurface()) {
             provider->setProperty("DisplayPortCount", 1ULL, 32);   // WindowServer then waits for the panel alone
@@ -592,7 +688,7 @@ bool NativeGopDisplay::start(IOService *provider)
         return false;
     }
     GOPLOG("started, display %ux%u at %u Hz, %ux%u mm, %s copies, thumbnail %s%u s (at most %u, 0: no limit)\n",
-          display_width(), display_height(), fRefreshHz, fWidthMM, fHeightMM, fRefreshCopies ? "with refresh" : "no refresh",
+          display_width(), display_height(), fRefreshHz, fWidthMM, fHeightMM, fRefreshPolicy ? "with refresh" : "no refresh",
           fThumbPeriod ? "every " : "off: ", fThumbPeriod, fThumbLimit);
     return true;
 }
@@ -603,23 +699,28 @@ void NativeGopDisplay::stop(IOService *provider)
     IOMobileFramebufferLegacy::stop(provider);
     stopCopies();
     releaseSurfaceMaps();
-    if (fHalfToByte)
-        IOFree(fHalfToByte, 16384);
+    if (fTables)
+        IOFree(fTables, sizeof(gopcompose::Tables));
     if (fRow)
         IOFree(fRow, fRowBytes);
     if (fLine)
         IOFree(fLine, fVideo.v_width * 4);
-    fHalfToByte = nullptr;
+    if (fOverlayRow)
+        IOFree(fOverlayRow, fVideo.v_width * 4);
+    fTables = nullptr;
     fRow = nullptr;
     fLine = nullptr;
+    fOverlayRow = nullptr;
     if (fThumbLuma)
         IOFree(fThumbLuma, kThumbCols * kThumbRows * sizeof(uint32_t));
     if (fThumbCount)
         IOFree(fThumbCount, kThumbCols * kThumbRows * sizeof(uint32_t));
     fThumbLuma = fThumbCount = nullptr;
-    if (fShown)
-        reinterpret_cast<OSObject *>(fShown)->release();
-    fShown = nullptr;
+    for (const void *&surface : fPipe.layers.surface) {   // the layers' references
+        if (surface)
+            reinterpret_cast<const OSObject *>(surface)->release();
+        surface = nullptr;
+    }
     OSSafeReleaseNULL(fScanoutMap);
     OSSafeReleaseNULL(fRamSurface);
     fScanout = nullptr;
@@ -628,7 +729,7 @@ void NativeGopDisplay::stop(IOService *provider)
     OSSafeReleaseNULL(fGpuFenceSymbol);
     OSSafeReleaseNULL(fDpu);
     OSSafeReleaseNULL(fDpuFlipSymbol);
-    OSSafeReleaseNULL(fFlipDone);
+    OSSafeReleaseNULL(fJobDone);
     OSSafeReleaseNULL(fDpuSlices);
     OSSafeReleaseNULL(fDpuSwapSymbol);
 }
@@ -646,13 +747,13 @@ bool NativeGopDisplay::start_hardware()
         OSSafeReleaseNULL(fVBL);
         return false;
     }
-    if (fFlipMode) {   // the flip completions, on the same work loop
-        fFlipDone = IOInterruptEventSource::interruptEventSource(this, flipDoneAction);
-        if (!fFlipDone || getWorkLoop()->addEventSource(fFlipDone) != kIOReturnSuccess) {
-            OSSafeReleaseNULL(fFlipDone);
-            fFlipMode = false;
-            GOPLOG("flip mode off: no work-loop source for the flip completions; copies\n");
-        }
+    // The completions of the swaps that wait for the copy thread, on the same work loop.
+    fJobDone = IOInterruptEventSource::interruptEventSource(this, jobDoneAction);
+    if (!fJobDone || getWorkLoop()->addEventSource(fJobDone) != kIOReturnSuccess) {
+        OSSafeReleaseNULL(fJobDone);
+        fFlipMode = false;
+        fDefer = gopcompose::kDeferNever;
+        GOPLOG("no work-loop source for the deferred completions: every swap completes at once, flip mode off\n");
     }
     if (fExternal) {   // D6: the plug schedule's timer, on the same work loop
         fPlugTimer = IOTimerEventSource::timerEventSource(this, plugFired);
@@ -694,8 +795,8 @@ IOReturn NativeGopDisplay::stop_hardware_gated()
         getWorkLoop()->removeEventSource(fVBL);
         OSSafeReleaseNULL(fVBL);
     }
-    if (fFlipDone)   // released in stop(), once the copy thread (which fires it) has ended
-        getWorkLoop()->removeEventSource(fFlipDone);
+    if (fJobDone)   // released in stop(), once the copy thread (which fires it) has ended
+        getWorkLoop()->removeEventSource(fJobDone);
     if (fPlugTimer) {   // released in stop()
         fPlugTimer->cancelTimeout();
         getWorkLoop()->removeEventSource(fPlugTimer);
@@ -796,19 +897,20 @@ IOReturn NativeGopDisplay::swap_begin_gated()
             fDropped++;
         }
     }
-    if (fFrames == frames && fShown && fRefreshLeft && fRefreshCopies) {
-        unsigned elapsed = kRefreshTicks - --fRefreshLeft;
-        if (!(elapsed & (elapsed - 1)) || !fRefreshLeft) {
-            if ((fCopyMode & kCopyFencedRefresh) && fRefreshLeft && __atomic_load_n(&fFenceCovered, __ATOMIC_ACQUIRE))
-                fRefreshSkipped++;   // the GPU had finished the frame before its copy read it; the last refresh still runs
-            else
-                requestCopy(fShown, true);
-        }
+    // The refresh countdown of the frame on screen (none while a swap waits for the copy thread; the copy thread skips the ones a
+    // fence-covered frame does not need, GopCompose.h refreshNeeded).
+    Job refresh;
+    if (fFrames == frames && fRefreshPolicy && fPipe.refreshJob(&refresh))
+        queueRefresh(refresh);
+    // A swap's job left undrawn (its GPU fence had not passed): the whole panel again from the current state, once the GPU is done.
+    if (__atomic_load_n(&fUnfinished, __ATOMIC_ACQUIRE) && fPipe.retryJob(true, &refresh)) {
+        fRetries++;
+        queueRefresh(refresh);
     }
-    // A thumbnail that is due while no new frame comes: one refresh copy of the surface on screen takes it.
-    if (fThumbPeriod && fThumbNext && fShown && !fThumbRequested && mach_absolute_time() >= fThumbNext) {
+    // A thumbnail that is due while no new frame comes: one refresh of the frame on screen takes it.
+    if (fThumbPeriod && fThumbNext && !fThumbRequested && mach_absolute_time() >= fThumbNext && fPipe.forcedRefreshJob(&refresh)) {
         fThumbRequested = true;
-        requestCopy(fShown, true);
+        queueRefresh(refresh);
     }
     if (at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))
         fStalled++;
@@ -826,8 +928,21 @@ IOReturn NativeGopDisplay::swap_begin_gated()
             GOPLOG("%llu copies skipped for newer ones\n", fCopiesSkipped);
         GOPLOG("at most %llu frames in a second\n", fPeakFps);
         if (fFlipMode)
-            GOPLOG("flip mode: %llu swaps flipped (no copy, no refresh copies), %llu copied (PianoDpu refused them or "
-                  "is not serving)\n", fFlips, fFlipCopies);
+            GOPLOG("flip mode: %llu swaps flipped (no copy, no refresh copies), %llu copied (PianoDpu refused them, is not serving, "
+                  "or a cursor was on the panel: %llu)\n", fFlips, fFlipCopies, fCursorForced);
+        if (fCursorJobs)
+            GOPLOG("cursor: %llu updates of its old and new rectangles, mean %llu us max %llu us, last at (%d, %d)\n", fCursorJobs,
+                  fCursorNs / fCursorJobs / 1000, fCursorMaxNs / 1000, fCursorX, fCursorY);
+        if (fDeferred)
+            GOPLOG("%llu swaps completed once the copy thread was done (native-gop-display-defer=%u), mean %llu us max %llu us after "
+                  "they were programmed\n", fDeferred, fDefer, fDeferNs / fDeferred / 1000, fDeferMaxNs / 1000);
+        if (fRefreshSkipped)
+            GOPLOG("%llu refresh copies not needed (their frame's fence wait saw the GPU done)\n", fRefreshSkipped);
+        if (fUnfinishedJobs || fRetries || fRefreshAborts)
+            GOPLOG("%llu jobs left undrawn (the GPU had not finished their frame within %u ms: the previous one stayed), %llu tick "
+                  "retries, %llu refresh copies cut short by a swap\n", fUnfinishedJobs, fGpuFenceWaitMs, fRetries, fRefreshAborts);
+        fUnfinishedJobs = fRetries = fRefreshAborts = 0;
+        fCursorJobs = fCursorNs = fCursorMaxNs = fDeferred = fDeferNs = fDeferMaxNs = 0;
         if (fFenceWaits)
             GOPLOG("%llu swaps from submit to programmed mean %llu us max %llu us\n", fFenceWaits,
                   fFenceWaitNs / fFenceWaits / 1000, fFenceWaitMaxNs / 1000);
@@ -835,15 +950,16 @@ IOReturn NativeGopDisplay::swap_begin_gated()
               fWakeLate, fWakeMaxNs / 1000000, fVBLLate, fVBLLateMaxNs / 1000000);
         if (fGpuWaits)
             GOPLOG("%llu copies waited for the GPU's fence, mean %llu us max %llu us, %llu gave up after %u ms\n", fGpuWaits,
-                  fGpuWaitNs / fGpuWaits / 1000, fGpuWaitMaxNs / 1000, fGpuTimeouts, kGpuFenceWaitMs);
+                  fGpuWaitNs / fGpuWaits / 1000, fGpuWaitMaxNs / 1000, fGpuTimeouts, fGpuFenceWaitMs);
         if (fCopyMode) {   // what the copy mode saved: refresh copies not made (at this period's mean copy time), the reads' cost
             const uint64_t mean = fCopies ? fCopyNs / fCopies : 0;
             GOPLOG("copy mode %#x: %llu refresh copies skipped (about %llu ms of copying saved, mean copy %llu us); "
                   "%llu cache invalidations mean %llu us%s\n", fCopyMode, fRefreshSkipped, fRefreshSkipped * mean / 1000000, mean / 1000,
                   fInvalidates, fInvalidates ? fInvalidateNs / fInvalidates / 1000 : 0,
                   fCachedMapRefused ? " (a cacheable mapping was refused: those surfaces read uncached)" : "");
-            fRefreshSkipped = fInvalidates = fInvalidateNs = 0;
+            fInvalidates = fInvalidateNs = 0;
         }
+        fRefreshSkipped = 0;
         fGpuWaits = fGpuWaitNs = fGpuWaitMaxNs = fGpuTimeouts = 0;
         fFenceWaits = fFenceWaitNs = fFenceWaitMaxNs = 0;
         fPeakFps = 0;
@@ -855,8 +971,9 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         fVBLDue = 0;
         return kIOReturnSuccess;
     }
-    // Flip mode: no tick while nothing needs one (a deferred swap completes from flipDoneAction, a submitted one calls this anyway).
-    if (fFlipMode && !fRefreshLeft && (fFlipSwap || !at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))) {
+    // Flip mode: no tick while nothing needs one (a deferred swap completes from jobDoneAction, a submitted one calls this anyway).
+    if (fFlipMode && !fPipe.refreshLeft && !__atomic_load_n(&fUnfinished, __ATOMIC_ACQUIRE) &&
+        (fWaitingSwap || !at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))) {
         fVBLDue = 0;
         return kIOReturnSuccess;
     }
@@ -868,8 +985,9 @@ IOReturn NativeGopDisplay::swap_begin_gated()
 
 // CoreAnimation asks swap_wait, without blocking, whether its last swaps are done before it composes the next frame. The family
 // answers kIOReturnBusy for the last completed swap as long as no later one replaces it (a display controller is still scanning it
-// out). Here the swap's surface was copied when it was programmed, so it is free: told it is busy, WindowServer updated at about 10
-// frames a second however little it drew (measured with the VM-era display kext).
+// out). Here the panel shows a copy, so it is done: told it is busy, WindowServer updated at about 10 frames a second however little
+// it drew (measured with the VM-era display kext). The surfaces themselves stay on their layers (the family hands one back only when a
+// later swap replaces it, and such a swap waits while the copy thread reads it: GopCompose.h admitSwap).
 IOReturn NativeGopDisplay::swap_wait(IOMobileFramebufferUserClient *client, unsigned int swapID, unsigned int options, unsigned int timeout)
 {
     IOReturn result = IOMobileFramebufferLegacy::swap_wait(client, swapID, options, timeout);
@@ -979,12 +1097,16 @@ void NativeGopDisplay::backlightCallout(bool on)
                                      reinterpret_cast<void *>(system), reinterpret_cast<void *>(api), nullptr);
 }
 
-// AppleParavirtDisplay::program_hardware_gated (its slot 473): show the swap, then complete it. There is no cursor plane (no
-// "CursorPlane" property), so WindowServer draws the cursor into the main surface. The screen is the largest surface of the swap.
+// AppleParavirtDisplay::program_hardware_gated (its slot 473): show the swap, then complete it. Every layer the swap hands over goes into
+// the composition (GopCompose.h, since 2026-11-12): layer 0 the frame at (0, 0), layer 1 WindowServer's cursor at its origin (it swaps
+// the cursor as a layer of its own, also alone: 'swap layers 0x2: 1: 128x128'), layers 2 and 3 only logged (no position is known for
+// them; none was seen with a surface). The swap completes at once, unless the copy thread is reading a surface it takes off the screen
+// (native-gop-display-defer=1) or, in flip mode, until its own job is done: then jobDoneAction completes it.
 void NativeGopDisplay::program_hardware_gated()
 {
     IOMFBSwapIORequest *swap = at<IOMFBSwapIORequest *>(this, kCurrentSwap);
-    uint64_t &submitted = fSubmitTime[at<uint32_t>(swap, kSwapID) % 16];
+    const uint32_t swapID = at<uint32_t>(swap, kSwapID);
+    uint64_t &submitted = fSubmitTime[swapID % 16];
     if (submitted) {
         uint64_t waited = 0;
         absolutetime_to_nanoseconds(mach_absolute_time() - submitted, &waited);
@@ -994,35 +1116,31 @@ void NativeGopDisplay::program_hardware_gated()
         if (waited > fFenceWaitMaxNs)
             fFenceWaitMaxNs = waited;
     }
-    uint8_t layers = at<uint8_t>(swap, kSwapLayers);
-    IOSurface *surface = nullptr;
-    uint64_t area = 0, shape = layers;
-    for (unsigned layer = 0; layer < kSwapLayerCount; layer++) {
-        IOSurface *candidate = (layers >> layer & 1) ? at<IOSurface *>(swap, kSwapMainSurface + 8 * layer) : nullptr;
-        if (!candidate)
-            continue;
-        uint64_t width = ioSurfaceWidth(candidate), height = ioSurfaceHeight(candidate);
-        shape = shape * 31 + width * 65537 + height;
-        if (width * height > area) {
-            area = width * height;
-            surface = candidate;
-        }
+    gopcompose::SwapLayers layers;
+    layers.mask = at<uint8_t>(swap, kSwapLayers) & ((1u << kSwapLayerCount) - 1);
+    for (unsigned layer = 0; layer < kSwapLayerCount; layer++)
+        layers.surface[layer] = (layers.mask >> layer & 1) ? at<IOSurface *>(swap, kSwapMainSurface + 8 * layer) : nullptr;
+    if (layers.mask & 2) {   // unaligned words
+        memcpy(&layers.x1, reinterpret_cast<const uint8_t *>(swap) + kSwapLayer1X, sizeof(layers.x1));
+        memcpy(&layers.y1, reinterpret_cast<const uint8_t *>(swap) + kSwapLayer1Y, sizeof(layers.y1));
     }
-    if (shape != fLayerShape) {   // each new combination of layers
-        fLayerShape = shape;
-        GOPLOG("swap layers %#x:", layers);
-        for (unsigned layer = 0; layer < kSwapLayerCount; layer++) {
-            IOSurface *candidate = (layers >> layer & 1) ? at<IOSurface *>(swap, kSwapMainSurface + 8 * layer) : nullptr;
-            if (candidate)
-                IOLog(" %u: %llux%llu %#x", layer, ioSurfaceWidth(candidate), ioSurfaceHeight(candidate), ioSurfacePixelFormat(candidate));
-        }
-        IOLog("\n");
+    noteLayers(layers, swapID);
+    if (!fCursorMode) {   // native-gop-display-cursor=0: layer 1 is neither drawn nor held
+        layers.mask &= ~2u;
+        layers.surface[1] = nullptr;
     }
-    if (surface && area * 4 >= static_cast<uint64_t>(fVideo.v_width) * fVideo.v_height) {   // a quarter of the screen at least
+    uint32_t fence = 0;
+    const bool fenced = gpuFence(&fence);
+    gopcompose::LayerChange change;
+    const Job job = fPipe.swapJob(layers, fenced, fence, fFlipMode, &change);
+    for (const void *taken : change.taken)   // the layers' own references
+        if (taken)
+            reinterpret_cast<const OSObject *>(taken)->retain();
+    if (change.base) {
         if (!fFrames++) {   // WindowServer's first frame: the verbose boot console stops drawing over the framebuffer
             if (!fExternal)
                 PE_initialize_console(nullptr, kPEDisableScreen);
-            GOPLOG("first frame (swap %u)%s\n", at<uint32_t>(swap, kSwapID),
+            GOPLOG("first frame (swap %u)%s\n", swapID,
                    fExternal ? ": WindowServer draws on the second display" : "; boot console released from the screen");
         }
         uint64_t now = mach_absolute_time(), second = 0;
@@ -1035,44 +1153,44 @@ void NativeGopDisplay::program_hardware_gated()
             fSecondFrames = 0;
         }
         fSecondFrames++;
-        uint32_t fence = 0;
-        const bool fenced = gpuFence(&fence);
-        requestCopy(surface, false, fenced, fence, fFlipMode);
         if (fDpuSwaps && fDpuSwapSymbol) {   // PianoDpu's refresh policy: a frame is shown
             IOService *dpu = dpuService(false);
             if (dpu)
                 dpu->callPlatformFunction(fDpuSwapSymbol, false, nullptr, nullptr, nullptr, nullptr);
         }
-        if (surface != fShown) {
-            reinterpret_cast<OSObject *>(surface)->retain();
-            if (fShown)
-                reinterpret_cast<OSObject *>(fShown)->release();
-            fShown = surface;
-        }
-        fRefreshLeft = fFlipMode ? 0 : kRefreshTicks;   // flip mode: set by flipDoneAction, once flipped or copied
-        if (fFlipMode) {
-            fFlipSwap = swap;   // completed by flipDoneAction
-            return;
-        }
+    }
+    // The job and the completion rule in one step under the lock: the copy thread cannot take a job that reads a surface this swap
+    // releases between the check and the offer (the offer merges such a job into this one, which reads only what stays on screen).
+    retainJob(job);
+    IOLockLock(fCopyLock);
+    const gopcompose::Admission admission = gopcompose::admitSwap(fSlot, fBusy, job, change, fDefer);
+    const bool wait = admission.waitSerial && fDoneSerial < admission.waitSerial;
+    if (wait)
+        fWaitSerial = admission.waitSerial;
+    if (wait && admission.abortBusy)   // the refresh in the way stops at its next row
+        __atomic_store_n(&fAbortSerial, fBusy.serial, __ATOMIC_RELEASE);
+    if (admission.hadJob) {
+        if (admission.offer == gopcompose::Offer::Taken)
+            fCopyRequestTime = mach_absolute_time();
+        IOLockWakeup(fCopyLock, &fSlot, true);
+    }
+    IOLockUnlock(fCopyLock);
+    if (admission.hadJob && admission.offer == gopcompose::Offer::Merged) {
+        if (!admission.displaced.refresh)
+            fCopiesSkipped++;   // a swap's job the copy thread had no time for: this newer state replaces it
+        releaseJob(admission.displaced);
+    }
+    for (const void *released : change.released)   // still held by any job that reads them
+        if (released)
+            reinterpret_cast<const OSObject *>(released)->release();
+    if (wait) {
+        fPipe.pending = true;
+        fPipe.waitSerial = admission.waitSerial;
+        fWaitingSwap = swap;
+        fDeferStart = mach_absolute_time();
+        return;
     }
     swap_complete_gated();
-}
-
-// Flip mode, the copy thread: the swap's surface to PianoDpu; refused, copied into the boot framebuffer (not on the panel while a
-// surface is) and the boot framebuffer then put back, so the copy never shows half done. Then the work loop completes the swap.
-void NativeGopDisplay::flipOrCopy(IOSurface *surface)
-{
-    PianoDpuFlipRequest request;
-    const bool flipped = dpuFlip(surface, &request);
-    if (flipped) {
-        fFlips++;
-    } else {
-        copySurface(surface, false);
-        dpuFlip(nullptr, &request);
-        fFlipCopies++;
-    }
-    __atomic_store_n(&fFlipShown, flipped, __ATOMIC_RELEASE);
-    fFlipDone->interruptOccurred(nullptr, nullptr, 0);
 }
 
 // PianoDpu's "PianoDpuFlip" (the copy thread only): surface on the panel, or with nullptr the boot framebuffer back. True once the
@@ -1117,36 +1235,228 @@ bool NativeGopDisplay::dpuFlip(IOSurface *surface, PianoDpuFlipRequest *request)
     return request->result == kPianoDpuFlipShown;
 }
 
-// Flip mode, on the work loop: the deferred swap is on the panel (flipped, or copied with the boot framebuffer back): complete it (the
-// surface it replaces is free only now), then take the next queued swap.
-void NativeGopDisplay::flipDoneAction(OSObject *owner, IOInterruptEventSource *, int)
+// On the work loop: the job a waiting swap needs is done (its read of the surfaces the swap takes off the screen is over; in flip mode
+// the swap's own frame is on the panel): complete the swap, then take the next queued one.
+void NativeGopDisplay::jobDoneAction(OSObject *owner, IOInterruptEventSource *, int)
 {
     auto *display = static_cast<NativeGopDisplay *>(owner);
-    IOMFBSwapIORequest *swap = display->fFlipSwap;
+    IOMFBSwapIORequest *swap = display->fWaitingSwap;
     if (!swap)
         return;
-    display->fFlipSwap = nullptr;
-    display->fRefreshLeft = __atomic_load_n(&display->fFlipShown, __ATOMIC_ACQUIRE) ? 0 : kRefreshTicks;
+    IOLockLock(display->fCopyLock);
+    const bool done = display->fDoneSerial >= display->fWaitSerial;
+    if (done)
+        display->fWaitSerial = 0;
+    IOLockUnlock(display->fCopyLock);
+    if (!done)
+        return;
+    display->fWaitingSwap = nullptr;
+    uint64_t waited = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - display->fDeferStart, &waited);
+    display->fDeferred++;
+    display->fDeferNs += waited;
+    if (waited > display->fDeferMaxNs)
+        display->fDeferMaxNs = waited;
+    display->fPipe.swapDone(__atomic_load_n(&display->fLastFlipped, __ATOMIC_ACQUIRE));
     if (at<IOMFBSwapIORequest *>(display, kCurrentSwap) == swap)
         display->swap_complete_gated();
     display->swap_begin_gated();
 }
 
-// 8-bit BGRA, 16-bit half-float RGBA ('RGhA': Core Animation's framebuffer on a virtual device, the ADT's vmm-present), and 'b3a8':
-// two planes, 10-bit extended-range BGR in 32 bits and 8-bit alpha, what WindowServer draws with a deep framebuffer (P3 gamut).
-static constexpr uint32_t kFormatBGRA = 'BGRA', kFormatRGhA = 'RGhA', kFormatB3A8 = 'b3a8';
-
-// A half float's value in [0, 1] as a byte, in integer arithmetic (no floating point in the kernel).
-static uint8_t halfToByte(uint16_t half)
+void NativeGopDisplay::retainJob(const Job &job)
 {
-    unsigned exponent = (half >> 10) & 31, mantissa = half & 1023;
-    if (half & 0x8000 || (exponent == 31 && mantissa))   // negative or NaN
-        return 0;
-    if (exponent >= 15)                                  // 1.0 and above
-        return 255;
-    uint32_t scaled = (exponent ? 1024 + mantissa : mantissa) * 255;   // value * 255 = scaled * 2^(exponent - 25), subnormals 2^-24
-    unsigned shift = exponent ? 25 - exponent : 24;
-    return static_cast<uint8_t>((scaled + (1u << (shift - 1))) >> shift);
+    if (job.base)
+        reinterpret_cast<const OSObject *>(job.base)->retain();
+    if (job.overlay)
+        reinterpret_cast<const OSObject *>(job.overlay)->retain();
+}
+
+void NativeGopDisplay::releaseJob(const Job &job)
+{
+    if (job.base)
+        reinterpret_cast<const OSObject *>(job.base)->release();
+    if (job.overlay)
+        reinterpret_cast<const OSObject *>(job.overlay)->release();
+}
+
+// A refresh job (the work loop): dropped when a swap's job waits (that one draws a newer state anyway).
+void NativeGopDisplay::queueRefresh(const Job &job)
+{
+    retainJob(job);
+    Job displaced;
+    IOLockLock(fCopyLock);
+    const gopcompose::Offer result = gopcompose::offer(fSlot, job, &displaced);
+    if (result == gopcompose::Offer::Taken)
+        fCopyRequestTime = mach_absolute_time();
+    if (result != gopcompose::Offer::Dropped)
+        IOLockWakeup(fCopyLock, &fSlot, true);
+    IOLockUnlock(fCopyLock);
+    if (result == gopcompose::Offer::Dropped)
+        releaseJob(job);
+    else if (result == gopcompose::Offer::Merged)
+        releaseJob(displaced);
+}
+
+static void fourcc(uint32_t format, char code[5])
+{
+    for (unsigned i = 0; i < 4; i++) {
+        const char c = static_cast<char>(format >> (24 - 8 * i));
+        code[i] = c >= 32 && c < 127 ? c : '?';
+    }
+    code[4] = 0;
+}
+
+// Each new combination of layers and each new kind of layer (its index, size and format, or off), once a boot (the first kLayerKinds).
+void NativeGopDisplay::noteLayers(const gopcompose::SwapLayers &swap, uint32_t swapID)
+{
+    if (!(fMasksSeen >> swap.mask & 1)) {
+        fMasksSeen |= 1u << swap.mask;
+        GOPLOG("swap layers %#x first seen (swap %u)\n", swap.mask, swapID);
+    }
+    for (unsigned layer = 0; layer < kSwapLayerCount; layer++) {
+        if (!(swap.mask >> layer & 1))
+            continue;
+        IOSurface *surface = static_cast<IOSurface *>(const_cast<void *>(swap.surface[layer]));
+        LayerKind kind = {layer, 0, 0, 0, !surface};
+        if (surface) {
+            kind.width = static_cast<uint32_t>(ioSurfaceWidth(surface));
+            kind.height = static_cast<uint32_t>(ioSurfaceHeight(surface));
+            kind.format = ioSurfacePixelFormat(surface);
+        }
+        bool seen = false;
+        for (unsigned i = 0; i < fKindCount && i < kLayerKinds && !seen; i++)
+            seen = fKinds[i].layer == kind.layer && fKinds[i].off == kind.off && fKinds[i].width == kind.width &&
+                   fKinds[i].height == kind.height && fKinds[i].format == kind.format;
+        if (seen)
+            continue;
+        if (fKindCount >= kLayerKinds) {
+            if (fKindCount++ == kLayerKinds)
+                GOPLOG("more than %u kinds of layers: the others are not logged\n", kLayerKinds);
+            continue;
+        }
+        fKinds[fKindCount++] = kind;
+        char code[5];
+        fourcc(kind.format, code);
+        if (kind.off)
+            GOPLOG("layer %u off (swap %u)%s\n", layer, swapID,
+                   layer == 0 ? ": no frame, the panel shows black (the cursor still drawn)" : layer == 1 ? ": the cursor hidden" : "");
+        else if (layer == 0)
+            GOPLOG("layer 0: %ux%u '%s' (swap %u): the frame, composed at (0, 0)\n", kind.width, kind.height, code, swapID);
+        else if (layer == 1)
+            GOPLOG("layer 1: %ux%u '%s' at (%d, %d) (swap %u): the cursor, %s\n", kind.width, kind.height, code, swap.x1, swap.y1, swapID,
+                   !fCursorMode ? "not drawn (native-gop-display-cursor=0)"
+                   : kind.format != gopcompose::kFormatBGRA ? "not drawn (only 'BGRA' is blended)"
+                                                            : "blended over the frame at that origin (premultiplied alpha)");
+        else
+            GOPLOG("layer %u: %ux%u '%s' (swap %u): not composed (no position is known for layers 2 and 3)\n", layer, kind.width,
+                   kind.height, code, swapID);
+    }
+}
+
+// Layer 1's geometry for a job (the copy thread): its glyph rectangle (IOSurface's origin and extents; the whole surface with
+// native-gop-display-cursor=2 or when the words are not consistent) with the surface's pixel (0, 0) at the layer's origin. False: not
+// drawn (none, the cursor off, not 'BGRA').
+bool NativeGopDisplay::overlayOf(IOSurface *surface, int32_t x, int32_t y, gopcompose::Overlay *o)
+{
+    *o = gopcompose::Overlay();
+    if (!surface || !fCursorMode)
+        return false;
+    const uint64_t width = ioSurfaceWidth(surface), height = ioSurfaceHeight(surface);
+    if (ioSurfacePixelFormat(surface) != gopcompose::kFormatBGRA || !width || !height || width > 16384 || height > 16384)
+        return false;
+    IOSurfaceOriginAndExtents extents = {};
+    if (fCursorMode == 1)
+        extents = ioSurfaceOriginAndExtents(surface);
+    o->visible = true;
+    o->x = x;
+    o->y = y;
+    o->glyph = gopcompose::glyphRect(uint32_t(width), uint32_t(height), fCursorMode == 1 ? extents.words : nullptr);
+    gopcompose::hotSpot(extents.words, &o->hotX, &o->hotY);
+    if ((width != fGlyphW || height != fGlyphH || !(o->glyph == fGlyphLogged)) && fCursorLogs < 8) {   // the first few shapes
+        fCursorLogs++;
+        fGlyphW = uint32_t(width);
+        fGlyphH = uint32_t(height);
+        fGlyphLogged = o->glyph;
+        GOPLOG("cursor: surface %llux%llu, glyph %d,%d %dx%d, hot spot (%d, %d) (origin-and-extents words %u %u %u %u %u %u); its "
+               "pixel (0, 0) at (%d, %d) on the panel\n", width, height, o->glyph.x, o->glyph.y, o->glyph.w, o->glyph.h, o->hotX, o->hotY,
+               extents.words[0], extents.words[1], extents.words[2], extents.words[3], extents.words[4], extents.words[5], x, y);
+    }
+    return true;
+}
+
+// One job on the copy thread, after its fence wait: whether it is drawn at all (GopCompose.h verdict: never a frame the GPU has not
+// finished), the plan of what the panel shows (planJob), then a flip, a composition, or both (a refused flip is composed and the boot
+// framebuffer put back).
+void NativeGopDisplay::runJob(const Job &job, bool retired, bool covered, bool *flipped)
+{
+    *flipped = false;
+    if (job.kind == Job::kFull && !job.refresh)
+        fFrameCovered = covered;
+    if (!job.refresh) {   // the newest swap job's fence: what the panel's state needs
+        fNeedFenced = job.fenced;
+        fNeedFence = job.fence;
+    }
+    const bool panelFinished = !fNeedFenced || (job.refresh ? gpuRetired(fNeedFence) : retired);
+    switch (gopcompose::verdict(job, retired, fRefreshPolicy, fFrameCovered, panelFinished)) {
+    case gopcompose::Verdict::NotNeeded:
+        fRefreshSkipped++;   // the GPU had finished the frame before its copy read it; the last refresh still runs
+        return;
+    case gopcompose::Verdict::Unfinished:   // the previous composition stays on the panel; the ticks retry (swap_begin_gated)
+        if (!job.refresh) {
+            fPanel.current = false;   // the next job composes the whole panel
+            fUnfinishedJobs++;
+            if (fPanel.flipped) {     // flip mode: the swap completes, so the surface the DPU scans must not stay on the panel
+                PianoDpuFlipRequest request;
+                dpuFlip(nullptr, &request);
+                fPanel.flipped = false;
+                fPanel.cursor = Rect();
+                GOPLOG("flip mode: the boot framebuffer (an older frame) is back until the GPU finishes the frame\n");
+            }
+            static unsigned undrawn;
+            if (++undrawn <= 8 || undrawn % 100 == 0)
+                GOPLOG("the GPU had not finished %s after %u ms (fence %u): not copied, the previous frame stays; retried at the next "
+                       "ticks (%u so far)\n", job.kind == Job::kFull ? "a frame" : "the frame under a cursor move", fGpuFenceWaitMs,
+                       job.fence, undrawn);
+        }
+        __atomic_store_n(&fUnfinished, true, __ATOMIC_RELEASE);
+        return;
+    case gopcompose::Verdict::Draw:
+        break;
+    }
+    IOSurface *base = static_cast<IOSurface *>(const_cast<void *>(job.base));
+    IOSurface *cursor = static_cast<IOSurface *>(const_cast<void *>(job.overlay));
+    gopcompose::Overlay o;
+    overlayOf(cursor, job.x1, job.y1, &o);
+    const uint32_t width = static_cast<uint32_t>(fVideo.v_width), height = static_cast<uint32_t>(fVideo.v_height);
+    const Rect onPanel = gopcompose::overlayOnPanel(o, width, height);
+    const gopcompose::Plan plan = gopcompose::planJob(fPanel, job, onPanel, gopcompose::panelRect(width, height));
+    PianoDpuFlipRequest request;
+    if (plan.tryFlip && dpuFlip(base, &request)) {
+        *flipped = true;
+        fFlips++;
+    }
+    if (!*flipped && plan.count && compose(plan, job, base, cursor, o, onPanel)) {   // a refresh a swap cut short
+        fRefreshAborts++;
+        gopcompose::abortedJob(fPanel, plan, onPanel);
+        return;
+    }
+    if (!*flipped && plan.count) {
+        if (plan.bootBack)   // the copy never shows half done: the boot framebuffer goes back on the panel only now
+            dpuFlip(nullptr, &request);
+        if (job.flip && plan.full) {
+            fFlipCopies++;
+            if (plan.cursorForced && !fCursorForced++)
+                GOPLOG("flip mode: a cursor is on the panel: frames are composed into the boot framebuffer (the DPU has no cursor "
+                       "pipe yet); flips resume once it hides\n");
+        }
+    }
+    if (!onPanel.empty()) {
+        fCursorX = o.x;
+        fCursorY = o.y;
+    }
+    if (*flipped || (plan.count && plan.full))   // the panel shows the whole current state again
+        __atomic_store_n(&fUnfinished, false, __ATOMIC_RELEASE);
+    gopcompose::commitJob(fPanel, plan, *flipped, onPanel);
 }
 
 // The newest fence the GPU handed out (the swap path only: it also looks PianoA830's service up, once a second until found).
@@ -1169,16 +1479,17 @@ bool NativeGopDisplay::gpuFence(uint32_t *fence)
             return false;
         __atomic_store_n(&fGpu, gpu, __ATOMIC_RELEASE);
         GOPLOG("GPU fences from %s: a swap's copy waits for the GPU work handed out before it (at most %u ms)\n",
-              gpu->getName(), kGpuFenceWaitMs);
+              gpu->getName(), fGpuFenceWaitMs);
     }
     uint32_t retired = 0;
     return fGpu->callPlatformFunction(fGpuFenceSymbol, false, fence, &retired, nullptr, nullptr) == kIOReturnSuccess;
 }
 
-// The copy thread: until the GPU retired fence (32-bit sequence numbers), bounded; a GPU that stops answering is not waited for.
-// True when the GPU retired it.
-bool NativeGopDisplay::waitGpuFence(uint32_t fence)
+// The copy thread: until the GPU retired fence (32-bit sequence numbers), at most fGpuFenceWaitMs (the hang guard). True when the GPU
+// retired it; *answered false when the GPU does not answer (no fence to go by: the job is drawn as without fences).
+bool NativeGopDisplay::waitGpuFence(uint32_t fence, bool *answered)
 {
+    *answered = false;
     IOService *gpu = __atomic_load_n(&fGpu, __ATOMIC_ACQUIRE);
     if (!gpu)
         return false;
@@ -1189,12 +1500,13 @@ bool NativeGopDisplay::waitGpuFence(uint32_t fence)
         uint32_t submitted = 0, retired = 0;
         if (gpu->callPlatformFunction(fGpuFenceSymbol, false, &submitted, &retired, nullptr, nullptr) != kIOReturnSuccess)
             break;
+        *answered = true;
         if (static_cast<int32_t>(retired - fence) >= 0) {
             retiredInTime = true;
             break;
         }
         absolutetime_to_nanoseconds(mach_absolute_time() - start, &waited);
-        if (waited >= kGpuFenceWaitMs * 1000000ull) {
+        if (waited >= fGpuFenceWaitMs * 1000000ull) {
             fGpuTimeouts++;
             break;
         }
@@ -1208,29 +1520,14 @@ bool NativeGopDisplay::waitGpuFence(uint32_t fence)
     return retiredInTime;
 }
 
-void NativeGopDisplay::requestCopy(IOSurface *surface, bool refresh, bool fenced, uint32_t fence, bool flip)
+// The copy thread, without waiting: whether the GPU retired fence (true when it does not answer).
+bool NativeGopDisplay::gpuRetired(uint32_t fence)
 {
-    reinterpret_cast<OSObject *>(surface)->retain();
-    IOLockLock(fCopyLock);
-    IOSurface *skipped = fCopyNext;
-    if (skipped && refresh && !fCopyRefresh) {   // a swap's surface waiting is newer than the one on screen
-        IOLockUnlock(fCopyLock);
-        reinterpret_cast<OSObject *>(surface)->release();
-        return;
-    }
-    fCopyNext = surface;
-    fCopyRefresh = refresh;
-    fCopyFenced = fenced;
-    fCopyFence = fence;
-    fCopyFlip = flip;
-    if (!skipped)
-        fCopyRequestTime = mach_absolute_time();
-    IOLockWakeup(fCopyLock, &fCopyNext, true);
-    IOLockUnlock(fCopyLock);
-    if (skipped) {
-        fCopiesSkipped++;
-        reinterpret_cast<OSObject *>(skipped)->release();
-    }
+    IOService *gpu = __atomic_load_n(&fGpu, __ATOMIC_ACQUIRE);
+    uint32_t submitted = 0, retired = 0;
+    if (!gpu || gpu->callPlatformFunction(fGpuFenceSymbol, false, &submitted, &retired, nullptr, nullptr) != kIOReturnSuccess)
+        return true;
+    return static_cast<int32_t>(retired - fence) >= 0;
 }
 
 void NativeGopDisplay::copyThreadMain(void *owner, wait_result_t)
@@ -1239,22 +1536,17 @@ void NativeGopDisplay::copyThreadMain(void *owner, wait_result_t)
     thread_terminate(current_thread());
 }
 
+// The copy thread: takes the waiting job (busy with it under the lock, so a swap that takes its surfaces off the screen waits), waits
+// for its GPU fence, draws it, and when a swap waits for it tells the work loop.
 void NativeGopDisplay::copyLoop()
 {
     IOLockLock(fCopyLock);
     while (!fCopyStop) {
-        IOSurface *surface = fCopyNext;
-        if (!surface) {
-            IOLockSleep(fCopyLock, &fCopyNext, THREAD_UNINT);
+        Job job;
+        if (!gopcompose::takeJob(fSlot, fBusy, &job)) {
+            IOLockSleep(fCopyLock, &fSlot, THREAD_UNINT);
             continue;
         }
-        bool refresh = fCopyRefresh;
-        const bool fenced = fCopyFenced;
-        const uint32_t fence = fCopyFence;
-        const bool flip = fCopyFlip;
-        fCopyNext = nullptr;
-        fCopyFenced = false;
-        fCopyFlip = false;
         uint64_t waited = 0;
         absolutetime_to_nanoseconds(mach_absolute_time() - fCopyRequestTime, &waited);
         IOLockUnlock(fCopyLock);
@@ -1263,14 +1555,20 @@ void NativeGopDisplay::copyLoop()
             if (waited > fWakeMaxNs)
                 fWakeMaxNs = waited;
         }
-        const bool covered = fenced && waitGpuFence(fence);
-        if (!refresh)   // a swap's copy: whether its refresh copies are needed (native-gop-display-copy bit 0)
-            __atomic_store_n(&fFenceCovered, covered, __ATOMIC_RELEASE);
-        if (flip)       // native-gop-display-flip: shown by the DPU, else copied
-            flipOrCopy(surface);
-        else
-            copySurface(surface, refresh);
-        reinterpret_cast<OSObject *>(surface)->release();
+        bool answered = false;   // a GPU that does not answer has no fence to go by: drawn as without fences
+        const bool retired = !job.fenced || waitGpuFence(job.fence, &answered) || !answered;
+        const bool covered = job.fenced && answered && retired;
+        bool flipped = false;
+        runJob(job, retired, covered, &flipped);
+        __atomic_store_n(&fLastFlipped, flipped, __ATOMIC_RELEASE);
+        IOLockLock(fCopyLock);
+        uint64_t done = 0;
+        const bool signal = gopcompose::finishJob(fBusy, &done, fWaitSerial);
+        fDoneSerial = done;
+        IOLockUnlock(fCopyLock);
+        releaseJob(job);
+        if (signal && fJobDone)
+            fJobDone->interruptOccurred(nullptr, nullptr, 0);
         IOLockLock(fCopyLock);
     }
     fCopyThreadDone = true;
@@ -1278,7 +1576,7 @@ void NativeGopDisplay::copyLoop()
     IOLockUnlock(fCopyLock);
 }
 
-// The kernel address of a surface's memory, mapped once for the next copies. *cached: the mapping is cacheable (copy mode bit 1).
+// The kernel address of a surface's memory, mapped once for the next jobs. *cached: the mapping is cacheable (copy mode bit 1).
 const uint8_t *NativeGopDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescriptor *memory, bool *cached)
 {
     SurfaceMap *slot = &fSurfaceMaps[0];
@@ -1297,7 +1595,7 @@ const uint8_t *NativeGopDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescri
         *slot = {};
     }
     IOMemoryMap *map = nullptr;
-    if (fCopyMode & kCopyCachedRead) {   // native-gop-display-copy bit 1: cacheable, invalidated before each read (copySurface)
+    if (fCopyMode & kCopyCachedRead) {   // native-gop-display-copy bit 1: cacheable, invalidated before each read (compose)
         map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly | kIOMapCopybackCache);
         if (!map && !fCachedMapRefused) {
             fCachedMapRefused = true;
@@ -1318,8 +1616,9 @@ const uint8_t *NativeGopDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescri
 // Copy mode bit 1: before a cacheable read of memory others write (the GPU through the SMMU, not snooping the CPU's caches), every
 // cache line of the range is cleaned and invalidated to the point of coherency by VA (DC CIVAC: a read-permission operation, so a
 // read-only mapping takes it; this kernel is not built IO-coherent, so IOKit's incoherent-IO flush would be a set/way flush of the
-// whole cache above its bulk size). Lines this alias never dirtied are only dropped; the next loads fetch what memory holds.
-static void invalidateForRead(const uint8_t *start, uint64_t length)
+// whole cache above its bulk size). Lines this alias never dirtied are only dropped; the next loads fetch what memory holds. It runs
+// after the job's fence wait, over exactly the rows (or row spans) the job reads; one barrier after the last range.
+static void invalidateForRead(const uint8_t *start, uint64_t length, bool barrier = true)
 {
     uint64_t ctr;
     __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
@@ -1327,7 +1626,27 @@ static void invalidateForRead(const uint8_t *start, uint64_t length)
     const uintptr_t end = reinterpret_cast<uintptr_t>(start) + length;
     for (uintptr_t p = reinterpret_cast<uintptr_t>(start) & ~(line - 1); p < end; p += line)
         __asm__ volatile("dc civac, %0" ::"r"(p) : "memory");
-    __asm__ volatile("dsb sy" ::: "memory");
+    if (barrier)
+        __asm__ volatile("dsb sy" ::: "memory");
+}
+
+// The rows [y0, y1) and columns [x0, x1) of a source (its own coordinates, clipped to it) that a composition reads.
+static void invalidateRows(const gopcompose::RowSource &source, int64_t x0, int64_t x1, int64_t y0, int64_t y1)
+{
+    x0 = gopcompose::max64(x0, 0);
+    y0 = gopcompose::max64(y0, 0);
+    x1 = gopcompose::min64(x1, source.width);
+    y1 = gopcompose::min64(y1, source.height);
+    if (x1 <= x0 || y1 <= y0)
+        return;
+    const unsigned pixelBytes = gopcompose::bytesPerPixel(source.format);
+    if (x0 == 0 && uint64_t(x1) == source.width) {   // whole rows: one range
+        invalidateForRead(source.bytes + uint64_t(y0) * source.rowBytes,
+                          uint64_t(y1 - y0 - 1) * source.rowBytes + uint64_t(x1) * pixelBytes, false);
+        return;
+    }
+    for (int64_t y = y0; y < y1; y++)
+        invalidateForRead(source.bytes + uint64_t(y) * source.rowBytes + uint64_t(x0) * pixelBytes, uint64_t(x1 - x0) * pixelBytes, false);
 }
 
 void NativeGopDisplay::stopCopies()
@@ -1336,14 +1655,15 @@ void NativeGopDisplay::stopCopies()
         return;
     IOLockLock(fCopyLock);
     fCopyStop = true;
-    IOLockWakeup(fCopyLock, &fCopyNext, true);
+    IOLockWakeup(fCopyLock, &fSlot, true);
     while (!fCopyThreadDone)
         IOLockSleep(fCopyLock, &fCopyThreadDone, THREAD_UNINT);
-    IOSurface *left = fCopyNext;
-    fCopyNext = nullptr;
+    const bool left = fSlot.busy;
+    const Job job = fSlot.job;
+    fSlot = gopcompose::Slot();
     IOLockUnlock(fCopyLock);
     if (left)
-        reinterpret_cast<OSObject *>(left)->release();
+        releaseJob(job);
     IOLockFree(fCopyLock);
     fCopyLock = nullptr;
 }
@@ -1359,61 +1679,98 @@ void NativeGopDisplay::releaseSurfaceMaps()
     }
 }
 
-void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
+// The row buffers (the panel's width) and the conversion tables, once.
+bool NativeGopDisplay::ensureBuffers()
 {
-    uint64_t width = ioSurfaceWidth(surface), height = ioSurfaceHeight(surface), rowBytes = ioSurfaceBytesPerRow(surface);
-    uint64_t base = ioSurfaceBaseOffset(surface);
-    uint32_t format = ioSurfacePixelFormat(surface);
+    if (fLine)
+        return true;
+    fRowBytes = fVideo.v_width * 8;
+    fRow = static_cast<uint8_t *>(IOMalloc(fRowBytes));
+    fOverlayRow = static_cast<uint32_t *>(IOMalloc(fVideo.v_width * 4));
+    fTables = static_cast<gopcompose::Tables *>(IOMalloc(sizeof(gopcompose::Tables)));
+    uint32_t *line = static_cast<uint32_t *>(IOMalloc(fVideo.v_width * 4));
+    if (!fRow || !fOverlayRow || !fTables || !line) {
+        if (fRow)
+            IOFree(fRow, fRowBytes);
+        if (fOverlayRow)
+            IOFree(fOverlayRow, fVideo.v_width * 4);
+        if (fTables)
+            IOFree(fTables, sizeof(gopcompose::Tables));
+        if (line)
+            IOFree(line, fVideo.v_width * 4);
+        fRow = nullptr;
+        fOverlayRow = nullptr;
+        fTables = nullptr;
+        GOPLOG("no memory for the row buffers\n");
+        return false;
+    }
+    fTables->init();
+    fLine = line;
+    return true;
+}
+
+// A surface opened for one job: mapped (kept for the next jobs), prepared, its rows checked against its memory. base: layer 0 ('BGRA',
+// 'RGhA', or 'b3a8''s colour plane), else layer 1 ('BGRA').
+bool NativeGopDisplay::openSource(IOSurface *surface, gopcompose::RowSource *source, Mapped *mapped, bool base)
+{
+    const uint64_t width = ioSurfaceWidth(surface), height = ioSurfaceHeight(surface);
+    uint64_t rowBytes = ioSurfaceBytesPerRow(surface), offset = ioSurfaceBaseOffset(surface);
+    const uint32_t format = ioSurfacePixelFormat(surface);
     IOMemoryDescriptor *memory = ioSurfaceMemory(surface);
-    const bool first = !fCopies && !refresh && fSurfaceFormat == 0;
-    if (format != fSurfaceFormat) {
-        GOPLOG("surface %llux%llu row %llu offset %llu format %#x memory %p\n", width, height, rowBytes, base, format, memory);
+    if (base && format != fSurfaceFormat) {
+        GOPLOG("surface %llux%llu row %llu offset %llu format %#x memory %p\n", width, height, rowBytes, offset, format, memory);
         for (uint32_t plane = 0, planes = ioSurfacePlaneCount(surface); plane < planes; plane++)
             GOPLOG(" plane %u: %llux%llu offset %llu row %llu element %llu\n", plane, ioSurfacePlaneWidth(surface, plane),
                   ioSurfacePlaneHeight(surface, plane), ioSurfacePlaneOffset(surface, plane), ioSurfacePlaneBytesPerRow(surface, plane),
                   ioSurfacePlaneBytesPerElement(surface, plane));
         fSurfaceFormat = format;
     }
-    if (format == kFormatB3A8) {   // the colour plane; alpha is not shown
-        if (ioSurfacePlaneCount(surface) < 1 || ioSurfacePlaneBytesPerElement(surface, 0) != 4)
-            return;
-        base = ioSurfacePlaneOffset(surface, 0);
-        rowBytes = ioSurfacePlaneBytesPerRow(surface, 0);
+    bool usable = base ? gopcompose::baseFormat(format) : format == gopcompose::kFormatBGRA;
+    if (usable && format == gopcompose::kFormatB3A8) {   // the colour plane; alpha is not shown
+        usable = ioSurfacePlaneCount(surface) >= 1 && ioSurfacePlaneBytesPerElement(surface, 0) == 4;
+        if (usable) {
+            offset = ioSurfacePlaneOffset(surface, 0);
+            rowBytes = ioSurfacePlaneBytesPerRow(surface, 0);
+        }
     }
-    uint64_t pixelBytes = format == kFormatRGhA ? 8 : 4;
-    if (!memory || !fScanout || rowBytes < width * pixelBytes || (format != kFormatBGRA && format != kFormatRGhA && format != kFormatB3A8)) {
+    const uint64_t pixelBytes = gopcompose::bytesPerPixel(format);
+    if (!memory || !usable || !width || !height || width > 16384 || height > 16384 || rowBytes < width * pixelBytes ||
+        offset + (height - 1) * rowBytes + width * pixelBytes > memory->getLength()) {
         static unsigned refused;
         if (refused++ < 8)
-            GOPLOG("surface format %#x (row %llu for %llu pixels) is not copied\n", format, rowBytes, width);
-        return;
+            GOPLOG("%s surface %llux%llu format %#x row %llu offset %llu (memory %llu bytes) is not read\n", base ? "a frame" : "a cursor",
+                  width, height, format, rowBytes, offset, memory ? static_cast<uint64_t>(memory->getLength()) : 0ull);
+        return false;
     }
-    uint64_t copyWidth = width < fVideo.v_width ? width : fVideo.v_width;
-    uint64_t copyHeight = height < fVideo.v_height ? height : fVideo.v_height;
-    if (!fLine) {
-        fRowBytes = fVideo.v_width * 8;
-        fRow = static_cast<uint16_t *>(IOMalloc(fRowBytes));
-        fLine = static_cast<uint32_t *>(IOMalloc(fVideo.v_width * 4));
-        fHalfToByte = static_cast<uint8_t *>(IOMalloc(16384));
-        if (!fRow || !fLine || !fHalfToByte) {
-            if (fRow)
-                IOFree(fRow, fRowBytes);
-            if (fLine)
-                IOFree(fLine, fVideo.v_width * 4);
-            if (fHalfToByte)
-                IOFree(fHalfToByte, 16384);
-            fRow = nullptr;
-            fLine = nullptr;
-            fHalfToByte = nullptr;
-            GOPLOG("no memory for the row buffers\n");
-            return;
-        }
-        // Indexed by the half float >> 2 (16 KiB): 8 bits of mantissa left, finer than a byte's step anywhere in [0, 1].
-        for (uint32_t index = 0; index < 16384; index++)
-            fHalfToByte[index] = halfToByte(static_cast<uint16_t>(index << 2 | 2));
-        for (uint32_t value = 0; value < 1024; value++)   // extended range: 384 is 0.0, 894 is 1.0
-            fXr10ToByte[value] = value <= 384 ? 0 : value >= 894 ? 255 : static_cast<uint8_t>((value - 384) * 255 / 510);
+    if (memory->prepare() != kIOReturnSuccess)
+        return false;
+    bool cached = false;
+    const uint8_t *bytes = surfaceBytes(surface, memory, &cached);
+    if (!bytes) {
+        memory->complete();
+        GOPLOG("cannot map a %llux%llu surface\n", width, height);
+        return false;
     }
-    uint64_t began = mach_absolute_time(), mark = began, now;
+    *source = {bytes + offset, rowBytes, static_cast<uint32_t>(width), static_cast<uint32_t>(height), format};
+    *mapped = {memory, cached};
+    return true;
+}
+
+// A plan's rectangles into the boot framebuffer (the copy thread): per row, layer 0's part read in one run and converted (black where
+// it has no pixel), layer 1's glyph blended over it, the row written at once (the framebuffer is write-combined). A plan for the whole
+// panel is a frame: its time, statistics and thumbnail are the periodic line's; a cursor plan redraws the cursor's old and new
+// rectangles only (the cursor line's time). A refresh stops at the next row when a swap asks (fAbortSerial): true then.
+bool NativeGopDisplay::compose(const gopcompose::Plan &plan, const Job &job, IOSurface *base, IOSurface *cursor,
+                               const gopcompose::Overlay &o, const Rect &onPanel)
+{
+    if (!fScanout || !plan.count || !ensureBuffers())
+        return false;
+    const bool full = plan.full, refresh = job.refresh;
+    uint64_t partialLaps = 0;
+    uint64_t &prepareNs = full ? fPrepareNs : partialLaps, &readNs = full ? fReadNs : partialLaps;
+    uint64_t &convertNs = full ? fConvertNs : partialLaps, &writeNs = full ? fWriteNs : partialLaps;
+    const uint64_t began = mach_absolute_time();
+    uint64_t mark = began, now;
     auto lap = [&](uint64_t &total) {
         now = mach_absolute_time();
         uint64_t ns;
@@ -1421,27 +1778,31 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
         total += ns;
         mark = now;
     };
-    if (memory->prepare() != kIOReturnSuccess)
-        return;
-    bool cached = false;
-    const uint8_t *bytes = surfaceBytes(surface, memory, &cached);
-    lap(fPrepareNs);
-    if (!bytes) {
-        memory->complete();
-        GOPLOG("cannot map a %llux%llu surface\n", width, height);
-        return;
-    }
-    if (cached) {   // native-gop-display-copy bit 1: the rows about to be read, from memory rather than stale cache lines
-        invalidateForRead(bytes + base, (copyHeight - 1) * rowBytes + copyWidth * pixelBytes);
+    const bool first = full && !refresh && base && !fCopies && fSurfaceFormat == 0;
+    gopcompose::RowSource baseRows, cursorRows;
+    Mapped baseMap = {}, cursorMap = {};
+    const bool haveBase = base && openSource(base, &baseRows, &baseMap, true);
+    const bool haveCursor = cursor && o.visible && !onPanel.empty() && openSource(cursor, &cursorRows, &cursorMap, false);
+    lap(prepareNs);
+    if (baseMap.cached || cursorMap.cached) {   // native-gop-display-copy bit 1: the rows about to be read, from memory
+        for (unsigned i = 0; i < plan.count; i++) {
+            const Rect &r = plan.rect[i];
+            if (haveBase && baseMap.cached)
+                invalidateRows(baseRows, r.x, r.right(), r.y, r.bottom());
+            const Rect c = gopcompose::intersect(r, onPanel);
+            if (haveCursor && cursorMap.cached && !c.empty())
+                invalidateRows(cursorRows, int64_t(c.x) - o.x, c.right() - o.x, int64_t(c.y) - o.y, c.bottom() - o.y);
+        }
+        __asm__ volatile("dsb sy" ::: "memory");
         lap(fInvalidateNs);
         fInvalidates++;
     }
     // Each new frame's statistics, and the thumbnail when one is due: the first new frame, then once every fThumbPeriod s, on a new
-    // frame or on the refresh copy swap_begin_gated asked for. Both come from every kSampleStep-th pixel of every kSampleStep-th row of
-    // the rows as written to the panel (after conversion), so they describe what the panel shows, in any source format. The sampling
-    // time is counted as conversion.
+    // frame or on the refresh swap_begin_gated asked for. Both come from every kSampleStep-th pixel of every kSampleStep-th row as
+    // written to the panel (after conversion and the cursor), so they describe what the panel shows. The sampling time is counted as
+    // conversion.
     FrameStats stats = {};
-    bool thumb = fThumbPeriod && (fThumbNext ? mach_absolute_time() >= fThumbNext : !refresh);
+    bool thumb = full && fThumbPeriod && (fThumbNext ? mach_absolute_time() >= fThumbNext : !refresh);
     if (thumb && !fThumbLuma) {
         fThumbLuma = static_cast<uint32_t *>(IOMalloc(kThumbCols * kThumbRows * sizeof(uint32_t)));
         fThumbCount = static_cast<uint32_t *>(IOMalloc(kThumbCols * kThumbRows * sizeof(uint32_t)));
@@ -1460,61 +1821,55 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
         bzero(fThumbLuma, kThumbCols * kThumbRows * sizeof(uint32_t));
         bzero(fThumbCount, kThumbCols * kThumbRows * sizeof(uint32_t));
     }
-    const bool sample = !refresh || thumb;
-    for (uint64_t y = 0; y < copyHeight; y++) {
-        uint8_t *line = fScanout + y * fVideo.v_rowBytes;
-        const uint8_t *source = bytes + base + y * rowBytes;
-        const bool sampled = sample && y % kSampleStep == 0;
-        if (format == kFormatBGRA) {
-            memcpy(fLine, source, copyWidth * 4);
-            lap(fReadNs);
-            if (sampled) {
-                sampleRow(fLine, nullptr, 4, y, copyWidth, copyHeight, stats, thumb);
-                lap(fConvertNs);
+    const bool sample = full && (!refresh || thumb);
+    const uint64_t width = fVideo.v_width, height = fVideo.v_height;
+    const bool halfFloat = haveBase && baseRows.format == gopcompose::kFormatRGhA;
+    bool aborted = false;
+    for (unsigned i = 0; i < plan.count && !aborted; i++) {
+        const Rect &r = plan.rect[i];
+        const int32_t x0 = r.x, x1 = static_cast<int32_t>(r.right());
+        for (int32_t y = r.y; y < r.bottom(); y++) {
+            if (refresh && __atomic_load_n(&fAbortSerial, __ATOMIC_ACQUIRE) == job.serial) {
+                aborted = true;
+                break;
             }
-            memcpy(line, fLine, copyWidth * 4);
-            lap(fWriteNs);
-            continue;
+            const uint32_t count = gopcompose::readBaseSpan(fLine, fRow, y, x0, x1, haveBase ? &baseRows : nullptr);
+            lap(readNs);
+            gopcompose::convertBaseSpan(fLine, fRow, x0, x1, count, haveBase ? &baseRows : nullptr, *fTables);
+            if (haveCursor)
+                gopcompose::blendOverlayRow(fLine, fOverlayRow, y, x0, x1, &cursorRows, o, onPanel);
+            if (sample && y % kSampleStep == 0)
+                sampleRow(fLine, halfFloat ? fRow : nullptr, halfFloat ? 8 : 4, static_cast<uint64_t>(y), width, height, stats, thumb);
+            lap(convertNs);
+            memcpy(fScanout + static_cast<uint64_t>(y) * fVideo.v_rowBytes + static_cast<uint64_t>(x0) * 4, fLine + x0,
+                   static_cast<size_t>(x1 - x0) * 4);
+            lap(writeNs);
         }
-        if (format == kFormatB3A8) {   // blue in the low bits, as BGR10A2
-            memcpy(fLine, source, copyWidth * 4);
-            lap(fReadNs);
-            for (uint64_t x = 0; x < copyWidth; x++) {
-                uint32_t bgr = fLine[x];
-                fLine[x] = 0xff000000u | fXr10ToByte[bgr >> 20 & 1023] << 16 | fXr10ToByte[bgr >> 10 & 1023] << 8 | fXr10ToByte[bgr & 1023];
-            }
-            if (sampled)   // converted in place: the nonzero count is of the converted pixels
-                sampleRow(fLine, nullptr, 4, y, copyWidth, copyHeight, stats, thumb);
-            lap(fConvertNs);
-            memcpy(line, fLine, copyWidth * 4);
-            lap(fWriteNs);
-            continue;
-        }
-        memcpy(fRow, source, copyWidth * 8);
-        lap(fReadNs);
-        const uint64_t *pixels = reinterpret_cast<const uint64_t *>(fRow);
-        for (uint64_t x = 0; x < copyWidth; x++) {
-            uint64_t rgba = pixels[x];
-            fLine[x] = 0xff000000u | fHalfToByte[rgba >> 2 & 0x3fff] << 16 | fHalfToByte[rgba >> 18 & 0x3fff] << 8 |
-                       fHalfToByte[rgba >> 34 & 0x3fff];
-        }
-        if (sampled)
-            sampleRow(fLine, reinterpret_cast<const uint8_t *>(fRow), 8, y, copyWidth, copyHeight, stats, thumb);
-        lap(fConvertNs);
-        memcpy(line, fLine, copyWidth * 4);
-        lap(fWriteNs);
     }
-    memory->complete();
+    if (haveBase)
+        baseMap.memory->complete();
+    if (haveCursor)
+        cursorMap.memory->complete();
+    if (aborted)   // no statistics, no thumbnail (it is taken again)
+        return true;
     uint64_t ns;
     absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+    if (!full) {
+        fCursorJobs++;
+        fCursorNs += ns;
+        if (ns > fCursorMaxNs)
+            fCursorMaxNs = ns;
+        return false;
+    }
     fCopies++;
     fCopyNs += ns;
     if (ns > fCopyMaxNs)
         fCopyMaxNs = ns;
-    if (first)
-        GOPLOG("first copy %llux%llu format %#x into the framebuffer in %llu us\n", copyWidth, copyHeight, format, ns / 1000);
+    const uint32_t format = haveBase ? baseRows.format : 0;
+    if (first && haveBase)
+        GOPLOG("first copy %llux%llu format %#x into the framebuffer in %llu us\n", width, height, format, ns / 1000);
     if (thumb) {
-        logThumbnail(stats, copyWidth, copyHeight, format, refresh);
+        logThumbnail(stats, width, height, format, refresh);
         uint64_t period;
         nanoseconds_to_absolutetime(static_cast<uint64_t>(fThumbPeriod) * 1000000000ULL, &period);
         fThumbNext = mach_absolute_time() + period;
@@ -1525,14 +1880,15 @@ void NativeGopDisplay::copySurface(IOSurface *surface, bool refresh)
         }
     }
     if (refresh)
-        return;
+        return false;
     const uint64_t samples = stats.samples ? stats.samples : 1;
     fLastLitPerMille = stats.lit * 1000 / samples;
     fLastMean = (stats.red / samples) << 16 | (stats.green / samples) << 8 | stats.blue / samples;
     fLastCenter = stats.centre;
-    if (format != kFormatBGRA && (fFrames <= 8 || fFrames % 50 == 0))
+    if (haveBase && format != gopcompose::kFormatBGRA && (fFrames <= 8 || fFrames % 50 == 0))
         GOPLOG("frame %llu: %llu of %llu sampled pixels non-black, %llu nonzero in the source, centre #%06x\n", fFrames,
               stats.lit, stats.samples, stats.raw, stats.centre);
+    return false;
 }
 
 // One sampled row (every kSampleStep-th pixel of LINE, 0xAARRGGBB as written to the panel) into STATS, and into the thumbnail's cells.
@@ -1567,7 +1923,7 @@ void NativeGopDisplay::sampleRow(const uint32_t *line, const uint8_t *source, un
 }
 
 // The thumbnail: a header with what the frame is, then kThumbRows lines of kThumbCols characters, each cell's mean luma (0..255) as
-// one of " .:-=+*#%@" (dark to bright). The panel's cursor is not in it: only the main layer is copied.
+// one of " .:-=+*#%@" (dark to bright), as composed: the cursor is in it (since 2026-11-12).
 void NativeGopDisplay::logThumbnail(const FrameStats &stats, uint64_t width, uint64_t height, uint32_t format, bool refresh)
 {
     static const char kRamp[] = " .:-=+*#%@";
