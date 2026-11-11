@@ -1,7 +1,9 @@
 # Display: GOP adoption first, then DPU address-only flips
 
 Status: design, 2026-11-10. Nothing built or run. Template: `README.md`. The GOP step (1. below) is built for the k27
-collection as `NativeGopDisplay`: [native-gop-display.md](native-gop-display.md) (2026-11-11, not run).
+collection as `NativeGopDisplay`: [native-gop-display.md](native-gop-display.md) (2026-11-11, not run). The DPU half (the `dpu=2`
+readout, direct flips, the SMMU window, refresh, colour, panel sleep) is now [dpu.md](dpu.md) (2026-11-11), with SM8750's v12
+register layout, piano's facts and `PianoDpu`; where this page and dpu.md differ, dpu.md is current.
 
 ## 1. Purpose and gate
 

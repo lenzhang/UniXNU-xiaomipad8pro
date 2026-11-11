@@ -206,7 +206,8 @@ Failure lines: `IOMobileFramebufferLegacy::start failed`, `createDisplayAttribut
      39 ms); it would only save the 1.4 ms write. Not done.
    - *Zero-copy scanout* (the DPU's source address at the swap's surface, `display.md` §4 "Direct flip"): needs the DPU pipe
      readout (M2b, not run), the display SMMU stream's context under Gunyah (unknown) and page tables for surfaces that are not
-     physically contiguous. The facts are not solid: not done.
+     physically contiguous. The facts are not solid: not done. Design and the read-only survey that settles the facts (B1a,
+     `piano-dpu=1`): [dpu.md](dpu.md) §4.2.
    - *What is done, opt-in (`native-gop-display-copy`):* bit 0 drops the refresh copies a GPU fence already covers (the fence
      wait guarantees the GPU finished the frame before the copy read it; the last refresh, tick 30, stays as a safety net):
      up to five of the seven copies per swap. Bit 1 reads through a cacheable mapping after a by-VA clean+invalidate (DC CIVAC)
