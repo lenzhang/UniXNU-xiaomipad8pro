@@ -5,7 +5,7 @@ contract (`package/include/PianoAdspContract.h`, `charging.md` §9): level 1 a r
 serving the owner's sensor pack from the ESP, level 3 the SNS client's sensor list. Host-tested (`tests/run-host-tests.py`: ASan/UBSan,
 synthetic inputs only, a simulated DSP and hub, the pack on an mtools FAT32 image, the kernel's no-FP/no-libc compile), compiled with the
 kernel's flags and **linked into the KC** (`configs/k27-native-kexts.txt`, after PianoPower and NativeUfs; the 2026-11-11 link with main's list:
-PianoSensors 384 pointers), inert without `piano-sensors`. **Not run on hardware.** Template: `README.md`. The macOS-side consumers (the rotation agent `piano-rotated`, PianoTouch's transform, PianoBacklight's
+PianoSensors 433 pointers among 20 native kexts), inert without `piano-sensors`. **Not run on hardware.** Template: `README.md`. The macOS-side consumers (the rotation agent `piano-rotated`, PianoTouch's transform, PianoBacklight's
 automatic mode, the streams' off/on lifecycle) are `package/PianoAuto`, host-tested (§5a).
 
 ## 1. Purpose and gate
@@ -98,24 +98,45 @@ PianoSensors : IOService on IOPlatformExpertDevice (not HID: no macOS consumer r
   '-- proximity, gyro, mag: discovered and listed, never streamed
 ```
 
-**The files.** One pack (`SensorsPack.h`) built on the host by `tools/make-sensor-pack.py` from archives of this tablet's own trees
-(vendor and odm sensor directories, persist's `sensors/` mounted `ro,noload`, the allowlisted soc0 values), kept under the ignored
-`out/` or `private/` and put on the ESP (partition 37, FAT32, 4096-byte sectors) as `EFI/UniXNU/piano-sensors.pack` by
+**The files.** One pack (`SensorsPack.h`) built on the host by `tools/make-sensor-pack.py` from this tablet's own registry backup and
+the stock ROM's sensor configuration (section 5b), kept under the ignored `out/` or `private/` and put on the ESP (partition 37, FAT32, 4096-byte sectors) as `EFI/UniXNU/piano-sensors.pack` by
 `build-esp.py --sensor-pack` (section 5b), never into a published image. The kext (`SensorsLoad.c`) finds partition `esp` through
 NativeUfs's `native_ufs_part_find`/`native_ufs_part_read`, reads it with its copy of PianoPower's `FatVolume` (as PianoPower's firmware
 and PianoWifi do) and **loads the pack whole into memory and checks it before the attach** (a few hundred KiB; refused above 4 MiB), so
 no DSP file call ever waits for UFS. Level 2 does not start without a valid pack (`piano-sensors-nopack=1` serves an empty one: every
-open fails and is logged, the way a first run learns what the pack must hold). Writes (`fwrite`, `fremove`, `frename`, `ftrunc`) are declined with an error: persist stays pristine and nothing written by
-the DSP can wedge the next boot (#3's cause). Ubuntu's V4 run sampled with an unchanged pristine registry. If S3 shows the PD retrying
+open fails and is logged, the way a first run learns what the pack must hold). Writes (`fwrite`, `fremove`, `frename`, `ftrunc`) are
+declined with an error: persist stays pristine and nothing written by the DSP can wedge the next boot (#3's cause). Ubuntu's V4 run sampled with an unchanged pristine registry. If S3 shows the PD retrying
 writes in a loop, a volatile RAM overlay (fstempfile + frename, lost at reboot) is the next step. B13 at run time: a read-only ext4
 reader for persist's `sensors/registry` (extents, linear directories, no journal replay) replacing the pack's copy (level S6).
 
 **DSP-addressable memory.** The invoke payloads, the inline buffers and `apps_mem`'s heap pages must be reachable by the DSP through
 stream 0x1003 with 32-bit addresses. In SMMU pass-through that means physical memory below 4 GiB, outside XNU's window (0x8c0000000 and
-up): the same question as `audio.md` §10.4 (candidates: the UEFI's former "Kernel" region at 0xA8000000 or its DXE heap; PAG used 8 MiB
-of conventional low memory). The alternative is a translating context bank with our own page tables (UniXNU's ArmSmmu4K): on piano the
-HLOS programs the compute-cb banks (Linux does), unlike the audio streams sheng found to be the hypervisor's. 2 MiB of calls plus up to
-6 MiB of heap pages (PAG's split); mapped write-combined, published with a barrier before each send.
+up), that nobody else uses. Linux needs no fixed range (its compute-cb sessions translate, and `adsp-rpc-remote-heap` is a movable CMA
+pool for the audio PD's static process), so the default comes from the live DT's fixed regions:
+
+| Fact | Source | State |
+|---|---|---|
+| `cdsp@9d200000`, 25 MiB, `no-map`, in reserved-memory | `docs/hyp-evidence/memory-map-running-dt.txt`, `out/inputs/piano-boot.dtb` | verified (DT) |
+| its only user, `remoteproc@32300000` (`qcom,sm8750-cdsp-pas`), is `status = "disabled"` on piano: Ubuntu never ran the CDSP, nothing native maps the range (repository search) | the same DT | verified (DT, source) |
+| piano's UEFI keeps it inside `PIL_Reserved` (0x89e00000 + 0x19700000): neither UEFI nor DarwinBoot allocates there | pianoPkg `MemoryMapLib.c` | verified (source) |
+| its neighbour `cvp@9cb00000`, the same kind of carveout, is the native console mailbox (written from XNU, read back by UEFI) | `bringup-debugging.md` | verified (hardware) |
+| the DSP reaches it through the bypassed stream | stage 2 is the HLOS VM's; no assignment, as the CDSP never authenticates | inferred; the first attach shows it (S2) |
+
+The split has one owner, `package/include/PianoDspMemory.h`; a driver uses its own slice only and changes the split only there:
+
+| Slice | Range | User |
+|---|---|---|
+| sensors | 0x9d200000 + 8 MiB | PianoSensors' FastRPC arena: the `piano-sensors-rpc-pa` default (2 MiB of calls, up to 6 MiB of `apps_mem` heap pages, PAG's split) |
+| audio | 0x9da00000 + 16 MiB | PianoAudio's DMA buffers when it needs them (`audio.md` §10.4), unused until then |
+| spare | 0x9ea00000 + 1 MiB | unassigned |
+
+Another address (`piano-sensors-rpc-pa=ADDR`) is taken only when `ps_arena_check` finds it in none of: every reserved-memory region of
+the live DT below 4 GiB but the CDSP carveout (among them the console mailbox `cvp@9cb00000` + 7 MiB, the GPU's ZAP `gpu-micro-code@9b09a000`,
+PianoVideo's `video@9c300000`, the ADSP's `adspslpi`, `q6-adsp-dtb` and `adsp-mhi`), the firmware's holes, the UEFI regions natively still
+in use (the firmware volume with its stacks and heaps, the boot image's "Kernel" area, the DXE heap, `Piano_Log`, `Display_Demura`), the
+CDSP carveout's other slices, and XNU's own memory; the host tests check every region of the evidence file is in that table. The
+alternative stays a translating context bank with our own page tables (UniXNU's ArmSmmu4K): on piano the HLOS programs the compute-cb
+banks (Linux does). The arena is mapped write-combined and published with a barrier before each send.
 
 **Properties** of the `PianoSensors` service (class `PianoSensors` on IOPlatformExpertDevice; match it by class name). They are the
 interface for the consumers (the auto-brightness and rotation work) and stay as named here; values are set with `setProperty` (no
@@ -310,7 +331,38 @@ PIANO_SEED=out/rotated/stage/scratch-data.img PIANO_TRUST=out/rotated/stage/kern
 
 ### 5b. The pack, step by step (the owner's own tablet; nothing private is committed)
 
-On the tablet, under Ubuntu (read only; `persist` is never mounted writable; the archives' member names are the DSP's paths):
+Ubuntu is no longer on the tablet (its root became macOS's), so the pack is made on the Mac from two local sources:
+- **this unit's registry**: the backup made before the switch, `CRITICAL-BACKUP/sensor-registry.tar` (Ubuntu's private seed: the
+  outer registry directory with `registry/`, `sns_reg_version` and `parsed_file_list.csv` under `usr/share/piano/sensors/registry-private/`).
+  Private: never committed, never printed (the tool reports only a count), never another unit's;
+- **the stock ROM's sensor configuration**: OS3.0.303.0.WPYCNXM's 66 ODM/vendor files as the Ubuntu project keeps them,
+  `xiaomipad-8pro-mainline/firmware/sensors` with `source.json` (each file's device path and sha256; the tool checks every hash). The
+  owner's own ROM image on this Mac is incomplete (`rollback-os3.0.303/`, a sparse download marked do-not-use), so it is not used; the
+  manifest-checked copy is the same build's files. Reading `vendor_a`/`odm_a` from `super` at run time through NativeUfs (LP metadata,
+  EROFS) is not needed while this copy matches.
+
+```sh
+python3 package/PianoSensors/tools/make-sensor-pack.py \
+  --registry-tar "$HOME/Downloads/XiaomiPad8Pro-Ubuntu/CRITICAL-BACKUP/sensor-registry.tar" \
+  --rom-config "$HOME/Downloads/XiaomiPad8Pro-Ubuntu/xiaomipad-8pro-mainline/firmware/sensors" \
+  --out out/sensors/pack.bin
+python3 tooling/persist/build-esp.py --profile base --sensor-pack out/sensors/pack.bin    # plus the usual --arg/--default options
+```
+
+Run 2026-11-11 (on the owner's sources, offline): `ROM configuration: 66 files of OS3.0.303.0.WPYCNXM, each matching its sha256`,
+`persist registry: 228 files, 99033 bytes (private: not listed)`, `out/sensors/pack.bin: 294 files, 338020 bytes`; the kernel's checks
+(header, table, names) accept it and find sns_reg_config, json.lst and the registry. No soc0 values: no source holds them, none is
+invented; level 2's log shows whether the PD asks for `/sys/devices/soc0` (then a `--soc0` file from the SoC's identity).
+
+The tool writes only under this repository's `out/` or `private/` (anything else is refused), with mode 0600; it refuses a link or a
+special file in the registry, a second registry directory, a ROM file whose sha256 differs, a ROM path outside the sensor trees, a serial
+number in soc0. `build-esp.py --sensor-pack` checks the pack (magic, size, at most 4 MiB), puts it at
+`EFI/UniXNU/piano-sensors.pack` and records only its sha256 in `out/persistent/<name>.json`; the ESP image then holds this unit's
+calibration (keep it local, never share it). Writing the ESP to the tablet is the maintenance session's step (`maint-session.py`,
+`persistent-boot.md`), done by the owner. A RAM-image boot reads the pack from the installed ESP as well.
+
+For a tablet that still runs Linux, `--dump DIR` takes archives made there (read only; `persist` is never mounted writable; the
+archives' member names are the DSP's paths):
 
 ```sh
 mkdir -p ~/piano-sensor-dump && cd ~/piano-sensor-dump
@@ -325,27 +377,16 @@ for n in soc_id revision machine family platform_subtype platform_subtype_id pla
 sudo chown "$USER" *.tar && chmod 600 *
 ```
 
-Copy the directory to the Mac into the checkout's ignored `out/sensors/dump/` (USB or the owner's usual private path), then:
-
-```sh
-python3 package/PianoSensors/tools/make-sensor-pack.py --dump out/sensors/dump --out out/sensors/pack.bin --list
-python3 tooling/persist/build-esp.py --profile base --sensor-pack out/sensors/pack.bin    # plus the usual --arg/--default options
-```
-
-`--list` prints sizes and paths only (no contents). The tool refuses a serial number in soc0.txt and any output inside the repository
-but `out/`/`private/`; it warns when sns_reg_config, json.lst or the persist registry is missing (without the registry the DSP falls back
-to the ROM's generic calibration). `build-esp.py --sensor-pack` checks the pack (magic, size, at most 4 MiB), puts it at
-`EFI/UniXNU/piano-sensors.pack` and records only its sha256 in `out/persistent/<name>.json`; the ESP image then holds this unit's
-calibration (keep it local, never share it). Writing the ESP to the tablet is the maintenance session's step (`maint-session.py`,
-`persistent-boot.md`), done by the owner. A RAM-image boot reads the pack from the installed ESP as well. Alternatives for the vendor/odm
-trees: the tablet's own `vendor_a`/`odm_a` from `super` (`lpunpack`, then `fsck.erofs --extract`), archived with the same member names.
+then `make-sensor-pack.py --dump out/sensors/dump --out out/sensors/pack.bin --list` (`--list` prints sizes and paths only, the
+registry as a count). The tool warns when sns_reg_config, json.lst or the persist registry is missing (without the registry the DSP falls
+back to the ROM's generic calibration).
 
 ## 6. Boot args
 
 | Argument | Default | Values |
 |---|---|---|
 | `piano-sensors=N` | 0 | 0 nothing (probe declines); 1 read-only survey; 2 + the FastRPC file service; 3 + the SNS sensor list (built); 4 + streams and the consumers (next) |
-| `piano-sensors-rpc-pa=ADDR` | none | the arena's physical address (8 MiB, below 4 GiB, outside the known owners: `ps_arena_check`); level 2 runs no file service without one |
+| `piano-sensors-rpc-pa=ADDR` | 0x9d200000 | the arena's physical address (8 MiB; default the CDSP carveout's sensors slice, `PianoDspMemory.h`; another address only outside every known user, `ps_arena_check`; 0: no file service); level 2 runs no file service without one |
 | `piano-sensors-bank=N` | 3 | the context bank (3..8); its streams 0x1000+N, +0x80, +0x40, +0x60 |
 | `piano-sensors-smmu=0` | 1 | leave the SMMU alone at level 2 (the streams must bypass already) |
 | `piano-sensors-settle=S` | 20 | seconds of the charger's newest generation before the first request |
@@ -387,8 +428,8 @@ Every run with `piano-power=2` (PianoPower starts the DSP; the sensors never do)
 | Level | What runs | Pass | State, effort |
 |---|---|---|---|
 | S1 survey | `piano-sensors=1`: health through the guard, the channel registered, the SNS port, the pack loaded and checked, the SMMU entries of 0x1003/0x1083/0x1043/0x1063 planned (loads only), the arena address checked (not mapped); no message to the DSP | `piano-sensors-dsp` up with `charger_pd 0x1fffffff`; `-guard run` 20 s after; `-channel 1` (the DSP's open answered); `-sns` announced; `-pack ok` with all four items; `-smmu` and `-arena` listed; no fatal and the charger generation unchanged for 10 min | built; 1 boot |
-| S2 files | `=2 piano-sensors-rpc-pa=ADDR`: the arena mapped, the streams bypassed, attach (bank 3, then `-bank=4`), listener, every DSP call answered from the pack, writes declined | `rpc: attached to the sensors PD`, `listening`, `first call of the DSP`, `rpc open` lines for sns_reg_config, json.lst and the registry; `-rpc` declined 0; the refused writes counted; no fatal for 15 min, charger unchanged | built; 2-4 boots |
-| S3 sensor list | `=3 piano-sensors-rpc-pa=ADDR`: + SUID lookups and attributes, no stream | `-types`: registry, accel, gyro, ambient_light, proximity, mag found with names and rates (without the file service, as SUN saw: accel none); guard `run` all along | built; 1-2 boots |
+| S2 files | `=2`: the arena (0x9d200000 by default) mapped, the streams bypassed, attach (bank 3, then `-bank=4`), listener, every DSP call answered from the pack, writes declined | `rpc: attached to the sensors PD`, `listening`, `first call of the DSP`, `rpc open` lines for sns_reg_config, json.lst and the registry; `-rpc` declined 0; the refused writes counted; no fatal for 15 min, charger unchanged | built; 2-4 boots |
+| S3 sensor list | `=3`: + SUID lookups and attributes, no stream | `-types`: registry, accel, gyro, ambient_light, proximity, mag found with names and rates (without the file service, as SUN saw: accel none); guard `run` all along | built; 1-2 boots |
 | S4 streams | `=4`: light on change -> `piano-sensors-light-target` / PianoBacklight; accel 10 Hz while the cover is detached -> `piano-sensors-edge`; 20 light off/on cycles | lux follows a lamp, the backlight within 2 s; readings after every cycle (v1.1.1); the four edges named right (fix `-axes` if not) | next: 2-3 days, 2 boots |
 | S5 rotation | the agent (staged and signed like the GPU plugin), the cover lock, touch rotation (the consumers' work) | each edge upright with touch at the four corners (Ubuntu's table); attached -> normal | 3-5 days, 2-3 boots |
 | S6 B13 | persist's registry read at run time (ext4 reader), or the RAM overlay if S2 asked for it | readings identical with the pack's registry; at rest 9.81 +- 0.1 m/s^2 on each face; light within 10 % of Ubuntu's under one lamp | 3-5 days, 1-2 boots |
@@ -408,8 +449,9 @@ entry, if it exists for this display) or none. Ubuntu keeps its own sensor stack
 Delivered (2026-11-11): A-C as PianoPower's client contract (`package/include/PianoAdspContract.h`, `charging.md` §9: 6 GLINK slots,
 8 QRTR client ports with callbacks, 2048-byte IPCRTR receive buffers, `piano_adsp_health` with the fatal bit and count, its own crash
 string and the link and charger generations, `piano_adsp_quiet`, and GLINK keeping a DSP-side open that precedes the registration);
-PianoKeyboard publishes `piano-keyboard-attached`. PianoSensors uses one channel and one port. Still open: D (the arena), PianoBacklight's
-and PianoTouch's inputs (for level 4), NativeGopDisplay's transform (R2 only). The original request, for the record:
+PianoKeyboard publishes `piano-keyboard-attached`. PianoSensors uses one channel and one port. D is decided: the CDSP carveout, split
+in `package/include/PianoDspMemory.h` (section 5). Still open: PianoBacklight's and PianoTouch's inputs (for level 4), NativeGopDisplay's
+transform (R2 only). The original request, for the record:
 
 - A. Existing, used as is: `piano_adsp_channel("fastrpcglink-apps-dsp", 512, 8, 0 /* the DSP opens it */, ...)` and `piano_adsp_send`
   (40-byte invokes; answers of 12-16 bytes). Asked: `kClients` from 4 to 6 (IPCRTR, PMIC_RTR_ADSP_APPS, audio's adsp_apps and this one
@@ -423,7 +465,7 @@ and PianoTouch's inputs (for level 4), NativeGopDisplay's transform (R2 only). T
   `open:` notes), GLINK link generation}; `piano_qrtr_charger_pd(&ups)` exists. And `piano_adsp_quiet()`: nonzero while PianoPower
   wants clients still (charger configuration, its own recovery), polled by the guard.
 - D. Not PianoPower's, shared with audio: one owner and one fixed range for DSP-addressable low memory (or a translating bank for
-  0x1003/0x1043; PianoWifi's and PianoDwc3's `SmmuStream.h` shows the bypass form).
+  0x1003/0x1043; PianoWifi's and PianoDwc3's `SmmuStream.h` shows the bypass form). Now `PianoDspMemory.h`.
 - The consumers' interfaces, specified in §5a with their code in `package/PianoAuto`: PianoBacklight's `PianoBacklightAmbient` and
   automatic mode (§5a.4, `AmbientBacklight.h`); PianoTouch's `PianoTouchRotation` / `piano-touch-rotation` and its transform (§5a.3,
   `TouchRotation.h`); PianoKeyboard's `piano-keyboard-attached` exists (keyboard.md §6c); NativeGopDisplay: nothing for R1, R2's
@@ -434,7 +476,7 @@ and PianoTouch's inputs (for level 4), NativeGopDisplay's transform (R2 only). T
 1. Does the sensor PD stay quiet for hours with nobody attached (215 s seen)? (S1, a long charging run)
 2. Which bank the DSP accepts for PD 2 (3 is Linux's first session on piano, 4 the 13T's) and whether 0x1003 is in bypass, fault or
    translation when the boot hands over. (S1, S2)
-3. The arena's location (10.1 D). (S1 + owner decision with audio)
+3. The arena: decided (section 5, the CDSP carveout's sensors slice); whether the DSP's accesses reach it shows at the first attach. (S2)
 4. Whether the PD asks for `apps_mem` pages, socinfo, DSP libraries (`/usr/lib/qcom/adsp`, empty on Ubuntu) or files outside the pack. (S2 log)
 5. Whether declined writes are harmless (Ubuntu's V4 says yes) or the PD loops (then the RAM overlay). (S2)
 6. One QMI client for the lookups and attributes (level 3 uses one) is enough; whether streams want one each (libssc, Android) at S4.
