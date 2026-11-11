@@ -17,7 +17,7 @@ watchdog is not armed without them) plus the profile's and --arg's additions. En
   macos-prev   only with --prev-kc (Payloads/previous/)
   fastboot     the seed, no UFS root, data-persist=0, no pstore console (the last run's log stays): reset into ABL fastboot after 1 s
   reset, shutdown, tools
-  build-esp.py --profile base|softgpu|gpu [--default macos|macos-diag] [--arg NAME=VALUE ...] [--from REPO] [--kc K --adt A --trust T
+  build-esp.py --profile base|softgpu|gpu|daily [--default macos|macos-diag] [--arg NAME=VALUE ...] [--from REPO] [--kc K --adt A --trust T
                --seed S] [--name esp-diag] [--out out/persistent]
 """
 import argparse
@@ -57,9 +57,19 @@ PROFILES = {
         'trust': 'out/turnip-a830/stage/kernel.macho.trustcache', 'seed': 'out/turnip-a830/stage/scratch-data.img',
         'args': ['piano-gpu=2', 'piano-gpu-delay=20', 'panic_on_crash_disabled=1'], 'vmm_present': 0,
         'kexts': ['com.unixnu.driver.PianoA830'], 'kexts_absent': ['com.unixnu.driver.NativeSoftGpu']},
+    'daily': {
+        'about': 'the installed configuration from 2026-11-11 evening: gpu + PianoPower level 1 (battery and Type-C readout, no writes, '
+                 'the DSP not started) + the USB debug console (PianoDwc3: kernel console, monitor with "reset fastboot", user pipe) '
+                 '+ the keyboard and pointer from the Mac (piano-usb-hid=1)',
+        'kc': 'out/k27/kc-k27-native.bin', 'adt': 'out/adt/piano-k27.adt',
+        'trust': 'out/turnip-a830/stage/kernel.macho.trustcache', 'seed': 'out/turnip-a830/stage/scratch-data.img',
+        'args': ['piano-gpu=2', 'piano-gpu-delay=20', 'panic_on_crash_disabled=1', 'piano-power=1', 'piano-usb=2', 'piano-usb-hid=1'],
+        'vmm_present': 0,
+        'kexts': ['com.unixnu.driver.PianoA830', 'com.unixnu.driver.PianoPower', 'com.unixnu.driver.PianoDwc3'],
+        'kexts_absent': ['com.unixnu.driver.NativeSoftGpu']},
 }
 # Profile arguments the menu's "fastboot" entry (a reset after 1 s) leaves out.
-NOT_IN_FASTBOOT = ('piano-gpu', 'piano-gpu-delay')
+NOT_IN_FASTBOOT = ('piano-gpu', 'piano-gpu-delay', 'piano-power', 'piano-usb', 'piano-usb-hid')
 DROPPED = ('piano-reset-after', 'piano-reset-to', 'data-persist', 'droidvm-utc')
 
 
