@@ -20,6 +20,8 @@ enum {SL_OK = 0, SL_NOT_FAT = 1, SL_NOT_FOUND = 2, SL_TOO_BIG = 3, SL_READ = 4, 
 
 /* Reads the file at path of the mounted volume into buf (capacity cap) and opens it as a pack: SL_OK with *size and *pack set. */
 int sl_load(FatVolume *v, const char *path, uint8_t *buf, uint32_t cap, uint32_t *size, SspPack *pack);
+/* The same checks on a pack already in memory (a RAM test image's, SensorsAddon.h): SL_OK and *pack, SL_TOO_BIG or SL_INVALID. */
+int sl_check(const uint8_t *buf, uint32_t size, SspPack *pack);
 const char *sl_error_name(int error);
 
 /* What the pack holds of what the sensor PD reads (bit set: present): the registry configuration, the ODM list, the persist registry,

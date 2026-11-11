@@ -363,6 +363,11 @@ def main():
     for bundle in profile.get('kexts_absent', []):
         if bundle in natives:
             raise SystemExit(f'profile {a.profile}: {inputs["kc"]} links {bundle}, which this profile excludes')
+    for adt in {inputs['adt'], (a.prev_adt or inputs['adt']).resolve()}:
+        if common.adt_addon_slot(adt):
+            raise SystemExit(f'{adt}: its /chosen/memory-map has the GpuAddon slot of a RAM test image carrying the sensor pack '
+                             '(PIANO_SENSOR_PACK): DarwinBoot refuses that slot without Payloads/kernel.macho.gpuaddon, which an ESP never '
+                             'carries; use the ADT made without it (out/adt/piano-k27.adt)')
     vmm = adt_vmm_present(inputs['adt'])
     if profile['vmm_present'] is not None and vmm != profile['vmm_present']:
         raise SystemExit(f'profile {a.profile} needs an ADT with vmm-present {profile["vmm_present"]}; {inputs["adt"]} has {vmm}')

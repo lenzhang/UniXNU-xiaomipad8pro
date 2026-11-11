@@ -14,6 +14,8 @@
            with the service's message shapes: the requests byte for byte, the light and the accelerometer, off/on cycles, the
            guard, a strike, a sleep, generations, the level-3 list feeding the streams
   load     SensorsLoad + FatVolume on a FAT32 image made by mtools as build-esp.py makes the ESP (skipped without mtools)
+  addon    the RAM test image's carrier: tools/sensor_addon.py's addon (build-ram-images.py's PIANO_SENSOR_PACK) read by SensorsAddon,
+           inflated with zlib and checked by sl_check, the container's refusals; the tool's own refusals
   kernel   every portable file compiles freestanding with AArch64 general registers only (no C library, no floating point)
 
 Synthetic inputs only: no vendor file, no registry, no calibration of any unit is read or written. Host tests do not establish that the
@@ -37,7 +39,7 @@ REPO_OUT = PKG.parents[1] / 'out' / 'host-tests'   # ignored; the pack tool writ
 POWER = PKG.parent / 'PianoPower'
 AUTO = PKG.parent / 'PianoAuto'   # AutoStream.c, AutoLight.c: the streams' off/on lifecycle and the light chain (level 4)
 PORTABLE = ('SensorsGuard.c', 'SensorsPolicy.c', 'SensorsPb.c', 'SensorsSsc.c', 'SensorsRpc.c', 'SensorsPack.c', 'SensorsFixed.c',
-            'SensorsOrient.c', 'SensorsClient.c', 'SensorsLoad.c', 'FatVolume.c', 'SensorsStream.c')
+            'SensorsOrient.c', 'SensorsClient.c', 'SensorsLoad.c', 'FatVolume.c', 'SensorsStream.c', 'SensorsAddon.c')
 INCLUDE = PKG.parent / 'include'   # PianoAdspContract.h
 CFLAGS = ['-std=c11', '-Wall', '-Wextra', '-Werror', '-O1', '-g', '-fsanitize=address,undefined', '-fno-sanitize-recover=all']
 
@@ -202,12 +204,31 @@ def esp_image(out, pack):
     return image
 
 
+def addon_checks(pack, scratch):
+    """tools/sensor_addon.py: the addon of a made-up pack (under out/, mode 0600, nothing of the pack printed), its refusals."""
+    tool = PKG / 'tools/sensor_addon.py'
+    addon = scratch / 'pack.gpuaddon'
+    done = subprocess.run([sys.executable, str(tool), str(pack), str(addon)], capture_output=True, text=True)
+    if done.returncode or not addon.is_file() or addon.stat().st_mode & 0o077 or 'sensors/piano-sensors.pack' not in done.stdout:
+        sys.exit(f'FAIL: sensor_addon.py: {done.stdout}{done.stderr}')
+    for where, expect in ((PKG / 'addon-in-the-tree.gpuaddon', 'goes only under'), (scratch / 'x.gpuaddon', 'not a sensor pack')):
+        source = pack if expect == 'goes only under' else tool
+        done = subprocess.run([sys.executable, str(tool), str(source), str(where)], capture_output=True, text=True)
+        if where.exists() and where.parent == PKG:
+            where.unlink()
+            sys.exit(f'FAIL: sensor_addon.py wrote {where}')
+        if not done.returncode or expect not in done.stderr:
+            sys.exit(f'FAIL: sensor_addon.py did not refuse {where}: {done.stdout}{done.stderr}')
+    print('PASS addon tool: the pack as UniXNU\'s addon container, only under out/ or private/, mode 0600, a non-pack refused')
+    return addon
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--only', action='append', default=[],
-                        choices=['wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'streams', 'load', 'kernel'])
+                        choices=['wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'streams', 'load', 'addon', 'kernel'])
     args = parser.parse_args()
-    want = set(args.only) or {'wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'streams', 'load', 'kernel'}
+    want = set(args.only) or {'wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'streams', 'load', 'addon', 'kernel'}
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
         src = lambda *names: [PKG / n for n in names]
@@ -221,7 +242,7 @@ def main():
         REPO_OUT.mkdir(parents=True, exist_ok=True)
         scratch = Path(tempfile.mkdtemp(prefix='sensor-pack-', dir=REPO_OUT))   # the only place a pack may be written
         atexit.register(shutil.rmtree, scratch, True)                            # made-up packs only, gone also after a FAIL
-        if 'pack' in want or 'rpc' in want or 'load' in want:
+        if 'pack' in want or 'rpc' in want or 'load' in want or 'addon' in want:
             (out / 'dump').mkdir()
             pack = pack_checks(out / 'dump', scratch)
         if 'rpc' in want:
@@ -240,6 +261,10 @@ def main():
             image = esp_image(out, pack)
             if image:
                 run(build(out, 'load', [HERE / 'load.c', *src('SensorsLoad.c', 'SensorsPack.c', 'FatVolume.c')]), image)
+        if 'addon' in want:
+            addon = addon_checks(pack, scratch)
+            run(build(out, 'addon', [HERE / 'addon.c', *src('SensorsAddon.c', 'SensorsLoad.c', 'SensorsPack.c', 'FatVolume.c')], ['-lz']),
+                addon, pack)
         if 'kernel' in want:
             # the kernel's constraints: no C library, no floating point registers (AArch64 -mgeneral-regs-only)
             for name in PORTABLE:

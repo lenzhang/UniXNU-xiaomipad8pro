@@ -18,6 +18,12 @@ The Data store (docs/data-store.md): a macOS image opens the tablet's store (dat
 (PIANO_INSTALLED_SEED in ~/.config/piano/env, or out/persistent/installed.json), else it runs Data volatile (data-persist=0), with a
 note on stderr either way. PIANO_DATA_PERSIST=0|1|2 overrides that (2 with another seed: the RAM test of the store guard, which keeps
 the store); PIANO_DATA_STORE_REPLACE=1|<8 hex> and PIANO_DATA_STORE_FLATTEN=1 add data-store-replace / data-store-flatten=1.
+
+PIANO_SENSOR_PACK=PACK (docs/drivers/sensors.md section 5b): the macOS image (and the dump image) carries this unit's sensor pack as
+Payloads/kernel.macho.gpuaddon (package/PianoSensors/tools/sensor_addon.py), which DarwinBoot hands to the kernel through the ADT's
+GpuAddon slot and PianoSensors takes before the ESP's; the ADT must have the slot (make-piano-adt.py --addon: build-native-image.sh makes
+out/adt/piano-k27-addon.adt with PIANO_SENSOR_PACK) and an ADT with the slot is refused without a pack. Only a pack under this
+repository's out/ or private/; the image then holds the unit's calibration (keep it local); the record has its sha256 only.
 """
 import argparse
 import hashlib
@@ -202,6 +208,39 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def sensor_pack_addon(adt):
+    """PIANO_SENSOR_PACK (see the module's text): (the addon's bytes, a record without contents), or (None, None) without it."""
+    slot = persist_common().adt_addon_slot(adt)
+    value = os.environ.get('PIANO_SENSOR_PACK', '')
+    if not value:
+        if slot:
+            raise SystemExit(f'{adt} has the GpuAddon slot but PIANO_SENSOR_PACK is not set: DarwinBoot refuses a slot without its addon '
+                             '(build-native-image.sh makes that ADT only with PIANO_SENSOR_PACK; else out/adt/piano-k27.adt)')
+        return None, None
+    if not slot:
+        raise SystemExit(f'PIANO_SENSOR_PACK: {adt} has no GpuAddon slot, and DarwinBoot refuses an addon without it: make the ADT with '
+                         'tooling/adt/make-piano-adt.py --addon (build-native-image.sh does with PIANO_SENSOR_PACK)')
+    path = Path(value).resolve()
+    if not any(path.is_relative_to((DEVICE / d).resolve()) for d in ('out', 'private')):
+        raise SystemExit(f'PIANO_SENSOR_PACK={value}: a sensor pack is taken only from this repository\'s out/ or private/ (it holds the '
+                         'unit\'s calibration; package/PianoSensors/tools/make-sensor-pack.py writes it there)')
+    if not path.is_file():
+        raise SystemExit(f'PIANO_SENSOR_PACK={value} is missing')
+    spec = importlib.util.spec_from_file_location('sensor_addon', DEVICE / 'package/PianoSensors/tools/sensor_addon.py')
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    data = path.read_bytes()
+    try:
+        blob = tool.addon_bytes(data)
+    except ValueError as error:
+        raise SystemExit(f'PIANO_SENSOR_PACK={value}: {error}')
+    digest = hashlib.sha256(data).hexdigest()
+    loud(f'PIANO_SENSOR_PACK: this image carries this unit\'s sensor pack ({len(data)} bytes, sha256 {digest[:16]}: its calibration) as '
+         'Payloads/kernel.macho.gpuaddon,\nwhich PianoSensors takes before the ESP\'s. Keep the image local (out/ is ignored) and never '
+         'share it.')
+    return blob, {'sha256': digest, 'bytes': len(data), 'private': 'this unit only', 'carrier': 'Payloads/kernel.macho.gpuaddon'}
+
+
 def payload(stage, image, label, size_mib):
     # mtools stamps the directories it creates with the current time unless SOURCE_DATE_EPOCH is set (mtools 4.0.50):
     # without it two builds a minute apart differ in two bytes of the FAT.
@@ -236,6 +275,10 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     shutil.copyfile(trust, payloads / 'kernel.macho.trustcache')
     shutil.copyfile(seed, payloads / 'scratch-data.img')
     shutil.copyfile(adt, payloads / 'kernel.macho.adt')
+    addon, sensor_pack = sensor_pack_addon(adt)
+    if addon is not None:
+        (payloads / 'kernel.macho.gpuaddon').write_bytes(addon)
+        (payloads / 'kernel.macho.gpuaddon').chmod(0o600)
     # PIANO_EXTRA_ARGS: more kernel arguments for one test image (e.g. piano-usb=2, docs/drivers/usb-device-debug.md).
     extra = os.environ.get('PIANO_EXTRA_ARGS', '').split()
     store = {'data-persist', 'data-store-replace', 'data-store-flatten'} & {x.split('=', 1)[0] for x in extra}
@@ -263,7 +306,7 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     image = work / 'payload-macos.img'
     payload(stage, image, 'PIANOESP', size_mib)
     return image, {'cmdline_1cpu': one, 'cmdline_8cpu': smp, 'payload_mib': size_mib, 'fast_boot': fast_boot_level(),
-                   'data_store': store_record}
+                   'data_store': store_record, 'sensor_pack': sensor_pack}
 
 
 def kernel_field(fd, dtb, work, name):

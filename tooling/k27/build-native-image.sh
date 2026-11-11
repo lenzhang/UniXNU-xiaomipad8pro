@@ -37,8 +37,13 @@ if [ "${PIANO_GPU:-0}" != 0 ]; then
   export PIANO_EXTRA_ARGS="piano-gpu=$PIANO_GPU piano-gpu-delay=${PIANO_GPU_DELAY:-20} ${PIANO_EXTRA_ARGS:-}"
 fi
 # PIANO_VMM_PRESENT=0|1: the ADT's /defaults vmm-present for this build (else configs/k27-adt.toml's; docs/drivers/soft-metal.md §9).
-python3 tooling/adt/make-piano-adt.py out/adt/piano-k27.adt --unique-chip-id "${UNIQUE_CHIP_ID:-47554e5941480001}" --data --trust \
-  ${PIANO_VMM_PRESENT:+--vmm-present "$PIANO_VMM_PRESENT"} > /dev/null
+# PIANO_SENSOR_PACK=PACK (docs/drivers/sensors.md §5b): the RAM images carry this unit's sensor pack for PianoSensors (DarwinBoot's
+# addon slot, build-ram-images.py); their ADT then has the GpuAddon slot and is made as out/adt/piano-k27-addon.adt, so the ADT an ESP
+# takes (out/adt/piano-k27.adt) never has it (build-esp.py refuses one that does).
+ADT_OUT=out/adt/piano-k27.adt
+if [ -n "${PIANO_SENSOR_PACK:-}" ]; then ADT_OUT=out/adt/piano-k27-addon.adt; export PIANO_SENSOR_PACK; fi
+python3 tooling/adt/make-piano-adt.py "$ADT_OUT" --unique-chip-id "${UNIQUE_CHIP_ID:-47554e5941480001}" --data --trust \
+  ${PIANO_SENSOR_PACK:+--addon} ${PIANO_VMM_PRESENT:+--vmm-present "$PIANO_VMM_PRESENT"} > /dev/null
 # The software Metal path (docs/drivers/soft-metal.md): when NativeSoftGpu is linked (the list or PIANO_EXTRA_KEXTS; PIANO_SOFT_METAL=0
 # leaves this out, =1 forces it), the NativeSoftMetal plugin is built and staged into a copy of the Data seed and the trust cache
 # (tooling/k27/stage-soft-metal.py, out/soft-metal), which the image then takes unless PIANO_SEED / PIANO_TRUST name others. The staging
@@ -117,7 +122,7 @@ fi
 # ~/.config/piano/env), else Data is volatile; build-ram-images.py prints which on stderr. PIANO_DATA_PERSIST=0|1|2 overrides it,
 # PIANO_DATA_STORE_REPLACE=1|<8 hex> and PIANO_DATA_STORE_FLATTEN=1 add data-store-replace / data-store-flatten=1.
 COMMON=(--fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-k27-native.bin --trust "${PIANO_TRUST:-out/inputs/kernel.macho.trustcache}"
-        --seed "${PIANO_SEED:-out/inputs/scratch-data.img}" --adt "${PIANO_ADT:-out/adt/piano-k27.adt}" --utc "$(date +%s)")
+        --seed "${PIANO_SEED:-out/inputs/scratch-data.img}" --adt "${PIANO_ADT:-$ADT_OUT}" --utc "$(date +%s)")
 # The dump image only lets our UEFI read the previous run's log; its XNU never touches the Data store (data-persist=0), so a dump
 # image with another seed cannot reset the store of the installed system (docs/persistent-boot.md).
 PIANO_RESET_AFTER=1 PIANO_DATA_PERSIST=0 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram-dump > out/k27/build-ram-dump.log 2>&1 &

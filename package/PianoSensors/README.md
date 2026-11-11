@@ -31,11 +31,13 @@ facts, the ladder, the properties and the pack's commands: `docs/drivers/sensors
 | `SensorsClient.c/.h` | new: level 3's SNS client on one QRTR port (SUID lookups, attributes) |
 | `SensorsStream.c/.h` | new: level 4's streams, each on its own QRTR port: the requests (514 / 513 / 10), the reports (1025, 768, 130), PianoAuto's AutoStream rules and AutoLight chain, the outputs, the sleep and strike teardown, a rate-limited log |
 | `SensorsLoad.c/.h`, `FatVolume.c/.h` | new: the pack read whole from the ESP and checked; PianoPower's FAT reader (copy) |
+| `SensorsAddon.c/.h`, `tools/sensor_addon.py` | new: the pack carried by a RAM test image (`PIANO_SENSOR_PACK`): UniXNU's boot addon container in DarwinBoot's `GpuAddon` slot, its writer and its checked reader (sensors.md §5b) |
 | `SmmuStream.h` | PianoDwc3's bypass-bank planner (copy) for the sensors PD's four stream ids |
 | `SensorsPolicy.c/.h` | new: piano's facts, the light curve with smoothing and hysteresis, panel edge and rotation with the cover lock |
-| `tests/` | `run-host-tests.py`: PaganiSensors' wire/fixed/orient/rpc tests, the pack tool, `piano.c` (guard, policy, cross-checks against libqmi, libssc, Linux fastrpc.c and qualcomm/fastrpc), `streams.c` (level 4 against a simulated hub sending the service's message shapes), the kernel's no-FP/no-libc compile |
+| `tests/` | `run-host-tests.py`: PaganiSensors' wire/fixed/orient/rpc tests, the pack tool, `piano.c` (guard, policy, cross-checks against libqmi, libssc, Linux fastrpc.c and qualcomm/fastrpc), `streams.c` (level 4 against a simulated hub sending the service's message shapes), `addon.c` (the RAM image's carrier), the kernel's no-FP/no-libc compile |
 
 Build: `tooling/k27/build-native-piano-sensors.sh` (host tests, copy checks, objects, import check). Tests alone:
 `python3 package/PianoSensors/tests/run-host-tests.py` (ASan/UBSan, synthetic inputs only; the loader test needs mtools). The pack holds a unit's calibration:
-build it only from the owner's own tablet, under the ignored `out/` or `private/`; it is never committed. Sources and licences: `UPSTREAM`,
+build it only from the owner's own tablet, under the ignored `out/` or `private/`; it is never committed. A RAM test image may carry
+it (`PIANO_SENSOR_PACK`, `tooling/k27/build-sensor-test-images.sh`); such an image is as private as the pack. Sources and licences: `UPSTREAM`,
 `LICENSE` (BSD-2-Clause-Patent).

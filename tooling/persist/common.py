@@ -41,6 +41,25 @@ BOOT_PARTITION_BYTES = 100663296
 BOOT_A_START_512, BOOT_A_SIZE_512 = 618800, 196608   # /sys/class/block/<boot_a>/{start,size}
 
 
+def adt_addon_slot(path):
+    """True when the ADT's /chosen/memory-map has a GpuAddon slot (UniXNU's generator with addon=True: make-piano-adt.py --addon).
+    DarwinBoot then needs Payloads/kernel.macho.gpuaddon next to the kernel and refuses the boot without it (EFI_COMPROMISED_DATA), and
+    refuses an addon without the slot as well. Only a RAM test image that carries the sensor pack has it (PIANO_SENSOR_PACK,
+    docs/drivers/sensors.md section 5b); the installed system's ADT never does."""
+    spec = importlib.util.spec_from_file_location('adt_dump', DEVICE / 'tooling/adt/adt-dump.py')
+    adt = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(adt)
+    (_, children), _ = adt.parse(Path(path).read_bytes())
+    for props, grandchildren in children:
+        if dict(props).get('name', b'').rstrip(b'\0') != b'chosen':
+            continue
+        for child, _ in grandchildren:
+            named = dict(child)
+            if named.get('name', b'').rstrip(b'\0') == b'memory-map':
+                return 'GpuAddon' in named
+    return False
+
+
 def sha(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:

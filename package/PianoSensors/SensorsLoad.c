@@ -6,7 +6,6 @@
 int sl_load(FatVolume *v, const char *path, uint8_t *buf, uint32_t cap, uint32_t *size, SspPack *pack)
 {
     FatFile f;
-    SspHeader h;
     *size = 0;
     const int rc = fat_open(v, path, &f);
     if (rc == FatNotFound || rc == FatNotDirectory || rc == FatIsDirectory || (!rc && f.directory)) return SL_NOT_FOUND;
@@ -14,10 +13,18 @@ int sl_load(FatVolume *v, const char *path, uint8_t *buf, uint32_t cap, uint32_t
     if (f.size > cap || f.size > SL_MAX_BYTES) return SL_TOO_BIG;
     if (f.size < SSP_HEADER) return SL_INVALID;
     if (fat_read(v, &f, 0, buf, f.size)) return SL_READ;
-    if (ssp_header(buf, f.size, &h) || h.total != f.size) return SL_INVALID;
+    const int checked = sl_check(buf, f.size, pack);
+    if (checked == SL_OK) *size = f.size;
+    return checked;
+}
+
+int sl_check(const uint8_t *buf, uint32_t size, SspPack *pack)
+{
+    SspHeader h;
+    if (size > SL_MAX_BYTES) return SL_TOO_BIG;
+    if (!buf || size < SSP_HEADER || ssp_header(buf, size, &h) || h.total != size) return SL_INVALID;
     const uint32_t table = ssp_table_bytes(&h);
-    if (table > f.size - SSP_HEADER || ssp_open(pack, &h, buf + SSP_HEADER)) return SL_INVALID;
-    *size = f.size;
+    if (table > size - SSP_HEADER || ssp_open(pack, &h, buf + SSP_HEADER)) return SL_INVALID;
     return SL_OK;
 }
 

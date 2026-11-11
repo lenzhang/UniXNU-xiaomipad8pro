@@ -27,6 +27,7 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
+#include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOMessage.h>
 #include <libkern/c++/OSDictionary.h>
@@ -36,10 +37,13 @@
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
+#include <libkern/zlib.h>
+#include <machine/machine_routines.h>
 #include <PianoAdspContract.h>
 #include <PianoPowerContract.h>
 extern "C" {
 #include "FatVolume.h"
+#include "SensorsAddon.h"
 #include "SensorsClient.h"
 #include "SensorsGuard.h"
 #include "SensorsHealth.h"
@@ -327,8 +331,108 @@ uint32_t gPackBytes, gPackBits;
 volatile int32_t gPackState = -1;   // -1 not yet, else SL_*
 char gPackText[160] = "not read";
 
+void packOk(const SspPack &table, const char *from)
+{
+  snprintf(gPackText, sizeof gPackText, "ok: %u entries, %u bytes;%s%s%s%s; from %s", table.count, gPackBytes,
+           gPackBits & SL_HAS_REG_CONFIG ? " sns_reg_config" : " NO sns_reg_config", gPackBits & SL_HAS_JSON_LIST ? " json.lst" : " NO json.lst",
+           gPackBits & SL_HAS_REGISTRY ? " registry" : " NO registry (stock defaults)", gPackBits & SL_HAS_SOC0 ? " soc0" : " NO soc0", from);
+}
+
+// libkern's zlib takes its allocations from the caller: IOMallocData with the size in front.
+voidpf zAlloc(voidpf, uInt items, uInt size)
+{
+  const uint64_t bytes = uint64_t(items) * size;
+  if (!bytes || bytes > (16u << 20)) return Z_NULL;
+  uint64_t *p = static_cast<uint64_t *>(IOMallocData(size_t(bytes) + 16));
+  if (!p) return Z_NULL;
+  p[0] = bytes + 16;
+  return p + 2;
+}
+void zFree(voidpf, voidpf address)
+{
+  if (!address) return;
+  uint64_t *p = static_cast<uint64_t *>(address) - 2;
+  IOFreeData(p, size_t(p[0]));
+}
+
+// One addon entry's zlib stream into out: exactly its size, and the stream's end (tests/addon.c does the same with the host's zlib).
+int inflateEntry(const SaEntry &e, uint8_t *out)
+{
+  z_stream z;
+  bzero(&z, sizeof z);
+  z.zalloc = zAlloc;
+  z.zfree = zFree;
+  z.next_in = const_cast<Bytef *>(e.data);
+  z.avail_in = uInt(e.compressed);
+  z.next_out = out;
+  z.avail_out = uInt(e.size);
+  if (inflateInit(&z) != Z_OK) return -1;
+  const int rc = inflate(&z, Z_FINISH);
+  const bool ok = rc == Z_STREAM_END && z.total_out == e.size;
+  inflateEnd(&z);
+  return ok ? 0 : -1;
+}
+
+// The pack a RAM test image carries (SensorsAddon.h; build-ram-images.py's PIANO_SENSOR_PACK): DarwinBoot's addon slot, read where the
+// loader put it (the kernel's static memory, as NativeRamBlock reads its RAMDisk). -1 when this boot has none (then the ESP's), else
+// SL_* (a carried pack that does not check is not replaced by the ESP's: the test image is wrong, and says so).
+int loadPackFromAddon()
+{
+  IORegistryEntry *map = IORegistryEntry::fromPath("/chosen/memory-map", gIODTPlane);
+  OSData *range = map ? OSDynamicCast(OSData, map->getProperty("GpuAddon")) : nullptr;
+  uint64_t pa = 0, bytes = 0;
+  if (range && range->getLength() == 16) {
+    memcpy(&pa, range->getBytesNoCopy(), 8);
+    memcpy(&bytes, static_cast<const uint8_t *>(range->getBytesNoCopy()) + 8, 8);
+  }
+  OSSafeReleaseNULL(map);
+  if (!bytes) return -1;
+  if (bytes > SA_MAX_BYTES || pa < gPhysBase || pa - gPhysBase > gPhysSize || bytes > gPhysSize - (pa - gPhysBase)) {
+    snprintf(gPackText, sizeof gPackText, "the RAM image's addon (%#llx + %#llx) is outside the kernel's memory", (unsigned long long)pa,
+             (unsigned long long)bytes);
+    return SL_INVALID;
+  }
+  const uint8_t *blob = reinterpret_cast<const uint8_t *>(ml_static_ptovirt(vm_offset_t(pa)));
+  SaEntry e;
+  const int found = blob ? sa_find(blob, bytes, SA_PACK_PATH, &e) : SA_INVALID;
+  if (found == SA_NOT_FOUND) {
+    note("pack: the RAM image's addon (%llu bytes) carries no %s: the ESP's is read", (unsigned long long)bytes, SA_PACK_PATH);
+    return -1;
+  }
+  if (found != SA_OK) {
+    snprintf(gPackText, sizeof gPackText, "the RAM image's addon: %s", sa_error_name(found));
+    return SL_INVALID;
+  }
+  if (e.size > SL_MAX_BYTES || e.size < SSP_HEADER) {
+    snprintf(gPackText, sizeof gPackText, "%s (the RAM image's, %llu bytes)", sl_error_name(e.size > SL_MAX_BYTES ? SL_TOO_BIG : SL_INVALID),
+             (unsigned long long)e.size);
+    return e.size > SL_MAX_BYTES ? SL_TOO_BIG : SL_INVALID;
+  }
+  uint8_t *buf = static_cast<uint8_t *>(IOMallocData(size_t(e.size)));
+  if (!buf) return SL_READ;
+  SspPack table;
+  const int rc = inflateEntry(e, buf) ? SL_INVALID : sl_check(buf, uint32_t(e.size), &table);
+  if (rc != SL_OK) {
+    IOFreeData(buf, size_t(e.size));
+    snprintf(gPackText, sizeof gPackText, "%s (the RAM image's %s)", sl_error_name(rc), SA_PACK_PATH);
+    return rc;
+  }
+  gPack = buf;
+  gPackBytes = uint32_t(e.size);
+  gPackBits = sl_contents(&table);
+  packOk(table, "the RAM image");
+  return SL_OK;
+}
+
 void loadPack()
 {
+  const int carried = loadPackFromAddon();
+  if (carried >= 0) {
+    note("pack: %s", gPackText);
+    __atomic_store_n(&gPackState, carried, __ATOMIC_RELEASE);
+    wake(&gRpcEvents, kEvPack);
+    return;
+  }
   uint32_t lun = 0;
   uint64_t first = 0, blocks = 0;
   for (unsigned waited = 0; !native_ufs_part_find(SL_PARTITION, &lun, &first, &blocks); ++waited) {
@@ -362,9 +466,7 @@ void loadPack()
       if (rc == SL_OK) {
         gPackBytes = size;
         gPackBits = sl_contents(&table);
-        snprintf(gPackText, sizeof gPackText, "ok: %u entries, %u bytes;%s%s%s%s", table.count, size,
-                 gPackBits & SL_HAS_REG_CONFIG ? " sns_reg_config" : " NO sns_reg_config", gPackBits & SL_HAS_JSON_LIST ? " json.lst" : " NO json.lst",
-                 gPackBits & SL_HAS_REGISTRY ? " registry" : " NO registry (stock defaults)", gPackBits & SL_HAS_SOC0 ? " soc0" : " NO soc0");
+        packOk(table, "the ESP");
       } else {
         IOFreeData(gPack, f.size);
         gPack = nullptr;

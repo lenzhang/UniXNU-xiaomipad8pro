@@ -3,9 +3,12 @@
 hardware from dts/piano.dts (+ UniXNU-sm8750-common's sm8750.dtsi), identity from configs/k27-adt.toml instead of the
 macos-27.3 profile, the rest of board.toml as it is.
 
-  make-piano-adt.py OUTPUT.adt --unique-chip-id HEX [--data] [--trust] [--dtb-out FILE] [--psci-method smc|hvc] [--no-gop-display]
+  make-piano-adt.py OUTPUT.adt --unique-chip-id HEX [--data] [--trust] [--addon] [--dtb-out FILE] [--psci-method smc|hvc] [--no-gop-display]
 
 --data / --trust: the payload carries a Data seed / trust cache (their /chosen/memory-map slots).
+--addon: the payload carries Payloads/kernel.macho.gpuaddon (the /chosen/memory-map GpuAddon slot DarwinBoot fills): a RAM test image
+  with the sensor pack (PIANO_SENSOR_PACK, docs/drivers/sensors.md section 5b). DarwinBoot refuses a slot without the file and a file
+  without the slot, so an ADT with it is never the installed system's (build-esp.py refuses it).
 --psci-method: override /psci method (default: the DTS's, "smc"; "hvc" only for a test inside the VM).
 The [arm-io.*] nodes of configs/k27-gop-display.toml go under /arm-io: /arm-io/gop-display, the display nub of NativeGopDisplay on
   the boot framebuffer (docs/drivers/native-gop-display.md). --no-gop-display leaves them out (the ADT without a display).
@@ -48,6 +51,7 @@ def main():
     p.add_argument('--unique-chip-id', required=True)
     p.add_argument('--data', action='store_true')
     p.add_argument('--trust', action='store_true')
+    p.add_argument('--addon', action='store_true', help='the GpuAddon slot (a RAM test image carrying the sensor pack)')
     p.add_argument('--dtb-out', type=Path)
     p.add_argument('--psci-method', choices=('smc', 'hvc'))
     p.add_argument('--no-gop-display', dest='gop_display', action='store_false', help='leave out /arm-io/gop-display')
@@ -73,10 +77,11 @@ def main():
         nodes = load_toml(DEVICE / 'configs/k27-gop-display.toml').get('arm-io', {})
         extra = [devicetree.platform_node(name, table) for name, table in nodes.items()]
     with arm_io_children(extra):
-        tree = generate(dtb, config, unique_chip_id=a.unique_chip_id, data=a.data, trust=a.trust)
+        tree = generate(dtb, config, unique_chip_id=a.unique_chip_id, data=a.data, trust=a.trust, addon=a.addon)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(tree)
-    print(f'{a.output}: {len(tree)} bytes (hardware {dtb}){", with /arm-io/gop-display" if a.gop_display else ""}')
+    print(f'{a.output}: {len(tree)} bytes (hardware {dtb}){", with /arm-io/gop-display" if a.gop_display else ""}'
+          f'{", with the GpuAddon slot" if a.addon else ""}')
 
 
 if __name__ == '__main__':

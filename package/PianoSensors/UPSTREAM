@@ -52,8 +52,14 @@ This repository's own packages, copied because their owners do not change them f
 New here (UniXNU-piano): PianoSensors.cpp (the kext: levels 1-4 on PianoPower's client contract), SensorsGuard.c/.h (the safety
 governor), SensorsHealth.h (PianoPower's health report as the guard's observation), SensorsPolicy.c/.h (piano's facts, the arena check,
 the light curve, the rotation policy), SensorsClient.c/.h (level 3's SNS client: lookups and attributes), SensorsStream.c/.h (level 4's
-streams), SensorsLoad.c/.h (the pack from the ESP), tests/piano.c, tests/streams.c and tests/load.c (their tests and the independent
-cross-checks), tests/qrtr_frame.h, tests/run-host-tests.py.
+streams), SensorsLoad.c/.h (the pack from the ESP), SensorsAddon.c/.h and tools/sensor_addon.py (the pack carried by a RAM test
+image), tests/piano.c, tests/streams.c, tests/load.c and tests/addon.c (their tests and the independent cross-checks),
+tests/qrtr_frame.h, tests/run-host-tests.py.
+
+UniXNU's boot addon, as a format only (no code taken): the container layout of UniXNU's scripts/make-gpu-addon.py ("NGPUADD2", the
+count, the total, per file its path, mode, size, compressed size, the path and the zlib stream padded to 8 bytes) and DarwinBoot's
+handling of Payloads/<kernel>.gpuaddon (DarwinBootPkg/Driver/DarwinBoot.c: the /chosen/memory-map GpuAddon slot, the header checked,
+the file copied into the kernel's memory); the kext inflates the entry with libkern's zlib (inflateInit_, inflate, inflateEnd).
 
 This repository's own code compiled in from its package (not copied): package/PianoAuto/AutoStream.c/.h (a stream's off/on rules) and
 AutoLight.c/.h (the light chain over SensorsPolicy's ps_als_step), linked into the kext for level 4; their tests run before the build.
