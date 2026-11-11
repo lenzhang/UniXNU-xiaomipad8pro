@@ -19,6 +19,7 @@ profile's and --arg's additions. Entries:
   reset, shutdown, tools
   build-esp.py --profile base|softgpu|gpu|daily [--default macos|macos-diag] [--arg NAME=VALUE ...] [--rtc-offset N|sdam] [--from REPO]
                [--fast-boot 0|1|2] [--boot-guard SECS] [--replace-data [1|HEX8]] [--flatten-data] [--sensor-pack PACK]
+               [--audio-preset FSM [--audio-preset-any]]
                [--kc K --adt A --trust T --seed S] [--name esp-diag] [--out out/persistent]
 
 The Data store (docs/data-store.md): the macos entries open it read-write (data-persist=2). When the installed seed is known
@@ -42,6 +43,11 @@ The sensors (docs/drivers/sensors.md section 5): --sensor-pack PACK puts this ta
 package/PianoSensors/tools/make-sensor-pack.py under the ignored out/ or private/) at EFI/UniXNU/piano-sensors.pack, where PianoSensors
 level 2 reads it. The image then holds this unit's calibration: keep it local, never publish or share it, and never use another
 unit's pack.
+The amplifiers (docs/drivers/audio.md section 10.3): --audio-preset FSM puts the owner's own copy of the stock amplifier preset
+(foursemi/piano/fs19xx.fsm of the tablet's odm_a, 4348 bytes) at EFI/UniXNU/piano-fs19xx.fsm, where PianoAudio level 5 reads it. It is
+checked as the kernel checks it (the container's size field and CRC16) and must be the stock file (size and SHA-256 as Ubuntu publishes
+them for OS3.0.303.0.WPYCNXM) unless --audio-preset-any; only its sha256 goes into the record. It is vendor data: never commit it, and
+keep the image local.
 """
 import argparse
 import os
@@ -302,6 +308,41 @@ def check_sensor_pack(path):
     return path
 
 
+# The stock amplifier preset's identity (xiaomipad-8pro-mainline firmware/piano-audio.json; package/PianoAudio/AudioSha256.c pins the
+# same): only these two facts are in this repository, never the file.
+AUDIO_PRESET_BYTES = 4348
+AUDIO_PRESET_SHA256 = 'ab060b8476065bd789f327f7f8e724a2e17d94e93a85e2e8aa4b4954ce88b90e'
+AUDIO_PRESET_MAX = 64 << 10
+
+
+def fsm_crc16(data):
+    """CRC-16/ARC (polynomial 0x8005 reflected, initial value 0): the container's checksum (Fs19xx.c fsm_crc16)."""
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+
+def check_audio_preset(path, any_preset):
+    """The amplifier preset as PianoAudio's level 5 takes it (AudioAmps.c audio_preset_check): at most 64 KiB, the container's size
+    field (offset 22) and CRC16 (offset 24, over bytes 26..) right, the stock file unless any_preset. Returns (path, stock)."""
+    path = path.resolve()
+    if not path.is_file():
+        raise SystemExit(f'--audio-preset: {path} is missing')
+    data = path.read_bytes()
+    if not 28 <= len(data) <= AUDIO_PRESET_MAX:
+        raise SystemExit(f'--audio-preset: {path} has {len(data)} bytes: not an fs19xx.fsm container')
+    if int.from_bytes(data[22:24], 'little') != len(data) or int.from_bytes(data[24:26], 'little') != fsm_crc16(data[26:]):
+        raise SystemExit(f'--audio-preset: {path} is not a valid fs19xx.fsm container (size field or CRC16)')
+    stock = len(data) == AUDIO_PRESET_BYTES and common.sha(path) == AUDIO_PRESET_SHA256
+    if not stock and not any_preset:
+        raise SystemExit(f'--audio-preset: {path} is not the stock fs19xx.fsm (OS3.0.303.0.WPYCNXM: {AUDIO_PRESET_BYTES} bytes, sha256 '
+                         f'{AUDIO_PRESET_SHA256[:16]}...); --audio-preset-any takes it (and the kernel then needs piano-audio-preset-any=1)')
+    return path, stock
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--profile', choices=sorted(PROFILES), required=True)
@@ -335,6 +376,9 @@ def main():
                    '(default: from PIANO_INSTALLED_SEED=<record>.json or out/persistent/installed.json)')
     p.add_argument('--sensor-pack', type=Path, metavar='PACK',
                    help="this tablet's sensor pack (make-sensor-pack.py) -> EFI/UniXNU/piano-sensors.pack (holds the unit's calibration)")
+    p.add_argument('--audio-preset', type=Path, metavar='FSM',
+                   help="the owner's own stock amplifier preset (fs19xx.fsm from odm_a) -> EFI/UniXNU/piano-fs19xx.fsm (vendor data)")
+    p.add_argument('--audio-preset-any', action='store_true', help='take a valid preset that is not the stock file')
     p.add_argument('--name', help='output base name (default esp-<profile>-<default>)')
     p.add_argument('--out', type=Path, default=common.DEVICE / 'out/persistent')
     a = p.parse_args()
@@ -344,6 +388,7 @@ def main():
         if not path.is_file():
             raise SystemExit(f'{n}: {path} is missing')
     pack = check_sensor_pack(a.sensor_pack) if a.sensor_pack else None
+    preset, preset_stock = check_audio_preset(a.audio_preset, a.audio_preset_any) if a.audio_preset else (None, False)
     natives, vm_era, kc_rtc, kc_guard = kc_bundles(inputs['kc'])
     if vm_era:
         raise SystemExit(f'{inputs["kc"]} links {vm_era}: the native kext rule allows only this repository\'s kexts '
@@ -394,6 +439,8 @@ def main():
         shutil.copyfile(inputs['seed'], payloads / 'scratch-data.img')
         if pack:   # a long name (FAT keeps its case): PianoSensors' SensorsLoad.h SL_PATH
             shutil.copyfile(pack, stage / 'EFI/UniXNU/piano-sensors.pack')
+        if preset:   # a long name as well: PianoAudio's AudioPreset.h AUDIO_PRESET_PATH
+            shutil.copyfile(preset, stage / 'EFI/UniXNU/piano-fs19xx.fsm')
         if prev:
             (payloads / 'previous').mkdir()
             shutil.copyfile(prev['kc'], payloads / 'previous/kernel.macho')
@@ -441,6 +488,8 @@ def main():
         'previous': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in prev.items()} if prev else None,
         'kc_natives': natives, 'adt_vmm_present': vmm,
         'sensor_pack': {'sha256': common.sha(pack), 'bytes': pack.stat().st_size, 'private': 'this unit only'} if pack else None,
+        'audio_preset': {'sha256': common.sha(preset), 'bytes': preset.stat().st_size, 'stock': preset_stock,
+                         'vendor_data': 'the owner\'s own copy: never committed'} if preset else None,
         'seed': seed, 'data_store': data_store,
         'store': {'window_blocks': window,
                   'first_lba_now': common.store_first(common.ROOTFS_LAST, window),
