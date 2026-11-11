@@ -334,7 +334,7 @@ struct Dsp {
         if (dropReads) {piano_mca_timeout(&m); ++n; continue;}
         if (prop == PIANO_MCA_PDOS) {
           for (size_t i = 0; i < pdo.size(); ++i) put32(resp + 24 + 4 * i, pdo[i]);
-        } else if (prop == PIANO_MCA_CHARGE_ENABLE) {
+        } else if (prop == PIANO_MCA_CHARGE_ENABLE || prop == PIANO_MCA_INPUT_SUSPEND || prop == PIANO_MCA_AICL_ENABLE) {
           resp[24] = uint8_t(props.count(prop) ? props[prop] : 0);
         } else {
           put32(resp + 24, props.count(prop) ? props[prop] : 0);
@@ -427,6 +427,29 @@ static void testMcaCodec()
   CHECK(piano_mca_receive(&m, pan, sizeof pan) == McaIgnored);   // no such port
   d.pan(m);
   CHECK(d.panAcks == 1);
+  // The read-only input-path diagnostic (§5c): the one-byte properties decode from byte 0, the four-byte ones from the word.
+  Dsp diag;
+  diag.props[PIANO_MCA_INPUT_SUSPEND] = 1;
+  diag.props[PIANO_MCA_AICL_ENABLE] = 1;
+  diag.props[PIANO_MCA_AICL_STATUS] = 0x30;
+  diag.props[PIANO_MCA_STATUS] = 7;
+  diag.props[PIANO_MCA_BUS_CURRENT] = 0;
+  PianoMca p;
+  piano_mca_init(&p, 0, 0);
+  piano_mca_link(&p, 1);
+  diag.run(p);
+  CHECK(piano_mca_has(&p, McaInputSuspend) && p.value[McaInputSuspend] == 1);
+  CHECK(piano_mca_has(&p, McaAiclEnable) && p.value[McaAiclEnable] == 1);
+  CHECK(piano_mca_has(&p, McaAiclStatus) && p.value[McaAiclStatus] == 0x30);
+  CHECK(piano_mca_has(&p, McaStatus) && p.value[McaStatus] == 7);
+  CHECK(diag.readsOf[PIANO_MCA_INPUT_SUSPEND] && diag.readsOf[PIANO_MCA_AICL_ENABLE] && diag.readsOf[PIANO_MCA_AICL_STATUS]);
+  CHECK(diag.writes.empty());   // the diagnostic never writes
+  CHECK(!std::strcmp(piano_mca_status_name(1), "charging") && !std::strcmp(piano_mca_status_name(2), "discharging"));
+  CHECK(!std::strcmp(piano_mca_status_name(3), "not charging") && !std::strcmp(piano_mca_status_name(4), "full"));
+  CHECK(!std::strcmp(piano_mca_status_name(7), "unknown") && !std::strcmp(piano_mca_status_name(0), "unknown"));
+  // A one-byte property whose answer carries only one byte is still taken (the model sends the full 280 bytes).
+  CHECK(p.errors == 0);
+
   // Short or foreign messages are ignored.
   CHECK(piano_mca_receive(&m, resp, 8) == McaIgnored);
   put32(resp, 0x1234);
@@ -439,6 +462,8 @@ static void testMcaPolicy()
   CHECK(piano_mca_write_allowed(PIANO_MCA_ICL, 1500, 4) && !piano_mca_write_allowed(PIANO_MCA_ICL, 2500, 4));
   CHECK(!piano_mca_write_allowed(PIANO_MCA_ICL, 50, 4) && !piano_mca_write_allowed(PIANO_MCA_FCC, 3000, 4));
   CHECK(piano_mca_write_allowed(PIANO_MCA_CHARGE_ENABLE, 1, 1) && !piano_mca_write_allowed(PIANO_MCA_CHARGE_ENABLE, 0, 1));
+  CHECK(piano_mca_write_allowed(PIANO_MCA_INPUT_SUSPEND, 0, 1) && !piano_mca_write_allowed(PIANO_MCA_INPUT_SUSPEND, 1, 1));
+  CHECK(!piano_mca_write_allowed(PIANO_MCA_INPUT_SUSPEND, 0, 4));
   CHECK(piano_mca_write_allowed(PIANO_MCA_PD_FIXED, 9000, 4) && !piano_mca_write_allowed(PIANO_MCA_PD_FIXED, 12000, 4));
   CHECK(!piano_mca_write_allowed(PIANO_MCA_STATUS, 1, 4) && !piano_mca_write_allowed(0x201a, 0, 4));
   CHECK(piano_mca_icl_for(PIANO_MCA_TYPE_SDP, 0) == 500 && piano_mca_icl_for(PIANO_MCA_TYPE_CDP, 0) == 900);
@@ -447,6 +472,47 @@ static void testMcaPolicy()
   CHECK(piano_mca_icl_for(PIANO_MCA_TYPE_FLOAT, 0) == 500 && piano_mca_icl_for(PIANO_MCA_TYPE_UNKNOWN, 0) == 500);
   CHECK(piano_mca_fcc_for(1, 30, 0) == 1000 && piano_mca_fcc_for(1, 30, 1) == 1500 && piano_mca_fcc_for(0, 30, 0) == 500);
   CHECK(piano_mca_fcc_for(1, 10, 0) == 500 && piano_mca_fcc_for(1, 38, 0) == 500 && piano_mca_fcc_for(1, 37, 0) == 1000);
+
+  // The suspended input: written to 0 only with piano-power-unsuspend, at most three times, and never to 1.
+  {
+    Dsp e;
+    e.props[PIANO_MCA_BUS_VOLTAGE] = 5100000;
+    e.props[PIANO_MCA_REAL_TYPE] = PIANO_MCA_TYPE_CDP;
+    e.props[PIANO_MCA_INPUT_SUSPEND] = 1;
+    e.props[PIANO_MCA_CHARGE_ENABLE] = 1;
+    e.props[PIANO_MCA_TBAT] = 28;
+    PianoMca off;
+    piano_mca_init(&off, 1, 0);
+    piano_mca_link(&off, 1);
+    e.run(off);
+    CHECK(e.count(PIANO_MCA_INPUT_SUSPEND) == 0);          // not allowed by default
+    CHECK(e.last(PIANO_MCA_ICL) == 900);                   // CDP keeps the Ubuntu policy's 900 mA
+    Dsp f = e;
+    f.writes.clear();
+    PianoMca on;
+    piano_mca_init(&on, 1, 0);
+    piano_mca_allow_unsuspend(&on, 1);
+    piano_mca_link(&on, 1);
+    f.run(on);
+    CHECK(f.count(PIANO_MCA_INPUT_SUSPEND) == 1 && f.last(PIANO_MCA_INPUT_SUSPEND) == 0 && f.props[PIANO_MCA_INPUT_SUSPEND] == 0);
+    cycle(on, f);
+    CHECK(f.count(PIANO_MCA_INPUT_SUSPEND) == 1);          // it reads 0 now: nothing more
+    // A firmware that refuses it: three tries, then no more.
+    Dsp g = e;
+    g.writes.clear();
+    g.retcodeFor[PIANO_MCA_INPUT_SUSPEND] = 5;
+    PianoMca refused;
+    piano_mca_init(&refused, 1, 0);
+    piano_mca_allow_unsuspend(&refused, 1);
+    piano_mca_link(&refused, 1);
+    for (int i = 0; i < 6; ++i) {piano_mca_refresh(&refused); g.run(refused);}
+    CHECK(g.count(PIANO_MCA_INPUT_SUSPEND) == 3);
+    // Without the policy the switch is ignored.
+    PianoMca ro;
+    piano_mca_init(&ro, 0, 0);
+    piano_mca_allow_unsuspend(&ro, 1);
+    CHECK(!ro.unsuspend_allowed);
+  }
 
   // A DCP is attached, the charger disabled: input limit, charge current and enable, then nothing more.
   PianoMca m;

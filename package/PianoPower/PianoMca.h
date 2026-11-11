@@ -39,6 +39,13 @@ extern "C" {
 /* Properties; bits 31:16 are the class (0 charger and battery, 2 USB and PD). The PD ids are the OS3 firmware's (HyperOS 4 firmware
  * inserts one at 0x2100b and moves the later ones up by one). */
 #define PIANO_MCA_STATUS 0x2001u
+/* The input path, read only here (§5c): the charger firmware can suspend the USB input independently of the input current limit and
+ * the charger's enable bit, and its automatic input-current limiting (AICL) walks the limit down when the source sags. Ids from the
+ * Linux driver's property family (Project-SunUEFI piano_mca.c, spec only) and the K90 port's notes; what they read on piano is what
+ * the diagnostic answers. */
+#define PIANO_MCA_INPUT_SUSPEND 0x2019u   /* 1 byte: 1 = the USB input is suspended */
+#define PIANO_MCA_AICL_ENABLE 0x2012u     /* 1 byte */
+#define PIANO_MCA_AICL_STATUS 0x2029u     /* 4 bytes */
 #define PIANO_MCA_CHARGE_ENABLE 0x2003u   /* one byte: the charger's enable bit */
 #define PIANO_MCA_FCC 0x2005u             /* charge current, mA; reading it is a no-op that returns zeroes, so it is never read */
 #define PIANO_MCA_ICL 0x2008u             /* input current limit, mA */
@@ -71,8 +78,8 @@ enum {
 
 /* The fields one cycle reads, in order. */
 enum {
-    McaBusVoltage, McaBusCurrent, McaType, McaIcl, McaTbat, McaChargeEnable, McaStatus, McaPackVoltage, McaPackCurrent, McaVerify,
-    McaPdos, McaFields
+    McaBusVoltage, McaBusCurrent, McaType, McaIcl, McaTbat, McaChargeEnable, McaStatus, McaPackVoltage, McaPackCurrent,
+    McaInputSuspend, McaAiclEnable, McaAiclStatus, McaVerify, McaPdos, McaFields
 };
 
 /* receive results */
@@ -97,6 +104,7 @@ typedef struct {
     uint8_t queued, sent_write;
     /* the policy: 0 reads only, 1 writes at 5 V; hv_allowed adds the 9 V request */
     uint8_t policy, hv_allowed, attached, hv, hv_checks, attach_cycles;
+    uint8_t unsuspend_allowed, unsuspend_tries;
     uint8_t icl_tries, fcc_tries, enable_tries;
     uint32_t icl_want, fcc_want;     /* what the last cycle wanted (tries restart when it changes) */
     uint32_t icl_set, fcc_set;       /* what the firmware took since its start (0: nothing yet) */
@@ -126,9 +134,15 @@ int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length);
 /* The owner's timer gave up on the request (or the port request) in flight. */
 void piano_mca_timeout(PianoMca *m);
 void piano_mca_pan_timeout(PianoMca *m);
+/* Allows the one write of the input-suspend flag: 0x2019 = 0 when it reads non-zero, at most three times per attach, never 1
+ * (piano-power-unsuspend=1; off by default, and it needs the policy on). */
+void piano_mca_allow_unsuspend(PianoMca *m, int allow);
 /* The gauges' temperature, used when the firmware's own reading is missing. */
 void piano_mca_battery_temperature(PianoMca *m, int valid, int32_t celsius);
 uint32_t piano_mca_take_events(PianoMca *m);
+/* The name of a charger status value, "unknown" when it is not one of the five the Linux driver and the K90 notes name
+ * (1 charging, 2 discharging, 3 not charging, 4/5 full; the 07:28 run read 0x7). */
+const char *piano_mca_status_name(int32_t status);
 
 static inline int piano_mca_has(const PianoMca *m, int field) {return (int)((m->valid >> field) & 1u);}
 

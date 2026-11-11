@@ -44,7 +44,7 @@ volatile int32_t piano_power_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, period, gauge, write, hv;
+  uint32_t level, period, gauge, write, hv, unsuspend;
 };
 Args gArgs;
 
@@ -64,6 +64,7 @@ void readArgs()
   gArgs.gauge = bootArg("piano-power-gauge", 1);
   gArgs.write = bootArg("piano-power-write", 1);
   gArgs.hv = bootArg("piano-power-hv", 0);
+  gArgs.unsuspend = bootArg("piano-power-unsuspend", 0);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -211,6 +212,7 @@ class PianoPower : public IOService {
   void pumpMca(uint64_t now);
   void logMcaEvents();
   void mcaLine(char *line, size_t size);
+  void diagLine(char *line, size_t size);
   void run();
   static void thread(void *self, wait_result_t);
   static void channelState(void *context, int up);
@@ -240,6 +242,8 @@ bool PianoPower::start(IOService *provider)
     note("level 2 policy: %s%s", gArgs.write ? "input limit by charger type (<= 1.5 A at 5 V), charge current 1.0 A in 15-38 C"
                                              : "no charger writes (piano-power-write=0): the DSP keeps its own 100 mA input limit",
          gArgs.write && gArgs.hv ? ", 9 V from a PD source's fixed PDO (piano-power-hv=1, then <= 1.6 A)" : "");
+  if (gArgs.level >= 2 && gArgs.write && gArgs.unsuspend)
+    note("piano-power-unsuspend=1: the input-suspend flag (0x2019) is written to 0 when it reads non-zero (never to 1)");
   setProperty("piano-power", gArgs.level, 32);
   fRingLock = IOSimpleLockAlloc();
   thread_t t = nullptr;
@@ -359,6 +363,27 @@ void PianoPower::mcaLine(char *line, size_t size)
 #undef HAS
 }
 
+// The input path as the firmware reports it, logged after every cycle of the first minute (and then with each report): the three
+// properties that can hold the input off whatever the limit says, the decoded charger status, and whether the DSP has sent any
+// USB-C port notification at all. Read only: nothing here writes.
+void PianoPower::diagLine(char *line, size_t size)
+{
+  const PianoMca &m = fMca;
+#define HAS(f) piano_mca_has(&m, f)
+  snprintf(line, size,
+           "diag: input suspend (0x2019) %s, AICL enable (0x2012) %s, AICL status (0x2029) %s%#x, charger status (0x2001) %#x (%s), "
+           "bus current (0x20004) %d mA, input limit (0x2008) %d mA; port notifications %u received, %u acked, enable %s; "
+           "%u reads, %u errors, %u timeouts, %u ignored, %u notifications",
+           HAS(McaInputSuspend) ? (m.value[McaInputSuspend] ? "1 (SUSPENDED)" : "0 (not suspended)") : "not readable",
+           HAS(McaAiclEnable) ? (m.value[McaAiclEnable] ? "1" : "0") : "not readable",
+           HAS(McaAiclStatus) ? "" : "not readable ", HAS(McaAiclStatus) ? (uint32_t)m.value[McaAiclStatus] : 0u,
+           HAS(McaStatus) ? (uint32_t)m.value[McaStatus] : 0u,
+           HAS(McaStatus) ? piano_mca_status_name(m.value[McaStatus]) : "not readable",
+           HAS(McaBusCurrent) ? m.value[McaBusCurrent] / 1000 : -1, HAS(McaIcl) ? m.value[McaIcl] : -1,
+           m.pan_notifies, m.pan_acks, m.pan_enable ? "due" : "sent", m.answers, m.errors, m.timeouts, m.ignored, m.notifications);
+#undef HAS
+}
+
 void PianoPower::report()
 {
   const uint64_t t = (nowMs() - fStartMs) / 1000;
@@ -398,8 +423,10 @@ void PianoPower::report()
          t, s.stage, piano_adsp_stage_name(s.stage), s.stage < 0 ? " FAILED" : "", s.slave, s.doorbells, s.glink_in, s.glink_out,
          s.channels_up, s.broken ? " BROKEN" : "", s.qrtr_stage, s.qrtr_requests, s.qrtr_answers, s.qrtr_services,
          s.text[0] ? ", " : "", s.text);
-    char line[400];
+    char line[520];
     mcaLine(line, sizeof line);
+    note("[%llus] %s", t, line);
+    diagLine(line, sizeof line);
     note("[%llus] %s", t, line);
   } else {
     PianoAdspSurvey s;
@@ -435,6 +462,7 @@ void PianoPower::channelReceive(void *context, const uint8_t *data, uint32_t len
 void PianoPower::startCharger()
 {
   piano_mca_init(&fMca, gArgs.write ? 1 : 0, gArgs.hv != 0);
+  piano_mca_allow_unsuspend(&fMca, gArgs.unsuspend != 0);
   if (fBattery.ok) piano_mca_battery_temperature(&fMca, 1, fBattery.tempDeciC / 10);
   static const PianoAdspClient client = {&PianoPower::channelState, &PianoPower::channelReceive};
   fChannel = piano_adsp_channel("PMIC_RTR_ADSP_APPS", 1024, 4, 0, &client, this);
@@ -465,7 +493,7 @@ void PianoPower::logMcaEvents()
   if (e & McaEvWrite) {
     const char *what = m.last_property == PIANO_MCA_ICL ? "input limit" : m.last_property == PIANO_MCA_FCC ? "charge current"
                        : m.last_property == PIANO_MCA_CHARGE_ENABLE ? "charge enable" : m.last_property == PIANO_MCA_PD_FIXED ? "PD fixed request"
-                       : "property";
+                       : m.last_property == PIANO_MCA_INPUT_SUSPEND ? "input suspend" : "property";
     note("mca: write %s (%#x) = %u: %s (%d)", what, m.last_property, m.last_value,
          m.last_result == 0 ? "ok" : m.last_result == -60 ? "no answer" : "refused by the firmware", m.last_result);
   }
@@ -519,10 +547,17 @@ void PianoPower::serviceMca(uint64_t now)
     if (r == McaAnswer || r == McaCycleDone || r == McaWritten) fRequestDue = 0;
     if (r == McaPanDone) fPanDue = 0;
     if (r == McaPanNotified) note("mca: USB-C port notification (port %u): acknowledged", data[12]);
-    if (r == McaCycleDone && fMca.cycles == 1) {
-      char line[400];
-      mcaLine(line, sizeof line);
-      note("first charger reading: %s", line);
+    if (r == McaCycleDone) {
+      char line[520];
+      if (fMca.cycles == 1) {
+        mcaLine(line, sizeof line);
+        note("first charger reading: %s", line);
+      }
+      // The input-path diagnostic after every cycle of the first minute (12 cycles of 5 s), then with each report.
+      if (fMca.cycles <= 12) {
+        diagLine(line, sizeof line);
+        note("[%llus] %s", (nowMs() - fStartMs) / 1000, line);
+      }
     }
   }
   if (!fWasUp) return;

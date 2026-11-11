@@ -26,7 +26,9 @@ porting.toml), package/:
       by DRV_STATUS, trigger and mode cleared in that order, CMD_STATUS checked, a TCS in flight left alone); sheng's
       qcom_rpmh_active_request/qcom_rpmh_finish are no longer called (QcomRpmh.c still provides the cmd-db lookup and the layout).
       The segments are stored with aligned 8-byte stores (no memcpy/bzero) into a mapping limited to the image's span, after a
-      read/write-back probe of the carveout; piano-power-map and piano-power-load-first choose the mapping type and the order.
+      read/write-back probe of the carveout; piano-power-map and piano-power-load-first choose the mapping type and the order. The
+      rail votes hold PianoA830's DRV-2 owner word (sm8750_rpmh_drv2_owner, its documented protocol: compare-exchange 0 for our
+      tag, 10 us between tries, at most 2 s), imported by name because PianoA830 links before PianoPower.
     AdspFirmware.c (ced26abf9e7ae3033dceaa1d39ccbf85e73abc636aac41aa7e3d3b2741e67a7c) -> PianoAdspFirmware.c: the headers from
       NAME.mdt when there is no NAME.b00 (piano's modem_a), piece 0 read from that file; names piano_fw_*; strong imports of
       NativeUfs's native_ufs_part_find/native_ufs_part_read (package/NativeUfs exports them).
@@ -64,5 +66,9 @@ docs/devel/linux/kernel.md; Ubuntu's piano-charging.service (xiaomipad-8pro-main
 descriptions. PianoMca.c describes and implements that behaviour in its own code. The bq27z561 standard commands come from TI's
 datasheet; the SM8750 addresses from piano's live DT (out/inputs/piano-boot.dtb). The K90 annibale drivers
 (unixnu-research/hackios-xnu-kernel-k90, annibale_adsp.c and annibale_adsp_fw.inc, APSL-2.0) were read for facts only (that the
-SM8750 DSP starts from XNU at EL1; its order, TCS choice and the no-overlapping-secure-calls rule; docs/drivers/charging.md §5a); no
-code is taken. Not used at all: Linux's qcom_battmgr, pmic_glink, qcom_q6v5_pas, bq27xxx and spmi-pmic-arb sources.
+SM8750 DSP starts from XNU at EL1; its order, TCS choice and the no-overlapping-secure-calls rule; the charger property family it
+names, docs/drivers/charging.md §5a and §5c); no code is taken.
+
+Xiaomi's stock charger modules (the mca_*, qcom_subpmic_proxy and qcom_adsp_pd_protocol binaries in the stock vendor_boot ramdisk)
+are proprietary and are NOT a source for this package: no property id, register map or sequence here comes from disassembling them.
+The ids come from the GPL driver's text and the APSL K90 port's notes, read as descriptions, and are confirmed on the device. Not used at all: Linux's qcom_battmgr, pmic_glink, qcom_q6v5_pas, bq27xxx and spmi-pmic-arb sources.

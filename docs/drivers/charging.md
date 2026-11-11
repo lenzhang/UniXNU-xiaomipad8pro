@@ -263,6 +263,71 @@ Run D; E or F only if D stalls after `probe (after mem_setup)` passes or at its 
 | `segment 1: 159164 bytes read from the file` missing after `segment 1: ...` | the UFS read stalled, not the carveout |
 | `segment 1: ... storing them` with no `first ... stored` | the stores stall although one word went through (then E) |
 
+## 5c. Level 2 with writes drains: the input path, not the limit (2026-11-11 07:28)
+
+**Result** (owner present, Mac USB-C port = CDP). Before the DSP: `battery: ... 0 mA (idle), 98 %` — the system ran from the USB
+input. The DSP's first charger reading: `bus 5231 mV 0 mA, type CDP, input limit 100 mA (set 0), charge enable 1, status 0x7`. Our
+writes were accepted (`write input limit (0x2008) = 900: ok`, `write charge current (0x2005) = 1000: ok`, read back as
+`input limit 900 mA (set 900)`), and yet `[65s] battery: 4440 mV, -860 mA (discharging)` with `bus 5233 mV 0 mA` still.
+
+So the limit is not the gate: it was accepted and read back, charging is enabled, the bus is at 5.2 V, and no input current flows.
+Something upstream of the limit holds the input off once the DSP's firmware owns the path (before the DSP the same port fed the
+system). Candidates, each a property of the same class in the Linux driver's family (Project-SunUEFI `piano_mca.c`, GPL, read as a
+specification) and in the K90 port's notes (APSL, facts only): the input-suspend flag `0x2019`, the automatic input-current
+limiting `0x2012`/`0x2029` (it walks the limit down when the source sags), and the DSP's USB-C port notifications, which its
+Type-C/PD state machine waits on (Ubuntu's `pan_ack`; we acknowledge them, but no notification was logged in that run). The
+charger status read `0x7`, which is none of the five values those sources name, so our decode of `0x2001` may be wrong too.
+
+**This build, read only first (image G).** At level 2 with `piano-power-write=0` the cycle also reads `0x2019` (input suspend),
+`0x2012` (AICL enable) and `0x2029` (AICL status), and a `diag:` line after every cycle of the first minute (then with each
+report) gives those three, the decoded `0x2001`, the bus current, the input limit, and how many port notifications arrived and
+were acknowledged. Nothing new is written. One `diag:` line, abbreviated:
+
+```
+PianoPower: [40s] diag: input suspend (0x2019) 0 (not suspended), AICL enable (0x2012) 1, AICL status (0x2029) 0x30,
+  charger status (0x2001) 0x7 (unknown), bus current (0x20004) 0 mA, input limit (0x2008) 900 mA;
+  port notifications 0 received, 0 acked, enable sent; 13 reads, 0 errors, 0 timeouts, 0 ignored, 0 notifications
+```
+
+**The one write it can make (image H, `piano-power-unsuspend=1`).** When `0x2019` reads non-zero, one byte 0 is written to it, at
+most three times per attach, read back on the next cycle, logged as `write input suspend (0x2019) = 0: ok (0)`. The allowlist
+only ever permits the value 0 there, never 1, so this driver cannot suspend the input. Everything else is unchanged; CDP keeps the
+Ubuntu policy's 900 mA (its table value) until a run shows the limit matters. If `0x2019` already reads 0, the write never
+happens and the `diag:` line says so — then the gate is AICL or the port notifications, not the suspend flag.
+
+**DRV-2 lock.** Every rail vote of ours now runs with PianoA830's `sm8750_rpmh_drv2_owner` held (compare-exchange 0 for `POWR`,
+10 us between tries, at most 2 s, released after the TCS is reclaimed), so `piano-power>=2` and `piano-gpu=2` can run together.
+PianoA830 is listed before PianoPower in `configs/k27-native-kexts.txt` and `PianoPower.json` names it as a library, so the KC
+linker (which has no weak imports) resolves the word to A830's single copy — checked in the KC's symbol list. `piano-power-rpmh=0`
+still skips our votes, which answers whether they are needed at all.
+
+| Image | Arguments (plus `exec-log=1 piano-usb=2`) | sha256 |
+|---|---|---|
+| G (probe, no new writes) | `piano-power=2 piano-power-write=0` | `4db6e479469844fa…` |
+| H (the one write) | `piano-power=2 piano-power-unsuspend=1` | `3766b18882dc4cc0…` |
+
+KC `83cda10d09a6bd43…` (main 1774c13 + this change; `native kext rule: 9 native kexts linked, none from DroidVM`), both verify
+PASS. Commands (in the main checkout):
+
+```sh
+tooling/k27/build-native-image.sh
+PIANO_EXTRA_ARGS="exec-log=1 piano-usb=2 piano-power=2 piano-power-write=0" PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300 \
+  python3 tooling/bootimg/build-ram-images.py --fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --out out/ram-power/G \
+  --kc out/k27/kc-k27-native.bin --trust out/inputs/kernel.macho.trustcache --seed out/inputs/scratch-data.img --adt out/adt/piano-k27.adt
+PIANO_EXTRA_ARGS="exec-log=1 piano-usb=2 piano-power=2 piano-power-unsuspend=1" PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300 \
+  python3 tooling/bootimg/build-ram-images.py --fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --out out/ram-power/H \
+  --kc out/k27/kc-k27-native.bin --trust out/inputs/kernel.macho.trustcache --seed out/inputs/scratch-data.img --adt out/adt/piano-k27.adt
+tooling/native/native-loop.sh out/ram-power/G/boot-piano-macos-ram-A-bundled.img
+grep -E 'PianoPower: (\[|diag|mca|first)' logs/native-runs/<ts>-loop/xnu-console.txt
+```
+
+Run G first and read its `diag:` lines; H only if G shows `input suspend (0x2019) 1 (SUSPENDED)`. With either image, watch the
+`battery:` line: the gate is found when the battery current stops being negative on the cable.
+
+**Not done, and why.** The property that un-suspends the input is not provable from the licence-clean sources alone; piano's own
+stock charger modules would name it exactly, but recovering IDs from those proprietary binaries is a vendor-binary derivation this
+repository does not do (§8). `0x2019` is the candidate those sources agree on, which is why it is the one opt-in write.
+
 ## 6. Risks
 
 - **Level 2 can charge less than no driver.** Once the DSP runs, its firmware holds the input at 100 mA until the ICL write takes
@@ -289,7 +354,10 @@ Run D; E or F only if D stalls after `probe (after mem_setup)` passes or at its 
 
 Transport from UniXNU-sheng (BSD-2-Clause-Patent) and Sm8750Scm from Adreno830 (MIT), hashes in `package/PianoPower/UPSTREAM`.
 `piano_mca.c`, xiaomi_mca, pmic_glink, qcom_battmgr, qcom_q6v5_pas and bq27xxx (GPL-2.0) are specification only; PianoMca.c,
-Gauge.h and ChargerPmic.h are written fresh.
+Gauge.h and ChargerPmic.h are written fresh. Xiaomi's own charger modules (the `mca_*`, `qcom_subpmic_proxy` and
+`qcom_adsp_pd_protocol` binaries in the stock `vendor_boot` ramdisk) are **not** used: they are proprietary, and recovering
+property ids or register maps from them by disassembly is outside what this repository derives from. Property ids come from the
+GPL driver's text and the APSL K90 port's notes, both read as descriptions, and are confirmed or refuted on the device.
 
 ## Measured 2026-11-11 (level 1, read only, 240 s on the Mac's USB-C port)
 

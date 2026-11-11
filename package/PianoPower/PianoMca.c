@@ -21,6 +21,9 @@ static const struct {uint32_t property; uint8_t pd;} kFields[McaFields] = {
     [McaStatus] = {PIANO_MCA_STATUS, 0},
     [McaPackVoltage] = {PIANO_MCA_PACK_VOLTAGE, 0},
     [McaPackCurrent] = {PIANO_MCA_PACK_CURRENT, 0},
+    [McaInputSuspend] = {PIANO_MCA_INPUT_SUSPEND, 0},
+    [McaAiclEnable] = {PIANO_MCA_AICL_ENABLE, 0},
+    [McaAiclStatus] = {PIANO_MCA_AICL_STATUS, 0},
     [McaVerify] = {PIANO_MCA_VERIFY, 1},
     [McaPdos] = {PIANO_MCA_PDOS, 1},
 };
@@ -31,6 +34,11 @@ static void zero(void *p, uint32_t n) {for (uint32_t i = 0; i < n; ++i) ((uint8_
 static uint32_t min32(uint32_t a, uint32_t b) {return a < b ? a : b;}
 
 static int is_pd(int type) {return type == PIANO_MCA_TYPE_PD || type == PIANO_MCA_TYPE_PD_VERIFY || type == PIANO_MCA_TYPE_PD_PPS;}
+/* The properties whose payload is one byte, not four. */
+static int one_byte(unsigned field)
+{
+    return field == McaChargeEnable || field == McaInputSuspend || field == McaAiclEnable;
+}
 
 void piano_mca_init(PianoMca *m, unsigned policy, int hv_allowed)
 {
@@ -44,7 +52,7 @@ static void reset_attach(PianoMca *m)
 {
     m->hv = McaHvOff;
     m->hv_checks = m->attach_cycles = 0;
-    m->icl_tries = m->fcc_tries = m->enable_tries = 0;
+    m->icl_tries = m->fcc_tries = m->enable_tries = m->unsuspend_tries = 0;
     m->icl_want = m->fcc_want = 0;
 }
 
@@ -96,6 +104,7 @@ int piano_mca_write_allowed(uint32_t property, uint32_t value, uint8_t bytes)
     case PIANO_MCA_ICL: return bytes == 4 && value >= PIANO_MCA_ICL_FLOOR && value <= PIANO_MCA_ICL_MAX_9V;
     case PIANO_MCA_FCC: return bytes == 4 && value >= 100 && value <= PIANO_MCA_FCC_9V;
     case PIANO_MCA_CHARGE_ENABLE: return bytes == 1 && value == 1;
+    case PIANO_MCA_INPUT_SUSPEND: return bytes == 1 && value == 0;   /* only ever un-suspended, never suspended */
     case PIANO_MCA_PD_FIXED: return bytes == 4 && (value == 5000 || value == 9000);
     default: return 0;
     }
@@ -266,6 +275,12 @@ static void policy(PianoMca *m)
                                                  : m->icl_set != icl;
     if (icl_off && m->icl_tries < TRIES) {queue_write(m, PIANO_MCA_ICL, icl, 4); m->icl_tries++;}
     if (m->fcc_set != fcc && m->fcc_tries < TRIES) {queue_write(m, PIANO_MCA_FCC, fcc, 4); m->fcc_tries++;}
+    /* The input path itself: the firmware can hold it suspended whatever the limit and the enable bit say (§5c). Only with
+     * piano-power-unsuspend, and only 0 is ever written. */
+    if (m->unsuspend_allowed && piano_mca_has(m, McaInputSuspend) && m->value[McaInputSuspend] && m->unsuspend_tries < TRIES) {
+        queue_write(m, PIANO_MCA_INPUT_SUSPEND, 0, 1);
+        m->unsuspend_tries++;
+    }
     if (piano_mca_has(m, McaChargeEnable) && !m->value[McaChargeEnable] && m->enable_tries < TRIES) {
         queue_write(m, PIANO_MCA_CHARGE_ENABLE, 1, 1);
         m->enable_tries++;
@@ -318,6 +333,11 @@ void piano_mca_timeout(PianoMca *m)
 }
 
 void piano_mca_pan_timeout(PianoMca *m) {m->pan_in_flight = 0;}
+
+void piano_mca_allow_unsuspend(PianoMca *m, int allow)
+{
+    m->unsuspend_allowed = m->policy && allow;
+}
 
 void piano_mca_battery_temperature(PianoMca *m, int valid, int32_t celsius)
 {
@@ -400,8 +420,8 @@ int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length)
         }
         m->value[field] = m->pdos;
         m->valid |= 1u << field;
-    } else if (have >= 4 || (field == McaChargeEnable && have >= 1)) {
-        m->value[field] = field == McaChargeEnable ? payload[0] : (int32_t)le32(payload);
+    } else if (have >= (one_byte(field) ? 1u : 4u)) {
+        m->value[field] = one_byte(field) ? payload[0] : (int32_t)le32(payload);
         m->valid |= 1u << field;
     } else {
         m->errors++;
@@ -409,6 +429,17 @@ int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length)
     }
     advance(m);
     return finish(m) ? McaCycleDone : McaAnswer;
+}
+
+const char *piano_mca_status_name(int32_t status)
+{
+    switch (status) {
+    case 1: return "charging";
+    case 2: return "discharging";
+    case 3: return "not charging";
+    case 4: case 5: return "full";
+    default: return "unknown";
+    }
 }
 
 const char *piano_mca_type_name(int type)

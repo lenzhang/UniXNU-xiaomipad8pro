@@ -315,6 +315,29 @@ constexpr uint32_t kAmcEnable = 1u << 16, kAmcTrigger = 1u << 24, kMsgidWriteRes
 constexpr uint32_t kCmdIssued = 1u << 8, kCmdCompleted = 1u << 16;
 bool gTcsStuck[kActiveTcs];
 
+// The DRV-2 owner word of PianoA830 (package/PianoA830/adreno830/platform/sm8750/Sm8750Rpmh.h §4.3.4): one 32-bit word, 0 = free,
+// any other value = its owner's tag. The A830 driver holds it around its own TCS transactions, so the installed system (piano-gpu=2)
+// and this driver cannot program the same TCS at once. PianoA830 is listed before PianoPower in configs/k27-native-kexts.txt, so the
+// KC linker (which has no weak imports) resolves this to A830's single copy; PianoPower.json names PianoA830 as a library. The
+// protocol is A830's: compare-exchange 0 for our tag, 10 us between tries, at most 2 s, and store 0 to release.
+extern "C" volatile uint32_t sm8750_rpmh_drv2_owner;
+constexpr uint32_t kDrv2Tag = 0x504f5752;   // "POWR"
+constexpr unsigned kDrv2Steps = 200000, kDrv2StepUs = 10;
+
+// Takes the lock; *waits gets the 10 us waits. false: someone held it for 2 s (then nothing is programmed).
+bool drv2Acquire(uint32_t *waits) {
+    for (uint32_t n = 0;; ++n) {
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&sm8750_rpmh_drv2_owner, &expected, kDrv2Tag, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            *waits = n;
+            return true;
+        }
+        if (n == kDrv2Steps) {*waits = n; return false;}
+        IODelay(kDrv2StepUs);
+    }
+}
+void drv2Release() {__atomic_store_n(&sm8750_rpmh_drv2_owner, 0, __ATOMIC_RELEASE);}
+
 uint32_t rscRead(uint64_t at) {return rd(gRsc, kRscTcs + at);}
 void rscWrite(uint64_t at, uint32_t value, const char *what) {
     if (gKnobs.trace) say("rsc: write %s (+%#llx) = %#x", what, (unsigned long long)(kRscTcs + at), value);
@@ -322,7 +345,7 @@ void rscWrite(uint64_t at, uint32_t value, const char *what) {
     if (gKnobs.trace) say("rsc: written %s, reads %#x", what, rd(gRsc, kRscTcs + at));
 }
 
-int vote(uint32_t lcx, uint32_t lmx, const char *why) {
+int voteLocked(uint32_t lcx, uint32_t lmx, const char *why) {
     const QcomRscLayout &l = gLayout;
     const uint32_t id = rd(gRsc, 0), major = (id >> 16) & 0xff;
     say("rsc: %s: lcx index %u, lmx index %u; DRV id %#x (version %u.%u: %s register layout)", why, lcx, lmx, id, major, (id >> 8) & 0xff,
@@ -387,6 +410,21 @@ int vote(uint32_t lcx, uint32_t lmx, const char *why) {
     rscWrite(0, irqEnable, "IRQ_ENABLE (as it was)");
     say("rails: lcx index %u, lmx index %u%s", lcx, lmx, completed ? "" : " (completion not seen)");
     return completed ? 0 : -60;
+}
+
+// Every vote of ours runs with PianoA830's DRV-2 owner word held, so a GPU vote cannot be programming the same TCS.
+int vote(uint32_t lcx, uint32_t lmx, const char *why) {
+    uint32_t waits = 0;
+    const uint32_t held = __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE);
+    if (held) say("rsc: the DRV-2 lock is held by %#x; waiting", held);
+    if (!drv2Acquire(&waits)) {
+        say("rsc: the DRV-2 lock stayed held by %#x for 2 s: no vote sent", __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE));
+        return -16;
+    }
+    if (waits) say("rsc: DRV-2 lock taken after %u waits of %u us", waits, kDrv2StepUs);
+    const int rc = voteLocked(lcx, lmx, why);
+    drv2Release();
+    return rc;
 }
 
 // ---- secure world calls (Sm8750Scm: INTERRUPTED, WAITQ_SLEEP polled, EBUSY) ----
