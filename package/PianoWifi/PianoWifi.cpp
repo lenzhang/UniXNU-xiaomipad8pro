@@ -18,7 +18,12 @@
 //                  port, PERST# released, the LTSSM, L0, the configuration window, `17cb:110e`, the memory window, BAR0, and the
 //                  SMMU stream 0x1401 through a bypass context bank.
 //   piano-wifi=4   MHI: the DMA window, the MHI registers in BAR0, `image/peach/amss20.bin` read at run time from the tablet's own
-//                  modem_a, BHI (the boot loader), the MHI contexts, BHIe (the rest of the image), mission mode. Stops there.
+//                  modem_a, BHI (the boot loader), the MHI contexts, BHIe (the rest of the image), mission mode.
+//   piano-wifi=5   QMI: the chip's two IPC router channels over MHI, the router itself, and the WLAN firmware's QMI service — the
+//                  radio's and the chip's capability, the indication registration, the host capability, the firmware's memory
+//                  regions answered out of the same window, the regulatory database and the China-region board file in 6 KiB
+//                  segments, the PHY and auxiliary microcodes by address, the trace configuration, and the firmware's ready
+//                  indication. Every file is read at run time from the tablet's own modem_a. Stops there.
 // Levels are cumulative and each one stops the ladder where it fails, leaving WLAN_EN low and PERST# asserted. Other arguments:
 // piano-wifi-delay=S (wait S seconds first, default 0), piano-wifi-repeat=S with piano-wifi-samples=N (resample the MMIO part every
 // S s, N times, default 3, one summary line each), piano-wifi-hwcg=1 (count a hardware-gated, voted branch under HW_CTL that reads
@@ -26,7 +31,11 @@
 // 2), piano-wifi-physeq=0 (only the PHY sequence's frame writes), piano-wifi-rcg=0 (leave the aux/rchng sources alone),
 // piano-wifi-blind=1 (vote a rail whose PMIC state could not be read), piano-wifi-release=1 (on a failure withdraw the enable of
 // the rails this driver enabled), piano-wifi-stop=N (return after step N), piano-wifi-dma=M (the DMA window in MiB, default 24),
-// piano-wifi-fwtimeout=MS (the deadline of each MHI phase, default 20000). Without piano-wifi the driver declines in probe() and
+// piano-wifi-fwtimeout=MS (the deadline of each MHI phase, default 20000), piano-wifi-qmitimeout=MS (the deadline of each level 5
+// step, default 10000), piano-wifi-iova=1 (give the endpoint's stream a translating context bank whose 32-bit window maps the DMA
+// window, instead of the bypass bank of level 3: the only way to hand this chip a 32-bit address, since piano's XNU memory is all
+// above 4 GiB), piano-wifi-mode=1 (level 5 also sends the firmware's options, the host's copy-engine configuration and the mode,
+// which is level 6's doorway), piano-wifi-shadow=1 (the shadow register list in that configuration). Without piano-wifi the driver declines in probe() and
 // maps nothing.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -40,9 +49,12 @@
 #include <stdarg.h>
 #include "SmmuStream.h"
 #include "WifiBringup.h"
+#include "WifiChannels.h"
 #include "WifiFirmware.h"
 #include "WifiMhi.h"
+#include "WifiSmmuWindow.h"
 #include "WifiSurvey.h"
+#include "WifiWlfw.h"
 
 using namespace pianowifi;
 
@@ -56,6 +68,7 @@ namespace {
 struct Args {
   uint32_t level, spmi, smmu, cmddb, hwcg, delay, repeat, samples;
   uint32_t gen, physeq, rcg, blind, release, stop, dmaMib, fwTimeoutMs;
+  uint32_t iova, mode, shadow, qmiTimeoutMs;
 };
 Args gArgs;
 
@@ -86,10 +99,18 @@ void readArgs()
   gArgs.blind = bootArg("piano-wifi-blind", 0);
   gArgs.release = bootArg("piano-wifi-release", 0);
   gArgs.stop = bootArg("piano-wifi-stop", 0);
-  gArgs.dmaMib = bootArg("piano-wifi-dma", kDmaWindowBytes >> 20);
-  if (gArgs.dmaMib < 12 || gArgs.dmaMib > 64) gArgs.dmaMib = kDmaWindowBytes >> 20;
+  // Level 5 needs the firmware's regions, the two microcodes and the router's buffers in the same window as level 4's image.
+  const uint32_t dmaDefault = (gArgs.level >= 5 ? kDmaWindowBytesL5 : kDmaWindowBytes) >> 20;
+  gArgs.dmaMib = bootArg("piano-wifi-dma", dmaDefault);
+  if (gArgs.dmaMib < 12 || gArgs.dmaMib > 96) gArgs.dmaMib = dmaDefault;
+  gArgs.dmaMib &= ~1u;   // whole 2 MiB blocks: the window's own mapping (piano-wifi-iova) maps it in blocks of that size
   gArgs.fwTimeoutMs = bootArg("piano-wifi-fwtimeout", 20000);
   if (gArgs.fwTimeoutMs < 1000 || gArgs.fwTimeoutMs > 60000) gArgs.fwTimeoutMs = 20000;
+  gArgs.iova = bootArg("piano-wifi-iova", 0);
+  gArgs.mode = bootArg("piano-wifi-mode", 0);
+  gArgs.shadow = bootArg("piano-wifi-shadow", 0);
+  gArgs.qmiTimeoutMs = bootArg("piano-wifi-qmitimeout", kWlfwTimeoutMs);
+  if (gArgs.qmiTimeoutMs < 1000 || gArgs.qmiTimeoutMs > 60000) gArgs.qmiTimeoutMs = kWlfwTimeoutMs;
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -792,6 +813,7 @@ bool smmuStream(uint16_t stream)
 IOBufferMemoryDescriptor *gDmaBuffer;
 IOMemoryMap *gDmaMap;
 Arena gArena;
+uint64_t gDmaPa;
 
 void cleanToPoc(const void *start, size_t length)
 {
@@ -839,9 +861,85 @@ bool dmaWindow()
     return false;
   }
   gDmaBuffer = buffer;
-  arenaInit(gArena, va, pa, uint32_t(bytes));
-  note("dma: %llu MiB at %#llx (write-combined mapping %p), the endpoint's bus addresses are physical (stream 0x1401 bypasses)",
-       (unsigned long long)gArgs.dmaMib, (unsigned long long)pa, va);
+  gDmaPa = pa;
+  // piano-wifi-iova=1: the chip's addresses are the 32-bit window's, which the SMMU translates to this range (iovaWindow()
+  // below, called once stream 0x1401 has its bank); otherwise they are physical, which only works while the stream bypasses.
+  arenaInit(gArena, va, gArgs.iova ? uint64_t(kIovaWindowBase) : pa, uint32_t(bytes));
+  note("dma: %llu MiB at %#llx (write-combined mapping %p), the endpoint's addresses are %s",
+       (unsigned long long)gArgs.dmaMib, (unsigned long long)pa, va,
+       gArgs.iova ? "this window's 32-bit addresses (stream 0x1401 translates)" : "physical (stream 0x1401 bypasses)");
+  return true;
+}
+
+// ---- the 32-bit window for the endpoint's stream (WifiSmmuWindow.h), with piano-wifi-iova=1 ----
+// The page table is a buffer of its own, not part of the window: the chip can reach every byte of the window, and its own
+// translation tables must not be among them. The table is cacheable and cleaned to the point of coherency once, as the SMMU's
+// walker is not coherent with the CPU's caches (the bank walks non-cacheable).
+IOBufferMemoryDescriptor *gIovaTable;
+iova::Window gIovaWindow;
+iova::Plan gIovaPlan;
+
+bool iovaWindow()
+{
+  if (!gSmmuVa) {
+    note("iova: the SMMU window is not mapped");
+    return false;
+  }
+  IOBufferMemoryDescriptor *table = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+      kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), iova::kTableBytes,
+      0x0000000ffffff000ull);   // 36 bits, 4 KiB aligned
+  if (!table || table->prepare() != kIOReturnSuccess) {
+    if (table) table->release();
+    note("iova: no page table of %llu bytes", (unsigned long long)iova::kTableBytes);
+    return false;
+  }
+  IOByteCount contiguous = 0;
+  const uint64_t tablePa = table->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
+  uint64_t *words = static_cast<uint64_t *>(table->getBytesNoCopy());
+  if (!tablePa || !words || contiguous < iova::kTableBytes) {
+    table->complete();
+    table->release();
+    note("iova: the page table is not usable (pa %#llx)", (unsigned long long)tablePa);
+    return false;
+  }
+  if (!iova::buildWindow(gIovaWindow, words, words + 512, tablePa, gDmaPa, uint32_t(uint64_t(gArgs.dmaMib) << 20),
+                         kIovaWindowBase)) {
+    table->complete();
+    table->release();
+    note("iova: the window (%#x + %u MiB over %#llx) does not fit the rule", kIovaWindowBase, gArgs.dmaMib,
+         (unsigned long long)gDmaPa);
+    return false;
+  }
+  cleanToPoc(words, size_t(iova::kTableBytes));
+  gIovaTable = table;
+  gIovaPlan = iova::plan(kStreamEndpoint, kSmmuBytes, [](uint32_t off) { return smmuRead(off); });
+  note("iova: window %#x + %u MiB -> %#llx in %u blocks of 2 MiB, table at %#llx; SMMU groups %u banks %u pages %u: %s slot %u "
+       "bank %u (output %u bits)",
+       gIovaWindow.base, gIovaWindow.bytes >> 20, (unsigned long long)gDmaPa, gIovaWindow.blocks,
+       (unsigned long long)tablePa, gIovaPlan.groups, gIovaPlan.banks, gIovaPlan.pages,
+       gIovaPlan.reuse ? "the stream's own" : "free", gIovaPlan.slot, gIovaPlan.bank, iova::kPaBits[gIovaPlan.pasize]);
+  if (gIovaPlan.error) {
+    note("iova: no context bank for stream %#x: %s", kStreamEndpoint, gIovaPlan.error);
+    return false;
+  }
+  // The self-check before the chip is given any of these addresses: every block translates to where the window really is.
+  for (uint32_t block = 0; block < gIovaWindow.blocks; ++block) {
+    const uint64_t at = uint64_t(gIovaWindow.base) + uint64_t(block) * kIovaBlockBytes;
+    if (iova::translate(gIovaWindow, at) == gDmaPa + uint64_t(block) * kIovaBlockBytes) continue;
+    note("iova: the table does not translate %#llx: the window is not usable", (unsigned long long)at);
+    return false;
+  }
+  const uint64_t deadline = nowMs() + 100;
+  const char *failure = iova::apply(gIovaPlan, kStreamEndpoint, tablePa, [](uint32_t off) { return smmuRead(off); },
+                                    [](uint32_t off, uint32_t v) { wr32(gSmmuVa + off, v); dsb(); },
+                                    [deadline] { return nowMs() >= deadline; });
+  if (failure) {
+    note("iova: stream %#x did not take the window: %s", kStreamEndpoint, failure);
+    return false;
+  }
+  note("iova: stream %#x translates through bank %u (smr %08x s2cr %08x sctlr %08x)", kStreamEndpoint, gIovaPlan.bank,
+       smmuRead(0x800 + 4 * gIovaPlan.slot), smmuRead(0xc00 + 4 * gIovaPlan.slot),
+       smmuRead(gIovaPlan.cb + iova::kCbSctlr));
   return true;
 }
 
@@ -890,6 +988,9 @@ uint32_t chipRead(uint32_t address)
   (void)barRd(nullptr, kChipWindowReg);
   return barRd(nullptr, kChipWindowStart + (address & kChipWindowRange));
 }
+
+MhiContexts gContexts;
+uint32_t gMhiRegLen;
 
 struct FirmwarePlan {
   FwLayout layout;
@@ -969,6 +1070,7 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
     safeOff(gHw, power, opt);
     return -5;
   }
+  gMhiRegLen = boot.reglen;
   const uint32_t version = chipRead(kChipTcsrSocHwVersion);
   note("level 4: BHI at %#x, BHIe at %#x, EE %s, state %#x; chip TCSR version %08x (major %u)", boot.bhi, boot.bhie,
        mhiEeName(mhiEeRead(boot)), mhiStateRead(boot), version, (version >> 8) & 0xfu);
@@ -978,8 +1080,8 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
     safeOff(gHw, power, opt);
     return -2;
   }
-  piano_wifi_firmware_close();
-  MhiContexts contexts;
+  if (gArgs.level < 5) piano_wifi_firmware_close();   // level 5 reads its own files from the same partition
+  MhiContexts &contexts = gContexts;
   uint64_t contextBus = 0;
   uint8_t *contextVa = arenaAlloc(gArena, kMhiContextBytes, &contextBus);
   if (!contextVa || !mhiContextsPlan(contexts, contextVa, contextBus, kMhiContextBytes)) {
@@ -1033,6 +1135,243 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
   return 0;
 }
 
+// =============================================== level 5: the IPC router's channels, QRTR, and the firmware's QMI service
+// The transport (WifiChannels.h) over the contexts level 4 gave the chip, the copied router (WifiQrtr.c) on top of it, and the
+// WLFW client (WifiWlfw.h) on top of that. Everything is polled from this thread: no MSI, no interrupt, no allocation after the
+// window, and every wait is bounded by piano-wifi-qmitimeout.
+Ipcr gIpcr;
+QcomQrtr gRouter;
+WlfwClient gClient;
+unsigned gQrtrUnrouted;
+
+// The link's send: a packet that already sits in one of our outbound buffers is submitted as it is; a control packet the router
+// built on its stack (hello, resume) is copied into a free buffer first.
+int qrtrSend(void *, const uint8_t *packet, uint32_t length)
+{
+  for (unsigned i = 0; i < kIpcrOutBuffers; ++i)
+    if (gIpcr.tx[i].va == packet) return ipcrSubmitTx(gIpcr, gMhiIo, i, length) ? 0 : -1;
+  const int index = ipcrClaimTx(gIpcr);
+  if (index < 0 || length > gIpcr.tx[index].bytes) return -1;
+  memcpy(gIpcr.tx[index].va, packet, length);
+  return ipcrSubmitTx(gIpcr, gMhiIo, unsigned(index), length) ? 0 : -1;
+}
+
+// A data packet for our port: the client's next message.
+void qrtrReceive(void *, QcomQrtr *, uint32_t, uint32_t, uint32_t, const uint8_t *data, uint32_t length)
+{
+  wlfwReceive(gClient, data, length);
+}
+
+// What the client needs: a buffer with room for the router's header in front of the message, the send, the firmware files of the
+// stock partition, memory of the window, and one line per step.
+uint8_t *wlfwClaim(void *, uint32_t *capacity)
+{
+  const int index = ipcrClaimTx(gIpcr);
+  if (index < 0) return nullptr;
+  *capacity = gIpcr.tx[index].bytes - QCOM_QRTR_HEADER;
+  return gIpcr.tx[index].va + QCOM_QRTR_HEADER;
+}
+int wlfwSendMessage(void *, uint8_t *buffer, uint32_t length)
+{
+  uint8_t *base = buffer - QCOM_QRTR_HEADER;
+  uint32_t node = 0, port = 0;
+  if (qcom_qrtr_find_service(&gRouter, kWlfwService, kWlfwInstanceWord, &node, &port)) return -1;
+  for (unsigned i = 0; i < kIpcrOutBuffers; ++i)
+    if (gIpcr.tx[i].va == base)
+      return qcom_qrtr_send_buffer(&gRouter, base, gIpcr.tx[i].bytes, kQrtrClientPort, node, port, length);
+  return -1;
+}
+uint32_t wlfwFileSize(void *, const char *name)
+{
+  uint32_t bytes = 0;
+  return piano_wifi_firmware_stat(name, &bytes, nullptr) ? 0 : bytes;
+}
+int wlfwFileRead(void *, const char *name, uint64_t offset, void *to, uint32_t bytes)
+{
+  return piano_wifi_firmware_read(name, offset, to, bytes);
+}
+uint64_t wlfwMemory(void *, uint32_t bytes, uint8_t **va)
+{
+  uint64_t bus = 0;
+  uint8_t *p = arenaAlloc(gArena, bytes, &bus);
+  if (!p) return 0;
+  if (va) *va = p;
+  return bus;
+}
+void wlfwStepNote(void *, int step, const char *what)
+{
+  piano_wifi_stage = step;
+  note("step %d: %s", step, what);
+}
+
+// One turn: the event rings walked, every received packet given to the router, the buffers given back to the chip. Returns how
+// many events were seen; `stop` is set when the chip reported an environment this driver cannot go on from.
+unsigned pump(bool &stop)
+{
+  bool fatal = false;
+  const unsigned seen = ipcrPoll(gIpcr, gContexts, gMhiIo, [&](uint32_t kind, uint32_t, uint32_t code, uint32_t length,
+                                                               uint8_t *va) {
+    switch (kind) {
+    case kIpcrPacket:
+      if (qcom_qrtr_receive(&gRouter, va, length)) ++gQrtrUnrouted;
+      break;
+    case kIpcrState:
+      note("level 5: the chip reports state %#x", code);
+      break;
+    case kIpcrEe:
+      note("level 5: the chip reports environment %s", mhiEeName(code));
+      if (code == kEeRddm) fatal = true;
+      break;
+    default:
+      break;
+    }
+  });
+  if (seen) ipcrPostRx(gIpcr, gMhiIo);
+  stop = fatal;
+  return seen;
+}
+
+// A channel started: one command on the primary ring, then its completion event.
+bool startChannel(uint32_t channel)
+{
+  if (!ipcrCommand(gIpcr, gMhiIo, channel, kTreCmdStart)) {
+    note("level 5: the start command for channel %u could not be queued (%s)", channel,
+         gIpcr.error ? gIpcr.error : "a command is in flight");
+    return false;
+  }
+  const uint64_t deadline = nowMs() + kMhiCommandTimeoutMs;
+  while (nowMs() < deadline) {
+    bool stop = false;
+    pump(stop);
+    if (stop) return false;
+    if ((channel == kChanIpcrOut && gIpcr.started[0]) || (channel == kChanIpcrIn && gIpcr.started[1])) return true;
+    if (gIpcr.commandErrors) {
+      note("level 5: the chip refused to start channel %u (completion code %#x)", channel, gIpcr.lastCode);
+      return false;
+    }
+    IOSleep(2);
+  }
+  note("level 5: no completion for the start of channel %u within %u ms", channel, kMhiCommandTimeoutMs);
+  return false;
+}
+
+int level5(PowerState &power, const Options &opt)
+{
+  stage(500, "level 5: the IPC router's channels, QRTR, and the WLAN firmware's QMI service");
+  if (!ipcrPlan(gIpcr, gArena, gContexts)) {
+    stage(-500, "level 5: the DMA window has no room for the channels' rings and buffers");
+    safeOff(gHw, power, opt);
+    return -1;
+  }
+  if (!ipcrOpen(gIpcr, gMhiIo, gMhiRegLen)) {
+    stage(-500, "level 5: the chip's doorbell arrays are not where the register space says");
+    safeOff(gHw, power, opt);
+    return -2;
+  }
+  note("level 5: channels %u and %u planned (%u elements each, %u KiB of buffers), channel doorbells at %#x, event doorbells "
+       "at %#x",
+       kChanIpcrOut, kChanIpcrIn, kIpcrElements, (kIpcrRxBuffers + kIpcrOutBuffers) * kIpcrBufferBytes / 1024, gIpcr.chdb,
+       gIpcr.erdb);
+  if (!startChannel(kChanIpcrOut) || !startChannel(kChanIpcrIn)) {
+    stage(-501, "level 5: a channel did not start");
+    safeOff(gHw, power, opt);
+    return -3;
+  }
+  const unsigned posted = ipcrPostRx(gIpcr, gMhiIo);
+  note("level 5: both channels run (states %#x / %#x), %u receive buffers posted", ipcrChanState(gIpcr.out),
+       ipcrChanState(gIpcr.in), posted);
+  // The router: our hello, then the firmware's hello and its service announcement.
+  qcom_qrtr_init(&gRouter, kQrtrLocalNode, qrtrSend, nullptr);
+  if (qcom_qrtr_add_client(&gRouter, kQrtrClientPort, qrtrReceive, nullptr)) {
+    stage(-502, "level 5: the router's client port could not be added");
+    safeOff(gHw, power, opt);
+    return -4;
+  }
+  qcom_qrtr_start(&gRouter);
+  uint32_t node = 0, port = 0;
+  uint64_t deadline = nowMs() + gArgs.qmiTimeoutMs;
+  while (nowMs() < deadline) {
+    bool stop = false;
+    pump(stop);
+    if (stop) break;
+    if (!qcom_qrtr_find_service(&gRouter, kWlfwService, kWlfwInstanceWord, &node, &port)) break;
+    IOSleep(5);
+  }
+  if (!gRouter.hello_received || qcom_qrtr_find_service(&gRouter, kWlfwService, kWlfwInstanceWord, &node, &port)) {
+    note("level 5: hello %s, %u services announced, %u packets in (%u unrouted)", gRouter.hello_received ? "answered" : "unanswered",
+         gRouter.remote_count, gRouter.rx_packets, gRouter.rx_unrouted);
+    stage(-502, "level 5: the firmware's QMI service was not announced on the router");
+    safeOff(gHw, power, opt);
+    return -5;
+  }
+  note("level 5: the router is up (our node %u port %#x, the chip's node %u; the firmware's service %u instance %#x on port %u)",
+       kQrtrLocalNode, kQrtrClientPort, gRouter.remote_node, kWlfwService, kWlfwInstanceWord, port);
+  // The service's exchange.
+  WlfwIo io;
+  io.ctx = nullptr;
+  io.claim = wlfwClaim;
+  io.send = wlfwSendMessage;
+  io.file_size = wlfwFileSize;
+  io.file_read = wlfwFileRead;
+  io.memory = wlfwMemory;
+  io.step = wlfwStepNote;
+  const uint64_t started = nowMs();
+  if (!wlfwStart(gClient, io, gArgs.mode, gArgs.shadow)) {
+    note("level 5: the first request was not sent: %s", wlfwErrorName(gClient.error));
+    stage(-503, "level 5: the QMI exchange did not start");
+    safeOff(gHw, power, opt);
+    return -6;
+  }
+  int last = gClient.step;
+  deadline = nowMs() + gArgs.qmiTimeoutMs;
+  while (gClient.step != kWlfwStepDone && gClient.step != kWlfwStepStopped) {
+    bool stop = false;
+    pump(stop);
+    if (stop) {
+      wlfwTimedOut(gClient);
+      note("level 5: the chip went to its crash dump environment during %s", wlfwStepName(last));
+      break;
+    }
+    if (gClient.step != last) {   // a step moved: its own deadline
+      last = gClient.step;
+      deadline = nowMs() + gArgs.qmiTimeoutMs;
+      continue;
+    }
+    if (nowMs() > deadline) {
+      wlfwTimedOut(gClient);
+      break;
+    }
+    IOSleep(2);
+  }
+  // What the firmware said, and what was sent to it.
+  note("level 5: the chip: chip %#x family %#x system-on-chip %#x, board %#x, %u radio(s)%s", gClient.chipId,
+       gClient.chipFamily, gClient.socId, gClient.boardId, gClient.radios, gClient.singleChipMlo ? ", single-chip multi-link" : "");
+  note("level 5: the firmware: version %#x built %s, capabilities %#llx, status %#llx, %u MAC(s), %u mV", gClient.fwVersion,
+       gClient.buildTimestamp[0] ? gClient.buildTimestamp : "?", (unsigned long long)gClient.fwCaps,
+       (unsigned long long)gClient.fwStatus, gClient.macs, gClient.voltageMv);
+  note("level 5: memory: %u request(s), %u region(s) of %u KiB asked for, %u KiB given%s", gClient.memRequests,
+       gClient.regionCount, gClient.regionBytes / 1024, gClient.regionGiven / 1024,
+       gClient.memDelayed ? " (the last answer asked the firmware to come back with smaller pieces)" : "");
+  for (uint32_t i = 0; i < gClient.regionCount && i < 8; ++i)
+    note("level 5: region %u: %u KiB of %s at %#llx", i, gClient.regions[i].size / 1024,
+         wlfwMemTypeName(gClient.regions[i].type), (unsigned long long)gClient.regions[i].address);
+  note("level 5: %u requests, %u responses, %u indications, %u download segments, %u shadow registers, %u unexpected messages",
+       gClient.requests, gClient.responses, gClient.indications, gClient.segments, gClient.shadowCount, gClient.unexpected);
+  note("level 5: the transport: %u packets out, %u in, %u completions, %u commands, %u events dropped, %u refused claims; "
+       "the router: %u packets in, %u data, %u unrouted, %u refused sends",
+       gIpcr.sent, gIpcr.received, gIpcr.txDone, gIpcr.commands, gIpcr.dropped, gIpcr.refused, gRouter.rx_packets,
+       gRouter.rx_data, gRouter.rx_unrouted, gRouter.tx_refused);
+  const bool done = gClient.step == kWlfwStepDone;
+  note("level 5: %s after %llu ms (step %d: %s%s%s)", done ? "the firmware is ready" : "stopped",
+       (unsigned long long)(nowMs() - started), done ? gClient.step : gClient.failedStep,
+       wlfwStepName(done ? gClient.step : gClient.failedStep), done ? "" : ", ", done ? "" : wlfwErrorName(gClient.error));
+  if (!done) {
+    safeOff(gHw, power, opt);
+    return -7;
+  }
+  return 0;
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------------ the service
@@ -1062,11 +1401,12 @@ bool PianoWifi::start(IOService *provider)
        gArgs.level, gArgs.spmi, gArgs.smmu, gArgs.cmddb, gArgs.hwcg, gArgs.delay, gArgs.repeat, gArgs.samples, kEndpointVendor,
        kEndpointDevice, (unsigned long long)kParf);
   if (gArgs.level >= 2)
-    note("levels: 1 survey, 2 power, 3 link%s (gen %u, physeq %u, rcg %u, blind %u, release %u, stop %u, dma %u MiB, "
-         "phase timeout %u ms)",
-         gArgs.level >= 4 ? ", 4 MHI firmware" : "", gArgs.gen, gArgs.physeq, gArgs.rcg, gArgs.blind, gArgs.release, gArgs.stop,
-         gArgs.dmaMib, gArgs.fwTimeoutMs);
-  if (gArgs.level > 4) note("piano-wifi=%u: levels above 4 are not implemented; running up to level 4", gArgs.level);
+    note("levels: 1 survey, 2 power, 3 link%s%s (gen %u, physeq %u, rcg %u, blind %u, release %u, stop %u, dma %u MiB, "
+         "phase timeout %u ms, qmi timeout %u ms, iova %u, mode %u, shadow %u)",
+         gArgs.level >= 4 ? ", 4 MHI firmware" : "", gArgs.level >= 5 ? ", 5 QMI" : "", gArgs.gen, gArgs.physeq, gArgs.rcg,
+         gArgs.blind, gArgs.release, gArgs.stop, gArgs.dmaMib, gArgs.fwTimeoutMs, gArgs.qmiTimeoutMs, gArgs.iova, gArgs.mode,
+         gArgs.shadow);
+  if (gArgs.level > 5) note("piano-wifi=%u: levels above 5 are not implemented; running up to level 5", gArgs.level);
   note("level 1: loads only, nothing written%s", gArgs.spmi || gArgs.level >= 2 ? "; SPMI observer read commands for the PMIC part"
                                                                                : "");
   setProperty("piano-wifi", gArgs.level, 32);
@@ -1217,10 +1557,29 @@ void PianoWifi::run()
     unmapAll();
     return;
   }
+  if (gArgs.iova && !iovaWindow()) {
+    stage(-400, "level 4: the window's 32-bit addresses were not set up; nothing was given to the endpoint");
+    safeOff(gHw, power, opt);
+    unmapWindows();
+    unmapAll();
+    return;
+  }
   rc = level4(link, power, opt);
   writeSummary("level 4");
   stage(rc ? -401 : 401, rc ? "level 4 stopped before mission mode" : "level 4: the firmware runs (mission mode)");
-  note("level 4: %s; the ladder ends here (QMI, WMI and the station are levels 5 and up)",
-       rc ? "the chip did not reach mission mode" : "the chip is in mission mode");
+  note("level 4: %s%s", rc ? "the chip did not reach mission mode" : "the chip is in mission mode",
+       rc ? "" : gArgs.level < 5 ? "; the ladder ends here (QMI is level 5, WMI and the station levels 6 and up)" : "");
+  if (rc || gArgs.level < 5) {
+    unmapAll();
+    return;
+  }
+
+  // ---- level 5 ---------------------------------------------------------------------------------------------------------
+  rc = level5(power, opt);
+  piano_wifi_firmware_close();
+  writeSummary("level 5");
+  stage(rc ? -504 : 504, rc ? "level 5 stopped before the firmware was ready" : "level 5: the firmware is ready");
+  note("level 5: %s; %s", rc ? "the firmware did not become ready" : "the firmware is ready",
+       rc ? "the ladder ends here" : "WMI, the scan and the station are levels 6 and up (docs/drivers/wifi.md section 13)");
   unmapAll();
 }
