@@ -1,6 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: BSD-2-Clause-Patent
-# The power test images of docs/power.md §6 (k27 0061 CPU idle, 0062 suspend-to-idle), in the order of risk, from a KC whose
+# The power test images of docs/power.md §6 (k27 0061 CPU idle, 0062 suspend-to-idle; the ufs* images: the storage side,
+# docs/drivers/ufs.md §12.8), in the order of risk, from a KC whose
 # kernel has 0061 and 0062. Each is a RAM image of the GPU profile (as the installed system boots: PianoA830 and Turnip,
 # vmm-present 0) plus PianoPower's battery lines every 10 s, the USB console and the buttons, with piano-reset-after as the
 # backstop and every reset into ABL fastboot (build-ram-images.py's K27_ARGS). Data: build-ram-images.py's store guard decides
@@ -28,7 +29,12 @@ done
 # keeps the command line under DarwinBoot's 1023 bytes with the power arguments.
 BASE="piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-power=1 piano-power-period=10 piano-usb=2 piano-input=1 ${PM_EXTRA:-}"
 CYCLES="piano-sleep-test=150 piano-sleep-test-count=3 piano-sleep-max=30"
-ORDER="base probe idle1 idle2 idle1pd idle3 sleep0 sleep1 sleep2 sleepkey measure"
+ORDER="base probe idle1 idle2 idle1pd idle3 sleep0 sleep1 sleep2 sleepkey measure ufssleep0 ufssleep1 ufsahit ufsahitsleep ufsmeasure"
+# The storage side (docs/drivers/ufs.md §12): native-ufs-suspend=1 (NativeUfs's link into Hibern8 for each sleep, the Data disk held
+# and synced first when its store is open read-write) and native-ufs-ahit=MS (auto-hibernate at run time). The store follows
+# build-ram-images.py's guard like every image here: with another seed than the installed one Data is volatile and only the root
+# windows take part; with the installed seed (data-persist=2) NativeRamBlock takes part too.
+UFS="native-ufs-suspend=1"
 # image NAME: sets A (its arguments) and R (its piano-reset-after, s)
 image() {
   case $1 in
@@ -46,6 +52,12 @@ image() {
               # vol-, keyboard); the cover's close needs PianoKeyboard in the KC: PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/PianoKeyboard.json
     measure)  A="piano-cpuidle=2 piano-sleep=1 piano-sleep-state=2 piano-sleep-test=240 piano-sleep-test-count=1"
               A="$A piano-sleep-max=1800";                      R=2400 ;;   # no cable: 30 min suspended between battery lines
+    ufssleep0) A="piano-sleep=1 piano-sleep-state=0 $CYCLES $UFS"; R=600 ;;   # S1 + the UFS link in Hibern8 (CPUs in WFI)
+    ufssleep1) A="piano-sleep=1 piano-sleep-state=1 $CYCLES $UFS"; R=600 ;;   # S2 + the same
+    ufsahit)   A="native-ufs-ahit=1000";                          R=900 ;;    # auto-hibernate after 1 s idle; A/B with base
+    ufsahitsleep) A="native-ufs-ahit=1000 piano-sleep=1 piano-sleep-state=1 $CYCLES $UFS"; R=600 ;;   # both: AHIT off/on per sleep
+    ufsmeasure) A="piano-cpuidle=2 piano-sleep=1 piano-sleep-state=2 piano-sleep-test=240 piano-sleep-test-count=1"
+              A="$A piano-sleep-max=1800 $UFS";                 R=2400 ;;   # measure's A/B: the same with the link in Hibern8
     *) return 1 ;;
   esac
 }
