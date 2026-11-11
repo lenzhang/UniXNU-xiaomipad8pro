@@ -7,7 +7,9 @@
 //   port 0: the kernel console (the pstore-console ring of k27 0055/0058, else the message buffer) streamed live, with the
 //           whole retained boot log replayed when the Mac opens the port, and a line-based kernel monitor (help, ioreg,
 //           peek, reset, ...);
-//   port 1: a byte pipe to user space, /dev/pianousb (piano-usb-shell=1), for a shell or `log stream` (docs).
+//   port 1: a byte pipe to user space, /dev/pianousb (piano-usb-shell=1), for a shell or `log stream` (docs);
+//   with piano-usb-hid=1 a third port, input from the Mac into two HID devices; with piano-usb-net=1 a CDC-NCM network function
+//   after the ports, whose macOS side is PianoUsbNet.cpp's IOEthernetController (an Ethernet link to the Mac).
 // Apple's own device stack (IOUSBDeviceFamily, AppleUSBDeviceNCM) is not used: the macOS 27.0.1 VM kernel collection has no
 // XDCI controller class to put under it (docs/drivers/usb-device-debug.md section 3).
 //
@@ -46,6 +48,7 @@
 #include "SmmuStream.h"
 #include "HidInput.h"
 #include "HidDescriptors.h"   // package/PianoKeyboard: the keyboard (+ consumer) and pointer report descriptors, shared
+#include "UsbNet.h"           // the network function's macOS side (PianoUsbNet.cpp)
 
 using namespace pianousb;
 
@@ -74,6 +77,7 @@ struct Args {
   uint32_t trace;     // piano-usb-trace: events logged one by one after each bus reset (default 400, 0 off)
   uint32_t hid;       // piano-usb-hid=1: a keyboard and a pointer for macOS, driven from the Mac over a third port (piano input)
   uint32_t hidHold;   // piano-usb-hid-hold=MS: keys/buttons still down this long after the last command are released (default 3000)
+  uint32_t net;       // piano-usb-net=1: a CDC-NCM network function after the ports, an Ethernet interface for macOS (PianoUsbNet)
 };
 Args gArgs;
 
@@ -100,6 +104,7 @@ void readArgs()
   gArgs.trace = bootArg("piano-usb-trace", 400);
   gArgs.hid = bootArg("piano-usb-hid", 0);
   gArgs.hidHold = bootArg("piano-usb-hid-hold", 3000);
+  gArgs.net = bootArg("piano-usb-net", 0);
 }
 
 // -------------------------------------------------------------------------------------------------------------------- MMIO
@@ -803,6 +808,16 @@ struct KernelHal {
       }
     }
   }
+  // The network function (piano-usb-net=1): PianoUsbNet.cpp's queues and link.
+  unsigned netTxNext(uint8_t *dst, unsigned room) { return pianonet::txNext(dst, room); }
+  unsigned netRxSpace() { return pianonet::rxSpace(); }
+  bool netRxFrame(const uint8_t *src, unsigned len) { return pianonet::rxFrame(src, len); }
+  void netRxDone() { pianonet::rxDone(); }
+  void netLink(bool up, uint32_t bitsPerSecond)
+  {
+    pianonet::link(up, bitsPerSecond);
+    note("net: the Mac %s the NCM data interface", up ? "selected" : "left");
+  }
   __attribute__((format(printf, 2, 3))) void note(const char *fmt, ...)
   {
     char line[640];
@@ -1066,14 +1081,18 @@ bool takeover()
   const uint32_t ip = gSnpsId >> 16;
   if (ip != 0x5533 && ip != 0x3331 && ip != 0x3332) { stage(-11, "takeover: GSNPSID is not a DWC_usb3x core"); return false; }
   const bool dwc31 = ip != 0x5533;
-  // Port p uses IN endpoints 2p+1 and 2p+2 (EP0 IN is the first): two ports need 5, the input port 7.
+  // Port p uses IN endpoints 2p+1 and 2p+2 (EP0 IN is the first): two ports need 5, the input port 7. The network function uses 7
+  // and 8 whatever the port count: 9 (piano: 16).
   const uint32_t inEps = (gHal.rd(GHWPARAMS3) >> 18) & 0x1fu;
   const unsigned wanted = gArgs.hid ? 3 : 2, ports = inEps >= 2 * wanted + 1 ? wanted : inEps >= 5 ? 2 : 1;
-  note("core %s, %u IN endpoints: %u ACM port(s)%s", dwc31 ? "DWC_usb31/32" : "DWC_usb3", inEps, ports,
-       gArgs.hid && ports < 3 ? " (no input port: it needs 7 IN endpoints)" : gArgs.hid ? " (port 2: piano input)" : "");
+  bool net = gArgs.net != 0 && inEps >= kNetInEndpoints;
+  note("core %s, %u IN endpoints: %u ACM port(s)%s%s", dwc31 ? "DWC_usb31/32" : "DWC_usb3", inEps, ports,
+       gArgs.hid && ports < 3 ? " (no input port: it needs 7 IN endpoints)" : gArgs.hid ? " (port 2: piano input)" : "",
+       net ? " + the CDC-NCM network function (interfaces after the ports, endpoints 7 and 8)" :
+       gArgs.net ? " (no network function: it needs 9 IN endpoints)" : "");
   stage(12, "takeover: halt");
   if (gHal.rd(DCTL) & DCTL_RUN_STOP) note("the firmware left RUN_STOP set (DSTS %08x)", gHal.rd(DSTS));
-  gGadget.bind(&gHal, ports, uint16_t(gArgs.pid), gArgs.trace);
+  gGadget.bind(&gHal, ports, uint16_t(gArgs.pid), gArgs.trace, net);
   if (!gGadget.halt(100)) note("no halt within 100 ms (DSTS %08x): continuing with the soft reset", gHal.rd(DSTS));
   stage(13, "takeover: DMA memory");
   if (!dmaAlloc()) { stage(-13, "takeover: DMA memory"); return false; }
@@ -1098,8 +1117,38 @@ bool takeover()
   note("TX FIFOs after the reset: %08x %08x %08x %08x %08x %08x %08x %08x", gHal.rd(GTXFIFOSIZ0), gHal.rd(GTXFIFOSIZ0 + 4),
        gHal.rd(GTXFIFOSIZ0 + 8), gHal.rd(GTXFIFOSIZ0 + 12), gHal.rd(GTXFIFOSIZ0 + 16), gHal.rd(GTXFIFOSIZ0 + 20), gHal.rd(GTXFIFOSIZ0 + 24),
        gHal.rd(GTXFIFOSIZ0 + 28));
+  // The network function: its IN endpoints' TX FIFOs (7, 8) and the ports' are laid out after EP0's (TxFifoPlan.h), as the reset
+  // values of FIFOs past the firmware's own are not known. Without piano-usb-net no FIFO is written.
+  if (net) {
+    uint8_t packets[TxFifoPlan::kMax] = {};
+    for (unsigned p = 0; p < ports; ++p) {
+      packets[notifyEp(p)] = 1;
+      packets[bulkEp(p)] = 4;
+    }
+    packets[kNetNotifyEp] = 1;
+    packets[kNetBulkEp] = 12;
+    const uint32_t fifo0 = gHal.rd(GTXFIFOSIZ0);
+    const TxFifoPlan plan = planTxFifos(packets, TxFifoPlan::kMax, fifo0,
+                                        txFifoRamWords(gHal.rd(GHWPARAMS1), gHal.rd(GHWPARAMS6), gHal.rd(GHWPARAMS7)),
+                                        txFifoWordBytes(gHal.rd(GHWPARAMS0), gHal.rd(GHWPARAMS6), ip == 0x3332), dwc31);
+    if (plan.error) {
+      note("net: TX FIFO plan: %s (FIFO 0 %08x, RAM %u words of %u bytes): the network function is left out", plan.error, fifo0, plan.ram,
+           plan.wordBytes);
+      net = false;
+      gGadget.bind(&gHal, ports, uint16_t(gArgs.pid), gArgs.trace, false);
+    } else {
+      gGadget.setTxFifoPlan(plan);
+      note("net: TX FIFO plan: words %u..%u of %u (%u bytes each): 1 %08x 2 %08x 3 %08x 4 %08x 5 %08x 6 %08x 7 %08x 8 %08x", plan.begin, plan.end,
+           plan.ram, plan.wordBytes, plan.value[1], plan.value[2], plan.value[3], plan.value[4], plan.value[5], plan.value[6], plan.value[7],
+           plan.value[8]);
+    }
+  }
   stage(17, "takeover: device mode, event buffer, EP0");
   if (!gGadget.init()) { stage(-17, "takeover: endpoint commands"); return false; }
+  if (net)
+    note("net: TX FIFOs now: %08x %08x %08x %08x %08x %08x %08x %08x %08x", gHal.rd(GTXFIFOSIZ0), gHal.rd(GTXFIFOSIZ0 + 4), gHal.rd(GTXFIFOSIZ0 + 8),
+         gHal.rd(GTXFIFOSIZ0 + 12), gHal.rd(GTXFIFOSIZ0 + 16), gHal.rd(GTXFIFOSIZ0 + 20), gHal.rd(GTXFIFOSIZ0 + 24), gHal.rd(GTXFIFOSIZ0 + 28),
+         gHal.rd(GTXFIFOSIZ0 + 32));
   stage(18, "takeover: VBUS/session override");
   if (!sessionValid()) note("QSCRATCH readback differs (continuing)");
   stage(19, "takeover: run");
@@ -1130,6 +1179,16 @@ void usbStatus()
     cprintf("hid: keyboard %s pointer %s; port 2 DTR %x; %u commands (keyboard %u consumer %u pointer %u), %u releases, %u auto-releases, "
             "%u bad lines, %u send errors\n", gHidDevice[0] ? "up" : "absent", gHidDevice[1] ? "up" : "absent", gLines[kPortInput],
             gHid.commands, gHid.keyboard, gHid.consumer, gHid.pointer, gHid.releases, gHid.autoReleases, gHid.errors, gHid.sendErrors);
+  if (gGadget.net()) {
+    const ncm::NetStats &n = gGadget.netStats;
+    char line[400];
+    pianonet::status(line, sizeof line);
+    cprintf("net: %s\n", line);
+    cprintf("net: alternate %u, NTB input size %u, filter %#x, %u notifications, %u zero-length packets, %u alternate changes\n", n.alt,
+            n.ntbInSize, n.filter, n.notifications, n.zlps, n.altChanges);
+  } else if (gArgs.net) {
+    cprintf("net: piano-usb-net=1 but the network function is left out (see the takeover's notes)\n");
+  }
 }
 
 void usbThread(void *, wait_result_t)
@@ -1387,9 +1446,10 @@ IOService *PianoDwc3::probe(IOService *provider, SInt32 *score)
 bool PianoDwc3::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
-  note("start: piano-usb=%u phy=%u smmu=%u utmi=%u delay=%u shell=%u hid=%u (DWC3 %#llx, SMMU stream %#x, polled)", gArgs.level,
-       gArgs.phy, gArgs.smmu, gArgs.utmi, gArgs.delay, gArgs.shell, gArgs.hid, pianohw::kDwc3, pianohw::kUsbStream);
+  note("start: piano-usb=%u phy=%u smmu=%u utmi=%u delay=%u shell=%u hid=%u net=%u (DWC3 %#llx, SMMU stream %#x, polled)", gArgs.level,
+       gArgs.phy, gArgs.smmu, gArgs.utmi, gArgs.delay, gArgs.shell, gArgs.hid, gArgs.net, pianohw::kDwc3, pianohw::kUsbStream);
   if (gArgs.hid && gArgs.level < 2) note("piano-usb-hid needs piano-usb=2: no HID input");
+  if (gArgs.net && gArgs.level < 2) note("piano-usb-net needs piano-usb=2: no network function");
   setProperty("piano-usb", gArgs.level, 32);
   gLock = IOLockAlloc();
   if (!gLock) return false;
@@ -1445,6 +1505,18 @@ bool PianoDwc3::start(IOService *provider)
       thread_deallocate(thread);
       if (!publishHid(this)) note("hid: the devices are not there; the input port answers \"err hid\"");
       registerService();
+    }
+  }
+  // piano-usb-net=1: the queues now (the USB thread uses them from its first enumeration), the Ethernet controller from a thread
+  // once IOBSD is up (PianoUsbNet.cpp). Without them the device keeps its ACM-only shape.
+  if (gArgs.net) {
+    if (!pianonet::init(&gGadget.netStats) || !pianonet::startThread(this)) {
+      note("net: no queues or thread: the network function is left out");
+      gArgs.net = 0;
+    } else {
+      note("net: CDC-NCM network function requested (piano-usb-net=1): MAC %02x:%02x:%02x:%02x:%02x:%02x here, %02x:%02x:%02x:%02x:%02x:%02x "
+           "on the Mac", kNetDeviceMac[0], kNetDeviceMac[1], kNetDeviceMac[2], kNetDeviceMac[3], kNetDeviceMac[4], kNetDeviceMac[5],
+           kNetHostMac[0], kNetHostMac[1], kNetHostMac[2], kNetHostMac[3], kNetHostMac[4], kNetHostMac[5]);
     }
   }
   if (kernel_thread_start(usbThread, nullptr, &thread) != KERN_SUCCESS) { stage(-8, "USB thread"); return true; }

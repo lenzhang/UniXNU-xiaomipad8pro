@@ -7,6 +7,7 @@
   "stop": "_native_kext_stop",
   "libraries": {
     "com.apple.iokit.IOHIDFamily": "2.0.0",
+    "com.apple.iokit.IONetworkingFamily": "1.0.0b1",
     "com.apple.kpi.bsd": "18.0.0",
     "com.apple.kpi.iokit": "18.0.0",
     "com.apple.kpi.libkern": "18.0.0",
@@ -39,5 +40,16 @@
     "ignore_slots": [
       16
     ]
-  }
+  },
+  "extra_vtables": [
+    {
+      "class": "PianoUsbNet",
+      "base": "IOEthernetController",
+      "base_kext": "com.apple.iokit.IONetworkingFamily",
+      "slots": 400,
+      "ignore_slots": [
+        16
+      ]
+    }
+  ]
 }
