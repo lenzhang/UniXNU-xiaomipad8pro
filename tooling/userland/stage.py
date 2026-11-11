@@ -10,6 +10,14 @@ to the trust cache, and a record of every file's sha256.
              [--out out/userland/stage] [--manifest configs/userland.toml] [--on UNIT]... [--off UNIT]... [--force]
     stage.py --live out/userland/live [--installed-trust FILE]     the same files as a live update's bundle, no seed (docs/userland.md 7)
     stage.py --plan                                                the manifest, checked, as a table; nothing built
+    --gpu-bundle BUNDLE (with any mode, repeatable)                a Metal plugin bundle as one more unit, gpu-<name>: every file of
+                                                                   BUNDLE at /Library/GPUBundles/<name>.bundle/..., Mach-Os trusted
+
+The system layer (docs/data-store.md section 9): the files that change are installed on the running system, never staged into the
+seed of an ESP that keeps the owner's Data (that seed is the store's base, tooling/persist/base-seed.py). `stage.py --live DIR
+--gpu-bundle out/turnip-a830/NativeAdrenoMetal.bundle --installed-trust <the base's trust cache>` is that layer: the userland and the
+plugin, and the trust cache an ESP takes with --layer DIR. install.sh keeps a copy of every file it replaces that it did not put
+there itself (the base's plugin) and puts it back when the unit goes, so taking the layer out restores the base's files.
 
 Outputs (seed mode, nothing outside --out is written; the input seed and trust cache are only read):
   OUT/scratch-data.img          the input seed plus STAGING (default /private/var/piano/userland: install.sh, manifest.tsv,
@@ -61,6 +69,10 @@ import common  # noqa: E402  (tooling/persist/common.py: seed identity, trust ca
 FORMAT = 1   # the staged layout's version: part of the stamp; raise it when the same inputs are to be staged differently
 INSTALLER = D / 'tooling/userland/install.sh'
 DIRS = {'/Library/LaunchDaemons': 'daemon', '/Library/LaunchAgents': 'agent', '/usr/local/bin': 'file', '/usr/local/libexec': 'file'}
+# A Metal plugin bundle's files (IOGPU looks for <MetalPluginName>.bundle in /Library/GPUBundles first; docs/data-store.md section 5):
+# Contents/Info.plist, Contents/MacOS/<file>, Contents/Resources/<file>.
+GPU_BUNDLES = '/Library/GPUBundles'
+GPU_BUNDLE_FILE = re.compile(r'/Library/GPUBundles/[A-Za-z0-9_-]+\.bundle/Contents/(?:Info\.plist|(?:MacOS|Resources)/[A-Za-z0-9_+-][A-Za-z0-9._+-]*)')
 SYSTEM_PROGRAMS = ('/bin/', '/usr/bin/', '/sbin/', '/usr/sbin/', '/usr/libexec/')
 WORD = re.compile(r'[A-Za-z0-9._+@/-]+')
 MODE = re.compile(r'0[0-7]{3}')
@@ -149,17 +161,26 @@ def load_manifest(path, on=(), off=()):
     return {'path': Path(path), 'staging': staging, 'units': units}
 
 
+def dest_kind(dest):
+    """What a destination is: daemon, agent or file (directly in one of DIRS, or a Metal plugin bundle's file); None when refused."""
+    parent, _, base = dest.rpartition('/')
+    if not WORD.fullmatch(dest) or not base or base.startswith('.') or '..' in dest.split('/'):
+        return None
+    return DIRS.get(parent) or ('file' if GPU_BUNDLE_FILE.fullmatch(dest) else None)
+
+
 def check_file(f, unit, problems):
     where = f'unit {unit["name"]}, {f.get("dest", "?")}'
     unknown = set(f) - {'source', 'sources', 'build', 'arch', 'min_os', 'cflags', 'frameworks', 'command', 'output', 'inputs',
-                        'dest', 'owner', 'mode', 'trust'}
+                        'dest', 'owner', 'mode', 'trust', 'staged'}
     if unknown:
         problems.append(f'{where}: unknown keys {sorted(unknown)}')
     dest = f.get('dest', '')
-    parent, _, base = dest.rpartition('/')
-    kind = DIRS.get(parent)
-    if not kind or not base or not WORD.fullmatch(dest) or base.startswith('.'):
-        problems.append(f'{where}: dest must be a file directly in {", ".join(DIRS)}')
+    base = dest.rpartition('/')[2]
+    kind = dest_kind(dest)
+    if not kind:
+        problems.append(f'{where}: dest must be a file directly in {", ".join(DIRS)}, or a Metal plugin bundle\'s '
+                        f'({GPU_BUNDLES}/<name>.bundle/Contents/Info.plist, MacOS/<file>, Resources/<file>)')
         kind = 'file'
     owner, mode = f.get('owner', 'root:wheel'), f.get('mode', '')
     if not OWNER.fullmatch(owner):
@@ -186,9 +207,47 @@ def check_file(f, unit, problems):
     else:
         problems.append(f'{where}: build {build!r} (copy, cc or script)')
     return {'unit': unit['name'], 'dest': dest, 'name': base, 'kind': kind, 'owner': owner, 'mode': mode, 'build': build,
+            'staged': f.get('staged'),
             'sources': sources, 'arch': f.get('arch', 'arm64'), 'min_os': f.get('min_os', '14.0'), 'cflags': list(f.get('cflags', [])),
             'frameworks': list(f.get('frameworks', [])), 'command': list(f.get('command', [])), 'output': f.get('output'),
             'inputs': list(f.get('inputs', [])), 'trust': f.get('trust', True)}
+
+
+def add_gpu_bundles(plan, bundles):
+    """--gpu-bundle: each Metal plugin bundle as one more unit of PLAN, gpu-<its name in lower case>, without a job (always installed):
+    every file of the bundle at /Library/GPUBundles/<name>.bundle/<its path>, root:wheel, 0755 for a Mach-O or an executable, 0644
+    otherwise, its Mach-Os' CDHashes into the trust cache. Staged as files/<unit>/<its path in the bundle>."""
+    problems = []
+    dests = {f['dest']: u['name'] for u in plan['units'] for f in u['files']}
+    for bundle in bundles:
+        bundle = Path(bundle).resolve()
+        if not re.fullmatch(r'[A-Za-z0-9_-]+\.bundle', bundle.name) or not (bundle / 'Contents/Info.plist').is_file():
+            raise SystemExit(f'--gpu-bundle {bundle}: not a plugin bundle (<name>.bundle with Contents/Info.plist)')
+        name = 'gpu-' + bundle.stem.lower().replace('_', '-')
+        if name in {u['name'] for u in plan['units']}:
+            raise SystemExit(f'--gpu-bundle {bundle}: unit {name} twice')
+        unit = {'name': name, 'about': f'the Metal plugin {bundle.name} in {GPU_BUNDLES} (the system layer, docs/data-store.md section 9)',
+                'on': True, 'default_on': True, 'planned': False, 'files': []}
+        for path in sorted(bundle.rglob('*')):
+            if path.is_symlink() or (not path.is_file() and not path.is_dir()):
+                raise SystemExit(f'--gpu-bundle {bundle}: {path.relative_to(bundle)} is neither a file nor a directory')
+            if not path.is_file():
+                continue
+            inside = path.relative_to(bundle).as_posix()
+            data = path.read_bytes()
+            executable = data[:4] == b'\xcf\xfa\xed\xfe' or os.access(path, os.X_OK)
+            f = check_file({'source': str(path), 'build': 'copy', 'dest': f'{GPU_BUNDLES}/{bundle.name}/{inside}',
+                            'mode': '0755' if executable else '0644', 'staged': f'files/{name}/{inside}'}, unit, problems)
+            if f['dest'] in dests:
+                problems.append(f'{f["dest"]}: also unit {dests[f["dest"]]}\'s')
+            dests[f['dest']] = name
+            unit['files'].append(f)
+        if not unit['files']:
+            problems.append(f'--gpu-bundle {bundle}: no files')
+        plan['units'].append(unit)
+    if problems:
+        raise SystemExit('--gpu-bundle:\n  ' + '\n  '.join(problems))
+    return plan
 
 
 def check_jobs(plan, built):
@@ -322,7 +381,7 @@ def staging_tree(plan, built):
     tree = {'install.sh': (INSTALLER.read_bytes(), 0o755)}
     lines = ['# unit\tkind\ton\tmode\towner\tgroup\tsha256\tstaged\tdest\tlabel (configs/userland.toml, tooling/userland/stage.py)']
     for f, data in built:
-        staged = f'files/{f["unit"]}/{f["name"]}'
+        staged = f.get('staged') or f'files/{f["unit"]}/{f["name"]}'
         tree[staged] = (data, 0o755 if int(f['mode'], 8) & 0o111 else 0o644)
         user, group = f['owner'].split(':')
         fields = [f['unit'], f['kind'], '1' if f['on'] else '0', f['mode'], user, group, f['sha256'], staged, f['dest'],
@@ -583,7 +642,8 @@ def stage_live(a, plan):
     os.chmod(out / 'apply-update.sh', 0o755)
     installed = a.installed_trust or common.installed_trust()
     report = {'format': FORMAT, 'manifest': rel(plan['path']), 'staging': plan['staging'], 'archive_sha256': sha(archive),
-              'files': files_record(built), 'installed_trust': rel(installed) if installed else None}
+              'files': files_record(built), 'installed_trust': rel(installed) if installed else None,
+              'installed_trust_sha256': common.sha(installed) if installed else None}
     print(f'{rel(out / "userland-update.tar")}: {len(archive)} bytes, sha256 {sha(archive)[:16]}; {rel(out / "apply-update.sh")}')
     machos = [f for f, _ in built if f['cdhash']]
     if not installed:
@@ -601,9 +661,9 @@ def stage_live(a, plan):
             (out / 'kernel.macho.trustcache').write_bytes(trust_new)
             report['trust'] = {'path': rel(out / 'kernel.macho.trustcache'), 'sha256': sha(trust_new), 'added_cdhashes': added}
             print(f'{rel(out / "kernel.macho.trustcache")}: the installed trust cache + {len(added)} CDHash(es). An ESP with it '
-                  'and the INSTALLED seed (the same identity: the store resumes) makes them trusted from its first boot: '
-                  'tooling/persist/build-esp.py --profile daily --seed <the installed seed> --trust ' +
-                  rel(out / 'kernel.macho.trustcache') + ' (docs/userland.md section 7)')
+                  'and the INSTALLED seed (the store\'s base: the same identity, the store resumes) makes them trusted from its first '
+                  'boot: tooling/persist/build-esp.py --profile daily --layer ' + rel(out) +
+                  ' (the daily profile takes the pinned base; docs/data-store.md section 9, docs/userland.md section 7)')
     (out / 'live.json').write_text(json.dumps(report, indent=1) + '\n')
     return report
 
@@ -633,8 +693,10 @@ def main():
     p.add_argument('--live', type=Path, metavar='DIR', help='write a live update\'s bundle to DIR instead of a seed')
     p.add_argument('--installed-trust', type=Path, help='the trust cache of the installed ESP (default: from its record)')
     p.add_argument('--plan', action='store_true', help='check the manifest and print it; build nothing')
+    p.add_argument('--gpu-bundle', action='append', default=[], type=Path, metavar='BUNDLE',
+                   help='a Metal plugin bundle as one more unit (/Library/GPUBundles/<name>.bundle), its Mach-Os trusted')
     a = p.parse_args()
-    plan = load_manifest(a.manifest, a.on, a.off)
+    plan = add_gpu_bundles(load_manifest(a.manifest, a.on, a.off), a.gpu_bundle)
     if a.plan:
         show_plan(plan)
     elif a.live:

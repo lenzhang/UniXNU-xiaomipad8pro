@@ -7,7 +7,9 @@
 1. manifest   configs/userland.toml loads and checks; every refusal of load_manifest / check_jobs on a broken manifest
 2. installer  install.sh (under /bin/sh and /bin/dash) on a scratch root with launchctl and logger stand-ins: the first install,
               a second run that changes nothing, --check and tampering, a torn staged file, a changed program (kickstart) and job
-              file (bootout + bootstrap), the owner's launchctl disable, an off job (Disabled), nobody logged in, the receipt's removals
+              file (bootout + bootstrap), the owner's launchctl disable, an off job (Disabled), nobody logged in, the receipt's removals;
+              the system layer: a Metal plugin bundle already in place (the base's) taken over with a copy kept, given back when its
+              unit goes, never taken over when that copy cannot be made
 3. pmset      piano-pmset-defaults.sh with a pmset stand-in: both sources, keys this model lacks, a battery that appears later,
               the owner's timers first, the owner's change after a partial run, once and only once
 4. trust      add_trust: one module first with the missing CDHashes only; none when all are there (byte for byte the input)
@@ -165,6 +167,33 @@ def manifest_tests(tmp):
           'refused: Disabled written by hand')
     check(refused(jobs, b'not a plist', match='not a property list'), 'refused: a job file that is no plist')
 
+    # --gpu-bundle: a Metal plugin bundle as one more unit (the system layer, docs/data-store.md section 9)
+    b = tmp / 'm/T_x.bundle'
+    write(b / 'Contents/Info.plist', plistlib.dumps({'CFBundleExecutable': 'T'}))
+    write(b / 'Contents/MacOS/T', b'\xcf\xfa\xed\xfe' + bytes(60), 0o644)       # a Mach-O, even without its x bit
+    write(b / 'Contents/MacOS/libt.dylib', b'\xcf\xfa\xed\xfe' + bytes(60), 0o755)
+    plan = stage.add_gpu_bundles(load(unit_toml('a', [good_tool])), [b])
+    unit = plan['units'][-1]
+    files = {f['dest']: f for f in unit['files']}
+    root = '/Library/GPUBundles/T_x.bundle/Contents'
+    check(unit['name'] == 'gpu-t-x' and unit['on'] and sorted(files) == [f'{root}/Info.plist', f'{root}/MacOS/T', f'{root}/MacOS/libt.dylib'],
+          '--gpu-bundle: one unit, every file of the bundle at /Library/GPUBundles')
+    check(files[f'{root}/Info.plist']['mode'] == '0644' and files[f'{root}/MacOS/T']['mode'] == '0755' and
+          files[f'{root}/MacOS/T']['staged'] == 'files/gpu-t-x/Contents/MacOS/T' and all(f['trust'] and f['kind'] == 'file' for f in files.values()),
+          '--gpu-bundle: modes, staged paths below the unit, trusted, no job')
+    check(refused(stage.add_gpu_bundles, load(unit_toml('a', [good_tool])), [tmp / 'm'], match='not a plugin bundle'), 'refused: --gpu-bundle of no bundle')
+    check(refused(stage.add_gpu_bundles, load(unit_toml('a', [good_tool])), [b, b], match='twice'), 'refused: the same bundle twice')
+    os.symlink('T', b / 'Contents/MacOS/link')
+    check(refused(stage.add_gpu_bundles, load(unit_toml('a', [good_tool])), [b], match='neither a file'), 'refused: a symlink in the bundle')
+    (b / 'Contents/MacOS/link').unlink()
+    ok = ['/Library/GPUBundles/A.bundle/Contents/Info.plist', '/Library/GPUBundles/A.bundle/Contents/MacOS/A',
+          '/Library/GPUBundles/A.bundle/Contents/Resources/x.metallib', '/usr/local/bin/x']
+    no = ['/Library/GPUBundles/A.bundle/Info.plist', '/Library/GPUBundles/A.bundle/Contents/MacOS/../../x',
+          '/Library/GPUBundles/A.bundle/Contents/MacOS/.hidden', '/Library/GPUBundles/x', '/Library/GPUBundles/A.kext/Contents/Info.plist',
+          '/Library/GPUBundles/A.bundle/Contents/MacOS/sub/x', '/System/Library/Extensions/A.bundle/Contents/Info.plist']
+    check(all(stage.dest_kind(d) == 'file' for d in ok) and not any(stage.dest_kind(d) for d in no),
+          'dest_kind: a bundle\'s Contents/Info.plist, MacOS/ and Resources/ files only')
+
 
 # ---- 2. the installer --------------------------------------------------------------------------------------------------------
 
@@ -209,9 +238,11 @@ class Rig:
         built = []
         for name, on, files in units:
             for dest, mode, data in files:
-                kind = stage.DIRS[dest.rsplit('/', 1)[0]]
+                kind = stage.dest_kind(dest)
                 f = {'unit': name, 'dest': dest, 'name': dest.rsplit('/', 1)[1], 'kind': kind, 'owner': 'root:wheel', 'mode': mode,
                      'on': on, 'sha256': sha(data)}
+                if dest.startswith(stage.GPU_BUNDLES + '/'):
+                    f['staged'] = f'files/{name}/' + dest.split('.bundle/', 1)[1]
                 if kind != 'file':
                     f['label'] = plistlib.loads(data)['Label']
                 built.append((f, data))
@@ -315,6 +346,58 @@ def installer_tests(tmp):
         check(rig.root('/usr/local/bin/cli').exists() and 'changed since it was installed: left' in out, f'{tag}: a dropped file changed since is left')
         check(subprocess.run([shell, str(tmp / tag / 'stage/install.sh'), '--bogus'], env=rig.env, capture_output=True).returncode == 2,
               f'{tag}: an unknown mode is refused')
+        layer_tests(tmp, shell, tag)
+
+
+def layer_tests(tmp, shell, tag):
+    """The system layer (docs/data-store.md section 9) on the owner's Data: the base seed's plugin is in place, not installed by
+    install.sh; the layer replaces one file and adopts two; taking the layer out gives the base's files back."""
+    rig = Rig(tmp / f'{tag}-layer', shell)
+    c = '/Library/GPUBundles/T.bundle/Contents'
+    base = {f'{c}/Info.plist': (b'<plist/>', 0o644), f'{c}/MacOS/T': (b'exe', 0o755), f'{c}/MacOS/libx.dylib': (b'old dylib', 0o755)}
+    for dest, (data, mode) in base.items():
+        write(rig.root(dest), data, mode)
+    cli = ('cli', True, [('/usr/local/bin/cli', '0755', b'#!/bin/sh\necho cli\n')])
+    layer = ('gpu-t', True, [(f'{c}/Info.plist', '0644', b'<plist/>'), (f'{c}/MacOS/T', '0755', b'exe'),
+                             (f'{c}/MacOS/libx.dylib', '0755', b'new dylib')])
+    prev = tmp / f'{tag}-layer/root/private/var/db/piano-userland/prev'
+    rig.files([cli, layer])
+    code, out = rig.run('--live')
+    check(code == 0 and rig.root(f'{c}/MacOS/libx.dylib').read_bytes() == b'new dylib' and
+          rig.root(f'{c}/MacOS/T').read_bytes() == b'exe', f'{tag}: layer: the changed file installed, the same ones adopted')
+    check(all((prev / d.lstrip('/')).read_bytes() == data for d, (data, _) in base.items()) and out.count('was not installed by this installer') == 3
+          and not (prev / 'usr/local/bin/cli').exists(), f'{tag}: layer: a copy of each base file it took over, none of a new file')
+    check((tmp / f'{tag}-layer/stage/files/gpu-t/Contents/MacOS/libx.dylib').is_file(),
+          f'{tag}: layer: staged below its unit with the bundle\'s paths')
+    code, out = rig.run('--live')
+    check(code == 0 and 'changed:)' in out and (prev / c.lstrip('/') / 'MacOS/libx.dylib').read_bytes() == b'old dylib',
+          f'{tag}: layer: a second run changes nothing; the copy is still the base\'s file')
+    layer2 = ('gpu-t', True, [*layer[2][:2], (f'{c}/MacOS/libx.dylib', '0755', b'newer dylib')])
+    rig.files([cli, layer2])
+    code, out = rig.run('--live')
+    check(code == 0 and rig.root(f'{c}/MacOS/libx.dylib').read_bytes() == b'newer dylib' and
+          (prev / c.lstrip('/') / 'MacOS/libx.dylib').read_bytes() == b'old dylib', f'{tag}: layer: an update; the copy stays the base\'s')
+    rig.files([cli])
+    code, out = rig.run('--live')
+    check(code == 0 and all(rig.root(d).read_bytes() == data for d, (data, _) in base.items()) and out.count('the file it had replaced is back') == 3,
+          f'{tag}: layer taken out: the base\'s files back, byte for byte')
+    check(not any(p.is_file() for p in prev.rglob('*')) and oct(rig.root(f'{c}/MacOS/T').stat().st_mode & 0o777) == '0o755',
+          f'{tag}: layer taken out: no copies left, the modes of before')
+    rig.files([cli, layer])
+    rig.run('--live')
+    rig.root(f'{c}/MacOS/libx.dylib').write_bytes(b'the owner\'s own')
+    rig.files([cli])
+    code, out = rig.run('--live')
+    check(rig.root(f'{c}/MacOS/libx.dylib').read_bytes() == b'the owner\'s own' and (prev / c.lstrip('/') / 'MacOS/libx.dylib').is_file() and
+          'changed since it was installed: left' in out, f'{tag}: layer: a file changed after the take-over is left, its copy kept')
+    rig = Rig(tmp / f'{tag}-layer2', shell)
+    for dest, (data, mode) in base.items():
+        write(rig.root(dest), data, mode)
+    write(rig.root('/private/var/db/piano-userland/prev'), 'not a directory')
+    rig.files([cli, layer])
+    code, out = rig.run('--live')
+    check(code == 1 and rig.root(f'{c}/MacOS/libx.dylib').read_bytes() == b'old dylib' and 'not installed (gpu-t)' in out and
+          rig.root('/usr/local/bin/cli').is_file(), f'{tag}: layer: no copy possible: the base\'s file is not replaced, the rest goes on')
 
 
 # ---- 3. pmset defaults -------------------------------------------------------------------------------------------------------

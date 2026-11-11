@@ -21,6 +21,10 @@
 #   - Agents go to the console user's session; with nobody logged in, the next login window or login loads them.
 #   - A file this installer put in place earlier (the receipt) that the manifest no longer lists is removed, its job booted out,
 #     when it is unchanged since; anything else is left alone.
+#   - A file already there that this installer did not put in place (not in its receipt: the base seed's Metal plugin, an owner's
+#     own file) is copied to $STATE/prev/<its path> before it is taken over (replaced, or adopted with the same bytes), once; when the
+#     manifest no longer lists it, that copy is put back instead of the file being removed (docs/data-store.md section 9). A file
+#     whose copy cannot be made is not taken over.
 # SIGHUP is ignored: run through the USB root shell, a restart of pianousb-shell ends that shell but not this script.
 # Lines go to stdout (the boot job's: the kernel log with stderr-log=1), the system log (logger -t piano-userland) and
 # /private/var/db/piano-userland/last.txt.
@@ -68,6 +72,18 @@ domain_of() {   # domain_of KIND: system, gui/<uid> of the console user, or noth
 
 loaded() { launchctl print "$1/$2" > /dev/null 2>&1; }
 
+ours() { [ -f "$STATE/receipt.tsv" ] && cut -f9 "$STATE/receipt.tsv" | grep -qxF "$1"; }
+
+# keep DEST DST: before the first take-over of a file this installer did not put in place, a copy of it in $STATE/prev/DEST (cp -p:
+# its owner, mode and times). Never replaced once made: it is the file of before.
+keep() {
+  [ -e "$2" ] || return 0
+  ! ours "$1" || return 0
+  [ ! -e "$STATE/prev$1" ] || return 0
+  mkdir -p "$(dirname "$STATE/prev$1")" && cp -p "$2" "$STATE/prev$1.new" && mv -f "$STATE/prev$1.new" "$STATE/prev$1" || return 1
+  say "$1: the file in place was not installed by this installer: kept as $STATE/prev$1 (back when the manifest drops it)"
+}
+
 disabled() { launchctl print-disabled "$1" 2> /dev/null | grep -Eq "\"$2\" => (disabled|true)"; }
 
 [ -f "$S/manifest.tsv" ] || { say "no manifest at $S/manifest.tsv"; exit 1; }
@@ -99,6 +115,7 @@ while IFS=$TAB read -r unit kind on mode owner group want staged dest label; do
     if [ "$NOCHOWN" = 1 ]; then install -d -m 755 "$dir"; else install -d -o root -g wheel -m 755 "$dir"; fi
   fi
   if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+    keep "$dest" "$dst" || { say "$dest: no copy of the file in place could be kept: not taken over ($unit)"; FAILED=1; continue; }
     if [ "$NOCHOWN" = 1 ]; then now=$(has "$dst" | cut -d' ' -f2); exp=$mode
     else now=$(has "$dst"); exp="$owner:$group $mode"; fi
     if [ "$now" != "$exp" ]; then
@@ -107,6 +124,7 @@ while IFS=$TAB read -r unit kind on mode owner group want staged dest label; do
     fi
     continue
   fi
+  keep "$dest" "$dst" || { say "$dest: no copy of the file it replaces could be kept: not installed ($unit)"; FAILED=1; continue; }
   if [ "$NOCHOWN" = 1 ]; then install -S -m "$mode" "$src" "$dst"; else install -S -o "$owner" -g "$group" -m "$mode" "$src" "$dst"; fi
   if [ $? != 0 ]; then say "$dest: install failed ($unit)"; FAILED=1; continue; fi
   say "$dest: installed (sha256 ${want%"${want#????????????????}"})"
@@ -120,13 +138,21 @@ if [ "$MODE" != --check ] && [ -f "$STATE/receipt.tsv" ]; then
     case "$unit" in ''|'#'*) continue ;; esac
     cut -f9 "$S/manifest.tsv" | grep -qxF "$dest" && continue
     dst=$R$dest
-    [ -f "$dst" ] || continue
-    if [ "$(sum "$dst")" != "$want" ]; then say "$dest: no longer in the manifest, but changed since it was installed: left"; continue; fi
-    if [ "$kind" != file ]; then
+    prev=$STATE/prev$dest
+    if [ -f "$dst" ] && [ "$(sum "$dst")" != "$want" ]; then say "$dest: no longer in the manifest, but changed since it was installed: left"; continue; fi
+    if [ -f "$dst" ] && [ "$kind" != file ]; then
       d=$(domain_of "$kind")
       if [ -n "$d" ] && loaded "$d" "$label"; then launchctl bootout "$d/$label" 2> /dev/null; fi
     fi
-    rm -f "$dst" && say "$dest: removed (no longer in the manifest)"
+    if [ -f "$prev" ]; then
+      if cp -p "$prev" "$dst.piano-prev" && mv -f "$dst.piano-prev" "$dst"; then
+        rm -f "$prev" && say "$dest: no longer in the manifest: the file it had replaced is back"
+      else
+        rm -f "$dst.piano-prev"; say "$dest: no longer in the manifest; putting back $prev failed: left as it is"; FAILED=1
+      fi
+    elif [ -f "$dst" ]; then
+      rm -f "$dst" && say "$dest: removed (no longer in the manifest)"
+    fi
   done < "$STATE/receipt.tsv"
 fi
 
