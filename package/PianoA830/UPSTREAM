@@ -23,10 +23,13 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
     A830Idle.h              (new)                                                            -> b90f05f80501078f9de1429a51d73b9644278b35ae8fcd167c15abc738848512
       2026-11-11, MIT, this repository's: the idle policy's configuration, the scanout's DDR floor, the idle votes' state machine, the
       transitions' line rule and the board hooks' declarations.
-    A830Dcvs.h              2e3cfc36d1cedc7c912d42b5fdb743ca44326b7876f30379f0c9dabebd1944fa -> 2a5f37e45ac2a52588277c71faf86e9e34f5adb1e74d8226903a49f21a1dad7c
-    A830Dcvs.cpp            6e457f98e72fe052b4b7fb0057ea2a8003e78fbaa3cc8784b291270690a0f016 -> deeab86eed8de94ec7944f323eec140e457717997f84b0acff381dca1d440e5f
+    A830Dcvs.h              2e3cfc36d1cedc7c912d42b5fdb743ca44326b7876f30379f0c9dabebd1944fa -> f2b18a507774a1beda67863c8d0dad5cd67e1100ddcde506de6efd8be4348ab3
+    A830Dcvs.cpp            6e457f98e72fe052b4b7fb0057ea2a8003e78fbaa3cc8784b291270690a0f016 -> 661f3cdcc621bd83c26577085578765913d1915f7910a8645c08b83b88db6d51
       2026-11-11: A830DcvsConfig::idleWindowMs (the window while the governor idles at the floor; the first submission still wakes
       the thread and the windows are 16 ms again) and A830DcvsOps::idleTick (the orchestrator's idle votes, every service tick).
+      2026-11-11, docs/drivers/thermal.md §10.5: adreno830_dcvs_set_ceiling(khz), a reversible external ceiling (0 clears) below
+      the knob and thermal ones, taken by init and every service tick (one wake per change); the board's "piano-gpu-ceiling"
+      platform function calls it (PianoThermal's passive trip, later Low Power Mode). Without a caller nothing changes.
     A830PowerState.h        0d0f10c3940e0be938714024fea1d13d51e311c0e8c45a8d8e8884a82adcb856 -> c85750d26c2b474ede32e7d9c750c360ed62cc5017d70a62ccd8cadd8e4bd478
     A830PowerState.cpp      4ee2dc29829d0dacd6cf1e774a1a511a4ad91b1293e2664431ca8e8b4c15199c -> 19de8eacf5a3b57c4a876e1230ffdf39d0b19bbb9239e4148356572e43d8114b
       2026-11-11: A830PowerStats::slumberBlocked: a failed P1 slumber entry or wake ends P1 for the boot (as the screen rule's
@@ -38,11 +41,11 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
     tests/A830PowerFakes.h  2993b53b13f77646b43ca807861e77083d16050ff3e4e3774e3688c3a0fdd040 -> 39d3da9e3549693516d59f9e0ba6e4e310c917591e632778cd639214ad638ed2
     tests/test_start.cpp    83099b66827778ab36df93100fe1301c3c8dd284108bb2c2e06ec265ee986a47 -> f2b02bf5e4a2be90a0bcb6b9cd3ff5c5a9017215ad2842b9b0dffea6f8ee0905
     tests/test_sm8750_rpmh.c be1c38fb9ada8dbb8ee084d9e13331640092d0883452feceff293abbdb226cc5 -> 75f7aa75ae9722e10de3c41c8dc1c959a057b061fa8fdbea77995db8e03758ec
-    tests/test_a830idle.cpp (new)                                                            -> 38423afa472be1c415b9fd695fdf62d48d7f74f0cf2e224baaa6dcc011e84817
+    tests/test_a830idle.cpp (new)                                                            -> 94e91269cf6394b33297b022eccc0ddce0ccec2bbfc3cc10f0db0e8d39743ae9
       2026-11-11, the ADRENO830_MACOS pass only where the code is: the idle ops field in the fakes' table, the RPMh double and the
       board hooks of test_start (mode 0 unless a case sets it; the pinned PASS line unchanged, a line of its own for piano-gpu-idle),
       the idle rails' TCS order, lock and refusals in test_sm8750_rpmh; test_a830idle (both passes): the scanout floor, the idle
-      votes' state machine and line rule, the DCVS floor and idle window, the idle hook, slumberBlocked.
+      votes' state machine and line rule, the DCVS floor and idle window, the idle hook, the external ceiling, slumberBlocked.
     NativeAdrenoPublish.cpp d2a85cbcb4ad29df03a05c9f4e3edc0120358ab90a731cb61b083accf93bd31f -> 4d31149ca8ffdb359d6261ddfcb38fd032064624822c7d2cbf23d6ff310d5607
       the render server is WindowServer (kRenderServer/isRenderServer at the six "backboardd" sites, as UniXNU Adreno740 7487f72);
       native_adreno_fences() for the display's fence rule (as Adreno740's, over the ring's lastSubmitted and the memptrs fence word).

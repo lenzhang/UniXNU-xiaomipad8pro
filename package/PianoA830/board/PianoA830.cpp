@@ -32,6 +32,7 @@
 #include "PianoA830.h"
 #include "PianoA830Rows.h"
 #include "A830Idle.h"
+#include "A830Dcvs.h"
 #include "Adreno830Status.h"
 #include "Adreno830Device.h"
 #include "NativeAdrenoPublish.h"
@@ -510,6 +511,22 @@ IOReturn PianoA830::callPlatformFunction(const OSSymbol *functionName, bool wait
   if (functionName && functionName->isEqualTo("native-adreno-fences")) {
     if (!param1 || !param2) return kIOReturnBadArgument;
     return native_adreno_fences(static_cast<uint32_t *>(param1), static_cast<uint32_t *>(param2)) ? kIOReturnSuccess : kIOReturnNotReady;
+  }
+  // PianoThermal's passive trip (docs/drivers/thermal.md §10.5), later macOS Low Power Mode (BACKLOG B5): a reversible DCVS ceiling,
+  // param1 = kHz, 0 clears (adreno830_dcvs_set_ceiling; one set before S10 applies when the DCVS starts). A line per change, the first
+  // 8 then every 10th, 100th, ...
+  if (functionName && functionName->isEqualTo("piano-gpu-ceiling")) {
+    const uint32_t khz = uint32_t(uintptr_t(param1));
+    static uint32_t last = 0, changes = 0;
+    if (__atomic_exchange_n(&last, khz, __ATOMIC_ACQ_REL) != khz) {
+      adreno830_dcvs_set_ceiling(khz);
+      const uint32_t n = __atomic_add_fetch(&changes, 1u, __ATOMIC_ACQ_REL);
+      if (A830IdleLogged(n)) {
+        if (khz) gpuLine("ceiling %u MHz (an external limit: thermal, power mode; #%u)", khz / 1000, n);
+        else gpuLine("ceiling cleared (#%u)", n);
+      }
+    }
+    return kIOReturnSuccess;
   }
   return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
 }

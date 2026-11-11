@@ -57,7 +57,7 @@ shape (SM8550 EPSS: not piano's registers). PianoThermal is new code (BSD-2-Clau
 Properties: `TemperaturesDeciC` (dict: cpu0/cpu1/gpu/nsp hottest), `SensorsDeciC` (data: int16 [4][16], -32768 = no reading),
 `ThermalState`, `PeakDeciC`, `CpuFreq` (cluster0/1 MHz), `piano-thermal`, `piano-cpufreq`. GPU: at passive
 `callPlatformFunction("piano-gpu-ceiling", khz)` on PianoA830's registered service (reversible, cleared below passive; no link
-dependency; proposed in §10.5, answered kIOReturnUnsupported until then), else and at critical PianoA830's exported
+dependency; §10.5, in PianoA830 since 2026-11-11), else and at critical PianoA830's exported
 `adreno830_dcvs_park()` (lowest level and bus for the rest of the boot); `adreno830_thermal_state()` (read). All are no-ops while
 PianoA830 is inert. The GPU's own caps stay PianoA830's (its default 342 MHz = Power Saver's GPU maximum). Not used, on purpose: IOPMrootDomain's `kIOPMOverTemp` (an emergency *sleep*: no sleep natively),
 `systemPowerEventOccurred(kIOPMThermalLevelWarningKey)` (the root domain's thermal warning, which makes it prefer sleep and treat full
@@ -173,7 +173,9 @@ clusters stay at the level the boot stages left (open question 1).
    (DT `0x303`-`0x306`, level high), "critical" SPI 484-487. The handler masks the sensor's upper bit, pulses its clear and wakes the
    thread, which then polls at the fast/warm tiers until every sensor is under 70 C and re-arms. The base poll can then go to 5 s.
    `kServicesUplow` (PianoThermal.cpp) becomes true, so the suspend hook keeps upper armed as Linux does.
-5. **PianoA830 patch proposal: a reversible DCVS ceiling** (owner: the GPU driver; forward as is). Behaviour without a caller:
+5. **PianoA830: a reversible DCVS ceiling** (implemented 2026-11-11 as proposed, host-tested in `test_a830idle`; the board logs
+   `PianoA830: gpu ceiling N MHz (...)` and `gpu ceiling cleared`, the first 8 changes then every 10th, 100th, ...; a ceiling set
+   before S10 applies when the DCVS starts). Behaviour without a caller:
    identical (the ceiling is 0 = none).
    - `A830Dcvs.h`, under `ADRENO830_MACOS`, marked "UniXNU-piano": `extern "C" void adreno830_dcvs_set_ceiling(uint32_t khz);`
      (0 clears; lock-free, any thread) and in `A830Dcvs`: `uint32_t externalKhz_ = 0;` (atomic), `uint8_t externalCeiling_ = 0;`,

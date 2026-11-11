@@ -153,6 +153,42 @@ static void testIdleHook()
     CHECK(gIdleQuiet==quiet+1);
 }
 
+/* The external ceiling (adreno830_dcvs_set_ceiling: PianoThermal's passive trip, later Low Power Mode): it wakes the thread once per
+ * change, holds the governor and every boost under it from the next tick, below the table means the lowest level, 0 gives the other
+ * ceilings back, and one set before S10 holds from the first vote of the fixed mode. */
+static void testCeiling()
+{
+    A830DcvsConfig config;
+    config.initialLevel=1;config.initialBus=2;
+    boot(config);
+    for(int i=0;i<10;++i)step(950,true);
+    CHECK(gDcvs.level()>=5 && gDcvs.externalCeiling()==0);
+    const unsigned wakes=gEnv.wakes;
+    adreno830_dcvs_set_ceiling(342000);
+    adreno830_dcvs_set_ceiling(342000);
+    CHECK(gEnv.wakes==wakes+1);
+    step(950,true);
+    CHECK(gDcvs.externalCeiling()==3 && gDcvs.ceiling()==3 && gDcvs.level()==3 && gOps.votes.back().first==3);
+    for(int i=0;i<20;++i) {step(950,true);CHECK(gDcvs.level()<=3);}
+    adreno830_dcvs_set_ceiling(1);
+    step(950,true);
+    CHECK(gDcvs.ceiling()==1 && gDcvs.level()==1);
+    adreno830_dcvs_set_ceiling(0);
+    for(int i=0;i<10;++i)step(950,true);
+    CHECK(gDcvs.externalCeiling()==0 && gDcvs.level()>3);
+    /* Fixed mode (pagani-gpu-dcvs=0, perf level 9), the ceiling set before the DCVS starts: the start's vote is under it. */
+    adreno830_dcvs_set_ceiling(443000);
+    A830DcvsConfig fixed;
+    fixed.governor=false;fixed.fixedLevel=9;fixed.initialLevel=1;fixed.initialBus=2;
+    boot(fixed);
+    CHECK(!gOps.votes.empty() && gOps.votes[0].first==5 && gDcvs.externalCeiling()==5);
+    step(0,false);
+    CHECK(gDcvs.level()==5);
+    adreno830_dcvs_set_ceiling(0);
+    step(0,false);
+    CHECK(gDcvs.level()==gDcvs.ceiling() && gDcvs.level()>5);
+}
+
 static uint32_t gSinkCause;
 static void sink(void *,uint8_t cause,uint64_t) {gSinkCause=cause;}
 static void runPower(unsigned ms)
@@ -216,10 +252,13 @@ int main()
 #ifdef ADRENO830_MACOS
     testDcvsFloor();
     testIdleHook();
+    testCeiling();
     testSlumberBlocked();
     std::printf("PASS: GPU idle policy: the scanout's DDR floor (level 5 for 3200x2136 at 120 Hz), the idle votes' state machine and "
                 "its lines; DCVS without the wake boost (an isolated frame, the login screen and a light 120 Hz desktop at the floor), "
-                "the idle window and its wake, the idle tick hook, a failed P1 slumber or wake ends P1 for the boot (%u checks)\n",gChecks);
+                "the idle window and its wake, the idle tick hook, the external ceiling (one wake per change, the next tick, the lowest "
+                "level below the table, cleared by 0, before S10 in fixed mode), a failed P1 slumber or wake ends P1 for the boot "
+                "(%u checks)\n",gChecks);
 #else
     std::printf("PASS: GPU idle policy helpers: the scanout's DDR floor, the idle votes' state machine and its lines (%u checks)\n",
                 gChecks);

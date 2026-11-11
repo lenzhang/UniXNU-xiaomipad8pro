@@ -17,6 +17,9 @@ __attribute__((weak)) volatile uint32_t pagani_screen_state;
 namespace {
 constexpr uint64_t NsPerMs=1000000,NsPerS=1000000000;
 A830Dcvs *gDcvs;
+#ifdef ADRENO830_MACOS
+uint32_t gExternalCeilingKhz;   /* UniXNU-piano: adreno830_dcvs_set_ceiling's kHz (any thread), read by init and the service tick */
+#endif
 
 constexpr uint32_t gmuReg(uint32_t dword) {return A830_GMU_REG_BYTE(dword);}
 /* 19.2 MHz XO ticks to ns: 1e9 / 19.2e6 = 625 / 12. */
@@ -74,6 +77,13 @@ IOReturn A830Dcvs::init(const A830DcvsConfig &config,const A830DcvsTable &table,
     nextStatus_=nextWatchdog_=0;residencyStart_=statusStart_=lastAccount_=0;statusBusyNs_=statusNs_=0;
     for(auto &ns:residencyNs_)ns=0;
     underrunStreak_=0;underrunAt_=0;busMax_=floorRaised_=false;
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: a ceiling set before S10 holds from the first vote (pagani-gpu-dcvs=0's at start included). */
+    {
+        const uint32_t khz=__atomic_load_n(&gExternalCeilingKhz,__ATOMIC_ACQUIRE);
+        externalCeiling_=khz?levelAtMost(khz):0;
+    }
+#endif
     power_->setTarget(level_,bus_);
     updateWakeTargets();
     initialized_=true;started_=false;
@@ -151,7 +161,13 @@ uint8_t A830Dcvs::busOf(uint8_t level) const
 
 uint8_t A830Dcvs::ceiling() const
 {
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the external ceiling (adreno830_dcvs_set_ceiling) below the other two. */
+    uint8_t ceiling=min8(knobCeiling_,thermalCeiling_);
+    if(externalCeiling_)ceiling=min8(ceiling,externalCeiling_);
+#else
     const uint8_t ceiling=min8(knobCeiling_,thermalCeiling_);
+#endif
     return ceiling?ceiling:1;
 }
 
@@ -213,6 +229,10 @@ void A830Dcvs::park()
     if(!__atomic_exchange_n(&parked_,1u,__ATOMIC_ACQ_REL))env_.wake(env_.context);
 }
 
+#ifdef ADRENO830_MACOS
+void A830Dcvs::noteCeiling() {env_.wake(env_.context);}   /* UniXNU-piano */
+#endif
+
 /* ---- service thread ------------------------------------------------------------------------------------------------ */
 
 uint64_t A830Dcvs::serviceTick(uint64_t now)
@@ -234,6 +254,14 @@ uint64_t A830Dcvs::serviceTick(uint64_t now)
         knobCeiling_=1;floor_=1;
         updateWakeTargets();
     }
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the external ceiling as last set (adreno830_dcvs_set_ceiling); the steer below votes under it at once. */
+    {
+        const uint32_t khz=__atomic_load_n(&gExternalCeilingKhz,__ATOMIC_ACQUIRE);
+        const uint8_t want=khz?levelAtMost(khz):0;
+        if(want!=externalCeiling_) {externalCeiling_=want;updateWakeTargets();}
+    }
+#endif
     /* 2. The display's power (the screen rule, pagani-screenoff bit 1), then touches: boost, and the slumber pre-wake. */
     if(power_->config().screenSlumber!=A830SlumberOff) {
         const bool off=(__atomic_load_n(&pagani_screen_state,__ATOMIC_ACQUIRE)&1u)!=0;
@@ -719,6 +747,15 @@ extern "C" void adreno830_dcvs_park(void)
 {
     if(A830Dcvs *dcvs=__atomic_load_n(&gDcvs,__ATOMIC_ACQUIRE))dcvs->park();
 }
+
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (A830Dcvs.h): stored for the service tick, which this wakes once the DCVS runs. */
+extern "C" void adreno830_dcvs_set_ceiling(uint32_t khz)
+{
+    if(__atomic_exchange_n(&gExternalCeilingKhz,khz,__ATOMIC_ACQ_REL)==khz)return;
+    if(A830Dcvs *dcvs=__atomic_load_n(&gDcvs,__ATOMIC_ACQUIRE))dcvs->noteCeiling();
+}
+#endif
 
 /* PaganiArmCpu's governor (pagani-cpufreq=2) reads these from its own thread every 20 ms; ArmCpu.cpp has weak defaults. */
 extern "C" int32_t adreno830_thermal_state(uint32_t *flags)

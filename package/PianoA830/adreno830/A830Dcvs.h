@@ -184,6 +184,11 @@ public:
     void noteUnderruns(uint32_t total); /* MDP INTF1 underrun count (cumulative) */
     void park();                        /* a reset is coming: hold the lowest level and its bus from the next tick on */
     void setAcd(bool running);          /* ACD came up or went away (ceiling) */
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the external ceiling (adreno830_dcvs_set_ceiling) changed: apply it at the next tick, which this wakes. */
+    void noteCeiling();
+    uint8_t externalCeiling() const {return externalCeiling_;}
+#endif
 
     /* Pure helpers (tested directly). */
     uint8_t levelAtLeast(uint32_t khz) const;   /* lowest level >= khz, the top when none */
@@ -258,6 +263,9 @@ private:
     uint32_t seenSeqno_=0,hookedSubmits_=0;   /* ring seqno seen, hook count at that time (submissions without the hook) */
     uint32_t touchSeen_=0,parked_=0;
     bool touchPrimed_=false;
+#ifdef ADRENO830_MACOS
+    uint8_t externalCeiling_=0;         /* UniXNU-piano: the level of adreno830_dcvs_set_ceiling's kHz, 0 = none */
+#endif
     /* periodic */
     uint64_t nextStatus_=0,nextWatchdog_=0,residencyStart_=0,statusStart_=0,statusBusyNs_=0,statusNs_=0,lastAccount_=0;
     uint64_t residencyNs_[Adreno830LevelMax + 1]={};
@@ -279,6 +287,13 @@ void adreno830_dcvs_submit(void);
  * so the SoC and the DRAM stacked on it cool down before the reset (a hot DRAM loses more of the log across it). Interrupt
  * safe; BootProgress carries a weak empty default. */
 void adreno830_dcvs_park(void);
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (docs/drivers/thermal.md §10.5): a reversible ceiling, kHz (the highest level at or below it, the lowest level when
+ * none is), 0 clears it; PianoThermal's passive trip (PianoA830's "piano-gpu-ceiling" platform function) and later macOS Low Power
+ * Mode. It applies below the knob and thermal ceilings and to every boost, in fixed mode too, from the next service tick (which it
+ * wakes); one set before S10 applies when the DCVS starts. Lock-free, any thread. */
+void adreno830_dcvs_set_ceiling(uint32_t khz);
+#endif
 /* PaganiInput's touch frame counter; this driver carries a weak zero definition so it links without the input driver. */
 extern volatile uint32_t pagani_input_touch_events;
 /* PaganiPanel's display power word (bit 0: the system turned the display off; the count of changes above it), read every
