@@ -14,9 +14,10 @@
 //   ceiling min(sustained (Linux: boost off), piano-cpufreq-cap0/1 when given, the power cap: Ubuntu's Power Saver caps on battery
 //           or when the power source is unknown (piano-cpufreq-bat0/1), its Balanced caps on external power (-ac0/1: 3532.8 /
 //           4089.6 MHz), the thermal limit); floor piano-cpufreq-min0/1. A ceiling that drops applies at once.
-// thermal limit (both modes; thermal() is called on every sensor poll, 20 ms apart while a sensor is near its trip): Linux's
+// thermal limit (both modes; thermal() is called on every sensor poll, 10 ms apart while a sensor is near its trip): Linux's
 //   step_wise on the stock trips (Cluster.h): any of the cluster's cpu-* sensors at or over its passive trip (105 C, or 118 C)
-//   -> one level down per stepMs (20 ms); all under passive - hysteresis (5 or 8 C) -> one level up per riseMs (1 s); in between
+//   -> one level down per stepMs (10 ms, Linux's passive polling); all under passive - hysteresis (5 or 8 C) -> one level up per
+//   riseMs (1 s); in between
 //   held; at the critical threshold (125 C - piano-thermal-margin), without a reading, or in PianoThermal's critical state ->
 //   the slowest level at once.
 #ifndef PIANO_THERMAL_GOVERNOR_H
@@ -40,7 +41,7 @@ struct GovernorConfig {
   uint32_t hispeedKhz = 0;      // 0: no hispeed jump
   uint32_t targetPermille = 800, hispeedPermille = 900;
   uint32_t downTicks = 3;
-  uint32_t stepMs = 20, riseMs = 1000;
+  uint32_t stepMs = 10, riseMs = 1000;   // PianoThermal.cpp sets stepMs to piano-thermal-fast-ms
 };
 
 struct TickInput {

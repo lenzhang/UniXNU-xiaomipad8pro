@@ -6,6 +6,8 @@
 //   - Scmi.h: the message header, the shared-memory transport and the perf protocol against a model of the CPUCP (v4 with level
 //     indexing and v3 with scaled values, paged DESCRIBE_LEVELS, LEVEL_GET/SET, busy/timeout/error/wrong-answer channels);
 //   - Governor.h: fixed and governor modes, hispeed, down hysteresis, battery/power caps, floor, the thermal limit.
+//   - Cluster.h: a cluster against its stock trips, the near-trip test, the poll tiers; Tsens.h's interrupt encoders and the
+//     suspend mask.
 //   thermal_host         run the tests
 //   thermal_host --map   print the sensor map for tooling/k27/check-thermal-map.py
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. thermal_host.cpp -o /tmp/thermal_host && /tmp/thermal_host
@@ -491,7 +493,7 @@ static void testGovernor()
   // the thermal limit: at the trip one level down per stepMs (20 ms), under the release point up one per riseMs (1 s)
   uint64_t t = 1000;
   CHECK(g.thermal(hot(), t) && g.limit() == 14);
-  CHECK(!g.thermal(hot(), t + 10) && g.limit() == 14);          // 10 ms later: not yet
+  CHECK(!g.thermal(hot(), t + 5) && g.limit() == 14);           // 5 ms later: not yet (one step per 10 ms)
   t += 20;
   for (int i = 0; i < 9; ++i, t += 20) g.thermal(hot(), t);
   CHECK(g.limit() == 5 && g.enforce(PowerSource::battery) == 4);
@@ -626,6 +628,41 @@ static void testCluster()
   CHECK(nearTrip(m, trips));
 }
 
+// ------------------------------------------------------------------------------------------------------------- interrupts, polling
+static void testInterruptsAndPolling()
+{
+  CHECK(lowerIntBits(15) == 0x7fff && lowerIntBits(16) == 0xffff && lowerIntBits(7) == 0x7f && upperIntBits(9) == 0x1ff0000);
+  const uint32_t ul = encodeUpperLower(700, 850);
+  const Thresholds th = decodeThresholds(ul, 0);
+  CHECK(th.lowerDeci == 700 && th.upperDeci == 850 && (ul >> 24) == 0);
+  CHECK(decodeThresholds(encodeUpperLower(-50, 1200), 0).lowerDeci == -50);
+  // suspend: every lower interrupt masked (and the upper ones while nothing services them), other bits kept, all pulsed clear
+  SuspendMask sm = suspendMask(0, 15, false);
+  CHECK(sm.mask == 0x7fff && sm.clear == 0x7fff);
+  sm = suspendMask(0x00030000, 7, true);
+  CHECK(sm.mask == (0x7fu | 0x7f0000u) && sm.clear == (0x7fu | 0x7f0000u));
+  sm = suspendMask(0x80000001u, 9, false);
+  CHECK(sm.mask == (0x80000000u | 0x1ffu) && sm.clear == 0x1ff);
+  // poll tiers
+  TsensModel model;
+  model.all(450);
+  Monitor m;
+  ClusterTrips trips;
+  m.poll(model.io());
+  CHECK(pollTier(m, trips, false, false, 700) == Poll::base);
+  CHECK(pollTier(m, trips, true, false, 700) == Poll::fast);    // a cluster thermally limited
+  CHECK(pollTier(m, trips, false, true, 700) == Poll::fast);    // a cluster above the fast-poll clock
+  model.status[2][6] = statusWord(700, true);
+  m.poll(model.io());
+  CHECK(pollTier(m, trips, false, false, 700) == Poll::warm);
+  model.status[1][1] = statusWord(950, true);                   // 10 C under cpu-1-0-0's 105 C trip
+  m.poll(model.io());
+  CHECK(pollTier(m, trips, false, false, 700) == Poll::fast);
+  CHECK(pollPeriodMs(Poll::base, 1000, 250, 10) == 1000 && pollPeriodMs(Poll::warm, 1000, 250, 10) == 250);
+  CHECK(pollPeriodMs(Poll::warm, 100, 250, 10) == 100 && pollPeriodMs(Poll::fast, 100, 250, 10) == 10);
+  CHECK(pollPeriodMs(Poll::fast, 5, 250, 10) == 5);
+}
+
 static void printMap()
 {
   for (unsigned c = 0; c < kControllers; ++c)
@@ -649,6 +686,7 @@ int main(int argc, char **argv)
   testScmi();
   testGovernor();
   testCluster();
+  testInterruptsAndPolling();
   if (failures) {
     std::printf("thermal_host: %d FAILED\n", failures);
     return 1;

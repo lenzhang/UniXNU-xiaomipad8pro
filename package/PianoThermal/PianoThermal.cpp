@@ -8,7 +8,8 @@
 //                    each core's clock measured with a chain of dependent adds (no device access; piano-thermal-clock=0 skips it).
 //                    Nothing is written at this level: every MMIO access is a load.
 //   piano-thermal=2  level 1 + the protection policy (Policy.h): warm (85 C) logged; at a sensor's stock passive trip the GPU is
-//                    parked at its lowest level for the rest of the boot (PianoA830's exported adreno830_dcvs_park); at the stock
+//                    capped (PianoA830's "piano-gpu-ceiling", reversible) or, while PianoA830 has none, parked at its lowest level
+//                    for the rest of the boot (its exported adreno830_dcvs_park; at critical always); at the stock
 //                    critical trip - piano-thermal-margin (10 C) held for 1 s: logged loudly (every 5 s), and with
 //                    piano-thermal-shutdown=1 the kernel's halt (reboot_kernel(RB_HALT): processes signalled, disks synced and
 //                    unmounted, IOKit's shutdown notifications, PSCI SYSTEM_OFF). Default: log only.
@@ -20,6 +21,8 @@
 //                    / on power (Balanced: 3532 / 4089) from the IOPMPowerSource's ExternalConnected (unknown = battery), thermal
 //                    limit on top.
 // piano-cpufreq >= 1 implies the level 1 readout (its thermal input). No clock, regulator or GDSC is voted by this kext.
+// Suspend hooks (piano_thermal_suspend_prepare/finish, below): the threshold interrupt masks across system suspend, the only TSENS
+// writes, and only when the suspend driver calls them.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -71,7 +74,7 @@ constexpr int kRbHalt = 0x08;                                                   
 
 struct Args {
   uint32_t level, cpufreq, shutdown, pollMs, logS, clock, srot, warmC, marginC, delay;
-  uint32_t cap[2], bat[2], ac[2], minMhz[2], hispeed[2], tickMs, fastMs, hotC, releaseC, cutC;
+  uint32_t cap[2], bat[2], ac[2], minMhz[2], hispeed[2], tickMs, fastMs, warmMs, warmPollC, fastMhz, gpuMhz, hotC, releaseC, cutC;
   bool capGiven[2];
 };
 Args gArgs;
@@ -122,7 +125,12 @@ void readArgs()
   gArgs.hispeed[0] = bootArg("piano-cpufreq-hispeed0", 1500);
   gArgs.hispeed[1] = bootArg("piano-cpufreq-hispeed1", 1800);
   gArgs.tickMs = clampU(bootArg("piano-cpufreq-tick-ms", 100), 20, 1000);
-  gArgs.fastMs = clampU(bootArg("piano-thermal-fast-ms", 20), 10, 1000);
+  // Poll tiers (Cluster.h pollTier): 10 ms near a trip (Linux: 10 ms while passive), 250 ms from 70 C, the base below.
+  gArgs.fastMs = clampU(bootArg("piano-thermal-fast-ms", 10), 5, 1000);
+  gArgs.warmMs = clampU(bootArg("piano-thermal-warm-ms", 250), 10, 10000);
+  gArgs.warmPollC = clampU(bootArg("piano-thermal-warm-poll", 70), 30, 104);
+  gArgs.fastMhz = clampU(bootArg("piano-thermal-fast-mhz", 2500), 300, 5000);
+  gArgs.gpuMhz = clampU(bootArg("piano-thermal-gpu-mhz", 160), 100, 1100);   // the GPU ceiling at passive (160: the A830's floor)
   // The cluster thermal limit's thresholds (Cluster.h): 0 = the stock DT's per zone (105 C or 118 C passive, 5 or 8 C hysteresis,
   // critical 125 C - margin); given, absolute degrees C for every cpu-* zone.
   gArgs.hotC = clampU(bootArg("piano-cpufreq-hot", 0), 0, 118);
@@ -141,11 +149,11 @@ void buildTrips()
   gTrips.cutDeci = int32_t(gArgs.cutC) * 10;
   gTrips.marginDeci = int32_t(gArgs.marginC) * 10;
   if (gTrips.hotDeci)
-    snprintf(gTripsText, sizeof gTripsText, "one level down per %u ms at %u C, up per 1 s under %u C, slowest at %u C", 20u, gArgs.hotC,
+    snprintf(gTripsText, sizeof gTripsText, "one level down per %u ms at %u C, up per 1 s under %u C, slowest at %u C", gArgs.fastMs, gArgs.hotC,
              gArgs.releaseC, gArgs.cutC ? gArgs.cutC : 125 - gArgs.marginC);
   else
-    snprintf(gTripsText, sizeof gTripsText, "stock trips (cpu-* passive 105/118 C, hysteresis 5/8 C): one level down per 20 ms, up "
-             "per 1 s, slowest at %u C", gArgs.cutC ? gArgs.cutC : 125 - gArgs.marginC);
+    snprintf(gTripsText, sizeof gTripsText, "stock trips (cpu-* passive 105/118 C, hysteresis 5/8 C): one level down per %u ms, up "
+             "per 1 s, slowest at %u C", gArgs.fastMs, gArgs.cutC ? gArgs.cutC : 125 - gArgs.marginC);
 }
 const char *tripsText() { return gTripsText; }
 
@@ -367,7 +375,86 @@ PowerSource readPowerSource()
   return r;
 }
 
+// PianoA830's reversible GPU ceiling (kHz, 0 clears) through its registered service, no link dependency: true when PianoA830 took it
+// (kIOReturnSuccess). Until PianoA830 implements "piano-gpu-ceiling" its service answers kIOReturnUnsupported, and without
+// piano-gpu=2 there is no service at all: false.
+bool gpuCeiling(uint32_t khz)
+{
+  OSDictionary *match = IOService::serviceMatching("PianoA830");
+  if (!match) return false;
+  IOService *gpu = IOService::copyMatchingService(match);
+  match->release();
+  if (!gpu) return false;
+  const IOReturn r = gpu->callPlatformFunction("piano-gpu-ceiling", false, reinterpret_cast<void *>(uintptr_t(khz)), nullptr, nullptr,
+                                               nullptr);
+  gpu->release();
+  return r == kIOReturnSuccess;
+}
+
 }  // namespace
+
+// ------------------------------------------------------------------------------------------------------------- suspend hooks
+// For the system-suspend driver (docs/power.md's contract when it lands; until then these two C functions, or
+// callPlatformFunction("piano-thermal-suspend-prepare" / "-finish") on the registered PianoThermal service):
+//   prepare  masks every sensor's lower-threshold interrupt on the four controllers and pulses their clears (Linux 08e750858038 on
+//            piano: a lower threshold crossed while the device cools in suspend refires, wake-armed, and aborts or ends every
+//            sleep); the upper ones too while PianoThermal does not service the uplow interrupt itself (today: nothing would clear
+//            it); the critical interrupts stay as they are. The masks found are kept.
+//   finish   puts the masks found back.
+// They work whatever piano-thermal says (the controllers are mapped by the hooks themselves), and are the only TSENS writes of
+// this kext. prepare returns the number of controllers masked (0..4), -1 when already prepared.
+namespace {
+Window gSuspendTm[kControllers];
+uint32_t gSavedUpLowMask[kControllers];
+bool gSuspendSaved[kControllers];
+uint32_t gSuspendState;            // 0 idle, 1 prepared
+constexpr bool kServicesUplow = false;   // true once the uplow interrupt is PianoThermal's (section 10 of the page)
+}
+
+extern "C" int piano_thermal_suspend_prepare(void)
+{
+  uint32_t idle = 0;
+  if (!__atomic_compare_exchange_n(&gSuspendState, &idle, 1u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return -1;
+  int done = 0;
+  char line[200];
+  int at = 0;
+  line[0] = 0;
+  for (unsigned c = 0; c < kControllers; ++c) {
+    gSuspendSaved[c] = false;
+    if (!gSuspendTm[c].va && !mapWindow(gSuspendTm[c], kMap[c].tm, kTmBytes)) {
+      gSuspendTm[c] = {};
+      continue;
+    }
+    const uintptr_t va = gSuspendTm[c].va;
+    const uint32_t found = rd32(va + kTmUpLowIntMask);
+    const SuspendMask sm = suspendMask(found, kMap[c].count, !kServicesUplow);
+    wr32(va + kTmUpLowIntMask, sm.mask);
+    wr32(va + kTmUpLowIntClear, sm.clear);
+    wr32(va + kTmUpLowIntClear, 0);
+    gSavedUpLowMask[c] = found;
+    gSuspendSaved[c] = true;
+    ++done;
+    at = catf(line, sizeof line, at, " tsens%u %#x->%#x", c, found, sm.mask);
+  }
+  __builtin_arm_dsb(0xf);
+  note("suspend prepare: lower%s threshold interrupts masked on %d controllers:%s", kServicesUplow ? "" : " and upper", done, line);
+  return done;
+}
+
+extern "C" void piano_thermal_suspend_finish(void)
+{
+  if (__atomic_load_n(&gSuspendState, __ATOMIC_ACQUIRE) != 1) return;
+  int done = 0;
+  for (unsigned c = 0; c < kControllers; ++c) {
+    if (!gSuspendSaved[c] || !gSuspendTm[c].va) continue;
+    wr32(gSuspendTm[c].va + kTmUpLowIntMask, gSavedUpLowMask[c]);
+    gSuspendSaved[c] = false;
+    ++done;
+  }
+  __builtin_arm_dsb(0xf);
+  __atomic_store_n(&gSuspendState, 0u, __ATOMIC_RELEASE);
+  note("suspend finish: the threshold interrupt masks found before suspend are back on %d controllers", done);
+}
 
 // ------------------------------------------------------------------------------------------------------------- the service
 class PianoThermal : public IOService {
@@ -389,7 +476,7 @@ class PianoThermal : public IOService {
   Policy policy_;
   int32_t peakDeci_ = 0;
   unsigned peakC_ = 0, peakS_ = 0;
-  bool peakValid_ = false, parked_ = false, halting_ = false, criticalPendingLogged_ = false;
+  bool peakValid_ = false, parked_ = false, gpuCapped_ = false, halting_ = false, criticalPendingLogged_ = false;
   uint64_t criticalLogNs_ = 0;
   // cpufreq
   scmi::Channel channel_;
@@ -411,9 +498,28 @@ class PianoThermal : public IOService {
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3,
+                                void *param4) override;
 };
 
 OSDefineMetaClassAndStructors(PianoThermal, IOService)
+
+// "piano-thermal-suspend-prepare" (param1: int *, the result, may be null) and "piano-thermal-suspend-finish": the suspend hooks
+// above for a caller that does not link against this kext.
+IOReturn PianoThermal::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2,
+                                            void *param3, void *param4)
+{
+  if (functionName && functionName->isEqualTo("piano-thermal-suspend-prepare")) {
+    const int r = piano_thermal_suspend_prepare();
+    if (param1) *static_cast<int *>(param1) = r;
+    return r < 0 ? kIOReturnBusy : kIOReturnSuccess;
+  }
+  if (functionName && functionName->isEqualTo("piano-thermal-suspend-finish")) {
+    piano_thermal_suspend_finish();
+    return kIOReturnSuccess;
+  }
+  return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
+}
 
 IOService *PianoThermal::probe(IOService *provider, SInt32 *score)
 {
@@ -581,14 +687,33 @@ void PianoThermal::protect(const PolicyEvent &e)
     note("[%us] state %s -> %s: %s s%u %s %s C", upS(), stateName(e.before), stateName(e.after), kMap[e.controller].name, e.sensor,
          sn.name, Deci(e.deci).s);
   if (gArgs.level < 2) return;
-  if (e.after >= State::passive && !parked_) {
-    parked_ = true;
-    adreno830_dcvs_park();
+  // The GPU: at passive a reversible ceiling (PianoA830's "piano-gpu-ceiling", once it has one: docs/drivers/thermal.md section
+  // 10), else the boot-long park; at critical always the park.
+  if (e.after >= State::passive && !parked_ && !gpuCapped_) {
     const int32_t critical = sn.criticalDeci - int32_t(gArgs.marginC) * 10;
     const int32_t passive = passiveOf(sn) < critical - 50 ? passiveOf(sn) : critical - 50;
-    note("[%us] PASSIVE: %s %s C >= %s C (stock passive %s C): GPU parked at its lowest level for the rest of the boot "
-         "(adreno830_dcvs_park)",
-         upS(), sn.name, Deci(e.deci).s, Deci(passive).s, Deci(passiveOf(sn)).s);
+    if (gpuCeiling(gArgs.gpuMhz * 1000u)) {
+      gpuCapped_ = true;
+      note("[%us] PASSIVE: %s %s C >= %s C (stock passive %s C): GPU capped at %u MHz until the state is below passive "
+           "(PianoA830 piano-gpu-ceiling)",
+           upS(), sn.name, Deci(e.deci).s, Deci(passive).s, Deci(passiveOf(sn)).s, gArgs.gpuMhz);
+    } else {
+      parked_ = true;
+      adreno830_dcvs_park();
+      note("[%us] PASSIVE: %s %s C >= %s C (stock passive %s C): GPU parked at its lowest level for the rest of the boot "
+           "(adreno830_dcvs_park; PianoA830 has no reversible ceiling)",
+           upS(), sn.name, Deci(e.deci).s, Deci(passive).s, Deci(passiveOf(sn)).s);
+    }
+  }
+  if (e.after == State::critical && !parked_) {
+    parked_ = true;
+    adreno830_dcvs_park();
+    note("[%us] CRITICAL: GPU parked at its lowest level for the rest of the boot (adreno830_dcvs_park)", upS());
+  }
+  if (e.after < State::passive && gpuCapped_ && !parked_) {
+    gpuCapped_ = false;
+    gpuCeiling(0);
+    note("[%us] GPU ceiling cleared (state %s)", upS(), stateName(e.after));
   }
   if (!e.criticalPending && e.after != State::critical) criticalPendingLogged_ = false;
   const uint64_t now = nowNs();
@@ -662,6 +787,7 @@ void PianoThermal::cpuStart()
     gc.externalKhz = capKhz(gArgs.ac[d]);
     gc.floorKhz = gArgs.minMhz[d] * 1000;
     gc.hispeedKhz = gArgs.hispeed[d] * 1000;
+    gc.stepMs = gArgs.fastMs;
     governor_[d].init(dom.canSet ? mode : CpuMode::report, gc, khz, dom.count, dom.sustained, unsigned(idx));
     levelSinceNs_[d] = nowNs();
     domainOk_[d] = true;
@@ -820,15 +946,17 @@ void PianoThermal::run()
   if (gArgs.cpufreq) cpuStart();
   else readTopology();
   const bool governing = cpuOk_ && gArgs.cpufreq == 3;
-  // The poll period: the governor's tick (100 ms) or the policy's (1 s); fastMs (20 ms) while any sensor is within 10 C of its trip or
-  // a cluster's thermal limit holds it down (heating reaches ~200 C/s on a prime-core load: Ubuntu's history).
+  // The poll period by tier (Cluster.h pollTier): base = the governor's tick (100 ms) or 1 s; warm (hottest >= 70 C) 250 ms; fast
+  // (10 ms) within 10 C of a trip, while a cluster is thermally limited, or while a cluster runs above piano-thermal-fast-mhz.
   const uint32_t base = governing ? gArgs.tickMs : gArgs.pollMs;
-  note("running: %s every %u ms (every %u ms near a trip), the policy every %u ms, a report every %u s%s",
-       governing ? "the governor and the sensors" : "the sensors", base, gArgs.fastMs, gArgs.pollMs, gArgs.logS,
-       gMapFailures ? " (some windows not mapped)" : "");
-  uint64_t lastPolicy = 0, lastLoad = 0, lastLog = nowNs(), lastCpuLog = nowNs(), fastSince = 0;
-  uint64_t fastPolls = 0;
-  bool first = true, wasFast = false;
+  note("running: %s every %u ms, %u ms from %u C, %u ms near a trip or above %u MHz; the policy every %u ms; a report every %u s%s",
+       governing ? "the governor and the sensors" : "the sensors", base, pollPeriodMs(Poll::warm, base, gArgs.warmMs, gArgs.fastMs),
+       gArgs.warmPollC, gArgs.fastMs, gArgs.fastMhz, gArgs.pollMs, gArgs.logS, gMapFailures ? " (some windows not mapped)" : "");
+  uint64_t lastPolicy = 0, lastLoad = 0, lastLog = nowNs(), lastCpuLog = nowNs(), tierSince = nowNs();
+  uint64_t tierNs[3] = {};
+  uint32_t tierChanges = 0;
+  Poll tier = Poll::base;
+  bool first = true, fastNoted = false;
   for (;;) {
     monitor_.poll(kTsensIo);
     const uint64_t now = nowNs();
@@ -843,18 +971,26 @@ void PianoThermal::run()
         peakS_ = s;
       }
     }
-    bool limited = false;
-    for (unsigned k = 0; k < kDomains; ++k)
-      limited |= domainOk_[k] && governor_[k].mode() >= CpuMode::fixed && governor_[k].limit() < governor_[k].count() - 1u;
-    const bool fast = nearTrip(monitor_, gTrips) || limited;
-    if (fast != wasFast) {
-      if (fast) fastSince = now;
-      note("[%us] polling every %u ms (%s)", upS(), fast ? gArgs.fastMs : base,
-           fast ? (limited ? "a cluster's thermal limit holds it down" : "a sensor is within 10 C of its trip") : "back to normal");
-      wasFast = fast;
+    bool limited = false, clusterFast = false;
+    for (unsigned k = 0; k < kDomains; ++k) {
+      if (!domainOk_[k]) continue;
+      limited |= governor_[k].mode() >= CpuMode::fixed && governor_[k].limit() < governor_[k].count() - 1u;
+      clusterFast |= boot_[k] >= 0 && domain_[k].levels[set_[k]].khz > gArgs.fastMhz * 1000u;
     }
-    fastPolls += fast;
-    if (first || fast || now - lastPolicy >= uint64_t(gArgs.pollMs) * 1000000ull) {
+    const Poll next = pollTier(monitor_, gTrips, limited, clusterFast, int32_t(gArgs.warmPollC) * 10);
+    if (next != tier) {
+      tierNs[unsigned(tier)] += now - tierSince;
+      tierSince = now;
+      ++tierChanges;
+      if (next == Poll::fast && !fastNoted) {   // the first fast spell of a report window, with its reason
+        fastNoted = true;
+        note("[%us] polling every %u ms: %s", upS(), gArgs.fastMs,
+             limited ? "a cluster's thermal limit holds it down"
+                     : clusterFast ? "a cluster runs above the fast-poll clock" : "a sensor is within 10 C of its trip");
+      }
+      tier = next;
+    }
+    if (first || tier != Poll::base || now - lastPolicy >= uint64_t(gArgs.pollMs) * 1000000ull) {
       lastPolicy = now;
       const PolicyEvent e = policy_.update(monitor_, now / 1000000ull);
       piano_thermal_state = int32_t(e.after);
@@ -871,13 +1007,18 @@ void PianoThermal::run()
         cpuReport(now - lastCpuLog);
         lastCpuLog = now;
       }
-      if (fastPolls) note("[%us] %llu fast polls in this window%s", upS(), (unsigned long long)fastPolls, fast ? ", still fast" : "");
-      fastPolls = 0;
+      tierNs[unsigned(tier)] += now - tierSince;
+      tierSince = now;
+      if (tierNs[1] || tierNs[2])
+        note("[%us] polling: base %llu ms, warm %llu ms, fast %llu ms; %u changes", upS(), (unsigned long long)(tierNs[0] / 1000000),
+             (unsigned long long)(tierNs[1] / 1000000), (unsigned long long)(tierNs[2] / 1000000), tierChanges);
+      tierNs[0] = tierNs[1] = tierNs[2] = 0;
+      tierChanges = 0;
+      fastNoted = false;
       lastLog = now;
       peakValid_ = false;   // the peak is per report window
     }
     first = false;
-    (void)fastSince;
-    IOSleep(fast ? gArgs.fastMs : base);
+    IOSleep(pollPeriodMs(tier, base, gArgs.warmMs, gArgs.fastMs));
   }
 }

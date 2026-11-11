@@ -77,6 +77,36 @@ inline Ctrl decodeCtrl(uint32_t v)
   return {(v & kCtrlEnable) != 0, (v >> kCtrlSensorShift) & kCtrlSensorBits, (v & kCtrlResultTemp) != 0};
 }
 
+// The threshold interrupts (TSV2): TM_UPPER_LOWER_INT_STATUS/CLEAR/MASK 0x08/0x0c/0x10 with sensor n's lower interrupt at bit n and
+// its upper one at bit 16 + n; TM_CRITICAL_INT_STATUS/CLEAR/MASK 0x14/0x18/0x1c (bit n; 30 cycle-counter monitor, 31 watchdog
+// bark); a mask bit set = masked; an interrupt is cleared by writing its clear bit 1 then 0; TM_INT_EN [2:0] = 7 enables them all
+// on v2 (Linux tsens_enable_irq). Used only by the suspend hooks (below) and, later, the uplow interrupt (docs/drivers/thermal.md
+// section 10); levels 1-2 never write them.
+constexpr uint32_t kTmUpLowIntClear = 0x0c, kTmUpLowIntMask = 0x10, kTmCriticalIntClear = 0x18, kTmCriticalIntMask = 0x1c;
+constexpr uint32_t kTmIntEnAll = 7;
+
+inline uint32_t lowerIntBits(unsigned sensors) { return sensors >= 16 ? 0xffffu : (1u << sensors) - 1u; }
+inline uint32_t upperIntBits(unsigned sensors) { return lowerIntBits(sensors) << 16; }
+inline uint32_t encodeThreshold(int32_t deci) { return uint32_t(deci) & 0xfffu; }
+inline uint32_t encodeUpperLower(int32_t lowerDeci, int32_t upperDeci)
+{
+  return encodeThreshold(lowerDeci) | encodeThreshold(upperDeci) << 12;
+}
+
+// System suspend (Linux 08e750858038 on piano: a lower-threshold interrupt crossed while the device cools in suspend cannot be
+// serviced, refires, and being wake-armed aborts or ends every sleep): the controller's up/low mask with every sensor's lower
+// interrupt masked and, while nothing services the uplow interrupt natively (today), every upper one too; the critical interrupts
+// are not touched (the hardware's own protection). clear: the bits to pulse 1 then 0 in TM_UPPER_LOWER_INT_CLEAR (any latched
+// status of a masked interrupt goes with it).
+struct SuspendMask {
+  uint32_t mask, clear;
+};
+inline SuspendMask suspendMask(uint32_t current, unsigned sensors, bool maskUpper)
+{
+  const uint32_t bits = lowerIntBits(sensors) | (maskUpper ? upperIntBits(sensors) : 0u);
+  return {current | bits, bits};
+}
+
 inline unsigned popcount(uint32_t v)
 {
   unsigned n = 0;

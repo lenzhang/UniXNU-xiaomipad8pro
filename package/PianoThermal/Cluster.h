@@ -6,8 +6,7 @@
 // cpu-1-* (tsens1 sensors 1..4) cpu6's (cpuss-* are monitoring only). Each sensor counts against its own zone's passive trip and
 // hysteresis (105 C / 5 C, or 118 C / 8 C) unless piano-cpufreq-hot / -release (absolute, C) override them, and against the critical
 // threshold (125 C - piano-thermal-margin, or piano-cpufreq-cut). Ubuntu's history: one prime-core load heats a zone at ~200 C/s,
-// so Linux polls these zones every 10 ms while passive; PianoThermal polls every 20 ms while any sensor is within kNearDeci of its
-// trip.
+// so Linux polls these zones every 10 ms while passive; PianoThermal's poll tiers are pollTier() below.
 #ifndef PIANO_THERMAL_CLUSTER_H
 #define PIANO_THERMAL_CLUSTER_H
 #include "Governor.h"
@@ -55,6 +54,33 @@ inline bool nearTrip(const Monitor &m, const ClusterTrips &t)
       if (m.deci(c, s) >= trip - kNearDeci) return true;
     }
   return false;
+}
+
+// The poll period's tier. A 1 s poll that only speeds up within 10 C of a trip can step over the whole window (34.5 -> 91 C in
+// 0.26 s; a 250 ms poll overshot Linux's trip by ~10 C, so Linux polls these zones every 10 ms while passive):
+//   fast  a sensor within kNearDeci of its trip, a cluster thermally limited, or a cluster set above the fast-poll clock
+//         (piano-thermal-fast-mhz: the clocks at which a prime-core load heats that fast) -> piano-thermal-fast-ms (10 ms);
+//   warm  the hottest sensor at piano-thermal-warm-poll (70 C) or more -> 250 ms (or the base when shorter);
+//   base  1 s (the governor's 100 ms tick when it runs).
+// The tsens upper-threshold interrupt will replace the warm tier's polling (docs/drivers/thermal.md section 10).
+enum class Poll : uint8_t { base, warm, fast };
+
+inline const char *pollName(Poll p) { return p == Poll::fast ? "fast" : p == Poll::warm ? "warm" : "base"; }
+
+inline Poll pollTier(const Monitor &m, const ClusterTrips &t, bool limited, bool clusterFast, int32_t warmDeci)
+{
+  if (limited || clusterFast || nearTrip(m, t)) return Poll::fast;
+  int32_t d;
+  unsigned c, s;
+  if (m.hottestAll(d, c, s) && d >= warmDeci) return Poll::warm;
+  return Poll::base;
+}
+
+inline uint32_t pollPeriodMs(Poll p, uint32_t baseMs, uint32_t warmMs, uint32_t fastMs)
+{
+  if (p == Poll::fast) return fastMs < baseMs ? fastMs : baseMs;
+  if (p == Poll::warm) return warmMs < baseMs ? warmMs : baseMs;
+  return baseMs;
 }
 
 }  // namespace pianothermal
