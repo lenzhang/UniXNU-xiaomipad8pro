@@ -17,8 +17,13 @@ watchdog is not armed without them) plus the profile's and --arg's additions. En
   macos-prev   only with --prev-kc (Payloads/previous/)
   fastboot     the seed, no UFS root, data-persist=0, no pstore console (the last run's log stays): reset into ABL fastboot after 1 s
   reset, shutdown, tools
-  build-esp.py --profile base|softgpu|gpu|daily [--default macos|macos-diag] [--arg NAME=VALUE ...] [--from REPO] [--kc K --adt A --trust T
-               --seed S] [--name esp-diag] [--out out/persistent]
+  build-esp.py --profile base|softgpu|gpu|daily [--default macos|macos-diag] [--arg NAME=VALUE ...] [--rtc-offset N|sdam] [--from REPO]
+               [--kc K --adt A --trust T --seed S] [--name esp-diag] [--out out/persistent]
+
+The clock (docs/drivers/rtc.md): droidvm-utc=<--utc> is always there, the OS image's settime.sh sets it when the calendar is still
+near 1970. --rtc-offset N (measured once: tooling/native/rtc-offset.py) adds piano-rtc=1 piano-rtc-offset=N, --rtc-offset sdam only
+piano-rtc=1 (the offset from the PMIC's SDAM cell): the kernel (k27 0060, checked in the collection) then starts the calendar from the
+PMIC RTC, settime.sh sees a set clock and leaves it, and droidvm-utc only matters when the RTC gives no date.
 """
 import argparse
 import os
@@ -91,13 +96,27 @@ def kc_bundles(path):
         raise SystemExit(f'{path}: not an MH_FILESET kernel collection')
     natives = sorted({m.decode() for m in re.findall(rb'com\.unixnu\.driver\.[A-Za-z0-9]+', data)})
     droidvm = sorted({m.decode() for m in re.findall(rb'com\.[A-Za-z0-9.]*[Dd]roid[Vv][Mm][A-Za-z0-9.]*', data)})
-    return natives, droidvm
+    rtc = b'piano-rtc: count %u + offset %u' in data   # the kernel has k27 0060
+    return natives, droidvm, rtc
+
+
+def rtc_args(value):
+    """--rtc-offset: N (UTC - the RTC's count, 0..2^32-1) or 'sdam' -> the kernel arguments of k27 0060."""
+    if value is None:
+        return []
+    if value == 'sdam':
+        return ['piano-rtc=1']
+    if not re.fullmatch(r'\d+', value) or int(value) >= 1 << 32:
+        raise SystemExit(f'--rtc-offset {value}: a number 0..4294967295 (tooling/native/rtc-offset.py prints it) or "sdam"')
+    return ['piano-rtc=1', f'piano-rtc-offset={int(value)}']
 
 
 def args_of(a, profile, utc):
     ram = common.ram_images()
     base = [x for x in ram.K27_ARGS if x.split('=', 1)[0] not in DROPPED]
-    extra = profile['args'] + a.arg
+    if a.rtc_offset is not None and any(x.split('=', 1)[0] in ('piano-rtc', 'piano-rtc-offset') for x in a.arg):
+        raise SystemExit('--rtc-offset and --arg piano-rtc...: one of them')
+    extra = profile['args'] + a.arg + rtc_args(a.rtc_offset)
     names = {x.split('=', 1)[0] for x in extra}
     base = [x for x in base if x.split('=', 1)[0] not in names] + extra
     base += ['data-persist=2', f'droidvm-utc={utc}']
@@ -116,12 +135,20 @@ def args_of(a, profile, utc):
     return lines
 
 
+def clock_text(a):
+    utc = f'droidvm-utc {time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(a.utc))}'
+    if a.rtc_offset is None:
+        return utc
+    offset = 'its SDAM offset cell' if a.rtc_offset == 'sdam' else f'offset {a.rtc_offset}'
+    return f'the PMIC RTC + {offset} (k27 0060 piano-rtc=1), else {utc}'
+
+
 def config_text(a, lines, prev):
     entry = ('[[entry]]\nid = "{id}"\ntitle = "{title}"\ntype = "xnu"\npath = "Payloads/{dir}kernel.macho"\n'
              'initrd = "Payloads/scratch-data.img"\nargs = "{args}"\n')
     text = ('# piano persistent boot (docs/persistent-boot.md): the ESP on UFS LUN 0, partition 37. boot_a holds only BootShim + FD; a\n'
             '# "fastboot boot" image with its own payload still wins (firmware/patches/unixnu/0001).\n'
-            f'# profile {a.profile}; clock (droidvm-utc) {time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(a.utc))}\n'
+            f'# profile {a.profile}; clock: {clock_text(a)}\n'
             'version = 1\n[boot]\ntimeout = ' + str(a.timeout) + '\ndefault = "' + a.default + '"\n[kits]\nautoload = false\n')
     text += entry.format(id='macos', title='macOS (native)', dir='', args=lines['macos'])
     text += entry.format(id='macos-diag', title=f'macOS, reset to fastboot after {a.diag_reset_after} s', dir='', args=lines['macos-diag'])
@@ -156,7 +183,9 @@ def main():
     p.add_argument('--default', default='macos-diag', help='the menu default (macos-diag for the test phase, macos for daily use)')
     p.add_argument('--diag-reset-after', type=int, default=240)
     p.add_argument('--timeout', type=int, default=3, help='menu seconds (the UEFI log can be read with oem dump meanwhile)')
-    p.add_argument('--utc', type=int, default=int(time.time()), help='droidvm-utc: the clock until there is an RTC driver')
+    p.add_argument('--utc', type=int, default=int(time.time()), help='droidvm-utc: the clock when the RTC gives none')
+    p.add_argument('--rtc-offset', metavar='N|sdam', help='the calendar from the PMIC RTC (k27 0060): piano-rtc=1 and '
+                   'piano-rtc-offset=N (tooling/native/rtc-offset.py), or "sdam" for the PMIC\'s own offset cell')
     p.add_argument('--name', help='output base name (default esp-<profile>-<default>)')
     p.add_argument('--out', type=Path, default=common.DEVICE / 'out/persistent')
     a = p.parse_args()
@@ -165,9 +194,12 @@ def main():
     for n, path in inputs.items():
         if not path.is_file():
             raise SystemExit(f'{n}: {path} is missing')
-    natives, droidvm = kc_bundles(inputs['kc'])
+    natives, droidvm, kc_rtc = kc_bundles(inputs['kc'])
     if droidvm:
         raise SystemExit(f'{inputs["kc"]} links {droidvm}: no DroidVM kext natively (docs/PROJECT-MAP.md rule 8)')
+    if a.rtc_offset is not None and not kc_rtc:
+        raise SystemExit(f'--rtc-offset: the kernel in {inputs["kc"]} has no k27 0060 (build the collection with '
+                         'K27_KERNEL=<kernel-k27-0060-native.macho> tooling/k27/build-native-image.sh)')
     for bundle in profile['kexts']:
         if bundle not in natives:
             raise SystemExit(f'profile {a.profile} needs {bundle} in the kernel collection; {inputs["kc"]} has {natives} '
@@ -237,7 +269,7 @@ def main():
         'partition': {'lun': 0, 'index': common.ESP_INDEX + 1, 'first_lba': common.ESP_FIRST, 'blocks': common.ESP_BLOCKS,
                       'dd': f'bs=1M seek={common.ESP_FIRST * common.LBA >> 20} count={common.ESP_BLOCKS * common.LBA >> 20}'},
         'profile': a.profile, 'about': profile['about'], 'extra_args': a.arg, 'default': a.default, 'timeout': a.timeout,
-        'utc': a.utc, 'cmdlines': lines,
+        'utc': a.utc, 'rtc_offset': a.rtc_offset, 'kc_has_rtc_calendar': kc_rtc, 'cmdlines': lines,
         'inputs': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in inputs.items()},
         'previous': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in prev.items()} if prev else None,
         'kc_natives': natives, 'adt_vmm_present': vmm,
