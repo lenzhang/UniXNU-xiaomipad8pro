@@ -1,0 +1,73 @@
+turnip: darwin, TU_DEBUG from the boot argument piano-tu-debug before the Data seed's file
+
+piano-tu-debug=<flags> on the kernel's boot line (read through kern.bootargs) stands in for TU_DEBUG when the environment has none, and
+wins over /private/var/ngpu/debug/tu-debug (0002); piano-tu-debug=none means no TU_DEBUG at all, the file unread. So sysmem against GMEM
+rendering is an A/B of two boot lines over one Data seed (one seed identity: data-persist=2's store survives the switch). WindowServer
+says once which it got: "TU: info: TU_DEBUG=sysmem from /private/var/ngpu/debug/tu-debug", "... from boot argument piano-tu-debug".
+Against the tree after 0001-0004. MIT, as the file.
+
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -10,6 +10,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#if defined(__APPLE__)
++#include <sys/sysctl.h>
++#endif
+ 
+ #include "util/os_file.h"
+ #include "util/os_file_notify.h"
+@@ -136,15 +139,44 @@
+    /* Darwin: a system daemon's environment comes from a launchd job on the read-only system volume, so without TU_DEBUG the first
+     * line of /private/var/ngpu/debug/tu-debug (on the Data volume, beside the Metal plugin's other debug switches) stands in for it. */
+    if (!getenv("TU_DEBUG")) {
+-      if (FILE *file = fopen("/private/var/ngpu/debug/tu-debug", "r")) {
+-         char line[128] = {};
+-         if (fgets(line, sizeof(line), file)) {
+-            line[strcspn(line, "\r\n")] = 0;
+-            if (line[0])
+-               setenv("TU_DEBUG", line, 0);
++      /* piano-tu-debug=<flags> on the kernel's boot line (kern.bootargs) wins over the file, so an A/B of TU_DEBUG (sysmem against
++       * GMEM rendering) is two boot lines over one Data seed; piano-tu-debug=none means no TU_DEBUG at all, the file unread. */
++      const char *source = "the default";
++      char args[1024] = {};
++      size_t size = sizeof(args) - 1;
++      bool from_boot = false;
++      if (!sysctlbyname("kern.bootargs", args, &size, NULL, 0)) {
++         static const char key[] = "piano-tu-debug=";
++         for (char *at = args; (at = strstr(at, key)); at += sizeof(key) - 1) {
++            if (at != args && at[-1] != ' ')
++               continue;
++            char value[128] = {};
++            const size_t n = strcspn(at + sizeof(key) - 1, " ");
++            memcpy(value, at + sizeof(key) - 1, n < sizeof(value) - 1 ? n : sizeof(value) - 1);
++            from_boot = true;
++            source = "boot argument piano-tu-debug";
++            if (value[0] && strcmp(value, "none"))
++               setenv("TU_DEBUG", value, 0);
++            break;
+          }
+-         fclose(file);
+-      }
++      }
++      if (!from_boot) {
++         if (FILE *file = fopen("/private/var/ngpu/debug/tu-debug", "r")) {
++            char line[128] = {};
++            if (fgets(line, sizeof(line), file)) {
++               line[strcspn(line, "\r\n")] = 0;
++               if (line[0]) {
++                  setenv("TU_DEBUG", line, 0);
++                  source = "/private/var/ngpu/debug/tu-debug";
++               }
++            }
++            fclose(file);
++         }
++      }
++      /* The compositor says once which mode it renders in: the A/B's evidence on the console (stderr-log=1). */
++      if (!strcmp(getprogname(), "WindowServer"))
++         mesa_logi("TU_DEBUG=%s from %s%s", getenv("TU_DEBUG") ? getenv("TU_DEBUG") : "", source,
++                   getenv("TU_DEBUG") ? "" : " (none: Turnip picks GMEM or sysmem per render pass)");
+    }
+ #endif
+    tu_env.start_debug = tu_env.debug = parse_debug_string(os_get_option("TU_DEBUG"), tu_debug_options);
