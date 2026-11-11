@@ -227,6 +227,8 @@ What each driver adds (their owners' work; nothing here changes their packages):
 | PianoTorch | torch off (four SPMI writes, synchronous in `setPowerState(kOff)`; also `systemWillShutdown`) | stays off (a new request lights it) | level 1: nothing |
 | NativeRamBlock | **built with `native-ufs-suspend=1`, host-tested, not run**, only with the Data store open read-write: NativeUfs's power child (off before the link, on after it); under its gate the store's SYNCHRONIZE CACHE (every acknowledged write is FUA already), then new requests held; a failed sync vetoes NativeUfs's suspend (the link stays up) | requests released | volatile Data: no part (nothing of it is on UFS) |
 | PianoNullEthernet, ARMPlatformStandIn | nothing | nothing | — |
+| PianoSensors | level 4 (joined then): both sensor streams disabled (SNS message 10) before the acknowledgement, at most 800 ms; a stream not off by then has its QRTR port closed (the hub drops it), unless PianoPower asks for quiet | fresh streams if their consumers want them | below level 4 nothing; never the DSP (PianoPower's), docs/drivers/sensors.md §5c.4 |
+| NativeRamBlock, PianoNullEthernet, ARMPlatformStandIn | nothing | nothing | — |
 
 **Status of the drivers' parts** (2026-11-11; built, host-tested, linked into the KC with the 0063 kernel; **not run on the
 tablet**; each driver's page has its lines). A driver in the power tree whose off/on is not reached costs nothing: the default ADT

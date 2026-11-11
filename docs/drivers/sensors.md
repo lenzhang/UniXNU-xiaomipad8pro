@@ -1,12 +1,16 @@
 # Sensors: ambient light, accelerometer, gyroscope, proximity through the ADSP's sensor hub: PianoSensors
 
-Status: levels 1-3 built, 2026-11-11 (backlog B3 and B13). `package/PianoSensors` is a k27 native kext on PianoPower's client
+Status: levels 1-4 built, 2026-11-11 (backlog B3 and B13). `package/PianoSensors` is a k27 native kext on PianoPower's client
 contract (`package/include/PianoAdspContract.h`, `charging.md` §9): level 1 a read-only survey, level 2 the FastRPC reverse file service
-serving the owner's sensor pack from the ESP, level 3 the SNS client's sensor list. Host-tested (`tests/run-host-tests.py`: ASan/UBSan,
-synthetic inputs only, a simulated DSP and hub, the pack on an mtools FAT32 image, the kernel's no-FP/no-libc compile), compiled with the
-kernel's flags and **linked into the KC** (`configs/k27-native-kexts.txt`, after PianoPower and NativeUfs; the 2026-11-11 link with main's list:
-PianoSensors 433 pointers among 20 native kexts), inert without `piano-sensors`. **Not run on hardware.** Template: `README.md`. The macOS-side consumers (the rotation agent `piano-rotated`, PianoTouch's transform, PianoBacklight's
-automatic mode, the streams' off/on lifecycle) are `package/PianoAuto`, host-tested (§5a).
+serving the owner's sensor pack from the ESP (or from a RAM test image that carries it, §5b), level 3 the SNS client's sensor list,
+level 4 the streams: the ambient light on change and the accelerometer at 10 Hz, each on a QMI client of its own and only while a
+consumer needs it, published as the properties §5 reserved (§5c). Host-tested (`tests/run-host-tests.py`: ASan/UBSan, synthetic inputs
+only, a simulated DSP and hub, the pack on an mtools FAT32 image and in a RAM image's addon, the kernel's no-FP/no-libc compile), compiled
+with the kernel's flags and **linked into the KC** (`configs/k27-native-kexts.txt`, after PianoPower and NativeUfs; the 2026-11-11
+link with level 4: PianoSensors 460 pointers among 21 native kexts, the native kext rule passed), inert without
+`piano-sensors` (and level 4's parts below `piano-sensors=4`). **Not run on hardware.** Template: `README.md`. The macOS-side consumers
+(the rotation agent `piano-rotated`, PianoTouch's transform, PianoBacklight's automatic mode) and the streams' off/on lifecycle, which the
+kext now runs itself, are `package/PianoAuto`, host-tested (§5a).
 
 ## 1. Purpose and gate
 
@@ -71,9 +75,11 @@ the v1.1.1 "light stops after off/on" fix: a nested close cancelled an open's fi
 read-only `apps_std`, `apps_mem` heap pages, link loss), `SensorsPack` (the read-only file tree), `SensorsFixed`, `SensorsOrient`, and
 their tests. Derived: the pack builder (piano's ODM archive, a soc0 allowlist, never written into a repository) and `SensorsRpc` (an
 `admit` hook: a call the guard declines is answered at once with `SSR_EUNSUPPORTED`, counted as `declined`). PAG's manager
-(`SensorsCore`: streams, retries, iOS units) stays the template of level 4's streams. New: `SensorsGuard` and `SensorsHealth.h`
+(`SensorsCore`: streams, retries, iOS units) was the template of levels 3 and 4, not taken. New: `SensorsGuard` and `SensorsHealth.h`
 (section 7), `SensorsPolicy` (section 5), `SensorsClient` (level 3: one connection, lookups then attributes, the guard asked for each
-request), `SensorsLoad` (the pack from the ESP), `PianoSensors.cpp` (the kext), `tests/piano.c` and `tests/load.c`.
+request), `SensorsStream` (level 4, §5c: a client per stream over PianoAuto's `AutoStream`/`AutoLight`), `SensorsLoad` and
+`SensorsAddon` (the pack from the ESP or a RAM test image), `PianoSensors.cpp` (the kext), `tests/piano.c`, `tests/streams.c`,
+`tests/load.c` and `tests/addon.c`.
 
 Cross-checks written here from the other sources, not from PAG (`tests/piano.c`): the SNS request bytes against libssc's messages, the
 QMI frames against libqmi (also parsed by PianoPower's own `qcom_qmi_parse`), and the file service's whole bring-up against FRPC and the
@@ -89,10 +95,11 @@ layout is a contained change in `SensorsRpc.c`'s `invoke()`.
 ```
 PianoPower (owns the DSP: PAS, SMP2P, GLINK, IPCRTR, locator, servreg; never touched by sensors)
   |-- GLINK "fastrpcglink-apps-dsp" (contract) ----------> file service: attach PD 2, listener, apps_std from the pack (read only)
-  |-- one QRTR client port following service 400 --------> SNS client: lookups, attributes (level 3); streams (level 4)
-  '-- piano_adsp_health / piano_adsp_quiet --------------> SensorsGuard (section 7) gates both
+  |-- a QRTR client port following service 400 ----------> SNS client: lookups, attributes (level 3)
+  |-- one more port per stream (level 4) ----------------> the light's and the accelerometer's own QMI clients (§5c)
+  '-- piano_adsp_health / piano_adsp_quiet --------------> SensorsGuard (section 7) gates all of it
 PianoSensors : IOService on IOPlatformExpertDevice (not HID: no macOS consumer reads sensor HID services for this display)
-  |-- ambient_light (514, on change; AutoLight) -> SensorsPolicy curve -> PianoBacklight "PianoBacklightAmbient" (requested, §5a.4)
+  |-- ambient_light (514, on change; AutoLight) -> SensorsPolicy curve -> piano-sensors-light-target -> PianoBacklight (§5a.4)
   |-- accel (513, 10 Hz, only while the cover is detached; AutoStream) -> SensorsOrient -> property piano-sensors-edge (§5a.5)
   |      -> launch agent piano-rotated: cover attached -> 0 deg; else the edge -> WindowServer's rotation -> PianoTouch (§5a.2, 5a.3)
   '-- proximity, gyro, mag: discovered and listed, never streamed
@@ -144,7 +151,7 @@ notification: poll at most 4 times a second, or the kernel consumer reads them o
 
 | Property | Type | Set by | Meaning |
 |---|---|---|---|
-| `piano-sensors` | number | all levels | the level running (1..3) |
+| `piano-sensors` | number | all levels | the level running (1..4) |
 | `piano-sensors-guard` / `-guard-reason` | string | level 1+ | `wait`, `run`, `backoff`, `off` / `none` or why it is off (`sg_reason_name`) |
 | `piano-sensors-dsp` | string | level 1+ | PianoPower's health: stage, up, fatal/reports, link and charger generations, quiet, crash reason |
 | `piano-sensors-channel` / `-channel-ups` | number | level 1+ | 1 while `fastrpcglink-apps-dsp` is up / how often it came up |
@@ -153,10 +160,11 @@ notification: poll at most 4 times a second, or the kernel consumer reads them o
 | `piano-sensors-smmu`, `-arena` | string | level 1+ | the four streams' entries (planned at 1, set at 2); the arena's address and verdict |
 | `piano-sensors-rpc` | string | level 1+ | the file service: stage, attaches, calls, opens, missing, reads, refused (writes), declined (guard), bytes, first missing path |
 | `piano-sensors-types` | dictionary | level 3 | data type (`registry`, `accel`, `gyro`, `mag`, `ambient_light`, `proximity`) -> `pending`, `none`, `no answer`, or `found N: name (vendor), available A, streaming/on change, rates L-H Hz` |
-| `piano-sensors-lux` | number | level 4 (reserved) | the front light sensor's last reading, integer lux |
-| `piano-sensors-light-target` | number | level 4 (reserved) | the backlight target, permille 0..1000 (`ps_als_step`) |
-| `piano-sensors-edge` | string | level 4 (reserved) | the panel edge that is up: `top`, `left`, `bottom`, `right`, `none` (`ps_edge_name` of `ps_edge_of`, after SensorsOrient's hold) |
-| `piano-sensors-seq` | number | level 4 (reserved) | moves with every change of the three above |
+| `piano-sensors-lux` | number | level 4 | the front light sensor's last reading, integer lux (with each target, else at most every 250 ms) |
+| `piano-sensors-light-target` | number | level 4 | the backlight target, permille 0..1000 (`ps_als_step`); absent before the first sample |
+| `piano-sensors-edge` | string | level 4 | the panel edge that is up: `top`, `left`, `bottom`, `right`, `none` (`ps_edge_name` of `ps_edge_of`, after SensorsOrient's hold; `none` while the stream is not wanted, failed or off; `none` at start) |
+| `piano-sensors-seq` | number | level 4 | moves by one with every change of the three above (0 at start), set after them; an edge change also sends `kIOMessageServicePropertyChange` |
+| `piano-sensors-streams` | dictionary | level 4 | `light`, `accel` -> state (`off (display off)`, `enabling`, `on`, `disabling`, `failed`, `no port`, `no service`, `no sensor yet`, `off (the guard)`), the request (`on change` / `N Hz asked`, the hub's rate), sessions, requests, answers, refused, unanswered, rearmed, errors, samples, dropped, and `consumer: ...` (§5c.2) |
 
 The rotation agent applies `ps_rotation_step` itself (SensorsPolicy.c is plain C and links into user space) with PianoKeyboard's
 `piano-keyboard-attached` and the user's lock; the backlight takes `piano-sensors-light-target`.
@@ -267,12 +275,15 @@ Command line (USB root shell): `--probe` (displays, the setter, `canChangeOrient
 - Log: ambient writes folded into one line per 10 s (`ambient: N targets in S s, lux A..B, target P..Q permille, offset K, code X -> Y`;
   failed accesses still logged at once); key steps in automatic mode `step +1 from ... in automatic mode: offset 0 -> 1, code 757 -> 954`.
 
-### 5a.5 PianoSensors' side (its kext at S4: `AutoStream.h`, `AutoLight.h`)
+### 5a.5 PianoSensors' side (its kext at S4: `AutoStream.h`, `AutoLight.h`; built, §5c)
 
 The outputs are §5's level-4 properties as landed: `piano-sensors-light-target` (permille), `piano-sensors-lux`, `piano-sensors-edge`
-(`ps_edge_name`), `piano-sensors-seq`, set without a notification; both consumers poll them at most 4 times a second. Asked of its
-owner: `registerService()` once started, so that matching (PianoBacklight's `copyMatchingService`, the agent's notifications) finds
-it; until then both find it by class (PianoBacklight among its provider's children, the agent by walking the service plane).
+(`ps_edge_name`), `piano-sensors-seq`, set without a notification but for the edge (a `kIOMessageServicePropertyChange` with each
+change); both consumers poll them at most 4 times a second. The kext calls `registerService()` in `start()` at every level, so
+matching (PianoBacklight's `copyMatchingService`, the agent's notifications) finds it; both still find it by class too. As built
+(§5c), these notes hold with three precisions: the light's consumer is PianoBacklight's automatic mode read from its boot arguments
+and properties (the kext sends no target through the platform function, only the -1 below); each stream has its own QMI client; the
+accelerometer also waits for its consumer (piano-rotated: `piano-rotate>=1`).
 
 - Ambient light: one `PalLight`; conditions: `piano-sensors-als` and PianoBacklight taking targets, NativeGopDisplay's
   `piano-display-power`, PianoKeyboard's `piano-keyboard-hall` (unknown counts as open). Each `pas_action` goes out only with
@@ -367,6 +378,19 @@ Run 2026-11-11 (on the owner's sources, offline): `ROM configuration: 66 files o
 (header, table, names) accept it and find sns_reg_config, json.lst and the registry. No soc0 values: no source holds them, none is
 invented; level 2's log shows whether the PD asks for `/sys/devices/soc0` (then a `--soc0` file from the SoC's identity).
 
+**A RAM test image that carries the pack** (built 2026-11-11, host-tested; no ESP write, nothing committed): `PIANO_SENSOR_PACK=PACK`
+for `tooling/bootimg/build-ram-images.py` (also through `build-native-image.sh`, which then makes the images' ADT with the GpuAddon slot
+as `out/adt/piano-k27-addon.adt`, and `tooling/k27/build-sensor-test-images.sh`, §8.1) puts the pack, zlib-compressed, as the one entry
+`sensors/piano-sensors.pack` of UniXNU's boot addon container (`package/PianoSensors/tools/sensor_addon.py`; the layout of UniXNU's
+`scripts/make-gpu-addon.py`) into the payload as `Payloads/kernel.macho.gpuaddon`. DarwinBoot copies that file into the kernel's memory
+and fills the ADT's `/chosen/memory-map` `GpuAddon` {address, size} (the k27 kernel has no GPU addon of its own: the slot is free
+natively). PianoSensors (`SensorsAddon.c`) checks the container whole, finds the entry, inflates it with libkern's zlib, checks the pack
+as it checks the ESP's and takes it before the ESP: `piano-sensors-pack` then ends `from the RAM image` (else `from the ESP`); a carried
+pack that does not check is not replaced by the ESP's (the image is wrong, and says so). DarwinBoot refuses a slot without the file and
+a file without the slot, so `build-ram-images.py` refuses either mismatch and `build-esp.py` refuses an ADT with the slot: the installed
+system's ADT never has it. Only a pack under `out/` or `private/` is taken, the record keeps only its sha256, and the images then hold
+this unit's calibration: they stay in the ignored `out/` and are never shared.
+
 The tool writes only under this repository's `out/` or `private/` (anything else is refused), with mode 0600; it refuses a link or a
 special file in the registry, a second registry directory, a ROM file whose sha256 differs, a ROM path outside the sensor trees, a serial
 number in soc0. `build-esp.py --sensor-pack` checks the pack (magic, size, at most 4 MiB), puts it at
@@ -394,11 +418,99 @@ then `make-sensor-pack.py --dump out/sensors/dump --out out/sensors/pack.bin --l
 registry as a count). The tool warns when sns_reg_config, json.lst or the persist registry is missing (without the registry the DSP falls
 back to the ROM's generic calibration).
 
+## 5c. Level 4: the streams (`piano-sensors=4`, S4), as built
+
+Status, 2026-11-11: built, host-tested (`tests/streams.c`, a simulated hub sending the service's message shapes; PianoAuto's
+`stream_tests.h`) and linked; not run. `SensorsStream.c` (portable C on the main thread) drives PianoAuto's `AutoStream.c` and
+`AutoLight.c`, compiled into the kext from their package: the off/on rules the consumers' side was written for are now the producer's
+own. Inert below `piano-sensors=4`: no stream port is opened, the kext does not join the power tree, no level-4 property is set.
+
+### 5c.1 The protocol (facts; libssc and Android as the specification, no code)
+
+| Item | Value | Source | State |
+|---|---|---|---|
+| A client per stream | each stream on a QRTR port of its own on PianoPower's router (`piano_qrtr_open`), so a QMI client of its own at the hub (its id in TLV 0x10 of every response); the level-3 list keeps its port: 3 of the 8 ports | libssc (one QMI client per sensor), Android's sensors HAL (one connection per sensor), `PianoAdspContract.h` | verified (source); answers question 6 |
+| Which sensor | the default SUID of `ambient_light` / `accel` from level 3's lookup (default only, with updates), taken once its attributes are read or given up, not when `available` is false; a new default sensor while its stream runs: the stream's port is closed and a new one starts clean | SSC, PAG | verified (source) |
+| Enable, light | message 514 (`sns_std_sensor`'s on-change config), request `{}` (no payload): the sensor reports when its value changes; if its attributes say `stream_type` 0 (streaming), 513 at its lowest advertised rate instead | SSC protos, libssc; Android (the light is an on-change sensor) | verified (source) |
+| Enable, accel | message 513, request `{payload {sample_rate 1: 10.0f}}` (float bits 0x41200000); the driver runs its nearest rate at or above and says which in the physical configuration event (768, field 1), logged; `batching {batch_period µs}` only with `piano-sensors-accel-batch` (off: as libssc) | SSC protos, libssc | verified (source); the rate chosen: needs-boot |
+| Disable | message 10, request `{}`, to the same SUID on the same client | SSC protos, libssc | verified (source) |
+| Delivery | `susp_config {processor 1 (APSS), delivery 0 (wakeup)}` as level 3 and libssc; both streams are off before every system sleep anyway (§5c.4) | SSC, libssc | verified (source) |
+| Samples | report 0x21 `{TLV 0x01 client id, TLV 0x02 sns_client_event_msg {suid, events {msg_id 1025, timestamp (19.2 MHz), payload sns_std_sensor_event {data (repeated float, packed or not), status 0..3}}}}`; light: `data[0]` lux (the light drivers add a raw count, unused); accel: `data[0..2]` m/s² in the SSC frame (+9.81 on the axis that points up); a report may carry several events (batching) | SSC protos, libssc, SUN's readings | verified (source) |
+| Other events | 768 (the rate: logged), 130 error (a failure, §5c.2), 129 flush, 133 resampler, 1022 calibration: counted, unused | SSC protos | verified (source) |
+| First event | an on-change sensor reports its current value when enabled | Android's on-change semantics, Ubuntu's readings after each enable | inferred; the re-arm covers it (5a.9 risk 7) |
+| A client gone | `piano_qrtr_close` sends DEL_CLIENT for the port; a QMI service drops a gone client's state, as when a Linux client's socket closes | Linux `qrtr` and `qmi_interface.c` (read for behaviour), `QcomQrtr.h` | verified (source); the hub's side: needs-boot |
+
+### 5c.2 When a stream runs, and the off/on rules
+
+| Stream | Wanted while | Read from |
+|---|---|---|
+| light | a consumer (`piano-sensors-als`: 1, the default, PianoBacklight's automatic mode: `piano-backlight=2 piano-backlight-auto=1` and not manual by the user's choice, i.e. not its published `piano-backlight-auto` false once it has taken a target; 2 always; 0 never), the display on, the lid open, no system sleep | the boot arguments, PianoBacklight's properties, NativeGopDisplay's `piano-display-power` (published with `piano-backlight=2`; unknown counts as on), PianoKeyboard's `piano-keyboard-hall` (unknown counts as open) |
+| accel | a consumer (`piano-sensors-rotate`: 1, the default, piano-rotated reads the edge: `piano-rotate>=1` and not `piano-rotate-test=1`; 2 always; 0 never), the display on, the cover detached (`piano-keyboard-attached` not 1), no system sleep | the boot arguments, NativeGopDisplay, PianoKeyboard |
+
+The services are found by class (registered or not) every 2 s for two minutes, then every 30 s; their properties are read on each pass
+of the main thread. The rules are AutoStream's (Ubuntu's v1.1.1 fix as a rule, §3): one request outstanding per client; an enable
+never followed by a disable before its answer, nor a disable by an enable; the first event kept also when it overtakes the enable's
+answer, and marked so that the light starts afresh from it; events while off, while a disable is out or while the hub's state is
+unknown are dropped; no first event within 3 s: re-armed (disable, enable), at most twice per period of wanting; no answer within 2 s,
+or an error event (130): a failure and the hub's state unknown, so a disable goes first, then a fresh enable; failures back off 1 s
+doubling to 32 s, six in a row end the stream for the boot. Every request takes a token of the guard (§7 rule 4) and every outcome is
+told to it (a refusal at the port or by the hub, a missing answer and an error event are failures), so the guard's backoff paces the
+retries and its strikes end them; the guard itself is unchanged.
+
+Outputs (§5's table): each light sample through `ps_als_step` (AutoLight: the first sample of every session at once, then the
+smoothing at most every 250 ms and only while it moves) into `piano-sensors-light-target`, the lux into `piano-sensors-lux` (with each
+target, else at most every 250 ms); each accelerometer sample through `ps_accel_sample` (the axis map `piano-sensors-axes`, SensorsOrient's
+250 ms hold) into `piano-sensors-edge`; `piano-sensors-seq` moves by one with every change and is set after the values, an edge change
+also sends `kIOMessageServicePropertyChange`. The consumers are unchanged: PianoBacklight's 250 ms poll takes the target (§5a.4),
+piano-rotated reads the edge on each sequence move or notification (§5a.2).
+
+### 5c.3 Battery
+
+- The lowest report rates: the light on change (nothing while the room stays the same); the accelerometer at 10 Hz, the rotation's need
+  (the driver's nearest rate at or above, logged); nothing else streams (proximity, gyroscope, magnetometer, the rear light: §5a.7).
+- A stream runs only while its consumer needs it: the light with the automatic brightness on, the display on and the lid open; the
+  accelerometer only with the rotation agent, the display on and the cover detached (the docked landscape needs no sensor). Each is
+  disabled at the main thread's next pass after its condition goes.
+- Before every system sleep both are off (§5c.4); after the wake they start afresh only if wanted.
+- The main thread polls the conditions every 250 ms while the display is on or a stream is busy, every second at rest with the display
+  off; the engine itself keeps no timer at rest (a deadline only for an answer due, a first event due, a smoothing step).
+- Stream on/off and failure lines go through a limiter per stream (8 lines, then one per 30 s, the lines left out counted in the next
+  one); `piano-sensors-streams` keeps the complete counters.
+
+### 5c.4 Teardown: display sleep, system sleep, the guard's strike
+
+- The display sleeps, the lid closes, the cover attaches, the consumer goes: the stream's disable goes out (with the guard's token) and
+  its late samples are dropped; the light keeps its last target (PianoBacklight lights the wake with it, then the new session's first
+  sample gives the room's level at once), the edge goes to `none`.
+- System sleep (`package/include/PianoPowerContract.h`, docs/power.md §4): at level 4 the kext joins the power tree once its main
+  thread runs. `setPowerState(kOff)` asks the thread to disable both and is acknowledged once they are off, within 800 ms (it returns
+  2 s to IOPMrootDomain); a stream not off by then (no answer, or the guard held the request) has its port closed (DEL_CLIENT: the hub
+  drops a gone client's requests), unless PianoPower asks for quiet (then nothing is sent and the stream stays on through the sleep,
+  logged). `kOn` lets them start afresh (new sessions; a closed port is opened again). mach_absolute_time stands still while suspended,
+  so no timeout runs out across it.
+- The guard's strike (§7 rule 3): nothing more is sent; the edge goes to `none`; PianoBacklight is told to leave automatic mode once
+  (`PianoBacklightAmbient` -1, the code as it is: the keys work as without automatic mode), if a target was ever given; every later
+  packet is ignored; the ports that carried a request are closed only while the DSP may still be told (the strike was ours or the
+  charger domain's restart, the DSP up without a fatal sign or crash reason, the charger domain up, no quiet); a dead or dying DSP is
+  never touched. A sleep under way is acknowledged at once.
+
+### 5c.5 Lines
+
+`PianoSensors: ` then: `light: QRTR port 24 for service 0x190 (its own QMI client)`, `light: the service is there generation=1`,
+`light: sensor 0x..., on change`, `light: on (on change) session=1`, `light: first sample: lux=153 session=1`, `light: off (display
+off) session=1 samples_total=12`, `accel: on (10.000 Hz asked) session=1`, `accel: the hub runs it at 12.500 Hz`, `accel: first sample:
+x=8.490 y=-0.080 z=4.750 m/s^2 session=1`, `accel: edge top`, `accel: off (cover attached) ...`. Failures: `... the hub refused the
+enable error=N`, `... no answer within 2000 ms: the hub's state is unknown (a disable goes first)`, `... error event error=N: a failure;
+...`, `... no first event within 3000 ms: re-armed (disable, then enable)`, `... failed for the boot (6 failures in a row); its outputs
+at rest`. The sleep: `streams: system sleep: disabling them`, `streams: ready for the sleep after 40 ms` (or `(ports closed)`),
+`streams: awake`. The strike: `... the guard is off: nothing more is sent, every packet is ignored, the outputs at rest`, `light:
+PianoBacklight told to leave automatic mode: 0x0`, `light: QRTR port 24 closed`.
+
 ## 6. Boot args
 
 | Argument | Default | Values |
 |---|---|---|
-| `piano-sensors=N` | 0 | 0 nothing (probe declines); 1 read-only survey; 2 + the FastRPC file service; 3 + the SNS sensor list (built); 4 + streams and the consumers (next) |
+| `piano-sensors=N` | 0 | 0 nothing (probe declines); 1 read-only survey; 2 + the FastRPC file service; 3 + the SNS sensor list; 4 + the streams (§5c); all built |
 | `piano-sensors-rpc-pa=ADDR` | 0x9d200000 | the arena's physical address (8 MiB; default the CDSP carveout's sensors slice, `PianoDspMemory.h`; another address only outside every known user, `ps_arena_check`; 0: no file service); level 2 runs no file service without one |
 | `piano-sensors-bank=N` | 3 | the context bank (3..8); its streams 0x1000+N, +0x80, +0x40, +0x60 |
 | `piano-sensors-smmu=0` | 1 | leave the SMMU alone at level 2 (the streams must bypass already) |
@@ -406,7 +518,11 @@ back to the ROM's generic calibration).
 | `piano-sensors-nopack=1` | 0 | level 2 with an empty pack (every open fails and is logged) |
 | `piano-sensors-channel=0` | 1 | level 1 does not register the FastRPC channel |
 | `piano-sensors-delay=S`, `-log=0..2` | 0, 1 | wait first; log volume (2: every SNS line) |
-| `piano-sensors-axes=a..` (level 4) | `a+y+x+z` | the accelerometer map (SensorsFixed text), for the four-edge test |
+| `piano-sensors-als=0\|1\|2` (level 4) | 1 | the light stream: 1 while PianoBacklight's automatic mode takes targets (`piano-backlight=2 piano-backlight-auto=1`, not manual by the user's choice); 2 always (lux without a consumer: S4); 0 never |
+| `piano-sensors-rotate=0\|1\|2` (level 4) | 1 | the accelerometer stream: 1 while piano-rotated reads the edge (`piano-rotate>=1`, not `piano-rotate-test=1`); 2 always (S4); 0 never |
+| `piano-sensors-accel-hz=N` (level 4) | 10 | the rate asked (1..100 Hz); the driver runs its nearest at or above (logged) |
+| `piano-sensors-accel-batch=MS` (level 4) | 0 | the hub may hold accelerometer samples this long (`batch_period`; 0: none, as libssc; at most 1000) |
+| `piano-sensors-axes=a..` (level 4) | `a+y+x+z` | the accelerometer map (SensorsFixed text), for the four-edge test; a text that is not a map: the default, logged |
 
 The consumers' own arguments: `piano-rotate*` (the agent, §5a.2) and `piano-backlight-auto=1` (PianoBacklight, §5a.4).
 
@@ -415,9 +531,10 @@ The consumers' own arguments: `piano-rotate*` (the agent, §5a.2) and `piano-bac
 Component `PianoSensors` (`com.unixnu.driver.PianoSensors`, `tooling/k27/kext/PianoSensors.json` naming `com.unixnu.driver.PianoPower`
 and `com.unixnu.driver.NativeUfs` as libraries), listed after both in `configs/k27-native-kexts.txt`; built by
 `tooling/k27/build-native-piano-sensors.sh` (host tests, the copies of FatVolume and SmmuStream checked against their originals, the
-objects, the import check: 335 kernel imports, 8 from the libraries). Two threads (`piano-sensors`: health, guard, SNS client,
-properties; `piano-sensors-rpc`: the file service); PianoPower's callbacks only record and wake them. Rules (`SensorsGuard.c` and
-`SensorsHealth.h`, host-tested):
+objects, the import check: 353 kernel imports, 9 from the libraries). Two threads (`piano-sensors`: health, guard, SNS client, the
+streams, properties; `piano-sensors-rpc`: the file service); PianoPower's callbacks only record and wake them. At level 4 the kext
+joins the power tree once its main thread runs (`setPowerState`, §5c.4). Rules (`SensorsGuard.c` and `SensorsHealth.h`, host-tested;
+level 4 adds none: its requests take the same tokens and count as the same failures, and after a strike it sends nothing more):
 
 1. A client only: never start, stop or restart the DSP, never vote its rails or touch RPMh/AOSS; no re-attach after a failed attach in
    the same boot (Ubuntu's `Restart=no`).
@@ -443,12 +560,40 @@ Every run with `piano-power=2` (PianoPower starts the DSP; the sensors never do)
 | S1 survey | `piano-sensors=1`: health through the guard, the channel registered, the SNS port, the pack loaded and checked, the SMMU entries of 0x1003/0x1083/0x1043/0x1063 planned (loads only), the arena address checked (not mapped); no message to the DSP | `piano-sensors-dsp` up with `charger_pd 0x1fffffff`; `-guard run` 20 s after; `-channel 1` (the DSP's open answered); `-sns` announced; `-pack ok` with all four items; `-smmu` and `-arena` listed; no fatal and the charger generation unchanged for 10 min | built; 1 boot |
 | S2 files | `=2`: the arena (0x9d200000 by default) mapped, the streams bypassed, attach (bank 3, then `-bank=4`), listener, every DSP call answered from the pack, writes declined | `rpc: attached to the sensors PD`, `listening`, `first call of the DSP`, `rpc open` lines for sns_reg_config, json.lst and the registry; `-rpc` declined 0; the refused writes counted; no fatal for 15 min, charger unchanged | built; 2-4 boots |
 | S3 sensor list | `=3`: + SUID lookups and attributes, no stream | `-types`: registry, accel, gyro, ambient_light, proximity, mag found with names and rates (without the file service, as SUN saw: accel none); guard `run` all along | built; 1-2 boots |
-| S4 streams | `=4`: light on change -> `piano-sensors-light-target` / PianoBacklight; accel 10 Hz while the cover is detached -> `piano-sensors-edge`; 20 light off/on cycles | lux follows a lamp, the backlight within 2 s; readings after every cycle (v1.1.1); the four edges named right (fix `-axes` if not) | next: 2-3 days, 2 boots |
+| S4 streams | `=4`: light on change -> `piano-sensors-light-target` / PianoBacklight; accel 10 Hz while the cover is detached -> `piano-sensors-edge`; 20 light off/on cycles; the streams off before a system sleep (§5c, §8.1) | lux follows a lamp, the backlight within 2 s; readings after every cycle (v1.1.1); the four edges named right (fix `-axes` if not); `ready for the sleep` before each sleep | built and host-tested; 3 boots (§8.1) |
 | S5 rotation | the agent (staged and signed like the GPU plugin), the cover lock, touch rotation (the consumers' work) | each edge upright with touch at the four corners (Ubuntu's table); attached -> normal | 3-5 days, 2-3 boots |
 | S6 B13 | persist's registry read at run time (ext4 reader), or the RAM overlay if S2 asked for it | readings identical with the pack's registry; at rest 9.81 +- 0.1 m/s^2 on each face; light within 10 % of Ubuntu's under one lamp | 3-5 days, 1-2 boots |
 
-What is left: S4-S6, about 2-3 weeks, and 9-14 attended boots for all six. Fails safe: everything stops at the first guard event; a
-reboot returns to Ubuntu.
+What is left: the boots of S1-S4 (one batched session, §8.1), then S5 and S6, about 1-2 weeks, and 9-14 attended boots for all six.
+Fails safe: everything stops at the first guard event; a reboot returns to the tablet's normal boot.
+
+### 8.1 The batched tablet test (S1-S4 in one attended session)
+
+Prerequisites: PianoPower level 2 healthy on this kernel (the DSP up, `charger_pd 0x1fffffff`, no fatal), the cable to the Mac, a
+charged battery, the cover, a lamp. The pack is made on the Mac from the owner's sources (§5b) and either carried by every test image
+(the default: `PIANO_SENSOR_PACK`, §5b) or put on the installed ESP by the owner's maintenance session (`SENSOR_PACK=esp`).
+
+```sh
+python3 package/PianoSensors/tools/make-sensor-pack.py --registry-tar ... --rom-config ... --out out/sensors/pack.bin   # §5b
+KB=$(tooling/k27/build-native-piano-keyboard.sh | tail -1)       # the cover's kext: piano-keyboard-attached, -hall
+PIANO_EXTRA_KEXTS=$KB PIANO_GPU=2 PIANO_VMM_PRESENT=0 K27_KERNEL=$PIANO_K27_TREE/out/k27/kernel-k27-0063-native.macho \
+  tooling/k27/build-native-image.sh
+tooling/k27/build-sensor-test-images.sh           # out/ram-sensors-<step>/ (SENSOR_PACK=out/sensors/pack.bin, or =esp)
+```
+
+Each step is `fastboot boot out/ram-sensors-<step>/boot-piano-macos-ram-A-bundled.img`; its timed reset lands in ABL fastboot, and
+`out/ram-sensors-dump/` reads the run's log before the next. Every image: `piano-power=2`, the GPU profile, the USB console and root
+shell, the buttons, Data volatile. Run in this order and stop at the first guard strike (`piano-sensors-guard off`), DSP fatal,
+charger generation change or failed pass; the tablet's normal boot is a reboot away.
+
+| Step | Image | Do (root shell: `ioreg -rc PianoSensors -l \| grep piano-sensors`) | Pass |
+|---|---|---|---|
+| S1 | `s1` | wait 10 min | §8's S1 row; `-pack` `ok: ... registry ...; from the RAM image` (or `from the ESP`) |
+| S2 | `s2` (`s2b4` only if the attach was refused) | wait 15 min | §8's S2 row |
+| S3 | `s3` | wait 10 min | §8's S3 row; `-types` ambient_light `found 1: ... on change`, accel `found 1: ... streaming` |
+| S4 | `s4` (`-als=2 -rotate=2`: no consumer needed) | a lamp off and on; off the stand: each edge up in turn, then flat; the cover attached and detached; `pmset displaysleepnow` and a key, 20 times | `-lux` follows the lamp within 2 s; `-edge` names the four edges right (else `piano-sensors-axes`, Ubuntu's table) and `none` flat; `accel: off (cover attached)` and on again; a `first sample` line after every wake; `-streams` 0 unanswered, 0 errors; no strike, the charger generation unchanged after 20 min |
+| S4c | `s4c` (the consumers decide) | the lamp again; `piano-backlight-percent` (manual), then `piano-backlight-auto` 1 (setProperties, backlight.md §5) | the backlight follows the lamp within 2 s; manual: `light: off`, `-streams` `consumer: PianoBacklight is in manual mode`; automatic again: a first sample at once |
+| S4z | `s4z` (k27 0062: three test sleeps) | nothing: the sleeps come every 120 s | before each sleep `streams: ready for the sleep after N ms` with N below 800 and no `ports closed`; after each wake `streams: awake` and fresh sessions; the room's level at once |
 
 ## 9. Fallback
 
@@ -464,8 +609,9 @@ Delivered (2026-11-11): A-C as PianoPower's client contract (`package/include/Pi
 string and the link and charger generations, `piano_adsp_quiet`, and GLINK keeping a DSP-side open that precedes the registration);
 PianoKeyboard publishes `piano-keyboard-attached`. PianoSensors uses one channel and one port. D is decided: the CDSP carveout, split
 in `package/include/PianoDspMemory.h` (section 5). Delivered too (2026-11-11, off by default): PianoBacklight's automatic mode reading
-`piano-sensors-light-target` (`piano-backlight-auto=1`, §5a.4) and PianoTouch's rotation input (`piano-touch-rotate=1`, §5a.3). Still
-open: NativeGopDisplay's transform (R2 only), and PianoSensors' own `registerService()` (§5a.5). The original request, for the record:
+`piano-sensors-light-target` (`piano-backlight-auto=1`, §5a.4), PianoTouch's rotation input (`piano-touch-rotate=1`, §5a.3), and
+PianoSensors' own `registerService()` in `start()` (§5a.5). Level 4 uses three of the eight QRTR ports (the list and one per stream)
+and `piano_qrtr_close` (§5c). Still open: NativeGopDisplay's transform (R2 only). The original request, for the record:
 
 - A. Existing, used as is: `piano_adsp_channel("fastrpcglink-apps-dsp", 512, 8, 0 /* the DSP opens it */, ...)` and `piano_adsp_send`
   (40-byte invokes; answers of 12-16 bytes). Asked: `kClients` from 4 to 6 (IPCRTR, PMIC_RTR_ADSP_APPS, audio's adsp_apps and this one
@@ -494,12 +640,30 @@ open: NativeGopDisplay's transform (R2 only), and PianoSensors' own `registerSer
 4. Whether the PD asks for `apps_mem` pages, socinfo, DSP libraries (`/usr/lib/qcom/adsp`, empty on Ubuntu) or files outside the pack. (S2 log)
 5. Whether declined writes are harmless (Ubuntu's V4 says yes) or the PD loops (then the RAM overlay). (S2)
 6. One QMI client for the lookups and attributes (level 3 uses one) is enough; whether streams want one each (libssc, Android) at S4.
+   Decided: one each (§5c.1); S4 shows whether the hub takes three clients from one node.
 7. The rotation path (verdict R1, §5a.1): does WindowServer answer `canChangeOrientation` yes for NativeGopDisplay's panel, and does a
    rotated desktop come through its CPU copy unchanged (composited rotated) or as transposed swaps? (§5a.8 R0, no sensor needed)
 8. The physical axes (left/right) (S4, S5: Ubuntu's four-edge table). macOS's sense of "90 deg" is public: clockwise, the panel's left
    edge up (CGDisplayConfiguration.h, §5a.1).
 9. The front sensor's placement (bezel or under the panel: an under-display sensor would see the screen's own light). (S4, lamp off/on)
 10. Jumbo reports: not requested (no TLV 0x10) to fit the router's 2048-byte buffers; whether the hub then splits or drops large ones. (S3)
+11. Which rate the accelerometer's driver runs for 10 Hz (the physical configuration event says; LSM6DSO's lowest rates), and whether
+    batching (`piano-sensors-accel-batch`) lowers the report rate as asked. (S4)
+12. Whether the hub reports an on-change light's value right after the enable (the re-arm covers it) and how often under a steady lamp. (S4)
+13. Whether the hub drops a closed port's streams (DEL_CLIENT) at once: only the sleep's fallback and a strike close ports. (S4z)
+
+### 10.3 Level 4's risks
+
+1. The light's consumer is read from PianoBacklight's boot arguments and properties: a level the user chose before the first target
+   looks like "no target yet" (its published `piano-backlight-auto` is false for both), so the light stream keeps running, its targets
+   refused, until PianoBacklight publishes its last target; bounded, and shown as the consumer in `piano-sensors-streams`.
+2. Without PianoKeyboard the cover reads detached and the lid open: the accelerometer streams whenever the agent runs and the display
+   is on; the batched test links PianoKeyboard.
+3. `piano-display-power` comes with `piano-backlight=2` only; without it the display counts as on (both streams then stop only with
+   their other conditions and the system sleep).
+4. The sleep's fallback closes a port (DEL_CLIENT) when a disable is not answered within 800 ms; with PianoPower asking for quiet it
+   does not, and the stream stays on through the sleep (logged): the hub's reports then wait in GLINK until the wake.
+5. The edge's axes and the light's placement are inferred (5a.9 risk 7); the rates the hub chooses are logged, not checked.
 
 ## 11. Licence note
 
@@ -511,4 +675,7 @@ the vendor/ODM sensor configuration and this unit's persist registry are data re
 under the ignored `out/`), never committed and never another unit's. PianoAuto (BSD-2-Clause-Patent) is this repository's own code; of
 Apple's it uses public SDK headers, and for the one private call (System Settings' rotation setter) class and selector names with their
 runtime type encodings, plus exported symbol names that are only cited: no Apple binary was disassembled or decompiled
-(`package/PianoAuto/UPSTREAM`). The msm DPU catalog (GPL-2.0) gave the pipes' rotation facts only.
+(`package/PianoAuto/UPSTREAM`). The msm DPU catalog (GPL-2.0) gave the pipes' rotation facts only. Level 4's requests, events and
+client model come from libssc (GPL-3.0) and Android's sensor behaviour (the reporting modes, one client per sensor) as specification
+only, Linux's qrtr and QMI interface (GPL-2.0) for what a gone client means; the RAM image's carrier follows UniXNU's addon layout
+(`scripts/make-gpu-addon.py`, DarwinBoot's `GpuAddon` slot) as a format; the kext inflates it with libkern's own zlib.
