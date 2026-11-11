@@ -112,12 +112,10 @@ Build outputs (`UniXNU-piano/out/`, `build/`), signing keys (`private/`), vendor
    archive's kext. `tooling/kc/build-kc-k27.sh` enforces this (`tooling/k27/check-native-kexts.py`, before and after the link).
    Evidence and history: `docs/bringup-debugging.md` §5.
 
-## 7. Current bring-up note (2026-11-11)
+## 7. Current bring-up note (2026-11-11 09:05)
 
-Native macOS on piano boots from UFS: NativeUfs publishes the OS and SystemOS windows of linux_rootfs (development build:
-unverified, writable), Data persists in NativeUfs's store window at the end of linux_rootfs, launchd runs its boot tasks and
-WindowServer starts (no display or GPU yet, so it restarts). Ubuntu's root is gone (owner's decision); linux_data is untouched.
-Tests run unattended with `tooling/native/native-loop.sh` (RAM boots only; see `docs/bringup-debugging.md`). Nothing in the boot
-chain is flashed: returning to the stock OS is a long-press of the power button (or power + volume-down for the vendor Fastboot
-screen). Prepared, not yet run: the persistent install (macOS from power-on: a 1 GiB ESP as LUN 0 partition 37, `boot_a` = BootShim
-+ FD), `docs/persistent-boot.md`.
+Native macOS is installed on piano and boots by itself: boot_a = BootShim + FD (signed v4), the UniXNU payload on an ESP (LUN 0
+partition 37, carved from linux_rootfs), the macOS root and Data on linux_rootfs (NativeUfs). The A830 GPU (PianoA830 + Turnip on
+ABI v2) composites the login screen. Input is still missing (keyboard cover driver in progress, touch later). Dev work continues with
+RAM boots (`fastboot boot`, which take priority over the installed copy); verified backups of every written region are on the NAS
+and `tooling/persist/maint-session.py rollback ...` restores them. See `docs/persistent-boot.md`.

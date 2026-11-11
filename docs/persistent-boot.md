@@ -247,3 +247,20 @@ partly discharged pack charges without the DSP is unmeasured. Note also:
 - The clock is the ESP build time (`droidvm-utc`), there is no RTC driver yet.
 - Watchdog: not armed without `piano-reset-after`; panics restart (no `panic-spin`) into macOS again; the escape is power +
   volume-down.
+
+## Done 2026-11-11 (sessions 1-3)
+
+- Session 1 (07:5x): NAS backups with read-back (boot_a 389d4271, boot_b 17e89056, vendor_boot_a 50f70e36, init_boot_a bbebc3d1,
+  both LUN 0 GPT copies, the 1 GiB linux_rootfs tail, the store header); new GPT written and read back (linux_rootfs ends at
+  71527423, partition 37 esp at 71527424 + 262144, sgdisk clean); esp-base-diag written and read back.
+- Session 2 (RAM only): ram-esp-test (UniXNU's config from HD(37) on LUN 0, XNU to its reset, Data store at LBA 68119455),
+  ram-precedence (a dev RAM image still boots its own payload; judged by its 45 s reset), ram-v4-signed (ABL accepts the signed v4
+  boot_a image, which loads the ESP).
+- Signing host: the signing helper runs on the host named by PIANO_SIGN_HOST in ~/.config/piano/env (never committed); the key
+  there is the one boot_a was signed with (public key sha1 f5151930...).
+- Session 3 (09:0x): boot_a = boot-piano-macos-persistent-v4-signed (1b212281...) written by dd and read back; ESP = esp-gpu-macos
+  (1120f7d8..., PianoA830 + Turnip, vmm-present 0) read back; vendor_boot_a, init_boot_a, boot_b, root manifest, GPT unchanged.
+- `fastboot reboot` (09:05): the tablet boots by itself into native macOS: the login screen on the A830 at about 2.5 min.
+
+The installed configuration has no piano-reset-after and no USB console: to get back to ABL fastboot for RAM boots, hold
+power + volume-down. Rollback: `maint-session.py rollback boot-a|esp-final|gpt` from the verified backups, or RAM-boot any image.
