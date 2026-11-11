@@ -456,6 +456,8 @@ class Torch {
     if (lit_) {
       const uint64_t left = deadlineMs_ > nowMs ? (deadlineMs_ - nowMs + 999) / 1000 : 0;
       snprintf(out, size, "on %u mA (2 x %u mA, itarget %u), off in %llu s", ma_, ma_ / 2, itarget_, (unsigned long long)left);
+    } else if (lastReason_ == Reason::none) {
+      snprintf(out, size, "off");
     } else {
       snprintf(out, size, "off (%s)", reasonName(lastReason_));
     }

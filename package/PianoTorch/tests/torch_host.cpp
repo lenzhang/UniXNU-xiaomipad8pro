@@ -239,6 +239,9 @@ static void testOnOff()
   GuardConfig g;
   Torch t(p.bus, g, 100);
   Temperatures temps;
+  char line[120];
+  t.describe(0, line, sizeof line);
+  CHECK(std::strcmp(line, "off") == 0);
   Torch::Outcome o = t.request(1000, 50, 0, temps);
   CHECK(o.lit && o.steps.ok && o.steps.writes == 12 && o.steps.readbacks == 12 && t.ma() == 50 && t.itarget() == 4);
   CHECK(a.flash(kRegModuleEn) == 0x81 && a.flash(kRegChanEn) == 0x03 && a.flash(kRegIres) == 0x07);
@@ -246,7 +249,6 @@ static void testOnOff()
   CHECK(a.flash(kRegStrobe0) == 0x01 && a.flash(kRegStrobe0 + 1) == 0x01 && a.flash(kRegTimer0) == 0 && a.flash(kRegTimer0 + 1) == 0);
   CHECK(onlyFlash(a));
   CHECK(t.deadlineMs() == 1000 + 300 * 1000);
-  char line[120];
   t.describe(1000, line, sizeof line);
   CHECK(std::strcmp(line, "on 50 mA (2 x 25 mA, itarget 4), off in 300 s") == 0);
 
