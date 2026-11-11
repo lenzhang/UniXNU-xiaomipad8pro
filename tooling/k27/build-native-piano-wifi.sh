@@ -13,8 +13,11 @@ D=$(cd "$(dirname "$0")/../.." && pwd)
 . "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 P=$D/package/PianoWifi; O=$D/out/native-kexts/PianoWifi
 mkdir -p "$O/host-tests"
-for t in wifi_host bringup_host; do
-  "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/$t.cpp" -o "$O/host-tests/$t"
+# WifiQrtr.c (the copy of PianoPower's QRTR codec) is a C source: the level 5 test links its object.
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/WifiQrtr.c" -o "$O/host-tests/WifiQrtr.o"
+for t in wifi_host bringup_host qmi_host; do
+  EXTRA=; [ "$t" = qmi_host ] && EXTRA="$O/host-tests/WifiQrtr.o"
+  "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/$t.cpp" $EXTRA -o "$O/host-tests/$t"
   "$O/host-tests/$t" || { echo "Error: PianoWifi host tests failed ($t)" >&2; exit 1; }
 done
 # FatVolume.c must stay the byte-for-byte copy of PianoPower's (but for its provenance line), which PianoPower never has to change.
@@ -23,7 +26,7 @@ for f in FatVolume.c FatVolume.h; do
     || { echo "Error: package/PianoWifi/$f has drifted from package/PianoPower/$f" >&2; exit 1; }
 done
 python3 "$D/tooling/k27/build-native-kext.py" PianoWifi "$P/PianoWifi.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
-  "$P/WifiFirmware.c" "$P/FatVolume.c" -I "$P" --obj "${K27_OBJ:-k27-native-obj}"
+  "$P/WifiFirmware.c" "$P/FatVolume.c" "$P/WifiQrtr.c" -I "$P" --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 # PianoA830's lock words and NativeUfs's partition reader come from those kexts (libraries in PianoWifi.json, both linked before
 # PianoWifi in configs/k27-native-kexts.txt), resolved by the KC link.
