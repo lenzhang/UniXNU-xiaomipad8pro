@@ -10,10 +10,12 @@
 //           "CTS, RTS" gpio24/25), "Stock bt_uwb_en: VIN1, no bias, output", "Baud index 0x11 (3.2 Mbaud) in every stock
 //           gngbtnv20 NVM", the PMU's supply map
 //   GCC   = drivers/clk/qcom/gcc-sm8750.c and dt-bindings qcom,sm8750-gcc.h of that kernel: the wrapper/SE6 branch offsets, vote
-//           bits, the SE6 RCG and its frequency table, parent map 5
+//           bits, the SE6 RCG and its frequency table (rates, sources, dividers, M/N), parent map 5, its DFS registration
 //   RCG   = drivers/clk/qcom/clk-rcg2.c: the CMD/CFG/M/N layout and the DFS registers of a QUP RCG
 //   PINS  = drivers/pinctrl/qcom/pinctrl-sm8750.c: gpio24..27 function 1 = qup2_se6; gpio18 function 1 = wcn_sw_ctrl
-//   PGPIO = drivers/pinctrl/qcom/pinctrl-spmi-gpio.c: the register layout of a PMIC GPIO (LV/MV subtypes)
+//   PGPIO = drivers/pinctrl/qcom/pinctrl-spmi-gpio.c: the register layout of a PMIC GPIO (LV/MV subtypes), the order of its
+//           configuration writes
+//   ARB   = drivers/spmi/spmi-pmic-arb.c (v7) and this repository's k27 0057 / PianoTorch: the owner channel of an APID
 //   FW    = xiaomipad-8pro-mainline firmware/piano-bluetooth-rom20.json: "OS3.0.303.0.WPYCNXM bluetooth_a FAT image, image directory"
 //   SHENG = UniXNU-sheng porting.toml and reports (BSD-2-Clause-Patent; SM8550 + WCN7850, hardware-verified): the same QUP2 SE6 at
 //           0x898000 with INTID 493 and stream 0x423 on SM8550; GENI firmware revision 0x204 (protocol 2) and QUP 0x30090000 read there
@@ -65,6 +67,25 @@ constexpr uint32_t kRcgParentHz[8] = {19200000, 600000000, 0, 0, 0, 0, 300000000
 constexpr uint32_t kS6Rates[] = {7372800,  14745600, 19200000, 29491200,  32000000,  48000000,  51200000,  64000000,
                                  75000000, 80000000, 96000000, 100000000, 102400000, 112000000, 117964800, 128000000};
 constexpr unsigned kS6RateCount = sizeof kS6Rates / sizeof kS6Rates[0];
+// The same table as GCC has it (ftbl_gcc_qupv3_wrap2_s6_clk_src): rate, parent map 5 source, the half divider field (2 x divider
+// - 1) and M/N (0/0: no M/N). Level 3 programs one of these when the boot chain left DFS off (clk-rcg2's configure: M, N as
+// ~(N - M), D as ~clamp(N, M, 2 (N - M)) in 16 bits, then CFG, then CMD bit 0 and a wait of at most 500 us for it to clear).
+struct RcgEntry {
+  uint32_t hz;
+  uint8_t source, halfDivider;
+  uint16_t m, n;
+};
+constexpr RcgEntry kS6Table[] = {
+  {7372800, 6, 1, 384, 15625},  {14745600, 6, 1, 768, 15625},  {19200000, 0, 1, 0, 0},       {29491200, 6, 1, 1536, 15625},
+  {32000000, 6, 1, 8, 75},      {48000000, 6, 1, 4, 25},       {51200000, 6, 1, 64, 375},    {64000000, 6, 1, 16, 75},
+  {75000000, 6, 7, 0, 0},       {80000000, 6, 1, 4, 15},       {96000000, 6, 1, 8, 25},      {100000000, 1, 11, 0, 0},
+  {102400000, 6, 1, 128, 375},  {112000000, 6, 1, 28, 75},     {117964800, 6, 1, 6144, 15625}, {128000000, 1, 1, 16, 75},
+};
+static_assert(sizeof kS6Table / sizeof kS6Table[0] == kS6RateCount, "one table entry per rate");
+constexpr uint32_t kRcgCmdUpdate = 1u << 0, kRcgCmdRootOff = 1u << 31, kRcgUpdatePolls = 500;
+constexpr uint32_t kRcgCfgMask = 0x1fu | 7u << 8 | 3u << 12 | 1u << 20;   // half divider, source, M/N mode, hardware control
+// The GCC window levels 2 and up map: the vote word, the five CBCRs and the RCG (0x100000 + 0x60000, PianoTouch's window).
+constexpr uint64_t kGccBytes = 0x60000;
 
 // ---- TLMM (pinctrl@f100000): the UART's pins and the PMU's two TLMM lines ----
 // Pin n: configuration at n * 0x1000 (pull 1:0 (0 none, 1 down, 2 keeper, 3 up), function 5:2, drive 8:6 ((v + 1) * 2 mA),
@@ -88,6 +109,9 @@ constexpr unsigned kPinCount = sizeof kPins / sizeof kPins[0];
 enum : unsigned { kPinCts = 0, kPinRts, kPinTx, kPinRx, kPinWlanEn, kPinSwCtrl };
 constexpr uint64_t tlmmCfg(unsigned gpio) { return kTlmm + uint64_t(gpio) * kTlmmStride; }
 constexpr uint64_t tlmmIo(unsigned gpio) { return tlmmCfg(gpio) + 4; }
+// Level 3's window: gpio0 .. gpio28 (WLAN_EN 16, SW_CTRL 18, the UART 24..27), never written but for the four UART pins.
+constexpr uint64_t kTlmmBytes = 0x1d000;
+constexpr unsigned kUartDriveMa = 2;   // the DT's drive-strength for all four
 
 // ---- BT_EN: pm8550ve "f" (SPMI SID 5) GPIO 3 ----
 // A PMIC GPIO n is peripheral 0x88 + n - 1 (gpio@8800, DT gpio numbers are 1-based: PGPIO's PMIC_GPIO_PHYSICAL_OFFSET), so
@@ -103,6 +127,21 @@ constexpr uint8_t kPgType = 0x04, kPgSubtype = 0x05, kPgStatus1 = 0x08, kPgRtSts
                   kPgPull = 0x42, kPgDigIn = 0x43, kPgOutSrc = 0x44, kPgDigOut = 0x45, kPgEn = 0x46;
 constexpr uint8_t kPgTypeGpio = 0x10, kPgOutLevel = 0x80, kPgEnabled = 0x80, kPgPullNone = 5;
 inline bool pgLvMv(uint8_t subtype) { return subtype >= 0x10 && subtype <= 0x15; }
+// Level 2 drives BT_EN to the DT's state: MODE_CTL 1 (digital output), DIG_VIN_CTL 1 (VIN1), DIG_PULL_CTL 5 (no bias),
+// DIG_OUT_SOURCE_CTL bit 7 = the level with function 0 (normal), EN_CTL 0x80; written in PGPIO's order (VIN, PULL, MODE, OUT_SOURCE,
+// EN), each read back, and only these five registers of this one peripheral (DIG_IN_CTL, DIG_OUT_CTL and the analog pass-through
+// are kept as they read: the DT names no strength). When the four configuration registers already read as the DT's state (the
+// stock "bt_uwb_en" state level 1 expects), only DIG_OUT_SOURCE_CTL is written.
+constexpr uint8_t kPgModeOutput = 1, kPgVin1 = 1;
+// The SPMI arbiter v7's owner channels (DT spmi@c400000 chnls 0xc500000): 0x1000 per APID, command +0x00 (opcode 0 = extended
+// write, register << 4, bytes - 1), status +0x08 (bit 0 done, bits 1..3 failure, denied, dropped), write data +0x10. The arbiter
+// takes a write only from the APID's owner EE (the cnfg table, SpmiObserver.h), so level 2 maps the channel only for an APID that
+// level 1 found owned by EE 0; PianoTorch's TorchCore.h and PianoDwc3's restart-reason write are the same channel.
+constexpr uint64_t kSpmiChnls = 0x0c500000;
+constexpr uint32_t kChnlStride = 0x1000, kChnlCmd = 0x00, kChnlStatus = 0x08, kChnlWdata0 = 0x10, kChnlBytes = 0x20;
+constexpr uint32_t kOpExtWrite = 0;
+// BT_EN low before it rises when it was found high (an earlier start stopped first; PianoWifi holds WLAN_EN low 150 ms for the same).
+constexpr unsigned kBtEnLowMs = 100;
 
 // ---- apps SMMU (iommu@15000000, ARM SMMUv2 / MMU-500): read only here ----
 constexpr uint64_t kSmmu = 0x15000000, kSmmuBytes = 0x100000;
@@ -124,5 +163,20 @@ constexpr const char *const kFirmwarePartitions[] = {"bluetooth_a", "bluetooth_b
 constexpr const char *const kFirmwareDirs[] = {"image"};
 constexpr uint32_t kStockRampatchBytes = 232436, kStockNvmBytes = 13399;
 constexpr uint8_t kStockRom = 0x20;
+// The largest file level 4 holds in memory at once (the rampatch is read whole once, then sent from memory).
+constexpr uint32_t kFirmwareMaxBytes = 512 * 1024, kNvmMaxBytes = 16 * 1024;
+
+// ---- the unit's Bluetooth address (private: never in this repository, never logged) ----
+// The locally built ADT carries it when the builder was given one (tooling/adt/make-piano-adt.py --bt-address-file, by default
+// private/bluetooth-address when that file exists): /arm-io/piano-bt, property bt-address, six bytes in the order it is written
+// (most significant first). No driver matches that node; level 4 reads the property at run time, writes it with the vendor
+// command and checks it by Read BD_ADDR. Without it the controller keeps its NVM's default address (reported as such).
+constexpr const char *kAddressNode = "/arm-io/piano-bt";
+constexpr const char *kAddressProperty = "bt-address";
+
+// ---- RPMh for the rails (PianoWcnRails.h): the AOP command database and apps DRV-2, as PianoWifi's WifiHw.h has them ----
+constexpr uint64_t kCmdDb = 0x81c60000, kCmdDbBytes = 0x20000;
+constexpr uint64_t kRscDrv2 = 0x16520000, kRscDrv2Bytes = 0x10000;
+constexpr uint32_t kRscTcsBlock = 0xd00;
 
 }  // namespace pianobt

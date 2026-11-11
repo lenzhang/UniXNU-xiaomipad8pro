@@ -11,6 +11,7 @@
 #include "GeniUart.h"
 #include "HciH4.h"
 #include "QcaCodec.h"
+#include "QcaSim.h"
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -19,6 +20,7 @@
 #include <vector>
 
 using namespace pianobt;
+using namespace pianobt::sim;
 static int failures;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
 
@@ -273,29 +275,6 @@ static void testH4()
 }
 
 // ------------------------------------------------------------------------------------------------------------ QCA codec
-static std::vector<uint8_t> makeNvm(bool envelope, uint8_t hci0, uint8_t sleep0)
-{
-  std::vector<uint8_t> tags;
-  auto tag = [&](uint16_t id, std::vector<uint8_t> data) {
-    const uint16_t len = uint16_t(data.size());
-    tags.insert(tags.end(), {uint8_t(id), uint8_t(id >> 8), uint8_t(len), uint8_t(len >> 8), 0, 0, 0, 0, 0, 0, 0, 0});
-    tags.insert(tags.end(), data.begin(), data.end());
-  };
-  tag(1, {9, 9});
-  tag(kTagBdAddr, {0x11, 0x22, 0x33, 0x44, 0x55, 0x66});
-  tag(kTagHci, {hci0, 0x00, 0x00, 0x00});
-  tag(kTagDeepSleep, {sleep0});
-  std::vector<uint8_t> f;
-  const uint32_t tl = uint32_t(tags.size()) << 8 | 2;
-  if (envelope) {
-    const uint32_t outer = uint32_t(tags.size() + 4) << 8 | 4;
-    f.insert(f.end(), {uint8_t(outer), uint8_t(outer >> 8), uint8_t(outer >> 16), uint8_t(outer >> 24)});
-  }
-  f.insert(f.end(), {uint8_t(tl), uint8_t(tl >> 8), uint8_t(tl >> 16), uint8_t(tl >> 24)});
-  f.insert(f.end(), tags.begin(), tags.end());
-  return f;
-}
-
 static void testCodec()
 {
   CHECK(baudCode(115200) == 0 && baudCode(3200000) == 0x11 && baudCode(3500000) == 0x12 && baudCode(12345) == -1);
@@ -382,122 +361,7 @@ static void testCodec()
 }
 
 // ----------------------------------------------------------------------------------------------- the simulated controller
-struct Sim {
-  // The line.
-  uint32_t hostBaud = 115200, chipBaud = 115200;
-  bool flow = true;
-  std::vector<std::string> log;   // what the host did, in order
-  // Events queued at the speed the controller sent them; delivered only when the host listens at that speed.
-  std::deque<std::pair<uint32_t, std::vector<uint8_t>>> events;
-  // Files.
-  std::map<std::string, std::vector<uint8_t>> files;
-  // State.
-  enum { kPatch, kNvm } phase = kPatch;
-  std::vector<uint8_t> received[2];
-  unsigned segments[2] = {0, 0};
-  uint32_t expect[2] = {0, 0};
-  uint8_t address[6] = {};   // least significant first
-  unsigned periFrames = 0, wakeInds = 0, sleeps = 0, flowOffBaud = 0;
-  // Faults.
-  bool deafAfterBaud = false, hwErrorInPatch = false, resetFails = false, badVersion = false, noBoardId = false;
-
-  void reply(uint16_t opcode, std::vector<uint8_t> ret)
-  {
-    std::vector<uint8_t> e = {kEvCommandComplete, uint8_t(3 + ret.size()), 0x01, uint8_t(opcode), uint8_t(opcode >> 8)};
-    e.insert(e.end(), ret.begin(), ret.end());
-    events.push_back({chipBaud, e});
-  }
-  void vendorEvent() { events.push_back({chipBaud, {kEvVendor, 2, 0x04, 0x00}}); }
-
-  int send(const uint8_t *b, size_t n)
-  {
-    if (hostBaud != chipBaud) return 0;   // the controller sees garbage
-    if (n == 1 && b[0] == kIbsWakeInd) {
-      ++wakeInds;
-      return 0;
-    }
-    if (n == kPeriFrameBytes && b[0] == 0x31) {
-      ++periFrames;
-      log.push_back("peri");
-      return 0;
-    }
-    if (n < 4 || b[0] != kH4Command || n != size_t(4) + b[3]) return -1;
-    const uint16_t op = le16(b + 1);
-    const uint8_t *p = b + 4;
-    char line[32];
-    std::snprintf(line, sizeof line, "cmd %04x", op);
-    if (op != kOpEdl || p[0] != kEdlTlvSegment) log.push_back(line);
-    switch (op) {
-    case kOpEdl:
-      switch (p[0]) {
-      case kEdlVersion:
-        if (badVersion) reply(op, {0x00, 0x19, 0x00});
-        else reply(op, {0x00, 0x19, 0x55, 0x13, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00, 0x02, 0x21, 0x40});
-        break;
-      case kEdlTlvSegment: {
-        const unsigned len = p[1];
-        std::vector<uint8_t> &r = received[phase];
-        r.insert(r.end(), p + 2, p + 2 + len);
-        ++segments[phase];
-        if (phase == kPatch && hwErrorInPatch && segments[phase] == 10) {
-          events.push_back({chipBaud, {kEvHardwareError, 1, 0x0b}});
-          break;
-        }
-        const bool last = r.size() >= expect[phase] || len < kSegmentMax;
-        if (phase == kNvm || last) {
-          if (last && phase == kPatch) vendorEvent();
-          reply(op, {0x00, 0x1e});
-        }
-        break;
-      }
-      case kEdlBoardId:
-        phase = kNvm;
-        if (!noBoardId) reply(op, {0x00, 0x23, 0x02, 0x00, 0x2e});
-        else reply(op, {0x01});
-        break;
-      case kEdlBuildInfo: reply(op, {0x00, 0x20, 0x05, 'B', 'T', 'F', 'W', '1'}); break;
-      }
-      break;
-    case kOpSetBaud: {
-      static const uint32_t bauds[] = {115200, 57600, 38400, 19200, 9600, 230400, 250000, 460800, 500000, 720000,
-                                       921600, 1000000, 1250000, 2000000, 3000000, 4000000, 1600000, 3200000};
-      if (flow) return -1;   // the host must have turned flow control off first
-      if (!deafAfterBaud) chipBaud = bauds[p[0]];
-      else chipBaud = 1;
-      flowOffBaud = chipBaud;
-      reply(op, {0x00});     // sent at the new speed: the host may or may not hear it
-      break;
-    }
-    case kOpLogging: reply(op, {0x00}); break;
-    case kOpReset: reply(op, {uint8_t(resetFails ? 0x03 : 0x00)}); break;
-    case kOpReadLocalVersion: reply(op, {0x00, 0x0d, 0x00, 0x00, 0x0d, 0x1d, 0x00, 0x07, 0x00}); break;
-    case kOpReadBdAddr: {
-      std::vector<uint8_t> r = {0x00};
-      r.insert(r.end(), address, address + 6);
-      reply(op, r);
-      break;
-    }
-    case kOpWriteBdAddr:
-      for (unsigned i = 0; i < 6; ++i) address[i] = p[5 - i];
-      reply(op, {0x00});
-      break;
-    }
-    return 0;
-  }
-  int event(uint8_t *ev, size_t cap)
-  {
-    while (!events.empty()) {
-      auto e = events.front();
-      events.pop_front();
-      if (e.first != hostBaud) continue;   // sent at another speed: lost
-      if (e.second.size() > cap) return -1;
-      std::memcpy(ev, e.second.data(), e.second.size());
-      return int(e.second.size());
-    }
-    return 0;   // the timeout
-  }
-};
-
+// tests/QcaSim.h (shared with bt_bringup_host.cpp), driven here a frame at a time.
 static SetupIo simIo(Sim &s)
 {
   SetupIo io;
@@ -533,21 +397,6 @@ static SetupIo simIo(Sim &s)
   return io;
 }
 
-static void stock(Sim &s)
-{
-  std::vector<uint8_t> patch(kStockRampatchBytes);
-  for (size_t i = 0; i < patch.size(); ++i) patch[i] = uint8_t(i * 7 + 3);
-  const uint8_t elf[7] = {0x7f, 'E', 'L', 'F', 1, 1, 1};
-  std::memcpy(patch.data(), elf, sizeof elf);
-  s.files["gngbtfw20.mbn"] = patch;
-  s.files["gngbtnv20.b2e"] = makeNvm(true, 0x83, 0x00);
-  s.files["gngbtnv20.bin"] = makeNvm(false, 0x03, 0x00);
-  s.expect[Sim::kPatch] = kStockRampatchBytes;
-  s.expect[Sim::kNvm] = uint32_t(s.files["gngbtnv20.b2e"].size());
-  const uint8_t def[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};   // the NVM's default, least significant first
-  std::memcpy(s.address, def, 6);
-}
-
 static void testSetup()
 {
   static uint8_t nvm[16384];
@@ -559,7 +408,7 @@ static void testSetup()
     o.address = mine;
     SetupResult r;
     const int e = qcaSetup(simIo(s), o, r, nvm, sizeof nvm);
-    CHECK(e == kSetupOk && r.error == kSetupOk && r.step == kStepAddress);
+    CHECK(e == kSetupOk && r.error == kSetupOk && r.step == kStepLocalVersion);
     CHECK(r.version.romCode == 0x20 && r.versionAtSpeed.soc == 0x40210200 && r.baud == 3200000);
     CHECK(!strcmp(r.rampatch, "gngbtfw20.mbn") && !strcmp(r.nvm, "gngbtnv20.b2e") && r.boardId == 0x2e && !r.nvmFallback);
     CHECK(s.segments[Sim::kPatch] == 957 && s.received[Sim::kPatch] == s.files["gngbtfw20.mbn"]);
@@ -570,11 +419,12 @@ static void testSetup()
     CHECK(sent.size() == s.files["gngbtnv20.b2e"].size());
     CHECK(r.nvmInfo.ok && r.nvmInfo.hciBefore == 0x83 && r.nvmInfo.hciAfter == 0x03 && r.nvmInfo.baudAfter == 0x11);
     CHECK(!strcmp(r.build, "BTFW1") && r.local.manufacturer == kManufacturerQualcomm);
-    CHECK(r.addressRead && r.addressIsNvmDefault && r.addressSet);
+    CHECK(r.addressRead && r.addressIsNvmDefault && r.addressSet && r.addressKept && !r.addressRewritten);
+    CHECK(r.reset0 == kSetupOk && r.reset0Status == 0 && s.resets == 3);
     CHECK(s.address[0] == 0xef && s.address[5] == 0x02);
     CHECK(s.periFrames == 1 && s.wakeInds == 1);
     // The order around the speed change: peri frame, flow off, the baud command, the host's speed, flow on.
-    std::vector<std::string> want = {"cmd fc00", "peri", "flow off", "cmd fc48", "host baud", "flow on", "cmd fc00"};
+    std::vector<std::string> want = {"cmd 0c03", "cmd fc00", "peri", "flow off", "cmd fc48", "host baud", "flow on", "cmd fc00"};
     CHECK(s.log.size() > want.size() && std::vector<std::string>(s.log.begin(), s.log.begin() + long(want.size())) == want);
   }
   {
@@ -656,6 +506,65 @@ static void testSetup()
     SetupResult r;
     CHECK(qcaSetup(none, SetupOptions(), r, nvm, sizeof nvm) == kSetupArgument);
   }
+  {
+    Sim s;   // the ROM does not answer HCI_Reset before its patch: noted, the set-up goes on
+    stock(s);
+    s.romIgnoresReset = true;
+    SetupResult r;
+    CHECK(qcaSetup(simIo(s), SetupOptions(), r, nvm, sizeof nvm) == kSetupOk && r.reset0 == kSetupTimeout && r.reset0Status == 0xff);
+    CHECK(s.resets == 3 && r.step == kStepLocalVersion);
+  }
+  {
+    Sim s;   // without the first reset: the version is the first command
+    stock(s);
+    SetupOptions o;
+    o.resetFirst = false;
+    SetupResult r;
+    CHECK(qcaSetup(simIo(s), o, r, nvm, sizeof nvm) == kSetupOk && s.log[0] == "cmd fc00" && s.resets == 2);
+  }
+  {
+    Sim s;   // the second reset brings the NVM's default address back: written again once, then it holds
+    stock(s);
+    s.forgetsAddress = true;
+    const uint8_t mine[6] = {0x02, 0x00, 0x00, 0x12, 0x34, 0x56};   // made up, display order
+    SetupOptions o;
+    o.address = mine;
+    SetupResult r;
+    CHECK(qcaSetup(simIo(s), o, r, nvm, sizeof nvm) == kSetupOk && r.addressSet && !r.addressKept && r.addressRewritten);
+    CHECK(s.address[0] == 0x56 && s.address[5] == 0x02);
+  }
+  {
+    Sim s;   // stop after the first reset, and after the address
+    stock(s);
+    SetupOptions o;
+    o.stopAfter = kStepReset0;
+    SetupResult r;
+    CHECK(qcaSetup(simIo(s), o, r, nvm, sizeof nvm) == kSetupStopped && s.log.size() == 1);
+    Sim t;
+    stock(t);
+    o.stopAfter = kStepAddress;
+    CHECK(qcaSetup(simIo(t), o, r, nvm, sizeof nvm) == kSetupStopped && t.resets == 2);
+  }
+}
+
+// The SE6 RCG's table: every entry gives its rate through rcgRate, and planRcg's registers say the same.
+static void testRcgTable()
+{
+  for (unsigned i = 0; i < kS6RateCount; ++i) {
+    const RcgEntry &e = kS6Table[i];
+    CHECK(e.hz == kS6Rates[i]);
+    const RcgPlan p = planRcg(e.hz, 0xfff00000u, 0xabcd0000u, 0x12340000u, 0);
+    CHECK(p.ok && p.index == i && (p.cfg & 0xfff00000u) == 0xffe00000u);   // bit 20 (hardware control) cleared, the rest kept
+    CHECK(rcgRate(p.cfg, p.m, p.n) == e.hz);
+    if (p.mnd) CHECK((p.m >> 16) == 0xabcd && (p.n >> 16) == 0x1234);
+  }
+  const RcgPlan a = planRcg(7372800, 0, 0, 0, 0);
+  CHECK(a.mnd && a.m == 384 && a.n == (~(15625u - 384u) & 0xffffu) && a.d == (~15625u & 0xffffu) && a.cfg == ((6u << 8) | 1u | (2u << 12)));
+  const RcgPlan b = planRcg(51200000, 0, 0, 0, 0);
+  CHECK(b.mnd && b.m == 64 && b.d == (~375u & 0xffffu));
+  const RcgPlan c = planRcg(100000000, 0x3000, 0, 0, 0);
+  CHECK(c.ok && !c.mnd && c.cfg == ((1u << 8) | 11u) && c.m == 0);
+  CHECK(!planRcg(12345, 0, 0, 0, 0).ok);
 }
 
 int main()
@@ -668,6 +577,7 @@ int main()
   testH4();
   testCodec();
   testSetup();
+  testRcgTable();
   if (failures) {
     std::printf("bt_host: %d failure(s)\n", failures);
     return 1;

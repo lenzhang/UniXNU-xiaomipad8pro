@@ -323,12 +323,16 @@ inline NvmInfo patchNvm(uint8_t *f, size_t n, uint8_t baud, int ibs, int deepSle
 }
 
 // ------------------------------------------------------------------------------------------------------ the set-up sequence
-// The order of btqca's qca_uart_setup with hci_qca's WCN7860 steps around it: version at 115200; the peripheral baud frame; flow
-// control off (RFR deasserted), the vendor baud command, the line drained, 10 ms, the host to the new speed, flow control on; the
-// rampatch; 10 ms; the board id; the NVM (patched); SoC logging off; HCI_Reset; the build information; then (ours) the local
-// version, the address check and the address. Two deliberate differences from Linux: the version is read again at the new speed
-// before the download (Linux does not check that the speed change took), and a board id read that fails ends the set-up only when
-// the default NVM is missing too (Linux ignores that error entirely and falls back to .bin, as this does).
+// The order of btqca's qca_uart_setup with hci_qca's WCN7860 steps around it, then what the host's own initialisation does after
+// a driver's set-up (the HCI core: the public address when one is configured, HCI_Reset, Read Local Version): an HCI_Reset at
+// 115200 first (ours: whether the ROM answers at all; no answer is noted, not fatal); the version at 115200; the peripheral baud
+// frame; flow control off (RFR deasserted), the vendor baud command, the line drained, 10 ms, the host to the new speed, flow
+// control on; the rampatch; 10 ms; the board id; the NVM (patched); SoC logging off; HCI_Reset; the build information; the address
+// (Read BD_ADDR against the NVM's default, then the unit's own when one was given, read back); HCI_Reset again; Read Local Version
+// and the address once more (it must survive the reset; written again once if it did not). Deliberate differences from Linux: the
+// first reset; the version read again at the new speed before the download (Linux does not check that the speed change took); a
+// board id read that fails ends the set-up only when the default NVM is missing too (Linux ignores that error entirely and falls
+// back to .bin, as this does).
 struct SetupIo {
   void *ctx = nullptr;
   int (*send)(void *ctx, const uint8_t *bytes, size_t n) = nullptr;            // into the engine, whole; 0 or negative
@@ -344,6 +348,7 @@ struct SetupIo {
 struct SetupOptions {
   uint32_t operBaud = 3200000;          // 0 or 115200: stay at the initial speed
   bool peri = true;                     // the WCN7860 peripheral baud frame
+  bool resetFirst = true;               // HCI_Reset at 115200 before the version (no answer is not fatal)
   bool verifyBaud = true;               // read the version again at the new speed
   int ibs = 0, deepSleep = 0;           // NVM bits: 1 set (Linux), 0 clear (the first bring-up: no in-band sleep to serve), -1 keep
   const uint8_t *address = nullptr;     // the unit's public address, display order, from a private source; never logged
@@ -351,8 +356,9 @@ struct SetupOptions {
   int stopAfter = 0;                    // return after this step (debugging)
 };
 enum SetupStep : int {
-  kStepVersion = 401, kStepPeriBaud = 402, kStepBaud = 403, kStepRampatch = 404, kStepBoardId = 405, kStepNvm = 406,
-  kStepLogging = 407, kStepReset = 408, kStepBuildInfo = 409, kStepLocalVersion = 410, kStepAddress = 411,
+  kStepReset0 = 400, kStepVersion = 401, kStepPeriBaud = 402, kStepBaud = 403, kStepRampatch = 404, kStepBoardId = 405,
+  kStepNvm = 406, kStepLogging = 407, kStepReset = 408, kStepBuildInfo = 409, kStepAddress = 410, kStepReset2 = 411,
+  kStepLocalVersion = 412,
 };
 enum SetupError : int {
   kSetupOk = 0, kSetupStopped = -1, kSetupArgument = -2, kSetupTransport = -3, kSetupTimeout = -4, kSetupBadReply = -5,
@@ -386,7 +392,9 @@ struct SetupResult {
   unsigned acks = 0, unmatched = 0;
   NvmInfo nvmInfo;
   LocalVersion local;
-  bool addressRead = false, addressIsNvmDefault = false, addressSet = false;
+  bool addressRead = false, addressIsNvmDefault = false, addressSet = false, addressKept = false, addressRewritten = false;
+  int reset0 = 0;                     // the first HCI_Reset: 0 answered (status in reset0Status), else the SetupError it met
+  uint8_t reset0Status = 0xff;
   uint16_t lastOpcode = 0;
   uint8_t lastStatus = 0, hardwareError = 0;
 };
@@ -476,6 +484,15 @@ inline int qcaSetup(const SetupIo &io, const SetupOptions &o, SetupResult &r, ui
   detail::Setup s{io, o, r, {}, {}};
   CommandComplete cc;
   int e;
+
+  if (o.resetFirst) {
+    s.announce(kStepReset0, "HCI_Reset at 115200 (does the ROM answer?)");
+    e = s.command(cmdPlain(s.frame, sizeof s.frame, kOpReset), kOpReset, cc, o.commandMs);
+    if (e == kSetupTransport || e == kSetupArgument) return s.fail(kStepReset0, e);
+    r.reset0 = e;
+    if (!e) r.reset0Status = cc.retLen ? cc.ret[0] : 0xff;
+    if (s.stopHere(kStepReset0)) return r.error = kSetupStopped;
+  }
 
   s.announce(kStepVersion, "the controller's version at 115200");
   e = s.command(cmdEdl(s.frame, sizeof s.frame, kEdlVersion), kOpEdl, cc, o.commandMs);
@@ -573,33 +590,70 @@ inline int qcaSetup(const SetupIo &io, const SetupOptions &o, SetupResult &r, ui
   if (e) return s.fail(kStepBuildInfo, e);
   if (!parseBuildInfo(cc, r.build, sizeof r.build)) return s.fail(kStepBuildInfo, kSetupBadReply);
 
-  s.announce(kStepLocalVersion, "Read Local Version Information");
-  e = s.command(cmdPlain(s.frame, sizeof s.frame, kOpReadLocalVersion), kOpReadLocalVersion, cc, o.commandMs);
-  if (e) return s.fail(kStepLocalVersion, e);
-  if (!parseLocalVersion(cc, r.local)) return s.fail(kStepLocalVersion, kSetupBadReply);
-
   s.announce(kStepAddress, "the address: the NVM's default or not, and the unit's own when one was given (never logged)");
-  e = s.command(cmdPlain(s.frame, sizeof s.frame, kOpReadBdAddr), kOpReadBdAddr, cc, o.commandMs);
+  auto readAddress = [&](uint8_t out[6]) {
+    int rc = s.command(cmdPlain(s.frame, sizeof s.frame, kOpReadBdAddr), kOpReadBdAddr, cc, o.commandMs);
+    if (rc) return rc;
+    if (cc.retLen != 7 || cc.ret[0]) return int(kSetupBadReply);
+    for (unsigned i = 0; i < 6; ++i) out[i] = cc.ret[1 + i];   // least significant first, as the controller sends it
+    return int(kSetupOk);
+  };
+  auto isOurs = [&](const uint8_t a[6]) {
+    bool same = true;
+    for (unsigned i = 0; i < 6; ++i) same = same && a[i] == o.address[5 - i];
+    return same;
+  };
+  auto writeAddress = [&]() {
+    int rc = s.command(cmdWriteBdAddr(s.frame, sizeof s.frame, o.address), kOpWriteBdAddr, cc, o.commandMs);
+    if (rc) return rc;
+    if (cc.retLen && cc.ret[0]) {
+      r.lastStatus = cc.ret[0];
+      return int(kSetupStatus);
+    }
+    uint8_t now[6];
+    rc = readAddress(now);
+    if (rc) return rc;
+    return isOurs(now) ? int(kSetupOk) : int(kSetupBadReply);
+  };
+  uint8_t found[6];
+  e = readAddress(found);
   if (e) return s.fail(kStepAddress, e);
-  if (cc.retLen != 7 || cc.ret[0]) return s.fail(kStepAddress, kSetupBadReply);
   r.addressRead = true;
   if (r.nvmInfo.address) {
     bool same = true;
-    for (unsigned i = 0; i < 6; ++i) same = same && cc.ret[1 + i] == nvmBuffer[r.nvmInfo.addressAt + i];
+    for (unsigned i = 0; i < 6; ++i) same = same && found[i] == nvmBuffer[r.nvmInfo.addressAt + i];
     r.addressIsNvmDefault = same;
   }
   if (o.address) {
-    e = s.command(cmdWriteBdAddr(s.frame, sizeof s.frame, o.address), kOpWriteBdAddr, cc, o.commandMs);
+    e = writeAddress();
     if (e) return s.fail(kStepAddress, e);
-    e = s.command(cmdPlain(s.frame, sizeof s.frame, kOpReadBdAddr), kOpReadBdAddr, cc, o.commandMs);
-    if (e) return s.fail(kStepAddress, e);
-    if (cc.retLen != 7 || cc.ret[0]) return s.fail(kStepAddress, kSetupBadReply);
-    bool same = true;
-    for (unsigned i = 0; i < 6; ++i) same = same && cc.ret[1 + i] == o.address[5 - i];   // the reply is least significant first
-    r.addressSet = same;
-    if (!same) return s.fail(kStepAddress, kSetupBadReply);
+    r.addressSet = true;
   }
-  r.step = kStepAddress;
+  if (s.stopHere(kStepAddress)) return r.error = kSetupStopped;
+
+  s.announce(kStepReset2, "HCI_Reset again (the host's initialisation)");
+  e = s.command(cmdPlain(s.frame, sizeof s.frame, kOpReset), kOpReset, cc, o.commandMs);
+  if (e) return s.fail(kStepReset2, e);
+  if (!cc.retLen || cc.ret[0]) {
+    r.lastStatus = cc.retLen ? cc.ret[0] : 0xff;
+    return s.fail(kStepReset2, kSetupStatus);
+  }
+
+  s.announce(kStepLocalVersion, "Read Local Version Information; the address after the reset");
+  e = s.command(cmdPlain(s.frame, sizeof s.frame, kOpReadLocalVersion), kOpReadLocalVersion, cc, o.commandMs);
+  if (e) return s.fail(kStepLocalVersion, e);
+  if (!parseLocalVersion(cc, r.local)) return s.fail(kStepLocalVersion, kSetupBadReply);
+  if (o.address) {
+    e = readAddress(found);
+    if (e) return s.fail(kStepLocalVersion, e);
+    r.addressKept = isOurs(found);
+    if (!r.addressKept) {   // the reset dropped it: once more, then it must hold
+      r.addressRewritten = true;
+      e = writeAddress();
+      if (e) return s.fail(kStepLocalVersion, e);
+    }
+  }
+  r.step = kStepLocalVersion;
   r.error = kSetupOk;
   return kSetupOk;
 }

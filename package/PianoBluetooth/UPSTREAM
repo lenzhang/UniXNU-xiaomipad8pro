@@ -1,6 +1,6 @@
-PianoBluetooth is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1 (a read-only survey) as a kext; the GENI UART
-plans, the H4 framing and the QCA vendor codec with the controller set-up sequence as host-tested portable headers. What it takes from
-other work, and from where:
+PianoBluetooth is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Levels 1 (a read-only survey), 2 (power), 3 (the UART)
+and 4 (the controller set-up) as a kext over host-tested portable headers; the shared rails helper package/include/PianoWcnRails.h
+is new code too. What it takes from other work, and from where:
 
 UniXNU-piano (this repository), BSD-2-Clause-Patent:
   package/PianoUsbHost/PianoUsbHost.cpp (sha256 344da37e70682f579b6c0915ab5ac2e38183b17334b1ed0d883c7d5d6c453415): the kext's shape
@@ -14,6 +14,27 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
     piano-bt-hwcg. PianoWifi itself is not modified and not linked against.
   package/PianoPower/SpmiObserver.h (sha256 4805d4fb7af91c210d75b9791e125f3789b7671e895afe6f80af27a36a849b07): included, not
     copied (-I package/PianoPower): the arbiter, the APID of a PPID with its owner, the observer read.
+  package/PianoPower/FatVolume.c and FatVolume.h (sha256 6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779,
+    a438bcc5519bacfbfa6b6c55646fe4a3f7787f37a50c52103d8094c6871b67e7): compiled into this kext, not copied (level 4's FAT reader).
+  package/PianoKeyboard/CmdDb.h (sha256 794cf39c76e2c903d79cc1146ae25d946946862daa9b8848d616e9ad8107c716): included, not copied
+    (-I package/PianoKeyboard): the cmd-db lookup and the RSC register layout.
+  package/PianoWifi/PianoWifi.cpp at main 2026-11-11 (sha256 6ac47f0a6855ce7d69651446c74a194d88dfe6d2cfe6535c12b4af6ec0dad600) and
+    package/PianoKeyboard/PianoKeyboard.cpp (sha256 f8af7f4e7b70b4f5b12871a8306a2bad562ab26090858a1c0fc92473a96c0293): the VRM
+    transaction on apps DRV-2 (vrmLocked / voteLocked: an idle ACTIVE TCS, its commands, the trigger, 100 ms of 1 ms polls, the TCS
+    reclaimed or left), the lock-word acquire/release with 10 us steps, the hardware-window write log (one line per kind, then
+    counted), re-expressed in BtRpmh.h and PianoBluetooth.cpp. PianoWifi itself is not modified and not linked against.
+  package/PianoWifi/WifiHw.h and WifiBringup.h at main 2026-11-11 (sha256 c38af5f43665b5d2da1a3b6fd580f6682796595f227c082a1c0ab5b8e21be6ee,
+    4f7cca6f37bd9b312959af4fe86bb66a26901422e59ef0b583c1ddd54c63d1b7): the six PMU rails and two PHY LDOs (names, cmd-db names,
+    SIDs, pages, DT voltage ranges, order) and level 2's rail rules (only add; keep a higher voltage within range; none above it;
+    refuse an unreadable rail unless blind; read back, none lower or disabled; the PHY LDOs never voted), taken as facts and rules
+    into package/include/PianoWcnRails.h; pinConfig re-expressed in BtBringup.h.
+  package/PianoWifi/WifiFirmware.c at main 2026-11-11 (sha256 5adf1711cb8b842c51972214c047edae8b77d0320357cf3294f0609d5746d963):
+    the partition reader over NativeUfs (4096-byte blocks, one cached) re-written as BtFirmware.c for bluetooth_a/_b, image/.
+  package/PianoTorch/TorchCore.h (sha256 e6d8d470aad8f5e530946d77e7a905d58b0f214864044ebf5c53ccc1e44c0855): the SPMI arbiter v7
+    owner-channel write (data, then the command, then the status), re-expressed in PianoBluetooth.cpp for BT_EN's five registers.
+  package/include/PianoScmLock.h (this repository): the lock-word protocol's shape (compare-exchange of a tag, nested holds of one
+    kext counted under its hold mutex, bounded waits with reports, the kernel glue macro), followed by PianoWcnRails.h's PMU lock
+    (without the take-over).
 
 UniXNU-sheng (unixnu-research/UniXNU-sheng, BSD-2-Clause-Patent; SM8550 + WCN7850, Bluetooth hardware-verified on iPadOS 27 there),
 facts and design only, no code:
@@ -24,7 +45,8 @@ facts and design only, no code:
     releases; Bluetooth-only start-up without the PCIe NoC vote); pairing keys need the keychain.
   reports/ipados27-bluetooth-startup.md: GENI UART protocol 2 (revision 0x204) and QUP 0x30090000 read on SM8550.
   package/WcnPower.h (sha256 2ae8cda83623ca7370f6bfcbe3f86eb48bc5be5d3433cabfe313a36021850039): the shape of the shared power
-    helper specified for PianoWifi in docs/drivers/bluetooth.md section 6 (one ownership vote per radio, idempotent until put).
+    helper of docs/drivers/bluetooth.md section 7.1, package/include/PianoWcnRails.h (one ownership vote per radio, idempotent until
+    put, the last owner releases).
   package/BluetoothProbe.cpp (sha256 2ae33391a94eadcb1f84dc13d1d4f33369cf91509d029aa0367ff45cbada8386): read for the bring-up
     order (clocks, pins, BT_EN, the 32 KiB DMA window through a bypass bank, the RX wake); its SM8550 pins and TLMM BT_EN are not
     piano's.
@@ -48,7 +70,9 @@ xiaomipad-8pro-mainline firmware/piano-bluetooth-rom20.json (sha256
 image/), names and sizes. The firmware itself (LicenseRef-Proprietary-Firmware) is never in this repository.
 
 Specifications only (no code, comment or table copied; GPL-2.0): the Ubuntu piano kernel (unixnu-research/ubuntu-ref/kernel, branch
-piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01): drivers/bluetooth/hci_qca.c (sha256
+piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01): net/bluetooth/hci_sync.c (sha256
+d3b734c646a9e63dcfbe960e4e1e41d3fcaef14fc240c19086f1edbd783f0302: the host's initialisation after a driver's set-up: the public
+address, HCI_Reset, Read Local Version); drivers/bluetooth/hci_qca.c (sha256
 23f3f66a5b8358196e77cfa2f2c95ffe9665ed92e2ef781043675b3f8007f487), btqca.c (sha256
 9b756a89d436d6dd9c85268bb58360cd4adda348baf5e04f8a4e26754e9a5242), btqca.h (sha256
 0d795bcd1106b2c69a75e94813f1adca15078b433d90e041e34aabb0d2179187); drivers/tty/serial/qcom_geni_serial.c (sha256

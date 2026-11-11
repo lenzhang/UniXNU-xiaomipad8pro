@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // The GENI serial engine as a UART (QUP2 SE6 on piano), portable: the register facts, decoders, PianoBluetooth's level 1 survey
-// (loads only, behind its gates), and the plans of the later levels (the serial clock for a baud rate, the UART set-up writes,
-// FIFO word packing) as pure functions that the host tests check and that level 1 never applies. Written for UniXNU-piano from the
+// (loads only, behind its gates), and the plans of the later levels (the serial clock for a baud rate, the UART set-up writes, the
+// SE6 RCG entry, FIFO word packing) as pure functions that the host tests check, level 1 never applies and BtBringup.h applies from
+// level 3 (this file itself has no store: tooling/k27/build-native-piano-bluetooth.sh checks it). Written for UniXNU-piano from the
 // behaviour of the Ubuntu piano kernel's qcom_geni_serial.c, qcom-geni-se.c and geni-se.h (GPL-2.0, read as the specification
 // only: register offsets, bit positions and the order of operations are facts; nothing is copied).
 //
@@ -49,6 +50,8 @@ constexpr uint32_t kIosRx = 1u << 0, kIosCts = 1u << 1;                        /
 constexpr uint32_t kOpcodeShift = 27, kUartStartTx = 1, kUartStartRead = 1;    // M/S_CMD0: opcode 31:27, parameters 26:0
 constexpr uint32_t kMCmdDone = 1u << 0, kMTxFifoWatermark = 1u << 30;          // M_IRQ_STATUS
 constexpr uint32_t kSRxFifoWatermark = 1u << 26, kSRxFifoLast = 1u << 27;      // S_IRQ_STATUS
+constexpr uint32_t kCmdAbort = 1u << 1, kCmdCancel = 1u << 2;                  // M/S_CMD_CTRL
+constexpr uint32_t kIrqCmdCancel = 1u << 4, kIrqCmdAbort = 1u << 5;            // M/S_IRQ_STATUS: the cancel / abort finished
 constexpr uint32_t kRxLast = 1u << 31, kRxLastValidShift = 28, kRxWordsMask = 0x1ffffff;   // RX_FIFO_STATUS
 constexpr uint32_t kTxWordsMask = 0x0fffffff;                                  // TX_FIFO_STATUS
 // geni-se.h's common interrupt enables (what geni_se_init ORs in), and the CGC / output defaults of geni_se_io_init.
@@ -378,6 +381,36 @@ inline ClockPlan planClock(uint32_t baud, uint32_t qupVersion, const uint32_t *l
   p.baud = uint32_t(p.sourceHz / p.divider / p.sampling);
   p.errorPpm = int32_t((int64_t(p.baud) - int64_t(baud)) * 1000000 / int64_t(baud));
   p.ok = true;
+  return p;
+}
+
+// The SE6 RCG's registers for one entry of its table (DFS off): CFG keeps the bits clk-rcg2 does not own; M, N and D are 16-bit
+// fields (their upper bits kept); `mnd` false: the entry has no M/N and those three are not written. The writes go M, N, D, CFG, then
+// CMD's update bit (level 3, BtBringup.h).
+struct RcgPlan {
+  bool ok = false, mnd = false;
+  unsigned index = 0;
+  uint32_t hz = 0, cfg = 0, m = 0, n = 0, d = 0;
+};
+inline RcgPlan planRcg(uint32_t hz, uint32_t cfgNow, uint32_t mNow, uint32_t nNow, uint32_t dNow)
+{
+  RcgPlan p;
+  for (unsigned i = 0; i < kS6RateCount; ++i) {
+    const RcgEntry &e = kS6Table[i];
+    if (e.hz != hz) continue;
+    p.ok = true;
+    p.index = i;
+    p.hz = hz;
+    p.mnd = e.n != 0;
+    p.cfg = (cfgNow & ~kRcgCfgMask) | uint32_t(e.source) << 8 | e.halfDivider | (p.mnd && e.m != e.n ? 2u << 12 : 0u);
+    if (p.mnd) {
+      const uint32_t twoD = e.n < e.m ? e.m : e.n > 2u * (e.n - e.m) ? 2u * (e.n - e.m) : e.n;   // clamp(N, M, 2 (N - M))
+      p.m = (mNow & ~0xffffu) | e.m;
+      p.n = (nNow & ~0xffffu) | (~uint32_t(e.n - e.m) & 0xffffu);
+      p.d = (dNow & ~0xffffu) | (~twoD & 0xffffu);
+    }
+    return p;
+  }
   return p;
 }
 
