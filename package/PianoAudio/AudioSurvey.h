@@ -6,7 +6,7 @@
 // What is read: the main TLMM's configuration and level words of the fourteen audio pins (always readable: the TLMM is in the
 // always-on domain, PianoPower, PianoDwc3 and PianoWifi read it the same way) and the apps SMMU's stream-match entries for the
 // DSP's PCM streams. What is not: the amplifiers themselves (an I2C read needs the bus's pins and engine set up and the amplifiers
-// out of reset, all writes: level 2), the I2C hub's engine (its clocks' state is not known here), and every LPASS block (macros,
+// out of reset, all writes: level 5), the I2C hub's engine (its clocks' state is not known here), and every LPASS block (macros,
 // SoundWire masters, LPI pins: their clocks are the DSP's PRM resources and nothing the application processor can read says
 // whether they run; a load from an unclocked block can stall the bus).
 #pragma once
@@ -114,16 +114,16 @@ inline Summary summarize(const Survey &s)
   return m;
 }
 
-// What level 2 (the amplifiers' bus probe) has to do first, from the reset lines.
+// What level 5 (the amplifiers' bus probe) has to do first, from the reset lines.
 inline const char *resetVerdict(const Summary &m)
 {
   if (m.held == kAmpCount)
-    return "all four amplifiers are held in shutdown (reset driven low): level 2 must release them (reset high) before a bus probe";
+    return "all four amplifiers are held in shutdown (reset driven low): level 5 must release them (reset high) before a bus probe";
   if (m.released == kAmpCount)
-    return "all four reset lines are released (driven high): a level 2 bus probe can read DEVID without touching the reset lines";
+    return "all four reset lines are released (driven high): a level 5 bus probe can read DEVID without touching the reset lines";
   if (m.undriven == kAmpCount)
-    return "no reset line is driven by the SoC: the board's pull decides (see each line's level); level 2 drives them";
-  return "the reset lines disagree (see the amp lines): level 2 sets each one explicitly before a bus probe";
+    return "no reset line is driven by the SoC: the board's pull decides (see each line's level); level 5 drives them";
+  return "the reset lines disagree (see the amp lines): level 5 sets each one explicitly before a bus probe";
 }
 
 // --------------------------------------------------------------------------------------------------- apps SMMU, read only

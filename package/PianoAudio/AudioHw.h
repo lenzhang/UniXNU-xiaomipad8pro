@@ -52,7 +52,7 @@ constexpr Amp kAmps[] = {
   {"Bottom Left", 0x34, 2, kPinResetFirst + 2, kPinIrqFirst + 2}, {"Bottom Right", 0x36, 3, kPinResetFirst + 3, kPinIrqFirst + 3},
 };
 constexpr unsigned kAmpCount = sizeof kAmps / sizeof kAmps[0];
-// UBU (for level 2, not read at level 1): register 0x03 DEVID reads 0x2900 on all four; register 0x00 STATUS bits 0 BOVDS, 1 PLLS,
+// UBU (for level 5, not read at level 1): register 0x03 DEVID reads 0x2900 on all four; register 0x00 STATUS bits 0 BOVDS, 1 PLLS,
 // 2 OTPDS, 3 OVDS, 4 UVDS, 5 OCDS, 6 CLKS, 8 OTWDS, 9 BOPS, 10 BOLDS, 11 INDS, 14 VDDPS (polarity not documented); 16-bit registers.
 constexpr uint8_t kAmpRegStatus = 0x00, kAmpRegDevId = 0x03;
 constexpr uint16_t kAmpDevId = 0x2900;
