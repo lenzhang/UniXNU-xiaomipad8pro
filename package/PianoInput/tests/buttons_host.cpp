@@ -147,6 +147,83 @@ static void testDebounce()
   }
 }
 
+// The adaptive poll loop (PollPlan + Debounce) over a press of `length` ms starting at `start`: whether it was reported, when
+// (ms after the press began), the samples in total, and the samples in the idle second before it.
+struct PressRun {
+  bool reported = false, released = false;
+  uint64_t reportedAfter = 0;
+  unsigned samples = 0, idleSecondSamples = 0;
+};
+static PressRun runPress(uint32_t idleMs, uint64_t start, uint64_t length, uint8_t key = kKeyVolumeUp)
+{
+  PollPlan plan(idleMs);
+  Debounce d;
+  PressRun r;
+  for (uint64_t t = 0; t < start + length + 3000;) {
+    const uint8_t keys = t >= start && t < start + length ? key : 0;
+    const uint8_t down = d.update(true, keys, t);
+    ++r.samples;
+    if (t >= start - 1000 && t < start) ++r.idleSecondSamples;
+    if ((down & key) && !r.reported) {
+      r.reported = true;
+      r.reportedAfter = t - start;
+    }
+    if (r.reported && !(down & key)) r.released = true;
+    t += plan.next(d, t);
+  }
+  return r;
+}
+
+static void testAdaptivePolling()
+{
+  CHECK(!PollPlan(0).adaptive() && !PollPlan(10).adaptive() && PollPlan(40).adaptive());
+  CHECK(PollPlan(5000).backoff.idleMs == kIdlePollMaxMs);
+  {   // idle 0: the old 10 ms everywhere
+    const PressRun r = runPress(0, 10000, 60);
+    CHECK(r.reported && r.released && r.idleSecondSamples == 100);
+  }
+  // Idle 40 ms: 25 samples in an idle second instead of 100; every press of 82 ms or more is reported, at every phase of the
+  // idle period, and released; at most one idle period plus the debounce late.
+  for (uint64_t phase = 0; phase < 40; ++phase) {
+    for (uint64_t length : {82ull, 100ull, 150ull, 400ull, 2000ull}) {
+      const PressRun r = runPress(kIdlePollMs, 10000 + phase, length);
+      CHECK(r.reported && r.released);
+      CHECK(r.reportedAfter <= kIdlePollMs + kDebounceMs + kPollMs);
+      CHECK(r.idleSecondSamples >= 24 && r.idleSecondSamples <= 26);
+    }
+    const PressRun power = runPress(kIdlePollMs, 20000 + phase, 120, kKeyPower);
+    CHECK(power.reported && power.released);
+  }
+  {   // a 30 ms tap is below the debounce: not reported at 10 ms polling either
+    CHECK(!runPress(0, 10000, 30).reported);
+    CHECK(!runPress(kIdlePollMs, 10003, 30).reported);
+  }
+  {   // after a press: 10 ms polling for kActiveHoldMs after the release (repeated presses stay fast), then idle again
+    PollPlan plan(kIdlePollMs);
+    Debounce d;
+    uint64_t t = 0;
+    for (; t < 3000; t += plan.next(d, t)) d.update(true, 0, t);
+    CHECK(!plan.fast(t));
+    for (; t < 3200; t += plan.next(d, t)) d.update(true, kKeyVolumeDown, t);
+    CHECK(plan.fast(t));
+    const uint64_t released = t;
+    uint64_t lastFast = t;
+    for (; t < 6000; t += plan.next(d, t)) {
+      d.update(true, 0, t);
+      if (plan.fast(t)) lastFast = t;
+    }
+    CHECK(lastFast + 2 * kPollMs >= released + kDebounceMs + kActiveHoldMs && lastFast <= released + kDebounceMs + kActiveHoldMs + 2 * kPollMs);
+    CHECK(!plan.fast(t));
+  }
+  {   // a key held at start (never up yet) keeps the polling fast: it is busy
+    PollPlan plan(kIdlePollMs);
+    Debounce d;
+    unsigned samples = 0;
+    for (uint64_t t = 0; t < 2000; t += plan.next(d, t), ++samples) CHECK(d.update(true, kKeyPower, t) == 0);
+    CHECK(samples >= 199);
+  }
+}
+
 // A HID 1.11 short-item walk of the buttons descriptor: the input bits in order with their (page, usage).
 static void testDescriptor()
 {
@@ -198,6 +275,7 @@ int main()
   testSpmi();
   testDecode();
   testDebounce();
+  testAdaptivePolling();
   testDescriptor();
   if (failures) {
     std::printf("buttons_host: %d failure(s)\n", failures);

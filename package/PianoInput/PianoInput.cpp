@@ -6,12 +6,16 @@
 //
 // The HID class is DroidVMInput's DroidVMHIDDevice (macOS-DroidVM, UPSTREAM): the only IOHIDDevice subclass proven on this macOS
 // 27.0.1 kernel collection (its 334-slot vtable checked at KC link time); the same overrides, without virtio. No interrupts:
-// a kernel thread polls every 10 ms, read only (no PMIC register is written, no interrupt configured).
+// a kernel thread polls, read only (no PMIC register is written, no interrupt configured): every 10 ms while a key is down or
+// changing and for a second after, every piano-input-idle ms otherwise (docs/power-irq.md; the PMIC arbiter's interrupt path is
+// described there, not used).
 //
 // Boot arguments (default: inert, the service does not even probe):
 //   piano-input=1        publish the buttons device and poll
 //   piano-input=2        the same, and log every key edge and report
 //   piano-input-mask=N   the keys reported to macOS (bit 0 power, bit 1 vol+, bit 2 vol-; default 7); masked keys are still logged
+//   piano-input-idle=MS  the poll period while no key is busy (default 40; 0: every 10 ms always, as before; at most 200)
+//   piano-wake-log=S     the "idle: N wakeups" line every S seconds (default 60, 0 none; shared with the other converted drivers)
 // Every step logs "PianoInput: ...": stage 1-6 of start, the raw PMIC registers once, the event driver attaching, and an
 // "alive" line with counters 15 s and 60 s after start, then every 5 minutes.
 #include <IOKit/IOService.h>
@@ -45,6 +49,7 @@ namespace {
 struct Args {
   uint32_t level;   // piano-input
   uint32_t mask;    // piano-input-mask
+  uint32_t idle;    // piano-input-idle
 };
 Args gArgs;
 
@@ -59,6 +64,7 @@ void readArgs()
 {
   gArgs.level = bootArg("piano-input", 0);
   gArgs.mask = bootArg("piano-input-mask", kKeysAll) & kKeysAll;
+  gArgs.idle = PollPlan::clampIdle(bootArg("piano-input-idle", kIdlePollMs));
 }
 
 // Explicit ldr/str, as PianoDwc3 does: every store from a general register.
@@ -188,8 +194,8 @@ IOService *PianoInput::probe(IOService *provider, SInt32 *score)
 bool PianoInput::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
-  note("start: piano-input=%u mask %#x: power, vol-, vol+ over SPMI, polled every %u ms, debounce %u ms, read only", gArgs.level,
-       gArgs.mask, kPollMs, kDebounceMs);
+  note("start: piano-input=%u mask %#x: power, vol-, vol+ over SPMI, polled every %u ms (%u ms while idle%s), debounce %u ms, read only",
+       gArgs.level, gArgs.mask, kPollMs, gArgs.idle, gArgs.idle > kPollMs ? "" : ": not adaptive", kDebounceMs);
   setProperty("piano-input", gArgs.level, 32);
   if (!probeKeys() || !publishButtons()) {
     setProperty("piano-input-stage", uint64_t(uint32_t(piano_input_stage)), 32);
@@ -265,6 +271,30 @@ bool PianoInput::probeKeys()
     }
   }
   note("raw: %s", line);
+  // The two peripherals' interrupt configuration as the firmware left it (read only): the facts a PMIC-arbiter interrupt path
+  // would start from (docs/power-irq.md). LATCHED/PENDING set without an enable would show the latch works on its own.
+  const struct {
+    const char *name;
+    int apid;
+  } peripherals[] = {{"PON", fPonApid}, {"GPIO6", fGpioApid}};
+  for (const auto &peripheral : peripherals) {
+    static const uint8_t kIrqRegs[] = {kRegIntSetType, kRegIntPolarityHigh, kRegIntPolarityLow, kRegIntEnable, kRegIntLatched,
+                                       kRegIntPending};
+    static const char *const kIrqNames[] = {"type", "pol-high", "pol-low", "enabled", "latched", "pending"};
+    used = 0;
+    line[0] = 0;
+    for (unsigned i = 0; i < sizeof kIrqRegs; ++i) {
+      uint8_t value = 0;
+      uint32_t status = 0;
+      const ReadResult result = spmiRead8(gIo, peripheral.apid, kIrqRegs[i], &value, &status);
+      if (used < sizeof line)
+        used += size_t(result == ReadResult::ok
+                         ? snprintf(line + used, sizeof line - used, "%s%s [%02x] %02x", used ? ", " : "", kIrqNames[i], kIrqRegs[i], value)
+                         : snprintf(line + used, sizeof line - used, "%s%s [%02x] %s", used ? ", " : "", kIrqNames[i], kIrqRegs[i],
+                                    resultName(result)));
+    }
+    note("irq registers %s: %s", peripheral.name, line);
+  }
   if (raw[2].result != ReadResult::ok || raw[5].result != ReadResult::ok) {
     stage(-3, "the key status registers (PON 0x1310, GPIO6 0x8d10) cannot be read");
     return false;
@@ -330,14 +360,26 @@ void PianoInput::pollThread(void *self, wait_result_t)
   PianoInput *input = static_cast<PianoInput *>(self);
   note("poll thread running (APIDs %d and %d)", input->fPonApid, input->fGpioApid);
   uint64_t nextDescribe = 15000;
+  PollPlan plan(gArgs.idle);
+  pianoirq::WakeStats wakes = pianoirq::wakeStats(pianoirq::wakeLogMs());
+  uint32_t fastWakes = 0;
   for (;;) {
     input->poll();
-    const uint64_t elapsed = nowMs() - input->fStartMs;
+    const uint64_t now = nowMs(), elapsed = now - input->fStartMs;
     if (elapsed >= nextDescribe) {
       input->describe(elapsed / 1000);
       nextDescribe = nextDescribe < 60000 ? 60000 : nextDescribe + 300000;
     }
-    IOSleep(kPollMs);
+    const uint32_t period = plan.next(input->fFilter, now);
+    pianoirq::WakeStats::Window w;
+    if (wakes.due(now, &w)) {
+      note("idle: %u wakeups in %u s, irq 0 (polled: %u at %u ms while a key was busy, %u at %u ms idle)", w.wakeups, w.seconds, fastWakes,
+           kPollMs, w.wakeups - fastWakes, gArgs.idle);
+      fastWakes = 0;
+    }
+    if (period == kPollMs) ++fastWakes;
+    IOSleep(period);
+    wakes.count(pianoirq::Woke::timeout);
   }
 }
 
