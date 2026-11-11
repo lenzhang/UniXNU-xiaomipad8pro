@@ -159,6 +159,8 @@ struct Bus {
 };
 Bus gBus[kIcs] = {{kPrimarySda, kPrimaryScl, false, false, {}, 0, 0, 0, 0, 0}, {kSecondarySda, kSecondaryScl, false, false, {}, 0, 0, 0, 0, 0}};
 
+// An eGPIO-capable pin whose eGPIO enable is clear belongs to the other (LPI) TLMM: not driven from here.
+bool foreign(const Pin &p) { return (p.ctl & kEgpioPresent) && !(p.ctl & kEgpioEnable); }
 uint32_t gpioCtl(const Pin &p, bool low) { return (p.ctl & ~(kFunction | kOe | 3u)) | kPullUp | (low ? kOe : 0); }
 void lineSda(void *ctx, bool release) { const Pin &p = gPin[static_cast<Bus *>(ctx)->sda]; wr32(p.page.va + kCtl, gpioCtl(p, !release)); }
 void lineScl(void *ctx, bool release) { const Pin &p = gPin[static_cast<Bus *>(ctx)->scl]; wr32(p.page.va + kCtl, gpioCtl(p, !release)); }
@@ -205,8 +207,8 @@ class KextIcs final : public Ics {
  public:
   bool read(unsigned ic, uint8_t reg, uint8_t *value) override
   {
+    if (ic >= kIcs || !gBus[ic].usable) return false;
     Bus &b = gBus[ic];
-    if (ic >= kIcs || !b.usable) return false;
     if (!b.muxed) muxToGpio(b);
     const I2c r = b.i2c.writeRead(kAddress, &reg, 1, value, 1);
     ++b.reads;
@@ -354,7 +356,7 @@ bool PianoBacklight::surveyPins()
     }
     const Pin &sda = gPin[b.sda], &scl = gPin[b.scl];
     const char *why = !sda.page.va || !scl.page.va ? "a pin does not map"
-                    : ((sda.ctl | scl.ctl) & kEgpioPresent) && !((sda.ctl & scl.ctl) & kEgpioEnable) ? "a pin is routed to the other TLMM (eGPIO)"
+                    : foreign(sda) || foreign(scl) ? "a pin is routed to the other TLMM (eGPIO)"
                     : !(sda.io & scl.io & 1) ? "a line is low as found (bus busy or no pull-up)"
                     : nullptr;
     b.usable = !why;

@@ -47,6 +47,15 @@ Linux `drivers/video/backlight/ktz8866.c` (GPL-2.0) as piano's kernels run it, p
 PianoBacklight does the same on both buses and adds a floor (never below `piano-backlight-min` while lit) and the read-back of every
 write. It does not run Linux's `ktz8866_init` writes (sinks, ramps, bias): UEFI already configured the ICs, and they are left so.
 
+The Ubuntu project's history (`docs/ubuntu-history/device.md` §2.4, §3.6; its kernel commit for the dual chip, v0.2.0) gives the
+same rules, all followed here: both chips written, primary then secondary; the boot loader's state kept (BL_EN and the code read
+first; here a level above 45 % is lowered, the owner's battery priority); the sinks never rewritten, BL_EN changed read-modify-write;
+**HWEN never driven low** (it resets every register, the LCD bias the panel runs on included); FLAG is read-to-clear. Its display
+off also blanks the keyboard and touch drivers: NativeGopDisplay's `piano-display-power` (§5) is the signal they can follow. Its
+policies: 120 Hz (the panel stays at ABL's 120 Hz mode here: no mode set), automatic brightness from the ambient light sensor (the
+ADSP's sensor hub: no native path yet), a cover key wakes the screen (macOS wakes the display on HID input; with
+`piano-backlight-lid=1` a press on the closed cover does not light the panel).
+
 ## 4. UniXNU template
 
 UniXNU-sheng's `ShengBacklight` (`package/AppleARMBacklight.cpp`, `docs/drivers/sheng-backlight.md`): the same two KTZ8866 on another
@@ -196,6 +205,9 @@ the display asleep).
 5. The hall polarity before `piano-backlight-lid=1` (`keyboard.md` §10.3).
 6. A restart with the display asleep: does the next boot come up lit (§9)?
 7. Panel sleep (DCS display-off/sleep-in) for more savings while dark: `display.md` §8, later.
+8. Automatic brightness: the ambient light sensor is behind the ADSP's sensor hub (Ubuntu's SSC path); `piano-backlight-percent`
+   (setProperties) is the input a later sensor driver or user-space agent would use.
+9. Keyboard and touch blank while dark (Ubuntu's policy): their owners can watch `piano-display-power`.
 
 ## 11. Licence note
 
