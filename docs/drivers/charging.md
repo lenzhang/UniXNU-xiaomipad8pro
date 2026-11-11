@@ -49,7 +49,7 @@ levels (9 V opt-in), charge current conservative, battery state on the console; 
 | Item | Value | Source | State |
 |---|---|---|---|
 | Charger PMIC | PMIH010x, SID 7, REVID type 0x51 model 0x47/0x56; charger = lowest TYPE 0x02 SUBTYPE 0x7f/0xa8/0xba; DCDC +0x100, USBIN +0x300, Type-C +0x600 (each +0x300 for SUBTYPE 0xba–0xc4) | Project-SunUEFI `PianoUsbTypec.c` (BSD, from stock PmicDxe) | verified (code) |
-| Port state | Type-C +0x06 sink status (Rp bits 1–3), +0x08 source status, +0x0b bit 0 attached, bit 1 CC; +0x44 mode | same | verified (code); Rp bit→current inferred |
+| Port state | Type-C +0x06 sink status (Rp: bit 3 default USB, bit 2 1.5 A, bit 1 3.0 A), +0x08 source status, +0x0b bit 0 attached, bit 1 CC; +0x44 mode | same; the Rp order from Linux's `qcom_pmic_typec_port.c` register facts (`usb-host.md` §facts) | verified (code, source); the order was reversed here until 2026-11-11 |
 | Fuel gauges | 2 × bq27z561 @0x55: pack A on `i2c@a94000` (qup1_se5, gpio52/53, with the SC8541 @0x6a), pack B on `i2c@88c000` (qup2_se3, gpio12/13); packs in parallel | live DT; SunUEFI `kernel.md` | verified (DT); SDA = first pin inferred |
 | DSP | `remoteproc@6800000` sm8750-adsp-pas, PAS 1 + DTB 36, `qcom/sm8750/piano/adsp.mdt` + `.b01–.b54` (no b27), `adsp_dtb.mdt` + `.b01`, from `modem_a` `image/` | live DT; `xiaomipad-8pro-mainline/firmware/README.md` | verified |
 | Carveouts | adspslpi 0xb8200000 + 0x5780000, q6-adsp-dtb 0x9ed80000 + 0x80000 (outside XNU's 0x8c0000000 window) | live DT, `el1-hyp-notes.md` §3 | verified |
@@ -124,7 +124,7 @@ sha256 `ec5267bc9e40a74e…` (`com.unixnu.driver.PianoPower: linked, header at 0
    PianoPower: adsp: survey: SMEM APPS/ADSP partition found, items 0x200, slave-kernel -1 (no SMP2P state from the DSP: not running), ...
    PianoPower: gauge A: bq27z561 answers: 3900 mV, 120 mA, 55 %, 2700/4900 mAh, 31.0 C, status 0x.., N cycles
    PianoPower: [30s] battery: 3900 mV, 240 mA (charging), 55 % (5400/9800 mAh), 31.0 C, 2 of 2 packs | A ... | B ...
-   PianoPower: [30s] usb: a source is attached (charger present) on CC1, Rp bits 0x.. (... mA, inferred), mode 0x.. | typec ...
+   PianoPower: [30s] usb: a source is attached (charger present) on CC1, Rp bits 0x.. (... mA), mode 0x.. | typec ...
    ```
    Pass: both gauges answer with plausible values; the port shows the Mac as a source; the charger's owner EE is logged. The
    **sign of the battery current on the cable is the measurement** that decides whether level 2 is needed at idle. Also run one
@@ -348,7 +348,7 @@ hardware. The values (`BatteryMap.h`, host-tested in `tests/battery_host.cpp`):
 | `ExternalConnected`, `ExternalChargeCapable` | a source's Rp on the Type-C port (else, without the port view, a charging battery) |
 | `IsCharging`, `FullyCharged` | on power and the packs take current / both report FC or 100 % |
 | `TimeRemaining`, `AvgTimeToEmpty`, `AvgTimeToFull` | minutes from the charge and the average current; 65535 when it cannot be computed |
-| `AdapterDetails` | Type-C family, 5 V, the Rp current (inferred), watts |
+| `AdapterDetails` | Type-C family, 5 V, the Rp current, watts |
 | `AtWarnLevel`, `AtCriticalLevel` | always false |
 
 **How macOS finds it** (xnu source, `iokit/Kernel`): `IOPMrootDomain` and powerd look for services of class `IOPMPowerSource`;
@@ -500,7 +500,8 @@ is not sinking; all normal with the gauges still negative → image I (the board
   Linux's ids and would show a neighbouring property there, harmless as reads but misleading); FCC cannot be read back; the Rp
   bit meaning.
 - **Board configuration (image I):** three writes of the stock values Linux and the stock driver send on every DSP start; the
-  allowlist takes nothing else. 0x201a sets up the OTG boost path, which only acts when the port sources (never in these tests).
+  allowlist takes nothing else. With 0x201a the DSP itself sources VBUS when a USB device (Rd) is attached (Linux never turns VBUS
+  on; `usb-host.md`'s H3 step relies on it): with an OTG adapter or a bus-powered device on the port, image I powers it.
 - **UCSI read (both images):** a read of the PPM's buffer, no UCSI command; a firmware that starts its UCSI machine on the first
   read would then send notifications nobody answers (logged, the first 8).
 - **Thermal:** nothing beyond the DSP's JEITA window and the 500 mA floor at ≥ 38 °C; no charge-pump or fast charging.
@@ -520,14 +521,52 @@ Gauge.h and ChargerPmic.h are written fresh. Xiaomi's own charger modules (the `
 property ids or register maps from them by disassembly is outside what this repository derives from. Property ids come from the
 GPL driver's text and the APSL K90 port's notes, both read as descriptions, and are confirmed or refuted on the device.
 
+## 9. The DSP client contract (PianoAudio, PianoSensors, PianoUsbHost)
+
+The DSP that charges also hosts the audio and sensor domains, and natively nothing restarts it: one DSP crash ends charging until
+the reboot. So PianoPower stays its only owner and offers the other kexts a client interface,
+`package/include/PianoAdspContract.h`. Each client names `com.unixnu.driver.PianoPower` as a library in its descriptor and is
+listed after PianoPower in `configs/k27-native-kexts.txt`, so the KC links the functions by name to PianoPower's single copy.
+
+| Offered | What | Answers `sensors.md` §10.1 / `audio.md` §10 |
+|---|---|---|
+| GLINK channels | `piano_adsp_channel` / `piano_adsp_send` (sheng's interface): **6 slots** (IPCRTR, PMIC_RTR_ADSP_APPS, then 4 for clients: `adsp_apps`, `fastrpcglink-apps-dsp`, 2 spare). PianoPower's two are always kept free, whatever registers first. A name can have only one owner. Messages up to 1056 bytes, a 16-message queue per channel. | A |
+| QRTR client ports | `piano_qrtr_open(service, instance, client, ctx)` with `server(up, node, port, instance)` and `receive(node, port, data, len)` callbacks; `piano_qrtr_server` (with a generation); `piano_qrtr_send` (queued, ≤ 1024 bytes); `piano_qrtr_close` (DEL_CLIENT to the DSP). Up to 8 ports, numbered from 16; a reopened slot gets a new number. A port can be opened before the DSP runs. IPCRTR now has **2048-byte receive buffers** (8 of them). | B |
+| Health | `piano_adsp_health(&h)`: stage, `dsp_up` (ready, not fatal, GLINK agreed and not broken, router hello), the fatal bit, the fatal-report count, the **link generation** (moves when a channel that was up goes down, or the transport breaks), `charger_pd` state and generation, the quiet bits, and **its own crash-reason string** (no longer shared with the `open:` notes). | C |
+| Quiet | `piano_adsp_quiet()`: `PIANO_ADSP_QUIET_CHARGER`, set while a charger generation is configured. It runs from the codec's link until a whole cycle ends with nothing left to write and the port enable is answered or timed out (board configuration and first policy writes included), at most 60 s. It is advisory: clients still answer what the DSP waits for. | C |
+
+**What protects the charger from a client.**
+- Every channel has its own buffers.
+- The DSP thread sends one message per channel per round, so a busy client channel never holds the charger's behind it in the
+  shared FIFO.
+- On the router channel, client packets are refused while fewer than 4 of its 16 queue slots would stay free; those are for
+  PianoPower's servreg and locator answers.
+- No lock is held across a client callback. The router step's events are collected under the router lock and delivered after it
+  is dropped. Each is delivered only while its port is open, with the port marked busy, so a close from another thread waits for
+  the callback in progress; a close from inside the port's own callback does not wait.
+- A callback that takes more than 20 ms is logged, because the charger waited with it.
+- Nothing in the contract starts, stops or restarts the DSP, votes rails, or touches RPMh, AOSS or PAS.
+
+**Late registration.** A client kext may register its channel after the DSP has opened it. Before, such an open was only noted,
+and the channel never came up. GLINK now keeps up to 4 such opens and answers one when its channel is registered (`late_opens`).
+It forgets one that the DSP closes, and when a fifth arrives it drops the oldest.
+
+**Without clients** nothing changes but the logs: at level 2 there are `quiet: raised …` and `quiet: released …` lines per
+charger generation, and the `adsp:` report line gains `link generation N, quiet 0x0, client ports 0 (…)`.
+
+Host tests are in `tests/ports_host.cpp`: the port table against the router fed with the DSP name service's packets, the router's
+12 local ports, DEL_CLIENT and the 1024-byte packet limit, the channel slots, the health pieces, the quiet flag, the charger codec's
+`configured`, and GLINK answering a late registration.
+
 ## Measured 2026-11-11 (level 1, read only, 240 s on the Mac's USB-C port)
 
 - SPMI arbiter v7, charger PMIC SID 7 = PMIH010x model 0x56; charger/DCDC/USBIN/Type-C blocks owned by EE 0, which is this processor (the arbiter node's `qcom,ee = <0>`; see §0).
 - DSP: SMEM APPS/ADSP partition present, no SMP2P state: not running, as expected natively.
 - Both gauges answer (bq27z561 on qup1_se5 gpio52/53 and qup2_se3 gpio12/13): 4480/4479 mV, 99 %, 4287/4344 and 4235/4290 mAh,
   28–30 °C, 113/114 cycles.
-- Type-C: a source attached on CC1, Rp 0x2 (500 mA). Battery current 0 mA ("idle") for the whole run: at 99 % the system ran
-  from the USB input without draining the pack. Whether a partly discharged pack charges without the DSP is still to be measured
+- Type-C: a source attached on CC1, Rp 0x2: **3.0 A** (logged as "500 mA" by the decode of the time, whose bit order was the
+  reverse of the PMIC's; corrected 2026-11-11 from Linux's register facts, `usb-host.md` §facts). Battery current 0 mA ("idle")
+  for the whole run: at 99 % the system ran from the USB input without draining the pack. Whether a partly discharged pack charges without the DSP is still to be measured
   (needs a lower charge level); level 2 (DSP start) is for an owner-attended session.
 - ABL `getvar battery-voltage` before/after: 4478 / 4477 mV.
 

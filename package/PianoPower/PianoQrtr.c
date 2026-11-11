@@ -3,13 +3,19 @@
  * ShengQrtr.c (UPSTREAM) on PianoAdsp.h. The DSP's protection domains (audio, charger, sensors) ask the application processor's locator
  * which domains provide a service before they start, and the charger properties are served from the charger domain: without these
  * answers they never come up. The domain table is the one Linux's pd-mapper uses for SM8750 (its SM8550 table), the same as sheng's.
- * Everything runs in the DSP thread's callbacks: each packet is handled at once and any answer is queued with piano_adsp_send. */
+ * Everything runs in the DSP thread's callbacks: each packet is handled at once and any answer is queued with piano_adsp_send.
+ * Other kexts open client ports on this router (PianoAdspContract.h): gLock covers the router and the port table; the DSP thread takes
+ * it around every router event, the clients around open, send, server and close. A client callback never runs under it: the events of
+ * one router step are collected under the lock and delivered after it is dropped, each only while its port is still open, the port
+ * marked busy so that a close from another thread waits for the callback in progress. */
 #include <stddef.h>
 #include <stdint.h>
 #include "QcomQrtr.h"
 #include "PianoAdsp.h"
+#include "QrtrPorts.h"
 #include "Servreg.h"
 #include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
 
 enum {kLocalNode = 1, kLocatorPort = 1, kServregPort = 2};
 
@@ -97,10 +103,112 @@ static void servregReceive(void *context, QcomQrtr *q, uint32_t port, uint32_t n
     IOLog("PianoPower: servreg: message %#x type %u ignored\n", m.message, m.type);
 }
 
+static IOLock *volatile gLock;
+static QrtrPorts gPorts;
+static uint8_t gStarted;         /* piano_qrtr_start ran: the router exists */
+static uint32_t gSendKeep;       /* while a client's packet is queued: the IPCRTR queue slots kept for PianoPower's own packets */
+static volatile uint32_t gMatchDue;
+enum {kClientKeep = 4, kSlowMs = 20, kCloseWaitMs = 5000};
+
+/* The data packet of the router step in progress for a client port (one per step), delivered once the lock is dropped. */
+static struct {uint8_t pending, slot; uint32_t number, node, from, length; const uint8_t *data;} gRx;
+
+static IOLock *routerLock(void)
+{
+    IOLock *lock = __atomic_load_n(&gLock, __ATOMIC_ACQUIRE);
+    if (lock) return lock;
+    IOLock *fresh = IOLockAlloc(), *expected = NULL;
+    if (!fresh) return NULL;
+    if (__atomic_compare_exchange_n(&gLock, &expected, fresh, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return fresh;
+    IOLockFree(fresh);
+    return expected;
+}
+
 static int send(void *context, const uint8_t *packet, uint32_t length)
 {
     (void)context;
-    return piano_adsp_send(gChannel, packet, length) ? -1 : 0;
+    return piano_adsp_send_keep(gChannel, packet, length, gSendKeep) ? -1 : 0;
+}
+
+/* A data packet for a client port (in qcom_qrtr_receive, under the lock): kept for delivery after the step. */
+static void clientRx(void *context, QcomQrtr *q, uint32_t port, uint32_t node, uint32_t from, const uint8_t *data, uint32_t length)
+{
+    (void)context; (void)q;
+    const int slot = qrtr_ports_find(&gPorts, port);
+    if (slot < 0) return;
+    gRx.pending = 1; gRx.slot = (uint8_t)slot; gRx.number = port; gRx.node = node; gRx.from = from; gRx.data = data; gRx.length = length;
+}
+
+/* Under the lock: the port's callbacks for one call, the port marked busy; 0 when it is closed or closing. */
+static int claim(uint8_t slot, uint32_t number, PianoQrtrClient *client, void **context)
+{
+    QrtrPort *p = &gPorts.port[slot];
+    if (!p->used || p->closing || p->number != number) return 0;
+    p->busy++;
+    *client = p->client;
+    *context = p->context;
+    return 1;
+}
+
+static void unclaim(uint8_t slot, uint32_t number)
+{
+    QrtrPort *p = &gPorts.port[slot];
+    if (p->used && p->number == number && p->busy) p->busy--;
+}
+
+static void timed(uint64_t since, const char *who)
+{
+    const uint64_t ms = piano_adsp_now_ms() - since;
+    if (ms > kSlowMs) piano_adsp_slow_callback(who, (uint32_t)ms);
+}
+
+/* With the lock held, after a router step: the server changes of the client ports and the step's data packet; drops the lock and
+ * delivers them (servers first). */
+static void deliverAndUnlock(IOLock *lock)
+{
+    QrtrPortEvent events[2 * PIANO_QRTR_MAX_PORTS];
+    const unsigned n = qrtr_ports_match(&gPorts, gStarted ? &gQrtr : NULL, events, sizeof events / sizeof events[0]);
+    const uint8_t pending = gRx.pending, slot = gRx.slot;
+    const uint32_t number = gRx.number, node = gRx.node, from = gRx.from, length = gRx.length;
+    const uint8_t *data = gRx.data;
+    gRx.pending = 0;
+    gMatchDue = 0;
+    IOLockUnlock(lock);
+    for (unsigned i = 0; i < n; ++i) {
+        const QrtrPortEvent *e = &events[i];
+        IOLog("PianoPower: qrtr: port %u: its service %s %u:%u (instance %#x, generation %u)\n", e->number, e->up ? "is at" : "left",
+              e->node, e->port, e->instance, e->generation);
+        PianoQrtrClient c;
+        void *context = NULL;
+        IOLockLock(lock);
+        const int ok = claim(e->slot, e->number, &c, &context);
+        IOLockUnlock(lock);
+        if (!ok) continue;
+        if (c.server) {
+            const uint64_t t = piano_adsp_now_ms();
+            c.server(context, e->up, e->node, e->port, e->instance);
+            timed(t, "a QRTR port's server callback");
+        }
+        IOLockLock(lock);
+        unclaim(e->slot, e->number);
+        IOLockUnlock(lock);
+    }
+    if (!pending) return;
+    PianoQrtrClient c;
+    void *context = NULL;
+    IOLockLock(lock);
+    const int ok = claim(slot, number, &c, &context);
+    if (ok) gPorts.delivered++;
+    IOLockUnlock(lock);
+    if (!ok) return;
+    if (c.receive) {
+        const uint64_t t = piano_adsp_now_ms();
+        c.receive(context, node, from, data, length);   /* data: the GLINK intent, valid until linkReceive returns */
+        timed(t, "a QRTR port's receive callback");
+    }
+    IOLockLock(lock);
+    unclaim(slot, number);
+    IOLockUnlock(lock);
 }
 
 static void locator(void *context, QcomQrtr *q, uint32_t port, uint32_t node, uint32_t from, const uint8_t *data, uint32_t length)
@@ -137,25 +245,32 @@ static void forget(void)
 static void linkState(void *context, int up)
 {
     (void)context;
+    IOLock *lock = routerLock();
+    if (!lock) return;
+    IOLockLock(lock);
     if (!up) {
         if (gPdState) pdState(0, "link down");
         forget();
         gStage = 1;
-        return;
+    } else {
+        gStage = 2;
+        if (gQrtr.hello_received) {
+            gStage = 3;
+            IOLog("PianoPower: qrtr: the DSP's hello came before the channel's up (node %u, %u services): kept\n", gQrtr.remote_node,
+                  gQrtr.remote_count);
+        }
+        if (!gQrtr.hello_sent) qcom_qrtr_start(&gQrtr);
+        servregRegister();
     }
-    gStage = 2;
-    if (gQrtr.hello_received) {
-        gStage = 3;
-        IOLog("PianoPower: qrtr: the DSP's hello came before the channel's up (node %u, %u services): kept\n", gQrtr.remote_node,
-              gQrtr.remote_count);
-    }
-    if (!gQrtr.hello_sent) qcom_qrtr_start(&gQrtr);
-    servregRegister();
+    deliverAndUnlock(lock);
 }
 
 static void linkReceive(void *context, const uint8_t *data, uint32_t length)
 {
     (void)context;
+    IOLock *lock = routerLock();
+    if (!lock) return;
+    IOLockLock(lock);
     const int had = notifier() >= 0;
     qcom_qrtr_receive(&gQrtr, data, length);
     if (gQrtr.hello_received && gStage == 2) {
@@ -168,16 +283,126 @@ static void linkReceive(void *context, const uint8_t *data, uint32_t length)
         if (gPdState) pdState(0, "notifier gone");
     }
     servregRegister();
+    deliverAndUnlock(lock);
 }
+
+/* The IPCRTR receive buffers: 2048 bytes (a sensor attribute report is about 1000 bytes of protobuf plus 50 of headers). */
+enum {kRouterIntent = 2048, kRouterIntents = 8};
 
 void piano_qrtr_start(void)
 {
     static const PianoAdspClient client = {linkState, linkReceive};
+    IOLock *lock = routerLock();
+    if (!lock) return;
+    IOLockLock(lock);
     qcom_qrtr_init(&gQrtr, kLocalNode, send, NULL);
     qcom_qrtr_add_service(&gQrtr, QCOM_SERVLOC_SERVICE, QCOM_SERVLOC_INSTANCE, kLocatorPort, locator, NULL);
     qcom_qrtr_add_client(&gQrtr, kServregPort, servregReceive, NULL);
-    gChannel = piano_adsp_channel("IPCRTR", 1024, 8, 0, &client, NULL);
+    for (unsigned i = 0; i < PIANO_QRTR_MAX_PORTS; ++i)   /* the ports clients opened before the router existed */
+        if (gPorts.port[i].used && !gPorts.port[i].closing) qcom_qrtr_add_client(&gQrtr, gPorts.port[i].number, clientRx, NULL);
+    gStarted = 1;
+    IOLockUnlock(lock);
+    gChannel = piano_adsp_channel("IPCRTR", kRouterIntent, kRouterIntents, 0, &client, NULL);
     gStage = gChannel ? 1 : 0;
+}
+
+/* On the DSP thread at every pass: the server changes a client's open asked for (PianoAdsp.cpp's service()). */
+void piano_qrtr_poll(void)
+{
+    if (!__atomic_load_n(&gMatchDue, __ATOMIC_ACQUIRE)) return;
+    IOLock *lock = routerLock();
+    if (!lock) return;
+    IOLockLock(lock);
+    deliverAndUnlock(lock);
+}
+
+/* ---- the client ports (PianoAdspContract.h) ---- */
+int piano_qrtr_open(uint32_t service, uint32_t instance, const PianoQrtrClient *client, void *context)
+{
+    IOLock *lock = routerLock();
+    if (!lock) return -1;
+    IOLockLock(lock);
+    const int slot = qrtr_ports_open(&gPorts, service, instance, client, context);
+    int rc = slot;
+    if (slot >= 0) {
+        rc = (int)gPorts.port[slot].number;
+        if (gStarted && qcom_qrtr_add_client(&gQrtr, gPorts.port[slot].number, clientRx, NULL)) {qrtr_ports_free(&gPorts, slot); rc = -1;}
+        else __atomic_store_n(&gMatchDue, 1u, __ATOMIC_RELEASE);
+    }
+    IOLockUnlock(lock);
+    if (rc >= 0) {
+        IOLog("PianoPower: qrtr: port %d opened, following service %u instance %#x\n", rc, service, instance);
+        piano_adsp_wake();
+    }
+    return rc;
+}
+
+int piano_qrtr_server(int port, PianoQrtrServer *out)
+{
+    IOLock *lock = routerLock();
+    if (!lock || !out || port <= 0) return -1;
+    IOLockLock(lock);
+    const int slot = qrtr_ports_find(&gPorts, (uint32_t)port);
+    if (slot >= 0) *out = gPorts.port[slot].server;
+    IOLockUnlock(lock);
+    return slot >= 0 ? 0 : -1;
+}
+
+int piano_qrtr_send(int port, uint32_t node, uint32_t to_port, const void *data, uint32_t length)
+{
+    IOLock *lock = routerLock();
+    if (!lock) return -3;
+    if (port <= 0 || !data || !length || length > PIANO_QRTR_MAX_DATA) return -2;
+    IOLockLock(lock);
+    int rc;
+    const int slot = qrtr_ports_find(&gPorts, (uint32_t)port);
+    if (slot < 0 || gPorts.port[slot].closing) rc = -2;
+    else if (!gStarted || !gQrtr.hello_received) rc = -3;
+    else {
+        gSendKeep = kClientKeep;
+        rc = qcom_qrtr_send_data(&gQrtr, (uint32_t)port, node, to_port, (const uint8_t *)data, length) ? -1 : 0;
+        gSendKeep = 0;
+        if (rc) gPorts.refused++;
+    }
+    IOLockUnlock(lock);
+    return rc;
+}
+
+void piano_qrtr_close(int port)
+{
+    IOLock *lock = routerLock();
+    if (!lock || port <= 0) return;
+    IOLockLock(lock);
+    const int slot = qrtr_ports_find(&gPorts, (uint32_t)port);
+    if (slot < 0 || gPorts.port[slot].closing) {IOLockUnlock(lock); return;}
+    QrtrPort *p = &gPorts.port[slot];
+    p->closing = 1;   /* no callback starts from here on */
+    if (gStarted) {
+        if (gQrtr.hello_received) qcom_qrtr_del_client(&gQrtr, (uint32_t)port);
+        qcom_qrtr_remove_port(&gQrtr, (uint32_t)port);
+    }
+    /* A callback in progress on the DSP thread finishes first, unless this is that callback closing its own port. */
+    const int self = piano_adsp_on_thread();
+    unsigned waited = 0;
+    while (!self && p->busy && waited < kCloseWaitMs) {IOLockUnlock(lock); IOSleep(1); waited++; IOLockLock(lock);}
+    if (p->busy && !self) IOLog("PianoPower: qrtr: port %d closed with a callback still running after %u ms\n", port, waited);
+    qrtr_ports_free(&gPorts, slot);
+    IOLockUnlock(lock);
+    IOLog("PianoPower: qrtr: port %d closed\n", port);
+}
+
+void piano_qrtr_port_counters(uint32_t *open, uint32_t *delivered, uint32_t *refused)
+{
+    uint32_t n = 0;
+    for (unsigned i = 0; i < PIANO_QRTR_MAX_PORTS; ++i) n += gPorts.port[i].used;
+    *open = n;
+    *delivered = gPorts.delivered;
+    *refused = gPorts.refused;
+}
+
+int piano_qrtr_link_up(void)
+{
+    return gStage >= 3 && gQrtr.hello_received;
 }
 
 void piano_qrtr_counters(uint32_t *stage, uint32_t *requests, uint32_t *answers, uint32_t *services)

@@ -7,7 +7,7 @@ static void put16(uint8_t *p, uint32_t v) {p[0] = (uint8_t)v; p[1] = (uint8_t)(v
 static void put32(uint8_t *p, uint32_t v) {put16(p, v); put16(p + 2, v >> 16);}
 
 #define CTRL_BYTES 20u  /* command and four words */
-#define MAX_PACKET 512u
+#define MAX_PACKET (QCOM_QRTR_HEADER + QCOM_QRTR_MAX_DATA)
 
 void qcom_qrtr_init(QcomQrtr *q, uint32_t local_node, QcomQrtrSend send, void *send_context)
 {
@@ -65,6 +65,22 @@ int qcom_qrtr_add_service(QcomQrtr *q, uint32_t service, uint32_t instance, uint
 int qcom_qrtr_add_client(QcomQrtr *q, uint32_t port, QcomQrtrReceive receive, void *context)
 {
     return qcom_qrtr_add_service(q, 0, 0, port, receive, context);
+}
+
+int qcom_qrtr_remove_port(QcomQrtr *q, uint32_t port)
+{
+    for (uint32_t i = 0; i < q->local_count; ++i) {
+        if (q->local[i].port != port) continue;
+        q->local[i] = q->local[--q->local_count];
+        return 0;
+    }
+    return -1;
+}
+
+int qcom_qrtr_del_client(QcomQrtr *q, uint32_t port)
+{
+    const uint32_t words[4] = {q->local_node, port, 0, 0};
+    return control(q, QCOM_QRTR_DEL_CLIENT, words);
 }
 
 void qcom_qrtr_start(QcomQrtr *q)

@@ -7,12 +7,16 @@ porting.toml), package/:
   Taken unchanged (sha256 of the copies here = of the originals):
     QcomSmem.c   4e9eb0ee22458dad30e1fcb7edb74a9d762222aff0623a6d5b85fb4a6e08bd03   QcomSmem.h   f2a25e807bfa0556f2ec19258d8b2f47782acdc5fe1d9bdab23ecbb9f948ae37
     QcomSmp2p.c  f91c38e60fe86c5a55cbf9e822e0486997f7104d564ea90d6afe6ab40ac9d60b   QcomSmp2p.h  894f36fd14be184252ce64c4c8c908d161d31433185b190041f4bd18d47d68c6
-    QcomGlink.c  3d7e18c2cae2c6136b1b7bf43f8d69e49c99ed8e60d3ee7cd98c37891df9b1ba   QcomGlink.h  7e617c764e11ba7ca08e9976e39c35710515a16613ea66f3e845da538ad2df07
     QcomQmp.c    6d5dd2e0ebf1f425f7fc929555edb275b8d499cfaa1f9c887bfcb68f09785249   QcomQmp.h    dd6722ade248435930c5f242ef78728f58f7e3bc6a9765fe229b32c87f342503
     QcomRpmh.c   679a55467e6ed4c7e75a8191f1d6da48637377088ef5e27879b1c99bc4a62314   QcomRpmh.h   47e299744ff83989449d262f74f5dfd2ba1cdbf921b2886643735f2febb6ee21
     QcomMdt.c    706f4a86624d119282683287bf408ae679275368f9bcc28d6f4ba652d3ad377a   QcomMdt.h    22d8e567b285e254becf1af41f8ba0c9c1cfcc5295f6246b4b9d09e5fef88477
-    QcomQrtr.c   d22ff8572b93424f1f03138204a44e10b444d0cb62b6be4f1c57b7d3b2ddbc74   QcomQrtr.h   3ead40f5f996497224ebef92e2e67820aa8372bab0a21646c15df954baba84f1
     FatVolume.c  6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779   FatVolume.h  a438bcc5519bacfbfa6b6c55646fe4a3f7787f37a50c52103d8094c6871b67e7
+  Taken and extended (sha256 of the originals; the additions are marked "UniXNU-piano" in the files):
+    QcomGlink.c  3d7e18c2cae2c6136b1b7bf43f8d69e49c99ed8e60d3ee7cd98c37891df9b1ba   QcomGlink.h  7e617c764e11ba7ca08e9976e39c35710515a16613ea66f3e845da538ad2df07
+      + the remote's opens of channels nobody registered yet are kept (4) and answered when the channel is registered later.
+    QcomQrtr.c   d22ff8572b93424f1f03138204a44e10b444d0cb62b6be4f1c57b7d3b2ddbc74   QcomQrtr.h   3ead40f5f996497224ebef92e2e67820aa8372bab0a21646c15df954baba84f1
+      + client ports that are never announced (qcom_qrtr_add_client), their removal and DEL_CLIENT (qcom_qrtr_remove_port,
+        qcom_qrtr_del_client); 12 local ports, 64 remote services, data packets of up to 1024 bytes (was 480).
   Derived:
     AdspProbe.cpp (eace137cc122c83551c971a0d6335d5c72fa7f1acc754d45221059be263f4e67) -> PianoAdsp.cpp. Kept: the bring-up order and
       every step (survey, SMP2P item, doorbells, AOSS load_state, cmd-db + lcx/lmx votes through RSC TCS 1, DTB then DSP image
@@ -33,9 +37,12 @@ porting.toml), package/:
       NAME.mdt when there is no NAME.b00 (piano's modem_a), piece 0 read from that file; names piano_fw_*; strong imports of
       NativeUfs's native_ufs_part_find/native_ufs_part_read (package/NativeUfs exports them).
     ShengQrtr.c (d3cac365aa20c5a6dc02ab3f2635ccec2c332cfd1862ec805512935124d440cc) -> PianoQrtr.c: the same domain table and
-      locator; on PianoAdsp.h; counters and a console line per locator request instead of native_qrtr_stats.
-    ShengAdsp.h (d877fc12d123ab99c08f00a6e043daf46270da01a0b093673af1910ba08e0b7f) -> PianoAdsp.h: the client interface renamed,
-      plus the survey and status interface.
+      locator; on PianoAdsp.h; counters and a console line per locator request instead of native_qrtr_stats; plus (new code) the
+      servreg listener, the router lock and the client ports of package/include/PianoAdspContract.h (QrtrPorts.c, written fresh;
+      the interface's shape is PaganiAdsp's as docs/drivers/sensors.md §10.1 describes it, no PaganiAdsp code is here).
+    ShengAdsp.h (d877fc12d123ab99c08f00a6e043daf46270da01a0b093673af1910ba08e0b7f) -> PianoAdsp.h and
+      package/include/PianoAdspContract.h: the client interface renamed (now in the contract header with the QRTR ports, the health
+      and the quiet calls), plus the survey and status interface.
     QcomScm.h (ab03ab1291f043cb281f4d64b82b0d497d0e4f61a5b888512f0ec852ae1a3244): its IPCC register offsets and doorbell ids, as
       constants in PianoAdsp.cpp.
     TouchBoard.h: the TLMM layout (configuration at 0x1000 * gpio: function 5:2, drive 8:6, output enable 9; input/output at +4),
@@ -79,4 +86,6 @@ values and order), the charger_pd gate and the per-generation re-send, the diag 
 (pmic_glink_altmode.c, ucsi_glink.c: the 24-byte PAN write, the header-only UCSI buffer read answered by the buffer and a return code)
 and the service registry messages (Linux's PDR message definitions: listener registration 0x20, state indication 0x22, ack 0x23 and
 their TLV ids). Servreg.h, the listener in PianoQrtr.c and the PianoMca.c additions are written fresh from those descriptions; the
-UCSI buffer offsets (VERSION 0, CCI 4) are the UCSI specification's.
+UCSI buffer offsets (VERSION 0, CCI 4) are the UCSI specification's. The Type-C sink status's Rp bit order in ChargerPmic.h (bit 3
+default, bit 2 1.5 A, bit 1 3.0 A) is the register fact of Linux's drivers/usb/typec/tcpm/qcom/qcom_pmic_typec_port.c (GPL, read for
+the fact only; docs/drivers/usb-host.md §facts).

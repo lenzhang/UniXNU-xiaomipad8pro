@@ -38,6 +38,7 @@
 #include "RtcReadout.h"
 extern "C" {
 #include "PianoAdsp.h"
+#include "AdspHealth.h"
 #include "PianoMca.h"
 }
 
@@ -233,6 +234,10 @@ class PianoPower : public IOService {
   void report();
   void startCharger();
   void serviceMca(uint64_t now);
+  void stepQuiet(uint64_t now);
+  // The quiet flag for the DSP's other clients (PianoAdspContract.h): raised per charger generation until it is configured.
+  PowerQuiet fQuiet = {};
+  static constexpr uint32_t kQuietCapMs = 60000;
   void pumpMca(uint64_t now);
   void logMcaEvents();
   void mcaLine(char *line, size_t size);
@@ -516,7 +521,7 @@ void PianoPower::report()
   if (havePort) {
     p = readPort(gIo, fCharger);
     if (p.ok)
-      note("[%llus] usb: %s%s, Rp bits %#x (%u mA, inferred), mode %#x | typec %02x %02x %02x %02x %02x %02x rt %#x | usbin %02x %02x "
+      note("[%llus] usb: %s%s, Rp bits %#x (%u mA), mode %#x | typec %02x %02x %02x %02x %02x %02x rt %#x | usbin %02x %02x "
            "%02x %02x %02x %02x %02x %02x rt %#x | dcdc %02x %02x %02x %02x %02x %02x %02x %02x rt %#x | chgr %02x %02x %02x %02x %02x "
            "%02x %02x %02x",
            t, !p.attached ? "nothing attached" : p.sourceSeen ? "a source is attached (charger present)" : p.sinkSeen ? "a device is attached (we source)" : "attached",
@@ -532,11 +537,15 @@ void PianoPower::report()
   if (gArgs.level >= 2) {
     PianoAdspStatus s;
     piano_adsp_status(&s);
+    uint32_t open = 0, delivered = 0, refused = 0;
+    piano_qrtr_port_counters(&open, &delivered, &refused);
+    PianoAdspHealth h;
+    piano_adsp_health(&h);
     note("[%llus] adsp: stage %d (%s)%s, slave-kernel %d, %u fatal, %u doorbells, GLINK %u in %u out, channels %#x%s, qrtr %u (%u "
-         "asked, %u answered, %u services)%s%s",
+         "asked, %u answered, %u services), link generation %u, quiet %#x, client ports %u (%u delivered, %u refused)%s%s",
          t, s.stage, piano_adsp_stage_name(s.stage), s.stage < 0 ? " FAILED" : "", s.slave, s.fatal, s.doorbells, s.glink_in, s.glink_out,
-         s.channels_up, s.broken ? " BROKEN" : "", s.qrtr_stage, s.qrtr_requests, s.qrtr_answers, s.qrtr_services,
-         s.text[0] ? ", " : "", s.text);
+         s.channels_up, s.broken ? " BROKEN" : "", s.qrtr_stage, s.qrtr_requests, s.qrtr_answers, s.qrtr_services, h.link_generation,
+         h.quiet, open, delivered, refused, s.text[0] ? ", " : "", s.text);
     char line[520];
     mcaLine(line, sizeof line);
     note("[%llus] %s", t, line);
@@ -734,13 +743,27 @@ void PianoPower::serviceMca(uint64_t now)
       }
     }
   }
-  if (!fWasUp) return;
+  if (!fWasUp) {stepQuiet(now); return;}
   if (fRequestDue && now >= fRequestDue) {piano_mca_timeout(&fMca); fRequestDue = 0;}
   if (fPanDue && now >= fPanDue) {piano_mca_pan_timeout(&fMca); fPanDue = 0;}
   if (fUcsiDue && now >= fUcsiDue) {piano_mca_ucsi_timeout(&fMca); fUcsiDue = 0;}
   if (now >= fCycleDue) {piano_mca_refresh(&fMca); fCycleDue = now + 5000;}
   pumpMca(now);
   logMcaEvents();
+  stepQuiet(now);
+}
+
+// Clients (audio, sensors) hold their traffic while a charger generation is configured: from the codec's link until a whole cycle ends
+// with nothing left to write and the port enable answered (or timed out), at most 60 s.
+void PianoPower::stepQuiet(uint64_t now)
+{
+  const int e = power_quiet_step(&fQuiet, fWasUp, fMca.links, piano_mca_configured(&fMca), now, kQuietCapMs);
+  if (e == PowerQuietNone) return;
+  piano_adsp_quiet_set(PIANO_ADSP_QUIET_CHARGER, fQuiet.raised);
+  note("quiet: %s", e == PowerQuietRaised ? "raised for the DSP's other clients: configuring the charger"
+                    : e == PowerQuietReleased ? "released: the charger is configured"
+                    : e == PowerQuietTimedOut ? "released after 60 s with the charger not configured"
+                                              : "dropped: the charger is not reachable now");
 }
 
 void PianoPower::run()

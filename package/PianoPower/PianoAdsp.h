@@ -1,30 +1,28 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* piano's audio DSP (ADSP, LPASS), which runs the charger firmware (PianoAdsp.cpp). UniXNU-sheng's ShengAdsp.h client interface,
- * renamed: a client registers a GLINK channel by name at any time (before or after the DSP is up) and gets its state and messages
- * through callbacks that run on the DSP thread; they must not block (copy what they need and wake their own thread). Sends are queued
- * and go out from the DSP thread, so a caller never waits for the DSP. */
+/* piano's audio DSP (ADSP, LPASS), which runs the charger firmware (PianoAdsp.cpp): PianoPower's own side. What other kexts may use
+ * (the GLINK channels, the QRTR client ports, the health and quiet calls) is package/include/PianoAdspContract.h, included here. */
 #ifndef PIANO_ADSP_H
 #define PIANO_ADSP_H
 #include <stddef.h>
 #include <stdint.h>
+#include "PianoAdspContract.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define PIANO_ADSP_MAX_MESSAGE 560u
-
-typedef struct PianoAdspChannel PianoAdspChannel;
-typedef struct {
-    void (*state)(void *context, int up);
-    void (*receive)(void *context, const uint8_t *data, uint32_t length);
-} PianoAdspClient;
-
-/* Registers the channel; intent_size/intent_count are the receive buffers offered to the DSP. initiator: we open it (otherwise we answer
- * the DSP's open). Returns null when out of slots or memory. */
-PianoAdspChannel *piano_adsp_channel(const char *name, uint32_t intent_size, uint32_t intent_count, int initiator,
-                                     const PianoAdspClient *client, void *context);
-/* Queues one message (at most PIANO_ADSP_MAX_MESSAGE bytes): 0 queued, -1 queue full or too big, -2 bad arguments. */
-int piano_adsp_send(PianoAdspChannel *channel, const void *data, uint32_t length);
+/* PianoPower's own sends on a channel it shares with clients (the router's): refused while fewer than keep_free queue slots would stay
+ * free (the clients' share; PianoPower's own packets use keep_free 0). */
+int piano_adsp_send_keep(PianoAdspChannel *channel, const void *data, uint32_t length, uint32_t keep_free);
+/* True on PianoPower's DSP thread (where every callback runs). */
+int piano_adsp_on_thread(void);
+/* PianoPower raises and drops the quiet bits (PIANO_ADSP_QUIET_*) clients read with piano_adsp_quiet(). */
+void piano_adsp_quiet_set(uint32_t bits, int on);
+/* A callback into a client took this long (PianoQrtr.c's dispatch reports its own): counted, the first few logged. */
+void piano_adsp_slow_callback(const char *who, uint32_t ms);
+/* Wakes the DSP thread (a client's open wants its server events). */
+void piano_adsp_wake(void);
+/* Milliseconds since boot (mach_absolute_time). */
+uint64_t piano_adsp_now_ms(void);
 
 /* What the boot stages left, read only: the windows are mapped and read, nothing is written (piano-power=1, and the first step of 2). */
 typedef struct {
@@ -69,12 +67,16 @@ enum PianoAdspStage {
     PianoAdspReady = 18, PianoAdspGlink = 19, PianoAdspChannelUp = 20,
 };
 
-/* The IPC router's link and service locator (PianoQrtr.c): registered before the DSP starts. */
+/* The IPC router's link and service locator (PianoQrtr.c): registered before the DSP starts. The charger domain's state
+ * (piano_qrtr_charger_pd, in the contract) comes from the DSP's service registry (Servreg.h). */
 void piano_qrtr_start(void);
 void piano_qrtr_counters(uint32_t *stage, uint32_t *requests, uint32_t *answers, uint32_t *services);
-/* The charger domain's state as the DSP's service registry reports it (Servreg.h): 0 unknown, 0x1fffffff up, ...; *ups (optional)
- * counts its transitions to up, one per charger generation. */
-uint32_t piano_qrtr_charger_pd(uint32_t *ups);
+/* The router's client ports (PianoQrtr.c) for the status line: open ports, packets delivered, sends refused. */
+void piano_qrtr_port_counters(uint32_t *open, uint32_t *delivered, uint32_t *refused);
+/* On the DSP thread at every pass: delivers the server changes an open asked for. */
+void piano_qrtr_poll(void);
+/* The router's link has the DSP's hello. */
+int piano_qrtr_link_up(void);
 
 /* The firmware files (PianoAdspFirmware.c). */
 int piano_fw_open(const char *path, void **handle, uint64_t *size);

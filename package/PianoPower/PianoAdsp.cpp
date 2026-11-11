@@ -50,6 +50,7 @@ extern "C" {
 #include "QcomSmp2p.h"
 #include "Sm8750Scm.h"
 #include "PianoAdsp.h"
+#include "AdspHealth.h"
 }
 
 namespace {
@@ -65,7 +66,10 @@ constexpr uint32_t kPasAdsp = 1, kPasDtb = 36, kRemotePid = 2, kItemIn = 443, kI
 constexpr uint32_t kItemGlinkDesc = 478, kItemGlinkTx = 479, kItemGlinkRx = 480, kGlinkFifo = 0x4000;
 constexpr uint32_t kFatal = 1u << 0, kReady = 1u << 1, kHandover = 1u << 2;
 constexpr uint32_t kEvSmp2p = 1, kEvGlink = 2, kEvAop = 4, kEvSend = 16;
-constexpr unsigned kClients = 4, kQueue = 8;
+// Six channels: PianoPower's IPCRTR and PMIC_RTR_ADSP_APPS, then the clients' (PianoAdspContract.h); a queue of 16 messages each.
+constexpr unsigned kClients = PIANO_ADSP_CHANNELS, kQueue = 16;
+static_assert(kClients <= QCOM_GLINK_MAX_CHANNELS, "a GLINK channel per client slot");
+constexpr uint32_t kSlowCallbackMs = 20;
 constexpr uint32_t kBringUpSliceMs = 2, kSteadySliceMs = 20;
 
 struct Knobs {uint32_t delay, stop, qmp, rpmh, trace, map, loadFirst;};
@@ -160,6 +164,30 @@ namespace {
 PianoAdspChannel gClients[kClients];
 uint32_t gClientCount;
 IOLock *gClientLock;
+// Health (piano_adsp_health): the crash reason of the last fatal report (under gClientLock), the link generation, the quiet bits.
+char gCrash[80];
+AdspLinkTrack gLinkTrack;
+volatile uint32_t gLinkGeneration, gQuiet, gSlowCallbacks;
+thread_t gThread;
+
+// The client lock, made once whoever comes first (a client kext may register before PianoPower starts the DSP).
+IOLock *clientLock() {
+    IOLock *lock = __atomic_load_n(&gClientLock, __ATOMIC_ACQUIRE);
+    if (lock) return lock;
+    IOLock *fresh = IOLockAlloc(), *expected = nullptr;
+    if (!fresh) return nullptr;
+    if (__atomic_compare_exchange_n(&gClientLock, &expected, fresh, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return fresh;
+    IOLockFree(fresh);
+    return expected;
+}
+// PianoPower's own channels: the router (PianoQrtr.c) and the charger (PianoPower.cpp).
+bool ownChannel(const char *name) {return !strcmp(name, "IPCRTR") || !strcmp(name, "PMIC_RTR_ADSP_APPS");}
+uint64_t nowMs() {
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    return ns / 1000000;
+}
+void linkChanged() {__atomic_store_n(&gLinkGeneration, gLinkTrack.generation, __ATOMIC_RELEASE);}
 
 void wake(uint32_t bits) {
     __atomic_fetch_or(&gPending, bits, __ATOMIC_RELEASE);
@@ -247,6 +275,11 @@ void noteCrash() {
     char text[80];
     readCrashReason(text, sizeof text);
     if (text[0]) {note("crash: ", text); say("crash reason: %s", text);}
+    if (IOLock *lock = clientLock()) {   // the health's own copy (gText is shared with the open: notes)
+        IOLockLock(lock);
+        strlcpy(gCrash, text, sizeof gCrash);
+        IOLockUnlock(lock);
+    }
 }
 
 bool mapAll() {
@@ -668,6 +701,11 @@ void serviceGlink() {
     }
     const bool agreed = gGlink.version_agreed;
     qcom_glink_poll(&gGlink);
+    if ((gGlink.broken != 0) != (gLinkTrack.broken != 0)) {
+        adsp_link_broken(&gLinkTrack, gGlink.broken != 0);
+        linkChanged();
+        if (gGlink.broken) say("GLINK: the transport is broken (link generation %u)", gLinkTrack.generation);
+    }
     pumpSends();
     if (!agreed && gGlink.version_agreed) say("GLINK: version agreed (features %#x)", gGlink.features);
     if (gGlink.unknown_opens != gUnknownSeen) {
@@ -683,6 +721,7 @@ void service(uint32_t bits) {
     if (bits & kEvAop) qcom_qmp_step(&gQmp);
     if (bits & (kEvSmp2p | kEvGlink)) serviceSmp2p();
     if (bits & (kEvGlink | kEvSend)) {applyClients(); serviceGlink();}
+    piano_qrtr_poll();   // server changes a client's open asked for (PianoQrtr.c)
 }
 // Runs events until done() holds or ms pass; returns done().
 template <typename F> bool waitUntil(uint32_t ms, F done) {
@@ -699,14 +738,29 @@ template <typename F> bool waitUntil(uint32_t ms, F done) {
 }
 
 // ---- client glue (DSP thread side) ----
+// No lock is held across these: a client's callback may queue sends (gClientLock, taken and dropped inside) and nothing else waits.
+void timed(uint64_t since, const char *name) {
+    const uint64_t ms = nowMs() - since;
+    if (ms > kSlowCallbackMs) piano_adsp_slow_callback(name, (uint32_t)ms);
+}
 void clientState(void *context, QcomGlinkChannel *, int up) {
     PianoAdspChannel *c = static_cast<PianoAdspChannel *>(context);
-    say("channel %s %s", c->name, up ? "up" : "down");
-    if (c->client.state) c->client.state(c->context, up);
+    adsp_link_channel(&gLinkTrack, (unsigned)(c - gClients), up);
+    linkChanged();
+    say("channel %s %s%s", c->name, up ? "up" : "down", up ? "" : " (link generation moves)");
+    if (c->client.state) {
+        const uint64_t t = nowMs();
+        c->client.state(c->context, up);
+        timed(t, c->name);
+    }
 }
 void clientReceive(void *context, QcomGlinkChannel *, const uint8_t *data, uint32_t length) {
     PianoAdspChannel *c = static_cast<PianoAdspChannel *>(context);
-    if (c->client.receive) c->client.receive(c->context, data, length);
+    if (c->client.receive) {
+        const uint64_t t = nowMs();
+        c->client.receive(c->context, data, length);
+        timed(t, c->name);
+    }
 }
 void applyClients() {
     if (!gGlinkStarted) return;
@@ -718,22 +772,25 @@ void applyClients() {
     }
     IOLockUnlock(gClientLock);
 }
+// One message per channel per round, so a busy channel (a client's) never holds the charger's behind it in the shared FIFO.
 void pumpSends() {
-    for (unsigned i = 0; i < gClientCount; ++i) {
-        PianoAdspChannel &c = gClients[i];
-        if (!c.glink || !c.glink->up) continue;
-        for (;;) {
+    uint32_t blocked = 0;
+    for (bool progress = true; progress;) {
+        progress = false;
+        for (unsigned i = 0; i < gClientCount; ++i) {
+            PianoAdspChannel &c = gClients[i];
+            if ((blocked >> i) & 1 || !c.glink || !c.glink->up) continue;
             IOLockLock(gClientLock);
-            if (!c.count) {IOLockUnlock(gClientLock); break;}
-            Message *m = &c.queue[c.head];
+            Message *m = c.count ? &c.queue[c.head] : nullptr;
             IOLockUnlock(gClientLock);
+            if (!m) continue;
             // Only this thread takes messages off the queue, so m stays valid while the lock is dropped for the send.
-            const int rc = qcom_glink_send(&gGlink, c.glink, m->data, m->length);
-            if (rc != QcomGlinkOk) break;
+            if (qcom_glink_send(&gGlink, c.glink, m->data, m->length) != QcomGlinkOk) {blocked |= 1u << i; continue;}
             IOLockLock(gClientLock);
             c.head = (c.head + 1) % kQueue;
             c.count--;
             IOLockUnlock(gClientLock);
+            progress = true;
         }
     }
 }
@@ -915,6 +972,7 @@ bool startGlink() {
 
 void adspThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "piano-adsp");
+    __atomic_store_n(&gThread, current_thread(), __ATOMIC_RELEASE);
     if (!gStage) {
         if (!mapAll()) {fail(PianoAdspMapped, gError); return;}
         stage(PianoAdspMapped);
@@ -949,12 +1007,23 @@ extern "C" int piano_adsp_survey(PianoAdspSurvey *out) {
 
 extern "C" PianoAdspChannel *piano_adsp_channel(const char *name, uint32_t intent_size, uint32_t intent_count, int initiator,
                                                 const PianoAdspClient *client, void *context) {
-    if (!gClientLock) gClientLock = IOLockAlloc();
-    if (!gClientLock || !name || !client || !intent_size || !intent_count || intent_count > QCOM_GLINK_MAX_LOCAL_INTENTS) return nullptr;
+    IOLock *lock = clientLock();
+    if (!lock || !name || !name[0] || strlen(name) >= QCOM_GLINK_NAME || !client || !intent_size || intent_size > 0x10000 ||
+        !intent_count || intent_count > QCOM_GLINK_MAX_LOCAL_INTENTS)
+        return nullptr;
     uint8_t *storage = static_cast<uint8_t *>(IOMallocData((vm_size_t)intent_size * intent_count));
     Message *queue = static_cast<Message *>(IOMallocData(sizeof(Message) * kQueue));
-    IOLockLock(gClientLock);
-    PianoAdspChannel *c = gClientCount < kClients && storage && queue ? &gClients[gClientCount] : nullptr;
+    IOLockLock(lock);
+    // One owner per channel name (a second registration of IPCRTR or PMIC_RTR_ADSP_APPS is refused), and two of the six slots stay
+    // PianoPower's own whatever registers first: a client kext may start before PianoPower's level 2.
+    bool taken = false;
+    unsigned others = 0;
+    for (unsigned i = 0; i < gClientCount; ++i) {
+        taken |= !strncmp(gClients[i].name, name, sizeof gClients[i].name);
+        others += !ownChannel(gClients[i].name);
+    }
+    const bool room = adsp_channel_room(gClientCount, others, ownChannel(name), kClients);
+    PianoAdspChannel *c = !taken && room && storage && queue ? &gClients[gClientCount] : nullptr;
     if (c) {
         bzero(c, sizeof *c);
         strlcpy(c->name, name, sizeof c->name);
@@ -962,36 +1031,82 @@ extern "C" PianoAdspChannel *piano_adsp_channel(const char *name, uint32_t inten
         c->client = *client; c->context = context; c->storage = storage; c->queue = queue;
         __atomic_store_n(&gClientCount, gClientCount + 1, __ATOMIC_RELEASE);
     }
-    IOLockUnlock(gClientLock);
+    IOLockUnlock(lock);
     if (!c) {
         if (storage) IOFreeData(storage, (vm_size_t)intent_size * intent_count);
         if (queue) IOFreeData(queue, sizeof(Message) * kQueue);
+        say("channel %s: not registered (%s)", name, taken ? "the name is taken" : "no slot or no memory");
         return nullptr;
     }
     wake(kEvSend);
     return c;
 }
 
-extern "C" int piano_adsp_send(PianoAdspChannel *c, const void *data, uint32_t length) {
+extern "C" int piano_adsp_send_keep(PianoAdspChannel *c, const void *data, uint32_t length, uint32_t keep_free) {
     if (!c || !data || !length) return -2;
     if (length > PIANO_ADSP_MAX_MESSAGE) return -1;
-    IOLockLock(gClientLock);
-    if (c->count == kQueue) {IOLockUnlock(gClientLock); return -1;}
+    IOLock *lock = clientLock();
+    if (!lock) return -1;
+    IOLockLock(lock);
+    if (c->count + keep_free >= kQueue) {IOLockUnlock(lock); return -1;}
     Message &m = c->queue[(c->head + c->count) % kQueue];
     memcpy(m.data, data, length);
     m.length = length;
     c->count++;
-    IOLockUnlock(gClientLock);
+    IOLockUnlock(lock);
     wake(kEvSend);
     return 0;
+}
+
+extern "C" int piano_adsp_send(PianoAdspChannel *c, const void *data, uint32_t length) {
+    return piano_adsp_send_keep(c, data, length, 0);
+}
+
+extern "C" int piano_adsp_on_thread(void) {
+    return current_thread() == __atomic_load_n(&gThread, __ATOMIC_ACQUIRE);
+}
+
+extern "C" void piano_adsp_wake(void) {wake(kEvSend);}
+
+extern "C" uint64_t piano_adsp_now_ms(void) {return nowMs();}
+
+extern "C" void piano_adsp_slow_callback(const char *who, uint32_t ms) {
+    const uint32_t n = __atomic_add_fetch(&gSlowCallbacks, 1u, __ATOMIC_RELAXED);
+    if (n <= 8 || (n & (n - 1)) == 0)
+        say("%s: a client callback took %u ms on the DSP thread (the charger waited; %u so far)", who, ms, n);
+}
+
+extern "C" void piano_adsp_quiet_set(uint32_t bits, int on) {
+    if (on) __atomic_fetch_or(&gQuiet, bits, __ATOMIC_ACQ_REL);
+    else __atomic_fetch_and(&gQuiet, ~bits, __ATOMIC_ACQ_REL);
+}
+
+extern "C" uint32_t piano_adsp_quiet(void) {return __atomic_load_n(&gQuiet, __ATOMIC_ACQUIRE);}
+
+extern "C" void piano_adsp_health(PianoAdspHealth *out) {
+    if (!out) return;
+    bzero(out, sizeof *out);
+    out->version = PIANO_ADSP_HEALTH_VERSION;
+    out->stage = gStage;
+    const uint32_t slave = gSlaveBits < 0 ? 0 : (uint32_t)gSlaveBits;
+    out->fatal = (slave & kFatal) ? 1 : 0;
+    out->fatal_reports = gRestarts;
+    out->link_generation = __atomic_load_n(&gLinkGeneration, __ATOMIC_ACQUIRE);
+    out->dsp_up = adsp_health_dsp_up(gStage, slave, gGlinkStarted && gGlink.version_agreed && !gGlink.broken, piano_qrtr_link_up());
+    out->charger_pd = piano_qrtr_charger_pd(&out->charger_generation);
+    out->quiet = piano_adsp_quiet();
+    if (IOLock *lock = clientLock()) {
+        IOLockLock(lock);
+        strlcpy(out->crash, gCrash, sizeof out->crash);
+        IOLockUnlock(lock);
+    }
 }
 
 extern "C" void piano_adsp_start(void) {
     if (gStarted) return;
     gStarted = true;
-    if (!gClientLock) gClientLock = IOLockAlloc();
     gScmLock = IOLockAlloc();
-    if (!gClientLock || !gScmLock) {fail(PianoAdspMapped, -12); return;}
+    if (!clientLock() || !gScmLock) {fail(PianoAdspMapped, -12); return;}
     PE_parse_boot_argn("piano-power-delay", &gKnobs.delay, sizeof gKnobs.delay);
     PE_parse_boot_argn("piano-power-stop", &gKnobs.stop, sizeof gKnobs.stop);
     PE_parse_boot_argn("piano-power-qmp", &gKnobs.qmp, sizeof gKnobs.qmp);

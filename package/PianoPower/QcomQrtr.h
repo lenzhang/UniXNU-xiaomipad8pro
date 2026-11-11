@@ -13,8 +13,9 @@ extern "C" {
 #define QCOM_QRTR_HEADER 32u
 #define QCOM_QRTR_PORT_CTRL 0xfffffffeu
 #define QCOM_QRTR_NODE_BROADCAST 0xffffffffu
-#define QCOM_QRTR_MAX_LOCAL 4u
-#define QCOM_QRTR_MAX_REMOTE 32u
+#define QCOM_QRTR_MAX_LOCAL 12u    /* UniXNU-piano: PianoPower's two ports and the eight client ports (PianoAdspContract.h) */
+#define QCOM_QRTR_MAX_REMOTE 64u
+#define QCOM_QRTR_MAX_DATA 1024u   /* one data packet's payload we send */
 
 enum {
     QCOM_QRTR_DATA = 1, QCOM_QRTR_HELLO = 2, QCOM_QRTR_BYE = 3, QCOM_QRTR_NEW_SERVER = 4, QCOM_QRTR_DEL_SERVER = 5,
@@ -49,6 +50,10 @@ int qcom_qrtr_add_service(QcomQrtr *q, uint32_t service, uint32_t instance, uint
 /* A client port: data packets to it go to receive, and it is never announced (UniXNU-piano addition, for the servreg listener of
  * PianoQrtr.c). Returns 0, or -1 when full. */
 int qcom_qrtr_add_client(QcomQrtr *q, uint32_t port, QcomQrtrReceive receive, void *context);
+/* Removes one of our ports (a closed client port: UniXNU-piano addition); 0, or -1 when it is not ours. */
+int qcom_qrtr_remove_port(QcomQrtr *q, uint32_t port);
+/* Tells the remote that our port is gone (DEL_CLIENT {our node, port}): its servers forget the client. 0 when queued. */
+int qcom_qrtr_del_client(QcomQrtr *q, uint32_t port);
 /* The link is up: says hello. */
 void qcom_qrtr_start(QcomQrtr *q);
 /* One received packet. Returns 0, or -1 when it was not a valid packet. */

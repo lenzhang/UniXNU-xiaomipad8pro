@@ -16,6 +16,7 @@ extern "C" {
 #define QCOM_GLINK_MAX_LOCAL_INTENTS 24u
 #define QCOM_GLINK_NAME 32u
 #define QCOM_GLINK_FEATURE_INTENT_REUSE 1u
+#define QCOM_GLINK_MAX_PENDING_OPENS 4u     /* the remote's opens of channels nobody registered yet (UniXNU-piano addition) */
 
 enum {
     QCOM_GLINK_VERSION = 0, QCOM_GLINK_VERSION_ACK = 1, QCOM_GLINK_OPEN = 2, QCOM_GLINK_CLOSE = 3, QCOM_GLINK_OPEN_ACK = 4,
@@ -52,6 +53,7 @@ struct QcomGlinkChannel {
     char name[QCOM_GLINK_NAME];
     uint16_t lcid, rcid;
     uint8_t used, initiator, open_sent, open_acked, remote_open, up, intent_asked;
+    uint8_t ack_due;   /* the remote opened it before it was registered: our OPEN_ACK is still to go */
     QcomGlinkClient client;
     void *context;
     /* Our receive intents: count buffers of size bytes in storage (count * size). */
@@ -74,6 +76,10 @@ typedef struct {
     uint32_t rx_messages, tx_messages, rx_data, unknown_opens, dropped;
     char last_unknown[QCOM_GLINK_NAME];
     char unknown_names[96];  /* the distinct names of those opens, space separated, as many as fit */
+    /* Those opens, kept until the channel is registered (it is then answered: a client kext that registers after the remote opened its
+     * channel still gets it) or the remote closes it; late_opens counts the ones answered that way. */
+    struct {uint16_t rcid; uint8_t used; char name[QCOM_GLINK_NAME];} pending[QCOM_GLINK_MAX_PENDING_OPENS];
+    uint32_t late_opens;
 } QcomGlink;
 
 /* Sets up the link on its FIFOs (rx may have no data yet: the remote makes its FIFO later) and resets the indices we own. */
@@ -81,7 +87,7 @@ void qcom_glink_init(QcomGlink *g, QcomGlinkFifo tx, QcomGlinkFifo rx, void (*ki
 /* The remote's FIFO once it exists. */
 void qcom_glink_set_rx(QcomGlink *g, volatile uint8_t *data, uint32_t length);
 /* Registers a channel by name with intent_count receive buffers of intent_size bytes in storage. open_now: we send OPEN ourselves;
- * otherwise we answer when the remote opens it. */
+ * otherwise we answer when the remote opens it (or answer the open it already sent, if it is pending). */
 QcomGlinkChannel *qcom_glink_channel(QcomGlink *g, const char *name, uint32_t intent_size, uint32_t intent_count, uint8_t *storage,
                                      const QcomGlinkClient *client, void *context, int open_now);
 /* Sends VERSION (once) and any channel OPEN that is due, then handles every complete message in the receive FIFO. Returns the number of

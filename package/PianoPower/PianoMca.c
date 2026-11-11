@@ -83,6 +83,7 @@ void piano_mca_link(PianoMca *m, int up)
     m->ucsi = 0;
     m->valid = 0;
     m->pdos = 0;
+    m->settled = 0;
     if (!up) {m->pan_enable = 0; return;}
     m->links++;
     m->icl_set = m->fcc_set = 0;   /* a started firmware is on its defaults */
@@ -362,6 +363,7 @@ static int finish(PianoMca *m)
     m->cursor = NO_CYCLE;
     m->cycles++;
     policy(m);
+    m->settled = !m->queued && !m->sent_write;
     if (m->refresh_wanted && !m->queued) {m->refresh_wanted = 0; piano_mca_refresh(m);}
     return 1;
 }
@@ -415,6 +417,11 @@ void piano_mca_battery_temperature(PianoMca *m, int valid, int32_t celsius)
 {
     m->ext_tbat_valid = valid != 0;
     m->ext_tbat_c = celsius;
+}
+
+int piano_mca_configured(const PianoMca *m)
+{
+    return m->settled && !m->queued && !m->sent_write && m->pan_enabled != 0;
 }
 
 uint32_t piano_mca_take_events(PianoMca *m)

@@ -150,6 +150,7 @@ typedef struct {
     /* counters and the last write, for the log */
     uint32_t cycles, answers, errors, timeouts, ignored, notifications, writes_ok, writes_failed, refused, pan_notifies, pan_acks;
     uint32_t links;
+    uint8_t settled;                 /* the last cycle of this link ended with nothing left to write (piano_mca_configured) */
     int32_t last_result;
     uint32_t last_property, last_value;
     uint32_t events;
@@ -182,6 +183,9 @@ void piano_mca_allow_board(PianoMca *m, int allow);
 /* The gauges' temperature, used when the firmware's own reading is missing. */
 void piano_mca_battery_temperature(PianoMca *m, int valid, int32_t celsius);
 uint32_t piano_mca_take_events(PianoMca *m);
+/* The link's charger generation is configured: a whole cycle ended with no write due or in flight (so the board configuration and the
+ * policy's writes are through, or given up) and the port enable was answered or timed out. PianoPower's quiet flag waits for it. */
+int piano_mca_configured(const PianoMca *m);
 /* The name of a charger status value, "unknown" when it is not one of the five the Linux driver and the K90 notes name
  * (1 charging, 2 discharging, 3 not charging, 4/5 full; the 07:28 run read 0x7). */
 const char *piano_mca_status_name(int32_t status);
