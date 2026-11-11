@@ -11,7 +11,9 @@
     "com.apple.kpi.libkern": "18.0.0",
     "com.apple.kpi.mach": "18.0.0",
     "com.apple.kpi.private": "18.0.0",
-    "com.apple.kpi.unsupported": "18.0.0"
+    "com.apple.kpi.unsupported": "18.0.0",
+    "com.unixnu.driver.NativeUfs": "1.0.0",
+    "com.unixnu.driver.PianoA830": "1.0.0"
   },
   "personalities": {
     "PianoVideo": {

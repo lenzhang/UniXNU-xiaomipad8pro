@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // PianoVideo: piano's video core (SM8750 Iris, VPU 3.5: H.264/HEVC/VP9 decode, H.264/HEVC encode) for macOS 27, native at EL1.
 // Design, the ladder (power, firmware via PAS, HFI, one H.264 frame, VideoToolbox through the VM-era paravirtual decoder, HEVC/VP9,
-// encode) and the test plan: docs/drivers/video.md. Facts and their sources: VideoHw.h. This is level 1 only:
+// encode) and the test plan: docs/drivers/video.md. Facts and their sources: VideoHw.h.
 //   piano-video=1  a read-only survey, logged as "PianoVideo: ..." lines: GCC's four video branches; VIDEO_CC (only with GCC's
 //                  video AHB on): PLL0, the core clock's RCG and dividers (the rate and the OPP it matches), both GDSCs, every
 //                  branch; the core's controller registers (version, CTRL_INIT/CTRL_STATUS, the queue table and UC region words,
@@ -9,33 +9,61 @@
 //                  idle words only with the codec domain on too; the apps SMMU's entries for streams 0x1940..0x194f, the free
 //                  stream-match groups and the banks in use. Nothing is written: every MMIO access is a load (VideoSurvey.h has no
 //                  store), and the two registers whose access acts (A2HSOFTINTCLR, IC_SOFTINT) are never loaded.
-// Other arguments: piano-video-cc=0 (skip VIDEO_CC and the core: the fallback if a load there stalls; default 1),
-// piano-video-smmu=N (0 skip the SMMU, 1 its global pages only, 2 (default) also the matching banks' registers),
-// piano-video-carveout=1 (also load the first 32 bytes of the firmware carveout 0x9c300000, memory XNU does not own; default 0),
-// piano-video-delay=S (wait S s first, default 0), piano-video-repeat=S with piano-video-samples=N (read the clock words again every
-// S s, N times, default 3: one line each, to see whether anything powers the core later). Without piano-video the driver declines in
-// probe() and maps nothing.
+//   piano-video=2  V1: the survey, then the core powered on and off at its lowest operating point (VideoPower.h, VideoRpmh.h):
+//                  MXC/MMCX and BCM MM1 by RPMh under PianoA830's DRV-2 lock, GCC's video branches, VIDEO_CC's PLL0 at 720 MHz,
+//                  the controller then the codec GDSC and clocks at 240 MHz, the readout with the gate open, off in Linux's order;
+//                  piano-video-cycles=N times (default 1; the test plan's 20), piano-video-hold-ms=MS powered (default 50)
+//   piano-video=3  V2: + the firmware (VideoFirmware.h): the owner's vpu35_4v.mbn from the ESP (pinned size and SHA-256), PAS 9
+//                  init_image / mem_setup / segments / auth_and_reset and MP_VIDEO_VAR under one hold of the kernel-wide
+//                  secure-call lock (package/include/PianoScmLock.h), then PAS shutdown before the power-off
+//   piano-video=4  V3: + the streams' own SMMU bank and the UC region (VideoSmmu.h), the boot words and the HFI handshake
+//                  (VideoHfi.h: SYS_INIT, IMAGE_VERSION, the version string), the collapse piano-video-idle-ms (1500) after the
+//                  last activity with the firmware kept, piano-video-resumes=N collapse/resume cycles, piano-video-unload=1 to end
+//                  with PAS shutdown and the bank released
+// Levels 2-4 write registers only through VideoBringup.h (each (address, value) pair logged the first time it is written; every
+// wait bounded; any failure powers everything down). Other arguments: piano-video-cc=0 (skip VIDEO_CC and the core in the survey:
+// the fallback if a load there stalls; default 1), piano-video-smmu=N (0 skip the SMMU survey, 1 its global pages only, 2 (default)
+// also the matching banks' registers), piano-video-carveout=1 (also load the first 32 bytes of the firmware carveout 0x9c300000,
+// memory XNU does not own; default 0), piano-video-delay=S (wait S s first, default 0), piano-video-repeat=S with
+// piano-video-samples=N (read the clock words again every S s, N times, default 3), piano-video-stop=STEP (levels 2-4: power
+// everything down after that step), piano-video-mmcx-floor=VLVL (default 0x140: MMCX is never voted or lowered below the boot
+// display's NOM_L1). Without piano-video the driver declines in probe() and maps nothing.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/libkern.h>
+#include <libkern/crypto/sha2.h>
 #include <kern/thread.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
+#include <sys/errno.h>
 #include <stdarg.h>
-#include "VideoSurvey.h"
-
-using namespace pianovideo;
-
+#define PIANO_SCM_LOCK_KERNEL 1
+#include <PianoScmLock.h>
 extern "C" {
+#include "FatVolume.h"
+#include "Sm8750Scm.h"
+// NativeUfs (package/NativeUfs): GPT lookup by name and 4096-byte block reads of any LUN, read only.
+int native_ufs_part_find(const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks);
+int native_ufs_part_read(uint32_t lun, uint64_t lba, uint32_t blocks, void *dst);
+// PianoA830's DRV-2 owner word (package/PianoA830/adreno830/platform/sm8750/Sm8750Rpmh.h, "DRV-2 lock"): one 32-bit word, 0 =
+// free, else the holder's tag. PianoA830 is listed before PianoVideo in configs/k27-native-kexts.txt and named as a library in
+// PianoVideo.json, so the KC linker resolves it (and sm8750_scm_owner, PianoScmLock.h) to A830's single copy.
+extern volatile uint32_t sm8750_rpmh_drv2_owner;
 // Post-mortem breadcrumb (also in the console log): the last stage reached, negative when it failed there.
 volatile int32_t piano_video_stage = 0;
 }
+#include "VideoBringup.h"
+
+using namespace pianovideo;
 
 namespace {
 
 struct Args {
   uint32_t level, cc, smmu, carveout, delay, repeat, samples;
+  uint32_t cycles, holdMs, idleMs, resumes, unload, stop, mmcxFloor;
 };
 Args gArgs;
 
@@ -45,31 +73,44 @@ uint32_t bootArg(const char *name, uint32_t fallback)
   if (!PE_parse_boot_argn(name, &v, sizeof v)) v = fallback;
   return v;
 }
+uint32_t clampArg(const char *name, uint32_t fallback, uint32_t most)
+{
+  const uint32_t v = bootArg(name, fallback);
+  return v > most ? most : v;
+}
 
 void readArgs()
 {
   gArgs.level = bootArg("piano-video", 0);
   gArgs.cc = bootArg("piano-video-cc", 1) ? 1 : 0;
-  gArgs.smmu = bootArg("piano-video-smmu", 2);
-  if (gArgs.smmu > 2) gArgs.smmu = 2;
+  gArgs.smmu = clampArg("piano-video-smmu", 2, 2);
   gArgs.carveout = bootArg("piano-video-carveout", 0) ? 1 : 0;
-  gArgs.delay = bootArg("piano-video-delay", 0);
-  if (gArgs.delay > 600) gArgs.delay = 600;
-  gArgs.repeat = bootArg("piano-video-repeat", 0);
-  if (gArgs.repeat > 3600) gArgs.repeat = 3600;
-  gArgs.samples = bootArg("piano-video-samples", 3);
-  if (gArgs.samples > 100) gArgs.samples = 100;
+  gArgs.delay = clampArg("piano-video-delay", 0, 600);
+  gArgs.repeat = clampArg("piano-video-repeat", 0, 3600);
+  gArgs.samples = clampArg("piano-video-samples", 3, 100);
+  gArgs.cycles = clampArg("piano-video-cycles", 1, 1000);
+  if (!gArgs.cycles) gArgs.cycles = 1;
+  gArgs.holdMs = clampArg("piano-video-hold-ms", 50, 60000);
+  gArgs.idleMs = clampArg("piano-video-idle-ms", kIdleCollapseMs, 600000);
+  gArgs.resumes = clampArg("piano-video-resumes", 0, 1000);
+  gArgs.unload = bootArg("piano-video-unload", 0) ? 1 : 0;
+  gArgs.stop = clampArg("piano-video-stop", 0, kStepDone);
+  gArgs.mmcxFloor = clampArg("piano-video-mmcx-floor", kMmcxDisplayFloor, 0x1000);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-void note(const char *fmt, ...)
+void vnote(const char *fmt, va_list ap)
 {
   char line[480];
+  vsnprintf(line, sizeof line, fmt, ap);
+  IOLog("PianoVideo: %s\n", line);
+}
+void note(const char *fmt, ...)
+{
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(line, sizeof line, fmt, ap);
+  vnote(fmt, ap);
   va_end(ap);
-  IOLog("PianoVideo: %s\n", line);
 }
 
 void stage(int32_t value, const char *what)
@@ -78,26 +119,37 @@ void stage(int32_t value, const char *what)
   note("%s %d: %s", value < 0 ? "FAILED at stage" : "stage", value < 0 ? -value : value, what);
 }
 
-// Explicit ldr, as PianoDpu, PianoAudio and PianoWifi do. This file has no store helper.
+// Explicit ldr/str, as PianoDpu, PianoAudio and PianoWifi do: every store comes from a general register, never wzr (Qualcomm's
+// trapped SMMU registers need that). Level 1 calls only load(); store() is reached only from VideoBringup.h (levels 2-4).
 inline uint32_t rd32(uintptr_t a)
 {
   uint32_t v;
   __asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(a) : "memory");
   return v;
 }
+inline void wr32(uintptr_t a, uint32_t v) { __asm__ volatile("str %w0, [%1]" ::"r"(v), "r"(a) : "memory"); }
+inline void dsb() { __asm__ volatile("dsb sy" ::: "memory"); }
+
+uint64_t nowUs()
+{
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+  return ns / 1000;
+}
 
 // ------------------------------------------------------------------------------------------------ MMIO pages, mapped on demand
-// PianoDpu's scheme: a page is mapped (device memory, uncached) the first time one of its words is loaded. The survey touches at
-// most 20 pages: GCC (one page), VIDEO_CC (three), the core (six), the SMMU's global pages and up to six banks, the carveout's first.
+// PianoDpu's scheme: a page is mapped (device memory, uncached) the first time one of its words is accessed. The survey touches at
+// most 20 pages; levels 2-4 add VIDEO_CC's 0x9000 page, the core's AON page, DRV-2's two TCS pages and, while V3's plan looks for a
+// free bank from the top, one page per bank it reads (a page that cannot be mapped reads as all ones: "in use", never taken).
 struct Page {
   uint64_t pa;
   IOMemoryMap *map;
   uintptr_t va;
 };
-constexpr unsigned kMaxPages = 32;
+constexpr unsigned kMaxPages = 160;
 Page gPages[kMaxPages];
 unsigned gPageCount, gMapFailures;
-uint64_t gLoads;
+uint64_t gLoads, gStores;
 
 uintptr_t pageVa(uint64_t pa)
 {
@@ -122,6 +174,18 @@ uint32_t load(uint64_t pa)
   }
   ++gLoads;
   return rd32(va + uintptr_t(pa & 0xfff));
+}
+
+void store(uint64_t pa, uint32_t v)
+{
+  const uintptr_t va = pageVa(pa);
+  if (!va) {
+    ++gMapFailures;
+    return;
+  }
+  ++gStores;
+  wr32(va + uintptr_t(pa & 0xfff), v);
+  dsb();
 }
 
 void unmapAll()
@@ -221,12 +285,372 @@ void summarize(const Clocks &c, const Core &r, const SmmuSurvey &m, char *out, s
            streamWord(m, kStreamFirst), streamWord(m, kStreamSecond), m.freeGroups);
 }
 
+// ------------------------------------------------------------------------------------------------------ the secure world (V2, V3)
+// Sm8750Scm (MIT, a copy of PianoPower's): its own request mutex, and the kernel-wide secure-call lock around every yielding request
+// (after the mutex: lock order SCM mutex -> hold mutex, docs/scm-lock.md) and once around the PAS sequence (scmHold).
+Sm8750Scm gScm;
+IOLock *gScmLock;
+bool gScmReady;
+uint64_t scmNowUs(void *) { return nowUs(); }
+void scmSleepUs(void *, uint32_t us)
+{
+  if (us >= 1000) IOSleep(us / 1000);
+  else IODelay(us);
+}
+PIANO_SCM_KERNEL_LOCK(gScmShared, PianoScmTagVideo, "PianoVideo");
+void scmLock(void *)
+{
+  IOLockLock(gScmLock);
+  piano_scm_kernel_take(&gScmShared);
+}
+void scmUnlock(void *)
+{
+  piano_scm_kernel_give(&gScmShared);
+  IOLockUnlock(gScmLock);
+}
+const Sm8750ScmOps gScmOps = {nullptr, Sm8750ScmSmcInstruction, scmNowUs, scmSleepUs, scmLock, scmUnlock, nullptr, nullptr};
+bool scmReady()
+{
+  if (gScmReady) return true;
+  if (!gScmLock && !(gScmLock = IOLockAlloc())) return false;
+  Sm8750ScmInit(&gScm, &gScmOps);
+  gScm.budget_us = 30u * 1000u * 1000u;   // as PianoPower: an image's authentication can take longer than the default second
+  gScmReady = true;
+  return true;
+}
+// One secure call with a line before it (and a moment for the console) and one after: a call that does not return leaves the first
+// line last in the log. Ok means x0 == 0 and, for the calls that return a result, x1[31:0] == 0.
+template <typename F>
+int secure(const char *what, bool result, F call)
+{
+  if (!scmReady()) return -1;
+  note("smc: %s: calling", what);
+  IOSleep(20);
+  Sm8750SmcResult r = {};
+  const uint64_t t0 = nowUs();
+  const Sm8750ScmStatus status = call(&r);
+  const bool ok = status == Sm8750ScmOk && (!result || uint32_t(r.x1) == 0);
+  note("smc: %s: %s (status %d, x0 %lld, x1 %#llx, %u SMCs: %u interrupted, %u wait-queue, %u busy; %llu us)", what, ok ? "ok" : "FAILED",
+       int(status), (long long)r.x0, (unsigned long long)r.x1, r.calls, r.interrupted, r.waitq, r.busy,
+       (unsigned long long)(nowUs() - t0));
+  return ok ? 0 : 1;
+}
+
+// ------------------------------------------------------------------------------------------------------------ the ESP (V2, V3)
+struct Partition {
+  uint32_t lun;
+  uint64_t first;
+  uint64_t cached;
+  uint8_t block[4096];
+};
+// PianoSensors' reader (PianoSensors.cpp partitionRead): whole blocks straight into to, the ends through the one-block cache.
+int partitionRead(void *context, uint64_t offset, void *to, size_t length)
+{
+  Partition *p = static_cast<Partition *>(context);
+  uint8_t *out = static_cast<uint8_t *>(to);
+  while (length) {
+    const uint64_t lba = offset / 4096;
+    const size_t within = size_t(offset % 4096);
+    if (!within && length >= 4096) {
+      const uint32_t n = length / 4096 > 256 ? 256 : uint32_t(length / 4096);
+      if (!native_ufs_part_read(p->lun, p->first + lba, n, out)) return -1;
+      out += size_t(n) * 4096;
+      offset += uint64_t(n) * 4096;
+      length -= size_t(n) * 4096;
+      continue;
+    }
+    if (p->cached != lba) {
+      p->cached = ~0ull;
+      if (!native_ufs_part_read(p->lun, p->first + lba, 1, p->block)) return -1;
+      p->cached = lba;
+    }
+    const size_t take = 4096 - within < length ? 4096 - within : length;
+    memcpy(out, p->block + within, take);
+    out += take;
+    offset += take;
+    length -= take;
+  }
+  return 0;
+}
+
+void cleanToPoc(const void *start, uint64_t length)
+{
+  uint64_t ctr;
+  __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+  const uintptr_t line = uintptr_t(4) << ((ctr >> 16) & 15);
+  for (uintptr_t a = uintptr_t(start) & ~(line - 1); a < uintptr_t(start) + length; a += line) __asm__ volatile("dc civac, %0" ::"r"(a) : "memory");
+  dsb();
+}
+
+// ------------------------------------------------------------------------------------------------------------- the kernel's Hw
+struct KernelHw {
+  // MMIO, time, the log
+  uint32_t rd(uint64_t pa) { return load(pa); }
+  void wr(uint64_t pa, uint32_t v) { store(pa, v); }
+  void delayUs(uint32_t us) { IODelay(us); }
+  void sleepMs(uint32_t ms) { IOSleep(ms); }
+  uint64_t nowUs() { return ::nowUs(); }
+  void note(const char *fmt, ...) __attribute__((format(printf, 2, 3)))
+  {
+    va_list ap;
+    va_start(ap, fmt);
+    vnote(fmt, ap);
+    va_end(ap);
+  }
+  void stage(int n, const char *what) { ::stage(n, what); }
+  void barrier() { dsb(); }
+  void cleanToPoc(const void *p, uint64_t bytes) { ::cleanToPoc(p, bytes); }
+
+  // PianoA830's DRV-2 owner word: compare-exchange 0 for our tag, 10 us between tries, at most 2 s (its documented protocol).
+  bool drv2Take(uint32_t *waits)
+  {
+    const uint32_t held = __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE);
+    if (held) ::note("rsc: the DRV-2 lock is held by %#x; waiting (at most 2 s)", held);
+    for (uint32_t n = 0;; ++n) {
+      uint32_t expected = 0;
+      if (__atomic_compare_exchange_n(&sm8750_rpmh_drv2_owner, &expected, kDrv2Tag, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        *waits = n;
+        if (n) ::note("rsc: DRV-2 lock taken after %u waits of 10 us", n);
+        return true;
+      }
+      if (n >= 200000) {
+        *waits = n;
+        ::note("rsc: the DRV-2 lock stayed held by %#x for 2 s: nothing voted", __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE));
+        return false;
+      }
+      IODelay(10);
+    }
+  }
+  void drv2Give()
+  {
+    uint32_t expected = kDrv2Tag;
+    __atomic_compare_exchange_n(&sm8750_rpmh_drv2_owner, &expected, 0u, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+  }
+
+  // The AOP command database: copied once with aligned loads (no-map reserved memory, a device mapping).
+  uint8_t *db = nullptr;
+  const uint8_t *cmdDb(uint32_t *bytes)
+  {
+    *bytes = uint32_t(kCmdDbBytes);
+    if (db) return db;
+    uint8_t *copy = static_cast<uint8_t *>(IOMallocData(kCmdDbBytes));
+    IODeviceMemory *m = copy ? IODeviceMemory::withRange(kCmdDb, kCmdDbBytes) : nullptr;
+    IOMemoryMap *map = m ? m->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+    if (m) m->release();
+    if (!map) {
+      if (copy) IOFreeData(copy, kCmdDbBytes);
+      ::note("cmd-db: %#llx does not map", (unsigned long long)kCmdDb);
+      return nullptr;
+    }
+    const uintptr_t va = uintptr_t(map->getVirtualAddress());
+    for (uint32_t i = 0; i < kCmdDbBytes; i += 4) {
+      const uint32_t w = rd32(va + i);
+      memcpy(copy + i, &w, 4);
+    }
+    map->release();
+    db = copy;
+    return db;
+  }
+
+  // The firmware file from the ESP, read whole (V2).
+  uint8_t *file = nullptr;
+  uint64_t fileBytes = 0;
+  int fwRead(const uint8_t **bytes, uint64_t *size)
+  {
+    uint32_t lun = 0;
+    uint64_t first = 0, blocks = 0;
+    for (unsigned waited = 0; !native_ufs_part_find(kEspPartition, &lun, &first, &blocks); ++waited) {
+      if (waited >= 60) {
+        ::note("firmware: NativeUfs did not publish the \"%s\" partition within 60 s", kEspPartition);
+        return ENXIO;
+      }
+      IOSleep(1000);
+    }
+    Partition *part = IOMallocType(Partition);
+    FatVolume *volume = IOMallocType(FatVolume);
+    int rc = kEspNoMemory;
+    if (part && volume) {
+      part->lun = lun;
+      part->first = first;
+      part->cached = ~0ull;
+      rc = espRead(
+          volume, blocks * 4096, partitionRead, part, [](uint64_t n) { return static_cast<uint8_t *>(IOMallocData(size_t(n))); },
+          [](uint8_t *p, uint64_t n) { IOFreeData(p, size_t(n)); }, &file, &fileBytes);
+    }
+    if (part) IOFreeType(part, Partition);
+    if (volume) IOFreeType(volume, FatVolume);
+    ::note("firmware: %s on the ESP (LUN %u, %llu blocks): %s, %llu bytes", kEspFirmwarePath, lun, (unsigned long long)blocks,
+           espErrorName(rc), (unsigned long long)(rc ? 0 : fileBytes));
+    if (rc) {
+      file = nullptr;
+      fileBytes = 0;
+    }
+    *bytes = file;
+    *size = fileBytes;
+    return rc;
+  }
+  void fwRelease()
+  {
+    if (file) IOFreeData(file, fileBytes);
+    file = nullptr;
+    fileBytes = 0;
+  }
+  void sha256(const uint8_t *p, uint64_t n, uint8_t out[32])
+  {
+    SHA256_CTX c;
+    SHA256_Init(&c);
+    SHA256_Update(&c, p, size_t(n));
+    SHA256_Final(out, &c);
+  }
+  IOBufferMemoryDescriptor *meta = nullptr;
+  uint8_t *fwMetadata(uint64_t bytes, uint64_t *phys)
+  {
+    fwMetadataFree();
+    meta = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous),
+                                                            bytes, 0x0000000ffffff000ull);
+    if (!meta || meta->prepare() != kIOReturnSuccess) {
+      if (meta) meta->release();
+      meta = nullptr;
+      return nullptr;
+    }
+    *phys = meta->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    ::note("firmware: metadata %llu bytes at %#llx", (unsigned long long)bytes, (unsigned long long)*phys);
+    return static_cast<uint8_t *>(meta->getBytesNoCopy());
+  }
+  void fwMetadataFree()
+  {
+    if (!meta) return;
+    meta->complete();
+    meta->release();
+    meta = nullptr;
+  }
+  IOMemoryMap *carveMap = nullptr;
+  volatile uint8_t *carveoutMap(uint64_t pa, uint64_t bytes)
+  {
+    IODeviceMemory *m = IODeviceMemory::withRange(pa, bytes);
+    carveMap = m ? m->map(kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
+    if (m) m->release();
+    return carveMap ? reinterpret_cast<volatile uint8_t *>(carveMap->getVirtualAddress()) : nullptr;
+  }
+  void carveoutUnmap()
+  {
+    if (carveMap) carveMap->release();
+    carveMap = nullptr;
+  }
+
+  // The secure calls (each logged before and after).
+  void scmHold(bool take)
+  {
+    if (take) piano_scm_kernel_take(&gScmShared);
+    else piano_scm_kernel_give(&gScmShared);
+  }
+  int scmPasInit(uint64_t metaPhys)
+  {
+    return secure("PAS init_image(9)", true, [&](Sm8750SmcResult *r) { return Sm8750ScmPasInitImage(&gScm, kPasId, metaPhys, r); });
+  }
+  int scmPasMemSetup(uint64_t pa, uint64_t bytes)
+  {
+    return secure("PAS mem_setup(9)", true, [&](Sm8750SmcResult *r) { return Sm8750ScmPasMemSetup(&gScm, kPasId, pa, bytes, r); });
+  }
+  int scmPasAuth()
+  {
+    return secure("PAS auth_and_reset(9)", true, [&](Sm8750SmcResult *r) { return Sm8750ScmPasAuthAndReset(&gScm, kPasId, r); });
+  }
+  int scmMpVideoVar(uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+  {
+    const uint64_t args[4] = {a, b, c, d};
+    return secure("MP_VIDEO_VAR (0x42000c08)", true, [&](Sm8750SmcResult *r) {
+      return Sm8750ScmCall(&gScm, kScmMpVideoVar, SM8750_SCM_ARGS(kScmMpVideoVarArgs, 0, 0, 0, 0), args, r);
+    });
+  }
+  int scmPasShutdown()
+  {
+    const uint64_t args[4] = {kPasId, 0, 0, 0};
+    return secure("PAS shutdown(9)", true, [&](Sm8750SmcResult *r) {
+      return Sm8750ScmCall(&gScm, SM8750_SCM_FID(0, Sm8750ScmSvcPil, kScmPilShutdownCmd), SM8750_SCM_ARGS(1, 0, 0, 0, 0), args, r);
+    });
+  }
+  int scmRemoteState(uint32_t state)
+  {
+    return secure(state ? "SET_REMOTE_STATE(1, 0)" : "SET_REMOTE_STATE(0, 0)", true,
+                  [&](Sm8750SmcResult *r) { return Sm8750ScmPasSetRemoteState(&gScm, state, 0, r); });
+  }
+
+  // V3's memory: the UC region (non-contiguous XNU pages, a write-combined view) with one scratch page after it, and the table's
+  // four contiguous 4 KiB pages (one 16 KiB XNU page, cacheable, cleaned before the SMMU walks it).
+  IOBufferMemoryDescriptor *ucMem = nullptr, *tableMem = nullptr;
+  IOMemoryMap *ucMap = nullptr;
+  bool dmaAlloc(Dma &d)
+  {
+    const uint64_t bytes = (uint64_t(kUcBytes) + 4096 + 0x3fff) & ~0x3fffull;
+    ucMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, IOOptionBits(kIODirectionInOut), bytes, 0x0000000ffffff000ull);
+    tableMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), 0x4000, 0x0000000fffffc000ull);
+    bool ok = ucMem && tableMem && ucMem->prepare() == kIOReturnSuccess;
+    if (ok && tableMem->prepare() != kIOReturnSuccess) {
+      ucMem->complete();
+      ok = false;
+    }
+    if (ok) {
+      uint8_t *cached = static_cast<uint8_t *>(ucMem->getBytesNoCopy());
+      bzero(cached, bytes);
+      ::cleanToPoc(cached, bytes);
+      for (unsigned i = 0; ok && i < vsmmu::kUcPages; ++i) {
+        d.pages[i] = ucMem->getPhysicalSegment(4096ull * i, nullptr, kIOMemoryMapperNone);
+        ok = d.pages[i] && !(d.pages[i] & 0xfff);
+      }
+      d.scratch = ok ? ucMem->getPhysicalSegment(kUcBytes, nullptr, kIOMemoryMapperNone) : 0;
+      d.tables = static_cast<uint64_t *>(tableMem->getBytesNoCopy());
+      d.tablesPa = tableMem->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+      ucMap = ok ? ucMem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
+      d.uc = ucMap ? reinterpret_cast<volatile uint32_t *>(ucMap->getVirtualAddress()) : nullptr;
+      ok = ok && d.scratch && d.tables && d.tablesPa && d.uc;
+      if (!ok) {
+        if (ucMap) ucMap->release();
+        ucMap = nullptr;
+        ucMem->complete();
+        tableMem->complete();
+      }
+    }
+    if (!ok) {
+      if (ucMem) ucMem->release();
+      if (tableMem) tableMem->release();
+      ucMem = tableMem = nullptr;
+      ::note("dma: no memory for the UC region (%u bytes) or the table", kUcBytes);
+      return false;
+    }
+    ::note("dma: UC region %u bytes in %u pages (first %#llx), write-combined at %p; table %#llx", kUcBytes, vsmmu::kUcPages,
+           (unsigned long long)d.pages[0], (void *)d.uc, (unsigned long long)d.tablesPa);
+    return true;
+  }
+  void dmaFree(Dma &d)
+  {
+    if (ucMap) ucMap->release();
+    if (ucMem) {
+      ucMem->complete();
+      ucMem->release();
+    }
+    if (tableMem) {
+      tableMem->complete();
+      tableMem->release();
+    }
+    ucMap = nullptr;
+    ucMem = tableMem = nullptr;
+    d.uc = nullptr;
+    d.tables = nullptr;
+  }
+};
+
+KernelHw gHw;
+Bringup<KernelHw> gBringup(gHw);
+
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------------ the service
 class PianoVideo : public IOService {
   OSDeclareDefaultStructors(PianoVideo)
   void run();
+  void bringup();
   static void thread(void *self, wait_result_t);
 
  public:
@@ -250,7 +674,10 @@ bool PianoVideo::start(IOService *provider)
        "%#x/%#x, carveout %#llx)",
        gArgs.level, gArgs.cc, gArgs.smmu, gArgs.carveout, gArgs.delay, gArgs.repeat, gArgs.samples, (unsigned long long)kIris,
        (unsigned long long)kVideoCc, kIrisSpi, kStreamFirst, kStreamSecond, (unsigned long long)kCarveout);
-  if (gArgs.level > 1) note("piano-video=%u: only level 1 exists (docs/drivers/video.md section 8); running level 1", gArgs.level);
+  if (gArgs.level > 4) note("piano-video=%u: the highest level is 4 (docs/drivers/video.md section 8); running the survey only", gArgs.level);
+  if (gArgs.level >= 2 && gArgs.level <= 4)
+    note("levels 2-4: cycles=%u hold-ms=%u idle-ms=%u resumes=%u unload=%u stop=%u mmcx-floor=%#x", gArgs.cycles, gArgs.holdMs,
+         gArgs.idleMs, gArgs.resumes, gArgs.unload, gArgs.stop, gArgs.mmcxFloor);
   note("level 1: loads only, nothing written");
   setProperty("piano-video", gArgs.level, 32);
   thread_t t = nullptr;
@@ -318,6 +745,30 @@ void PianoVideo::run()
          k.gccAhb, k.gccAxi0, k.gccAxi1, k.mvs0cGdsc, k.mvs0Gdsc, k.pllMode, k.mvs0);
   }
   stage(6, "done");
-  note("done: %llu MMIO loads, 0 stores; %u pages mapped, %u map failures", (unsigned long long)gLoads, gPageCount, gMapFailures);
-  unmapAll();
+  note("done: %llu MMIO loads, %llu stores; %u pages mapped, %u map failures", (unsigned long long)gLoads, (unsigned long long)gStores,
+       gPageCount, gMapFailures);
+  if (gArgs.level >= 2 && gArgs.level <= 4) bringup();
+  unmapAll();   // the register pages only: V3's steady state keeps its UC region and table (KernelHw), and a later level maps again
+}
+
+void PianoVideo::bringup()
+{
+  Options o;
+  o.level = gArgs.level;
+  o.cycles = gArgs.cycles;
+  o.holdMs = gArgs.holdMs;
+  o.idleMs = gArgs.idleMs;
+  o.resumes = gArgs.resumes;
+  o.unload = gArgs.unload != 0;
+  o.stop = int(gArgs.stop);
+  o.mmcxFloor = gArgs.mmcxFloor;
+  note("level %u: writes start here; every register write is logged the first time it is written", gArgs.level);
+  const uint64_t loads0 = gLoads, stores0 = gStores;
+  const int rc = gBringup.run(o);
+  setProperty("piano-video-bringup", gBringup.rep.summary);
+  note("bring-up: %s", gBringup.rep.summary);
+  note("bring-up %s: %llu MMIO loads, %llu stores (%u distinct writes logged, %u repeats); %u pages mapped, %u map failures; DRV-2 "
+       "requests %u",
+       rc ? "FAILED" : "done", (unsigned long long)(gLoads - loads0), (unsigned long long)(gStores - stores0), gBringup.log.logged,
+       gBringup.log.repeats, gPageCount, gMapFailures, gBringup.votes.requests);
 }

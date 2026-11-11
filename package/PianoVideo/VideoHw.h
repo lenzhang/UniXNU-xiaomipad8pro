@@ -110,12 +110,153 @@ constexpr uint64_t kIovaLimit = 0xe0000000;
 constexpr const char *kFirmwareName = "qcom/sm8750/vpu35_4v.mbn";
 constexpr uint32_t kFirmwareBytes = 2409160;
 
-// --------------------------------------------------------------------------------------------------- HFI (levels 4+, not used here)
+// --------------------------------------------------------------------------------------------------------- HFI (level 4 = V3)
 // iris_hfi_queue.h: one queue table (a 288-byte table header, then three 56-byte queue headers: command, message, debug; 456
 // bytes), then three queues of 1024 x 64 x 16 bytes (1 MiB each, variable-size packets in 32-bit words, read/write indices in words); the SFR is
 // 4 KiB. iris_hfi_gen2_packet.h: a 32-byte header {size, session_id, header_id, reserved[4], num_packets} followed by packets of
 // a 32-byte {size, type, flags, payload_info, port, packet_id, reserved[2]} plus the payload.
 constexpr uint32_t kHfiQueueBytes = 1024u * 64u * 16u;
 constexpr uint32_t kHfiCmdInit = 0x01000001, kHfiPropImageVersion = 0x03000001;
+
+// ============================================================================================================================
+// Levels 2-4 of piano-video (the ladder's V1-V3, docs/drivers/video.md section 8). The facts the writes take, each with its source.
+// ============================================================================================================================
+
+// ------------------------------------------------------------------------------------------------- GCC: the video branches (V1)
+// gcc: gcc_video_axi0_clk / gcc_video_axi1_clk are BRANCH_HALT_SKIP with hardware clock gating at bit 1 of the same register; their
+// resets "bus0" / "bus1" (DT resets <&gcc 0x1d>, <&gcc 0x1e> = GCC_VIDEO_AXI0_CLK_ARES / _AXI1_CLK_ARES) are bit 2 of those registers.
+// gcc_video_ahb_clk / gcc_video_xo_clk get CLK_EN at Linux's probe (qcom_branch_set_clk_en) and are never gated by Linux.
+constexpr uint32_t kCbcrEnable = 1u << 0, kCbcrHwcg = 1u << 1, kCbcrAres = 1u << 2, kCbcrOff = 1u << 31;
+constexpr uint32_t kCbcrNocFsmShift = 28, kCbcrNocFsmOn = 2;   // clk-branch.h: CBCR_NOC_FSM_STATUS 30:28, FSM_STATUS_ON
+constexpr uint32_t kBranchHaltUs = 200;                        // clk_branch_wait: 200 x 1 us
+constexpr uint32_t kBranchVotedOffUs = 10;                     // a voted branch's disable: a 10 us delay instead of a poll
+
+// ------------------------------------------------------------------------------------------------------- VIDEO_CC (V1)
+// PLL0, Taycan ELU (clk-alpha-pll.c clk_alpha_pll_regs[TAYCAN_ELU], clk_lucid_evo_pll_configure, alpha_pll_lucid_evo_enable /
+// _disable / _prepare; clk_alpha_pll_taycan_elu_ops = clk_alpha_pll_lucid_evo_ops):
+constexpr uint32_t kPllStatus = 0x0c, kPllUserCtl = 0x18, kPllUserCtlU = 0x1c, kPllConfigCtl = 0x20, kPllConfigCtlU = 0x24,
+                   kPllConfigCtlU1 = 0x28, kPllTestCtl = 0x2c, kPllTestCtlU = 0x30;
+constexpr uint32_t kPllOutctrl = 1u << 0, kPllResetN = 1u << 2, kPllPcalNotDone = 1u << 8, kPllLockDet = 1u << 31;
+constexpr uint32_t kPllStandby = 0, kPllRun = 1;
+constexpr uint32_t kPllOutMask = 7, kPllEnableVoteRun = 1u << 25;   // USER_CTL: the outputs; FSM (voted) mode
+constexpr uint32_t kPllCalL = 0x44u << 16;                          // TRION_PLL_CAL_VAL in L_VAL 31:16 (no cal_l in the config)
+// videocc-sm8750.c video_cc_pll0_config (written only when non-zero, as clk_alpha_pll_write_config does; skipped altogether when the
+// PLL already runs: "If the bootloader left the PLL enabled it's likely that there are RCGs that will lock up if we disable it").
+constexpr uint32_t kPll0ConfigCtl = 0x19660387, kPll0ConfigCtlU = 0x098060a0, kPll0ConfigCtlU1 = 0xb416cb20, kPll0UserCtlU = 0x2;
+constexpr uint32_t kPllLockUs = 1500;                               // wait_for_pll: 1500 x 1 us for LOCK_DET
+// RCG2 (clk-rcg2.c): CMD UPDATE 0, ROOT_EN 1, ROOT_OFF 31; CFG source 10:8, half-divider 4:0 (hid_width 5), mode 13:12, HW_CLK_CTRL 20.
+constexpr uint32_t kRcgUpdate = 1u << 0, kRcgRootEn = 1u << 1, kRcgRootOff = 1u << 31;
+constexpr uint32_t kRcgCfgMask = 0x1fu | 7u << 8 | 3u << 12 | 1u << 20;
+// video_cc_mvs0_clk_src F(720000000, P_VIDEO_CC_PLL0_OUT_MAIN, 1, 0, 0): source 1 (parent_map_1), pre_div 2 * 1 - 1 = 1. Shared
+// RCG (clk_rcg2_shared_ops): enable = force ROOT_EN, CFG, UPDATE, release; disable = park on the safe source (XO, CFG 0) the same way.
+constexpr uint32_t kMvs0Cfg720 = 1u << 8 | 1u, kRcgCfgXo = 0;
+constexpr uint32_t kRcgUpdateUs = 500;                              // update_config / clk_rcg2_set_force_enable: 500 x 1 us
+constexpr uint32_t kMvs0DivFor240 = 2;                              // video_cc_mvs0_div_clk_src (read only): 720 MHz / (2 + 1)
+// video_cc_mvs0_freerun_clk is a clk_mem_branch: mem_enable_reg 0x8090 bit 3, inverted (cleared to enable), ack 11:10.
+constexpr uint32_t kMemEnable = 1u << 3, kMemAck = 3u << 10;
+// GDSC (gdsc.c), both video GDSCs POLL_CFG_GDSCR | RETAIN_FF_ENABLE, en_rest_wait 2, en_few_wait 2, clk_dis_wait 6; MVS0 also
+// HW_CTRL_TRIGGER (hardware mode switched by the iris driver: on after the firmware boots, off before the power-off).
+constexpr uint32_t kGdscCollapse = 1u << 0, kGdscHwControl = 1u << 1, kGdscSwOverride = 1u << 2, kGdscRetainFf = 1u << 11,
+                   kGdscPwrOn = 1u << 31;
+constexpr uint32_t kGdscWaitMask = 0xfu << 20 | 0xfu << 16 | 0xfu << 12, kGdscWaits = 2u << 20 | 2u << 16 | 6u << 12;
+constexpr uint32_t kGdscPowerUpComplete = 1u << 16, kGdscPowerDownComplete = 1u << 15;   // CFG_GDSCR (GDSCR + 4)
+constexpr uint32_t kGdscPollUs = 2000;                              // STATUS_POLL_TIMEOUT_US
+// qcom_cc_really_probe with video_cc_sm8750_driver_data: PLL0 configured, the critical branches enabled, clk_sm8750_regs_configure.
+constexpr uint32_t kCcShifterDoneMvs0 = 0x8074, kCcShifterDoneMvs0c = 0x8040, kCcShifterDoneBits = 0x1fu << 21;   // 25:21 = 0xf..
+constexpr uint32_t kCcSpare9f24 = 0x9f24;                           // bit 0 set at probe
+// DT resets "core" <&videocc 5> = VIDEO_CC_MVS0C_FREERUN_CLK_ARES {0x805c, 2}, "vcodec0_core" <&videocc 4> = MVS0_FREERUN_CLK_ARES
+// {0x808c, 2}; reset_control_bulk_reset = assert, 1 us, deassert (qcom_reset).
+
+// ------------------------------------------------------------------------------------------------------- the core (V1, V3)
+// iris_vpu3x.c iris_vpu33_power_off_hardware (VPU 3.5's codec power-off), iris_vpu_common.c iris_vpu35_vpu4x_power_off_controller,
+// iris_vpu_set_preset_registers, iris_vpu_boot_firmware, iris_vpu_prepare_pc.
+constexpr uint32_t kVcodecIdle = 1u << 22;                          // VCODEC_SS_IDLE_STATUSN: readl_poll_timeout(.., 2000, 20000)
+constexpr uint32_t kIdlePollUs = 20000, kIdleStepUs = 2000;
+constexpr uint32_t kLpiReq = 1u << 0;                               // REQ_POWER_DOWN_PREP
+constexpr uint32_t kLpiDone = 1u << 0, kLpiDeny = 1u << 1, kLpiActive = 1u << 2;
+constexpr uint32_t kLpiPollUs = 2000, kLpiStepUs = 200;             // readl_poll_timeout(.., 200, 2000)
+constexpr unsigned kLpiRetries = 1000;                              // "Retry up to 1000 times as recommended by hardware documentation"
+constexpr uint32_t kLpiRetryUsCodec = 15, kLpiRetryUsCtl = 10;      // udelay(15) (codec MVP NoC), usleep_range(10, 20) (video-ctl NoC)
+constexpr uint32_t kBridgeSwReset = 1u << 0, kBridgeHwResetDisable = 1u << 1;
+constexpr uint32_t kX2RpmhMaskAll = 3;                              // MSK_SIGNAL_FROM_TENSILICA | MSK_CORE_POWER_ON
+constexpr uint32_t kCorePowered = 1u << 1;                          // WRAPPER_CORE_POWER_STATUS bit 1
+constexpr uint32_t kCtrlStatusInitDone = 1u << 0, kCtrlStatusErrorMask = 0xfe, kCtrlStatusErrorUcRegion = 0x4,
+                   kCtrlStatusPcReady = 0x100, kCtrlStatusIdle = 1u << 30;
+constexpr unsigned kBootPolls = 1000;                               // iris_vpu_boot_firmware: 1000 x usleep_range(50, 100)
+constexpr uint32_t kBootPollUs = 100;
+constexpr uint32_t kPcPollUs = 2500, kPcStepUs = 250;               // iris_vpu_prepare_pc: readl_poll_timeout(.., 250, 2500)
+constexpr uint32_t kUcRegionAlign = 1u << 20, kSfrBytes = 4096, kSfrCoreArch = 1;   // SFR_ADDR = SFR IOVA + VIDEO_ARCH_LX (1)
+constexpr uint32_t kH2xEnable = 1, kSoftIntH2a = 1;                 // HOST2XTENSA_INTR_ENABLE; 1 << CPU_IC_SOFTINT_H2A_SHFT (0)
+constexpr uint32_t kHfiResponseMs = 1000;                           // HW_RESPONSE_TIMEOUT_VALUE
+constexpr uint32_t kIdleCollapseMs = 1500;                          // AUTOSUSPEND_DELAY_VALUE = HW_RESPONSE_TIMEOUT_VALUE + 500
+
+// ------------------------------------------------------------------------------------------------------------- RPMh (V1)
+// The AOP command database (DT aop-cmd-db@81c60000, 0x20000, no-map) and the apps RSC's DRV-2 (DT rsc@16500000 "drv-2" at 0x16520000,
+// tcs-offset 0xd00, tcs-distance 0x2a0, three ACTIVE TCSes first): the same constants as PianoA830's Sm8750Rpmh.h and PianoWifi.
+constexpr uint64_t kCmdDb = 0x81c60000, kCmdDbBytes = 0x20000;
+constexpr uint64_t kRscDrv2 = 0x16520000, kRscDrv2Bytes = 0x10000;
+constexpr uint32_t kRscTcsBlock = 0xd00, kRscTcsStride = 0x2a0;
+constexpr unsigned kRscActiveTcs = 3;
+// The resources (rpmhpd.c sm8750: mxc "mxc.lvl", mmcx_w_cx_parent "mmcx.lvl"; interconnect sm8750.c: BCM "MM1", enable_mask BIT(0)).
+constexpr const char *kArcMxc = "mxc.lvl", *kArcMmcx = "mmcx.lvl", *kBcmMm1 = "MM1";
+// Corners (RPMH_REGULATOR_LEVEL_*; DT rpmhpd opp table): what V1-V3 need. VIDEO_CC itself: MMCX and MXC at low_svs (its
+// required-opps); the 240 MHz OPP: MXC svs (0x80), MMCX low_svs_d1 (0x38). So MXC >= 0x80, MMCX >= 0x40.
+constexpr uint32_t kVlvlLowSvsD1 = 0x38, kVlvlLowSvs = 0x40, kVlvlSvs = 0x80, kVlvlNomL1 = 0x140;
+constexpr uint32_t kMxcNeed = kVlvlSvs, kMmcxNeed = kVlvlLowSvs;
+// MMCX also feeds the boot framebuffer's display (DT mdss: power-domain MMCX; the MDP's OPP at 575 MHz requires NOM_L1, which
+// ABL leaves it at; docs/drivers/gpu.md). Nothing natively votes MMCX, and a DRV-2 vote replaces the DRV's earlier one: a vote below
+// NOM_L1 could take the display's rail away. So the MMCX vote is never below this floor and is never lowered under it.
+constexpr uint32_t kMmcxDisplayFloor = kVlvlNomL1;
+// BCM MM1 (qnm_video_mvp, qns_mem_noc_sf; bcm-voter.c bcm_aggregate_mask: x 0, y enable_mask when any of its nodes has bandwidth):
+// on = commit | valid | y 1, off = commit only (valid 0). The display rides MM0; the path's SH1 (qnm_mnoc_sf, also chm_apps: the
+// CPUs' own traffic, so necessarily on), SH0/MC0/ACV (DDR: PianoA830's host vote or the boot's, both above anything V1-V3 move) and
+// CN0 (cpu-cfg: keepalive) are not voted here (docs/drivers/video.md section 12.1).
+constexpr uint32_t kBcmMm1On = 0x60000001, kBcmMm1Off = 0x40000000;
+constexpr uint32_t kDrv2Tag = 0x56494445;                           // "VIDE": PianoVideo in sm8750_rpmh_drv2_owner
+
+// ------------------------------------------------------------------------------------------------- the firmware file (V2)
+// Read at run time from the ESP (GPT "esp", partition 37 on LUN 0, FAT32 with 4 KiB sectors: docs/persistent-boot.md), where
+// tooling/persist/build-esp.py --video-firmware puts the owner's copy after checking it against the pin below. Never in this
+// repository or a build output; never disassembled.
+constexpr const char *kEspPartition = "esp";
+constexpr const char *kEspFirmwarePath = "EFI/UniXNU/firmware/qcom/sm8750/vpu35_4v.mbn";
+constexpr uint8_t kFirmwareSha256[32] = {   // xiaomipad-8pro-mainline firmware/piano-iris.json
+    0x95, 0xc5, 0x88, 0x2f, 0x9b, 0x66, 0xb9, 0x3a, 0xd2, 0x63, 0x56, 0x04, 0xb7, 0xdb, 0x56, 0x3c,
+    0xc3, 0x10, 0x48, 0x1e, 0x01, 0x7f, 0xa6, 0xb8, 0x2e, 0x0c, 0xe6, 0xcb, 0xb9, 0xea, 0xe0, 0x1b};
+constexpr uint32_t kScmPilShutdownCmd = 0x06;                       // QCOM_SCM_PIL_PAS_SHUTDOWN
+constexpr uint32_t kScmMpVideoVarArgs = 4;                          // QCOM_SCM_ARGS(4, VAL, VAL, VAL, VAL)
+constexpr uint32_t kRemoteStateSuspend = 0, kRemoteStateResume = 1; // iris_set_hw_state: qcom_scm_set_remote_state(resume, 0)
+
+// ------------------------------------------------------------------------------------------------------ the SMMU bank (V3)
+// The streams' own stage-1 bank: IOVAs from 0x80000000 (above the content-protection range MP_VIDEO_VAR declares, below the core's
+// 0xe0000000 limit); the UC region (queue table + three queues + the SFR) at its start, 1 MiB aligned, declared 4 MiB
+// (ALIGN(SFR + queues, 1 MiB) as iris_vpu_setup_ucregion_memory_map computes it).
+constexpr uint64_t kXnuDramBase = 0x8c0000000ull, kXnuDramEnd = 0xc00000000ull;   // dts/piano.dts memory@8c0000000 (DpuHw.h)
+constexpr uint32_t kIovaBase = 0x80000000u;
+constexpr uint32_t kQueueTableBytes = 456;                          // 288 + 3 x 56
+constexpr uint32_t kQueueAreaBytes = (kQueueTableBytes + 3 * kHfiQueueBytes + 4095) & ~4095u;   // 0x301000
+constexpr uint32_t kSfrOffset = kQueueAreaBytes;                    // the SFR right after the queues, inside the UC region
+constexpr uint32_t kUcBytes = kQueueAreaBytes + kSfrBytes;          // 0x302000 bytes backed by memory
+constexpr uint32_t kUcRegionBytes = (kUcBytes + kUcRegionAlign - 1) & ~(kUcRegionAlign - 1);   // 0x400000 declared
+static_assert(kUcRegionBytes == 0x400000, "the UC region the firmware is told about");
+static_assert(kIovaBase % kUcRegionAlign == 0 && kIovaBase + kUcRegionBytes <= kIovaLimit, "the window");
+
+// ---------------------------------------------------------------------------------------------------------- HFI gen2 (V3)
+// iris_hfi_common.h / iris_hfi_gen2_defines.h / iris_hfi_gen2_packet.c / iris_hfi_queue.c / ubwc_config.c (sm8750_data).
+constexpr uint32_t kHfiHeaderBytes = 32, kHfiPacketBytes = 32, kHfiCorePacketBytes = 4096;   // IFACEQ_CORE_PKT_SIZE
+constexpr uint32_t kHfiCmdPowerCollapse = 0x01000002, kHfiCmdBegin = 0x01000000, kHfiCmdEnd = 0x01ffffff;
+constexpr uint32_t kHfiPropIntraFramePc = 0x03000002, kHfiPropUbwcMaxChannels = 0x03000003, kHfiPropUbwcMalLength = 0x03000004,
+                   kHfiPropUbwcHbb = 0x03000005, kHfiPropUbwcSwzl1 = 0x03000006, kHfiPropUbwcSwzl2 = 0x03000007,
+                   kHfiPropUbwcSwzl3 = 0x03000008, kHfiPropUbwcBankSpreading = 0x03000009;
+constexpr uint32_t kHfiPropBegin = 0x03000000, kHfiPropEnd = 0x03ffffff, kHfiSysErrorBegin = 0x05000000, kHfiSysErrorEnd = 0x05ffffff;
+constexpr uint32_t kHfiHostIntr = 1, kHfiHostResponse = 2, kHfiHostNonDiscardable = 4, kHfiHostGetProperty = 8;
+constexpr uint32_t kHfiFwSuccess = 1, kHfiFwInformation = 2, kHfiFwSessionError = 4, kHfiFwSystemError = 8;
+constexpr uint32_t kHfiPayloadNone = 0, kHfiPayloadU32 = 1, kHfiPortNone = 0, kHfiArchLx = 1;
+constexpr uint32_t kHfiVersionChars = 128;                          // IRIS_FW_VERSION_LENGTH
+// SM8750 UBWC (ubwc_config.c sm8750_data: UBWC 5.0, swizzle 6, bank spread, HBB 16, macrotile): max channels 8 (macrotile), MAL 32
+// (not 64-byte min access: that is UBWC 1.0 only), HBB 16, swizzle level 1 off, 2 on, 3 on, bank spreading on.
+constexpr uint32_t kUbwcMaxChannels = 8, kUbwcMalLength = 32, kUbwcHbb = 16, kUbwcSwzl1 = 0, kUbwcSwzl2 = 1, kUbwcSwzl3 = 1,
+                   kUbwcBankSpreading = 1;
+constexpr uint32_t kIfaceqDefaultHeader = 0x0101;                   // IFACEQ_DFLT_QHDR
 
 }  // namespace pianovideo

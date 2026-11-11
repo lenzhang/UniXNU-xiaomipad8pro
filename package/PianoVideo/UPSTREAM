@@ -1,5 +1,44 @@
-PianoVideo is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1 only: a read-only survey. What it takes from other
-work, and from where:
+PianoVideo is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1: a read-only survey; levels 2-4 (2026-11-11): the
+ladder's V1 power, V2 firmware through PAS 9, V3 the SMMU bank and the HFI handshake (docs/drivers/video.md section 12). What it
+takes from other work, and from where:
+
+Levels 2-4, copied byte for byte but for their provenance lines (tooling/k27/build-native-piano-video.sh checks it; their owners
+are not modified):
+  package/PianoPower/FatVolume.c (sha256 6e00c31149c4d52733bce0eea360e2db3647c32f01f14ae7c4550ac641f62779) and FatVolume.h
+    (sha256 a438bcc5519bacfbfa6b6c55646fe4a3f7787f37a50c52103d8094c6871b67e7) -> FatVolume.c / FatVolume.h (BSD-2-Clause-Patent;
+    PianoPower took them unchanged from UniXNU-sheng, its UPSTREAM): the ESP's FAT32 for the firmware file.
+  package/PianoPower/QcomMdt.c (sha256 706f4a86624d119282683287bf408ae679275368f9bcc28d6f4ba652d3ad377a) and QcomMdt.h
+    (sha256 22d8e567b285e254becf1af41f8ba0c9c1cfcc5295f6246b4b9d09e5fef88477) -> QcomMdt.c / QcomMdt.h (BSD-2-Clause-Patent; the
+    same origin): the signed image's headers, metadata, span and segment places.
+  package/PianoPower/Sm8750Scm.c (sha256 6e2c36fc87b68e684223988973ad27ca0b591b3119838abf0d2553ed9c79cc2e) and Sm8750Scm.h
+    (sha256 0715cbd4e24162ab2b20dcc3c600d8a5d6a7a3f254814afc1983c2deaee1ac7b) -> Sm8750Scm.c / Sm8750Scm.h: Adreno830's SCM client
+    (unixnu-research/Adreno830 main 1a1321056ffc5428ae925f4680093718b46ca7c2, platform/sm8750), MIT; the notice is in LICENSE.
+
+Levels 2-4, re-expressed (nothing linked; these files are BSD-2-Clause-Patent, this repository's):
+  package/PianoA830/adreno830/platform/sm8750/Sm8750Rpmh.c (sha256 48195157ca191fe7667c491575f58bb4007393cbcabc56091f5945194a479f20)
+    and Sm8750Rpmh.h (sha256 b8f948fb6359368e79e00a7fe310b3daede1b9078b072d0cdfece469ddb4787f), MIT (Adreno830's, this repository's
+    copy): the cmd-db layout and lookup rules (a unique name, its slave type in the address, the aux data inside the snapshot), the
+    ARC table's count up to the zero padding, the corner rule (the first hlvl whose vlvl reaches the request), the BCM command
+    encoding, and Sm8750RpmhWriteActive's protocol (the DRV-2 owner word, the version-selected layout, the idle-TCS test, the
+    masked IRQ_ENABLE bit, MSGID/ADDR/DATA, WAIT_FOR_CMPL, CMD_ENABLE, AMC mode, read-backs, the trigger, the completion test, the
+    clean-up, a TCS that never completed left as evidence) -> VideoRpmh.h, written fresh around the video's three resources.
+  package/PianoWifi/PianoWifi.cpp (sha256 138c48f3b5841b95a070a0a5fa0a86bf7cac429e19bb880f280da2e68fbd2551) and
+    package/PianoPower/PianoAdsp.cpp (sha256 9b90b3d9ed1f53c12baee6378f653b7143c1b0c19dca754f24aa85c52900918a): how a kext imports
+    PianoA830's DRV-2 owner word and takes it (compare-exchange for its own tag, 10 us steps, at most 2 s), PianoAdsp.cpp's secure()
+    wrapper (a line before each call with 20 ms for the console, one after) and its Sm8750Scm set-up (the ops lock taking the
+    kernel-wide secure-call lock, the 30 s budget) -> PianoVideo.cpp.
+  package/PianoUsbHost/SmmuIdentity.h (sha256 d0cdab46fc2815d45895d6c652e610b0d9969b5bdbed6496aea3ecd5b4cba949): the plan/apply
+    split, the geometry checks, the bank search from banks - 2 down skipping referenced and translating banks, the stage-1 context
+    bank's words in Linux's order (CBAR stage 1 MemAttr WB BPSHCFG NSH, CBA2R VA64, TCR2, TCR, TTBR0/1, CONTEXTIDR, MAIR, SCTLR
+    M/TRE/AFE/CFRE/ASIDPNE), S2CR before SMR, the bank's TLBIALL/TLBSYNC and the global TLBIALLNSNH/sTLBGSYNC with non-zero values,
+    bounded waits -> VideoSmmu.h (two streams, the highest free groups, a translated window instead of an identity map, the
+    teardown back as found).
+  package/PianoDpu/DpuSmmu.h (sha256 9cc7d830e27084905081222f6ab4ebe17786709dac869649e706504303f1ae30): the 4 KiB-granule table
+    with a 32-bit input (T0SZ 32, from level 1), TCR2 SEP 7 (SEP 0 faults bit-31 IOVAs under this hypervisor family), the
+    non-cacheable walks over tables cleaned to the PoC, MAIR0 0x44, the fault registers (FSR/FAR/FSYNR0, RESUME for a stalled
+    one), the software walk as a self-check -> VideoSmmu.h.
+  package/PianoSensors/PianoSensors.cpp (sha256 5525fe010130a20159b3ce6749cdecbae245237b8090198b64c930dd0e27f8de): finding the ESP
+    through NativeUfs (GPT "esp") and partitionRead over native_ufs_part_read -> PianoVideo.cpp KernelHw::fwRead.
 
 UniXNU-piano (this repository), BSD-2-Clause-Patent:
   package/PianoDpu/PianoDpu.cpp (sha256 8f6cbd007f692b3408a738b45484266196c4eae397b80e018ffbc5443764dc40): the kext's shape (probe
@@ -30,11 +69,36 @@ piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01):
     wrapper version word's layout at the v6 base, inferred for VPU 3.5);
   drivers/iommu/arm/arm-smmu/arm-smmu.h (IDR0 fields), arch/arm64/boot/dts/qcom/sm8750.dtsi and sm8750-xiaomi-piano.dts (the node,
     the OPP table, the firmware name).
+  For levels 2-4, same tree and terms (sha256 of the files read): iris_vpu3x.c f0c17bc41ec68daa070a7249af54e387ff3c4f24e3a4d2282c2c96761498b68a
+    (iris_vpu35_power_on_hw/_off_hw, iris_vpu33_power_off_hardware), iris_vpu_common.c
+    d217c2ca61cfc0de6715b54a582820f46de4d8bf237c56f062c89dd85e14f4a5 (power on/off, the VPU 3.5 controller sequences, the boot
+    words, prepare-PC), iris_resources.c dabb614bece8ef7e84edc0ee2c7d7723a63e4c00e177c1b1ba7f5cb65788d221 (the bandwidth and power
+    domain calls), iris_core.c 7289f6fd6da8354b92092ba759aa023cf6a33d8f29eb9303a86b3808788067e7 (the init order),
+    iris_hfi_common.c 5db9d87c45f7bf54cb99dae3f5ae097c794b3ad28f03f6b8c4e486e2d39a9a97 (suspend/resume), iris_firmware.c (above),
+    iris_hfi_queue.h a4b2586de5f9f1fecc8f5217cd0ef3e57412d33067df05c88240870a2113694d and .c
+    42b1687d106f61ba48e05552715de41ca6994aee6ca80316bc25707ef7001ef8 (the table, headers, ring reads and writes),
+    iris_hfi_gen2_packet.c d5c356b55c76d75d2f1d69d873312aaa18282e61f2052c38a3ecdb653abba5fc (the system packets),
+    iris_hfi_gen2_response.c 4f223485ad37304188db5fffa542f0e465e683232fb5195642580a0252f459da (validation, the system answers, the
+    version string, the debug queue), iris_hfi_gen2_defines.h b1ae5f553d7307840512e37eb55a515ffb743d79c9517b81ceffb53157cfa0b9;
+    drivers/clk/qcom/videocc-sm8750.c (above), clk-alpha-pll.c d81f628af746854dbdd6ef8b0f2e36f85ba38858404690759199a026cac77109
+    (Lucid EVO configure/enable/disable/prepare), clk-rcg2.c 4a1c8f29e2d4a80ef14f5c58f14de7a3576ea591c84f091b59cf5257e303f947 (the
+    shared RCG), clk-branch.c d29259eb77a5d1d6a07adf4aa835588f8e04d1fa3c14be2b7d4162cce737abfa (halt checks, the memory branch),
+    gdsc.c 04c66019948835d4b0def6f96d940500a85eb3e9c277f69de06c953f7d6475d2 (init, enable, disable, hardware mode), common.c
+    ea4541695d6567d8a7e3b3ff450c50353c278a44777fc6565f98616a28f30949 (the probe's order); drivers/pmdomain/qcom/rpmhpd.c
+    5eeaaebd7772655a0168a8ac70db04a7b628bf7509b8e9cd14f3c57b7a4cb169 (mxc, mmcx with its cx parent, the corner choice);
+    drivers/interconnect/qcom/sm8750.c 345dc0edbf96f32f880d77397baf225ac4473bae5ba05bd84b462447b5159815 (the video path's nodes and
+    BCMs), bcm-voter.c f482cad4f35ff5c144ce802baf9f8d9591770830a860feb79be9fc6a1c80aa83 (the enable-mask vote, the command
+    encoding); drivers/soc/qcom/ubwc_config.c 8d98a537c024f023039a09e3a32d02e6fa53590314a1f65806bc93d83d990d48 (SM8750's UBWC);
+    drivers/firmware/qcom/qcom_scm.c 0440862805d3c25b62de3772c6f6877ac4ad578221272d2089785c6bf2addcd5 (MP_VIDEO_VAR, PAS
+    shutdown, SET_REMOTE_STATE arguments).
 
 Data: the piano boot DT (out/inputs/piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840): the
 Iris node (address, interrupt, streams, firmware-name, memory-region), the videocc node, the video@9c300000 carveout, the apps
-SMMU's dma-coherent property, the video thermal zone. xiaomipad-8pro-mainline firmware/piano-iris.json: the firmware's name, size
-and pin (the file itself is the owner's, read at run time, never in this repository).
+SMMU's dma-coherent property, the video thermal zone; for levels 2-4 the node's resets and interconnects, the rpmhpd OPP levels
+(the 240 MHz OPP's required MXC svs / MMCX low_svs_d1, VIDEO_CC's low_svs), the mdss/DPU OPP table (575 MHz requires MMCX
+NOM_L1: the display floor), the cmd-db and DRV-2 reservations. xiaomipad-8pro-mainline firmware/piano-iris.json: the firmware's
+name, size and pin (the file itself is the owner's, read at run time, never in this repository; when it is on the build Mac,
+tests/bringup_host.cpp hashes it and parses its ELF and program headers, as the secure world's loader takes them).
 
-Not read and not used for anything: any Qualcomm or Xiaomi binary (vpu35_4v.mbn is data for the secure world's loader, never
-disassembled), Apple binaries beyond public headers and class/symbol names.
+Not read and not used for anything: any Qualcomm or Xiaomi binary beyond that (vpu35_4v.mbn is data for the secure world's
+loader, never disassembled), Apple binaries beyond public headers and class/symbol names.
