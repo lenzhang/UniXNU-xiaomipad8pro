@@ -1,0 +1,25 @@
+{
+  "name": "PianoBluetooth",
+  "bundle": "com.unixnu.driver.PianoBluetooth",
+  "version": "1.0.0",
+  "objects": "@OUT@/native-kexts/PianoBluetooth/objects.json",
+  "start": "_native_kext_start",
+  "stop": "_native_kext_stop",
+  "libraries": {
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.private": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0"
+  },
+  "personalities": {
+    "PianoBluetooth": {
+      "CFBundleIdentifier": "com.unixnu.driver.PianoBluetooth",
+      "IOClass": "PianoBluetooth",
+      "IOProviderClass": "IOPlatformExpertDevice",
+      "IOProbeScore": 100,
+      "IOMatchCategory": "PianoBluetooth"
+    }
+  }
+}
