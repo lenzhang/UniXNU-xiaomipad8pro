@@ -28,15 +28,30 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
     and the vtable check of tooling/k27/kext/PianoKeyboard.json. Same overrides plus setReport (the LED output report).
   package/PianoPower/Gauge.h: the software I2C bus (generalised in BitI2c.h: writes, repeated-START reads, a configurable clock).
   package/PianoPower/QcomRpmh.c and PianoAdsp.cpp: the cmd-db lookup and the RSC layouts (CmdDb.h), the active TCS vote sequence
-    (PianoKeyboard.cpp vote()), the apps RSC and cmd-db addresses.
+    (PianoKeyboard.cpp voteLocked()), the apps RSC and cmd-db addresses, and (f53192b) how a vote holds the DRV-2 lock.
+  package/PianoA830/adreno830/platform/sm8750/Sm8750Rpmh.h ("DRV-2 lock"): the owner word sm8750_rpmh_drv2_owner and its protocol
+    (compare-exchange 0 for a tag, 10 us between tries, at most 2 s, store 0), used by PianoKeyboard.cpp vote() with the tag 'KBRD'.
 
 Read as a specification only, never copied (GPL-2.0): Linux hid-nanosic-wn8030 (blu-sharky/linux-piano, map220v, GPL-2.0-only), as
 built in the v1.1.0 Ubuntu release (debs/linux-image-7.2.15-piano58_7.2.15-58.1_arm64.deb, sha256
 53b55b325519be948a598d0a929d2003341439ef157ec556097e03d825a352b7; drivers/hid/hid-nanosic-wn8030.ko sha256
 8434ebe582b1abc52c57146fb049c7340d0ca9a7cc2ef0b2bd56a4b2682f5d28): the piano frame packing and report sizes, the runtime command
 register, the attach bit, the touchpad device made on the first 0x19 report, the commands sent on attach, and the report layouts as
-its piano HID descriptors declare them. The macOS descriptors (HidDescriptors.h) are written from the HID 1.11 specification and the
-HID Usage Tables.
+its piano HID descriptors declare them; 2026-11-11 also the frame check (type 0x39/0x4a/0x5b/0x6c), the attach bit (byte 9 bit 0,
+tablet mode its inverse), the keyboard and consumer reports passed through (3 consumer bytes), the touchpad device on the first 0x19
+report and the mouse reports dropped after it, the auth kinds and lengths. Also read as a specification only (GPL-2.0), the newer
+port with the touchpad made at attach, as embedded in Project-SunUEFI patches/linux/7.3/0003-input-wireless.patch (sha256
+b3cb4f645a654c94886e7c6101697c346ff70879edc8b741069eb1b3653fdf0d) and its follow-ups 0024/0037/0074 there: the touchpad HID
+descriptor's physical size (94 x 42 mm: the 2/3 Y scale of Wn8030Piano.h's Pointer), the Windows-8 digitizer layout (contact count,
+hid-multitouch's reading of it), the touchpad enable as the only touchpad command (no feature-report transport), the Right Ctrl
+function row (the opt-in Keys::fnRow, written fresh from that behaviour), 0x24's request values, the hall (SW_LID) handling that
+turns input off while closed (not done here). Linux's HID core (hid-input, ErrorRollOver ignored in a keyboard array): the rollover
+rule of Keys. The macOS descriptors (HidDescriptors.h) are written from the HID 1.11 specification and the HID Usage Tables.
+
+Facts from piano itself: the 2026-11-11 capture (logs/usb-console/20261111-084701-port0.txt, not committed): frame trailer = byte
+sum of bytes 2..66, each vendor message's own sum, the ack (kind 0xf0) and state messages after each command, kinds 0xa4/0x28/0x01.
+piano's boot DT (v1.1.0 piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840): gpio-keys
+switch-lid on TLMM gpio80, EV_SW/SW_LID, GPIO_ACTIVE_LOW (the hall sensor).
 
 The MCU image (MCU_Upgrade.bin, stock OS3.0.303.0 odm_a, 83,436 bytes, sha256
 c03d6b650cb85a983359c6686d831875df10ee1206fd31afc1403baefeb7e407) is Xiaomi/Nanosic's and is never committed: the build copies the

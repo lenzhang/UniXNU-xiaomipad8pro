@@ -85,7 +85,7 @@ Keyboard cover (§11), then the volume/power keys in the UniXNU menu; touch disa
 3. Held-contact break-ups seen on Ubuntu: same tracker, same symptom expected; fix once for both. (replay test offline)
 4. Where the private calibration lives in the payload (Data seed vs a separate FAT file) without entering any repository.
 
-## 11. Keyboard cover (summary; own page later)
+## 11. Keyboard cover (summary; its page is [keyboard.md](keyboard.md), driver `package/PianoKeyboard`)
 
 "Xiaomi Keyboard" 15d9:00a3 + touchpad 15d9:00a1 (clickpad 3200x2136) + "Tablet Mode" switch, over GENI I2C
 `i2c@a98000` through a nanosic HID bridge (MCU firmware `nanosic/piano/MCU_Upgrade.bin`, 83436 bytes, identity only)
