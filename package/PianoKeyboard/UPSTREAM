@@ -1,0 +1,43 @@
+PianoKeyboard is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). What it takes from other work, and from where:
+
+UniXNU-sheng (unixnu-research/UniXNU-sheng, main 00ba90984e831e4c6ce30ec3d8a56e6434e9f1af), BSD-2-Clause-Patent:
+  package/Wn8030.c (sha256 40beab9c2287187e1f62263fba83ae1b3863fd71fd4ee33acb3d58f8a062b55b) and Wn8030.h
+    Taken into Wn8030Piano.h: the boot ROM protocol (commands, states, id 0xc8), the image check and the header/data block layout,
+    the command frame and its checksum, the vendor message kinds, the design of the touchpad-as-pointer conversion
+    (wn8030_pointer_report: one finger moves, two scroll, no jump when fingers change, palms lifted) and the command codes.
+    Changed for piano: runtime commands to register 0x4c, piano's packed frames, the 27-byte touchpad report with 8-byte fingers,
+    the attach bit (byte 9 bit 0), the consumer report's 5 bytes; taps added.
+  package/KeyboardCover.cpp (sha256 35cdacf115e4599d7195ec52d8419f93520b595f09df8058cb34cc05cfb2e843)
+    Facts: macOS 27 makes no pointer of a touchpad's finger collections, so a relative pointer; the Caps Lock output report path.
+  package/KeyboardProbe.cpp (sha256 c98c61c12819611359bcc656f1b5830e9f21d5fb238845732ae31d372832d3a5)
+    The bring-up order (pins, supplies, power-on, image, serving), the attach handling and the 12 s keyboard-power keepalive,
+    authentication left unanswered. Not taken: its GENI engine and interrupt plumbing (sheng's kernel, not a kext).
+
+Project-SunUEFI (unixnu-research/Project-SunUEFI, main 4ef87402e9d58465af871e4c4f4a5de87599d81c), BSD-2-Clause-Patent:
+  uefi/components/pogo-product/PianoPogoBoard.c (sha256 7739d3b85d25b6028d22d425e4b7496e56ffaf8191b07a1b9efea11ad9c88b85),
+  PianoPogoMcu.c (sha256 290e0e1bb3f488c73bffe1db90679aed50fd93c4020b70cd6e082bbd2e6ae296), PianoPogoService.c
+  (sha256 8a8950d587a5ddbe258c6d88566f1a9815d5efc73e086c76ed26ec99a9b6976d)
+    piano's facts: SDA/SCL gpio56/57, reset gpio188, sleep gpio3, irq gpio97 (rising-edge latch with INTR_CFG target at bits 10:8,
+    raw status, enable off), the eGPIO claim, rails ldob11 1.8 V before ldob14 3.3 V (voltage, enable, mode 7), the timing (reset
+    2 ms, boot ROM 500 ms, wake 50 ms, 3 ms after every boot ROM write), runtime register 0x4c. Not verified on hardware there.
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoInput (PianoHIDDevice, itself DroidVMInput's DroidVMHIDDevice from macOS-DroidVM overlay/kext/DroidVMInput,
+    sha256 f05d9d9912b1ae5b57000dcc49f6a4539410e5212c34b31aa4270e31cfac8afc): the IOHIDDevice subclass and how it is published
+    (OSTypeAlloc, init, attach, start under the service), the event-service notification, the codeless IOHIDEventDriver personality
+    and the vtable check of tooling/k27/kext/PianoKeyboard.json. Same overrides plus setReport (the LED output report).
+  package/PianoPower/Gauge.h: the software I2C bus (generalised in BitI2c.h: writes, repeated-START reads, a configurable clock).
+  package/PianoPower/QcomRpmh.c and PianoAdsp.cpp: the cmd-db lookup and the RSC layouts (CmdDb.h), the active TCS vote sequence
+    (PianoKeyboard.cpp vote()), the apps RSC and cmd-db addresses.
+
+Read as a specification only, never copied (GPL-2.0): Linux hid-nanosic-wn8030 (blu-sharky/linux-piano, map220v, GPL-2.0-only), as
+built in the v1.1.0 Ubuntu release (debs/linux-image-7.2.15-piano58_7.2.15-58.1_arm64.deb, sha256
+53b55b325519be948a598d0a929d2003341439ef157ec556097e03d825a352b7; drivers/hid/hid-nanosic-wn8030.ko sha256
+8434ebe582b1abc52c57146fb049c7340d0ca9a7cc2ef0b2bd56a4b2682f5d28): the piano frame packing and report sizes, the runtime command
+register, the attach bit, the touchpad device made on the first 0x19 report, the commands sent on attach, and the report layouts as
+its piano HID descriptors declare them. The macOS descriptors (HidDescriptors.h) are written from the HID 1.11 specification and the
+HID Usage Tables.
+
+The MCU image (MCU_Upgrade.bin, stock OS3.0.303.0 odm_a, 83,436 bytes, sha256
+c03d6b650cb85a983359c6686d831875df10ee1206fd31afc1403baefeb7e407) is Xiaomi/Nanosic's and is never committed: the build copies the
+pinned file into the ignored out/native-kexts/PianoKeyboard/firmware and embeds it from there.
