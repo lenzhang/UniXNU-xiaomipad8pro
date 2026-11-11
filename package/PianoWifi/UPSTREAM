@@ -1,0 +1,36 @@
+PianoWifi is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1 only: a read-only survey. What it takes from other
+work, and from where:
+
+UniXNU-sheng (unixnu-research/UniXNU-sheng, main 00ba90984e831e4c6ce30ec3d8a56e6434e9f1af), BSD-2-Clause-Patent (LICENSE sha256
+5b1d3d911103cb0f41641ec0964c5ac1f7e229f57aa072b6ac38bae913a1307b; SM8550 + WCN7850, the Wi-Fi path hardware-verified there per its
+porting.toml), package/WifiProbe.cpp (sha256 72f46e8229865eff68feae9a3002b919ad3b610e634d93877879f4960d5b01a0):
+  Design only, re-implemented (no code copied): a level that only looks before any level powers anything; the controller's
+  registers read only when its power domain is on and its interface clocks run ("a read of an unclocked block stalls the bus");
+  the TLMM pin layout (also used by PianoPower and PianoDwc3); the SMPS peripheral page rule 0x9b + 3 * (n - 1). Its SM8550
+  addresses (DBI 0x60000000, GCC branch offsets, the v6 PHY layout) are NOT piano's and are not used.
+
+UniXNU-Pagani-Drivers (github.com/Shad0w23333/UniXNU-Pagani-Drivers 3d570b7653bf9831def8fe49b339b42990508d83, also
+IssacL04/UniXNU-Pagani-Drivers), drivers/PaganiWifi, BSD-2-Clause-Patent (LICENSE sha256 as UniXNU-sheng's; SM8750 + the same
+17cb:110e chip on the OnePlus 13T; host-tested only, never run on a device), PaganiWifiTables.h (sha256
+001f808ba5dd4356b1e31efcfd9631c0a1064d71201c29f73cf55f3efb859516), WifiBringup.cpp (sha256
+bb40a62361e06870348cd66eecca0634fb0e48d36a60afcb3f3acb0035ab3cd2):
+  Facts only, cross-checked against mainline Linux (below) where mainline has them: the SM8750 PCIe0 GDSC, collapse vote, branch
+  CBCR / vote bit / hardware-gating table, BCRs, RCGs and pipe mux; the v7 PHY layout; the LDO page rule 0xc0 + n on SM8750's
+  PMICs (its running DT's OCP notifier names); the PMK8550 gpio3 sleep clock pin; gpio19 / 202 / 203; the cmd-db names of the
+  supplies and the PCIe NoC BCM (SN4). Board values of the 13T (its rails, PPIDs, PHY sequence) are not piano's and are not used.
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoPower/SpmiObserver.h (sha256 4805d4fb7af91c210d75b9791e125f3789b7671e895afe6f80af27a36a849b07) -> SpmiObserver.h:
+    copied, namespace pianowifi and the include guard changed, one provenance line added.
+  package/PianoKeyboard/CmdDb.h (sha256 794cf39c76e2c903d79cc1146ae25d946946862daa9b8848d616e9ad8107c716): cmdDbFind re-expressed
+    in WifiSurvey.h (same layout, 64-bit sizes), and its way of reading cmd-db (one mapping, copied out word by word).
+  package/PianoDwc3/SmmuStream.h (sha256 8f566938f259730d15407aa2d84abb3f6ec3b06c7bf3dabaef78c7e7fbb930a3): the SMMU geometry
+    checks and the stream-match decode, re-expressed read-only in surveySmmu (no plan, no write).
+
+Specifications only (no code, comment or table copied): mainline Linux drivers/clk/qcom/gcc-sm8750.c and tcsrcc-sm8750.c,
+include/dt-bindings/clock/qcom,sm8750-gcc.h, drivers/pci/controller/dwc/pcie-qcom.c and pcie-designware.h,
+drivers/phy/qualcomm/phy-qcom-qmp-pcie.c and phy-qcom-qmp-pcs-v7.h, drivers/pinctrl/qcom/pinctrl-sm8750.c (register offsets, bit
+positions, the DesignWare LTSSM L0 value); Project-SunUEFI (unixnu-research/Project-SunUEFI) patches/linux/7.3/0001-platform.patch,
+a GPL-2.0 kernel patch read for facts only (the WCN7861 supply voltage ranges in WifiHw.h's comment); the piano boot DT
+(out/inputs/piano-boot.dtb); ARM IHI 0062 (SMMUv2: SMR, S2CR, IDR0/IDR1). Not read and not used for anything: any Qualcomm
+binary (no reverse engineering of vendor firmware or drivers).
