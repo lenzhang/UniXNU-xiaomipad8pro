@@ -23,6 +23,8 @@
 // Mac enumerates afresh). Every QSCRATCH write (the VBUS/session override, the UTMI clock select, a monitor poke into it) goes to the
 // glue only while awake with its clocks on, else it is recorded and written after the wake (Ubuntu's K:7dffd78b342d: such a write
 // with the glue unclocked never completes and resets the SoC).
+// piano-usb-handoff=1 (default 0): PianoUsbHost may borrow the controller for host mode and give it back (UsbHandoff.h,
+// docs/drivers/usb-host.md H3): released between passes on its ask (only while awake), the takeover run again on its reclaim.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -60,6 +62,7 @@
 #include "PianoBacklightClient.h"   // package/PianoBacklight: brightness keys to the backlight (piano-backlight-keys=1)
 #include "UsbIdle.h"          // the USB thread's wait tiers
 #include "UsbSleep.h"         // a system sleep's steps and the QSCRATCH guard
+#include "UsbHandoff.h"       // the controller hand-off to PianoUsbHost (piano-usb-handoff=1)
 #include "../common/PianoIrq.h"
 #include <PianoPowerContract.h>
 
@@ -95,6 +98,7 @@ struct Args {
   uint32_t irq;       // piano-usb-irq=1: the core's interrupt (SPI 133) wakes the USB thread (default 0: polled, adaptive)
   uint32_t idle;      // piano-usb-idle: 1 (default) the adaptive wait (UsbIdle.h), 0 the old loop (1 ms after every quiet pass)
   uint32_t sleepUsb;  // piano-sleep-usb: 1 (default) a configured host keeps the gadget across a system sleep, 0 a soft disconnect
+  uint32_t handoff;   // piano-usb-handoff=1: PianoUsbHost may borrow the controller for host mode (UsbHandoff.h; default 0)
 };
 Args gArgs;
 
@@ -126,6 +130,7 @@ void readArgs()
   gArgs.irq = bootArg("piano-usb-irq", 0);
   gArgs.idle = bootArg("piano-usb-idle", 1);
   gArgs.sleepUsb = bootArg("piano-sleep-usb", 1);
+  gArgs.handoff = bootArg("piano-usb-handoff", 0);
   if (!gArgs.idle) gArgs.irq = 0;   // the old loop is the old loop
 }
 
@@ -1397,17 +1402,83 @@ void waitAwake()
   IOLockUnlock(gSleepLock);
 }
 
+// ------------------------------------------------------------------------------- the hand-off to PianoUsbHost (piano-usb-handoff=1)
+// PianoUsbHost asks through callPlatformFunction (UsbHandoff.h); the USB thread acts between passes: a release stops the device
+// controller (RUN_STOP 0, the halt awaited), masks its event interrupt and parks the thread until a reclaim; a reclaim re-reads the
+// core's power domain and clocks and, only when they read on, runs the whole takeover again (PianoUsbHost has put the core back in
+// device mode first). Without piano-usb-handoff nothing of this runs and the platform function answers unsupported.
+volatile uint32_t gHandoffState = kHoOff, gHandoffAsk = kAskState;
+uint32_t gHandoffReleases, gHandoffReclaims;
+
+void handoffSet(uint32_t state)
+{
+  __atomic_store_n(&gHandoffState, state, __ATOMIC_RELEASE);
+  thread_wakeup((event_t)&gHandoffState);
+}
+uint32_t handoffTake() { return __atomic_exchange_n(&gHandoffAsk, uint32_t(kAskState), __ATOMIC_ACQ_REL); }
+
+void handoffRelease()
+{
+  using namespace dwc3;
+  gRunning = false;
+  const bool halted = gGadget.halt(100);
+  gHal.wr(GEVNTSIZ, GEVNTSIZ_INTMASK | Layout::kEventBytes);
+  gHal.barrier();
+  if (gIrqMode) irqOff("the controller is handed to PianoUsbHost");
+  gHandoffReleases++;
+  gHal.note("hand-off: released to PianoUsbHost (%u): DCTL %08x DSTS %08x (%s); the console keeps its log for the replay", gHandoffReleases,
+            gHal.rd(DCTL), gHal.rd(DSTS), halted ? "halted" : "NOT halted within 100 ms");
+  handoffSet(kHoReleased);
+}
+
+// Parked (released, or a takeover that failed): waits for a reclaim; returns once a takeover after one went through. gRunning is
+// false meanwhile, so a system sleep is answered by setPowerState itself without touching the core (UsbSleep.h's early state).
+void handoffPark()
+{
+  for (;;) {
+    const uint32_t seen = gWake.now();
+    const uint32_t ask = handoffTake();
+    if (handoffDecide(__atomic_load_n(&gHandoffState, __ATOMIC_ACQUIRE), ask) == HandoffDo::reclaim) {
+      gHandoffReclaims++;
+      waitAwake();   // a system sleep while the controller was lent: the takeover waits for the wake
+      if (!glueClocked()) {
+        note("hand-off: reclaim %u: the core's power domain or clocks read off: no takeover (idle until asked again)", gHandoffReclaims);
+        handoffSet(kHoFailed);
+        continue;
+      }
+      note("hand-off: reclaim %u: the core is back from PianoUsbHost: the takeover again", gHandoffReclaims);
+      gCoreClocked = true;
+      if (takeover()) {
+        gRunning = true;
+        handoffSet(kHoDevice);
+        return;
+      }
+      note("hand-off: the takeover after the reclaim failed: idle until asked again");
+      handoffSet(kHoFailed);
+      continue;
+    }
+    gWake.wait(seen, 60000);   // a kick (the ask) ends it
+  }
+}
+
 void usbThread(void *, wait_result_t)
 {
+  if (gArgs.handoff) handoffSet(kHoStarting);
   if (gArgs.delay) {
     note("waiting %u s (piano-usb-delay)", gArgs.delay);
     IOSleep(gArgs.delay * 1000);
   }
   waitAwake();
   if (!takeover()) {
-    note("takeover failed; the controller is left as it is. Rebuild the RAM image without piano-usb to drop this driver.");
-    return;
+    if (!gArgs.handoff) {
+      note("takeover failed; the controller is left as it is. Rebuild the RAM image without piano-usb to drop this driver.");
+      return;
+    }
+    note("takeover failed; the controller is left as it is; parked for a hand-off (piano-usb-handoff=1)");
+    handoffSet(kHoFailed);
+    handoffPark();
   }
+  if (gArgs.handoff) handoffSet(kHoDevice);
   gRunning = true;
   gIrqMode = gArgs.irq && attachCoreInterrupt();
   if (!gArgs.idle) gHal.note("wait: 1 ms after every quiet pass (piano-usb-idle=0, the old loop)");
@@ -1425,6 +1496,18 @@ void usbThread(void *, wait_result_t)
     if (!sleepStep()) {   // a system sleep without a host kept, or the glue unclocked at the wake: the core is not touched
       gWake.wait(seen, 1000);
       continue;
+    }
+    // The hand-off (piano-usb-handoff=1): a release only while awake (not in a sleep's kept state); an ask it cannot act on is dropped.
+    if (gArgs.handoff && __atomic_load_n(&gHandoffAsk, __ATOMIC_ACQUIRE) != kAskState) {
+      const uint32_t ask = handoffTake();
+      if (gSleep.state() == SleepState::awake && handoffDecide(__atomic_load_n(&gHandoffState, __ATOMIC_ACQUIRE), ask) == HandoffDo::release) {
+        handoffRelease();
+        handoffPark();
+        gIrqMode = false;   // after a hand-off the thread polls (the line may be Apple's xHCI's by then)
+        lastReport = nowNs();
+        lastActivity = lastEvent = lastReport / 1000000;
+        continue;
+      }
     }
     const bool kept = gSleep.state() == SleepState::kept;   // until the freeze: polled, the interrupt left masked
     const unsigned events = gGadget.poll();
@@ -1720,9 +1803,49 @@ public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
   IOReturn setPowerState(unsigned long state, IOService *device) override;
+  IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3,
+                                void *param4) override;
 };
 
 OSDefineMetaClassAndStructors(PianoDwc3, IOService)
+
+// "piano-usb-handoff" (UsbHandoff.h): param1 the ask, param2 uint32_t * for the state after, param3 the wait in ms (at most 5000).
+// Unsupported without piano-usb-handoff=1 (the controller stays PianoDwc3's).
+IOReturn PianoDwc3::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3,
+                                         void *param4)
+{
+  if (!functionName || !functionName->isEqualTo(kHandoffFunction))
+    return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
+  uint32_t *state = static_cast<uint32_t *>(param2);
+  if (!gArgs.handoff || gArgs.level < 2) {
+    if (state) *state = kHoOff;
+    return kIOReturnUnsupported;
+  }
+  const uint32_t ask = uint32_t(uintptr_t(param1));
+  uint32_t waitMs = uint32_t(uintptr_t(param3));
+  if (waitMs > 5000) waitMs = 5000;
+  // Only an ask the thread can act on now is left for it: a release asked while the takeover still runs, or during a system sleep,
+  // is not kept for later (the caller may have changed its mind by then, and nobody would reclaim). "state" withdraws a pending ask.
+  if (ask == kAskState) __atomic_store_n(&gHandoffAsk, uint32_t(kAskState), __ATOMIC_RELEASE);
+  const bool awake = gSleep.state() == SleepState::awake;
+  if ((ask != kAskRelease || awake) && handoffDecide(__atomic_load_n(&gHandoffState, __ATOMIC_ACQUIRE), ask) != HandoffDo::nothing) {
+    __atomic_store_n(&gHandoffAsk, ask, __ATOMIC_RELEASE);
+    gWake.kick();
+  } else {
+    if (state) *state = __atomic_load_n(&gHandoffState, __ATOMIC_ACQUIRE);
+    return kIOReturnSuccess;
+  }
+  const uint64_t until = nowNs() + uint64_t(waitMs) * 1000000ull;
+  for (;;) {
+    const uint32_t s = __atomic_load_n(&gHandoffState, __ATOMIC_ACQUIRE);
+    if (handoffSettled(ask, s) || nowNs() >= until) break;
+    assert_wait_timeout((event_t)&gHandoffState, THREAD_UNINT, 10, kMillisecondScale);
+    if (__atomic_load_n(&gHandoffState, __ATOMIC_ACQUIRE) != s) clear_wait(current_thread(), THREAD_AWAKENED);
+    else thread_block(THREAD_CONTINUE_NULL);
+  }
+  if (state) *state = __atomic_load_n(&gHandoffState, __ATOMIC_ACQUIRE);
+  return kIOReturnSuccess;
+}
 
 IOService *PianoDwc3::probe(IOService *provider, SInt32 *score)
 {
@@ -1811,6 +1934,11 @@ bool PianoDwc3::start(IOService *provider)
            "on the Mac", kNetDeviceMac[0], kNetDeviceMac[1], kNetDeviceMac[2], kNetDeviceMac[3], kNetDeviceMac[4], kNetDeviceMac[5],
            kNetHostMac[0], kNetHostMac[1], kNetHostMac[2], kNetHostMac[3], kNetHostMac[4], kNetHostMac[5]);
     }
+  }
+  // piano-usb-handoff=1: registered so PianoUsbHost finds this service by class for its platform function (UsbHandoff.h).
+  if (gArgs.handoff) {
+    note("hand-off: piano-usb-handoff=1: PianoUsbHost may borrow the controller for host mode (released and reclaimed on its ask)");
+    if (!gArgs.hid && !gArgs.net) registerService();   // the HID and network paths registered it already
   }
   if (kernel_thread_start(usbThread, nullptr, &thread) != KERN_SUCCESS) { stage(-8, "USB thread"); return true; }
   thread_deallocate(thread);

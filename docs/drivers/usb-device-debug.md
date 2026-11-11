@@ -163,6 +163,7 @@ IOPlatformExpertDevice ── PianoDwc3 (start, matching thread)   read-only pro
 | `piano-usb-net-fifo=0` | 1 | with `piano-usb-net=1`: keep the TX FIFO sizes the core reset left instead of the plan of §14.2 (a first-run experiment) |
 | `piano-usb-idle=0` | 1 | the old USB loop (1 ms after every quiet pass) instead of the adaptive wait of §15 |
 | `piano-usb-irq=1` | 0 | the core's interrupt (SPI 133) ends the USB thread's waits (§15); falls back to polling by itself |
+| `piano-usb-handoff=1` | 0 | PianoUsbHost (levels 3/4 with `piano-usbhost-handoff=5\|6`) may borrow the controller for host mode: on its ask the USB thread stops the device controller, masks its event interrupt and parks; on its reclaim the clocks are re-read and the whole takeover runs again (`UsbHandoff.h`, `usb-host.md` §6.6). The service is registered for it. 0: the controller is PianoDwc3's for the whole boot |
 | `piano-wake-log=S` | 60 | the `idle: N wakeups in S s` line every S seconds (0 none; shared with PianoInput and PianoTouch) |
 | `piano-sleep-usb=0` | 1 | a system sleep disconnects the gadget even with the Mac attached (§16); 1: a configured host keeps it (the console survives) |
 

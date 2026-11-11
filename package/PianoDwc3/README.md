@@ -24,10 +24,15 @@ Design, hardware facts, boot arguments, test plan and the Mac-side commands: `do
 | `HidInput.h` | the input port's line protocol (K/C/P/R/?) and line framing, portable |
 | `SmmuStream.h` | SID 0x40 through a VA64 bypass context bank of the apps SMMU |
 | `UsbIdle.h` | the USB thread's wait tiers (busy / open / configured / no host) and the core interrupt handler's decision, portable (`docs/power-irq.md`) |
+| `UsbHandoff.h` | the controller hand-off to PianoUsbHost's host mode (`piano-usb-handoff=1`, default off): the platform function's asks and states, the USB thread's decision, portable (`docs/drivers/usb-host.md` §6.6) |
 | `Dwc3Regs.h`, `PianoUsbHw.h` | register facts, with their sources |
-| `tests/` | host tests: the gadget core (2 and 3 ports, without and with the network function; the ACM-only descriptors against their pre-network bytes), NTB16 and the TX FIFO plan, the SMMU planner, the input parser, the wait tiers (`tests/run.sh`) |
+| `tests/` | host tests: the gadget core (2 and 3 ports, without and with the network function; the ACM-only descriptors against their pre-network bytes), NTB16 and the TX FIFO plan, the SMMU planner, the input parser, the wait tiers, the hand-off decisions (`tests/run.sh`) |
 
 Build: `tooling/k27/build-native-piano-dwc3.sh` (host tests, the objects, the import check, the PianoUsbNet vtable check). PianoDwc3 is in
 `configs/k27-native-kexts.txt` and inert without `piano-usb`. Sources and licences: `UPSTREAM`, `LICENSE` (BSD-2-Clause-Patent).
 Battery: the USB thread's wait adapts to the link (`piano-usb-idle=0`: the old 1 ms loop); `piano-usb-irq=1` adds the core's
 interrupt, SPI 133, through `package/common/PianoIrq.h` (`docs/drivers/usb-device-debug.md` section 15, `docs/power-irq.md`).
+Host mode: with `piano-usb-handoff=1` PianoUsbHost (levels 3/4 with `piano-usbhost-handoff=5|6`) may ask this driver to release
+the controller (the device controller stopped, its event interrupt masked, the USB thread parked) and to reclaim it (the clocks
+re-read, the whole takeover again); without it the controller is this driver's for the whole boot. The VBUS/session override store
+re-reads the core's clocks right before it.
