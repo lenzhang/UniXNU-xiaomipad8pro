@@ -38,9 +38,14 @@ constexpr uint32_t cba2rOffset(unsigned n) { return 0x1800 + 4 * n; }
 constexpr uint32_t kCbSctlr = 0x000, kCbTcr2 = 0x010, kCbTtbr0Lo = 0x020, kCbTtbr0Hi = 0x024, kCbTtbr1Lo = 0x028, kCbTcr = 0x030,
                    kCbContextIdr = 0x034, kCbMair0 = 0x038, kCbMair1 = 0x03c, kCbFsr = 0x058, kCbTlbiAll = 0x618,
                    kCbTlbSync = 0x7f0, kCbTlbStatus = 0x7f4;
-// SCTLR: M translation on, TRE, AFE, CFRE (a fault aborts the transaction rather than stalling it), ASIDPNE.
+// SCTLR: M translation on, TRE, AFE, CFRE (a fault aborts the transaction rather than stalling it), ASIDPNE. piano's SMMU keeps
+// ASIDPNE at 0 (wifi-l5ib, 2026-11-12: wrote 0x1027, read 0x27): the ASID namespace is then shared between banks, so the window's
+// ASID is its own bank number (as Linux's arm-smmu gives each stage-1 bank), and only the other four bits must read back.
 constexpr uint32_t kSctlrM = 1u << 0;
-constexpr uint32_t kSctlrWindow = 1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12;
+constexpr uint32_t kSctlrAsidpne = 1u << 12;
+constexpr uint32_t kSctlrWindow = 1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | kSctlrAsidpne;
+constexpr uint32_t kSctlrRequired = kSctlrWindow & ~kSctlrAsidpne;
+constexpr uint32_t ttbr0Hi(uint64_t tablePa, unsigned bank) { return uint32_t(tablePa >> 32) | (bank & 0xffu) << 16; }   // ASID 55:48
 constexpr uint32_t kCbarStage1 = 1u << 16 | 0xfu << 12 | 3u << 8;   // stage 1 with stage 2 bypass; MemAttr, BPSHCFG
 constexpr uint32_t kFsrFaults = 0xc00001feu;
 // TCR (VA64): T0SZ 5:0, IRGN0 9:8, ORGN0 11:10, SH0 13:12, TG0 15:14 (0 = 4 KiB), EPD1 23. Non-cacheable non-shareable walks.
@@ -210,7 +215,7 @@ inline const char *apply(const Plan &p, uint16_t stream, uint64_t tablePa, Read 
   wr(cb + kCbTcr2, tcr2Window(p.pasize));
   wr(cb + kCbTcr, kTcrWindow);
   wr(cb + kCbTtbr0Lo, uint32_t(tablePa));
-  wr(cb + kCbTtbr0Hi, uint32_t(tablePa >> 32));
+  wr(cb + kCbTtbr0Hi, ttbr0Hi(tablePa, p.bank));
   wr(cb + kCbTtbr1Lo, 0);
   wr(cb + kCbTtbr1Lo + 4, 0);
   wr(cb + kCbContextIdr, 0);
@@ -223,9 +228,9 @@ inline const char *apply(const Plan &p, uint16_t stream, uint64_t tablePa, Read 
   const uint32_t fsr = rd(cb + kCbFsr);
   if (fsr & kFsrFaults) wr(cb + kCbFsr, fsr & kFsrFaults);   // stale faults cleared (write one to clear)
   wr(cb + kCbSctlr, kSctlrWindow);
-  if ((rd(cb + kCbSctlr) & kSctlrWindow) != kSctlrWindow || rd(cba2rOffset(p.bank)) != 1 ||
+  if ((rd(cb + kCbSctlr) & kSctlrRequired) != kSctlrRequired || rd(cba2rOffset(p.bank)) != 1 ||
       rd(cbarOffset(p.bank)) != kCbarStage1 || rd(cb + kCbTtbr0Lo) != uint32_t(tablePa) ||
-      rd(cb + kCbTtbr0Hi) != uint32_t(tablePa >> 32) || rd(cb + kCbTcr) != kTcrWindow)
+      rd(cb + kCbTtbr0Hi) != ttbr0Hi(tablePa, p.bank) || rd(cb + kCbTcr) != kTcrWindow)
     return "context bank readback";
   wr(s2crOffset(p.slot), p.bank);            // translate through the bank
   if ((rd(s2crOffset(p.slot)) & 0x300ffu) != p.bank) return "stream context readback";

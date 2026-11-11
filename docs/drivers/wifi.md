@@ -18,7 +18,15 @@ the chip was written: `mhiOpen` took the 2 MiB BAR mapping as the register lengt
 BHIEOFF 0x224 were fine): fixed, the mapping now bounds the space (host test added). With `piano-wifi-iova=1` the translating
 context bank did not read back what was written (`context bank readback`, before the stream pointed at it): the failure now logs
 every register read back against its written value and turns the bank off again. Level 3 held PERST# low 6-18 s (the GCC votes
-waited while PianoA830 came up): harmless for the link. Next: level 4 again, then 5. Association, keys and the data path (levels 7 and 8) are design only (§12 has level
+waited while PianoA830 came up): harmless for the link.
+
+**Second round (2026-11-12 morning, the fixes above):** without the window (`piano-wifi=4`/`5`) MHI opened and the boot began in
+the boot loader over BHI, then timed out after 20 s with BHI status `ffffffff` (reads no longer answered) and error `ef0e0003`:
+the contexts and the image were at 0x9aab08000, above 4 GiB, which the chip (32-bit DMA, as Linux's driver configures it) cannot
+reach; level 4 needs the window (`piano-wifi-iova=1`). With the window, the bank read back everything as written except SCTLR's
+ASIDPNE (wrote 0x1027, read 0x27; FSR 0x400 is only its format field): piano's SMMU keeps that bit at 0. Fixed: ASIDPNE is no
+longer required, and the window's ASID is its bank number (TTBR0[55:48]) so the shared ASID namespace cannot mix it with another
+bank's entries (host test models piano's SMMU). Next: `piano-wifi=5 piano-wifi-iova=1`, then level 6. Association, keys and the data path (levels 7 and 8) are design only (§12 has level
 5's message table, §14 level 6's, §13 what levels 7 and 8 need and the macOS side's remaining plan). Template: `README.md`.
 
 ## 1. Purpose and gate

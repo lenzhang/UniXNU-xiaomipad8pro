@@ -1238,7 +1238,7 @@ static void testWindow()
   CHECK(model.rd(iova::s2crOffset(plan.slot)) == plan.bank);
   CHECK(model.rd(iova::smrOffset(plan.slot)) == (0x80000000u | kStreamEndpoint));
   CHECK(model.rd(plan.cb + iova::kCbTtbr0Lo) == uint32_t(tablePa));
-  CHECK(model.rd(plan.cb + iova::kCbTtbr0Hi) == uint32_t(tablePa >> 32));
+  CHECK(model.rd(plan.cb + iova::kCbTtbr0Hi) == (uint32_t(tablePa >> 32) | (plan.bank & 0xffu) << 16));   // ASID = the bank
   CHECK(model.rd(plan.cb + iova::kCbTcr) == iova::kTcrWindow);
   CHECK(model.rd(plan.cb + iova::kCbTcr2) == iova::tcr2Window(plan.pasize));
   CHECK(model.rd(plan.cb + iova::kCbMair0) == iova::kMair0Nc);
@@ -1256,6 +1256,16 @@ static void testWindow()
   CHECK(iova::apply(plan, kStreamEndpoint, tablePa + 1, rd, wr, never) != nullptr);
   CHECK(iova::apply(plan, kStreamEndpoint, 0x10000000000ull, rd, wr, never) != nullptr);
   CHECK(writes.size() == before);
+  // piano's SMMU: ASIDPNE reads 0 (wifi-l5ib, 2026-11-12); the window is still taken, the other bits must stick.
+  for (uint32_t dropped : {iova::kSctlrAsidpne, iova::kSctlrM}) {
+    SmmuModel piano;
+    auto rdP = [&](uint32_t off) { return piano.rd(off); };
+    iova::Plan p2 = iova::plan(kStreamEndpoint, kSmmuBytes, rdP);
+    CHECK(!p2.error);
+    auto wrP = [&](uint32_t off, uint32_t value) { piano.wr(off, off == p2.cb + iova::kCbSctlr ? value & ~dropped : value); };
+    const char *failure = iova::apply(p2, kStreamEndpoint, tablePa, rdP, wrP, never);
+    CHECK(dropped == iova::kSctlrAsidpne ? failure == nullptr : failure != nullptr);   // M not sticking is refused
+  }
   // A context TLB that never finishes is a timeout, not a hang.
   SmmuModel stuck;
   auto rdStuck = [&](uint32_t off) {
