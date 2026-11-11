@@ -538,6 +538,13 @@ IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit *submit,Nat
  * filled (3), or 0 while no plugin reached the driver (the diagnostic page stays). Each row NUL-terminated, <= 66 characters. */
 void native_adreno_publish_status(const Adreno830Status *status);
 unsigned native_adreno_report_rows(char rows[3][68]);
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (docs/power.md "Idle wakeups by driver"): the render server's mailbox server's pace (board/PianoGpuIdle.h): poll keeps
+ * the 1 ms / 16 ms poll of before; dark_ms the wait while the display is off (0: none). And the display's state, from the board's
+ * follower of NativeGopDisplay's piano-display-power (any context). */
+void native_adreno_mailbox_pace(bool poll,uint32_t dark_ms);
+void native_adreno_mailbox_display(bool dark);
+#endif
 /* The coherence level the plugin may rely on (NativeAdrenoCoherentImports, user-space patch M8, ARCHITECTURE 4.14.1): the VM's
  * effective level (NativeAdrenoVm::coherence(): 0 none, 1 GPU-read-only imports coherent after V9a, 2 also GPU-written imports after
  * V9b/V9c with pagani-gpu-coherent=2), never above 1 unless the published DeviceInfo carries NativeAdrenoDeviceCachedCoherent. */

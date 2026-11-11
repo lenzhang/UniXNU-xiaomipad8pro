@@ -68,7 +68,7 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       2026-11-11, the system suspend: test_a830suspend (both passes: the targets and the four-step machine; ADRENO830_MACOS: the gate
       on the register model), the suspend/resume and RailsSet doubles and the orchestrator's cases in test_start (a PASS line of its
       own), RailsSet's TCS order, lock and refusals in test_sm8750_rpmh.
-    NativeAdrenoPublish.cpp d2a85cbcb4ad29df03a05c9f4e3edc0120358ab90a731cb61b083accf93bd31f -> ae9fc8e4fdb91daef5dc65cd4f3d1d2803183fd42bb6e188d1b6a7714035293a
+    NativeAdrenoPublish.cpp d2a85cbcb4ad29df03a05c9f4e3edc0120358ab90a731cb61b083accf93bd31f -> b03c760843845aa624e0a3712d32cd5339238a80e71a81cc780a05e65ecb89c5
       the render server is WindowServer (kRenderServer/isRenderServer at the six "backboardd" sites, as UniXNU Adreno740 7487f72);
       native_adreno_fences() for the display's fence rule (as Adreno740's, over the ring's lastSubmitted and the memptrs fence word).
       2026-11-11, the session's GPU events on the console (boot_progress_gpu_event, rate-limited by NativeAdrenoEventNote): a failed
@@ -77,13 +77,16 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       2026-11-12, the address space (run attend4): a refused BoMap's reason in a line after its "call failed" line
       (NativeAdrenoMapRefusalLine), and every 30 s while it changes, and at the tick after a refusal, the VM's records and ranges, the
       BO pool and what is outside it, then each connection's mappings against its window (NativeAdrenoMapLines.h).
-    NativeAdrenoPublish.h   b266fa844b199254611f2bb1fc0bfca6dedd1c73535cf442838b07527e74a854 -> cbcd8590e938d3e3f20a0cbb644f055b532633517597d8af2e3f400248a2278b
+      2026-11-12, the idle wakeups (docs/power.md "Idle wakeups by driver"): the render server's mailbox server paced by
+      board/PianoGpuIdle.h's MailboxPace (the doorbell's rings counted; a look every 100 ms while the requests come rung, the poll of
+      before otherwise or with piano-gpu-mailbox-poll=1; the display-off wait), native_adreno_mailbox_pace / _display for the board.
+    NativeAdrenoPublish.h   b266fa844b199254611f2bb1fc0bfca6dedd1c73535cf442838b07527e74a854 -> 5dd9e2a2e2ca45d949b39d912b618ee6f3979623d2349e99cb4b621b18b716c2
       macOS process lists (NativeAdrenoSandboxGrantList, NativeAdrenoLargeClientList) in place of iPadOS's. 2026-11-11: the event
       lines' helpers (method and IOReturn names, the routine answers, the first-then-every-decade table), host-tested by
       tooling/k27/run-a830-host-tests.py (macos_events).
       2026-11-12: macOS's 16 GiB window table (the render server 3.5 GiB up to 4 GiB, large 768 MiB, small 320 MiB, none across a
       multiple of 4 GiB; the first desktop had WindowServer at 1153 of 1536 MiB and iconservicesagent at 490 of 512), checked at
-      compile time and in tests/test_vamap.cpp.
+      compile time and in tests/test_vamap.cpp. 2026-11-12: native_adreno_mailbox_pace / _display declared (ADRENO830_MACOS).
     Adreno830Status.h       9626f67c6f430b06562fa1be64598e8956929541c7954d1e1c84a394bf49df8a -> 4bc97572307f59e6a174295c0dea76dada0e971e0349ba96739499dcfc1ef6e6
     Adreno830Status.cpp     0e4e7b2b218a0df73f9c688623658302f4ce5da8fba7dc716cad6afe8993e7b1 -> 43d652bd67bcf750f277e4db052a3f6e8fb3226e293e97de37f9e1d5fcce0fc7
       2026-11-11: the board hooks boot_progress_gpu_event and adreno830_board_hang_ms, declared and given weak defaults.

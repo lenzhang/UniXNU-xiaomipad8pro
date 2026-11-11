@@ -32,6 +32,7 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/graphics/IOAccelerator.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
@@ -54,6 +55,8 @@
 #include "A830PowerState.h"
 #include "PianoLlccIsland.h"
 #include "PianoGpuCeiling.h"
+#include "PianoGpuIdle.h"
+#include <PianoDisplayFollow.h>
 
 extern "C" const Adreno830Board *piano_a830_board(void);
 
@@ -104,7 +107,11 @@ extern "C" void piano_a830_note(const char *format, ...)
 // this CPU's interrupts off (A830TraceLock), the status rows under the status block's spin lock. Kernel printf/IOLog end in
 // os_log_with_args, which must not run with interrupts off: piano-gpu=2's first run printed the trace's first line and hung the
 // system right after it (2026-11-11 07:20). So the hooks only copy their line into this ring (a short spin lock with interrupts off,
-// a bounded memcpy, nothing else), and the logger thread prints it with IOLog from plain thread context, polling every millisecond.
+// a bounded memcpy, nothing else), and the logger thread prints it with IOLog from plain thread context. Since 2026-11-12 a push
+// wakes the logger (thread_wakeup after the ring's unlock, only while it waits: callable with interrupts off and with spin locks
+// held, it never blocks or prints), so the logger no longer polls every millisecond (1000 wakeups a second whatever the GPU did,
+// docs/power.md "Idle wakeups by driver"); it still looks once a second (the canary, the held rows). piano-gpu-logger-ms=N polls
+// every N ms as before (1: the old behaviour); piano-gpu-trace=3 polls every millisecond as before (its heartbeat).
 // A full ring drops lines and counts them; the logger says how many. The trace line of an access is in the ring before the access
 // is made, but the console shows it only once the logger has printed every line before it: with -v each console line is drawn
 // (tens of ms), so the logger can be many seconds and the whole bring-up behind the driver (2026-11-11 "power1": S1's lines 5 s
@@ -118,6 +125,8 @@ struct LineRing {
   uint32_t head, tail, drops, lock;
 };
 LineRing gRing;
+uint32_t gLoggerPollMs;            // piano-gpu-logger-ms: 0 woken by the pushes (default), N poll every N ms (1: before 2026-11-12)
+volatile uint32_t gLoggerWaiting;  // the logger is (about to be) blocked on it: a push wakes it
 
 uintptr_t ringLock()
 {
@@ -152,6 +161,18 @@ void ringPush(const char *prefix, const char *text, size_t length)
     gRing.head++;
   }
   ringUnlock(irq);
+  // The line is in (head stored) before the logger's state is read; the logger stores its state before it reads head: one of the
+  // two sees the other (seq_cst on both sides), so no line waits for the logger's next look.
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&gLoggerWaiting, __ATOMIC_RELAXED)) thread_wakeup(reinterpret_cast<event_t>(const_cast<uint32_t *>(&gLoggerWaiting)));
+}
+
+bool ringPending()
+{
+  const uintptr_t irq = ringLock();
+  const bool any = gRing.tail != gRing.head;
+  ringUnlock(irq);
+  return any;
 }
 
 bool ringPop(char *out, uint32_t *drops, uint64_t *stamp = nullptr)
@@ -317,13 +338,27 @@ void heartbeat()
         __atomic_load_n(&gPrintedSync, __ATOMIC_RELAXED), __atomic_load_n(&gSyncSkipped, __ATOMIC_RELAXED), head - tail);
 }
 
+// The logger's wait between passes: woken by a push (ringPush) or at the next once-a-second look (deadline).
+void loggerWait(uint64_t deadline)
+{
+  const wait_result_t w = assert_wait_deadline(reinterpret_cast<event_t>(const_cast<uint32_t *>(&gLoggerWaiting)), THREAD_UNINT, deadline);
+  __atomic_store_n(&gLoggerWaiting, 1u, __ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  if (ringPending()) {
+    if (w == THREAD_WAITING) clear_wait(current_thread(), THREAD_AWAKENED);
+  } else if (w == THREAD_WAITING) {
+    thread_block(THREAD_CONTINUE_NULL);
+  }
+  __atomic_store_n(&gLoggerWaiting, 0u, __ATOMIC_RELAXED);
+}
+
 void logger(void *, wait_result_t)
 {
   char line[RingBytes];
   canaryStart();
-  uint64_t second = 0, lastBeat = 0;
+  uint64_t second = 0, lastBeat = 0, lastLook = mach_absolute_time();
   nanoseconds_to_absolutetime(1000000000ull, &second);
-  for (unsigned tick = 0;; ++tick) {
+  for (;;) {
     if (gTraceSync && gPrintLock) {
       // Never wait for the bring-up thread's print: if it is stuck inside IOLog, the heartbeat must still come.
       if (IOLockTryLock(gPrintLock)) {
@@ -344,11 +379,18 @@ void logger(void *, wait_result_t)
       }
       if (drops) IOLog("PianoA830: (%u lines dropped: the ring was full)\n", drops);
     }
-    if (tick % 1000 == 0) {
+    // Once a second (before 2026-11-12: every 1000th 1 ms pass): the canary and the rows held back.
+    const uint64_t now = mach_absolute_time();
+    if (now - lastLook >= second) {
+      lastLook = now;
       canaryCheck();
       flushHeldRows();
     }
-    IOSleep(1);
+    if (gTraceSync || gLoggerPollMs) {
+      IOSleep(gTraceSync ? 1 : gLoggerPollMs);
+      continue;
+    }
+    loggerWait(lastLook + second);
   }
 }
 }  // namespace
@@ -1034,6 +1076,21 @@ IOService *PianoA830::probe(IOService *provider, SInt32 *score)
   return IOService::probe(provider, score);
 }
 
+// The panel's display power (NativeGopDisplay's piano-display-power, followed through its messages: package/include/PianoDisplayFollow.h),
+// 2026-11-12: the mailbox server's display-off wait (board/PianoGpuIdle.h) and the DCVS screen rule's word (pagani_screen_state: read
+// only with piano-screenoff bit 1, so nothing else changes without it). The callback runs in NativeGopDisplay's gated power change:
+// it records, and at most wakes the mailbox server.
+namespace {
+pianodisplay::Follow gDisplayFollow;
+void displayChanged(void *, int state)
+{
+  const bool off = state == pianodisplay::kOff;
+  native_adreno_mailbox_display(off);
+  const uint32_t before = __atomic_load_n(&pagani_screen_state, __ATOMIC_ACQUIRE);
+  __atomic_store_n(&pagani_screen_state, pianogpu::screenWord(before, off), __ATOMIC_RELEASE);
+}
+}  // namespace
+
 bool PianoA830::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
@@ -1047,6 +1104,11 @@ bool PianoA830::start(IOService *provider)
   const uint32_t traceArg = bootArg("piano-gpu-trace", 1);
   gTrace = gLevel >= 2 && traceArg != 0;
   gTraceSync = gLevel >= 2 && traceArg == 3;   // the driver gets 1 (PianoA830Board.cpp)
+  gLoggerPollMs = bootArg("piano-gpu-logger-ms", 0);
+  if (gLoggerPollMs > 1000) gLoggerPollMs = 1000;
+  const bool mailboxPoll = bootArg("piano-gpu-mailbox-poll", 0) == 1;
+  const uint32_t mailboxDarkMs = pianogpu::clampDarkMs(bootArg("piano-gpu-mailbox-dark-ms", pianogpu::kMailboxDarkMsDefault));
+  native_adreno_mailbox_pace(mailboxPoll, mailboxDarkMs);
   nanoseconds_to_absolutetime(10ull * 1000000000ull, &gRowEvery);
   setProperty("piano-gpu", gLevel, 32);
   gService = this;
@@ -1081,7 +1143,8 @@ bool PianoA830::start(IOService *provider)
     gTraceSync = 0;
   } else {
     thread_deallocate(thread);
-    piano_a830_note("line ring %u x %u bytes, logger thread running%s", RingLines, RingBytes,
+    piano_a830_note("line ring %u x %u bytes, logger thread running (%s)%s", RingLines, RingBytes,
+                    gTraceSync ? "polling every 1 ms" : gLoggerPollMs ? "polling: piano-gpu-logger-ms" : "woken by each line, a look once a second",
                     gTraceSync ? "; piano-gpu-trace=3: each trace line printed before its access by the thread making it" : "");
   }
   thread = nullptr;
@@ -1090,6 +1153,11 @@ bool PianoA830::start(IOService *provider)
     return true;
   }
   thread_deallocate(thread);
+  const bool following = gDisplayFollow.start(displayChanged, nullptr);
+  piano_a830_note("display power: %s; display off: the mailbox looked at every %u ms (piano-gpu-mailbox-dark-ms, 0: as lit)",
+                  following ? "following NativeGopDisplay's messages" : "NOT followed (no notification)", mailboxPoll ? 0u : mailboxDarkMs);
+  piano_a830_note("mailbox: %s", mailboxPoll ? "polled as before (piano-gpu-mailbox-poll=1: 1 ms for a second after a request, else 16 ms)"
+                                             : "a look every 100 ms while its doorbell rings for the requests, else polled as before");
   // For the display's fence lookup, the thermal and power-profile ceilings and the LLCC island query (callPlatformFunction below).
   // At piano-gpu=1 too since 2026-11-11 (the island query): the fences answer NotReady and a ceiling waits for a DCVS that never starts.
   registerService();

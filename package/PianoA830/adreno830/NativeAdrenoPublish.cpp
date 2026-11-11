@@ -25,6 +25,7 @@
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <kern/task.h>
+#include <kern/sched_prim.h>
 #include "NativeAdrenoUserClient.h"
 #include "NativeAdrenoPublish.h"
 #ifdef ADRENO830_MACOS
@@ -35,6 +36,9 @@
 #include "A830Fence.h"
 #include "A830PowerState.h"
 #include "A830Recovery.h"
+#ifdef ADRENO830_MACOS
+#include "PianoGpuIdle.h"   /* UniXNU-piano: the mailbox server's pace (board/PianoGpuIdle.h) */
+#endif
 
 extern "C" void proc_selfname(char *, int);
 /* UniXNU-piano (macOS 27): the system's render server, the process that composes the display, is WindowServer on macOS and
@@ -168,6 +172,13 @@ IOBufferMemoryDescriptor *gMailbox=nullptr;
 volatile uint32_t *gMailboxWords=nullptr;
 bool gPollerStarted=false,gMailboxMapped=false;
 uint32_t gMailboxDoorbell;   /* event only */
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (2026-11-12, docs/power.md "Idle wakeups by driver"): the server's pace (board/PianoGpuIdle.h). The doorbell's rings
+ * are counted (a request found after one is a rung request: the doorbell is trusted once they are the rule), the display's state comes
+ * from the board (native_adreno_mailbox_display, NativeGopDisplay's piano-display-power). */
+pianogpu::MailboxPace gMailboxPace;
+volatile uint32_t gMailboxRings=0,gMailboxDark=0;
+#endif
 /* The render server's connection serves the mailbox; it is retained while set (under g.lock), so the poller never runs on a freed object. */
 AGXDeviceUserClient *gMailboxOwner=nullptr;
 
@@ -384,22 +395,47 @@ void nativeAdrenoMailboxPoller(void *,wait_result_t)
     thread_set_thread_name(current_thread(),"adreno830-mailbox");
     uint32_t last=0;
     uint64_t active_until=0;
+#ifdef ADRENO830_MACOS
+    uint32_t rings_seen=__atomic_load_n(&gMailboxRings,__ATOMIC_ACQUIRE);
+#endif
     for(;;) {
         IOLockLock(g.lock);
         /* Nothing to serve: sleep until the render server's connection maps the page (or the doorbell rings). */
         while(!gMailboxOwner || !gMailboxMapped || !gMailboxWords)IOLockSleep(g.lock,&gMailboxDoorbell,THREAD_UNINT);
         const uint64_t now=nowUs();
         AbsoluteTime deadline=0;
+#ifdef ADRENO830_MACOS
+        /* 1 ms after a request and 16 ms otherwise was the pace before 2026-11-12 (piano-gpu-mailbox-poll=1 keeps it): now a look every
+         * 100 ms while the doorbell rings for the requests, and the display-off wait (board/PianoGpuIdle.h). */
+        (void)active_until;
+        clock_interval_to_deadline(gMailboxPace.waitMs(now,__atomic_load_n(&gMailboxDark,__ATOMIC_ACQUIRE)!=0),kMillisecondScale,&deadline);
+#else
         clock_interval_to_deadline(now<active_until?1:16,kMillisecondScale,&deadline);
+#endif
         IOLockSleepDeadline(g.lock,&gMailboxDoorbell,deadline,THREAD_UNINT);
         AGXDeviceUserClient *owner=gMailboxOwner;
         if(owner)owner->retain();
         IOLockUnlock(g.lock);
         if(!owner)continue;
+#ifdef ADRENO830_MACOS
+        const uint32_t rings=__atomic_load_n(&gMailboxRings,__ATOMIC_ACQUIRE);
+        const bool rang=rings!=rings_seen;
+        rings_seen=rings;
+#endif
         const uint32_t request=gMailboxWords[1];
         if(request!=last && request!=gMailboxWords[2]) {
             last=request;
             active_until=nowUs()+1000000;
+#ifdef ADRENO830_MACOS
+            if(gMailboxPace.request(nowUs(),rang)) {
+                char line[200];
+                snprintf(line,sizeof line,"mailbox: %s (%u requests found after a ring, %u without)%s",
+                         gMailboxPace.trusted()?"the render server rings the doorbell: a look every 100 ms, no 1 ms polling"
+                                               :"requests without the doorbell: polled again (1 ms for a second after each, else 16 ms)",
+                         gMailboxPace.rung,gMailboxPace.unrung,gMailboxPace.trusted()?"":"; trusted again only while one in 64 at most is unrung");
+                boot_progress_gpu_event(line);
+            }
+#endif
             const uint32_t method=gMailboxWords[3],in_size=gMailboxWords[5],out_size=gMailboxWords[6];
             IOReturn status=kIOReturnBadArgument;
             if(in_size<=0x700 && out_size<=0x700) {
@@ -422,6 +458,22 @@ void nativeAdrenoMailboxPoller(void *,wait_result_t)
         owner->release();
     }
 }
+
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano: the board's configuration of the mailbox server's pace (piano-gpu-mailbox-poll, piano-gpu-mailbox-dark-ms; before the
+ * render server connects) and the display's state (NativeGopDisplay's piano-display-power, from its message; any context: records,
+ * and wakes the server when the display comes back so it leaves its display-off wait at once). */
+extern "C" void native_adreno_mailbox_pace(bool poll,uint32_t dark_ms)
+{
+    gMailboxPace.poll=poll;
+    gMailboxPace.darkMs=pianogpu::clampDarkMs(dark_ms);
+}
+extern "C" void native_adreno_mailbox_display(bool dark)
+{
+    const uint32_t before=__atomic_exchange_n(&gMailboxDark,dark?1u:0u,__ATOMIC_ACQ_REL);
+    if(before && !dark)thread_wakeup(&gMailboxDoorbell);
+}
+#endif
 
 /* The client log row of name (NativeAdrenoClientRecordFor: with every row used, the row of a name that holds no slot and never hung the
  * GPU is given to it, and that row's open streak restarts); null only when every row is live or charged with hangs. Under g.lock, which
@@ -1091,6 +1143,9 @@ static IOReturn noteMarker(uint32_t value)
     }
     if(value==NativeAdrenoMarkerDoorbell) {
         /* The mailbox doorbell: the server thread looks at the page now instead of at its next poll. */
+#ifdef ADRENO830_MACOS
+        __atomic_add_fetch(&gMailboxRings,1u,__ATOMIC_ACQ_REL);
+#endif
         if(g.lock) {IOLockLock(g.lock);IOLockWakeup(g.lock,&gMailboxDoorbell,false);IOLockUnlock(g.lock);}
         return kIOReturnUnsupported;
     }
