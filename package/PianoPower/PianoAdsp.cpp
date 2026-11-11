@@ -624,6 +624,7 @@ int startImage(Image &image, const char *name, uint32_t pas, uint64_t base, uint
 // ---- events ----
 uint32_t gSlave;
 bool gHandedOver;
+uint32_t gSlaveChanges, gHandoverAgain;
 void serviceSmp2p() {
     if (!gP2p.in) {
         if (volatile uint8_t *in = item(kItemIn, nullptr)) gP2p.in = reinterpret_cast<volatile uint32_t *>(in);
@@ -631,7 +632,9 @@ void serviceSmp2p() {
     }
     uint32_t value = 0, changed = 0;
     if (qcom_smp2p_service(&gP2p, "slave-kernel", &value, &changed)) kickSmp2p();
-    if (value != gSlave) say("slave-kernel bits %#x", value);
+    // The piano ADSP raises handover again after every power collapse (kernel.md §2.5, K:9adeb3213d24), so the bits may change often:
+    // the first 16 changes are logged, then every 64th; fatal and ready changes always are (below).
+    if (value != gSlave && (++gSlaveChanges <= 16 || gSlaveChanges % 64 == 0)) say("slave-kernel bits %#x (change %u)", value, gSlaveChanges);
     gSlave = value;
     gSlaveBits = (int32_t)value;
     if ((changed & value & kFatal)) {
@@ -642,6 +645,8 @@ void serviceSmp2p() {
         noteCrash();
     }
     if ((changed & ~value & kReady) && gStage >= PianoAdspReady) say("the DSP is no longer ready (slave-kernel %#x)", value);
+    if ((changed & value & kHandover) && gHandedOver && ++gHandoverAgain <= 3)
+        say("handover raised again (%u; a DSP power collapse): ignored, it is one-shot per DSP boot", gHandoverAgain);
     if ((value & kHandover) && !gHandedOver) {
         gHandedOver = true;
         say("handover: the DSP holds its own votes now");

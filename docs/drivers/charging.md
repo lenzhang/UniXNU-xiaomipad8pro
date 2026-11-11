@@ -391,54 +391,78 @@ changes with every build: it carries the build time as `droidvm-utc`). Not boote
 
 ## 5e. What the Ubuntu history adds (images I and G2, 2026-11-11)
 
-`docs/ubuntu-history/device.md` §2.5, §2.14 and §3.1 (the Ubuntu device and kernel history, GPL kernel read for facts only) change
-how the 07:28 drain reads and what level 2 sends:
+`docs/ubuntu-history/device.md` §2.5/§3.1 and `docs/ubuntu-history/kernel.md` §2.5/§3.1 (the Ubuntu device and kernel history; the
+GPL kernel read for facts only) change how the 07:28 drain reads and what level 2 sends:
 
-- **Linux never wrote 0x2019 or 0x2012**, and never saw 0 mA input with the DSP running (≥ 394 mA with no host write). So the H
-  image stays opt-in; image I does not write 0x2019.
-- **0x2008 reads back the requested limit, not the one in force** (Linux read 100 with 394 mA flowing), and **0x20004 reads 0
-  once the firmware considers charging done**. Our run was at 98 %. The verdict is the gauges' summed current, now in the diag
-  line; next runs should be at 40–90 % and on a wall DCP/PD charger as well as the Mac's port: Ubuntu has **no SDP/CDP charging
-  result at all**.
-- **The stock board configuration**, sent by Linux on every charger generation before any policy (as the stock subpmic driver
-  does): 0x201c = 1 byte 1 (charge pump present), 0x201a = 16 bytes (words 0, 1, 0xffffffff, 0xffffffff: the charger boost and
-  the PMIC GPIO controller, no external GPIOs), 0x201b = 0x708 (the firmware sets up cable-insertion detection from it). Now
-  sent the same way (`PianoMca.c` board(): before any policy write, read back in the diag line, retried for five cycles, again on
-  every new generation); the allowlist takes exactly these three values. `piano-power-board=0` leaves it out.
+- **Linux saw input current with no host write at all**: an SDP port at 5.041 V gave **394 mA** with the DSP running while 0x2008
+  read 100 and the type read 1 (K:1e4a0fc89fee). Linux never wrote 0x2019 or 0x2012. So the DSP's defaults do let a computer port
+  charge; H (the 0x2019 write) stays opt-in and image I does not write 0x2019.
+- **0x2008 reads back the requested limit, not the one in force**, and **0x20004 reads 0 once the firmware considers charging done**.
+  Our run was at 98 %. The verdict is the gauges' summed current (now on the `diag board:` line); next runs should be at 40–90 %
+  and on a wall DCP/PD charger as well as the Mac's port: Ubuntu has no CDP result at all, and only one SDP reading.
 - **Every client waits for `msm/adsp/charger_pd` to report up**: PianoQrtr.c now registers a listener with the DSP's service
-  registry notifier (QMI service 0x42, instance 74; `Servreg.h`, layout from Linux's pdr messages) and acknowledges every state
-  change; the charger codec, the port enable and the policy start only on "up" (or 60 s after the channel without an answer,
-  logged), and a new "up" sends everything again (the firmware is back on its defaults; Ubuntu #18 recovered only by re-sending).
-- **USB-C port notifications**: our encoding already matches Linux (enable = write request opcode 0x15 with cmd 0x10, ack = opcode
-  0x15 cmd 0x11 arg = port, notifications opcode 0x16); what differed is the timing: we enabled them before charger_pd was up,
-  and the 07:28 run counted no reply. The enable now goes after "up".
-- **The firmware's port view in a second diag line**: 0x21002 verify (an interrupted adapter authentication left 5 V on the bus with
-  both cells slowly discharging, Ubuntu #20), 0x200d OTG boost, 0x200e OTG gate, 0x21015 Type-C mode, 0x21022 sink/source mode,
-  0x20001 usb type, 0x2007 float (decoded), the board readbacks, the charger_pd state and generation, the gauges' current.
-- **DSP restarts**: a FATAL on SMP2P and a lost "ready" are logged with a count and the crash reason (Ubuntu #3: a
-  sensor-framework loop restarted the ADSP about 8 times a minute; natively nothing serves the sensors' files). Nothing restarts
-  the DSP natively yet; a FATAL means the charger is back on its defaults.
+  registry notifier (QMI service 0x42, instance 74; `Servreg.h`, message layout from Linux's PDR messages) and acknowledges every
+  state change; the charger codec, the port enable, the UCSI probe and the policy start only on "up" (or 60 s after the channel
+  without an answer, logged), and every new "up" (a new service generation) sends everything again: the firmware is back on its
+  defaults, and Ubuntu #18 recovered only by re-sending.
+- **The stock board configuration** per generation, before any policy write, in the stock order: 0x201c = 1 byte 1 (the SC8541
+  charge pump is present), then 0x201a = 16 bytes (words 0, 1, 0xffffffff, 0xffffffff), then 0x201b = 0x708 (the firmware's
+  cable-insertion detection id) (K:cf4d132fdee4, K:27490ca3d1f4, K:de5a8c2b874f). `PianoMca.c` board(): read back on the diag line,
+  retried for five cycles, the allowlist takes exactly these three values; `piano-power-board=0` leaves it out. Linux added it in
+  v0.5.0 for OTG, after sink charging already worked, so it is not proven to matter for input current.
+- **The three owners**: battery/charger 0x800a (Xiaomi's MCA properties), UCSI 0x800b, USB-C port (PAN) 0x800c. Our PAN encoding
+  already matched Linux (request {owner 0x800c, type 1, opcode 0x15, cmd, arg, reserved}: cmd 0x10 = enable with arg 0, cmd 0x11 =
+  ack with arg = port; notifications opcode low byte 0x16, the SVID in bits 31:16; every write answered with opcode 0x15). What
+  differed: we enabled before charger_pd was up, and gave the answer 1 s, not 5 s. Now the enable goes after "up", the answer gets
+  5 s, and the outcome is logged (`port notifications enabled` / `no answer from owner 0x800c`): no answer means that owner is not
+  served at all.
+- **UCSI, read only**: Linux runs a full UCSI client on every "up"; we run none. Both images now read the UCSI buffer once per
+  generation (owner 0x800b, opcode 0x11, the 12-byte header alone; the answer carries VERSION and CCI) and log UCSI notifications
+  (opcode 0x13), sending nothing back. It answers whether the owner is served; whether the DSP's Type-C state machine waits for a
+  UCSI host is *open* (kernel.md §3.1). `piano-power-ucsi=0` leaves the read out.
+- **The DSP's first QRTR HELLO is kept**: the DSP may send as soon as it holds one of our intents, before the channel reports up
+  here; Linux's GLINK dropped that first HELLO in 1 cold boot of 26 and then had no service at all (K:235ab34e2a6e). PianoQrtr.c
+  used to clear the router's state when the channel came up, which would have discarded such a HELLO; it now clears it when the
+  channel goes down, keeps what came first (`qrtr: the DSP's hello came before the channel's up ... kept`) and sends our HELLO
+  on "up" if it has not gone out yet.
+- **The firmware's view of the port**, read every cycle (`diag port:`): 0x21002 verify (adapter authentication in progress; an
+  interrupted one left 5 V on the bus with both cells slowly discharging, Ubuntu #20), 0x2100d PD state (2 = SNK_Ready), 0x2100c
+  data role (1 UFP, 2 DFP), 0x200d/0x200e OTG boost/gate, 0x21020 OTG plug-in, 0x21015 Type-C mode, 0x21021 CC toggle, 0x21022
+  sink/source mode, 0x20001 online. A DSP that believes it sources, or is stuck authenticating, shows here.
+- **DSP restarts and handover**: a FATAL and a lost "ready" are logged with a count and the crash reason (Ubuntu #3: a sensor
+  loop restarted the ADSP about 8 times a minute; natively nothing serves the sensors' files). Nothing restarts the DSP natively
+  yet; a FATAL means the charger is back on its defaults. The piano ADSP raises handover again after every power collapse
+  (K:9adeb3213d24); ours was already one-shot (the proxy votes go once), the re-raises are now counted and the slave-kernel bit
+  changes are logged for the first 16, then every 64th.
+- **The float voltage default is 4400 mV** (0x2007 reads 5200; §0 corrected), shown decoded on the `diag board:` line.
 
-Expected new lines (level 2):
+Expected new lines (level 2; the values are what Linux saw or what is to be found):
 
 ```
+PianoPower: qrtr: the DSP said hello (node 5)       (or: the DSP's hello came before the channel's up (node 5, N services): kept)
 PianoPower: servreg: the notifier is at 5:N (instance 0x4a01); registering a listener for msm/adsp/charger_pd: sent
 PianoPower: servreg: msm/adsp/charger_pd is up (0x1fffffff, registration answer)
+PianoPower: mca: PMIC_RTR_ADSP_APPS up: waiting for msm/adsp/charger_pd to report up
 PianoPower: mca: msm/adsp/charger_pd is up: reading the charger properties
-PianoPower: mca: write CP state (0x201c) = 1: ok (0)          (image I only)
-PianoPower: mca: write OTG configuration (0x201a) = 0: ok (0)  (the 16-byte constant)
+PianoPower: ucsi: reading the buffer of owner 0x800b (read only)
+PianoPower: ucsi: owner 0x800b answers: version 1.0, CCI 0x..., 48-byte buffer (UCSI 1.x), return code 0   (or: no answer in 5 s)
+PianoPower: mca: USB-C port notifications enabled: owner 0x800c answered the enable (opcode 0x15, cmd 0x10)
+PianoPower: mca: write CP state (0x201c) = 1: ok (0)                (image I only, these four)
+PianoPower: mca: write OTG configuration (0x201a) = 0: ok (0)       (the 16-byte constant)
 PianoPower: mca: write CID configuration (0x201b) = 1800: ok (0)
 PianoPower: mca: board configuration taken (CP state, OTG configuration, CID): the policy follows
-PianoPower: [45s] diag port: verify (0x21002) 0, OTG boost (0x200d) 0, ..., float (0x2007) 5200 = 4400 mV; board: CP state
-  (0x201c) 1, CID (0x201b) 0x708, OTG (0x201a) word 0 0, sent 0x7; charger_pd up (generation 1); battery (gauges) ... mA
+PianoPower: [45s] diag port: verify (0x21002) 0, PD state (0x2100d) ..., data role (0x2100c) ..., ..., online (0x20001) 1
+PianoPower: [45s] diag board: CP (0x201c) 1, CID (0x201b) 0x708, OTG (0x201a) 0, sent 0x7; float (0x2007) 5200 = 4400 mV;
+  port enable answered; UCSI answered; charger_pd up (generation 1); battery (gauges) ... mA
 ```
 
 | Image | Arguments (plus `exec-log=1 piano-usb=2`, built with `PIANO_GPU=2 PIANO_VMM_PRESENT=0`) | What it answers |
 |---|---|---|
-| G2 | `piano-power=2 piano-power-write=0` | read only: the charger_pd wait, the port enable after "up", both diag lines; no write at all |
+| G2 | `piano-power=2 piano-power-write=0` | no charger write: the charger_pd wait, the port enable after "up" (answered or not), the UCSI read, both new diag lines |
 | I | `piano-power=2` | the same plus the board configuration, then the policy (ICL/FCC by type, CDP 900 mA); no 0x2019 write |
 
-Both take PianoA830's DRV-2 lock for our rail votes, so they run with `piano-gpu=2`. Commands (main checkout):
+Both take PianoA830's DRV-2 lock for our rail votes, so they run with `piano-gpu=2` (`PIANO_GPU=2` adds `piano-gpu=2
+piano-gpu-delay=20`). Commands (main checkout):
 
 ```sh
 PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300 \
@@ -448,10 +472,13 @@ PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300 \
   PIANO_EXTRA_ARGS="exec-log=1 piano-usb=2 piano-power=2" tooling/k27/build-native-image.sh
 mkdir -p out/ram-power/I && cp out/ram/boot-piano-macos-ram-A-bundled.img out/ram/build-A-bundled.json out/ram-power/I/
 tooling/native/native-loop.sh out/ram-power/G2/boot-piano-macos-ram-A-bundled.img out/ram-dump/boot-piano-macos-ram-A-bundled.img
-grep -E 'PianoPower: (servreg|mca|\[[0-9]+s\] (diag|battery|mca))' logs/native-runs/<ts>-loop/xnu-console.txt
+grep -E 'PianoPower: (qrtr|servreg|ucsi|mca|\[[0-9]+s\] (diag|battery|mca))' logs/native-runs/<ts>-loop/xnu-console.txt
 ```
 
-Run G2, then I, each at 40–90 % and once on a wall charger; the battery current on the `battery:` line is the verdict.
+Run G2, then I, each at 40–90 % and once on a wall charger; the gauges' current on the `diag board:` and `battery:` lines is
+the verdict. Reading G2: charger_pd never "up" → the gate is the PD itself (the 60 s fallback line follows); `port enable NO
+ANSWER` or `UCSI NO ANSWER` → that owner is not served; `verify` non-zero or `sink/source`/`data role` showing a source → the DSP
+is not sinking; all normal with the gauges still negative → image I (the board configuration) is next, then a UCSI client.
 
 ## 6. Risks
 
@@ -466,7 +493,13 @@ Run G2, then I, each at 40–90 % and once on a wall charger; the battery curren
 - **TLMM:** the gauge pins are switched to GPIOs and back every report; a wrong SDA/SCL assignment gives "no ack" lines, not
   damage (open drain only). The SC8541 shares bus A and is never addressed.
 - **Protocol assumptions:** owner 0x800c for port notifications; PD ids of the OS3 firmware (HyperOS 4 moves 0x2100b–0x21026 by
-  one: keep `piano-power-hv` off with other firmware); FCC cannot be read back; the Rp bit meaning.
+  one: keep `piano-power-hv` off with other firmware; the §5e diag reads 0x2100c, 0x2100d, 0x21015 and 0x21020–0x21022 are
+  Linux's ids and would show a neighbouring property there, harmless as reads but misleading); FCC cannot be read back; the Rp
+  bit meaning.
+- **Board configuration (image I):** three writes of the stock values Linux and the stock driver send on every DSP start; the
+  allowlist takes nothing else. 0x201a sets up the OTG boost path, which only acts when the port sources (never in these tests).
+- **UCSI read (both images):** a read of the PPM's buffer, no UCSI command; a firmware that starts its UCSI machine on the first
+  read would then send notifications nobody answers (logged, the first 8).
 - **Thermal:** nothing beyond the DSP's JEITA window and the 500 mA floor at ≥ 38 °C; no charge-pump or fast charging.
 
 ## 7. Open questions

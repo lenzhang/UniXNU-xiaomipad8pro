@@ -71,4 +71,12 @@ names, docs/drivers/charging.md §5a and §5c); no code is taken.
 
 Xiaomi's stock charger modules (the mca_*, qcom_subpmic_proxy and qcom_adsp_pd_protocol binaries in the stock vendor_boot ramdisk)
 are proprietary and are NOT a source for this package: no property id, register map or sequence here comes from disassembling them.
-The ids come from the GPL driver's text and the APSL K90 port's notes, read as descriptions, and are confirmed on the device. Not used at all: Linux's qcom_battmgr, pmic_glink, qcom_q6v5_pas, bq27xxx and spmi-pmic-arb sources.
+The ids come from the GPL driver's text and the APSL K90 port's notes, read as descriptions, and are confirmed on the device. Not used at all: Linux's qcom_battmgr, qcom_q6v5_pas, bq27xxx and spmi-pmic-arb sources.
+
+Specification only (GPL-2.0, read for wire facts, never copied), 2026-11-11: the Ubuntu piano kernel (unixnu-research/ubuntu-ref/kernel,
+branch piano/dev) as digested in docs/ubuntu-history/device.md and kernel.md: the board configuration (0x201c, 0x201a, 0x201b and their
+values and order), the charger_pd gate and the per-generation re-send, the diag property ids, the PAN and UCSI message layouts
+(pmic_glink_altmode.c, ucsi_glink.c: the 24-byte PAN write, the header-only UCSI buffer read answered by the buffer and a return code)
+and the service registry messages (Linux's PDR message definitions: listener registration 0x20, state indication 0x22, ack 0x23 and
+their TLV ids). Servreg.h, the listener in PianoQrtr.c and the PianoMca.c additions are written fresh from those descriptions; the
+UCSI buffer offsets (VERSION 0, CCI 4) are the UCSI specification's.

@@ -122,21 +122,35 @@ static void locator(void *context, QcomQrtr *q, uint32_t port, uint32_t node, ui
     IOLog("PianoPower: qrtr: the DSP asks the locator for \"%s\": %s\n", name, sent ? "answered" : n ? "answer not sent" : "not answered");
 }
 
+/* The link's state. The old link's hello and services are forgotten when it goes DOWN, not when the new one comes up: the DSP may send
+ * as soon as it holds one of our intents, before the channel reports up here, and its first message is its name service's HELLO.
+ * Losing that HELLO left Linux with every channel open and no service at all, 1 cold boot in 26 (docs/ubuntu-history/kernel.md §2.5,
+ * K:235ab34e2a6e); here a HELLO (and the servers after it) that came first is kept, and ours goes out on "up" if it has not yet. */
+static void forget(void)
+{
+    gRegistered = 0;
+    gQrtr.hello_sent = gQrtr.hello_received = 0;
+    gQrtr.remote_count = 0;
+    gQrtr.remote_node = QCOM_QRTR_NODE_BROADCAST;
+}
+
 static void linkState(void *context, int up)
 {
     (void)context;
-    gRegistered = 0;
-    if (gPdState) pdState(0, up ? "link restarted" : "link down");
-    if (up) {
-        /* a fresh link: forget the old one's hello and services, keep ours */
-        gQrtr.hello_sent = gQrtr.hello_received = 0;
-        gQrtr.remote_count = 0;
-        gQrtr.remote_node = QCOM_QRTR_NODE_BROADCAST;
-        gStage = 2;
-        qcom_qrtr_start(&gQrtr);
-    } else {
+    if (!up) {
+        if (gPdState) pdState(0, "link down");
+        forget();
         gStage = 1;
+        return;
     }
+    gStage = 2;
+    if (gQrtr.hello_received) {
+        gStage = 3;
+        IOLog("PianoPower: qrtr: the DSP's hello came before the channel's up (node %u, %u services): kept\n", gQrtr.remote_node,
+              gQrtr.remote_count);
+    }
+    if (!gQrtr.hello_sent) qcom_qrtr_start(&gQrtr);
+    servregRegister();
 }
 
 static void linkReceive(void *context, const uint8_t *data, uint32_t length)

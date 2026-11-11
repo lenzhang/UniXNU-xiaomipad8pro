@@ -51,7 +51,7 @@ volatile int32_t piano_power_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor, board;
+  uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor, board, ucsi;
   bool hasRtcOffset;
   uint32_t rtcOffset;
 };
@@ -75,6 +75,7 @@ void readArgs()
   gArgs.hv = bootArg("piano-power-hv", 0);
   gArgs.unsuspend = bootArg("piano-power-unsuspend", 0);
   gArgs.board = bootArg("piano-power-board", 1);   // the stock board configuration at level 2 with writes (PianoMca.h)
+  gArgs.ucsi = bootArg("piano-power-ucsi", 1);     // one read of the UCSI owner's buffer per charger generation (PianoMca.h)
   gArgs.ps = bootArg("piano-power-ps", 0);            // the battery for macOS (PianoBattery.cpp)
   gArgs.psFloor = bootArg("piano-power-ps-floor", 0); // the lowest percentage shown on battery (BatteryMap.h)
   if (gArgs.psFloor > 50) gArgs.psFloor = 50;
@@ -85,7 +86,7 @@ void readArgs()
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void note(const char *fmt, ...)
 {
-  char line[400];
+  char line[512];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(line, sizeof line, fmt, ap);
@@ -220,7 +221,8 @@ class PianoPower : public IOService {
   bool fChannelUp = false, fGateTimedOut = false;
   uint64_t fChannelSinceMs = 0;
   uint32_t fPdUpsLinked = 0;
-  uint64_t fRequestDue = 0, fPanDue = 0, fCycleDue = 0, fReadyWarnDue = 0;
+  uint64_t fRequestDue = 0, fPanDue = 0, fUcsiDue = 0, fCycleDue = 0, fReadyWarnDue = 0;
+  uint32_t fUcsiNotesLogged = 0;
   uint64_t fStartMs = 0;
 
   bool probeSpmi();
@@ -235,7 +237,7 @@ class PianoPower : public IOService {
   void logMcaEvents();
   void mcaLine(char *line, size_t size);
   void diagLine(char *line, size_t size);
-  void diagPortLine(char *line, size_t size);
+  void diagPortLine(char *line, size_t size, bool board);
   void publishBattery(uint64_t t, const PortState *port);
   void run();
   static void thread(void *self, wait_result_t);
@@ -418,7 +420,7 @@ void PianoPower::mcaLine(char *line, size_t size)
 // USB-C port notification at all. Read only: nothing here writes.
 // The port as the firmware sees it, the board configuration read back, the charger domain and the gauges (docs/ubuntu-history/
 // device.md §3.1): a DSP that believes it sources, or is stuck in an adapter authentication, explains a live bus with no input.
-void PianoPower::diagPortLine(char *line, size_t size)
+void PianoPower::diagPortLine(char *line, size_t size, bool board)
 {
   const PianoMca &m = fMca;
 #define HAS(f) piano_mca_has(&m, f)
@@ -426,13 +428,22 @@ void PianoPower::diagPortLine(char *line, size_t size)
   uint32_t ups = 0;
   const uint32_t pd = piano_qrtr_charger_pd(&ups);
   const int termRaw = VAL(McaTermVolt);
-  snprintf(line, size,
-           "diag port: verify (0x21002) %d, OTG boost (0x200d) %d, OTG gate (0x200e) %d, Type-C mode (0x21015) %d, sink/source "
-           "(0x21022) %d, usb type (0x20001) %d, float (0x2007) %d = %d mV; board: CP state (0x201c) %d, CID (0x201b) %#x, OTG "
-           "(0x201a) word 0 %d, sent %#x%s; charger_pd %s (generation %u); battery (gauges) %d mA",
-           VAL(McaVerify), VAL(McaOtgBoost), VAL(McaOtgGate), VAL(McaTypecMode), VAL(McaSnkSrc), VAL(McaUsbType), termRaw,
-           HAS(McaTermVolt) ? (termRaw + 3600) / 2 : -1, VAL(McaCpState), (uint32_t)VAL(McaCidCfg), VAL(McaOtgCfg), m.board_done,
-           m.board_allowed ? "" : " (off)", servreg_state_name(pd), ups, fBattery.ok ? fBattery.currentMa : 0);
+  static const char *const kPan[] = {"not answered yet", "answered", "NO ANSWER"};
+  static const char *const kUcsi[] = {"off", "due", "asked", "answered", "NO ANSWER"};
+  if (!board) {
+    snprintf(line, size,
+             "diag port: verify (0x21002) %d, PD state (0x2100d) %d, data role (0x2100c) %d, OTG boost (0x200d) %d, gate (0x200e) %d, "
+             "plug-in (0x21020) %d, Type-C mode (0x21015) %d, CC toggle (0x21021) %d, sink/source (0x21022) %d, online (0x20001) %d",
+             VAL(McaVerify), VAL(McaPdState), VAL(McaDataRole), VAL(McaOtgBoost), VAL(McaOtgGate), VAL(McaOtgPlugin),
+             VAL(McaTypecMode), VAL(McaCcToggle), VAL(McaSnkSrc), VAL(McaUsbType));
+  } else {
+    snprintf(line, size,
+             "diag board: CP (0x201c) %d, CID (0x201b) %#x, OTG (0x201a) %d, sent %#x%s; float (0x2007) %d = %d mV; port enable %s; "
+             "UCSI %s; charger_pd %s (generation %u); battery (gauges) %d mA",
+             VAL(McaCpState), (uint32_t)VAL(McaCidCfg), VAL(McaOtgCfg), m.board_done, m.board_allowed ? "" : " (off)", termRaw,
+             HAS(McaTermVolt) ? (termRaw + 3600) / 2 : -1, kPan[m.pan_enabled < 3 ? m.pan_enabled : 0], kUcsi[m.ucsi < 5 ? m.ucsi : 0],
+             servreg_state_name(pd), ups, fBattery.ok ? fBattery.currentMa : 0);
+  }
 #undef VAL
 #undef HAS
 }
@@ -531,7 +542,9 @@ void PianoPower::report()
     note("[%llus] %s", t, line);
     diagLine(line, sizeof line);
     note("[%llus] %s", t, line);
-    diagPortLine(line, sizeof line);
+    diagPortLine(line, sizeof line, false);
+    note("[%llus] %s", t, line);
+    diagPortLine(line, sizeof line, true);
     note("[%llus] %s", t, line);
   } else {
     PianoAdspSurvey s;
@@ -569,6 +582,7 @@ void PianoPower::startCharger()
   piano_mca_init(&fMca, gArgs.write ? 1 : 0, gArgs.hv != 0);
   piano_mca_allow_unsuspend(&fMca, gArgs.unsuspend != 0);
   piano_mca_allow_board(&fMca, gArgs.board != 0);
+  piano_mca_allow_ucsi(&fMca, gArgs.ucsi != 0);
   if (fBattery.ok) piano_mca_battery_temperature(&fMca, 1, fBattery.tempDeciC / 10);
   static const PianoAdspClient client = {&PianoPower::channelState, &PianoPower::channelReceive};
   fChannel = piano_adsp_channel("PMIC_RTR_ADSP_APPS", 1024, 4, 0, &client, this);
@@ -596,6 +610,9 @@ void PianoPower::logMcaEvents()
   if (e & McaEvHvOn) note("mca: the bus is at %d mV: 9 V on", m.value[McaBusVoltage] / 1000);
   if (e & McaEvHvBlocked) note("mca: 9 V not reached or lost: 5 V until the source is detached");
   if (e & McaEvRefused) note("mca: a write outside the allowed set was refused (%u so far)", m.refused);
+  if (e & McaEvPanEnabled) note("mca: USB-C port notifications enabled: owner 0x800c answered the enable (opcode 0x15, cmd 0x10)");
+  if (e & McaEvPanSilent) note("mca: no answer from owner 0x800c to the port enable in 5 s: the port owner is not served now");
+  if (e & McaEvUcsiSilent) note("ucsi: no answer from owner 0x800b in 5 s");
   if (e & McaEvBoardDone) note("mca: board configuration taken (CP state, OTG configuration, CID): the policy follows");
   if (e & McaEvBoardGaveUp) note("mca: board configuration not taken after 5 cycles (sent %#x): the policy goes on without it", m.board_done);
   if (e & McaEvWrite) {
@@ -619,11 +636,20 @@ void PianoPower::pumpMca(uint64_t now)
       fRequestDue = now + 1000;
     }
   }
+  // The port owner's writes get 5 s each, as Linux gives them (kernel.md §2.5): no answer to the enable means the owner is not served.
   if (!fPanDue) {
     const uint32_t n = piano_mca_pan_next(&fMca, out);
     if (n) {
       piano_adsp_send(fChannel, out, n);
-      fPanDue = now + 1000;
+      fPanDue = now + 5000;
+    }
+  }
+  if (!fUcsiDue) {
+    const uint32_t n = piano_mca_ucsi_next(&fMca, out);
+    if (n) {
+      note("ucsi: reading the buffer of owner 0x800b (read only)");
+      piano_adsp_send(fChannel, out, n);
+      fUcsiDue = now + 5000;
     }
   }
 }
@@ -661,7 +687,7 @@ void PianoPower::serviceMca(uint64_t now)
     note("mca: %s", ready ? (pdUp ? "msm/adsp/charger_pd is up: reading the charger properties" : "reading the charger properties")
                           : "the charger is not reachable now: requests stop");
     piano_mca_link(&fMca, ready);
-    fRequestDue = fPanDue = 0;
+    fRequestDue = fPanDue = fUcsiDue = 0;
     fCycleDue = now + 5000;
     fWasUp = ready;
     fPdUpsLinked = ups;
@@ -681,6 +707,15 @@ void PianoPower::serviceMca(uint64_t now)
     const int r = piano_mca_receive(&fMca, data, length);
     if (r == McaAnswer || r == McaCycleDone || r == McaWritten) fRequestDue = 0;
     if (r == McaPanDone) fPanDue = 0;
+    if (r == McaUcsiDone) {
+      fUcsiDue = 0;
+      note("ucsi: owner 0x800b answers: version %x.%x, CCI %#x, %u-byte buffer (UCSI %s), return code %u", fMca.ucsi_version >> 8,
+           fMca.ucsi_version & 0xff, fMca.ucsi_cci, fMca.ucsi_bytes, fMca.ucsi_bytes > 48 ? "2.x" : "1.x", fMca.ucsi_ret);
+    }
+    if (r == McaUcsiNotified && fUcsiNotesLogged < 8) {
+      fUcsiNotesLogged++;
+      note("ucsi: notification from owner 0x800b (%u so far; nothing is sent back: we run no UCSI client)", fMca.ucsi_notifies);
+    }
     if (r == McaPanNotified) note("mca: USB-C port notification (port %u): acknowledged", data[12]);
     if (r == McaCycleDone) {
       char line[520];
@@ -692,7 +727,9 @@ void PianoPower::serviceMca(uint64_t now)
       if (fMca.cycles <= 12) {
         diagLine(line, sizeof line);
         note("[%llus] %s", (nowMs() - fStartMs) / 1000, line);
-        diagPortLine(line, sizeof line);
+        diagPortLine(line, sizeof line, false);
+        note("[%llus] %s", (nowMs() - fStartMs) / 1000, line);
+        diagPortLine(line, sizeof line, true);
         note("[%llus] %s", (nowMs() - fStartMs) / 1000, line);
       }
     }
@@ -700,6 +737,7 @@ void PianoPower::serviceMca(uint64_t now)
   if (!fWasUp) return;
   if (fRequestDue && now >= fRequestDue) {piano_mca_timeout(&fMca); fRequestDue = 0;}
   if (fPanDue && now >= fPanDue) {piano_mca_pan_timeout(&fMca); fPanDue = 0;}
+  if (fUcsiDue && now >= fUcsiDue) {piano_mca_ucsi_timeout(&fMca); fUcsiDue = 0;}
   if (now >= fCycleDue) {piano_mca_refresh(&fMca); fCycleDue = now + 5000;}
   pumpMca(now);
   logMcaEvents();

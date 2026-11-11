@@ -11,8 +11,9 @@
  *
  * This is the codec, one refresh cycle at a time (one request in flight; the owner's timer gives up on one after a second), and the
  * charging policy: after every cycle it decides which writes are due. Writes are limited to the input current limit, the charge
- * current, the charger's enable bit and the fixed PDO request, each within conservative bounds (piano_mca_write_allowed); anything
- * else is refused before it is built. No I/O and no waits: the owner sends the bytes and feeds back what arrives. */
+ * current, the charger's enable bit, the fixed PDO request, the opt-in input un-suspend and the stock board configuration, each within
+ * conservative bounds or to its one value (piano_mca_write_allowed); anything else is refused before it is built. The UCSI owner is
+ * only read (piano_mca_ucsi_next). No I/O and no waits: the owner sends the bytes and feeds back what arrives. */
 #ifndef PIANO_MCA_H
 #define PIANO_MCA_H
 #include <stdint.h>
@@ -35,6 +36,14 @@ extern "C" {
 #define PIANO_MCA_PAN_ENABLE 0x10u
 #define PIANO_MCA_PAN_ACK 0x11u
 #define PIANO_MCA_PAN_PORTS 3u
+/* The USB-C connector interface (UCSI) the same firmware serves under its own owner (docs/ubuntu-history/kernel.md §2.5): a read of
+ * the PPM's buffer is the 12-byte header alone (opcode 0x11); the answer is the header, the buffer (48 bytes for UCSI 1.x, larger for
+ * 2.x: VERSION at 0, CCI at 4, CONTROL at 8, MESSAGE_IN at 16) and a return code. Notifications: opcode 0x13. Read only here: it tells
+ * whether the owner is served at all (Linux runs a full UCSI client on every charger_pd "up"; we send no UCSI command). */
+#define PIANO_MCA_OWNER_UCSI 0x800bu
+#define PIANO_MCA_UCSI_READ 0x11u
+#define PIANO_MCA_UCSI_NOTIFY 0x13u
+#define PIANO_MCA_UCSI_REQUEST_BYTES 12u
 
 /* Properties; bits 31:16 are the class (0 charger and battery, 2 USB and PD). The PD ids are the OS3 firmware's (HyperOS 4 firmware
  * inserts one at 0x2100b and moves the later ones up by one). */
@@ -53,6 +62,10 @@ extern "C" {
 #define PIANO_MCA_SNK_SRC 0x21022u        /* sink/source mode */
 #define PIANO_MCA_USB_TYPE 0x20001u
 #define PIANO_MCA_TERM_VOLT 0x2007u       /* reads 2 x mV - 3600 (the default 4400 mV reads 5200) */
+#define PIANO_MCA_OTG_PLUGIN 0x21020u
+#define PIANO_MCA_CC_TOGGLE 0x21021u      /* 1 byte */
+#define PIANO_MCA_DATA_ROLE 0x2100cu      /* 1 UFP, 2 DFP (a write swaps: never written here) */
+#define PIANO_MCA_PD_STATE 0x2100du       /* 2 = SNK_Ready */
 /* The stock board configuration (Linux sends it on every charger generation before any policy, as the stock subpmic driver does):
  * charge pump present (1 byte, 1), the OTG configuration (16 bytes: words 0, 1, 0xffffffff, 0xffffffff: the charger boost and the
  * PMIC GPIO controller, no external GPIOs) and the cable-insertion detection identifier (u32 0x708). Written only these values. */
@@ -94,15 +107,17 @@ enum {
 enum {
     McaBusVoltage, McaBusCurrent, McaType, McaIcl, McaTbat, McaChargeEnable, McaStatus, McaPackVoltage, McaPackCurrent,
     McaInputSuspend, McaAiclEnable, McaAiclStatus, McaOtgBoost, McaOtgGate, McaTypecMode, McaSnkSrc, McaUsbType, McaTermVolt,
-    McaCpState, McaOtgCfg, McaCidCfg, McaVerify, McaPdos, McaFields
+    McaCpState, McaOtgCfg, McaCidCfg, McaOtgPlugin, McaCcToggle, McaDataRole, McaPdState, McaVerify, McaPdos, McaFields
 };
 
 /* receive results */
-enum {McaIgnored = 0, McaAnswer = 1, McaCycleDone = 2, McaNotified = 3, McaWritten = 4, McaPanNotified = 5, McaPanDone = 6};
+enum {McaIgnored = 0, McaAnswer = 1, McaCycleDone = 2, McaNotified = 3, McaWritten = 4, McaPanNotified = 5, McaPanDone = 6,
+      McaUcsiDone = 7, McaUcsiNotified = 8};
 /* events for the owner's log (piano_mca_take_events) */
 enum {
     McaEvAttach = 1u << 0, McaEvDetach = 1u << 1, McaEvWrite = 1u << 2, McaEvHvOn = 1u << 3, McaEvHvBlocked = 1u << 4,
     McaEvRefused = 1u << 5, McaEvHvAsked = 1u << 6, McaEvBoardDone = 1u << 7, McaEvBoardGaveUp = 1u << 8,
+    McaEvPanEnabled = 1u << 9, McaEvPanSilent = 1u << 10, McaEvUcsiSilent = 1u << 11,
 };
 enum {McaHvOff = 0, McaHvAsked = 1, McaHvOn = 2, McaHvBlocked = 3};
 
@@ -126,8 +141,12 @@ typedef struct {
     uint32_t icl_set, fcc_set;       /* what the firmware took since its start (0: nothing yet) */
     int32_t ext_tbat_c;              /* the gauges' temperature, from the owner */
     uint8_t ext_tbat_valid;
-    /* USB-C port notifications */
-    uint8_t pan_enable, pan_pending, pan_in_flight;
+    /* USB-C port notifications; pan_cmd: the command in flight; pan_enabled: 0 not answered yet, 1 answered, 2 no answer */
+    uint8_t pan_enable, pan_pending, pan_in_flight, pan_cmd, pan_enabled;
+    /* the UCSI probe: ucsi 0 off, 1 due, 2 in flight, 3 answered, 4 no answer; what the buffer read showed */
+    uint8_t ucsi_allowed, ucsi;
+    uint16_t ucsi_version;
+    uint32_t ucsi_cci, ucsi_ret, ucsi_bytes, ucsi_notifies;
     /* counters and the last write, for the log */
     uint32_t cycles, answers, errors, timeouts, ignored, notifications, writes_ok, writes_failed, refused, pan_notifies, pan_acks;
     uint32_t links;
@@ -145,7 +164,11 @@ void piano_mca_refresh(PianoMca *m);
 uint32_t piano_mca_next(PianoMca *m, uint8_t out[PIANO_MCA_REQUEST_BYTES]);
 /* The next port request (enable, then acknowledgements); 0 when none. */
 uint32_t piano_mca_pan_next(PianoMca *m, uint8_t out[PIANO_MCA_PAN_REQUEST_BYTES]);
-/* A message from the channel (either owner); returns a Mca* result. */
+/* The UCSI buffer read (once per link, when allowed); 0 when none is due. */
+uint32_t piano_mca_ucsi_next(PianoMca *m, uint8_t out[PIANO_MCA_UCSI_REQUEST_BYTES]);
+void piano_mca_ucsi_timeout(PianoMca *m);
+void piano_mca_allow_ucsi(PianoMca *m, int allow);
+/* A message from the channel (any of the three owners); returns a Mca* result. */
 int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length);
 /* The owner's timer gave up on the request (or the port request) in flight. */
 void piano_mca_timeout(PianoMca *m);

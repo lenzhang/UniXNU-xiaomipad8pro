@@ -33,9 +33,15 @@ static const struct {uint32_t property; uint8_t pd;} kFields[McaFields] = {
     [McaCpState] = {PIANO_MCA_CP_STATE, 0},
     [McaOtgCfg] = {PIANO_MCA_OTG_CFG, 0},
     [McaCidCfg] = {PIANO_MCA_CID_CFG, 0},
+    [McaOtgPlugin] = {PIANO_MCA_OTG_PLUGIN, 0},
+    [McaCcToggle] = {PIANO_MCA_CC_TOGGLE, 0},
+    [McaDataRole] = {PIANO_MCA_DATA_ROLE, 0},
+    [McaPdState] = {PIANO_MCA_PD_STATE, 0},
     [McaVerify] = {PIANO_MCA_VERIFY, 0},   /* always: a stuck adapter authentication holds the bus at 5 V (Ubuntu #20) */
     [McaPdos] = {PIANO_MCA_PDOS, 1},
 };
+
+_Static_assert(McaFields <= 32, "PianoMca.valid has one bit per field");
 
 /* piano's OTG configuration (PIANO_MCA_OTG_CFG): the charger boost, the PMIC GPIO controller, no external GPIOs. */
 static const uint32_t kOtgConfig[4] = {0, 1, 0xffffffffu, 0xffffffffu};
@@ -49,7 +55,7 @@ static int is_pd(int type) {return type == PIANO_MCA_TYPE_PD || type == PIANO_MC
 /* The properties whose payload is one byte, not four. */
 static int one_byte(unsigned field)
 {
-    return field == McaChargeEnable || field == McaInputSuspend || field == McaAiclEnable || field == McaCpState;
+    return field == McaChargeEnable || field == McaInputSuspend || field == McaAiclEnable || field == McaCpState || field == McaCcToggle;
 }
 
 void piano_mca_init(PianoMca *m, unsigned policy, int hv_allowed)
@@ -73,7 +79,8 @@ void piano_mca_link(PianoMca *m, int up)
     m->cursor = NO_CYCLE;
     m->in_flight = m->refresh_wanted = 0;
     m->queued = m->sent_write = 0;
-    m->pan_in_flight = m->pan_pending = 0;
+    m->pan_in_flight = m->pan_pending = m->pan_enabled = 0;
+    m->ucsi = 0;
     m->valid = 0;
     m->pdos = 0;
     if (!up) {m->pan_enable = 0; return;}
@@ -83,6 +90,7 @@ void piano_mca_link(PianoMca *m, int up)
     m->attached = 0;
     reset_attach(m);
     m->pan_enable = 1;
+    if (m->ucsi_allowed) m->ucsi = 1;
     piano_mca_refresh(m);
 }
 
@@ -182,8 +190,26 @@ uint32_t piano_mca_pan_next(PianoMca *m, uint8_t out[PIANO_MCA_PAN_REQUEST_BYTES
     put32(out + 12, command);
     put32(out + 16, argument);
     m->pan_in_flight = 1;
+    m->pan_cmd = (uint8_t)command;
     return PIANO_MCA_PAN_REQUEST_BYTES;
 }
+
+uint32_t piano_mca_ucsi_next(PianoMca *m, uint8_t out[PIANO_MCA_UCSI_REQUEST_BYTES])
+{
+    if (m->ucsi != 1) return 0;
+    header(out, PIANO_MCA_OWNER_UCSI, PIANO_MCA_UCSI_READ);
+    m->ucsi = 2;
+    return PIANO_MCA_UCSI_REQUEST_BYTES;
+}
+
+void piano_mca_ucsi_timeout(PianoMca *m)
+{
+    if (m->ucsi != 2) return;
+    m->ucsi = 4;
+    m->events |= McaEvUcsiSilent;
+}
+
+void piano_mca_allow_ucsi(PianoMca *m, int allow) {m->ucsi_allowed = allow != 0;}
 
 /* ---- the policy ---- */
 uint32_t piano_mca_icl_for(int type, uint32_t pdo5v_ma)
@@ -367,7 +393,13 @@ void piano_mca_timeout(PianoMca *m)
     finish(m);
 }
 
-void piano_mca_pan_timeout(PianoMca *m) {m->pan_in_flight = 0;}
+void piano_mca_pan_timeout(PianoMca *m)
+{
+    if (!m->pan_in_flight) return;
+    m->pan_in_flight = 0;
+    /* No answer to the enable: the owner is not served now (kernel.md §3.1); the acks are not retried either. */
+    if (m->pan_cmd == PIANO_MCA_PAN_ENABLE && !m->pan_enabled) {m->pan_enabled = 2; m->events |= McaEvPanSilent;}
+}
 
 void piano_mca_allow_unsuspend(PianoMca *m, int allow)
 {
@@ -398,7 +430,8 @@ static int receive_pan(PianoMca *m, const uint8_t *data, uint32_t length)
     if (opcode == PIANO_MCA_PAN_WRITE) {
         if (!m->pan_in_flight) {m->ignored++; return McaIgnored;}
         m->pan_in_flight = 0;
-        m->pan_acks++;
+        m->pan_acks++;   /* the answers to our writes (the enable's included); they carry nothing else */
+        if (m->pan_cmd == PIANO_MCA_PAN_ENABLE && m->pan_enabled != 1) {m->pan_enabled = 1; m->events |= McaEvPanEnabled;}
         return McaPanDone;
     }
     if (opcode == PIANO_MCA_PAN_NOTIFY && length >= 13 && data[12] < PIANO_MCA_PAN_PORTS) {
@@ -410,11 +443,26 @@ static int receive_pan(PianoMca *m, const uint8_t *data, uint32_t length)
     return McaIgnored;
 }
 
+static int receive_ucsi(PianoMca *m, const uint8_t *data, uint32_t length)
+{
+    const uint32_t opcode = le32(data + 8) & 0xff;
+    if (opcode == PIANO_MCA_UCSI_NOTIFY) {m->ucsi_notifies++; return McaUcsiNotified;}
+    if (opcode != PIANO_MCA_UCSI_READ || m->ucsi != 2 || length < 12 + 8 + 4) {m->ignored++; return McaIgnored;}
+    const uint32_t bytes = length - 12 - 4;   /* the buffer between the header and the return code */
+    m->ucsi_bytes = bytes;
+    m->ucsi_version = (uint16_t)(data[12] | data[13] << 8);
+    m->ucsi_cci = le32(data + 16);
+    m->ucsi_ret = le32(data + 12 + bytes);
+    m->ucsi = 3;
+    return McaUcsiDone;
+}
+
 int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length)
 {
     if (!data || length < 12) {m->ignored++; return McaIgnored;}
     const uint32_t owner = le32(data), type = le32(data + 4), opcode = le32(data + 8);
     if (owner == PIANO_MCA_OWNER_PAN) return receive_pan(m, data, length);
+    if (owner == PIANO_MCA_OWNER_UCSI) return receive_ucsi(m, data, length);
     if (owner != PIANO_MCA_OWNER) {m->ignored++; return McaIgnored;}
     if (type == PIANO_MCA_TYPE_NOTIFY) {
         m->notifications++;

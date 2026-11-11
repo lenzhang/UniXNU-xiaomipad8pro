@@ -684,6 +684,67 @@ static void testServreg()
   CHECK(servreg_register_listener(out, 10, 1, SERVREG_CHARGER_PD) == 0);   // too small: nothing built
 }
 
+// The port owner's enable answered or not, notifications with an SVID in the opcode's high half, and the read-only UCSI probe.
+static void testPortOwners()
+{
+  PianoMca m;
+  piano_mca_init(&m, 0, 0);
+  piano_mca_link(&m, 1);
+  uint8_t out[PIANO_MCA_PAN_REQUEST_BYTES];
+  CHECK(piano_mca_pan_next(&m, out) == PIANO_MCA_PAN_REQUEST_BYTES && le32(out + 12) == PIANO_MCA_PAN_ENABLE && le32(out + 16) == 0);
+  CHECK(le32(out + 20) == 0 && m.pan_enabled == 0);
+  piano_mca_pan_timeout(&m);
+  CHECK(m.pan_enabled == 2 && (piano_mca_take_events(&m) & McaEvPanSilent) && !piano_mca_pan_next(&m, out));
+  piano_mca_link(&m, 0);
+  piano_mca_link(&m, 1);
+  CHECK(m.pan_enabled == 0 && piano_mca_pan_next(&m, out));
+  uint8_t reply[16] = {};
+  put32(reply, PIANO_MCA_OWNER_PAN); put32(reply + 4, PIANO_MCA_TYPE_REQUEST); put32(reply + 8, PIANO_MCA_PAN_WRITE);
+  CHECK(piano_mca_receive(&m, reply, sizeof reply) == McaPanDone && m.pan_enabled == 1);
+  CHECK(piano_mca_take_events(&m) & McaEvPanEnabled);
+  uint8_t note[32] = {};
+  put32(note, PIANO_MCA_OWNER_PAN); put32(note + 4, PIANO_MCA_TYPE_NOTIFY); put32(note + 8, 0xff010000u | PIANO_MCA_PAN_NOTIFY);
+  CHECK(piano_mca_receive(&m, note, sizeof note) == McaPanNotified);   // the DP SVID in bits 31:16
+  CHECK(piano_mca_pan_next(&m, out) && le32(out + 12) == PIANO_MCA_PAN_ACK && le32(out + 16) == 0);
+  CHECK(piano_mca_receive(&m, reply, sizeof reply) == McaPanDone && !(piano_mca_take_events(&m) & McaEvPanEnabled));
+
+  // UCSI: nothing without the allowance; then one read per link.
+  uint8_t u[PIANO_MCA_UCSI_REQUEST_BYTES];
+  CHECK(!piano_mca_ucsi_next(&m, u));
+  piano_mca_allow_ucsi(&m, 1);
+  piano_mca_link(&m, 0);
+  piano_mca_link(&m, 1);
+  CHECK(piano_mca_ucsi_next(&m, u) == PIANO_MCA_UCSI_REQUEST_BYTES && !piano_mca_ucsi_next(&m, u));
+  CHECK(le32(u) == PIANO_MCA_OWNER_UCSI && le32(u + 4) == PIANO_MCA_TYPE_REQUEST && le32(u + 8) == PIANO_MCA_UCSI_READ);
+  uint8_t r[12 + 48 + 4] = {};
+  put32(r, PIANO_MCA_OWNER_UCSI); put32(r + 4, PIANO_MCA_TYPE_REQUEST); put32(r + 8, PIANO_MCA_UCSI_READ);
+  r[12] = 0x00; r[13] = 0x01;            // VERSION 1.0
+  put32(r + 16, 0x20000000u);            // CCI: busy
+  put32(r + 12 + 48, 0);
+  CHECK(piano_mca_receive(&m, r, 20) == McaIgnored);   // too short to hold a buffer and a return code
+  CHECK(piano_mca_receive(&m, r, sizeof r) == McaUcsiDone);
+  CHECK(m.ucsi == 3 && m.ucsi_version == 0x100 && m.ucsi_cci == 0x20000000u && m.ucsi_bytes == 48 && m.ucsi_ret == 0);
+  CHECK(piano_mca_receive(&m, r, sizeof r) == McaIgnored);   // nothing asked any more
+  uint8_t un[24] = {};
+  put32(un, PIANO_MCA_OWNER_UCSI); put32(un + 4, PIANO_MCA_TYPE_NOTIFY); put32(un + 8, PIANO_MCA_UCSI_NOTIFY);
+  CHECK(piano_mca_receive(&m, un, sizeof un) == McaUcsiNotified && m.ucsi_notifies == 1);
+  piano_mca_link(&m, 0);
+  piano_mca_link(&m, 1);
+  CHECK(piano_mca_ucsi_next(&m, u));
+  piano_mca_ucsi_timeout(&m);
+  CHECK(m.ucsi == 4 && (piano_mca_take_events(&m) & McaEvUcsiSilent) && !piano_mca_ucsi_next(&m, u));
+
+  // The firmware's port view is read every cycle.
+  Dsp d;
+  d.props[PIANO_MCA_BUS_VOLTAGE] = 5000000;
+  PianoMca c;
+  piano_mca_init(&c, 0, 0);
+  piano_mca_link(&c, 1);
+  d.run(c);
+  CHECK(d.readsOf[PIANO_MCA_PD_STATE] == 1 && d.readsOf[PIANO_MCA_DATA_ROLE] == 1 && d.readsOf[PIANO_MCA_OTG_PLUGIN] == 1);
+  CHECK(d.readsOf[PIANO_MCA_CC_TOGGLE] == 1 && d.writes.empty());
+}
+
 static void testMcaHv()
 {
   // A PD source with 5 V/3 A and 9 V/3 A: 900 mA... then the 5 V PDO's limit, 9 V after three cycles, then 1.6 A.
@@ -855,6 +916,7 @@ int main()
   testMcaHv();
   testBoardConfig();
   testServreg();
+  testPortOwners();
   if (gFailures) {
     std::fprintf(stderr, "power_host: %d failure(s)\n", gFailures);
     return 1;
