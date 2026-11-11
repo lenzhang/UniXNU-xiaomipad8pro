@@ -2,9 +2,11 @@
 // Copyright (c) 2026, UniXNU-piano contributors. All rights reserved.
 // piano-rotated: automatic display rotation on native macOS for piano (docs/drivers/sensors.md section 5a). A launchd agent
 // (com.unixnu.piano-rotated.plist: the login window's session and each user's, so it acts at the login window too) that
-//   reads    PianoSensors' "piano-sensors-edge" (the panel edge up: 0 top, 1 left, 2 bottom, 3 right, anything else none) and
-//            PianoKeyboard's "piano-keyboard-attached" (the cover, 0/1), IORegistry properties of their services, on each
-//            kIOMessageServicePropertyChange they send (no polling);
+//   reads    PianoSensors' "piano-sensors-edge" (its level 4: "top", "left", "bottom", "right", "none"; a number 0..3 is taken
+//            too) whenever its "piano-sensors-seq" moves, polled every 250 ms only while that can matter (PianoSensors at level 4,
+//            the cover not attached; every 5 s while the display sleeps): PianoSensors sets its properties without a notification
+//            (sensors.md section 5) and is found by class even unregistered; PianoKeyboard's "piano-keyboard-attached" (0/1) on each
+//            kIOMessageServicePropertyChange it sends;
 //   decides  AutoRotate.c over SensorsPolicy's ps_rotation_step, the functions the host tests run;
 //   rotates  WindowServer's own rotation of the panel's display, the one System Settings > Displays > Rotation sets. No public API
 //            sets it (CoreGraphics only reads it: CGDisplayRotation); the setter used is MonitorPanel's (a private framework):
@@ -49,6 +51,8 @@
 #define APP "com.unixnu.piano-rotated"
 #define PREFS_NOTIFICATION APP ".prefs"
 #define EDGE_PROPERTY "piano-sensors-edge"
+#define SEQ_PROPERTY "piano-sensors-seq"
+#define SENSORS_LEVEL_PROPERTY "piano-sensors"
 #define COVER_PROPERTY "piano-keyboard-attached"
 // NativeGopDisplay's ProductAttributes: ManufacturerID "XMI" (EISA: X=24, M=13, I=9), ProductID 0x8750.
 static const uint32_t kPanelVendor = (24u << 10) | (13u << 5) | 9u, kPanelModel = 0x8750;
@@ -285,6 +289,42 @@ static int readNumber(io_service_t s, const char *key, long *out)
 
 // PianoTouch told the rotation shown. Three failures in a row (no PianoTouch, or one without the property: kIOReturnUnsupported) end
 // the retries until the rotation changes again, so a missing driver costs no wake-ups.
+// PianoSensors' edge: its name (ps_edge_name) or, from an earlier draft, the number; anything else is none.
+static int readEdge(io_service_t s)
+{
+    if (!s) return PS_EDGE_NONE;
+    CFTypeRef v = IORegistryEntryCreateCFProperty(s, CFSTR(EDGE_PROPERTY), kCFAllocatorDefault, 0);
+    int edge = PS_EDGE_NONE;
+    if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+        char name[16];
+        if (CFStringGetCString((CFStringRef)v, name, sizeof name, kCFStringEncodingUTF8))
+            for (int e = PS_EDGE_TOP; e <= PS_EDGE_RIGHT; ++e)
+                if (!strcmp(name, ps_edge_name(e))) edge = e;
+    } else if (v && CFGetTypeID(v) == CFNumberGetTypeID()) {
+        long n = -1;
+        if (CFNumberGetValue((CFNumberRef)v, kCFNumberLongType, &n) && n >= PS_EDGE_TOP && n <= PS_EDGE_RIGHT) edge = (int)n;
+    }
+    if (v) CFRelease(v);
+    return edge;
+}
+
+// A service by class even when it never called registerService (matching finds registered ones only): the service plane, walked.
+static io_service_t findByClass(const char *cls)
+{
+    io_registry_entry_t root = IORegistryGetRootEntry(kIOMainPortDefault);
+    io_iterator_t it = 0;
+    io_service_t found = 0;
+    if (root && IORegistryEntryCreateIterator(root, kIOServicePlane, kIORegistryIterateRecursively, &it) == KERN_SUCCESS) {
+        for (io_object_t o; !found && (o = IOIteratorNext(it));) {
+            if (IOObjectConformsTo(o, cls)) found = o;
+            else IOObjectRelease(o);
+        }
+        IOObjectRelease(it);
+    }
+    if (root) IOObjectRelease(root);
+    return found;
+}
+
 static int pushTouch(int degrees)
 {
     static int failures, failedDegrees = -1;
@@ -310,7 +350,9 @@ static int pushTouch(int degrees)
 }
 
 // ------------------------------------------------------------------------------------------------------------- the policy
-static CFRunLoopTimerRef gTimer;
+static CFRunLoopTimerRef gTimer, gSensorsTimer;
+static long gSensorsSeq = -1;
+static unsigned gSensorsLookups;
 static int gInPolicy, gAgain, gLastShown = -2, gLastWant = -2, gLastEdge = -2, gLastCover = -2;
 static const char *gLastWhy;
 
@@ -379,8 +421,8 @@ static void readInputs(void)
         Boolean valid = false;
         const CFIndex e = CFPreferencesGetAppIntegerValue(CFSTR("TestEdge"), CFSTR(APP), &valid);
         edge = valid && e >= PS_EDGE_TOP && e <= PS_EDGE_RIGHT ? (int)e : PS_EDGE_NONE;
-    } else if (readNumber(gSensors.service, EDGE_PROPERTY, &v) && v >= PS_EDGE_TOP && v <= PS_EDGE_RIGHT) {
-        edge = (int)v;
+    } else if (gSensors.service && readNumber(gSensors.service, SENSORS_LEVEL_PROPERTY, &v) && v >= 4) {
+        edge = readEdge(gSensors.service);
     }
     int cover = PAR_COVER_UNKNOWN;
     if (readNumber(gKeyboard.service, COVER_PROPERTY, &v)) cover = v ? PAR_COVER_ATTACHED : PAR_COVER_DETACHED;
@@ -391,9 +433,35 @@ static void readInputs(void)
     if (cover != gLastCover) {
         note("keyboard cover %s", coverName(cover));
         gLastCover = cover;
+        if (gSensorsTimer) CFRunLoopTimerSetNextFireDate(gSensorsTimer, CFAbsoluteTimeGetCurrent());   // polling starts or stops
     }
     par_cover(&gAgent, cover, now);
     par_edge(&gAgent, edge, now);
+}
+
+// PianoSensors' properties come without a notification: its sequence every 250 ms while an edge can matter (level 4, the cover not
+// attached, the display awake; every 5 s while it sleeps), never otherwise. Not found yet: looked for every 30 s, 20 times.
+static void sensorsTick(void)
+{
+    double next = 0;
+    if (!gSensors.service && !gTestEdges && gSensorsLookups < 20) {
+        ++gSensorsLookups;
+        if ((gSensors.service = findByClass(gSensors.cls))) note("found %s (not registered: by class)", gSensors.cls);
+        else next = 30;
+    }
+    long level = 0, seq = -1;
+    const int wanted = gRunning && !gTestEdges && gSensors.service && readNumber(gSensors.service, SENSORS_LEVEL_PROPERTY, &level) &&
+                       level >= 4 && gLastCover != PAR_COVER_ATTACHED;
+    if (wanted) {
+        const CGDirectDisplayID d = panelDisplay();
+        next = d && CGDisplayIsAsleep(d) ? 5 : 0.25;
+        if (readNumber(gSensors.service, SEQ_PROPERTY, &seq) && seq != gSensorsSeq) {
+            gSensorsSeq = seq;
+            readInputs();
+            runPolicy();
+        }
+    }
+    if (gSensorsTimer) CFRunLoopTimerSetNextFireDate(gSensorsTimer, CFAbsoluteTimeGetCurrent() + (next > 0 ? next : 1e9));
 }
 
 static void reloadPrefs(void)
@@ -488,8 +556,11 @@ static void probe(void)
                display ? ((int (*)(id, SEL))objc_msgSend)(display, gMp.get) : -1, mpBool(display, gMp.sensor, -1));
     }
     long v = -1;
-    printf("  PianoSensors: %s, %s %s\n", gSensors.service ? "found" : "not found", EDGE_PROPERTY,
-           readNumber(gSensors.service, EDGE_PROPERTY, &v) ? ps_edge_name(v >= 0 && v <= 3 ? (int)v : PS_EDGE_NONE) : "absent");
+    if (!gSensors.service) gSensors.service = findByClass(gSensors.cls);
+    long level = 0, seq = -1;
+    printf("  PianoSensors: %s, level %ld, %s %s, %s %ld\n", gSensors.service ? "found" : "not found",
+           readNumber(gSensors.service, SENSORS_LEVEL_PROPERTY, &level) ? level : 0L, EDGE_PROPERTY,
+           ps_edge_name(readEdge(gSensors.service)), SEQ_PROPERTY, readNumber(gSensors.service, SEQ_PROPERTY, &seq) ? seq : -1L);
     printf("  PianoKeyboard: %s, %s %s\n", gKeyboard.service ? "found" : "not found", COVER_PROPERTY,
            readNumber(gKeyboard.service, COVER_PROPERTY, &v) ? (v ? "1 (attached)" : "0 (detached)") : "absent");
     printf("  PianoTouch: %s, %s %s\n", gTouch.service ? "found" : "not found", PAT_PROPERTY,
@@ -576,6 +647,11 @@ int main(int argc, char **argv)
             runPolicy();
         });
         CFRunLoopAddTimer(CFRunLoopGetMain(), gTimer, kCFRunLoopDefaultMode);
+        gSensorsTimer = CFRunLoopTimerCreateWithHandler(NULL, CFAbsoluteTimeGetCurrent() + 1e9, 1e9, 0, 0, ^(CFRunLoopTimerRef t) {
+            (void)t;
+            sensorsTick();
+        });
+        CFRunLoopAddTimer(CFRunLoopGetMain(), gSensorsTimer, kCFRunLoopDefaultMode);
         CGDisplayRegisterReconfigurationCallback(reconfigured, NULL);
         signal(SIGHUP, SIG_IGN);
         dispatch_source_t hup = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGHUP, 0, dispatch_get_main_queue());
@@ -595,6 +671,7 @@ int main(int argc, char **argv)
         gRunning = 1;
         readInputs();
         runPolicy();
+        sensorsTick();
         CFRunLoopRun();
     }
     return 0;
