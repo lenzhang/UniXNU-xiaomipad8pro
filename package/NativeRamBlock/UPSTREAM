@@ -29,3 +29,10 @@ UniXNU-piano changes of 2026-11-11 (docs/data-store.md):
   (native_ufs_power_parent); off syncs the store under the gate and holds new requests (doAsyncReadWrite waits), a failed sync
   vetoes NativeUfs's suspend (native_ufs_power_veto); on releases them. Without the argument (or with Data volatile) no part, as
   before. Test/power.cpp (new): PowerHold.h on a store with a volatile write cache and power cuts.
+- The volatile disk's memory (2026-11-12, after three data-persist=0 runs hung the tablet under Spotlight's first import): VolatilePool.h
+  (new). Pages come from 2 MiB IOMallocAligned chunks that a refill thread allocates without the gate; the I/O path only takes ready
+  pages after admitting its need (volatileAdmit): refused with kIOReturnNoSpace past the budget (data-volatile-mib, default a quarter
+  of memory), kIOReturnNoMemory after 2 s of waiting with the gate released. The first VolatileDisk allocated zone pages
+  (IOMallocZero) inside the gate and could deadlock with pageout. Unmap (doUnmap, IOStorageFeatures Unmap, volatile only,
+  data-volatile-unmap=0 off) gives APFS's freed blocks back. The status line "NativeRamBlock: volatile: N pages, M MiB resident ..."
+  from the refill thread, rate-limited. VolatileDisk.h: volatileNeed, volatileUnmap. Test/volatile-stress.cpp (new).

@@ -5,9 +5,10 @@
 // live in RAM only and are gone at the next boot; the seed stays immutable, and the store is never touched. Before this, a seed above
 // 2 GiB had no write path at all without the store (writes failed with kIOReturnNotReady).
 // Memory follows the pages written: a directory of one pointer per 512 pages (8 bytes per 2 MiB of disk, allocated once), leaves of 512
-// page pointers and the pages themselves, both 4096 bytes and allocated on first write.
+// page pointers and the pages themselves, both 4096 bytes and taken on first write. In the kernel they come from VolatilePool.h's
+// ready pages: allocate() never blocks, and the caller admits a write's need (volatileNeed) before it calls volatileDiskIO.
 //   Seed:  const uint8_t *find(uint64_t page) const          (SeedDisk, RamSparseDisk)
-//   Ops:   uint8_t *allocate()                               a zeroed 4096-byte block, or null
+//   Ops:   uint8_t *allocate()                               a zeroed 4096-byte block, or null (never waits)
 //   Buf:   uint64_t read(at, p, n) / copy(at, p, n)          as DirectDisk.h
 // Caller serializes I/O.
 #include <stdint.h>
@@ -61,6 +62,40 @@ static uint64_t volatileDiskIO(const Seed &seed, VolatileDisk &d, bool write, ui
     if (got != n) break;
   }
   return done;
+}
+
+// The pages (data pages and leaves) a write of [offset, offset + length) may take: what volatileDiskIO allocates for it at most.
+// The caller admits that many from its pool first (VolatilePool.h), so the I/O itself never waits for memory.
+static uint64_t volatileNeed(const VolatileDisk &d, uint64_t offset, uint64_t length)
+{
+  if (!d.dir || !length || offset > d.bytes || length > d.bytes - offset) return 0;
+  uint64_t need = 0, lastLeaf = ~0ULL;
+  for (uint64_t i = offset / 4096, last = (offset + length - 1) / 4096; i <= last; ++i) {
+    uint64_t e = i / VolatileDisk::kLeafPages;
+    if (!d.dir[e]) { if (e != lastLeaf) { ++need; lastLeaf = e; } ++need; continue; }
+    if (!d.dir[e][i % VolatileDisk::kLeafPages]) ++need;
+  }
+  return need;
+}
+
+// Unmap (TRIM) of [offset, offset + length): every page it covers whole goes back through give(page) and reads as the seed's page
+// again (an unmapped block's content is undefined; APFS writes before it reads). Parts of pages are kept. Leaves stay. Returns the
+// pages given back.
+template<class Give> static uint64_t volatileUnmap(VolatileDisk &d, uint64_t offset, uint64_t length, Give &give)
+{
+  if (!d.dir || !length || offset > d.bytes || length > d.bytes - offset) return 0;
+  uint64_t first = (offset + 4095) / 4096, end = (offset + length) / 4096, freed = 0;   // whole pages only
+  for (uint64_t i = first; i < end; ++i) {
+    uint8_t **leaf = d.dir[i / VolatileDisk::kLeafPages];
+    if (!leaf) { i = (i / VolatileDisk::kLeafPages + 1) * VolatileDisk::kLeafPages - 1; continue; }   // a whole leaf never written
+    uint8_t *&page = leaf[i % VolatileDisk::kLeafPages];
+    if (!page) continue;
+    give(page);
+    page = nullptr;
+    d.resident -= 4096;
+    ++freed;
+  }
+  return freed;
 }
 
 // Frees every leaf and page (not the directory). Free: void free(void *block) for one 4096-byte block.
