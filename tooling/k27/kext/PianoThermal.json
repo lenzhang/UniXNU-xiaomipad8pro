@@ -1,0 +1,26 @@
+{
+  "name": "PianoThermal",
+  "bundle": "com.unixnu.driver.PianoThermal",
+  "version": "1.0.0",
+  "objects": "@OUT@/native-kexts/PianoThermal/objects.json",
+  "start": "_native_kext_start",
+  "stop": "_native_kext_stop",
+  "libraries": {
+    "com.apple.kpi.bsd": "18.0.0",
+    "com.apple.kpi.iokit": "18.0.0",
+    "com.apple.kpi.libkern": "18.0.0",
+    "com.apple.kpi.mach": "18.0.0",
+    "com.apple.kpi.private": "18.0.0",
+    "com.apple.kpi.unsupported": "18.0.0",
+    "com.unixnu.driver.PianoA830": "1.0.0"
+  },
+  "personalities": {
+    "PianoThermal": {
+      "CFBundleIdentifier": "com.unixnu.driver.PianoThermal",
+      "IOClass": "PianoThermal",
+      "IOProviderClass": "IOPlatformExpertDevice",
+      "IOProbeScore": 100,
+      "IOMatchCategory": "PianoThermal"
+    }
+  }
+}

@@ -13,6 +13,7 @@ PianoDwc3            # USB device-mode debug channel (CDC-ACM console); inert wi
 PianoInput           # the buttons (power, vol-, vol+) as HID consumer keys; inert without piano-input=N
 PianoNullEthernet    # a built-in en0 without hardware: TimeSync (and so WindowServer) needs a built-in interface
 PianoPower           # battery gauges, charger port, the DSP charger path; inert without piano-power=N
+PianoThermal         # SoC temperatures (TSENS), protection, CPU frequency over SCMI (docs/drivers/thermal.md); inert without piano-thermal=N / piano-cpufreq=N; after PianoA830 (its GPU hooks)
 PianoTouch           # the NT36532E touch screen (docs/drivers/touch.md); inert without piano-touch=N; after PianoA830 (its GCC lock word)
 PianoWifi            # the WCN7860 Wi-Fi on PCIe0 (docs/drivers/wifi.md): 1 survey, 2 power, 3 link, 4 MHI firmware; inert without piano-wifi=N; after PianoA830 (its lock words) and NativeUfs (level 4 reads modem_a)
 PianoAudio           # speakers (4 x FS19xx, TDM) and DMICs via the ADSP, level 1 (read-only survey) only; inert without piano-audio=N (docs/drivers/audio.md)

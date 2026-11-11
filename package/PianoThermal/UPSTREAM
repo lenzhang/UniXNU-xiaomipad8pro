@@ -1,0 +1,36 @@
+PianoThermal is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). No source file was copied from anywhere. What it takes
+from other work, and from where:
+
+Adreno830 (github.com/Shad0w23333/Adreno830, main 1a1321056ffc5428ae925f4680093718b46ca7c2, unixnu.lock pin."Adreno830"), MIT;
+in this repository unchanged as package/PianoA830/adreno830/platform/sm8750/Sm8750Tsens.h (sha256
+31bfb95b347466bfe01151f7bba3b94159e974062ff09509f75dd60f59f26a79) and Sm8750Tsens.c (sha256
+a395406398360589e88e467a1279a4ed490d2f57d477b20c6c8aa818e57c35b0):
+  Facts, hardware-verified on the OnePlus 13T (SM8750): TM_Sn_STATUS = TM + 0xa0 + 4n, LAST_TEMP [11:0] signed deci-degrees C,
+  VALID bit 21, VALID dropping for a few AHB cycles (retry a few reads). Tsens.h re-implements the decode for all four controllers.
+
+hackios-xnu-kernel, branch k90-port 0e0f19bbba27da57c1845bc16d2415cd38046cab (the REDMI K90 "annibale", SM8750, XNU port; local
+unixnu-research/hackios-xnu-kernel-k90), xnu/files/bsd/dev/annibale/annibale_cpufreq.c (sha256
+b01bcc372d9293f984f138ad1636553e90181b374af99eb38c6682279b1f17ef), under that repository's APSL-2.0 LICENSE:
+  Facts only, no code: on SM8750 the cores' clocks are set by the CPUCP firmware through SCMI's performance protocol 0x13, polled,
+  one message at a time in the shared memory at 0x17b4e000 with a doorbell write at 0x17830000 + 0x104; domain 0 = cluster 0
+  (six cores), domain 1 = cluster 1 (two); protocol 4.0 with level indexing; "NCC0" 16 levels 384-3532 MHz, "NCC1" 16 levels
+  1017-4320 MHz, sustained 4089.6 MHz; the boot loader left domain 1 at its slowest there; the TSENS groups 0x0c228000 sensors
+  1-14, 0x0c229000 1-6, 0x0c22a000 1-8 (the port's run: hackios-redmi-k90-annibale docs/progress/2026-10-26-gpu-desktop-acceleration.md). The
+  governor's shape (busiest core decides, up at once, down after a delay, step-wise thermal limit) is the common design of that
+  file, UniXNU-sheng's below and Linux's schedutil/step_wise; PianoThermal's thresholds, caps and code are its own.
+  Every one of these facts is also checked against piano's own DT (docs/drivers/thermal.md section 2).
+
+UniXNU-sheng (unixnu-research/UniXNU-sheng, main 00ba90984e831e4c6ce30ec3d8a56e6434e9f1af, unixnu.lock pin."UniXNU-sheng"),
+BSD-2-Clause-Patent, package/CpuFreqProbe.cpp (sha256 f442c044d6cf403ce8ff164a58ac3c67dcb7a1a82af50ce7e9bc1db95c11fd8a):
+  Design only (SM8550's EPSS cpufreq-hw registers are not piano's and are not used): a default-off level ladder (report, fixed,
+  governor), the busy share of the busiest CPU from its idle time, schedutil's 1.25 margin, a hispeed jump, up at once / down only
+  after several windows that asked for less.
+
+Specifications read, never copied:
+  - Arm System Control and Management Interface (SCMI), DEN0056: the shared-memory transport, the message header, the performance
+    domain management protocol (Scmi.h);
+  - Linux (GPL-2.0, as the specification only): drivers/thermal/qcom/tsens-v2.c and tsens.c (register offsets and fields),
+    drivers/mailbox/qcom-cpucp-mbox.c (the doorbell offset), drivers/firmware/arm_scmi/perf.c and shmem.c (cross-check of the
+    layouts), drivers/thermal/gov_step_wise.c (the shape of the thermal limit);
+  - XNU (APSL-2.0, the k27 tree): processor_info's PROCESSOR_CPU_LOAD_INFO, thread_bind, reboot_kernel, IOPMrootDomain (why the
+    thermal emergency sleep and the root domain's thermal warning are not used: docs/drivers/thermal.md section 5).
