@@ -92,7 +92,7 @@ A person is needed only when the tablet is parked (no reset, no fastboot): power
 ## 4. Rebuild after a change
 
 ```sh
-K27_VARIANT=native ../droidvm-build/macOS-DroidVM/build-k27-piano.sh   # kernel (k27 tree: patches 0001-0052 + patches/k27 0053-0058)
+K27_VARIANT=native ../droidvm-build/macOS-DroidVM/build-k27-piano.sh   # kernel (k27 tree: patches 0001-0052 + patches/k27 0053-0060)
 tooling/unixnu.sh build firmware --skip-preflight                          # FD (A: Binaries/piano -> the bundled set)
 tooling/k27/build-native-image.sh                                          # kexts (package/) -> KC -> ADT -> out/ram + out/ram-dump
 python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json

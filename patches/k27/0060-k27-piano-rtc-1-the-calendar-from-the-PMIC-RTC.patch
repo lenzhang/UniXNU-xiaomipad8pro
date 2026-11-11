@@ -1,0 +1,297 @@
+From f9b5ceeaa09f09d42ac4bc87728a1b3198f38251 Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Wed, 11 Nov 2026 11:46:21 +0800
+Subject: [PATCH] k27: piano-rtc=1: the calendar from the PMIC RTC (count +
+ piano-rtc-offset, else the SDAM offset cell)
+
+ArmDTPlatform has no clock (getUTCTimeOfDay answers 0), so the calendar started at 1970 until settime.sh. PEGetUTCTimeOfDay
+now reads the PMK8550 RTC_RW counter (SID 0, PPID 0x061) through EE 0's SPMI observer channel when piano-rtc=1, adds
+piano-rtc-offset=N or the SDAM cell 0x72 (PPID 0x071), and takes the sum when it is a date in [2026, 2100). Read only.
+osfmk/arm64/piano_rtc.h is UniXNU-piano's package/PianoPower/PmicRtc.h, host-tested there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ iokit/Kernel/IOPlatformExpert.cpp |  11 +++
+ osfmk/arm64/machine_routines.c    | 146 ++++++++++++++++++++++++++++++
+ osfmk/arm64/piano_rtc.h           |  83 +++++++++++++++++
+ 3 files changed, 240 insertions(+)
+ create mode 100644 osfmk/arm64/piano_rtc.h
+
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+index 76555f6..18abdc0 100644
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1403,6 +1403,11 @@ PESetGMTTimeOfDay(long secs)
+ 	PESetUTCTimeOfDay(secs, 0);
+ }
+ 
++#if defined(__arm64__) && defined(XNU_VM_GUEST)
++/* k27 0060 (piano): the PMIC RTC, with piano-rtc=1 (osfmk/arm64/machine_routines.c) */
++extern "C" int piano_rtc_calendar(clock_sec_t *secs);
++#endif
++
+ void
+ PEGetUTCTimeOfDay(clock_sec_t * secs, clock_usec_t * usecs)
+ {
+@@ -1412,6 +1417,12 @@ PEGetUTCTimeOfDay(clock_sec_t * secs, clock_usec_t * usecs)
+ 	if (gIOPlatform) {
+ 		gIOPlatform->getUTCTimeOfDay(secs, &nsecs);
+ 	}
++#if defined(__arm64__) && defined(XNU_VM_GUEST)
++	/* k27 0060: ArmDTPlatform has no clock and answers 0; then the PMIC RTC, when piano-rtc=1 and it gives a date */
++	if (*secs == 0 && piano_rtc_calendar(secs) == 0) {
++		nsecs = 0;
++	}
++#endif
+ 
+ 	assert(nsecs < NSEC_PER_SEC);
+ 	*usecs = nsecs / NSEC_PER_USEC;
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index b839b2e..77739ff 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1113,6 +1113,152 @@ piano_reset_init(void)
+ 	piano_reset_tick(NULL, NULL);
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_reset_init);
++
++/*
++ * k27 0060: piano-rtc=1: the calendar starts from the PMIC RTC (UniXNU-piano docs/drivers/rtc.md). XNU sets the calendar once,
++ * in clock_initialize_calendar() at bsd_init, from PEGetUTCTimeOfDay(). The platform expert here (ArmDTPlatform, an
++ * IODTPlatformExpert) has no clock and answers 0, so the calendar starts at 1970 and only the OS image's settime.sh moves it,
++ * to droidvm-utc (when the boot image was built). PEGetUTCTimeOfDay now asks piano_rtc_calendar() when the platform answered
++ * 0: the RTC_RW counter of the PMK8550 (SID 0, PPID 0x061: EN_CTL +0x46 bit 7, the count at RDATA +0x48, 4 bytes LE), read
++ * through EE 0's observer channel like 0057's reads, plus an offset: piano-rtc-offset=N when given (UTC - count, measured
++ * once against a reference clock), else the 4-byte LE cell at 0x72 of the SID 0 SDAM (PPID 0x071), where Linux's
++ * rtc-pm8xxx keeps it in Ubuntu's DT (nvmem cell "offset"; the driver read as the specification only). A stopped counter,
++ * a failed read or a sum outside [2026, 2100) leaves the answer at 0, and settime.sh then still sets droidvm-utc. Read only:
++ * nothing is written to the PMIC; PESetUTCTimeOfDay stays the platform's no-op, so a time set from userland lasts until the
++ * reboot. The arithmetic is piano_rtc.h (UniXNU-piano package/PianoPower/PmicRtc.h, host-tested there).
++ */
++#include "piano_rtc.h"
++
++static int piano_rtc_state;                /* 0 not tried, 1 ready, -1 off or failed */
++static volatile uint32_t *piano_rtc_obsv;  /* EE 0's observer channels, 0x20 bytes an APID */
++static int piano_rtc_apid = -1;
++static uint32_t piano_rtc_offset;
++static bool piano_rtc_logged;
++
++/* The APID of a PPID; one owned by EE 0 wins over another (observer reads need no ownership). */
++static int
++piano_spmi_apid(volatile uint32_t *core, volatile uint32_t *cnfg, uint32_t count, uint32_t ppid, uint32_t *owner)
++{
++	int found = -1;
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t map = core[(0x2000 >> 2) + i];
++		if (map == 0 || ((map >> 8) & 0xfff) != ppid) {
++			continue;
++		}
++		uint32_t o = cnfg[i] & 7;
++		if (found < 0 || (o == 0 && *owner != 0)) {
++			found = (int)i;
++			*owner = o;
++		}
++	}
++	return found;
++}
++
++/* piano_rtc_read_fn: n (1..8) registers from reg of APID (uintptr_t)ctx, through its observer channel. */
++static int
++piano_rtc_spmi_read(void *ctx, uint8_t reg, uint8_t *value, unsigned n)
++{
++	volatile uint32_t *ch = piano_rtc_obsv + (0x20 >> 2) * (uintptr_t)ctx;
++	if (n == 0 || n > 8) {
++		return -1;
++	}
++	ch[0] = (1u << 27) | ((uint32_t)reg << 4) | (n - 1);   /* extended read */
++	if (!piano_spmi_wait(&ch[2])) {
++		return -1;
++	}
++	uint32_t lo = ch[6], hi = n > 4 ? ch[7] : 0;
++	for (unsigned b = 0; b < n; b++) {
++		value[b] = (uint8_t)((b < 4 ? lo : hi) >> (8 * (b & 3)));
++	}
++	return 0;
++}
++
++static int
++piano_rtc_setup(void)
++{
++	uint32_t on = 0;
++	if (!PE_parse_boot_argn("piano-rtc", &on, sizeof(on)) || on != 1) {
++		return -1;
++	}
++	volatile uint32_t *core = (volatile uint32_t *)ml_io_map(SPMI_CORE, 0x3000);
++	volatile uint32_t *cnfg = (volatile uint32_t *)ml_io_map(SPMI_CNFG, 0x1000);
++	if (core == NULL || cnfg == NULL) {
++		printf("piano-rtc: the SPMI arbiter does not map: the calendar is not set from the RTC\n");
++		return -1;
++	}
++	uint32_t version = core[0], count = core[1] & 0x7ff;
++	if ((version >> 28) != 7 || count == 0 || count > 1024) {
++		printf("piano-rtc: SPMI arbiter version %#x, %u APIDs: not v7, the calendar is not set from the RTC\n", version, count);
++		return -1;
++	}
++	uint32_t rtc_owner = 8, sdam_owner = 8;
++	int rtc = piano_spmi_apid(core, cnfg, count, PIANO_RTC_PPID, &rtc_owner);
++	int sdam = piano_spmi_apid(core, cnfg, count, PIANO_RTC_SDAM_PPID, &sdam_owner);
++	piano_rtc_obsv = (volatile uint32_t *)ml_io_map(SPMI_OBSV, 0x20 * 1024);
++	if (rtc < 0 || piano_rtc_obsv == NULL) {
++		printf("piano-rtc: %s: the calendar is not set from the RTC\n",
++		    rtc < 0 ? "RTC_RW (PPID 0x061) is not in the arbiter's map" : "the observer channels do not map");
++		return -1;
++	}
++	uint8_t en = 0;
++	int en_read = piano_rtc_spmi_read((void *)(uintptr_t)rtc, PIANO_RTC_EN_CTL, &en, 1);
++	if (en_read != 0 || !(en & PIANO_RTC_ENABLED)) {
++		printf("piano-rtc: the RTC counter %s (EN_CTL %#x): the calendar is not set from it\n",
++		    en_read != 0 ? "does not read" : "is stopped", en);
++		return -1;
++	}
++	const char *source = "piano-rtc-offset";
++	if (!PE_parse_boot_argn("piano-rtc-offset", &piano_rtc_offset, sizeof(piano_rtc_offset))) {
++		uint8_t cell[4];
++		if (sdam < 0 || piano_rtc_spmi_read((void *)(uintptr_t)sdam, PIANO_RTC_SDAM_OFFSET, cell, 4) != 0) {
++			printf("piano-rtc: no piano-rtc-offset and the SDAM offset cell does not read: the calendar is not set from the RTC\n");
++			return -1;
++		}
++		piano_rtc_offset = piano_rtc_le32(cell);
++		source = "the SDAM cell";
++	}
++	piano_rtc_apid = rtc;
++	printf("piano-rtc: RTC_RW APID %d (owner EE %u), EN_CTL %#x, offset %u from %s\n", rtc, rtc_owner, en, piano_rtc_offset, source);
++	return 0;
++}
++
++int piano_rtc_calendar(clock_sec_t *secs);
++
++/* 0 and *secs = the RTC's UTC; -1 (and *secs untouched) when piano-rtc is not 1 or the RTC gives no date. */
++int
++piano_rtc_calendar(clock_sec_t *secs)
++{
++	if (piano_rtc_state == 0) {
++		piano_rtc_state = piano_rtc_setup() == 0 ? 1 : -1;
++	}
++	if (piano_rtc_state != 1) {
++		return -1;
++	}
++	uint32_t count = 0;
++	if (piano_rtc_read_count(piano_rtc_spmi_read, (void *)(uintptr_t)piano_rtc_apid, &count) != 0) {
++		printf("piano-rtc: the RDATA read failed\n");
++		return -1;
++	}
++	uint32_t utc = piano_rtc_utc(count, piano_rtc_offset);
++	struct piano_rtc_date d;
++	piano_rtc_civil(utc, &d);
++	bool dated = piano_rtc_plausible(utc) != 0;
++	if (!piano_rtc_logged) {
++		piano_rtc_logged = true;
++		if (dated) {
++			printf("piano-rtc: count %u + offset %u = %u, %04u-%02u-%02u %02u:%02u:%02u UTC: the calendar starts there\n",
++			    count, piano_rtc_offset, utc, d.year, d.month, d.day, d.hour, d.minute, d.second);
++		} else {
++			printf("piano-rtc: count %u + offset %u = %u (year %u) is not a date: the calendar is not set from the RTC\n",
++			    count, piano_rtc_offset, utc, d.year);
++		}
++	}
++	if (!dated) {
++		return -1;
++	}
++	*secs = utc;
++	return 0;
++}
+ #endif /* defined(XNU_VM_GUEST) */
+ 
+ __attribute__((noreturn))
+diff --git a/osfmk/arm64/piano_rtc.h b/osfmk/arm64/piano_rtc.h
+new file mode 100644
+index 0000000..52b2db2
+--- /dev/null
++++ b/osfmk/arm64/piano_rtc.h
+@@ -0,0 +1,83 @@
++// SPDX-License-Identifier: BSD-2-Clause-Patent
++// piano's PMIC RTC (docs/drivers/rtc.md): the counter, its offset and the date, shared by PianoPower's readout and the k27 kernel's
++// calendar (patches/k27/0060 adds this file, unchanged, as osfmk/arm64/piano_rtc.h). Plain C, no allocation, no I/O of its own.
++//
++// The RTC of the PMK8550 PMIC (SID 0, DT pmic@0 rtc@6100, "qcom,pmk8350-rtc") is a seconds counter that runs on the battery. It is
++// read only here: the boot DT has no allow-set-time, the counter is never written, and the calendar is the counter plus an offset
++// kept elsewhere (Ubuntu's DT: the 4-byte "offset" cell at 0x72 of the SDAM at 0x7100; Android: persist/time/ats_2).
++//   RTC_RW (PPID 0x061)  +0x46 EN_CTL, bit 7 = the counter runs; +0x48..+0x4b RDATA, the count, little endian
++//   SDAM   (PPID 0x071)  +0x72..+0x75 the offset (UTC - count), little endian (+0x48 is the restart reason of k27 0057)
++// The count is read as Linux's rtc-pm8xxx does (specification only): the four bytes, then the low byte again; a low byte smaller
++// than the first one means a carry ran through the bytes during the read, and the four are read once more.
++#ifndef PIANO_PMIC_RTC_H
++#define PIANO_PMIC_RTC_H
++#include <stdint.h>
++
++#define PIANO_RTC_PPID 0x061u         /* SID 0, peripheral 0x61: RTC_RW */
++#define PIANO_RTC_SDAM_PPID 0x071u    /* SID 0, peripheral 0x71: the SDAM with the offset cell */
++#define PIANO_RTC_TYPE 0x04u          /* peripheral TYPE and SUBTYPE at +4, +5 (logged, not checked) */
++#define PIANO_RTC_EN_CTL 0x46u
++#define PIANO_RTC_ENABLED 0x80u
++#define PIANO_RTC_RDATA 0x48u
++#define PIANO_RTC_SDAM_OFFSET 0x72u
++/* A sum outside [2026-01-01, 2100-01-01) is not taken as the date: a zero, erased or stale offset. */
++#define PIANO_RTC_UTC_MIN 1767225600u
++#define PIANO_RTC_UTC_MAX 4102444800u
++
++/* Reads n (1..8) registers from reg of the peripheral ctx stands for; 0 when the read completed. */
++typedef int (*piano_rtc_read_fn)(void *ctx, uint8_t reg, uint8_t *value, unsigned n);
++
++static inline uint32_t piano_rtc_le32(const uint8_t b[4])
++{
++	return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++}
++
++/* The count, consistent across a carry during the read. 0 on success. */
++static inline int piano_rtc_read_count(piano_rtc_read_fn rd, void *ctx, uint32_t *count)
++{
++	uint8_t v[4], low = 0;
++	if (rd(ctx, PIANO_RTC_RDATA, v, 4) != 0 || rd(ctx, PIANO_RTC_RDATA, &low, 1) != 0) {
++		return -1;
++	}
++	if (low < v[0] && rd(ctx, PIANO_RTC_RDATA, v, 4) != 0) {
++		return -1;
++	}
++	*count = piano_rtc_le32(v);
++	return 0;
++}
++
++/* UTC = count + offset, modulo 2^32 as the stock reader adds them (so an offset "below zero" works too). */
++static inline uint32_t piano_rtc_utc(uint32_t count, uint32_t offset)
++{
++	return count + offset;
++}
++
++static inline int piano_rtc_plausible(uint32_t utc)
++{
++	return utc >= PIANO_RTC_UTC_MIN && utc < PIANO_RTC_UTC_MAX;
++}
++
++struct piano_rtc_date {
++	uint32_t year, month, day, hour, minute, second;
++};
++
++/* Seconds since 1970-01-01 00:00:00 UTC as a proleptic Gregorian date. Days are counted from 0000-03-01, so that the leap day
++ * is the last day of a year: 400-year eras of 146097 days, years of 365 days plus the leap days before them, months of
++ * 153 days per 5. */
++static inline void piano_rtc_civil(uint32_t utc, struct piano_rtc_date *d)
++{
++	const uint32_t days = utc / 86400u, rem = utc % 86400u;
++	d->hour = rem / 3600u;
++	d->minute = rem / 60u % 60u;
++	d->second = rem % 60u;
++	const uint32_t z = days + 719468u;   /* 1970-01-01 is day 719468 after 0000-03-01 */
++	const uint32_t era = z / 146097u, doe = z - era * 146097u;
++	const uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
++	const uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
++	const uint32_t mp = (5u * doy + 2u) / 153u;
++	d->day = doy - (153u * mp + 2u) / 5u + 1u;
++	d->month = mp < 10u ? mp + 3u : mp - 9u;
++	d->year = era * 400u + yoe + (d->month <= 2u ? 1u : 0u);
++}
++
++#endif
+-- 
+2.55.0
+

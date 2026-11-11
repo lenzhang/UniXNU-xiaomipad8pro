@@ -12,5 +12,6 @@ the same kernel boot natively on piano at EL1 (all inert in the VM unless their 
 | 0057 | `piano-reset-to=bootloader`: the PMIC SDAM restart reason (SPMI arbiter v7, SID 0 byte 0x48 = 2) set at boot, so every reset lands in ABL fastboot |
 | 0058 | pstore-console header stored 11 times too ("DBGR": signature, then 11 {start, size} pairs; the reader takes their majority): one decayed bit of the single size word had cut the log's tail |
 | 0059 | On `!BSD` (IOBSD matching not finished after 30 s), every busy IOService with its clients and their state goes to the console: who holds the root up |
+| 0060 | `piano-rtc=1` (`piano-rtc-offset=N`): the calendar starts from the PMIC RTC (PMK8550 RTC_RW, SID 0 PPID 0x061, read through the SPMI observer channel) plus the offset, else the SDAM offset cell 0x72; read only, `PEGetUTCTimeOfDay` asks it when ArmDTPlatform answers 0 (`docs/drivers/rtc.md`). Adds `osfmk/arm64/piano_rtc.h` = `package/PianoPower/PmicRtc.h` |
 
 Build: `K27_VARIANT=native build-k27-piano.sh` in the macOS-DroidVM tree (see `docs/bringup-debugging.md` §4).
