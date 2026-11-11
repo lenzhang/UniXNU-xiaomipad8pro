@@ -38,8 +38,14 @@ QcomQmpUsb3.h, which are GPL-2.0-only and were not read for this). QcomDwc3.cpp 
     our kernel) is replaced by the distributor's set/clear-enable bits. NOT used: its QcomDwc3Xhci subclass (three vtable overrides
     of AppleUSBXHCI: path A2, the owner's decision), its PHY sequences.
   setCoreRole(): the role change shape (a core soft reset, PRTCAPDIR, the PHY suspend bits) as one witness besides Linux.
-  QcomUcsi.h (sha256 5c688feeddd335ddc3e2f06baa9909fc7fbd1712285b6216d23bb85a60cf94b3) is the UCSI client a later level derives from
-  (docs/drivers/usb-host.md sections 4 and 9).
+  QcomUcsi.h (sha256 5c688feeddd335ddc3e2f06baa9909fc7fbd1712285b6216d23bb85a60cf94b3): the GLINK framing facts of Ucsi.h (owner
+  32779, opcodes 0x11/0x12/0x13, the read answer as header + mailbox + return code, the write as a whole mailbox image). Its state
+  machine is not copied: UcsiClient.h is written anew after the UCSI specification and Linux's described order (below).
+
+The UCSI specification (Intel, USB Type-C Connector System Software Interface, revisions 1.2 and 2.0; public): the mailbox layout
+(VERSION, CCI, CONTROL, MESSAGE_IN, MESSAGE_OUT), the CCI indicators, the command codes and their CONTROL bits (ACK_CC_CI,
+SET_NOTIFICATION_ENABLE, GET_CONNECTOR_CAPABILITY, GET_CONNECTOR_STATUS, SET_UOR, SET_PDR, GET_ERROR_STATUS), the data structures
+Ucsi.h decodes.
 
 Project-SunUEFI (unixnu-research/Project-SunUEFI, main 4ef87402e9d58465af871e4c4f4a5de87599d81c), BSD-2-Clause-Patent, facts only:
 docs/archive/storage-usb/usb-host-port-plan.md (sha256 8f6e2f6b57d3f9cd9b1adb1edc8d25daaa6610a908a904bac438ab40550df512) and
@@ -57,8 +63,10 @@ Specifications only (no code, comment or table copied): the Ubuntu piano kernel 
 GPL-2.0): drivers/usb/dwc3/{core.h,core.c,drd.c,host.c,dwc3-qcom.c}, drivers/usb/host/{xhci.c,xhci.h,xhci-mem.c,xhci-ring.c,
 xhci-hub.c,xhci-plat.c} (the reset, the rings, the port write-back mask, the 64-bit write order), drivers/phy/qualcomm/
 {phy-qcom-qmp-combo.c,phy-qcom-qmp-dp-com-v3.h,phy-qcom-qmp-pcs-v8.h,phy-qcom-eusb2-repeater.c},
-drivers/usb/typec/tcpm/qcom/qcom_pmic_typec_port.c, drivers/usb/typec/ucsi/{ucsi.h,ucsi.c,ucsi_glink.c}, drivers/soc/qcom/
-{pmic_glink.c,pmic_glink_altmode.c}, drivers/usb/typec/mux/fsa4480.c, drivers/power/supply/{xiaomi_mca.c,sc8541_charger.c}; the xHCI
+drivers/usb/typec/tcpm/qcom/qcom_pmic_typec_port.c, drivers/usb/typec/ucsi/{ucsi.h,ucsi.c,ucsi_glink.c} (UcsiClient.h's order:
+ucsi_init, ucsi_reset_ppm's polling and re-send, ucsi_run_command's acknowledgement, ucsi_handle_connector_change, the
+supported-notifications rule, ucsi_partner_change's roles, ucsi_glink's 5 s answers and its gpio orientation read), drivers/soc/qcom/
+{pmic_glink.c,pmic_glink_altmode.c} (the port notification's layout, Ucsi.h decodePort), drivers/usb/typec/mux/fsa4480.c, drivers/power/supply/{xiaomi_mca.c,sc8541_charger.c}; the xHCI
 1.2 specification (registers, TRBs, the programming model); the ARM SMMUv2 / MMU-500 programming model (context bank registers). Not
 read and not used for anything: any Apple binary beyond the kernel collection's kext names, class names, Info.plist matching
 dictionaries and the KC link report's symbol names (docs/drivers/usb-host.md section 5), any Qualcomm binary.

@@ -59,6 +59,11 @@
 #include "SmmuStream.h"
 #include "ChargerPmic.h"
 #include "../common/PianoIrq.h"
+#include "UcsiClient.h"       // levels 3/4: the UCSI client (H4)
+#include "PortRole.h"         // the witnesses and the role switch
+#include "UsbHandoff.h"       // PianoDwc3's side of the hand-off (package/PianoDwc3)
+#include <PianoUsbcContract.h>   // PianoPower's USB-C relay (UCSI)
+#include <PianoAdspContract.h>   // PianoPower's USB-C port events (the port notifications, read only)
 
 using namespace pianousbhost;
 using pianopower::Window;
@@ -73,6 +78,7 @@ namespace {
 struct Args {
   uint32_t level, delay, xhci, qmp, spmi, watch, period;
   uint32_t back, csr, utmi, reset, smmu, slots, attach, irq, probe;   // levels 5 and 6
+  uint32_t handoff, debounce, uor;                                    // levels 3 and 4
 };
 Args gArgs;
 
@@ -112,10 +118,20 @@ void readArgs()
   if (gArgs.attach > 2) gArgs.attach = 1;
   gArgs.irq = bootArg("piano-usbhost-irq", 1) != 0;
   gArgs.probe = bootArg("piano-usbhost-probe", 1) != 0;
+  gArgs.handoff = bootArg("piano-usbhost-handoff", 0);   // levels 3/4: 0 the decision only, 5 host with our probe, 6 with Apple's xHCI
+  if (gArgs.handoff != 5 && gArgs.handoff != 6) gArgs.handoff = 0;
+  gArgs.debounce = bootArg("piano-usbhost-debounce", 1000);
+  if (gArgs.debounce > 10000) gArgs.debounce = 10000;
+  gArgs.uor = bootArg("piano-usbhost-uor", 0);           // level 4: SET_UOR once per generation (1 DFP, 2 UFP); a test switch
+  if (gArgs.uor > 2) gArgs.uor = 0;
+  if (gArgs.handoff && (gArgs.level == 3 || gArgs.level == 4)) {
+    gArgs.smmu = bootArg("piano-usbhost-smmu", gArgs.handoff == 6 ? 2 : 1);
+    if (gArgs.smmu > 2) gArgs.smmu = 2;
+  }
 }
-// The level that runs: 1 and 2 (read only), 5 (our xHCI probe), 6 (Apple's xHCI on our nub); 3 and 4 (the DSP's VBUS and UCSI,
-// PianoPower's) and anything else run as 2.
-uint32_t runLevel(uint32_t level) { return level == 1 || level == 5 || level == 6 ? level : 2; }
+// The level that runs: 1 and 2 (read only), 3 (the port notifications), 4 (the UCSI client too), 5 (our xHCI probe), 6 (Apple's xHCI
+// on our nub); anything else runs as 2.
+uint32_t runLevel(uint32_t level) { return level >= 1 && level <= 6 ? level : 2; }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void note(const char *fmt, ...)
@@ -1080,8 +1096,8 @@ void appleLine(const char *when, const AppleState &s)
        (unsigned long long)q.disables);
 }
 
-// Level 6 after the switch: the gate, the nub, Apple's xHCI on it, then a watch of what it does (stages 30..33).
-void appleStack(const Xhci &x, uint32_t seconds)
+// Level 6 after the switch: the gate, the nub, Apple's xHCI on it (stages 30..32); appleTick is one sample of the watch (stage 33).
+void appleUp()
 {
   stage(30, "the host stack's gate resource PianoUsbHostStack (IOUSBHostFamily's and IOUSBMassStorageDriver's resource personalities)");
   IOService::publishResource(kStackGate);
@@ -1129,25 +1145,58 @@ void appleStack(const Xhci &x, uint32_t seconds)
   }
   if (gAppleXhci)
     note("attach: client %s, power state %u", gAppleXhci->getMetaClass()->getClassName(), unsigned(gAppleXhci->getPowerState()));
+}
+
+struct AppleWatch {
+  AppleState last;
+  uint64_t start, lastLine;
+};
+void appleWatchBegin(const Xhci &x, AppleWatch &w)
+{
   stage(33, "watch of Apple's xHCI (registers from our side, interrupt counts, IOUSBHostDevice services)");
-  AppleState last = appleState(x);
-  appleLine("+0 s", last);
-  const uint64_t start = nowMs(), end = start + uint64_t(seconds) * 1000;
-  uint64_t lastLine = start;
+  w.last = appleState(x);
+  appleLine("+0 s", w.last);
+  w.start = w.lastLine = nowMs();
+}
+// One sample: a line when something changed, or every 30 s.
+void appleTick(const Xhci &x, AppleWatch &w)
+{
+  const AppleState s = appleState(x);
+  const AppleState &last = w.last;
+  const bool changed = s.usbcmd != last.usbcmd || (s.usbsts & ~kUsbStsEint) != (last.usbsts & ~kUsbStsEint) || s.portsc[0] != last.portsc[0] ||
+                       s.portsc[1] != last.portsc[1] || s.dcbaap != last.dcbaap || s.erstba != last.erstba || s.power != last.power ||
+                       s.devices != last.devices || s.vidPid != last.vidPid;
+  if (changed || nowMs() - w.lastLine >= 30000) {
+    char when[32];
+    const uint64_t at = nowMs() - w.start;
+    snprintf(when, sizeof when, "+%llu.%01llu s", (unsigned long long)(at / 1000), (unsigned long long)(at % 1000 / 100));
+    appleLine(when, s);
+    w.lastLine = nowMs();
+  }
+  w.last = s;
+}
+// The end of Apple's session: the nub terminated (Apple's family stops its devices and the controller), then halted and reset.
+void appleDown(const Xhci &x)
+{
+  if (gNub) {
+    gNub->terminate(kIOServiceSynchronous);   // a removed controller's path: Apple's family stops its devices and the controller
+    note("nub terminated: Apple's xHCI stopped");
+    OSSafeReleaseNULL(gNub);
+  }
+  OSSafeReleaseNULL(gAppleXhci);
+  const StopResult st = xhciStop(gHal, x);
+  note("xHCI stop: USBSTS %08x: %s", st.usbsts, st.ok ? "ok" : st.why);
+}
+
+void appleStack(const Xhci &x, uint32_t seconds)
+{
+  appleUp();
+  AppleWatch w;
+  appleWatchBegin(x, w);
+  const uint64_t end = w.start + uint64_t(seconds) * 1000;
   while (nowMs() < end) {
     IOSleep(gArgs.period);
-    const AppleState s = appleState(x);
-    const bool changed = s.usbcmd != last.usbcmd || (s.usbsts & ~kUsbStsEint) != (last.usbsts & ~kUsbStsEint) || s.portsc[0] != last.portsc[0] ||
-                         s.portsc[1] != last.portsc[1] || s.dcbaap != last.dcbaap || s.erstba != last.erstba || s.power != last.power ||
-                         s.devices != last.devices || s.vidPid != last.vidPid;
-    if (changed || nowMs() - lastLine >= 30000) {
-      char when[32];
-      const uint64_t at = nowMs() - start;
-      snprintf(when, sizeof when, "+%llu.%01llu s", (unsigned long long)(at / 1000), (unsigned long long)(at % 1000 / 100));
-      appleLine(when, s);
-      lastLine = nowMs();
-    }
-    last = s;
+    appleTick(x, w);
   }
 }
 
@@ -1198,14 +1247,477 @@ void hostSession(char *line, size_t size)
            gNub ? "up" : "none", gAppleXhci ? "attached" : "not attached", devices, vidPid >> 16, vidPid & 0xffff,
            gNubIrq.polled ? "polled" : gNubIrq.line.up ? "SPI 133" : "-", gArgs.back ? "back to device" : "host kept");
   if (gArgs.back) {
-    if (gNub) {
-      gNub->terminate(kIOServiceSynchronous);   // a removed controller's path: Apple's family stops its devices and the controller
-      note("nub terminated: Apple's xHCI stopped");
-    }
-    OSSafeReleaseNULL(gAppleXhci);
-    const StopResult st = xhciStop(gHal, x);
-    note("xHCI stop: USBSTS %08x: %s", st.usbsts, st.ok ? "ok" : st.why);
+    appleDown(x);
     hostEnd(nullptr, sw, true);
+  }
+}
+
+// ------------------------------------------------------------------------------------- levels 3 and 4: the port manager (H3/H4)
+// The DSP's view of the port: level 3 the port notifications only (owner 0x800c, which PianoPower enables and acknowledges and hands to
+// watchers as port events, PianoAdspContract.h), level 4 also our UCSI client (UcsiClient.h) on owner 0x800b through PianoPower's
+// USB-C relay (package/include/PianoUsbcContract.h). At each
+// status the orientation line gpio61 is read (a TLMM load). The role decision, the power direction (do we source VBUS: the DSP's own
+// OTG boost after PianoPower's board configuration) and the orientation with its witnesses are published as properties of this
+// service and logged on every change. Event-driven: the thread sleeps without a timeout while nothing is in flight (no poll when
+// nothing is attached); a command's completion, the reset's CCI polls and, during a host session, the port watch are the only timers.
+// piano-usbhost-handoff=5|6 (default 0) lets the decision switch the controller (PortRole.h's RoleSwitch): host with our probe (5)
+// or Apple's xHCI on the nub (6), PianoDwc3 released first and reclaimed after (UsbHandoff.h, piano-usb-handoff=1 on its side).
+
+// The relay's and the port events' callbacks (PianoPower's thread): copied, then this thread is woken.
+struct RelayMessage {
+  uint32_t length;
+  uint8_t kind;   // 0 UCSI, 1 port notification
+  uint8_t data[PIANO_USBC_MAX_MESSAGE];
+};
+constexpr unsigned kRelayRing = 8;
+struct RelayRx {
+  IOSimpleLock *lock;
+  RelayMessage ring[kRelayRing];
+  unsigned head, count, dropped;
+  volatile uint32_t ready, generation, stateMoves;
+};
+RelayRx gRx;
+pianoirq::Waiter gPortWake;
+
+void rxPush(uint8_t kind, const uint8_t *data, uint32_t length)
+{
+  if (!gRx.lock || length > PIANO_USBC_MAX_MESSAGE) return;
+  IOSimpleLockLock(gRx.lock);
+  if (gRx.count < kRelayRing) {
+    RelayMessage &m = gRx.ring[(gRx.head + gRx.count) % kRelayRing];
+    m.kind = kind;
+    m.length = length;
+    memcpy(m.data, data, length);
+    gRx.count++;
+  } else {
+    gRx.dropped++;
+  }
+  IOSimpleLockUnlock(gRx.lock);
+  gPortWake.kick();
+}
+bool rxPop(RelayMessage &out)
+{
+  IOSimpleLockLock(gRx.lock);
+  const bool any = gRx.count != 0;
+  if (any) {
+    out = gRx.ring[gRx.head];
+    gRx.head = (gRx.head + 1) % kRelayRing;
+    gRx.count--;
+  }
+  IOSimpleLockUnlock(gRx.lock);
+  return any;
+}
+void relayState(void *, int ready, uint32_t generation)
+{
+  __atomic_store_n(&gRx.generation, generation, __ATOMIC_RELEASE);
+  __atomic_store_n(&gRx.ready, ready ? 1u : 0u, __ATOMIC_RELEASE);
+  __atomic_add_fetch(&gRx.stateMoves, 1, __ATOMIC_ACQ_REL);
+  gPortWake.kick();
+}
+void relayUcsi(void *, const uint8_t *data, uint32_t length) { rxPush(0, data, length); }
+// PianoPower's port events (PianoAdspContract.h): each port notification as received (at most its first 32 bytes, the whole of it).
+void portEvent(void *, const PianoPortEvent *e)
+{
+  rxPush(1, e->data, e->length < PIANO_PORT_EVENT_MAX ? e->length : PIANO_PORT_EVENT_MAX);
+}
+
+// Sleeps until woken or the deadline (ms since boot; 0: no timeout at all).
+void portWait(uint32_t seen, uint64_t deadline)
+{
+  if (deadline) {
+    const uint64_t now = nowMs();
+    gPortWake.wait(seen, deadline > now ? uint32_t(deadline - now < 600000 ? deadline - now : 600000) : 1);
+    return;
+  }
+  assert_wait((event_t)(uintptr_t)&gPortWake.gen, THREAD_UNINT);
+  if (gPortWake.now() != seen) clear_wait(current_thread(), THREAD_AWAKENED);
+  else thread_block(THREAD_CONTINUE_NULL);
+}
+
+// ---- PianoDwc3 (UsbHandoff.h)
+IOService *gDwc3;
+// The ask's answer: PianoDwc3's state (kHoOff when it is not there or the switch is off on its side).
+uint32_t dwc3Ask(uint32_t ask, uint32_t waitMs)
+{
+  if (!gDwc3) {
+    if (OSDictionary *match = IOService::serviceMatching("PianoDwc3")) {
+      gDwc3 = IOService::copyMatchingService(match);
+      match->release();
+    }
+  }
+  if (!gDwc3) return pianousb::kHoOff;
+  uint32_t state = pianousb::kHoOff;
+  const IOReturn r = gDwc3->callPlatformFunction(pianousb::kHandoffFunction, false, reinterpret_cast<void *>(uintptr_t(ask)), &state,
+                                                 reinterpret_cast<void *>(uintptr_t(waitMs)), nullptr);
+  return r == kIOReturnSuccess ? state : uint32_t(pianousb::kHoOff);
+}
+
+// ---- the live host session (the switch's "host")
+struct LiveHost {
+  bool active = false;
+  SwitchResult sw;
+  Probe pr;
+  Xhci x;
+  AppleWatch apple;
+  uint64_t nextPoll = 0, start = 0;
+  uint32_t last[16] = {};
+  unsigned changes = 0, sessions = 0;
+};
+LiveHost gLive;
+
+// Host mode now (the switch, then our probe or Apple's xHCI). False: it did not work and the core is back in device mode.
+bool liveUp(LiveHost &h)
+{
+  h.sessions++;
+  note("hand-off: host session %u: %s", h.sessions, gArgs.handoff == 6 ? "the switch, then Apple's xHCI on the nub" : "the switch, then our xHCI probe");
+  if (!hostSwitchLogged(h.sw)) {
+    if (h.sw.stores) hostEnd(nullptr, h.sw, true);
+    return false;
+  }
+  if (gArgs.handoff == 6) {
+    h.x = readCaps(gHal);
+    if (!h.x.sane) {
+      stage(-11, "the capability words are not an xHCI's");
+      hostEnd(nullptr, h.sw, true);
+      return false;
+    }
+    if (gArgs.probe) {
+      Probe pr;
+      const bool ok = xhciProbe(pr);
+      if (pr.running) {
+        const StopResult st = xhciStop(gHal, pr.x);
+        note("xHCI stop before Apple's driver: halted and reset: USBSTS %08x: %s", st.usbsts, st.ok ? "ok" : st.why);
+      }
+      if (!ok) {
+        hostEnd(nullptr, h.sw, true);
+        return false;
+      }
+    }
+    appleUp();
+    appleWatchBegin(h.x, h.apple);
+  } else {
+    h.pr = Probe();
+    if (!xhciProbe(h.pr)) {
+      hostEnd(&h.pr, h.sw, true);
+      return false;
+    }
+    char ports[96];
+    portsReport(h.pr, ports, sizeof ports);
+    note("hand-off: host ports %s", ports);
+    h.x = h.pr.x;
+    const unsigned count = h.x.maxPorts < 16 ? h.x.maxPorts : 16;
+    for (unsigned i = 1; i <= count; ++i) h.last[i - 1] = gHal.rd(portscAt(h.x, i)) & ~kPortChangeBits;
+  }
+  h.active = true;
+  h.start = nowMs();
+  h.nextPoll = h.start + gArgs.period;
+  h.changes = 0;
+  return true;
+}
+
+// One pass of the host session's watch (every piano-usbhost-period ms while it lasts): our probe's ports (a line per change, a new
+// USB 2 connection reset with piano-usbhost-reset=1), or one sample of Apple's xHCI.
+void livePoll(LiveHost &h)
+{
+  if (gArgs.handoff == 6) {
+    appleTick(h.x, h.apple);
+    return;
+  }
+  uint32_t ports = 0;
+  drainEvents(gHal, h.pr.x, h.pr.rings, &ports);
+  const unsigned count = h.x.maxPorts < 16 ? h.x.maxPorts : 16;
+  for (unsigned i = 1; i <= count; ++i) {
+    const uint32_t v = gHal.rd(portscAt(h.x, i));
+    if ((v & ~kPortChangeBits) == h.last[i - 1] && !(v & kPortChangeBits)) continue;
+    const uint64_t at = nowMs() - h.start;
+    char what[32];
+    snprintf(what, sizeof what, "+%llu.%01llu s:", (unsigned long long)(at / 1000), (unsigned long long)(at % 1000 / 100));
+    if ((v & ~kPortChangeBits) != h.last[i - 1]) {
+      ++h.changes;
+      portLine(h.x, i, v, what);
+    }
+    h.last[i - 1] = v & ~kPortChangeBits;
+    if ((v & kPortCcs) && !(v & kPortPed) && (v & kPortCsc) && gArgs.reset && portMajor(h.x, i) == 2) {
+      const PortResetResult r = portReset(gHal, h.x, i);
+      note("port %u: reset: PORTSC %08x -> %08x in %u ms: %s%s", i, r.before, r.after, r.waitedMs, r.ok ? "enabled, " : r.why,
+           r.ok ? speedName(portSpeed(r.after)) : "");
+      h.last[i - 1] = gHal.rd(portscAt(h.x, i)) & ~kPortChangeBits;
+    } else {
+      portAck(gHal, h.x, i, v);
+    }
+  }
+}
+
+// Device mode again: the controller halted and reset, the core back in the device role (each glue store behind its clock gate).
+bool liveDown(LiveHost &h)
+{
+  if (!h.active) return true;
+  h.active = false;
+  note("hand-off: host session %u ends after %llu s (%u port changes): back to device mode", h.sessions,
+       (unsigned long long)((nowMs() - h.start) / 1000), h.changes);
+  if (gArgs.handoff == 6) {
+    appleDown(h.x);
+    hostEnd(nullptr, h.sw, true);
+  } else {
+    hostEnd(&h.pr, h.sw, true);
+  }
+  return piano_usbhost_stage != -20;
+}
+
+// ---- the published view
+const char *orientationWord(unsigned o) { return o == 1 ? "normal" : o == 2 ? "reverse" : "-"; }
+
+void publishPort(IOService *self, const pianoucsi::Client &c, bool ucsiOn, const PortWitnesses &w, const PortView &v,
+                 const RoleSwitch &rs, char *line, size_t size)
+{
+  using namespace pianoucsi;
+  char ucsi[200];
+  if (!ucsiOn) snprintf(ucsi, sizeof ucsi, "off (level 3: port notifications only)");
+  else if (c.phase == Phase::ready)
+    snprintf(ucsi, sizeof ucsi, "ready: UCSI %x.%02x (%u-byte mailbox), %u connector(s), PD %x.%x, features %#x, notifications %#llx",
+             c.version >> 8, c.version & 0xff, c.answerBytes, c.cap.connectors, c.cap.pdVersion >> 8, (c.cap.pdVersion >> 4) & 0xf,
+             c.cap.features, (unsigned long long)c.enabled);
+  else if (c.phase == Phase::failed)
+    snprintf(ucsi, sizeof ucsi, "failed at %s: %s (CCI %#x, attempt %u of %u)", stepName(c.failedStep), c.failure, c.failedCci, c.attempts,
+             kAttempts);
+  else if (c.phase == Phase::init)
+    snprintf(ucsi, sizeof ucsi, "starting (%s)", stepName(c.currentStep()));
+  else
+    snprintf(ucsi, sizeof ucsi, "waiting for PianoPower's DSP channel (piano-power=2, charger_pd up, the board configuration through)");
+  self->setProperty("piano-usbhost-ucsi", ucsi);
+  char port[220];
+  if (!v.known) snprintf(port, sizeof port, "unknown (no witness yet)");
+  else if (!v.connected) snprintf(port, sizeof port, "nothing attached");
+  else
+    snprintf(port, sizeof port, "%s%s%s, %s, %s", w.ucsiReady ? partnerTypeName(w.ucsi.partnerType) : "a partner",
+             w.ucsiReady && (w.ucsi.partnerFlags & kPartnerFlagUsb) ? " (USB)" : "", w.ucsiReady && (w.ucsi.partnerFlags & kPartnerFlagAltMode) ? " (alt mode)" : "",
+             v.vbus == 1 ? "we source VBUS" : v.vbus == 0 ? "we sink" : "power direction unknown",
+             w.ucsiReady ? powerModeName(w.ucsi.powerMode) : w.panSeen ? muxName(w.pan.mux) : "-");
+  self->setProperty("piano-usbhost-port", port);
+  char orient[160];
+  snprintf(orient, sizeof orient, "%s (UCSI %s, port notification %s, gpio61 %s, PMIC %s)%s", orientationWord(v.orientation),
+           !w.ucsiReady ? "-" : w.ucsiVersion >= kV2_0 ? orientationWord(v.ucsiO) : "- (1.x)", orientationWord(v.panO),
+           orientationWord(v.gpioO), orientationWord(v.pmicO), v.orientationKnown && !v.agree ? ": the witnesses DISAGREE" : "");
+  self->setProperty("piano-usbhost-orientation", orient);
+  self->setProperty("piano-usbhost-role", roleName(v.role.role));
+  self->setProperty("piano-usbhost-role-why", v.role.why);
+  self->setProperty("piano-usbhost-vbus", v.vbus == 1 ? "source" : v.vbus == 0 ? "sink" : "-");
+  char hand[120];
+  if (!rs.enabled)
+    snprintf(hand, sizeof hand, "off (piano-usbhost-handoff=0)%s", v.role.role == Role::host ? ": would switch to host" : "");
+  else
+    snprintf(hand, sizeof hand, "%s: controller %s, %u to host, %u to device, %u failed", gArgs.handoff == 6 ? "Apple's xHCI" : "our probe",
+             roleName(rs.current), rs.toHost, rs.toDevice, rs.failures);
+  self->setProperty("piano-usbhost-handoff", hand);
+  snprintf(line, size, "ucsi %s | port %s | orientation %s%s | vbus %s | role %s | hand-off %s",
+           !ucsiOn ? "off" : c.phase == Phase::ready ? "ready" : c.phase == Phase::failed ? "failed" : c.phase == Phase::init ? "starting" : "waiting",
+           !v.known ? "?" : !v.connected ? "empty" : w.ucsiReady ? partnerTypeName(w.ucsi.partnerType) : "connected",
+           orientationWord(v.orientation), v.orientationKnown && !v.agree ? " (DISAGREE)" : "",
+           v.vbus == 1 ? "source" : v.vbus == 0 ? "sink" : "-", roleName(v.role.role), !rs.enabled ? "off" : roleName(rs.current));
+  self->setProperty("piano-usbhost-summary", line);
+}
+
+void logUcsiEvents(const pianoucsi::Client &c, uint32_t e)
+{
+  using namespace pianoucsi;
+  if (e & kEvReady)
+    note("ucsi: ready: UCSI %x.%02x, %u-byte mailbox, %u connector(s) (attributes %#x, features %#x, %u alternate modes, BC %x.%02x, PD "
+         "%x.%02x, Type-C %x.%02x); connector 1 capability %#x (%s%s%s%s%s); notifications %#llx; %u commands, completions %u notified "
+         "%u polled, %u busy",
+         c.version >> 8, c.version & 0xff, c.answerBytes, c.cap.connectors, c.cap.attributes, c.cap.features, c.cap.altModes,
+         c.cap.bcVersion >> 8, c.cap.bcVersion & 0xff, c.cap.pdVersion >> 8, c.cap.pdVersion & 0xff, c.cap.typecVersion >> 8,
+         c.cap.typecVersion & 0xff, c.concap.bits, (c.concap.bits & kOpDrp) ? "DRP" : (c.concap.bits & kOpDfp) ? "DFP" : (c.concap.bits & kOpUfp) ? "UFP" : "?",
+         (c.concap.bits & kOpUsb3) ? ", USB3" : "", (c.concap.bits & kOpAltMode) ? ", alt modes" : "", (c.concap.bits & kCapProvider) ? ", provider" : "",
+         (c.concap.bits & kCapSwapToDfp) ? ", swaps to DFP" : "", (unsigned long long)c.enabled, c.count.commands, c.count.byNotify,
+         c.count.byPoll, c.count.busy);
+  if (e & kEvStatus) {
+    const ConnectorStatus &s = c.status;
+    note("ucsi: connector 1 status %02x%02x%02x%02x %02x%02x%02x%02x %02x: %s%s, partner %s (flags %#x), %s, power mode %s, changes %#x, "
+         "RDO %#x, battery charging %u%s",
+         s.raw[3], s.raw[2], s.raw[1], s.raw[0], s.raw[7], s.raw[6], s.raw[5], s.raw[4], s.raw[8], s.connected ? "connected" : "nothing attached",
+         s.orientation >= 0 ? (s.orientation ? ", reverse" : ", normal") : "", partnerTypeName(s.partnerType), s.partnerFlags,
+         s.connected ? (s.provider ? "we are the provider (we source VBUS)" : "we are the consumer (we sink)") : "-", powerModeName(s.powerMode),
+         s.change, s.rdo, s.battery, c.count.changes ? "" : " (the init's)");
+  }
+  if (e & kEvFailed)
+    note("ucsi: FAILED at %s: %s (CCI %#x; attempt %u of %u%s; %u reads, %u writes, %u notifications, %u timeouts)", stepName(c.failedStep),
+         c.failure, c.failedCci, c.attempts, kAttempts, c.phase == Phase::failed && c.attempts < kAttempts ? ", again in 10 s" : "",
+         c.count.reads, c.count.writes, c.count.notifies, c.count.timeouts);
+  if (e & kEvGaveUp) note("ucsi: no attempt left for this DSP generation: the client waits for the next one (nothing polls)");
+  if (e & kEvError)
+    note("ucsi: %s ended with %s%s%s", commandName(c.lastErrorCommand), c.lastError ? "ERROR: " : "NOT SUPPORTED or ERROR",
+         c.lastError ? errorName(c.lastError) : "", c.lastError ? "" : " (no error status)");
+  if (e & kEvUserDone)
+    note("ucsi: %s (piano-usbhost-uor): %s", commandName(c.userCommand),
+         c.userResult == 0 ? "done" : c.userResult == 1 ? "rejected (error)" : c.userResult == 2 ? "not supported" : "no answer");
+  if (e & kEvBogus) note("ucsi: a change reported for a connector that does not exist (CCI %#x): not followed", c.cci);
+  if (e & kEvStorm) note("ucsi: more than %u connector changes in %u s: not followed until the next notification", kStormChanges, kStormWindowMs / 1000);
+}
+
+// Levels 3 and 4: runs for the rest of the boot.
+void portManager(IOService *self)
+{
+  using namespace pianoucsi;
+  const bool ucsiOn = gArgs.level == 4;
+  stage(40, ucsiOn ? "port manager: the UCSI client over PianoPower's USB-C relay, the port notifications from its port events"
+                   : "port manager: the port notifications from PianoPower's port events (no UCSI command)");
+  gRx.lock = IOSimpleLockAlloc();
+  static const PianoUsbcClient client = {relayState, relayUcsi};
+  const int attached = gRx.lock ? piano_usbc_attach(&client, nullptr) : -2;
+  if (attached) {
+    stage(-40, attached == -1 ? "the USB-C relay has another client" : "the USB-C relay refused the client");
+    return;
+  }
+  static const PianoPortClient portClient = {portEvent};
+  const int portSlot = piano_port_events(&portClient, nullptr);
+  note("port: attached to PianoPower's USB-C relay (%s) and its port events (%s, %u seen before); the role switch %s",
+       ucsiOn ? "the UCSI owner 0x800b" : "the ready state only: level 3 sends no UCSI command",
+       portSlot >= 0 ? "slot taken" : "NO SLOT: no port notification will be seen", piano_port_seen(),
+       gArgs.handoff ? (gArgs.handoff == 6 ? "is ON: host with Apple's xHCI on the nub (piano-usbhost-handoff=6)" : "is ON: host with our probe (piano-usbhost-handoff=5)")
+                     : "is off (piano-usbhost-handoff=0: the decision is published, nothing is switched)");
+  const uint32_t usbLevel = bootArg("piano-usb", 0);
+  const bool dwc3Owns = usbLevel >= 2;
+  RoleSwitch rs;
+  rs.enabled = gArgs.handoff != 0;
+  rs.debounceMs = gArgs.debounce;
+  Client c;
+  PortWitnesses w;
+  PortView v;
+  bool ready = false, uorSent = false;
+  uint32_t generation = 0, moves = 0, panLogged = 0;
+  uint8_t lastPan[3] = {0xff, 0xff, 0xff};
+  char line[400], lastLine[400] = "";
+  stage(41, "port manager: running (event-driven)");
+  bool first = true;   // the properties from the start ("waiting for PianoPower's DSP channel")
+  for (;;) {
+    const uint32_t seen = gPortWake.now();
+    const uint64_t now = nowMs();
+    bool viewDirty = first;
+    first = false;
+    // The relay's ready flag: start over on every new generation (the PPM is back on its defaults).
+    const uint32_t m = __atomic_load_n(&gRx.stateMoves, __ATOMIC_ACQUIRE);
+    if (m != moves) {
+      moves = m;
+      const bool r = __atomic_load_n(&gRx.ready, __ATOMIC_ACQUIRE) != 0;
+      const uint32_t g = __atomic_load_n(&gRx.generation, __ATOMIC_ACQUIRE);
+      if (r != ready || (r && g != generation)) {
+        ready = r;
+        generation = g;
+        note("port: the DSP's USB-C owners are %s (generation %u)%s", r ? "ready" : "not ready", g,
+             r && ucsiOn ? ": the UCSI client starts (PPM_RESET first)" : "");
+        w.ucsiReady = false;
+        w.ucsi = ConnectorStatus();
+        if (r) {
+          w.panSeen = false;
+          uorSent = false;
+        }
+        if (ucsiOn) {
+          if (r) c.start(g, now);
+          else c.stop();
+        }
+        viewDirty = true;
+      }
+    }
+    // Messages from the relay.
+    RelayMessage msg;
+    while (rxPop(msg)) {
+      if (msg.kind == 0) {
+        if (ucsiOn) c.receive(msg.data, msg.length, now);
+        continue;
+      }
+      const PortNotification p = decodePort(msg.data, msg.length);
+      if (!p.ok || p.port != 0) continue;
+      w.panSeen = true;
+      w.pan = p;
+      viewDirty = true;
+      if ((p.orientation != lastPan[0] || p.mux != lastPan[1] || uint8_t(p.svid) != lastPan[2]) || panLogged < 4) {
+        panLogged++;
+        note("port: notification: port %u, orientation %u (%s), mux %u (%s), SVID %#06x%s, %u bytes", p.port, p.orientation,
+             portOrientation(p.orientation) == 0 ? "normal" : portOrientation(p.orientation) == 1 ? "reverse" : "none", p.mux, muxName(p.mux),
+             p.svid, p.svid == kSvidDp ? " (DisplayPort: B8)" : "", msg.length);
+        lastPan[0] = p.orientation;
+        lastPan[1] = p.mux;
+        lastPan[2] = uint8_t(p.svid);
+      }
+    }
+    if (ucsiOn) {
+      c.tick(now);
+      Request q;
+      while (c.take(q, now)) {
+        const int r = piano_usbc_send(q.data, q.length);
+        c.sent(r == 0, now);
+        if (r) break;
+      }
+      const uint32_t e = c.takeEvents();
+      if (e) logUcsiEvents(c, e);
+      if (e & (kEvReady | kEvStatus | kEvFailed | kEvGaveUp)) {
+        w.ucsiReady = c.phase == Phase::ready && c.status.valid;
+        w.ucsiVersion = c.version;
+        w.ucsi = c.status;
+        viewDirty = true;
+      }
+      // piano-usbhost-uor=1|2 (a test switch): once per generation, at the first connected status, ask for the DFP (host) or UFP role.
+      if (gArgs.uor && !uorSent && c.phase == Phase::ready && c.status.valid && c.status.connected) {
+        uorSent = true;
+        const bool queued = c.request(setUor(kConnector, gArgs.uor == 1, false));
+        note("ucsi: SET_UOR %s (piano-usbhost-uor=%u): %s", gArgs.uor == 1 ? "DFP (we host)" : "UFP (we are the device)", gArgs.uor,
+             queued ? "asked" : "refused by the client");
+      }
+    }
+    if (viewDirty) {
+      // gpio61 at each status, as ucsi_glink reads it (meaningful with a cable in).
+      const Pins pins = surveyPins(load);
+      w.gpioRead = true;
+      w.gpioHigh = decodePin(pins.orientation.cfg, pins.orientation.io).in;
+      const PortView nv = portView(w);
+      if (nv.role.role != v.role.role || nv.connected != v.connected || nv.known != v.known)
+        note("role: %s: %s%s", roleName(nv.role.role), nv.role.why,
+             !rs.enabled && nv.role.role == Role::host ? " (would switch to host: piano-usbhost-handoff=0)" : "");
+      v = nv;
+      publishPort(self, c, ucsiOn, w, v, rs, line, sizeof line);
+      if (strcmp(line, lastLine)) {
+        note("port: %s", line);
+        strlcpy(lastLine, line, sizeof lastLine);
+      }
+    }
+    // The role switch.
+    const SwitchAction a = rs.step(v.role.role, v.connected, now);
+    if (a == SwitchAction::toHost) {
+      bool free = !dwc3Owns;
+      if (dwc3Owns) {
+        uint32_t st = dwc3Ask(pianousb::kAskRelease, 2000);
+        // Not taken within 2 s (or refused during a sleep): withdrawn, and the answer says whether it was taken meanwhile.
+        if (st == pianousb::kHoDevice) st = dwc3Ask(pianousb::kAskState, 0);
+        note("hand-off: PianoDwc3 asked to release the controller: %s", pianousb::handoffStateName(st));
+        if (st == pianousb::kHoStarting) {
+          rs.defer(now + 2000);
+          continue;
+        }
+        free = pianousb::handoffCoreFree(true, st);
+        if (!free) note("hand-off: PianoDwc3 keeps the controller (boot it with piano-usb-handoff=1): no host mode for this connection");
+      }
+      const bool ok = free && liveUp(gLive);
+      if (!ok && free && dwc3Owns) note("hand-off: back to PianoDwc3: %s", pianousb::handoffStateName(dwc3Ask(pianousb::kAskReclaim, 5000)));
+      rs.done(a, ok);
+      publishPort(self, c, ucsiOn, w, v, rs, line, sizeof line);
+      note("hand-off: %s", ok ? "host mode" : "host mode FAILED: device mode kept until the partner goes away");
+    } else if (a == SwitchAction::toDevice) {
+      const bool ok = liveDown(gLive);
+      if (dwc3Owns) note("hand-off: PianoDwc3 reclaims the controller: %s", pianousb::handoffStateName(dwc3Ask(pianousb::kAskReclaim, 5000)));
+      rs.done(a, ok);
+      publishPort(self, c, ucsiOn, w, v, rs, line, sizeof line);
+      note("hand-off: device mode%s", ok ? "" : " (the way back reported a failure: see stage 20)");
+    }
+    if (gLive.active && nowMs() >= gLive.nextPoll) {
+      livePoll(gLive);
+      gLive.nextPoll = nowMs() + gArgs.period;
+    }
+    // Sleep until woken or the next deadline (none: no timer at all).
+    uint64_t deadline = ucsiOn ? c.deadline() : 0;
+    const auto earliest = [&deadline](uint64_t t) { if (t && (!deadline || t < deadline)) deadline = t; };
+    earliest(rs.deadline());
+    if (gLive.active) earliest(gLive.nextPoll);
+    portWait(seen, deadline);
   }
 }
 
@@ -1240,7 +1752,7 @@ bool PianoUsbHost::start(IOService *provider)
   const uint32_t asked = gArgs.level;
   gArgs.level = runLevel(asked);
   if (gArgs.level != asked)
-    note("piano-usbhost=%u: levels 1, 2, 5 and 6 exist (docs/drivers/usb-host.md section 8; 3 and 4 are PianoPower's); running 2", asked);
+    note("piano-usbhost=%u: levels 1 to 6 exist (docs/drivers/usb-host.md section 8); running 2", asked);
   // PianoDwc3 owns the controller with piano-usb >= 2: no host mode, except level 5's timed hand-off (its takeover starts at
   // piano-usb-delay, at least 30 s after our host session ends; piano-usbhost-back returns the core to device mode first).
   const uint32_t usb = bootArg("piano-usb", 0), usbDelay = bootArg("piano-usb-delay", 0);
@@ -1255,7 +1767,28 @@ bool PianoUsbHost::start(IOService *provider)
            gArgs.delay, usbDelay);
     }
   }
-  if (gArgs.level <= 2) {
+  // Levels 3/4: the port manager. The switch needs the controller: free (piano-usb < 2) or PianoDwc3's hand-off (piano-usb-handoff=1).
+  if ((gArgs.level == 3 || gArgs.level == 4) && gArgs.handoff && usb >= 2 && !bootArg("piano-usb-handoff", 0)) {
+    note("piano-usbhost-handoff=%u refused: PianoDwc3 owns the controller (piano-usb=%u) without piano-usb-handoff=1: the decision only",
+         gArgs.handoff, usb);
+    gArgs.handoff = 0;
+  }
+  if (gArgs.level == 3 || gArgs.level == 4) {
+    note("level %u: %s from PianoPower (its USB-C relay and port events; needs piano-power=2); the role, power direction and orientation published; "
+         "role switch %s (debounce %u ms)%s",
+         gArgs.level, gArgs.level == 4 ? "the UCSI client (PPM_RESET, notifications, GET_CAPABILITY, GET_CONNECTOR_STATUS) and the port notifications"
+                                       : "the port notifications (no UCSI command)",
+         gArgs.handoff == 6 ? "ON with Apple's xHCI on the nub (piano-usbhost-handoff=6)" : gArgs.handoff ? "ON with our probe (piano-usbhost-handoff=5)" : "off",
+         gArgs.debounce, gArgs.uor ? (gArgs.uor == 1 ? "; SET_UOR DFP once connected (piano-usbhost-uor=1)" : "; SET_UOR UFP once connected (piano-usbhost-uor=2)") : "");
+    if (!bootArg("piano-power", 0)) note("level %u: piano-power is not set: the DSP does not run, nothing will be ready", gArgs.level);
+    if (gArgs.handoff && gArgs.smmu) {
+      stage(9, gArgs.smmu == 2 ? "SMMU: stream 0x40 through an identity-mapped write-back context bank" : "SMMU: stream 0x40 through a bypass bank");
+      if (!smmuSetup(gArgs.smmu)) {
+        stage(-9, "SMMU: no route for stream 0x40: the role switch is off");
+        gArgs.handoff = 0;
+      }
+    }
+  } else if (gArgs.level <= 2) {
     note("level %u: loads only, nothing written (the SPMI observer's read command is the only store)", gArgs.level);
   } else {
     note("level %u: %s; back=%u csr=%u utmi=%u reset=%u smmu=%u slots=%u%s", gArgs.level,
@@ -1340,6 +1873,12 @@ void PianoUsbHost::run()
     hostSession(host, sizeof host);
     setProperty("piano-usbhost-host", host);
     note("host summary: %s", host);
+  }
+  if (gArgs.level == 3 || gArgs.level == 4) {
+    unmapRegion(gCore);   // the SPMI windows: the port manager reads no PMIC register
+    unmapRegion(gCnfg);
+    unmapRegion(gObsv);
+    portManager(this);    // the rest of the boot (returns only when the relay refused us)
   }
 
   if (gArgs.level == 2 && gArgs.watch) {
