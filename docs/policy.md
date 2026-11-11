@@ -4,7 +4,8 @@ Status 2026-11-11: **built, host-tested (`policy_host: all 21670 checks passed`)
 (kernels 0059 and 0062: `com.unixnu.driver.PianoPolicy: linked, ... 322 pointers`), test images built; not run on the tablet.**
 2026-11-12: the GPU ceiling as PianoA830's client 1 (§5.3: no interim arbitration with its slots), the profile checked end to end
 through PianoThermal's `Governor.h` (§5.2), `piano-policy-lpm=1` for an unattended test (P7); `policy_host: all 21915 checks passed`;
-not run.
+not run. Later on 2026-11-12: NativeGopDisplay's display power is an event (§5.6: its messages listened to, the 5 s keyboard tick
+gone; the tick only for a NativeGopDisplay without them, logged once); `policy_host: all 22217 checks passed`; not run.
 Backlog B2 (cover / keyboard / power key) and B5 (Low Power Mode → power profile), `BACKLOG-hardware.md`. Inert without
 `piano-policy=N`. The kernel side of sleep is `power.md` (k27 0062, the driver contract); this page is the policy on top of it.
 
@@ -74,7 +75,7 @@ require the password immediately). `piano-backlight-lid=1` (PianoBacklight) cuts
 | 0062 arms the cover-open wake (bit 2) only when the cover reads closed at entry, the keyboard (bit 16) only with the cover open and PianoKeyboard's gpio95 latch configured and clear; gpio97 never; the mask is a boot argument | verified | `tooling/k27/piano-pm/piano_pm_policy.h`; `power.md` §3.3 |
 | `machdep.piano_sleep` begins "on;" with piano-sleep=1 and carries "wake mask 0x..": PianoPolicy reads it once (no 0062 symbol linked: the KC links with the 0059 kernel too) | verified | `patches/k27/0062` `piano_sleep_format` |
 | PianoKeyboard publishes `piano-keyboard-hall`, `-attached`, `-status` with a `kIOMessageServicePropertyChange` per change; what gpio95 does while the MCU runs is open | verified; needs-boot | `drivers/keyboard.md` §6c, §10.10 |
-| NativeGopDisplay publishes `piano-display-power` only with `piano-backlight=2`, without a message | verified | `NativeGopDisplay.cpp` |
+| NativeGopDisplay publishes `piano-display-power` on every power change call and messages `kIOMessageServicePropertyChange` (argument `"piano-display-power"`) on each change (since 2026-11-11; before: only with `piano-backlight=2`, no message); since 2026-11-12 its `piano-display-power-messages` = true (set before it registers) says so | verified | `NativeGopDisplay.cpp` `publishDisplayPower`, `start` |
 | PianoThermal mode 3 takes Power Saver caps on battery or unknown power, Balanced on external power; `"piano-thermal-profile"` (§5.2, 2026-11-11) forces either, `kIOReturnUnsupported` below `piano-cpufreq=2` | verified | `drivers/thermal.md` §5-6, `Governor.h` |
 | PianoA830's `piano-gpu-ceiling` has a slot per caller since 2026-11-11 (`piano-gpu-ceiling-clients` = 4, published before its service is; the DCVS runs at the lowest slot); PianoThermal (level 2) puts 160 MHz in slot 0 (param2 null) at passive and clears it below; its `ThermalState` property is refreshed every 30 s, the breadcrumb `piano_thermal_state` at every policy update. A PianoA830 from before the slots had one slot, the last caller winning | verified | `board/PianoGpuCeiling.h`, `board/PianoA830.cpp`, `PianoThermal.cpp` |
 | PianoA830's own maximum is 342 MHz unless `piano-gpu-dcvs-max` / `piano-gpu-maxlevel` is given: the Power Saver ceiling is then a no-op and PianoPolicy sends none | verified | `adreno830/A830Dcvs.h`; `drivers/gpu.md` |
@@ -106,10 +107,17 @@ require the password immediately). `piano-backlight-lid=1` (PianoBacklight) cuts
 - **The kext** (`PianoPolicy.cpp`): an IOService on IOPlatformExpertDevice, one thread blocked on an event. Events: PianoKeyboard's
   property messages (gpio95's rises are counted in the handler, so a short pulse is not lost), the power source's
   `kIOPMMessageBatteryStatusHasChanged`, the root domain's clamshell message and wake, a write of `machdep.piano_policy_lpm`, a
-  watched service appearing (PianoKeyboard, IOPMPowerSource, NativeGopDisplay, PianoThermal, PianoA830). Each turn reads every input
-  afresh (a few properties) and runs `Engine::step`. A 5 s tick runs only while a keyboard wake could come with the display state
-  known (NativeGopDisplay sends no message: the 1 s hold-off is then between 1 and 6 s) or, with a PianoA830 that has no ceiling
-  slots, while our GPU ceiling shares PianoThermal's slot; otherwise no timer at all.
+  watched service appearing (PianoKeyboard, IOPMPowerSource, NativeGopDisplay, PianoThermal, PianoA830), and since 2026-11-12
+  NativeGopDisplay's `piano-display-power` messages (§5.6). Each turn reads every input afresh (a few properties) and runs
+  `Engine::step`. **No timer** in the normal case: the cover and gpio95 are PianoKeyboard's messages, the power source PianoPower's
+  `kIOPMMessageBatteryStatusHasChanged`, the display NativeGopDisplay's message, so the keyboard's 1 s hold-off is timed from the
+  display's change itself. A 5 s tick only as a fallback: while a keyboard wake could come with the display state known **and** the
+  display sends no messages (a NativeGopDisplay without `piano-display-power-messages` from which no message was seen yet: an older
+  KC; logged once: `keyboard wake: NativeGopDisplay sends no display-power messages ...`; the hold-off is then between 1 and 6 s),
+  or with `piano-policy-display-tick=1` (the old behaviour), or, with a PianoA830 that has no ceiling slots, while our GPU ceiling
+  shares PianoThermal's slot (its breadcrumb has no message). `Engine::tickWhy` names the reason; `machdep.piano_policy` ends with
+  `display messages N (events|polled), tick T ms`. A NativeGopDisplay with the property replaces one without it (D6's second
+  instance shares the class and publishes no display power).
 - **Level 1** logs every decision as "would send"; the platform functions answer kIOReturnUnsupported (PianoInput and PianoKeyboard
   keep their own behaviour). **Level 2** acts. The cover part needs `piano-policy-lid=1` as well (the hall polarity, `keyboard.md`
   §10.3) and refuses while `piano-keyboard-lid` is set (two clamshell controllers).
@@ -175,7 +183,8 @@ of `ExternalConnected`, as a Mac's battery manager does; PianoPolicy's mirror th
 `updateStatus()` on every change (PianoPolicy listens to its message).
 
 **5.6 NativeGopDisplay.** Publish `piano-display-power` always (not only with `piano-backlight=2`) and message
-`kIOMessageServicePropertyChange` on each change: the 5 s tick and the hold-off's 5 s uncertainty go away.
+`kIOMessageServicePropertyChange` on each change: the 5 s tick and the hold-off's 5 s uncertainty go away. Its
+`piano-display-power-messages` = true (published before the service registers) tells a reader so without waiting for a change.
 
 **5.7 PianoBacklight, the kernel.** Nothing: `piano-backlight-lid=1` is the backlight off on close; 0062's wake rules already
 implement the cover-open-only and keyboard-only-when-open rules.
@@ -189,7 +198,7 @@ implement the cover-open-only and keyboard-only-when-open rules.
 | 5.3 | PianoA830, PianoPolicy | **done**: PianoA830's 4 slots (2026-11-11, `test_gpu_ceiling`); PianoPolicy as client 1 when `piano-gpu-ceiling-clients` >= 2, the interim arbitration only without it (2026-11-12, `policy_host` `ownGpuSlot`) |
 | 5.4 | PianoKeyboard | **done** (`CoverPower.h`, `keyboard_host` `testCoverPower`): `piano-keyboard-lid=0` stays the default and the messages per change stay; gpio95's latch at a system sleep from an acting PianoPolicy (its `piano-policy` property 2: at level 1 the function answers success with false, which is not taken), else the own rule (attached, not closed); key and touchpad reports dropped while closed behind `piano-keyboard-lid-drop=1` (opt-in until the hall polarity is verified); power-follows-panel behind `piano-keyboard-blank=1` (gpio95 rising while blanked wakes the MCU only with `now`) |
 | 5.5 | PianoPower | not done (optional): PianoPolicy's mirror sends `kIOPMSetACAdaptorConnected`; `updateStatus()` on each change is unchanged |
-| 5.6 | NativeGopDisplay | **done**: `piano-display-power` on every power change call whatever the arguments, a `kIOMessageServicePropertyChange` on each change. PianoPolicy reads the property at each turn as before; to drop its 5 s tick and the hold-off's uncertainty it must also register interest on NativeGopDisplay (it listens only to PianoKeyboard and the power source today): PianoPolicy's change, not made here |
+| 5.6 | NativeGopDisplay, PianoPolicy | **done**: `piano-display-power` on every power change call whatever the arguments, a `kIOMessageServicePropertyChange` on each change; `piano-display-power-messages` (2026-11-12). PianoPolicy (2026-11-12, host-tested `policy_host` `displayEventsTick`, not run) registers interest on it and drops the 5 s keyboard tick when the property is there or a message was seen; the tick stays only as the fallback for an older NativeGopDisplay (logged once) and behind `piano-policy-display-tick=1` |
 | 5.7 | PianoBacklight | nothing for the policy; its system-sleep part (dark before the freeze) is `power.md` §4's |
 
 ## 6. Boot arguments
@@ -204,6 +213,7 @@ implement the cover-open-only and keyboard-only-when-open rules.
 | `piano-policy-kbd=0` | 1 | no display wake by gpio95 |
 | `piano-policy-kbd-holdoff=MS` | 1000 | the display off at least this long before gpio95 counts (0..10000) |
 | `piano-policy-lpm=1` | 0 | Low Power Mode on from boot (`machdep.piano_policy_lpm` starts at 1; writing 0 turns it off): a test's switch, for an unattended run with the Mac's cable (external power) |
+| `piano-policy-display-tick=1` | 0 | the 5 s display tick of before 2026-11-12 while a keyboard wake could come, even with NativeGopDisplay's messages (the A/B switch) |
 
 Read, not owned: `piano-keyboard-lid`, `piano-gpu-dcvs-max`, `piano-gpu-maxlevel`, `piano-thermal`, `piano-thermal-gpu-mhz`; PianoA830's
 property `piano-gpu-ceiling-clients`. sysctl:
@@ -229,6 +239,9 @@ set once, unless the owner set that source's timers first. The sleep timer stays
 PianoPolicy: start: piano-policy=2 (acting), cover acted on, profile on, GPU ceiling 342 MHz (a no-op: PianoA830's own maximum is 342 MHz), power key on, keyboard wake on (hold-off 1000 ms)
 PianoPolicy: system sleep: on, wake mask 0x13 (power key, cover open, keyboard); machdep.piano_sleep: on; state 1, poll 100 ms, wake mask 0x13, ...
 PianoPolicy: watching PianoKeyboard (the cover)            PianoPolicy: watching AppleSmartBattery (the power source)
+PianoPolicy: watching NativeGopDisplay (the display power: a message per change, no tick)
+PianoPolicy: watching NativeGopDisplay (the display power; it publishes no piano-display-power-messages: until one of its messages is seen it is read every 5 s while a keyboard wake could come)   (an older KC)
+PianoPolicy: keyboard wake: NativeGopDisplay sends no display-power messages (no piano-display-power-messages, none seen): its piano-display-power is read every 5000 ms while the cover is open and attached (the fallback of an older KC)   (once)
 PianoPolicy: inputs: cover open (attached), battery, display on, Low Power Mode off, thermal unknown (change 3)
 PianoPolicy: root domain: kIOPMSetACAdaptorConnected (none) (on battery)
 PianoPolicy: root domain: kIOPMEnableClamshell (on battery: sleep)

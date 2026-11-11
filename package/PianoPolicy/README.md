@@ -14,4 +14,6 @@ tests, then the objects); it is in configs/k27-native-kexts.txt.
 
 The userland half (Low Power Mode, the lock on a cover closed on power): `tooling/native/piano-policy-agent/`.
 
-Status (2026-11-11): built, host-tested, linked into the KC (kernels 0059 and 0062); not run on the tablet.
+Status (2026-11-11): built, host-tested, linked into the KC (kernels 0059 and 0062); not run on the tablet. 2026-11-12: no timer in
+the normal case: NativeGopDisplay's display power is listened to (its `piano-display-power-messages`), the 5 s tick is only the
+fallback for a NativeGopDisplay without messages (logged once) and `piano-policy-display-tick=1`.

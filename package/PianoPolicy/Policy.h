@@ -4,7 +4,7 @@
 // the actions; docs/policy.md is the page (signals, the table, what each driver adds).
 //
 // Inputs: the cover's hall sensor and attach bit (PianoKeyboard), the power source (PianoPower's AppleSmartBattery), the display
-// power (NativeGopDisplay), macOS Low Power Mode (machdep.piano_policy_lpm, which a userland agent mirrors), whether system sleep
+// power (NativeGopDisplay, a message per change: no polling), macOS Low Power Mode (machdep.piano_policy_lpm, which a userland agent mirrors), whether system sleep
 // exists (k27 0062: machdep.piano_sleep "on") with its wake mask, PianoThermal's protection state.
 // Outputs: IOPMrootDomain power notifications (the clamshell, clamshell sleep allowed or not, the AC adaptor), user-active
 // requests (display wake), sleep now (the power key), PianoThermal's profile, PianoA830's GPU ceiling (client 1 of its slots).
@@ -48,6 +48,11 @@ constexpr uint32_t kThermalAuto = 0, kThermalSaver = 1;
 // Without the property (a PianoA830 from before the slots): the one shared slot and the interim arbitration (Engine::gpu).
 constexpr uint32_t kGpuClientShared = 0, kGpuClientPolicy = 1;
 inline bool gpuOwnSlot(uint32_t clients) { return clients >= 2; }
+// NativeGopDisplay's capability (docs/policy.md 5.6): published true on the panel's service before it registers, it says that each
+// change of piano-display-power is messaged (kIOMessageServicePropertyChange, the property's name). Without it (an older KC) a
+// message seen proves the same; else the display is polled by the tick (Engine::tickWhy).
+constexpr const char *kDisplayMessagesKey = "piano-display-power-messages";
+inline bool displayEvents(bool marked, uint32_t messagesSeen) { return marked || messagesSeen > 0; }
 // Thresholds of the power key (PianoInput measures the press).
 constexpr uint32_t kLongPressMs = 1500;
 
@@ -63,13 +68,15 @@ struct Config {
   bool powerKey = true;          // piano-policy-powerkey
   bool keyboard = true;          // piano-policy-kbd: gpio95 rising wakes the display
   uint32_t holdoffMs = 1000;     // piano-policy-kbd-holdoff: the display off at least this long before gpio95 counts
+  bool displayTick = false;      // piano-policy-display-tick=1: the 5 s tick of before 2026-11-12 even with display messages
 };
 
 struct Inputs {
   Lid lid = Lid::unknown;        // PianoKeyboard piano-keyboard-hall (1 open, 0 closed); unknown without the service or the hall
   bool attached = false;         // piano-keyboard-attached
   Power power = Power::unknown;  // IOPMPowerSource ExternalConnected
-  Screen screen = Screen::unknown;   // NativeGopDisplay piano-display-power (only published with piano-backlight=2)
+  Screen screen = Screen::unknown;   // NativeGopDisplay piano-display-power (always since 2026-11-11; before: piano-backlight=2)
+  bool displayEvents = false;    // the display found messages each change of it (its piano-display-power-messages, or one seen)
   bool lpm = false;              // machdep.piano_policy_lpm
   bool sleepOn = false;          // machdep.piano_sleep begins with "on" (k27 0062 and piano-sleep=1)
   uint32_t wakeMask = 0;         // its "wake mask"
@@ -266,17 +273,22 @@ class Engine {
     return *why = "display off, cover open: wake the display", true;
   }
 
-  // How often the shell must look again without an event, in ms (0: no tick): the display state while a keyboard wake could come
-  // (NativeGopDisplay sends no message: the hold-off is timed from the turn that first saw the display off, so it is between
-  // holdoffMs and holdoffMs + kTickMs), PianoThermal's state while a GPU ceiling of ours sits in the slot it shares (PianoThermal
-  // clears the slot when it leaves passive: ours is written again within kTickMs). With our own slot the GPU needs no tick.
+  // How often the shell must look again without an event, in ms (0: no tick), and why. The display state while a keyboard wake
+  // could come, only where the display sends no message per change (a NativeGopDisplay from before docs/policy.md 5.6: no
+  // piano-display-power-messages and no message seen) or piano-policy-display-tick=1 asks for the old tick: the hold-off is then timed from the turn that first saw the display off, so it is between holdoffMs and holdoffMs + kTickMs.
+  // With the messages the display's change is an event itself: the hold-off is timed from the change, no tick. PianoThermal's
+  // state while a GPU ceiling of ours sits in the slot it shares (PianoThermal clears the slot when it leaves passive: ours is
+  // written again within kTickMs); with our own slot the GPU needs no tick.
   static constexpr uint32_t kTickMs = 5000;
-  uint32_t tickMs(const Inputs &in) const
+  enum class Tick : uint8_t { none, displayPoll, gpuShared };
+  Tick tickWhy(const Inputs &in) const
   {
-    if (c_.keyboard && in.attached && in.lid == Lid::open && in.screen != Screen::unknown) return kTickMs;
-    if (c_.profile && c_.thermalOwnsGpu && !ownSlot_ && (gpuWritten_ || gpuHeld_)) return kTickMs;
-    return 0;
+    if (c_.keyboard && in.attached && in.lid == Lid::open && in.screen != Screen::unknown && (c_.displayTick || !in.displayEvents))
+      return Tick::displayPoll;
+    if (c_.profile && c_.thermalOwnsGpu && !ownSlot_ && (gpuWritten_ || gpuHeld_)) return Tick::gpuShared;
+    return Tick::none;
   }
+  uint32_t tickMs(const Inputs &in) const { return tickWhy(in) == Tick::none ? 0 : kTickMs; }
 
  private:
   void ownSlotSeen()

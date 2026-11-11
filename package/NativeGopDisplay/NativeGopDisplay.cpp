@@ -583,6 +583,10 @@ bool NativeGopDisplay::start(IOService *provider)
         // with two instances that lookup may return this one. It publishes no display power, and D6's images run none of them.
         GOPLOG("D6: drivers that look NativeGopDisplay up by class may find this instance: test it without them\n");
     }
+    // The display power's capability for its readers (docs/policy.md 5.6), before the service registers: each change of
+    // piano-display-power is messaged, so PianoPolicy (and any other reader) needs no polling. D6's instance publishes neither.
+    if (!fExternal)
+        setProperty("piano-display-power-messages", true);
     unsigned backlight = 0;
     PE_parse_boot_argn("piano-backlight", &backlight, sizeof(backlight));
     fBacklightCallout = backlight >= 2 && !fExternal;

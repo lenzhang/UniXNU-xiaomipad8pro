@@ -8,8 +8,10 @@
 //   PianoKeyboard     piano-keyboard-hall (0 closed, 1 open), -attached, -status (gpio95), each change a
 //                     kIOMessageServicePropertyChange to interested clients (this one)
 //   IOPMPowerSource   ExternalConnected (PianoPower's AppleSmartBattery, piano-power-ps=1); kIOPMMessageBatteryStatusHasChanged
-//   NativeGopDisplay  piano-display-power (published with piano-backlight=2), read when needed and every second while a keyboard
-//                     wake could come (its hold-off)
+//   NativeGopDisplay  piano-display-power (every power change since 2026-11-11), a kIOMessageServicePropertyChange per change: the
+//                     display is an event, no polling (docs/policy.md 5.6). Its piano-display-power-messages (or a message seen) says
+//                     so; a NativeGopDisplay without either (an older KC) is read every 5 s while a keyboard wake could come (the
+//                     hold-off's timing), and that fallback is logged once
 //   machdep.piano_policy_lpm   macOS Low Power Mode, written by root (the agent tooling/native/piano-policy-agent mirrors
 //                     com.apple.system.lowpowermode into it; by hand: sudo sysctl machdep.piano_policy_lpm=1)
 //   machdep.piano_sleep (k27 0062)   "on" = system sleep exists (piano-sleep=1), and its wake mask; read once at start
@@ -43,6 +45,7 @@
 //   piano-policy-powerkey=0 the power key stays macOS's                       piano-policy-kbd=0  no display wake by gpio95
 //   piano-policy-kbd-holdoff=MS  the display off at least MS before gpio95 counts (1000)
 //   piano-policy-lpm=1      Low Power Mode on from boot (machdep.piano_policy_lpm starts at 1): an unattended test's switch
+//   piano-policy-display-tick=1  the 5 s display tick of before 2026-11-12 while a keyboard wake could come, messages or not
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -80,7 +83,8 @@ volatile int32_t piano_policy_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, lid, profile, gpuMhz, powerKey, kbd, holdoffMs, lpm, keyboardLid, gpuDcvsMax, gpuMaxLevel, thermal, thermalGpuMhz;
+  uint32_t level, lid, profile, gpuMhz, powerKey, kbd, holdoffMs, lpm, displayTick, keyboardLid, gpuDcvsMax, gpuMaxLevel, thermal,
+      thermalGpuMhz;
   bool gpuMaxGiven;
 };
 Args gArgs;
@@ -105,6 +109,7 @@ void readArgs()
   gArgs.kbd = bootArg("piano-policy-kbd", 1);
   gArgs.holdoffMs = clampArg(bootArg("piano-policy-kbd-holdoff", 1000), 0, 10000);
   gArgs.lpm = bootArg("piano-policy-lpm", 0) == 1 ? 1 : 0;
+  gArgs.displayTick = bootArg("piano-policy-display-tick", 0) == 1 ? 1 : 0;
   // The other drivers' own arguments, read here as they read them (no call needed): PianoKeyboard's clamshell mode, PianoA830's
   // DCVS maximum (342 MHz unless piano-gpu-dcvs-max or piano-gpu-maxlevel is given), PianoThermal's level and passive GPU ceiling.
   gArgs.keyboardLid = bootArg("piano-keyboard-lid", 0);
@@ -220,17 +225,19 @@ class PianoPolicy : public IOService {
   bool start(IOService *provider) override;
   IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3,
                                 void *param4) override;
-  enum : uint32_t { kKeyboard = 1, kPower = 2, kLpm = 4, kRoot = 8, kService = 16 };   // what woke the thread (for the log)
+  enum : uint32_t { kKeyboard = 1, kPower = 2, kLpm = 4, kRoot = 8, kService = 16, kDisplay = 32 };   // what woke the thread (log)
   void kick(uint32_t bits);
 
  private:
-  enum : uintptr_t { kRefKeyboard = 1, kRefPower = 2, kRefOther = 3 };
+  enum : uintptr_t { kRefKeyboard = 1, kRefPower = 2, kRefOther = 3, kRefDisplay = 4 };
 
   static void threadMain(void *self, wait_result_t);
   static bool published(void *target, void *ref, IOService *service, IONotifier *notifier);
   static IOReturn interest(void *target, void *ref, UInt32 type, IOService *provider, void *arg, vm_size_t size);
   static IOReturn rootInterest(void *target, void *ref, UInt32 type, IOService *provider, void *arg, vm_size_t size);
   void run();
+  void adoptDisplay(IOService *service);
+  IOService *copyDisplay(bool *marked);
   Inputs gather();
   void perform(const Actions &a, const Inputs &in, bool fromThread);
   Result call(const char *service, const char *function, uint32_t value);
@@ -242,7 +249,15 @@ class PianoPolicy : public IOService {
   Engine fEngine{Config()};
   IOLock *fLock = nullptr;
   uint32_t fPending = 0;
-  IOService *fKeyboard = nullptr, *fPowerSource = nullptr, *fDisplay = nullptr, *fGpu = nullptr;   // retained once found
+  IOService *fKeyboard = nullptr, *fPowerSource = nullptr, *fGpu = nullptr;   // retained once found
+  // NativeGopDisplay (the panel's): retained once found, its messages listened to; one with piano-display-power-messages replaces
+  // one without (D6's second instance shares the class and publishes no display power). Under fDisplayLock, which no handler takes.
+  IOLock *fDisplayLock = nullptr;
+  IOService *fDisplay = nullptr;
+  IONotifier *fDisplayInterest = nullptr;
+  bool fDisplayMarked = false;
+  volatile uint32_t fDisplayMessages = 0;   // piano-display-power messages received
+  bool fDisplayPollLogged = false;
   volatile uint32_t fStatusRises = 0, fRootClamshell = 0, fRootClamshellSeen = 0;
   uint32_t fStatusRisesSeen = 0;
   bool fSleepOn = false;
@@ -278,8 +293,9 @@ bool PianoPolicy::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
   fLock = IOLockAlloc();
+  fDisplayLock = IOLockAlloc();
   gStatusLock = IOLockAlloc();
-  if (!fLock || !gStatusLock) {
+  if (!fLock || !fDisplayLock || !gStatusLock) {
     note("FAILED: no lock");
     return false;
   }
@@ -294,6 +310,7 @@ bool PianoPolicy::start(IOService *provider)
   fConfig.powerKey = gArgs.powerKey != 0;
   fConfig.keyboard = gArgs.kbd != 0;
   fConfig.holdoffMs = gArgs.holdoffMs;
+  fConfig.displayTick = gArgs.displayTick != 0;
   fEngine = Engine(fConfig);
   // System sleep and its wake mask, as the kernel has them (k27 0062; absent before it).
   char sleep[640] = {};   // 0062's string is at most 512 bytes
@@ -314,6 +331,9 @@ bool PianoPolicy::start(IOService *provider)
   if (fConfig.thermalOwnsGpu)
     note("PianoThermal at level 2 writes a GPU ceiling at its passive trip: with PianoA830's slots ours is client 1 (the lowest wins), "
          "without them ours is never written over its passive one");
+  if (fConfig.displayTick)
+    note("piano-policy-display-tick=1: the display read every 5 s while a keyboard wake could come, even with its messages (the "
+         "behaviour before 2026-11-12)");
   if (gArgs.lpm) {
     __atomic_store_n(&gLpm, 1u, __ATOMIC_RELEASE);
     note("piano-policy-lpm=1: Low Power Mode on from boot (machdep.piano_policy_lpm=0 turns it off)");
@@ -326,12 +346,13 @@ bool PianoPolicy::start(IOService *provider)
   sysctl_register_oid(&gOidStatus);
   sysctl_register_oid(&gOidLpm);
   setProperty("piano-policy", gArgs.level, 32);
-  // The services watched: their appearance (now or later) is an event; PianoKeyboard and the power source are also listened to.
+  // The services watched: their appearance (now or later) is an event; PianoKeyboard, the power source and NativeGopDisplay are also
+  // listened to (each change of theirs a message: no polling).
   static const char *const kWatched[] = {"PianoKeyboard", "IOPMPowerSource", "NativeGopDisplay", "PianoThermal", "PianoA830"};
   for (unsigned i = 0; i < sizeof kWatched / sizeof kWatched[0]; ++i) {
     OSDictionary *match = IOService::serviceMatching(kWatched[i]);
     if (!match) continue;
-    const uintptr_t ref = i == 0 ? kRefKeyboard : i == 1 ? kRefPower : kRefOther;
+    const uintptr_t ref = i == 0 ? kRefKeyboard : i == 1 ? kRefPower : i == 2 ? kRefDisplay : kRefOther;
     IOService::addMatchingNotification(gIOPublishNotification, match, &PianoPolicy::published, this, reinterpret_cast<void *>(ref));
     match->release();
   }
@@ -360,6 +381,11 @@ bool PianoPolicy::published(void *target, void *ref, IOService *service, IONotif
 {
   PianoPolicy *self = static_cast<PianoPolicy *>(target);
   const uintptr_t which = reinterpret_cast<uintptr_t>(ref);
+  if (which == kRefDisplay) {
+    self->adoptDisplay(service);
+    self->kick(kDisplay);
+    return true;
+  }
   IOService **slot = which == kRefKeyboard ? &self->fKeyboard : which == kRefPower ? &self->fPowerSource : nullptr;
   if (slot && !*slot) {
     service->retain();
@@ -381,6 +407,15 @@ IOReturn PianoPolicy::interest(void *target, void *ref, UInt32 type, IOService *
     if (name && !strcmp(name, "piano-keyboard-status") && numberProperty(provider, "piano-keyboard-status") == 1)
       __atomic_add_fetch(&self->fStatusRises, 1u, __ATOMIC_ACQ_REL);
     self->kick(kKeyboard);
+    return kIOReturnSuccess;
+  }
+  if (reinterpret_cast<uintptr_t>(ref) == kRefDisplay && type == kIOMessageServicePropertyChange) {
+    // NativeGopDisplay, inside its gated power change: the property is already set; only counted and the thread woken.
+    const char *name = static_cast<const char *>(arg);
+    if (name && !strcmp(name, "piano-display-power")) {
+      __atomic_add_fetch(&self->fDisplayMessages, 1u, __ATOMIC_ACQ_REL);
+      self->kick(kDisplay);
+    }
     return kIOReturnSuccess;
   }
   if (reinterpret_cast<uintptr_t>(ref) == kRefPower && type == kIOPMMessageBatteryStatusHasChanged) {
@@ -406,6 +441,45 @@ IOReturn PianoPolicy::rootInterest(void *target, void *, UInt32 type, IOService 
   return kIOReturnUnsupported;
 }
 
+// A NativeGopDisplay published (or found by class): kept when the slot is empty, or when it says it messages its display power and
+// the one kept does not (D6's second instance shares the class). Its interest is registered before the first read of the property,
+// so no change between the two is lost.
+void PianoPolicy::adoptDisplay(IOService *service)
+{
+  if (!service) return;
+  const bool marked = numberProperty(service, kDisplayMessagesKey) == 1;
+  IOLockLock(fDisplayLock);
+  if (service == fDisplay || (fDisplay && (fDisplayMarked || !marked))) {
+    IOLockUnlock(fDisplayLock);
+    return;
+  }
+  IOService *old = fDisplay;
+  IONotifier *oldInterest = fDisplayInterest;
+  service->retain();
+  fDisplay = service;
+  fDisplayMarked = marked;
+  fDisplayInterest = service->registerInterest(gIOGeneralInterest, &PianoPolicy::interest, this, reinterpret_cast<void *>(kRefDisplay));
+  IOLockUnlock(fDisplayLock);
+  if (oldInterest) oldInterest->remove();
+  OSSafeReleaseNULL(old);
+  if (marked)
+    note("watching NativeGopDisplay (the display power: a message per change%s)",
+         fConfig.displayTick ? "; piano-policy-display-tick=1 reads it every 5 s as well" : ", no tick");
+  else
+    note("watching NativeGopDisplay (the display power; it publishes no %s: until one of its messages is seen it is read every 5 s "
+         "while a keyboard wake could come)", kDisplayMessagesKey);
+}
+
+IOService *PianoPolicy::copyDisplay(bool *marked)
+{
+  IOLockLock(fDisplayLock);
+  IOService *d = fDisplay;
+  if (d) d->retain();
+  *marked = fDisplayMarked;
+  IOLockUnlock(fDisplayLock);
+  return d;
+}
+
 // Every input, fresh. Cheap: a few registry property reads.
 Inputs PianoPolicy::gather()
 {
@@ -417,15 +491,19 @@ Inputs PianoPolicy::gather()
   IOService *ps = __atomic_load_n(&fPowerSource, __ATOMIC_ACQUIRE);
   const int ext = numberProperty(ps, "ExternalConnected");
   in.power = ext < 0 ? Power::unknown : ext ? Power::external : Power::battery;
-  IOService *display = __atomic_load_n(&fDisplay, __ATOMIC_ACQUIRE);
-  if (!display) {
+  bool marked = false;
+  IOService *display = copyDisplay(&marked);
+  if (!display) {   // (the publish notification normally finds it first)
     if (IOService *d = copyByClass("NativeGopDisplay")) {
-      if (__atomic_exchange_n(&fDisplay, d, __ATOMIC_ACQ_REL)) d->release();
-      display = __atomic_load_n(&fDisplay, __ATOMIC_ACQUIRE);
+      adoptDisplay(d);
+      d->release();
+      display = copyDisplay(&marked);
     }
   }
   const int on = numberProperty(display, "piano-display-power");
+  OSSafeReleaseNULL(display);
   in.screen = on < 0 ? Screen::unknown : on ? Screen::on : Screen::off;
+  in.displayEvents = displayEvents(marked, __atomic_load_n(&fDisplayMessages, __ATOMIC_ACQUIRE));
   in.lpm = __atomic_load_n(&gLpm, __ATOMIC_ACQUIRE) != 0;
   in.sleepOn = fSleepOn;
   in.wakeMask = fWakeMask;
@@ -537,13 +615,14 @@ void PianoPolicy::describe(const Inputs &in, const View &v)
   snprintf(gStatus, sizeof gStatus,
            "level %u (%s); cover %s, %sattached; %s; display %s; Low Power Mode %u; sleep %s, wake mask %#x; thermal %s; close: %s "
            "(%s); profile %s (%s); GPU ceiling %u MHz (written %u%s); keyboard wake %u, latch %u; sent: root %u, user-active %u, "
-           "profile %u, gpu %u; power keys %u, keyboard wakes %u, input changes %u\n",
+           "profile %u, gpu %u; power keys %u, keyboard wakes %u, input changes %u; display messages %u (%s), tick %u ms\n",
            gArgs.level, fConfig.act ? "acting" : "decisions only", lidName(in.lid), in.attached ? "" : "not ", powerName(in.power),
            screenName(in.screen), in.lpm ? 1u : 0u, in.sleepOn ? "on" : "off", in.wakeMask, thermalName(in.thermal),
            closeName(v.close), v.closeWhy, profileName(v.profile), v.profileWhy, v.gpuKhz / 1000, fEngine.gpuWritten() / 1000,
            fEngine.gpuOwnSlot() ? ", client 1" : fEngine.gpuHeld() ? ", PianoThermal holds the slot" : ", shared slot",
            v.keyboardWake ? 1u : 0u, v.keyboardLatch ? 1u : 0u, fRootSent,
-           fUserActive, fProfileCalls, fGpuCalls, fKeys, fKbdWakes, fInputChanges);
+           fUserActive, fProfileCalls, fGpuCalls, fKeys, fKbdWakes, fInputChanges, __atomic_load_n(&fDisplayMessages, __ATOMIC_ACQUIRE),
+           in.displayEvents ? "events" : "polled", fEngine.tickMs(in));
   IOLockUnlock(gStatusLock);
 }
 
@@ -650,6 +729,13 @@ void PianoPolicy::run()
     fLast = in;
     fHaveLast = true;
     tick = fEngine.tickMs(in);
+    if (fEngine.tickWhy(in) == Engine::Tick::displayPoll && !fConfig.displayTick && !fDisplayPollLogged) {
+      fDisplayPollLogged = true;   // once a boot
+      note("keyboard wake: NativeGopDisplay sends no display-power messages (%s): its piano-display-power is read every %u ms while "
+           "the cover is open and attached (the fallback of an older KC)",
+           __atomic_load_n(&fDisplay, __ATOMIC_ACQUIRE) ? "no piano-display-power-messages, none seen" : "not found yet",
+           Engine::kTickMs);
+    }
     (void)bits;
   }
 }

@@ -6,7 +6,7 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
     part this kext takes over. package/PianoThermal: its piano_thermal_state breadcrumb, readPowerSource (ExternalConnected) and
     gpuCeiling (callPlatformFunction on the class's service), Governor.h's Profile and profilePower (in the host test only).
     package/PianoA830: "piano-gpu-ceiling" (0 clears) and its slots (board/PianoGpuCeiling.h, piano-gpu-ceiling-clients).
-    package/NativeGopDisplay: piano-display-power. package/PianoBacklight: the service on IOPlatformExpertDevice with one thread
+    package/NativeGopDisplay: piano-display-power, its change messages, piano-display-power-messages. package/PianoBacklight: the service on IOPlatformExpertDevice with one thread
     woken by an IOLock event. patches/k27/0062: machdep.piano_sleep's format and the wake sources' rules.
 
 Facts, read as references only (no code taken):

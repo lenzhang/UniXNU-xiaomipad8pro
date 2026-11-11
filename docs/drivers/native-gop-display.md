@@ -79,6 +79,9 @@ arguments, and a change of it sends `kIOMessageServicePropertyChange` (argument:
 clients (PianoPolicy, PianoKeyboard's `piano-keyboard-blank=1`). Before WindowServer's first call the property is absent, as before.
 Nothing else changed: the backlight callout still needs `piano-backlight=2`, the DPU's `piano-dpu-panel=1`. The clients' handlers
 run inside the framebuffer's gated power change, so they only record it (none may call back into this service there).
+Since 2026-11-12 the panel's instance also publishes `piano-display-power-messages` = true at its start, before it registers: the
+capability its readers check (PianoPolicy listens to the messages and drops its 5 s display tick when it is there; an older
+NativeGopDisplay without it is polled as before, `docs/policy.md` §4). D6's second instance publishes neither property.
 
 No boot arg is needed for the display. Everything else is the native set as it is (`K27_ARGS` in
 `tooling/bootimg/build-ram-images.py`). For a log of the WindowServer stage, give the run more than the default 45 s

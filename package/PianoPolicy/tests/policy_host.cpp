@@ -4,7 +4,8 @@
 // PianoThermal and PianoA830 are sent (start, close and open on battery and on power, plugging and unplugging with the cover
 // closed, a boot with the cover closed, the PianoKeyboard conflict, the power key, gpio95 with its hold-off, Low Power Mode on and
 // off, PianoThermal's passive trip around the shared GPU ceiling, PianoA830's own slot for us (client 1: no arbitration), a missing
-// PianoThermal call), the profile through PianoThermal's Governor.h to its CPU caps, and machdep.piano_sleep's parse.
+// PianoThermal call), the display's messages in place of the 5 s tick (and its fallback), the profile through PianoThermal's
+// Governor.h to its CPU caps, and machdep.piano_sleep's parse.
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. policy_host.cpp -o /tmp/policy_host && /tmp/policy_host
 #include "Policy.h"
 #include "../../PianoThermal/Governor.h"   // PianoThermal's profile modes and caps: the end-to-end check of 5.2
@@ -251,9 +252,90 @@ static void keyboard()
   run(u, un, 0);
   Actions unknown;
   CHECK(!u.keyboardRise(un, 99000, unknown, &why) && unknown.n == 0);
-  // The tick: while a keyboard wake can come (attached, open, display state known), every 5 s.
+  // The tick: while a keyboard wake can come (attached, open, display state known) and the display sends no messages, every 5 s.
   CHECK(e.tickMs(in) == Engine::kTickMs);
+  in.displayEvents = true;
+  CHECK(e.tickMs(in) == 0);
   CHECK(u.tickMs(un) == 0);
+}
+
+// NativeGopDisplay's messages (docs/policy.md 5.6): with them the display is an event and nothing ticks for the keyboard; without
+// them (an older KC: no piano-display-power-messages, no message seen) the 5 s tick of before; piano-policy-display-tick=1 forces it.
+static void displayEventsTick()
+{
+  // The capability: the marker, or a message seen.
+  CHECK(!displayEvents(false, 0));
+  CHECK(displayEvents(true, 0) && displayEvents(false, 1) && displayEvents(true, 7));
+  // Every combination: the keyboard's tick only where a keyboard wake could come and the display is not evented.
+  const Lid lids[] = {Lid::unknown, Lid::open, Lid::closed};
+  const Screen screens[] = {Screen::unknown, Screen::on, Screen::off};
+  for (int kbd = 0; kbd < 2; ++kbd)
+    for (int forced = 0; forced < 2; ++forced)
+      for (Lid lid : lids)
+        for (int attached = 0; attached < 2; ++attached)
+          for (Screen screen : screens)
+            for (int events = 0; events < 2; ++events) {
+              Config c = actLid();
+              c.keyboard = kbd;
+              c.displayTick = forced;
+              Engine e(c);
+              Inputs in = base();
+              in.lid = lid;
+              in.attached = attached;
+              in.screen = screen;
+              in.displayEvents = events;
+              run(e, in);
+              const bool poll = kbd && attached && lid == Lid::open && screen != Screen::unknown && (forced || !events);
+              CHECK((e.tickWhy(in) == Engine::Tick::displayPoll) == poll);
+              CHECK(e.tickMs(in) == (poll ? Engine::kTickMs : 0u));
+            }
+  // Evented: the display goes off at t = 1000 (its message's turn), nothing runs until gpio95 rises: the hold-off is timed from the
+  // change itself, exactly.
+  Engine e(actLid());
+  Inputs in = base();
+  in.displayEvents = true;
+  run(e, in, 0);
+  CHECK(e.tickMs(in) == 0);
+  in.screen = Screen::off;
+  run(e, in, 1000);
+  CHECK(e.tickMs(in) == 0);
+  Actions out;
+  const char *why = "";
+  CHECK(!e.keyboardRise(in, 1999, out, &why) && out.n == 0);
+  CHECK(e.keyboardRise(in, 2000, out, &why) && str(out) == "user");
+  // Display on again (a message), then off: a new period.
+  in.screen = Screen::on;
+  run(e, in, 5000);
+  in.screen = Screen::off;
+  run(e, in, 6000);
+  Actions next;
+  CHECK(e.keyboardRise(in, 7000, next, &why) && str(next) == "user");
+  CHECK(e.tickMs(in) == 0);
+  // The fallback (no messages): the old tick while the cover is open and attached, none closed or detached.
+  Engine f(actLid());
+  Inputs fi = base();
+  run(f, fi, 0);
+  CHECK(f.tickWhy(fi) == Engine::Tick::displayPoll && f.tickMs(fi) == Engine::kTickMs);
+  fi.lid = Lid::closed;
+  run(f, fi, 100);
+  CHECK(f.tickMs(fi) == 0);
+  // A message seen later (an older marker-less display that does message): the tick stops from that turn.
+  fi.lid = Lid::open;
+  fi.displayEvents = displayEvents(false, 1);
+  run(f, fi, 200);
+  CHECK(f.tickMs(fi) == 0);
+  // The GPU's shared-slot tick is not the display's: it stays with the display evented.
+  Config g = actLid();
+  g.gpuNeeded = true;
+  g.thermalOwnsGpu = true;
+  Engine s(g);
+  Inputs si = base();
+  si.displayEvents = true;
+  run(s, si);
+  CHECK(s.tickWhy(si) == Engine::Tick::gpuShared && s.tickMs(si) == Engine::kTickMs);
+  si.gpuClients = 4;   // PianoA830 with slots: no tick at all
+  run(s, si);
+  CHECK(s.tickWhy(si) == Engine::Tick::none && s.tickMs(si) == 0);
 }
 
 static void profile()
@@ -529,6 +611,7 @@ int main()
   noSleep();
   lidOff();
   keyboard();
+  displayEventsTick();
   profile();
   profileUnsupported();
   thermalSharedSlot();
