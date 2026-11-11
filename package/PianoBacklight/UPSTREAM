@@ -1,0 +1,39 @@
+PianoBacklight is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). What it takes from other work, and from where:
+
+UniXNU-sheng (unixnu-research/UniXNU-sheng, main), BSD-2-Clause-Patent:
+  package/AppleARMBacklight.cpp (ShengBacklight) and docs/drivers/sheng-backlight.md in UniXNU
+    The design: the two KTZ8866 at 0x11 get the same 11-bit code in BL_BRT_LSB (0x04, bits 2:0) and BL_BRT_MSB (0x05); the level
+    found at start is read back and kept; a newer request replaces one not yet written; requests reach the driver's own thread
+    without making the caller wait. Not taken: its GENI I2C engines, clock votes and interrupts (piano drives the two buses in
+    software), its CoreBrightness service (AppleARMBacklight impersonation, backlight-control, the nits tables: an iPadOS path; on
+    macOS this display is external and no brightness service of macOS reaches it, see docs/drivers/backlight.md section 5).
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoKeyboard/BitI2c.h: copied as BitI2c.h (namespace changed): the software I2C master (itself PianoPower's Gauge.h I2cBus,
+    run on piano). package/PianoKeyboard/PianoKeyboard.cpp: the TLMM register layout and the open-drain line functions (released =
+    input with the pull-up, low = output enable with the output value 0), the mapping helper; the service on IOPlatformExpertDevice
+    with one kernel thread and the boot-argument gate. package/NativeGopDisplay: the class lookup and callPlatformFunction pattern it
+    uses for PianoA830's fences (here the other way round: NativeGopDisplay calls PianoBacklight).
+
+Facts, from public documents:
+  KTZ8866 datasheet, Kinetic Technologies, "High Efficiency 6-CH LED Backlight Driver with Dual LCD Bias Power", revision 04b,
+  January 2022 (kinet-ic.com/uploads/KTZ8866-04b.pdf): the address, the register map and every field used (Ktz8866.h's header lists
+  them), HWEN shutdown, FLAG cleared by reading, code 0 turning the boost and sinks off, LSB-then-MSB.
+  HID Usage Tables 1.4, Consumer page 0x0C: 0x6F Display Brightness Increment, 0x70 Display Brightness Decrement.
+
+Read as a specification only, never copied (GPL-2.0):
+  Linux drivers/video/backlight/ktz8866.c (Jianhua Lu), as Project-SunUEFI patches/linux/7.3/0002-display.patch changes it for
+  piano (the secondary IC mirrored, the fade waited for, the boot level kept): the order on (code, then BL_EN), off (BL_EN cleared,
+  the IC fades over register 0x14's off ramp), the level read at start (BL_EN set and a non-zero code), every write to the primary
+  then the secondary. Its DT binding change in 0001-platform.patch: kinetic,secondary-backlight / kinetic,secondary.
+  Project-SunUEFI docs/devel/hardware/display-depth.md: the stock firmware's lowest brightness reads code 374 on both ICs, the
+  highest 2047 (the stock curve, not used here).
+
+Facts from piano itself:
+  piano's boot DT (v1.1.0 piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840): backlight@11 on
+  i2c@98c000 (qcom,geni-i2c-master-hub, pinctrl hub-i2c3-data-clk-state: gpio70, gpio71, function i2chub0_se3, bias-pull-up, 2 mA;
+  enable-gpios TLMM 2; current-num-sinks 6; kinetic,secondary-backlight), backlight@11 on i2c@880000 (qcom,geni-i2c, QUP2 SE0,
+  pinctrl qup-i2c8-data-clk-state: gpio0, gpio1, function qup2_se0, bias-pull-up, 2 mA; kinetic,secondary), both 400 kHz; TLMM
+  gpio-reserved-ranges 36-39, 48-51, 74. The piano UEFI's panel configuration (Panel_P81_*_dualdsi_dsc_vid.xml in piano-uefi's
+  RawFiles, a configuration file, not a binary): "ktz8866 hwen: gpio 2", "VSP EN: gpio 117", "VSN EN: gpio 118" (the panel's bias
+  enables are the KTZ8866's ENP/ENN), the power-on sequence raising gpio2 and no power-off step lowering it.
