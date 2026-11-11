@@ -34,8 +34,13 @@ extern "C" {
 #define PS_ACCEL_AXES "a+y+x+z"
 
 /* ---- the DSP-addressable arena (sensors.md section 5): physical, page aligned, below 4 GiB (the DSP's 32-bit addresses through a
- * bypassed stream), in DRAM and outside every range known to be someone else's. XNU's own memory is above 4 GiB, so the owner
- * names the range (piano-sensors-rpc-pa); this only refuses what is certainly wrong. ---- */
+ * bypassed stream), in DRAM and outside every range known to be someone else's. XNU's own memory is above 4 GiB. The default is
+ * the sensors' slice of the CDSP carveout (PianoDspMemory.h: no-map, its loader disabled on piano, UEFI's PIL_Reserved); another
+ * address (piano-sensors-rpc-pa) is taken only when it overlaps none of the users below: every reserved-memory region of the live DT
+ * (the console mailbox in cvp, the GPU's ZAP, PianoVideo's carveout, the ADSP's carveouts, ...), the firmware's holes, the UEFI
+ * regions still in use, and the CDSP carveout's other slices. ---- */
+#include <PianoDspMemory.h>
+#define PS_ARENA_DEFAULT PIANO_DSP_MEMORY_SENSORS
 typedef struct {
     uint64_t base, bytes;
     const char *owner;

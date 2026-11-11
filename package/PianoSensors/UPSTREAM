@@ -29,8 +29,10 @@ sources (qualcomm/sensinghub, qualcomm/fastrpc), Linux and hexagonrpc read for f
       PaganiAdsp's qcom_qrtr_frame, so the vector checks the router piano really uses.
     scripts/make-sensor-pack.py (b42dbf530f45403ed199f11d0c0ec9e17d96ec9e7e332d38cd78cdcf76e21e2b) -> tools/make-sensor-pack.py: the
       pack format and archive handling unchanged; added piano's odm-etc-sensors.tar, the soc0 name allowlist (Ubuntu's sensors-prepare
-      list; a serial number is refused), the refusal to write a pack inside a repository except its ignored out/ and private/, mode
-      0600, the persist-registry and json.lst warnings; the Data-seed wording replaced.
+      list; a serial number is refused), two local sources (--registry-tar: a registry backup's outer directory under any prefix,
+      links refused, never printed; --rom-config: a stock configuration checked file by file against its source.json manifest),
+      --dump made optional, the output allowed only under this repository's out/ or private/, mode 0600, the persist-registry,
+      json.lst and soc0 notes; the Data-seed wording replaced.
     Test/check-pagani-sensors-host.py (only its build lines and sample dump, re-written) -> tests/run-host-tests.py.
   Not taken (yet): SensorsCore.c/.h (the sensor manager: SUID lookups, attributes, streams, retries) and Test/core.c, Test/stack.c: they
     depend on PaganiSensors.h's iOS kinds and PaganiAdsp's router ports; they are the template of the kext's level S2..S4

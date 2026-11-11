@@ -11,7 +11,8 @@
 //                    the sensors PD, the listener, every DSP file call answered from the pack in memory, writes declined; the guard's
 //                    tokens before each bring-up call, its strikes after, its decline mode once off.
 //   piano-sensors=3  + the SNS client (SensorsClient.c): SUID lookups and attributes, the sensor list published; no stream.
-// Other arguments: piano-sensors-delay=S, -settle=S (20), -rpc-pa=ADDR (the arena; level 2 does nothing without one), -bank=N (3),
+// Other arguments: piano-sensors-delay=S, -settle=S (20), -rpc-pa=ADDR (the arena; default the sensors' slice of the CDSP carveout,
+// PianoDspMemory.h; 0: no file service), -bank=N (3),
 // -smmu=0 (leave the SMMU alone), -nopack=1 (level 2 without a pack: every open fails, the paths are logged), -channel=0 (level 1
 // does not register the channel), -log=0..2 (1). Without piano-sensors the driver declines in probe() and maps nothing.
 // Properties on the PianoSensors service (stable; sensors.md §5 lists them with their units).
@@ -77,7 +78,7 @@ void readArgs()
   gArgs.log = bootArg("piano-sensors-log", 1);
   if (gArgs.log > 2) gArgs.log = 2;
   uint64_t pa = 0;
-  if (!PE_parse_boot_argn("piano-sensors-rpc-pa", &pa, sizeof pa)) pa = 0;
+  if (!PE_parse_boot_argn("piano-sensors-rpc-pa", &pa, sizeof pa)) pa = PS_ARENA_DEFAULT;   // 0 given: no arena
   gArgs.rpcPa = pa;
 }
 
@@ -347,7 +348,7 @@ PianoAdspChannel *gChannel;
 IOMemoryMap *gArenaMap;
 uint8_t *gArena, *gBounce;
 volatile uint32_t gChannelUp, gChannelUps;
-char gArenaText[160] = "none (piano-sensors-rpc-pa not given)";
+char gArenaText[200] = "none (piano-sensors-rpc-pa=0)";
 
 void channelState(void *, int up)   // PianoPower's DSP thread: record and wake only
 {
@@ -397,8 +398,10 @@ bool mapArena()
     snprintf(gArenaText, sizeof gArenaText, "%#llx + %#llx refused: %s", (unsigned long long)pa, (unsigned long long)bytes, why);
     return false;
   }
+  const char *which = pa == PS_ARENA_DEFAULT ? "the default, the CDSP carveout's sensors slice" : "named by piano-sensors-rpc-pa";
   if (gArgs.level < 2) {
-    snprintf(gArenaText, sizeof gArenaText, "%#llx + %#llx acceptable (not mapped at level 1)", (unsigned long long)pa, (unsigned long long)bytes);
+    snprintf(gArenaText, sizeof gArenaText, "%#llx + %#llx (%s) acceptable, not mapped at level 1", (unsigned long long)pa,
+             (unsigned long long)bytes, which);
     return false;
   }
   IODeviceMemory *m = IODeviceMemory::withRange(pa, bytes);
@@ -413,7 +416,8 @@ bool mapArena()
   volatile uint64_t *z = reinterpret_cast<volatile uint64_t *>(gArena);
   for (uint64_t i = 0; i < bytes / 8; ++i) z[i] = 0;
   dsb();
-  snprintf(gArenaText, sizeof gArenaText, "%#llx + %#llx mapped write-combined", (unsigned long long)pa, (unsigned long long)bytes);
+  snprintf(gArenaText, sizeof gArenaText, "%#llx + %#llx (%s) mapped write-combined", (unsigned long long)pa, (unsigned long long)bytes,
+           which);
   return true;
 }
 

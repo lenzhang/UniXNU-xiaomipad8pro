@@ -3,15 +3,67 @@
 /* Piano's sensor policies: see SensorsPolicy.h. */
 #include "SensorsPolicy.h"
 
-/* Known owners of low DRAM (el1-hyp-notes.md §3, charging.md §2, the live DT). The VM regions' sizes are not all recorded: their
- * whole span up to the splash is refused. */
+/* The users of low DRAM: every reserved-memory region of the live DT below 4 GiB but the CDSP carveout
+ * (docs/hyp-evidence/memory-map-running-dt.txt), the firmware's holes in it, the UEFI regions natively still in use (pianoPkg
+ * MemoryMapLib.c: the firmware volume with its stacks and heaps, the boot image's "Kernel" area, the DXE heap, Piano_Log,
+ * Display_Demura), and the CDSP carveout's slices that are not the sensors' (PianoDspMemory.h). Ranges may overlap; the first match
+ * names the user. */
 const PsRange ps_reserved[] = {
     {0x80000000ull, 0x1200000ull, "gunyah-hyp"},
+    {0x81200000ull, 0x200000ull, "cpucp"},
+    {0x81400000ull, 0x560000ull, "a firmware hole"},
+    {0x81a00000ull, 0x40000ull, "xbl-dtlog"},
+    {0x81c00000ull, 0x60000ull, "aop-image"},
+    {0x81c60000ull, 0x20000ull, "aop-cmd-db"},
+    {0x81c80000ull, 0x74000ull, "aop-tme-uefi-merged"},
+    {0x81cf4000ull, 0x1000ull, "display-dump"},
+    {0x81d00000ull, 0x200000ull, "smem"},
+    {0x81f00000ull, 0x100000ull, "pdp-ns-shared"},
+    {0x82000000ull, 0x380000ull, "cpucp-scandump"},
+    {0x82380000ull, 0x20000ull, "adsp-mhi (the DSP's)"},
+    {0x823a0000ull, 0x40000ull, "soccp-sdi"},
+    {0x823e0000ull, 0x80000ull, "pmic-minii-dump"},
+    {0x824a0000ull, 0x100000ull, "pvmfw"},
+    {0x825a0000ull, 0x60000ull, "a firmware hole"},
+    {0x82600000ull, 0x100000ull, "global-sync"},
+    {0x82700000ull, 0x100000ull, "tz-stat"},
+    {0x82800000ull, 0x2000000ull, "qdss"},
+    {0x84a00000ull, 0x4900000ull, "dsm-partition-1"},
+    {0x89300000ull, 0xa80000ull, "dsm-partition-2"},
+    {0x8ba00000ull, 0xf600000ull, "mpss (disabled, but the UEFI's PIL_Reserved)"},
+    {0x9b000000ull, 0x80000ull, "q6-mpss-dtb"},
+    {0x9b080000ull, 0x10000ull, "ipa-fw"},
+    {0x9b090000ull, 0xa000ull, "ipa-gsi"},
+    {0x9b09a000ull, 0x2000ull, "gpu-micro-code (the GPU's ZAP)"},
+    {0x9b09c000ull, 0x4000ull, "reserved@9b09c000"},
+    {0x9b0a0000ull, 0x1e0000ull, "spss"},
+    {0x9b280000ull, 0x40000ull, "spu-tz-shared"},
+    {0x9b2c0000ull, 0x40000ull, "spu-modem-shared"},
+    {0x9b300000ull, 0x800000ull, "camera"},
+    {0x9bb00000ull, 0x800000ull, "camera-2"},
+    {0x9c300000ull, 0x800000ull, "video (PianoVideo's firmware)"},
+    {0x9cb00000ull, 0x700000ull, "cvp (the native console mailbox)"},
+    {PIANO_DSP_MEMORY_AUDIO, PIANO_DSP_MEMORY_AUDIO_BYTES, "the CDSP carveout's audio slice (PianoDspMemory.h)"},
+    {PIANO_DSP_MEMORY_SPARE, PIANO_DSP_MEMORY_SPARE_BYTES, "the CDSP carveout's spare slice (PianoDspMemory.h)"},
+    {0x9eb00000ull, 0x80000ull, "q6-cdsp-dtb"},
+    {0x9eb80000ull, 0x80000ull, "reserved@9eb80000"},
+    {0x9ec00000ull, 0x180000ull, "soccp"},
     {0x9ed80000ull, 0x80000ull, "q6-adsp-dtb (the DSP's)"},
-    {0xa7100000ull, 0x300000ull, "the UEFI firmware volume"},
+    {0xa3500000ull, 0x2c80000ull, "Display_Demura / ramoops"},
+    {0xa7000000ull, 0x1000000ull, "the UEFI firmware volume, its stacks and heaps"},
+    {0xa8000000ull, 0x10000000ull, "the UEFI's Kernel area (the boot image)"},
+    {0xb8000000ull, 0x200000ull, "xbl-ramdump"},
     {0xb8200000ull, 0x5780000ull, "adspslpi (the DSP's image)"},
-    {0xf3800000ull, 0x9000000ull, "trust-ui-vm, oem-vm, pvmfw, vm-shared"},
+    {0xbd930000ull, 0x1a5d0000ull, "the UEFI's DXE heap"},
+    {0xd4e23000ull, 0x2dd000ull, "hwfence-shbuf"},
+    {0xd7f00000ull, 0x100000ull, "Piano_Log"},
+    {0xd8000000ull, 0x600000ull, "tz-merged"},
+    {0xd8600000ull, 0xb120000ull, "a firmware hole"},
+    {0xf3800000ull, 0x5000000ull, "trust-ui-vm"},
+    {0xf8800000ull, 0x3800000ull, "oem-vm"},
+    {0xfc000000ull, 0x400000ull, "vm-shared"},
     {0xfc800000ull, 0x2b00000ull, "the splash framebuffer"},
+    {0xff800000ull, 0x800000ull, "llcc-lpi"},
 };
 const unsigned ps_reserved_count = sizeof ps_reserved / sizeof ps_reserved[0];
 

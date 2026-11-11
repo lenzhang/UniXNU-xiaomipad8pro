@@ -16,7 +16,10 @@
 Synthetic inputs only: no vendor file, no registry, no calibration of any unit is read or written. Host tests do not establish that the
 sensor hub or the DSP answers."""
 import argparse
+import atexit
+import hashlib
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -27,6 +30,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
+REPO_OUT = PKG.parents[1] / 'out' / 'host-tests'   # ignored; the pack tool writes only under out/ or private/
 POWER = PKG.parent / 'PianoPower'
 PORTABLE = ('SensorsGuard.c', 'SensorsPolicy.c', 'SensorsPb.c', 'SensorsSsc.c', 'SensorsRpc.c', 'SensorsPack.c', 'SensorsFixed.c',
             'SensorsOrient.c', 'SensorsClient.c', 'SensorsLoad.c', 'FatVolume.c')
@@ -79,9 +83,44 @@ def tool(*args):
     return subprocess.run([sys.executable, str(PKG / 'tools/make-sensor-pack.py'), *map(str, args)], capture_output=True, text=True)
 
 
-def pack_checks(d):
+def registry_tar(path, prefix='usr/share/piano/sensors/registry-private/', link=False, twice=False):
+    """A registry backup shaped as piano's (the outer registry directory under a prefix), with made-up contents."""
+    with tarfile.open(path, 'w') as tar:
+        member(tar, prefix + 'registry/group_a', b'made-up group a')
+        member(tar, prefix + 'registry/sub/group_b', b'made-up group b')
+        member(tar, prefix + 'sns_reg_version', b'1\n')
+        member(tar, prefix + 'parsed_file_list.csv', b'x\n')
+        if link:
+            member(tar, prefix + 'registry/escape', link='/etc/passwd')
+        if twice:
+            member(tar, 'other/registry/group_c', b'c')
+            member(tar, 'other/sns_reg_version', b'1\n')
+
+
+def rom_config(d, tamper=False, outside=False):
+    """A stock-configuration directory with its manifest, as firmware/sensors/source.json describes one, made-up contents."""
+    d.mkdir(parents=True, exist_ok=True)
+    (d / 'vendor').mkdir(exist_ok=True)
+    (d / 'odm/config').mkdir(parents=True, exist_ok=True)
+    bodies = {'vendor/sns_reg_config': b'version=1\n', 'odm/config/json.lst': b'b.json\n', 'odm/config/b.json': b'{"b":1}'}
+    sources = {'vendor/sns_reg_config': 'vendor/etc/sensors/sns_reg_config', 'odm/config/json.lst': 'odm/etc/sensors/config/json.lst',
+               'odm/config/b.json': 'odm/etc/sensors/config/b.json'}
+    if outside:
+        sources['odm/config/b.json'] = 'odm/etc/init/b.json'
+    files = []
+    for path, body in bodies.items():
+        (d / path).write_bytes(body)
+        files.append({'path': path, 'source': sources[path], 'sha256': hashlib.sha256(body).hexdigest()})
+    if tamper:
+        (d / 'odm/config/b.json').write_bytes(b'{"b":2}')
+    (d / 'source.json').write_text(json.dumps({'stock_build': 'TEST.BUILD', 'files': files}))
+    return d
+
+
+def pack_checks(d, scratch):
+    """The pack tool on made-up inputs; every pack is written under this repository's out/ (scratch), the only place it may go."""
     sample_dump(d)
-    pack = d / 'pack.bin'
+    pack = scratch / 'pack.bin'
     done = tool('--dump', d, '--out', pack, '--library-path', '/vendor/dsp/sensors;/x', '--add', f'/vendor/extra/added={d / "added"}',
                 '--list')
     if done.returncode or 'skipped vendor/etc/sensors/escape' not in done.stderr or '/odm/etc/sensors/config/json.lst' not in done.stdout:
@@ -91,22 +130,49 @@ def pack_checks(d):
     (d / 'evil').mkdir()
     with tarfile.open(d / 'evil/vendor-etc-sensors.tar', 'w') as tar:
         member(tar, 'vendor/../../etc/passwd', b'x')
-    done = tool('--dump', d / 'evil', '--out', d / 'evil.bin')
-    if not done.returncode or 'unsafe member name' not in done.stderr or (d / 'evil.bin').exists():
+    done = tool('--dump', d / 'evil', '--out', scratch / 'evil.bin')
+    if not done.returncode or 'unsafe member name' not in done.stderr or (scratch / 'evil.bin').exists():
         sys.exit(f'FAIL: make-sensor-pack took an unsafe name: {done.stdout}{done.stderr}')
     (d / 'serial').mkdir()
     (d / 'serial/soc0.txt').write_text('soc_id=618\nserial_number=12345\n')
-    done = tool('--dump', d / 'serial', '--out', d / 'serial.bin')
-    if not done.returncode or 'serial_number is not served' not in done.stderr or (d / 'serial.bin').exists():
+    done = tool('--dump', d / 'serial', '--out', scratch / 'serial.bin')
+    if not done.returncode or 'serial_number is not served' not in done.stderr or (scratch / 'serial.bin').exists():
         sys.exit(f'FAIL: make-sensor-pack took a serial number: {done.stdout}{done.stderr}')
-    done = tool('--dump', d, '--out', PKG / 'pack-in-the-tree.bin')
-    if (PKG / 'pack-in-the-tree.bin').exists():
-        (PKG / 'pack-in-the-tree.bin').unlink()
-        sys.exit('FAIL: make-sensor-pack wrote a pack into the repository')
-    if subprocess.run(['git', '-C', str(PKG), 'rev-parse'], capture_output=True).returncode == 0 and \
-            (not done.returncode or 'inside the repository' not in done.stderr):
-        sys.exit(f'FAIL: make-sensor-pack did not refuse the repository: {done.stdout}{done.stderr}')
-    print('PASS pack tool: piano\'s archives, links, soc0 allowlist (no serial), unsafe names, never inside the repository')
+    # only out/ or private/ of this repository: not the package, not a temporary directory
+    for where in (PKG / 'pack-in-the-tree.bin', d / 'outside.bin'):
+        done = tool('--dump', d, '--out', where)
+        if where.exists():
+            where.unlink()
+            sys.exit(f'FAIL: make-sensor-pack wrote a pack to {where}')
+        if not done.returncode or 'a pack goes only under' not in done.stderr:
+            sys.exit(f'FAIL: make-sensor-pack did not refuse {where}: {done.stdout}{done.stderr}')
+    # the owner's private sources: a registry backup and the stock configuration with its manifest
+    registry_tar(d / 'registry.tar')
+    rom = rom_config(d / 'rom')
+    local = scratch / 'local.bin'
+    done = tool('--registry-tar', d / 'registry.tar', '--rom-config', rom, '--out', local, '--list')
+    if done.returncode or 'persist registry: 4 files' not in done.stdout or 'ROM configuration: 3 files of TEST.BUILD' not in done.stdout:
+        sys.exit(f'FAIL: make-sensor-pack (local sources): {done.stdout}{done.stderr}')
+    if 'group_a' in done.stdout + done.stderr or 'made-up' in done.stdout + done.stderr:
+        sys.exit('FAIL: make-sensor-pack printed a registry name or content')
+    blob = local.read_bytes()
+    for path, body in (('/mnt/vendor/persist/sensors/registry/registry/group_a', b'made-up group a'),
+                       ('/mnt/vendor/persist/sensors/registry/registry/sub/group_b', b'made-up group b'),
+                       ('/mnt/vendor/persist/sensors/registry/sns_reg_version', b'1\n'),
+                       ('/vendor/etc/sensors/sns_reg_config', b'version=1\n'), ('/odm/etc/sensors/config/json.lst', b'b.json\n')):
+        if path.encode() + b'\0' not in blob or body not in blob:
+            sys.exit(f'FAIL: make-sensor-pack (local sources): {path} missing')
+    for label, args, expect in (
+            ('a link in the registry', ['--registry-tar', registry_tar(d / 'link.tar', link=True) or d / 'link.tar'], 'link or a special'),
+            ('two registry directories', ['--registry-tar', registry_tar(d / 'twice.tar', twice=True) or d / 'twice.tar'], '2 registry'),
+            ('a tampered ROM file', ['--rom-config', rom_config(d / 'tampered', tamper=True)], 'does not match its sha256'),
+            ('a ROM path outside the sensor trees', ['--rom-config', rom_config(d / 'outside', outside=True)], 'is not under')):
+        bad = scratch / 'bad.bin'
+        done = tool(*args, '--out', bad)
+        if not done.returncode or expect not in done.stderr or bad.exists():
+            sys.exit(f'FAIL: make-sensor-pack took {label}: {done.stdout}{done.stderr}')
+    print("PASS pack tool: piano's archives, links, soc0 allowlist (no serial), unsafe names, only out/ or private/; the registry "
+          "backup (never printed) and the manifest-checked ROM configuration")
     return pack
 
 
@@ -147,9 +213,12 @@ def main():
         if 'orient' in want:
             run(build(out, 'orient', [HERE / 'orient.c', *src('SensorsOrient.c')], ['-lm']))
         pack = None
+        REPO_OUT.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='sensor-pack-', dir=REPO_OUT))   # the only place a pack may be written
+        atexit.register(shutil.rmtree, scratch, True)                            # made-up packs only, gone also after a FAIL
         if 'pack' in want or 'rpc' in want or 'load' in want:
             (out / 'dump').mkdir()
-            pack = pack_checks(out / 'dump')
+            pack = pack_checks(out / 'dump', scratch)
         if 'rpc' in want:
             run(build(out, 'rpc', [HERE / 'rpc.c', *src('SensorsRpc.c', 'SensorsPack.c')], ['-D_DARWIN_C_SOURCE', '-lpthread']), pack)
         if 'piano' in want:

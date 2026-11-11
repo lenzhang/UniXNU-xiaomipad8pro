@@ -14,8 +14,9 @@ hangs off the audio DSP's sensor hub (the SSC in `msm/adsp/sensor_pd`), so this 
 
 **Status: levels 1-3 built and linked into the KC, not run.** `piano-sensors=1` a read-only survey (PianoPower's health through the
 guard, the FastRPC channel, the SNS service, the pack on the ESP, the SMMU entries, the arena address), `=2` the file service serving the
-pack (with `piano-sensors-rpc-pa=ADDR`), `=3` the SNS sensor list; without `piano-sensors` the driver declines in probe(). Design, facts,
-the ladder, the properties and the pack's commands: `docs/drivers/sensors.md`.
+pack (its arena by default the CDSP carveout's sensors slice, `package/include/PianoDspMemory.h`), `=3` the SNS sensor list;
+without `piano-sensors` the driver declines in probe(). Design, facts, the ladder, the properties and the pack's commands:
+`docs/drivers/sensors.md`.
 
 | File | What |
 |---|---|

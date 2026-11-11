@@ -844,18 +844,39 @@ static void health_arena(void)
     d = sensors_dsp_of(&h);
     CHECK(sg_observe(&g, &d, 80001) == SG_OFF && g.reason == SG_REASON_FATAL);
     const char *why = NULL;
-    CHECK(ps_arena_check(0xa0000000ull, SSR_ARENA_BYTES, &why) == 0 && !why);
+    // the default: the sensors' slice of the CDSP carveout, exactly the arena's size, the whole of it
+    CHECK(PS_ARENA_DEFAULT == 0x9d200000ull && PIANO_DSP_MEMORY_SENSORS_BYTES == SSR_ARENA_BYTES);
+    CHECK(ps_arena_check(PS_ARENA_DEFAULT, SSR_ARENA_BYTES, &why) == 0 && !why);
+    CHECK(PIANO_DSP_MEMORY_SENSORS + PIANO_DSP_MEMORY_SENSORS_BYTES == PIANO_DSP_MEMORY_AUDIO);
+    CHECK(PIANO_DSP_MEMORY_AUDIO + PIANO_DSP_MEMORY_AUDIO_BYTES == PIANO_DSP_MEMORY_SPARE);
+    CHECK(PIANO_DSP_MEMORY_SPARE + PIANO_DSP_MEMORY_SPARE_BYTES == PIANO_DSP_MEMORY_BASE + PIANO_DSP_MEMORY_BYTES);
+    CHECK(ps_arena_check(PS_ARENA_DEFAULT + 0x1000, SSR_ARENA_BYTES, &why) && strstr(why, "audio slice"));
+    CHECK(ps_arena_check(PIANO_DSP_MEMORY_SPARE, 0x1000, &why) && strstr(why, "spare slice"));
+    // the users named in the task: the console mailbox, the GPU's ZAP, PianoVideo, the ADSP's carveouts
+    CHECK(ps_arena_check(0x9cb00000ull, SSR_ARENA_BYTES, &why) && strstr(why, "console mailbox"));
+    CHECK(ps_arena_check(0x9d1ff000ull, 0x2000, &why) && strstr(why, "console mailbox"));   // the page below the default
+    CHECK(ps_arena_check(0x9b09a000ull, 0x1000, &why) && strstr(why, "ZAP"));
+    CHECK(ps_arena_check(0x9c300000ull, SSR_ARENA_BYTES, &why) && strstr(why, "PianoVideo"));
+    CHECK(ps_arena_check(0xb9000000ull, SSR_ARENA_BYTES, &why) && strstr(why, "adspslpi"));
+    CHECK(ps_arena_check(0x9ed80000ull, 0x1000, &why) && strstr(why, "q6-adsp-dtb"));
+    CHECK(ps_arena_check(0x82380000ull, 0x1000, &why) && strstr(why, "adsp-mhi"));
+    // and the rest of the table
     CHECK(ps_arena_check(0xa0000800ull, SSR_ARENA_BYTES, &why) && !strcmp(why, "not whole 4 KiB pages"));
     CHECK(ps_arena_check(0x40000000ull, SSR_ARENA_BYTES, &why) && !strcmp(why, "below DRAM"));
     CHECK(ps_arena_check(0xfff00000ull, SSR_ARENA_BYTES, &why) && strstr(why, "4 GiB"));
     CHECK(ps_arena_check(0x8c0000000ull, SSR_ARENA_BYTES, &why) && strstr(why, "4 GiB"));
     CHECK(ps_arena_check(0x80800000ull, SSR_ARENA_BYTES, &why) && !strcmp(why, "gunyah-hyp"));
-    CHECK(ps_arena_check(0xb8000000ull, SSR_ARENA_BYTES, &why) && strstr(why, "adspslpi"));
     CHECK(ps_arena_check(0xfc000000ull, SSR_ARENA_BYTES, &why) && strstr(why, "vm"));
     CHECK(ps_arena_check(0xfd000000ull, SSR_ARENA_BYTES, &why) && strstr(why, "splash"));
-    CHECK(ps_arena_check(0x9ed00000ull, SSR_ARENA_BYTES, &why) && strstr(why, "q6-adsp-dtb"));
     CHECK(ps_arena_check(0xa7000000ull, SSR_ARENA_BYTES, &why) && strstr(why, "firmware volume"));
-    for (unsigned i = 1; i < ps_reserved_count; ++i) CHECK(ps_reserved[i - 1].base + ps_reserved[i - 1].bytes <= ps_reserved[i].base);
+    CHECK(ps_arena_check(0xa9000000ull, SSR_ARENA_BYTES, &why) && strstr(why, "Kernel area"));
+    CHECK(ps_arena_check(0x9b300000ull, SSR_ARENA_BYTES, &why) && !strcmp(why, "camera"));
+    CHECK(ps_arena_check(0xe0000000ull, SSR_ARENA_BYTES, &why) && strstr(why, "firmware hole"));
+    CHECK(ps_arena_check(0xa0000000ull, SSR_ARENA_BYTES, &why) == 0);   // RAM in the DT and no known user: the owner's risk
+    for (unsigned i = 0; i < ps_reserved_count; ++i) {          // each entry refuses its own first page, and none touches the default
+        CHECK(ps_arena_check(ps_reserved[i].base & ~0xfffull, 0x1000, &why) && why);
+        CHECK(ps_reserved[i].base + ps_reserved[i].bytes <= PS_ARENA_DEFAULT || ps_reserved[i].base >= PS_ARENA_DEFAULT + SSR_ARENA_BYTES);
+    }
     printf("PASS health and arena: PianoPower's report as the guard reads it, the arena's refusals\n");
 }
 
