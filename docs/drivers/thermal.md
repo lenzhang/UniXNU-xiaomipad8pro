@@ -351,14 +351,18 @@ names the channels lost to an error. Lock-free (a sequence count around a copy o
 SPMI access. Linking needs PianoThermal named as a library in PianoPower's descriptor and listed before it (today it is listed
 after); the platform function needs neither.
 
-Rules for the policy (B4 sets the numbers; the ones below are a proposal, not stock-verified):
-- these readings may only make charging more conservative than today's rules and the DSP's own JEITA window, never less;
-- missing = unknown, never cool: PianoPower's existing "without a temperature" branch (FCC 500 mA);
-- FCC: the warmest of the DSP's Tbat, the gauges' and the batt NTC (today: the DSP's, else the gauges');
-- connector: conn or conn2 at or above 60 °C → ICL 100 mA (as at detach) until both are under 50 °C, logged (a hot USB-C plug means
-  a damaged cable, a bad contact or lint; the stock threshold is not known);
-- charger at or above 85 °C → ICL 500 mA until it is under 75 °C;
-- batt NTC and the gauges more than 10 °C apart → logged, and the warmer one counts.
+How B4 takes it (`docs/drivers/charging-policy.md`, `package/PianoPower/ChargePolicy.h`; a proposal for its owner, the numbers
+below not stock-verified):
+- these readings may only make charging more conservative than the policy without them and the DSP's own JEITA window, never
+  less; missing = unknown, never cool (the policy's "none" branch: 500 mA);
+- battery: the batt NTC joins the derating's t, "the warmest of the firmware's 0x202a and the two packs", as a third source, and
+  the coolest-pack checks as a third reading (in `PianoChargeInput`: `t_ntc_dc` and a `PIANO_CHG_IN_NTC` valid bit, filled by
+  PianoPower from `piano_thermal_board_temps()` each cycle); the NTC and the packs more than 10 °C apart is logged, and the warmer
+  counts;
+- connectors: the policy keeps the input limit off the battery temperature on purpose (a warm battery is not left to carry the
+  system); a hot connector is the input current's own heating (contact resistance, a damaged cable, lint), so here the input limit
+  is what to lower: conn or conn2 at or above 60 °C → ICL 100 mA (as at detach) until both are under 50 °C, logged;
+- charger at or above 85 °C → ICL 500 mA until it is under 75 °C.
 
 ### 12.8 Hardware test (one RAM boot; unattended is fine, nothing is driven)
 
