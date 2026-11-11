@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""The persistent-boot install on piano, step by step (docs/persistent-boot.md; plan droidvm-build/piano-patches/
-persistent-boot-plan.md option A1, with the owner's 2026-11-11 06:42 rules).
+"""The persistent-boot install on piano, step by step (docs/persistent-boot.md; plan option A1 of the local
+persistent-boot-plan.md, with the owner's 2026-11-11 06:42 rules).
 
   maint-session.py --list
   maint-session.py --dry-run STEP [STEP ...]          print every command; nothing is sent to the tablet, ABL or the NAS

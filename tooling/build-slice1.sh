@@ -3,7 +3,8 @@
 # reset after 10-15 s), then tooling/k27/build-native-image.sh (native kexts, KC, ADT, the macOS RAM image + the loop's dump image) and
 # the offline verification. SIGN=1 also AVB-signs the images on the private build host (sign-on-remote.sh). Inputs are the pinned
 # checkouts of unixnu.lock and the files of out/inputs/ (ARTIFACTS.md). Nothing is flashed or sent to the tablet.
-#   tooling/build-slice1.sh            environment: SIGN=1, FD_B=1, K27_KERNEL, PIANO_RESET_AFTER (see build-native-image.sh)
+#   tooling/build-slice1.sh            environment: SIGN=1, FD_B=1 (needs PIANO_PARTITION_BACKUP), K27_KERNEL, PIANO_RESET_AFTER
+#                                      (see build-native-image.sh); PIANO_K27_TREE (tooling/k27/k27-tree.sh)
 set -euo pipefail
 D=$(cd "$(dirname "$0")/.." && pwd); cd "$D"
 R=${UNIXNU_RESEARCH:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/unixnu-research}
@@ -17,7 +18,10 @@ fd() {   # $1 variant name, $2 Binaries/piano directory
   grep -E '^\+ build ' "logs/fd/build-$1.log" | tail -1 > "logs/fd/command-$1.txt"
 }
 if [ "${FD_B:-0}" = 1 ]; then
-  [ -d "$R/piano-binaries-own303/QcomPkg" ] || tooling/firmware/make-own-binaries.sh "$D/../droidvm-build/piano-backup-20261110/sde/1-uefi_a.img.zst" "$R/piano-binaries-own303"
+  if [ ! -d "$R/piano-binaries-own303/QcomPkg" ]; then   # from the 2026-11-10 partition backup (PIANO_PARTITION_BACKUP)
+    PB=$(python3 -c 'import sys; sys.path.insert(0, "tooling/persist"); import common; print(common.partition_backup())')
+    tooling/firmware/make-own-binaries.sh "$PB/sde/1-uefi_a.img.zst" "$R/piano-binaries-own303"
+  fi
   fd B-own303 "$R/piano-binaries-own303"
 fi
 fd A-bundled "$R/piano-uefi-UniXNU-piano/uefi/Binaries/piano"

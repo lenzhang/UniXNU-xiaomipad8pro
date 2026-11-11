@@ -13,7 +13,6 @@ from pathlib import Path
 
 DEVICE = Path(__file__).resolve().parents[2]
 BACKUP = Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/CRITICAL-BACKUP'
-PARTITION_BACKUP = Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/piano-backup-20261110'
 
 # LUN 0 (4096-byte LBAs), CRITICAL-BACKUP/gpt-after.json = new-primary.bin / new-backup.bin (the tables on the tablet since
 # 2026-11-08). Entry indexes are 0-based (index 34 is partition 35).
@@ -34,7 +33,7 @@ ESP_NAME = 'esp'
 RESERVE_BLOCKS = 1024 * 256
 # A copy of the store in the free gap of linux_rootfs, well above the root image and below both store places (plan 3.0).
 STORE_SCRATCH_FIRST = 64711424
-# The boot triplet on LUN 4 (CRITICAL-BACKUP/boot-partitions.json; backups droidvm-build/piano-backup-20261110/sde/).
+# The boot triplet on LUN 4 (CRITICAL-BACKUP/boot-partitions.json; backups in partition_backup()'s sde/).
 BOOT_A_SHA256 = '389d4271743bb4c69664bdb31c34440589978c8add3af0ce9190c46045259a87'      # 13-boot_a (Ubuntu, key f5151930)
 VENDOR_BOOT_A_SHA256 = '50f70e361b927945afa4adb5ddc9947e39a136cd2cd2e28a311a4c3d2163829a'  # 23-vendor_boot_a (Ubuntu)
 INIT_BOOT_A_SHA256 = 'bbebc3d156fa4bffbdf2fdf83940a71a1ec6d64dcddc60977ece057eb1147061'    # 28-init_boot_a (Ubuntu)
@@ -163,6 +162,16 @@ def piano_env():
                 env[k.strip().removeprefix('export ').strip()] = v.strip().strip('"\'')
     env.update({k: v for k, v in os.environ.items() if k.startswith('PIANO_')})
     return env
+
+
+def partition_backup():
+    """The local partition backup of 2026-11-10 (its sde/<n>-<name>.img.zst images): PIANO_PARTITION_BACKUP from the environment or
+    ~/.config/piano/env; no committed file names it."""
+    value = piano_env().get('PIANO_PARTITION_BACKUP')
+    if not value:
+        raise SystemExit('PIANO_PARTITION_BACKUP is not set (environment or ~/.config/piano/env): the directory of the 2026-11-10 '
+                         'partition backup, with its sde/*.img.zst images')
+    return Path(os.path.expanduser(value))
 
 
 def installed_seed(out=None):

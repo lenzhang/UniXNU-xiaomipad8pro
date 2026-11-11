@@ -155,7 +155,7 @@ def verify(a):
                                          ('vendor_boot', '23-vendor_boot_a', common.VENDOR_BOOT_A_SHA256)):
                 source = a.out / 'ref' / f'{backup}.img'
                 if not source.is_file():
-                    subprocess.run(['zstd', '-q', '-d', '-f', '-o', str(source), str(common.PARTITION_BACKUP / 'sde' / f'{backup}.img.zst')], check=True)
+                    subprocess.run(['zstd', '-q', '-d', '-f', '-o', str(source), str(common.partition_backup() / 'sde' / f'{backup}.img.zst')], check=True)
                 check(common.sha(source) == digest, f'{set_name}/{part}.img is slot A\'s current {part} ({digest[:16]})')
                 shutil.copyfile(source, d / f'{part}.img')
             (d / 'SHA256SUMS').write_text(''.join(f'{common.sha(d / n)}  {n}\n' for n in ('boot.img', 'init_boot.img', 'vendor_boot.img')))

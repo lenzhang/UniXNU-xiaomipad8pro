@@ -269,8 +269,6 @@ fi
 STAMP=$(date +%Y%m%d-%H%M%S)
 if [ -n "${PIANO_BOOT_LOGDIR:-}" ]; then
   LOGDIR="$PIANO_BOOT_LOGDIR"
-elif [ -d "$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/piano-patches" ]; then
-  LOGDIR="$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/piano-patches/logs/home-ram-boot-$STAMP"
 else
   LOGDIR="$HOME/Downloads/piano-ram-boot-ready/logs/home-ram-boot-$STAMP"
 fi
