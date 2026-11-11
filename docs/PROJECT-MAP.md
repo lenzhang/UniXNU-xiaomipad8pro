@@ -129,6 +129,7 @@ Drivers and their state (each inert without its boot argument; pages in `docs/dr
 | PianoKeyboard (WN8030 cover + touchpad, hall gpio80) | MCU boots and the cover attaches; key/touchpad reports not yet seen with someone typing |
 | PianoTouch (NT36532E on QUP1 SE2) | built and linked, not run |
 | PianoWifi (WCN7860 on PCIe0) | level 1 read-only survey built, not run; the full ladder is months of work (`wifi.md`) |
+| PianoBacklight (2x KTZ8866: boot level, off on display sleep, key steps) | built, host-tested and linked, not run (`backlight.md`) |
 | PianoInput (buttons) | runs on the tablet |
 
 The installed profile (`build-esp.py --profile daily`: GPU + PianoPower level 1 + the USB console and the Mac's keyboard/pointer)

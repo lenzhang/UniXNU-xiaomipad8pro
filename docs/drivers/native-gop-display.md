@@ -205,7 +205,8 @@ Failure lines: `IOMobileFramebufferLegacy::start failed`, `createDisplayAttribut
 6. **Framebuffer mapping.** The splash region lies outside XNU's DRAM window (`memory@8c0000000`). It is mapped as I/O,
    write-combined, as the console maps it. The base comes from `PE_state.video`. The ADT's `framebuffer-*` values only
    cross-check it, or stand in when there is no console info.
-7. **No power control.** "display off" stops nothing on the panel. There is no DPMS or backlight (display.md, later).
+7. **No power control.** "display off" stops nothing on the panel. There is no DPMS (display.md, later); with `piano-backlight=2` the
+   display power goes to PianoBacklight, which turns the backlight off and on (backlight.md).
 8. The boot console keeps drawing over the solid colour until WindowServer's first frame
    (`PE_initialize_console(kPEDisableScreen)`).
 
