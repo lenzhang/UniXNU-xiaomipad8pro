@@ -91,3 +91,9 @@ their TLV ids). Servreg.h, the listener in PianoQrtr.c and the PianoMca.c additi
 UCSI buffer offsets (VERSION 0, CCI 4) are the UCSI specification's. The Type-C sink status's Rp bit order in ChargerPmic.h (bit 3
 default, bit 2 1.5 A, bit 1 3.0 A) is the register fact of Linux's drivers/usb/typec/tcpm/qcom/qcom_pmic_typec_port.c (GPL, read for
 the fact only; docs/drivers/usb-host.md §facts).
+
+ChargePolicy.c/.h (the charging policy, backlog B4) and ChargeLink.h (its wiring into the codec, piano-power-policy=1) are new code
+(BSD-2-Clause-Patent), written fresh: the behaviour and numbers from docs/ubuntu-history/device.md and kernel.md and the GPL
+xiaomi_mca driver read as a specification (docs/drivers/charging-policy.md §12), the board-thermistor rules from
+docs/drivers/thermal.md §12.7, the precedence of a sink's sources of current (PD, Type-C current, BC 1.2, default USB power) from
+the USB Type-C specification. Nothing copied.

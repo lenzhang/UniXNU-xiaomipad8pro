@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Host tests of PianoPower's portable cores: the charger PMIC discovery and port decode over a model of the SPMI arbiter
 // (ChargerPmic.h, SpmiObserver.h), the software I2C bus and the bq27z561 reads against a model of the gauge (Gauge.h), and the MCA
-// codec and charging policy against a model of the DSP's charger properties (PianoMca.c). Built and run by
-// tooling/k27/build-native-piano-power.sh before the kext.
+// codec and charging policy against a model of the DSP's charger properties (PianoMca.c), and ChargePolicy wired to the codec
+// (ChargeLink.h, piano-power-policy=1) against the same model. Built and run by tooling/k27/build-native-piano-power.sh before the kext.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +18,7 @@ extern "C" {
 #include "PianoMca.h"
 #include "Servreg.h"
 }
+#include "ChargeLink.h"
 
 using namespace pianopower;
 
@@ -320,6 +321,8 @@ struct Dsp {
   std::map<uint32_t, unsigned> readsOf;
   uint32_t otg[4] = {};   // the last OTG configuration payload written
   bool dropReads = false;
+  void (*hook)(void *, PianoMca &, int) = nullptr;   // after each answer is received (the owner's view of it)
+  void *hookCtx = nullptr;
 
   // Answers every request the codec has until it has none; returns how many.
   unsigned run(PianoMca &m)
@@ -359,8 +362,10 @@ struct Dsp {
         writes.push_back({prop, value});
         if (!retcodeFor.count(prop) || !retcodeFor[prop]) props[prop] = value;
         if (prop == PIANO_MCA_PD_FIXED && value == 9000 && props.count(0xf9000)) props[PIANO_MCA_BUS_VOLTAGE] = props[0xf9000];
+        if (prop == PIANO_MCA_PD_FIXED && value == 5000 && props.count(0xf5000)) props[PIANO_MCA_BUS_VOLTAGE] = props[0xf5000];
       }
-      piano_mca_receive(&m, resp, sizeof resp);
+      const int r = piano_mca_receive(&m, resp, sizeof resp);
+      if (hook) hook(hookCtx, m, r);
       ++n;
     }
     return n;
@@ -805,6 +810,527 @@ static void testMcaHv()
   CHECK(g.count(PIANO_MCA_PD_FIXED) == 0);
 }
 
+// ------------------------------------------------------------------------------------- ChargePolicy wired to the codec (ChargeLink.h)
+// The owner's side as PianoPower runs it: the codec linked after charger_pd, the DSP model answering, the link stepped after each
+// pass, a resync answered by a relink. The defaults are the 2026-11-11 evening run's Mac port: CDP at 5.23 V, Rp 3.0 A, 97 %, 29 C, the firmware's
+// 100 mA requested limit.
+struct LinkRig {
+  Dsp d;
+  PianoMca m{};
+  ChargeLink link;
+  LinkOptions opts;
+  GaugeReading packs[2];
+  PortState port;
+  piano_board_temps board{};
+  bool havePort = true, haveBoard = false, pdUp = true, packsFresh = true, sleep = false, shutdown = false;
+  uint32_t wakes = 0;
+  uint64_t now = 0;
+  unsigned relinks = 0, handoverReady = 0, refused = 0, waitingPd = 0, waitingBoard = 0;
+  uint32_t events = 0;              // every decision's events since the last take()
+  std::vector<LinkReadback> readbacks;
+
+  explicit LinkRig(LinkOptions o, bool boardCfg = true) : opts(o)
+  {
+    piano_mca_init(&m, o.writes ? 1 : 0, o.hv != 0);
+    piano_mca_allow_board(&m, boardCfg);
+    link.configure(m, o);
+    piano_mca_link(&m, 1);
+    // as PianoPower's receive loop: each write answer to the policy, and a decision after each finished cycle
+    d.hook = [](void *ctx, PianoMca &mm, int r) {
+      LinkRig *rig = static_cast<LinkRig *>(ctx);
+      if (r == McaWritten) rig->link.answered(mm);
+      if (r == McaCycleDone) rig->stepOnce();
+    };
+    d.hookCtx = this;
+    d.props[PIANO_MCA_BUS_VOLTAGE] = 5231000;
+    d.props[PIANO_MCA_BUS_CURRENT] = 397000;
+    d.props[PIANO_MCA_REAL_TYPE] = PIANO_MCA_TYPE_CDP;
+    d.props[PIANO_MCA_ICL] = 100;
+    d.props[PIANO_MCA_TBAT] = 29;
+    d.props[PIANO_MCA_CHARGE_ENABLE] = 1;
+    d.props[PIANO_MCA_TERM_VOLT] = 5200;
+    d.props[PIANO_MCA_VERIFY] = 0;
+    for (GaugeReading &g : packs) {
+      g.ok = true;
+      g.voltageMv = 4450;
+      g.currentMa = -800;
+      g.socPct = 97;
+      g.tempDeciC = 290;
+    }
+    port.ok = port.attached = port.sourceSeen = true;
+    port.cc = 1;
+    port.rpBits = 0x2;   // 3.0 A, as the Mac's port
+    board.version = PIANO_BOARD_TEMPS_VERSION;
+    board.state = PIANO_BOARD_TEMPS_RUNNING;
+    temps(30, 33, 31, 30);
+  }
+  void temps(int battery, int charger, int conn, int conn2)
+  {
+    const int c[4] = {battery, charger, conn, conn2};
+    board.valid = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+      board.milli_c[i] = c[i] * 1000;
+      if (c[i] > -100) board.valid |= 1u << i;   // -100: that channel does not read
+    }
+  }
+  void soc(int pct) { packs[0].socPct = pct; packs[1].socPct = pct - 1; }
+  LinkView view() const
+  {
+    LinkView v;
+    v.nowMs = now;
+    v.chargerPdUp = pdUp;
+    v.packs = packs;
+    v.packsFresh = packsFresh;
+    v.port = havePort ? &port : nullptr;
+    v.board = haveBoard ? &board : nullptr;
+    v.wakes = wakes;
+    v.willSleep = sleep;
+    v.shutdown = shutdown;
+    return v;
+  }
+  LinkOutcome stepOnce()
+  {
+    LinkOutcome o;
+    link.step(m, view(), o);
+    events |= o.events;
+    relinks += o.resync;
+    handoverReady += o.handoverReady;
+    refused += o.refused;
+    waitingPd += o.waitingPd;
+    waitingBoard += o.waitingBoard;
+    for (unsigned i = 0; i < o.readbacks; ++i) readbacks.push_back(o.readback[i]);
+    if (o.resync) {piano_mca_link(&m, 0); piano_mca_link(&m, 1);}
+    return o;
+  }
+  // Until nothing moves: the model answers everything, the link decides and queues, a resync relinks.
+  void settle()
+  {
+    for (int guard = 0; guard < 40; ++guard) {
+      const unsigned n = d.run(m);
+      const LinkOutcome o = stepOnce();
+      if (!n && !o.queued && !o.resync && !o.decided) return;
+    }
+    CHECK(!"the link never settled");
+  }
+  void period(uint64_t dt = 5000) { now += dt; piano_mca_refresh(&m); settle(); }
+  uint32_t take() { const uint32_t e = events; events = 0; return e; }
+  int index(uint32_t property, unsigned from = 0) const
+  {
+    for (size_t i = from; i < d.writes.size(); ++i) if (d.writes[i].property == property) return int(i);
+    return -1;
+  }
+  // Every write the model saw is one the codec's allowlist admits, and within the stage A ceilings.
+  bool allAllowed() const
+  {
+    for (const Dsp::Write &w : d.writes) {
+      const uint8_t bytes = w.property == PIANO_MCA_CHARGE_ENABLE || w.property == PIANO_MCA_CP_STATE ? 1
+                            : w.property == PIANO_MCA_OTG_CFG ? 16 : 4;
+      if (!piano_mca_write_allowed_for(&m, w.property, w.value, bytes)) return false;
+      if (w.property == PIANO_MCA_ICL && (w.value < 100 || w.value > 1600)) return false;
+      if (w.property == PIANO_MCA_FCC && (w.value < 100 || w.value > 1500)) return false;
+      if (w.property == PIANO_MCA_CHARGE_ENABLE && w.value == 0 && !link.cfg.limit) return false;
+      if (w.property == PIANO_MCA_INPUT_SUSPEND || w.property == PIANO_MCA_TERM_VOLT) return false;
+    }
+    return true;
+  }
+};
+
+static void testLinkCdp()
+{
+  // That Mac port, the default options: the board configuration, then the CDP row (900 / 900) whatever the Rp says.
+  LinkRig r{LinkOptions()};
+  r.period();
+  const int cp = r.index(PIANO_MCA_CP_STATE), cid = r.index(PIANO_MCA_CID_CFG), fcc = r.index(PIANO_MCA_FCC), icl = r.index(PIANO_MCA_ICL);
+  CHECK(cp >= 0 && cid >= 0 && r.index(PIANO_MCA_OTG_CFG) >= 0 && fcc > cid && icl > fcc);   // board first, then FCC, then ICL
+  CHECK(r.d.last(PIANO_MCA_ICL) == 900 && r.d.last(PIANO_MCA_FCC) == 900 && r.d.count(PIANO_MCA_ICL) == 1);
+  CHECK(r.link.plan.cls == PIANO_CHG_C_CDP && r.link.plan.icl_why == PIANO_CHG_ICL_ROW && r.link.plan.rp_ma == 0);
+  CHECK(!r.d.count(PIANO_MCA_CHARGE_ENABLE) && !r.d.count(PIANO_MCA_PD_FIXED) && !r.d.count(PIANO_MCA_INPUT_SUSPEND));
+  CHECK(r.take() & PIANO_CHG_EV_ATTACH);
+  CHECK(r.m.icl_set == 900 && r.m.fcc_set == 900);   // what the 3-minute warning and the mca line read
+  // the input limit read back on the next cycle, as written
+  bool readBack = false;
+  for (const LinkReadback &b : r.readbacks) readBack |= b.property == PIANO_MCA_ICL && b.readable && b.agrees && b.read == 900;
+  CHECK(readBack);
+  const size_t settled = r.d.writes.size();
+  for (int i = 0; i < 4; ++i) r.period();
+  CHECK(r.d.writes.size() == settled);                // nothing more while it reads back as written
+  r.d.pan(r.m);                                       // the port enable answered
+  r.period();
+  CHECK(piano_mca_configured(&r.m));                  // the quiet flag can be released
+  // the firmware loses the limit: one disagreeing cycle is tolerated, the second writes it again
+  r.d.props[PIANO_MCA_ICL] = 100;
+  r.period();
+  CHECK(r.d.count(PIANO_MCA_ICL) == 1);
+  r.period();
+  CHECK(r.d.count(PIANO_MCA_ICL) == 2 && r.d.last(PIANO_MCA_ICL) == 900);
+  CHECK(r.allAllowed() && r.refused == 0 && r.waitingPd == 0);
+  // piano-power-write=0: the decisions for the log, nothing sent, the codec refuses everything
+  LinkOptions ro;
+  ro.writes = false;
+  LinkRig w(ro);
+  for (int i = 0; i < 3; ++i) w.period();
+  CHECK(w.d.writes.empty() && w.link.plan.icl_ma == 900 && w.link.decisions >= 3);
+  CHECK(piano_mca_queue(&w.m, PIANO_MCA_ICL, 900, 4) == -1);
+  // without the external policy the queue is closed (the built-in policy keeps its own path)
+  PianoMca plain;
+  piano_mca_init(&plain, 1, 0);
+  CHECK(piano_mca_queue(&plain, PIANO_MCA_ICL, 900, 4) == -1);
+}
+
+static void testLinkRp()
+{
+  LinkOptions o;
+  o.rp = true;
+  // Rp 3.0 A with the connectors reading 31 / 30 C: 1600 mA (the ceiling), the charge current still the CDP row
+  {
+    LinkRig r(o);
+    r.haveBoard = true;
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_ICL) == 1600 && r.d.last(PIANO_MCA_FCC) == 900);
+    CHECK(r.link.plan.icl_why == PIANO_CHG_ICL_RP && r.link.plan.rp_ma == 3000);
+    r.port.rpBits = 0x4;   // 1.5 A
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_ICL) == 1500);
+    r.port.rpBits = 0x8;   // the default: nothing above the row
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_ICL) == 900 && r.link.plan.icl_why == PIANO_CHG_ICL_ROW);
+    r.port.rpBits = 0x2;
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_ICL) == 1600);
+    r.take();
+    // the bus sags under it: the trust ends for the boot
+    r.d.props[PIANO_MCA_BUS_VOLTAGE] = 4400000;
+    r.period();
+    CHECK((r.take() & PIANO_CHG_EV_RP_DISTRUST) && r.d.last(PIANO_MCA_ICL) == 900);
+    r.d.props[PIANO_MCA_BUS_VOLTAGE] = 5200000;
+    r.period();
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_ICL) == 900 && r.link.st.rp_distrust);
+    CHECK(r.allAllowed());
+  }
+  // no PianoThermal: unknown is never cool, the row and one note
+  {
+    LinkRig r(o);
+    r.period();
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_ICL) == 900 && (r.take() & PIANO_CHG_EV_RP_WITHHELD));
+    r.period();
+    CHECK(!(r.take() & PIANO_CHG_EV_RP_WITHHELD));   // once per attach
+  }
+  // a warm connector (52 C): the row; one connector channel lost, the other cool: the Rp limit
+  {
+    LinkRig r(o);
+    r.haveBoard = true;
+    r.temps(30, 33, 52, 30);
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_ICL) == 900);
+    r.temps(30, 33, 31, -100);
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_ICL) == 1600);
+    // no Type-C reading: the row
+    r.havePort = false;
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_ICL) == 900);
+  }
+  // a PD source: its contract governs, the Rp is not used
+  {
+    LinkRig r(o);
+    r.haveBoard = true;
+    r.d.props[PIANO_MCA_REAL_TYPE] = PIANO_MCA_TYPE_PD;
+    r.d.pdo = {5000, 5000, 1200, 9000, 9000, 2000};
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_ICL) == 1200 && r.link.plan.icl_why == PIANO_CHG_ICL_ROW);
+  }
+  // the source goes twice within 30 s of an Rp limit taking (a port's over-current cut): distrusted
+  {
+    LinkRig r(o);
+    r.haveBoard = true;
+    for (int k = 0; k < 2; ++k) {
+      r.d.props[PIANO_MCA_BUS_VOLTAGE] = 5200000;
+      r.period();
+      CHECK(r.d.last(PIANO_MCA_ICL) == 1600);
+      r.d.props[PIANO_MCA_BUS_VOLTAGE] = 200000;
+      r.period();
+    }
+    CHECK((r.take() & PIANO_CHG_EV_RP_DISTRUST) && r.link.st.rp_distrust);
+    r.d.props[PIANO_MCA_BUS_VOLTAGE] = 5200000;
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_ICL) == 900);
+  }
+}
+
+static void testLinkPd()
+{
+  // 5 V/3 A + 9 V/2 A, piano-power-hv=1: the 5 V offer (capped 1500) first, 9 V 15 s after the attach, then 1600 mA
+  LinkOptions o;
+  o.hv = 1;
+  LinkRig r(o);
+  r.d.props[PIANO_MCA_REAL_TYPE] = PIANO_MCA_TYPE_PD;
+  r.d.pdo = {5000, 5000, 3000, 9000, 9000, 2000};
+  r.d.props[0xf9000] = 8900000;
+  r.d.props[0xf5000] = 5100000;
+  r.period();
+  CHECK(r.d.last(PIANO_MCA_ICL) == 1500 && r.d.last(PIANO_MCA_FCC) == 1500 && !r.d.count(PIANO_MCA_PD_FIXED));
+  for (int i = 0; i < 4; ++i) r.period();
+  CHECK(r.d.count(PIANO_MCA_PD_FIXED) == 1 && r.d.last(PIANO_MCA_PD_FIXED) == 9000);
+  r.period();
+  CHECK(r.link.plan.hv == PIANO_CHG_HV_ON && r.d.last(PIANO_MCA_ICL) == 1600 && r.link.plan.icl_why == PIANO_CHG_ICL_9V);
+  bool asked = false;
+  for (const LinkReadback &b : r.readbacks) asked |= b.property == PIANO_MCA_PD_FIXED && b.agrees && b.read == 8900;
+  CHECK(asked && r.allAllowed());
+  // without piano-power-hv the codec refuses a 9 V request even if one were planned
+  LinkRig f{LinkOptions()};
+  CHECK(piano_mca_queue(&f.m, PIANO_MCA_PD_FIXED, 9000, 4) == -1 && piano_mca_queue(&f.m, PIANO_MCA_PD_FIXED, 5000, 4) == 0);
+  CHECK(piano_mca_queue(&f.m, PIANO_MCA_PPS, (450u << 16) | 60u, 4) == -1);   // the APDO request only with hv 2
+}
+
+static void testLinkDetachWakeGeneration()
+{
+  LinkRig r{LinkOptions()};
+  r.period();
+  r.period();
+  // detach: the firmware's own values back where written, once; a new attach sends the row again
+  r.d.props[PIANO_MCA_BUS_VOLTAGE] = 300000;
+  r.period();
+  CHECK((r.take() & PIANO_CHG_EV_DETACH) && r.d.last(PIANO_MCA_ICL) == 100 && r.d.last(PIANO_MCA_FCC) == 500);
+  const size_t gone = r.d.writes.size();
+  r.period();
+  CHECK(r.d.writes.size() == gone);
+  r.d.props[PIANO_MCA_BUS_VOLTAGE] = 5200000;
+  r.period();
+  CHECK(r.d.last(PIANO_MCA_ICL) == 900 && r.d.last(PIANO_MCA_FCC) == 900 && r.d.count(PIANO_MCA_ICL) == 3);
+  // a wake: the codec relinked (board configuration again), then everything sent again although the firmware kept it
+  r.take();
+  r.wakes++;
+  r.period();
+  r.period();
+  CHECK(r.relinks == 1 && (r.take() & PIANO_CHG_EV_WAKE));
+  CHECK(r.d.count(PIANO_MCA_CP_STATE) == 2 && r.d.count(PIANO_MCA_CID_CFG) == 2);
+  CHECK(r.d.count(PIANO_MCA_ICL) == 4 && r.d.count(PIANO_MCA_FCC) == 4 && r.index(PIANO_MCA_ICL, size_t(r.index(PIANO_MCA_CP_STATE, 1))) > 0);
+  // a new charger generation (charger_pd up again: PianoPower links the codec afresh): the same without a resync
+  const unsigned relinks = r.relinks;
+  piano_mca_link(&r.m, 0);
+  piano_mca_link(&r.m, 1);
+  r.d.props[PIANO_MCA_ICL] = 100;   // the firmware is on its defaults
+  r.settle();
+  r.period();
+  CHECK((r.take() & PIANO_CHG_EV_GENERATION) && r.relinks == relinks);
+  CHECK(r.d.count(PIANO_MCA_CP_STATE) == 3 && r.d.count(PIANO_MCA_ICL) == 5 && r.d.last(PIANO_MCA_ICL) == 900);
+  CHECK(r.allAllowed());
+}
+
+static void testLinkGates()
+{
+  // charger_pd not up (the codec linked on the 60 s fallback): the board configuration is the codec's, no policy write
+  LinkRig r{LinkOptions()};
+  r.pdUp = false;
+  for (int i = 0; i < 3; ++i) r.period();
+  CHECK(r.d.count(PIANO_MCA_CP_STATE) == 1 && !r.d.count(PIANO_MCA_ICL) && !r.d.count(PIANO_MCA_FCC) && r.waitingPd == 1);
+  r.pdUp = true;
+  r.period();
+  CHECK(r.d.last(PIANO_MCA_ICL) == 900);
+  // the board configuration refused: five cycles of it, the policy only after it gave up
+  LinkRig b{LinkOptions()};
+  b.d.retcodeFor[PIANO_MCA_CID_CFG] = 5;
+  for (int i = 0; i < 8; ++i) b.period();
+  const int lastCid = [&] { int k = -1; for (size_t i = 0; i < b.d.writes.size(); ++i) if (b.d.writes[i].property == PIANO_MCA_CID_CFG) k = int(i); return k; }();
+  CHECK(b.d.count(PIANO_MCA_CID_CFG) == 5 && b.index(PIANO_MCA_ICL) > lastCid && b.waitingBoard == 1);
+  // a write that gets no answer: the policy hears -60 (a refusal) and plans it again on the next decision
+  LinkRig t{LinkOptions()};
+  t.period();
+  t.d.props[PIANO_MCA_ICL] = 100;
+  t.period();                        // the first cycle that reads 100
+  auto hook = t.d.hook;
+  t.d.hook = nullptr;                // the owner's loop by hand from here
+  t.now += 5000;
+  piano_mca_refresh(&t.m);
+  t.d.run(t.m);                      // the second
+  const LinkOutcome o = t.stepOnce();   // plans the input limit again
+  CHECK(o.queued == 1);
+  uint8_t out[PIANO_MCA_REQUEST_BYTES];
+  CHECK(piano_mca_next(&t.m, out) && le32(out + 8) == PIANO_MCA_OP_WRITE && le32(out + 12) == PIANO_MCA_ICL);
+  t.link.timeout(t.m);               // no answer in 1 s
+  CHECK(t.m.last_result == -60 && t.link.st.tries[PIANO_CHG_S_ICL] == 1 && !(t.link.st.pending & (1u << PIANO_CHG_S_ICL)));
+  t.d.hook = hook;
+  t.settle();
+  t.period();
+  CHECK(t.d.last(PIANO_MCA_ICL) == 900);
+}
+
+static void testLinkHealth()
+{
+  LinkOptions o;
+  o.health = true;
+  // 85 %: the stop (0x2003 = 0) before the limits, no hold; it reads back 0
+  {
+    LinkRig r(o);
+    r.soc(85);
+    r.period();
+    const int stop = r.index(PIANO_MCA_CHARGE_ENABLE);
+    CHECK(stop >= 0 && r.d.writes[size_t(stop)].value == 0 && stop < r.index(PIANO_MCA_FCC) && stop < r.index(PIANO_MCA_ICL));
+    CHECK(!r.link.hold && r.link.plan.why_off == PIANO_CHG_OFF_LIMIT && (r.take() & PIANO_CHG_EV_LIMIT_STOP));
+    bool stopped = false;
+    for (const LinkReadback &b : r.readbacks) stopped |= b.property == PIANO_MCA_CHARGE_ENABLE && b.agrees && b.read == 0;
+    CHECK(stopped);
+    r.soc(78);
+    r.period();
+    CHECK(r.d.count(PIANO_MCA_CHARGE_ENABLE) == 1);   // between the thresholds nothing changes
+    r.soc(75);
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_CHARGE_ENABLE) == 1 && (r.take() & PIANO_CHG_EV_LIMIT_RESUME) && r.link.hold);
+    // the packs not read lately: no hold (the charge is not known)
+    r.packsFresh = false;
+    r.period();
+    CHECK(!r.link.hold);
+    CHECK(r.allAllowed());
+  }
+  // battery health off: never a 0, and the codec would refuse one
+  {
+    LinkRig r{LinkOptions()};
+    r.soc(95);
+    for (int i = 0; i < 3; ++i) r.period();
+    CHECK(!r.d.count(PIANO_MCA_CHARGE_ENABLE) && !r.link.hold);
+    CHECK(piano_mca_queue(&r.m, PIANO_MCA_CHARGE_ENABLE, 0, 1) == -1);
+    LinkRig h(o);
+    CHECK(piano_mca_queue(&h.m, PIANO_MCA_CHARGE_ENABLE, 0, 1) == 0);
+  }
+  // thresholds out of range: refused, the mode stays off
+  {
+    LinkOptions bad = o;
+    bad.stopPct = 30;
+    LinkRig r(bad);
+    CHECK(r.link.healthRefused && !r.link.cfg.limit && !r.m.stop_allowed);
+  }
+}
+
+static void testLinkSleepShutdown()
+{
+  LinkOptions o;
+  o.health = true;
+  LinkRig r(o);
+  r.soc(60);
+  r.period();
+  r.period();
+  CHECK(r.link.hold && !r.d.count(PIANO_MCA_CHARGE_ENABLE));
+  // the system sleeps: the protected charge stopped for the sleep, the CDP row kept, ready once the firmware took it
+  r.sleep = true;
+  r.settle();
+  CHECK(r.d.last(PIANO_MCA_CHARGE_ENABLE) == 0 && !r.link.hold && r.handoverReady >= 1 && (r.take() & PIANO_CHG_EV_SLEEP));
+  CHECK(r.d.last(PIANO_MCA_ICL) == 900);
+  // awake: relinked, the stop lifted, everything sent again, the hold back
+  r.sleep = false;
+  r.wakes++;
+  r.handoverReady = 0;
+  r.period();
+  r.period();
+  CHECK(r.relinks == 1 && r.d.last(PIANO_MCA_CHARGE_ENABLE) == 1 && r.link.hold);
+  // nothing attached: the handover is ready at once
+  LinkRig n(o);
+  n.d.props[PIANO_MCA_BUS_VOLTAGE] = 0;
+  n.period();
+  n.sleep = true;
+  n.settle();
+  CHECK(n.handoverReady >= 1 && !n.d.count(PIANO_MCA_CHARGE_ENABLE));
+  // charger_pd not up: nothing can be sent, ready at once
+  LinkRig p(o);
+  p.pdUp = false;
+  p.sleep = true;
+  p.settle();
+  CHECK(p.handoverReady >= 1);
+  // shutdown with our stop in force: lifted
+  LinkRig s(o);
+  s.soc(90);
+  s.period();
+  CHECK(s.d.last(PIANO_MCA_CHARGE_ENABLE) == 0);
+  s.shutdown = true;
+  s.settle();
+  CHECK(s.d.last(PIANO_MCA_CHARGE_ENABLE) == 1 && s.handoverReady >= 1 && !s.link.hold);
+  CHECK(r.allAllowed() && s.allAllowed());
+}
+
+static void testLinkThermal()
+{
+  LinkOptions o;
+  o.rp = true;
+  LinkRig r(o);
+  r.haveBoard = true;
+  r.period();
+  CHECK(r.d.last(PIANO_MCA_ICL) == 1600);
+  // a connector at 61 C: 100 mA until both read below 50; one of them lost meanwhile keeps the hold (unknown, never cool)
+  r.temps(30, 33, 61, 40);
+  r.period();
+  CHECK((r.take() & PIANO_CHG_EV_CONN_HOT) && r.d.last(PIANO_MCA_ICL) == 100 && r.link.plan.icl_why == PIANO_CHG_ICL_CONN);
+  r.temps(30, 33, 45, -100);
+  r.period();
+  CHECK(r.d.last(PIANO_MCA_ICL) == 100);
+  r.temps(30, 33, 45, 44);
+  r.period();
+  CHECK((r.take() & PIANO_CHG_EV_CONN_COOL) && r.d.last(PIANO_MCA_ICL) == 1600);
+  // the charger at 86 C: 500 mA at most until below 75
+  r.temps(30, 86, 40, 40);
+  r.period();
+  CHECK((r.take() & PIANO_CHG_EV_CHGR_HOT) && r.d.last(PIANO_MCA_ICL) == 500);
+  r.temps(30, 76, 40, 40);
+  r.period();
+  CHECK(r.d.last(PIANO_MCA_ICL) == 500);
+  r.temps(30, 74, 40, 40);
+  r.period();
+  CHECK((r.take() & PIANO_CHG_EV_CHGR_COOL) && r.d.last(PIANO_MCA_ICL) == 1600);
+  // the battery thermistor at 45 C with the packs at 29: the charge current derated at once (900 - 7 x 300 -> the 500 floor), noted
+  r.temps(45, 33, 31, 30);
+  r.period();
+  CHECK((r.take() & PIANO_CHG_EV_NTC_APART) && r.d.last(PIANO_MCA_FCC) == 500);
+  // PianoThermal gone quiet (no valid bits): the firmware's and the gauges' temperatures still count, back up one step per 30 s
+  r.board.valid = 0;
+  for (int i = 0; i < 14; ++i) r.period();
+  CHECK(r.d.last(PIANO_MCA_FCC) == 900);
+  CHECK(r.d.last(PIANO_MCA_ICL) == 900);   // and no connector reading: no Rp limit
+  CHECK(r.allAllowed());
+}
+
+// A random walk of the owner's world: every write the model sees must pass the codec's allowlist and the ceilings, a stop only with
+// battery health, and nothing before charger_pd and the board configuration.
+static void testLinkRandom()
+{
+  uint64_t x = 0x9e3779b97f4a7c15ull;
+  auto rnd = [&](unsigned n) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return unsigned(x % n); };
+  for (int run = 0; run < 12; ++run) {
+    LinkOptions o;
+    o.hv = rnd(3);
+    o.rp = rnd(2);
+    o.health = rnd(2);
+    o.writes = rnd(6) != 0;
+    LinkRig r(o);
+    r.haveBoard = rnd(2);
+    r.d.props[0xf9000] = 8900000;
+    r.d.props[0xf5000] = 5100000;
+    for (int i = 0; i < 300; ++i) {
+      switch (rnd(24)) {
+      case 0: r.d.props[PIANO_MCA_BUS_VOLTAGE] = rnd(2) ? 5200000 : 100000; break;
+      case 1: r.d.props[PIANO_MCA_REAL_TYPE] = rnd(16); break;
+      case 2: r.d.pdo = rnd(2) ? std::vector<uint32_t>{5000, 5000, 3000, 9000, 9000, 2000} : std::vector<uint32_t>{5000, 5000, 1500}; break;
+      case 3: r.port.rpBits = uint8_t(1u << rnd(4)); break;
+      case 4: r.temps(int(rnd(70)), int(rnd(100)), int(rnd(80)) - 10, rnd(4) ? int(rnd(80)) : -100); break;
+      case 5: r.wakes++; break;
+      case 6: piano_mca_link(&r.m, 0); piano_mca_link(&r.m, 1); break;
+      case 7: r.sleep = !r.sleep; break;
+      case 8: r.pdUp = rnd(5) != 0; break;
+      case 9: r.soc(int(rnd(60)) + 40); break;
+      case 10: r.d.props[PIANO_MCA_BUS_VOLTAGE] = 4000000 + rnd(600000); break;
+      case 11: r.havePort = !r.havePort; break;
+      case 12: r.packsFresh = !r.packsFresh; break;
+      case 13: r.d.props[PIANO_MCA_ICL] = rnd(2000); break;
+      case 14: if (rnd(2)) r.d.retcodeFor[PIANO_MCA_ICL] = 5; else r.d.retcodeFor.erase(PIANO_MCA_ICL); break;
+      default: break;
+      }
+      r.period(rnd(4) ? 5000 : rnd(60000));
+      if (!o.writes) CHECK(r.d.writes.empty());
+      if (r.sleep) CHECK(!r.link.hold);
+    }
+    CHECK(r.allAllowed());
+  }
+}
+
 // ------------------------------------------------------------------------------------------------------------- PMIC RTC
 // The count as RDATA shows it during a read: `ticks` lists the counter value at each register read (the four bytes of one
 // read come from the value current when that byte is read, so a carry between them tears the value).
@@ -923,6 +1449,15 @@ int main()
   testBoardConfig();
   testServreg();
   testPortOwners();
+  testLinkCdp();
+  testLinkRp();
+  testLinkPd();
+  testLinkDetachWakeGeneration();
+  testLinkGates();
+  testLinkHealth();
+  testLinkSleepShutdown();
+  testLinkThermal();
+  testLinkRandom();
   if (gFailures) {
     std::fprintf(stderr, "power_host: %d failure(s)\n", gFailures);
     return 1;

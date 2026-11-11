@@ -20,6 +20,12 @@
 // At both levels the PMIC RTC is read with every report from the first one after IOBSD is published (RtcReadout.h,
 // docs/drivers/rtc.md): its count, enable bit and the date with the offset of piano-rtc-offset=N or else the SDAM cell. Read only;
 // the kernel's calendar from it is k27 0060 (piano-rtc=1).
+// piano-power-policy=1 (level 2; default 0 keeps the built-in policy above exactly): ChargePolicy.c decides the charger writes instead
+// (ChargeLink.h, docs/drivers/charging-policy.md §8): after charger_pd is up and the board configuration is through; the class rows
+// (CDP 900 mA), the charge current derated by the warmest battery temperature (the firmware's, the gauges', PianoThermal's battery
+// thermistor), the connector and charger thermistors' holds, re-sent on a new generation and after a wake, the sleep and shutdown
+// handovers; piano-power-rp=1 the Type-C Rp current as the 5 V limit (within 1600 mA), piano-power-health=1 stop at 80 %, resume at
+// 75 % (piano-power-health-stop=N, -resume=N) with the charging-hold assertion. PianoPower then joins the power tree.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -36,11 +42,14 @@
 #include "PianoBattery.h"
 #include "Servreg.h"
 #include "RtcReadout.h"
+#include <PianoPowerContract.h>
+#include <PianoBoardTemps.h>
 extern "C" {
 #include "PianoAdsp.h"
 #include "AdspHealth.h"
 #include "PianoMca.h"
 }
+#include "ChargeLink.h"
 
 using namespace pianopower;
 
@@ -53,6 +62,7 @@ namespace {
 
 struct Args {
   uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor, board, ucsi;
+  uint32_t policy, rp, health, healthStop, healthResume;
   bool hasRtcOffset;
   uint32_t rtcOffset;
 };
@@ -80,6 +90,11 @@ void readArgs()
   gArgs.ps = bootArg("piano-power-ps", 0);            // the battery for macOS (PianoBattery.cpp)
   gArgs.psFloor = bootArg("piano-power-ps-floor", 0); // the lowest percentage shown on battery (BatteryMap.h)
   if (gArgs.psFloor > 50) gArgs.psFloor = 50;
+  gArgs.policy = bootArg("piano-power-policy", 0);          // ChargePolicy instead of the built-in policy (level 2, ChargeLink.h)
+  gArgs.rp = bootArg("piano-power-rp", 0);                  // with it: the Type-C Rp current as the 5 V input limit (<= 1600 mA)
+  gArgs.health = bootArg("piano-power-health", 0);          // with it: stop charging at 80 %, resume at 75 %
+  gArgs.healthStop = bootArg("piano-power-health-stop", 80);
+  gArgs.healthResume = bootArg("piano-power-health-resume", 75);
   gArgs.rtcOffset = 0;
   gArgs.hasRtcOffset = PE_parse_boot_argn("piano-rtc-offset", &gArgs.rtcOffset, sizeof gArgs.rtcOffset);
 }
@@ -249,9 +264,33 @@ class PianoPower : public IOService {
   static void channelState(void *context, int up);
   static void channelReceive(void *context, const uint8_t *data, uint32_t length);
 
+  // piano-power-policy=1 (ChargeLink.h): ChargePolicy decides the charger writes. All of it runs on the thread; setPowerState and
+  // systemWillShutdown only raise the asks below and wait for (or are acknowledged by) the thread.
+  bool fPolicyOn = false, fPolicyEnded = false;
+  ChargeLink fLink;
+  uint64_t fPackMs = 0;                       // when the packs were last read (the decisions take them for 3 periods)
+  IOService *fThermal = nullptr;              // PianoThermal, for its board temperatures (looked up every 10 s until found)
+  uint64_t fThermalLookupMs = 0;
+  bool fThermalNoted = false;
+  uint32_t fBoardStateShown = ~0u, fBoardValidShown = ~0u;
+  IOPMDriverAssertionID fHoldId = 0;
+  bool fHoldOn = false, fHoldFailed = false;
+  volatile uint32_t fSleepAsk = 0, fShutdownAsk = 0, fShutdownDone = 0, fWakes = 0;
+  bool fWentOff = false, fHandover = false, fHandoverAcked = false, fShutdownSeen = false;
+  uint64_t fHandoverUntil = 0, fShutdownUntil = 0;
+  void stepPolicy(uint64_t now);
+  void logPolicy(const LinkOutcome &o, uint64_t now);
+  void policyLine(char *line, size_t size);
+  bool boardTemps(piano_board_temps &t, uint64_t now);
+  void setHold(bool on);
+  void relinkMca(uint64_t now, const char *why);
+  bool policyAsked();
+
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  IOReturn setPowerState(unsigned long state, IOService *device) override;
+  void systemWillShutdown(IOOptionBits specifier) override;
 };
 
 OSDefineMetaClassAndStructors(PianoPower, IOService)
@@ -269,12 +308,30 @@ bool PianoPower::start(IOService *provider)
   note("start: piano-power=%u period %u s, gauges %s; %s", gArgs.level, gArgs.period, gArgs.gauge ? "on" : "off",
        gArgs.level >= 2 ? "level 2: the DSP's charger firmware is started and its charger properties are managed"
                         : "level 1: read only (no PMIC register written, the DSP is not started)");
-  if (gArgs.level >= 2)
+  fPolicyOn = gArgs.level >= 2 && gArgs.policy != 0;
+  if (gArgs.level >= 2 && !fPolicyOn)
     note("level 2 policy: %s%s", gArgs.write ? "input limit by charger type (<= 1.5 A at 5 V), charge current 1.0 A in 15-38 C"
                                              : "no charger writes (piano-power-write=0): the DSP keeps its own 100 mA input limit",
          gArgs.write && gArgs.hv ? ", 9 V from a PD source's fixed PDO (piano-power-hv=1, then <= 1.6 A)" : "");
-  if (gArgs.level >= 2 && gArgs.write && gArgs.unsuspend)
+  if (gArgs.level >= 2 && gArgs.write && gArgs.unsuspend && !fPolicyOn)
     note("piano-power-unsuspend=1: the input-suspend flag (0x2019) is written to 0 when it reads non-zero (never to 1)");
+  if (fPolicyOn) {
+    note("piano-power-policy=1: ChargePolicy decides the charger writes%s, after msm/adsp/charger_pd is up and the board "
+         "configuration is through: input limit by class (SDP 500, CDP 900, DCP 1500, PD its 5 V offer <= 1500 mA), charge current "
+         "by class (<= 1500 mA) derated -300 mA/C above 38 C (500 mA below 15 C or without a temperature), a connector at 60 C -> "
+         "100 mA input, the charger at 85 C -> 500 mA; re-sent on a new charger generation and after a wake",
+         gArgs.write ? "" : " for the log only (piano-power-write=0: nothing is sent)");
+    note("piano-power-rp=%u: %s", gArgs.rp ? 1u : 0u,
+         gArgs.rp ? "a source without PD that advertises 1.5 or 3.0 A on its Rp gets that as its 5 V input limit, at most 1600 mA, "
+                    "while a connector temperature (PianoThermal) reads below 50 C; a bus sag below 4.5 V under it ends the trust"
+                  : "the Type-C Rp current is not trusted: the class rows (a CDP gets 900 mA whatever its Rp says)");
+    note("piano-power-health=%u%s; piano-power-hv=%u%s", gArgs.health ? 1u : 0u,
+         gArgs.health ? ": charging stops at the stop charge (piano-power-health-stop, 80 %) and resumes at the resume charge "
+                        "(-resume, 75 %), the higher pack's, with a charging hold against idle sleep below the stop"
+                      : " (battery health off: 0x2003 is never written 0)",
+         gArgs.hv > 2 ? 2u : gArgs.hv, gArgs.hv ? " (9 V asked from a PD source 15 s after the attach)" : "");
+    if (gArgs.unsuspend) note("piano-power-unsuspend=1 is the built-in policy's: not used with piano-power-policy=1");
+  }
   if (gArgs.ps)
     note("piano-power-ps=1: the battery is published to macOS as AppleSmartBattery (IOPMPowerSource) from the gauges and the "
          "Type-C state, refreshed every %u s%s%s", gArgs.period, gArgs.psFloor ? "; the percentage shown on battery stays at least " : "",
@@ -287,7 +344,45 @@ bool PianoPower::start(IOService *provider)
     return true;   // stays attached and does nothing more
   }
   thread_deallocate(t);
+  // With the policy the charger is handed over before a system sleep and told everything again after it (docs/power.md §4), and a
+  // stop of ours is lifted at shutdown: setPowerState and systemWillShutdown need the power tree.
+  if (fPolicyOn) {
+    const IOReturn r = pianopower::join(this);
+    note("policy: joined the power tree (%#x): sleep hands the charger over, a wake sends everything again", r);
+  }
   return true;
+}
+
+// kOff: the thread hands the charger over (decide with the sleep flag until the plan is ready, at most 2 s) and acknowledges; the
+// answer here gives it 3 s. kOn after an off: one more wake, which the next decision sends everything again for.
+IOReturn PianoPower::setPowerState(unsigned long state, IOService *)
+{
+  if (!fPolicyOn) return kIOPMAckImplied;
+  if (state == pianopower::kOff) {
+    if (__atomic_load_n(&fSleepAsk, __ATOMIC_ACQUIRE)) return kIOPMAckImplied;
+    fWentOff = true;
+    __atomic_store_n(&fSleepAsk, 1u, __ATOMIC_RELEASE);
+    thread_wakeup((event_t)this);
+    return 3000 * 1000;
+  }
+  if (fWentOff) {
+    fWentOff = false;
+    __atomic_add_fetch(&fWakes, 1u, __ATOMIC_ACQ_REL);
+  }
+  __atomic_store_n(&fSleepAsk, 0u, __ATOMIC_RELEASE);
+  thread_wakeup((event_t)this);
+  return kIOPMAckImplied;
+}
+
+// Shutdown or restart: a stop of ours lifted and the source back at 5 V (piano_charge_shutdown), at most 2 s, then the assertion goes.
+void PianoPower::systemWillShutdown(IOOptionBits specifier)
+{
+  if (fPolicyOn) {
+    __atomic_store_n(&fShutdownAsk, 1u, __ATOMIC_RELEASE);
+    thread_wakeup((event_t)this);
+    for (unsigned waited = 0; waited < 2500 && !__atomic_load_n(&fShutdownDone, __ATOMIC_ACQUIRE); waited += 10) IOSleep(10);
+  }
+  IOService::systemWillShutdown(specifier);
 }
 
 void PianoPower::thread(void *self, wait_result_t)
@@ -400,6 +495,7 @@ void PianoPower::sampleGauges()
 {
   if (!fGauges) return;
   for (unsigned i = 0; i < 2; ++i) fPack[i] = gBuses[i].sda.page.va && gBuses[i].scl.page.va ? readBus(gBuses[i]) : GaugeReading();
+  fPackMs = nowMs();
   fBattery = combinePacks(fPack, 2);
   piano_mca_battery_temperature(&fMca, fBattery.ok, fBattery.tempDeciC / 10);
 }
@@ -555,6 +651,10 @@ void PianoPower::report()
     note("[%llus] %s", t, line);
     diagPortLine(line, sizeof line, true);
     note("[%llus] %s", t, line);
+    if (fPolicyOn) {
+      policyLine(line, sizeof line);
+      note("[%llus] %s", t, line);
+    }
   } else {
     PianoAdspSurvey s;
     if (!piano_adsp_survey(&s)) note("[%llus] adsp: slave-kernel %d (not started at level 1)", t, s.slave);
@@ -593,6 +693,19 @@ void PianoPower::startCharger()
   piano_mca_allow_board(&fMca, gArgs.board != 0);
   piano_mca_allow_ucsi(&fMca, gArgs.ucsi != 0);
   if (fBattery.ok) piano_mca_battery_temperature(&fMca, 1, fBattery.tempDeciC / 10);
+  if (fPolicyOn) {
+    LinkOptions o;
+    o.writes = gArgs.write != 0;
+    o.hv = gArgs.hv;
+    o.rp = gArgs.rp != 0;
+    o.health = gArgs.health != 0;
+    o.stopPct = gArgs.healthStop;
+    o.resumePct = gArgs.healthResume;
+    fLink.configure(fMca, o);
+    if (fLink.healthRefused)
+      note("policy: piano-power-health-stop=%u / -resume=%u refused (stop 50..100, resume 40..stop - 1): battery health stays off",
+           gArgs.healthStop, gArgs.healthResume);
+  }
   static const PianoAdspClient client = {&PianoPower::channelState, &PianoPower::channelReceive};
   fChannel = piano_adsp_channel("PMIC_RTR_ADSP_APPS", 1024, 4, 0, &client, this);
   if (!fChannel) {
@@ -665,7 +778,7 @@ void PianoPower::pumpMca(uint64_t now)
 
 void PianoPower::serviceMca(uint64_t now)
 {
-  if (!fChannel) return;
+  if (!fChannel) {stepPolicy(now); return;}
   // The channel, then the gate: like every Linux pmic_glink client, nothing is sent until msm/adsp/charger_pd reports up on the DSP's
   // service registry (PianoQrtr.c); without any answer for 60 s after the channel came up, the codec starts anyway (logged). Each
   // new charger generation (charger_pd up again) links the codec afresh, so the board configuration, the port enable and the
@@ -715,6 +828,13 @@ void PianoPower::serviceMca(uint64_t now)
     if (!length) break;
     const int r = piano_mca_receive(&fMca, data, length);
     if (r == McaAnswer || r == McaCycleDone || r == McaWritten) fRequestDue = 0;
+    if (r == McaWritten && fPolicyOn) {
+      // each answer logged as it comes (several can arrive in one pass) and handed to the policy
+      note("mca: write %s (%#x) = %u: %s (%d)", piano_mca_property_name(fMca.last_property), fMca.last_property, fMca.last_value,
+           fMca.last_result == 0 ? "ok" : "refused by the firmware", fMca.last_result);
+      fMca.events &= ~uint32_t(McaEvWrite);
+      fLink.answered(fMca);
+    }
     if (r == McaPanDone) fPanDue = 0;
     if (r == McaUcsiDone) {
       fUcsiDue = 0;
@@ -743,11 +863,16 @@ void PianoPower::serviceMca(uint64_t now)
       }
     }
   }
-  if (!fWasUp) {stepQuiet(now); return;}
-  if (fRequestDue && now >= fRequestDue) {piano_mca_timeout(&fMca); fRequestDue = 0;}
+  if (!fWasUp) {stepPolicy(now); stepQuiet(now); return;}
+  if (fRequestDue && now >= fRequestDue) {
+    if (fPolicyOn) fLink.timeout(fMca);   // a write's timeout is the policy's answer too (-60)
+    else piano_mca_timeout(&fMca);
+    fRequestDue = 0;
+  }
   if (fPanDue && now >= fPanDue) {piano_mca_pan_timeout(&fMca); fPanDue = 0;}
   if (fUcsiDue && now >= fUcsiDue) {piano_mca_ucsi_timeout(&fMca); fUcsiDue = 0;}
   if (now >= fCycleDue) {piano_mca_refresh(&fMca); fCycleDue = now + 5000;}
+  stepPolicy(now);
   pumpMca(now);
   logMcaEvents();
   stepQuiet(now);
@@ -764,6 +889,254 @@ void PianoPower::stepQuiet(uint64_t now)
                     : e == PowerQuietReleased ? "released: the charger is configured"
                     : e == PowerQuietTimedOut ? "released after 60 s with the charger not configured"
                                               : "dropped: the charger is not reachable now");
+}
+
+// ------------------------------------------------------------------------------------- piano-power-policy=1 (ChargeLink.h)
+namespace {
+// A board temperature for the log: whole degrees, "-" when it does not count.
+const char *tempText(char *buf, size_t size, const piano_board_temps &t, unsigned index)
+{
+  if (!(t.valid & (1u << index))) return "-";
+  snprintf(buf, size, "%d", t.milli_c[index] / 1000);
+  return buf;
+}
+int whole(int32_t dc) { return dc >= 0 ? dc / 10 : -((-dc + 9) / 10); }
+}  // namespace
+
+// The sleep or shutdown asked since the thread last looked (the wait in run() must not sleep through it).
+bool PianoPower::policyAsked()
+{
+  if (!fPolicyOn || fPolicyEnded) return false;
+  const bool sleep = __atomic_load_n(&fSleepAsk, __ATOMIC_ACQUIRE) != 0;
+  const bool down = __atomic_load_n(&fShutdownAsk, __ATOMIC_ACQUIRE) != 0;
+  return sleep != fHandover || (down && !fShutdownSeen);
+}
+
+// The plan's resync (a wake; Ubuntu #18): what a rebind did, the board configuration, the port enable and the UCSI read with it.
+void PianoPower::relinkMca(uint64_t now, const char *why)
+{
+  note("mca: %s: the charger codec is linked again (board configuration, port enable, UCSI read, every property read again)", why);
+  piano_mca_link(&fMca, 0);
+  piano_mca_link(&fMca, 1);
+  fRequestDue = fPanDue = fUcsiDue = 0;
+  fCycleDue = now + 5000;
+}
+
+// PianoThermal's board temperatures through its platform function (PianoBoardTemps.h): no link dependency, PianoThermal may be
+// absent or inert; then every temperature is unknown, which the policy never takes for cool.
+bool PianoPower::boardTemps(piano_board_temps &t, uint64_t now)
+{
+  if (!fThermal && now >= fThermalLookupMs) {
+    fThermalLookupMs = now + 10000;
+    OSDictionary *match = IOService::serviceMatching("PianoThermal");
+    fThermal = match ? IOService::copyMatchingService(match) : nullptr;   // kept: a kext of the collection never unloads
+    OSSafeReleaseNULL(match);
+    if (fThermal) {
+      note("policy: PianoThermal found: its board temperatures (battery, charger, connectors) join the rules");
+    } else if (!fThermalNoted) {
+      fThermalNoted = true;
+      note("policy: no PianoThermal service: the board temperatures are unknown (never cool: no Rp limit); looked up every 10 s");
+    }
+  }
+  if (!fThermal) return false;
+  bzero(&t, sizeof t);
+  t.version = PIANO_BOARD_TEMPS_VERSION;
+  if (fThermal->callPlatformFunction("piano-thermal-board-temps", false, &t, nullptr, nullptr, nullptr) != kIOReturnSuccess) return false;
+  if (t.state != fBoardStateShown || t.valid != fBoardValidShown) {
+    fBoardStateShown = t.state;
+    fBoardValidShown = t.valid;
+    static const char *const kState[] = {"off (no piano-thermal-adc)", "starting", "running", "STOPPED"};
+    char a[12], b[12], c[12], d[12];
+    note("policy: board temperatures %s, valid %#x: battery %s, charger %s, connector %s, connector 2 %s C (disabled %#x)",
+         t.state < 4 ? kState[t.state] : "?", t.valid, tempText(a, sizeof a, t, PIANO_BOARD_TEMP_BATTERY),
+         tempText(b, sizeof b, t, PIANO_BOARD_TEMP_CHARGER), tempText(c, sizeof c, t, PIANO_BOARD_TEMP_CONNECTOR),
+         tempText(d, sizeof d, t, PIANO_BOARD_TEMP_CONNECTOR2), t.disabled);
+  }
+  return true;
+}
+
+// The charging hold (charging-policy.md §5): no idle sleep while protected charging runs below the limit. Created on first use.
+void PianoPower::setHold(bool on)
+{
+  if (on == fHoldOn) return;
+  IOPMrootDomain *root = getPMRootDomain();
+  if (!root) return;
+  if (!fHoldId) {
+    if (!on) return;
+    fHoldId = root->createPMAssertion(kIOPMDriverAssertionPreventSystemIdleSleepBit, kIOPMDriverAssertionLevelOff, this,
+                                      "com.unixnu.driver.PianoPower.charging-hold");
+    if (!fHoldId) {
+      if (!fHoldFailed) note("policy: the charging-hold assertion could not be created: idle sleep is not held off");
+      fHoldFailed = true;
+      return;
+    }
+  }
+  root->setPMAssertionLevel(fHoldId, on ? kIOPMDriverAssertionLevelOn : kIOPMDriverAssertionLevelOff);
+  fHoldOn = on;
+  note("policy: charging hold %s", on ? "on: no idle sleep while protected charging runs below the limit" : "off");
+}
+
+void PianoPower::policyLine(char *line, size_t size)
+{
+  const PianoChargePlan &p = fLink.plan;
+  const PianoChargeConfig &c = fLink.cfg;
+  static const char *const kWhy[] = {"row", "Rp", "9 V row", "connector hot", "charger hot"};
+  static const char *const kHv[] = {"5 V", "9 V asked", "9 V", "9 V blocked"};
+  static const char *const kOff[] = {"", " (battery health limit)", " (battery too hot)", " (battery too cold)", " (asleep)"};
+  char rp[24] = "";
+  if (p.rp_ma) snprintf(rp, sizeof rp, ", %u mA advertised", p.rp_ma);
+  snprintf(line, size,
+           "policy: %s, input limit %u mA (%s%s), charge current %u mA, %s, %s%s, hold %s; %u decisions, %u writes queued, %u "
+           "refused, %u relinks; Rp %s; battery health %s",
+           piano_charge_class_name(p.cls), p.icl_ma, kWhy[p.icl_why < 5 ? p.icl_why : 0], rp, p.fcc_ma, kHv[p.hv < 4 ? p.hv : 0],
+           p.charge ? "charging" : "not charging", kOff[p.why_off < 5 ? p.why_off : 0], fLink.hold ? "on" : "off", fLink.decisions,
+           fLink.queuedTotal, fLink.refusedTotal, fLink.resyncs,
+           !c.rp ? "not trusted" : fLink.st.rp_distrust ? "DISTRUSTED (a sag or quick detaches)" : "trusted",
+           c.limit ? (fLink.st.hold ? "stopped at the limit" : "on") : "off");
+}
+
+void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
+{
+  const uint64_t t = (now - fStartMs) / 1000;
+  const PianoChargeInput &in = fLink.in;
+  const PianoChargeConfig &c = fLink.cfg;
+  if (o.waitingPd) note("policy: waiting for msm/adsp/charger_pd to report up: no policy write before it");
+  if (o.waitingBoard) note("policy: waiting for the board configuration to be taken (or given up) before the first policy write");
+  const uint32_t e = o.events;
+  if (e & PIANO_CHG_EV_GENERATION) note("policy: charger generation %u: the firmware is on its defaults, everything is sent again", in.generation);
+  if (e & PIANO_CHG_EV_WAKE) note("policy: wake %u: the codec is relinked and everything is sent again", in.wakes);
+  if (e & PIANO_CHG_EV_ATTACH) {
+    char rp[40] = "";
+    if (in.valid & PIANO_CHG_IN_TYPEC) snprintf(rp, sizeof rp, ", Type-C Rp %u mA", in.rp_ma);
+    note("policy: a source is attached: bus %d mV, type %s%s", in.bus_mv, (in.valid & PIANO_CHG_IN_TYPE) ? piano_mca_type_name(in.type) : "?", rp);
+  }
+  if (e & PIANO_CHG_EV_TYPE) note("policy: the source's type is now %s (%d)", piano_mca_type_name(in.type), in.type);
+  if (e & PIANO_CHG_EV_DETACH)
+    note("policy: the source is gone: the firmware's own input limit (100 mA) and charge current (500 mA) back where written, a "
+         "stop of ours lifted");
+  if (e & PIANO_CHG_EV_HV_ASKED) note("policy: asking the PD source for 9 V (%s)", fLink.st.hv_pps ? "its PPS APDO" : "its fixed 9 V PDO");
+  if (e & PIANO_CHG_EV_HV_ON) note("policy: the bus is at %d mV: 9 V on", in.bus_mv);
+  if (e & PIANO_CHG_EV_HV_BLOCKED) note("policy: 9 V not reached, lost or refused: 5 V until the source is detached");
+  if (e & PIANO_CHG_EV_HV_RETRY) note("policy: the source went back to 5 V by itself: 9 V asked again in 10 s");
+  if (e & PIANO_CHG_EV_LIMIT_STOP)
+    note("policy: battery health: %d %% reached the stop (%u %%): charging stops (0x2003 = 0)", in.soc_max_pct, c.stop_pct);
+  if (e & PIANO_CHG_EV_LIMIT_RESUME)
+    note("policy: battery health: %d %% is down to the resume (%u %%): charging resumes", in.soc_max_pct, c.resume_pct);
+  if (e & PIANO_CHG_EV_HOT) note("policy: battery health: the battery is at 55 C or more: charging stops until below 53 C");
+  if (e & PIANO_CHG_EV_COLD) note("policy: battery health: the battery is below 0 C: charging stops until 2 C");
+  if (e & PIANO_CHG_EV_SOC_LOST) note("policy: battery health: no charge reading for 5 min: the limit cannot be held, charging goes on");
+  if (e & PIANO_CHG_EV_STOP_LEAK)
+    note("policy: WARNING: 0x2003 reads 0 a minute after the stop and the packs still take %d mA: the bit does not stop charging "
+         "here; turn piano-power-health off and report", in.ibat_ma);
+  if (e & PIANO_CHG_EV_FW_DISABLED) note("policy: the firmware itself has charging disabled (0x2003 reads 0): not overridden");
+  if (e & PIANO_CHG_EV_GAVE_UP) note("policy: a write refused 3 times in a row: left until the next attach, wake or generation");
+  if (e & PIANO_CHG_EV_READBACK) note("policy: a value the firmware took 3 times reads back otherwise: left alone");
+  if (e & PIANO_CHG_EV_REFUSED) note("policy: a computed write outside the policy's allowlist (a bug): not planned");
+  if (e & PIANO_CHG_EV_WEDGE_RESYNC)
+    note("policy: the firmware sees no source while the Type-C block sees one (30 s, Ubuntu #18): the codec is relinked");
+  if (e & PIANO_CHG_EV_WEDGED) note("policy: WARNING: still no source after two relinks: replug the cable or reboot");
+  if (e & PIANO_CHG_EV_SLEEP) note("policy: the sleep handover began");
+  if (e & PIANO_CHG_EV_RP_DISTRUST)
+    note("policy: the Rp limit is not trusted for the rest of the boot (the bus sagged below 4.5 V under it, or the source went "
+         "twice within 30 s of it): the class rows");
+  if (e & PIANO_CHG_EV_RP_WITHHELD)
+    note("policy: the source advertises %u mA on its Rp, but no connector temperature reads below 50 C (%s): the class row",
+         in.rp_ma, fThermal ? "PianoThermal's connector channels" : "PianoThermal is not there");
+  if (e & PIANO_CHG_EV_NTC_APART)
+    note("policy: the battery thermistor (%d C) and the packs (%d C) are more than 10 C apart: the warmer counts", whole(in.t_ntc_dc),
+         whole(in.t_warm_dc));
+  if (e & PIANO_CHG_EV_CONN_HOT)
+    note("policy: a connector thermistor reads 60 C or more (%d / %d C): input limit 100 mA until both read below 50 C",
+         (in.valid & PIANO_CHG_IN_CONN1) ? whole(in.t_conn1_dc) : -99, (in.valid & PIANO_CHG_IN_CONN2) ? whole(in.t_conn2_dc) : -99);
+  if (e & PIANO_CHG_EV_CONN_COOL) note("policy: both connector thermistors read below 50 C: the input limit follows the source again");
+  if (e & PIANO_CHG_EV_CHGR_HOT) note("policy: the charger thermistor reads 85 C or more: input limit 500 mA at most until below 75 C");
+  if (e & PIANO_CHG_EV_CHGR_COOL) note("policy: the charger thermistor reads below 75 C: the input limit follows the source again");
+  for (unsigned i = 0; i < o.readbacks; ++i) {
+    const LinkReadback &r = o.readback[i];
+    const bool volt = r.property == PIANO_MCA_PD_FIXED || r.property == PIANO_MCA_PPS;
+    if (!r.readable)
+      note("policy: %s (%#x) = %u: not readable on the cycle after the write", piano_mca_property_name(r.property), r.property, r.written);
+    else if (volt)
+      note("policy: the bus reads %d mV after the %s request (%#x): %s", r.read, r.property == PIANO_MCA_PPS || r.written == 9000 ? "9 V" : "5 V",
+           r.written, r.agrees ? "as asked" : "NOT as asked (the policy blocks 9 V if it stays so)");
+    else
+      note("policy: %s (%#x) reads %d after the write of %u: %s", piano_mca_property_name(r.property), r.property, r.read, r.written,
+           r.agrees ? "as written" : "NOT as written (written again after a second such read)");
+  }
+  if (o.refused)
+    note("policy: the codec's allowlist refused %s (%#x) = %u (%u so far): not sent", piano_mca_property_name(o.refusedProperty),
+         o.refusedProperty, o.refusedValue, fLink.refusedTotal);
+  if (o.full) note("policy: the codec's queue is full: %u writes are planned again later", o.full);
+  if (o.planChanged) {
+    char line[400];
+    policyLine(line, sizeof line);
+    note("[%llus] %s", t, line);
+  }
+}
+
+// One pass of the policy: the gates and the decision in ChargeLink.h; here the inputs only this side has (the port, PianoThermal),
+// the codec's relink, the assertion, and the sleep and shutdown acknowledgements.
+void PianoPower::stepPolicy(uint64_t now)
+{
+  if (!fPolicyOn || fPolicyEnded) return;
+  const bool sleepAsk = __atomic_load_n(&fSleepAsk, __ATOMIC_ACQUIRE) != 0;
+  const bool downAsk = __atomic_load_n(&fShutdownAsk, __ATOMIC_ACQUIRE) != 0;
+  if (sleepAsk && !fHandover) {
+    fHandover = true;
+    fHandoverAcked = false;
+    fHandoverUntil = now + 2000;
+    note("policy: system sleep: handing the charger over (the class's 5 V limits%s), at most 2 s",
+         fLink.cfg.limit ? ", charging stopped for the sleep below the limit" : "");
+  } else if (!sleepAsk && fHandover) {
+    fHandover = false;
+    note("policy: awake again (wake %u)", __atomic_load_n(&fWakes, __ATOMIC_ACQUIRE));
+  }
+  if (downAsk && !fShutdownSeen) {
+    fShutdownSeen = true;
+    fShutdownUntil = now + 2000;
+    note("policy: shutdown or restart: a stop of ours is lifted and the source put back at 5 V, at most 2 s");
+  }
+  const bool reachable = fChannel && fWasUp;
+  LinkView v;
+  v.nowMs = now;
+  uint32_t ups = 0;
+  v.chargerPdUp = reachable && piano_qrtr_charger_pd(&ups) == SERVREG_STATE_UP;
+  v.packs = fPack;
+  v.packsFresh = fGauges && fPackMs && now - fPackMs <= 3ull * gArgs.period * 1000;
+  v.wakes = __atomic_load_n(&fWakes, __ATOMIC_ACQUIRE);
+  v.willSleep = fHandover;
+  v.shutdown = fShutdownSeen;
+  PortState port;
+  piano_board_temps board;
+  if (reachable && fLink.due(fMca, v)) {
+    // the port every decision (the Rp current, the #18 check), not only every report
+    if (fSpmi && fCharger.found) {
+      port = readPort(gIo, fCharger);
+      v.port = &port;
+    }
+    if (boardTemps(board, now)) v.board = &board;
+  }
+  LinkOutcome o;
+  if (reachable) fLink.step(fMca, v, o);
+  else o.handoverReady = true;   // nothing reachable: nothing to hand over
+  if (o.decided || o.waitingPd || o.waitingBoard || o.refused || o.full) logPolicy(o, now);
+  if (o.resync) relinkMca(now, o.events & PIANO_CHG_EV_WAKE ? "after the wake" : "the firmware lost the source (#18)");
+  setHold(reachable && fLink.hold && !fShutdownSeen);
+  if (fHandover && !fHandoverAcked && (o.handoverReady || now >= fHandoverUntil)) {
+    fHandoverAcked = true;
+    note("policy: sleep handover %s: acknowledged", o.handoverReady ? "done" : "not complete after 2 s");
+    acknowledgeSetPowerState();
+  }
+  if (fShutdownSeen && (o.handoverReady || now >= fShutdownUntil)) {
+    note("policy: shutdown handover %s; the policy stops", o.handoverReady ? "done" : "not complete after 2 s");
+    setHold(false);
+    if (fHoldId) {
+      if (IOPMrootDomain *root = getPMRootDomain()) root->releasePMAssertion(fHoldId);
+      fHoldId = 0;
+    }
+    fPolicyEnded = true;
+    __atomic_store_n(&fShutdownDone, 1u, __ATOMIC_RELEASE);
+  }
 }
 
 void PianoPower::run()
@@ -798,9 +1171,11 @@ void PianoPower::run()
       if (fPanDue && fPanDue < next) next = fPanDue;
     }
     if (fReadyWarnDue && fReadyWarnDue < next) next = fReadyWarnDue;
+    if (fHandover && !fHandoverAcked && fHandoverUntil < next) next = fHandoverUntil;
+    if (fShutdownSeen && !fPolicyEnded && fShutdownUntil < next) next = fShutdownUntil;
     const uint32_t wait = next > now ? uint32_t(next - now < 60000 ? next - now : 60000) : 1;
     assert_wait_timeout((event_t)this, THREAD_UNINT, wait, kMillisecondScale);
-    bool pending = __atomic_load_n(&fLinkChanged, __ATOMIC_ACQUIRE) != 0;
+    bool pending = __atomic_load_n(&fLinkChanged, __ATOMIC_ACQUIRE) != 0 || policyAsked();
     IOSimpleLockLock(fRingLock);
     pending |= fRingCount != 0;
     IOSimpleLockUnlock(fRingLock);
