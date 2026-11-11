@@ -324,6 +324,11 @@ private:
     bool fBacklightCallout;
     IOService *fBacklight;            // retained once found
     bool fPowerPublished, fPowerPublishedOn;   // what "piano-display-power" was last messaged as
+    // The VBL tick while the display is off (2026-11-12, docs/power.md "Idle wakeups by driver"): it stops once nothing is queued,
+    // waiting, refreshed or retried (a submitted swap calls swap_begin_gated anyway, the display's power-on starts it again), instead of
+    // 60 wakeups a second for nothing. native-gop-display-vbl=0: the tick runs always, as before.
+    bool fVblDarkStop, fVblStopped;
+    uint32_t fVblStops;
     void publishDisplayPower(bool on);
     void backlightCallout(bool on);
     // Zero-copy flips (boot-arg native-gop-display-flip=1, with PianoDpu's piano-dpu=2 piano-dpu-flip=4; docs/drivers/dpu.md §4.1;
@@ -587,6 +592,9 @@ bool NativeGopDisplay::start(IOService *provider)
     // piano-display-power is messaged, so PianoPolicy (and any other reader) needs no polling. D6's instance publishes neither.
     if (!fExternal)
         setProperty("piano-display-power-messages", true);
+    unsigned vbl = 1;
+    PE_parse_boot_argn("native-gop-display-vbl", &vbl, sizeof(vbl));
+    fVblDarkStop = vbl != 0 && !fExternal;
     unsigned backlight = 0;
     PE_parse_boot_argn("piano-backlight", &backlight, sizeof(backlight));
     fBacklightCallout = backlight >= 2 && !fExternal;
@@ -981,6 +989,17 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         fVBLDue = 0;
         return kIOReturnSuccess;
     }
+    // The display off: no tick while nothing needs one (the panel is dark; a submitted swap calls this anyway, the power-on restarts it).
+    if (gopcompose::vblStops(fVblDarkStop, fPowerPublished && !fPowerPublishedOn, fPipe.refreshLeft,
+                             __atomic_load_n(&fUnfinished, __ATOMIC_ACQUIRE), fWaitingSwap != nullptr,
+                             at<IOMFBSwapIORequest *>(this, kSwapQueueFirst) != nullptr)) {
+        if (!fVblStopped && (++fVblStops <= 4 || fVblStops % 64 == 0))
+            GOPLOG("display off: the VBL tick stopped, nothing queued or to refresh (stop %u; native-gop-display-vbl=0 keeps it)\n", fVblStops);
+        fVblStopped = true;
+        fVBLDue = 0;
+        return kIOReturnSuccess;
+    }
+    fVblStopped = false;
     uint64_t period;
     nanoseconds_to_absolutetime(1000000000ULL / fRefreshHz, &period);
     fVBLDue = mach_absolute_time() + period;
@@ -1039,6 +1058,8 @@ IOReturn NativeGopDisplay::do_power_state_change_gated()
             GOPLOG("display %s: no PianoDpu service (piano-dpu-panel needs piano-dpu=1)\n", on ? "on" : "off");
     }
     powerstate_notify(true, on);
+    if (on && fVblStopped)   // the tick stopped while the display was off: again from now
+        swap_begin_gated();
     return kIOReturnSuccess;
 }
 

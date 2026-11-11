@@ -541,6 +541,16 @@ static void testRefresh()
       if (last) sawLast = tick == 30;
     }
   CHECK((due == std::vector<unsigned>{1, 2, 4, 8, 16, 30}) && sawLast && left == 0);
+  // The VBL tick while the display is off: it stops only dark, with nothing queued, waiting, refreshed or retried, and only with the
+  // argument; every other combination keeps it.
+  for (int stop = 0; stop < 2; stop++)
+    for (int dark = 0; dark < 2; dark++)
+      for (unsigned refresh : {0u, 1u, kRefreshTicks})
+        for (int unfinished = 0; unfinished < 2; unfinished++)
+          for (int waiting = 0; waiting < 2; waiting++)
+            for (int queued = 0; queued < 2; queued++)
+              CHECK(vblStops(stop, dark, refresh, unfinished, waiting, queued) ==
+                    (stop && dark && !refresh && !unfinished && !waiting && !queued));
   CHECK(!refreshNeeded(kRefreshOff, false, true));
   CHECK(refreshNeeded(kRefreshUncovered, false, false) && !refreshNeeded(kRefreshUncovered, true, false) && refreshNeeded(kRefreshUncovered, true, true));
   CHECK(refreshNeeded(kRefreshAlways, true, false));

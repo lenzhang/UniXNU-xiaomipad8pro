@@ -497,6 +497,12 @@ inline bool refreshTick(unsigned &left, bool *last)
   *last = !left;
   return !(elapsed & (elapsed - 1)) || !left;
 }
+// The work loop's VBL tick while the display is off (2026-11-12): none once nothing needs it. darkStop: native-gop-display-vbl not 0;
+// dark: the display's power is known and off. A swap queued or waiting, a refresh countdown or an undrawn job's retry keep it.
+inline bool vblStops(bool darkStop, bool dark, unsigned refreshLeft, bool unfinished, bool waiting, bool queued)
+{
+  return darkStop && dark && !refreshLeft && !unfinished && !waiting && !queued;
+}
 // On the copy thread, when a refresh job runs: whether it copies (covered: the last frame's copy waited for its fence and saw it
 // retired, so it read the finished frame).
 inline bool refreshNeeded(uint32_t policy, bool covered, bool last)
