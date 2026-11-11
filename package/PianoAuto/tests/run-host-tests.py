@@ -4,10 +4,11 @@
 """Host tests of PianoAuto, the macOS-side consumers of PianoSensors (docs/drivers/sensors.md section 5a), all with -Wall -Wextra
 -Werror and ASan/UBSan (compilers from the environment's CC and CXX, default cc and c++):
 
-  c        tests/auto_host.c: TouchRotation.h (PianoTouch's transform) and AutoRotate.c (piano-rotated's policy) over PianoSensors'
-           SensorsPolicy.c, which is compiled from its own package, unchanged
+  c        tests/auto_host.c: TouchRotation.h (PianoTouch's transform), AutoRotate.c (piano-rotated's policy), AutoStream.c (a sensor
+           stream's off/on lifecycle) and AutoLight.c (the ambient light chain) over PianoSensors' SensorsPolicy.c, which is compiled
+           from its own package, unchanged
   kernel   every part a kernel driver includes compiles freestanding with AArch64 general registers only (no C library, no floating
-           point): TouchRotation.h in C and C++, AutoRotate.c (portable, though only piano-rotated uses it)
+           point): AutoStream.c, AutoLight.c, TouchRotation.h in C and C++, AutoRotate.c (portable, though only piano-rotated uses it)
 
 Synthetic inputs only; nothing here talks to a display, a sensor or a driver."""
 import argparse
@@ -21,6 +22,7 @@ HERE = Path(__file__).resolve().parent
 PKG = HERE.parent
 SENSORS = PKG.parent / 'PianoSensors'
 POLICY = [SENSORS / n for n in ('SensorsPolicy.c', 'SensorsOrient.c', 'SensorsFixed.c')]
+C_FILES = ('AutoRotate.c', 'AutoStream.c', 'AutoLight.c')
 INCLUDES = ['-I', str(PKG), '-I', str(SENSORS), '-I', str(SENSORS / 'tests')]
 SANITIZE = ['-O1', '-g', '-fsanitize=address,undefined', '-fno-sanitize-recover=all']
 WARN = ['-Wall', '-Wextra', '-Werror']
@@ -41,7 +43,7 @@ def run(exe):
 
 def c_tests(out, defines=(), extra=()):
     exe = out / 'auto_host'
-    subprocess.run([cc(), '-std=c11', *WARN, *SANITIZE, *INCLUDES, *defines, str(HERE / 'auto_host.c'), str(PKG / 'AutoRotate.c'),
+    subprocess.run([cc(), '-std=c11', *WARN, *SANITIZE, *INCLUDES, *defines, str(HERE / 'auto_host.c'), *(str(PKG / n) for n in C_FILES),
                     *map(str, extra), *map(str, POLICY), '-o', str(exe)], check=True)
     run(exe)
 
@@ -69,7 +71,7 @@ def main():
         if 'c' in want:
             c_tests(out)
         if 'kernel' in want:
-            kernel_checks(out, c_files=[PKG / 'AutoRotate.c'], headers=['TouchRotation.h'])
+            kernel_checks(out, c_files=[PKG / n for n in C_FILES], headers=['TouchRotation.h'])
     print('PASS PianoAuto host tests')
 
 

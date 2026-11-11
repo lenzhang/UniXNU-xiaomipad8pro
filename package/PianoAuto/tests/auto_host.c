@@ -6,12 +6,11 @@
 //   rotate   AutoRotate.c over SensorsPolicy's ps_rotation_step: settle and interval, the cover (forced 0, held, at attach only,
 //            ignored, unknown), the detach hold and contact bounce, confirmation by reading back, refusal and backoff, giving up,
 //            rotations made by hand, the user's lock, observing only, touch retries, deadlines
+//   stream, light (stream_tests.h): AutoStream.c and AutoLight.c, the sensor streams' off/on lifecycle and the ambient light chain
 #include "check.h"
 #include "TouchRotation.h"
 #include "AutoRotate.h"
-#ifdef PIANO_AUTO_STREAM_TESTS
 #include "stream_tests.h"
-#endif
 
 enum {W = 3200, H = 2136};
 
@@ -284,9 +283,7 @@ int main(void)
 {
     test_touch();
     test_rotate();
-#ifdef PIANO_AUTO_STREAM_TESTS
     stream_tests();
-#endif
     printf("PASS PianoAuto C host tests (%u checks)\n", checks);
     return 0;
 }
