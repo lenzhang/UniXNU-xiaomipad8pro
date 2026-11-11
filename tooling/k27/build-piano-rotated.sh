@@ -9,7 +9,7 @@ D=$(cd "$(dirname "$0")/../.." && pwd)
 P=$D/package/PianoAuto; S=$D/package/PianoSensors; O=$D/out/piano-rotated
 python3 "$P/tests/run-host-tests.py" >&2
 mkdir -p "$O"
-xcrun clang -arch arm64 -mmacosx-version-min="${MACOSX_MIN:-14.0}" -fobjc-arc -O2 -Wall -Wextra -Werror -I "$P" -I "$S" \
+xcrun clang -arch arm64 -mmacosx-version-min="${MACOSX_MIN:-14.0}" -fobjc-arc -O2 -Wall -Wextra -Werror -I "$P" -I "$S" -I "$D/package/include" \
   "$P/daemon/piano-rotated.m" "$P/AutoRotate.c" "$S/SensorsPolicy.c" "$S/SensorsOrient.c" "$S/SensorsFixed.c" \
   -framework Foundation -framework CoreGraphics -framework IOKit -o "$O/piano-rotated"
 cp "$P/daemon/com.unixnu.piano-rotated.plist" "$P/daemon/install-piano-rotated.sh" "$O/"

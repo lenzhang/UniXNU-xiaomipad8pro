@@ -28,7 +28,8 @@ SENSORS = PKG.parent / 'PianoSensors'
 BACKLIGHT = PKG.parent / 'PianoBacklight'
 POLICY = [SENSORS / n for n in ('SensorsPolicy.c', 'SensorsOrient.c', 'SensorsFixed.c')]
 C_FILES = ('AutoRotate.c', 'AutoStream.c', 'AutoLight.c')
-INCLUDES = ['-I', str(PKG), '-I', str(SENSORS), '-I', str(SENSORS / 'tests')]
+INCLUDE = PKG.parent / 'include'   # PianoDspMemory.h (SensorsPolicy.h's arena split)
+INCLUDES = ['-I', str(PKG), '-I', str(SENSORS), '-I', str(SENSORS / 'tests'), '-I', str(INCLUDE)]
 SANITIZE = ['-O1', '-g', '-fsanitize=address,undefined', '-fno-sanitize-recover=all']
 WARN = ['-Wall', '-Wextra', '-Werror']
 KERNEL = ['-target', 'arm64-apple-macos13', '-ffreestanding', '-fno-builtin', '-mgeneral-regs-only', *WARN]
