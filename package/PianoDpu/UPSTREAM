@@ -1,6 +1,7 @@
 PianoDpu is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1: a read-only survey; level 2 (B1b): the zero-copy
-flips (DpuSmmu.h, DpuFlip.h, DpuFlip.cpp, PianoDpuFlipClient.h, tests/dpu_flip_host.cpp; provenance in the B1b paragraph at the end).
-What it takes from other work, and from where:
+flips (DpuSmmu.h, DpuFlip.h, DpuFlip.cpp, PianoDpuFlipClient.h, tests/dpu_flip_host.cpp; provenance in the B1b paragraph at the end);
+the opt-in writing slices B1c (refresh), B1d (Night Light), B1e (panel sleep) (DpuSlices.h/.cpp, DpuRefresh.h, DpuPcc.h, DpuPanel.h,
+tests/dpu_model.h and dpu_{refresh,pcc,panel}_host.cpp; their facts below). What it takes from other work, and from where:
 
 UniXNU-piano (this repository), BSD-2-Clause-Patent:
   package/PianoAudio/PianoAudio.cpp (sha256 cb0499f7fa02dec2919101843c70a1d3d7b9eed389c77625ac032782321f6a8a): the kext's shape
@@ -25,6 +26,35 @@ UniXNU community code (facts only, no code copied; read for what other SM8x50 po
     word at +0x6c is not the timing engine enable; this survey reads +0x0).
   hackios-xnu-kernel-k90 (APSL 2.0, an SM8750 phone): facts only (the display clocks must be checked before an MDSS load; the
     branch list), no code read into this package.
+
+UniXNU-sm8750-common (BSD-2-Clause-Patent) kits/Sm8750Platform/PeripheralIO.h (sha256
+  d014288207411510edaf12d5b2a16a45413d7183d81b80f7bac56d7facc5c8ce): the DSI command FIFO route on SM8750 (dsi_panel_packet_mode:
+  the busy check, the FIFO words and the short-packet header, TEST_PATTERN_GEN_CTRL 0x30006, CMD_DMA_CTRL bits 31/30/28/26, the
+  +0x390 word, the length, the trigger, the done bit, the restore with the +0x1ec pulse), re-written for both links of a video-mode
+  panel in DpuPanel.h (no code copied).
+
+The writing slices' facts (specifications only, nothing copied):
+  Project-SunUEFI patches/linux/7.3/0002-display.patch (GPL-2.0; sha256
+    5eae6fca95b4b772c996c941c58ca13423c6ac2c836291791b434839579ee2c2): the seamless VFP update on piano: one vblank waited, the DSI
+    timing DB mode (msm-relative 0x1e8) / TOTAL / timing flush (0x1e4) on the clock master then the slave, INTF_VSYNC_PERIOD_F0 =
+    vtotal * htotal and the CTL INTF flush, DB mode cleared after the commit completed; programmable fetch kept off (DpuRefresh.h).
+  The Ubuntu piano kernel's msm (GPL-2.0, below): dsi_host.c (sha256 94ed063d4a9b568e3385c699276c82933d534ef4e6d80d4d8e425f9deb3f960e:
+    the video-mode command transfer: CMD_MODE_EN beside video, CMD_DMA_CTRL's LOW_POWER, TRIG_CTRL with BLOCK_DMA_WITHIN_FRAME, a
+    bonded pair's commands on DSI0 then DSI1), registers/display/dsi.xml (sha256
+    1e112f0d439b884dfeb56668810d62dd65da22084323bdf868b7ff5a688ae4a8: CMD_DMA_CTRL, DMA_LEN, TRIG_CTRL, TRIG_DMA, STATUS0,
+    INTR_CTRL, TEST_PATTERN_GEN_CTRL fields), disp/dpu1/dpu_encoder_phys_vid.c (sha256
+    d8408037f42d59e2f20fc5aedb1813d22acba863c18e0c18758cc4f0fde137c3: the CTL flush before a timing engine starts, master first; a
+    stop waits for its frame end), dpu_hw_intf.c (INTF_STATUS bit 0, INTF_CONFIG bit 31 programmable fetch, the counter enable 3),
+    dpu_hw_ctl.c (CTL_INTF_FLUSH, CTL_DSPP_n_FLUSH bit 4, CTL_FLUSH bits 31 and 29), dpu_hwio.h (INTR_CLEAR 0x18), dpu_hw_dspp.c and
+    dpu_crtc.c (the PCC's coefficient places, the CTM mapping), drm/panel/panel-novatek-nt36532.c (MIPI_DSI_MODE_LPM; display-off
+    20 ms, sleep-in 100 ms, sleep-out 120 ms, display-on 10 ms).
+  The stock panel XML (below): DSITermSequence 05 28, FF 14, 05 10, FF 64; the init's end 05 11, FF 78, 05 29.
+  Asahi Linux (github.com/AsahiLinux/linux, branch asahi, GPL-2.0-only OR MIT) drivers/gpu/drm/apple/iomfb.h (iomfb_set_matrix_req:
+    a location word and nine 64-bit words) and iomfb_template.c (the identity as 1 << 32 on the diagonal, DRM's S31.32 CTM passed
+    through): the layout taken for IOMFBColorFixedMatrix (DpuPcc.h), to be confirmed by B1d-0's log.
+  The iOS gamma table layout (3 x 257 32-bit words, 0xc0c bytes, channels at words 0x001/0x102/0x203) as public open-source iOS
+    night-light tools (GammaThingy) wrote it, from memory of their published code, not re-read: the hypothesis behind
+    piano-dpu-pcc=2 only, to be confirmed by B1d-0's log.
 
 Specifications only (no code, comment or table copied; GPL-2.0): the Ubuntu piano kernel (unixnu-research/ubuntu-ref/kernel, branch
 piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01): drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_12_0_sm8750.h (sha256

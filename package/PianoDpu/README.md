@@ -16,6 +16,10 @@ flips, a ladder of four steps (`piano-dpu-flip=1..4`), the last of which serves 
   SMMU bank in place (identity blocks for 2-4 GiB plus four 32 MiB windows below 2 GiB, never moving the stream) and shows a test
   pattern through a window, step 4 maps each IOSurface NativeGopDisplay hands over into a window and flips to it. Any missed latch,
   SMMU fault or underrun puts the boot framebuffer back, the bank as found, and turns flips off for the boot (NativeGopDisplay copies).
+- Writing slices, each inert without its own argument (and all on top of `piano-dpu` >= 1): `piano-dpu-refresh=plan|60|120|auto`
+  (B1c: 120 <-> 60 Hz by the vertical front porch, verified, reverted on an anomaly, an idle policy), `piano-dpu-pcc=1|2` (B1d: Night
+  Light in the DSPPs' PCC from macOS's colour matrices), `piano-dpu-panel=1` (B1e: the panel's light sleep with display sleep over the
+  DSI command FIFO, the timing engines stopped slave first). One thread, its own page maps and a store guard that cannot reach TLMM.
 
 Design, hardware facts, the staged plan, the boot arguments and the test plan with the expected lines: `docs/drivers/dpu.md`.
 
@@ -30,6 +34,10 @@ Design, hardware facts, the staged plan, the boot arguments and the test plan wi
 | `PianoDpuFlipClient.h` | the `PianoDpuFlip` request NativeGopDisplay sends (header only, no link dependency) |
 | `tests/dpu_host.cpp` | host tests of level 1 against register models (the gate, what is and is never loaded, decoders, verdicts, SMMU, walk) |
 | `tests/dpu_flip_host.cpp` | host tests of B1b against DPU/MDSS/SMMU/RAM models (`dpu_flip_host N` prints step N's lines) |
+| `DpuSlices.h` | portable: what B1c/B1d/B1e share: the Io, the store guard, the live path, frame edges, line windows, latches, the rate |
+| `DpuRefresh.h`, `DpuPcc.h`, `DpuPanel.h` | portable: B1c's switch and policy, B1d's conversion and stores, B1e's DCS FIFO packets and sleep/wake |
+| `DpuSlices.cpp` | the slices in the kernel: arguments, the worker thread, page maps, the platform functions NativeGopDisplay calls |
+| `tests/dpu_model.h`, `tests/dpu_{refresh,pcc,panel}_host.cpp` | a timed register model and the slices' host tests |
 
-Build: `tooling/k27/build-native-piano-dpu.sh` (both host tests, the objects, the import check). PianoDpu is in
+Build: `tooling/k27/build-native-piano-dpu.sh` (all host tests, the objects, the import check). PianoDpu is in
 `configs/k27-native-kexts.txt` and inert without `piano-dpu`. Sources and licences: `UPSTREAM`, `LICENSE` (BSD-2-Clause-Patent).

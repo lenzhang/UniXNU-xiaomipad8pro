@@ -35,7 +35,8 @@ brightness steps from keys, (4) optionally the backlight off while the keyboard 
 Power: BL_EN cleared stops the backlight boost and the six sinks, the dominant consumer; it is the datasheet's own off. Code 0 also
 stops them, but BL_EN is what the Linux driver and the datasheet use and it keeps the code for the wake. HWEN low would save the
 chip's standby current too, but it also drops the LCD bias, i.e. the panel's supply: not available. The panel keeps scanning
-(DSI video mode, DPU): panel sleep (DCS display-off/sleep-in) is a separate, later step (`display.md` §8).
+(DSI video mode, DPU): panel sleep (DCS display-off/sleep-in, the timing engines stopped) is PianoDpu's `piano-dpu-panel=1`
+([dpu.md](dpu.md) §4.5), which never touches HWEN, ENP/ENN or the panel's reset either.
 
 ## 3. Ubuntu as the specification
 
@@ -223,7 +224,8 @@ the display asleep).
 4. The cover's brightness keys (usages) and the PianoKeyboard integration: a PianoKeyboard level-1 log, then its owner.
 5. The hall polarity before `piano-backlight-lid=1` (`keyboard.md` §10.3).
 6. A restart with the display asleep: does the next boot come up lit (§9)?
-7. Panel sleep (DCS display-off/sleep-in) for more savings while dark: `display.md` §8, later.
+7. Panel sleep (DCS display-off/sleep-in) for more savings while dark: PianoDpu's `piano-dpu-panel=1` (dpu.md §4.5, §8.3), built,
+   not run; NativeGopDisplay hands it the same display power, after this driver's request.
 8. Automatic brightness (§5, `piano-backlight-auto=1`): built and host-tested; its targets wait for PianoSensors' level 4 (the light
    stream, [sensors.md](sensors.md) §5a.5). Then: does the backlight follow a lamp within 2 s, and do the keys' offset and the curve
    feel right (sensors.md §5a.8 R3)?

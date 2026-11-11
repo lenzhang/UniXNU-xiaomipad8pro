@@ -74,6 +74,9 @@ WindowServer launched once and stayed up.
 | `native-gop-display-thumb=N` | 30 | a thumbnail of the frame on the panel (see §5) on the first frame and then every N s; 0: none |
 | `native-gop-display-copy=BITS` | 0 | the copy's cost (§6 risk 3): bit 0 skips the refresh copies of a swap whose copy waited for the GPU's fence and saw it retired (the last one, tick 30, still runs); bit 1 maps surfaces cacheable and cleans/invalidates the rows by VA before each read. Not run on the tablet yet; the periodic `copy mode ...` line says what was saved |
 | `piano-backlight=2` | off | (PianoBacklight's argument) each display power change is published as `piano-display-power` and handed to PianoBacklight ([backlight.md](backlight.md)) |
+| `piano-dpu-pcc=1\|2` | off | (PianoDpu's, [dpu.md](dpu.md) §4.4) `swap_set_color_matrix` and `set_gamma_table` log each new matrix / table (raw words: B1d-0) and hand it to PianoDpu's PCC; without it both stay stubs |
+| `piano-dpu-panel=1` | off | (PianoDpu's, §4.5) each display power change also goes to PianoDpu (`PianoDpuPanel`: the panel's light sleep), after the backlight's request |
+| `piano-dpu-refresh=auto` | off | (PianoDpu's, §4.3) each frame shown is reported to PianoDpu (`PianoDpuSwap`: its 60/120 Hz policy) |
 
 No boot arg is needed for Path B. Everything else is the native set as it is (`K27_ARGS` in
 `tooling/bootimg/build-ram-images.py`). For a log of the WindowServer stage, give the run more than the default 45 s
@@ -226,7 +229,8 @@ Failure lines: `IOMobileFramebufferLegacy::start failed`, `createDisplayAttribut
    write-combined, as the console maps it. The base comes from `PE_state.video`. The ADT's `framebuffer-*` values only
    cross-check it, or stand in when there is no console info.
 7. **No power control.** "display off" stops nothing on the panel. There is no DPMS (display.md, later); with `piano-backlight=2` the
-   display power goes to PianoBacklight, which turns the backlight off and on (backlight.md).
+   display power goes to PianoBacklight, which turns the backlight off and on (backlight.md); with `piano-dpu-panel=1` also to
+   PianoDpu, which puts the panel to sleep and stops the DPU's timing engines (dpu.md §4.5, not run yet).
 8. The boot console keeps drawing over the solid colour until WindowServer's first frame
    (`PE_initialize_console(kPEDisableScreen)`).
 
