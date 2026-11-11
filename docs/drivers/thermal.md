@@ -4,7 +4,8 @@ Status: code, 2026-11-11. `package/PianoThermal` is built, host-tested (`thermal
 the DT: 47 sensors) and linked into the native KC (kernel 0059: `com.unixnu.driver.PianoThermal: linked, ... 374 pointers`, none
 from outside this repository), inert without `piano-thermal` / `piano-cpufreq`; **not run on hardware**. Template: `README.md`. B6, the eleven
 PMIC board thermistors (battery, charger, connectors, skin, ...) and `piano_thermal_board_temps()` for charging safety: §12
-(`piano-thermal-adc=1`, host-tested, linked, not run).
+(`piano-thermal-adc=1`, host-tested, linked, not run). 2026-11-11 (host-tested, linked, not run): PianoPolicy's
+`"piano-thermal-profile"` (§5, `docs/policy.md` §5.2) and the power-tree join for system sleep (§5, `docs/power.md` §4).
 
 ## 1. Purpose and gate
 
@@ -79,6 +80,24 @@ every sensor's lower-threshold interrupt (`TM_UPPER_LOWER_INT_MASK` 0x10 bits 0.
 untouched; returns the controllers masked, -1 if already prepared. `void piano_thermal_suspend_finish(void)` restores the masks
 found. Also as `callPlatformFunction("piano-thermal-suspend-prepare", int *result)` / `"-finish"` on the PianoThermal service. They
 map the controllers themselves (work without `piano-thermal`) and are the kext's only TSENS writes.
+**System sleep** (2026-11-11; `docs/power.md` §4, `Governor.h` SleepPlan, host-tested): PianoThermal is in the power tree
+(`pianopower::join` in `start`). `setPowerState(off)` parks the thread at the top of a poll (no SCMI request, no TSENS read in
+flight; the clusters stay at their level, nothing to power), and with `piano-thermal-sleep-mask=1` calls
+`piano_thermal_suspend_prepare()`; `on` calls `piano_thermal_suspend_finish()` for what that off masked (not when another caller
+had prepared first) and runs the thread again: the first zone update is at once, the power source is read again at the next CPU
+tick. Default `piano-thermal-sleep-mask=0`: the threshold interrupts are left as found, since no TSENS interrupt is taken natively
+(its SPI has no handler and stays disabled at the GIC); the contract's rule is "masked when interrupts are used". The ADC thread
+(§12) is not parked (a conversion in flight at the freeze is a read error after the wake, §12.5). Lines: `system sleep: in the power
+tree (0): the thread parks while suspended`, `[Ns] sleep: the thread is parked (no SCMI, no TSENS); threshold interrupts as they
+are (piano-thermal-sleep-mask=0)`, `[Ns] wake N: polling again`.
+**The power profile** (2026-11-11; `docs/policy.md` §5.2, `Governor.h` Profile, host-tested): `callPlatformFunction(
+"piano-thermal-profile", false, (void *)(uintptr_t)mode, ...)` on this service, any thread: 0 the caps by the power source (as
+before), 1 Power Saver whatever the source (the `-bat0/-bat1` ceilings), 2 Balanced whatever the source (`-ac0/-ac1`); else
+`kIOReturnBadArgument`, and `kIOReturnUnsupported` without CPU frequency control (`piano-cpufreq` < 2). An atomic the governor reads
+every tick: the power source it hands `Governor::tick` / `enforce` becomes battery for 1, external for 2 (a lower ceiling applies at
+once); the fixed level (mode 2) has no power caps and ignores it. One line per change (`[Ns] cpufreq: profile Power Saver
+(PianoPolicy)`), the property `piano-thermal-profile` (0/1/2, with `piano-cpufreq` >= 2), and the 30 s report names it (`ceiling
+1785 MHz (on power; profile Power Saver)`).
 **Board thermistors** (B6, §12, `piano-thermal-adc`): a second kernel thread `piano-thermal-adc`; properties
 `BoardTemperaturesDeciC` (dict: batt, charger, conn, conn2, msm, quiet, xo, wifi, display, backlight, flash; working channels only),
 `BoardAdc` (dict: each channel `ok` / `no reading yet` / `off: <why>`), `BoardAdcState` (`off`, `starting`, `running`,
@@ -105,6 +124,7 @@ map the controllers themselves (work without `piano-thermal`) and are the kext's
 | `piano-cpufreq-hot` / `-release` / `-cut` | stock | cluster thermal limit (modes 2, 3): default each cpu-* zone's passive trip / trip - hysteresis / 125 - margin; given: absolute C for all |
 | `piano-thermal-adc=N` | 0 | B6 (§12): 0 off (no SPMI access); 1 the eleven board thermistors on the PMIC ADC (writes: the ADC SDAM's conversion bytes); 2 the same with each round's raw codes. Implies `piano-thermal=1` |
 | `piano-thermal-adc-s` | `-log-s` (30) | the ADC round period, 5..3600 s (the first round right after the start survey, after `-delay`) |
+| `piano-thermal-sleep-mask=1` | 0 | a system sleep also masks the threshold interrupts (the suspend hooks, §5); 0: the thread is parked only |
 
 ## 7. Kernel archive / component
 
@@ -156,9 +176,15 @@ All RAM boots with the cable, owner present. Every level is off by default, so a
    warm: ...`, `polling every 10 ms: a sensor is within 10 C of its trip`, `[30s] polling: base ... ms, warm ... ms, fast ... ms`,
    `PASSIVE: ... GPU capped at 160 MHz ...` (or `GPU parked ...; PianoA830 has no reversible ceiling`), `critical threshold met ...`,
    `CRITICAL: ... NOT shutting down (log only)`. `piano-thermal-shutdown=1` only after a session showed no wild readings.
-5. **Suspend hooks** (with the suspend driver's first s2idle test): `suspend prepare: lower and upper threshold interrupts masked on
-   4 controllers: tsens0 0x...->0x7fff7fff tsens1 ...->0x7f007f ...`, after resume `suspend finish: ... back on 4 controllers`. A
-   sleep that still ends at once with these lines points at another wake source; fewer than 4 controllers: a mapping failed.
+5. **System sleep and the suspend hooks** (with the suspend driver's first s2idle test, `docs/power.md` §6 S1): each suspend
+   `[Ns] sleep: the thread is parked (no SCMI, no TSENS); ...` and after the wake `[Ns] wake N: polling again`, the 30 s lines
+   continuing. With `piano-thermal-sleep-mask=1` also `suspend prepare: lower and upper threshold interrupts masked on 4 controllers:
+   tsens0 0x...->0x7fff7fff tsens1 ...->0x7f007f ...`, after the wake `suspend finish: ... back on 4 controllers`. A sleep that
+   still ends at once with these lines points at another wake source; fewer than 4 controllers: a mapping failed.
+5a. **The profile** (`docs/policy.md` §9 P4, PianoPolicy at level 2 with `piano-cpufreq=3`): on power `sysctl -w
+   machdep.piano_policy_lpm=1` → `cpufreq: profile Power Saver (PianoPolicy)` and the next 30 s lines `ceiling 1785 MHz (on power;
+   profile Power Saver)` (cluster 1: 1958); `=0` → `cpufreq: profile by the power source (PianoPolicy)`, `ceiling 3532 MHz (on
+   power)`.
 6. **Board thermistors** (B6): one RAM boot with `piano-thermal=1 piano-thermal-adc=1` (and `piano-power=1` for the gauges'
    temperature to compare); the procedure, the expected lines and what failures mean: §12.8.
 

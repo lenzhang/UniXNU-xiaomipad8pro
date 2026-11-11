@@ -574,6 +574,78 @@ static void testGovernor()
   CHECK(g.level() == 14);
 }
 
+// ------------------------------------------------------------------------------------------------------------- profile, sleep
+// PianoPolicy's profile (docs/policy.md 5.2): what the governor is handed as its power source, and so its ceiling; the fixed level
+// ignores it. The sleep plan: what kOff and kOn do, once each.
+static void testProfileAndSleep()
+{
+  CHECK(profileValid(0) && profileValid(1) && profileValid(2) && !profileValid(3) && !profileValid(~uintptr_t(0)));
+  const PowerSource sources[3] = {PowerSource::unknown, PowerSource::battery, PowerSource::external};
+  for (PowerSource p : sources) {
+    CHECK(profilePower(p, Profile::bySource) == p);
+    CHECK(profilePower(p, Profile::saver) == PowerSource::battery);
+    CHECK(profilePower(p, Profile::balanced) == PowerSource::external);
+  }
+  GovernorConfig gv;
+  gv.batteryKhz = capKhz(1958);
+  gv.externalKhz = capKhz(4089);
+  gv.hispeedKhz = 1800000;
+  Governor g;
+  g.init(CpuMode::govern, gv, kNcc1, 16, 14, 0);
+  // on external power: Balanced by the source; Power Saver forces the battery cap at once (enforce), Balanced lifts it again
+  for (int i = 0; i < 5; ++i) g.tick(tick(1000, profilePower(PowerSource::external, Profile::bySource)));
+  CHECK(g.level() == 14);
+  CHECK(g.enforce(profilePower(PowerSource::external, Profile::saver)) == 4);
+  CHECK(g.ceiling(profilePower(PowerSource::external, Profile::saver)) == 4);
+  for (int i = 0; i < 5; ++i) g.tick(tick(1000, profilePower(PowerSource::external, Profile::saver)));
+  CHECK(g.level() == 4);
+  // on battery with Balanced: the external caps
+  for (int i = 0; i < 5; ++i) g.tick(tick(1000, profilePower(PowerSource::battery, Profile::balanced)));
+  CHECK(g.level() == 14 && g.ceiling(profilePower(PowerSource::unknown, Profile::balanced)) == 14);
+  // back to the source on battery: the battery cap at once
+  CHECK(g.enforce(profilePower(PowerSource::battery, Profile::bySource)) == 4);
+  // the fixed level: no power caps, the profile changes nothing
+  GovernorConfig gc;
+  gc.capKhz = capKhz(1958);
+  g.init(CpuMode::fixed, gc, kNcc1, 16, 14, 15);
+  for (Profile pr : {Profile::bySource, Profile::saver, Profile::balanced})
+    CHECK(g.enforce(profilePower(PowerSource::external, pr)) == 4 && g.tick(tick(1000, profilePower(PowerSource::battery, pr))) == 4);
+  CHECK(!strcmp(profileName(Profile::saver), "Power Saver") && !strcmp(profileName(Profile::balanced), "Balanced"));
+
+  {   // the default: park on off, unpark on on, no TSENS write either way
+    SleepPlan s;
+    const SleepSteps first = s.on();   // the power tree's first kOn
+    CHECK(!first.park && !first.mask && !first.finish && !first.unpark && !s.asleep());
+    const SleepSteps off = s.off();
+    CHECK(off.park && !off.mask && !off.finish && !off.unpark && s.asleep());
+    const SleepSteps again = s.off();
+    CHECK(!again.park && !again.mask);
+    const SleepSteps on = s.on();
+    CHECK(on.unpark && !on.finish && !on.park && !s.asleep() && s.wakes() == 1);
+    CHECK(!s.on().unpark && s.wakes() == 1);
+  }
+  {   // piano-thermal-sleep-mask=1: masked at off, put back at on, every cycle
+    SleepPlan s(true);
+    for (int cycle = 0; cycle < 3; ++cycle) {
+      const SleepSteps off = s.off();
+      CHECK(off.park && off.mask);
+      s.maskResult(4);
+      const SleepSteps on = s.on();
+      CHECK(on.finish && on.unpark);
+    }
+    CHECK(s.wakes() == 3);
+    // another caller prepared first (-1): not ours to finish
+    CHECK(s.off().mask);
+    s.maskResult(-1);
+    const SleepSteps on = s.on();
+    CHECK(!on.finish && on.unpark);
+    // a mask that found no controller (0) is still finished (finish restores only what prepare saved)
+    CHECK(s.off().mask);
+    s.maskResult(0);
+    CHECK(s.on().finish);
+  }
+}
+
 // ------------------------------------------------------------------------------------------------------------- cluster
 static void testCluster()
 {
@@ -685,6 +757,7 @@ int main(int argc, char **argv)
   testPolicy();
   testScmi();
   testGovernor();
+  testProfileAndSleep();
   testCluster();
   testInterruptsAndPolling();
   if (failures) {

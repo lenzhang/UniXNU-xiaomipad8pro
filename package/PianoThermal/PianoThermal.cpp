@@ -22,7 +22,12 @@
 //                    limit on top.
 // piano-cpufreq >= 1 implies the level 1 readout (its thermal input). No clock, regulator or GDSC is voted by this kext.
 // Suspend hooks (piano_thermal_suspend_prepare/finish, below): the threshold interrupt masks across system suspend, the only TSENS
-// writes, and only when the suspend driver calls them.
+// writes, and only when a caller asks: this service's setPowerState (in the power tree, docs/power.md 4) with
+// piano-thermal-sleep-mask=1, or another driver through the platform functions. Across a system sleep the thread is parked (no
+// SCMI request, no TSENS read in flight; Governor.h SleepPlan); the first zone update after the wake follows at once.
+// The power profile (docs/policy.md 5.2): callPlatformFunction("piano-thermal-profile", mode) from PianoPolicy: 0 the caps by the
+// power source, 1 Power Saver, 2 Balanced, whatever the source (Governor.h Profile); the governor reads it every tick, the fixed
+// level ignores it; the property piano-thermal-profile and one line per change.
 // piano-thermal-adc=1|2 (B6, PianoThermalAdc.cpp; implies piano-thermal=1): the eleven board thermistors on the PMIC ADC, on a thread
 // of their own, and piano_thermal_board_temps() for charging safety. Its only writes: the ADC SDAM's conversion bytes.
 #include <IOKit/IOService.h>
@@ -46,6 +51,7 @@
 #include <stdarg.h>
 #include "Cluster.h"
 #include "Governor.h"
+#include <PianoPowerContract.h>
 #include "PianoThermalAdc.h"
 #include "Policy.h"
 #include "Scmi.h"
@@ -76,7 +82,7 @@ constexpr uint32_t kA830Valid = 1u << 0, kA830Limiting = 1u << 1, kA830Emergency
 constexpr int kRbHalt = 0x08;                                                                   // bsd/sys/reboot.h RB_HALT
 
 struct Args {
-  uint32_t level, cpufreq, shutdown, pollMs, logS, clock, srot, warmC, marginC, delay;
+  uint32_t level, cpufreq, shutdown, pollMs, logS, clock, srot, warmC, marginC, delay, sleepMask;
   uint32_t cap[2], bat[2], ac[2], minMhz[2], hispeed[2], tickMs, fastMs, warmMs, warmPollC, fastMhz, gpuMhz, hotC, releaseC, cutC;
   bool capGiven[2];
 };
@@ -108,6 +114,7 @@ void readArgs()
   gArgs.warmC = clampU(bootArg("piano-thermal-warm", 85), 50, 104);
   gArgs.marginC = clampU(bootArg("piano-thermal-margin", 10), 5, 30);
   gArgs.delay = clampU(bootArg("piano-thermal-delay", 0), 0, 600);
+  gArgs.sleepMask = bootArg("piano-thermal-sleep-mask", 0);   // a system sleep also masks the threshold interrupts (the hooks)
   // Ubuntu's GNOME profiles on piano (docs/ubuntu-history/device.md 2.6): Power Saver caps cpu0-5 at 1785.6 MHz and cpu6-7 at
   // 1958.4 MHz, Balanced at 3532.8 / 4089.6 MHz (boost off). piano-cpufreq-cap (both clusters) or -cap0/-cap1: the fixed level of
   // mode 2 (default Power Saver's); in mode 3 a hard ceiling, only when given. A cap in MHz admits the levels of that whole MHz.
@@ -498,12 +505,21 @@ class PianoThermal : public IOService {
   PowerSource power_ = PowerSource::unknown;
   uint64_t powerAtNs_ = 0;
   bool cpuOk_ = false;
+  // PianoPolicy's profile (any thread writes it; the governor reads it each tick) and what the 30 s report last named
+  volatile uint32_t profile_ = 0;
+  // system sleep: the thread parks between kOff and kOn (SleepPlan says what each does)
+  IOLock *sleepLock_ = nullptr;
+  SleepPlan sleep_;
+  bool sleepWanted_ = false, threadParked_ = false, threadRunning_ = false;
+  bool park();
+  void pollWait(uint32_t ms);
 
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
   IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3,
                                 void *param4) override;
+  IOReturn setPowerState(unsigned long state, IOService *device) override;
 };
 
 OSDefineMetaClassAndStructors(PianoThermal, IOService)
@@ -524,7 +540,84 @@ IOReturn PianoThermal::callPlatformFunction(const OSSymbol *functionName, bool w
   }
   if (functionName && functionName->isEqualTo("piano-thermal-board-temps"))   // B6: param1 = struct piano_board_temps *
     return adc::hookBoardTemps(param1) ? kIOReturnSuccess : kIOReturnBadArgument;
+  // docs/policy.md 5.2: param1 = the mode (0 by the power source, 1 Power Saver, 2 Balanced). Taken by the governor (mode 3) at its
+  // next tick and by the fixed level (mode 2, which has no power caps: ignored there); without CPU frequency control unsupported.
+  if (functionName && functionName->isEqualTo("piano-thermal-profile")) {
+    const uintptr_t mode = uintptr_t(param1);
+    if (!profileValid(mode)) return kIOReturnBadArgument;
+    if (gArgs.cpufreq < 2) return kIOReturnUnsupported;
+    const uint32_t before = __atomic_exchange_n(&profile_, uint32_t(mode), __ATOMIC_ACQ_REL);
+    if (before != mode) {
+      setProperty("piano-thermal-profile", uint64_t(mode), 32);
+      note("[%us] cpufreq: profile %s (PianoPolicy)%s", upS(), profileName(Profile(mode)),
+           gArgs.cpufreq == 2 ? ": the fixed level (piano-cpufreq=2) has no power caps, ignored" : "");
+    }
+    return kIOReturnSuccess;
+  }
   return IOService::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
+}
+
+// The thread's wait between polls; a system sleep's park request ends it early.
+void PianoThermal::pollWait(uint32_t ms)
+{
+  IOLockLock(sleepLock_);
+  if (!sleepWanted_) {
+    uint64_t deadline = 0;
+    clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+    IOLockSleepDeadline(sleepLock_, &sleepWanted_, deadline, THREAD_UNINT);
+  }
+  IOLockUnlock(sleepLock_);
+}
+
+// At the top of each poll (no SCMI request or TSENS read in flight): parked here from kOff to kOn. True after a park.
+bool PianoThermal::park()
+{
+  IOLockLock(sleepLock_);
+  const bool parking = sleepWanted_;
+  if (parking) {
+    threadParked_ = true;
+    IOLockWakeup(sleepLock_, &threadParked_, false);
+    while (sleepWanted_) IOLockSleep(sleepLock_, &sleepWanted_, THREAD_UNINT);
+    threadParked_ = false;
+  }
+  IOLockUnlock(sleepLock_);
+  return parking;
+}
+
+// docs/power.md 4: off = the thread parked (no SCMI request: the clusters stay at their level; no TSENS access) and, with
+// piano-thermal-sleep-mask=1, the threshold interrupts masked (the suspend hooks; Ubuntu's 08e750858038); on = the masks back, the
+// thread on (its first zone update at once). Synchronous: the park waits for the poll in progress (at most a few ms of SCMI).
+IOReturn PianoThermal::setPowerState(unsigned long state, IOService *)
+{
+  if (!sleepLock_) return pianopower::kAckNow;
+  IOLockLock(sleepLock_);
+  const SleepSteps s = state == pianopower::kOff ? sleep_.off() : sleep_.on();
+  if (s.park && threadRunning_) {
+    sleepWanted_ = true;
+    IOLockWakeup(sleepLock_, &sleepWanted_, false);
+    uint64_t deadline = 0;
+    clock_interval_to_deadline(500, kMillisecondScale, &deadline);
+    while (!threadParked_ && IOLockSleepDeadline(sleepLock_, &threadParked_, deadline, THREAD_UNINT) != THREAD_TIMED_OUT) {
+    }
+  }
+  const bool parked = threadParked_;
+  IOLockUnlock(sleepLock_);
+  if (s.park) {
+    int masked = 0;
+    if (s.mask) sleep_.maskResult(masked = piano_thermal_suspend_prepare());
+    note("[%us] sleep: %s; %s", upS(), !threadRunning_ ? "no thread to park" : parked ? "the thread is parked (no SCMI, no TSENS)"
+                                                                                       : "the thread did not park within 500 ms",
+         !s.mask ? "threshold interrupts as they are (piano-thermal-sleep-mask=0)"
+                 : masked < 0 ? "threshold interrupts already masked by another caller" : "threshold interrupts masked");
+  }
+  if (s.finish) piano_thermal_suspend_finish();
+  if (s.unpark) {
+    IOLockLock(sleepLock_);
+    sleepWanted_ = false;
+    IOLockWakeup(sleepLock_, &sleepWanted_, false);
+    IOLockUnlock(sleepLock_);
+  }
+  return pianopower::kAckNow;
 }
 
 IOService *PianoThermal::probe(IOService *provider, SInt32 *score)
@@ -552,14 +645,20 @@ bool PianoThermal::start(IOService *provider)
   policy_ = Policy(pc);
   setProperty("piano-thermal", gArgs.level, 32);
   setProperty("piano-cpufreq", gArgs.cpufreq, 32);
+  if (gArgs.cpufreq >= 2) setProperty("piano-thermal-profile", 0ull, 32);
+  sleepLock_ = IOLockAlloc();
+  sleep_ = SleepPlan(gArgs.sleepMask != 0);
   registerService();
   adc::hookStart(this, adc::hookLevel(), gArgs.logS, gArgs.delay);   // B6 (PianoThermalAdc.cpp): nothing without piano-thermal-adc
   thread_t t = nullptr;
-  if (kernel_thread_start(&PianoThermal::thread, this, &t) != KERN_SUCCESS) {
+  if (!sleepLock_ || kernel_thread_start(&PianoThermal::thread, this, &t) != KERN_SUCCESS) {
     note("FAILED: no thread");
     return true;
   }
   thread_deallocate(t);
+  threadRunning_ = true;
+  note("system sleep: in the power tree (%#x): the thread parks while suspended%s", pianopower::join(this),
+       gArgs.sleepMask ? ", the threshold interrupts masked (piano-thermal-sleep-mask=1)" : "");
   return true;
 }
 
@@ -857,6 +956,7 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
     power_ = p;
     powerAtNs_ = now;
   }
+  const PowerSource power = profilePower(power_, Profile(__atomic_load_n(&profile_, __ATOMIC_ACQUIRE)));
   int32_t busy[kDomains] = {-1, -1};
   if (loadTick) domainBusy(busy);
   const bool critical = gArgs.level >= 2 && policy_.state() == State::critical;
@@ -883,7 +983,7 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
       ++busyTicks_[d];
       if (uint32_t(busy[d]) > busyMax_[d]) busyMax_[d] = uint32_t(busy[d]);
     }
-    const unsigned want = loadTick && g.mode() == CpuMode::govern ? g.tick({busy[d] < 0 ? 0u : uint32_t(busy[d]), power_}) : g.enforce(power_);
+    const unsigned want = loadTick && g.mode() == CpuMode::govern ? g.tick({busy[d] < 0 ? 0u : uint32_t(busy[d]), power}) : g.enforce(power);
     cpuApply(d, want, now);
   }
 }
@@ -892,6 +992,8 @@ void PianoThermal::cpuReport(uint64_t spanNs)
 {
   if (!cpuOk_ && !channel_.messages) return;
   const uint64_t now = nowNs();
+  const Profile profile = Profile(__atomic_load_n(&profile_, __ATOMIC_ACQUIRE));
+  const PowerSource power = profilePower(power_, profile);
   for (unsigned d = 0; d < kDomains; ++d) {
     if (boot_[d] < 0) continue;
     const scmi::Domain &dom = domain_[d];
@@ -907,10 +1009,12 @@ void PianoThermal::cpuReport(uint64_t spanNs)
     }
     const Governor &g = governor_[d];
     if (at < int(sizeof line))
-      at = catf(line, sizeof line, at, "; %u changes; busy avg %llu%% max %u%%; ceiling %u MHz (%s), thermal limit %u MHz (%llu limited "
-               "polls, %u cuts)",
+      at = catf(line, sizeof line, at, "; %u changes; busy avg %llu%% max %u%%; ceiling %u MHz (%s%s%s), thermal limit %u MHz (%llu "
+               "limited polls, %u cuts)",
                changes_[d], (unsigned long long)(busyTicks_[d] ? busySum_[d] / busyTicks_[d] / 10 : 0), busyMax_[d] / 10,
-               g.khz(g.ceiling(power_)) / 1000, powerName(power_), g.khz(g.limit()) / 1000, (unsigned long long)limitedPolls_[d], cuts_[d]);
+               g.khz(g.ceiling(power)) / 1000, powerName(power_), profile == Profile::bySource ? "" : "; profile ",
+               profile == Profile::bySource ? "" : profileName(profile), g.khz(g.limit()) / 1000, (unsigned long long)limitedPolls_[d],
+               cuts_[d]);
     note("%s", line);
     changes_[d] = 0;
     busySum_[d] = busyTicks_[d] = 0;
@@ -965,6 +1069,10 @@ void PianoThermal::run()
   Poll tier = Poll::base;
   bool first = true, fastNoted = false;
   for (;;) {
+    if (park()) {   // back from a system sleep: the power source read again at the next CPU tick, the zones now
+      powerAtNs_ = 0;
+      note("[%us] wake %u: polling again", upS(), sleep_.wakes());
+    }
     monitor_.poll(kTsensIo);
     const uint64_t now = nowNs();
     int32_t d;
@@ -1026,6 +1134,6 @@ void PianoThermal::run()
       peakValid_ = false;   // the peak is per report window
     }
     first = false;
-    IOSleep(pollPeriodMs(tier, base, gArgs.warmMs, gArgs.fastMs));
+    pollWait(pollPeriodMs(tier, base, gArgs.warmMs, gArgs.fastMs));
   }
 }

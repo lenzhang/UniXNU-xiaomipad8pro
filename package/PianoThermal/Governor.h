@@ -34,6 +34,65 @@ inline const char *powerName(PowerSource p)
   return p == PowerSource::external ? "on power" : p == PowerSource::battery ? "on battery" : "power unknown (battery caps)";
 }
 
+// PianoPolicy's power profile (docs/policy.md 5.2, the platform function "piano-thermal-profile"): 0 the caps by the power source
+// (as without PianoPolicy), 1 Power Saver whatever the source (the battery caps, -bat0/-bat1), 2 Balanced whatever the source (the
+// external-power caps, -ac0/-ac1). The governor (mode 3) is handed profilePower() instead of the measured source; the fixed level
+// (mode 2) has no power caps and so ignores it.
+enum class Profile : uint8_t { bySource = 0, saver = 1, balanced = 2 };
+inline bool profileValid(uintptr_t mode) { return mode <= 2; }
+inline PowerSource profilePower(PowerSource measured, Profile p)
+{
+  return p == Profile::saver ? PowerSource::battery : p == Profile::balanced ? PowerSource::external : measured;
+}
+inline const char *profileName(Profile p)
+{
+  return p == Profile::saver ? "Power Saver" : p == Profile::balanced ? "Balanced" : "by the power source";
+}
+
+// A system sleep (docs/power.md 4, PianoPowerContract.h): off parks the thread (no SCMI request, no TSENS read in flight) and, with
+// piano-thermal-sleep-mask=1, masks the threshold interrupts (piano_thermal_suspend_prepare); on puts back what that off masked
+// (piano_thermal_suspend_finish), then the thread runs again (its first zone update follows at once). A second off, or an on
+// without an off (the power tree's first on), does nothing; a prepare that answered -1 (another caller prepared first) is not
+// finished here.
+struct SleepSteps {
+  bool park = false, mask = false, finish = false, unpark = false;
+};
+class SleepPlan {
+ public:
+  explicit SleepPlan(bool mask = false) : mask_(mask) {}
+  SleepSteps off()
+  {
+    SleepSteps s;
+    if (asleep_) return s;
+    asleep_ = true;
+    masked_ = mask_;
+    s.park = true;
+    s.mask = mask_;
+    return s;
+  }
+  void maskResult(int prepared)
+  {
+    if (prepared < 0) masked_ = false;
+  }
+  SleepSteps on()
+  {
+    SleepSteps s;
+    if (!asleep_) return s;
+    asleep_ = false;
+    s.finish = masked_;
+    s.unpark = true;
+    masked_ = false;
+    ++wakes_;
+    return s;
+  }
+  bool asleep() const { return asleep_; }
+  uint32_t wakes() const { return wakes_; }
+
+ private:
+  bool mask_, asleep_ = false, masked_ = false;
+  uint32_t wakes_ = 0;
+};
+
 struct GovernorConfig {
   uint32_t capKhz = 0;          // 0: none (fixed mode needs one; PianoThermal.cpp gives the default)
   uint32_t batteryKhz = 0, externalKhz = 0;   // 0: none
