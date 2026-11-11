@@ -15,6 +15,10 @@
 // piano-dpu-repeat=S with piano-dpu-samples=N (re-measure every S s, N times, default 3: one line each, to see a change after
 // WindowServer starts or the display sleeps). Without piano-dpu the driver declines in probe() and maps nothing. NativeGopDisplay is
 // not touched: this driver never registers a display.
+//   piano-dpu-ahb-vote=N (default 0: level 1 stores nothing at all) the GCC display AHB branch before the survey (DpuAhbVote.h): 1 its
+//                CLK_ENABLE set if clear (under PianoA830's GCC vote lock) and the gate's GCC check by Linux's rule (enabled and
+//                hardware-gated counts as on), 2 also its HW_CTL cleared (forced on, CLK_OFF must read clear); the only stores of
+//                level 1, all to GCC_DISP_AHB_CBCR, undone after the survey unless a later stage reads MDSS.
 //   piano-dpu=2  level 1, then B1b, the zero-copy flips (DpuFlip.cpp: piano-dpu-flip=N, the ladder of docs/drivers/dpu.md section 8);
 //                the service is registered so that NativeGopDisplay (native-gop-display-flip=1) finds its "PianoDpuFlip" function.
 // The writing slices B1c (piano-dpu-refresh), B1d (piano-dpu-pcc) and B1e (piano-dpu-panel) are DpuSlices.cpp's: their own thread,
@@ -30,6 +34,7 @@
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include "DpuSurvey.h"
+#include "DpuAhbVote.h"
 #include "DpuFlipKernel.h"
 
 using namespace pianodpu;
@@ -42,12 +47,15 @@ bool dpuSlicesPlatformFunction(const OSSymbol *name, void *p1, void *p2, void *p
 extern "C" {
 // Post-mortem breadcrumb (also in the console log): the last stage reached, negative when it failed there.
 volatile int32_t piano_dpu_stage = 0;
+// PianoA830's lock word of the GCC clock registers (0 free, else the holder's tag); PianoA830 links first and is a library of
+// PianoDpu.json. Taken only by piano-dpu-ahb-vote.
+extern volatile uint32_t sm8750_gcc_vote_owner;
 }
 
 namespace {
 
 struct Args {
-  uint32_t level, smmu, measure, delay, repeat, samples;
+  uint32_t level, smmu, measure, delay, repeat, samples, ahbVote;
 };
 Args gArgs;
 
@@ -72,6 +80,8 @@ void readArgs()
   if (gArgs.repeat > 3600) gArgs.repeat = 3600;
   gArgs.samples = bootArg("piano-dpu-samples", 3);
   if (gArgs.samples > 100) gArgs.samples = 100;
+  gArgs.ahbVote = bootArg("piano-dpu-ahb-vote", 0);
+  if (gArgs.ahbVote > 2) gArgs.ahbVote = 0;   // an unknown value writes nothing
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -91,7 +101,7 @@ void stage(int32_t value, const char *what)
   note("%s %d: %s", value < 0 ? "FAILED at stage" : "stage", value < 0 ? -value : value, what);
 }
 
-// Explicit ldr, as PianoAudio, PianoPower and PianoWifi do. This file has no store helper.
+// Explicit ldr, as PianoAudio, PianoPower and PianoWifi do. The one store helper below (gccStore) serves piano-dpu-ahb-vote only.
 inline uint32_t rd32(uintptr_t a)
 {
   uint32_t v;
@@ -139,6 +149,41 @@ uint32_t load(uint64_t pa)
 
 uint64_t load64(uint64_t pa) { return uint64_t(load(pa)) | uint64_t(load(pa + 4)) << 32; }
 
+// piano-dpu-ahb-vote's store (DpuAhbVote.h): GCC_DISP_AHB_CBCR only, into the page its load mapped, never a new mapping.
+uint64_t gStores;
+void gccStore(uint64_t pa, uint32_t v)
+{
+  if (pa != kGcc + kGccDispAhb) return;
+  const uint64_t base = pa & ~0xfffull;
+  for (unsigned i = 0; i < gPageCount; ++i)
+    if (gPages[i].pa == base) {
+      __asm__ volatile("str %w0, [%1]" : : "r"(v), "r"(gPages[i].va + uintptr_t(pa & 0xfff)) : "memory");
+      __builtin_arm_dsb(0xf);
+      ++gStores;
+      return;
+    }
+}
+
+// PianoA830's lock word, PianoTouch's protocol: tried every 10 us, at most 50 ms; not taken: nothing written.
+struct GccLock {
+  bool take(unsigned *tries)
+  {
+    for (unsigned n = 1; n <= kGccLockTries; ++n) {
+      *tries = n;
+      uint32_t expected = 0;
+      if (__atomic_compare_exchange_n(&sm8750_gcc_vote_owner, &expected, kDpuGccVoteTag, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return true;
+      IODelay(10);
+    }
+    return false;
+  }
+  void give()
+  {
+    uint32_t expected = kDpuGccVoteTag;
+    __atomic_compare_exchange_n(&sm8750_gcc_vote_owner, &expected, 0u, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+  }
+};
+
 void unmapAll()
 {
   for (unsigned i = 0; i < gPageCount; ++i) gPages[i].map->release();
@@ -177,14 +222,33 @@ void indexList(unsigned bits, const char *prefix, unsigned count, char *out, siz
   if (!n) snprintf(out, size, "none");
 }
 
+// Three lines (the console cuts a line at 255 characters: before 2026-11-12 one line lost the MDP RCG's source and divider).
 void reportClocks(const ClockGate &g)
 {
   const unsigned src = (g.rcgCfg >> 8) & 7u, div = g.rcgCfg & 0x1fu;
-  note("clocks: gcc disp ahb %08x hf-axi %08x; dispcc mdss gdsc %08x (%s) ahb %08x non-gdsc-ahb %08x mdp %08x vsync %08x "
-       "pclk %08x/%08x byte %08x/%08x esc0 %08x; mdp rcg cmd %08x cfg %08x (source %u, divider %u.%u)",
-       g.gccDispAhb, g.gccDispAxi, g.gdsc, gdscOn(g.gdsc) ? "on" : "off", g.ahb, g.nonGdscAhb, g.mdp, g.vsync, g.pclk[0], g.pclk[1],
-       g.byte[0], g.byte[1], g.esc0, g.rcgCmd, g.rcgCfg, src, div ? (div + 1) / 2 : 1, div && !(div & 1u) ? 5 : 0);
+  note("clocks: gcc disp ahb %08x (enable %u, hw gating %u, clk-off %u: %s) hf-axi %08x (clk-off %u)", g.gccDispAhb,
+       g.gccDispAhb & kCbcrEnable, (g.gccDispAhb & kCbcrHwCtl) >> 1, g.gccDispAhb >> 31,
+       branchOn(g.gccDispAhb) ? "running" : branchHwGated(g.gccDispAhb) ? "hardware-gated, idle" : "off", g.gccDispAxi, g.gccDispAxi >> 31);
+  note("clocks: dispcc mdss gdsc %08x (%s) ahb %08x non-gdsc-ahb %08x mdp %08x vsync %08x pclk %08x/%08x byte %08x/%08x esc0 %08x",
+       g.gdsc, gdscOn(g.gdsc) ? "on" : "off", g.ahb, g.nonGdscAhb, g.mdp, g.vsync, g.pclk[0], g.pclk[1], g.byte[0], g.byte[1], g.esc0);
+  note("clocks: mdp rcg cmd %08x cfg %08x (source %u, divider %u.%u)", g.rcgCmd, g.rcgCfg, src, div ? (div + 1) / 2 : 1,
+       div && !(div & 1u) ? 5 : 0);
   note("gate: %s", g.why);
+}
+
+void reportVote(const AhbVote &v)
+{
+  if (v.lockFailed)
+    note("ahb vote %u: GCC_DISP_AHB_CBCR %08x: the GCC vote lock stayed taken (%u tries, holder %08x): nothing written", v.mode, v.found,
+         v.lockTries, __atomic_load_n(&sm8750_gcc_vote_owner, __ATOMIC_ACQUIRE));
+  else if (v.wrote)
+    note("ahb vote %u: GCC_DISP_AHB_CBCR %08x -> wrote %08x (%s%s) under the GCC vote lock (%u tries); now %08x after %u us: %s",
+         v.mode, v.found, v.written, v.setEnable ? "enable set" : "", v.clearedHwCtl ? (v.setEnable ? ", hw gating off" : "hw gating off") : "",
+         v.lockTries, v.after, v.waitedUs, v.on ? "passes the gate's rule" : "does NOT pass the gate's rule");
+  else
+    note("ahb vote %u: GCC_DISP_AHB_CBCR %08x: %s; nothing written; %s", v.mode, v.found,
+         v.found == kUnreadable ? "not readable" : v.mode >= 2 ? "already enabled, hw gating off" : "already enabled (the boot's vote)",
+         v.on ? (v.mode == 1 && !branchOn(v.after) ? "enabled and hardware-gated: on by Linux's rule" : "running") : "does NOT pass the gate's rule");
 }
 
 void reportTop(const Survey &s)
@@ -514,7 +578,11 @@ bool PianoDpu::start(IOService *provider)
        gArgs.smmu, gArgs.measure, gArgs.delay, gArgs.repeat, gArgs.samples, (unsigned long long)kMdss, (unsigned long long)kMdp,
        (unsigned long long)kDsi[0], (unsigned long long)kDsi[1]);
   if (gArgs.level > 2) note("piano-dpu=%u: levels 1 and 2 exist (docs/drivers/dpu.md section 8); running level 2", gArgs.level);
-  note("level 1: loads only, nothing written%s", gArgs.level >= 2 ? "; then B1b (piano-dpu=2): the flips of piano-dpu-flip" : "");
+  if (gArgs.ahbVote)
+    note("level 1: loads only, but piano-dpu-ahb-vote=%u: GCC_DISP_AHB_CBCR (GCC %#x) %s, under the GCC vote lock, before the survey%s",
+         gArgs.ahbVote, kGccDispAhb, gArgs.ahbVote >= 2 ? "enable set and hw gating off if not so" : "enable set if clear",
+         gArgs.level >= 2 ? "; then B1b (piano-dpu=2): the flips of piano-dpu-flip" : "");
+  else note("level 1: loads only, nothing written%s", gArgs.level >= 2 ? "; then B1b (piano-dpu=2): the flips of piano-dpu-flip" : "");
   setProperty("piano-dpu", gArgs.level, 32);
   if (gArgs.level >= 2) registerService();   // NativeGopDisplay finds the flip function by this class
   thread_t t = nullptr;
@@ -548,8 +616,18 @@ void PianoDpu::run()
     IOSleep(gArgs.delay * 1000);
   }
   static Survey s;   // ~3 KiB: not on the thread's stack
-  stage(1, "clock gate: GCC display AHB, DISPCC MDSS GDSC / AHB / MDP (read only)");
-  s.clocks = surveyClocks(load, &s.loads);
+  GccLock lock;
+  AhbVote vote;
+  if (gArgs.ahbVote) {
+    stage(1, "clock gate: piano-dpu-ahb-vote first (GCC_DISP_AHB_CBCR, under the GCC vote lock), then GCC display AHB, DISPCC MDSS "
+             "GDSC / AHB / MDP (read only)");
+    vote = ahbVote(gArgs.ahbVote, load, gccStore, [](unsigned us) { IODelay(us); }, lock);
+    reportVote(vote);
+  } else {
+    stage(1, "clock gate: GCC display AHB, DISPCC MDSS GDSC / AHB / MDP (read only)");
+  }
+  // piano-dpu-ahb-vote=1: GCC's display AHB branch enabled and hardware-gated counts as on (Linux's rule); 2 keeps the strict rule.
+  s.clocks = surveyClocks(load, &s.loads, gArgs.ahbVote == 1);
   reportClocks(s.clocks);
   if (s.clocks.readable) {
     stage(2, "MDSS, DPU and DSI registers (read only)");
@@ -600,8 +678,21 @@ void PianoDpu::run()
          load(kMdp + kIntfBase + kIntfStride + kIntfStatus), addr[0], addr[1], p.ctl,
          p.ctl >= 0 ? load(kMdp + kCtlBase + kCtlStride * unsigned(p.ctl) + kCtlFlush) : 0);
   }
+  if (vote.setEnable || vote.clearedHwCtl) {
+    // B1b (piano-dpu=2) and the writing slices read MDSS after this: the vote stays for the boot; else the found bits come back.
+    if (gArgs.level >= 2 || dpuSlicesWanted()) {
+      note("ahb vote %u: kept for the boot (%s reads MDSS after the survey): GCC_DISP_AHB_CBCR %08x", vote.mode,
+           gArgs.level >= 2 ? "B1b" : "a writing slice", load(kGcc + kGccDispAhb));
+    } else {
+      ahbUndo(vote, load, gccStore, lock);
+      if (vote.undone) note("ahb vote %u: undone after the survey: GCC_DISP_AHB_CBCR %08x (found %08x)", vote.mode, vote.undoneTo, vote.found);
+      else note("ahb vote %u: NOT undone: the GCC vote lock stayed taken; GCC_DISP_AHB_CBCR %08x stays as voted", vote.mode,
+                load(kGcc + kGccDispAhb));
+    }
+  }
   stage(5, "done");
-  note("done: %llu MMIO loads, 0 stores; %u pages mapped, %u map failures", (unsigned long long)gLoads, gPageCount, gMapFailures);
+  note("done: %llu MMIO loads, %llu stores%s; %u pages mapped, %u map failures", (unsigned long long)gLoads,
+       (unsigned long long)gStores, gStores ? " (piano-dpu-ahb-vote's, GCC_DISP_AHB_CBCR only)" : "", gPageCount, gMapFailures);
   unmapAll();
   if (gArgs.level >= 2) flipRun(this, s, m, gArgs.smmu);   // B1b: DpuFlip.cpp, its own mappings and stores
 }

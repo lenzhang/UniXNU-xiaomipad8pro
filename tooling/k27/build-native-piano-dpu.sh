@@ -27,4 +27,6 @@ done
 python3 "$D/tooling/k27/build-native-kext.py" PianoDpu "$P/PianoDpu.cpp" "$P/DpuFlip.cpp" "$P/DpuSlices.cpp" "$D/tooling/k27/NativeKextGlue.cpp" -I "$P" \
   --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
-[ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" | cut -c1-160 >&2
+# piano-dpu-ahb-vote takes PianoA830's GCC vote lock word (sm8750_gcc_vote_owner): PianoA830 links first, a library of PianoDpu.json.
+[ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" --library-prefix _sm8750_gcc_vote_owner \
+  | cut -c1-160 >&2

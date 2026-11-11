@@ -42,7 +42,7 @@ hypervisor family, "K90" = an SM8750 phone). Every offset is in `package/PianoDp
 | Boot route | Linux keeps 0x800 on its boot bank as an identity domain; **moving the live stream to the emulated bypass bank reset the SM8750** | msm arm-smmu-qcom.c | verified (Linux) |
 | Bank 2 contents | translation on or off, TTBR0, what it maps | sheng: bank 3 SCTLR 0xe0 (off); SunUEFI fixture 0x1e5 (on?) | **needs-boot (B1a)** |
 | Pipes ABL uses | which pipe(s), multirect or two pipes, alpha, CTL, LMs, DSPP in path | Linux at 144 Hz: one DMA pipe multirect 2×1600; K90: VIG0+VIG1 | **needs-boot (B1a)** |
-| Clocks | MDSS AHB may be gated (an SM8750 phone read it off and hung on an ungated read) | Adreno830 docs, K90 | **needs-boot (B1a gate)** |
+| Clocks | MDSS AHB may be gated (an SM8750 phone read it off and hung on an ungated read). On piano under XNU (2026-11-12, dpu1, dpu-c0, the panel lit): GCC_DISP_AHB_CBCR (GCC 0x27004) **0x88000003** = CLK_ENABLE (bit 0) and HW_CTL (bit 1, hardware clock gating) set, CLK_OFF (bit 31) set: enabled and hardware-gated, idle between accesses; hf-axi 0x08200001 running. Linux only sets bit 0 on it (gcc-sm8750's kept-on list) and its halt check skips CLK_OFF in hardware gating mode | Adreno830 docs, K90; tablet; msm gcc-sm8750.c, clk-branch.c | the reading: verified; that DISPCC reads behind it work: **needs-boot (B1a with `piano-dpu-ahb-vote`)** |
 | Underrun, engine | TOP0 INTR_STATUS bits 26/28 latch INTF1/INTF2 underruns, enabled or not (INTR_CLEAR +0x18, write-one-to-clear); INTF_STATUS +0x26c bit 0 = engine running (EN = 0 stops it at its frame end); INTF_CONFIG bit 31 = programmable fetch; COUNT_EN 3 = both counters | msm dpu_hwio.h, dpu_hw_intf.c, catalog | verified (sources) |
 | CTL flush | CTL_INTF_FLUSH +0x110 bit n = INTF n, CTL_DSPP_n_FLUSH bit 4 = PCC, CTL_FLUSH bit 31 (INTFs) / 29 (DSPPs); cleared by the hardware at the latch; video mode: the flush before a timing engine starts | msm dpu_hw_ctl.c, dpu_encoder_phys_vid.c | verified (sources); write-one-to-set: inferred |
 | DSI command path | per controller (offsets from its base): CTRL bit 2 command mode (set beside video for a transfer); CMD_DMA_CTRL +0x3c (31 broadcast, 30 master, 28 from buffer/FIFO, 26 low power); DMA length +0x4c; TRIG_CTRL +0x84 (DMA trigger 2:0, 4 = software; bit 12 BLOCK_DMA_WITHIN_FRAME); TRIG_DMA +0x90; STATUS0 bit 1 DMA busy; INTR_CTRL +0x110 (bit 0 DMA done, write-one-to-clear; odd bits enables); TEST_PATTERN_GEN_CTRL +0x15c = 0x30006 makes the DMA read the controller's command FIFO +0x17c (no DMA buffer through the SMMU); +0x390 bit 1 cleared for the transfer; short write = header 0x80000000 \| 0x05 << 16 \| command, a pad word, length 4 | msm dsi.xml, dsi_host.c; UniXNU-sm8750-common PeripheralIO.h | verified (sources); +0x390's meaning, TRIG_CTRL as left: needs-boot (B1e logs them) |
@@ -282,7 +282,9 @@ grep -a "PianoDpu" logs/usb-console/<newest>-port0.txt
 PianoDpu: start: piano-dpu=1 smmu=2 measure=1000 ms delay=0 repeat=0 samples=3 (MDSS 0xae00000, DPU 0xae01000, DSI 0xae94000/0xae96000)
 PianoDpu: level 1: loads only, nothing written
 PianoDpu: stage 1: clock gate: GCC display AHB, DISPCC MDSS GDSC / AHB / MDP (read only)
-PianoDpu: clocks: gcc disp ahb ... hf-axi ...; dispcc mdss gdsc 8....... (on) ahb ... mdp ... (source N, divider ...)
+PianoDpu: clocks: gcc disp ahb ........ (enable 1, hw gating ., clk-off .: running|hardware-gated, idle) hf-axi ........ (clk-off 0)
+PianoDpu: clocks: dispcc mdss gdsc 8....... (on) ahb ... non-gdsc-ahb ... mdp ... vsync ... pclk .../... byte .../... esc0 ...
+PianoDpu: clocks: mdp rcg cmd ... cfg ... (source N, divider ...)
 PianoDpu: gate: MDSS powered, AHB and MDP clocks on
 PianoDpu: stage 2: MDSS, DPU and DSI registers (read only)
 PianoDpu: pipe VIG0 rect 0: 1600x2136 @0,0 -> 1600x2136 @0,0 addr fc800000 stride 12800 format ........ unpack 03020001 'BGRA' ... [splash at 0,0]
@@ -307,11 +309,47 @@ PianoDpu: stage 5: done
 PianoDpu: done: N MMIO loads, 0 stores; P pages mapped, 0 map failures
 ```
 The pipe names, alpha, timing numbers and route are what B1a is for: the INTF's compressed width (427) and wide-bus split are
-inferred from Linux and may read differently. Failure lines: `gate: MDSS AHB clock off: ...` (nothing of MDSS read: the next image
-adds a one-register AHB vote before the survey, attended), `dsi1: not read (its byte clock ... or pixel clock ... is off)` (the
+inferred from Linux and may read differently. Failure lines: `gate: MDSS AHB clock off: ...` or `gate: GCC display AHB clock off: ...` (nothing of MDSS read: B1a with
+the AHB vote, below), `dsi1: not read (its byte clock ... or pixel clock ... is off)` (the
 slave link's clocks are not where Linux has them: record the CBCRs), `refresh: intf1 frame counter did not move ... disabled` (counters
 off: the refresh then comes from B1b's vsync interrupt), a hang before `stage 2` lines (an ungated block: report the last line).
 With a `bank-on` route, run once more with `piano-dpu-smmu=3`: `walk: iova 0xfc800000 -> pa 0xfc800000 ... (identity)`.
+
+**B1a with the AHB vote** (`piano-dpu-ahb-vote`, 2026-11-12, queue5 P13; `DpuAhbVote.h`). dpu1 and dpu-c0 stopped at
+`gate: GCC display AHB clock off` with the CBCR at 0x88000003 (§2 Clocks): the software vote the plan was to write is already
+there, the branch is hardware-gated. `piano-dpu-ahb-vote=1`: CLK_ENABLE set if clear (none on the tablet), under PianoA830's GCC
+vote lock (`sm8750_gcc_vote_owner`, tag "DPU1"), then the gate's GCC check by Linux's rule (enabled + hardware-gated = on);
+DISPCC's GDSC/AHB/MDP stay strict. `=2`: also HW_CTL cleared (the branch forced on), the strict rule then wants CLK_OFF clear
+within 500 µs before any DISPCC load; the bits it changed are set back after the survey (kept for the boot with `piano-dpu=2` or
+a writing slice). Without the argument level 1 stores nothing. Neither bit can stop the scan-out (inferred: the pixels come over
+hf-axi and DISPCC's MDP clock; this branch is the register interface and the vote only makes it run more): unattended, the panel
+stays lit; the failure mode is a stall on the first DISPCC load, which the Gunyah watchdog or `piano-reset-after` resets into ABL
+fastboot (`piano-reset-to=bootloader`).
+```sh
+# unattended, 5 minutes; then the same with piano-dpu-ahb-vote=2 only if =1 stops after its "clocks: gcc" line
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=300 \
+  PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-dpu=1 piano-dpu-ahb-vote=1" \
+  tooling/k27/build-native-image.sh && rm -rf out/ram-dpu-ahb1 && cp -R out/ram out/ram-dpu-ahb1
+```
+Expected, then B1a's lines from `stage 2` on:
+```
+PianoDpu: level 1: loads only, but piano-dpu-ahb-vote=1: GCC_DISP_AHB_CBCR (GCC 0x27004) enable set if clear, under the GCC vote lock, before the survey
+PianoDpu: stage 1: clock gate: piano-dpu-ahb-vote first (GCC_DISP_AHB_CBCR, under the GCC vote lock), then GCC display AHB, DISPCC MDSS GDSC / AHB / MDP (read only)
+PianoDpu: ahb vote 1: GCC_DISP_AHB_CBCR 88000003: already enabled (the boot's vote); nothing written; enabled and hardware-gated: on by Linux's rule
+PianoDpu: clocks: gcc disp ahb 88000003 (enable 1, hw gating 1, clk-off 1: hardware-gated, idle) hf-axi 08200001 (clk-off 0)
+PianoDpu: clocks: dispcc mdss gdsc 8....... (on) ahb ........ ...
+PianoDpu: gate: MDSS powered, AHB and MDP clocks on
+PianoDpu: stage 2: MDSS, DPU and DSI registers (read only)
+...
+PianoDpu: done: N MMIO loads, 0 stores; P pages mapped, 0 map failures
+```
+With `=2`: `ahb vote 2: GCC_DISP_AHB_CBCR 88000003 -> wrote 88000001 (hw gating off) under the GCC vote lock (1 tries); now
+08000001 after N us: passes the gate's rule`, at the end `ahb vote 2: undone after the survey: GCC_DISP_AHB_CBCR 88000003 (found
+88000003)` and `done: ... 2 stores (piano-dpu-ahb-vote's, GCC_DISP_AHB_CBCR only)`. Failure meanings: the console stops after
+the `clocks: gcc` line (a DISPCC load stalled: the hardware gating does not wake on an access from this master; report it, try
+`=2`); `gate: MDSS GDSC off` or `MDSS AHB clock off` (DISPCC read fine, its own branches are off under XNU: DISPCC 0x80b0's enable
+is the next one-register vote, a later image); `does NOT pass the gate's rule` with `=2` (forcing does not start it: its parent is
+off); `the GCC vote lock stayed taken` (another kext held it 50 ms: nothing written, run again).
 
 **B1b ladder** (built and host-tested 2026-11-11, not run; each step a separate RAM image, owner present, in order: a step runs
 only after the previous one passed). Every step starts with B1a's lines (the survey is the path's source), then runs within a second
@@ -541,7 +579,9 @@ and the SPI 83 handler, which stays attached: ArmCpu has no detach); step 4's fa
 
 ## 10. Open questions
 
-1. Is the MDSS AHB clock on at XNU time? → B1a gate line. If not, one vote (DISPCC 0x80b0 enable) precedes every later level.
+1. Is the MDSS AHB clock on at XNU time? → B1a gate line. 2026-11-12: GCC's display AHB branch reads enabled and hardware-gated
+   (0x88000003), so the B1a gate closed on CLK_OFF; `piano-dpu-ahb-vote=1` reads behind it by Linux's rule (§8). DISPCC's own
+   branches: that run's `clocks: dispcc` line; if its AHB (0x80b0) reads off, its enable is the next one-register vote.
 2. Which pipes, rects, alpha, DSPP in path; INTF compressed width and wide bus? → B1a.
 3. Bank 2: translation on or off, and is it the HLOS's to reprogram under Gunyah (sheng: yes on SM8550)? → B1a, then B1b(3).
 4. Is TCR2 PASize 36 bits enough, and does the walker accept tables above 4 GiB? → B1b(3) (sheng used 48-bit, tables in RAM).

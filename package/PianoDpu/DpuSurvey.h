@@ -79,18 +79,31 @@ constexpr uint32_t kGccDispAhb = 0x27004, kGccDispHfAxi = 0x27008;   // msm gcc-
 constexpr uint32_t kCcNonGdscAhb = 0xc004;                          // msm dispcc-sm8750: disp_cc_mdss_non_gdsc_ahb_clk
 inline bool branchOn(uint32_t cbcr) { return !(cbcr >> 31); }       // CBCR bit 31: CLK_OFF
 inline bool gdscOn(uint32_t gdscr) { return (gdscr >> 31) & 1u; }   // GDSCR bit 31: PWR_ON
+// CBCR bit 0 CLK_ENABLE (the software vote), bit 1 HW_CTL (dynamic hardware clock gating: msm gcc-sm8750's hwcg_bit). A branch
+// with both set is enabled and gated by the hardware while idle, so CLK_OFF reads 1 between accesses; Linux's halt check skips
+// CLK_OFF for such a branch (clk-branch.c, the specification only). The tablet's GCC display AHB read 0x88000003 so (2026-11-12).
+constexpr uint32_t kCbcrEnable = 1u << 0, kCbcrHwCtl = 1u << 1;
+inline bool branchHwGated(uint32_t cbcr)   // all ones: no reading (an unmapped page), never a pass
+{
+  return cbcr != 0xffffffffu && (cbcr & (kCbcrEnable | kCbcrHwCtl)) == (kCbcrEnable | kCbcrHwCtl);
+}
 // The INTFs read: INTF1 and INTF2 (the panel's). INTF0/INTF3 drive DP, which nothing runs: not read.
 constexpr bool intfSurveyed(unsigned i) { return i == 1 || i == 2; }
 
+// hwGatedAhb (piano-dpu-ahb-vote=1, DpuAhbVote.h): GCC's display AHB branch also counts as on when it is enabled and hardware-gated
+// (Linux's rule for it); DISPCC's GDSC and branches are checked as before. Without it: CLK_OFF must read clear.
 template <class Load>
-ClockGate surveyClocks(Load load, unsigned *loads)
+ClockGate surveyClocks(Load load, unsigned *loads, bool hwGatedAhb = false)
 {
   ClockGate g;
   g.gccDispAhb = load(kGcc + kGccDispAhb);
   g.gccDispAxi = load(kGcc + kGccDispHfAxi);
   *loads += 2;
-  if (!branchOn(g.gccDispAhb)) {   // DISPCC's own registers sit behind this clock
-    g.why = "GCC display AHB clock off: DISPCC, MDSS, DPU and DSI not read";
+  if (!branchOn(g.gccDispAhb) && !(hwGatedAhb && branchHwGated(g.gccDispAhb))) {   // DISPCC's own registers sit behind this clock
+    g.why = branchHwGated(g.gccDispAhb)
+                ? "GCC display AHB clock off: DISPCC, MDSS, DPU and DSI not read (enabled and hardware-gated, CLK_OFF only says idle: "
+                  "piano-dpu-ahb-vote=1 reads behind it)"
+                : "GCC display AHB clock off: DISPCC, MDSS, DPU and DSI not read";
     return g;
   }
   const uint32_t at[] = {kCcMdssGdsc, kCcAhb, kCcNonGdscAhb, kCcMdp, kCcVsync, kCcPclk0, kCcPclk1, kCcByte0, kCcByte1, kCcEsc0,

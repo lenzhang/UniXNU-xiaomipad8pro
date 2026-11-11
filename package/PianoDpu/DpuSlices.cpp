@@ -70,6 +70,7 @@ struct SliceArgs {
   bool pccTest = false;
   int32_t pccTestMilli[3] = {1000, 1000, 1000};
   unsigned panel = 0, panelEngines = 1, panelHs = 0, panelTest = 0;
+  unsigned ahbVote = 0;   // piano-dpu-ahb-vote: 1 = the gate's Linux rule for GCC's display AHB (DpuAhbVote.h)
 };
 SliceArgs gA;
 bool gArgsRead;
@@ -86,6 +87,7 @@ void readSliceArgs()
   if (gArgsRead) return;
   gArgsRead = true;
   gA.level = argNumber("piano-dpu", 0, 0, 100);
+  gA.ahbVote = argNumber("piano-dpu-ahb-vote", 0, 0, 2);
   char s[32] = {};
   if (PE_parse_boot_arg_str("piano-dpu-refresh", s, sizeof s)) {
     if (!strcmp(s, "auto")) gA.refresh = kRefreshAuto;
@@ -283,7 +285,7 @@ void publish()
 // ------------------------------------------------------------------------------------------------------------- B1c
 bool reread(const char *after)
 {
-  const LivePath p = readPath(gIo);
+  const LivePath p = readPath(gIo, gA.ahbVote == 1);
   if (!p.ok) {
     note("path after %s: %s", after, p.why);
     return false;
@@ -634,7 +636,7 @@ void worker(void *, wait_result_t)
     note("slices: off: a register page did not map (%u mapped)", gPageCount);
     return;
   }
-  const LivePath p = readPath(gIo);
+  const LivePath p = readPath(gIo, gA.ahbVote == 1);
   note("slices: path: %s; ctl%d (top %08x intf %x master %x) lms %02x dspps %x; intf1 en %x status %x frame %u, intf2 en %x status %x "
        "frame %u",
        p.why, p.ctl, p.ctlTop, p.intfActive, p.intfMaster, p.lms, p.dspps, p.link[0].en, p.link[0].status, p.link[0].frame,

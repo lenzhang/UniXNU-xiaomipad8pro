@@ -62,7 +62,8 @@ piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01): drivers/gpu/drm/msm/disp/d
 dpu_hw_lm.c, dpu_hw_dspp.c, dpu_hw_intf.c, dpu_hw_dsc_1_2.c, dpu_hw_merge3d.c, dpu_hw_interrupts.c, dpu_hwio.h, dpu_hw_catalog.c
 (register offsets and field layouts), dpu_crtc.c (the PCC's S3.15 coefficients), msm/registers/display/dsi.xml and dsi/dsi_host.c
 (the DSI 6G registers and how msm programs the bonded/DSC timing), msm_kms.c (the DPU's 32-bit address space),
-clk/qcom/dispcc-sm8750.c and gcc-sm8750.c (the display clock branches), iommu/arm/arm-smmu/arm-smmu-qcom.c (the SM8750 MDSS boot
+clk/qcom/dispcc-sm8750.c and gcc-sm8750.c (the display clock branches; gcc's kept-on CLK_ENABLE list with 0x27004 and its hwcg
+bit 1), clk-branch.c and clk-branch.h (CBCR bits 0/1/31, the halt check skipped in hardware clock gating mode: DpuAhbVote.h), iommu/arm/arm-smmu/arm-smmu-qcom.c (the SM8750 MDSS boot
 route kept as identity; moving it to the emulated bypass bank resets the SoC), drm/panel/panel-novatek-nt36532.c (sha256
 0e7a9692367e70493f712d0e7237c8c4e27da7886ea4134b342fddffeeb89e08; the piano modes, the rate-group registers, the off sequence).
 Project-SunUEFI (per-file licences; its docs and its GPL-2.0 Linux patches read for facts only): docs/devel/hardware/oem-refresh.md,

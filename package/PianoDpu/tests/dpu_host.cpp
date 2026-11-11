@@ -9,6 +9,7 @@
 //   - the SMMU scan (group match under a mask, the bank registers only at level 2, the route verdicts) and the level-3 walk.
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. dpu_host.cpp -o /tmp/dpu_host && /tmp/dpu_host
 #include "DpuSurvey.h"
+#include "DpuAhbVote.h"
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -194,6 +195,139 @@ static void testGate()
     Survey s2;
     survey(s2, [&](uint64_t pa) { return soc.load(pa); });
     CHECK(!s2.dsiRead[0] && soc.in(kDsi[0], kDsiBytes) == 0);
+  }
+}
+
+// piano-dpu-ahb-vote (DpuAhbVote.h) on the tablet's reading 0x88000003 (enable, hardware gating, CLK_OFF: queue5 P13).
+struct LockModel {
+  bool busy = false;
+  unsigned takes = 0, gives = 0;
+  bool held = false;
+  bool take(unsigned *tries)
+  {
+    *tries = busy ? kGccLockTries : 1;
+    if (busy) return false;
+    ++takes;
+    held = true;
+    return true;
+  }
+  void give()
+  {
+    ++gives;
+    held = false;
+  }
+};
+// GCC_DISP_AHB_CBCR as the branch behaves: CLK_OFF follows the enable and HW_CTL (hardware-gated and idle: off) after `lagUs`.
+struct AhbModel {
+  uint32_t cbcr = 0x88000003;
+  unsigned lagUs = 0, sinceWrite = 0, stores = 0;
+  bool stuckOff = false;   // the branch never runs (its parent off)
+  std::vector<uint32_t> written;
+  LockModel *lock = nullptr;
+  bool storeOutsideLock = false;
+  uint32_t load(uint64_t pa)
+  {
+    if (pa != kGcc + kGccDispAhb) return 0;
+    const bool runs = !stuckOff && (cbcr & kCbcrEnable) && !(cbcr & kCbcrHwCtl) && sinceWrite >= lagUs;
+    return runs ? cbcr & ~(1u << 31) : cbcr | 1u << 31;
+  }
+  void store(uint64_t pa, uint32_t v)
+  {
+    if (pa != kGcc + kGccDispAhb) return;
+    if (lock && !lock->held) storeOutsideLock = true;
+    cbcr = v & ~(1u << 31);
+    written.push_back(v);
+    sinceWrite = 0;
+    ++stores;
+  }
+};
+
+static void testAhbVote()
+{
+  auto run = [](unsigned mode, AhbModel &m, LockModel &l) {
+    m.lock = &l;
+    return ahbVote(mode, [&](uint64_t pa) { return m.load(pa); }, [&](uint64_t pa, uint32_t v) { m.store(pa, v); },
+                   [&](unsigned us) { m.sinceWrite += us; }, l);
+  };
+  CHECK(branchHwGated(0x88000003) && !branchOn(0x88000003) && !branchHwGated(0x80000000) && !branchHwGated(0xffffffffu));
+  {   // the tablet, mode 1: the boot's vote is there, nothing written; the branch passes by Linux's rule
+    AhbModel m;
+    LockModel l;
+    const AhbVote v = run(1, m, l);
+    CHECK(!v.wrote && m.stores == 0 && l.takes == 0 && v.on && v.found == 0x88000003 && v.after == 0x88000003);
+    Soc soc;
+    bootState(soc);
+    soc.set(kGcc + kGccDispAhb, 0x88000003);
+    unsigned loads = 0;
+    CHECK(!surveyClocks([&](uint64_t pa) { return soc.load(pa); }, &loads).readable);   // the strict rule: closed (tonight's line)
+    CHECK(soc.in(kDispCc, 0x20000) == 0);
+    soc.loads.clear();
+    const ClockGate g = surveyClocks([&](uint64_t pa) { return soc.load(pa); }, &loads, true);
+    CHECK(g.readable && soc.in(kDispCc, 0x20000) > 0);                                  // Linux's rule: DISPCC is read
+    soc.set(kDispCc + kCcAhb, 0x80000000);                                              // DISPCC's branches stay strict
+    CHECK(!surveyClocks([&](uint64_t pa) { return soc.load(pa); }, &loads, true).readable);
+    soc.set(kGcc + kGccDispAhb, 0x80000000);                                            // not enabled: closed either way
+    soc.loads.clear();
+    CHECK(!surveyClocks([&](uint64_t pa) { return soc.load(pa); }, &loads, true).readable && soc.in(kDispCc, 0x20000) == 0);
+    soc.set(kGcc + kGccDispAhb, 0xffffffffu);                                           // an unmapped page: never a pass
+    CHECK(!surveyClocks([&](uint64_t pa) { return soc.load(pa); }, &loads, true).readable);
+  }
+  {   // mode 1 with the enable clear: one read-modify-write of bit 0 under the lock, then running
+    AhbModel m;
+    m.cbcr = 0x80000000;
+    m.lagUs = 3;
+    LockModel l;
+    AhbVote v = run(1, m, l);
+    CHECK(v.wrote && v.setEnable && !v.clearedHwCtl && m.stores == 1 && m.written[0] == 0x80000001 && !m.storeOutsideLock);
+    CHECK(l.takes == 1 && l.gives == 1 && !l.held && v.on && branchOn(v.after) && v.waitedUs == 3);
+    ahbUndo(v, [&](uint64_t pa) { return m.load(pa); }, [&](uint64_t pa, uint32_t x) { m.store(pa, x); }, l);
+    CHECK(v.undone && m.stores == 2 && (m.cbcr & kCbcrEnable) == 0 && !m.storeOutsideLock && l.gives == 2);   // put back as found
+  }
+  {   // mode 2 on the tablet's value: HW_CTL cleared (forced on), CLK_OFF clears, the strict gate passes; undo sets HW_CTL back
+    AhbModel m;
+    m.lagUs = 10;
+    LockModel l;
+    AhbVote v = run(2, m, l);
+    CHECK(v.wrote && !v.setEnable && v.clearedHwCtl && m.written[0] == 0x88000001 && v.on && branchOn(v.after) && v.waitedUs == 10);
+    Soc soc;
+    bootState(soc);
+    soc.set(kGcc + kGccDispAhb, v.after);
+    unsigned loads = 0;
+    CHECK(surveyClocks([&](uint64_t pa) { return soc.load(pa); }, &loads).readable);
+    ahbUndo(v, [&](uint64_t pa) { return m.load(pa); }, [&](uint64_t pa, uint32_t x) { m.store(pa, x); }, l);
+    CHECK(v.undone && m.cbcr == 0x08000003 && (v.undoneTo & 0x3u) == 3u && m.stores == 2);
+  }
+  {   // mode 2, the branch never runs: 500 us, then the gate stays closed (it decides by itself)
+    AhbModel m;
+    m.stuckOff = true;
+    LockModel l;
+    const AhbVote v = run(2, m, l);
+    CHECK(v.wrote && !v.on && v.waitedUs == kAhbOnWaitUs && !branchOn(v.after));
+  }
+  {   // the lock held elsewhere: nothing written, nothing undone
+    AhbModel m;
+    m.cbcr = 0x80000000;
+    LockModel l;
+    l.busy = true;
+    AhbVote v = run(1, m, l);
+    CHECK(v.lockFailed && !v.wrote && m.stores == 0 && !v.on);
+    ahbUndo(v, [&](uint64_t pa) { return m.load(pa); }, [&](uint64_t pa, uint32_t x) { m.store(pa, x); }, l);
+    CHECK(!v.undone && m.stores == 0);
+  }
+  {   // mode 0: reads only
+    AhbModel m;
+    m.cbcr = 0x80000000;
+    LockModel l;
+    const AhbVote v = run(0, m, l);
+    CHECK(!v.wrote && m.stores == 0 && l.takes == 0 && !v.on);
+  }
+  {   // unreadable (an unmapped page reads all ones): nothing written in either mode
+    for (unsigned mode = 1; mode <= 2; ++mode) {
+      LockModel l;
+      unsigned stores = 0;
+      const AhbVote v = ahbVote(mode, [](uint64_t) { return kUnreadable; }, [&](uint64_t, uint32_t) { ++stores; }, [](unsigned) {}, l);
+      CHECK(!v.wrote && stores == 0 && l.takes == 0 && !v.on);
+    }
   }
 }
 
@@ -512,6 +646,7 @@ static void testWalk()
 int main()
 {
   testGate();
+  testAhbVote();
   testFormat();
   testPipes();
   testCtlLm();

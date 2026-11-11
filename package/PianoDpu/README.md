@@ -9,7 +9,10 @@ flips, a ladder of four steps (`piano-dpu-flip=1..4`), the last of which serves 
   clock are on), then every pipe, CTL, layer mixer, DSPP (PCC/GC), MERGE_3D, DSC encoder, INTF and both DSI controllers; the panel ID
   pin; the apps SMMU's entries and bank for the DPU's streams 0x800-0x803; the refresh measured from INTF1/INTF2's frame counters
   read twice; the path and what a zero-copy flip would write. Every MMIO access is a load; no store at all. NativeGopDisplay is not
-  touched.
+  touched. `piano-dpu-ahb-vote=1|2` (`DpuAhbVote.h`) adds the one register level 1 may write, GCC_DISP_AHB_CBCR, before the survey,
+  under PianoA830's GCC vote lock: 1 its enable if clear and the gate's GCC check by Linux's rule (enabled and hardware-gated counts
+  as on, as the tablet reads it), 2 also hardware gating off (forced on, CLK_OFF must clear); undone after the survey unless a later
+  stage reads MDSS.
 - `piano-dpu=2`: level 1, then B1b on the same thread: the pipes the survey found on the boot framebuffer re-pointed by their
   source address and stride with one CTL flush, latched at the next frame (the vsync interrupt, SPI 83, enabled only around a flush);
   step 1 re-flushes their own addresses, step 2 shifts the boot framebuffer by 64 rows for 2 s, step 3 reprograms the DPU stream's own
@@ -27,6 +30,7 @@ Design, hardware facts, the staged plan, the boot arguments and the test plan wi
 |---|---|
 | `PianoDpu.cpp` | the IOService on IOPlatformExpertDevice; the survey thread, its log lines and the `piano-dpu-survey` property; level 2 hands over to `DpuFlip.cpp` and forwards `callPlatformFunction` |
 | `DpuSurvey.h` | portable: what level 1 reads (no store in the file), the clock gate, the decoders, the path and route verdicts, the walk |
+| `DpuAhbVote.h` | portable: `piano-dpu-ahb-vote`, the GCC display AHB branch's enable / hardware gating under the GCC vote lock, and its undo |
 | `DpuHw.h` | the facts, each with its source, including the blocks level 1 does not read |
 | `DpuSmmu.h` | portable (B1b): the DPU's SMMU bank in place: geometry and plan (stage 1 or 2 from the bank), the table and windows, the enable and its exact undo, the TLB sync, the window slots |
 | `DpuFlip.h` | portable (B1b): the flip path from the survey, program and latch, the ladder steps, the `PianoDpuFlip` service, the reverts, the rate-limited log |

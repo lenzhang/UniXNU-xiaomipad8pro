@@ -116,12 +116,13 @@ void readLink(Io &io, unsigned i, Link &k)
   k.dsiTrig = io.rd(dsiReg(i, kDsiTrigCtrl));
 }
 
+// hwGatedAhb: the survey's gate rule (piano-dpu-ahb-vote, DpuSurvey.h surveyClocks).
 template <class Io>
-LivePath readPath(Io &io)
+LivePath readPath(Io &io, bool hwGatedAhb = false)
 {
   LivePath p;
   unsigned loads = 0;
-  p.clocks = surveyClocks([&](uint64_t pa) { return io.rd(pa); }, &loads);
+  p.clocks = surveyClocks([&](uint64_t pa) { return io.rd(pa); }, &loads, hwGatedAhb);
   if (!p.clocks.readable) {
     p.why = p.clocks.why;
     return p;
