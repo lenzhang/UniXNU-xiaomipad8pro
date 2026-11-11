@@ -221,6 +221,7 @@ What each driver adds (their owners' work; nothing here changes their packages):
 | NativeUfs | hibern8, then every UFS clock and the GDSC (no extra references, no ICE) | exit hibern8 | in-flight I/O finishes after the wake (times do not advance) |
 | PianoThermal | tsens lower-threshold interrupts masked (when interrupts are used); no SCMI requests | the first zone update re-arms them | cpufreq: nothing |
 | PianoAudio | release LPASS_HW_MACRO / DCODEC votes when idle (Linux: 100 ms autosuspend) — **only after the LLCC island is confirmed reserved** | — | the island reset is about exactly this |
+| PianoTorch | torch off (four SPMI writes, synchronous in `setPowerState(kOff)`; also `systemWillShutdown`) | stays off (a new request lights it) | level 1: nothing |
 | NativeRamBlock, PianoNullEthernet, ARMPlatformStandIn | nothing | nothing | — |
 
 ## 5. Policy defaults
