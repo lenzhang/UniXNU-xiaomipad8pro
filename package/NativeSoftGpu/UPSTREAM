@@ -1,8 +1,8 @@
-macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM; local droidvm-build/macOS-DroidVM) 11ac316b789d81fc9f734e15645456f536c05141
+macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM) 11ac316b789d81fc9f734e15645456f536c05141
 (branch el1/native-variant), BSD-2-Clause-Patent (SPDX header of the file): overlay/kext/DroidVMGpuKext.cpp (class AGXAccelerator) and
 overlay/kext/DroidVMGpu.json (its personality and vtable check).
 Taken: an ordinary IOAccelerator subclass whose personality carries MetalPluginName / MetalPluginClassName for Metal's discovery, the
 logged MetalPluginName readers (copyProperty) and the logged opens (newUserClient).
-Removed: NativeAdrenoGpuPublished, the NativeAdreno publish and user client, DroidVMGpuStarter.
+Removed: NativeAdrenoGpuPublished, the NativeAdreno publish and user client, the starter class.
 Changed: class NativeSoftAccelerator on IOResources in its own match category; MetalPluginName NativeSoftMetal (package/NativeSoftMetal);
 every open refused; boot-arg native-soft-gpu=0 leaves it out; "NativeSoftGpu: ..." logs.

@@ -2438,7 +2438,7 @@ static void publishThread (void *, wait_result_t)
 {
   // UniXNU-piano (2026-11-11): publish no window before IOResources has matched IOBSD. Otherwise AppleAPFSContainer::start can run on
   // a window first: it takes APFS's module lock and waits for that matching, which itself waits in com_apple_filesystems_apfs::start
-  // for the lock (the deadlock macOS-DroidVM's build-native-ram-block.py describes). Seen on the tablet as "!BSD", both windows busy
+  // for the lock (the same deadlock NativeRamBlock's publishWhenBSDMatched avoids). Seen on the tablet as "!BSD", both windows busy
   // for 30 s and no root, whenever the windows came up before IOBSD (a slower display start or an accelerator shifted the timing).
   // The same match as IOKitBSDInit's "!BSD" wait: IOResources once its matching for the IOBSD resource has finished.
   if (OSDictionary *matching = IOService::serviceMatching ("IOResources")) {

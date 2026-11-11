@@ -288,7 +288,7 @@ OSDefineMetaClassAndStructors(NativeRamBlock, IOBlockStorageDevice)
 
 #include <kern/thread.h>
 extern "C" int native_ufs_store_ready(void);   // NativeUfs
-// UniXNU-piano (as macOS-DroidVM build-native-ram-block.py): publish once IOResources has matched IOBSD
+// UniXNU-piano (UPSTREAM): publish once IOResources has matched IOBSD
 static void publishWhenBSDMatched(void *argument, wait_result_t)
 {
   NativeRamBlock *ram = static_cast<NativeRamBlock *>(argument);

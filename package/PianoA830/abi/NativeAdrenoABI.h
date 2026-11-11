@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* PianoA830's user-client ABI as Turnip's darwin KMD includes it: point Mesa's -Dtu-darwin-abi-dir at this directory
  * (package/PianoA830/abi) to build Turnip for the native A830. It is Adreno830's NativeAdrenoABI.h v2, included unchanged (the kernel
- * side is built from that same file), plus the one name the Droid-VM darwin KMD (UniXNU-turnip patches/mesa/turnip-darwin-kmd.patch,
+ * side is built from that same file), plus the one name the VM-era darwin KMD (UniXNU-turnip patches/mesa/turnip-darwin-kmd.patch,
  * tu_knl_darwin.cc) uses that v2 does not have: NativeAdrenoParamsOwnedCoherent, a Params flag of the VM's v1 ABI (BOs IO-coherent for
  * the GPU, so map them write-back). PianoA830 never sets it: its BOs are write-combined for the CPU unless DeviceInfo.flags carries
  * NativeAdrenoDeviceCachedCoherent (S8's coherence self-test), which the KMD already reads.

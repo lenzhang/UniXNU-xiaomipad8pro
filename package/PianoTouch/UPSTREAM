@@ -1,7 +1,7 @@
 PianoTouch is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). What it takes from other work, and from where:
 
-NativeGeniSpi (droidvm-build/UniXNU drivers/NativeGeniSpi, b5399b5646c4d7415deec6d887fd51715a97a024; the UniXNU catalog's QcomGeniSpi
-lineage), BSD-2-Clause-Patent:
+NativeGeniSpi (UniXNU, github.com/Droid-VM/UniXNU, drivers/NativeGeniSpi, b5399b5646c4d7415deec6d887fd51715a97a024; the UniXNU
+catalog's QcomGeniSpi lineage), BSD-2-Clause-Patent:
   GeniSpi.c (sha256 2042cfc9647391e24d5a558202046425ac62a05adfc73afe769367b8374e3f91), GeniSpi.h (sha256
   e73891e4571c5323bca27aaf987bafa002856dfa1dcee156ff31b119e2d3ae3c) and Test/geni-spi.c as tests/geni_spi_host.c (sha256
   a5b8a9ab217590064fc8ce701ceee5f2dcfbc0b3f0b0d8907505bae25fb2c113): copied unchanged. The GENI SPI master (FIFO and SE DMA modes,
@@ -61,12 +61,12 @@ xiaomipad-8pro-mainline (main 4b853f8ae9770bc6fa9f9eec3bcc996e9bc86dbf), device/
 
 UniXNU-piano (this repository), BSD-2-Clause-Patent:
   package/PianoDwc3/SmmuStream.h: included as it is (-I package/PianoDwc3) for stream 0xa3's bypass context bank.
-  package/PianoKeyboard (PianoKeyboardHID, itself DroidVMInput's DroidVMHIDDevice from macOS-DroidVM overlay/kext/DroidVMInput,
+  package/PianoKeyboard (PianoKeyboardHID; provenance in package/PianoInput/UPSTREAM: macOS-DroidVM 11ac316 overlay/kext/DroidVMInput,
     sha256 f05d9d9912b1ae5b57000dcc49f6a4539410e5212c34b31aa4270e31cfac8afc): the IOHIDDevice subclass, its publication from start
     and the event-service notification, the codeless IOHIDEventDriver personality and the vtable check of
     tooling/k27/kext/PianoTouch.json; the TLMM pin handling (eGPIO claim, the rising-edge latch with the GIC delivery off), the step
-    and boot-argument layout. The tablet report's shape (absolute X/Y 0..32767 and buttons) is DroidVMInput's tablet mode, which
-    logged in by tap in the piano VM; TouchHid.h's descriptor is written from the HID 1.11 specification and the Usage Tables.
+    and boot-argument layout. The tablet report's shape (absolute X/Y 0..32767 and buttons) is the source HID class's tablet mode
+    (the same file); TouchHid.h's descriptor is written from the HID 1.11 specification and the Usage Tables.
 
 Facts only, no code (their licences do not allow reuse here):
   hackios-xnu-kernel-k90 (unixnu-research, k90-port 0e0f19bbba27da57c1845bc16d2415cd38046cab)
@@ -74,7 +74,8 @@ Facts only, no code (their licences do not allow reuse here):
     Redmi K90's touch on the same SE of the same SoC: vote bit 24 for wrap1 s2, its branch 0x1827c, divider 0x1828c, the QSPI
     reference RCG at 0x188c0 and its parents (Se2Bus.h).
   Linux spi-geni-qcom.c, qcom-geni-se.c, gcc-sm8750.c, nt36532e / nt36xxx (GPL-2.0): as quoted by the sources above; not read here.
-  droidvm-build/piano-patches/touch-native-plan.md: the hardware chain of piano's touch (DT, sizes, SIDs, payload 5192 for BOE).
+  the local bring-up notes (touch-native-plan.md, not published): the hardware chain of piano's touch (DT, sizes, SIDs, payload
+  5192 for BOE).
 
 The panel images (novatek_nt36532_piano_fw_boe.bin, sha256 b7999389d49decb14019e24ce68c6fbb0a388e26391b9b0ab913e285c5e44c6b;
 novatek_nt36532_piano_fw_csot.bin, sha256 14b30bb7799d273f6c5d967376694c2cbd3056f3939135ceda70ebec64abfa7a; 245,760 bytes each, the

@@ -410,7 +410,7 @@ bool vote(const Rail &r)
 }  // namespace
 
 // --------------------------------------------------------------------------------------------------------------- the HID devices
-// DroidVMInput's DroidVMHIDDevice (as package/PianoInput's PianoHIDDevice, UPSTREAM) with what a device says about itself taken from
+// package/PianoInput's PianoHIDDevice pattern (an IOHIDDevice subclass, UPSTREAM) with what a device says about itself taken from
 // HidDescriptors.h; setReport takes the keyboard's LED output report (Caps Lock goes to the MCU).
 class PianoKeyboardHID : public IOHIDDevice {
   OSDeclareDefaultStructors(PianoKeyboardHID)

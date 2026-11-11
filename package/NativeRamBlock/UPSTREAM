@@ -1,12 +1,12 @@
-Droid-VM/UniXNU 2e61915 (drivers/NativeRamBlock; the revision macOS-DroidVM's k27 builds use, local checkout droidvm-build/UniXNU),
-BSD-2-Clause-Patent (LICENSE). Vendored 2026-11-11 so the native build reads no driver source from the archive.
+UniXNU (github.com/Droid-VM/UniXNU) 2e61915, drivers/NativeRamBlock, BSD-2-Clause-Patent (LICENSE). Vendored 2026-11-11 so the
+native build reads no driver source from outside this repository.
 
 UniXNU-piano changes (NativeRamBlock.cpp), formerly applied at build time by tooling/k27/build-native-ram-block.sh:
-- publishWhenBSDMatched: as macOS-DroidVM scripts/build-native-ram-block.py, the disk is published from a thread once IOResources has
-  matched IOBSD (APFS deadlocks otherwise); then it waits for NativeUfs's root layout (native_ufs_store_ready), opens the store and
-  only then publishes the disk.
+- publishWhenBSDMatched (the change macOS-DroidVM's scripts/build-native-ram-block.py applied): the disk is published from a
+  thread once IOResources has matched IOBSD (APFS deadlocks otherwise); then it waits for NativeUfs's root layout
+  (native_ufs_store_ready), opens the store and only then publishes the disk.
 - The six native_ufs_store_* hooks are plain imports (the KC linker takes no weak imports): NativeUfs provides them (data-persist=2).
-  The VM's DroidVMDataStore.c (virtio data store) is not part of the native build.
+  The upstream virtio data store is not part of the native build.
 - attachStore logs "NativeRamBlock: Data store state ...".
 
 UniXNU-piano changes of 2026-11-11 (docs/data-store.md):

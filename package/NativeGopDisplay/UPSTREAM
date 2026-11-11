@@ -1,22 +1,22 @@
-macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM; local droidvm-build/macOS-DroidVM) 11ac316b789d81fc9f734e15645456f536c05141
+macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM) 11ac316b789d81fc9f734e15645456f536c05141
 (branch el1/native-variant; the file is as committed in a1e3f4e), BSD-2-Clause-Patent (SPDX header of the file):
 overlay/kext/DroidVMDisplay/DroidVMDisplay.cpp (sha256 2f89789f3d9d77c49307bd7bc535f379a94a57ae20440df177bec55ef0cd0b5d).
 Taken: stage 1 (the CPU copy of the swap's main IOSurface into the boot framebuffer, BGRA / RGhA / b3a8, on its own thread), the
 IOMobileFramebufferLegacy hooks as AppleParavirtDisplay implements them, the macOS 27.0.1 offsets, the display attributes, timing and
 colour elements, the power states and the swap info notifications.
-Removed: the virtio-gpu scanout (stage 2), the waits for the virtio GPU's 3D work, the AppleParavirtGPU nub class (the nub stays
-DroidVMDisplay's), ParavirtDisplayPrefs and the AppleParavirtDisplay registry name (DroidVMDisplay's kext, loaded for its nub, owns
-that name).
+Removed: the virtio-gpu scanout (stage 2), the waits for the virtio GPU's 3D work, ParavirtDisplayPrefs and the
+AppleParavirtDisplay registry name. The AppleParavirtGPU nub is this package's own (the end of NativeGopDisplay.cpp), so the source
+kext is not linked natively.
 Changed: class and registry name NativeGopDisplay; probe() gate (the ADT marker native-gop-display, boot-arg native-gop-display=0/1
 over it, never with /arm-io/virtio-gpu); piano defaults (239x163 mm, 60 Hz) and the ADT's panel-*/refresh-hz/framebuffer-* properties; integer dot pitch;
 "NativeGopDisplay: ..." logs at every init step; optional colour bars (native-gop-display-bars=1); product attributes.
 
-IOMobileFramebufferABI.h is not copied: tooling/k27/build-native-gop-display.sh generates it at build time with macOS-DroidVM's
+IOMobileFramebufferABI.h is not copied: tooling/k27/build-native-gop-display.sh generates it at build time with the k27 tree's
 scripts/gen-iomfb-abi.py from the collection the KC is built from (out/kc/kc27.bin, 27.0.1 26A434); the result is byte-identical to
 overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h at 11ac316 (sha256 78fd62697802cc576612f6367700bc1e0b9b861727c23c16932880839137d36b).
 
 Read, not copied: UniXNU GopFramebuffer d711e8c9de58825c9a758907cb15c409a804a537 (BSD-2-Clause-Patent). Its macOS display attributes
-already follow DroidVMDisplay (its README), and its macOS build binds IOMobileFramebufferLegacy through UniXNU's XnuPrelink ABI fixtures of
+are the same as the source file's (its README), and its macOS build binds IOMobileFramebufferLegacy through UniXNU's XnuPrelink ABI fixtures of
 the 27.3 (26C5035r) collection, not the 27.0.1 collection this KC uses. Its DPU direct-flip path (dpu-scanout=2) is the later step.
 
 UniXNU-piano (2026-11-11): the PianoDpu callouts (docs/drivers/dpu.md §4.3-4.5), new code, each off without its boot argument:

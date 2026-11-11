@@ -4,18 +4,16 @@
 // UEFI's SimpleFbDxe exposes as the GOP and DarwinBoot hands to XNU as the boot console (boot_args Video, PE_state.video). The DPU
 // pipeline ABL started keeps scanning that memory at the panel's refresh; this driver only writes it. No display register is touched.
 //
-// Derived from macOS-DroidVM's DroidVMDisplay (overlay/kext/DroidVMDisplay/DroidVMDisplay.cpp, see UPSTREAM): its stage 1, the CPU copy
-// of each swap's main IOSurface into the boot framebuffer, with the family hooks AppleParavirtDisplay (vma2) overrides. The virtio-gpu
-// scanout (stage 2) and the waits for the virtio GPU's 3D work are gone; the defaults are the panel's.
+// The CPU copy of each swap's main IOSurface into the boot framebuffer, with the family hooks AppleParavirtDisplay (vma2) overrides
+// (provenance: UPSTREAM). There is no virtio-gpu scanout and no wait for a virtual GPU's 3D work; the defaults are the panel's.
 //
-// Discovery is DroidVMDisplay's: IOMobileFramebuffer.framework (iomfb_populate_all_display_infos) counts the DisplayPortCount of the
-// AppleParavirtGPU services when an /arm-io node is compatible "paravirtualizedgraphics,gpu", and waits for that many framebuffers.
-// The native ADT has such a node (tooling/adt/make-piano-adt.py, configs/k27-gop-display.toml); this kext also provides the nub,
-// AppleParavirtGPU (end of this file), so DroidVMDisplay is not linked natively. In a collection that still has DroidVMDisplay this
-// class is a second candidate for the nub's display with a higher probe score. It takes the nub only on a node marked native-gop-display (that opt-in ADT's own node), not with boot-arg
-// native-gop-display=0, and not in the VM (no /arm-io/virtio-gpu). Otherwise DroidVMDisplay's own display (AppleParavirtDisplay)
-// starts on the nub, which on piano is its CPU copy into the same framebuffer. One display is published either way: WindowServer
-// never has two to choose from.
+// Discovery: IOMobileFramebuffer.framework (iomfb_populate_all_display_infos) counts the DisplayPortCount of the AppleParavirtGPU
+// services when an /arm-io node is compatible "paravirtualizedgraphics,gpu", and waits for that many framebuffers. The native ADT has
+// such a node (tooling/adt/make-piano-adt.py, configs/k27-gop-display.toml) and this kext provides the nub, AppleParavirtGPU (end of
+// this file), so no other display kext is linked natively. probe() takes the nub only on a node marked native-gop-display (that
+// opt-in ADT's own node), not with boot-arg native-gop-display=0, and not when an /arm-io/virtio-gpu exists (a virtual machine's
+// ADT, where another display driver owns the nub); the refusal strings below still name the VM-era display kext of that case. One
+// display is published either way: WindowServer never has two to choose from.
 //
 // Every step logs "NativeGopDisplay: ..." (IOLog), so the pstore console mailbox of a headless boot tells how far it got.
 #include "IOMobileFramebufferABI.h"
@@ -39,8 +37,7 @@
 
 extern "C" task_t kernel_task;
 
-// macOS 27.0.1's (26A434, the k27 collection's) offsets, as DroidVMDisplay has them (its notes give the AppleParavirtDisplay code each
-// was read from).
+// macOS 27.0.1's (26A434, the k27 collection's) offsets, each read from AppleParavirtDisplay's code (provenance: UPSTREAM).
 // IOMobileFramebufferLegacy (instance 0x1dd8)
 static constexpr size_t kCurrentSwap = 6720;       // the swap being programmed
 static constexpr size_t kSwapQueueFirst = 6728;    // TAILQ head of the pending swaps
@@ -307,7 +304,7 @@ static IOPMPowerState gPowerStates[2] = {   // AppleParavirtDisplay's gPowerStat
     {1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0},
 };
 
-// The ADT node under the nub (DroidVMDisplay's AppleParavirtGPU is the provider, its provider the /arm-io node).
+// The ADT node under the nub (the AppleParavirtGPU nub is the provider, its provider the /arm-io node).
 static IORegistryEntry *adtNode(IOService *provider)
 {
     return provider ? provider->getProvider() : nullptr;
@@ -324,8 +321,8 @@ static bool adtNumber(IORegistryEntry *node, const char *key, uint64_t *value)
 }
 
 // Whether this display takes the nub: the ADT node's native-gop-display marker (configs/k27-gop-display.toml, only in the ADT made with
-// make-piano-adt.py --gop-display) says yes, boot-arg native-gop-display overrides it (0: DroidVMDisplay's display instead, 1: take
-// it), and never in the VM.
+// make-piano-adt.py --gop-display) says yes, boot-arg native-gop-display overrides it (0: leave the nub to another display driver,
+// 1: take it), and never when an /arm-io/virtio-gpu exists.
 IOService *NativeGopDisplay::probe(IOService *provider, SInt32 *score)
 {
     IORegistryEntry *node = adtNode(provider);
@@ -717,7 +714,7 @@ IOReturn NativeGopDisplay::swap_begin_gated()
 // CoreAnimation asks swap_wait, without blocking, whether its last swaps are done before it composes the next frame. The family
 // answers kIOReturnBusy for the last completed swap as long as no later one replaces it (a display controller is still scanning it
 // out). Here the swap's surface was copied when it was programmed, so it is free: told it is busy, WindowServer updated at about 10
-// frames a second however little it drew (DroidVMDisplay's finding).
+// frames a second however little it drew (measured with the VM-era display kext).
 IOReturn NativeGopDisplay::swap_wait(IOMobileFramebufferUserClient *client, unsigned int swapID, unsigned int options, unsigned int timeout)
 {
     IOReturn result = IOMobileFramebufferLegacy::swap_wait(client, swapID, options, timeout);
@@ -1522,7 +1519,7 @@ bool NativeGopDisplay::createDisplayAttributes()
         if (!(appendNumber(scalingLimits, "RGBLayer_MinScaleFraction", 4) && appendNumber(scalingLimits, "RGBLayer_MaxScale", 4)))
             break;
         setProperty("IOMFBUUID", "4E474F50-4449-5350-0000-000000008750");
-        // As DroidVMDisplay publishes its display (external, display index 0); proven with macOS 27's WindowServer in the VM.
+        // External, display index 0: the attributes macOS 27's WindowServer accepted on the VM-era display (UPSTREAM).
         setProperty("external", true);
         setProperty("primary", 0ULL, 32);
         done = setProperty("DisplayAttributes", attributes) && setProperty("Transport", transport) &&
@@ -1708,9 +1705,9 @@ IOReturn NativeGopDisplay::do_swap_info_notify_gated(IOMFBNotifyRequest *request
 IOReturn NativeGopDisplay::notify_crc_ready_gated(unsigned int) {return kIOReturnSuccess;}
 bool NativeGopDisplay::are_timings_enabled() const {return false;}
 
-// UniXNU-piano (2026-11-11): the display's nub, here so the native collection needs no DroidVMDisplay. IOMobileFramebuffer.framework
+// UniXNU-piano (2026-11-11): the display's nub, here so the native collection needs no other display kext. IOMobileFramebuffer.framework
 // counts the DisplayPortCount of the AppleParavirtGPU services (it matches the class name) when an /arm-io node is compatible
-// "paravirtualizedgraphics,gpu" (make-piano-adt.py's /arm-io/gop-display). The same nub as DroidVMDisplay's.
+// "paravirtualizedgraphics,gpu" (make-piano-adt.py's /arm-io/gop-display). One display port, as the VM-era nub (UPSTREAM).
 class AppleParavirtGPU : public IOService {
     OSDeclareDefaultStructors(AppleParavirtGPU)
 public:

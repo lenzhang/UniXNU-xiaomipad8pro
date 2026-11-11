@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* The PCM transport under PianoAudio's macOS devices (PianoAudioDevice.cpp), in place of DroidVMAudio's virtio-snd: each device's
+/* The PCM transport under PianoAudio's macOS devices (PianoAudioDevice.cpp), in place of a virtio-snd transport: each device's
  * engine thread hands it one period at a time, interleaved S16 at 48 kHz (the speaker's stereo out, the microphone's mono in).
  *   null  (this file): takes every output period and gives no input, so the devices run on their own clock into silence (the HAL
  *         still has a default output; nothing reaches any hardware)

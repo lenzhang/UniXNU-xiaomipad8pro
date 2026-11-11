@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// The two HID devices PianoKeyboard publishes (piano-keyboard=2), one PianoKeyboardHID each, as DroidVMInput publishes one per kind:
+// The two HID devices PianoKeyboard publishes (piano-keyboard=2), one PianoKeyboardHID (one IOHIDDevice) per kind:
 //   keyboard  the cover's keyboard (report 5, sent as the controller sends it: modifiers, a reserved byte, six usages 0..0xff; the
 //             Num/Caps/Scroll/Compose/Kana LEDs as output report 5, of which Caps Lock goes to the controller) and its consumer keys
 //             (report 6: one 16-bit usage 0..0x3ff, the first three bytes of the controller's 5-byte report)
@@ -18,8 +18,8 @@
 
 namespace pianokeyboard {
 
-// Vendor 0x1AF4 is DroidVMInput's (whose IOHIDDevice class PianoKeyboardHID is) and PianoInput's; the product 'PK' is PianoKeyboard's
-// own, shared by both devices as DroidVMInput's devices share theirs. tooling/k27/kext/PianoKeyboard.json's codeless
+// Vendor 0x1AF4 is PianoInput's (that of the IOHIDDevice class PianoKeyboardHID shares with it, UPSTREAM); the product 'PK' is
+// PianoKeyboard's own, shared by both devices. tooling/k27/kext/PianoKeyboard.json's codeless
 // IOHIDEventDriver personality matches the pair.
 constexpr uint32_t kVendorId = 0x1af4, kProductId = 0x504b;
 

@@ -1,6 +1,6 @@
 --- !tapi-tbd
 # IOGPU.framework (private, not in the SDK): only what the Metal plugin links against. The exports are those of the macOS 27.0.1 cache.
-# As macOS-DroidVM's overlay/metal/frameworks/IOGPU.framework/IOGPU.tbd.
+# Unchanged from its source (package/NativeSoftMetal/UPSTREAM).
 tbd-version:     4
 targets:         [ arm64e-macos ]
 install-name:    '/System/Library/PrivateFrameworks/IOGPU.framework/Versions/A/IOGPU'

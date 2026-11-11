@@ -1368,8 +1368,8 @@ void pianonet::usbKick() { gWake.kick(); }
 
 // ---------------------------------------------------------------------------------------------- HID input (piano-usb-hid=1)
 // A keyboard (+ consumer keys) and a relative pointer for macOS, fed by the Mac's commands on port 2 (HidInput.h). The class is the
-// pattern PianoInput's PianoHIDDevice and PianoKeyboard's PianoKeyboardHID took from DroidVMInput (the IOHIDDevice subclass proven on
-// this kernel collection, vtable checked at link time); the report descriptors are PianoKeyboard's (HidDescriptors.h: kind 0 the
+// pattern of PianoInput's PianoHIDDevice and PianoKeyboard's PianoKeyboardHID (the IOHIDDevice subclass proven on this kernel
+// collection, vtable checked at link time; UPSTREAM); the report descriptors are PianoKeyboard's (HidDescriptors.h: kind 0 the
 // keyboard, 1 the pointer), so the reports are the cover's. Own product ID and names; nothing typed is ever logged, only counts.
 namespace {
 constexpr uint32_t kHidProductId = 0x5055;   // 'PU'; vendor 0x1AF4 as PianoInput/PianoKeyboard (tooling/k27/kext/PianoDwc3.json)

@@ -282,7 +282,7 @@ uint32_t smmuRead(uint32_t off) { return rd32(gSmmu.va + off); }
 }  // namespace
 
 // --------------------------------------------------------------------------------------------------------------- the HID device
-// DroidVMInput's DroidVMHIDDevice (as package/PianoInput's PianoHIDDevice and PianoKeyboard's PianoKeyboardHID, UPSTREAM) with the
+// The IOHIDDevice subclass of package/PianoInput's PianoHIDDevice and PianoKeyboard's PianoKeyboardHID (UPSTREAM) with the
 // tablet descriptor of TouchHid.h.
 class PianoTouchHID : public IOHIDDevice {
   OSDeclareDefaultStructors(PianoTouchHID)

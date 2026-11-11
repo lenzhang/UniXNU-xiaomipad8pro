@@ -94,12 +94,12 @@ BSD-2-Clause-Patent (sha256 5b1d3d911103cb0f41641ec0964c5ac1f7e229f57aa072b6ac38
   scripts/build-pagani-gpu.py (c63b3b5eb38d38476ab0781e68b85e8f9016ac24c66cd4f040073dd5583050a4)
     -> tooling/k27/stage-piano-gpu-firmware.py: pinned, page-aligned .incbin images, the pins header; sizes as literals.
 
-macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM; local droidvm-build/macOS-DroidVM, read only), 11ac316 (branch el1/native-variant),
+macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM) 11ac316 (branch el1/native-variant),
 BSD-2-Clause-Patent (SPDX headers): overlay/kext/DroidVMGpuKext.cpp (b312016ace4de3a69209626690234ca20ab3e25678b2a7ace1d1234b2109317b)
 and overlay/kext/DroidVMGpu.json (46b6274795be70cf55601616361b801edc8b58b7a9990104408e850e588ce7e7): the AGXAccelerator class (an
 IOAccelerator subclass carrying MetalPluginName/MetalPluginClassName, the logged property reads and opens) and its personality and
-vtable check, in board/PianoA830.cpp and tooling/k27/kext/PianoA830.json. Removed: DroidVMGpuStarter, the virtio-gpu hooks and the
-weak NativeAdreno 805c7e4 stubs. No DroidVM kext is linked (docs/PROJECT-MAP.md rule 8).
+vtable check, in board/PianoA830.cpp and tooling/k27/kext/PianoA830.json. Removed: the starter class, the virtio-gpu hooks and the
+weak NativeAdreno 805c7e4 stubs. The source kext is not linked (the native kext rule, docs/PROJECT-MAP.md rule 8).
 
 This repository's own, not from upstream: board/ (BSD-2-Clause-Patent, but for the derived files above), abi/NativeAdrenoABI.h (a
 wrapper that includes Adreno830's v2 header unchanged and adds the one v1 name Turnip's darwin KMD uses; MIT like the header it

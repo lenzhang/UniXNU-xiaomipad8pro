@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // The HID device PianoTouch publishes at piano-touch=2: the touch screen as a single-touch absolute pointer (a "tablet"), the shape
-// that logged in by tap in the piano VM (DroidVMInput's tablet mode, UPSTREAM): IOHIDFamily's IOHIDEventDriver turns its absolute
+// that logged in by tap on piano under the earlier VM-based port (UPSTREAM): IOHIDFamily's IOHIDEventDriver turns its absolute
 // X/Y into pointer positions on the display and its first button into clicks, so a tap clicks and a drag drags. Report (no report
 // ID, 5 bytes): buttons (bit 0 the tip), X and Y as LE16 in 0..32767 over the whole panel. Written from the HID 1.11 specification
 // and the HID Usage Tables (pages 0x01 and 0x09). Multi-touch (Apple's path frames to HSTouchHIDService) is not done here.

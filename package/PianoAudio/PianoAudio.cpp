@@ -286,8 +286,8 @@ void PianoAudio::devicesThread(void *self, wait_result_t)
   static_cast<PianoAudio *>(self)->devices();
 }
 
-// Level 3: the macOS devices once IOBSD is up (DroidVMAudio's starter matched IOResources' IOBSD for the same reason: the family's
-// kext load and the HAL's matching come after it).
+// Level 3: the macOS devices once IOBSD is up (the family's kext load and the HAL's matching come after it; the VM-era audio kext's
+// starter matched IOResources' IOBSD for the same reason, UPSTREAM).
 void PianoAudio::devices()
 {
   OSDictionary *bsd = IOService::resourceMatching("IOBSD");

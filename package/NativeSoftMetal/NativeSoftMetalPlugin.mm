@@ -51,8 +51,8 @@
 // minute; and Core Animation's CAEnableDeepFramebuffer preference is set false for the process. Every debug option that is on is listed
 // once (the survey), so a run shows what else Core Animation was told.
 //
-// The IOGPU registration answers (_setAcceleratorService:, _setDeviceWrapper:, _deviceWrapper, the stub survey) follow macOS-DroidVM's
-// overlay/metal/NativeAdrenoMetalPlugin.mm (package/NativeSoftMetal/UPSTREAM).
+// The IOGPU registration answers (_setAcceleratorService:, _setDeviceWrapper:, _deviceWrapper, the stub survey) follow the VM-era
+// Metal plugin (provenance: package/NativeSoftMetal/UPSTREAM).
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <IOKit/IOKitLib.h>

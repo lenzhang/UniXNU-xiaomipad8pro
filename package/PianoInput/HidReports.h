@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// The HID devices PianoInput publishes, one PianoHIDDevice each (as DroidVMInput publishes one IOHIDDevice per input kind):
+// The HID devices PianoInput publishes, one PianoHIDDevice (one IOHIDDevice) per input kind:
 //   buttons  a Consumer Control: Power (0x30), Volume Increment (0xE9), Volume Decrement (0xEA), one bit each, no report ID.
 //            A consumer-only device: IOHIDEventDriver posts the keys and Keyboard Setup Assistant has nothing to ask about.
 //   touch    (later: NT36532E over GENI SPI) a second device of its own, Digitizer/Touch Screen as its primary usage, Built-In and
-//            displayUUID set, as DroidVMInput's digitizer; its descriptor and reports go next to the buttons' here.
+//            displayUUID set, as the VM-era HID class's digitizer (UPSTREAM); its descriptor and reports go next to the buttons' here.
 // Descriptor written for piano from the HID 1.11 specification and the HID Usage Tables (consumer page 0x0C).
 #ifndef PIANO_INPUT_HID_REPORTS_H
 #define PIANO_INPUT_HID_REPORTS_H
@@ -13,7 +13,7 @@ namespace pianoinput {
 
 enum class Kind : uint8_t { buttons };
 
-// Vendor 6900 (0x1AF4) is DroidVMInput's, whose class this is; the product IDs are PianoInput's own ('PB'; 'PT' for touch).
+// Vendor 6900 (0x1AF4) is the source HID class's (UPSTREAM); the product IDs are PianoInput's own ('PB'; 'PT' for touch).
 // tooling/k27/kext/PianoInput.json's codeless IOHIDEventDriver personality matches the buttons' pair.
 constexpr uint32_t kVendorId = 0x1af4, kProductButtons = 0x5042, kProductTouch = 0x5054;
 

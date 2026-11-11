@@ -28,8 +28,8 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent, for the HID input (piano-us
   package/PianoKeyboard/HidDescriptors.h and Wn8030Piano.h: included as they are (build -I package/PianoKeyboard), not copied: the
   keyboard (+ consumer) and pointer report descriptors the PianoUsbHID devices declare, and the report sizes/IDs HidInput.h's reports
   are checked against (tests/hid_input_host.cpp, static_asserts and a descriptor walk).
-  package/PianoInput/PianoInput.cpp, package/PianoKeyboard/PianoKeyboard.cpp: the IOHIDDevice subclass pattern (DroidVMInput's
-  DroidVMHIDDevice, see their UPSTREAM): the same overrides, OSTypeAlloc/init/Built-In/attach/start under the driver's service from
+  package/PianoInput/PianoInput.cpp, package/PianoKeyboard/PianoKeyboard.cpp: the IOHIDDevice subclass pattern (provenance: their
+  UPSTREAM): the same overrides, OSTypeAlloc/init/Built-In/attach/start under the driver's service from
   start(), handleReport from a kernel thread, the IOHIDEventService publish notification, the codeless IOHIDEventDriver personality
   and the 334-slot vtable check in the kext descriptor. Re-written for PianoUsbHID (own product ID 0x5055 and names).
 
@@ -41,7 +41,7 @@ The network function (piano-usb-net=1):
   TxFifoPlan.h: the DWC3 TX FIFO rules (GTXFIFOSIZn layout, k packets = k * (MaxPacket/word + 1) + 1 words, RAM1 / single-port RAM0
   depth, MDWIDTH) from the controller's programming model as mainline Linux drivers/usb/dwc3 (core.h, gadget.c TX FIFO resizing)
   describes it: specification only, as above. The numbers are piano's, from the T1 probe.
-  PianoUsbNet.cpp: this repository's package/PianoNullEthernet (DroidVMEthernet's IOEthernetController pattern, see its UPSTREAM):
+  PianoUsbNet.cpp: this repository's package/PianoNullEthernet (its IOEthernetController pattern; provenance: its UPSTREAM):
   the same overrides and __PRIVATE_SPI__ include, no output queue with outputPacket under a lock, inputPacket from one thread
-  (DroidVMEthernet's receive loop), the 400-slot vtable check. Re-written: not built-in, link from the USB side, own work loop,
+  (the source's receive loop), the 400-slot vtable check. Re-written: not built-in, link from the USB side, own work loop,
   own MAC.

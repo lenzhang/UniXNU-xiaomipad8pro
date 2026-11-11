@@ -4,7 +4,7 @@
 // IOHIDFamily's IOHIDEventDriver turns into Power / Volume Increment / Volume Decrement key events. The touch screen (NT36532E
 // over GENI SPI) is to be the second source, a digitizer PianoHIDDevice of its own.
 //
-// The HID class is DroidVMInput's DroidVMHIDDevice (macOS-DroidVM, UPSTREAM): the only IOHIDDevice subclass proven on this macOS
+// The HID class (provenance: UPSTREAM) is the only IOHIDDevice subclass proven on this macOS
 // 27.0.1 kernel collection (its 334-slot vtable checked at KC link time); the same overrides, without virtio. No interrupts:
 // a kernel thread polls, read only (no PMIC register is written, no interrupt configured): every 10 ms while a key is down or
 // changing and for a second after, every piano-input-idle ms otherwise (docs/power-irq.md; the PMIC arbiter's interrupt path is
@@ -130,7 +130,7 @@ const char *resultName(ReadResult r) { return r == ReadResult::ok ? "ok" : r == 
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------ the HID device
-// DroidVMInput's DroidVMHIDDevice (UPSTREAM) with what a device says about itself taken from HidReports.h's DeviceInfo.
+// An IOHIDDevice subclass (UPSTREAM) with what a device says about itself taken from HidReports.h's DeviceInfo.
 class PianoHIDDevice : public IOHIDDevice {
   OSDeclareDefaultStructors(PianoHIDDevice)
 
@@ -308,7 +308,7 @@ bool PianoInput::probeKeys()
   return true;
 }
 
-// Stage 4: the buttons' IOHIDDevice under this service, as DroidVMInput attaches and starts its devices.
+// Stage 4: the buttons' IOHIDDevice under this service: OSTypeAlloc, init, attach, start (UPSTREAM).
 bool PianoInput::publishButtons()
 {
   stage(4, "HID device: Consumer Control (Power, Volume Increment, Volume Decrement)");

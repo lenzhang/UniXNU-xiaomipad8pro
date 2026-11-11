@@ -10,7 +10,7 @@ client of it (`package/include/PianoAdspContract.h`) and never starts, stops or 
   page only). Every MMIO access is a load.
 - `piano-audio=2` (with `piano-power=2`): the DSP link: `adsp_apps` registered, PianoPower's health watched (off for the boot at the
   first sign of trouble), one `APM_CMD_GET_SPF_STATE`; nothing else is sent.
-- `piano-audio=3`: also the macOS devices "Speaker" and "Mic" (IOAudio2Devices, DroidVMAudio's shape) on the null transport: their
+- `piano-audio=3`: also the macOS devices "Speaker" and "Mic" (IOAudio2Devices, the VM-era audio kext's shape) on the null transport: their
   own clock, silence both ways, nothing reaches the hardware.
 
 Host-tested, not run by any level yet: the FS19xx core, piano's AudioReach graphs with the one-command-at-a-time sequencer and its
@@ -28,7 +28,7 @@ reverse unwind, the period pump, the speaker-safety chain. Design, hardware fact
 | `Fs19xx.{h,c}` | the amplifiers: registers, probe, the `fs19xx.fsm` container (read at run time, never committed), the safety filter, the power sequences, status |
 | `AudioSha256.{h,c}` | the stock preset's published size and digest |
 | `AudioSafety.{h,c}` | the output chain (slots, DC blocker, gain <= 0 dB, fades, ceiling <= -1 dBFS), the test tone, the stream guard, the PCM ring |
-| `AudioPcm.{h,c}`, `PianoAudioDevice.cpp` | the PCM transport interface and the null transport; the IOAudio2Device classes (from DroidVMAudio) |
+| `AudioPcm.{h,c}`, `PianoAudioDevice.cpp` | the PCM transport interface and the null transport; the IOAudio2Device classes (provenance: `UPSTREAM`) |
 | `tests/` | `audio_host.cpp`, `gpr_host.c`, `audioreach_host.c`, `sequence_host.c`, `fs19xx_host.c`, `pcm_host.c`, `dsplink_host.c` |
 
 Build: `tooling/k27/build-native-piano-audio.sh` (all host tests, the objects, the import check, `check-audio2-family.py`).

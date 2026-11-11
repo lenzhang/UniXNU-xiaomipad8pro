@@ -11,7 +11,7 @@
 //
 // The personality matches IOResources in its own match category, so nothing else on IOResources is held up. Boot argument
 // native-soft-gpu=0 leaves the accelerator out (WindowServer's behaviour is then as without this kext). Progress goes to the kernel log.
-// Derived from macOS-DroidVM's overlay/kext/DroidVMGpuKext.cpp (AGXAccelerator), without NativeAdreno (package/NativeSoftGpu/UPSTREAM).
+// An IOAccelerator subclass without a GPU behind it (provenance: package/NativeSoftGpu/UPSTREAM).
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>

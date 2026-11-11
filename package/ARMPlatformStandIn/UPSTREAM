@@ -1,4 +1,4 @@
-ARMPlatformStandIn.cpp: macOS-DroidVM (local archive droidvm-build/macOS-DroidVM, branch el1/native-variant 11ac316)
+ARMPlatformStandIn.cpp: macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM) 11ac316 (branch el1/native-variant),
 overlay/kext/ARMPlatformStandIn.cpp, unchanged (BSD-2-Clause-Patent, UniXNU-droidvm contributors). Natively it is still needed: the
 vma2 collection's IOMobileGraphicsFamily (NativeGopDisplay's family) and the kexts it needs link against AppleARMPlatform's classes.
 UsbCableKeys.cpp: UniXNU-piano's own (BSD-2-Clause-Patent), compiled in only with PIANO_USBHOST_STACK=1 (tooling/k27/build-native-standin.sh):

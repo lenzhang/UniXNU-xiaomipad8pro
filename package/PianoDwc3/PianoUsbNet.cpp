@@ -6,7 +6,7 @@
 // Not built-in, and not the primary interface: PianoNullEthernet stays the built-in en0 whose MAC TimeSync takes at boot (with or
 // without a cable); configd names this one (en1, or the next free unit). MAC 02:50:49:41:4e:02, fixed (UsbDescriptors.h).
 //
-// The controller pattern is PianoNullEthernet's (DroidVMEthernet's, see UPSTREAM): no output queue, outputPacket under a lock from
+// The controller pattern is PianoNullEthernet's (see UPSTREAM): no output queue, outputPacket under a lock from
 // the stack's threads, inputPacket from one thread only, the same overrides plus the link from the USB side and an own work loop.
 // The data path: outputPacket copies the frame into a queue the USB thread empties into the NTB IN buffer; the USB thread puts the
 // datagrams of each NTB OUT into the other queue, this file's thread turns them into mbufs. Only counts are logged.

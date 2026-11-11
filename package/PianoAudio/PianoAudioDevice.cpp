@@ -3,9 +3,9 @@
 // piano's speaker and microphone as the built-in audio devices macOS's HAL takes: IOAudio2Devices (HALS_IOA2Manager in audiomxd /
 // coreaudiod matches IOServiceMatching("IOAudio2Device") + IOObjectConformsTo), opened through an IOAudio2DeviceUserClient.
 // Everything above is stock: the HAL's HALS_IOA2Device/Engine, VirtualAudio (routes, ports, volume).
-// UniXNU-droidvm's DroidVMAudio.cpp (UPSTREAM: e29d087 with macOS-DroidVM's four patches, the version that ran on this macOS 27 in
-// the VM and, before the no-DroidVM rule, natively), its virtio-snd transport replaced by AudioPcm.h's interface: the null transport
-// now (the devices run on their own clock into silence), the DSP's from level 7. The ABI notes below are DroidVMAudio's.
+// The IOAudio2Device top half of the VM-era audio kext (provenance: UPSTREAM), its virtio-snd transport replaced by AudioPcm.h's
+// interface: the null transport now (the devices run on their own clock into silence), the DSP's from level 7. The ABI notes below
+// come with it.
 //
 // VirtualAudio's DeviceFactory picks the physical-device class by the device UID string, with a single-transducer class per kind. Two
 // devices: UID "Speaker" (a routable speaker output port) and UID "Mic" (a routable built-in-mic input port); the default VirtualAudio
@@ -17,7 +17,7 @@
 // which is what IOService matching and IOObjectConformsTo test. No family code runs on these objects. The family's classes derive
 // directly from IOService and IOUserClient (checked in the KC base by tooling/k27/check-audio2-family.py), the C++ bases used here.
 //
-// The ABI, read off 21H461's AudioServerDriverTransports_IOA2 (ASDT::IOA2UserClient) and CoreAudio (HALS_IOA2UCDevice) for DroidVMAudio:
+// The ABI, as the source read it off 21H461's AudioServerDriverTransports_IOA2 (ASDT::IOA2UserClient) and CoreAudio (HALS_IOA2UCDevice):
 //   registry   the description, as dictionary keys with spaces ("device UID", "output streams"/"input streams", ...); sample rates
 //              are Fixed64 (32.32) SInt64 numbers
 //   open       IOServiceOpen type 0; IOConnectSetNotificationPort type 0 (IOAudio2Notification)
@@ -54,7 +54,7 @@ volatile int piano_audio_dev_family_status = -1, piano_audio_dev_hog_owner = -1,
 namespace {
 enum : uint32_t {
     // The ring a whole number of periods (32, 160 ms): the engine moves a period at a time and never splits one at the wrap
-    // (DroidVMAudio's 8192-frame ring let the period at 7952..8191 run 832 bytes past the end).
+    // (the source's 8192-frame ring let the period at 7952..8191 run 832 bytes past the end).
     Rate = 48000, RingFrames = 32 * 240, PeriodFrames = 240,   // 5 ms
     OutputChannels = 2, InputChannels = 1, StreamID = 1,
     SafetyOffset = 2 * PeriodFrames, Latency = PeriodFrames,

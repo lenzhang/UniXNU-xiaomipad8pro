@@ -89,13 +89,13 @@ The DSP link (AudioDspLink.{h,c}, AudioDsp.cpp, tests/dsplink_host.c): new code 
   (package/include/PianoAdspContract.h, this repository); the guard follows package/PianoSensors/SensorsGuard.h (sha256
   d7e0fe6ea49a9ba4f310910b92c550492e427a86aaea8baccf5d39e281e955d6) in design, not in code. The readiness query is PianoGpr.c's.
 
-The macOS devices (PianoAudioDevice.cpp, AudioPcm.{h,c}): UniXNU-droidvm (Droid-VM/UniXNU-droidvm wip/hackintosh e29d087),
+The macOS devices (PianoAudioDevice.cpp, AudioPcm.{h,c}): UniXNU-droidvm (github.com/Droid-VM/UniXNU-droidvm, wip/hackintosh) e29d087,
   BSD-2-Clause-Patent, package/DroidVMAudio.cpp as macOS-DroidVM's k27/build-native-audio.sh exports it with its four
   patches/droidvm-audio (no staged module load for a native kext, output lead, host latency, the ring a whole number of periods):
   out/k27/src/DroidVMAudio/DroidVMAudio.cpp sha256 5ff26725120c96b9a400bda12e022b8b921886c856f50027f9139a4fcdd60fae. Kept: the two
   IOService / IOUserClient classes, the registry description, the status page and ring memory types, the selectors, hog mode, the
   per-device period engine, the metaclass link under IOAudio2Family's classes, the publishing on IOResources nubs. Changed: the
-  class, nub and counter names (no DroidVM name may load natively: tooling/k27/check-native-kexts.py), the virtio-snd transport
+  class, nub and counter names (the native kext rule refuses the source's names: tooling/k27/check-native-kexts.py), the virtio-snd transport
   (DroidVMVirtioSnd.c, not taken) replaced by AudioPcm.h's interface with a null transport, the VM-only latencies (the virtio
   prefill and Android's mixer) replaced by the transport's own, a failed engine thread start stops the transport again.
   overlay/kext/DroidVMAudio/DroidVMAudioStarter.cpp (sha256 9211cc8dd4ae163445e9ab3a8540e8c2a03c8fa7a307afcc1cdaa936759f8330): the

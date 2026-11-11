@@ -1,4 +1,4 @@
-macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM; local droidvm-build/macOS-DroidVM) 11ac316b789d81fc9f734e15645456f536c05141
+macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM) 11ac316b789d81fc9f734e15645456f536c05141
 (branch el1/native-variant), BSD-2-Clause-Patent (SPDX header of the file): overlay/metal/NativeAdrenoMetalPlugin.mm.
 Taken: the plugin entry (an IOGPUMetalDevice subclass whose -initWithAcceleratorPort: returns another object, the original kept), the IOGPU
 registration answers (_setAcceleratorService:, _setDeviceWrapper:, _deviceWrapper, isBuiltIn), the housekeeping no-ops, the stub survey
@@ -7,4 +7,4 @@ UniXNU-turnip's NativeBridgeMetalFrontend.mm native_bridge_metal_open makes it),
 Removed: the frontend, the bridge, metal2vulkan and Turnip; the per-process environment; the CA pacing hooks.
 Changed: the device does no GPU work. acceleratorPort 0 and nil from every command queue, buffer, texture and library maker (the survey
 names each once); a device only in WindowServer unless soft-metal-all=1; soft-metal=0 for none.
-frameworks/IOGPU.framework/IOGPU.tbd is macOS-DroidVM's overlay/metal/frameworks/IOGPU.framework/IOGPU.tbd (the link stub).
+frameworks/IOGPU.framework/IOGPU.tbd: the same commit's overlay/metal/frameworks/IOGPU.framework/IOGPU.tbd (the link stub), unchanged.

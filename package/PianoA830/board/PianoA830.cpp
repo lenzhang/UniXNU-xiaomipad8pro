@@ -9,8 +9,8 @@
 //  - AGXAccelerator: the macOS accelerator, an ordinary IOAccelerator subclass of IOGraphicsFamily. Its personality matches the
 //    NativeAdrenoGpuPublished service the driver's S9 registers (only after S0..S8 passed) and carries MetalPluginName
 //    NativeAdrenoMetal / MetalPluginClassName NativeAdrenoMetalDevice, the VM's plugin contract; opens go to the driver's
-//    AGXDeviceUserClient (NativeAdrenoABI.h v2, open type 0x4147). Taken from macOS-DroidVM overlay/kext/DroidVMGpuKext.cpp (11ac316,
-//    BSD-2-Clause-Patent) without its DroidVMGpuStarter and the virtio-gpu paths.
+//    AGXDeviceUserClient (NativeAdrenoABI.h v2, open type 0x4147). Without a starter class or virtio-gpu paths (provenance:
+//    ../UPSTREAM).
 //  - The BootProgress hooks the driver calls (strong definitions; tooling/k27/coalesce-weak.py drops the driver's weak defaults):
 //    status rows and stage results, the bring-up register trace (piano-gpu-trace) as "PianoA830: t ..." lines, all through a line
 //    ring that a logger thread prints (the hooks run with interrupts off; see the ring below).

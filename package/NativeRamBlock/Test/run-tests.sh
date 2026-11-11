@@ -2,7 +2,7 @@
 # Host tests of NativeRamBlock's disk and store code (no tablet, no kernel): build each test with the host compiler and run it.
 #   package/NativeRamBlock/Test/run-tests.sh [SEED.img]   SEED: also print SeedDisk.h's identity of a packed seed (seed-identity.cpp),
 #                                                          to compare with tooling/persist/common.py seed_info
-# From upstream (Droid-VM/UniXNU drivers/NativeRamBlock/Test): sparse, persist (adapted to the store guard), direct, seeddisk,
+# From upstream (UniXNU drivers/NativeRamBlock/Test, see ../UPSTREAM): sparse, persist (adapted to the store guard), direct, seeddisk,
 # seed-identity. UniXNU-piano: guard (the store guard, replace, flatten with power cuts, self-contained stores, header compatibility),
 # volatile (VolatileDisk.h). Binaries go to a temporary directory.
 set -euo pipefail

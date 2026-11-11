@@ -8,8 +8,7 @@
 // the display; without it they hang). IOTimeSyncClockManager looks once, at its start: the descriptor (tooling/k27/kext/
 // PianoNullEthernet.json) gates IOTimeSyncRootService on the resource published here, once the interface is matched.
 //
-// Derived from macOS-DroidVM's DroidVMEthernet (overlay/kext/DroidVMEthernet.cpp at 0855e2a, BSD-2-Clause-Patent): its controller
-// without the virtio-net transport (see UPSTREAM).
+// The controller of the VM-era Ethernet kext without its virtio-net transport (provenance: UPSTREAM).
 #include <IOKit/IOLib.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-anon-enum-enum-conversion"   // the family's headers mix anonymous enums
@@ -38,7 +37,7 @@ public:
     IOReturn enable(IONetworkInterface *) override { return kIOReturnSuccess; }
     IOReturn disable(IONetworkInterface *) override { return kIOReturnSuccess; }
     // IOBSD is up (our IOResourceMatch), and the family's wait for it from start() needs IOResources matched, which it is not while
-    // IOResources' own matching starts us: a deadlock whenever IOBSD is published inside IOResources' first match (DroidVMEthernet).
+    // IOResources' own matching starts us: a deadlock whenever IOBSD is published inside IOResources' first match (seen in the source).
     UInt32 getFeatures() const override { return kIONetworkFeatureNoBSDWait; }
     UInt32 outputPacket(mbuf_t packet, void *) override { ++fTxDrops; freePacket(packet); return kIOReturnOutputDropped; }
     IOReturn setPromiscuousMode(bool) override { return kIOReturnSuccess; }

@@ -1,8 +1,8 @@
 PianoInput is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE) around one vendored class. What it takes from other work,
 and from where:
 
-macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM; local archive droidvm-build/macOS-DroidVM, branch el1/native-variant
-11ac316b789d81fc9f734e15645456f536c05141, read only), BSD-2-Clause-Patent (SPDX header of the file):
+macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM) 11ac316b789d81fc9f734e15645456f536c05141 (branch el1/native-variant),
+BSD-2-Clause-Patent (SPDX header of the file):
   overlay/kext/DroidVMInput/DroidVMInput.cpp (sha256 f05d9d9912b1ae5b57000dcc49f6a4539410e5212c34b31aa4270e31cfac8afc)
     Taken: the class DroidVMHIDDevice as PianoHIDDevice (PianoInput.cpp): an IOHIDDevice subclass with the same overrides
     (newReportDescriptor, newTransportString, newManufacturerString, newProductString, newVendorIDNumber, newProductIDNumber,
@@ -20,7 +20,7 @@ macOS-DroidVM (github.com/Droid-VM/macOS-DroidVM; local archive droidvm-build/ma
     personality on IOHIDInterface (probe score 3000; PianoInput's own VendorID/ProductID pair), and the vtable check (IOHIDDevice,
     334 slots, slot 16 ignored).
   The IOKit/hid headers are not copied: tooling/k27/build-native-piano-input.sh includes the k27 tree's out/x12377/inc-hid (the
-  headers DroidVMInput was built with), out/x12377/inc-gfx and out/x12377/storage-abi/include (TargetConditionals.h), read only.
+  headers the source class was built with), out/x12377/inc-gfx and out/x12377/storage-abi/include (TargetConditionals.h), read only.
 
 UniXNU-piano (this repository), BSD-2-Clause-Patent:
   package/PianoDwc3/PianoDwc3.cpp at 7860af438e035b3a5035b243b84132bb9854a59c: the SPMI arbiter v7 reads (spmiApid, spmiRead:
@@ -41,5 +41,5 @@ Re-implemented in Buttons.h and HidReports.h; its key polarities are the 13T's, 
 
 Not read and not used: GPL code. piano-uefi selector/keys.c and Project-SunUEFI PianoKeys.c (GPL-2.0-only), and Linux's PON,
 pwrkey and SPMI arbiter drivers (GPL-2.0). The register facts come from the BSD sources above and from
-droidvm-build/piano-patches/touch-native-plan.md section 3; the report descriptor from the HID 1.11 specification and the HID
+the local bring-up notes (touch-native-plan.md section 3, not published); the report descriptor from the HID 1.11 specification and the HID
 Usage Tables (consumer page 0x0C).

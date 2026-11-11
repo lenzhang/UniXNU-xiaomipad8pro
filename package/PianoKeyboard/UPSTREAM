@@ -22,7 +22,7 @@ Project-SunUEFI (unixnu-research/Project-SunUEFI, main 4ef87402e9d58465af871e4c4
     2 ms, boot ROM 500 ms, wake 50 ms, 3 ms after every boot ROM write), runtime register 0x4c. Not verified on hardware there.
 
 UniXNU-piano (this repository), BSD-2-Clause-Patent:
-  package/PianoInput (PianoHIDDevice, itself DroidVMInput's DroidVMHIDDevice from macOS-DroidVM overlay/kext/DroidVMInput,
+  package/PianoInput (PianoHIDDevice; provenance in its UPSTREAM: macOS-DroidVM 11ac316 overlay/kext/DroidVMInput/DroidVMInput.cpp,
     sha256 f05d9d9912b1ae5b57000dcc49f6a4539410e5212c34b31aa4270e31cfac8afc): the IOHIDDevice subclass and how it is published
     (OSTypeAlloc, init, attach, start under the service), the event-service notification, the codeless IOHIDEventDriver personality
     and the vtable check of tooling/k27/kext/PianoKeyboard.json. Same overrides plus setReport (the LED output report).

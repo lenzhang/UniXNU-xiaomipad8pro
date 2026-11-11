@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// piano's three physical keys, read from the PMICs (droidvm-build/piano-patches/touch-native-plan.md section 3; the same registers
+// piano's three physical keys, read from the PMICs (the local bring-up notes, touch-native-plan.md section 3; the same registers
 // as piano-uefi's KeypadDeviceLib, on which the UniXNU menu runs at EL1 on this tablet):
 //   power  PMK8550 PON, SID 0 base 0x1300 (PPID 0x013), INT_RT_STS 0x10 bit 7 (KPDPWR), active high
 //   vol-   the same register, bit 6 (RESIN), active high
