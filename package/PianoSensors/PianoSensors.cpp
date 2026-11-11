@@ -500,6 +500,7 @@ bool PianoSensors::start(IOService *provider)
        gArgs.delay, gArgs.settle, gArgs.bank, gArgs.smmu, (unsigned long long)gArgs.rpcPa, gArgs.nopack, gArgs.channel, gArgs.log);
   note("a client of PianoPower's DSP (PianoAdspContract.h): it never starts, stops or restarts the DSP");
   setProperty("piano-sensors", gArgs.level, 32);
+  registerService();   // consumers (PianoBacklight's automatic mode, piano-rotated) find the service by matching
   gGuardLock = IOLockAlloc();
   gCore = static_cast<SsrCore *>(IOMallocZeroData(sizeof(SsrCore)));
   gRing = static_cast<Ring *>(IOMallocZeroData(sizeof(Ring)));
