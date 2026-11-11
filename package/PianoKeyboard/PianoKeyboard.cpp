@@ -16,7 +16,8 @@
 //   5 firmware   the image's header (state 1), its 101 data blocks (3 ms after each write), verify (state 3), boot
 //   6 serving    gpio97's rising edges latched in TLMM (no GIC interrupt: polled every piano-keyboard-poll ms), each frame read
 //                from register 0x4c and split into reports; attach messages answered as Linux does (keyboard power, Caps LED,
-//                touchpad on), the keyboard power repeated every 12 s while attached
+//                touchpad on, mic LED, backlight: Wn8030Piano.h attachCommands), the keyboard power repeated every 12 s while
+//                attached
 // The I2C bus is driven in software (BitI2c.h); the QUP engine is not touched.
 //
 // Boot arguments (default: inert, the service does not even probe):
@@ -34,6 +35,7 @@
 //   piano-keyboard-raw=0        level 1 without the raw dump of every frame that is not an accelerometer sample
 //   piano-keyboard-tap=0        no tap-to-click        piano-keyboard-invert=B  bit 0 X, bit 1 Y        piano-keyboard-divide=D (2)
 //   piano-keyboard-mouse=0      ignore the MCU's own mouse reports (ID 2; used only while no touchpad report has been seen)
+//   piano-keyboard-fnrow=1      Right Ctrl + 1..0 - = are F1..F12 (Wn8030Piano.h Keys; default 0: keys as the cover sends them)
 // Not done: the hall sensors (keys still pass with the cover folded back), the authentication token, the backlight/mic LED beyond
 // the boot arguments, suspend.
 #include <IOKit/IOService.h>
@@ -67,7 +69,7 @@ extern const uint64_t piano_keyboard_firmware_size;
 namespace {
 
 struct Args {
-  uint32_t level, stop, trace, halfUs, pollMs, rails, touchpad, backlight, tap, invert, divide, mouse, auth, raw;
+  uint32_t level, stop, trace, halfUs, pollMs, rails, touchpad, backlight, tap, invert, divide, mouse, auth, raw, fnrow;
 };
 Args gArgs;
 
@@ -95,6 +97,7 @@ void readArgs()
   gArgs.mouse = bootArg("piano-keyboard-mouse", 1);
   gArgs.auth = bootArg("piano-keyboard-auth", 0);
   gArgs.raw = bootArg("piano-keyboard-raw", 1);
+  gArgs.fnrow = bootArg("piano-keyboard-fnrow", 0);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -401,6 +404,7 @@ class PianoKeyboard : public IOService {
   IONotifier *fPublished = nullptr;
   BitI2c fBus;
   Pointer fPointer;
+  Keys fKeyFilter;
   uint8_t fFrame[kFrameBytes];
   uint8_t fWire[kDataWire];
   // serving state (the thread's own)
@@ -409,6 +413,7 @@ class PianoKeyboard : public IOService {
   uint32_t fReads = 0, fFrames = 0, fEmpty = 0, fReadErrors = 0, fBadFrames = 0, fEdges = 0, fCommands = 0, fCommandErrors = 0;
   uint32_t fKeys = 0, fConsumer = 0, fTouch = 0, fMouse = 0, fVendor = 0, fAccel = 0, fAuth = 0, fAttaches = 0, fSent = 0, fSendErrors = 0;
   uint32_t fConsecutiveErrors = 0, fRawLogged = 0, fEmptyLogged = 0, fLevelReads = 0, fIrqHigh = 0, fPolls = 0;
+  uint32_t fAcks = 0, fStates = 0, fPointerSent = 0, fSumBad = 0;
   bool fIrqWasLow = false;
   // the LED request from IOHIDFamily's side
   volatile uint32_t fLedRequests = 0, fLedWanted = 0;
@@ -431,8 +436,8 @@ class PianoKeyboard : public IOService {
   void dispatch(const Report &r);
   void coverAttached(bool on, const char *why);
   bool sendCommand(uint8_t cmd, uint8_t value, const char *what);
-  void authAnswer(Vendor v, const Report &r);
-  void send(Kind kind, const uint8_t *bytes, unsigned length);
+  void authAnswer(const Report &r);
+  IOReturn send(Kind kind, const uint8_t *bytes, unsigned length);
   void releaseAll();
   void describe(uint64_t seconds);
   bool romWrite(uint8_t value);
@@ -456,9 +461,9 @@ bool PianoKeyboard::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
   note("start: piano-keyboard=%u (%s), stop %u, I2C half-bit %u us, poll %u ms, rails %u, touchpad cmd %u, backlight %u, auth %u, "
-       "raw %u, firmware %llu bytes",
+       "raw %u, fnrow %u, firmware %llu bytes",
        gArgs.level, gArgs.level >= 2 ? "HID devices for macOS" : "raw reports logged, nothing for macOS", gArgs.stop, gArgs.halfUs,
-       gArgs.pollMs, gArgs.rails, gArgs.touchpad, gArgs.backlight, gArgs.auth, gArgs.raw,
+       gArgs.pollMs, gArgs.rails, gArgs.touchpad, gArgs.backlight, gArgs.auth, gArgs.raw, gArgs.fnrow,
        (unsigned long long)piano_keyboard_firmware_size);
   setProperty("piano-keyboard", gArgs.level, 32);
   PointerConfig pc;
@@ -467,6 +472,7 @@ bool PianoKeyboard::start(IOService *provider)
   pc.invertX = gArgs.invert & 1;
   pc.invertY = gArgs.invert & 2;
   fPointer.configure(pc);
+  fKeyFilter.fnRow = gArgs.fnrow != 0;
   thread_t thread = nullptr;
   if (kernel_thread_start(threadMain, this, &thread) != KERN_SUCCESS) {
     stage(-1, "kernel_thread_start");
@@ -496,15 +502,13 @@ void PianoKeyboard::run()
 {
   if (!step(1, "survey (read only): pins, rails, RSC")) return;
   survey();
-  if (!step(2, "pins: reset/sleep low (asserted), gpio56/57/97/95 GPIO inputs")) return;
-  if (!setupPins()) return;
-  if (!step(3, "rails: RPMh votes L11B 1.8 V then L14B 3.3 V")) return;
-  if (!setupRails()) return;
-  if (!step(4, "power-on: reset released, boot ROM 500 ms, sleep released 50 ms; boot ROM id and state")) return;
-  if (!powerOn()) return;
-  if (!step(5, "firmware: header, data blocks, verify, boot")) return;
-  if (!loadFirmware()) return;
-  if (!step(6, "serving: gpio97 edges latched and polled, frames read from register 0x4c")) return;
+  const bool served = step(2, "pins: reset/sleep low (asserted), gpio56/57/97/95 GPIO inputs") && setupPins() &&
+                      step(3, "rails: RPMh votes L11B 1.8 V then L14B 3.3 V") && setupRails() &&
+                      step(4, "power-on: reset released, boot ROM 500 ms, sleep released 50 ms; boot ROM id and state") && powerOn() &&
+                      step(5, "firmware: header, data blocks, verify, boot") && loadFirmware() &&
+                      step(6, "serving: gpio97 edges latched and polled, frames read from register 0x4c");
+  setProperty("piano-keyboard-stage", uint64_t(uint32_t(piano_keyboard_stage)), 32);
+  if (!served) return;
   armIrq();
   if (gArgs.level >= 2 && !publish()) return;
   setProperty("piano-keyboard-stage", uint64_t(uint32_t(piano_keyboard_stage)), 32);
@@ -760,16 +764,17 @@ void PianoKeyboard::ledRequest(void *self, uint8_t leds)
   __atomic_fetch_add(&k->fLedRequests, 1, __ATOMIC_RELEASE);
 }
 
-void PianoKeyboard::send(Kind kind, const uint8_t *bytes, unsigned length)
+IOReturn PianoKeyboard::send(Kind kind, const uint8_t *bytes, unsigned length)
 {
   PianoKeyboardHID *hid = fHid[unsigned(kind)];
-  if (!hid) return;
+  if (!hid) return kIOReturnNotReady;
   IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(bytes, length, kIODirectionNone);
   const IOReturn rc = report ? hid->handleReport(report) : kIOReturnNoMemory;
   OSSafeReleaseNULL(report);
   ++fSent;
   if (rc != kIOReturnSuccess && (++fSendErrors <= 5 || fSendErrors % 1000 == 0))
     note("%s: handleReport %#x (%u failures)", deviceInfo(kind).product, rc, fSendErrors);
+  return rc;
 }
 
 void PianoKeyboard::releaseAll()
@@ -781,6 +786,7 @@ void PianoKeyboard::releaseAll()
   send(Kind::keyboard, consumer, sizeof consumer);
   send(Kind::pointer, pointer, sizeof pointer);
   fPointer.reset();
+  fKeyFilter.reset();
 }
 
 // ------------------------------------------------------------------------------------------------------------------ step 6
@@ -795,26 +801,26 @@ bool PianoKeyboard::sendCommand(uint8_t cmd, uint8_t value, const char *what)
   return r == I2c::ok;
 }
 
-// piano-keyboard-auth=1: the Linux driver's answers (Wn8030Piano.h authInit/authS3t1); the cover's challenge is only logged.
-void PianoKeyboard::authAnswer(Vendor v, const Report &r)
+// piano-keyboard-auth=1: the Linux driver's answers (Wn8030Piano.h authReply). The cover's UID and challenge are never logged.
+void PianoKeyboard::authAnswer(const Report &r)
 {
   uint8_t wire[kCommandWire];
-  char line[100];
+  const AuthStep a = authReply(r, wire);
   const char *what = nullptr;
-  if (v == Vendor::authRequest) {
-    authInit(wire);
-    what = "auth init (MIAUTH)";
-  } else if (v == Vendor::authInit && r.length >= 24) {
-    note("auth: cover UID %s", hex(r.bytes + 8, 16, line, sizeof line));
-    authS3t1(wire);
+  switch (a) {
+  case AuthStep::init: what = "auth init (MIAUTH)"; break;
+  case AuthStep::s3t1:
+    note("auth: the cover's init reply carries its 16-byte UID (not logged)");
     what = "auth s3t1 (offline: key meta 00 00 00 02, fixed host challenge)";
-  } else if (v == Vendor::authChallenge && r.length >= 38) {
-    note("auth: cover challenge %s; the token (s5t1) needs the Linux helper's secret: not sent", hex(r.bytes + 22, 16, line, sizeof line));
+    break;
+  case AuthStep::challenge:
+    note("auth: the cover's challenge (16 bytes, not logged); the token (s5t1) needs the Linux helper's secret: not sent, "
+         "the exchange ends here");
     return;
-  } else {
-    note("auth: %s of %u bytes: too short to answer", vendorName(v), r.length);
-    return;
+  case AuthStep::tooShort: note("auth: kind %#04x in a %u-byte report: too short to answer", r.bytes[4], r.length); return;
+  case AuthStep::none: return;
   }
+  char line[60];
   const I2c rc = fBus.write(kAddress, wire, kCommandWire);
   ++fCommands;
   if (rc != I2c::ok) ++fCommandErrors;
@@ -827,17 +833,13 @@ void PianoKeyboard::coverAttached(bool on, const char *why)
   fAttached = on;
   note("cover %s (%s)", on ? "ATTACHED" : "detached", why);
   if (!on) {
-    releaseAll();
+    releaseAll();   // every key, consumer key and button up; the pointer and key state forgotten
     return;
   }
   ++fAttaches;
-  // As Linux (v1.1.0) does on attach: keyboard power, the Caps Lock LED, the touchpad; then its input-state work: the touchpad, the
-  // Caps Lock and mic LEDs, the backlight.
-  sendCommand(kCmdKeyboardPower, 1, "keyboard power");
-  sendCommand(kCmdIndicator, fCaps ? kLedCapsOn : kLedCapsOff, "caps lock LED");
-  if (gArgs.touchpad != 2) sendCommand(kCmdTouchpad, uint8_t(gArgs.touchpad), "touchpad");
-  sendCommand(kCmdIndicator, kLedMicOff, "mic LED");
-  if (gArgs.backlight <= 100) sendCommand(kCmdBacklight, uint8_t(gArgs.backlight), "backlight");
+  Command list[5];
+  const unsigned n = attachCommands(fCaps, gArgs.touchpad, gArgs.backlight, list);
+  for (unsigned i = 0; i < n; ++i) sendCommand(list[i].cmd, list[i].value, list[i].what);
   fKeepaliveMs = nowMs() + 12000;
 }
 
@@ -857,7 +859,8 @@ bool PianoKeyboard::readFrame()
   Report reports[24];
   unsigned count = 0;
   const Frame f = unpackFrame(fFrame, reports, 24, &count);
-  // Raw bytes may hold keys: at level 2 (the login password) only with piano-keyboard-trace=1.
+  // Raw bytes may hold keys: at level 2 (the login password) only with piano-keyboard-trace=1. Authentication material (the
+  // cover's UID, a challenge) never.
   const bool show = gArgs.level < 2 || gArgs.trace;
   char line[220];
   if (f == Frame::empty) {
@@ -867,47 +870,87 @@ bool PianoKeyboard::readFrame()
     return false;
   }
   // Every frame that is more than an accelerometer sample, raw (the first 300, then every 50th): what the MCU sends is not all known.
-  bool onlyAccel = f == Frame::reports;
-  for (unsigned i = 0; i < count && onlyAccel; ++i) {
+  bool onlyAccel = f == Frame::reports, secret = false;
+  for (unsigned i = 0; i < count; ++i) {
     int attached = -1;
-    onlyAccel = vendorKind(reports[i], &attached) == Vendor::accel;
+    onlyAccel = onlyAccel && vendorKind(reports[i], &attached) == Vendor::accel;
+    secret = secret || authPayload(reports[i]);
   }
-  if (show && gArgs.raw && !onlyAccel && (++fRawLogged <= 300 || fRawLogged % 50 == 0))
-    note("frame %u (read %u, %u reports), raw: %s", fFrames + 1, fReads, count, hex(fFrame, kFrameBytes, line, sizeof line));
+  if (show && gArgs.raw && !onlyAccel && (++fRawLogged <= 300 || fRawLogged % 50 == 0)) {
+    if (secret) note("frame %u (read %u, %u reports): authentication material, raw not logged", fFrames + 1, fReads, count);
+    else note("frame %u (read %u, %u reports), raw: %s", fFrames + 1, fReads, count, hex(fFrame, kFrameBytes, line, sizeof line));
+  }
+  // The trailer checksum is not a condition (Linux checks none): a mismatch is counted, the first ones logged.
+  if (!frameSumOk(fFrame) && (++fSumBad <= 5 || fSumBad % 100 == 0))
+    note("frame %u: trailer checksum %#04x, the bytes sum to %#04x (%u mismatches; dispatched anyway)", fReads, fFrame[kFrameBytes - 1],
+         sum8(fFrame + 2, kFrameBytes - 3), fSumBad);
   if (f != Frame::reports) {
     if (++fBadFrames <= 20 || fBadFrames % 100 == 0)
-      note("frame %u: %s (%u reports before it): %s", fReads, frameName(f), count, hex(fFrame, show ? 24 : 3, line, sizeof line));
+      note("frame %u: %s (%u reports before it): %s", fReads, frameName(f), count, hex(fFrame, show && !secret ? 24 : 3, line, sizeof line));
   }
   ++fFrames;
-  if (fFrames <= 3 && show) note("frame %u: first frames, raw: %s", fFrames, hex(fFrame, kFrameBytes, line, sizeof line));
   for (unsigned i = 0; i < count; ++i) dispatch(reports[i]);
   return f == Frame::reports;
 }
 
+// "mods 0x02 keys 04 05" of a 9-byte keyboard report.
+static const char *keyList(const uint8_t *k, char *out, size_t size)
+{
+  size_t used = size_t(snprintf(out, size, "mods %#04x keys", k[1]));
+  bool any = false;
+  for (unsigned i = 3; i < kKeyboardBytes && used + 4 < size; ++i)
+    if (k[i]) {
+      used += size_t(snprintf(out + used, size - used, " %02x", k[i]));
+      any = true;
+    }
+  if (!any && used + 6 < size) snprintf(out + used, size - used, " none");
+  return out;
+}
+
 void PianoKeyboard::dispatch(const Report &r)
 {
-  char line[220];
+  char line[220], decoded[80];
   const bool show = gArgs.level < 2 || gArgs.trace;
   switch (r.id) {
-  case kIdKeyboard:
+  case kIdKeyboard: {
     ++fKeys;
     if (!fAttached) coverAttached(true, "a key report without an attach message");
-    if (show) note("key %u: %s", fKeys, hex(r.bytes, r.length, line, sizeof line));
-    send(Kind::keyboard, r.bytes, kKeyboardBytes);
+    uint8_t out[kKeyboardBytes];
+    const uint32_t rollovers = fKeyFilter.rollovers();
+    fKeyFilter.filter(r.bytes, out);
+    const bool rollover = fKeyFilter.rollovers() != rollovers, changed = memcmp(out, r.bytes, kKeyboardBytes) != 0;
+    const IOReturn rc = send(Kind::keyboard, out, kKeyboardBytes);
+    if (show)
+      note("key %u: %s -> %s%s%s", fKeys, hex(r.bytes, r.length, line, sizeof line), keyList(out, decoded, sizeof decoded),
+           rollover ? " (rollover: the previous keys kept)" : changed ? " (Fn row)" : "", fHid[0] ? (rc ? " (macOS refused)" : "") : "");
+    else if (fKeys <= 3 || fKeys % 100 == 0)
+      note("key report %u to macOS: %s (contents not logged at level 2)", fKeys, rc ? "handleReport FAILED" : "handleReport ok");
     return;
-  case kIdConsumer:
+  }
+  case kIdConsumer: {
     ++fConsumer;
-    if (show) note("consumer %u: %s (usage %#x)", fConsumer, hex(r.bytes, r.length, line, sizeof line), le16(r.bytes + 1));
-    send(Kind::keyboard, r.bytes, kConsumerBytes);
+    const IOReturn rc = send(Kind::keyboard, r.bytes, kConsumerBytes);
+    if (show || fConsumer <= 20)
+      note("consumer %u: %s (usage %#x)%s", fConsumer, hex(r.bytes, r.length, line, sizeof line), le16(r.bytes + 1),
+           fHid[0] ? (rc ? ", macOS refused" : ", to macOS") : "");
     return;
+  }
   case kIdTouchpad: {
     if (!fTouchSeen) note("touchpad detected (first report 0x19): a cover with a touchpad");
     fTouchSeen = true;
     ++fTouch;
-    if (show && (fTouch <= 40 || fTouch % 50 == 0)) note("touch %u: %s", fTouch, hex(r.bytes, r.length, line, sizeof line));
+    if (show && (fTouch <= 120 || fTouch % 25 == 0)) note("touch %u: %s", fTouch, hex(r.bytes, r.length, line, sizeof line));
     uint8_t out[2][kPointerBytes];
     const unsigned n = fPointer.touch(r.bytes, nowMs(), out);
-    for (unsigned i = 0; i < n; ++i) send(Kind::pointer, out[i], kPointerBytes);
+    for (unsigned i = 0; i < n; ++i) {
+      const IOReturn rc = send(Kind::pointer, out[i], kPointerBytes);
+      if (fHid[1] && ++fPointerSent <= 3) note("pointer report %u to macOS: %s", fPointerSent, rc ? "handleReport FAILED" : "handleReport ok");
+    }
+    Gesture g;
+    if (fPointer.takeGesture(&g) && (fPointer.gestures() <= 100 || fPointer.gestures() % 20 == 0))
+      note("touch gesture %u: %u finger%s, %u ms, (%d,%d) -> (%d,%d), travel %u, %u moves, %u scrolls%s%s", fPointer.gestures(), g.most,
+           g.most == 1 ? "" : "s", g.ms, g.x0, g.y0, g.x1, g.y1, g.travel, g.moves, g.scrolls, g.pressed ? ", pressed" : "",
+           g.tap ? (g.most >= 2 ? ", TAP (right click)" : ", TAP (left click)") : "");
     return;
   }
   case kIdMouse: {
@@ -931,10 +974,15 @@ void PianoKeyboard::dispatch(const Report &r)
   } else if (v == Vendor::accel) {
     if (++fAccel <= 3 || fAccel % 500 == 0) note("accelerometer %u: %s", fAccel, hex(r.bytes, 16, line, sizeof line));
   } else if (v == Vendor::authRequest || v == Vendor::authInit || v == Vendor::authChallenge) {
+    // A request's bytes are logged; an init reply's or a challenge's only up to the payload (the UID / challenge is not).
     if (++fAuth <= 20 || gArgs.auth)
-      note("%s (%s): %s", vendorName(v), gArgs.auth ? "answered as Linux with its helper" : "unanswered: piano-keyboard-auth=0",
-           hex(r.bytes, r.length < 40 ? r.length : 40, line, sizeof line));
-    if (gArgs.auth) authAnswer(v, r);
+      note("%s (%s): %s%s", vendorName(v), gArgs.auth ? "answered as Linux with its helper" : "unanswered: piano-keyboard-auth=0",
+           hex(r.bytes, v == Vendor::authRequest ? 12 : 8, line, sizeof line), v == Vendor::authRequest ? "" : " ... (not logged)");
+    if (gArgs.auth) authAnswer(r);
+  } else if (v == Vendor::ack) {
+    if (++fAcks <= 12 || fAcks % 100 == 0) note("command ack %u: command %#04x status %u", fAcks, r.bytes[6], r.bytes[7]);
+  } else if (v == Vendor::state) {
+    if (++fStates <= 12 || fStates % 100 == 0) note("command state %u: command %#04x = %#04x", fStates, r.bytes[4], r.bytes[6]);
   } else if (fVendor <= 30) {
     note("vendor %#04x (%s): %s", r.id, vendorName(v), hex(r.bytes, r.length < 24 ? r.length : 24, line, sizeof line));
   }
@@ -999,10 +1047,11 @@ void PianoKeyboard::serve()
 
 void PianoKeyboard::describe(uint64_t seconds)
 {
-  note("alive at %llu s: %s, %u reads (%u frames, %u empty, %u errors, %u bad), %u edges%s, %u level reads, irq high in %u of %u "
-       "polls; keys %u, consumer %u, touch %u, mouse %u, vendor %u (accel %u, auth %u), attaches %u, taps %u; %u commands (%u "
-       "failed), %u reports to macOS (%u failed); irq %u status %u",
-       seconds, fAttached ? "attached" : "no cover", fReads, fFrames, fEmpty, fReadErrors, fBadFrames, fEdges,
-       fEdgeSeen ? "" : " (none yet: polled every 100 ms)", fLevelReads, fIrqHigh, fPolls, fKeys, fConsumer, fTouch, fMouse, fVendor,
-       fAccel, fAuth, fAttaches, fPointer.taps(), fCommands, fCommandErrors, fSent, fSendErrors, level(kIrq), level(kStatus));
+  note("alive at %llu s: %s, %u reads (%u frames, %u empty, %u errors, %u bad, %u checksum mismatches), %u edges%s, %u level reads, irq high in %u of %u "
+       "polls; keys %u (rollovers %u), consumer %u, touch %u (gestures %u, taps %u), mouse %u, vendor %u (accel %u, auth %u, acks "
+       "%u), attaches %u; %u commands (%u failed), %u reports to macOS (%u failed); irq %u status %u",
+       seconds, fAttached ? "attached" : "no cover", fReads, fFrames, fEmpty, fReadErrors, fBadFrames, fSumBad, fEdges,
+       fEdgeSeen ? "" : " (none yet: polled every 100 ms)", fLevelReads, fIrqHigh, fPolls, fKeys, fKeyFilter.rollovers(), fConsumer,
+       fTouch, fPointer.gestures(), fPointer.taps(), fMouse, fVendor, fAccel, fAuth, fAcks, fAttaches, fCommands, fCommandErrors,
+       fSent, fSendErrors, level(kIrq), level(kStatus));
 }
