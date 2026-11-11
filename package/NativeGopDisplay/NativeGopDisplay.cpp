@@ -238,6 +238,11 @@ private:
     uint32_t fCopyFence;              // with fCopyNext: the fence its swap waits for, when fCopyFenced
     bool fCopyFenced;
     uint64_t fGpuWaits, fGpuWaitNs, fGpuWaitMaxNs, fGpuTimeouts;
+    // The backlight callout (boot-arg piano-backlight=2 only; without it nothing here runs): each display power change is published
+    // as "piano-display-power" and handed to PianoBacklight (package/PianoBacklight/PianoBacklightClient.h), found by class like the GPU.
+    bool fBacklightCallout;
+    IOService *fBacklight;            // retained once found
+    void backlightCallout(bool on);
     bool gpuFence(uint32_t *fence);
     void waitGpuFence(uint32_t fence);
     SwapInfo fSwapInfo[kSwapInfoRing];   // held while kSwapInfoHeld is set, sent in order afterwards
@@ -386,6 +391,9 @@ bool NativeGopDisplay::start(IOService *provider)
     PE_parse_boot_argn("native-gop-display-gpu-fence", &gpuFence, sizeof(gpuFence));
     fGpuFences = gpuFence != 0;
     fGpuFenceSymbol = OSSymbol::withCStringNoCopy("native-adreno-fences");
+    unsigned backlight = 0;
+    PE_parse_boot_argn("piano-backlight", &backlight, sizeof(backlight));
+    fBacklightCallout = backlight >= 2;
     if (!readFramebuffer())
         return false;
     IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress(fVideoPhys, fVideo.v_rowBytes * fVideo.v_height,
@@ -634,6 +642,8 @@ IOReturn NativeGopDisplay::swap_submit(IOMFBSwapRec *rec, IOUserClient *client, 
 IOReturn NativeGopDisplay::do_power_state_change_gated()
 {
     bool on = at<uint32_t>(this, kSystemPowerState) && at<uint32_t>(this, kAPIPowerState);
+    if (fBacklightCallout)
+        backlightCallout(on);
     if (on == fDisplayOn)
         return kIOReturnSuccess;
     fDisplayOn = on;
@@ -641,6 +651,28 @@ IOReturn NativeGopDisplay::do_power_state_change_gated()
     IOLog("NativeGopDisplay: display %s\n", on ? "on" : "off");
     powerstate_notify(true, on);
     return kIOReturnSuccess;
+}
+
+// piano-backlight=2: every call, with both power states as they are (PianoBacklight logs their raw values, so an intermediate state
+// WindowServer might use for dimming shows up), only records a request there: nothing waits for the backlight's I2C.
+void NativeGopDisplay::backlightCallout(bool on)
+{
+    setProperty("piano-display-power", on);
+    if (!fBacklight) {
+        OSDictionary *match = IOService::serviceMatching("PianoBacklight");
+        IOService *backlight = match ? IOService::copyMatchingService(match) : nullptr;
+        if (match)
+            match->release();
+        if (!backlight) {
+            IOLog("NativeGopDisplay: display %s: no PianoBacklight service yet (it reads piano-display-power when it starts)\n",
+                  on ? "on" : "off");
+            return;
+        }
+        fBacklight = backlight;
+    }
+    const uintptr_t system = at<uint32_t>(this, kSystemPowerState), api = at<uint32_t>(this, kAPIPowerState);
+    fBacklight->callPlatformFunction("PianoBacklightDisplay", false, reinterpret_cast<void *>(uintptr_t(on)),
+                                     reinterpret_cast<void *>(system), reinterpret_cast<void *>(api), nullptr);
 }
 
 // AppleParavirtDisplay::program_hardware_gated (its slot 473): show the swap, then complete it. There is no cursor plane (no
