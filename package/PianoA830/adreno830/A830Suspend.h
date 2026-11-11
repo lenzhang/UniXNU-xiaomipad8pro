@@ -40,6 +40,7 @@ struct A830SuspendConfig {
     bool eagerWake=true;         /* piano-gpu-suspend-wake: wake the GPU in kOn (0: the first submission wakes it) */
     uint32_t wakeBoundMs=100;    /* piano-gpu-suspend-wake-ms: a wake slower than this is reported as over the bound */
     uint32_t displayWaitMs=300;  /* PreSleep: how long to wait for PianoDpu's panel sleep to finish (it runs on its own thread) */
+    bool cancel=false;           /* piano-gpu-suspend-cancel=1 (UniXNU-piano, 2026-11-12): a failed entry cancels the sleep (0064) */
 };
 
 /* The DDR vote while suspended: 0 kBps (Sm8750RpmhHostDdr's keepalive minimum: SH0/MC0 x = y = 1, ACV off) once the scanout
@@ -92,6 +93,10 @@ struct A830SuspendMachine {
         if(outcome!=A830SuspendOff)++refusals;
         if(outcome==A830SuspendFailed)blocked=true;
     }
+    /* UniXNU-piano (2026-11-12, docs/power.md 3.7): the outcome a system sleep must not go on with, for the board's opt-in cancel
+     * (piano-gpu-suspend-cancel=1, k27 0064's piano-sleep-cancel=1): a failed slumber entry (the recovery had the GPU, possibly still
+     * running it when the CPUs would freeze). Busy, lost or off cost only the GPU's share of the saving: no cancel. */
+    static bool cancelWanted(uint8_t outcome) {return outcome==A830SuspendFailed;}
     bool votesDownWanted() const {return phase==A830SuspendGpuDown;}
     void votesDownDone(bool ok) {if(ok) {phase=A830SuspendVotesDown;++voteDowns;} else ++voteFailures;}
     bool votesUpWanted() const {return phase==A830SuspendVotesDown;}

@@ -838,6 +838,9 @@ void suspendGpu()
   else if (result == kIOReturnIOError) outcome = A830SuspendFailed;
   else outcome = r.powerPhase == A830PowerLost ? A830SuspendLost : A830SuspendBusy;   // still being recovered after the wait
   gSuspend.sleepDone(outcome);
+  // piano-gpu-suspend-cancel=1 (default 0; docs/power.md 3.7): a failed entry cancels the whole sleep (k27 0064, piano-sleep-cancel=1),
+  // asked after the recovery wait below, still inside kOff (the thread call acknowledges after it).
+  const bool cancel = gSuspendConfig.cancel && A830SuspendMachine::cancelWanted(outcome);
   switch (outcome) {
   case A830SuspendOk:
     piano_a830_note("gpu suspend #%u: GPU down in %u.%03u ms (quiet after %u us; %s; %s): submissions wait for the resume", n,
@@ -865,10 +868,17 @@ void suspendGpu()
     }
     const A830PowerPhase phase = power ? power->phase() : A830PowerLost;
     piano_a830_note("gpu suspend #%u: REFUSED: the slumber entry failed; the recovery %s after %u ms; no GPU suspend for the rest of the "
-                    "boot; the suspend goes on without the GPU's share", n, phase == A830PowerActive ? "brought it back" :
-                    phase == A830PowerLost ? "lost it" : "is STILL RUNNING", waited);
+                    "boot; %s", n, phase == A830PowerActive ? "brought it back" : phase == A830PowerLost ? "lost it" : "is STILL RUNNING",
+                    waited, gSuspendConfig.cancel ? "the kernel is asked to cancel this sleep (piano-gpu-suspend-cancel=1)"
+                                                  : "the suspend goes on without the GPU's share");
     break;
   }
+  }
+  if (cancel) {
+    const IOReturn c = pianopower::cancelSystemSleep("PianoA830", "the GPU's slumber entry failed (the recovery had it)");
+    piano_a830_note("gpu suspend #%u: cancel of the sleep: %s", n, c == kIOReturnSuccess ? "taken, nothing is suspended (a normal wake follows)"
+                    : c == kIOReturnUnsupported ? "refused (piano-sleep-cancel=0, no piano-sleep, or a kernel before k27 0064): the sleep goes on"
+                    : c == kIOReturnNotReady ? "no system sleep in progress" : "too late");
   }
   suspendPublish();
 }
@@ -958,6 +968,7 @@ void suspendConfigure(unsigned level)
   c.wakeBoundMs = bound < 1 ? 1 : bound > 10000 ? 10000 : bound;
   const uint32_t display = bootArg("piano-gpu-suspend-display-ms", 300);
   c.displayWaitMs = display > 2000 ? 2000 : display;
+  c.cancel = c.enabled && bootArg("piano-gpu-suspend-cancel", 0) == 1;
 }
 
 // The starter thread, once the GPU runs: into the power tree (the contract's two states), so IOPMrootDomain takes the GPU down
@@ -977,6 +988,9 @@ void suspendJoin()
                   gSuspendConfig.railVlvl ? " (at least NOM_L1 while the panel scans)" : " (the votes gone; NOM_L1 while the panel scans)",
                   gSuspendConfig.eagerWake ? "wakes the GPU" : "opens the gate (the first submission wakes it)", gSuspendConfig.wakeBoundMs);
   if (r != kIOReturnSuccess) gJoined = false;
+  if (gJoined && gSuspendConfig.cancel)
+    piano_a830_note("gpu suspend: piano-gpu-suspend-cancel=1: a failed slumber entry asks the kernel to cancel that sleep (k27 0064 "
+                    "with piano-sleep-cancel=1; else the sleep goes on without the GPU's share)");
   suspendPublish();
 }
 }  // namespace

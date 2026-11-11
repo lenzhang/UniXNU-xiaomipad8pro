@@ -34,9 +34,10 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
     A830Idle.h              (new)                                                            -> b90f05f80501078f9de1429a51d73b9644278b35ae8fcd167c15abc738848512
       2026-11-11, MIT, this repository's: the idle policy's configuration, the scanout's DDR floor, the idle votes' state machine, the
       transitions' line rule and the board hooks' declarations.
-    A830Suspend.h           (new)                                                            -> 4dd88c84392497ac4539bd4ddc9f9862a1f1aa93e70dbcdab3a683268443c019
+    A830Suspend.h           (new)                                                            -> 1223ec471f73547fcfd2aa5177df13abae23f80e577f35c680611084ba4886ff
       2026-11-11, MIT, this repository's: the system suspend's configuration, the DDR and rail targets, the four-step machine, the
-      report and the orchestrator's entry points.
+      report and the orchestrator's entry points. 2026-11-12: cancelWanted (a failed entry) and the config's cancel, for the board's
+      opt-in cancel of the sleep (piano-gpu-suspend-cancel=1, k27 0064).
     A830Dcvs.h              2e3cfc36d1cedc7c912d42b5fdb743ca44326b7876f30379f0c9dabebd1944fa -> f2b18a507774a1beda67863c8d0dad5cd67e1100ddcde506de6efd8be4348ab3
     A830Dcvs.cpp            6e457f98e72fe052b4b7fb0057ea2a8003e78fbaa3cc8784b291270690a0f016 -> 661f3cdcc621bd83c26577085578765913d1915f7910a8645c08b83b88db6d51
       2026-11-11: A830DcvsConfig::idleWindowMs (the window while the governor idles at the floor; the first submission still wakes
@@ -64,7 +65,7 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       board hooks of test_start (mode 0 unless a case sets it; the pinned PASS line unchanged, a line of its own for piano-gpu-idle),
       the idle rails' TCS order, lock and refusals in test_sm8750_rpmh; test_a830idle (both passes): the scanout floor, the idle
       votes' state machine and line rule, the DCVS floor and idle window, the idle hook, the external ceiling, slumberBlocked.
-    tests/test_a830suspend.cpp (new)                                                         -> ed876b04e4bf319ddc34f5a71fbbc8ef61b8f47ab37a3785f2d21cd5e2b87d2d
+    tests/test_a830suspend.cpp (new)                                                         -> 486d492034c950516480f24b9610a3b391768862169ef5511f0ba9229185175d
       2026-11-11, the system suspend: test_a830suspend (both passes: the targets and the four-step machine; ADRENO830_MACOS: the gate
       on the register model), the suspend/resume and RailsSet doubles and the orchestrator's cases in test_start (a PASS line of its
       own), RailsSet's TCS order, lock and refusals in test_sm8750_rpmh.

@@ -76,6 +76,10 @@ static void testMachine()
     CHECK(m.refusals==2 && m.sleepWanted() && !m.votesDownWanted());
     m.sleepDone(A830SuspendFailed);
     CHECK(m.refusals==3 && m.blocked && !m.sleepWanted() && !m.votesDownWanted() && !m.wakeWanted() && m.suspends==4);
+    /* The opt-in cancel: only a failed entry. */
+    CHECK(A830SuspendMachine::cancelWanted(A830SuspendFailed) && !A830SuspendMachine::cancelWanted(A830SuspendOk) &&
+          !A830SuspendMachine::cancelWanted(A830SuspendBusy) && !A830SuspendMachine::cancelWanted(A830SuspendLost) &&
+          !A830SuspendMachine::cancelWanted(A830SuspendOff));
 }
 
 #ifdef ADRENO830_MACOS

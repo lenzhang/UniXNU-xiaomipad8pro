@@ -2631,6 +2631,12 @@ static void mediaReportThread (void *, wait_result_t)
 // to off before a system sleep and back on after; the Data disk (NativeRamBlock) joins as its power child, so it is held and synced
 // before the link goes down and released after the link is back. 0 (the default): not in the power tree at all, as before.
 static uint32_t gPowerArg = 0;
+// native-ufs-suspend-cancel=1 (2026-11-12, default 0; docs/power.md §3.7): a suspend NativeUfs had to abort for a state the system
+// must not sleep in (RootPower.h ufsCancelWanted: the Data store not synced, I/O in flight, the cache not synced, a link that cannot
+// enter Hibern8) asks the kernel to cancel the whole sleep (pianopower::cancelSystemSleep; honoured by k27 0064 with
+// piano-sleep-cancel=1, else refused and the sleep goes on with UFS up, as before).
+static uint32_t gCancelArg = 0;
+static uint32_t gCancels = 0, gCancelRefusals = 0;
 static volatile int gPowerJoin = 0;   // 0 root start still running, 1 joined, -1 not taking part
 static NativeUfs *gPowerOwner = nullptr;
 // UEFI's UFS clocks and power domains, read only, for the log: NativeUfs holds none of them and never writes GCC (GccUfs.h).
@@ -2665,7 +2671,8 @@ void NativeUfs::joinPower (void)
   gPowerOwner = this;
   __atomic_store_n (&gPowerJoin, 1, __ATOMIC_RELEASE);   // after gPowerOwner: native_ufs_power_parent reads them in that order
   IOLog ("NativeUfs: power: native-ufs-suspend=1: in the power tree; a system sleep holds and drains the queue, syncs the cache, "
-         "turns auto-hibernate off and puts the link into Hibern8; any failure first undoes it and the sleep goes on with UFS up\n");
+         "turns auto-hibernate off and puts the link into Hibern8; any failure first undoes it and %s\n",
+         gCancelArg ? "the kernel is asked to cancel the sleep (native-ufs-suspend-cancel=1)" : "the sleep goes on with UFS up");
   powerClockLine ("power");
 #else
   IOLog ("NativeUfs: power: native-ufs-suspend=1 needs the SM8750 link handling; no part in a system sleep\n");
@@ -2684,6 +2691,22 @@ IOReturn NativeUfs::setPowerState (unsigned long state, IOService *)
     IOLog ("NativeUfs: power: an off before the first on (not a system sleep): ignored\n");
   } else if (hostSuspend ()) {
     powerClockLine ("suspended");
+  } else if (gPower.state != UfsPower::Failed && ufsCancelWanted (gPower.abortKind)) {
+    if (!gCancelArg) {
+      IOLog ("NativeUfs: power: suspend %u aborted (%s): a sleep that should not happen; native-ufs-suspend-cancel=1 would ask the "
+             "kernel to cancel it\n", gPower.suspends, ufsAbortName (gPower.abortKind));
+    } else {
+      char why[96];
+      snprintf (why, sizeof (why), "%s (%s: %s)", ufsAbortName (gPower.abortKind), gPower.lastStep, gPower.lastWhy);
+      const IOReturn r = pianopower::cancelSystemSleep ("NativeUfs", why);
+      if (r == kIOReturnSuccess) ++gCancels;
+      else ++gCancelRefusals;
+      IOLog ("NativeUfs: power: suspend %u aborted (%s): asked the kernel to cancel this sleep (native-ufs-suspend-cancel=1): %s "
+             "(%u cancelled, %u refused)\n", gPower.suspends, why,
+             r == kIOReturnSuccess ? "cancelled, nothing is suspended" : r == kIOReturnUnsupported ?
+             "refused (piano-sleep-cancel=0, no piano-sleep, or a kernel before k27 0064): the sleep goes on with UFS up" :
+             r == kIOReturnNotReady ? "no system sleep in progress" : "too late", gCancels, gCancelRefusals);
+    }
   }
 #else
   (void) state;
@@ -2715,6 +2738,7 @@ bool NativeUfs::start (IOService *provider)
   PE_parse_boot_argn ("native-ufs-probe", &probe, sizeof (probe));
   PE_parse_boot_argn ("native-ufs-root", &rootMode, sizeof (rootMode));
   if (!PE_parse_boot_argn ("native-ufs-suspend", &gPowerArg, sizeof (gPowerArg)) || gPowerArg != 1) gPowerArg = 0;
+  if (!PE_parse_boot_argn ("native-ufs-suspend-cancel", &gCancelArg, sizeof (gCancelArg)) || gCancelArg != 1) gCancelArg = 0;
   if (!gPowerArg) gPowerJoin = -1;
   IOLog ("NativeUfs: start on %s probe=%u root=%u\n", provider ? provider->getName () : "?", probe, rootMode);
   native_ufs_probe_requested = probe != 0;

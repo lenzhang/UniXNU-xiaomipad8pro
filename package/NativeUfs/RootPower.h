@@ -24,8 +24,24 @@
 // (docs/drivers/ufs.md §12.3 lists them).
 
 enum class UfsPower : uint32_t { On = 0, Suspended = 1, Failed = 2 };
+// Why the last suspend was aborted (2026-11-12, docs/power.md §3.7): native-ufs-suspend-cancel=1 asks the kernel (k27 0064,
+// piano-sleep-cancel=1) to cancel the whole system sleep for the kinds a sleep must not happen in: a power child's veto (the Data
+// store not synced: data not yet safe), I/O still in flight, the cache not synced, a link that could not go into Hibern8 (or whose
+// state could not be read). A precondition (the transport not up, quarantined, a panic) is no reason: the disk is no worse asleep.
+enum class UfsAbort : uint8_t { None = 0, Precondition, Veto, InFlight, Sync, Link };
+static inline bool ufsCancelWanted (UfsAbort kind)
+{
+  return kind == UfsAbort::Veto || kind == UfsAbort::InFlight || kind == UfsAbort::Sync || kind == UfsAbort::Link;
+}
+static inline const char *ufsAbortName (UfsAbort kind)
+{
+  return kind == UfsAbort::Veto ? "the Data store is not synced" : kind == UfsAbort::InFlight ? "I/O in flight" :
+         kind == UfsAbort::Sync ? "the cache is not synced" : kind == UfsAbort::Link ? "the link cannot enter Hibern8" :
+         kind == UfsAbort::Precondition ? "the transport is not usable" : "none";
+}
 struct UfsPowerStatus {
   UfsPower state = UfsPower::On;
+  UfsAbort abortKind = UfsAbort::None;   // the last suspend's abort (None after a suspend that went down)
   uint32_t suspends = 0, aborts = 0, resumes = 0, retries = 0, vetoes = 0;
   uint32_t ahitRuntime = 0;          // AHIT while the system runs: 0 (auto-hibernate off, today's) or native-ufs-ahit's
   uint32_t ahitSaved = 0;            // AHIT as the last suspend found it (restored by the wake)
@@ -207,12 +223,15 @@ static bool hostSuspend (void)
   const char *step = "preconditions", *why = nullptr;
   bool linkTouched = false;
   uint32_t drained = 0, tx = 0xffffffff;
+  UfsAbort kind = UfsAbort::Precondition;
+  gPower.abortKind = UfsAbort::None;
   gPower.entered = false;
   gPower.txBefore = gPower.txAfter = 0xffffffff;
   if (const char *veto = gPowerVeto) {
     gPowerVeto = nullptr;
     ++gPower.vetoes;
     why = veto;
+    kind = UfsAbort::Veto;
   } else if (!gHost.ready || gHost.poisoned || gHostPanic) {
     why = gHost.poisoned ? "the transport is quarantined (an earlier command failed)" : gHostPanic ? "a panic is in progress"
                                                                                           : "the transport is not up";
@@ -221,11 +240,14 @@ static bool hostSuspend (void)
   step = "queue hold";
   hostHoldSet (true);
   step = "drain";
+  kind = UfsAbort::InFlight;
   if (!hostDrain (kDrainMs, &drained)) { why = "commands still running after 1000 ms"; goto release; }
   gPower.drainUs = drained * 1000ULL;
   if (read32 (gHost.hc, 0x58) || read32 (gHost.hc, 0x78)) { why = "a doorbell is set with the queue drained"; goto release; }
+  kind = UfsAbort::Link;
   if (read32 (gHost.hc, 0x20) & kUfsFatalStatus) { why = "the controller reports a fatal error"; goto release; }
   step = "cache sync";
+  kind = UfsAbort::Sync;
   if (hostAnyWritable ()) {
     const uint64_t s0 = mach_absolute_time ();
     if (hostSyncOn (ufsSlot (0)) != kIOReturnSuccess) {
@@ -237,6 +259,7 @@ static bool hostSuspend (void)
     gPower.syncUs = 0;
   }
   IOLockLock (gHost.lock);   // one UIC command at a time (native_ufs_dme_get)
+  kind = UfsAbort::Link;
   step = "auto-hibernate off";
   gPower.ahitSaved = read32 (gHost.hc, 0x18);
   if (gPower.ahitSaved) {
@@ -288,6 +311,7 @@ release:
   hostHoldSet (false);
 aborted:
   ++gPower.aborts;
+  gPower.abortKind = kind;
   gPower.lastStep = step;
   gPower.lastWhy = why;
   char link[64];

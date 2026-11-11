@@ -108,16 +108,19 @@ static void abortsBeforeTheLink ()
   reset ();
   gPowerVeto ="NativeRamBlock: the Data store's cache sync failed";
   assert (!hostSuspend () && gPower.aborts == 1 && gPower.vetoes == 1 && !gHostHeld && m.events.empty () && !gPowerVeto);
+  assert (gPower.abortKind == UfsAbort::Veto && ufsCancelWanted (gPower.abortKind));
   assert (linesContain ("suspend 1 ABORTED at preconditions: NativeRamBlock: the Data store's cache sync failed") &&
           linesContain ("queue released, link untouched; this sleep goes on with UFS up"));
   assert (hostResume () && m.events.empty ());       // the wake after it: nothing to undo
-  assert (hostSuspend () && hostResume ());
+  assert (hostSuspend () && gPower.abortKind == UfsAbort::None && hostResume ());
   assertUp ();
-  // A quarantined transport, a panic in progress.
+  // A quarantined transport, a panic in progress: no reason to cancel the sleep (the disk is no worse asleep).
   reset (); gHost.poisoned = true;
   assert (!hostSuspend () && m.events.empty () && !gHostHeld && linesContain ("the transport is quarantined"));
+  assert (gPower.abortKind == UfsAbort::Precondition && !ufsCancelWanted (gPower.abortKind));
   reset (); gHostPanic = true;
   assert (!hostSuspend () && m.events.empty () && !gHostHeld && linesContain ("a panic is in progress"));
+  assert (gPower.abortKind == UfsAbort::Precondition && !ufsCancelWanted (gPower.abortKind));
   // A command that keeps its slot past the drain's 1000 ms.
   reset ();
   const int slot = ufs_test_slot_take ();
@@ -125,12 +128,14 @@ static void abortsBeforeTheLink ()
   uint64_t t0 = m.now;
   assert (!hostSuspend () && !gHostHeld && m.events.empty () && m.now - t0 >= 1000000);
   assert (linesContain ("ABORTED at drain: commands still running after 1000 ms"));
+  assert (gPower.abortKind == UfsAbort::InFlight && ufsCancelWanted (gPower.abortKind));
   ufs_test_slot_give (unsigned (slot));
   assert (hostSuspend () && hostResume ());
   assertUp ();
   // A doorbell bit that is not ours (a task) with the pool drained.
   reset (); reg (0x78) = 1;
   assert (!hostSuspend () && m.events.empty () && !gHostHeld && linesContain ("a doorbell is set with the queue drained"));
+  assert (gPower.abortKind == UfsAbort::InFlight);
   reg (0x78) = 0;
   assertUp ();
   // The sync refused (CHECK CONDITION): the transport stays usable, the link untouched.
@@ -138,6 +143,7 @@ static void abortsBeforeTheLink ()
   assert (hostStoreOpen (100, 64));
   assert (!hostSuspend () && m.syncs == 1 && m.getCommands == 0 && !gHostHeld && !gHost.poisoned);
   assert (linesContain ("ABORTED at cache sync: SYNCHRONIZE CACHE failed"));
+  assert (gPower.abortKind == UfsAbort::Sync && ufsCancelWanted (gPower.abortKind));
   m.fault = Fault::None;
   assertUp ();
   // The sync never answers: quarantined as any command that times out; the link untouched, the queue released.
@@ -150,12 +156,14 @@ static void abortsBeforeTheLink ()
   hostAutoHibernateStart (1000);
   m.fault = Fault::AutoHibernate;
   assert (!hostSuspend () && m.getCommands == 0 && reg (0x18) == 0xfe8 && !gHostHeld && linesContain ("AHIT did not read back 0"));
+  assert (gPower.abortKind == UfsAbort::Link);
   // The UIC not ready, or DME_GET refused: AHIT back, the link untouched.
   reset ();
   hostAutoHibernateStart (1000);
   reg (0x30) &= ~8U;
   assert (!hostSuspend () && m.getCommands == 0 && reg (0x18) == 0xfe8 && !gHostHeld);
   assert (linesContain ("ABORTED at link state: UIC command not ready"));
+  assert (gPower.abortKind == UfsAbort::Link && ufsCancelWanted (gPower.abortKind));
   reg (0x30) |= 8U;
   assertUp (0xfe8);
   reset (Fault::UicResult);
@@ -181,6 +189,7 @@ static void failuresAtTheLink ()
                                                     : "ABORTED at Hibern8 enter: UIC link command failed"));
     assert (linesContain (inHibern8 ? "link up again (TX lane 0 1 -> 5, NOP OUT answered)"
                                     : "link up again (TX lane 0 5 -> 5, NOP OUT answered)"));
+    assert (gPower.abortKind == UfsAbort::Link && ufsCancelWanted (gPower.abortKind));   // native-ufs-suspend-cancel=1 cancels
     m.fault = Fault::None;
     assertUp (0xfe8);
     assert (hostSuspend () && hostResume ());   // and the next sleep works

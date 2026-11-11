@@ -182,7 +182,7 @@ shared with the host harness), `NativeUfs.cpp` (the power-tree join, `setPowerSt
 | MPHY TX_FSM_STATE (attribute 0x41, TX lane 0) = 1: the lane is in HIBERN8; ufs-qcom checks exactly this of a hibernated link | spec | `ufs-qcom.c` `ufs_qcom_check_hibern8` |
 | Before any driver's off, IOPMrootDomain syncs the file systems (`disk_sync_callout` → `sync_internal`) and suspends the user tasks (`tasks_system_suspend`, then `vm_pageout_wait` up to 10 s): little I/O is left to meet the hold | verified | k27 `IOPMrootDomain.cpp` |
 | Children in the power tree go to off before their parent and come back after it (the parent's will-change notifies the children and waits for them; the did-change of a power rise notifies them after the parent's `setPowerState`); siblings run in parallel | verified | k27 `IOServicePM.cpp` (`notifyRootDomain`, `notifyChildren`) |
-| `setPowerState` returning an error is treated as an acknowledgement (`(result == IOPMAckImplied) \|\| (result < 0)`): a driver cannot cancel a system sleep that way, and k27 0062 has no driver veto (its only abort is a CPU that does not park); k27 0064 adds one, opt-in (`piano-sleep-cancel=1`, `pianopower::cancelSystemSleep` from kOff or PreSleep, `power.md` §3.7), not used by NativeUfs yet | verified | k27 `IOServicePM.cpp` `driverSetPowerState`; `patches/k27/0062-*`, `0064-*` |
+| `setPowerState` returning an error is treated as an acknowledgement (`(result == IOPMAckImplied) \|\| (result < 0)`): a driver cannot cancel a system sleep that way, and k27 0062 has no driver veto (its only abort is a CPU that does not park); k27 0064 adds one, opt-in (`piano-sleep-cancel=1`, `pianopower::cancelSystemSleep` from kOff or PreSleep, `power.md` §3.7); NativeUfs calls it with `native-ufs-suspend-cancel=1` (2026-11-12, §12.3) | verified | k27 `IOServicePM.cpp` `driverSetPowerState`; `patches/k27/0062-*`, `0064-*` |
 
 ### 12.2 What NativeUfs holds, and what stays on (the votes are UEFI's)
 
@@ -231,11 +231,18 @@ NativeUfs on (hostResume): DME_GET; DME_HIBERNATE_EXIT when 1; DME_GET != 1; NOP
 NativeRamBlock on: its held requests released
 ```
 
-- **The abort is NativeUfs's part only.** No interface lets a driver cancel the system sleep (§12.1, last row): an aborted suspend
-  puts everything back as it was (queue released, AHIT, the link active and proven by a NOP OUT) and the system sleeps with UFS
-  up, which is exactly today's behaviour; the line says so. A real cancel needs a kernel hook, e.g. k27 `piano_sleep_kernel`
-  (IOCPU.cpp) skipping `piano_s2idle_enter` when a driver set a veto during its off, which then wakes as an aborted suspend does
-  (all drivers back on); not part of this change.
+- **The abort is NativeUfs's part only, unless asked.** An aborted suspend puts everything back as it was (queue released, AHIT, the
+  link active and proven by a NOP OUT) and the system sleeps with UFS up, which is exactly the behaviour before; the line says so.
+  **Since 2026-11-12, `native-ufs-suspend-cancel=1`** (default 0; host-tested, not run) turns the aborts a sleep must not happen in
+  into a cancel of the whole sleep (k27 0064's `pianopower::cancelSystemSleep` from the kOff, honoured only with
+  `piano-sleep-cancel=1`, `../power.md` §3.7): `RootPower.h` `UfsAbort` records why the suspend was aborted and `ufsCancelWanted`
+  takes a power child's veto (the Data store did not sync: data not yet safe), I/O in flight (commands past the 1000 ms drain, or a
+  doorbell set with the queue drained), the cache not synced, and a link that cannot go into Hibern8 (a fatal status, AHIT stuck, the
+  UIC refusing, the enter failing: undone first, so the link is up again); not a precondition (the transport not up, quarantined, a
+  panic in progress: the disk is no worse asleep). The cancel comes after the undo, so the queue runs again at once; the kernel then
+  wakes every driver as after an aborted park (`piano.cancelled`). Refused (no 0064, `piano-sleep-cancel=0`): the sleep goes on with
+  UFS up, as before. Without the argument such an abort logs that it would have asked. `tests/RootPower.cpp` checks the kind of
+  every abort and which of them cancel.
 - **The Data disk.** Its store's writes are FUA (`PersistOverlay.h`): every acknowledged write is on the medium before it
   completes; the sync is belt and braces. Holding the disk at its own gate (not only in NativeUfs) keeps a multi-block request (the
   pages, then the bitmap block) from straddling the sleep, so the store at the cut-off is exactly the acknowledged one.
@@ -276,9 +283,13 @@ sleep and the wake restores it.
 |---|---|---|
 | `native-ufs-suspend=1` | 0 | NativeUfs (and the Data disk, with its store open read-write) in the power tree: §12.3. Exactly `1`; any other value is off |
 | `native-ufs-ahit=MS` | none (AHIT 0) | the controller's auto-hibernate after MS ms idle: §12.4 |
+| `native-ufs-suspend-cancel=1` | 0 | (with `native-ufs-suspend=1`) a suspend aborted for a state the system must not sleep in (Data store not synced, I/O in flight, cache not synced, the link not into Hibern8) asks the kernel to cancel the whole sleep (k27 0064, `piano-sleep-cancel=1`): §12.3 |
 
 ```
 NativeUfs: power: native-ufs-suspend=1: in the power tree; a system sleep holds and drains the queue, syncs the cache, turns auto-hibernate off and puts the link into Hibern8; any failure first undoes it and the sleep goes on with UFS up
+   (with native-ufs-suspend-cancel=1: "... and the kernel is asked to cancel the sleep (native-ufs-suspend-cancel=1)")
+NativeUfs: power: suspend 2 aborted (I/O in flight (drain: commands still running after 1000 ms)): asked the kernel to cancel this sleep (native-ufs-suspend-cancel=1): cancelled, nothing is suspended (1 cancelled, 0 refused)
+NativeUfs: power: suspend 2 aborted (I/O in flight): a sleep that should not happen; native-ufs-suspend-cancel=1 would ask the kernel to cancel it   (without the argument)
 NativeUfs: power: UFS clocks and GDSCs as UEFI left them (NativeUfs holds no vote to drop): GDSC fa22f800, PHY GDSC ..., AXI 08000001, AHB 88000003, UniPro ..., ICE ..., TX symbol 0 ..., RX symbol 0/1 .../..., PHY aux ..., aggre AXI 08000001
 NativeRamBlock: power: native-ufs-suspend=1: the Data disk is NativeUfs's power child (...)          (the store open read-write only)
 NativeUfs: auto-hibernate: on (native-ufs-ahit=1000): AHIT 00000fe8, the controller takes the link into Hibern8 after 1000 ms without a command and back at the next one
