@@ -179,6 +179,10 @@ Switch switchTo(Io &io, const LivePath &p, unsigned vtotal, const Options &o)
   }
   if ((io.rd(kMdp + kTopIntrStatus) & kUnderrunBits) && !io.wr(kMdp + kTopIntrClear, kUnderrunBits)) ++s.refused;
   const char *why = stage(io, p, vtotal, o, s);
+  if (why && !s.stores) {   // nothing was written (no window): nothing to switch back
+    s.why = why;
+    return s;
+  }
   if (!why) why = verify(io, vtotal, p, o, s);
   if (!why) {
     s.ok = true;

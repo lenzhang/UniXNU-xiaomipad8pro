@@ -169,6 +169,14 @@ static void testAnomalies()
     const Switch s = switchTo(m, path(m), kVtotal60, o);
     CHECK(!s.ok && s.reverted && m.midFrameTotal > 0);
   }
+  {   // a line counter that does not move: no window, nothing written, nothing to switch back
+    model::Dpu m;
+    m.sleepMs(4);
+    const LivePath p = path(m);
+    m.intf[1].counting = false;   // reads 0: never inside 200..2000
+    const Switch s = switchTo(m, p, kVtotal60, Options());
+    CHECK(!s.ok && !s.reverted && s.stores == 0 && m.stores.empty() && std::strstr(s.why, "window"));
+  }
   {   // refusals: no stores at all
     model::Dpu m;
     m.regs[intfReg(2, kIntfConfig)] = kIntfConfigProgFetch;

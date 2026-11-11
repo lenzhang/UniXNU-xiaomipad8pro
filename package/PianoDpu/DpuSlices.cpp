@@ -304,7 +304,7 @@ bool doSwitch(unsigned hz, const char *why)
   ++gSwitches;
   if (s.ok) {
     if (gSwitches <= 50 || gSwitches % 100 == 0)
-      note("refresh: %u -> %u lines (%u Hz, %s): ok in %u us: latched in %d us, %u stores, window try %u; measured %u.%03u Hz (frames "
+      note("refresh: %u -> %u lines (%u Hz, %s): ok in %u us: latched in %d us, %u stores, line window %u of 3; measured %u.%03u Hz (frames "
            "%u/%u in %llu us, lockstep); periods %08x/%08x dsi totals %08x/%08x; switch %u",
            s.from, s.to, hz, why, us, s.latchUs, s.stores, s.tries - 1, w, f, s.rate.frames[0], s.rate.frames[1],
            (unsigned long long)s.rate.us, s.period[0], s.period[1], s.dsiTotal[0], s.dsiTotal[1], gSwitches);
@@ -316,7 +316,7 @@ bool doSwitch(unsigned hz, const char *why)
          s.reverted ? (s.revertOk ? "; switched back, verified" : "; SWITCHED BACK BUT THAT FAILED TOO (a reset brings the boot state)") : "",
          s.latchUs, s.stores, s.refused, w, f, s.rate.frames[0], s.rate.frames[1], s.underrun, s.period[0], s.period[1], s.dsiTotal[0],
          s.dsiTotal[1]);
-    if (s.reverted || s.refused) {
+    {   // any failure: no more switches this boot
       gRefreshBroken = true;
       IOLockLock(gLock);
       gS.policy.disable();
