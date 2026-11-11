@@ -1,0 +1,34 @@
+turnip: darwin, the device's GPU window is its own connection's, not the enumeration probe's
+
+tu_knl_darwin_load opens a connection for the facts (Query, GetDeviceInfo: its slot's GPU window va_start/va_size), stores them in the
+physical device and closes it; darwin_device_init opens the device's own connection. That one can land in another slot (the probe's
+slot still going away, or another process opening in between), with another window, while the VA heap was still seeded from the
+probe's: every BoMap then fell outside the window the kernel checks and was refused with BadArgument (the first macOS desktop on
+piano, run attend4: "Installer Progress[102] slot 5 BoMap -> BadArgument", "MenuBarAgent[203] slot 5 BoMap -> BadArgument", both
+processes' Metal devices dead). Now the device takes the window GetDeviceInfo gave its own connection before the heap is seeded, and
+says so once on stderr when it differs: "NativeAdreno: this device's GPU window is 0x... + 0x..., the enumeration probe's was ...".
+Against the tree after 0001-0005. MIT, as the file.
+
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -1623,6 +1623,20 @@
+       if (result != VK_SUCCESS)
+          return result;
+    }
++   /* This connection may sit in another slot than the probe's, with another GPU window (the probe's slot still going away, another
++    * process opening in between): the kernel refuses every BoMap outside the window GetDeviceInfo just gave this connection
++    * (BadArgument), so the device's addresses come from that window, not the probe's. The VA heap is seeded at the first allocation. */
++   if (!dw.virtgpu && dw.info.va_size &&
++       (dw.info.va_start != dev->physical_device->va_start || dw.info.va_size != dev->physical_device->va_size)) {
++      mesa_loge("NativeAdreno: this device's GPU window is %#llx + %#llx, the enumeration probe's was %#llx + %#llx (another slot); "
++                "the device takes its own", (unsigned long long)dw.info.va_start, (unsigned long long)dw.info.va_size,
++                (unsigned long long)dev->physical_device->va_start, (unsigned long long)dev->physical_device->va_size);
++      dev->physical_device->va_start = dw.info.va_start;
++      dev->physical_device->va_size = dw.info.va_size;
++   }
++   /* tu_CreateDevice copied the probe's window into the device before this call (its own VMA heap is made after it, from these). */
++   dev->va_start = dev->physical_device->va_start;
++   dev->va_size = dev->physical_device->va_size;
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)
+       vk_zalloc(&dev->vk.alloc, sizeof(*retire), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+    if (!retire) {

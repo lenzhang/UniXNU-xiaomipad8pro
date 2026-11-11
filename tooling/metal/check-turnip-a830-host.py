@@ -28,11 +28,12 @@ Runs, each must pass:
   4. plugin_host (tooling/metal/turnip-a830/plugin_host.mm): the staged plugin executable itself, frontend and bridge on this Turnip:
      AIR pipelines, compute, a render into an IOSurface, a blit, then a desktop session's extras (a heap, 4x MSAA, a concurrent compute
      encoder, a shared event, 24 panel-sized IOSurfaces churned with no import left behind, an 8192x4096 texture); with 16 KiB and
-     4 KiB pages, and in a small slot's window (HOSTSIM_SLOT=4).
+     4 KiB pages, in a small slot's window (HOSTSIM_SLOT=4), and with the device's connection in another slot than the enumeration
+     probe's (HOSTSIM_SLOT_REOPEN=5: Turnip 0006 takes the device's own window; without it every BoMap is BadArgument, run attend4).
   5. abort_reporter (tooling/metal/turnip-a830/reporter_host.mm): the plugin's abort reporter on abort(), an uncaught exception and a
      bad access: the process dies with the same signal and says why on stderr first.
-Sources are read from ADRENO830_TREE, ADRENOMETAL_TREE and the kits below, never changed; everything built goes to
-out/turnip-a830/hostsim."""
+Sources are read from this repository's package/PianoA830/adreno830 (or ADRENO830_TREE), ADRENOMETAL_TREE and the kits below, never
+changed; everything built goes to out/turnip-a830/hostsim."""
 import argparse
 import os
 import shutil
@@ -45,7 +46,10 @@ from pathlib import Path
 
 D = Path(__file__).resolve().parents[2]
 H = Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/unixnu-research'
-A830 = Path(os.environ.get('ADRENO830_TREE', H / 'Adreno830'))
+# The kernel stack and hostsim: this repository's Adreno830 copy (package/PianoA830/adreno830, the code PianoA830 builds, upstream paths:
+# no ADRENO830_MACOS here; its hostsim has HOSTSIM_SLOT_REOPEN), else ADRENO830_TREE (e.g. unixnu-research/Adreno830 at 1a13210).
+A830 = Path(os.environ.get('ADRENO830_TREE', D / 'package/PianoA830/adreno830' if (D / 'package/PianoA830/adreno830').is_dir()
+                           else H / 'Adreno830'))
 METAL = Path(os.environ.get('ADRENOMETAL_TREE', H / 'AdrenoMetal'))
 SIM = A830 / 'tests/hostsim'
 # The kits Adreno830 1a13210 is written against: ArmSmmu4K e923329 (ArmSmmu4KLiveArena still {mapping, capacity_pages}, with
@@ -249,8 +253,11 @@ def main():
             return result.returncode == 0 and verdict.startswith('PASS'), f'{device}; {verdict}'
         # -slot4: the same as a process in a small slot (HOSTSIM_SLOT=4, the hostsim's 124 MiB app window, smaller than piano's 448 MiB
         # ones): the panel-sized IOSurface churn then needs every import's GPU range back before the next one.
+        # -reslot: the enumeration probe in slot 4, the device's connection in slot 5 (HOSTSIM_SLOT_REOPEN), another window: Turnip
+        # 0006 takes the device's own (without it every BoMap fell outside the window, BadArgument, run attend4).
         for label, extra in [('plugin_host-16k', {}), ('plugin_host-4k', {'HOSTSIM_PAGE_SIZE': '4096'}),
-                             ('plugin_host-slot4', {'HOSTSIM_PAGE_SIZE': '4096', 'HOSTSIM_SLOT': '4'})]:
+                             ('plugin_host-slot4', {'HOSTSIM_PAGE_SIZE': '4096', 'HOSTSIM_SLOT': '4'}),
+                             ('plugin_host-reslot', {'HOSTSIM_PAGE_SIZE': '4096', 'HOSTSIM_SLOT': '4', 'HOSTSIM_SLOT_REOPEN': '5'})]:
             check(label, [host, executable, library, cache], extra, plugin_host_verdict)
 
         # 5. The plugin's abort reporter (tooling/metal/turnip-a830/abort_reporter.mm): a process with it dies as it would have (the same
