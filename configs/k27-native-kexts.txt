@@ -22,3 +22,4 @@ PianoAudio           # speakers (4 x FS19xx, TDM) and DMICs via the ADSP, level 
 PianoUsbHost         # USB host / Type-C (docs/drivers/usb-host.md): level 1 only, a read-only survey (Type-C state, orientation, DWC3 role, xHCI caps, QMP mux); inert without piano-usbhost=N; PianoDwc3 keeps the controller
 PianoVideo           # the video core (SM8750 Iris, docs/drivers/video.md): level 1 only, a read-only survey (video clocks/GDSCs, the core when powered, SMMU 0x1940/0x1947); inert without piano-video=N
 PianoSensors         # the ADSP sensor hub (docs/drivers/sensors.md): 1 survey, 2 the FastRPC file service from the ESP pack, 3 the SNS sensor list; inert without piano-sensors=N; after PianoPower (its client contract) and NativeUfs (the ESP)
+PianoBluetooth       # the WCN7860's Bluetooth over QUP2 SE6 "UART14" (docs/drivers/bluetooth.md): level 1 only, a read-only survey (SE6 clocks/registers, UART pins, BT_EN over SPMI); inert without piano-bt=N
