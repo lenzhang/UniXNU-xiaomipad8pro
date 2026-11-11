@@ -13,7 +13,9 @@
  * charging policy: after every cycle it decides which writes are due. Writes are limited to the input current limit, the charge
  * current, the charger's enable bit, the fixed PDO request, the opt-in input un-suspend and the stock board configuration, each within
  * conservative bounds or to its one value (piano_mca_write_allowed); anything else is refused before it is built. The UCSI owner is
- * only read (piano_mca_ucsi_next). No I/O and no waits: the owner sends the bytes and feeds back what arrives. */
+ * only read (piano_mca_ucsi_next). No I/O and no waits: the owner sends the bytes and feeds back what arrives.
+ * With piano-power-policy=1 the built-in policy is left out and ChargePolicy.c decides instead (piano_mca_use_external_policy,
+ * piano_mca_queue; ChargeLink.h): the board configuration stays here and still goes first. */
 #ifndef PIANO_MCA_H
 #define PIANO_MCA_H
 #include <stdint.h>
@@ -84,6 +86,7 @@ extern "C" {
 #define PIANO_MCA_REAL_TYPE 0x2000cu      /* the charger type the firmware detected (PIANO_MCA_TYPE_*) */
 #define PIANO_MCA_VERIFY 0x21002u         /* non-zero while a charger authentication runs */
 #define PIANO_MCA_PDOS 0x21011u           /* up to 7 x {min mV, max mV, max mA} */
+#define PIANO_MCA_PPS 0x21017u            /* ask a PPS source for an APDO voltage: (mV / 20) << 16 | mA / 50 (external policy, hv 2) */
 #define PIANO_MCA_PD_FIXED 0x21018u       /* ask the source for a fixed PDO, mV */
 
 enum {
@@ -129,11 +132,15 @@ typedef struct {
     /* the cycle */
     uint8_t cursor, in_flight, refresh_wanted;
     uint32_t seq, sent_property, sent_opcode;
-    /* the writes the policy queued, sent between cycles; sent_write: one of them is in flight */
-    struct {uint32_t property, value; uint8_t bytes;} queue[4];
+    /* the writes the policy queued, sent between cycles; sent_write: one of them is in flight (the built-in policy uses 4 entries,
+     * an external one all 6) */
+    struct {uint32_t property, value; uint8_t bytes;} queue[6];
     uint8_t queued, sent_write;
     /* the policy: 0 reads only, 1 writes at 5 V; hv_allowed adds the 9 V request */
     uint8_t policy, hv_allowed, attached, hv, hv_checks, attach_cycles;
+    /* external: ChargePolicy decides (piano-power-policy=1): the built-in policy is left out, the board configuration stays, the owner
+     * queues through piano_mca_queue; stop_allowed admits 0x2003 = 0 (battery health on), pps_allowed the 9 V APDO request (hv 2) */
+    uint8_t external, stop_allowed, pps_allowed;
     uint8_t unsuspend_allowed, unsuspend_tries;
     uint8_t board_allowed, board_done, board_tries;   /* the board configuration: bit 0 CP state, 1 OTG, 2 CID */
     uint8_t icl_tries, fcc_tries, enable_tries;
@@ -182,6 +189,18 @@ void piano_mca_allow_unsuspend(PianoMca *m, int allow);
 void piano_mca_allow_board(PianoMca *m, int allow);
 /* The gauges' temperature, used when the firmware's own reading is missing. */
 void piano_mca_battery_temperature(PianoMca *m, int valid, int32_t celsius);
+/* ChargePolicy decides instead of the built-in policy (docs/drivers/charging-policy.md §8): the cycle, the board configuration, the port
+ * notifications and the UCSI probe stay; stop: battery health is on (0x2003 = 0 admitted); pps: hv 2 (0x21017's 9 V word admitted).
+ * Without the policy (piano-power-write=0) the codec stays read only: piano_mca_queue refuses everything. */
+void piano_mca_use_external_policy(PianoMca *m, int stop, int pps);
+/* A write the external policy wants, queued for the gap after this cycle (one per property: a later value replaces a queued one).
+ * Returns 0 queued, -1 refused (outside piano_mca_write_allowed_for, or no policy), -2 the queue is full. */
+int piano_mca_queue(PianoMca *m, uint32_t property, uint32_t value, uint8_t bytes);
+/* The board configuration of this link is through (taken, given up after five cycles, or not allowed): the policy may write. */
+int piano_mca_board_settled(const PianoMca *m);
+/* The allowlist as this codec applies it: piano_mca_write_allowed, and with the external policy 0x2003 = 0 only when stop_allowed,
+ * 0x21017 only as the 9 V word (500..3000 mA) when pps_allowed, 0x21018 = 9000 only when hv_allowed. */
+int piano_mca_write_allowed_for(const PianoMca *m, uint32_t property, uint32_t value, uint8_t bytes);
 uint32_t piano_mca_take_events(PianoMca *m);
 /* The link's charger generation is configured: a whole cycle ended with no write due or in flight (so the board configuration and the
  * policy's writes are through, or given up) and the port enable was answered or timed out. PianoPower's quiet flag waits for it. */
@@ -199,6 +218,8 @@ int piano_mca_write_allowed(uint32_t property, uint32_t value, uint8_t bytes);
 /* The max current of the source's fixed PDO at mv, 0 when it has none. */
 uint32_t piano_mca_pdo_fixed(const PianoMca *m, uint32_t mv);
 const char *piano_mca_type_name(int type);
+/* The name the log gives a written property ("input limit", "charge current", ...; "property" for others). */
+const char *piano_mca_property_name(uint32_t property);
 
 #ifdef __cplusplus
 }

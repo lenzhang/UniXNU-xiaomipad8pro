@@ -135,6 +135,21 @@ int piano_mca_write_allowed(uint32_t property, uint32_t value, uint8_t bytes)
     }
 }
 
+int piano_mca_write_allowed_for(const PianoMca *m, uint32_t property, uint32_t value, uint8_t bytes)
+{
+    if (!m->external) return piano_mca_write_allowed(property, value, bytes);
+    switch (property) {
+    case PIANO_MCA_CHARGE_ENABLE: return bytes == 1 && (value == 1 || (value == 0 && m->stop_allowed));
+    case PIANO_MCA_PD_FIXED: return bytes == 4 && (value == 5000 || (value == 9000 && m->hv_allowed));
+    case PIANO_MCA_PPS: {
+        const uint32_t mv = (value >> 16) * 20, ma = (value & 0xffffu) * 50;
+        return bytes == 4 && m->pps_allowed && mv == 9000 && ma >= 500 && ma <= 3000;
+    }
+    case PIANO_MCA_INPUT_SUSPEND: return 0;   /* the built-in policy's opt-in only */
+    default: return piano_mca_write_allowed(property, value, bytes);
+    }
+}
+
 uint32_t piano_mca_next(PianoMca *m, uint8_t out[PIANO_MCA_REQUEST_BYTES])
 {
     if (m->in_flight) return 0;
@@ -142,7 +157,7 @@ uint32_t piano_mca_next(PianoMca *m, uint8_t out[PIANO_MCA_REQUEST_BYTES])
     while (m->queued && m->cursor == NO_CYCLE) {
         const uint32_t property = m->queue[0].property, value = m->queue[0].value;
         const uint8_t bytes = m->queue[0].bytes;
-        if (m->policy && piano_mca_write_allowed(property, value, bytes)) {
+        if (m->policy && piano_mca_write_allowed_for(m, property, value, bytes)) {
             zero(out, PIANO_MCA_REQUEST_BYTES);
             header(out, PIANO_MCA_OWNER, PIANO_MCA_OP_WRITE);
             put32(out + 12, property);
@@ -242,15 +257,42 @@ uint32_t piano_mca_pdo_fixed(const PianoMca *m, uint32_t mv)
     return 0;
 }
 
-static void queue_write(PianoMca *m, uint32_t property, uint32_t value, uint8_t bytes)
+#define BUILTIN_QUEUE 4   /* the built-in policy's queue, as it always was */
+
+static int queue_into(PianoMca *m, uint32_t property, uint32_t value, uint8_t bytes, unsigned room)
 {
     for (unsigned i = 0; i < m->queued; ++i)
-        if (m->queue[i].property == property) {m->queue[i].value = value; m->queue[i].bytes = bytes; return;}
-    if (m->queued >= sizeof m->queue / sizeof m->queue[0]) return;
+        if (m->queue[i].property == property) {m->queue[i].value = value; m->queue[i].bytes = bytes; return 0;}
+    if (m->queued >= room) return -2;
     m->queue[m->queued].property = property;
     m->queue[m->queued].value = value;
     m->queue[m->queued].bytes = bytes;
     m->queued++;
+    return 0;
+}
+
+static void queue_write(PianoMca *m, uint32_t property, uint32_t value, uint8_t bytes)
+{
+    (void)queue_into(m, property, value, bytes, BUILTIN_QUEUE);
+}
+
+void piano_mca_use_external_policy(PianoMca *m, int stop, int pps)
+{
+    m->external = 1;
+    m->stop_allowed = m->policy && stop;
+    m->pps_allowed = m->policy && pps;
+}
+
+int piano_mca_queue(PianoMca *m, uint32_t property, uint32_t value, uint8_t bytes)
+{
+    if (!m->policy || !m->external || !piano_mca_write_allowed_for(m, property, value, bytes)) {
+        m->refused++;
+        m->events |= McaEvRefused;
+        return -1;
+    }
+    const int r = queue_into(m, property, value, bytes, sizeof m->queue / sizeof m->queue[0]);
+    if (!r) m->settled = 0;   /* something is to be written: this generation is not configured yet */
+    return r;
 }
 
 static void hv_step(PianoMca *m, int type)
@@ -300,9 +342,15 @@ static int board(PianoMca *m)
     return 1;
 }
 
+int piano_mca_board_settled(const PianoMca *m)
+{
+    return !m->board_allowed || m->board_done == 7 || m->board_tries > BOARD_TRIES;
+}
+
 static void policy(PianoMca *m)
 {
     if (!m->policy) return;
+    if (m->external) {(void)board(m); return;}   /* ChargePolicy decides the rest (the owner queues it) */
     if (board(m)) return;
     if (!piano_mca_has(m, McaBusVoltage)) return;
     const int attached = m->value[McaBusVoltage] > ONLINE_UV;
@@ -539,6 +587,23 @@ const char *piano_mca_status_name(int32_t status)
     case 3: return "not charging";
     case 4: case 5: return "full";
     default: return "unknown";
+    }
+}
+
+const char *piano_mca_property_name(uint32_t property)
+{
+    switch (property) {
+    case PIANO_MCA_ICL: return "input limit";
+    case PIANO_MCA_FCC: return "charge current";
+    case PIANO_MCA_CHARGE_ENABLE: return "charge enable";
+    case PIANO_MCA_PD_FIXED: return "PD fixed request";
+    case PIANO_MCA_PPS: return "PPS request";
+    case PIANO_MCA_INPUT_SUSPEND: return "input suspend";
+    case PIANO_MCA_CP_STATE: return "CP state";
+    case PIANO_MCA_OTG_CFG: return "OTG configuration";
+    case PIANO_MCA_CID_CFG: return "CID configuration";
+    case PIANO_MCA_TERM_VOLT: return "float voltage";
+    default: return "property";
     }
 }
 
