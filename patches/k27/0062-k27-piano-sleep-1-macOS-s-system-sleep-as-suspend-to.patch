@@ -1,0 +1,1185 @@
+From d613a22702fad88688808b54de2d8b29f45a6431 Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Wed, 11 Nov 2026 15:10:01 +0800
+Subject: [PATCH 62/62] k27: piano-sleep=1: macOS's system sleep as
+ suspend-to-idle (CPUs parked in PSCI states, wake sources polled)
+
+The stock arm64 sleep cannot run on this platform: ArmCpu's haltCPU spins in WFI on the calling CPU, its initCPU(false)
+panics, this board's arm64_prepare_for_sleep is a WFI loop, and Gunyah's SYSTEM_SUSPEND needs every other vCPU in CPU_OFF,
+which ArmCpu cannot undo. So, as Linux's s2idle on this tablet: IOPMrootDomain takes the drivers down as usual, then
+IOCPUSleepKernel (piano branch) runs the platform actions and piano_s2idle_enter():
+
+- parks the other CPUs (a bound kernel thread each: preemption and interrupts off, the virtual timer masked, the sleep
+  state's PSCI vote via k27 0061's chooser), freezes them with a handshake IPI after which they take no interrupt (so
+  nothing runs or stamps a time), and loops on the boot CPU in the deepest state allowed (piano-sleep-state, default ret;
+  ss3 only with the LLCC island reserved), its virtual timer the poll clock (piano-sleep-poll, 100 ms), reading the wake
+  sources between polls without any driver code: the power key and volume-down (PON INT_RT_STS, SPMI observer), the cover
+  opening (TLMM gpio80), the keyboard's status line (gpio95, latched by its owner), a USB-C attach change (Type-C block),
+  piano-sleep-max seconds, or a peripheral SPI (piano-sleep-wake selects; default the power key);
+- on wake: waits for the power key's release (PianoInput sees no press), moves mach_absolute_time() back by the time
+  asleep (no sleep in absolute time, as on a Mac) and has clock_wakeup_calendar() add it to the calendar, releases and
+  resyncs the parked CPUs; IOPMrootDomain then wakes the drivers and makes it a full wake (requestUserActive, wake reason
+  "piano.<source>" claimed); an aborted suspend (a CPU that does not park) returns at once.
+- The Gunyah watchdog is armed from entry, pinged by the loop every 5 s and for 240 s after wake (IOPMrootDomain's 180 s
+  wake watchdog panics into it), so a hang resets the tablet (piano-sleep-wdt=0 off; piano-reset-after keeps it).
+- piano-sleep=1 overrides the ADT's /defaults sleep-disabled (1 in every native image) at boot completion; without it
+  nothing changes. piano-sleep-test=S[,piano-sleep-test-count=N]: kIOPMSleepNow S s after boot and after each wake, with
+  piano-sleep-max 30 unless given (unattended tests). machdep.piano_sleep: counts, last duration and reason, RPMh line.
+- RPMh sleep counters logged at entry and wake: whether CX and DDR got anywhere (they need the drivers' votes gone: the
+  contract in UniXNU-piano package/include/PianoPowerContract.h).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bsd/dev/arm64/sysctl.c          |  17 +
+ iokit/Kernel/IOCPU.cpp          |  58 +++
+ iokit/Kernel/IOPMrootDomain.cpp |  48 ++
+ osfmk/arm64/piano_pm.c          | 884 ++++++++++++++++++++++++++++++++
+ osfmk/arm64/piano_pm.h          |  28 +-
+ osfmk/kern/clock.c              |   9 +
+ 6 files changed, 1041 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/dev/arm64/sysctl.c b/bsd/dev/arm64/sysctl.c
+index 1b1acc3..88050c8 100644
+--- a/bsd/dev/arm64/sysctl.c
++++ b/bsd/dev/arm64/sysctl.c
+@@ -152,6 +152,23 @@ SYSCTL_PROC(_machdep, OID_AUTO, piano_cpuidle_level,
+     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_piano_cpuidle_level, "I",
+     "piano-cpuidle: the deepest level in force (0 WFI .. the boot argument's level)");
++
++/* piano (k27 0062): suspend-to-idle, its count, last duration and wake reasons */
++extern size_t piano_sleep_format(char *buf, size_t len);
++
++static int
++sysctl_piano_sleep SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	char buf[512];
++	size_t n = piano_sleep_format(buf, sizeof(buf));
++	return SYSCTL_OUT(req, buf, n + 1);
++}
++
++SYSCTL_PROC(_machdep, OID_AUTO, piano_sleep,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_piano_sleep, "A",
++    "piano-sleep: suspend-to-idle state and counters");
+ #endif /* defined(XNU_VM_GUEST) */
+ 
+ #if defined(HAS_IPI)
+diff --git a/iokit/Kernel/IOCPU.cpp b/iokit/Kernel/IOCPU.cpp
+index 278be13..59b30b8 100644
+--- a/iokit/Kernel/IOCPU.cpp
++++ b/iokit/Kernel/IOCPU.cpp
+@@ -253,6 +253,58 @@ OSMetaClassDefineReservedUnused(IOCPU, 7);
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+ #if !USE_APPLEARMSMP
++#if defined(XNU_VM_GUEST) && defined(__arm64__)
++/*
++ * piano (k27 0062): piano-sleep=1. ArmCpu cannot take a CPU down and bring it back (its haltCPU spins in WFI on the calling CPU,
++ * its initCPU(false) panics) and this board's arm64_prepare_for_sleep never returns, so the stock sequence below would hang the
++ * tablet at the first haltCPU. Instead the system sleeps here as suspend-to-idle (osfmk/arm64/piano_pm.c): the drivers are down
++ * already (IOPMrootDomain's power tree), the other CPUs are parked in a PSCI idle state, the boot CPU idles until a wake source,
++ * and the same platform actions, trace points and the sleep/wake watchdog bracket it as on a Mac.
++ */
++#include <IOKit/IOPlatformActions.h>
++extern "C" bool piano_sleep_enabled(void);
++extern "C" int piano_s2idle_enter(void (*quiesce)(void), void (*active)(void));
++extern "C" const char *piano_s2idle_reason_name(int reason);
++
++static void
++piano_quiesce_actions(void)
++{
++	IOCPURunPlatformQuiesceActions();
++}
++
++static void
++piano_active_actions(void)
++{
++	IOCPURunPlatformActiveActions();
++}
++
++static void
++piano_sleep_kernel(IOPMrootDomain *rootDomain)
++{
++	printf("IOCPUSleepKernel enter (piano: suspend-to-idle)\n");
++	rootDomain->tracePoint( kIOPMTracePointSleepPlatformActions );
++	IOPlatformActionsPreSleep();
++	rootDomain->tracePoint( kIOPMTracePointSleepCPUs );
++
++	thread_t self = current_thread();
++	integer_t old_pri = thread_kern_get_pri(self);
++	thread_kern_set_pri(self, thread_kern_get_kernel_maxpri());
++
++	rootDomain->tracePoint( kIOPMTracePointSleepPlatformDriver );
++	rootDomain->stop_watchdog_timer();
++
++	int reason = piano_s2idle_enter(&piano_quiesce_actions, &piano_active_actions);
++
++	rootDomain->start_watchdog_timer();
++	rootDomain->tracePoint( kIOPMTracePointWakeCPUs );
++	rootDomain->tracePoint( kIOPMTracePointWakePlatformActions );
++	IOPlatformActionsPostResume();
++
++	thread_kern_set_pri(self, old_pri);
++	printf("IOCPUSleepKernel exit (piano: %s)\n", piano_s2idle_reason_name(reason));
++}
++#endif /* defined(XNU_VM_GUEST) && defined(__arm64__) */
++
+ void
+ IOCPUSleepKernel(void)
+ {
+@@ -264,6 +316,12 @@ IOCPUSleepKernel(void)
+ 	IOCPU *bootCPU = NULL;
+ 	IOPMrootDomain  *rootDomain = IOService::getPMRootDomain();
+ 
++#if defined(XNU_VM_GUEST) && defined(__arm64__)
++	if (piano_sleep_enabled()) {
++		piano_sleep_kernel(rootDomain);
++		return;
++	}
++#endif
+ 	printf("IOCPUSleepKernel enter\n");
+ 	sched_override_available_cores_for_sleep();
+ 
+diff --git a/iokit/Kernel/IOPMrootDomain.cpp b/iokit/Kernel/IOPMrootDomain.cpp
+index 4b42199..94dd5e8 100644
+--- a/iokit/Kernel/IOPMrootDomain.cpp
++++ b/iokit/Kernel/IOPMrootDomain.cpp
+@@ -529,6 +529,24 @@ enum {
+ };
+ 
+ static IOPMrootDomain * gRootDomain;
++
++#if defined(XNU_VM_GUEST) && defined(__arm64__)
++/* piano (k27 0062): suspend-to-idle (osfmk/arm64/piano_pm.c, UniXNU-piano docs/power.md) */
++extern "C" bool piano_sleep_enabled(void);
++extern "C" int piano_s2idle_last_reason(void);
++extern "C" const char *piano_s2idle_reason_name(int reason);
++extern "C" void piano_sleep_system_up(void (*request_sleep)(void));
++
++/* piano-sleep-test: the timed sleep request, as a "Sleep Now" from a power controller would be */
++static void
++piano_request_sleep(void)
++{
++	if (gRootDomain != NULL) {
++		gRootDomain->receivePowerNotification(kIOPMSleepNow);
++	}
++}
++#endif
++
+ static IORootParent *   gPatriarch;
+ static IONotifier *     gSysPowerDownNotifier = NULL;
+ static UInt32           gSleepOrShutdownPending = 0;
+@@ -3393,6 +3411,26 @@ IOPMrootDomain::powerChangeDone( unsigned long previousPowerState )
+ 		timeSinceReset = ml_get_time_since_reset();
+ 		kdebugTrace(kPMLogSystemWake, 0, (uintptr_t)(timeSinceReset >> 32), (uintptr_t) timeSinceReset);
+ 
++#if defined(XNU_VM_GUEST) && defined(__arm64__)
++		/*
++		 * piano (k27 0062): a suspend-to-idle wake. Every wake source it has is the user's (power key, cover, keyboard, USB-C,
++		 * volume-down) or a test's (piano-sleep-max, an interrupt): a full wake, as the dark wake promotion boot-arg does;
++		 * the reason in the wake reason key and claimed as the wake event. An aborted suspend (a CPU did not park) wakes so too.
++		 */
++		bool piano_wake = piano_sleep_enabled();
++		if (piano_wake) {
++			const char *piano_reason = piano_s2idle_reason_name(piano_s2idle_last_reason());
++			char piano_name[48];
++			snprintf(piano_name, sizeof(piano_name), "piano.%s", piano_reason);
++			setProperty(kIOPMRootDomainWakeReasonKey, piano_name);
++			setProperty("piano-wake-reason", piano_reason);
++			claimSystemWakeEvent(this, kIOPMWakeEventSource, piano_name, NULL);
++			wranglerTickled = true;
++			fullWakeReason = kFullWakeReasonLocalUser;
++			requestUserActive(this, piano_name);
++			piano_sleep_system_up(&piano_request_sleep);
++		} else
++#endif
+ 		if ((gDarkWakeFlags & kDarkWakeFlagPromotionMask) == kDarkWakeFlagPromotionEarly) {
+ 			wranglerTickled = true;
+ 			fullWakeReason = kFullWakeReasonLocalUser;
+@@ -8505,7 +8543,17 @@ IOPMrootDomain::dispatchPowerEvent(
+ 					DLOG("Clearing gSleepDisabledFlag due to test_sleep_in_vm boot-arg\n");
+ 					gSleepDisabledFlag = 0;
+ 				}
++#if defined(XNU_VM_GUEST) && defined(__arm64__)
++				/* piano (k27 0062): every native ADT says sleep-disabled 1; piano-sleep=1 alone makes system sleep possible */
++				if (gSleepDisabledFlag && piano_sleep_enabled()) {
++					IOLog("piano-sleep: the ADT's sleep-disabled is overridden (piano-sleep=1): system sleep is suspend-to-idle\n");
++					gSleepDisabledFlag = 0;
++				}
++#endif
+ 			}
++#if defined(XNU_VM_GUEST) && defined(__arm64__)
++			piano_sleep_system_up(&piano_request_sleep);
++#endif
+ 
+ 			if (lowBatteryCondition || thermalEmergencyState) {
+ 				if (lowBatteryCondition) {
+diff --git a/osfmk/arm64/piano_pm.c b/osfmk/arm64/piano_pm.c
+index 8c5c74c..cb28a6e 100644
+--- a/osfmk/arm64/piano_pm.c
++++ b/osfmk/arm64/piano_pm.c
+@@ -636,6 +636,847 @@ piano_cpuidle_init(void)
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_cpuidle_init);
+ 
++/* ==== k27 0062 begin ==== */
++/*
++ * k27 0062: piano-sleep=1, macOS's system sleep as suspend-to-idle (UniXNU-piano docs/power.md §3).
++ *
++ * The platform cannot do the sleep XNU's arm64 path expects (IOCPUSleepKernel: ArmCpu's haltCPU spins in WFI on the caller,
++ * initCPU(false) panics, and this board's arm64_prepare_for_sleep is a WFI loop that only a SoC power cycle would leave), and
++ * Gunyah offers SYSTEM_SUSPEND only with every other vCPU in CPU_OFF, which ArmCpu cannot undo. So, as Linux's s2idle on this
++ * tablet does: after IOPMrootDomain has taken every driver down (setPowerState through the power tree) and IOCPUSleepKernel's
++ * platform actions ran, piano_s2idle_enter()
++ *   1. parks the other CPUs: a kernel thread bound to each, preemption off and interrupts masked, its virtual timer masked,
++ *      in the sleep state's PSCI CPU_SUSPEND vote (or WFI) until released; it takes pending IPIs while the others park;
++ *   2. freezes: every parked CPU acknowledges that it takes no more interrupts (a handshake IPI), so nothing else runs and
++ *      nothing stamps a time any more; every polling thread stops (all piano drivers poll; nothing can wake them);
++ *   3. loops on the boot CPU in the same state (the last CPU of all: the deepest domain state allowed), its virtual timer the
++ *      poll clock (piano-sleep-poll ms), and reads the wake sources between polls (no driver code runs): the power key and
++ *      volume-down (PMK8550 PON INT_RT_STS through the SPMI observer channel), the cover opening (TLMM gpio80 level), the
++ *      keyboard's status line (TLMM gpio95, latched by its owner), a USB-C attach change (the charger PMIC's Type-C block),
++ *      piano-sleep-max seconds, or a peripheral interrupt;
++ *   4. on wake: the power key's release, mach_absolute_time() moved back by the time asleep (it does not count sleep, as on a
++ *      Mac; the calendar is advanced by clock_wakeup_calendar through piano_s2idle_take_wake_utc), the others released and
++ *      their timers resynced, and IOPMrootDomain's normal wake (drivers up, a full wake for a user wake source).
++ * The Gunyah watchdog (32 s bite) is armed from entry, pinged by the loop every 5 s, and kept for 240 s after wake: a hang
++ * anywhere in that path resets the tablet instead of leaving it dark (piano-sleep-wdt=0 turns this off).
++ *
++ * What this does not do: the RPMh sleep votes. CX collapse and DDR self-refresh need every APPS vote dropped by its driver
++ * before the system state (the RSC replays its sleep set only when the CPU subsystem goes down), and the LLCC island slice
++ * reserved (else the SoC resets); the drivers' side is UniXNU-piano package/include/PianoPowerContract.h. The RPMh counters
++ * before and after each suspend say whether CX and DDR got there.
++ */
++#include <kern/sched_prim.h>
++#include <kern/processor.h>
++#include <kern/thread.h>
++#include <kern/timer_queue.h>
++#include <arm/cpu_internal.h>
++#include <arm/commpage/commpage.h>
++
++#define GH_WDT_CONTROL          0x86000005ULL
++#define GH_WDT_PING             0x86000007ULL
++#define GH_WDT_SET_TIME         0x86000008ULL
++
++
++#define ICC_IAR1_EL1            "S3_0_C12_C12_0"
++#define ICC_EOIR1_EL1           "S3_0_C12_C12_1"
++#define PIANO_INTID_VTIMER      27
++#define PIANO_INTID_SPI_IPI     1008       /* ArmCpu's armcpu-spi-ipi: SPI 1008 + core */
++
++#define SPMI_ARB_CORE           0x0C400000ULL
++#define SPMI_ARB_CNFG           0x0C42D000ULL
++#define SPMI_ARB_OBSV           0x0C440000ULL
++#define PIANO_PON_PPID          0x013u
++#define PIANO_PON_RT_STS        0x10
++#define PIANO_TLMM              0x0F100000ULL
++#define PIANO_GPIO_HALL         80
++#define PIANO_GPIO_KBD_STATUS   95
++
++static bool piano_sleep_on;
++static uint32_t piano_sleep_state = 1;            /* piano-sleep-state: the deepest level while suspended (0 WFI .. 3 ss3) */
++static uint32_t piano_sleep_poll_ms = 100;        /* piano-sleep-poll */
++static uint32_t piano_sleep_wake = PIANO_SRC_POWER; /* piano-sleep-wake */
++static uint32_t piano_sleep_max_s;                /* piano-sleep-max: wake after S s (0 never) */
++static uint32_t piano_sleep_wdt = 1;              /* piano-sleep-wdt */
++static uint32_t piano_sleep_test_s, piano_sleep_test_count = 1;
++static bool piano_sleep_reset_after;              /* piano-reset-after (k27 0056) owns the watchdog */
++
++static volatile uint32_t *piano_spmi_core, *piano_spmi_cnfg, *piano_spmi_obsv;
++static uint32_t piano_spmi_count;
++static int piano_pon_apid = -1, piano_typec_apid = -1;
++static volatile uint32_t *piano_hall, *piano_kbd_status;   /* TLMM pin pages: +0 CTL, +4 IO, +8 INTR_CFG, +0xc INTR_STATUS */
++static bool piano_sleep_hw_ready;
++
++static thread_t piano_park_thread[MAX_CPUS];
++static uint32_t piano_park_want;                  /* the CPUs that park for this suspend */
++static _Atomic uint32_t piano_parked;             /* the CPUs parked now */
++static _Atomic uint32_t piano_frozen_ack;         /* the parked CPUs that take no more interrupts */
++static _Atomic uint32_t piano_park_gen;
++static volatile uint32_t piano_park_release;
++static volatile uint32_t piano_park_frozen;
++static int piano_park_level;
++static uint64_t piano_park_windows[MAX_CPUS], piano_park_swallowed[MAX_CPUS];
++
++static uint32_t piano_sleep_count, piano_sleep_aborts, piano_sleep_last_irq = 1023;
++static int piano_sleep_last_reason;
++static uint64_t piano_sleep_last_ms, piano_sleep_total_ms, piano_sleep_last_polls, piano_sleep_last_spurious,
++    piano_sleep_last_ipis;
++static uint64_t piano_sleep_reasons[10];
++static uint64_t piano_slept_abs;                  /* for the calendar at wake */
++static bool piano_slept_pending;
++static bool piano_wdt_on;
++static uint64_t piano_wdt_until;
++static thread_call_t piano_wdt_call, piano_test_call;
++static void (*piano_sleep_request)(void);
++static uint32_t piano_sleep_tests;
++
++_Static_assert(PIANO_WAKE_POWER_KEY == PIANO_PM_WAKE_POWER_KEY && PIANO_WAKE_LID == PIANO_PM_WAKE_LID &&
++    PIANO_WAKE_USB == PIANO_PM_WAKE_USB && PIANO_WAKE_VOLUME_DOWN == PIANO_PM_WAKE_VOLUME_DOWN &&
++    PIANO_WAKE_KEYBOARD == PIANO_PM_WAKE_KEYBOARD, "piano_pm.h and piano_pm_policy.h name the wake reasons alike");
++
++static const char *const piano_wake_names[] = {
++	"none", "aborted", "power-key", "lid", "usb", "volume-down", "timer", "irq", "keyboard",
++};
++
++const char *
++piano_s2idle_reason_name(int reason)
++{
++	if (reason < 0 || reason >= (int)(sizeof(piano_wake_names) / sizeof(piano_wake_names[0]))) {
++		return "unknown";
++	}
++	return piano_wake_names[reason];
++}
++
++bool
++piano_sleep_enabled(void)
++{
++	return piano_sleep_on;
++}
++
++int
++piano_s2idle_last_reason(void)
++{
++	return piano_sleep_last_reason;
++}
++
++/* ---- the wake sources: SPMI observer reads (as k27 0057/0060) and TLMM levels; read only ---- */
++
++static bool
++piano_spmi_done(volatile uint32_t *status, int spins)
++{
++	for (int i = 0; i < spins; i++) {
++		uint32_t st = status[0];
++		if (st & 1) {
++			return (st & 0xe) == 0;
++		}
++	}
++	return false;
++}
++
++static int
++piano_spmi_read(int apid, uint8_t reg, uint8_t *value, unsigned n)
++{
++	if (apid < 0 || piano_spmi_obsv == NULL || n == 0 || n > 8) {
++		return -1;
++	}
++	volatile uint32_t *ch = piano_spmi_obsv + (0x20 >> 2) * (uint32_t)apid;
++	/* A command another reader (PianoInput, PianoPower) had in flight when its thread stopped finishes first. */
++	(void)piano_spmi_done(&ch[2], 2000);
++	ch[0] = (1u << 27) | ((uint32_t)reg << 4) | (n - 1);
++	if (!piano_spmi_done(&ch[2], 100000)) {
++		return -1;
++	}
++	uint32_t lo = ch[6], hi = n > 4 ? ch[7] : 0;
++	for (unsigned b = 0; b < n; b++) {
++		value[b] = (uint8_t)((b < 4 ? lo : hi) >> (8 * (b & 3)));
++	}
++	return 0;
++}
++
++/* The APID of a PPID; one owned by EE 0 wins (observer reads need no ownership). */
++static int
++piano_spmi_apid(uint32_t ppid)
++{
++	int found = -1;
++	uint32_t owner = 8;
++	for (uint32_t i = 0; i < piano_spmi_count; i++) {
++		uint32_t map = piano_spmi_core[(0x2000 >> 2) + i];
++		if (map == 0 || ((map >> 8) & 0xfff) != ppid) {
++			continue;
++		}
++		uint32_t o = piano_spmi_cnfg[i] & 7;
++		if (found < 0 || (o == 0 && owner != 0)) {
++			found = (int)i;
++			owner = o;
++		}
++	}
++	return found;
++}
++
++/* The charger PMIC's Type-C block (UniXNU-piano package/PianoPower/ChargerPmic.h): SID 7, the lowest TYPE 0x02 block with
++ * SUBTYPE 0x7f, 0xa8 or 0xba is the charger, Type-C is 0x600 above it (0x900 for SUBTYPE 0xba..0xc4); +0x0b bit 0 attached. */
++static int
++piano_typec_find(void)
++{
++	bool have = false;
++	uint16_t best = 0;
++	uint8_t subtype = 0;
++	for (uint32_t i = 0; i < piano_spmi_count; i++) {
++		uint32_t map = piano_spmi_core[(0x2000 >> 2) + i];
++		uint32_t ppid = (map >> 8) & 0xfff;
++		if (map == 0 || (ppid >> 8) != 7) {
++			continue;
++		}
++		uint16_t address = (uint16_t)((ppid & 0xff) << 8);
++		if (have && address >= best) {
++			continue;
++		}
++		uint8_t kind[2] = { 0, 0 };
++		if (piano_spmi_read((int)i, 4, kind, 2) != 0 || !piano_pm_charger_kind(kind[0], kind[1])) {
++			continue;
++		}
++		best = address;
++		subtype = kind[1];
++		have = true;
++	}
++	if (!have) {
++		return -1;
++	}
++	uint16_t typec = piano_pm_typec_address(best, subtype);
++	return piano_spmi_apid((7u << 8) | (typec >> 8));
++}
++
++static void
++piano_sleep_hw_setup(void)
++{
++	if (piano_sleep_hw_ready) {
++		return;
++	}
++	piano_sleep_hw_ready = true;
++	piano_spmi_core = (volatile uint32_t *)ml_io_map(SPMI_ARB_CORE, 0x3000);
++	piano_spmi_cnfg = (volatile uint32_t *)ml_io_map(SPMI_ARB_CNFG, 0x1000);
++	piano_spmi_obsv = (volatile uint32_t *)ml_io_map(SPMI_ARB_OBSV, 0x20 * 1024);
++	if (piano_spmi_core != NULL && piano_spmi_cnfg != NULL && piano_spmi_obsv != NULL) {
++		uint32_t version = piano_spmi_core[0], count = piano_spmi_core[1] & 0x7ff;
++		if ((version >> 28) == 7 && count != 0 && count <= 1024) {
++			piano_spmi_count = count;
++			piano_pon_apid = piano_spmi_apid(PIANO_PON_PPID);
++			if (piano_sleep_wake & PIANO_SRC_USB) {
++				piano_typec_apid = piano_typec_find();
++			}
++		} else {
++			printf("piano-sleep: SPMI arbiter version %#x, %u APIDs: not v7, no power key wake\n", version, count);
++		}
++	}
++	piano_hall = (volatile uint32_t *)ml_io_map(PIANO_TLMM + PIANO_GPIO_HALL * 0x1000ULL, 0x1000);
++	piano_kbd_status = (volatile uint32_t *)ml_io_map(PIANO_TLMM + PIANO_GPIO_KBD_STATUS * 0x1000ULL, 0x1000);
++	printf("piano-sleep: wake sources: power key and volume-down PON APID %d, cover gpio80 IO %#x, keyboard gpio95 INTR_CFG %#x, "
++	    "Type-C APID %d\n", piano_pon_apid, piano_hall ? piano_hall[1] : 0, piano_kbd_status ? piano_kbd_status[2] : 0,
++	    piano_typec_apid);
++}
++
++/* What the sources read before the suspend (thread context, interrupts on): an edge from there wakes. */
++static void
++piano_wake_baseline(struct piano_pm_wake *b)
++{
++	uint8_t pon = 0, misc = 0;
++	bool pon_ok = piano_pon_apid >= 0 && piano_spmi_read(piano_pon_apid, PIANO_PON_RT_STS, &pon, 1) == 0;
++	bool usb_ok = piano_typec_apid >= 0 && piano_spmi_read(piano_typec_apid, 0x0b, &misc, 1) == 0;
++	piano_pm_wake_arm(b, piano_sleep_wake, pon_ok, pon, piano_hall != NULL, piano_hall ? piano_hall[1] : 0,
++	    piano_kbd_status != NULL, piano_kbd_status ? piano_kbd_status[2] : 0, piano_kbd_status ? piano_kbd_status[3] : 0,
++	    usb_ok, misc);
++}
++
++/* One look at the armed sources, interrupts masked (only those are read): a PIANO_WAKE_* reason, or 0. */
++static int
++piano_wake_poll(struct piano_pm_wake *b)
++{
++	uint8_t pon = 0, misc = 0;
++	bool pon_ok = (b->src & (PIANO_SRC_POWER | PIANO_SRC_VOLUME_DOWN)) &&
++	    piano_spmi_read(piano_pon_apid, PIANO_PON_RT_STS, &pon, 1) == 0;
++	bool usb_ok = (b->src & PIANO_SRC_USB) && piano_spmi_read(piano_typec_apid, 0x0b, &misc, 1) == 0;
++	return piano_pm_wake_check(b, pon_ok, pon, (b->src & PIANO_SRC_LID) ? piano_hall[1] : 0,
++	    (b->src & PIANO_SRC_KEYBOARD) ? piano_kbd_status[3] : 0, usb_ok, misc);
++}
++
++/* ---- the Gunyah watchdog across the suspend (SMCCC vendor-hypervisor calls, as k27 0056) ---- */
++
++static void
++piano_wdt_arm(void)
++{
++	if (!piano_sleep_wdt || piano_wdt_on) {
++		return;
++	}
++	if ((int64_t)piano_pm_call(GH_WDT_SET_TIME, 30000, 32000, 0) == 0 && (int64_t)piano_pm_call(GH_WDT_CONTROL, 3, 0, 0) == 0) {
++		piano_wdt_on = true;
++	}
++}
++
++static inline void
++piano_wdt_ping(void)
++{
++	if (piano_wdt_on) {
++		(void)piano_pm_call(GH_WDT_PING, 0, 0, 0);
++	}
++}
++
++/* After a wake: pinged every 10 s for 240 s, then off again unless piano-reset-after keeps it (and pings it itself). */
++static void
++piano_wdt_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	piano_wdt_ping();
++	if (mach_absolute_time() < piano_wdt_until) {
++		uint64_t deadline;
++		clock_interval_to_deadline(10, NSEC_PER_SEC, &deadline);
++		thread_call_enter_delayed(piano_wdt_call, deadline);
++		return;
++	}
++	if (piano_wdt_on && !piano_sleep_reset_after) {
++		(void)piano_pm_call(GH_WDT_CONTROL, 2, 0, 0);
++		piano_wdt_on = false;
++		printf("piano-sleep: the wake went through: the Gunyah watchdog is off again\n");
++	}
++}
++
++static void
++piano_wdt_window(void)
++{
++	if (!piano_wdt_on) {
++		return;
++	}
++	clock_interval_to_deadline(240, NSEC_PER_SEC, &piano_wdt_until);   /* past IOPMrootDomain's 180 s wake watchdog panic */
++	piano_wdt_tick(NULL, NULL);
++}
++
++/* ---- the park ---- */
++
++/* A long masked or non-preemptible stretch is the point here: no scheduler-hygiene timeout for it (DEVELOPMENT kernels). */
++static inline void
++piano_masked_forget(void)
++{
++#if SCHED_HYGIENE_DEBUG
++	ml_spin_debug_clear_self();
++#endif
++}
++
++/* An interrupt taken by hand while frozen (an IPI sent before the freeze): acknowledged and ended, XNU's signal bits stay set
++ * and are handled after the release. Returns the INTID, 1023 when nothing was pending. */
++static uint32_t
++piano_swallow_pending(void)
++{
++	uint32_t id = (uint32_t)(__builtin_arm_rsr64(ICC_IAR1_EL1) & 0xffffff);
++	if (id < 1020) {
++		__builtin_arm_wsr64(ICC_EOIR1_EL1, id);
++		__builtin_arm_isb(ISB_SY);
++	}
++	return id;
++}
++
++static void
++piano_park_here(int cpu)
++{
++	if (piano_park_release) {
++		return;
++	}
++	cpu_data_t *cdp = getCpuDatap();
++	struct piano_idle_cpu *pc = &piano_idle[cpu];
++	if (!pc->ready) {
++		piano_idle_cpu_setup(cdp, pc);
++	}
++	bool swallowed = false;
++	disable_preemption();
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	uint64_t ctl = __builtin_arm_rsr64("CNTV_CTL_EL0");
++	__builtin_arm_wsr64("CNTV_CTL_EL0", ctl | CNTV_CTL_EL0_IMASKED);   /* this CPU's timer cannot wake it */
++	__builtin_arm_isb(ISB_SY);
++	os_atomic_or(&piano_parked, 1u << cpu, release);
++	for (;;) {
++		if (piano_park_release) {
++			break;
++		}
++		const bool frozen = piano_park_frozen != 0;
++		if (frozen) {
++			os_atomic_or(&piano_frozen_ack, 1u << cpu, release);   /* from here on no XNU code runs on this CPU */
++		}
++		uint32_t param = 0;
++		int level = piano_idle_pick(pc, cpu, piano_park_level, mach_absolute_time(), UINT64_MAX, &param);
++		(void)piano_idle_do(cdp, pc, level, param, piano_counter(), false);
++		if (piano_park_release) {
++			break;
++		}
++		if (__builtin_arm_rsr64("ISR_EL1") != 0) {
++			if (!frozen) {
++				/* An IPI (the peripherals' SPIs go to the boot CPU) from a CPU that is not parked yet: taken here, with the
++				 * timer still masked and preemption off, so a sender waiting for it is not held up. */
++				piano_park_windows[cpu]++;
++				piano_masked_forget();
++				ml_set_interrupts_enabled(TRUE);
++				ml_set_interrupts_enabled(FALSE);
++			} else if (piano_swallow_pending() < 1020) {
++				piano_park_swallowed[cpu]++;
++				swallowed = true;
++			}
++		}
++	}
++	__builtin_arm_wsr64("CNTV_CTL_EL0", ctl);
++	__builtin_arm_isb(ISB_SY);
++	timer_resync_deadlines();
++	ClearIdlePop(FALSE);                       /* the decrementer from this CPU's deadlines, after the timebase moved */
++	os_atomic_andnot(&piano_parked, 1u << cpu, release);
++	piano_masked_forget();
++	abandon_preemption_disable_measurement();
++	ml_set_interrupts_enabled(istate);
++	enable_preemption();
++	if (swallowed) {
++		(void)cpu_signal(cdp, SIGPnop, NULL, NULL);   /* the signals of the IPIs taken by hand */
++	}
++}
++
++__attribute__((noreturn))
++static void
++piano_park_main(void *arg, wait_result_t wr __unused)
++{
++	int cpu = (int)(uintptr_t)arg;
++	uint32_t seen = 0;
++	thread_bind(cpu_to_processor(cpu));
++	thread_block(THREAD_CONTINUE_NULL);
++	for (;;) {
++		assert_wait((event_t)&piano_park_gen, THREAD_UNINT);
++		if (os_atomic_load(&piano_park_gen, acquire) != seen) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		} else {
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++		uint32_t gen = os_atomic_load(&piano_park_gen, acquire);
++		if (gen == seen) {
++			continue;
++		}
++		seen = gen;
++		if ((piano_park_want & (1u << cpu)) != 0 && cpu_number() == cpu) {
++			piano_park_here(cpu);
++		}
++	}
++}
++
++static void
++piano_park_setup(void)
++{
++	int boot = ml_get_boot_cpu_number();
++	int max = ml_get_max_cpu_number();
++	for (int cpu = 0; cpu <= max && cpu < MAX_CPUS; cpu++) {
++		if (cpu == boot || piano_park_thread[cpu] != THREAD_NULL || cpu_datap(cpu) == NULL) {
++			continue;
++		}
++		thread_t t = THREAD_NULL;
++		if (kernel_thread_start_priority(piano_park_main, (void *)(uintptr_t)cpu, MAXPRI_KERNEL, &t) == KERN_SUCCESS) {
++			thread_set_thread_name(t, "piano-sleep-park");
++			piano_park_thread[cpu] = t;
++		}
++	}
++}
++
++static void
++piano_park_signal(uint32_t mask)
++{
++	__builtin_arm_dsb(DSB_ISH);
++	for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
++		if (mask & (1u << cpu)) {
++			(void)cpu_signal(cpu_datap(cpu), SIGPnop, NULL, NULL);
++		}
++	}
++}
++
++/* ---- the boot CPU's loop ---- */
++
++static uint32_t
++piano_sleep_level(void)
++{
++	uint32_t level = piano_sleep_state < PIANO_IDLE_LEVELS ? piano_sleep_state : PIANO_IDLE_LEVELS - 1;
++	if (level == 3 && !piano_llcc_island_ok()) {
++		level = 2;
++	}
++	if (level > 0 && piano_psci_suspend_features < 0) {
++		level = 0;
++	}
++	return level;
++}
++
++/* Arm the virtual timer TICKS from now (counter ticks), unmasked: CPU_SUSPEND or WFI returns when it fires. */
++static inline void
++piano_timer_in(uint64_t ticks)
++{
++	__builtin_arm_wsr64("CNTV_TVAL_EL0", ticks);
++	__builtin_arm_wsr64("CNTV_CTL_EL0", CNTV_CTL_EL0_ENABLE);
++	__builtin_arm_isb(ISB_SY);
++}
++
++/* The pending interrupt after a wake from the state: the poll timer is acknowledged and quietened here (XNU never sees it), an
++ * IPI is acknowledged (its signal bits wait for the release); a peripheral's SPI is acknowledged and returned. 1023: none. */
++static uint32_t
++piano_take_pending(bool *ipi)
++{
++	uint32_t id = (uint32_t)(__builtin_arm_rsr64(ICC_IAR1_EL1) & 0xffffff);
++	if (id >= 1020) {
++		return id;
++	}
++	if (id == PIANO_INTID_VTIMER) {
++		__builtin_arm_wsr64("CNTV_CTL_EL0", CNTV_CTL_EL0_ENABLE | CNTV_CTL_EL0_IMASKED);
++		__builtin_arm_isb(ISB_SY);
++	}
++	__builtin_arm_wsr64(ICC_EOIR1_EL1, id);
++	__builtin_arm_isb(ISB_SY);
++	if (id < 16 || (id >= PIANO_INTID_SPI_IPI && id < PIANO_INTID_SPI_IPI + 8)) {
++		*ipi = true;
++	}
++	return id;
++}
++
++static int
++piano_s2idle_loop(struct piano_pm_wake *b, cpu_data_t *cdp, struct piano_idle_cpu *pc, int level, uint64_t start, bool *ipi)
++{
++	const uint64_t frq = __builtin_arm_rsr64("CNTFRQ_EL0");
++	const uint64_t poll = frq / 1000 * piano_sleep_poll_ms;
++	const uint64_t limit = (uint64_t)piano_sleep_max_s * frq;
++	uint64_t poll_abs = 0;
++	nanoseconds_to_absolutetime((uint64_t)piano_sleep_poll_ms * NSEC_PER_MSEC, &poll_abs);
++	uint64_t pinged = start;
++	piano_sleep_last_polls = piano_sleep_last_spurious = piano_sleep_last_ipis = 0;
++	for (;;) {
++		int r = piano_wake_poll(b);
++		if (r != 0) {
++			return r;
++		}
++		uint64_t now = piano_counter();
++		if (limit != 0 && now - start >= limit) {
++			return PIANO_WAKE_TIMER;
++		}
++		if (now - pinged >= 5 * frq) {
++			piano_wdt_ping();
++			pinged = now;
++		}
++		piano_timer_in(poll);
++		uint32_t param = 0;
++		uint64_t abs = mach_absolute_time();
++		int l = piano_idle_pick(pc, cdp->cpu_number, level, abs, abs + poll_abs, &param);
++		(void)piano_idle_do(cdp, pc, l, param, piano_counter(), false);
++		uint32_t id = piano_take_pending(ipi);
++		if (id == PIANO_INTID_VTIMER) {
++			piano_sleep_last_polls++;
++		} else if (id >= 1020) {
++			piano_sleep_last_spurious++;
++		} else if (id < 16 || (id >= PIANO_INTID_SPI_IPI && id < PIANO_INTID_SPI_IPI + 8)) {
++			piano_sleep_last_ipis++;
++		} else {
++			piano_sleep_last_irq = id;
++			return PIANO_WAKE_IRQ;
++		}
++	}
++}
++
++/* After a power key wake: until the key is up (at most 3 s), so that PianoInput sees no press and macOS no sleep request. */
++static void
++piano_wait_power_release(bool *ipi)
++{
++	const uint64_t step = __builtin_arm_rsr64("CNTFRQ_EL0") / 50;   /* 20 ms */
++	for (int i = 0; i < 150; i++) {
++		uint8_t pon = 0;
++		if (piano_spmi_read(piano_pon_apid, PIANO_PON_RT_STS, &pon, 1) != 0 || (pon & PIANO_PON_KPDPWR) == 0) {
++			return;
++		}
++		piano_timer_in(step);
++		__builtin_arm_dsb(DSB_SY);
++		__builtin_arm_wfi();
++		(void)piano_take_pending(ipi);
++	}
++}
++
++static void
++piano_rpmh_log(const char *when, uint32_t n)
++{
++	char line[200];
++	piano_rpmh_line(line, sizeof(line));
++	printf("piano-sleep: suspend %u %s: RPMh sleep %s\n", n, when, line);
++}
++
++int
++piano_s2idle_enter(void (*quiesce)(void), void (*active)(void))
++{
++	if (!piano_sleep_on) {
++		return PIANO_WAKE_ABORTED;
++	}
++	piano_sleep_hw_setup();
++	piano_park_setup();
++	processor_t prev = thread_bind(master_processor);
++	thread_block(THREAD_CONTINUE_NULL);
++	const int boot = cpu_number();
++	const uint32_t n = ++piano_sleep_count;
++	const int level = (int)piano_sleep_level();
++	struct piano_pm_wake base;
++	piano_wake_baseline(&base);
++	printf("piano-sleep: suspend %u: CPUs down to %s, wake on%s%s%s%s%s%s, poll %u ms, watchdog %s\n", n,
++	    piano_idle_e[level].name, base.src & PIANO_SRC_POWER ? " power-key" : "", base.src & PIANO_SRC_LID ? " cover-open" : "",
++	    base.src & PIANO_SRC_KEYBOARD ? " keyboard" : "", base.src & PIANO_SRC_USB ? " usb" : "",
++	    base.src & PIANO_SRC_VOLUME_DOWN ? " volume-down" : "", piano_sleep_max_s ? " timer" : "", piano_sleep_poll_ms,
++	    piano_sleep_wdt ? "armed (32 s bite)" : "off");
++	if (piano_sleep_max_s) {
++		printf("piano-sleep: automatic wake after %u s (piano-sleep-max)\n", piano_sleep_max_s);
++	}
++	piano_rpmh_log("entry", n);
++	piano_wdt_arm();
++
++	/* 1. park the others */
++	uint32_t want = 0;
++	for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
++		if (cpu != boot && piano_park_thread[cpu] != THREAD_NULL && cpu_to_processor(cpu) != PROCESSOR_NULL &&
++		    cpu_to_processor(cpu)->state != PROCESSOR_OFF_LINE) {
++			want |= 1u << cpu;
++		}
++	}
++	piano_park_release = 0;
++	piano_park_frozen = 0;
++	piano_park_level = level;
++	piano_park_want = want;
++	os_atomic_store(&piano_parked, 0, relaxed);
++	os_atomic_store(&piano_frozen_ack, 0, relaxed);
++	os_atomic_inc(&piano_park_gen, release);
++	thread_wakeup((event_t)&piano_park_gen);
++	const char *abort_why = NULL;
++	uint32_t missing = 0;
++	uint64_t deadline;
++	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
++	while ((os_atomic_load(&piano_parked, acquire) & want) != want) {
++		if (mach_absolute_time() > deadline) {
++			missing = want & ~os_atomic_load(&piano_parked, acquire);
++			abort_why = "did not park within 1 s";
++			break;
++		}
++		delay(50);
++	}
++
++	/* 2. freeze: interrupts off here, and every parked CPU acknowledges that it takes none either */
++	disable_preemption();
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	const uint64_t frq = __builtin_arm_rsr64("CNTFRQ_EL0");
++	if (abort_why == NULL) {
++		piano_park_frozen = 1;
++		piano_park_signal(want);
++		for (uint64_t until = piano_counter() + frq / 10; (os_atomic_load(&piano_frozen_ack, acquire) & want) != want;) {
++			if (piano_counter() > until) {
++				missing = want & ~os_atomic_load(&piano_frozen_ack, acquire);
++				abort_why = "did not stop taking interrupts within 100 ms";
++				break;
++			}
++		}
++	}
++	if (abort_why != NULL) {
++		piano_park_frozen = 0;
++		piano_park_release = 1;
++		piano_park_signal(want);
++		piano_masked_forget();
++		abandon_preemption_disable_measurement();
++		ml_set_interrupts_enabled(istate);
++		enable_preemption();
++		for (int i = 0; i < 10000 && os_atomic_load(&piano_parked, acquire) != 0; i++) {
++			delay(100);
++		}
++		piano_sleep_aborts++;
++		piano_sleep_last_reason = PIANO_WAKE_ABORTED;
++		piano_sleep_reasons[PIANO_WAKE_ABORTED]++;
++		printf("piano-sleep: suspend %u aborted: CPUs %#x %s\n", n, missing, abort_why);
++		thread_bind(prev);
++		thread_block(THREAD_CONTINUE_NULL);
++		piano_wdt_window();
++		return PIANO_WAKE_ABORTED;
++	}
++	if (quiesce != NULL) {
++		quiesce();
++	}
++	cpu_data_t *cdp = getCpuDatap();
++	struct piano_idle_cpu *pc = &piano_idle[boot];
++	if (!pc->ready) {
++		piano_idle_cpu_setup(cdp, pc);
++	}
++	const uint64_t ctl = __builtin_arm_rsr64("CNTV_CTL_EL0");
++	const uint64_t abs0 = mach_absolute_time();
++	const uint64_t cnt0 = piano_counter();
++
++	/* 3. the loop */
++	bool ipi = false;
++	int reason = piano_s2idle_loop(&base, cdp, pc, level, cnt0, &ipi);
++	const uint64_t cnt1 = piano_counter();
++	if (reason == PIANO_WAKE_POWER_KEY) {
++		piano_wait_power_release(&ipi);
++	}
++
++	/* 4. back */
++	__builtin_arm_wsr64("CNTV_CTL_EL0", ctl);
++	__builtin_arm_isb(ISB_SY);
++	piano_slept_abs = mach_absolute_time() - abs0;
++	rtclock_base_abstime = abs0 - ml_get_hwclock();             /* mach_absolute_time() resumes where it stopped */
++	for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
++		cpu_data_t *c = cpu_datap(cpu);
++		if (c != NULL) {
++			c->cpu_base_timebase = rtclock_base_abstime;
++		}
++	}
++	commpage_update_timebase();
++	piano_slept_pending = true;
++	if (active != NULL) {
++		active();
++	}
++	piano_park_frozen = 0;
++	piano_park_release = 1;
++	piano_park_signal(want);
++	uint32_t stuck = 0;
++	for (uint64_t until = piano_counter() + frq / 2; os_atomic_load(&piano_parked, acquire) != 0;) {
++		if (piano_counter() > until) {
++			stuck = os_atomic_load(&piano_parked, acquire);
++			break;
++		}
++	}
++	timer_resync_deadlines();
++	ClearIdlePop(FALSE);
++	piano_masked_forget();
++	abandon_preemption_disable_measurement();
++	ml_set_interrupts_enabled(istate);
++	enable_preemption();
++	if (ipi) {
++		(void)cpu_signal(cdp, SIGPnop, NULL, NULL);   /* the signals of the IPIs the loop took by hand */
++	}
++	thread_bind(prev);
++	thread_block(THREAD_CONTINUE_NULL);
++
++	const uint64_t ms = (cnt1 - cnt0) * 1000 / frq;
++	piano_sleep_last_ms = ms;
++	piano_sleep_total_ms += ms;
++	piano_sleep_last_reason = reason;
++	piano_sleep_reasons[reason]++;
++	if (reason == PIANO_WAKE_IRQ) {
++		printf("piano-sleep: suspend %u: woke after %llu.%03llu s by interrupt %u; %llu polls, %llu IPIs, %llu spurious\n", n,
++		    ms / 1000, ms % 1000, piano_sleep_last_irq, piano_sleep_last_polls, piano_sleep_last_ipis, piano_sleep_last_spurious);
++	} else {
++		printf("piano-sleep: suspend %u: woke after %llu.%03llu s by %s; %llu polls, %llu IPIs, %llu spurious\n", n, ms / 1000,
++		    ms % 1000, piano_s2idle_reason_name(reason), piano_sleep_last_polls, piano_sleep_last_ipis, piano_sleep_last_spurious);
++	}
++	piano_rpmh_log("wake", n);
++	if (stuck != 0) {
++		panic("piano-sleep: CPUs %#x did not come back from the park after suspend %u", stuck, n);
++	}
++	piano_wdt_window();
++	return reason;
++}
++
++bool
++piano_s2idle_take_wake_utc(unsigned long *secs, unsigned int *usecs)
++{
++	if (!piano_slept_pending) {
++		return false;
++	}
++	piano_slept_pending = false;
++	clock_sec_t s = 0;
++	clock_usec_t us = 0;
++	clock_get_calendar_microtime(&s, &us);      /* the calendar as mach_absolute_time() has it, sleep not counted */
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(piano_slept_abs, &ns);
++	piano_pm_add_slept(s, us, ns, secs, usecs);
++	return true;
++}
++
++static void
++piano_test_tick(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	piano_sleep_tests++;
++	printf("piano-sleep: test sleep %u of %u (piano-sleep-test): asking IOPMrootDomain to sleep now\n", piano_sleep_tests,
++	    piano_sleep_test_count);
++	if (piano_sleep_request != NULL) {
++		piano_sleep_request();
++	}
++}
++
++void
++piano_sleep_system_up(void (*request_sleep)(void))
++{
++	if (!piano_sleep_on) {
++		return;
++	}
++	piano_sleep_request = request_sleep;
++	piano_park_setup();
++	if (piano_sleep_test_s == 0 || piano_sleep_tests >= piano_sleep_test_count) {
++		return;
++	}
++	if (piano_test_call == NULL) {
++		piano_test_call = thread_call_allocate_with_options(piano_test_tick, NULL, THREAD_CALL_PRIORITY_KERNEL,
++		    THREAD_CALL_OPTIONS_ONCE);
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(piano_sleep_test_s, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(piano_test_call, deadline);
++	printf("piano-sleep: test sleep %u of %u in %u s\n", piano_sleep_tests + 1, piano_sleep_test_count, piano_sleep_test_s);
++}
++
++size_t
++piano_sleep_format(char *buf, size_t len)
++{
++	size_t n = (size_t)snprintf(buf, len, "%s; state %u, poll %u ms, wake mask %#x, max %u s; suspends %u (aborted %u), "
++	    "last %llu ms by %s, total %llu ms; wakes:", piano_sleep_on ? "on" : "off", piano_sleep_state, piano_sleep_poll_ms,
++	    piano_sleep_wake, piano_sleep_max_s, piano_sleep_count, piano_sleep_aborts, piano_sleep_last_ms,
++	    piano_s2idle_reason_name(piano_sleep_last_reason), piano_sleep_total_ms);
++	for (int r = 2; r < (int)(sizeof(piano_wake_names) / sizeof(piano_wake_names[0])) && n < len; r++) {
++		n += (size_t)snprintf(buf + n, len - n, " %s %llu", piano_wake_names[r], piano_sleep_reasons[r]);
++	}
++	if (n < len) {
++		n += (size_t)snprintf(buf + n, len - n, "; LLCC island %s; rpmh ", piano_llcc_island < 0 ? "not read" :
++		    piano_llcc_island ? "reserved" : "not reserved");
++	}
++	if (n < len) {
++		n += piano_rpmh_line(buf + n, len - n);
++	}
++	if (n < len) {
++		n += (size_t)snprintf(buf + n, len - n, "\n");
++	}
++	return n < len ? n : len - 1;
++}
++
++static void
++piano_sleep_init(void)
++{
++	uint32_t on = 0, reset_after = 0;
++	if (!PE_parse_boot_argn("piano-sleep", &on, sizeof(on)) || on != 1) {
++		return;
++	}
++	if (ml_psci_conduit != PIANO_CONDUIT_SMC) {
++		printf("piano-sleep: PSCI is not through SMC (ADT /psci): native only, system sleep stays off\n");
++		return;
++	}
++	PE_parse_boot_argn("piano-sleep-state", &piano_sleep_state, sizeof(piano_sleep_state));
++	PE_parse_boot_argn("piano-sleep-poll", &piano_sleep_poll_ms, sizeof(piano_sleep_poll_ms));
++	PE_parse_boot_argn("piano-sleep-wake", &piano_sleep_wake, sizeof(piano_sleep_wake));
++	PE_parse_boot_argn("piano-sleep-max", &piano_sleep_max_s, sizeof(piano_sleep_max_s));
++	PE_parse_boot_argn("piano-sleep-wdt", &piano_sleep_wdt, sizeof(piano_sleep_wdt));
++	PE_parse_boot_argn("piano-sleep-test", &piano_sleep_test_s, sizeof(piano_sleep_test_s));
++	PE_parse_boot_argn("piano-sleep-test-count", &piano_sleep_test_count, sizeof(piano_sleep_test_count));
++	piano_sleep_reset_after = PE_parse_boot_argn("piano-reset-after", &reset_after, sizeof(reset_after)) && reset_after != 0;
++	if (piano_sleep_poll_ms < 20) {
++		piano_sleep_poll_ms = 20;
++	} else if (piano_sleep_poll_ms > 1000) {
++		piano_sleep_poll_ms = 1000;
++	}
++	if (piano_sleep_test_s != 0 && piano_sleep_max_s == 0) {
++		piano_sleep_max_s = 30;                   /* an unattended test always comes back */
++	}
++	piano_pm_probe();
++	const uint32_t level = piano_sleep_level();
++	piano_pm_domains_setup((int)level);
++	piano_wdt_call = thread_call_allocate_with_options(piano_wdt_tick, NULL, THREAD_CALL_PRIORITY_KERNEL_HIGH,
++	    THREAD_CALL_OPTIONS_ONCE);
++	piano_sleep_on = true;
++	printf("piano-sleep: system sleep is suspend-to-idle: CPUs down to %s while suspended (%s), wake mask %#x (1 power key, "
++	    "2 cover open, 4 usb, 8 volume-down, 16 keyboard), poll %u ms%s\n", piano_idle_e[level].name,
++	    piano_osi ? "OS-initiated" : "platform-coordinated", piano_sleep_wake, piano_sleep_poll_ms,
++	    piano_sleep_test_s ? ", test sleeps (piano-sleep-test)" : "");
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_sleep_init);
++/* ==== k27 0062 end ==== */
++
+ #else /* !defined(XNU_VM_GUEST) */
+ 
+ size_t
+@@ -667,4 +1508,47 @@ piano_cpuidle_latency_release(int handle __unused)
+ {
+ }
+ 
++/* ==== k27 0062 stubs begin ==== */
++size_t
++piano_sleep_format(char *buf, size_t len)
++{
++	return (size_t)snprintf(buf, len, "not built\n");
++}
++
++bool
++piano_sleep_enabled(void)
++{
++	return false;
++}
++
++int
++piano_s2idle_enter(void (*quiesce)(void) __unused, void (*active)(void) __unused)
++{
++	return PIANO_WAKE_ABORTED;
++}
++
++const char *
++piano_s2idle_reason_name(int reason __unused)
++{
++	return "none";
++}
++
++int
++piano_s2idle_last_reason(void)
++{
++	return PIANO_WAKE_NONE;
++}
++
++bool
++piano_s2idle_take_wake_utc(unsigned long *secs __unused, unsigned int *usecs __unused)
++{
++	return false;
++}
++
++void
++piano_sleep_system_up(void (*request_sleep)(void) __unused)
++{
++}
++/* ==== k27 0062 stubs end ==== */
++
+ #endif /* defined(XNU_VM_GUEST) */
+diff --git a/osfmk/arm64/piano_pm.h b/osfmk/arm64/piano_pm.h
+index 0e7f830..dd64d13 100644
+--- a/osfmk/arm64/piano_pm.h
++++ b/osfmk/arm64/piano_pm.h
+@@ -1,7 +1,7 @@
+ /*
+- * piano (k27 0061): CPU idle through PSCI CPU_SUSPEND, for the native k27 on the Xiaomi Pad 8 Pro (SM8750, EL1 under Gunyah).
+- * UniXNU-piano docs/power.md has the design, the facts it rests on and the test plan; nothing here runs unless piano-cpuidle
+- * (or piano-pm-probe) is set.
++ * piano (k27 0061, 0062): CPU idle through PSCI CPU_SUSPEND, and system sleep as suspend-to-idle, for the native k27 on the
++ * Xiaomi Pad 8 Pro (SM8750, EL1 under Gunyah). UniXNU-piano docs/power.md has the design, the facts it rests on and the test
++ * plan; nothing here runs unless piano-cpuidle, piano-sleep (or piano-pm-probe) is set.
+  */
+ #ifndef _ARM64_PIANO_PM_H_
+ #define _ARM64_PIANO_PM_H_
+@@ -33,6 +33,28 @@ int piano_cpuidle_set_level(int level);
+  */
+ int piano_cpuidle_latency_hold(uint32_t max_exit_us);
+ void piano_cpuidle_latency_release(int handle);
++
++/* k27 0062: piano-sleep=1. machdep.piano_sleep (string). */
++size_t piano_sleep_format(char *buf, size_t len);
++bool piano_sleep_enabled(void);
++/* IOCPUSleepKernel's suspend-to-idle; QUIESCE/ACTIVE are the kQueueQuiesce/kQueueActive platform actions. A PIANO_WAKE_*. */
++int piano_s2idle_enter(void (*quiesce)(void), void (*active)(void));
++const char *piano_s2idle_reason_name(int reason);
++int piano_s2idle_last_reason(void);
++/* clock_wakeup_calendar: the wall time at wake (the calendar plus the time suspended), once after each suspend. */
++bool piano_s2idle_take_wake_utc(unsigned long *secs, unsigned int *usecs);
++/* IOPMrootDomain, once boot completed and after every wake: the park threads, piano-sleep-test's next request. */
++void piano_sleep_system_up(void (*request_sleep)(void));
+ __END_DECLS
+ 
++#define PIANO_WAKE_NONE         0
++#define PIANO_WAKE_ABORTED      1   /* a CPU did not park within 1 s: nothing was suspended */
++#define PIANO_WAKE_POWER_KEY    2
++#define PIANO_WAKE_LID          3   /* the cover opened (hall gpio80 high) */
++#define PIANO_WAKE_USB          4   /* a USB-C attach or detach */
++#define PIANO_WAKE_VOLUME_DOWN  5
++#define PIANO_WAKE_TIMER        6   /* piano-sleep-max */
++#define PIANO_WAKE_IRQ          7   /* an interrupt other than the poll timer was pending */
++#define PIANO_WAKE_KEYBOARD     8   /* the keyboard's status line (gpio95, latched by PianoKeyboard) */
++
+ #endif /* _ARM64_PIANO_PM_H_ */
+diff --git a/osfmk/kern/clock.c b/osfmk/kern/clock.c
+index 119f8ba..e25f108 100644
+--- a/osfmk/kern/clock.c
++++ b/osfmk/kern/clock.c
+@@ -1294,6 +1294,15 @@ clock_wakeup_calendar_legacy(void)
+ 		/*
+ 		 * Get UTC time and corresponding sys time
+ 		 */
++#if defined(XNU_VM_GUEST) && defined(__arm64__)
++		/*
++		 * piano (k27 0062): after a suspend-to-idle the time asleep is known exactly (the architected counter runs through it,
++		 * mach_absolute_time() was moved back by it): the calendar plus that, rather than the platform's RTC, which answers 0
++		 * without piano-rtc (k27 0060) and has a 1 s resolution with it.
++		 */
++		extern bool piano_s2idle_take_wake_utc(unsigned long *secs, unsigned int *usecs);
++		if (!piano_s2idle_take_wake_utc(&wake_sec, &wake_usec))
++#endif
+ 		PEGetUTCTimeOfDay(&wake_sec, &wake_usec);
+ 		wake_abs = mach_absolute_time();
+ 		absolutetime_to_microtime(wake_abs, &wake_sys_sec, &wake_sys_usec);
+-- 
+2.55.0
+
