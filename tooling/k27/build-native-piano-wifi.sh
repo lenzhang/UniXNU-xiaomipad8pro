@@ -25,4 +25,7 @@ done
 python3 "$D/tooling/k27/build-native-kext.py" PianoWifi "$P/PianoWifi.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
   "$P/WifiFirmware.c" "$P/FatVolume.c" -I "$P" --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
-[ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" | cut -c1-160 >&2
+# PianoA830's lock words and NativeUfs's partition reader come from those kexts (libraries in PianoWifi.json, both linked before
+# PianoWifi in configs/k27-native-kexts.txt), resolved by the KC link.
+[ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" --library-prefix _sm8750_rpmh_drv2_owner \
+  --library-prefix _sm8750_gcc_vote_owner --library-prefix _native_ufs_part_ | cut -c1-160 >&2
