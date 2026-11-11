@@ -1,0 +1,105 @@
+#!/bin/sh
+# piano-wifi: what PianoWifi's level 6 scan found, on the tablet itself (docs/drivers/wifi.md sections 13 and 13.1).
+#
+# The driver publishes the scan as the registry property `piano-wifi-scan` (an array of one dictionary per network) on itself
+# and on PianoWifiEthernet, the en1 interface of the macOS side. This reads it with ioreg — no other tool, no network, nothing
+# written — and prints a table. A network's address is **masked to its first three bytes** unless --full is given, because a
+# pasted log or a commit must never carry the owner's environment (wifi.md section 11).
+#
+#   piano-wifi              the networks, addresses masked
+#   piano-wifi --full       the whole addresses (for a join, not for a document)
+#   piano-wifi status       what the ladder reached, the interface, the summary line
+#   piano-wifi --raw        the property as ioreg prints it
+#
+# Levels: nothing is published without piano-wifi=6, and the interface only appears when level 6 came up.
+set -u
+FULL=0
+MODE=table
+for arg in "$@"; do
+  case $arg in
+  --full) FULL=1 ;;
+  --raw) MODE=raw ;;
+  status) MODE=status ;;
+  -h | --help)
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  *)
+    echo "piano-wifi: $arg?  (piano-wifi [--full] | piano-wifi status | piano-wifi --raw)" >&2
+    exit 2
+    ;;
+  esac
+done
+
+property() {   # property NAME: the first line of ioreg that carries it, from either driver
+  ioreg -c PianoWifi -r -l -w0 2>/dev/null | grep -m1 "\"$1\" = "
+}
+
+case $MODE in
+raw)
+  property piano-wifi-scan
+  exit 0
+  ;;
+status)
+  for name in piano-wifi piano-wifi-level6 piano-wifi-link piano-wifi-scan-summary; do
+    line=$(property "$name")
+    [ -n "$line" ] && echo "$line" | sed 's/^[ |]*//'
+  done
+  if ifconfig en1 > /dev/null 2>&1; then
+    echo "en1: $(ifconfig en1 | sed -n 's/.*status: *//p; s/^	flags=\([^ ]*\).*/flags \1/p' | tr '\n' ' ')"
+  else
+    echo "en1: not published (PianoWifiEthernet needs PianoWifi's level 6 to come up)"
+  fi
+  exit 0
+  ;;
+esac
+
+LINE=$(property piano-wifi-scan)
+if [ -z "$LINE" ]; then
+  echo "piano-wifi: no scan in the registry: the driver is not loaded, or piano-wifi is below 6" >&2
+  exit 1
+fi
+
+# One network per "},{" group; each is a flat list of key=value pairs, which awk turns into a row.
+printf '%s\n' "$LINE" | awk -v full="$FULL" '
+function value(text, key,   m) {
+  if (match(text, "\"" key "\"=\"[^\"]*\"")) {
+    m = substr(text, RSTART, RLENGTH)
+    sub("\"" key "\"=\"", "", m)
+    sub("\"$", "", m)
+    return m
+  }
+  if (match(text, "\"" key "\"=[^,}]*")) {
+    m = substr(text, RSTART, RLENGTH)
+    sub("\"" key "\"=", "", m)
+    return m
+  }
+  return ""
+}
+function signed(n) { return (n + 0 > 2147483647) ? n - 4294967296 : n + 0 }
+function mask(address,   parts, n, i, out) {
+  if (full == 1) return address
+  n = split(address, parts, ":")
+  out = ""
+  for (i = 1; i <= n; i++) out = out (i > 1 ? ":" : "") (i <= 3 ? parts[i] : "**")
+  return out
+}
+{
+  body = $0
+  sub(/^.*= \(/, "", body)
+  sub(/\)[^)]*$/, "", body)
+  count = split(body, entries, /\}, *\{/)
+  printf "%-32s %-17s %7s %6s %6s %8s\n", "SSID", "BSSID", "CHANNEL", "MHZ", "DBM", "FRAMES"
+  for (i = 1; i <= count; i++) {
+    text = entries[i]
+    ssid = value(text, "ssid")
+    bssid = value(text, "bssid")
+    if (bssid == "") continue
+    hidden = value(text, "hidden")
+    if (ssid == "") ssid = (hidden == "Yes") ? "(it does not say its name)" : "(none)"
+    printf "%-32s %-17s %7s %6s %6d %8d\n", ssid, mask(bssid), value(text, "channel"), value(text, "freq"),
+           signed(value(text, "rssi")), value(text, "beacons") + value(text, "probes")
+    kept++
+  }
+  if (kept == 0) print "(the scan found nothing)"
+}'
