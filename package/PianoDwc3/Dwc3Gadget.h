@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // A minimal DWC3 device-mode (gadget) core for the piano debug channel: one event buffer, EP0 control transfers (chapter 9 and
-// the CDC-ACM class requests), and one bulk IN + one bulk OUT transfer in flight per ACM port. Polled, single-threaded: every
-// method runs on the caller's one USB thread. Written for UniXNU-piano from the DWC3 programming model (Dwc3Regs.h); the
+// the CDC-ACM class requests), and one bulk IN + one bulk OUT transfer in flight per ACM port; optionally a CDC-NCM network
+// function (NCM class requests, its alternate setting, notifications, one NTB16 in flight each way). Polled, single-threaded:
+// every method runs on the caller's one USB thread. Written for UniXNU-piano from the DWC3 programming model (Dwc3Regs.h); the
 // takeover order and the piano-specific quirks follow Project-SunUEFI's piano driver (BSD-2-Clause-Patent, see UPSTREAM).
 //
 // Portable and header-only: the kernel (PianoDwc3.cpp) and the host test (tests/usb_gadget_host.cpp) instantiate it with their
@@ -16,13 +17,22 @@
 //   void rxData(unsigned port, const uint8_t *src, unsigned len);
 //   void lineState(unsigned port, uint16_t state);                  SET_CONTROL_LINE_STATE (bit 0 DTR, bit 1 RTS)
 //   void note(const char *fmt, ...);                                diagnostics
+// and for the network function (bind(..., net = true); never called without it):
+//   unsigned netTxNext(uint8_t *dst, unsigned room);                the next frame to the host into dst if it has at most room
+//                                                                   bytes (it stays queued otherwise); its length, 0 for none
+//   unsigned netRxSpace();                                          room for frames from the host (an NTB's worth is asked for)
+//   bool netRxFrame(const uint8_t *src, unsigned len);              one frame from the host (false: no room, dropped)
+//   void netRxDone();                                               after the frames of one NTB
+//   void netLink(bool up, uint32_t bitsPerSecond);                  the host selected the data interface's alternate 1 (or left it)
 #pragma once
 #include "Dwc3Regs.h"
 #include "UsbDescriptors.h"
+#include "Ncm.h"
+#include "TxFifoPlan.h"
 
 namespace pianousb {
 
-// One physically contiguous, non-cacheable region (128 KiB: three ports).
+// One physically contiguous, non-cacheable region (128 KiB: three ports and the network function).
 struct Layout {
   static constexpr uint32_t kBytes = 0x20000;
   static constexpr uint32_t kEvents = 0x0000, kEventBytes = 0x1000;     // event buffer 0
@@ -34,10 +44,20 @@ struct Layout {
   static constexpr uint32_t kInOff = 0x0000, kInBytes = 0x4000;         //   bulk IN (16 KiB)
   static constexpr uint32_t kOutOff = 0x4000, kOutBytes = 0x1000;       //   bulk OUT (4 KiB, a multiple of 512 and 64)
   static constexpr uint32_t portOff(unsigned p) { return kPortBase + p * kPortStride; }
+  static constexpr uint32_t kNetNotify = 0x15000;                       // network function: one notification (16 bytes),
+  static constexpr uint32_t kNetIn = 0x16000, kNetOut = 0x1a000;        //   NTB IN and NTB OUT (ncm::kNtbMax each)
 };
-static_assert(Layout::kPortBase + kPorts * Layout::kPortStride <= Layout::kBytes, "DMA layout");
+static_assert(Layout::kPortBase + kPorts * Layout::kPortStride <= Layout::kNetNotify && Layout::kNetNotify + 64 <= Layout::kNetIn &&
+              Layout::kNetIn + ncm::kNtbMax <= Layout::kNetOut && Layout::kNetOut + ncm::kNtbMax <= Layout::kBytes, "DMA layout");
+static_assert(ncm::kNtbMax % 512 == 0 && Layout::kTrbs + 32 * (2 * kNetBulkEp + 2) <= Layout::kSetup, "NTB OUT size, TRB area");
 
-constexpr unsigned kPhys = 2 + 4 * kPorts;   // EP0 OUT/IN, then per port: (unused OUT), notify IN, bulk OUT, bulk IN
+// EP0 OUT/IN, then per port and for the network function (the fifth slot): (unused OUT), notify IN, bulk OUT, bulk IN.
+constexpr unsigned kPhys = 2 + 4 * (kPorts + 1);
+constexpr unsigned kNetNotifyPhys = physOf(kNetNotifyEp, true), kNetOutPhys = physOf(kNetBulkEp, false),
+                   kNetInPhys = physOf(kNetBulkEp, true);
+static_assert(kNetInPhys < kPhys, "physical endpoints");
+// The network function's IN endpoints (7, 8) are the highest: a core needs this many IN endpoints for it.
+constexpr unsigned kNetInEndpoints = kNetBulkEp + 1u;
 
 struct GadgetStats {
   uint32_t events, deviceEvents, resets, connects, disconnects, linkChanges, erratic, overflows, unknown;
@@ -52,16 +72,23 @@ template <class Hal>
 class Gadget {
 public:
   GadgetStats stats;
+  ncm::NetStats netStats;   // the network function's counters (kept across bus resets)
   uint16_t lineState[kPorts];
   uint8_t lineCoding[kPorts][7];
 
-  // traceEvents: how many events after each bus reset are logged one by one (with the EP0 state), 0 for none.
-  void bind(Hal *hal, unsigned ports, uint16_t product, uint32_t traceEvents = 0)
+  // traceEvents: how many events after each bus reset are logged one by one (with the EP0 state), 0 for none. net: the CDC-NCM
+  // function after the ports (piano-usb-net=1); without it the device is the ACM-only one, descriptors and behaviour unchanged.
+  void bind(Hal *hal, unsigned ports, uint16_t product, uint32_t traceEvents = 0, bool net = false)
   {
     h = hal;
     portCount = ports < 1 ? 1 : ports > kPorts ? kPorts : ports;
     productId = product;
     traceLimit = traceEvents;
+    netOn = net;
+    fifoPlan = TxFifoPlan{};
+    netStats = ncm::NetStats{};
+    netStats.ntbInSize = ncm::kNtbMax;
+    netAlt = 0;
     for (unsigned p = 0; p < kPorts; ++p) {
       static const uint8_t k115200[7] = {0x00, 0xc2, 0x01, 0x00, 0, 0, 8};   // 115200 8N1 (only reported, never used)
       for (unsigned i = 0; i < 7; ++i) lineCoding[p][i] = k115200[i];
@@ -69,7 +96,12 @@ public:
     }
   }
   unsigned ports() const { return portCount; }
+  bool net() const { return netOn; }
   bool configured() const { return stats.configuration == 1; }
+  bool netLinkUp() const { return netOn && configured() && netAlt == 1; }
+  unsigned interfaces() const { return 2 * portCount + (netOn ? 2 : 0); }
+  // TX FIFO sizes written by initDevice() (the network function's; planTxFifos), before the core runs.
+  void setTxFifoPlan(const TxFifoPlan &plan) { fifoPlan = plan; }
 
   // DCTL.CSFTRST with both PHY interfaces awake (a soft reset needs their clocks; the firmware's USB shutdown can leave the
   // UTMI side in suspend). dwc31: DWC_usb31/32 (GSNPSID 0x3331/0x3332): 20 ms steps up to 200 ms, then 50 ms settling.
@@ -117,6 +149,9 @@ public:
     h->wr(GCTL, (h->rd(GCTL) & ~GCTL_PRTCAPDIR_MASK) | GCTL_PRTCAP_DEVICE | GCTL_DSBLCLKGTNG);
     h->wr(DCFG, (h->rd(DCFG) & ~(DCFG_DEVSPD_MASK | DCFG_DEVADDR_MASK | DCFG_NUMP_MASK | DCFG_LPM_CAP)) | DCFG_SPEED_HS | dcfgNump(16));
     for (unsigned i = 0; i < kPhys; ++i) ep[i] = EpState{};
+    netAlt = netAltNew = 0;
+    netNotifyPending = 0;
+    pendNetAlt = false;
     phase = kIdle;
     ep0Mps = 64;
     highSpeed = true;
@@ -132,6 +167,11 @@ public:
       if (!configureEp(phys, EP_CONTROL, ep0Mps, DEPCFG_ACTION_INIT, 0) || !cmd(phys, CMD_SETTRANSFRESOURCE, 1, 0, 0, nullptr)) return false;
     for (unsigned phys = 2; phys < 2 + 4 * portCount; ++phys)
       if (!cmd(phys, CMD_SETTRANSFRESOURCE, 1, 0, 0, nullptr)) return false;
+    if (netOn)
+      for (unsigned phys = kNetNotifyPhys; phys <= kNetInPhys; ++phys)
+        if (!cmd(phys, CMD_SETTRANSFRESOURCE, 1, 0, 0, nullptr)) return false;
+    for (unsigned n = 1; n < fifoPlan.fifos; ++n)   // the core is halted and no IN endpoint is enabled
+      if (fifoPlan.value[n]) h->wr(GTXFIFOSIZ0 + 4 * n, fifoPlan.value[n]);
     h->wr(DALEPENA, 3);
     h->wr(DEVTEN, DEVTEN_DISCONN | DEVTEN_USBRST | DEVTEN_CONNECTDONE | DEVTEN_ULSTCNG | DEVTEN_ERRTICERR);
     return true;
@@ -198,6 +238,7 @@ public:
         if (n) startXfer(in, Layout::portOff(p) + Layout::kInOff, n, dwc3::TRBCTL_NORMAL, n % ep[in].mps == 0);
       }
     }
+    if (netOn) netPump();
   }
 
   bool inBusy(unsigned port) const { return ep[physOf(bulkEp(port), true)].busy; }
@@ -214,7 +255,7 @@ public:
       snapshot("EP0 stuck 1 s: ending it, SETUP again");
       endXfer(0);
       endXfer(1);
-      pendAddress = pendConfig = false;
+      pendAddress = pendConfig = pendNetAlt = false;
       pendLinePort = outPort = -1;
       armSetup();
     } else if (phase == kSetup && !ep[0].busy && now - ep0Since > 100000) {
@@ -290,9 +331,17 @@ private:
   uint8_t newAddress, newConfig;
   int pendLinePort;
   uint16_t pendLineValue;
-  // OUT data stage target
+  // OUT data stage target (kNetSlot: a network function request)
   int outPort;
   uint8_t outRequest;
+  // the network function
+  bool netOn;
+  TxFifoPlan fifoPlan;
+  uint8_t netAlt, netAltNew;   // the data interface's alternate setting; the one SET_INTERFACE asked for (after its status stage)
+  bool pendNetAlt;
+  uint8_t netNotifyPending;    // kNotifySpeed / kNotifyConnect still to send
+  uint16_t netSeq;             // wSequence of the next NTB to the host
+  enum : uint8_t { kNotifySpeed = 1, kNotifyConnect = 2 };
 
   void wakePhy()
   {
@@ -404,7 +453,7 @@ private:
     endXfer(0);
     endXfer(1);
     cmd(0, dwc3::CMD_SETSTALL, 0, 0, 0, nullptr);   // the core clears it with the next SETUP
-    pendAddress = pendConfig = false;
+    pendAddress = pendConfig = pendNetAlt = false;
     pendLinePort = outPort = -1;
     armSetup();
   }
@@ -516,8 +565,9 @@ private:
     endXfer(1);
     h->wr(DCFG, h->rd(DCFG) & ~DCFG_DEVADDR_MASK);
     stats.address = stats.configuration = 0;
-    pendAddress = pendConfig = false;
+    pendAddress = pendConfig = pendNetAlt = false;
     pendLinePort = outPort = -1;
+    netDown();
     setupNotes = 0;
     snapshots = 0;
     if (stats.resets + stats.disconnects <= 8) traceBudget = traceLimit;   // a host that resets in a loop does not flood the log
@@ -583,7 +633,7 @@ private:
     stats.lastSetupLo = uint32_t(u[0]) | uint32_t(u[1]) << 8 | uint32_t(u[2]) << 16 | uint32_t(u[3]) << 24;
     stats.lastSetupHi = uint32_t(u[4]) | uint32_t(u[5]) << 8 | uint32_t(u[6]) << 16 | uint32_t(u[7]) << 24;
     const uint16_t length = uint16_t(u[6] | u[7] << 8);
-    pendAddress = pendConfig = false;
+    pendAddress = pendConfig = pendNetAlt = false;
     pendLinePort = outPort = -1;
     const Reply r = dispatch(u);
     // What goes on the wire: an IN data stage is the reply cut to wLength (+ a zero-length packet when it ends short of
@@ -634,6 +684,8 @@ private:
       if (number == notifyEp(p) && in) return physOf(notifyEp(p), true);
       if (number == bulkEp(p)) return physOf(bulkEp(p), in);
     }
+    if (netOn && number == kNetNotifyEp && in) return kNetNotifyPhys;
+    if (netOn && number == kNetBulkEp) return physOf(kNetBulkEp, in);
     return number == 0 ? in : kPhys;
   }
 
@@ -679,10 +731,10 @@ private:
         unsigned n = 0;
         switch (kind) {
         case 1: n = which ? 0 : deviceDescriptor(data, cap, productId); break;
-        case 2: n = which ? 0 : configDescriptor(data, cap, 2, highSpeed, portCount); break;
-        case 3: n = stringDescriptor(data, cap, which); break;
+        case 2: n = which ? 0 : configDescriptor(data, cap, 2, highSpeed, portCount, netOn); break;
+        case 3: n = stringDescriptor(data, cap, which, netOn ? kStringCount : kStringCountAcm); break;
         case 6: n = which ? 0 : qualifierDescriptor(data, cap); break;
-        case 7: n = which ? 0 : configDescriptor(data, cap, 7, !highSpeed, portCount); break;
+        case 7: n = which ? 0 : configDescriptor(data, cap, 7, !highSpeed, portCount, netOn); break;
         default: n = 0; break;   // BOS (USB 2.0 device) and the rest: stall
         }
         if (!n || n > cap) return stall;
@@ -700,16 +752,23 @@ private:
         newConfig = uint8_t(value);
         return none;
       case 0x0a:   // GET_INTERFACE
-        if (!in || length < 1 || index >= 2 * portCount || !stats.configuration) return stall;
-        data[0] = 0;
+        if (!in || length < 1 || index >= interfaces() || !stats.configuration) return stall;
+        data[0] = netOn && index == netData() ? netAlt : 0;
         return {kIn, 1};
-      case 0x0b:   // SET_INTERFACE: one alternate setting each
-        if (in || length || index >= 2 * portCount || value || !stats.configuration) return stall;
-        return none;
+      case 0x0b:   // SET_INTERFACE: one alternate setting each, but the network data interface's two (endpoints now, as
+                   // SET_CONFIGURATION; the transfers and the link once the status stage is done)
+        if (in || length || index >= interfaces() || !stats.configuration) return stall;
+        if (netOn && index == netData()) {
+          if (value > 1 || !netSetAlt(uint8_t(value))) return stall;
+          pendNetAlt = true;
+          return none;
+        }
+        return value ? stall : none;
       default:
         return stall;
       }
     }
+    if ((type & 0x7f) == 0x21 && netOn && index == netComm()) return netRequest(type, request, value, length, data);
     if ((type & 0x7f) == 0x21) {   // class, interface: CDC-ACM (PSTN) requests
       if (index >= 2 * portCount) return stall;
       const unsigned port = index / 2;
@@ -741,6 +800,15 @@ private:
   void dataOut(uint32_t got)
   {
     const volatile uint8_t *d = h->dma() + Layout::kEp0;
+    if (outPort == int(kNetSlot)) {
+      // SET_NTB_INPUT_SIZE: the largest NTB the host takes, within what the spec allows and this side's buffer.
+      if (outRequest == ncm::SET_NTB_INPUT_SIZE && got >= 4) {
+        const uint32_t size = uint32_t(d[0]) | uint32_t(d[1]) << 8 | uint32_t(d[2]) << 16 | uint32_t(d[3]) << 24;
+        netStats.ntbInSize = size < ncm::kNtbMinIn ? ncm::kNtbMinIn : size > ncm::kNtbMax ? ncm::kNtbMax : size;
+      }
+      outPort = -1;   // SET_MAX_DATAGRAM_SIZE, SET_NET_ADDRESS, the multicast filters: taken, not applied
+      return;
+    }
     if (outRequest == 0x20 && outPort >= 0 && got >= 7)
       for (unsigned i = 0; i < 7; ++i) lineCoding[outPort][i] = d[i];
     outPort = -1;
@@ -754,8 +822,197 @@ private:
       lineState[pendLinePort] = pendLineValue;
       h->lineState(unsigned(pendLinePort), pendLineValue);
     }
-    pendAddress = pendConfig = false;
+    if (pendNetAlt) netAltDone();
+    pendAddress = pendConfig = pendNetAlt = false;
     pendLinePort = -1;
+  }
+
+  // ------------------------------------------------------------------------------------------------ the network function
+  unsigned netComm() const { return 2 * portCount; }
+  unsigned netData() const { return 2 * portCount + 1; }
+  uint32_t netBitrate() const { return highSpeed ? 480000000u : 12000000u; }
+
+  // The NCM requests (6.2) to the communications interface. NTB16 only, no CRC; the optional ones the host may still send are
+  // taken and ignored rather than stalled.
+  Reply netRequest(uint8_t type, uint8_t request, uint16_t value, uint16_t length, uint8_t *data)
+  {
+    using namespace ncm;
+    const bool in = type & 0x80;
+    const Reply stall = {kStall, 0}, none = {kNoData, 0};
+    switch (request) {
+    case GET_NTB_PARAMETERS:
+      if (!in) return stall;
+      return {kIn, uint16_t(ntbParameters(data, kNtbMax, kNtbMax))};
+    case GET_NTB_FORMAT:
+      if (!in) return stall;
+      wr16(data, 0);   // NTB16
+      return {kIn, 2};
+    case SET_NTB_FORMAT:
+      return in || length || value ? stall : none;
+    case GET_NTB_INPUT_SIZE:
+      if (!in) return stall;
+      wr32(data, netStats.ntbInSize);
+      return {kIn, 4};
+    case GET_MAX_DATAGRAM_SIZE:
+      if (!in) return stall;
+      wr16(data, kNetMaxSegment);
+      return {kIn, 2};
+    case GET_CRC_MODE:
+      if (!in) return stall;
+      wr16(data, 0);
+      return {kIn, 2};
+    case SET_CRC_MODE:
+      return in || length || value ? stall : none;
+    case GET_NET_ADDRESS:
+      if (!in) return stall;
+      for (unsigned i = 0; i < 6; ++i) data[i] = kNetHostMac[i];
+      return {kIn, 6};
+    case SET_ETHERNET_PACKET_FILTER:
+      if (in || length) return stall;
+      netStats.filter = value;
+      return none;
+    case SET_NTB_INPUT_SIZE:
+    case SET_MAX_DATAGRAM_SIZE:
+    case SET_NET_ADDRESS:
+    case SET_ETHERNET_MULTICAST_FILTERS:
+      if (in || length > Layout::kEp0Bytes || (request == SET_NTB_INPUT_SIZE && length != 4 && length != 8)) return stall;
+      if (!length) return none;
+      outPort = int(kNetSlot);
+      outRequest = request;
+      return {kOut, length};
+    default:
+      return stall;   // encapsulated commands, statistics, power filters
+    }
+  }
+
+  // SET_INTERFACE on the data interface, SETUP stage: alternate 1 has the bulk pair (configured afresh, so their sequence starts
+  // over), alternate 0 none. Selecting alternate 0 resets the function (7.2): NTB input size, sequence number.
+  bool netSetAlt(uint8_t alt)
+  {
+    using namespace dwc3;
+    endXfer(kNetOutPhys);
+    endXfer(kNetInPhys);
+    ep[kNetOutPhys].configured = ep[kNetInPhys].configured = false;
+    uint32_t enable = h->rd(DALEPENA) & ~(1u << kNetOutPhys | 1u << kNetInPhys);
+    bool ok = true;
+    if (alt == 1) {
+      const unsigned mps = highSpeed ? 512 : 64;
+      ok = configureEp(kNetOutPhys, EP_BULK, mps, DEPCFG_ACTION_INIT, 0) && configureEp(kNetInPhys, EP_BULK, mps, DEPCFG_ACTION_INIT, 0);
+      if (ok) {
+        ep[kNetOutPhys].configured = ep[kNetInPhys].configured = true;
+        enable |= 1u << kNetOutPhys | 1u << kNetInPhys;
+      }
+    } else {
+      netStats.ntbInSize = ncm::kNtbMax;
+    }
+    h->wr(DALEPENA, enable);
+    netSeq = 0;
+    netAltNew = alt;
+    return ok;
+  }
+
+  // The status stage of SET_INTERFACE is done: the link follows the alternate setting; with alternate 1 the host is told the
+  // speed, then that the network is connected (6.3, in that order).
+  void netAltDone()
+  {
+    const bool was = netAlt == 1;
+    netAlt = netAltNew;
+    netStats.alt = netAlt;
+    ++netStats.altChanges;
+    if (netAlt == 1) {
+      netNotifyPending = kNotifySpeed | kNotifyConnect;
+      h->netLink(true, netBitrate());
+    } else {
+      netNotifyPending = 0;
+      if (was) h->netLink(false, 0);
+    }
+  }
+
+  // Configuration gone (SET_CONFIGURATION, bus reset, disconnect): the link is down and the function back at alternate 0.
+  void netDown()
+  {
+    if (!netOn) return;
+    const bool was = netAlt == 1;
+    netAlt = netAltNew = 0;
+    netStats.alt = 0;
+    netNotifyPending = 0;
+    netSeq = 0;
+    netStats.ntbInSize = ncm::kNtbMax;
+    if (was) h->netLink(false, 0);
+  }
+
+  void netNotify()
+  {
+    using namespace ncm;
+    uint8_t *n = h->dma() + Layout::kNetNotify;
+    uint32_t length = 8;
+    n[0] = 0xa1;
+    wr16(n + 4, netComm());
+    if (netNotifyPending & kNotifySpeed) {   // ConnectionSpeedChange: downstream and upstream bit rates
+      netNotifyPending &= uint8_t(~kNotifySpeed);
+      n[1] = kSpeedChange;
+      wr16(n + 2, 0);
+      wr16(n + 6, 8);
+      wr32(n + 8, netBitrate());
+      wr32(n + 12, netBitrate());
+      length = 16;
+    } else {                                 // NetworkConnection: connected
+      netNotifyPending &= uint8_t(~kNotifyConnect);
+      n[1] = kNetworkConnection;
+      wr16(n + 2, 1);
+      wr16(n + 6, 0);
+    }
+    ++netStats.notifications;
+    startXfer(kNetNotifyPhys, Layout::kNetNotify, length, dwc3::TRBCTL_NORMAL, false);
+  }
+
+  // While the host runs the link: the notifications, one NTB OUT queued whenever an NTB's worth of frames fits on this side, one
+  // NTB IN built from the queued frames whenever there are some.
+  void netPump()
+  {
+    if (!configured()) return;
+    if (netNotifyPending && !ep[kNetNotifyPhys].busy && ep[kNetNotifyPhys].configured) netNotify();
+    if (netAlt != 1) return;
+    EpState &out = ep[kNetOutPhys], &in = ep[kNetInPhys];
+    if (!out.busy && out.configured && h->netRxSpace() >= ncm::kNtbMax)
+      startXfer(kNetOutPhys, Layout::kNetOut, ncm::kNtbMax, dwc3::TRBCTL_NORMAL, false);
+    if (in.busy || !in.configured) return;
+    uint8_t *const buffer = h->dma() + Layout::kNetIn;
+    ncm::NtbWriter w;
+    w.begin(buffer, netStats.ntbInSize);
+    while (const uint32_t room = w.room()) {
+      const unsigned n = h->netTxNext(buffer + w.offset(), room);
+      if (!n) break;
+      w.add(n);
+      ++netStats.txFrames;
+      netStats.txBytes += n;
+    }
+    const uint32_t total = w.finish(netSeq);
+    if (!total) return;
+    ++netSeq;
+    ++netStats.txNtbs;
+    // A block ending on a packet boundary gets a zero-length packet, unless it is exactly the host's NTB input size (3.8).
+    const bool zlp = total % in.mps == 0 && total < netStats.ntbInSize;
+    netStats.zlps += zlp;
+    startXfer(kNetInPhys, Layout::kNetIn, total, dwc3::TRBCTL_NORMAL, zlp);
+  }
+
+  // An NTB from the host: every datagram the parser accepts goes to the Hal; a refused block is counted and its first few logged.
+  void netReceived(uint32_t got)
+  {
+    if (!got) return;   // a zero-length packet after a block that ended on a packet boundary
+    ++netStats.rxNtbs;
+    const uint8_t *const b = h->dma() + Layout::kNetOut;
+    const ncm::NtbResult r = ncm::parseNtb16(b, got, [&](uint32_t at, uint32_t n) {
+      if (h->netRxFrame(b + at, n)) { ++netStats.rxFrames; netStats.rxBytes += n; }
+      else ++netStats.rxDrops;
+    });
+    netStats.badDatagrams += r.bad;
+    if (r.error) {
+      netStats.lastError = r.error;
+      if (++netStats.ntbErrors <= 5) h->note("net: NTB from the host refused (%s), %u bytes; %u so far", r.error, got, netStats.ntbErrors);
+    }
+    if (r.datagrams) h->netRxDone();
   }
 
   bool configure()
@@ -771,6 +1028,12 @@ private:
       ep[notify].configured = ep[out].configured = ep[in].configured = true;
       enable |= 1u << notify | 1u << out | 1u << in;
     }
+    // The network function: its notification endpoint; the data interface starts at alternate 0 (no bulk endpoints).
+    if (netOn) {
+      if (!configureEp(kNetNotifyPhys, EP_INTERRUPT, kNotifyMps, DEPCFG_ACTION_INIT, highSpeed ? kNotifyIntervalHs - 1 : 0)) return false;
+      ep[kNetNotifyPhys].configured = true;
+      enable |= 1u << kNetNotifyPhys;
+    }
     h->wr(DALEPENA, enable);
     return true;
   }
@@ -782,6 +1045,7 @@ private:
       ep[phys].configured = false;
     }
     h->wr(dwc3::DALEPENA, 3);
+    netDown();
   }
 
   void bulkComplete(unsigned phys)
@@ -790,6 +1054,13 @@ private:
     EpState &e = ep[phys];
     if (!e.busy || (t[3] & dwc3::TRB_HWO)) { ++stats.stale; return; }
     e.busy = false;
+    if (phys >= kNetNotifyPhys) {   // the network function (notifications and the NTB IN need nothing more)
+      if (phys == kNetOutPhys) {
+        const uint32_t residual = dwc3::trbResidual(t[2]);
+        netReceived(residual <= e.posted ? e.posted - residual : 0);
+      }
+      return;
+    }
     if (phys < 3) return;
     const unsigned port = (phys - 3) / 4;
     if (port >= portCount || phys == physOf(notifyEp(port), true)) return;
