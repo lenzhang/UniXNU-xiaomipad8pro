@@ -35,6 +35,13 @@ ORDER="$ORDER island gsleep1 gsleep2 gsleep3 gmeasure"
 # decision. Only with a 0064 kernel in the KC (checked below for the images that need it).
 ORDER="$ORDER cancel0 cancel llccsleep llccidle3"
 K64="cancel0 cancel llccsleep llccidle3"
+# The idle wakeups (power.md "Idle wakeups by driver", 2026-11-12; tests W1, W2, C2), into out/ram-p8-<name minus p8>: p8idle is
+# pm-idle1 with this change's defaults (and PianoPolicy at level 1, the display as an event), p8idleold the same with every switch
+# that restores the old behaviour (the A/B), p8cancel the two drivers' cancels by their test switches (one suspend, neither the UFS
+# link nor the GPU goes down; k27 0064).
+ORDER="$ORDER p8idle p8idleold p8cancel"
+K64="$K64 p8cancel"
+OLDWAKE="piano-gpu-logger-ms=1 piano-gpu-mailbox-poll=1 piano-gpu-mailbox-dark-ms=0 native-gop-display-vbl=0 piano-policy-display-tick=1"
 # The storage side (docs/drivers/ufs.md §12): native-ufs-suspend=1 (NativeUfs's link into Hibern8 for each sleep, the Data disk held
 # and synced first when its store is open read-write) and native-ufs-ahit=MS (auto-hibernate at run time). The store follows
 # build-ram-images.py's guard like every image here: with another seed than the installed one Data is volatile and only the root
@@ -80,6 +87,11 @@ image() {
               # island programmed by PianoA830, read again at each suspend's entry (no ss3: state 1)
     llccidle3) A="piano-cpuidle=3 piano-llcc-island=1 piano-llcc-island-live=1"; R=300 ;;   # L3 (after L2, I1, I2): ss3 at run time
               # once the programmed island reads reserved at an ss3 decision (no piano-llcc-island-ok)
+    p8idle)   A="piano-cpuidle=1 piano-policy=1";               R=900 ;;    # W1: the new idle defaults (pm-idle1's A/B partner)
+    p8idleold) A="piano-cpuidle=1 piano-policy=1 $OLDWAKE";     R=900 ;;    # W2: every old pace restored
+    p8cancel) A="piano-sleep=1 piano-sleep-state=1 piano-sleep-test=150 piano-sleep-test-count=1 piano-sleep-max=30 piano-sleep-cancel=1"
+              A="$A $UFS native-ufs-suspend-cancel=1 native-ufs-suspend-abort-test=1 $GSUS piano-gpu-suspend-cancel=1"
+              A="$A piano-gpu-suspend-fail-test=1";             R=600 ;;    # C2: NativeUfs and PianoA830 cancel suspend 1
     *) return 1 ;;
   esac
 }
@@ -89,9 +101,11 @@ for n in ${*:-$ORDER}; do
   case " $K64 " in *" $n "*)
     grep -a -q piano_s2idle_cancel_window "$KC" || { echo "build-pm-test-images: $n needs k27 0064 ($KC's kernel lacks it): skipped" >&2; continue; } ;;
   esac
+  dir=out/ram-pm-$n
+  case $n in p8*) dir=out/ram-p8-${n#p8} ;; esac
   PIANO_FAST_BOOT=1 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=$R PIANO_EXTRA_ARGS="$BASE $A" \
-    python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out "out/ram-pm-$n" | tail -1
+    python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out "$dir" | tail -1
 done
 PIANO_FAST_BOOT=1 PIANO_RESET_AFTER=1 PIANO_DATA_PERSIST=0 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram-pm-dump \
   | tail -1
-shasum -a 256 out/ram-pm-*/boot-piano-macos-ram-A-bundled.img | sed "s#  $D/#  #"
+shasum -a 256 out/ram-pm-*/boot-piano-macos-ram-A-bundled.img out/ram-p8-*/boot-piano-macos-ram-A-bundled.img 2>/dev/null | sed "s#  $D/#  #"
