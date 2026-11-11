@@ -1022,8 +1022,13 @@ void PianoThermal::cpuReport(uint64_t spanNs)
     char line[480];
     int at = snprintf(line, sizeof line, "[%us] cpufreq d%u %s: now %u MHz (boot %u MHz);", upS(), d, dom.name,
                       dom.levels[set_[d]].khz / 1000, dom.levels[boot_[d]].khz / 1000);
+    // The window these residencies cover: the first one starts at the domain's init, before the thread's first report (whose
+    // spanNs is a few ms: "1996 MHz 26718%", queue5 P5); later ones equal spanNs.
+    uint64_t windowNs = 0;
+    for (unsigned i = 0; i < dom.count; ++i) windowNs += residencyNs_[d][i];
+    if (!windowNs) windowNs = spanNs;
     for (unsigned i = 0; i < dom.count && at < int(sizeof line) - 24; ++i) {
-      const uint64_t pct = spanNs ? residencyNs_[d][i] * 100 / spanNs : 0;
+      const uint64_t pct = windowNs ? residencyNs_[d][i] * 100 / windowNs : 0;
       if (pct) at = catf(line, sizeof line, at, " %u MHz %llu%%", dom.levels[i].khz / 1000, (unsigned long long)pct);
       residencyNs_[d][i] = 0;
     }

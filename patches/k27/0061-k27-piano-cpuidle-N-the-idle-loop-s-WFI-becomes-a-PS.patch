@@ -21,7 +21,9 @@ clear, no local-timer-stop), so CPU_SUSPEND returns to the caller: ret 0x4 (core
 - osfmk/arm64/piano_pm_policy.h: the decisions without hardware (state choice, wake sources and the wake calendar for
   0062, the Type-C address, the PSCI and LLCC verdicts), host-tested in UniXNU-piano tooling/k27/piano-pm.
 - A probe at boot (also piano-pm-probe=1 alone): PSCI VERSION and FEATURES, the APPS RSC DRV2 id and solver bit, the
-  AOP's RPMh sleep counters (aosd, cxsd, ddr at 0xc3f0048), the LLCC island slice.
+  AOP's RPMh sleep counters (aosd, cxsd, ddr at 0xc3f0048), the LLCC island slice. VERSION and FEATURES are SMC32 calls:
+  their int32 in w0 is sign-extended, so NOT_SUPPORTED is -1 for the checks and the line (before 2026-11-12 the upper half
+  of x0 read zero: "STAT_COUNT 4294967295", and a refused SET_SUSPEND_MODE would have tested as supported).
 - Counters per CPU and state in counter ticks; "piano-cpuidle: cpuN state X entries .. residency ..%" and the RPMh line
   every piano-cpuidle-period s (60, 0 off); machdep.piano_cpuidle (string) and machdep.piano_cpuidle_level (read-write
   up to N).
@@ -153,7 +155,7 @@ index 04ecbbc..7e5fb63 100644
  			os_atomic_add(&virt_wfi_ticks, mach_absolute_time() - before, relaxed);
 diff --git a/osfmk/arm64/piano_pm.c b/osfmk/arm64/piano_pm.c
 new file mode 100644
-index 0000000..cc84190
+index 0000000..c0abfe0
 --- /dev/null
 +++ b/osfmk/arm64/piano_pm.c
 @@ -0,0 +1,684 @@
@@ -411,12 +413,12 @@ index 0000000..cc84190
 +	if (piano_psci_version >= 0) {
 +		return;
 +	}
-+	piano_psci_version = (int64_t)piano_pm_call(PSCI_VERSION, 0, 0, 0);
-+	piano_psci_suspend_features = (int64_t)piano_pm_call(PSCI_FEATURES, PSCI_CPU_SUSPEND64, 0, 0);
-+	piano_psci_system_suspend = (int64_t)piano_pm_call(PSCI_FEATURES, PSCI_SYSTEM_SUSPEND64, 0, 0);
-+	piano_psci_set_mode = (int64_t)piano_pm_call(PSCI_FEATURES, PSCI_SET_SUSPEND_MODE, 0, 0);
-+	piano_psci_cpu_off = (int64_t)piano_pm_call(PSCI_FEATURES, PSCI_CPU_OFF, 0, 0);
-+	piano_psci_stat = (int64_t)piano_pm_call(PSCI_FEATURES, PSCI_STAT_COUNT64, 0, 0);
++	piano_psci_version = (int64_t)(int32_t)piano_pm_call(PSCI_VERSION, 0, 0, 0);   /* SMC32 calls: an int32 in w0 */
++	piano_psci_suspend_features = (int64_t)(int32_t)piano_pm_call(PSCI_FEATURES, PSCI_CPU_SUSPEND64, 0, 0);
++	piano_psci_system_suspend = (int64_t)(int32_t)piano_pm_call(PSCI_FEATURES, PSCI_SYSTEM_SUSPEND64, 0, 0);
++	piano_psci_set_mode = (int64_t)(int32_t)piano_pm_call(PSCI_FEATURES, PSCI_SET_SUSPEND_MODE, 0, 0);
++	piano_psci_cpu_off = (int64_t)(int32_t)piano_pm_call(PSCI_FEATURES, PSCI_CPU_OFF, 0, 0);
++	piano_psci_stat = (int64_t)(int32_t)piano_pm_call(PSCI_FEATURES, PSCI_STAT_COUNT64, 0, 0);
 +	printf("piano-pm: PSCI version %#llx; FEATURES: CPU_SUSPEND %lld (%s StateID%s), SYSTEM_SUSPEND %lld, SET_SUSPEND_MODE %lld, "
 +	    "CPU_OFF %lld, STAT_COUNT %lld\n", piano_psci_version, piano_psci_suspend_features,
 +	    piano_psci_suspend_features >= 0 && (piano_psci_suspend_features & 2) ? "extended" : "original",

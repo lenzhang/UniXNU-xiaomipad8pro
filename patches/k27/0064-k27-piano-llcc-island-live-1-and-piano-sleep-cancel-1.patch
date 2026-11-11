@@ -111,7 +111,7 @@ index 94dd5e8..1e6ca94 100644
  	else if (functionName &&
  	    functionName->isEqualTo(kIOPMInstallSystemSleepPolicyHandlerKey)) {
 diff --git a/osfmk/arm64/piano_pm.c b/osfmk/arm64/piano_pm.c
-index e8a21b2..a0cb23e 100644
+index ae30804..daed751 100644
 --- a/osfmk/arm64/piano_pm.c
 +++ b/osfmk/arm64/piano_pm.c
 @@ -55,8 +55,10 @@

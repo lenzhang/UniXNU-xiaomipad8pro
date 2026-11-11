@@ -778,7 +778,7 @@ index 0000000..ea846e8
 +
 +#endif /* PIANO_GUARD_POLICY_H */
 diff --git a/osfmk/arm64/piano_pm.c b/osfmk/arm64/piano_pm.c
-index 7b00b1f..e8a21b2 100644
+index 66b34c3..ae30804 100644
 --- a/osfmk/arm64/piano_pm.c
 +++ b/osfmk/arm64/piano_pm.c
 @@ -672,7 +672,10 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_cpuidle_init);

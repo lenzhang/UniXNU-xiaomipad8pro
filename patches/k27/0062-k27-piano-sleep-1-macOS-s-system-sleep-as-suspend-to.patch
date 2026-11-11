@@ -219,7 +219,7 @@ index 4b42199..94dd5e8 100644
  			if (lowBatteryCondition || thermalEmergencyState) {
  				if (lowBatteryCondition) {
 diff --git a/osfmk/arm64/piano_pm.c b/osfmk/arm64/piano_pm.c
-index cc84190..7b00b1f 100644
+index c0abfe0..66b34c3 100644
 --- a/osfmk/arm64/piano_pm.c
 +++ b/osfmk/arm64/piano_pm.c
 @@ -650,6 +650,867 @@ piano_cpuidle_init(void)
