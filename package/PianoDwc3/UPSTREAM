@@ -20,6 +20,21 @@ UniXNU-sm8750-common feaa135df4763e3c19a155402e6b17b124a12e13 kits/Sm8750Platfor
   SmmuStream.h follows its bypass-bank shape (SCTLR 0, CBA2R VA64, CBAR 0x10000), its geometry checks and the global TLB sync
   with a non-zero value. Written anew for SID 0x40 (redirect/keep of an existing exact entry, no panic).
 
+The cold start (UsbCold.h, piano-usb-cold, 2026-11-12):
+  Specifications only (GPL-2.0, register facts and the order of steps; no code or text copied): the Ubuntu piano kernel's
+  drivers/phy/qualcomm/phy-qcom-eusb2-repeater.c (status 0x08 b7, EN_CTL1 0x46 b7, FORCE_EN_5 0xe8 / FORCE_VAL_5 0xed b6, the tuning
+  registers 0x50..0x5b and which DT property sets which, the squelch scale; enable, then tuning, then the status poll; device mode
+  clears the forced clock), phy-qcom-m31-eusb2.c (the M31 bit names; rails, then the repeater, then the reference clock, then the PHY
+  reset, then its tables), drivers/usb/dwc3/dwc3-qcom.c (the glue's block reset at probe), drivers/clk/qcom/gdsc.c and clk-rcg2.c
+  (GDSC and RCG bits), drivers/clk/qcom/gcc-sm8750.c (offsets, GPLL0's vote word 0x52020, the USB30 GDSC's waits).
+  The tables are this repository's: the M31 init (kM31Init, Project-SunUEFI's stock sequence, above), the repeater tuning and the
+  rails (names, ranges, PMICs) from piano's boot DT (board facts; the same on every unit, no calibration).
+  Reused from this repository (BSD-2-Clause-Patent, included, not copied): package/PianoBluetooth/BtRpmh.h (vrmSend: one VRM
+  transaction on apps DRV-2), package/PianoKeyboard/CmdDb.h (the cmd-db lookup, the RSC layout), package/PianoPower/ChargerPmic.h and
+  SpmiObserver.h (the PMIC's Type-C block found and read), the lock-word protocol of PianoA830's Sm8750GpuPower.c / Sm8750Rpmh.h
+  (sm8750_gcc_vote_owner, sm8750_rpmh_drv2_owner: imported from PianoA830, not defined here), the LDO page rule of
+  package/include/PianoWcnRails.h.
+
 Specifications only (no code or text copied): mainline Linux drivers/usb/dwc3 (core.h, gadget.c, ep0.c, dwc3-qcom.c),
 drivers/clk/qcom/gcc-sm8750.c and tcsrcc-sm8750.c (register offsets), the piano DT (out/inputs/piano-boot.dtb), the USB 2.0,
 IAD and CDC 1.2 / PSTN specifications, ARM IHI 0062 (SMMUv2). Mu-Silicium's SamsungPkg UsbfnDwc3Dxe (Linux-derived) was not read.

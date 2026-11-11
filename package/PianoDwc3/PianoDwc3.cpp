@@ -25,6 +25,12 @@
 // with the glue unclocked never completes and resets the SoC).
 // piano-usb-handoff=1 (default 0): PianoUsbHost may borrow the controller for host mode and give it back (UsbHandoff.h,
 // docs/drivers/usb-host.md H3): released between passes on its ask (only while awake), the takeover run again on its reclaim.
+// The cold start (UsbCold.h, docs/drivers/usb-device-debug.md section 17; piano-usb-cold=0|1|auto, default auto): before the takeover
+// the USB thread reads the inherited state and, when it is not a running device controller (the normal power-on path, no ABL
+// fastboot), brings the GDSC, clocks, rails (RPMh, under PianoA830's DRV-2 lock word), the eUSB2 repeater and the M31 PHY up from
+// this driver's own tables; after RUN_STOP a link watch runs the cold start when no host resets the device within
+// piano-usb-cold-wait seconds (at most 3 cold starts a boot). piano-usb-cold-sim=MASK first leaves the hardware as the normal path
+// may (a test from ABL fastboot); the monitor's `usb cold [sim MASK]` does the same live.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -63,14 +69,24 @@
 #include "UsbIdle.h"          // the USB thread's wait tiers
 #include "UsbSleep.h"         // a system sleep's steps and the QSCRATCH guard
 #include "UsbHandoff.h"       // the controller hand-off to PianoUsbHost (piano-usb-handoff=1)
+#include "UsbCold.h"          // the cold start (piano-usb-cold)
+#include "BtRpmh.h"           // package/PianoBluetooth: one VRM transaction on apps DRV-2 (and PianoKeyboard's CmdDb.h lookup)
+#include "ChargerPmic.h"      // package/PianoPower: the PMIC's Type-C block, found read only (only where no other kext reads it)
 #include "../common/PianoIrq.h"
 #include <PianoPowerContract.h>
 
 using namespace pianousb;
 
 extern "C" {
-// Post-mortem breadcrumbs (also in the console log): the last takeover stage reached, negative when it failed there.
+// Post-mortem breadcrumbs (also in the console log): the last takeover stage reached, negative when it failed there; the last cold
+// start step (1..5 = c1..c5, 6 done), negative where its hard part failed.
 volatile int32_t piano_dwc3_stage = 0;
+volatile int32_t piano_dwc3_cold = 0;
+// PianoA830's lock words (Sm8750GpuPower.c: the GCC branch/PLL vote words; Sm8750Rpmh.h: apps DRV-2's TCSs): PianoA830 links before
+// PianoDwc3 (configs/k27-native-kexts.txt) and is a library of PianoDwc3.json, so the KC resolves both to A830's single copy, as for
+// PianoTouch, PianoKeyboard, PianoWifi and PianoBluetooth. The protocol is A830's: 0 free, else the holder's tag, compare-exchange.
+extern volatile uint32_t sm8750_gcc_vote_owner;
+extern volatile uint32_t sm8750_rpmh_drv2_owner;
 }
 
 class PianoUsbHID;   // the HID input devices (piano-usb-hid=1), below
@@ -99,6 +115,11 @@ struct Args {
   uint32_t idle;      // piano-usb-idle: 1 (default) the adaptive wait (UsbIdle.h), 0 the old loop (1 ms after every quiet pass)
   uint32_t sleepUsb;  // piano-sleep-usb: 1 (default) a configured host keeps the gadget across a system sleep, 0 a soft disconnect
   uint32_t handoff;   // piano-usb-handoff=1: PianoUsbHost may borrow the controller for host mode (UsbHandoff.h; default 0)
+  cold::Mode cold;    // piano-usb-cold=0|1|auto: the inherited state only, always the cold start, or by the inherited state (default)
+  bool coldKnown;     // false: piano-usb-cold had a value other than 0, 1, auto (then auto)
+  uint32_t coldSteps; // piano-usb-cold-steps=MASK: the cold start's optional parts (UsbCold.h kStep*, default 0x17)
+  uint32_t coldSim;   // piano-usb-cold-sim=MASK: the test hook, before the decision (UsbCold.h kSim*, default 0)
+  uint32_t coldWait;  // piano-usb-cold-wait=S: no bus reset this long after RUN_STOP: a cold start (default 15, 0: no link watch)
 };
 Args gArgs;
 
@@ -132,6 +153,13 @@ void readArgs()
   gArgs.sleepUsb = bootArg("piano-sleep-usb", 1);
   gArgs.handoff = bootArg("piano-usb-handoff", 0);
   if (!gArgs.idle) gArgs.irq = 0;   // the old loop is the old loop
+  char text[16] = {};
+  const bool given = PE_parse_boot_arg_str("piano-usb-cold", text, sizeof text);
+  gArgs.cold = cold::parseMode(text, given, &gArgs.coldKnown);
+  gArgs.coldSteps = bootArg("piano-usb-cold-steps", cold::kStepsDefault) & cold::kStepsAll;
+  gArgs.coldSim = bootArg("piano-usb-cold-sim", 0) & cold::kSimAll;
+  gArgs.coldWait = bootArg("piano-usb-cold-wait", cold::kWatchDefaultS);
+  if (gArgs.coldWait > 3600) gArgs.coldWait = 3600;
 }
 
 // -------------------------------------------------------------------------------------------------------------------- MMIO
@@ -186,7 +214,7 @@ uint64_t nowNs()
 }
 
 // ------------------------------------------------------------------------------------------------------------------- state
-Region gGccUsb, gGccQusb, gGccPhy, gTcsrUsb2, gTcsrUsb3, gDwc, gQs, gM31, gSmmu, gSpmiCore, gSpmiCnfg, gSpmiObs;
+Region gGccUsb, gGccQusb, gGccPhy, gGccPll, gGccVote, gTcsrUsb2, gTcsrUsb3, gDwc, gQs, gM31, gSmmu, gSpmiCore, gSpmiCnfg, gSpmiObs, gTlmm61;
 bool gCoreClocked;
 uint32_t gSnpsId;
 IOBufferMemoryDescriptor *gDma;
@@ -213,6 +241,9 @@ UsbSleep gSleep;
 enum : uint32_t { kAskNone = 0, kAskOff = 1, kAskOn = 2 };
 uint32_t gSleepAsk = kAskNone, gSleepSeq, gSleepDone;
 bool qsWrite(uint32_t offset, uint32_t value);
+// The monitor's `usb cold [sim MASK]` for the USB thread (UsbCold.h): bit 31 pending, bits 4:0 the test hook's mask; due at gColdAskAtMs.
+volatile uint32_t gColdAsk;
+uint64_t gColdAskAtMs;
 
 struct Ring {
   uint8_t *buf;
@@ -571,6 +602,7 @@ void execute(const char *line)
             "  live on|off    the live log stream on this port (output of commands is always sent)\n"
             "  echo on|off    echo typed characters\n"
             "  usb            controller and channel state\n"
+            "  usb cold [sim M]  a cold start of the controller now (piano-usb-cold), after the test hook M (piano-usb-cold-sim)\n"
             "  ioreg [depth]  the IOService plane (default and limit: depth 32); Ctrl-C stops it\n"
             "  peek PA [n]    n 32-bit words at physical address PA (uncached mapping)\n"
             "  poke PA V      write V at PA (needs piano-usb-poke=1)\n"
@@ -589,6 +621,16 @@ void execute(const char *line)
   } else if (word(s, "echo")) {
     gEcho = !word(s, "off");
   } else if (word(s, "usb")) {
+    if (word(s, "cold")) {   // the USB thread does it in 0.5 s, after this reply went out; the link drops and the Mac enumerates again
+      uint64_t mask = 0;
+      if (word(s, "sim") && (!parseNumber(s, &mask) || mask > cold::kSimAll)) { cprintf("usb cold [sim MASK]: MASK 0..%#x\n", cold::kSimAll); return; }
+      gColdAskAtMs = nowNs() / 1000000 + 500;
+      __atomic_store_n(&gColdAsk, 0x80000000u | uint32_t(mask), __ATOMIC_RELEASE);
+      usbKick();
+      cprintf("cold restart in 0.5 s (test hook %#llx): the link drops now; usb-console.py reconnects once the Mac enumerates again\n",
+              (unsigned long long)mask);
+      return;
+    }
     usbStatus();
   } else if (word(s, "ioreg")) {
     if (!parseNumber(s, &a) || a > 32) a = 32;
@@ -892,11 +934,15 @@ Gadget<KernelHal> gGadget;
 bool gRunning;
 
 // ------------------------------------------------------------------------------------------------------- hardware: probe
+// The GCC pages this driver reads: the USB block 0x39000, the USB3 PHY's 0x50000, the M31's BCR 0x12000, GPLL0 at 0 and the vote
+// words at 0x52000 (the cold start; the vote word only under PianoA830's lock, UsbCold.h).
 uint32_t gcc(uint32_t off)
 {
   if (off >= 0x39000 && off < 0x3a000) return rd32(gGccUsb.va + (off - 0x39000));
   if (off >= 0x50000 && off < 0x51000) return rd32(gGccPhy.va + (off - 0x50000));
   if (off >= 0x12000 && off < 0x13000) return rd32(gGccQusb.va + (off - 0x12000));
+  if (off < 0x1000 && gGccPll.va) return rd32(gGccPll.va + off);
+  if (off >= 0x52000 && off < 0x53000 && gGccVote.va) return rd32(gGccVote.va + (off - 0x52000));
   return 0xdeadbeef;
 }
 void gccWrite(uint32_t off, uint32_t v)
@@ -904,6 +950,7 @@ void gccWrite(uint32_t off, uint32_t v)
   if (off >= 0x39000 && off < 0x3a000) wr32(gGccUsb.va + (off - 0x39000), v);
   else if (off >= 0x50000 && off < 0x51000) wr32(gGccPhy.va + (off - 0x50000), v);
   else if (off >= 0x12000 && off < 0x13000) wr32(gGccQusb.va + (off - 0x12000), v);
+  else if (off >= 0x52000 && off < 0x53000 && gGccVote.va) wr32(gGccVote.va + (off - 0x52000), v);
   dsb();
 }
 
@@ -942,7 +989,8 @@ bool probeClocks()
 {
   using namespace pianohw;
   if (!mapRegion(gGccUsb, kGcc + 0x39000, 0x1000) || !mapRegion(gGccPhy, kGcc + 0x50000, 0x1000) ||
-      !mapRegion(gGccQusb, kGcc + 0x12000, 0x1000) || !mapRegion(gTcsrUsb2, kTcsrUsb2ClkRef, 4) || !mapRegion(gTcsrUsb3, kTcsrUsb3ClkRef, 4)) {
+      !mapRegion(gGccQusb, kGcc + 0x12000, 0x1000) || !mapRegion(gGccPll, kGcc, 0x1000) || !mapRegion(gGccVote, kGcc + 0x52000, 0x1000) ||
+      !mapRegion(gTcsrUsb2, kTcsrUsb2ClkRef, 4) || !mapRegion(gTcsrUsb3, kTcsrUsb3ClkRef, 4)) {
     note("cannot map GCC/TCSR");
     return false;
   }
@@ -1148,14 +1196,333 @@ bool dmaAlloc()
   return gDmaVa != nullptr;
 }
 
+// ------------------------------------------------------------------------------------ the cold start's kernel side (UsbCold.h)
+// The lock words are PianoA830's (above); this kext's tag in both is "DWC3". The GCC vote lock: 10 us steps, at most 50 ms, a holder
+// that keeps it longer does not stop the vote (the bit is only ever set; PianoTouch's and PianoWifi's rule). The DRV-2 lock: 10 us
+// steps, at most 2 s, then nothing is sent (PianoKeyboard's and PianoBluetooth's rule).
+constexpr uint32_t kLockTag = 0x44574333;   // "DWC3"
+bool lockTake(volatile uint32_t *word, uint32_t steps, uint32_t *waits)
+{
+  for (uint32_t n = 0;; ++n) {
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n(word, &expected, kLockTag, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      *waits = n;
+      return true;
+    }
+    if (n >= steps) {
+      *waits = n;
+      return false;
+    }
+    IODelay(10);
+  }
+}
+void lockGive(volatile uint32_t *word)
+{
+  uint32_t expected = kLockTag;
+  __atomic_compare_exchange_n(word, &expected, 0u, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+
+// The rails' RPMh addresses (cmd-db, read once) and apps DRV-2 (mapped once); one VRM transaction a vote through PianoBluetooth's
+// vrmSend (BtRpmh.h: an idle ACTIVE TCS 2, 1, 0; completion polled for at most 100 ms; a TCS that does not complete is never used
+// again), with the DRV-2 lock word held around it.
+uint32_t gRailAddr[cold::kRails];
+bool gCmdDbTried, gCmdDbOk;
+Region gRsc;
+pianobt::Rsc gRscState;
+bool gRscMapped;
+
+bool coldCmdDb()
+{
+  using namespace pianohw;
+  if (gCmdDbTried) return gCmdDbOk;
+  gCmdDbTried = true;
+  uint8_t *copy = static_cast<uint8_t *>(IOMallocData(kCmdDbBytes));
+  Region db = {};
+  if (!copy || !mapRegion(db, kCmdDb, kCmdDbBytes)) {
+    if (copy) IOFreeData(copy, kCmdDbBytes);
+    note("cold: cmd-db: cannot map %#llx or allocate its copy: no rail can be voted", (unsigned long long)kCmdDb);
+    return false;
+  }
+  for (uint32_t i = 0; i < kCmdDbBytes; i += 4) {
+    const uint32_t w = rd32(db.va + i);
+    memcpy(copy + i, &w, 4);
+  }
+  db.map->release();
+  gCmdDbOk = true;
+  char line[200];
+  size_t n = 0;
+  for (unsigned i = 0; i < cold::kRails && n < sizeof line; ++i) {
+    const int rc = pianokeyboard::cmdDbFind(copy, kCmdDbBytes, cold::kRailTable[i].cmdDb, &gRailAddr[i]);
+    if (rc) gRailAddr[i] = 0;
+    gCmdDbOk = gCmdDbOk && !rc;
+    n += size_t(rc ? snprintf(line + n, sizeof line - n, "%s%s none (%d)", i ? ", " : "", cold::kRailTable[i].cmdDb, rc)
+                   : snprintf(line + n, sizeof line - n, "%s%s %#x", i ? ", " : "", cold::kRailTable[i].cmdDb, gRailAddr[i]));
+  }
+  IOFreeData(copy, kCmdDbBytes);
+  note("cold: cmd-db: %s", line);
+  return gCmdDbOk;
+}
+
+uint32_t coldRscRd(void *, uint32_t off) { return rd32(gRsc.va + pianohw::kRscTcsBlock + off); }
+void coldRscWr(void *, uint32_t off, uint32_t v)
+{
+  wr32(gRsc.va + pianohw::kRscTcsBlock + off, v);
+  dsb();
+}
+void coldRscSleep(void *, unsigned ms) { IOSleep(ms); }
+
+bool coldRsc()
+{
+  if (gRscMapped) return true;
+  if (!mapRegion(gRsc, pianohw::kRscDrv2, pianohw::kRscDrv2Bytes)) {
+    note("cold: rsc: cannot map apps DRV-2 (%#llx): no rail can be voted", (unsigned long long)pianohw::kRscDrv2);
+    return false;
+  }
+  const uint32_t id = rd32(gRsc.va);
+  gRscState.layout = pianokeyboard::rscLayout(id);
+  gRscMapped = true;
+  note("cold: rsc: apps DRV-2 id %#x (version %u.%u), TCS block +%#x", id, (id >> 16) & 0xff, (id >> 8) & 0xff, pianohw::kRscTcsBlock);
+  return true;
+}
+
+// One rail: enable = mode 7 (high power), the set point, enable 1 (PianoKeyboard's order); else enable 0 only (the test hook).
+int coldRailVote(unsigned i, uint16_t mv, bool enable)
+{
+  if (i >= cold::kRails) return -22;
+  if (!coldCmdDb() && !gRailAddr[i]) return -19;
+  if (!gRailAddr[i] || !coldRsc()) return -19;
+  const PianoWcnVrmCmd on[3] = {{PianoWcnVrmMode, PianoWcnVrmModeNpm}, {PianoWcnVrmVoltage, mv}, {PianoWcnVrmEnable, 1}};
+  const PianoWcnVrmCmd off[1] = {{PianoWcnVrmEnable, 0}};
+  uint32_t waits = 0;
+  const uint32_t held = __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE);
+  if (held) note("cold: rsc: the DRV-2 lock is held by %#x: waiting (at most 2 s)", held);
+  if (!lockTake(&sm8750_rpmh_drv2_owner, 200000, &waits)) {
+    note("cold: rsc: the DRV-2 lock stayed held by %#x for 2 s: %s not voted", __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE),
+         cold::kRailTable[i].cmdDb);
+    return -16;
+  }
+  pianobt::VrmResult res;
+  const pianobt::RscIo io = {nullptr, coldRscRd, coldRscWr, coldRscSleep};
+  const int rc = pianobt::vrmSend(gRscState, io, gRailAddr[i], enable ? on : off, enable ? 3 : 1, res);
+  lockGive(&sm8750_rpmh_drv2_owner);
+  note("cold: rsc: %s (%#x) %s: TCS %d %s after %u ms (status %#x %#x %#x; DRV-2 lock after %u waits of 10 us)", cold::kRailTable[i].cmdDb,
+       gRailAddr[i], enable ? "mode 7, set point, enable 1" : "enable 0", res.tcs, res.done ? "completed" : rc == -16 ? "NOT sent (no idle TCS)" :
+       "NOT completed (left in flight, not used again)", res.waited, res.status[0], res.status[1], res.status[2], waits);
+  return rc;
+}
+
+// SPMI for the cold start: the APIDs found once (EE 0's entry preferred), reads through the observer channel (spmiRead above), one
+// write channel (the repeater's) mapped on first use. piano-usb-spmi=0: nothing (-2).
+struct ApidEntry { uint16_t ppid; int apid; };
+ApidEntry gApids[12];
+unsigned gApidCount;
+Region gChnl;
+int gChnlApid = -1;
+
+bool coldSpmiMapped()
+{
+  using namespace pianohw;
+  return mapRegion(gSpmiCore, kSpmiCore, 0x3000) && mapRegion(gSpmiCnfg, kSpmiCnfg, 0x1000) && mapRegion(gSpmiObs, kSpmiObs, 0x8000);
+}
+int coldApid(uint16_t ppid)
+{
+  for (unsigned i = 0; i < gApidCount; ++i)
+    if (gApids[i].ppid == ppid) return gApids[i].apid;
+  if (!coldSpmiMapped()) return -19;
+  const uint32_t version = rd32(gSpmiCore.va), count = rd32(gSpmiCore.va + 4) & 0x7ffu;
+  int found = -1;
+  if (version >= 0x70000000u && version < 0x80000000u && count && count <= 1024)
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t map = rd32(gSpmiCore.va + 0x2000 + 4 * i);
+      if (map && ((map >> 8) & 0xfffu) == ppid && (found < 0 || (rd32(gSpmiCnfg.va + 4 * i) & 7u) == 0)) found = int(i);
+    }
+  if (gApidCount < sizeof gApids / sizeof gApids[0]) gApids[gApidCount++] = {ppid, found};
+  return found;
+}
+int coldSpmiRead(uint16_t ppid, uint8_t reg, uint8_t *v)
+{
+  if (!gArgs.spmi) return -2;
+  const int apid = coldApid(ppid);
+  if (apid < 0) return -19;
+  return spmiRead(apid, reg, v) ? 0 : -5;
+}
+int coldSpmiOwner(uint16_t ppid)
+{
+  if (!gArgs.spmi) return -2;
+  const int apid = coldApid(ppid);
+  return apid < 0 ? -1 : int(rd32(gSpmiCnfg.va + 4 * uint32_t(apid)) & 7u);
+}
+int coldSpmiWrite(uint16_t ppid, uint8_t reg, uint8_t v)
+{
+  using namespace pianohw;
+  if (!gArgs.spmi) return -2;
+  const int apid = coldApid(ppid);
+  if (apid < 0) return -19;
+  if (coldSpmiOwner(ppid) != 0) return -1;
+  if (gChnlApid != apid) {
+    if (gChnl.map) gChnl.map->release();
+    gChnl = {};
+    gChnlApid = -1;
+    if (!mapRegion(gChnl, kSpmiChnl + uint64_t(kSpmiChnlStride) * uint32_t(apid), 0x20)) return -12;
+    gChnlApid = apid;
+  }
+  wr32(gChnl.va + 0x10, v);
+  wr32(gChnl.va + 0x00, uint32_t(reg) << 4);   // opcode 0: extended write, one byte
+  dsb();
+  for (unsigned i = 0; i < 1000; ++i) {
+    const uint32_t st = rd32(gChnl.va + 0x08);
+    if (st & 1u) return (st & 0xeu) ? -5 : 0;
+    IODelay(1);
+  }
+  return -60;
+}
+
+// The PMIC's Type-C block (ChargerPmic.h's discovery), read only, and only where no other kext reads it: one observer channel serves
+// one reader at a time, and PianoPower (any level) and PianoUsbHost read this block themselves.
+uint32_t coldIoRd(void *, pianopower::Window w, uint32_t off)
+{
+  return rd32((w == pianopower::Window::core ? gSpmiCore.va : w == pianopower::Window::cnfg ? gSpmiCnfg.va : gSpmiObs.va) + off);
+}
+void coldIoWr(void *, pianopower::Window w, uint32_t off, uint32_t v)
+{
+  if (w == pianopower::Window::obsv) wr32(gSpmiObs.va + off, v);
+}
+void coldIoDelay(void *, unsigned us) { IODelay(us); }
+
+cold::TypeC coldTypec()
+{
+  cold::TypeC t;
+  if (!gArgs.spmi || bootArg("piano-power", 0) || bootArg("piano-usbhost", 0) || !coldSpmiMapped()) return t;
+  const pianopower::Io io = {nullptr, coldIoRd, coldIoWr, coldIoDelay};
+  const pianopower::Arbiter a = pianopower::spmiArbiter(io);
+  if (!a.v7) return t;
+  const pianopower::ChargerLayout l = pianopower::discoverCharger(io, a);
+  uint8_t v[6] = {};
+  if (!l.found || pianopower::spmiRead(io, l.typec.apid, 0x06, v, 6) != pianopower::ReadResult::ok) return t;
+  t.snk = v[0];
+  t.src = v[2];
+  t.misc = v[5];
+  (void)pianopower::spmiRead(io, l.typec.apid, 0x44, &t.mode, 1);
+  t.read = true;
+  return t;
+}
+
+// UsbCold.h's Hal. Before RUN_STOP its lines go straight to IOLog (as the takeover's); the USB thread is the only caller (and start()
+// at piano-usb=1, read only).
+using ColdTypeC = cold::TypeC;
+struct ColdHal {
+  uint32_t gcc(uint32_t off) { return ::gcc(off); }
+  void gccWrite(uint32_t off, uint32_t v) { ::gccWrite(off, v); }
+  uint32_t tcsr() { return rd32(gTcsrUsb2.va); }
+  void tcsrWrite(uint32_t v)
+  {
+    wr32(gTcsrUsb2.va, v);
+    dsb();
+  }
+  uint32_t core(uint32_t off) { return rd32(gDwc.va + off); }
+  void coreWrite(uint32_t off, uint32_t v)
+  {
+    wr32(gDwc.va + off, v);
+    dsb();
+  }
+  uint32_t m31(uint32_t off) { return rd32(gM31.va + off); }
+  void m31Write(uint32_t off, uint32_t v)
+  {
+    wr32(gM31.va + off, v);
+    dsb();
+  }
+  uint32_t qs(uint32_t off) { return rd32(gQs.va + off); }
+  bool qsWrite(uint32_t off, uint32_t v) { return ::qsWrite(off, v); }
+  int spmiRead(uint16_t ppid, uint8_t reg, uint8_t *v) { return coldSpmiRead(ppid, reg, v); }
+  int spmiWrite(uint16_t ppid, uint8_t reg, uint8_t v) { return coldSpmiWrite(ppid, reg, v); }
+  int spmiOwner(uint16_t ppid) { return coldSpmiOwner(ppid); }
+  int railVote(unsigned rail, uint16_t mv, bool enable) { return coldRailVote(rail, mv, enable); }
+  bool voteLock(bool take)
+  {
+    if (!take) {
+      lockGive(&sm8750_gcc_vote_owner);
+      return true;
+    }
+    uint32_t waits = 0;
+    if (lockTake(&sm8750_gcc_vote_owner, 5000, &waits)) return true;
+    note("cold: the GCC vote lock stayed held by %#x for 50 ms: GPLL0's vote bit is set anyway (only ever set)",
+         __atomic_load_n(&sm8750_gcc_vote_owner, __ATOMIC_ACQUIRE));
+    return false;
+  }
+  bool gpio61(uint32_t *cfg, uint32_t *io)
+  {
+    if (!mapRegion(gTlmm61, pianohw::kTlmmGpio61, 8)) return false;
+    *cfg = rd32(gTlmm61.va);
+    *io = rd32(gTlmm61.va + 4);
+    return true;
+  }
+  ColdTypeC typec() { return coldTypec(); }
+  void udelay(unsigned us)
+  {
+    if (us >= 1000) IOSleep(us / 1000);
+    else IODelay(us);
+  }
+  void cold(int step) { piano_dwc3_cold = step; }
+  __attribute__((format(printf, 2, 3))) void note(const char *fmt, ...)
+  {
+    char line[640];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    IOLog("PianoDwc3: %s\n", line);
+  }
+};
+
+// Every register block the cold start and its inspection may touch, mapped (mapping touches nothing).
+bool coldMap()
+{
+  using namespace pianohw;
+  return gGccUsb.va && gTcsrUsb2.va && mapRegion(gDwc, kDwc3, kDwc3Bytes) && mapRegion(gQs, kQscratch, 0x100) && mapRegion(gM31, kM31, 0x1000);
+}
+
+// What the cold start saw and did this boot (the monitor's `usb`).
+cold::Watch gWatch;
+cold::Result gColdLast;
+uint32_t gColdReasons;
+bool gColdRan;
+
+// The test hook (if any), the inherited state read and reported, the decision: true = the cold start.
+bool coldDecide(uint32_t sim)
+{
+  ColdHal h;
+  if (!coldMap()) {
+    note("cold: cannot map the USB blocks: the inherited state is taken as it is");
+    return false;
+  }
+  if (sim) cold::simulate(h, sim);
+  const cold::Inherited s = cold::inspect(h, gArgs.spmi != 0, (sim & cold::kSimRails) != 0);
+  gColdReasons = cold::report(h, s, gArgs.cold, gArgs.spmi != 0);
+  return gArgs.cold == cold::Mode::always || (gArgs.cold == cold::Mode::automatic && gColdReasons);
+}
+
 uint32_t gLastDsts = ~0u;
 
-bool takeover()
+// coldStart: UsbCold.h's c1..c5 first (power, stop, rails, repeater, M31 PHY), instead of trusting what the firmware left.
+bool takeover(bool coldStart)
 {
   using namespace dwc3;
   using namespace pianohw;
   stage(10, "takeover: power and clocks");
-  if (!gCoreClocked && gArgs.level >= 3) gCoreClocked = enableClocks();
+  if (coldStart) {
+    stage(11, "takeover: cold start (piano-usb-cold: power, stop, rails, repeater, M31 PHY)");
+    ColdHal h;
+    gColdRan = true;
+    ++gWatch.colds;
+    gColdLast = coldMap() ? cold::coldStart(h, gArgs.coldSteps) : cold::Result{};
+    if (!gColdLast.ok() || !coldMap()) { stage(-11, "takeover: the cold start (its 'cold cN FAILED' line names the step)"); return false; }
+    gCoreClocked = true;
+    gSnpsId = 0;   // read again below
+  } else {
+    // The glue's clocks as GCC reads them now (a test hook or a hand-off may have changed them since the probe).
+    gCoreClocked = glueClocked();
+    if (!gCoreClocked && gArgs.level >= 3) gCoreClocked = enableClocks();
+  }
   if (!gCoreClocked) { stage(-10, "takeover: the core is not powered/clocked (piano-usb=3 switches GDSC and clocks on)"); return false; }
   if (!gSnpsId) probeCore();
   const uint32_t ip = gSnpsId >> 16;
@@ -1176,7 +1543,7 @@ bool takeover()
   if (!gGadget.halt(100)) note("no halt within 100 ms (DSTS %08x): continuing with the soft reset", gHal.rd(DSTS));
   stage(13, "takeover: DMA memory");
   if (!dmaAlloc()) { stage(-13, "takeover: DMA memory"); return false; }
-  if (gArgs.phy) {
+  if (gArgs.phy && !coldStart) {   // the cold start's c5 did it
     stage(14, "takeover: M31 eUSB2 PHY init");
     phyInit();
   }
@@ -1246,8 +1613,17 @@ void usbStatus()
 {
   using namespace dwc3;
   const GadgetStats &s = gGadget.stats;
-  cprintf("piano-usb=%u stage %d; core %08x DCTL %08x DSTS %08x (link %u) DCFG %08x GEVNTCOUNT %08x\n", gArgs.level, piano_dwc3_stage,
-          gSnpsId, gHal.rd(DCTL), gHal.rd(DSTS), dstsLinkState(gHal.rd(DSTS)), gHal.rd(DCFG), gHal.rd(GEVNTCOUNT));
+  if (glueClocked() && gDwc.va)
+    cprintf("piano-usb=%u stage %d; core %08x DCTL %08x DSTS %08x (link %u) DCFG %08x GEVNTCOUNT %08x\n", gArgs.level, piano_dwc3_stage,
+            gSnpsId, gHal.rd(DCTL), gHal.rd(DSTS), dstsLinkState(gHal.rd(DSTS)), gHal.rd(DCFG), gHal.rd(GEVNTCOUNT));
+  else
+    cprintf("piano-usb=%u stage %d; the glue is NOT clocked: the core is not read\n", gArgs.level, piano_dwc3_stage);
+  char why[480];
+  cold::whyText(gColdReasons, why, sizeof why);
+  cprintf("cold: piano-usb-cold=%s steps %#x sim %#x wait %u s; at the takeover the inherited state had: %s; cold starts %u (at most %u), "
+          "breadcrumb %d, last soft failures %#x; link watch %s\n", cold::modeName(gArgs.cold), gArgs.coldSteps, gArgs.coldSim, gArgs.coldWait,
+          why, gWatch.colds, cold::kColdTries, piano_dwc3_cold, gColdLast.soft, gWatch.armed ? "armed" : gWatch.hostSeen ? "done (a host came)" :
+          "off");
   cprintf("speed %u address %u configuration %u; events %u (device %u): resets %u connects %u disconnects %u erratic %u overflows %u\n",
           s.speed, s.address, s.configuration, s.events, s.deviceEvents, s.resets, s.connects, s.disconnects, s.erratic, s.overflows);
   cprintf("setups %u stalls %u EP0 timeouts %u; command errors %u timeouts %u (last %08x) start errors %u stale %u; notes dropped %llu\n",
@@ -1448,7 +1824,8 @@ void handoffPark()
       }
       note("hand-off: reclaim %u: the core is back from PianoUsbHost: the takeover again", gHandoffReclaims);
       gCoreClocked = true;
-      if (takeover()) {
+      gWatch.disarm();   // the controller has two users now: no cold start behind PianoUsbHost's back
+      if (takeover(false)) {
         gRunning = true;
         handoffSet(kHoDevice);
         return;
@@ -1461,6 +1838,51 @@ void handoffPark()
   }
 }
 
+// A takeover that failed: more cold starts (piano-usb-cold=1|auto), kRetryMs apart, while the boot's budget (kColdTries) lasts. True
+// once one went through.
+bool takeoverRetry(bool coldStart)
+{
+  bool ok = takeover(coldStart);
+  while (!ok && gArgs.cold != cold::Mode::inherited && gWatch.colds < cold::kColdTries) {
+    note("takeover failed: a cold start in %u ms (cold start %u of at most %u this boot)", cold::kRetryMs, gWatch.colds + 1, cold::kColdTries);
+    IOSleep(cold::kRetryMs);
+    waitAwake();
+    ok = takeover(true);
+  }
+  return ok;
+}
+
+// The link watch's or the monitor's cold start, on the USB thread between passes (awake, not lent): the device controller stopped (a
+// host sees a detach), the test hook if asked, the state read and reported, the cold start and the takeover. False: no takeover went
+// through (the caller stops touching the core).
+bool coldRestart(uint32_t sim, const char *why)
+{
+  note("cold restart (%s): the device controller stopped, then%s the cold start and the takeover", why, sim ? " the test hook," : "");
+  if (gIrqMode) irqOff("a cold restart: polled from now on");
+  if (glueClocked()) {
+    gGadget.halt(100);
+    gHal.wr(dwc3::GEVNTSIZ, dwc3::GEVNTSIZ_INTMASK | Layout::kEventBytes);
+    gHal.barrier();
+  }
+  IOLockLock(gLock);
+  for (uint16_t &line : gLines) line = 0;   // every port closed: the Mac opens them again after it enumerates
+  IOLockUnlock(gLock);
+  (void)coldDecide(sim);
+  const bool ok = takeoverRetry(true);
+  gWatch.restarted(nowNs() / 1000000);
+  return ok;
+}
+
+// The monitor's ask, once its reply had time to go out (0.5 s). True with the mask when it is due.
+bool coldAskDue(uint64_t nowMs, uint32_t *sim)
+{
+  const uint32_t ask = __atomic_load_n(&gColdAsk, __ATOMIC_ACQUIRE);
+  if (!(ask & 0x80000000u) || nowMs < gColdAskAtMs) return false;
+  __atomic_store_n(&gColdAsk, 0u, __ATOMIC_RELEASE);
+  *sim = ask & cold::kSimAll;
+  return true;
+}
+
 void usbThread(void *, wait_result_t)
 {
   if (gArgs.handoff) handoffSet(kHoStarting);
@@ -1469,7 +1891,8 @@ void usbThread(void *, wait_result_t)
     IOSleep(gArgs.delay * 1000);
   }
   waitAwake();
-  if (!takeover()) {
+  // The inherited state read (after the test hook, piano-usb-cold-sim) and the decision (piano-usb-cold), then the takeover.
+  if (!takeoverRetry(coldDecide(gArgs.coldSim))) {
     if (!gArgs.handoff) {
       note("takeover failed; the controller is left as it is. Rebuild the RAM image without piano-usb to drop this driver.");
       return;
@@ -1480,6 +1903,13 @@ void usbThread(void *, wait_result_t)
   }
   if (gArgs.handoff) handoffSet(kHoDevice);
   gRunning = true;
+  if (gArgs.cold == cold::Mode::inherited || !gArgs.coldWait) {
+    gHal.note("cold: no link watch (%s)", gArgs.cold == cold::Mode::inherited ? "piano-usb-cold=0" : "piano-usb-cold-wait=0");
+  } else {
+    gWatch.arm(gArgs.coldWait * 1000, nowNs() / 1000000);
+    gHal.note("cold: link watch: no bus reset from a host within %u s: a cold start (the wait doubles; at most %u cold starts this boot, %u "
+              "so far)", gArgs.coldWait, cold::kColdTries, gWatch.colds);
+  }
   gIrqMode = gArgs.irq && attachCoreInterrupt();
   if (!gArgs.idle) gHal.note("wait: 1 ms after every quiet pass (piano-usb-idle=0, the old loop)");
   else if (!gIrqMode)
@@ -1496,6 +1926,39 @@ void usbThread(void *, wait_result_t)
     if (!sleepStep()) {   // a system sleep without a host kept, or the glue unclocked at the wake: the core is not touched
       gWake.wait(seen, 1000);
       continue;
+    }
+    // The monitor's `usb cold` and the link watch (piano-usb-cold=1|auto): a cold start, only while awake. A host seen once ends the
+    // watch for the boot; a cold start that does not go through leaves the core alone from then on (parked, as a failed takeover).
+    if (gSleep.state() == SleepState::awake) {
+      const uint64_t ms = nowNs() / 1000000;
+      uint32_t sim = 0;
+      const char *why = nullptr;
+      if (coldAskDue(ms, &sim)) {
+        why = "asked on the console";
+      } else if (gWatch.armed) {
+        const cold::WatchDo d = gWatch.step(ms, gGadget.stats.resets != 0 || gGadget.stats.connects != 0);
+        if (d == cold::WatchDo::coldStart) why = "no bus reset from a host since the last run (the link watch)";
+        if (d == cold::WatchDo::giveUp)
+          gHal.note("cold: link watch: still no host after %u cold starts: given up for this boot (DSTS %08x)", gWatch.colds, gHal.rd(dwc3::DSTS));
+        if (!gWatch.armed && gWatch.hostSeen && d == cold::WatchDo::nothing)
+          gHal.note("cold: link watch: a host reset the device: the watch ends (%u cold starts this boot)", gWatch.colds);
+      }
+      if (why) {
+        const bool ok = coldRestart(sim, why);
+        lastReport = nowNs();
+        lastActivity = lastEvent = lastReport / 1000000;
+        if (!ok) {
+          gRunning = false;
+          if (!gArgs.handoff) {
+            note("cold restart: no takeover went through; the controller is left as it is for the rest of the boot");
+            return;
+          }
+          note("cold restart: no takeover went through; parked for a hand-off (piano-usb-handoff=1)");
+          handoffSet(kHoFailed);
+          handoffPark();
+        }
+        continue;
+      }
     }
     // The hand-off (piano-usb-handoff=1): a release only while awake (not in a sleep's kept state); an ask it cannot act on is dropped.
     if (gArgs.handoff && __atomic_load_n(&gHandoffAsk, __ATOMIC_ACQUIRE) != kAskState) {
@@ -1860,6 +2323,11 @@ bool PianoDwc3::start(IOService *provider)
   note("start: piano-usb=%u phy=%u smmu=%u utmi=%u delay=%u shell=%u hid=%u net=%u irq=%u idle=%u (DWC3 %#llx, SMMU stream %#x, %s)",
        gArgs.level, gArgs.phy, gArgs.smmu, gArgs.utmi, gArgs.delay, gArgs.shell, gArgs.hid, gArgs.net, gArgs.irq, gArgs.idle,
        pianohw::kDwc3, pianohw::kUsbStream, gArgs.irq ? "interrupt, else polled" : gArgs.idle ? "polled, adaptive" : "polled every 1 ms");
+  note("start: piano-usb-cold=%s%s steps=%#x sim=%#x wait=%u s (the cold start, UsbCold.h: %s)", cold::modeName(gArgs.cold),
+       gArgs.coldKnown ? "" : " (an unknown value: auto)", gArgs.coldSteps, gArgs.coldSim, gArgs.coldWait,
+       gArgs.cold == cold::Mode::inherited ? "never; the inherited state only, as before" : gArgs.cold == cold::Mode::always ? "always" :
+       "when the inherited state is not a running device controller, or no host comes");
+  if (gArgs.coldSim && gArgs.level < 2) note("piano-usb-cold-sim needs piano-usb=2: no test hook");
   if (gArgs.hid && gArgs.level < 2) note("piano-usb-hid needs piano-usb=2: no HID input");
   if (gArgs.net && gArgs.level < 2) note("piano-usb-net needs piano-usb=2: no network function");
   setProperty("piano-usb", gArgs.level, 32);
@@ -1889,6 +2357,11 @@ bool PianoDwc3::start(IOService *provider)
       IOSleep(20);
       stage(5, "probe: SMMU (read only)");
       probeSmmu();
+    }
+    // What the cold start would find (read only; at level 2 the USB thread reads it again before its decision).
+    if (coldMap()) {
+      ColdHal h;
+      cold::report(h, cold::inspect(h, gArgs.spmi != 0), gArgs.cold, gArgs.spmi != 0);
     }
     stage(9, "probe done (piano-usb=1: nothing written)");
     setProperty("piano-usb-stage", uint64_t(uint32_t(piano_dwc3_stage)), 32);

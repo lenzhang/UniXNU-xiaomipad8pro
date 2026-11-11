@@ -25,8 +25,9 @@ Design, hardware facts, boot arguments, test plan and the Mac-side commands: `do
 | `SmmuStream.h` | SID 0x40 through a VA64 bypass context bank of the apps SMMU |
 | `UsbIdle.h` | the USB thread's wait tiers (busy / open / configured / no host) and the core interrupt handler's decision, portable (`docs/power-irq.md`) |
 | `UsbHandoff.h` | the controller hand-off to PianoUsbHost's host mode (`piano-usb-handoff=1`, default off): the platform function's asks and states, the USB thread's decision, portable (`docs/drivers/usb-host.md` §6.6) |
+| `UsbCold.h` | the cold start (`piano-usb-cold`, default auto): the inherited state read and judged, then GDSC/clocks, stop, the rails (RPMh under PianoA830's DRV-2 lock), the eUSB2 repeater and the M31 PHY from this driver's own tables; the test hook (`piano-usb-cold-sim`) and the link watch, portable (`docs/drivers/usb-device-debug.md` §17) |
 | `Dwc3Regs.h`, `PianoUsbHw.h` | register facts, with their sources |
-| `tests/` | host tests: the gadget core (2 and 3 ports, without and with the network function; the ACM-only descriptors against their pre-network bytes), NTB16 and the TX FIFO plan, the SMMU planner, the input parser, the wait tiers, the hand-off decisions (`tests/run.sh`) |
+| `tests/` | host tests: the gadget core (2 and 3 ports, without and with the network function; the ACM-only descriptors against their pre-network bytes), NTB16 and the TX FIFO plan, the SMMU planner, the input parser, the wait tiers, the hand-off decisions, the cold start against a model of the USB hardware (`tests/run.sh`) |
 
 Build: `tooling/k27/build-native-piano-dwc3.sh` (host tests, the objects, the import check, the PianoUsbNet vtable check). PianoDwc3 is in
 `configs/k27-native-kexts.txt` and inert without `piano-usb`. Sources and licences: `UPSTREAM`, `LICENSE` (BSD-2-Clause-Patent).
@@ -36,3 +37,7 @@ Host mode: with `piano-usb-handoff=1` PianoUsbHost (levels 3/4 with `piano-usbho
 the controller (the device controller stopped, its event interrupt masked, the USB thread parked) and to reclaim it (the clocks
 re-read, the whole takeover again); without it the controller is this driver's for the whole boot. The VBUS/session override store
 re-reads the core's clocks right before it.
+Normal boot path: the takeover no longer relies on what ABL fastboot leaves. `piano-usb-cold=auto` (default) reads the inherited state
+and runs a cold start when it is not a running device controller, plus a link watch (no host within 15 s: a cold start; at most 3 a
+boot). It takes PianoA830's GCC vote and DRV-2 lock words, so PianoA830 is a library of `PianoDwc3.json`. `piano-usb-cold=0` is the
+takeover of before.
