@@ -999,10 +999,10 @@ bool PianoKeyboard::readFrame()
   return f == Frame::reports;
 }
 
-// "mods 0x02 keys 04 05" of a 9-byte keyboard report.
+// "mods 02 keys 04 05" of a 9-byte keyboard report (hex).
 static const char *keyList(const uint8_t *k, char *out, size_t size)
 {
-  size_t used = size_t(snprintf(out, size, "mods %#04x keys", k[1]));
+  size_t used = size_t(snprintf(out, size, "mods %02x keys", k[1]));
   bool any = false;
   for (unsigned i = 3; i < kKeyboardBytes && used + 4 < size; ++i)
     if (k[i]) {
@@ -1088,7 +1088,7 @@ void PianoKeyboard::dispatch(const Report &r)
   } else if (v == Vendor::ack) {
     if (++fAcks <= 12 || fAcks % 100 == 0) note("command ack %u: command %#04x status %u", fAcks, r.bytes[6], r.bytes[7]);
   } else if (v == Vendor::state) {
-    if (++fStates <= 12 || fStates % 100 == 0) note("command state %u: command %#04x = %#04x", fStates, r.bytes[4], r.bytes[6]);
+    if (++fStates <= 12 || fStates % 100 == 0) note("command state %u: command %#04x = %02x", fStates, r.bytes[4], r.bytes[6]);
   } else if (fVendor <= 30) {
     note("vendor %#04x (%s): %s", r.id, vendorName(v), hex(r.bytes, r.length < 24 ? r.length : 24, line, sizeof line));
   }
