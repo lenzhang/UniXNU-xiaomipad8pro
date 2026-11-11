@@ -177,8 +177,9 @@ The rotation agent applies `ps_rotation_step` itself (SensorsPolicy.c is plain C
 Status, 2026-11-11: offline. `package/PianoAuto` is host-tested (`tests/run-host-tests.py`: the rotation policy, the touch transform,
 the sensor streams' off/on lifecycle, the light chain, PianoBacklight's automatic mode against its own step ladder; the kernel's
 no-FP/no-libc compile) and the agent `piano-rotated` is built (`tooling/k27/build-piano-rotated.sh`); its read-only `--probe` ran on a
-Mac with macOS 26.6. Nothing ran on the tablet. PianoTouch, PianoBacklight, PianoKeyboard and NativeGopDisplay are not edited: their
-owners add the interfaces below. Independent of the sensor transport: everything but §5a.5 works with a test edge source today.
+Mac with macOS 26.6. Nothing ran on the tablet. The two driver interfaces are built, host-tested and linked, both off by default:
+PianoTouch's rotation (`piano-touch-rotate=1`, §5a.3) and PianoBacklight's automatic mode (`piano-backlight-auto=1`, §5a.4); PianoKeyboard
+and NativeGopDisplay are unchanged. Independent of the sensor transport: everything but §5a.5 works with a test edge source today.
 
 ### 5a.1 Display rotation: the mechanism (verdict)
 
@@ -202,7 +203,7 @@ a transpose (slower than today's 39 ms row copy) and leaves PianoDpu without zer
 ### 5a.2 piano-rotated (the agent)
 
 ```
-PianoSensors  piano-sensors-edge (0..3; 255 none) + kIOMessageServicePropertyChange --+
+PianoSensors  piano-sensors-edge (top|left|bottom|right|none) when piano-sensors-seq moves --+
 PianoKeyboard piano-keyboard-attached (0/1)        + kIOMessageServicePropertyChange --+--> AutoRotate (ps_rotation_step inside)
 the user      defaults com.unixnu.piano-rotated Locked; notifyutil -p ...prefs     --+        |
 WindowServer  CGDisplayRotation (read back) + the display reconfiguration callback   --+        v
@@ -211,7 +212,10 @@ PianoTouch    <-- piano-touch-rotation (setProperties): the rotation shown      
 ```
 
 A global LaunchAgent (`daemon/com.unixnu.piano-rotated.plist`: LoginWindow and Aqua sessions, since WindowServer's display services are
-per session; a system daemon would not reach them), event driven (no polling; a timer only while a settle, hold or read-back is due),
+per session; a system daemon would not reach them), event driven for the cover and WindowServer; PianoSensors sets its properties
+without a notification (§5), so its `piano-sensors-seq` is read every 250 ms only while it can matter (PianoSensors at level 4, the cover
+not attached; every 5 s while the display sleeps) and PianoSensors is found by class even unregistered; other timers only while a
+settle, hold or read-back is due;
 arm64, ad-hoc signed, `/usr/local/libexec/piano-rotated`. Policy (`AutoRotate.h`): an edge settles 600 ms; rotations at least 1 s
 apart; cover attached: 0 at once and held (a rotation chosen while attached is turned back); detached: a 1.5 s hold, then an edge that
 settles afresh (contacts bounce while the cover goes on or off); every rotation read back within 2 s, else backoff 2 s doubling to
@@ -232,46 +236,55 @@ Command line (USB root shell): `--probe` (displays, the setter, `canChangeOrient
 `rotate 0 -> 90 degrees: asked`, `display 0x.. shows 90 degrees`, `PianoTouch told 90 degrees: taken`; failures: `MonitorPanel has no
 ... (another macOS build?)`, `WindowServer offers no rotation ... (canChangeOrientation NO)`, `the rotation asked for did not show`).
 
-### 5a.3 PianoTouch: the interface asked (`TouchRotation.h`; its owner adds it)
+### 5a.3 PianoTouch: the rotation input (built: `piano-touch-rotate=1`, touch.md §5)
 
-- State `PatRotation fRotation` (`pat_init` in `start`). Inputs, both only recording (`pat_request`), never waiting:
+- Off by default: without `piano-touch-rotate=1` both inputs are refused as before and every report is unchanged.
+- State `PatRotation fRotation`. Inputs, both only recording (`pat_request`), never waiting:
   `callPlatformFunction("PianoTouchRotation", false, (void *)(uintptr_t)degrees, (void *)source, 0, 0)` for kernel callers, and
   `setProperties({"piano-touch-rotation": 0|90|180|270})` for the agent, allowed for root (`kIOClientPrivilegeAdministrator`) or the
   console user (`kIOClientPrivilegeConsoleUser`: the agent runs as the logged-in user); other values `kIOReturnBadArgument`, other
   callers `kIOReturnNotPrivileged`. Published: `piano-touch-rotation` (the rotation in use).
-- In `contact()`/`send()`: `r = pat_latch(&fRotation, e == TipEvent::down)`, `p = pat_rotate(r, x, y, kPanelW, kPanelH)`,
-  `tabletReport(tip, p.x, p.y, p.width, p.height, report)`. The degrees are CGDisplayRotation's (the agent sends what it read back); a
-  change takes effect at the next touch-down, never mid-drag. At 0 the report is the same as today's. One log line per change.
+- In `contact()`: `pat_latch(&fRotation, 1)` at each touch-down; `send()` builds `rotatedTabletReport(tip, x, y, kPanelW, kPanelH,
+  fRotation.shown, report)` (`TouchHid.h`: `pat_rotate`, then `tabletReport` over the rotated size). The degrees are CGDisplayRotation's
+  (the agent sends what it read back); a change takes effect at the next touch-down, never mid-drag. At 0 the bytes are the same as
+  before (host test). One log line per change. The agent needs `piano-touch-rotate=1` with `piano-rotate=3`.
 
-### 5a.4 Automatic brightness: PianoBacklight's interface asked (`AmbientBacklight.h`; its owner adds it)
+### 5a.4 Automatic brightness: PianoBacklight's automatic mode (built: `piano-backlight-auto=1`, backlight.md §5)
 
 - Boot argument `piano-backlight-auto=1` (default 0: targets refused with `kIOReturnUnsupported`, nothing changes).
+- Two inputs, the same effect: PianoSensors' `piano-sensors-light-target` (with `piano-sensors-seq`, `piano-sensors-lux`; §5's table),
+  read on PianoBacklight's 250 ms poll and inert until PianoSensors publishes it; and the platform function below.
 - `callPlatformFunction("PianoBacklightAmbient", false, (void *)(intptr_t)permille, (void *)source, (void *)(uintptr_t)lux, 0)`:
   permille of the code range (1000 = 2047), the light policy's output; -1 leaves automatic mode with the code as it is. Records the
-  newest and wakes the thread like `PianoBacklightStep`; `kIOReturnNotReady` before its lock exists. `PianoBacklightClient.h` gains the
+  newest and wakes the thread like `PianoBacklightStep`; `kIOReturnNotReady` before its lock exists. `PianoBacklightClient.h` has the
   name and an `ambient()` helper.
-- `Controller` takes `pianoauto::Ambient` (three calls, the header's comment): a target applies `code()`; a step in automatic mode
+- `Controller` takes `pianoauto::Ambient` (`ambient()`, `automatic()`, and in `step()`/`percent()`): a target applies `code()`; a step in automatic mode
   shifts the curve by one of its own steps (x 2^(1/3) linear, 1/16 exponential) and the offset stays for the boot, a press always a
   visible step unless at an end; `piano-backlight-percent` (administrator) switches to manual; `piano-backlight-auto` 0/1 as a
   property leaves or re-enters (the last target at once, the offset kept). Written only on a change, nothing while dark (the newest
   code lights the wake).
 - Published: `piano-backlight-auto` (automatic now), `piano-backlight-offset`, `piano-backlight-ambient-permille`, `-ambient-lux`.
-- Log: ambient writes folded into one line per 10 s (`ambient: N targets, lux A..B, permille P..Q, offset K, code X -> Y`; failed
-  accesses still logged at once); key steps in automatic mode `step +1 in automatic mode: offset 0 -> 1, code 757 -> 954`.
+- Log: ambient writes folded into one line per 10 s (`ambient: N targets in S s, lux A..B, target P..Q permille, offset K, code X -> Y`;
+  failed accesses still logged at once); key steps in automatic mode `step +1 from ... in automatic mode: offset 0 -> 1, code 757 -> 954`.
 
 ### 5a.5 PianoSensors' side (its kext at S4: `AutoStream.h`, `AutoLight.h`)
+
+The outputs are §5's level-4 properties as landed: `piano-sensors-light-target` (permille), `piano-sensors-lux`, `piano-sensors-edge`
+(`ps_edge_name`), `piano-sensors-seq`, set without a notification; both consumers poll them at most 4 times a second. Asked of its
+owner: `registerService()` once started, so that matching (PianoBacklight's `copyMatchingService`, the agent's notifications) finds
+it; until then both find it by class (PianoBacklight among its provider's children, the agent by walking the service plane).
 
 - Ambient light: one `PalLight`; conditions: `piano-sensors-als` and PianoBacklight taking targets, NativeGopDisplay's
   `piano-display-power`, PianoKeyboard's `piano-keyboard-hall` (unknown counts as open). Each `pas_action` goes out only with
   `sg_may_request`'s token (enable = 514 on change, disable = 10, on the light's own QMI client), answers matched by QMI transaction id
-  to `pas_response`, indications to `pal_event` (data[0]), a timer at `pal_deadline` to `pal_tick`; each target to
-  `PianoBacklightAmbient`; `PAS_FAILED` sends -1 once. The rules make readings resume after every off/on (Ubuntu v1.1.1): one request
+  to `pas_response`, indications to `pal_event` (data[0]), a timer at `pal_deadline` to `pal_tick`; each target into
+  `piano-sensors-light-target` (or to `PianoBacklightAmbient`); `PAS_FAILED` sends -1 once (the platform function). The rules make readings resume after every off/on (Ubuntu v1.1.1): one request
   outstanding, no nested close, the first event kept even before the enable's answer, a re-arm when it never comes, a fresh start
   from it (no fade from the level before the display slept).
 - Accelerometer: one `PasStream` (513 at 10 Hz), wanted with the display on, the cover detached (`piano-keyboard-attached` 0 or
   absent) and `piano-sensors-rotate`; samples through `ps_accel_sample` (a `PAS_EV_FIRST` restarts `sno_init`); on each new state
-  `piano-sensors-edge` = `ps_edge_of` (0..3, 255 for none: flat, face up/down, unknown, stream off), `piano-sensors-edge-changes`, and
-  `messageClients(kIOMessageServicePropertyChange)` as PianoKeyboard does.
+  `piano-sensors-edge` = `ps_edge_name(ps_edge_of(state))` (`none` for flat, face up/down, unknown, the stream off) and
+  `piano-sensors-seq` moved. A `messageClients(kIOMessageServicePropertyChange)` with it would let the agent stop polling.
 - PianoKeyboard: nothing new (`piano-keyboard-attached` and its messages exist, keyboard.md §6c).
 
 ### 5a.6 NativeGopDisplay and PianoDpu
@@ -310,7 +323,7 @@ PIANO_SEED=out/rotated/stage/scratch-data.img PIANO_TRUST=out/rotated/stage/kern
 |---|---|---|
 | R0 | root shell: `piano-rotated --probe`; `--set 90`, `--set 180`, `--set 0` | MPDisplay found, `canChangeOrientation 1`; each `... -> 90 degrees: shown`; the thumbnail rotated; `swap layers` stays `3200x2136` (R1 holds; `2136x3200`: R2); no WindowServer exit |
 | R1 | `piano-rotate=2 piano-rotate-test=1` (+ `piano-keyboard=2`): TestEdge 1, 3, 2, 0; attach and detach the cover; Locked true/false | each edge's rotation 0.6 s after its notification; attach: 0 at once, held; detach: none for 1.5 s; locked: none; a System Settings rotation adopted |
-| R2 | PianoTouch's interface, `piano-rotate=3 piano-touch=2`: at each rotation the four corners and the centre | the pointer under the finger (about 10 px); a drag never jumps at a rotation |
+| R2 | `piano-rotate=3 piano-touch=2 piano-touch-rotate=1`: at each rotation the four corners and the centre | the pointer under the finger (about 10 px); a drag never jumps at a rotation |
 | R3 | with PianoSensors S4 (§8 S4/S5): `piano-rotate=3` without `-test`; PianoBacklight with `piano-backlight-auto=1` | the four edges upright with touch; attached: normal; the backlight follows a lamp within 2 s; 20 display sleep/wake cycles each give readings and the room's level at once |
 
 ### 5a.9 Risks
@@ -450,8 +463,9 @@ Delivered (2026-11-11): A-C as PianoPower's client contract (`package/include/Pi
 8 QRTR client ports with callbacks, 2048-byte IPCRTR receive buffers, `piano_adsp_health` with the fatal bit and count, its own crash
 string and the link and charger generations, `piano_adsp_quiet`, and GLINK keeping a DSP-side open that precedes the registration);
 PianoKeyboard publishes `piano-keyboard-attached`. PianoSensors uses one channel and one port. D is decided: the CDSP carveout, split
-in `package/include/PianoDspMemory.h` (section 5). Still open: PianoBacklight's and PianoTouch's inputs (for level 4), NativeGopDisplay's
-transform (R2 only). The original request, for the record:
+in `package/include/PianoDspMemory.h` (section 5). Delivered too (2026-11-11, off by default): PianoBacklight's automatic mode reading
+`piano-sensors-light-target` (`piano-backlight-auto=1`, §5a.4) and PianoTouch's rotation input (`piano-touch-rotate=1`, §5a.3). Still
+open: NativeGopDisplay's transform (R2 only), and PianoSensors' own `registerService()` (§5a.5). The original request, for the record:
 
 - A. Existing, used as is: `piano_adsp_channel("fastrpcglink-apps-dsp", 512, 8, 0 /* the DSP opens it */, ...)` and `piano_adsp_send`
   (40-byte invokes; answers of 12-16 bytes). Asked: `kClients` from 4 to 6 (IPCRTR, PMIC_RTR_ADSP_APPS, audio's adsp_apps and this one

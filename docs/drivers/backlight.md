@@ -3,6 +3,8 @@
 Status, 2026-11-11: built, host-tested and in the kext list (inert without `piano-backlight`); not run on the tablet. Sources:
 `package/PianoBacklight` (design and boot arguments at the top of `PianoBacklight.cpp`, register facts and the state machine in
 `Ktz8866.h`, the interface for other drivers in `PianoBacklightClient.h`, provenance in `UPSTREAM`). Template: `README.md`.
+Automatic brightness (2026-11-11, host-tested, default off): `piano-backlight-auto=1` takes the ambient light policy's targets
+(§5, [sensors.md](sensors.md) §5a.4); nothing of it runs without the argument.
 
 ## 1. Purpose and gate
 
@@ -72,11 +74,26 @@ piano), so there is no clock, firmware or vote, and no PianoA830 lock is needed.
 |---|---|---|
 | `PianoBacklightDisplay` | NativeGopDisplay's `do_power_state_change_gated` (with `piano-backlight=2`) | on, system power state, WindowServer's API power state |
 | `PianoBacklightStep` | key producers (`piano-backlight-keys=1`): PianoDwc3's HID port now; PianoKeyboard can call it the same way | signed steps, a source name |
+| `PianoBacklightAmbient` | a kernel light consumer (`piano-backlight-auto=1`, else `kIOReturnUnsupported`) | target permille of the code range (intptr_t; -1 leaves automatic mode), a source name, the lux (uintptr_t) |
 
 Watched properties: NativeGopDisplay's `piano-display-power` (boolean, set with each change; read every second, so a call missed while
 PianoBacklight was not yet published is caught up) and PianoKeyboard's `piano-keyboard-hall` (1 open, 0 closed; every 250 ms with
-`piano-backlight-lid=1`). Published: `piano-backlight-code`, `-percent`, `-lit`, `-found-code`. `setProperties` (administrator only):
-`piano-backlight-percent` (0-100) and `piano-backlight-step` (signed).
+`piano-backlight-lid=1`); with `piano-backlight-auto=1` also PianoSensors' `piano-sensors-light-target` (permille) with
+`piano-sensors-seq` and `piano-sensors-lux`, read on the same 250 ms poll and taken when the sequence or the value moves (absent until
+PianoSensors' level 4: inert until then; PianoSensors does not register itself, so it is found by class beside this service).
+Published: `piano-backlight-code`, `-percent`, `-lit`, `-found-code`; with `piano-backlight-auto=1` also `piano-backlight-auto`
+(automatic now), `-offset` (signed 32-bit, in steps), `-ambient-permille`, `-ambient-lux`. `setProperties` (administrator only):
+`piano-backlight-percent` (0-100), `piano-backlight-step` (signed) and, with `piano-backlight-auto=1`, `piano-backlight-auto` (0/1).
+
+**Automatic brightness** (`piano-backlight-auto=1`, level 2; `Ktz8866.h`'s Controller with `package/PianoAuto/AmbientBacklight.h`).
+A target (the light policy's curve, smoothed in the sensor kext: at most one per 250 ms, none at rest) sets the code: permille x 2047,
+never under the floor. The brightness keys then shift the curve by this driver's own steps (x 2^(1/3) with the linear mapping, 1/16 of
+the range with the exponential one): the offset stays for the boot, so "a step darker than automatic" holds as the room changes, and a
+press is always a visible step unless the code is at an end. `piano-backlight-percent` switches to manual (targets recorded only);
+`piano-backlight-auto=1` as a property re-enters (the last target at once, the offset kept), `=0` leaves; a target of -1 (the sensor
+gone) leaves with the code as it is. Writes happen only on a change and not while dark (the newest code lights the wake). The writes'
+own lines are folded into one per 10 s: `ambient: N targets in S s, lux A..B, target P..Q permille, offset K, code X -> Y (Z %)`; the
+first target says `automatic brightness: on (PianoSensors): ...`, a key `step +1 from ... in automatic mode: offset 0 -> 1, code ...`.
 
 **Display sleep hook.** On this stack macOS powers a display off through IOMobileFramebuffer: WindowServer's display sleep calls
 `setAPIPowerState`, system sleep `setPowerState`; the family stores both and calls the driver's `do_power_state_change_gated`, where
@@ -114,6 +131,7 @@ Steps: linear mapping: full scale divided by 2^(k/3) (three steps per doubling, 
 | `piano-backlight-keys=1` | 0 | read by the producers: brightness usages and Right Ctrl + 1/2 step the backlight |
 | `piano-backlight-flags=1` | 0 | the survey reads FLAG (0x0f; clears its latched faults) |
 | `piano-backlight-halfbit=US` | 5 | I2C half-bit time (~100 kHz; 2..50) |
+| `piano-backlight-auto=1` | 0 | automatic brightness (§5): ambient targets taken (`PianoBacklightAmbient`, PianoSensors' `piano-sensors-light-target`), the keys shift the curve |
 | `piano-backlight-swap=B` | 0 | SDA/SCL swapped, bit 0 primary bus, bit 1 secondary (only if reads fail with "no ack (address)" on idle-high pins) |
 
 ## 7. Build, kernel collection, RAM image
@@ -121,7 +139,8 @@ Steps: linear mapping: full scale divided by 2^(k/3) (three steps per doubling, 
 `tooling/k27/build-native-piano-backlight.sh`: the host tests (`tests/backlight_host.cpp`: BitI2c on a bit-level KTZ8866 model with
 auto-increment and clock stretching; steps, levels, log limit; the controller's sequences on register models: survey writes nothing,
 boot level, display off/on order, steps and floor, lid, partial failures and retries, giving up after 8 failed attempts, a missing
-or foreign IC, only 0x04/0x05/0x08 written, BL_EN bit 7 never, bits 5:0 kept; the whole stack; the key watch), then the objects and
+or foreign IC, only 0x04/0x05/0x08 written, BL_EN bit 7 never, bits 5:0 kept; the whole stack; the key watch; the automatic mode:
+refused without the argument, targets, keys as an offset, dark, the summary line, manual and re-entry, leaving), then the objects and
 the import check. PianoBacklight is in `configs/k27-native-kexts.txt`, so every `build-native-image.sh` links it.
 
 ## 8. Hardware test plan (owner present, cable to the Mac, RAM boots only)
@@ -205,8 +224,9 @@ the display asleep).
 5. The hall polarity before `piano-backlight-lid=1` (`keyboard.md` §10.3).
 6. A restart with the display asleep: does the next boot come up lit (§9)?
 7. Panel sleep (DCS display-off/sleep-in) for more savings while dark: `display.md` §8, later.
-8. Automatic brightness: the ambient light sensor is behind the ADSP's sensor hub (Ubuntu's SSC path); `piano-backlight-percent`
-   (setProperties) is the input a later sensor driver or user-space agent would use.
+8. Automatic brightness (§5, `piano-backlight-auto=1`): built and host-tested; its targets wait for PianoSensors' level 4 (the light
+   stream, [sensors.md](sensors.md) §5a.5). Then: does the backlight follow a lamp within 2 s, and do the keys' offset and the curve
+   feel right (sensors.md §5a.8 R3)?
 9. Keyboard and touch blank while dark (Ubuntu's policy): their owners can watch `piano-display-power`.
 
 ## 11. Licence note

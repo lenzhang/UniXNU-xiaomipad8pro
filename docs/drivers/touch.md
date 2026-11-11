@@ -5,6 +5,8 @@ without `piano-touch=N`). **Not run on the tablet**: every hardware fact marked 
 the first run. First deliverable: a **single-touch absolute pointer** (tap = click, drag = drag). Multi-touch is not done.
 Battery (2026-11-11): at rest the frame loop reads one frame per 50 ms instead of every frame and a 1 ms poll (§13,
 [`../power-irq.md`](../power-irq.md)); `piano-touch-irq=1` takes those frames' edge from the TLMM interrupt.
+Display rotation (2026-11-11, host-tested, default off): `piano-touch-rotate=1` maps each contact into the rotated desktop (§5,
+[sensors.md](sensors.md) §5a.3).
 
 ## 1. Purpose and gate
 
@@ -60,6 +62,19 @@ Not used in this pass: the multi-contact trackers (ShengNovatekTouch's, piano-th
 (vendor 0x1af4, product 0x5054, 56-byte descriptor: mouse usage, 3 buttons, absolute X/Y 0..32767; the tablet shape that logged in
 by tap in the piano VM), matched by a codeless `IOHIDEventDriver` personality; the 334-slot vtable is checked at the KC link.
 
+**Display rotation** (`piano-touch-rotate=1`; without it both inputs are refused as before and the reports are unchanged). The
+rotation is CGDisplayRotation's (degrees clockwise, 90 = the panel's left edge up), told by the rotation agent `piano-rotated`
+([sensors.md](sensors.md) §5a.2) after it read it back:
+- `callPlatformFunction("PianoTouchRotation", false, (void *)(uintptr_t)degrees, (void *)source, 0, 0)` for a kernel caller, and
+  the property `piano-touch-rotation` through `setProperties` (0, 90, 180, 270) from root or the console user (the agent runs as
+  the logged-in user; xnu's `"console"` privilege). Both only record the request (`kIOReturnBadArgument` for another value,
+  `kIOReturnNotPrivileged` for another caller, `kIOReturnUnsupported` without the argument). `piano-touch-rotation` is also
+  published: the rotation in use.
+- A new rotation takes effect at the next touch-down, never in the middle of a contact (`pat_latch`); each report goes through
+  `rotatedTabletReport` (`TouchHid.h`): the contact in the rotated desktop (`package/PianoAuto/TouchRotation.h`, `pat_rotate`), scaled
+  over its size. At 0 the bytes are `tabletReport`'s. One line per change: `rotation: 90 degrees from this touch on (was 0; from
+  setProperties, change 1)`.
+
 ## 6. Boot args
 
 | Argument | Default | Meaning |
@@ -80,11 +95,13 @@ by tap in the piano VM), matched by a codeless `IOHIDEventDriver` personality; t
 | `piano-touch-irq=1` | 0 | the idle frames' edge by the TLMM summary interrupt instead of 1 ms polls (§13) |
 | `piano-wake-log=S` | 60 | the `idle: N wakeups in S s` line every S seconds (0 none; shared) |
 | `piano-touch-trace=1` | 0 | more frame headers; contact positions also at level 2 |
+| `piano-touch-rotate=1` | 0 | follow the display's rotation (§5): `PianoTouchRotation` and `piano-touch-rotation` taken, contacts mapped from their touch-down |
 
 ## 7. Build and kernel collection
 
 `tooling/k27/build-native-piano-touch.sh`: host tests (GeniSpi; the NT36532E model over whole transfers and bit by bit; both
-real images downloaded into the model with its CRC check; decoder, tip debounce, HID, clocks), the pinned images staged into
+real images downloaded into the model with its CRC check; decoder, tip debounce, HID, the rotated report (identical bytes at 0
+over the panel and beyond, the corners at 90/180/270, the latch), clocks), the pinned images staged into
 the ignored `out/native-kexts/PianoTouch/firmware` and `.incbin`'d, the objects. `tooling/k27/build-native-image.sh` builds it
 with the list; PianoTouch links after PianoA830 (it takes A830's `sm8750_gcc_vote_owner` around the 0x52008 write). Without the
 images the build warns and step 5 stops on the target ("no usable image").
