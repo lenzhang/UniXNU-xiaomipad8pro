@@ -6,9 +6,9 @@
  * SHA-256, about 136 bytes in its __TEXT) and gets the bytes at run time, checked against the pin, from (in this order):
  *
  *   1. the kext itself, when it was built with the image inside (the embedded path: the caller passes it, size 0 when not built in);
- *   2. the boot's firmware addon: a RAM image carries the files of its collection's pins as Payloads/kernel.macho.gpuaddon (the
- *      UniXNU addon container "NGPUADD2", entry paths EFI/UniXNU/firmware/...), which DarwinBoot hands over at
- *      /chosen/memory-map GpuAddon (tooling/bootimg/build-ram-images.py; k27 itself reads nothing there);
+ *   2. the boot's addon: a RAM image carries the files of its collection's pins in Payloads/kernel.macho.gpuaddon (the UniXNU
+ *      addon container "NGPUADD2", entry paths EFI/UniXNU/firmware/..., shared with PianoSensors' pack entry), which DarwinBoot
+ *      hands over at /chosen/memory-map GpuAddon (tooling/bootimg/build-ram-images.py; k27 itself reads nothing there);
  *   3. the ESP on UFS (GPT partition "esp", read only through NativeUfs and FatVolume, as PianoSensors reads its pack): the installed
  *      system's EFI/UniXNU/firmware/<path> (tooling/persist/build-esp.py places every pin's file there).
  *

@@ -13,8 +13,9 @@ kexts carry, the staged copies in the ignored out/firmware/, the ESP's EFI/UniXN
                                              its PIANO_FW_PIN line written to the header H and its symbols to the C
                                              source C: the file inside (--embed, .incbin into the kext's __TEXT: pointer
                                              free, no __DATA_CONST) or size 0 (read at run time)
-  firmware.py addon KC OUT [--dir DIR]       the NGPUADD2 addon of the collection's pins (what build-ram-images.py puts in a RAM
-                                             image as Payloads/kernel.macho.gpuaddon)
+  firmware.py addon KC OUT [--dir DIR]       the NGPUADD2 addon of the collection's pins alone (build-ram-images.py puts these
+                                             entries into the RAM image's one Payloads/kernel.macho.gpuaddon, next to
+                                             PianoSensors' pack entry when PIANO_SENSOR_PACK is set)
   firmware.py dump-addon ADDON               its entries
 
 A pin (PianoFirmwarePin, 136 bytes): "PianoFw1", the path below EFI/UniXNU/firmware (88 bytes with its NUL), u32 size, u32 flags
@@ -23,7 +24,8 @@ the collection itself says which files its kexts read; the builders place exactl
 The addon is UniXNU's container (scripts/make-gpu-addon.py): "NGPUADD2", u32 count, u32 0, u64 total; per file u32 path bytes (with
 the NUL, at most 160), u32 mode, u64 size, u64 compressed size, the path and the zlib stream each padded to 8 bytes. DarwinBoot loads
 <kernel>.gpuaddon from the payload only when the ADT has a /chosen/memory-map GpuAddon slot, and refuses to boot when one is there
-without the other: adt_with_slot() / adt_slot() keep the two together.
+without the other: adt_with_slot() / adt_slot() keep the two together. It loads one such file: every user's entries share it
+(container()), and each reader takes only its own paths.
 """
 import argparse
 import hashlib
@@ -117,19 +119,30 @@ def record(pins, found, problems):
              'problem': next((text for q, text in problems if q is p), None)} for p in pins]
 
 
-def addon_bytes(found):
-    """The NGPUADD2 container of FOUND [(pin, data)]: entries EFI/UniXNU/firmware/<path>, mode 0644, zlib level 9."""
+def firmware_entries(found):
+    """FOUND [(pin, data)] as addon entries [(path, mode, data)]: EFI/UniXNU/firmware/<path>, mode 0644, sorted."""
+    return [(f'{ESP_DIR}/{pin["path"]}', 0o644, data) for pin, data in sorted(found, key=lambda item: item[0]['path'])]
+
+
+def container(entries):
+    """The NGPUADD2 container of ENTRIES [(path, mode, data)] in their order, zlib level 9 (one container carries every user's
+    entries: the firmware's, PianoSensors' pack; each reader takes only its own paths)."""
     body = b''
-    for pin, data in sorted(found, key=lambda item: item[0]['path']):
-        name = f'{ESP_DIR}/{pin["path"]}'.encode() + b'\0'
-        if len(name) > 160:
-            raise SystemExit(f'{name!r}: an addon path has at most 160 bytes')
+    for path, mode, data in entries:
+        name = path.encode() + b'\0'
+        if len(name) > 160 or len({p for p, _, _ in entries}) != len(entries):
+            raise SystemExit(f'{path}: an addon path has at most 160 bytes and appears once')
         packed = zlib.compress(data, 9)
-        body += struct.pack('<IIQQ', len(name), 0o644, len(data), len(packed)) + pad8(name) + pad8(packed)
-    blob = ADDON_MAGIC + struct.pack('<IIQ', len(found), 0, 24 + len(body)) + body
+        body += struct.pack('<IIQQ', len(name), mode, len(data), len(packed)) + pad8(name) + pad8(packed)
+    blob = ADDON_MAGIC + struct.pack('<IIQ', len(entries), 0, 24 + len(body)) + body
     if len(blob) > ADDON_MAX:
-        raise SystemExit(f'the firmware addon has {len(blob)} bytes; DarwinBoot reads at most {ADDON_MAX}')
+        raise SystemExit(f'the addon has {len(blob)} bytes; DarwinBoot reads at most {ADDON_MAX}')
     return blob
+
+
+def addon_bytes(found):
+    """The NGPUADD2 container of FOUND [(pin, data)] alone."""
+    return container(firmware_entries(found))
 
 
 def pad8(data):

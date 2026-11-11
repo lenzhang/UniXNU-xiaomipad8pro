@@ -6,11 +6,14 @@
 Per image: the v2 header equals the Ubuntu RAM set's (v1.1.0 boot-ram-maintenance.img) in every field but the sizes,
 command line and id; the id is recomputed; the kernel field is BootShim (ARM64 header: text offset = FD base, image size
 = shim + FD) + the exact FD + the boot DTB; the v2 dtb section is the boot DTB; the ramdisk is a FAT volume whose files
-are listed and, for the macOS image, hashed against the inputs; an AVB footer, when present, is shown and verified with
-the public key. Prints a log; exits 1 on any failure.
+are listed and, for the macOS image, hashed against the inputs, with the boot addon and the ADT's GpuAddon slot present
+together or not at all and every addon entry matching its pin in the payload's collection or the recorded sensor pack
+(docs/kc-space.md); an AVB footer,
+when present, is shown and verified with the public key. Prints a log; exits 1 on any failure.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import struct
@@ -77,6 +80,57 @@ def fat_files(ramdisk):
         return listing.returncode == 0, files
 
 
+def fat_file(ramdisk, name):
+    """The bytes of one file of the payload FAT."""
+    env = dict(os.environ, MTOOLS_SKIP_CHECK='1', TZ='UTC')
+    with tempfile.TemporaryDirectory() as tmp:
+        image = Path(tmp) / 'fat.img'
+        image.write_bytes(ramdisk)
+        out = Path(tmp) / 'f'
+        subprocess.run(['mcopy', '-n', '-o', '-i', str(image), '::/' + name, str(out)], check=True, env=env, capture_output=True)
+        return out.read_bytes()
+
+
+def check_firmware(ramdisk, files, info):
+    """The boot addon (docs/kc-space.md, docs/drivers/sensors.md section 5b): present exactly when the build recorded one (firmware
+    entries or the sensor pack), then the ADT has the GpuAddon slot and every entry is a pin of the payload's own collection with that
+    pin's size and SHA-256, or the recorded sensor pack; absent: no slot. No private hash shown."""
+    spec = importlib.util.spec_from_file_location('piano_firmware', Path(__file__).resolve().parents[2] / 'tooling/persist/firmware.py')
+    fw = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fw)
+    record, sensor = info.get('firmware') or {}, info.get('sensor_pack')
+    name = 'EFI/UniXNU/Payloads/kernel.macho.gpuaddon'
+    adt = fat_file(ramdisk, 'EFI/UniXNU/Payloads/kernel.macho.adt')
+    if not record.get('addon') and not sensor:
+        check(name not in files, 'no boot addon (the build recorded none)')
+        check(not fw.adt_slot(adt), 'the ADT has no /chosen/memory-map GpuAddon slot (DarwinBoot refuses a slot without an addon)')
+        return
+    if record.get('addon_sha256'):
+        check(files.get(name, (0, None))[1] == record['addon_sha256'], f'{name} is the addon the build recorded')
+    check(name in files, f'{name} present')
+    check(fw.adt_slot(adt), 'the ADT has the /chosen/memory-map GpuAddon slot DarwinBoot fills with the addon')
+    if name not in files:
+        return
+    pins = {f'{fw.ESP_DIR}/{p["path"]}': p for p in fw.pins_in(fat_file(ramdisk, 'EFI/UniXNU/Payloads/kernel.macho'))}
+    try:
+        entries = fw.parse_addon(fat_file(ramdisk, name))
+    except ValueError as problem:
+        check(False, f'the addon parses ({problem})')
+        return
+    for path, mode, data in entries:
+        digest = hashlib.sha256(data).hexdigest()
+        if path == 'sensors/piano-sensors.pack':   # PianoSensors' SensorsAddon.h SA_PACK_PATH: this unit's pack (private)
+            check(bool(sensor) and digest == sensor.get('sha256'), f'addon {path} ({len(data)} bytes) is the sensor pack the build recorded')
+            continue
+        pin = pins.get(path)
+        ok = pin is not None and len(data) == pin['size'] and digest == pin['sha256']
+        shown = 'private' if pin and pin['private'] else digest[:16]
+        check(ok, f'addon {path} ({len(data)} bytes, {shown}) matches its pin in the payload\'s collection')
+    missing = sorted(set(pins) - {path for path, _, _ in entries})
+    if missing:
+        print('  info  pinned but not in the addon (the kexts try the ESP): ' + ', '.join(missing))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('build_json', type=Path)
@@ -127,6 +181,8 @@ def main():
         for name, digest in want.items():
             if digest:
                 check(files.get(name, (0, None))[1] == digest, f'{name} is the input the build recorded')
+        if 'EFI/UniXNU/Payloads/kernel.macho' in files:
+            check_firmware(ramdisk, files, info)
         config = files.get('EFI/UniXNU/unixnu.toml', (0, None, None))[2]
         check(config is not None, 'EFI/UniXNU/unixnu.toml present')
         if config:

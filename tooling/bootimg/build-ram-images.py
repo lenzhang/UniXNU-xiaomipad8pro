@@ -24,6 +24,13 @@ Payloads/kernel.macho.gpuaddon (package/PianoSensors/tools/sensor_addon.py), whi
 GpuAddon slot and PianoSensors takes before the ESP's; the ADT must have the slot (make-piano-adt.py --addon: build-native-image.sh makes
 out/adt/piano-k27-addon.adt with PIANO_SENSOR_PACK) and an ADT with the slot is refused without a pack. Only a pack under this
 repository's out/ or private/; the image then holds the unit's calibration (keep it local); the record has its sha256 only.
+The firmware (docs/kc-space.md, package/include/PianoFirmware.h): a macOS image also carries the files its collection's kexts pin
+(tooling/persist/firmware.py finds the pins in the KC), as entries EFI/UniXNU/firmware/<path> of the same addon (one container
+for both: PianoSensors takes only its entry, the firmware loader only its own), taken from PIANO_FW_DIR (default out/firmware, staged
+by the kexts' build scripts) after their size and SHA-256 are checked. The payload's ADT has the GpuAddon slot exactly when the
+payload has the addon: the input ADT's (made with --addon for PIANO_SENSOR_PACK), or added to the payload's copy when only firmware
+is carried. A collection without pins adds nothing, so the image is as before. PIANO_FW_ADDON=0 leaves the firmware out (the kexts
+then read the tablet's ESP); a pin whose file is not staged is left out with a note.
 """
 import argparse
 import hashlib
@@ -138,6 +145,49 @@ def persist_common():
 
 def loud(text):
     print('\n'.join(['', '*' * 100, *[f'*  {line}' for line in text.splitlines()], '*' * 100, '']), file=sys.stderr, flush=True)
+
+
+def firmware_module():
+    """tooling/persist/firmware.py (the pins, the staged copies, the addon, the ADT slot), loaded by path."""
+    spec = importlib.util.spec_from_file_location('piano_firmware', DEVICE / 'tooling/persist/firmware.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def firmware_addon(payloads, kc, adt, addon):
+    """The collection's pinned firmware as entries of the payload's addon, next to ADDON's (the sensor pack's container from
+    sensor_pack_addon, or None). Returns (the build record's 'firmware', the addon's bytes or None). sensor_pack_addon has checked
+    that the input ADT has the GpuAddon slot exactly when ADDON is there; when only firmware is carried, the payload's copy of the ADT
+    gets the slot here, so the payload has both or neither. No hash of a private pin in the record."""
+    fw = firmware_module()
+    pins = fw.kc_pins(kc)
+    directory = Path(os.environ.get('PIANO_FW_DIR') or DEVICE / 'out/firmware')
+    record = {'pins': len(pins), 'dir': str(directory), 'entries': 0}
+    found = []
+    if pins:
+        found, problems = fw.staged(pins, directory)
+        record['files'] = fw.record(pins, found, problems)
+        if problems:
+            loud('pinned firmware not staged, left out of this image (the kexts then try the tablet\'s ESP):\n'
+                 + '\n'.join(f'{fw.ESP_DIR}/{pin["path"]}: {why}' for pin, why in problems))
+        if found and os.environ.get('PIANO_FW_ADDON', '1') == '0':
+            loud('PIANO_FW_ADDON=0: no firmware in this image\'s addon; the kexts read their files from the tablet\'s ESP')
+            found = []
+    if found:
+        entries = fw.parse_addon(addon) if addon is not None else []
+        if any(path.startswith(fw.ESP_DIR + '/') for path, _, _ in entries):
+            raise SystemExit('the sensor pack\'s addon already has firmware entries')
+        addon = fw.container(entries + fw.firmware_entries(found))
+        if not fw.adt_slot(Path(adt).read_bytes()):
+            (payloads / 'kernel.macho.adt').write_bytes(fw.adt_with_slot(Path(adt).read_bytes()))
+            record.update(adt_input_sha256=sha(adt), adt_sha256=sha(payloads / 'kernel.macho.adt'))
+        record['entries'] = len(found)
+        print(f'firmware: {len(found)} of {len(pins)} pinned file(s) in the addon', file=sys.stderr)
+    record['addon'] = addon is not None
+    if addon is not None:
+        record.update(addon_bytes=len(addon), addon_sha256=hashlib.sha256(addon).hexdigest())
+    return record, addon
 
 
 def data_store_args(seed, kc):
@@ -276,6 +326,7 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     shutil.copyfile(seed, payloads / 'scratch-data.img')
     shutil.copyfile(adt, payloads / 'kernel.macho.adt')
     addon, sensor_pack = sensor_pack_addon(adt)
+    firmware, addon = firmware_addon(payloads, kc, adt, addon)
     if addon is not None:
         (payloads / 'kernel.macho.gpuaddon').write_bytes(addon)
         (payloads / 'kernel.macho.gpuaddon').chmod(0o600)
@@ -306,7 +357,7 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     image = work / 'payload-macos.img'
     payload(stage, image, 'PIANOESP', size_mib)
     return image, {'cmdline_1cpu': one, 'cmdline_8cpu': smp, 'payload_mib': size_mib, 'fast_boot': fast_boot_level(),
-                   'data_store': store_record, 'sensor_pack': sensor_pack}
+                   'data_store': store_record, 'sensor_pack': sensor_pack, 'firmware': firmware}
 
 
 def kernel_field(fd, dtb, work, name):
@@ -366,7 +417,9 @@ def main():
             ramdisk, extra = macos_payload(work, a.kc, a.trust, a.seed, a.adt, a.utc)
             image, info = pack(a.out, a.fd, a.dtb, ramdisk, work, f'boot-piano-macos-ram-{a.fd_name}')
             report['images'][image.name] = {**info, **extra, 'payload_sha256': sha(ramdisk), 'payload_bytes': ramdisk.stat().st_size,
-                                            'kc_sha256': sha(a.kc), 'adt_sha256': sha(a.adt), 'trust_sha256': sha(a.trust),
+                                            'kc_sha256': sha(a.kc), 'trust_sha256': sha(a.trust),
+                                            # the payload's ADT: the input's, or its copy with the firmware addon's slot
+                                            'adt_sha256': extra['firmware'].get('adt_sha256') or sha(a.adt),
                                             'seed_sha256': sha(a.seed), 'sha256': sha(image), 'bytes': image.stat().st_size}
     (a.out / f'build-{a.fd_name}.json').write_text(json.dumps(report, indent=2) + '\n')
     for name, info in report['images'].items():

@@ -315,7 +315,11 @@ def fat32_read(image):
             if e[11] == 0x0f:
                 lfn.insert(0, (e[1:11] + e[14:26] + e[28:32]).decode('utf-16le', 'replace'))
                 continue
-            name = ''.join(lfn).split('\0')[0] if lfn else (e[0:8].decode().rstrip() + ('.' + e[8:11].decode().rstrip() if e[8:11].strip() else ''))
+            # a short name's case flags (byte 12: 0x08 base, 0x10 extension in lower case), as EDK2 FatPkg's
+            # FatGetFileNameViaCaseFlag reads them: mtools stores a lower-case 8.3 name ("firmware") so, without a long name
+            base, ext = e[0:8].decode().rstrip(), e[8:11].decode().rstrip()
+            base, ext = base.lower() if e[12] & 0x08 else base, ext.lower() if e[12] & 0x10 else ext
+            name = ''.join(lfn).split('\0')[0] if lfn else base + ('.' + ext if ext else '')
             lfn = []
             attr = e[11]
             if attr & 0x08:

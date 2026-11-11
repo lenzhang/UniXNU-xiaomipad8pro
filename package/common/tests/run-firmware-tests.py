@@ -7,6 +7,8 @@
   loader   firmware_host (ASan/UBSan): the pins, an ESP-like FAT32 image made by mtools as build-esp.py formats the ESP, the
            embedded check, the NGPUADD2 addon that firmware.py addon makes from the pins it finds in the test binary itself (as the
            RAM image builder finds them in a kernel collection), damaged containers, zlib through the loader's allocator
+  shared   one container with PianoSensors' pack entry (its tools/sensor_addon.py) and the firmware entries, as build-ram-images.py
+           makes it with PIANO_SENSOR_PACK: PianoSensors' SensorsAddon.c and the loader both accept it
   pins     pins_in on noise, duplicates, conflicts; check and dump-addon
   adt      the /chosen/memory-map GpuAddon slot added to a synthetic ADT and to out/adt/piano-k27.adt when present, the rest
            unchanged, as DarwinBoot walks it
@@ -166,6 +168,22 @@ def main():
         print((result.stdout + result.stderr).strip())
         if result.returncode:
             sys.exit('FAIL: firmware_host')
+
+        # one addon for every user: PianoSensors' pack entry (its own tool's) and the firmware entries in one container, as
+        # build-ram-images.py makes it, accepted by PianoSensors' reader and by the loader
+        sensors = REPO / 'package/PianoSensors'
+        if (sensors / 'SensorsAddon.c').is_file() and (sensors / 'tools/sensor_addon.py').is_file():
+            tool = module(sensors / 'tools/sensor_addon.py', 'sensor_addon')
+            pack = b'SSCPACK1' + bytes(8) + struct.pack('<Q', 4096) + bytes(4096 - 24)
+            shared = t / 'shared.addon'
+            shared.write_bytes(fw.container(fw.parse_addon(tool.addon_bytes(pack)) + fw.firmware_entries(found)))
+            check_exe = t / 'shared_addon_host'
+            run(os.environ.get('CC', 'cc'), *CFLAGS, '-I', INCLUDE, '-I', COMMON, '-I', FAT, '-I', sensors, HERE / 'shared_addon_host.c',
+                sensors / 'SensorsAddon.c', COMMON / 'PianoFirmwareCore.c', FAT / 'FatVolume.c', '-o', check_exe)
+            result = subprocess.run([check_exe, shared, 'EFI/UniXNU/firmware/PianoTest/good.bin'], capture_output=True, text=True)
+            print((result.stdout + result.stderr).strip())
+            if result.returncode:
+                sys.exit('FAIL: shared_addon_host')
 
         # pins: noise, duplicates, conflicts; check and dump-addon
         raw = exe.read_bytes()

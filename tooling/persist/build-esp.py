@@ -20,6 +20,7 @@ profile's and --arg's additions. Entries:
   build-esp.py --profile base|softgpu|gpu|daily [--default macos|macos-diag] [--arg NAME=VALUE ...] [--rtc-offset N|sdam] [--from REPO]
                [--fast-boot 0|1|2] [--boot-guard SECS] [--replace-data [1|HEX8]] [--flatten-data] [--sensor-pack PACK]
                [--audio-preset FSM [--audio-preset-any]]
+               [--firmware-dir DIR] [--allow-missing-firmware]
                [--kc K --adt A --trust T --seed S] [--name esp-diag] [--out out/persistent]
 
 The Data store (docs/data-store.md): the macos entries open it read-write (data-persist=2). When the installed seed is known
@@ -48,6 +49,12 @@ The amplifiers (docs/drivers/audio.md section 10.3): --audio-preset FSM puts the
 checked as the kernel checks it (the container's size field and CRC16) and must be the stock file (size and SHA-256 as Ubuntu publishes
 them for OS3.0.303.0.WPYCNXM) unless --audio-preset-any; only its sha256 goes into the record. It is vendor data: never commit it, and
 keep the image local.
+The firmware (docs/kc-space.md, package/include/PianoFirmware.h): every file the collection's kexts pin (tooling/persist/firmware.py
+finds the pins in the KC, and in --prev-kc's) goes to EFI/UniXNU/firmware/<path>, taken from --firmware-dir (default <--from>/out/
+firmware, where the kexts' build scripts stage them; never committed) after its size and SHA-256 are checked against the pin. A pin
+whose file is missing or different stops the build unless --allow-missing-firmware (that kext then reports it at its level). A
+private pin (this unit's own data) is recorded without its hash. The ESP never carries the boot addon (that is a RAM image's, where
+the same files travel), so an ADT with the GpuAddon slot is refused (above).
 """
 import argparse
 import os
@@ -62,6 +69,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common  # noqa: E402
+import firmware  # noqa: E402
 
 EPOCH = 1262304000
 LABEL, SERIAL = 'PIANOESP', '50494e4f'
@@ -343,6 +351,31 @@ def check_audio_preset(path, any_preset):
     return path, stock
 
 
+def esp_firmware(a, kc, prev_kc, directory):
+    """The pinned firmware files for EFI/UniXNU/firmware/: (pins, found [(pin, data)], problems [(pin, text)]). The previous
+    collection's pins too, unless one names a path of this collection's with other contents (this one's wins, with a note)."""
+    pins = firmware.kc_pins(kc)
+    if prev_kc:
+        mine = {p['path']: p for p in pins}
+        for pin in firmware.kc_pins(prev_kc):
+            other = mine.get(pin['path'])
+            if other is None:
+                pins.append(pin)
+            elif (other['size'], other['sha256']) != (pin['size'], pin['sha256']):
+                loud(f'--prev-kc pins {firmware.ESP_DIR}/{pin["path"]} with other contents than {kc.name}: the ESP holds this '
+                     "collection's file, so the previous collection's kext refuses it (macos-prev)")
+    found, problems = firmware.staged(pins, directory)
+    for pin, _ in found:
+        print(f'firmware: {firmware.describe(pin)}')
+    if problems:
+        text = '\n'.join(f'{firmware.ESP_DIR}/{pin["path"]}: {why}' for pin, why in problems)
+        if not a.allow_missing_firmware:
+            raise SystemExit(f"pinned firmware not staged in {directory} (the kexts' build scripts stage it; "
+                             f'--allow-missing-firmware builds without):\n{text}')
+        loud(f'--allow-missing-firmware: the ESP lacks these pinned files; their kexts will report them:\n{text}')
+    return pins, found, problems
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--profile', choices=sorted(PROFILES), required=True)
@@ -379,6 +412,9 @@ def main():
     p.add_argument('--audio-preset', type=Path, metavar='FSM',
                    help="the owner's own stock amplifier preset (fs19xx.fsm from odm_a) -> EFI/UniXNU/piano-fs19xx.fsm (vendor data)")
     p.add_argument('--audio-preset-any', action='store_true', help='take a valid preset that is not the stock file')
+    p.add_argument('--firmware-dir', type=Path, help='the staged firmware copies (default <--from>/out/firmware)')
+    p.add_argument('--allow-missing-firmware', action='store_true',
+                   help='build even when a pinned firmware file is missing or different (its kext then reports it)')
     p.add_argument('--name', help='output base name (default esp-<profile>-<default>)')
     p.add_argument('--out', type=Path, default=common.DEVICE / 'out/persistent')
     a = p.parse_args()
@@ -419,6 +455,9 @@ def main():
     prev = None
     if a.prev_kc:
         prev = {'kc': a.prev_kc.resolve(), 'adt': (a.prev_adt or inputs['adt']).resolve(), 'trust': (a.prev_trust or inputs['trust']).resolve()}
+    fw_dir = (a.firmware_dir or a.source / 'out/firmware').resolve()
+    fw_pins, fw_found, fw_problems = esp_firmware(a, inputs['kc'], prev['kc'] if prev else None, fw_dir)
+    fw_private = {f'{firmware.ESP_DIR}/{pin["path"]}' for pin in fw_pins if pin['private']}
     seed = common.seed_info(inputs['seed'])
     window = seed['store_blocks']
     data_store = check_store(a, seed, inputs['kc'])
@@ -437,6 +476,10 @@ def main():
         shutil.copyfile(inputs['adt'], payloads / 'kernel.macho.adt')
         shutil.copyfile(inputs['trust'], payloads / 'kernel.macho.trustcache')
         shutil.copyfile(inputs['seed'], payloads / 'scratch-data.img')
+        for pin, data in fw_found:   # EFI/UniXNU/firmware/<path>, long names (FAT keeps their case)
+            target = stage / firmware.ESP_DIR / pin['path']
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
         if pack:   # a long name (FAT keeps its case): PianoSensors' SensorsLoad.h SL_PATH
             shutil.copyfile(pack, stage / 'EFI/UniXNU/piano-sensors.pack')
         if preset:   # a long name as well: PianoAudio's AudioPreset.h AUDIO_PRESET_PATH
@@ -490,12 +533,13 @@ def main():
         'sensor_pack': {'sha256': common.sha(pack), 'bytes': pack.stat().st_size, 'private': 'this unit only'} if pack else None,
         'audio_preset': {'sha256': common.sha(preset), 'bytes': preset.stat().st_size, 'stock': preset_stock,
                          'vendor_data': 'the owner\'s own copy: never committed'} if preset else None,
+        'firmware': {'dir': str(fw_dir), 'files': firmware.record(fw_pins, fw_found, fw_problems)},
         'seed': seed, 'data_store': data_store,
         'store': {'window_blocks': window,
                   'first_lba_now': common.store_first(common.ROOTFS_LAST, window),
                   'first_lba_after': common.store_first(common.ROOTFS_NEW_LAST, window)},
         'fat': {k: v for k, v in fat.items() if k not in ('files', 'problems')},
-        'files': want, 'unixnu_toml': config,
+        'files': {n: ('private' if n in fw_private else h) for n, h in want.items()}, 'unixnu_toml': config,
     }
     common.write_json(a.out / f'{name}.json', record)
     print(f'{image.name}: {record["bytes"]} bytes sha256 {record["sha256"]} (profile {a.profile}, default {a.default}, '
