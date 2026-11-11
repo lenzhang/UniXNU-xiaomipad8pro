@@ -77,4 +77,5 @@ store and runs Data volatile ("kept"). Images built before the guard still start
 
 Charging control (level 1 only reads; whether a part-empty battery charges without the DSP is being measured), the keyboard cover
 and touch screen (drivers built, first tests pending), Wi-Fi (months: `docs/drivers/wifi.md`; a USB network to the Mac is built),
-audio, Bluetooth, cameras, sensors, sleep.
+audio, Bluetooth, cameras, sensors, sleep (CPU idle states and suspend-to-idle are built as k27 0061/0062, opt-in and not run yet:
+`docs/power.md`).
