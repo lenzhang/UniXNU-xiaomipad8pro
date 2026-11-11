@@ -5,12 +5,15 @@ Status 2026-11-11: **level 1 ran on the tablet** (`package/PianoTouch`, listed i
 calibration loaded, frames with good checksums. Facts still marked *inferred* or *needs-boot* below wait for a run with a finger.
 **Level 2** (`piano-touch=2`): the touch screen for macOS, which has no touch screen interface of its own, as what it understands
 from a HID pointer (§14): tap = click, hold = right click, drag = left drag, two-finger scroll (fine, natural), two-finger tap =
-right click, palms rejected, a pinch recognised (sent only on request). Host-tested on synthetic frames, **not run yet**: the
-attended test list for the next session is §15. Multi-contact tracking (§14.2) feeds it; Apple's multitouch path is not used.
+right click, palms rejected, a pinch recognised (sent only on request). Multi-contact tracking (§14.2) feeds it; Apple's
+multitouch path is not used. **Ran 2026-11-11** (§15.1): contacts, taps, drags and two-finger scrolling worked (12238 frames,
+1 bad checksum); the Y axis was reversed on this BOE unit (now `PIANO_TOUCH_INVERT_Y=1` at build, §5); a second run lost touch
+after ~5 minutes to the controller's watchdog state (0xfd) that three downloads in a row did not clear. Fixed 2026-11-12 (§13):
+the frame pace keeps the controller fed (every frame on its edge, a latched edge never dropped, no read inside a scan, never
+more than 250 ms unread) and the watchdog is downloaded again every 10 s, never given up; host-tested against a model of the
+handshake that reproduces both failures. The attended list for the next session is §15.
 Battery (2026-11-11): at rest the frame loop reads one frame per 50 ms instead of every frame and a 1 ms poll (§13,
-[`../power-irq.md`](../power-irq.md)); `piano-touch-irq=1` takes those frames' edge from the TLMM interrupt. The first run saw
-almost no gpio162 edges at rest, so a frame is now also read without one (§13): a touch at rest is read within ~50 ms instead of
-200, and under a finger the loop reads ~80 frames a second even if the edge never comes.
+[`../power-irq.md`](../power-irq.md)); `piano-touch-irq=1` takes those frames' edge from the TLMM interrupt.
 Display rotation (2026-11-11, host-tested, default off): `piano-touch-rotate=1` maps each contact into the rotated desktop before
 the gestures (§5, [sensors.md](sensors.md) §5a.3).
 
@@ -39,9 +42,10 @@ contact work runs **in the kext** (`TouchMatrix.h`, Project-SunUEFI's decoder fo
 | Protocol | trim ID `0e .. .. 32 65 03`; cascade: event buffer 0x11c400, poll info 0x1093d8; reset state 0xa0..0xaf, calibrated 0xa3 | SunUEFI, ShengNovatekTouch | verified on piano by SunUEFI (download, idle frames) |
 | Frame | 257-byte transport block + THP packet (checksum, 40 x 60 int16); BOE payload 5192 B (frame 5449 B); 120 Hz | plan §1; Ubuntu | verified (Ubuntu) |
 | Images | `novatek_nt36532_piano_fw_{boe,csot}.bin`, 245,760 B each (sha256 `b7999389…` / `14b30bb7…`) | xiaomipad-8pro-mainline `firmware/piano-input.json` | verified; both download byte-exact into the host model |
-| Orientation | X along the 60 columns (3200 px), Y along the 40 rows (row-major matrix); BOE: panel Y = processor Y (no flip), CSOT: reversed; X never flipped | piano-thp `frame.cpp`, `orientation.hpp`; this BOE unit ran so on Ubuntu | verified (Ubuntu); the verification step confirms it natively |
+| Orientation | X along the 60 columns (3200 px), Y along the 40 rows (row-major matrix); BOE: panel Y = processor Y (no flip), CSOT: reversed; X never flipped. **This BOE unit: Y reversed** (the owner at level 2, 2026-11-11; piano's Ubuntu needed a per-device invert_y on it too) | piano-thp `frame.cpp`, `orientation.hpp`; attend1 | verified on the tablet: `PIANO_TOUCH_INVERT_Y=1` (§5) |
 | Calibration | per unit, private: electrode centres `row_map[40]`, `column_map[60]` (52-54 px steps, not uniform), maxima 21360 / 32000 (pixels x 10), edge band 600 (60 px), gain 4350 / base 2700; `project_vendor_id` 26 = BOE | the unit's Ubuntu file (§7) | verified (file); its arrays are never written down here |
-| Frames at rest | nobody touching: ~0.5 gpio162 edges a second, frame type 3, every read with or without an edge had a good checksum (1074 of 1074 in 210 s), peak delta 9-12 at rest | the first level-1 run, 2026-11-11 | verified at rest; under a finger **needs-boot** (§15) |
+| Frames at rest | nobody touching: ~0.5 gpio162 edges a second, frame type 3, every read with or without an edge had a good checksum (1074 of 1074 in 210 s), peak delta 9-12 at rest | the first level-1 run, 2026-11-11 | verified; the few edges were the loop's own doing (next row) |
+| Frame handshake | gpio162 rises when a frame is ready and the frame waits until the host reads it; the next one is scanned only then: edges = reads, at most ~79 a second under a finger (a 5.1 ms read, ~7.5 ms scan). The level-1 loop dropped the latch after each idle sleep, so the waiting frame raised no new edge (its 0.5 edges/s). The watchdog state (transport 0xfd, no frames until a download) came with reads ~500 ms apart (attend1, the display off at boot) and with 12 ms edge-less reads inside the ~12.6 ms cycle (attend2: three downloads in a row, each into 0xfd at once) | attend1, attend2 (2026-11-11) | **inferred** from the counts; the model of §13 reproduces both; the next run confirms it (§15) |
 
 ## 3. Specification sources
 
@@ -104,14 +108,14 @@ rotation is CGDisplayRotation's (degrees clockwise, 90 = the panel's left edge u
 | `piano-touch-mode=V` | 2 | operating-mode command value (65536: not sent) |
 | `piano-touch-baseline=0` | 1 | no idle-baseline command |
 | `piano-touch-threshold=T` | 200 | contact threshold of the decoder |
-| `piano-touch-flip=B` | auto | auto: by the panel (BOE none, CSOT Y reversed; the calibration's panel wins over gpio100 here, its `invert_y` over both); 0..3: bit 0 X, bit 1 Y flipped |
+| `piano-touch-flip=B` | auto | auto: this unit's Y from the build (`PIANO_TOUCH_INVERT_Y`, §7) if given, else by the panel (BOE none, CSOT Y reversed; the calibration's panel wins over gpio100 here, its `invert_y` over both); 0..3: bit 0 X, bit 1 Y flipped (wins over all of them) |
 | `piano-touch-poll=MS` | 1 | edge polling interval while the panel is busy |
-| `piano-touch-idle=MS` | 50 | at rest one frame per MS (20..500); 0: every frame, the old loop (§13) |
+| `piano-touch-idle=MS` | 50 | at rest one frame per MS (20..200: never more than 250 ms unread, §13); 0: every frame on its edge, the old loop |
 | `piano-touch-irq=1` | 0 | the idle frames' edge by the TLMM summary interrupt instead of 1 ms polls (§13) |
 | `piano-wake-log=S` | 60 | the `idle: N wakeups in S s` line every S seconds (0 none; shared) |
 | `piano-touch-trace=1` | 0 | more frame headers; contact positions also at level 2 |
 | `piano-touch-rotate=1` | 0 | follow the display's rotation (§5): `PianoTouchRotation` and `piano-touch-rotation` taken, contacts mapped from their touch-down |
-| `piano-touch-noedge=MS` | 12 | while busy, a frame is read anyway MS after the last one when no gpio162 edge came (4..200); at rest the idle period + 10 ms, or the idle period itself once 3 reads in a row had no edge (§13). With `piano-touch-idle=0`: 200, as before |
+| `piano-touch-noedge=MS` | 50 | while busy, a frame is read anyway MS after the last one when neither an edge nor the line's level said one waits (25..200; never inside a ~12.6 ms cycle); at rest the idle period + 50 ms; with `piano-touch-idle=0` 200, as before (§13) |
 | `piano-touch-gestures=0` | 1 | level 2 without the gestures: the first contact is the tip (down presses, moves drag, up releases), as before this change |
 | `piano-touch-hold=MS` | 500 | a finger held this long within the slop: right click (200..3000; 0: never, and a long press is a click) |
 | `piano-touch-slop=PX` | 32 | panel pixels (~2.4 mm) a finger may move and still tap or hold; past it a drag, a scroll or a pinch (4..200) |
@@ -148,6 +152,14 @@ The build prints `calibration: unit file (panel BOE, sha256 xxxxxxxx), electrode
 linear map` when the file is absent, unset (`PIANO_TOUCH_CALIBRATION=` in the environment) or invalid (with the reason). With it, a
 contact's position is piano-thp's: the electrode positions weighted by max(delta - 25, 0) over the peak's 3 x 3 nodes (widened toward a stronger neighbour, §14.2), then the
 edge stretch, then the orientation, then / 10 to pixels. Without it, the linear map over node centres.
+
+**This unit's Y orientation** (`PIANO_TOUCH_INVERT_Y`, in the environment or `~/.config/piano/env`: `1` Y reversed, `0` as the
+processor gives it; private like the calibration, never committed). The first level-2 run showed this BOE unit's Y reversed under
+the panel's default (no flip); piano's Ubuntu needed a per-device invert_y on it as well. The generator writes it as
+`kUnitInvertYOverride` (with or without a calibration file) and `piano-touch-flip=auto` takes it before the file's `invert_y` and
+the panel; an explicit `piano-touch-flip=0..3` still wins. The build prints `...; Y reversed by PIANO_TOUCH_INVERT_Y=1`, the boot
+`orientation: this unit's Y reversed by the build (PIANO_TOUCH_INVERT_Y=1): ...` and `orientation: flip X 0, Y 1 (this unit: Y
+reversed (PIANO_TOUCH_INVERT_Y=1 at build); ...)`. For this unit: add `PIANO_TOUCH_INVERT_Y=1` to `~/.config/piano/env`.
 
 ## 8. Hardware test plan
 
@@ -210,7 +222,8 @@ use (`calibration: none` in the log). Level 2 adds `HID device: touch screen poi
 | `geni: transfer N: the engine is still busy` | a command still running 2 ms after the previous DMA completed: the engine hangs |
 | no `first gpio162 edge`, ~0 edges/s, ~20 reads/s at rest and ~80 while touching | GPIO162 does not latch (or, at rest, the controller idles its scanning): frames are read without it (§13); good checksums mean they are whole. Before this change the same case read 5 frames a second |
 | many `checksum BAD` | reads not synced to the edge, or slower than a frame: `piano-touch-khz=19200` |
-| `N watchdog frames in a row`, `watchdog (state S): the download again` | controller firmware crashed: idled first when S is 0xfe (swrst <- 0xaa), then downloaded again (at most 3 times) |
+| `watchdog (state S, N frames in a row): the download again (K for the watchdog...)` | the controller's watchdog state (0xfd: starved or read inside a scan, §13; 0xfe: idled first, swrst <- 0xaa): downloaded again at once, then every 10 s while it comes back, never given up. Repeated: the pace is not feeding it (the `frames: reads ...` line: many B, or gaps) |
+| `geni: a QUP1/SE2 clock branch is off ...` | someone cleared PianoTouch's 0x52008 votes or the branch stopped: voted again, that transfer skipped (an SE2 access then would have stalled the bus) |
 | `FAILED at step 7: frames: 50 frame reads in a row failed` | the transport died mid-run |
 | level 2 without `event service ... published` | IOHIDEventDriver did not attach (personality/IDs) |
 | `contact N down` lines but no pointer movement in macOS | the reports go nowhere: `HID: handleReport` failures, or the descriptor not taken (compare with `piano-touch-gestures=0`, the plain tip) |
@@ -249,15 +262,14 @@ The panel images and the unit's calibration stay out of every repository: the ca
 
 ## 13. Battery: the frame pace (`piano-touch-idle`, `piano-touch-irq`)
 
-The controller streams a frame about every 8.3 ms whether or not a finger is on the panel. The loop now reads every frame
-(1 ms latch polls, as before) only while the panel is busy: a contact in the last frame, the tip confirming or down, the decoder
-still learning its type or reference, watchdog frames, and for 1.5 s after the last of these. At rest (`TouchPace.h`) it sleeps
-until 2 ms before the next read is due (one per `piano-touch-idle`, default 50 ms), drops the latch (that edge came mid-sleep,
-mid-frame) and reads on the next fresh edge. A finger is read at most one idle period and a frame late, then every frame. The
-host test's model: ~20 reads and ~60 wake-ups a second at rest instead of ~120 and ~1000. SPI by hand is not paced (it reads at
-most 10 frames a second anyway).
+The loop reads every frame (1 ms latch polls, as before) only while the panel is busy: a contact, a gesture going on, the decoder
+still learning its type or reference, watchdog frames, and for 1.5 s after the last of these. At rest (`TouchPace.h`) one frame
+per `piano-touch-idle` (default 50 ms). The first design (2026-11-11) assumed a controller streaming every 8.3 ms regardless and
+dropped the latched edge after each idle sleep as "mid-frame"; the level-2 runs showed the opposite (§2 "Frame handshake": the
+frame waits behind its edge), and dropping it is what starved the edges: the rules since 2026-11-12 are the next paragraphs. SPI
+by hand is not paced (it reads at most 10 frames a second anyway).
 
-With `piano-touch-irq=1` the wait for that fresh edge is the TLMM interrupt: gpio162 on the summary line SPI 208
+With `piano-touch-irq=1` the wait for the edge (when it is not latched yet after the idle sleep) is the TLMM interrupt: gpio162 on the summary line SPI 208
 (`package/common/PianoIrq.h` `tlmm::Pin`, the table shared with PianoKeyboard), enabled only for that wait (the handler masks
 it), with INTR_CFG's PDC bit cleared. Ubuntu measured touch reads 43-51 % slow while the system idle state (4.4 ms exit) was
 entered and held a 2000 µs CPU latency limit per transfer (`../ubuntu-history/kernel.md` top finding 8): the busy state therefore
@@ -266,15 +278,47 @@ timed-out waits in a row with the latch set turn the interrupt off (`no interrup
 (its guard) too. Lines: `frames: gpio162 interrupt on the TLMM summary (SPI 208, INTID 240): slot N, INTR_CFG armed ... masked
 ...` or `... NOT used (why)`. Test images and the A/B: `../power-irq.md` §5.
 
-**Without an edge** (2026-11-11, after the first run). The level-1 run on the tablet saw about one gpio162 edge in two seconds with
-nobody touching (perhaps the controller idling its scanning at rest; open question 8), and every frame read without one had a
-good checksum. The old loop then read a frame only every 200 ms (5 a second; a touch at rest up to 200 ms late, and under a
-finger 5 frames a second if the edge stayed away). Now (`TouchPace.h` `noEdgeMs`): while busy a frame is read anyway 12 ms after
-the last one (`piano-touch-noedge`; ~80 frames a second; with edges every frame comes on its edge first); at rest the idle period
-plus 10 ms, and once three reads in a row came without an edge the rest is *blind*: the thread sleeps to the due time itself and
-reads (one wake-up a read) until an edge latches during a sleep again. Host model with no edges at all: 198 reads and 297 wake-ups
-in 10 s at rest (with edges, polled: 201 and 600), a touch read at most 49 ms after it landed, then 32 or more reads in 400 ms.
-`piano-touch-idle=0` (the old loop, the A of the battery A/B) keeps 200 ms.
+**Keeping the controller fed** (2026-11-12, after the level-2 runs; `TouchPace.h`). What the runs show (§2 "Frame handshake"):
+the frame waits behind its edge until the host reads it and the next one is scanned only then; reads ~500 ms apart and reads
+started inside the ~12.6 ms cycle both put the controller into its watchdog state. The 2026-11-11 pace did both: it dropped the
+latched edge after each idle sleep (as the level-1 loop had: the waiting frame then raised no new edge, its 0.5 edges/s), read
+12 ms after the last read without an edge while busy (inside the cycle: attend2), and read once per 500 ms plus a 250 ms wait with
+the display off (attend1's 0xfd while the display was still off at boot). Now:
+- a latched edge is never dropped (it is the frame that waits); it is taken and cleared before the read;
+- busy: the latch polled every 1 ms, every frame read on its edge; the line still high 25 ms after the last read started (an edge
+  missed): read; no edge and the line low for 50 ms (`piano-touch-noedge`, 25..200): read anyway (two cycles and more: a frame
+  waits by then);
+- at rest: one frame per idle period: the thread sleeps to the due time and reads on the latch (set during the sleep), else on the
+  line's level, else waits for the edge, at most to the idle period + 50 ms;
+- the display off: one frame per 200 ms (the level-1 loop's proven gap), never more than 250 ms unread anywhere (the idle period is
+  at most 200 ms);
+- `piano-touch-idle=0`: every frame on its edge, 200 ms without one (the level-1 loop).
+Host model (`tests/touch_host.cpp` `simulateFeed`: a frame ready 6.5-11 ms after the read of the previous one ended, waiting;
+a read before it is ready or a frame unread for 450 ms sends the model to 0xfd): the previous rules reproduce both runs (the
+display off for 70 s at boot: 0xfd, reads 505 ms apart; no edges with a finger down: 4 collisions, 3 downloads); the current ones
+never reach 0xfd with edges, with every third edge lost, with none at all (then they read on the line's level), with cycles of 11.6
+and 16.1 ms, with and without the display off, never more than 250 ms between reads (200 with the display off), ~80 frames a second under a finger and ~20 at
+rest. The latency at rest: one idle period if the waiting frame is current, two if the controller scanned it right after the last
+read (the model samples the finger at the read; the run tells which, open question 8).
+
+**The watchdog** (`WatchdogRecovery`): eleven watchdog transport blocks in a row (0xfd, or 0xfe: idled first, swrst <- 0xaa) and the
+download again at once; while it comes back sooner than 10 s after a download, the next one 10 s after it, and so on, never given
+up (2026-11-11: three downloads in a row, then `FAILED at step 7` and no touch for the boot). With the display off it is only
+counted; the display's return reads one frame as well as the probe (§16) and downloads again if it is a watchdog block. Lines:
+`frames: watchdog (state 0xfd, 11 frames in a row): the download again (N for the watchdog[; it came back: every 10 s from now
+on, never given up])`, `frames: watchdog (state 0xfd) again T ms after its download: the next download in T ms`, `frames: the
+download for the watchdog failed: again in 10 s`. With every stats line: `frames: reads N: E on an edge, L on the line still high,
+B without either; gpio162 now 0|1; watchdog frames W, downloads for it D`: L and B near 0 mean the edges come.
+
+**SE2's clocks before each transfer.** Every GENI register access needs the QUP1 SE2 clock branches; an access with one off stalls
+the bus, which can hang a CPU until the watchdog resets the tablet (two desktop sessions with touch reset, cause unknown). Before
+each transfer the five branches are read in GCC (always safe); one found off: PianoTouch's votes in 0x52008 again (bits only set,
+under PianoA830's lock word) and the transfer skipped (`geni: a QUP1/SE2 clock branch is off (CBCR ...; vote ... -> ...; N
+times): voted again, the transfer skipped`). Audit of the touch paths for the resets: nothing masks interrupts; the waits are bounded
+(the GENI polls: 300 µs spinning, then 1 ms sleeps, ~110 ms at most a frame; the engine-idle wait 2 ms; the lock word 50 ms, at
+bring-up only; the SMMU's TLB sync 100 ms, at step 2 only; `setPowerState(off)` 600 ms of 1 ms sleeps); no other driver clears the
+0x52008 bits (PianoA830 votes in 0x52000, PianoWifi only sets bits under the lock); the latency hold is not in the 0059 images. The
+decoder's and the tracker's scratch (~4.5 KiB) moved from the 16 KiB kernel stack into their structures.
 
 **The CPU latency hold** (`piano-touch-cpu-hold`, default 2000 µs; `TouchPace.h` `BurstHold`). Ubuntu held a 2000 µs CPU latency
 limit around each GPI SPI transfer (reads 43-51 % slow without it). Here the hold covers the read burst: taken when the panel turns
@@ -293,7 +337,7 @@ itself (`TouchTrack.h`) over the matrix's peaks (`TouchMatrix.h` points).
 | Touch | macOS gets | Notes |
 |---|---|---|
 | a finger lands | the pointer moves there, no button | the first report of a touch: in the contact's first frame when its peak reaches 400 (`piano-touch-fast`), else its second |
-| **tap**: lifted within 500 ms, moved at most 32 px (~2.4 mm) | **left click** where it landed | pressed and released when the lift is seen (3 frames, ~25 ms, without the contact). A tap within 500 ms and 48 px of the previous one clicks exactly where that one did, so macOS counts a double click |
+| **tap**: lifted within 500 ms, moved at most 32 px (~2.4 mm) | **left click** where it landed | pressed and released when the lift is seen (3 frames without the contact, ~38 ms at the ~80 frames a second the controller gives). A tap within 500 ms and 48 px of the previous one clicks exactly where that one did, so macOS counts a double click |
 | **hold**: 500 ms within 32 px | **right click** where it landed, at 500 ms | the context menu opens under the finger; the finger then only moves the pointer (past the slop), its lift sends nothing |
 | **drag**: moved past 32 px before 500 ms | **left drag**: pressed where it landed, the pointer follows the finger, released at the lift | selecting text, moving windows and icons, sliders; a second finger during a drag changes nothing |
 | two fingers (the second seen in 2 frames while the first was undecided) | the pointer moves between them | the window under it is the one that scrolls |
@@ -342,9 +386,10 @@ steps: `piano-touch-scroll=2`.
 
 ### 14.4 Latency and the log
 
-From the finger's landing to the first report: at rest up to one idle period (50 ms) and a frame read (~5 ms), with or without
-edges (§13); then the pointer moves in the contact's first frame read when its peak is strong, else in the second (8-12 ms
-later). Under a finger every frame is read (8.3 ms with edges, 12 ms without). A tap's click: 3 frames (~25 ms) after the lift;
+From the finger's landing to the first report: at rest up to one idle period (50 ms) and a frame read (~5 ms), or two idle
+periods if the frame waiting at the idle read was scanned right after the previous read (§13; the run tells which); then the
+pointer moves in the contact's first frame read when its peak is strong, else in the second (~12.6 ms later: under a finger
+every frame is read on its edge, ~80 a second). A tap's click: 3 frames (~38 ms) after the lift;
 a hold's right click 500 ms after the landing (host test: 504 ms). `piano-touch-idle=20` halves the rest latency for 50 reads a
 second instead of 20; `piano-touch-irq=1` changes only how the idle edge is waited for (≤ 1 ms).
 
@@ -377,37 +422,65 @@ The burst hold. The power states and the probe (§16).
 
 ## 15. Attended test list (the next tablet session)
 
-Images (RAM boot, `piano-reset-after=900`, back in ABL fastboot, the installed system untouched; GPU profile; built 2026-11-11 from
-this change on main 471197c, sha256 of each `boot-piano-macos-ram-A-bundled.img` in the table; `out/` is never committed):
+### 15.1 Results of 2026-11-11
 
-| Image (`out/`) | Kernel | Arguments added to the GPU profile | sha256 (16) |
-|---|---|---|---|
-| A `ram-touch-g` | 0059 (no latency hold) | `panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-touch=2 piano-touch-trace=1` | `9a9b7dd2709ffc5c` |
-| B `ram-touch-g-fast` | 0059 | A + `piano-touch-idle=20 piano-touch-irq=1` | `59d2318506f0b502` |
-| C `ram-touch-g-sleep` | 0062 (latency hold compiled in) | `panic_on_crash_disabled=1 piano-power=1 piano-power-period=10 piano-usb=2 piano-usb-hid=1 piano-input=1 piano-sleep=1 piano-sleep-state=1 piano-sleep-test=150 piano-sleep-test-count=3 piano-sleep-max=30 piano-touch=2 piano-touch-trace=1` (the suspend test's set, the Mac's keyboard and pointer over USB, and touch) | `c0bdd714217f7c2e` |
-| D `ram-touch-g-display` (optional) | 0059 | A + `piano-backlight=2` | `d7f2e831f39a89e0` |
+- **attend1** (`piano-touch=2`, `piano-touch-flip` auto: BOE, no flip): the display read off at boot (NativeGopDisplay's
+  `piano-display-power` before WindowServer), touch muted at ~2 reads a second, and the controller went to its watchdog state
+  (0xfd) while muted; at the display's return the probe said "kept its state" (the firmware info survives 0xfd), two downloads for
+  the watchdog, then edges at 24-79 a second and touch worked: contacts, taps, drags, two-finger scrolling (12238 frames, 1 bad
+  checksum). **The Y axis was reversed** (as on Ubuntu, which needed a per-device invert_y).
+- **attend2** (the same with `piano-touch-flip=2`): muted at boot without 0xfd, then at rest without a single edge counted (the
+  latch dropped after each idle sleep), at the first touch (183 s) 0xfd at once, three downloads each into 0xfd at once (the 12 ms
+  edge-less reads inside the cycle), `FAILED at step 7`.
+- Two desktop sessions with touch enabled reset the tablet (no panic in the log; the RAM images' Gunyah watchdog bites after
+  32 s of a hang); cause unknown, a run without touch is the comparison. §13 has the touch paths' audit and the clock guard.
 
-Each has its dump image in `out/ram-<name>-dump`. KC (16): `58c18824f3425025` (0059, A, B, D), `f29b076e05a7b0ff` (0062, C); 21
-native kexts, the native kext rule passed, `PianoTouchHID` 0 problem slots. Data runs volatile (the A830 stage's seed is not the
-installed one). Order: A, then B, then C; D only after the backlight's own first run.
+Fixed 2026-11-12 (§13, §7): the frame pace, the watchdog's back-off, the probe's frame read, SE2's clock guard, this unit's Y.
 
-Rebuild any of them (`K27_KERNEL` only for C):
+### 15.2 The next run
+
+Image (RAM boot, `piano-reset-after=1800`, back in ABL fastboot, the installed system untouched; GPU profile; this unit's Y from
+the build environment, `PIANO_TOUCH_INVERT_Y=1`; `out/` is never committed):
+
+`out/ram-touch-feed/boot-piano-macos-ram-A-bundled.img`, sha256 (16) `5bf3819a00820ad1`, its dump image in `out/ram-touch-feed-dump`
+(`d6d52465f3db0438`); kernel 0059 (no latency hold), KC `c9406cf824cb90d4` (23 native kexts, the native kext rule passed,
+`PianoTouchHID` 0 problem slots); arguments added to the GPU profile `panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1
+piano-touch=2 piano-touch-trace=1`; built 2026-11-12 on main 45493f4 with this change. Data runs volatile.
 
 ```sh
-PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=900 \
+PIANO_TOUCH_INVERT_Y=1 PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=1800 \
   PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-touch=2 piano-touch-trace=1" \
-  tooling/k27/build-native-image.sh                                                 # A (out/ram, out/ram-dump)
+  tooling/k27/build-native-image.sh                                                 # out/ram, out/ram-dump
 tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img out/ram-dump/boot-piano-macos-ram-A-bundled.img
 grep 'PianoTouch:' logs/native-runs/*-loop/xnu-console.txt | tail -200            # or live: tooling/native/usb-console.py
 ```
 
-**A, at boot** (no finger yet): `gestures: tap = click, held 500 ms = right click, moved past 32 px = drag, two-finger tap = right
+(With `PIANO_TOUCH_INVERT_Y=1` in `~/.config/piano/env` the prefix is not needed.) What this run must show, beyond §15.3's steps:
+
+1. **Y**: `orientation: this unit's Y reversed by the build (PIANO_TOUCH_INVERT_Y=1): ...` and `orientation: flip X 0, Y 1 (this
+   unit: Y reversed ...)`; a drag downward moves the pointer downward, the corners of §15.3 step 11 land in their corners.
+2. **Fed at boot**: `frames: every frame on its gpio162 edge while busy (none for 50 ms, or the line still high after 25 ms: read
+   anyway), one per 50 ms at rest (none by 100 ms: read anyway), one per 200 ms with the display off`; while the display reads off
+   at boot, `frames at ... s: ~5 reads/s` and `watchdog 0`; at its return `display: the controller kept its state ...` and no
+   `watchdog` line.
+3. **Edges at rest**: the `frames: reads N: E on an edge, L on the line still high, B without either; gpio162 now ...` line after
+   each stats line: at rest E grows by ~20 a second and L, B stay near 0 (a frame per idle period on its edge); under a finger E by
+   ~80 a second. Large B: the edge does not latch (then L tells whether the line's level does).
+4. **Long session**: 20 minutes of desktop use with touch (taps, drags, scrolling, pauses of a few minutes): no `watchdog` line,
+   `watchdog frames 0` throughout. If 0xfd comes anyway: `frames: watchdog (state 0xfd, ...): the download again (1 for the
+   watchdog)`, touch back within ~1 s, and if it returns, a download every 10 s (never `FAILED at step 7`); note what was going on.
+5. **No reset**: the session ends at `piano-reset-after` only. A reset before it: save the whole console log; any `geni: a QUP1/SE2
+   clock branch is off` line before it matters.
+
+### 15.3 The steps (the list of 2026-11-11, still to be done in full)
+
+**At boot** (no finger yet): `gestures: tap = click, held 500 ms = right click, moved past 32 px = drag, two-finger tap = right
 click, two-finger scroll 4 px a count (declared 45/inch, the content follows the fingers under natural scrolling), pinch
 recognised, nothing sent`; `contacts: up to 8 followed; one counts after 2 frames, at once from a peak of 400, ...`; `latency: no
 CPU latency hold (built for a kernel without piano_cpuidle_latency_hold)`; `power: joined the power tree: ...`; `HID device:
 touch screen pointer (absolute X/Y, 3 buttons, wheel and AC Pan at 45 counts/inch), ... 89-byte descriptor`; `event service
-IOHIDEventDriver published on the touch screen`; after step 7 `frames: without a gpio162 edge a frame is read anyway 12 ms after
-the last one while busy, 60 ms at rest` and `matrix: reference of 32 frames ...`.
+IOHIDEventDriver published on the touch screen`; after step 7 the `frames: every frame on its gpio162 edge while busy ...` line of §15.2
+and `matrix: reference of 32 frames ...`.
 
 Then, in this order (each step: what to do, the lines that prove it, what to watch on the screen):
 
@@ -448,10 +521,10 @@ Fallbacks for the next image: no pointer movement although `contact` lines come 
 whether the descriptor or the gestures are at fault; every tap a palm → `piano-touch-palm=` above the `area` of step 1; taps
 read as drags → `piano-touch-slop=48`; holds too eager → `piano-touch-hold=700`.
 
-**B** (lowest latency at rest): steps 1-2 again; the `contact 1 down` line comes at most ~20 ms after the touch (one idle period of
+**With `piano-touch-idle=20 piano-touch-irq=1` added** (the lowest latency at rest): steps 1-2 again; the `contact 1 down` line comes at most ~20 ms after the touch (one idle period of
 20 ms); `frames: gpio162 interrupt on the TLMM summary ...` or `... NOT used (why)`; `frames at 60 s: ~50 reads/s` at rest.
 
-**C** (suspend, the 0062 kernel: a sleep 150 s after the boot completed and 150 s after each wake, three times, each woken after
+**Suspend** (`K27_KERNEL=<the 0062 kernel>`, the suspend test's arguments `piano-power=1 piano-power-period=10 piano-input=1 piano-sleep=1 piano-sleep-state=1 piano-sleep-test=150 piano-sleep-test-count=3 piano-sleep-max=30` added: a sleep 150 s after the boot completed and 150 s after each wake, three times, each woken after
 30 s; log in before the first with the Mac's keyboard over USB, keep the cable in): at start `latency: while the panel is busy no
 CPU idle state slower than 2000 us to leave (piano_cpuidle_latency_hold)`; at each suspend `power:
 system off (suspend N): frames stopped, contacts released, CPU latency hold released, gpio162 interrupt masked` and `power:
@@ -460,10 +533,10 @@ firmware info ...`, (if lost) `firmware: download N done ...`, `power: system on
 of 32 frames ...` again. After each wake: a tap and a two-finger scroll work as in A (steps 2 and 7). A touch while the
 tablet is suspended wakes nothing (touch is no wake source).
 
-**D** (optional, after backlight.md's own first run: it needs `piano-backlight=2`, with which NativeGopDisplay publishes
+**The display off** (optional, `piano-backlight=2` added, after backlight.md's own first run: it needs `piano-backlight=2`, with which NativeGopDisplay publishes
 `piano-display-power`): at start `display: following NativeGopDisplay's piano-display-power (on now)`. Let the display sleep
 (System Settings, Lock Screen: turn the display off on power adapter when inactive, for 1 minute): `display off: touch muted
-(nothing reported), one frame per 500 ms ...`; touch and tap the dark panel: no `gesture:` lines, the display stays off; wake it
+(nothing reported), one frame per 200 ms ...`; touch and tap the dark panel: no `gesture:` lines, the display stays off; wake it
 with a key: `display: the controller kept its state ...`, `display on: touch back after T ms`; a tap works at once.
 
 ## 16. Power states: suspend and the display off (2026-11-11, host-tested, not run)
@@ -489,10 +562,13 @@ The touch part of the driver contract (`package/include/PianoPowerContract.h`, `
   stopped until the next wake. The latch, the contacts and the gestures start afresh.
 - **The display off** (`piano-touch-display`, default 1): NativeGopDisplay's `piano-display-power` (published with
   `piano-backlight=2`; without it the display counts as on), read every 250 ms. Off: every contact and gesture ended, nothing
-  reported, one frame per 500 ms (the slowest tier; decoded only so that the reference keeps following the drift), never busy (no
+  reported, one frame per 200 ms (the slowest tier that keeps the controller fed, §13; decoded only so that the reference keeps following the drift), never busy (no
   latency hold), read errors and watchdog frames only counted (a TDDI stops scanning with its panel: Ubuntu started the THP stream
   after panel enable and stopped it at disable, `../ubuntu-history/device.md` §2.10). On: the same probe; kept, nothing more
   (the reference was followed); lost, the download and the reference.
+- The probe (both returns) also reads one frame: the firmware info and the reset state survive the watchdog state (attend1's
+  "kept its state" followed by 0xfd frames), a watchdog transport block counts as lost (`... the controller is in its watchdog
+  state: ...`, then the download).
 - Lines: `power: joined the power tree: ...`, `power: system off (suspend N): ...`, `power: system off taken, frames stopped after
   M ms` (or `NOT taken yet`), `power: the controller kept|lost its state: firmware info V/C (started with S), reset state R`,
   `power: system on: touch back after T ms` (or `the controller did not come back: frames stopped until the next resume`),

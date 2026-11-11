@@ -130,10 +130,12 @@ idle frames' edge comes by interrupt (2 wake-ups per idle read); a bad checksum 
 idle edge polled, three missed interrupts turn it off. When the idle work provides a latency-hold hook, the busy state can wait
 for the interrupt too, holding it across each read. Default paced: the driver has not run yet, so its first run tests this
 too; the IRQ is opt-in. (Ubuntu also notes the firmware idles its scanning only after the BF commands, which PianoTouch sends.)
-2026-11-11, after the first run (about one gpio162 edge in two seconds at rest, every read without one whole): a frame is also read
-without an edge, 12 ms after the last one while busy and the idle period + 10 ms at rest, blind (a sleep to the due time and one
-wake-up a read) once three reads in a row had none; and the k27 0061 latency hold now covers each busy read burst when the kernel
-has it (`drivers/touch.md` §13).
+2026-11-12, after the level-2 runs: the controller holds each frame behind its edge until it is read and scans the next one only
+then, and reads inside its ~12.6 ms cycle or ~500 ms apart put it into its watchdog state. So a latched edge is never dropped after
+an idle sleep any more (that was why the level-1 run saw ~0.5 edges/s), a read without an edge waits 50 ms while busy (25 ms with
+the line still high), at rest the idle period + 50 ms, never more than 250 ms unread (200 ms with the display off); the watchdog is
+downloaded again every 10 s, never given up; the k27 0061 latency hold covers each busy read burst when the kernel has it
+(`drivers/touch.md` §13).
 
 ## 5. Measuring: the A/B
 
