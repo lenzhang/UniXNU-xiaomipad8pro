@@ -496,6 +496,9 @@ bool NativeGopDisplay::start(IOService *provider)
         GOPLOG("D6 (piano-dp-fake): a second display %ux%u@%u, %ux%u mm, primary %u, %s; RAM-backed, no hardware touched%s%s\n",
                fFake.width, fFake.height, fFake.hz, fFake.widthMm, fFake.heightMm, fFake.primary,
                fFake.atBoot ? "connected from its start" : "disconnected until its plug timer", *fFake.note ? "; " : "", fFake.note);
+        // Other drivers find the panel's display by class (PianoBacklight, PianoKeyboard, PianoPolicy, PianoSensors, PianoTouch);
+        // with two instances that lookup may return this one. It publishes no display power, and D6's images run none of them.
+        GOPLOG("D6: drivers that look NativeGopDisplay up by class may find this instance: test it without them\n");
     }
     unsigned backlight = 0;
     PE_parse_boot_argn("piano-backlight", &backlight, sizeof(backlight));
@@ -897,7 +900,8 @@ IOReturn NativeGopDisplay::swap_submit(IOMFBSwapRec *rec, IOUserClient *client, 
 IOReturn NativeGopDisplay::do_power_state_change_gated()
 {
     bool on = at<uint32_t>(this, kSystemPowerState) && at<uint32_t>(this, kAPIPowerState);
-    publishDisplayPower(on);
+    if (!fExternal)   // the panel's power only: D6's second display publishes none (its readers mean the panel)
+        publishDisplayPower(on);
     if (fBacklightCallout)
         backlightCallout(on);
     if (on == fDisplayOn)

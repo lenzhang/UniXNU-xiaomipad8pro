@@ -92,7 +92,8 @@ DDR: +2 GB/s needs a bus vote (open: RPMh BCM path natively).
 IOMobileFramebuffer services; NativeGopDisplay is one `IOMobileFramebufferLegacy` subclass (27.0.1 ABI generated at build time)
 that reports one timing and `hotPlug_notify(1)`. Design: `DisplayPortCount = 2` on the nub; **a second NativeGopDisplay instance**
 (the same class, a second matching category, a "DPU flip" backend instead of the GOP copy: there is no GOP framebuffer for DP, and
-even a CPU copy needs the SMMU window because XNU's RAM is above 4 GiB) that starts **disconnected** (`hotPlug_notify(0)`) and on
+even a CPU copy needs the SMMU window because XNU's RAM is above 4 GiB; for D7 a leaf class of its own, so the drivers that look the
+panel's display up by class name keep finding the panel) that starts **disconnected** (`hotPlug_notify(0)`) and on
 PianoDp's "link up" publishes the EDID modes as its timings and the EDID (manufacturer, product, physical size) as display
 attributes, then `hotPlug_notify(1)`; unplug → `hotPlug_notify(0)`, pipes parked. Swaps of that instance go to PianoDpu's external
 flip. Whether WindowServer turns a paravirt-type IOMFB's hot-plug into an extended desktop is **unknown** (the VM's displays are
@@ -229,13 +230,17 @@ own timing (the same CVT-RB-style blanking), size (527x296 mm), `IOMFBUUID` (`4E
 (`PianoDp test display`, product 0xd6); none of the panel's callouts (backlight, PianoDpu), no refresh copies, the boot console left
 alone. `hotPlug_notify(0)` at its start (1 with `-boot`), then a work-loop timer walks the schedule (plug at S, then with `-unplug=U`
 alternately every U s, `-cycles` plugs, ending plugged); its VBL timer stops while it is unplugged. If its start fails, the nub's count
-goes back to 1. No register, no DMA, no hardware. Its lines say `NativeGopDisplay-ext:` (the panel's are unchanged), so
-`boot-timeline.py`'s login-frame match stays the panel's:
+goes back to 1. No register, no DMA, no hardware. It publishes no `piano-display-power` (that property and its messages are the
+panel's). Caveat: PianoBacklight, PianoKeyboard, PianoPolicy, PianoSensors and PianoTouch find the panel's display by the class
+name `NativeGopDisplay`, which the second instance shares, so with D6 armed such a lookup may return it; the D6 images run none of
+them (and D7's real external display gets a class of its own, §4.5). Its lines say `NativeGopDisplay-ext:` (the panel's are
+unchanged), so `boot-timeline.py`'s login-frame match stays the panel's:
 
 ```
 NativeGopDisplay: AppleParavirtGPU nub on gop-display, 2 display ports (piano-dp-fake: the second is D6's RAM-backed test display)
 NativeGopDisplay-ext: probe on AppleParavirtGPU (ADT gop-display): taking it
 NativeGopDisplay-ext: D6 (piano-dp-fake): a second display 1920x1080@60, 527x296 mm, primary 0, disconnected until its plug timer; RAM-backed, no hardware touched
+NativeGopDisplay-ext: D6: drivers that look NativeGopDisplay up by class may find this instance: test it without them
 NativeGopDisplay-ext: RAM surface 1920x1080 row 7680 (8294400 bytes): frames are copied there and never scanned out
 NativeGopDisplay-ext: display attributes published (one 1920x1080@60 timing, 8-bit SDR sRGB)
 NativeGopDisplay-ext: hardware started (VBL timer 60 Hz while connected, power states registered, hot plug 0; plugged in 180 s)
