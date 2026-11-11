@@ -27,3 +27,41 @@ running Ubuntu DT): every address, pin, bus address, stream ID and DSP service o
 Specifications only (no code, comment or table copied): none at this level beyond the DT. Later levels read Linux's q6apm, gpr,
 q6prm, lpass-va-macro and the FS19xx driver (GPL-2.0) as specifications only (docs/drivers/audio.md section 11). Not read and not
 used for anything: any Qualcomm or FourSemi binary, the amplifier preset (fs19xx.fsm), the DSP firmware, the ACDB, the topology.
+
+Levels 2+ (host-tested code, 2026-11-11; nothing of it runs on hardware yet):
+
+UniXNU-sheng (main 00ba90984e831e4c6ce30ec3d8a56e6434e9f1af), BSD-2-Clause-Patent, code reused:
+  package/ShengGpr.h (sha256 a274dded1f4d1e2709b9f966759bcb1f57d12747ee0f57743dea1fa97d95d23e) and package/ShengGpr.c (sha256
+    c4f498f07e2cb601b593e64a8d32474a21d6a87375618e1a67b99d52c5d3160e): PianoGpr.h / PianoGpr.c, unchanged but for the names.
+  package/tests/gpr_host.c (sha256 0ef79db96255f7f63c3479e0b512279d99ce38532ccf72e79cd0627e507ec9bd): tests/gpr_host.c, only the
+    include renamed.
+  package/ShengAudioReach.h (sha256 b135177a5feb3e24e0d8a6aabb301600e2c37078b970a09ada6e8eb7bb6a5b98) and package/ShengAudioReach.c
+    (sha256 9b198e58272d325bad48e68633f59c8cc5bdc97033d2a485abb6691a402b6a8d): PianoAudioReach.h / .c keep its packet writer,
+    graph_open, the graph, memory map, buffer and PRM commands and ar_parse; piano's graphs replace sheng's (I2S sink and codec DMA
+    TX3 out; LOG + MFC + TDM sink, the four-module stream, VA TX0 and the five-module capture stream in), and the logger, MFC and TDM
+    parameters, the channel maps, the ports and the DSP address are new.
+  package/tests/audioreach_host.c (sha256 bc95229edebbcde37de7de11c8e4f66f30f8010911570399d1478392dedc1352): the harness of
+    tests/audioreach_host.c (blocks(), CHECK); the checks are piano's.
+  package/AudioProbe.cpp (sha256 78fd6bc2700cfa697ed4fe70ad58130a02f6b1ae3611a3690a05e1d7d3b3427b): design only (the bring-up
+    order, four periods in flight, answers copied on the DSP thread); AudioSequence.c is new code.
+
+xiaomipad-8pro-mainline (main 4b853f8ae9770bc6fa9f9eec3bcc996e9bc86dbf; the topology files BSD-3-Clause), facts only: the graphs
+  of device/audio/Xiaomi-Pad-8-Pro.m4 (sha256 06e6543ff30e63b1a8a9b67d321b9bdf2863fae7ee62face512dcda0066f1563), piano/module_tdm.m4
+  (c2b8d0048bc7d1cf1411804123a89dcaaa26778af42af670b8d639006452c69c), piano/subgraph-device-tdm-playback.m4
+  (78b64aac45fa84e78b104d5792cb796e5fd170ac85e8521ecc26fb8bceeaef78), piano/subgraph-stream-playback.m4
+  (5916069380edd71815829465fa636b1bc8316610e4f6512ec3e5f8a1d4baae2f): subgraph, container and instance ids, the modules and their
+  links, the TDM frame, the logger codes, the WR_SH output port 1.
+linux-msm/audioreach-topology 2af1f1ebb8d4fd03b5f53891467ddde2e208a8a0 (BSD-3-Clause; the vendored copy's source.tar sha256
+  e970b0caf9317360dd8ffc69c3c48e531c10b077e300186913e47e51660f38d3), facts only: audioreach/audioreach.m4's constants (LPAIF types,
+  codec DMA indexes, directions, positions, GC container), subgraph-device-codec-dma-capture.m4 and subgraph-stream-capture.m4 (the
+  capture modules and links).
+
+Specifications only (GPL-2.0; behaviour, ids and layouts as facts, no code, comment or table copied):
+  yzddmr6/linux-sm8750-piano (piano/v1.1.0 d2710cd13b337ef5172bd2394839e9d9673ff88a): sound/soc/qcom/qdsp6/audioreach.{c,h}
+  (PARAM_ID_TDM_INTF_CFG 0x0800101B and its field order, the MFC, logger, hardware endpoint and frame size parameters, the default
+  channel maps), q6apm.c (the memory map command), q6apm-dai.c (the stream index in bits 32 and up of a buffer address), q6prm.{c,h}
+  (the clock request, SEC_TDM_IBIT 0x202), sc8280xp.c (the TDM bit clock and slot channel types FL FR LS RS), drivers/soc/qcom/apr.c
+  (GPR ports: services 1 and 2, dynamic ports from 0x10000000); include/uapi/sound/snd_ar_tokens.h (internal sync source 1).
+  Project-SunUEFI patches/linux/7.3/0005-audio.patch (sha256 191b05b323cca594c3f9e40efc7d6ed696cc7a1a9926f1f336ee9632c27e490c): the
+  same TDM parameter, and its note that its ADSP answered APM/PRM only from ports 3/7 (Ubuntu's piano kernel uses 1/2: an open
+  question, audio.md section 10).
