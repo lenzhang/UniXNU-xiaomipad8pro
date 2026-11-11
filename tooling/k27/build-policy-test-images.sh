@@ -5,7 +5,7 @@
 # policy watches (PianoKeyboard level 2 with piano-keyboard-lid=0, PianoPower's battery as macOS's power source, PianoBacklight level
 # 2 for the display power, PianoThermal's governor), the USB console, the buttons and piano-reset-after as the backstop.
 #
-#   build-policy-test-images.sh [NAME ...]    default: all of observe lock sleep lpm suspend; out/ram-pol-<NAME>/ and out/ram-pol-dump/
+#   build-policy-test-images.sh [NAME ...]    default: all of observe lock sleep lpm suspend gpuslot; out/ram-pol-<NAME>/ and out/ram-pol-dump/
 #                                             (chargesleep only by name: it starts the DSP, PianoPower level 2)
 #
 # Inputs (this repository's out/ unless set): POL_KC (out/k27/kc-k27-native.bin, built by
@@ -28,7 +28,7 @@ done
 # raise a level BASE already gives).
 BASE="piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-usb=2 piano-input=1 piano-power-ps=1"
 BASE="$BASE piano-power-period=10 piano-keyboard=2 piano-backlight=2 piano-cpufreq=3 ${POL_EXTRA:-}"
-ORDER="observe lock sleep lpm suspend"
+ORDER="observe lock sleep lpm suspend gpuslot"
 image() {
   PW="piano-power=1" TH="piano-thermal=1"
   case $1 in
@@ -38,6 +38,10 @@ image() {
              A="$A piano-sleep-wake=19 piano-sleep-max=600";                             R=1800 ;;   # closing on battery sleeps
     lpm)     TH="piano-thermal=2"
              A="piano-policy=2 piano-gpu-dcvs-max=607";                                  R=900 ;;    # the profile and the ceiling
+    # P7, unattended (the Mac's cable: external power): Low Power Mode from boot, so Power Saver on power: PianoThermal's profile 1 and
+    # the GPU ceiling in PianoA830's slot 1 next to PianoThermal's (level 2) slot 0 (docs/policy.md 5.2, 5.3)
+    gpuslot) TH="piano-thermal=2"
+             A="piano-policy=2 piano-gpu-dcvs-max=607 piano-policy-lpm=1";               R=600 ;;
     # every driver of power.md 4 that joins the power tree in a suspend: PianoInput, PianoDwc3 (the Mac kept), PianoKeyboard (the
     # MCU blanked, gpio95 latched), PianoBacklight, PianoThermal, NativeGopDisplay's display power; 3 test sleeps of 30 s, then by hand
     suspend) A="piano-policy=2 piano-policy-lid=1 piano-backlight-lid=1 piano-keyboard-blank=1 piano-sleep=1 piano-sleep-state=1"

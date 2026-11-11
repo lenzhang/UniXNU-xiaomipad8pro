@@ -42,6 +42,7 @@
 //   piano-policy-profile=0  no PianoThermal profile, no GPU ceiling            piano-policy-gpu-mhz=M  Power Saver's GPU ceiling (342)
 //   piano-policy-powerkey=0 the power key stays macOS's                       piano-policy-kbd=0  no display wake by gpio95
 //   piano-policy-kbd-holdoff=MS  the display off at least MS before gpio95 counts (1000)
+//   piano-policy-lpm=1      Low Power Mode on from boot (machdep.piano_policy_lpm starts at 1): an unattended test's switch
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -79,7 +80,7 @@ volatile int32_t piano_policy_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, lid, profile, gpuMhz, powerKey, kbd, holdoffMs, keyboardLid, gpuDcvsMax, gpuMaxLevel, thermal, thermalGpuMhz;
+  uint32_t level, lid, profile, gpuMhz, powerKey, kbd, holdoffMs, lpm, keyboardLid, gpuDcvsMax, gpuMaxLevel, thermal, thermalGpuMhz;
   bool gpuMaxGiven;
 };
 Args gArgs;
@@ -103,6 +104,7 @@ void readArgs()
   gArgs.powerKey = bootArg("piano-policy-powerkey", 1);
   gArgs.kbd = bootArg("piano-policy-kbd", 1);
   gArgs.holdoffMs = clampArg(bootArg("piano-policy-kbd-holdoff", 1000), 0, 10000);
+  gArgs.lpm = bootArg("piano-policy-lpm", 0) == 1 ? 1 : 0;
   // The other drivers' own arguments, read here as they read them (no call needed): PianoKeyboard's clamshell mode, PianoA830's
   // DCVS maximum (342 MHz unless piano-gpu-dcvs-max or piano-gpu-maxlevel is given), PianoThermal's level and passive GPU ceiling.
   gArgs.keyboardLid = bootArg("piano-keyboard-lid", 0);
@@ -312,6 +314,10 @@ bool PianoPolicy::start(IOService *provider)
   if (fConfig.thermalOwnsGpu)
     note("PianoThermal at level 2 writes a GPU ceiling at its passive trip: with PianoA830's slots ours is client 1 (the lowest wins), "
          "without them ours is never written over its passive one");
+  if (gArgs.lpm) {
+    __atomic_store_n(&gLpm, 1u, __ATOMIC_RELEASE);
+    note("piano-policy-lpm=1: Low Power Mode on from boot (machdep.piano_policy_lpm=0 turns it off)");
+  }
   gPolicy = this;
   fillOid(gOidStatus, "piano_policy", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, sysctlStatus, "A",
           "PianoPolicy: inputs, decisions and counters");
