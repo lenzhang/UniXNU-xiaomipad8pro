@@ -21,6 +21,7 @@ O=$D/out/native-kexts/PianoA830
 K27=${K27_TREE:-$HOME/Downloads/XiaomiPad8Pro-Ubuntu/droidvm-build/macOS-DroidVM}
 mkdir -p "$O" "$D/out/k27/kext"
 python3 "$D/tooling/k27/gen-piano-gpu-inputs.py" --check
+"$D/package/include/tests/run.sh" >&2   # PianoScmLock.h: the secure-call lock the board takes (docs/scm-lock.md)
 python3 "$D/tooling/k27/stage-piano-gpu-firmware.py" ${PIANO_GPU_NO_FIRMWARE:+--no-firmware}
 # PIANO_A830_HOST_TESTS: 1 always, 0 never, auto (default) when the driver sources, the kits or the test runner changed since the last
 # pass (out/native-kexts/PianoA830/host-tests/stamp): the image build links PianoA830 every time.

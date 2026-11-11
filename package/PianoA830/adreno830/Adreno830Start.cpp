@@ -68,6 +68,9 @@ extern "C" __attribute__((weak)) void native_adreno_note_hang_snapshot(const A83
 extern "C" __attribute__((weak)) void adreno830_board_idle(A830IdleConfig *) {}
 extern "C" __attribute__((weak)) void adreno830_board_idle_event(const A830IdleEvent *) {}
 static A830IdleConfig gIdle;   /* piano-gpu-idle and its knobs (the board's), filled by bindPower */
+/* The kernel-wide secure-call lock (UniXNU-piano package/include/PianoScmLock.h): the board takes (1) and gives (0) one hold; a
+ * no-op without the board (the host tests). Held around every yielding SCM request and once around the ZAP's PAS sequence. */
+extern "C" __attribute__((weak)) void adreno830_board_scm_hold(int) {}
 #endif
 
 /* An A830Irq window the bring-up trace forwards to (A830Trace.h): the window as bound, and its id for the lines. */
@@ -796,8 +799,14 @@ uint32_t tsensRead(void *,uint32_t offset) {return mapped(A830WinTsensTm) && off
 /* SCM (Sm8750ScmOps) from the kernel services. */
 uint64_t scmNow(void *) {return nowUs();}
 void scmSleep(void *,uint32_t us) {os().sleep_us(us);}
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano: after the driver's own SCM mutex, the kernel-wide secure-call lock (other kexts call the secure world too). */
+void scmLock(void *) {os().mutex_lock(g830.scm_mutex);adreno830_board_scm_hold(1);}
+void scmUnlock(void *) {adreno830_board_scm_hold(0);os().mutex_unlock(g830.scm_mutex);}
+#else
 void scmLock(void *) {os().mutex_lock(g830.scm_mutex);}
 void scmUnlock(void *) {os().mutex_unlock(g830.scm_mutex);}
+#endif
 void scmWait(void *,const void *event,uint32_t timeout_us) {os().wait(event,timeout_us);}
 void scmWake(void *,const void *event) {os().wake(event);}
 /* GPU registers by dword (NativeAdrenoRingIo, A830CpIo, NativeAdrenoTimeIo). */
@@ -1770,7 +1779,13 @@ IOReturn stageZap(Adreno830Device *d,Adreno830Failure *f)
     if(r!=kIOReturnSuccess)return refuse(f,A830S7StepZapInit,A830ReasonArgument,0,r,0,r);
     /* 4.11 steps 1-7: MDT checks, metadata, PAS_INIT_IMAGE, MEM_SETUP, segment copy, AUTH_AND_RESET; once per boot. */
     adreno830_status_step(A830ZapStepParse);
+#ifdef ADRENO830_MACOS
+    adreno830_board_scm_hold(1);   /* UniXNU-piano: PAS 13's init_image .. auth_and_reset, one secure-call critical section */
+#endif
     r=d->zap.load(b->zap_fw.bytes,size_t(b->zap_fw.length),b->zap.phys,b->zap.bytes);
+#ifdef ADRENO830_MACOS
+    adreno830_board_scm_hold(0);
+#endif
     d->zap.noteStatus();
     if(r!=kIOReturnSuccess) {
         A830ZapFailure zf={};

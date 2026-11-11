@@ -38,6 +38,8 @@
 #include "NativeAdrenoPublish.h"
 #include <IOKit/IODeviceMemory.h>
 #include <kern/clock.h>
+#define PIANO_SCM_LOCK_KERNEL 1
+#include <PianoScmLock.h>
 
 extern "C" const Adreno830Board *piano_a830_board(void);
 
@@ -285,6 +287,21 @@ extern "C" uint32_t adreno830_board_hang_ms(void)
   const uint32_t ms = bootArg("piano-gpu-hang-ms", 0);
   if (!ms) return 0;
   return ms < 1000 ? 1000 : ms > 60000 ? 60000 : ms;
+}
+
+// The kernel-wide secure-call lock (package/include/PianoScmLock.h, docs/scm-lock.md). PianoA830 owns the word, as it owns the DRV-2
+// word: it links before every other user, which import this single copy (their descriptors name com.unixnu.driver.PianoA830 as a
+// library). Its own calls take it through adreno830_board_scm_hold: around every yielding request of the driver's Sm8750Scm (its
+// ops->lock/unlock, after/before its SCM mutex) and once around the ZAP's PAS 13 sequence (init_image .. auth_and_reset).
+extern "C" volatile uint32_t sm8750_scm_owner;
+volatile uint32_t sm8750_scm_owner = 0;
+namespace {
+PIANO_SCM_KERNEL_LOCK(gScmLock, PianoScmTagA830, "PianoA830");
+}  // namespace
+extern "C" void adreno830_board_scm_hold(int take)
+{
+  if (take) piano_scm_kernel_take(&gScmLock);
+  else piano_scm_kernel_give(&gScmLock);
 }
 
 namespace {
