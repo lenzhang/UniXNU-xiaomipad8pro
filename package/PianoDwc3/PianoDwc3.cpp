@@ -17,6 +17,12 @@
 // controller over; 3 also switches on GDSC/branch clocks it finds off. Every step is logged as "PianoDwc3: ...".
 // The USB thread's wait between passes follows the link (UsbIdle.h, docs/power-irq.md): 1 ms only while something moves, up to
 // 250 ms with no host; piano-usb-irq=1 lets the core's interrupt (SPI 133) end a wait; piano-usb-idle=0 is the old 1 ms loop.
+// System sleep (docs/power.md 4, UsbSleep.h): at piano-usb=2 the service is in the power tree. With a host that has configured the
+// device and piano-sleep-usb=1 (the default) the gadget stays as it is across a suspend (the console survives; the core's interrupt
+// masked, polled until the freeze); otherwise off is a soft disconnect and on, once the glue's clocks read on, connects again (the
+// Mac enumerates afresh). Every QSCRATCH write (the VBUS/session override, the UTMI clock select, a monitor poke into it) goes to the
+// glue only while awake with its clocks on, else it is recorded and written after the wake (Ubuntu's K:7dffd78b342d: such a write
+// with the glue unclocked never completes and resets the SoC).
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -53,7 +59,9 @@
 #include "UsbNet.h"           // the network function's macOS side (PianoUsbNet.cpp)
 #include "PianoBacklightClient.h"   // package/PianoBacklight: brightness keys to the backlight (piano-backlight-keys=1)
 #include "UsbIdle.h"          // the USB thread's wait tiers
+#include "UsbSleep.h"         // a system sleep's steps and the QSCRATCH guard
 #include "../common/PianoIrq.h"
+#include <PianoPowerContract.h>
 
 using namespace pianousb;
 
@@ -86,6 +94,7 @@ struct Args {
   uint32_t netFifo;   // piano-usb-net-fifo: 1 (default) the TX FIFO plan for the endpoints in use, 0 keep the sizes the reset left
   uint32_t irq;       // piano-usb-irq=1: the core's interrupt (SPI 133) wakes the USB thread (default 0: polled, adaptive)
   uint32_t idle;      // piano-usb-idle: 1 (default) the adaptive wait (UsbIdle.h), 0 the old loop (1 ms after every quiet pass)
+  uint32_t sleepUsb;  // piano-sleep-usb: 1 (default) a configured host keeps the gadget across a system sleep, 0 a soft disconnect
 };
 Args gArgs;
 
@@ -116,6 +125,7 @@ void readArgs()
   gArgs.netFifo = bootArg("piano-usb-net-fifo", 1);
   gArgs.irq = bootArg("piano-usb-irq", 0);
   gArgs.idle = bootArg("piano-usb-idle", 1);
+  gArgs.sleepUsb = bootArg("piano-sleep-usb", 1);
   if (!gArgs.idle) gArgs.irq = 0;   // the old loop is the old loop
 }
 
@@ -190,6 +200,14 @@ pianoirq::MissGuard gIrqMiss = pianoirq::missGuard(3);
 volatile uint32_t gIrqTaken;   // entries that masked events: the thread tells an interrupt from a kick by it
 bool gIrqMode;
 UsbTier gTier = UsbTier::busy;
+
+// System sleep (UsbSleep.h): setPowerState asks, the USB thread carries it out (the gadget is the thread's); gSleepLock guards the
+// state machine and the request. QSCRATCH writes ask it too (qsWrite).
+IOLock *gSleepLock;
+UsbSleep gSleep;
+enum : uint32_t { kAskNone = 0, kAskOff = 1, kAskOn = 2 };
+uint32_t gSleepAsk = kAskNone, gSleepSeq, gSleepDone;
+bool qsWrite(uint32_t offset, uint32_t value);
 
 struct Ring {
   uint8_t *buf;
@@ -577,6 +595,12 @@ void execute(const char *line)
   } else if (word(s, "poke")) {
     if (!gArgs.poke) { cprintf("poke: boot with piano-usb-poke=1\n"); return; }
     if (!parseNumber(s, &a) || !parseNumber(s, &b) || (a & 3)) { cprintf("poke PA VALUE (PA 4-byte aligned)\n"); return; }
+    if (a >= pianohw::kQscratch && a < pianohw::kQscratch + 0x100 && gQs.va) {   // the glue: through the sleep guard
+      const bool now = qsWrite(uint32_t(a - pianohw::kQscratch), uint32_t(b));
+      cprintf("%010llx <- %08x %s, reads %08x\n", a, uint32_t(b), now ? "written" : "recorded for the wake (asleep or unclocked)",
+              rd32(gQs.va + uintptr_t(a - pianohw::kQscratch)));
+      return;
+    }
     Region r = {};
     if (!mapRegion(r, a, 4)) { cprintf("poke: cannot map %#llx\n", a); return; }
     wr32(r.va, uint32_t(b));
@@ -884,6 +908,31 @@ bool clocksOn(uint32_t gdsc, uint32_t master, uint32_t cfgNoc, uint32_t aggre)
   return (gdsc & kGdscPwrOn) && !(master & kCbcrClkOff) && !(cfgNoc & kCbcrClkOff) && !(aggre & kCbcrClkOff);
 }
 
+// The glue's clocks as GCC reads them now (GCC is always readable): the GDSC on and the master and AXI branches running.
+bool glueClocked()
+{
+  using namespace pianohw;
+  return clocksOn(gcc(kGccUsb30Gdsc), gcc(kGccUsb30Master), gcc(kGccCfgNocUsb3Axi), gcc(kGccAggreUsb3Axi));
+}
+
+// Every QSCRATCH write: to the glue only while awake with its clocks on (UsbSleep.h), else recorded (the last value per register)
+// and written after the wake. True when written now.
+bool qsWrite(uint32_t offset, uint32_t value)
+{
+  const bool clocked = glueClocked();
+  IOLockLock(gSleepLock);
+  const bool now = gSleep.qscratchWrite(offset, value, clocked);
+  IOLockUnlock(gSleepLock);
+  if (now) {
+    wr32(gQs.va + offset, value);
+    dsb();
+  } else {
+    note("QSCRATCH %#x = %08x not written now (%s, glue %s): recorded for the wake", offset, value, sleepStateName(gSleep.state()),
+         clocked ? "clocked" : "NOT clocked");
+  }
+  return now;
+}
+
 bool probeClocks()
 {
   using namespace pianohw;
@@ -1053,14 +1102,11 @@ void selectUtmi()
 {
   using namespace pianohw;
   const uintptr_t cfg = gQs.va + kQsGeneralCfg;
-  wr32(cfg, rd32(cfg) | kQsPipeUtmiClkDis);
-  dsb();
+  qsWrite(kQsGeneralCfg, rd32(cfg) | kQsPipeUtmiClkDis);
   IODelay(100);
-  wr32(cfg, rd32(cfg) | kQsPipeUtmiClkSel | kQsPipe3PhystatusSw);
-  dsb();
+  qsWrite(kQsGeneralCfg, rd32(cfg) | kQsPipeUtmiClkSel | kQsPipe3PhystatusSw);
   IODelay(100);
-  wr32(cfg, rd32(cfg) & ~kQsPipeUtmiClkDis);
-  dsb();
+  qsWrite(kQsGeneralCfg, rd32(cfg) & ~kQsPipeUtmiClkDis);
   note("QSCRATCH general %08x: UTMI clock as PIPE clock", rd32(cfg));
 }
 
@@ -1070,9 +1116,8 @@ bool sessionValid()
   using namespace pianohw;
   const uintptr_t hs = gQs.va + kQsHsPhyCtrl, ss = gQs.va + kQsSsPhyCtrl;
   const uint32_t hsWant = rd32(hs) | kQsUtmiOtgVbusValid | kQsSwSessvldSel, ssWant = rd32(ss) | kQsLane0PwrPresent;
-  wr32(ss, ssWant);
-  wr32(hs, hsWant);
-  dsb();
+  qsWrite(kQsSsPhyCtrl, ssWant);
+  qsWrite(kQsHsPhyCtrl, hsWant);
   note("QSCRATCH session: hs_phy %08x ss_phy %08x", rd32(hs), rd32(ss));
   return rd32(hs) == hsWant && rd32(ss) == ssWant;
 }
@@ -1207,6 +1252,8 @@ void usbStatus()
           gTx[1].dropped);
   cprintf("log: %s capacity %u avail %u; /dev/pianousb %s\n", !gLog.ok ? "none" : gLog.msgbuf ? "msgbuf" : "pstore", gLog.cap, gLog.avail,
           gDevNode ? "present" : "absent");
+  cprintf("sleep: %s (piano-sleep-usb=%u); %u sleeps, %u wakes; QSCRATCH writes recorded %u (lost %u)\n", sleepStateName(gSleep.state()),
+          gArgs.sleepUsb, gSleep.sleeps(), gSleep.wakes(), gSleep.deferred(), gSleep.lost());
   cprintf("wait: %s, tier %s; SPI 133: %s, %llu handled, %llu strays, %u missed\n",
           !gArgs.idle ? "1 ms loop (piano-usb-idle=0)" : gIrqMode ? "interrupt" : "polled, adaptive", tierName(gTier),
           gIrqLine.up ? (gIrqLine.tripped ? "disabled (storm)" : "attached") : "not attached", (unsigned long long)gIrqLine.count(),
@@ -1272,12 +1319,91 @@ void irqOff(const char *why)
             (unsigned long long)gIrqLine.strays, gIrqMiss.total);
 }
 
+// The USB thread's side of a system sleep, at the top of each pass: carries out an off or an on asked by setPowerState (UsbSleep.h)
+// and writes what QSCRATCH writes were recorded once awake and clocked. Returns whether the pass may touch the core.
+bool sleepStep()
+{
+  using namespace dwc3;
+  IOLockLock(gSleepLock);
+  const uint32_t ask = gSleepAsk, seq = gSleepSeq;
+  gSleepAsk = kAskNone;
+  if (ask == kAskOff) {
+    const SleepOff o = gSleep.off(true, gGadget.configured(), gIrqMode);
+    const uint32_t n = gSleep.sleeps();
+    IOLockUnlock(gSleepLock);
+    if (o.maskIrq) {
+      gHal.wr(GEVNTSIZ, GEVNTSIZ_INTMASK | Layout::kEventBytes);
+      gHal.barrier();
+    }
+    if (o.halt) {
+      const bool halted = gGadget.sleepDisconnect();
+      gHal.note("sleep %u: soft disconnect (%s): RUN_STOP off (%s), the endpoints and the address forgotten; the core is left alone "
+                "until the wake", n, gArgs.sleepUsb ? "no host has the device configured" : "piano-sleep-usb=0",
+                halted ? "halted" : "NOT halted within 100 ms");
+    } else if (o.keepPolling) {
+      gHal.note("sleep %u: the Mac has the device configured: kept (the console survives the suspend; piano-sleep-usb=0 disconnects "
+                "instead)%s", n, o.maskIrq ? "; the core's interrupt masked, polled until the freeze" : "");
+    }
+    IOLockLock(gSleepLock);
+    gSleepDone = seq;
+    IOLockWakeup(gSleepLock, &gSleepDone, false);
+  } else if (ask == kAskOn) {
+    const bool clocked = glueClocked();
+    const SleepOn o = gSleep.on(clocked);
+    const uint32_t n = gSleep.wakes();
+    IOLockUnlock(gSleepLock);
+    if (!o.touch) {
+      using namespace pianohw;
+      gHal.note("wake %u: the glue is NOT clocked (GDSC %08x, master %08x, cfg_noc %08x, aggre %08x): the core and QSCRATCH are left "
+                "alone for the rest of the boot", n, gcc(kGccUsb30Gdsc), gcc(kGccUsb30Master), gcc(kGccCfgNocUsb3Axi),
+                gcc(kGccAggreUsb3Axi));
+    } else if (o.reconnect) {
+      const bool ok = gGadget.sleepConnect();
+      gHal.note("wake %u: the glue clocked: %s", n, ok ? "connected again (RUN_STOP on): the Mac enumerates afresh"
+                                                       : "the core did not restart (DSTS below); left as it is");
+      if (!ok) gHal.note("DSTS %08x DCTL %08x", gHal.rd(DSTS), gHal.rd(DCTL));
+    } else {
+      gHal.note("wake %u: the glue clocked; %s", n, gGadget.configured() ? "kept: the console goes on" : "polling again");
+    }
+    IOLockLock(gSleepLock);
+  }
+  // QSCRATCH writes recorded while asleep or unclocked (a takeover cut by a sleep): written once awake with the glue clocked.
+  uint32_t offset[UsbSleep::kRecorded], value[UsbSleep::kRecorded];
+  unsigned replay = 0;
+  if (gSleep.state() == SleepState::awake && gSleep.recorded() && glueClocked()) {
+    replay = gSleep.recorded();
+    for (unsigned i = 0; i < replay; ++i) {
+      offset[i] = gSleep.recordedOffset(i);
+      value[i] = gSleep.recordedValue(i);
+    }
+    gSleep.replayed();
+  }
+  const bool usable = gSleep.coreUsable();
+  IOLockUnlock(gSleepLock);
+  for (unsigned i = 0; i < replay; ++i) {
+    wr32(gQs.va + offset[i], value[i]);
+    dsb();
+    gHal.note("QSCRATCH %#x = %08x written (recorded while asleep or unclocked), reads %08x", offset[i], value[i], rd32(gQs.va + offset[i]));
+  }
+  return usable;
+}
+
+// Before the takeover: a system sleep that came first (piano-usb-delay) is waited out.
+void waitAwake()
+{
+  IOLockLock(gSleepLock);
+  if (!gSleep.takeoverMayRun()) note("takeover: waiting for the wake (a system sleep came first)");
+  while (!gSleep.takeoverMayRun()) IOLockSleep(gSleepLock, &gSleep, THREAD_UNINT);
+  IOLockUnlock(gSleepLock);
+}
+
 void usbThread(void *, wait_result_t)
 {
   if (gArgs.delay) {
     note("waiting %u s (piano-usb-delay)", gArgs.delay);
     IOSleep(gArgs.delay * 1000);
   }
+  waitAwake();
   if (!takeover()) {
     note("takeover failed; the controller is left as it is. Rebuild the RAM image without piano-usb to drop this driver.");
     return;
@@ -1296,6 +1422,11 @@ void usbThread(void *, wait_result_t)
   bool kicked = false;
   for (;;) {
     const uint32_t seen = gWake.now();   // before the pass: a kick during it ends the wait at once
+    if (!sleepStep()) {   // a system sleep without a host kept, or the glue unclocked at the wake: the core is not touched
+      gWake.wait(seen, 1000);
+      continue;
+    }
+    const bool kept = gSleep.state() == SleepState::kept;   // until the freeze: polled, the interrupt left masked
     const unsigned events = gGadget.poll();
     const bool moved = logPump();
     gGadget.pump();
@@ -1333,8 +1464,8 @@ void usbThread(void *, wait_result_t)
     a.sinceEventMs = now - lastEvent;
     gTier = usbTier(a);
     ++passes[unsigned(gTier)];
-    const uint32_t period = periodMs(gTier, gIrqMode ? kIrqPeriods : kPolledPeriods);
-    if (gIrqMode) {   // unmask: events already pending raise the line at once
+    const uint32_t period = periodMs(gTier, gIrqMode && !kept ? kIrqPeriods : kPolledPeriods);
+    if (gIrqMode && !kept) {   // unmask: events already pending raise the line at once
       gHal.wr(dwc3::GEVNTSIZ, Layout::kEventBytes);
       gHal.barrier();
     }
@@ -1588,6 +1719,7 @@ class PianoDwc3 : public IOService {
 public:
   IOService *probe(IOService *provider, SInt32 *score) override;
   bool start(IOService *provider) override;
+  IOReturn setPowerState(unsigned long state, IOService *device) override;
 };
 
 OSDefineMetaClassAndStructors(PianoDwc3, IOService)
@@ -1609,7 +1741,9 @@ bool PianoDwc3::start(IOService *provider)
   if (gArgs.net && gArgs.level < 2) note("piano-usb-net needs piano-usb=2: no network function");
   setProperty("piano-usb", gArgs.level, 32);
   gLock = IOLockAlloc();
-  if (!gLock) return false;
+  gSleepLock = IOLockAlloc();   // the sleep guard: QSCRATCH writes (the takeover, a monitor poke) and setPowerState
+  gSleep = UsbSleep(gArgs.sleepUsb != 0);
+  if (!gLock || !gSleepLock) return false;
   stage(1, "probe: GCC and TCSR (read only)");
   if (!probeClocks()) { stage(-1, "probe: GCC map"); return true; }
   if (gCoreClocked) {
@@ -1680,5 +1814,54 @@ bool PianoDwc3::start(IOService *provider)
   }
   if (kernel_thread_start(usbThread, nullptr, &thread) != KERN_SUCCESS) { stage(-8, "USB thread"); return true; }
   thread_deallocate(thread);
+  note("system sleep: in the power tree (%#x): %s", pianopower::join(this),
+       gArgs.sleepUsb ? "a host that has the device configured keeps it across a suspend (the console survives), else a soft "
+                        "disconnect; QSCRATCH written only awake with the glue clocked"
+                      : "a soft disconnect at every suspend (piano-sleep-usb=0); QSCRATCH written only awake with the glue clocked");
   return true;
+}
+
+// docs/power.md 4. off: the USB thread keeps the gadget (a configured host, piano-sleep-usb=1) or disconnects it, and this waits
+// for it (at most 500 ms); before the takeover nothing is to do (it waits for the wake). on: asynchronous, the thread reads the
+// glue's clocks first and touches nothing when they are off.
+IOReturn PianoDwc3::setPowerState(unsigned long state, IOService *)
+{
+  if (!gSleepLock) return pianopower::kAckNow;
+  IOLockLock(gSleepLock);
+  if (state == pianopower::kOff) {
+    if (!gRunning) {
+      gSleep.off(false, false, false);
+      IOLockUnlock(gSleepLock);
+      note("sleep: before the takeover: it runs after the wake");
+      return pianopower::kAckNow;
+    }
+    gSleepAsk = kAskOff;
+    const uint32_t seq = ++gSleepSeq;
+    IOLockUnlock(gSleepLock);
+    usbKick();
+    IOLockLock(gSleepLock);
+    uint64_t deadline = 0;
+    clock_interval_to_deadline(500, kMillisecondScale, &deadline);
+    while (gSleepDone != seq && IOLockSleepDeadline(gSleepLock, &gSleepDone, deadline, THREAD_UNINT) != THREAD_TIMED_OUT) {
+    }
+    const bool done = gSleepDone == seq;
+    IOLockUnlock(gSleepLock);
+    if (!done) note("sleep: the USB thread did not answer within 500 ms (it acts at its next pass)");
+    return pianopower::kAckNow;
+  }
+  if (gSleep.state() == SleepState::awake) {   // the power tree's first on
+    IOLockUnlock(gSleepLock);
+    return pianopower::kAckNow;
+  }
+  if (!gRunning) {   // asleep before the takeover: it may run now
+    gSleep.on(true);
+    IOLockWakeup(gSleepLock, &gSleep, false);
+    IOLockUnlock(gSleepLock);
+    return pianopower::kAckNow;
+  }
+  gSleepAsk = kAskOn;
+  ++gSleepSeq;
+  IOLockUnlock(gSleepLock);
+  usbKick();
+  return pianopower::kAckNow;
 }

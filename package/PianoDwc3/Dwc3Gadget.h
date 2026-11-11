@@ -292,6 +292,24 @@ public:
     if (!ok || !run(50)) h->note("reconnect: the core did not restart (DSTS %08x)", h->rd(dwc3::DSTS));
   }
 
+  // A system sleep without a host kept (UsbSleep.h): RUN_STOP off (the host sees a detach), the endpoints and the address
+  // forgotten, the counters kept. sleepConnect() after the wake: what the halt produced drained, the device side set up again,
+  // RUN_STOP on (the host enumerates afresh). Together what reconnect() does, without its 300 ms wait (the sleep is the gap).
+  bool sleepDisconnect()
+  {
+    const bool halted = halt(100);
+    busReset(false);
+    return halted;
+  }
+  bool sleepConnect()
+  {
+    const GadgetStats kept = stats;
+    poll();
+    const bool ok = initDevice();
+    stats = kept;
+    return ok && run(50);
+  }
+
   void snapshot(const char *why)
   {
     using namespace dwc3;

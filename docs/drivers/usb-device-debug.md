@@ -15,6 +15,10 @@
 > moves, 20 ms with a port open, 50 ms configured, 250 ms with no host); `piano-usb-irq=1` adds the core's interrupt (SPI 133).
 > Default on for the adaptive wait, the interrupt opt-in; `piano-usb-idle=0` is the old loop. Not run yet. §15 and
 > [`../power-irq.md`](../power-irq.md).
+>
+> **2026-11-11, system sleep** (host-tested, linked, not run): in the power tree at `piano-usb=2`; a configured Mac keeps the
+> console across a suspend (`piano-sleep-usb=1`, default), else a soft disconnect; no QSCRATCH write while asleep or with the glue
+> unclocked (Ubuntu's SoC reset, K:7dffd78b342d). §16.
 
 
 Status: design and code, 2026-11-11. Built, host-tested and linked into a test KC (`out/k27/kc-k27-usb-test.bin`); **not
@@ -160,6 +164,7 @@ IOPlatformExpertDevice ── PianoDwc3 (start, matching thread)   read-only pro
 | `piano-usb-idle=0` | 1 | the old USB loop (1 ms after every quiet pass) instead of the adaptive wait of §15 |
 | `piano-usb-irq=1` | 0 | the core's interrupt (SPI 133) ends the USB thread's waits (§15); falls back to polling by itself |
 | `piano-wake-log=S` | 60 | the `idle: N wakeups in S s` line every S seconds (0 none; shared with PianoInput and PianoTouch) |
+| `piano-sleep-usb=0` | 1 | a system sleep disconnects the gadget even with the Mac attached (§16); 1: a configured host keeps it (the console survives) |
 
 On the Mac (no root, standard library only; logs go to `logs/usb-console/`, gitignored):
 
@@ -567,3 +572,33 @@ link state L, configuration C; SPI 133 count X)`; the monitor's `usb` adds `wait
 handled, S strays, M missed`. Expected at rest: no cable ~240/min (polled) or ~60/min (interrupt); Mac attached with the console
 open ~3000/min (open tier, the log pump). A cable plugged in after more than 3 s without a host may lose the first SETUP in poll
 mode (the Mac re-enumerates within seconds). Test plan and images: [`../power-irq.md`](../power-irq.md) §5.
+
+## 16. System sleep (`piano-sleep-usb`, 2026-11-11)
+
+[`../power.md`](../power.md) §4's contract for PianoDwc3, built as `UsbSleep.h` (host-tested by `tests/usb_sleep_host.cpp`; the
+gadget's half, `sleepDisconnect` / `sleepConnect`, by `tests/usb_gadget_host.cpp`'s sleep cycle). At `piano-usb=2` the service
+joins the power tree (`pianopower::join`); the gadget stays the USB thread's, so `setPowerState` only asks and the thread acts at
+the top of its next pass (off: `setPowerState` waits for it, at most 500 ms; on: asynchronous).
+
+| Case | off | on |
+|---|---|---|
+| a host has the device configured, `piano-sleep-usb=1` (default) | **kept**: nothing changes on the bus, the console survives (the Mac sees a device that does not answer while frozen, then the backlog); the core's interrupt (with `piano-usb-irq=1`) masked at its source and the thread polls until the freeze, so no USB event ends the suspend | the glue's clocks read; on: the passes as before (the interrupt unmasked by the next wait) |
+| no host configured, or `piano-sleep-usb=0` | **soft disconnect**: RUN_STOP off (the Mac sees a detach; a cable plugged in while suspended is not half-enumerated), the endpoints and the address forgotten, the interrupt masked; the thread does not touch the core | the glue's clocks read; on: the event buffer drained, the device side set up again, RUN_STOP on: the Mac enumerates afresh |
+| before the takeover (`piano-usb-delay`) | nothing; the takeover waits for the wake | the takeover runs |
+| the glue not clocked at the wake | – | nothing is touched again this boot (core, QSCRATCH): logged with the four GCC words |
+
+**QSCRATCH** (the glue's VBUS/session override, the UTMI-as-PIPE clock select, a monitor `poke` into 0x0a6f8800..+0x100): every
+write goes through one guard and reaches the glue only while awake with the glue's clocks on (GCC: the USB30 GDSC on, the master
+and both AXI branches running); otherwise it is recorded (the last value per register, four registers) and written by the thread
+once awake and clocked (Ubuntu K:7dffd78b342d: the VBUS-override write that a UCSI role switch ran while the glue was suspended
+never completed and reset the SoC; its fix records and applies later, the same rule). PianoDwc3 itself never gates these clocks;
+the guard is for whoever does (the firmware, a later runtime-PM step). The monitor's `usb` adds `sleep: <state> (piano-sleep-usb=N);
+N sleeps, N wakes; QSCRATCH writes recorded N (lost N)`.
+
+Lines: `system sleep: in the power tree (0): a host that has the device configured keeps it across a suspend ...` at start; per
+suspend `sleep N: the Mac has the device configured: kept (the console survives the suspend; ...)` or `sleep N: soft disconnect (no
+host has the device configured): RUN_STOP off (halted), the endpoints and the address forgotten; ...`, after the wake `wake N: the
+glue clocked; kept: the console goes on` or `wake N: the glue clocked: connected again (RUN_STOP on): the Mac enumerates afresh`.
+Failure lines: `sleep: the USB thread did not answer within 500 ms`, `wake N: the glue is NOT clocked (GDSC ..., master ..., ...)`,
+`QSCRATCH 0x10 = ... not written now (...): recorded for the wake`. The cable to a host keeps the HS PHY out of its low-power state
+(power.md §4): a suspend measurement is made without it (`piano-sleep-usb` then decides nothing: no host is configured).

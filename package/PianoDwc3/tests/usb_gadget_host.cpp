@@ -862,9 +862,52 @@ static void scenario(unsigned P, bool net, bool quiet)
   std::printf("\n");
 }
 
+// A system sleep without a host kept (UsbSleep.h quiesce): sleepDisconnect halts the core (RUN_STOP off), ends every transfer and
+// forgets the configuration; sleepConnect after the wake runs again with SETUP armed and the counters kept; the host's new
+// enumeration configures the device as at the first attach.
+static void sleepCycle(bool quiet)
+{
+  FakeHal h;
+  h.quiet = quiet;
+  G g{};
+  g.bind(&h, 2, kProduct, 0, false);
+  h.regs[DSTS] = DSTS_DEVCTRLHLT;
+  CHECK(g.init() && g.run(10));
+  auto attach = [&](uint16_t address) {
+    h.devEvent(DEVT_RESET);
+    h.regs[DSTS] = (h.regs[DSTS] & ~7u) | SPEED_HS;
+    h.devEvent(DEVT_CONNECT_DONE);
+    step(g);
+    controlNoData(h, g, setupBytes(0x00, 5, address, 0, 0));
+    controlNoData(h, g, setupBytes(0x00, 9, 1, 0, 0));
+  };
+  attach(5);
+  CHECK(g.configured() && g.stats.address == 5);
+  const unsigned resets = g.stats.resets, setups = g.stats.setups;
+  bool busy = false;
+  for (unsigned phys = 2; phys < kPhys; ++phys) busy = busy || h.eps[phys].active;
+  CHECK(busy);   // the ports' bulk transfers queued while configured
+  CHECK(g.sleepDisconnect());
+  CHECK(!(h.regs[DCTL] & DCTL_RUN_STOP) && (h.regs[DSTS] & DSTS_DEVCTRLHLT));
+  CHECK(!g.configured() && g.stats.address == 0 && ((h.regs[DCFG] >> 3) & 0x7f) == 0);
+  for (unsigned phys = 0; phys < kPhys; ++phys) CHECK(!h.eps[phys].active);
+  g.pump();   // nothing queued while disconnected
+  for (unsigned phys = 0; phys < kPhys; ++phys) CHECK(!h.eps[phys].active);
+  const unsigned startcfg = h.count(CMD_DEPSTARTCFG, 0);
+  CHECK(g.sleepConnect());
+  CHECK((h.regs[DCTL] & DCTL_RUN_STOP) && !(h.regs[DSTS] & DSTS_DEVCTRLHLT));
+  CHECK(h.count(CMD_DEPSTARTCFG, 0) == startcfg + 1 && h.eps[0].active && h.trbType(0) == TRBCTL_CONTROL_SETUP);
+  CHECK(g.stats.resets == resets && g.stats.setups == setups);   // the counters kept across the sleep
+  attach(6);
+  CHECK(g.configured() && g.stats.address == 6 && g.stats.resets == resets + 1);
+  CHECK(g.stats.cmdErrors == 0 && g.stats.cmdTimeouts == 0 && g.stats.startErrors == 0);
+  std::printf("sleep cycle: disconnected, connected again, enumerated afresh\n");
+}
+
 int main(int argc, char **argv)
 {
   (void)argv;
+  sleepCycle(argc < 2);
   goldenDescriptors();
   scenario(2, false, argc < 2);
   scenario(3, false, argc < 2);
