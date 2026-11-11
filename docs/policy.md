@@ -239,7 +239,7 @@ set once, unless the owner set that source's timers first. The sleep timer stays
 ```
 PianoPolicy: start: piano-policy=2 (acting), cover acted on, profile on, GPU ceiling 342 MHz (a no-op: PianoA830's own maximum is 342 MHz), power key on, keyboard wake on (hold-off 1000 ms)
 PianoPolicy: system sleep: on, wake mask 0x13 (power key, cover open, keyboard); machdep.piano_sleep: on; state 1, poll 100 ms, wake mask 0x13, ...
-PianoPolicy: system sleep: on, wake mask 0x3 (power key, cover open) from the boot arguments piano-sleep and piano-sleep-wake, as k27 0062 reads them: machdep.piano_sleep exists but refused the in-kernel read (error 1, EPERM: its OID lacks CTLFLAG_KERN, a 0062-0064 kernel built before 2026-11-12)   (an older kernel)
+PianoPolicy: system sleep: on, wake mask 0x3 (power key, cover open) from the boot arguments (machdep.piano_sleep: error 1, EPERM: its OID lacks CTLFLAG_KERN, k27 0062-0064 before 2026-11-12)   (an older kernel)
 PianoPolicy: system sleep: machdep.piano_sleep absent (error 2, ENOENT: a kernel before k27 0062): no sleep, the cover only locks   (0059/0060 kernels)
 PianoPolicy: watching PianoKeyboard (the cover)            PianoPolicy: watching AppleSmartBattery (the power source)
 PianoPolicy: watching NativeGopDisplay (the display power: a message per change, no tick)

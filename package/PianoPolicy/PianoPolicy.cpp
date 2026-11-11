@@ -340,9 +340,9 @@ bool PianoPolicy::start(IOService *provider)
       note("system sleep: %s, wake mask %#x (%s%s%s); machdep.piano_sleep: %.120s", state, fWakeMask, wakeKey, wakeLid, wakeKbd, sleep);
       break;
     case SleepSource::bootArgs:
-      note("system sleep: %s, wake mask %#x (%s%s%s) from the boot arguments piano-sleep and piano-sleep-wake, as k27 0062 reads them: "
-           "machdep.piano_sleep exists but refused the in-kernel read (error %d, EPERM: its OID lacks CTLFLAG_KERN, a 0062-0064 kernel "
-           "built before 2026-11-12)", state, fWakeMask, wakeKey, wakeLid, wakeKbd, err);
+      // (one console line: at most 255 characters)
+      note("system sleep: %s, wake mask %#x (%s%s%s) from the boot arguments (machdep.piano_sleep: error %d, EPERM: its OID lacks "
+           "CTLFLAG_KERN, k27 0062-0064 before 2026-11-12)", state, fWakeMask, wakeKey, wakeLid, wakeKbd, err);
       break;
     case SleepSource::absent:
       note("system sleep: machdep.piano_sleep absent (error %d, ENOENT: a kernel before k27 0062): no sleep, the cover only locks", err);
