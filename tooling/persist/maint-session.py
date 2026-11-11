@@ -594,6 +594,16 @@ def map_step(s):
               f'{", the store is self-contained" if old.get("self_contained") else ""}): --store auto will '
               f'{"move it" if same else "let it start fresh"}')
         s.save(store_matches_esp=same)
+    current = s.state.get('store_new') or {}
+    if s.esp and s.state.get('gpt_state') == 'new' and current.get('state') == 'valid':
+        # Installed: the store lives at the new place, and it is the one this ESP's first boot opens. Its seed must be this ESP's (the
+        # store's base, docs/data-store.md section 9), else that boot keeps the store untouched and runs Data volatile.
+        usable = common.store_usable(current, s.esp['seed'])
+        s.log(f'  {"ok   " if usable else "WARN "} the store at LBA {store_new(s)} (seed {current["identity"][:16]}, generation '
+              f'{current["generation"]}) {"IS" if usable else "is NOT"} the one this ESP resumes (seed {s.esp["seed"]["identity_sha256"][:16]}'
+              f'{", the store is self-contained" if current.get("self_contained") else ""})' +
+              ('' if usable else ': its boots would keep it and run Data VOLATILE; write_esp refuses such an ESP unless its build '
+               'record has --replace-data'))
 
 
 def store_plan(s):
@@ -736,6 +746,13 @@ def write_esp(s, image_name):
     else:
         now = s.region_sha(lun0, common.ESP_FIRST, common.ESP_BLOCKS, name='esp-region-sha')
         s.require_backup('linux_rootfs-tail-esp', now if s.execute else None)
+    current = s.state.get('store_new') or {}
+    if s.state.get('gpt_state') == 'new' and current.get('state') == 'valid' and not common.store_usable(current, record['seed']) \
+            and not (record.get('data_store') or {}).get('replace'):
+        raise Stop(f'{record["image"]}: its seed {record["seed"]["identity_sha256"][:16]} is not the seed of the store at LBA {store_new(s)} '
+                   f'({current["identity"][:16]}, as step map read it): every boot of it would keep that store untouched and run the '
+                   'owner\'s Data volatile. Build it with the store\'s base (build-esp.py --seed base, the daily profile\'s default; '
+                   'docs/data-store.md section 9), or with --replace-data if the owner decided to start Data over')
     s.fetch(record['image'], OUT / record['image'], record['sha256'])
     if s.write(f'{record["image"]} (default {record["default"]}, profile {record["profile"]}) -> /dev/{esp} (LUN 0 LBA {common.ESP_FIRST}, 1 GiB)'):
         s.job('esp-write', 'write', record['image'], esp, 0, MiB, timeout=1800)

@@ -7,7 +7,9 @@
    blocks), a sparse LUN 4 with boot_a/vendor_boot_a/init_boot_a/boot_b, a temporary "NAS" directory, and a stand-in for
    maint-shell.py that runs tablet.sh's subcommands in Python over those files (partitions as offset views of the disks).
    Runs map, backup, gpt, store (move), esp, check, boot-a, check, then the rollbacks esp, store, gpt, boot-a, and checks that
-   every region is byte for byte what it was. Also checks that a changed-but-not-written region stops the session.
+   every region is byte for byte what it was. Also checks that a changed-but-not-written region stops the session, and that once
+   installed, esp-final refuses an ESP whose seed is not the store's (docs/data-store.md section 9) unless its record says
+   --replace-data, and writes one of the store's seed.
   test-persist.py [--keep DIR]
 """
 import argparse
@@ -379,6 +381,21 @@ def test_session(tmp):
     check(sha_region(lun0, common.ESP_FIRST * B, common.ESP_BLOCKS * B) == common.sha(out / 'esp-test.img'), 'ESP region = the image')
     run('boot-a', 'check')
     check(sha_region(root / 'lun4.img', LUN4['boot_a'][1], LUN4['boot_a'][2]) == common.sha(out / 'boot-test-signed.img'), 'boot_a = the image')
+    # An ESP update once installed: the store at the new place is the one its first boot opens.
+    rec = json.loads((out / 'esp-test.json').read_text())
+    shutil.copyfile(out / 'esp-test.img', out / 'esp-other.img')
+    common.write_json(out / 'esp-other.json', {**rec, 'image': 'esp-other.img', 'seed': {**rec['seed'], 'identity_sha256': 'ab' * 32}})
+    log = run('map', 'esp-final', '--esp', 'esp-other.img', '--esp-final', 'esp-other.img', expect=3)
+    check('is NOT the one this ESP resumes' in log and 'is not the seed of the store' in log,
+          'installed: esp-final refuses an ESP of another seed (its boots would run Data volatile)')
+    common.write_json(out / 'esp-other.json', {**rec, 'image': 'esp-other.img', 'seed': {**rec['seed'], 'identity_sha256': 'ab' * 32},
+                                                'data_store': {'replace': 'cd' * 4}})
+    run('map', 'esp-final', '--esp', 'esp-other.img', '--esp-final', 'esp-other.img')
+    check(True, '... and writes it when its record says --replace-data (the owner\'s decision)')
+    log = run('map', 'esp-final')
+    check('IS the one this ESP resumes' in log and
+          sha_region(lun0, common.ESP_FIRST * B, common.ESP_BLOCKS * B) == common.sha(out / 'esp-test.img'),
+          'installed: esp-final writes an ESP of the store\'s seed')
     run('backup')   # again, after the writes: must keep the originals as the rollback sources
     state2 = json.loads((tmp / 'session/state.json').read_text())
     check(state2['backups'] == state['backups'], 'a second backup run keeps the original backups')
