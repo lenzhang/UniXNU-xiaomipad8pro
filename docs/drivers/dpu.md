@@ -132,9 +132,9 @@ a full modeset in both Linux ports, and more power, so not planned. Risks: a mis
 (Ubuntu's full-modeset 60 Hz was grey until the stock order was used); the TDDI touch follows display timing (watch touch at 60 Hz);
 the DSI shadow offsets are confirmed by B1a's raw `timing words`.
 
-**4.4 Night Light (B1d).** PCC in DSPP0 and DSPP1 (both halves, same matrix): R from (R,G,B) at +0x10/+0x1c/+0x28, G +0x14/+0x20/
-+0x2c, B +0x18/+0x24/+0x30, S3.15; enable +0 bit 0; flush CTL_DSPP0/1_FLUSH bit 4 + CTL_FLUSH b29, latched with the frame. A warm
-white point is a diagonal (e.g. 3400 K ≈ 1.0, 0.73, 0.45). macOS reaches the display through IOMFB's `swap_set_color_matrix` (slot
+**4.4 Night Light (B1d).** PCC in DSPP0 and DSPP1 (both halves, same matrix): output R from (R,G,B) at +0x10/+0x14/+0x18, G
++0x1c/+0x20/+0x24, B +0x28/+0x2c/+0x30 (msm's PCC_<input>_<output>_OFF names), S3.15; enable +0 bit 0; flush CTL_DSPP0/1_FLUSH bit 4
++ CTL_FLUSH b29, latched with the frame. A warm white point is a diagonal (e.g. 3400 K ≈ 1.0, 0.73, 0.45). macOS reaches the display through IOMFB's `swap_set_color_matrix` (slot
 343) and `set_gamma_table` (slot 307), both stubs in NativeGopDisplay today: B1d-0 logs which one Night Shift calls; a per-channel
 linear gamma ramp maps exactly onto a PCC diagonal, a non-linear one needs GC v2 via REGDMA (later). Re-applied at display-on; no
 CPU cost per frame. Needs the DSPP in ABL's path (B1a reads the PCC/GC enables; LM n → DSPP n is the catalog's wiring).

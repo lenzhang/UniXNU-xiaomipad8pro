@@ -288,7 +288,9 @@ static void testPcc()
   d.pcc[kPccCoef[2][2] / 4] = 0x4ccd;   // blue 0.6: a warm Night Light matrix
   p = viewPcc(d);
   CHECK(!p.identity && p.m[2][2] == 600);
-  CHECK(kPccCoef[0][0] == 0x10 && kPccCoef[1][0] == 0x14 && kPccCoef[2][2] == 0x30);
+  CHECK(kPccCoef[0][0] == 0x10 && kPccCoef[0][1] == 0x14 && kPccCoef[1][0] == 0x1c && kPccCoef[2][2] == 0x30);
+  d.pcc[0x14 / 4] = 0x1000;   // output R from input G (msm's PCC_GREEN_R_OFF): an off-diagonal term of row R
+  CHECK(viewPcc(d).m[0][1] == 125 && viewPcc(d).m[1][0] == 0);
 }
 
 static void testTiming()
