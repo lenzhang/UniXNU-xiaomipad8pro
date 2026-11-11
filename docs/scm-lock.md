@@ -1,7 +1,8 @@
 # The secure-call lock: one owner of the secure world across kexts
 
-Status, 2026-11-11: **built, host-tested and linked** (`package/include/PianoScmLock.h`; PianoA830 and PianoPower take it, PianoVideo
-from its level 3); not run on the tablet. Code side and the full protocol: the header's comment.
+Status, 2026-11-11: **built, host-tested and linked** (`package/include/PianoScmLock.h`; PianoA830, PianoPower and PianoVideo
+(from its level 3, built the same day: `drivers/video.md` §12.2) take it); not run on the tablet. Code side and the full
+protocol: the header's comment.
 
 ## Why
 
@@ -29,7 +30,7 @@ and MP_VIDEO_VAR (`drivers/video.md` §4.3).
 |---|---|---|
 | PianoA830 | `scmLock`/`scmUnlock` in `Adreno830Start.cpp` through the board hook `adreno830_board_scm_hold` (ADRENO830_MACOS; a weak no-op for the host tests) | `stageZap`: `zap.load` (PAS 13 parse, metadata, init_image, mem_setup, the segment, auth_and_reset) |
 | PianoPower | `scmLock`/`scmUnlock` in `PianoAdsp.cpp` | `startImage` (DTB PAS 36, then DSP PAS 1: metadata, init_image, mem_setup, segments, auth_and_reset) |
-| PianoVideo | level 3+: its `Sm8750Scm` ops the same way | PAS 9 init_image .. auth_and_reset, then MP_VIDEO_VAR, as one section; resume's SET_REMOTE_STATE alone |
+| PianoVideo | level 3+: `scmLock`/`scmUnlock` in `PianoVideo.cpp`, its own `Sm8750Scm` (a copy of PianoPower's) | `KernelHw::scmHold` around `VideoFirmware.h`'s PAS 9 init_image .. mem_setup .. segments .. auth_and_reset .. MP_VIDEO_VAR (and a failure's PAS shutdown) as one section; PAS shutdown and SET_REMOTE_STATE (collapse, resume) alone |
 
 Without contention a take is one compare-exchange, so nothing else changes. A new user: define `PIANO_SCM_LOCK_KERNEL`, include
 `<PianoScmLock.h>`, declare `PIANO_SCM_KERNEL_LOCK(name, tag, "Label")` with a tag of its own, name PianoA830 as a library in its
