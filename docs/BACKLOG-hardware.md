@@ -30,7 +30,7 @@ Standing constraints for every item:
 | Charging | PianoPower level 1/2 (level 2 input stays 0 mA: image I in progress) | policies → B4 |
 | RTC / time | k27 0060 `piano-rtc=1` + offset; NTP over USB NCM | — |
 | CPU frequency, power modes, thermal | PianoThermal (`piano-thermal`, `piano-cpufreq=1..3`: Ubuntu's Power Saver/Balanced caps) | macOS Low Power Mode mapping → B5; PMIC board thermistors → B6 |
-| GPU acceleration | PianoA830 + Turnip | idle power (in flight) |
+| GPU acceleration | PianoA830 + Turnip | idle power: `piano-gpu-idle` (1 the default, 2 to A/B on the tablet: gpu.md §8) |
 | Suspend (s2idle, CX off) | k27 cpuidle/s2idle patch + power contract (in flight) | lid/keyboard/charging policies → B2, B4 |
 | Speakers, microphones | PianoAudio level 1 + `audio.md` design | levels 2+ (6–9 weeks) |
 | Boot time (Ubuntu: ~13 s to login) | `docs/boot-time.md`, `PIANO_FAST_BOOT` | ours ~150 s; keep cutting |

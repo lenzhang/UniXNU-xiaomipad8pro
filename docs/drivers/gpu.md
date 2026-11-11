@@ -75,6 +75,12 @@ kernel side must provide (2026-11-11).
 | other `piano-gpu-*`, `piano-screenoff`, `piano-diag` | driver's | Adreno830's `pagani-*` knobs renamed (README of `package/PianoA830/adreno830`), e.g. `piano-gpu-pool=<MiB>`, `piano-gpu-profile`, `piano-gpu-dcvs-max` |
 | `piano-gpu-metal-opens=<n>` | 0 (no limit) | connections ever granted to the plugin |
 | `piano-gpu-hang-ms=<ms>` | 0 (2000) | the time without progress (fence, ring read pointer, BR's IB1) the fence and recovery watchdogs call a hang, 1000..60000; 10000 for the first desktop sessions ([gpu-userspace.md](gpu-userspace.md), desktop section) |
+| `piano-gpu-idle=0/1/2` | 1 | the GPU's idle power (§8, "GPU idle power"): 0 as before; 1 the DCVS floor (no wake boost, a 250 ms window while idle at 160 MHz, no touch pre-wake); 2 also the boot DDR vote dropped to the display's floor at S10, the host CX/MX votes lowered after `piano-gpu-idle-ms` quiet, and P1's full slumber |
+| `piano-gpu-idle-ms=<ms>` | 1000 | quiet (nothing submitted, in flight or held) this long: the idle votes and the slumber of level 2; 100..60000 |
+| `piano-gpu-idle-slumber=0/1` | 1 | with level 2, P1's full slumber too (0: the votes alone); `piano-gpu-slumber` given wins |
+| `piano-gpu-idle-ddr=<level>` | the scanout's (5 on piano) | the host DDR bus level of the display's floor: the lowest level holding twice the boot framebuffer's 120 Hz read rate (3.28 GB/s at 3200x2136); 5 = 6.67 GB/s |
+| `piano-gpu-idle-rails=<vlvl>` | 0x140 | the host CX/MX level while idle (RPMh vlvl; 0x140 NOM_L1), never above what is held; 0 keeps the rails |
+| `piano-gpu-ddr-floor=<level>` | the boot level (11) | the driver's S5 floor; given, level 2's S10 drop is skipped and the idle votes lower the DDR only while idle |
 | `piano-metal-report=0/1/2` | 1 | the plugin's abort reporter: off / the desktop's system processes / every process that loads the plugin (userspace, read through kern.bootargs) |
 | `native-gop-display-gpu-fence=0/1` | 1 | NativeGopDisplay waits for the GPU's fence before a swap's copy (§8) |
 
@@ -85,7 +91,7 @@ Build: `tooling/k27/build-native-piano-a830.sh`: (1) `gen-piano-gpu-inputs.py --
 dtc'd to `out/native-kexts/PianoA830/inputs/piano-boot.dts`, plus the stock DT's recorded KGSL policy, cross-checked; `--compare` with
 the 13T's header: only digests, SoC 639 and bin 1's length differ); (2) `stage-piano-gpu-firmware.py` (pins checked, copies in the
 ignored `out/native-kexts/PianoA830/firmware`, `.incbin` from there; firmware is never committed); (3) `run-a830-host-tests.py`
-(43 pass; known: `test_sha256` SQE/AQE/ZAP against the 13T's built-in pin table, `test_a830regs` needs upstream's unpublished
+(44 upstream and 43 macOS pass with `test_a830idle`; known: `test_sha256` SQE/AQE/ZAP against the 13T's built-in pin table, `test_a830regs` needs upstream's unpublished
 `docs/inputs`, `test_userclient` asserts iPadOS names in the macOS pass, which has its own list check); (4) objects, coalescing,
 import check. Image: `PIANO_EXTRA_KEXTS=$(tooling/k27/build-native-piano-a830.sh | tail -1) PIANO_EXTRA_ARGS="piano-gpu=1" tooling/k27/build-native-image.sh`;
 ladder: `tooling/k27/build-gpu-ladder.sh` (out/ram-gpu/s1..s9, full).
@@ -136,9 +142,92 @@ out): an accelerator without its MetalPluginName bundle would put WindowServer b
 bring-up takes about 1.1 s (S3's 512 MiB pool reservation is 1.0 s of it), so `piano-gpu-delay=0` would publish the accelerator before
 WindowServer starts; try it once before making it the default. DCVS: keep the annibale default (at most 342 MHz, 160 MHz held from
 70 C until below 60 C): the login run sat at 342 MHz and 56-57 C with no cooling and no charging control (PianoPower is read-only so
-far), and the GPU never slumbers (P0) while host CX/MX stay at their top votes and DDR at level 11. Raise it
-(`piano-gpu-dcvs-max=607 piano-gpu-maxlevel=7`) only after a 10-minute desktop soak with the temperatures logged; slumber
-(`piano-gpu-slumber=2`) is untested on piano.
+far), and until `piano-gpu-idle=2` has passed its A/B (below) the GPU never slumbers (P0) while host CX/MX stay at their top
+votes and DDR at level 11. Raise it (`piano-gpu-dcvs-max=607 piano-gpu-maxlevel=7`) only after a 10-minute desktop soak with the
+temperatures logged; slumber (`piano-gpu-slumber=2`, or level 2's full slumber) is untested on piano.
+
+**GPU idle power (2026-11-11).** What the driver held all day before: P0 (no slumber); on every frame after 64 ms of quiet the
+DCVS's wake boost to the ceiling for 50 ms (the login screen, ~10 frames a second of 2.5 ms of work, spent 47 % of its time at
+342 MHz); the DCVS thread awake every 16 ms whether anything ran or not; and host votes on apps DRV-2 that nothing lowers: CX and
+MX at the top of their cmd-db tables, DDR at bus level 11 (18.6 GB/s, the table's top) with ACV. They are the HLOS's only votes for
+those resources (UFS, the display and the CPU have none of their own here; PianoAdsp votes lcx/lmx, PianoWifi and PianoKeyboard
+regulators), so the DDR ran at its top frequency and CX/MX at their top voltage all day, in the installed profile too.
+`piano-gpu-idle` (`adreno830/A830Idle.h`, the board's `adreno830_board_idle`):
+
+- **1 (default): the DCVS floor.** No wake boost: an isolated frame runs at the floor (2.5 ms of 342 MHz work is about 5 ms at
+  160 MHz, inside a 120 Hz frame); a sustained load still climbs through the governor's up rules (≥ 90 % busy: two levels; demand
+  above the level: demand x 1.1) within a window or two. While the governor idles at the floor its window is 250 ms, not 16 ms; the
+  first submission wakes the thread and the windows are 16 ms again. No touch pre-wake (nothing on piano counts touches for it).
+  The down rule (demand under 85 % of the next level down for 4 windows, 6 after a step up) was checked against a mostly idle desktop: host-tested, the login
+  screen's frames (a third of a 16 ms window at 160 MHz), an isolated frame and a light 120 Hz desktop (64 % busy at 160 MHz,
+  demand 137 MHz) all stay at 160 MHz; with the design's boost every frame of the login screen went above it.
+- **2: also the votes and the slumber.** (a) At S10 the boot DDR vote falls to the display's floor for the rest of the boot
+  (`gpu idle: the boot DDR vote went to the display's floor, level 5 (6671 MB/s); the GMU votes the GPU's own`): the GMU votes
+  each GPU level's bandwidth itself (its table from the DT's opp-peak-kBps), so the host vote only has to carry the scanout. (b)
+  After `piano-gpu-idle-ms` with nothing submitted, in flight or held, the host CX/MX votes go to `piano-gpu-idle-rails` (NOM_L1)
+  and, if a chosen `piano-gpu-ddr-floor` is above the display's, the DDR to it; back at the next submission, rails first, on the DCVS
+  thread (the GPU's work does not wait: the GMU votes its own GX, CX and DDR through its RSC, and its CX levels are LOW_SVS/SVS).
+  Every vote goes through `Sm8750RpmhWriteActive`, which takes the DRV-2 owner word (`sm8750_rpmh_drv2_owner`) as for every vote of
+  this driver; cx is lowered first, raised last (`Sm8750RpmhHostRailsIdle`). (c) With `piano-gpu-idle-slumber=1` A830PowerState's
+  P1 full slumber after the same quiet time: PREPARE_SLUMBER, RSCC sleep (the GMU's votes drop through its RSC's sleep set), GBIF
+  halt, CX power-off; a submission wakes it (acquire, a few ms).
+  Fail-safe: a failed vote puts back what went down and ends the idle votes for the boot; a failed slumber entry or wake goes
+  through the recovery as before and ends P1 for the boot (`A830PowerStats::slumberBlocked`), so a slumber that does not work
+  costs one recovery, not three.
+
+The floors, from the Ubuntu port (facts only: [ubuntu-history/kernel.md](../ubuntu-history/kernel.md) §2.7, §3.4, and its
+`sm8750.dtsi`/piano DT): the boot framebuffer's display path votes 3.28 GB/s average and 4.26 GB/s peak (3200x2136 at 120 Hz with the
+2310-line vertical total) and the DPU at least 0.8 GB/s: level 5 (6.67 GB/s) is above all three. The same DT holds MMCX at NOM_L1
+for the boot framebuffer (the MDP at 575 MHz), and on SM8750 MMCX has CX as its parent domain, so Linux keeps CX at NOM_L1 while the
+panel is lit; UFS at HS-G5 (403 MHz), USB and PCIe Gen3 need NOM; this driver never votes MMCX. The other facts of that history,
+checked against this driver: the boot bandwidth vote must go once the GMU votes bandwidth or DDR stays at top speed (K:97567648b85d:
+level 2's S10 drop); the MX dependency index of each GX level comes from the GPU's own OPP levels (K:cbb3f4900bb4: A830Votes takes
+the first mx level at or above each level's vlvl from the boot DT's table); GMXC is never at retention while GX is on
+(K:925bbbba6eca: the GX vote's secondary is the first gmxc level at or above the GFX corner, 50 at 160 MHz; level 0 "off" only with
+GX off); the HFI interrupt clears only its fault bits (K:891bc63f703a: 336's top half clears bits 1, 2, 15 and 23, never MSGQ or
+the OOB acks) and the GMU's interrupts are masked before its boot (K:ce9c0ed98aab: the annibale profile, piano's, masks both and
+polls); the GMU firmware's init wait is 100 ms (K:d86e3f7b2204: `A830_T_FW_INIT_US`). Linux slumbers this GPU 66 ms after its last
+work and runs IFPC (hysteresis 0x1680); level 2 starts at 1000 ms and without IFPC.
+
+What the lines say (all `PianoA830: gpu ...` through the line ring, the first 8 of each kind and then every 10th, 100th, ...):
+`idle: piano-gpu-idle=2 (slumber 1, after 1000 ms); idle DDR level 5 (6671 MB/s; 3200x2136 scanout 3280 MB/s at 120 Hz), rails vlvl
+0x140` at S8 (the power state's binding); `idle: votes down after 1000 ms quiet (#n): DDR level L (M MB/s), CX 0x140 MX 0x140` and `idle: votes up after N ms
+down (#n): ...`; `idle -> slumber after 1000 ms quiet (#n, entry U us); votes CX x MX y DDR level z (M MB/s)`; `wake after N ms asleep
+(#n): the wake took X.XXX ms (what the first submission waited)`: the first-frame latency after idle; once a minute with anything in
+it `idle last 60 s: votes down D, up U, down P % of the time; slumbers S, wakes W, longest wake X.XXX ms`. Trouble: `idle: a host
+vote failed (rpmh R, #n): no idle votes for this boot`, `idle: a slumber or wake failed (step S, E, F failures): no slumber for this
+boot` (with the `gpu recovery` lines before it), `the boot DDR vote could not drop`. What level 2 could break, and its lever: a
+display that flickers or tears at DDR level 5 (no underrun counter is wired on piano: watch the panel and the thumbnails;
+`piano-gpu-idle-ddr=6` or `piano-gpu-ddr-floor=11`); UFS errors (`NativeUfs` lines) with the rails at NOM_L1
+(`piano-gpu-idle-rails=0`); CPU-heavy work under a still screen with the DDR at 6.67 GB/s (no CPU DDR governor here;
+`piano-gpu-ddr-floor=11` keeps the boot vote and lowers it only while the GPU idles); a first frame after a slumber a few ms late
+(the wake line).
+
+**The A/B power test** (PianoPower's `[Ns] battery: V mV, I mA (discharging), ...` line every 30 s; the same brightness, a still
+wallpaper, charger unplugged, nothing touched after the login):
+
+```sh
+for idle in 0 2; do
+  PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=1200 \
+  PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-power=1 exec-log=1 stderr-log=1 piano-gpu-hang-ms=10000 piano-gpu-idle=$idle" \
+    tooling/k27/build-native-image.sh || break
+  rm -rf out/ram-gpu-idle$idle && cp -R out/ram out/ram-gpu-idle$idle
+done
+tooling/native/native-loop.sh out/ram-gpu-idle0/boot-piano-macos-ram-A-bundled.img   # then out/ram-gpu-idle2/...
+```
+
+Both images carry the same seed and kernel collection; only the boot line differs. Per run: log in, leave the desktop alone, average
+the `battery:` current from minute 3 to minute 10 after the login (14 lines), note `row0`'s temperature and, for level 2, the minute
+summaries (an idle desktop should be down most of the time) and the longest wake. Then, one variable at a time: `piano-gpu-idle-ms=100`
+(nearer Linux's 66 ms), `piano-gpu-ifpc=1` (P2, GX collapse between frames; Linux runs it on this GPU), `piano-gpu-idle-slumber=0`
+(the votes without the slumber, if a wake line shows trouble).
+
+Not done here: system suspend. The host votes are ACTIVE-only on DRV-2 and nothing programs its SLEEP/WAKE sets, so they survive
+into sleep: a CX-off suspend needs the GPU in P1's full slumber (the GMU's votes dropped) and every host vote lowered to its sleep minimum
+first, and put back on resume, through the same `Sm8750RpmhHost` calls; the entry point belongs to
+the power contract when it lands (kernel.md §3.2). The thermal ceiling PianoThermal asks for at its passive trip
+(`callPlatformFunction("piano-gpu-ceiling", kHz)`, [thermal.md](thermal.md) §10.5) is in: `adreno830_dcvs_set_ceiling`, a line per
+change (`gpu ceiling N MHz (...)`, `gpu ceiling cleared`); macOS Low Power Mode will use the same call (BACKLOG B5).
 
 ## 9. Fallback
 
@@ -148,8 +237,10 @@ far), and the GPU never slumbers (P0) while host CX/MX stay at their top votes a
 
 1. Does Gunyah on piano keep only ACTLR `0x303` (13T)? (S3 trace + survey after S1.)
 2. Does the SCM path (GPU_INIT_REGS, PAS 13 with piano's ZAP) work from XNU at EL1 on piano? (S2, S7.)
-3. DRV-2 sharing with PianoPower: PianoPower sends on TCS 1 without `sm8750_rpmh_drv2_owner`; do not run `piano-power>=2` with
-   `piano-gpu=2` until both take the lock.
+3. DRV-2 sharing: PianoPower (PianoAdsp's lcx/lmx), PianoWifi and PianoKeyboard (regulators) take `sm8750_rpmh_drv2_owner` around
+   every vote now, as PianoA830 does (2026-11-11 tree); none of them votes cx/mx or the DDR BCMs. `piano-gpu-idle=2` sends at run
+   time (a vote pair per idle period), so the lock matters more than at the boot's few votes; on the tablet, the TCS lines of each
+   driver with `piano-gpu-idle=2` and `piano-power>=2` together are still to be seen.
 4. Real Metal client count on macOS (32 slots); the 3200x2136 hang seen under virgl.
 5. Whether the 50 ms fence wait is ever reached (NativeGopDisplay's 10 s line), and the real frame time on the panel.
 
