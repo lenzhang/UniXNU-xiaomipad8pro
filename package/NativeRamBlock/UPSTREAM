@@ -21,3 +21,6 @@ UniXNU-piano changes of 2026-11-11 (docs/data-store.md):
 - Test/: upstream's host tests sparse.cpp, persist.cpp (its stale-seed case now expects Kept, then Fresh with replace), direct.cpp,
   seeddisk.cpp, seed-identity.cpp (sparse.cpp: the over-size case moved past SparseDisk.h's 1 TiB limit); new guard.cpp and
   volatile.cpp; run-tests.sh.
+- native-ram-trace=1 (2026-11-11, docs/forensics-2026-11-11.md): a console line before and after each step of the store's set-up
+  (the waits for IOBSD and NativeUfs's root layout, the GPT check, the window, the header and bitmap I/O, the syncs, the disk's
+  registration), with the milliseconds since the publish thread started. Off without the argument; the set-up's I/O is unchanged.

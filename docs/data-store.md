@@ -95,6 +95,12 @@ The old collection's line is `Data store state S (1 blank, 2 resumed, 3 fresh, 4
 direct D`. `generation` and `present` describe the store as found (or as made). A boot after a kept one shows the same two
 numbers if nothing wrote to the store.
 
+`native-ram-trace=1` (off by default; not a `data-*` name, so `PIANO_EXTRA_ARGS` and `build-esp.py --arg` take it) adds a line
+before and after each step of the set-up, `NativeRamBlock: store +<ms> ms: …`: the waits for IOBSD and NativeUfs's root layout,
+the GPT check, the window, `header read: SHNGDATA v1, <pages> pages, seed <8 hex>, generation G, flags F` (the store as found,
+before any decision), the bitmap read or clear (first block, every 32nd, last), each cache sync, the header write, the disk's
+registration ([forensics-2026-11-11.md](forensics-2026-11-11.md) §4). A set-up that stops names its step.
+
 ## 4. Flatten: a store that no longer needs its seed
 
 `data-store-flatten=1` (`Overlay::flatten`, `NativeRamBlock::flattenStore`) works only on this seed's store, opened read-write

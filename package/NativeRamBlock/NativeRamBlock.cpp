@@ -15,6 +15,8 @@
 #include <vm/vm_kern.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
+#include <stdarg.h>
+#include <libkern/libkern.h>
 #include "SparseDisk.h"
 #include "PersistOverlay.h"
 #include "DirectDisk.h"
@@ -50,6 +52,69 @@ volatile uint64_t native_data_persist_pages = 0, native_data_persist_loaded = 0,
                   native_data_persist_present = 0, native_data_persist_flattened = 0, native_ram_block_volatile_bytes = 0;
 }
 
+// UniXNU-piano (2026-11-11, docs/forensics-2026-11-11.md): native-ram-trace=1 prints a short console line before and after each step
+// of the Data store's set-up: the waits for IOBSD and for NativeUfs's root layout, the GPT check, the window, the header and bitmap
+// I/O, the cache syncs, the disk's registration. Each line carries the milliseconds since the publish thread started, so a set-up
+// that stops names the step it stopped in and how long the steps before it took. Without the argument nothing is printed and the
+// set-up is unchanged (the same I/O in the same order; the trace only observes it).
+namespace {
+bool gStoreTrace;
+uint64_t gStoreTraceStart;
+__attribute__((format(printf, 1, 2))) void storeTrace(const char *format, ...)
+{
+  if (!gStoreTrace) return;
+  char line[200];
+  va_list ap;
+  va_start(ap, format);
+  vsnprintf(line, sizeof line, format, ap);
+  va_end(ap);
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time() - gStoreTraceStart, &ns);
+  IOLog("NativeRamBlock: store +%llu ms: %s\n", ns / 1000000, line);
+}
+// One store call of the set-up, before (done false) or after it (done true, ok its result). The header block is described once read;
+// the bitmap gets a line at its first block, every 32nd and its last; the page area its first call; every failure its own line.
+void storeTraceIo(char op, uint64_t block, uint32_t count, uint64_t bitmapBlocks, bool done, bool ok, const void *data)
+{
+  if (!gStoreTrace) return;
+  const char *what = op == 'r' ? "read" : "write";
+  if (done && !ok) {
+    storeTrace("%s of block %llu (%u blocks) FAILED", what, block, count);
+    return;
+  }
+  if (block == 0) {
+    if (!done) {
+      storeTrace("%s the header (block 0)", op == 'r' ? "reading" : "writing");
+    } else if (op == 'w') {
+      storeTrace("header written");
+    } else {
+      persist::HeaderInfo info;
+      const int parsed = data ? persist::parseHeader(static_cast<const uint8_t *>(data), &info) : 1;
+      if (parsed == 1) storeTrace("header read: no store header (blank or foreign)");
+      else if (parsed == 2) storeTrace("header read: damaged (version, size or CRC)");
+      else
+        storeTrace("header read: SHNGDATA v1, %llu pages, seed %08x, generation %llu, flags %u", info.pages, persist::seedTag(info.seed),
+                   info.generation, info.flags);
+    }
+    return;
+  }
+  if (block <= bitmapBlocks) {
+    if (!done && block == 1)
+      storeTrace(op == 'r' ? "reading the bitmap (%llu blocks)" : "clearing the bitmap (%llu blocks, one FUA write each)", bitmapBlocks);
+    else if (done && block == bitmapBlocks)
+      storeTrace(op == 'r' ? "bitmap read (%llu blocks)" : "bitmap cleared (%llu blocks)", bitmapBlocks);
+    else if (done && block % 32 == 0)
+      storeTrace("bitmap block %llu of %llu %s", block, bitmapBlocks, op == 'r' ? "read" : "written");
+    return;
+  }
+  static bool pagesSeen;
+  if (!pagesSeen) {
+    if (done) pagesSeen = true;
+    storeTrace("%s page area block %llu (%u blocks)%s", what, block, count, done ? ": done (later page calls get no line)" : "");
+  }
+}
+}  // namespace
+
 class NativeRamBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors(NativeRamBlock)
   IOLock *gate = nullptr;
@@ -72,9 +137,30 @@ class NativeRamBlock : public IOBlockStorageDevice {
   // window. A failed store write stops all further writes (a page the system was told is written must be on the medium).
   bool direct = false, directFailed = false;
   struct StoreOps {
-    bool read(uint64_t b, uint32_t n, void *d) { __atomic_fetch_add(&native_data_persist_loaded, n, __ATOMIC_RELAXED); return native_ufs_store_read(b, n, d); }
-    bool write(uint64_t b, uint32_t n, const void *s) { return native_ufs_store_write(b, n, s); }
-    bool sync() { return native_ufs_store_sync(); }
+    // UniXNU-piano: the set-up's calls get native-ram-trace=1's lines (attachStore sets traceBitmap to the bitmap's size); 0: none.
+    uint64_t traceBitmap = 0;
+    bool read(uint64_t b, uint32_t n, void *d) {
+      __atomic_fetch_add(&native_data_persist_loaded, n, __ATOMIC_RELAXED);
+      if (!traceBitmap) return native_ufs_store_read(b, n, d);
+      storeTraceIo('r', b, n, traceBitmap, false, false, nullptr);
+      const bool ok = native_ufs_store_read(b, n, d);
+      storeTraceIo('r', b, n, traceBitmap, true, ok, d);
+      return ok;
+    }
+    bool write(uint64_t b, uint32_t n, const void *s) {
+      if (!traceBitmap) return native_ufs_store_write(b, n, s);
+      storeTraceIo('w', b, n, traceBitmap, false, false, nullptr);
+      const bool ok = native_ufs_store_write(b, n, s);
+      storeTraceIo('w', b, n, traceBitmap, true, ok, s);
+      return ok;
+    }
+    bool sync() {
+      if (!traceBitmap) return native_ufs_store_sync();
+      storeTrace("cache sync");
+      const bool ok = native_ufs_store_sync();
+      storeTrace(ok ? "synced" : "cache sync FAILED");
+      return ok;
+    }
   };
   void persistFailed() { overlay.active = false; native_data_persist_state = 5; __atomic_fetch_add(&native_data_persist_errors, 1, __ATOMIC_RELAXED); }
 public:
@@ -139,14 +225,18 @@ public:
     char ours[9], theirs[9] = "-";
     seedText(seedHash, ours);
     unsigned mode = &native_ufs_store_mode ? native_ufs_store_mode() : 0;
+    storeTrace("set-up: data-persist=%u, seed %s, %s disk", mode, ours, isBig ? "large" : sparse.pages ? "sparse" : "flat");
     if (mode && (sparse.pages || isBig) && &native_ufs_store_open && &native_ufs_store_read && &native_ufs_store_write &&
         &native_ufs_store_sync && &native_ufs_store_gpt_check) {
       uint64_t pages = (isBig ? big.bytes : sparse.bytes) / 4096, first = 0;
       const char *why = "";
       native_data_persist_pages = pages;
+      storeTrace("GPT check");
       native_data_persist_gpt = native_ufs_store_gpt_check();
+      storeTrace("GPT check: %u; opening the window (%llu blocks)", native_data_persist_gpt, persist::windowBlocks(pages));
       if (!native_ufs_store_open(persist::windowBlocks(pages), &first, &why)) {
         native_data_persist_state = 4;
+        storeTrace("window refused: %s", why);
         IOLog("NativeRamBlock: persistent store refused: %s\n", why);
       } else {
         native_data_persist_first_lba = first;
@@ -154,9 +244,16 @@ public:
         overlayBits = static_cast<uint8_t *>(IOMallocZero(bb * persist::kBlock));
         stage = static_cast<uint8_t *>(IOMallocZero(kStagePages * persist::kBlock));
         StoreOps ops;
+        if (gStoreTrace) ops.traceBitmap = bb;
+        storeTrace("window open at LBA %llu; opening the store (%s, data-store-replace %#x, sheng-data-reset %d)", first,
+                   mode == 1 ? "read only" : "read-write", replaceRequested(), discardRequested() ? 1 : 0);
         persist::Open result = overlayBits && stage ? overlay.open(ops, pages, seedHash, mode == 1, overlayBits, discardRequested(),
                                                                    replaceRequested())
                                                     : persist::Open::Failed;
+        storeTrace("store opened: %s (header check %d, generation %llu, present %llu)",
+                   result == persist::Open::Resumed ? "resumed" : result == persist::Open::Fresh ? "fresh"
+                   : result == persist::Open::Blank ? "blank" : result == persist::Open::Kept ? "kept" : "FAILED",
+                   overlay.header, overlay.generation, overlay.present);
         native_data_persist_header = static_cast<uint32_t>(overlay.header);
         native_data_persist_flags = overlay.flags;
         native_data_persist_store_tag = persist::seedTag(overlay.storeSeed);
@@ -246,6 +343,7 @@ public:
           "direct %d, seed %s, store seed %s, flags %u, generation %llu, present %llu\n",
           native_data_persist_state, native_data_persist_header, native_data_persist_first_lba, native_data_persist_pages, direct,
           ours, theirs, native_data_persist_flags, overlay.generation, overlay.present);
+    storeTrace("set-up done");
     IOLockUnlock(gate);
   }
 
@@ -292,16 +390,28 @@ extern "C" int native_ufs_store_ready(void);   // NativeUfs
 static void publishWhenBSDMatched(void *argument, wait_result_t)
 {
   NativeRamBlock *ram = static_cast<NativeRamBlock *>(argument);
+  uint32_t trace = 0;   // UniXNU-piano: native-ram-trace=1, the set-up's lines (storeTrace above)
+  gStoreTrace = PE_parse_boot_argn("native-ram-trace", &trace, sizeof trace) && trace == 1;
+  gStoreTraceStart = mach_absolute_time();
+  storeTrace("publish thread: waiting for IOBSD");
   if (OSDictionary *matching = IOService::resourceMatching(kIOBSDKey)) {
     if (IOService *resources = IOService::waitForMatchingService(matching)) resources->release();
     matching->release();
   }
   // UniXNU-piano: the store is part of NativeUfs's root layout: wait for it (60 s at most), open the store, then publish the disk,
   // so APFS never reads Data before its changed pages are attached.
-  if (native_ufs_store_mode())
-    for (unsigned i = 0; i < 600 && !native_ufs_store_ready(); ++i) IOSleep(100);
+  if (native_ufs_store_mode()) {
+    storeTrace("IOBSD matched; waiting for NativeUfs's root layout (data-persist=%u)", native_ufs_store_mode());
+    unsigned waited = 0;
+    for (; waited < 600 && !native_ufs_store_ready(); ++waited) IOSleep(100);
+    storeTrace("root layout: ready %d after %u ms", native_ufs_store_ready(), waited * 100);
+  } else {
+    storeTrace("IOBSD matched; data-persist=0: no store to open");
+  }
   ram->attachStore();
+  storeTrace("registering the disk");
   ram->registerService();
+  storeTrace("disk registered");
   ram->release();
 }
 
