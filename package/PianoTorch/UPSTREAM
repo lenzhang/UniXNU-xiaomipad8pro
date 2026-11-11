@@ -1,0 +1,36 @@
+PianoTorch is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE): piano's rear torch (backlog B12). What it takes from other
+work, and from where:
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoUsbHost/PianoUsbHost.cpp (sha256 344da37e70682f579b6c0915ab5ac2e38183b17334b1ed0d883c7d5d6c453415): the kext's shape
+    (probe gate on the boot argument, a survey thread, the post-mortem stage word, the SPMI windows mapped uncached and loaded with an
+    explicit ldr, one summary property), re-written for this driver.
+  package/PianoBacklight/PianoBacklight.cpp (sha256 4483d0384a5e958956d1755ff065b6e3a655eca653b4bd08ce165ce854bfb6d5): the control
+    pattern (requests queued under a lock for the service's thread, an administrator-only setProperties, callPlatformFunction entries
+    for other drivers, copyMatchingService lookups of other drivers' properties), re-written for this driver.
+  package/PianoPower/SpmiObserver.h (sha256 4805d4fb7af91c210d75b9791e125f3789b7671e895afe6f80af27a36a849b07): included, not copied
+    (the arbiter v7 windows, the APID map and owner table, the observer read).
+  package/PianoDwc3/PianoDwc3.cpp (setRestartReason): the arbiter v7 owner-channel write this repository already makes (chnls +
+    0x1000 * APID, data at +0x10, command opcode 0 at +0x00, status at +0x08); re-expressed in TorchCore.h spmiWriteByte.
+  package/include/PianoPowerContract.h: the power-tree join and the synchronous off in setPowerState(kOff) (docs/power.md section 4).
+  tooling/native/pianousb-shell/pianousb-shell.c (sha256 85b3dca552641fd5089cae0189840f5576c2f2b52c1c3d304b6d2b3241de691a): the form of
+    a user-space tool built on the Mac for the tablet's macOS (tooling/native/piano-torch/piano-torch.c).
+
+The piano boot DT (out/inputs/piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840): the SPMI
+arbiter's windows and EE, PM8550 at SID 1, led-controller@ee00 ("qcom,pm8550-flash-led", status disabled).
+
+Specifications only (no code, comment or table copied):
+  the Ubuntu piano kernel (yzddmr6/linux-sm8750-piano, piano/dev 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01; GPL-2.0):
+    drivers/leds/flash/leds-qcom-flash.c (sha256 d2951516c5119e8de053f68d9a2781a8a41ce3063a1301f9689a95ec12ae10b6): the module's
+      identity values, the four-channel register offsets and fields, the torch current step and rounding, the clamp rule, the
+      software strobe word, the torch sequence (strobe off, module off, current, timer off, module on, strobe on), the status bits;
+    arch/arm64/boot/dts/qcom/sm8750-xiaomi-piano.dts (sha256 79fe7c8009621e4fe00423a10218eacee6b92294ee978a5044026d0e05d127dd): the
+      lamp (led-sources <1 2>, led-max-microamp 100000, flash-max-microamp 400000, flash-max-timeout-us 300000; v1.1.1,
+      K:82a40d864b46) and the flash thermistor's ADC channel (pmk8550 0x145, not read here);
+    drivers/spmi/spmi-pmic-arb.c (sha256 320e71b64915eb4e32be90b49fd65f12da2241e877bf4f68f0c0c1eb4ab3e28d): v7 channel offsets,
+      the write command, the owner check.
+  the Ubuntu device repository (yzddmr6/xiaomipad-8pro-mainline, v1.2.0 7fe59cc; MIT): tools/check-piano-flash.py (sha256
+    de2f7286217719f4a2f52b68691dac800846b707b70676db985505126eb9dc20, "write and read back a torch setting, then restore it") and
+    device/camera/piano-camera-light-off (sha256 278c85b166b35252f83905acd709b037eb5501cbf5f29e4d110acc9c3121d987, "closing V4L2
+    does not turn torch mode off"): behaviour only.
+Not read and not used for anything: any Qualcomm or Xiaomi binary, any Apple binary.
