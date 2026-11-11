@@ -1,8 +1,8 @@
-From d613a22702fad88688808b54de2d8b29f45a6431 Mon Sep 17 00:00:00 2001
+From 51f2ce7de28406079a5aa7a37acf982f4b629216 Mon Sep 17 00:00:00 2001
 From: leozhang <zwj8727@gmail.com>
 Date: Wed, 11 Nov 2026 15:10:01 +0800
-Subject: [PATCH 62/62] k27: piano-sleep=1: macOS's system sleep as
- suspend-to-idle (CPUs parked in PSCI states, wake sources polled)
+Subject: [PATCH] k27: piano-sleep=1: macOS's system sleep as suspend-to-idle
+ (CPUs parked in PSCI states, wake sources polled)
 
 The stock arm64 sleep cannot run on this platform: ArmCpu's haltCPU spins in WFI on the calling CPU, its initCPU(false)
 panics, this board's arm64_prepare_for_sleep is a WFI loop, and Gunyah's SYSTEM_SUSPEND needs every other vCPU in CPU_OFF,
@@ -33,10 +33,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  bsd/dev/arm64/sysctl.c          |  17 +
  iokit/Kernel/IOCPU.cpp          |  58 +++
  iokit/Kernel/IOPMrootDomain.cpp |  48 ++
- osfmk/arm64/piano_pm.c          | 884 ++++++++++++++++++++++++++++++++
+ osfmk/arm64/piano_pm.c          | 897 ++++++++++++++++++++++++++++++++
  osfmk/arm64/piano_pm.h          |  28 +-
  osfmk/kern/clock.c              |   9 +
- 6 files changed, 1041 insertions(+), 3 deletions(-)
+ 6 files changed, 1054 insertions(+), 3 deletions(-)
 
 diff --git a/bsd/dev/arm64/sysctl.c b/bsd/dev/arm64/sysctl.c
 index 1b1acc3..88050c8 100644
@@ -217,10 +217,10 @@ index 4b42199..94dd5e8 100644
  			if (lowBatteryCondition || thermalEmergencyState) {
  				if (lowBatteryCondition) {
 diff --git a/osfmk/arm64/piano_pm.c b/osfmk/arm64/piano_pm.c
-index 8c5c74c..cb28a6e 100644
+index 8c5c74c..0d66b73 100644
 --- a/osfmk/arm64/piano_pm.c
 +++ b/osfmk/arm64/piano_pm.c
-@@ -636,6 +636,847 @@ piano_cpuidle_init(void)
+@@ -636,6 +636,860 @@ piano_cpuidle_init(void)
  }
  STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_cpuidle_init);
  
@@ -267,6 +267,7 @@ index 8c5c74c..cb28a6e 100644
 +
 +#define ICC_IAR1_EL1            "S3_0_C12_C12_0"
 +#define ICC_EOIR1_EL1           "S3_0_C12_C12_1"
++#define ICC_HPPIR1_EL1          "S3_0_C12_C12_2"
 +#define PIANO_INTID_VTIMER      27
 +#define PIANO_INTID_SPI_IPI     1008       /* ArmCpu's armcpu-spi-ipi: SPI 1008 + core */
 +
@@ -697,12 +698,23 @@ index 8c5c74c..cb28a6e 100644
 +	__builtin_arm_isb(ISB_SY);
 +}
 +
-+/* The pending interrupt after a wake from the state: the poll timer is acknowledged and quietened here (XNU never sees it), an
-+ * IPI is acknowledged (its signal bits wait for the release); a peripheral's SPI is acknowledged and returned. 1023: none. */
++static inline bool
++piano_intid_ipi(uint32_t id)
++{
++	return id < 16 || (id >= PIANO_INTID_SPI_IPI && id < PIANO_INTID_SPI_IPI + 8);
++}
++
++/* The pending interrupt after a wake from the state (the highest one, ICC_HPPIR1): the poll timer is acknowledged and quietened
++ * here (XNU never sees it) and an IPI acknowledged (its signal bits wait for the release); a peripheral's SPI (every SPI goes
++ * to the boot CPU) is left pending, so its driver's handler takes it after the wake. 1023: none. */
 +static uint32_t
 +piano_take_pending(bool *ipi)
 +{
-+	uint32_t id = (uint32_t)(__builtin_arm_rsr64(ICC_IAR1_EL1) & 0xffffff);
++	uint32_t id = (uint32_t)(__builtin_arm_rsr64(ICC_HPPIR1_EL1) & 0xffffff);
++	if (id >= 1020 || (id != PIANO_INTID_VTIMER && !piano_intid_ipi(id))) {
++		return id;
++	}
++	id = (uint32_t)(__builtin_arm_rsr64(ICC_IAR1_EL1) & 0xffffff);
 +	if (id >= 1020) {
 +		return id;
 +	}
@@ -712,9 +724,10 @@ index 8c5c74c..cb28a6e 100644
 +	}
 +	__builtin_arm_wsr64(ICC_EOIR1_EL1, id);
 +	__builtin_arm_isb(ISB_SY);
-+	if (id < 16 || (id >= PIANO_INTID_SPI_IPI && id < PIANO_INTID_SPI_IPI + 8)) {
++	if (piano_intid_ipi(id)) {
 +		*ipi = true;
 +	}
++	/* (an SPI that overtook the timer between the two reads is acknowledged here: a level line asserts again) */
 +	return id;
 +}
 +
@@ -751,7 +764,7 @@ index 8c5c74c..cb28a6e 100644
 +			piano_sleep_last_polls++;
 +		} else if (id >= 1020) {
 +			piano_sleep_last_spurious++;
-+		} else if (id < 16 || (id >= PIANO_INTID_SPI_IPI && id < PIANO_INTID_SPI_IPI + 8)) {
++		} else if (piano_intid_ipi(id)) {
 +			piano_sleep_last_ipis++;
 +		} else {
 +			piano_sleep_last_irq = id;
@@ -1068,7 +1081,7 @@ index 8c5c74c..cb28a6e 100644
  #else /* !defined(XNU_VM_GUEST) */
  
  size_t
-@@ -667,4 +1508,47 @@ piano_cpuidle_latency_release(int handle __unused)
+@@ -667,4 +1521,47 @@ piano_cpuidle_latency_release(int handle __unused)
  {
  }
  
