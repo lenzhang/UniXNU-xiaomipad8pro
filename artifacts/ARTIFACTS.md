@@ -78,3 +78,21 @@ seed df5579ddb4a1d9ec… (seed identity aced5bf9794b42f3…), `ESP_UTC=179435427
 | `persistent/esp-gpu-diag.img` | 1073741824 | 97fecadfb84cc91ff5d64c6c7d99e9906de907e3c593d03c7cb80734716a5b18 | default `macos-diag` (session 1, RAM tests) |
 | `persistent/esp-gpu-macos.img` | 1073741824 | 1120f7d86ce688f9e122f863f59f71e50a5865e17227fa999824e2d331970615 | default `macos` (session 3, `esp-final`) |
 | `ram-precedence/boot-piano-macos-ram-A-bundled.img` | 203726848 | 7f8c2d6194d8c8c11f005572d107de6dbb495122ff14638c4e8557458faa4846 | `ram-precedence`'s dev image: patched FD, base inputs, reset 45 s, data-persist=0 (cannot reset the installed store) |
+
+ESP v3 (`docs/persistent-boot.md` §11; built 2026-11-12 in an agent worktree, `--utc 1794427214`; **OFFLINE_BUILD_NOT_DEVICE_TESTED**,
+not installed). The seed is the store's base, pinned from the installed `esp-daily2-macos` (`e0acb375…`) with
+`tooling/persist/base-seed.py` (`docs/data-store.md` §9):
+
+| File | Bytes | SHA-256 | What |
+|---|---|---|---|
+| `persistent/esp-daily3-macos.img` | 1073741824 | f6f7bb53658b3fd621d6dc5563bae6b1da2884613eb1b99a5767cbb484105309 | daily profile, default `macos`, `piano-boot-guard=180`, `--layer out/layer-v3` |
+| `k27/kc-k27-native.bin` | 92782592 | 557420c421c42dce0bf3dc3beed655453a867995eb454a5152365293f86f39e2 | k27 0064, the 23 kexts of `configs/k27-native-kexts.txt` |
+| `adt/piano-k27.adt` | 15432 | 1532b37e251640e5eb24e66505e6ccf7259d6a49df4f83bee35a3103876a0c6f | vmm-present 0 |
+| `base/8f3331104e03c970/scratch-data.img` | 124665984 | 23a5ec59fc4c4c467e3dc6227cdf37ca291b5a48a270d08137ae4755535f6944 | the base: seed identity 8f3331104e03c970… (the installed store's) |
+| `base/8f3331104e03c970/kernel.macho.trustcache` | 446880 | cd4aa536a546437007c708c8408f4ae0dd1734fb3dffec06b1d52d9a4c743e4c | the base's trust cache, 18611 CDHashes in 5 modules |
+| `layer-v3/kernel.macho.trustcache` | 447004 | 607c60efd5565a90d4357b05949af8528547ccd97a5a84ac3230db13a322d213 | the base's + 1 module: Turnip 0006 `5efbe639…`, pianousb-shell `83876bc9…`, piano-rotated `c401d51b…`, piano-torch `f386f217…` |
+| `layer-v3/userland-update.tar` | 41082880 | 5f48c12572e390d18cec5d6b9bf173b8765c56e5fdfae08a854c914ac4d5133d | the system layer (12 files, 6 units); `apply-update.sh` 240cd52b… |
+
+The Turnip bundle built from a fresh worktree is byte for byte main's: `NativeAdrenoMetal` d4ffaf27…, `libvulkan_freedreno.dylib`
+8c6958ba… (patch 0006), `Info.plist` 9595a4d2… (`docs/data-store.md` §9.4).
+

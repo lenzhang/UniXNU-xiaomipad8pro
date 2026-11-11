@@ -1,6 +1,7 @@
 # The Data store: format, the store guard, flatten, plugin staging
 
-Status 2026-11-11: **built and host-tested offline; nothing of it has run on the tablet.** The installed ESP (`esp-daily-macos`,
+Status 2026-11-12: section 9 (the store's base and the system layer) is the way an installed ESP changes without losing the
+owner's Data: built and host-tested offline, not run on the tablet. Status 2026-11-11: **built and host-tested offline; nothing of it has run on the tablet.** The installed ESP (`esp-daily-macos`,
 docs/USING.md §2; before it `esp-gpu-macos`, the same seed `aced5bf9…`) still has the kernel collection from before this change:
 it has no store guard and no flatten. The guard protects the owner's store from RAM images built with the new collection; section 7 is the test procedure.
 
@@ -190,7 +191,11 @@ After a flatten:
   WindowServer cannot load it. `build-esp.py` compares the installed trust cache with the new one and prints a loud note.
   Measured 2026-11-11: the current Turnip staging lacks the installed Turnip's CDHash `eaa367a2…`.
 
-## 5. Plugin staging (part b): evaluated, not done; the plan
+## 5. Plugin staging (part b): evaluated; superseded by section 9 (2026-11-12)
+
+Section 9 replaces the choice below: the store keeps its seed as its base, the plugin is a file of the system layer, and no flatten
+is needed for a plugin update. What follows is the evaluation of 2026-11-11; its facts about the plugin's search path and the trust
+cache still hold.
 
 How macOS finds the plugin:
 - PianoA830's `AGXAccelerator` publishes `MetalPluginName NativeAdrenoMetal`.
@@ -237,9 +242,10 @@ new seed.
 | `tooling/bootimg/build-ram-images.py` | `data-persist` of a RAM macOS image (`data_store_args`, note on stderr). Without `PIANO_DATA_PERSIST`: **2 only when the image's seed is the installed one**; another seed gets **0**; an unknown installed seed gets 2 with a collection that has the guard, else 0. `PIANO_DATA_PERSIST=0\|1\|2` overrides, but 2 is refused when the seed is not known to be the installed one and the collection has no guard. `PIANO_DATA_STORE_REPLACE=1\|<8 hex>` and `PIANO_DATA_STORE_FLATTEN=1` (need 2 and the guard). `data-*` in `PIANO_EXTRA_ARGS` is refused, and so is 2 for a seed whose size is not the installed store's (section 8). The build record has `data_store` |
 | installed seed | `PIANO_INSTALLED_SEED` (environment or `~/.config/piano/env`): the identity (8 to 64 hex digits) or an ESP build record (`.json`); else `out/persistent/installed.json`, which `maint-session.py` writes with every ESP it installs (and removes on its rollback). For the installed ESP: `PIANO_INSTALLED_SEED=aced5bf9794b42f3c8ffeeef3078a408ff506f5b0b374e02eed6f0ab56e52616` |
 | `tooling/k27/build-native-image.sh` | `out/ram` as above; the dump image `out/ram-dump` keeps `data-persist=0` |
-| `tooling/persist/build-esp.py` | the macos entries keep `data-persist=2`. `--replace-data [1\|HEX8]` adds `data-store-replace` for an intended one-time switch; `--flatten-data` adds `data-store-flatten=1` (a no-op once the store is self-contained). A seed that is not the installed one gets a loud note (with the guard: kept, Data volatile, unless the store is self-contained). With a collection without the guard it is refused unless `--replace-data`. The installed trust cache's CDHashes are checked against the new one (`--installed-trust`). `--arg data-*` is refused. The record has `data_store` |
+| `tooling/persist/base-seed.py` | section 9: `pin` the installed ESP's seed and trust cache as the store's base (`out/base/<identity16>/`, read only, never replaced); `show`, `path`, `diff` |
+| `tooling/persist/build-esp.py` | the daily profile takes the pinned base's seed and trust cache (`--seed base --trust base`); `--layer DIR` the system layer's trust cache (section 9). The macos entries keep `data-persist=2`. `--replace-data [1\|HEX8]` adds `data-store-replace` for an intended one-time switch; `--flatten-data` adds `data-store-flatten=1` (a no-op once the store is self-contained). A seed that is not the installed one gets a loud note (with the guard: kept, Data volatile, unless the store is self-contained). With a collection without the guard it is refused unless `--replace-data`. The installed trust cache's CDHashes are checked against the new one (`--installed-trust`). `--arg data-*` is refused. The record has `data_store` |
 | `tooling/persist/store-test-images.py` | the RAM images of section 7: `out/ram-store-probe` (`data-persist=1`, reset 90 s), `out/ram-store-guard` (`=2`, another seed, 240 s), `--flatten`: `out/ram-store-flatten` (the installed seed, trust cache and ADT from `--installed-esp`, `data-store-flatten=1`, 180 s) |
-| `tooling/persist/maint-session.py` | step `map` reads 128 bytes of each store header (flags, self-contained); `--store auto` moves a self-contained store whatever the ESP's seed; the RAM tests accept state 7 |
+| `tooling/persist/maint-session.py` | step `map` reads 128 bytes of each store header (flags, self-contained), and once installed says whether the store at its place is the one the ESP resumes; `esp`/`esp-final` refuse an ESP whose seed is not that store's unless its record has `--replace-data` (section 9); `--store auto` moves a self-contained store whatever the ESP's seed; the RAM tests accept state 7 |
 
 Host tests (offline, about 10 s in all):
 
@@ -327,9 +333,9 @@ From now on the guard image (`data-persist=2`, any seed) resumes the owner's Dat
 
 **T5, later (cable session): the guard on the installed system.** Build an ESP from a collection with these commits. Keep the
 installed seed and trust cache, so the plugin stays the one the store has:
-`PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh`, then `build-esp.py --profile daily --default macos --seed
-out/installed/scratch-data.img --trust out/installed/kernel.macho.trustcache`, then `maint-session.py … esp-final …`
-(docs/persistent-boot.md). Once the store is self-contained, the ESP's seed may change; the trust cache rule of section 4 still
+`PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh`, then `build-esp.py --profile daily --default macos` (since section 9 its
+default seed and trust cache are the pinned base's: `--seed base --trust base`), then `maint-session.py … esp-final …`
+(docs/persistent-boot.md §11). Once the store is self-contained, the ESP's seed may change; the trust cache rule of section 4 still
 holds.
 
 **V1, the volatile disk under load (after the 2026-11-11 hangs).** Use the attended desktop image (`ram-attend3`'s arguments:
@@ -371,3 +377,133 @@ not a hang. To see the limit on purpose, add `data-volatile-mib=512` to `PIANO_E
   first `data-persist=2` boot initialises a store there, over the owner's pages. All seeds so far are 12 GiB.
   `build-ram-images.py` and `build-esp.py` refuse `data-persist=2` for any other size (`common.INSTALLED_STORE_PAGES`) unless
   `PIANO_DATA_STORE_RELAYOUT=1` (a deliberate re-layout, with `maint-session.py --store fresh` and a backup first).
+
+## 9. The store's base and the system layer (2026-11-12)
+
+Built and host-tested offline; nothing of it has run on the tablet.
+
+### 9.1 What the seed identity is made of
+
+The identity (`SeedDisk.h seedIdentity`, `common.seed_info`) is SHA-256 over `SHNGSEED2`, the logical size, and every nonzero
+4 KiB page of the 12 GiB Data disk with its index. The disk is one APFS container with the volume Data. Every byte of it counts:
+
+| Layer | What | Where it comes from |
+|---|---|---|
+| input seed | the Data volume of the macOS 27.0.1 install (users, preferences, `settime.sh` and its boot job `org.droidvm.run.0`) | `out/inputs/scratch-data.img`, identity `469ed440…` |
+| Metal plugin | `/Library/GPUBundles/NativeAdrenoMetal.bundle`: `Contents/Info.plist`, `MacOS/NativeAdrenoMetal` (plugin, frontend, Rust bridge), `MacOS/libvulkan_freedreno.dylib` (Turnip) | `tooling/metal/build-turnip-a830.sh`, staged by `tooling/k27/stage-soft-metal.py` |
+| debug file | `/private/var/ngpu/debug/tu-debug` (`PIANO_A830_TU_DEBUG`, default `sysmem`) | `build-native-image.sh` |
+| boot job edits | `--log-errors` loops, Reduce transparency (soft Metal), the userland installer's command | `stage-soft-metal.py`, `tooling/userland/stage.py` |
+| APFS itself | the container superblock, checkpoints, transaction ids, inode times: every staging mounts the volume read-write | the Mac's APFS during the staging |
+
+The plugin is in the seed because IOGPU looks for `<MetalPluginName>.bundle` in `/Library/GPUBundles` first, and `/Library` is on
+Data (section 5). So every plugin build, and every restage even of the same files (APFS writes times and transaction ids), is a new
+identity. A seed is therefore never reproduced: neither from another checkout nor from the same one.
+
+The installed base, `8f3331104e03c970` (file `23a5ec59…`, the daily2 ESP), against tonight's Turnip stage with patch 0006
+(`f6176467…`), measured with `base-seed.py diff`: **3913 pages differ**: page 0 (the container superblock), 4 pages of the checkpoint
+descriptor area, 13 of the checkpoint data area, 11 pages that were zero in the base, and **3884 pages that are in use in the base**.
+Those hold the old `libvulkan_freedreno.dylib`: both stagings start from the same input seed, and APFS put the new dylib (the same
+17678800 bytes) where the old one is.
+
+### 9.2 Why no block-level migration
+
+The store's disk is the store's page where its bitmap bit is set, else the seed's. Two ways to carry a store over to a new seed:
+
+- **Rebase when the store's pages and the changed pages are disjoint.** Every read-write mount writes page 0 and checkpoints, on
+  the tablet as in a staging, so a store's pages and a new seed's changed pages always meet there: the check always refuses.
+  Relaxing it to ignore the superblock and checkpoints is unsound. The 3884 changed pages above are file data that the store's
+  filesystem still refers to (the base's plugin, unless something rewrote it). A store that never rewrote them passes, and the
+  rebased disk then shows the new dylib's bytes under the old file's inode and extents. That happens to be a whole new file here
+  (same size, same place), but in general it is a mix of two filesystems: APFS checksums each metadata block, not a tree against
+  another tree, and file data not at all.
+- **Rebase where the store's pages win** (copy the base's pages the store lacks into it, then relabel). The disk is byte for byte
+  what it was, so it is safe. It also delivers nothing: the store's checkpoint is the filesystem, and the new seed's files sit in
+  its free space, unreachable. Flatten (section 4) already gives the same seed independence.
+
+Files reach an existing Data volume only through its filesystem, on the running system.
+
+### 9.3 The design
+
+1. **The base is immutable.** The store's seed stays its base. `tooling/persist/base-seed.py pin --esp <installed ESP image>`
+   extracts the seed and trust cache with the independent FAT32 reader and checks the identity against `PIANO_INSTALLED_SEED`.
+   It writes them read only to `out/base/<identity16>/` (or `PIANO_BASE_DIR`), and never replaces a base. `common.pinned_base`
+   checks both files' sha256 and the identity again at every use.
+2. **Every ESP that keeps the store carries the base byte for byte.** `build-esp.py --profile daily` takes `--seed base --trust base`
+   by default. The kernel collection, the device tree, the arguments and the trust cache are separate payload files and change
+   freely.
+3. **The files that change are the system layer**: the Metal plugin and our userland. `tooling/userland/stage.py --live DIR
+   --gpu-bundle out/turnip-a830/NativeAdrenoMetal.bundle --installed-trust <the base's trust cache>` builds the bundle
+   (`userland-update.tar`, `apply-update.sh`). The plugin is one more unit, `gpu-nativeadrenometal`, at
+   `/Library/GPUBundles/NativeAdrenoMetal.bundle/...`, root:wheel. `DIR/kernel.macho.trustcache` is the base's trust cache with one
+   module of the layer's new CDHashes first.
+4. **The ESP trusts the layer before the layer is installed**: `build-esp.py --layer DIR` takes `DIR`'s trust cache. It refuses a
+   layer made against another trust cache, and any trust cache that lacks one of the base's CDHashes while the ESP resumes the
+   store, because the resumed Data still has the base's plugin.
+5. **The layer goes in as files**, by `install.sh --live` on the running system (`docs/userland.md` §7):
+   - Each file is replaced by `install -S`, a new file renamed over the old one, so each file is either the old or the new.
+   - Before the installer first takes over a file it did not put there (the base's plugin), it keeps a copy in
+     `/private/var/db/piano-userland/prev/<path>`. Without that copy it does not touch the file.
+   - When the layer drops the unit, the copies go back. Taking the layer out restores the base's files byte for byte.
+
+Why it is safe:
+- The ESP's seed is the store's own, so the guard's existing rule (resume only the store's seed; keep any other untouched, Data
+  volatile) decides as before. Nothing in the kernel changes, and no store is ever relabelled.
+- The trust cache only grows: the base's modules stay as they are, so the base's plugin and the layer's both load, and no binary
+  is ever installed before it is trusted (ESP first, files after).
+- APFS sees only file operations of its own system. The base's files can always be restored.
+- The install session checks the same rule on the tablet: once installed, `maint-session.py map` reads the store at its place,
+  and `esp`/`esp-final` refuse an ESP whose seed is not that store's unless its build record says `--replace-data`
+  (`tooling/persist/test-persist.py`).
+
+What it does not do:
+- **The first layer installation needs root on the running system.** The base's Data has no installer, no USB root shell and no
+  network job: only `settime.sh`. So the first time is the owner's: Terminal, `sudo sh apply-update.sh` with the owner's password
+  (`docs/userland.md` §7.5), over the USB network link (`piano-usb-net=1`). After that, `pianousb-shell` is on Data, and an ESP with
+  `piano-usb-shell=1` gives later updates without the owner. That ESP argument opens an unauthenticated root shell on the cable, so it
+  is the owner's decision.
+- Until the layer is in, the system runs the base's plugin (Turnip without 0006) on the new kernel. The kernel ABI is unchanged
+  (ABI v2, `20ac9298…`). PianoA830's NoResources fix is kernel-side. 0006's BadArgument fix (a device whose connection lands in
+  another slot) waits for the layer.
+- RAM test images keep their staged seeds (`out/turnip-a830/stage`, `out/userland/stage`), which run Data volatile against the
+  installed store as before.
+
+### 9.4 Reproducible from every checkout
+
+The ESP's seed is the pinned base, the same file from every checkout. The layer's plugin must be the same bytes too, since its
+CDHashes are in the trust cache. A worktree on 2026-11-12 built another `libvulkan_freedreno.dylib` (`919c6fb9…` against
+`8c6958ba…`):
+- Its `out/turnip-a830` had been copied from main, build directory included. Meson's coredata still named main's source tree.
+- The `-Dtu-darwin-abi-dir` option names this checkout's `out/turnip-a830/abi`, so it differed and triggered `meson configure`. That
+  regenerated every compile command against main's tree: `../../../../../../out/turnip-a830/mesa/src/...` instead of `../mesa/src/...`.
+- Mesa's `vk_error`/`mesa_log` embed `__FILE__`, so the 51 longer strings moved everything after them.
+
+Builds from fresh worktrees give main's bytes. Another worktree's fresh build that night gave the same dylib. On 2026-11-12, this
+change's own worktree built Mesa from scratch and linked the plugin itself, and all three files equal main's: `NativeAdrenoMetal`
+`d4ffaf27…`, `libvulkan_freedreno.dylib` `8c6958ba…`, `Info.plist` `9595a4d2…`. Its staged test seed did not (`f16615ae…` against
+main's `f6176467…`, with the same staging stamp): APFS again. Two fixes:
+- `build-turnip-a830.sh` sets the build directory up again when meson configured it for another source or build directory.
+- Its step 7, `tooling/metal/check-bundle-paths.py`, stops the build on any string in the bundle that names the checkout, a worktree,
+  or a source path climbing out of `out/turnip-a830`.
+
+It reports but accepts the one machine-dependent path: the plugin's debug map (N_OSO) names the prebuilt bridge archive in the
+k27 tree, the same from every checkout of this Mac. Dropping it (`ld -S`) would change the plugin that runs today, so it is left.
+
+### 9.5 Commands and tests
+
+```sh
+python3 tooling/persist/base-seed.py pin --esp <persist checkout>/out/persistent/esp-daily2-macos.img   # once: out/base/8f3331104e03c970/
+python3 tooling/persist/base-seed.py show                       # checked again
+python3 tooling/persist/base-seed.py diff out/base/8f3331104e03c970/scratch-data.img out/turnip-a830/stage/scratch-data.img
+python3 tooling/userland/stage.py --live out/layer --gpu-bundle out/turnip-a830/NativeAdrenoMetal.bundle \
+        --installed-trust out/base/8f3331104e03c970/kernel.macho.trustcache
+python3 tooling/persist/build-esp.py --profile daily --default macos --layer out/layer ...   # docs/persistent-boot.md section 11
+PIANO_SEED=$(python3 tooling/persist/base-seed.py path) ...      # a RAM image with the base (build-native-image.sh)
+```
+
+Host tests:
+- `tooling/persist/test-data-store.py` part 5: pin from files and from an mtools ESP image, the refusals, a changed base, the daily
+  profile's inputs, `--layer` and its refusals, `check_trust` for a resuming ESP, `diff` on seeds with an APFS superblock.
+- `tooling/userland/test-stage.py` parts 1-2: `--gpu-bundle`, `dest_kind`, and the take-over with a kept copy under `/bin/sh` and
+  `/bin/dash`: an update, the copy kept as the base's, the base's files back, a file the owner changed left alone, and no take-over
+  when no copy can be made.
+- `tooling/metal/check-bundle-paths.py --self-test`.

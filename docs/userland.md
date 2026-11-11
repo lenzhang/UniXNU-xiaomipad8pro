@@ -150,6 +150,10 @@ the same script with `--live`, and `--check` changes nothing.
     without it, it loads. The override's precedence is stock launchd behaviour, needs-boot (U9).
 - **Removal**: `/private/var/db/piano-userland/receipt.tsv` lists what the installer put in place. A file the manifest no longer
   has is removed, its job booted out, when it is unchanged since. Anything else is left (host-tested).
+- **Files it did not put there** (2026-11-12, for the system layer of `data-store.md` §9): before the installer first takes over
+  a file that is in place but not in its receipt (the base seed's Metal plugin, an owner's file), whether it replaces it or adopts
+  the same bytes, it copies it to `/private/var/db/piano-userland/prev/<path>`. It never replaces that copy. When the manifest drops
+  the file, the copy goes back instead of the file being removed. A file whose copy cannot be made is not taken over (host-tested).
 - **SIGHUP is ignored**. Through the USB root shell, a restart of `pianousb-shell` ends that shell but not the installer, and
   the receipt is written before any job is touched.
 - **Lines** go to stdout, which is the kernel log with `stderr-log=1`: `fd1: pid N sh: piano-userland: ...`. They also go to
@@ -204,9 +208,12 @@ An ESP can therefore change it and keep the **installed seed**: the same identit
 kept. `stage.py --live` writes exactly that trust cache: the installed one plus a module of the new CDHashes. It is a superset,
 so `build-esp.py`'s missing-CDHash check (`data-store.md` §4) stays quiet. After a flatten, any seed may go with it.
 
-### 7.2 The bundle: `stage.py --live DIR [--installed-trust FILE]`
+### 7.2 The bundle: `stage.py --live DIR [--installed-trust FILE] [--gpu-bundle BUNDLE]`
 
-The same build and staging tree as section 3, without a seed:
+The same build and staging tree as section 3, without a seed. `--gpu-bundle out/turnip-a830/NativeAdrenoMetal.bundle` adds the Metal
+plugin as one more unit, `gpu-nativeadrenometal`: every file of the bundle at `/Library/GPUBundles/NativeAdrenoMetal.bundle/...`,
+root:wheel, its Mach-Os trusted. That is the system layer of `data-store.md` §9. `live.json` records the sha256 of the trust cache it
+was made against, which `build-esp.py --layer DIR` checks.
 
 - `DIR/staging/`;
 - `DIR/userland-update.tar`: deterministic, root:wheel, time 0, the same bytes on every run (host-tested);
@@ -238,10 +245,12 @@ line with the installed seed.
 ### 7.4 The procedure
 
 1. Run `python3 tooling/userland/stage.py --live out/userland/live --installed-trust <the installed ESP's trust cache>`. That is
-   the persist checkout's copy, for example `out/installed/kernel.macho.trustcache` (`data-store.md` T5).
+   the pinned base's, `"$(python3 tooling/persist/base-seed.py path trust)"` (`data-store.md` §9). Add `--gpu-bundle
+   out/turnip-a830/NativeAdrenoMetal.bundle` when the plugin changed.
 2. If the report lists Mach-Os that are not in the installed trust cache, and L1 said untrusted code is refused:
-   1. Build the ESP with `python3 tooling/persist/build-esp.py --profile daily --default macos --seed <the installed seed>
-      --trust out/userland/live/kernel.macho.trustcache ...`.
+   1. Build the ESP with `python3 tooling/persist/build-esp.py --profile daily --default macos --layer out/userland/live ...`
+      (the daily profile takes the pinned base's seed; `--layer` its trust cache, which build-esp.py checks was made against
+      the base's).
    2. Install it (`USING.md` §5) and reboot. The old files keep working (their modules are kept), and the new CDHashes are
       trusted from this boot on.
    3. Then go on to step 3. This order leaves no moment with an installed binary the kernel does not trust.
@@ -256,7 +265,8 @@ The daily profile has none of the transports yet: no `piano-usb-shell`, no `pian
 first update therefore needs the owner once, with the owner's own password:
 
 1. Build an ESP with the installed seed, the trust cache of 7.4 step 2, and the daily profile's arguments plus
-   `piano-usb-net=1`. It changes only arguments and the trust cache: the same seed, so no Data consequence.
+   `piano-usb-net=1`. It changes only arguments and the trust cache: the same seed, so no Data consequence. Or, without a new ESP,
+   a RAM boot of the installed payload plus `piano-usb-net=1` with `PIANO_DATA_PERSIST=2` (`persistent-boot.md` §11.6).
 2. After its boot, with the owner logged in, run in Terminal: `curl` the two files (7.3), then `sudo sh apply-update.sh`. The
    Mac can type the commands (`piano-input.py`, since the daily profile has `piano-usb-hid=1`). The owner types the password
    (`piano-input.py type --secret`).

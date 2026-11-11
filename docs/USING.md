@@ -48,7 +48,7 @@ tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
 ```
 
 Data caution (`docs/data-store.md`): set `PIANO_INSTALLED_SEED` in `~/.config/piano/env` once (the installed seed is
-`aced5bf9794b42f3c8ffeeef3078a408ff506f5b0b374e02eed6f0ab56e52616`). Then a RAM image whose Data seed is not the installed one
+`8f3331104e03c970…` since the daily2 ESP; `aced5bf9…` before). Then a RAM image whose Data seed is not the installed one
 gets `data-persist=0` by default (Data volatile, the store untouched), and `build-ram-images.py` says so on stderr. A kernel
 collection built from this tree also has the store guard: with `PIANO_DATA_PERSIST=2` and another seed it keeps the installed
 store and runs Data volatile ("kept"). Images built before the guard still start another seed's store over, so never boot one with
@@ -56,16 +56,26 @@ store and runs Data volatile ("kept"). Images built before the guard still start
 
 ## 5. Update the installed ESP
 
+The Data store is a block overlay over one seed, its **base**. Every ESP that keeps the owner's Data carries that seed byte for byte.
+The Metal plugin and our userland change; they are the **system layer**, installed as files on the running system
+(`docs/data-store.md` §9). The current plan, with its exact commands, is `docs/persistent-boot.md` §11 (ESP v3).
+
 1. Build and test the change as a RAM image (§4).
-2. Build the ESP from the same inputs: `python3 tooling/persist/build-esp.py --profile daily --kc ... --adt ... --trust ... --seed ...
-   --default macos --name esp-daily-macos --out out/persistent` (rebuild just before installing: the clock starts from the build time
-   until the RTC is in the profile, `docs/drivers/rtc.md`). A seed other than the installed one does not carry the owner's Data
-   over: build-esp.py prints a loud note, refuses it with a collection that has no store guard, and `--replace-data` is the
-   explicit "start Data over". The way to change the seed without losing Data is a flatten first (`docs/data-store.md` §4, T4);
-   build-esp.py also warns when the new trust cache lacks CDHashes of the installed one.
-3. Tablet to ABL fastboot (§3), then from the persist worktree (steps before options):
-   `python3 tooling/persist/maint-session.py maint-boot map backup esp-final check maint-exit --esp esp-daily-macos.img --esp-final esp-daily-macos.img`
+2. Once: pin the installed base, `python3 tooling/persist/base-seed.py pin --esp <persist checkout>/out/persistent/<installed ESP>.img`.
+   It checks the identity against `PIANO_INSTALLED_SEED`.
+3. If the plugin or the userland changed: `python3 tooling/userland/stage.py --live out/layer --gpu-bundle out/turnip-a830/NativeAdrenoMetal.bundle
+   --installed-trust "$(python3 tooling/persist/base-seed.py path trust)"`.
+4. Build the ESP: `python3 tooling/persist/build-esp.py --profile daily --default macos [--layer out/layer] --name esp-daily<N>-macos
+   --out out/persistent`. The daily profile takes the base's seed and trust cache. `--layer` takes the layer's trust cache, the base's
+   plus the new CDHashes. Rebuild just before installing: the clock starts from the build time until the RTC is in the profile,
+   `docs/drivers/rtc.md`.
+   - Another `--seed` does not carry the owner's Data over: build-esp.py prints a loud note, and the store guard keeps the store and
+     runs Data volatile. `--replace-data` is the explicit "start Data over", the owner's decision.
+   - A trust cache that lacks a CDHash of the base's is refused: the resumed Data still has the base's plugin.
+5. Tablet to ABL fastboot (§3), then from the persist worktree (steps before options):
+   `python3 tooling/persist/maint-session.py maint-boot map backup esp-final check maint-exit --esp esp-daily<N>-macos.img --esp-final esp-daily<N>-macos.img --new-backup`
    then `abl-final reboot`. Every write is preceded by a verified NAS backup and followed by a SHA-256 read-back.
+6. With a layer: install it on the running system (`docs/userland.md` §7; the first time with the owner, `docs/persistent-boot.md` §11.6).
 
 ## 6. Recover
 
