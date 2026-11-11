@@ -128,8 +128,9 @@ sync, fault readout) for PianoDpu (B1b) and PianoVideo, and one registry with a 
 backup) goes onto the ESP (`piano/firmware/qcom/sm8750/vpu35_4v.mbn`, a `build-esp.py` option to add) from the ignored `private/`;
 PianoVideo reads it through NativeUfs + FatVolume (PianoPower's reader), checks size and SHA-256 against the pin and refuses a
 mismatch. Never in this repository or a build output; never disassembled (data for the secure world's loader). Later, an odm_a
-reader would serve video, audio and sensors alike. The load is PianoPower's sequence with PAS 9, through **one SCM lock shared**
-with PianoPower and PianoA830 (no two secure calls at once: the K90's rule, `charging.md` §5a's stall).
+reader would serve video, audio and sensors alike. The load is PianoPower's sequence with PAS 9, holding the **kernel-wide
+secure-call lock** (`../scm-lock.md`, tag `VIDE`) from init_image through auth_and_reset and MP_VIDEO_VAR, and around every other
+request (no two secure calls at once: the K90's rule, `charging.md` §5a's stall); PianoVideo.json then names PianoA830 as a library.
 
 **4.4 The backend's states.** Per instance: the V4L2 state machine (Linux's `iris_state.c/.h` as the specification: deinit, init,
 input streaming, output streaming, streaming, error; sub-states first source change, resolution change and its last buffer, drain
@@ -245,7 +246,7 @@ events (software again) and powers the core off. A hang or reset returns to the 
    'RGhA' framebuffer (`soft-metal.md`); no other route is open within the rules.
 2. The state at XNU time (GCC video AHB, GDSCs, PLL0) and whether VIDEO_CC is readable at the boot rail levels → V0.
 3. SMMU: entries for 0x1940..0x194f, free groups and banks, CTTW → V0; a fresh bank accepted under Gunyah → V3.
-4. PAS 9 from XNU with the owner's file, and the shared SCM lock → V2.
+4. PAS 9 from XNU with the owner's file, under the secure-call lock (`../scm-lock.md`, built 2026-11-11) → V2.
 5. Is the MM1 vote needed (the display uses MM0)? → V1/V3 (a stalled core without it).
 6. The internal buffer sizes (`iris_vpu33_buf_size`) re-derived exactly → V4 (INSUFFICIENT_RESOURCES or an SMMU fault otherwise).
 7. VP9 through the paravirtual protocol (the VM never offered `vp09`) → V6.

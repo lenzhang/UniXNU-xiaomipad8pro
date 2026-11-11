@@ -249,7 +249,8 @@ checked): 1536 MiB with piano's 13 GiB, so the desktop's BOs stay pooled and the
 ## 10. Open questions
 
 1. Does Gunyah on piano keep only ACTLR `0x303` (13T)? (S3 trace + survey after S1.)
-2. Does the SCM path (GPU_INIT_REGS, PAS 13 with piano's ZAP) work from XNU at EL1 on piano? (S2, S7.)
+2. Does the SCM path (GPU_INIT_REGS, PAS 13 with piano's ZAP) work from XNU at EL1 on piano? (S2, S7.) Every SCM request and the
+   ZAP's whole PAS sequence hold the kernel-wide secure-call lock, whose word PianoA830 owns (`../scm-lock.md`, 2026-11-11).
 3. DRV-2 sharing: PianoPower (PianoAdsp's lcx/lmx), PianoWifi and PianoKeyboard (regulators) take `sm8750_rpmh_drv2_owner` around
    every vote now, as PianoA830 does (2026-11-11 tree); none of them votes cx/mx or the DDR BCMs. `piano-gpu-idle=2` sends at run
    time (a vote pair per idle period), so the lock matters more than at the boot's few votes; on the tablet, the TCS lines of each

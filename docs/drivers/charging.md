@@ -489,7 +489,9 @@ is not sinking; all normal with the gauges still negative → image I (the board
   (the 11:11 drain: about -1.8 A per cell under load). If GLINK, the locator or the properties fail, only the WARNING line shows it;
   reboot. A PMIC is not reset by a warm reset: after a failed level 2, check `battery-voltage` before trusting the next boot.
 - **PAS from XNU** is verified on SM8750 for the GPU's ZAP (13T, K90) and for the DSP on the K90; on piano the first attempt
-  stalled the whole system (§5a). A secure-world hang ends in the Gunyah watchdog reset about 30 s later.
+  stalled the whole system (§5a). A secure-world hang ends in the Gunyah watchdog reset about 30 s later. Since 2026-11-11 no
+  secure call of another kext can run inside a PAS sequence or alongside one of ours: every request and each image's whole
+  sequence (`startImage`) hold the kernel-wide secure-call lock (`../scm-lock.md`), PianoA830's word.
   Sm8750Scm's limit of 10000 SMC instructions per request could cut a long authentication short (logged as a status).
 - **Memory:** the top 0x50000 of the adspslpi carveout overlaps our UEFI's DXE heap range (gone after ExitBootServices); the
   images are written there only in level 2.
