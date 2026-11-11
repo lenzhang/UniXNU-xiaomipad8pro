@@ -7,7 +7,9 @@
   usb-console.py --list          what is attached
   usb-console.py --send 'usb'    send one monitor command after opening (repeatable), e.g. with --capture
 
-Every byte received is also written to logs/usb-console/<time>-port<N>.txt (gitignored). Only the Python standard library;
+Every byte received is also written to logs/usb-console/<time>-port<N>.txt (gitignored), and every complete line once more to
+<time>-port<N>.times.txt behind the Mac's clock when it arrived (UTC seconds, 3 decimals, a tab): the reference for the PMIC
+RTC's offset (tooling/native/rtc-offset.py, docs/drivers/rtc.md). Only the Python standard library;
 no root needed (the cu.* nodes are world-accessible). The device is found by its USB product string ("piano macOS debug",
 via ioreg) and the interface names "piano kernel console" / "piano user pipe"; --device overrides.
 """
@@ -102,6 +104,20 @@ def open_port(path):
     return fd
 
 
+class Stamper:
+    """Complete lines, each behind the Mac's time (time.time(), UTC seconds) at which the chunk that ended it arrived."""
+
+    def __init__(self, out):
+        self.out, self.partial = out, b''
+
+    def feed(self, data, now):
+        lines = (self.partial + data).split(b'\n')
+        self.partial = lines.pop()
+        for line in lines:
+            text = line.rstrip(b'\r').decode('utf-8', 'replace')
+            self.out.write(f'{now:.3f}\t{text}\n')
+
+
 def main():
     a = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     a.add_argument('--port', type=int, default=0, choices=(0, 1, 2))
@@ -123,6 +139,7 @@ def main():
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     log_path = args.log_dir / f'{stamp}-port{args.port}.txt'
     log = open(log_path, 'ab', buffering=0)
+    times = Stamper(open(log_path.with_suffix('.times.txt'), 'a', buffering=1))
     interactive = args.capture is None and sys.stdin.isatty()
     deadline = time.monotonic() + args.capture if args.capture is not None else None
     print(f'[usb-console] port {args.port}, log {log_path}' + ('; Ctrl-] quits' if interactive else ''), file=sys.stderr)
@@ -161,6 +178,7 @@ def main():
                         if not data:
                             raise OSError('end of file')
                         log.write(data)
+                        times.feed(data, time.time())
                         sys.stdout.buffer.write(data)
                         sys.stdout.buffer.flush()
                     if interactive and sys.stdin in ready:
@@ -177,6 +195,7 @@ def main():
         if saved is not None:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
         log.close()
+        times.out.close()
 
 
 if __name__ == '__main__':
