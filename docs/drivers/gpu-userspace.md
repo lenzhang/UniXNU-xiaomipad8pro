@@ -15,7 +15,7 @@ Natively it uses its NativeAdreno backend (open type 0x4147) on Adreno830's user
 | Piece | Natively | Source |
 |---|---|---|
 | `Contents/MacOS/NativeAdrenoMetal` (plugin + frontend + bridge) | the VM's plugin and bridge, its frontend with one patch, plus an abort reporter, linked here (CDHash `9c42e844…` since the evening of 2026-11-11; the login run had the VM's binary, `ea549d13…`). The objects are compiled without objc_msgSend selector stubs, which makes the link reproducible | the VM-era plugin (`overlay/metal` of the k27 tree), UniXNU-turnip `drivers/AdrenoMetal` + `tooling/metal/turnip-a830/frontend/`, `tooling/metal/turnip-a830/abort_reporter.mm`, bridge `out/metal/bridge` |
-| `Contents/MacOS/libvulkan_freedreno.dylib` (Turnip) | rebuilt: the VM's Mesa tree, `NativeAdrenoABI.h` v2, 5 patches (CDHash `205e665f…` with 0004/0005; `031df58a…` with 3, `eaa367a2…` with 2 in the login run; cold builds byte-identical) | Mesa `cecc0e9` + 23 VM-era patches (`tooling/metal/UPSTREAM`) + `tooling/metal/turnip-a830/mesa/` |
+| `Contents/MacOS/libvulkan_freedreno.dylib` (Turnip) | rebuilt: the VM's Mesa tree, `NativeAdrenoABI.h` v2, 6 patches (CDHash `5efbe639…` with 0006; `205e665f…` with 0004/0005, `031df58a…` with 3, `eaa367a2…` with 2 in the login run; cold builds byte-identical) | Mesa `cecc0e9` + 23 VM-era patches (`tooling/metal/UPSTREAM`) + `tooling/metal/turnip-a830/mesa/` |
 | `Contents/Info.plist` | the VM's (`org.droidvm.NativeAdrenoMetal`, a legacy bundle identifier kept as staged; principal class `NativeAdrenoMetalDevice`) | |
 
 The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
@@ -41,6 +41,12 @@ The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
   `TU_DEBUG` and wins over the seed's `tu-debug` file; `piano-tu-debug=none` means none at all (Turnip picks GMEM or sysmem per
   render pass). WindowServer says which: `TU: info: TU_DEBUG=sysmem from /private/var/ngpu/debug/tu-debug` or `... from boot
   argument piano-tu-debug`. The sysmem/GMEM A/B is two boot lines over one seed (below).
+- `0006-turnip-darwin-device-window.patch` (2026-11-12): the enumeration probe's connection reads GetDeviceInfo's GPU window and closes;
+  the device's own connection can land in another slot with another window (the first desktop, run attend4: `Installer Progress` and
+  `MenuBarAgent` in slot 5, every BoMap BadArgument, no Metal device). The device now takes its own connection's window before its
+  address heap is seeded, and says so once: `TU: error: NativeAdreno: this device's GPU window is 0x... + 0x..., the enumeration
+  probe's was 0x... + 0x... (another slot); the device takes its own` (not an error: a note that it happened). gpu.md §8, "The first
+  desktop's address space".
 
 The frontend patch (`tooling/metal/turnip-a830/frontend/0001-…patch`, applied after the k27 tree's `scripts/piano-frontend-patch.py`): the
 stderr copy of its `NBLOG` lines is rate-limited per call site (8 lines, then the 16th, 32nd, … with the count); `no device answer`
@@ -101,7 +107,9 @@ Result 2026-11-11, all pass:
 - Added in the evening (all pass): `plugin_host` also runs a desktop session's extras (a heap with placed resources, a 4x MSAA pass
   with resolve, a concurrent compute encoder, a shared event signalled by a command buffer, 24 panel-sized 3200x2136 IOSurfaces
   rendered into and released one after another with no kernel object left behind, an 8192x4096 texture), also as a small-slot client
-  (`plugin_host-slot4`: `HOSTSIM_SLOT=4`, a 124 MiB window, so every import's GPU range must come back); `abort_reporter-abort`,
+  (`plugin_host-slot4`: `HOSTSIM_SLOT=4`, a 124 MiB window, so every import's GPU range must come back), and since 2026-11-12 with
+  the device's connection in another slot than the probe's (`plugin_host-reslot`: `HOSTSIM_SLOT=4 HOSTSIM_SLOT_REOPEN=5`; Turnip 0006
+  passes it, the 0001-0005 Turnip fails it as the tablet did); `abort_reporter-abort`,
   `-exception` and `-fault` (`reporter_host.mm`): the plugin's abort reporter reports and the process still dies with SIGABRT, SIGABRT
   and SIGSEGV.
 
@@ -474,3 +482,22 @@ minute is `gpu DEVICE LOST` (the GPU stays off until the next boot). A WindowSer
 WindowServer ...`, then the login window). What to keep from such a run: the three snapshot lines (where BR stood: the same IB1 in
 every hang points at one pass), the culprit's process, the `clients` line before it, and whether it came with `piano-tu-debug=none`
 or with sysmem. Not a hang: a long pass that ends before 10 s (no recovery line); a page fault (its own line, the process's window).
+
+### The next desktop run (2026-11-12)
+
+What changed since attend4: the shared VM's 524288 table ranges, a 2048 MiB BO pool, macOS's window table (WindowServer 3.5 GiB),
+Turnip 0006, and the address-space lines (gpu.md §8, "The first desktop's address space"). One image, attend4's boot line plus
+`stderr-log=1` (Turnip's 0006 note and its errors reach the console only with it) and `piano-gpu-hang-ms=10000`:
+
+```sh
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=1200 \
+PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-power=1 piano-keyboard=2 piano-keyboard-gestures=1 piano-backlight=2 piano-backlight-keys=1 exec-log=1 stderr-log=1 piano-gpu-hang-ms=10000" \
+  tooling/k27/build-native-image.sh && rm -rf out/ram-attend5 && cp -R out/ram out/ram-attend5
+tooling/native/native-loop.sh out/ram-attend5/boot-piano-macos-ram-A-bundled.img
+```
+
+The new Turnip makes a new seed identity: a `data-persist=2` store of another seed is left alone (Data volatile for this run, as the
+store guard does). What to look for: `board: BO pool 2048 MiB` (or `1024` if S3 had to halve it), no `gpu call failed: ... BoMap`;
+if one comes, the `gpu BoMap refused ...` line after it names the limit or the argument; the `gpu va/map` lines' ranges and each
+window's `pk` against its size, at the login screen and as apps open; in the processes that had slot 5, a `TU: error: NativeAdreno:
+this device's GPU window ...` note at most, and a device; NativeGopDisplay's `N gave up after 50 ms` (the flicker's source, gpu.md §8).

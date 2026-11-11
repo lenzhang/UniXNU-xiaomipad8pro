@@ -75,7 +75,7 @@ kernel side must provide (2026-11-11).
 | `piano-gpu-trace=0/1/2/3` | 1 at N=2 | the register trace: every access and SMC before it is made; 0 off, 1 runs counted, 2 verbatim, both printed by the logger thread from a ring (with `-v` it can lag the driver by the whole bring-up); 3 runs counted and printed synchronously by the thread making the access, before it, with each line's uptime, plus a heartbeat line every second ([../forensics-2026-11-11.md](../forensics-2026-11-11.md)); slow with `-v` (tens of seconds for S1..S10) |
 | `piano-gpu-status=0..3` | 2 at N=2 | status rows (2: the diagnostic page) |
 | other `piano-gpu-*`, `piano-screenoff`, `piano-diag` | driver's | Adreno830's `pagani-*` knobs renamed (README of `package/PianoA830/adreno830`), e.g. `piano-gpu-profile`, `piano-gpu-dcvs-max` |
-| `piano-gpu-pool=<MiB>` | an eighth of the RAM, 512..1536 (1536 on piano) | the write-combined BO pool S3 reserves (halved until it succeeds, 64..2048); §8, "The BO pool" |
+| `piano-gpu-pool=<MiB>` | a quarter of the RAM, 512..2048 (2048 on piano: XNU reports 8192 MiB) | the write-combined BO pool S3 reserves (halved until it succeeds, 64..2048); §8, "The BO pool" |
 | `piano-gpu-metal-opens=<n>` | 0 (no limit) | connections ever granted to the plugin |
 | `piano-gpu-hang-ms=<ms>` | 0 (2000) | the time without progress (fence, ring read pointer, BR's IB1) the fence and recovery watchdogs call a hang, 1000..60000; 10000 for the first desktop sessions ([gpu-userspace.md](gpu-userspace.md), desktop section) |
 | `piano-gpu-idle=0/1/2` | 1 | the GPU's idle power (§8, "GPU idle power"): 0 as before; 1 the DCVS floor (no wake boost, a 250 ms window while idle at 160 MHz, no touch pre-wake); 2 also the boot DDR vote dropped to the display's floor at S10, the host CX/MX votes lowered after `piano-gpu-idle-ms` quiet, and P1's full slumber |
@@ -330,13 +330,56 @@ ceiling cleared (no slot holds one; #n)`. PianoPolicy can now pass client 1 and 
 **The BO pool (2026-11-11).** The write-combined pool S3 reserves while memory is unfragmented holds the BOs Turnip allocates
 (`BoAlloc`; imported IOSurfaces are not in it): a pooled BO is one span of the GPU's table and needs no page attribute change. What
 does not fit is, as before, a contiguous attempt and then scattered pages: 3 ms a BO and 90-130 ms a surface-sized one of attribute
-changes, one span per 4 KiB page out of the VM's 262144 (int-137 ran out at 65536). The login run used 486 MiB of the 13T board's
+changes, one span per 4 KiB page out of the VM's table ranges (262144 then, 524288 since 2026-11-12; int-137 ran out at 65536). The login run used 486 MiB of the 13T board's
 512 MiB with 6 clients (WindowServer 446 MiB); the desktop adds 15-25 Metal clients (Dock, Finder, SystemUIServer, ControlCenter,
 NotificationCenter, WindowManager, Spotlight, ...) of tens of MiB each and WindowServer's surfaces for them, so most of it would have
-been scattered. The default is now an eighth of the RAM in 256 MiB steps, 512..1536 MiB (`piano_a830_pool_default`, compile-time
-checked): 1536 MiB with piano's 13 GiB, so the desktop's BOs stay pooled and the rest of the RAM stays the system's
-(`board: BO pool 1536 MiB (an eighth of the RAM, 512..1536; RAM N MiB)`; S3 halves it until a reservation succeeds, as before;
-`piano-gpu-pool=<MiB>` wins, 64..2048). The `MEM` row shows pool and use; S3's time grows with the pool (1.0 s for 512 MiB).
+been scattered. The default was then an eighth of the RAM; XNU reports 8192 MiB (`max_mem`), so the first desktop ran with 1024 MiB,
+used 936 of it and had 701 MiB of own BOs outside it (below). Since 2026-11-12 it is a quarter of the RAM in 256 MiB steps,
+512..2048 MiB (`piano_a830_pool_default`, compile-time checked): 2048 MiB on piano (`board: BO pool 2048 MiB (a quarter of the RAM,
+512..2048; RAM 8192 MiB)`; S3 halves it until a reservation succeeds, as before; `piano-gpu-pool=<MiB>` wins, 64..2048). The `MEM`
+row shows pool and use; S3's time grows with the pool (1.0 s for 512 MiB, 1.8 s for 1024).
+
+**The first desktop's address space (2026-11-12, run attend4).** The owner logged in on the A830 for the first time: Dock, the menu
+bar, Finder, Control Center, WallpaperAerials and VTDecoderXPCService among 24 Metal clients, none refused a slot. After a few minutes
+`gpu call failed: WindowServer[146] slot 0 BoMap -> 0xe00002be (NoResources)`, then loginwindow, Dock, Finder and SystemUIServer
+went and WindowServer aborted (`exit: pid 146 WindowServer status 0x6`): back to the login window, again and again. Every boot also
+had `Installer Progress[102] slot 5 BoMap -> BadArgument` and `MenuBarAgent[203] slot 5 BoMap -> BadArgument`. The last `MEM` row
+before it: `pool 1024 used 936 imp 5316 coh 1 vm 1795 sc701 Window:1061+92` (imp: the VM's mapping records; vm: MiB mapped; sc: own
+BOs outside the pool; WindowServer 1061 MiB of own BOs and 92 of imports). What the code says:
+- **NoResources**: for the render server (no reserve) a BoMap can only run out of the shared VM's mapping records (5316 of 32768:
+  not those) or of its table ranges, 262144 of them, one per physically contiguous run. A pooled BO is one range; a scattered BO or an
+  import is about one per 4 KiB page: 701 MiB outside the pool plus the imports is about 200 000 ranges, and a 64 MiB Metal heap
+  block is 16384 more. Fixed three ways: the table holds 524288 ranges (`NativeAdrenoVmMaxSpans`, 20 MiB of records), the pool is 2
+  GiB (above), and the next run says which limit with its figures (below).
+- **BadArgument**: the window check (`ovf 2` in the meter line). Turnip opens a probe connection for GetDeviceInfo, keeps its window
+  and closes it; the device's own connection can get another slot (both failures were in slot 5) with another window, and every BoMap from the
+  probe's window falls outside the device's. Fixed in Turnip (gpu-userspace.md, 0006): the device takes its own connection's window.
+  On the host the old Turnip fails exactly so (`kernel BoMap failed: 0xe00002c2`, no device) and 0006 passes (the reslot run).
+- **The windows**: WindowServer had 1153 MiB in its 1536 MiB window and iconservicesagent 490 MiB in its 512 MiB large one (Turnip
+  refuses an address range on its own side when a window is full: VK_ERROR_OUT_OF_DEVICE_MEMORY, no kernel line), while no small client
+  passed 77 MiB of its 448. macOS's 16 GiB table since: slot 0 0x20000000 + 3.5 GiB (up to 4 GiB), slots 1-3 768 MiB from 4 GiB,
+  slots 4-31 320 MiB (5 up to 8 GiB, 12 from 8 GiB, 11 from 12 GiB, the last up to 0x3FFFFE000), none across a multiple of 4 GiB.
+- **No unmap leak**: freeBo is the one unmap, and Turnip retries a Busy free from its deferred list; the objects followed the clients
+  (6 at the login screen, 1950 with 9 clients, 5316 with 24). The new lines below show it per connection.
+
+The new lines: after a refused BoMap's `call failed` line, why: `gpu BoMap refused by the VM: table ranges full, 16384 needed, 11200
+free of 524288 (iova 0x..., 65536 KiB in 16384 ranges)`, `... mapping records full, N of 32768`, `... the render server's reserve,
+...`, `gpu BoMap refused: iova 0x... + N KiB ends past this connection's window 0x...-0x...`, `... the request: permissions ...
+writeback ... shareability ...`, `... handle 0x... is no live object`; and every 30 s while anything changed, and at the next tick
+after a refusal, `gpu va/map: VM 5316/32768 records, 231002/524288 ranges (44.0%), 1795 MiB mapped; pool 936/2048 MiB, 701 MiB
+outside it` with `gpu va/map: 0:WindowServer 1153/3584M pk1290 3120o 150kr 1:iconservicesag ...` (mapped MiB / window MiB, the
+highest end reached in the window, mapping records, table ranges). Read the trend: ranges climbing toward the capacity, a window's
+`pk` near its size, records near 32768.
+
+**The login screen's flicker and white bands (GPU side).** NativeGopDisplay copies WindowServer's frame into the framebuffer after
+the GPU's fence of the newest job handed out when the swap was programmed, at most 50 ms; then it copies anyway. In attend4 its 10 s
+lines show `6 gave up after 50 ms` in the first window of the login screen and 1-4 in many later ones (7-8 a run, in the 11-11 runs
+without the idle levels as well): each such copy takes a frame the GPU has not finished, i.e. cleared but not yet drawn regions, white
+bands in a sysmem render pass that draws top to bottom. The ring is in order, so the wait covers every client's earlier work (the
+wallpaper's decoder, an app) and the frames run at 160-342 MHz (the annibale ceiling). From the GPU side the fix belongs to the copy:
+never show a frame whose fence has not passed (keep the previous one and copy at the next tick, or wait longer), and hand a swap's
+surface back to WindowServer only after its copy (a buffer re-rendered while it is being read gives the same bands). Faster frames
+help too: GMEM rendering (`piano-tu-debug=none`, gpu-userspace.md) and a higher ceiling once thermals allow.
 
 ## 9. Fallback
 
