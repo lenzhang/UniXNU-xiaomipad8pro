@@ -53,6 +53,7 @@ typedef struct {
     int64_t scm_x0;
     uint64_t scm_x1;
     uint32_t qrtr_stage, qrtr_requests, qrtr_answers, qrtr_services;
+    uint32_t fatal;         /* FATAL reports from the DSP since the start */
     char text[96];          /* the firmware path that failed, the crash reason or the channels nobody serves */
 } PianoAdspStatus;
 void piano_adsp_status(PianoAdspStatus *out);
@@ -71,6 +72,9 @@ enum PianoAdspStage {
 /* The IPC router's link and service locator (PianoQrtr.c): registered before the DSP starts. */
 void piano_qrtr_start(void);
 void piano_qrtr_counters(uint32_t *stage, uint32_t *requests, uint32_t *answers, uint32_t *services);
+/* The charger domain's state as the DSP's service registry reports it (Servreg.h): 0 unknown, 0x1fffffff up, ...; *ups (optional)
+ * counts its transitions to up, one per charger generation. */
+uint32_t piano_qrtr_charger_pd(uint32_t *ups);
 
 /* The firmware files (PianoAdspFirmware.c). */
 int piano_fw_open(const char *path, void **handle, uint64_t *size);

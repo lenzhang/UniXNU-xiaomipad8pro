@@ -11,7 +11,8 @@ D=$(cd "$(dirname "$0")/../.." && pwd)
 P=$D/package/PianoPower
 T=$D/out/native-kexts/PianoPower/host-tests; mkdir -p "$T"
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/PianoMca.c" -o "$T/PianoMca.o"
-"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/power_host.cpp" "$T/PianoMca.o" -o "$T/power_host"
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/QcomQrtr.c" -o "$T/QcomQrtr.o"   # the QMI helpers Servreg.h uses
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/power_host.cpp" "$T/PianoMca.o" "$T/QcomQrtr.o" -o "$T/power_host"
 "$T/power_host" || { echo "Error: PianoPower host tests failed" >&2; exit 1; }
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/battery_host.cpp" -o "$T/battery_host"   # BatteryMap.h (piano-power-ps)
 "$T/battery_host" || { echo "Error: PianoPower battery host tests failed" >&2; exit 1; }

@@ -34,6 +34,7 @@
 #include "ChargerPmic.h"
 #include "Gauge.h"
 #include "PianoBattery.h"
+#include "Servreg.h"
 #include "RtcReadout.h"
 extern "C" {
 #include "PianoAdsp.h"
@@ -50,7 +51,7 @@ volatile int32_t piano_power_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor;
+  uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor, board;
   bool hasRtcOffset;
   uint32_t rtcOffset;
 };
@@ -73,6 +74,7 @@ void readArgs()
   gArgs.write = bootArg("piano-power-write", 1);
   gArgs.hv = bootArg("piano-power-hv", 0);
   gArgs.unsuspend = bootArg("piano-power-unsuspend", 0);
+  gArgs.board = bootArg("piano-power-board", 1);   // the stock board configuration at level 2 with writes (PianoMca.h)
   gArgs.ps = bootArg("piano-power-ps", 0);            // the battery for macOS (PianoBattery.cpp)
   gArgs.psFloor = bootArg("piano-power-ps-floor", 0); // the lowest percentage shown on battery (BatteryMap.h)
   if (gArgs.psFloor > 50) gArgs.psFloor = 50;
@@ -214,6 +216,10 @@ class PianoPower : public IOService {
   uint32_t fDropped = 0;
   volatile uint32_t fLinkUp = 0, fLinkChanged = 0;
   bool fWasUp = false;
+  // the charger_pd gate (serviceMca): the channel's state, since when, whether the 60 s fallback was taken, the generation linked
+  bool fChannelUp = false, fGateTimedOut = false;
+  uint64_t fChannelSinceMs = 0;
+  uint32_t fPdUpsLinked = 0;
   uint64_t fRequestDue = 0, fPanDue = 0, fCycleDue = 0, fReadyWarnDue = 0;
   uint64_t fStartMs = 0;
 
@@ -229,6 +235,7 @@ class PianoPower : public IOService {
   void logMcaEvents();
   void mcaLine(char *line, size_t size);
   void diagLine(char *line, size_t size);
+  void diagPortLine(char *line, size_t size);
   void publishBattery(uint64_t t, const PortState *port);
   void run();
   static void thread(void *self, wait_result_t);
@@ -409,6 +416,27 @@ void PianoPower::mcaLine(char *line, size_t size)
 // The input path as the firmware reports it, logged after every cycle of the first minute (and then with each report): the three
 // properties that can hold the input off whatever the limit says, the decoded charger status, and whether the DSP has sent any
 // USB-C port notification at all. Read only: nothing here writes.
+// The port as the firmware sees it, the board configuration read back, the charger domain and the gauges (docs/ubuntu-history/
+// device.md §3.1): a DSP that believes it sources, or is stuck in an adapter authentication, explains a live bus with no input.
+void PianoPower::diagPortLine(char *line, size_t size)
+{
+  const PianoMca &m = fMca;
+#define HAS(f) piano_mca_has(&m, f)
+#define VAL(f) (HAS(f) ? m.value[f] : -1)
+  uint32_t ups = 0;
+  const uint32_t pd = piano_qrtr_charger_pd(&ups);
+  const int termRaw = VAL(McaTermVolt);
+  snprintf(line, size,
+           "diag port: verify (0x21002) %d, OTG boost (0x200d) %d, OTG gate (0x200e) %d, Type-C mode (0x21015) %d, sink/source "
+           "(0x21022) %d, usb type (0x20001) %d, float (0x2007) %d = %d mV; board: CP state (0x201c) %d, CID (0x201b) %#x, OTG "
+           "(0x201a) word 0 %d, sent %#x%s; charger_pd %s (generation %u); battery (gauges) %d mA",
+           VAL(McaVerify), VAL(McaOtgBoost), VAL(McaOtgGate), VAL(McaTypecMode), VAL(McaSnkSrc), VAL(McaUsbType), termRaw,
+           HAS(McaTermVolt) ? (termRaw + 3600) / 2 : -1, VAL(McaCpState), (uint32_t)VAL(McaCidCfg), VAL(McaOtgCfg), m.board_done,
+           m.board_allowed ? "" : " (off)", servreg_state_name(pd), ups, fBattery.ok ? fBattery.currentMa : 0);
+#undef VAL
+#undef HAS
+}
+
 void PianoPower::diagLine(char *line, size_t size)
 {
   const PianoMca &m = fMca;
@@ -493,15 +521,17 @@ void PianoPower::report()
   if (gArgs.level >= 2) {
     PianoAdspStatus s;
     piano_adsp_status(&s);
-    note("[%llus] adsp: stage %d (%s)%s, slave-kernel %d, %u doorbells, GLINK %u in %u out, channels %#x%s, qrtr %u (%u asked, %u "
-         "answered, %u services)%s%s",
-         t, s.stage, piano_adsp_stage_name(s.stage), s.stage < 0 ? " FAILED" : "", s.slave, s.doorbells, s.glink_in, s.glink_out,
+    note("[%llus] adsp: stage %d (%s)%s, slave-kernel %d, %u fatal, %u doorbells, GLINK %u in %u out, channels %#x%s, qrtr %u (%u "
+         "asked, %u answered, %u services)%s%s",
+         t, s.stage, piano_adsp_stage_name(s.stage), s.stage < 0 ? " FAILED" : "", s.slave, s.fatal, s.doorbells, s.glink_in, s.glink_out,
          s.channels_up, s.broken ? " BROKEN" : "", s.qrtr_stage, s.qrtr_requests, s.qrtr_answers, s.qrtr_services,
          s.text[0] ? ", " : "", s.text);
     char line[520];
     mcaLine(line, sizeof line);
     note("[%llus] %s", t, line);
     diagLine(line, sizeof line);
+    note("[%llus] %s", t, line);
+    diagPortLine(line, sizeof line);
     note("[%llus] %s", t, line);
   } else {
     PianoAdspSurvey s;
@@ -538,6 +568,7 @@ void PianoPower::startCharger()
 {
   piano_mca_init(&fMca, gArgs.write ? 1 : 0, gArgs.hv != 0);
   piano_mca_allow_unsuspend(&fMca, gArgs.unsuspend != 0);
+  piano_mca_allow_board(&fMca, gArgs.board != 0);
   if (fBattery.ok) piano_mca_battery_temperature(&fMca, 1, fBattery.tempDeciC / 10);
   static const PianoAdspClient client = {&PianoPower::channelState, &PianoPower::channelReceive};
   fChannel = piano_adsp_channel("PMIC_RTR_ADSP_APPS", 1024, 4, 0, &client, this);
@@ -565,10 +596,14 @@ void PianoPower::logMcaEvents()
   if (e & McaEvHvOn) note("mca: the bus is at %d mV: 9 V on", m.value[McaBusVoltage] / 1000);
   if (e & McaEvHvBlocked) note("mca: 9 V not reached or lost: 5 V until the source is detached");
   if (e & McaEvRefused) note("mca: a write outside the allowed set was refused (%u so far)", m.refused);
+  if (e & McaEvBoardDone) note("mca: board configuration taken (CP state, OTG configuration, CID): the policy follows");
+  if (e & McaEvBoardGaveUp) note("mca: board configuration not taken after 5 cycles (sent %#x): the policy goes on without it", m.board_done);
   if (e & McaEvWrite) {
     const char *what = m.last_property == PIANO_MCA_ICL ? "input limit" : m.last_property == PIANO_MCA_FCC ? "charge current"
                        : m.last_property == PIANO_MCA_CHARGE_ENABLE ? "charge enable" : m.last_property == PIANO_MCA_PD_FIXED ? "PD fixed request"
-                       : m.last_property == PIANO_MCA_INPUT_SUSPEND ? "input suspend" : "property";
+                       : m.last_property == PIANO_MCA_INPUT_SUSPEND ? "input suspend" : m.last_property == PIANO_MCA_CP_STATE ? "CP state"
+                       : m.last_property == PIANO_MCA_OTG_CFG ? "OTG configuration" : m.last_property == PIANO_MCA_CID_CFG ? "CID configuration"
+                       : "property";
     note("mca: write %s (%#x) = %u: %s (%d)", what, m.last_property, m.last_value,
          m.last_result == 0 ? "ok" : m.last_result == -60 ? "no answer" : "refused by the firmware", m.last_result);
   }
@@ -596,15 +631,40 @@ void PianoPower::pumpMca(uint64_t now)
 void PianoPower::serviceMca(uint64_t now)
 {
   if (!fChannel) return;
+  // The channel, then the gate: like every Linux pmic_glink client, nothing is sent until msm/adsp/charger_pd reports up on the DSP's
+  // service registry (PianoQrtr.c); without any answer for 60 s after the channel came up, the codec starts anyway (logged). Each
+  // new charger generation (charger_pd up again) links the codec afresh, so the board configuration, the port enable and the
+  // policy are all sent again (the firmware is back on its defaults; Ubuntu #18 needed the same re-send to recover).
   if (__atomic_exchange_n(&fLinkChanged, 0u, __ATOMIC_ACQ_REL)) {
     const bool up = __atomic_load_n(&fLinkUp, __ATOMIC_ACQUIRE) != 0;
-    if (up != fWasUp) {
-      note("mca: PMIC_RTR_ADSP_APPS %s", up ? "up: reading the charger properties" : "down");
-      piano_mca_link(&fMca, up);
-      fRequestDue = fPanDue = 0;
-      fCycleDue = now + 5000;
-      fWasUp = up;
+    if (up != fChannelUp) {
+      note("mca: PMIC_RTR_ADSP_APPS %s", up ? "up: waiting for msm/adsp/charger_pd to report up" : "down");
+      fChannelUp = up;
+      fChannelSinceMs = now;
+      fGateTimedOut = false;
     }
+  }
+  uint32_t ups = 0;
+  const uint32_t pd = piano_qrtr_charger_pd(&ups);
+  const bool pdUp = pd == SERVREG_STATE_UP;
+  if (fChannelUp && !pdUp && !fGateTimedOut && now - fChannelSinceMs >= 60000) {
+    fGateTimedOut = true;
+    note("mca: no 'up' from msm/adsp/charger_pd 60 s after the channel (state %s): starting without it", servreg_state_name(pd));
+  }
+  const bool ready = fChannelUp && (pdUp || fGateTimedOut);
+  if (ready && fWasUp && pdUp && ups != fPdUpsLinked) {
+    note("mca: msm/adsp/charger_pd up again (generation %u): sending everything again", ups);
+    piano_mca_link(&fMca, 0);
+    fWasUp = false;
+  }
+  if (ready != fWasUp) {
+    note("mca: %s", ready ? (pdUp ? "msm/adsp/charger_pd is up: reading the charger properties" : "reading the charger properties")
+                          : "the charger is not reachable now: requests stop");
+    piano_mca_link(&fMca, ready);
+    fRequestDue = fPanDue = 0;
+    fCycleDue = now + 5000;
+    fWasUp = ready;
+    fPdUpsLinked = ups;
   }
   for (;;) {
     uint8_t data[PIANO_ADSP_MAX_MESSAGE];
@@ -631,6 +691,8 @@ void PianoPower::serviceMca(uint64_t now)
       // The input-path diagnostic after every cycle of the first minute (12 cycles of 5 s), then with each report.
       if (fMca.cycles <= 12) {
         diagLine(line, sizeof line);
+        note("[%llus] %s", (nowMs() - fStartMs) / 1000, line);
+        diagPortLine(line, sizeof line);
         note("[%llus] %s", (nowMs() - fStartMs) / 1000, line);
       }
     }

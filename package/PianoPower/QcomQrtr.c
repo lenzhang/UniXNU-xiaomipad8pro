@@ -47,6 +47,7 @@ static int control(QcomQrtr *q, uint32_t command, const uint32_t words[4])
 
 static void announce(QcomQrtr *q, unsigned i)
 {
+    if (!q->local[i].service) return;  /* a client port (qcom_qrtr_add_client): it receives answers, it is not a server */
     const uint32_t words[4] = {q->local[i].service, q->local[i].instance, q->local_node, q->local[i].port};
     control(q, QCOM_QRTR_NEW_SERVER, words);
 }
@@ -59,6 +60,11 @@ int qcom_qrtr_add_service(QcomQrtr *q, uint32_t service, uint32_t instance, uint
     q->local[i].receive = receive; q->local[i].context = context;
     if (q->hello_received) announce(q, i);
     return 0;
+}
+
+int qcom_qrtr_add_client(QcomQrtr *q, uint32_t port, QcomQrtrReceive receive, void *context)
+{
+    return qcom_qrtr_add_service(q, 0, 0, port, receive, context);
 }
 
 void qcom_qrtr_start(QcomQrtr *q)

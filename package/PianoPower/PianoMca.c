@@ -24,9 +24,21 @@ static const struct {uint32_t property; uint8_t pd;} kFields[McaFields] = {
     [McaInputSuspend] = {PIANO_MCA_INPUT_SUSPEND, 0},
     [McaAiclEnable] = {PIANO_MCA_AICL_ENABLE, 0},
     [McaAiclStatus] = {PIANO_MCA_AICL_STATUS, 0},
-    [McaVerify] = {PIANO_MCA_VERIFY, 1},
+    [McaOtgBoost] = {PIANO_MCA_OTG_BOOST, 0},
+    [McaOtgGate] = {PIANO_MCA_OTG_GATE, 0},
+    [McaTypecMode] = {PIANO_MCA_TYPEC_MODE, 0},
+    [McaSnkSrc] = {PIANO_MCA_SNK_SRC, 0},
+    [McaUsbType] = {PIANO_MCA_USB_TYPE, 0},
+    [McaTermVolt] = {PIANO_MCA_TERM_VOLT, 0},
+    [McaCpState] = {PIANO_MCA_CP_STATE, 0},
+    [McaOtgCfg] = {PIANO_MCA_OTG_CFG, 0},
+    [McaCidCfg] = {PIANO_MCA_CID_CFG, 0},
+    [McaVerify] = {PIANO_MCA_VERIFY, 0},   /* always: a stuck adapter authentication holds the bus at 5 V (Ubuntu #20) */
     [McaPdos] = {PIANO_MCA_PDOS, 1},
 };
+
+/* piano's OTG configuration (PIANO_MCA_OTG_CFG): the charger boost, the PMIC GPIO controller, no external GPIOs. */
+static const uint32_t kOtgConfig[4] = {0, 1, 0xffffffffu, 0xffffffffu};
 
 static void put32(uint8_t *p, uint32_t v) {p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);}
 static uint32_t le32(const uint8_t *p) {return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;}
@@ -37,7 +49,7 @@ static int is_pd(int type) {return type == PIANO_MCA_TYPE_PD || type == PIANO_MC
 /* The properties whose payload is one byte, not four. */
 static int one_byte(unsigned field)
 {
-    return field == McaChargeEnable || field == McaInputSuspend || field == McaAiclEnable;
+    return field == McaChargeEnable || field == McaInputSuspend || field == McaAiclEnable || field == McaCpState;
 }
 
 void piano_mca_init(PianoMca *m, unsigned policy, int hv_allowed)
@@ -67,6 +79,7 @@ void piano_mca_link(PianoMca *m, int up)
     if (!up) {m->pan_enable = 0; return;}
     m->links++;
     m->icl_set = m->fcc_set = 0;   /* a started firmware is on its defaults */
+    m->board_done = m->board_tries = 0;   /* and has to be told the board again */
     m->attached = 0;
     reset_attach(m);
     m->pan_enable = 1;
@@ -105,6 +118,9 @@ int piano_mca_write_allowed(uint32_t property, uint32_t value, uint8_t bytes)
     case PIANO_MCA_FCC: return bytes == 4 && value >= 100 && value <= PIANO_MCA_FCC_9V;
     case PIANO_MCA_CHARGE_ENABLE: return bytes == 1 && value == 1;
     case PIANO_MCA_INPUT_SUSPEND: return bytes == 1 && value == 0;   /* only ever un-suspended, never suspended */
+    case PIANO_MCA_CP_STATE: return bytes == 1 && value == 1;
+    case PIANO_MCA_CID_CFG: return bytes == 4 && value == PIANO_MCA_CID_VALUE;
+    case PIANO_MCA_OTG_CFG: return bytes == 16 && value == 0;         /* the payload is kOtgConfig, never the caller's */
     case PIANO_MCA_PD_FIXED: return bytes == 4 && (value == 5000 || value == 9000);
     default: return 0;
     }
@@ -123,6 +139,7 @@ uint32_t piano_mca_next(PianoMca *m, uint8_t out[PIANO_MCA_REQUEST_BYTES])
             put32(out + 12, property);
             put32(out + 16, ++m->seq);
             if (bytes == 1) out[20] = (uint8_t)value;
+            else if (bytes == 16) for (unsigned w = 0; w < 4; ++w) put32(out + 20 + 4 * w, kOtgConfig[w]);
             else put32(out + 20, value);
             m->sent_property = property;
             m->sent_opcode = PIANO_MCA_OP_WRITE;
@@ -240,9 +257,27 @@ static void hv_step(PianoMca *m, int type)
     }
 }
 
+#define BOARD_TRIES 5
+/* The stock board configuration before any policy write; true while it is still being sent (the policy waits a cycle). */
+static int board(PianoMca *m)
+{
+    if (!m->board_allowed || m->board_done == 7) return 0;
+    if (m->board_tries >= BOARD_TRIES) {
+        if (m->board_tries == BOARD_TRIES) {m->board_tries++; m->events |= McaEvBoardGaveUp;}
+        return 0;
+    }
+    m->board_tries++;
+    if (!(m->board_done & 1)) queue_write(m, PIANO_MCA_CP_STATE, 1, 1);
+    if (!(m->board_done & 2)) queue_write(m, PIANO_MCA_OTG_CFG, 0, 16);
+    if (!(m->board_done & 4)) queue_write(m, PIANO_MCA_CID_CFG, PIANO_MCA_CID_VALUE, 4);
+    return 1;
+}
+
 static void policy(PianoMca *m)
 {
-    if (!m->policy || !piano_mca_has(m, McaBusVoltage)) return;
+    if (!m->policy) return;
+    if (board(m)) return;
+    if (!piano_mca_has(m, McaBusVoltage)) return;
     const int attached = m->value[McaBusVoltage] > ONLINE_UV;
     if (!attached) {
         if (m->attached) {
@@ -339,6 +374,11 @@ void piano_mca_allow_unsuspend(PianoMca *m, int allow)
     m->unsuspend_allowed = m->policy && allow;
 }
 
+void piano_mca_allow_board(PianoMca *m, int allow)
+{
+    m->board_allowed = m->policy && allow;
+}
+
 void piano_mca_battery_temperature(PianoMca *m, int valid, int32_t celsius)
 {
     m->ext_tbat_valid = valid != 0;
@@ -395,6 +435,11 @@ int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length)
              * enable bit is not: if the firmware clears it again, it means to. */
             m->writes_ok++;
             if (property == PIANO_MCA_ICL) {m->icl_set = value; m->icl_tries = 0;}
+            const uint8_t bit = property == PIANO_MCA_CP_STATE ? 1 : property == PIANO_MCA_OTG_CFG ? 2 : property == PIANO_MCA_CID_CFG ? 4 : 0;
+            if (bit && m->board_done != 7) {
+                m->board_done |= bit;
+                if (m->board_done == 7) m->events |= McaEvBoardDone;
+            }
             if (property == PIANO_MCA_FCC) {m->fcc_set = value; m->fcc_tries = 0;}
         } else {
             m->writes_failed++;

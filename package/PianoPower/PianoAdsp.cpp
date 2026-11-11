@@ -87,7 +87,7 @@ void wr(const Window &w, uint64_t at, uint32_t value) {*reinterpret_cast<volatil
 
 // ---- status for the owner's report ----
 volatile int32_t gStage, gError, gSlaveBits = -1;
-volatile uint32_t gDoorbells, gReadyMs, gAdspKib;
+volatile uint32_t gDoorbells, gReadyMs, gAdspKib, gRestarts;
 int64_t gScmX0;
 uint64_t gScmX1;
 char gText[96];
@@ -634,7 +634,14 @@ void serviceSmp2p() {
     if (value != gSlave) say("slave-kernel bits %#x", value);
     gSlave = value;
     gSlaveBits = (int32_t)value;
-    if ((changed & value & kFatal)) noteCrash();
+    if ((changed & value & kFatal)) {
+        // Every DSP crash puts the charger back on its defaults (Ubuntu #3: a sensor-framework loop restarted the ADSP about 8
+        // times a minute; natively nothing serves the sensors' files). Nothing here restarts it: the count and the reason are logged.
+        gRestarts = gRestarts + 1;
+        say("the DSP reports a FATAL error (%u since the start)", gRestarts);
+        noteCrash();
+    }
+    if ((changed & ~value & kReady) && gStage >= PianoAdspReady) say("the DSP is no longer ready (slave-kernel %#x)", value);
     if ((value & kHandover) && !gHandedOver) {
         gHandedOver = true;
         say("handover: the DSP holds its own votes now");
@@ -1013,6 +1020,7 @@ extern "C" void piano_adsp_status(PianoAdspStatus *out) {
     out->broken = gGlink.broken;
     out->unknown_opens = gGlink.unknown_opens;
     out->ready_ms = gReadyMs;
+    out->fatal = gRestarts;
     out->adsp_kib = gAdspKib;
     out->scm_x0 = gScmX0;
     out->scm_x1 = gScmX1;

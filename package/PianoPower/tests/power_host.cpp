@@ -16,6 +16,7 @@
 #include <ctime>
 extern "C" {
 #include "PianoMca.h"
+#include "Servreg.h"
 }
 
 using namespace pianopower;
@@ -311,6 +312,7 @@ struct Dsp {
   std::vector<Write> writes;
   unsigned reads = 0, panEnables = 0, panAcks = 0;
   std::map<uint32_t, unsigned> readsOf;
+  uint32_t otg[4] = {};   // the last OTG configuration payload written
   bool dropReads = false;
 
   // Answers every request the codec has until it has none; returns how many.
@@ -344,7 +346,10 @@ struct Dsp {
         }
       } else {
         CHECK(op == PIANO_MCA_OP_WRITE);
-        const uint32_t value = prop == PIANO_MCA_CHARGE_ENABLE ? out[20] : le32(out + 20);
+        const bool oneByte = prop == PIANO_MCA_CHARGE_ENABLE || prop == PIANO_MCA_INPUT_SUSPEND || prop == PIANO_MCA_CP_STATE;
+        const uint32_t value = oneByte ? out[20] : le32(out + 20);
+        if (prop == PIANO_MCA_OTG_CFG)
+          for (unsigned w = 0; w < 4; ++w) otg[w] = le32(out + 20 + 4 * w);
         writes.push_back({prop, value});
         if (!retcodeFor.count(prop) || !retcodeFor[prop]) props[prop] = value;
         if (prop == PIANO_MCA_PD_FIXED && value == 9000 && props.count(0xf9000)) props[PIANO_MCA_BUS_VOLTAGE] = props[0xf9000];
@@ -575,6 +580,110 @@ static void testMcaPolicy()
   CHECK(d.count(PIANO_MCA_ICL) == before + 1 && d.last(PIANO_MCA_ICL) == 500);
 }
 
+static void testBoardConfig()
+{
+  CHECK(piano_mca_write_allowed(PIANO_MCA_CP_STATE, 1, 1) && !piano_mca_write_allowed(PIANO_MCA_CP_STATE, 0, 1));
+  CHECK(piano_mca_write_allowed(PIANO_MCA_CID_CFG, 0x708, 4) && !piano_mca_write_allowed(PIANO_MCA_CID_CFG, 0x709, 4));
+  CHECK(piano_mca_write_allowed(PIANO_MCA_OTG_CFG, 0, 16) && !piano_mca_write_allowed(PIANO_MCA_OTG_CFG, 0, 4));
+  Dsp d;
+  d.props[PIANO_MCA_BUS_VOLTAGE] = 5100000;
+  d.props[PIANO_MCA_REAL_TYPE] = PIANO_MCA_TYPE_DCP;
+  d.props[PIANO_MCA_ICL] = 100;
+  d.props[PIANO_MCA_TBAT] = 28;
+  d.props[PIANO_MCA_CHARGE_ENABLE] = 1;
+  PianoMca m;
+  piano_mca_init(&m, 1, 0);
+  piano_mca_allow_board(&m, 1);
+  piano_mca_link(&m, 1);
+  d.run(m);
+  // The board configuration first, then the policy, all in this one run (the read-back cycle after the board writes).
+  CHECK(d.count(PIANO_MCA_CP_STATE) == 1 && d.last(PIANO_MCA_CP_STATE) == 1);
+  CHECK(d.count(PIANO_MCA_CID_CFG) == 1 && d.last(PIANO_MCA_CID_CFG) == 0x708);
+  CHECK(d.count(PIANO_MCA_OTG_CFG) == 1 && d.otg[0] == 0 && d.otg[1] == 1 && d.otg[2] == 0xffffffffu && d.otg[3] == 0xffffffffu);
+  size_t firstPolicy = d.writes.size(), lastBoard = 0;
+  for (size_t i = 0; i < d.writes.size(); ++i) {
+    const uint32_t q = d.writes[i].property;
+    if (q == PIANO_MCA_CP_STATE || q == PIANO_MCA_OTG_CFG || q == PIANO_MCA_CID_CFG) lastBoard = i;
+    else if (firstPolicy == d.writes.size()) firstPolicy = i;
+  }
+  CHECK(lastBoard < firstPolicy && d.last(PIANO_MCA_ICL) == 1500);
+  CHECK(m.board_done == 7 && (piano_mca_take_events(&m) & McaEvBoardDone));
+  cycle(m, d);
+  CHECK(d.count(PIANO_MCA_CP_STATE) == 1);   // once per generation
+  // A restarted firmware: sent again.
+  piano_mca_link(&m, 0);
+  piano_mca_link(&m, 1);
+  d.run(m);
+  CHECK(d.count(PIANO_MCA_CP_STATE) == 2 && d.count(PIANO_MCA_OTG_CFG) == 2 && d.count(PIANO_MCA_CID_CFG) == 2);
+  // Refused: five cycles of tries, then the policy goes on.
+  Dsp r = d;
+  r.writes.clear();
+  r.retcodeFor[PIANO_MCA_CID_CFG] = 5;
+  r.props[PIANO_MCA_ICL] = 100;   // the model kept the earlier run's 1500
+  PianoMca n;
+  piano_mca_init(&n, 1, 0);
+  piano_mca_allow_board(&n, 1);
+  piano_mca_link(&n, 1);
+  for (int i = 0; i < 8; ++i) {piano_mca_refresh(&n); r.run(n);}
+  CHECK(r.count(PIANO_MCA_CID_CFG) == 5 && r.count(PIANO_MCA_CP_STATE) == 1 && r.count(PIANO_MCA_OTG_CFG) == 1);
+  CHECK((piano_mca_take_events(&n) & McaEvBoardGaveUp) && r.count(PIANO_MCA_ICL) >= 1);
+  // Off by default, and never without the policy.
+  Dsp o = d;
+  o.writes.clear();
+  PianoMca off;
+  piano_mca_init(&off, 1, 0);
+  piano_mca_link(&off, 1);
+  o.run(off);
+  CHECK(o.count(PIANO_MCA_CP_STATE) == 0 && o.count(PIANO_MCA_OTG_CFG) == 0);
+  PianoMca ro;
+  piano_mca_init(&ro, 0, 0);
+  piano_mca_allow_board(&ro, 1);
+  CHECK(!ro.board_allowed);
+  // The diag reads include the port state, the float readback and the board readbacks, and the verify flag always.
+  CHECK(d.readsOf[PIANO_MCA_OTG_BOOST] && d.readsOf[PIANO_MCA_OTG_GATE] && d.readsOf[PIANO_MCA_TYPEC_MODE] && d.readsOf[PIANO_MCA_SNK_SRC]);
+  CHECK(d.readsOf[PIANO_MCA_USB_TYPE] && d.readsOf[PIANO_MCA_TERM_VOLT] && d.readsOf[PIANO_MCA_VERIFY] && d.readsOf[PIANO_MCA_CID_CFG]);
+}
+
+static void testServreg()
+{
+  uint8_t out[96];
+  const uint32_t n = servreg_register_listener(out, sizeof out, 7, SERVREG_CHARGER_PD);
+  QcomQmiMessage m;
+  CHECK(n == QCOM_QMI_HEADER + 4 + 3 + 19 && !qcom_qmi_parse(out, n, &m));
+  CHECK(m.type == QCOM_QMI_REQUEST && m.transaction == 7 && m.message == SERVREG_REGISTER_LISTENER && m.length == n - QCOM_QMI_HEADER);
+  uint32_t size = 0;
+  const uint8_t *e = qcom_qmi_tlv(&m, 0x01, &size);
+  CHECK(e && size == 1 && e[0] == 1);
+  const uint8_t *path = qcom_qmi_tlv(&m, 0x02, &size);
+  CHECK(path && size == 19 && !std::memcmp(path, "msm/adsp/charger_pd", 19));
+  // The response: success with the state up.
+  const uint8_t resp[] = {2, 7, 0, 0x20, 0, 14, 0, 0x02, 4, 0, 0, 0, 0, 0, 0x10, 4, 0, 0xff, 0xff, 0xff, 0x1f};
+  CHECK(!qcom_qmi_parse(resp, sizeof resp, &m));
+  uint16_t result = 1, error = 1;
+  CHECK(!servreg_result(&m, &result, &error) && result == 0 && servreg_listener_state(&m) == SERVREG_STATE_UP);
+  const uint8_t refused[] = {2, 7, 0, 0x20, 0, 7, 0, 0x02, 4, 0, 1, 0, 0x10, 0};
+  CHECK(!qcom_qmi_parse(refused, sizeof refused, &m) && servreg_result(&m, &result, &error) && result == 1 && error == 0x10);
+  // An indication for our path, down, transaction 0x1234; and its acknowledgement.
+  uint8_t ind[64] = {4, 3, 0, 0x22, 0};
+  uint32_t at = QCOM_QMI_HEADER;
+  const uint8_t down[4] = {0xff, 0xff, 0xff, 0x0f}, txn[2] = {0x34, 0x12};
+  at = servreg_tlv(ind, at, sizeof ind, 0x01, down, 4);
+  at = servreg_tlv(ind, at, sizeof ind, 0x02, "msm/adsp/charger_pd", 19);
+  at = servreg_tlv(ind, at, sizeof ind, 0x03, txn, 2);
+  ind[5] = (uint8_t)(at - QCOM_QMI_HEADER); ind[6] = 0;
+  CHECK(!qcom_qmi_parse(ind, at, &m));
+  uint32_t state = 0;
+  uint16_t indTxn = 0;
+  CHECK(!servreg_state_updated(&m, SERVREG_CHARGER_PD, &state, &indTxn) && state == SERVREG_STATE_DOWN && indTxn == 0x1234);
+  CHECK(servreg_state_updated(&m, "msm/adsp/audio_pd", &state, &indTxn));   // another domain's: not ours
+  const uint32_t a = servreg_set_ack(out, sizeof out, 8, SERVREG_CHARGER_PD, indTxn);
+  CHECK(a && !qcom_qmi_parse(out, a, &m) && m.message == SERVREG_SET_ACK && m.transaction == 8);
+  const uint8_t *t = qcom_qmi_tlv(&m, 0x02, &size);
+  CHECK(t && size == 2 && t[0] == 0x34 && t[1] == 0x12);
+  CHECK(!std::strcmp(servreg_state_name(SERVREG_STATE_UP), "up") && !std::strcmp(servreg_state_name(0), "unknown"));
+  CHECK(servreg_register_listener(out, 10, 1, SERVREG_CHARGER_PD) == 0);   // too small: nothing built
+}
+
 static void testMcaHv()
 {
   // A PD source with 5 V/3 A and 9 V/3 A: 900 mA... then the 5 V PDO's limit, 9 V after three cycles, then 1.6 A.
@@ -744,6 +853,8 @@ int main()
   testMcaCodec();
   testMcaPolicy();
   testMcaHv();
+  testBoardConfig();
+  testServreg();
   if (gFailures) {
     std::fprintf(stderr, "power_host: %d failure(s)\n", gFailures);
     return 1;

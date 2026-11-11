@@ -46,6 +46,20 @@ extern "C" {
 #define PIANO_MCA_INPUT_SUSPEND 0x2019u   /* 1 byte: 1 = the USB input is suspended */
 #define PIANO_MCA_AICL_ENABLE 0x2012u     /* 1 byte */
 #define PIANO_MCA_AICL_STATUS 0x2029u     /* 4 bytes */
+/* The firmware's own view of the port and the float voltage, read for the diag line (docs/ubuntu-history/device.md §3.1). */
+#define PIANO_MCA_OTG_BOOST 0x200du       /* OTG boost status */
+#define PIANO_MCA_OTG_GATE 0x200eu        /* OTG gate status */
+#define PIANO_MCA_TYPEC_MODE 0x21015u
+#define PIANO_MCA_SNK_SRC 0x21022u        /* sink/source mode */
+#define PIANO_MCA_USB_TYPE 0x20001u
+#define PIANO_MCA_TERM_VOLT 0x2007u       /* reads 2 x mV - 3600 (the default 4400 mV reads 5200) */
+/* The stock board configuration (Linux sends it on every charger generation before any policy, as the stock subpmic driver does):
+ * charge pump present (1 byte, 1), the OTG configuration (16 bytes: words 0, 1, 0xffffffff, 0xffffffff: the charger boost and the
+ * PMIC GPIO controller, no external GPIOs) and the cable-insertion detection identifier (u32 0x708). Written only these values. */
+#define PIANO_MCA_CP_STATE 0x201cu
+#define PIANO_MCA_OTG_CFG 0x201au
+#define PIANO_MCA_CID_CFG 0x201bu
+#define PIANO_MCA_CID_VALUE 0x708u
 #define PIANO_MCA_CHARGE_ENABLE 0x2003u   /* one byte: the charger's enable bit */
 #define PIANO_MCA_FCC 0x2005u             /* charge current, mA; reading it is a no-op that returns zeroes, so it is never read */
 #define PIANO_MCA_ICL 0x2008u             /* input current limit, mA */
@@ -79,7 +93,8 @@ enum {
 /* The fields one cycle reads, in order. */
 enum {
     McaBusVoltage, McaBusCurrent, McaType, McaIcl, McaTbat, McaChargeEnable, McaStatus, McaPackVoltage, McaPackCurrent,
-    McaInputSuspend, McaAiclEnable, McaAiclStatus, McaVerify, McaPdos, McaFields
+    McaInputSuspend, McaAiclEnable, McaAiclStatus, McaOtgBoost, McaOtgGate, McaTypecMode, McaSnkSrc, McaUsbType, McaTermVolt,
+    McaCpState, McaOtgCfg, McaCidCfg, McaVerify, McaPdos, McaFields
 };
 
 /* receive results */
@@ -87,7 +102,7 @@ enum {McaIgnored = 0, McaAnswer = 1, McaCycleDone = 2, McaNotified = 3, McaWritt
 /* events for the owner's log (piano_mca_take_events) */
 enum {
     McaEvAttach = 1u << 0, McaEvDetach = 1u << 1, McaEvWrite = 1u << 2, McaEvHvOn = 1u << 3, McaEvHvBlocked = 1u << 4,
-    McaEvRefused = 1u << 5, McaEvHvAsked = 1u << 6,
+    McaEvRefused = 1u << 5, McaEvHvAsked = 1u << 6, McaEvBoardDone = 1u << 7, McaEvBoardGaveUp = 1u << 8,
 };
 enum {McaHvOff = 0, McaHvAsked = 1, McaHvOn = 2, McaHvBlocked = 3};
 
@@ -105,6 +120,7 @@ typedef struct {
     /* the policy: 0 reads only, 1 writes at 5 V; hv_allowed adds the 9 V request */
     uint8_t policy, hv_allowed, attached, hv, hv_checks, attach_cycles;
     uint8_t unsuspend_allowed, unsuspend_tries;
+    uint8_t board_allowed, board_done, board_tries;   /* the board configuration: bit 0 CP state, 1 OTG, 2 CID */
     uint8_t icl_tries, fcc_tries, enable_tries;
     uint32_t icl_want, fcc_want;     /* what the last cycle wanted (tries restart when it changes) */
     uint32_t icl_set, fcc_set;       /* what the firmware took since its start (0: nothing yet) */
@@ -137,6 +153,9 @@ void piano_mca_pan_timeout(PianoMca *m);
 /* Allows the one write of the input-suspend flag: 0x2019 = 0 when it reads non-zero, at most three times per attach, never 1
  * (piano-power-unsuspend=1; off by default, and it needs the policy on). */
 void piano_mca_allow_unsuspend(PianoMca *m, int allow);
+/* Allows the stock board configuration (PIANO_MCA_CP_STATE, _OTG_CFG, _CID_CFG with their one value each), sent once per charger
+ * generation before any policy write and retried for five cycles; needs the policy on. */
+void piano_mca_allow_board(PianoMca *m, int allow);
 /* The gauges' temperature, used when the firmware's own reading is missing. */
 void piano_mca_battery_temperature(PianoMca *m, int valid, int32_t celsius);
 uint32_t piano_mca_take_events(PianoMca *m);
