@@ -62,7 +62,8 @@ inline bool nearTrip(const Monitor &m, const ClusterTrips &t)
 //         (piano-thermal-fast-mhz: the clocks at which a prime-core load heats that fast) -> piano-thermal-fast-ms (10 ms);
 //   warm  the hottest sensor at piano-thermal-warm-poll (70 C) or more -> 250 ms (or the base when shorter);
 //   base  1 s (the governor's 100 ms tick when it runs).
-// The tsens upper-threshold interrupt will replace the warm tier's polling (docs/drivers/thermal.md section 10).
+// With piano-thermal-irq=1 the tsens upper-threshold interrupt stands in for the warm tier and the fast-clock rule at rest
+// (TsensIrq.h, docs/drivers/thermal.md section 13).
 enum class Poll : uint8_t { base, warm, fast };
 
 inline const char *pollName(Poll p) { return p == Poll::fast ? "fast" : p == Poll::warm ? "warm" : "base"; }

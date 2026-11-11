@@ -80,8 +80,8 @@ inline Ctrl decodeCtrl(uint32_t v)
 // The threshold interrupts (TSV2): TM_UPPER_LOWER_INT_STATUS/CLEAR/MASK 0x08/0x0c/0x10 with sensor n's lower interrupt at bit n and
 // its upper one at bit 16 + n; TM_CRITICAL_INT_STATUS/CLEAR/MASK 0x14/0x18/0x1c (bit n; 30 cycle-counter monitor, 31 watchdog
 // bark); a mask bit set = masked; an interrupt is cleared by writing its clear bit 1 then 0; TM_INT_EN [2:0] = 7 enables them all
-// on v2 (Linux tsens_enable_irq). Used only by the suspend hooks (below) and, later, the uplow interrupt (docs/drivers/thermal.md
-// section 10); levels 1-2 never write them.
+// on v2 (Linux tsens_enable_irq). Used by the suspend hooks (below) and the uplow interrupt (TsensIrq.h, piano-thermal-irq=1;
+// docs/drivers/thermal.md section 13); levels 1-2 alone never write them.
 constexpr uint32_t kTmUpLowIntClear = 0x0c, kTmUpLowIntMask = 0x10, kTmCriticalIntClear = 0x18, kTmCriticalIntMask = 0x1c;
 constexpr uint32_t kTmIntEnAll = 7;
 
