@@ -266,6 +266,16 @@ unsigned native_adreno_report_rows(char rows[3][Adreno830StatusRowBytes]);
  * orphaned cores while the GPU is awake and fills *clients (Adreno830StatusClients); returns 1, or 0 before S9 published the shell
  * (the weak default here: no client figures). */
 unsigned native_adreno_client_tick(Adreno830StatusClients *clients);
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (macOS 27): hooks of the kext's board glue (board/PianoA830.cpp), weak defaults in Adreno830Status.cpp.
+ * boot_progress_gpu_event: one line of an event the session's console must show whatever the trace and status settings are (a call
+ * that failed, an open refused, a recovery and its snapshot, a page fault, the device lost, the clients); the board prints it as
+ * "PianoA830: gpu <text>", and the callers rate-limit. Any context but a primary interrupt handler: the board only copies the line
+ * into its ring. adreno830_board_hang_ms: piano-gpu-hang-ms, the time without progress that the fence and recovery watchdogs call a
+ * hang (0: theirs, 2000 ms). */
+void boot_progress_gpu_event(const char *text);
+uint32_t adreno830_board_hang_ms(void);
+#endif
 #ifdef __cplusplus
 }
 #endif

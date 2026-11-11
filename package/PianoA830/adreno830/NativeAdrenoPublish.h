@@ -397,6 +397,93 @@ static inline bool NativeAdrenoIsHandoffMethod(uint32_t method)
     return method>=NativeAdrenoHandoffBase && method<=NativeAdrenoHandoffLast;
 }
 
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (macOS 27): the GPU events of a session on the console (NativeAdrenoPublish.cpp through boot_progress_gpu_event, which
+ * the board prints whatever the trace and status settings are): a call that failed, an open refused, a recovery, a page fault, the
+ * device lost, the clients. The status rows and the minute's meter line carry counters; these lines name the process, the ABI method and
+ * the IOReturn. */
+/* The ABI method's name (NativeAdrenoABI.h), null for a number it has not got. */
+static inline const char *NativeAdrenoMethodName(uint32_t method)
+{
+    static const char *const names[]={nullptr,"Query","BoAlloc","BoMap","BoFree","Submit","WaitFence","GetTimestamp","GetStatus",
+                                      "SetMetadata","GetMetadata","CreateQueue","CloseQueue","BoCpuMap","BoCpuUnmap","GetDeviceInfo",
+                                      "BoImport"};
+    return method<sizeof names/sizeof names[0]?names[method]:nullptr;
+}
+/* IOReturn.h's name of the codes the shell and its core answer, null for another. */
+static inline const char *NativeAdrenoReturnName(IOReturn status)
+{
+    switch(uint32_t(status)) {
+    case 0xe00002bdu: return "NoMemory";
+    case 0xe00002beu: return "NoResources";
+    case 0xe00002c1u: return "NotPrivileged";
+    case 0xe00002c2u: return "BadArgument";
+    case 0xe00002c5u: return "ExclusiveAccess";
+    case 0xe00002c7u: return "Unsupported";
+    case 0xe00002c8u: return "VMError";
+    case 0xe00002c9u: return "InternalError";
+    case 0xe00002cau: return "IOError";
+    case 0xe00002d5u: return "Busy";
+    case 0xe00002d6u: return "Timeout";
+    case 0xe00002d8u: return "NotReady";
+    case 0xe00002dbu: return "NoSpace";
+    case 0xe00002e2u: return "NotPermitted";
+    case 0xe00002ebu: return "Aborted";
+    case 0xe00002edu: return "NotResponding";
+    case 0xe00002f0u: return "NotFound";
+    default: return nullptr;
+    }
+}
+/* The answers Turnip's darwin backend expects and handles (a fence wait's slice that timed out, a full ring and a BO still in use, both
+ * tried again, no status counters): not events. Everything else a method answers but success is one. */
+static inline bool NativeAdrenoCallRoutine(uint32_t method,IOReturn status)
+{
+    return !status || (method==6 /* WaitFence */ && uint32_t(status)==0xe00002d6u) ||
+           ((method==5 /* Submit */ || method==4 /* BoFree */) && uint32_t(status)==0xe00002d5u) ||
+           (method==8 /* GetStatus */ && uint32_t(status)==0xe00002c7u);
+}
+/* How often a repeated event is written: its first time, then at its 10th, 100th, 1000th, ... occurrence with the count, so a failure
+ * that repeats every frame stays visible at the cost of a line per decade. The keys are (process name, kind, status); with every key
+ * used, a new one is counted in the table's overflow and written by the same rule. Under the caller's lock. */
+enum : unsigned {NativeAdrenoEventKeys=64};
+struct NativeAdrenoEventKey {char name[20];uint32_t kind,status,count;};
+struct NativeAdrenoEventTable {NativeAdrenoEventKey keys[NativeAdrenoEventKeys];uint32_t others;};
+static inline bool NativeAdrenoEventDecade(uint64_t count)
+{
+    uint64_t mark=1;
+    while(mark<count)mark*=10;
+    return count && mark==count;
+}
+/* Counts one occurrence of (name, kind, status); returns its count when its line is due, else 0. */
+static inline uint32_t NativeAdrenoEventNote(NativeAdrenoEventTable *table,const char *name,uint32_t kind,uint32_t status)
+{
+    if(!table)return 0;
+    if(!name)name="";
+    const auto same=[&](const NativeAdrenoEventKey &key) {   /* over the 19 characters a key keeps */
+        for(size_t i=0;i+1<sizeof key.name;++i) {
+            if(key.name[i]!=name[i])return false;
+            if(!name[i])return true;
+        }
+        return true;
+    };
+    unsigned i=0;
+    while(i<NativeAdrenoEventKeys && table->keys[i].count && !(table->keys[i].kind==kind && table->keys[i].status==status && same(table->keys[i])))
+        ++i;
+    uint32_t count;
+    if(i<NativeAdrenoEventKeys) {
+        NativeAdrenoEventKey &key=table->keys[i];
+        if(!key.count) {
+            size_t n=0;
+            for(;n+1<sizeof key.name && name[n];++n)key.name[n]=name[n];
+            key.name[n]=0;
+            key.kind=kind;key.status=status;
+        }
+        count=++key.count;
+    } else count=++table->others;
+    return NativeAdrenoEventDecade(count)?count:0;
+}
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -4,19 +4,31 @@ PianoA830 is the Adreno830 A830 kernel GPU driver (OnePlus 13T lineage) as a k27
 Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), main 1a1321056ffc5428ae925f4680093718b46ca7c2
 (unixnu.lock pin."Adreno830"), MIT (adreno830/LICENSE, sha256 16fbc0170994a48f60938d9f0d992d3bad113383cf90882f75c206e079c2a2dc).
   Copied into adreno830/: every file of the repository except docs/ and AGENTS.md (the design documents stay upstream; read them
-  there), 159 files unchanged (sha256 equal to the originals). Hardware-proven on the 13T: S0-S10 and a GPU-composited desktop under
+  there), 156 files unchanged (sha256 equal to the originals). Hardware-proven on the 13T: S0-S10 and a GPU-composited desktop under
   iPadOS 17.7.11 (gpu-native-plan.md section 2). Changed, every change marked "UniXNU-piano" in a comment and compiled only with
   -DADRENO830_MACOS (the host tests build without it, so they test the upstream code paths):
-    Adreno830Start.cpp      215e565650d176cd28c2e11e79e098195474add04ea5ae054b15e9eaa4ff0b0f -> f14a4ec706aca0a9742d8409ee3c75a526fb7747b8b09ae5cf21930bc0cb49a1
+    Adreno830Start.cpp      215e565650d176cd28c2e11e79e098195474add04ea5ae054b15e9eaa4ff0b0f -> d82ebcc754001252d136ddae24eeaed4c4c6ad6d884d9b0928ed6a78310221ea
       S9 publishMetal without the iPadOS-only staged IOAcceleratorES (no IOGPUFamily load, no static class initializer, no
       g_kernel_kmod_info): prepare/commit report steps 4/5; the macOS accelerator is the kext's AGXAccelerator personality on the
       NativeAdrenoGpuPublished service native_adreno_publish registers. The 128 KiB cmd-db snapshot on the heap (allocated once by
-      adreno830_start): the k27 collection's largest __DATA gap for a native kext is about 166 KiB.
-    NativeAdrenoPublish.cpp d2a85cbcb4ad29df03a05c9f4e3edc0120358ab90a731cb61b083accf93bd31f -> 18c0dda18777736bb00d310f691588b1dc59c002e2057465c19711cca6c8b0f3
+      adreno830_start): the k27 collection's largest __DATA gap for a native kext is about 166 KiB. 2026-11-11: the fence and recovery
+      watchdogs take piano-gpu-hang-ms (adreno830_board_hang_ms, 0: their 2 s), and the hang verdict's snapshot goes to
+      native_adreno_note_hang_snapshot (a weak no-op here, the shell's definition prints it).
+    NativeAdrenoPublish.cpp d2a85cbcb4ad29df03a05c9f4e3edc0120358ab90a731cb61b083accf93bd31f -> 4d31149ca8ffdb359d6261ddfcb38fd032064624822c7d2cbf23d6ff310d5607
       the render server is WindowServer (kRenderServer/isRenderServer at the six "backboardd" sites, as UniXNU Adreno740 7487f72);
       native_adreno_fences() for the display's fence rule (as Adreno740's, over the ring's lastSubmitted and the memptrs fence word).
-    NativeAdrenoPublish.h   b266fa844b199254611f2bb1fc0bfca6dedd1c73535cf442838b07527e74a854 -> 9b7f30aa11694cfb44a7731b1efc4fbe5a73ebf7807acee1443aa932fb01c46b
-      macOS process lists (NativeAdrenoSandboxGrantList, NativeAdrenoLargeClientList) in place of iPadOS's.
+      2026-11-11, the session's GPU events on the console (boot_progress_gpu_event, rate-limited by NativeAdrenoEventNote): a failed
+      call (process, pid, slot, ABI method, IOReturn), a refused open and why, a recovery's culprit and failed jobs, the hang snapshot,
+      a page fault and whose window, the device lost, and the live clients with their memory when they change (at most every 10 s).
+    NativeAdrenoPublish.h   b266fa844b199254611f2bb1fc0bfca6dedd1c73535cf442838b07527e74a854 -> c9a7be6b85289976338211267d43cd1e1298f0a974516bda96a27b3cda2899ae
+      macOS process lists (NativeAdrenoSandboxGrantList, NativeAdrenoLargeClientList) in place of iPadOS's. 2026-11-11: the event
+      lines' helpers (method and IOReturn names, the routine answers, the first-then-every-decade table), host-tested by
+      tooling/k27/run-a830-host-tests.py (macos_events).
+    Adreno830Status.h       9626f67c6f430b06562fa1be64598e8956929541c7954d1e1c84a394bf49df8a -> 4bc97572307f59e6a174295c0dea76dada0e971e0349ba96739499dcfc1ef6e6
+    Adreno830Status.cpp     0e4e7b2b218a0df73f9c688623658302f4ce5da8fba7dc716cad6afe8993e7b1 -> 43d652bd67bcf750f277e4db052a3f6e8fb3226e293e97de37f9e1d5fcce0fc7
+      2026-11-11: the board hooks boot_progress_gpu_event and adreno830_board_hang_ms, declared and given weak defaults.
+    A830Recovery.h          be274c0781de5ed0e44c01da50f1e45467fbd89f6efdb8a5c3ab3d941284630c -> 18729f79ba9d0813a241deb76211a17862e7636553a46eda041bd29629c31a50
+      2026-11-11: native_adreno_note_hang_snapshot declared.
     NativeAdrenoMemory.cpp  ea99b5e92be53377467c830bb63e5043597e543692ec20087711ba4d67770b1c -> 28882d551523a43a27890f4ed2fb82968bcbefcfdece71cf68465a9bdf6effad
       the pool's 128 KiB extent table on the heap, allocated with the pool (same __DATA reason).
   Not compiled into the kext: NativeAdrenoAccelerator.cpp (the iPadOS IOAcceleratorES class), NativeAdrenoClient.cpp and

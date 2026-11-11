@@ -57,6 +57,12 @@
 #include <machine/machine_routines.h>
 #endif
 
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (macOS 27): the publish shell's definition (NativeAdrenoPublish.cpp) replaces this weak default, which the host tests
+ * that link the orchestrator without the shell take: no snapshot line. */
+extern "C" __attribute__((weak)) void native_adreno_note_hang_snapshot(const A830HangSnapshot *) {}
+#endif
+
 /* An A830Irq window the bring-up trace forwards to (A830Trace.h): the window as bound, and its id for the lines. */
 struct A830TraceMmio {A830Mmio raw;unsigned window;};
 
@@ -1937,8 +1943,14 @@ IOReturn stageFence(Adreno830Device *d,Adreno830Failure *f)
     irq.own_mask=adreno830_annibale() && b->knobs.irq?uint32_t(A830_INT_MASK_FENCE_ONLY):0u;
     IOReturn r=d->irq.start(irq);
     if(r!=kIOReturnSuccess)return refuse(f,A830S8StepStart,A830ReasonNoMemory,0,r,0,r);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: piano-gpu-hang-ms (adreno830_board_hang_ms, 0: the 2000 ms default) for the fence watchdog, as for the recovery's. */
+    const A830FenceConfig fence={static_cast<volatile uint32_t *>(const_cast<void *>(d->buffers[GpuBufferMemptrs].cpu)),&d->irq,
+                                 0,adreno830_board_hang_ms(),0};
+#else
     const A830FenceConfig fence={static_cast<volatile uint32_t *>(const_cast<void *>(d->buffers[GpuBufferMemptrs].cpu)),&d->irq,
                                  0,0,0};
+#endif
     if((r=d->fence.start(fence))!=kIOReturnSuccess)return refuse(f,A830S8StepStart,A830ReasonNoMemory,1,r,0,r);
     /* The completion waits, and the queue meter's stamp of every fenced submission (ARCHITECTURE 4.13.5). */
     const NativeAdrenoRingWaiter waiter={&d->fence,A830Fence::ringWaiter,A830Fence::ringStamp};
@@ -2196,6 +2208,9 @@ void ropSnapshot(void *,A830HangSnapshot *snapshot)
         snapshot->smmuFar[i]=smmuFar(cb);
     }
     if(snapshot->cxOn)drainHfiLate();
+#ifdef ADRENO830_MACOS
+    native_adreno_note_hang_snapshot(snapshot);   /* UniXNU-piano: the snapshot on the console (NativeAdrenoPublish.cpp) */
+#endif
 }
 void powerFaultSink(void *,uint8_t cause,uint64_t detail) {g830.recovery.report(cause,detail);}
 /* The power state machine and the recovery, bound once (S8; started in S10). */
@@ -2222,6 +2237,11 @@ void bindPower(Adreno830Device *d)
     d->power_state.setFaultSink(powerFaultSink,nullptr);
     A830RecoveryConfig recovery;
     recovery.enabled=true;   /* M10: a global loss is recovered first */
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: piano-gpu-hang-ms, the no-progress time the software watchdog calls a hang (the board keeps it in 1000..60000). A
+     * full-panel pass at the annibale clocks (160-342 MHz) can run past the 2 s that suit the 13T's iPadOS work. */
+    if(const uint32_t hang_ms=adreno830_board_hang_ms())recovery.watchdogLimitMs=hang_ms;
+#endif
     d->recovery.init(recovery,d->power_win,d->power_env,d->power_ops,d->recovery_ops,&d->power_state);
     d->power_state.start(d->level,d->bus);
 }

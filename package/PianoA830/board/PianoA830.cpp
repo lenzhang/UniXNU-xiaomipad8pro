@@ -16,6 +16,9 @@
 //    ring that a logger thread prints (the hooks run with interrupts off; see the ring below).
 //  piano-gpu-delay=<s> (default 0): the survey or bring-up thread waits that long first (after the root is up, say), so a hang there
 //  does not also stop the boot.
+//  piano-gpu-hang-ms=<ms> (default 0: 2000): the time without progress the fence and recovery watchdogs call a hang (1000..60000).
+//  The session's GPU events (NativeAdrenoPublish.cpp: failed calls, refused opens, recoveries and their snapshot, page faults, the
+//  device lost, the clients) are printed as "PianoA830: gpu ..." through the same ring, whatever piano-gpu-trace says.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -27,6 +30,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include "PianoA830.h"
+#include "PianoA830Rows.h"
 #include "Adreno830Status.h"
 #include "Adreno830Device.h"
 #include "NativeAdrenoPublish.h"
@@ -174,6 +178,8 @@ void canaryCheck()
   gCanary.expected = now;
 }
 
+void flushHeldRows();   // the status rows held back (below)
+
 void logger(void *, wait_result_t)
 {
   char line[RingBytes];
@@ -185,23 +191,98 @@ void logger(void *, wait_result_t)
       IOLog("PianoA830: %s\n", line);
     }
     if (drops) IOLog("PianoA830: (%u lines dropped: the ring was full)\n", drops);
-    if (tick % 1000 == 0) canaryCheck();
+    if (tick % 1000 == 0) {
+      canaryCheck();
+      flushHeldRows();
+    }
     IOSleep(1);
   }
 }
 }  // namespace
 
 // ---- BootProgress hooks (Adreno830Status.h): into the ring only ------------------------------------------------------------------
-// The overlay rows: each row whose text changed (row 0 the summary, rows 1-3 the diagnostic page of piano-gpu-status=2).
+// The overlay rows: each row whose text changed (row 0 the summary, rows 1-3 the diagnostic page of piano-gpu-status=2). Once the GPU
+// runs ("GPU RUN ..."), the rows change every second (submissions, clock, temperature, the queue figures): the login run printed two
+// of them a second for the whole session. From then on a row is printed when it changed and 10 s have passed since it was last, or at
+// once when row 0's state (its second word: RUN, LOST, ...) or its fault or hang count changed; a row held back is printed by the
+// logger thread when its 10 s are up, so the last state of an idle GPU still shows. Before the GPU runs (the bring-up) every change
+// is printed at once, as before. Under the ring's lock (the hook runs under the status block's spin lock, the logger beside it).
+namespace {
+enum : unsigned { RowSlots = Adreno830StatusRows < 4 ? Adreno830StatusRows : 4 };
+const char *const kRowPrefixes[] = {"row0 ", "row1 ", "row2 ", "row3 "};
+char gRowHeld[RowSlots][Adreno830StatusRowBytes];
+bool gRowPending[RowSlots];
+uint64_t gRowShownAt[RowSlots];
+uint64_t gRowEvery;   // 10 s in mach_absolute_time units (set by start())
+
+}  // namespace
+
 extern "C" void boot_progress_gpu_rows(const char (*rows)[Adreno830StatusRowBytes], unsigned count)
 {
-  static const char *const prefixes[] = {"row0 ", "row1 ", "row2 ", "row3 "};
-  for (unsigned i = 0; i < count && i < Adreno830StatusRows && i < 4; ++i) {
-    if (!memcmp(gRows[i], rows[i], Adreno830StatusRowBytes)) continue;
-    memcpy(gRows[i], rows[i], Adreno830StatusRowBytes);
-    gRows[i][Adreno830StatusRowBytes - 1] = 0;
-    ringPush(prefixes[i], gRows[i], Adreno830StatusRowBytes);
+  char out[RowSlots][Adreno830StatusRowBytes];
+  bool show[RowSlots] = {};
+  const bool running = count && !strncmp(rows[0], "GPU RUN ", 8);
+  const uint64_t now = mach_absolute_time();
+  const uintptr_t irq = ringLock();
+  for (unsigned i = 0; i < count && i < RowSlots; ++i) {
+    if (!memcmp(gRows[i], rows[i], Adreno830StatusRowBytes)) {
+      gRowPending[i] = false;   // back to what the console shows
+      continue;
+    }
+    bool due = !running || !gRowEvery || now - gRowShownAt[i] >= gRowEvery;
+    if (!due && i == 0) due = PianoA830RowZeroStateChanged(gRows[0], rows[0], Adreno830StatusRowBytes);
+    if (due) {
+      memcpy(gRows[i], rows[i], Adreno830StatusRowBytes);
+      gRows[i][Adreno830StatusRowBytes - 1] = 0;
+      memcpy(out[i], gRows[i], Adreno830StatusRowBytes);
+      gRowShownAt[i] = now;
+      gRowPending[i] = false;
+      show[i] = true;
+    } else {
+      memcpy(gRowHeld[i], rows[i], Adreno830StatusRowBytes);
+      gRowHeld[i][Adreno830StatusRowBytes - 1] = 0;
+      gRowPending[i] = true;
+    }
   }
+  ringUnlock(irq);
+  for (unsigned i = 0; i < RowSlots; ++i)
+    if (show[i]) ringPush(kRowPrefixes[i], out[i], Adreno830StatusRowBytes);
+}
+
+namespace {
+// The logger's once-a-second look: a row held back for 10 s is printed now.
+void flushHeldRows()
+{
+  char out[RowSlots][Adreno830StatusRowBytes];
+  bool show[RowSlots] = {};
+  const uint64_t now = mach_absolute_time();
+  const uintptr_t irq = ringLock();
+  for (unsigned i = 0; i < RowSlots; ++i) {
+    if (!gRowPending[i] || (gRowEvery && now - gRowShownAt[i] < gRowEvery)) continue;
+    memcpy(gRows[i], gRowHeld[i], Adreno830StatusRowBytes);
+    memcpy(out[i], gRowHeld[i], Adreno830StatusRowBytes);
+    gRowShownAt[i] = now;
+    gRowPending[i] = false;
+    show[i] = true;
+  }
+  ringUnlock(irq);
+  for (unsigned i = 0; i < RowSlots; ++i)
+    if (show[i]) ringPush(kRowPrefixes[i], out[i], Adreno830StatusRowBytes);
+}
+}  // namespace
+
+// UniXNU-piano's event lines (NativeAdrenoPublish.cpp, Adreno830Status.h): whatever piano-gpu-trace and piano-gpu-status say.
+extern "C" void boot_progress_gpu_event(const char *text)
+{
+  if (text) ringPush("gpu ", text, RingBytes);
+}
+// piano-gpu-hang-ms=<ms>: the time without progress (fence, ring read pointer, BR's IB1) the fence and recovery watchdogs call a hang;
+// absent or 0: their 2000 ms. Kept in 1000..60000.
+extern "C" uint32_t adreno830_board_hang_ms(void)
+{
+  const uint32_t ms = bootArg("piano-gpu-hang-ms", 0);
+  if (!ms) return 0;
+  return ms < 1000 ? 1000 : ms > 60000 ? 60000 : ms;
 }
 extern "C" void boot_progress_display_status(const char *detail, uint64_t value)
 {
@@ -308,6 +389,7 @@ bool PianoA830::start(IOService *provider)
     return true;
   }
   gTrace = gLevel >= 2 && bootArg("piano-gpu-trace", 1) != 0;
+  nanoseconds_to_absolutetime(10ull * 1000000000ull, &gRowEvery);
   setProperty("piano-gpu", gLevel, 32);
   piano_a830_note("start: piano-gpu=%u (A830 chip %#x, k27 native kext, polled)", gLevel, 0x44050001u);
   thread_t thread = nullptr;
@@ -372,8 +454,11 @@ IOReturn AGXAccelerator::newUserClient(task_t owningTask, void *securityID, UInt
 {
   const unsigned limit = bootArg("piano-gpu-metal-opens", 0);   // connections ever granted to the plugin (0 = no limit)
   const IOReturn status = native_adreno_new_user_client(this, owningTask, securityID, type, properties, handler, limit);
+  // Every Metal process opens twice (Turnip's enumeration, then its device) and a login session has a few dozen of them: the first 160
+  // opens are logged (64 before 2026-11-11, which a session after login could use up); a refused GPU open also gets the publish
+  // shell's "gpu open refused" line with its reason.
   static unsigned logged;
-  if (logged < 64) {
+  if (logged < 160) {
     logged++;
     char name[20] = {};
     proc_selfname(name, sizeof name);
@@ -386,7 +471,7 @@ static void notePropertyRead(const char *key)
 {
   native_adreno_note_property_read(key);
   static unsigned logged;
-  if (key && !strcmp(key, "MetalPluginName") && logged < 32) {
+  if (key && !strcmp(key, "MetalPluginName") && logged < 96) {   // 32 before 2026-11-11 (a session after login reads more)
     logged++;
     char name[20] = {};
     proc_selfname(name, sizeof name);

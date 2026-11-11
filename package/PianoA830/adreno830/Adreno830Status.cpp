@@ -15,6 +15,11 @@ __attribute__((weak)) int boot_progress_trace_enabled(void) {return 0;}
 __attribute__((weak)) void native_adreno_publish_status(const Adreno830Status *) {}
 __attribute__((weak)) unsigned native_adreno_report_rows(char (*)[Adreno830StatusRowBytes]) {return 0;}
 __attribute__((weak)) unsigned native_adreno_client_tick(Adreno830StatusClients *) {return 0;}
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (macOS 27): the board glue's (board/PianoA830.cpp) event line and watchdog time; no line, the watchdogs' own 2 s. */
+__attribute__((weak)) void boot_progress_gpu_event(const char *) {}
+__attribute__((weak)) uint32_t adreno830_board_hang_ms(void) {return 0;}
+#endif
 }
 
 namespace {

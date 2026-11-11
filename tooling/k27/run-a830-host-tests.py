@@ -77,13 +77,89 @@ int main()
 """
 
 
-def macos_lists(root, out):
-    """The macOS client lists of NativeAdrenoPublish.h, built with -DADRENO830_MACOS over the runner's host doubles."""
-    source, binary = out / 'macos_lists.cpp', out / 'macos_lists'
-    source.write_text(MACOS_LISTS)
+MACOS_EVENTS = r"""
+#include "NativeAdrenoABI.h"
+#include "NativeAdrenoPublish.h"
+#include "PianoA830Rows.h"
+#include <cstdio>
+#include <cstring>
+static int bad;
+static void check(bool ok, const char *what) {if(!ok) {std::printf("FAIL %s\n", what); ++bad;}}
+static IOReturn code(uint32_t value) {return IOReturn(value);}
+int main()
+{
+    unsigned due = 0;
+    for (uint64_t c = 0; c <= 100000; ++c) due += NativeAdrenoEventDecade(c) ? 1 : 0;
+    check(due == 6 && NativeAdrenoEventDecade(1) && NativeAdrenoEventDecade(1000) && !NativeAdrenoEventDecade(2), "decades 1..100000");
+    static NativeAdrenoEventTable table{};
+    unsigned lines = 0;
+    const uint32_t alloc = 1u | uint32_t(NativeAdrenoMethodBoAlloc) << 8;
+    for (int i = 0; i < 1000; ++i) lines += NativeAdrenoEventNote(&table, "WindowServer", alloc, 0xe00002bdu) ? 1 : 0;
+    check(lines == 4, "1000 failures of one key: lines at 1, 10, 100, 1000");
+    check(NativeAdrenoEventNote(&table, "Dock", alloc, 0xe00002bdu) == 1, "another process: its own key");
+    check(NativeAdrenoEventNote(&table, "WindowServer", alloc + 256, 0xe00002bdu) == 1, "another method: its own key");
+    check(NativeAdrenoEventNote(&table, "WindowServer", alloc, 0xe00002edu) == 1, "another status: its own key");
+    check(NativeAdrenoEventNote(&table, "com.apple.WebKit.GPU.long", 1, 1) == 1 &&
+          NativeAdrenoEventNote(&table, "com.apple.WebKit.GPU.long", 1, 1) == 0, "a long name is one key");
+    static NativeAdrenoEventTable full{};
+    for (unsigned k = 0; k < NativeAdrenoEventKeys; ++k) {
+        char name[20];
+        std::snprintf(name, sizeof name, "p%u", k);
+        NativeAdrenoEventNote(&full, name, 1, 1);
+    }
+    check(NativeAdrenoEventNote(&full, "late", 1, 1) == 1 && NativeAdrenoEventNote(&full, "later", 1, 1) == 0,
+          "with every key used, the overflow is one key");
+    check(NativeAdrenoCallRoutine(NativeAdrenoMethodWaitFence, code(0xe00002d6u)) &&
+          NativeAdrenoCallRoutine(NativeAdrenoMethodSubmit, code(0xe00002d5u)) &&
+          NativeAdrenoCallRoutine(NativeAdrenoMethodBoFree, code(0xe00002d5u)) &&
+          NativeAdrenoCallRoutine(NativeAdrenoMethodGetStatus, code(0xe00002c7u)) && NativeAdrenoCallRoutine(NativeAdrenoMethodBoAlloc, 0),
+          "the answers Turnip expects are routine");
+    check(!NativeAdrenoCallRoutine(NativeAdrenoMethodBoAlloc, code(0xe00002bdu)) &&
+          !NativeAdrenoCallRoutine(NativeAdrenoMethodWaitFence, code(0xe00002edu)) &&
+          !NativeAdrenoCallRoutine(NativeAdrenoMethodSubmit, code(0xe00002edu)) &&
+          !NativeAdrenoCallRoutine(NativeAdrenoMethodBoImport, code(0xe00002c2u)), "every other failure is an event");
+    static const struct {uint32_t method; const char *name;} methods[] = {
+        {NativeAdrenoMethodQuery, "Query"}, {NativeAdrenoMethodBoAlloc, "BoAlloc"}, {NativeAdrenoMethodBoMap, "BoMap"},
+        {NativeAdrenoMethodBoFree, "BoFree"}, {NativeAdrenoMethodSubmit, "Submit"}, {NativeAdrenoMethodWaitFence, "WaitFence"},
+        {NativeAdrenoMethodGetTimestamp, "GetTimestamp"}, {NativeAdrenoMethodGetStatus, "GetStatus"},
+        {NativeAdrenoMethodSetMetadata, "SetMetadata"}, {NativeAdrenoMethodGetMetadata, "GetMetadata"},
+        {NativeAdrenoMethodCreateQueue, "CreateQueue"}, {NativeAdrenoMethodCloseQueue, "CloseQueue"},
+        {NativeAdrenoMethodBoCpuMap, "BoCpuMap"}, {NativeAdrenoMethodBoCpuUnmap, "BoCpuUnmap"},
+        {NativeAdrenoMethodGetDeviceInfo, "GetDeviceInfo"}, {NativeAdrenoMethodBoImport, "BoImport"}};
+    for (const auto &m : methods)
+        check(NativeAdrenoMethodName(m.method) && !std::strcmp(NativeAdrenoMethodName(m.method), m.name), m.name);
+    check(!NativeAdrenoMethodName(0) && !NativeAdrenoMethodName(17) && !NativeAdrenoMethodName(0x7000), "no name for another number");
+    check(!std::strcmp(NativeAdrenoReturnName(code(0xe00002edu)), "NotResponding") && !NativeAdrenoReturnName(0), "IOReturn names");
+    const char run1[] = "GPU RUN 160M b0 g1/b2 s1606 f0 h0 r23 p1 47C", run2[] = "GPU RUN 342M b57 g1/b3 s1700 f0 h0 r23 p1 56C",
+               fault[] = "GPU RUN 342M b57 g1/b3 s1700 f1 h0 r23 p1 56C", hang[] = "GPU RUN 342M b57 g1/b3 s1700 f1 h1 r23 p1 56C",
+               lost[] = "GPU LOST S15.03 e00002ed r23 f1";
+    check(!PianoA830RowZeroStateChanged(run1, run2, sizeof run1), "clock, busy, levels, submissions, temperature: no state change");
+    check(PianoA830RowZeroStateChanged(run2, fault, sizeof run2) && PianoA830RowZeroStateChanged(fault, hang, sizeof fault),
+          "a fault or a hang: at once");
+    check(PianoA830RowZeroStateChanged(hang, lost, sizeof lost), "RUN to LOST: at once");
+    char unterminated[68];
+    std::memset(unterminated, 'f', sizeof unterminated);
+    unterminated[3] = ' ';
+    unterminated[10] = ' ';
+    unterminated[11] = 'f';
+    unterminated[12] = '1';
+    char key[PianoA830RowKeyBytes];
+    PianoA830RowZeroKey(unterminated, sizeof unterminated, key);
+    check(std::strlen(key) < PianoA830RowKeyBytes, "an unterminated row");
+    if (!bad) std::printf("PASS: event lines: decade rule, keys and overflow, routine answers, method and IOReturn names, row 0 state\n");
+    return bad ? 1 : 0;
+}
+"""
+
+
+def macos_lists(root, out, name='macos_lists', text=MACOS_LISTS):
+    """A check of NativeAdrenoPublish.h's macOS parts (the client lists; the event lines with board/PianoA830Rows.h), built with
+    -DADRENO830_MACOS over the runner's host doubles."""
+    source, binary = out / f'{name}.cpp', out / name
+    source.write_text(text)
     command = ['xcrun', 'clang++', '-std=c++20', '-O1', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined', '-DADRENO830_MACOS',
                '-DADRENO830_HOST_TEST', '-I', str(out / 'macos/host-include'), '-I', str(root / 'tests'), '-I', str(root),
-               str(source), '-o', str(binary)]
+               '-I', str(PACKAGE / 'board'), str(source), '-o', str(binary)]
     built = subprocess.run(command, capture_output=True, text=True)
     if built.returncode:
         return False, built.stderr[-2000:]
@@ -141,6 +217,9 @@ def main():
         if macos and not args.names:
             ok, text = macos_lists(root, args.out)
             print(f'macos_lists: {text}')
+            bad += 0 if ok else 1
+            ok, text = macos_lists(root, args.out, 'macos_events', MACOS_EVENTS)
+            print(f'macos_events: {text}')
             bad += 0 if ok else 1
     return 1 if bad else 0
 

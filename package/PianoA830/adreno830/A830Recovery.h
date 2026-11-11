@@ -151,6 +151,11 @@ extern "C" {
 void adreno830_recovery_report(uint8_t cause,uint64_t detail);
 /* 0 open, 1 recovering, 2 lost (A830Gate): what the ABI shell checks before a submission or a new connection. */
 uint8_t adreno830_recovery_gate(void);
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (macOS 27): the hang verdict's snapshot on the console (NativeAdrenoPublish.cpp; a weak no-op in A830Recovery.cpp),
+ * called by the orchestrator's snapshot hook once the CP pipe and SMMU registers are in. Thread context (the recovery's). */
+void native_adreno_note_hang_snapshot(const A830HangSnapshot *snapshot);
+#endif
 }
 
 #endif

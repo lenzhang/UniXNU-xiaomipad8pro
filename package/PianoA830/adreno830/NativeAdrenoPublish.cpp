@@ -195,6 +195,32 @@ void shiftName(char names[3][17]) {
 /* The box of slot s (a live connection's or an orphan's), under g.lock. */
 CoreBox *slotBox(unsigned s);
 }
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (macOS 27): the session's GPU events (NativeAdrenoPublish.h: NativeAdrenoEventNote's first-then-every-decade rule),
+ * printed by the board as "PianoA830: gpu <text>" (boot_progress_gpu_event) whatever the trace and status settings are. The event table
+ * has its own lock: a call's note comes from any thread with no other lock of the shell held. */
+extern "C" int proc_selfpid(void);
+namespace {
+NativeAdrenoEventTable gEvents;
+IOLock *gEventLock=nullptr;   /* allocated with the shell's locks (native_adreno_publish) */
+enum : uint32_t {EventCall=1,EventOpen=2,EventFault=3};
+uint32_t noteEvent(const char *name,uint32_t kind,uint32_t status)
+{
+    if(!gEventLock)return 0;
+    IOLockLock(gEventLock);
+    const uint32_t count=NativeAdrenoEventNote(&gEvents,name,kind,status);
+    IOLockUnlock(gEventLock);
+    return count;
+}
+/* ", <n> times" after the first, and the IOReturn's name in brackets when it has one. */
+void eventTail(char *out,size_t size,IOReturn status,uint32_t count)
+{
+    const char *code=NativeAdrenoReturnName(status);
+    if(count>1)snprintf(out,size,"%s%s%s, %u times",code?" (":"",code?code:"",code?")":"",count);
+    else snprintf(out,size,"%s%s%s",code?" (":"",code?code:"",code?")":"");
+}
+}
+#endif
 void nativeAdrenoMailboxPoller(void *,wait_result_t);
 static IOReturn runCore(AGXDeviceUserClient *,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
 
@@ -952,8 +978,25 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
         return kIOReturnSuccess;
     }
     if(handoffOnly_)return kIOReturnUnsupported;   /* a hand-off connection mounts no GPU core */
+#ifndef ADRENO830_MACOS
     if(method==NativeAdrenoMethodBoImport)return importBo(input,input_size,output,output_size);
     return runCore(this,method,input,input_size,output,output_size);
+#else
+    const IOReturn status=method==NativeAdrenoMethodBoImport?importBo(input,input_size,output,output_size):
+        runCore(this,method,input,input_size,output,output_size);
+    /* UniXNU-piano: a failed call (but the answers Turnip expects, NativeAdrenoCallRoutine) on the console: the process, its slot, the ABI
+     * method and the IOReturn, the first time per process, method and status and then every decade. */
+    if(!NativeAdrenoCallRoutine(method,status))
+        if(const uint32_t count=noteEvent(name_,EventCall|method<<8,uint32_t(status))) {
+            char what[24],tail[48],line[160];
+            if(const char *known=NativeAdrenoMethodName(method))snprintf(what,sizeof what,"%s",known);
+            else snprintf(what,sizeof what,"method %#x",method);
+            eventTail(tail,sizeof tail,status,count);
+            snprintf(line,sizeof line,"call failed: %s[%d] slot %u %s -> %#x%s",name_,proc_selfpid(),slot_,what,unsigned(status),tail);
+            boot_progress_gpu_event(line);
+        }
+    return status;
+#endif
 }
 IOReturn AGXDeviceUserClient::action(OSObject *target,void *,IOExternalMethodArguments *arguments)
 {
@@ -1160,12 +1203,40 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
      * whose jobs hung the GPU NativeAdrenoClientHangLimit times is refused, never the render server. */
     const bool render_server=!kernel && isRenderServer(opener,sizeof opener);
     IOReturn refusal;
+#ifdef ADRENO830_MACOS
+    uint32_t hangs=0;
+#endif
     {
         const NativeAdrenoClientRecord *record=kernel?nullptr:clientRecord(opener);
         refusal=NativeAdrenoOpenRefusal(lost(),limit,record?openStreak(record):0,record && !render_server?record->hangs:0);
+#ifdef ADRENO830_MACOS
+        hangs=record?record->hangs:0;
+#endif
     }
     IOLockUnlock(g.lock);
+#ifdef ADRENO830_MACOS
+    const bool policy=refusal!=kIOReturnSuccess;   /* refused by the open policy, not by mount() */
+#endif
     if(!refusal)refusal=connection->mount(kernel);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: a refused GPU open on the console, with why: the process then has no Metal device (Core Image no Metal context). */
+    if(refusal && !kernel)
+        if(const uint32_t count=noteEvent(opener,EventOpen,uint32_t(refusal))) {
+            char why[64],tail[48],line[160];
+            if(policy)snprintf(why,sizeof why,"%s",lost()?"the GPU is lost":hangs>=NativeAdrenoClientHangLimit?"its jobs hung the GPU":
+                                                    "piano-gpu-metal-opens reached");
+            else {
+                const uint32_t reason=native_adreno_mount_fail[0];
+                unsigned live=0;
+                for(unsigned s=0;s<NativeAdrenoMaxClients;++s)if(g.slots[s].connection)++live;
+                if(reason==1)snprintf(why,sizeof why,"no free slot, %u connections live",live);
+                else snprintf(why,sizeof why,"%s",reason==2?"the core refused the open":reason==3?"its window":reason==4?"no memory":"mount");
+            }
+            eventTail(tail,sizeof tail,refusal,count);
+            snprintf(line,sizeof line,"open refused: %s[%d] -> %#x%s: %s",opener,proc_selfpid(),unsigned(refusal),tail,why);
+            boot_progress_gpu_event(line);
+        }
+#endif
     /* The row is looked up again under each hold of g.lock: while it was free, another open may have been given this name's row (an
      * idle row without hangs, NativeAdrenoClientRecordFor). */
     if(refusal) {
@@ -1227,6 +1298,24 @@ extern "C" bool native_adreno_note_page_fault(uint64_t far,uint32_t completed,ui
     } else {
         native_adreno_fault_stats[1]=native_adreno_fault_stats[1]+1;native_adreno_fault_stats[5]=uint32_t(far);
     }
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the fault's address and whose window it is in, the first fault and then every decade (one key for every fault). */
+    if(const uint32_t count=noteEvent("",EventFault,0)) {
+        char name[20]="nobody";
+        if(attributed) {
+            IOLockLock(g.lock);
+            if(const CoreBox *box=slotBox(slot))strlcpy(name,box->name,sizeof name);
+            IOLockUnlock(g.lock);
+        }
+        /* The jobs in flight against the window, so far (NativeAdrenoFaultNote's verdicts): alike / apart / undecided / polled. */
+        char line[160];
+        snprintf(line,sizeof line,"page fault at %#llx: %s%s (slot %u), %u fault%s so far; in flight alike %u apart %u undecided %u polled %u",
+            (unsigned long long)far,attributed?name:"no client's window",attributed?"'s window":"",at,count,count==1?"":"s",
+            native_adreno_fault_attribution[NativeAdrenoFaultAlike],native_adreno_fault_attribution[NativeAdrenoFaultApart],
+            native_adreno_fault_attribution[NativeAdrenoFaultUndecided],native_adreno_fault_attribution[NativeAdrenoFaultPolled]);
+        boot_progress_gpu_event(line);
+    }
+#endif
     return attributed;
 }
 /* Every connection and orphan, under g.lock. */
@@ -1243,6 +1332,15 @@ extern "C" void native_adreno_device_lost(uint32_t reason)
     if(!__atomic_compare_exchange_n(&g.lost,&expected,reason,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return;   /* already lost */
     native_adreno_fault_stats[2]=native_adreno_fault_stats[2]+1;native_adreno_fault_stats[7]=reason;
     adreno830_status_add32(&adreno830_status.faults,1);
+#ifdef ADRENO830_MACOS
+    {
+        /* UniXNU-piano: once a boot (the exchange above). */
+        char line[160];
+        snprintf(line,sizeof line,"DEVICE LOST (reason %u): the GPU is given up for this boot; every call answers %#x and every GPU open is "
+            "refused (WindowServer then has no Metal device)",unsigned(reason),unsigned(NativeAdrenoReturnNotResponding));
+        boot_progress_gpu_event(line);
+    }
+#endif
     if(!g.published)return;
     IOLockLock(g.lock);
     forEachBox([](unsigned,CoreBox *box) {box->status.noteFault();});
@@ -1282,8 +1380,28 @@ extern "C" void native_adreno_recovery_begin(bool charge_culprit)
         if(g.kernel_client && g.kernel_client->box()) {g.kernel_client->box()->status.noteFault();any=true;}
         else if(g.kernel_orphan) {g.kernel_orphan->status.noteFault();any=true;}
     }
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: who the recovery charges and whose jobs fail (those processes see their device lost); a recovery at most twice a
+     * minute (A830Recovery), so no rate limit. */
+    char line[160];
+    {
+        const CoreBox *culprit=oldest<NativeAdrenoMaxClients?slotBox(oldest):nullptr;
+        int at=snprintf(line,sizeof line,"recovery: %s",!charge_culprit?"the driver's own fault, nobody charged":
+            oldest>=NativeAdrenoMaxClients?"nothing in flight":culprit && !isRenderServer(culprit->name,sizeof culprit->name)?"culprit":
+            "in the render server's or the kernel's job");
+        if(charge_culprit && culprit && at>0 && size_t(at)<sizeof line)
+            at+=snprintf(line+at,sizeof line-size_t(at)," slot %u %s",oldest,culprit->name);
+        if(at>0 && size_t(at)<sizeof line)at+=snprintf(line+at,sizeof line-size_t(at),"; jobs in flight fail:");
+        for(unsigned s=0;s<NativeAdrenoMaxClients && at>0 && size_t(at)<sizeof line;++s)
+            if(ranges&(1u<<s))
+                if(const CoreBox *box=slotBox(s))at+=snprintf(line+at,sizeof line-size_t(at)," %u:%s",s,box->name);
+    }
+#endif
     IOLockUnlock(g.lock);
     if(any)adreno830_status_add32(&adreno830_status.faults,1);
+#ifdef ADRENO830_MACOS
+    boot_progress_gpu_event(line);
+#endif
 }
 extern "C" void native_adreno_recovery_end(bool recovered)
 {
@@ -1306,6 +1424,14 @@ extern "C" void native_adreno_recovery_end(bool recovered)
         return;
     }
     native_adreno_fault_stats[4]=native_adreno_fault_stats[4]+1;
+#ifdef ADRENO830_MACOS
+    {
+        char line[160];
+        snprintf(line,sizeof line,"recovery done (%u of %u begun so far): the GPU restarted; at most two a minute, the third loses it",
+            native_adreno_fault_stats[4],native_adreno_fault_stats[3]);
+        boot_progress_gpu_event(line);
+    }
+#endif
     IOLockLock(g.lock);
     forEachBox([](unsigned,CoreBox *box) {box->status.noteSuspend();});
     g.submit->resume();
@@ -1373,7 +1499,50 @@ extern "C" unsigned native_adreno_client_tick(Adreno830StatusClients *out)
     }
     if(g.kernel_client && g.kernel_client->box())visit(g.kernel_client->box(),false);
     if(g.kernel_orphan)visit(g.kernel_orphan,true);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: the live GPU connections (slot, process, MiB of own BOs and imports) on the console when the set changed, at most
+     * every 10 s (this runs once a second): how many Metal clients a session has and who holds the GPU memory. */
+    struct ClientEntry {uint32_t slot,mib;char name[15];};
+    ClientEntry entries[NativeAdrenoMaxClients];
+    unsigned listed=0;
+    uint32_t signature=2166136261u;
+    for(unsigned s=0;s<NativeAdrenoMaxClients;++s) {
+        AGXDeviceUserClient *connection=g.slots[s].connection;
+        CoreBox *box=connection?connection->box():nullptr;
+        if(!box)continue;
+        uint64_t pool=0,other=0,imported=0;
+        box->core.usage(&pool,&other,&imported);
+        ClientEntry &e=entries[listed++];
+        e.slot=s;e.mib=mib(pool+other+imported);
+        strlcpy(e.name,box->name,sizeof e.name);
+        signature=(signature^s)*16777619u;
+        for(const char *c=box->name;*c && c<box->name+sizeof box->name;++c)signature=(signature^uint8_t(*c))*16777619u;
+    }
+#endif
     IOLockUnlock(g.lock);
+#ifdef ADRENO830_MACOS
+    {
+        static uint32_t ticks,printedAt,printedSignature;
+        ++ticks;
+        if(signature!=printedSignature && (!printedAt || ticks-printedAt>=10)) {
+            printedAt=ticks;printedSignature=signature;
+            char line[150];   /* the board's ring keeps 159 characters with its "gpu " */
+            int at=snprintf(line,sizeof line,"clients %u (peak %u, refused for want of a slot %u):",listed,native_adreno_slot_pressure[0],
+                native_adreno_slot_pressure[1]);
+            for(unsigned i=0;i<listed && at>0;++i) {
+                char entry[40];
+                const int length=snprintf(entry,sizeof entry," %u:%s %uM",entries[i].slot,entries[i].name,entries[i].mib);
+                if(length<=0)break;
+                if(size_t(at)+size_t(length)>=sizeof line-1) {
+                    boot_progress_gpu_event(line);
+                    at=snprintf(line,sizeof line,"clients (more):");
+                }
+                if(at>0 && size_t(at)+size_t(length)<sizeof line) {memcpy(line+at,entry,size_t(length)+1);at+=length;}
+            }
+            boot_progress_gpu_event(line);
+        }
+    }
+#endif
     static uint32_t callsSeen;
     const uint32_t calls=native_adreno_metal_diag.calls;
     out->second_calls=calls-callsSeen;callsSeen=calls;
@@ -1412,6 +1581,9 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
     if(!g.ring_lock)g.ring_lock=IOLockAlloc();
     if(!g.memory_lock)g.memory_lock=IOLockAlloc();
     if(!g.lock || !g.ring_lock || !g.memory_lock)return kIOReturnNoMemory;
+#ifdef ADRENO830_MACOS
+    if(!gEventLock)gEventLock=IOLockAlloc();   /* UniXNU-piano: the event lines' table; without it they are only not written */
+#endif
     const NativeAdrenoSubmitLocks locks={nullptr,lockHook,unlockHook};
     const IOReturn attached=submit->attachLocks(&locks);
     if(attached)return attached;
@@ -1501,5 +1673,26 @@ extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired)
     *submitted=handed;
     *retired=int32_t(written-recorded)>=0?written:recorded;
     return true;
+}
+/* UniXNU-piano (macOS 27): the hang verdict's snapshot (A830Recovery::capture plus the orchestrator's CP pipe and SMMU registers) as
+ * three console lines, what a hang after login has to be read from: the cause, the fences, the ring pointers, where BR's IB1/IB2 stood,
+ * the pipes' fault and protect status and the GPU bank's last fault. Once per recovery or loss (A830Recovery: two recoveries a minute). */
+extern "C" void native_adreno_note_hang_snapshot(const A830HangSnapshot *s)
+{
+    if(!s)return;
+    static const char *const causes[]={"none","hang detect","CP HW error","watchdog: no progress","GMU fault","GMU watchdog",
+                                       "WPTR fence","self-test","slumber","wake","HFI"};
+    char line[150];
+    snprintf(line,sizeof line,"hang snapshot 1/3: %s (detail %#llx), fence %u of %u submitted, RBBM %08x/%08x INT0 %08x, CX %s GX %s",
+        s->cause<sizeof causes/sizeof causes[0]?causes[s->cause]:"?",(unsigned long long)s->detail,s->fence,s->lastSubmitted,
+        s->rbbmStatus,s->rbbmStatus1,s->int0Status,s->cxOn?"on":"off",s->gxOn?"on":"off");
+    boot_progress_gpu_event(line);
+    snprintf(line,sizeof line,"hang snapshot 2/3: RPTR %u WPTR %u, BR IB1 %#llx+%u IB2 %#llx+%u, RL error %08x %08x",s->cpRptr,s->cpWptr,
+        (unsigned long long)s->ib1Base,s->ib1Rem,(unsigned long long)s->ib2Base,s->ib2Rem,s->cpRlError[0],s->cpRlError[1]);
+    boot_progress_gpu_event(line);
+    snprintf(line,sizeof line,"hang snapshot 3/3: BR hw %08x int %08x pipe %08x prot %08x, BV hw %08x int %08x, GPU bank FSR %08x FAR %#llx",
+        s->pipeHwFault[0],s->pipeIntStatus[0],s->pipeStatus[0],s->pipeProtect[0],s->pipeHwFault[1],s->pipeIntStatus[1],s->smmuFsr[0],
+        (unsigned long long)s->smmuFar[0]);
+    boot_progress_gpu_event(line);
 }
 #endif
