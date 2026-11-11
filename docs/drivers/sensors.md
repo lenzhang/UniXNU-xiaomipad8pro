@@ -3,7 +3,9 @@
 Status: design + host-tested protocol code, 2026-11-11 (backlog B3 and B13). `package/PianoSensors` holds portable C only: the FastRPC
 reverse file service, the QMI/SNS client codecs, the read-only file pack and its builder, a safety governor and the macOS-side policies,
 all host-tested (`tests/run-host-tests.py`: ASan/UBSan, synthetic inputs, the kernel's no-FP/no-libc compile). **No kext, no boot
-argument, nothing linked, nothing run on hardware.** Template: `README.md`.
+argument, nothing linked, nothing run on hardware.** The macOS-side consumers (the rotation agent `piano-rotated`, PianoTouch's
+transform, PianoBacklight's automatic mode, the streams' off/on lifecycle) are `package/PianoAuto`, host-tested too (§5a). Template:
+`README.md`.
 
 ## 1. Purpose and gate
 
@@ -87,9 +89,9 @@ PianoPower (owns the DSP: PAS, SMP2P, GLINK, IPCRTR, locator, servreg; never tou
   |-- QRTR client ports (requested, 10.1 B) -------------> SNS client: service 400, a port per sensor
   '-- health: fatal bit, crash text, charger generation --> SensorsGuard (section 7) gates both
 PianoSensors : IOService on IOPlatformExpertDevice (not HID: no macOS consumer reads sensor HID services for this display)
-  |-- ambient_light (514, on change) -> SensorsPolicy curve -> PianoBacklight "PianoBacklightAmbient" (requested, 10.1)
-  |-- accel (513, 10 Hz, only while the cover is detached) -> SensorsOrient -> property piano-sensors-edge
-  |      -> launchd daemon piano-rotated: cover attached -> 0 deg; else the edge -> WindowServer rotation (+ PianoTouch's rotation)
+  |-- ambient_light (514, on change; AutoLight) -> SensorsPolicy curve -> PianoBacklight "PianoBacklightAmbient" (requested, §5a.4)
+  |-- accel (513, 10 Hz, only while the cover is detached; AutoStream) -> SensorsOrient -> property piano-sensors-edge (§5a.5)
+  |      -> launch agent piano-rotated: cover attached -> 0 deg; else the edge -> WindowServer's rotation -> PianoTouch (§5a.2, 5a.3)
   '-- proximity, gyro, mag: discovered and listed, never streamed
 ```
 
@@ -111,17 +113,173 @@ of conventional low memory). The alternative is a translating context bank with 
 HLOS programs the compute-cb banks (Linux does), unlike the audio streams sheng found to be the hypervisor's. 2 MiB of calls plus up to
 6 MiB of heap pages (PAG's split); mapped write-combined, published with a barrier before each send.
 
-**macOS consumers.**
+**macOS consumers** (all of it in §5a, code in `package/PianoAuto`).
 - Ambient light: the curve (`ps_als_curve`: 0 lux 4 %, 100 lux 24 %, 300 lux 37 %, 1000 lux 57 %, 10000 lux 100 %, battery first),
-  smoothing (1 s towards brighter, 4 s towards darker), 3 % hysteresis, at most one target per 250 ms; PianoBacklight applies it with
-  the user's offset (the brightness keys shift the curve), its ramps and its caps. The stream stops while `piano-display-power` is off.
-  macOS's own CoreBrightness needs a built-in panel with Apple's backlight service; NativeGopDisplay's panel is external (backlight.md §5).
-- Rotation: the kernel publishes the edge that is up (`PS_EDGE_*`, after SensorsOrient's 250 ms hold and a 600 ms settle); a launchd
-  daemon applies it, 1 s apart at most, and forces 0 deg while PianoKeyboard reports the cover attached (Ubuntu's rule). R1: WindowServer's
-  own rotation (System Settings offers Rotation for external displays on Apple silicon; the daemon makes the same private call, pinned to
-  this build); R2: NativeGopDisplay rotates in its copy and offers portrait modes (its owner); R3: none. Touch must follow (PianoTouch).
-- Proximity: unused (no ear detection on a Mac; the screen goes off by lid/hall and display sleep). Gyroscope and magnetometer: unused;
-  the gyroscope may later gate rotation while the tablet turns.
+  smoothing (1 s towards brighter, 4 s towards darker), 3 % hysteresis, at most one target per 250 ms, in the kext; PianoBacklight
+  applies it in an automatic mode with the user's offset (the brightness keys shift the curve). The stream is off while the display is
+  off or the lid closed and starts afresh after every off/on. macOS's own CoreBrightness needs a built-in panel with Apple's backlight
+  service; NativeGopDisplay's panel is external (backlight.md §5).
+- Rotation: the kernel publishes the edge that is up (`piano-sensors-edge`, after SensorsOrient's 250 ms hold); the launch agent
+  `piano-rotated` settles it (600 ms), keeps rotations 1 s apart, holds 0 deg while the cover is attached (Ubuntu's rule) and sets
+  WindowServer's own rotation (verdict R1, §5a.1); PianoTouch follows the rotation read back.
+- Proximity, gyroscope, magnetometer, the rear light sensor: unused (§5a.7).
+
+## 5a. The consumers on macOS: rotation, touch, automatic brightness (package/PianoAuto)
+
+Status, 2026-11-11: offline. `package/PianoAuto` is host-tested (`tests/run-host-tests.py`: the rotation policy, the touch transform,
+the sensor streams' off/on lifecycle, the light chain, PianoBacklight's automatic mode against its own step ladder; the kernel's
+no-FP/no-libc compile) and the agent `piano-rotated` is built (`tooling/k27/build-piano-rotated.sh`); its read-only `--probe` ran on a
+Mac with macOS 26.6. Nothing ran on the tablet. PianoTouch, PianoBacklight, PianoKeyboard and NativeGopDisplay are not edited: their
+owners add the interfaces below. Independent of the sensor transport: everything but §5a.5 works with a test edge source today.
+
+### 5a.1 Display rotation: the mechanism (verdict)
+
+| Item | Value | Source | State |
+|---|---|---|---|
+| macOS's sense | `CGDisplayRotation`: degrees clockwise; 90 = the display turned clockwise, its physical bottom now on the left and its top on the right, i.e. the panel's left edge up (SensorsPolicy's default map: TOP 0, LEFT 90, BOTTOM 180, RIGHT 270) | CGDisplayConfiguration.h (public) | verified (header) |
+| Public setter | none: CoreGraphics only reads the rotation; display modes are public (`CGDisplaySetDisplayMode`) | SDK headers | verified |
+| IOFramebuffer era | a framebuffer with `kIOScaleCanRotate` in its scaler features rotated scaled modes (`kIOScaleRotateFlags`, set by `IOServiceRequestProbe(kIOFBSetTransform)`): Intel GPUs' family, not IOMobileFramebuffer's, so not this display | IOGraphicsTypes.h | verified (header) |
+| System Settings' setter | MonitorPanel.framework: `+[MPDisplayMgr sharedMgr]`, `-displayWithID:` (int), `-[MPDisplay canChangeOrientation]` (BOOL), `-orientation` (int), `-setOrientation:` (int), `-hasRotationSensor` | Objective-C runtime names and type encodings, macOS 26.6 | verified (names, resolve); macOS 27: needs-boot |
+| Below it (names only, not called) | SkyLight `SLSSetDisplayRotation`; CoreDisplay `CGXSetDisplayRotation` (WindowServer's side); IOMobileFramebuffer.framework `IOMobileFramebufferSetRenderingAngle`, whose kernel side is `IOMobileFramebufferLegacy::setRenderingAngle(float*)` (slot 353, the family's own; NativeGopDisplay does not override it); `rotate_surface` (slot 279) | exported symbols; the KC's IOMFB names | verified (names); behaviour not read |
+| Offered for this display? | `canChangeOrientation` is WindowServer's answer; on Apple silicon external displays get Rotation, and NativeGopDisplay's display is external | macOS behaviour | inferred; R0 |
+| Rotated frames | expected: WindowServer composites rotated into the display's own 3200x2136 surfaces and tells the framebuffer the angle (the name `setRenderingAngle`): the copy and later flips unchanged. A transposed 2136x3200 surface (the display to rotate) would show in NativeGopDisplay's existing `swap layers 0x1: 0: 2136x3200` line | names above | inferred; R0 |
+| DPU rotation | SM8750's pipes (VIG0-3 `VIG_SDM845_MASK_SDMA`, DMA0-5) have no inline rotation (only SC7280's VIGs, NV12 UBWC, up to 1088 lines); every pipe flips: SRC_OP_MODE +0x38 (rect 1 +0x17c) bit 13 FLIP_LR, bit 14 FLIP_UD, so 0 and 180 degrees only | msm `dpu_hw_catalog.c`, `catalog/dpu_12_0_sm8750.h`, `dpu_hw_sspp.c` | verified (source) |
+
+**Verdict: R1, WindowServer's own rotation, set by a launch agent through System Settings' setter; no kernel change.** It needs no
+display-driver change, keeps PianoDpu's zero-copy plan intact (no 90-degree pipe is needed when WindowServer composites rotated), and is
+read back with a public call. **R2** (NativeGopDisplay rotates its copy, portrait timings chosen with the public `CGDisplaySetDisplayMode`)
+only if R0 shows `canChangeOrientation NO` or transposed swaps: it changes the timing list WindowServer keeps per display, makes every copy
+a transpose (slower than today's 39 ms row copy) and leaves PianoDpu without zero-copy for 90/270. Its spec: §5a.6. **R3**: none.
+
+### 5a.2 piano-rotated (the agent)
+
+```
+PianoSensors  piano-sensors-edge (0..3; 255 none) + kIOMessageServicePropertyChange --+
+PianoKeyboard piano-keyboard-attached (0/1)        + kIOMessageServicePropertyChange --+--> AutoRotate (ps_rotation_step inside)
+the user      defaults com.unixnu.piano-rotated Locked; notifyutil -p ...prefs     --+        |
+WindowServer  CGDisplayRotation (read back) + the display reconfiguration callback   --+        v
+              <-- -[MPDisplay setOrientation:] (by name, encodings checked first)    <-- rotate (level 2)
+PianoTouch    <-- piano-touch-rotation (setProperties): the rotation shown            <-- touch (level 3)
+```
+
+A global LaunchAgent (`daemon/com.unixnu.piano-rotated.plist`: LoginWindow and Aqua sessions, since WindowServer's display services are
+per session; a system daemon would not reach them), event driven (no polling; a timer only while a settle, hold or read-back is due),
+arm64, ad-hoc signed, `/usr/local/libexec/piano-rotated`. Policy (`AutoRotate.h`): an edge settles 600 ms; rotations at least 1 s
+apart; cover attached: 0 at once and held (a rotation chosen while attached is turned back); detached: a 1.5 s hold, then an edge that
+settles afresh (contacts bounce while the cover goes on or off); every rotation read back within 2 s, else backoff 2 s doubling to
+60 s and, after 5 failures in a row, off for the session; a rotation made in System Settings is adopted and holds until the tablet is
+turned to another edge; the user's lock; only on the console's session with the display awake.
+
+| Boot argument (read by the agent) | Default | Meaning |
+|---|---|---|
+| `piano-rotate=N` | 0 | 0 the agent exits (launchd does not restart it); 1 observe (inputs and decisions logged); 2 + WindowServer's rotation; 3 + PianoTouch told |
+| `piano-rotate-map=T,L,B,R` | 0,90,180,270 | degrees per edge up (fix after the four-edge test) |
+| `piano-rotate-settle=MS`, `-interval=MS`, `-detach=MS` | 600, 1000, 1500 | the policy's times |
+| `piano-rotate-cover=N` | 2 | 2 held at 0 while attached; 1 turned to 0 at attach only; 0 the cover ignored |
+| `piano-rotate-test=1` | 0 | the edge from the preference `TestEdge` (`defaults write com.unixnu.piano-rotated TestEdge -int 1`, then `notifyutil -p com.unixnu.piano-rotated.prefs`) instead of PianoSensors |
+
+Command line (USB root shell): `--probe` (displays, the setter, `canChangeOrientation`, the three drivers' properties; changes nothing),
+`--set DEG [--touch]` (one rotation, read back), `--level N`, `--stderr`. Log: `log show --last 5m --predicate 'subsystem ==
+"com.unixnu.piano-rotated"'` (`start: level ...`, `edge up: left`, `keyboard cover attached`, `wants 90 degrees: the tablet turned`,
+`rotate 0 -> 90 degrees: asked`, `display 0x.. shows 90 degrees`, `PianoTouch told 90 degrees: taken`; failures: `MonitorPanel has no
+... (another macOS build?)`, `WindowServer offers no rotation ... (canChangeOrientation NO)`, `the rotation asked for did not show`).
+
+### 5a.3 PianoTouch: the interface asked (`TouchRotation.h`; its owner adds it)
+
+- State `PatRotation fRotation` (`pat_init` in `start`). Inputs, both only recording (`pat_request`), never waiting:
+  `callPlatformFunction("PianoTouchRotation", false, (void *)(uintptr_t)degrees, (void *)source, 0, 0)` for kernel callers, and
+  `setProperties({"piano-touch-rotation": 0|90|180|270})` for the agent, allowed for root (`kIOClientPrivilegeAdministrator`) or the
+  console user (`kIOClientPrivilegeConsoleUser`: the agent runs as the logged-in user); other values `kIOReturnBadArgument`, other
+  callers `kIOReturnNotPrivileged`. Published: `piano-touch-rotation` (the rotation in use).
+- In `contact()`/`send()`: `r = pat_latch(&fRotation, e == TipEvent::down)`, `p = pat_rotate(r, x, y, kPanelW, kPanelH)`,
+  `tabletReport(tip, p.x, p.y, p.width, p.height, report)`. The degrees are CGDisplayRotation's (the agent sends what it read back); a
+  change takes effect at the next touch-down, never mid-drag. At 0 the report is the same as today's. One log line per change.
+
+### 5a.4 Automatic brightness: PianoBacklight's interface asked (`AmbientBacklight.h`; its owner adds it)
+
+- Boot argument `piano-backlight-auto=1` (default 0: targets refused with `kIOReturnUnsupported`, nothing changes).
+- `callPlatformFunction("PianoBacklightAmbient", false, (void *)(intptr_t)permille, (void *)source, (void *)(uintptr_t)lux, 0)`:
+  permille of the code range (1000 = 2047), the light policy's output; -1 leaves automatic mode with the code as it is. Records the
+  newest and wakes the thread like `PianoBacklightStep`; `kIOReturnNotReady` before its lock exists. `PianoBacklightClient.h` gains the
+  name and an `ambient()` helper.
+- `Controller` takes `pianoauto::Ambient` (three calls, the header's comment): a target applies `code()`; a step in automatic mode
+  shifts the curve by one of its own steps (x 2^(1/3) linear, 1/16 exponential) and the offset stays for the boot, a press always a
+  visible step unless at an end; `piano-backlight-percent` (administrator) switches to manual; `piano-backlight-auto` 0/1 as a
+  property leaves or re-enters (the last target at once, the offset kept). Written only on a change, nothing while dark (the newest
+  code lights the wake).
+- Published: `piano-backlight-auto` (automatic now), `piano-backlight-offset`, `piano-backlight-ambient-permille`, `-ambient-lux`.
+- Log: ambient writes folded into one line per 10 s (`ambient: N targets, lux A..B, permille P..Q, offset K, code X -> Y`; failed
+  accesses still logged at once); key steps in automatic mode `step +1 in automatic mode: offset 0 -> 1, code 757 -> 954`.
+
+### 5a.5 PianoSensors' side (its kext at S4: `AutoStream.h`, `AutoLight.h`)
+
+- Ambient light: one `PalLight`; conditions: `piano-sensors-als` and PianoBacklight taking targets, NativeGopDisplay's
+  `piano-display-power`, PianoKeyboard's `piano-keyboard-hall` (unknown counts as open). Each `pas_action` goes out only with
+  `sg_may_request`'s token (enable = 514 on change, disable = 10, on the light's own QMI client), answers matched by QMI transaction id
+  to `pas_response`, indications to `pal_event` (data[0]), a timer at `pal_deadline` to `pal_tick`; each target to
+  `PianoBacklightAmbient`; `PAS_FAILED` sends -1 once. The rules make readings resume after every off/on (Ubuntu v1.1.1): one request
+  outstanding, no nested close, the first event kept even before the enable's answer, a re-arm when it never comes, a fresh start
+  from it (no fade from the level before the display slept).
+- Accelerometer: one `PasStream` (513 at 10 Hz), wanted with the display on, the cover detached (`piano-keyboard-attached` 0 or
+  absent) and `piano-sensors-rotate`; samples through `ps_accel_sample` (a `PAS_EV_FIRST` restarts `sno_init`); on each new state
+  `piano-sensors-edge` = `ps_edge_of` (0..3, 255 for none: flat, face up/down, unknown, stream off), `piano-sensors-edge-changes`, and
+  `messageClients(kIOMessageServicePropertyChange)` as PianoKeyboard does.
+- PianoKeyboard: nothing new (`piano-keyboard-attached` and its messages exist, keyboard.md §6c).
+
+### 5a.6 NativeGopDisplay and PianoDpu
+
+R1 asks nothing of either. R2's spec, only if R0 calls for it, behind `native-gop-display-rotate=1` (byte-identical without): override
+`setRenderingAngle(float*)` (decode its bits without FP, log the first 8 calls and each change, publish
+`native-gop-display-rendering-angle`, then call the family's); copy a main surface of the transposed size rotated by that angle (or by
+`native-gop-display-rotation` set by the agent, root or console user) through a 64-row tile (256-byte runs read into a cached buffer,
+whole framebuffer rows written); only with `canChangeOrientation NO`, a second timing 2136x3200 that the agent chooses with
+`CGDisplaySetDisplayMode`. PianoDpu (B1b): R1's surfaces flip as today; a 180-degree flip is FLIP_LR|FLIP_UD with the two halves'
+sources swapped (the left mixer fetches the surface's right half); 90/270 always go to the copy.
+
+### 5a.7 Unused: proximity, gyroscope, magnetometer, the rear light sensor
+
+Proximity has no consumer on a Mac: no call or ear detection, the screen goes off by display sleep and the folio's hall (PianoBacklight's
+`piano-backlight-lid`); waking on approach would keep a stream on while the display sleeps (DSP traffic, sensor power) for little gain.
+It is discovered and listed at S2, never streamed. The gyroscope could gate rotation while the tablet turns (the settle time does that),
+the magnetometer has no macOS consumer, the rear light/flicker sensor (`ambient_light_back`) is not the one facing the user.
+
+### 5a.8 Test plan (attended RAM boots, the GPU profile so WindowServer runs; nothing needs the sensors until R3)
+
+Staging (the A830 path's seed plus the agent; `PIANO_SEED`/`PIANO_TRUST` make build-native-image.sh take it):
+```sh
+tooling/metal/build-turnip-a830.sh && printf 'sysmem\n' > out/turnip-a830/tu-debug
+R=$(tooling/k27/build-piano-rotated.sh); A=private/var/piano/rotated
+python3 tooling/k27/stage-soft-metal.py --out out/rotated/stage --file out/turnip-a830/tu-debug:private/var/ngpu/debug/tu-debug \
+  --file $R/piano-rotated:$A/piano-rotated --file $R/com.unixnu.piano-rotated.plist:$A/com.unixnu.piano-rotated.plist \
+  --file $R/install-piano-rotated.sh:$A/install-piano-rotated.sh --boot-run "sh /$A/install-piano-rotated.sh" \
+  --log-stream 'subsystem == "com.unixnu.piano-rotated"' out/turnip-a830/NativeAdrenoMetal.bundle
+PIANO_SEED=out/rotated/stage/scratch-data.img PIANO_TRUST=out/rotated/stage/kernel.macho.trustcache PIANO_GPU=2 PIANO_VMM_PRESENT=0 \
+  PIANO_RESET_AFTER=900 PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-usb-shell=1 piano-rotate=2 \
+  piano-rotate-test=1" tooling/k27/build-native-image.sh
+```
+
+| Step | What | Pass |
+|---|---|---|
+| R0 | root shell: `piano-rotated --probe`; `--set 90`, `--set 180`, `--set 0` | MPDisplay found, `canChangeOrientation 1`; each `... -> 90 degrees: shown`; the thumbnail rotated; `swap layers` stays `3200x2136` (R1 holds; `2136x3200`: R2); no WindowServer exit |
+| R1 | `piano-rotate=2 piano-rotate-test=1` (+ `piano-keyboard=2`): TestEdge 1, 3, 2, 0; attach and detach the cover; Locked true/false | each edge's rotation 0.6 s after its notification; attach: 0 at once, held; detach: none for 1.5 s; locked: none; a System Settings rotation adopted |
+| R2 | PianoTouch's interface, `piano-rotate=3 piano-touch=2`: at each rotation the four corners and the centre | the pointer under the finger (about 10 px); a drag never jumps at a rotation |
+| R3 | with PianoSensors S4 (§8 S4/S5): `piano-rotate=3` without `-test`; PianoBacklight with `piano-backlight-auto=1` | the four edges upright with touch; attached: normal; the backlight follows a lamp within 2 s; 20 display sleep/wake cycles each give readings and the room's level at once |
+
+### 5a.9 Risks
+
+1. The setter is private: pinned by name and encoding, checked before each run; a changed macOS refuses cleanly (R2 then).
+2. `canChangeOrientation` may be NO for this IOMFB display, or WindowServer may hand it transposed surfaces: R0 says which; R2.
+3. Rotated composition cost: with NativeSoftMetal (software compositing) a rotated desktop costs CPU per frame; on the A830 path it
+   is a GPU pass. Measured in R0 (the copy line's frame rate and CPU).
+4. Absolute pointers: the transform assumes macOS stretches the HID tablet's range over the rotated display; if macOS rotates it
+   itself, R2's corners show it: then `piano-rotate=2` (touch not told).
+5. PianoTouch's property is writable by the console user (the agent is not root after login): a user process could remap touch to one
+   of four rotations; bounded, documented. A root daemon cannot reach WindowServer's per-session display services.
+6. AMFI: the agent is ad-hoc signed like `pianousb-shell`; if it is refused, its CDHash (printed by the build) goes into the trust
+   cache as the plugin's do. The login window's agent loads only if the boot job installs it before loginwindow starts; otherwise at
+   the next login.
+7. Sensors (S4): the hub's first event on enable is inferred (the re-arm covers it); an under-display light sensor sees the panel
+   (question 9); the edge's axes are inferred (`piano-rotate-map`, `piano-sensors-axes`).
 
 ## 6. Boot args
 
@@ -132,6 +290,8 @@ HLOS programs the compute-cb banks (Linux does), unlike the audio streams sheng 
 | `piano-sensors-bank=N` / `-rpc-pa=ADDR` | 3 / none | the context bank (3..8); the arena's physical address (S3 refuses to run without one) |
 | `piano-sensors-settle=S` | 20 | seconds of a healthy charger domain before the first request |
 | `piano-sensors-als=0`, `-rotate=0`, `-log=0..2` | 1, 1, 1 | consumers off; log volume |
+
+The consumers' own arguments: `piano-rotate*` (the agent, §5a.2) and `piano-backlight-auto=1` (PianoBacklight, §5a.4).
 
 ## 7. Kernel component, and the safety story
 
@@ -158,8 +318,8 @@ exists, inert without `piano-sensors`, imports PianoPower's client functions by 
 | S1 survey | `=1`: the router's services (0x190 there? instance), the `open:` list, SMMU entries of 0x1003..0x1008/0x1043.. (loads only), the pack found and valid on the ESP, the arena candidate's map type; no message to the DSP | all listed; nothing written; charger unchanged | 1-2 days, 1 boot |
 | S2 SNS | `=2`: SUID lookups (`registry`, accel, gyro, ambient_light, proximity, mag) and attributes, no file service, no stream | answers parse; expected without files: `registry` maybe, no accel (SUN saw that with incomplete files); no fatal for 10 min, `charger_pd` generation and charge current unchanged | PianoPower ports (owner) + 2-3 days, 1-2 boots |
 | S3 files | `=3`: attach (bank 3, then 4), listener, the pack served, writes declined, every path logged | attach retval 0; `sns_reg_config`, `json.lst`, the registry read; S2's lookups now find accel/gyro/light; no fatal for 15 min, charger unchanged | 3-5 days, 2-4 boots |
-| S4 streams | `=4`: light on change -> PianoBacklight; accel 10 Hz -> the edge; 20 light off/on cycles | lux follows a lamp, the backlight within 2 s; readings after every cycle (v1.1.1); the four edges named right (fix `-axes` if not) | 3-4 days, 2 boots |
-| S5 rotation | the daemon (staged and signed like the GPU plugin), the cover lock, touch rotation | each edge upright with touch at the four corners (Ubuntu's table); attached -> normal | 3-5 days, 2-3 boots |
+| S4 streams | `=4`: light on change -> PianoBacklight (`AutoLight`, `piano-backlight-auto=1`); accel 10 Hz -> the edge (`AutoStream`); 20 light off/on cycles | lux follows a lamp, the backlight within 2 s; readings after every cycle (v1.1.1); the four edges named right (fix `-axes` if not) | 3-4 days, 2 boots |
+| S5 rotation | `piano-rotated` (§5a.8: R0-R2 can run before S4, with the test edge), the cover lock, touch rotation | each edge upright with touch at the four corners (Ubuntu's table); attached -> normal | 2-4 days, 2-3 boots |
 | S6 B13 | persist's registry read at run time (ext4 reader), or the RAM overlay if S3 asked for it | readings identical with the pack's registry; at rest 9.81 +- 0.1 m/s^2 on each face; light within 10 % of Ubuntu's under one lamp | 3-5 days, 1-2 boots |
 
 About 3-4 weeks of work and 9-14 attended boots. Fails safe: everything stops at the first guard event; a reboot returns to Ubuntu.
@@ -186,9 +346,10 @@ entry, if it exists for this display) or none. Ubuntu keeps its own sensor stack
   wants clients still (charger configuration, its own recovery), polled by the guard.
 - D. Not PianoPower's, shared with audio: one owner and one fixed range for DSP-addressable low memory (or a translating bank for
   0x1003/0x1043; PianoWifi's and PianoDwc3's `SmmuStream.h` shows the bypass form).
-- PianoBacklight: `PianoBacklightAmbient` (param1 = target permille, or -1 to leave automatic mode; param2 = source), the user's offset
-  kept across steps, `piano-backlight-auto=1`. PianoKeyboard: publish `piano-keyboard-attached` (0/1) in `coverAttached`. PianoTouch: a
-  rotation input (0/90/180/270) applied to its absolute coordinates. NativeGopDisplay (R2 only): a transform in its copy and portrait modes.
+- The consumers' interfaces, specified in §5a with their code in `package/PianoAuto`: PianoBacklight's `PianoBacklightAmbient` and
+  automatic mode (§5a.4, `AmbientBacklight.h`); PianoTouch's `PianoTouchRotation` / `piano-touch-rotation` and its transform (§5a.3,
+  `TouchRotation.h`); PianoKeyboard's `piano-keyboard-attached` exists (keyboard.md §6c); NativeGopDisplay: nothing for R1, R2's
+  opt-in only if R0 asks for it (§5a.6).
 
 ### 10.2 Questions
 
@@ -199,9 +360,10 @@ entry, if it exists for this display) or none. Ubuntu keeps its own sensor stack
 4. Whether the PD asks for `apps_mem` pages, socinfo, DSP libraries (`/usr/lib/qcom/adsp`, empty on Ubuntu) or files outside the pack. (S3 log)
 5. Whether declined writes are harmless (Ubuntu's V4 says yes) or the PD loops (then the RAM overlay). (S3)
 6. One QMI client per sensor (libssc, Android) or one for all: ports needed. (S2)
-7. The rotation path: does System Settings offer Rotation for NativeGopDisplay's panel, and does a rotated desktop come through its CPU
-   copy unchanged (WindowServer composites rotated) or as swaps with a transform? (S5)
-8. The physical axes (left/right) and macOS's sense of "90 deg" (S4, S5: Ubuntu's four-edge table).
+7. The rotation path (verdict R1, §5a.1): does WindowServer answer `canChangeOrientation` yes for NativeGopDisplay's panel, and does a
+   rotated desktop come through its CPU copy unchanged (composited rotated) or as transposed swaps? (§5a.8 R0, no sensor needed)
+8. The physical axes (left/right) (S4, S5: Ubuntu's four-edge table). macOS's sense of "90 deg" is public: clockwise, the panel's left
+   edge up (CGDisplayConfiguration.h, §5a.1).
 9. The front sensor's placement (bezel or under the panel: an under-display sensor would see the screen's own light). (S4, lamp off/on)
 10. Jumbo reports: requested as "small" (TLV 0x10 = 0) to fit the intents; whether the hub then splits or drops large ones. (S2)
 
@@ -212,4 +374,7 @@ the SM8750 devicetree (GPL-2.0), hexagonrpc and the Ubuntu project's patches to 
 (GPL-3.0) and libqmi (LGPL-2.1) are specification only: behaviour, numbers and layouts as facts, no code or text copied. qualcomm/fastrpc
 (BSD-3-Clause) was read for its IDL's numbers only. No Qualcomm, ST, Sensortek or Xiaomi binary is reverse engineered. The DSP firmware,
 the vendor/ODM sensor configuration and this unit's persist registry are data read at run time from the owner's own tablet (or a pack
-under the ignored `out/`), never committed and never another unit's.
+under the ignored `out/`), never committed and never another unit's. PianoAuto (BSD-2-Clause-Patent) is this repository's own code; of
+Apple's it uses public SDK headers, and for the one private call (System Settings' rotation setter) class and selector names with their
+runtime type encodings, plus exported symbol names that are only cited: no Apple binary was disassembled or decompiled
+(`package/PianoAuto/UPSTREAM`). The msm DPU catalog (GPL-2.0) gave the pipes' rotation facts only.
