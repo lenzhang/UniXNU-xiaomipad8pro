@@ -37,3 +37,14 @@ if got != want:
     raise SystemExit('test-piano-pm: %s does not add %s byte for byte' % (patch.split('/')[-1], header.split('/')[-1]))
 print('test-piano-pm: the 0061 patch carries piano_pm_policy.h unchanged (%d lines)' % len(out))
 EOF
+# --kext: package/include/PianoPowerContract.h compiled as a kext (the k27 objects' recipe, -Werror), and with K27_KERNEL set
+# (a 0062 kernel) its imports resolved against that kernel.
+if [ "${1:-}" = --kext ]; then
+  python3 "$D/tooling/k27/build-native-kext.py" PianoPowerContractCheck "$S/contract_check.cpp" --out "$T/contract-check" \
+    2>&1 | grep -v -e CCC_OVERRIDE -e 'Adding argument' || true
+  [ -f "$T/contract-check/contract_check.o" ] || { echo "test-piano-pm: PianoPowerContract.h does not compile as a kext" >&2; exit 1; }
+  if [ -n "${K27_KERNEL:-}" ]; then
+    printf '["%s"]\n' "$T/contract-check/contract_check.o" > "$T/contract-check/objects.json"
+    python3 "$D/tooling/k27/check-kext-imports.py" "$T/contract-check/objects.json" "$K27_KERNEL"
+  fi
+fi

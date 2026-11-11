@@ -55,6 +55,8 @@ for source in args.sources:
         index += 1
     for include in args.includes:
         command += ['-I', include]
+    # The headers several drivers share (PianoPowerContract.h: the power contract, docs/power.md §4), after the driver's own.
+    command += ['-I', str(PIANO / 'package/include')]
     for define in args.defines:
         command += ['-U', define[2:]] if define.startswith('U:') else ['-D', define]
     command += ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-c99-designator', '-Wno-reorder-init-list',
