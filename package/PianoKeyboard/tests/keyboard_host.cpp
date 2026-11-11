@@ -4,6 +4,8 @@
 // authentication frames of the same shape), the keyboard filter (rollover, the opt-in Fn row), the pointer made of touchpad reports
 // (swipes, scrolling, taps, the contact count, the press button, the axes' scale; with the defaults: fine natural scrolling and its
 // axis lock, three-finger swipes, the typing guard, press settling), the touchpad descriptor's declared resolutions, the backlight,
+// the poll plan and the interrupt wait's timeouts and outcomes, the panel's brightness keys as PianoBacklightClient.h's KeyWatch
+// sees the cover's reports,
 // BitI2c.h against a bit-level I2C target model
 // (START/STOP, ACK/NACK, repeated START reads, clock stretching), CmdDb.h on a small database, and HidDescriptors.h (parsed item by
 // item: each report is as long as the driver sends it).
@@ -12,6 +14,7 @@
 #include "BitI2c.h"
 #include "CmdDb.h"
 #include "HidDescriptors.h"
+#include "../PianoBacklight/PianoBacklightClient.h"
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -1104,6 +1107,31 @@ static void testIrqWait()
   CHECK(waitEnd(false, true, true) == WaitEnd::miss);   // a kick that came too late does not hide a miss
 }
 
+// The panel's brightness keys through PianoBacklightClient.h's KeyWatch, fed as the kext feeds it: the consumer usage, and the
+// keyboard report as the cover sent it (before the Fn row turns Right Ctrl + 2 into F2).
+static void testBrightnessKeys()
+{
+  pianobacklight::KeyWatch w;
+  Report r[24];
+  unsigned n = 0;
+  uint8_t f[kFrameBytes];
+  pack(f, 1, {{kIdConsumer, 0x6f, 0x00, 0, 0}, {kIdConsumer, 0, 0, 0, 0}, {kIdConsumer, 0x70, 0x00, 0, 0}, {kIdConsumer, 0x70, 0, 0, 0}});
+  CHECK(unpackFrame(f, r, 24, &n) == Frame::reports && n == 4);
+  CHECK(w.consumer(le16(r[0].bytes + 1)) == 1 && w.consumer(le16(r[1].bytes + 1)) == 0 && w.consumer(le16(r[2].bytes + 1)) == -1 &&
+        w.consumer(le16(r[3].bytes + 1)) == 0);   // held: one step
+  CHECK(w.consumer(0xe9) == 0);                   // volume up is not brightness
+  Keys k;
+  k.fnRow = true;
+  const std::vector<uint8_t> ctrl2 = keys(kModRightCtrl, {0x1f}), none = keys(0, {});
+  uint8_t out[kKeyboardBytes];
+  k.filter(ctrl2.data(), out);
+  CHECK(sentIs(out, 0, {0x3b}));                  // macOS gets F2
+  CHECK(w.keyboard(ctrl2.data()) == 1);           // the panel gets a step up from the raw report
+  CHECK(w.keyboard(ctrl2.data()) == 0 && w.keyboard(none.data()) == 0);
+  const std::vector<uint8_t> ctrl1 = keys(kModRightCtrl, {0x1e});
+  CHECK(w.keyboard(ctrl1.data()) == -1);
+}
+
 int main(int argc, char **argv)
 {
   bool noFirmware = false;
@@ -1131,6 +1159,7 @@ int main(int argc, char **argv)
   testBacklight();
   testPollPlan();
   testIrqWait();
+  testBrightnessKeys();
   if (failures) {
     std::printf("keyboard_host: %d failure(s)\n", failures);
     return 1;

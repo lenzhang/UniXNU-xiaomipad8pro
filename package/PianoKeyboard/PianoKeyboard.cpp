@@ -61,7 +61,12 @@
 //   piano-keyboard-irq=1        wait for gpio97's edge by the TLMM summary interrupt (SPI 208, package/common/PianoIrq.h) instead of
 //                               sleeping: the wait then times out after 500 ms (the hall sensor's period) at most; back to polling
 //                               after 3 waits that timed out with the edge latched, or when the line's storm guard trips. Default 0
-
+// Other drivers can watch (IORegistry properties of this service, each change also a kIOMessageServicePropertyChange):
+//   piano-keyboard-attached  0/1 the cover (the MCU's attach bit)      piano-keyboard-hall    0 closed / 1 open (gpio80)
+//   piano-keyboard-status    0/1 gpio95 (the MCU's status / wake request line; read only, no wake armed)
+//   piano-keyboard-changes   a counter of those changes
+// The panel's brightness keys: with piano-backlight-keys=1 the cover's consumer 0x6F/0x70 and Right Ctrl + 1 / 2 step PianoBacklight
+// (package/PianoBacklight/PianoBacklightClient.h); the reports still go to macOS.
 //   piano-keyboard-fnrow=1      Right Ctrl + 1..0 - = are F1..F12 (Wn8030Piano.h Keys; default 0: keys as the cover sends them)
 //   piano-keyboard-hall=0       do not read gpio80 at all
 //   piano-keyboard-lid=1        tell IOPMrootDomain the hall state (kIOPMClamshellClosed/Opened), with clamshell sleep disabled
@@ -88,6 +93,8 @@
 #include "HidDescriptors.h"
 #include "CmdDb.h"
 #include "../common/PianoIrq.h"                      // the TLMM summary interrupt (docs/power-irq.md)
+#include "../PianoBacklight/PianoBacklightClient.h"  // the panel's brightness keys (piano-backlight-keys=1)
+#include <IOKit/IOMessage.h>
 
 using namespace pianokeyboard;
 
@@ -470,7 +477,9 @@ class PianoKeyboard : public IOService {
   bool fIrqLive = false;
   volatile uint32_t fKickPending = 0;
   uint32_t fIrqWakes = 0, fKickWakes = 0, fIrqWakesAtMinute = 0;
-
+  // the panel's brightness keys, the published state
+  pianobacklight::KeyWatch fBrightness;
+  uint32_t fStatusChanges = 0, fStateChanges = 0;
   uint8_t fFrame[kFrameBytes];
   uint8_t fWire[kDataWire];
   // serving state (the thread's own)
@@ -510,6 +519,7 @@ class PianoKeyboard : public IOService {
   void authAnswer(const Report &r);
   IOReturn send(Kind kind, const uint8_t *bytes, unsigned length);
   void backlight(int value, const char *why);
+  void published(const char *what);
   bool waitForEdge(uint32_t ms);
   void surveyHall();
   void pollHall(uint64_t now);
@@ -567,7 +577,8 @@ bool PianoKeyboard::start(IOService *provider)
        gArgs.scrollInvert ? "scrolling inverted" : "natural scrolling", gArgs.tap ? "on" : "off", gArgs.typing,
        gArgs.gestures ? "ON" : "off (recognised for the log only)", gArgs.backlight,
        gArgs.backlightIdle ? ", off when idle" : "", gArgs.pollMs, gArgs.idlePoll, gArgs.slowPoll);
-  note("interrupt: piano-keyboard-irq=%u (%s)", gArgs.irq, gArgs.irq ? "gpio97 on the TLMM summary when it opens" : "polled");
+  note("interrupt: piano-keyboard-irq=%u (%s); panel brightness keys %s (piano-backlight-keys)", gArgs.irq,
+       gArgs.irq ? "gpio97 on the TLMM summary when it opens" : "polled", pianobacklight::keysEnabled() ? "on" : "off");
   thread_t thread = nullptr;
   if (kernel_thread_start(threadMain, this, &thread) != KERN_SUCCESS) {
     stage(-1, "kernel_thread_start");
@@ -692,6 +703,7 @@ void PianoKeyboard::pollHall(uint64_t now)
   note("hall: cover %s (gpio80 %d, change %u, %llu s after start)", fHall ? "open" : "closed", fHall, fHallChanges,
        (unsigned long long)(fStartMs ? (now - fStartMs) / 1000 : 0));
   setProperty("piano-keyboard-hall", uint64_t(fHall), 32);
+  published("piano-keyboard-hall");
   lidNotify(!fHall);
 }
 
@@ -882,6 +894,8 @@ void PianoKeyboard::armIrq()
   note("serving: gpio97 INTR_CFG %08x (rising edge latched, not enabled), level %u; status gpio95 %u", rd32(pinVa(kIrq) + kIntrCfg),
        level(kIrq), level(kStatus));
   fStatusLevel = level(kStatus);
+  setProperty("piano-keyboard-status", uint64_t(fStatusLevel), 32);
+  setProperty("piano-keyboard-attached", 0ull, 32);
   if (!gArgs.irq) return;
   // The same latch, and its interrupt on the TLMM summary line, enabled only while the loop waits (open() writes INTR_CFG again,
   // latched and not enabled, with the PDC wake bit cleared: gpio97 is never a wake source).
@@ -1021,6 +1035,14 @@ void PianoKeyboard::authAnswer(const Report &r)
   note("auth: sent %s: %s (%s)", what, i2cName(rc), hex(wire + 1, 12, line, sizeof line));
 }
 
+// A change of a property other drivers watch: the counter, and a property-change message to the service's interested clients.
+void PianoKeyboard::published(const char *what)
+{
+  ++fStateChanges;
+  setProperty("piano-keyboard-changes", uint64_t(fStateChanges), 32);
+  messageClients(kIOMessageServicePropertyChange, const_cast<char *>(what));
+}
+
 // A backlight value from Backlight (-1: nothing to send).
 void PianoKeyboard::backlight(int value, const char *why)
 {
@@ -1033,9 +1055,12 @@ void PianoKeyboard::coverAttached(bool on, const char *why)
   if (on == fAttached) return;
   fAttached = on;
   note("cover %s (%s)", on ? "ATTACHED" : "detached", why);
+  setProperty("piano-keyboard-attached", uint64_t(on ? 1 : 0), 32);
+  published("piano-keyboard-attached");
   if (!on) {
     releaseAll();   // every key, consumer key and button up; the pointer and key state forgotten
     fBacklight.detach();
+    fBrightness = pianobacklight::KeyWatch();
     return;
   }
   ++fAttaches;
@@ -1122,6 +1147,7 @@ void PianoKeyboard::dispatch(const Report &r)
     const uint32_t rollovers = fKeyFilter.rollovers();
     const uint64_t now = nowMs();
     if (Keys::newKey(fLastKeys, r.bytes)) fPointer.keyTyped(now);   // the typing guard
+    if (pianobacklight::keysEnabled()) pianobacklight::step(fBrightness.keyboard(r.bytes), "the cover");   // before the Fn row
     memcpy(fLastKeys, r.bytes, kKeyboardBytes);
     backlight(fBacklight.input(now), "backlight (a key after idle)");
     fKeyFilter.filter(r.bytes, out);
@@ -1138,6 +1164,7 @@ void PianoKeyboard::dispatch(const Report &r)
     ++fConsumer;
     const IOReturn rc = send(Kind::keyboard, r.bytes, kConsumerBytes);
     backlight(fBacklight.consumer(le16(r.bytes + 1), nowMs()), "backlight (keyboard-brightness key)");
+    if (pianobacklight::keysEnabled()) pianobacklight::step(fBrightness.consumer(le16(r.bytes + 1)), "the cover");
     if (show || fConsumer <= 20)
       note("consumer %u: %s (usage %#x)%s", fConsumer, hex(r.bytes, r.length, line, sizeof line), le16(r.bytes + 1),
            fHid[0] ? (rc ? ", macOS refused" : ", to macOS") : "");
@@ -1289,10 +1316,13 @@ void PianoKeyboard::serve()
       while (fReadAgain && ++burst < 8);
       if (fReadAgain || burst) fPoll.activity(now);   // reports came
     }
-    const bool status = level(kStatus);
+    const bool status = level(kStatus);   // read only: the MCU's status / wake request line (no wake is armed)
     if (status != fStatusLevel) {
       fStatusLevel = status;
-      note("status gpio95 now %u", status);
+      if (++fStatusChanges <= 50 || fStatusChanges % 100 == 0)
+        note("status gpio95 now %u (change %u, %s)", status, fStatusChanges, fAttached ? "attached" : "no cover");
+      setProperty("piano-keyboard-status", uint64_t(status), 32);
+      published("piano-keyboard-status");
     }
     const uint32_t requests = __atomic_load_n(&fLedRequests, __ATOMIC_ACQUIRE);
     if (requests != fLedSeen) {
