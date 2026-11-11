@@ -1,0 +1,67 @@
+PianoBluetooth is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE). Level 1 (a read-only survey) as a kext; the GENI UART
+plans, the H4 framing and the QCA vendor codec with the controller set-up sequence as host-tested portable headers. What it takes from
+other work, and from where:
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoUsbHost/PianoUsbHost.cpp (sha256 344da37e70682f579b6c0915ab5ac2e38183b17334b1ed0d883c7d5d6c453415): the kext's shape
+    (probe gate on the boot argument, a survey thread, the post-mortem stage word, MMIO pages mapped on demand and loaded with an
+    explicit ldr, the SPMI windows and the observer channel as the only store, one summary property), re-written for this driver;
+    its decodePin / pullName copied into this namespace (GeniUart.h).
+  package/PianoUsbHost/tests/usbhost_host.cpp (sha256 2e80c61089a79764f546bed763a4978299421d8d310cf7e08dd012edb9dd656c): the
+    register-model harness (Soc, CHECK), re-used in tests/bt_host.cpp.
+  package/PianoWifi/WifiSurvey.h (sha256 41a9703bf079dfd4f86fe5073399c788725d43e7dc0ad4306b36ffd16c9aa219): surveySmmu (read-only
+    stream-match scan) re-expressed for one stream in GeniUart.h; the hardware-gated branch rule (piano-wifi-hwcg) taken as
+    piano-bt-hwcg. PianoWifi itself is not modified and not linked against.
+  package/PianoPower/SpmiObserver.h (sha256 4805d4fb7af91c210d75b9791e125f3789b7671e895afe6f80af27a36a849b07): included, not
+    copied (-I package/PianoPower): the arbiter, the APID of a PPID with its owner, the observer read.
+
+UniXNU-sheng (unixnu-research/UniXNU-sheng, BSD-2-Clause-Patent; SM8550 + WCN7850, Bluetooth hardware-verified on iPadOS 27 there),
+facts and design only, no code:
+  porting.toml (sha256 8f3d462ea12a78e90ca6ee8ed182e3f6573178841589305b0a49142631598894), area "bluetooth": the same QUP2 SE6 at
+    0x898000 with INTID 493, wrapper 0x8c0000 and stream 0x423 on SM8550; 3.2 Mbit/s from a 51.2 MHz source at 16x oversampling;
+    the macOS 27.3 (26C5035r) outcome (controller up, a patched bluetoothd opened /dev/cu.BLTH, its initialisation stopped at a
+    Broadcom vendor command); WcnPower's model of the shared rails (independent Wi-Fi and Bluetooth ownership, the last owner
+    releases; Bluetooth-only start-up without the PCIe NoC vote); pairing keys need the keychain.
+  reports/ipados27-bluetooth-startup.md: GENI UART protocol 2 (revision 0x204) and QUP 0x30090000 read on SM8550.
+  package/WcnPower.h (sha256 2ae8cda83623ca7370f6bfcbe3f86eb48bc5be5d3433cabfe313a36021850039): the shape of the shared power
+    helper specified for PianoWifi in docs/drivers/bluetooth.md section 6 (one ownership vote per radio, idempotent until put).
+  package/BluetoothProbe.cpp (sha256 2ae33391a94eadcb1f84dc13d1d4f33369cf91509d029aa0367ff45cbada8386): read for the bring-up
+    order (clocks, pins, BT_EN, the 32 KiB DMA window through a bypass bank, the RX wake); its SM8550 pins and TLMM BT_EN are not
+    piano's.
+  dts/sheng.dts (sha256 7407181ec4c2a6207b039e2aa88869f70a414eaa35d0cacc231b41b69e041130): the ADT bluetooth node bluetoothd looks
+    for (device_type and name "bluetooth", transport-encoding 1, transport-speed 3200000).
+
+QcaBluetooth (unixnu-research/QcaBluetooth; its Linux-derived files are GPL-2.0-only and were read as the specification only, like
+Linux; its BSD-2-Clause-Patent files read for design), no code taken:
+  README.md (sha256 7b2863099e6eb562842f72675522abd161570b94fff768ceeb4b2e878bdb8974), native-ios27.md (sha256
+  a645b5f63b7ce5539a7c33be61bf1b4f623e1fa86cd0860840182bda3ea5b4f5), src/qbt_tty.c (sha256
+  f0958a140d1cfa2b573a87d246b1010fd3ddd0844fe67c7421701ef4e31de91e, BSD-2-Clause-Patent: "macOS bluetoothd reaches an H4 controller
+  through a BSD serial device"), tools/native_macos27.py (sha256 207fa0a5af5f1aa4c871baa5d6944aeb2a0fedd4483845cdcc24f15440d0318a,
+  BSD-2-Clause-Patent: a version-locked patch of macOS 27.3's bluetoothd): cited in docs/drivers/bluetooth.md section 5 as the
+  precedent of the Apple-stack route; nothing of the patcher is used (it is binary analysis of an Apple daemon, an owner decision).
+
+The piano boot DT (out/inputs/piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840; the running
+Ubuntu DT): every address, pin, interrupt, stream and PMIC peripheral of BtHw.h.
+
+xiaomipad-8pro-mainline firmware/piano-bluetooth-rom20.json (sha256
+491bc9b0da503f91c1ec4b5a13c7b915e3045f9fba92ea86265ba59800e6119e, MIT): the firmware's origin (the stock bluetooth_a FAT image,
+image/), names and sizes. The firmware itself (LicenseRef-Proprietary-Firmware) is never in this repository.
+
+Specifications only (no code, comment or table copied; GPL-2.0): the Ubuntu piano kernel (unixnu-research/ubuntu-ref/kernel, branch
+piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01): drivers/bluetooth/hci_qca.c (sha256
+23f3f66a5b8358196e77cfa2f2c95ffe9665ed92e2ef781043675b3f8007f487), btqca.c (sha256
+9b756a89d436d6dd9c85268bb58360cd4adda348baf5e04f8a4e26754e9a5242), btqca.h (sha256
+0d795bcd1106b2c69a75e94813f1adca15078b433d90e041e34aabb0d2179187); drivers/tty/serial/qcom_geni_serial.c (sha256
+782839413b16f8e128c56c956a694dd209366715e9a4b0e7bbf7012c4901a41b); drivers/soc/qcom/qcom-geni-se.c (sha256
+249348128bcc6d6431bc4c7e37098c3c9b3f7035d6c608634200f87861c1699e); include/linux/soc/qcom/geni-se.h (sha256
+93766f20e89a2e0eb2014b2b04aee616fb7527bffd646010c6a1f1bdae9b549a); drivers/power/sequencing/pwrseq-qcom-wcn.c (sha256
+d09b804e655125e7aa0abda7f862a3ccceb2a016c6e6e6de56f23739a857b441); drivers/clk/qcom/gcc-sm8750.c (sha256
+0cefef94a558b310be2a903d9ad883b1226cc1897a7bed517b119b97794f39bd) and clk-rcg2.c (sha256
+4a1c8f29e2d4a80ef14f5c58f14de7a3576ea591c84f091b59cf5257e303f947); include/dt-bindings/clock/qcom,sm8750-gcc.h (sha256
+e8f4f6e4ab0d16d1e248073ce1409d935c3a1c4220dd259a8bd627cae02a06b9); drivers/pinctrl/qcom/pinctrl-sm8750.c (sha256
+9772d7520ee7a6271d7fd7f3ecba58d3fe86073387569604d589d8c907d5ffff) and pinctrl-spmi-gpio.c (sha256
+546efbe1601c05b7739b8c1fecd317b228a348699637a85aa59951eedaf87f51); arch/arm64/boot/dts/qcom/sm8750.dtsi (sha256
+b94834a8364d8007d5c12af1b5ad2e0a74a80094fcecb6a583a6d0d6b2ada923) and sm8750-xiaomi-piano.dts (sha256
+79fe7c8009621e4fe00423a10218eacee6b92294ee978a5044026d0e05d127dd); the Bluetooth Core Specification (H4, HCI events). Not read
+and not used for anything: any Apple binary beyond the kernel collection's kext names, class names and Info.plist matching
+dictionaries (docs/drivers/bluetooth.md section 5), any Qualcomm binary; the controller firmware is data loaded at run time.
