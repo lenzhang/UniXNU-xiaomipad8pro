@@ -221,7 +221,7 @@ run time to compare).
 Status: code, 2026-11-11. `Ntc.h`, `AdcChannels.h`, `PmicAdc.h`, `BoardTemps.h` (portable), `PianoThermalAdc.cpp` (the kernel
 side, the kext's second object) and `package/include/PianoBoardTemps.h` (the API); host-tested (`adc_host: all passed`), the map
 checked against the DT (`check-adc-map: 11 channels, 4 thermistor pins, the arbiter EE and the SDAMs match the DT`), linked into the
-native KC (kernel 0059: `com.unixnu.driver.PianoThermal: linked, ... 435 pointers`, 16 native kexts, none from DroidVM); inert
+native KC (kernel 0059: `com.unixnu.driver.PianoThermal: linked, ... 435 pointers`, 17 native kexts, none from DroidVM); inert
 without `piano-thermal-adc`; **not run on hardware**.
 
 ### 12.1 Purpose and gate
