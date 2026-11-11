@@ -217,7 +217,7 @@ All RAM boots with the cable, owner present. Every level is off by default, so a
    never above the stock trip), the own time left out of busy and the clock-measurement window dropped, the fast-clock rule fast
    only from 70 C (100 ms below), and the policy images no longer run the governor uncapped (`build-policy-test-images.sh`: the
    fixed Power Saver level, the governor only for P4/P7 and capped at 2400 / 2438 MHz). The test: `ram-p9-gov` (`power.md` §6.5:
-   the governor with the spinners off) should show cluster 0 near the bottom of its table (`384 MHz` mostly, `busy avg` a few %),
+   the governor with the spinners off, `piano-power-ps=1` on the cable as in pol-observe) should show cluster 0 near the bottom of its table (`384 MHz` mostly, `busy avg` a few %),
    `own work` under a few ms/s, `polling: ... clock N ms` only while above 2.5 GHz, and with a real load the 90 C ceiling's lines
    (`thermal limit N MHz (N limited polls ...)`) before any sensor passes 92 C; a hotter reading than that is a failure (report
    the polling line: the tier was not fast).

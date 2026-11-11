@@ -295,7 +295,9 @@ USB console. The CPU clock (2026-11-12): the fixed Power Saver level (`piano-cpu
 P7, which test the profile's hand-off to the governor and so keep `piano-cpufreq=3`, under a hard cap of 2400 / 2438 MHz
 (`piano-cpufreq-cap0/1`); before, every image ran the uncapped governor, which on the Mac's cable held cluster 0 at 3532 MHz and
 102-105 C for the whole of pol-observe and pol-suspend (`power.md` §1.2, `drivers/thermal.md` §8). `POL_CPUFREQ` overrides the
-choice for every image. Run each with
+choice for every image. Built so from an agent worktree (2026-11-12, the KC of `power.md` §6.5, `verify-ram-images.py` PASS):
+`ram-pol-observe` `0c34391c6bc26cdf…` (`piano-thermal=1 piano-cpufreq=2`, 801 bytes), `ram-pol-gpuslot` `9057a88d68fe7625…`
+(`piano-thermal=2 piano-cpufreq=3 piano-cpufreq-cap0=2400 piano-cpufreq-cap1=2438`, 872 bytes). Run each with
 `tooling/native/native-loop.sh out/ram-pol-<name>/boot-piano-macos-ram-A-bundled.img` and `usb-console.py --capture`.
 2026-11-12 (client 1, P7): the KC with the 0064 kernel (any kernel from 0062 does for these images) and PianoKeyboard, 24 native
 kexts, `ram-pol-gpuslot` `593e2fd733b9335a…` (`verify-ram-images.py` PASS, command line 819 bytes); the default 0059 build links

@@ -173,7 +173,10 @@ Fixes and defaults:
   in the daily profile until PianoAudio reaches the HAL.
 - On the installed system (persistent Data) the reports of every boot are kept: `ls -l /Library/Logs/DiagnosticReports | grep -E
   'PerfPower|audiomxd'` from the root shell, or `spindump PerfPowerServices 10 -file /tmp/pps.txt` / `sample audiomxd 10` there,
-  names the loop without any test image (attended).
+  names the loop without any test image (attended). Also there: `sysctl kern.monotonicclock_usecs kern.monotonicclock`. powerlog
+  takes its monotonic time from that sysctl (`kern.monotonicclock_usecs` in PowerlogCore's strings), which Apple's kernels register
+  (the vmapple kernels of the KDK have it; the open xnu tree only calls it, `clock.c`), so it may be missing natively: a second,
+  weaker candidate for the spin, and `sc-trace` cannot show it (it skips failing `sysctl` calls).
 
 ## 2. CPU idle (k27 0061, `piano-cpuidle=N`)
 
@@ -666,7 +669,7 @@ overrides, the busiest processes every 5 minutes, and the CPU-resource reports s
 | B | `ram-p9-off` (required; the fix's A/B partner) | `com.apple.PerfPowerServices` and `com.apple.audiomxd` disabled in the seed's override database | `cpu-reports: override: "com.apple.PerfPowerServices" => disabled` (and audiomxd); no `job:` line, no exec of either (`exec-log`), no `caught burning CPU`, neither in `pc-sample: task`; **per-CPU idle up**: the eight `piano-cpuidle:` lines' `ret` residency against A's (expected: cpu0-2 and cpu6/7 well above A's 30-50 %, the sum over the eight cores at least one core more idle), fewer `ret entries` on cpu6/7 if audiomxd's message loop was theirs; the login window as in A (`NativeGopDisplay: ... non-black`, 0 WindowServer exits, no new `Denying core dump` names) | the login window stops or a daemon waits (no SecurityAgent, WindowServer exits): a client of the disabled services blocks; record which, keep the daemon and try `deny` |
 | C | `ram-p9-rtc` (`P9_RTC_OFFSET` from `tooling/native/rtc-offset.py`) | `piano-rtc=1 piano-rtc-offset=N`: the calendar right from the start (k27 0060) | `piano-rtc: count N + offset M = X, 2026-... UTC: the calendar starts there`; no `settime:` change; **PerfPowerServices**: no `caught burning CPU`, small in `pc-sample` and `ps`, its first instance not exiting (no `exit: pid 87 PerfPowerService status 0`) → §1.2's clock hypothesis holds and the fix is the RTC calendar; audiomxd as in A | PerfPowerServices spins as in A: not the clock; A's report names the loop |
 | D | `ram-p9-deny` (optional) | `PIANO_DENY_EXEC=/usr/libexec/PerfPowerServices,/usr/libexec/audiomxd` | `k27-deny-exec=/usr/libexec/mobileactivationd,/usr/libexec/PerfPowerServices,/usr/libexec/audiomxd` in the boot args; `exit: pid N xpcproxy status 0x4e00` about every 10 s, no exec of either daemon; idle residency as B's (the respawn attempts are the difference) | an exec of the daemon: the 27.0.1 path differs (A's report `Path:` line): fix `EXECS` |
-| E | `ram-p9-gov` (optional; after B) | B + `piano-thermal=1 piano-cpufreq=3` | `drivers/thermal.md` §8 item 8: `cpufreq d0 NCC0: now 384 MHz ...` mostly (busy avg a few %), `own work N us/s` small, no `polling every 10 ms` at rest; `thermal limit` lines only above 90 C | cluster 0 high with B's idle figures: the governor itself (report its lines) |
+| E | `ram-p9-gov` (optional; after B) | B + `piano-thermal=1 piano-cpufreq=3 piano-power-ps=1` (on the cable: Balanced's 3532 / 4089 MHz ceiling, pol-observe's condition) | `drivers/thermal.md` §8 item 8: `cpufreq d0 NCC0: now 384 MHz ...` mostly (busy avg a few %), `own work N us/s` small, no `polling every 10 ms` at rest; `thermal limit` lines only above 90 C | cluster 0 high with B's idle figures: the governor itself (report its lines) |
 | F | `ram-p9-diag` (optional, 600 s, not a measurement) | A + `iokit-log=PerfPowerService,audiomxd sc-trace=PerfPowerService,audiomxd` | the services both daemons look up (`iokit: audiomxd services: ...`), the failing calls with their paths (`sc: audiomxd N err E ...`) | a console flood (the spin is such calls): its first lines are the answer |
 
 Capture with `usb-console.py --capture 940` per image (P7: the capture must cover `piano-reset-after` plus the boot). Reading:
@@ -675,13 +678,14 @@ last four `piano-cpuidle:` blocks of each run (the display may sleep after ~650 
 <capture>.txt` gives the reports.
 
 Built offline 2026-11-12 from an agent worktree (`PIANO_A830_METAL=0`: the main checkout's Turnip stage, `out/turnip-a830/stage`,
-seed identity `f61764674739968c`, as `ram-pm-idle1` had; KC with the 0064 kernel `01d4ef0ceaea3bfe…` and this page's PianoThermal,
-23 native kexts, the native kext rule passed, `ddce0816862755ef…`; ADT `06ebf45e26d60981…`). Seeds: `report` `bad57b99d90afae7`,
-`off` `e7cc3b928b443640` (the Turnip stage's trust cache unchanged). Images (`verify-ram-images.py` PASS, Data volatile, longest
-command line 878 bytes): `ram-p9-base` `6c144c00ec2ef0c3…`, `ram-p9-off` `ce5f9958834045ec…`, `ram-p9-rtc` `7edae69c613dd9dd…`
-(`P9_RTC_OFFSET` from that night's rtc run by `rtc-offset.py`), `ram-p9-deny` `e47cd9f67f73ed05…`, `ram-p9-gov` `d6e38357dafbcd2b…`,
-`ram-p9-diag` `2638573913752442…`, the dump image `ram-p9-dump` `855a10044d1502f5…`. The kernel's hash depends on the k27 tree's
-path: rebuild in the main checkout before a run if the queue's other images are built there.
+seed identity `f61764674739968c`, as `ram-pm-idle1` had; one KC for these and the policy images: the 0064 kernel
+`01d4ef0ceaea3bfe…`, this page's PianoThermal and PianoKeyboard (`PIANO_EXTRA_KEXTS`, inert here), 24 native kexts, the native kext
+rule passed, `8abff49adba7c86d…`; ADT `66161d6588895ed3…`). Seeds: `report` `018414d76e2f9c67`, `off` `cdb5dc165f4ce5a1` (the
+Turnip stage's trust cache unchanged). Images (`verify-ram-images.py` PASS, Data volatile, no `-v`, longest command line 878
+bytes): `ram-p9-base` `e841ee0bfe4bb0b6…`, `ram-p9-off` `9382144d99d72171…`, `ram-p9-rtc` `1beefb86f6486dc1…` (`P9_RTC_OFFSET`
+from that night's rtc run by `rtc-offset.py`), `ram-p9-deny` `dbc1dd5dc09e7449…`, `ram-p9-gov` `b62db2500d6a368d…`, `ram-p9-diag`
+`6efaaf5a673285fd…`, the dump image `ram-p9-dump` `c4d62771c314faaa…`. The kernel's hash depends on the k27 tree's path: rebuild in
+the main checkout before a run if the queue's other images are built there.
 
 ## 7. Risks and limits
 

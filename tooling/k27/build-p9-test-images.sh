@@ -11,8 +11,9 @@
 #   rtc   base with the calendar from the PMIC RTC from the start (piano-rtc=1 piano-rtc-offset=$P9_RTC_OFFSET, k27 0060), so no
 #         daemon sees settime's jump from 1970 to droidvm-utc: the test of the clock-jump hypothesis for PerfPowerServices
 #   deny  base with both executables denied (PIANO_DENY_EXEC, k27-deny-exec): the argument-only disable an ESP can take
-#   gov   off with PianoThermal's governor (piano-thermal=1 piano-cpufreq=3, its 2026-11-12 fixes): the governor at an idle login
-#         window without the spinners
+#   gov   off with PianoThermal's governor (piano-thermal=1 piano-cpufreq=3, its 2026-11-12 fixes) and PianoPower's battery
+#         (piano-power-ps=1, so on the Mac's cable the Balanced ceiling 3532 / 4089 MHz, as pol-observe had): P9's condition without
+#         the spinners
 #   diag  base with iokit-log and sc-trace for both daemons (600 s): what they look up and which calls fail; may flood the console
 #         if a spin is made of such calls, so it is not a measurement image
 #
@@ -80,7 +81,7 @@ for n in $NAMES; do
           grep -a -q "piano-rtc-offset" "$KC" || { echo "build-p9-test-images: rtc needs k27 0060 in $KC's kernel" >&2; exit 1; }
           A="piano-rtc=1 piano-rtc-offset=$P9_RTC_OFFSET" ;;
     deny) DENY=$EXECS ;;
-    gov)  SEED=out/p9-stage/off A="piano-thermal=1 piano-cpufreq=3"
+    gov)  SEED=out/p9-stage/off A="piano-thermal=1 piano-cpufreq=3 piano-power-ps=1"
           grep -a -q "left out of busy" "$KC" || { echo "build-p9-test-images: gov needs PianoThermal's 2026-11-12 governor in $KC" >&2; exit 1; } ;;
     diag) A="iokit-log=PerfPowerService,audiomxd sc-trace=PerfPowerService,audiomxd" R=600 ;;
   esac
