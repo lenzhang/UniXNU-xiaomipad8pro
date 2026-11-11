@@ -286,6 +286,38 @@ int main(int argc, char **argv)
         }
         printf("desktop: heap, 4x MSAA, concurrent compute, shared event, %u panel-sized IOSurface imports (live objects %u -> %u)%s\n",
                churnImports, liveBeforeChurn, liveAfterChurn, renderServer ? ", an 8192x4096 texture" : "");
+
+        // 5. The per-allocation limit: a kernel BO holds at most Query's max_bo_bytes (256 MiB). Every layer must say so before an
+        //    allocation gets that far: Turnip's maxMemoryAllocationSize/maxBufferSize/maxResourceSize (0004), the device's maxBufferLength.
+        //    A buffer of maxBufferLength is made; one past it and an 8192x8192 RGBA8 texture (256 MiB and its padding) are refused
+        //    without any BoAlloc reaching the kernel and refused there.
+        auto calls = (MethodCounter)dlsym(RTLD_DEFAULT, "host_gpu_calls");
+        const NSUInteger maxBuffer = device.maxBufferLength;
+        printf("limits: maxBufferLength %lu MiB\n", (unsigned long)(maxBuffer >> 20));
+        CHECK(maxBuffer && maxBuffer <= (NSUInteger)256 << 20, "maxBufferLength %lu MiB is past the kernel's 256 MiB per-object limit",
+              (unsigned long)(maxBuffer >> 20));
+        if (renderServer && calls && maxBuffer <= (NSUInteger)256 << 20) {
+            const unsigned refusedBefore = calls(2 /* BoAlloc */) - successes(2);
+            @autoreleasepool {
+                id<MTLBuffer> largest = [device newBufferWithLength:maxBuffer options:MTLResourceStorageModePrivate];
+                CHECK(largest, "a buffer of maxBufferLength (%lu MiB)", (unsigned long)(maxBuffer >> 20));
+            }
+            @autoreleasepool {
+                id<MTLBuffer> over = [device newBufferWithLength:maxBuffer + 65536 options:MTLResourceStorageModePrivate];
+                CHECK(!over, "a buffer past maxBufferLength was made");
+                MTLTextureDescriptor *huge = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8192
+                                                                                               height:8192 mipmapped:NO];
+                huge.storageMode = MTLStorageModePrivate;
+                huge.usage = MTLTextureUsageShaderRead;
+                id<MTLTexture> hugeTexture = [device newTextureWithDescriptor:huge];
+                CHECK(!hugeTexture, "an 8192x8192 RGBA8 texture past the per-object limit was made");
+            }
+            const unsigned refusedAfter = calls(2) - successes(2);
+            CHECK(refusedAfter == refusedBefore, "%u BoAlloc call(s) the kernel refused: the limit was not taken before the kernel",
+                  refusedAfter - refusedBefore);
+            printf("limits: a %lu MiB buffer made; one past it and an 8192x8192 RGBA8 texture refused before the kernel\n",
+                   (unsigned long)(maxBuffer >> 20));
+        }
         for (auto &m : gMissing)
             printf("missing selector: %s\n", m.c_str());
         if (surface)

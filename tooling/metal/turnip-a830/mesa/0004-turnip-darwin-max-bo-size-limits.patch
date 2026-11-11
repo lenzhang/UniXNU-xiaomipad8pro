@@ -1,0 +1,114 @@
+turnip: darwin, the kernel's per-object limit (Query's max_bo_bytes, 256 MiB on Adreno830) is every layer's allocation limit
+
+Adreno830's BoAlloc and BoImport refuse more than max_bo_bytes (kIOReturnBadArgument), while Turnip advertised maxMemoryAllocationSize
+4 GiB - 1, maxBufferSize 4 GiB and images' maxResourceSize 4 GiB - 1: an 8192x8192 RGBA8 texture got as far as the kernel and the Metal
+client saw an out-of-memory answer with a kernel BadArgument behind it. Now, on the native darwin path (not virtio-gpu):
+- tu_physical_device.max_bo_size = Query's max_bo_bytes;
+- VkPhysicalDeviceVulkan11Properties::maxMemoryAllocationSize, VkPhysicalDeviceVulkan13Properties::maxBufferSize and
+  VkImageFormatProperties::maxResourceSize are capped at it;
+- a BO or host import past it is refused before any kernel call (VK_ERROR_OUT_OF_DEVICE_MEMORY / VK_ERROR_INVALID_EXTERNAL_HANDLE), and
+  named on stderr the first time and then every 10th, 100th, ...: "NativeAdreno: a BO of 257 MiB is past the kernel's per-object
+  limit of 256 MiB (maxMemoryAllocationSize); refused (1 time)".
+Against the tree after 0001-0003. MIT, as the files.
+
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -194,6 +194,10 @@
+     * is shared with every other process on the device, so the budget must come from the kernel
+     * rather than from our own accounting. */
+    uint64_t guest_pool_size;
++
++   /* Darwin native (Adreno830's ABI v2): the kernel's largest BO, Query's max_bo_bytes (256 MiB); 0 elsewhere. The memory allocation,
++    * buffer and image resource limits are capped at it, and a larger BO is refused here, before the kernel would answer BadArgument. */
++   uint64_t max_bo_size;
+ 
+    struct vk_sync_type syncobj_type;
+    /* virtio only: syncobj wrapped with a userspace-fence poll fast path;
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -992,6 +992,9 @@
+    if (pdevice->guest_pool_size)
+       p->maxMemoryAllocationSize =
+          MIN2(p->maxMemoryAllocationSize, pdevice->heap.size);
++   /* A BO of the native kernel holds at most max_bo_size (Darwin, Adreno830: 256 MiB). */
++   if (pdevice->max_bo_size)
++      p->maxMemoryAllocationSize = MIN2(p->maxMemoryAllocationSize, pdevice->max_bo_size);
+ 
+ }
+ 
+@@ -1171,6 +1174,8 @@
+     * a 4GB buffer.
+     */
+    p->maxBufferSize = 1ull << 32;
++   if (pdevice->max_bo_size)
++      p->maxBufferSize = MIN2(p->maxBufferSize, pdevice->max_bo_size);
+ }
+ 
+ /* CP_ALWAYS_ON_COUNTER is fixed 19.2 MHz */
+--- a/src/freedreno/vulkan/tu_formats.cc
++++ b/src/freedreno/vulkan/tu_formats.cc
+@@ -707,7 +707,7 @@
+       /* FINISHME: Accurately calculate
+        * VkImageFormatProperties::maxResourceSize.
+        */
+-      .maxResourceSize = UINT32_MAX,
++      .maxResourceSize = physical_device->max_bo_size ? MIN2((uint64_t)UINT32_MAX, physical_device->max_bo_size) : UINT32_MAX,
+    };
+ 
+    if (p_feature_flags)
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -939,6 +939,26 @@
+ 
+ /* ---- buffer objects ---- */
+ 
++/* A BO past the kernel's per-object limit (max_bo_size, Query's max_bo_bytes) is refused here, as maxMemoryAllocationSize says, instead
++ * of a kernel BadArgument; the first such request and then every 10th, 100th, ... is named on stderr. */
++static bool
++darwin_past_bo_limit(struct tu_device *dev, uint64_t size, const char *what)
++{
++   const uint64_t limit = dev->physical_device->max_bo_size;
++   if (!limit || size <= limit)
++      return false;
++   static uint64_t refusals;
++   const uint64_t refused = p_atomic_inc_return(&refusals);
++   uint64_t mark = 1;
++   while (mark < refused)
++      mark *= 10;
++   if (mark == refused)
++      mesa_loge("NativeAdreno: a %s of %llu MiB is past the kernel's per-object limit of %llu MiB (maxMemoryAllocationSize); refused "
++                "(%llu time%s)", what, (unsigned long long)((size + (1u << 20) - 1) >> 20), (unsigned long long)(limit >> 20),
++                (unsigned long long)refused, refused == 1 ? "" : "s");
++   return true;
++}
++
+ static VkResult
+ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+                struct tu_bo **out_bo, uint64_t size, uint64_t client_iova,
+@@ -952,6 +972,8 @@
+    VkResult collected = darwin_collect_retired(dev);
+    if (collected != VK_SUCCESS)
+       return collected;
++   if (darwin_past_bo_limit(dev, size, "BO"))
++      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+ 
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    /* TU_DARWIN_BO_CACHE=0 turns the cache off (the host checks of the release paths need every free to reach the kernel). */
+@@ -1075,6 +1097,8 @@
+ darwin_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer, uint64_t size)
+ {
+    if (!(dw.params.flags & NativeAdrenoParamsHostImport))
++      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   if (darwin_past_bo_limit(dev, size, "host import"))
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    VkResult collected = darwin_collect_retired(dev);
+    if (collected != VK_SUCCESS)
+@@ -1809,6 +1833,8 @@
+    device->heap.size = tu_get_system_heap_size(device);
+    device->heap.used = 0u;
+    device->heap.flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
++   /* The kernel's largest BO (Query's max_bo_bytes): maxMemoryAllocationSize, maxBufferSize and the images' maxResourceSize. */
++   device->max_bo_size = dw.virtgpu ? 0 : dw.params.max_bo_bytes;
+ 
+    instance->knl = &darwin_knl_funcs;
+ 
