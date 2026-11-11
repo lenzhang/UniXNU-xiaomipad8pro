@@ -811,8 +811,12 @@ def ram_test(s, image, expect_uefi, reset_after):
     # 2026-11-11: only the UNIXNURAMDISK lines). Until the expected line shows, or the UEFI is gone (DarwinBoot has taken over).
     lines = []
     for attempt in range(25 if s.execute else 1):
-        s.fastboot('oem', 'dump', 'D7F00000', '100000', serial='piano-uefi', check=False)
-        s.fastboot('get_staged', f'{name}-uefi.bin', serial='piano-uefi', check=False)
+        try:   # short: the UEFI may leave (DarwinBoot takes over) while a command runs, and fastboot then hangs
+            s.fastboot('oem', 'dump', 'D7F00000', '100000', serial='piano-uefi', check=False, timeout=15)
+            s.fastboot('get_staged', f'{name}-uefi.bin', serial='piano-uefi', check=False, timeout=15)
+        except subprocess.TimeoutExpired:
+            s.log('        (the UEFI left during the dump)')
+            break
         if not s.execute:
             break
         path = s.dir / f'{name}-uefi.bin'
