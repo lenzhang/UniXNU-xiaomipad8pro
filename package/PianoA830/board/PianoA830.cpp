@@ -978,7 +978,15 @@ void run(void *, wait_result_t)
       runPhase(RunWait);
       IOSleep(60000);
       runPhase(RunRoutes);
-      piano_a830_smmu_routes("60 s later");
+      // By now the GPU may sleep (piano-gpu-idle=2's slumber, a system suspend's full slumber): read only while it is up, holding it
+      // so (a slumber entry waits for the reader).
+      A830PowerState *power = adreno830_power_state();
+      if (!power || power->accessBegin(false)) {
+        piano_a830_smmu_routes("60 s later");
+        if (power) power->accessEnd(false);
+      } else {
+        piano_a830_note("SMMU routes (60 s later): skipped, the GPU sleeps (CX may be off: an unclocked SMMU read can hang the bus)");
+      }
     }
   }
   runPhase(RunDone);
