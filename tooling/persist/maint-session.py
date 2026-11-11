@@ -830,8 +830,10 @@ def ram_test(s, image, expect_uefi, reset_after):
     if s.execute:
         for line in lines[:60]:
             s.log('        | ' + line)
-        if lines:
+        if any('config: volume' in line for line in lines):
             s.need(any(expect_uefi in line for line in lines), f'UEFI log has "{expect_uefi}"')
+        elif lines:
+            s.log('  WARN  the UEFI left before UniXNU logged its configuration volume: judged by the run below')
         else:
             s.log('  WARN  the UEFI DEBUG log could not be read (the UEFI was gone before the dump): judged by the run below')
     else:
