@@ -244,7 +244,8 @@ partly discharged pack charges without the DSP is unmeasured. Note also:
   (`build-native-image.sh`), so it never touches the store.
 - Payload updates still need the cable: maintenance image, `backup` (new set) and `esp` with a new image. NativeUfs could later
   publish partition 37 so macOS updates its own payload.
-- The clock is the ESP build time (`droidvm-utc`), there is no RTC driver yet.
+- The clock is the ESP build time (`droidvm-utc`) unless the ESP is built with `--rtc-offset` on a k27 0060 kernel: then the
+  calendar starts from the PMIC RTC (`docs/drivers/rtc.md`; built, not yet run on the tablet).
 - Watchdog: not armed without `piano-reset-after`; panics restart (no `panic-spin`) into macOS again; the escape is power +
   volume-down.
 

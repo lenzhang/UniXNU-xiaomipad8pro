@@ -66,7 +66,8 @@ levels (9 V opt-in), charge current conservative, battery state on the console; 
   partition, SMP2P "slave-kernel" bits, GLINK items, crash reason) → both gauges. Then every 30 s: pack voltage (mean), current
   (sum, + = charging), state of charge (by full-charge capacity), temperature (the warmer pack), each pack's status word; the
   Type-C state (attached, source Rp seen = charger present) with the raw Type-C/USBIN/DCDC/charger status bytes; the DSP's
-  SMP2P bits. Writes: none to any PMIC register; the SPMI observer channel's command; the four gauge pins' TLMM configuration
+  SMP2P bits; the PMIC RTC's count and date (`rtc: ...`, [rtc.md](rtc.md), at start and with every report). Writes: none to any
+  PMIC register; the SPMI observer channel's command; the four gauge pins' TLMM configuration
   (GPIO, pull-up, output value 0, output enable toggled: open drain, never driven high), restored after each read.
 - **Level 2, charging.** Level 1 plus `piano_adsp_start` (after `piano-power-delay`, sheng's order in numbered steps, §5a:
   firmware from modem_a via NativeUfs + FAT → SMP2P item 429 → doorbells → AOSS `load_state adsp` → lcx/lmx at max through an
