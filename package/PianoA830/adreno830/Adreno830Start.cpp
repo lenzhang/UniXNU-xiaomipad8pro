@@ -21,6 +21,9 @@
 #include "A830PowerState.h"
 #include "A830Recovery.h"
 #include "A830Dcvs.h"
+#ifdef ADRENO830_MACOS
+#include "A830Idle.h"
+#endif
 #include "A830Trace.h"
 #include "NativeAdrenoABI.h"
 #include "NativeAdrenoFirmware.h"
@@ -61,6 +64,10 @@
 /* UniXNU-piano (macOS 27): the publish shell's definition (NativeAdrenoPublish.cpp) replaces this weak default, which the host tests
  * that link the orchestrator without the shell take: no snapshot line. */
 extern "C" __attribute__((weak)) void native_adreno_note_hang_snapshot(const A830HangSnapshot *) {}
+/* The idle policy's board hooks (A830Idle.h): mode 0 and no line without the board (the host tests). */
+extern "C" __attribute__((weak)) void adreno830_board_idle(A830IdleConfig *) {}
+extern "C" __attribute__((weak)) void adreno830_board_idle_event(const A830IdleEvent *) {}
+static A830IdleConfig gIdle;   /* piano-gpu-idle and its knobs (the board's), filled by bindPower */
 #endif
 
 /* An A830Irq window the bring-up trace forwards to (A830Trace.h): the window as bound, and its id for the lines. */
@@ -2233,6 +2240,18 @@ void bindPower(Adreno830Device *d)
     power.ifpc=knobs.ifpc!=0;power.ahbTimeout=knobs.ahbto!=0;power.defaultLevel=d->level;power.defaultBus=d->bus;
     /* pagani-screenoff bit 1: slumber while the display is off (bit 3: the full collapse instead of keeping CX). */
     power.screenSlumber=!(knobs.screenoff&2u)?A830SlumberOff:(knobs.screenoff&8u)?A830SlumberFull:A830SlumberCxKeep;
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (A830Idle.h): piano-gpu-idle=2 with its slumber is P1's full collapse after piano-gpu-idle-ms, unless
+     * piano-gpu-slumber chose a mode itself. No touch pre-wake from level 1 on: nothing on piano counts touches for it
+     * (pagani_input_touch_events), and asleep the thread then looked at that counter every 16 ms for nothing. */
+    gIdle=A830IdleConfig{};
+    adreno830_board_idle(&gIdle);
+    if(gIdle.mode>=1)power.touchPrewake=false;
+    if(gIdle.mode>=2 && gIdle.slumber && !(d->board->flags&(1u<<Adreno830KnobSlumber))) {
+        power.slumber=A830SlumberFull;
+        power.idleMs=gIdle.idleMs;
+    }
+#endif
     d->power_state.init(power,d->power_win,d->power_env,d->power_ops);
     d->power_state.setFaultSink(powerFaultSink,nullptr);
     A830RecoveryConfig recovery;
@@ -2259,6 +2278,120 @@ IOReturn dcvsHostDdr(void *,uint32_t kbps)
 {
     return Sm8750RpmhHostDdr(&g830.host,kbps)==Sm8750RpmhOk?kIOReturnSuccess:kIOReturnIOError;
 }
+#ifdef ADRENO830_MACOS
+/* ===== UniXNU-piano: the idle votes (A830Idle.h, piano-gpu-idle=2) ============================================================ */
+A830IdleVotes gIdleVotes;
+uint32_t gIdleDdrFloorKbps;   /* the host DDR vote while the GPU is not idle: S5's floor, or in mode 2 the display's (stageDcvs) */
+struct IdleReport {
+    uint64_t periodStart=0,downSince=0,downNs=0;
+    uint32_t downs=0,ups=0,slumbers=0,wakes=0,maxWakeUs=0;   /* in the period */
+    uint32_t seenEntries=0,seenWakes=0;
+    uint64_t seenSleptNs=0;
+    bool slumberOffSaid=false;
+} gIdleReport;
+uint32_t railVlvl(const Sm8750RpmhArc &arc,uint32_t hlvl) {return hlvl<arc.count?arc.vlvl[hlvl]:0;}
+void idleEvent(A830IdleEvent event)
+{
+    const Sm8750RpmhHost &h=g830.host;
+    event.ddrKbps=h.ddr_kbps;
+    event.ddrLevel=0;
+    for(uint8_t level=0;g830.board && level<g830.board->ddr_levels;++level)
+        if(adreno830_ddr_kbps(level)==h.ddr_kbps)event.ddrLevel=level;
+    event.cxVlvl=h.res?railVlvl(h.res->cx,h.cx_hlvl):0;
+    event.mxVlvl=h.res?railVlvl(h.res->mx,h.mx_hlvl):0;
+    adreno830_board_idle_event(&event);
+}
+/* Down: the DDR vote to the display's floor (only lower than what is held), then the rails to the idle level (lowering only, cx first:
+ * Sm8750RpmhHostRailsIdle). Up: the rails as S1 chose them (pagani-gpu-rails: the top), then the DDR floor S5 left (pagani-gpu-ddr-floor,
+ * = the boot level). Every one of them goes through Sm8750RpmhWriteActive, which takes the DRV-2 lock, as for every vote of this driver. */
+int idleVotesDown()
+{
+    const uint32_t floor=adreno830_ddr_kbps(gIdle.ddrLevel);
+    int rc=Sm8750RpmhOk;
+    if(floor && floor<g830.host.ddr_kbps)rc=Sm8750RpmhHostDdr(&g830.host,floor);
+    if(!rc)rc=Sm8750RpmhHostRailsIdle(&g830.host,gIdle.railVlvl);
+    return rc;
+}
+int idleVotesUp()
+{
+    const Adreno830Board *b=g830.board;
+    int rc=Sm8750RpmhHostRails(&g830.host,int(b->knobs.rails));
+    const int ddr=g830.host.ddr_kbps==gIdleDdrFloorKbps?int(Sm8750RpmhOk):Sm8750RpmhHostDdr(&g830.host,gIdleDdrFloorKbps);
+    return rc?rc:ddr;
+}
+uint64_t dcvsIdleTick(void *,uint64_t now,bool quiet,uint64_t lastSubmit)
+{
+    IdleReport &r=gIdleReport;
+    if(!r.periodStart)r.periodStart=now;
+    /* The slumbers and wakes A830PowerState counted since the last look (its own counters; their lines from here). */
+    const A830PowerStats &ps=g830.power_state.stats();
+    while(r.seenEntries<ps.entries) {
+        ++r.seenEntries;++r.slumbers;
+        if(A830IdleLogged(r.seenEntries)) {
+            A830IdleEvent e{};e.kind=A830IdleEventSlumber;e.count=r.seenEntries;e.us=ps.lastEntryUs;e.ms=gIdle.idleMs;
+            idleEvent(e);
+        }
+    }
+    while(r.seenWakes<ps.wakes) {
+        ++r.seenWakes;++r.wakes;
+        if(ps.lastWakeUs>r.maxWakeUs)r.maxWakeUs=ps.lastWakeUs;
+        if(A830IdleLogged(r.seenWakes)) {
+            A830IdleEvent e{};e.kind=A830IdleEventWake;e.count=r.seenWakes;e.us=ps.lastWakeUs;
+            e.ms=(ps.sleptNs-r.seenSleptNs)/1000000u;   /* asleep since the last look (one sleep but for a burst) */
+            idleEvent(e);
+        }
+    }
+    r.seenSleptNs=ps.sleptNs;
+    if(ps.slumberBlocked && !r.slumberOffSaid) {
+        r.slumberOffSaid=true;
+        A830IdleEvent e{};e.kind=A830IdleEventSlumberOff;e.count=ps.failures;e.result=int32_t(ps.lastError);e.us=ps.lastStep;
+        idleEvent(e);
+    }
+    uint64_t next=0;
+    const A830IdleAction action=gIdleVotes.step(now,quiet,lastSubmit,gIdle.idleMs,&next);
+    if(action==A830IdleDown) {
+        const int rc=idleVotesDown();
+        gIdleVotes.done(action,rc==Sm8750RpmhOk,now,lastSubmit);
+        A830IdleEvent e{};
+        if(rc==Sm8750RpmhOk) {
+            ++r.downs;r.downSince=now;
+            e.kind=A830IdleEventDown;e.count=gIdleVotes.downs;e.ms=(now-lastSubmit)/1000000u;
+            if(A830IdleLogged(e.count))idleEvent(e);
+        } else {
+            (void)idleVotesUp();   /* best effort: what went down comes back */
+            e.kind=A830IdleEventFailed;e.result=rc;e.count=gIdleVotes.failures;
+            idleEvent(e);
+        }
+    } else if(action==A830IdleUp) {
+        const int rc=idleVotesUp();
+        gIdleVotes.done(action,rc==Sm8750RpmhOk,now,lastSubmit);
+        A830IdleEvent e{};
+        if(r.downSince) {r.downNs+=now-r.downSince;e.ms=(now-r.downSince)/1000000u;r.downSince=0;}
+        if(rc==Sm8750RpmhOk) {
+            ++r.ups;
+            e.kind=A830IdleEventUp;e.count=gIdleVotes.ups;
+            if(A830IdleLogged(e.count))idleEvent(e);
+        } else {
+            e.kind=A830IdleEventFailed;e.result=rc;e.count=gIdleVotes.failures;
+            idleEvent(e);
+        }
+    }
+    /* Once a minute, when anything happened in it: the summary (every transition past the logged ones is only counted here). */
+    if(now-r.periodStart>=60000000000ull) {
+        uint64_t down=r.downNs;
+        if(r.downSince)down+=now-r.downSince;
+        if(r.downs || r.ups || r.slumbers || r.wakes) {
+            A830IdleEvent e{};e.kind=A830IdleEventSummary;e.ms=(now-r.periodStart)/1000000u;
+            e.downs=r.downs;e.ups=r.ups;e.slumbers=r.slumbers;e.wakes=r.wakes;e.maxWakeUs=r.maxWakeUs;
+            e.downPermille=uint32_t(down*1000u/(now-r.periodStart));
+            idleEvent(e);
+        }
+        r.periodStart=now;r.downNs=0;if(r.downSince)r.downSince=now;
+        r.downs=r.ups=r.slumbers=r.wakes=r.maxWakeUs=0;
+    }
+    return next;
+}
+#endif
 void dcvsPollFaults(void *)
 {
     if(g830.gmu.interruptsOff() || !g830.gmu.interruptsWired())g830.gmu.pollFatal();
@@ -2309,7 +2442,29 @@ IOReturn stageDcvs(Adreno830Device *d,Adreno830Failure *f)
     config.hostBootKbps=adreno830_ddr_kbps(b->knobs.ddr_boot);
     config.hostFloorKbps=adreno830_ddr_kbps(b->knobs.ddr_floor);
     const A830DcvsTable table={d->votes.level,d->votes.levels,b->ddr_kbps,b->ddr_levels};
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (A830Idle.h): from piano-gpu-idle=1 on no wake boost (an isolated frame runs at the floor) and the idle window;
+     * from 2 on the idle votes. */
+    if(gIdle.mode>=1) {config.wakeBoostKhz=0;config.idleWindowMs=gIdle.windowMs;}
+    gIdleVotes=A830IdleVotes{};gIdleReport=IdleReport{};
+    gIdleDdrFloorKbps=config.hostFloorKbps;
+    /* Mode 2: the boot bandwidth vote goes now that the GMU votes the GPU's own (S5, and at every wake): the host DDR vote falls to
+     * the display's floor for the rest of the boot, unless pagani-gpu-ddr-floor chose a floor. The DCVS thread is not running yet:
+     * this thread still owns the host votes. A failed vote keeps the boot vote (the line says so). */
+    if(gIdle.mode>=2 && !(b->flags&(1u<<Adreno830KnobDdrFloor))) {
+        const uint32_t floor=adreno830_ddr_kbps(gIdle.ddrLevel);
+        if(floor && floor<d->host.ddr_kbps) {
+            A830IdleEvent e{};e.kind=A830IdleEventFloor;
+            e.result=Sm8750RpmhHostDdr(&d->host,floor);
+            if(e.result==Sm8750RpmhOk)gIdleDdrFloorKbps=config.hostFloorKbps=floor;
+            idleEvent(e);
+        }
+    }
+    const A830DcvsOps ops={nullptr,dcvsPerfVote,dcvsHostDdr,dcvsPollFaults,dcvsMemoryRow,dcvsQueueRow,
+                           gIdle.mode>=2?dcvsIdleTick:nullptr};
+#else
     const A830DcvsOps ops={nullptr,dcvsPerfVote,dcvsHostDdr,dcvsPollFaults,dcvsMemoryRow,dcvsQueueRow};
+#endif
     d->tsens_io={nullptr,tsensRead};
     IOReturn r=d->dcvs.init(config,table,d->power_win,d->power_env,ops,&d->power_state,&d->recovery,
                             mapped(A830WinTsensTm)?&d->tsens_io:nullptr);

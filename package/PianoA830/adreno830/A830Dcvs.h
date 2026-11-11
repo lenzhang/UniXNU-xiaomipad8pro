@@ -119,6 +119,11 @@ struct A830DcvsConfig {
     uint32_t voteRetryMs=1000;
     uint32_t underrunHoldMs=10000;      /* bus-max and the raised host floor end after this long without growth */
     uint32_t statusMs=1000;             /* status rows, fault poll, memory row, underrun check */
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (A830Idle.h, piano-gpu-idle >= 1): the window while the governor idles at the floor (0: windowMs); a submission wakes
+     * the thread anyway (noteSubmit). */
+    uint32_t idleWindowMs=0;
+#endif
     uint32_t residencyMs=10000;         /* residency window of the DCVS row */
     /* annibale profile (kernel-sequences 13, section 14 row 38) */
     uint32_t annibaleMaxKhz=342000;     /* first-round ceiling while pagani-gpu-dcvs-max is not given */
@@ -136,6 +141,11 @@ struct A830DcvsOps {
     /* The ring's queue period into the status block (A830Fence::takeQueue + adreno830_status_queue, ARCHITECTURE 4.13.5),
      * once a second after the memory row, awake or asleep, before the DCVS row publishes; may be null. */
     void (*queueRow)(void *context);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (A830Idle.h): every service tick, after the slumber step: the idle votes. quiet: the GPU up or asleep with nothing
+     * in flight and no holder; lastSubmitNs: the newest submission. Returns the next time it needs a look (ns), 0 for none. May be null. */
+    uint64_t (*idleTick)(void *context,uint64_t now,bool quiet,uint64_t lastSubmitNs);
+#endif
 };
 
 struct A830DcvsStats {

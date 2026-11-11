@@ -205,6 +205,9 @@ uint64_t A830PowerState::tick(uint64_t now)
     /* The screen rule (config.screenSlumber) where P1 is not configured: its mode once the display has been off and the GPU
      * quiet for screenIdleMs, counted from the later of the two. */
     uint8_t mode=config_.slumber;
+#ifdef ADRENO830_MACOS
+    if(stats_.slumberBlocked)mode=A830SlumberOff;   /* UniXNU-piano: a P1 failure ended P1 for the boot */
+#endif
     uint64_t from=since,wait=idleNs;
     const bool screen=mode==A830SlumberOff && config_.screenSlumber!=A830SlumberOff && screenOff() && !stats_.screenBlocked;
     if(screen) {
@@ -274,6 +277,9 @@ void A830PowerState::fail(uint16_t step,IOReturn result,uint8_t cause)
     ++stats_.failures;stats_.lastStep=step;stats_.lastError=result;
     /* A slumber the screen rule began, or the wake from one taken while the display was off: the rule ends for the boot. */
     if(screenEntering_ || screenSlept())stats_.screenBlocked=true;
+#ifdef ADRENO830_MACOS
+    else if(config_.slumber!=A830SlumberOff)stats_.slumberBlocked=true;   /* UniXNU-piano: P1 off for the boot (A830PowerStats) */
+#endif
     /* The GPU is in an unknown state: nobody may use it until the recovery has run (or for good without one). */
     __atomic_store_n(&phase_,uint8_t(sink_?A830PowerRecovering:A830PowerLost),__ATOMIC_SEQ_CST);
     if(sink_)sink_(sinkContext_,cause,uint64_t(step)<<32|uint32_t(result));

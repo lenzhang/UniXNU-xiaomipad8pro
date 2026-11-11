@@ -265,12 +265,26 @@ uint64_t A830Dcvs::serviceTick(uint64_t now)
         const bool teMode=__atomic_load_n(&vsyncs_,__ATOMIC_ACQUIRE) &&
                           now-__atomic_load_n(&lastVsyncNs_,__ATOMIC_ACQUIRE)<ms(config_.teTimeoutMs);
         const uint32_t vsyncs=__atomic_load_n(&vsyncs_,__ATOMIC_ACQUIRE);
+#ifdef ADRENO830_MACOS
+        /* UniXNU-piano: idle at the floor, the window stretches (A830DcvsConfig::idleWindowMs); the next submission wakes the thread
+         * and its steer applies at once. */
+        const uint32_t windowMs=__atomic_load_n(&idle_,__ATOMIC_ACQUIRE) && config_.idleWindowMs?config_.idleWindowMs:config_.windowMs;
+        const bool due=teMode?vsyncs-windowVsyncs_>=2u || now-lastWindow_>=ms(config_.teTimeoutMs)
+                             :now-lastWindow_>=ms(windowMs);
+#else
         const bool due=teMode?vsyncs-windowVsyncs_>=2u || now-lastWindow_>=ms(config_.teTimeoutMs)
                              :now-lastWindow_>=ms(config_.windowMs);
+#endif
         if(due || !haveSample_)window(now);
         /* Boosts can start between windows (first submission after idle, a touch): apply them right away. */
         steer(now);
+#ifdef ADRENO830_MACOS
+        /* After the window and the steer: the window may have begun the idle, a submission the steer saw ended it. */
+        const uint32_t nextMs=__atomic_load_n(&idle_,__ATOMIC_ACQUIRE) && config_.idleWindowMs?config_.idleWindowMs:config_.windowMs;
+        const uint64_t windowNext=lastWindow_+ms(teMode?config_.teTimeoutMs:nextMs);
+#else
         const uint64_t windowNext=lastWindow_+ms(teMode?config_.teTimeoutMs:config_.windowMs);
+#endif
         if(windowNext<next)next=windowNext;
     } else {
         /* Asleep (or being recovered): no register, no vote. The GPU is idle, so the governor sits at the floor and
@@ -298,6 +312,15 @@ uint64_t A830Dcvs::serviceTick(uint64_t now)
     /* 6. Once a second: status rows, memory row, unwired fault lines, underruns. */
     if(now>=nextStatus_) {periodic(now);nextStatus_=now+ms(config_.statusMs);}
     if(nextStatus_<next)next=nextStatus_;
+#ifdef ADRENO830_MACOS
+    /* 7. UniXNU-piano: the idle votes (A830Idle.h), on this thread, which owns the host votes after S10. */
+    if(ops_.idleTick) {
+        const A830PowerPhase phase=power_->phase();
+        const bool quiet=(phase==A830PowerActive || phase==A830PowerSlumber) && !power_->inFlight() && !power_->holders();
+        const uint64_t idleNext=ops_.idleTick(ops_.context,now,quiet,__atomic_load_n(&lastSubmitNs_,__ATOMIC_ACQUIRE));
+        if(idleNext && idleNext<next)next=idleNext;
+    }
+#endif
     return next>now?next:now+ms(1);
 }
 

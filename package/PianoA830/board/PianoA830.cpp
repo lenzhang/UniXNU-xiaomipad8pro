@@ -31,6 +31,7 @@
 #include <string.h>
 #include "PianoA830.h"
 #include "PianoA830Rows.h"
+#include "A830Idle.h"
 #include "Adreno830Status.h"
 #include "Adreno830Device.h"
 #include "NativeAdrenoPublish.h"
@@ -283,6 +284,96 @@ extern "C" uint32_t adreno830_board_hang_ms(void)
   const uint32_t ms = bootArg("piano-gpu-hang-ms", 0);
   if (!ms) return 0;
   return ms < 1000 ? 1000 : ms > 60000 ? 60000 : ms;
+}
+
+namespace {
+__attribute__((format(printf, 1, 2))) void gpuLine(const char *format, ...)
+{
+  char line[RingBytes];
+  va_list ap;
+  va_start(ap, format);
+  vsnprintf(line, sizeof line, format, ap);
+  va_end(ap);
+  boot_progress_gpu_event(line);
+}
+}  // namespace
+
+// The GPU's idle policy (adreno830/A830Idle.h):
+//   piano-gpu-idle=0|1|2 (default 1): 0 as before; 1 the DCVS floor (no wake boost, the idle window); 2 + the idle votes and slumber;
+//   piano-gpu-idle-ms=<ms> (1000, 100..60000): quiet this long -> the idle votes and slumber;
+//   piano-gpu-idle-slumber=0|1 (1): with 2, also P1's full slumber (0: the votes alone);
+//   piano-gpu-idle-ddr=<level> (the scanout's: twice the panel's read rate at 120 Hz, from the boot framebuffer): the host DDR bus level
+//       while idle, never above the level held;
+//   piano-gpu-idle-rails=<vlvl> (0x140, RPMh NOM_L1: the lit panel's CX through MMCX; 0 keeps them): the host CX/MX level while
+//       idle, never above the level held.
+extern "C" void adreno830_board_idle(A830IdleConfig *config)
+{
+  if (!config) return;
+  config->mode = uint8_t(bootArg("piano-gpu-idle", 1) > 2 ? 2 : bootArg("piano-gpu-idle", 1));
+  const uint32_t ms = bootArg("piano-gpu-idle-ms", 1000);
+  config->idleMs = ms < 100 ? 100 : ms > 60000 ? 60000 : ms;
+  config->slumber = bootArg("piano-gpu-idle-slumber", 1) != 0;
+  config->railVlvl = bootArg("piano-gpu-idle-rails", 0x140);
+  // The scanout: the GOP framebuffer the panel reads from DDR at ABL's 120 Hz (NativeGopDisplay copies frames into it).
+  const Adreno830Board *board = piano_a830_board();
+  PE_Video video = {};
+  uint32_t width = 3200, height = 2136, scanout = 0;
+  if (IOService::getPlatform() && IOService::getPlatform()->getConsoleInfo(&video) == kIOReturnSuccess && video.v_width && video.v_height) {
+    width = uint32_t(video.v_width);
+    height = uint32_t(video.v_height);
+  }
+  uint8_t floor = board && board->ddr_kbps ? A830IdleScanoutLevel(board->ddr_kbps, board->ddr_levels, width, height, 4, 120, 2000, &scanout) : 5;
+  const uint32_t asked = bootArg("piano-gpu-idle-ddr", 0xff);
+  if (asked != 0xff && board && asked < board->ddr_levels) floor = uint8_t(asked);
+  config->ddrLevel = floor;
+  gpuLine("idle: piano-gpu-idle=%u (slumber %u, after %u ms); idle DDR level %u (%u MB/s; %ux%u scanout %u MB/s at 120 Hz), "
+          "rails vlvl %#x", config->mode, config->mode >= 2 && config->slumber ? 1u : 0u, config->idleMs, floor,
+          board && board->ddr_kbps && floor < board->ddr_levels ? board->ddr_kbps[floor] / 1000 : 0, width, height, scanout / 1000,
+          config->railVlvl);
+}
+
+extern "C" void adreno830_board_idle_event(const A830IdleEvent *e)
+{
+  if (!e) return;
+  switch (e->kind) {
+  case A830IdleEventDown:
+    gpuLine("idle: votes down after %llu ms quiet (#%u): DDR level %u (%u MB/s), CX %#x MX %#x", (unsigned long long)e->ms, e->count,
+            e->ddrLevel, e->ddrKbps / 1000, e->cxVlvl, e->mxVlvl);
+    break;
+  case A830IdleEventUp:
+    gpuLine("idle: votes up after %llu ms down (#%u): DDR level %u (%u MB/s), CX %#x MX %#x", (unsigned long long)e->ms, e->count,
+            e->ddrLevel, e->ddrKbps / 1000, e->cxVlvl, e->mxVlvl);
+    break;
+  case A830IdleEventSlumber:
+    gpuLine("idle -> slumber after %llu ms quiet (#%u, entry %u us); votes CX %#x MX %#x DDR level %u (%u MB/s)",
+            (unsigned long long)e->ms, e->count, e->us, e->cxVlvl, e->mxVlvl, e->ddrLevel, e->ddrKbps / 1000);
+    break;
+  case A830IdleEventWake:
+    gpuLine("wake after %llu ms asleep (#%u): the wake took %u.%03u ms (what the first submission waited)", (unsigned long long)e->ms,
+            e->count, e->us / 1000, e->us % 1000);
+    break;
+  case A830IdleEventFailed:
+    gpuLine("idle: a host vote failed (rpmh %d, #%u): no idle votes for this boot; DDR level %u CX %#x MX %#x", e->result, e->count,
+            e->ddrLevel, e->cxVlvl, e->mxVlvl);
+    break;
+  case A830IdleEventSlumberOff:
+    gpuLine("idle: a slumber or wake failed (step %#x, %#x, %u failures): no slumber for this boot", e->us, unsigned(e->result), e->count);
+    break;
+  case A830IdleEventFloor:
+    if (!e->result)
+      gpuLine("idle: the boot DDR vote went to the display's floor, level %u (%u MB/s); the GMU votes the GPU's own", e->ddrLevel,
+              e->ddrKbps / 1000);
+    else
+      gpuLine("idle: the boot DDR vote could not drop (rpmh %d): level %u (%u MB/s) stays", e->result, e->ddrLevel, e->ddrKbps / 1000);
+    break;
+  case A830IdleEventSummary:
+    gpuLine("idle last %llu s: votes down %u, up %u, down %u.%u %% of the time; slumbers %u, wakes %u, longest wake %u.%03u ms",
+            (unsigned long long)(e->ms / 1000), e->downs, e->ups, e->downPermille / 10, e->downPermille % 10, e->slumbers, e->wakes,
+            e->maxWakeUs / 1000, e->maxWakeUs % 1000);
+    break;
+  default:
+    break;
+  }
 }
 extern "C" void boot_progress_display_status(const char *detail, uint64_t value)
 {

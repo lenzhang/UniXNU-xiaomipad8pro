@@ -34,6 +34,9 @@
 #include "A830PowerState.h"
 #include "A830Recovery.h"
 #include "A830Dcvs.h"
+#ifdef ADRENO830_MACOS
+#include "A830Idle.h"   /* UniXNU-piano */
+#endif
 #include "NativeAdrenoABI.h"
 #include "NativeAdrenoGmuContext.h"
 #include "NativeAdrenoGmuMemory.h"
@@ -252,11 +255,33 @@ int Sm8750RpmhHostCn0(Sm8750RpmhHost *host)
     host->held|=Sm8750RpmhHeldCn0;
     return Sm8750RpmhOk;
 }
+#ifdef ADRENO830_MACOS
+int Sm8750RpmhHostRailsIdle(Sm8750RpmhHost *host,uint32_t vlvl)   /* UniXNU-piano (A830Idle.h): piano-gpu-idle=2 only */
+{
+    if(hit("Sm8750RpmhHostRailsIdle"))return Sm8750RpmhTimeout;
+    if(vlvl)counts["rails-idle"]++;
+    (void)host;
+    return Sm8750RpmhOk;
+}
+}
+/* UniXNU-piano: the board's idle hooks (A830Idle.h): what the case sets, mode 0 (the weak defaults' answer) unless a case says. */
+static A830IdleConfig testIdle;
+static std::vector<A830IdleEvent> idleEvents;
+extern "C" void adreno830_board_idle(A830IdleConfig *config) {*config=testIdle;}
+extern "C" void adreno830_board_idle_event(const A830IdleEvent *event) {idleEvents.push_back(*event);}
+extern "C" {
+#endif
 static std::vector<uint32_t> ddrVotes;
+#ifdef ADRENO830_MACOS
+static uint32_t ddrFailKbps;   /* UniXNU-piano: a vote of exactly this rate fails (the S10 floor drop of piano-gpu-idle=2) */
+#endif
 int Sm8750RpmhHostDdr(Sm8750RpmhHost *host,uint32_t kbps)
 {
     if(ioScript.ddr)ioScript.ddr(host->drv2,kbps);
     if(hit("Sm8750RpmhHostDdr"))return Sm8750RpmhTimeout;
+#ifdef ADRENO830_MACOS
+    if(ddrFailKbps && kbps==ddrFailKbps)return Sm8750RpmhTimeout;
+#endif
     ddrVotes.push_back(kbps);host->held|=Sm8750RpmhHeldDdr;host->ddr_kbps=kbps;
     return Sm8750RpmhOk;
 }
@@ -963,7 +988,11 @@ extern "C" bool native_adreno_note_page_fault(uint64_t far,uint32_t completed,ui
 extern "C" uint32_t native_adreno_coherent_imports(void) {return 1;}
 IOReturn A830PowerState::init(const A830PowerConfig &config,const A830PowerIo &io,const A830PowerEnv &env,const A830PowerOps &ops)
 {
+#ifdef ADRENO830_MACOS
+    CHECK((config.slumber==A830SlumberOff || testIdle.mode>=2) && !config.ifpc && io.read32 && env.lock && env.startThread);
+#else
     CHECK(config.slumber==A830SlumberOff && !config.ifpc && io.read32 && env.lock && env.startThread);
+#endif
     CHECK(ops.cxPowerOn && ops.cxPowerOff && ops.smmuRestore && ops.cxTimerSeed && ops.gmuStart && ops.gmuForceOff &&
           ops.rsccSleep && ops.oobSet && ops.oobClear && ops.hfiSend && ops.cpStart && ops.secureResume && ops.irqEnable &&
           ops.lastSubmitted && ops.retired);
@@ -1993,6 +2022,89 @@ int main()
         CHECK(run(&b)==kIOReturnSuccess && !adreno830_status_current_diag());
         diagCases+=2;
     }
+#ifdef ADRENO830_MACOS
+    /* ---- UniXNU-piano: piano-gpu-idle (A830Idle.h) through the board hook: 0 as before; 1 no wake boost, the 250 ms idle window,
+     * no touch pre-wake; 2 also P1's full slumber after idle-ms (unless pagani-gpu-slumber chose) and the idle votes on the DCVS
+     * thread: down after the quiet time (DDR to the display's floor, the rails to NOM_L1), held while quiet, up at the next submission
+     * (rails, then the DDR floor S5 left), a line for each; a failed vote puts back what went down and ends them for the boot. --- */
+    unsigned idleCases=0;
+    {
+        struct Mode {uint8_t mode;bool slumber,knob;uint8_t want;bool tick;};
+        const Mode modes[]={{0,true,false,A830SlumberOff,false},{1,true,false,A830SlumberOff,false},
+            {2,true,false,A830SlumberFull,true},{2,false,false,A830SlumberOff,true},{2,true,true,A830SlumberOff,true}};
+        for(const Mode &m:modes) {
+            testIdle=A830IdleConfig{};testIdle.mode=m.mode;testIdle.slumber=m.slumber;
+            b=board13t();
+            if(m.knob) {b.knobs.slumber=0;b.flags|=1u<<Adreno830KnobSlumber;}
+            CHECK(run(&b)==kIOReturnSuccess && powerStarted);
+            CHECK(powerConfig.slumber==m.want && powerConfig.touchPrewake==(m.mode==0) &&
+                  (m.want==A830SlumberOff || powerConfig.idleMs==1000));
+            CHECK(lastDcvs.wakeBoostKhz==(m.mode?0u:525000u) && lastDcvs.idleWindowMs==(m.mode?250u:0u) &&
+                  (lastDcvsOps.idleTick!=nullptr)==m.tick);
+            ++idleCases;
+        }
+        /* Mode 2 by default: the boot DDR vote (level 11) falls to the display's floor at S10, after S5's, before the DCVS starts;
+         * the idle votes then move the rails alone. */
+        testIdle=A830IdleConfig{};testIdle.mode=2;
+        idleEvents.clear();
+        b=board13t();
+        CHECK(run(&b)==kIOReturnSuccess && ddrVotes==std::vector<uint32_t>({18597656,6671875}) && lastDcvs.hostFloorKbps==6671875);
+        CHECK(position("Sm8750RpmhHostDdr")<position("A830Dcvs::init") && trace[size_t(position("A830Dcvs::init"))-1]=="Sm8750RpmhHostDdr");
+        CHECK(idleEvents.size()==1 && idleEvents[0].kind==A830IdleEventFloor && idleEvents[0].result==0 && idleEvents[0].ddrLevel==5);
+        auto tick=lastDcvsOps.idleTick;
+        const uint64_t s=5000000000ull,ms=1000000ull;
+        ddrVotes.clear();idleEvents.clear();
+        unsigned top=called("rails-top");
+        CHECK(tick(nullptr,s+1000*ms,true,s)==0 && ddrVotes.empty() && called("rails-idle")==1 && trace.back()=="Sm8750RpmhHostRailsIdle");
+        CHECK(idleEvents.size()==1 && idleEvents[0].kind==A830IdleEventDown && idleEvents[0].ddrLevel==5);
+        CHECK(tick(nullptr,s+2001*ms,true,s+2000*ms)==0 && ddrVotes.empty() && called("rails-top")==top+1 &&
+              trace.back()=="Sm8750RpmhHostRails");
+        CHECK(idleEvents.size()==2 && idleEvents[1].kind==A830IdleEventUp && idleEvents[1].ddrLevel==5);
+        ++idleCases;
+        /* A failed floor vote: the boot vote stays, the line says so, the idle votes carry the DDR. */
+        ddrFailKbps=6671875;
+        idleEvents.clear();
+        b=board13t();
+        CHECK(run(&b)==kIOReturnSuccess && lastDcvs.hostFloorKbps==18597656 && ddrVotes==std::vector<uint32_t>({18597656}));
+        CHECK(idleEvents.size()==1 && idleEvents[0].kind==A830IdleEventFloor && idleEvents[0].result==Sm8750RpmhTimeout &&
+              idleEvents[0].ddrLevel==11);
+        ddrFailKbps=0;
+        ++idleCases;
+        /* piano-gpu-ddr-floor given (here the boot level): no S10 drop; the idle votes take the DDR down and back. */
+        b=board13t();b.knobs.ddr_floor=11;b.flags|=1u<<Adreno830KnobDdrFloor;
+        CHECK(run(&b)==kIOReturnSuccess && ddrVotes==std::vector<uint32_t>({18597656}));
+        tick=lastDcvsOps.idleTick;
+        ddrVotes.clear();idleEvents.clear();
+        top=called("rails-top");
+        CHECK(tick(nullptr,s+500*ms,true,s)==s+1000*ms && ddrVotes.empty() && !called("rails-idle"));
+        CHECK(tick(nullptr,s+1000*ms,false,s)==0 && ddrVotes.empty());      /* work in flight */
+        CHECK(tick(nullptr,s+1000*ms,true,s)==0 && ddrVotes==std::vector<uint32_t>({6671875}) && called("rails-idle")==1);
+        CHECK(trace.size()>=2 && trace[trace.size()-2]=="Sm8750RpmhHostDdr" && trace.back()=="Sm8750RpmhHostRailsIdle");
+        CHECK(idleEvents.size()==1 && idleEvents[0].kind==A830IdleEventDown && idleEvents[0].ms==1000 && idleEvents[0].count==1 &&
+              idleEvents[0].ddrLevel==5 && idleEvents[0].ddrKbps==6671875);
+        CHECK(tick(nullptr,s+9000*ms,true,s)==0 && ddrVotes.size()==1 && called("rails-top")==top);
+        CHECK(tick(nullptr,s+9001*ms,true,s+9000*ms)==0 && ddrVotes.size()==2 && ddrVotes[1]==18597656 &&
+              called("rails-top")==top+1);
+        CHECK(trace[trace.size()-2]=="Sm8750RpmhHostRails" && trace.back()=="Sm8750RpmhHostDdr");   /* rails first */
+        CHECK(idleEvents.size()==2 && idleEvents[1].kind==A830IdleEventUp && idleEvents[1].ms==8001 && idleEvents[1].ddrLevel==11);
+        /* A minute after the first look: the summary (one down, one up, 8 s down of 60 s: 133 permille). */
+        CHECK(tick(nullptr,s+60600*ms,false,s+9000*ms)==0 && idleEvents.size()==3 && idleEvents[2].kind==A830IdleEventSummary &&
+              idleEvents[2].downs==1 && idleEvents[2].ups==1 && idleEvents[2].downPermille==133);
+        /* A failed rails vote: the DDR that went down comes back, one Failed line, and never again this boot. */
+        faults["Sm8750RpmhHostRailsIdle"]={kIOReturnTimeout,0,0,0};
+        CHECK(tick(nullptr,s+70000*ms,true,s+9000*ms)==0 && ddrVotes.size()==4 && ddrVotes[2]==6671875 && ddrVotes[3]==18597656);
+        CHECK(idleEvents.size()==4 && idleEvents[3].kind==A830IdleEventFailed && idleEvents[3].result==Sm8750RpmhTimeout);
+        faults.erase("Sm8750RpmhHostRailsIdle");
+        CHECK(tick(nullptr,s+90000*ms,true,s+9000*ms)==0 && ddrVotes.size()==4 && idleEvents.size()==4);
+        ++idleCases;
+        testIdle=A830IdleConfig{};
+    }
+    std::printf("PASS: piano-gpu-idle (UniXNU-piano): %u full runs (modes 0, 1, 2 with and without its slumber, pagani-gpu-slumber's "
+                "choice kept; mode 2 drops the boot DDR vote to the display's floor at S10, a failed drop keeps it, a chosen "
+                "pagani-gpu-ddr-floor is kept) and the idle votes through the DCVS hook (down after 1 s quiet to DDR level 5 and "
+                "NOM_L1 rails, held, up at the next submission rails first, the minute's summary, a failed vote undone and final)\n",
+                idleCases);
+#endif
     std::printf("PASS: pagani-diag: %u cases (off when absent, its own name, no flag bit, S0 hands it over)\n",diagCases);
     std::printf("PASS: pagani-gpu-kopt: %u cases (all on when absent, stored by S0 as given, a bit past the known ones refused)\n",koptCases);
     std::printf("PASS: pagani-screenoff: %u full runs (bit 1 the screen rule with CX kept, bit 3 the full collapse, other bits "

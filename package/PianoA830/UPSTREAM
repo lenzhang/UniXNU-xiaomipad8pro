@@ -4,16 +4,45 @@ PianoA830 is the Adreno830 A830 kernel GPU driver (OnePlus 13T lineage) as a k27
 Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), main 1a1321056ffc5428ae925f4680093718b46ca7c2
 (unixnu.lock pin."Adreno830"), MIT (adreno830/LICENSE, sha256 16fbc0170994a48f60938d9f0d992d3bad113383cf90882f75c206e079c2a2dc).
   Copied into adreno830/: every file of the repository except docs/ and AGENTS.md (the design documents stay upstream; read them
-  there), 156 files unchanged (sha256 equal to the originals). Hardware-proven on the 13T: S0-S10 and a GPU-composited desktop under
+  there), 148 files unchanged (sha256 equal to the originals). Hardware-proven on the 13T: S0-S10 and a GPU-composited desktop under
   iPadOS 17.7.11 (gpu-native-plan.md section 2). Changed, every change marked "UniXNU-piano" in a comment and compiled only with
   -DADRENO830_MACOS (the host tests build without it, so they test the upstream code paths):
-    Adreno830Start.cpp      215e565650d176cd28c2e11e79e098195474add04ea5ae054b15e9eaa4ff0b0f -> d82ebcc754001252d136ddae24eeaed4c4c6ad6d884d9b0928ed6a78310221ea
+    Adreno830Start.cpp      215e565650d176cd28c2e11e79e098195474add04ea5ae054b15e9eaa4ff0b0f -> ab0b34c410cf3361eabef22ef05ea608dc548bc90d59e00e78029d7812e15a4a
       S9 publishMetal without the iPadOS-only staged IOAcceleratorES (no IOGPUFamily load, no static class initializer, no
       g_kernel_kmod_info): prepare/commit report steps 4/5; the macOS accelerator is the kext's AGXAccelerator personality on the
       NativeAdrenoGpuPublished service native_adreno_publish registers. The 128 KiB cmd-db snapshot on the heap (allocated once by
       adreno830_start): the k27 collection's largest __DATA gap for a native kext is about 166 KiB. 2026-11-11: the fence and recovery
       watchdogs take piano-gpu-hang-ms (adreno830_board_hang_ms, 0: their 2 s), and the hang verdict's snapshot goes to
-      native_adreno_note_hang_snapshot (a weak no-op here, the shell's definition prints it).
+      native_adreno_note_hang_snapshot (a weak no-op here, the shell's definition prints it). 2026-11-11, the GPU's idle power
+      (A830Idle.h, piano-gpu-idle through the board hooks adreno830_board_idle/_event, weak defaults here: mode 0): bindPower turns
+      off the touch pre-wake from mode 1 and selects P1's full slumber after piano-gpu-idle-ms in mode 2 (unless pagani-gpu-slumber
+      chose); stageDcvs drops the wake boost and sets the idle window from mode 1, and in mode 2 drops the boot DDR vote to the
+      display's floor (unless pagani-gpu-ddr-floor chose one: the GMU votes the GPU's own) and hands the DCVS the idle votes
+      (dcvsIdleTick: the host DDR vote to the display's floor and the rails through Sm8750RpmhHostRailsIdle after the quiet time, back
+      at the next submission, the slumber/wake/vote lines and the minute's summary, a failed vote undone and final).
+    A830Idle.h              (new)                                                            -> b90f05f80501078f9de1429a51d73b9644278b35ae8fcd167c15abc738848512
+      2026-11-11, MIT, this repository's: the idle policy's configuration, the scanout's DDR floor, the idle votes' state machine, the
+      transitions' line rule and the board hooks' declarations.
+    A830Dcvs.h              2e3cfc36d1cedc7c912d42b5fdb743ca44326b7876f30379f0c9dabebd1944fa -> 2a5f37e45ac2a52588277c71faf86e9e34f5adb1e74d8226903a49f21a1dad7c
+    A830Dcvs.cpp            6e457f98e72fe052b4b7fb0057ea2a8003e78fbaa3cc8784b291270690a0f016 -> deeab86eed8de94ec7944f323eec140e457717997f84b0acff381dca1d440e5f
+      2026-11-11: A830DcvsConfig::idleWindowMs (the window while the governor idles at the floor; the first submission still wakes
+      the thread and the windows are 16 ms again) and A830DcvsOps::idleTick (the orchestrator's idle votes, every service tick).
+    A830PowerState.h        0d0f10c3940e0be938714024fea1d13d51e311c0e8c45a8d8e8884a82adcb856 -> c85750d26c2b474ede32e7d9c750c360ed62cc5017d70a62ccd8cadd8e4bd478
+    A830PowerState.cpp      4ee2dc29829d0dacd6cf1e774a1a511a4ad91b1293e2664431ca8e8b4c15199c -> 19de8eacf5a3b57c4a876e1230ffdf39d0b19bbb9239e4148356572e43d8114b
+      2026-11-11: A830PowerStats::slumberBlocked: a failed P1 slumber entry or wake ends P1 for the boot (as the screen rule's
+      screenBlocked; the recovery takes the GPU back as before).
+    platform/sm8750/Sm8750Rpmh.h a39f9324d152faf7b83063d71784555031d5c4e4f142b359478ccf656562843f -> b8f948fb6359368e79e00a7fe310b3daede1b9078b072d0cdfece469ddb4787f
+    platform/sm8750/Sm8750Rpmh.c 5ef9d62301c3519eb447da85b475cf477367b9dc53b12ad1f1ef1ac82a1a7f1d -> 48195157ca191fe7667c491575f58bb4007393cbcabc56091f5945194a479f20
+      2026-11-11: Sm8750RpmhHostRailsIdle, the idle rails (lowering only, cx first, one TCS through Sm8750RpmhWriteActive and its
+      DRV-2 lock).
+    tests/A830PowerFakes.h  2993b53b13f77646b43ca807861e77083d16050ff3e4e3774e3688c3a0fdd040 -> 39d3da9e3549693516d59f9e0ba6e4e310c917591e632778cd639214ad638ed2
+    tests/test_start.cpp    83099b66827778ab36df93100fe1301c3c8dd284108bb2c2e06ec265ee986a47 -> f2b02bf5e4a2be90a0bcb6b9cd3ff5c5a9017215ad2842b9b0dffea6f8ee0905
+    tests/test_sm8750_rpmh.c be1c38fb9ada8dbb8ee084d9e13331640092d0883452feceff293abbdb226cc5 -> 75f7aa75ae9722e10de3c41c8dc1c959a057b061fa8fdbea77995db8e03758ec
+    tests/test_a830idle.cpp (new)                                                            -> 38423afa472be1c415b9fd695fdf62d48d7f74f0cf2e224baaa6dcc011e84817
+      2026-11-11, the ADRENO830_MACOS pass only where the code is: the idle ops field in the fakes' table, the RPMh double and the
+      board hooks of test_start (mode 0 unless a case sets it; the pinned PASS line unchanged, a line of its own for piano-gpu-idle),
+      the idle rails' TCS order, lock and refusals in test_sm8750_rpmh; test_a830idle (both passes): the scanout floor, the idle
+      votes' state machine and line rule, the DCVS floor and idle window, the idle hook, slumberBlocked.
     NativeAdrenoPublish.cpp d2a85cbcb4ad29df03a05c9f4e3edc0120358ab90a731cb61b083accf93bd31f -> 4d31149ca8ffdb359d6261ddfcb38fd032064624822c7d2cbf23d6ff310d5607
       the render server is WindowServer (kRenderServer/isRenderServer at the six "backboardd" sites, as UniXNU Adreno740 7487f72);
       native_adreno_fences() for the display's fence rule (as Adreno740's, over the ring's lastSubmitted and the memptrs fence word).

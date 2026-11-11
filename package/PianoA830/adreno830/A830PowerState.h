@@ -171,6 +171,12 @@ struct A830PowerStats {
     uint32_t warnings;                /* Sm8750GpuPowerOff warnings of the last full slumber */
     uint32_t screenEntries,screenWakes;   /* slumbers entered by the screen rule; wakes because the display came back */
     bool screenBlocked;               /* a screen-rule slumber or its wake failed: the rule is off for the boot */
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (A830Idle.h): a P1 slumber (config.slumber) or its wake failed: no P1 slumber for the rest of the boot (the
+     * recovery takes the GPU back as for any power failure; without this the next quiet moment would try again, and three
+     * recoveries in a minute lose the GPU). */
+    bool slumberBlocked;
+#endif
 };
 
 /* Host builds have no kIOReturnNotResponding in their IOKit double. */

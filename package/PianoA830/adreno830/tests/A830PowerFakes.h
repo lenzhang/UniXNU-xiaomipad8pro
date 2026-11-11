@@ -278,7 +278,11 @@ static void opQueue(void *)
     gOps.queueAwake.push_back(gQueuePower && gQueuePower->phase()==A830PowerActive);
     gOps.queueOrder.emplace_back(gStatus.memory.size(),gStatus.dcvs.size());
 }
+#ifdef ADRENO830_MACOS
+static const A830DcvsOps gDcvsOps={nullptr,opVote,opHostDdr,opPoll,opMemory,opQueue,nullptr};   /* UniXNU-piano: no idleTick */
+#else
 static const A830DcvsOps gDcvsOps={nullptr,opVote,opHostDdr,opPoll,opMemory,opQueue};
+#endif
 
 static void resetAll()
 {
