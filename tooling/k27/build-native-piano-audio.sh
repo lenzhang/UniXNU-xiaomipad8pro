@@ -3,7 +3,8 @@
 # objects in out/native-kexts/PianoAudio for tooling/k27/kext/PianoAudio.json. Inert without the boot argument piano-audio.
 #   host tests: tests/audio_host.cpp (level 1: what the survey loads and never loads, the facts tables, decoders, verdicts, the SMMU
 #   scan), tests/gpr_host.c (the GPR codec, sheng's), tests/audioreach_host.c (piano's APM/PRM packets), tests/sequence_host.c (one
-#   command at a time, the reverse unwind, the speaker plan, the period pump)
+#   command at a time, the reverse unwind, the speaker plan, the period pump), tests/fs19xx_host.c (the amplifiers against a register
+#   model: probe, a synthetic preset container, the safety filter, the power sequences, status; the preset's SHA-256 identity)
 # No firmware, amplifier preset or topology is needed or read.
 #   environment: K27_TREE (the k27 build tree, read only: its compile recipes), K27_OBJ (default k27-native-obj), CC/CXX (host
 #                compilers for the tests, default cc/c++), K27_KERNEL (for the import check; skipped when absent)
@@ -18,8 +19,9 @@ C=("${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I "$P")
 "${C[@]}" "$P/tests/gpr_host.c" "$P/PianoGpr.c" -o "$T/gpr_host"
 "${C[@]}" "$P/tests/audioreach_host.c" "$P/PianoAudioReach.c" "$P/PianoGpr.c" -o "$T/audioreach_host"
 "${C[@]}" "$P/tests/sequence_host.c" "$P/AudioSequence.c" "$P/PianoAudioReach.c" "$P/PianoGpr.c" -o "$T/sequence_host"
-for t in gpr_host audioreach_host sequence_host; do "$T/$t" || { echo "Error: PianoAudio $t failed" >&2; exit 1; }; done
+"${C[@]}" "$P/tests/fs19xx_host.c" "$P/Fs19xx.c" "$P/AudioSha256.c" -o "$T/fs19xx_host"
+for t in gpr_host audioreach_host sequence_host fs19xx_host; do "$T/$t" || { echo "Error: PianoAudio $t failed" >&2; exit 1; }; done
 python3 "$D/tooling/k27/build-native-kext.py" PianoAudio "$P/PianoAudio.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
-  "$P/PianoGpr.c" "$P/PianoAudioReach.c" "$P/AudioSequence.c" -I "$P" --obj "${K27_OBJ:-k27-native-obj}"
+  "$P/PianoGpr.c" "$P/PianoAudioReach.c" "$P/AudioSequence.c" "$P/Fs19xx.c" "$P/AudioSha256.c" -I "$P" --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" | cut -c1-160 >&2

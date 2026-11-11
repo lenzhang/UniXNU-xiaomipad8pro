@@ -65,3 +65,18 @@ Specifications only (GPL-2.0; behaviour, ids and layouts as facts, no code, comm
   Project-SunUEFI patches/linux/7.3/0005-audio.patch (sha256 191b05b323cca594c3f9e40efc7d6ed696cc7a1a9926f1f336ee9632c27e490c): the
   same TDM parameter, and its note that its ADSP answered APM/PRM only from ports 3/7 (Ubuntu's piano kernel uses 1/2: an open
   question, audio.md section 10).
+
+The FS19xx amplifiers (Fs19xx.{h,c}, tests/fs19xx_host.c) and the preset identity (AudioSha256.{h,c}): new code, from facts.
+  Specifications only (GPL-2.0, behaviour and register positions as facts; no code, comment or table copied): yzddmr6/linux-sm8750-piano
+  sound/soc/codecs/fs19xx.c (sha256 cc758c6b4e5d2b7585b98a72d25c0c215f66b7a573740c964e675c42aefc79e3) and the same driver in
+  Project-SunUEFI 0005-audio.patch: the register addresses and bits, the 8-bit address / 16-bit big-endian register format, DEVID and
+  REVID, the soft reset (unacknowledged I2CR, CHIPINI 0x0003/0x0300), the configure order (speaker coefficient, common table, music
+  scene, shut down), the start order (sample rate field and data out, the PLL under the OTP access key: one row, 6.144 MHz; blocks
+  on, power up, gain, unmute, temperature sensing), the shut-down order and its 35 ms, the gain encoding (0.375 dB steps, low byte
+  0xc0), the preset container's offsets (header, blocks, lists, unit fields, delay and wait units) and its CRC16.
+  xiaomipad-8pro-mainline tools/speaker-playback-check.py (MIT; sha256 4263391b8b631598029b3f5f6d422b6c63a696592e7a4f242de3e6f9d163fe4c):
+  the STATUS bit names, DIGSTAT (0x06) DACRUN, the running/down criteria, STATUS compared across the four rather than judged; and
+  device/audio/README.md: the gains (UCM 192, unattended 160, kernel caps 215/231), the tone limits.
+  xiaomipad-8pro-mainline firmware/piano-audio.json (sha256 03160998dc346030f4bbe65ae0b7488463a82fbd2c1cc89b5e7a2f7192bee224):
+  the stock preset's published size (4348) and SHA-256 (ab060b84...b90e), the one pinned in AudioSha256.c. The preset itself is
+  not in this repository and was not read: tests/fs19xx_host.c builds a synthetic container with made-up register data.
