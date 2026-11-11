@@ -1,4 +1,4 @@
-From 51f2ce7de28406079a5aa7a37acf982f4b629216 Mon Sep 17 00:00:00 2001
+From 7218f5494363973e00263f2611148e0f439e4201 Mon Sep 17 00:00:00 2001
 From: leozhang <zwj8727@gmail.com>
 Date: Wed, 11 Nov 2026 15:10:01 +0800
 Subject: [PATCH] k27: piano-sleep=1: macOS's system sleep as suspend-to-idle
@@ -31,12 +31,12 @@ IOCPUSleepKernel (piano branch) runs the platform actions and piano_s2idle_enter
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  bsd/dev/arm64/sysctl.c          |  17 +
- iokit/Kernel/IOCPU.cpp          |  58 +++
+ iokit/Kernel/IOCPU.cpp          |  58 ++
  iokit/Kernel/IOPMrootDomain.cpp |  48 ++
- osfmk/arm64/piano_pm.c          | 897 ++++++++++++++++++++++++++++++++
+ osfmk/arm64/piano_pm.c          | 904 ++++++++++++++++++++++++++++++++
  osfmk/arm64/piano_pm.h          |  28 +-
  osfmk/kern/clock.c              |   9 +
- 6 files changed, 1054 insertions(+), 3 deletions(-)
+ 6 files changed, 1061 insertions(+), 3 deletions(-)
 
 diff --git a/bsd/dev/arm64/sysctl.c b/bsd/dev/arm64/sysctl.c
 index 1b1acc3..88050c8 100644
@@ -217,10 +217,10 @@ index 4b42199..94dd5e8 100644
  			if (lowBatteryCondition || thermalEmergencyState) {
  				if (lowBatteryCondition) {
 diff --git a/osfmk/arm64/piano_pm.c b/osfmk/arm64/piano_pm.c
-index 8c5c74c..0d66b73 100644
+index 8c5c74c..566abcc 100644
 --- a/osfmk/arm64/piano_pm.c
 +++ b/osfmk/arm64/piano_pm.c
-@@ -636,6 +636,860 @@ piano_cpuidle_init(void)
+@@ -636,6 +636,867 @@ piano_cpuidle_init(void)
  }
  STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_cpuidle_init);
  
@@ -492,7 +492,14 @@ index 8c5c74c..0d66b73 100644
 +static void
 +piano_wdt_arm(void)
 +{
-+	if (!piano_sleep_wdt || piano_wdt_on) {
++	if (piano_wdt_on) {
++		return;
++	}
++	if (piano_sleep_reset_after) {
++		piano_wdt_on = true;   /* k27 0056 armed it at boot and pings it from a thread call, which does not run while frozen */
++		return;
++	}
++	if (!piano_sleep_wdt) {
 +		return;
 +	}
 +	if ((int64_t)piano_pm_call(GH_WDT_SET_TIME, 30000, 32000, 0) == 0 && (int64_t)piano_pm_call(GH_WDT_CONTROL, 3, 0, 0) == 0) {
@@ -1081,7 +1088,7 @@ index 8c5c74c..0d66b73 100644
  #else /* !defined(XNU_VM_GUEST) */
  
  size_t
-@@ -667,4 +1521,47 @@ piano_cpuidle_latency_release(int handle __unused)
+@@ -667,4 +1528,47 @@ piano_cpuidle_latency_release(int handle __unused)
  {
  }
  
