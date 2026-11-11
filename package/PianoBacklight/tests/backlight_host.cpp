@@ -621,6 +621,69 @@ static void testKeys()
   CHECK(k.keyboard(r) == 0);
 }
 
+// piano-backlight-auto=1 (Config::autoAllowed): ambient targets through PianoAuto's AmbientBacklight.h. Without it nothing changes.
+static void testAmbient()
+{
+  using pianoauto::Ambient;
+  {
+    Model m;
+    m.setFound(0, 812, true);
+    m.setFound(1, 812, true);
+    Controller c(m);
+    c.configure(config());
+    c.survey();
+    CHECK(c.start());
+    CHECK(!c.ambient(500, 400, "test light") && !c.automatic(true, "test") && m.writes().empty() && !c.ambientState().automatic());
+    c.step(1, "test keys");
+    CHECK(m.code(0) == 1024 && !m.logged("automatic"));
+  }
+  Model m;
+  m.setFound(0, 812, true);
+  m.setFound(1, 812, true);
+  Config cf = config();
+  cf.autoAllowed = true;
+  Controller c(m);
+  c.configure(cf);
+  c.survey();
+  CHECK(c.start());
+  c.display(true, 1, 1);
+  // The first target: automatic mode, the curve's code on both ICs, its writes not logged one by one.
+  CHECK(c.ambient(370, 300, "test light") && c.ambientState().automatic());
+  CHECK(m.code(0) == 757 && m.code(1) == 757 && m.logged("automatic brightness: on (test light): 300 lux, target 370 permille"));
+  CHECK(!m.logged("code 757 (37 %)"));
+  // The keys in automatic mode shift the curve by the ladder's step; the offset stays as the room changes.
+  c.step(1, "test keys");
+  CHECK(c.ambientState().offset() == 1 && m.code(0) == 954 && m.logged("in automatic mode: offset 0 -> 1, code 757 -> 954"));
+  CHECK(c.ambient(500, 400, "test light") && m.code(0) == 1290 && m.code(1) == 1290);   // 1024 one step up: the ladder's 1290
+  // Dark (display asleep): a target is kept, nothing written; the wake lights the newest.
+  c.display(false, 1, 0);
+  const size_t before = m.writes().size();
+  CHECK(c.ambient(240, 100, "test light") && m.writes().size() == before && !m.lit(0));
+  c.display(true, 1, 1);
+  CHECK(m.lit(0) && m.code(0) == Ambient::shift(Ambient::codeForPermille(240, 128), 1, 128, false));
+  // One summary line per 10 s while targets come (retry(), every second in the kext, flushes it).
+  m.now += 11000;
+  c.retry();
+  CHECK(m.logged("ambient: 3 targets in "));
+  // An explicit level: manual, targets only recorded; the property re-enters with the last target and the offset.
+  c.percent(50, "setProperties");
+  CHECK(!c.ambientState().automatic() && m.code(0) == codeForPercent(50, 128) &&
+        m.logged("automatic brightness: off, a level was set by setProperties"));
+  CHECK(c.ambient(800, 3000, "test light") && m.code(0) == codeForPercent(50, 128));
+  CHECK(c.automatic(true, "setProperties") && c.ambientState().automatic() &&
+        m.code(0) == Ambient::shift(Ambient::codeForPermille(800, 128), 1, 128, false));
+  // -1: the sensor leaves, the code stays; the keys step the ladder again.
+  const uint16_t kept = m.code(0);
+  CHECK(c.ambient(-1, 0, "test light") && !c.ambientState().automatic() && m.code(0) == kept &&
+        m.logged("automatic brightness: off (test light left it)"));
+  Steps ladder;
+  ladder.build(128, false);
+  c.step(1, "test keys");
+  CHECK(m.code(0) == ladder.up(kept));
+  CHECK(!m.inBurst);
+  checkWhitelist(m, 128);
+}
+
 int main()
 {
   testI2c();
@@ -632,6 +695,7 @@ int main()
   testFailures();
   testStack();
   testKeys();
+  testAmbient();
   if (failures) {
     std::printf("backlight_host: %d FAILED\n", failures);
     return 1;

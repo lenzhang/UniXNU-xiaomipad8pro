@@ -4,6 +4,10 @@
 //   "PianoBacklightDisplay"  param1 = on (0/1), param2 = the system power state, param3 = WindowServer's (setAPIPowerState)
 //                            power state: NativeGopDisplay's display power, from its do_power_state_change_gated (piano-backlight>=2)
 //   "PianoBacklightStep"     param1 = steps (intptr_t, + brighter, - darker), param2 = the caller's name (a static C string)
+//   "PianoBacklightAmbient"  param1 = a target of the ambient light policy, permille of the code range (intptr_t; -1 leaves
+//                            automatic mode), param2 = the caller's name, param3 = the lux it came from (uintptr_t); only with
+//                            piano-backlight-auto=1 (else kIOReturnUnsupported). PianoSensors' piano-sensors-light-target property is
+//                            read as well (docs/drivers/sensors.md 5a.4)
 // Both only record the request and wake the service's thread: they never wait for I2C, so a gated or interrupt-free caller is fine.
 // NativeGopDisplay also publishes "piano-display-power" (a boolean, on itself) with each change, which the service reads as well.
 //
@@ -25,6 +29,10 @@ namespace pianobacklight {
 constexpr const char *kServiceClass = "PianoBacklight";
 constexpr const char *kFunctionDisplay = "PianoBacklightDisplay";
 constexpr const char *kFunctionStep = "PianoBacklightStep";
+constexpr const char *kFunctionAmbient = "PianoBacklightAmbient";   // = pianoauto::kFunctionAmbient (AmbientBacklight.h)
+// PianoSensors' level 4 properties (sensors.md section 5) the automatic mode reads.
+constexpr const char *kSensorsTargetProperty = "piano-sensors-light-target", *kSensorsSeqProperty = "piano-sensors-seq",
+                     *kSensorsLuxProperty = "piano-sensors-lux";
 constexpr const char *kDisplayPowerProperty = "piano-display-power";
 constexpr uint16_t kUsageBrightnessUp = 0x6f, kUsageBrightnessDown = 0x70;
 constexpr uint8_t kModRightCtrl = 0x10, kUsageKey1 = 0x1e, kUsageKey2 = 0x1f;
@@ -88,6 +96,13 @@ inline IOService *service()
   OSSafeReleaseNULL(matching);
   if (s && !__sync_bool_compare_and_swap(&found, nullptr, s)) s->release();
   return found;
+}
+// A light target for the automatic mode (PianoSensors' kext, if it calls rather than publishes): permille, or -1 to leave.
+inline bool ambient(int32_t permille, uint32_t lux, const char *source)
+{
+  IOService *s = service();
+  return s && s->callPlatformFunction(kFunctionAmbient, false, reinterpret_cast<void *>(intptr_t(permille)), const_cast<char *>(source),
+                                      reinterpret_cast<void *>(uintptr_t(lux)), nullptr) == kIOReturnSuccess;
 }
 inline bool step(int delta, const char *source)
 {

@@ -31,6 +31,12 @@
 //   piano-backlight-halfbit=US  I2C half-bit time (default 5 us: ~100 kHz; 2..50)
 //   piano-backlight-swap=B      SDA/SCL swapped on bus 0 (bit 0, primary) / bus 1 (bit 1, secondary): only if the survey's reads
 //                               fail with "no ack (address)" on idle-high pins
+//   piano-backlight-auto=1      automatic brightness (level 2): targets of the ambient light policy, permille of the range, from
+//                               the platform function "PianoBacklightAmbient" or PianoSensors' property piano-sensors-light-target
+//                               (polled every 250 ms with its piano-sensors-seq; nothing happens until PianoSensors publishes it);
+//                               the brightness keys then shift the curve by the steps (kept for the boot); piano-backlight-percent
+//                               switches to manual, piano-backlight-auto=0/1 as a property leaves / enters again. Without it nothing
+//                               of this runs (docs/drivers/backlight.md, sensors.md 5a.4)
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -61,7 +67,7 @@ volatile int32_t piano_backlight_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, percent, percentGiven, floor, lid, keys, flags, halfUs, swap;
+  uint32_t level, percent, percentGiven, floor, lid, keys, flags, halfUs, swap, autoAllowed;
 };
 Args gArgs;
 
@@ -86,6 +92,7 @@ void readArgs()
   gArgs.flags = bootArg("piano-backlight-flags", 0);
   gArgs.halfUs = clampArg(bootArg("piano-backlight-halfbit", 5), 2, 50);
   gArgs.swap = bootArg("piano-backlight-swap", 0);
+  gArgs.autoAllowed = bootArg("piano-backlight-auto", 0) == 1;
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -262,9 +269,15 @@ struct Pending {
   int32_t percent;   // -1: none
   const char *source;
   uint32_t displayCalls, stepCalls;
+  bool ambient;              // piano-backlight-auto=1 only: the newest target (permille, -1 leaves automatic mode)
+  int32_t target;
+  uint32_t lux;
+  const char *ambientSource;
+  int32_t automatic;         // the property piano-backlight-auto: -1 none, 0 off, 1 on
+  uint32_t ambientCalls;
 };
 IOLock *gLock;
-Pending gPending = {false, false, false, 0, 0, 0, -1, "?", 0, 0};
+Pending gPending = {false, false, false, 0, 0, 0, -1, "?", 0, 0, false, -1, 0, "?", -1, 0};
 
 }  // namespace
 
@@ -274,7 +287,10 @@ class PianoBacklight : public IOService {
 
   KextIcs fIcs;
   Controller fCtl{fIcs};
-  IOService *fDisplay = nullptr, *fKeyboard = nullptr;
+  IOService *fDisplay = nullptr, *fKeyboard = nullptr, *fSensors = nullptr;   // fSensors: piano-backlight-auto=1 only
+  uint64_t fSensorsSeq = ~0ull;   // PianoSensors' piano-sensors-seq as last taken
+  int64_t fSensorsTarget = -2;    // its piano-sensors-light-target as last taken (-2: none yet)
+  int fAutoPublished = -1, fOffsetPublished = 0x7fffffff;
   uint64_t fNextLookupMs = 0;
   int fDisplayProperty = -1;   // NativeGopDisplay's piano-display-power as last read (-1: none yet)
   bool fDisplayKnown = false, fDisplayOn = true;
@@ -285,6 +301,7 @@ class PianoBacklight : public IOService {
   bool surveyPins();
   void serve();
   void poll(uint64_t now, bool lidOnly);
+  IOService *sibling(const char *className);
   void publishState();
 
  public:
@@ -307,10 +324,12 @@ IOService *PianoBacklight::probe(IOService *provider, SInt32 *score)
 bool PianoBacklight::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
-  note("start: piano-backlight=%u (%s); boot level %u %%%s, floor %u, lid %u, keys %u, flags %u, half-bit %u us, swap %u",
+  note("start: piano-backlight=%u (%s); boot level %u %%%s, floor %u, lid %u, keys %u, flags %u, half-bit %u us, swap %u%s",
        gArgs.level, gArgs.level >= 2 ? "control" : "read-only survey", gArgs.percent,
        gArgs.percentGiven ? " (given: set whatever was found)" : " (default: only lowers a higher found level)", gArgs.floor, gArgs.lid,
-       gArgs.keys, gArgs.flags, gArgs.halfUs, gArgs.swap);
+       gArgs.keys, gArgs.flags, gArgs.halfUs, gArgs.swap,
+       gArgs.autoAllowed ? "; automatic brightness allowed (piano-backlight-auto=1: PianoBacklightAmbient, PianoSensors' "
+                           "piano-sensors-light-target)" : "");
   setProperty("piano-backlight", gArgs.level, 32);
   Config c;
   c.floor = uint16_t(gArgs.floor);
@@ -318,6 +337,7 @@ bool PianoBacklight::start(IOService *provider)
   c.bootForce = gArgs.percentGiven && gArgs.percent;
   c.lidWatch = gArgs.lid == 1;
   c.readFlags = gArgs.flags == 1;
+  c.autoAllowed = gArgs.level >= 2 && gArgs.autoAllowed;
   fCtl.configure(c);
   gLock = IOLockAlloc();
   thread_t thread = nullptr;
@@ -404,25 +424,40 @@ void PianoBacklight::run()
 // cover's hall sensor (PianoKeyboard's property): looked up every 2 s until found, read on each poll.
 void PianoBacklight::poll(uint64_t now, bool lidOnly)
 {
-  if ((!fDisplay || !fKeyboard) && now >= fNextLookupMs) {
+  if ((!fDisplay || !fKeyboard || (gArgs.autoAllowed && !fSensors)) && now >= fNextLookupMs) {
     fNextLookupMs = now + 2000;
     const struct {
       IOService **slot;
       const char *name;
-    } wanted[2] = {{&fDisplay, "NativeGopDisplay"}, {&fKeyboard, "PianoKeyboard"}};
+    } wanted[3] = {{&fDisplay, "NativeGopDisplay"}, {&fKeyboard, "PianoKeyboard"}, {&fSensors, "PianoSensors"}};
     for (const auto &w : wanted) {
       IOService **slot = w.slot;
       const char *name = w.name;
-      if (*slot) continue;
+      if (*slot || (slot == &fSensors && !gArgs.autoAllowed)) continue;
       OSDictionary *matching = IOService::serviceMatching(name);
       *slot = matching ? IOService::copyMatchingService(matching) : nullptr;
       OSSafeReleaseNULL(matching);
-      if (*slot) note("found %s (%s)", name, slot == &fKeyboard ? "its hall sensor property is watched" : "its display power property is watched");
+      if (!*slot && slot == &fSensors) *slot = sibling(name);   // PianoSensors (levels 1-3) does not register itself
+      if (*slot)
+        note("found %s (%s)", name, slot == &fKeyboard ? "its hall sensor property is watched"
+             : slot == &fSensors ? "its piano-sensors-light-target is taken when it publishes one" : "its display power property is watched");
     }
   }
   if (fKeyboard) {
     OSNumber *hall = OSDynamicCast(OSNumber, fKeyboard->getProperty("piano-keyboard-hall"));
     if (hall) fCtl.lid(hall->unsigned32BitValue() == 0 ? 0 : hall->unsigned32BitValue() == 1 ? 1 : -1);
+  }
+  // PianoSensors' light target (its level 4; the property is absent before): a new one when its sequence or the value moved.
+  if (fSensors) {
+    OSNumber *target = OSDynamicCast(OSNumber, fSensors->getProperty(kSensorsTargetProperty));
+    OSNumber *seq = OSDynamicCast(OSNumber, fSensors->getProperty(kSensorsSeqProperty));
+    OSNumber *lux = OSDynamicCast(OSNumber, fSensors->getProperty(kSensorsLuxProperty));
+    const uint64_t t = target ? target->unsigned64BitValue() : ~0ull, q = seq ? seq->unsigned64BitValue() : 0;
+    if (target && t <= 1000 && (int64_t(t) != fSensorsTarget || (seq && q != fSensorsSeq))) {
+      fSensorsTarget = int64_t(t);
+      fSensorsSeq = q;
+      fCtl.ambient(int32_t(t), lux ? lux->unsigned32BitValue() : 0, "PianoSensors");
+    }
   }
   if (lidOnly || !fDisplay) return;
   OSBoolean *power = OSDynamicCast(OSBoolean, fDisplay->getProperty(kDisplayPowerProperty));
@@ -434,6 +469,24 @@ void PianoBacklight::poll(uint64_t now, bool lidOnly)
     fCtl.display(value, fSystem, fApi);
   }
   fDisplayProperty = value;
+}
+
+// A service beside this one under IOPlatformExpertDevice, by class, registered or not (copyMatchingService finds registered ones
+// only). Retained.
+IOService *PianoBacklight::sibling(const char *className)
+{
+  IOService *provider = getProvider();
+  OSIterator *it = provider ? provider->getChildIterator(gIOServicePlane) : nullptr;
+  IOService *found = nullptr;
+  if (it) {
+    while (OSObject *o = it->getNextObject())
+      if (o->metaCast(className) && (found = OSDynamicCast(IOService, o))) {
+        found->retain();
+        break;
+      }
+    it->release();
+  }
+  return found;
 }
 
 void PianoBacklight::serve()
@@ -450,9 +503,9 @@ void PianoBacklight::serve()
       IOLockSleepDeadline(gLock, &gPending, deadline, THREAD_UNINT);
     }
     p = gPending;
-    gPending.any = gPending.display = false;
+    gPending.any = gPending.display = gPending.ambient = false;
     gPending.steps = 0;
-    gPending.percent = -1;
+    gPending.percent = gPending.automatic = -1;
     IOLockUnlock(gLock);
 
     if (p.display) {
@@ -464,6 +517,8 @@ void PianoBacklight::serve()
     }
     if (p.steps) fCtl.step(p.steps, p.source);
     if (p.percent >= 0) fCtl.percent(uint32_t(p.percent), "setProperties");
+    if (p.automatic >= 0) fCtl.automatic(p.automatic == 1, "setProperties");
+    if (p.ambient) fCtl.ambient(p.target, p.lux, p.ambientSource);
     const uint64_t now = nowMs();
     if (now >= nextPoll) {
       nextPoll = now + 250;
@@ -472,7 +527,9 @@ void PianoBacklight::serve()
       poll(now, !slow);
       if (slow) fCtl.retry();
     }
-    if (fCtl.lit(0) != lastLit || fCtl.code() != lastCode) {
+    const pianoauto::Ambient &a = fCtl.ambientState();
+    if (fCtl.lit(0) != lastLit || fCtl.code() != lastCode ||
+        (gArgs.autoAllowed && (int(a.automatic()) != fAutoPublished || a.offset() != fOffsetPublished))) {
       lastLit = fCtl.lit(0);
       lastCode = fCtl.code();
       publishState();
@@ -491,15 +548,34 @@ void PianoBacklight::publishState()
   setProperty("piano-backlight-code", fCtl.code(), 32);
   setProperty("piano-backlight-percent", percentOf(fCtl.code()), 32);
   setProperty("piano-backlight-lit", fCtl.lit(0) && fCtl.lit(1));
+  if (!gArgs.autoAllowed) return;
+  const pianoauto::Ambient &a = fCtl.ambientState();
+  fAutoPublished = a.automatic();
+  fOffsetPublished = a.offset();
+  setProperty(pianoauto::kPropertyAuto, a.automatic());
+  setProperty(pianoauto::kPropertyOffset, uint64_t(uint32_t(int32_t(a.offset()))), 32);   // signed 32-bit
+  if (a.lastTarget() >= 0) {
+    setProperty(pianoauto::kPropertyTarget, uint64_t(a.lastTarget()), 32);
+    setProperty(pianoauto::kPropertyLux, uint64_t(a.lastLux()), 32);
+  }
 }
 
 IOReturn PianoBacklight::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
   const bool display = name && name->isEqualTo(kFunctionDisplay), step = name && name->isEqualTo(kFunctionStep);
-  if (!display && !step) return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
+  const bool ambient = name && name->isEqualTo(kFunctionAmbient);
+  if (!display && !step && !ambient) return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
+  if (ambient && (gArgs.level < 2 || !gArgs.autoAllowed)) return kIOReturnUnsupported;
   if (!gLock) return kIOReturnNotReady;
   IOLockLock(gLock);
-  if (display) {
+  if (ambient) {
+    const intptr_t t = intptr_t(p1);
+    gPending.ambient = true;
+    gPending.target = t < 0 ? -1 : t > 1000 ? 1000 : int32_t(t);
+    gPending.lux = uint32_t(uintptr_t(p3) > 0xffffffffu ? 0xffffffffu : uintptr_t(p3));
+    gPending.ambientSource = p2 ? static_cast<const char *>(p2) : "?";
+    ++gPending.ambientCalls;
+  } else if (display) {
     gPending.display = true;
     gPending.on = p1 != nullptr;
     gPending.system = uint32_t(uintptr_t(p2));
@@ -526,13 +602,17 @@ IOReturn PianoBacklight::setProperties(OSObject *properties)
   if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess) return kIOReturnNotPrivileged;
   OSNumber *percent = OSDynamicCast(OSNumber, d->getObject("piano-backlight-percent"));
   OSNumber *steps = OSDynamicCast(OSNumber, d->getObject("piano-backlight-step"));
-  if (!percent && !steps) return kIOReturnBadArgument;
+  OSObject *automatic = gArgs.autoAllowed ? d->getObject(pianoauto::kArgAuto) : nullptr;   // OSNumber 0/1 or OSBoolean
+  OSNumber *autoNumber = OSDynamicCast(OSNumber, automatic);
+  OSBoolean *autoBoolean = OSDynamicCast(OSBoolean, automatic);
+  if (!percent && !steps && !autoNumber && !autoBoolean) return kIOReturnBadArgument;
   IOLockLock(gLock);
   if (percent) gPending.percent = int32_t(clampArg(percent->unsigned32BitValue(), 0, 100));
   if (steps) {
     gPending.steps = int32_t(clampArg(uint32_t(gPending.steps + int32_t(steps->unsigned32BitValue()) + 20), 0, 40)) - 20;
     gPending.source = "setProperties";
   }
+  if (autoNumber || autoBoolean) gPending.automatic = autoBoolean ? autoBoolean->isTrue() : autoNumber->unsigned32BitValue() ? 1 : 0;
   gPending.any = true;
   IOLockWakeup(gLock, &gPending, false);
   IOLockUnlock(gLock);

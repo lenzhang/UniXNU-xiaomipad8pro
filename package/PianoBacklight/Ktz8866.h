@@ -19,11 +19,17 @@
 //
 // This driver writes three registers only, 0x04, 0x05 and 0x08, and in 0x08 only bit 6: bits 5:0 are written back as read, bit 7
 // (the software reset) always 0. The code is never below the floor (piano-backlight-min), so a lit panel never goes dark by a step.
+//
+// Automatic brightness (Config::autoAllowed, piano-backlight-auto=1; off by default, and then nothing below changes): targets of the
+// ambient light policy (permille of the code range) set the code through package/PianoAuto/AmbientBacklight.h; the brightness keys
+// then shift the curve by this ladder's steps (the offset, kept for the boot); an explicit level (percent) switches to manual until
+// automatic(true). docs/drivers/sensors.md 5a.4, backlight.md.
 #ifndef PIANO_BACKLIGHT_KTZ8866_H
 #define PIANO_BACKLIGHT_KTZ8866_H
 #include <stdint.h>
 #include <stddef.h>
 #include <stdarg.h>
+#include "../PianoAuto/AmbientBacklight.h"
 #ifdef KERNEL
 #include <libkern/libkern.h>
 #else
@@ -164,6 +170,7 @@ struct Config {
   bool bootForce = false;      // piano-backlight-level given explicitly: set even when the found level is lower
   bool lidWatch = false;       // piano-backlight-lid=1: the cover's hall sensor closed -> backlight off
   bool readFlags = false;      // piano-backlight-flags=1: the survey reads FLAG (0x0f), which clears its latched faults
+  bool autoAllowed = false;    // piano-backlight-auto=1: ambient targets taken (automatic brightness)
   unsigned errorLimit = 8;     // consecutive failed accesses before control stops (the ICs stay as they are)
 };
 
@@ -210,6 +217,7 @@ class Controller {
     exponential_ = !(p.reg[kRegCfg1] & kCfg1LinearMap);
     if ((p.reg[kRegCfg1] ^ q.reg[kRegCfg1]) & kCfg1LinearMap) note("the ICs map codes differently (BL_CFG1 0x%02x, 0x%02x): steps follow the primary's", p.reg[kRegCfg1], q.reg[kRegCfg1]);
     steps_.build(cfg_.floor, exponential_);
+    ambient_.configure(cfg_.autoAllowed, cfg_.floor, exponential_, int(steps_.count()) - 1);
     code_ = p.foundCode;
     if (p.foundCode != q.foundCode) note("the ICs hold different codes (%u, %u): both get the primary's", p.foundCode, q.foundCode);
     const uint32_t target = cfg_.bootPercent ? codeForPercent(cfg_.bootPercent, cfg_.floor) : 0;
@@ -255,11 +263,22 @@ class Controller {
     note("lid %s%s", state == 0 ? "closed" : state == 1 ? "open" : "unknown", cfg_.lidWatch ? "" : " (not acted on: piano-backlight-lid=0)");
     if (cfg_.lidWatch) apply();
   }
-  // Brightness keys: delta steps up (+) or down (-).
+  // Brightness keys: delta steps up (+) or down (-). In automatic mode they shift the curve instead (the offset, kept for the boot).
   void step(int delta, const char *source)
   {
     if (!control_) {
       limited("step %+d from %s: not controlling", delta, source);
+      return;
+    }
+    if (ambient_.automatic()) {
+      const int before = ambient_.offset();
+      ambient_.step(delta);
+      const uint16_t next = ambient_.code();
+      limited("step %+d from %s in automatic mode: offset %d -> %d, code %u -> %u (%u %%)%s", delta, source, before, ambient_.offset(),
+              code_, next, percentOf(next), next == code_ ? (delta > 0 ? " (full scale)" : " (the floor)")
+              : wantLit() ? "" : " (applied when the backlight is on again)");
+      code_ = next;
+      apply();
       return;
     }
     uint16_t next = code_;
@@ -273,16 +292,70 @@ class Controller {
   void percent(uint32_t p, const char *source)
   {
     if (!control_) return;
+    if (ambient_.automatic()) note("automatic brightness: off, a level was set by %s (piano-backlight-auto=1 as a property: on again)", source);
+    ambient_.manual();
     const uint16_t next = codeForPercent(p, cfg_.floor);
     limited("level %u %% from %s: code %u -> %u", p, source, code_, next);
     code_ = next;
     apply();
   }
-  // A state the ICs did not take yet (an access failed): tried again (the kext calls this periodically).
+  // A state the ICs did not take yet (an access failed): tried again (the kext calls this periodically, every second).
   void retry()
   {
     if (control_ && pending()) apply();
+    if (summary_.targets && ics_.nowMs() - summary_.since >= kSummaryMs) summarize();
   }
+
+  // A target of the ambient light policy (PianoBacklightAmbient, or PianoSensors' piano-sensors-light-target): permille of the code
+  // range; -1 leaves automatic mode with the code as it is. False when not taken (piano-backlight-auto not set, or not controlling).
+  // Its writes are not logged one by one: one line per kSummaryMs (failures still are).
+  bool ambient(int32_t permille, uint32_t lux, const char *source)
+  {
+    if (!control_ || !cfg_.autoAllowed) return false;
+    const bool was = ambient_.automatic();
+    if (!ambient_.target(permille, lux)) {
+      if (was && !ambient_.automatic()) note("automatic brightness: off (%s left it): the code stays %u", source, code_);
+      return true;
+    }
+    const uint16_t next = ambient_.code();
+    if (!was)
+      note("automatic brightness: on (%s): %u lux, target %d permille, offset %d: code %u -> %u (%u %%)", source, lux, permille,
+           ambient_.offset(), code_, next, percentOf(next));
+    if (!summary_.targets) {
+      summary_ = Summary{};
+      summary_.since = ics_.nowMs();
+      summary_.from = code_;
+      summary_.luxMin = summary_.luxMax = lux;
+      summary_.minPermille = summary_.maxPermille = uint32_t(ambient_.lastTarget());
+    }
+    ++summary_.targets;
+    summary_.luxMin = lux < summary_.luxMin ? lux : summary_.luxMin;
+    summary_.luxMax = lux > summary_.luxMax ? lux : summary_.luxMax;
+    const uint32_t t = uint32_t(ambient_.lastTarget());
+    summary_.minPermille = t < summary_.minPermille ? t : summary_.minPermille;
+    summary_.maxPermille = t > summary_.maxPermille ? t : summary_.maxPermille;
+    if (next != code_) {
+      code_ = next;
+      quiet_ = true;
+      apply();
+      quiet_ = false;
+    }
+    if (ics_.nowMs() - summary_.since >= kSummaryMs) summarize();
+    return true;
+  }
+  // piano-backlight-auto as a property: 0 leaves automatic mode, 1 enters it again (the last target at once, the offset kept).
+  bool automatic(bool on, const char *source)
+  {
+    if (!control_ || !cfg_.autoAllowed) return false;
+    const bool now = ambient_.setAutomatic(on);
+    note("automatic brightness: %s by %s%s", on ? "on" : "off", source, on && !now ? " (from the next target)" : "");
+    if (now) {
+      code_ = ambient_.code();
+      apply();
+    }
+    return true;
+  }
+  const pianoauto::Ambient &ambientState() const { return ambient_; }
 
   bool controlling() const { return control_; }
   bool wantLit() const { return displayOn_ && !(cfg_.lidWatch && lid_ == 0); }
@@ -326,8 +399,10 @@ class Controller {
     writes_ += wrote ? 2 : 1;
     const bool readBack = wrote && access(ics_.read(i, kRegBrtLsb, &rl)) && access(ics_.read(i, kRegBrtMsb, &rm));
     const bool good = readBack && codeOf(rl, rm) == code;
-    limited("write %s: BL_BRT_LSB 0x04 = 0x%02x, BL_BRT_MSB 0x05 = 0x%02x: code %u (%u %%), was %u; %s", kIcName[i], lsb, msb, code,
-            percentOf(code), ic_[i].code, !wrote ? "WRITE FAILED" : !readBack ? "read back failed" : good ? "read back ok" : "READ BACK DIFFERS");
+    if (!quiet_ || !good) {   // an ambient change that took is in the summary line instead
+      limited("write %s: BL_BRT_LSB 0x04 = 0x%02x, BL_BRT_MSB 0x05 = 0x%02x: code %u (%u %%), was %u; %s", kIcName[i], lsb, msb, code,
+              percentOf(code), ic_[i].code, !wrote ? "WRITE FAILED" : !readBack ? "read back failed" : good ? "read back ok" : "READ BACK DIFFERS");
+    }
     if (readBack && !good) access(false);
     return good;
   }
@@ -446,6 +521,23 @@ class Controller {
   Config cfg_;
   IcState ic_[kIcs];
   Steps steps_;
+  // Automatic brightness (autoAllowed only) and its log: one line per kSummaryMs while targets come.
+  struct Summary {
+    uint32_t targets = 0, luxMin = 0, luxMax = 0, minPermille = 0, maxPermille = 0;
+    uint64_t since = 0;
+    uint16_t from = 0;
+  };
+  static constexpr uint64_t kSummaryMs = 10000;
+  void summarize()
+  {
+    note("ambient: %u targets in %llu s, lux %u..%u, target %u..%u permille, offset %d, code %u -> %u (%u %%)%s", summary_.targets,
+         (unsigned long long)((ics_.nowMs() - summary_.since + 500) / 1000), summary_.luxMin, summary_.luxMax, summary_.minPermille,
+         summary_.maxPermille, ambient_.offset(), summary_.from, code_, percentOf(code_), wantLit() ? "" : " (dark: applied at the next on)");
+    summary_ = Summary{};
+  }
+  pianoauto::Ambient ambient_;
+  Summary summary_;
+  bool quiet_ = false;
   LogLimit limit_{24, 10000};
   bool control_ = false, exponential_ = false, armed_ = false, displayOn_ = true;
   bool rawSeen_ = false, rawOn_ = false;
