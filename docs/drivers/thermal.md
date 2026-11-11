@@ -55,19 +55,28 @@ shape (SM8550 EPSS: not piano's registers). PianoThermal is new code (BSD-2-Clau
 
 `PianoThermal : IOService` on `IOPlatformExpertDevice` (personality in `tooling/k27/kext/PianoThermal.json`), one kernel thread.
 Properties: `TemperaturesDeciC` (dict: cpu0/cpu1/gpu/nsp hottest), `SensorsDeciC` (data: int16 [4][16], -32768 = no reading),
-`ThermalState`, `PeakDeciC`, `CpuFreq` (cluster0/1 MHz), `piano-thermal`, `piano-cpufreq`. GPU: PianoA830's exported
-`adreno830_dcvs_park()` (lowest level and bus for the rest of the boot; existing hook, **no PianoA830 change**) and
-`adreno830_thermal_state()` (read); both no-ops while PianoA830 is inert. The GPU's caps stay PianoA830's (its default 342 MHz =
-Power Saver's GPU maximum). Not used, on purpose: IOPMrootDomain's `kIOPMOverTemp` (an emergency *sleep*: no sleep natively),
+`ThermalState`, `PeakDeciC`, `CpuFreq` (cluster0/1 MHz), `piano-thermal`, `piano-cpufreq`. GPU: at passive
+`callPlatformFunction("piano-gpu-ceiling", khz)` on PianoA830's registered service (reversible, cleared below passive; no link
+dependency; proposed in §10.5, answered kIOReturnUnsupported until then), else and at critical PianoA830's exported
+`adreno830_dcvs_park()` (lowest level and bus for the rest of the boot); `adreno830_thermal_state()` (read). All are no-ops while
+PianoA830 is inert. The GPU's own caps stay PianoA830's (its default 342 MHz = Power Saver's GPU maximum). Not used, on purpose: IOPMrootDomain's `kIOPMOverTemp` (an emergency *sleep*: no sleep natively),
 `systemPowerEventOccurred(kIOPMThermalLevelWarningKey)` (the root domain's thermal warning, which makes it prefer sleep and treat full
 wake as unsustainable), `shutdownSystem()` (kIOReturnUnsupported in k27); macOS thermal pressure is a userspace notification: no
 clean KPI. The shutdown is the kernel's own halt path `reboot_kernel(RB_HALT)`: processes signalled, disks synced and unmounted,
 IOKit's shutdown notifications (IOPMrootDomain `handlePlatformHaltRestart`), PSCI SYSTEM_OFF (k27 0053).
 CPU load: XNU's per-processor idle time from `processor_info(cpu_to_processor(i), PROCESSOR_CPU_LOAD_INFO)` (recount, 1/hz s ticks:
 ±10 ms per 100 ms tick), busy = 1 - idle / wall, the busiest core per cluster. Power source: the `IOPMPowerSource`'s
-`ExternalConnected` (PianoPower with `piano-power-ps=1`), unknown = battery caps. Polling: the base period (governor 100 ms, else
-1 s), 20 ms while any sensor is within 10 C of its trip or a cluster is thermally limited. The idle states (PSCI cpuidle) are
-another driver's: not touched.
+`ExternalConnected` (PianoPower with `piano-power-ps=1`), unknown = battery caps. Polling tiers (`Cluster.h` pollTier): base 1 s
+(the governor's 100 ms tick when it runs); 250 ms once the hottest sensor reaches 70 C; 10 ms (Linux's passive polling) while any
+sensor is within 10 C of its trip, a cluster is thermally limited, or a cluster runs above 2.5 GHz (where a prime-core load heats
+at ~200 C/s). The upper-threshold interrupt replaces the warm tier later (§10.4). The idle states (PSCI cpuidle) are another
+driver's: not touched.
+**Suspend hooks** (for the suspend driver; docs/power.md's contract when it lands): `int piano_thermal_suspend_prepare(void)` masks
+every sensor's lower-threshold interrupt (`TM_UPPER_LOWER_INT_MASK` 0x10 bits 0..n-1, clears pulsed 1→0 at 0x0c; Linux
+08e750858038) and, while PianoThermal does not service the uplow interrupt itself, the upper ones (bits 16..) too; critical
+untouched; returns the controllers masked, -1 if already prepared. `void piano_thermal_suspend_finish(void)` restores the masks
+found. Also as `callPlatformFunction("piano-thermal-suspend-prepare", int *result)` / `"-finish"` on the PianoThermal service. They
+map the controllers themselves (work without `piano-thermal`) and are the kext's only TSENS writes.
 
 ## 6. Boot args
 
@@ -76,7 +85,10 @@ another driver's: not touched.
 | `piano-thermal=N` | 0 | 0 off (probe declines, nothing mapped); 1 readout: loads only; 2 readout + protection |
 | `piano-thermal-shutdown=1` | 0 | at level 2's critical state: halt (`reboot_kernel(RB_HALT)`); 0 logs only |
 | `piano-thermal-warm=<C>` / `-margin=<C>` | 85 / 10 | warm (a log line); critical = stock critical (125) - margin, held 1 s |
-| `piano-thermal-poll-ms` / `-fast-ms` / `-log-s` / `-delay` | 1000 / 20 / 30 / 0 | base and near-trip poll; report period; start delay (s) |
+| `piano-thermal-poll-ms` / `-log-s` / `-delay` | 1000 / 30 / 0 | base poll and policy period; report period; start delay (s) |
+| `piano-thermal-warm-poll=<C>` / `-warm-ms` | 70 / 250 | the warm tier: from this hottest reading, poll this often |
+| `piano-thermal-fast-ms` / `-fast-mhz` | 10 / 2500 | the fast tier (near a trip, limited, or a cluster above this clock); also the thermal limit's step |
+| `piano-thermal-gpu-mhz` | 160 | the reversible GPU ceiling at passive (when PianoA830 offers it) |
 | `piano-thermal-clock=0` / `-srot=0` | 1 / 1 | skip the per-core clock measurement / the SROT reads |
 | `piano-cpufreq=N` | 0 | 1 report (SCMI messages, nothing set); 2 fixed level; 3 governor. Implies `piano-thermal=1` |
 | `piano-cpufreq-cap=<MHz>`, `-cap0`, `-cap1` | 1785 / 1958 (Power Saver) | mode 2: each cluster at the fastest level ≤ cap (and ≤ sustained); mode 3: a hard ceiling when given. A cap admits its whole MHz (1785 admits 1785.6) |
@@ -130,8 +142,12 @@ All RAM boots with the cable, owner present. Every level is off by default, so a
    `power unknown (battery caps)`), residency mostly at the slowest level when idle (`384 MHz 9x%`). Compare the mean battery
    current of the three sessions; a lower cap (`piano-cpufreq-cap=1000`) is a fourth point.
 4. **Level 2** (protection) once level 1 shows sane readings: `piano-thermal=2`. Nothing visible below 85 C. Lines: `state normal ->
-   warm: ...`, `polling every 20 ms (a sensor is within 10 C of its trip)`, `PASSIVE: ... GPU parked ...`, `critical threshold met ...`,
+   warm: ...`, `polling every 10 ms: a sensor is within 10 C of its trip`, `[30s] polling: base ... ms, warm ... ms, fast ... ms`,
+   `PASSIVE: ... GPU capped at 160 MHz ...` (or `GPU parked ...; PianoA830 has no reversible ceiling`), `critical threshold met ...`,
    `CRITICAL: ... NOT shutting down (log only)`. `piano-thermal-shutdown=1` only after a session showed no wild readings.
+5. **Suspend hooks** (with the suspend driver's first s2idle test): `suspend prepare: lower and upper threshold interrupts masked on
+   4 controllers: tsens0 0x...->0x7fff7fff tsens1 ...->0x7f007f ...`, after resume `suspend finish: ... back on 4 controllers`. A
+   sleep that still ends at once with these lines points at another wake source; fewer than 4 controllers: a mapping failed.
 
 Failure meanings: `NOT MAPPED` (no mapping: nothing read from that controller); `NOT ENABLED` / `DIFFERS` (the boot stages left
 TSENS off or partly configured: readings will lack VALID); `ADC CODES` (result format is codes: the decode is wrong); many `without
@@ -152,10 +168,28 @@ clusters stay at the level the boot stages left (open question 1).
 1. Which levels did the boot stages leave? (`piano-cpufreq=1`; NCC1 at 4.32 GHz would be a battery drain modes 2/3 remove.)
 2. Does the CPUCP serve SCMI natively under Gunyah at EL1 as on K90? (`piano-cpufreq=1`.)
 3. Are the TSENS hardware thresholds (critical / upper) programmed by the boot stages? (level 1's threshold line.)
-4. A reversible GPU cap at the passive trip (instead of the boot-long park) needs a ceiling hook in A830Dcvs: later, with PianoA830's
-   owner. The PMIC NTCs and temp-alarm stages need SPMI reads/conversions: later (PianoPower's SPMI code).
-5. Does `reboot_kernel(RB_HALT)` power the tablet off natively (PSCI SYSTEM_OFF under Gunyah)? (one deliberate test, owner present.)
-6. Is ±10 ms idle accounting enough for the governor, or does it need recount's mach-time idle (a k27 helper)? (the `gov` session's
+4. **The upper-threshold interrupt** (when the GIC/PDC helper lands): per CPU sensor `TM_Sn_UPPER_LOWER_THRESHOLD` = lower 70 C,
+   upper 85 C (`encodeUpperLower`, Tsens.h), their upper bits unmasked in 0x10, `TM_INT_EN` = 7; the "uplow" lines are SPI 771-774
+   (DT `0x303`-`0x306`, level high), "critical" SPI 484-487. The handler masks the sensor's upper bit, pulses its clear and wakes the
+   thread, which then polls at the fast/warm tiers until every sensor is under 70 C and re-arms. The base poll can then go to 5 s.
+   `kServicesUplow` (PianoThermal.cpp) becomes true, so the suspend hook keeps upper armed as Linux does.
+5. **PianoA830 patch proposal: a reversible DCVS ceiling** (owner: the GPU driver; forward as is). Behaviour without a caller:
+   identical (the ceiling is 0 = none).
+   - `A830Dcvs.h`, under `ADRENO830_MACOS`, marked "UniXNU-piano": `extern "C" void adreno830_dcvs_set_ceiling(uint32_t khz);`
+     (0 clears; lock-free, any thread) and in `A830Dcvs`: `uint32_t externalKhz_ = 0;` (atomic), `uint8_t externalCeiling_ = 0;`,
+     `void setExternalCeiling(uint32_t khz)` (store, then `env_.wake(env_.context)`).
+   - `A830Dcvs.cpp`: in `serviceTick`, next to the park block: load `externalKhz_`; the wanted level is
+     `khz ? max(levelAtMost(khz), 1) : 0`; when it differs from `externalCeiling_`, store it and `updateWakeTargets()`. In `ceiling()`:
+     `c = min8(knobCeiling_, thermalCeiling_); if (externalCeiling_) c = min8(c, externalCeiling_);` (the vote path already clamps
+     to `ceiling()`, so the next window drops at once). Optionally an `A830ThermalExternal` flag in `adreno830_thermal_state` and an
+     "X" on the DCVS row.
+   - `board/PianoA830.cpp` `callPlatformFunction`: `"piano-gpu-ceiling"` with `param1 = (void *)(uintptr_t)khz` →
+     `adreno830_dcvs_set_ceiling(khz)`, `kIOReturnSuccess` (needs `registerService`, done at `piano-gpu=2`).
+   - `UPSTREAM`: the two files' new sha256 and the change's line. PianoThermal needs no change: it already asks for it (falls back
+     to the park while the answer is kIOReturnUnsupported) and clears it below passive.
+6. The PMIC NTCs and temp-alarm stages need SPMI reads/conversions: later (PianoPower's SPMI code).
+7. Does `reboot_kernel(RB_HALT)` power the tablet off natively (PSCI SYSTEM_OFF under Gunyah)? (one deliberate test, owner present.)
+8. Is ±10 ms idle accounting enough for the governor, or does it need recount's mach-time idle (a k27 helper)? (the `gov` session's
    residency and the touch feel.)
 
 ## 11. Licence note
