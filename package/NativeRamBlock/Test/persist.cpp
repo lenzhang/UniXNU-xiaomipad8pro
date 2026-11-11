@@ -59,7 +59,7 @@ int main() {
   // A different seed makes the overlay stale: it is never applied. UniXNU-piano store guard: it is kept untouched (Kept) unless the
   // caller asks to replace it (data-store-replace), then replaced (guard.cpp has the rest).
   { Medium copy = m; Overlay r; auto b2 = fresh(); unsigned before = copy.writes;
-    assert(r.open(copy, pages, seedB, true, b2.data()) == Open::Kept && r.header == 3 && r.present == 0 && !r.active);
+    assert(r.open(copy, pages, seedB, true, b2.data()) == Open::Kept && r.header == 3 && r.present == 11 && !r.active);   // its count, reported
     assert(r.open(copy, pages, seedB, false, b2.data()) == Open::Kept && r.header == 3 && copy.writes == before && !r.active);
     assert(r.open(copy, pages, seedB, false, b2.data(), false, 1) == Open::Fresh && r.generation == 2 && r.present == 0); }
   // An explicit reset discards a valid overlay for the same seed.

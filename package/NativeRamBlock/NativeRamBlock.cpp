@@ -241,10 +241,11 @@ public:
     if (!direct)
       IOLog("NativeRamBlock: Data is volatile this boot (state %u, data-persist=%u): its changes stay in RAM and are gone at the next boot\n",
             native_data_persist_state, mode);
+    // generation and present (the store's, as found or made): a boot after a kept one shows the same two numbers if nothing wrote.
     IOLog("NativeRamBlock: Data store state %u (1 blank, 2 resumed, 3 fresh, 4 failed, 7 kept), header %u, first LBA %llu, %llu pages, "
-          "direct %d, seed %s, store seed %s, flags %u\n",
+          "direct %d, seed %s, store seed %s, flags %u, generation %llu, present %llu\n",
           native_data_persist_state, native_data_persist_header, native_data_persist_first_lba, native_data_persist_pages, direct,
-          ours, theirs, native_data_persist_flags);
+          ours, theirs, native_data_persist_flags, overlay.generation, overlay.present);
     IOLockUnlock(gate);
   }
 

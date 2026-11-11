@@ -134,6 +134,8 @@ int main() {
     Medium m = base.fork(); Overlay o;
     CHECK(o.open(m, pages, Y.digest, false, bits.data()) == Open::Kept && o.header == 3 && !o.active && !o.sameSeed);
     CHECK(m.writes == 0 && m.blocks == base.blocks && !memcmp(o.storeSeed, X.digest, 32) && o.generation == 1);
+    CHECK(o.present == presentBefore);             // reported (the console line), so a later boot can show nothing changed
+    for (size_t k = 0; k < bitmapBytes; ++k) if (bits[k]) { CHECK(false); break; }   // and the kept store's bitmap is not left in use
     CHECK(o.open(m, pages, Y.digest, true, bits.data()) == Open::Kept && m.writes == 0);          // read-only too
     CHECK(o.open(m, pages, Y.digest, false, bits.data(), false, seedTag(Y.digest)) == Open::Kept && m.writes == 0);  // another tag
     uint8_t other[32]; memcpy(other, X.digest, 32); other[31] ^= 1;   // same tag, other seed: the tag names the store's seed

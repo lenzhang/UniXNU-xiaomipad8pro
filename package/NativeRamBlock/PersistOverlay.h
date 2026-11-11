@@ -166,8 +166,16 @@ struct Overlay {
       active = true;
       return Open::Resumed;
     }
+    if (header == 3 && !startOver) {
+      // Another seed's store: never applied, nothing written. Its bitmap is only read to report how many pages it holds (present),
+      // so a later boot can show that the store is unchanged; then it is cleared again.
+      bool counted = info.pages == pages;
+      for (uint64_t b = 0; b < bb && counted; ++b) counted = ops.read (1 + b, 1, bitmap + b * kBlock);
+      for (uint64_t i = 0; counted && i < pages; ++i) present += has (i);
+      memset (bitmap, 0, bb * kBlock);
+      return Open::Kept;
+    }
     memset (bitmap, 0, bb * kBlock);
-    if (header == 3 && !startOver) return Open::Kept;   // another seed's store: nothing read beyond its header, nothing written
     if (ro) return Open::Blank;
     uint8_t zero[kBlock] = {};
     for (uint64_t b = 0; b < bb; ++b) if (!ops.write (1 + b, 1, zero)) return Open::Failed;
