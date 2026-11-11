@@ -7,6 +7,9 @@
 //   - the SMMU stream scan with masks, the overflow count and a bad geometry.
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. audio_host.cpp -o /tmp/audio_host && /tmp/audio_host
 #include "AudioSurvey.h"
+#include "AudioPins.h"
+#include "AudioAmps.h"
+#include "SmmuStream.h"
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -179,6 +182,83 @@ static void testSmmu()
   CHECK(surveySmmu(streams, kSmmuBytes, [&](uint32_t off) { return bad[off]; }).error != nullptr);
 }
 
+// ---------------------------------------------------------------------------------------- levels 4-6: the pins and the SMMU
+static void testPins()
+{
+  // the TDM pins from GPIO with a pull-down and 2 mA to i2s1 (function 1), 8 mA, no bias; nothing else changed
+  const uint32_t gpio = 0x1u | 0u << 2 | 0u << 6;
+  CHECK(tdmCtl(gpio) == (1u << 2 | 3u << 6));
+  CHECK(decodePin(tdmCtl(gpio), 0).function == 1 && decodePin(tdmCtl(gpio), 0).driveMa == 8 && decodePin(tdmCtl(gpio), 0).pull == 0);
+  CHECK(tdmCtl(0x3ffu) == (1u << 2 | 3u << 6));   // output enable, pull and drive all replaced
+  // a reset line: GPIO, driven, the value first; an eGPIO pin claimed for this TLMM, a plain one left without the bit
+  CHECK(resetCtl(0x0u) == kCtlOe && resetCtl(5u << 2 | 1u) == (kCtlOe | 1u));
+  CHECK(resetCtl(kCtlEgpioPresent) == (kCtlEgpioPresent | kCtlEgpioEnable | kCtlOe));
+  CHECK(resetIo(true) == 2 && resetIo(false) == 0);
+  CHECK(resetState(decodePin(resetCtl(0), resetIo(false))) == Reset::held && resetState(decodePin(resetCtl(0), resetIo(true))) == Reset::released);
+  // the bus: GPIO with the pull-up, low = output enabled
+  CHECK(i2cCtl(kFunctionHub0 << 2 | 2u << 6, false) == (kCtlPullUp | 2u << 6) && i2cCtl(kFunctionHub0 << 2, true) == (kCtlPullUp | kCtlOe));
+  CHECK(foreign(kCtlEgpioPresent) && !foreign(kCtlEgpioPresent | kCtlEgpioEnable) && !foreign(0));
+  // the amplifier table the C side uses is AudioHw.h's, slot by slot
+  const uint8_t addresses[4] = AUDIO_AMP_ADDRESSES;
+  for (unsigned a = 0; a < kAmpCount; ++a) CHECK(addresses[a] == kAmps[a].address);
+  // what level 4 reads lies in the VA macro's block and the LPI TLMM's (both DT okay), and nowhere else
+  for (const LpassRead &r : kVaIds) CHECK(r.pa >= 0x07660000 && r.pa < 0x07662000 && r.pa % 4 == 0);
+  for (unsigned i = 0; i < kDmicPinCount; ++i) CHECK(lpiPin(kDmicPins[i]) + 4 < 0x07760000 + 0x20000);
+  const VaIdentity id = vaIdentity(0x02, 0x0f, 0x30);
+  CHECK(id.major == 2 && id.minor == 3 && id.step == 0 && id.hasVa && !vaIdentity(1, 0x7, 0).hasVa);
+}
+
+// The SMMU model of PianoDwc3's SmmuStream.h tests, for the DSP's four PCM stream ids.
+struct SmmuModel {
+  std::map<uint32_t, uint32_t> r;
+  std::vector<std::pair<uint32_t, uint32_t>> writes;
+  SmmuModel()
+  {
+    r[0x20] = 1u << 30 | 0x40;    // AArch64 stage 1, 64 groups
+    r[0x24] = 0x60000053;         // 83 banks, 128 pages
+    r[0x28] = 1u << 12;
+  }
+  uint32_t rd(uint32_t off) { return r.count(off) ? r[off] : 0; }
+  void wr(uint32_t off, uint32_t v) { writes.push_back({off, v}); r[off] = v; }
+};
+static const uint16_t kAudioStreams[4] = {0x1001, 0x1081, 0x1041, 0x1061};   // 0x1001 mask 0x80, 0x1041 mask 0x20 as exact ids
+
+static void testSmmuBypass()
+{
+  {   // nothing left by the firmware: each stream a free group and a bypass bank of its own, from the top down
+    SmmuModel m;
+    unsigned banks[4];
+    for (unsigned i = 0; i < 4; ++i) {
+      const SmmuPlan p = planSmmuStream(kAudioStreams[i], kSmmuBytes, [&](uint32_t o) { return m.rd(o); });
+      CHECK(!p.error && !p.reuse && !p.keep && p.slot == i);
+      CHECK(!applySmmuStream(p, kAudioStreams[i], [&](uint32_t o) { return m.rd(o); }, [&](uint32_t o, uint32_t v) { m.wr(o, v); },
+                             [] { return false; }));
+      CHECK(m.rd(0x800 + 4 * i) == (0x80000000u | kAudioStreams[i]) && m.rd(0xc00 + 4 * i) == p.bank);
+      CHECK(m.rd((128 + p.bank) * 4096) == 0 && m.rd(0x1800 + 4 * p.bank) == 1 && m.rd(0x1000 + 4 * p.bank) == 0x10000);
+      banks[i] = p.bank;
+    }
+    CHECK(banks[0] == 81 && banks[1] == 80 && banks[2] == 79 && banks[3] == 78);
+  }
+  {   // 0x1001 already bypassing in an exact entry: kept, not one write
+    SmmuModel m;
+    m.r[0x800 + 4 * 5] = 0x80000000u | 0x1001;
+    m.r[0xc00 + 4 * 5] = 1u << 16;
+    const SmmuPlan p = planSmmuStream(0x1001, kSmmuBytes, [&](uint32_t o) { return m.rd(o); });
+    CHECK(!p.error && p.reuse && p.keep);
+    CHECK(!applySmmuStream(p, 0x1001, [&](uint32_t o) { return m.rd(o); }, [&](uint32_t o, uint32_t v) { m.wr(o, v); }, [] { return false; }));
+    CHECK(m.writes.empty());
+  }
+  {   // the DT's masked group <0x1001 0x80> left by someone: refused, nothing written (level 6 then fails without the DSP's buffer)
+    SmmuModel m;
+    m.r[0x800 + 4 * 2] = 0x80000000u | 0x0080u << 16 | 0x1001;
+    m.r[0xc00 + 4 * 2] = 1u << 16;
+    const SmmuPlan p = planSmmuStream(0x1001, kSmmuBytes, [&](uint32_t o) { return m.rd(o); });
+    CHECK(p.error && !std::strcmp(p.error, "the stream sits in a masked stream-match group"));
+    CHECK(applySmmuStream(p, 0x1001, [&](uint32_t o) { return m.rd(o); }, [&](uint32_t o, uint32_t v) { m.wr(o, v); }, [] { return false; }));
+    CHECK(m.writes.empty());
+  }
+}
+
 int main()
 {
   testTables();
@@ -186,6 +266,8 @@ int main()
   testDecode();
   testSummary();
   testSmmu();
+  testPins();
+  testSmmuBypass();
   if (failures) {
     std::printf("audio_host: %d failures\n", failures);
     return 1;

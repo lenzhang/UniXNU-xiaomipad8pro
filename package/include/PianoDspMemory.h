@@ -17,7 +17,7 @@
 
 #define PIANO_DSP_MEMORY_SENSORS 0x9d200000ull   /* PianoSensors: the FastRPC arena (SSR_ARENA_BYTES), the piano-sensors-rpc-pa default */
 #define PIANO_DSP_MEMORY_SENSORS_BYTES 0x800000ull
-#define PIANO_DSP_MEMORY_AUDIO 0x9da00000ull     /* PianoAudio: its DMA buffers when it needs them (audio.md §10.4), not used yet */
+#define PIANO_DSP_MEMORY_AUDIO 0x9da00000ull     /* PianoAudio: its DMA buffers (audio.md §10.4): from level 6 the first 128 KiB (AudioSession.h) */
 #define PIANO_DSP_MEMORY_AUDIO_BYTES 0x1000000ull
 #define PIANO_DSP_MEMORY_SPARE 0x9ea00000ull     /* unassigned */
 #define PIANO_DSP_MEMORY_SPARE_BYTES 0x100000ull
