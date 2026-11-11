@@ -1,7 +1,7 @@
 # Bluetooth: the WCN7860's Bluetooth over QUP2 SE6 ("UART14"): PianoBluetooth
 
 Status: design + level 1 code, 2026-11-11 (backlog B9). `package/PianoBluetooth` carries level 1 (a read-only survey) as a kext, built
-and linked into the native KC (17 native kexts, PianoBluetooth 326 pointers, inert without `piano-bt`), **not run**; and, host-tested
+and linked into the native KC (20 native kexts, PianoBluetooth 326 pointers, inert without `piano-bt`), **not run**; and, host-tested
 only (`tests/bt_host.cpp`), the portable code of levels 3 and 4: the GENI UART plans, H4 framing and the QCA vendor codec with the
 whole controller set-up sequence. The macOS side is the hard half: §5 is its verdict. Template: `README.md`.
 
@@ -137,7 +137,7 @@ recommendation: C for input devices, A kept open for audio if the owner accepts 
 
 `tooling/k27/build-native-piano-bluetooth.sh` (host tests, a store check of the survey headers, the objects, the import check: 0
 unresolved), descriptor `tooling/k27/kext/PianoBluetooth.json` (`com.unixnu.driver.PianoBluetooth`), listed in
-`configs/k27-native-kexts.txt`, so `tooling/k27/build-native-image.sh` links it (inert). Link check 2026-11-11 (kernel 0059): "17 native
+`configs/k27-native-kexts.txt`, so `tooling/k27/build-native-image.sh` links it (inert). Link check 2026-11-11 (kernel 0059): "20 native
 kexts linked, none from DroidVM", PianoBluetooth 326 pointers, every vtable check 0 problem slots. No library dependency yet; level 3
 adds PianoWifi (§7.1) and PianoA830 (the GCC vote lock) to the descriptor, level 4 NativeUfs.
 
