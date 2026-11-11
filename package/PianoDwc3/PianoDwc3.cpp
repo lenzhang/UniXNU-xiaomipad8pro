@@ -1512,12 +1512,14 @@ bool PianoDwc3::start(IOService *provider)
     }
   }
   // piano-usb-net=1: the queues now (the USB thread uses them from its first enumeration), the Ethernet controller from a thread
-  // once IOBSD is up (PianoUsbNet.cpp). Without them the device keeps its ACM-only shape.
+  // once IOBSD is up (PianoUsbNet.cpp), under this service, registered as for the HID devices. Without them the device keeps its
+  // ACM-only shape.
   if (gArgs.net) {
     if (!pianonet::init(&gGadget.netStats) || !pianonet::startThread(this)) {
       note("net: no queues or thread: the network function is left out");
       gArgs.net = 0;
     } else {
+      if (!gArgs.hid) registerService();   // the HID path registered it already
       note("net: CDC-NCM network function requested (piano-usb-net=1): MAC %02x:%02x:%02x:%02x:%02x:%02x here, %02x:%02x:%02x:%02x:%02x:%02x "
            "on the Mac", kNetDeviceMac[0], kNetDeviceMac[1], kNetDeviceMac[2], kNetDeviceMac[3], kNetDeviceMac[4], kNetDeviceMac[5],
            kNetHostMac[0], kNetHostMac[1], kNetHostMac[2], kNetHostMac[3], kNetHostMac[4], kNetHostMac[5]);
