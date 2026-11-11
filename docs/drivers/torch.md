@@ -53,9 +53,11 @@ channels 3/4 off (else "someone else drives this module"). Found lit → turned 
   (Ubuntu's DT limit, ITARGET 9, clamp 9). 5 mA a channel steps, rounded down.
 - **Guard** (polled every second while lit, `TorchCore.h judge`): the request's time (default `piano-torch-timeout` 300 s, at most
   1800 s); STATUS2 over-temperature/thermal overload, current limit, low supply, STATUS1 short → off and 60 s cool-down; the
-  enables no longer on → off; the hottest TSENS controller (PianoThermal's `TemperaturesDeciC`) ≥ `piano-torch-soc-max` (85 °C, its
-  "warm") or the battery (AppleSmartBattery `Temperature`, PianoPower) ≥ `piano-torch-batt-max` (45 °C) → off / refused; two
-  unreadable polls in a row → off. Missing drivers only remove their input; the time limit and the module's bits always apply.
+  enables no longer on → off; the hottest TSENS controller (PianoThermal's `TemperaturesDeciC`, refreshed at its report interval)
+  ≥ `piano-torch-soc-max` (85 °C, its "warm") or the battery (AppleSmartBattery `Temperature`, PianoPower) ≥ `piano-torch-batt-max`
+  (45 °C) → off / refused; two unreadable polls in a row → off. Missing drivers only remove their input; the time limit and the
+  module's bits always apply. The time limit is software: the module's own safety timer is off for a torch (its range ends at
+  1.27 s, a flash's).
 - **Power**: joins the power tree (`PianoPowerContract.h`): `setPowerState(kOff)` (system sleep) and `systemWillShutdown` turn it
   off synchronously (four SPMI writes). A panic cannot: see §10.
 
@@ -128,7 +130,7 @@ PianoTorch: stage 3: done
 PianoTorch: done: 10 observer reads (0 failed), 0 PMIC writes
 ```
 **T2 expected** (`piano-torch=2 piano-torch-ma=20 piano-torch-test=5`, 30 s after the kext starts; the owner watches the rear LED: a
-dim light for 5 s, then dark): the T1 lines without the `level 1` line, then
+dim light for 5 s, then dark): the T1 lines up to `summary:` (without the `level 1` line), then
 ```
 PianoTorch: stage 3: level 2: torch control (writes to the flash module only, each read back)
 PianoTorch: level 2: torch control on channels 1+2 at 20 mA (at most 100), auto-off after 300 s, off at SoC >= 85 C or battery >= 45 C; writes only to PPID 0x1ee, 10 allowlisted registers
@@ -139,8 +141,9 @@ PianoTorch: temperatures: SoC ..C, battery 0.00 C (none)
 PianoTorch: off (guard): the boot test is over; 4 writes, 4 read back
 ```
 **T3** (attended, runtime): `piano-torch=2 piano-usb=2 piano-usb-shell=1` (+ `piano-power=1` for the battery input); the tool on the
-tablet (built on the Mac, `out/native-kexts/PianoTorch/host-tests/piano-torch`, copied to `/usr/local/bin` over the root shell or
-staged with `stage-soft-metal.py --file`). In the root shell: `piano-torch on` → `level 2: on 50 mA (2 x 25 mA, itarget 4), off in 300 s`;
+tablet (built on the Mac by the build script: `out/native-kexts/PianoTorch/host-tests/piano-torch`, ad-hoc signed; pasted over the
+root shell with `base64 -D`, or staged with `stage-soft-metal.py --file <tool>:usr/local/bin/piano-torch --boot-run "/bin/chmod 755
+/usr/local/bin/piano-torch"`, as staged files are mode 644). In the root shell: `piano-torch on` → `level 2: on 50 mA (2 x 25 mA, itarget 4), off in 300 s`;
 `piano-torch off` → `off (asked)`; `piano-torch on 100 10` and wait → `off (the time limit)` after 10 s; `piano-torch on 500` → 100 mA
 (`on: 500 mA asked, 100 mA set`); as a plain user → `not an administrator: use sudo`; lit through 5 minutes once (default timeout)
 with a finger on the lens area: warm, not hot; `lit:` lines every 30 s show status 00.
