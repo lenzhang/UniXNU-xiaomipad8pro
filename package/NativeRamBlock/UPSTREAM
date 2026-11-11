@@ -8,3 +8,16 @@ UniXNU-piano changes (NativeRamBlock.cpp), formerly applied at build time by too
 - The six native_ufs_store_* hooks are plain imports (the KC linker takes no weak imports): NativeUfs provides them (data-persist=2).
   The VM's DroidVMDataStore.c (virtio data store) is not part of the native build.
 - attachStore logs "NativeRamBlock: Data store state ...".
+
+UniXNU-piano changes of 2026-11-11 (docs/data-store.md):
+- The store guard (PersistOverlay.h open -> Open::Kept, state 7): a valid store made for another seed is left untouched and the disk
+  runs volatile for that boot, unless data-store-replace=1 (or =0x<the store's 8 hex>) or sheng-data-reset=1|2 asks to start over.
+  Upstream re-initialised it ("stale"), which dropped every Data change whenever a RAM image brought another seed.
+- VolatileDisk.h: a large seed (above 2 GiB) without the store open read-write has a volatile write path (pages in RAM); upstream
+  refused its writes (kIOReturnNotReady). The read-only probe (data-persist=1) of a large disk no longer dereferences sparse.pages.
+- Self-contained stores (header extension "SHNGEXT1" in bytes 64..127 of block 0, flag kSelfContained) and Overlay::flatten
+  (data-store-flatten=1): every seed page written into the store, then the flag; DirectDisk.h then reads clear bits as zero, so the
+  store works with any seed of its size. The version 1 header (bytes 0..63) is unchanged, so earlier kernels still read the store.
+- Test/: upstream's host tests sparse.cpp, persist.cpp (its stale-seed case now expects Kept, then Fresh with replace), direct.cpp,
+  seeddisk.cpp, seed-identity.cpp (sparse.cpp: the over-size case moved past SparseDisk.h's 1 TiB limit); new guard.cpp and
+  volatile.cpp; run-tests.sh.

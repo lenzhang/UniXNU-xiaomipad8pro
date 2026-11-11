@@ -18,6 +18,7 @@
 #include "SparseDisk.h"
 #include "PersistOverlay.h"
 #include "DirectDisk.h"
+#include "VolatileDisk.h"
 
 extern "C" {
 extern unsigned long gPhysBase, gPhysSize;
@@ -39,11 +40,14 @@ int native_ufs_store_write(uint64_t, uint32_t, const void *);
 int native_ufs_store_sync(void);
 unsigned native_ufs_store_gpt_check(void);
 // Diagnostics. state: 0 off, 1 blank (read-only probe), 2 resumed, 3 fresh, 4 refused/failed, 5 degraded after an I/O error,
-// 6 resumed read-only (probe). header: persist::checkHeader result.
-volatile uint32_t native_data_persist_state = 0, native_data_persist_header = 9, native_data_persist_gpt = 0xff, native_data_persist_gpt_after = 0xff;
+// 6 resumed read-only (probe), 7 kept (another seed's store, untouched; Data volatile). header: persist::checkHeader result.
+// flags: the header's extension flags (1 self-contained); store_tag: the first 4 bytes of the store's seed digest;
+// flattened: pages data-store-flatten wrote this boot; volatile_bytes: RAM held by the volatile disk's written pages.
+volatile uint32_t native_data_persist_state = 0, native_data_persist_header = 9, native_data_persist_gpt = 0xff, native_data_persist_gpt_after = 0xff,
+                  native_data_persist_flags = 0, native_data_persist_store_tag = 0;
 volatile uint64_t native_data_persist_pages = 0, native_data_persist_loaded = 0, native_data_persist_writes = 0,
                   native_data_persist_syncs = 0, native_data_persist_errors = 0, native_data_persist_first_lba = 0,
-                  native_data_persist_present = 0;
+                  native_data_persist_present = 0, native_data_persist_flattened = 0, native_ram_block_volatile_bytes = 0;
 }
 
 class NativeRamBlock : public IOBlockStorageDevice {
@@ -54,9 +58,11 @@ class NativeRamBlock : public IOBlockStorageDevice {
   bool online = false;
   RamSparseDisk sparse = {};
   // A disk above 2 GiB keeps only the nonzero pages of its seed (SeedDisk.h), in memory proportional to the content, and is served by the
-  // direct (store-backed) path alone: it needs the persistent store open read-write, or its requests fail.
+  // direct (store-backed) path when the persistent store is open read-write; otherwise (UniXNU-piano) by the volatile disk below.
   SeedDisk big = {};
   bool isBig = false;
+  // UniXNU-piano: the volatile disk of a large seed (VolatileDisk.h), set up by attachStore whenever the store is not open read-write.
+  VolatileDisk vol = {};
   uint8_t seedHash[32] = {};
   persist::Overlay overlay;
   uint8_t *overlayBits = nullptr, *stage = nullptr;   // stage: kStagePages pages, one write or read run
@@ -75,13 +81,63 @@ public:
   // Called once, before the Data volume is mounted (native_ram_block_volume_seed): open the store window, put the pages that
   // earlier boots changed back into the sparse disk, and from then on write changed pages through. The seed identity
   // (seedHash) is not affected. Any refusal or error leaves the disk volatile, exactly as without persistence.
-  // sheng-data-reset=1 or 2 starts the overlay over (the old pages are dropped, not applied); 2 also asks for Setup (BootWatchdogPolicy.c).
+  // Boot arguments (docs/data-store.md):
+  //   sheng-data-reset=1|2   start the store over, whatever it holds (the old pages are dropped, not applied); 2 also asks for Setup
+  //                          (BootWatchdogPolicy.c)
+  //   data-store-replace=1   UniXNU-piano: replace a store made for another seed. Without it such a store is kept untouched and Data
+  //                          runs volatile for this boot (state 7). =0x<8 hex>: only the store whose seed begins with those digits.
+  //   data-store-flatten=1   UniXNU-piano: write every seed page the store lacks into it, then mark it self-contained (resumable)
   static bool discardRequested() { uint32_t v = 0; return PE_parse_boot_argn("sheng-data-reset", &v, sizeof v) && (v == 1 || v == 2); }
+  static uint32_t replaceRequested() { uint32_t v = 0; return PE_parse_boot_argn("data-store-replace", &v, sizeof v) ? v : 0; }
+  static bool flattenRequested() { uint32_t v = 0; return PE_parse_boot_argn("data-store-flatten", &v, sizeof v) && v == 1; }
+  static void seedText(const uint8_t digest[32], char out[9]) { snprintf(out, 9, "%08x", persist::seedTag(digest)); }
+  static constexpr uint32_t kFlattenPages = 256;   // 1 MiB per flatten run
+  // data-store-flatten (PersistOverlay.h flatten): only this seed's store, open read-write. Runs before the disk is published.
+  void flattenStore() {
+    char ours[9], theirs[9];
+    seedText(seedHash, ours);
+    seedText(overlay.storeSeed, theirs);
+    if (!direct || !overlay.active || overlay.readOnly) {
+      IOLog("NativeRamBlock: data-store-flatten=1: the store is not open read-write this boot (state %u); nothing flattened\n",
+            native_data_persist_state);
+      return;
+    }
+    if (overlay.selfContained) {
+      IOLog("NativeRamBlock: data-store-flatten=1: the store is self-contained already (made with seed %s); nothing to do\n", theirs);
+      return;
+    }
+    uint8_t *buffer = static_cast<uint8_t *>(IOMallocZero(kFlattenPages * persist::kBlock));
+    const uint32_t runPages = buffer ? kFlattenPages : kStagePages;
+    const uint64_t before = overlay.present;
+    uint64_t written = 0;
+    IOLog("NativeRamBlock: flatten: seed %s, %llu of %llu pages present; writing the seed's other pages into the store\n",
+          ours, overlay.present, overlay.pages);
+    StoreOps ops;
+    int result = isBig ? overlay.flatten(ops, big, buffer ? buffer : stage, runPages, &written)
+                       : overlay.flatten(ops, sparse, buffer ? buffer : stage, runPages, &written);
+    if (buffer) IOFree(buffer, kFlattenPages * persist::kBlock);
+    native_data_persist_flattened = written;
+    native_data_persist_present = overlay.present;
+    native_data_persist_flags = overlay.flags;
+    if (result > 0) {
+      IOLog("NativeRamBlock: flatten done: %llu seed pages written now (%llu present before, %llu now); the store is self-contained: "
+            "any seed boots it from now on, a seed only starts a new store\n", written, before, overlay.present);
+    } else {
+      // Every run that reached the medium carries its bits; what is on the medium is still this seed's valid store.
+      directFailed = true;
+      native_data_persist_state = 5;
+      __atomic_fetch_add(&native_data_persist_errors, 1, __ATOMIC_RELAXED);
+      IOLog("NativeRamBlock: flatten stopped by a store error after %llu pages: the store stays seed %s's and valid; Data writes are off "
+            "this boot; data-store-flatten=1 again resumes it\n", written, ours);
+    }
+  }
   void attachStore() {
     if (!gate) return;
     IOLockLock(gate);
     if (storeAttached) { IOLockUnlock(gate); return; }
     storeAttached = true;
+    char ours[9], theirs[9] = "-";
+    seedText(seedHash, ours);
     unsigned mode = &native_ufs_store_mode ? native_ufs_store_mode() : 0;
     if (mode && (sparse.pages || isBig) && &native_ufs_store_open && &native_ufs_store_read && &native_ufs_store_write &&
         &native_ufs_store_sync && &native_ufs_store_gpt_check) {
@@ -98,22 +154,47 @@ public:
         overlayBits = static_cast<uint8_t *>(IOMallocZero(bb * persist::kBlock));
         stage = static_cast<uint8_t *>(IOMallocZero(kStagePages * persist::kBlock));
         StoreOps ops;
-        persist::Open result = overlayBits && stage ? overlay.open(ops, pages, seedHash, mode == 1, overlayBits, discardRequested())
-                                                          : persist::Open::Failed;
+        persist::Open result = overlayBits && stage ? overlay.open(ops, pages, seedHash, mode == 1, overlayBits, discardRequested(),
+                                                                   replaceRequested())
+                                                    : persist::Open::Failed;
         native_data_persist_header = static_cast<uint32_t>(overlay.header);
+        native_data_persist_flags = overlay.flags;
+        native_data_persist_store_tag = persist::seedTag(overlay.storeSeed);
+        if (overlay.header == 0 || overlay.header == 3) seedText(overlay.storeSeed, theirs);
         if (result == persist::Open::Failed) {
           native_data_persist_state = 4;
           overlay.active = false;
         } else if (result == persist::Open::Blank) {
           native_data_persist_state = 1;
+        } else if (result == persist::Open::Kept) {
+          // UniXNU-piano store guard: another seed's store (a test image, a rebuilt seed) is never replaced without being asked to.
+          native_data_persist_state = 7;
+          overlay.active = false;
+          IOLog("NativeRamBlock: the store belongs to seed %s (this seed %s): kept; Data is volatile this boot; data-store-replace=1 starts over\n",
+                theirs, ours);
         } else if (result == persist::Open::Fresh) {
           native_data_persist_state = 3;
           direct = mode == 2;
+          if (overlay.replaced)
+            IOLog("NativeRamBlock: the store was started over on request (data-store-replace or sheng-data-reset): a new store for seed %s, "
+                  "generation %llu\n", ours, overlay.generation);
         } else if (mode == 2) {
           // Resumed read-write: nothing is copied into RAM. The window answers for every page whose bit is set.
           direct = true;
           native_data_persist_state = 2;
+        } else if (isBig) {
+          // A large disk has no RAM copy to load the store into (the loader below would need sparse.pages): the probe proves the
+          // header and bitmap and leaves them alone.
+          native_data_persist_state = 6;
+          overlay.active = false;
+          IOLog("NativeRamBlock: read-only probe: the store's %llu pages are not applied to a large disk; Data is the seed's this boot\n",
+                overlay.present);
         } else {
+          if (overlay.selfContained && !overlay.sameSeed) {
+            // The store holds every page of its own seed; this seed's pages must not show through its clear bits.
+            for (uint64_t i = 0; i < sparse.bytes / 4096; ++i)
+              if (sparse.pages[i]) { IOFree(sparse.pages[i], 4096); sparse.pages[i] = nullptr; sparse.resident -= 4096; }
+          }
           struct Loader {
             NativeRamBlock *self;
             bool operator()(uint64_t i, const uint8_t *page) {
@@ -139,12 +220,31 @@ public:
             overlay.active = false;
           }
         }
+        if (result == persist::Open::Resumed && overlay.selfContained)
+          IOLog("NativeRamBlock: self-contained store (made with seed %s, %llu pages flattened; this seed %s): the seed is not read\n",
+                theirs, overlay.flattened, ours);
+        if (flattenRequested()) {
+          if (result == persist::Open::Kept)
+            IOLog("NativeRamBlock: data-store-flatten=1: the store is seed %s's and flattens only under that seed; nothing written\n", theirs);
+          else flattenStore();
+        }
         native_data_persist_present = overlay.present;
         native_data_persist_gpt_after = native_ufs_store_gpt_check();
       }
     }
-    IOLog("NativeRamBlock: Data store state %u (1 blank, 2 resumed, 3 fresh, 4 failed), header %u, first LBA %llu, %llu pages, direct %d\n",
-          native_data_persist_state, native_data_persist_header, native_data_persist_first_lba, native_data_persist_pages, direct);
+    if (isBig && !direct) {
+      // UniXNU-piano: a large seed without the store open read-write runs volatile (VolatileDisk.h) instead of refusing writes.
+      vol.bytes = big.bytes;
+      vol.dir = static_cast<uint8_t ***>(IOMallocZero(VolatileDisk::entries(vol.bytes) * sizeof(uint8_t **)));
+      if (!vol.dir) IOLog("NativeRamBlock: no memory for the volatile disk's directory: Data writes are refused this boot\n");
+    }
+    if (!direct)
+      IOLog("NativeRamBlock: Data is volatile this boot (state %u, data-persist=%u): its changes stay in RAM and are gone at the next boot\n",
+            native_data_persist_state, mode);
+    IOLog("NativeRamBlock: Data store state %u (1 blank, 2 resumed, 3 fresh, 4 failed, 7 kept), header %u, first LBA %llu, %llu pages, "
+          "direct %d, seed %s, store seed %s, flags %u\n",
+          native_data_persist_state, native_data_persist_header, native_data_persist_first_lba, native_data_persist_pages, direct,
+          ours, theirs, native_data_persist_flags);
     IOLockUnlock(gate);
   }
 
@@ -285,9 +385,10 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
   IOLockLock(gate);
   if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
   uint64_t actual;bool noMemory=false;
-  if(isBig && !direct) {
+  if(isBig && !direct && !vol.dir) {
     // Before the store is attached (APFS probes the disk for its volume UUID long before the kernel asks for the Data volume, which is what
-    // attaches the store) a disk this size is read from its seed alone; it has no volatile mode, so writes wait.
+    // attaches the store) a disk this size is read from its seed alone, and writes wait. (UniXNU-piano publishes the disk only after
+    // attachStore, which sets up the volatile disk whenever the store is not open read-write; this stays for a failed allocation.)
     if(buffer->getDirection()==kIODirectionIn) {
       struct SeedReadOps {
         IOMemoryDescriptor *buffer;
@@ -311,7 +412,21 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
     }
     IOLockUnlock(gate);return kIOReturnNotReady;
   }
-  if(sparse.pages||isBig){
+  if(isBig && !direct){
+    // Volatile large disk (VolatileDisk.h): the pages written this boot in RAM, every other page from the seed; the store is not used.
+    struct VolatileOps {
+      IOMemoryDescriptor *buffer;
+      uint8_t *allocate(){return static_cast<uint8_t *>(IOMallocZero(4096));}
+      uint64_t read(uint64_t at,void *p,uint64_t n){return buffer->readBytes(at,p,n);}
+      uint64_t copy(uint64_t at,const void *p,uint64_t n){return buffer->writeBytes(at,p,n);}
+    } vops={buffer};
+    bool write=buffer->getDirection()==kIODirectionOut;
+    actual=volatileDiskIO(big,vol,write,block*512,bytes,vops,vops,noMemory);
+    if(write)__atomic_fetch_add(&native_ram_block_writes,1,__ATOMIC_RELAXED);
+    else __atomic_fetch_add(&native_ram_block_reads,1,__ATOMIC_RELAXED);
+    native_ram_block_volatile_bytes=vol.resident;
+    native_ram_block_resident_bytes=big.resident+vol.resident+vol.leaves*4096;
+  }else if(sparse.pages||isBig){
     struct Operations {
       IOMemoryDescriptor *buffer;
       uint8_t *allocate(){return static_cast<uint8_t *>(IOMallocZero(4096));}
@@ -377,6 +492,12 @@ void NativeRamBlock::free()
 {
   if (overlayBits) { IOFree(overlayBits, persist::bitmapBlocks(sparse.bytes / 4096) * persist::kBlock); overlayBits = nullptr; }
   if (stage) { IOFree(stage, kStagePages * persist::kBlock); stage = nullptr; }
+  if (vol.dir) {
+    struct Release { void operator()(uint8_t *block) { IOFree(block, 4096); } } release;
+    volatileDiskRelease(vol, release);
+    IOFree(vol.dir, VolatileDisk::entries(vol.bytes) * sizeof(uint8_t **));
+    vol = {};
+  }
   if (isBig) {
     for (uint64_t k = 0; k < big.count; ++k) IOFree(big.page[k], 4096);
     if (big.index) IOFree(big.index, (big.capacity ? big.capacity : 1) * sizeof(uint64_t));

@@ -2,6 +2,8 @@
 #pragma once
 // I/O for a Data disk whose changed pages live only in the store window (PersistOverlay.h), not in RAM. The seed (the sparse disk) stays the
 // immutable base for pages the window does not hold: a page whose bit is set is read from the window, any other page from the seed (or zero).
+// A self-contained store (PersistOverlay.h kSelfContained, after data-store-flatten) holds every page its seed had, so the seed is not
+// read at all: a page whose bit is clear is zero, whatever seed this boot brought.
 // Writes always go to the window, durably, before they are reported done; the seed is never modified.
 //   Buf: uint64_t read(uint64_t at, void *p, uint64_t n)        bytes of the request buffer (the data of a write)
 //        uint64_t copy(uint64_t at, const void *p, uint64_t n)  bytes into the request buffer (the data of a read)
@@ -38,7 +40,7 @@ static uint64_t directDiskIO(const Seed &seed, persist::Overlay &ov, Store &stor
       }
       uint64_t n = 4096 - skip;
       if (n > length - done) n = length - done;
-      const uint8_t *page = seed.find(index);
+      const uint8_t *page = ov.selfContained ? nullptr : seed.find(index);
       uint64_t got = buf.copy(done, (page ? page : zero) + skip, n);
       done += got;
       if (got != n) break;
@@ -57,7 +59,7 @@ static uint64_t directDiskIO(const Seed &seed, persist::Overlay &ov, Store &stor
     if (ov.has(index)) {
       if (!store.read(persist::pageBlock(ov.pages, index), 1, stage)) { *storeError = true; break; }
     } else {
-      const uint8_t *page = seed.find(index);
+      const uint8_t *page = ov.selfContained ? nullptr : seed.find(index);
       memcpy(stage, page ? page : zero, 4096);
     }
     if (buf.read(done, stage + skip, n) != n) break;
