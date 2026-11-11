@@ -9,7 +9,8 @@
 // One kernel thread does everything, in steps (each logs "PianoKeyboard: step N ..." before it touches anything):
 //   1 survey     read only: the six pins' TLMM registers and levels, the two rails' cmd-db addresses, the apps RSC id
 //   2 pins       reset and sleep driven low (asserted); the bus pins, gpio97 and gpio95 GPIO inputs
-//   3 rails      RPMh active votes through the apps RSC (DRV 2, an idle active TCS): L11B 1.8 V, then L14B 3.3 V (mode, mV, enable)
+//   3 rails      RPMh active votes through the apps RSC (DRV 2, an idle active TCS): L11B 1.8 V, then L14B 3.3 V (mode, mV, enable),
+//                each with PianoA830's DRV-2 owner word held (tag 'KBRD'; a wait for another owner is logged)
 //   4 power-on   the bus released to its pull-ups, reset released after 2 ms, 500 ms for the boot ROM, sleep released, 50 ms;
 //                boot ROM id 0xc8 in state 0
 //   5 firmware   the image's header (state 1), its 101 data blocks (3 ms after each write), verify (state 3), boot
@@ -213,6 +214,46 @@ Rail gRails[2] = {{"ldob11", "vreg_l11b_1p8 (vddio)", 1800, 0}, {"ldob14", "vreg
 uint32_t rscRd(uint32_t at) { return rd32(gRsc.va + kRscTcs + at); }
 void rscWr(uint32_t at, uint32_t v) { wr32(gRsc.va + kRscTcs + at, v); }
 
+// The DRV-2 owner word of PianoA830 (package/PianoA830/adreno830/platform/sm8750/Sm8750Rpmh.h, "DRV-2 lock"): one 32-bit word,
+// 0 = free, any other value = its owner's tag. PianoA830 holds it around its own TCS transactions (tag 'A830'), PianoPower around
+// its votes ('POWR'), so piano-gpu=2, piano-power>=2 and this driver never pick and program a TCS of DRV-2 (or its shared
+// IRQ_ENABLE) at once. PianoA830 is in configs/k27-native-kexts.txt and PianoKeyboard comes after the list (PIANO_EXTRA_KEXTS), so
+// the KC linker (no weak imports) resolves this to A830's single copy; PianoKeyboard.json names PianoA830 as a library. The protocol
+// is A830's: compare-exchange 0 for our tag, 10 us between tries, at most 2 s, store 0 to release.
+extern "C" volatile uint32_t sm8750_rpmh_drv2_owner;
+constexpr uint32_t kDrv2Tag = 0x4b425244;   // "KBRD"
+constexpr unsigned kDrv2Steps = 200000, kDrv2StepUs = 10;
+
+// The owner tag as four characters when it is printable ('A830', 'POWR'), else "?".
+const char *tagName(uint32_t tag, char out[5])
+{
+  for (unsigned i = 0; i < 4; ++i) {
+    const char c = char(tag >> (24 - 8 * i));
+    if (c < 0x20 || c > 0x7e) return "?";
+    out[i] = c;
+  }
+  out[4] = 0;
+  return out;
+}
+
+// Takes the lock; *waits gets the 10 us waits. false: someone held it for 2 s (then nothing is programmed).
+bool drv2Acquire(uint32_t *waits)
+{
+  for (uint32_t n = 0;; ++n) {
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n(&sm8750_rpmh_drv2_owner, &expected, kDrv2Tag, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      *waits = n;
+      return true;
+    }
+    if (n == kDrv2Steps) {
+      *waits = n;
+      return false;
+    }
+    IODelay(kDrv2StepUs);
+  }
+}
+void drv2Release() { __atomic_store_n(&sm8750_rpmh_drv2_owner, 0, __ATOMIC_RELEASE); }
+
 bool readRails()
 {
   Region db = {};
@@ -236,7 +277,7 @@ bool readRails()
   return ok;
 }
 
-bool vote(const Rail &r)
+bool voteLocked(const Rail &r)
 {
   const RscLayout &l = gLayout;
   static const unsigned kOrder[3] = {2, 1, 0};
@@ -284,6 +325,24 @@ bool vote(const Rail &r)
   rscWr(0, irqEnable);
   note("rails: %s (%s) %u mV, mode 7, enable: TCS %d %s after %u ms (cmd status %#x %#x %#x)", r.name, r.what, r.mv, tcs,
        done ? "completed" : "NOT completed (left in flight, not used again)", waited, s[0], s[1], s[2]);
+  return done;
+}
+
+// Every vote runs with the DRV-2 owner word held: the idle TCS is picked, programmed, triggered and reclaimed inside it.
+bool vote(const Rail &r)
+{
+  char tag[5];
+  uint32_t waits = 0;
+  const uint32_t held = __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE);
+  if (held) note("rails: %s: the DRV-2 lock is held by %#x ('%s'); waiting (at most 2 s)", r.name, held, tagName(held, tag));
+  if (!drv2Acquire(&waits)) {
+    const uint32_t owner = __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE);
+    note("rails: %s: the DRV-2 lock stayed held by %#x ('%s') for 2 s: no vote sent", r.name, owner, tagName(owner, tag));
+    return false;
+  }
+  note("rails: %s: DRV-2 lock taken (tag 'KBRD') after %u waits of %u us", r.name, waits, kDrv2StepUs);
+  const bool done = voteLocked(r);
+  drv2Release();
   return done;
 }
 

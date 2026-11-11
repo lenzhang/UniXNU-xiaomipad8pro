@@ -40,8 +40,9 @@ python3 "$D/tooling/k27/build-native-kext.py" PianoKeyboard "$P/PianoKeyboard.cp
   -I "$P" -I "$HID" -I "$K/out/x12377/inc-gfx" -I "$K/out/x12377/storage-abi/include" -D U:TARGET_OS_OSX -D TARGET_OS_OSX=1 \
   --obj "${K27_OBJ:-k27-native-obj}" >&2
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
-# IOHIDDevice's symbols come from IOHIDFamily (a library of the descriptor), resolved by the KC link.
+# IOHIDDevice's symbols come from IOHIDFamily, the DRV-2 owner word from PianoA830 (both libraries of the descriptor; PianoA830 is
+# in the kext list, which links before PIANO_EXTRA_KEXTS), resolved by the KC link.
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" --library-prefix __ZN11IOHIDDevice \
-  --library-prefix __ZNK11IOHIDDevice --library-prefix __ZTV11IOHIDDevice | cut -c1-160 >&2
+  --library-prefix __ZNK11IOHIDDevice --library-prefix __ZTV11IOHIDDevice --library-prefix _sm8750_rpmh_drv2_owner | cut -c1-160 >&2
 sed "s#@OUT@#$D/out#" "$D/tooling/k27/kext/PianoKeyboard.json" > "$D/out/k27/kext/PianoKeyboard.json"
 echo "$D/out/k27/kext/PianoKeyboard.json"
