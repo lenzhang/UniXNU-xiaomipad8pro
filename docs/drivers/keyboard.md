@@ -2,7 +2,8 @@
 
 Status, 2026-11-11: built and linked (inert without `piano-keyboard`). Level 1 ran once on the tablet (240 s, nobody typed):
 MCU booted, cover attached, commands acknowledged. No key or touchpad report seen yet; level 2, the hall sensor and the
-DRV-2 lock not run. 2026-11-12 (offline, host-tested, not run): the touchpad tuned for macOS (§6a) and the battery work (§6b).
+DRV-2 lock not run. 2026-11-12 (offline, host-tested, not run): the touchpad tuned for macOS (§6a), the battery work (§6b), the
+gpio97 interrupt (opt-in, §6b), the panel's brightness keys and the state other drivers watch (§6c).
 Sources: `package/PianoKeyboard` (design and boot arguments at the top of `PianoKeyboard.cpp`, the codec in `Wn8030Piano.h`, the
 descriptors in `HidDescriptors.h`, provenance in `UPSTREAM`). Template: `README.md`.
 
@@ -82,6 +83,8 @@ which are unchanged.
 | `piano-keyboard-backlight=P` | 0 | keyboard backlight on attach, 0..100 (over 100: not sent) |
 | `piano-keyboard-backlight-idle=S` | 0 | backlight off after S s without a key or touch, back at the next |
 | `piano-keyboard-poll=MS` / `-idle-poll=MS` / `-slow-poll=MS` | 4 / 30 / 200 | latch poll while reports flow / idle / detached or closed |
+| `piano-keyboard-irq=1` | 0 | wait for gpio97 by the TLMM summary interrupt (§6b); polled again after 3 misses or a storm |
+| `piano-backlight-keys=1` | 0 | (PianoBacklight's) the cover's 0x6F/0x70 and Right Ctrl + 1 / 2 also step the panel backlight |
 | `piano-keyboard-raw=0`, `-invert=B`, `-mouse=0`, `-halfbit=US`, `-rails=0` | | see `PianoKeyboard.cpp` |
 
 ## 6a. The touchpad on macOS (2026-11-12)
@@ -121,6 +124,32 @@ seen low at the previous wakeup (a line that idles high made every 4 ms poll an 
 500 ms. The backlight is off unless `piano-keyboard-backlight=P` (Linux's `nanosic::kbd_backlight`, 0..100); the cover's
 keyboard-brightness keys, if it sends consumer 0x79/0x7a/0x7c, step it by 10; `piano-keyboard-backlight-idle=S` turns it off when
 idle. Display sleep is not used (natively only NativeGopDisplay knows it). The mic-mute LED stays off (nothing in macOS drives it).
+
+**The interrupt** (`piano-keyboard-irq=1`, default 0 until a native interrupt run has shown delivery; `docs/power-irq.md` §6).
+gpio97 goes to the TLMM summary line (SPI 208, INTID 240) through `package/common/PianoIrq.h`'s `tlmm::Pin`, the table PianoTouch's
+gpio162 shares (the second opener takes slot 1); its INTR_CFG keeps the PDC wake bit clear, so gpio97 is never a wake source.
+`waitForEdge` arms the pin, waits for the handler (which masks it) or a timeout of min(read-every, 500 ms), masks, then reads and
+clears the latch as before; an LED report from IOHIDFamily ends the wait early. At rest that is 2 wakeups a second instead of 33,
+and the first keystroke after a pause is read on its edge. A wait that timed out with the edge latched is a miss; three in a row,
+or the line's storm guard, and the loop polls again (logged once). The wake-up line reads `idle: N wakeups in 60 s, irq M (...)`.
+
+## 6c. The panel's brightness keys; state for other drivers; the wake rules for later (B2)
+
+With PianoBacklight's `piano-backlight-keys=1` the cover's display-brightness usages (consumer 0x6F up, 0x70 down) and Right Ctrl +
+1 / 2 step the panel backlight (`package/PianoBacklight/PianoBacklightClient.h`'s KeyWatch, fed the report as the cover sent it,
+before the Fn row); the reports still go to macOS. The cover's own keyboard-brightness usages (0x79/0x7a/0x7c) stay with its
+backlight (§6b).
+
+Properties of the PianoKeyboard service, set on each change, with a `kIOMessageServicePropertyChange` to its interested clients
+and the counter `piano-keyboard-changes`: `piano-keyboard-attached` (0/1, the MCU's attach bit), `piano-keyboard-hall` (0 closed,
+1 open; PianoBacklight's `piano-backlight-lid=1` reads it), `piano-keyboard-status` (gpio95's level: the MCU's status / wake
+request line). gpio95 is read only; its transitions are logged (`status gpio95 now 1 (change N, attached)`).
+
+No wake is armed here. The suspend work (backlog B2, `docs/BACKLOG-hardware.md`) will route the wakes through the PDC, under
+Ubuntu's rules (`docs/ubuntu-history/kernel.md`): the keyboard wakes on gpio95 rising (PDC 128 → SPI 639) only while the screen is
+off and the lid open; never gpio97; the lid (gpio80, PDC 122 → SPI 633) wakes on opening only; the keyboard power sequence follows
+the panel's blank / unblank; check the PDC's SPI-interface bit for SPI 639 first (it caused Ubuntu's early wakes). Ubuntu also
+dropped the community 12 s keep-alive (`docs/power-irq.md` §6.11): a candidate once the cover's behaviour without it is measured.
 
 ## 7. Build, kernel collection, RAM image
 
@@ -190,6 +219,14 @@ gestures on, `gesture N: three-finger swipe up (...): sent` and Mission Control 
 touching while typing gives `ignored (typing)`. Battery: `idle: N wakeups in 60 s (... idle at 30 ms ...)` with N about 2,000
 while idle and about 300 with the cover detached or closed (15,000 before).
 
+**(e) the interrupt** (an image with `piano-keyboard-irq=1` added to (b)'s `PIANO_EXTRA_ARGS`; with `piano-touch=2 piano-touch-irq=1`
+as well for the shared line): `serving: gpio97 interrupt on the TLMM summary (SPI 208, INTID 240): slot 0` (slot 1 when PianoTouch
+opened first); `idle: N wakeups in 60 s, irq M (...)` with N about 120 at rest; typing after a pause loses no first key; Caps Lock's LED follows at
+once. Fallback lines: `gpio97 interrupt NOT used (...)`, `gpio97 latched but no interrupt in 3 waits in a row: polled from now
+on`, `the TLMM summary line went away (state 2): polled from now on`. State: `ioreg -l -w0 -c PianoKeyboard | grep piano-keyboard`
+shows `piano-keyboard-attached`, `-hall`, `-status`, `-changes`; with `piano-backlight=2 piano-backlight-keys=1`, the cover's
+brightness keys move the panel.
+
 Failure lines and what they mean:
 - `rails: ldob11: the DRV-2 lock stayed held by 0x... ('A830') for 2 s` → the GPU kept the lock (its own hang); run (a) first.
 - `boot ROM: id 0xffffffff` / `nack address` → MCU unpowered or the bus wrong (rails, reset/sleep levels in the `pins:` lines).
@@ -222,6 +259,8 @@ volume/power keys (PianoInput). A hang is a reset (`piano-reset-after`, the Guny
    defaults move.
 7. Whether the contact count is clean enough for gestures on by default: (a)'s three-finger lines.
 8. Whether the cover sends keyboard-brightness consumer usages at all: (a)'s `consumer` lines.
+9. Native interrupt delivery on the summary line, and whether gpio97's edges ever miss it: (e), then `piano-keyboard-irq` on.
+10. What gpio95 does while the cover is in use (its transitions in (a)/(b)), before B2 arms it as a wake.
 
 ## 11. Licence note
 

@@ -11,4 +11,5 @@ authentication request left unanswered. Nobody typed or touched the touchpad in 
 seen yet; level 2 (macOS HID devices), the hall sensor and the DRV-2 lock have not run. Tonight's test: docs/drivers/keyboard.md §8.
 2026-11-12, offline and host-tested only: the touchpad tuned for macOS (declared resolutions, fine natural scrolling with an axis
 lock, taps, a typing guard, three-finger swipes off by default) and battery work (adaptive latch polling, the hall sensor at 500 ms,
-backlight off unless asked): keyboard.md §6a, §6b.
+backlight off unless asked): keyboard.md §6a, §6b. Also: gpio97 by the TLMM summary interrupt (piano-keyboard-irq=1, opt-in), the
+panel's brightness keys (piano-backlight-keys=1), the attach / hall / gpio95 state as properties for other drivers: §6b, §6c.

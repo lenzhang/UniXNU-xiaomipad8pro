@@ -184,6 +184,9 @@ Plan (owner present, tablet in ABL fastboot, same brightness, Wi-Fi/none, the sc
 
 ## 6. PianoKeyboard: the change to take (another change owns the driver)
 
+Taken 2026-11-12 (steps 1-8; `piano-keyboard-irq`, default 0; `docs/drivers/keyboard.md` §6b); 9 (gpio80 by interrupt) not
+taken: the hall pin stays read only, sampled every 500 ms; 10 and 11 are for the suspend work.
+
 Its serving loop already has the one place for this, `PianoKeyboard::waitForEdge(ms)` (adaptive 4 / 30 / 200 ms, Wn8030Piano.h
 PollPlan). Route: **gpio97 on the TLMM summary (SPI 208, INTID 240)**, not its PDC line (PDC 100 → SPI 611): no PDC or
 SPI-interface write, the same table as PianoTouch's gpio162, and with bit 7 cleared gpio97 is no wake source (§2.3). With the

@@ -53,6 +53,10 @@ sum of bytes 2..66, each vendor message's own sum, the ack (kind 0xf0) and state
 piano's boot DT (v1.1.0 piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840): gpio-keys
 switch-lid on TLMM gpio80, EV_SW/SW_LID, GPIO_ACTIVE_LOW (the hall sensor).
 
+UniXNU-piano (this repository), BSD-2-Clause-Patent, included as they are: package/common/PianoIrq.h (the TLMM summary interrupt,
+tlmm::Pin, MissGuard) for the gpio97 interrupt; package/PianoBacklight/PianoBacklightClient.h (KeyWatch, step) for the panel's
+brightness keys.
+
 Read as a reference only (Apple Public Source License; nothing copied): IOHIDFamily as fetched by UniXNU
 (unixnu-research/UniXNU/out/feeds/IOHIDFamily-f53ac321): IOHIDEventService::determineResolution and its defaults (400 dpi, 9 for
 scrolling), IOHIDEventDriver::handleScrollReport (whole Wheel / AC Pan counts, AC Pan negated, no Resolution Multiplier), the HID
