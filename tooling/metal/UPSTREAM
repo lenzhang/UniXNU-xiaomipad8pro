@@ -11,7 +11,10 @@ Mesa (MIT): https://github.com/Droid-VM/mesa cecc0e96d7193c72356a31abb0cc589e4fc
   (piano-tu-debug=<flags>|none on the boot line before the seed's tu-debug file), 0006-turnip-darwin-device-window.patch (2026-11-12:
   the device's GPU window is its own connection's, not the enumeration probe's, whose slot may differ),
   0007-turnip-darwin-sysmem-feedback-flush.patch (2026-11-12: in a sysmem pass a draw whose fragment shader reads an input attachment
-  of the subpass first cleans the CCU, invalidates UCHE and waits for the earlier draws' writes; TU_DEBUG=nofbflush / fbflushall)
+  of the subpass first cleans the CCU, invalidates UCHE and waits for the earlier draws' writes; TU_DEBUG=nofbflush / fbflushall),
+  0008-turnip-darwin-object-limit-window.patch (2026-11-12: the per-object limit is Query's max_bo_bytes within the connection's GPU
+  window, the device's own connection's when it differs from the probe's; a BO past its cache budget asked at its own size, not its
+  size class; the largest BOs on stderr; tu_darwin_limits for the Metal frontend)
   (MIT, as the files).
   Build options: UniXNU-turnip build-turnip-macos-piano.py's, with -Dtu-darwin-abi-dir pointing at the ABI below.
 Kernel ABI (MIT): https://github.com/Shad0w23333/Adreno830 1a1321056ffc5428ae925f4680093718b46ca7c2, NativeAdrenoABI.h
@@ -30,6 +33,9 @@ Frontend (MIT): UniXNU-turnip drivers/AdrenoMetal (NativeMetal fb063de per the V
   plugin executable is linked here (objects without objc_msgSend selector stubs, so the link is reproducible), not taken from the VM.
   0002-frontend-render-barrier-policy.patch (2026-11-12, MIT as the file: piano-metal-barriers=all|small|none or
   /private/var/ngpu/debug/render-barriers for the render-pass barriers of panel-sized surface passes, each one left out on stderr).
+  0003-frontend-surface-texture-sizes-limits.patch (2026-11-12, MIT as the file: no fixed cap on two-plane YCbCr surface textures,
+  every refused or large texture, buffer and surface texture on the console with its geometry and the runtime's memory for it, the
+  device's texture dimensions and memory figures answered from Turnip's tu_darwin_limits, a limits line per process).
 Abort reporter (ours, BSD-2-Clause-Patent): tooling/metal/turnip-a830/abort_reporter.mm, linked into the plugin as a third object; it is
   this repository's package/NativeSoftMetal/NativeSoftMetalPlugin.mm reporter (2026-11-11) with chaining to the process's own handlers.
 Bridge (GPL-2.0-or-later OR LGPL-3.0-or-later): macOS-DroidVM out/metal/bridge/libnative_metal_bridge.a
@@ -44,4 +50,6 @@ Host check (check-turnip-a830-host.py, MIT inputs): Adreno830 tests/hostsim and 
   https://github.com/UniXNU/AdrenoPM4 282606b528b2595bc4274ea7490b62b323f35a5f (GitHub archives into out/turnip-a830/kits).
   tooling/metal/turnip-a830/plugin_host.mm and reporter_host.mm are ours (BSD-2-Clause-Patent, as the plugin); so is
   render_trace_host.mm (2026-11-12: what RenderBox and Core Animation ask of the device, observed through the Objective-C runtime;
-  nothing of Apple's is read or kept).
+  nothing of Apple's is read or kept; CA_VIDEO: a 4096x2160 CoreVideo frame as a layer's contents, and every surface texture asked).
+  plugin_host.mm's sections 5-7 (2026-11-12: the per-object limit, 16384x16384 textures, 4096x2160 video frames) read the hostsim's
+  figures; check-turnip-a830-host.py also builds the hostsim with -DADRENO830_MACOS (the kernel as piano's kext has it).

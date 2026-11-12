@@ -1,0 +1,247 @@
+frontend: no fixed cap on YCbCr surface textures; every refused or large allocation on the console with its geometry; the device's limits
+
+The VM's frontend refused every two-plane YCbCr surface texture over 1 Mpx (1024 x 1024 pixels), but plane 0 of a 4:2:0 one in
+WindowServer, which the runtime reads in place ("surface texture refused: 4096x2160 YCbCr format 503 converts on the CPU"). That was a
+rule against the memory of the runtime's conversion, not a limit of the GPU: metal2vulkan makes such a texture as an RGBA16Float image
+of the converted texels (8 bytes a texel) and a staging copy of both planes, 67.5 + 25.3 = 92.8 MiB at 4096x2160 (the "about 97 MB"),
+and converts on the GPU (one dispatch, skipped while the planes are unchanged). The login window's aerial wallpaper (4096x2160 frames,
+format 503, YCbCr 8-bit 4:4:4 over two planes: 25.3 MiB a frame) was refused at every frame and never drawn. Now:
+- No fixed cap: a surface texture is made when the runtime, Turnip and the kernel can make it; each of those refuses with its own
+  reason (the runtime's error, Turnip's "NativeAdreno: a BO of N MiB is past ...", the kernel's "gpu BoAlloc refused: ...").
+- Every refused surface texture (each check of the surface method: 1 plane, 2 base, 3 plane range, 4 import, 5 texture), every one
+  that cost 64 MiB or more of device memory or lies over a surface of 256 MiB or more, and every YCbCr one over 1 Mpx is two lines:
+  "native-metal: surface texture 4096x2160 fmt 503 YCbCr8 4:4:4 plane 0: made, 92.8M of device memory for it" (or "(at O, row R):
+  refused (step): why"), then "native-metal: surface '444v' 4096x2160 25.3M, p0 4096x2160 1B r4096/4096 @0 8.4M p1 4096x2160 2B
+  r8192/4096 @8847360 16.9M": the surface's four-character code, size and allocation, each plane's size, bytes per element, row bytes
+  and their alignment, offset and rows x height. The device memory is the runtime's own count (nmb_device_memory_counts) across the call.
+- A texture of 16 Mi texels or more says its layout bytes (the runtime's heap size), made or refused, with maxBufferLength; a refused
+  buffer its length and maxBufferLength, a buffer of 256 MiB or more that it was made.
+- The texture dimensions the base class left at 0 (maxTextureWidth1D, maxTextureWidth3D/Height3D/Depth3D, maxTextureDimensionCube,
+  maxTextureBufferWidth) and recommendedMaxWorkingSetSize, currentAllocatedSize are answered, from this bundle's Turnip
+  (tu_darwin_limits, Turnip 0008) and the runtime's memory counts; at open each process says "native-metal: limits: 2D 16384, cube
+  16384, 3D 2048, layers 2048; buffer B (kernel object K, window W), heap H; IOSurface 16384x16384".
+Made lines go to stderr and the unified log as NBLOG's (8 per call site, then the 16th, 32nd, ...) without a problem note.
+Applied by tooling/metal/build-turnip-a830.sh after 0002. MIT, as the file.
+
+--- a/frontend.mm
++++ b/frontend.mm
+@@ -949,6 +949,85 @@
+  return [NSError errorWithDomain:@"org.blu-sharky.native-metal" code:-1 userInfo:@{NSLocalizedDescriptionKey:why?:@"refused"}];
+ }
+ static NSString *lastError() {return [NSString stringWithUTF8String:nmb_last_error()];}
++// UniXNU-piano (tooling/metal/turnip-a830/frontend 0003, 2026-11-12): the sizes behind textures over surfaces and large resources, on
++// the console. The VM's frontend refused every two-plane YCbCr surface texture over 1 Mpx but plane 0 of a 4:2:0 one in WindowServer
++// (which reads its planes in place): a rule against the memory of the runtime's conversion (an RGBA16Float image of the converted
++// texels and a staging copy of both planes: 92.8 MiB at 4096x2160), not a limit of the GPU. The login window's 4096x2160 aerial frames
++// (format 503, YCbCr 8-bit 4:4:4 over two planes) were refused at every frame and the wallpaper was never drawn. That rule is gone: a
++// texture is made when the runtime, Turnip and the kernel can make it, each of which refuses with its own reason, and here every
++// refused texture or buffer, every large one (64 MiB or more of device memory) and every YCbCr surface texture over 1 Mpx says what
++// it is: the surface's format, planes, rows and allocation, and the device memory the runtime allocated for it.
++// NBNOTE: NBLOG's console line (the unified log, stderr rate-limited per call site) without the problem note: a resource that was made
++// is no problem of the client's.
++#define NBNOTE(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];os_log(OS_LOG_DEFAULT,"%{public}s",nbText.UTF8String?:"?");\
++ if(logToStderr()){static std::atomic<uint32_t> nbSiteLines{0};const uint32_t nbLine=++nbSiteLines;\
++  if(nbLine<=8)fprintf(stderr,"%s: %.140s\n",getprogname(),nbText.UTF8String?:"?");\
++  else if(!(nbLine&(nbLine-1)))fprintf(stderr,"%s: [#%u] %.130s\n",getprogname(),nbLine,nbText.UTF8String?:"?");}}while(0)
++static constexpr uint64_t kLargeAllocationBytes=uint64_t(64)<<20;
++// Device memory the runtime allocated so far (nmb_device_memory_counts word 5): the difference across a call is what it allocated for
++// that call (and for any other thread of the process meanwhile).
++static uint64_t runtimeAllocatedBytes() {uint64_t mc[10]={};return gDevice && nmb_device_memory_counts(gDevice,mc)?mc[5]:0;}
++static NSString *nbMiB(uint64_t bytes) {return [NSString stringWithFormat:@"%.1fM",bytes/1048576.0];}
++// A four-character code as text ('444v'), or its hex when a byte is not printable.
++static NSString *fourCC(uint32_t code) {
++ char c[5]={(char)(code>>24),(char)(code>>16),(char)(code>>8),(char)code,0};
++ for(int i=0;i<4;i++)if(c[i]<32 || c[i]>126)return [NSString stringWithFormat:@"%08x",code];
++ return [NSString stringWithFormat:@"'%s'",c];
++}
++// Apple's two-plane YCbCr and RGB pixel formats (500 to 545, metal2vulkan's table), for the console; null for any other format.
++static const char *ycbcrFormatName(uint64_t format) {
++ switch(format) {
++ case 500: return "YCbCr8 4:2:0"; case 502: return "YCbCr8 4:2:2"; case 503: return "YCbCr8 4:4:4";
++ case 505: return "YCbCr10 4:2:0"; case 506: return "YCbCr10 4:2:2"; case 507: return "YCbCr10 4:4:4";
++ case 508: return "YCbCr10p 4:2:0"; case 509: return "YCbCr10p 4:2:2"; case 510: return "YCbCr10p 4:4:4";
++ case 540: return "RGB8 4:2:0"; case 541: return "RGB8 4:2:2"; case 542: return "RGB8 4:4:4";
++ case 543: return "RGB10 4:2:0"; case 544: return "RGB10 4:2:2"; case 545: return "RGB10 4:4:4";
++ default: return format>=500 && format<600?"YCbCr":nullptr;
++ }
++}
++// The largest power of two up to 4096 that divides a row's bytes: the row alignment the surface's maker chose.
++static size_t rowAlignment(size_t row) {size_t a=1;while(a<4096 && row && !(row%(a*2)))a*=2;return row?a:0;}
++// Two lines: the texture and what it cost (made) or why not (refused, with the step of the surface method's checks: 1 plane, 2 base,
++// 3 plane range, 4 import, 5 texture), then the surface: its format, size and allocation, and each plane's size, bytes per element,
++// row bytes and their alignment, offset and rows x height. A YCbCr format the runtime converts holds an RGBA16Float image of the
++// texels and a staging copy of the planes (the "made" figure); one it reads in place holds neither.
++static void noteSurfaceTexture(bool made,uint32_t step,MTLTextureDescriptor *d,IOSurfaceRef surface,NSUInteger plane,uint64_t offset,
++                               uint64_t row,uint64_t allocated,NSString *why) {
++ if(!surface || !d)return;
++ const size_t planes=IOSurfaceGetPlaneCount(surface);
++ const char *name=ycbcrFormatName(d.pixelFormat);
++ NSString *texture=[NSString stringWithFormat:@"native-metal: surface texture %lux%lu fmt %lu%s%s plane %lu",(unsigned long)d.width,
++  (unsigned long)d.height,(unsigned long)d.pixelFormat,name?" ":"",name?:"",(unsigned long)plane];
++ NSMutableString *layout=[NSMutableString stringWithFormat:@"native-metal: surface %@ %zux%zu %@,",fourCC(IOSurfaceGetPixelFormat(surface)),
++  IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),nbMiB(IOSurfaceGetAllocSize(surface))];
++ const uintptr_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface);
++ for(size_t p=0;p<planes && p<3;p++) {
++  const size_t w=IOSurfaceGetWidthOfPlane(surface,p),h=IOSurfaceGetHeightOfPlane(surface,p),r=IOSurfaceGetBytesPerRowOfPlane(surface,p);
++  const uintptr_t at=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,p);
++  [layout appendFormat:@" p%zu %zux%zu %zuB r%zu/%zu @%lu %@",p,w,h,IOSurfaceGetBytesPerElementOfPlane(surface,p),r,rowAlignment(r),
++   (unsigned long)(at>=base?at-base:0),nbMiB((uint64_t)r*h)];
++ }
++ if(!planes)[layout appendFormat:@" no planes %zuB r%zu/%zu",IOSurfaceGetBytesPerElement(surface),IOSurfaceGetBytesPerRow(surface),
++  rowAlignment(IOSurfaceGetBytesPerRow(surface))];
++ if(made) {
++  NBNOTE(@"%@: made, %@ of device memory for it",texture,nbMiB(allocated));
++  NBNOTE(@"%@",layout);
++ } else {
++  NBLOG(@"%@ (at %llu, row %llu): refused (%u): %@",texture,(unsigned long long)offset,(unsigned long long)row,step,why?:@"?");
++  NBLOG(@"%@",layout);
++ }
++}
++// The limits the device's allocations meet, end to end, from this bundle's Turnip (tu_darwin_limits, its 0008): [0] the kernel's per-
++// object limit (Query's max_bo_bytes, the connection's GPU window in macOS builds), [1] the window, [2] Turnip's per-object limit
++// (maxMemoryAllocationSize, maxBufferSize, images' maxResourceSize), [3] its memory heap, [4] maxImageDimension1D, [5] 2D, [6] 3D,
++// [7] cube, [8] maxImageArrayLayers, [9] maxTexelBufferElements. Read once the device is open; zeros from a Turnip without it.
++static uint64_t gTurnipLimits[12];
++static void readTurnipLimits() {
++ if(gLoaderPath.empty())return;
++ void *turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
++ auto limits=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_darwin_limits"):nullptr;
++ if(limits)limits(gTurnipLimits);
++}
+ // The render pipeline journal: one line per render pipeline creation (when, on which thread, how long, the outcome, both functions with
+ // every constant value, the attachments, blending and vertex descriptor) appended to pipelines.log in the runtime's cache directory, which
+ // the board log exports with the caches (CacheExport.h): every pipeline a boot made, or was refused, can be made again on the host.
+@@ -1448,20 +1527,17 @@
+  return true;
+ }
+ // A texture over a two-plane surface: the runtime reads plane 1 from the surface's own layout (two-plane RGB and YCbCr formats).
++// UniXNU-piano (0003): no fixed cap for the two-plane YCbCr formats (noteSurfaceTexture), and a refusal is said by the caller, with the
++// surface's geometry.
+ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSurfaceRef surface,NSUInteger plane,NSUInteger offset,NSUInteger row) {
+  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
+- if(d.pixelFormat>=500 && d.pixelFormat<600 && (uint64_t)d.width*d.height>1024*1024 &&
+-    !(getenv("METAL2VULKAN_YCBCR_PLANES_ONLY") && plane==0 && (d.pixelFormat==500 || d.pixelFormat==505))){
+-  static std::atomic<unsigned> refusals;   // the server asks again at every frame
+-  if(refusals++<4)NBLOG(@"native-metal: surface texture refused: %lux%lu YCbCr format %lu converts on the CPU",(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat);
+-  return nil;}
+  const uint64_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface),chroma=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1);
+  uint64_t chromaOffset=chroma>=base?chroma-base:0,chromaRow=IOSurfaceGetBytesPerRowOfPlane(surface,1);
+  size_t computed[4];   // myron: a 'b3a8' surface without plane rows
+  if(!chromaRow && b3a8Planes(surface,IOSurfaceGetAllocSize(surface),computed)){chromaOffset=computed[2];chromaRow=computed[3];}
+  NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,
+   IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chromaOffset,chromaRow);
+- if(!handle){NBLOG(@"native-metal: texture over surface refused: %@",lastError());return nil;}
++ if(!handle)return nil;
+  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
+ }
+@@ -4506,6 +4582,17 @@
+ }
+ - (uint64_t)registryID {return gRegistryID;}
+ - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
++// UniXNU-piano (0003): the texture dimensions the base class's limits left at 0 (initLimits is empty here; the runtime answers the 2D
++// ones and the layers), Turnip's Vulkan limits, and the memory figures clients budget with: the heap (Turnip's: the GPU window, at most
++// its share of the RAM) and the device memory the runtime holds.
++- (NSUInteger)maxTextureWidth1D {return (NSUInteger)gTurnipLimits[4];}
++- (NSUInteger)maxTextureWidth3D {return (NSUInteger)gTurnipLimits[6];}
++- (NSUInteger)maxTextureHeight3D {return (NSUInteger)gTurnipLimits[6];}
++- (NSUInteger)maxTextureDepth3D {return (NSUInteger)gTurnipLimits[6];}
++- (NSUInteger)maxTextureDimensionCube {return (NSUInteger)gTurnipLimits[7];}
++- (NSUInteger)maxTextureBufferWidth {return (NSUInteger)gTurnipLimits[9];}
++- (uint64_t)recommendedMaxWorkingSetSize {return gTurnipLimits[3];}
++- (NSUInteger)currentAllocatedSize {uint64_t mc[10]={};return gDevice && nmb_device_memory_counts(gDevice,mc)?(NSUInteger)(mc[0]+mc[3]):0;}
+ - (BOOL)hasUnifiedMemory {return YES;}
+ - (BOOL)respondsToSelector:(SEL)selector {
+  if(selector==sel_registerName("targetDeviceInfo"))return NO;   // the inherited _MTLDevice one, NULL without IOGPU
+@@ -4618,7 +4705,11 @@
+ - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count {(void)count;return [(id<MTLDevice>)self newCommandQueue];}
+ - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
+- if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
++ // UniXNU-piano (0003): the length and the limit with a refusal; a large buffer on the console.
++ if(!handle){NBLOG(@"native-metal: buffer of %@ (options %lx, maxBufferLength %@) refused: %@",nbMiB(length),(unsigned long)options,
++  nbMiB(nmb_device_max_buffer_length(gDevice)),lastError());return nil;}
++ if(length>=kLargeAllocationBytes*4)NBNOTE(@"native-metal: buffer of %@ (options %lx): made (maxBufferLength %@)",nbMiB(length),
++  (unsigned long)options,nbMiB(nmb_device_max_buffer_length(gDevice)));
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;
+  {NmbTextureDescriptor none={};none.options=options;buffer.asked=askedToken(1,length,none);}
+  return (id<MTLBuffer>)buffer;
+@@ -4644,13 +4735,25 @@
+ }
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
++ // UniXNU-piano (0003): the runtime's layout bytes of a large texture (16 Mi texels or more: 64 MiB at 4 bytes), made or refused.
++ const uint64_t texels=(uint64_t)descriptor.width*std::max<uint64_t>(descriptor.height,1)*std::max<uint64_t>(descriptor.depth,1)*
++  std::max<uint64_t>(descriptor.array_length,1)*std::max<uint64_t>(descriptor.samples,1);
++ uint64_t layout[2]={0,0};
++ if(texels>=(uint64_t(16)<<20)){NmbTextureDescriptor asked=descriptor;if(!nmb_device_heap_texture_size_and_align(gDevice,&asked,layout))layout[0]=0;}
+  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
++ if(handle && layout[0]>=kLargeAllocationBytes)
++  NBNOTE(@"native-metal: texture %llux%llux%llu fmt %llu L%llu s%llu a%llu: made, %@ by the runtime's layout (maxBufferLength %@)",
++   (unsigned long long)descriptor.width,(unsigned long long)descriptor.height,(unsigned long long)descriptor.depth,
++   (unsigned long long)descriptor.format,(unsigned long long)descriptor.levels,(unsigned long long)descriptor.samples,
++   (unsigned long long)descriptor.array_length,nbMiB(layout[0]),nbMiB(nmb_device_max_buffer_length(gDevice)));
+  if(gLogTextures && textureLogTurn())
+   GLOG(@"native-metal: texture-log %llu texture %llux%llu fmt %llu type %llu levels %llu usage %llx options %llx %s",
+         (unsigned long long)gTexturesLogged.load(),(unsigned long long)descriptor.width,(unsigned long long)descriptor.height,
+         (unsigned long long)descriptor.format,(unsigned long long)descriptor.type,(unsigned long long)descriptor.levels,
+         (unsigned long long)descriptor.usage,(unsigned long long)descriptor.options,handle?"made":"REFUSED");
+- if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());return nil;}
++ if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lux%lu, %lu levels, %lu slices%s%@, maxBufferLength %@) refused: %@",(unsigned long)d.pixelFormat,
++  (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.depth,(unsigned long)d.mipmapLevelCount,(unsigned long)d.arrayLength,
++  layout[0]?", layout ":"",layout[0]?nbMiB(layout[0]):@"",nbMiB(nmb_device_max_buffer_length(gDevice)),lastError());return nil;}
+  NBTexture *texture=[NBTexture new];texture.handle=handle;countAskedTexture(texture,descriptor);nmb_texture_describe(handle,&descriptor);
+  texture.descriptor=descriptor;
+  if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
+@@ -4662,20 +4765,33 @@
+  // A planar surface (Apple's lossless-compressed BGRA spelling has one plane, video formats two) is imported whole; the texture starts at
+  // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
+  const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
+- if(!surface || !d || (planes?plane>=planes:plane!=0)){refuseSurface(1,surface,d,plane,0,0);return nil;}
++ if(!surface || !d || (planes?plane>=planes:plane!=0)){
++  refuseSurface(1,surface,d,plane,0,0);noteSurfaceTexture(false,1,d,surface,plane,0,0,0,@"no such plane");return nil;}
+  const uint64_t rotation=textureRotation(d);if(rotation<5)gSurfaceRotations[rotation]++;
+  if(planes)gSurfacePlanar++;
+  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
+- if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){refuseSurface(2,surface,d,plane,(uintptr_t)base,0);return nil;}
++ if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){
++  refuseSurface(2,surface,d,plane,(uintptr_t)base,0);noteSurfaceTexture(false,2,d,surface,plane,0,0,0,@"no page-aligned base");return nil;}
+  uintptr_t start=planes?(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane):(uintptr_t)base;
+  size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
+  size_t computed[4];   // myron: a 'b3a8' surface without plane rows
+  if(!row && plane<2 && b3a8Planes(surface,allocation,computed)){start=(uintptr_t)base+computed[plane*2];row=computed[plane*2+1];}
+- if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){refuseSurface(3,surface,d,plane,start-(uintptr_t)base,row);return nil;}
++ if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){
++  refuseSurface(3,surface,d,plane,start-(uintptr_t)base,row);
++  noteSurfaceTexture(false,3,d,surface,plane,start-(uintptr_t)base,row,0,@"the plane lies outside the allocation or has no rows");return nil;}
+  const size_t bytes=(allocation+page-1)&~(page-1);
+- NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
++ const uint64_t before=runtimeAllocatedBytes();
++ NBBuffer *buffer=surfaceBuffer(surface,base,bytes);
++ if(!buffer){
++  refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);
++  noteSurfaceTexture(false,4,d,surface,plane,start-(uintptr_t)base,row,0,[@"import: " stringByAppendingString:lastError()]);return nil;}
+  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
+- if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
++ const uint64_t made=runtimeAllocatedBytes()-before;
++ if(!texture){
++  refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);
++  noteSurfaceTexture(false,5,d,surface,plane,start-(uintptr_t)base,row,made,lastError());return nil;}
++ if(made>=kLargeAllocationBytes || allocation>=kLargeAllocationBytes*4 || (ycbcrFormatName(d.pixelFormat) && (uint64_t)d.width*d.height>1024*1024))
++  noteSurfaceTexture(true,0,d,surface,plane,start-(uintptr_t)base,row,made,nil);
+  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
+  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];return (id<MTLTexture>)texture;
+ }
+@@ -5134,6 +5250,12 @@
+  watchImportPressure();watchIdleMemory();
+  if(cache && logGpuOn()){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
++ // UniXNU-piano (0003): what this process's device reports, end to end (Turnip's limits, the runtime's maxBufferLength, IOSurface's).
++ readTurnipLimits();
++ NBNOTE(@"native-metal: limits: 2D %llu, cube %llu, 3D %llu, layers %llu; buffer %@ (kernel object %@, window %@), heap %@; IOSurface %zux%zu",
++  (unsigned long long)gTurnipLimits[5],(unsigned long long)gTurnipLimits[7],(unsigned long long)gTurnipLimits[6],
++  (unsigned long long)gTurnipLimits[8],nbMiB(nmb_device_max_buffer_length(gDevice)),nbMiB(gTurnipLimits[0]),nbMiB(gTurnipLimits[1]),
++  nbMiB(gTurnipLimits[3]),IOSurfaceGetPropertyMaximum(kIOSurfaceWidth),IOSurfaceGetPropertyMaximum(kIOSurfaceHeight));
+  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
+  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
+   for(char *line=waived,*next;*line;line=next){next=strchr(line,'\n');if(next)*next++=0;else next=line+strlen(line);journal(std::string("F ")+line);}}

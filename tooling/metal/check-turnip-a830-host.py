@@ -27,9 +27,17 @@ Runs, each must pass:
      pass built (ir3 compiles them for the A830), submitted and retired. Skipped with --no-plugin-smoke or without glslangValidator.
   4. plugin_host (tooling/metal/turnip-a830/plugin_host.mm): the staged plugin executable itself, frontend and bridge on this Turnip:
      AIR pipelines, compute, a render into an IOSurface, a blit, then a desktop session's extras (a heap, 4x MSAA, a concurrent compute
-     encoder, a shared event, 24 panel-sized IOSurfaces churned with no import left behind, an 8192x4096 texture); with 16 KiB and
-     4 KiB pages, in a small slot's window (HOSTSIM_SLOT=4), and with the device's connection in another slot than the enumeration
-     probe's (HOSTSIM_SLOT_REOPEN=5: Turnip 0006 takes the device's own window; without it every BoMap is BadArgument, run attend4).
+     encoder, a shared event, 24 panel-sized IOSurfaces churned with no import left behind, an 8192x4096 texture), the per-object
+     limit (maxBufferLength equal to it, one byte more refused before the kernel), 16384x16384 BGRA8 textures (own and over an
+     IOSurface: made where the limit takes 1 GiB, else refused before the kernel) and 4096x2160 video frames sampled ('444v' as format
+     503, '420v' as 500); with 16 KiB and 4 KiB pages, in a small slot's window (HOSTSIM_SLOT=4), and with the device's connection in
+     another slot than the enumeration probe's (HOSTSIM_SLOT_REOPEN=5: Turnip 0006 takes the device's own window; without it every
+     BoMap is BadArgument, run attend4). Then the same over the kernel as piano's kext builds it (-DADRENO830_MACOS, 2026-11-12: the
+     per-object limit is the connection's window, the VM's 524288 table ranges) with the 16 GiB aperture (HOSTSIM_VA=16: the render
+     server's 3.5 GiB window): plugin_host-macos (the 16384x16384 textures made: a 1 GiB BO and a 1 GiB import), -macos-scatter
+     (HOSTSIM_SCATTER=1: every BO one page per span, as outside the BO pool on the tablet: the 1 GiB BO is 262144 table ranges),
+     -macos-pool (HOSTSIM_POOL_MIB=1536: a BO pool as S3 reserves it, the 1 GiB BO one span of it) and -macos-slot4 (a small client's
+     320 MiB window: maxBufferLength 320 MiB, the 16384x16384 textures refused before the kernel).
   5. abort_reporter (tooling/metal/turnip-a830/reporter_host.mm): the plugin's abort reporter on abort(), an uncaught exception and a
      bad access: the process dies with the same signal and says why on stderr first.
 Sources are read from this repository's package/PianoA830/adreno830 (or ADRENO830_TREE), ADRENOMETAL_TREE and the kits below, never
@@ -151,10 +159,17 @@ def main():
     (includes / 'kern/clock.h').write_text('#include "Adreno830HostClock.h"\n')
     kernel_flags = ['-DADRENO830_HOST_TEST', '-I', includes, '-I', A830 / 'tests', '-I', A830, '-I', SMMU, '-I', PM4,
                     '-I', A830 / 'platform/sm8750']
-    objects = [compile_one(s, out / f'{s.stem}.o', []) for s in KITS]
+    kits = [compile_one(s, out / f'{s.stem}.o', []) for s in KITS]
     headers = sorted(A830.glob('*.h'))
-    objects += [compile_one(A830 / f'{n}.cpp', out / f'{n}.o', kernel_flags, headers) for n in CORE]
+    objects = kits + [compile_one(A830 / f'{n}.cpp', out / f'{n}.o', kernel_flags, headers) for n in CORE]
     objects.append(compile_one(SIM / 'host_gpu_service.cpp', out / 'host_gpu_service.o', kernel_flags, headers))
+    # The same kernel core as piano's kext builds it (-DADRENO830_MACOS: macOS's per-object limit, window table and VM capacity), into
+    # out/turnip-a830/hostsim/macos, for the macOS runs of section 4.
+    macos_out = out / 'macos'
+    macos_out.mkdir(exist_ok=True)
+    macos_flags = kernel_flags + ['-DADRENO830_MACOS']
+    macos_objects = kits + [compile_one(A830 / f'{n}.cpp', macos_out / f'{n}.o', macos_flags, headers) for n in CORE]
+    macos_objects.append(compile_one(SIM / 'host_gpu_service.cpp', macos_out / 'host_gpu_service.o', macos_flags, headers))
     # The shim, answering the macOS plugin's service name as the iOS one: a generated copy, the source stays as it is.
     shim_source = out / 'host_iokit_shim.cpp'
     text = (SIM / 'host_iokit_shim.cpp').read_text()
@@ -170,6 +185,10 @@ def main():
     shim = out / 'libhostiokit.dylib'
     if stale(shim, shim_obj, *objects):
         run(['xcrun', 'clang++', *ARCH, '-dynamiclib', '-o', shim, shim_obj, *objects, '-framework', 'IOKit',
+             '-framework', 'CoreFoundation'])
+    macos_shim = macos_out / 'libhostiokit.dylib'
+    if stale(macos_shim, shim_obj, *macos_objects):
+        run(['xcrun', 'clang++', *ARCH, '-dynamiclib', '-o', macos_shim, shim_obj, *macos_objects, '-framework', 'IOKit',
              '-framework', 'CoreFoundation'])
     smoke = out / 'vulkan_smoke'
     if stale(smoke, SIM / 'vulkan_smoke.c'):
@@ -241,7 +260,7 @@ def main():
         source = D / 'tooling/metal/turnip-a830/plugin_host.mm'
         if stale(host, source):
             run(['xcrun', 'clang++', *ARCH, '-fobjc-arc', '-std=c++17', '-O1', '-x', 'objective-c++', source, '-o', host,
-                 '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOSurface'])
+                 '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOSurface', '-framework', 'CoreVideo'])
         cache = out / 'm2v-cache'
         shutil.rmtree(cache, ignore_errors=True)
         cache.mkdir()
@@ -259,6 +278,11 @@ def main():
                              ('plugin_host-slot4', {'HOSTSIM_PAGE_SIZE': '4096', 'HOSTSIM_SLOT': '4'}),
                              ('plugin_host-reslot', {'HOSTSIM_PAGE_SIZE': '4096', 'HOSTSIM_SLOT': '4', 'HOSTSIM_SLOT_REOPEN': '5'})]:
             check(label, [host, executable, library, cache], extra, plugin_host_verdict)
+        # The kernel as piano's kext builds it (2026-11-12): the per-object limit is the window, and the 16 GiB aperture's windows.
+        macos = {'DYLD_INSERT_LIBRARIES': str(macos_shim), 'HOSTSIM_PAGE_SIZE': '4096', 'HOSTSIM_VA': '16'}
+        for label, extra in [('plugin_host-macos', {}), ('plugin_host-macos-scatter', {'HOSTSIM_SCATTER': '1'}),
+                             ('plugin_host-macos-pool', {'HOSTSIM_POOL_MIB': '1536'}), ('plugin_host-macos-slot4', {'HOSTSIM_SLOT': '4'})]:
+            check(label, [host, executable, library, cache], dict(macos, **extra), plugin_host_verdict)
 
         # 5. The plugin's abort reporter (tooling/metal/turnip-a830/abort_reporter.mm): a process with it dies as it would have (the same
         #    signal) and says why on stderr first: the reason, the crash-reporter message, the stack.

@@ -13,10 +13,13 @@
 //                                                                  TU_DARWIN_SERVICE=AGXAccelerator); no shader runs there
 // Scenes (environment): RenderBox by default (RB_PATHS=1 CGPath shapes, RB_CLIP=1 a clipped avatar, RB_BLEND=<mode> a capsule in that
 // blend mode, RB_DIST=1|2|3 a distance filter, a blur or a shadow); CA_MODE=1 Core Animation instead (CA_SDF=1 SDF fill elements,
-// CA_GLASS=1 SDF glass elements, CA_BACKDROP=1 a blurred backdrop, CA_STROKE=1 a stroked circle); RB_ONLY_FAMILIES=1 prints the
-// device's GPU family answers only. With the plugin, TU_DEBUG reaches its Turnip (e.g. sysmem, sysmem,nofbflush).
+// CA_GLASS=1 SDF glass elements, CA_BACKDROP=1 a blurred backdrop, CA_STROKE=1 a stroked circle, CA_VIDEO=444v a 4096x2160 video
+// frame of that CoreVideo format under them, as the login window's aerial wallpaper); RB_ONLY_FAMILIES=1 prints the device's GPU family
+// answers only. With the plugin, TU_DEBUG reaches its Turnip (e.g. sysmem, sysmem,nofbflush).
 // Build: xcrun clang++ -target arm64e-apple-macos14.0 -fobjc-arc -std=c++17 -O1 -x objective-c++ render_trace_host.mm -o render_trace_host
 //        -framework Foundation -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework QuartzCore
+//        -framework CoreVideo
+#import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
@@ -265,6 +268,21 @@ static id tNewDSS(id self, SEL s, MTLDepthStencilDescriptor *d)
     gDSSNames[(__bridge void *)r] = n.UTF8String;
     return r;
 }
+// Every texture asked over an IOSurface (2026-11-12): the surface's format and planes, the descriptor's pixel format and size, and
+// whether the device made it (CA_VIDEO: which Metal format Core Animation takes for a video frame's planes).
+static IMP oSurfaceTex;
+static id tSurfaceTex(id self, SEL s, MTLTextureDescriptor *d, IOSurfaceRef surface, NSUInteger plane)
+{
+    id t = ((id (*)(id, SEL, MTLTextureDescriptor *, IOSurfaceRef, NSUInteger))oSurfaceTex)(self, s, d, surface, plane);
+    const uint32_t code = surface ? IOSurfaceGetPixelFormat(surface) : 0;
+    const char name[5] = {(char)(code >> 24), (char)(code >> 16), (char)(code >> 8), (char)code, 0};
+    fprintf(stderr, "SURFACE TEXTURE %lux%lu fmt %lu usage %lx storage %lu plane %lu over '%s' %zux%zu (%zu planes, %zu bytes): %s\n",
+            (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, (unsigned long)d.usage,
+            (unsigned long)d.storageMode, (unsigned long)plane, name, surface ? IOSurfaceGetWidth(surface) : 0,
+            surface ? IOSurfaceGetHeight(surface) : 0, surface ? IOSurfaceGetPlaneCount(surface) : 0,
+            surface ? IOSurfaceGetAllocSize(surface) : 0, t ? "made" : "REFUSED");
+    return t;
+}
 static void trace(id device, id queue);
 static void trace(id device, id queue)
 {
@@ -309,6 +327,7 @@ static void trace(id device, id queue)
     swizzle(dc, @selector(newRenderPipelineStateWithDescriptor:options:reflection:error:), (IMP)tNewPipeRefl, &oNewPipeRefl);
     swizzle(dc, @selector(newRenderPipelineStateWithDescriptor:completionHandler:), (IMP)tNewPipeAsync, &oNewPipeAsync);
     swizzle(dc, @selector(newRenderPipelineStateWithDescriptor:options:completionHandler:), (IMP)tNewPipeAsyncRefl, &oNewPipeAsyncRefl);
+    swizzle(dc, @selector(newTextureWithDescriptor:iosurface:plane:), (IMP)tSurfaceTex, &oSurfaceTex);
 }
 
 static void writePNG(IOSurfaceRef surface, const char *path)
@@ -430,6 +449,33 @@ int main(int argc, char **argv)
                 e2.cornerRadius = 40;
                 [sdf addSublayer:e2];
                 [root addSublayer:sdf];
+            }
+            // CA_VIDEO=<four-character code> (2026-11-12): a 4096x2160 video frame as the login window's aerial wallpaper is shown, a layer
+            // under the others whose contents are a CoreVideo IOSurface of that format ('444v' when the code is not four characters;
+            // '420v', 'x420', ...) filling the target. The trace shows the texture Core Animation makes over it (fragTex: its pixel format)
+            // and, with the plugin, the frontend's surface lines (the surface's planes and the device memory the texture took).
+            if (const char *video = getenv("CA_VIDEO")) {
+                const OSType code = strlen(video) == 4 ? (OSType)((uint32_t)video[0] << 24 | (uint32_t)video[1] << 16 | (uint32_t)video[2] << 8 |
+                                                                  (uint32_t)video[3]) : (OSType)'444v';
+                CVPixelBufferRef frame = nullptr;
+                NSDictionary *attributes = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+                if (CVPixelBufferCreate(kCFAllocatorDefault, 4096, 2160, code, (__bridge CFDictionaryRef)attributes, &frame) == kCVReturnSuccess) {
+                    CVPixelBufferLockBaseAddress(frame, 0);   /* luma 0x60, chroma 0x80: a dark grey */
+                    for (size_t p = 0; p < CVPixelBufferGetPlaneCount(frame); p++)
+                        memset(CVPixelBufferGetBaseAddressOfPlane(frame, p), p ? 0x80 : 0x60,
+                               CVPixelBufferGetBytesPerRowOfPlane(frame, p) * CVPixelBufferGetHeightOfPlane(frame, p));
+                    CVPixelBufferUnlockBaseAddress(frame, 0);
+                    IOSurfaceRef frameSurface = CVPixelBufferGetIOSurface(frame);
+                    CALayer *wallpaper = [CALayer layer];
+                    wallpaper.frame = root.bounds;
+                    wallpaper.contentsGravity = kCAGravityResizeAspectFill;
+                    wallpaper.contents = (__bridge id)frameSurface;
+                    [root insertSublayer:wallpaper atIndex:0];
+                    const char name[5] = {(char)(code >> 24), (char)(code >> 16), (char)(code >> 8), (char)code, 0};
+                    fprintf(stderr, "video layer: 4096x2160 '%s' IOSurface, %zu planes, %zu bytes\n", name, IOSurfaceGetPlaneCount(frameSurface),
+                            IOSurfaceGetAllocSize(frameSurface));
+                } else
+                    fprintf(stderr, "video layer: no 4096x2160 '%s' pixel buffer\n", video);
             }
             if (getenv("CA_STROKE")) {
                 CAShapeLayer *st = [CAShapeLayer layer];

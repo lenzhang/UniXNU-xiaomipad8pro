@@ -1,0 +1,159 @@
+turnip: darwin, the per-object limit within the connection's GPU window, BOs past the cache budget at their own size, the limits for Metal
+
+Adreno830's kernel on piano (PianoA830, macOS builds, 2026-11-12) answers Query's max_bo_bytes with the connection's GPU window (the
+render server's 3.5 GiB, a large client's 768 MiB, a small one's 320 MiB) instead of upstream's fixed 256 MiB: Metal's 16384x16384
+textures (1 GiB at 4 bytes a texel) and 4096x2160 video frames converted by the runtime were refused below every real limit. On the
+native darwin path (not virtio-gpu):
+- max_bo_size (0004: maxMemoryAllocationSize, maxBufferSize, images' maxResourceSize, and the refusal before the kernel) is Query's
+  max_bo_bytes within the window GetDeviceInfo gave the connection, page aligned: a BO the window cannot hold could never be mapped.
+  The device's own connection takes its own limit when it differs from the enumeration probe's (another slot, as 0006 for the window):
+  "NativeAdreno: this device's per-object limit is N MiB, the enumeration probe's was M MiB; the device takes its own". The refusal
+  line names both limits: "NativeAdreno: a BO of N MiB is past the per-object limit of L MiB (maxMemoryAllocationSize: the kernel's K
+  MiB, GPU window W MiB); refused (1 time)".
+- A BO larger than its cache budget (TU_DARWIN_BO_CACHE_MB, TU_DARWIN_BO_CACHE_SMALL_MB) is asked of the kernel at its own size, not
+  its size class: darwin_cache_put never keeps it, and the class held up to a quarter more for nothing (a 16384x16384 BGRA8 texture,
+  1 GiB and its UBWC metadata, would have asked 1.25 GiB).
+- Each BO of 256 MiB or more that is larger than every one before it in the process is on stderr: "TU: info: NativeAdreno: a BO of N
+  MiB, the largest so far (per-object limit L MiB, GPU window W MiB)".
+- tu_darwin_limits(uint64_t out[12]) (exported, as tu_darwin_bo_cache_stats): the kernel's and Turnip's per-object limits, the window,
+  the heap, maxImageDimension1D/2D/3D/Cube, maxImageArrayLayers, maxTexelBufferElements and maxMemoryAllocationSize, for the Metal
+  frontend's device limits (frontend 0003).
+Against the tree after 0001-0007. MIT, as the files.
+
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -939,6 +939,66 @@
+ 
+ /* ---- buffer objects ---- */
+ 
++/* The largest BO this connection can use (2026-11-12): the kernel's per-object limit (Query's max_bo_bytes: Adreno830 upstream 256 MiB,
++ * piano's macOS kernel its GPU window), and never more than the window GetDeviceInfo gave it, which every BO must be mapped in. The
++ * memory allocation, buffer and image resource limits are capped at it (max_bo_size, 0004); a larger BO is refused before the kernel. */
++static uint64_t
++darwin_object_limit(void)
++{
++   uint64_t limit = dw.params.max_bo_bytes;
++   if (dw.info.va_size && dw.info.va_size < limit)
++      limit = dw.info.va_size;
++   return limit & ~(uint64_t)4095;
++}
++
++/* The physical device whose limits tu_darwin_limits answers (one per process). */
++static struct tu_physical_device *darwin_limits_device;
++
++/* The limits this process's allocations meet, for the Metal frontend's answers and its console line (frontend 0003): [0] the kernel's
++ * per-object limit (Query's max_bo_bytes), [1] the device's GPU window, [2] Turnip's per-object limit (max_bo_size:
++ * maxMemoryAllocationSize, maxBufferSize, images' maxResourceSize), [3] the memory heap, [4] maxImageDimension1D, [5] 2D, [6] 3D,
++ * [7] cube, [8] maxImageArrayLayers, [9] maxTexelBufferElements, [10] maxMemoryAllocationSize as reported, [11] 0. All 0 before a
++ * physical device exists. */
++extern "C" __attribute__((visibility("default"))) void tu_darwin_limits(uint64_t out[12]);
++extern "C" __attribute__((visibility("default"))) void
++tu_darwin_limits(uint64_t out[12])
++{
++   memset(out, 0, 12 * sizeof(uint64_t));
++   const struct tu_physical_device *pdev = darwin_limits_device;
++   if (!pdev)
++      return;
++   const struct vk_properties *props = &pdev->vk.properties;
++   out[0] = dw.params.max_bo_bytes;
++   out[1] = pdev->va_size;
++   out[2] = pdev->max_bo_size;
++   out[3] = pdev->heap.size;
++   out[4] = props->maxImageDimension1D;
++   out[5] = props->maxImageDimension2D;
++   out[6] = props->maxImageDimension3D;
++   out[7] = props->maxImageDimensionCube;
++   out[8] = props->maxImageArrayLayers;
++   out[9] = props->maxTexelBufferElements;
++   out[10] = props->maxMemoryAllocationSize;
++}
++
++/* A BO of 256 MiB or more on stderr, each one larger than every one before it in this process: what the per-object limit and the
++ * memory are up against (a 16384x16384 texture is 1 GiB at 4 bytes a texel). */
++static void
++darwin_note_large_bo(struct tu_device *dev, uint64_t size)
++{
++   static uint64_t largest;
++   if (size < ((uint64_t)256 << 20))
++      return;
++   for (uint64_t seen = p_atomic_read(&largest); size > seen; seen = p_atomic_read(&largest)) {
++      if (p_atomic_cmpxchg(&largest, seen, size) != seen)
++         continue;
++      mesa_logi("NativeAdreno: a BO of %llu MiB, the largest so far (per-object limit %llu MiB, GPU window %llu MiB)",
++                (unsigned long long)((size + (1u << 20) - 1) >> 20), (unsigned long long)(dev->physical_device->max_bo_size >> 20),
++                (unsigned long long)(dev->physical_device->va_size >> 20));
++      return;
++   }
++}
++
+ /* A BO past the kernel's per-object limit (max_bo_size, Query's max_bo_bytes) is refused here, as maxMemoryAllocationSize says, instead
+  * of a kernel BadArgument; the first such request and then every 10th, 100th, ... is named on stderr. */
+ static bool
+@@ -953,9 +1013,10 @@
+    while (mark < refused)
+       mark *= 10;
+    if (mark == refused)
+-      mesa_loge("NativeAdreno: a %s of %llu MiB is past the kernel's per-object limit of %llu MiB (maxMemoryAllocationSize); refused "
+-                "(%llu time%s)", what, (unsigned long long)((size + (1u << 20) - 1) >> 20), (unsigned long long)(limit >> 20),
+-                (unsigned long long)refused, refused == 1 ? "" : "s");
++      mesa_loge("NativeAdreno: a %s of %llu MiB is past the per-object limit of %llu MiB (maxMemoryAllocationSize: the kernel's "
++                "%llu MiB, GPU window %llu MiB); refused (%llu time%s)", what, (unsigned long long)((size + (1u << 20) - 1) >> 20),
++                (unsigned long long)(limit >> 20), (unsigned long long)(dw.params.max_bo_bytes >> 20),
++                (unsigned long long)(dev->physical_device->va_size >> 20), (unsigned long long)refused, refused == 1 ? "" : "s");
+    return true;
+ }
+ 
+@@ -980,7 +1041,11 @@
+    static const bool cache_enabled = debug_get_bool_option("TU_DARWIN_BO_CACHE", true);
+    const bool cacheable = cache_enabled && !(flags & TU_BO_ALLOC_REPLAYABLE) && !lazy_vma;
+    const bool read_only = !!(flags & TU_BO_ALLOC_GPU_READ_ONLY);
+-   uint64_t alloc_size = cacheable ? darwin_size_class(size) : size;
++   /* A BO larger than its cache budget is released when it is freed (darwin_cache_put): it keeps its own size instead of its size class,
++    * which held up to a quarter more for nothing (a 16384x16384 texture, 1 GiB and its UBWC metadata, asked 1.25 GiB of the kernel). */
++   const uint64_t size_class = darwin_size_class(size);
++   const bool fits_cache = size_class <= (darwin_small(size_class) ? darwin_cache_small_budget() : darwin_cache_budget());
++   uint64_t alloc_size = cacheable && fits_cache ? size_class : size;
+ 
+    uint64_t iova = 0, handle = 0;
+    void *cached_mapping = NULL;
+@@ -1052,6 +1117,7 @@
+       handle = reply.handle;
+       if (lazy_vma)   /* its address now goes with the BO (darwin_bo_finish), not with the VMA */
+          lazy_vma->msm.backs_lazy_bo = true;
++      darwin_note_large_bo(dev, alloc_size);
+       break;
+    }
+ 
+@@ -1634,6 +1700,13 @@
+       dev->physical_device->va_start = dw.info.va_start;
+       dev->physical_device->va_size = dw.info.va_size;
+    }
++   /* The per-object limit follows the window (darwin_object_limit): the device's own connection's, as above. */
++   if (!dw.virtgpu && darwin_object_limit() != dev->physical_device->max_bo_size) {
++      mesa_loge("NativeAdreno: this device's per-object limit is %llu MiB, the enumeration probe's was %llu MiB; the device takes its own",
++                (unsigned long long)(darwin_object_limit() >> 20), (unsigned long long)(dev->physical_device->max_bo_size >> 20));
++      dev->physical_device->max_bo_size = darwin_object_limit();
++   }
++   darwin_limits_device = dev->physical_device;
+    /* tu_CreateDevice copied the probe's window into the device before this call (its own VMA heap is made after it, from these). */
+    dev->va_start = dev->physical_device->va_start;
+    dev->va_size = dev->physical_device->va_size;
+@@ -1847,8 +1920,9 @@
+    device->heap.size = tu_get_system_heap_size(device);
+    device->heap.used = 0u;
+    device->heap.flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+-   /* The kernel's largest BO (Query's max_bo_bytes): maxMemoryAllocationSize, maxBufferSize and the images' maxResourceSize. */
+-   device->max_bo_size = dw.virtgpu ? 0 : dw.params.max_bo_bytes;
++   /* The kernel's largest BO (Query's max_bo_bytes) within this connection's window (darwin_object_limit): maxMemoryAllocationSize,
++    * maxBufferSize and the images' maxResourceSize. */
++   device->max_bo_size = dw.virtgpu ? 0 : darwin_object_limit();
+ 
+    instance->knl = &darwin_knl_funcs;
+ 
+@@ -1862,5 +1936,6 @@
+    }
+ 
+    list_addtail(&device->vk.link, &instance->vk.physical_devices.list);
++   darwin_limits_device = device;
+    return VK_SUCCESS;
+ }
