@@ -7,6 +7,10 @@
 //                held holdMs within slopPx: a right click there (the menu opens under the finger; the contact then only moves the
 //                pointer, its lift sends nothing);
 //                moved past slopPx first: a left drag, pressed where it landed, then following the finger, released at the lift;
+//                the drag starts only once the finger stayed down dragDelayMs after it first passed slopPx (or went past three
+//                times slopPx): lifted before, it is the tap after all (2026-11-12: on this panel a lifting finger's centre moves
+//                30-70 px in its last frames, and attend1's short taps became drags: 11 of 16 drags under 310 ms, several ending
+//                within 6-32 px of where they started, with slopPx 32);
 //   two fingers  (the second seen in minFrames frames while the first was still undecided; the pointer moves between them):
 //                both lifted within twoTapMs of the first landing, neither the middle nor the spread moved past slopPx: a right
 //                click between them;
@@ -43,8 +47,9 @@ struct GestureContact {
 struct GestureConfig {
   bool gestures = true;
   uint32_t holdMs = 500;         // still this long: a right click (0: never)
-  int32_t slopPx = 32;           // movement that makes a drag, a scroll or a pinch
-  uint32_t twoTapMs = 500;       // a two-finger tap: every finger lifted within this of the first landing
+  int32_t slopPx = 64;           // movement that makes a drag, a scroll or a pinch (~4.7 mm; the sensor's nodes are 53 px apart)
+  uint32_t dragDelayMs = 80;     // past slopPx this long before the drag starts; a lift before is a tap (0: at once)
+  uint32_t twoTapMs = 700;       // a two-finger tap: every finger lifted within this of the first landing
   unsigned minFrames = 2;        // frames a contact needs for a tap, or to count as the second finger
   int32_t scrollPx = 4;          // the middle's travel per wheel / AC Pan count
   bool scrollInvert = false, axisLock = true;
@@ -59,8 +64,9 @@ enum class GestureKind : uint8_t {
   tap, holdRight, dragStart, dragEnd, twoTap, scrollStart, scrollEnd, pinchStart, pinchEnd, cancelPalm, cancelFingers, cancelLost,
   plainDown, plainUp
 };
-// For the log: where (desktop pixels), how long since the first finger landed, and two numbers: dragEnd distance; scroll start the
-// axis (0 free, 1 vertical, 2 horizontal), scroll end wheel and pan counts; pinch end the spread change and the zoom counts.
+// For the log: where (desktop pixels), how long since the first finger landed, and two numbers: tap the farthest the finger got
+// from its landing and 1 when that was past slopPx (a drag that did not start); dragEnd distance; scroll start the axis (0 free,
+// 1 vertical, 2 horizontal), scroll end wheel and pan counts; pinch end the spread change and the zoom counts.
 struct GestureNote {
   GestureKind kind;
   int32_t x, y;
@@ -83,6 +89,9 @@ struct Gesture {
   unsigned frames1 = 0, candFrames = 0;
   int32_t landX = 0, landY = 0, anchorX = 0, anchorY = 0;
   uint64_t downMs = 0;
+  bool pending = false;                    // one finger past slopPx, the drag not started yet (dragDelayMs)
+  uint64_t pendingMs = 0;
+  int32_t maxDev = 0;                      // one finger's farthest distance from its landing (the tap's note)
   int32_t c0x = 0, c0y = 0, d0 = 0, lastCx = 0, lastCy = 0, lastD = 0, maxTravel = 0, maxSpread = 0;
   uint8_t axis = 0;
   bool lifting = false;
@@ -260,6 +269,8 @@ inline void gestureUpdate(Gesture &g, const GestureContact *all, unsigned count,
     g.frames1 = c.frames;
     g.landX = g.anchorX = c.x;
     g.landY = g.anchorY = c.y;
+    g.pending = false;
+    g.maxDev = 0;
     g.cand = nv > 1 ? v[1].id : 0;
     g.candFrames = nv > 1 ? v[1].frames : 0;
     if (g.haveTap && now - g.lastTapMs <= g.cfg.doubleTapMs && dist2(c.x, c.y, g.lastTapX, g.lastTapY) <= sq(g.cfg.doubleTapPx)) {
@@ -307,8 +318,9 @@ inline void gestureUpdate(Gesture &g, const GestureContact *all, unsigned count,
         g.lastTapX = g.anchorX;
         g.lastTapY = g.anchorY;
         ++g.taps;
-        gnote(o, GestureKind::tap, g.anchorX, g.anchorY, now - g.downMs);
+        gnote(o, GestureKind::tap, g.anchorX, g.anchorY, now - g.downMs, g.maxDev, g.pending ? 1 : 0);
       }
+      g.pending = false;
       g.mode = nv ? GestureMode::inert : GestureMode::idle;
       g.cand = 0;
       return;
@@ -325,7 +337,16 @@ inline void gestureUpdate(Gesture &g, const GestureContact *all, unsigned count,
       return;
     }
     const GestureContact &c = v[i];
-    if (dist2(c.x, c.y, g.landX, g.landY) > sq(slop)) {
+    const int64_t dev2 = dist2(c.x, c.y, g.landX, g.landY);
+    const int32_t dev = isqrt(dev2);
+    if (dev > g.maxDev) g.maxDev = dev;
+    if (dev2 > sq(slop) && !g.pending) {
+      g.pending = true;   // past the slop: a drag unless the finger lifts within dragDelayMs (a lifting finger's drift)
+      g.pendingMs = now;
+    }
+    if (g.pending) {
+      if (g.cfg.dragDelayMs && now - g.pendingMs < g.cfg.dragDelayMs && dev2 <= sq(int64_t(3) * slop)) return;
+      g.pending = false;
       emit(g, o, kButtonLeft, g.anchorX, g.anchorY);   // pressed where it landed
       if (c.x != g.anchorX || c.y != g.anchorY) emit(g, o, kButtonLeft, c.x, c.y);
       g.mode = GestureMode::drag;

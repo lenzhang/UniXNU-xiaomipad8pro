@@ -393,8 +393,16 @@ class Keys {
 //     dominant (twice the other), as Mac trackpads scroll straight; a diagonal start stays free. No inertia.
 //   - the press (button 1): the left button, or the right one when it starts with two fingers down (kept until the press ends);
 //     the second button is the right one; for `pressSettleMs` after the press changes the fingers move nothing (a clickpad's press
-//     moves the contact).
-//   - taps (`tap`): a touch of at most 180 ms, 2.5 mm of travel and no press is a click: one finger left, two right, three middle.
+//     moves the contact). Two fingers more than `secondaryMm` apart press the left button (a finger resting elsewhere, not a
+//     two-finger click).
+//   - a resting thumb (`restingThumb`, 2026-11-12): a contact in the pad's bottom fifth (Y past `kRestY`, the edge nearest the
+//     user) while another contact is above it is not counted at all: it neither makes a press a right click, nor turns one
+//     finger's motion into scrolling, nor moves the fingers' mean. In attend4 9 of 31 presses had two fingers down, all without
+//     motion and several with one at Y 1800-1914: right clicks where left clicks were meant.
+//   - taps (`tap`): a touch of at most `tapMs` (220; 180 before 2026-11-12), `tapTravel` X counts of travel (150, ~4.4 mm; 85
+//     before) and no press is a click: one finger left, two right, three middle. A tap the `tapVeto` hook refuses (the kext's:
+//     a finger on the touch screen meanwhile, PianoTouchClient.h) sends nothing: attend1's three cover taps (33-56 ms) each came
+//     inside a screen tap, 11-16 ms before the screen's own click (two clicks for one).
 //   - typing (`typingMs`): a touch that starts within that time after a key went down is ignored (no motion, scroll, tap or
 //     gesture; the press still works), as libinput's disable-while-typing.
 //   - gestures (`gestures`): three fingers moving 9 mm, mostly along one axis, once per three-finger touch: up = Mission Control,
@@ -402,12 +410,20 @@ class Keys {
 //     kext sends Control + arrow through the keyboard device). Off: three fingers scroll; the swipe is still recognised for the log.
 constexpr unsigned kPointerBytes = 7;
 constexpr int32_t kYNum = 2, kYDen = 3;
+constexpr int32_t kRestY = int32_t(kTouchYMax) * 4 / 5;   // the bottom fifth (after invertY): where a resting thumb lies
 struct PointerConfig {
   int32_t divide = 1;          // touchpad X counts per pointer count
   int32_t scrollCounts = 5;    // X counts of finger travel per wheel / AC Pan count
   bool tap = true;
   bool invertX = false, invertY = false, scrollInvert = false, axisLock = true, gestures = false;
+  bool restingThumb = true;    // a contact in the bottom fifth with another above it is not counted
   uint32_t typingMs = 250, pressSettleMs = 50;
+  uint32_t tapMs = 220;        // a tap: at most this long ...
+  uint32_t tapTravel = 150;    // ... and this much travel (X counts)
+  uint32_t secondaryMm = 45;   // two fingers pressing farther apart than this: the left button
+  // Asked before a tap is sent (the tap's duration in ms); true drops it. The kext's: a finger on the touch screen meanwhile.
+  bool (*tapVeto)(void *context, uint32_t tapMs) = nullptr;
+  void *tapVetoContext = nullptr;
 };
 enum class Swipe : uint8_t { none, up, down, left, right };
 inline const char *swipeName(Swipe s)
@@ -438,6 +454,9 @@ struct Gesture {
   int32_t x0, y0, x1, y1;                // where it started and ended (touchpad counts; the fingers' mean)
   uint8_t most, tap;                     // most fingers at once; the tap's button (1 left, 2 right, 4 middle; 0 none)
   bool pressed, typing;                  // the pad was pressed; ignored as typing
+  uint8_t pressButton;                   // the press's button (1 left, 2 right; 0 no press)
+  bool vetoed, rested;                   // a tap dropped by tapVeto; a resting thumb was left out
+
   Swipe swipe;                           // a three-finger swipe recognised (sent only with gestures on)
 };
 class Pointer {
@@ -459,20 +478,38 @@ class Pointer {
     continuation_ = count > kFingers;
     if (count) countSeen_ = true;
     const unsigned slots = count ? (count < kFingers ? count : kFingers) : (countSeen_ ? 0 : kFingers);
-    unsigned fingers = 0;
-    uint8_t contact = 0;
-    int32_t x = 0, y = 0;
+    // The touching contacts (lifted ones and palms out), in desktop orientation (invertX / invertY first).
+    unsigned seen = 0;
+    uint8_t ids[kFingers] = {};
+    int32_t xs[kFingers] = {}, ys[kFingers] = {};
     for (unsigned f = 0; f < slots; ++f) {
       const uint8_t *p = tp + 2 + 8 * f;
       if ((p[0] & 1) == 0 || (p[0] & 4) == 0) continue;   // lifted, or a palm
-      if (!fingers) contact = p[1];
-      x += le16(p + 4);
-      y += le16(p + 6);
+      ids[seen] = p[1];
+      xs[seen] = cfg_.invertX ? int32_t(kTouchXMax) - int32_t(le16(p + 4)) : int32_t(le16(p + 4));
+      ys[seen] = cfg_.invertY ? int32_t(kTouchYMax) - int32_t(le16(p + 6)) : int32_t(le16(p + 6));
+      ++seen;
+    }
+    // A resting thumb: in the bottom fifth while another contact is above it; left out of everything below.
+    bool keep[kFingers] = {true, true, true};
+    bool above = false;
+    for (unsigned f = 0; f < seen; ++f) above = above || ys[f] < kRestY;
+    bool rested = false;
+    if (cfg_.restingThumb && above)
+      for (unsigned f = 0; f < seen; ++f)
+        if (ys[f] >= kRestY) { keep[f] = false; rested = true; }
+    unsigned fingers = 0;
+    uint8_t contact = 0;
+    int32_t x = 0, y = 0, fx[2] = {}, fy[2] = {};
+    for (unsigned f = 0; f < seen; ++f) {
+      if (!keep[f]) continue;
+      if (!fingers) contact = ids[f];
+      if (fingers < 2) { fx[fingers] = xs[f]; fy[fingers] = ys[f]; }
+      x += xs[f];
+      y += ys[f];
       ++fingers;
     }
     if (fingers) { x /= int32_t(fingers); y /= int32_t(fingers); }
-    if (cfg_.invertX) x = int32_t(kTouchXMax) - x;
-    if (cfg_.invertY) y = int32_t(kTouchYMax) - y;
     // A touch begins: a fresh gesture; one that starts right after typing is ignored to its end.
     if (fingers && !fingers_ && !touching_) {
       touching_ = true;
@@ -488,10 +525,18 @@ class Pointer {
     }
     if (fingers) { g_.x1 = x; g_.y1 = y; }
     if (fingers > most_) most_ = uint8_t(fingers);
+    if (rested && touching_) g_.rested = true;
     if (tp[1] & 3) pressed_ = true;
-    // The press (button 1): which button it is is decided when it starts; motion settles after each change.
+    // The press (button 1): which button it is is decided when it starts; motion settles after each change. Two fingers far
+    // apart (millimetres: 34 X counts, 51 Y counts each) are one finger pressing and one resting.
     const bool press = tp[1] & 1;
-    if (press && !pressing_) pressButton_ = fingers >= 2 ? 2 : 1;
+    if (press && !pressing_) {
+      const int32_t dx = fx[1] - fx[0], dy = (fy[1] - fy[0]) * kYNum / kYDen;
+      const int64_t far = int64_t(cfg_.secondaryMm) * 34;
+      const bool apart = fingers == 2 && int64_t(dx) * dx + int64_t(dy) * dy > far * far;
+      pressButton_ = fingers >= 2 && !apart ? 2 : 1;
+      if (touching_) g_.pressButton = pressButton_;
+    }
     if (press != pressing_ || bool(tp[1] & 2) != second_) settleUntil_ = ms + cfg_.pressSettleMs;
     pressing_ = press;
     second_ = tp[1] & 2;
@@ -522,7 +567,13 @@ class Pointer {
         }
       }
     }
-    const bool tapped = !fingers && touching_ && cfg_.tap && !pressed_ && !ignored_ && ms - downMs_ <= 180 && travel_ <= 85;
+    bool tapped = !fingers && touching_ && cfg_.tap && !pressed_ && !ignored_ && ms - downMs_ <= cfg_.tapMs &&
+                  travel_ <= cfg_.tapTravel;
+    if (tapped && cfg_.tapVeto && cfg_.tapVeto(cfg_.tapVetoContext, uint32_t(ms - downMs_))) {
+      tapped = false;
+      g_.vetoed = true;
+      ++vetoes_;
+    }
     const uint8_t tapButton = most_ >= 3 ? 4 : most_ == 2 ? 2 : 1;
     if (!fingers && touching_) {
       touching_ = false;
@@ -586,9 +637,10 @@ class Pointer {
   // A detach: nothing held, nothing pending; the counters stay.
   void reset()
   {
-    const uint32_t taps = taps_, gestures = gestures_, continuations = continuations_, swipes = swipes_;
+    const uint32_t taps = taps_, gestures = gestures_, continuations = continuations_, swipes = swipes_, vetoes = vetoes_;
     const bool countSeen = countSeen_;
     *this = Pointer(cfg_);
+    vetoes_ = vetoes;
     taps_ = taps;
     gestures_ = gestures;
     continuations_ = continuations;
@@ -596,6 +648,7 @@ class Pointer {
     countSeen_ = countSeen;
   }
   uint32_t taps() const { return taps_; }
+  uint32_t vetoes() const { return vetoes_; }
   uint32_t gestures() const { return gestures_; }
   uint32_t continuations() const { return continuations_; }
   uint32_t swipes() const { return swipes_; }
@@ -648,7 +701,7 @@ class Pointer {
   int32_t x_ = 0, y_ = 0, moveX_ = 0, moveY_ = 0, scrollX_ = 0, scrollY_ = 0, swipeX0_ = 0, swipeY0_ = 0;
   uint32_t travel_ = 0, lockX_ = 0, lockY_ = 0;
   uint64_t downMs_ = 0, lastKeyMs_ = 0, settleUntil_ = 0;
-  uint32_t taps_ = 0, gestures_ = 0, continuations_ = 0, swipes_ = 0;
+  uint32_t taps_ = 0, gestures_ = 0, continuations_ = 0, swipes_ = 0, vetoes_ = 0;
   Swipe pendingSwipe_ = Swipe::none;
   Gesture g_ = {};
 };

@@ -289,7 +289,7 @@ static void touchpad(uint8_t out[kTouchpadBytes], uint8_t buttons, std::initiali
   out[26] = uint8_t(i);
 }
 // The pointer settings the first tests were written for (before 2026-11-12): 2 counts per pointer count, 50 per wheel step, no axis
-// lock, no typing guard, no press settling.
+// lock, no typing guard, no press settling, taps of 180 ms and 85 counts, no resting thumb.
 static PointerConfig legacy()
 {
   PointerConfig c;
@@ -298,6 +298,9 @@ static PointerConfig legacy()
   c.axisLock = false;
   c.typingMs = 0;
   c.pressSettleMs = 0;
+  c.tapMs = 180;
+  c.tapTravel = 85;
+  c.restingThumb = false;
   return c;
 }
 static int16_t px(const uint8_t *o) { return int16_t(le16(o + 1)); }
@@ -1006,6 +1009,110 @@ static void testTapsAndTyping()
   CHECK(s.touch(tp, 2070, out) == 1 && px(out[0]) == 40 && out[0][0] == 1);   // a drag goes on
 }
 
+// 2026-11-12 (attend4: 9 of 31 presses with two fingers down, a thumb at Y 1800-1914; attend1: three 33-56 ms taps inside screen
+// taps): a resting thumb is not counted, two fingers far apart press the left button, the tap's limits, the tap veto.
+static bool gVetoAnswer = false;
+static uint32_t gVetoAsked = 0, gVetoMs = 0;
+static bool vetoHook(void *, uint32_t ms)
+{
+  ++gVetoAsked;
+  gVetoMs = ms;
+  return gVetoAnswer;
+}
+static void testRestingThumb()
+{
+  constexpr uint8_t kTouch = 1 | 2 | 4;
+  uint8_t tp[kTouchpadBytes], out[2][kPointerBytes];
+  Gesture g;
+  {   // a thumb resting at the bottom edge, a finger above pressing: the left button
+    Pointer p;
+    touchpad(tp, 0, {{kTouch, 1, 1600, 1900}, {kTouch, 2, 1500, 900}});
+    p.touch(tp, 0, out);
+    touchpad(tp, 1, {{kTouch, 1, 1600, 1900}, {kTouch, 2, 1500, 900}});
+    CHECK(p.touch(tp, 100, out) == 1 && out[0][0] == 1);
+    touchpad(tp, 0, {});
+    CHECK(p.touch(tp, 300, out) == 1 && out[0][0] == 0);
+    CHECK(p.takeGesture(&g) && g.pressed && g.pressButton == 1 && g.rested && g.most == 1);
+  }
+  {   // the same with restingThumb off: two fingers, the right button (the behaviour before)
+    PointerConfig c;
+    c.restingThumb = false;
+    Pointer p(c);
+    touchpad(tp, 0, {{kTouch, 1, 1600, 1900}, {kTouch, 2, 1500, 900}});
+    p.touch(tp, 0, out);
+    touchpad(tp, 1, {{kTouch, 1, 1600, 1900}, {kTouch, 2, 1500, 900}});
+    CHECK(p.touch(tp, 100, out) == 1 && out[0][0] == 2);
+  }
+  {   // a thumb resting, a finger moving above it: the pointer moves (one finger), nothing scrolls
+    Pointer p;
+    touchpad(tp, 0, {{kTouch, 1, 1600, 1950}, {kTouch, 2, 1500, 900}});
+    p.touch(tp, 0, out);
+    touchpad(tp, 0, {{kTouch, 1, 1600, 1950}, {kTouch, 2, 1600, 900}});
+    CHECK(p.touch(tp, 10, out) == 1 && px(out[0]) == 100 && out[0][5] == 0 && out[0][6] == 0);
+  }
+  {   // two fingers close together above the edge: a two-finger click, the right button
+    Pointer p;
+    touchpad(tp, 0, {{kTouch, 1, 1500, 900}, {kTouch, 2, 2100, 950}});
+    p.touch(tp, 0, out);
+    touchpad(tp, 1, {{kTouch, 1, 1500, 900}, {kTouch, 2, 2100, 950}});
+    CHECK(p.touch(tp, 100, out) == 1 && out[0][0] == 2);
+  }
+  {   // two fingers 50 mm apart (1700 X counts): one pressing, one resting: the left button
+    Pointer p;
+    touchpad(tp, 0, {{kTouch, 1, 800, 900}, {kTouch, 2, 2500, 900}});
+    p.touch(tp, 0, out);
+    touchpad(tp, 1, {{kTouch, 1, 800, 900}, {kTouch, 2, 2500, 900}});
+    CHECK(p.touch(tp, 100, out) == 1 && out[0][0] == 1);
+  }
+  {   // both fingers in the bottom fifth: nothing above, so both count (a two-finger click low on the pad)
+    Pointer p;
+    touchpad(tp, 0, {{kTouch, 1, 1500, 1900}, {kTouch, 2, 2000, 1950}});
+    p.touch(tp, 0, out);
+    touchpad(tp, 1, {{kTouch, 1, 1500, 1900}, {kTouch, 2, 2000, 1950}});
+    CHECK(p.touch(tp, 100, out) == 1 && out[0][0] == 2);
+  }
+  {   // the tap's limits: 200 ms is a tap (220), 240 ms is not; 120 counts of travel is a tap (150)
+    Pointer p;
+    touchpad(tp, 0, {{kTouch, 1, 1000, 1000}});
+    p.touch(tp, 0, out);
+    touchpad(tp, 0, {});
+    CHECK(p.touch(tp, 200, out) == 2 && out[0][0] == 1);
+    touchpad(tp, 0, {{kTouch, 2, 1000, 1000}});
+    p.touch(tp, 1000, out);
+    touchpad(tp, 0, {});
+    CHECK(p.touch(tp, 1240, out) == 0);
+    touchpad(tp, 0, {{kTouch, 3, 1000, 1000}});
+    p.touch(tp, 2000, out);
+    touchpad(tp, 0, {{kTouch, 3, 1120, 1000}});
+    p.touch(tp, 2050, out);
+    touchpad(tp, 0, {});
+    CHECK(p.touch(tp, 2110, out) == 2 && out[0][0] == 1 && p.taps() == 2);
+  }
+  {   // the veto: asked with the tap's duration; true drops the tap (nothing sent, the gesture says so), false lets it through
+    PointerConfig c;
+    c.tapVeto = vetoHook;
+    Pointer p(c);
+    gVetoAnswer = true;
+    touchpad(tp, 0, {{kTouch, 1, 1000, 1000}});
+    p.touch(tp, 0, out);
+    touchpad(tp, 0, {});
+    CHECK(p.touch(tp, 45, out) == 0 && gVetoAsked == 1 && gVetoMs == 45 && p.vetoes() == 1 && p.taps() == 0);
+    CHECK(p.takeGesture(&g) && g.vetoed && !g.tap);
+    gVetoAnswer = false;
+    touchpad(tp, 0, {{kTouch, 1, 1000, 1000}});
+    p.touch(tp, 1000, out);
+    touchpad(tp, 0, {});
+    CHECK(p.touch(tp, 1100, out) == 2 && out[0][0] == 1 && gVetoAsked == 2 && p.taps() == 1);
+    CHECK(p.takeGesture(&g) && !g.vetoed && g.tap == 1);
+    // a press is never asked about: it is not a tap
+    touchpad(tp, 1, {{kTouch, 1, 1000, 1000}});
+    p.touch(tp, 2000, out);
+    touchpad(tp, 0, {});
+    p.touch(tp, 2050, out);
+    CHECK(gVetoAsked == 2);
+  }
+}
+
 // The cover's backlight.
 static void testBacklight()
 {
@@ -1255,6 +1362,7 @@ int main(int argc, char **argv)
   testScrolling();
   testGestures();
   testTapsAndTyping();
+  testRestingThumb();
   testBacklight();
   testPollPlan();
   testIrqWait();

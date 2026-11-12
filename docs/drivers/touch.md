@@ -16,6 +16,14 @@ Battery (2026-11-11): at rest the frame loop reads one frame per 50 ms instead o
 [`../power-irq.md`](../power-irq.md)); `piano-touch-irq=1` takes those frames' edge from the TLMM interrupt.
 Display rotation (2026-11-11, host-tested, default off): `piano-touch-rotate=1` maps each contact into the rotated desktop before
 the gestures (§5, [sensors.md](sensors.md) §5a.3).
+Taps (2026-11-12, host-tested, not run): attend1's short taps became drags (11 of its 16 drags under 310 ms, most pressed 25-100 ms
+before the lift and ending 6-70 px from their start: a lifting finger's centre moves on this sensor, whose nodes are 53 px apart).
+The slop is 64 px now (32 before) and a drag starts only after the finger stayed past it for 80 ms (`piano-touch-drag-delay`), or
+went past three times the slop: lifted before, the touch is the tap at its landing. Holds that wobbled past 32 px (drags of 700-1050
+ms ending 20-52 px away) stay right clicks. A two-finger tap may take 700 ms (500 before: two of attend1's took 517-526 ms). The tap
+line says how far the finger got (`gesture: tap -> click (N ms, M px at most from the landing[: past the slop, lifted before the
+drag])`). The service answers `PianoTouchContact` (`PianoTouchClient.h`): the last frame with a finger, which PianoKeyboard asks
+before it sends a touchpad tap ([keyboard.md](keyboard.md) §6a).
 
 ## 1. Purpose and gate
 
@@ -118,7 +126,8 @@ rotation is CGDisplayRotation's (degrees clockwise, 90 = the panel's left edge u
 | `piano-touch-noedge=MS` | 50 | while busy, a frame is read anyway MS after the last one when neither an edge nor the line's level said one waits (25..200; never inside a ~12.6 ms cycle); at rest the idle period + 50 ms; with `piano-touch-idle=0` 200, as before (§13) |
 | `piano-touch-gestures=0` | 1 | level 2 without the gestures: the first contact is the tip (down presses, moves drag, up releases), as before this change |
 | `piano-touch-hold=MS` | 500 | a finger held this long within the slop: right click (200..3000; 0: never, and a long press is a click) |
-| `piano-touch-slop=PX` | 32 | panel pixels (~2.4 mm) a finger may move and still tap or hold; past it a drag, a scroll or a pinch (4..200) |
+| `piano-touch-slop=PX` | 64 | panel pixels (~4.7 mm) a finger may move and still tap or hold; past it a drag, a scroll or a pinch (4..200; 32 before 2026-11-12) |
+| `piano-touch-drag-delay=MS` | 80 | past the slop this long before a drag starts (or past three times the slop at once); a lift before is the tap (0..500; 0: at once, as before 2026-11-12) |
 | `piano-touch-scroll=PX` | 4 | finger travel per wheel / AC Pan count (1..64): smaller is finer and faster |
 | `piano-touch-scroll-res=N` | 45 | the scroll resolution the descriptor declares, counts per inch (10..900): macOS's scroll acceleration works in it, so higher is slower; 45 gives a finger's millimetre the wheel travel of PianoKeyboard's touchpad (§14.3) |
 | `piano-touch-scroll-invert=1` | 0 | both scroll axes reversed (natural scrolling is macOS's setting, one for every device) |
@@ -228,7 +237,7 @@ use (`calibration: none` in the log). Level 2 adds `HID device: touch screen poi
 | level 2 without `event service ... published` | IOHIDEventDriver did not attach (personality/IDs) |
 | `contact N down` lines but no pointer movement in macOS | the reports go nowhere: `HID: handleReport` failures, or the descriptor not taken (compare with `piano-touch-gestures=0`, the plain tip) |
 | every tap a `contact N is a palm` | the finger's blob is larger than `piano-touch-palm` (the `area A nodes` of its down line): raise it |
-| taps logged `gesture: drag` | the centroid moves more than the slop during a tap: `piano-touch-slop=48` |
+| taps logged `gesture: drag` | the centroid moves more than the slop for longer than the drag delay: `piano-touch-slop=96` or `piano-touch-drag-delay=150`; the tap lines' `M px at most` say how far taps go |
 
 ## 9. Fallback
 
@@ -519,7 +528,7 @@ the gestures is host-tested (§14.5) and checked with that agent's own test.
 
 Fallbacks for the next image: no pointer movement although `contact` lines come → `piano-touch-gestures=0` (the plain tip) tells
 whether the descriptor or the gestures are at fault; every tap a palm → `piano-touch-palm=` above the `area` of step 1; taps
-read as drags → `piano-touch-slop=48`; holds too eager → `piano-touch-hold=700`.
+read as drags → `piano-touch-slop=96` (64 since 2026-11-12, with an 80 ms drag delay); holds too eager → `piano-touch-hold=700`.
 
 **With `piano-touch-idle=20 piano-touch-irq=1` added** (the lowest latency at rest): steps 1-2 again; the `contact 1 down` line comes at most ~20 ms after the touch (one idle period of
 20 ms); `frames: gpio162 interrupt on the TLMM summary ...` or `... NOT used (why)`; `frames at 60 s: ~50 reads/s` at rest.

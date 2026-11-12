@@ -81,6 +81,9 @@ which are unchanged.
 | `piano-keyboard-gestures=1` | 0 | three-finger swipes as Control + arrow (Mission Control, App Exposé, Spaces) |
 | `piano-keyboard-tap=0` | 1 | no tap-to-click (on: 1 finger left, 2 right, 3 middle; no drag lock) |
 | `piano-keyboard-typing=MS` | 250 | touches starting within MS of a key going down are ignored (0: off) |
+| `piano-keyboard-resting=0` | 1 | count a thumb resting in the bottom fifth (§6a) |
+| `piano-keyboard-tap-ms=MS` / `-tap-travel=C` | 220 / 150 | the longest tap and its travel in X counts (180 / 85 before 2026-11-12) |
+| `piano-keyboard-tap-veto=0` | 1 | send a tap even while a finger is on the touch screen (§6a) |
 | `piano-keyboard-backlight=P` | 0 | keyboard backlight on attach, 0..100 (over 100: not sent) |
 | `piano-keyboard-backlight-idle=S` | 0 | backlight off after S s without a key or touch, back at the next |
 | `piano-keyboard-poll=MS` / `-idle-poll=MS` / `-slow-poll=MS` | 4 / 30 / 200 | latch poll while reports flow / idle / detached or closed |
@@ -107,6 +110,19 @@ determineResolution` divides the relative X element's and the Wheel's logical ra
   stays free. No inertia (the risk of a runaway scroll without a way to stop it).
 - **Clicks.** Taps on: one finger left, two right, three middle; a press is left, or right when it starts with two fingers; the
   pad's second button right. No drag lock. 50 ms without motion after a press changes (a clickpad moves under the press).
+- **A resting thumb** (2026-11-12, host-tested, not run): a contact in the pad's bottom fifth (Y past 1708 of 2135, the edge nearest
+  the user) while another contact is above it is not counted at all: a press with it is a left click, one finger moving above it
+  moves the pointer instead of scrolling, and it does not move the fingers' mean. Two fingers pressing more than 45 mm apart are
+  one pressing and one resting: the left button. attend4 had 9 two-finger presses among 31, all without motion and several with a
+  contact at Y 1800-1914: right clicks where left ones were meant ("clicks that did nothing"). `piano-keyboard-resting=0` counts the
+  thumb again.
+- **Taps' limits and the screen** (2026-11-12): a tap may take 220 ms and 150 counts (~4.4 mm) of travel (180 ms and 85 before:
+  attend4's 181 ms two-finger tap and attend1's 116 ms one with 110 counts were lost). A tap while a finger is on the touch screen,
+  or within 60 ms of one, is dropped (`PianoTouchClient.h`, `piano-keyboard-tap-veto=0` keeps it): attend1's three cover taps
+  (33-56 ms) each came inside a screen tap, 11-16 ms before the screen's click, so one click became a double click. The gesture
+  line names the press's button (`pressed (left)` / `pressed (right)`), `a resting thumb left out` and `tap dropped (a finger on the
+  screen)`; the alive line is two lines now (the console cut the first at ~255 characters) with the vetoed taps and the LED
+  requests; every LED request from macOS (`LED request N from macOS: 0x02 (Caps Lock on)`) and every 0x2e command is logged.
 - **Typing.** A touch that starts within 250 ms of a key going down is ignored (palm or thumb while typing); its press still clicks.
 - **Gestures.** Three fingers moving 9 mm along one axis, once per touch: up Mission Control (Control+Up), down App Exposé
   (Control+Down), left the Space to the right (Control+Right), right the Space to the left (Control+Left), sent through the

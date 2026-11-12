@@ -1223,11 +1223,12 @@ static void testGestures()
       forward = forward && p.sent[i].r.buttons == kButtonLeft && p.sent[i].r.x >= p.sent[i - 1].r.x;
     CHECK(forward && near(p.sent.back().r.x, 1600, kPx) && p.sent.back().r.buttons == 0);
   }
-  {   // a second finger during a drag changes nothing: the drag goes on, no scroll
+  {   // a second finger during a drag changes nothing: the drag goes on, no scroll (the drag started: past the slop 80 ms)
     Pipeline p;
     p.hold({finger(800, 1000)}, 2);
-    for (int k = 1; k <= 10; ++k) p.step({finger(800 + 10 * k, 1000)});
-    for (int k = 11; k <= 30; ++k) p.step({finger(800 + 10 * k, 1000), finger(2000, 600 - 5 * k)});
+    for (int k = 1; k <= 20; ++k) p.step({finger(800 + 10 * k, 1000)});
+    CHECK(p.g.buttons == kButtonLeft);
+    for (int k = 21; k <= 40; ++k) p.step({finger(800 + 10 * k, 1000), finger(2000, 600 - 5 * k)});
     p.none();
     CHECK(p.wheel() == 0 && p.noted(GestureKind::dragEnd) == 1 && !p.any(kButtonRight) && p.clean());
   }
@@ -1250,9 +1251,76 @@ static void testGestures()
   }
   {   // two fingers held long and lifted: nothing
     Pipeline p;
-    p.hold({finger(1200, 1000), finger(1500, 1000)}, 90);
+    p.hold({finger(1200, 1000), finger(1500, 1000)}, 100);
     p.none();
     CHECK(p.clicks().empty() && p.clean());
+  }
+  // 2026-11-12 (attend1): a lifting finger's centre moves 30-70 px in its last frames; short taps became drags with a 32 px slop.
+  {   // a tap whose centre drifts 50 px as it lifts: still a tap at the landing (64 px slop)
+    Pipeline p;
+    p.hold({finger(X, Y)}, 10);
+    p.step({finger(X + 25, Y + 10)});
+    p.step({finger(X + 50, Y + 20)});
+    p.none();
+    const std::vector<PointerReport> c = p.clicks();
+    CHECK(c.size() == 1 && c[0].buttons == kButtonLeft && near(c[0].x, X, kPx) && near(c[0].y, Y, kPx));
+    CHECK(p.noted(GestureKind::dragStart) == 0 && p.noted(GestureKind::tap) == 1 && p.clean());
+  }
+  {   // a drift past the slop (110 px) in the last frame before the lift: the drag waits 80 ms, the lift makes it a tap
+    Pipeline p;
+    p.hold({finger(X, Y)}, 10);
+    p.step({finger(X + 110, Y)});
+    p.none();
+    const std::vector<PointerReport> c = p.clicks();
+    CHECK(c.size() == 1 && c[0].buttons == kButtonLeft && near(c[0].x, X, kPx) && p.noted(GestureKind::dragStart) == 0);
+    bool past = false;
+    for (const GestureNote &n : p.notes) past = past || (n.kind == GestureKind::tap && n.b == 1 && n.a > 64);
+    CHECK(past && p.clean());
+  }
+  {   // a slow drag: it starts once past the slop for 80 ms, pressed where the finger landed, then follows
+    Pipeline p;
+    p.hold({finger(800, 1000)}, 2);
+    for (int k = 1; k <= 40; ++k) p.step({finger(800 + 5 * k, 1000)});
+    p.none();
+    unsigned first = 0;
+    while (first < p.sent.size() && !p.sent[first].r.buttons) ++first;
+    CHECK(first < p.sent.size() && p.sent[first].r.x == p.sent[0].r.x && p.noted(GestureKind::dragStart) == 1);
+    // past 64 px at about frame 13 (5 px a frame from frame 3); the press 10 frames (80 ms) later
+    CHECK(first < p.sent.size() && p.sent[first].frame >= 20 && p.sent[first].frame <= 30);
+    if (first < p.sent.size()) std::printf("gestures: a 5 px a frame drag pressed in frame %u (past the slop about frame 15)\n", p.sent[first].frame);
+    CHECK(near(p.sent.back().r.x, 1000, kPx) && p.noted(GestureKind::dragEnd) == 1 && p.clean() && p.clicks().empty());
+  }
+  {   // a fast move past three times the slop starts the drag at once
+    Pipeline p;
+    p.hold({finger(800, 1000)}, 3);
+    for (int k = 1; k <= 6; ++k) p.step({finger(800 + 60 * k, 1000)});
+    p.none();
+    unsigned first = 0;
+    while (first < p.sent.size() && !p.sent[first].r.buttons) ++first;
+    CHECK(first < p.sent.size() && p.sent[first].frame <= 8 && p.noted(GestureKind::dragStart) == 1 && p.clean());
+  }
+  {   // piano-touch-drag-delay=0: the drag at the first frame past the slop, as before
+    GestureConfig gc;
+    gc.dragDelayMs = 0;
+    Pipeline p(TrackConfig(), gc);
+    p.hold({finger(X, Y)}, 10);
+    p.step({finger(X + 110, Y)});
+    p.none();
+    CHECK(p.noted(GestureKind::dragStart) == 1 && p.clicks().empty() && p.clean());
+  }
+  {   // a finger held still but wobbling 40 px: the right click at 500 ms, never a drag
+    Pipeline p;
+    for (int k = 0; k < 75; ++k) p.step({finger(X + ((k / 4) % 2 ? 40 : 0), Y)});
+    p.none();
+    const std::vector<PointerReport> c = p.clicks();
+    CHECK(c.size() == 1 && c[0].buttons == kButtonRight && !p.any(kButtonLeft) && p.noted(GestureKind::dragStart) == 0);
+  }
+  {   // a two-finger tap of 560 ms (attend1's 517-526 ms ones were lost with 500): a right click
+    Pipeline p;
+    p.hold({finger(1200, 1000), finger(1500, 1000)}, 70);
+    p.none();
+    const std::vector<PointerReport> c = p.clicks();
+    CHECK(c.size() == 1 && c[0].buttons == kButtonRight && p.noted(GestureKind::twoTap) == 1);
   }
   auto scroll = [](double dx, double dy, GestureConfig gc) {
     Pipeline p(TrackConfig(), gc);
@@ -1381,7 +1449,7 @@ static void testGestures()
   {   // frames lost during a drag: released at once; during a pinch with Command: Command released
     Pipeline p;
     p.hold({finger(800, 1000)}, 2);
-    for (int k = 1; k <= 10; ++k) p.step({finger(800 + 10 * k, 1000)});
+    for (int k = 1; k <= 20; ++k) p.step({finger(800 + 10 * k, 1000)});
     CHECK(p.g.buttons == kButtonLeft);
     p.lose();
     CHECK(p.clean() && p.noted(GestureKind::cancelLost) == 1 && p.g.mode == GestureMode::idle && trackerLive(p.tr) == 0);
@@ -1496,7 +1564,7 @@ static void testPower()
   // The gestures across a mute: a drag in progress is released, the next touch after the display's return starts afresh.
   Pipeline g;
   g.hold({finger(800, 1000)}, 2);
-  for (int k = 1; k <= 10; ++k) g.step({finger(800 + 10 * k, 1000)});
+  for (int k = 1; k <= 20; ++k) g.step({finger(800 + 10 * k, 1000)});
   CHECK(g.g.buttons == kButtonLeft);
   g.lose();   // PianoTouch::lost at the mute: tracker and gestures cancelled
   CHECK(g.clean() && g.g.buttons == 0);

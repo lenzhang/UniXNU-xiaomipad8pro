@@ -33,7 +33,10 @@
 //                            window could spell a password on an on-screen keyboard); piano-touch-trace=1 logs them
 //   piano-touch-gestures=0   level 2 as before the gestures: the first contact is the tip (down presses, up releases)
 //   piano-touch-hold=MS      still this long: a right click (default 500; 0: never; 200..3000)
-//   piano-touch-slop=PX      movement (panel pixels) that makes a drag, a scroll or a pinch (default 32; 4..200)
+//   piano-touch-slop=PX      movement (panel pixels) that makes a drag, a scroll or a pinch (default 64; 4..200; 32 before
+//                            2026-11-12, when attend1's short taps became drags)
+//   piano-touch-drag-delay=MS past the slop this long before a drag starts; lifted before, the touch is a tap (default 80;
+//                            0: at once, as before 2026-11-12; at most 500)
 //   piano-touch-scroll=PX    finger travel per wheel count (default 4; 1..64)
 //   piano-touch-scroll-res=N the scroll resolution the descriptor declares, counts per inch (default 45; 10..900)
 //   piano-touch-scroll-invert=1  scroll against macOS's natural direction setting (both axes)
@@ -97,6 +100,7 @@
 #include "SmmuStream.h"
 #include "TouchPace.h"
 #include "TouchPower.h"
+#include "PianoTouchClient.h"   // "PianoTouchContact": the last frame with a finger, for PianoKeyboard's tap veto
 #include "../common/PianoIrq.h"
 // The power contract (docs/power.md §4): the two power states and pianopower::join. PIANO_TOUCH_LATENCY_HOLD:
 // tooling/k27/build-native-piano-touch.sh sets it to 1 when the kernel the KC links (K27_KERNEL) exports
@@ -126,7 +130,8 @@ namespace {
 
 struct Args {
   uint32_t level, stop, bus, khz, seirq, smmu, loopback, mode, baseline, threshold, flip, pollMs, trace, idleMs, irq, rotate;
-  uint32_t gestures, holdMs, slopPx, scrollPx, scrollRes, scrollInvert, pinch, palmNodes, confirm, fastPeak, cpuHoldUs, noEdgeMs;
+  uint32_t gestures, holdMs, slopPx, dragDelayMs, scrollPx, scrollRes, scrollInvert, pinch, palmNodes, confirm, fastPeak, cpuHoldUs,
+      noEdgeMs;
   uint32_t pm, display;
 };
 Args gArgs;
@@ -169,7 +174,8 @@ void readArgs()
   gArgs.gestures = bootArg("piano-touch-gestures", 1);
   const uint32_t hold = bootArg("piano-touch-hold", 500);
   gArgs.holdMs = hold ? clampArg(hold, 200, 3000) : 0;
-  gArgs.slopPx = clampArg(bootArg("piano-touch-slop", 32), 4, 200);
+  gArgs.slopPx = clampArg(bootArg("piano-touch-slop", 64), 4, 200);
+  gArgs.dragDelayMs = clampArg(bootArg("piano-touch-drag-delay", 80), 0, 500);
   gArgs.scrollPx = clampArg(bootArg("piano-touch-scroll", 4), 1, 64);
   gArgs.scrollRes = touchScrollResolution(bootArg("piano-touch-scroll-res", kTouchScrollResolution));
   gArgs.scrollInvert = bootArg("piano-touch-scroll-invert", 0);
@@ -200,6 +206,7 @@ GestureConfig gestureConfig()
   c.gestures = gArgs.gestures != 0;
   c.holdMs = gArgs.holdMs;
   c.slopPx = int32_t(gArgs.slopPx);
+  c.dragDelayMs = gArgs.dragDelayMs;
   c.scrollPx = int32_t(gArgs.scrollPx);
   c.scrollInvert = gArgs.scrollInvert != 0;
   c.pinch = uint8_t(gArgs.pinch);
@@ -445,6 +452,8 @@ class PianoTouch : public IOService {
   // touch-down (TouchRotation.h). Without the argument it stays 0 and every report is as before.
   PatRotation fRotation = {0, 0, 0};
   const char *volatile fRotationSource = "none";
+  // The uptime (ms) of the last frame with a finger on the screen (not a palm), for "PianoTouchContact" (PianoTouchClient.h).
+  volatile uint64_t fLastContactMs = 0;
 
   static void threadMain(void *self, wait_result_t);
   static bool eventServicePublished(void *target, void *refCon, IOService *service, IONotifier *notifier);
@@ -523,10 +532,10 @@ bool PianoTouch::start(IOService *provider)
        (unsigned long long)piano_touch_firmware_boe_size, (unsigned long long)piano_touch_firmware_csot_size);
   setProperty("piano-touch", gArgs.level, 32);
   if (gArgs.gestures)
-    note("gestures: tap = click, held %u ms = right click%s, moved past %u px = drag, two-finger tap = right click, two-finger "
-         "scroll %u px a count (declared %u/inch, %s), pinch %s", gArgs.holdMs, gArgs.holdMs ? "" : " (never)", gArgs.slopPx,
-         gArgs.scrollPx, gArgs.scrollRes, gArgs.scrollInvert ? "inverted" : "the content follows the fingers under natural scrolling",
-         kPinchNames[gArgs.pinch]);
+    note("gestures: tap = click, held %u ms = right click%s, moved past %u px for %u ms = drag, two-finger tap = right click, "
+         "two-finger scroll %u px a count (declared %u/inch, %s), pinch %s", gArgs.holdMs, gArgs.holdMs ? "" : " (never)",
+         gArgs.slopPx, gArgs.dragDelayMs, gArgs.scrollPx, gArgs.scrollRes,
+         gArgs.scrollInvert ? "inverted" : "the content follows the fingers under natural scrolling", kPinchNames[gArgs.pinch]);
   else
     note("gestures: off (piano-touch-gestures=0): the first contact is the tip, down presses, up releases");
   char fast[48] = "", palm[96] = "off (piano-touch-palm=0)";
@@ -1147,6 +1156,11 @@ bool PianoTouch::eventServicePublished(void *, void *, IOService *service, IONot
 // recorded; the frame thread takes it at the next touch-down.
 IOReturn PianoTouch::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
+  if (name && name->isEqualTo(pianotouch::kFunctionContact)) {   // PianoTouchClient.h: one word, no lock, no wait
+    if (!p1) return kIOReturnBadArgument;
+    *static_cast<uint64_t *>(p1) = __atomic_load_n(&fLastContactMs, __ATOMIC_ACQUIRE);
+    return kIOReturnSuccess;
+  }
   if (!name || !name->isEqualTo(PAT_FUNCTION)) return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
   if (!gArgs.rotate) return kIOReturnUnsupported;
   if (!pat_request(&fRotation, uint32_t(uintptr_t(p1)))) return kIOReturnBadArgument;
@@ -1239,11 +1253,14 @@ void PianoTouch::gestures(uint64_t now)
   }
   GestureContact c[kMaxTracks];
   unsigned n = 0;
+  bool finger = false;
   for (const Track &t : fTracker.t) {
     if (t.state != TrackState::active) continue;
     const PatPoint p = pat_rotate(fRotation.shown, t.x, t.y, kPanelW, kPanelH);
     c[n++] = GestureContact{t.id, t.palm, p.x, p.y, t.frames};
+    finger = finger || !t.palm;
   }
+  if (finger) __atomic_store_n(&fLastContactMs, now, __ATOMIC_RELEASE);
   GestureOut out;
   gestureUpdate(fGesture, c, n, now, out);
   deliver(out);
@@ -1272,7 +1289,8 @@ void PianoTouch::deliver(const GestureOut &out)
     if (show) snprintf(at, sizeof at, " at (%d, %d)", g.x, g.y);
     static const char *const kAxis[3] = {"both axes", "vertical", "horizontal"};
     switch (g.kind) {
-    case GestureKind::tap: note("gesture: tap%s -> click (%u ms)", at, g.ms); break;
+    case GestureKind::tap: note("gesture: tap%s -> click (%u ms, %d px at most from the landing%s)", at, g.ms, g.a,
+                                g.b ? ": past the slop, lifted before the drag" : ""); break;
     case GestureKind::holdRight: note("gesture: held %u ms%s -> right click", g.ms, at); break;
     case GestureKind::dragStart: note("gesture: drag%s, left button down (%u ms after the touch)", at, g.ms); break;
     case GestureKind::dragEnd: note("gesture: drag ends%s after %u ms, %d px from its start", at, g.ms, g.a); break;

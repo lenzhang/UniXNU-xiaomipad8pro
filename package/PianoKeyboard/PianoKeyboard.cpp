@@ -51,6 +51,11 @@
 //   piano-keyboard-gestures=1   three-finger swipes as Control + arrow (Mission Control, App Expose, Spaces); default 0
 //   piano-keyboard-tap=0        no tap-to-click (default 1: one finger left, two right, three middle; no drag lock)
 //   piano-keyboard-typing=MS    ignore touches that start within MS of a key going down (default 250; 0 off)
+//   piano-keyboard-resting=0    count a thumb resting in the pad's bottom fifth (default 1: not counted while another finger is
+//                               above it, so a press with it is a left click and one finger's motion is not a scroll; 2026-11-12)
+//   piano-keyboard-tap-ms=MS    the longest tap (default 220; 180 before 2026-11-12)   piano-keyboard-tap-travel=C  its travel in X
+//                               counts (default 150, ~4.4 mm; 85 before)
+//   piano-keyboard-tap-veto=0   send a tap even while a finger is on the touch screen (default 1: dropped, PianoTouchClient.h)
 //   piano-keyboard-invert=B     bit 0 X, bit 1 Y
 // The backlight and polling:
 //   piano-keyboard-backlight=P  keyboard backlight 0..100 on attach (default 0: off; over 100: not sent); the cover's
@@ -108,6 +113,7 @@
 #include "CoverPower.h"                              // the closed-cover gate, gpio95's sleep latch, the MCU following the display
 #include "../common/PianoIrq.h"                      // the TLMM summary interrupt (docs/power-irq.md)
 #include "../PianoBacklight/PianoBacklightClient.h"  // the panel's brightness keys (piano-backlight-keys=1)
+#include "../PianoTouch/PianoTouchClient.h"          // the touch screen's last contact: a cover tap during a screen touch is dropped
 #include <IOKit/IOMessage.h>
 #include <libkern/c++/OSBoolean.h>
 #include <PianoPowerContract.h>
@@ -127,7 +133,7 @@ namespace {
 struct Args {
   uint32_t level, stop, trace, halfUs, pollMs, rails, touchpad, backlight, tap, invert, divide, mouse, auth, raw, fnrow, hall, lid;
   uint32_t dpi, scrollRes, scroll, scrollInvert, gestures, typing, backlightIdle, idlePoll, slowPoll, irq;
-  uint32_t blank, lidDrop;
+  uint32_t blank, lidDrop, resting, tapMs, tapTravel, tapVeto;
 };
 Args gArgs;
 
@@ -138,6 +144,10 @@ uint32_t bootArg(const char *name, uint32_t fallback)
   return v;
 }
 uint32_t clampArg(uint32_t v, uint32_t lo, uint32_t hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+// The cover's tap veto (Wn8030Piano.h PointerConfig::tapVeto, piano-keyboard-tap-veto=1): a finger on the touch screen during the tap
+// or just before it (PianoTouchClient.h): the screen's touch showing through on the pad, not a tap of its own.
+bool screenVeto(void *, uint32_t tapMs) { return pianotouch::screenTouchedDuring(tapMs); }
 
 void readArgs()
 {
@@ -164,6 +174,10 @@ void readArgs()
   gArgs.scrollInvert = bootArg("piano-keyboard-scroll-invert", 0);
   gArgs.gestures = bootArg("piano-keyboard-gestures", 0);
   gArgs.typing = clampArg(bootArg("piano-keyboard-typing", 250), 0, 2000);
+  gArgs.resting = bootArg("piano-keyboard-resting", 1);
+  gArgs.tapMs = clampArg(bootArg("piano-keyboard-tap-ms", 220), 50, 1000);
+  gArgs.tapTravel = clampArg(bootArg("piano-keyboard-tap-travel", 150), 10, 2000);
+  gArgs.tapVeto = bootArg("piano-keyboard-tap-veto", 1);
   gArgs.backlightIdle = clampArg(bootArg("piano-keyboard-backlight-idle", 0), 0, 3600);
   gArgs.idlePoll = clampArg(bootArg("piano-keyboard-idle-poll", 30), 1, 200);
   gArgs.slowPoll = clampArg(bootArg("piano-keyboard-slow-poll", 200), 10, 1000);
@@ -603,6 +617,10 @@ bool PianoKeyboard::start(IOService *provider)
   pc.scrollInvert = gArgs.scrollInvert != 0;
   pc.gestures = gArgs.gestures != 0;
   pc.typingMs = gArgs.typing;
+  pc.restingThumb = gArgs.resting != 0;
+  pc.tapMs = gArgs.tapMs;
+  pc.tapTravel = gArgs.tapTravel;
+  if (gArgs.tapVeto) pc.tapVeto = screenVeto;
   fPointer.configure(pc);
   fKeyFilter.fnRow = gArgs.fnrow != 0;
   gTouchpad = makeTouchpadDescriptor(gArgs.dpi, gArgs.scrollRes);
@@ -618,6 +636,10 @@ bool PianoKeyboard::start(IOService *provider)
        gArgs.scrollInvert ? "scrolling inverted" : "natural scrolling", gArgs.tap ? "on" : "off", gArgs.typing,
        gArgs.gestures ? "ON" : "off (recognised for the log only)", gArgs.backlight,
        gArgs.backlightIdle ? ", off when idle" : "", gArgs.pollMs, gArgs.idlePoll, gArgs.slowPoll);
+  note("touchpad: a tap at most %u ms and %u counts of travel, %s; a thumb resting in the bottom fifth %s; two fingers pressing "
+       "within 45 mm: the right button, else the left", gArgs.tapMs, gArgs.tapTravel,
+       gArgs.tapVeto ? "dropped while a finger is on the touch screen" : "sent whatever the touch screen does",
+       gArgs.resting ? "not counted while another finger is above it" : "counted (piano-keyboard-resting=0)");
   note("interrupt: piano-keyboard-irq=%u (%s); panel brightness keys %s (piano-backlight-keys)", gArgs.irq,
        gArgs.irq ? "gpio97 on the TLMM summary when it opens" : "polled", pianobacklight::keysEnabled() ? "on" : "off");
   fGate.configure(gArgs.lidDrop != 0);
@@ -1067,7 +1089,8 @@ bool PianoKeyboard::sendCommand(uint8_t cmd, uint8_t value, const char *what)
   const I2c r = fBus.write(kAddress, wire, kCommandWire);
   ++fCommands;
   if (r != I2c::ok) ++fCommandErrors;
-  if (r != I2c::ok || fCommands <= 20) note("command %#04x %s = %u: %s", cmd, what, value, i2cName(r));
+  // Every LED command is logged (they are rare: attach, Caps Lock); the rest the first 20 and failures.
+  if (r != I2c::ok || fCommands <= 20 || cmd == kCmdIndicator) note("command %#04x %s = %u: %s", cmd, what, value, i2cName(r));
   return r == I2c::ok;
 }
 
@@ -1263,9 +1286,11 @@ void PianoKeyboard::dispatch(const Report &r)
     }
     Gesture g;
     if (fPointer.takeGesture(&g) && (fPointer.gestures() <= 100 || fPointer.gestures() % 20 == 0))
-      note("touch gesture %u: %u finger%s, %u ms, (%d,%d) -> (%d,%d), travel %u, %u moves, %u scrolls%s%s%s%s%s", fPointer.gestures(),
-           g.most, g.most == 1 ? "" : "s", g.ms, g.x0, g.y0, g.x1, g.y1, g.travel, g.moves, g.scrolls, g.pressed ? ", pressed" : "",
+      note("touch gesture %u: %u finger%s, %u ms, (%d,%d) -> (%d,%d), travel %u, %u moves, %u scrolls%s%s%s%s%s%s%s",
+           fPointer.gestures(), g.most, g.most == 1 ? "" : "s", g.ms, g.x0, g.y0, g.x1, g.y1, g.travel, g.moves, g.scrolls,
+           !g.pressed ? "" : g.pressButton == 2 ? ", pressed (right)" : ", pressed (left)",
            g.tap == 1 ? ", TAP (left click)" : g.tap == 2 ? ", TAP (right click)" : g.tap == 4 ? ", TAP (middle click)" : "",
+           g.vetoed ? ", tap dropped (a finger on the screen)" : "", g.rested ? ", a resting thumb left out" : "",
            g.typing ? ", ignored (typing)" : "", g.swipe != Swipe::none ? ", three-finger swipe " : "",
            g.swipe != Swipe::none ? swipeName(g.swipe) : "");
     return;
@@ -1414,7 +1439,11 @@ void PianoKeyboard::serve()
     const uint32_t requests = __atomic_load_n(&fLedRequests, __ATOMIC_ACQUIRE);
     if (requests != fLedSeen) {
       fLedSeen = requests;
-      const bool caps = __atomic_load_n(&fLedWanted, __ATOMIC_ACQUIRE) & kLedCapsLock;
+      const uint32_t leds = __atomic_load_n(&fLedWanted, __ATOMIC_ACQUIRE);
+      const bool caps = leds & kLedCapsLock;
+      if (requests <= 20 || requests % 50 == 0)
+        note("LED request %u from macOS: %#04x (Caps Lock %s)%s", requests, leds, caps ? "on" : "off",
+             caps == fCaps ? ", no change" : fAttached && fCover.running() ? "" : ", sent when the cover runs again");
       if (caps != fCaps) {
         fCaps = caps;
         if (fAttached && fCover.running()) sendCommand(kCmdIndicator, caps ? kLedCapsOn : kLedCapsOff, "caps lock LED");   // else at the unblank
@@ -1628,14 +1657,17 @@ IOReturn PianoKeyboard::setPowerState(unsigned long state, IOService *)
 
 void PianoKeyboard::describe(uint64_t seconds)
 {
-  note("alive at %llu s: %s, %u reads (%u frames, %u empty, %u errors, %u bad, %u checksum mismatches), %u edges%s, %u level reads, irq high in %u of %u "
-       "polls; keys %u (rollovers %u), consumer %u, touch %u (gestures %u, taps %u, swipes %u sent %u), mouse %u, vendor %u (accel %u, "
-       "auth %u, acks %u), attaches %u; %u commands (%u failed), %u reports to macOS (%u failed); irq %u status %u; hall %s; poll %s",
-       seconds, fAttached ? "attached" : "no cover", fReads, fFrames, fEmpty, fReadErrors, fBadFrames, fSumBad, fEdges,
-       fEdgeSeen ? "" : " (none yet: polled every 100 ms)", fLevelReads, fIrqHigh, fPolls, fKeys, fKeyFilter.rollovers(), fConsumer,
-       fTouch, fPointer.gestures(), fPointer.taps(), fPointer.swipes(), fSwipesSent, fMouse, fVendor, fAccel, fAuth, fAcks, fAttaches,
-       fCommands, fCommandErrors, fSent, fSendErrors, level(kIrq), level(kStatus), fHall < 0 ? "not read" : fHall ? "open" : "closed",
+  // Two lines: the console cuts a line near 255 characters (attend4's alive line lost its reports-to-macOS field).
+  note("alive at %llu s: %s, %u reads (%u frames, %u empty, %u errors, %u bad, %u checksum mismatches), %u edges%s, %u level reads, "
+       "irq high in %u of %u polls; irq %u status %u; hall %s; poll %s", seconds, fAttached ? "attached" : "no cover", fReads, fFrames,
+       fEmpty, fReadErrors, fBadFrames, fSumBad, fEdges, fEdgeSeen ? "" : " (none yet: polled every 100 ms)", fLevelReads, fIrqHigh,
+       fPolls, level(kIrq), level(kStatus), fHall < 0 ? "not read" : fHall ? "open" : "closed",
        pollModeName(fPoll.mode(nowMs(), fAttached, fHall == 0 || !fCover.running())));
+  note("alive at %llu s: keys %u (%u rollovers), consumer %u, touch %u (gestures %u, taps %u, vetoed %u, swipes %u/%u), mouse %u, "
+       "vendor %u (accel %u, auth %u, acks %u), attaches %u; commands %u (%u failed), reports to macOS %u (%u failed), LED requests %u",
+       seconds, fKeys, fKeyFilter.rollovers(), fConsumer, fTouch, fPointer.gestures(), fPointer.taps(),
+       fPointer.vetoes(), fPointer.swipes(), fSwipesSent, fMouse, fVendor, fAccel, fAuth, fAcks, fAttaches, fCommands, fCommandErrors,
+       fSent, fSendErrors, unsigned(__atomic_load_n(&fLedRequests, __ATOMIC_ACQUIRE)));
   if (fGate.enabled() || fCover.enabled() || fSleeps)
     note("power at %llu s: input %s (%u reports dropped while closed); MCU %s (%u blanks, %u unblanks, %u early wakes, %u timed out); "
          "%u system sleeps", seconds, fGate.closed() ? "DROPPED (cover closed)" : "passed", fGate.dropped(),
