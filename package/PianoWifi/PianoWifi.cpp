@@ -185,7 +185,7 @@ uint64_t nowMs();
 // the only one who can answer the firmware, so from the boot loader's doorbell to the end of the ladder this thread's lines are
 // kept in a heap buffer and printed when the ladder stops (deferFlush), each with how long after the doorbell it was written.
 // Other threads (the power hook) still print at once. piano-wifi-defer=0 prints everything as it happens.
-constexpr unsigned kDeferLines = 224, kDeferBytes = 300;
+constexpr unsigned kDeferLines = 320, kDeferBytes = 300;   // 96 000 bytes of heap while the ladder runs
 char *gDeferBuf;
 unsigned gDeferCount, gDeferDropped;
 uint64_t gDeferSince;
@@ -1531,6 +1531,9 @@ void crashReport(const char *when)
 {
   if (gCrashReported) return;
   gCrashReported = true;
+  // The firmware is dead: nothing waits on this host any more, and the crash's own lines must never be the ones a full buffer
+  // drops, so the held lines come out first and these are printed as they are written.
+  deferFlush();
   const MhiBoot &b = gBoot;
   MhiHealth h = mhiHealth(gMhiIo, b.bhi);
   note("crash: %s: MHISTATUS %08x (state %#x%s), EE %s, BHI error code %08x, debug %08x %08x %08x, receive status %08x", when,
