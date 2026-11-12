@@ -17,6 +17,10 @@ porting.toml), package/:
     QcomQrtr.c   d22ff8572b93424f1f03138204a44e10b444d0cb62b6be4f1c57b7d3b2ddbc74   QcomQrtr.h   3ead40f5f996497224ebef92e2e67820aa8372bab0a21646c15df954baba84f1
       + client ports that are never announced (qcom_qrtr_add_client), their removal and DEL_CLIENT (qcom_qrtr_remove_port,
         qcom_qrtr_del_client); 12 local ports, 64 remote services, data packets of up to 1024 bytes (was 480).
+      + 2026-11-12: the flow-control answer (resume_tx, qcom_qrtr_poll, the rx_confirms/resume_* fields): RESUME_TX from our port
+        to the sender's node:port naming our node and port, as net/qrtr has it (facts only), and an answer the link refused sent
+        again; the original answered from the control port naming the sender. The same change PianoWifi's WifiQrtr.c made (P21,
+        docs/drivers/wifi.md section 10.26), written into this file for the DSP's link.
   Derived:
     AdspProbe.cpp (eace137cc122c83551c971a0d6335d5c72fa7f1acc754d45221059be263f4e67) -> PianoAdsp.cpp. Kept: the bring-up order and
       every step (survey, SMP2P item, doorbells, AOSS load_state, cmd-db + lcx/lmx votes through RSC TCS 1, DTB then DSP image

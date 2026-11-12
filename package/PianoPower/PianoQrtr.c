@@ -272,7 +272,11 @@ static void linkReceive(void *context, const uint8_t *data, uint32_t length)
     if (!lock) return;
     IOLockLock(lock);
     const int had = notifier() >= 0;
+    const uint32_t confirms = gQrtr.rx_confirms;
     qcom_qrtr_receive(&gQrtr, data, length);
+    if (gQrtr.rx_confirms != confirms && (gQrtr.rx_confirms <= 4 || gQrtr.rx_confirms % 64 == 0))
+        IOLog("PianoPower: qrtr: flow control: the DSP asked for a confirmation (%u so far), %u answered from our port (RESUME_TX), "
+              "%s\n", gQrtr.rx_confirms, gQrtr.resumes_sent, gQrtr.resume_owed ? "one owed (the link refused it: again next pass)" : "none owed");
     if (gQrtr.hello_received && gStage == 2) {
         gStage = 3;
         IOLog("PianoPower: qrtr: the DSP said hello (node %u)\n", gQrtr.remote_node);
@@ -306,13 +310,16 @@ void piano_qrtr_start(void)
     gStage = gChannel ? 1 : 0;
 }
 
-/* On the DSP thread at every pass: the server changes a client's open asked for (PianoAdsp.cpp's service()). */
+/* On the DSP thread at every pass: the server changes a client's open asked for (PianoAdsp.cpp's service()), and a flow-control
+ * answer the link refused when it was due (qcom_qrtr_poll). */
 void piano_qrtr_poll(void)
 {
-    if (!__atomic_load_n(&gMatchDue, __ATOMIC_ACQUIRE)) return;
+    if (!__atomic_load_n(&gMatchDue, __ATOMIC_ACQUIRE) && !(gStarted && __atomic_load_n(&gQrtr.resume_owed, __ATOMIC_ACQUIRE))) return;
     IOLock *lock = routerLock();
     if (!lock) return;
     IOLockLock(lock);
+    if (gStarted && qcom_qrtr_poll(&gQrtr) > 0)
+        IOLog("PianoPower: qrtr: flow control: an owed confirmation sent (RESUME_TX, %u in all)\n", gQrtr.resumes_sent);
     deliverAndUnlock(lock);
 }
 

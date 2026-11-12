@@ -110,6 +110,38 @@ static void remote_server(QcomQrtr *q, const uint8_t *w, int add)
     q->remote_count++;
 }
 
+/* UniXNU-piano (2026-11-12, the change PianoWifi's WifiQrtr.c made for P21, docs/drivers/wifi.md section 10.26, ported to the DSP's
+ * link): the flow-control answer as the router protocol has it. A sender that sets confirm_rx counts the packets it has sent to one
+ * destination node:port and stops sending to it at its high-water mark (net/qrtr: ten packets, the confirmation asked for on the
+ * fifth) until a RESUME_TX names that destination. The payload's client node and port are therefore the receiver's own address
+ * (ours: the data packet's destination), and the packet goes from that port to the sender's node:port (net/qrtr's form). The
+ * original put the sender's own address in the payload and sent it from the control port, which resumes nothing: a DSP service that
+ * asks for confirmation would go quiet after its tenth packet to one of our ports (charger_pd's answers, the servreg notifier, a
+ * client port). An answer the link refuses is kept and sent again by qcom_qrtr_poll. */
+static int resume_tx(QcomQrtr *q, uint32_t node, uint32_t port, uint32_t our_port)
+{
+    uint8_t pkt[CTRL_BYTES] = {0};
+    put32(pkt, QCOM_QRTR_RESUME_TX);
+    put32(pkt + 4, q->local_node);
+    put32(pkt + 8, our_port);
+    if (!emit(q, QCOM_QRTR_RESUME_TX, our_port, node, port, pkt, sizeof pkt)) {
+        q->resumes_sent++;
+        q->resume_owed = 0;
+        return 0;
+    }
+    q->resume_owed = 1;
+    q->resume_node = node;
+    q->resume_port = port;
+    q->resume_from = our_port;
+    return -1;
+}
+
+int qcom_qrtr_poll(QcomQrtr *q)
+{
+    if (!q || !q->resume_owed) return 0;
+    return resume_tx(q, q->resume_node, q->resume_port, q->resume_from) ? -1 : 1;
+}
+
 int qcom_qrtr_receive(QcomQrtr *q, const uint8_t *packet, uint32_t length)
 {
     if (length < QCOM_QRTR_HEADER || le32(packet) != 1) {q->rx_bad++; return -1;}
@@ -124,9 +156,9 @@ int qcom_qrtr_receive(QcomQrtr *q, const uint8_t *packet, uint32_t length)
         while (i < q->local_count && q->local[i].port != dst_port) ++i;
         if (i < q->local_count) q->local[i].receive(q->local[i].context, q, dst_port, src_node, src_port, data, size);
         else q->rx_unrouted++;
-        if (confirm) {  /* the sender waits for this before it sends more to the port */
-            const uint32_t words[4] = {src_node, src_port, 0, 0};
-            if (!control(q, QCOM_QRTR_RESUME_TX, words)) q->resumes_sent++;
+        if (confirm) {  /* the sender waits for this before it sends more to the port (UniXNU-piano: resume_tx) */
+            q->rx_confirms++;
+            resume_tx(q, src_node, src_port, dst_port);
         }
         return 0;
     }

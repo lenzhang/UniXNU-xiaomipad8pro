@@ -41,6 +41,9 @@ struct QcomQrtr {
     uint32_t remote_count;
     /* counters for the log */
     uint32_t rx_packets, rx_data, rx_bad, rx_unrouted, tx_packets, tx_refused, resumes_sent;
+    /* UniXNU-piano (2026-11-12, PianoWifi's P21 change ported): data packets that asked for a flow-control answer, and an answer the
+     * link refused, kept for qcom_qrtr_poll (the sender's node and port, and our port the answer names) */
+    uint32_t rx_confirms, resume_owed, resume_node, resume_port, resume_from;
 };
 
 void qcom_qrtr_init(QcomQrtr *q, uint32_t local_node, QcomQrtrSend send, void *send_context);
@@ -62,6 +65,11 @@ int qcom_qrtr_receive(QcomQrtr *q, const uint8_t *packet, uint32_t length);
 int qcom_qrtr_send_data(QcomQrtr *q, uint32_t from_port, uint32_t node, uint32_t port, const uint8_t *data, uint32_t length);
 /* Index of a remote service in the list, -1 when not announced. */
 int qcom_qrtr_find_remote(const QcomQrtr *q, uint32_t service);
+/* UniXNU-piano (PianoWifi's P21 change ported): a flow-control answer (RESUME_TX) the link refused when it was due, sent again (the
+ * owner calls this on every turn). Returns 1 when one went out, 0 when none was owed, -1 when the link refused it again (it stays
+ * owed). qcom_qrtr_receive sends the answer for every data packet whose header asks for it: it names our port (the packet's
+ * destination) as the destination the sender resumes, and goes from that port to the sender's node:port. */
+int qcom_qrtr_poll(QcomQrtr *q);
 
 /* ---- QMI messages carried in data packets: a 7-byte header (type, transaction, message id, length) and TLVs ---- */
 #define QCOM_QMI_HEADER 7u

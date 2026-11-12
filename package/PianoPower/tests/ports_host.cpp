@@ -164,6 +164,74 @@ static void testRouterPorts()
     CHECK(qcom_qrtr_send_data(&q, PIANO_QRTR_FIRST_PORT, 5, 40, big, PIANO_QRTR_MAX_DATA + 1) == -1);
 }
 
+// The flow-control answer (PianoWifi's P21 change, ported): a data packet from the DSP's 5:0x4001 to our port 2 that asks for a
+// confirmation is answered by a RESUME_TX from our port 2 to 5:0x4001 naming our node 1 and port 2 (net/qrtr's form), not from the
+// control port naming the sender; a refused answer is owed and sent again by qcom_qrtr_poll; a sender that stops at its tenth
+// unconfirmed packet goes on.
+static bool refuseSends;
+static int captureOrRefuse(void *, const uint8_t *packet, uint32_t length)
+{
+    if (refuseSends) return -1;
+    sent.emplace_back(packet, packet + length);
+    return 0;
+}
+
+static void testFlowControl()
+{
+    QcomQrtr q;
+    qcom_qrtr_init(&q, 1, captureOrRefuse, nullptr);
+    CHECK(!qcom_qrtr_add_client(&q, 2, rx, nullptr));
+    const uint8_t d[16] = {1, 2, 3};
+    auto p = packet(QCOM_QRTR_DATA, 0x4001, 2, d, sizeof d);
+    put32(&p[16], 1);   // confirm_rx
+    sent.clear();
+    rxCount = 0;
+    CHECK(!qcom_qrtr_receive(&q, p.data(), uint32_t(p.size())) && rxCount == 1 && q.rx_confirms == 1 && q.resumes_sent == 1);
+    CHECK(sent.size() == 1 && sent[0].size() == 32 + 20);
+    const uint8_t *h = sent[0].data();
+    CHECK(le32(h + 4) == QCOM_QRTR_RESUME_TX && le32(h + 8) == 1 && le32(h + 12) == 2);       // from our node 1, our port 2
+    CHECK(le32(h + 24) == 5 && le32(h + 28) == 0x4001);                                       // to the sender's node:port
+    CHECK(le32(h + 32) == QCOM_QRTR_RESUME_TX && le32(h + 36) == 1 && le32(h + 40) == 2);     // naming our node and port
+    CHECK(le32(h + 12) != QCOM_QRTR_PORT_CTRL && le32(h + 36) != 5);                          // not the old form
+    // Without a confirmation asked: no answer.
+    put32(&p[16], 0);
+    sent.clear();
+    CHECK(!qcom_qrtr_receive(&q, p.data(), uint32_t(p.size())) && sent.empty() && q.rx_confirms == 1);
+    // A refused answer: owed, sent by the next poll (once), nothing owed after.
+    put32(&p[16], 1);
+    refuseSends = true;
+    CHECK(!qcom_qrtr_receive(&q, p.data(), uint32_t(p.size())) && q.resume_owed && q.resumes_sent == 1 && q.rx_confirms == 2);
+    CHECK(qcom_qrtr_poll(&q) == -1 && q.resume_owed);
+    refuseSends = false;
+    sent.clear();
+    CHECK(qcom_qrtr_poll(&q) == 1 && !q.resume_owed && q.resumes_sent == 2 && sent.size() == 1);
+    CHECK(le32(&sent[0][12]) == 2 && le32(&sent[0][28]) == 0x4001 && le32(&sent[0][40]) == 2);
+    CHECK(qcom_qrtr_poll(&q) == 0 && sent.size() == 1 && qcom_qrtr_poll(nullptr) == 0);
+    // A sender with net/qrtr's high-water mark (10 unconfirmed packets to one destination, a confirmation asked on the fifth) keeps
+    // going: 40 packets all delivered.
+    {
+        QcomQrtr r;
+        qcom_qrtr_init(&r, 1, captureOrRefuse, nullptr);
+        CHECK(!qcom_qrtr_add_client(&r, 2, rx, nullptr));
+        unsigned unconfirmed = 0, delivered = 0;
+        rxCount = 0;
+        for (unsigned i = 0; i < 40; ++i) {
+            if (unconfirmed >= 10) break;   // the sender waits for a RESUME_TX that names 1:2
+            auto m = packet(QCOM_QRTR_DATA, 0x4001, 2, d, sizeof d);
+            const bool ask = unconfirmed + 1 >= 5;
+            put32(&m[16], ask ? 1 : 0);
+            sent.clear();
+            CHECK(!qcom_qrtr_receive(&r, m.data(), uint32_t(m.size())));
+            unconfirmed++;
+            delivered++;
+            for (const auto &s : sent)
+                if (le32(&s[4]) == QCOM_QRTR_RESUME_TX && le32(&s[24]) == 5 && le32(&s[28]) == 0x4001 && le32(&s[36]) == 1 && le32(&s[40]) == 2)
+                    unconfirmed = 0;
+        }
+        CHECK(delivered == 40 && rxCount == 40);
+    }
+}
+
 static void testHealth()
 {
     CHECK(adsp_health_dsp_up(20, ADSP_SLAVE_READY | 4, 1, 1));
@@ -358,6 +426,7 @@ int main()
     testPorts();
     testServerEvents();
     testRouterPorts();
+    testFlowControl();
     testHealth();
     testQuiet();
     testConfigured();
