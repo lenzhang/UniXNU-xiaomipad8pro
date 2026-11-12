@@ -98,6 +98,15 @@ Turnip stage replaced (124.7 -> 101.1 MB). `build-ram-images.py` refuses an imag
 `96e5ef285001ea36d92605f965ed54592d96fe5428d9ab2e6ff97ada7891cace` (KC `20b08b86...`, seed `57a354da...`); build it with
 `DESK_COMPACT_SEED=1` added to the desk-dev command above.
 
+**First boot (2026-11-13 01:02, `ram-k273-desk-dev-s1b`, owner's run).** Confirmed on the tablet: NativeUfs takes the root from
+linux_data (`root-part=linux_data`, 2 windows published), the root waits on 84581E99 and mounts, every firmlink 0, Data volatile;
+over the root shell `sw_vers` 27.3 26C5035r and `hw.model` Mac17,11; WindowServer, loginwindow, SecurityAgent and MenuBarAgent are
+GPU clients. The panel stayed black but for the cursor: 27.3's WindowServer draws its framebuffers as '&BGA' (Apple's
+lossless-compressed BGRA spelling, one plane), which NativeGopDisplay refused (`a frame surface 3200x2136 format 0x26424741 row 3200
+... is not read`). Swaps did complete (the family's last-completed went 1 -> 814; the `swap_wait` lines are WindowServer's
+non-blocking polls, as on 27.0.1), so the ABI=2 offsets held. Fix: '&BGA' read as BGRA from its plane 0, which the Metal plugin
+renders linearly (`ram-k273-desk-dev-s1c`, sha256 `43a25f0c56d40178b6a9a9b96d904765904418f32692b2a564273701b83aa61b`).
+
 The large inputs live on the external SSD (`/Volumes/ExtSSD/k273/`: the IPSW members, `root/root.img`, `root/systemos.img`), with
 links at their `out/inputs/k273/` paths.
 
