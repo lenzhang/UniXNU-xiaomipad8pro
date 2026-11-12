@@ -13,6 +13,7 @@
 #include "ChargerPmic.h"
 #include "ChargerWdog.h"
 #include "ChargerEnable.h"
+#include "ChargerFix.h"
 #include "Gauge.h"
 #include "RtcReadout.h"
 #include <algorithm>
@@ -738,6 +739,468 @@ static void testChgEn()
     char tiny[12];
     CHECK(diffViews(a, b, tiny, sizeof tiny) == 7 && std::strlen(tiny) == sizeof tiny - 1);
     CHECK(diffViews(a, a, out, sizeof out) == 0 && out[0] == 0);
+  }
+}
+
+// ------------------------------------------------------------------- the complex's snapshot, the watch, the recovery (ChargerFix.h)
+// dev14's complex (ChgPmic) with the rest of the 2026-11-12 21:18 boot's bytes: USBIN 0x2900 rt 0x11 (plug-in), +0x40 0x00; MISC
+// 0x2c00 +0x44 0x00; DCDC 0x2700 ICL 0x1e. The charger model: charging (c3, +0x0c 0x0a) until `stopAt`, then DISABLED with its
+// enable command on; `cure` is the step that restarts it (the enable's edge, an AICL restart, a suspend lifted); `restopMs` after
+// a cure it stops again (0: never).
+struct FixPmic {
+  ChgPmic p;
+  int usbin = -1, dcdc = -1;
+  FixStep cure = FixStep::none;
+  uint64_t now = 0, stopAt = 40000, restopMs = 0, curedAt = 0;
+  bool suspended = false, everSuspended = false, refuseUsbin = false;
+  uint64_t suspendedSince = 0, longestSuspend = 0;
+  FixPmic() : p(0x05, 0x07, 0xc3)
+  {
+    for (size_t i = 0; i < p.a.apids.size(); ++i) {
+      if (p.a.apids[i].owner != 0) continue;
+      if (p.a.apids[i].ppid == uint16_t(7 << 8 | 0x29)) usbin = int(i);
+      if (p.a.apids[i].ppid == uint16_t(7 << 8 | 0x27)) dcdc = int(i);
+    }
+    charging(true);
+    U(p.chgr)[0x08] = 0x0a;
+    U(p.chgr)[0x09] = 0x03;
+    p.mirror();
+    U(usbin)[0x10] = 0x11;
+    U(usbin)[0x06] = 0x02;
+    U(usbin)[0x08] = 0x0f;
+    for (int k = 0x06; k <= 0x09; ++k) U(dcdc)[k] = 0x1e;
+    U(dcdc)[0x0a] = 0x01;
+    U(dcdc)[0x0b] = 0xe2;
+    U(p.misc)[0x08] = 0x02;
+    U(p.misc)[0x0d] = 0x05;
+  }
+  uint8_t *U(int apid) { return p.a.apids[size_t(apid)].regs; }
+  void charging(bool on)
+  {
+    uint8_t *c = U(p.chgr);
+    c[0x06] = on ? 0xc3 : 0x87;
+    c[0x07] = on ? 0x19 : 0x00;
+    c[0x0a] = on ? 0x00 : 0x05;
+    c[0x0c] = on ? 0x0a : 0x00;
+    c[0x0d] = on ? 0x28 : 0x38;
+    c[0x10] = on ? 0x22 : 0x20;
+    p.mirror();
+  }
+  bool isCharging() { return (U(p.chgr)[0x06] & 7) == 3; }
+  int packsMa() { return isCharging() ? (suspended ? 0 : 470) : 0; }
+  void advance(uint64_t t)
+  {
+    now = t;
+    if (stopAt && t >= stopAt) {
+      stopAt = 0;
+      charging(false);
+    }
+    if (restopMs && curedAt && t >= curedAt + restopMs) {
+      curedAt = 0;
+      charging(false);
+    }
+    if (suspended && t - suspendedSince > longestSuspend) longestSuspend = t - suspendedSince;
+  }
+  void cured()
+  {
+    charging(true);
+    curedAt = now;
+  }
+  static bool write(void *ctx, int apid, uint8_t r, uint8_t value, uint32_t *status)
+  {
+    FixPmic *f = static_cast<FixPmic *>(ctx);
+    f->p.writes.push_back({apid, r, value});
+    const bool refuse = f->refuseUsbin && apid == f->usbin;
+    if (status) *status = refuse ? (kStatusDone | 0x4) : kStatusDone;
+    if (refuse) return false;
+    uint8_t *reg = f->U(apid);
+    const uint8_t was = reg[r];
+    if (apid == f->p.chgr && r == kChgrEnableCmd) {
+      reg[r] = value;
+      if (!(value & kChgEnableBit)) f->charging(false);
+      else if (!(was & kChgEnableBit) && f->cure == FixStep::pulse) f->cured();
+      f->p.mirror();
+    } else if (apid == f->p.misc && r == kMiscAiclCmd) {
+      if ((value & kAiclRestart) && f->cure == FixStep::aicl) f->cured();   // a command bit: reads 0 again at once
+    } else if (apid == f->usbin && r == kUsbinCmdIl) {
+      reg[r] = value;
+      if (value & kUsbinSuspendBit) {
+        f->suspended = f->everSuspended = true;
+        f->suspendedSince = f->now;
+      } else if (f->suspended) {
+        f->suspended = false;
+        if (f->cure == FixStep::suspend) f->cured();
+      }
+    } else {
+      reg[r] = value;
+    }
+    return true;
+  }
+  SpmiWriter writer() { return SpmiWriter{this, write}; }
+  unsigned count(int apid, uint8_t r, int value = -1) const { return p.count(apid, r, value); }
+  bool onlyAllowedRegs() const
+  {
+    for (const ChgPmic::W &w : p.writes)
+      if (!((w.apid == p.chgr && w.reg == kChgrEnableCmd) || (w.apid == p.misc && w.reg == kMiscAiclCmd) ||
+            (w.apid == usbin && w.reg == kUsbinCmdIl)))
+        return false;
+    return true;
+  }
+};
+
+struct FixRig {
+  FixPmic &f;
+  Io io;
+  Arbiter arb;
+  ChargerLayout layout;
+  ChargerWdog w;
+  ChargerEnable e;
+  ChargerComplex cx;
+  ChargerFix fix;
+  ChargerWatch watch;
+  bool level1 = true;
+  std::vector<FixEvent> events;
+  std::vector<uint64_t> times;   // events[i] came at times[i]
+  std::vector<CxTransition> moves;
+  uint64_t clock = 0;
+  explicit FixRig(FixPmic &fp, FixMode mode, ChgEnMode chgen = ChgEnMode::restore)
+      : f(fp), io(fp.p.a.io()), arb(spmiArbiter(io)), layout(discoverCharger(io, arb))
+  {
+    w.mode = WdogMode::off;
+    w.locate(io, arb, layout);
+    e.mode = chgen;
+    e.locate(w);
+    cx.locate(io, arb, layout);
+    fix.mode = mode;
+    fix.locate(cx, e);
+    watch.extend(0, 180000);
+  }
+  void keep(const FixEvent &ev)
+  {
+    if (ev.kind == FixEvent::none) return;
+    events.push_back(ev);
+    times.push_back(clock);
+  }
+  // The thread from `from` to `to` in 500 ms steps, as PianoPower.cpp runs it: the model's clock, chgen's pulse restore, the watch's
+  // ticks (each one also a poll of the fix), the reports every 30 s (watchdog read, chgen check, a full snapshot to the watch, the
+  // fix's poll), the fix's own deadlines.
+  void run(uint64_t from, uint64_t to, const ChgEnInputs &in = dev14Inputs())
+  {
+    for (uint64_t t = from; t < to; t += 500) {
+      clock = t;
+      f.advance(t);
+      e.restoreIfDue(io, f.writer(), t);
+      CxTransition x;
+      const uint32_t ticks = watch.ticks;
+      if (watch.tick(io, cx, t, &x)) moves.push_back(x);
+      if (watch.ticks != ticks) keep(fix.poll(io, f.writer(), e, in, level1, f.packsMa(), t));
+      if (t % 30000 == 0) {
+        const WdogView v = w.check(io, SpmiWriter{}, t, nullptr, nullptr);
+        e.check(io, f.writer(), v, in, t);
+        if (watch.see(cx.read(io, true, t), &x)) moves.push_back(x);
+        keep(fix.poll(io, f.writer(), e, in, level1, f.packsMa(), t));
+      }
+      if (fix.nextDue() && t >= fix.nextDue()) keep(fix.poll(io, f.writer(), e, in, level1, f.packsMa(), t));
+    }
+  }
+  unsigned kinds(FixEvent::Kind k) const
+  {
+    unsigned n = 0;
+    for (const FixEvent &ev : events) n += ev.kind == k;
+    return n;
+  }
+  const FixEvent *last(FixEvent::Kind k) const
+  {
+    for (size_t i = events.size(); i-- > 0;)
+      if (events[i].kind == k) return &events[i];
+    return nullptr;
+  }
+};
+
+static void testChgFix()
+{
+  // The places and the snapshot: CHGR 0x2600 .. MISC 0x2c00 from Type-C 0x2b00, this processor's TYPE 0x02 blocks; the status part
+  // and the configuration part read; the diff and the status line.
+  {
+    FixPmic f;
+    FixRig r(f, FixMode::off);
+    CHECK(r.cx.located && r.cx.b[kCxChgr].address == 0x2600 && r.cx.b[kCxDcdc].address == 0x2700 && r.cx.b[kCxUsbin].address == 0x2900);
+    CHECK(r.cx.b[kCxTypec].address == 0x2b00 && r.cx.b[kCxMisc].address == 0x2c00 && r.cx.b[kCxChgr].ours() && r.cx.b[kCxMisc].ours());
+    CHECK(r.cx.b[kCxChgr].apid == f.p.chgr && r.cx.b[kCxUsbin].apid == f.usbin);
+    const CxSnapshot a = r.cx.read(r.io, true, 0);
+    uint8_t v = 0;
+    CHECK(a.chgrOk() && a.chgrState() == 3 && a.reg(kCxChgr, 0x42, &v) && v == 0x05 && a.reg(kCxUsbin, 0x10, &v) && v == 0x11);
+    CHECK(a.reg(kCxDcdc, 0x06, &v) && v == 0x1e && !a.reg(kCxChgr, 0x20, &v) && !a.reg(kCxChgr, 0xc0, &v));
+    const CxSnapshot s = r.cx.read(r.io, false, 0);
+    CHECK(!s.full && !s.reg(kCxChgr, 0x42, &v) && s.reg(kCxChgr, 0x06, &v));
+    f.charging(false);
+    f.U(f.p.misc)[0x06] = 0x40;
+    f.U(f.p.chgr)[0x61] = 0x14;
+    const CxSnapshot b = r.cx.read(r.io, true, 30000);
+    char out[400];
+    CHECK(cxDiff(a, b, out, sizeof out) == 8);
+    CHECK(std::strcmp(out, "CHGR +06 c3>87 +07 19>00 +0a 00>05 +0c 0a>00 +0d 28>38 +10 22>20 +61 00>14; MISC +06 00>40") == 0);
+    CHECK(cxDiff(s, b, out, sizeof out) == 7 && !std::strstr(out, "+61"));   // the configuration only when both are full
+    char tiny[24];
+    CHECK(cxDiff(a, b, tiny, sizeof tiny) == 8 && std::strlen(tiny) == sizeof tiny - 1 && std::strstr(tiny, "..."));
+    char line[400];
+    cxStatusText(b, line, sizeof line);
+    CHECK(std::strncmp(line, "CHGR 87 00 0a 03 05 be 00 38 00 00 rt 20 | DCDC 1e 1e 1e 1e 01 e2", 63) == 0 && std::strstr(line, "| MISC 40 00 02"));
+    CHECK(std::strstr(line, "| USBIN 02 00 0f 00 00 00 00 00 00 00 rt 11"));
+    CHECK(f.p.writes.empty() && f.p.a.writesOutsideCommands == 0);
+  }
+
+  // chgfix=0 (the default): the watch catches the stop between two 2 s ticks with the bytes that moved; nothing is written in 10
+  // minutes; the watch ends at 180 s.
+  {
+    FixPmic f;
+    f.stopAt = 41000;
+    FixRig r(f, FixMode::off);
+    r.run(0, 600000);
+    CHECK(f.p.writes.empty() && r.events.empty() && r.fix.attempts == 0 && r.fix.nextDue() == 0);
+    CHECK(r.moves.size() == 1 && r.moves[0].stop && r.moves[0].from == 3 && r.moves[0].to == 7);
+    CHECK(r.moves[0].fromMs == 40000 && r.moves[0].toMs == 42000 && r.watch.firstStopMs == 42000 && r.watch.stops == 1);
+    CHECK(std::strstr(r.moves[0].diff, "CHGR +06 c3>87 +07 19>00 +0a 00>05 +0c 0a>00 +0d 28>38 +10 22>20"));
+    CHECK(r.watch.ticks == 91 && r.watch.nextDue() == 0);
+  }
+
+  // chgfix=1 on a charger that an edge of the command restarts: step A 20 s after the stop (0x05 -> 0x04, 2 s, -> 0x05), judged 15 s
+  // later CHARGING again; A is the step from then on; nothing but +0x42 written.
+  {
+    FixPmic f;
+    f.cure = FixStep::pulse;
+    FixRig r(f, FixMode::light);
+    r.run(0, 600000);
+    const FixEvent *wrote = r.last(FixEvent::wrote);
+    CHECK(wrote && wrote->step == FixStep::pulse && wrote->ok && wrote->before == 0x05 && wrote->value == 0x04 && wrote->after == 0x04);
+    const FixEvent *judged = r.last(FixEvent::judged);
+    CHECK(judged && judged->step == FixStep::pulse && judged->charging && std::strcmp(judged->why, "CHARGING again") == 0);
+    CHECK(r.fix.winner == FixStep::pulse && r.fix.attempts == 1 && r.fix.successes == 1 && f.isCharging());
+    CHECK(f.count(f.p.chgr, kChgrEnableCmd, 0x04) == 1 && f.count(f.p.chgr, kChgrEnableCmd, 0x05) == 1 && f.onlyAllowedRegs());
+    CHECK(f.count(f.p.misc, kMiscAiclCmd) == 0 && f.count(f.usbin, kUsbinCmdIl) == 0);
+    CHECK(r.e.fixPulses == 1 && r.e.pulses == 0 && r.e.clearedByOthers == 0 && r.e.sets == 0);   // chgen saw none of it as another's
+    CHECK(std::strstr(r.fix.statusWhat, "WORKED") && r.fix.statusStep == FixStep::pulse);
+    // the timing: the stop at 40 s seen by the watch's tick at 40 s, A at 60 s, its restore at 62 s, the judge at 77 s; the watch
+    // (180 s) sees the restart too
+    CHECK(r.events.size() == 2 && r.times[0] == 60000 && r.times[1] == 77000);
+    CHECK(r.moves.size() == 2 && r.moves[1].from == 7 && r.moves[1].to == 3 && !r.moves[1].stop && r.moves[1].toMs == 62000);
+  }
+
+  // A charger that only an AICL restart restarts: A judged "no change", B 15 s later (MISC +0x44 = 0x02, reads 0x00 back), CHARGING.
+  {
+    FixPmic f;
+    f.cure = FixStep::aicl;
+    FixRig r(f, FixMode::light);
+    r.run(0, 600000);
+    CHECK(r.fix.winner == FixStep::aicl && r.fix.attempts == 2 && f.isCharging());
+    CHECK(f.count(f.p.misc, kMiscAiclCmd, kAiclRestart) == 1 && f.count(f.p.chgr, kChgrEnableCmd) == 2 && f.count(f.usbin, kUsbinCmdIl) == 0);
+    unsigned judged = 0;
+    for (const FixEvent &ev : r.events)
+      if (ev.kind == FixEvent::judged) {
+        CHECK(judged ? ev.charging : !ev.charging && std::strcmp(ev.why, "no change") == 0);
+        judged++;
+      }
+    CHECK(judged == 2);
+    const FixEvent *b = nullptr;
+    for (const FixEvent &ev : r.events)
+      if (ev.kind == FixEvent::wrote && ev.step == FixStep::aicl) b = &ev;
+    CHECK(b && b->ok && b->readBack && b->after == 0x00 && b->reg == kMiscAiclCmd && b->address == 0x2c00);
+  }
+
+  // chgfix=1 on a charger that neither restarts: A and B, then "no step brought charging back", nothing more in the boot; step C
+  // is never tried at =1.
+  {
+    FixPmic f;
+    f.cure = FixStep::suspend;
+    FixRig r(f, FixMode::light);
+    r.run(0, 1800000);
+    CHECK(r.fix.finished && r.fix.attempts == 2 && r.fix.winner == FixStep::none && !f.everSuspended);
+    CHECK(r.kinds(FixEvent::finished) == 1 && std::strstr(r.last(FixEvent::finished)->why, "no step"));
+    CHECK(f.count(f.usbin, kUsbinCmdIl) == 0 && f.p.writes.size() == 3 && f.onlyAllowedRegs() && r.fix.nextDue() == 0);
+  }
+
+  // chgfix=2 on a charger that a suspended input restarts: A, B, then C (USBIN +0x40 0x00 -> 0x01, about 1 s, -> 0x00), CHARGING.
+  {
+    FixPmic f;
+    f.cure = FixStep::suspend;
+    FixRig r(f, FixMode::suspend);
+    r.run(0, 600000);
+    CHECK(r.fix.winner == FixStep::suspend && r.fix.attempts == 3 && f.isCharging() && !f.suspended);
+    CHECK(f.count(f.usbin, kUsbinCmdIl, 0x01) == 1 && f.count(f.usbin, kUsbinCmdIl, 0x00) == 1 && f.longestSuspend <= 1500);
+    CHECK(f.U(f.usbin)[kUsbinCmdIl] == 0x00 && !r.fix.suspendOpen && f.onlyAllowedRegs());
+  }
+
+  // The lift refused by the channel: tried again every second until it goes through; the input never stays suspended past that.
+  {
+    FixPmic f;
+    f.cure = FixStep::suspend;
+    FixRig r(f, FixMode::suspend);
+    r.run(0, 121000);   // the stop at 40 s; A at 60 s (judged at 77 s), B at 92 s (judged at 107 s)
+    CHECK(r.fix.attempts == 2 && !f.everSuspended);
+    r.run(121000, 122500);   // C at 122 s
+    CHECK(r.fix.attempts == 3 && f.suspended && r.fix.suspendOpen);
+    f.refuseUsbin = true;
+    r.run(122500, 128000);   // the lift at 123 s refused, again at 124 .. 127 s
+    CHECK(f.suspended && r.fix.suspendOpen && r.fix.restoreTries >= 4 && r.fix.writeFailures >= 4);
+    f.refuseUsbin = false;
+    r.run(128000, 130000);
+    CHECK(!f.suspended && !r.fix.suspendOpen && f.U(f.usbin)[kUsbinCmdIl] == 0x00);
+    r.run(130000, 600000);
+    CHECK(r.fix.winner == FixStep::suspend && f.isCharging());
+  }
+
+  // A step that works once and the charger that stops again a minute later: the same step each time, two minutes apart at least,
+  // six attempts in all.
+  {
+    FixPmic f;
+    f.cure = FixStep::pulse;
+    f.restopMs = 60000;
+    FixRig r(f, FixMode::light);
+    r.run(0, 3600000);
+    CHECK(r.fix.attempts == kFixMaxAttempts && r.fix.finished && r.fix.winner == FixStep::pulse);
+    CHECK(f.count(f.p.chgr, kChgrEnableCmd, 0x04) == kFixMaxAttempts && f.count(f.p.misc, kMiscAiclCmd) == 0);
+    uint64_t prev = 0;
+    unsigned n = 0;
+    bool spaced = true;
+    for (size_t i = 0; i < r.events.size(); ++i)
+      if (r.events[i].kind == FixEvent::wrote) {
+        if (n) spaced = spaced && r.times[i] - prev >= kFixRepeatGapMs;
+        prev = r.times[i];
+        n++;
+      }
+    CHECK(n == kFixMaxAttempts && spaced && std::strstr(r.last(FixEvent::finished)->why, "six attempts"));
+    CHECK(r.fix.successes == kFixMaxAttempts - 1 || r.fix.successes == kFixMaxAttempts);
+  }
+
+  // The gates: each alone keeps every write out (the reason logged once), and the limits themselves let it through.
+  {
+    struct Case { const char *name; void (*pmic)(FixPmic &); void (*edit)(ChgEnInputs &); bool level1; const char *why; };
+    const Case cases[] = {
+        {"level 2", nullptr, nullptr, false, "level 2"},
+        {"no source", nullptr, [](ChgEnInputs &i) { i.sourcePresent = false; }, true, "no source"},
+        {"one pack", nullptr, [](ChgEnInputs &i) { i.packsOk = false; }, true, "both"},
+        {"full", nullptr, [](ChgEnInputs &i) { i.anyFull = true; }, true, "full"},
+        {"4350", nullptr, [](ChgEnInputs &i) { i.maxPackMv = 4350; }, true, "4350"},
+        {"hot", nullptr, [](ChgEnInputs &i) { i.maxDeciC = 451; }, true, "15-45"},
+        {"cold", nullptr, [](ChgEnInputs &i) { i.minDeciC = 149; }, true, "15-45"},
+        {"dsp", nullptr, [](ChgEnInputs &i) { i.dspOwns = true; }, true, "DSP"},
+        {"pin", [](FixPmic &f) { f.U(f.p.chgr)[kChgrCfg2] = 0x87; f.p.mirror(); }, nullptr, true, "bit 7 or 6"},
+    };
+    for (const Case &k : cases) {
+      FixPmic f;
+      f.cure = FixStep::pulse;
+      if (k.pmic) k.pmic(f);
+      FixRig r(f, FixMode::suspend);
+      r.level1 = k.level1;
+      ChgEnInputs in = dev14Inputs();
+      if (k.edit) k.edit(in);
+      r.run(0, 600000, in);
+      const bool ok = f.p.writes.empty() && r.fix.attempts == 0 && r.kinds(FixEvent::skipped) == 1 &&
+                      std::strstr(r.last(FixEvent::skipped)->why, k.why) != nullptr;
+      if (!ok) std::fprintf(stderr, "chgfix gate case %s: %zu writes, %u skips, why \"%s\"\n", k.name, f.p.writes.size(),
+                            r.kinds(FixEvent::skipped), r.last(FixEvent::skipped) ? r.last(FixEvent::skipped)->why : "");
+      CHECK(ok);
+    }
+    FixPmic f;
+    f.cure = FixStep::pulse;
+    FixRig r(f, FixMode::light);
+    ChgEnInputs in = dev14Inputs();
+    in.maxPackMv = 4349;
+    in.minDeciC = 150;
+    in.maxDeciC = 450;
+    in.maxSocPct = 99;
+    r.run(0, 600000, in);
+    CHECK(r.fix.winner == FixStep::pulse);
+  }
+
+  // The enable command off: ChargerEnable's set restores it (chgen=1); the fix writes nothing for that. With chgen=0 nobody does.
+  {
+    FixPmic f;
+    f.cure = FixStep::pulse;
+    f.stopAt = 0;
+    f.charging(false);
+    f.U(f.p.chgr)[kChgrEnableCmd] = 0x04;
+    f.p.mirror();
+    FixRig r(f, FixMode::light, ChgEnMode::off);
+    r.run(0, 600000);
+    CHECK(f.p.writes.empty() && std::strstr(r.last(FixEvent::skipped)->why, "reads off"));
+  }
+
+  // Step B's own gate: MISC +0x44 that does not read 0x00 is passed over for good (no MISC write); C follows at =2.
+  {
+    FixPmic f;
+    f.cure = FixStep::suspend;
+    f.U(f.p.misc)[kMiscAiclCmd] = 0x01;
+    FixRig r(f, FixMode::suspend);
+    r.run(0, 600000);
+    CHECK(f.count(f.p.misc, kMiscAiclCmd) == 0 && r.fix.winner == FixStep::suspend && r.fix.attempts == 2);
+    bool said = false;
+    for (const FixEvent &ev : r.events) said |= ev.kind == FixEvent::skipped && std::strstr(ev.why, "+0x44 does not read 0x00");
+    CHECK(said);
+  }
+  // Step C's own gate: USBIN's plug-in bit clear: passed over, no USBIN write.
+  {
+    FixPmic f;
+    f.cure = FixStep::suspend;
+    f.U(f.usbin)[0x10] = 0x01;
+    FixRig r(f, FixMode::suspend);
+    r.run(0, 600000);
+    CHECK(f.count(f.usbin, kUsbinCmdIl) == 0 && r.fix.finished && r.fix.attempts == 2);
+  }
+
+  // The start guard (a reset inside step C's second): USBIN +0x40 bit 0 found set is cleared at chgfix 1 with a source; left at
+  // chgfix 0 and without a source.
+  {
+    FixPmic f;
+    f.U(f.usbin)[kUsbinCmdIl] = 0x01;
+    f.suspended = true;
+    FixRig r(f, FixMode::light);
+    const FixEvent g = r.fix.startGuard(r.io, f.writer(), true);
+    CHECK(g.kind == FixEvent::guard && g.ok && g.before == 0x01 && g.value == 0x00 && g.after == 0x00 && f.U(f.usbin)[kUsbinCmdIl] == 0);
+    CHECK(f.p.writes.size() == 1 && r.fix.startGuard(r.io, f.writer(), true).kind == FixEvent::none);
+  }
+  {
+    FixPmic f;
+    f.U(f.usbin)[kUsbinCmdIl] = 0x01;
+    FixRig off(f, FixMode::off);
+    CHECK(off.fix.startGuard(off.io, f.writer(), true).kind == FixEvent::none);
+    FixRig r(f, FixMode::light);
+    const FixEvent g = r.fix.startGuard(r.io, f.writer(), false);
+    CHECK(g.kind == FixEvent::skipped && f.p.writes.empty() && f.U(f.usbin)[kUsbinCmdIl] == 0x01);
+  }
+
+  // The allowlist: nothing while no write is armed, whatever the register; no writer: refused, nothing sent.
+  {
+    FixPmic f;
+    FixRig r(f, FixMode::suspend);
+    CHECK(!r.fix.allowed(f.p.misc, kMiscAiclCmd, kAiclRestart, 0) && !r.fix.allowed(f.usbin, kUsbinCmdIl, 0x01, 0x00));
+    CHECK(!r.fix.allowed(f.usbin, kUsbinCmdIl, 0x00, 0x01) && !r.fix.allowed(f.p.chgr, kChgrEnableCmd, 0x04, 0x05));
+    FixRig n(f, FixMode::light);
+    n.f.cure = FixStep::aicl;
+    n.fix.mode = FixMode::light;
+    for (uint64_t t = 0; t < 600000; t += 500) {
+      f.advance(t);
+      n.e.restoreIfDue(n.io, SpmiWriter{}, t);
+      if (t % 2000 == 0) n.fix.poll(n.io, SpmiWriter{}, n.e, dev14Inputs(), true, 0, t);
+    }
+    CHECK(f.p.writes.empty() && n.fix.refused + n.e.refused >= 2);
+  }
+
+  // ChargerEnable's own pulses are not consumed by the fix's, and its check sees the fix's open pulse as ours.
+  {
+    FixPmic f;
+    f.stopAt = 0;
+    f.charging(false);
+    FixRig r(f, FixMode::light, ChgEnMode::pulse);
+    ChgEnWrite w;
+    CHECK(r.e.fixPulse(r.io, f.writer(), 0, &w) && w.ok && r.e.pulseOpen && r.e.fixOpen);
+    const WdogView v = r.w.check(r.io, SpmiWriter{}, 1000, nullptr, nullptr);
+    const ChgEnResult c = r.e.check(r.io, f.writer(), v, dev14Inputs(), 1000);
+    CHECK(!c.cmdCleared && !c.write.done && std::strstr(c.why, "pulse is open"));
+    CHECK(r.e.restoreIfDue(r.io, f.writer(), 2000, &w) && w.ok && std::strcmp(w.what, "chgfix pulse on") == 0);
+    CHECK(r.e.fixPulses == 1 && r.e.pulses == 0 && !r.e.fixOpen && !r.e.pulseOpen);
+    const ChgEnResult d = r.e.check(r.io, f.writer(), r.w.check(r.io, SpmiWriter{}, 30000, nullptr, nullptr), dev14Inputs(), 30000);
+    CHECK(!d.judged && !d.cmdSet && !d.cmdCleared);   // the fix judges its own
   }
 }
 
@@ -2429,6 +2892,7 @@ int main()
   testCharger();
   testWdog();
   testChgEn();
+  testChgFix();
   testGauge();
   testMcaCodec();
   testMcaPolicy();
