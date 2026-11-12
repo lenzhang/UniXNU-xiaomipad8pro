@@ -45,8 +45,10 @@ refuses (c3rp, c3r: the release now keeps such words, runs first, and the report
 | `CameraSmmuWindow.h` | portable: the translating window (PianoWifi's `WifiSmmuWindow.h`, copied) |
 | `CameraRpmh.h` | portable: one RPMh transaction on apps DRV-2 (PianoBluetooth's `BtRpmh.h`; commands with full addresses for the shared votes) |
 | `BitI2c.h` | portable: the software I2C master (PianoKeyboard's) |
+| `CameraPlan.h` | portable: `piano-camera-plan`, several test images' sequences on one boot (their arguments, the parser, the rule to go on) |
 | `tests/camera_host.cpp` | host tests against a board model (gates, CCI0 and bit-level sensors, PMIC/RPMh, timing; level 3: PLL0, the CAMSS blocks, the SMMU and its walk, memory, frames written by the model's write master; the tablet's SMMU rules and the teardown's order), failures at every step, the as-found check after every power-down, the tables' header |
 
 Build: `tooling/k27/build-native-piano-camera.sh` (the tables' check against `data/camera/MANIFEST`, their header into `out/`, the
-host tests, a store check of the survey headers, the objects, the import check). PianoCamera is in `configs/k27-native-kexts.txt`
+host tests, a store check of the survey headers, the objects, the camera thread's stack bound (`tooling/k27/check-kext-stack.py`, at
+most 6 KiB of the kext's own frames: the thread has XNU's 16 KiB; the sequence's objects live in static storage), the import check). PianoCamera is in `configs/k27-native-kexts.txt`
 after PianoA830 (its lock words) and inert without `piano-camera`. Sources and licences: `UPSTREAM`, `LICENSE` (BSD-2-Clause-Patent).
