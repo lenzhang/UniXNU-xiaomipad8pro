@@ -150,3 +150,35 @@ The piano boot DT (out/inputs/piano-boot.dtb, sha256 above): the bclk cell <q6pr
 Not read and not used for anything: any Qualcomm or FourSemi binary, the DSP firmware, the ACDB, the topology. The stock preset was
   only checked, on the owner's Mac, against its pinned size and SHA-256 and by this package's own parser (verdicts and counts
   printed, nothing of its contents); it is not in this repository, a build output or a test.
+
+Levels 8-10 and the preset's pin (2026-11-12, host-tested; nothing of it has run on hardware yet):
+
+New code, from facts: AudioLive.{h,c} (the macOS devices on the DSP: the shared rings and flags, the speaker and mic paths, one
+  command at a time over two sequencers, the drift controller, the master volume), AudioVa.{h,c} (the VA macro's DMIC path),
+  the capture pump and the level 10 capture plan in AudioSequence.c, the keep hand-over in AudioSession.c, the dsp transport in
+  AudioDsp.cpp, the VA and LPI stores in AudioBoard.cpp, tests/live_host.c and tests/va_host.c. The design of the period engine
+  (a ring between the device and the DSP, four periods in flight, answers copied on the DSP thread) follows UniXNU-sheng's
+  AudioProbe.cpp (recorded above) in design only.
+
+UniXNU-piano (this repository): the shared run-time firmware loader, package/common/PianoFirmware.cpp, PianoFirmwareCore.{h,c},
+  PianoFirmwareZlib.c and package/include/PianoFirmware.h, compiled in unchanged (as PianoVideo does), and
+  tooling/persist/firmware.py stage for the pin. The pin's two facts are the published ones recorded above
+  (xiaomipad-8pro-mainline firmware/piano-audio.json).
+
+Specifications only (GPL-2.0; register offsets, fields, values and order as facts, no code, comment or table copied), the same piano
+  tree as above: sound/soc/codecs/lpass-va-macro.c (sha256 above): the MCLK, FS counter and FS broadcast enables, the per-pair DMIC
+  clock registers and divider codes, the input muxes and each TX path's DMIC select, the TX path's rate field, the decimator's
+  power-up (clock, high-pass zero gate, the cut-off change request and its 1 ms waits, the 6 ms before the gain is written again),
+  the mute bit, the gain encoding, the power-down order; drivers/pinctrl/qcom/pinctrl-lpass-lpi.c
+  (b3a2cb72cad4575765e1fb023ee8aa8bf0c552d0a3577c178863c323d7f4da9c), pinctrl-lpass-lpi.h and pinctrl-sm8650-lpass-lpi.c (sha256
+  above): the CFG fields, the output value before the configuration, gpio6-9's dmic1/dmic2 functions (index 1); sound/soc/soc-dapm.c
+  (20409805608c88fe8282aeb8b1c9d1a87e582147a8554600c39fe30cd8e7ce29) and soc-pcm.c
+  (5ed35a0231e4c7d5009414c97d195b769478bb49b64f9a28d8c339b437cc63f2): the power-up order (supplies, muxes, then the ADC widgets: the
+  DMIC clocks after the decimators) and the unmute after it, the stop order.
+xiaomipad-8pro-mainline device/audio/ucm2/Qualcomm/sm8750/Xiaomi-Pad-8-Pro/HiFi.conf (BSD-3-Clause; sha256
+  f7c6fd2a15ee66a49742d3707e6f54d8a4e3cdab7ccf09fee77c76e9613009d4), facts only: DEC0 <- DMIC0 (side top, LPI gpio6/7), DEC1 <- DMIC2
+  (side bottom, gpio8/9), the decimators' gain 124 (+40 dB).
+The piano boot DT (sha256 above): the VA macro's qcom,dmic-sample-rate (2.4 MHz) and its fallback compatible, the LPI node's
+  fallback to sm8650's table, the dmic01/dmic23 pin states (4 mA, the clock pins driven).
+hackios-redmi-k90-annibale docs/analysis/2026-11-02-audio-and-volume.md (local research notes, facts only): on the iOS-family stacks
+  the system volume scales the samples in software when the device publishes none (audio.md 10.19).

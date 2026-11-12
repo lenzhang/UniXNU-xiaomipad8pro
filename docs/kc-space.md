@@ -286,14 +286,19 @@ Then the ESP (`build-esp.py`) and the RAM images (`build-native-image.sh` -> `bu
   `fFirmware.size` of a `PianoFirmware` loaded with `piano_fw_pianokeyboard_mcu_upgrade_pin` before the image check of step 5;
   release it when the update is done (it is only needed for an MCU update).
 
-### 7.5 PianoAudio: nothing to convert
+### 7.5 PianoAudio: the preset on the loader (done 2026-11-12)
 
-Nothing is embedded in it (9.7 KiB `__DATA_CONST` at 471197c: vtables and tables with pointers). Since then (main's levels 4-7) it
-reads its amplifier preset (4348 bytes, `EFI/UniXNU/piano-fs19xx.fsm`, staged by `build-esp.py --audio-preset`) from the ESP with
-its own reader, so a RAM boot reads the installed ESP's ([audio.md](drivers/audio.md) §10.3). Optional, for its owner: the preset
-as a pin of this loader (`firmware.py stage --kext PianoAudio ... fs19xx.fsm=4348:<its sha256>`, path
-`EFI/UniXNU/firmware/PianoAudio/fs19xx.fsm`) would put it into RAM images' addon too, and `build-esp.py` would place it from the pin
-without `--audio-preset`; its CRC16 and safety checks stay the driver's. Its `__DATA` holds an 8.9 KiB `__bss`: see §7.6.
+Nothing is embedded in it (9.7 KiB `__DATA_CONST` at 471197c: vtables and tables with pointers). Its amplifier preset is now a pin of
+this loader: `tooling/k27/build-native-piano-audio.sh` runs `firmware.py stage --kext PianoAudio ... fs19xx.fsm=4348:ab060b84...`
+(the published size and SHA-256, the facts `AudioSha256.c` already holds, so the pin is committed and not private), compiles the
+loader's three files in, and stages the owner's copy (`PIANO_AUDIO_PRESET`, `private/audio/fs19xx.fsm`, or the Ubuntu project's
+checkout next to this repository) in `out/firmware/PianoAudio/`. `AudioBoard.cpp` loads it with `piano_fw_load` (addon, then the
+ESP's `EFI/UniXNU/firmware/PianoAudio/fs19xx.fsm`) and falls back to its own reader of `build-esp.py --audio-preset`'s
+`EFI/UniXNU/piano-fs19xx.fsm` (the only path for a non-stock preset); the container and safety checks stay the driver's. So a RAM
+image built with `PIANO_FW_ADDON=1` carries it ([audio.md](drivers/audio.md) §10.3), and `build-esp.py` places it from the pin (an
+ESP build on a host without the copy then stops unless `--allow-missing-firmware`). Cost: the loader's code (about 9 KiB
+`__TEXT_EXEC`) and 136 bytes of `__TEXT` for the pin. Its `__DATA` holds an 8.9 KiB `__bss`: see §7.6 (levels 8-10's rings and
+state are allocated at run time, not static).
 
 ### 7.6 `__DATA`, the tight kind: the static buffers
 

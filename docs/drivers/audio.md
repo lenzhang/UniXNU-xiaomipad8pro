@@ -1,14 +1,17 @@
 # Audio: four FS19xx speakers on TDM, DMICs on the VA macro, through the ADSP's AudioReach: PianoAudio
 
-Status, 2026-11-11 (night): `package/PianoAudio` levels 1-7 are built, host-tested and linked into the native KC, each inert below
-its level and all of it inert without `piano-audio`; **nothing of it has run on hardware**. Level 1 is the read-only survey, level 2
-the DSP link (one readiness query through PianoPower's client contract, from a GPR port set chosen by boot argument), level 3 the
-macOS "Speaker" and "Mic" devices on a null transport (silence, no hardware). New tonight, on the host-tested pieces (§7.1): level 4
-the LPASS clocks through the DSP's resource manager (PRM), level 5 the four amplifiers (bit-banged bus, the owner's preset staged on
-the ESP, configured powered down and muted), level 6 the speaker graphs with a silent stream and the microphone graphs opened and
-closed (the TDM pins, the SMMU bypass of the DSP's PCM streams, the buffers in PianoDspMemory.h's audio slice), level 7 the tone walk
-(<= -20 dBFS, <= 3 s of tone, a 5 s watchdog) behind an explicit `piano-audio-tone=1`. The batched tablet test list: §8.8.
-Template: `README.md`.
+Status, 2026-11-12: `package/PianoAudio` levels 1-10 are built, host-tested and linked into the native KC, each inert below its
+level and all of it inert without `piano-audio`. **On the tablet** (11-12 queue): level 1's survey passed (audio1), level 3 published
+Speaker and Mic as IOAudio2Devices on the null transport (audio3), and level 2 reached `APM ready (status 1) after 1 queries from
+port 0x1 (set 0, Ubuntu), 22 ms after the first` with PianoPower's lines unchanged (au2, §8.8); levels 4-10 have not run yet. Level 1 is
+the read-only survey, level 2 the DSP link, level 3 the macOS devices on a null transport, level 4 the LPASS clocks through the DSP's
+resource manager (PRM), level 5 the four amplifiers (bit-banged bus, the owner's stock preset, configured powered down and muted),
+level 6 the speaker graphs with a silent stream and the microphone graphs opened and closed, level 7 the tone walk behind an explicit
+`piano-audio-tone=1`. New on 11-12 (§8.9): **level 8** the macOS Speaker on the DSP (the speaker plan comes up with the first sound and
+goes down after 3 s without one; gain 160 and full scale at -20 dBFS), **level 9** the daily level (gain up to 192, full scale up to
+-1 dBFS, the kernel's master volume and mute), **level 10** the Mic (the capture plan with the VA macro's DMIC path); and the preset is
+now a pin of the shared firmware loader, so a RAM image carries it in its addon and no ESP write is needed (§10.3). The batched
+tablet test list: §8.8; the images: `tooling/k27/build-audio-test-images.sh`. Template: `README.md`.
 
 ## 1. Purpose and gate
 
@@ -34,7 +37,7 @@ Sources: DT = `out/inputs/piano-boot.dtb` (Ubuntu's running DT); UBU = `xiaomipa
 | Amplifier bus | `i2c@980000`, the I2C hub's SE0 (`qcom,geni-i2c-master-hub`, wrapper `geniqup@9c0000`), 400 kHz, only these four devices; pins gpio64/gpio65 `i2chub0_se0` (their first function in the SoC's pin table), 2 mA, pull-up; the engine's clocks `se`/`core` (GCC) and `s-ahb` (the wrapper), interconnects `qup-core`/`qup-config` (RPMh votes) | DT, Linux pinctrl-sm8750 | verified (DT); state at hand-over: needs-boot (level 1); **decided: bit-banged** (§4) |
 | Amplifier lines | reset (active low): 0x34 gpio128, 0x35 gpio129, 0x36 gpio107, 0x37 gpio108 (107/108 are eGPIO-capable: muxing them to a TLMM function claims them, as Linux's msm pinctrl does); interrupt (level low): gpio66, 84, 81, 67; no supply in the DT; Ubuntu holds reset 10 ms, releases it, then polls DEVID every 5 ms for up to 100 ms (the first power-up after a cold boot answers late) | DT, Linux fs19xx.c / pinctrl-msm.c | verified (DT); levels: needs-boot (level 1) |
 | Amplifier identity | DEVID (reg 0x03) 0x2900 on all four; STATUS (0x00) bits BOVDS, PLLS, OTPDS, OVDS, UVDS, OCDS, CLKS, OTWDS, BOPS, BOLDS, INDS, VDDPS; gain 0.375 dB steps, 255 max | UBU | verified (source) |
-| Amplifier preset | `foursemi/piano/fs19xx.fsm`, 4348 bytes, from the stock **odm_a** partition: per-amplifier register tables (TDM slot registers 0x1a/0x1c, 0xbd/0xbe, scene masks), CRC16; the same file on every unit of the build, no per-unit calibration (the stock driver reports re25 0) | `firmware/piano-audio.json` | verified (metadata; the pinned size and SHA-256 and the parser checked locally against the Ubuntu install's copy: stock, four blocks of 36 common and 140 scene units); read at run time from the owner's copy staged on the ESP (§10.3), never committed |
+| Amplifier preset | `foursemi/piano/fs19xx.fsm`, 4348 bytes, from the stock **odm_a** partition: per-amplifier register tables (TDM slot registers 0x1a/0x1c, 0xbd/0xbe, scene masks), CRC16; the same file on every unit of the build, no per-unit calibration (the stock driver reports re25 0) | `firmware/piano-audio.json` | verified (metadata; the pinned size and SHA-256 and the parser checked locally against the Ubuntu install's copy: stock, four blocks of 36 common and 140 scene units); read at run time through the firmware loader's pin `PianoAudio/fs19xx.fsm` from a RAM image's addon or the ESP (§10.3), never committed |
 | Speaker link | LPAIF **secondary TDM** (`SECONDARY_TDM_RX_0` = q6apm-lpass-dais dai 40): 48 kHz, 4 x 32-bit slots, mask 0xf, bit clock 6.144 MHz from the SoC (internal sync), long sync, data delay 1; slot 0 TL, 1 TR, 2 BL, 3 BR; the DSP's TDM sink module 0x0700100E on LPAIF interface 1; bit clock = q6prm clock 0x25 (the DT's `bclk` of dai@28) | DT, UBU | verified (DT, source); the sync mode is UBU's one guess |
 | TDM pins | main TLMM gpio121 `i2s1_sck`, 122 `i2s1_data0`, 123 `i2s1_ws`, 124 `i2s1_data1`, 8 mA (the sound node's pinctrl); i2s1 is each pin's first function (mux value 1) | DT, Linux pinctrl-sm8750 | verified (DT, source); mux at hand-over: needs-boot (level 1) |
 | SoundWire / WSA / RX | WSA macro `0x6b00000` + SoundWire `0x6b10000`, WSA2 `0x6aa0000` + `0x6ab0000`, RX macro `0x6ac0000` + `0x6ad0000`, TX SoundWire `0x7630000`: all `disabled`. **No SoundWire and no WSA88xx on piano's speaker path** (Project-SunUEFI's early WSA884x guess was replaced by FS19xx on TDM) | DT, SUN | verified |
@@ -117,11 +120,36 @@ kernel classes (compiled against the same headers), so `tooling/k27/check-audio2
 relies on, in the KC base: IOAudio2Family is kept, defines both classes, and their `superClass` pointers are exactly
 `IOService::gMetaClass` and `IOUserClient::gMetaClass` (chained fixups of 26A434's `kc27.bin`). It passes.
 
+**Built (levels 8-10).** From `piano-audio=8` the devices are published on the **dsp transport** (`AudioDsp.cpp`, `AudioLive.h`)
+instead of the null one. The Speaker's engine thread keeps its own clock and hands each 5 ms period to `play()`, which only puts it
+into a stereo ring (4096 frames) while the speaker path runs, and otherwise notes whether it had sound. The live thread (PianoAudio's
+levels thread, after levels 4-6 passed and the session kept the hardware) brings the speaker plan up at the first period with sound,
+starts the amplifiers muted at the playing gain, unmutes them after four silent periods came back, then fills each 10 ms DSP period
+from the ring through the safety chain (L -> TL + BL, R -> TR + BR; the DC blocker; the master gain scaled so that full scale lands
+on the level's ceiling, which the clamp keeps as the last guard; the 20 ms fades). Four periods (40 ms) are queued at the DSP and the
+ring is held near 20 ms; the published output latency is 2880 frames (60 ms) on top of the engine's own. The device and the DSP run
+on two clocks (the host's and the TDM's): the ring's slow average is held where it settled, give or take 240 frames, by dropping or
+repeating single frames (none while the clocks agree: host-tested at 0 and +-200 ppm). When the device stops, plays only silence or
+is muted (level 9), the chain fades to silence, the amplifiers are muted once those periods played, and after `piano-audio-idle` ms
+(3000) without sound everything goes down: the amplifiers powered down (kept configured, out of reset), the plan undone, the DSP's
+clocks released; the next sound brings it up again (about 150 ms: the bring-up's start of a sound is lost). A device that only plays
+silence never brings anything up. The HAL's own volume works on the samples before they reach the kernel (VirtualAudio, as on
+the iOS-family stacks; to be confirmed by ear, §10.19); the kernel's master volume and mute (level 9) are the boot argument
+`piano-audio-volume=P` and the Speaker device's properties `piano-audio-volume` (0..100) / `piano-audio-mute` (a boolean), ramped
+by at most 1/32 a period. Level 10 does the same for the Mic: the capture plan (the VA clocks, the mic graphs, the VA macro's DMIC
+path between the prepares and the starts) while the device runs, the capture periods (DEC0 side top, DEC1 side bottom) mixed to
+mono into the Mic's ring, the first 100 ms dropped.
+
 ## 6. Boot args
 
 | Boot arg | Default | Effect |
 |---|---|---|
-| `piano-audio=N` | 0 (probe() declines, nothing mapped) | 1: the read-only survey; 2: also the DSP link (§8.2); 3: also the macOS devices on the null transport (§8.3); 4: also the LPASS clocks (§8.4); 5: also the amplifiers, powered down (§8.5; without the DSP link level 5 runs alone); 6: also the graphs with silence (§8.6); 7: also the tone walk, only with `piano-audio-tone=1` (§8.7); >= 8: not built, runs 1-7 |
+| `piano-audio=N` | 0 (probe() declines, nothing mapped) | 1: the read-only survey; 2: also the DSP link (§8.2); 3: also the macOS devices on the null transport (§8.3); 4: also the LPASS clocks (§8.4); 5: also the amplifiers, powered down (§8.5; without the DSP link level 5 runs alone); 6: also the graphs with silence (§8.6); 7: also the tone walk, only with `piano-audio-tone=1` (§8.7); 8: levels 4-6 (7 with the tone), then the macOS Speaker on the DSP for the rest of the boot, gain 160, full scale at -20 dBFS (§8.9); 9: also the daily level; 10: also the Mic; > 10: runs 1-10 |
+| `piano-audio-gain=G` | 160 | levels 8-10: the amplifiers' gain while playing; capped at 160 at level 8 and at the core's 192 (-23.6 dB, Ubuntu's UCM value) from level 9 |
+| `piano-audio-ceiling=DB` | 6 | level 9 and up: full scale lands DB dB below full scale (1..40; 1 = -1 dBFS, the highest); level 8 is fixed at -20 dBFS |
+| `piano-audio-volume=P` | 100 | level 9 and up: the kernel's master volume in percent (-0.5 dB a step, 0 silent); the Speaker device's `piano-audio-volume` / `piano-audio-mute` properties change it at run time |
+| `piano-audio-idle=MS` | 3000 | levels 8-10: no sound (or no running device) this long and the path goes down (at most 600000) |
+| `piano-audio-mic-gain=G` | 124 | level 10: the VA decimators' gain, Ubuntu's UCM control (0..124, 84 = 0 dB, 124 = +40 dB) |
 | `piano-audio-smmu=0` | 1 | skip the SMMU stream scan (global page only); level 6 then leaves the SMMU alone (stream 0x1001 must bypass already) |
 | `piano-audio-ports=N` | 0 | the GPR source ports (§10.10, `AudioDspLink.h`): 0 Ubuntu's (APM 1, PRM 2, data 0x10000000), 1 sheng's (APM and data 0x2001, PRM 2), 2 SunUEFI's (APM 3, PRM 7, data 0x10000000) |
 | `piano-audio-ports-try=1` | 0 | level 2's readiness query walks the other sets, each once, while nobody answers (10 unanswered queries a set); an answer of any kind keeps the set; every query is logged with its port |
@@ -145,38 +173,48 @@ relies on, in the KC base: IOAudio2Family is kept, defines both classes, and the
 The DSP link needs `piano-power=2` in the same boot (PianoPower starts the DSP; PianoAudio never starts or stops it): without it the
 level logs "the DSP does not run in this boot" and registers nothing. The macOS devices do not need the DSP, nor does level 5 (it
 then runs alone: `piano-audio=5 piano-audio-dsp=0`). Levels 4, 6 and 7 need level 2's "APM ready" in the same boot; level 6 needs
-level 4 passed, level 7 needs levels 5 and 6 passed.
+level 4 passed, level 7 needs levels 5 and 6 passed; levels 8-10 need levels 4, 5 and 6 passed in the same boot (and 7 not failed),
+otherwise the devices stay on the dsp transport in silence.
 
 ## 7. Build, kernel collection
 
-`tooling/k27/build-native-piano-audio.sh`: the ten host tests (below; the preset loader on an mtools FAT32 image, skipped without
-mtools), the copies checked against their originals (FatVolume, SmmuStream, BitI2c), the objects in `out/native-kexts/PianoAudio`
-(17), the import check (392 kernel imports, 5 library imports: `piano_adsp_channel`, `piano_adsp_send`, `piano_adsp_health` from
-PianoPower, `native_ufs_part_find`, `native_ufs_part_read` from NativeUfs; 0 unresolved) and `check-audio2-family.py` (§5).
+`tooling/k27/build-native-piano-audio.sh`: the twelve host tests (below; the preset loader on an mtools FAT32 image, skipped without
+mtools) and the shared firmware loader's (`run-firmware-tests.py`), the copies checked against their originals (FatVolume,
+SmmuStream, BitI2c), the preset's pin (`firmware.py stage`: `PianoAudio/fs19xx.fsm`, 4348 bytes, the published SHA-256, the same two
+facts as `AudioSha256.c`, which the script cross-checks; the owner's copy staged in the ignored `out/firmware/PianoAudio/` when it is
+on this Mac: `PIANO_AUDIO_PRESET`, else `private/audio/fs19xx.fsm`, else the Ubuntu project's checkout next to this repository),
+the objects in `out/native-kexts/PianoAudio` (23, with the shared loader's three files), the import check (407 kernel imports, 5
+library imports: `piano_adsp_channel`, `piano_adsp_send`, `piano_adsp_health` from PianoPower, `native_ufs_part_find`,
+`native_ufs_part_read` from NativeUfs; 0 unresolved) and `check-audio2-family.py` (§5).
 Descriptor `tooling/k27/kext/PianoAudio.json` (`com.unixnu.driver.PianoAudio`), which names `com.unixnu.driver.PianoPower` and
 `com.unixnu.driver.NativeUfs` among its libraries; listed in `configs/k27-native-kexts.txt` after both, so the KC resolves their
-functions by name; `tooling/k27/build-native-image.sh` links it into every native KC (inert). Measured 2026-11-11 (night):
-`PIANO_A830_METAL=0 tooling/k27/build-native-image.sh` links 21 native kexts, none from outside this repository
-(`check-native-kexts.py`: the self-test, the descriptors, the KC log), PianoAudio 1233 pointers; `verify-ram-images.py` PASS.
-`tooling/persist/build-esp.py --audio-preset FILE` stages the owner's preset (§10.3).
+functions by name; `tooling/k27/build-native-image.sh` links it into every native KC (inert). Measured 2026-11-12 with levels
+8-10 and the pin: `PIANO_A830_METAL=0 tooling/k27/build-native-image.sh` links 23 native kexts, none from outside this repository
+(`check-native-kexts.py`: the self-test, the descriptors, the KC log), PianoAudio 1343 pointers, the collection's pins
+`PianoAudio/fs19xx.fsm` and `PianoVideo/vpu35_4v.mbn`; `verify-ram-images.py` PASS; `build-audio-test-images.sh amp graphs`
+built both images with `firmware: 2 of 2 pinned file(s) in the addon` and verified them (PASS).
+`tooling/persist/build-esp.py` places the pinned preset at `EFI/UniXNU/firmware/PianoAudio/fs19xx.fsm` by itself (it stops when it
+is not staged, unless `--allow-missing-firmware`); `--audio-preset FILE` still stages a copy at the older path (§10.3).
 
-### 7.1 The code (host-tested; levels 1-7 run it on the tablet, level 8 and up wait for their level)
+### 7.1 The code (host-tested; levels 1-3 have run on the tablet, levels 4-10 wait for their runs)
 
 | Piece | Files | What it does | Host test (checks) |
 |---|---|---|---|
 | Level 1 survey | `AudioSurvey.h`, `AudioHw.h` | §8.1 | `audio_host.cpp` |
 | GPR codec | `PianoGpr.{h,c}` (sheng's) | the 24-byte header, decode with its bounds, basic results; the APM readiness probe (one query in flight, retries, give-up) | `gpr_host.c` (37) |
 | AudioReach packets | `PianoAudioReach.{h,c}` | GRAPH_OPEN of the four piano subgraphs (§3: device 0x4005 LOG 0x6050 -> MFC 0x6051 -> TDM 0x6052; stream 0x4001 WR_SH 0x6001 (out port 1) -> DEC -> CNV -> LOG 0x6004 -> 0x6050; mic 0x4008 codec DMA 0x6080 (VA, TX0) -> LOG 0x6081; capture 0x4003 LOG -> MFC -> CNV -> ENC -> RD_SH 0x6024); SET_CFG of the loggers (0x19ab/0x19af), the MFC (48 kHz, 32 bit, FL FR LS RS), the TDM sink (`PARAM_ID_TDM_INTF_CFG` 0x0800101B: LPAIF 0, interface 1, internal sync, data out, mask 0xf, 4 x 32, sync mode 1, delay 1; HW endpoint 48000/32/4; frame size factor 1), the decoder/converter, the WR_SH media format; PREPARE/START/STOP/CLOSE; MEM_MAP/UNMAP; WRITE/READ V2; PRM clock (SEC_TDM_IBIT 0x202 at 6.144 MHz) and votes; the DSP address (32-bit physical with the stream index above; XNU memory refused); the answer parser. Packet sizes 68-504 bytes (capture GRAPH_OPEN 504, stream 456, device 392): all within 512 | `audioreach_host.c` (276; GRAPH_START and the PRM clock request byte for byte) |
-| Sequencer | `AudioSequence.{h,c}` | §10.1's rule as code: one command at a time, each answer checked (port, domain, token, opcode, status, handle), the first error unwinds what was done (and a step that may have half run) last first, without the DSP only the local undos; piano's speaker plan (clock, device graph, stream graph, map, prepare x2, start x2, amplifiers on; stop = its exact reverse, amplifiers first while the bit clock runs); level 4's PRM plans (the bit clock alone; the macro vote, the dcodec vote, the VA mclk 0x30c at 19.2 MHz); the microphone plan (the VA clocks, the mic device and capture stream graphs, the capture map, prepare x2, start x2; level 6 runs it to the prepares); the period pump (N periods in flight, error statuses, unknown slots, late periods) | `sequence_host.c` (4241: an error, a timeout and an abort at every step of every plan against a DSP model; every packet from its port in all three port sets) |
+| Sequencer | `AudioSequence.{h,c}` | §10.1's rule as code: one command at a time, each answer checked (port, domain, token, opcode, status, handle), the first error unwinds what was done (and a step that may have half run) last first, without the DSP only the local undos; piano's speaker plan (clock, device graph, stream graph, map, prepare x2, start x2, amplifiers on; stop = its exact reverse, amplifiers first while the bit clock runs); level 4's PRM plans (the bit clock alone; the macro vote, the dcodec vote, the VA mclk 0x30c at 19.2 MHz); the microphone plan (the VA clocks, the mic device and capture stream graphs, the capture map, prepare x2, start x2; level 6 runs it to the prepares; level 10's has the VA macro's DMIC path as a local step between the prepares and the starts); the period pump (N periods in flight, error statuses, unknown slots, late periods) and its capture form (READs of empty slots, READ_DONE with the bytes filled, bounded by the slot) | `sequence_host.c` (4441: an error, a timeout and an abort at every step of every plan against a DSP model; every packet from its port in all three port sets; the capture pump; the DMIC step's order and its failure) |
 | DSP link | `AudioDspLink.{h,c}`, `AudioDsp.cpp` | the guard on PianoPower's health (§10.1), the receive inbox, level 2's exchange; the GPR port sets (Ubuntu's, sheng's, SunUEFI's) and the walk over them while nobody answers | `dsplink_host.c` (417) |
-| Levels 4-7 | `AudioSession.{h,c}` | one state machine over the pieces: level 4's two PRM plans (the VA registers loaded while the votes hold), level 5 in one go, level 6 (pins, SMMU, buffers zeroed, the speaker plan with the amplifiers down, a silent stream, the status of the amplifiers every 100 ms: any not powered down stops it; the microphone plan to its prepares, undone), level 7 (the speaker plan with the amplifiers started muted at gain <= 160, unmuted after four silent periods came back, the walk through the safety chain into the DSP's buffer, the stream guard: 5 s watchdog, the group check every 100 ms, a refused or late period, quiet); PianoPower's health every tick: the guard off = no DSP command any more, the amplifiers muted, powered down and held at once; quiet = nothing new sent, a running stream stopped; at the end the amplifiers held in reset and the TDM pins given back | `session_host.c` (17343: a DSP model that plays one buffer per 10 ms and an amplifier model with reset lines in simulated time; every command of every level in order for the three port sets; at every amplifier write and every buffer: no power-up outside level 7's running graphs, no unmute before four silent periods, no unmuted gain above 160, no sample above -20 dBFS, only zeros while muted, at most 3 s of tone, the amplifiers down before a speaker graph stops; a refusal or a missing answer at the bit clock, the VA mclk, the stream start, the capture open, level 7's starts; a fatal report, a new link or charger generation, quiet, an amplifier's status change, a late or refused period, the watchdog, the owner's stop soft and hard, during the walk and during the silence; a missing amplifier, a preset that is not the stock file, a hostile preset, a damaged one, SDA/SCL swapped, a full queue) |
-| Amplifier group | `AudioAmps.{h,c}` | the four in slot order: reset held 10 ms and released, probed; the preset's verdict (missing, too big, not the stock file unless `-preset-any`, a bad container); all four configured or none (the others held in reset again); start at min(gain, 160) muted, unmute, the group check against the first reading after the unmute, the way down (all four muted first, then each powered down), held in reset | `amps_host.c` (82) |
-| Preset source | `AudioPreset.{h,c}`, `FatVolume.{h,c}` (PianoPower's) | `EFI/UniXNU/piano-fs19xx.fsm` read whole from the ESP (at most 64 KiB) | `preset_host.c` (22, on an mtools FAT32 image as `build-esp.py` makes the ESP) |
+| Levels 4-7 | `AudioSession.{h,c}` | one state machine over the pieces: level 4's two PRM plans (the VA registers loaded while the votes hold), level 5 in one go, level 6 (pins, SMMU, buffers zeroed, the speaker plan with the amplifiers down, a silent stream, the status of the amplifiers every 100 ms: any not powered down stops it; the microphone plan to its prepares, undone), level 7 (the speaker plan with the amplifiers started muted at gain <= 160, unmuted after four silent periods came back, the walk through the safety chain into the DSP's buffer, the stream guard: 5 s watchdog, the group check every 100 ms, a refused or late period, quiet); PianoPower's health every tick: the guard off = no DSP command any more, the amplifiers muted, powered down and held at once; quiet = nothing new sent, a running stream stopped; at the end the amplifiers held in reset and the TDM pins given back | `session_host.c` (20123: a DSP model that plays one buffer per 10 ms and an amplifier model with reset lines in simulated time; every command of every level in order for the three port sets; at every amplifier write and every buffer: no power-up outside level 7's running graphs, no unmute before four silent periods, no unmuted gain above 160, no sample above -20 dBFS, only zeros while muted, at most 3 s of tone, the amplifiers down before a speaker graph stops; a refusal or a missing answer at the bit clock, the VA mclk, the stream start, the capture open, level 7's starts; a fatal report, a new link or charger generation, quiet, an amplifier's status change, a late or refused period, the watchdog, the owner's stop soft and hard, during the walk and during the silence; a missing amplifier, a preset that is not the stock file, a hostile preset, a damaged one, SDA/SCL swapped, a full queue; `keep`: the hardware left for levels 8-10 only after levels 4-6 passed) |
+| Amplifier group | `AudioAmps.{h,c}` | the four in slot order: reset held 10 ms and released, probed; the preset's verdict (missing, too big, not the stock file unless `-preset-any`, a bad container); all four configured or none (the others held in reset again); start at min(gain, 160) muted, unmute, the group check against the first reading after the unmute, the way down (all four muted first, then each powered down), held in reset; levels 8-10's start at a gain capped at 160 or 192 and the DACs muted while powered | `amps_host.c` (105) |
+| Preset source | `AudioBoard.cpp` `presetPinned`, `package/common/PianoFirmware*` (the shared loader), `AudioPreset.{h,c}`, `FatVolume.{h,c}` (PianoPower's) | the pin `PianoAudio/fs19xx.fsm` through `piano_fw_load`: the boot's addon, then the ESP's `EFI/UniXNU/firmware/PianoAudio/fs19xx.fsm` (size and SHA-256 checked by the loader); then `EFI/UniXNU/piano-fs19xx.fsm` read whole from the ESP (at most 64 KiB; the one path for a non-stock preset with `-preset-any`) | `preset_host.c` (22, on an mtools FAT32 image as `build-esp.py` makes the ESP); the loader's own tests |
+| Levels 8-10 | `AudioLive.{h,c}` | §5's built paragraph: the shared state of the devices' threads (two rings, the running flags, the sound flag that wakes the live thread once, the master volume); the speaker path (down, starting, running: priming, playing, fading, muting, quiet; stopping; off) and the mic path over two sequencers with one command in flight over both; the drift controller; the faults (a refused period or command, an amplifier status: off for the boot; late: down and back, the third time off; quiet: down and back; PianoPower's health: everything held, no command) | `live_host.c` (186279: the real session's levels 4-6 hand over, then the DSP model with its own playback and capture clocks, the amplifiers and both devices' engines: the plans in order for the three port sets, one command at a time over both plans, no unmuted gain above the level's cap, no sample above the level's ceiling, no slot changed while the DSP has it, no sound while an amplifier is muted, start at the first sound, down after silence, a stopped device or the mute, the hold, the drift at +-200 ppm, the master volume's ramp, a muted device waking the thread once, every fault, every speaker plan step refused and unanswered, the Mic with the DMIC path between the prepares and the starts, both paths at once, a full queue) |
+| VA macro DMIC path | `AudioVa.{h,c}` | level 10's register values: the LPI DMIC pins, the macro's clock, 48 kHz, DEC0 <- DMIC0, DEC1 <- DMIC2, the decimators' power-up (the high-pass zero gate, 150 Hz, ~9 ms each), the gain, the DMIC clocks at 2.4 MHz last, the unmute; off in reverse | `va_host.c` (53: a register model with the reset values: final values, order, waits, a macro that does not take its clock) |
 | Pins, SMMU, bus | `AudioPins.h`, `SmmuStream.h` (PianoDwc3's), `BitI2c.h` (PianoKeyboard's) | the TDM pins' i2s1 value, the reset lines' driven value (an eGPIO pin claimed), the bus lines' open-drain values, the LPASS loads of level 4; the bypass plan of the four PCM stream ids | `audio_host.cpp` (the values; the plan: free groups and banks, a bypassing entry kept, the DT's masked group refused without a write) |
 | Kext glue | `AudioBoard.{h,cpp}`, `AudioDsp.cpp`, `PianoAudio.cpp` | the stores of AudioPins.h's values to the TLMM, the bit-banged bus, the SMMU writes through SmmuStream.h, the audio slice mapped write-combined, the VA/LPI loads, the ESP read through NativeUfs; the levels loop on level 2's channel, inbox and guard (2 ms ticks while a stream runs), bounded (an owner's stop after 180 s plus the silence, without DSP commands 30 s later) | KC link + import check |
 | FS19xx | `Fs19xx.{h,c}`, `AudioSha256.{h,c}` | 8-bit register / 16-bit big-endian I/O through the owner's bus; probe (DEVID polled 100 ms, 0x29xx only); the `fs19xx.fsm` container (size, CRC16, per-address blocks, lists) without copying it; the units (whole, field, delay capped 100 ms, wait) through the safety filter (PWDN and the DAC mute kept, gain <= 192); configure (soft reset, coefficient, common table, music scene, shut down); start (48 kHz / 6.144 MHz only, the capped gain before the unmute, shut down again on a bus error); mute; shutdown (every write tried); status reads and the group check that stops a stream; the stock preset's published size and SHA-256 | `fs19xx_host.c` (287: a four-amplifier register model flags any write that powers up, unmutes or exceeds the cap outside start; a hostile synthetic preset) |
 | Safety chain | `AudioSafety.{h,c}` | stereo/mono -> FL FR LS RS; DC blocker (-3 dB near 38 Hz); gain <= 0 dB; fade-in from silence at every start, fade-out to silence; clamp at a ceiling <= -1 dBFS (compile time), -20 dBFS by default; the 1 kHz test tone (<= -20 dBFS, <= 3 s, 20 ms ramps); level 7's walk (the tone in one slot at a time in slot order, gaps of zeros; <= 3 s of tone, <= 4 s in all); the stream guard (DSP error, late period, amplifier status, quiet, 5 s watchdog); the PCM ring | `pcm_host.c` (no random full-scale input crosses any ceiling; the walk sample by sample) |
-| macOS devices | `PianoAudioDevice.cpp`, `AudioPcm.{h,c}` | §5 | KC link + `check-audio2-family.py` |
+| macOS devices | `PianoAudioDevice.cpp`, `AudioPcm.{h,c}`, the dsp transport in `AudioDsp.cpp` | §5 | KC link + `check-audio2-family.py` |
 
 ## 8. Bring-up ladder, test plan and effort
 
@@ -196,13 +234,13 @@ write to the hardware; the hardware levels moved up by one (old 3-6 are now 4-7,
 | 5 (built) amplifiers | the bit-banged bus on gpio64/65 (SDA/SCL swapped once if nobody answers), resets held 10 ms and released, `fs19xx_probe` x 4; the owner's preset from the ESP (§10.3: the stock file only, `fsm_find` x 4), `fs19xx_configure` x 4, status read, all four held in reset again at the end (§8.5); runs without the DSP too | DEVID 0x2900 x 4, the preset "the stock file", container ok, "0 changed by the safety filter" or a plausible count, PWDN (PWRCTRL bit 0) set on all four | done (host); 1-2 boots |
 | 6 (built) TDM link + graphs | TDM pins muxed (`sec-tdm-default-state`), the four PCM stream ids through bypass, the audio slice zeroed, the speaker plan with the amplifiers left down and 2 s of silence (their status every 100 ms), undone; the microphone plan to its prepares, undone; the pins given back (§8.6) | every command answers 0; the unwind answers 0 too; every period returned; the amplifiers' CLKS (and perhaps PLLS) bits appear while the device graph runs, PWDN stays set | done (host); 1-2 boots |
 | 7 (built) test tone | only with `piano-audio-tone=1`: the speaker plan with the amplifiers started muted at gain 160, unmuted after 4 silent periods came back; the walk (1 kHz at -20 dBFS, 600 ms in each slot TL, TR, BL, BR, 150 ms apart: 2.4 s of tone) through the chain and the pump; the guard (5 s watchdog, the group check every 100 ms, a refused or late period, quiet, PianoPower's health); zeros, the amplifiers down, the plan undone, held in reset (§8.7) | WRITE_DONE for every period, STATUS equal on all four, audible on each speaker in turn (someone listens: the slot order by ear), `level 7: passed`, PWDN after | done (host); 1-2 boots, attended |
-| 8 macOS device on the DSP | §5 B with the DSP transport: `audio_output_period` into the ring, the pump draining it, the plan on the transport's `running()` | `say` and `afplay` play | 1 week; 2-3 boots |
-| 9 volume/mute | HAL volume -> `audio_chain_set_gain` (<= 0 dB) at fixed amplifier gain <= 192; mute = fade-out, zeros, then PWDN after 1 s; the ceiling raised from -20 dBFS (at most -1 dBFS) | volume keys work; no click at start/stop; the caps hold at maximum | 3-5 days; 1-2 boots |
-| 10 microphones | PRM votes for the VA macro, LPI DMIC pins (DMIC0/DMIC2), VA macro DMIC clock divider 4, DEC0/DEC1, gain, high-pass; capture graphs (packets done: VA TX0 codec DMA, five-module stream); the first ~75 frames of a start transient dropped; the Mic device on the DSP transport | `tools/mic-capture-check.py` criteria (live, not clipped, >= -60 dBFS, non-flat) on a recording; Voice Memos | 1-2 weeks; 3-4 boots |
+| 8 (built) macOS device on the DSP | §5's built paragraph: the dsp transport's ring, the speaker plan at the first sound, the pump, the chain, down after silence; gain 160, full scale at -20 dBFS (§8.9) | `say` and `afplay` play from all four speakers, quietly; nothing after the sound ends; `live: speaker: ... down` 3 s later | done (host); 1-2 boots, attended |
+| 9 (built) volume/mute | the playing gain up to 192, full scale up to -1 dBFS (`piano-audio-gain`, `-ceiling`); the HAL's volume on the samples; the kernel's master volume and mute (`piano-audio-volume`, the Speaker's properties), ramped; mute = fade-out, the amplifiers muted, down after `-idle` | the volume slider and keys change the loudness (the HAL's); no click at start/stop; the caps hold at maximum | done (host); 1-2 boots, attended |
+| 10 (built) microphones | the capture plan: the VA votes and mclk, the mic graphs, the VA macro's DMIC path (LPI gpio6-9 to dmic1/dmic2, the macro's clock, DEC0 <- DMIC0, DEC1 <- DMIC2, the high-pass at 150 Hz, gain 124, DMIC clocks 2.4 MHz) between the prepares and the starts; the capture pump; the first 100 ms dropped; the Mic device on the dsp transport | `tools/mic-capture-check.py` criteria (live, not clipped, >= -60 dBFS, non-flat) on a recording; Voice Memos | done (host); 2-3 boots |
 | 11 USB-C / Bluetooth | wired: USB host mode + a USB audio class path (option A's family) or the analog switch if a codec exists; Bluetooth with its own page | later | - |
 
-Totals: levels 1-7 are built; about 3-5 weeks of agent work left (levels 8-10) and 12-20 owner boots to speakers, volume and
-microphones in macOS, six to eight of them the batch of §8.8.
+Totals: levels 1-10 are built and host-tested; 1-3 passed on the tablet. Left: the boots of §8.8 (two unattended, then the attended
+tone and desktop boots), the fixes they ask for, then USB-C / Bluetooth audio.
 
 ### 8.1 Level 1 test image
 
@@ -325,21 +363,17 @@ with `piano-audio-lpass-read=0` (the clocks alone).
 
 ### 8.5 Level 5: the amplifiers, powered down
 
-Once: the owner's own stock preset on the ESP (the file of the tablet's odm_a, as the Ubuntu install carries it at
-`/lib/firmware/foursemi/piano/fs19xx.fsm`, or a copy from the owner's backup; kept under the ignored `private/` or `out/`):
+The preset (§10.3) is the owner's own stock `fs19xx.fsm` (the file of the tablet's odm_a, as the Ubuntu install carries it at
+`/lib/firmware/foursemi/piano/fs19xx.fsm`). On this Mac a copy is in the Ubuntu project's checkout next to this repository
+(`xiaomipad-8pro-mainline/firmware/foursemi/piano/fs19xx.fsm`: 4348 bytes, the stock SHA-256), and
+`tooling/k27/build-native-piano-audio.sh` stages it by itself into the ignored `out/firmware/PianoAudio/fs19xx.fsm` for the kext's
+pin (`PIANO_AUDIO_PRESET=FILE` or `private/audio/fs19xx.fsm` name another copy; a file that is not the stock one stops the build).
+A RAM image built with `PIANO_FW_ADDON=1` then carries it in its addon (the loader takes it from there before the ESP), so no ESP
+write is needed; `tooling/k27/build-audio-test-images.sh` builds the images of §8.8 that way. Without any copy level 5 still probes,
+then fails with `preset: none: ...` and holds the four in reset. Level 5 needs no DSP, so its first run is without one:
 
 ```sh
-python3 tooling/persist/build-esp.py --profile daily --audio-preset private/audio/fs19xx.fsm   # plus the profile's usual options
-# -> the ESP image with EFI/UniXNU/piano-fs19xx.fsm; refused unless it is the stock file (4348 bytes, sha256 ab060b84...);
-#    written to the tablet by the maintenance session (persistent-boot.md), as the sensor pack is
-```
-
-A RAM-image boot reads it from the installed ESP. Without it level 5 still probes, then fails with `preset: none: no
-EFI/UniXNU/piano-fs19xx.fsm on the ESP (tooling/persist/build-esp.py --audio-preset)` and holds the four in reset. Level 5 needs no
-DSP, so its first run is without one:
-
-```sh
-PIANO_EXTRA_ARGS="piano-usb=2 piano-audio=5 piano-audio-dsp=0" PIANO_RESET_AFTER=300 tooling/k27/build-native-image.sh
+tooling/k27/build-audio-test-images.sh amp    # piano-audio=5 piano-audio-dsp=0, 300 s, the preset in the addon: out/ram-au-amp/
 ```
 
 Expected (the level 1 lines first; then):
@@ -348,7 +382,8 @@ Expected (the level 1 lines first; then):
 PianoAudio: level 2: the DSP link skipped (piano-audio-dsp=0)
 PianoAudio: stage 7: level 5 alone (no DSP link: levels 4, 6 and 7 need it)
 PianoAudio: bus: gpio64 CTL ........ IO ........, gpio65 CTL ........ IO ........ as found: software I2C, the pins given back after each burst
-PianoAudio: preset: EFI/UniXNU/piano-fs19xx.fsm: 4348 bytes, SHA-256 ab060b84..., the stock file
+PianoFirmware: EFI/UniXNU/firmware/PianoAudio/fs19xx.fsm: the boot's addon, 4348 bytes (addon: ok)     (the shared loader's own line)
+PianoAudio: preset: EFI/UniXNU/firmware/PianoAudio/fs19xx.fsm from the boot's addon: 4348 bytes, the stock file (the pin's SHA-256) (addon: ok)
 PianoAudio: levels 4-5: ports Ubuntu (...); no DSP link (level 5 only); preset the stock file only; tone off
 PianoAudio: level 5: the amplifiers: resets held 10 ms and released, each probed, configured from the preset, left powered down and muted
 PianoAudio: reset Top Left gpio129: CTL ........ IO ........ as found (held) -> CTL ........, driven          (4 lines, one per reset pin)
@@ -373,7 +408,7 @@ idle` word).
 ### 8.6 Level 6: the graphs with silence, the microphone graphs opened and closed
 
 ```sh
-PIANO_EXTRA_ARGS="piano-usb=2 piano-power=2 piano-power-write=0 piano-audio=6" PIANO_RESET_AFTER=600 tooling/k27/build-native-image.sh
+tooling/k27/build-audio-test-images.sh graphs   # piano-power=2 piano-power-write=0 piano-audio=6, 600 s, the preset in the addon
 ```
 
 Expected after levels 4 and 5 (as above, now on the DSP link):
@@ -421,8 +456,11 @@ Charged battery, cable attached, the tablet flat on a table, someone listening w
 `piano-audio-tone=1`:
 
 ```sh
-PIANO_EXTRA_ARGS="piano-usb=2 piano-power=2 piano-power-write=0 piano-audio=7 piano-audio-tone=1" PIANO_RESET_AFTER=600 tooling/k27/build-native-image.sh
+tooling/k27/build-audio-test-images.sh tone     # ... piano-audio=8 piano-audio-tone=1, 1800 s: the walk, then level 8 (§8.9)
 ```
+
+(`piano-audio=7 piano-audio-tone=1` stops after the walk; the `tone` image goes on into level 8, so the same attended boot also
+checks the desktop's sound.)
 
 Expected after levels 4-6:
 
@@ -446,28 +484,70 @@ TL, TR, BL, BR, none distorted, nothing after the last one (no click at the end 
 line names it (watchdog, DSP error, late period, amplifier status, quiet, or the guard's line before it) and the amplifiers were muted
 and powered down at that moment. Only one speaker: `piano-audio-tone-mask=1` (TL alone) and so on for a second run.
 
-### 8.8 The batched tablet test list (levels 1-7)
+### 8.8 The batched tablet test list (levels 1-10)
 
 One boot each, in this order; read each run's log before the next (`tooling/native/usb-console.py`, or `grep PianoAudio` in the run's
-`xnu-console.txt`), stop at the first failure and keep its log. RAM boots, cable attached, charged battery, owner present,
-`PIANO_RESET_AFTER` as the backstop; `verify-ram-images.py out/ram/build-A-bundled.json` PASS before each. Every image is
-`PIANO_EXTRA_ARGS="..." PIANO_RESET_AFTER=S tooling/k27/build-native-image.sh`.
+`xnu-console.txt`), stop at the first failure and keep its log. RAM boots, cable attached, charged battery, `PIANO_RESET_AFTER` as the
+backstop. Runs 1-3 were built as `PIANO_EXTRA_ARGS="..." PIANO_RESET_AFTER=S tooling/k27/build-native-image.sh`; from run 4 on
+`tooling/k27/build-audio-test-images.sh NAME` builds them (`out/ram-au-NAME/`, the preset in the image's addon, verified), from a KC
+of `PIANO_A830_METAL=0 tooling/k27/build-native-image.sh` (the build that also stages the preset). No ESP write is needed (the old
+run 0, `build-esp.py --audio-preset`, is not: the pin and the addon replace it).
 
-| # | Arguments (`PIANO_EXTRA_ARGS`) | S | Attended | What it shows | Pass (expected lines) |
-|---|---|---|---|---|---|
-| 0 | (once, before 4) `build-esp.py ... --audio-preset <the owner's fs19xx.fsm>`, the maintenance session writes the ESP | - | owner | the preset where level 5 reads it | `build-esp.py`: accepted (the stock file); the JSON record's `audio_preset.stock` true |
-| 1 | `piano-usb=2 piano-audio=1` | 300 | no | level 1 (§8.1): the hand-over state of the pins and SMMU | the survey lines; `verdict: ...` |
-| 2 | `piano-usb=2 piano-power=2 piano-power-write=0 piano-audio=3` | 600 | no | levels 2-3 (§8.2-8.3) | `dsp: APM ready (status 1) after N queries from port 0x1 (set 0, Ubuntu)`; `devices: Speaker and Mic as IOAudio2Devices ...` |
-| 2b | only if 2 gave `no answer within 300 s` with the channel up: `... piano-audio=2 piano-audio-ports-try=1` | 600 | no | which GPR port set the DSP serves (§10.10) | `nobody answered from port 0x1: GPR ports set 1 (sheng ...)` then `APM ready ... from port 0x2001 (set 1, sheng)` (or set 2, port 0x3); use that `piano-audio-ports=N` in every later run |
-| 3 | `piano-usb=2 piano-power=2 piano-power-write=0 piano-audio=4` | 600 | no | level 4 (§8.4): the clocks are granted and released | `level 4: passed`; the CORE_ID line with "a VA macro"; PianoPower's lines unchanged (no `fatal`, link generation 0) |
-| 4 | `piano-usb=2 piano-audio=5 piano-audio-dsp=0` | 300 | no | level 5 alone (§8.5): the bus, the four, the preset, no DSP | DEVID 0x2900 x 4; `level 5: passed`; `held in reset` |
-| 5 | `piano-usb=2 piano-power=2 piano-power-write=0 piano-audio=6` | 600 | no (nothing is powered up) | level 6 (§8.6): the graphs, the bypass, the slice, silence | `level 6: passed`; every period returned; CLKS in the amplifiers' STATUS |
-| 6 | `piano-usb=2 piano-power=2 piano-power-write=0 piano-audio=7 piano-audio-tone=1` | 600 | **yes: someone listens** | level 7 (§8.7): the walk | four tones TL, TR, BL, BR (by ear); `level 7: passed` |
+| # | Image / arguments | S | Attended | What it shows | Pass (expected lines) | Result |
+|---|---|---|---|---|---|---|
+| 1 | `piano-usb=2 piano-audio=1` | 300 | no | level 1 (§8.1): the hand-over state of the pins and SMMU | the survey lines; `verdict: ...` | **passed 11-12 (audio1)**: the four reset lines not driven by the SoC (read 0), the interrupts 1, the hub pins on GPIO without pulls (read 0), the TDM pins on GPIO, no SMMU entry for 0x1001/0x1041 |
+| 2 | `piano-usb=2 piano-power=2 piano-power-write=0 piano-audio=3` | 600 | no | levels 2-3 (§8.2-8.3) | `dsp: APM ready (status 1) after N queries from port 0x1 (set 0, Ubuntu)`; `devices: Speaker and Mic as IOAudio2Devices ...` | **passed 11-12 (au2)**: APM ready after 1 query from port 0x1, 22 ms; inbox dropped 0; PianoPower: 0 fatal, link generation 0, quiet raised for the charger and released; the devices published (also audio3 without the DSP) |
+| 2b | only if 2 gave `no answer within 300 s`: `... piano-audio=2 piano-audio-ports-try=1` | 600 | no | which GPR port set the DSP serves (§10.10) | `APM ready ... from port ...` | not needed: set 0 (Ubuntu's) answers |
+| 3 | `piano-usb=2 piano-power=2 piano-power-write=0 piano-audio=4` | 600 | no | level 4 (§8.4): the clocks are granted and released | `level 4: passed`; the CORE_ID line with "a VA macro"; PianoPower's lines unchanged | queued (au3) |
+| 4 | `amp`: `piano-audio=5 piano-audio-dsp=0` | 300 | no | level 5 alone (§8.5): the bus, the four, the preset from the addon, no DSP | `preset: ... from the boot's addon ... the stock file`; DEVID 0x2900 x 4; `level 5: passed`; `held in reset` | |
+| 5 | `graphs`: `piano-power=2 piano-power-write=0 piano-audio=6` | 600 | no (nothing is powered up) | levels 4-6 (§8.4-8.6): the clocks, the amplifiers configured, the graphs, the bypass, the slice, silence, the mic graphs | `level 6: passed`; every period returned; CLKS in the amplifiers' STATUS | |
+| 6 | `tone`: `... piano-audio=8 piano-audio-tone=1` (and the desktop drivers) | 1800 | **yes: someone listens** | level 7 (§8.7): the walk; then level 8 (§8.9) in the desktop | four tones TL, TR, BL, BR (by ear); `level 7: passed`; then `say hello` heard quietly from all four; `live: speaker: ... down` 3 s after | |
+| 7 | `desktop`: `... piano-audio=9 piano-audio-gain=176 piano-audio-ceiling=6` | 3600 | yes, first time | level 9 (§8.9): the daily level, the HAL's volume | music at a normal level; the volume slider and keys change it; no click at start or stop | |
+| 8 | `mic`: as 7 with `piano-audio=10` | 3600 | yes | level 10 (§8.9): the Mic | a Voice Memos recording of speech plays back; `tools/mic-capture-check.py` on a recording | |
 
-Add `piano-audio-ports=N` from run 2b on when it chose a set, `piano-audio-i2c-swap=1` from run 4 on when level 5 swapped the lines.
-Keep the other DSP clients and SMMU users out of these boots (no `piano-sensors>=2`, no `piano-wifi>=3`: §10.13). Six to eight
-boots in all. Afterwards, with `piano-power-write=1` (PianoPower's normal writes) once, run 5 again: the graphs with the
-charger configured as in daily use. Levels 8-10 (the macOS devices on the DSP, volume, the microphones) follow on these results.
+Add `AU_PORTS=N` (`piano-audio-ports=N`) when run 2b chose a set and `AU_SWAP=1` (`piano-audio-i2c-swap=1`) when level 5 swapped the
+lines. The builder keeps the other DSP clients and SMMU users out of these boots (no `piano-sensors>=2`, no `piano-wifi>=3`: §10.13).
+Afterwards, with `piano-power-write=1` (PianoPower's normal writes) once, run 5 again: the graphs with the charger configured as in
+daily use; and run 7 for an hour unattended with a playlist (the clocks' slips, the amplifiers' group check over time).
+
+### 8.9 Levels 8-10: the macOS devices on the DSP
+
+Expected after levels 4-6 (and 7) passed, with `piano-audio=8` (the devices thread has published them on the dsp transport):
+
+```
+PianoAudio: levels 8-8: the Speaker on the DSP for the rest of the boot (SOUND from the speakers once levels 4-6 passed); the dsp transport
+PianoAudio: devices: Speaker and Mic as IOAudio2Devices on the dsp transport (the speakers once levels 4-6 passed and the speaker plan runs; silence until then)
+PianoAudio: the amplifiers stay configured, muted and powered down, the TDM pins muxed: levels 8 and up take them over
+PianoAudio: levels 8-8: the macOS devices on the DSP (the hardware of levels 5 and 6 kept)
+PianoAudio: live: level 8: the Speaker on the DSP: playing gain 160 (-35.6 dB, cap 160), ceiling 3276 (max 3276), master volume off (level 9); down after 3000 ms without sound; ports Ubuntu
+                (nothing more until something plays: a device that runs with silence brings nothing up)
+PianoAudio: live: speaker: sound from the Speaker device: the speaker plan (start 1)
+PianoAudio: live: dsp: -> tdm bit clock 6.144 MHz (PRM REQUEST, 76 bytes, token 0x8000, from port 0x2)   ... <- done   (the 14 commands of §8.6)
+PianoAudio: live: amplifiers on: all four powered up MUTED, gain 160 (-35.6 dB)
+PianoAudio: live: speaker: stream up: 10 ms periods, 4 in flight, the ring's target 960 frames; ceiling 3276, gain 160; 4 silent periods first, the amplifiers muted
+PianoAudio: live: speaker: 4 periods returned: the amplifiers unmuted, the sound fades in
+                (heard: the sound, quietly, from all four speakers; left on TL + BL, right on TR + BR)
+PianoAudio: live: speaker: silence: faded to silence, the amplifiers muted; down after 3000 ms more without sound
+PianoAudio: live: speaker: no sound for 3000 ms: down after N ms (N periods, N with sound, 0 underruns, 0 skips, 0 frames dropped, 0 repeated; peak P of ceiling 3276): the plan undone, the amplifiers first
+PianoAudio: live: amplifiers off: all four muted and powered down
+PianoAudio: live: dsp: -> undo: start stream (GRAPH_STOP ...) ... (the six undo commands)
+PianoAudio: live: speaker: down
+```
+
+`ioreg -l | grep piano-audio-live` shows the paths' states and counters (updated when a state changes); `piano_audio_live_word`
+(post-mortem) the speaker's state | the mic's << 4 | the speaker's mode << 8 | its starts << 16. Read from a failure: `live: speaker:
+the plan failed at <step> (status ...)` (a DSP refusal at bring-up: the same suspects as level 6, which passed in the same boot, so
+first a state level 6 left behind), `STOPPED: late period` (the live thread did not refill in 250 ms: it comes back with the next
+sound; three times and the path is off), `STOPPED: DSP error` / `amplifier status` (off for the boot: the lines before it name the
+period's status or the flagged amplifier's STATUS), `underruns` growing while sound plays (the device's engine fell behind: the
+`piano_audio_dev_late` count), `frames dropped` / `repeated` growing by more than a few a minute (the two clocks disagree more than
+§10.18 assumes). Level 9 adds `piano-audio-gain` (up to 192) and `piano-audio-ceiling` (full scale at -DB dBFS, at most -1 dBFS):
+the first daily image uses 176 and 6 dB (about 15 dB under Ubuntu's UCM level); the HAL's volume works on top. The kernel's master
+volume and mute can be set from a root shell on the tablet through the Speaker device's properties (`piano-audio-volume`,
+`piano-audio-mute`; IORegistryEntrySetCFProperties on the IOAudio2Device whose `device UID` is Speaker). Level 10's Mic logs
+`live: mic: the Mic device runs: the capture plan`, the DMIC path's register line (`mic: LPI gpio6-9 to dmic1/dmic2 (CFG 00000244
+00000044 00000244 00000044 ...); VA macro: TX0 CTL 00000024 CFG0 000000d0 VOL 00000028 ... DMIC CTL 00000005 00000005, gain 124
+(+40 dB)`), `live: mic: capture up`, and at the device's stop `live: mic: the Mic device stopped: down after N ms`.
 
 ## 9. Fallback
 
@@ -508,14 +588,18 @@ Ubuntu (reboot), or later AirPlay/Bluetooth from macOS.
 3. **The amplifier preset.** `fs19xx.fsm` (TDM slot registers, per-speaker tables) is the stock file of odm_a: read at run time
    from the owner's own tablet, never committed, never disassembled. The parser (`fsm_check`/`fsm_find`) and the identity check
    (`audio_preset_is_stock`: 4348 bytes and the SHA-256 Ubuntu publishes for OS3.0.303.0.WPYCNXM) are done; a file that is not the
-   stock one is refused unless the owner overrides it (`piano-audio-preset-any=1`). **Decided: the ESP.** odm_a is a logical partition
-   in `super` (LP metadata) holding an Android EROFS image whose files may be LZ4-compressed: a reader for it is a new filesystem in
-   the kernel for one 4348-byte file. Instead `build-esp.py --audio-preset FILE` puts the owner's own copy (the Ubuntu install's, or
-   one from the owner's backup; checked there for the container, the size and the SHA-256) at `EFI/UniXNU/piano-fs19xx.fsm`, and level
-   5 reads it through NativeUfs and a copy of PianoPower's FatVolume (`AudioPreset.h`), as PianoSensors reads its pack. Never committed,
-   never in a published image; an odm_a reader (video, audio and sensors alike) can replace the staged copy later. The RAM-image
-   carrier the sensors gained the same night (DarwinBoot's addon slot, `sensors.md` §5b, `SensorsAddon.h`) could carry the preset
-   as a second entry, so that a RAM test needs no ESP write: a later change (one owner of the slot's container first). (level 5)
+   stock one is refused unless the owner overrides it (`piano-audio-preset-any=1`). odm_a is a logical partition in `super` (LP
+   metadata) holding an Android EROFS image whose files may be LZ4-compressed: a reader for it is a new filesystem in the kernel for
+   one 4348-byte file, so the file is staged instead. **Decided 11-12: a pin of the shared firmware loader** (`kc-space.md` §6):
+   the kext carries `PianoAudio/fs19xx.fsm` (4348 bytes, the published SHA-256: facts already in this repository, so the pin is
+   committed, not private), `build-native-piano-audio.sh` stages the owner's copy into the ignored `out/firmware/PianoAudio/`
+   (on this Mac it finds it in the Ubuntu project's checkout next to this repository, `xiaomipad-8pro-mainline/firmware/foursemi/
+   piano/fs19xx.fsm`, which matches the stock size and hash; also `private/audio/fs19xx.fsm` or `PIANO_AUDIO_PRESET=FILE`), RAM images
+   built with `PIANO_FW_ADDON=1` carry it in their addon (the fw-T0 run of 11-12 booted with the addon) and `build-esp.py` places it at
+   `EFI/UniXNU/firmware/PianoAudio/fs19xx.fsm`; the loader checks the size and the hash before PianoAudio sees a byte, and
+   `audio_preset_check` its container and identity again. The older ESP copy (`build-esp.py --audio-preset FILE`,
+   `EFI/UniXNU/piano-fs19xx.fsm`) stays as the second source and the only one for a non-stock preset. Never committed, never in a
+   published image: RAM images that carry it are local, like every image with firmware in its addon. (level 5)
 4. **A DSP-addressable buffer.** The DSP takes 32-bit addresses with the stream index above (`ar_dsp_address`; the plan refuses
    anything else); XNU's memory is above 4 GiB on piano. **Decided**: PianoDspMemory.h's audio slice (0x9da00000 + 16 MiB, the CDSP
    carveout's, `sensors.md` §5), of which the first 128 KiB are mapped write-combined at level 6 (speaker periods at +0, capture at
@@ -563,13 +647,37 @@ Ubuntu (reboot), or later AirPlay/Bluetooth from macOS.
    the audio thread before the graphs stop. Every period queued meanwhile is zeros (the buffer is zeroed at a stop for trouble).
 17. **The tone level.** -20 dBFS at gain 160 (-35.6 dB) is Ubuntu's unattended limit; nothing here can make it louder (the walk's
    peak, the chain's ceiling and the gain cap are compile-time limits). Heat: 2.4 s of tone, once per boot. (level 7)
+18. **Two clocks.** The macOS devices run on the host clock (mach time, 24 MHz), the DSP on the TDM's (6.144 MHz from LPASS). Both
+   probably derive from the same crystal, so their ratio may be exact; if not, the ring's slow average moves and single frames slip
+   (dropped or repeated, at most one a period, counted in `live: speaker: ... N frames dropped, N repeated`). 200 ppm costs about 10
+   slips a second after a first 25 s; a device whose clock follows the DSP's (the engine paced by WRITE_DONE) would need none, at
+   the cost of a HAL timeline with jitter. (levels 8, 10)
+19. **The HAL's volume.** The devices publish no volume control (the VM-era device did not either): VirtualAudio is expected to
+   scale the samples itself for the built-in speaker route, as the iOS-family stacks do (K90 research notes), so the volume slider
+   and keys work above the kernel. If the attended run shows a greyed slider instead, the next step is the IOAudio2 "controls"
+   dictionary (its keys read off the HAL as the device keys were, §5) with SetControlValue (selector 2) driving the master volume
+   that `piano-audio-volume` sets today. (level 9)
+20. **The first sound after silence.** The speaker plan comes up at the first period with sound (14 commands, the amplifiers' start
+   over the bit-banged bus, four silent periods): about 150 ms of that sound are not heard; sounds within `piano-audio-idle` of the
+   last keep the path up and lose nothing. A longer idle (`piano-audio-idle=30000`) trades that for the amplifiers and the DSP's
+   graphs running 30 s after every sound (battery). (level 8)
+21. **The VA macro's registers** (level 10) are facts read off Linux's VA macro and LPI pin drivers (offsets, fields, the power-up
+   order with its waits); the DT's LPI node falls back to sm8650's pin table, whose DMIC functions are index 1 on gpio6-9. Not checked
+   on hardware: the first level 10 run logs the registers as written and read back; a capture of zeros with every READ_DONE in time
+   points at the macro (clock, mux, DMIC clock), one of noise only at the DMIC pins. An access while the DSP's votes are released
+   could stall the bus: the DMIC path is set and undone only inside the capture plan, between the votes' request and release, and
+   never after PianoPower's health went off. (level 10)
+22. **A hard stop of levels 8-10** (the owner's stop without DSP commands) leaves the DSP's clocks and votes as they were (only the
+   local undos run: the amplifiers held in reset, the DMIC path off). Not reached in normal use (the live paths run until the DSP's
+   health stops them, and then the DSP is gone anyway). (levels 8-10)
 
 ## 11. Licence note
 
 This repository's packages are BSD-2-Clause-Patent. Linux (q6apm, audioreach, gpr, q6prm and q6prm-clocks, q6dsp-lpass-clocks,
 q6apm-lpass-dais, lpass-va-macro, the FS19xx driver, the piano machine driver sc8280xp.c, pinctrl-sm8750, pinctrl-msm, the LPASS
-LPI pinctrl) and Project-SunUEFI's kernel patches are GPL-2.0: specification only (behaviour, IDs and register positions
-as facts); no code, comment or table is copied. hackios-xnu-kernel-k90 is APSL-2.0: facts only. UniXNU-sheng and
+LPI pinctrl and its sm8650 table, ASoC's power sequence order) and Project-SunUEFI's kernel patches are GPL-2.0: specification only
+(behaviour, IDs and register positions as facts; `AudioVa.c`'s offsets, fields, values and order are such facts, written fresh);
+no code, comment or table is copied. hackios-xnu-kernel-k90 is APSL-2.0: facts only. UniXNU-sheng and
 the VM-era audio kext are BSD-2-Clause-Patent and are reused with `UPSTREAM` records; AudioReach's topology macros and
 engine headers (BSD-3-Clause / BSD-3-Clause-Clear) supply IDs and layouts with attribution. No Qualcomm or FourSemi binary is
 reverse engineered. The DSP firmware, the amplifier preset and any topology or ACDB file are data read at run time from the
