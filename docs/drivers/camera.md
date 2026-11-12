@@ -305,7 +305,7 @@ Cost: ~3.1 M quads a frame for the rear at 30 fps is ~94 M quads/s: NEON (vImage
 rear runs at 15 fps on NEON and at 30 on the A830 through a Metal compute kernel once the GPU path is up (the front's 2 M quads at
 30 fps fit NEON). A first version can drop to 1/4-resolution quads (1020×768) to stay simple.
 
-### 4.5 L5: a macOS camera device (designed; C5 first)
+### 4.5 L5: a macOS camera device (designed; its kernel side's first version built, §4.5.1)
 
 Research of 2026-11-12 (public documentation and developer reports, sources at the end of this section; no Apple binary read):
 
@@ -351,6 +351,40 @@ Research of 2026-11-12 (public documentation and developer reports, sources at t
   session 10022; Apple, "Debugging and testing system extensions" (DriverKit documentation); Apple support 108387 (DAL plug-ins off
   from 14.1); OBS Studio's `plugins/mac-virtualcam` (its camera extension's entitlements and Info.plist); Apple developer forums
   threads 706184, 716181, 725481, 795835, 823200; the SDKs' CoreMediaIO headers (26.5 and 27.2). Reports, not tested here.
+
+#### 4.5.1 Level 5's first version (built 2026-11-13, image `c5`): the kernel side and a command-line client
+
+What the next boot verifies, without any app or system extension: `piano-camera=5` (4 as well: level 4, the ISP, is user space)
+publishes `IOUserClientClass` = `PianoCameraUserClient` on the PianoCamera service; after the survey the camera thread waits for
+captures. The ABI is `package/PianoCamera/PianoCameraABI.h` (C): `kPianoCameraCapture` (sensor, pattern, exposure loop, target,
+timeout) runs one level-3 sequence on the camera thread (the sensor up, the exposure loop, one frame after it, everything down
+again: a few seconds; one capture at a time) and answers with `PianoCameraFrameInfo` (size, stride, Bayer order, black level,
+exposure, gain, the loop's verdict, means, the result line); memory type 0 (`IOConnectMapMemory64`, read-only) is the last frame,
+RAW10 MIPI-packed, kept in a 16 MiB `kIOMemoryKernelUserShared` buffer by `Ops::frameReady` after the write master stopped.
+`kPianoCameraInfo` reads the last description. An administrator only in this version (`clientHasPrivilege`). The software ISP's
+first version is `package/PianoCamera/CameraIsp.h` (C, host-tested): quads (one RGB pixel per 2x2), `scale` x `scale` of them
+averaged, the black level, grey-world balance, a digital gain to the 99th percentile, the sRGB curve. Its first client,
+`piano-camera-grab` (configs/userland.toml: `/usr/local/bin`, and a LaunchDaemon that runs once at boot only with
+`piano-camera-grab=1`), captures the front then the rear, writes `/private/var/tmp/piano-camera-<sensor>.ppm` (1020x768 rear,
+816x459 front at scale 2), and prints its lines and a 64-pixel thumbnail on the console; `tooling/camera/console-thumb.py LOG` turns
+the thumbnails of the console capture or the mailbox copy into PNGs on the Mac, so the first pictures need no shell on the tablet.
+
+#### 4.5.2 The order to Photo Booth and FaceTime
+
+| Step | What | Verified by |
+|---|---|---|
+| 1 (built) | the user client, one capture per call; the CPU ISP and `piano-camera-grab` | `c5`: the console's result and ISP lines, the thumbnails as PNGs |
+| 2 | **C5**, the test-pattern camera extension (no kernel): `/Applications/PianoCamera.app` (LSUIElement, `com.apple.developer.system-extension.install`, an app group) with `Contents/Library/SystemExtensions/com.unixnu.PianoCamera.Extension.systemextension` (CMIOExtensionProvider/Device/Stream, a moving test pattern in BGRA and 420v at 1280x960, 30 fps), ad-hoc signed, both CDHashes in the trust cache (stage.py's units), `systemextensionsctl developer on` (SIP off by the ADT) | `systemextensionsctl list` shows it activated; `CMIOExtension.<id>` runs in `user/262` without sandbox denials; Photo Booth shows the pattern. **One attended step**: the approval in Settings › Login Items & Extensions (unless sysextd skips it in developer mode: the log says) |
+| 3 | the kernel's stream for a client: `Stream` split into open / frames / close (today a bounded sequence), the write master cycling through a ring of 3 buffers in the SMMU window (one window, 3 x 16 MiB at consecutive IOVAs), a frame-ready notification (`IOConnectSetNotificationPort`, `sendAsyncResult64`), the exposure loop every 3 frames from the frame path, the ring as memory type 1 (slots with a sequence number, the SOF host time, exposure, gain); open powers up, close (or the client's death) powers down; the rear's 2x2-binned 4080x3072 at 30 fps, the front's 3264x1836 | a `piano-camera-grab --stream N` mode: N frames' times and sequence numbers on the console, no drop, the power-down complete after close |
+| 4 | the extension on the kernel's stream: the user client accepts a client with our entitlement instead of an administrator (`IOUserClient::copyClientEntitlement`; the extension runs as `_cmiodalassistants`, sandboxed, with `com.apple.security.temporary-exception.iokit-user-client-class` = `PianoCameraUserClient`); the ISP of step 1 on the CPU at 1020x768 (rear) and 816x612/816x459 (front) into an IOSurface-backed BGRA pool, scaled to the formats it publishes; "Front Camera" / "Rear Camera"; open/close follow the stream's start/stop | Photo Booth and FaceTime show both cameras; QuickTime records; closing the app powers the sensor down (the console's power-down lines) |
+| 5 | the ISP on the A830 (a Metal compute kernel) for full-resolution quads at 30 fps, 420v output, the colour matrix, the rear's orientation | frame times in the extension's log |
+
+Constraints on this platform: code runs only with its CDHash in the trust cache (AMFI is permissive, `mac-amfi-launch-permissive=1`,
+but sysextd and the camera sandbox check signatures and entitlements on their own: *inferred*, step 2 tells); every rebuild of the
+extension is a new CDHash, so a new trust cache, a new seed and a reboot (the system layer's live update carries it on the installed
+system, docs/userland.md 7); the files reach Data only through the system layer (`tooling/userland/stage.py`, `configs/userland.toml`);
+the approval is the one attended step; the user client of steps 1-3 needs root (the grab tool runs as root), step 4 replaces that
+with the entitlement check.
 
 ## 5. Dependencies
 
@@ -444,6 +478,7 @@ grep -a "PianoCamera" logs/usb-console/<newest>-port0.txt
 | `c3rs` | `piano-camera=3 piano-camera-sensor=1 piano-camera-pattern=0 piano-camera-frames=4 piano-camera-delay=20` | **yes**, after `c3r` | the rear's scene: four frames, the means with the room light |
 | `c3f` | `piano-camera=3 piano-camera-sensor=2 piano-camera-delay=20` | **yes**, after `c2f` and `c3r` | the front's scene over CSIPHY4 |
 | `cplan` | `piano-camera=3 piano-camera-plan=c3rp,c2f,c3r,c3rs,c3f piano-camera-delay=20` | **yes** | the ladder on one boot in its gated order, each with its image's arguments, the next only after a complete power-down (`CameraPlan.h`; host-tested on c1's board model: five runs, the same free SMMU group and bank each time, everything as found after the last). Ran 2026-11-13 with c2fx in c2f's place (§8.4) |
+| `c5` | `piano-camera=5 piano-camera-grab=1 piano-camera-delay=20`, the userland's seed (`CAM_SEED=out/userland/stage/scratch-data.img CAM_TRUST=out/userland/stage/kernel.macho.trustcache`) | **yes** | level 5's first version (§4.5.1): `piano-camera-grab`'s boot job captures the front, then the rear, through the user client; its lines and thumbnails on the console (`tooling/camera/console-thumb.py`), the PPMs in /private/var/tmp |
 | `cae` | `piano-camera=3 piano-camera-plan=c3r,c3rs,c3f piano-camera-delay=20` | **yes** | the exposure loop on both scenes: the rear's colour bars first (the stream's regression check after the loop's rework), then the rear's and the front's scenes, each from its driver's defaults to 160 above black, a non-flat histogram where light reaches the sensor (§8.2 "cae") |
 
 Each runs `piano-reset-after=300`. The order is `c1` → (`c1x`) → `c1b` → `c2f` → `c2r` → `c2rg`/`c2r24` as needed → `c3rp` → `c3r` →
@@ -623,6 +658,26 @@ the desk is the expected case; for the front facing the lit room it would point 
 = the means do not follow exposure x gain (the registers do not reach the pixels: compare the read-back values with the writes);
 `read back FAILED` or other values than written = the control registers themselves; a lit `ae 1` sample already at the drivers'
 defaults with c3f's black frames of 11-13 = the missing controls were the cause (the tables alone are dark).
+
+**c5** (level 5; the userland's seed): the survey as usual, then `level 5: the user client PianoCameraUserClient (...)` at start
+and `stage 7: level 5: ready for captures (PianoCameraUserClient)`. Once launchd runs the job (about 30-60 s after XNU starts):
+```
+piano-camera-grab: --boot: waiting for PianoCamera's level 5
+PianoCamera: level 5: capture 1: the front, the scene, exposure loop on (target 160)
+PianoCamera: ... (c3f's lines: the controls, the ae samples, the frame, the power-down)
+PianoCamera: stack: ... the least M at step S ...
+PianoCamera: level 5: capture 1: front: 1 frames, our translating window, guard intact, means ../../../.., ae converged (exposure E gain G), power down complete; 7490880 bytes kept (status 0)
+piano-camera-grab: front: front: 1 frames, ...; exposure E gain G (x.xx); 3264x1836 stride 4080; means ../../../..; status 0
+piano-camera-grab: front isp: 816x459 (scale 2) means r/g/b above black, white balance r/b, digital gain k -> /private/var/tmp/piano-camera-front.ppm
+piano-camera-grab: t front 64x36 r0 p0 <hex> ...   (108 lines)
+... the same for the rear (4080x3072, 1020x768, a 64x48 thumbnail: 144 lines)
+piano-camera-grab: done
+```
+Then on the Mac: `python3 tooling/camera/console-thumb.py <the console log>` writes `front-1.png` and `rear-1.png`. Fail lines:
+`piano-camera-grab: IOServiceOpen: 0x...` (the user client did not open: its class, or not root), `capture: 0x...` (kIOReturnBusy
+0xe00002d5, kIOReturnTimeout 0xe00002d6: the kext's lines say how far the capture got), `status N` (the capture failed at step N),
+no `piano-camera-grab` line at all (the job did not run: launchd, the seed, the trust cache). The PPM files stay in
+/private/var/tmp for a later shell (`pianousb-shell`, ssh) until the reset.
 Failure lines: `FAILED at step 303: ... no LOCK_DET within 1.5 ms` (PLL0: its MODE in `last value`; MXC's vote line above),
 `FAILED at step 306: refused: ...` (the SMMU's state: report the survey's smmu lines), `FAILED at step 308: CSID-lite0 did not
 reset`, `FAILED at step 320: no frame arrived` (report the `irq seen` and `csiphy1 status` lines: a CSI-2 RX error says the PHY saw
