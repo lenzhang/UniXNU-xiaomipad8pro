@@ -74,8 +74,14 @@
 "sub-product-type" = "VirtualMac2,1"
 "unique-model" = "VMA2MACOSAP"
 "partition-style" = "macOS"
-"product-name" = "Apple Virtual Machine 1"
-"product-description" = "virtual machine for ARM-v8.4 with Apple Silicon extensions"
+# Display strings only (the VM-era ADT had "Apple Virtual Machine 1" and "virtual machine for ARM-v8.4 with Apple Silicon
+# extensions"): System Information's Model Name and the About window read product-name (VirtualMac2,1 has no entry of its own in
+# ServerInformation's model table), as a Mac's "MacBook Pro (14-inch, 2021)". product-soc-name is XNU's machdep.cpu.brand_string
+# (bsd/dev/arm64/sysctl.c; without it "ARM architecture processor"), System Information's Chip (else "Unknown"), as a Mac's
+# "Apple M1 Pro". The model identifier and every compatible/target-type value above stay the VM's.
+"product-name" = "Xiaomi Pad 8 Pro"
+"product-description" = "Xiaomi Pad 8 Pro"
+"product-soc-name" = "Snapdragon 8 Elite"
 
 ["adt"."product"."u32"]
 "artwork-device-subtype" = 0
