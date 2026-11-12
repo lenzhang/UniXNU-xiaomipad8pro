@@ -212,6 +212,20 @@ stream's and the frame's report after step 331, before the power-down; (4) the s
 line ran into the next). The rear's smallest mode is already the one used (4080×3072 is the 2×2-binned mode; the only other is
 8160×6144), and the drivers have no other link rate (one PLL setting, 700 MHz: 1.4 Gbit/s a lane): nothing lower to choose.
 
+**After the c3rp of 2026-11-13 (§8.4): the camera thread's stack.** The rebuilt c3rp reset at step 201 with a kernel stack
+overflow (`Invalid kernel stack pointer (probable overflow)`, `MACH Reboot`) while entering DRV-2's 64 KiB mapping for the first
+shared vote. The thread (`kernel_thread_start`) has XNU's 16 KiB (`KERNEL_STACK_SIZE` on this DEVELOPMENT kernel); the kext's own
+frames from its entry were at most 15,200 bytes after the c3 fixes (12,672 at the 14:35 runs): `PianoCamera::run` 8,528 (the
+survey, a Session with its survey copy, a Stream with its result, the copied StreamResult), `Stream::run` 2,368 (a StreamResult
+temporary from `r_ = StreamResult()`), `Session::begin` 2,000 (a Survey temporary from `s = survey(...)`), `reportControllers`
+1,616 (four `Lines`). XNU's IOKit mapping path below them took the rest. Changes: the survey, the options, the ops and level 2/3's
+Session and Stream in static storage (`gWork`: one camera thread per boot; `Slot` builds each in place for its use, a fresh Session
+per level-2 cycle as before), the results read by reference, every reset in place (`renew`, no temporary), one `Lines` at a time.
+The kext's frames are now at most 3,184 bytes (`tooling/k27/check-kext-stack.py`, which `build-native-piano-camera.sh` runs with a
+6 KiB limit), and the tablet reports the real margin: `stack: N of 16384 bytes free at the thread's start, the least M at step S`
+at the end of every run (`ml_stack_remaining` at each log line and before each IOKit mapping), and a mapping with less than 6 KiB
+left logs `stack: only N bytes ...` first.
+
 **Memory safety.** On c1's tablet the route is our window: the write master can reach only the buffer's 16 MiB (anything else
 faults in the SMMU, logged from the bank's FSR/FAR before the release), the guard catches an overflow inside it, and the buffer is
 not freed while the write master could still run. With a boot-chain bypass (not the tablet's case) the write master sees physical
@@ -328,6 +342,7 @@ installs on our boot), PianoTorch (the photo flash, B12, built).
 | `piano-camera-stop` | 0 | power down after this step (201..230; level 3: 300..331, below 300 stops level 2's part) |
 | `piano-camera-cycles` | 1 | repeat level 2 (1..20) |
 | `piano-camera-delay` | 0 | wait first (s) |
+| `piano-camera-plan` | none | `NAME,NAME,...` (at most 8 of c1b c2f c2fx c2r c2rg c2r24 c3rp c3r c3rs c3f): after the survey, each test image's sequence with exactly its arguments (`CameraPlan.h`), in that order, 0.5 s apart, the next only when the one before ended with `power down complete` and no buffer kept; a `plan result` line per item at the end; an unknown name runs the survey only. Sets the level (3 if any c3) |
 | `piano-camera-cc`, `-mclkcc`, `-blocks`, `-qup`, `-spmi`, `-smmu` | 1 | 0 leaves that part of the survey out (`-cc=0` also refuses the rear on CCI0) |
 | `piano-camera-votes` | 1 | 0: level 2 votes no CAMCC domain (§4.2 after c1); level 3 always votes |
 | `piano-camera-camss` | 1 | level 2: TITAN_TOP (with CAMCC's domains and the camera AHB) for either sensor and bus, the sensors' DT power domain (§4.2 after c2f); 0: the minimal path (only the rear over CCI0 powers it); level 3 always 1 |
@@ -394,13 +409,17 @@ grep -a "PianoCamera" logs/usb-console/<newest>-port0.txt
 | `c3r` | `piano-camera=3 piano-camera-sensor=1 piano-camera-delay=20` | **yes**, after `c3rp` passed | the rear's colour bars: two frames with their times, the band pattern, the stride, the rows, the guard |
 | `c3rs` | `piano-camera=3 piano-camera-sensor=1 piano-camera-pattern=0 piano-camera-frames=4 piano-camera-delay=20` | **yes**, after `c3r` | the rear's scene: four frames, the means with the room light |
 | `c3f` | `piano-camera=3 piano-camera-sensor=2 piano-camera-delay=20` | **yes**, after `c2f` and `c3r` | the front's scene over CSIPHY4 |
+| `cplan` | `piano-camera=3 piano-camera-plan=c3rp,c2fx,c3r,c3rs,c3f piano-camera-delay=20` | **yes** | the five on one boot in their gated order, each with its image's arguments, the next only after a complete power-down (`CameraPlan.h`; host-tested on c1's board model: five runs, the same free SMMU group and bank each time, everything as found after the last) |
 
 Each runs `piano-reset-after=300`. The order is `c1` → (`c1x`) → `c1b` → `c2f` → `c2r` → `c2rg`/`c2r24` as needed → `c3rp` → `c3r` →
 `c3rs` → `c3f`. **Rebuild the c2 images from this commit on**: images built before it wait at step 201 for CLK_OFF on the
 hardware-gated AHB branches c1 found and stop there (harmlessly: `FAILED at step 201: a GCC branch did not run`, power down
 complete). **The next queue (from the c2f/c3 fixes on, 2026-11-12 evening)**: `c3rp` → `c3r` → `c2f` → `c2fx` → `c3rs` → `c3f`
 (c3rs after c3r showed frames; c3f after c2f passed). Images built before these fixes abort in level 3's power-down (c3rp/c3r) and
-fail the front at MCLK4 (c2f): rebuild them.
+fail the front at MCLK4 (c2f): rebuild them. **Images built between those fixes and the stack fix of 2026-11-13** (§4.3 "After the
+c3rp of 2026-11-13") overflow the camera thread's kernel stack at step 201 (c3rp 5ca512344610b166): rebuild them too. Since the
+stack fix the five of that queue also run on one boot, `cplan`: run it first; when it stops early (its `plan: stopped after` line,
+or a reset), the separate image of the first item it did not finish takes the next boot.
 
 **Why level 2 is safe unattended** (and what could go wrong). What it changes: five LDO votes that, in the boot DT, supply nothing
 but the cameras (L6B/L7B also the disabled VCM), at the DT's exact voltages, each read back (any other voltage: off at once); ten
@@ -529,6 +548,26 @@ PianoCamera: level 3: N writes logged, M quiet (...), 0 refused, 0 off-side warn
 PianoCamera: stage 6: done (level 3)
 ```
 A bank whose found CBAR is a stage-1 type is restored as found (no `left at` line); the two `left at` lines are what c1's SMMU gives.
+
+**Every run since the stack fix** ends with the camera thread's stack margin (after `done:`): `PianoCamera: stack: N of 16384 bytes
+free at the thread's start, the least M at step S (logging and IOKit mappings measured)`. Expected N about 15,000 and M above 6,000
+(the kext's own frames are at most 3.6 KiB; XNU's IOKit mapping and IOLog paths below them). `stack: only N bytes of the thread's
+stack left before ...` before a mapping means under 6 KiB: report it with the step.
+
+**cplan** (the plan): after the survey `plan: c3rp,c2fx,c3r,c3rs,c3f (5 sequences ...)` at start, then per item `plan 1/5: c3rp
+(level 3, the rear; camss 1 rear-bus cci mclk24 1 pattern 1 frames 2 stop 312)` followed by that image's own lines (as c3rp, c2fx,
+c3r, c3rs, c3f above), and at the end one line per item run and the count:
+```
+PianoCamera: plan result 1/5 c3rp: rear: failed at step 312: stopped (piano-camera-stop)          <- pass (the stop asked for)
+PianoCamera: plan result 2/5 c2fx: front chip id 0x5632 ok over software I2C gpio4/5, mclk 19200000 Hz   (or: front failed at step 214: ...)
+PianoCamera: plan result 3/5 c3r: rear: 2 frames, our translating window ..., guard intact, means ../../../.., power down complete
+PianoCamera: plan result 4/5 c3rs: rear: 4 frames, ...
+PianoCamera: plan result 5/5 c3f: front: 2 frames, ...                                            (or: front: failed at step 214: ...)
+PianoCamera: plan: 5 of 5 run
+PianoCamera: stack: ... the least M at step S ...
+```
+`plan: stopped after NAME (its power-down was not complete, or its buffer was kept): K of 5 not run` stops it (each item's own
+lines say why); a reset during an item leaves its last lines, and the items before it have their whole reports.
 Failure lines: `FAILED at step 303: ... no LOCK_DET within 1.5 ms` (PLL0: its MODE in `last value`; MXC's vote line above),
 `FAILED at step 306: refused: ...` (the SMMU's state: report the survey's smmu lines), `FAILED at step 308: CSID-lite0 did not
 reset`, `FAILED at step 320: no frame arrived` (report the `irq seen` and `csiphy1 status` lines: a CSI-2 RX error says the PHY saw
@@ -614,6 +653,24 @@ configuration it does not have; (b) c3r's two BUF_DONEs were frames (98 ms is th
 and the next), not an instant stale return (two polls would take 0.2 ms), but no frame number or byte of them reached the log; (c)
 the missing chip-ID and frame lines are not a separate fault: level 3 printed its whole report, and level 2's line, only after the
 power-down. Fixed: §4.3 "After c3" (the release's rules, the order, the report before the power-down, the diagnostics).
+
+**c3rp rebuilt after the c3 fixes, 2026-11-13 00:06** (5ca512344610b166, main's KC; `logs/native-runs/20261113-000631-loop`):
+back in ABL 29 s after XNU started. The survey ran as c3rp's of 11-12 (the same lines), then `step 300`, `step 201`, `votes:
+mxc.lvl 0x300a0 ...` and the panic: `Invalid kernel stack pointer (probable overflow). at pc 0xfffffff009fda0f0, lr
+0xa7c38c7009ef7714`, esr `0x96000047` (a data abort, a write, a level-3 translation fault), far `0xfffffff736fb4ca8`, sp
+`0xfffffff736fb4ca0`; `MACH Reboot`. The live USB capture had stopped at the survey's `smmu:` line (the port went away), the
+mailbox copy has the panic. Reading it (the kernel runs unslid, `atos` names both): pc is
+`el1_sp0_synchronous_vector_long+0xf0`, the vector's `stp x0, x1, [sp, #0x8]` after `sub sp, sp, #0x350`, so the exception came
+with SP_EL0 = 0xfffffff736fb4ff0, 0x10 below a 4 KiB page boundary; far = sp + 8 is that store, in the same unmapped page. The
+first fault was therefore a store just below the stack's bottom (a 16 KiB stack at 0xfffffff736fb5000), which the vector's check
+(SP within kstackptr - 0x4000) still let pass; its frame then faulted again below the bound, and that one is reported. lr (PAC
+stripped) is `vm_map_store_lookup_entry`, x21/x22 and x23/x25 are 0xfffffff746240000 and 0xfffffff746250000: a 64 KiB range being
+entered into a map, the size of apps DRV-2 (`kRscDrv2Bytes`), which PianoCamera maps right after the `votes:` line (the 11-12
+runs printed `rsc: apps DRV-2 id 0x30800` there). **Cause (confirmed by the panic and the registers): the camera thread's 16 KiB
+kernel stack overflowed**; the kext's own frames down to `mapRsc` were 13,456 bytes (thread 32, run 8,528, Stream::run 2,368,
+up 32, Session::begin 2,000, mmUpdate 240, mmSend 176, mapRsc 80; the 14:35 build's 1,456 fewer left XNU's mapping path enough;
+`check-kext-stack.py` on main's object: 15,200 at most anywhere since the c3 fixes, 12,672 before them), no other driver's change was involved (no vote, RPMh, SPMI or timer path: the fault is a
+store into a stack guard page). Fixed: §4.3 "After the c3rp of 2026-11-13".
 
 ## 9. Fallback
 

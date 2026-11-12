@@ -16,6 +16,7 @@
 #include "CameraRpmh.h"
 #include "CameraSurvey.h"
 #include "CameraStream.h"
+#include "CameraPlan.h"
 #include "CameraTables.h"
 #include <algorithm>
 #include <cstdarg>
@@ -2053,6 +2054,66 @@ static void testFrameStats()
   CHECK(!s.guardIntact && s.guardFirstBad == 10);
 }
 
+// The plan (CameraPlan.h): the names parse to their images' arguments; on one board (c1's tablet) c3rp, c2fx, c3r, c3rs and c3f run
+// one after another, each from what the one before left (the SMMU words the release keeps, PLL0's configuration), each with its
+// power-down complete, the board as found after the last.
+static void testPlan()
+{
+  const Plan p = parsePlan("c3rp,c2fx,c3r,c3rs,c3f");
+  CHECK(!p.error && p.count == 5 && p.level == 3);
+  CHECK(!std::strcmp(p.item[0]->name, "c3rp") && p.item[0]->level == 3 && p.item[0]->sensor == 1 && p.item[0]->stop == 312);
+  CHECK(p.item[1]->level == 2 && p.item[1]->sensor == 2 && p.item[1]->camss == 0 && p.item[1]->stop == 0);
+  CHECK(p.item[2]->pattern == 1 && p.item[2]->frames == 2 && p.item[3]->pattern == 0 && p.item[3]->frames == 4);
+  CHECK(p.item[4]->level == 3 && p.item[4]->sensor == 2);
+  const Plan bad = parsePlan("c3r,c3x");
+  CHECK(bad.error == -1 && bad.bad == 4 && bad.count == 0);
+  CHECK(parsePlan("").error == -3 && parsePlan(nullptr).error == -3 && parsePlan("c3r,").error == -1 && parsePlan(",c3r").error == -1);
+  CHECK(parsePlan("c3r,c3r,c3r,c3r,c3r,c3r,c3r,c3r").count == 8 && parsePlan("c3r,c3r,c3r,c3r,c3r,c3r,c3r,c3r,c3r").error == -2);
+  CHECK(parsePlan("c2f").level == 2 && parsePlan("c1b").item[0]->stop == 203 && parsePlan("c2r24").item[0]->mclk24 == 1);
+  CHECK(parsePlan("c2rg").item[0]->rearBus == 1 && parsePlan("c3r extra").count == 1);
+  CHECK(planGoesOn(true, false) && !planGoesOn(false, false) && !planGoesOn(true, true));
+
+  L3Rig r;
+  const auto before = l3Snapshot(r.b);
+  StreamResult last, first;   // the first level-3 run kept the found words this SMMU refuses; the later ones find its words
+  bool haveFirst = false;
+  for (unsigned i = 0; i < p.count; ++i) {
+    const PlanItem &it = *p.item[i];
+    const Sensor w = it.sensor == 2 ? Sensor::front : Sensor::rear;
+    if (it.level == 3) {
+      StreamOptions o;
+      o.frames = it.frames;
+      o.pattern = it.pattern != 0;
+      o.stopAt = it.stop >= 300 ? it.stop : 0;
+      PowerOptions po;
+      po.stopAt = it.stop < 300 ? it.stop : 0;
+      last = r.run(w, o, po);
+      if (!haveFirst) {
+        first = last;
+        haveFirst = true;
+        CHECK(first.release.s2crKept && first.release.cbarKept);
+      } else {
+        CHECK(!last.release.s2crKept && !last.release.cbarKept && !last.release.error);   // its found words are configurations
+      }
+      const bool ok = it.stop ? last.failure == StreamFailure::stopped && last.failedStep == -int(it.stop) : last.ok;
+      if (!ok) std::printf("  plan %s: failure %s at %d\n", it.name, streamFailureName(last.failure), -last.failedStep);
+      CHECK(ok && last.cleanOff && last.bufferFreed && planGoesOn(last.cleanOff, last.pa && !last.bufferFreed));
+      CHECK(last.route == Route::window && r.plan.slot == 5 && r.plan.bank == 81);   // the same free group and bank each time
+    } else {
+      PowerOptions po;
+      po.camss = it.camss != 0;
+      po.mclk24 = it.mclk24 != 0;
+      po.rearCci = !it.rearBus;
+      po.stopAt = it.stop;
+      const SensorResult res = r.Rig::run(w, po);
+      CHECK(res.idOk && res.cleanOff && planGoesOn(res.cleanOff, false));
+    }
+  }
+  for (auto &v : r.b.violations) std::printf("  violation: %s\n", v.c_str());
+  CHECK(r.b.violations.empty() && !r.b.mm1On && !r.b.mxcVoted && r.b.allocs == r.b.frees && r.b.smmuFaults == 0);
+  CHECK(haveFirst && asFound(before, first, r.plan, r.b));
+}
+
 int main()
 {
   testSurvey();
@@ -2075,6 +2136,7 @@ int main()
   testSmmuRules();
   testL3Teardown();
   testL3Diagnostics();
+  testPlan();
   if (failures) {
     std::printf("camera_host: %d check(s) FAILED\n", failures);
     return 1;

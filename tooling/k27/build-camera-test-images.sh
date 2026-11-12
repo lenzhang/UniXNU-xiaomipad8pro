@@ -13,7 +13,7 @@
 # RAM image of the GPU profile (PianoA830, the Turnip stage, ADT vmm-present 0), or CAM_PROFILE=plain, with the USB console and
 # piano-reset-after as the backstop; PIANO_FAST_BOOT=1 keeps the command line short.
 #
-#   build-camera-test-images.sh [NAME ...]    default: c1 c1x c1b c2f c2fx c2r c2rg c2r24 c3rp c3r c3rs c3f
+#   build-camera-test-images.sh [NAME ...]    default: c1 c1x c1b c2f c2fx c2r c2rg c2r24 c3rp c3r c3rs c3f cplan
 #                                             out/ram-cam-<NAME>/ and out/ram-cam-dump/
 #
 # Inputs (this repository's out/ unless set): CAM_KC (out/k27/kc-k27-native.bin, built by
@@ -38,7 +38,7 @@ for f in "$KC" "$ADT" "$FD" "$SEED" "$TRUST"; do [ -f "$f" ] || { echo "build-ca
 for s in com.unixnu.driver.PianoCamera com.unixnu.driver.PianoA830; do
   grep -a -q "$s" "$KC" || { echo "build-camera-test-images: $KC has no $s (build it with tooling/k27/build-native-image.sh)" >&2; exit 1; }
 done
-ORDER="c1 c1x c1b c2f c2fx c2r c2rg c2r24 c3rp c3r c3rs c3f"
+ORDER="c1 c1x c1b c2f c2fx c2r c2rg c2r24 c3rp c3r c3rs c3f cplan"
 image() {
   case $1 in
     c1)    A="piano-camera=1 piano-camera-delay=20" ;;                                                       # the survey
@@ -53,6 +53,9 @@ image() {
     c3r)   A="piano-camera=3 piano-camera-sensor=1 piano-camera-delay=20" ;;                                 # rear, colour bars
     c3rs)  A="piano-camera=3 piano-camera-sensor=1 piano-camera-pattern=0 piano-camera-frames=4 piano-camera-delay=20" ;;   # rear scene
     c3f)   A="piano-camera=3 piano-camera-sensor=2 piano-camera-delay=20" ;;                                 # front, its scene
+    # The five of the 2026-11-13 queue on one boot (CameraPlan.h): each with its image's arguments, the next only after a complete
+    # power-down, the riskier ones last (the rear's stream after its power-down's test, the front's stream at the end).
+    cplan) A="piano-camera=3 piano-camera-plan=c3rp,c2fx,c3r,c3rs,c3f piano-camera-delay=20" ;;
     *) return 1 ;;
   esac
 }
