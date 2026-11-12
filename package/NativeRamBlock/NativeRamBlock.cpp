@@ -149,17 +149,20 @@ class NativeRamBlock : public IOBlockStorageDevice {
     uint32_t mib = 0;
     if (PE_parse_boot_argn("data-volatile-mib", &mib, sizeof mib) && mib >= 64 && mib <= 65536) return mib * 256ULL;
     uint64_t pages = gPhysSize / 4 / 4096;          // a quarter of the memory this kernel manages
-    return pages < 65536 ? 65536 : pages > 524288 ? 524288 : pages;   // 256 MiB .. 2 GiB
+    return pages < 65536 ? 65536 : pages > 1048576 ? 1048576 : pages;   // 256 MiB .. 4 GiB
   }
   // The boot reservation, taken by the refill thread as soon as the disk is set up, before the GPU and the desktop take memory and
-  // the kernel's address ranges. Default 256 MiB (the login's first minute of Data writes): every page is wired RAM for the whole
-  // boot, and on piano the desktop runs short of RAM (2026-11-12 desk-dev: 5.8 GiB of 8 wired, 40 MB free). Past it the pool grows as
-  // Data is written, from kmem's private data range first (not the GPU's) and smaller chunks when 2 MiB fail.
-  // data-volatile-reserve-mib=N: N MiB (up to the budget; 0: none).
+  // the kernel's address ranges (2026-11-12: at 1080 MiB held no 2 MiB was left in the range IOMallocAligned uses). Default a sixth of
+  // the memory this kernel manages, at most 2 GiB and the budget: 2 GiB with the 13 GiB window, 1365 MiB with 8 GiB; the two desktop
+  // sessions of 2026-11-12 peaked at 1080 and 1552 MiB held. Its pages are wired for the whole boot. Past it the pool grows as Data
+  // is written, from kmem's private data range first (not the GPU's) and smaller chunks when 2 MiB fail.
+  // data-volatile-reserve-mib=N: N MiB (up to the budget; 0: none, the pool grows from the start).
   static uint64_t volatileReservePages(uint64_t budget) {
-    uint32_t mib = 256;
-    if (PE_parse_boot_argn("data-volatile-reserve-mib", &mib, sizeof mib) && mib > 65536) mib = 256;
-    return mib * 256ULL < budget ? mib * 256ULL : budget;
+    uint64_t pages = gPhysSize / 6 / 4096;
+    if (pages > 524288) pages = 524288;
+    uint32_t mib = 0;
+    if (PE_parse_boot_argn("data-volatile-reserve-mib", &mib, sizeof mib) && mib <= 65536) pages = mib * 256ULL;
+    return pages < budget ? pages : budget;
   }
   // The refill thread's allocators, in the order it tries them at each chunk size (VolatilePool.h kinds): 0 IOMallocData, kmem's
   // private data range (kalloc_large: KMA_DATA); 1 IOMallocAligned, the shared data range (KMA_DATA_SHARED, where the GPU's kernel

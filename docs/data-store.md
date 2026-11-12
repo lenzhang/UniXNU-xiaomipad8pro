@@ -112,12 +112,15 @@ showed `disk2s1: memory allocation error.` (3393 times) and `cluster_push() fail
 
 Now:
 - **The boot reservation.** The refill thread starts when the disk is set up, before the GPU and the desktop. It first takes
-  `data-volatile-reserve-mib` (default 256 MiB, about the login's first minute of Data writes) while memory and the kernel's ranges
-  are unfragmented. A write under the reservation never waits for the system. Once it is complete:
-  `NativeRamBlock: volatile: N MiB reserved at start in T ms (...)`. The reservation is small on purpose: every page of it is wired
-  RAM for the whole boot, and on piano the desktop runs short of RAM (desk-dev, 2026-11-12 17:27-17:40: 5.8 GiB of 8 wired, 40 MB
-  free, 13k pageouts, Data about 1.4 GiB, then WindowServer died on a GPU out-of-memory). What protects the writes past it is the
-  allocators below: the address range that ran out is now the second choice, not the only one.
+  `data-volatile-reserve-mib` while memory and the kernel's ranges are unfragmented. The default is a sixth of the RAM XNU manages,
+  at most 2 GiB and the budget:
+  - 2048 MiB with DarwinBoot's 13 GiB window;
+  - 1365 MiB with today's 8 GiB (DarwinBoot caps the window; the tablet has 16 GB).
+  The two desktop sessions of 2026-11-12 peaked at 1080 and 1552 MiB held. A write under the reservation never waits for the system.
+  Once it is complete: `NativeRamBlock: volatile: N MiB reserved at start in T ms (...)`. Its pages are wired RAM for the whole boot
+  (desk-dev, 17:27-17:40, with 8 GiB: 5.8 GiB wired, 40 MB free, Data about 1.4 GiB, then WindowServer died on a GPU out-of-memory).
+  Past the reservation the pool grows as Data is written. The allocators below protect those writes: the address range that ran out
+  is now the second choice, not the only one.
 - **Allocation.** Chunks are taken by the refill thread with no lock held. It may wait for memory as long as the VM needs. Each chunk
   is as large as can be had: 2 MiB, then 512, 128 and 32 KiB, then a single page. At each size it tries three allocators, in this
   order:
@@ -143,31 +146,30 @@ Now:
 
 | Boot argument | Default | Meaning |
 |---|---|---|
-| `data-volatile-mib=N` | a quarter of the memory XNU manages, within 256 MiB to 2 GiB (was 4 GiB): 2048 MiB on piano | the budget (64 to 65536) |
-| `data-volatile-reserve-mib=N` | 256 | taken at start, at most the budget (0: none, the pool grows as Data is written, as before 2026-11-12) |
+| `data-volatile-mib=N` | a quarter of the RAM XNU manages, within 256 MiB to 4 GiB: 2048 MiB with 8 GiB, about 3.3 GiB with the 13 GiB window | the budget (64 to 65536) |
+| `data-volatile-reserve-mib=N` | a sixth of the RAM XNU manages, at most 2 GiB and the budget | taken at start (0: none, the pool grows as Data is written, as before 2026-11-12) |
 | `data-volatile-unmap=0` | 1 | do not advertise unmap |
 
-**The budget against the desktop's RAM.** All of Data's written pages are wired RAM. A smaller budget does not make Data need less;
-it turns the excess into failed writes, and a failed metadata write corrupts the container (above). The two sessions of 2026-11-12:
+**The budget and the sessions.** All of Data's written pages are wired RAM. A smaller budget does not make Data need less: it
+turns the excess into failed writes, and a failed metadata write corrupts the container (above). The two sessions of 2026-11-12:
 
-| session | live Data at its peak (resident) | held | a 1 GiB budget would have refused writes |
-|---|---|---|---|
-| desk-a, 17:00-17:26 | 1079 MiB (26 min) | 1080 MiB | yes, at about minute 20-25 |
-| desk-dev, 17:27-17:40 | 1535 MiB | 1552 MiB | yes, at the first jump (714 to 1349 MiB in one 10 s interval, minutes after the login) |
+| session | live Data at its peak (resident) | held |
+|---|---|---|
+| desk-a, 17:00-17:26 | 1079 MiB (26 min) | 1080 MiB |
+| desk-dev, 17:27-17:40 | 1535 MiB | 1552 MiB |
 
-Both sessions write and delete blobs of several hundred MiB: resident swings 1349, 1056, 1416, 910, 1531, 1167 MiB in desk-dev.
-desk-a's refusals hit a 261 MB file (`ino 35906`, `cluster_pageout`). The jumps come with crash reporting (`ReportCrash`,
-`coresymbolicationd` clearing purgeability on its caches) and asset/settings processes (inference: which file it is was not
-logged). So the default stays 2 GiB, and `data-volatile-mib=1024` is right for a test image only once those writers are stopped
-or kept off Data. Then `writes refused` stays 0 at 1 GiB. Without that, a lower budget trades the GPU's out-of-memory for a corrupt
-Data container. The pool does not give memory back yet: after unmaps, `held` stays at the peak (1552 MiB held, 866 to 1167 MiB
-resident). Pages APFS freed are reused first, but not returned to the system.
+Both sessions write and delete blobs of several hundred MiB. In desk-dev resident swings 1349, 1056, 1416, 910, 1531, 1167 MiB;
+the first jump, 714 to 1349 MiB, came within one 10 s interval minutes after the login. desk-a's refusals hit a 261 MB file
+(`ino 35906`, `cluster_pageout`). The jumps come with crash reporting and asset or settings processes (`ReportCrash`,
+`coresymbolicationd` clearing purgeability on its caches). That is an inference: the file was not logged. The pool does not give
+memory back yet: after unmaps, `held` stays at the peak (1552 MiB held, 866 to 1167 MiB resident). Pages APFS freed are reused
+first, but not returned to the system.
 
-Lines:
+Lines (8 GiB; with the 13 GiB window the budget is about 3.3 GiB and the reservation 2048 MiB):
 
 ```
-NativeRamBlock: volatile: budget 2048 MiB (data-volatile-mib), 256 MiB reserved at start (data-volatile-reserve-mib), chunks of 2 MiB down to a page; a write past the budget (no space) or after 10000 ms without pages (no memory) fails as an I/O error; unmap on
-NativeRamBlock: volatile: 256 MiB reserved at start in T ms (C chunks, F of them fallbacks, A failed allocations): writes under it never wait for memory
+NativeRamBlock: volatile: budget 2048 MiB (data-volatile-mib), 1365 MiB reserved at start (data-volatile-reserve-mib), chunks of 2 MiB down to a page; a write past the budget (no space) or after 10000 ms without pages (no memory) fails as an I/O error; unmap on
+NativeRamBlock: volatile: 1365 MiB reserved at start in T ms (C chunks, F of them fallbacks, A failed allocations): writes under it never wait for memory
 NativeRamBlock: volatile: N pages, M MiB resident (H MiB held in chunks, peak P MiB, budget B MiB); U pages unmapped; writes refused: X no space, Y no memory; W waits, F chunk failures; R MiB ready (reserve S MiB), K fallback chunks, E rounds with nothing to be had
 ```
 
@@ -179,9 +181,10 @@ Not done (options for the RAM, 2026-11-12):
 - **Giving memory back.** Return a chunk to the system once all its pages are free. This needs per-chunk free counts (a page's chunk
   found by address) and per-chunk free lists.
 - **Pageable or compressible pages** (`KMA_PAGEABLE`, so the compressor could take them). The I/O path copies under the disk's lock.
-  A pool page the VM has swapped out would fault there, and this kernel's swap (`vm_compressor_mode` 4, with swap) lives on the
-  container this disk is. That is the lock-order deadlock of section 3 again. It would need the copies done outside the lock, with
-  per-page pinning. Data written as downloaded archives would not compress anyway.
+  A pool page the VM has swapped out would fault there. This kernel swaps (`vm_compressor_mode` 4, compressor with swap), and macOS
+  keeps its swap files on a volume of the system's container (not checked here: whether that is this disk's container). If it is,
+  that is the lock-order deadlock of section 3 again. It would need the copies done outside the lock, with per-page pinning. Data
+  written as downloaded archives would not compress anyway.
 - **A UFS scratch region for test images**, so their Data goes to UFS instead of RAM. The store window is the owner's store
   (section 1). The only other room is the 1 GiB reserve after it in `linux_rootfs`, smaller than desk-dev's live Data. It would be
   a new region of `linux_rootfs` for test boots, which this repository does not have yet.
@@ -422,8 +425,9 @@ If the budget is reached, the line shows `writes refused: X no space` and APFS r
 not a hang. To see the limit on purpose, add `data-volatile-mib=512` to `PIANO_EXTRA_ARGS` for a second image.
 
 Since the boot reservation (2026-11-12), also expected:
-- `NativeRamBlock: volatile: 256 MiB reserved at start in T ms` within a second or so of the first line;
-- `H MiB held in chunks` at least 256 from the start;
+- `NativeRamBlock: volatile: N MiB reserved at start in T ms` (1365 with 8 GiB, 2048 with the 13 GiB window) within a second or
+  so of the first line;
+- `H MiB held in chunks` at least the reservation from the start;
 - `0 no memory` for the whole session. If `K fallback chunks` grows, the private data range or 2 MiB holes ran short and the
   fallbacks carried the writes.
 A `no memory` count above 0 below the budget means the system had no memory at all for 10 s (look for jetsam and pageout lines),
