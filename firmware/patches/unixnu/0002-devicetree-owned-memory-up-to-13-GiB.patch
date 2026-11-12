@@ -1,0 +1,16 @@
+diff --git a/scripts/unixnu/devicetree.py b/scripts/unixnu/devicetree.py
+--- a/scripts/unixnu/devicetree.py
++++ b/scripts/unixnu/devicetree.py
+@@ -318,8 +318,10 @@
+         raise Error('Pass --unique-chip-id HEX for this board')
+     if options.get('owned_memory_size'):
+         size = int(str(options['owned_memory_size']), 0)
+-        if not 0x10000000 <= size <= 0x200000000 or size % 0x200000:
+-            raise Error('Owned memory must be 256 MiB to 8 GiB in 2 MiB steps')
++        # UniXNU-piano: DarwinBoot's bound with firmware/patches/darwinboot/0001 (WindowSize.h DARWIN_WINDOW_MAX), and never
++        # more than the DRAM range the ADT describes.
++        if not 0x10000000 <= size <= min(0x340000000, dram_size) or size % 0x200000:
++            raise Error('Owned memory must be 256 MiB to 13 GiB (and within the DRAM range) in 2 MiB steps')
+         chosen.append(('darwinboot-memory-size', struct.pack('<Q', size)))
+     if options.get('root_match_volume_uuid'):
+         volume = str(uuid.UUID(options['root_match_volume_uuid'])).upper()

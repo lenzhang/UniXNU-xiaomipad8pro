@@ -45,7 +45,7 @@ role = "UniXNU's BootShim.S (image size = shim + FD, cache maintenance after the
 [pin."DarwinBoot"]
 git = "https://github.com/UniXNU/DarwinBoot.git"
 commit = "8544957e04bdc43e2aac9243764ac16979f15c42"
-role = "XNU loader in the FD (arm64e, MH_FILESET, 256 MiB kernels, darwinboot-memory-size window <= 8 GiB)"
+role = "XNU loader in the FD (arm64e, MH_FILESET, 256 MiB kernels, darwinboot-memory-size window <= 8 GiB; <= 13 GiB with firmware/patches/darwinboot/0001, built from out/deps/DarwinBoot by tooling/unixnu.sh)"
 
 [pin."ArmCpu"]
 git = "https://github.com/UniXNU/ArmCpu.git"

@@ -1,0 +1,122 @@
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -495,7 +495,7 @@
+ 
+ STATIC
+ EFI_STATUS
+-AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address)
++AllocateWindow (KERNEL *Kernel, UINT64 *WindowSizeInOut, EFI_PHYSICAL_ADDRESS *Address)
+ {
+   EFI_MEMORY_DESCRIPTOR *Map;
+   EFI_MEMORY_DESCRIPTOR *Descriptor;
+@@ -510,7 +510,12 @@
+   UINT64                BestStart;
+   UINT64                BestBytes;
+   UINT64                RunBytes;
++  UINT64                WindowSize;
++  UINT64                Fit;
++  UINT64                FitBytes;
++  UINT64                FitStart;
+ 
++  WindowSize = *WindowSizeInOut;
+   *Address = 0;
+   Map = NULL;
+   Capacity = 0;
+@@ -531,6 +536,34 @@
+     Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
+     if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
+   }
++  //
++  // No run holds a request above DARWIN_WINDOW_FLOOR whole (the kernel's offset in its 2 MiB block, or UEFI's
++  // own pages at the top of DRAM): take the largest run's whole blocks if they reach the floor. XNU is told the
++  // size it got (boot_args MemorySize).
++  //
++  if (EFI_ERROR (Status) && (WindowSize > DARWIN_WINDOW_FLOOR)) {
++    FitBytes = 0;
++    FitStart = 0;
++    for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
++      Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
++      if ((Descriptor->Type != EfiConventionalMemory) || (Descriptor->NumberOfPages == 0)) { continue; }
++      End = RunEnd (Map, Size, Stride, Descriptor->PhysicalStart,
++                    Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages));
++      Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
++      if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate)) { continue; }
++      Fit = DarwinWindowFit (WindowSize, End - Candidate);
++      if (Fit > FitBytes) { FitBytes = Fit; FitStart = Candidate; }
++    }
++    if (FitBytes != 0) {
++      Candidate = FitStart;
++      Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (FitBytes), &Candidate);
++      if (!EFI_ERROR (Status)) {
++        Print (L"DARWINBOOT: window 0x%lx requested, 0x%lx taken (largest run) at 0x%lx\n", WindowSize, FitBytes, Candidate);
++        *Address = Candidate;
++        *WindowSizeInOut = FitBytes;
++      }
++    }
++  }
+   if (EFI_ERROR (Status)) {
+     CHAR16 Line[96];
+     UINTN  Row = 1;
+@@ -722,7 +755,7 @@
+   }
+   Status = ReadBootVideo (Video);
+   if (EFI_ERROR (Status)) { goto Fail; }
+-  Status = AllocateWindow (&Kernel, WindowSize, &Address);
++  Status = AllocateWindow (&Kernel, &WindowSize, &Address);
+   if (EFI_ERROR (Status)) { goto Fail; }
+   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
+   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
+--- a/DarwinBootPkg/Driver/WindowSize.h
++++ b/DarwinBootPkg/Driver/WindowSize.h
+@@ -2,8 +2,24 @@
+ #ifndef DARWINBOOT_WINDOW_SIZE_H
+ #define DARWINBOOT_WINDOW_SIZE_H
+ // Allocation still requires one real conventional-memory run. This is a
+-// parser bound, never a declaration of available RAM or an allocation fallback.
++// parser bound, never a declaration of available RAM.
++// 13 GiB: the largest hole-free DRAM run of a 16 GiB SM8750 board
++// (0x8c0000000..0xc00000000); XNU's boot tables and zone map are sized for it.
++#define DARWIN_WINDOW_MAX   0x340000000ULL
++// A request above this may shrink to the largest run when no run holds it
++// whole (UEFI's own allocations at the top of DRAM), never below it: the
++// window every board ran with before the bound was raised.
++#define DARWIN_WINDOW_FLOOR 0x200000000ULL
+ static inline int DarwinWindowSizeValid(unsigned long long size) {
+-  return size >= 0x10000000ULL && size <= 0x200000000ULL && !(size & 0x1fffffULL);
++  return size >= 0x10000000ULL && size <= DARWIN_WINDOW_MAX && !(size & 0x1fffffULL);
+ }
++// The window to take from a run with Avail bytes after its aligned start:
++// the request if it fits, else (requests above the floor only) the run's
++// whole 2 MiB blocks when they reach the floor, else 0.
++static inline unsigned long long DarwinWindowFit(unsigned long long request, unsigned long long avail) {
++  unsigned long long fit = avail & ~0x1fffffULL;
++  if (avail >= request) { return request; }
++  if (request <= DARWIN_WINDOW_FLOOR || fit < DARWIN_WINDOW_FLOOR) { return 0; }
++  return fit;
++}
+ #endif
+--- a/Test/window-size.c
++++ b/Test/window-size.c
+@@ -2,8 +2,20 @@
+ #include <assert.h>
+ #include "../DarwinBootPkg/Driver/WindowSize.h"
+ int main(void) {
+- const unsigned long long yes[]={0x10000000ULL,0xe0000000ULL,0x100000000ULL,0x130000000ULL,0x200000000ULL};
+- const unsigned long long no[]={0,0xfffffffULL,0x10000001ULL,0x130001000ULL,0x200200000ULL,~0ULL};
++ const unsigned long long yes[]={0x10000000ULL,0xe0000000ULL,0x100000000ULL,0x130000000ULL,0x200000000ULL,0x33fe00000ULL,0x340000000ULL};
++ const unsigned long long no[]={0,0xfffffffULL,0x10000001ULL,0x130001000ULL,0x340200000ULL,0x33fe01000ULL,~0ULL};
+  for(unsigned i=0;i<sizeof(yes)/sizeof(yes[0]);++i)assert(DarwinWindowSizeValid(yes[i]));
+  for(unsigned i=0;i<sizeof(no)/sizeof(no[0]);++i)assert(!DarwinWindowSizeValid(no[i]));
++ // A request that fits is taken as it is.
++ assert(DarwinWindowFit(0x200000000ULL,0x33fffc000ULL)==0x200000000ULL);
++ assert(DarwinWindowFit(0x33fe00000ULL,0x33fffc000ULL)==0x33fe00000ULL);
++ // 13 GiB from a 13 GiB run with the kernel's 16 KiB offset: the run's whole 2 MiB blocks.
++ assert(DarwinWindowFit(0x340000000ULL,0x33fffc000ULL)==0x33fe00000ULL);
++ // UEFI's pools at the top of DRAM: shrunk, never below 8 GiB.
++ assert(DarwinWindowFit(0x340000000ULL,0x2f0123000ULL)==0x2f0000000ULL);
++ assert(DarwinWindowFit(0x340000000ULL,0x200000000ULL)==0x200000000ULL);
++ assert(DarwinWindowFit(0x340000000ULL,0x1ffffc000ULL)==0);
++ // Requests up to 8 GiB never shrink (the old behaviour).
++ assert(DarwinWindowFit(0x200000000ULL,0x1ffffc000ULL)==0);
++ assert(DarwinWindowFit(0x100000000ULL,0xfff00000ULL)==0);
+ }

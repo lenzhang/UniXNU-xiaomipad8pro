@@ -18,13 +18,8 @@ FROM=${ESP_FROM:-$D}
 mkdir -p "$O" out/fd logs/fd
 FD_FILE=out/fd/piano-uefi-A-bundled.fd
 if [ "${FD:-0}" = 1 ]; then
-  tooling/firmware/setup-mu.sh
-  ln -sfn "$R/piano-uefi-UniXNU-piano/uefi/Binaries/piano" "$M/Binaries/piano"
-  tooling/unixnu.sh build firmware --skip-preflight -j "${JOBS:-10}" > logs/fd/build-A-bundled.log 2>&1 || { tail -20 logs/fd/build-A-bundled.log; exit 1; }
-  strings -a "$M/Build/pianoPkg/DEBUG_CLANGPDB/AARCH64/UniXNU.efi" | grep -q 'config: volume %s' \
-    || { echo "UniXNU.efi lacks firmware/patches/unixnu/0001 (config: volume)" >&2; exit 1; }
-  cp "$M/Build/pianoPkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd" "$FD_FILE"
-  shasum -a 256 "$FD_FILE" | cut -c1-64 > "$FD_FILE.ram-payload-first"
+  # setup-mu.sh, the build, the checks of firmware/patches/unixnu/0001 and darwinboot/0001, the stamps, the old FD as .prev
+  tooling/firmware/build-fd.sh
 fi
 [ -f "$FD_FILE" ] || { echo "no $FD_FILE: FD=1 $0" >&2; exit 1; }
 [ "$(cat "$FD_FILE.ram-payload-first" 2>/dev/null)" = "$(shasum -a 256 "$FD_FILE" | cut -c1-64)" ] \
