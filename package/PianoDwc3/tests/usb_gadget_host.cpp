@@ -36,6 +36,7 @@ struct FakeHal {
   uint16_t lines[kPorts] = {};
   bool quiet = true;
 
+  FakeHal() { regs[GCTL] = 0x00102004; }   // the core's reset value on piano (C7, after USB30_PRIM_BCR): the device role
   uint32_t rd(uint32_t off) { return regs[off]; }
   void wr(uint32_t off, uint32_t v)
   {
@@ -904,9 +905,27 @@ static void sleepCycle(bool quiet)
   std::printf("sleep cycle: disconnected, connected again, enumerated afresh\n");
 }
 
+// The core outside the device role (C6: the host role at the takeover): every entry that would touch a device register refuses, and
+// none is touched (no endpoint command, DCTL and DCFG as they were, the role left alone).
+static void hostRoleRefused()
+{
+  for (uint32_t gctl : {0x00101005u, 0x00103005u, 0x00100005u}) {
+    FakeHal h;
+    h.regs[GCTL] = gctl;
+    h.regs[DCTL] = 0x10f00000;
+    h.regs[DCFG] = 0x0048080c;
+    G g;
+    g.bind(&h, 3, 0x0001);
+    uint32_t waited = 7;
+    CHECK(!g.halt(10) && !g.softReset(true, &waited) && waited == 0 && !g.init() && !g.initDevice() && !g.run(10));
+    CHECK(h.cmds.empty() && h.regs[DCTL] == 0x10f00000 && h.regs[DCFG] == 0x0048080c && h.regs[GCTL] == gctl);
+  }
+}
+
 int main(int argc, char **argv)
 {
   (void)argv;
+  hostRoleRefused();
   sleepCycle(argc < 2);
   goldenDescriptors();
   scenario(2, false, argc < 2);

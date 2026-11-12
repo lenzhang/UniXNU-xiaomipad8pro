@@ -31,6 +31,9 @@
 // this driver's own tables; after RUN_STOP a link watch runs the cold start when no host resets the device within
 // piano-usb-cold-wait seconds (at most 3 cold starts a boot). piano-usb-cold-sim=MASK first leaves the hardware as the normal path
 // may (a test from ABL fastboot); the monitor's `usb cold [sim MASK]` does the same live.
+// The role rule (C6, docs/forensics-2026-11-11.md section 7.6): no device register while GCTL reads another role, no xHCI register
+// outside the host role. c2 and the takeover's gate leave the core in the device role (the xHCI halted, PRTCAPDIR, then the device
+// soft reset; the block reset when that is not shown done); the gadget refuses outside the device role; coreRd/coreWr refuse too.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -222,6 +225,37 @@ IOMemoryMap *gDmaMap;
 uint8_t *gDmaVa;
 uint64_t gDmaPa;
 IOLock *gLock;
+
+// The role rule at the lowest level (UsbCold.h; C6, docs/forensics-2026-11-11.md section 7.6): GCTL.PRTCAPDIR as this driver last
+// read or wrote it (0xff: not known, as at the start and after a hand-off's release). A device register (dwc3::isDeviceReg) is
+// touched only while that is the device role, an xHCI register only while it is the host role: otherwise a read answers 0 and a
+// write is dropped, both counted (the first offset kept for `usb`). Every path reads GCTL before its first device register (the
+// probe, the inspection, c2, the takeover's gate), so a stale value can only refuse, never let an access through. Every core access
+// of this driver goes through coreRd/coreWr (the gadget's Hal and the cold start's) except the interrupt's GEVNTSIZ/GEVNTCOUNT
+// (global registers).
+volatile uint32_t gRoleSeen = 0xffu, gRoleRefused, gRoleRefusedFirst;
+bool roleAllows(uint32_t off)
+{
+  const uint32_t role = __atomic_load_n(&gRoleSeen, __ATOMIC_RELAXED);
+  if ((dwc3::isDeviceReg(off) && role != dwc3::ROLE_DEVICE) || (dwc3::isXhciReg(off) && role != dwc3::ROLE_HOST)) {
+    if (__atomic_fetch_add(&gRoleRefused, 1u, __ATOMIC_RELAXED) == 0) gRoleRefusedFirst = off;
+    return false;
+  }
+  return true;
+}
+uint32_t coreRd(uint32_t off)
+{
+  if (!roleAllows(off)) return 0;
+  const uint32_t v = rd32(gDwc.va + off);
+  if (off == dwc3::GCTL) __atomic_store_n(&gRoleSeen, dwc3::roleOf(v), __ATOMIC_RELAXED);
+  return v;
+}
+void coreWr(uint32_t off, uint32_t v)
+{
+  if (!roleAllows(off)) return;
+  wr32(gDwc.va + off, v);
+  if (off == dwc3::GCTL) __atomic_store_n(&gRoleSeen, dwc3::roleOf(v), __ATOMIC_RELAXED);
+}
 
 // The USB thread's wake-up word (docs/power-irq.md): it waits on it between passes; the core's interrupt (piano-usb-irq=1) and every
 // producer (console and pipe writers, the pipe and HID readers freeing room, the network queues) kick it.
@@ -820,8 +854,8 @@ void shellThread(void *, wait_result_t)
 
 // ------------------------------------------------------------------------------------------------------- the gadget's Hal
 struct KernelHal {
-  uint32_t rd(uint32_t off) { return rd32(gDwc.va + off); }
-  void wr(uint32_t off, uint32_t v) { wr32(gDwc.va + off, v); }
+  uint32_t rd(uint32_t off) { return coreRd(off); }
+  void wr(uint32_t off, uint32_t v) { coreWr(off, v); }
   void barrier() { dsb(); }
   void udelay(unsigned us)
   {
@@ -1011,14 +1045,19 @@ void probeCore()
   using namespace dwc3;
   using namespace pianohw;
   if (!mapRegion(gDwc, kDwc3, kDwc3Bytes) || !mapRegion(gQs, kQscratch, 0x100)) { note("cannot map the core"); return; }
-  auto r = [](uint32_t off) { return rd32(gDwc.va + off); };
+  auto r = [](uint32_t off) { return coreRd(off); };
   gSnpsId = r(GSNPSID);
+  const uint32_t gctl = r(GCTL);   // first: the role rule (coreRd) needs the role before any device register
   note("core GSNPSID %08x GVERSION %08x GVERTYPE %08x GCTL %08x GSTS %08x GUCTL %08x GUCTL1 %08x GSBUSCFG0 %08x GSBUSCFG1 %08x",
-       gSnpsId, r(GVERSION), r(GVERTYPE), r(GCTL), r(GSTS), r(GUCTL), r(GUCTL1), r(GSBUSCFG0), r(GSBUSCFG1));
+       gSnpsId, r(GVERSION), r(GVERTYPE), gctl, r(GSTS), r(GUCTL), r(GUCTL1), r(GSBUSCFG0), r(GSBUSCFG1));
   note("core GHWPARAMS0 %08x 1 %08x 3 %08x 6 %08x 7 %08x GUSB2PHYCFG %08x GUSB3PIPECTL %08x GDBGLTSSM %08x", r(GHWPARAMS0),
        r(GHWPARAMS1), r(GHWPARAMS3), r(GHWPARAMS6), r(GHWPARAMS7), r(GUSB2PHYCFG), r(GUSB3PIPECTL), r(GDBGLTSSM));
-  note("device DCFG %08x DCTL %08x DSTS %08x (link state %u) DEVTEN %08x DALEPENA %08x GEVNTADR %08x%08x GEVNTSIZ %08x GEVNTCOUNT %08x",
-       r(DCFG), r(DCTL), r(DSTS), dstsLinkState(r(DSTS)), r(DEVTEN), r(DALEPENA), r(GEVNTADRHI), r(GEVNTADRLO), r(GEVNTSIZ), r(GEVNTCOUNT));
+  if (roleOf(gctl) == ROLE_DEVICE)
+    note("device DCFG %08x DCTL %08x DSTS %08x (link state %u) DEVTEN %08x DALEPENA %08x GEVNTADR %08x%08x GEVNTSIZ %08x GEVNTCOUNT %08x",
+         r(DCFG), r(DCTL), r(DSTS), dstsLinkState(r(DSTS)), r(DEVTEN), r(DALEPENA), r(GEVNTADRHI), r(GEVNTADRLO), r(GEVNTSIZ), r(GEVNTCOUNT));
+  else
+    note("device registers not read: the core is in the %s role (GCTL %08x); GEVNTADR %08x%08x GEVNTSIZ %08x GEVNTCOUNT %08x",
+         cold::roleName(roleOf(gctl)), gctl, r(GEVNTADRHI), r(GEVNTADRLO), r(GEVNTSIZ), r(GEVNTCOUNT));
   note("TX FIFOs %08x %08x %08x %08x %08x, RX FIFO %08x; QSCRATCH general %08x hs_phy %08x ss_phy %08x", r(GTXFIFOSIZ0),
        r(GTXFIFOSIZ0 + 4), r(GTXFIFOSIZ0 + 8), r(GTXFIFOSIZ0 + 12), r(GTXFIFOSIZ0 + 16), r(GRXFIFOSIZ0), rd32(gQs.va + kQsGeneralCfg),
        rd32(gQs.va + kQsHsPhyCtrl), rd32(gQs.va + kQsSsPhyCtrl));
@@ -1419,10 +1458,10 @@ struct ColdHal {
     wr32(gTcsrUsb2.va, v);
     dsb();
   }
-  uint32_t core(uint32_t off) { return rd32(gDwc.va + off); }
+  uint32_t core(uint32_t off) { return coreRd(off); }
   void coreWrite(uint32_t off, uint32_t v)
   {
-    wr32(gDwc.va + off, v);
+    coreWr(off, v);
     dsb();
   }
   uint32_t m31(uint32_t off) { return rd32(gM31.va + off); }
@@ -1538,6 +1577,16 @@ bool takeover(bool coldStart)
        net ? " + the CDC-NCM network function (interfaces after the ports, endpoints 7 and 8)" :
        gArgs.net ? " (no network function: it needs 9 IN endpoints)" : "");
   stage(12, "takeover: halt");
+  {   // The role rule's gate (UsbCold.h ensureDevice), before the first device register, in every mode: a core that does not read
+      // the device role (a boot path that ran it as a host, a hand-off not given back, piano-usb-cold=0) gets the xHCI halted and
+      // the switch first; one that still does not is left alone (C6's order hung the system).
+    ColdHal h;
+    cold::RoleSwitch rs;
+    if (!coldMap() || !cold::ensureDevice(h, rs)) {
+      stage(-12, "takeover: the device role (the 'takeover: role:' line says why; no device register was touched)");
+      return false;
+    }
+  }
   if (gHal.rd(DCTL) & DCTL_RUN_STOP) note("the firmware left RUN_STOP set (DSTS %08x)", gHal.rd(DSTS));
   gGadget.bind(&gHal, ports, uint16_t(gArgs.pid), gArgs.trace, net);
   if (!gGadget.halt(100)) note("no halt within 100 ms (DSTS %08x): continuing with the soft reset", gHal.rd(DSTS));
@@ -1606,6 +1655,9 @@ bool takeover(bool coldStart)
   piano_dwc3_stage = 20;
   gHal.note("stage 20 running: DCFG %08x DCTL %08x DSTS %08x GEVNTCOUNT %08x; waiting for the Mac (VID:PID %04x:%04x)", gHal.rd(DCFG),
             gHal.rd(DCTL), gHal.rd(DSTS), gHal.rd(GEVNTCOUNT), kVendor, gArgs.pid);
+  if (gRoleRefused)
+    gHal.note("role rule: %u core accesses refused so far (the first at %#x): a path reached a device register outside the device role "
+              "(or the xHCI outside the host role); report this line", gRoleRefused, gRoleRefusedFirst);
   return true;
 }
 
@@ -1613,11 +1665,22 @@ void usbStatus()
 {
   using namespace dwc3;
   const GadgetStats &s = gGadget.stats;
-  if (glueClocked() && gDwc.va)
+  const uint32_t gctl = glueClocked() && gDwc.va ? gHal.rd(GCTL) : 0;   // first: the role rule
+  if (glueClocked() && gDwc.va && roleOf(gctl) == ROLE_DEVICE)
     cprintf("piano-usb=%u stage %d; core %08x DCTL %08x DSTS %08x (link %u) DCFG %08x GEVNTCOUNT %08x\n", gArgs.level, piano_dwc3_stage,
             gSnpsId, gHal.rd(DCTL), gHal.rd(DSTS), dstsLinkState(gHal.rd(DSTS)), gHal.rd(DCFG), gHal.rd(GEVNTCOUNT));
+  else if (glueClocked() && gDwc.va)
+    cprintf("piano-usb=%u stage %d; core %08x GCTL %08x: the %s role, the device registers are not read\n", gArgs.level, piano_dwc3_stage,
+            gSnpsId, gctl, cold::roleName(roleOf(gctl)));
   else
     cprintf("piano-usb=%u stage %d; the glue is NOT clocked: the core is not read\n", gArgs.level, piano_dwc3_stage);
+  const cold::RoleSwitch &rs = gColdLast.role;
+  if (gColdRan)
+    cprintf("role: the last cold start's c2 found role %u (%s), xHCI %d, soft switch %s, block reset %s; role rule: %u accesses refused "
+            "(the first at %#x)\n", rs.found, cold::roleName(rs.found), rs.xhci, !rs.soft ? "not tried" : rs.proven ? "proven" : "NOT proven",
+            rs.blockReset ? rs.bcrWhy : "not taken", gRoleRefused, gRoleRefusedFirst);
+  else
+    cprintf("role: no cold start this boot; role rule: %u accesses refused (the first at %#x)\n", gRoleRefused, gRoleRefusedFirst);
   char why[480];
   cold::whyText(gColdReasons, why, sizeof why);
   cprintf("cold: piano-usb-cold=%s steps %#x sim %#x wait %u s; at the takeover the inherited state had: %s; cold starts %u (at most %u), "
@@ -1804,6 +1867,7 @@ void handoffRelease()
   gHandoffReleases++;
   gHal.note("hand-off: released to PianoUsbHost (%u): DCTL %08x DSTS %08x (%s); the console keeps its log for the replay", gHandoffReleases,
             gHal.rd(DCTL), gHal.rd(DSTS), halted ? "halted" : "NOT halted within 100 ms");
+  __atomic_store_n(&gRoleSeen, 0xffu, __ATOMIC_RELAXED);   // PianoUsbHost changes the role: not known until GCTL is read again
   handoffSet(kHoReleased);
 }
 

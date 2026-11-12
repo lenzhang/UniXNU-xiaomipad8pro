@@ -103,11 +103,23 @@ public:
   // TX FIFO sizes written by initDevice() (the network function's; planTxFifos), before the core runs.
   void setTxFifoPlan(const TxFifoPlan &plan) { fifoPlan = plan; }
 
+  // GCTL reads the device role. Every method that touches a device register (DCTL, DSTS, DCFG, the endpoint commands) asks first
+  // and touches nothing when it does not: the role switch is the caller's (UsbCold.h's toDevice: the xHCI halted, PRTCAPDIR, then
+  // the device side's soft reset). A device soft reset or an endpoint started in the host role is what hung C6
+  // (docs/forensics-2026-11-11.md section 7.6).
+  bool deviceRole() { return dwc3::roleOf(h->rd(dwc3::GCTL)) == dwc3::ROLE_DEVICE; }
+
   // DCTL.CSFTRST with both PHY interfaces awake (a soft reset needs their clocks; the firmware's USB shutdown can leave the
-  // UTMI side in suspend). dwc31: DWC_usb31/32 (GSNPSID 0x3331/0x3332): 20 ms steps up to 200 ms, then 50 ms settling.
+  // UTMI side in suspend). dwc31: DWC_usb31/32 (GSNPSID 0x3331/0x3332): 20 ms steps up to 200 ms, then 50 ms settling. Only in the
+  // device role (false, nothing written, otherwise).
   bool softReset(bool dwc31, uint32_t *waitedUs)
   {
     using namespace dwc3;
+    *waitedUs = 0;
+    if (!deviceRole()) {
+      h->note("soft reset refused: GCTL %08x is not the device role (no device register is touched)", h->rd(GCTL));
+      return false;
+    }
     wakePhy();
     h->udelay(1000);
     h->wr(DCTL, (h->rd(DCTL) & ~(DCTL_RUN_STOP | DCTL_ULSTCHNGREQ_MASK)) | DCTL_CSFTRST);
@@ -141,12 +153,18 @@ public:
     return initDevice();
   }
 
-  // The device side again (role, speed, EP0, transfer resources) with the event buffer as it is: after init(), and for a
-  // reconnect (the core keeps its event write position, as Linux relies on when it toggles RUN_STOP).
+  // The device side again (speed, EP0, transfer resources) with the event buffer as it is: after init(), and for a reconnect (the
+  // core keeps its event write position, as Linux relies on when it toggles RUN_STOP). The core must already be in the device
+  // role (false, no device register touched, otherwise): switching it here, after the soft reset, left C6's host state in place.
   bool initDevice()
   {
     using namespace dwc3;
-    h->wr(GCTL, (h->rd(GCTL) & ~GCTL_PRTCAPDIR_MASK) | GCTL_PRTCAP_DEVICE | GCTL_DSBLCLKGTNG);
+    const uint32_t gctl = h->rd(GCTL);
+    if (roleOf(gctl) != ROLE_DEVICE) {
+      h->note("device init refused: GCTL %08x is not the device role (no device register is touched)", gctl);
+      return false;
+    }
+    h->wr(GCTL, gctl | GCTL_DSBLCLKGTNG);
     h->wr(DCFG, (h->rd(DCFG) & ~(DCFG_DEVSPD_MASK | DCFG_DEVADDR_MASK | DCFG_NUMP_MASK | DCFG_LPM_CAP)) | DCFG_SPEED_HS | dcfgNump(16));
     for (unsigned i = 0; i < kPhys; ++i) ep[i] = EpState{};
     netAlt = netAltNew = 0;
@@ -177,10 +195,14 @@ public:
     return true;
   }
 
-  // Arm the first SETUP, then RUN_STOP. waitMs bounds the wait for DSTS.DEVCTRLHLT to clear.
+  // Arm the first SETUP, then RUN_STOP (only in the device role). waitMs bounds the wait for DSTS.DEVCTRLHLT to clear.
   bool run(unsigned waitMs)
   {
     using namespace dwc3;
+    if (!deviceRole()) {
+      h->note("run refused: GCTL %08x is not the device role (no device register is touched)", h->rd(GCTL));
+      return false;
+    }
     if (!armSetup()) return false;
     h->wr(DCTL, (h->rd(DCTL) & ~(DCTL_U1U2_MASK | DCTL_ULSTCHNGREQ_MASK | DCTL_TSTCTRL_MASK)) | DCTL_RUN_STOP);
     for (unsigned i = 0; i < waitMs * 10; ++i) {
@@ -190,10 +212,11 @@ public:
     return !(h->rd(DSTS) & DSTS_DEVCTRLHLT);
   }
 
-  // RUN_STOP off, then wait for the halt (true when halted).
+  // RUN_STOP off, then wait for the halt (true when halted). Outside the device role nothing is touched (false).
   bool halt(unsigned waitMs)
   {
     using namespace dwc3;
+    if (!deviceRole()) return false;
     h->wr(DCTL, h->rd(DCTL) & ~DCTL_RUN_STOP);
     for (unsigned i = 0; i < waitMs * 10; ++i) {
       if (h->rd(DSTS) & DSTS_DEVCTRLHLT) return true;

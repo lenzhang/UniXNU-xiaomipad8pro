@@ -23,6 +23,14 @@ constexpr uint32_t depcmdBase(unsigned phys) { return 0xc800 + 16 * phys; }
 // GCTL
 constexpr uint32_t GCTL_DSBLCLKGTNG = 1u << 0, GCTL_CORESOFTRESET = 1u << 11, GCTL_PRTCAPDIR_MASK = 3u << 12,
                    GCTL_PRTCAP_DEVICE = 2u << 12;
+// The role (GCTL.PRTCAPDIR): 1 host, 2 device, 3 OTG (0 is not a role). GSTS.CURMOD (bits 1:0) says which side runs: 0 device, 1 host.
+enum : uint32_t { ROLE_NONE = 0, ROLE_HOST = 1, ROLE_DEVICE = 2, ROLE_OTG = 3 };
+constexpr uint32_t roleOf(uint32_t gctl) { return (gctl >> 12) & 3u; }
+constexpr uint32_t GSTS_CURMOD_MASK = 3u, GSTS_CURMOD_DEVICE = 0u, GSTS_CURMOD_HOST = 1u;
+// The device registers (DCFG 0xc700 up to the last endpoint command block, below 0xcc00): only touched while GCTL reads the device
+// role. The xHCI's registers (below 0x8000, CAPLENGTH at 0) only while it reads the host role. Everything else from 0xc100 is global.
+constexpr bool isDeviceReg(uint32_t off) { return off >= 0xc700 && off < 0xcc00; }
+constexpr bool isXhciReg(uint32_t off) { return off < 0x8000; }
 // GUSB2PHYCFG / GUSB3PIPECTL: PHY suspend controls (piano DT: snps,dis_u2_susphy_quirk, snps,dis_enblslpm_quirk)
 constexpr uint32_t GUSB2PHYCFG_SUSPHY = 1u << 6, GUSB2PHYCFG_ENBLSLPM = 1u << 8, GUSB3PIPECTL_SUSPHY = 1u << 17;
 // GEVNTSIZ
