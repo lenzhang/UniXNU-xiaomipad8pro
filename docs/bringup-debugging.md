@@ -199,3 +199,13 @@ The fix: PianoA830 never asks XNU for a contiguous block above 2 GiB less a page
 patch 0065 (`patches/k27/0065-*`) gives a failed contiguous allocation's pages back ungobbled with both counts fixed and refuses a size
 the map would refuse before the search. Until 0065 is in the kernel, a contiguous allocation that fails on a full kmem range (13 GiB:
 the shared data range holds the GPU's buffers and the Data disk's fallback chunks) can still leak.
+
+**A kernel stack overflow** (2026-11-13, c3rp: `logs/native-runs/20261113-000631-loop`): `Invalid kernel stack pointer (probable
+overflow). at pc 0xfffffff009fda0f0, lr ...` and `MACH Reboot`, no other panic text. pc in `el1_sp0_synchronous_vector_long` (+0xf0:
+the vector's `stp x0, x1, [sp, #0x8]` after `sub sp, sp, #0x350`) means the exception frame itself faulted: SP_EL0 at the first
+exception was sp + 0x350, and far = sp + 8 lies in the unmapped page below the thread's stack. A kernel thread has 16 KiB
+(`KERNEL_STACK_SIZE` on this DEVELOPMENT kernel; the vector's check is SP above kstackptr - 0x4000, a little below the real bottom,
+so a store just past the bottom faults first and the frame's store is the one reported). lr and x19-x28 are the overflowing
+thread's (here `vm_map_store_lookup_entry`, a 64 KiB range: PianoCamera mapping DRV-2). A kext's own frames from its thread's entry:
+`tooling/k27/check-kext-stack.py OBJECT.o ENTRY --indirect NAMES` (a static bound; XNU's IOKit mapping path below needed about 3-4
+KiB); at run time `ml_stack_remaining()` (PianoCamera logs its least at the end of a run).
