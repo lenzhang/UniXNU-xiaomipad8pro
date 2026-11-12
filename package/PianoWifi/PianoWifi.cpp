@@ -198,7 +198,8 @@ uint64_t nowMs();
 // its lines out within a second (desk-dev8n, 2026-11-12: the lines were printed only at the ladder's end, the ladder never ended,
 // and nothing came for 30 minutes). The same helper watches each level's hard deadline (piano-wifi-deadline) and says so when the
 // ladder is past it. Other threads (the power hook) print at once. piano-wifi-defer=0 prints everything as it happens.
-constexpr unsigned kDeferLines = 320, kDeferBytes = 300;   // 96 000 bytes of heap while the ladder runs
+// 480 lines: level 5 now has a line per answer (the board file alone is 21 segments) before level 6's lines.
+constexpr unsigned kDeferLines = 480, kDeferBytes = 300;   // 144 000 bytes of heap while the ladder runs
 constexpr unsigned kDeferTickMs = 50, kDeferAgeMs = 1000, kWatchGraceMs = 2000, kWatchRepeatMs = 30000, kWatchLines = 20;
 char *gDeferBuf;
 unsigned gDeferCount, gDeferDropped;   // gDeferCount: lines written (the ladder's thread only, published with a release store)
@@ -1993,11 +1994,13 @@ uint8_t *wlfwClaim(void *, uint32_t *capacity)
   *capacity = gIpcr.tx[index].bytes - QCOM_QRTR_HEADER;
   return gIpcr.tx[index].va + QCOM_QRTR_HEADER;
 }
+uint64_t gWlfwSentAt;   // when the request outstanding went out (its answer's line says how long it took)
 int wlfwSendMessage(void *, uint8_t *buffer, uint32_t length)
 {
   uint8_t *base = buffer - QCOM_QRTR_HEADER;
   uint32_t node = 0, port = 0;
   if (!wlfwFind(&node, &port)) return -1;
+  gWlfwSentAt = nowMs();
   for (unsigned i = 0; i < kIpcrOutBuffers; ++i)
     if (gIpcr.tx[i].va == base)
       return qcom_qrtr_send_buffer(&gRouter, base, gIpcr.tx[i].bytes, kQrtrClientPort, node, port, length);
@@ -2024,7 +2027,60 @@ void wlfwStepNote(void *, int step, const char *what)
 {
   piano_wifi_stage = step;
   note("step %d: %s", step, what);
+  // What each download step sends (names and sizes only: nothing of a file is ever printed).
+  auto file = [&](const char *name, const char *kind) {
+    const uint32_t bytes = wlfwFileSize(nullptr, name);
+    if (!bytes) return note("step %d: %s: %s is not in %s of the firmware partition", step, kind, name, "image/peach or image");
+    note("step %d: %s: %s, %u bytes, %u segment(s) of at most %u, file identifier %#x", step, kind, name, bytes,
+         (bytes + kWlfwMaxDataBytes - 1) / kWlfwMaxDataBytes, kWlfwMaxDataBytes, gClient.boardId);
+  };
+  if (step == kWlfwStepRegdb) {
+    note("step %d: board identifiers: the chip's capability %s%#x, the radio's capability %s%#x; the downloads carry %#x", step,
+         gClient.haveCapBoard ? "" : "gave none: ", gClient.haveCapBoard ? gClient.capBoardId : kBoardIdDefault,
+         gClient.havePhyBoard ? "" : "gave none: ", gClient.havePhyBoard ? gClient.phyBoardId : kBoardIdDefault, gClient.boardId);
+    file(kRegdbName, "the regulatory database (kind 4)");
+  } else if (step == kWlfwStepBoard) {
+    const char *why = nullptr;
+    const char *name = wlfwBoardFile(gClient.boardId, &why);
+    note("step %d: board file %s for board %#x: %s", step, name, gClient.boardId, why);
+    file(name, "the board file (kind 1, at most 256 KiB sent)");
+  } else if (step == kWlfwStepM3 || step == kWlfwStepAuxUc) {
+    const char *name = step == kWlfwStepM3 ? kM3Name : kAuxUcName;
+    note("step %d: %s, %u bytes, by address", step, name, wlfwFileSize(nullptr, name));
+  } else if (step == kWlfwStepQdss) {
+    file(kQdssName, "the trace configuration");
+  }
   deferPhase();
+}
+
+// Every answer and indication of the firmware's service, with its codes (WlfwIo::event).
+const char *wlfwIndicationName(uint16_t message)
+{
+  switch (message) {
+  case kWlfwRequestMemInd: return "the firmware asks for memory";
+  case kWlfwFwMemReadyInd: return "the firmware's memory is ready";
+  case kWlfwFwReadyInd: return "the firmware is ready";
+  default: return "one this driver does not act on";
+  }
+}
+void wlfwEventNote(void *, const WlfwEvent &e)
+{
+  if (e.kind == kWlfwEventIndication) {
+    note("step %d: indication %#06x: %s", e.step, e.message, wlfwIndicationName(e.message));
+    return;
+  }
+  if (e.kind == kWlfwEventUnexpected) {
+    note("step %d: unexpected message %#06x transaction %u%s%s (counted, not acted on)", e.step, e.message, e.transaction,
+         e.hasResult ? ", a response or a refusal" : "", e.message == kWlfwFwReadyInd ? ": a ready indication before its time" : "");
+    return;
+  }
+  char what[120] = "";
+  if (e.segment >= 0)
+    snprintf(what, sizeof what, ", %s segment %d of %u, %u bytes%s", e.file ? e.file : "?", e.segment + 1, e.segments, e.bytes,
+             e.last ? ", the last" : "");
+  note("step %d: answer to %#06x (transaction %u%s) after %llu ms: %s result %u error %#x%s", e.step, e.message, e.transaction,
+       what, (unsigned long long)(nowMs() - gWlfwSentAt), !e.hasResult ? "no result TLV," : "", e.result, e.error,
+       !e.hasResult ? "" : e.result == kQmiResultSuccess ? " (accepted)" : " (refused)");
 }
 
 // One turn: the event rings walked, every received packet given to the router, the buffers given back to the chip, and the
@@ -2071,6 +2127,8 @@ unsigned pump(bool &stop)
   // Every buffer a packet came back in goes onto channel 21's ring again (from the walk after 21's start on: before it the
   // transport posts nothing, since 21's preparation puts its ring back at the base).
   if (seen) ipcrPostRx(gIpcr, gMhiIo);
+  // A flow-control answer the link refused when it was due goes out now (the firmware sends nothing more to our port without it).
+  qcom_qrtr_poll(&gRouter);
   const MhiHealth h = mhiHealth(gMhiIo, gBoot.bhi);
   if (h.dead()) fatal = true;
   if (fatal) gChipDead = true;
@@ -2118,15 +2176,19 @@ void ipcrReport(const char *when)
   if (!o.ctx || !i.ctx) return;
   uint8_t *ev = mhiEventCtx(gContexts, kIpcrEventRing);
   const uint64_t evBase = get64(ev + 12), evRp = get64(ev + 28), acked = gContexts.acked[kIpcrEventRing];
+  // Three lines: a held line has room for 300 bytes (kDeferBytes), and one line cut the 2026-11-12 boots' report in half.
   note("level 5: %s: channel 20 state %#x, the chip's read pointer at element %d, ours %u, written to %u (%u owed), %u "
-       "completion(s) (last code %#x), %u doorbell(s); channel 21 state %#x, the chip's read pointer at element %d, ours %u, "
-       "written to %u (%u buffers posted), %u completion(s) (last code %#x, %u bytes), %u doorbell(s); data event ring: the chip "
-       "at element %lld, this host at %lld; %u event(s) dropped, %u element(s) given back unread, %u error code(s), %u "
-       "doorbell-mode event(s)",
+       "completion(s) (last code %#x), %u doorbell(s)",
        when, ipcrChanState(o), ipcrElementOf(o, get64(o.ctx + kChanRp)), o.rp, o.wp, ipcrOutstanding(o), o.events, o.lastCode,
-       o.doorbells, ipcrChanState(i), ipcrElementOf(i, get64(i.ctx + kChanRp)), i.rp, i.wp, ipcrRxPosted(gIpcr), i.events,
-       i.lastCode, i.lastLength, i.doorbells, (long long)(evRp - evBase) / int(kMhiElement),
-       (long long)(acked - evBase) / int(kMhiElement), gIpcr.dropped, gIpcr.skipped, gIpcr.transferErrors, gIpcr.dbModes);
+       o.doorbells);
+  note("level 5: %s: channel 21 state %#x, the chip's read pointer at element %d, ours %u, written to %u (%u buffers posted), "
+       "%u completion(s) (last code %#x, %u bytes), %u doorbell(s)",
+       when, ipcrChanState(i), ipcrElementOf(i, get64(i.ctx + kChanRp)), i.rp, i.wp, ipcrRxPosted(gIpcr), i.events, i.lastCode,
+       i.lastLength, i.doorbells);
+  note("level 5: %s: data event ring: the chip at element %lld, this host at %lld; %u event(s) dropped, %u element(s) given "
+       "back unread, %u error code(s), %u doorbell-mode event(s)",
+       when, (long long)(evRp - evBase) / int(kMhiElement), (long long)(acked - evBase) / int(kMhiElement), gIpcr.dropped,
+       gIpcr.skipped, gIpcr.transferErrors, gIpcr.dbModes);
 }
 
 int level5(PowerState &power, const Options &opt)
@@ -2244,6 +2306,7 @@ int level5(PowerState &power, const Options &opt)
   io.file_read = wlfwFileRead;
   io.memory = wlfwMemory;
   io.step = wlfwStepNote;
+  io.event = wlfwEventNote;
   const uint64_t started = nowMs();
   if (!wlfwStart(gClient, io, gArgs.mode, gArgs.shadow)) {
     note("level 5: the first request was not sent: %s", wlfwErrorName(gClient.error));
@@ -2252,6 +2315,7 @@ int level5(PowerState &power, const Options &opt)
     return -6;
   }
   int last = gClient.step;
+  unsigned heard = 0;   // responses and indications so far: each one is progress, and the next request gets its own deadline
   deadline = nowMs() + gArgs.qmiTimeoutMs;
   while (gClient.step != kWlfwStepDone && gClient.step != kWlfwStepStopped) {
     bool stop = false;
@@ -2261,8 +2325,10 @@ int level5(PowerState &power, const Options &opt)
       note("level 5: the chip reported a system error or its crash dump environment during %s", wlfwStepName(last));
       break;
     }
-    if (gClient.step != last && !levelLate()) {   // a step moved: its own deadline
+    const unsigned now = gClient.responses + gClient.indications;
+    if ((gClient.step != last || now != heard) && !levelLate()) {   // a step moved or an answer came: a deadline of its own
       last = gClient.step;
+      heard = now;
       deadline = nowMs() + gArgs.qmiTimeoutMs;
       continue;
     }
@@ -2274,8 +2340,24 @@ int level5(PowerState &power, const Options &opt)
     IOSleep(2);
   }
   // What the firmware said, and what was sent to it.
+  if (gClient.error == kWlfwErrTimeout && gClient.timedOutWaiting) {
+    char what[120] = "";
+    if (gClient.outSegment >= 0)
+      snprintf(what, sizeof what, ", %s segment %d of %u, %u bytes%s", gClient.outFile ? gClient.outFile : "?",
+               gClient.outSegment + 1, gClient.outSegments, gClient.outBytes, gClient.outLast ? ", the last" : "");
+    note("level 5: unanswered: request %#06x (transaction %u%s), sent %llu ms before the stop", gClient.pendingMessage,
+         gClient.pending, what, (unsigned long long)(nowMs() - gWlfwSentAt));
+  }
   note("level 5: the chip: chip %#x family %#x system-on-chip %#x, board %#x, %u radio(s)%s", gClient.chipId,
        gClient.chipFamily, gClient.socId, gClient.boardId, gClient.radios, gClient.singleChipMlo ? ", single-chip multi-link" : "");
+  note("level 5: board identifiers: the chip's capability %s%#x, the radio's capability %s%#x (only noted); board file %s",
+       gClient.haveCapBoard ? "" : "gave none, so ", gClient.haveCapBoard ? gClient.capBoardId : kBoardIdDefault,
+       gClient.havePhyBoard ? "" : "gave none: ", gClient.havePhyBoard ? gClient.phyBoardId : kBoardIdDefault,
+       wlfwBoardFile(gClient.boardId, nullptr));
+  if (gClient.qdssRefused || gClient.qdssSkipped)
+    note("level 5: the trace configuration %s; the exchange went on without it", gClient.qdssSkipped ? "is not on the partition"
+                                                                                                     : "was refused");
+  if (gClient.qdssRefused) note("level 5: its refusal: result %u error %#x", gClient.qdssResult, gClient.qdssError);
   note("level 5: the firmware: version %#x built %s, capabilities %#llx, status %#llx, %u MAC(s), %u mV", gClient.fwVersion,
        gClient.buildTimestamp[0] ? gClient.buildTimestamp : "?", (unsigned long long)gClient.fwCaps,
        (unsigned long long)gClient.fwStatus, gClient.macs, gClient.voltageMv);
@@ -2291,6 +2373,12 @@ int level5(PowerState &power, const Options &opt)
        "the router: %u packets in, %u data, %u unrouted, %u refused sends",
        gIpcr.sent, gIpcr.received, gIpcr.txDone, gIpcr.commands, gIpcr.dropped, gIpcr.refused, gRouter.rx_packets,
        gRouter.rx_data, gRouter.rx_unrouted, gRouter.tx_refused);
+  // The firmware's router asks for a RESUME_TX on its fifth packet to our port and sends nothing more from its tenth without one
+  // (P21): every request answered, none owed, is the healthy reading.
+  note("level 5: flow control: %u data packet(s) asked for an answer, %u RESUME_TX sent (from our port %#x to the sender, naming "
+       "node %u port %#x), %s",
+       gRouter.rx_confirms, gRouter.resumes_sent, kQrtrClientPort, kQrtrLocalNode, kQrtrClientPort,
+       gRouter.resume_owed ? "one still owed (the link refused it)" : "none owed");
   const bool done = gClient.step == kWlfwStepDone;
   note("level 5: %s after %llu ms (step %d: %s%s%s)", done ? "the firmware is ready" : "stopped",
        (unsigned long long)(nowMs() - started), done ? gClient.step : gClient.failedStep,
@@ -2299,7 +2387,13 @@ int level5(PowerState &power, const Options &opt)
        gM1Answers);
   ipcrReport(done ? "at the firmware's ready" : "where it stopped");
   if (!done) {
-    if (gChipDead) crashReport("level 5, during the QMI exchange");
+    if (gChipDead) {
+      crashReport("level 5, during the QMI exchange");
+    } else {   // the chip lives: whether its DMA left the window or a request was refused on the link is in these
+      rasReport();
+      if (gLinkState) dmaReport(*gLinkState);
+      msiSinkReport("where level 5 stopped");
+    }
     safeOff(gHw, power, opt);
     return -7;
   }
