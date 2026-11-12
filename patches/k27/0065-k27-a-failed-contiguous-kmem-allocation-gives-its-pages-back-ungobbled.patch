@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: UniXNU-piano <noreply@unixnu-piano.invalid>
+Date: Thu, 12 Nov 2026 20:00:00 +0800
+Subject: [PATCH] k27: a failed contiguous kmem allocation gives its pages back
+ ungobbled, and a size the kernel map refuses is refused before the search
+
+The first boot with the 13 GiB window (UniXNU-piano docs/bringup-debugging.md section 6) stopped at 158 s in
+vm_page_unwire() (vm_resident.c:6226 assert(!mem->vmp_gobbled)), called from vm_page_do_delayed_work()'s
+DW_vm_page_unwire (an IOPL's upl_commit_range/upl_abort_range slow path). Only vm_page_find_contiguous(wire=FALSE)
+sets vmp_gobbled, for kmem_alloc_contig_guard() (cpm_allocate()), and kernel_memory_populate_object_and_unlock()
+clears it. kmem_alloc_guard_internal() takes the contiguous pages before kmem_find_space(); when that fails (no room
+in the kmem range, or a size vm_map_is_map_size_valid() refuses: above vm_map_kernel_max_simple_mappable_size(), 2 GiB
+less a page, REJECT by default) the error path hands them to vm_page_free_list(..., FALSE), which keeps vmp_gobbled and
+leaves them in vm_page_wire_count and vm_page_gobble_count. vm_page_grab() hands such a page out as it is;
+vm_object_iopl_wire_empty() and iopl_valid_data() wire it without vm_page_wire() (the only other place that clears the
+flag), and its later vm_page_unwire() asserts. On piano the trigger was PianoA830's 2048 MiB BO pool request (every boot
+since 2026-11-12; with 13 GiB the contiguous pages could be found, then the map refused the mapping); with the 13 GiB
+window the kmem ranges are 2611 MiB each instead of about 4.5 GiB, so a range that fills is the other way in.
+
+- kmem_ungobble_page_list(): before the error path frees the list, every gobbled page is ungobbled and both counts
+  drop by their number (vm_page_find_contiguous() added each of them to vm_page_wire_count and vm_page_gobble_count).
+- For kmem_alloc_contig_guard() only (alloc_pages), vm_map_is_map_size_valid() is asked before the contiguous search:
+  a size the map will refuse no longer takes (and relocates) its pages first. KERN_NO_SPACE, as the map answers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ osfmk/vm/vm_kern.c | 42 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index 4f2045c..e71e45b 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -831,6 +831,37 @@ kmem_find_space(
+ 	return KERN_SUCCESS;
+ }
+ 
++/*
++ * k27 (piano): kmem_alloc_contig_guard()'s pages come from cpm_allocate()
++ * gobbled, and vm_page_find_contiguous() counted them as wired. When the
++ * allocation fails after taking them (kmem_find_space(): no room left in
++ * the kmem range, or a size the kernel map refuses), they go back to the
++ * free list through vm_page_free_list(..., FALSE), which keeps
++ * vmp_gobbled: the next owner of such a page that wires it without
++ * vm_page_wire() (vm_object_iopl_wire_empty()) and unwires it through
++ * vm_page_unwire() stops at assert(!mem->vmp_gobbled) (vm_resident.c,
++ * the 13 GiB boot of 2026-11-12), and the wired and gobbled counts keep
++ * the pages forever. Ungobble them first, as kernel_memory_populate does.
++ */
++static void
++kmem_ungobble_page_list(vm_page_t page_list)
++{
++	unsigned int gobbled = 0;
++
++	for (vm_page_t mem = page_list; mem != VM_PAGE_NULL; mem = mem->vmp_snext) {
++		if (mem->vmp_gobbled) {
++			mem->vmp_gobbled = false;
++			gobbled++;
++		}
++	}
++	if (gobbled) {
++		vm_page_lockspin_queues();
++		vm_page_gobble_count -= gobbled;
++		vm_page_wire_count -= gobbled;
++		vm_page_unlock_queues();
++	}
++}
++
+ static kmem_return_t
+ kmem_alloc_guard_internal(
+ 	vm_map_t                map,
+@@ -977,6 +1008,16 @@ kmem_alloc_guard_internal(
+ 
+ 	if (!(flags & (KMA_VAONLY | KMA_PAGEABLE))) {
+ 		if (alloc_pages) {
++			/*
++			 * k27 (piano): a size the kernel map will refuse
++			 * (vm_map_locate_space_anywhere()) is refused before
++			 * the contiguous search takes and relocates its pages.
++			 */
++			if (__improbable(!vm_map_is_map_size_valid(map, map_size,
++			    vmk_flags.vmkf_no_soft_limit))) {
++				kmr.kmr_return = KERN_NO_SPACE;
++				goto out_error;
++			}
+ 			kmr.kmr_return = alloc_pages(fill_size, flags,
+ 			    &wired_page_list);
+ 		} else {
+@@ -1162,6 +1203,7 @@ out_error:
+ 		wired_page_list = guard_right;
+ 	}
+ 	if (wired_page_list) {
++		kmem_ungobble_page_list(wired_page_list);
+ 		vm_page_free_list(wired_page_list, FALSE);
+ 	}
+ 
+-- 
+2.55.0
+
