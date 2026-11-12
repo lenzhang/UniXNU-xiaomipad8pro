@@ -173,7 +173,7 @@ struct StreamUndo {
 // what the first dump settles), else the packed line.
 inline void frameStats(const uint8_t *buf, uint64_t bytes, uint32_t frameBytes, unsigned width, unsigned height, FrameStats &s)
 {
-  s = FrameStats();
+  renew(s);
   s.width = width;
   s.height = height;
   s.bpl = raw10Bytes(width);
@@ -325,12 +325,13 @@ class Stream {
   Session<O> &s;
   StreamOptions opt;
 
-  StreamResult run(Sensor which, const Loader &loader, const Pmic &pmic, const SurveyOptions &so, Survey &survey)
+  // The result is the stream's own (valid while it lives; a StreamResult is 1.5 KiB, never copied onto the camera thread's stack).
+  const StreamResult &run(Sensor which, const Loader &loader, const Pmic &pmic, const SurveyOptions &so, Survey &survey)
   {
-    r_ = StreamResult();
-    u_ = StreamUndo();
-    d_ = Dma();
-    plan_ = RoutePlan();
+    renew(r_);
+    renew(u_);
+    renew(d_);
+    renew(plan_);
     rup_ = 0;
     wmEver_ = false;
     r_.attempted = true;

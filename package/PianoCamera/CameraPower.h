@@ -153,8 +153,9 @@ class Session {
   O &ops;
   PowerOptions opt;
 
-  // Powers `which`, reads its ID, powers it down. `s` is level 1's survey (re-read here after step 201).
-  SensorResult run(Sensor which, const Loader &loader, const Pmic &pmic, const SurveyOptions &so, Survey &s)
+  // Powers `which`, reads its ID, powers it down. `s` is level 1's survey (re-read here after step 201). The result is the
+  // session's own (valid while it lives: nothing of this size is copied onto the camera thread's stack).
+  const SensorResult &run(Sensor which, const Loader &loader, const Pmic &pmic, const SurveyOptions &so, Survey &s)
   {
     begin(which, loader, pmic, so, s);
     end();
@@ -164,8 +165,8 @@ class Session {
   // end() powers it down (always, after begin, whatever begin returned).
   bool begin(Sensor which, const Loader &loader, const Pmic &pmic, const SurveyOptions &so, Survey &s)
   {
-    r_ = SensorResult();
-    u_ = Undo();
+    renew(r_);
+    renew(u_);
     r_.attempted = true;
     r_.which = which;
     rear_ = which == Sensor::rear;
@@ -671,7 +672,7 @@ class Session {
     if (!gccBranchOn(2, kGccMclkAhb, "GCC MCLK controller AHB on")) return fail(kStepGcc, Failure::gcc);
     if (stopHere(kStepGcc)) return false;
     ops.step(kStepResurvey, "the survey again, with the controllers' AHB running");
-    s = survey(loader, pmic, so);
+    survey(loader, pmic, so, s);   // in place (a Survey is 1.8 KiB)
     found_ = s;
     ops.surveyed(s);   // the controllers as step 201 made them readable (logged: c1 could not read them)
     ops.step(kStepRefusals, "level 2's checks");

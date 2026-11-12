@@ -39,6 +39,11 @@ if grep -nE 'asm|"str[ \\]|volatile[^;]*\*[^;]*[^=!<>]=[^=]|ops\.' "$P/CameraSmm
 fi
 python3 "$D/tooling/k27/build-native-kext.py" PianoCamera "$P/PianoCamera.cpp" "$D/tooling/k27/NativeKextGlue.cpp" "${INC[@]}" -I "$G" \
   --obj "${K27_OBJ:-k27-native-obj}"
+# The camera thread's own frames stay well inside its 16 KiB kernel stack (c3rp 2026-11-13 overflowed it with 15 KiB of them; XNU's
+# IOKit mapping path below needs about 4 KiB): at most 6 KiB from its entry, the function-pointer targets of Loader/Pmic/RscIo/
+# PianoMmVotesOps/the SPMI Io included.
+python3 "$D/tooling/k27/check-kext-stack.py" "$O/PianoCamera.o" __ZN11PianoCamera6threadEPvi --max 6144 --brief \
+  --indirect loaderRd,pmicApid,pmicRead,cmdDbLookup,rscRd,rscWr,rscSleep,mmAddress,mmLevel,mmSend,mmSleep,mmReport,ioRd,ioWr,ioDelay >&2
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 # PianoA830's lock words (DRV-2, GCC votes) and the shared multimedia votes' words come from that kext (a library in
 # PianoCamera.json, linked before PianoCamera in configs/k27-native-kexts.txt), resolved by the KC link.

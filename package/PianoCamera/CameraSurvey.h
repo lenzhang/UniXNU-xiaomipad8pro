@@ -18,9 +18,26 @@
 #pragma once
 #include <stdint.h>
 #include <string.h>
+#if __has_include(<new>)
+#include <new>
+#else
+// The kernel has no <new>: XNU's own forward declaration (libkern/c++/safe_allocation.h). The reserved placement form, which the
+// compiler emits as its pointer argument (no call, no import).
+void *operator new(size_t, void *) noexcept;
+#endif
 #include "CameraHw.h"
 
 namespace pianocamera {
+
+// A value reset in place. `x = T()` builds the fresh T on the stack first and copies it: with Survey (1.8 KiB), StreamResult
+// (1.5 KiB) and level 3's objects on it, the camera thread's 16 KiB kernel stack overflowed (c3rp, 2026-11-13: "Invalid kernel
+// stack pointer (probable overflow)" while entering DRV-2's 64 KiB mapping; docs/drivers/camera.md section 8.4).
+template <class T>
+inline void renew(T &x)
+{
+  x.~T();
+  ::new (static_cast<void *>(&x)) T();
+}
 
 struct Loader {
   void *ctx = nullptr;
@@ -177,9 +194,10 @@ class Surveyor {
  public:
   Surveyor(const Loader &l, const Pmic &p, const SurveyOptions &o) : l_(l), p_(p), o_(o) {}
 
-  Survey run()
+  // Into `s`, renewed in place (no Survey on the stack).
+  void run(Survey &s)
   {
-    Survey s;
+    renew(s);
     gcc(s);
     // A clock controller is read only while GCC clocks its AHB interface (Linux keeps both branches on from GCC's probe).
     if (!o_.cc) s.cc.why = "piano-camera-cc=0";
@@ -194,7 +212,6 @@ class Surveyor {
     if (o_.spmi) rails(s);
     if (o_.smmu) smmu(s);
     s.loads = loads_;
-    return s;
   }
 
  private:
@@ -437,7 +454,13 @@ class Surveyor {
   unsigned loads_ = 0;
 };
 
-inline Survey survey(const Loader &l, const Pmic &p, const SurveyOptions &o) { return Surveyor(l, p, o).run(); }
+inline void survey(const Loader &l, const Pmic &p, const SurveyOptions &o, Survey &out) { Surveyor(l, p, o).run(out); }
+inline Survey survey(const Loader &l, const Pmic &p, const SurveyOptions &o)   // (the host tests; the kernel's fill their own)
+{
+  Survey s;
+  survey(l, p, o, s);
+  return s;
+}
 
 // ------------------------------------------------------------------------------------------------------- level 2's checks
 // Whether level 2 may power a sensor, from the survey alone. nullptr = yes; else why not (nothing is written for that sensor).

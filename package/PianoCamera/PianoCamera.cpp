@@ -54,6 +54,8 @@ extern volatile uint32_t sm8750_rpmh_drv2_owner;
 // The shared multimedia votes (package/include/PianoMmVotes.h: MXC, MMCX, MM1 with PianoVideo), PianoA830's words too.
 extern volatile uint32_t piano_mm_votes_owner;
 extern volatile uint32_t piano_mm_votes[32];
+// XNU's (osfmk/arm64): the bytes left on the current thread's kernel stack (or the interrupt stack it is on).
+vm_offset_t ml_stack_remaining(void);
 }
 #include <PianoMmVotes.h>
 
@@ -106,9 +108,47 @@ void readArgs()
   gArgs.gain = clampArg(bootArg("piano-camera-gain", 64), 32, 2048);
 }
 
+// ------------------------------------------------------------------------------------------------ the camera thread's stack
+// XNU's kernel threads have 16 KiB of stack (KERNEL_STACK_SIZE; the exception vector's check is SP within kstackptr - 0x4000).
+// c3rp of 2026-11-13 overflowed it (`Invalid kernel stack pointer (probable overflow)`, then `MACH Reboot`) entering DRV-2's
+// 64 KiB mapping at step 201: the sequence's objects were on it. They live in static slots now (gWork below); the least free stack
+// seen at a log line or before an IOKit mapping is logged at the end of every run, and a mapping with less than kStackWarn left
+// says so first (the line a further overflow would leave in the mailbox).
+constexpr vm_offset_t kStackBytes = 16384, kStackWarn = 6144;
+thread_t gThread;                    // the camera thread (the only one measured)
+vm_offset_t gStackStart, gStackLeast = kStackBytes;
+int32_t gStackLeastAt;               // piano_camera_stage when the least was seen
+bool gStackWarned;
+vm_offset_t stackMark()
+{
+  if (!gThread || current_thread() != gThread) return kStackBytes;
+  const vm_offset_t left = ml_stack_remaining();
+  if (left < gStackLeast) {
+    gStackLeast = left;
+    gStackLeastAt = piano_camera_stage;
+  }
+  return left;
+}
+
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+// Before an IOKit mapping or allocation (several KiB of XNU's VM path below the caller): the margin, and a line when it is short.
+void stackCheck(const char *what)
+{
+  const vm_offset_t left = stackMark();
+  if (left >= kStackWarn || gStackWarned) return;
+  gStackWarned = true;
+  note("stack: only %lu bytes of the thread's stack left before %s at step %d (an overflow would follow as a panic)",
+       (unsigned long)left, what, piano_camera_stage);
+}
+void reportStack()
+{
+  note("stack: %lu of %lu bytes free at the thread's start, the least %lu at step %d (logging and IOKit mappings measured)",
+       (unsigned long)gStackStart, (unsigned long)kStackBytes, (unsigned long)gStackLeast, gStackLeastAt);
+}
+
 void note(const char *fmt, ...)
 {
+  stackMark();
   char line[400];
   va_list ap;
   va_start(ap, fmt);
@@ -149,6 +189,7 @@ uintptr_t pageVa(uint64_t pa)
   for (unsigned i = 0; i < gPageCount; ++i)
     if (gPages[i].pa == base) return gPages[i].va;
   if (gPageCount == kMaxPages) return 0;
+  stackCheck("a register page's mapping");
   IODeviceMemory *m = IODeviceMemory::withRange(base, 0x1000);
   IOMemoryMap *map = m ? m->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
   if (m) m->release();
@@ -196,6 +237,7 @@ bool mapRegion(Region &r, uint64_t pa, uint64_t bytes)
 {
   if (r.va) return true;
   const uint64_t base = pa & ~0xfffull, length = ((pa + bytes + 0xfff) & ~0xfffull) - base;
+  stackCheck("an SPMI window's mapping");
   IODeviceMemory *m = IODeviceMemory::withRange(base, length);
   r.map = m ? m->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
   if (m) m->release();
@@ -254,6 +296,7 @@ uint8_t *gCmdDb;   // a copy, read once (IOMallocData), freed at the end of the 
 int cmdDbLookup(void *, const char *name, uint32_t *address)
 {
   if (!gCmdDb) {
+    stackCheck("cmd-db's mapping");
     uint8_t *copy = static_cast<uint8_t *>(IOMallocData(kCmdDbBytes));
     IODeviceMemory *m = copy ? IODeviceMemory::withRange(kCmdDb, kCmdDbBytes) : nullptr;
     IOMemoryMap *map = m ? m->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
@@ -316,6 +359,7 @@ const RscIo gRscIo = {nullptr, rscRd, rscWr, rscSleep};
 bool mapRsc()
 {
   if (gRscVa) return true;
+  stackCheck("DRV-2's mapping");
   IODeviceMemory *m = IODeviceMemory::withRange(kRscDrv2, kRscDrv2Bytes);
   gRscMap = m ? m->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
   if (m) m->release();
@@ -446,6 +490,13 @@ class Lines {
     n_ = 0;
     line_[0] = 0;
   }
+  // The same buffer under the next title (one Lines at a time on the camera thread's stack).
+  void restart(const char *title)
+  {
+    flush();
+    title_ = title;
+    parts_ = 0;
+  }
 
  private:
   static constexpr size_t kWidth = 190;
@@ -471,19 +522,20 @@ void reportControllers(const Survey &s)
   } else {
     // Lines of at most ~200 characters: the console cuts a line at 255 with its prefix and loses its newline (c3r, 2026-11-12: the
     // branches, RCGs and PLLs ran into one cut line).
-    Lines gdsc("camcc gdsc"), branches("camcc branches"), rcgs("camcc rcgs"), plls("camcc plls");
+    // One Lines for the four (each is 0.3 KiB of the camera thread's stack).
+    Lines l("camcc gdsc");
     for (unsigned i = 0; i < kCcGdscCount; ++i)
-      gdsc.add("%s %08x/%08x (%s)", kCcGdscs[i].name, c.gdsc[i].gdscr, c.gdsc[i].cfg, gdscOn(c.gdsc[i].gdscr) ? "ON" : "off");
-    gdsc.flush();
-    for (unsigned i = 0; i < kCcBranchCount; ++i) branches.add("%s %08x", kCcBranches[i].name, c.branch[i]);
-    branches.flush();
+      l.add("%s %08x/%08x (%s)", kCcGdscs[i].name, c.gdsc[i].gdscr, c.gdsc[i].cfg, gdscOn(c.gdsc[i].gdscr) ? "ON" : "off");
+    l.restart("camcc branches");
+    for (unsigned i = 0; i < kCcBranchCount; ++i) l.add("%s %08x", kCcBranches[i].name, c.branch[i]);
+    l.restart("camcc rcgs");
     for (unsigned i = 0; i < kCcRcgCount; ++i)
-      rcgs.add("%s %08x/%08x src %u%s", kCcRcgs[i].name, c.rcg[i].cmd, c.rcg[i].cfg, rcgSource(c.rcg[i].cfg), c.rcg[i].rootOff ? " root-off" : "");
-    rcgs.flush();
+      l.add("%s %08x/%08x src %u%s", kCcRcgs[i].name, c.rcg[i].cmd, c.rcg[i].cfg, rcgSource(c.rcg[i].cfg), c.rcg[i].rootOff ? " root-off" : "");
+    l.restart("camcc plls");
     for (unsigned p = 0; p < kCcPllCount; ++p)
-      plls.add("pll%u mode %08x op %x L %#x (%s)", p, c.pllMode[p], c.pllOpmode[p], c.pllL[p],
-               pllRunning(c.pllMode[p], c.pllOpmode[p]) ? "RUNNING" : pllLocked(c.pllMode[p]) ? "locked" : "off");
-    plls.flush();
+      l.add("pll%u mode %08x op %x L %#x (%s)", p, c.pllMode[p], c.pllOpmode[p], c.pllL[p],
+            pllRunning(c.pllMode[p], c.pllOpmode[p]) ? "RUNNING" : pllLocked(c.pllMode[p]) ? "locked" : "off");
+    l.flush();
   }
   const MclkState &m = s.mclk;
   if (!m.read) {
@@ -671,6 +723,7 @@ class Ops {
   }
   void note(const char *fmt, ...) __attribute__((format(printf, 2, 3)))
   {
+    stackMark();
     char line[400];
     va_list ap;
     va_start(ap, fmt);
@@ -682,7 +735,8 @@ class Ops {
   // kernel view; the window's two table pages (one 16 KiB XNU page, contiguous).
   bool dmaAlloc(uint64_t bytes, bool tables, Dma &d)
   {
-    d = Dma();
+    renew(d);
+    stackCheck("the frame buffer's allocation");
     IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
         kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), bytes, 0x000000ffffe00000ull);
     if (!buf || buf->prepare() != kIOReturnSuccess) {
@@ -811,6 +865,41 @@ void reportStream(const StreamResult &r)
              r.cleanOff ? "complete" : "incomplete");
 }
 
+// ------------------------------------------------------------------------------------------- the sequence's objects, off the stack
+// One object in static storage, built in place for each use and destroyed after it (level 2's Session per cycle, level 3's Session
+// and Stream): a Session is 2.6 KiB with its survey copy, a Stream 1.9 KiB with its result, on a 16 KiB stack (see stackMark).
+template <class T>
+class Slot {
+ public:
+  template <class... A>
+  T &make(A &&...a)
+  {
+    drop();
+    p_ = ::new (static_cast<void *>(buf_)) T(static_cast<A &&>(a)...);
+    return *p_;
+  }
+  void drop()
+  {
+    if (p_) p_->~T();
+    p_ = nullptr;
+  }
+
+ private:
+  alignas(T) unsigned char buf_[sizeof(T)];
+  T *p_ = nullptr;
+};
+// The one camera thread's (start() makes one per boot): level 1's survey, the options, the ops, the sequence's objects.
+struct Work {
+  Survey survey;
+  SurveyOptions so;
+  PowerOptions po;
+  StreamOptions o;
+  Ops ops;
+  Slot<Session<Ops>> session;
+  Slot<Stream<Ops>> stream;
+};
+Work gWork;
+
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------------ the service
@@ -866,16 +955,22 @@ bool PianoCamera::start(IOService *provider)
 void PianoCamera::thread(void *self, wait_result_t)
 {
   thread_set_thread_name(current_thread(), "piano-camera");
+  gThread = current_thread();
+  gStackStart = ml_stack_remaining();
+  gStackLeast = gStackStart;
   static_cast<PianoCamera *>(self)->run();
+  reportStack();
 }
 
+// Everything of size in gWork (the camera thread's stack is 16 KiB; c3rp of 2026-11-13 overflowed it).
 void PianoCamera::run()
 {
   if (gArgs.delay) {
     note("waiting %u s", gArgs.delay);
     IOSleep(gArgs.delay * 1000);
   }
-  SurveyOptions so;
+  Work &k = gWork;
+  SurveyOptions &so = k.so;
   so.cc = gArgs.cc != 0;
   so.mclkcc = gArgs.mclkcc != 0;
   so.blocks = gArgs.blocks != 0;
@@ -883,7 +978,8 @@ void PianoCamera::run()
   so.spmi = gArgs.spmi != 0;
   so.smmu = gArgs.smmu != 0;
   stage(1, "the survey (loads only; the SPMI observer for the PMIC)");
-  Survey s = survey(gLoader, gPmic, so);
+  Survey &s = k.survey;
+  survey(gLoader, gPmic, so, s);
   reportSurvey(s);
   char line[220];
   summary(s, line, sizeof line);
@@ -917,7 +1013,7 @@ void PianoCamera::run()
   }
 
   if (gArgs.level == 2) stage(3, "level 2: power each sensor, read its chip ID, power it down");
-  PowerOptions po;
+  PowerOptions &po = k.po;
   po.rearCci = !gArgs.rearBus;
   po.mclk24 = gArgs.mclk24 != 0;
   po.cciKhz = gArgs.cciKhz;
@@ -928,7 +1024,7 @@ void PianoCamera::run()
   po.stopAt = int(gArgs.stop);
   po.votes = gArgs.votes != 0;
   po.camss = gArgs.camss != 0;
-  Ops ops;
+  Ops &ops = k.ops;
   ops.survey = &s;
   if (gArgs.level == 3) {
     // One sensor (piano-camera-sensor=2: the front; else the rear), TITAN_TOP and CAMCC's domains for either bus, the rear's MCLK at
@@ -937,7 +1033,7 @@ void PianoCamera::run()
     po.camss = true;
     po.votes = true;
     po.stopAt = gArgs.stop < 300 ? int(gArgs.stop) : 0;
-    StreamOptions o;
+    StreamOptions &o = k.o;
     o.frames = gArgs.frames;
     o.pattern = gArgs.pattern != 0;
     o.timeoutMs = gArgs.timeoutMs;
@@ -945,9 +1041,9 @@ void PianoCamera::run()
     o.stopAt = gArgs.stop >= 300 ? int(gArgs.stop) : 0;
     stage(5, "level 3: RAW10 frames through CSIPHY, CSID-lite0 and TFE-lite0's RDI0 into memory");
     IOLockLock(gSequenceLock);
-    Session<Ops> session(ops, po);
-    Stream<Ops> stream(ops, session, o);
-    const StreamResult r = stream.run(w, gLoader, gPmic, so, s);
+    Session<Ops> &session = k.session.make(ops, po);
+    Stream<Ops> &stream = k.stream.make(ops, session, o);
+    const StreamResult &r = stream.run(w, gLoader, gPmic, so, s);
     IOLockUnlock(gSequenceLock);
     reportResult(r.sensor);
     reportStream(r);
@@ -955,6 +1051,8 @@ void PianoCamera::run()
     stage(r.failedStep ? -6 : 6, r.ok ? "done (level 3)" : "done (level 3, see the lines above)");
     note("done: level 3 %s; %llu MMIO loads, %llu stores logged, %llu quiet stores, %u map failures", r.ok ? "ok" : "not ok",
          (unsigned long long)gLoads, (unsigned long long)gStores, (unsigned long long)gQuietStores, gMapFailures);
+    k.stream.drop();
+    k.session.drop();
     cmdDbFree();
     return;
   }
@@ -962,17 +1060,18 @@ void PianoCamera::run()
   bool refused[2] = {false, false};   // a sensor the checks refused is not tried again in later cycles
   for (unsigned cycle = 0; cycle < gArgs.cycles; ++cycle) {
     for (Sensor w : both) {
-      const unsigned k = w == Sensor::rear ? 0 : 1;
-      if (!(gArgs.sensor & (1u << k)) || refused[k]) continue;
-      note("cycle %u: %s %s", cycle + 1, kSensors[k].name, kSensors[k].part);
+      const unsigned i = w == Sensor::rear ? 0 : 1;
+      if (!(gArgs.sensor & (1u << i)) || refused[i]) continue;
+      note("cycle %u: %s %s", cycle + 1, kSensors[i].name, kSensors[i].part);
       IOLockLock(gSequenceLock);
-      Session<Ops> session(ops, po);
-      const SensorResult r = session.run(w, gLoader, gPmic, so, s);
+      Session<Ops> &session = k.session.make(ops, po);   // a fresh session for each cycle, as before
+      const SensorResult &r = session.run(w, gLoader, gPmic, so, s);
       IOLockUnlock(gSequenceLock);
       reportResult(r);
-      ++attempted[k];
-      passed[k] += r.idOk && r.cleanOff;
-      refused[k] = r.failure == Failure::refused;
+      ++attempted[i];
+      passed[i] += r.idOk && r.cleanOff;
+      refused[i] = r.failure == Failure::refused;
+      k.session.drop();
     }
   }
   if (gArgs.sensor & 1) setProperty("piano-camera-rear", gResult[0]);
