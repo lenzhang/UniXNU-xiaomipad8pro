@@ -114,7 +114,9 @@ enum MhiFail : uint32_t {
   kMhiErrNone, kMhiErrLayout, kMhiErrNotPbl, kMhiErrBhi, kMhiErrBhie, kMhiErrSysErr, kMhiErrTimeout, kMhiErrState, kMhiErrRddm,
 };
 enum MhiEe : uint32_t { kEePbl = 0, kEeSbl = 1, kEeAmss = 2, kEeRddm = 3, kEeWfw = 4, kEePthru = 5, kEeEdl = 6, kEeFp = 7 };
-enum MhiState : uint32_t { kStateReset = 0, kStateReady = 1, kStateM0 = 2, kStateBhi = 7, kStateSysErr = 0xff };
+enum MhiState : uint32_t {
+  kStateReset = 0, kStateReady = 1, kStateM0 = 2, kStateM1 = 3, kStateM2 = 4, kStateM3 = 5, kStateBhi = 7, kStateSysErr = 0xff,
+};
 
 inline const char *mhiPhaseName(uint32_t phase)
 {
@@ -385,7 +387,17 @@ inline uint32_t mhiTimedOut(MhiBoot &m)
 // 128 channel contexts left disabled, two event rings (control: 32 elements on MSI vector 1; data: 256 on vector 2) and the
 // primary command ring, in the arena; then the registers that point the device at them, and the host address range it may reach.
 // The driver of this chip family gives the device its contexts before the boot loader starts and again once the loader has reset
-// the registers (SHENG saw the loader refuse an image otherwise).
+// the registers (SHENG saw the loader refuse an image otherwise); since 2026-11-12 this driver gives them only at READY, as the
+// MHI host does (piano-wifi-ctxearly=1 restores the early write).
+//
+// The layout inside the 32 KiB (2026-11-12, after wifi-4a): the channel contexts at +0, the event ring contexts at +0x2000 and the
+// command ring's at +0x3000, each array on a page of its own as the MHI host allocates them; then the rings, each one's base a
+// multiple of its own length (the MHI host's rule for every ring it gives a device): the control event ring (512 bytes), the data
+// event ring (4 KiB) and the command ring (128 bytes). Until then the data event ring sat 512 bytes into a page, which the control
+// ring and the boot loader never noticed, but channels 20 and 21 report on that ring.
+// The two IPC router channels' fixed fields are written here too, as the MHI host's context initialisation writes every channel
+// its configuration names before the power-up: state disabled, burst mode disabled, the type (20 to the device, 21 back) and the
+// event ring they report on. Their rings and the enabled state come only when the channel is started (WifiChannels.h).
 struct MhiContexts {
   uint8_t *va = nullptr;
   uint64_t bus = 0;
@@ -398,7 +410,18 @@ struct MhiContexts {
 };
 constexpr uint32_t kMhiContextBytes = 32 * 1024;
 constexpr uint32_t kMhiContextStride = 44, kMhiChannels = 128, kMhiEventRings = 2, kMhiCommandElements = 8, kMhiElement = 16;
+constexpr uint32_t kMhiEventCtxOffset = 0x2000, kMhiCommandCtxOffset = 0x3000, kMhiRingsOffset = 0x4000;
 constexpr uint64_t kMhiHostLimit = (1ull << 36) - 1;   // what ath12k and the 13T's cnss2 both allow the chip to reach
+// The channels whose fixed fields the plan writes: the IPC router's (WifiHw.h kChanIpcrOut / kChanIpcrIn, on the data event ring).
+struct MhiChannelInit { uint32_t chan, type, eventRing; };
+constexpr MhiChannelInit kMhiChannelInit[] = {
+  {kChanIpcrOut, kChanTypeOutbound, kIpcrEventRing},
+  {kChanIpcrIn, kChanTypeInbound, kIpcrEventRing},
+};
+
+inline uint8_t *mhiChannelCtx(const MhiContexts &c, uint32_t chan) { return c.va + chan * kMhiContextStride; }
+inline uint8_t *mhiEventCtx(const MhiContexts &c, unsigned ring) { return c.va + kMhiEventCtxOffset + ring * kMhiContextStride; }
+inline uint8_t *mhiCommandCtx(const MhiContexts &c) { return c.va + kMhiCommandCtxOffset; }
 
 namespace mhidetail {
 inline void put32(uint8_t *at, uint32_t v)
@@ -421,23 +444,37 @@ inline void reg64(const MhiIo &io, uint32_t low, uint64_t v)
   io.write(io.ctx, low, uint32_t(v));
   io.write(io.ctx, low + 4, uint32_t(v >> 32));
 }
+// The first offset from `cursor` whose bus address is a multiple of `align` (a power of two).
+inline uint32_t alignedAt(uint64_t bus, uint32_t cursor, uint32_t align)
+{
+  const uint64_t at = (bus + cursor + align - 1) & ~uint64_t(align - 1);
+  return uint32_t(at - bus);
+}
 }  // namespace mhidetail
 
 inline bool mhiContextsPlan(MhiContexts &c, uint8_t *va, uint64_t bus, uint32_t bytes)
 {
   using namespace mhidetail;
-  const uint32_t events = kMhiChannels * kMhiContextStride, command = events + kMhiEventRings * kMhiContextStride;
-  uint32_t cursor = (command + kMhiContextStride + 4095u) & ~4095u;
+  static_assert(kMhiChannels * kMhiContextStride <= kMhiEventCtxOffset, "the channel contexts reach the event contexts");
+  static_assert(kMhiEventCtxOffset + kMhiEventRings * kMhiContextStride <= kMhiCommandCtxOffset, "the event contexts overlap");
+  c = MhiContexts{};
   c.va = va;
   c.bus = bus;
   c.bytes = bytes;
   c.eventBytes[0] = 32 * kMhiElement;
   c.eventBytes[1] = 256 * kMhiElement;
-  if (!va || cursor + c.eventBytes[0] + c.eventBytes[1] + kMhiCommandElements * kMhiElement > bytes) return false;
+  const uint32_t commandBytes = kMhiCommandElements * kMhiElement;
+  uint32_t at[kMhiEventRings] = {}, cursor = kMhiRingsOffset;
   for (unsigned i = 0; i < kMhiEventRings; ++i) {
-    c.eventBus[i] = bus + cursor;
-    c.eventVa[i] = va + cursor;
-    uint8_t *ctx = va + events + i * kMhiContextStride;
+    at[i] = alignedAt(bus, cursor, c.eventBytes[i]);
+    cursor = at[i] + c.eventBytes[i];
+  }
+  const uint32_t commandAt = alignedAt(bus, cursor, commandBytes);
+  if (!va || (bus & 4095u) || commandAt + commandBytes > bytes) return false;
+  for (unsigned i = 0; i < kMhiEventRings; ++i) {
+    c.eventBus[i] = bus + at[i];
+    c.eventVa[i] = va + at[i];
+    uint8_t *ctx = mhiEventCtx(c, i);
     put32(ctx, i == 0 ? 0 : 1u << 16);                                        // interrupt moderation: none / 1 ms
     put32(ctx + 4, 1);                                                        // the ring is valid
     put32(ctx + 8, i + 1);                                                    // MSI vector
@@ -446,24 +483,28 @@ inline bool mhiContextsPlan(MhiContexts &c, uint8_t *va, uint64_t bus, uint32_t 
     put64(ctx + 28, c.eventBus[i]);                                           // read pointer
     put64(ctx + 36, c.eventBus[i] + c.eventBytes[i] - kMhiElement);           // write pointer: the whole ring is the device's
     c.acked[i] = c.eventBus[i];
-    cursor += c.eventBytes[i];
   }
-  c.commandBus = bus + cursor;
-  uint8_t *cmd = va + command;
+  c.commandBus = bus + commandAt;
+  uint8_t *cmd = mhiCommandCtx(c);
   put64(cmd + 12, c.commandBus);
-  put64(cmd + 20, kMhiCommandElements * kMhiElement);
+  put64(cmd + 20, commandBytes);
   put64(cmd + 28, c.commandBus);
   put64(cmd + 36, c.commandBus);
+  for (const MhiChannelInit &ch : kMhiChannelInit) {
+    uint8_t *ctx = mhiChannelCtx(c, ch.chan);
+    put32(ctx + kChanCfg, kChanStateDisabled | kChanBurstDisable << 8);
+    put32(ctx + kChanType, ch.type);
+    put32(ctx + kChanErIndex, ch.eventRing);
+  }
   return true;
 }
 
 inline void mhiContextsProgram(MhiContexts &c, const MhiIo &io, uint32_t reglen)
 {
   using namespace mhidetail;
-  const uint32_t events = kMhiChannels * kMhiContextStride, command = events + kMhiEventRings * kMhiContextStride;
   reg64(io, kMhiCcabap, c.bus);
-  reg64(io, kMhiEcabap, c.bus + events);
-  reg64(io, kMhiCrcbap, c.bus + command);
+  reg64(io, kMhiEcabap, c.bus + kMhiEventCtxOffset);
+  reg64(io, kMhiCrcbap, c.bus + kMhiCommandCtxOffset);
   reg64(io, kMhiCtrlBase, 0);
   reg64(io, kMhiCtrlLimit, kMhiHostLimit);
   reg64(io, kMhiDataBase, 0);
@@ -485,7 +526,7 @@ inline unsigned mhiEventAck(MhiContexts &c, const MhiIo &io, uint32_t reglen)
   if (erdb < 0x100 || erdb + 8 * kMhiEventRings > reglen || (erdb & 3)) return 0;
   unsigned moved = 0;
   for (unsigned r = 0; r < kMhiEventRings; ++r) {
-    uint8_t *ctx = c.va + kMhiChannels * kMhiContextStride + r * kMhiContextStride;
+    uint8_t *ctx = mhiEventCtx(c, r);
     const uint64_t base = get64(ctx + 12), length = get64(ctx + 20), read = get64(ctx + 28);
     if (read == c.acked[r] || read < base || read >= base + length) continue;
     c.acked[r] = read;
@@ -496,6 +537,48 @@ inline unsigned mhiEventAck(MhiContexts &c, const MhiIo &io, uint32_t reglen)
   }
   c.acks += moved;
   return moved;
+}
+
+// ------------------------------------------------------------------------------------------- after mission mode: wake, state
+// The device wake doorbell (WifiHw.h kMhiDevWakeChannel): a 64-bit doorbell like every other, the high half first. False when the
+// channel doorbell array the device reports does not reach it inside the register space.
+inline bool mhiDevWake(const MhiIo &io, uint32_t reglen, bool on)
+{
+  const uint32_t chdb = io.read(io.ctx, kMhiChdbOff);
+  const uint64_t at = uint64_t(chdb) + 8u * kMhiDevWakeChannel;
+  if (chdb < 0x100 || (chdb & 3) || at + 8 > reglen) return false;
+  io.write(io.ctx, uint32_t(at) + 4, 0);
+  io.write(io.ctx, uint32_t(at), on ? 1u : 0u);
+  return true;
+}
+// The host's half of a state change: MHICTRL's state field (15:8) with the reset bit clear, as for M0 at READY. Level 5 uses it to
+// answer a device that went to M1 with M2, which is what the MHI host does whenever the device idles.
+inline void mhiSetState(const MhiIo &io, uint32_t state)
+{
+  const uint32_t ctrl = io.read(io.ctx, kMhiCtrl);
+  io.write(io.ctx, kMhiCtrl, (ctrl & ~(0xffu << kMhiStateShift) & ~kMhiCtrlReset) | (state & 0xffu) << kMhiStateShift);
+}
+// What MHISTATUS and the execution environment say about a firmware that runs: dead when the device reports a system error (the
+// status bit, or the state 0xff) or its crash dump environment. All ones from MHISTATUS is a device that does not answer
+// (`gone`), which is neither.
+struct MhiHealth {
+  uint32_t status = 0, ee = 0, state = 0;
+  bool sysErr = false, rddm = false, gone = false;
+  bool dead() const { return sysErr || rddm; }
+};
+inline MhiHealth mhiHealth(const MhiIo &io, uint32_t bhiOff)
+{
+  MhiHealth h;
+  h.status = io.read(io.ctx, kMhiStatus);
+  if (h.status == 0xffffffffu) {
+    h.gone = true;
+    return h;
+  }
+  h.state = (h.status >> kMhiStateShift) & 0xffu;
+  h.ee = bhiOff ? io.read(io.ctx, bhiOff + kBhiExecEnv) : 0;
+  h.sysErr = (h.status & kMhiStatusSysErr) || h.state == kStateSysErr;
+  h.rddm = h.ee == kEeRddm;
+  return h;
 }
 
 }  // namespace pianowifi

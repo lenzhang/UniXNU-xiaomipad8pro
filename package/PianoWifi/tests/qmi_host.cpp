@@ -6,10 +6,21 @@
 //             and a half-open TLV is refused too;
 //   the router: the chip's hello is answered, its service announcement is remembered with its instance word, a data packet built
 //             in a transport buffer carries the right header, and a received packet reaches our port's callback;
-//   the channels: the two contexts are filled as the chip reads them (enabled, burst mode disabled, the event ring, the ring),
-//             the start commands go on the command ring and their completions start the channels, every inbound element but one
-//             gets a buffer, a packet is sent with one doorbell per submission, and the event walk delivers a received packet, frees
-//             the outbound buffer, and reports state and execution-environment changes; a bogus event is counted, never acted on;
+//   the channels: the two contexts carry only their fixed fields before the start (disabled, burst mode disabled, the type, the
+//             event ring; every other channel untouched), a start before the channel is prepared is refused by the chip model,
+//             a start prepares the ring (base a multiple of its length, both pointers at the base) and enables the channel before
+//             its command, 20 before 21 and one at a time; the start commands go on the command ring and their completions start
+//             the channels, every inbound element but one gets a buffer, a packet is sent with one doorbell per submission, the
+//             event walk delivers a received packet, frees the outbound buffer, and reports state and execution-environment
+//             changes; a bogus event is counted, never acted on; the M0 answer rings every event ring and running channel;
+//   MHI after mission mode: the device wake doorbell (channel 127, high half first, refused outside the register space), the
+//             host's state write (M2), the health read (a system error, the crash dump environment, a device that is gone);
+//   the crash dump (WifiRddm.h): the plan (segments aligned to their size, the table on its own page, every entry), the arm's
+//             order (address high, low, size, doorbell with the session), the receive status (complete, an error, waiting, all
+//             ones), and the decode against synthetic dumps: the header in both word orders, files back to back across segments,
+//             the failure reason read across a segment boundary, bounded and sanitised, the serial masked, the fallback strings
+//             (the strong ones first, format strings never, at most four of at most 120 characters), an all-zero dump, a header
+//             with no names, a file larger than the dump;
 //   the client: the whole exchange against a simulated firmware — the radio's capability, the indication registration, the host
 //             capability, the memory request answered out of the window, the chip's capability, the regulatory database and the
 //             board file in 6 KiB segments with the right total/segment/end fields and the right bytes, the two microcodes by
@@ -22,6 +33,7 @@
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. qmi_host.cpp ../WifiQrtr.c -o /tmp/qmi_host && /tmp/qmi_host
 #include "WifiChannels.h"
 #include "WifiQmi.h"
+#include "WifiRddm.h"
 #include "WifiSmmuWindow.h"
 #include "WifiWlfw.h"
 #include <cstdio>
@@ -194,11 +206,8 @@ struct DeviceSide {
 
   DeviceSide(Device &device, MhiContexts &c) : d(device), contexts(c) {}
 
-  uint8_t *contextOf(uint32_t chan) { return contexts.va + chan * kMhiContextStride; }
-  uint8_t *eventContext(unsigned ring)
-  {
-    return contexts.va + kMhiChannels * kMhiContextStride + ring * kMhiContextStride;
-  }
+  uint8_t *contextOf(uint32_t chan) { return mhiChannelCtx(contexts, chan); }
+  uint8_t *eventContext(unsigned ring) { return mhiEventCtx(contexts, ring); }
   void event(unsigned ring, uint64_t ptr, uint32_t word0, uint32_t word1)
   {
     uint8_t *ctx = eventContext(ring);
@@ -216,8 +225,9 @@ struct DeviceSide {
   }
   void run()
   {
-    // the command ring
-    uint8_t *cctx = contexts.va + kMhiChannels * kMhiContextStride + kMhiEventRings * kMhiContextStride;
+    // the command ring (a start is refused, as the MHI specification has it, unless the host enabled the channel and gave it a
+    // ring of whole elements on an event ring that exists, with its type set)
+    uint8_t *cctx = mhiCommandCtx(contexts);
     const uint64_t cbase = get64(cctx + 12), clen = get64(cctx + 20), cwp = get64(cctx + 36);
     if (!cmd.rp) cmd.rp = cbase;
     while (cmd.rp != cwp) {
@@ -225,7 +235,11 @@ struct DeviceSide {
       const uint32_t word1 = element ? get32(element + 12) : 0;
       const uint32_t chan = word1 >> 24, command = (word1 >> 16) & 0xffu;
       ++d.commandsSeen;
-      if (command == kTreCmdStart) {
+      const uint8_t *sctx = contextOf(chan);
+      const bool startable = (get32(sctx) & 0xffu) == kChanStateEnabled && get32(sctx + kChanType) != 0 &&
+                             get32(sctx + kChanErIndex) < kMhiEventRings && get64(sctx + kChanRLen) &&
+                             get64(sctx + kChanRLen) % kMhiElement == 0 && get64(sctx + kChanRBase) % get64(sctx + kChanRLen) == 0;
+      if (command == kTreCmdStart && startable) {
         uint8_t *ctx = contextOf(chan);
         put32(ctx, (get32(ctx) & ~0xffu) | kChanStateRunning);
         if (chan == kChanIpcrOut) startedOut = true;
@@ -800,9 +814,9 @@ struct Host {
   void bring()
   {
     start();
-    CHECK(ipcrCommand(transport, device.io(), kChanIpcrOut, kTreCmdStart));
+    CHECK(ipcrStart(transport, device.io(), kChanIpcrOut));
     turn();
-    CHECK(ipcrCommand(transport, device.io(), kChanIpcrIn, kTreCmdStart));
+    CHECK(ipcrStart(transport, device.io(), kChanIpcrIn));
     turn();
     CHECK(ipcrRunning(transport));
     CHECK(ipcrPostRx(transport, device.io()) == 0);   // the turn above posted them
@@ -841,26 +855,47 @@ static void testTransport()
 {
   Host h;
   h.start();
-  // The contexts as the chip reads them.
-  const uint8_t *out = h.contexts.va + kChanIpcrOut * kMhiContextStride;
-  const uint8_t *in = h.contexts.va + kChanIpcrIn * kMhiContextStride;
-  CHECK((get32(out) & 0xffu) == kChanStateEnabled && ((get32(out) >> 8) & 3u) == kChanBurstDisable);
+  // The contexts as the chip reads them before the start: the fixed fields only (the MHI host's context initialisation), no ring.
+  const uint8_t *out = mhiChannelCtx(h.contexts, kChanIpcrOut);
+  const uint8_t *in = mhiChannelCtx(h.contexts, kChanIpcrIn);
+  CHECK((get32(out) & 0xffu) == kChanStateDisabled && ((get32(out) >> 8) & 3u) == kChanBurstDisable);
+  CHECK((get32(in) & 0xffu) == kChanStateDisabled && ((get32(in) >> 8) & 3u) == kChanBurstDisable);
   CHECK(get32(out + kChanType) == kChanTypeOutbound && get32(in + kChanType) == kChanTypeInbound);
   CHECK(get32(out + kChanErIndex) == kIpcrEventRing && get32(in + kChanErIndex) == kIpcrEventRing);
-  CHECK(get64(out + kChanRLen) == kIpcrElements * kMhiElement);
-  CHECK(get64(out + kChanRBase) == h.transport.out.bus && get64(out + kChanRp) == h.transport.out.bus);
+  CHECK(get64(out + kChanRBase) == 0 && get64(out + kChanRLen) == 0 && get64(in + kChanRBase) == 0);
+  // Every other channel context is untouched.
+  for (uint32_t chan = 0; chan < kMhiChannels; ++chan)
+    if (chan != kChanIpcrOut && chan != kChanIpcrIn)
+      for (uint32_t i = 0; i < kMhiContextStride; ++i) CHECK(mhiChannelCtx(h.contexts, chan)[i] == 0);
   // The doorbell arrays are inside the register space.
   CHECK(h.transport.chdb == h.device.chdb && h.transport.erdb == h.device.erdb && !h.transport.error);
-  // The start commands and their completions.
+  // A bare start command for a channel that was not prepared is refused by the chip (the model holds the MHI rule).
   CHECK(ipcrCommand(h.transport, h.device.io(), kChanIpcrOut, kTreCmdStart));
-  CHECK(!ipcrCommand(h.transport, h.device.io(), kChanIpcrIn, kTreCmdStart));   // one at a time
+  h.turn();
+  CHECK(!h.transport.started[0] && h.transport.commandErrors == 1);
+  h.transport.commandErrors = 0;
+  // The start: prepared (ring and enabled state), then the command, one at a time, 20 first.
+  CHECK(ipcrStart(h.transport, h.device.io(), kChanIpcrOut));
+  CHECK((get32(out) & 0xffu) == kChanStateEnabled && ((get32(out) >> 8) & 3u) == kChanBurstDisable);
+  CHECK(get64(out + kChanRLen) == kIpcrElements * kMhiElement);
+  CHECK(get64(out + kChanRBase) == h.transport.out.bus && get64(out + kChanRp) == h.transport.out.bus &&
+        get64(out + kChanWp) == h.transport.out.bus);
+  CHECK(h.transport.out.bus % (kIpcrElements * kMhiElement) == 0);   // the ring's base is a multiple of its length
+  CHECK(!ipcrStart(h.transport, h.device.io(), kChanIpcrIn));           // one at a time
+  CHECK(!ipcrStart(h.transport, h.device.io(), 7));                     // not one of the two
   h.turn();
   CHECK(h.transport.started[0] && !h.transport.started[1]);
-  CHECK(ipcrCommand(h.transport, h.device.io(), kChanIpcrIn, kTreCmdStart));
+  CHECK(ipcrStart(h.transport, h.device.io(), kChanIpcrIn));
   h.turn();
   CHECK(ipcrRunning(h.transport));
-  CHECK(h.device.commandsSeen == 2 && h.transport.commands == 2 && h.transport.commandErrors == 0);
-  CHECK(ipcrChanState(h.transport.out) == kChanStateRunning);
+  CHECK(h.device.commandsSeen == 3 && h.transport.commands == 3 && h.transport.commandErrors == 0);
+  CHECK(ipcrChanState(h.transport.out) == kChanStateRunning && ipcrChanState(h.transport.in) == kChanStateRunning);
+  // The M0 answer: both event rings, and both running channels, rung again with what their contexts hold.
+  const unsigned before = h.device.doorbells;
+  CHECK(ipcrRingAll(h.transport, h.contexts, h.device.io()) == 4);
+  CHECK(h.device.doorbells == before + 2);   // the model counts the channels' and the command ring's doorbells
+  CHECK(h.device.reg64(h.device.erdb + 8) == get64(mhiEventCtx(h.contexts, 1) + 36));
+  CHECK(h.device.reg64(h.device.chdb + 8 * kChanIpcrIn) == get64(in + kChanWp));
   // Every inbound element but one has a buffer (the turn above posted them), and a second posting adds none.
   CHECK(kIpcrRxBuffers == kIpcrElements - 1);
   unsigned busy = 0;
@@ -1278,10 +1313,268 @@ static void testWindow()
   CHECK(iova::apply(stuckPlan, kStreamEndpoint, tablePa, rdStuck, wrStuck, [] { return true; }) != nullptr);
 }
 
+// =========================================================================================== MHI after mission mode
+struct RegLog {
+  std::map<uint32_t, uint32_t> regs;
+  std::vector<std::pair<uint32_t, uint32_t>> writes;
+  static uint32_t rd(void *ctx, uint32_t reg)
+  {
+    auto &m = static_cast<RegLog *>(ctx)->regs;
+    auto it = m.find(reg);
+    return it == m.end() ? 0 : it->second;
+  }
+  static void wr(void *ctx, uint32_t reg, uint32_t value)
+  {
+    RegLog &l = *static_cast<RegLog *>(ctx);
+    l.regs[reg] = value;
+    l.writes.push_back({reg, value});
+  }
+  MhiIo io() { return MhiIo{this, &RegLog::rd, &RegLog::wr}; }
+};
+
+static void testAfterMission()
+{
+  RegLog l;
+  l.regs[kMhiChdbOff] = 0x300;
+  CHECK(mhiDevWake(l.io(), 0x1000, true));
+  const uint32_t wake = 0x300 + 8 * kMhiDevWakeChannel;
+  CHECK(l.writes.size() == 2 && l.writes[0].first == wake + 4 && l.writes[0].second == 0 && l.writes[1].first == wake &&
+        l.writes[1].second == 1);
+  CHECK(mhiDevWake(l.io(), 0x1000, false) && l.regs[wake] == 0);
+  CHECK(!mhiDevWake(l.io(), 0x6f8, true));   // the doorbell would lie past the register space: nothing written
+  CHECK(l.writes.size() == 4);
+  l.regs[kMhiChdbOff] = 0x302;
+  CHECK(!mhiDevWake(l.io(), 0x1000, true));
+
+  // The host's state: the field set, the reset bit and the other bits as they were.
+  l.regs[kMhiCtrl] = 0x0000020a;   // M0, reset bit set, bit 3 something else
+  mhiSetState(l.io(), kStateM2);
+  CHECK(l.regs[kMhiCtrl] == (0x00000008u | kStateM2 << kMhiStateShift));
+
+  // Health.
+  const uint32_t bhi = 0x100;
+  l.regs[kMhiStatus] = kStateM0 << kMhiStateShift | kMhiStatusReady;
+  l.regs[bhi + kBhiExecEnv] = kEeAmss;
+  MhiHealth h = mhiHealth(l.io(), bhi);
+  CHECK(!h.dead() && !h.gone && h.state == kStateM0 && h.ee == kEeAmss);
+  l.regs[kMhiStatus] |= kMhiStatusSysErr;
+  CHECK(mhiHealth(l.io(), bhi).sysErr && mhiHealth(l.io(), bhi).dead());
+  l.regs[kMhiStatus] = kStateSysErr << kMhiStateShift;
+  CHECK(mhiHealth(l.io(), bhi).sysErr);
+  l.regs[kMhiStatus] = kStateM0 << kMhiStateShift;
+  l.regs[bhi + kBhiExecEnv] = kEeRddm;
+  CHECK(mhiHealth(l.io(), bhi).rddm && mhiHealth(l.io(), bhi).dead());
+  l.regs[kMhiStatus] = 0xffffffffu;
+  h = mhiHealth(l.io(), bhi);
+  CHECK(h.gone && !h.dead());
+}
+
+// ========================================================================================================== the crash dump
+// A dump as the firmware writes it: the header (version, size or size, version), the entries, then the files back to back.
+struct DumpFile { const char *name, *description; uint64_t size; std::string content; };
+static std::vector<uint8_t> makeDump(const std::vector<DumpFile> &files, bool sizeFirst = false)
+{
+  const uint32_t header = kRddmHeaderWords + uint32_t(files.size()) * kRddmEntryBytes;
+  std::vector<uint8_t> d(header, 0);
+  put32(d.data(), sizeFirst ? header : 1);
+  put32(d.data() + 4, sizeFirst ? 1 : header);
+  for (size_t i = 0; i < files.size(); ++i) {
+    uint8_t *e = d.data() + kRddmHeaderWords + i * kRddmEntryBytes;
+    put64(e, 0x86000000ull + i * 0x100000);
+    put64(e + 8, 0x4000000ull + i);
+    put64(e + 16, files[i].size);
+    std::strncpy(reinterpret_cast<char *>(e + 24), files[i].description, kRddmNameBytes);
+    std::strncpy(reinterpret_cast<char *>(e + 44), files[i].name, kRddmNameBytes);
+  }
+  for (const DumpFile &f : files) {
+    std::string body = f.content;
+    body.resize(size_t(f.size), 'x');
+    d.insert(d.end(), body.begin(), body.end());
+  }
+  return d;
+}
+
+struct DumpHost {
+  std::vector<uint8_t> memory;
+  Arena arena;
+  Rddm r;
+  DumpHost() : memory(8u << 20, 0)
+  {
+    arenaInit(arena, memory.data(), kBusBase, uint32_t(memory.size()));
+    CHECK(rddmPlan(r, arena, kRddmBytes));
+  }
+  // The device's side: the dump written across the segments the table names.
+  void write(const std::vector<uint8_t> &dump)
+  {
+    uint64_t at = 0;
+    for (uint32_t s = 0; s < r.segments && at < dump.size(); ++s) {
+      const uint64_t address = get64(r.table + 16 * s), size = get64(r.table + 16 * s + 8);
+      uint8_t *to = memory.data() + (address - kBusBase);
+      const uint64_t n = dump.size() - at < size ? dump.size() - at : size;
+      std::memcpy(to, dump.data() + at, size_t(n));
+      at += n;
+    }
+  }
+  void decode(RddmReport &out, uint32_t serial = 0)
+  {
+    std::vector<uint8_t> scratch(kRddmScratchBytes);
+    rddmDecode(r, scratch.data(), [](uint8_t *to, const uint8_t *from, uint32_t n) { std::memcpy(to, from, n); }, serial, out);
+  }
+};
+
+static void testRddm()
+{
+  {   // the plan
+    DumpHost h;
+    CHECK(h.r.segments == 9 && h.r.segBytes == kRddmSegBytes && h.r.tableBytes == 9 * 16);
+    for (uint32_t i = 0; i < h.r.segments; ++i) {
+      CHECK(h.r.segBus[i] % kRddmSegBytes == 0);
+      CHECK(get64(h.r.table + 16 * i) == h.r.segBus[i] && get64(h.r.table + 16 * i + 8) == kRddmSegBytes);
+    }
+    CHECK(h.r.tableBus % 4096 == 0 && h.r.tableBus > h.r.segBus[8]);
+    Rddm none;
+    Arena small;
+    std::vector<uint8_t> two(2u << 20);
+    arenaInit(small, two.data(), kBusBase, uint32_t(two.size()));
+    CHECK(!rddmPlan(none, small, kRddmBytes) && none.segments == 0);   // 9 segments do not fit 2 MiB
+    CHECK(!rddmPlan(none, small, 0));
+    CHECK(!rddmPlan(none, small, 17 * kRddmSegBytes));                // more segments than the table plans for
+  }
+  {   // the arm and the receive status
+    DumpHost h;
+    RegLog l;
+    const uint32_t bhie = 0x224;
+    l.regs[bhie + kBhieRxVecDb] = 0xc0000000u;   // the doorbell's other bits stay as they are
+    rddmArm(h.r, l.io(), bhie, 0x40001234u);
+    CHECK(h.r.seq == 0x1234 && h.r.arms == 1);
+    CHECK(l.writes.size() == 4);
+    CHECK(l.writes[0].first == bhie + kBhieRxVecAddrHi && l.writes[0].second == uint32_t(h.r.tableBus >> 32));
+    CHECK(l.writes[1].first == bhie + kBhieRxVecAddrLo && l.writes[1].second == uint32_t(h.r.tableBus));
+    CHECK(l.writes[2].first == bhie + kBhieRxVecSize && l.writes[2].second == 9 * 16);
+    CHECK(l.writes[3].first == bhie + kBhieRxVecDb && l.writes[3].second == (0xc0000000u | 0x1234u));
+    rddmArm(h.r, l.io(), bhie, 0);
+    CHECK(h.r.seq == 1);   // a session is never 0
+    CHECK(rddmPoll(h.r, l.io(), bhie) == kRddmWaiting);
+    l.regs[bhie + kBhieRxVecStatus] = kMhiXferSuccess << 30 | 1;
+    CHECK(rddmPoll(h.r, l.io(), bhie) == kRddmComplete && rddmSessionMatches(h.r));
+    l.regs[bhie + kBhieRxVecStatus] = kMhiXferSuccess << 30 | 5;
+    CHECK(rddmPoll(h.r, l.io(), bhie) == kRddmComplete && !rddmSessionMatches(h.r));
+    l.regs[bhie + kBhieRxVecStatus] = kMhiXferError << 30 | 1;
+    CHECK(rddmPoll(h.r, l.io(), bhie) == kRddmError);
+    l.regs[bhie + kBhieRxVecStatus] = 0xffffffffu;
+    CHECK(rddmPoll(h.r, l.io(), bhie) == kRddmWaiting);
+  }
+  {   // a dump with a failure reason that crosses into the second segment
+    DumpHost h;
+    const uint32_t serial = 0x1a2b3c4du;
+    const std::string reason = std::string("wlan_fw.c:1234 Assertion pmu_ready failed\r\n  (serial 1a2b3c4d)\x01") +
+                               std::string(1, '\0') + "trailing bytes nobody prints";
+    const std::vector<DumpFile> files = {
+      {"Q6-DUMP.bin", "Q6 memory", 600000, ""},
+      {"Q6-SFR.bin", "Failure reason", 96, reason},
+      {"Q6-REGS.bin", "Registers", 4096, ""},
+    };
+    h.write(makeDump(files));
+    RddmReport rep;
+    h.decode(rep, serial);
+    CHECK(rep.header && !rep.sizeFirst && rep.version == 1 && rep.headerBytes == 8 + 3 * 64 && rep.entries == 3 && rep.files == 3);
+    CHECK(std::strcmp(rep.file[0].name, "Q6-DUMP.bin") == 0 && std::strcmp(rep.file[0].description, "Q6 memory") == 0);
+    CHECK(rep.file[0].offset == rep.headerBytes && rep.file[1].offset == rep.headerBytes + 600000 &&
+          rep.file[2].offset == rep.headerBytes + 600096);
+    CHECK(rep.file[0].inDump && rep.file[1].inDump && rep.file[2].inDump);
+    CHECK(rep.file[0].base == 0x86000000ull && rep.file[1].phys == 0x4000001ull);
+    CHECK(rep.reasonFile == 1);
+    CHECK(std::strcmp(rep.reason, "wlan_fw.c:1234 Assertion pmu_ready failed (serial --------).") == 0);
+    CHECK(rep.strings == 0);   // a reason was found: nothing else is looked for
+    CHECK(rep.segmentsWithData == 2 && rep.dataEnd == rep.headerBytes + 600000 + 96 + 4096);
+  }
+  {   // the size before the version; a reason longer than the log takes; the decimal form of the serial
+    DumpHost h;
+    const uint32_t serial = 987654321u;
+    const std::string reason = "err_fatal: id 987654321 " + std::string(400, 'z');
+    h.write(makeDump({{"q6-sfr.BIN", "sfr", 2048, reason}}, true));
+    RddmReport rep;
+    h.decode(rep, serial);
+    CHECK(rep.header && rep.sizeFirst && rep.headerBytes == 72 && rep.version == 1);
+    CHECK(rep.reasonFile == 0 && std::strlen(rep.reason) == kRddmReasonBytes);
+    CHECK(std::strncmp(rep.reason, "err_fatal: id --------- zzz", 27) == 0);
+  }
+  {   // no header: the first segment's error-like strings, the strong ones first, format strings never
+    DumpHost h;
+    std::vector<uint8_t> dump(64 * 1024, 0);
+    auto at = [&](size_t off, const std::string &s) { std::memcpy(dump.data() + off, s.data(), s.size()); };
+    put32(dump.data(), 0xdeadbeefu);
+    put32(dump.data() + 4, 0x12345678u);
+    at(0x100, "an ordinary sentence with nothing in it");
+    at(0x200, "cnss: timed out waiting for the host");                // weak
+    at(0x300, "%s: failed to start %d, ERR_FATAL at %p");              // a format string: never
+    at(0x400, "ERR_FATAL wdog bite: core 0 pc 0x0001f00d");            // strong
+    at(0x500, "short err");                                            // too short
+    at(0x600, "phy_init.c:77 assertion " + std::string(300, 'q'));    // strong, long: cut at 120
+    at(0x900, "timeout one");                                          // too short
+    at(0xa00, "a fault was seen on the bus here");                     // weak
+    at(0xb00, "another fail in the radio calibration");                // weak
+    at(0xc00, "and an error that is the fourth weak one");             // weak, one too many to keep
+    h.write(dump);
+    RddmReport rep;
+    h.decode(rep);
+    CHECK(!rep.header && rep.why != nullptr && rep.word0 == 0xdeadbeefu && rep.word1 == 0x12345678u);
+    CHECK(rep.reasonFile == -1 && rep.reason[0] == 0);
+    CHECK(rep.strings == kRddmMaxStrings && rep.candidates == 6);
+    CHECK(std::strcmp(rep.string[0].text, "ERR_FATAL wdog bite: core 0 pc 0x0001f00d") == 0 && rep.string[0].at == 0x400);
+    CHECK(std::strlen(rep.string[1].text) == kRddmStringBytes && rep.string[1].at == 0x600);
+    CHECK(std::strcmp(rep.string[2].text, "cnss: timed out waiting for the host") == 0);
+    CHECK(std::strcmp(rep.string[3].text, "a fault was seen on the bus here") == 0);
+    for (unsigned i = 0; i < rep.strings; ++i) CHECK(std::strchr(rep.string[i].text, '%') == nullptr);
+  }
+  {   // an all-zero dump: nothing decoded, nothing printed
+    DumpHost h;
+    RddmReport rep;
+    h.decode(rep);
+    CHECK(!rep.header && rep.dataEnd == 0 && rep.segmentsWithData == 0 && rep.strings == 0 && rep.why != nullptr);
+  }
+  {   // a header whose entries carry no names is not a header; a file larger than the dump is flagged, the walk goes on
+    DumpHost h;
+    std::vector<uint8_t> dump = makeDump({{"", "", 64, "nothing"}});
+    h.write(dump);
+    RddmReport rep;
+    h.decode(rep);
+    CHECK(!rep.header && rep.files == 0 && rep.why != nullptr);
+    DumpHost g;
+    g.write(makeDump({{"Q6-HUGE.bin", "memory", 64ull << 20, ""}, {"Q6-SFR.bin", "reason", 32, "never reached"}}));
+    // the second file's offset is past the dump: no reason is read
+    RddmReport rep2;
+    g.decode(rep2);
+    CHECK(rep2.header && rep2.files == 2 && !rep2.file[0].inDump && !rep2.file[1].inDump && rep2.reasonFile == -1);
+  }
+  {   // the read across segments
+    DumpHost h;
+    std::vector<uint8_t> dump(kRddmSegBytes + 16, 0);
+    for (size_t i = 0; i < dump.size(); ++i) dump[i] = uint8_t(i * 7 + 1);
+    h.write(dump);
+    uint8_t buf[32] = {};
+    auto copy = [](uint8_t *to, const uint8_t *from, uint32_t n) { std::memcpy(to, from, n); };
+    CHECK(rddmRead(h.r, kRddmSegBytes - 8, buf, 16, copy) == 16);
+    for (unsigned i = 0; i < 16; ++i) CHECK(buf[i] == uint8_t((kRddmSegBytes - 8 + i) * 7 + 1));
+    CHECK(rddmRead(h.r, uint64_t(h.r.segments) * kRddmSegBytes - 4, buf, 16, copy) == 4);   // clipped at the end
+    CHECK(rddmRead(h.r, uint64_t(h.r.segments) * kRddmSegBytes, buf, 16, copy) == 0);
+  }
+  {   // the mask: hex in either case, never a partial match, and nothing for a serial of 0
+    char text[] = "id 1A2B3C4D and 1a2b3c4d and 1a2b3c4 end";
+    rddmMask(text, 0x1a2b3c4du);
+    CHECK(std::strcmp(text, "id -------- and -------- and 1a2b3c4 end") == 0);
+    char untouched[] = "00000000";
+    rddmMask(untouched, 0);
+    CHECK(std::strcmp(untouched, "00000000") == 0);
+  }
+}
+
 int main()
 {
   testCodec();
   testTransport();
+  testAfterMission();
+  testRddm();
   testRouter();
   testClient();
   testClientGate();

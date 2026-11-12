@@ -29,7 +29,12 @@ Nothing above level 1 has run on hardware yet: read one boot's log before raisin
   before the doorbell, as the boots before 2026-11-12's fourth round did), BHIe for the second ELF, mission mode. Polled. The
   MHI/BHI/BHIe block is logged before the doorbell, every change of its status words while waiting, the TLP counters of both
   ends of the link (`piano-wifi-ras=0`), and after a failure where the chip's DMA went (PCI status, AER, the SMMU's faults, the
-  sink, whether the image is still the stock one) (docs/drivers/wifi.md sections 10.21 and 10.23).
+  sink, whether the image is still the stock one) (docs/drivers/wifi.md sections 10.21 and 10.23). Since the fifth round (§10.24):
+  the crash dump's segments and vector table are given to the chip right after the receive block's clear (`piano-wifi-rddm=0`
+  skips it), and read back and decoded whenever the firmware later reports its crash dump environment or a system error; the
+  ladder's lines from the doorbell on are held and printed when it stops (`piano-wifi-defer=0`), since a console line held this
+  thread for 2 s right after mission mode in wifi-4a; mission mode asserts the device wake doorbell (`piano-wifi-wake=0`); the
+  MHI rings sit at multiples of their own length and the context arrays on pages of their own, as the MHI host allocates them.
 - `piano-wifi=5`: the chip's two IPC router channels (20 out, 21 in) over MHI with their rings and 8 KiB buffers in the same
   window (64 MiB by default at this level), the IPC router itself (hello, the firmware's service announcement), and the WLAN
   firmware's QMI service: the radio's capability, the indication registration, the host capability, the firmware's memory regions
@@ -65,7 +70,8 @@ meanings: `docs/drivers/wifi.md`.
 | `WifiMhi.h` | portable: the firmware file's layout, the DMA arena, the BHIe vector table, the BHI/BHIe boot machine, the MHI contexts |
 | `WifiPbl.h` | portable: level 4 before the doorbell — the chip's power-on reset, the endpoint's MSI into a sink, the RAS DES TLP counters, the image hashed as the chip reads it |
 | `WifiSha256.h` | portable SHA-256 (FIPS 180-4) for that check, after PianoAudio's (`UPSTREAM`) |
-| `WifiChannels.h` | portable: level 5's transport — the two IPC router channels' contexts and rings, the start commands, the receive buffers, a send, and the event walk |
+| `WifiChannels.h` | portable: level 5's transport — the two IPC router channels' contexts and rings, their preparation and start commands, the receive buffers, a send, the event walk, and the M0 answer |
+| `WifiRddm.h` | portable: the firmware's crash dump (RDDM) over BHIe — the segments and vector table given before the boot, the receive status, and the bounded decode (the header's files, the failure reason, error-like strings only when there is no reason; the serial masked) |
 | `WifiQmi.h` | portable: the QMI message writer and the typed readers over the copied codec's parse |
 | `WifiWlfw.h` | portable: the WLAN firmware's message set and the step machine, the memory answer, the downloads, the copy-engine configuration and the shadow list |
 | `WifiSmmuWindow.h` | portable: the 32-bit window for stream 0x1401 (a translating context bank and its two-page table), copies of PianoDpu's and PianoUsbHost's SMMU pieces (`UPSTREAM`) |

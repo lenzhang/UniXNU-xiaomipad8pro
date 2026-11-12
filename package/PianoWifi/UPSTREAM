@@ -186,6 +186,29 @@ This repository: package/PianoAudio/AudioSha256.c (sha256 d3a1a322ee462493b0eeaf
     chip power-up ran the same ath12k recipe including the QFPROM bit and enabled MSI into a sink page before its boot loader,
     and that its working window for this chip family's stream mapped IOVA 0x10000000 upward (the IOVA range is not the cause).
 
+Specifications only for the fifth round of 2026-11-12 (docs/drivers/wifi.md section 10.24: the crash after mission mode; behaviour,
+register and layout facts as these hosts are publicly known to behave, no code, comment or table copied), the same Ubuntu kernel:
+  drivers/bus/mhi/host/boot.c, init.c, pm.c, main.c, internal.h and drivers/bus/mhi/common.h: that a controller with a crash dump
+    size gets a BHIe receive vector table over segments of that size before the power-up, right after the receive block is zeroed,
+    written address high, low, size, then the session in the doorbell's 29:0; that on the crash dump environment the host only
+    waits for the receive status (31:30 = 2 complete, 3 an error); the receive block's offsets (+0x60 .. +0x78); that the context
+    initialisation writes every configured channel's state (disabled), burst mode, type and event ring before the power-up and the
+    ring with the enabled state only when the channel is prepared, right before its start command; that every ring's base is a
+    multiple of its length; that the mission-mode transition asserts the device wake doorbell (channel 127) before the devices
+    are created, that an M0 in mission mode rings every event ring, the command ring with work and every channel again, and that
+    an M1 is answered with M2 (and a wake toggle when the host still needs the device). WifiMhi.h's mhiDevWake / mhiSetState /
+    mhiHealth and the layout, WifiChannels.h's ipcrPrepare / ipcrStart / ipcrRingAll and WifiRddm.h are this repository's own.
+  drivers/net/wireless/ath/ath12k/mhi.c, coredump.c, qmi.c: this chip's crash dump size (0x420000 bytes) and 512 KiB segments,
+    that the host collects the dump on the crash dump callback, the order of the first three WLFW requests once the service
+    arrives (the radio's capability, the indication registration, the host capability with the internal sleep clock bit).
+  net/qrtr/ns.c: that the host's name service answers a remote's hello (with its own hello and its servers) rather than speaking
+    first on a new link; level 5 now waits 500 ms for the chip's hello before saying its own.
+  The vendor MHI host (msm kernels, GPL-2.0), for the crash dump's header layout only: a version and the header's size, then one
+  64-byte entry per file (device address, physical address, size, a 20-byte description, a 20-byte file name), the files back to
+  back after the header across the segments, and the failure reason in the file whose name says SFR. WifiRddm.h's decode accepts
+  either order of the first two words, since only the layout was taken, not the code.
+Not read and not used: any Qualcomm binary; no dump is kept, committed or printed beyond the decode's short lines.
+
 Specifications only (no code, comment or table copied): mainline Linux drivers/clk/qcom/gcc-sm8750.c and tcsrcc-sm8750.c,
 include/dt-bindings/clock/qcom,sm8750-gcc.h, drivers/pci/controller/dwc/pcie-qcom.c and pcie-designware.h,
 drivers/phy/qualcomm/phy-qcom-qmp-pcie.c and phy-qcom-qmp-pcs-v7.h, drivers/pinctrl/qcom/pinctrl-sm8750.c (register offsets, bit

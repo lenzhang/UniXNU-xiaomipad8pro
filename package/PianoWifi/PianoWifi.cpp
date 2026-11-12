@@ -50,7 +50,13 @@
 // address in the log instead of its first three bytes), piano-wifi-noc=0 (no PCIe NoC vote), and level 4's four switches of the
 // 2026-11-12 fourth round (WifiPbl.h, docs §10.23), each the A/B of a default: piano-wifi-socreset=0 (no chip power-on reset before
 // BHI), piano-wifi-msi=0 (MSI left off), piano-wifi-ctxearly=1 (the MHI context registers before the doorbell too),
-// piano-wifi-ras=0 (no TLP counters). Without piano-wifi the driver declines in probe() and maps nothing.
+// piano-wifi-ras=0 (no TLP counters). After wifi-4a (2026-11-12: mission mode at 477 ms, then the firmware's crash dump
+// environment 2 s later while one console line held this thread; docs §10.24), three more, each the A/B of a default:
+// piano-wifi-rddm=0 (no crash dump: by default the dump's segments are given to the chip before the boot, as the MHI host does,
+// and read back and decoded when the firmware dies), piano-wifi-defer=0 (every line printed when it happens: by default the lines
+// from the boot loader's doorbell to the end of the ladder are held in memory and printed afterwards, so that the console never
+// stalls the host while the firmware waits for it), piano-wifi-wake=0 (no device wake doorbell at mission mode). Without
+// piano-wifi the driver declines in probe() and maps nothing.
 //
 // Power (package/include/PianoPowerContract.h): the radio is off unless piano-wifi>=2, since nothing below that level votes a
 // rail or releases PERST#. From level 2 on the driver joins the power tree, and its only power state change is to stop the
@@ -76,6 +82,7 @@
 #include "WifiLink.h"
 #include "WifiMhi.h"
 #include "WifiPbl.h"
+#include "WifiRddm.h"
 #include "WifiSmmuWindow.h"
 #include "WifiSurvey.h"
 #include "WifiWlfw.h"
@@ -97,6 +104,7 @@ struct Args {
   uint32_t iova, mode, shadow, qmiTimeoutMs;
   uint32_t wmiTimeoutMs, scanWaitMs, band, bssid;
   uint32_t noc, socreset, msi, ctxearly, ras;
+  uint32_t rddm, defer, wake;
 };
 Args gArgs;
 
@@ -149,8 +157,8 @@ void readArgs()
   // piano-wifi-noc=0: no vote for the PCIe NoC's bus clock manager (SN4) before level 3's clocks (the A/B test of docs §10.21)
   gArgs.noc = bootArg("piano-wifi-noc", 1);
   // The fourth round's alignments with the chip's own host (docs §10.23, WifiPbl.h), each on by default and each with its A/B:
-  // piano-wifi-socreset=0: no chip-side power-on reset before BHI (the whole recipe of ath12k's power-up, the BHIe vector words and
-  //   the MHI host's receive-vector clear included);
+  // piano-wifi-socreset=0: no chip-side power-on reset before BHI (the whole recipe of ath12k's power-up and its BHIe vector words;
+  //   since docs §10.24 the MHI host's own receive-vector clear runs either way, as the crash dump's table follows it);
   gArgs.socreset = bootArg("piano-wifi-socreset", 1);
   // piano-wifi-msi=0: the endpoint's MSI left off (by default one vector into a sink page of the DMA window, as the host boots it);
   gArgs.msi = bootArg("piano-wifi-msi", 1);
@@ -159,7 +167,29 @@ void readArgs()
   gArgs.ctxearly = bootArg("piano-wifi-ctxearly", 0);
   // piano-wifi-ras=0: no TLP counters on the two ends of the link (diagnostic only)
   gArgs.ras = bootArg("piano-wifi-ras", 1);
+  // After wifi-4a (docs §10.24), each on by default with its A/B:
+  // piano-wifi-rddm=0: no crash dump segments for the chip (WifiRddm.h);
+  gArgs.rddm = bootArg("piano-wifi-rddm", 1);
+  // piano-wifi-defer=0: every line printed at once, even while the firmware starts (see note() below);
+  gArgs.defer = bootArg("piano-wifi-defer", 1);
+  // piano-wifi-wake=0: no device wake doorbell at mission mode.
+  gArgs.wake = bootArg("piano-wifi-wake", 1);
 }
+
+uint64_t nowMs();
+
+// ---- the log, and why part of it waits (wifi-4a, 2026-11-12) ----
+// IOLog goes to the console, and the console can hold the calling thread for seconds while the rest of the boot prints (wifi-4a:
+// the line after "changed +477 ms" took 2027 ms to come out, while the root volume mounted and launchd started; the firmware
+// reached mission mode at 477 ms and was in its crash dump environment when the next register read came, at 2503 ms). The host is
+// the only one who can answer the firmware, so from the boot loader's doorbell to the end of the ladder this thread's lines are
+// kept in a heap buffer and printed when the ladder stops (deferFlush), each with how long after the doorbell it was written.
+// Other threads (the power hook) still print at once. piano-wifi-defer=0 prints everything as it happens.
+constexpr unsigned kDeferLines = 224, kDeferBytes = 300;
+char *gDeferBuf;
+unsigned gDeferCount, gDeferDropped;
+uint64_t gDeferSince;
+thread_t gDeferThread;
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void note(const char *fmt, ...)
@@ -169,7 +199,43 @@ void note(const char *fmt, ...)
   va_start(ap, fmt);
   vsnprintf(line, sizeof line, fmt, ap);
   va_end(ap);
+  if (gDeferBuf && current_thread() == gDeferThread) {
+    if (gDeferCount < kDeferLines)
+      snprintf(gDeferBuf + gDeferCount++ * kDeferBytes, kDeferBytes, "%s [+%llu ms]", line,
+               (unsigned long long)(nowMs() - gDeferSince));
+    else
+      ++gDeferDropped;
+    return;
+  }
   IOLog("PianoWifi: %s\n", line);
+}
+
+void deferStart()
+{
+  if (!gArgs.defer || gDeferBuf) return;
+  char *buffer = static_cast<char *>(IOMallocData(kDeferLines * kDeferBytes));
+  if (!buffer) {
+    note("log: no buffer to hold the lines while the firmware starts: they are printed as they come");
+    return;
+  }
+  note("log: from here until the ladder stops, this thread's lines are held and printed afterwards with their time since now "
+       "(piano-wifi-defer=0 prints them at once)");
+  gDeferCount = gDeferDropped = 0;
+  gDeferSince = nowMs();
+  gDeferThread = current_thread();
+  gDeferBuf = buffer;
+}
+
+void deferFlush()
+{
+  char *buffer = gDeferBuf;
+  if (!buffer) return;
+  gDeferBuf = nullptr;   // from here note() prints again
+  const uint64_t held = nowMs() - gDeferSince;
+  IOLog("PianoWifi: log: %u line(s) held for %llu ms follow\n", gDeferCount, (unsigned long long)held);
+  for (unsigned i = 0; i < gDeferCount; ++i) IOLog("PianoWifi: %s\n", buffer + i * kDeferBytes);
+  if (gDeferDropped) IOLog("PianoWifi: log: %u later line(s) did not fit and were not kept\n", gDeferDropped);
+  IOFreeData(buffer, kDeferLines * kDeferBytes);
 }
 
 void stage(int32_t value, const char *what)
@@ -1418,7 +1484,124 @@ void dmaReport(const LinkState &link)
 }
 
 MhiContexts gContexts;
+Ipcr gIpcr;                       // level 5's two channels, planned by level 4 before the boot when level 5 follows
+bool gIpcrPlanned;
 uint32_t gMhiRegLen;
+MhiBoot gBoot;                   // level 4's register layout (BHI, BHIe), for the crash report of any later level
+const LinkState *gLinkState;      // for dmaReport after a crash
+
+// ---- the crash dump (WifiRddm.h, docs §10.24) ----
+// Given to the chip before the boot loader's doorbell, right after the receive block's clear, as the MHI host gives its table in
+// the power-up's preparation; read back once the firmware reports its crash dump environment or a system error.
+Rddm gRddm;
+bool gRddmArmed, gCrashReported;
+constexpr uint32_t kRddmEnterMs = 1000, kRddmWaitMs = 3000, kRddmRearmMs = 1500;
+
+void rddmSetup(const MhiBoot &b)
+{
+  if (!gArgs.rddm) {
+    note("level 4: crash dump: not given to the chip (piano-wifi-rddm=0): a firmware that dies cannot say why");
+    return;
+  }
+  if (!rddmPlan(gRddm, gArena, kRddmBytes)) {
+    note("level 4: crash dump: the DMA window has no room for %u KiB of segments: not given to the chip", kRddmBytes / 1024);
+    return;
+  }
+  rddmArm(gRddm, gMhiIo, b.bhie, uint32_t(nowMs() * 2654435761u) | 1u);
+  gRddmArmed = true;
+  note("level 4: crash dump: %u segments of %u KiB from bus %#llx, the vector table at %#llx (%u bytes), given to the chip "
+       "before the boot with session %#x (receive status %08x)",
+       gRddm.segments, gRddm.segBytes / 1024, (unsigned long long)gRddm.segBus[0], (unsigned long long)gRddm.tableBus,
+       gRddm.tableBytes, gRddm.seq, barRd(nullptr, b.bhie + kBhieRxVecStatus));
+}
+
+// Whether the device has written anything into the first segment's first page yet (the re-arm below only happens to a dump that
+// never started).
+bool rddmTouched()
+{
+  if (!gRddm.segments) return false;
+  for (uint32_t i = 0; i < 4096; i += 8)
+    if (*reinterpret_cast<volatile uint64_t *>(gRddm.seg[0] + i)) return true;
+  return false;
+}
+
+// The firmware died (`when` says where): what MHI and BHI say, the dump once the chip has written it, its decode, and where the
+// chip's DMA went. Once per boot; bounded by kRddmEnterMs + kRddmWaitMs.
+void crashReport(const char *when)
+{
+  if (gCrashReported) return;
+  gCrashReported = true;
+  const MhiBoot &b = gBoot;
+  MhiHealth h = mhiHealth(gMhiIo, b.bhi);
+  note("crash: %s: MHISTATUS %08x (state %#x%s), EE %s, BHI error code %08x, debug %08x %08x %08x, receive status %08x", when,
+       h.status, h.state, h.sysErr ? ", SYSERR" : "", mhiEeName(h.ee), barRd(nullptr, b.bhi + kBhiErrCode),
+       barRd(nullptr, b.bhi + kBhiErrDbg1), barRd(nullptr, b.bhi + kBhiErrDbg2), barRd(nullptr, b.bhi + kBhiErrDbg3),
+       barRd(nullptr, b.bhie + kBhieRxVecStatus));
+  const uint64_t start = nowMs();
+  while (!h.rddm && !h.gone && nowMs() - start < kRddmEnterMs) {   // a system error comes first; the dump environment follows
+    IOSleep(5);
+    h = mhiHealth(gMhiIo, b.bhi);
+  }
+  if (!h.rddm) note("crash: the chip is not in its crash dump environment after %llu ms (EE %s%s)",
+                    (unsigned long long)(nowMs() - start), mhiEeName(h.ee), h.gone ? ", MHISTATUS all ones" : "");
+  if (!gRddmArmed) {
+    note("crash: no dump segments were given to the chip: the reason cannot be read back");
+  } else {
+    uint32_t poll = kRddmWaiting;
+    bool rearmed = false;
+    while (nowMs() - start < kRddmEnterMs + kRddmWaitMs) {
+      poll = rddmPoll(gRddm, gMhiIo, b.bhie);
+      if (poll != kRddmWaiting) break;
+      // A dump that never started by now: the table given once more with a new session (the device may only look at the doorbell
+      // in its dump environment). Never while data is arriving.
+      if (!rearmed && h.rddm && nowMs() - start >= kRddmRearmMs && !rddmTouched()) {
+        rddmArm(gRddm, gMhiIo, b.bhie, gRddm.seq + 0x101u);
+        rearmed = true;
+      }
+      IOSleep(5);
+    }
+    note("crash: dump %s after %llu ms: receive status %08x (session %s%s)", rddmPollName(poll),
+         (unsigned long long)(nowMs() - start), gRddm.status, rddmSessionMatches(gRddm) ? "ours" : "not ours",
+         rearmed ? "; the table was given once more" : "");
+    uint8_t *scratch = static_cast<uint8_t *>(IOMallocData(kRddmScratchBytes));
+    RddmReport *rep = static_cast<RddmReport *>(IOMallocData(sizeof(RddmReport)));
+    if (!scratch || !rep) {
+      note("crash: no memory to decode the dump");
+    } else {
+      const uint32_t serial = barRd(nullptr, b.bhi + kBhiSerialNumber);
+      rddmDecode(gRddm, scratch, [](uint8_t *to, const uint8_t *from, uint32_t n) { memcpy(to, from, n); }, serial, *rep);
+      note("crash: dump: %u of %u segment(s) hold data, the data ends at +%#llx", rep->segmentsWithData, gRddm.segments,
+           (unsigned long long)rep->dataEnd);
+      if (rep->header) {
+        note("crash: dump header: version %#x, %u bytes (%s), %u entr%s", rep->version, rep->headerBytes,
+             rep->sizeFirst ? "the size first" : "the version first", rep->entries, rep->entries == 1 ? "y" : "ies");
+        for (uint32_t i = 0; i < rep->files; ++i) {
+          const RddmFile &f = rep->file[i];
+          note("crash: file %u: \"%s\" (\"%s\"), %llu bytes at +%#llx%s, device address %#llx", i, f.name, f.description,
+               (unsigned long long)f.size, (unsigned long long)f.offset, f.inDump ? "" : " (not inside the segments)",
+               (unsigned long long)f.base);
+        }
+      } else if (rep->why) {
+        note("crash: dump header not decoded (%s): first words %08x %08x", rep->why, rep->word0, rep->word1);
+      }
+      if (rep->reason[0])
+        note("crash: the firmware's failure reason (file \"%s\"): \"%s\"", rep->file[rep->reasonFile].name, rep->reason);
+      else if (rep->reasonFile >= 0)
+        note("crash: the failure reason file \"%s\" is empty", rep->file[rep->reasonFile].name);
+      for (unsigned i = 0; i < rep->strings; ++i)
+        note("crash: error-like text in the first segment at +%#llx: \"%s\"", (unsigned long long)rep->string[i].at,
+             rep->string[i].text);
+      if (!rep->reason[0] && rep->dataEnd)
+        note("crash: %u error-like string(s) in the first segment, %u shown; nothing else of the dump is printed",
+             rep->candidates, rep->strings);
+    }
+    if (scratch) IOFreeData(scratch, kRddmScratchBytes);
+    if (rep) IOFreeData(rep, sizeof(RddmReport));
+  }
+  dumpMhi("at the crash", b);
+  if (gLinkState) dmaReport(*gLinkState);   // the SMMU's fault registers say whether the chip's DMA left the window
+  msiSinkReport("at the crash");
+}
 
 struct FirmwarePlan {
   FwLayout layout;
@@ -1507,6 +1690,8 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
     return -5;
   }
   gMhiRegLen = boot.reglen;
+  gBoot = boot;
+  gLinkState = &link;
   const uint32_t version = chipRead(kChipTcsrSocHwVersion);
   note("level 4: BHI at %#x, BHIe at %#x, EE %s, state %#x; chip TCSR version %08x (major %u)", boot.bhi, boot.bhie,
        mhiEeName(mhiEeRead(boot)), mhiStateRead(boot), version, (version >> 8) & 0xfu);
@@ -1532,8 +1717,22 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
   if (gArgs.socreset) {
     chipPowerOn(boot);
     noteIdentity("after the chip's reset", boot);
+  } else {
+    // The MHI host's own clear of the receive block (its power-on values are undefined) comes before the crash dump's table in
+    // any case; chipPowerOn has it after the chip's reset.
+    note("level 4: %u receive vector words cleared (no chip reset: piano-wifi-socreset=0)", mhiClearRxVectors(boot));
   }
+  rddmSetup(boot);
   if (gArgs.msi) msiSink(link);
+  // Level 5's two channels: their rings and buffers now, out of the same window, so that nothing but doorbells and the start
+  // commands is left for after mission mode (the MHI host initialises every context its configuration names before the
+  // power-up; mhiContextsPlan wrote the two channels' fixed fields).
+  if (gArgs.level >= 5) {
+    gIpcrPlanned = ipcrPlan(gIpcr, gArena, contexts);
+    note("level 4: channels %u and %u %s", kChanIpcrOut, kChanIpcrIn,
+         gIpcrPlanned ? "planned before the boot (state disabled, burst mode disabled, the data event ring)"
+                      : "could not be planned: the DMA window has no room (level 5 will stop)");
+  }
   dsb();
   if (gArgs.ctxearly) mhiContextsProgram(contexts, gMhiIo, boot.reglen);
   note("level 4: contexts at %#llx (channels %u, event rings %u: control at %#llx, data at %#llx, command ring at %#llx), %s",
@@ -1547,6 +1746,7 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
        (unsigned long long)(arenaAlign(kMhiSblBytes) >> 10), (unsigned long long)plan.tableBus);
   dumpMhi("before the doorbell", boot);
   rasArm();
+  deferStart();   // from the doorbell on, the console must not hold this thread (wifi-4a: 2 s, and the firmware died meanwhile)
   uint32_t phase = mhiBegin(boot, 0, plan.sblBus, plan.layout.sblBytes, plan.tableBus,
                             plan.tableEntries * uint32_t(sizeof(BhieEntry)), uint32_t(nowMs()) | 1u);
   if (phase == kMhiSblLoading)
@@ -1608,11 +1808,24 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
     msiSinkReport("at the end");
     imageHash("after the failure", false);
     noteIdentity("at the end", boot);
+    if (boot.error == kMhiErrRddm || boot.error == kMhiErrSysErr) crashReport("level 4, before mission mode");
     safeOff(gHw, power, opt);
     return -1;
   }
+  // Mission mode. What the MHI host does first (its mission-mode transition): the device kept awake through the wake doorbell, so
+  // that it stays in M0 while the host starts the channels; this host keeps it asserted while its levels run.
+  if (gArgs.wake) {
+    const bool rung = mhiDevWake(gMhiIo, boot.reglen, true);
+    note("level 4: device wake %s", rung ? "asserted (channel 127's doorbell = 1)" : "NOT asserted: the doorbell array is outside BAR0");
+  }
   rasReport();
   msiSinkReport("at mission mode");
+  const MhiHealth health = mhiHealth(gMhiIo, boot.bhi);
+  if (health.dead()) {
+    crashReport("level 4, right after mission mode");
+    safeOff(gHw, power, opt);
+    return -1;
+  }
   return 0;
 }
 
@@ -1620,7 +1833,6 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
 // The transport (WifiChannels.h) over the contexts level 4 gave the chip, the copied router (WifiQrtr.c) on top of it, and the
 // WLFW client (WifiWlfw.h) on top of that. Everything is polled from this thread: no MSI, no interrupt, no allocation after the
 // window, and every wait is bounded by piano-wifi-qmitimeout.
-Ipcr gIpcr;
 QcomQrtr gRouter;
 WlfwClient gClient;
 unsigned gQrtrUnrouted;
@@ -1685,8 +1897,12 @@ void wlfwStepNote(void *, int step, const char *what)
   note("step %d: %s", step, what);
 }
 
-// One turn: the event rings walked, every received packet given to the router, the buffers given back to the chip. Returns how
-// many events were seen; `stop` is set when the chip reported an environment this driver cannot go on from.
+// One turn: the event rings walked, every received packet given to the router, the buffers given back to the chip, and the
+// chip's health read (MHISTATUS and the execution environment: two register reads). Returns how many events were seen; `stop` is
+// set when the chip reported an environment this driver cannot go on from (its crash dump environment, a system error), and
+// gChipDead says that it died rather than refused.
+bool gChipDead;
+unsigned gM0Events, gM1Answers;
 unsigned pump(bool &stop)
 {
   bool fatal = false;
@@ -1698,6 +1914,21 @@ unsigned pump(bool &stop)
       break;
     case kIpcrState:
       note("level 5: the chip reports state %#x", code);
+      if (code == kStateM0) {
+        // The MHI host's M0 in mission mode: every event ring, the command ring with a command waiting, every running channel
+        // rung again, so that a device that came back from a low-power state sees where the host is.
+        ++gM0Events;
+        ipcrRingAll(gIpcr, gContexts, gMhiIo);
+      } else if (code == kStateM1) {
+        // The device idled although the wake doorbell is asserted: the MHI host's answer is M2, and a host that still needs the
+        // device then toggles the wake doorbell, which brings it back to M0.
+        ++gM1Answers;
+        mhiSetState(gMhiIo, kStateM2);
+        mhiDevWake(gMhiIo, gMhiRegLen, false);
+        mhiDevWake(gMhiIo, gMhiRegLen, true);
+      } else if (code == kStateSysErr) {
+        fatal = true;
+      }
       break;
     case kIpcrEe:
       note("level 5: the chip reports environment %s", mhiEeName(code));
@@ -1708,14 +1939,17 @@ unsigned pump(bool &stop)
     }
   });
   if (seen) ipcrPostRx(gIpcr, gMhiIo);
+  const MhiHealth h = mhiHealth(gMhiIo, gBoot.bhi);
+  if (h.dead()) fatal = true;
+  if (fatal) gChipDead = true;
   stop = fatal;
   return seen;
 }
 
-// A channel started: one command on the primary ring, then its completion event.
+// A channel started: its ring into its context, one command on the primary ring, then its completion event.
 bool startChannel(uint32_t channel)
 {
-  if (!ipcrCommand(gIpcr, gMhiIo, channel, kTreCmdStart)) {
+  if (!ipcrStart(gIpcr, gMhiIo, channel)) {
     note("level 5: the start command for channel %u could not be queued (%s)", channel,
          gIpcr.error ? gIpcr.error : "a command is in flight");
     return false;
@@ -1724,7 +1958,10 @@ bool startChannel(uint32_t channel)
   while (nowMs() < deadline) {
     bool stop = false;
     pump(stop);
-    if (stop) return false;
+    if (stop) {
+      note("level 5: the chip died while channel %u was being started", channel);
+      return false;
+    }
     if ((channel == kChanIpcrOut && gIpcr.started[0]) || (channel == kChanIpcrIn && gIpcr.started[1])) return true;
     if (gIpcr.commandErrors) {
       note("level 5: the chip refused to start channel %u (completion code %#x)", channel, gIpcr.lastCode);
@@ -1739,7 +1976,8 @@ bool startChannel(uint32_t channel)
 int level5(PowerState &power, const Options &opt)
 {
   stage(500, "level 5: the IPC router's channels, QRTR, and the WLAN firmware's QMI service");
-  if (!ipcrPlan(gIpcr, gArena, gContexts)) {
+  const uint64_t entered = nowMs();
+  if (!gIpcrPlanned && !(gIpcrPlanned = ipcrPlan(gIpcr, gArena, gContexts))) {
     stage(-500, "level 5: the DMA window has no room for the channels' rings and buffers");
     safeOff(gHw, power, opt);
     return -1;
@@ -1754,33 +1992,55 @@ int level5(PowerState &power, const Options &opt)
        kChanIpcrOut, kChanIpcrIn, kIpcrElements, (kIpcrRxBuffers + kIpcrOutBuffers) * kIpcrBufferBytes / 1024, gIpcr.chdb,
        gIpcr.erdb);
   if (!startChannel(kChanIpcrOut) || !startChannel(kChanIpcrIn)) {
+    if (gChipDead) crashReport("level 5, starting the IPC router's channels");
     stage(-501, "level 5: a channel did not start");
     safeOff(gHw, power, opt);
     return -3;
   }
   const unsigned posted = ipcrPostRx(gIpcr, gMhiIo);
-  note("level 5: both channels run (states %#x / %#x), %u receive buffers posted", ipcrChanState(gIpcr.out),
-       ipcrChanState(gIpcr.in), posted);
-  // The router: our hello, then the firmware's hello and its service announcement.
+  note("level 5: both channels run (states %#x / %#x) %llu ms after level 5 began, %u receive buffers posted",
+       ipcrChanState(gIpcr.out), ipcrChanState(gIpcr.in), (unsigned long long)(nowMs() - entered), posted);
+  // The router. The chip's router speaks first on this link (the Linux host only ever answers a hello), and the copied router
+  // answers it; ours goes out only if the chip has said nothing within kHelloWaitMs.
   qcom_qrtr_init(&gRouter, kQrtrLocalNode, qrtrSend, nullptr);
   if (qcom_qrtr_add_client(&gRouter, kQrtrClientPort, qrtrReceive, nullptr)) {
     stage(-502, "level 5: the router's client port could not be added");
     safeOff(gHw, power, opt);
     return -4;
   }
-  qcom_qrtr_start(&gRouter);
-  uint32_t node = 0, port = 0;
-  uint64_t deadline = nowMs() + gArgs.qmiTimeoutMs;
-  while (nowMs() < deadline) {
+  constexpr uint32_t kHelloWaitMs = 500;
+  bool died = false;
+  const uint64_t helloFrom = nowMs();
+  while (!gRouter.hello_received && nowMs() - helloFrom < kHelloWaitMs) {
     bool stop = false;
     pump(stop);
-    if (stop) break;
+    if (stop) {
+      died = true;
+      break;
+    }
+    IOSleep(2);
+  }
+  const bool chipFirst = gRouter.hello_received;
+  if (!gRouter.hello_sent && !died) qcom_qrtr_start(&gRouter);
+  note("level 5: router: %s", chipFirst ? "the chip said hello first and was answered"
+                              : died   ? "the chip died before it said hello"
+                                       : "no hello from the chip within 500 ms: ours went first");
+  uint32_t node = 0, port = 0;
+  uint64_t deadline = nowMs() + gArgs.qmiTimeoutMs;
+  while (!died && nowMs() < deadline) {
+    bool stop = false;
+    pump(stop);
+    if (stop) {
+      died = true;
+      break;
+    }
     if (!qcom_qrtr_find_service(&gRouter, kWlfwService, kWlfwInstanceWord, &node, &port)) break;
     IOSleep(5);
   }
-  if (!gRouter.hello_received || qcom_qrtr_find_service(&gRouter, kWlfwService, kWlfwInstanceWord, &node, &port)) {
+  if (died || !gRouter.hello_received || qcom_qrtr_find_service(&gRouter, kWlfwService, kWlfwInstanceWord, &node, &port)) {
     note("level 5: hello %s, %u services announced, %u packets in (%u unrouted)", gRouter.hello_received ? "answered" : "unanswered",
          gRouter.remote_count, gRouter.rx_packets, gRouter.rx_unrouted);
+    if (gChipDead) crashReport("level 5, waiting for the firmware's QMI service");
     stage(-502, "level 5: the firmware's QMI service was not announced on the router");
     safeOff(gHw, power, opt);
     return -5;
@@ -1810,7 +2070,7 @@ int level5(PowerState &power, const Options &opt)
     pump(stop);
     if (stop) {
       wlfwTimedOut(gClient);
-      note("level 5: the chip went to its crash dump environment during %s", wlfwStepName(last));
+      note("level 5: the chip reported a system error or its crash dump environment during %s", wlfwStepName(last));
       break;
     }
     if (gClient.step != last) {   // a step moved: its own deadline
@@ -1846,7 +2106,10 @@ int level5(PowerState &power, const Options &opt)
   note("level 5: %s after %llu ms (step %d: %s%s%s)", done ? "the firmware is ready" : "stopped",
        (unsigned long long)(nowMs() - started), done ? gClient.step : gClient.failedStep,
        wlfwStepName(done ? gClient.step : gClient.failedStep), done ? "" : ", ", done ? "" : wlfwErrorName(gClient.error));
+  note("level 5: MHI after mission mode: %u M0 event(s) answered by ringing every doorbell, %u M1 answered with M2", gM0Events,
+       gM1Answers);
   if (!done) {
+    if (gChipDead) crashReport("level 5, during the QMI exchange");
     safeOff(gHw, power, opt);
     return -7;
   }
@@ -1968,6 +2231,11 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
       break;
     }
     step = linkRun(gLink, nowMs());
+    if (mhiHealth(gMhiIo, gBoot.bhi).dead()) {   // MHI still carries the firmware's health while the copy engine runs
+      note("level 6: the chip reported a system error or its crash dump environment during %s", linkStepName(step));
+      gChipDead = true;
+      break;
+    }
     if (nowMs() > overall) {
       note("level 6: the ladder as a whole ran out of time during %s", linkStepName(step));
       break;
@@ -2030,6 +2298,7 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
            gLink.scan.count, gLink.endpoint, gLink.htc.credits);
   owner->setProperty("piano-wifi-level6", state);
   if (!done) {
+    if (gChipDead) crashReport("level 6");
     safeOff(gHw, power, opt);
     return -2;
   }
@@ -2320,6 +2589,19 @@ void PianoWifi::run()
   }
 
   // ---- level 4 ---------------------------------------------------------------------------------------------------------
+  // The lines level 4 starts holding at the boot loader's doorbell (note(), deferStart) come out on every way out of the ladder
+  // from here; and a ladder that ended well lets the device idle again (the wake doorbell back to 0, as the MHI host's last
+  // release does), since nothing answers it after this thread is gone.
+  struct LadderExit {
+    bool released = false;
+    ~LadderExit() { deferFlush(); }
+  } ladderExit;
+  auto releaseWake = [&]() {
+    if (!gArgs.wake || ladderExit.released || gChipDead) return;
+    ladderExit.released = true;
+    note("level %u: device wake %s", gArgs.level,
+         mhiDevWake(gMhiIo, gMhiRegLen, false) ? "released (the chip may idle)" : "not released");
+  };
   stage(400, "level 4: the DMA window, BAR0's MHI registers, the firmware over BHI/BHIe");
   if (!dmaWindow()) {
     stage(-400, "level 4: no DMA window; nothing was given to the endpoint");
@@ -2344,6 +2626,7 @@ void PianoWifi::run()
        rc ? "" : gArgs.level < 5 ? "; the ladder ends here (QMI is level 5, WMI and the station levels 6 and up)" : "");
   if (rc) chipPut();   // level 4's failures end in safeOff: WLAN_EN low
   if (rc || gArgs.level < 5) {
+    if (!rc) releaseWake();
     unmapAll();
     return;
   }
@@ -2359,11 +2642,13 @@ void PianoWifi::run()
           : gArgs.level < 6 ? "the copy engine, the transport and the scan are level 6 (docs/drivers/wifi.md section 13)"
                             : "level 6 follows: the copy engine, the transport and a passive scan");
   if (rc || gArgs.level < 6) {
+    if (!rc) releaseWake();
     unmapAll();
     return;
   }
   if (!gArgs.mode) {
     note("level 6: not run: the firmware's radio was not started (piano-wifi-mode=0); piano-wifi=6 needs it");
+    releaseWake();
     unmapAll();
     return;
   }
@@ -2376,6 +2661,7 @@ void PianoWifi::run()
   note("level 6: %s; %s", rc ? "the scan did not finish" : "the scan is done",
        rc ? "the ladder ends here" : "association, keys and the data path are levels 7 and 8 (docs/drivers/wifi.md section 13)");
   if (!rc) {
+    releaseWake();
     // The gate PianoWifiEthernet waits for: en1 appears (link down, with the scan list) only when level 6 came up.
     publishResource("PianoWifiLink");
     note("level 6: the resource PianoWifiLink is published: PianoWifiEthernet's en1 may come up (link down, the scan list in "

@@ -5,10 +5,13 @@
 // use them (behaviour only, nothing copied). Design re-expressed from UniXNU-sheng's and PaganiWifi's MHI boot (BSD-2-Clause-Patent,
 // UPSTREAM), which stop at mission mode: the channels, their rings and the event walk are this driver's own.
 //
-// What it does, once level 4's firmware is in mission mode:
-//   1. the two channel contexts (20 to the device, 21 back) are filled in the context array level 4 already gave the chip: state
-//      enabled, burst mode disabled, the event ring the chip reports on, and the ring each channel reads or writes;
-//   2. a "start channel" command for each goes on the command ring, and the chip answers with a command completion event;
+// What it does:
+//   0. before the boot (level 4, when level 5 follows): the rings and buffers out of the arena; the two channel contexts (20 to the
+//      device, 21 back) carry only their fixed fields, which level 4's context plan wrote (state disabled, burst mode disabled,
+//      the type, the event ring), as the MHI host's context initialisation leaves them;
+//   1. once the firmware is in mission mode, for each channel in turn (20, then 21, as the MHI host prepares a device's two
+//      channels): its ring into its context and the state enabled, then
+//   2. a "start channel" command on the command ring, and the chip answers with a command completion event;
 //   3. every element of the inbound ring but one gets an 8 KiB buffer of the arena, and the chip is told (one doorbell);
 //   4. a packet to the chip is written straight into one of our four outbound buffers (no copy of the 6 KiB downloads), given one
 //      element of the outbound ring, and one doorbell;
@@ -89,8 +92,9 @@ inline void element(uint8_t *at, uint64_t ptr, uint32_t word0, uint32_t word1)
 }
 }  // namespace ipcrdetail
 
-// The rings and buffers out of the arena, and the two channel contexts filled in place. The command ring is the one level 4
-// planned (its address comes from the contexts). False when the arena has no room for all of it.
+// The rings and buffers out of the arena (each ring aligned to its own 1 KiB length by the arena's rule), and the two channel
+// contexts with their fixed fields only: state disabled, burst mode disabled, the type and the event ring, no ring yet. The command
+// ring is the one level 4 planned (its address comes from the contexts). False when the arena has no room for all of it.
 inline bool ipcrPlan(Ipcr &p, Arena &arena, MhiContexts &contexts)
 {
   using namespace ipcrdetail;
@@ -107,14 +111,10 @@ inline bool ipcrPlan(Ipcr &p, Arena &arena, MhiContexts &contexts)
     s.ring->chan = s.chan;
     s.ring->elements = kIpcrElements;
     s.ring->wp = 0;
-    s.ring->ctx = contexts.va + s.chan * kMhiContextStride;
-    put32(s.ring->ctx + kChanCfg, kChanStateEnabled | kChanBurstDisable << 8);
+    s.ring->ctx = mhiChannelCtx(contexts, s.chan);
+    put32(s.ring->ctx + kChanCfg, kChanStateDisabled | kChanBurstDisable << 8);
     put32(s.ring->ctx + kChanType, s.type);
     put32(s.ring->ctx + kChanErIndex, kIpcrEventRing);
-    put64(s.ring->ctx + kChanRBase, bus);
-    put64(s.ring->ctx + kChanRLen, ringBytes);
-    put64(s.ring->ctx + kChanRp, bus);
-    put64(s.ring->ctx + kChanWp, bus);
   }
   for (IpcrBuffer &b : p.rx) {
     b.va = arenaAlloc(arena, kIpcrBufferBytes, &b.bus);
@@ -126,13 +126,27 @@ inline bool ipcrPlan(Ipcr &p, Arena &arena, MhiContexts &contexts)
     if (!b.va) return false;
     b.bytes = kIpcrBufferBytes;
   }
-  // The primary command ring is level 4's: its context sits after the channels' and the event rings', its elements where
-  // mhiContextsPlan put them.
-  p.cmd.ctx = contexts.va + kMhiChannels * kMhiContextStride + kMhiEventRings * kMhiContextStride;
+  // The primary command ring is level 4's: its context on the page mhiContextsPlan gave it, its elements where it put them.
+  p.cmd.ctx = mhiCommandCtx(contexts);
   p.cmd.va = contexts.va + uint32_t(contexts.commandBus - contexts.bus);
   p.cmd.bus = contexts.commandBus;
   p.cmd.elements = kMhiCommandElements;
   p.cmd.wp = 0;
+  return true;
+}
+
+// A channel about to be started: its ring into its context (base, length, both pointers at the base) and the state enabled, the
+// burst mode and the other fixed fields kept, as the MHI host prepares a channel right before its start command.
+inline bool ipcrPrepare(ChanRing &r)
+{
+  using namespace ipcrdetail;
+  if (!r.ctx || !r.va) return false;
+  r.wp = 0;
+  put64(r.ctx + kChanRBase, r.bus);
+  put64(r.ctx + kChanRLen, uint64_t(r.elements) * kMhiElement);
+  put64(r.ctx + kChanRp, r.bus);
+  put64(r.ctx + kChanWp, r.bus);
+  put32(r.ctx + kChanCfg, (get32(r.ctx + kChanCfg) & ~0xffu) | kChanStateEnabled);
   return true;
 }
 
@@ -169,6 +183,45 @@ inline bool ipcrCommand(Ipcr &p, const MhiIo &io, uint32_t channel, uint32_t com
   p.cmdPending = at;
   p.cmdChannel = channel;
   return true;
+}
+
+// One of the two channels started: prepared (its ring and the enabled state), then its start command. False when nothing was
+// queued (`error` says why).
+inline bool ipcrStart(Ipcr &p, const MhiIo &io, uint32_t channel)
+{
+  ChanRing *r = channel == kChanIpcrOut ? &p.out : channel == kChanIpcrIn ? &p.in : nullptr;
+  if (!r || !ipcrPrepare(*r)) {
+    p.error = "not one of the two planned channels";
+    return false;
+  }
+  if (p.cmdPending) {
+    p.error = "a command is already in flight";
+    return false;
+  }
+  return ipcrCommand(p, io, channel, kTreCmdStart);
+}
+
+// What the MHI host does when the device reports M0 in mission mode: every event ring's doorbell rung again with the write pointer
+// its context holds, the command ring's when a command waits, and each running channel's. Returns the number of doorbells.
+inline unsigned ipcrRingAll(Ipcr &p, MhiContexts &contexts, const MhiIo &io)
+{
+  using namespace ipcrdetail;
+  if (!contexts.va || !p.erdb || !p.chdb) return 0;
+  unsigned rung = 0;
+  for (unsigned r = 0; r < kMhiEventRings; ++r, ++rung) doorbell(io, p.erdb + 8 * r, get64(mhiEventCtx(contexts, r) + 36));
+  if (p.cmdPending) {
+    doorbell(io, kMhiCrdbLo, get64(p.cmd.ctx + kChanWp));
+    ++rung;
+  }
+  if (p.started[0]) {
+    doorbell(io, p.chdb + 8 * kChanIpcrOut, get64(p.out.ctx + kChanWp));
+    ++rung;
+  }
+  if (p.started[1]) {
+    doorbell(io, p.chdb + 8 * kChanIpcrIn, get64(p.in.ctx + kChanWp));
+    ++rung;
+  }
+  return rung;
 }
 
 // Every inbound element but one gets a buffer, then one doorbell. Returns how many were posted.
@@ -243,7 +296,7 @@ inline unsigned ipcrPollRing(Ipcr &p, MhiContexts &contexts, const MhiIo &io, un
 {
   using namespace ipcrdetail;
   if (ring >= kMhiEventRings || !contexts.va || !p.erdb) return 0;
-  uint8_t *ctx = contexts.va + kMhiChannels * kMhiContextStride + ring * kMhiContextStride;
+  uint8_t *ctx = mhiEventCtx(contexts, ring);
   const uint64_t base = get64(ctx + 12), length = get64(ctx + 20), rp = get64(ctx + 28);
   if (!length || rp < base || rp >= base + length || (rp - base) % kMhiElement) {
     if (rp != base) ++p.dropped;

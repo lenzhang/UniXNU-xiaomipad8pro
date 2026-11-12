@@ -757,8 +757,28 @@ static void testMhiBoot()
   CHECK(mhiContextsPlan(c, memory.data(), 0xc2000000, kMhiContextBytes));
   CHECK(c.eventBytes[0] == 32 * kMhiElement && c.eventBytes[1] == 256 * kMhiElement);
   CHECK(c.eventBus[0] > 0xc2000000 && c.commandBus > c.eventBus[1]);
+  // The layout of 2026-11-12 (after wifi-4a): each ring's base a multiple of its own length, the context arrays on pages of their
+  // own, and nothing past the 32 KiB.
+  CHECK(c.eventBus[0] % c.eventBytes[0] == 0 && c.eventBus[1] % c.eventBytes[1] == 0 && c.commandBus % (8 * kMhiElement) == 0);
+  CHECK(c.eventBus[0] >= 0xc2000000 + kMhiRingsOffset && c.commandBus + 8 * kMhiElement <= 0xc2000000 + kMhiContextBytes);
+  CHECK(mhiEventCtx(c, 1) == memory.data() + kMhiEventCtxOffset + kMhiContextStride && mhiCommandCtx(c) == memory.data() + 0x3000);
+  {
+    const uint8_t *ev1 = mhiEventCtx(c, 1);
+    uint64_t base = 0;
+    for (unsigned i = 0; i < 8; ++i) base |= uint64_t(ev1[12 + i]) << (8 * i);
+    CHECK(base == c.eventBus[1]);
+  }
+  // The IPC router channels' fixed fields, as the MHI host's context initialisation writes them; no ring, state disabled.
+  for (uint32_t chan : {kChanIpcrOut, kChanIpcrIn}) {
+    const uint8_t *ctx = mhiChannelCtx(c, chan);
+    CHECK(ctx[0] == kChanStateDisabled && ((ctx[1] & 3u) == kChanBurstDisable));
+    CHECK(ctx[kChanType] == (chan == kChanIpcrOut ? kChanTypeOutbound : kChanTypeInbound) && ctx[kChanErIndex] == kIpcrEventRing);
+    for (uint32_t i = kChanRBase; i < kMhiContextStride; ++i) CHECK(ctx[i] == 0);
+  }
   MhiContexts tooSmall;
   CHECK(!mhiContextsPlan(tooSmall, memory.data(), 0xc2000000, 1024));
+  MhiContexts unaligned;
+  CHECK(!mhiContextsPlan(unaligned, memory.data(), 0xc2000200, kMhiContextBytes));   // the arrays need a page of their own
 
   Device d;
   MhiBoot boot;
@@ -1274,6 +1294,7 @@ static void testContextsAtReady()
   CHECK(d.contextWrites == 0);
   CHECK(runBoot(b, d, c) == kMhiDone);
   CHECK(d.contextWrites == 1 && c.writes == 1 && d.regs[kMhiCcabap] == 0x20708000u);
+  CHECK(d.regs[kMhiEcabap] == 0x20708000u + kMhiEventCtxOffset && d.regs[kMhiCrcbap] == 0x20708000u + kMhiCommandCtxOffset);
 }
 
 int main()

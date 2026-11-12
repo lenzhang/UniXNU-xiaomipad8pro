@@ -241,6 +241,19 @@ constexpr uint32_t kChipParfLtssm = 0x01e081b0, kChipParfLtssmValue = 0x111, kCh
 // values are undefined": BHIe + 0x60 .. + 0x78, the address, size, doorbell and status of the crash dump's vector table).
 constexpr uint32_t kChipTxVecDb = 0x360, kChipTxVecStatus = 0x368, kChipRxVecDb = 0x394, kChipRxVecStatus = 0x39c;
 constexpr uint32_t kBhieRxVecAddrLo = 0x60, kBhieRxVecStatus = 0x78;
+// The crash dump (RDDM) over the same receive block (the MHI specification's names, as the mainline host uses them; behaviour and
+// offsets only): the vector table's address high at +0x64 (low at +0x60), its length in bytes at +0x68, the doorbell at +0x70
+// (the session number in 29:0) and the status at +0x78 (29:0 the session the device answers, 31:30 its state: 2 complete, 3 an
+// error). The host gives the table before the device's power-up, right after zeroing the block, so that a firmware that dies
+// later can write its memory into the host's segments without asking; the host then only waits for the status. The size is the
+// one this chip family's host reserves for it (0x420000 bytes, in 512 KiB segments: nine, the last one partly used), a fact of
+// its MHI configuration.
+constexpr uint32_t kBhieRxVecAddrHi = 0x64, kBhieRxVecSize = 0x68, kBhieRxVecDb = 0x70;
+constexpr uint32_t kRddmBytes = 0x420000, kRddmSegBytes = 512 * 1024;
+// The device wake doorbell: the last channel doorbell (channel 127, at CHDBOFF + 8 * 127), 1 while the host needs the device in M0,
+// 0 when it lets it idle (M1, then the host's M2). The MHI host asserts it at every M0 transition and around each command or
+// transfer; this polled host asserts it at mission mode and keeps it while its levels run (the device then never idles under it).
+constexpr uint32_t kMhiDevWakeChannel = 127;
 
 // ---- the PCIe NoC's bus clock manager (level 3, before the clocks) ----
 // The endpoint's DMA leaves the controller through the PCIe aggregate NoC: Ubuntu's sm8750 interconnect driver has MASTER_PCIE_0
