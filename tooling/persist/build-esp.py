@@ -366,7 +366,7 @@ def charging_of(a, profile):
 
 def args_of(a, profile, utc):
     ram = common.ram_images()
-    base = [x for x in ram.K27_ARGS if x.split('=', 1)[0] not in DROPPED]
+    base = [x for x in ram.K27_ARGS if x.split('=', 1)[0] not in DROPPED + tuple(getattr(a, 'drop_arg', None) or [])]
     if a.rtc_offset is not None and any(x.split('=', 1)[0] in ('piano-rtc', 'piano-rtc-offset') for x in a.arg):
         raise SystemExit('--rtc-offset and --arg piano-rtc...: one of them')
     guard = boot_guard(a, profile)
@@ -527,6 +527,8 @@ def main():
     p.add_argument('--prev-adt', type=Path)
     p.add_argument('--prev-trust', type=Path)
     p.add_argument('--arg', action='append', default=[], help='one more kernel argument NAME=VALUE (replaces the same NAME)')
+    p.add_argument('--drop-arg', action='append', default=[], metavar='NAME',
+                   help='leave one of the RAM images\' base arguments out (e.g. native-ufs-diagnostics, when the lines run long)')
     p.add_argument('--default', default='macos-diag', help='the menu default (macos-diag for the test phase, macos for daily use)')
     p.add_argument('--diag-reset-after', type=int, default=240)
     p.add_argument('--timeout', type=int, default=3, help='menu seconds (the UEFI log can be read with oem dump meanwhile)')
