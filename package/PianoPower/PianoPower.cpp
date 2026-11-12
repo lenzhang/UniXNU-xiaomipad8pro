@@ -670,6 +670,10 @@ void PianoPower::startFix()
   fCx.locate(gIo, fArbiter, fCharger);
   fFix.mode = FixMode(gArgs.chgfix);
   fFix.locate(fCx, fChgEn);
+  if (fFix.mode != FixMode::off && fChgEn.mode == ChgEnMode::pulse) {
+    fChgEn.mode = ChgEnMode::restore;   // one pulser: two would confound each other's judgement
+    note("chgen: piano-power-chgen=2 with piano-power-chgfix: the pulses are chgfix's step A (chgen sets an enable that reads off only)");
+  }
   if (!fCx.located) {
     note("complex: not located (no Type-C block): no snapshot, no watch, no recovery");
     return;

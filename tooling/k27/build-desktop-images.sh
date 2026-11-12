@@ -78,12 +78,12 @@ case $DEVNET in auto|static|dhcp) ;; *) echo "build-desktop-images: DESK_DEV_NET
 # edge, 2026-11-12: the watchdog loop of desk1 and desk-diag), PianoKeyboard's resting thumb, PianoA830's pooled BOs from several
 # extents with the va/sizes lines (2026-11-12, desk-dev's OutOfMemory(Device): gpu-userspace.md), PianoPower's charger watchdog (the
 # charger's stop at ~40 s of every boot, 2026-11-12: charging-policy.md §18) and its charging enable command with the record of the
-# charger's register changes (charging-policy.md §19).
+# charger's register changes (charging-policy.md §19), and the whole charger complex in view with its recovery (§20).
 for s in 'start: piano-keyboard=%u' 'start: piano-touch=%u' 'start: piano-backlight=%u' 'start: piano-usb=%u' 'start: piano-power=%u' \
          "the render server's reserve of ranges" 'composition: layer 0 the frame, layer 1 the cursor' \
          'reserved at start (data-volatile-reserve-mib)' 'the download for the watchdog failed: again in' 'piano-touch-drag-delay' \
          'a frame read only when the controller announces it' 'piano-keyboard-resting' "per-object limit of %llu MiB (its GPU window)" \
-         'va/sizes: %u:%s <1M' 'wdog: piano-power-wdog=%u (%s)' 'chgen: piano-power-chgen=%u (%s)'; do
+         'va/sizes: %u:%s <1M' 'wdog: piano-power-wdog=%u (%s)' 'chgen: piano-power-chgen=%u (%s)' 'chgfix: piano-power-chgfix=%u (%s)'; do
   grep -a -q -F "$s" "$KC" || { echo "build-desktop-images: $KC lacks \"$s\": rebuild it from this tree (tooling/k27/build-native-image.sh)" >&2; exit 1; }
 done
 # The seed's Metal plugin must have the day's GPU fixes (docs/results-2026-11-12.md): Turnip 0007 (a sysmem draw that reads its own
