@@ -28,9 +28,10 @@
 // The protocol (this file implements it; nothing else writes the words):
 //   take    interrupts masked on this CPU (ml_set_interrupts_enabled(FALSE): the holder can be neither interrupted nor preempted, so
 //           a hold lasts one transaction, and an interrupt handler taking the lock can never spin on its own CPU's holder), then a
-//           compare-exchange 0 -> tag. Taken by someone else: interrupts back as they were, a 1 us spin, again. Bounded: after
-//           bound_us (default 20 ms; a hold is at most one transaction, about 6 ms when it times out) the waiter takes the word over
-//           (counted and reported: a holder that never gave it back) rather than hang the caller.
+//           compare-exchange 0 -> tag. Taken by someone else: interrupts back as they were, a 1 us spin, again. Bounded: a waiter
+//           that spins bound_us (default 20000 spins of about 1 us; a hold is at most one transaction, about 6 ms when it times out)
+//           while no new hold begins takes the word over (counted and reported: a holder that never gave it back) rather than hang
+//           the caller; its own preemption or losing races to other waiters never counts.
 //   hold    exactly one transaction: the data and the command stored, the status polled (1000 x 1 us, Linux's bound), the read data
 //           read; after a timeout, up to 5 ms more until the channel reports done, so the next holder finds the bus quiet. Never a
 //           sleep, a log line, a mapping or an allocation inside (the channel windows are mapped before).
@@ -126,25 +127,34 @@ static inline PianoSpmiToken piano_spmi_take(PianoSpmiLock *l)
         t.kind = PianoSpmiTokenNested;
         return t;
     }
+    // The bound counts this waiter's own spins (about 1 us each) since the lock last changed hands (the transaction count moved):
+    // neither a waiter that was preempted between two spins nor one that keeps losing to other waiters ever takes it over, only
+    // one that sees the same hold for bound_us of its own spinning.
     const uint32_t bound = l->bound_us ? l->bound_us : (uint32_t)PianoSpmiDefaultBoundUs;
     const uint64_t start = piano_spmi_now(l);
-    uint32_t spins = 0, other = 0, over = 0;
+    uint32_t spins = 0, same = 0, other = 0, over = 0, epoch = __atomic_load_n(&w->takes, __ATOMIC_RELAXED);
     for (;;) {
         uint32_t expected = 0;
         if (__atomic_compare_exchange_n(&w->owner, &expected, l->tag, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
         other = expected;
-        const uint64_t waited = o->now_us ? piano_spmi_now(l) - start : spins;
-        if (waited >= bound) {
+        const uint32_t now = __atomic_load_n(&w->takes, __ATOMIC_RELAXED);
+        if (now != epoch) {
+            epoch = now;
+            same = 0;
+        }
+        if (same >= bound) {
             // Take it over from whoever holds it now (if that changes under us, try again).
             if (__atomic_compare_exchange_n(&w->owner, &expected, l->tag, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
                 over = 1;
                 break;
             }
+            same = 0;
             continue;
         }
         o->unmask(o->context, t.was);  // wait with the interrupts as the caller had them
         o->spin(o->context);
         spins++;
+        same++;
         t.was = o->mask(o->context);
     }
     __atomic_store_n(&w->holder, self, __ATOMIC_RELAXED);

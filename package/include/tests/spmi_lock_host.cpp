@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -57,10 +58,12 @@ uint64_t hSelf(void *)
   if (!tSelf) tSelf = gNextSelf++;
   return tSelf;
 }
+static std::function<void()> gSpinHook;   // a test's view of the world between two spins
 void hSpin(void *)
 {
   if (tMaskDepth) ++gMaskedSpins;
   gClockUs += 1;
+  if (gSpinHook) gSpinHook();
   std::this_thread::yield();
 }
 uint64_t hNow(void *) { return gClockUs.load(); }
@@ -141,6 +144,27 @@ static void testProtocol()
     tMaskDepth = 1;                  // the stuck token's give, on its own (masked) state
     piano_spmi_give(&c, stuck);      // not the holder any more: counted, nothing freed
     CHECK(c.lost == 1 && v.owner == 0 && tMaskDepth == 0);
+  }
+
+  // The bound counts the waiter's own spins while no new hold begins: holds that keep changing hands (other kexts' transactions)
+  // never make it take over, however long it waits; nor does its own preemption (the clock jumping between two spins).
+  {
+    PianoSpmiWords v{};
+    PianoSpmiLock e = makeLock(&v, 0x57494649u);
+    e.bound_us = 100;
+    v.owner = 0x504f5745u;   // "POWE" holds it
+    v.holder = 12345;
+    unsigned spins = 0;
+    gSpinHook = [&] {
+      ++spins;
+      gClockUs += 1000000;                 // preempted for a second between two spins
+      if (spins < 1000) v.takes = v.takes + 1;   // meanwhile others' transactions come and go (the word handed on each time)
+    };
+    PianoSpmiToken x = piano_spmi_take(&e);
+    gSpinHook = nullptr;
+    CHECK(x.kind == PianoSpmiTokenOuter && e.taken_over == 1 && spins >= 999 + 100 && spins <= 999 + 101);   // the last change at spin 999
+    piano_spmi_give(&e, x);
+    CHECK(v.owner == 0 && tMaskDepth == 0);
   }
 
   char line[512];
