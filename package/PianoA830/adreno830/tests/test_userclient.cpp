@@ -1295,6 +1295,13 @@ int main()
         NativeAdrenoAbiBoAlloc big{65536,12,0};
         CHECK(p.client.allocBo(&big,&pooled)==kIOReturnSuccess && p.client.memoryOf(pooled.handle)->pooled());
         p.client.usage(&pool,&other,&imported);CHECK(pool==65536 && other==16384 && imported==3*4096);
+#ifdef ADRENO830_MACOS
+        {   /* UniXNU-piano: the same objects by size class (three own BOs below 1 MiB, one import) */
+            NativeAdrenoSizeUsage sizes{};p.client.sizeUsage(&sizes);
+            CHECK(sizes.count[0]==3 && sizes.bytes[0]==16384+65536 && !sizes.count[1] && !sizes.count[2] && !sizes.count[3]);
+            CHECK(sizes.count[4]==1 && sizes.bytes[4]==3*4096);
+        }
+#endif
         /* The second BO's release fails (its descriptor refuses complete()): it stays live and keeps its bytes. */
         fixture.complete_fail=true;
         NativeAdrenoAbiBoFree refused{second.handle};
@@ -1304,6 +1311,9 @@ int main()
         /* Teardown: the first BO (before it), the import and the pooled BO (after it) go; it stays and answers Busy. */
         CHECK(p.client.releaseAll(&ringclock,1000)==kIOReturnBusy && p.client.liveObjects()==1);
         p.client.usage(&pool,&other,&imported);CHECK(!pool && other==8192 && !imported);
+#ifdef ADRENO830_MACOS
+        {NativeAdrenoSizeUsage sizes{};p.client.sizeUsage(&sizes);CHECK(sizes.count[0]==1 && sizes.bytes[0]==8192 && !sizes.count[4]);}
+#endif
         CHECK(p.client.releaseAll(&ringclock,1000)==kIOReturnBusy && p.client.liveObjects()==1);   /* an orphan's retry: the same */
         ++blocks;
     }

@@ -56,6 +56,8 @@ static inline IOReturn NativeAdrenoMaintainRuns(uintptr_t address,size_t bytes,s
  * maxObjectBytes: a BO the window cannot hold could never be mapped), the BO pool or the pages XNU gives, and the VM's table ranges,
  * each refused with its reason on the console. */
 enum : uint64_t {NativeAdrenoMemoryMaxBytes=UINT64_C(0xFFFFF000)};
+/* UniXNU-piano (2026-11-12): the most free extents of the BO pool one BO is cut from when none holds it whole (allocatePooled). */
+enum : size_t {NativeAdrenoPoolMaxPieces=64};
 #else
 enum : uint64_t {NativeAdrenoMemoryMaxBytes=UINT64_C(256)*1024*1024};
 #endif
@@ -85,7 +87,7 @@ class NativeAdrenoMemory final {
     bool unzeroed_=false;   /* from the pool, still holding what its last owner left: no device reference until finishPooled succeeded */
     size_t pool_offset_=0;
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
-    IOReturn takePooled(size_t bytes,uint64_t limit);
+    IOReturn takePooled(size_t bytes,uint64_t limit,bool contiguous);
 public:
     NativeAdrenoMemory()=default;
     ~NativeAdrenoMemory()=default;
@@ -105,8 +107,10 @@ public:
      * is tried). The pool's free list and figures are shared: the caller holds the Memory lock (NativeAdrenoSubmitLockMemory). A BO
      * outside the pool (allocate with pooled false: the contiguous attempt, the scattered pages, makeWriteCombined, release) touches
      * nothing shared but atomic figures, so the user-client cores allocate and release it without that lock (int-152: 3 ms a BO,
-     * 90-130 ms a surface-sized one, of page attribute changes). The BO is not zeroed yet: finishPooled does that. */
-    IOReturn allocatePooled(size_t bytes,unsigned output_bits);
+     * 90-130 ms a surface-sized one, of page attribute changes). The BO is not zeroed yet: finishPooled does that.
+     * UniXNU-piano (2026-11-12): with a write-combined pool, a BO no single free extent holds is cut from several (at most
+     * NativeAdrenoPoolMaxPieces, one span each, mapping() null) unless `contiguous` (the caller asked for one span). */
+    IOReturn allocatePooled(size_t bytes,unsigned output_bits,bool contiguous=false);
     /* allocatePooled's zero fill (allocate(..., pooled=true) calls it itself): the pages are this object's alone, so it needs no lock
      * and the caller drops the Memory lock first (pagani-gpu-kopt bit 0): every process's BoAlloc, BoImport and BoFree waited for the
      * write-combined zeros of the largest BO anyone asked for. Until it succeeded holdForDevice refuses, so a BO whose fill was forgotten

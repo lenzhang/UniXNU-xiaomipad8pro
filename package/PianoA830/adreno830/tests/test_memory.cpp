@@ -364,10 +364,81 @@ static unsigned poolExtents()
     delete[] bos;
     return controls;
 }
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (2026-11-12): a BO no single free extent of the (write-combined) pool holds is cut from several (desk-dev: 168 MiB free
+ * in extents of at most 19 MiB, a 49 MiB BoAlloc sent to XNU, which had no pages). Runs after poolExtents: the pool is 64 MiB, empty,
+ * write-combined. */
+extern "C" volatile uint32_t native_adreno_pool_split[3];
+static unsigned poolPieces()
+{
+    unsigned controls=0;
+    uint32_t pool=0,used=9;
+    NativeAdrenoMemory::usage(&pool,&used,nullptr);CHECK(pool==64 && !used && native_adreno_pool_shape[0]==1);
+    enum : size_t {Mib=size_t(1)<<20,Blocks=16};
+    NativeAdrenoMemory blocks[Blocks];
+    unsigned char *where[Blocks];
+    for(size_t i=0;i<Blocks;++i) {
+        CHECK(blocks[i].allocate(4*Mib,36,false,4*Mib,true)==kIOReturnSuccess && blocks[i].pooled() && blocks[i].spanCount()==1);
+        where[i]=static_cast<unsigned char *>(blocks[i].mapping());
+        std::memset(where[i],0x5a,4*Mib);
+    }
+    for(size_t i=0;i<Blocks;i+=2)CHECK(blocks[i].release()==kIOReturnSuccess);
+    NativeAdrenoMemory::usage(&pool,&used,nullptr);CHECK(used==32 && native_adreno_pool_shape[0]==8 && NativeAdrenoMemory::poolLargestFree()==4*Mib);
+    /* 12 MiB from three 4 MiB gaps: three spans in BO order, no kernel mapping, zeroed by span, write-combined by flag alone. */
+    const uint32_t cut=native_adreno_pool_split[0],pieces=native_adreno_pool_split[1];
+    NativeAdrenoMemory split;
+    CHECK(split.allocatePooled(12*Mib,36)==kIOReturnSuccess && split.pooled() && split.spanCount()==3 && !split.mapping());
+    CHECK(native_adreno_pool_split[0]==cut+1 && native_adreno_pool_split[1]==pieces+3);
+    for(size_t i=0;i<3;++i)CHECK(split.spans()[i].offset==i*4*Mib && split.spans()[i].bytes==4*Mib);
+    CHECK(split.holdForDevice()==kIOReturnNotReady && split.finishPooled()==kIOReturnSuccess);
+    for(size_t i=0;i<Blocks;i+=2) {   /* the three gaps it took are zero, the other gap still holds the pattern */
+        bool taken=false;
+        for(size_t j=0;j<3;++j)taken|=split.spans()[j].physical==blocks[1].spans()[0].physical+(uint64_t)(where[i]-where[1]);
+        if(taken)for(size_t k=0;k<4*Mib;k+=4096)CHECK(!where[i][k] && !where[i][k+4095]);
+    }
+    CHECK(split.makeWriteCombined()==kIOReturnSuccess && split.writeCombined() && split.holdForDevice()==kIOReturnSuccess &&
+          split.retireAfterQuiescence()==kIOReturnSuccess);
+    NativeAdrenoMemory::usage(&pool,&used,nullptr);CHECK(used==44 && native_adreno_pool_shape[0]==5);++controls;
+    /* One span asked: not cut (the pool gives none, the caller goes elsewhere). More than is free: refused whole, nothing taken. */
+    NativeAdrenoMemory whole,large;
+    CHECK(whole.allocatePooled(8*Mib,36,true)==kIOReturnNoResources && !whole.backed());++controls;
+    CHECK(large.allocatePooled(24*Mib,36)==kIOReturnNoResources && !large.backed());
+    NativeAdrenoMemory::usage(&pool,&used,nullptr);CHECK(used==44 && native_adreno_pool_shape[0]==5);++controls;
+    /* Released: every extent goes back, merged with its neighbours. */
+    CHECK(split.release()==kIOReturnSuccess);
+    NativeAdrenoMemory::usage(&pool,&used,nullptr);CHECK(used==32 && native_adreno_pool_shape[0]==8);++controls;
+    for(size_t i=1;i<Blocks;i+=2)CHECK(blocks[i].release()==kIOReturnSuccess);
+    NativeAdrenoMemory::usage(&pool,&used,nullptr);CHECK(!used && native_adreno_pool_shape[0]==1 && !native_adreno_pool_shape[2]);++controls;
+    /* More gaps than NativeAdrenoPoolMaxPieces would need: 200 single free pages between pooled pages, 100 pages asked (65 pieces
+     * would be needed): refused, every piece taken given back. */
+    NativeAdrenoMemory *pages=new NativeAdrenoMemory[400];
+    for(size_t i=0;i<400;++i)CHECK(pages[i].allocate(4096,36,false,4096,true)==kIOReturnSuccess);
+    NativeAdrenoMemory rest;
+    CHECK(rest.allocate(64*Mib-400*4096,36,true,64*Mib-400*4096,true)==kIOReturnSuccess && rest.pooled());
+    for(size_t i=0;i<400;i+=2)CHECK(pages[i].release()==kIOReturnSuccess);
+    NativeAdrenoMemory::usage(&pool,&used,nullptr);
+    const uint32_t extents=native_adreno_pool_shape[0],alive=native_adreno_pool_shape[2],missed=native_adreno_pool_split[2];
+    NativeAdrenoMemory scattered;
+    CHECK(scattered.allocatePooled(100*4096,36)==kIOReturnNoResources && native_adreno_pool_split[2]==missed+1);
+    CHECK(native_adreno_pool_shape[0]==extents && native_adreno_pool_shape[2]==alive);
+    CHECK(scattered.allocatePooled(64*4096,36)==kIOReturnSuccess && scattered.spanCount()==64 && scattered.release()==kIOReturnSuccess);
+    CHECK(native_adreno_pool_shape[0]==extents && native_adreno_pool_shape[2]==alive);++controls;
+    for(size_t i=1;i<400;i+=2)CHECK(pages[i].release()==kIOReturnSuccess);
+    CHECK(rest.release()==kIOReturnSuccess);
+    NativeAdrenoMemory::usage(&pool,&used,nullptr);CHECK(!used && native_adreno_pool_shape[0]==1 && !native_adreno_pool_shape[2]);++controls;
+    delete[] pages;
+    return controls;
+}
+#endif
 int main()
 {
     auto profiles=successes(),failure_controls=failures(),argument_controls=arguments();reset();
     const unsigned scanout=scanoutImports(),pool=bestEffortPool(),threaded=poolThreads(),extents=poolExtents(),runs=maintenanceRuns();
+#ifdef ADRENO830_MACOS
+    const unsigned cut=poolPieces();
+    std::printf("PASS: %u pool piece controls (a BO cut from several free extents, zeroed by span, given back whole; one span asked; "
+                "more pieces than allowed)\n",cut);
+#endif
     std::printf("PASS: %u cache maintenance run controls (64 pages at a time, each with its pin and barriers, the whole range once)\n",runs);
     std::printf("PASS: %u pooled BOs zeroed outside the lock by four threads, none reaching another's pages\n",threaded);
     std::printf("PASS: %u scanout/device-import controls and %u best-effort pool controls (the zero fill after the Memory lock, its failure "

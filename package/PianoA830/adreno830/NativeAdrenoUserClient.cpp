@@ -141,6 +141,12 @@ void NativeAdrenoUserClient::account(const Entry &entry,bool add)
     uint64_t *counter=memory.imported() || memory.scanout()?&import_bytes_:memory.pooled()?&pool_bytes_:&other_bytes_;
     const uint64_t bytes=memory.bytes(),now=__atomic_load_n(counter,__ATOMIC_RELAXED);
     __atomic_store_n(counter,add?now+bytes:now>=bytes?now-bytes:0,__ATOMIC_RELAXED);
+#ifdef ADRENO830_MACOS
+    const unsigned cls=NativeAdrenoSizeClass(bytes,memory.imported() || memory.scanout());
+    const uint64_t count=__atomic_load_n(&size_count_[cls],__ATOMIC_RELAXED),held=__atomic_load_n(&size_bytes_[cls],__ATOMIC_RELAXED);
+    __atomic_store_n(&size_count_[cls],add?count+1:count?count-1:0,__ATOMIC_RELAXED);
+    __atomic_store_n(&size_bytes_[cls],add?held+bytes:held>=bytes?held-bytes:0,__ATOMIC_RELAXED);
+#endif
 }
 #ifdef ADRENO830_MACOS
 /* UniXNU-piano: the live mappings' figures (mapBo adds, freeBo's unmap takes away). */
@@ -160,6 +166,14 @@ void NativeAdrenoUserClient::mapUsage(NativeAdrenoMapUsage *out) const
     out->spans=__atomic_load_n(&mapped_spans_,__ATOMIC_RELAXED);
     out->bytes=__atomic_load_n(&mapped_bytes_,__ATOMIC_RELAXED);
     out->window_start=window_start_;out->window_bytes=window_bytes_;out->window_peak=window_peak_;
+}
+void NativeAdrenoUserClient::sizeUsage(NativeAdrenoSizeUsage *out) const
+{
+    if(!out)return;
+    for(unsigned i=0;i<NativeAdrenoSizeClasses;++i) {
+        out->count[i]=__atomic_load_n(&size_count_[i],__ATOMIC_RELAXED);
+        out->bytes[i]=__atomic_load_n(&size_bytes_[i],__ATOMIC_RELAXED);
+    }
 }
 #endif
 void NativeAdrenoUserClient::usage(uint64_t *pool,uint64_t *other,uint64_t *imported) const
@@ -222,6 +236,10 @@ IOReturn NativeAdrenoUserClient::open(uint32_t abi_version,NativeAdrenoVm *vm,
     entry_count_=objects;fifo_head_=fifo_count_=fresh_=live_=0;allocations_=early_reuses_=0;keep_objects_=keep_spans_=keep_pool_=0;
     __atomic_store_n(&pool_bytes_,uint64_t(0),__ATOMIC_RELAXED);__atomic_store_n(&other_bytes_,uint64_t(0),__ATOMIC_RELAXED);
     __atomic_store_n(&import_bytes_,uint64_t(0),__ATOMIC_RELAXED);
+#ifdef ADRENO830_MACOS
+    for(unsigned i=0;i<NativeAdrenoSizeClasses;++i)
+        {__atomic_store_n(&size_count_[i],uint64_t(0),__ATOMIC_RELAXED);__atomic_store_n(&size_bytes_[i],uint64_t(0),__ATOMIC_RELAXED);}
+#endif
     vm_=vm;submit_=submit;ring_=ring;input_bits_=input_bits;output_bits_=output_bits;
     next_handle_=1;open_=true;retry_fence_=0;scanout_={};source_=NativeAdrenoRingSourceExternal;
     queues_[0]={0,true};
@@ -368,7 +386,7 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
          * pool allocation and release holds). */
         NativeAdrenoSubmitGuard memory(submit_,NativeAdrenoSubmitLockMemory);
         if(!keep_pool_ || NativeAdrenoMemory::poolFreeBytes()>=keep_pool_+(size_t)request->bytes) {
-            status=entry->memory.allocatePooled((size_t)request->bytes,output_bits_);
+            status=entry->memory.allocatePooled((size_t)request->bytes,output_bits_,request->contiguous!=0);
             if(!status && !zero_outside)status=zeroPooled(*entry,clock);
         }
     }

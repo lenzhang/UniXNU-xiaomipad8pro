@@ -159,5 +159,20 @@ static inline int NativeAdrenoVaClientEntry(char *entry,size_t size,unsigned slo
     return snprintf(entry,size," %u:%s %llu/%lluM pk%llu %lluo %llur",slot,cut,mib,window,peak,(unsigned long long)u.objects,
                     (unsigned long long)u.spans);
 }
+
+/* 2026-11-12 (desk-dev: WindowServer's 1.2 GiB of own BOs, nothing said what they were): one connection's live objects by size,
+ * "va/sizes: <slot>:<name> <1M <n>/<MiB>M 1-16M <n>/<MiB>M 16-64M <n>/<MiB>M 64M+ <n>/<MiB>M imp <n>/<MiB>M" (MiB rounded up): the
+ * runtime's blocks (16-64 MiB), large textures and conversions (64 MiB and more) and imports told apart. */
+static inline int NativeAdrenoVaSizesLine(char *line,size_t size,unsigned slot,const char *name,const NativeAdrenoSizeUsage &u)
+{
+    if(!line || !size)return 0;
+    char cut[15]={};
+    if(name)strlcpy(cut,name,sizeof cut);
+    typedef unsigned long long u64;
+    const auto m=[](uint64_t bytes) {return u64((bytes+(UINT64_C(1)<<20)-1)>>20);};
+    return snprintf(line,size,"va/sizes: %u:%s <1M %llu/%lluM 1-16M %llu/%lluM 16-64M %llu/%lluM 64M+ %llu/%lluM imp %llu/%lluM",slot,cut,
+                    u64(u.count[0]),m(u.bytes[0]),u64(u.count[1]),m(u.bytes[1]),u64(u.count[2]),m(u.bytes[2]),u64(u.count[3]),
+                    m(u.bytes[3]),u64(u.count[4]),m(u.bytes[4]));
+}
 #endif
 #endif

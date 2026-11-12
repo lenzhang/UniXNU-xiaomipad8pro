@@ -135,6 +135,37 @@ static void accounting()
     NativeAdrenoMapUsage none{};
     CHECK(NativeAdrenoVaClientEntry(entry,sizeof entry,31,nullptr,none)>0 && !std::strcmp(entry," 31: 0/0M pk0 0o 0r"));
 }
+
+/* A connection's live objects by size (2026-11-12, desk-dev): the classes' bounds and the line within the ring's. */
+static void sizeLines()
+{
+    CHECK(NativeAdrenoSizeClass(4096,false)==0 && NativeAdrenoSizeClass((1u<<20)-4096,false)==0 && NativeAdrenoSizeClass(1u<<20,false)==1);
+    CHECK(NativeAdrenoSizeClass((16u<<20)-4096,false)==1 && NativeAdrenoSizeClass(16u<<20,false)==2 && NativeAdrenoSizeClass(64u<<20,false)==3);
+    CHECK(NativeAdrenoSizeClass(UINT64_C(1)<<30,false)==3 && NativeAdrenoSizeClass(4096,true)==4 && NativeAdrenoSizeClass(UINT64_C(1)<<30,true)==4);
+    char line[NativeAdrenoMapLineBytes];
+    const NativeAdrenoSizeUsage ws{{900,100,25,3,300},{60ull<<20,300ull<<20,520ull<<20,240ull<<20,(150ull<<20)-1}};
+    CHECK(NativeAdrenoVaSizesLine(line,sizeof line,0,"WindowServer",ws)>0);
+    CHECK(!std::strcmp(line,"va/sizes: 0:WindowServer <1M 900/60M 1-16M 100/300M 16-64M 25/520M 64M+ 3/240M imp 300/150M"));
+    const NativeAdrenoSizeUsage most{{UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX},
+                                     {UINT64_MAX/2,UINT64_MAX/2,UINT64_MAX/2,UINT64_MAX/2,UINT64_MAX/2}};
+    NativeAdrenoVaSizesLine(line,sizeof line,31,"com.apple.WebKit.GPU",most);
+    CHECK(std::strlen(line)<NativeAdrenoMapLineBytes && !std::strncmp(line,"va/sizes: 31:com.apple.WebK <1M ",32));
+}
+
+/* The failure lines' counts (2026-11-12, desk-dev): a process's own first failure is written although an earlier process of its name
+ * failed the same way 10000 times; the same process keeps counting by decades. */
+static void eventCounts()
+{
+    static NativeAdrenoEventTable table;
+    const uint32_t kind=1|2u<<8,status=0xe00002bd;
+    CHECK(NativeAdrenoEventNote(&table,"WindowServer",kind,status,98)==1);
+    for(uint32_t i=2;i<=10000;++i)CHECK(NativeAdrenoEventNote(&table,"WindowServer",kind,status,98)==(NativeAdrenoEventDecade(i)?i:0));
+    CHECK(NativeAdrenoEventNote(&table,"WindowServer",kind,status,1463)==1);   /* the next WindowServer: its first time */
+    CHECK(!NativeAdrenoEventNote(&table,"WindowServer",kind,status,1463));
+    CHECK(NativeAdrenoEventNote(&table,"WindowServer",kind,status,98)==1);
+    CHECK(NativeAdrenoEventNote(&table,"",3,0)==1 && !NativeAdrenoEventNote(&table,"",3,0));   /* no process: never restarts */
+    CHECK(table.keys[0].pid==98 && table.keys[1].pid==0 && !table.others);
+}
 #endif
 
 int main()
@@ -144,9 +175,11 @@ int main()
     refusalLines();
     allocLines();
     accounting();
+    sizeLines();
+    eventCounts();
     std::printf("PASS: macOS GPU address space: the 16 GiB windows (3.5 GiB render server, 768 MiB large, 320 MiB small, none across 4 GiB), "
                 "BoMap, BoAlloc and BoImport refusal lines for every reason within the ring's line, the address-space totals and "
-                "per-connection lines (%u checks)\n",checks);
+                "per-connection lines, the objects by size, failure counts per process (%u checks)\n",checks);
 #else
     std::printf("PASS: macOS GPU address space: nothing in the upstream pass\n");
 #endif

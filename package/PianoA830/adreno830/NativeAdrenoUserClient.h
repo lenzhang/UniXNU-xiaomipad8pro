@@ -61,6 +61,15 @@ enum NativeAdrenoMapWhy : uint8_t {
 struct NativeAdrenoMapRefusal {uint8_t why;uint64_t a,b,c,d;NativeAdrenoVmRefusal vm;bool vm_captured;};
 /* The mappings one connection holds: count, table ranges, bytes, its window and the highest end any mapping reached. */
 struct NativeAdrenoMapUsage {uint64_t objects,spans,bytes,window_start,window_bytes,window_peak;};
+/* UniXNU-piano (2026-11-12, desk-dev: WindowServer held 1.2 GiB of own BOs and nothing said what they were): the live objects by kind
+ * and size, [0] own BOs below 1 MiB, [1] 1 to 16 MiB, [2] 16 to 64 MiB, [3] 64 MiB and more, [4] imports; counts and bytes. */
+enum : unsigned {NativeAdrenoSizeClasses=5};
+struct NativeAdrenoSizeUsage {uint64_t count[NativeAdrenoSizeClasses],bytes[NativeAdrenoSizeClasses];};
+static inline unsigned NativeAdrenoSizeClass(uint64_t bytes,bool imported)
+{
+    if(imported)return 4;
+    return bytes<(UINT64_C(1)<<20)?0:bytes<(UINT64_C(16)<<20)?1:bytes<(UINT64_C(64)<<20)?2:3;
+}
 /* UniXNU-piano (2026-11-12): why this connection's last BoAlloc or BoImport was refused (lastAllocRefusal), for the console's detail
  * line after its "call failed" line: the first macOS desktops said "BoAlloc -> BadArgument" for a BO past 256 MiB and "NoMemory" with
  * no figure. method is the ABI method (NativeAdrenoMethodBoAlloc or NativeAdrenoMethodBoImport); the figures are named per code. */
@@ -112,6 +121,8 @@ class NativeAdrenoUserClient final {
 #ifdef ADRENO830_MACOS
     /* UniXNU-piano: the live mappings (relaxed atomics, written under the connection's lock) and the last BoMap refusal. */
     uint64_t mapped_objects_=0,mapped_spans_=0,mapped_bytes_=0;
+    /* UniXNU-piano (2026-11-12): the live objects by size class (account() adds and takes away; relaxed atomics, as the bytes above). */
+    uint64_t size_count_[NativeAdrenoSizeClasses]={},size_bytes_[NativeAdrenoSizeClasses]={};
     NativeAdrenoMapRefusal map_refusal_{};
     void noteMapped(const Entry &,bool add);
     IOReturn refuseMap(uint8_t why,IOReturn status,uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_t d=0)
@@ -211,6 +222,8 @@ public:
     /* UniXNU-piano: the mappings this connection holds (any thread, relaxed reads) and why its last BoMap was refused (read by the
      * IOKit wrapper right after that call, under the connection's lock). */
     void mapUsage(NativeAdrenoMapUsage *) const;
+    /* UniXNU-piano (2026-11-12): the live objects by size class (NativeAdrenoSizeUsage), for the console's va/sizes lines. */
+    void sizeUsage(NativeAdrenoSizeUsage *) const;
     NativeAdrenoMapRefusal lastMapRefusal() const {return map_refusal_;}
     /* UniXNU-piano (2026-11-12): why the last BoAlloc or BoImport was refused (read as lastMapRefusal is). */
     NativeAdrenoAllocRefusal lastAllocRefusal() const {return alloc_refusal_;}

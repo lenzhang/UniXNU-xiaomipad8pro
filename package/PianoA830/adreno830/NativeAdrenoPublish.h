@@ -477,9 +477,12 @@ static inline bool NativeAdrenoCallRoutine(uint32_t method,IOReturn status)
 }
 /* How often a repeated event is written: its first time, then at its 10th, 100th, 1000th, ... occurrence with the count, so a failure
  * that repeats every frame stays visible at the cost of a line per decade. The keys are (process name, kind, status); with every key
- * used, a new one is counted in the table's overflow and written by the same rule. Under the caller's lock. */
+ * used, a new one is counted in the table's overflow and written by the same rule. Under the caller's lock.
+ * UniXNU-piano (2026-11-12): a key also holds the process id of its last occurrence, and another process of the same name starts its
+ * count again: WindowServer's second instance (desk-dev, 17:33:58) failed every BoAlloc unseen, its predecessor's count being past
+ * 10000 already. `pid` 0 (an event of no process) never restarts. */
 enum : unsigned {NativeAdrenoEventKeys=64};
-struct NativeAdrenoEventKey {char name[20];uint32_t kind,status,count;};
+struct NativeAdrenoEventKey {char name[20];uint32_t kind,status,count;int32_t pid;};
 struct NativeAdrenoEventTable {NativeAdrenoEventKey keys[NativeAdrenoEventKeys];uint32_t others;};
 static inline bool NativeAdrenoEventDecade(uint64_t count)
 {
@@ -488,7 +491,8 @@ static inline bool NativeAdrenoEventDecade(uint64_t count)
     return count && mark==count;
 }
 /* Counts one occurrence of (name, kind, status); returns its count when its line is due, else 0. */
-static inline uint32_t NativeAdrenoEventNote(NativeAdrenoEventTable *table,const char *name,uint32_t kind,uint32_t status)
+static inline uint32_t NativeAdrenoEventNote(NativeAdrenoEventTable *table,const char *name,uint32_t kind,uint32_t status,
+    int32_t pid=0)
 {
     if(!table)return 0;
     if(!name)name="";
@@ -509,8 +513,8 @@ static inline uint32_t NativeAdrenoEventNote(NativeAdrenoEventTable *table,const
             size_t n=0;
             for(;n+1<sizeof key.name && name[n];++n)key.name[n]=name[n];
             key.name[n]=0;
-            key.kind=kind;key.status=status;
-        }
+            key.kind=kind;key.status=status;key.pid=pid;
+        } else if(pid && key.pid!=pid) {key.count=0;key.pid=pid;}   /* another process of this name: its own first time */
         count=++key.count;
     } else count=++table->others;
     return NativeAdrenoEventDecade(count)?count:0;

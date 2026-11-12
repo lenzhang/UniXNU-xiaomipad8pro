@@ -28,6 +28,11 @@ extern "C" {volatile uint32_t native_adreno_pool_wc;}   /* [0] pool MiB, [1] BOs
 /* The pool's shape: [0] free extents now, [1] their peak, [2] pooled BOs alive, [3] allocations sent past the pool because
  * PoolExtentCapacity - 1 pooled BOs were alive, [4] releases whose extent found no room (never: see Pool), [5] the MiB they lost. */
 extern "C" {volatile uint32_t native_adreno_pool_shape[6];}
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano: [0] pooled BOs cut from several free extents (poolTakeMany), [1] the extents they took, [2] BOs the free extents
+ * could not cover within NativeAdrenoPoolMaxPieces (or the gaps bound), sent past the pool. */
+extern "C" {volatile uint32_t native_adreno_pool_split[3];}
+#endif
 namespace {
 /* The free extents are kept sorted by address and fully merged, so every one of them is a gap between two pooled BOs (or an end of
  * the pool): with L pooled BOs alive there are at most L + 1. The table holds PoolExtentCapacity of them and a BO is taken from the
@@ -81,6 +86,50 @@ bool poolTake(size_t bytes,size_t *offset) {
     poolShape();
     return true;
 }
+#ifdef ADRENO830_MACOS
+void poolGive(size_t offset,size_t bytes);
+/* UniXNU-piano (2026-11-12, the first desktop sessions): a BO the pool holds in no single free extent is cut from several, the largest
+ * first and the last one best fit, at most `max` of them (one span and one GPU range each). In run desk-dev the pool had 168 MiB free
+ * in extents of at most 19 MiB when WindowServer's 49 MiB BoAlloc went to XNU's pages instead and XNU had none left to wire: the
+ * next 10000 of its BoAllocs failed alike and WindowServer aborted. Only for a write-combined pool (a piece needs no attribute
+ * change, and no kernel mapping is kept for the BO: its zero fill goes by span, its CPU views and GPU table take the spans). Each
+ * piece counts in `live`, so the gaps bound (at most live + 1 free extents) holds. When they do not cover it, every piece goes back. */
+bool poolTakeMany(size_t bytes,NativeAdrenoPhysicalSpan *pieces,size_t max,size_t *count)
+{
+    *count=0;
+    if(!pool.write_combined || pool.bytes-pool.used<bytes)return false;
+    size_t remaining=bytes,at=0;
+    while(remaining && *count<max && pool.live<PoolExtentCapacity-1) {
+        const uint32_t pages=uint32_t(remaining>>12);
+        int fit=-1,largest=-1;
+        for(unsigned i=0;i<pool.count;++i) {
+            const uint32_t n=pool.free[i].pages;
+            if(n>=pages && (fit<0 || n<pool.free[fit].pages))fit=(int)i;
+            if(largest<0 || n>pool.free[largest].pages)largest=(int)i;
+        }
+        const int pick=fit>=0?fit:largest;
+        if(pick<0)break;
+        const uint32_t take=fit>=0?pages:pool.free[pick].pages;
+        const size_t offset=size_t(pool.free[pick].page)<<12,piece=size_t(take)<<12;
+        pool.free[pick].page+=take;pool.free[pick].pages-=take;
+        if(!pool.free[pick].pages)poolRemove(unsigned(pick));
+        ++pool.live;pool.used+=piece;
+        pieces[(*count)++]={at,pool.physical+offset,piece};
+        at+=piece;remaining-=piece;
+    }
+    if(remaining) {
+        for(size_t i=0;i<*count;++i)poolGive(size_t(pieces[i].physical-pool.physical),size_t(pieces[i].bytes));
+        *count=0;
+        native_adreno_pool_split[2]=native_adreno_pool_split[2]+1;
+        return false;
+    }
+    if(pool.used>pool.peak)pool.peak=pool.used;
+    native_adreno_pool_stats[3]=(uint32_t)(pool.used>>20);native_adreno_pool_stats[4]=(uint32_t)(pool.peak>>20);
+    native_adreno_pool_split[0]=native_adreno_pool_split[0]+1;native_adreno_pool_split[1]=native_adreno_pool_split[1]+uint32_t(*count);
+    poolShape();
+    return true;
+}
+#endif
 void poolGive(size_t offset,size_t bytes) {
     const uint32_t page=uint32_t(offset>>12),pages=uint32_t(bytes>>12);
     /* The first extent at or after page (the extents are sorted by address and never overlap a live BO). */
@@ -197,8 +246,9 @@ IOReturn NativeAdrenoMemory::reservePoolBestEffort(unsigned bits,uint32_t mib,ui
 }
 /* A BO from the pool: kIOReturnNoResources when the pool cannot take it (none, too small, no room: counted as fell back when the pool
  * could have held it), else what the pooled allocation returned. The pool's free list and figures: under the Memory lock. */
-IOReturn NativeAdrenoMemory::takePooled(size_t bytes,uint64_t limit)
+IOReturn NativeAdrenoMemory::takePooled(size_t bytes,uint64_t limit,bool contiguous)
 {
+    (void)contiguous;   /* upstream builds: one extent, always */
     if(!pool.descriptor || bytes>pool.bytes)return kIOReturnNoResources;
     size_t offset=0;
     if(poolTake(bytes,&offset)) {
@@ -213,12 +263,36 @@ IOReturn NativeAdrenoMemory::takePooled(size_t bytes,uint64_t limit)
             return kIOReturnSuccess;
         }
     }
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano: no single free extent holds it: several (poolTakeMany), when the BO may have more than one span. Such a BO has no
+     * kernel mapping (mapping() is null: its zero fill goes by span, its views and the GPU's table take its spans). */
+    else if(!contiguous && pool.physical<limit && pool.bytes<=limit-pool.physical) {
+        NativeAdrenoPhysicalSpan *pieces=IONewData(NativeAdrenoPhysicalSpan,NativeAdrenoPoolMaxPieces);
+        if(!pieces)return kIOReturnNoMemory;
+        size_t count=0;
+        if(poolTakeMany(bytes,pieces,NativeAdrenoPoolMaxPieces,&count)) {
+            spans_=pieces;span_capacity_=NativeAdrenoPoolMaxPieces;span_count_=count;
+            mapping_=nullptr;bytes_=bytes;pooled_=true;pool_offset_=0;prepared_=true;unzeroed_=true;
+            native_adreno_pool_stats[1]=native_adreno_pool_stats[1]+1;
+            return kIOReturnSuccess;
+        }
+        IODeleteData(pieces,NativeAdrenoPhysicalSpan,NativeAdrenoPoolMaxPieces);
+    }
+#endif
     native_adreno_pool_stats[2]=native_adreno_pool_stats[2]+1;
     return kIOReturnNoResources;
 }
 IOReturn NativeAdrenoMemory::finishPooled()
 {
     if(!unzeroed_)return kIOReturnSuccess;
+#ifdef ADRENO830_MACOS
+    if(!mapping_) {   /* UniXNU-piano: cut from several extents (poolTakeMany, a write-combined pool only): each through the pool's mapping */
+        for(size_t i=0;i<span_count_;++i)bzero(pool.virt+(spans_[i].physical-pool.physical),(size_t)spans_[i].bytes);
+        __asm__ volatile("dsb sy":::"memory");
+        unzeroed_=false;
+        return kIOReturnSuccess;
+    }
+#endif
     bzero(mapping_,bytes_);
     /* Through a write-combined pool's own mapping the zeros go to DRAM; the barrier completes them. */
     if(pool.write_combined)__asm__ volatile("dsb sy":::"memory");
@@ -229,14 +303,14 @@ IOReturn NativeAdrenoMemory::finishPooled()
     unzeroed_=false;
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoMemory::allocatePooled(size_t bytes,unsigned bits)
+IOReturn NativeAdrenoMemory::allocatePooled(size_t bytes,unsigned bits,bool contiguous)
 {
     if(descriptor_ || spans_ || quarantined_)return kIOReturnBusy;
     /* UniXNU-piano: here and below the bound is NativeAdrenoMemoryMaxBytes (NativeAdrenoMemory.h; 256 MiB upstream). */
     if(!bytes || (bytes&4095) || !outputWidth(bits) || bytes>NativeAdrenoMemoryMaxBytes)return kIOReturnBadArgument;
     NativeAdrenoCpuState cpu{};
     const IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
-    return takePooled(bytes,UINT64_C(1)<<bits);
+    return takePooled(bytes,UINT64_C(1)<<bits,contiguous);
 }
 IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous,size_t budget,bool pooled)
 {
@@ -248,7 +322,7 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
     uint64_t limit=UINT64_C(1)<<bits;
     if(pooled) {
-        status=takePooled(bytes,limit);
+        status=takePooled(bytes,limit,contiguous);
         if(status==kIOReturnSuccess) {
             status=finishPooled();
             if(status)(void)release();   /* its pages go back to the pool; the failure is the answer, as for every failed allocation */
@@ -386,9 +460,11 @@ IOReturn NativeAdrenoMemory::importDevice(IOMemoryDescriptor *scanout,uint64_t o
 }
 IOReturn NativeAdrenoMemory::makeWriteCombined()
 {
+    /* A write-combined pool's BO only takes the flag (a BO cut from several of its extents has no kernel mapping). */
+    if(pooled_ && pool.write_combined && prepared_ && !quarantined_ && !device_references_ && !write_combined_ && span_count_)
+        {write_combined_=true;return kIOReturnSuccess;}
     if(!(descriptor_ || pooled_) || imported_ || !prepared_ || quarantined_ || device_references_ || write_combined_ || !mapping_ || !span_count_)
         return kIOReturnNotReady;
-    if(pooled_ && pool.write_combined) {write_combined_=true;return kIOReturnSuccess;}
     IOReturn status=NativeAdrenoMaintainOwnedPages(mapping_,bytes_,NativeAdrenoCleanInvalidate);
     if(status)return status;
     status=NativeAdrenoSetPagesCacheMode(spans_,span_count_,true);
@@ -429,7 +505,11 @@ IOReturn NativeAdrenoMemory::release()
         descriptor_->release();descriptor_=nullptr;
         native_adreno_trace_stage=34;
     }
-    if(pooled_) {poolGive(pool_offset_,bytes_);pooled_=false;prepared_=false;pool_offset_=0;unzeroed_=false;}
+    if(pooled_) {
+        /* Every extent it holds goes back (one, or several when poolTakeMany cut it). */
+        for(size_t i=0;i<span_count_;++i)poolGive(size_t(spans_[i].physical-pool.physical),size_t(spans_[i].bytes));
+        pooled_=false;prepared_=false;pool_offset_=0;unzeroed_=false;
+    }
     if(spans_)IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
     mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;
     return kIOReturnSuccess;

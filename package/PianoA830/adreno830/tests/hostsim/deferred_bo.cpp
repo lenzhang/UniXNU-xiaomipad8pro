@@ -75,6 +75,48 @@ int main(int argc,char **argv) {
     VkDeviceCreateInfo di={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qi};
     VkDevice device;OK(vkCreateDevice(physical,&di,nullptr,&device));
     VkQueue queue;vkGetDeviceQueue(device,(uint32_t)family,0,&queue);
+    /* UniXNU-piano (Turnip 0009, 2026-11-12): "no-memory": a BoAlloc answered NoMemory twice is made after one or two waits (one when
+     * the process's own cache had something to give back first); seven times, refused after the whole series of waits; once more within
+     * the second after that, refused at once. "idle-trim" (run with
+     * TU_DARWIN_BO_CACHE_AGE_MS=200 and the cache on): a freed BO stays cached, then goes back to the kernel with no further call. */
+    const bool noMemory=!std::strcmp(argv[2],"no-memory"),idleTrim=!std::strcmp(argv[2],"idle-trim");
+    if(noMemory||idleTrim){
+        VkMemoryAllocateInfo mi={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=65536,.memoryTypeIndex=(uint32_t)type};
+        const auto ms=[](std::chrono::steady_clock::time_point since) {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-since).count();
+        };
+        if(noMemory){
+            const unsigned made=successes(NativeAdrenoMethodBoAlloc);
+            inject(NativeAdrenoMethodBoAlloc,4,2);   // fixture kIOReturnNoMemory
+            VkDeviceMemory first=VK_NULL_HANDLE,refused=VK_NULL_HANDLE;
+            auto since=std::chrono::steady_clock::now();
+            OK(vkAllocateMemory(device,&mi,nullptr,&first));
+            REQUIRE(successes(NativeAdrenoMethodBoAlloc)==made+1 && ms(since)>=4);   // a wait of 4 ms at least
+            inject(NativeAdrenoMethodBoAlloc,4,7);
+            since=std::chrono::steady_clock::now();
+            REQUIRE(vkAllocateMemory(device,&mi,nullptr,&refused)==VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            REQUIRE(ms(since)>=124);   // 4 + 8 + 16 + 32 + 64 ms
+            inject(NativeAdrenoMethodBoAlloc,4,1);
+            since=std::chrono::steady_clock::now();
+            REQUIRE(vkAllocateMemory(device,&mi,nullptr,&refused)==VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            REQUIRE(ms(since)<4);   // no wait within the second after a series failed
+            inject(~0u,0,0);
+            REQUIRE(successes(NativeAdrenoMethodBoAlloc)==made+1);
+            vkFreeMemory(device,first,nullptr);
+        } else {
+            const unsigned frees=successes(NativeAdrenoMethodBoFree),before=live();
+            VkDeviceMemory cached=VK_NULL_HANDLE;OK(vkAllocateMemory(device,&mi,nullptr,&cached));
+            REQUIRE(live()==before+1);
+            vkFreeMemory(device,cached,nullptr);   // no work in flight: reaped at once, into the cache
+            REQUIRE(live()==before+1 && successes(NativeAdrenoMethodBoFree)==frees);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));   // the age 200 ms, the timer's leeway 100 ms
+            REQUIRE(successes(NativeAdrenoMethodBoFree)==frees+1 && live()==before);
+        }
+        vkDestroyDevice(device,nullptr);vkDestroyInstance(instance,nullptr);
+        REQUIRE(live()==0);
+        std::printf("PASS: deferred BO %s; native objects at exit=%u; software control only, no shader execution\n",argv[2],live());
+        return 0;
+    }
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=4096,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT,.sharingMode=VK_SHARING_MODE_EXCLUSIVE};
     VkBuffer buffer;OK(vkCreateBuffer(device,&bi,nullptr,&buffer));
     VkMemoryRequirements req;vkGetBufferMemoryRequirements(device,buffer,&req);REQUIRE(req.memoryTypeBits&(1u<<type));

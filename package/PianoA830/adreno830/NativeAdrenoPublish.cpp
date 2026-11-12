@@ -221,11 +221,11 @@ namespace {
 NativeAdrenoEventTable gEvents;
 IOLock *gEventLock=nullptr;   /* allocated with the shell's locks (native_adreno_publish) */
 enum : uint32_t {EventCall=1,EventOpen=2,EventFault=3};
-uint32_t noteEvent(const char *name,uint32_t kind,uint32_t status)
+uint32_t noteEvent(const char *name,uint32_t kind,uint32_t status,int32_t pid=0)
 {
     if(!gEventLock)return 0;
     IOLockLock(gEventLock);
-    const uint32_t count=NativeAdrenoEventNote(&gEvents,name,kind,status);
+    const uint32_t count=NativeAdrenoEventNote(&gEvents,name,kind,status,pid);
     IOLockUnlock(gEventLock);
     return count;
 }
@@ -1045,7 +1045,7 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
     /* UniXNU-piano: a failed call (but the answers Turnip expects, NativeAdrenoCallRoutine) on the console: the process, its slot, the ABI
      * method and the IOReturn, the first time per process, method and status and then every decade. */
     if(!NativeAdrenoCallRoutine(method,status))
-        if(const uint32_t count=noteEvent(name_,EventCall|method<<8,uint32_t(status))) {
+        if(const uint32_t count=noteEvent(name_,EventCall|method<<8,uint32_t(status),proc_selfpid())) {
             char what[24],tail[48],line[160];
             if(const char *known=NativeAdrenoMethodName(method))snprintf(what,sizeof what,"%s",known);
             else snprintf(what,sizeof what,"method %#x",method);
@@ -1578,7 +1578,7 @@ extern "C" unsigned native_adreno_client_tick(Adreno830StatusClients *out)
 #ifdef ADRENO830_MACOS
     /* UniXNU-piano: the live GPU connections (slot, process, MiB of own BOs and imports) on the console when the set changed, at most
      * every 10 s (this runs once a second): how many Metal clients a session has and who holds the GPU memory. */
-    struct ClientEntry {uint32_t slot,mib;char name[15];NativeAdrenoMapUsage map;};
+    struct ClientEntry {uint32_t slot,mib;char name[15];NativeAdrenoMapUsage map;NativeAdrenoSizeUsage sizes;};
     ClientEntry entries[NativeAdrenoMaxClients];
     unsigned listed=0;
     uint32_t signature=2166136261u;
@@ -1592,6 +1592,7 @@ extern "C" unsigned native_adreno_client_tick(Adreno830StatusClients *out)
         e.slot=s;e.mib=mib(pool+other+imported);
         strlcpy(e.name,box->name,sizeof e.name);
         box->core.mapUsage(&e.map);
+        box->core.sizeUsage(&e.sizes);
         signature=(signature^s)*16777619u;
         for(const char *c=box->name;*c && c<box->name+sizeof box->name;++c)signature=(signature^uint8_t(*c))*16777619u;
     }
@@ -1646,6 +1647,13 @@ extern "C" unsigned native_adreno_client_tick(Adreno830StatusClients *out)
                 if(at>0 && size_t(at)+size_t(length)<sizeof vaLine) {memcpy(vaLine+at,entry,size_t(length)+1);at+=length;}
             }
             boot_progress_gpu_event(vaLine);
+            /* 2026-11-12 (desk-dev): what a client of 128 MiB or more holds, by size (NativeAdrenoVaSizesLine). */
+            for(unsigned i=0;i<listed;++i) {
+                if(entries[i].mib<128)continue;
+                char sizes[NativeAdrenoMapLineBytes];
+                if(NativeAdrenoVaSizesLine(sizes,sizeof sizes,entries[i].slot,entries[i].name,entries[i].sizes)>0)
+                    boot_progress_gpu_event(sizes);
+            }
         }
     }
 #endif
