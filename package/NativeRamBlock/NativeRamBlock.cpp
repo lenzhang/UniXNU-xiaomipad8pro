@@ -12,6 +12,7 @@
 #include <libkern/crypto/sha2.h>
 #include <mach/machine.h>
 #include <machine/machine_routines.h>
+#include <mach/vm_param.h>   // max_mem: the RAM window line in start()
 #include <vm/vm_kern.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -29,6 +30,7 @@
 
 extern "C" {
 extern unsigned long gPhysBase, gPhysSize;
+extern uint64_t gDramBase, gDramSize;   // the ADT's /chosen dram-base, dram-size (arm_init)
 int native_ram_block_volume_device(const char *, dev_t *, char *, size_t);
 volatile uint32_t native_ram_block_ready = 0;
 volatile uint64_t native_ram_block_bytes = 0;
@@ -514,6 +516,10 @@ static void publishWhenBSDMatched(void *argument, wait_result_t)
 bool NativeRamBlock::start(IOService *provider)
 {
   if (!IOBlockStorageDevice::start(provider)) return false;
+  // UniXNU-piano: the RAM window XNU got (DarwinBoot's boot_args PhysicalBase/MemorySize, configs/k27-adt.toml owned_memory_size)
+  // in the ADT's DRAM range, once a boot: "grep 'RAM window'" in any console log says which window a run had.
+  IOLog("NativeRamBlock: RAM window 0x%lx..0x%lx (%lu MiB) in DRAM 0x%llx..0x%llx; max_mem %llu MiB\n", gPhysBase,
+        gPhysBase + gPhysSize, gPhysSize >> 20, gDramBase, gDramBase + gDramSize, (unsigned long long)(max_mem >> 20));
   IORegistryEntry *map = IORegistryEntry::fromPath("/chosen/memory-map", gIODTPlane);
   if (!map) return false;
   OSData *packed = OSDynamicCast(OSData, map->getProperty("PackedRAMDisk"));
