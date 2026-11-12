@@ -688,6 +688,8 @@ def main():
         'timeout': a.timeout,
         'utc': a.utc, 'rtc_offset': a.rtc_offset, 'kc_has_rtc_calendar': kc_rtc, 'boot_guard': guard, 'charging': level,
         'kc_has_boot_guard': kc_guard, 'cmdlines': lines,
+        # XNU's RAM window the ADT asks for: maint-session.py writes the ESP only onto a boot_a whose DarwinBoot takes it
+        'ram_window': common.adt_ram_window(inputs['adt']),
         'inputs': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in inputs.items()},
         'previous': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in prev.items()} if prev else None,
         'kc_natives': natives, 'adt_vmm_present': vmm,

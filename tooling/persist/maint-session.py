@@ -23,6 +23,12 @@ Order (sessions as in the plan; s = the maintenance RAM image, a = ABL fastboot)
   a  abl-final reboot
   later, an ESP update on the installed tablet (docs/persistent-boot.md section 11):
   s  maint-boot map backup [store-backup] esp-final check maint-exit --esp E --esp-final E --new-backup
+  later, a new boot_a FD with its ESP (docs/persistent-boot.md section 12; B = boot-piano-macos-persistent-vN-signed.img):
+  a  ram-boot-a --boot-image B                       fastboot boot only: B boots the installed ESP (no reset: the USB console)
+  s  maint-boot map backup [store-backup] boot-a esp-final check maint-exit --boot-image B --esp E --esp-final E --new-backup
+The pair on the tablet stays bootable: an ESP whose ADT asks for a larger RAM window than boot_a's DarwinBoot takes never boots,
+so esp-final refuses such an ESP until boot-a has written an FD that takes it, and boot-a / rollback boot-a refuse an older FD
+while such an ESP is on the tablet (rollback esp-final first). Each is checked against the tablet's bytes, not the state file.
 Never used: fastboot flash, erase, set_active, any oem to ABL; nothing is written to xbl, abl, tz, hyp, vbmeta, dtbo, persist or
 any _b partition (boot_b is backed up only); vendor_boot_a and init_boot_a are only read and backed up. No password anywhere.
 The tablet side is tooling/persist/tablet.sh (served over HTTP from the host's USB-link address, a fixed list of files, sha256
@@ -36,6 +42,7 @@ import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -104,7 +111,9 @@ class Session:
             self.state.pop('backups', None)
         os.environ['PATH'] = PLATFORM_TOOLS + os.pathsep + os.environ['PATH']
         self.gpt = json.loads((OUT / 'gpt.json').read_text()) if (OUT / 'gpt.json').is_file() else None
-        self.boot = json.loads((OUT / 'boot.json').read_text()) if (OUT / 'boot.json').is_file() else None
+        self.boot = self.boot_records()
+        # What a dry run's earlier steps would have written (boot_a, ESP sha256), for the later steps' pair checks.
+        self.sim, self.windows = {}, {}
         self.esp = self.esp_record(a.esp)
         self.nodes = self.state.get('nodes', {'lun0': 'sda', 'rootfs': 'sda35', 'esp': 'sda37', 'boot_a': '<boot_a>',
                                               'boot_b': '<boot_b>', 'vendor_boot_a': '<vendor_boot_a>', 'init_boot_a': '<init_boot_a>'})
@@ -123,6 +132,95 @@ class Session:
                     env[k.strip()] = v.strip().strip('"')
         env.update({k: v for k, v in os.environ.items() if k.startswith('PIANO_')})
         return env
+
+    @staticmethod
+    def boot_records():
+        """The signed boot_a images of boot.json (series 4) and every boot-v*.json (build-boot.py --series N), each with its record's
+        name and its FD's DarwinBoot window bound (common.boot_fd_bound)."""
+        signed, unsigned = {}, {}
+        for path in [OUT / 'boot.json', *sorted(OUT.glob('boot-v*.json'))]:
+            if path.is_file():
+                record = json.loads(path.read_text())
+                bound = common.boot_fd_bound(record)
+                for name, entry in (record.get('signed') or {}).items():
+                    signed[name] = {**entry, 'record': path.name, 'fd_bound': bound}
+                for name in record.get('images') or {}:
+                    unsigned[name] = {'record': path.name, 'fd_bound': bound}
+        return {'signed': signed, 'unsigned': unsigned}
+
+    def boot_identity(self, sha):
+        """(name, DarwinBoot window bound) of the boot_a contents with this sha256; the bound is None for Ubuntu's boot_a (no UEFI: no
+        ESP is booted) and for unknown contents. 'planned:NAME' is a dry run's boot-a of an image not signed yet."""
+        if sha == common.BOOT_A_SHA256:
+            return 'Ubuntu\'s boot_a (13-boot_a)', None
+        if sha and sha.startswith('planned:'):
+            name = sha.removeprefix('planned:')
+            entry = self.boot['unsigned'].get(name.replace('-signed.img', '.img')) or {}
+            return f'{name} (not signed yet)', entry.get('fd_bound')
+        for name, entry in self.boot['signed'].items():
+            if entry.get('sha256') == sha:
+                return name, entry['fd_bound']
+        return 'unknown contents', None
+
+    def esp_by_sha(self, sha):
+        """The build record (out/persistent/*.json) of the ESP image with this sha256, else None."""
+        for path in sorted(OUT.glob('*.json')):
+            try:
+                record = json.loads(path.read_text())
+            except ValueError:
+                continue
+            if isinstance(record, dict) and record.get('sha256') == sha and record.get('image'):
+                return record
+        return None
+
+    def esp_window(self, record):
+        """XNU's RAM window the ESP's ADT asks for (bytes; None: no ADT, DarwinBoot's 256 MiB): the record's ram_window, else its ADT
+        input while that file has the recorded sha256, else the ADT read out of the image itself."""
+        if not record:
+            return None
+        if record.get('ram_window'):
+            return int(record['ram_window'])
+        key = record.get('sha256')
+        if key not in self.windows:
+            window = None
+            adt = (record.get('inputs') or {}).get('adt') or {}
+            if adt.get('path') and Path(adt['path']).is_file() and common.sha(adt['path']) == adt.get('sha256'):
+                window = common.adt_ram_window(adt['path'])
+            elif (OUT / record['image']).is_file():
+                try:
+                    data = common.fat32_read(OUT / record['image'])['files'].get('EFI/UniXNU/Payloads/kernel.macho.adt')
+                    window = common.adt_ram_window(data) if data else None
+                except (ValueError, IndexError, KeyError, struct.error):
+                    window = None   # not a FAT image (the tests' stand-ins): no payload, no window
+            self.windows[key] = window
+        return self.windows[key]
+
+    def tablet_boot_a(self):
+        """boot_a's sha256 on the tablet: read from the medium (a real run), what this dry run's steps would have written, else the
+        state's."""
+        if self.execute:
+            return self.region_sha(self.nodes['boot_a'], 0, self.sizes['boot_a'] // MiB, MiB, name='sha-boot_a')
+        return self.sim.get('boot_a') or self.state.get('boot_a_written') or self.state.get('boot_a_sha256')
+
+    def tablet_esp(self):
+        """The ESP region's sha256 on the tablet (as tablet_boot_a)."""
+        if self.execute:
+            return self.region_sha(self.nodes['lun0'], common.ESP_FIRST * B // MiB, 1024, MiB, name='esp-region-now')
+        return self.sim.get('esp') or self.state.get('esp_sha256')
+
+    def pair(self, boot_sha, esp_record, what):
+        """The rule: an ESP whose ADT asks for more than boot_a's DarwinBoot takes never boots (DarwinBoot refuses the ADT)."""
+        window = self.esp_window(esp_record)
+        name, bound = self.boot_identity(boot_sha)
+        if not window or window <= common.OLD_DARWINBOOT_WINDOW_MAX or boot_sha == common.BOOT_A_SHA256:
+            self.log(f'  info  {what}: boot_a {name}, ESP {esp_record["image"] if esp_record else "-"} '
+                     f'(RAM window {window >> 20 if window else "-"} MiB): every DarwinBoot takes it')
+            return
+        self.need(bound is not None and bound >= window,
+                  f'{what}: boot_a {name} ({boot_sha and boot_sha[:16]}) takes the RAM window of ESP {esp_record["image"]} '
+                  f'({window >> 20} MiB): its DarwinBoot\'s bound is {bound >> 20 if bound else "unknown"} MiB' +
+                  ('' if bound and bound >= window else ' -> that pair never boots: boot_a first (boot-a with an FD that takes it) '
+                   'before esp-final, and rollback esp-final before rollback boot-a'))
 
     def esp_record(self, name):
         path = OUT / (name.removesuffix('.img') + '.json')
@@ -565,7 +663,9 @@ def map_step(s):
         elif not s.execute:
             s.log(f'  info  {key} sha256 is recorded ({"Ubuntu 13-boot_a " + digest[:16] + " or the macOS image" if digest else "never written"})')
         elif key == 'boot_a':
-            s.log(f'  info  boot_a sha256 {got} ({"Ubuntu, backup 13-boot_a" if got == digest else "the macOS image" if got == signed else "unknown: backed up as is"})')
+            name, bound = s.boot_identity(got)
+            s.log(f'  info  boot_a sha256 {got} ({name}' + (f', DarwinBoot window up to {bound >> 20} MiB' if bound else '') +
+                  (', the image this session writes' if got == signed else '') + ')')
         else:
             s.log(f'  info  boot_b sha256 {got} (never written)')
         if s.execute:
@@ -783,6 +883,11 @@ def write_esp(s, image_name):
                    f'({current["identity"][:16]}, as step map read it): every boot of it would keep that store untouched and run the '
                    'owner\'s Data volatile. Build it with the store\'s base (build-esp.py --seed base, the daily profile\'s default; '
                    'docs/data-store.md section 9), or with --replace-data if the owner decided to start Data over')
+    window = s.esp_window(record)
+    if window and window > common.OLD_DARWINBOOT_WINDOW_MAX:   # the pair rule: boot_a's DarwinBoot (read from the tablet) takes it
+        s.pair(s.tablet_boot_a(), record, f'{record["image"]} asks for {window >> 20} MiB')
+    else:
+        s.log(f'  info  {record["image"]}: RAM window {window >> 20 if window else "-"} MiB, which every DarwinBoot takes')
     s.fetch(record['image'], OUT / record['image'], record['sha256'])
     if s.write(f'{record["image"]} (default {record["default"]}, profile {record["profile"]}) -> /dev/{esp} (LUN 0 LBA {common.ESP_FIRST}, 1 GiB)'):
         s.job('esp-write', 'write', record['image'], esp, 0, MiB, timeout=1800)
@@ -790,6 +895,7 @@ def write_esp(s, image_name):
     got2 = s.region_sha(lun0, common.ESP_FIRST * B // MiB, 1024, MiB, name='esp-check-lun0')
     s.need(got == record['sha256'] and got2 == record['sha256'] if s.execute else None,
            f'ESP read back through /dev/{esp} and /dev/{lun0}: {got} / {got2} = {record["sha256"][:16]}')
+    s.sim['esp'] = record['sha256']
     if s.execute:
         s.save(esp_written=record['image'], esp_sha256=record['sha256'])
         # The installed ESP's seed, which build-ram-images.py and build-esp.py compare theirs with (common.installed_seed).
@@ -806,9 +912,16 @@ def esp_step(s):
 
 @rollback('esp')
 def esp_back(s):
-    """The linux_rootfs tail as backed up (linux_rootfs-tail-esp, 1 GiB from the NAS), read back."""
+    """The linux_rootfs tail as backed up (linux_rootfs-tail-esp, 1 GiB from the NAS), read back. Refused while boot_a's DarwinBoot
+    would not take the backed-up ESP's RAM window (the pair rule)."""
     map_nodes(s)
+    entry = s.state.get('backups', {}).get('linux_rootfs-tail-esp') or {}
+    record = s.esp_by_sha(entry.get('sha256'))
+    window = s.esp_window(record)
+    if window and window > common.OLD_DARWINBOOT_WINDOW_MAX:
+        s.pair(s.tablet_boot_a(), record, f'the backed-up ESP {record["image"]} asks for {window >> 20} MiB')
     s.restore('linux_rootfs-tail-esp', s.nodes['lun0'], common.ESP_FIRST, B)
+    s.sim['esp'] = entry.get('sha256')
     if s.execute:
         s.save(esp_written=None, esp_sha256=None)
         (OUT / 'installed.json').unlink(missing_ok=True)   # the region holds what it held before this install
@@ -830,13 +943,17 @@ def check_step(s):
         s.need(got == s.state.get(f'{key}_sha256') if s.execute else None, f'{key} unchanged')
     got = s.region_sha(s.nodes['boot_a'], 0, s.sizes['boot_a'] // MiB, MiB, name='sha-boot_a')
     s.need(got in (s.state.get('boot_a_sha256'), s.state.get('boot_a_written')) if s.execute else None, f'boot_a as expected ({got})')
+    boot_now = got if s.execute else s.tablet_boot_a()
     head, tail = s.region_sha(lun0, 0, 6), s.region_sha(lun0, TAIL_LBA, 5)
     s.need((head, tail) == (s.gpt['gpt-head.bin']['sha256'], s.gpt['gpt-tail.bin']['sha256']) if s.execute else None, 'GPT = the new tables')
     v = s.shell(f'sgdisk -v /dev/{lun0}')
     s.need('No problems found' in v if v is not None else None, 'sgdisk -v clean')
+    esp_now = s.tablet_esp() if not s.execute else None
     if s.state.get('esp_sha256') or not s.execute:
         got = s.region_sha(lun0, common.ESP_FIRST * B // MiB, 1024, MiB, name='esp-check-lun0')
         s.need(got == s.state.get('esp_sha256') if s.execute else None, f'ESP = {s.state.get("esp_written", "the image written")}')
+        esp_now = got if s.execute else esp_now
+    s.pair(boot_now, s.esp_by_sha(esp_now) if esp_now else None, 'the pair on the tablet')
     h = s.t('peek', rootfs, rel(store_new(s)), 0, 8)
     if h:
         s.log(f'  info  store header at LBA {store_new(s)}: {bytes.fromhex(h["hex"])!r}'
@@ -867,6 +984,40 @@ def ram_test(s, image, expect_uefi, reset_after):
     s.fastboot('boot', str(image), timeout=180)
     if not s.wait('piano-uefi', True, 40):
         raise Stop('our UEFI did not appear: ABL refused the image? (fastboot reboot bootloader; docs/persistent-boot.md, v2 fallback)')
+    uefi_log(s, name, expect_uefi)
+    s.wait('piano-uefi', False, 90)
+    if not s.wait(s.serial, True, reset_after + 150):
+        raise Stop(f'not back in ABL fastboot {reset_after + 150} s later (parked? power + volume-down 15-20 s)')
+    if s.execute:
+        took = int(time.time() - t0)
+        s.log(f'  {"ok   " if reset_after <= took <= reset_after + 150 else "WARN "} back in ABL fastboot after {took} s '
+              f'(the configuration it ran resets after {reset_after} s)')
+    s.fastboot('boot', str(dump), timeout=180)
+    if not s.wait('piano-uefi', True, 40):
+        raise Stop('dump image: our UEFI did not appear')
+    s.fastboot('oem', 'dump', '9cb00000', '700000', serial='piano-uefi', check=False)
+    s.fastboot('get_staged', f'{name}-xnu.bin', serial='piano-uefi', check=False)
+    s.log(f'  host$ python3 tooling/native/xnu-log.py decode {name}-xnu.bin > {name}-xnu.txt')
+    s.log(f'  check the Data store opens at LBA {store_new(s)} (the new partition end): "NativeRamBlock: Data store state ... first LBA"')
+    if s.execute:
+        r = subprocess.run(['python3', str(XNU_LOG), 'decode', str(s.dir / f'{name}-xnu.bin')], capture_output=True, text=True)
+        (s.dir / f'{name}-xnu.txt').write_text(r.stdout)
+        for line in r.stdout.splitlines():
+            if re.search(r'NativeRamBlock: Data store|NativeUfs:.*(root|window|store)|panic\(|launchd\[1\]', line):
+                s.log('        | ' + line[:200])
+        # state 0 = data-persist=0 (no store: the precedence image); 4 = refused, first LBA 0 (a failure worth stopping on);
+        # 7 = another seed's store, kept (the store guard, docs/data-store.md): opened at its place, not used
+        lbas = re.findall(r'Data store state [1-47] .*?first LBA (\d+)', r.stdout)
+        if lbas:
+            s.need(all(int(x) == store_new(s) for x in lbas), f'the Data store opened at LBA {lbas[-1]} = {store_new(s)}')
+        else:
+            s.log('  WARN  no "Data store state" line in the XNU log (store off, or the log ring lost it)')
+    s.wait(s.serial, True, 120)
+
+
+def uefi_log(s, name, expect_uefi):
+    """While our UEFI's fastboot is there: its DEBUG log (oem dump to our own UEFI only) into session/NAME-uefi.bin, checked for
+    EXPECT_UEFI once UniXNU has logged its configuration volume."""
     # The DEBUG log is dumped repeatedly: right after the UEFI's fastboot appears, UniXNU has not read its configuration yet (seen
     # 2026-11-11: only the UNIXNURAMDISK lines). Until the expected line shows, or the UEFI is gone (DarwinBoot has taken over).
     lines = []
@@ -898,34 +1049,7 @@ def ram_test(s, image, expect_uefi, reset_after):
             s.log('  WARN  the UEFI DEBUG log could not be read (the UEFI was gone before the dump): judged by the run below')
     else:
         s.log(f'  check {name}-uefi.bin has "{expect_uefi}"')
-    s.wait('piano-uefi', False, 90)
-    if not s.wait(s.serial, True, reset_after + 150):
-        raise Stop(f'not back in ABL fastboot {reset_after + 150} s later (parked? power + volume-down 15-20 s)')
-    if s.execute:
-        took = int(time.time() - t0)
-        s.log(f'  {"ok   " if reset_after <= took <= reset_after + 150 else "WARN "} back in ABL fastboot after {took} s '
-              f'(the configuration it ran resets after {reset_after} s)')
-    s.fastboot('boot', str(dump), timeout=180)
-    if not s.wait('piano-uefi', True, 40):
-        raise Stop('dump image: our UEFI did not appear')
-    s.fastboot('oem', 'dump', '9cb00000', '700000', serial='piano-uefi', check=False)
-    s.fastboot('get_staged', f'{name}-xnu.bin', serial='piano-uefi', check=False)
-    s.log(f'  host$ python3 tooling/native/xnu-log.py decode {name}-xnu.bin > {name}-xnu.txt')
-    s.log(f'  check the Data store opens at LBA {store_new(s)} (the new partition end): "NativeRamBlock: Data store state ... first LBA"')
-    if s.execute:
-        r = subprocess.run(['python3', str(XNU_LOG), 'decode', str(s.dir / f'{name}-xnu.bin')], capture_output=True, text=True)
-        (s.dir / f'{name}-xnu.txt').write_text(r.stdout)
-        for line in r.stdout.splitlines():
-            if re.search(r'NativeRamBlock: Data store|NativeUfs:.*(root|window|store)|panic\(|launchd\[1\]', line):
-                s.log('        | ' + line[:200])
-        # state 0 = data-persist=0 (no store: the precedence image); 4 = refused, first LBA 0 (a failure worth stopping on);
-        # 7 = another seed's store, kept (the store guard, docs/data-store.md): opened at its place, not used
-        lbas = re.findall(r'Data store state [1-47] .*?first LBA (\d+)', r.stdout)
-        if lbas:
-            s.need(all(int(x) == store_new(s) for x in lbas), f'the Data store opened at LBA {lbas[-1]} = {store_new(s)}')
-        else:
-            s.log('  WARN  no "Data store state" line in the XNU log (store off, or the log ring lost it)')
-    s.wait(s.serial, True, 120)
+    return lines
 
 
 @step('ram-esp-test', 'ABL fastboot, RAM boot (no writes)')
@@ -956,17 +1080,69 @@ def ram_precedence(s):
     ram_test(s, image, f'config: volume VenHw({RAM_PAYLOAD_VENDOR})', reset)
 
 
+@step('ram-boot-a', 'ABL fastboot, RAM boot of --boot-image (no writes); the installed ESP boots and stays up')
+def ram_boot_a(s):
+    """The exact bytes of a new boot_a image (--boot-image) from RAM, before boot-a writes them: ABL takes the image, our UEFI
+    loads the configuration of the ESP on the tablet from partition 37 (UEFI log: config: volume VenHw(<LUN 0>)/HD(37,GPT,...)),
+    DarwinBoot boots its default entry with this FD. The installed daily ESP does not reset: the run is the installed system's
+    normal boot (the owner's Data, data-persist=2), judged on the USB console (usb-console.py --capture), and left with the
+    console's 'reset fastboot'. Host-side: the image is a signed one of boot.json/boot-v*.json, and its DarwinBoot takes the RAM
+    window of the ESP on the tablet (the state's)."""
+    image = OUT / s.a.boot_image
+    entry = s.boot['signed'].get(s.a.boot_image)
+    s.need(bool(entry) and image.is_file() and common.sha(image) == entry['sha256'],
+           f'{image.name} is a signed image of {entry["record"] if entry else "no boot record"}' +
+           (f' (sha256 {entry["sha256"][:16]}, DarwinBoot window up to {entry["fd_bound"] >> 20} MiB)' if entry else ''))
+    esp = s.esp_by_sha(s.state.get('esp_sha256')) or s.esp_record(s.state.get('esp_written') or s.a.esp)
+    window = s.esp_window(esp)
+    s.need(bool(entry) and (window or 0) <= entry['fd_bound'],
+           f'the ESP on the tablet ({esp["image"] if esp else "unknown"}, RAM window {window >> 20 if window else "-"} MiB) boots with this FD')
+    guid = s.gpt['esp_guid'] if s.gpt else '<esp guid>'
+    if not s.wait(s.serial, True, 240):
+        raise Stop('no ABL fastboot (from the installed system: usb-console.py --send "reset fastboot" --capture 5)')
+    s.fastboot('boot', str(image), timeout=180)
+    if not s.wait('piano-uefi', True, 40):
+        raise Stop('our UEFI did not appear: ABL refused the image? (fastboot reboot bootloader)')
+    lines = uefi_log(s, image.stem, f'config: volume VenHw({UFS_LUN0_VENDOR})/HD(37,GPT,{guid}')
+    if s.execute and not any('config: volume' in line for line in lines):
+        s.log('  WARN  no configuration volume in the UEFI log: judge the run by the USB console alone')
+    s.log(f'  check the USB console (usb-console.py --capture 400, started before this step): "NativeRamBlock: RAM window ... '
+          f'({window >> 20 if window else 256} MiB)", "Data store state 2 ... first LBA {store_new(s)}", '
+          '"piano-boot-guard: healthy after 180 s, restart reason normal"; then usb-console.py --send "reset fastboot" --capture 5')
+
+
+def check_boot_image_pair(s, sha, what):
+    """Before boot_a gets the contents SHA: the ESP on the tablet (read from it) must boot with their DarwinBoot (the pair rule).
+    An FD whose DarwinBoot takes every window needs no read; Ubuntu's boot_a boots no ESP."""
+    name, bound = s.boot_identity(sha)
+    if sha == common.BOOT_A_SHA256 or (bound and bound >= common.DARWIN_WINDOW_MAX):
+        s.log(f'  info  {what}: {name} (DarwinBoot window up to {bound >> 20 if bound else "-"} MiB): every ESP\'s window boots')
+        return
+    esp_sha = s.tablet_esp()
+    record = s.esp_by_sha(esp_sha) if esp_sha else None
+    if record is None:
+        s.log(f'  info  {what}: the ESP region ({esp_sha and esp_sha[:16]}) is no ESP of a build record here: nothing to compare')
+        return
+    s.pair(sha, record, what)
+
+
 @step('boot-a', 'maintenance, WRITE boot_a by dd (slot bits untouched)', writes='boot_a (LUN 4)')
 def boot_a_step(s):
-    """boot_a = the signed v4 image (--boot-image; the signed v2 test image is the fallback), written by dd from the
-    maintenance image so slot A's successful bit and retry count stay as they are. Read back whole."""
+    """boot_a = the signed image (--boot-image: a signed image of boot.json or boot-v*.json; the signed v2 test image is the
+    fallback), written by dd from the maintenance image so slot A's successful bit and retry count stay as they are. Read back
+    whole. Refused when the ESP on the tablet asks for a RAM window this image's DarwinBoot does not take (the pair rule)."""
     image = OUT / s.a.boot_image
     signed = ((s.boot or {}).get('signed') or {}).get(s.a.boot_image, {}).get('sha256')
-    if s.execute and not signed:
-        raise Stop(f'{s.a.boot_image} is not in boot.json "signed" (tooling/persist/sign.sh, then build-boot.py --verify)')
+    if not signed:
+        what = f'{s.a.boot_image} is not in boot.json/boot-v*.json "signed" (tooling/persist/sign.sh OUT SERIES: signs and verifies)'
+        if s.execute:
+            raise Stop(what)
+        s.need(False, what)
+    s.need(image.is_file() and common.sha(image) == signed if signed else None, f'{image.name} hashes to its record\'s {signed and signed[:16]}')
     r = map_nodes(s)
     if r:
         s.need(r['boot_a'].split()[1:] == [str(common.BOOT_A_START_512), str(common.BOOT_A_SIZE_512)], f'boot_a is {r["boot_a"]}')
+    check_boot_image_pair(s, signed or f'planned:{s.a.boot_image}', f'{image.name} with the ESP on the tablet')
     boot_a = s.nodes['boot_a']
     now = s.region_sha(boot_a, 0, s.sizes['boot_a'] // MiB, MiB, name='sha-boot_a')
     s.require_backup('boot_a', now if s.execute else None)
@@ -981,15 +1157,22 @@ def boot_a_step(s):
     s.need(got == signed if s.execute else None, f'boot_a read back {got} = {signed and signed[:16]}')
     h = s.t('peek', boot_a, 0, 0, 8)
     s.need(bytes.fromhex(h['hex']) == b'ANDROID!' if h else None, 'boot_a starts with ANDROID!')
+    s.sim['boot_a'] = signed or f'planned:{s.a.boot_image}'
     if s.execute:
         s.save(boot_a_written=signed)
 
 
 @rollback('boot-a')
 def boot_a_back(s):
-    """boot_a as backed up (the verified backup boot_a: Ubuntu's 389d4271 when the install started), read back."""
+    """boot_a as backed up (the verified backup boot_a of this backup set: Ubuntu's 389d4271 when the install started, the
+    image of before in a later set), read back. Refused while the ESP on the tablet asks for a RAM window the backup's DarwinBoot
+    does not take: rollback esp-final first (the pair rule)."""
     map_nodes(s)
+    entry = s.state.get('backups', {}).get('boot_a') or {}
+    if entry.get('sha256'):
+        check_boot_image_pair(s, entry['sha256'], f'the boot_a backup ({s.boot_identity(entry["sha256"])[0]}) with the ESP on the tablet')
     s.restore('boot_a', s.nodes['boot_a'], 0, MiB)
+    s.sim['boot_a'] = entry.get('sha256')
     if s.execute:
         s.save(boot_a_written=None)
 

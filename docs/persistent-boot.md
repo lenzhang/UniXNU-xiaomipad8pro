@@ -93,6 +93,7 @@ Outputs in `out/persistent/` (all gitignored; hashes in `artifacts/ARTIFACTS.md`
 | File | What |
 |---|---|
 | `boot-piano-macos-persistent-v4.img` / `-signed.img` | the `boot_a` image (v4) |
+| `boot-piano-macos-persistent-vN.img` / `-signed.img`, `boot-vN.json`, `kernel-field-vN.bin` | a later `boot_a` series (`build-boot.py --series N`, §12): the same container with another FD; the record keeps the FD's DarwinBoot window bound |
 | `boot-piano-esp-test-v2.img` / `-signed.img` | the same kernel field in the RAM v2 container with a 4096-byte zero ramdisk: the RAM test of the flashed path, and (signed) the `boot_a` fallback if ABL refuses v4 |
 | `kernel-field.bin`, `boot.json` | the kernel field; the build and signing record |
 | `esp-<profile>-diag.img`, `esp-<profile>-macos.img`, `.json` | the 1 GiB ESP (default `macos-diag` / `macos`); the record has every input's sha256, the command lines, the seed identity, the store places, the FAT geometry |
@@ -506,6 +507,158 @@ The layer's own rollback: `out/layer-none` the same way (its two files, `sudo sh
    crash-loop. First the empty layer (§11.8, on v3 or `ram-v3-layer`), then step 2. Or, with the store backup: `maint-boot`,
    `rollback esp-final store-backup`, `maint-exit`, which puts the ESP and the owner's Data back to the moment of the backup
    together.
+
+## 12. boot_a v5: the FD with DarwinBoot's 13 GiB window (built 2026-11-12; not signed, not installed)
+
+The RAM images carry FD A built with `firmware/patches/darwinboot/0001` since 2026-11-12 18:40 (`tooling/firmware/build-fd.sh`), so
+XNU gets 13310 MiB there; the installed `boot_a` (v4, `1b212281…`) carries the FD of 2026-11-11 (`6d15f0f8…`), whose DarwinBoot
+refuses an ADT asking for more than 8192 MiB. The installed system gets the 13 GiB window with `boot_a` v5 **and** an ESP whose ADT
+asks for it, in that order (§12.3). `boot_b` and every other partition stay untouched.
+
+### 12.1 The image
+
+```sh
+python3 tooling/persist/build-boot.py --series 5 --fd out/fd/piano-uefi-A-bundled.fd \
+        --same-kernel-as <checkout>/out/ram-desk-dev15/build-A-bundled.json --out out/persistent
+tooling/persist/sign.sh out/persistent 5        # on the signing host (§12.2), then build-boot.py --verify --series 5
+```
+
+| | v4 (installed) | v5 |
+|---|---|---|
+| unsigned image | `605c3a60…`, 3301376 bytes | **`d1363bb16351281adb60e044944c344729ad7f53c667377725d7b4f38c135360`**, 3301376 bytes |
+| boot v4 header (page 4096, os_version 15.0.0, patch level 2026-02, no ramdisk, empty command line) | | byte for byte v4's (first 4096 bytes equal) |
+| BootShim (192 bytes, Linux Image header) | `7199075c…` | the same bytes |
+| FD (3 MiB) | `6d15f0f8…`: unixnu/0001 | `ce719ffbe9998b0960e7f142a2bbd684046e24611f903e0cd5a11ba0f8d802af`: unixnu/0001 and darwinboot/0001 (both `build-fd.sh` stamps; bound `0x340000000`) |
+| boot DTB | `50636eff…` | the same bytes |
+| kernel field | `a1df7f14…` | `72bd1c28742090d64e0bcfc53cdc4878775de03ad7ee64c8b11b1eb689b30c59`: **the kernel field of the RAM images that ran on the tablet today** (desk-dev8n, -13, -14, -15: `--same-kernel-as` checks it) |
+| signed | `1b212281…` (key sha1 `f5151930…`) | pending: 100663296 bytes, the same key |
+
+The record `boot-v5.json` keeps the FD's bound (`fd.ram_window` = 13312 MiB); `maint-session.py` reads `boot.json` and every
+`boot-v*.json` of its directory. `build-boot.py --verify` now records an image as signed only when every check passed (before, an
+image that failed a check was still listed under `signed`, which step `boot-a` writes).
+
+### 12.2 Signing: which key, where
+
+- The AVB key is the RSA-4096 key that signed Ubuntu's `boot_a` (backup `13-boot_a`) and v4: public key sha1
+  `f5151930dc69791637b2a48505cb175f5f78a522`. Its **private half exists only on the signing host** (named by `PIANO_SIGN_HOST` in
+  `~/.config/piano/env`, never committed; the key's path there is `sign-on-remote.sh`'s default or `SIGN_KEY`). It is not on the
+  Mac and not in `private/`, and it never leaves that host.
+- `tooling/persist/sign.sh OUT 5` runs `tooling/bootimg/sign-on-remote.sh` (ssh/scp in BatchMode: key-based login, no password):
+  it copies the pinned avbtool 1.3.0 and the unsigned image to a temporary directory there, extracts the public halves
+  (`out/keys/piano-boot-signing.{avbpubkey,pub.pem}`, which come back), runs `add_hash_footer` (partition `boot`, 100663296 bytes,
+  `SHA256_RSA4096`, rollback index 1769904000 and the three `com.android.build.boot.*` properties of the release's
+  `boot-profile.json`) and `verify_image` there, brings the signed image back and removes its copies.
+- Then, on the Mac, `build-boot.py --verify --series 5`: exactly 100663296 bytes, starts with the recorded unsigned image, the hash
+  descriptor of partition `boot`, the algorithm, the rollback index, the properties, the public key sha1, and `avbtool
+  verify_image` with the local public key. The same tool verifies the installed v4 (`1b212281…`) with the local public key: PASS.
+- Rehearsed offline: the same `add_hash_footer` with a throwaway key on a copy of v5 gives the expected footer and passes every check
+  but the two key checks, which fail; `boot-v5.json` then lists nothing as signed.
+
+### 12.3 The pair rule (the order)
+
+DarwinBoot is in `boot_a`'s FD; the RAM window it is asked for is in the ESP's ADT. Of the four pairs, one never boots:
+
+| boot_a | ESP's ADT | Boots? | Evidence |
+|---|---|---|---|
+| v4 (8 GiB bound) | 8 GiB | yes | installed (2026-11-12 20:43: `RAM window 0x8c0004000..0xac0004000 (8192 MiB)`, store state 2, guard healthy) |
+| v5 (13 GiB bound) | 8 GiB | yes | `ram-desk-dev8n` (new FD, 8 GiB ADT) ran 37 minutes on 2026-11-12 19:40 (`max_mem 8192 MiB`); `check-ram-window.py` |
+| v5 | 13 GiB | yes | `ram-desk-dev14`/`-15` (new FD, 13 GiB ADT, KC with k27 0065): `RAM window 0x8c0004000..0xbffe04000 (13310 MiB)`; `check-ram-window.py` |
+| v4 | 13 GiB | **no**: `DARWINBOOT: boot refused`, the menu redraws (the guard is not armed: XNU never starts) | `check-ram-window.py`: `PROBLEM: request 0x33fe00000 is past the FD's DarwinBoot bound 0x200000000` |
+
+So: `boot-a` before `esp-final`; when undoing, `rollback esp-final` before `rollback boot-a`. Interrupted anywhere in between, the
+tablet holds a bootable pair. `maint-session.py` enforces it against the tablet's bytes (not the state file): `esp-final` reads
+`boot_a` and refuses an ESP its DarwinBoot does not take; `boot-a` and `rollback boot-a` read the ESP region and refuse an FD that
+does not take its window; `rollback esp-final` checks the backed-up ESP against `boot_a`; `check` reports the pair. A dry run
+counts a wrong order as a stop. The ESP's window comes from its record (`ram_window`, `build-esp.py` from now on), else its ADT
+input, else the ADT read out of the image. `test-persist.py` runs both orders and both rollbacks on the fake tablet.
+
+### 12.4 The ESP that goes with it
+
+Any daily ESP built with the 13 GiB ADT (`out/adt/piano-k27.adt` of `PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh`,
+`/chosen darwinboot-memory-size 0x33fe00000`) and `PIANO_BOOT_FD_RAM_WINDOW=1` (`build-esp.py`'s own gate: it states that `boot_a`
+gets v5 first; the session checks it):
+
+```sh
+PIANO_BOOT_FD_RAM_WINDOW=1 python3 tooling/persist/build-esp.py --profile daily --default macos --boot-guard 180 \
+        --layer <the layer-v3 directory> --charging 1 --rtc-offset 1794397906 --adt out/adt/piano-k27.adt [--kc KC] [--arg ...] \
+        --name esp-<name>-macos --out out/persistent
+python3 tooling/adt/check-ram-window.py --adt out/adt/piano-k27.adt --kc KC --fd out/fd/piano-uefi-A-bundled.fd   # 13310 MiB, exit 0
+```
+
+The KC must have the 13 GiB fixes: the k27 0065 kernel (`build-kc.log` names `kernel-k27-0065-native.macho`) and PianoA830's
+contiguous limit (`bringup-debugging.md` §6). For the dry runs here: `esp-daily32-macos.img`
+`a350e35944255d28c2e1d8ae9116aa265d8a555a66788db4ba705a2eb8e943ea`, the v3.1 ESP with only the ADT changed (its record differs from
+v3.1's in the ADT's hash and paths alone: KC `ad1c5c45…` with k27 0065, trust `a83bbee6…`, seed `23a5ec59…`, identical `unixnu.toml`).
+
+### 12.5 The session
+
+Run this checkout's `maint-session.py` (the persist checkout's older one knows only `boot.json`) on the install state, as §11.7:
+
+```sh
+PERSIST=<persist checkout>/out/persistent; export PIANO_PERSIST_OUT=$PERSIST; P=tooling/persist/maint-session.py
+B=boot-piano-macos-persistent-v5-signed.img; E=esp-<name>-macos.img
+cp -c out/persistent/boot-piano-macos-persistent-v5.img out/persistent/$B out/persistent/boot-v5.json $PERSIST/
+cp -c <where it was built>/out/persistent/${E%.img}.{img,json} $PERSIST/       # unless built there
+python3 $P --dry-run maint-boot map backup store-backup boot-a esp-final check maint-exit --boot-image $B --esp $E --esp-final $E --new-backup
+# ABL fastboot: from the running system python3 tooling/native/usb-console.py --send 'reset fastboot' --capture 5
+python3 $P abl-check
+python3 tooling/native/usb-console.py --capture 420 &      # the RAM test of v5's exact bytes (nothing written):
+python3 $P ram-boot-a --boot-image $B                      # UEFI log "config: volume VenHw(860845C1-...)/HD(37,GPT,3F8B0988-..."
+#   console: "RAM window ... (8192 MiB)" (the installed ESP's ADT with the new FD), "Data store state 2", guard healthy at 180 s
+python3 tooling/native/usb-console.py --send 'reset fastboot' --capture 5
+python3 $P maint-boot map backup store-backup boot-a esp-final check maint-exit --boot-image $B --esp $E --esp-final $E --new-backup
+python3 $P abl-final reboot
+```
+
+- The dry run must end with `done (dry run: nothing was sent)` and no `would stop a real run` (before signing it names exactly one:
+  the image is not signed yet).
+- `--new-backup` starts a new NAS set: both GPT copies, `boot_a` (v4 `1b212281…`), `boot_b`, `vendor_boot_a`, `init_boot_a` (`boot_a`
+  and the small ones also locally in `session/`), the ESP region as installed; each exported, checked against the tablet's sha256
+  and read back from the NAS without the cache. `store-backup` (optional, 12.9 GB, about 7 + 7 minutes) is advised here: no boot has
+  yet run the direct store (`data-persist=2`) with the 13 GiB window.
+- `boot-a`: the pair check (v5 takes every window), `vendor_boot_a`/`init_boot_a` are slot A's, the image fetched by sha256, written
+  by `dd`, read back whole (= the signed sha256), `ANDROID!`. `esp-final`: the pair check reads `boot_a` back from the tablet (= v5),
+  then writes and reads back partition 37 through the partition and through LUN 0. `check`: everything else unchanged, the pair.
+- `ram-boot-a` boots the installed system's normal path (its own Data) with the new FD; it is optional, but it is the one run of
+  v5's ESP path (UniXNU finding partition 37) before `boot_a` holds it: every 13 GiB boot so far had its payload in RAM.
+
+### 12.6 First boot
+
+`python3 tooling/native/usb-console.py --capture 600` from `reboot`:
+- `NativeRamBlock: RAM window 0x8c0004000..0xbffe04000 (13310 MiB) in DRAM 0x8c0000000..0xc00000000; max_mem 13310 MiB`
+  (8192 MiB means the ESP's ADT is still the 8 GiB one);
+- `NativeRamBlock: Data store state 2 (...), header 0, first LBA 68119455, 3145728 pages, direct 1, seed 8f333110, store seed
+  8f333110, ...`;
+- `piano-boot-guard: armed: ...`, then `piano-boot-guard: healthy after 180 s, restart reason normal`;
+- `PianoDwc3: cold: verdict ...` and enumeration (the console itself); no `panic`, no `vm_page_unwire`.
+
+**Stop** on `state 3`, `state 7`, `kept` or `started over` (§11.7). No console at all and the panel back at the UniXNU menu after a
+`DARWINBOOT` line: the pair is wrong (cannot happen through the session; power + volume-down, then §12.7).
+
+### 12.7 Roll back, least invasive first
+
+1. A hang or panic in the first 180 s: the guard lands in ABL fastboot; always: power + volume-down 15-20 s. RAM images still win.
+2. Both back, from ABL fastboot: `python3 $P maint-boot map`, then `python3 $P rollback esp-final boot-a` (a rollback is its own
+   command line; this order: the ESP of before, then v4, each streamed from the new set and read back; `boot_a`'s copy is also
+   local in `session/`), then `python3 $P map check maint-exit` (`map` again, so `check` compares with what is there now). The pair
+   rule refuses `rollback boot-a` while the 13 GiB ESP is there.
+3. Only the ESP back (v5 stays; it boots the 8 GiB ADT): `rollback esp-final`.
+4. Copies kept for writing back by name: `$PERSIST/boot-piano-macos-persistent-v4-signed.img` (`1b212281…`), the earlier ESP images
+   in `$PERSIST`, and the NAS sets of 2026-11-12 (each with `boot_a` = v4). Write by name with a new set: `maint-boot map backup
+   esp-final boot-a check maint-exit --esp-final <8 GiB ESP> --boot-image boot-piano-macos-persistent-v4-signed.img --new-backup`
+   (ESP first, as the rule demands).
+
+### 12.8 Risks
+
+- Signing needs the signing host (§12.2); until it signs, nothing can be installed (`boot-a` refuses an unsigned image).
+- v5's ESP path has not run: the RAM boots that proved FD `ce719ffb…` all carried their payload in RAM (UniXNU's RAM disk first);
+  the UniXNU in this FD is newer than v4's. `ram-boot-a` closes that gap without a write.
+- The 13 GiB window with the direct store (`data-persist=2`) has not run (the 13 GiB boots were `data-persist=0`): `store-backup`,
+  and a RAM test of the new ESP's payload with the read-only probe (`PIANO_DATA_PERSIST=1`, §11.6) before the install.
+- If v5 never reaches XNU, the boot guard cannot act (it lives in XNU): power + volume-down needs the owner. `ram-boot-a` shows ABL
+  takes v5 and the UEFI reaches the ESP.
+- The FD build is not bit-reproducible: v5 is identified by hashes (`out/fd/piano-uefi-A-bundled.fd` = `ce719ffb…`; its `.prev` is
+  v4's FD).
 
 ## Done 2026-11-11 (sessions 1-3)
 

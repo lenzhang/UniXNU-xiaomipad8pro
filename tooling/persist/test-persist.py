@@ -421,6 +421,70 @@ def test_session(tmp):
     check('changed since its verified backup' in log, 'an unexplained change of boot_b stops the backup step')
 
 
+def test_pair_rule(tmp):
+    """The boot_a/ESP pair (docs/persistent-boot.md section 12): an ESP asking for a 13 GiB RAM window only after boot_a has an FD
+    whose DarwinBoot takes it, and the rollbacks in the reverse order."""
+    print('== maint-session.py: the boot_a FD and the ESP\'s RAM window (a fake tablet)')
+    root, out, window, old = build_fake(tmp)
+    nas = tmp / 'nas'
+    nas.mkdir()
+    env = dict(os.environ, FAKE_ROOT=str(root), PIANO_PERSIST_OUT=str(out), PIANO_MAINT_HOST='127.0.0.1',
+               PIANO_BACKUP_DIR=str(nas), PIANO_SERIAL='test', PIANO_MAINT_SHELL=str(tmp / 'fake-shell.py'),
+               PYTHONDONTWRITEBYTECODE='1')
+    (tmp / 'fake-shell.py').write_text(f'import sys; sys.path.insert(0, {str(HERE)!r}); import importlib.util\n'
+                                       f'spec = importlib.util.spec_from_file_location("t", {str(Path(__file__).resolve())!r})\n'
+                                       'm = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n'
+                                       'sys.stdout.write(m.fake_shell(sys.argv[1]))\n')
+    base = ['python3', str(HERE / 'maint-session.py'), '--session', str(tmp / 'session'), '--http-port', '18010', '--nc-port', '19010']
+
+    def run(*steps, expect=0):
+        r = subprocess.run(base + list(steps), capture_output=True, text=True, env=env, timeout=3600)
+        log = r.stdout + r.stderr
+        (tmp / 'session-out.txt').open('a').write(log)
+        if r.returncode != expect:
+            print(log[-3000:])
+        check(r.returncode == expect, f'maint-session.py {" ".join(steps)} -> {r.returncode}')
+        return log
+
+    old_boot = ['--boot-image', 'boot-test-signed.img']
+    new_boot = ['--boot-image', 'boot-test5-signed.img']
+    small = ['--esp', 'esp-test.img', '--esp-final', 'esp-test.img']
+    big = ['--esp', 'esp-13g.img', '--esp-final', 'esp-13g.img']
+    # the installed state: boot_a = an image of an FD without darwinboot/0001 (boot.json: no fd.ram_window), an 8 GiB ESP
+    run('map', 'backup', 'gpt', 'store', 'esp', 'boot-a', 'check', *old_boot, *small)
+    image5 = out / 'boot-test5-signed.img'
+    image5.write_bytes(b'ANDROID!' + os.urandom(common.BOOT_PARTITION_BYTES - 8))
+    common.write_json(out / 'boot-v5.json', {'series': 5, 'fd': {'sha256': 'ce' * 32, 'ram_window': common.DARWIN_WINDOW_MAX},
+                                             'signed': {image5.name: {'sha256': common.sha(image5)}}})
+    rec = json.loads((out / 'esp-test.json').read_text())
+    shutil.copyfile(out / 'esp-test.img', out / 'esp-13g.img')
+    write_at(out / 'esp-13g.img', 8 * MiB, b'the 13 GiB ADT')
+    common.write_json(out / 'esp-13g.json', {**rec, 'image': 'esp-13g.img', 'sha256': common.sha(out / 'esp-13g.img'),
+                                             'ram_window': 0x33fe00000})
+    installed = snapshot(root, window, old)
+    log = run('--dry-run', 'map', 'backup', 'esp-final', 'boot-a', 'check', *new_boot, *big)
+    check('would stop a real run' in log and 'that pair never boots' in log, 'dry run, ESP before boot_a: reported as a stop')
+    log = run('--dry-run', 'map', 'backup', 'boot-a', 'esp-final', 'check', *new_boot, *big)
+    check('would stop a real run' not in log, 'dry run, boot_a before the ESP: clean')
+    log = run('map', 'backup', 'esp-final', 'check', *old_boot, *big, '--new-backup', expect=3)
+    check('that pair never boots' in log and snapshot(root, window, old)['esp-region'] == installed['esp-region'],
+          'esp-final refuses a 13 GiB ESP while boot_a\'s DarwinBoot takes 8 GiB; the ESP region is untouched')
+    run('map', 'boot-a', 'esp-final', 'check', *new_boot, *big)
+    lun0, lun4 = root / 'lun0.img', root / 'lun4.img'
+    check(sha_region(lun4, LUN4['boot_a'][1], LUN4['boot_a'][2]) == common.sha(image5) and
+          sha_region(lun0, common.ESP_FIRST * B, common.ESP_BLOCKS * B) == common.sha(out / 'esp-13g.img'),
+          'boot-a then esp-final: boot_a = the series 5 image, the ESP = the 13 GiB one')
+    log = run('rollback', 'boot-a', *new_boot, *big, expect=3)
+    check('that pair never boots' in log and sha_region(lun4, LUN4['boot_a'][1], LUN4['boot_a'][2]) == common.sha(image5),
+          'rollback boot-a refuses the 8 GiB FD while the 13 GiB ESP is on the tablet; boot_a untouched')
+    log = run('map', 'boot-a', *old_boot, *small, expect=3)
+    check('that pair never boots' in log, 'boot-a refuses to write the 8 GiB FD under the 13 GiB ESP')
+    run('rollback', 'esp-final', 'boot-a', *new_boot, *big)
+    after = snapshot(root, window, old)
+    check(after['boot_a'] == installed['boot_a'] and after['esp-region'] == installed['esp-region'],
+          'rollback esp-final, then boot-a: both as installed (the new backup set\'s copies)')
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--fake-shell', nargs=2)
@@ -434,6 +498,8 @@ def main():
     try:
         test_tablet_sh(tmp)
         test_session(tmp)
+        (tmp / 'pair').mkdir()
+        test_pair_rule(tmp / 'pair')
     finally:
         if not a.keep:
             shutil.rmtree(tmp, ignore_errors=True)

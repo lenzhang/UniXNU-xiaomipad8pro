@@ -42,16 +42,18 @@ BOOT_A_START_512, BOOT_A_SIZE_512 = 618800, 196608   # /sys/class/block/<boot_a>
 
 
 # XNU's RAM window (/chosen darwinboot-memory-size, configs/k27-adt.toml owned_memory_size): DarwinBoot before
-# firmware/patches/darwinboot/0001 refuses an ADT asking for more than this (EFI_COMPROMISED_DATA: no boot).
+# firmware/patches/darwinboot/0001 refuses an ADT asking for more than this (EFI_COMPROMISED_DATA: no boot); with it, up to
+# DARWIN_WINDOW_MAX (tooling/adt/check-ram-window.py).
 OLD_DARWINBOOT_WINDOW_MAX = 0x200000000
+DARWIN_WINDOW_MAX = 0x340000000
 
 
 def adt_ram_window(path):
-    """The ADT's /chosen darwinboot-memory-size (bytes), or None without one (DarwinBoot then takes 256 MiB)."""
+    """The ADT's /chosen darwinboot-memory-size (bytes), or None without one (DarwinBoot then takes 256 MiB). PATH or the bytes."""
     spec = importlib.util.spec_from_file_location('adt_dump', DEVICE / 'tooling/adt/adt-dump.py')
     adt = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(adt)
-    (_, children), _ = adt.parse(Path(path).read_bytes())
+    (_, children), _ = adt.parse(path if isinstance(path, (bytes, bytearray)) else Path(path).read_bytes())
     for props, _ in children:
         named = dict(props)
         if named.get('name', b'').rstrip(b'\0') == b'chosen' and len(named.get('darwinboot-memory-size', b'')) == 8:
@@ -66,6 +68,21 @@ def fd_ram_window(fd):
     if stamp.is_file():
         fields = stamp.read_text().split()
         if len(fields) == 2 and fields[0] == sha(fd):
+            return int(fields[1], 0)
+    return OLD_DARWINBOOT_WINDOW_MAX
+
+
+def boot_fd_bound(record):
+    """The DarwinBoot window bound of the FD in a build-boot.py record (boot.json, boot-vN.json): its fd.ram_window (series 5 on),
+    else the .ram-window stamp beside the recorded FD when the stamp names the recorded sha256, else the bound without
+    firmware/patches/darwinboot/0001 (the installed v4 of 2026-11-11: 8 GiB)."""
+    fd = record.get('fd') or {}
+    if fd.get('ram_window'):
+        return int(fd['ram_window'])
+    if fd.get('path'):
+        stamp = Path(fd['path'] + '.ram-window')
+        fields = stamp.read_text().split() if stamp.is_file() else []
+        if len(fields) == 2 and fields[0] == fd.get('sha256'):
             return int(fields[1], 0)
     return OLD_DARWINBOOT_WINDOW_MAX
 

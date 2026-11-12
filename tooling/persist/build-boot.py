@@ -11,10 +11,21 @@ UFS ESP. Nothing here touches a device; signing is tooling/persist/sign.sh (the 
                                       Signed, it is the fallback for boot_a if ABL refuses the v4 container.
 The kernel field is build-ram-images.py's (kernel_field: UniXNU's BootShim with a Linux Image header + FD + the boot DTB).
 
-  build-boot.py [--fd out/fd/piano-uefi-A-bundled.fd] [--dtb out/inputs/piano-boot.dtb] [--out out/persistent]
-  build-boot.py --verify [--out out/persistent]     after signing: check the -signed images and assemble macos-set/
+Series (--series N, default 4) number the boot_a images by the FD they carry, not by their container (always boot v4). 4 is the
+image installed on 2026-11-11 (record boot.json, both images above). From 5: only boot-piano-macos-persistent-vN.img (ABL took
+the v4 container in session 2 and boots it since), record boot-vN.json and kernel-field-vN.bin beside the older ones, so one
+install directory keeps every series' record (maint-session.py reads boot.json and every boot-v*.json). From 5 the FD must carry
+both stamps of tooling/firmware/build-fd.sh, and the record keeps its DarwinBoot window bound (fd.ram_window), with which
+maint-session.py keeps the pair on the tablet bootable: an ESP whose ADT asks for more than boot_a's DarwinBoot takes never boots.
+Series 5 = the FD with firmware/patches/darwinboot/0001 (XNU's RAM window up to 13 GiB, docs/persistent-boot.md section 12).
+
+  build-boot.py [--series N] [--fd out/fd/piano-uefi-A-bundled.fd] [--dtb out/inputs/piano-boot.dtb] [--out out/persistent]
+                [--same-kernel-as RECORD]   RECORD: a build-ram-images.py record (build-<fd>.json) whose RAM images ran on the
+                                            tablet: the kernel field must be theirs byte for byte (the same shim, FD and DTB)
+  build-boot.py --verify [--series N] [--out out/persistent]     after signing: check the -signed images, assemble macos-set*/
 """
 import argparse
+import json
 import shutil
 import struct
 import subprocess
@@ -41,6 +52,14 @@ def check(ok, what):
         failures.append(what)
 
 
+def series(n):
+    """Series N's names: boot_a image, v2 test twin (None from 5), record, kernel field file, {image: macos-set directory}."""
+    if n == 4:
+        return V4_NAME, V2_NAME, 'boot.json', 'kernel-field.bin', {V4_NAME: 'macos-set', V2_NAME: 'macos-set-v2'}
+    name = f'boot-piano-macos-persistent-v{n}'
+    return name, None, f'boot-v{n}.json', f'kernel-field-v{n}.bin', {name: f'macos-set-v{n}'}
+
+
 def v4_sections(data):
     magic, kernel, ramdisk, os_version, header = struct.unpack_from('<8sIIII', data, 0)
     version = struct.unpack_from('<I', data, 40)[0]
@@ -64,25 +83,50 @@ def v2_sections(data):
             'kernel': kernel, 'ramdisk': ramdisk, 'dtb': dtb}
 
 
+def fd_stamps(fd):
+    """Both stamps of tooling/firmware/build-fd.sh for this FD's SHA-256 (series 5 on), else SystemExit."""
+    digest, stamps = common.sha(fd), {}
+    for stamp in ('ram-payload-first', 'ram-window'):
+        path = Path(str(fd) + '.' + stamp)
+        fields = path.read_text().split() if path.is_file() else []
+        if not fields or fields[0] != digest:
+            raise SystemExit(f'{fd}: no {path.name} stamp for this FD (sha256 {digest[:16]}): tooling/firmware/build-fd.sh builds the FD '
+                             'with firmware/patches/unixnu/0001 and darwinboot/0001 and stamps it')
+        stamps[stamp] = fields
+    return stamps
+
+
 def build(a):
+    name, twin, record_name, field_name, _ = series(a.series)
+    stamps = fd_stamps(a.fd) if a.series >= 5 else {}
     ram = common.ram_images()
     if common.sha(ram.MKBOOTIMG) != ram.MKBOOTIMG_SHA256:
         raise SystemExit(f'{ram.MKBOOTIMG} is not the pinned mkbootimg.py')
     a.out.mkdir(parents=True, exist_ok=True)
     dtb = a.dtb.read_bytes()
+    v2 = None
     with tempfile.TemporaryDirectory(prefix='piano-boot-') as scratch:
         work = Path(scratch)
         kernel, info = ram.kernel_field(a.fd, a.dtb, work, 'persistent')
         field = kernel.read_bytes()
-        shutil.copyfile(kernel, a.out / 'kernel-field.bin')
-        v4 = a.out / f'{V4_NAME}.img'
+        shutil.copyfile(kernel, a.out / field_name)
+        v4 = a.out / f'{name}.img'
         subprocess.run(['python3', str(ram.MKBOOTIMG), *V4, '--kernel', str(kernel), '--output', str(v4)], check=True)
-        zero = work / 'zero.ramdisk'
-        zero.write_bytes(bytes(4096))
-        v2 = a.out / f'{V2_NAME}.img'
-        subprocess.run(['python3', str(ram.MKBOOTIMG), *ram.V2, '--kernel', str(kernel), '--ramdisk', str(zero), '--dtb', str(a.dtb),
-                        '--output', str(v2)], check=True)
+        if twin:
+            zero = work / 'zero.ramdisk'
+            zero.write_bytes(bytes(4096))
+            v2 = a.out / f'{twin}.img'
+            subprocess.run(['python3', str(ram.MKBOOTIMG), *ram.V2, '--kernel', str(kernel), '--ramdisk', str(zero), '--dtb', str(a.dtb),
+                            '--output', str(v2)], check=True)
     print(f'kernel field {len(field)} bytes sha256 {info["kernel_sha256"]} (shim {info["shim_bytes"]} + FD + DTB)')
+    same = None
+    if a.same_kernel_as:
+        ref = json.loads(a.same_kernel_as.read_text())
+        kernels = {r.get('kernel_sha256') for r in ref.get('images', {}).values() if isinstance(r, dict)} - {None}
+        check(ref.get('fd', {}).get('sha256') == common.sha(a.fd), f'{a.same_kernel_as.name}: its RAM images carry this FD')
+        check(kernels == {info['kernel_sha256']}, f'kernel field = the one of the RAM images of {a.same_kernel_as.parent.name}/'
+              f'{a.same_kernel_as.name} ({", ".join(k[:16] for k in sorted(kernels))})')
+        same = {'record': str(a.same_kernel_as.resolve()), 'kernel_sha256': sorted(kernels)}
     h = v4_sections(v4.read_bytes())
     print(f'== {v4.name}')
     check(h['magic'] == b'ANDROID!' and h['header_version'] == 4 and h['header_size'] == 1584, 'boot v4 header, header_size 1584')
@@ -90,20 +134,25 @@ def build(a):
           'kernel = the kernel field, no ramdisk, no boot signature, empty command line')
     check(h['os_version'] == UBUNTU_OS_VERSION, f'os_version/patch level {h["os_version"]:#x} = the installed Ubuntu boot_a\'s')
     check(v4.stat().st_size <= common.BOOT_PARTITION_BYTES - (1 << 20), 'fits boot_a with the signing helper\'s 1 MiB footer margin')
-    s = v2_sections(v2.read_bytes())
-    ref = v2_sections(Path(a.reference).read_bytes())
-    print(f'== {v2.name}')
-    check(s['magic'] == b'ANDROID!' and s['header_version'] == 2 and s['page_size'] == 4096, 'boot v2 header, page 4096')
-    check((s['kernel_addr'], s['ramdisk_addr'], s['tags_addr']) == (ref['kernel_addr'], ref['ramdisk_addr'], ref['tags_addr']),
-          'load addresses = the Ubuntu RAM set\'s (boot-ram-maintenance.img)')
-    check(s['kernel'] == field and s['ramdisk'] == bytes(4096) and s['dtb'] == dtb, 'kernel field, 4096 zero bytes of ramdisk, the boot DTB')
-    record = {'status': 'OFFLINE_BUILD_NOT_DEVICE_TESTED', 'fd': {'path': str(a.fd.resolve()), 'sha256': common.sha(a.fd)},
-              'dtb_sha256': common.sha(a.dtb), 'kernel_field': {**info, 'file': 'kernel-field.bin'},
+    if v2:
+        s = v2_sections(v2.read_bytes())
+        ref = v2_sections(Path(a.reference).read_bytes())
+        print(f'== {v2.name}')
+        check(s['magic'] == b'ANDROID!' and s['header_version'] == 2 and s['page_size'] == 4096, 'boot v2 header, page 4096')
+        check((s['kernel_addr'], s['ramdisk_addr'], s['tags_addr']) == (ref['kernel_addr'], ref['ramdisk_addr'], ref['tags_addr']),
+              'load addresses = the Ubuntu RAM set\'s (boot-ram-maintenance.img)')
+        check(s['kernel'] == field and s['ramdisk'] == bytes(4096) and s['dtb'] == dtb, 'kernel field, 4096 zero bytes of ramdisk, the boot DTB')
+    fd = {'path': str(a.fd.resolve()), 'sha256': common.sha(a.fd)}
+    if stamps:
+        fd.update(ram_payload_first=True, ram_window=int(stamps['ram-window'][1], 0))
+        print(f'FD {fd["sha256"]}: RAM payload first, DarwinBoot window bound {fd["ram_window"]:#x} ({fd["ram_window"] >> 20} MiB)')
+    record = {'status': 'OFFLINE_BUILD_NOT_DEVICE_TESTED', 'series': a.series, 'fd': fd,
+              'dtb_sha256': common.sha(a.dtb), 'kernel_field': {**info, 'file': field_name, 'same_as': same},
               'mkbootimg_sha256': ram.MKBOOTIMG_SHA256,
-              'images': {p.name: {'bytes': p.stat().st_size, 'sha256': common.sha(p)} for p in (v4, v2)}}
-    common.write_json(a.out / 'boot.json', record)
-    for name, r in record['images'].items():
-        print(f'{name}: {r["bytes"]} bytes sha256 {r["sha256"]}')
+              'images': {p.name: {'bytes': p.stat().st_size, 'sha256': common.sha(p)} for p in (v4, v2) if p}}
+    common.write_json(a.out / record_name, record)
+    for image, r in record['images'].items():
+        print(f'{image}: {r["bytes"]} bytes sha256 {r["sha256"]}')
 
 
 def avb(*args):
@@ -111,21 +160,23 @@ def avb(*args):
 
 
 def verify(a):
-    import json
     if common.sha(AVBTOOL) != AVBTOOL_SHA256:
         raise SystemExit(f'{AVBTOOL} is not the pinned avbtool 1.3.0')
     profile = json.loads(PROFILE.read_text())['boot']
     pubkey = common.DEVICE / 'out/keys/piano-boot-signing.pub.pem' if not a.pubkey else a.pubkey
-    record = json.loads((a.out / 'boot.json').read_text())
+    main_name, twin, record_name, _, sets = series(a.series)
+    record = json.loads((a.out / record_name).read_text())
     signed = {}
-    for name in (V4_NAME, V2_NAME):
+    for name in [n for n in (main_name, twin) if n]:
         unsigned, image = a.out / f'{name}.img', a.out / f'{name}-signed.img'
         if not image.is_file():
             print(f'== {image.name}: not signed yet (tooling/persist/sign.sh)')
             continue
         data = image.read_bytes()
+        before = len(failures)
         print(f'== {image.name}  {len(data)} bytes  sha256 {common.sha(image)}')
         check(len(data) == common.BOOT_PARTITION_BYTES, 'exactly the boot partition (100663296 bytes)')
+        check(common.sha(unsigned) == record['images'][unsigned.name]['sha256'], f'{unsigned.name} is the one {record_name} recorded')
         check(data.startswith(unsigned.read_bytes()), f'starts with {unsigned.name} byte for byte')
         info = avb('info_image', '--image', str(image))
         text = info.stdout
@@ -141,11 +192,13 @@ def verify(a):
             v = avb('verify_image', '--image', str(Path(tmp) / 'boot.img'), '--key', str(pubkey))
         print('    ' + (v.stdout + v.stderr).strip().replace('\n', '\n    '))
         check(v.returncode == 0, f'avbtool verify_image with {pubkey.name}')
-        signed[image.name] = {'bytes': len(data), 'sha256': common.sha(image)}
+        # Only an image that passed every check is recorded as signed: maint-session.py's boot-a writes what "signed" names.
+        if len(failures) == before:
+            signed[image.name] = {'bytes': len(data), 'sha256': common.sha(image)}
     record['signed'] = signed
-    # macos-set/: piano-switch.py's image set (boot = the signed v4, init_boot and vendor_boot = slot A's current Ubuntu images).
-    if f'{V4_NAME}-signed.img' in signed and not failures:
-        for set_name, boot in (('macos-set', V4_NAME), ('macos-set-v2', V2_NAME)):
+    # macos-set*/: piano-switch.py's image set (boot = the signed image, init_boot and vendor_boot = slot A's current Ubuntu images).
+    if f'{main_name}-signed.img' in signed and not failures:
+        for boot, set_name in sets.items():
             if f'{boot}-signed.img' not in signed:
                 continue
             d = a.out / set_name
@@ -161,7 +214,7 @@ def verify(a):
             (d / 'SHA256SUMS').write_text(''.join(f'{common.sha(d / n)}  {n}\n' for n in ('boot.img', 'init_boot.img', 'vendor_boot.img')))
             record[set_name] = (d / 'SHA256SUMS').read_text()
             print(f'{set_name}/:\n' + record[set_name])
-    common.write_json(a.out / 'boot.json', record)
+    common.write_json(a.out / record_name, record)
     print(f'\n{"PASS" if not failures else "FAIL"}: {len(failures)} failure(s)')
     sys.exit(1 if failures else 0)
 
@@ -172,9 +225,14 @@ def main():
     p.add_argument('--dtb', type=Path, default=common.DEVICE / 'out/inputs/piano-boot.dtb')
     p.add_argument('--reference', type=Path, default=common.DEVICE / 'out/inputs/ubuntu-boot-ram-maintenance.img')
     p.add_argument('--out', type=Path, default=common.DEVICE / 'out/persistent')
-    p.add_argument('--verify', action='store_true', help='check the signed images and assemble macos-set/')
+    p.add_argument('--series', type=int, default=4, help='4: the image installed on 2026-11-11 (boot.json); 5 and later: '
+                   'boot-piano-macos-persistent-vN.img and boot-vN.json from an FD with both build-fd.sh stamps')
+    p.add_argument('--same-kernel-as', type=Path, help='a build-ram-images.py record whose RAM images ran on the tablet')
+    p.add_argument('--verify', action='store_true', help='check the signed images and assemble macos-set*/')
     p.add_argument('--pubkey', type=Path)
     a = p.parse_args()
+    if a.series < 4:
+        p.error('--series starts at 4')
     if a.verify:
         verify(a)
     build(a)
