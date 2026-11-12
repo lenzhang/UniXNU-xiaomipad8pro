@@ -536,9 +536,12 @@ so the defects are in what the GPU drew. What was seen:
 Two kinds of boot, then. In a boot that shows the login window as first drawn (073745, 091642), the materials are flat boxes and the
 avatar is round. After the three sleeps and wakes of 074855, which drew the window again, the boxes were gone, so the materials
 rendered live, and the glass shapes came out as polygons. The field's white fill has the pointed end in all three: in the boxed
-boots its middle is hidden by the column's and the message's boxes, which leaves the slanted strip. So 3 looks like the first
-render's state of the materials, kept because nothing redraws a still login window. 1 is in the glass shapes whenever they render.
-The same binaries gave both kinds, so this is a race or a coherence problem, not a shader translation error. The VM drew the same
+boots its middle is hidden by the column's and the message's boxes, which leaves the slanted strip. So 3 looks like a state
+the materials take when the window is first drawn and keep until a wake rebuilds them. 1 is in the glass shapes whenever they render.
+A fourth sample, the Mac's webcam on run `20261112-093853` (`desk-diag`, 09:43, no sleep): boxes, a round avatar, and the clock keeps
+changing inside its box every minute, so whatever the box is, it is drawn again with the clock, not merely left over. The run
+`20261112-092748` (09:34, the lock state without the password prompt) showed no boxes. The same binaries gave both kinds, so this is
+a race or a coherence problem, not a shader translation error. The VM drew the same
 glass login with this plugin and Mesa round, at 1280x800 (the VM-era screenshot `vma2-login.png`, 2026-11-10).
 
 ### How the login window's renderers use the device (host trace)
@@ -590,8 +593,8 @@ DYLD_INSERT_LIBRARIES=$O/hostsim/libhostiokit.dylib HOSTSIM_GPU=a830 HOSTSIM_PAG
    line holds pixels of both, and `SINGLE_PRIM_MODE` flushes only for a pixel that overlaps. (b) Guard-band clipping of a quad far
    larger than the panel. At 3200 wide the guard band is ±19.5 viewports, and the two triangles are clipped apart. 0007 cannot help
    within one draw; the `ubwc` image tests (a).
-3. **The opaque panels.** Inference: the window as first drawn has the materials in a fallback, and nothing redraws a still login
-   window until a wake does (the photos above). Two candidates for the fallback. (a) The materials read the framebuffer behind them
+3. **The opaque panels.** Inference: the window as first drawn has the materials in a fallback, which they keep (redrawn with the
+   clock every minute) until a wake rebuilds them (the photos above). Two candidates for the fallback. (a) The materials read the framebuffer behind them
    (backdrop, vibrancy) and composite over stale or cleared pixels: 0007 again. (b) A first-use state of a cold boot: every boot of
    these images starts with empty shader caches, and the backdrop's source (the wallpaper video) never has a picture. The images below
    take one test sleep to see the window drawn first and again, in one boot. Reduce transparency is not the cause: the A830 seeds do not stage it (no `com.apple.universalaccess`
