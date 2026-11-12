@@ -47,7 +47,10 @@
 // which is level 6's doorway), piano-wifi-shadow=1 (the shadow register list in that configuration),
 // piano-wifi-wmitimeout=MS (the deadline of each level 6 step, default 10000), piano-wifi-scanwait=MS (how long the scan itself
 // may take, default 12000), piano-wifi-band=N (1 both bands, 0 only 2.4 GHz), piano-wifi-bssid=1 (print a network's whole
-// address in the log instead of its first three bytes). Without piano-wifi the driver declines in probe() and maps nothing.
+// address in the log instead of its first three bytes), piano-wifi-noc=0 (no PCIe NoC vote), and level 4's four switches of the
+// 2026-11-12 fourth round (WifiPbl.h, docs §10.23), each the A/B of a default: piano-wifi-socreset=0 (no chip power-on reset before
+// BHI), piano-wifi-msi=0 (MSI left off), piano-wifi-ctxearly=1 (the MHI context registers before the doorbell too),
+// piano-wifi-ras=0 (no TLP counters). Without piano-wifi the driver declines in probe() and maps nothing.
 //
 // Power (package/include/PianoPowerContract.h): the radio is off unless piano-wifi>=2, since nothing below that level votes a
 // rail or releases PERST#. From level 2 on the driver joins the power tree, and its only power state change is to stop the
@@ -72,6 +75,7 @@
 #include "WifiFirmware.h"
 #include "WifiLink.h"
 #include "WifiMhi.h"
+#include "WifiPbl.h"
 #include "WifiSmmuWindow.h"
 #include "WifiSurvey.h"
 #include "WifiWlfw.h"
@@ -92,7 +96,7 @@ struct Args {
   uint32_t gen, physeq, rcg, blind, release, stop, dmaMib, fwTimeoutMs;
   uint32_t iova, mode, shadow, qmiTimeoutMs;
   uint32_t wmiTimeoutMs, scanWaitMs, band, bssid;
-  uint32_t noc, socreset;
+  uint32_t noc, socreset, msi, ctxearly, ras;
 };
 Args gArgs;
 
@@ -144,8 +148,17 @@ void readArgs()
   gArgs.bssid = bootArg("piano-wifi-bssid", 0);
   // piano-wifi-noc=0: no vote for the PCIe NoC's bus clock manager (SN4) before level 3's clocks (the A/B test of docs §10.21)
   gArgs.noc = bootArg("piano-wifi-noc", 1);
-  // piano-wifi-socreset=1: the chip-side reset this chip's own host runs before MHI (WifiHw.h), at level 4 before BHI
-  gArgs.socreset = bootArg("piano-wifi-socreset", 0);
+  // The fourth round's alignments with the chip's own host (docs §10.23, WifiPbl.h), each on by default and each with its A/B:
+  // piano-wifi-socreset=0: no chip-side power-on reset before BHI (the whole recipe of ath12k's power-up, the BHIe vector words and
+  //   the MHI host's receive-vector clear included);
+  gArgs.socreset = bootArg("piano-wifi-socreset", 1);
+  // piano-wifi-msi=0: the endpoint's MSI left off (by default one vector into a sink page of the DMA window, as the host boots it);
+  gArgs.msi = bootArg("piano-wifi-msi", 1);
+  // piano-wifi-ctxearly=1: the MHI context registers written before the doorbell as well (the 2026-11-12 boots did; the MHI host
+  //   writes them only once the device reports READY, which level 4 does in any case);
+  gArgs.ctxearly = bootArg("piano-wifi-ctxearly", 0);
+  // piano-wifi-ras=0: no TLP counters on the two ends of the link (diagnostic only)
+  gArgs.ras = bootArg("piano-wifi-ras", 1);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -890,6 +903,8 @@ void reportLink(const LinkState &l)
        (l.sidCfg & kParfBdfToSidBypass) ? "bypass" : "table");
   note("root port: id %08x buses %08x command %08x pcie cap %#x link ctl2 %08x; PERST# low %u ms", l.rootId, l.busNumbers,
        l.rootCommand, l.expCap, l.linkCtl2, l.perstLowMs);
+  note("root port: windows as found: I/O %04x upper %08x, prefetchable %08x upper %08x:%08x; closed: I/O %04x, prefetchable %08x",
+       l.ioBefore, l.ioUpperBefore, l.prefBefore, l.prefBaseHiBefore, l.prefLimitHiBefore, l.io, l.pref);
   note("link: debug0 %08x (LTSSM %#x %s) debug1 %08x (%s) status %08x (Gen%u x%u) after %u ms", l.debug0, l.debug0 & kLtssmMask,
        ltssmName(l.debug0), l.debug1, (l.debug1 & kPortDebug1LinkUp) ? "up" : "down", l.linkStatus, (l.linkStatus >> 16) & 0xfu,
        (l.linkStatus >> 20) & 0x3fu, l.linkMs);
@@ -1197,28 +1212,169 @@ void noteSnap(const char *when, uint64_t ms, const MhiSnap &s)
        (s.status & kMhiStatusSysErr) ? ", SYSERR" : "", s.ee, s.bhi, s.err, s.bhie);
 }
 
-// piano-wifi-socreset=1: the chip-side reset this chip's own host runs before MHI (WifiHw.h). chipRead/chipWrite write the window
-// register before every access, so the window the global reset clears needs nothing restored here.
-void chipSocReset(const MhiBoot &b)
+// The chip's power-on reset before BHI (WifiPbl.h chipPowerOnReset: ath12k's whole power-up recipe), then the MHI host's clear of
+// the receive vector block. chipRead/chipWrite write the window register before every access, so the window the global reset
+// clears needs nothing restored here.
+void chipPowerOn(MhiBoot &b)
 {
-  chipWrite(kChipPcieIntAllClear, 0xffffffffu);
-  const uint32_t warm = chipRead(kChipWlaonWarmSwEntry);
-  chipWrite(kChipWlaonWarmSwEntry, 0);
-  const uint32_t warmAfter = chipRead(kChipWlaonWarmSwEntry), cause = chipRead(kChipWlaonResetCause);
-  const uint32_t before = barRd(nullptr, kChipSocGlobalReset);
-  barWr(nullptr, kChipSocGlobalReset, before | kChipSocGlobalResetBit);
-  (void)barRd(nullptr, kChipSocGlobalReset);
-  IOSleep(kChipSocResetMs);
-  barWr(nullptr, kChipSocGlobalReset, before & ~kChipSocGlobalResetBit);
-  (void)barRd(nullptr, kChipSocGlobalReset);
-  IOSleep(kChipSocResetMs);
-  const uint32_t after = barRd(nullptr, kChipSocGlobalReset);
-  barWr(nullptr, kMhiCtrl, kMhiCtrlReset);
-  IOSleep(kChipSocResetMs);
-  note("level 4: chip-side reset (piano-wifi-socreset=1): interrupts cleared, warm entry %08x -> %08x, reset cause %08x, global "
-       "reset %08x -> %08x%s, MHICTRL reset; now MHISTATUS %08x, EE %08x, BHI status %08x",
-       warm, warmAfter, cause, before, after, after == 0xffffffffu ? " (the link went down)" : "", barRd(nullptr, kMhiStatus),
-       barRd(nullptr, b.bhi + kBhiExecEnv), barRd(nullptr, b.bhi + kBhiStatus));
+  ChipReset r;
+  chipPowerOnReset(gChipIo, [](unsigned ms) { IOSleep(ms); }, b.bhi, r);
+  const unsigned rx = mhiClearRxVectors(b);
+  note("level 4: chip power-on reset: chip LTSSM %08x -> %08x (%u writes), GCC hot reset %08x -> %08x, interrupts cleared, QFPROM "
+       "power %08x -> %08x (VDD4BLOW %s), BHIe vector words cleared, Q6 cookie %08x",
+       r.ltssmBefore, r.ltssm, r.ltssmWrites, r.hotResetBefore, r.hotReset, r.qfpromBefore, r.qfprom,
+       (r.qfpromBefore & kChipQfpromVdd4Blow) ? (r.qfprom & kChipQfpromVdd4Blow ? "was on, still on" : "was on, now off")
+                                              : "was off",
+       r.cookie);
+  note("level 4: chip power-on reset: warm entry %08x -> %08x, reset cause %08x, global reset %08x -> %08x%s, MHISTATUS %08x -> "
+       "%08x after MHICTRL's reset, EE %08x; %u receive vector words cleared",
+       r.warm, r.warmAfter, r.cause, r.globalBefore, r.globalAfter, r.linkLost ? " (the link went down)" : "", r.mhiStatusBefore,
+       r.mhiStatusAfter, r.ee, rx);
+}
+
+// What the boot loader reports it read from the chip's fuses (WifiPbl.h bhiIdentity): counts and a digest, never the values.
+void noteIdentity(const char *when, const MhiBoot &b)
+{
+  if (b.bhi + kBhiOemPkHash + 4 * kBhiOemPkHashWords > b.reglen) return;
+  const BhiIdentity id = bhiIdentity([](uint32_t off) { return barRd(nullptr, off); }, b.bhi);
+  note("level 4: BHI identity %s: MSM hardware ID %u of %u words non-zero, OEM public key hash %u of %u non-zero (%u all ones), "
+       "digest %08x",
+       when, id.hwIdNonZero, kBhiMsmHwIdWords, id.pkHashNonZero, kBhiOemPkHashWords, id.pkHashAllOnes, id.digest);
+}
+
+// ---- the fourth round's diagnostics (docs §10.23): the MSI sink, the TLP counters of both ends, the image as the chip reads it ----
+// The sink: one page of the DMA window, filled with a pattern; the endpoint's MSI points at it (one vector, data kMsiSinkData),
+// so any word that changed is a write the chip made into the window.
+constexpr uint32_t kMsiSinkFill = 0xa5a5a5a5u;
+constexpr uint16_t kMsiSinkData = 0x4d53;
+uint8_t *gMsiSinkVa;
+uint64_t gMsiSinkBus;
+MsiSetup gMsi;
+RasDes gRasRoot, gRasEndpoint;
+
+uint32_t cfgRd(uint32_t off) { return hwRead(nullptr, kWinCfg, off); }
+void msiWr(uint32_t off, uint32_t v) { hwWrite(nullptr, kWinCfg, off, v, "endpoint MSI capability / command"); }
+void cfgWr(uint32_t off, uint32_t v) { hwWrite(nullptr, kWinCfg, off, v, "endpoint TLP counter control"); }
+uint32_t dbiRd(uint32_t off) { return hwRead(nullptr, kWinDbi, off); }
+void dbiWr(uint32_t off, uint32_t v) { hwWrite(nullptr, kWinDbi, off, v, "root port TLP counter control"); }
+
+void msiSink(const LinkState &link)
+{
+  uint64_t bus = 0;
+  uint8_t *va = arenaAlloc(gArena, 4096, &bus);
+  if (!va) {
+    note("level 4: msi: no room for the sink page");
+    return;
+  }
+  for (uint32_t i = 0; i < 4096; i += 4) *reinterpret_cast<volatile uint32_t *>(va + i) = kMsiSinkFill;
+  dsb();
+  gMsiSinkVa = va;
+  gMsiSinkBus = bus;
+  const bool on = msiEnable(gMsi, cfgRd, msiWr, link.endpointMsiCap, bus, kMsiSinkData);
+  note("level 4: msi: cap %#x control %04x -> %04x (%s addresses), address %08x:%08x data %04x, command %08x: %s%s",
+       gMsi.cap, gMsi.ctlBefore, gMsi.ctl, gMsi.is64 ? "64-bit" : "32-bit", gMsi.addressHi, gMsi.addressLo, gMsi.data, gMsi.command,
+       on ? "one vector into the sink at " : "not enabled: ", on ? "" : gMsi.why);
+  if (on) note("level 4: msi: the sink is at bus %#llx", (unsigned long long)bus);
+}
+
+// What the chip wrote into the sink: the first changed words (an MSI write is one word, the data in its low half).
+void msiSinkReport(const char *when)
+{
+  if (!gMsiSinkVa) return;
+  unsigned changed = 0, first = ~0u;
+  uint32_t firstValue = 0;
+  for (uint32_t i = 0; i < 4096; i += 4) {
+    const uint32_t v = *reinterpret_cast<volatile uint32_t *>(gMsiSinkVa + i);
+    if (v == kMsiSinkFill) continue;
+    if (!changed++) {
+      first = i;
+      firstValue = v;
+    }
+  }
+  if (!changed)
+    note("dma: msi sink %s: untouched (no write from the chip reached the window%s)", when,
+         gMsi.enabled ? "" : "; MSI was not enabled");
+  else
+    note("dma: msi sink %s: %u word(s) changed, the first at +%#x = %08x (%s): the chip's writes reach the window", when, changed,
+         first, firstValue, (firstValue & 0xffffu) == kMsiSinkData ? "an MSI" : "not the MSI data");
+}
+
+void rasArm()
+{
+  if (!gArgs.ras) return;
+  gRasRoot.at = rasDesFind(dbiRd);
+  gRasEndpoint.at = rasDesFind(cfgRd);
+  rasDesArm(gRasRoot, dbiRd, dbiWr);
+  rasDesArm(gRasEndpoint, cfgRd, cfgWr);
+  note("level 4: TLP counters: root port %s%#x (%u of %u on), endpoint %s%#x (%u of %u on)", gRasRoot.at ? "at " : "none ",
+       gRasRoot.at, __builtin_popcount(gRasRoot.on), kRasEventCount, gRasEndpoint.at ? "at " : "none ", gRasEndpoint.at,
+       __builtin_popcount(gRasEndpoint.on), kRasEventCount);
+}
+
+void rasLine(const char *who, const RasDes &r)
+{
+  if (!r.at) return;
+  char line[300];
+  size_t n = 0;
+  for (unsigned i = 0; i < kRasEventCount && n + 24 < sizeof line; ++i)
+    n += size_t(((r.on >> i) & 1u) ? snprintf(line + n, sizeof line - n, " %s %u", kRasEvents[i].name, r.delta[i])
+                                   : snprintf(line + n, sizeof line - n, " %s -", kRasEvents[i].name));
+  note("dma: TLPs since the doorbell, %s:%s", who, line);
+}
+
+void rasReport()
+{
+  if (!gArgs.ras) return;
+  rasDesRead(gRasRoot, dbiRd, dbiWr);
+  rasDesRead(gRasEndpoint, cfgRd, cfgWr);
+  rasLine("root port", gRasRoot);
+  rasLine("endpoint", gRasEndpoint);
+  if (!gRasRoot.at) return;
+  // The reading (§8.4): reads from the chip, and what went back. A 512 KiB image is about a thousand reads of 512 bytes.
+  const uint32_t reads = rasDelta(gRasRoot, 7, 0x0c), data = rasDelta(gRasRoot, 7, 0x07), bare = rasDelta(gRasRoot, 7, 0x06);
+  if (!rasOn(gRasRoot, 7, 0x0c)) return;
+  if (!reads)
+    note("dma: the root port received no read request from the chip: the boot loader refused before it fetched anything");
+  else
+    note("dma: the chip asked for data %u time(s); the root port answered with %u completion(s) with data and %u without (%s)",
+         reads, data, bare, bare ? "errors: a read the SMMU or the NoC refused" : data ? "the reads were served" : "no answer");
+}
+
+// The image as the chip reads it: the boot loader's buffer and the file's parts in the window, read through its write-combined
+// mapping (DRAM), against the stock file's identity.
+struct ImageParts {
+  Span spans[1 + kMhiMaxSegments];
+  unsigned count = 0, fileFrom = 0;   // the file is spans[fileFrom .. count)
+  uint32_t bytes = 0;
+};
+ImageParts gImage;
+constexpr uint32_t kBounceBytes = 16384;
+
+void imageHash(const char *when, bool whole)
+{
+  if (!gImage.count) return;
+  uint8_t *bounce = static_cast<uint8_t *>(IOMallocData(kBounceBytes));
+  if (!bounce) return note("firmware: %s: no buffer to hash the image through", when);
+  auto copy = [](uint8_t *to, const uint8_t *from, uint32_t n) { memcpy(to, from, n); };
+  uint8_t sbl[32], file[32];
+  hashSpans(gImage.spans, 1, bounce, kBounceBytes, copy, sbl);
+  const bool sblStock = sha256Same(sbl, kAmssStockSblSha256);
+  if (!whole) {
+    IOFreeData(bounce, kBounceBytes);
+    note("firmware: %s: the boot loader in the window %s (sha256 %02x%02x%02x%02x...)", when,
+         sblStock ? "is still the stock file's first 512 KiB" : "is NOT the stock file's first 512 KiB", sbl[0], sbl[1], sbl[2],
+         sbl[3]);
+    return;
+  }
+  // The whole file: the boot loader's buffer is its first 512 KiB, the segments the rest (peach's split; WCN7850's layout would
+  // carry the whole file in the segments, and the line says so).
+  hashSpans(gImage.spans + gImage.fileFrom, gImage.count - gImage.fileFrom, bounce, kBounceBytes, copy, file);
+  IOFreeData(bounce, kBounceBytes);
+  const bool fileStock = gImage.bytes == kAmssStockBytes && sha256Same(file, kAmssStockSha256);
+  note("firmware: %s: boot loader sha256 %02x%02x%02x%02x... (%s), the file as the window holds it, %u bytes, sha256 "
+       "%02x%02x%02x%02x... (%s)",
+       when, sbl[0], sbl[1], sbl[2], sbl[3], sblStock ? "the stock file's first 512 KiB" : "NOT the stock boot loader", gImage.bytes,
+       file[0], file[1], file[2], file[3], fileStock ? "the stock amss20.bin Ubuntu runs" : "NOT the stock amss20.bin");
 }
 
 // After a failed level 4: where the chip's DMA went. The PCI status and AER words of both ends (a request the root complex
@@ -1307,6 +1463,10 @@ bool loadFirmware(FirmwarePlan &plan)
   if (!sbl) return note("firmware: the DMA window has no room for the boot loader"), false;
   if (piano_wifi_firmware_read(kAmssName, plan.layout.sblOffset, sbl, plan.layout.sblBytes))
     return note("firmware: the boot loader could not be read"), false;
+  // The parts as the chip will read them, for the identity check below and the one after a failure (§10.23): the boot loader's
+  // buffer, then the segments. With peach's split the file is the buffer and the segments; with one image it is the segments.
+  gImage = ImageParts{};
+  gImage.spans[gImage.count++] = Span{sbl, plan.layout.sblBytes};
   uint64_t addresses[kMhiMaxSegments] = {};
   for (uint32_t i = 0; i < plan.segments; ++i) {
     uint8_t *segment = arenaAlloc(gArena, kMhiSegBytes, &plan.segmentBus[i]);
@@ -1315,7 +1475,10 @@ bool loadFirmware(FirmwarePlan &plan)
     if (piano_wifi_firmware_read(kAmssName, plan.layout.imageOffset + done, segment, left < kMhiSegBytes ? left : kMhiSegBytes))
       return note("firmware: segment %u could not be read", i), false;
     addresses[i] = plan.segmentBus[i];
+    gImage.spans[gImage.count++] = Span{segment, left < kMhiSegBytes ? left : kMhiSegBytes};
   }
+  gImage.fileFrom = plan.layout.split ? 0 : 1;
+  gImage.bytes = plan.bytes;
   BhieEntry *table = reinterpret_cast<BhieEntry *>(arenaAlloc(gArena, 4096, &plan.tableBus));
   if (!table) return note("firmware: the DMA window has no room for the vector table"), false;
   plan.tableEntries = bhieTable(table, 4096 / sizeof(BhieEntry), addresses, plan.layout.imageBytes, kMhiSegBytes);
@@ -1323,6 +1486,7 @@ bool loadFirmware(FirmwarePlan &plan)
   dsb();
   note("firmware: in the window: boot loader at %#llx, %u segments, vector table at %#llx (%u entries)",
        (unsigned long long)plan.sblBus, plan.segments, (unsigned long long)plan.tableBus, plan.tableEntries);
+  imageHash("in the window", true);
   return true;
 }
 
@@ -1346,6 +1510,7 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
   const uint32_t version = chipRead(kChipTcsrSocHwVersion);
   note("level 4: BHI at %#x, BHIe at %#x, EE %s, state %#x; chip TCSR version %08x (major %u)", boot.bhi, boot.bhie,
        mhiEeName(mhiEeRead(boot)), mhiStateRead(boot), version, (version >> 8) & 0xfu);
+  noteIdentity("at the start", boot);
   FirmwarePlan plan;
   if (!loadFirmware(plan)) {
     piano_wifi_firmware_close();
@@ -1361,18 +1526,27 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
     safeOff(gHw, power, opt);
     return -12;
   }
-  if (gArgs.socreset) chipSocReset(boot);
+  // What the chip's own host does before the doorbell (WifiPbl.h, docs §10.23): its power-on reset of the chip, the receive
+  // vector block cleared, MSI enabled; the MHI context registers only once the device reports READY (the loop below does that in
+  // any case), unless piano-wifi-ctxearly=1 asks for the 2026-11-12 order.
+  if (gArgs.socreset) {
+    chipPowerOn(boot);
+    noteIdentity("after the chip's reset", boot);
+  }
+  if (gArgs.msi) msiSink(link);
   dsb();
-  mhiContextsProgram(contexts, gMhiIo, boot.reglen);
-  note("level 4: contexts at %#llx (channels %u, event rings %u: control at %#llx, data at %#llx, command ring at %#llx)",
+  if (gArgs.ctxearly) mhiContextsProgram(contexts, gMhiIo, boot.reglen);
+  note("level 4: contexts at %#llx (channels %u, event rings %u: control at %#llx, data at %#llx, command ring at %#llx), %s",
        (unsigned long long)contextBus, kMhiChannels, kMhiEventRings, (unsigned long long)contexts.eventBus[0],
-       (unsigned long long)contexts.eventBus[1], (unsigned long long)contexts.commandBus);
+       (unsigned long long)contexts.eventBus[1], (unsigned long long)contexts.commandBus,
+       gArgs.ctxearly ? "given to the device now and again at READY" : "given to the device at READY, as the MHI host does");
   // The image reaches the chip through the write-combined mapping only: everything written so far is pushed out before the doorbell
   // (the dsb above; barWr ends every register write with another).
   note("level 4: the image: %u bytes at bus %#llx (%s), aligned to %llu KiB; the vector table at %#llx", plan.layout.sblBytes,
        (unsigned long long)plan.sblBus, gArgs.iova ? "the 32-bit window, translated by the SMMU" : "physical, the stream bypasses",
        (unsigned long long)(arenaAlign(kMhiSblBytes) >> 10), (unsigned long long)plan.tableBus);
   dumpMhi("before the doorbell", boot);
+  rasArm();
   uint32_t phase = mhiBegin(boot, 0, plan.sblBus, plan.layout.sblBytes, plan.tableBus,
                             plan.tableEntries * uint32_t(sizeof(BhieEntry)), uint32_t(nowMs()) | 1u);
   if (phase == kMhiSblLoading)
@@ -1427,12 +1601,18 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
          "(%s); %u register change line(s)",
          mhiPhaseName(boot.failedPhase), boot.errcode, boot.errdbg[0], boot.errdbg[1], boot.errdbg[2], boot.statusBefore,
          boot.statusCleared, boot.clearTook ? "it took" : "not taken or not reached", snapLines);
+    rasReport();   // first: the counters as close to the refusal as the log allows
     noteSnap("at the end", nowMs() - started, mhiSnap(boot));
     dumpMhi("at the end", boot);
     dmaReport(link);
+    msiSinkReport("at the end");
+    imageHash("after the failure", false);
+    noteIdentity("at the end", boot);
     safeOff(gHw, power, opt);
     return -1;
   }
+  rasReport();
+  msiSinkReport("at mission mode");
   return 0;
 }
 
@@ -1926,9 +2106,11 @@ bool PianoWifi::start(IOService *provider)
          gArgs.blind, gArgs.release, gArgs.stop, gArgs.dmaMib, gArgs.fwTimeoutMs, gArgs.qmiTimeoutMs, gArgs.iova, gArgs.mode,
          gArgs.shadow, gArgs.wmiTimeoutMs, gArgs.scanWaitMs, gArgs.band, gArgs.bssid);
   if (gArgs.level >= 3)
-    note("options: noc %u (the PCIe NoC's bus clock manager voted before level 3's clocks), socreset %u (the chip-side reset "
-         "before BHI)",
-         gArgs.noc, gArgs.socreset);
+    note("options: noc %u (the PCIe NoC's bus clock manager voted before level 3's clocks)", gArgs.noc);
+  if (gArgs.level >= 4)
+    note("options: socreset %u (the chip's power-on reset before BHI), msi %u (MSI into a sink page), ctxearly %u (MHI contexts "
+         "before the doorbell), ras %u (TLP counters)",
+         gArgs.socreset, gArgs.msi, gArgs.ctxearly, gArgs.ras);
   if (gArgs.level > 6) note("piano-wifi=%u: levels above 6 are not implemented; running up to level 6", gArgs.level);
   note("level 1: loads only, nothing written%s", gArgs.spmi || gArgs.level >= 2 ? "; SPMI observer read commands for the PMIC part"
                                                                                : "");

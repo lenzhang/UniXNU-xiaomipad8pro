@@ -206,6 +206,11 @@ constexpr uint32_t kBhiImgAddrLo = 0x08, kBhiImgAddrHi = 0x0c, kBhiImgSize = 0x1
 // anti-rollback version and segment count. The dumps read +0x00..+0x48 and nothing past it.
 constexpr uint32_t kBhiVersionMinor = 0x00, kBhiVersionMajor = 0x04, kBhiErrDbg1 = 0x34, kBhiErrDbg2 = 0x38, kBhiErrDbg3 = 0x3c,
                    kBhiSerialNumber = 0x40, kBhiDumpBytes = 0x4c;
+// What the boot loader reports about the chip after it read its fuses: six words of the MSM hardware ID from +0x4c and the 24 words
+// of the OEM public key hash from +0x64 (the MHI specification's names; the host reads them before the boot). Never logged as
+// values: level 4 logs how many are non-zero and a short digest, so two boots can be compared (an all-zero or changing hash would
+// mean the boot loader could not read its fuses).
+constexpr uint32_t kBhiMsmHwId = 0x4c, kBhiMsmHwIdWords = 6, kBhiOemPkHash = 0x64, kBhiOemPkHashWords = 24;
 constexpr uint32_t kBhieTxVecAddrLo = 0x2c, kBhieTxVecAddrHi = 0x30, kBhieTxVecSize = 0x34, kBhieTxVecDb = 0x3c,
                    kBhieTxVecStatus = 0x44;
 constexpr uint32_t kBhieDumpBytes = 0x7c;     // up to the receive vector's status (+0x78), which the crash dump path uses
@@ -217,13 +222,25 @@ constexpr uint32_t kChipWindowReg = 0x3278, kChipWindowEnable = 0x40000000, kChi
                    kChipWindowStart = 0x80000, kChipWindowRange = 0x7ffff;
 constexpr uint32_t kChipTcsrSocHwVersion = 0x01b00000;
 constexpr uint32_t kBar0BytesExpected = 0x200000;   // 2 MiB on WCN7850 (sheng); needs-boot for 0x110e
-// The chip-side reset this chip's own host runs at every power-up before MHI (Ubuntu's ath12k `pci.c`, sw_reset: behaviour, the
-// offsets are facts of the chip, the same for every chip of the family it drives, WCN7860 included): the chip's PCIe interrupts
-// cleared (a hot reset leaves one pending that the boot loader would take), the warm-boot entry word cleared and the reset cause
-// read (it clears on read), the SoC's global reset pulsed (bit 0 of BAR0 + 0x3008, 10 ms each way; the window register is lost
-// and written again), then MHICTRL's reset bit. piano-wifi-socreset=1 runs it before BHI; off by default (docs §10.21).
+// The chip-side power-on reset this chip's own host runs at every power-up before MHI (Ubuntu's ath12k `pci.c`, sw_reset with
+// power_on: behaviour; the offsets are facts of the chip, the same for every chip of the family it drives, WCN7860 included, and
+// WifiPbl.h has the order): the chip's own PCIe PARF LTSSM word set to 0x111 (retried, as the link can be unsettled after a hot
+// reset), the hot-reset bit of the chip's GCC (WCN7860 uses the QCC2072 register set: 0x1e65304; WCN7850's is 0x1e40304), the
+// chip's PCIe interrupts cleared (a hot reset leaves one pending that the boot loader would take), the QFPROM power control's
+// VDD4BLOW bit cleared (the fuse-blow supply off), the BHIe vector doorbells and status words cleared, the Q6 cookie read, the
+// warm-boot entry word cleared and the reset cause read (it clears on read), the SoC's global reset pulsed (bit 0 of BAR0 +
+// 0x3008, 10 ms each way; the window register is lost and written again), then MHICTRL's reset bit and 10 ms. Before 2026-11-12's
+// fourth round only the last four ran, and only with piano-wifi-socreset=1; now the whole recipe is the default (docs §10.23).
 constexpr uint32_t kChipSocGlobalReset = 0x3008, kChipSocGlobalResetBit = 1u << 0, kChipSocResetMs = 10;
 constexpr uint32_t kChipPcieIntAllClear = 0x01e08228, kChipWlaonWarmSwEntry = 0x01f80504, kChipWlaonResetCause = 0x01f8060c;
+constexpr uint32_t kChipParfLtssm = 0x01e081b0, kChipParfLtssmValue = 0x111, kChipGccHotReset = 0x01e65304,
+                   kChipGccHotResetBit = 0x10, kChipQfpromPwrCtrl = 0x01f8031c, kChipQfpromVdd4Blow = 0x4,
+                   kChipQ6Cookie = 0x01f80500, kChipLtssmTries = 5, kChipLtssmSettleMs = 5;
+// The BHIe vector words ath12k clears by their BAR0 offsets (they are BHIEOFF 0x224 + 0x3c / 0x44 / 0x70 / 0x78 on this chip, which
+// is also what the logs read: BHIEOFF 0x224), and the receive vector block the MHI host zeroes before the boot ("their power-on
+// values are undefined": BHIe + 0x60 .. + 0x78, the address, size, doorbell and status of the crash dump's vector table).
+constexpr uint32_t kChipTxVecDb = 0x360, kChipTxVecStatus = 0x368, kChipRxVecDb = 0x394, kChipRxVecStatus = 0x39c;
+constexpr uint32_t kBhieRxVecAddrLo = 0x60, kBhieRxVecStatus = 0x78;
 
 // ---- the PCIe NoC's bus clock manager (level 3, before the clocks) ----
 // The endpoint's DMA leaves the controller through the PCIe aggregate NoC: Ubuntu's sm8750 interconnect driver has MASTER_PCIE_0
@@ -266,6 +283,32 @@ inline uint32_t bcmCommand(uint32_t average, uint32_t peak)
 // 20 unsupported request), correctable status at +0x10.
 constexpr uint32_t kStatusErrorBits = 0xf8000000u, kExtCapStart = 0x100, kExtCapAer = 0x0001, kAerUncorrectable = 0x04,
                    kAerCorrectable = 0x10;
+// The root port's type 1 windows besides the memory one (PCI-to-PCI bridge specification): I/O base/limit (the low half of +0x1c;
+// the high half is the secondary status, write-one-to-clear) with its upper 16 bits at +0x30, and the prefetchable window at +0x24
+// with its upper 32 bits at +0x28 / +0x2c. Linux's enumeration closes a window the bus does not need (base above limit: I/O 0xf0,
+// prefetchable 0x0000fff0, uppers 0); level 3 does the same and logs what the controller had (2026-11-12, fourth round).
+constexpr uint32_t kDbiIoBaseLimit = 0x1c, kDbiPrefBaseLimit = 0x24, kDbiPrefBaseHi = 0x28, kDbiPrefLimitHi = 0x2c,
+                   kDbiIoUpper = 0x30;
+constexpr uint32_t kIoWindowClosed = 0x000000f0u, kPrefWindowClosed = 0x0000fff0u, kIoUpperDisabled = 0x0000ffffu;
+// The MSI capability (PCI): message control in the upper half of +0 (bit 0 enable, 3:1 vectors capable, 6:4 vectors enabled, 7
+// 64-bit addresses, 8 per-vector masking), the address at +4 (+8 the high half when 64-bit), the data at +8 or +0xc, the mask at
+// +0xc or +0x10. Command bit 10 disables INTx, as the host does when it enables MSI.
+constexpr uint32_t kMsiCtlEnable = 1u << 0, kMsiCtlMmeMask = 7u << 4, kMsiCtl64 = 1u << 7, kMsiCtlMask = 1u << 8;
+constexpr uint32_t kCommandIntxDisable = 1u << 10;
+// The DesignWare controller's RAS DES event counters (a vendor-specific extended capability, ID 0x000b, whose header at +4 says
+// ID 2, revision 4 on Qualcomm's controllers; Ubuntu's pcie-designware-debugfs.c is read for the facts only): the counter control
+// at +8 (27:24 group, 23:16 event, 4:2 enable: 3 this event on, 0 no change; 7 the selected counter's status) and its data at +0xc.
+// Group 7 counts TLPs by kind, group 3 errors. Level 4 enables the ones below on both ends of the link before the doorbell and
+// logs how far each moved: whether the chip asked for the image at all, and what the root port answered.
+constexpr uint32_t kExtCapVendor = 0x000b, kRasDesVsecId = 2, kRasDesVsecRev = 4, kRasDesCtrl = 0x08, kRasDesData = 0x0c;
+constexpr uint32_t kRasDesEnableOn = 3u << 2, kRasDesStatus = 1u << 7;
+struct RasEvent { const char *name; uint8_t group, event; };
+constexpr RasEvent kRasEvents[] = {
+  {"tx MRd", 7, 0x01}, {"tx MWr", 7, 0x00}, {"tx CplD", 7, 0x07}, {"tx Cpl", 7, 0x06},
+  {"rx MRd", 7, 0x0c}, {"rx MWr", 7, 0x0b}, {"rx CplD", 7, 0x12}, {"rx Cpl", 7, 0x11},
+  {"UR", 3, 0x03},     {"CA", 3, 0x04},     {"CTO", 3, 0x05},
+};
+constexpr unsigned kRasEventCount = sizeof kRasEvents / sizeof kRasEvents[0];
 // The firmware file (never in this repository): the stock modem_a FAT, image/peach/amss20.bin = ath12k's amss.bin, 6930496 bytes.
 // BHI carries its first 512 KiB (the secondary boot loader); BHIe carries the second ELF that follows when the bytes at 512 KiB are
 // "\177ELF" (peach), else the whole file (WCN7850). Segments of 512 KiB, as the 13T's cnss2 cuts them.
@@ -273,6 +316,17 @@ constexpr const char *const kFirmwarePartitions[] = {"modem_a", "modem_b"};
 constexpr const char *const kFirmwareDirs[] = {"image/peach", "image"};
 constexpr const char *kAmssName = "amss20.bin";
 constexpr uint32_t kMhiSblBytes = 512 * 1024, kMhiSegBytes = 512 * 1024, kMhiMaxSegments = 32;
+// The identity of the stock file Ubuntu runs (xiaomipad-8pro-mainline firmware/piano-wlan.json, stock build OS3.0.303.0.WPYCNXM:
+// ath12k/WCN7860/hw2.0/amss.bin = image/peach/amss20.bin, 6930496 bytes), and of its first 512 KiB, the image BHI carries (the
+// boot loader: a signed 32-bit ARM ELF of 0x2e630 bytes, zero to 512 KiB; then the Hexagon ELF to the end of the file). Hashes
+// only: level 4 compares what is in the DMA window, read back the way the chip reads it, with these (docs §10.23).
+constexpr uint32_t kAmssStockBytes = 6930496;
+constexpr uint8_t kAmssStockSha256[32] = {
+  0x02, 0xbb, 0xc0, 0x28, 0xf7, 0x32, 0x29, 0xc9, 0x6c, 0xce, 0xde, 0x74, 0x74, 0xb2, 0x30, 0xd3,
+  0x9d, 0x21, 0x86, 0xdc, 0x5d, 0x9d, 0xb7, 0x73, 0x7f, 0x69, 0x38, 0x1b, 0x8d, 0xd3, 0x3c, 0xac};
+constexpr uint8_t kAmssStockSblSha256[32] = {
+  0xc0, 0xe4, 0xbb, 0x91, 0x7b, 0x29, 0x79, 0xf5, 0x77, 0x90, 0x92, 0x28, 0x60, 0xaa, 0x01, 0xa5,
+  0x2c, 0xa7, 0x77, 0x2d, 0xb6, 0x2e, 0x0f, 0x95, 0x97, 0xe0, 0xbd, 0x56, 0xff, 0x79, 0xd7, 0x08};
 constexpr uint32_t kDmaWindowBytes = 24u << 20;   // the boot loader, the segments, the vector table and the MHI contexts
 
 // ======================================================== level 5: the MHI channels, QRTR, and the WLAN firmware's QMI service

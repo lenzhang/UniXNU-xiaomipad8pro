@@ -173,8 +173,9 @@ struct MhiBoot {
   uint32_t ee = 0, state = 0, seq = 0, errcode = 0, lastStatus = 0;
   uint32_t errdbg[3] = {0, 0, 0};           // BHI's three error debug words, read with the error code
   // BHI's status as found before the boot loader's address was written, and right after this host wrote 0 to it: the register's
-  // power-on value is undefined (piano: ffffffff, with error code ef0e0003, 2026-11-12), so an error read later counts only if the
-  // clear took or the value changed since.
+  // power-on value is undefined, so an error read later counts only if the clear took or the value changed since. (piano,
+  // 2026-11-12: the morning's boots ended with ffffffff / ef0e0003 and were taken for untouched power-on contents; wifi-3a and 3b
+  // read 0 before the clear and saw the boot loader itself write ffffffff / ef0e0003 45 ms after the doorbell.)
   uint32_t statusBefore = 0, statusCleared = 0;
   bool clearTook = false;
   uint64_t sblBus = 0, tableBus = 0;
@@ -252,6 +253,17 @@ inline bool mhiOpen(MhiBoot &m, const MhiIo &io, uint32_t space)
   }
   m.phase = kMhiIdle;
   return true;
+}
+
+// The receive vector block (BHIe + 0x60 .. + 0x78: the crash dump table's address, size, doorbell and status) zeroed word by word,
+// as the MHI host does before every power-up of a device with a crash dump: their power-on values are undefined (piano's read
+// 74bf67da:e7bbfbc5 ... f10d0db2 on 2026-11-12). Returns the number of words written.
+inline unsigned mhiClearRxVectors(MhiBoot &m)
+{
+  if (m.phase != kMhiIdle || !m.bhie || m.bhie + kBhieRxVecStatus + 4 > m.reglen) return 0;
+  unsigned n = 0;
+  for (uint32_t off = kBhieRxVecAddrLo; off <= kBhieRxVecStatus; off += 4, ++n) mhidetail::wr(m, m.bhie + off, 0);
+  return n;
 }
 
 // One BHIe vector table entry, as the device reads it (little endian).

@@ -132,6 +132,9 @@ struct LinkState {
   uint8_t sidHash = 0;
   uint32_t sidEntry = 0, sidCfg = 0;
   uint32_t rootId = 0, busNumbers = 0, rootCommand = 0, expCap = 0, linkCtl2 = 0;
+  // the root port's I/O and prefetchable windows as the controller had them (I/O base/limit, its upper half, prefetchable
+  // base/limit, its two upper words), and after level 3 closed them
+  uint32_t ioBefore = 0, ioUpperBefore = 0, prefBefore = 0, prefBaseHiBefore = 0, prefLimitHiBefore = 0, io = 0, pref = 0;
   uint32_t perstLowMs = 0, linkMs = 0, debug0 = 0, debug1 = 0, linkStatus = 0;
   uint32_t atuCtrl2[2] = {0, 0};
   uint32_t endpointId = 0, endpointClass = 0, endpointSubsys = 0, endpointCap = 0, endpointMsiCap = 0;
@@ -548,6 +551,22 @@ inline int linkUp(LinkState &l, PowerState &p, const Hw &hw, const Options &opt)
   wr(hw, kWinDbi, kDbiBusNumbers, 0x00010100u, "DBI bus numbers 0/1/1");
   l.memBaseLimit = memBaseLimit(kMem32, kMem32Bytes);
   wr(hw, kWinDbi, kDbiMemBaseLimit, l.memBaseLimit, "DBI memory base/limit of the 32-bit window");
+  // The windows the bus does not use, closed as Linux's enumeration leaves them (base above limit), in its order: the I/O range
+  // disabled through its upper half while the low half changes, then the prefetchable limit's upper word first. The secondary
+  // status shares the I/O word and is write-one-to-clear: written as 0, so nothing it says is lost.
+  l.ioBefore = rd(hw, kWinDbi, kDbiIoBaseLimit) & 0xffffu;
+  l.ioUpperBefore = rd(hw, kWinDbi, kDbiIoUpper);
+  l.prefBefore = rd(hw, kWinDbi, kDbiPrefBaseLimit);
+  l.prefBaseHiBefore = rd(hw, kWinDbi, kDbiPrefBaseHi);
+  l.prefLimitHiBefore = rd(hw, kWinDbi, kDbiPrefLimitHi);
+  wr(hw, kWinDbi, kDbiIoUpper, kIoUpperDisabled, "DBI I/O window: upper half disabled while it changes");
+  wr(hw, kWinDbi, kDbiIoBaseLimit, kIoWindowClosed, "DBI I/O window closed");
+  wr(hw, kWinDbi, kDbiIoUpper, 0, "DBI I/O window upper half");
+  wr(hw, kWinDbi, kDbiPrefLimitHi, 0, "DBI prefetchable limit upper");
+  wr(hw, kWinDbi, kDbiPrefBaseLimit, kPrefWindowClosed, "DBI prefetchable window closed");
+  wr(hw, kWinDbi, kDbiPrefBaseHi, 0, "DBI prefetchable base upper");
+  l.io = rd(hw, kWinDbi, kDbiIoBaseLimit) & 0xffffu;
+  l.pref = rd(hw, kWinDbi, kDbiPrefBaseLimit);
   setBits(hw, kWinDbi, kDbiCommand, kCommandMemory | kCommandMaster, "DBI command: memory space, bus master");
   uint32_t cap = rd(hw, kWinDbi, kDbiCapPtr) & 0xfcu;
   for (unsigned guard = 0; cap >= 0x40 && cap < 0x100 && guard < 16; ++guard) {

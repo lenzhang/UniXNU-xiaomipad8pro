@@ -153,9 +153,38 @@ comment or table copied), the same Ubuntu kernel and commit:
     never rounded to 0). WifiHw.h's bcmVote/bcmCommand and WifiSurvey.h's cmdDbEntry/cmdDbBcm are this repository's own.
   drivers/net/wireless/ath/ath12k/pci.c and pci.h: the chip-side reset of every power-up (the PCIe interrupt clear, the warm-boot
     entry word, the reset cause, the SoC global reset at BAR0 + 0x3008 and its 10 ms, MHICTRL's reset), for
-    piano-wifi-socreset=1 (PianoWifi.cpp chipSocReset).
+    piano-wifi-socreset=1 (then PianoWifi.cpp chipSocReset; from the fourth round the whole recipe, WifiPbl.h, below).
   UniXNU-sheng package/WifiProbe.cpp (BSD-2-Clause-Patent, read, nothing copied): that its hardware-verified ladder votes the PCIe
     NoC's bus clock manager (SN7 on SM8550) when the link comes up, before the chip's first DMA.
+
+Specifications only for level 4's fourth round of 2026-11-12 (docs/drivers/wifi.md section 10.23; behaviour and register facts,
+no code, comment or table copied), the same Ubuntu kernel and commit:
+  drivers/net/wireless/ath/ath12k/pci.c, pci.h, mhi.c, mhi.h, wifi7/pci.c, wifi7/hal.c, wifi7/hal_qcc2072.c: the whole power-on
+    sw_reset and its order (the chip's PARF LTSSM word 0x1e081b0 := 0x111 retried five times, the GCC hot-reset bit 0x10 of the
+    QCC2072 register set's 0x1e65304 that WCN7860 uses, the interrupt clear, the QFPROM power control 0x1f8031c with VDD4BLOW bit
+    2 cleared, the BHIe vector doorbell/status words at BAR0 0x360/0x368/0x394/0x39c, the Q6 cookie, the warm entry, the reset
+    cause, the global reset, MHICTRL's reset and its 10 ms); that the host disables ASPM and enables MSI before MHI starts; that
+    the MHI controller of this chip is configured with a 512 KiB boot loader, 512 KiB segments, full-boot-chain download and a
+    crash dump size. WifiPbl.h's chipPowerOnReset and msiEnable are this repository's own.
+  drivers/bus/mhi/host/init.c, pm.c, boot.c: that before the boot the host zeroes the BHIe receive vector block and writes only
+    BHI's vector; that the MHI context registers are written once the device is READY (mhi_init_mmio from the ready transition);
+    that the full boot chain loads the first 512 KiB over BHI and, when an ELF header follows at 512 KiB, only the rest over
+    BHIe. WifiMhi.h's mhiClearRxVectors is this repository's own.
+  drivers/pci/controller/dwc/pcie-designware-debugfs.c, pcie-designware.c and include/linux/pcie-dwc.h: the RAS DES capability
+    (a vendor-specific extended capability, ID 2 revision 4 on Qualcomm's controllers), its counter control and data offsets and
+    fields, and the group/event numbers of the TLP and error counters in WifiHw.h kRasEvents. WifiPbl.h's rasDes* are this
+    repository's own.
+  drivers/pci/setup-bus.c: how the enumeration closes a bridge's unused I/O and prefetchable windows (the values and the order),
+    which WifiBringup.h step 307 now does.
+  xiaomipad-8pro-mainline firmware/piano-wlan.json: the stock amss.bin's size and SHA-256 (WifiHw.h kAmssStockSha256); the
+    boot loader part's SHA-256 (kAmssStockSblSha256) was computed from that same pinned file, which this repository never holds.
+This repository: package/PianoAudio/AudioSha256.c (sha256 d3a1a322ee462493b0eeaf4cb312f534a4ea80f926e65138561da7994f686cee,
+  BSD-2-Clause-Patent) ->
+  WifiSha256.h: the FIPS 180-4 compression and padding re-expressed in this namespace as a header, with a whole-block update path
+  added; PianoAudio is not modified.
+  UniXNU-sheng package/WifiProbe.cpp and ShengUfs NativeUfs.cpp (BSD-2-Clause-Patent, read, nothing copied): that sheng's own
+    chip power-up ran the same ath12k recipe including the QFPROM bit and enabled MSI into a sink page before its boot loader,
+    and that its working window for this chip family's stream mapped IOVA 0x10000000 upward (the IOVA range is not the cause).
 
 Specifications only (no code, comment or table copied): mainline Linux drivers/clk/qcom/gcc-sm8750.c and tcsrcc-sm8750.c,
 include/dt-bindings/clock/qcom,sm8750-gcc.h, drivers/pci/controller/dwc/pcie-qcom.c and pcie-designware.h,

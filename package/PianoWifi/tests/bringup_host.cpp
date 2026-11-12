@@ -8,9 +8,15 @@
 //            no cmd-db address, stops level 2 before any vote; WLAN_EN goes low, waits 150 ms and goes high after PERST# is low;
 //   level 3: the order of the whole sequence (domains, clocks, resets, PARF, the PHY table, BDF-to-SID, root port, PERST# release,
 //            LTSSM, L0, the configuration window, BAR0), the pipe mux switched to the PHY between the table's body and its last two
-//            writes, PERST# low for at least 100 ms, the endpoint's capability walk, BAR0's size and placement;
+//            writes, PERST# low for at least 100 ms, the endpoint's capability walk, BAR0's size and placement, the root port's
+//            unused I/O and prefetchable windows closed in Linux's order without a status bit written;
 //   level 4: the firmware file's layout (one image, or a boot loader and a second ELF), the DMA arena's alignment, the BHIe vector
-//            table, and the boot state machine from PBL through SBL to mission mode;
+//            table, and the boot state machine from PBL through SBL to mission mode; before the doorbell (WifiPbl.h): the chip's
+//            power-on reset in ath12k's order with every value kept (an LTSSM word that takes two writes, a link that does not
+//            answer), the receive vector block cleared and nothing else, MSI programmed off-then-on with one vector for 32- and
+//            64-bit capabilities and refused where the sink cannot be reached, the RAS DES capability found behind other
+//            capabilities and the counters' deltas (an unsupported counter, a wrap), the contexts given only at READY; SHA-256 on
+//            the standard vectors, in pieces across block boundaries and through a bounce buffer, and the two pins;
 //   every injected fault (a domain that stays off, a branch that does not start, an RCG update that hangs, PHYSTATUS stuck, no L0,
 //            an iATU that will not enable, the wrong endpoint, an impossible BAR mask, a refused rail vote, an unreadable rail, a
 //            BHI error, a BHIe error, a system error, a crash dump, a timeout) must make the level fail at that step and leave
@@ -18,6 +24,8 @@
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. bringup_host.cpp -o /tmp/bringup_host && /tmp/bringup_host
 #include "WifiBringup.h"
 #include "WifiMhi.h"
+#include "WifiPbl.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -468,6 +476,27 @@ static void testLink()
     ++phySeen;
   }
   CHECK(phySeen == kPhySequenceCount);
+
+  // the root port's unused windows closed as Linux's enumeration leaves them, after the memory window and before the command,
+  // the I/O range disabled through its upper half while its low half changes, the prefetchable limit's upper word first
+  const int mem = m.indexOf(kWinDbi, kDbiMemBaseLimit);
+  const int ioUp = m.indexOf(kWinDbi, kDbiIoUpper), io = m.indexOf(kWinDbi, kDbiIoBaseLimit);
+  const int ioUpLast = m.lastIndexOf(kWinDbi, kDbiIoUpper), prefHi = m.indexOf(kWinDbi, kDbiPrefLimitHi);
+  const int pref = m.indexOf(kWinDbi, kDbiPrefBaseLimit), prefBase = m.indexOf(kWinDbi, kDbiPrefBaseHi);
+  const int command = m.indexOf(kWinDbi, kDbiCommand);
+  CHECK(mem < ioUp && ioUp < io && io < ioUpLast && ioUpLast < prefHi && prefHi < pref && pref < prefBase && prefBase < command);
+  CHECK(m.writes[size_t(ioUp)].value == kIoUpperDisabled && m.writes[size_t(ioUpLast)].value == 0);
+  CHECK(m.writes[size_t(io)].value == kIoWindowClosed && !(m.writes[size_t(io)].value >> 16));   // no status bit written
+  CHECK(m.writes[size_t(pref)].value == kPrefWindowClosed && m.writes[size_t(prefHi)].value == 0);
+  CHECK(l.io == kIoWindowClosed && l.pref == kPrefWindowClosed);
+  {   // what the controller had is kept for the log
+    Model w;
+    w.regs[key(kWinDbi, kDbiPrefBaseLimit)] = 0x0001fff1u;
+    w.regs[key(kWinDbi, kDbiIoBaseLimit)] = 0x22000101u;   // secondary status bits above the I/O word
+    LinkState lw;
+    CHECK(runLink(w, lw) == kErrNone);
+    CHECK(lw.prefBefore == 0x0001fff1u && lw.ioBefore == 0x0101u && lw.pref == kPrefWindowClosed);
+  }
 }
 
 static void testLinkFaults()
@@ -631,6 +660,7 @@ struct Device {
   // on an error (piano's model: all ones), and whether the device answers at all (a link that went away reads all ones).
   uint32_t bhiStatus = 0, bhiErrorValue = kMhiXferError << 30;
   bool statusWritable = true, gone = false;
+  bool echoDebug = false;   // on an error the debug words name the image's address (low, high) and size (wifi-3a, 2026-11-12)
   std::vector<uint32_t> bhiWrites;   // the BHI block's offsets in the order they were written
 
   Device()
@@ -677,6 +707,11 @@ struct Device {
     if (reg == bhi + kBhiImgTxDb) {
       ++bhiDoorbells;
       if (!stuck) bhiStatus = bhiError ? bhiErrorValue : kMhiXferSuccess << 30;
+      if (!stuck && bhiError && echoDebug) {
+        regs[bhi + kBhiErrDbg1] = regs[bhi + kBhiImgAddrLo];
+        regs[bhi + kBhiErrDbg2] = regs[bhi + kBhiImgAddrHi];
+        regs[bhi + kBhiErrDbg3] = regs[bhi + kBhiImgSize];
+      }
       if (!bhiError && !stuck) ready = true;
     }
     if (reg == bhie + kBhieTxVecDb) {
@@ -857,6 +892,22 @@ static void testMhiBoot()
     CHECK(mhiContextsPlan(k, memory.data(), 0xc2000000, kMhiContextBytes));
     CHECK(runBoot(b, p, k) == kMhiDone && b.error == kMhiErrNone && b.statusBefore == 0xffffffffu && b.clearTook);
   }
+  {   // wifi-3a / 3b (2026-11-12): BHI's status 0 before the clear, then the boot loader's own ffffffff / ef0e0003 with the debug
+      // words naming the image's address and size: an error at once, the status before the clear recorded as 0, the words read
+    Device p;
+    p.state = kStateReset;
+    p.bhiError = true;
+    p.bhiErrorValue = 0xffffffffu;
+    p.echoDebug = true;
+    p.regs[p.bhi + kBhiErrCode] = 0xef0e0003u;
+    MhiBoot b;
+    CHECK(mhiOpen(b, p.io(), 0x200000));
+    MhiContexts k;
+    CHECK(mhiContextsPlan(k, memory.data(), 0x20708000, kMhiContextBytes));
+    CHECK(runBoot(b, p, k, 3) == kMhiFailed && b.error == kMhiErrBhi && b.statusBefore == 0 && b.clearTook);
+    CHECK(b.errcode == 0xef0e0003u && b.errdbg[0] == 0xc0000000u && b.errdbg[1] == 0 && b.errdbg[2] == kMhiSblBytes);
+    CHECK(p.contextWrites == 0);   // nothing of the contexts reached the device before the refusal
+  }
   {   // BHIe reports an error
     Device bhie;
     bhie.bhieError = true;
@@ -893,6 +944,338 @@ static void testMhiBoot()
   }
 }
 
+// ------------------------------------------------------------------------- level 4 before the doorbell (WifiPbl.h, §10.23)
+static std::string hex(const uint8_t d[32])
+{
+  static const char *digits = "0123456789abcdef";
+  std::string s;
+  for (unsigned i = 0; i < 32; ++i) {
+    s += digits[d[i] >> 4];
+    s += digits[d[i] & 15];
+  }
+  return s;
+}
+
+static void testSha256()
+{
+  struct Vector { const char *text; const char *digest; };
+  const Vector vectors[] = {
+    {"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+    {"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+    {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"},
+  };
+  for (const Vector &v : vectors) {
+    Sha256 s;
+    sha256Update(s, v.text, std::strlen(v.text));
+    uint8_t d[32];
+    sha256Final(s, d);
+    CHECK(hex(d) == v.digest);
+  }
+  // a million 'a', in pieces that straddle the block boundary every way
+  std::vector<uint8_t> a(1000000, 'a');
+  for (size_t piece : {size_t(1), size_t(63), size_t(64), size_t(65), size_t(4096), size_t(1000000)}) {
+    Sha256 s;
+    for (size_t at = 0; at < a.size(); at += piece) sha256Update(s, a.data() + at, std::min(piece, a.size() - at));
+    uint8_t d[32];
+    sha256Final(s, d);
+    CHECK(hex(d) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+  }
+  // the image's parts hashed through a small bounce buffer are the file hashed whole
+  std::vector<uint8_t> file(3 * 1000 + 17);
+  for (size_t i = 0; i < file.size(); ++i) file[i] = uint8_t(i * 37 + (i >> 5));
+  uint8_t whole[32], parts[32];
+  {
+    Sha256 s;
+    sha256Update(s, file.data(), file.size());
+    sha256Final(s, whole);
+  }
+  const Span spans[3] = {{file.data(), 1000}, {file.data() + 1000, 2000}, {file.data() + 3000, 17}};
+  uint8_t bounce[96];
+  unsigned copies = 0;
+  hashSpans(spans, 3, bounce, sizeof bounce, [&](uint8_t *to, const uint8_t *from, uint32_t n) {
+    CHECK(n <= sizeof bounce);
+    std::memcpy(to, from, n);
+    ++copies;
+  }, parts);
+  CHECK(sha256Same(whole, parts) && copies == 11 + 21 + 1);
+  parts[31] ^= 1;
+  CHECK(!sha256Same(whole, parts));
+  // the pins are the manifest's (xiaomipad-8pro-mainline firmware/piano-wlan.json) and the boot loader's
+  CHECK(hex(kAmssStockSha256) == "02bbc028f73229c96ccede7474b230d39d2186dc5d9db7737f69381b8dd33cac");
+  CHECK(hex(kAmssStockSblSha256) == "c0e4bb917b2979f57790922860aa01a52ca7772db62e0f9597e0bd56ff79d708");
+}
+
+// The chip's registers as chipPowerOnReset reaches them: an LTSSM word that takes a few writes, a reset cause that clears on read.
+struct Chip {
+  std::map<uint32_t, uint32_t> regs;
+  std::vector<std::pair<uint32_t, uint32_t>> writes;
+  unsigned ltssmTakesAfter = 2, ltssmWrites = 0, sleptMs = 0;
+  bool linkDown = false;
+  uint32_t read(uint32_t a)
+  {
+    if (linkDown) return 0xffffffffu;
+    if (a == kChipWlaonResetCause) {
+      const uint32_t v = regs[a];
+      regs[a] = 0;
+      return v;
+    }
+    return regs[a];
+  }
+  void write(uint32_t a, uint32_t v)
+  {
+    writes.push_back({a, v});
+    if (a == kChipParfLtssm) {
+      if (++ltssmWrites < ltssmTakesAfter) return;   // not yet taken
+    }
+    if (!linkDown) regs[a] = v;
+  }
+  static uint32_t rd(void *c, uint32_t a) { return static_cast<Chip *>(c)->read(a); }
+  static void wr(void *c, uint32_t a, uint32_t v) { static_cast<Chip *>(c)->write(a, v); }
+  ChipIo io() { return {this, rd, wr}; }
+  int indexOf(uint32_t a, size_t from = 0) const
+  {
+    for (size_t i = from; i < writes.size(); ++i)
+      if (writes[i].first == a) return int(i);
+    return -1;
+  }
+};
+
+static void testChipPowerOn()
+{
+  Chip c;
+  c.regs[kChipParfLtssm] = 0x100;
+  c.regs[kChipGccHotReset] = 0x1;
+  c.regs[kChipQfpromPwrCtrl] = 0xc;              // VDD4BLOW (bit 2) on, another bit that must survive
+  c.regs[kChipWlaonWarmSwEntry] = 0x5a;
+  c.regs[kChipWlaonResetCause] = 0x3;
+  c.regs[kChipSocGlobalReset] = 0x4;
+  c.regs[kChipQ6Cookie] = 0xc0000000u;
+  c.regs[kMhiStatus] = 0x4;                      // a SYSERR, as the global reset may leave
+  c.regs[0x100 + kBhiExecEnv] = kEePbl;
+  ChipReset r;
+  chipPowerOnReset(c.io(), [&](unsigned ms) { c.sleptMs += ms; }, 0x100, r);
+  CHECK(r.ltssmBefore == 0x100 && r.ltssm == kChipParfLtssmValue && r.ltssmWrites == 2);
+  CHECK(r.hotResetBefore == 0x1 && r.hotReset == (0x1 | kChipGccHotResetBit));
+  CHECK(r.qfpromBefore == 0xc && r.qfprom == 0x8);
+  CHECK(r.cookie == 0xc0000000u && r.warm == 0x5a && r.warmAfter == 0 && r.cause == 3 && c.regs[kChipWlaonResetCause] == 0);
+  CHECK(r.globalBefore == 4 && r.globalAfter == 4 && !r.linkLost);
+  CHECK(r.mhiStatusBefore == 0x4 && r.ee == kEePbl);
+  CHECK(c.sleptMs == kChipLtssmSettleMs + 5 * kChipSocResetMs);
+  // ath12k's order: the LTSSM word, the hot reset bit, the interrupts, the QFPROM, the vector words, the warm entry, the global
+  // reset set then cleared, MHICTRL's reset last
+  const int ltssm = c.indexOf(kChipParfLtssm), hot = c.indexOf(kChipGccHotReset), intr = c.indexOf(kChipPcieIntAllClear);
+  const int qf = c.indexOf(kChipQfpromPwrCtrl), txdb = c.indexOf(kChipTxVecDb), txst = c.indexOf(kChipTxVecStatus);
+  const int rxdb = c.indexOf(kChipRxVecDb), rxst = c.indexOf(kChipRxVecStatus), warm = c.indexOf(kChipWlaonWarmSwEntry);
+  const int gset = c.indexOf(kChipSocGlobalReset), gclr = c.indexOf(kChipSocGlobalReset, size_t(gset) + 1);
+  const int ctrl = c.indexOf(kMhiCtrl);
+  CHECK(ltssm >= 0 && ltssm < hot && hot < intr && intr < qf && qf < txdb && txdb < txst && txst < rxdb && rxdb < rxst &&
+        rxst < warm && warm < gset && gset < gclr && gclr < ctrl && ctrl == int(c.writes.size()) - 1);
+  CHECK(c.writes[size_t(intr)].second == 0xffffffffu && c.writes[size_t(warm)].second == 0);
+  CHECK(c.writes[size_t(gset)].second == 5 && c.writes[size_t(gclr)].second == 4 && c.writes[size_t(ctrl)].second == kMhiCtrlReset);
+  for (int i : {txdb, txst, rxdb, rxst}) CHECK(c.writes[size_t(i)].second == 0);
+  {   // the link not answering: the LTSSM word is tried kChipLtssmTries times with a pause each, and the loss is reported
+    Chip d;
+    d.linkDown = true;
+    ChipReset rd;
+    chipPowerOnReset(d.io(), [&](unsigned ms) { d.sleptMs += ms; }, 0x100, rd);
+    CHECK(rd.ltssmWrites == kChipLtssmTries && rd.ltssm == 0xffffffffu && rd.linkLost);
+    CHECK(d.sleptMs == kChipLtssmTries * kChipLtssmSettleMs + kChipLtssmSettleMs + 5 * kChipSocResetMs);
+  }
+  {   // an LTSSM word already right is not written
+    Chip e;
+    e.regs[kChipParfLtssm] = kChipParfLtssmValue;
+    ChipReset re;
+    chipPowerOnReset(e.io(), [](unsigned) {}, 0, re);
+    CHECK(re.ltssmWrites == 0 && e.indexOf(kChipParfLtssm) < 0 && re.ee == 0);
+  }
+}
+
+static void testRxVectorClear()
+{
+  Device d;
+  MhiBoot b;
+  CHECK(mhiOpen(b, d.io(), 0x1000));
+  for (uint32_t off = kBhieRxVecAddrLo; off <= kBhieRxVecStatus; off += 4) d.regs[d.bhie + off] = 0xdeadbeefu;
+  CHECK(mhiClearRxVectors(b) == 7);
+  for (uint32_t off = kBhieRxVecAddrLo; off <= kBhieRxVecStatus; off += 4) CHECK(d.regs[d.bhie + off] == 0);
+  CHECK(d.regs[d.bhie + kBhieTxVecDb] == 0);   // nothing else written: the transmit vector is the boot's own
+  CHECK(d.bhiWrites.empty());
+  CHECK(runBoot(b, d, *[] { static std::vector<uint8_t> mem(kMhiContextBytes); static MhiContexts k;
+                            mhiContextsPlan(k, mem.data(), 0xc2000000, kMhiContextBytes); return &k; }()) == kMhiDone);
+  CHECK(mhiClearRxVectors(b) == 0);            // only before the boot
+  Device small;
+  small.regs[kMhiBhieOff] = 0x1000 - 0x50;     // BHIe's transmit words fit the mapping, its receive block would not
+  MhiBoot s;
+  CHECK(mhiOpen(s, small.io(), 0x1000));
+  CHECK(mhiClearRxVectors(s) == 0);
+}
+
+// The endpoint's configuration space for msiEnable and the RAS DES counters.
+struct Config {
+  std::map<uint32_t, uint32_t> regs;
+  std::vector<std::pair<uint32_t, uint32_t>> writes;
+  uint32_t rasAt = 0;
+  std::map<uint32_t, uint32_t> counters;   // group << 8 | event -> count
+  std::map<uint32_t, bool> enabled;
+  uint32_t selected = 0, unsupported = ~0u;   // a counter that never reads as enabled (group << 8 | event)
+  uint32_t read(uint32_t off)
+  {
+    if (rasAt && off == rasAt + kRasDesCtrl) {
+      const uint32_t key = selected;
+      return ((key >> 8) << 24) | ((key & 0xff) << 16) | (enabled[key] ? kRasDesStatus : 0u);
+    }
+    if (rasAt && off == rasAt + kRasDesData) return counters[selected];
+    auto it = regs.find(off);
+    return it == regs.end() ? 0 : it->second;
+  }
+  void write(uint32_t off, uint32_t v)
+  {
+    writes.push_back({off, v});
+    if (rasAt && off == rasAt + kRasDesCtrl) {
+      selected = ((v >> 24) & 0xf) << 8 | ((v >> 16) & 0xff);
+      if (((v >> 2) & 7) == 3 && selected != unsupported) enabled[selected] = true;
+      return;
+    }
+    regs[off] = v;
+  }
+};
+
+static void testMsi()
+{
+  for (bool is64 : {true, false}) {
+    Config c;
+    c.regs[0x04] = 0x00100006u;
+    c.regs[0x50] = 0x05u | 0x70u << 8 | uint32_t(0x0006u | (is64 ? kMsiCtl64 : 0u) | kMsiCtlMask) << 16;   // 8 vectors capable
+    auto rd = [&](uint32_t o) { return c.read(o); };
+    auto wr = [&](uint32_t o, uint32_t v) { c.write(o, v); };
+    MsiSetup m;
+    const uint64_t sink = 0x20708000ull;
+    CHECK(msiEnable(m, rd, wr, 0x50, sink, 0x4d53));
+    CHECK(m.enabled && m.is64 == is64 && !m.why);
+    CHECK((m.ctl & kMsiCtlEnable) && !(m.ctl & kMsiCtlMmeMask));   // one vector
+    CHECK(c.regs[0x54] == uint32_t(sink) && c.regs[is64 ? 0x5c : 0x58] == 0x4d53u);
+    if (is64) CHECK(c.regs[0x58] == 0);
+    CHECK(c.regs[is64 ? 0x60 : 0x5c] == 0);                      // no vector masked
+    CHECK(c.regs[0x04] == (0x0006u | kCommandIntxDisable));       // INTx off, no status bit written
+    // the capability is off while it is programmed, and switched on last
+    CHECK(!c.writes.empty() && c.writes.front().first == 0x50 && !((c.writes.front().second >> 16) & kMsiCtlEnable));
+    CHECK(c.writes.back().first == 0x50 && ((c.writes.back().second >> 16) & kMsiCtlEnable));
+    CHECK((c.writes.back().second & 0xffffu) == (c.regs[0x50] & 0xffffu));
+  }
+  {   // a 32-bit capability cannot take a sink above 4 GiB: nothing is written
+    Config c;
+    c.regs[0x50] = 0x05u | 0x0006u << 16;   // 32-bit addresses only
+    MsiSetup m;
+    CHECK(!msiEnable(m, [&](uint32_t o) { return c.read(o); }, [&](uint32_t o, uint32_t v) { c.write(o, v); }, 0x50,
+                     0x9aa600000ull, 1));
+    CHECK(m.why && c.writes.empty());
+  }
+  {   // no capability, or not an MSI one
+    Config c;
+    c.regs[0x50] = 0x10u;
+    MsiSetup m;
+    auto rd = [&](uint32_t o) { return c.read(o); };
+    auto wr = [&](uint32_t o, uint32_t v) { c.write(o, v); };
+    CHECK(!msiEnable(m, rd, wr, 0, 0x1000, 1) && m.why);
+    CHECK(!msiEnable(m, rd, wr, 0x50, 0x1000, 1) && m.why && c.writes.empty());
+  }
+}
+
+static void testRasDes()
+{
+  Config c;
+  c.regs[0] = 0x011c17cbu;                           // Qualcomm's root port
+  c.regs[0x100] = 0x00010001u | 0x148u << 20;        // AER, next 0x148
+  c.regs[0x148] = kExtCapVendor | 0x1u << 16 | 0x200u << 20;   // a vendor capability of another kind first
+  c.regs[0x14c] = 0x00100001u;
+  c.regs[0x200] = kExtCapVendor | 0x1u << 16;        // RAS DES, last in the list
+  c.regs[0x204] = kRasDesVsecId | kRasDesVsecRev << 16 | 0x100u << 20;
+  c.rasAt = 0x200;
+  c.unsupported = 3u << 8 | 0x05;                    // completion timeouts not counted on this one
+  c.counters[7u << 8 | 0x0c] = 100;                  // rx MRd before the doorbell
+  auto rd = [&](uint32_t o) { return c.read(o); };
+  auto wr = [&](uint32_t o, uint32_t v) { c.write(o, v); };
+  RasDes r;
+  r.at = rasDesFind(rd);
+  CHECK(r.at == 0x200);
+  rasDesArm(r, rd, wr);
+  CHECK(r.at == 0x200 && __builtin_popcount(r.on) == int(kRasEventCount) - 1 && !rasOn(r, 3, 0x05) && rasOn(r, 7, 0x0c));
+  c.counters[7u << 8 | 0x0c] += 1024;                // the chip's reads of the image
+  c.counters[7u << 8 | 0x07] += 4096;                // the completions with data
+  c.counters[3u << 8 | 0x05] += 9;                   // not counted: reads as off
+  rasDesRead(r, rd, wr);
+  CHECK(rasDelta(r, 7, 0x0c) == 1024 && rasDelta(r, 7, 0x07) == 4096 && rasDelta(r, 7, 0x06) == 0 && rasDelta(r, 3, 0x05) == 0);
+  CHECK(rasDelta(r, 9, 9) == 0 && !rasOn(r, 9, 9));
+  // no write ever touches the counter data, and every control write selects a known event
+  for (const auto &w : c.writes) {
+    CHECK(w.first == 0x200 + kRasDesCtrl);
+    bool known = false;
+    for (const RasEvent &e : kRasEvents) known |= (w.second & 0x0fff0000u) == rasDesSelect(e);
+    CHECK(known);
+  }
+  // a counter that wraps still gives the right delta
+  RasDes wrap;
+  wrap.at = 0x200;
+  c.counters[7u << 8 | 0x0b] = 0xfffffff0u;
+  rasDesArm(wrap, rd, wr);
+  c.counters[7u << 8 | 0x0b] += 0x20;
+  rasDesRead(wrap, rd, wr);
+  CHECK(rasDelta(wrap, 7, 0x0b) == 0x20);
+  {   // not Qualcomm's, no capability, a broken list: none found, nothing written
+    Config o;
+    o.regs[0] = 0x12345678u;
+    CHECK(rasDesFind([&](uint32_t x) { return o.read(x); }) == 0);
+    Config e;
+    e.regs[0] = 0x110e17cbu;
+    e.regs[0x100] = 0xffffffffu;
+    CHECK(rasDesFind([&](uint32_t x) { return e.read(x); }) == 0);
+    Config loop;
+    loop.regs[0] = 0x110e17cbu;
+    loop.regs[0x100] = 0x00010001u | 0x100u << 20;   // points at itself
+    CHECK(rasDesFind([&](uint32_t x) { return loop.read(x); }) == 0);
+    RasDes none;
+    rasDesArm(none, [&](uint32_t x) { return o.read(x); }, [&](uint32_t x, uint32_t v) { o.write(x, v); });
+    rasDesRead(none, [&](uint32_t x) { return o.read(x); }, [&](uint32_t x, uint32_t v) { o.write(x, v); });
+    CHECK(o.writes.empty() && !none.on);
+  }
+}
+
+static void testBhiIdentity()
+{
+  std::map<uint32_t, uint32_t> regs;
+  auto rd = [&](uint32_t o) { auto it = regs.find(o); return it == regs.end() ? 0u : it->second; };
+  const BhiIdentity empty = bhiIdentity(rd, 0x100);
+  CHECK(empty.hwIdNonZero == 0 && empty.pkHashNonZero == 0 && empty.pkHashAllOnes == 0);
+  for (uint32_t i = 0; i < kBhiMsmHwIdWords; ++i) regs[0x100 + kBhiMsmHwId + 4 * i] = i ? 0 : 0x001b0e1u;
+  for (uint32_t i = 0; i < kBhiOemPkHashWords; ++i) regs[0x100 + kBhiOemPkHash + 4 * i] = i < 12 ? 0x9e3779b9u * (i + 1) : 0;
+  regs[0x100 + kBhiOemPkHash + 4 * 23] = 0xffffffffu;
+  const BhiIdentity a = bhiIdentity(rd, 0x100), b = bhiIdentity(rd, 0x100);
+  CHECK(a.hwIdNonZero == 1 && a.pkHashNonZero == 13 && a.pkHashAllOnes == 1 && a.digest == b.digest && a.digest != empty.digest);
+  regs[0x100 + kBhiOemPkHash] ^= 1;   // one bit of the hash changed: another digest
+  CHECK(bhiIdentity(rd, 0x100).digest != a.digest);
+  // only the 30 words are read, and the serial number (+0x40) is not among them
+  std::vector<uint32_t> seen;
+  (void)bhiIdentity([&](uint32_t o) { seen.push_back(o); return rd(o); }, 0x100);
+  CHECK(seen.size() == kBhiMsmHwIdWords + kBhiOemPkHashWords);
+  for (uint32_t o : seen) CHECK(o >= 0x100 + kBhiMsmHwId && o < 0x100 + kBhiOemPkHash + 4 * kBhiOemPkHashWords && o != 0x100 + kBhiSerialNumber);
+}
+
+static void testContextsAtReady()
+{
+  // The MHI host's order: no context register before the doorbell, the contexts given once the device reports READY. The
+  // device model takes the image either way; what matters is that the boot completes with exactly the one context write at READY.
+  std::vector<uint8_t> memory(kMhiContextBytes, 0);
+  MhiContexts c;
+  CHECK(mhiContextsPlan(c, memory.data(), 0x20708000, kMhiContextBytes));
+  Device d;
+  MhiBoot b;
+  CHECK(mhiOpen(b, d.io(), 0x200000));
+  CHECK(mhiClearRxVectors(b) == 7);
+  CHECK(d.contextWrites == 0);
+  CHECK(runBoot(b, d, c) == kMhiDone);
+  CHECK(d.contextWrites == 1 && c.writes == 1 && d.regs[kMhiCcabap] == 0x20708000u);
+}
+
 int main()
 {
   testPowerUp();
@@ -903,6 +1286,13 @@ int main()
   testFirmwareLayout();
   testArena();
   testMhiBoot();
+  testSha256();
+  testChipPowerOn();
+  testRxVectorClear();
+  testMsi();
+  testRasDes();
+  testBhiIdentity();
+  testContextsAtReady();
   if (failures) {
     std::printf("bringup_host: %d failures\n", failures);
     return 1;

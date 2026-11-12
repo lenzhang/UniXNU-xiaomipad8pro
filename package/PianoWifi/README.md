@@ -22,10 +22,14 @@ Nothing above level 1 has run on hardware yet: read one boot's log before raisin
   the root port, PERST# released at least 100 ms after it went low, the LTSSM, L0, the configuration window and `17cb:110e`, the
   memory window, BAR0's size and address, and stream 0x1401 through an SMMU bypass context bank.
 - `piano-wifi=4`: a 24 MiB DMA window, BAR0's MHI block, `image/peach/amss20.bin` read at run time from the tablet's own `modem_a`
-  (never from this repository), BHI for the boot loader (its status cleared first, as Ubuntu's MHI host does), the MHI contexts,
-  BHIe for the second ELF, mission mode. Polled, no MSI. The MHI/BHI/BHIe block is logged before the doorbell, every change of
-  its status words while waiting, and after a failure where the chip's DMA went (PCI status, AER, the SMMU's faults);
-  `piano-wifi-socreset=1` first runs the chip-side reset of Ubuntu's ath12k (docs/drivers/wifi.md section 10.21).
+  (never from this repository) and checked in the window against the stock file's SHA-256, then what the chip's own host does
+  before the doorbell (`WifiPbl.h`): ath12k's whole power-on reset of the chip (`piano-wifi-socreset=0` skips it), the BHIe
+  receive vector block cleared, MSI on with one vector into a sink page of the window (`piano-wifi-msi=0`); BHI for the boot
+  loader (its status cleared first), the MHI contexts once the device reports READY (`piano-wifi-ctxearly=1` also writes them
+  before the doorbell, as the boots before 2026-11-12's fourth round did), BHIe for the second ELF, mission mode. Polled. The
+  MHI/BHI/BHIe block is logged before the doorbell, every change of its status words while waiting, the TLP counters of both
+  ends of the link (`piano-wifi-ras=0`), and after a failure where the chip's DMA went (PCI status, AER, the SMMU's faults, the
+  sink, whether the image is still the stock one) (docs/drivers/wifi.md sections 10.21 and 10.23).
 - `piano-wifi=5`: the chip's two IPC router channels (20 out, 21 in) over MHI with their rings and 8 KiB buffers in the same
   window (64 MiB by default at this level), the IPC router itself (hello, the firmware's service announcement), and the WLAN
   firmware's QMI service: the radio's capability, the indication registration, the host capability, the firmware's memory regions
@@ -59,6 +63,8 @@ meanings: `docs/drivers/wifi.md`.
 | `WifiBringup.h` | portable: levels 2 and 3 — the writes, their order, read-backs, bounded polls, what each failure leaves behind |
 | `WifiPhySeq.h` | the PHY sequence table and its provenance note (PaganiWifi, from the 13T's vendor device tree) |
 | `WifiMhi.h` | portable: the firmware file's layout, the DMA arena, the BHIe vector table, the BHI/BHIe boot machine, the MHI contexts |
+| `WifiPbl.h` | portable: level 4 before the doorbell — the chip's power-on reset, the endpoint's MSI into a sink, the RAS DES TLP counters, the image hashed as the chip reads it |
+| `WifiSha256.h` | portable SHA-256 (FIPS 180-4) for that check, after PianoAudio's (`UPSTREAM`) |
 | `WifiChannels.h` | portable: level 5's transport — the two IPC router channels' contexts and rings, the start commands, the receive buffers, a send, and the event walk |
 | `WifiQmi.h` | portable: the QMI message writer and the typed readers over the copied codec's parse |
 | `WifiWlfw.h` | portable: the WLAN firmware's message set and the step machine, the memory answer, the downloads, the copy-engine configuration and the shadow list |
