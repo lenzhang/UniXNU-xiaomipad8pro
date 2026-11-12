@@ -1,6 +1,9 @@
 # Cameras (B11): PianoCamera, the level ladder
 
-Status, 2026-11-12 (evening): **levels 1-3 built and host-tested** (`package/PianoCamera`, in the kext list, inert without
+Status, 2026-11-13: **both sensors' first RAW10 frames on the tablet** (cplan, §8.4: the rear's colour bars exact at 4080x3072,
+30 fps through our SMMU window; the front's 3264x1836 frames; every power-down complete), the scenes still black (fixed since: the
+exposure loop, §4.3 "After cplan"; image `cae`); level 2 takes level 3's path for either sensor (§4.2 "After c2fx"). Earlier,
+2026-11-12 (evening): **levels 1-3 built and host-tested** (`package/PianoCamera`, in the kext list, inert without
 `piano-camera`). On the tablet (§8.4): level 1 passed (c1); level 2 read the **rear's chip ID 0x38e1** over CCI0 at 19.2 and 24 MHz
 with a clean power-down (c2r, c2r24); the **front failed at its MCLK4** (c2f), fixed since (§4.2 "After c2f"); level 3 (c3rp, c3r)
 ran the whole rear path to stream-on and, by its timing, two frames, then **aborted in its power-down** at the SMMU window's release
@@ -30,7 +33,7 @@ facts as code, each with its source.
 | Clock controllers | CAMCC `ade0000` (0x20000; domains MMCX + MXC at low_svs; GCC's camera AHB `0x26004`), cambistmclkcc `1760000` (0x6000; MMCX + MX; GCC `0xa0004`). Linux keeps GCC `0x26004`, `0x26034` (camera XO), `0xa0004` on from GCC's probe (CLK_ENABLE only), and CAMCC's DRV AHB/XO, GDSC clock and sleep clock (`0x113c4/0x113c0/0x1137c/0x11398`) on from CAMCC's. **At XNU (c1)**: GCC `0x26004` = 0x88000002, `0x26034` = 0x88000000, `0xa0004` = 0x88000002: all three off (CLK_ENABLE clear), both AHBs with HW_CTL (hardware gating: CLK_OFF reads set while idle even when enabled, as the display's 0x88000003); HF/SF AXI 0x8a200000 off; neither controller readable at level 1 | DT, msm; tablet | verified (source); GCC state verified (c1); CAMCC/MCLK-CC: needs-boot (L2) |
 | GDSCs | TITAN_TOP `+0x1134c` (parent of all; CFG completion bits, RETAIN_FF), TFE0/1/2 `+0x11004/0x11084/0x110ec`; Linux's set-up: wait values 2/8/2, HW control and SW override off; on: un-collapse, POWER_UP_COMPLETE within 2 ms, 1 µs, RETAIN_FF | msm (`gdsc.c`) | verified (source) |
 | CAMCC PLL0 | Taycan ELU, 19.2 MHz × 62.5 = 1200 MHz (L 0x3e, alpha 0x8000); even /2 = 600, odd /3 = 400 MHz: the CSIPHY/CSID/TFE-lite sources (400 MHz = main /3), CAMNOC RT AXI 200 (even /3), slow AHB 80 (even /7.5). Every CAMCC source's selector 0 is the XO (19.2 MHz), the reset state | msm | verified (source) |
-| MCLKs | cambistmclkcc PLL0 Rivian ELU 960 MHz (L 0x32, CONFIG_CTL 0x12000000/0x00890263/0x1af04237); MCLK n RCG `+0x4000` + 0x1c·n, branch `+0x4018` + 0x1c·n; table 12 / 19.2 (XO) / 24 / 68.57 MHz; 24 MHz = PLL0 / 10 × 1/4 (source 3, CFG 0x2313, M 1, N reg 0xfc, D reg 0xfb). KDTS: rear MCLK1 24 MHz (gpio90 `cam_mclk`, 4 mA), front MCLK4 19.2 MHz (gpio93 `cam_aon_mclk4`, 2 mA); MCLK4 is the same kind of RCG/branch as the others (`+0x4070`/`+0x4088`, no GDSC of its own; the controller's domains MMCX + MX at low_svs); both sensor nodes name TITAN_TOP as their power domain. **On the tablet**: MCLK1 ran from the XO (c2r) and from PLL0 at 24 MHz (c2r24) with GCC's camera XO on; MCLK4's branch did not run with GCC's camera XO and TITAN_TOP off (c2f: 0x88000000), its RCG and branch words as MCLK1's (*inferred*: the camera XO feeds the MCLK controller; `c2fx` tells it from TITAN_TOP) | msm, KDTS; tablet | verified (source); MCLK1 verified (c2r); MCLK4: needs-boot (c2f/c2fx) |
+| MCLKs | cambistmclkcc PLL0 Rivian ELU 960 MHz (L 0x32, CONFIG_CTL 0x12000000/0x00890263/0x1af04237); MCLK n RCG `+0x4000` + 0x1c·n, branch `+0x4018` + 0x1c·n; table 12 / 19.2 (XO) / 24 / 68.57 MHz; 24 MHz = PLL0 / 10 × 1/4 (source 3, CFG 0x2313, M 1, N reg 0xfc, D reg 0xfb). KDTS: rear MCLK1 24 MHz (gpio90 `cam_mclk`, 4 mA), front MCLK4 19.2 MHz (gpio93 `cam_aon_mclk4`, 2 mA); MCLK4 is the same kind of RCG/branch as the others (`+0x4070`/`+0x4088`, no GDSC of its own; the controller's domains MMCX + MX at low_svs); both sensor nodes name TITAN_TOP as their power domain. **On the tablet**: MCLK1 ran from the XO (c2r) and from PLL0 at 24 MHz (c2r24) with GCC's camera XO on; MCLK4's branch did not run with GCC's camera XO and TITAN_TOP off (c2f: 0x88000000), its RCG and branch words as MCLK1's (c2fx, 2026-11-13: not with the camera XO alone either; c3f's path with TITAN_TOP and CAMCC's domains ran it, §4.2 "After c2fx") | msm, KDTS; tablet | verified (source); MCLK1 verified (c2r); MCLK4 verified on level 3's path (c3f) |
 | CCI | only **CCI0** `ac7b000`, SPI 426, master 1 (KDTS 1 MHz Fast-mode Plus with the CCI clock at 37.5 MHz from PLL0), SDA gpio115, SCL gpio116 (`cci_i2c_*`, 4 mA, no bias); registers per master 0x100·m, queues 0x300 + 0x200·m + 0x100·n, IRQ 0xc00..0xc0c; commands SET_PARAM 1, REPORT 8, WRITE 9, READ 10; queues of 64/16 words, writes ≤ 11 bytes, reads ≤ 12; timing sets for a 19.2 MHz CCI clock (100/400 kHz) and a 37.5 MHz one (100/400/1000 kHz) | DT, msm | verified (source) |
 | Rear S5KJN1 | CCI0 m1 **0x10**; CSIPHY1, 4 lanes (D-PHY), 700 MHz link (1.4 Gbit/s a lane); reset gpio6 active low; vddd L1I 1.096 V (`ldoi1`), vdda 2.8 V fixed (gpio175 enable, 100 µs), vddio L6B 1.8 V (`ldob6`), afvdd L7B 2.8 V (`ldob7`); on: vddd, 1–2 ms, vdda, vddio, afvdd, MCLK, reset release, 10–15 ms; off: reset, MCLK, afvdd, vddio, vdda, 1–2 ms, vddd; ID 0x0000 = 0x38e1; modes 4080×3072@30 (HTS 4352, VTS 4288), 8160×6144@10; RAW10, mounted rotated 180° (Ubuntu sets vflip: BGGR); controls exposure 0x0202, gain 0x0204 (32 = 1×, 32..2048), frame length 0x0340, orientation 0x0101, test pattern 0x0600 (2 = colour bars), stream 0x0100; flash = PianoTorch's lamp | DT, msm | verified (source) |
 | Front OV32D40 | **not on CCI**: QUP2 SE1's pins (`i2c@884000`, SDA gpio4, SCL gpio5, `qup2_se1`, 2 mA, no bias; Ubuntu ran GENI I2C at 1 MHz) **0x10**; CSIPHY4, 4 lanes, 842.4 MHz; reset gpio7 active low; vddio L10B 1.8 V (`ldob10`), dvdd L2G 1.2 V (`ldog2`), avdd 2.8 V fixed (gpio176); on: reset asserted, supplies, 5–6 ms, MCLK, 10–12 ms, reset release, 20–25 ms; ID 0x300a = 0x5632 (five reads, 10–12 ms apart); modes 3264×2448@30, 3264×1836@30, 6528×4896@10; SBGGR10; controls exposure 0x3500 (24 bits), gain 0x3508 (256 = 1×, 288..15872), frame length 0x380e | DT, msm | verified (source) |
@@ -146,6 +149,15 @@ DT power domain (`piano-camera-camss=0`: the minimal path, now with the camera X
 even at the XO, so a missing source shows as `its RCG's root did not come on`. `c2f` (default) and `c2fx` (`camss=0`) tell the two
 inputs apart.
 
+**After c2fx (cplan, 2026-11-13; §8.4).** The minimal path with GCC's camera XO on still stopped at step 214 (`a clock branch did
+not run`, power-down complete), while c3f's level-2 part, the default path with TITAN_TOP, its top AHB and CAMCC's domains voted,
+ran MCLK4 at 19.2 MHz and read the front's chip ID 0x5632 (**confirmed on the tablet**). So the camera XO alone is not MCLK4's
+missing input; TITAN_TOP or CAMCC's domains (MXC) is (which of the two is not told apart, *inferred* TITAN_TOP: the sensors' DT
+power domain). There is no reason to tell them apart: level 3 needs TITAN_TOP and CAMCC's domains anyway (CSIPHY, CSID and TFE are
+inside TITAN_TOP), and Linux has both on whenever a sensor is powered. **Level 2 keeps level 3's path for either sensor**: the boot
+argument `piano-camera-camss` and the `c2fx` image are gone; the host model keeps the minimal path for its tests, and its
+`mclkNeedsTitan` now models the tablet (the minimal path fails at 214, everything as found).
+
 **Deviations from Linux, on purpose.** CCI0 and the rear's MCLK run from the XO at L2 (no CAMCC PLL); 400 kHz instead of 1 MHz. The
 rear sensor's EXTCLK range is not in any source: Linux refuses anything but 24 MHz because its mode's PLL words assume it. Reading
 the ID at 19.2 MHz is *inferred* to work (sensors of this class take 6–27 MHz); a rear `idRead` failure with the front passing is
@@ -225,6 +237,27 @@ The kext's frames are now at most 3,184 bytes (`tooling/k27/check-kext-stack.py`
 6 KiB limit), and the tablet reports the real margin: `stack: N of 16384 bytes free at the thread's start, the least M at step S`
 at the end of every run (`ml_stack_remaining` at each log line and before each IOKit mapping), and a mapping with less than 6 KiB
 left logs `stack: only N bytes ...` first.
+
+**After cplan (2026-11-13 00:56, §8.4): the exposure loop.** The colour bars came out exact, but both scenes read the black level
+(c3rs rear means 63-64, min 56, max 88; c3f front 63-64, min 61, max 71) with the room lit and the front facing it. Evidence vs
+inference: (1) the front wrote **no control**: its init table sets only 0x3501/0x3502 (exposure 0x0102 = 258 rows of 2820, about
+3 ms) and leaves the gain at its reset value, while its driver writes exposure 1024, gain 7936 and the test pattern off (0x3019 =
+0xd2, 0x4308 = 0) before every stream-on (its control setup): **verified (source)**; that this made the front's frames black:
+*inferred*. (2) The rear had exposure 3840 lines (about 30 ms) at gain 64 (2x; its driver's default is 192, 6x): enough for a lit
+scene, so its black frames say no light reached it: *inferred*: the rear camera faces the desk. (3) Both outputs carry read noise
+around the black level (no constant code): the ADC and its analogue supply run (*inferred*). Changes: the front's controls at its
+driver's defaults; both sensors' exposure and gain **read back** before stream-on (`controls: ... read back ok`); and, for the
+scene (the front always, the rear without its colour bars), an **exposure loop** after stream-on (`CameraStream.h`
+`exposureLoop`, `aeRule`, `aeSplit`): from the drivers' defaults, a sample of 64 row pairs of the frame aeSettle (2) frames after
+each change, exposure x gain scaled toward 160 above black (within a quarter: converged), 8x when there is no signal, a quarter when
+over a quarter is saturated, the exposure first (up to the frame length less the margin) at the lowest gain, then the gain; each
+sample logged as it is taken (`ae N: exposure .. gain .. (x.xx): means ../../../.., N above black; histogram ...; saturated ..%`),
+and a verdict: **converged**, **DARK** at the longest exposure and the highest gain (no light reaches the sensor), dim, saturated,
+**NO RESPONSE** (a change of 1.4x or more that moved the mean under 10 %: the controls do not reach the pixels), or not converged.
+One boot then tells the three causes apart: the registers (read back wrong, or NO RESPONSE), the tables (the defaults' sample
+already lit), the lighting (DARK). Host-tested on the model's lit scene (its value follows exposure x gain a frame late): both
+sensors converge from too bright, too dim and much too bright, with the rear's padded lines; DARK with no light; saturated at the
+minimum; no loop for the colour bars or with `piano-camera-ae=0`.
 
 **Memory safety.** On c1's tablet the route is our window: the write master can reach only the buffer's 16 MiB (anything else
 faults in the SMMU, logged from the bank's FSR/FAR before the release), the guard catches an overflow inside it, and the buffer is
@@ -342,10 +375,12 @@ installs on our boot), PianoTorch (the photo flash, B12, built).
 | `piano-camera-stop` | 0 | power down after this step (201..230; level 3: 300..331, below 300 stops level 2's part) |
 | `piano-camera-cycles` | 1 | repeat level 2 (1..20) |
 | `piano-camera-delay` | 0 | wait first (s) |
-| `piano-camera-plan` | none | `NAME,NAME,...` (at most 8 of c1b c2f c2fx c2r c2rg c2r24 c3rp c3r c3rs c3f): after the survey, each test image's sequence with exactly its arguments (`CameraPlan.h`), in that order, 0.5 s apart, the next only when the one before ended with `power down complete` and no buffer kept; a `plan result` line per item at the end; an unknown name runs the survey only. Sets the level (3 if any c3) |
+| `piano-camera-plan` | none | `NAME,NAME,...` (at most 8 of c1b c2f c2r c2rg c2r24 c3rp c3r c3rs c3f): after the survey, each test image's sequence with exactly its arguments (`CameraPlan.h`), in that order, 0.5 s apart, the next only when the one before ended with `power down complete` and no buffer kept; a `plan result` line per item at the end; an unknown name runs the survey only. Sets the level (3 if any c3) |
 | `piano-camera-cc`, `-mclkcc`, `-blocks`, `-qup`, `-spmi`, `-smmu` | 1 | 0 leaves that part of the survey out (`-cc=0` also refuses the rear on CCI0) |
 | `piano-camera-votes` | 1 | 0: level 2 votes no CAMCC domain (§4.2 after c1); level 3 always votes |
-| `piano-camera-camss` | 1 | level 2: TITAN_TOP (with CAMCC's domains and the camera AHB) for either sensor and bus, the sensors' DT power domain (§4.2 after c2f); 0: the minimal path (only the rear over CCI0 powers it); level 3 always 1 |
+| `piano-camera-ae` | 1 | level 3: the exposure loop for the scene (the front always, the rear without its colour bars; §4.3 "After cplan"); 0: the drivers' default controls only |
+| `piano-camera-ae-target` | 160 | the loop's target mean above the black level (16..800) |
+| `piano-camera-ae-steps` | 8 | the loop's samples at most (1..8) |
 | `piano-camera-mmcx-floor` | 0x140 | the MMCX floor this client declares to the shared votes (the boot display's NOM_L1; never lower than another client's) |
 | `piano-camera-frames` | 2 | level 3: frames to collect (1..8) |
 | `piano-camera-pattern` | 1 | level 3: the rear's colour bars (0x0600 = 2); 0: the scene |
@@ -388,7 +423,7 @@ GPU path):
 
 ```sh
 PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh   # the KC with PianoCamera
-tooling/k27/build-camera-test-images.sh                              # out/ram-cam-<name>/ for c1 c1x c1b c2f c2fx c2r c2rg c2r24 c3rp c3r c3rs c3f
+tooling/k27/build-camera-test-images.sh                              # out/ram-cam-<name>/ for c1 c1x c1b c2f c2r c2rg c2r24 c3rp c3r c3rs c3f cplan cae
 # (or: PIANO_A830_METAL=0 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh, then CAM_PROFILE=plain tooling/k27/build-camera-test-images.sh)
 python3 tooling/native/usb-console.py --capture 1000 &               # then each image: tooling/native/native-loop.sh out/ram-cam-c1/boot-piano-macos-ram-A-bundled.img
 grep -a "PianoCamera" logs/usb-console/<newest>-port0.txt
@@ -400,7 +435,6 @@ grep -a "PianoCamera" logs/usb-console/<newest>-port0.txt
 | `c1x` | `piano-camera=1 piano-camera-cc=0 piano-camera-mclkcc=0 piano-camera-delay=20` | **yes** | only if `c1` hangs after its `gcc:` line: the rest of the survey without the clock controllers |
 | `c1b` | `piano-camera=2 piano-camera-sensor=1 piano-camera-stop=203 piano-camera-delay=20` | **yes** (c1 passed) | c1's re-test: level 2's steps 201-203 only (CAMCC's domains voted, GCC's three camera branches enabled), the `step 202: the controllers ...` lines (CAMCC's GDSCs, branches, sources, PLLs; the MCLK controller; TITAN_TOP's state) that c1 could not read, then everything as found: no rail, pin, CAMCC or CCI store |
 | `c2f` | `piano-camera=2 piano-camera-sensor=2 piano-camera-delay=20` | **yes**, after `c1` passed | the front: rails, software I2C, 0x5632; since c2f with GCC's camera XO and TITAN_TOP (its DT power domain; CAMCC's domains voted, the camera AHB): the rear's c2r path minus CCI0 (failed 11-12 before that: MCLK4, §8.4) |
-| `c2fx` | `piano-camera=2 piano-camera-sensor=2 piano-camera-camss=0 piano-camera-delay=20` | **yes**, after `c2f` | the front on the minimal path, only GCC's camera XO added: whether MCLK4 needed the camera XO (passes) or TITAN_TOP/MXC (fails at 214 with `mclk4: ...`, powered down) |
 | `c2r` | `piano-camera=2 piano-camera-sensor=1 piano-camera-delay=20` | **yes**, after `c1` passed | the rear over CCI0 (TITAN_TOP, XO clocks), 0x38e1 (**passed**, §8.4) |
 | `c2rg` | `piano-camera=2 piano-camera-sensor=1 piano-camera-rear-bus=1 piano-camera-delay=20` | **yes** | the rear over software I2C (separates CCI0 from the sensor when `c2r` fails) |
 | `c2r24` | `piano-camera=2 piano-camera-sensor=1 piano-camera-mclk24=1 piano-camera-delay=20` | **yes** | the rear with Linux's 24 MHz MCLK (the MCLK PLL) (**passed**, §8.4) |
@@ -409,7 +443,8 @@ grep -a "PianoCamera" logs/usb-console/<newest>-port0.txt
 | `c3r` | `piano-camera=3 piano-camera-sensor=1 piano-camera-delay=20` | **yes**, after `c3rp` passed | the rear's colour bars: two frames with their times, the band pattern, the stride, the rows, the guard |
 | `c3rs` | `piano-camera=3 piano-camera-sensor=1 piano-camera-pattern=0 piano-camera-frames=4 piano-camera-delay=20` | **yes**, after `c3r` | the rear's scene: four frames, the means with the room light |
 | `c3f` | `piano-camera=3 piano-camera-sensor=2 piano-camera-delay=20` | **yes**, after `c2f` and `c3r` | the front's scene over CSIPHY4 |
-| `cplan` | `piano-camera=3 piano-camera-plan=c3rp,c2fx,c3r,c3rs,c3f piano-camera-delay=20` | **yes** | the five on one boot in their gated order, each with its image's arguments, the next only after a complete power-down (`CameraPlan.h`; host-tested on c1's board model: five runs, the same free SMMU group and bank each time, everything as found after the last) |
+| `cplan` | `piano-camera=3 piano-camera-plan=c3rp,c2f,c3r,c3rs,c3f piano-camera-delay=20` | **yes** | the ladder on one boot in its gated order, each with its image's arguments, the next only after a complete power-down (`CameraPlan.h`; host-tested on c1's board model: five runs, the same free SMMU group and bank each time, everything as found after the last). Ran 2026-11-13 with c2fx in c2f's place (§8.4) |
+| `cae` | `piano-camera=3 piano-camera-plan=c3r,c3rs,c3f piano-camera-delay=20` | **yes** | the exposure loop on both scenes: the rear's colour bars first (the stream's regression check after the loop's rework), then the rear's and the front's scenes, each from its driver's defaults to 160 above black, a non-flat histogram where light reaches the sensor (§8.2 "cae") |
 
 Each runs `piano-reset-after=300`. The order is `c1` → (`c1x`) → `c1b` → `c2f` → `c2r` → `c2rg`/`c2r24` as needed → `c3rp` → `c3r` →
 `c3rs` → `c3f`. **Rebuild the c2 images from this commit on**: images built before it wait at step 201 for CLK_OFF on the
@@ -554,12 +589,12 @@ free at the thread's start, the least M at step S (logging and IOKit mappings me
 (the kext's own frames are at most 3.6 KiB; XNU's IOKit mapping and IOLog paths below them). `stack: only N bytes of the thread's
 stack left before ...` before a mapping means under 6 KiB: report it with the step.
 
-**cplan** (the plan): after the survey `plan: c3rp,c2fx,c3r,c3rs,c3f (5 sequences ...)` at start, then per item `plan 1/5: c3rp
-(level 3, the rear; camss 1 rear-bus cci mclk24 1 pattern 1 frames 2 stop 312)` followed by that image's own lines (as c3rp, c2fx,
-c3r, c3rs, c3f above), and at the end one line per item run and the count:
+**cplan** (the plan): after the survey `plan: c3rp,c2f,c3r,c3rs,c3f (5 sequences ...)` at start, then per item `plan 1/5: c3rp
+(level 3, the rear; rear-bus cci mclk24 1 pattern 1 frames 2 stop 312)` followed by that image's own lines (as c3rp, c2f, c3r, c3rs,
+c3f above), and at the end one line per item run and the count:
 ```
 PianoCamera: plan result 1/5 c3rp: rear: failed at step 312: stopped (piano-camera-stop)          <- pass (the stop asked for)
-PianoCamera: plan result 2/5 c2fx: front chip id 0x5632 ok over software I2C gpio4/5, mclk 19200000 Hz   (or: front failed at step 214: ...)
+PianoCamera: plan result 2/5 c2f: front chip id 0x5632 ok over software I2C gpio4/5, mclk 19200000 Hz
 PianoCamera: plan result 3/5 c3r: rear: 2 frames, our translating window ..., guard intact, means ../../../.., power down complete
 PianoCamera: plan result 4/5 c3rs: rear: 4 frames, ...
 PianoCamera: plan result 5/5 c3f: front: 2 frames, ...                                            (or: front: failed at step 214: ...)
@@ -568,6 +603,26 @@ PianoCamera: stack: ... the least M at step S ...
 ```
 `plan: stopped after NAME (its power-down was not complete, or its buffer was kept): K of 5 not run` stops it (each item's own
 lines say why); a reset during an item leaves its last lines, and the items before it have their whole reports.
+
+**cae** (the exposure loop; `plan: c3r,c3rs,c3f`). Item 1 (the rear's colour bars, no loop) as c3r: `controls: exposure 3840
+(0x202) gain 64 (0x204) written; read back ok: exposure 3840 gain 64`, `level 3: rear S5KJN1 4080x3072 RAW10: OK (2 frames, ...)`,
+the bands b0..b7 as on 11-13. Items 2 and 3 (the rear's and the front's scenes), each:
+```
+PianoCamera: controls: exposure 3840 (0x202) gain 192 (0x204) written; read back ok: exposure 3840 gain 192        (front: exposure 1024 (0x3500) gain 7936 (0x3508) ... read back ok: exposure 1024 gain 7936)
+PianoCamera: ae: the exposure loop: target 160 above black (64), at most 8 samples, 2 frames after each change; exposure 8..4266, gain 32..2048 (32 = 1x)
+PianoCamera: ae 1: exposure 3840 gain 192 (6.00x): means ../../../.., N above black; histogram ...; saturated ..%
+PianoCamera: ae 2: exposure .. gain .. (..x): ...
+PianoCamera: ae K: ...: converged                                       (or: DARK / dim / saturated / NO RESPONSE / not converged)
+PianoCamera: ae: K sample(s) over F frames, W control writes: <the verdict>; the frames below at exposure E gain G
+PianoCamera: frame: r0c0 min .. mean .. max ..; histogram (128 a bin) ...    (four lines: the final frame at the loop's controls)
+PianoCamera: plan result 2/3 c3rs: rear: 4 frames, our translating window, guard intact, means a/b/c/d, ae converged (exposure E gain G), power down complete
+```
+Pass for a sensor: `converged` and the final frame's means near 224 (64 + 160) with its histogram spread over several bins.
+What each other verdict says: **DARK** at the longest exposure and the highest gain = no light reaches that sensor (the rear facing
+the desk is the expected case; for the front facing the lit room it would point at the sensor's analogue path); **NO RESPONSE**
+= the means do not follow exposure x gain (the registers do not reach the pixels: compare the read-back values with the writes);
+`read back FAILED` or other values than written = the control registers themselves; a lit `ae 1` sample already at the drivers'
+defaults with c3f's black frames of 11-13 = the missing controls were the cause (the tables alone are dark).
 Failure lines: `FAILED at step 303: ... no LOCK_DET within 1.5 ms` (PLL0: its MODE in `last value`; MXC's vote line above),
 `FAILED at step 306: refused: ...` (the SMMU's state: report the survey's smmu lines), `FAILED at step 308: CSID-lite0 did not
 reset`, `FAILED at step 320: no frame arrived` (report the `irq seen` and `csiphy1 status` lines: a CSI-2 RX error says the PHY saw
@@ -672,6 +727,18 @@ up 32, Session::begin 2,000, mmUpdate 240, mmSend 176, mapRsc 80; the 14:35 buil
 `check-kext-stack.py` on main's object: 15,200 at most anywhere since the c3 fixes, 12,672 before them), no other driver's change was involved (no vote, RPMh, SPMI or timer path: the fault is a
 store into a stack guard page). Fixed: §4.3 "After the c3rp of 2026-11-13".
 
+**cplan, 2026-11-13 00:56** (the stack fix's image, a25ccc68e3f9e91a; plan c3rp, c2fx, c3r, c3rs, c3f; the console in the main
+session's capture): **all five ran, each with its power-down complete; the stack's least margin 12,792 of 16,384 bytes (at step
+202)**. Confirmed on the tablet: c3rp stopped at 312 as asked (`smmu: group 5's S2CR left at fault`, `power down complete`, `buffer
+freed`): the SMMU release fix of 11-12 works. c2fx: `front failed at step 214: a clock branch did not run` (the minimal path with
+the camera XO: §4.2 "After c2fx"). **c3r: the rear's first frames**: two BUF_DONEs, the first 64 ms after stream-on (SOF +39.7 ms),
+then 33.3 ms apart (30 fps); written 15,678,864 bytes, **stride 5104** (lines padded to 16 bytes: open question 7), the guard
+intact, no SMMU fault; the colour bars **exact** (bands b0..b7 white, yellow, cyan, green, magenta, red, blue, black at 1023/0 per
+position, which also confirms GRBG as the unflipped order). c3rs: four scene frames, means 64/64/63/64 (min 56-58, max 74-88: the
+black level with read noise); c3f: **the front's first frames**, two at 3264x1836, stride 4080, the first 26.6 ms after
+stream-on, 33.3 ms apart, means 64/64/64/63 (min 61, max 67-71). Why the scenes are black: §4.3 "After cplan" (the front: no
+controls written, *inferred* the cause; the rear: *inferred* facing the desk). Next: `cae`.
+
 ## 9. Fallback
 
 Without `piano-camera` nothing is mapped. A refusal writes nothing for that sensor. Any failure runs the full power-down. A
@@ -687,11 +754,12 @@ system sleep during a sequence waits for its power-down (the kext joins the powe
 5. Stream 0x1c00's SMMU entry at XNU time; bypass allowed? → `c1`: **no entry** (unmatched streams fault): L3 takes its window.
 6. The shared multimedia votes (MXC, MMCX, MM BCMs) between camera, video and display → **built** (§4.3.1); whether MXC at low_svs
    suffices for PLL0 at 1200 MHz → `c3rp`: **yes** (PLL0 locked).
-7. Frame mode's line padding for 4080-pixel lines → L3's first frame (`c3r`: `frame: written ..., stride ...`; lost in c3r's abort).
+7. Frame mode's line padding for 4080-pixel lines → **answered** (cplan's c3r, 2026-11-13): padded to 16 bytes, stride 5104.
 10. Are Linux's clock lists all the CAMSS blocks need (no stall on a CSID-lite0/TFE-lite0/CSIPHY access)? → `c3rp`/`c3r`: **yes**.
 11. The CSID-lite 980's RDI interrupt bits (SOF 12, EOF 9: inferred from the 680's layout at the same offset) → `c3r`'s per-frame
     lines (`stream: frame 1: SOF +.. EOF +.. BUF_DONE +..`).
-12. What MCLK4 needs besides its RCG and branch: GCC's camera XO or TITAN_TOP (c2f had neither) → `c2f` (both) and `c2fx` (the XO).
+12. What MCLK4 needs besides its RCG and branch: GCC's camera XO or TITAN_TOP (c2f had neither) → **answered** (cplan, 2026-11-13):
+    not the camera XO alone (c2fx); TITAN_TOP and CAMCC's domains run it (c3f), which level 2 now always takes (§4.2 "After c2fx").
 13. Which SMMU words the hypervisor refuses besides an S2CR naming a missing bank (c3r): the release keeps every found word that is
     not a valid configuration (§4.3 "After c3"); `c3rp`'s `left at` lines and its clean end confirm the rest.
 14. The CSI2 RX status bits of the lite 980 (not named in the specification): `c3r`'s raw words (`first csi2-rx word`) with the

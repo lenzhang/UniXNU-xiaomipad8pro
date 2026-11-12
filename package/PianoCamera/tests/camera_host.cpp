@@ -1041,6 +1041,9 @@ struct TestOps {
   }
   void cacheClean(const void *, uint64_t) { ++b.cleans; }
   void cacheInvalidate(const void *, uint64_t) { ++b.invalidates; }
+  // level 5's copy of the last frame (the kernel's Ops keeps it for the user client)
+  std::vector<uint8_t> kept;
+  void frameReady(const uint8_t *buf, const StreamResult &r) { kept.assign(buf, buf + uint64_t(r.stats.stride) * r.height); }
   uint64_t nowUs() { return b.now; }
   void msleep(unsigned ms) { udelay(ms * 1000); }
   int vrm(unsigned rail, const VrmCmd *cmds, unsigned n) { return b.vrm(rail, cmds, n); }

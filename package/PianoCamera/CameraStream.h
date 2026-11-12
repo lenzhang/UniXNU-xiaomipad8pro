@@ -440,6 +440,7 @@ class Stream {
       stream();
       stop();
       statistics();
+      if (r_.stats.done) ops.frameReady(d_.cpu, r_);   // the last frame, the write master stopped (level 5 keeps a copy)
     } else if (u_.streaming || u_.wm) {
       stop();
     }
