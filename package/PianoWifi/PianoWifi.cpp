@@ -46,7 +46,11 @@
 // above 4 GiB), piano-wifi-mode=1 (level 5 also sends the firmware's options, the host's copy-engine configuration and the mode,
 // which is level 6's doorway), piano-wifi-shadow=1 (the shadow register list in that configuration),
 // piano-wifi-wmitimeout=MS (the deadline of each level 6 step, default 10000), piano-wifi-scanwait=MS (how long the scan itself
-// may take, default 12000), piano-wifi-band=N (1 both bands, 0 only 2.4 GHz), piano-wifi-bssid=1 (print a network's whole
+// may take, default 12000), piano-wifi-l6pre=N (the radio's set-up between the firmware's ready event and level 6's virtual
+// device, default 0x3f = 63: bit 0 the hardware mode, 1 the radio's six parameters, 2 the channel list of its regulatory event,
+// 3 a device address that is never all zeros, 4 wait for that event first, 5 pace the commands apart, 6 no scan at all — docs
+// §10.27) with piano-wifi-l6regwait/l6pace/l6hold (2000, 50, 8000 ms),
+// piano-wifi-band=N (1 both bands, 0 only 2.4 GHz), piano-wifi-bssid=1 (print a network's whole
 // address in the log instead of its first three bytes), piano-wifi-noc=0 (no PCIe NoC vote), and level 4's four switches of the
 // 2026-11-12 fourth round (WifiPbl.h, docs §10.23), each the A/B of a default: piano-wifi-socreset=0 (no chip power-on reset before
 // BHI), piano-wifi-msi=0 (MSI left off), piano-wifi-ctxearly=1 (the MHI context registers before the doorbell too),
