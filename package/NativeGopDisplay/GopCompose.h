@@ -29,6 +29,11 @@
 namespace gopcompose {
 
 static constexpr uint32_t kFormatBGRA = 'BGRA', kFormatRGhA = 'RGhA', kFormatB3A8 = 'b3a8';
+// '&BGA': Apple's lossless-compressed spelling of BGRA, one plane. macOS 27.3's WindowServer takes it for its framebuffers on the
+// Mac17,11 identity (2026-11-13, ram-k273-desk-dev-s1b: "a frame surface 3200x2136 format 0x26424741 row 3200 ... is not read").
+// Nothing here compresses: the Metal plugin's frontend renders a planar surface at its plane's address and rows, so plane 0 holds
+// plain BGRA rows (NativeGopDisplay::openSource reads it as such).
+static constexpr uint32_t kFormatBGRALossless = '&BGA';
 static constexpr uint32_t kBlack = 0xff000000u;
 static constexpr unsigned kLayers = 4;         // the family's layers in a swap (IOMFBSwapIORequest: surfaces at 2944 + 8 * i)
 static constexpr unsigned kRefreshTicks = 30;  // refresh copies on ticks 1, 2, 4, 8, 16 and 30 after a frame

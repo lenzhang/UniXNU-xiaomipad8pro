@@ -2040,15 +2040,18 @@ bool NativeGopDisplay::openSource(IOSurface *surface, gopcompose::RowSource *sou
                   ioSurfacePlaneBytesPerElement(surface, plane));
         fSurfaceFormat = format;
     }
-    bool usable = base ? gopcompose::baseFormat(format) : format == gopcompose::kFormatBGRA;
-    if (usable && format == gopcompose::kFormatB3A8) {   // the colour plane; alpha is not shown
+    // '&BGA' (gopcompose::kFormatBGRALossless) is read as BGRA from its one plane, for a frame and for the cursor.
+    const bool lossless = format == gopcompose::kFormatBGRALossless;
+    const uint32_t readFormat = lossless ? gopcompose::kFormatBGRA : format;
+    bool usable = lossless || (base ? gopcompose::baseFormat(format) : format == gopcompose::kFormatBGRA);
+    if (usable && (format == gopcompose::kFormatB3A8 || lossless)) {   // the colour plane ('b3a8': alpha is not shown)
         usable = ioSurfacePlaneCount(surface) >= 1 && ioSurfacePlaneBytesPerElement(surface, 0) == 4;
         if (usable) {
             offset = ioSurfacePlaneOffset(surface, 0);
             rowBytes = ioSurfacePlaneBytesPerRow(surface, 0);
         }
     }
-    const uint64_t pixelBytes = gopcompose::bytesPerPixel(format);
+    const uint64_t pixelBytes = gopcompose::bytesPerPixel(readFormat);
     if (!memory || !usable || !width || !height || width > 16384 || height > 16384 || rowBytes < width * pixelBytes ||
         offset + (height - 1) * rowBytes + width * pixelBytes > memory->getLength()) {
         static unsigned refused;
@@ -2063,7 +2066,7 @@ bool NativeGopDisplay::openSource(IOSurface *surface, gopcompose::RowSource *sou
         GOPLOG("cannot map a %llux%llu surface\n", width, height);
         return false;
     }
-    *source = {bytes + offset, rowBytes, static_cast<uint32_t>(width), static_cast<uint32_t>(height), format};
+    *source = {bytes + offset, rowBytes, static_cast<uint32_t>(width), static_cast<uint32_t>(height), readFormat};
     *mapped = {memory, cached};
     return true;
 }
