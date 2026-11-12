@@ -12,12 +12,21 @@
 //   1. once the firmware is in mission mode, for each channel in turn (20, then 21, as the MHI host prepares a device's two
 //      channels): its ring into its context and the state enabled, then
 //   2. a "start channel" command on the command ring, and the chip answers with a command completion event;
-//   3. every element of the inbound ring but one gets an 8 KiB buffer of the arena, and the chip is told (one doorbell);
+//   3. once channel 21's start has completed (never before: its preparation puts its ring back at the base), every element of the
+//      inbound ring but one gets an 8 KiB buffer of the arena, and the chip is told (one doorbell), as the MHI host queues an
+//      inbound channel's buffers right after its start;
 //   4. a packet to the chip is written straight into one of our four outbound buffers (no copy of the 6 KiB downloads), given one
 //      element of the outbound ring, and one doorbell;
-//   5. polling walks the two event rings: a transfer completion on 21 is a received packet (the chip wrote its length), one on 20
-//      frees that outbound buffer, and state or execution-environment events are reported to the owner (a system error or a crash
-//      dump environment ends level 5).
+//   5. polling walks the two event rings: a transfer completion names the ring ELEMENT it completes (WifiHw.h), so each ring
+//      keeps which buffer each of its elements carries and its own read pointer, walked up to the element the event names; one
+//      on 21 is a received packet (the chip wrote its length), one on 20 frees that outbound buffer, a "doorbell mode" event
+//      rings the channel again, and state or execution-environment events are reported to the owner (a system error or a
+//      crash dump environment ends level 5).
+// The first level 5 boots with a firmware in mission mode (2026-11-12, desk-dev13w/14/15) stopped at "0 receive buffers posted":
+// the event walk after channel 20's start posted the buffers into channel 21's ring before 21 was prepared, and 21's preparation
+// then put that ring's write pointer back at the base with every buffer still marked busy, so the chip had nowhere to put its
+// router's hello. And every transfer completion was matched against the buffers' addresses instead of the elements', so not one
+// would have been recognised.
 // Nothing here maps memory, allocates or sleeps: the arena is the owner's, and every wait is the owner's bounded poll.
 #pragma once
 #include <stdint.h>
@@ -28,10 +37,16 @@ namespace pianowifi {
 
 constexpr uint32_t kIpcrRxBuffers = kIpcrElements - 1;   // a transfer ring is never filled completely: one element stays free
 
+constexpr int8_t kIpcrNoBuffer = -1;
+
 struct ChanRing {
   uint8_t *va = nullptr, *ctx = nullptr;
   uint64_t bus = 0;
   uint32_t chan = 0, elements = 0, wp = 0;   // wp: the element we fill next (the chip reads up to it)
+  uint32_t rp = 0;                           // the oldest element the chip has not completed (ours, moved by its events)
+  int8_t slot[kIpcrElements];                // the buffer each element carries (an index into rx or tx), kIpcrNoBuffer: none
+  // for the log: transfer completions seen on this channel, the last one's code and length, doorbells rung
+  uint32_t events = 0, lastCode = 0, lastLength = 0, doorbells = 0;
 };
 
 struct IpcrBuffer {
@@ -54,6 +69,7 @@ struct Ipcr {
   uint32_t cmdChannel = 0;
   // counters and the last things seen, for the log
   uint32_t sent = 0, received = 0, txDone = 0, commands = 0, commandErrors = 0, states = 0, ees = 0, dropped = 0, refused = 0;
+  uint32_t dbModes = 0, transferErrors = 0, skipped = 0;   // doorbell-mode events, error codes, completed elements not delivered
   uint32_t lastState = 0, lastEe = 0, lastCode = 0;
   const char *error = nullptr;
 };
@@ -110,7 +126,8 @@ inline bool ipcrPlan(Ipcr &p, Arena &arena, MhiContexts &contexts)
     s.ring->bus = bus;
     s.ring->chan = s.chan;
     s.ring->elements = kIpcrElements;
-    s.ring->wp = 0;
+    s.ring->wp = s.ring->rp = 0;
+    for (int8_t &e : s.ring->slot) e = kIpcrNoBuffer;
     s.ring->ctx = mhiChannelCtx(contexts, s.chan);
     put32(s.ring->ctx + kChanCfg, kChanStateDisabled | kChanBurstDisable << 8);
     put32(s.ring->ctx + kChanType, s.type);
@@ -141,7 +158,8 @@ inline bool ipcrPrepare(ChanRing &r)
 {
   using namespace ipcrdetail;
   if (!r.ctx || !r.va) return false;
-  r.wp = 0;
+  r.wp = r.rp = 0;
+  for (int8_t &e : r.slot) e = kIpcrNoBuffer;
   put64(r.ctx + kChanRBase, r.bus);
   put64(r.ctx + kChanRLen, uint64_t(r.elements) * kMhiElement);
   put64(r.ctx + kChanRp, r.bus);
@@ -190,13 +208,22 @@ inline bool ipcrCommand(Ipcr &p, const MhiIo &io, uint32_t channel, uint32_t com
 inline bool ipcrStart(Ipcr &p, const MhiIo &io, uint32_t channel)
 {
   ChanRing *r = channel == kChanIpcrOut ? &p.out : channel == kChanIpcrIn ? &p.in : nullptr;
-  if (!r || !ipcrPrepare(*r)) {
+  if (!r || !r->ctx || !r->va) {
     p.error = "not one of the two planned channels";
     return false;
   }
   if (p.cmdPending) {
     p.error = "a command is already in flight";
     return false;
+  }
+  ipcrPrepare(*r);
+  // The ring starts empty: whatever its elements carried is the host's again (an inbound buffer is posted only once the start
+  // has completed, ipcrPostRx; an outbound one only on a running channel, ipcrSubmitTx).
+  if (r == &p.in) {
+    p.started[1] = false;
+    for (IpcrBuffer &b : p.rx) b.busy = false;
+  } else {
+    p.started[0] = false;
   }
   return ipcrCommand(p, io, channel, kTreCmdStart);
 }
@@ -224,25 +251,53 @@ inline unsigned ipcrRingAll(Ipcr &p, MhiContexts &contexts, const MhiIo &io)
   return rung;
 }
 
-// Every inbound element but one gets a buffer, then one doorbell. Returns how many were posted.
+// How many elements of a ring the chip still owes a completion for.
+inline uint32_t ipcrOutstanding(const ChanRing &r)
+{
+  return r.elements ? (r.wp + r.elements - r.rp) % r.elements : 0;
+}
+
+// The element a transfer completion's pointer names, -1 when it is not one of this ring's elements.
+inline int ipcrSlotOf(const ChanRing &r, uint64_t ptr)
+{
+  const uint64_t bytes = uint64_t(r.elements) * kMhiElement;
+  if (!r.elements || ptr < r.bus || ptr >= r.bus + bytes || (ptr - r.bus) % kMhiElement) return -1;
+  return int((ptr - r.bus) / kMhiElement);
+}
+
+// Every free receive buffer on the inbound ring (one element always stays free, so at most kIpcrRxBuffers are posted), then one
+// doorbell; only on a running inbound channel (its start completed). Returns how many were posted.
 inline unsigned ipcrPostRx(Ipcr &p, const MhiIo &io)
 {
   using namespace ipcrdetail;
+  if (!p.started[1] || !p.in.va || !p.in.ctx || !p.chdb) return 0;
   unsigned posted = 0;
-  for (IpcrBuffer &b : p.rx) {
+  for (uint32_t i = 0; i < kIpcrRxBuffers; ++i) {
+    IpcrBuffer &b = p.rx[i];
     if (b.busy || !b.va) continue;
-    const uint32_t slot = p.in.wp;
+    const uint32_t slot = p.in.wp, next = (slot + 1) % p.in.elements;
+    if (next == p.in.rp) break;   // the ring is full
     element(p.in.va + slot * kMhiElement, b.bus, b.bytes & 0xffffu, kTreTypeTransfer << 16 | kTreIeot);
+    p.in.slot[slot] = int8_t(i);
     b.busy = true;
     b.length = 0;
-    p.in.wp = (slot + 1) % p.in.elements;
+    p.in.wp = next;
     ++posted;
   }
   if (!posted) return 0;
   const uint64_t wp = p.in.bus + uint64_t(p.in.wp) * kMhiElement;
   put64(p.in.ctx + kChanWp, wp);
   doorbell(io, p.chdb + 8 * kChanIpcrIn, wp);
+  ++p.in.doorbells;
   return posted;
+}
+
+// How many receive buffers the chip holds (posted, not completed).
+inline unsigned ipcrRxPosted(const Ipcr &p)
+{
+  unsigned n = 0;
+  for (const IpcrBuffer &b : p.rx) n += b.busy ? 1 : 0;
+  return n;
 }
 
 // A free outbound buffer to build a packet in (its bus address is the chip's); -1 when all four are in flight. The buffer is
@@ -272,18 +327,23 @@ inline bool ipcrSubmitTx(Ipcr &p, const MhiIo &io, unsigned index, uint32_t leng
 {
   using namespace ipcrdetail;
   if (index >= kIpcrOutBuffers || !p.tx[index].va || !p.tx[index].busy || !length || length > p.tx[index].bytes) return false;
+  if (!p.started[0] || !p.out.va || !p.out.ctx) {   // not a running channel: nothing would ever complete it
+    ipcrReleaseTx(p, index);
+    return false;
+  }
   const uint32_t slot = p.out.wp, next = (slot + 1) % p.out.elements;
-  const uint64_t rp = get64(p.out.ctx + kChanRp);
-  if (p.out.bus + uint64_t(next) * kMhiElement == rp) {   // the ring would look empty to the chip again
+  if (next == p.out.rp) {   // the ring would look empty to the chip again
     ipcrReleaseTx(p, index);
     return false;
   }
   element(p.out.va + slot * kMhiElement, p.tx[index].bus, length & 0xffffu, kTreTypeTransfer << 16 | kTreIeot);
+  p.out.slot[slot] = int8_t(index);
   p.tx[index].length = length;
   p.out.wp = next;
   const uint64_t wp = p.out.bus + uint64_t(next) * kMhiElement;
   put64(p.out.ctx + kChanWp, wp);
   doorbell(io, p.chdb + 8 * kChanIpcrOut, wp);
+  ++p.out.doorbells;
   ++p.sent;
   return true;
 }
@@ -314,27 +374,59 @@ inline unsigned ipcrPollRing(Ipcr &p, MhiContexts &contexts, const MhiIo &io, un
     switch (type) {
     case kEvTypeTransfer: {
       p.lastCode = code;
-      if (chan == kChanIpcrIn) {
-        IpcrBuffer *b = nullptr;
-        for (IpcrBuffer &candidate : p.rx)
-          if (candidate.bus == ptr) b = &candidate;
-        if (!b || !b->busy || len > b->bytes) {
-          ++p.dropped;
-          break;
-        }
-        b->busy = false;
-        b->length = len;
-        ++p.received;
-        deliver(kIpcrPacket, chan, code, len, b->va);
-      } else if (chan == kChanIpcrOut) {
-        for (IpcrBuffer &candidate : p.tx)
-          if (candidate.bus == ptr && candidate.busy) {
-            candidate.busy = false;
-            ++p.txDone;
-            deliver(kIpcrTxDone, chan, code, len, candidate.va);
-          }
-      } else {
+      ChanRing *r = chan == kChanIpcrIn ? &p.in : chan == kChanIpcrOut ? &p.out : nullptr;
+      if (!r || !r->elements) {
         ++p.dropped;
+        break;
+      }
+      ++r->events;
+      r->lastCode = code;
+      r->lastLength = len;
+      if (code == kEvCodeDbMode || code == kEvCodeOob) {
+        // The channel is back in doorbell mode (or ran out of elements): nothing completed; the MHI host rings it again when it
+        // has elements the chip has not taken.
+        ++p.dbModes;
+        if (r->wp != r->rp) {
+          doorbell(io, p.chdb + 8 * r->chan, r->bus + uint64_t(r->wp) * kMhiElement);
+          ++r->doorbells;
+        }
+        break;
+      }
+      const int slot = ipcrSlotOf(*r, ptr);
+      if (slot < 0 || (uint32_t(slot) + r->elements - r->rp) % r->elements >= ipcrOutstanding(*r)) {   // not one the chip holds
+        ++p.dropped;
+        break;
+      }
+      const bool good = code == kEvCodeEot || code == kEvCodeEob || code == kEvCodeSuccess;
+      if (!good) ++p.transferErrors;
+      // Every element from our read pointer up to the one the event names is complete. With a completion asked for per element
+      // (IEOT) the chip names each; a longer walk means completions were merged, and only the named element's length is known:
+      // the others are given back without being delivered.
+      for (;;) {
+        const uint32_t at = r->rp;
+        const int index = r->slot[at];
+        r->slot[at] = kIpcrNoBuffer;
+        r->rp = (at + 1) % r->elements;
+        const bool named = at == uint32_t(slot);
+        if (r == &p.in) {
+          if (index >= 0 && uint32_t(index) < kIpcrRxBuffers) {
+            IpcrBuffer &b = p.rx[index];
+            b.busy = false;
+            if (named && good && len <= b.bytes) {
+              b.length = len;
+              ++p.received;
+              deliver(kIpcrPacket, chan, code, len, b.va);
+            } else {
+              ++p.skipped;
+            }
+          }
+        } else if (index >= 0 && uint32_t(index) < kIpcrOutBuffers) {
+          IpcrBuffer &b = p.tx[index];
+          b.busy = false;
+          ++p.txDone;
+          deliver(kIpcrTxDone, chan, code, len, b.va);
+        }
+        if (named) break;
       }
       break;
     }
@@ -383,6 +475,7 @@ inline unsigned ipcrPollRing(Ipcr &p, MhiContexts &contexts, const MhiIo &io, un
 }
 
 // Both rings: the control ring first (a state or environment change outranks a packet), then the data ring the channels report on.
+// A received buffer is free again once its packet was delivered; the caller posts it back (ipcrPostRx) after the walk.
 template <class Deliver>
 inline unsigned ipcrPoll(Ipcr &p, MhiContexts &contexts, const MhiIo &io, Deliver deliver)
 {

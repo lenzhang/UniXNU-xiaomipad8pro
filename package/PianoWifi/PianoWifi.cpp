@@ -55,8 +55,9 @@
 // piano-wifi-rddm=0 (no crash dump: by default the dump's segments are given to the chip before the boot, as the MHI host does,
 // and read back and decoded when the firmware dies), piano-wifi-defer=0 (every line printed when it happens: by default the lines
 // from the boot loader's doorbell to the end of the ladder are held in memory and printed afterwards, so that the console never
-// stalls the host while the firmware waits for it), piano-wifi-wake=0 (no device wake doorbell at mission mode). Without
-// piano-wifi the driver declines in probe() and maps nothing.
+// stalls the host while the firmware waits for it; since the sixth round a helper thread prints them at every phase change and
+// within a second), piano-wifi-wake=0 (no device wake doorbell at mission mode), and piano-wifi-deadline=MS (the hard deadline of
+// each of levels 4, 5 and 6, default 60000, docs §10.25). Without piano-wifi the driver declines in probe() and maps nothing.
 //
 // Power (package/include/PianoPowerContract.h): the radio is off unless piano-wifi>=2, since nothing below that level votes a
 // rail or releases PERST#. From level 2 on the driver joins the power tree, and its only power state change is to stop the
@@ -105,6 +106,7 @@ struct Args {
   uint32_t wmiTimeoutMs, scanWaitMs, band, bssid;
   uint32_t noc, socreset, msi, ctxearly, ras;
   uint32_t rddm, defer, wake;
+  uint32_t deadlineMs;
 };
 Args gArgs;
 
@@ -174,6 +176,12 @@ void readArgs()
   gArgs.defer = bootArg("piano-wifi-defer", 1);
   // piano-wifi-wake=0: no device wake doorbell at mission mode.
   gArgs.wake = bootArg("piano-wifi-wake", 1);
+  // piano-wifi-deadline=MS: the hard deadline of each of levels 4, 5 and 6 as a whole (default 60000; level 6 at least its own
+  // overall bound and 5 s more). Every wait inside a level has its own shorter bound; this one ends the level whatever it waits for,
+  // and the log's helper thread reports a ladder that is past it without coming back (the desk-dev8n boot of 2026-11-12 held its
+  // lines from the doorbell on and printed nothing for 30 minutes).
+  gArgs.deadlineMs = bootArg("piano-wifi-deadline", 60000);
+  if (gArgs.deadlineMs < 10000 || gArgs.deadlineMs > 600000) gArgs.deadlineMs = 60000;
 }
 
 uint64_t nowMs();
@@ -183,13 +191,24 @@ uint64_t nowMs();
 // the line after "changed +477 ms" took 2027 ms to come out, while the root volume mounted and launchd started; the firmware
 // reached mission mode at 477 ms and was in its crash dump environment when the next register read came, at 2503 ms). The host is
 // the only one who can answer the firmware, so from the boot loader's doorbell to the end of the ladder this thread's lines are
-// kept in a heap buffer and printed when the ladder stops (deferFlush), each with how long after the doorbell it was written.
-// Other threads (the power hook) still print at once. piano-wifi-defer=0 prints everything as it happens.
+// kept in a heap buffer, each with how long after the doorbell it was written, and never printed by this thread while it runs.
+// A helper thread prints them (deferPrinter): at every phase change (a stage, a level 4 phase, a level 5 or 6 step), and any line
+// held longer than kDeferAgeMs, so the console's stalls hold the helper and never the ladder, and a ladder that hangs still has
+// its lines out within a second (desk-dev8n, 2026-11-12: the lines were printed only at the ladder's end, the ladder never ended,
+// and nothing came for 30 minutes). The same helper watches each level's hard deadline (piano-wifi-deadline) and says so when the
+// ladder is past it. Other threads (the power hook) print at once. piano-wifi-defer=0 prints everything as it happens.
 constexpr unsigned kDeferLines = 320, kDeferBytes = 300;   // 96 000 bytes of heap while the ladder runs
+constexpr unsigned kDeferTickMs = 50, kDeferAgeMs = 1000, kWatchGraceMs = 2000, kWatchRepeatMs = 30000, kWatchLines = 20;
 char *gDeferBuf;
-unsigned gDeferCount, gDeferDropped;
+unsigned gDeferCount, gDeferDropped;   // gDeferCount: lines written (the ladder's thread only, published with a release store)
+unsigned gDeferPrinted;                // lines printed (claimed one at a time, so the helper and the last flush never repeat one)
 uint64_t gDeferSince;
 thread_t gDeferThread;
+uint32_t gDeferPhase;                  // bumped at every phase change: the helper prints what is held
+uint32_t gPrinterRun, gPrinterExited;  // the helper runs / has returned (atomics)
+// The current level's hard deadline (ms since boot; 0 none), for the ladder's own checks and the helper's watch.
+uint64_t gLevelDeadline;
+uint32_t gLevelNow;
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void note(const char *fmt, ...)
@@ -200,14 +219,64 @@ void note(const char *fmt, ...)
   vsnprintf(line, sizeof line, fmt, ap);
   va_end(ap);
   if (gDeferBuf && current_thread() == gDeferThread) {
-    if (gDeferCount < kDeferLines)
-      snprintf(gDeferBuf + gDeferCount++ * kDeferBytes, kDeferBytes, "%s [+%llu ms]", line,
-               (unsigned long long)(nowMs() - gDeferSince));
-    else
+    const unsigned n = gDeferCount;
+    if (n < kDeferLines) {
+      snprintf(gDeferBuf + n * kDeferBytes, kDeferBytes, "%s [+%llu ms]", line, (unsigned long long)(nowMs() - gDeferSince));
+      __atomic_store_n(&gDeferCount, n + 1, __ATOMIC_RELEASE);   // the helper reads the line only after this
+    } else {
       ++gDeferDropped;
+    }
     return;
   }
   IOLog("PianoWifi: %s\n", line);
+}
+
+// Prints held lines from `buffer` that nobody has printed yet, each claimed first; returns how many this call printed.
+unsigned deferPrintHeld(const char *buffer)
+{
+  unsigned printed = 0;
+  for (;;) {
+    unsigned at = __atomic_load_n(&gDeferPrinted, __ATOMIC_ACQUIRE);
+    const unsigned count = __atomic_load_n(&gDeferCount, __ATOMIC_ACQUIRE);
+    if (at >= count) return printed;
+    if (!__atomic_compare_exchange_n(&gDeferPrinted, &at, at + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+    IOLog("PianoWifi: %s\n", buffer + at * kDeferBytes);
+    ++printed;
+  }
+}
+
+// The helper: held lines out at every phase change and when one has waited kDeferAgeMs; the level's hard deadline watched.
+void deferPrinter(void *arg, wait_result_t)
+{
+  const char *buffer = static_cast<const char *>(arg);
+  uint32_t phase = __atomic_load_n(&gDeferPhase, __ATOMIC_ACQUIRE);
+  uint64_t pendingSince = 0, lastWatch = 0;
+  unsigned watches = 0;
+  while (__atomic_load_n(&gPrinterRun, __ATOMIC_ACQUIRE)) {
+    IOSleep(lastWatch ? 1000 : kDeferTickMs);   // a ladder past its deadline is only watched, once a second
+    const uint64_t now = nowMs();
+    const uint32_t nowPhase = __atomic_load_n(&gDeferPhase, __ATOMIC_ACQUIRE);
+    const bool pending = __atomic_load_n(&gDeferPrinted, __ATOMIC_ACQUIRE) < __atomic_load_n(&gDeferCount, __ATOMIC_ACQUIRE);
+    if (!pending) pendingSince = 0;
+    else if (!pendingSince) pendingSince = now;
+    if (pending && (nowPhase != phase || now - pendingSince >= kDeferAgeMs)) {
+      phase = nowPhase;
+      deferPrintHeld(buffer);
+      pendingSince = 0;
+    }
+    const uint64_t deadline = __atomic_load_n(&gLevelDeadline, __ATOMIC_ACQUIRE);
+    const bool due = !lastWatch || now - lastWatch >= kWatchRepeatMs;
+    if (deadline && now > deadline + kWatchGraceMs && watches < kWatchLines && due) {
+      lastWatch = now;
+      ++watches;
+      deferPrintHeld(buffer);
+      IOLog("PianoWifi: watchdog: level %u is %llu ms past its hard deadline (piano-wifi-deadline) and the ladder's thread has "
+            "not come back; last stage %d, %u line(s) held so far (all printed above)\n",
+            __atomic_load_n(&gLevelNow, __ATOMIC_ACQUIRE), (unsigned long long)(now - deadline), piano_wifi_stage,
+            __atomic_load_n(&gDeferCount, __ATOMIC_ACQUIRE));
+    }
+  }
+  __atomic_store_n(&gPrinterExited, 1u, __ATOMIC_RELEASE);
 }
 
 void deferStart()
@@ -218,11 +287,19 @@ void deferStart()
     note("log: no buffer to hold the lines while the firmware starts: they are printed as they come");
     return;
   }
-  note("log: from here until the ladder stops, this thread's lines are held and printed afterwards with their time since now "
-       "(piano-wifi-defer=0 prints them at once)");
-  gDeferCount = gDeferDropped = 0;
+  gDeferCount = gDeferDropped = gDeferPrinted = 0;
   gDeferSince = nowMs();
   gDeferThread = current_thread();
+  __atomic_store_n(&gPrinterRun, 1u, __ATOMIC_RELEASE);
+  __atomic_store_n(&gPrinterExited, 0u, __ATOMIC_RELEASE);
+  thread_t printer = nullptr;
+  const bool helper = kernel_thread_start(&deferPrinter, buffer, &printer) == KERN_SUCCESS;
+  if (helper) thread_deallocate(printer);
+  else __atomic_store_n(&gPrinterExited, 1u, __ATOMIC_RELEASE);
+  note("log: from here until the ladder stops, this thread's lines are held with their time since now and printed by %s "
+       "(piano-wifi-defer=0 prints them at once)",
+       helper ? "a helper thread at every phase change and within a second" : "this thread when the ladder stops (no helper "
+       "thread)");
   gDeferBuf = buffer;
 }
 
@@ -231,17 +308,41 @@ void deferFlush()
   char *buffer = gDeferBuf;
   if (!buffer) return;
   gDeferBuf = nullptr;   // from here note() prints again
-  const uint64_t held = nowMs() - gDeferSince;
-  IOLog("PianoWifi: log: %u line(s) held for %llu ms follow\n", gDeferCount, (unsigned long long)held);
-  for (unsigned i = 0; i < gDeferCount; ++i) IOLog("PianoWifi: %s\n", buffer + i * kDeferBytes);
+  __atomic_store_n(&gPrinterRun, 0u, __ATOMIC_RELEASE);
+  // The helper may be inside IOLog (the console stalls it, not us); what it has not claimed yet is printed here.
+  const uint64_t until = nowMs() + 3000;
+  while (!__atomic_load_n(&gPrinterExited, __ATOMIC_ACQUIRE) && nowMs() < until) IOSleep(kDeferTickMs);
+  const unsigned before = __atomic_load_n(&gDeferPrinted, __ATOMIC_ACQUIRE);
+  const unsigned here = deferPrintHeld(buffer);
+  IOLog("PianoWifi: log: %u line(s) held for %llu ms, %u printed by the helper thread and %u now%s\n", gDeferCount,
+        (unsigned long long)(nowMs() - gDeferSince), before, here,
+        __atomic_load_n(&gPrinterExited, __ATOMIC_ACQUIRE) ? "" : " (the helper is still inside the console: its buffer is kept)");
   if (gDeferDropped) IOLog("PianoWifi: log: %u later line(s) did not fit and were not kept\n", gDeferDropped);
-  IOFreeData(buffer, kDeferLines * kDeferBytes);
+  if (__atomic_load_n(&gPrinterExited, __ATOMIC_ACQUIRE)) IOFreeData(buffer, kDeferLines * kDeferBytes);
 }
+
+// A phase change: the helper prints what is held (a stage, a level 4 phase, a level 5 or 6 step).
+void deferPhase() { __atomic_add_fetch(&gDeferPhase, 1u, __ATOMIC_ACQ_REL); }
 
 void stage(int32_t value, const char *what)
 {
   piano_wifi_stage = value;
   note("%s %d: %s", value < 0 ? "FAILED at stage" : "stage", value < 0 ? -value : value, what);
+  deferPhase();
+}
+
+// Each of levels 4, 5 and 6 begins with its hard deadline (piano-wifi-deadline); every wait of the level ends once it is passed
+// (levelLate), and the helper thread reports a ladder that does not come back from it.
+void levelBegin(uint32_t level, uint32_t ms)
+{
+  __atomic_store_n(&gLevelNow, level, __ATOMIC_RELEASE);
+  __atomic_store_n(&gLevelDeadline, nowMs() + ms, __ATOMIC_RELEASE);
+}
+void levelEnd() { __atomic_store_n(&gLevelDeadline, uint64_t(0), __ATOMIC_RELEASE); }
+bool levelLate()
+{
+  const uint64_t deadline = __atomic_load_n(&gLevelDeadline, __ATOMIC_ACQUIRE);
+  return deadline && nowMs() > deadline;
 }
 
 // Explicit ldr, as PianoDwc3 and PianoPower do. The only store helper of this file is spmiWr (the observer channel's command).
@@ -1785,11 +1886,13 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
     if (phase != last) {
       note("level 4: %s after %llu ms (EE %s, state %#x)", mhiPhaseName(phase), (unsigned long long)(now - started),
            mhiEeName(boot.ee), boot.state);
+      deferPhase();
       last = phase;
       since = now;
-      continue;
+      if (!levelLate()) continue;
     }
-    if (now - since > gArgs.fwTimeoutMs) {
+    if (now - since > gArgs.fwTimeoutMs || levelLate()) {
+      if (levelLate()) note("level 4: the level's hard deadline (%u ms) passed in phase %s", gArgs.deadlineMs, mhiPhaseName(phase));
       phase = mhiTimedOut(boot);
       break;
     }
@@ -1839,6 +1942,25 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
 QcomQrtr gRouter;
 WlfwClient gClient;
 unsigned gQrtrUnrouted;
+// The firmware's service as it was announced: the instance word this family uses (WifiHw.h), or, when only another instance of
+// service 69 is announced, that one (logged; the chip's own host looks the service up by its instance, which this driver has from
+// the documents, not from a boot).
+uint32_t gWlfwInstance = kWlfwInstanceWord;
+bool wlfwFind(uint32_t *node, uint32_t *port)
+{
+  if (!qcom_qrtr_find_service(&gRouter, kWlfwService, kWlfwInstanceWord, node, port)) {
+    gWlfwInstance = kWlfwInstanceWord;
+    return true;
+  }
+  for (uint32_t i = 0; i < gRouter.remote_count; ++i)
+    if (gRouter.remote[i].service == kWlfwService) {
+      gWlfwInstance = gRouter.remote[i].instance;
+      if (node) *node = gRouter.remote[i].node;
+      if (port) *port = gRouter.remote[i].port;
+      return true;
+    }
+  return false;
+}
 
 // The link's send: a packet that already sits in one of our outbound buffers is submitted as it is; a control packet the router
 // built on its stack (hello, resume) is copied into a free buffer first.
@@ -1871,7 +1993,7 @@ int wlfwSendMessage(void *, uint8_t *buffer, uint32_t length)
 {
   uint8_t *base = buffer - QCOM_QRTR_HEADER;
   uint32_t node = 0, port = 0;
-  if (qcom_qrtr_find_service(&gRouter, kWlfwService, kWlfwInstanceWord, &node, &port)) return -1;
+  if (!wlfwFind(&node, &port)) return -1;
   for (unsigned i = 0; i < kIpcrOutBuffers; ++i)
     if (gIpcr.tx[i].va == base)
       return qcom_qrtr_send_buffer(&gRouter, base, gIpcr.tx[i].bytes, kQrtrClientPort, node, port, length);
@@ -1898,6 +2020,7 @@ void wlfwStepNote(void *, int step, const char *what)
 {
   piano_wifi_stage = step;
   note("step %d: %s", step, what);
+  deferPhase();
 }
 
 // One turn: the event rings walked, every received packet given to the router, the buffers given back to the chip, and the
@@ -1941,6 +2064,8 @@ unsigned pump(bool &stop)
       break;
     }
   });
+  // Every buffer a packet came back in goes onto channel 21's ring again (from the walk after 21's start on: before it the
+  // transport posts nothing, since 21's preparation puts its ring back at the base).
   if (seen) ipcrPostRx(gIpcr, gMhiIo);
   const MhiHealth h = mhiHealth(gMhiIo, gBoot.bhi);
   if (h.dead()) fatal = true;
@@ -1958,7 +2083,7 @@ bool startChannel(uint32_t channel)
     return false;
   }
   const uint64_t deadline = nowMs() + kMhiCommandTimeoutMs;
-  while (nowMs() < deadline) {
+  while (nowMs() < deadline && !levelLate()) {
     bool stop = false;
     pump(stop);
     if (stop) {
@@ -1974,6 +2099,30 @@ bool startChannel(uint32_t channel)
   }
   note("level 5: no completion for the start of channel %u within %u ms", channel, kMhiCommandTimeoutMs);
   return false;
+}
+
+// Where the two channels and the data event ring are, as this host and as the chip's contexts have them: the line that says
+// whether the chip took what was posted (its read pointers moved), and what came back.
+int ipcrElementOf(const ChanRing &r, uint64_t ptr)
+{
+  return ptr == r.bus + uint64_t(r.elements) * kMhiElement ? int(r.elements) : ipcrSlotOf(r, ptr);
+}
+void ipcrReport(const char *when)
+{
+  using namespace ipcrdetail;
+  const ChanRing &o = gIpcr.out, &i = gIpcr.in;
+  if (!o.ctx || !i.ctx) return;
+  uint8_t *ev = mhiEventCtx(gContexts, kIpcrEventRing);
+  const uint64_t evBase = get64(ev + 12), evRp = get64(ev + 28), acked = gContexts.acked[kIpcrEventRing];
+  note("level 5: %s: channel 20 state %#x, the chip's read pointer at element %d, ours %u, written to %u (%u owed), %u "
+       "completion(s) (last code %#x), %u doorbell(s); channel 21 state %#x, the chip's read pointer at element %d, ours %u, "
+       "written to %u (%u buffers posted), %u completion(s) (last code %#x, %u bytes), %u doorbell(s); data event ring: the chip "
+       "at element %lld, this host at %lld; %u event(s) dropped, %u element(s) given back unread, %u error code(s), %u "
+       "doorbell-mode event(s)",
+       when, ipcrChanState(o), ipcrElementOf(o, get64(o.ctx + kChanRp)), o.rp, o.wp, ipcrOutstanding(o), o.events, o.lastCode,
+       o.doorbells, ipcrChanState(i), ipcrElementOf(i, get64(i.ctx + kChanRp)), i.rp, i.wp, ipcrRxPosted(gIpcr), i.events,
+       i.lastCode, i.lastLength, i.doorbells, (long long)(evRp - evBase) / int(kMhiElement),
+       (long long)(acked - evBase) / int(kMhiElement), gIpcr.dropped, gIpcr.skipped, gIpcr.transferErrors, gIpcr.dbModes);
 }
 
 int level5(PowerState &power, const Options &opt)
@@ -2000,9 +2149,19 @@ int level5(PowerState &power, const Options &opt)
     safeOff(gHw, power, opt);
     return -3;
   }
-  const unsigned posted = ipcrPostRx(gIpcr, gMhiIo);
-  note("level 5: both channels run (states %#x / %#x) %llu ms after level 5 began, %u receive buffers posted",
-       ipcrChanState(gIpcr.out), ipcrChanState(gIpcr.in), (unsigned long long)(nowMs() - entered), posted);
+  // The inbound channel's buffers, right after its start (the walk that saw the start's completion has normally posted them
+  // already; this call posts whatever is still free).
+  ipcrPostRx(gIpcr, gMhiIo);
+  note("level 5: both channels run (states %#x / %#x) %llu ms after level 5 began, %u receive buffers posted (channel 21's "
+       "ring written to element %u, %u doorbell(s))",
+       ipcrChanState(gIpcr.out), ipcrChanState(gIpcr.in), (unsigned long long)(nowMs() - entered), ipcrRxPosted(gIpcr),
+       gIpcr.in.wp, gIpcr.in.doorbells);
+  if (!ipcrRxPosted(gIpcr)) {
+    ipcrReport("no receive buffer on channel 21");
+    stage(-501, "level 5: channel 21 runs but has no receive buffer: the chip could not answer");
+    safeOff(gHw, power, opt);
+    return -3;
+  }
   // The router. The chip's router speaks first on this link (the Linux host only ever answers a hello), and the copied router
   // answers it; ours goes out only if the chip has said nothing within kHelloWaitMs.
   qcom_qrtr_init(&gRouter, kQrtrLocalNode, qrtrSend, nullptr);
@@ -2014,7 +2173,7 @@ int level5(PowerState &power, const Options &opt)
   constexpr uint32_t kHelloWaitMs = 500;
   bool died = false;
   const uint64_t helloFrom = nowMs();
-  while (!gRouter.hello_received && nowMs() - helloFrom < kHelloWaitMs) {
+  while (!gRouter.hello_received && nowMs() - helloFrom < kHelloWaitMs && !levelLate()) {
     bool stop = false;
     pump(stop);
     if (stop) {
@@ -2028,28 +2187,48 @@ int level5(PowerState &power, const Options &opt)
   note("level 5: router: %s", chipFirst ? "the chip said hello first and was answered"
                               : died   ? "the chip died before it said hello"
                                        : "no hello from the chip within 500 ms: ours went first");
+  // Our hello (or our answer to the chip's) must complete on channel 20: its transfer completion names the element it took.
   uint32_t node = 0, port = 0;
-  uint64_t deadline = nowMs() + gArgs.qmiTimeoutMs;
-  while (!died && nowMs() < deadline) {
+  uint64_t deadline = nowMs() + gArgs.qmiTimeoutMs, helloDone = 0;
+  auto helloSeen = [&]() {
+    if (!helloDone && gIpcr.txDone) helloDone = nowMs();
+  };
+  helloSeen();
+  while (!died && nowMs() < deadline && !levelLate()) {
     bool stop = false;
     pump(stop);
+    helloSeen();
     if (stop) {
       died = true;
       break;
     }
-    if (!qcom_qrtr_find_service(&gRouter, kWlfwService, kWlfwInstanceWord, &node, &port)) break;
+    if (wlfwFind(&node, &port)) break;
     IOSleep(5);
   }
-  if (died || !gRouter.hello_received || qcom_qrtr_find_service(&gRouter, kWlfwService, kWlfwInstanceWord, &node, &port)) {
-    note("level 5: hello %s, %u services announced, %u packets in (%u unrouted)", gRouter.hello_received ? "answered" : "unanswered",
-         gRouter.remote_count, gRouter.rx_packets, gRouter.rx_unrouted);
+  if (helloDone)
+    note("level 5: router: our %s completed on channel 20 %llu ms after the router began (code %#x, %u packet(s) out, %u "
+         "completed)",
+         chipFirst ? "answer to the chip's hello" : "hello", (unsigned long long)(helloDone - helloFrom), gIpcr.out.lastCode,
+         gIpcr.sent, gIpcr.txDone);
+  else
+    note("level 5: router: our %s was %s (%u packet(s) out, none completed by the chip)",
+         chipFirst ? "answer to the chip's hello" : "hello", gRouter.hello_sent ? "sent and never completed" : "not sent",
+         gIpcr.sent);
+  if (died || !gRouter.hello_received || !wlfwFind(&node, &port)) {
+    note("level 5: hello %s, %u services announced, %u packets in (%u unrouted)%s", gRouter.hello_received ? "answered" : "unanswered",
+         gRouter.remote_count, gRouter.rx_packets, gRouter.rx_unrouted, levelLate() ? "; the level's hard deadline passed" : "");
+    ipcrReport("waiting for the firmware's service");
+    for (uint32_t r = 0; r < gRouter.remote_count && r < 8; ++r)
+      note("level 5: the chip announced service %u instance %#x on node %u port %#x", gRouter.remote[r].service,
+           gRouter.remote[r].instance, gRouter.remote[r].node, gRouter.remote[r].port);
     if (gChipDead) crashReport("level 5, waiting for the firmware's QMI service");
     stage(-502, "level 5: the firmware's QMI service was not announced on the router");
     safeOff(gHw, power, opt);
     return -5;
   }
-  note("level 5: the router is up (our node %u port %#x, the chip's node %u; the firmware's service %u instance %#x on port %u)",
-       kQrtrLocalNode, kQrtrClientPort, gRouter.remote_node, kWlfwService, kWlfwInstanceWord, port);
+  note("level 5: the router is up (our node %u port %#x, the chip's node %u; the firmware's service %u instance %#x on port %u%s)",
+       kQrtrLocalNode, kQrtrClientPort, gRouter.remote_node, kWlfwService, gWlfwInstance, port,
+       gWlfwInstance == kWlfwInstanceWord ? "" : ": not the instance word this family was expected to announce, used anyway");
   // The service's exchange.
   WlfwIo io;
   io.ctx = nullptr;
@@ -2076,12 +2255,13 @@ int level5(PowerState &power, const Options &opt)
       note("level 5: the chip reported a system error or its crash dump environment during %s", wlfwStepName(last));
       break;
     }
-    if (gClient.step != last) {   // a step moved: its own deadline
+    if (gClient.step != last && !levelLate()) {   // a step moved: its own deadline
       last = gClient.step;
       deadline = nowMs() + gArgs.qmiTimeoutMs;
       continue;
     }
-    if (nowMs() > deadline) {
+    if (nowMs() > deadline || levelLate()) {
+      if (levelLate()) note("level 5: the level's hard deadline (%u ms) passed during %s", gArgs.deadlineMs, wlfwStepName(last));
       wlfwTimedOut(gClient);
       break;
     }
@@ -2111,6 +2291,7 @@ int level5(PowerState &power, const Options &opt)
        wlfwStepName(done ? gClient.step : gClient.failedStep), done ? "" : ", ", done ? "" : wlfwErrorName(gClient.error));
   note("level 5: MHI after mission mode: %u M0 event(s) answered by ringing every doorbell, %u M1 answered with M2", gM0Events,
        gM1Answers);
+  ipcrReport(done ? "at the firmware's ready" : "where it stopped");
   if (!done) {
     if (gChipDead) crashReport("level 5, during the QMI exchange");
     safeOff(gHw, power, opt);
@@ -2132,6 +2313,7 @@ void linkNote(void *, int step, const char *what)
 {
   piano_wifi_stage = step;
   note("step %d: %s", step, what);
+  deferPhase();
 }
 
 // The scan's result in the registry: one entry per network, and a line for the log. The addresses are published whole (the
@@ -2239,7 +2421,7 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
       gChipDead = true;
       break;
     }
-    if (nowMs() > overall) {
+    if (nowMs() > overall || levelLate()) {
       note("level 6: the ladder as a whole ran out of time during %s", linkStepName(step));
       break;
     }
@@ -2383,6 +2565,10 @@ bool PianoWifi::start(IOService *provider)
     note("options: socreset %u (the chip's power-on reset before BHI), msi %u (MSI into a sink page), ctxearly %u (MHI contexts "
          "before the doorbell), ras %u (TLP counters)",
          gArgs.socreset, gArgs.msi, gArgs.ctxearly, gArgs.ras);
+  if (gArgs.level >= 4)
+    note("options: rddm %u (crash dump), defer %u (lines held from the doorbell, printed by a helper thread), wake %u (device "
+         "wake), deadline %u ms (each level's hard deadline)",
+         gArgs.rddm, gArgs.defer, gArgs.wake, gArgs.deadlineMs);
   if (gArgs.level > 6) note("piano-wifi=%u: levels above 6 are not implemented; running up to level 6", gArgs.level);
   note("level 1: loads only, nothing written%s", gArgs.spmi || gArgs.level >= 2 ? "; SPMI observer read commands for the PMIC part"
                                                                                : "");
@@ -2597,7 +2783,11 @@ void PianoWifi::run()
   // release does), since nothing answers it after this thread is gone.
   struct LadderExit {
     bool released = false;
-    ~LadderExit() { deferFlush(); }
+    ~LadderExit()
+    {
+      levelEnd();
+      deferFlush();
+    }
   } ladderExit;
   auto releaseWake = [&]() {
     if (!gArgs.wake || ladderExit.released || gChipDead) return;
@@ -2622,7 +2812,9 @@ void PianoWifi::run()
     unmapAll();
     return;
   }
+  levelBegin(4, gArgs.deadlineMs);
   rc = level4(link, power, opt);
+  levelEnd();
   writeSummary("level 4");
   stage(rc ? -401 : 401, rc ? "level 4 stopped before mission mode" : "level 4: the firmware runs (mission mode)");
   note("level 4: %s%s", rc ? "the chip did not reach mission mode" : "the chip is in mission mode",
@@ -2635,7 +2827,9 @@ void PianoWifi::run()
   }
 
   // ---- level 5 ---------------------------------------------------------------------------------------------------------
+  levelBegin(5, gArgs.deadlineMs);
   rc = level5(power, opt);
+  levelEnd();
   piano_wifi_firmware_close();
   if (rc) chipPut();   // level 5's failures end in safeOff too
   writeSummary("level 5");
@@ -2657,7 +2851,13 @@ void PianoWifi::run()
   }
 
   // ---- level 6 ---------------------------------------------------------------------------------------------------------
+  // level 6's own overall bound (six message steps and the scan) is inside its hard deadline
+  {
+    const uint32_t own = gArgs.wmiTimeoutMs * 6 + gArgs.scanWaitMs + 5000;
+    levelBegin(6, own > gArgs.deadlineMs ? own : gArgs.deadlineMs);
+  }
   rc = level6(this, power, opt);
+  levelEnd();
   if (rc) chipPut();   // level 6's failures end in safeOff as well
   writeSummary("level 6");
   stage(rc ? -613 : 613, rc ? "level 6 stopped before the scan was done" : "level 6: the scan is done");

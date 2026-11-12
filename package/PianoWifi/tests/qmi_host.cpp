@@ -138,6 +138,7 @@ constexpr uint32_t kWindowBytes = 8u << 20;
 struct Device {
   std::vector<uint8_t> memory;          // the DMA window as the chip sees it
   std::map<uint32_t, uint32_t> regs;    // the MHI register block in BAR0
+  std::map<uint32_t, unsigned> writesTo;   // how often each register was written (a doorbell rung twice with one value)
   std::vector<std::vector<uint8_t>> toHost;   // packets the firmware wants to send
   unsigned doorbells = 0, commandsSeen = 0, packetsTaken = 0, rxPosted = 0;
   uint32_t chdb = 0x300, erdb = 0x200, reglen = 0x1000;
@@ -161,6 +162,7 @@ struct Device {
   {
     Device &d = *static_cast<Device *>(ctx);
     d.regs[reg] = value;
+    ++d.writesTo[reg];
     if (reg == d.chdb + 8 * kChanIpcrOut || reg == d.chdb + 8 * kChanIpcrIn || reg == kMhiCrdbLo) ++d.doorbells;
   }
   MhiIo io() { return MhiIo{this, &Device::rd, &Device::wr}; }
@@ -189,9 +191,13 @@ static void put32(uint8_t *at, uint32_t v)
   for (unsigned i = 0; i < 4; ++i) at[i] = uint8_t(v >> (8 * i));
 }
 
-// The chip's side of a channel: its read pointer walks the ring the host fills.
+// The chip's side of a channel: its read pointer walks the ring the host fills, up to the write pointer it was last told. Like the
+// chip, the model learns that pointer from the context when the channel starts and from the channel's doorbell after that — a
+// doorbell rung before the start is not seen (the context the start reads is what counts), and a ring the host fills without a
+// doorbell is not read.
 struct DeviceChannel {
-  uint64_t rp = 0;
+  uint64_t rp = 0, wp = 0, lastDoorbell = 0;
+  unsigned lastWrites = 0;   // how many times the doorbell's latching half had been written when the chip last looked
 };
 
 // What the chip does between two polls of the driver: consume the command ring, consume outbound packets, fill inbound buffers,
@@ -201,8 +207,11 @@ struct DeviceSide {
   MhiContexts &contexts;
   DeviceChannel out, in, cmd;
   uint64_t evWp[kMhiEventRings] = {0, 0};   // where the chip writes next
-  unsigned events = 0;
+  unsigned events = 0, staleDoorbells = 0;
   bool startedOut = false, startedIn = false;
+  bool helloFirst = false;   // the chip's router says hello as soon as its inbound channel has a buffer (what the chip does)
+  bool mergeEvents = false;  // one completion for every two inbound packets (a chip that merges them: only the second is named)
+  bool dbModeOnce = false;   // the first outbound doorbell is answered with a doorbell-mode event, not taken
 
   DeviceSide(Device &device, MhiContexts &c) : d(device), contexts(c) {}
 
@@ -242,6 +251,13 @@ struct DeviceSide {
       if (command == kTreCmdStart && startable) {
         uint8_t *ctx = contextOf(chan);
         put32(ctx, (get32(ctx) & ~0xffu) | kChanStateRunning);
+        DeviceChannel *c = chan == kChanIpcrOut ? &out : chan == kChanIpcrIn ? &in : nullptr;
+        if (c) {   // the start reads the ring from the context; a doorbell rung before it is stale
+          c->rp = get64(ctx + kChanRp);
+          c->wp = get64(ctx + kChanWp);
+          c->lastDoorbell = d.reg64(d.chdb + 8 * chan);
+          c->lastWrites = d.writesTo[d.chdb + 8 * chan];
+        }
         if (chan == kChanIpcrOut) startedOut = true;
         if (chan == kChanIpcrIn) startedIn = true;
         event(0, cmd.rp, kEvCodeSuccess << 24, kEvTypeCmdCompletion << 16);
@@ -251,11 +267,27 @@ struct DeviceSide {
       cmd.rp += kMhiElement;
       if (cmd.rp >= cbase + clen) cmd.rp = cbase;
     }
-    // the outbound channel: every element the host added is a packet for the firmware
+    // the doorbells since the last turn (a doorbell of a channel that is not running is counted and ignored)
+    for (uint32_t chan : {kChanIpcrOut, kChanIpcrIn}) {
+      DeviceChannel &c = chan == kChanIpcrOut ? out : in;
+      const bool running = chan == kChanIpcrOut ? startedOut : startedIn;
+      const uint64_t db = d.reg64(d.chdb + 8 * chan);
+      const unsigned writes = d.writesTo[d.chdb + 8 * chan];
+      if (writes == c.lastWrites) continue;
+      c.lastWrites = writes;
+      c.lastDoorbell = db;
+      if (running) c.wp = db;
+      else ++staleDoorbells;
+    }
+    // the outbound channel: every element the host added is a packet for the firmware; the completion names the element
     uint8_t *octx = contextOf(kChanIpcrOut);
-    const uint64_t obase = get64(octx + 12), olen = get64(octx + 20), owp = get64(octx + 36);
-    if (!out.rp) out.rp = obase;
-    while (out.rp != owp && startedOut) {
+    const uint64_t obase = get64(octx + 12), olen = get64(octx + 20);
+    if (startedOut && dbModeOnce && out.rp != out.wp) {
+      dbModeOnce = false;   // nothing taken: the host must ring again
+      event(kIpcrEventRing, out.rp, kEvCodeDbMode << 24, kChanIpcrOut << 24 | kEvTypeTransfer << 16);
+      out.wp = out.rp;
+    }
+    while (startedOut && out.rp != out.wp && out.wp >= obase && out.wp < obase + olen) {
       const uint8_t *element = d.at(out.rp, kMhiElement);
       const uint64_t ptr = element ? get64(element) : 0;
       const uint32_t length = element ? get32(element + 8) & 0xffffu : 0;
@@ -264,16 +296,20 @@ struct DeviceSide {
         ++d.packetsTaken;
         onPacket(std::vector<uint8_t>(payload, payload + length));
       }
-      event(kIpcrEventRing, ptr, kEvCodeEot << 24 | length, kChanIpcrOut << 24 | kEvTypeTransfer << 16);
+      event(kIpcrEventRing, out.rp, kEvCodeEot << 24 | length, kChanIpcrOut << 24 | kEvTypeTransfer << 16);
       out.rp += kMhiElement;
       if (out.rp >= obase + olen) out.rp = obase;
       put64(octx + 28, out.rp);
     }
     // the inbound channel: each queued packet takes the next buffer the host posted
     uint8_t *ictx = contextOf(kChanIpcrIn);
-    const uint64_t ibase = get64(ictx + 12), ilen = get64(ictx + 20), iwp = get64(ictx + 36);
-    if (!in.rp) in.rp = ibase;
-    while (!d.toHost.empty() && in.rp != iwp && startedIn) {
+    const uint64_t ibase = get64(ictx + 12), ilen = get64(ictx + 20);
+    if (startedIn && helloFirst && !helloQueued && in.rp != in.wp && helloHook) {
+      helloQueued = true;
+      helloHook(hookContext);
+    }
+    unsigned merged = 0;
+    while (startedIn && !d.toHost.empty() && in.rp != in.wp && in.wp >= ibase && in.wp < ibase + ilen) {
       const uint8_t *element = d.at(in.rp, kMhiElement);
       const uint64_t ptr = element ? get64(element) : 0;
       const uint32_t room = element ? get32(element + 8) & 0xffffu : 0;
@@ -282,13 +318,19 @@ struct DeviceSide {
       uint8_t *buffer = d.at(ptr, room);
       if (buffer && packet.size() <= room) {
         std::memcpy(buffer, packet.data(), packet.size());
-        event(kIpcrEventRing, ptr, kEvCodeEot << 24 | uint32_t(packet.size()), kChanIpcrIn << 24 | kEvTypeTransfer << 16);
+        ++d.rxPosted;
+        if (!mergeEvents || ++merged % 2 == 0)
+          event(kIpcrEventRing, in.rp, kEvCodeEot << 24 | uint32_t(packet.size()), kChanIpcrIn << 24 | kEvTypeTransfer << 16);
+      } else {
+        event(kIpcrEventRing, in.rp, kEvCodeOverflow << 24 | room, kChanIpcrIn << 24 | kEvTypeTransfer << 16);
       }
       in.rp += kMhiElement;
       if (in.rp >= ibase + ilen) in.rp = ibase;
       put64(ictx + 28, in.rp);
     }
   }
+  bool helloQueued = false;
+  void (*helloHook)(void *) = nullptr;
   // Set by the firmware model.
   void (*packetHook)(void *, const std::vector<uint8_t> &) = nullptr;
   void *hookContext = nullptr;
@@ -772,6 +814,12 @@ struct Host {
     h.firmware.onMessage(packet.data() + QCOM_QRTR_HEADER, size);
   }
 
+  static void firmwareHello(void *ctx)
+  {
+    Host &h = *static_cast<Host *>(ctx);
+    if (!h.firmware.helloSent) h.firmware.hello();
+  }
+
   void start()
   {
     arenaInit(arena, device.memory.data(), kBusBase, uint32_t(device.memory.size()));
@@ -785,6 +833,7 @@ struct Host {
     owned.reset(new DeviceSide(device, contexts));
     side = owned.get();
     side->packetHook = &Host::firmwarePacket;
+    side->helloHook = &Host::firmwareHello;
     side->hookContext = this;
     firmware.device = side;
     qcom_qrtr_init(&router, kQrtrLocalNode, &Host::send, this);
@@ -807,19 +856,23 @@ struct Host {
       ++packets;
       qcom_qrtr_receive(&router, va, length);
     });
-    if (ipcrRunning(transport)) ipcrPostRx(transport, io);   // as the driver does: buffers only once both channels run
+    ipcrPostRx(transport, io);   // as the driver's pump: after every walk (the transport itself refuses before 21 runs)
     return packets;
   }
   // The link up: the two channels started, the inbound buffers posted, the hello said and the service announcement in.
+  // As the driver's level 5: channel 20, then 21, each with its walk (which posts receive buffers whenever it saw events), then
+  // the buffers, then the hello.
   void bring()
   {
     start();
     CHECK(ipcrStart(transport, device.io(), kChanIpcrOut));
     turn();
+    CHECK(ipcrRxPosted(transport) == 0);   // channel 21 is not running yet: nothing is posted into its ring
     CHECK(ipcrStart(transport, device.io(), kChanIpcrIn));
     turn();
     CHECK(ipcrRunning(transport));
-    CHECK(ipcrPostRx(transport, device.io()) == 0);   // the turn above posted them
+    CHECK(ipcrRxPosted(transport) == kIpcrRxBuffers);   // the walk after 21's start posted them, once 21 ran
+    CHECK(ipcrPostRx(transport, device.io()) == 0);
     qcom_qrtr_start(&router);
     for (unsigned i = 0; i < 8 && router.remote_count == 0; ++i) turn();
     CHECK(router.hello_received && router.remote_count == 1);
@@ -964,6 +1017,136 @@ static void testTransport()
   bad.start();
   bad.device.regs[kMhiChdbOff] = 0xfffff000u;
   CHECK(!ipcrOpen(bad.transport, bad.device.io(), bad.device.reglen) && bad.transport.error != nullptr);
+}
+
+// ================================================================== the rings after mission mode (desk-dev14, 2026-11-12)
+// What the first boots that reached level 5 with a running firmware showed ("both channels run ... 0 receive buffers posted", no
+// hello from the chip, ours unanswered), and what the transport now holds to.
+static void testRings()
+{
+  // The boot's order: channel 20, its walk (which posts after any event), channel 21, its walk. Nothing goes into 21's ring before
+  // its start completed, and after it every buffer is on the ring, which the chip reads up to the doorbell.
+  {
+    Host h;
+    h.start();
+    h.side->helloFirst = true;   // the chip's router speaks first, as soon as it has somewhere to put the hello
+    CHECK(ipcrStart(h.transport, h.device.io(), kChanIpcrOut));
+    h.turn();
+    CHECK(h.transport.started[0] && !h.transport.started[1]);
+    CHECK(ipcrPostRx(h.transport, h.device.io()) == 0 && ipcrRxPosted(h.transport) == 0);
+    CHECK(h.side->staleDoorbells == 0);   // not even a doorbell for the channel that is not running
+    CHECK(ipcrStart(h.transport, h.device.io(), kChanIpcrIn));
+    h.turn();
+    CHECK(ipcrRunning(h.transport) && ipcrRxPosted(h.transport) == kIpcrRxBuffers);
+    const uint8_t *in = mhiChannelCtx(h.contexts, kChanIpcrIn);
+    const uint64_t wp = h.transport.in.bus + uint64_t(kIpcrRxBuffers) * kMhiElement;
+    CHECK(get64(in + kChanWp) == wp && h.device.reg64(h.device.chdb + 8 * kChanIpcrIn) == wp && h.transport.in.doorbells == 1);
+    for (uint32_t e = 0; e < kIpcrRxBuffers; ++e) {   // each element: its buffer, 8 KiB, a transfer asking for its completion
+      const uint8_t *element = h.transport.in.va + e * kMhiElement;
+      CHECK(h.transport.in.slot[e] >= 0 && get64(element) == h.transport.rx[h.transport.in.slot[e]].bus);
+      CHECK((get32(element + 8) & 0xffffu) == kIpcrBufferBytes && get32(element + 12) == (kTreTypeTransfer << 16 | kTreIeot));
+    }
+    CHECK(h.transport.in.slot[kIpcrRxBuffers] == kIpcrNoBuffer);   // one element stays free
+    // The chip's hello comes in on the next walk, is answered, and its announcement follows our answer.
+    for (unsigned i = 0; i < 6 && h.router.remote_count == 0; ++i) h.turn();
+    CHECK(h.router.hello_received && h.router.hello_sent && h.router.remote_count == 1 && h.router.remote_node == kFirmwareNode);
+    CHECK(h.transport.received >= 2 && h.transport.dropped == 0 && h.transport.skipped == 0);
+    // Our answer went out on 20 and its completion (naming the element, not the buffer) gave the buffer back.
+    CHECK(h.transport.sent >= 1 && h.transport.txDone == h.transport.sent && h.transport.out.rp == h.transport.out.wp);
+    for (const IpcrBuffer &b : h.transport.tx) CHECK(!b.busy);
+    // Every received buffer went back on the ring: the chip still holds all but one element's worth.
+    CHECK(ipcrRxPosted(h.transport) == kIpcrRxBuffers && ipcrOutstanding(h.transport.in) == kIpcrRxBuffers);
+  }
+  // Many more packets than the ring has elements: the ring wraps, every packet is delivered once, the buffers keep coming back.
+  {
+    Host h;
+    h.bring();
+    const unsigned before = h.transport.received;
+    for (unsigned i = 0; i < 3 * kIpcrElements; ++i) {
+      std::vector<uint8_t> packet(QCOM_QRTR_HEADER + 4, 0);
+      put32(packet.data(), 1);
+      put32(packet.data() + 4, QCOM_QRTR_DATA);
+      put32(packet.data() + 20, 4);
+      put32(packet.data() + 28, 0x77);   // nobody's port: counted as unrouted by the router
+      h.firmware.queue(packet);
+      if (i % 5 == 4) h.turn();
+    }
+    for (unsigned i = 0; i < 8; ++i) h.turn();
+    CHECK(h.transport.received - before == 3 * kIpcrElements && h.router.rx_unrouted == 3 * kIpcrElements);
+    CHECK(h.transport.dropped == 0 && h.transport.skipped == 0 && ipcrRxPosted(h.transport) == kIpcrRxBuffers);
+  }
+  // A completion that names a buffer's address (what the old walk expected) is not an element of the ring: dropped, the
+  // buffer stays the chip's.
+  {
+    Host h;
+    h.bring();
+    const unsigned dropped = h.transport.dropped, received = h.transport.received;
+    const int slot = h.transport.in.slot[h.transport.in.rp];
+    CHECK(slot >= 0);
+    h.side->event(kIpcrEventRing, h.transport.rx[slot].bus, kEvCodeEot << 24 | 40, kChanIpcrIn << 24 | kEvTypeTransfer << 16);
+    h.turn();
+    CHECK(h.transport.dropped == dropped + 1 && h.transport.received == received && h.transport.rx[slot].busy);
+    // nor is an element the chip does not hold (the free one past the write pointer)
+    h.side->event(kIpcrEventRing, h.transport.in.bus + uint64_t(h.transport.in.wp) * kMhiElement, kEvCodeEot << 24 | 40,
+                  kChanIpcrIn << 24 | kEvTypeTransfer << 16);
+    h.turn();
+    CHECK(h.transport.dropped == dropped + 2 && h.transport.received == received);
+  }
+  // A chip that merges two completions into one: the named element is delivered, the one before it given back unread.
+  {
+    Host h;
+    h.bring();
+    h.side->mergeEvents = true;
+    const unsigned received = h.transport.received;
+    for (unsigned i = 0; i < 2; ++i) h.firmware.queue(std::vector<uint8_t>(QCOM_QRTR_HEADER + 8, 0x11));
+    h.turn();
+    h.turn();
+    CHECK(h.transport.received == received + 1 && h.transport.skipped == 1 && ipcrRxPosted(h.transport) == kIpcrRxBuffers);
+  }
+  // A packet larger than the buffer: the chip reports an overflow; nothing delivered, the buffer back on the ring.
+  {
+    Host h;
+    h.bring();
+    const unsigned received = h.transport.received;
+    h.firmware.queue(std::vector<uint8_t>(kIpcrBufferBytes + 64, 0x22));
+    h.turn();
+    h.turn();
+    CHECK(h.transport.received == received && h.transport.transferErrors == 1 && h.transport.skipped == 1);
+    CHECK(h.transport.in.lastCode == kEvCodeOverflow && ipcrRxPosted(h.transport) == kIpcrRxBuffers);
+  }
+  // The channel back in doorbell mode: the packet is not taken until the host rings again, which the walk does.
+  {
+    Host h;
+    h.bring();
+    h.side->dbModeOnce = true;
+    const int index = ipcrClaimTx(h.transport);
+    CHECK(index >= 0);
+    std::memset(h.transport.tx[index].va, 0, 64);
+    put32(h.transport.tx[index].va, 1);
+    put32(h.transport.tx[index].va + 4, QCOM_QRTR_DATA);
+    put32(h.transport.tx[index].va + 28, 0x55);
+    const unsigned taken = h.device.packetsTaken, rung = h.transport.out.doorbells;
+    CHECK(ipcrSubmitTx(h.transport, h.device.io(), unsigned(index), QCOM_QRTR_HEADER + 4));
+    h.turn();   // the chip answers with a doorbell-mode event; the walk rings the channel again
+    CHECK(h.transport.dbModes == 1 && h.transport.out.doorbells == rung + 2 && h.transport.tx[index].busy);
+    h.turn();   // and now it is taken and completed
+    CHECK(h.device.packetsTaken == taken + 1 && !h.transport.tx[index].busy);
+  }
+  // A send on a channel that does not run is refused and its claim given back; a restarted inbound channel starts empty.
+  {
+    Host h;
+    h.start();
+    const int index = ipcrClaimTx(h.transport);
+    CHECK(index >= 0 && !ipcrSubmitTx(h.transport, h.device.io(), unsigned(index), 64) && !h.transport.tx[index].busy);
+    Host r;
+    r.bring();
+    CHECK(ipcrRxPosted(r.transport) == kIpcrRxBuffers);
+    CHECK(ipcrStart(r.transport, r.device.io(), kChanIpcrIn));
+    CHECK(!r.transport.started[1] && ipcrRxPosted(r.transport) == 0 && r.transport.in.wp == 0 && r.transport.in.rp == 0);
+    CHECK(ipcrPostRx(r.transport, r.device.io()) == 0);   // not before the start completed
+    r.turn();
+    CHECK(r.transport.started[1] && ipcrRxPosted(r.transport) == kIpcrRxBuffers);
+  }
 }
 
 // ====================================================================================================== the router's copy
@@ -1573,6 +1756,7 @@ int main()
 {
   testCodec();
   testTransport();
+  testRings();
   testAfterMission();
   testRddm();
   testRouter();

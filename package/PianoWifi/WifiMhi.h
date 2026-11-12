@@ -444,6 +444,13 @@ inline void reg64(const MhiIo &io, uint32_t low, uint64_t v)
   io.write(io.ctx, low, uint32_t(v));
   io.write(io.ctx, low + 4, uint32_t(v >> 32));
 }
+// A doorbell: the high half first, since the device latches the value on the low half (as WifiChannels.h's doorbells; the owner's
+// register write ends with a barrier, so the ring's memory is also out before the latching write).
+inline void doorbell64(const MhiIo &io, uint32_t low, uint64_t v)
+{
+  io.write(io.ctx, low + 4, uint32_t(v >> 32));
+  io.write(io.ctx, low, uint32_t(v));
+}
 // The first offset from `cursor` whose bus address is a multiple of `align` (a power of two).
 inline uint32_t alignedAt(uint64_t bus, uint32_t cursor, uint32_t align)
 {
@@ -513,7 +520,7 @@ inline void mhiContextsProgram(MhiContexts &c, const MhiIo &io, uint32_t reglen)
   const uint32_t erdb = io.read(io.ctx, kMhiErdbOff);
   if (erdb >= 0x100 && erdb + 8 * kMhiEventRings <= reglen && !(erdb & 3))
     for (unsigned i = 0; i < kMhiEventRings; ++i)
-      reg64(io, erdb + 8 * i, c.eventBus[i] + c.eventBytes[i] - kMhiElement);
+      doorbell64(io, erdb + 8 * i, c.eventBus[i] + c.eventBytes[i] - kMhiElement);
   ++c.writes;
 }
 
@@ -532,7 +539,7 @@ inline unsigned mhiEventAck(MhiContexts &c, const MhiIo &io, uint32_t reglen)
     c.acked[r] = read;
     const uint64_t write = read == base ? base + length - kMhiElement : read - kMhiElement;
     put64(ctx + 36, write);
-    reg64(io, erdb + 8 * r, write);
+    doorbell64(io, erdb + 8 * r, write);
     ++moved;
   }
   c.acks += moved;

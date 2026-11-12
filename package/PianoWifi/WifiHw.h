@@ -352,10 +352,18 @@ constexpr uint32_t kMhiChdbOff = 0x18, kMhiCrdbLo = 0x70, kMhiCrdbHi = 0x74;
 //   command:   word1 = channel (31:24) | command (23:16); start channel = 18, stop = 17, reset = 16
 //   event:     word0 = code (31:24) | length (15:0) — for a state change or an execution environment event the new value is in
 //              31:24 instead; word1 = channel (31:24) | type (23:16); transfer completion 0x22, command completion 0x21,
-//              state change 0x20, execution environment change 0x40. Completion code 1 = success, 2 = end of transfer.
+//              state change 0x20, execution environment change 0x40. Completion codes: 1 success, 2 end of transfer, 3 the
+//              buffer overflowed, 4 end of block, 5 out of buffers, 6 the channel went back to doorbell mode, 0x10 undefined
+//              error, 0x11 a bad element.
+//   An event's pointer: a command completion's is the command element's bus address on the command ring; a TRANSFER
+//   completion's is the bus address of the transfer ring ELEMENT it completes — never the buffer that element names. The host
+//   finds its buffer through the element (the MHI host keeps a buffer record per element and walks its own read pointer up to
+//   the one the event names). An event with code 5 or 6 completes nothing: the host rings that channel's doorbell again if it
+//   has elements the chip has not taken.
 constexpr uint32_t kTreTypeTransfer = 2, kTreCmdStart = 18, kTreCmdStop = 17, kTreCmdReset = 16;
 constexpr uint32_t kEvTypeTransfer = 0x22, kEvTypeCmdCompletion = 0x21, kEvTypeStateChange = 0x20, kEvTypeEeChange = 0x40;
-constexpr uint32_t kEvCodeSuccess = 1, kEvCodeEot = 2;
+constexpr uint32_t kEvCodeSuccess = 1, kEvCodeEot = 2, kEvCodeOverflow = 3, kEvCodeEob = 4, kEvCodeOob = 5, kEvCodeDbMode = 6;
+constexpr uint32_t kEvCodeUndefined = 0x10, kEvCodeBadTre = 0x11;
 constexpr uint32_t kTreIeot = 1u << 9, kTreIeob = 1u << 8, kTreChain = 1u << 0, kTreBei = 1u << 10;
 // A channel context's words: configuration (channel state 7:0, burst mode 9:8, poll configuration 15:10), type (1 outbound to the
 // device, 2 inbound), the event ring it reports on; then base, length, read and write pointers (64-bit each).
