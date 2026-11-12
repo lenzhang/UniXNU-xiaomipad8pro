@@ -61,6 +61,21 @@ enum NativeAdrenoMapWhy : uint8_t {
 struct NativeAdrenoMapRefusal {uint8_t why;uint64_t a,b,c,d;NativeAdrenoVmRefusal vm;bool vm_captured;};
 /* The mappings one connection holds: count, table ranges, bytes, its window and the highest end any mapping reached. */
 struct NativeAdrenoMapUsage {uint64_t objects,spans,bytes,window_start,window_bytes,window_peak;};
+/* UniXNU-piano (2026-11-12): why this connection's last BoAlloc or BoImport was refused (lastAllocRefusal), for the console's detail
+ * line after its "call failed" line: the first macOS desktops said "BoAlloc -> BadArgument" for a BO past 256 MiB and "NoMemory" with
+ * no figure. method is the ABI method (NativeAdrenoMethodBoAlloc or NativeAdrenoMethodBoImport); the figures are named per code. */
+enum NativeAdrenoAllocWhy : uint8_t {
+    NativeAdrenoAllocWhyNone,
+    NativeAdrenoAllocWhyNotOpen,
+    NativeAdrenoAllocWhyRequest,       /* a bytes, b align_log2 (BoImport: the address), c contiguous */
+    NativeAdrenoAllocWhyLimit,         /* a bytes, b the per-object limit (maxObjectBytes), c the window's bytes (0: no window) */
+    NativeAdrenoAllocWhyObjects,       /* no free object slot: a live objects, b the connection's capacity */
+    NativeAdrenoAllocWhyMemory,        /* a bytes, b status, c the pool's free bytes, d its largest free extent, e bytes the pool keeps for
+                                        * the render server (0: none kept); no pool room and XNU gave no (contiguous) pages, or the fill */
+    NativeAdrenoAllocWhyWriteCombine,  /* a bytes, b status: the pages' write-combined attribute */
+    NativeAdrenoAllocWhyImport,        /* a bytes, b status, c the import's stage (native_adreno_import_stage), d the address */
+};
+struct NativeAdrenoAllocRefusal {uint8_t why;uint32_t method;uint64_t a,b,c,d,e;};
 #endif
 class NativeAdrenoUserClient final {
     struct Queue {uint32_t id=0;bool active=false;};
@@ -101,6 +116,11 @@ class NativeAdrenoUserClient final {
     void noteMapped(const Entry &,bool add);
     IOReturn refuseMap(uint8_t why,IOReturn status,uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_t d=0)
     {map_refusal_={why,a,b,c,d,{},false};return status;}
+    /* The last BoAlloc or BoImport refusal (refuseAlloc), and the BoAlloc that found no memory: the pool's figures, under the Memory lock. */
+    NativeAdrenoAllocRefusal alloc_refusal_{};
+    IOReturn refuseAlloc(uint8_t why,uint32_t method,IOReturn status,uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_t d=0,uint64_t e=0)
+    {alloc_refusal_={why,method,a,b,c,d,e};return status;}
+    IOReturn refuseAllocMemory(uint64_t bytes,IOReturn status);
 #endif
     Queue queues_[NativeAdrenoAbiMaxQueues]{};
     NativeAdrenoVm *vm_=nullptr;
@@ -192,6 +212,15 @@ public:
      * IOKit wrapper right after that call, under the connection's lock). */
     void mapUsage(NativeAdrenoMapUsage *) const;
     NativeAdrenoMapRefusal lastMapRefusal() const {return map_refusal_;}
+    /* UniXNU-piano (2026-11-12): why the last BoAlloc or BoImport was refused (read as lastMapRefusal is). */
+    NativeAdrenoAllocRefusal lastAllocRefusal() const {return alloc_refusal_;}
+    /* The largest BO or import this connection can use, Query's max_bo_bytes: its GPU window (a larger object could never be mapped),
+     * page aligned, at most NativeAdrenoMemoryMaxBytes; NativeAdrenoMemoryMaxBytes without a window. Upstream: 256 MiB
+     * (NativeAdrenoAbiMaxBoBytesShift) whatever the window. */
+    uint64_t maxObjectBytes() const
+    {const uint64_t w=window_bytes_&~UINT64_C(4095);return w && w<NativeAdrenoMemoryMaxBytes?w:uint64_t(NativeAdrenoMemoryMaxBytes);}
+#else
+    uint64_t maxObjectBytes() const {return UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;}
 #endif
     IOReturn query(NativeAdrenoAbiParams *);
     /* clock (dispatch's; optional): the contiguous backoff's time and the zero fill's. Without one nothing is remembered or timed. */

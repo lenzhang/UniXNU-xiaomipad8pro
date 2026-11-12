@@ -30,8 +30,12 @@ extern "C" int proc_selfpid(void);
 /* UniXNU-piano: a BoMap refusal records why (NativeAdrenoMapWhy, lastMapRefusal) in macOS builds; elsewhere the status alone, as before. */
 #ifdef ADRENO830_MACOS
 #define MAP_REFUSE(why,status,a,b,c,d) refuseMap(NativeAdrenoMapWhy##why,status,a,b,c,d)
+/* UniXNU-piano (2026-11-12): a BoAlloc's or BoImport's refusal records why (NativeAdrenoAllocWhy, lastAllocRefusal) the same way. */
+#define ALLOC_REFUSE(why,method,status,a,b,c) refuseAlloc(NativeAdrenoAllocWhy##why,NativeAdrenoMethod##method,status,a,b,c)
+extern "C" volatile uint32_t native_adreno_import_stage;   /* NativeAdrenoMemory.cpp: where the last import stopped */
 #else
 #define MAP_REFUSE(why,status,a,b,c,d) (status)
+#define ALLOC_REFUSE(why,method,status,a,b,c) (status)
 #endif
 namespace {
 unsigned gImportNext;
@@ -308,9 +312,18 @@ IOReturn NativeAdrenoUserClient::query(NativeAdrenoAbiParams *params)
     if(!open_)return kIOReturnNotReady;
     params->abi_version=NativeAdrenoAbiVersion;
     params->input_bits=input_bits_;params->output_bits=output_bits_;
-    params->flags=NativeAdrenoParamsHostImport;params->max_bo_bytes=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
+    params->flags=NativeAdrenoParamsHostImport;params->max_bo_bytes=maxObjectBytes();   /* UniXNU-piano: the window's in macOS builds */
     return kIOReturnSuccess;
 }
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano: a BoAlloc the pool and XNU could not serve: the pool's figures, read under the Memory lock (the caller holds none). */
+IOReturn NativeAdrenoUserClient::refuseAllocMemory(uint64_t bytes,IOReturn status)
+{
+    NativeAdrenoSubmitGuard memory(submit_,NativeAdrenoSubmitLockMemory);
+    const uint64_t free_bytes=NativeAdrenoMemory::poolFreeBytes(),largest=NativeAdrenoMemory::poolLargestFree();
+    return refuseAlloc(NativeAdrenoAllocWhyMemory,NativeAdrenoMethodBoAlloc,status,bytes,uint32_t(status),free_bytes,largest,keep_pool_);
+}
+#endif
 IOReturn NativeAdrenoUserClient::allocBo(const NativeAdrenoAbiBoAlloc *request,
     NativeAdrenoAbiBoAllocReply *reply,const NativeAdrenoRingClock *clock)
 {
@@ -337,13 +350,16 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     NativeAdrenoAbiBoAllocReply *reply,const NativeAdrenoRingClock *clock)
 {
     if(!request || !reply)return kIOReturnBadArgument;reply->handle=0;
-    if(!open_)return kIOReturnNotReady;
-    const uint64_t limit=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
-    if(!request->bytes || (request->bytes&4095) || request->bytes>limit ||
-        request->align_log2<12 || request->align_log2>24 || request->contiguous>1)
-        return kIOReturnBadArgument;
+#ifdef ADRENO830_MACOS
+    alloc_refusal_={};   /* UniXNU-piano: this call's refusal only */
+#endif
+    if(!open_)return ALLOC_REFUSE(NotOpen,BoAlloc,kIOReturnNotReady,0,0,0);
+    const uint64_t limit=maxObjectBytes();
+    if(!request->bytes || (request->bytes&4095) || request->align_log2<12 || request->align_log2>24 || request->contiguous>1)
+        return ALLOC_REFUSE(Request,BoAlloc,kIOReturnBadArgument,request->bytes,request->align_log2,request->contiguous);
+    if(request->bytes>limit)return ALLOC_REFUSE(Limit,BoAlloc,kIOReturnBadArgument,request->bytes,limit,window_bytes_);
     Entry *entry=free();
-    if(!entry)return kIOReturnNoResources;
+    if(!entry)return ALLOC_REFUSE(Objects,BoAlloc,kIOReturnNoResources,live_,entry_count_,0);
     IOReturn status=kIOReturnNoResources;
     const bool zero_outside=NativeAdrenoKoptOn(NativeAdrenoKoptPoolZero);
     {
@@ -379,12 +395,33 @@ IOReturn NativeAdrenoUserClient::allocBoInner(const NativeAdrenoAbiBoAlloc *requ
     /* User BOs are write-combined for the CPU, as the GPU maps them non-cacheable: no per-submission cache maintenance
      * (ARCHITECTURE 4.14.1). Turnip maps every BO asking kIOMapWriteCombineCache (kIOMapDefaultCache only with CachedCoherent).
      * The object's own pages (a write-combined pool's BO only takes the flag): no Memory lock either. */
+#ifdef ADRENO830_MACOS
+    const bool backed=!status;   /* UniXNU-piano: a failure from here on is the write-combined attribute's */
+#endif
     if(!status && native_adreno_wc_enabled)status=entry->memory.makeWriteCombined();
     if(status) {
-        /* A pooled object gives its pages back to the pool under the Memory lock; one from outside it needs none. */
-        NativeAdrenoSubmitGuard memory(entry->memory.pooled()?submit_:nullptr,NativeAdrenoSubmitLockMemory);
-        releaseEntry(*entry);
+#ifdef ADRENO830_MACOS
+        bool figures=false;uint64_t pool_free=0,pool_largest=0;   /* UniXNU-piano: the refusal's pool figures */
+#endif
+        {
+            /* A pooled object gives its pages back to the pool under the Memory lock; one from outside it needs none. */
+            NativeAdrenoSubmitGuard memory(entry->memory.pooled()?submit_:nullptr,NativeAdrenoSubmitLockMemory);
+#ifdef ADRENO830_MACOS
+            figures=entry->memory.pooled();
+#endif
+            releaseEntry(*entry);
+#ifdef ADRENO830_MACOS
+            if(figures) {pool_free=NativeAdrenoMemory::poolFreeBytes();pool_largest=NativeAdrenoMemory::poolLargestFree();}
+#endif
+        }
+#ifdef ADRENO830_MACOS
+        if(backed)return refuseAlloc(NativeAdrenoAllocWhyWriteCombine,NativeAdrenoMethodBoAlloc,status,request->bytes,uint32_t(status));
+        if(!figures)return refuseAllocMemory(request->bytes,status);   /* takes the Memory lock for them */
+        return refuseAlloc(NativeAdrenoAllocWhyMemory,NativeAdrenoMethodBoAlloc,status,request->bytes,uint32_t(status),pool_free,
+                           pool_largest,keep_pool_);
+#else
         return status;
+#endif
     }
     publish(*entry);
     entry->mapped=0;entry->iova=0;entry->mapped_state=false;
@@ -409,19 +446,27 @@ IOReturn NativeAdrenoUserClient::importBo(const NativeAdrenoAbiBoImport *request
     NativeAdrenoAbiBoAllocReply *reply)
 {
     if(!request || !reply)return kIOReturnBadArgument;reply->handle=0;
-    if(!open_)return kIOReturnNotReady;
+#ifdef ADRENO830_MACOS
+    alloc_refusal_={};   /* UniXNU-piano: this call's refusal only */
+#endif
+    if(!open_)return ALLOC_REFUSE(NotOpen,BoImport,kIOReturnNotReady,0,0,0);
     native_adreno_import_diag[0]=native_adreno_import_diag[0]+1;
-    const uint64_t limit=UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift;
+    const uint64_t limit=maxObjectBytes();
     if(!task || !request->address || ((request->address|request->bytes)&4095) || !request->bytes || request->bytes>limit) {
         noteImport(kIOReturnBadArgument,1,request->bytes,request->address);
-        return kIOReturnBadArgument;
+        if(task && request->address && !((request->address|request->bytes)&4095) && request->bytes)
+            return ALLOC_REFUSE(Limit,BoImport,kIOReturnBadArgument,request->bytes,limit,window_bytes_);
+        return ALLOC_REFUSE(Request,BoImport,kIOReturnBadArgument,request->bytes,request->address,0);
     }
     /* M9: the hand-off scanout lies outside the XNU memory window and has no managed pages to wire: its BO is the presenter's own
      * physical range (ARCHITECTURE 5.3.2). */
     uint64_t offset=0;
     const bool scanout=isScanoutAddress(task,request->address,request->bytes,&offset);
     Entry *entry=free();
-    if(!entry) {noteImport(kIOReturnNoResources,2,request->bytes,request->address);return kIOReturnNoResources;}
+    if(!entry) {
+        noteImport(kIOReturnNoResources,2,request->bytes,request->address);
+        return ALLOC_REFUSE(Objects,BoImport,kIOReturnNoResources,live_,entry_count_,0);
+    }
     IOReturn status;
     {
         NativeAdrenoSubmitGuard memory(submit_,NativeAdrenoSubmitLockMemory);
@@ -431,6 +476,10 @@ IOReturn NativeAdrenoUserClient::importBo(const NativeAdrenoAbiBoImport *request
     }
     if(status) {
         noteImport(status,scanout?5:4,request->bytes,request->address);
+#ifdef ADRENO830_MACOS
+        refuseAlloc(NativeAdrenoAllocWhyImport,NativeAdrenoMethodBoImport,status,request->bytes,uint32_t(status),
+                    scanout?5u:native_adreno_import_stage,request->address);
+#endif
         return status;
     }
     publish(*entry);

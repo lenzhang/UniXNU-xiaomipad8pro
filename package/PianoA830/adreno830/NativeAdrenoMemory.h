@@ -48,6 +48,17 @@ static inline IOReturn NativeAdrenoMaintainRuns(uintptr_t address,size_t bytes,s
     }
     return kIOReturnSuccess;
 }
+/* The largest backing object allocate(), allocatePooled(), importTask() and importDevice() take (their byte budget's bound). */
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano (2026-11-12): 4 GiB less a page, the largest allocation Turnip's buffer size fields can describe (its
+ * maxMemoryAllocationSize is at most 0xFFFFFFFF), instead of upstream's 256 MiB: Metal's 16384x16384 textures are 1 GiB at 4 bytes a
+ * texel and more with UBWC metadata. What bounds a BO in practice is the connection's GPU window (NativeAdrenoUserClient::
+ * maxObjectBytes: a BO the window cannot hold could never be mapped), the BO pool or the pages XNU gives, and the VM's table ranges,
+ * each refused with its reason on the console. */
+enum : uint64_t {NativeAdrenoMemoryMaxBytes=UINT64_C(0xFFFFF000)};
+#else
+enum : uint64_t {NativeAdrenoMemoryMaxBytes=UINT64_C(256)*1024*1024};
+#endif
 /* Every CPU mapping of the spans' pages becomes write-combined (true) or takes the default cacheable attribute again (false). */
 IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t count,bool write_combined);
 /* int-100 found a write-combined BO's page back at the default (cacheable) attribute with dirty IB lines: XNU's view machinery sets a page's
@@ -120,6 +131,11 @@ public:
     /* Pool bytes not handed out (0 without a pool). Read under the Memory lock by an allocation that must leave part of the pool to the
      * render server (NativeAdrenoUserClient::setReserve). */
     static size_t poolFreeBytes();
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (2026-11-12): the pool's largest free extent in bytes (0 without a pool) and, with extents, how many free extents
+     * there are: what a BoAlloc that found no room in the pool says. Read under the Memory lock. */
+    static size_t poolLargestFree(uint32_t *extents=nullptr);
+#endif
     /* The pool's first physical byte (0 without a pool): its pages belong to pooled BOs alone. */
     static uint64_t poolPhysical();
     /* The status page's MEM row (ARCHITECTURE 8.4): pool MiB, pool MiB in use, live imports (task and device). */

@@ -1060,6 +1060,13 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
                 boot_progress_gpu_event(detail);
                 __atomic_store_n(&native_adreno_va_due,1u,__ATOMIC_RELEASE);
             }
+            /* 2026-11-12: a BoAlloc's or BoImport's reason the same way (the per-object limit, the pool's room and XNU's answer). */
+            if((method==NativeAdrenoMethodBoAlloc || method==NativeAdrenoMethodBoImport) && box_) {
+                char detail[NativeAdrenoMapLineBytes];
+                NativeAdrenoAllocRefusalLine(detail,sizeof detail,box_->core.lastAllocRefusal());
+                boot_progress_gpu_event(detail);
+                __atomic_store_n(&native_adreno_va_due,1u,__ATOMIC_RELEASE);
+            }
         }
     return status;
 #endif

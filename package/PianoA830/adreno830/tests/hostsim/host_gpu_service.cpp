@@ -58,6 +58,14 @@ bool a830()
     static const int chosen=[] {const char *gpu=std::getenv("HOSTSIM_GPU");return gpu && !std::strcmp(gpu,"a830")?1:0;}();
     return chosen!=0;
 }
+/* UniXNU-piano (2026-11-12): HOSTSIM_VA=16 (a830 only): the 16 GiB aperture piano's kernel runs with (pagani-gpu-va 16: a 34-bit
+ * input, 8209 table pages) and its client window table (NativeAdrenoClientWindows16G; with ADRENO830_MACOS macOS's: the render server
+ * 3.5 GiB up to 4 GiB), instead of the 4 GiB one. */
+bool va16()
+{
+    static const int chosen=[] {const char *va=std::getenv("HOSTSIM_VA");return va && !std::strcmp(va,"16")?1:0;}();
+    return a830() && chosen!=0;
+}
 
 /* Software CP: a write of the ring write pointer retires everything up to it (the BR read pointer shadow and the completed fence in
  * the memptrs page), unless a test holds completions; the fence the ring reads is the number of submissions so far. */
@@ -106,6 +114,12 @@ const NativeAdrenoAbiDeviceInfo infoA740={0x43050a01u,3u<<20,0x1000000ull,0x1fff
  * macrotiles, UBWC 5. */
 const NativeAdrenoAbiDeviceInfo infoA830={0x44050001u,12u<<20,0x4000000ull,0x1fffffffff000ull,0x20000000ull,0xE0000000ull,
     16,6,1,5,NativeAdrenoDeviceClientIova,0};
+/* UniXNU-piano: the same facts with the 16 GiB aperture's client VA (HOSTSIM_VA=16). */
+const NativeAdrenoAbiDeviceInfo infoA830Va16={0x44050001u,12u<<20,0x4000000ull,0x1fffffffff000ull,0x20000000ull,0x3E0000000ull,
+    16,6,1,5,NativeAdrenoDeviceClientIova,0};
+const NativeAdrenoAbiDeviceInfo &deviceInfoA830() {return va16()?infoA830Va16:infoA830;}
+/* UniXNU-piano: the successful BoAllocs' and BoImports' bytes, all and the largest, for the plugin's host checks of large resources. */
+uint64_t allocBytes=0,allocLargest=0,importLargest=0;
 const NativeAdrenoRingIo ringio{nullptr,cwrite,cread,cbarrier,nullptr,nullptr,nullptr};
 const NativeAdrenoRingCache ringcache{nullptr,cpublish,cacquire};
 const NativeAdrenoRingClock clock_{nullptr,cnow,cidle};
@@ -135,7 +149,10 @@ bool build() {
     NativeAdrenoGpuContextConfig config{};
     config.programmer=&programmer;
     config.bank=0;config.asid=1;config.slot=0;config.lpac_slot=3;config.sid=0;config.lpac_sid=1;
-    config.output_bits=0;config.aperture_gib=a830()?4:2;config.pool_mib=0;config.write_combined_pool=false;
+    config.output_bits=0;config.aperture_gib=va16()?16:a830()?4:2;config.pool_mib=0;config.write_combined_pool=false;
+    /* UniXNU-piano (2026-11-12): HOSTSIM_POOL_MIB=<MiB>: a BO pool of that size, as S3 reserves on the device (pagani-gpu-pool; none by
+     * default here), so a BO the pool can hold is one span of it (a 16384x16384 texture's 1 GiB among them). */
+    if(const char *pool=std::getenv("HOSTSIM_POOL_MIB"))config.pool_mib=uint32_t(std::strtoul(pool,nullptr,0));
     NativeAdrenoGmuContextReport report;
     const IOReturn up=context->bringUp(config,nullptr,&report);
     if(up!=kIOReturnSuccess) {std::fprintf(stderr,"host gpu: context bring-up failed %d at step %u\n",up,report.step);return false;}
@@ -158,7 +175,7 @@ extern "C" {
 int host_gpu_open() {
     std::lock_guard<std::recursive_mutex> guard(serviceLock);
     if(!build() || opened)return kIOReturnBusy;
-    const uint32_t input_bits=a830()?32:31;
+    const uint32_t input_bits=va16()?34:a830()?32:31;   /* UniXNU-piano: the 16 GiB aperture's 34 bits */
     /* HOSTSIM_SLOT=<n> (a830 only): the connection is mounted as NativeAdrenoPublish.cpp mounts a client in slot n, with
      * NativeAdrenoClientTermsFor's objects and render-server reserve and slot n's window of the 4 GiB table: 4 is an app's 124 MiB small
      * window, 1 a large client's 352 MiB (AdrenoMetal bridge/texture_atlas_host.mm). Unset or 0: the render server's slot 0, as before. */
@@ -177,8 +194,9 @@ int host_gpu_open() {
     client.attachTimer(&timer);
     if(a830()) {
         /* The render server's slot of the kernel (ARCHITECTURE 6.2): its window is the VA GetDeviceInfo reports. */
-        const NativeAdrenoClientWindow *windows=NativeAdrenoClientWindowsFor(infoA830.va_start+infoA830.va_size);
-        client.attachDeviceInfo(&infoA830);
+        const NativeAdrenoAbiDeviceInfo &info=deviceInfoA830();
+        const NativeAdrenoClientWindow *windows=NativeAdrenoClientWindowsFor(info.va_start+info.va_size);
+        client.attachDeviceInfo(&info);
         if(slot>=NativeAdrenoMaxClients || !windows[slot].bytes) {
             std::fprintf(stderr,"host gpu: slot %u has no window\n",slot);client.releaseAll(&clock_,0);return kIOReturnNotReady;
         }
@@ -214,6 +232,7 @@ int host_gpu_call(uint32_t method,const void *in,size_t in_size,void *out,size_t
         const IOReturn status=client.importBo(&request,reinterpret_cast<void *>(0x1000),&reply);
         if(!status)std::memcpy(out,&reply,sizeof(reply));
         if(!status)++successes[method];
+        if(!status && request.bytes>importLargest)importLargest=request.bytes;   /* UniXNU-piano */
         return translate(status);
     }
     IOReturn status;
@@ -234,6 +253,10 @@ int host_gpu_call(uint32_t method,const void *in,size_t in_size,void *out,size_t
             [] {return cnow(nullptr);});
     } else status=client.dispatch(method,in,in_size,out,out_size,&clock_);
     if(!status && method<32)++successes[method];
+    if(!status && method==NativeAdrenoMethodBoAlloc && in) {   /* UniXNU-piano */
+        const uint64_t bytes=static_cast<const NativeAdrenoAbiBoAlloc *>(in)->bytes;
+        allocBytes+=bytes;if(bytes>allocLargest)allocLargest=bytes;
+    }
     if(!status && method==NativeAdrenoMethodBoMap && in)
         lastMapIova=static_cast<const NativeAdrenoAbiBoMap *>(in)->iova;
     /* HOSTSIM_TRACE=1: every failing call, and every allocation size, on stderr. */
@@ -255,6 +278,20 @@ unsigned host_gpu_live_objects() {std::lock_guard<std::recursive_mutex> guard(se
 unsigned host_gpu_calls(uint32_t method) {std::lock_guard<std::recursive_mutex> guard(serviceLock);return method<32?calls[method]:0;}
 unsigned host_gpu_successes(uint32_t method) {std::lock_guard<std::recursive_mutex> guard(serviceLock);return method<32?successes[method]:0;}
 uint64_t host_gpu_last_map_iova() {std::lock_guard<std::recursive_mutex> guard(serviceLock);return lastMapIova;}
+/* UniXNU-piano (2026-11-12): the open connection's per-object limit (Query's max_bo_bytes) and window, and the successful BoAllocs' bytes
+ * (all of them and the largest) and the largest BoImport since the service started. */
+uint64_t host_gpu_object_limit() {std::lock_guard<std::recursive_mutex> guard(serviceLock);return opened?client.maxObjectBytes():0;}
+uint64_t host_gpu_window_bytes() {std::lock_guard<std::recursive_mutex> guard(serviceLock);return opened?client.windowBytes():0;}
+uint64_t host_gpu_alloc_bytes() {std::lock_guard<std::recursive_mutex> guard(serviceLock);return allocBytes;}
+uint64_t host_gpu_alloc_largest() {std::lock_guard<std::recursive_mutex> guard(serviceLock);return allocLargest;}
+uint64_t host_gpu_import_largest() {std::lock_guard<std::recursive_mutex> guard(serviceLock);return importLargest;}
+size_t host_gpu_vm_spans() {std::lock_guard<std::recursive_mutex> guard(serviceLock);return context?context->vm()->spanCount():0;}
+/* The BO pool's MiB in use (HOSTSIM_POOL_MIB; 0 without a pool). */
+uint64_t host_gpu_pool_used_mib() {
+    std::lock_guard<std::recursive_mutex> guard(serviceLock);
+    uint32_t pool=0,used=0,imports=0;NativeAdrenoMemory::usage(&pool,&used,&imports);
+    return used;
+}
 // Only the atomic peer-release flag changes off-thread. The next service call, idle wait or ring read/acquire publishes the
 // software peer's completion under the service lock, like the existing CP model.
 void host_gpu_hold_completion(int hold) {holdCompletion.store(hold!=0,std::memory_order_release);}

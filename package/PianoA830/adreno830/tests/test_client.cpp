@@ -242,7 +242,16 @@ int main()
         /* Argument refusals are decided here and never reach the kernel. */
         CHECK(client.allocBo(4096,12,false,nullptr)==kIOReturnBadArgument);
         CHECK(client.allocBo(4096,11,false,&handle)==kIOReturnBadArgument);
+#ifdef ADRENO830_MACOS
+        {
+            /* UniXNU-piano (2026-11-12): the kernel's per-object limit is Query's (the window's, NativeAdrenoMemoryMaxBytes without one). */
+            NativeAdrenoAbiParams limits{};
+            CHECK(client.query(&limits)==kIOReturnSuccess && limits.max_bo_bytes>(UINT64_C(1)<<28));
+            CHECK(client.allocBo(limits.max_bo_bytes+4096,12,false,&handle)==kIOReturnBadArgument);
+        }
+#else
         CHECK(client.allocBo((UINT64_C(1)<<28)+4096,12,false,&handle)==kIOReturnBadArgument);
+#endif
         CHECK(client.freeBo(0)==kIOReturnBadArgument);
         CHECK(client.setMetadata(1,nullptr,65)==kIOReturnBadArgument);
         uint32_t length=0;

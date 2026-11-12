@@ -156,7 +156,23 @@ int main()
         NativeAdrenoAbiParams params{};
         CHECK(p.client.query(&params)==kIOReturnSuccess && params.abi_version==NativeAdrenoAbiVersion);
         CHECK(params.input_bits==32 && params.output_bits==36 && params.flags==NativeAdrenoParamsHostImport);
+#ifdef ADRENO830_MACOS
+        /* UniXNU-piano (2026-11-12): without a window the per-object limit is NativeAdrenoMemoryMaxBytes (4 GiB less a page). */
+        CHECK(params.max_bo_bytes==NativeAdrenoMemoryMaxBytes && p.client.maxObjectBytes()==NativeAdrenoMemoryMaxBytes);
+        {
+            /* A BO past upstream's 256 MiB is made (288 MiB: a 16384x16384 texture is 1 GiB, which the hostsim run maps), and the
+             * memory object's own bound is NativeAdrenoMemoryMaxBytes. */
+            NativeAdrenoAbiBoAlloc large{UINT64_C(288)<<20,12,0};NativeAdrenoAbiBoAllocReply made{};
+            CHECK(p.client.allocBo(&large,&made)==kIOReturnSuccess && made.handle && p.client.memoryOf(made.handle)->bytes()==(UINT64_C(288)<<20));
+            NativeAdrenoAbiBoFree drop{made.handle};
+            CHECK(p.client.freeBo(&drop)==kIOReturnSuccess);
+            NativeAdrenoMemory past;
+            CHECK(past.allocate(4096,36,false,size_t(NativeAdrenoMemoryMaxBytes)+4096)==kIOReturnBadArgument);
+        }
+        macosChecks+=4;
+#else
         CHECK(params.max_bo_bytes==(UINT64_C(1)<<NativeAdrenoAbiMaxBoBytesShift));
+#endif
         NativeAdrenoAbiTimestamp no_timer{};
         CHECK(p.client.timestamp(&no_timer)==kIOReturnUnsupported);
         NativeAdrenoAbiStatus no_status{};
@@ -704,6 +720,25 @@ int main()
             NativeAdrenoAbiBoFree drop{outside.handle};
             CHECK(second.freeBo(&drop)==kIOReturnSuccess);
             macosChecks+=5;
+            /* 2026-11-12: the per-object limit is the window: Query says so, and a BO or an import the window cannot hold is refused
+             * before any page is taken, with the limit and the window in the reason (a limit of 256 MiB whatever the window before). */
+            NativeAdrenoAbiParams params{};
+            CHECK(second.query(&params)==kIOReturnSuccess && params.max_bo_bytes==0x4000 && second.maxObjectBytes()==0x4000);
+            const unsigned created=fixture.created;
+            NativeAdrenoAbiBoAlloc past{0x5000,12,0};
+            CHECK(second.allocBo(&past,&outside)==kIOReturnBadArgument && !outside.handle && fixture.created==created);
+            const NativeAdrenoAllocRefusal limit=second.lastAllocRefusal();
+            CHECK(limit.why==NativeAdrenoAllocWhyLimit && limit.method==NativeAdrenoMethodBoAlloc && limit.a==0x5000 && limit.b==0x4000 &&
+                  limit.c==0x4000);
+            NativeAdrenoAbiBoImport big{0x10000000,0x5000};NativeAdrenoAbiBoAllocReply imported{};
+            CHECK(second.importBo(&big,reinterpret_cast<void *>(0x77),&imported)==kIOReturnBadArgument && !imported.handle &&
+                  second.lastAllocRefusal().why==NativeAdrenoAllocWhyLimit && second.lastAllocRefusal().method==NativeAdrenoMethodBoImport &&
+                  second.lastAllocRefusal().b==0x4000);
+            NativeAdrenoAbiBoAlloc whole{0x4000,12,0};
+            CHECK(second.allocBo(&whole,&outside)==kIOReturnSuccess && !second.lastAllocRefusal().why);
+            drop.handle=outside.handle;
+            CHECK(second.freeBo(&drop)==kIOReturnSuccess);
+            macosChecks+=6;
         }
 #endif
         NativeAdrenoAbiSubmitReply reply{};
@@ -827,8 +862,19 @@ int main()
             {8192,25,0},{8192,12,2},{0x10000001,12,0}};
         for(const auto &r:bad)CHECK(p.client.allocBo(&r,&allocated)==kIOReturnBadArgument);
         CHECK(!allocated.handle);
+#ifdef ADRENO830_MACOS
+        /* UniXNU-piano (2026-11-12): each refusal's reason (lastAllocRefusal) for the console's detail line, the request's figures. */
+        for(const auto &r:bad)
+            CHECK(p.client.allocBo(&r,&allocated)==kIOReturnBadArgument && p.client.lastAllocRefusal().why==NativeAdrenoAllocWhyRequest &&
+                  p.client.lastAllocRefusal().method==NativeAdrenoMethodBoAlloc && p.client.lastAllocRefusal().a==r.bytes);
+        macosChecks+=sizeof bad/sizeof bad[0];
+#endif
         NativeAdrenoAbiBoAlloc good{4096,12,0};
         CHECK(p.client.allocBo(&good,&allocated)==kIOReturnSuccess);
+#ifdef ADRENO830_MACOS
+        CHECK(!p.client.lastAllocRefusal().why);   /* a call that succeeds leaves no refusal */
+        ++macosChecks;
+#endif
         NativeAdrenoAbiBoMap wrong[]={{0,Base,3,0,2,0},{allocated.handle,Base,2,0,2,0},
             {allocated.handle,Base+1,3,0,2,0},{allocated.handle,Base,3,2,2,0},
             {allocated.handle,Base,3,0,1,0},{allocated.handle,Base,3,0,2,1},
@@ -1051,6 +1097,12 @@ int main()
         NativeAdrenoAbiBoAllocReply second{};
         fixture.allocation_fail_count=2; /* contiguous and scattered both fail */
         CHECK(p.client.allocBo(&big,&second)==kIOReturnNoMemory && !second.handle && fixture.allocation_fail_count==0);
+#ifdef ADRENO830_MACOS
+        /* UniXNU-piano: the reason with the pool's figures (no pool here) and XNU's answer. */
+        CHECK(p.client.lastAllocRefusal().why==NativeAdrenoAllocWhyMemory && p.client.lastAllocRefusal().a==(128u<<10) &&
+              p.client.lastAllocRefusal().b==uint32_t(kIOReturnNoMemory) && !p.client.lastAllocRefusal().c && !p.client.lastAllocRefusal().d);
+        ++macosChecks;
+#endif
         NativeAdrenoAbiBoAlloc demanded{1u<<20,12,1};
         fixture.allocation_fail_count=1; /* a demanded contiguous run is not retried scattered */
         CHECK(p.client.allocBo(&demanded,&second)==kIOReturnNoMemory);
@@ -1494,7 +1546,8 @@ int main()
         "only counted against it (alike, apart, undecided, polled)\n",attribution);
 #ifdef ADRENO830_MACOS
     std::printf("PASS: BoMap refusal records and mapping figures (UniXNU-piano): %u checks (every request refusal's reason, already mapped, "
-                "outside the window with its figures, mapped/unmapped counts)\n",macosChecks);
+                "outside the window with its figures, mapped/unmapped counts; the per-object limit as the window, BoAlloc's and BoImport's "
+                "refusal reasons, a 288 MiB BO)\n",macosChecks);
 #endif
     std::printf("PASS: %u user-client blocks over software SMMU/CP peers: transaction with wait_fence validated against the ring (no CPU "
         "wait), per-connection faults with FAR attribution, 32 slots with 4 GiB (1+3 large+8 small)/16 GiB (1+3 large+28 small)/2 GiB "

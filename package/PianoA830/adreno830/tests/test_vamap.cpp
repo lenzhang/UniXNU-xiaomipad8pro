@@ -82,6 +82,42 @@ static void refusalLines()
     }
 }
 
+/* 2026-11-12: a BoAlloc's or BoImport's reason (lastAllocRefusal), every one within the ring's line at its widest. */
+static void allocLines()
+{
+    char line[NativeAdrenoMapLineBytes];
+    auto says=[&](const NativeAdrenoAllocRefusal &r,const char *text) {
+        NativeAdrenoAllocRefusalLine(line,sizeof line,r);
+        if(std::strcmp(line,text))std::fprintf(stderr,"got  \"%s\"\nwant \"%s\"\n",line,text);
+        return !std::strcmp(line,text) && std::strlen(line)<NativeAdrenoMapLineBytes;
+    };
+    CHECK(says({NativeAdrenoAllocWhyLimit,NativeAdrenoMethodBoAlloc,(1025ull<<20)+4096,0x14000000ull,0x14000000ull,0,0},
+               "BoAlloc refused: 1026 MiB is past this connection's per-object limit of 320 MiB (its GPU window)"));
+    CHECK(says({NativeAdrenoAllocWhyLimit,NativeAdrenoMethodBoImport,4096ull<<20,0xFFFFF000ull,0,0,0},
+               "BoImport refused: 4096 MiB is past the per-object limit of 4095 MiB"));
+    CHECK(says({NativeAdrenoAllocWhyRequest,NativeAdrenoMethodBoAlloc,4097,12,0,0,0},
+               "BoAlloc refused: the request: 4097 bytes (whole 4 KiB pages), alignment 2^12 (12..24), contiguous 0"));
+    CHECK(says({NativeAdrenoAllocWhyRequest,NativeAdrenoMethodBoImport,8192,0x10000001,0,0,0},
+               "BoImport refused: the request: 8192 bytes at 0x10000001 (both whole 4 KiB pages, nonzero)"));
+    CHECK(says({NativeAdrenoAllocWhyObjects,NativeAdrenoMethodBoAlloc,1024,1024,0,0,0},"BoAlloc refused: no object slot free, 1024 live of 1024"));
+    CHECK(says({NativeAdrenoAllocWhyMemory,NativeAdrenoMethodBoAlloc,1088ull<<20,0xe00002bdull,412ull<<20,96ull<<20,512ull<<20},
+               "BoAlloc refused: 1088 MiB: pool 412 MiB free, largest 96, 512 kept for the render server; then no pages from XNU (0xe00002bd NoMemory)"));
+    CHECK(says({NativeAdrenoAllocWhyMemory,NativeAdrenoMethodBoAlloc,64ull<<20,0xe00002bdull,0,0,0},
+               "BoAlloc refused: 64 MiB: pool 0 MiB free, largest 0; then no pages from XNU (0xe00002bd NoMemory)"));
+    CHECK(says({NativeAdrenoAllocWhyWriteCombine,NativeAdrenoMethodBoAlloc,32ull<<20,0xe00002c7ull,0,0,0},
+               "BoAlloc refused: 32 MiB: its pages' write-combined attribute was refused (0xe00002c7)"));
+    CHECK(says({NativeAdrenoAllocWhyImport,NativeAdrenoMethodBoImport,26ull<<20,0xe00002c8ull,18,0x104000000ull,0},
+               "BoImport refused: 26 MiB at 0x104000000: the task's pages were not pinned (0xe00002c8 VMError, stage 18)"));
+    CHECK(says({NativeAdrenoAllocWhyNotOpen,NativeAdrenoMethodBoAlloc,0,0,0,0,0},"BoAlloc refused: the connection is not open"));
+    CHECK(says({200,NativeAdrenoMethodBoImport,0,0,0,0,0},"BoImport refused: no reason recorded"));
+    for(uint8_t why=NativeAdrenoAllocWhyNone;why<=NativeAdrenoAllocWhyImport;++why)
+        for(uint32_t method:{uint32_t(NativeAdrenoMethodBoAlloc),uint32_t(NativeAdrenoMethodBoImport)}) {
+            const NativeAdrenoAllocRefusal r{why,method,UINT64_MAX,0xe00002c8ull,UINT64_MAX,UINT64_MAX,UINT64_MAX};
+            NativeAdrenoAllocRefusalLine(line,sizeof line,r);
+            CHECK(std::strlen(line)<NativeAdrenoMapLineBytes && (!std::strncmp(line,"BoAlloc refused: ",17) || !std::strncmp(line,"BoImport refused: ",18)));
+        }
+}
+
 static void accounting()
 {
     char line[NativeAdrenoMapLineBytes];
@@ -106,10 +142,11 @@ int main()
 #ifdef ADRENO830_MACOS
     windows();
     refusalLines();
+    allocLines();
     accounting();
     std::printf("PASS: macOS GPU address space: the 16 GiB windows (3.5 GiB render server, 768 MiB large, 320 MiB small, none across 4 GiB), "
-                "BoMap refusal lines for every reason within the ring's line, the address-space totals and per-connection lines (%u checks)\n",
-                checks);
+                "BoMap, BoAlloc and BoImport refusal lines for every reason within the ring's line, the address-space totals and "
+                "per-connection lines (%u checks)\n",checks);
 #else
     std::printf("PASS: macOS GPU address space: nothing in the upstream pass\n");
 #endif

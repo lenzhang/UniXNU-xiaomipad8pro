@@ -107,6 +107,17 @@ void poolGive(size_t offset,size_t bytes) {
 }
 size_t NativeAdrenoMemory::poolBytes() {return pool.bytes;}
 size_t NativeAdrenoMemory::poolFreeBytes() {return pool.descriptor && pool.bytes>pool.used?pool.bytes-pool.used:0;}
+#ifdef ADRENO830_MACOS
+/* UniXNU-piano: a walk of the free extents (at most PoolExtentCapacity), only when a BoAlloc is refused. */
+size_t NativeAdrenoMemory::poolLargestFree(uint32_t *extents)
+{
+    if(extents)*extents=pool.descriptor?pool.count:0;
+    if(!pool.descriptor)return 0;
+    uint32_t largest=0;
+    for(unsigned i=0;i<pool.count;++i)if(pool.free[i].pages>largest)largest=pool.free[i].pages;
+    return size_t(largest)<<12;
+}
+#endif
 uint64_t NativeAdrenoMemory::poolPhysical() {return pool.descriptor?pool.physical:0;}
 /* Imports alive (importTask and importDevice objects not yet released), for the MEM row. */
 static uint32_t liveImports;
@@ -221,7 +232,8 @@ IOReturn NativeAdrenoMemory::finishPooled()
 IOReturn NativeAdrenoMemory::allocatePooled(size_t bytes,unsigned bits)
 {
     if(descriptor_ || spans_ || quarantined_)return kIOReturnBusy;
-    if(!bytes || (bytes&4095) || !outputWidth(bits) || bytes>256u*1024u*1024u)return kIOReturnBadArgument;
+    /* UniXNU-piano: here and below the bound is NativeAdrenoMemoryMaxBytes (NativeAdrenoMemory.h; 256 MiB upstream). */
+    if(!bytes || (bytes&4095) || !outputWidth(bits) || bytes>NativeAdrenoMemoryMaxBytes)return kIOReturnBadArgument;
     NativeAdrenoCpuState cpu{};
     const IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
     return takePooled(bytes,UINT64_C(1)<<bits);
@@ -229,7 +241,7 @@ IOReturn NativeAdrenoMemory::allocatePooled(size_t bytes,unsigned bits)
 IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous,size_t budget,bool pooled)
 {
     if(descriptor_ || spans_ || quarantined_)return kIOReturnBusy;
-    if(!bytes || (bytes&4095) || !outputWidth(bits) || !budget || budget>256u*1024u*1024u)
+    if(!bytes || (bytes&4095) || !outputWidth(bits) || !budget || budget>NativeAdrenoMemoryMaxBytes)
         return kIOReturnBadArgument;
     if(bytes>budget)return kIOReturnNoResources;
     NativeAdrenoCpuState cpu{};
@@ -301,7 +313,7 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
     if(descriptor_ || imported_ || spans_ || quarantined_)return kIOReturnBusy;
     native_adreno_import_stage=11;
     if(!task || !address || (address&4095) || !bytes || (bytes&4095) || address>UINT64_MAX-bytes || !outputWidth(bits) ||
-        !budget || budget>256u*1024u*1024u)return kIOReturnBadArgument;
+        !budget || budget>NativeAdrenoMemoryMaxBytes)return kIOReturnBadArgument;
     native_adreno_import_stage=12;
     if(bytes>budget)return kIOReturnNoResources;
     NativeAdrenoCpuState cpu{};
@@ -351,7 +363,7 @@ failed:
 IOReturn NativeAdrenoMemory::importDevice(IOMemoryDescriptor *scanout,uint64_t offset,size_t bytes)
 {
     if(descriptor_ || imported_ || spans_ || device_ || pooled_ || quarantined_)return kIOReturnBusy;
-    if(!scanout || (offset&4095) || !bytes || (bytes&4095) || offset>UINT64_MAX-bytes || bytes>256u*1024u*1024u ||
+    if(!scanout || (offset&4095) || !bytes || (bytes&4095) || offset>UINT64_MAX-bytes || bytes>NativeAdrenoMemoryMaxBytes ||
         offset+bytes>(uint64_t)scanout->getLength())return kIOReturnBadArgument;
     span_capacity_=bytes/4096;
     spans_=IONewData(NativeAdrenoPhysicalSpan,span_capacity_);

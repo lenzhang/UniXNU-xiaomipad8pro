@@ -7,11 +7,14 @@
  *  - NativeAdrenoMapRefusalLine: after a refused BoMap's "call failed" line, why (NativeAdrenoUserClient::lastMapRefusal): which
  *    argument or which limit, with its figures. The first macOS desktop (run attend4) said only "BoMap -> NoResources" and
  *    "BoMap -> BadArgument".
+ *  - NativeAdrenoAllocRefusalLine (2026-11-12): after a refused BoAlloc's or BoImport's "call failed" line, why
+ *    (NativeAdrenoUserClient::lastAllocRefusal): the per-object limit and the window behind it, the pool's room and XNU's answer.
  *  - NativeAdrenoVaTotalsLine / NativeAdrenoVaClientEntry: the shared VM's records and table ranges, the BO pool and what lies outside
  *    it, then per connection its mappings, ranges, mapped MiB against its window and the highest end it reached, so a run shows the
  *    trend before a limit is hit. */
 #ifdef ADRENO830_MACOS
 #include "NativeAdrenoUserClient.h"
+#include "NativeAdrenoPublish.h"   /* NativeAdrenoReturnName */
 #ifdef ADRENO830_HOST_TEST
 #include <stdio.h>
 #else
@@ -82,6 +85,49 @@ static inline void NativeAdrenoMapRefusalLine(char *line,size_t size,const Nativ
         break;
     }
     default: snprintf(line,size,"BoMap refused: no reason recorded");break;
+    }
+}
+
+/* The detail of a refused BoAlloc or BoImport (2026-11-12; NativeAdrenoUserClient::lastAllocRefusal): the per-object limit with the
+ * window behind it, the pool's room and XNU's answer, the object slots, the import's stage. Sizes in MiB, rounded up. */
+static inline void NativeAdrenoAllocRefusalLine(char *line,size_t size,const NativeAdrenoAllocRefusal &r)
+{
+    if(!line || !size)return;
+    typedef unsigned long long u64;
+    const char *what=r.method==NativeAdrenoMethodBoImport?"BoImport":"BoAlloc";
+    const auto mib=[](uint64_t bytes) {return u64((bytes+(UINT64_C(1)<<20)-1)>>20);};
+    switch(r.why) {
+    case NativeAdrenoAllocWhyNotOpen: snprintf(line,size,"%s refused: the connection is not open",what);break;
+    case NativeAdrenoAllocWhyRequest:
+        if(r.method==NativeAdrenoMethodBoImport)
+            snprintf(line,size,"%s refused: the request: %llu bytes at %#llx (both whole 4 KiB pages, nonzero)",what,u64(r.a),u64(r.b));
+        else snprintf(line,size,"%s refused: the request: %llu bytes (whole 4 KiB pages), alignment 2^%llu (12..24), contiguous %llu",what,
+                      u64(r.a),u64(r.b),u64(r.c));
+        break;
+    case NativeAdrenoAllocWhyLimit:
+        if(r.c)snprintf(line,size,"%s refused: %llu MiB is past this connection's per-object limit of %llu MiB (its GPU window)",what,
+                        mib(r.a),u64(r.b>>20));
+        else snprintf(line,size,"%s refused: %llu MiB is past the per-object limit of %llu MiB",what,mib(r.a),u64(r.b>>20));
+        break;
+    case NativeAdrenoAllocWhyObjects: snprintf(line,size,"%s refused: no object slot free, %llu live of %llu",what,u64(r.a),u64(r.b));break;
+    case NativeAdrenoAllocWhyMemory: {
+        const char *code=NativeAdrenoReturnName(IOReturn(r.b));
+        char kept[40]="";
+        if(r.e)snprintf(kept,sizeof kept,", %llu kept for the render server",mib(r.e));
+        snprintf(line,size,"%s refused: %llu MiB: pool %llu MiB free, largest %llu%s; then no pages from XNU (%#llx%s%s)",what,mib(r.a),
+                 u64(r.c>>20),u64(r.d>>20),kept,u64(r.b),code?" ":"",code?code:"");
+        break;
+    }
+    case NativeAdrenoAllocWhyWriteCombine:
+        snprintf(line,size,"%s refused: %llu MiB: its pages' write-combined attribute was refused (%#llx)",what,mib(r.a),u64(r.b));
+        break;
+    case NativeAdrenoAllocWhyImport: {
+        const char *code=NativeAdrenoReturnName(IOReturn(r.b));
+        snprintf(line,size,"%s refused: %llu MiB at %#llx: the task's pages were not pinned (%#llx%s%s, stage %llu)",what,mib(r.a),u64(r.d),
+                 u64(r.b),code?" ":"",code?code:"",u64(r.c));
+        break;
+    }
+    default: snprintf(line,size,"%s refused: no reason recorded",what);break;
     }
 }
 
