@@ -1,8 +1,7 @@
 # The native kexts linked into piano's k27 kernel collection (tooling/k27/build-native-image.sh): descriptors in tooling/k27/kext/,
 # sources in package/, objects in out/native-kexts/. Only this repository's kexts (the native kext rule, docs/bringup-debugging.md
 # §5, enforced by tooling/k27/check-native-kexts.py): none of the VM-era paravirtual kexts (virtio block root, Ethernet, audio,
-# video, input, the stub GPU accelerator, the virtio display), and no NativeAES (no reader natively: no AppleKeyStore, Data
-# unencrypted).
+# video, input, the stub GPU accelerator, the virtio display).
 ARMPlatformStandIn   # AppleARMPlatform's classes, which IOMobileGraphicsFamily and its kexts link against
 NativeUfs            # UFS root windows + Data store
 NativeRamBlock       # the Data disk (RAM seed + changed pages in NativeUfs's store)
@@ -28,3 +27,4 @@ PianoSensors         # the ADSP sensor hub (docs/drivers/sensors.md): 1 survey, 
 PianoDp              # USB-C DisplayPort (docs/drivers/displayport.md): level 1 only, read only: D1 a survey (DP controller, QMP DP half, the DPU's DP side, each behind its clock gate), D2 the DSP's port notifications logged (with piano-power=2); inert without piano-dp=N; after PianoPower (its client contract)
 PianoBluetooth       # the WCN7860's Bluetooth over QUP2 SE6 "UART14" (docs/drivers/bluetooth.md): 1 survey, 2 power (the rails shared with PianoWifi, BT_EN), 3 UART, 4 controller set-up (firmware from bluetooth_a); inert without piano-bt=N; after PianoA830 (its lock words, the rails helper's words) and NativeUfs (bluetooth_a)
 PianoPolicy          # the laptop-class policy (docs/policy.md): cover, keyboard wake, power key, Low Power Mode -> PianoThermal / PianoA830; inert without piano-policy=N; after the drivers it watches (PianoThermal: a library, its breadcrumb)
+SoftwareAES          # UniXNU's software IOAESAccelerator (package/SoftwareAES/UPSTREAM): AppleImage4's start waits, without a timeout, for one; without it /defaults stays busy and the IOKit registry never goes quiet (configd's InterfaceNamer waits 240 s for every interface its database lacks; docs/identity.md section 8). Always on (no boot argument)

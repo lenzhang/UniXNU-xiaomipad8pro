@@ -1,0 +1,14 @@
+NativeAES.cpp, OriginalAESABI.h, LICENSE: UniXNU's SoftwareAES component (github.com/UniXNU/SoftwareAES 4a45326da5c2cd6fe6813d79ee43db20805628af,
+BSD-2-Clause-Patent, UniXNU's components.toml id SoftwareAES, runtime class NativeAES): software AES-CBC behind IOAESAccelerator,
+with its known-answer tests. OriginalAESABI.h's sizes (IOAESAccelerator 0x120) match both collections' IOCryptoAcceleratorFamily
+(27.0.1 vma2 base and 27.3 mac17j: the instance size their metaclass constructors pass).
+
+Changed here (marked "UniXNU-piano"): the device key, selector 2212, served with a fixed software key (isKeySupported, performAES),
+because macOS 27's AppleImage4 entangles the nonce slots it resets with it and panics when the accelerator refuses it (the VM era's
+finding, "encryption failed: 0xe00002c7"); one console line at registration and one at the first use of that key.
+
+Why piano needs it (docs/identity.md section 8): AppleImage4::start finalizes its expert by waiting, without a timeout, for a
+registered IOAESAccelerator (serviceMatching("IOAESAccelerator") then waitForMatchingService(..., UINT64_MAX), the same in 27.0.1
+and 27.3). With none, its start never returns, its provider /defaults stays busy, and the IOKit registry never goes quiet: configd's
+InterfaceNamer then names every interface missing from its database only after its 240 s timeout. The VM era had this driver
+(NativeAES); it was dropped from native boots on 2026-11-11 as unused.
