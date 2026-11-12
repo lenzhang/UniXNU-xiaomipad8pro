@@ -92,6 +92,7 @@ struct Args {
   uint32_t gen, physeq, rcg, blind, release, stop, dmaMib, fwTimeoutMs;
   uint32_t iova, mode, shadow, qmiTimeoutMs;
   uint32_t wmiTimeoutMs, scanWaitMs, band, bssid;
+  uint32_t noc, socreset;
 };
 Args gArgs;
 
@@ -141,6 +142,10 @@ void readArgs()
   if (gArgs.scanWaitMs < 1000 || gArgs.scanWaitMs > 60000) gArgs.scanWaitMs = kScanWaitMsDefault;
   gArgs.band = bootArg("piano-wifi-band", 1);
   gArgs.bssid = bootArg("piano-wifi-bssid", 0);
+  // piano-wifi-noc=0: no vote for the PCIe NoC's bus clock manager (SN4) before level 3's clocks (the A/B test of docs §10.21)
+  gArgs.noc = bootArg("piano-wifi-noc", 1);
+  // piano-wifi-socreset=1: the chip-side reset this chip's own host runs before MHI (WifiHw.h), at level 4 before BHI
+  gArgs.socreset = bootArg("piano-wifi-socreset", 0);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -330,6 +335,14 @@ void reportSmmu()
 // survey, which also settles the LDO page rule). 0 means "not found", and a rail without both is never voted.
 uint32_t gRailAddress[kRailCount];
 uint16_t gRailPpid[kRailCount];
+// The PCIe NoC's bus clock manager (WifiHw.h, kNocBcmName): its RPMh address and aux data from cmd-db, and whether our vote stands.
+struct NocBcm {
+  uint32_t address = 0, vote = 0;
+  BcmAux aux;
+  int rc = -2;
+  bool voted = false;
+};
+NocBcm gNoc;
 
 void reportCmdDb()
 {
@@ -364,8 +377,15 @@ void reportCmdDb()
     n += size_t(rc ? snprintf(line + n, sizeof line - n, "%s%s none (%d)", i ? ", " : "", name, rc)
                    : snprintf(line + n, sizeof line - n, "%s%s %#x", i ? ", " : "", name, address));
   }
+  gNoc.rc = cmdDbBcm(copy, kCmdDbBytes, kNocBcmName, &gNoc.address, gNoc.aux);
   IOFreeData(copy, kCmdDbBytes);
   note("cmd-db: %s", line);
+  if (!gNoc.rc)
+    note("cmd-db: %s (the PCIe NoC's bus clock manager) %#x: unit %u, width %u, clock domain %u", kNocBcmName, gNoc.address,
+         gNoc.aux.unit, gNoc.aux.width, gNoc.aux.domain);
+  else
+    note("cmd-db: %s (the PCIe NoC's bus clock manager): %s (%d)", kNocBcmName,
+         gNoc.rc == -4 ? "no aux data (unit, width): a vote would be the smallest one" : "not found", gNoc.rc);
 }
 
 // Also keeps the arbiter for levels 2 and up (hwPmic reads one regulator through the same observer channel).
@@ -595,9 +615,13 @@ int hwVoteLock(void *, int take)
   return 0;
 }
 
-// ---- one RPMh VRM transaction on apps DRV-2, under the DRV-2 lock (the protocol of PianoA830's Sm8750Rpmh.h, as PianoPower and
+// ---- one RPMh transaction on apps DRV-2, under the DRV-2 lock (the protocol of PianoA830's Sm8750Rpmh.h, as PianoPower and
 // PianoKeyboard run it): an idle ACTIVE TCS, its commands, the trigger, completion polled for at most 100 ms, the TCS reclaimed.
 // A TCS that did not complete is left alone and never used again.
+// Nothing under the lock sleeps or logs (P17, wifi-l5ib 2026-11-12: one of our rail transactions, which slept 1 ms per poll and
+// printed its line before letting the lock go, spanned PianoA830's whole 2 s wait for it, and the GPU's bring-up failed with
+// "the DRV-2 lock was not free"): completion is polled every 10 us against a 100 ms clock, the reclaim clears WAIT_FOR_CMPL with
+// the rest (PianoA830 takes a TCS only when it reads 0), and the line comes after the release, with how long the lock was held.
 struct RscLayout {
   uint32_t tcsStride, cmdStride, irqStatus, irqClear, waitForCmpl, control, status, cmdEnable, cmdMsgid, cmdAddr, cmdData;
 };
@@ -640,18 +664,30 @@ bool mapRsc()
   return true;
 }
 
-int vrmLocked(const char *resource, uint32_t base, const VrmCmd *cmds, unsigned count)
+struct TcsOutcome {
+  int tcs = -1;
+  bool done = false;
+  uint32_t waitedUs = 0, status[3] = {0, 0, 0};
+};
+constexpr unsigned kTcsPollUs = 10, kTcsDeadlineUs = 100000;
+
+uint64_t nowUs()
+{
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+  return ns / 1000;
+}
+
+// The caller holds the DRV-2 lock; nothing here sleeps or logs.
+int tcsLocked(uint32_t base, const VrmCmd *cmds, unsigned count, TcsOutcome &out)
 {
   const RscLayout &l = gRsc;
   static const unsigned kOrder[3] = {2, 1, 0};
-  int tcs = -1;
-  for (unsigned k = 0; k < 3 && tcs < 0; ++k)
-    if (!gTcsStuck[kOrder[k]] && rscRd(l.tcsStride * kOrder[k] + l.status)) tcs = int(kOrder[k]);
-  if (tcs < 0) {
-    note("rsc: %s: no idle ACTIVE TCS, nothing sent", resource);
-    return -16;
-  }
-  const uint32_t at = l.tcsStride * unsigned(tcs), bit = 1u << tcs, irqEnable = rscRd(0), mask = (1u << count) - 1;
+  out = TcsOutcome();
+  for (unsigned k = 0; k < 3 && out.tcs < 0; ++k)
+    if (!gTcsStuck[kOrder[k]] && rscRd(l.tcsStride * kOrder[k] + l.status)) out.tcs = int(kOrder[k]);
+  if (out.tcs < 0) return -16;
+  const uint32_t at = l.tcsStride * unsigned(out.tcs), bit = 1u << out.tcs, irqEnable = rscRd(0), mask = (1u << count) - 1;
   if (rscRd(l.irqStatus) & bit) rscWr(l.irqClear, bit);
   for (unsigned c = 0; c < count; ++c) {
     const uint32_t cmd = at + l.cmdStride * c;
@@ -667,31 +703,59 @@ int vrmLocked(const char *resource, uint32_t base, const VrmCmd *cmds, unsigned 
   rscWr(at + l.control, control & ~(kAmcTrigger | kAmcEnable));
   rscWr(at + l.control, kAmcEnable);
   rscWr(at + l.control, kAmcEnable | kAmcTrigger);
-  bool done = false;
-  unsigned waited = 0;
-  uint32_t status[3] = {0, 0, 0};
-  for (;; ++waited) {
+  const uint64_t start = nowUs();
+  for (;;) {
     uint32_t all = kCmdCompleted;
     for (unsigned c = 0; c < count; ++c) {
-      status[c] = rscRd(at + l.cmdStride * c + l.cmdData + 4);
-      all &= status[c];
+      out.status[c] = rscRd(at + l.cmdStride * c + l.cmdData + 4);
+      all &= out.status[c];
     }
-    done = (rscRd(l.irqStatus) & bit) || all == kCmdCompleted;
-    if (done || waited >= 100) break;
-    IOSleep(1);
+    out.done = (rscRd(l.irqStatus) & bit) || all == kCmdCompleted;
+    const uint64_t spent = nowUs() - start;
+    out.waitedUs = spent > 0xffffffffu ? 0xffffffffu : uint32_t(spent);
+    if (out.done || spent >= kTcsDeadlineUs) break;
+    IODelay(kTcsPollUs);
   }
-  if (done) {
+  if (out.done) {
     rscWr(at + l.cmdEnable, 0);
+    rscWr(at + l.waitForCmpl, 0);
     rscWr(l.irqClear, bit);
     rscWr(at + l.control, rscRd(at + l.control) & ~kAmcTrigger);
     rscWr(at + l.control, 0);
   } else {
-    gTcsStuck[tcs] = true;
+    gTcsStuck[out.tcs] = true;
   }
   rscWr(0, irqEnable);
-  note("rsc: %s (%#x): %u commands through TCS %d %s after %u ms (status %#x %#x %#x)", resource, base, count, tcs,
-       done ? "completed" : "NOT completed (left in flight, not used again)", waited, status[0], status[1], status[2]);
-  return done ? 0 : -60;
+  return out.done ? 0 : -60;
+}
+
+// One transaction of `count` commands of the resource at `base`, the DRV-2 lock around it and the line after it.
+int rpmhSend(const char *resource, uint32_t base, const VrmCmd *cmds, unsigned count)
+{
+  if (!gRscVa || !base || !cmds || !count || count > 3) return -22;
+  uint32_t waits = 0;
+  const uint32_t held = __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE);
+  if (held) note("rsc: the DRV-2 lock is held by %#x; waiting (at most 2 s)", held);
+  if (!lockAcquire(&sm8750_rpmh_drv2_owner, &waits, kLockSteps)) {
+    note("rsc: the DRV-2 lock stayed held by %#x for 2 s: %s not voted",
+         __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE), resource);
+    return -16;
+  }
+  const uint64_t taken = nowUs();
+  TcsOutcome out;
+  const int rc = tcsLocked(base, cmds, count, out);
+  const uint64_t heldUs = nowUs() - taken;
+  lockRelease(&sm8750_rpmh_drv2_owner);
+  if (out.tcs < 0) {
+    note("rsc: %s (%#x): no idle ACTIVE TCS, nothing sent (the DRV-2 lock held %llu us)", resource, base,
+         (unsigned long long)heldUs);
+    return rc;
+  }
+  note("rsc: %s (%#x): %u command(s) through TCS %d %s after %u us (status %#x %#x %#x); the DRV-2 lock held %llu us, taken "
+       "after %u waits",
+       resource, base, count, out.tcs, out.done ? "completed" : "NOT completed (left in flight, not used again)", out.waitedUs,
+       out.status[0], out.status[1], out.status[2], (unsigned long long)heldUs, waits);
+  return rc;
 }
 
 int hwVrm(void *, const char *resource, const VrmCmd *cmds, unsigned count, uint32_t *address)
@@ -709,17 +773,33 @@ int hwVrm(void *, const char *resource, const VrmCmd *cmds, unsigned count, uint
     note("rsc: %s: no RPMh resource of that name in cmd-db, nothing sent", resource);
     return -19;
   }
-  uint32_t waits = 0;
-  const uint32_t held = __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE);
-  if (held) note("rsc: the DRV-2 lock is held by %#x; waiting (at most 2 s)", held);
-  if (!lockAcquire(&sm8750_rpmh_drv2_owner, &waits, kLockSteps)) {
-    note("rsc: the DRV-2 lock stayed held by %#x for 2 s: %s not voted",
-         __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE), resource);
-    return -16;
+  return rpmhSend(resource, base, cmds, count);
+}
+
+// The PCIe NoC's bus clock manager (WifiHw.h): voted before level 3's clocks, as pcie-qcom votes its "pcie-mem" path, at the
+// peak of the link level 3 trains (Gen x 2 lanes; average 0, as pcie-qcom asks); withdrawn (commit, not valid) wherever the chip
+// is given up. A cmd-db entry without aux data gets the smallest vote that keeps the NoC on.
+void nocVote(bool on)
+{
+  if (!gArgs.noc || (!on && !gNoc.voted)) return;
+  if (!gNoc.address || (gNoc.rc && gNoc.rc != -4)) {
+    if (on) note("PCIe NoC: %s is not in cmd-db (%d): not voted; the chip's DMA may not reach memory", kNocBcmName, gNoc.rc);
+    return;
   }
-  const int rc = vrmLocked(resource, base, cmds, count);
-  lockRelease(&sm8750_rpmh_drv2_owner);
-  return rc;
+  const uint64_t kbps = on ? uint64_t(kPcieLanes) * pcieLaneKbps(gArgs.gen) : 0;
+  uint32_t peak = on ? bcmVote(kbps, gNoc.aux.unit, gNoc.aux.width, kNocBusWidth) : 0;
+  const bool smallest = on && !peak;
+  if (smallest) peak = 1;
+  const VrmCmd cmd = {0, bcmCommand(0, peak)};
+  const int rc = rpmhSend(kNocBcmName, gNoc.address, &cmd, 1);
+  note("PCIe NoC: %s %s: peak %llu kB/s (Gen%u x%u) -> vote %u%s (unit %u, width %u, bus width %u), command %08x: %s (%d)",
+       kNocBcmName, on ? "voted" : "withdrawn", (unsigned long long)kbps, gArgs.gen, kPcieLanes, peak,
+       smallest ? " (the smallest: no aux data)" : "", gNoc.aux.unit, gNoc.aux.width, kNocBusWidth, cmd.value,
+       rc ? "NOT taken" : "taken", rc);
+  if (!rc) {
+    gNoc.voted = on;
+    gNoc.vote = peak;
+  }
 }
 
 // ---- one regulator over the SPMI observer channel (reads only, the same channel level 1 uses)
@@ -753,6 +833,12 @@ PIANO_WCN_KERNEL_RAILS(gWcn, PianoWcnTagWifi, "PianoWifi", wcnVrm, hwPmic, nullp
 // Wi-Fi no longer runs on the rails: its owner bit back (with piano-wifi-release=1 the last owner withdraws the helper's enables).
 unsigned wcnPutOwners() { return piano_wcn_rails_put(&gWcn.rails, PIANO_WCN_WLAN | (gArgs.release ? unsigned(PIANO_WCN_RELEASE) : 0u)); }
 void wcnPut() { (void)wcnPutOwners(); }
+// A level from 3 up gave the chip up: the PCIe NoC's vote goes (PCIe0 is Wi-Fi's alone), the rails' owner bit with it.
+void chipPut()
+{
+  nocVote(false);
+  wcnPut();
+}
 
 Options options()
 {
@@ -822,6 +908,7 @@ void reportLink(const LinkState &l)
 // already left that bypasses is kept as it is. piano-wifi-smmu=2 does the root port's stream (0x1400) as well; 0 skips both.
 IOMemoryMap *gSmmuMap;
 uintptr_t gSmmuVa;
+unsigned gEndpointBank = ~0u, gSmmuPages = 0;   // stream 0x1401's bypass bank (level 3's tail), for the fault report
 
 uint32_t smmuRead(uint32_t off) { return rd32(gSmmuVa + off); }
 
@@ -854,6 +941,10 @@ bool smmuStream(uint16_t stream)
                                         [deadline] { return nowMs() >= deadline; });
   note("SMMU stream %#x: %s (slot %u: smr %08x s2cr %08x)", stream, failure ? failure : p.keep ? "left as it was" : "bypass set",
        p.slot, smmuRead(0x800 + 4 * p.slot), smmuRead(0xc00 + 4 * p.slot));
+  if (!failure && stream == kStreamEndpoint) {
+    gEndpointBank = p.bank;
+    gSmmuPages = p.pages;
+  }
   return failure == nullptr;
 }
 
@@ -1062,6 +1153,114 @@ uint32_t chipIoRead(void *, uint32_t address) { return chipRead(address); }
 void chipIoWrite(void *, uint32_t address, uint32_t value) { chipWrite(address, value); }
 const ChipIo gChipIo = {nullptr, chipIoRead, chipIoWrite};
 
+// ---- level 4's diagnostics (P16, 2026-11-12: the boot loader never took the image, BHI status ffffffff, error ef0e0003) ----
+// The MHI register block as the chip has it, eight words a line: the core registers, BHI (the serial number at +0x40 masked: it is
+// per unit) and BHIe. Reads only, of registers both MHI hosts read.
+void dumpRegs(const char *when, const char *what, uint32_t base, uint32_t bytes, uint32_t masked)
+{
+  for (uint32_t off = 0; off < bytes; off += 32) {
+    char line[120];
+    size_t n = 0;
+    for (uint32_t k = off; k < off + 32 && k < bytes && n + 10 < sizeof line; k += 4)
+      n += size_t(k == masked ? snprintf(line + n, sizeof line - n, " --------")
+                              : snprintf(line + n, sizeof line - n, " %08x", barRd(nullptr, base + k)));
+    note("level 4: %s: %s +%02x:%s", when, what, off, line);
+  }
+}
+void dumpMhi(const char *when, const MhiBoot &b)
+{
+  dumpRegs(when, "MHI", 0, kMhiCoreDumpBytes, ~0u);
+  dumpRegs(when, "BHI", b.bhi, kBhiDumpBytes, kBhiSerialNumber);
+  dumpRegs(when, "BHIe", b.bhie, kBhieDumpBytes, ~0u);
+}
+
+// What level 4's loop watches besides the state machine, one line whenever any of it changes (at most kSnapLines lines).
+struct MhiSnap {
+  uint32_t status = 0, ee = 0, bhi = 0, err = 0, bhie = 0;
+  bool operator!=(const MhiSnap &o) const { return status != o.status || ee != o.ee || bhi != o.bhi || err != o.err || bhie != o.bhie; }
+};
+constexpr unsigned kSnapLines = 48;
+MhiSnap mhiSnap(const MhiBoot &b)
+{
+  MhiSnap s;
+  s.status = barRd(nullptr, kMhiStatus);
+  s.ee = barRd(nullptr, b.bhi + kBhiExecEnv);
+  s.bhi = barRd(nullptr, b.bhi + kBhiStatus);
+  s.err = barRd(nullptr, b.bhi + kBhiErrCode);
+  s.bhie = barRd(nullptr, b.bhie + kBhieTxVecStatus);
+  return s;
+}
+void noteSnap(const char *when, uint64_t ms, const MhiSnap &s)
+{
+  note("level 4: %s +%llu ms: MHISTATUS %08x (state %#x%s%s), EE %08x, BHI status %08x, error code %08x, BHIe status %08x", when,
+       (unsigned long long)ms, s.status, (s.status >> kMhiStateShift) & 0xffu, (s.status & kMhiStatusReady) ? ", ready" : "",
+       (s.status & kMhiStatusSysErr) ? ", SYSERR" : "", s.ee, s.bhi, s.err, s.bhie);
+}
+
+// piano-wifi-socreset=1: the chip-side reset this chip's own host runs before MHI (WifiHw.h). chipRead/chipWrite write the window
+// register before every access, so the window the global reset clears needs nothing restored here.
+void chipSocReset(const MhiBoot &b)
+{
+  chipWrite(kChipPcieIntAllClear, 0xffffffffu);
+  const uint32_t warm = chipRead(kChipWlaonWarmSwEntry);
+  chipWrite(kChipWlaonWarmSwEntry, 0);
+  const uint32_t warmAfter = chipRead(kChipWlaonWarmSwEntry), cause = chipRead(kChipWlaonResetCause);
+  const uint32_t before = barRd(nullptr, kChipSocGlobalReset);
+  barWr(nullptr, kChipSocGlobalReset, before | kChipSocGlobalResetBit);
+  (void)barRd(nullptr, kChipSocGlobalReset);
+  IOSleep(kChipSocResetMs);
+  barWr(nullptr, kChipSocGlobalReset, before & ~kChipSocGlobalResetBit);
+  (void)barRd(nullptr, kChipSocGlobalReset);
+  IOSleep(kChipSocResetMs);
+  const uint32_t after = barRd(nullptr, kChipSocGlobalReset);
+  barWr(nullptr, kMhiCtrl, kMhiCtrlReset);
+  IOSleep(kChipSocResetMs);
+  note("level 4: chip-side reset (piano-wifi-socreset=1): interrupts cleared, warm entry %08x -> %08x, reset cause %08x, global "
+       "reset %08x -> %08x%s, MHICTRL reset; now MHISTATUS %08x, EE %08x, BHI status %08x",
+       warm, warmAfter, cause, before, after, after == 0xffffffffu ? " (the link went down)" : "", barRd(nullptr, kMhiStatus),
+       barRd(nullptr, b.bhi + kBhiExecEnv), barRd(nullptr, b.bhi + kBhiStatus));
+}
+
+// After a failed level 4: where the chip's DMA went. The PCI status and AER words of both ends (a request the root complex
+// refused leaves "received master/target abort" or an AER bit in the endpoint; a completion that never came, a completion
+// timeout), the controller's interrupt status, the SMMU's global fault (an unmatched stream: sGFSYNR1 holds the stream it came
+// with) and the endpoint bank's fault registers. Reads only.
+uint32_t aerAt(unsigned win)
+{
+  uint32_t at = kExtCapStart;
+  for (unsigned guard = 0; at >= kExtCapStart && at + 0x14 <= 0x1000 && guard < 32; ++guard) {
+    const uint32_t h = hwRead(nullptr, win, at);
+    if (!h || h == 0xffffffffu) return 0;
+    if ((h & 0xffffu) == kExtCapAer) return at;
+    at = (h >> 20) & 0xffcu;
+  }
+  return 0;
+}
+void dmaReport(const LinkState &link)
+{
+  const uint32_t epAer = aerAt(kWinCfg), rpAer = aerAt(kWinDbi), epStatus = hwRead(nullptr, kWinCfg, 0x04);
+  note("dma: endpoint command/status %08x%s, device control/status %08x; AER%s uncorrectable %08x correctable %08x", epStatus,
+       (epStatus & kStatusErrorBits) ? " (error bits set)" : "", link.endpointCap ? hwRead(nullptr, kWinCfg, link.endpointCap + 0x08) : 0,
+       epAer ? "" : " (no capability)", epAer ? hwRead(nullptr, kWinCfg, epAer + kAerUncorrectable) : 0,
+       epAer ? hwRead(nullptr, kWinCfg, epAer + kAerCorrectable) : 0);
+  note("dma: root port command/status %08x, secondary status %04x, device control/status %08x, BAR0 %08x BAR1 %08x; AER%s "
+       "uncorrectable %08x correctable %08x; PARF interrupt status %08x",
+       hwRead(nullptr, kWinDbi, kDbiCommand), hwRead(nullptr, kWinDbi, 0x1c) >> 16,
+       link.expCap ? hwRead(nullptr, kWinDbi, link.expCap + 0x08) : 0, hwRead(nullptr, kWinDbi, 0x10), hwRead(nullptr, kWinDbi, 0x14),
+       rpAer ? "" : " (no capability)", rpAer ? hwRead(nullptr, kWinDbi, rpAer + kAerUncorrectable) : 0,
+       rpAer ? hwRead(nullptr, kWinDbi, rpAer + kAerCorrectable) : 0, hwRead(nullptr, kWinParf, kParfIntAllStatus));
+  if (!gSmmuVa) return;
+  note("dma: SMMU sCR0 %08x, global fault sGFSR %08x sGFSYNR0 %08x sGFSYNR1 %08x (stream %#x) sGFSYNR2 %08x sGFAR %08x:%08x",
+       smmuRead(0x000), smmuRead(0x048), smmuRead(0x050), smmuRead(0x054), smmuRead(0x054) & 0xffffu, smmuRead(0x058),
+       smmuRead(0x044), smmuRead(0x040));
+  const bool window = gArgs.iova && !gIovaPlan.error && gIovaPlan.cb;
+  const unsigned bank = window ? gIovaPlan.bank : gEndpointBank;
+  if (bank == ~0u) return;
+  const uint32_t cb = window ? gIovaPlan.cb : (gSmmuPages + bank) * 4096u;
+  note("dma: SMMU bank %u (%s): sctlr %08x fsr %08x far %08x:%08x fsynr0 %08x", bank, window ? "the 32-bit window" : "bypass",
+       smmuRead(cb + iova::kCbSctlr), smmuRead(cb + iova::kCbFsr), smmuRead(cb + 0x064), smmuRead(cb + 0x060), smmuRead(cb + 0x068));
+}
+
 MhiContexts gContexts;
 uint32_t gMhiRegLen;
 
@@ -1162,17 +1361,32 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
     safeOff(gHw, power, opt);
     return -12;
   }
+  if (gArgs.socreset) chipSocReset(boot);
   dsb();
   mhiContextsProgram(contexts, gMhiIo, boot.reglen);
   note("level 4: contexts at %#llx (channels %u, event rings %u: control at %#llx, data at %#llx, command ring at %#llx)",
        (unsigned long long)contextBus, kMhiChannels, kMhiEventRings, (unsigned long long)contexts.eventBus[0],
        (unsigned long long)contexts.eventBus[1], (unsigned long long)contexts.commandBus);
+  // The image reaches the chip through the write-combined mapping only: everything written so far is pushed out before the doorbell
+  // (the dsb above; barWr ends every register write with another).
+  note("level 4: the image: %u bytes at bus %#llx (%s), aligned to %llu KiB; the vector table at %#llx", plan.layout.sblBytes,
+       (unsigned long long)plan.sblBus, gArgs.iova ? "the 32-bit window, translated by the SMMU" : "physical, the stream bypasses",
+       (unsigned long long)(arenaAlign(kMhiSblBytes) >> 10), (unsigned long long)plan.tableBus);
+  dumpMhi("before the doorbell", boot);
   uint32_t phase = mhiBegin(boot, 0, plan.sblBus, plan.layout.sblBytes, plan.tableBus,
                             plan.tableEntries * uint32_t(sizeof(BhieEntry)), uint32_t(nowMs()) | 1u);
-  note("level 4: boot begun in phase %s (EE %s)", mhiPhaseName(phase), mhiEeName(boot.ee));
+  if (phase == kMhiSblLoading)
+    note("level 4: boot begun in phase %s (EE %s); BHI status %08x before, %08x after this host cleared it (%s)",
+         mhiPhaseName(phase), mhiEeName(boot.ee), boot.statusBefore, boot.statusCleared,
+         boot.clearTook ? "the clear took" : "the clear did not take: that value is the register's own, not an error");
+  else
+    note("level 4: boot begun in phase %s (EE %s)", mhiPhaseName(phase), mhiEeName(boot.ee));
   const uint64_t started = nowMs();
   uint64_t since = started;
   uint32_t last = phase, steps = 0;
+  MhiSnap seen = mhiSnap(boot);
+  unsigned snapLines = 1;
+  noteSnap("after the doorbell", 0, seen);
   while (phase != kMhiDone && phase != kMhiFailed) {
     if (phase == kMhiNeedContexts) {
       dsb();
@@ -1184,6 +1398,13 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
     }
     ++steps;
     const uint64_t now = nowMs();
+    const MhiSnap snap = mhiSnap(boot);
+    if (snap != seen) {
+      if (snapLines < kSnapLines) noteSnap("changed", now - started, snap);
+      else if (snapLines == kSnapLines) note("level 4: further register changes are not logged (%u lines)", kSnapLines);
+      ++snapLines;
+      seen = snap;
+    }
     if (phase != last) {
       note("level 4: %s after %llu ms (EE %s, state %#x)", mhiPhaseName(phase), (unsigned long long)(now - started),
            mhiEeName(boot.ee), boot.state);
@@ -1202,6 +1423,13 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
        phase == kMhiDone ? "mission mode" : "stopped", (unsigned long long)(nowMs() - started), steps, contexts.writes,
        contexts.acks, mhiEeName(mhiEeRead(boot)), boot.state, boot.lastStatus, boot.errcode, mhiFailName(boot.error));
   if (phase != kMhiDone) {
+    note("level 4: failed in phase %s: BHI error code %08x, debug %08x %08x %08x; BHI status %08x before the clear, %08x after "
+         "(%s); %u register change line(s)",
+         mhiPhaseName(boot.failedPhase), boot.errcode, boot.errdbg[0], boot.errdbg[1], boot.errdbg[2], boot.statusBefore,
+         boot.statusCleared, boot.clearTook ? "it took" : "not taken or not reached", snapLines);
+    noteSnap("at the end", nowMs() - started, mhiSnap(boot));
+    dumpMhi("at the end", boot);
+    dmaReport(link);
     safeOff(gHw, power, opt);
     return -1;
   }
@@ -1647,6 +1875,7 @@ void stopRadio(const char *why)
   if (!gLinkRunning && gLink.ce) linkTeardown();
   if (gPowerState && gWin[kWinTlmm].va) {
     safeOff(gHw, *gPowerState, gPowerOptions);
+    nocVote(false);   // PERST# is asserted: nothing crosses the PCIe NoC any more
     // The chip is given up for good, so the rails are given back: Bluetooth keeps them up if it is running, and with
     // piano-wifi-release=1 the last owner withdraws the enables this driver added.
     const unsigned left = wcnPutOwners();
@@ -1696,6 +1925,10 @@ bool PianoWifi::start(IOService *provider)
          gArgs.level >= 6 ? ", 6 the copy engine, the transport and a scan" : "", gArgs.gen, gArgs.physeq, gArgs.rcg,
          gArgs.blind, gArgs.release, gArgs.stop, gArgs.dmaMib, gArgs.fwTimeoutMs, gArgs.qmiTimeoutMs, gArgs.iova, gArgs.mode,
          gArgs.shadow, gArgs.wmiTimeoutMs, gArgs.scanWaitMs, gArgs.band, gArgs.bssid);
+  if (gArgs.level >= 3)
+    note("options: noc %u (the PCIe NoC's bus clock manager voted before level 3's clocks), socreset %u (the chip-side reset "
+         "before BHI)",
+         gArgs.noc, gArgs.socreset);
   if (gArgs.level > 6) note("piano-wifi=%u: levels above 6 are not implemented; running up to level 6", gArgs.level);
   note("level 1: loads only, nothing written%s", gArgs.spmi || gArgs.level >= 2 ? "; SPMI observer read commands for the PMIC part"
                                                                                : "");
@@ -1863,6 +2096,8 @@ void PianoWifi::run()
   }
 
   // ---- level 3 ---------------------------------------------------------------------------------------------------------
+  // The DMA path's bandwidth before the controller's clocks, as pcie-qcom does (WifiHw.h: the PCIe NoC's bus clock manager).
+  nocVote(true);
   LinkState link;
   rc = linkUp(link, power, gHw, opt);
   reportLink(link);
@@ -1876,7 +2111,7 @@ void PianoWifi::run()
   if (rc) {
     stage(link.step, "level 3 stopped here");
     note("level 3: FAILED at step %d (%s): WLAN_EN is low and PERST# asserted", link.step, errorName(link.error));
-    wcnPut();
+    chipPut();
     unmapWindows();
     unmapAll();
     return;
@@ -1888,7 +2123,7 @@ void PianoWifi::run()
     if (!smmuStream(kStreamEndpoint)) {
       stage(-(kStepBar + 1), "level 3: the endpoint's SMMU stream was not set up; no DMA is started");
       safeOff(gHw, power, opt);
-      wcnPut();
+      chipPut();
       unmapWindows();
       unmapAll();
       return;
@@ -1907,7 +2142,7 @@ void PianoWifi::run()
   if (!dmaWindow()) {
     stage(-400, "level 4: no DMA window; nothing was given to the endpoint");
     safeOff(gHw, power, opt);
-    wcnPut();
+    chipPut();
     unmapWindows();
     unmapAll();
     return;
@@ -1915,7 +2150,7 @@ void PianoWifi::run()
   if (gArgs.iova && !iovaWindow()) {
     stage(-400, "level 4: the window's 32-bit addresses were not set up; nothing was given to the endpoint");
     safeOff(gHw, power, opt);
-    wcnPut();
+    chipPut();
     unmapWindows();
     unmapAll();
     return;
@@ -1925,7 +2160,7 @@ void PianoWifi::run()
   stage(rc ? -401 : 401, rc ? "level 4 stopped before mission mode" : "level 4: the firmware runs (mission mode)");
   note("level 4: %s%s", rc ? "the chip did not reach mission mode" : "the chip is in mission mode",
        rc ? "" : gArgs.level < 5 ? "; the ladder ends here (QMI is level 5, WMI and the station levels 6 and up)" : "");
-  if (rc) wcnPut();   // level 4's failures end in safeOff: WLAN_EN low
+  if (rc) chipPut();   // level 4's failures end in safeOff: WLAN_EN low
   if (rc || gArgs.level < 5) {
     unmapAll();
     return;
@@ -1934,7 +2169,7 @@ void PianoWifi::run()
   // ---- level 5 ---------------------------------------------------------------------------------------------------------
   rc = level5(power, opt);
   piano_wifi_firmware_close();
-  if (rc) wcnPut();   // level 5's failures end in safeOff too
+  if (rc) chipPut();   // level 5's failures end in safeOff too
   writeSummary("level 5");
   stage(rc ? -504 : 504, rc ? "level 5 stopped before the firmware was ready" : "level 5: the firmware is ready");
   note("level 5: %s; %s", rc ? "the firmware did not become ready" : "the firmware is ready",
@@ -1953,7 +2188,7 @@ void PianoWifi::run()
 
   // ---- level 6 ---------------------------------------------------------------------------------------------------------
   rc = level6(this, power, opt);
-  if (rc) wcnPut();   // level 6's failures end in safeOff as well
+  if (rc) chipPut();   // level 6's failures end in safeOff as well
   writeSummary("level 6");
   stage(rc ? -613 : 613, rc ? "level 6 stopped before the scan was done" : "level 6: the scan is done");
   note("level 6: %s; %s", rc ? "the scan did not finish" : "the scan is done",

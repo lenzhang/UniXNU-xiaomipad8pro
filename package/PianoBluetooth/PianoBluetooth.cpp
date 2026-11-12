@@ -593,7 +593,8 @@ void rscWr(void *, uint32_t off, uint32_t v)
   dsb();
 }
 void rscSleep(void *, unsigned ms) { IOSleep(ms); }
-const RscIo gRscIo = {nullptr, rscRd, rscWr, rscSleep};
+void rscDelay(void *, unsigned us) { IODelay(us); }   // the TCS poll runs under the DRV-2 lock: a busy wait, never a sleep (P17)
+const RscIo gRscIo = {nullptr, rscRd, rscWr, rscSleep, rscDelay};
 
 bool mapRsc()
 {
@@ -633,8 +634,8 @@ int wcnVrm(void *, const char *resource, const PianoWcnVrmCmd *cmds, unsigned co
   VrmResult res;
   const int rc = vrmSend(gRsc, gRscIo, base, cmds, count, res);
   lockRelease(&sm8750_rpmh_drv2_owner);
-  note("rsc: %s (%#x): %u commands through TCS %d %s after %u ms (status %#x %#x %#x)", resource, base, count, res.tcs,
-       res.done ? "completed" : rc == -16 ? "NOT sent (no idle TCS)" : "NOT completed (left in flight, not used again)", res.waited,
+  note("rsc: %s (%#x): %u commands through TCS %d %s after %u us (status %#x %#x %#x)", resource, base, count, res.tcs,
+       res.done ? "completed" : rc == -16 ? "NOT sent (no idle TCS)" : "NOT completed (left in flight, not used again)", res.waitedUs,
        res.status[0], res.status[1], res.status[2]);
   return rc;
 }

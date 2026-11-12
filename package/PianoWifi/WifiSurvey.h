@@ -368,10 +368,14 @@ inline const char *s2crType(uint32_t s2cr)
 // u32 reserved, then the data area the offsets count from (byte 144). Entries are 24 bytes: an 8-byte id, two u32 priorities, u32
 // address, u16 aux length, u16 aux offset. Returns 0 with the address, -1 not a cmd-db, -2 no such resource, -3 corrupt.
 constexpr uint32_t kCmdDbMagic = 0x0c0330db;
-inline int cmdDbFind(const uint8_t *db, uint64_t bytes, const char *name, uint32_t *address)
+// An entry's aux data sits at the data area + the slave's data offset (its record's +4) + the entry's aux offset; `aux`/`auxBytes`
+// get where and how long (0 when it has none or it would lie outside the copy).
+inline int cmdDbEntry(const uint8_t *db, uint64_t bytes, const char *name, uint32_t *address, uint64_t *aux, uint32_t *auxBytes)
 {
   auto u16 = [db](uint64_t at) { return uint32_t(db[at] | db[at + 1] << 8); };
   auto u32 = [&u16](uint64_t at) { return u16(at) | u16(at + 2) << 16; };
+  if (aux) *aux = 0;
+  if (auxBytes) *auxBytes = 0;
   if (bytes < 144 || u32(4) != kCmdDbMagic) return -1;
   char id[8] = {0};
   for (unsigned i = 0; i < 8 && name[i]; ++i) id[i] = name[i];
@@ -386,10 +390,37 @@ inline int cmdDbFind(const uint8_t *db, uint64_t bytes, const char *name, uint32
       for (unsigned i = 0; i < 8 && same; ++i) same = db[entry + i] == uint8_t(id[i]);
       if (!same) continue;
       *address = u32(entry + 16);
+      const uint32_t length = u16(entry + 20);
+      const uint64_t at = 144 + uint64_t(u16(slave + 4)) + u16(entry + 22);
+      if (length && at < bytes && length <= bytes - at) {
+        if (aux) *aux = at;
+        if (auxBytes) *auxBytes = length;
+      }
       return *address ? 0 : -3;
     }
   }
   return -2;
+}
+inline int cmdDbFind(const uint8_t *db, uint64_t bytes, const char *name, uint32_t *address)
+{
+  return cmdDbEntry(db, bytes, name, address, nullptr, nullptr);
+}
+
+// A bus clock manager's aux data (cmd-db): u32 unit, u16 width, u8 clock domain. 0 with the three, -4 when the entry has fewer than
+// the 7 bytes that carry them.
+struct BcmAux { uint32_t unit = 0; uint16_t width = 0; uint8_t domain = 0; };
+inline int cmdDbBcm(const uint8_t *db, uint64_t bytes, const char *name, uint32_t *address, BcmAux &out)
+{
+  uint64_t aux = 0;
+  uint32_t length = 0;
+  out = BcmAux{};
+  const int rc = cmdDbEntry(db, bytes, name, address, &aux, &length);
+  if (rc) return rc;
+  if (length < 7) return -4;
+  out.unit = uint32_t(db[aux]) | uint32_t(db[aux + 1]) << 8 | uint32_t(db[aux + 2]) << 16 | uint32_t(db[aux + 3]) << 24;
+  out.width = uint16_t(db[aux + 4] | db[aux + 5] << 8);
+  out.domain = db[aux + 6];
+  return 0;
 }
 
 }  // namespace pianowifi

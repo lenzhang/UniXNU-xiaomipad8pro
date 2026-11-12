@@ -627,6 +627,11 @@ struct Device {
   bool ready = false, sysErr = false, bhiError = false, bhieError = false, rddm = false, stuck = false;
   unsigned bhiDoorbells = 0, bhieDoorbells = 0, m0 = 0, contextWrites = 0;
   uint32_t bhi = 0x200, bhie = 0x300, reglen = 0x1000;
+  // BHI's status register: its power-on value (piano: all ones), whether a host write reaches it, the value the boot loader writes
+  // on an error (piano's model: all ones), and whether the device answers at all (a link that went away reads all ones).
+  uint32_t bhiStatus = 0, bhiErrorValue = kMhiXferError << 30;
+  bool statusWritable = true, gone = false;
+  std::vector<uint32_t> bhiWrites;   // the BHI block's offsets in the order they were written
 
   Device()
   {
@@ -634,6 +639,14 @@ struct Device {
     regs[kMhiBhiOff] = bhi;
     regs[kMhiBhieOff] = bhie;
     regs[kMhiErdbOff] = 0x400;
+  }
+  // piano, 2026-11-12: BHI status ffffffff and error code ef0e0003 before anything was written
+  void piano()
+  {
+    bhiStatus = 0xffffffffu;
+    bhiErrorValue = 0xffffffffu;
+    regs[bhi + kBhiErrCode] = 0xef0e0003u;
+    state = kStateReset;
   }
   uint32_t status() const
   {
@@ -644,12 +657,10 @@ struct Device {
   }
   uint32_t read(uint32_t reg)
   {
+    if (gone) return 0xffffffffu;
     if (reg == kMhiStatus) return status();
     if (reg == bhi + kBhiExecEnv) return ee;
-    if (reg == bhi + kBhiStatus) {
-      if (!bhiDoorbells || stuck) return 0;
-      return (bhiError ? kMhiXferError : kMhiXferSuccess) << 30;
-    }
+    if (reg == bhi + kBhiStatus) return bhiStatus;
     if (reg == bhie + kBhieTxVecStatus) {
       if (!bhieDoorbells) return 0;
       return ((bhieError ? kMhiXferError : kMhiXferSuccess) << 30) | (regs[bhie + kBhieTxVecDb] & kMhiSeqMask);
@@ -659,9 +670,13 @@ struct Device {
   }
   void write(uint32_t reg, uint32_t value)
   {
+    if (gone) return;
     regs[reg] = value;
+    if (reg >= bhi && reg < bhi + kBhiDumpBytes) bhiWrites.push_back(reg - bhi);
+    if (reg == bhi + kBhiStatus && statusWritable) bhiStatus = value;
     if (reg == bhi + kBhiImgTxDb) {
       ++bhiDoorbells;
+      if (!stuck) bhiStatus = bhiError ? bhiErrorValue : kMhiXferSuccess << 30;
       if (!bhiError && !stuck) ready = true;
     }
     if (reg == bhie + kBhieTxVecDb) {
@@ -764,6 +779,83 @@ static void testMhiBoot()
     CHECK(mhiContextsPlan(k, memory.data(), 0xc2000000, kMhiContextBytes));
     CHECK(runBoot(b, bhi, k) == kMhiFailed && b.error == kMhiErrBhi && b.errcode == 0x1234);
     CHECK(b.failedPhase == kMhiSblLoading);
+  }
+  {   // the order of BHI's writes: the vector, the status cleared, the address high then low, the size, the doorbell last
+    Device order;
+    MhiBoot b;
+    CHECK(mhiOpen(b, order.io(), 0x1000));
+    MhiContexts k;
+    CHECK(mhiContextsPlan(k, memory.data(), 0xc2000000, kMhiContextBytes));
+    CHECK(runBoot(b, order, k) == kMhiDone);
+    const std::vector<uint32_t> want = {kBhiIntVec, kBhiIntVec, kBhiStatus, kBhiImgAddrHi, kBhiImgAddrLo, kBhiImgSize, kBhiImgTxDb};
+    CHECK(order.bhiWrites == want);
+    CHECK(order.regs[order.bhi + kBhiImgSize] == kMhiSblBytes && order.regs[order.bhi + kBhiImgAddrLo] == 0xc0000000u);
+    CHECK(order.regs[order.bhi + kBhiImgTxDb] == 7 && b.clearTook && b.statusBefore == 0);
+  }
+  {   // piano's power-on BHI status (all ones, error code ef0e0003), cleared by the host, and a boot loader that never answers
+      // (2026-11-12: the image's DMA never completed): the phase stands until the owner's deadline, with the errors read then
+    Device p;
+    p.piano();
+    p.stuck = true;
+    p.regs[p.bhi + kBhiErrDbg1] = 0x11;
+    p.regs[p.bhi + kBhiErrDbg3] = 0x33;
+    MhiBoot b;
+    CHECK(mhiOpen(b, p.io(), 0x200000));
+    MhiContexts k;
+    CHECK(mhiContextsPlan(k, memory.data(), 0xc2000000, kMhiContextBytes));
+    CHECK(runBoot(b, p, k, 50) == kMhiSblLoading);
+    CHECK(b.statusBefore == 0xffffffffu && b.statusCleared == 0 && b.clearTook && b.lastStatus == 0);
+    CHECK(mhiTimedOut(b) == kMhiFailed && b.error == kMhiErrTimeout && b.errcode == 0xef0e0003u);
+    CHECK(b.errdbg[0] == 0x11 && b.errdbg[1] == 0 && b.errdbg[2] == 0x33);
+  }
+  {   // the same, but the status register keeps its power-on value whatever the host writes: that value is not an error
+    Device p;
+    p.piano();
+    p.stuck = true;
+    p.statusWritable = false;
+    MhiBoot b;
+    CHECK(mhiOpen(b, p.io(), 0x200000));
+    MhiContexts k;
+    CHECK(mhiContextsPlan(k, memory.data(), 0xc2000000, kMhiContextBytes));
+    CHECK(runBoot(b, p, k, 50) == kMhiSblLoading && !b.clearTook && b.lastStatus == 0xffffffffu && b.error == kMhiErrNone);
+    p.bhiStatus = 0xc0000123u;   // ... until the boot loader writes an error of its own
+    CHECK(mhiStep(b) == kMhiFailed && b.error == kMhiErrBhi && b.errcode == 0xef0e0003u && b.lastStatus == 0xc0000123u);
+  }
+  {   // piano's model of a refusal: the cleared status turns all ones after the doorbell, MHI_STATUS still answering: an error at
+      // once (the old reading took all ones for "not answering" and waited 20 s)
+    Device p;
+    p.piano();
+    p.bhiError = true;
+    p.regs[p.bhi + kBhiErrCode] = 0x0000beefu;
+    p.regs[p.bhi + kBhiErrDbg2] = 0x22;
+    MhiBoot b;
+    CHECK(mhiOpen(b, p.io(), 0x200000));
+    MhiContexts k;
+    CHECK(mhiContextsPlan(k, memory.data(), 0xc2000000, kMhiContextBytes));
+    CHECK(runBoot(b, p, k, 3) == kMhiFailed && b.error == kMhiErrBhi && b.failedPhase == kMhiSblLoading);
+    CHECK(b.lastStatus == 0xffffffffu && b.errcode == 0xbeefu && b.errdbg[1] == 0x22);
+  }
+  {   // the device gone (every read all ones, the link down): not a BHI error, the phase stands
+    Device p;
+    p.piano();
+    p.stuck = true;
+    MhiBoot b;
+    CHECK(mhiOpen(b, p.io(), 0x200000));
+    MhiContexts k;
+    CHECK(mhiContextsPlan(k, memory.data(), 0xc2000000, kMhiContextBytes));
+    CHECK(runBoot(b, p, k, 3) == kMhiSblLoading);
+    p.gone = true;
+    for (unsigned i = 0; i < 5; ++i) CHECK(mhiStep(b) == kMhiSblLoading);
+    CHECK(b.error == kMhiErrNone);
+  }
+  {   // piano's power-on status and a boot loader that takes the image: the boot completes
+    Device p;
+    p.piano();
+    MhiBoot b;
+    CHECK(mhiOpen(b, p.io(), 0x200000));
+    MhiContexts k;
+    CHECK(mhiContextsPlan(k, memory.data(), 0xc2000000, kMhiContextBytes));
+    CHECK(runBoot(b, p, k) == kMhiDone && b.error == kMhiErrNone && b.statusBefore == 0xffffffffu && b.clearTook);
   }
   {   // BHIe reports an error
     Device bhie;

@@ -139,6 +139,24 @@ the step machine on top of them (WifiCe.h, WifiHtc.h, WifiWmi.h, WifiLink.h) are
     that a passive scan asks for no network by name.
 Not read and not used: any Qualcomm binary.
 
+Specifications only for level 4's fixes of 2026-11-12 (docs/drivers/wifi.md section 10.21; behaviour and register facts, no code,
+comment or table copied), the same Ubuntu kernel and commit:
+  drivers/bus/mhi/host/boot.c and pm.c: that the host writes 0 to BHI's status before the image's address (high, then low), size
+    and doorbell; that bits 31:30 at 3 are an error, with the error code and the three error debug words read then; that the
+    receive vector registers' power-on values are undefined; that the boot loader gets exactly the first 512 KiB; that the vector
+    for BHI is 0 and is written again after a reset. WifiMhi.h's startSbl/readErrors and the stale-value rule are this
+    repository's own.
+  drivers/interconnect/qcom/sm8750.c and drivers/pci/controller/dwc/pcie-qcom.c: that PCIe0's DMA path is MASTER_PCIE_0 ->
+    qns_pcie_mem_noc (8 bytes wide), whose bus clock manager is SN4 and not keep-alive; that pcie-qcom votes that path before the
+    controller's clocks and at width x the lane rate once the link is up; drivers/interconnect/qcom/bcm-voter.c and icc-rpmh.c:
+    the BCM command's bits and how a bandwidth becomes a vote (the aux data's unit and width, the scale of 1000, a small vote
+    never rounded to 0). WifiHw.h's bcmVote/bcmCommand and WifiSurvey.h's cmdDbEntry/cmdDbBcm are this repository's own.
+  drivers/net/wireless/ath/ath12k/pci.c and pci.h: the chip-side reset of every power-up (the PCIe interrupt clear, the warm-boot
+    entry word, the reset cause, the SoC global reset at BAR0 + 0x3008 and its 10 ms, MHICTRL's reset), for
+    piano-wifi-socreset=1 (PianoWifi.cpp chipSocReset).
+  UniXNU-sheng package/WifiProbe.cpp (BSD-2-Clause-Patent, read, nothing copied): that its hardware-verified ladder votes the PCIe
+    NoC's bus clock manager (SN7 on SM8550) when the link comes up, before the chip's first DMA.
+
 Specifications only (no code, comment or table copied): mainline Linux drivers/clk/qcom/gcc-sm8750.c and tcsrcc-sm8750.c,
 include/dt-bindings/clock/qcom,sm8750-gcc.h, drivers/pci/controller/dwc/pcie-qcom.c and pcie-designware.h,
 drivers/phy/qualcomm/phy-qcom-qmp-pcie.c and phy-qcom-qmp-pcs-v7.h, drivers/pinctrl/qcom/pinctrl-sm8750.c (register offsets, bit

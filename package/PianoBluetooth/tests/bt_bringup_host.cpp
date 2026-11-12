@@ -684,8 +684,8 @@ struct RscModel {
   std::map<uint32_t, uint32_t> regs;
   RscLayout l = pianokeyboard::rscLayout(0x00030000);
   bool complete = true;
-  unsigned triggers = 0;
-  uint32_t lastAddr = 0, lastData = 0;
+  unsigned triggers = 0, sleeps = 0, delays = 0, delayedUs = 0;
+  uint32_t lastAddr = 0, lastData = 0, lastWait = 0;
 };
 static void testRsc()
 {
@@ -707,12 +707,13 @@ static void testRsc()
         ++x->triggers;
         x->lastAddr = x->regs[at + x->l.cmdAddr];
         x->lastData = x->regs[at + x->l.cmdData];
+        x->lastWait = x->regs[at + x->l.waitForCmpl];
         if (x->complete) x->regs[x->l.irqStatus] |= 1u << t;
       }
       if (off == x->l.irqClear) x->regs[x->l.irqStatus] &= ~v;
     }
   };
-  io.sleepMs = [](void *, unsigned) {};
+  io.sleepMs = [](void *c, unsigned) { ++static_cast<RscModel *>(c)->sleeps; };
   Rsc rsc;
   rsc.layout = m.l;
   const PianoWcnVrmCmd cmds[3] = {{PianoWcnVrmMode, 7}, {PianoWcnVrmVoltage, 1800}, {PianoWcnVrmEnable, 1}};
@@ -720,10 +721,35 @@ static void testRsc()
   CHECK(vrmSend(rsc, io, 0x30100, cmds, 3, res) == 0 && res.tcs == 2 && res.done && m.triggers == 1);
   const uint32_t at = m.l.tcsStride * 2;
   CHECK(m.regs[at + m.l.cmdAddr] == 0x30108 && m.regs[at + m.l.cmdStride * 2 + m.l.cmdAddr] == 0x30104);
-  CHECK(m.regs[at + m.l.cmdStride + m.l.cmdData] == 1800 && m.regs[at + m.l.waitForCmpl] == 7 && m.regs[at + m.l.control] == 0);
-  CHECK(m.regs[at + m.l.cmdEnable] == 0 && !(m.regs[m.l.irqStatus] & 4u));
+  CHECK(m.regs[at + m.l.cmdStride + m.l.cmdData] == 1800 && m.lastWait == 7 && m.regs[at + m.l.control] == 0);
+  // the reclaim leaves CMD_ENABLE, WAIT_FOR_CMPL and CONTROL at 0: what PianoA830's idle test reads (P17)
+  CHECK(m.regs[at + m.l.cmdEnable] == 0 && m.regs[at + m.l.waitForCmpl] == 0 && !(m.regs[m.l.irqStatus] & 4u));
   m.complete = false;
   CHECK(vrmSend(rsc, io, 0x30100, cmds, 1, res) == -60 && res.tcs == 2 && rsc.stuck[2] && res.waited == kTcsPollMs);
+  CHECK(m.sleeps == kTcsPollMs && res.waitedUs == kTcsPollMs * 1000);   // no delayUs: the 1 ms fallback
+  {   // with delayUs (what every owner gives): a busy poll of 10 us steps, never a sleep under the DRV-2 lock
+    RscModel b;
+    for (unsigned t = 0; t < 3; ++t) b.regs[b.l.tcsStride * t + b.l.status] = 1;
+    RscIo bio = io;
+    bio.ctx = &b;
+    bio.sleepMs = [](void *c, unsigned) { ++static_cast<RscModel *>(c)->sleeps; };
+    bio.delayUs = [](void *c, unsigned us) {
+      RscModel *x = static_cast<RscModel *>(c);
+      ++x->delays;
+      x->delayedUs += us;
+    };
+    Rsc r2;
+    r2.layout = b.l;
+    b.complete = false;
+    CHECK(vrmSend(r2, bio, 0x30100, cmds, 1, res) == -60 && r2.stuck[2] && b.sleeps == 0);
+    CHECK(b.delays == kTcsPollMs * 1000 / kTcsPollUs && b.delayedUs == kTcsPollMs * 1000 && res.waited == kTcsPollMs);
+    b.complete = true;
+    CHECK(vrmSend(r2, bio, 0x30100, cmds, 1, res) == 0 && res.tcs == 1 && b.sleeps == 0 && res.waitedUs == 0);
+    RscIo none = bio;
+    none.sleepMs = nullptr;
+    none.delayUs = nullptr;
+    CHECK(vrmSend(r2, none, 0x30100, cmds, 1, res) == -22);
+  }
   m.complete = true;
   CHECK(vrmSend(rsc, io, 0x30100, cmds, 1, res) == 0 && res.tcs == 1);   // the stuck one is skipped
   m.regs[m.l.tcsStride * 1 + m.l.status] = 0;

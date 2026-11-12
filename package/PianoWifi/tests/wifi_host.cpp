@@ -219,6 +219,47 @@ static void testCmdDb()
   CHECK(cmdDbFind(db.data(), db.size(), "ldof3", &address) == 0 && address == 0x30000);
   CHECK(cmdDbFind(db.data(), db.size(), "smpi7", &address) == 0 && address == 0x30100);
   CHECK(cmdDbFind(db.data(), db.size(), "smpg3", &address) == -2);
+
+  // A second slave (BCM, id 5) with SN4 and its aux data: the data area of that slave at +0x200, the entry's aux at +0x10.
+  put16(24, 5);        // slave 1
+  put16(26, 0x100);    // its entries at 144 + 0x100
+  put16(28, 0x200);    // its data at 144 + 0x200
+  put16(30, 2);
+  std::memcpy(&db[144 + 0x100], "SN4", 3);
+  put32(144 + 0x100 + 16, 0x50020);
+  put16(144 + 0x100 + 20, 8);       // 8 bytes of aux
+  put16(144 + 0x100 + 22, 0x10);
+  const size_t aux = 144 + 0x200 + 0x10;
+  put32(aux, 1000);                 // unit
+  put16(aux + 4, 16);               // width
+  db[aux + 6] = 4;                  // clock domain
+  std::memcpy(&db[144 + 0x100 + 24], "SN7", 3);
+  put32(144 + 0x100 + 24 + 16, 0x50030);
+  put16(144 + 0x100 + 24 + 20, 4);  // too short to carry unit, width and domain
+  put16(144 + 0x100 + 24 + 22, 0x20);
+  BcmAux bcm;
+  CHECK(cmdDbBcm(db.data(), db.size(), "SN4", &address, bcm) == 0 && address == 0x50020 && bcm.unit == 1000 && bcm.width == 16 &&
+        bcm.domain == 4);
+  CHECK(cmdDbFind(db.data(), db.size(), "SN4", &address) == 0 && address == 0x50020);
+  CHECK(cmdDbBcm(db.data(), db.size(), "SN7", &address, bcm) == -4 && address == 0x50030 && bcm.unit == 0);
+  CHECK(cmdDbBcm(db.data(), db.size(), "SN9", &address, bcm) == -2);
+  put16(144 + 0x100 + 20, 0x4000);  // aux past the copy: no aux
+  uint64_t at = 1;
+  uint32_t length = 1;
+  CHECK(cmdDbEntry(db.data(), db.size(), "SN4", &address, &at, &length) == 0 && at == 0 && length == 0);
+  CHECK(cmdDbBcm(db.data(), db.size(), "SN4", &address, bcm) == -4);
+
+  // The vote: Gen2 x2 (1 000 000 kB/s) over a bus 8 bytes wide, aux width 16, unit 1000: 2 000 000 x 1000 / 1000, clamped.
+  CHECK(pcieLaneKbps(1) == 250000 && pcieLaneKbps(2) == 500000 && pcieLaneKbps(3) == 984500);
+  CHECK(bcmVote(2 * pcieLaneKbps(2), 1000, 16, kNocBusWidth) == kBcmVoteMask);
+  CHECK(bcmVote(2 * pcieLaneKbps(2), 2000000, 4, kNocBusWidth) == 250);   // 500 000 x 1000 / 2 000 000
+  CHECK(bcmVote(1, 0xffffffffu, 1, kNocBusWidth) == 1);                     // a small vote is never lost
+  CHECK(bcmVote(0, 1000, 16, kNocBusWidth) == 0 && bcmVote(1000, 0, 16, kNocBusWidth) == 0);
+  CHECK(bcmCommand(0, 250) == (kBcmCommit | kBcmValid | 250u));
+  CHECK(bcmCommand(0, 0) == kBcmCommit);                                     // the vote withdrawn: commit, not valid
+  CHECK(bcmCommand(0x5000, 0x5000) == (kBcmCommit | kBcmValid | kBcmVoteMask << kBcmVoteXShift | kBcmVoteMask));
+  CHECK(!(bcmCommand(kBcmVoteMask, kBcmVoteMask) & 0x90000000u));            // bits 31 and 28 clear (PianoA830's BCM rule)
+
   put32(4, 0);
   CHECK(cmdDbFind(db.data(), db.size(), "ldof3", &address) == -1);
 }

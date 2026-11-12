@@ -1337,6 +1337,7 @@ void coldRscWr(void *, uint32_t off, uint32_t v)
   dsb();
 }
 void coldRscSleep(void *, unsigned ms) { IOSleep(ms); }
+void coldRscDelay(void *, unsigned us) { IODelay(us); }   // BtRpmh.h's poll under the DRV-2 lock: busy, never a sleep (P17)
 
 bool coldRsc()
 {
@@ -1369,12 +1370,12 @@ int coldRailVote(unsigned i, uint16_t mv, bool enable)
     return -16;
   }
   pianobt::VrmResult res;
-  const pianobt::RscIo io = {nullptr, coldRscRd, coldRscWr, coldRscSleep};
+  const pianobt::RscIo io = {nullptr, coldRscRd, coldRscWr, coldRscSleep, coldRscDelay};
   const int rc = pianobt::vrmSend(gRscState, io, gRailAddr[i], enable ? on : off, enable ? 3 : 1, res);
   lockGive(&sm8750_rpmh_drv2_owner);
-  note("cold: rsc: %s (%#x) %s: TCS %d %s after %u ms (status %#x %#x %#x; DRV-2 lock after %u waits of 10 us)", cold::kRailTable[i].cmdDb,
+  note("cold: rsc: %s (%#x) %s: TCS %d %s after %u us (status %#x %#x %#x; DRV-2 lock after %u waits of 10 us)", cold::kRailTable[i].cmdDb,
        gRailAddr[i], enable ? "mode 7, set point, enable 1" : "enable 0", res.tcs, res.done ? "completed" : rc == -16 ? "NOT sent (no idle TCS)" :
-       "NOT completed (left in flight, not used again)", res.waited, res.status[0], res.status[1], res.status[2], waits);
+       "NOT completed (left in flight, not used again)", res.waitedUs, res.status[0], res.status[1], res.status[2], waits);
   return rc;
 }
 

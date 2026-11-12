@@ -201,8 +201,15 @@ constexpr uint32_t kMhiCfg = 0x10, kMhiErdbOff = 0x20, kMhiCcabap = 0x58, kMhiEc
 constexpr uint32_t kMhiCtrlReset = 1u << 1, kMhiStatusReady = 1u << 0, kMhiStatusSysErr = 1u << 2, kMhiStateShift = 8;
 constexpr uint32_t kBhiImgAddrLo = 0x08, kBhiImgAddrHi = 0x0c, kBhiImgSize = 0x10, kBhiImgTxDb = 0x18, kBhiIntVec = 0x20,
                    kBhiExecEnv = 0x28, kBhiStatus = 0x2c, kBhiErrCode = 0x30;
+// The rest of the BHI block (the MHI specification's names, as both MHI hosts use them): the version words at +0/+4, the three
+// error debug words after the error code, the chip's serial number (+0x40: per unit, so a dump masks it) and the boot loader's
+// anti-rollback version and segment count. The dumps read +0x00..+0x48 and nothing past it.
+constexpr uint32_t kBhiVersionMinor = 0x00, kBhiVersionMajor = 0x04, kBhiErrDbg1 = 0x34, kBhiErrDbg2 = 0x38, kBhiErrDbg3 = 0x3c,
+                   kBhiSerialNumber = 0x40, kBhiDumpBytes = 0x4c;
 constexpr uint32_t kBhieTxVecAddrLo = 0x2c, kBhieTxVecAddrHi = 0x30, kBhieTxVecSize = 0x34, kBhieTxVecDb = 0x3c,
                    kBhieTxVecStatus = 0x44;
+constexpr uint32_t kBhieDumpBytes = 0x7c;     // up to the receive vector's status (+0x78), which the crash dump path uses
+constexpr uint32_t kMhiCoreDumpBytes = 0xa8;  // MHIREGLEN .. MHIDATALIMIT_HIGHER
 constexpr uint32_t kMhiSeqMask = 0x3fffffffu, kMhiXferSuccess = 2, kMhiXferError = 3;
 // The chip's register window in BAR0: offsets below 0x80000 are direct, higher ones go through the window register (PAGANI's choice
 // for 0x110e, from the 13T's cnss2: 0x3278; WCN7850 and sheng use 0x310c). Level 4 reads only the SoC version through it.
@@ -210,6 +217,55 @@ constexpr uint32_t kChipWindowReg = 0x3278, kChipWindowEnable = 0x40000000, kChi
                    kChipWindowStart = 0x80000, kChipWindowRange = 0x7ffff;
 constexpr uint32_t kChipTcsrSocHwVersion = 0x01b00000;
 constexpr uint32_t kBar0BytesExpected = 0x200000;   // 2 MiB on WCN7850 (sheng); needs-boot for 0x110e
+// The chip-side reset this chip's own host runs at every power-up before MHI (Ubuntu's ath12k `pci.c`, sw_reset: behaviour, the
+// offsets are facts of the chip, the same for every chip of the family it drives, WCN7860 included): the chip's PCIe interrupts
+// cleared (a hot reset leaves one pending that the boot loader would take), the warm-boot entry word cleared and the reset cause
+// read (it clears on read), the SoC's global reset pulsed (bit 0 of BAR0 + 0x3008, 10 ms each way; the window register is lost
+// and written again), then MHICTRL's reset bit. piano-wifi-socreset=1 runs it before BHI; off by default (docs §10.21).
+constexpr uint32_t kChipSocGlobalReset = 0x3008, kChipSocGlobalResetBit = 1u << 0, kChipSocResetMs = 10;
+constexpr uint32_t kChipPcieIntAllClear = 0x01e08228, kChipWlaonWarmSwEntry = 0x01f80504, kChipWlaonResetCause = 0x01f8060c;
+
+// ---- the PCIe NoC's bus clock manager (level 3, before the clocks) ----
+// The endpoint's DMA leaves the controller through the PCIe aggregate NoC: Ubuntu's sm8750 interconnect driver has MASTER_PCIE_0
+// (xm_pcie3) -> qns_pcie_mem_noc, whose bus clock manager is "SN4", not keep-alive, the only manager of that NoC; the gem NoC's
+// SH0 and DDR's MC0 behind it are keep-alive. pcie-qcom votes this path ("pcie-mem") before it enables the controller's clocks
+// and raises it to width x speed once the link is up; nothing votes it on native piano, and sheng (SM8550) had to vote the same
+// manager (SN7 there) before its chip's DMA worked. The vote is a BCM command: bit 30 commit, bit 29 valid, the average in 27:14,
+// the peak in 13:0, in the manager's units: peak kB/s x aux width / the node's bus width (8 bytes), x 1000 / aux unit (cmd-db's
+// aux data: u32 unit, u16 width, u8 clock domain), a non-zero value never rounded to 0, at most 0x3fff.
+constexpr const char *kNocBcmName = "SN4";
+constexpr uint16_t kNocBusWidth = 8;
+constexpr unsigned kPcieLanes = 2;
+constexpr uint32_t kBcmCommit = 1u << 30, kBcmValid = 1u << 29, kBcmVoteMask = 0x3fff, kBcmVoteXShift = 14;
+// pcie-qcom's peak per lane: the link's data rate after its encoding, in kB/s (Gen1 2000 Mb/s, Gen2 4000, Gen3 7876).
+inline uint32_t pcieLaneKbps(unsigned gen) { return gen >= 3 ? 984500u : gen == 2 ? 500000u : 250000u; }
+inline uint32_t bcmDiv(uint64_t num, uint64_t base)
+{
+  if (!base) return 0;
+  if (num && num < base) return 1;   // a small vote is never lost
+  const uint64_t q = num / base;
+  return q > 0xffffffffu ? 0xffffffffu : uint32_t(q);
+}
+inline uint32_t bcmVote(uint64_t kbps, uint32_t unit, uint16_t width, uint16_t busWidth)
+{
+  if (!kbps || !unit || !width || !busWidth) return 0;
+  const uint32_t v = bcmDiv(uint64_t(bcmDiv(kbps * width, busWidth)) * 1000u, unit);
+  return v > kBcmVoteMask ? kBcmVoteMask : v;
+}
+inline uint32_t bcmCommand(uint32_t average, uint32_t peak)
+{
+  const uint32_t x = average > kBcmVoteMask ? kBcmVoteMask : average, y = peak > kBcmVoteMask ? kBcmVoteMask : peak;
+  return kBcmCommit | ((x || y) ? kBcmValid : 0u) | x << kBcmVoteXShift | y;
+}
+
+// ---- the PCI status bits a DMA that failed leaves behind (type 0/1 headers, the PCI Express capability, AER) ----
+// Status (the upper half of +0x04, and of +0x1c for the root port's secondary side): 27 signaled target abort, 28 received target
+// abort, 29 received master abort (an Unsupported Request completion), 30 signaled system error, 31 detected parity error. Device
+// status (+0x0a of the PCI Express capability): 0 correctable, 1 non-fatal, 2 fatal, 3 unsupported request detected. AER
+// (extended capability 1): uncorrectable status at +0x04 (14 completion timeout, 15 completer abort, 16 unexpected completion,
+// 20 unsupported request), correctable status at +0x10.
+constexpr uint32_t kStatusErrorBits = 0xf8000000u, kExtCapStart = 0x100, kExtCapAer = 0x0001, kAerUncorrectable = 0x04,
+                   kAerCorrectable = 0x10;
 // The firmware file (never in this repository): the stock modem_a FAT, image/peach/amss20.bin = ath12k's amss.bin, 6930496 bytes.
 // BHI carries its first 512 KiB (the secondary boot loader); BHIe carries the second ELF that follows when the bytes at 512 KiB are
 // "\177ELF" (peach), else the whole file (WCN7850). Segments of 512 KiB, as the 13T's cnss2 cuts them.

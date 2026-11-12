@@ -171,6 +171,12 @@ struct MhiBoot {
   uint32_t space = 0, reglen = 0, bhi = 0, bhie = 0;
   uint32_t phase = kMhiFailed, error = kMhiErrNone, failedPhase = 0;
   uint32_t ee = 0, state = 0, seq = 0, errcode = 0, lastStatus = 0;
+  uint32_t errdbg[3] = {0, 0, 0};           // BHI's three error debug words, read with the error code
+  // BHI's status as found before the boot loader's address was written, and right after this host wrote 0 to it: the register's
+  // power-on value is undefined (piano: ffffffff, with error code ef0e0003, 2026-11-12), so an error read later counts only if the
+  // clear took or the value changed since.
+  uint32_t statusBefore = 0, statusCleared = 0;
+  bool clearTook = false;
   uint64_t sblBus = 0, tableBus = 0;
   uint32_t sblBytes = 0, tableBytes = 0, msiVector = 0;
 };
@@ -185,9 +191,22 @@ inline uint32_t fail(MhiBoot &m, uint32_t error)
   m.phase = kMhiFailed;
   return m.phase;
 }
+inline void readErrors(MhiBoot &m)
+{
+  m.errcode = rd(m, m.bhi + kBhiErrCode);
+  m.errdbg[0] = rd(m, m.bhi + kBhiErrDbg1);
+  m.errdbg[1] = rd(m, m.bhi + kBhiErrDbg2);
+  m.errdbg[2] = rd(m, m.bhi + kBhiErrDbg3);
+}
+// The boot loader's image over BHI, in the order this chip family's own host writes it: the status cleared, the address high then
+// low, the size, then the doorbell with the session's sequence number (never 0).
 inline uint32_t startSbl(MhiBoot &m)
 {
   wr(m, m.bhi + kBhiIntVec, m.msiVector);   // a reset clears it
+  m.statusBefore = rd(m, m.bhi + kBhiStatus);
+  wr(m, m.bhi + kBhiStatus, 0);
+  m.statusCleared = rd(m, m.bhi + kBhiStatus);
+  m.clearTook = m.statusCleared >> 30 != kMhiXferError;
   wr(m, m.bhi + kBhiImgAddrHi, uint32_t(m.sblBus >> 32));
   wr(m, m.bhi + kBhiImgAddrLo, uint32_t(m.sblBus));
   wr(m, m.bhi + kBhiImgSize, m.sblBytes);
@@ -276,7 +295,9 @@ inline uint32_t mhiBegin(MhiBoot &m, uint32_t msiVector, uint64_t sblBus, uint32
 }
 
 // Re-reads what the phase waits for and moves on. All ones from MHI_STATUS means the device is not answering (its PCIe core is
-// restarting while its boot loader starts): not a status, so the phase stands and the owner's deadline decides.
+// restarting while its boot loader starts): not a status, so the phase stands and the owner's deadline decides. BHI's status is
+// read as this chip family's host reads it: bits 31:30 at 3 are an error, all ones included, as long as MHI_STATUS answers and the
+// value is not the power-on one this host could not clear (statusBefore / clearTook above).
 inline uint32_t mhiStep(MhiBoot &m)
 {
   using namespace mhidetail;
@@ -295,9 +316,10 @@ inline uint32_t mhiStep(MhiBoot &m)
   case kMhiSblLoading: {
     const uint32_t bhi = rd(m, m.bhi + kBhiStatus);
     m.lastStatus = bhi;
-    if (bhi == 0xffffffffu) return m.phase;
     if (bhi >> 30 == kMhiXferError) {
-      m.errcode = rd(m, m.bhi + kBhiErrCode);
+      if (bhi == 0xffffffffu && rd(m, kMhiStatus) == 0xffffffffu) return m.phase;   // the link went away between the two reads
+      if (!m.clearTook && bhi == m.statusBefore) return m.phase;                     // the stale power-on value
+      readErrors(m);
       return fail(m, kMhiErrBhi);
     }
     if (bhi >> 30 != kMhiXferSuccess) return m.phase;
@@ -343,7 +365,7 @@ inline uint32_t mhiTimedOut(MhiBoot &m)
 {
   using namespace mhidetail;
   if (m.phase == kMhiIdle || m.phase == kMhiDone || m.phase == kMhiFailed) return m.phase;
-  if (m.phase == kMhiSblLoading) m.errcode = rd(m, m.bhi + kBhiErrCode);
+  if (m.phase == kMhiSblLoading) mhidetail::readErrors(m);
   return fail(m, kMhiErrTimeout);
 }
 
