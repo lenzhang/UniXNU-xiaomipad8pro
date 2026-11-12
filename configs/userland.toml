@@ -110,6 +110,23 @@ dest = "/Library/LaunchDaemons/com.unixnu.piano-pmset-defaults.plist"
 mode = "0644"
 
 [[unit]]
+name = "piano-login-front"
+about = "once at login, the Finder brought to the front: on the owner's Data the session could start with AccessibilityUIServer frontmost, which keeps the menu bar off the screen (2026-11-13)"
+default_on = true
+
+[[unit.file]]
+source = "tooling/userland/piano-login-front/piano-login-front.sh"
+build = "copy"
+dest = "/usr/local/libexec/piano-login-front"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/userland/piano-login-front/com.unixnu.piano-login-front.plist"
+build = "copy"
+dest = "/Library/LaunchAgents/com.unixnu.piano-login-front.plist"
+mode = "0644"
+
+[[unit]]
 name = "piano-still-wallpaper"
 about = "the still login wallpaper (docs/drivers/gpu-userspace.md): once a boot, the login window's picture for every local account that has none (no software video decode at the login window); replaces nothing"
 default_on = true
