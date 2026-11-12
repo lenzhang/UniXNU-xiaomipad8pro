@@ -10,7 +10,9 @@
 //     or a shutdown is handed over, also one per write answer, until the plan says ready.
 //   - Writes: in the plan's order through piano_mca_queue, whose allowlist (piano_mca_write_allowed_for) is the codec's, not the
 //     policy's: a write it refuses is answered to the policy as refused (three refusals: given up until the next attach). Every
-//     answer, a timeout's included, goes back through piano_charge_ack().
+//     answer, a timeout's included, goes back through piano_charge_ack(), and so does a late answer to a write the owner's timer had
+//     given up on (McaLateWritten: the owner calls answered() for it too). The codec's input limit bound follows the policy's
+//     (piano_mca_allow_icl(piano_charge_icl_max)): above 1600 mA only for the stepped Type-C current (charging-policy.md §15).
 //   - Read-back: the input limit, the enable bit and the bus voltage request are compared with the first cycle read after they were
 //     taken (the policy itself writes a limit again after two disagreeing read-backs); the charge current has none (0x2005 reads 0).
 //   - Resync (a wake, Ubuntu #18): the plan's writes are not queued; the owner relinks the codec (board configuration, port enable,
@@ -30,6 +32,8 @@ struct LinkOptions {
   bool writes = true;              // piano-power-write
   unsigned hv = 0;                 // piano-power-hv: 0, 1 fixed 9 V PDO, 2 also a PPS APDO
   bool rp = false;                 // piano-power-rp: the Type-C Rp current as the 5 V limit of a source without PD
+  bool ramp = true;                // piano-power-ramp: that limit in steps from the row (ChargePolicy cfg.ramp, docs §15)
+  unsigned rpMax = 0;              // piano-power-rp-max: the stepped limit's ceiling, mA (0: the 1600 mA cap; at most 3000)
   bool health = false;             // piano-power-health: stop at stopPct, resume at resumePct
   unsigned stopPct = 80, resumePct = 75;
 };
@@ -102,9 +106,12 @@ class ChargeLink {
     cfg.writes = o.writes && m.policy ? 1 : 0;
     cfg.hv = uint8_t(o.hv > 2 ? 2 : o.hv);
     cfg.rp = o.rp ? 1 : 0;
+    cfg.ramp = o.rp && o.ramp ? 1 : 0;
+    cfg.rp_cap_ma = uint16_t(cfg.ramp && o.rpMax ? (o.rpMax > PIANO_CHG_RP_ABS_MAX ? PIANO_CHG_RP_ABS_MAX : o.rpMax) : 0);
     healthRefused = o.health && piano_charge_config_limit(&cfg, 1, o.stopPct, o.resumePct) != 0;
     piano_charge_init(&st);
     piano_mca_use_external_policy(&m, cfg.limit, cfg.hv >= 2);
+    piano_mca_allow_icl(&m, piano_charge_icl_max(&cfg));   // the codec's bound follows the policy's (1600 unless stepped higher)
   }
 
   // The charger thermistor's reading was taken while charger_pd was up (at or after it came up this time).
@@ -124,6 +131,7 @@ class ChargeLink {
     x.sleep = v.willSleep ? PIANO_CHG_WILL_SLEEP : PIANO_CHG_AWAKE;
     auto has = [&](int f) { return piano_mca_has(&m, f) != 0; };
     if (has(McaBusVoltage)) {x.valid |= PIANO_CHG_IN_BUS; x.bus_mv = m.value[McaBusVoltage] / 1000;}
+    if (has(McaBusCurrent)) {x.valid |= PIANO_CHG_IN_IBUS; x.ibus_ma = m.value[McaBusCurrent] / 1000;}
     if (has(McaType)) {x.valid |= PIANO_CHG_IN_TYPE; x.type = m.value[McaType];}
     if (has(McaIcl)) {x.valid |= PIANO_CHG_IN_ICL; x.icl_ma = m.value[McaIcl];}
     if (has(McaChargeEnable)) {x.valid |= PIANO_CHG_IN_ENABLE; x.enable = m.value[McaChargeEnable];}

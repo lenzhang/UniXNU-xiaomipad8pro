@@ -25,8 +25,10 @@
 // (ChargeLink.h, docs/drivers/charging-policy.md §8): after charger_pd is up and the board configuration is through; the class rows
 // (CDP 900 mA), the charge current derated by the warmest battery temperature (the firmware's, the gauges', PianoThermal's battery
 // thermistor), the connector and charger thermistors' holds, re-sent on a new generation and after a wake, the sleep and shutdown
-// handovers; piano-power-rp=1 the Type-C Rp current as the 5 V limit (within 1600 mA), piano-power-health=1 stop at 80 %, resume at
-// 75 % (piano-power-health-stop=N, -resume=N) with the charging-hold assertion. PianoPower then joins the power tree.
+// handovers; piano-power-rp=1 the Type-C Rp current as the 5 V limit, in steps from the row up to piano-power-rp-max (3000 mA) while
+// the bus holds and the input is used up (piano-power-ramp=0: at once within 1600 mA; charging-policy.md §15), piano-power-health=1
+// stop at 80 %, resume at 75 % (piano-power-health-stop=N, -resume=N) with the charging-hold assertion. PianoPower then joins the
+// power tree. A charger write's answer is awaited piano-power-write-ms (3000; reads 1 s) and one that comes later is still taken.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -66,6 +68,7 @@ namespace {
 struct Args {
   uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor, board, ucsi;
   uint32_t policy, rp, health, healthStop, healthResume;
+  uint32_t ramp, rpMax, writeMs;
   bool hasRtcOffset;
   uint32_t rtcOffset;
 };
@@ -98,6 +101,16 @@ void readArgs()
   gArgs.health = bootArg("piano-power-health", 0);          // with it: stop charging at 80 %, resume at 75 %
   gArgs.healthStop = bootArg("piano-power-health-stop", 80);
   gArgs.healthResume = bootArg("piano-power-health-resume", 75);
+  // with piano-power-rp=1: the Rp limit in steps from the row (default) up to piano-power-rp-max (1500..3000, default 3000: the 3.0 A
+  // Rp's current at 5 V); piano-power-ramp=0 takes it at once within the 1600 mA cap, as before (ChargePolicy.h cfg.ramp)
+  gArgs.ramp = bootArg("piano-power-ramp", 1);
+  gArgs.rpMax = bootArg("piano-power-rp-max", PIANO_CHG_RP_ABS_MAX);
+  if (gArgs.rpMax < 1500) gArgs.rpMax = 1500;
+  if (gArgs.rpMax > PIANO_CHG_RP_ABS_MAX) gArgs.rpMax = PIANO_CHG_RP_ABS_MAX;
+  // how long a charger write's answer is awaited (reads: 1 s); 2026-11-12 the firmware answered limit writes after 1 s and applied them
+  gArgs.writeMs = bootArg("piano-power-write-ms", 3000);
+  if (gArgs.writeMs < 1000) gArgs.writeMs = 1000;
+  if (gArgs.writeMs > 5000) gArgs.writeMs = 5000;
   gArgs.rtcOffset = 0;
   gArgs.hasRtcOffset = PE_parse_boot_argn("piano-rtc-offset", &gArgs.rtcOffset, sizeof gArgs.rtcOffset);
 }
@@ -242,6 +255,7 @@ class PianoPower : public IOService {
   uint32_t fPdUpsLinked = 0;
   uint64_t fRequestDue = 0, fPanDue = 0, fUcsiDue = 0, fCycleDue = 0, fReadyWarnDue = 0;
   uint32_t fUcsiNotesLogged = 0;
+  uint32_t fIgnoredSeen = 0, fIgnoredLogged = 0;   // the charger answers that matched no request: the first 8 are logged
   uint64_t fStartMs = 0;
 
   bool probeSpmi();
@@ -289,6 +303,7 @@ class PianoPower : public IOService {
   void stepPolicy(uint64_t now);
   void logPolicy(const LinkOutcome &o, uint64_t now);
   void policyLine(char *line, size_t size);
+  void inputLine(char *line, size_t size);
   bool boardTemps(piano_board_temps &t, uint64_t now);
   void setHold(bool on);
   void relinkMca(uint64_t now, const char *why);
@@ -329,10 +344,18 @@ bool PianoPower::start(IOService *provider)
          "by class (<= 1500 mA) derated -300 mA/C above 38 C (500 mA below 15 C or without a temperature), a connector at 60 C -> "
          "100 mA input, the charger at 85 C -> 500 mA; re-sent on a new charger generation and after a wake",
          gArgs.write ? "" : " for the log only (piano-power-write=0: nothing is sent)");
-    note("piano-power-rp=%u: %s", gArgs.rp ? 1u : 0u,
-         gArgs.rp ? "a source without PD that advertises 1.5 or 3.0 A on its Rp gets that as its 5 V input limit, at most 1600 mA, "
-                    "while a connector temperature (PianoThermal) reads below 50 C; a bus sag below 4.5 V under it ends the trust"
-                  : "the Type-C Rp current is not trusted: the class rows (a CDP gets 900 mA whatever its Rp says)");
+    if (gArgs.rp && gArgs.ramp)
+      note("piano-power-rp=1 piano-power-ramp=1: a source without PD that advertises 1.5 or 3.0 A on its Rp is stepped from its class "
+           "row to that current, at most %u mA (piano-power-rp-max): 1500, 2000, 2500, 3000, each held 10 s with the bus at 4.65 V or "
+           "more and the input used up; above 1500 mA only while a connector temperature (PianoThermal) reads below 50 C; a sag below "
+           "4.5 V, a detach within 30 s of a step or a refused step: one step back, the ceiling for this boot", gArgs.rpMax);
+    else
+      note("piano-power-rp=%u: %s", gArgs.rp ? 1u : 0u,
+           gArgs.rp ? "a source without PD that advertises 1.5 or 3.0 A on its Rp gets that as its 5 V input limit, at most 1600 mA, "
+                      "while a connector temperature (PianoThermal) reads below 50 C; a bus sag below 4.5 V under it ends the trust "
+                      "(piano-power-ramp=0)"
+                    : "the Type-C Rp current is not trusted: the class rows (a CDP gets 900 mA whatever its Rp says)");
+    note("charger writes: an answer is awaited %u ms (reads 1000 ms); one that comes later is still taken and logged", gArgs.writeMs);
     note("piano-power-health=%u%s; piano-power-hv=%u%s", gArgs.health ? 1u : 0u,
          gArgs.health ? ": charging stops at the stop charge (piano-power-health-stop, 80 %) and resumes at the resume charge "
                         "(-resume, 75 %), the higher pack's, with a charging hold against idle sleep below the stop"
@@ -662,6 +685,8 @@ void PianoPower::report()
     if (fPolicyOn) {
       policyLine(line, sizeof line);
       note("[%llus] %s", t, line);
+      inputLine(line, sizeof line);
+      note("[%llus] %s", t, line);
     }
   } else {
     PianoAdspSurvey s;
@@ -706,6 +731,8 @@ void PianoPower::startCharger()
     o.writes = gArgs.write != 0;
     o.hv = gArgs.hv;
     o.rp = gArgs.rp != 0;
+    o.ramp = gArgs.ramp != 0;
+    o.rpMax = gArgs.rpMax;
     o.health = gArgs.health != 0;
     o.stopPct = gArgs.healthStop;
     o.resumePct = gArgs.healthResume;
@@ -763,7 +790,7 @@ void PianoPower::pumpMca(uint64_t now)
     const uint32_t n = piano_mca_next(&fMca, out);
     if (n) {
       if (piano_adsp_send(fChannel, out, n)) note("mca: send queue full");
-      fRequestDue = now + 1000;
+      fRequestDue = now + (fMca.sent_write ? gArgs.writeMs : 1000);   // a write's answer may take the firmware longer than a read's
     }
   }
   // The port owner's writes get 5 s each, as Linux gives them (kernel.md §2.5): no answer to the enable means the owner is not served.
@@ -843,6 +870,23 @@ void PianoPower::serviceMca(uint64_t now)
            fMca.last_result == 0 ? "ok" : "refused by the firmware", fMca.last_result);
       fMca.events &= ~uint32_t(McaEvWrite);
       fLink.answered(fMca);
+    }
+    if (r == McaLateWritten) {
+      // the answer to a write already counted as "no answer": the firmware took (or refused) it after all
+      note("mca: late answer to the write of %s (%#x) = %u: %s (%d), after the %u ms window (%u late so far)%s",
+           piano_mca_property_name(fMca.last_property), fMca.last_property, fMca.last_value,
+           fMca.last_result == 0 ? "ok" : "refused by the firmware", fMca.last_result, gArgs.writeMs, fMca.late_answers,
+           fPolicyOn ? ": handed to the policy" : "");
+      if (fPolicyOn) fLink.answered(fMca);
+    }
+    if (r == McaIgnored && fMca.ignored_answers > fIgnoredSeen) {
+      fIgnoredSeen = fMca.ignored_answers;
+      if (fIgnoredLogged < 8) {
+        fIgnoredLogged++;
+        note("mca: an answer that matches no request: opcode %u, %s (%#x), sequence %u, return code %d (in flight: %u%s); %u so far",
+             fMca.ignored_opcode, piano_mca_property_name(fMca.ignored_property), fMca.ignored_property, fMca.ignored_seq,
+             int32_t(fMca.ignored_retcode), fMca.ignored_in_flight, fMca.ignored_in_flight ? "" : " = none", fMca.ignored_answers);
+      }
     }
     if (r == McaPanDone) fPanDue = 0;
     if (r == McaUcsiDone) {
@@ -1012,6 +1056,24 @@ void PianoPower::policyLine(char *line, size_t size)
            c.limit ? (fLink.st.hold ? "stopped at the limit" : "on") : "off");
 }
 
+// The input as the charger firmware reads it and where the steps are, with each report (under the console's 255 characters): the
+// verdict lines for a charging test are this one and "battery:".
+void PianoPower::inputLine(char *line, size_t size)
+{
+  const PianoMca &m = fMca;
+  const PianoChargePlan &p = fLink.plan;
+#define HAS(f) piano_mca_has(&m, f)
+  static const char *const kWait[] = {"no steps", "writing", "holding", "bus low", "no current", "not used up", "at target"};
+  snprintf(line, size,
+           "input: bus %d mV %d mA, limit %d mA asked, 0x2029 %d; steps %u mA (%s) of %u, ceiling %u; writes %u ok %u no answer "
+           "%u late, %u unmatched",
+           HAS(McaBusVoltage) ? m.value[McaBusVoltage] / 1000 : -1, HAS(McaBusCurrent) ? m.value[McaBusCurrent] / 1000 : -1,
+           HAS(McaIcl) ? m.value[McaIcl] : -1, HAS(McaAiclStatus) ? m.value[McaAiclStatus] : -1, p.ramp_ma,
+           kWait[p.ramp_wait < 7 ? p.ramp_wait : 0], p.ramp_target_ma, fLink.st.ramp_ceiling_ma, m.writes_ok, m.timeouts,
+           m.late_answers, m.ignored_answers);
+#undef HAS
+}
+
 void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
 {
   const uint64_t t = (now - fStartMs) / 1000;
@@ -1068,6 +1130,24 @@ void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
   if (e & PIANO_CHG_EV_CONN_COOL) note("policy: both connector thermistors read below 50 C: the input limit follows the source again");
   if (e & PIANO_CHG_EV_CHGR_HOT) note("policy: the charger thermistor reads 85 C or more: input limit 500 mA at most until below 75 C");
   if (e & PIANO_CHG_EV_CHGR_COOL) note("policy: the charger thermistor reads below 75 C: the input limit follows the source again");
+  // the stepped Rp limit (ChargePolicy.c ramp(), charging-policy.md §15): every step, every step back, each wait reason once a step
+  const PianoChargePlan &pl = fLink.plan;
+  static const char *const kBack[] = {"?", "the bus sagged below 4.5 V under it", "the source went within 30 s of the step",
+                                      "the firmware refused the step three times"};
+  static const char *const kWait[] = {"not stepping", "writing", "holding", "the bus is below 4.65 V under it",
+                                      "no bus current reading", "the input is not used up", "at the target"};
+  if (e & PIANO_CHG_EV_RAMP_BACK)
+    note("policy: input steps: back from %u mA: %s (bus %d mV); %u mA is the ceiling for the rest of this boot", pl.ramp_back_from_ma,
+         kBack[pl.ramp_back_why < 4 ? pl.ramp_back_why : 0], pl.ramp_back_mv, pl.ramp_ceiling_ma);
+  if (e & PIANO_CHG_EV_RAMP_STEP)
+    note("policy: input steps: up %u -> %u mA (towards %u mA, Rp %u mA): it held %d mV with %d mA taken", pl.ramp_from_ma, pl.ramp_ma,
+         pl.ramp_target_ma, in.rp_ma, in.bus_mv, (in.valid & PIANO_CHG_IN_IBUS) ? in.ibus_ma : -1);
+  if (e & PIANO_CHG_EV_RAMP_WAIT) {
+    char ceiling[40] = "";
+    if (pl.ramp_ceiling_ma) snprintf(ceiling, sizeof ceiling, ", this boot's ceiling %u mA", pl.ramp_ceiling_ma);
+    note("policy: input steps: at %u mA (towards %u mA%s): %s; bus %d mV, %d mA", pl.ramp_ma, pl.ramp_target_ma, ceiling,
+         kWait[pl.ramp_wait < 7 ? pl.ramp_wait : 0], in.bus_mv, (in.valid & PIANO_CHG_IN_IBUS) ? in.ibus_ma : -1);
+  }
   for (unsigned i = 0; i < o.readbacks; ++i) {
     const LinkReadback &r = o.readback[i];
     const bool volt = r.property == PIANO_MCA_PD_FIXED || r.property == PIANO_MCA_PPS;

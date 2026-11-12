@@ -9,7 +9,8 @@
  * acknowledges them (up to 13 s each): enable once {owner, type 1, opcode 0x15, command 0x10, argument 0, 0}, then acknowledge each
  * notification (opcode 0x16, port index in byte 12) with command 0x11 and the port index.
  *
- * This is the codec, one refresh cycle at a time (one request in flight; the owner's timer gives up on one after a second), and the
+ * This is the codec, one refresh cycle at a time (one request in flight; the owner's timer gives up on a read after a second and on
+ * a write after its longer write window, and the answer to a write given up on is still taken when it comes), and the
  * charging policy: after every cycle it decides which writes are due. Writes are limited to the input current limit, the charge
  * current, the charger's enable bit, the fixed PDO request, the opt-in input un-suspend and the stock board configuration, each within
  * conservative bounds or to its one value (piano_mca_write_allowed); anything else is refused before it is built. The UCSI owner is
@@ -114,8 +115,11 @@ enum {
 };
 
 /* receive results */
+/* McaLateWritten: the answer to a write the owner's timer had already given up on (last_property, last_value, last_result as for
+ * McaWritten); the request in flight, if any, is still awaited. McaIgnored on a 0x800a answer that matches nothing: ignored_* say
+ * what it was. */
 enum {McaIgnored = 0, McaAnswer = 1, McaCycleDone = 2, McaNotified = 3, McaWritten = 4, McaPanNotified = 5, McaPanDone = 6,
-      McaUcsiDone = 7, McaUcsiNotified = 8};
+      McaUcsiDone = 7, McaUcsiNotified = 8, McaLateWritten = 9};
 /* events for the owner's log (piano_mca_take_events) */
 enum {
     McaEvAttach = 1u << 0, McaEvDetach = 1u << 1, McaEvWrite = 1u << 2, McaEvHvOn = 1u << 3, McaEvHvBlocked = 1u << 4,
@@ -141,6 +145,13 @@ typedef struct {
     /* external: ChargePolicy decides (piano-power-policy=1): the built-in policy is left out, the board configuration stays, the owner
      * queues through piano_mca_queue; stop_allowed admits 0x2003 = 0 (battery health on), pps_allowed the 9 V APDO request (hv 2) */
     uint8_t external, stop_allowed, pps_allowed;
+    uint32_t icl_max;                /* external: the input limit admitted up to this (the stepped Rp limit, <= 3000; 0: 1600) */
+    /* the last write the owner's timer gave up on: its answer may still come (the firmware answered limit writes after the window
+     * on 2026-11-12 and applied them; McaLateWritten) */
+    uint8_t late_pending;
+    uint32_t late_seq, late_property, late_value, late_answers;
+    /* the last 0x800a answer that matched nothing (McaIgnored): opcode, property, sequence, and the sequence then in flight */
+    uint32_t ignored_answers, ignored_opcode, ignored_property, ignored_seq, ignored_retcode, ignored_in_flight;
     uint8_t unsuspend_allowed, unsuspend_tries;
     uint8_t board_allowed, board_done, board_tries;   /* the board configuration: bit 0 CP state, 1 OTG, 2 CID */
     uint8_t icl_tries, fcc_tries, enable_tries;
@@ -193,6 +204,10 @@ void piano_mca_battery_temperature(PianoMca *m, int valid, int32_t celsius);
  * notifications and the UCSI probe stay; stop: battery health is on (0x2003 = 0 admitted); pps: hv 2 (0x21017's 9 V word admitted).
  * Without the policy (piano-power-write=0) the codec stays read only: piano_mca_queue refuses everything. */
 void piano_mca_use_external_policy(PianoMca *m, int stop, int pps);
+/* With the external policy: the input limit admitted up to max_ma (1600..3000; the stepped Type-C current, ChargePolicy's
+ * cfg.rp_cap_ma); 0 or less keeps the 1600 mA bound. */
+void piano_mca_allow_icl(PianoMca *m, uint32_t max_ma);
+#define PIANO_MCA_ICL_MAX_RP 3000u    /* the Type-C current's 3.0 A at 5 V */
 /* A write the external policy wants, queued for the gap after this cycle (one per property: a later value replaces a queued one).
  * Returns 0 queued, -1 refused (outside piano_mca_write_allowed_for, or no policy), -2 the queue is full. */
 int piano_mca_queue(PianoMca *m, uint32_t property, uint32_t value, uint8_t bytes);

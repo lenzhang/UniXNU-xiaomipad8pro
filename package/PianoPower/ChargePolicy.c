@@ -46,6 +46,16 @@
 #define RP_SAG_MV 4500
 #define RP_QUICK_MS 30000u
 #define RP_STRIKES 2
+/* The stepped Rp limit (cfg.ramp, docs/drivers/charging-policy.md §15): with that limiting off, the policy finds what the source
+ * and the cable hold by itself, one step at a time, demand-driven, and remembers for the boot where they did not. 2026-11-12 on the
+ * Mac's port (CDP, Rp 3.0 A): 900 mA in -> the bus at 5.05 V and 897 mA, 1600 mA in -> 4.89 V and 1594 mA (about 0.21 Ohm from
+ * the source to the charger), so 3 A would leave about 4.6 V. */
+#define RAMP_HOLD_MS 10000u      /* a step taken is held this long, */
+#define RAMP_HOLD_DECISIONS 2    /* and this many decisions (a charger cycle read under it), before the next */
+#define RAMP_UP_MV 4650          /* the bus under a step must read this much for the next (the sag rule's 4.5 V plus headroom) */
+#define RAMP_BC12_MA 1500u       /* up to here without a connector reading: BC 1.2's CDP/DCP current and the 1.5 A Rp, as the DCP row */
+#define RAMP_USED_MIN_MA 100u    /* the input counts as used up within max(this, an eighth of the step) of the step */
+static const uint32_t kRampSteps[] = {1500u, 2000u, 2500u, 3000u};
 /* The board thermistors (docs/drivers/thermal.md 12.7): only ever more conservative. */
 #define CONN_HOT_C 60            /* a connector at or above: the input at 100 mA (the detach value) */
 #define CONN_COOL_C 50           /* until both read below; also the most an Rp limit is allowed with */
@@ -63,6 +73,13 @@ static int32_t floor_c(int32_t dc) {return dc >= 0 ? dc / 10 : -((-dc + 9) / 10)
 static int is_pd(int cls) {return cls == PIANO_CHG_C_PD || cls == PIANO_CHG_C_PD_PPS;}
 static uint32_t icl_cap(const PianoChargeConfig *c) {return c->icl_cap_ma ? umin(c->icl_cap_ma, PIANO_CHG_ICL_ABS_MAX) : PIANO_CHG_ICL_CAP;}
 static uint32_t fcc_cap(const PianoChargeConfig *c) {return c->fcc_cap_ma ? umin(c->fcc_cap_ma, PIANO_CHG_FCC_ABS_MAX) : PIANO_CHG_FCC_CAP;}
+/* The Rp limit's ceiling: the stepped one may go to rp_cap_ma (within the Type-C current's 3 A), the immediate one stays in icl_cap. */
+static int ramped(const PianoChargeConfig *c) {return c->rp && c->ramp;}
+static uint32_t rp_cap(const PianoChargeConfig *c)
+{
+    return ramped(c) && c->rp_cap_ma ? umin(c->rp_cap_ma, PIANO_CHG_RP_ABS_MAX) : icl_cap(c);
+}
+uint32_t piano_charge_icl_max(const PianoChargeConfig *c) {return umax(icl_cap(c), ramped(c) ? rp_cap(c) : 0);}
 
 /* ---------------------------------------------------------------------------------------------------------------- configuration */
 void piano_charge_config_default(PianoChargeConfig *c)
@@ -129,6 +146,21 @@ uint32_t piano_charge_icl_rp(int cls, uint32_t row_ma, uint32_t rp_ma, uint32_t 
     if (rp_ma < RP_MIN_MA) return row_ma;
     const uint32_t ma = umin(rp_ma, cap_ma);
     return ma > row_ma ? ma : row_ma;
+}
+
+uint32_t piano_charge_ramp_next(uint32_t from_ma, uint32_t goal_ma)
+{
+    for (unsigned i = 0; i < sizeof kRampSteps / sizeof kRampSteps[0]; ++i)
+        if (kRampSteps[i] > from_ma) return umin(kRampSteps[i], goal_ma);
+    return umin(umax(from_ma, goal_ma), PIANO_CHG_RP_ABS_MAX);
+}
+
+uint32_t piano_charge_ramp_back(uint32_t from_ma, uint32_t row_ma)
+{
+    uint32_t back = row_ma;
+    for (unsigned i = 0; i < sizeof kRampSteps / sizeof kRampSteps[0]; ++i)
+        if (kRampSteps[i] < from_ma && kRampSteps[i] > back) back = kRampSteps[i];
+    return back < from_ma ? back : umin(from_ma, row_ma);
 }
 
 uint32_t piano_charge_icl_9v(int cls, uint32_t source_ma)
@@ -205,7 +237,7 @@ int piano_charge_write_allowed(const PianoChargeConfig *c, uint32_t property, ui
     switch (property) {
     case PIANO_CHG_ENABLE: return bytes == 1 && value <= 1;
     case PIANO_CHG_FCC: return bytes == 4 && value >= 100 && value <= fcc_cap(c);
-    case PIANO_CHG_ICL: return bytes == 4 && value >= PIANO_CHG_ICL_DEFAULT && value <= icl_cap(c);
+    case PIANO_CHG_ICL: return bytes == 4 && value >= PIANO_CHG_ICL_DEFAULT && value <= piano_charge_icl_max(c);
     case PIANO_CHG_FV:
         return bytes == 4 && (value == PIANO_CHG_FV_DEFAULT || (c->full_charge && (value == PIANO_CHG_FV_FULL || value == PIANO_CHG_FV_HOT)));
     case PIANO_CHG_PD_FIXED: return bytes == 4 && (value == 5000 || (c->hv && value == HV_MV));
@@ -235,6 +267,14 @@ static void reset_tries(PianoChargeState *s)
     for (unsigned i = 0; i < PIANO_CHG_SLOTS; ++i) s->tries[i] = s->mismatch[i] = s->rewrites[i] = 0;
 }
 
+static void ramp_restart(PianoChargeState *s)
+{
+    s->ramp_ma = 0;
+    s->ramp_taken_ms = s->ramp_step_ms = 0;
+    s->ramp_decisions = 0;
+    s->ramp_waits_shown = 0;
+}
+
 /* The firmware is on its defaults (a new generation) or has to be told everything again (a wake): forget what it took. What is
  * about the battery (the battery-health hysteresis, a stop of ours that may still be in force) is kept. */
 static void forget(PianoChargeState *s, uint64_t now)
@@ -253,6 +293,7 @@ static void forget(PianoChargeState *s, uint64_t now)
     s->wedge_checks = 0;
     s->wedge_since_ms = 0;
     s->rp_taken_ms = 0;   /* the trust itself and its strikes are about the source and stay */
+    ramp_restart(s);      /* the steps start again from the row; this boot's ceiling is about the source and stays */
 }
 
 void piano_charge_init(PianoChargeState *s)
@@ -438,15 +479,102 @@ static uint32_t icl_at_5v(const PianoChargeConfig *c, const PianoChargeInput *in
     p->icl_why = PIANO_CHG_ICL_ROW;
     p->rp_ma = 0;
     if (!with_rp || !c->rp || s->rp_distrust || !(in->valid & PIANO_CHG_IN_TYPEC) || !in->typec_source) return row;
-    const uint32_t rp = piano_charge_icl_rp(cls, row, in->rp_ma, icl_cap(c));
+    uint32_t rp = piano_charge_icl_rp(cls, row, in->rp_ma, rp_cap(c));
     if (rp <= row) return row;
     if (!conn_allows_rp(in, s)) {
         if (!s->rp_noted) {s->rp_noted = 1; p->events |= PIANO_CHG_EV_RP_WITHHELD;}
-        return row;
+        /* stepped: up to 1.5 A still (the current BC 1.2 and a 1.5 A Rp promise, which the DCP row takes without a thermistor) */
+        if (!ramped(c) || umin(rp, RAMP_BC12_MA) <= row) return row;
+        rp = umin(rp, RAMP_BC12_MA);
     }
     p->icl_why = PIANO_CHG_ICL_RP;
     p->rp_ma = in->rp_ma;
     return rp;
+}
+
+/* Which wait reasons are worth a line: each once per step. */
+static void ramp_wait(PianoChargeState *s, PianoChargePlan *p, uint8_t wait)
+{
+    p->ramp_wait = wait;
+    if (wait < PIANO_CHG_RAMP_BUS_LOW) return;   /* writing and holding pass by themselves */
+    const uint8_t bit = (uint8_t)(1u << (wait - PIANO_CHG_RAMP_BUS_LOW));
+    if (!(s->ramp_waits_shown & bit)) {s->ramp_waits_shown |= bit; p->events |= PIANO_CHG_EV_RAMP_WAIT;}
+}
+
+/* One step back from the step wanted now, and that is the ceiling for the rest of the boot (it only goes down). */
+static void ramp_back(PianoChargeState *s, PianoChargePlan *p, uint8_t why, int32_t bus_mv)
+{
+    const uint32_t back = piano_charge_ramp_back(s->ramp_ma, s->ramp_row_ma);
+    s->ramp_back_why = why;
+    s->ramp_back_from_ma = s->ramp_ma;
+    s->ramp_back_mv = bus_mv;
+    if (!s->ramp_ceiling_ma || back < s->ramp_ceiling_ma) s->ramp_ceiling_ma = back;
+    s->ramp_ma = back;
+    s->ramp_taken_ms = s->ramp_step_ms = 0;
+    s->ramp_decisions = 0;
+    s->ramp_waits_shown = 0;
+    p->events |= PIANO_CHG_EV_RAMP_BACK;
+    p->ramp_back_why = why;
+    p->ramp_back_from_ma = s->ramp_back_from_ma;
+    p->ramp_back_mv = bus_mv;
+    p->ramp_ceiling_ma = s->ramp_ceiling_ma;
+}
+
+/* The stepped Rp limit (cfg.ramp): from the class row to target (the Rp current within rp_cap and the connector rule) one step at
+ * a time. A step goes up only when the one in force was taken, held RAMP_HOLD_MS and RAMP_HOLD_DECISIONS, the bus reads at least
+ * RAMP_UP_MV under it and the bus current is within max(100 mA, an eighth) of it: the system and the battery take what it gives,
+ * so more is of use, and the source has just shown it holds this much. A lower target applies at once. A sag below RP_SAG_MV under a
+ * step above the row, or the firmware refusing a step three times: one step back and this boot's ceiling (a quick detach: in
+ * detached()). Returns the input limit to plan. */
+static uint32_t ramp(const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p, uint64_t now, uint32_t row,
+                     uint32_t target)
+{
+    p->ramp_target_ma = target;
+    p->ramp_ceiling_ma = s->ramp_ceiling_ma;
+    if (s->ramp_ceiling_ma && target > s->ramp_ceiling_ma) target = umax(s->ramp_ceiling_ma, row);
+    s->ramp_row_ma = row;
+    if (target <= row) {
+        s->ramp_ma = row;
+        s->ramp_taken_ms = s->ramp_step_ms = 0;
+        p->ramp_ma = row;
+        ramp_wait(s, p, PIANO_CHG_RAMP_TOP);
+        return row;
+    }
+    if (s->ramp_ma < row) {s->ramp_ma = row; s->ramp_taken_ms = 0; s->ramp_waits_shown = 0;}   /* the start (or a higher row) */
+    if (s->ramp_ma > target) {s->ramp_ma = target; s->ramp_taken_ms = 0; s->ramp_waits_shown = 0;}   /* a lower target: at once */
+    const int taken = s->icl_set == s->ramp_ma;
+    if (!taken) s->ramp_taken_ms = 0;
+    else if (!s->ramp_taken_ms) {s->ramp_taken_ms = now ? now : 1; s->ramp_decisions = 0;}
+    else if (s->ramp_decisions < 255) s->ramp_decisions++;
+    if (s->ramp_ma > row) {
+        const int sag = taken && (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv < RP_SAG_MV;
+        const int refused = !taken && s->want[PIANO_CHG_S_ICL] == s->ramp_ma && s->tries[PIANO_CHG_S_ICL] >= TRIES;
+        if (sag || refused) {
+            ramp_back(s, p, sag ? PIANO_CHG_BACK_SAG : PIANO_CHG_BACK_REFUSED, in->bus_mv);
+            p->ramp_ma = s->ramp_ma;
+            p->ramp_wait = PIANO_CHG_RAMP_WRITING;
+            return s->ramp_ma;
+        }
+    }
+    uint8_t wait;
+    if (s->ramp_ma >= target) wait = PIANO_CHG_RAMP_TOP;
+    else if (!taken) wait = PIANO_CHG_RAMP_WRITING;
+    else if (now < s->ramp_taken_ms + RAMP_HOLD_MS || s->ramp_decisions < RAMP_HOLD_DECISIONS) wait = PIANO_CHG_RAMP_HOLDING;
+    else if (!(in->valid & PIANO_CHG_IN_BUS) || in->bus_mv < RAMP_UP_MV) wait = PIANO_CHG_RAMP_BUS_LOW;
+    else if (!(in->valid & PIANO_CHG_IN_IBUS)) wait = PIANO_CHG_RAMP_NO_CURRENT;
+    else if (in->ibus_ma + (int32_t)umax(RAMP_USED_MIN_MA, s->ramp_ma / 8) < (int32_t)s->ramp_ma) wait = PIANO_CHG_RAMP_NOT_USED;
+    else {
+        p->ramp_from_ma = s->ramp_ma;
+        s->ramp_ma = piano_charge_ramp_next(s->ramp_ma, target);
+        s->ramp_taken_ms = 0;
+        s->ramp_step_ms = now ? now : 1;
+        s->ramp_waits_shown = 0;
+        p->events |= PIANO_CHG_EV_RAMP_STEP;
+        wait = PIANO_CHG_RAMP_WRITING;
+    }
+    ramp_wait(s, p, wait);
+    p->ramp_ma = s->ramp_ma;
+    return s->ramp_ma;
 }
 
 /* The board holds on top of any limit. */
@@ -670,8 +798,12 @@ static void detached(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
             s->rp_distrust = 1;
             p->events |= PIANO_CHG_EV_RP_DISTRUST;
         }
+        /* stepped: gone within 30 s of a step up above the row (planned or taken): that step was one too many, for the boot */
+        if (s->ramp_ma > s->ramp_row_ma && s->ramp_step_ms && now < s->ramp_step_ms + RP_QUICK_MS)
+            ramp_back(s, p, PIANO_CHG_BACK_DETACH, (in->valid & PIANO_CHG_IN_BUS) ? in->bus_mv : 0);
     }
     s->rp_taken_ms = 0;
+    ramp_restart(s);
     s->attached = 0;
     s->type = -1;
     s->hv = PIANO_CHG_HV_OFF;
@@ -816,10 +948,29 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
         p->rp_ma = 0;
     } else {
         icl = icl_at_5v(c, in, s, p, cls, 1);
+        if (ramped(c) && p->icl_why == PIANO_CHG_ICL_RP) {
+            /* stepped from the row; the row is computed after the Rp target so that icl_why and rp_ma stay the Rp's */
+            const uint8_t why = p->icl_why;
+            const uint32_t rp_ma = p->rp_ma;
+            const uint32_t row = icl_at_5v(c, in, s, p, cls, 0);
+            p->icl_why = why;
+            p->rp_ma = rp_ma;
+            icl = ramp(in, s, p, now, row, icl);
+        } else if (s->ramp_ma) {
+            ramp_restart(s);   /* no Rp limit above the row now (the Rp gone, a PD contract, a hold): the next one starts over */
+        }
     }
+    if (hv_on && s->ramp_ma) ramp_restart(s);
     icl = board_cap(s, p, icl);
-    /* an Rp limit in force: a bus that sags under it ends the trust (the row from this decision on) */
-    if (p->icl_why == PIANO_CHG_ICL_RP && s->icl_set == icl) {
+    if (s->ramp_ma && (p->icl_why == PIANO_CHG_ICL_CONN || p->icl_why == PIANO_CHG_ICL_CHGR)) {
+        ramp_restart(s);   /* a board hold: afterwards the steps start again from the row, never straight back up */
+        p->ramp_ma = p->ramp_from_ma = 0;
+        p->ramp_wait = PIANO_CHG_RAMP_OFF;
+    }
+    /* an Rp limit in force (not stepped): a bus that sags under it ends the trust (the row from this decision on) */
+    if (ramped(c)) {
+        s->rp_taken_ms = 0;   /* the steps have their own sag and detach rules */
+    } else if (p->icl_why == PIANO_CHG_ICL_RP && s->icl_set == icl) {
         if (!s->rp_taken_ms) s->rp_taken_ms = now ? now : 1;
         if (in->bus_mv < RP_SAG_MV) {
             s->rp_distrust = 1;
@@ -835,10 +986,18 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
     p->icl_ma = icl;
     p->fcc_ma = fcc;
     p->bus_mv = s->hv == PIANO_CHG_HV_ASKED || s->hv == PIANO_CHG_HV_ON ? HV_MV : 5000;
-    /* the writes, in this order: a stop first, the currents, the bus voltage, a resume, the float voltage */
+    /* the writes, in this order: a stop first, the currents, the bus voltage, a resume, the float voltage. The currents: an input
+     * limit that goes up first (the system gets the input before the battery asks for more), else the charge current first. On
+     * 2026-11-12 the firmware answered a first charge current write made while its input was still at the 100 mA request only
+     * after the codec's window, twice (P1, P2), and every one made after the input limit at once (I, usbhost-u0). */
     if (!charge_ok) plan_enable(c, in, s, p, now, 0);
-    plan_fcc(c, s, p, now, fcc, full);
-    plan_icl(c, in, s, p, now, icl);
+    if (icl > s->icl_set) {
+        plan_icl(c, in, s, p, now, icl);
+        plan_fcc(c, s, p, now, fcc, full);
+    } else {
+        plan_fcc(c, s, p, now, fcc, full);
+        plan_icl(c, in, s, p, now, icl);
+    }
     plan_volt(c, s, p, now);
     if (charge_ok) {
         if (s->disabled) plan_enable(c, in, s, p, now, 1);

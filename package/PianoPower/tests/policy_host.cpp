@@ -7,6 +7,7 @@
 //   c++ -std=c++20 -Wall -Wextra -Werror -I package/PianoPower package/PianoPower/tests/policy_host.cpp /tmp/ChargePolicy.o \
 //     -o /tmp/policy_host && /tmp/policy_host
 // (tooling/k27/build-native-piano-power.sh runs it before the kext; the wiring into PianoPower is tested in power_host.cpp.)
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -47,6 +48,10 @@ struct Sim {
   std::vector<std::vector<uint32_t>> pdos;
   int busMv = 5000;
   int verify = 0;
+  // the system and the battery (loadMa > 0): the bus current is min(input limit, load) and the bus busMv less ohms x that current;
+  // above kneeMa the source's voltage gives way by kneeOhms more
+  int loadMa = 0, kneeMa = 0;
+  double ohms = 0, kneeOhms = 0;
   // the battery
   int soc = 50, tbatC = 30, tWarmDc = 300, tCoolDc = 290, ibat = 1000, vbat = 3900;
   // the Type-C current and PianoThermal's board thermistors (0.1 degC; boardValid: PIANO_CHG_IN_NTC..CONN2 bits)
@@ -72,6 +77,12 @@ struct Sim {
     in.valid = PIANO_CHG_IN_BUS | PIANO_CHG_IN_TYPE | PIANO_CHG_IN_ICL | PIANO_CHG_IN_ENABLE | PIANO_CHG_IN_FV | PIANO_CHG_IN_VERIFY |
                PIANO_CHG_IN_TBAT | PIANO_CHG_IN_TYPEC;
     in.bus_mv = source ? busMv : 0;
+    if (source && loadMa > 0) {
+      const int ma = int(icl) < loadMa ? int(icl) : loadMa;
+      in.valid |= PIANO_CHG_IN_IBUS;
+      in.ibus_ma = ma;
+      in.bus_mv = busMv - int(ohms * ma) - (kneeMa && ma > kneeMa ? int(kneeOhms * (ma - kneeMa)) : 0);
+    }
     in.type = source ? type : 0;
     in.icl_ma = int32_t(icl);
     in.enable = enable;
@@ -143,7 +154,9 @@ struct Sim {
       CHECK(piano_charge_write_allowed(&cfg, w.property, w.value, w.bytes));
       CHECK(!(slots & (1u << w.slot)));   // one write per slot and plan
       slots |= 1u << w.slot;
-      if (w.property == PIANO_CHG_ICL) CHECK(w.value <= (cfg.icl_cap_ma ? cfg.icl_cap_ma : PIANO_CHG_ICL_CAP));
+      if (w.property == PIANO_CHG_ICL) CHECK(w.value <= piano_charge_icl_max(&cfg) && w.value <= PIANO_CHG_RP_ABS_MAX);
+      if (w.property == PIANO_CHG_ICL && w.value > (cfg.icl_cap_ma ? cfg.icl_cap_ma : PIANO_CHG_ICL_CAP))
+        CHECK(cfg.rp && cfg.ramp && plan.icl_why == PIANO_CHG_ICL_RP);   // above the cap only a stepped Rp limit
       if (w.property == PIANO_CHG_FCC) CHECK(w.value <= (cfg.fcc_cap_ma ? cfg.fcc_cap_ma : PIANO_CHG_FCC_CAP));
       if (w.property == PIANO_CHG_ENABLE && w.value == 0) CHECK(cfg.limit);   // a stop only from battery health
     }
@@ -278,14 +291,14 @@ static void testTables()
 // ------------------------------------------------------------------------------------------------------------ the 5 V decisions
 static void testFiveVolt()
 {
-  // A DCP at 30 degC: the charge current then the input limit (the stage A ceilings), once.
+  // A DCP at 30 degC: the input limit (it goes up) then the charge current (the stage A ceilings), once.
   {
     Sim s;
     s.step();
     CHECK(s.plan.events & PIANO_CHG_EV_ATTACH);
     CHECK(s.plan.cls == PIANO_CHG_C_DCP && s.plan.icl_ma == 1500 && s.plan.fcc_ma == 1500);
-    CHECK(s.plan.writes == 2 && s.plan.write[0].property == PIANO_CHG_FCC && s.plan.write[0].value == 1500);
-    CHECK(s.plan.write[1].property == PIANO_CHG_ICL && s.plan.write[1].value == 1500);
+    CHECK(s.plan.writes == 2 && s.plan.write[0].property == PIANO_CHG_ICL && s.plan.write[0].value == 1500);
+    CHECK(s.plan.write[1].property == PIANO_CHG_FCC && s.plan.write[1].value == 1500);
     CHECK(!s.plan.hold_awake);
     s.step();
     CHECK(s.plan.writes == 0);
@@ -1015,6 +1028,172 @@ static void testRpAndBoard()
   }
 }
 
+// ------------------------------------------------------------------------------------------------------ the stepped Rp limit (§15)
+static void testRamp()
+{
+  // the steps
+  CHECK(piano_charge_ramp_next(900, 3000) == 1500 && piano_charge_ramp_next(1500, 3000) == 2000 && piano_charge_ramp_next(2000, 3000) == 2500);
+  CHECK(piano_charge_ramp_next(2500, 3000) == 3000 && piano_charge_ramp_next(2500, 2800) == 2800 && piano_charge_ramp_next(900, 1200) == 1200);
+  CHECK(piano_charge_ramp_next(1600, 3000) == 2000 && piano_charge_ramp_next(3000, 3000) == 3000 && piano_charge_ramp_next(500, 3000) == 1500);
+  CHECK(piano_charge_ramp_back(2500, 900) == 2000 && piano_charge_ramp_back(1500, 900) == 900 && piano_charge_ramp_back(2000, 1500) == 1500);
+  CHECK(piano_charge_ramp_back(2800, 900) == 2500 && piano_charge_ramp_back(1600, 900) == 1500 && piano_charge_ramp_back(900, 900) == 900);
+  CHECK(piano_charge_ramp_back(3000, 500) == 2500);
+  // the allowlist's ceiling: 1600, or with rp and ramp the larger rp_cap (at most 3000)
+  PianoChargeConfig c;
+  piano_charge_config_default(&c);
+  CHECK(!c.ramp && !c.rp_cap_ma && piano_charge_icl_max(&c) == 1600);
+  c.rp_cap_ma = 3000;
+  CHECK(piano_charge_icl_max(&c) == 1600);          // neither rp nor ramp
+  c.rp = 1;
+  CHECK(piano_charge_icl_max(&c) == 1600 && !piano_charge_write_allowed(&c, PIANO_CHG_ICL, 1700, 4));   // rp at once: the cap
+  c.ramp = 1;
+  CHECK(piano_charge_icl_max(&c) == 3000 && piano_charge_write_allowed(&c, PIANO_CHG_ICL, 3000, 4));
+  c.rp_cap_ma = 9000;
+  CHECK(piano_charge_icl_max(&c) == 3000 && !piano_charge_write_allowed(&c, PIANO_CHG_ICL, 3001, 4));
+  c.rp_cap_ma = 0;
+  CHECK(piano_charge_icl_max(&c) == 1600);
+  const uint32_t conns = PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2;
+  auto mac = [&](Sim &s) {   // the 2026-11-12 Mac port: CDP, Rp 3.0 A, 5.23 V open, 0.21 Ohm, the system taking more than it gets
+    s.type = PIANO_CHG_T_CDP;
+    s.cfg.rp = 1;
+    s.cfg.ramp = 1;
+    s.cfg.rp_cap_ma = 3000;
+    s.boardValid = conns;
+    s.busMv = 5230;
+    s.ohms = 0.21;
+    s.loadMa = 3500;
+  };
+  // the climb: the row first (the input before the charge current), then a step per 15 s (10 s held and two decisions after the
+  // decision that saw it taken), the bus 4.6 V at 3 A; each wait reason once a step
+  {
+    Sim s;
+    mac(s);
+    s.step();
+    CHECK(s.plan.writes == 2 && s.plan.write[0].property == PIANO_CHG_ICL && s.plan.write[0].value == 900);
+    CHECK(s.plan.write[1].property == PIANO_CHG_FCC && s.plan.write[1].value == 900);
+    CHECK(s.plan.icl_why == PIANO_CHG_ICL_RP && s.plan.ramp_ma == 900 && s.plan.ramp_target_ma == 3000);
+    std::vector<std::pair<uint64_t, uint32_t>> steps;
+    unsigned waits = 0;
+    for (int i = 0; i < 40; ++i) {
+      s.step();
+      if (s.plan.events & PIANO_CHG_EV_RAMP_STEP) {
+        CHECK(s.wrote(PIANO_CHG_ICL, s.plan.ramp_ma) && s.plan.ramp_from_ma < s.plan.ramp_ma);
+        steps.push_back({s.now, s.plan.ramp_ma});
+      }
+      waits += (s.plan.events & PIANO_CHG_EV_RAMP_WAIT) != 0;
+    }
+    CHECK(steps.size() == 4 && steps[0].second == 1500 && steps[3].second == 3000);
+    for (size_t i = 1; i < steps.size(); ++i) CHECK(steps[i].first == steps[i - 1].first + 15000);
+    CHECK(s.plan.ramp_wait == PIANO_CHG_RAMP_TOP && s.icl == 3000 && waits == 1 && !s.st.ramp_ceiling_ma);
+    // a detach long after the last step costs nothing; the next attach climbs again from the row
+    s.source = false;
+    s.step();
+    CHECK(s.wrote(PIANO_CHG_ICL, 100) && !s.st.ramp_ceiling_ma && !s.st.ramp_ma);
+    s.source = true;
+    s.step();
+    CHECK(s.wrote(PIANO_CHG_ICL, 900));
+  }
+  // a source that gives way above 2.2 A: a sag under 2500 -> 2000, this boot's ceiling (kept across a generation and a wake)
+  {
+    Sim s;
+    mac(s);
+    s.kneeMa = 2200;
+    s.kneeOhms = 1.0;
+    for (int i = 0; i < 40; ++i) s.step();
+    CHECK(s.st.ramp_ceiling_ma == 2000 && s.st.ramp_back_why == PIANO_CHG_BACK_SAG && s.st.ramp_back_from_ma == 2500 && s.icl == 2000);
+    s.generation++;
+    s.wakes++;
+    for (int i = 0; i < 40; ++i) s.step();
+    CHECK(s.icl == 2000 && s.plan.ramp_wait == PIANO_CHG_RAMP_TOP && s.plan.ramp_ceiling_ma == 2000);
+  }
+  // a quick detach after a step: one step back for the boot; a slow one: nothing
+  {
+    Sim s;
+    mac(s);
+    for (int i = 0; i < 4; ++i) s.step();
+    CHECK(s.icl == 1500 && (s.plan.events & PIANO_CHG_EV_RAMP_STEP));
+    s.source = false;
+    s.step();
+    CHECK((s.plan.events & PIANO_CHG_EV_RAMP_BACK) && s.st.ramp_ceiling_ma == 900 && s.st.ramp_back_why == PIANO_CHG_BACK_DETACH);
+    s.source = true;
+    for (int i = 0; i < 20; ++i) s.step();
+    CHECK(s.icl == 900 && s.plan.ramp_wait == PIANO_CHG_RAMP_TOP);
+  }
+  // the input not used up: no step; no bus current reading: none either; a low bus: none
+  {
+    Sim s;
+    mac(s);
+    s.loadMa = 780;   // within an eighth (788 mA at 900) counts as used up; 780 does not
+    for (int i = 0; i < 20; ++i) s.step();
+    CHECK(s.icl == 900 && s.plan.ramp_wait == PIANO_CHG_RAMP_NOT_USED);
+    Sim t;
+    mac(t);
+    t.loadMa = 0;   // no IBUS bit
+    for (int i = 0; i < 20; ++i) t.step();
+    CHECK(t.icl == 900 && t.plan.ramp_wait == PIANO_CHG_RAMP_NO_CURRENT);
+    Sim u;
+    mac(u);
+    u.busMv = 4800;   // 4.61 V under 900 mA
+    for (int i = 0; i < 20; ++i) u.step();
+    CHECK(u.icl == 900 && u.plan.ramp_wait == PIANO_CHG_RAMP_BUS_LOW);
+  }
+  // no connector reading: 1500 at most (noted once); with one again the steps go on; Rp 1.5 A: 1500 is the target
+  {
+    Sim s;
+    mac(s);
+    s.boardValid = 0;
+    for (int i = 0; i < 20; ++i) s.step();
+    CHECK(s.icl == 1500 && s.plan.ramp_wait == PIANO_CHG_RAMP_TOP && s.plan.ramp_target_ma == 1500);
+    s.boardValid = conns;
+    for (int i = 0; i < 40; ++i) s.step();
+    CHECK(s.icl == 3000);
+    Sim t;
+    mac(t);
+    t.rpMa = 1500;
+    for (int i = 0; i < 20; ++i) t.step();
+    CHECK(t.icl == 1500 && t.plan.ramp_target_ma == 1500);
+  }
+  // refused three times: back, the ceiling
+  {
+    Sim s;
+    mac(s);
+    for (int i = 0; i < 20 && s.icl != 1500; ++i) s.step();
+    CHECK(s.icl == 1500);
+    s.refuseIcl = true;
+    for (int i = 0; i < 10; ++i) s.step();
+    CHECK(s.st.ramp_ceiling_ma == 1500 && s.st.ramp_back_why == PIANO_CHG_BACK_REFUSED && s.icl == 1500);
+    CHECK(s.plan.ramp_wait == PIANO_CHG_RAMP_TOP);
+    s.refuseIcl = false;
+    for (int i = 0; i < 20; ++i) s.step();
+    CHECK(s.icl == 1500);
+  }
+  // writes off: the steps for the log only, nothing sent; ramp off: the Rp limit at once within the cap (the old behaviour)
+  {
+    Sim s;
+    mac(s);
+    s.cfg.writes = 0;
+    for (int i = 0; i < 20; ++i) {s.step(); CHECK(s.plan.writes == 0);}
+    Sim t;
+    mac(t);
+    t.cfg.ramp = 0;
+    t.step();
+    CHECK(t.wrote(PIANO_CHG_ICL, 1600) && t.plan.ramp_ma == 0);
+  }
+  // a board hold mid-climb: 100 mA; afterwards the row first, never straight back up
+  {
+    Sim s;
+    mac(s);
+    for (int i = 0; i < 10; ++i) s.step();
+    CHECK(s.icl >= 2000);
+    s.conn1Dc = 610;
+    s.step();
+    CHECK(s.wrote(PIANO_CHG_ICL, 100) && !s.st.ramp_ma);
+    s.conn1Dc = 400;
+    s.step();
+    CHECK(s.wrote(PIANO_CHG_ICL, 900));
+  }
+}
+
 // ---------------------------------------------------------------------------------------------------------------- random walk
 static void testRandom()
 {
@@ -1028,7 +1207,10 @@ static void testRandom()
     s.cfg.sleep_charge = uint8_t(rnd(2));
     s.cfg.writes = rnd(8) != 0;
     s.cfg.rp = uint8_t(rnd(2));
+    s.cfg.ramp = uint8_t(rnd(2));
+    s.cfg.rp_cap_ma = uint16_t(rnd(2) ? 3000 : rnd(4000));
     if (rnd(2)) { s.cfg.icl_cap_ma = 2500; s.cfg.fcc_cap_ma = 3500; }
+    if (rnd(2)) { s.loadMa = 300 + int(rnd(3500)); s.ohms = 0.05 * rnd(8); s.kneeMa = rnd(2) ? 0 : 1000 + int(rnd(2000)); s.kneeOhms = 1.0; }
     for (int i = 0; i < 1500; ++i) {
       switch (rnd(40)) {
       case 0: s.source = !s.source; break;
@@ -1065,8 +1247,13 @@ static void testRandom()
       if (s.st.conn_hot && s.plan.cls != PIANO_CHG_C_NONE && s.plan.icl_ma) CHECK(s.plan.icl_ma <= 100);
       if (s.plan.icl_why == PIANO_CHG_ICL_RP) {
         CHECK(s.cfg.rp && !s.st.rp_distrust && s.plan.cls != PIANO_CHG_C_PD && s.plan.cls != PIANO_CHG_C_PD_PPS);
-        CHECK((s.in.valid & (PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2)) && s.plan.icl_ma <= (s.cfg.icl_cap_ma ? s.cfg.icl_cap_ma : 1600u));
+        CHECK(s.plan.icl_ma <= piano_charge_icl_max(&s.cfg));
+        // a connector reading for anything from the Rp, except a stepped limit up to 1.5 A
+        if (!(s.cfg.ramp && s.plan.icl_ma <= 1500)) CHECK(s.in.valid & (PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2));
+        if (!s.cfg.ramp) CHECK(s.plan.icl_ma <= (s.cfg.icl_cap_ma ? s.cfg.icl_cap_ma : 1600u));
+        if (s.cfg.ramp && s.st.ramp_ceiling_ma) CHECK(s.plan.icl_ma <= std::max(s.st.ramp_ceiling_ma, 900u) || s.plan.icl_ma <= 1500);
       }
+      if (s.st.ramp_ceiling_ma) CHECK(s.cfg.rp && s.cfg.ramp);
     }
   }
 }
@@ -1081,6 +1268,7 @@ int main()
   testSleep();
   testCp();
   testRpAndBoard();
+  testRamp();
   testRandom();
   if (gFailures) {
     std::fprintf(stderr, "policy_host: %d failure(s)\n", gFailures);

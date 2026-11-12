@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <vector>
 #include "SpmiObserver.h"
 #include "ChargerPmic.h"
@@ -323,6 +324,39 @@ struct Dsp {
   bool dropReads = false;
   void (*hook)(void *, PianoMca &, int) = nullptr;   // after each answer is received (the owner's view of it)
   void *hookCtx = nullptr;
+  // The source and the system (loadMa > 0): the bus current is min(input limit, load), the bus voltage the open-circuit voltage less
+  // ohms x current (the 2026-11-12 Mac port: 5.23 V, about 0.21 Ohm); tripMa > 0: above it the source cuts out (the bus reads 0).
+  int loadMa = 0, openMv = 5230, tripMa = 0;
+  bool tripped = false;   // the source cut out (over-current): it stays off until the next period (a replug, a port's retry)
+  double ohms = 0.21;
+  int kneeMa = 0;          // > 0: above this the source's own voltage gives way as well (kneeOhms more per mA beyond it)
+  double kneeOhms = 0;
+  uint32_t iclMax = 0;   // > 0: the firmware refuses input limits above this (retcode 1)
+  // Writes the owner's timer gives up on (lateWrites > 0): the answer is held back and handed in later with deliverLate().
+  unsigned lateWrites = 0;
+  std::vector<std::vector<uint8_t>> held;
+  void source()
+  {
+    if (loadMa <= 0) return;
+    const uint32_t icl = props.count(PIANO_MCA_ICL) ? props[PIANO_MCA_ICL] : 100;
+    const int ma = int(icl) < loadMa ? int(icl) : loadMa;
+    if (tripMa && ma > tripMa) tripped = true;
+    if (tripped) {props[PIANO_MCA_BUS_VOLTAGE] = 0; props[PIANO_MCA_BUS_CURRENT] = 0; return;}
+    props[PIANO_MCA_BUS_CURRENT] = uint32_t(ma) * 1000;
+    const int knee = kneeMa && ma > kneeMa ? int(kneeOhms * (ma - kneeMa)) : 0;
+    props[PIANO_MCA_BUS_VOLTAGE] = uint32_t((openMv - int(ohms * ma) - knee) * 1000);
+  }
+  unsigned deliverLate(PianoMca &m)
+  {
+    unsigned n = 0;
+    for (auto &r : held) {
+      const int k = piano_mca_receive(&m, r.data(), uint32_t(r.size()));
+      if (hook) hook(hookCtx, m, k);
+      n += k == McaLateWritten;
+    }
+    held.clear();
+    return n;
+  }
 
   // Answers every request the codec has until it has none; returns how many.
   unsigned run(PianoMca &m)
@@ -346,6 +380,7 @@ struct Dsp {
         reads++;
         readsOf[prop]++;
         if (dropReads) {piano_mca_timeout(&m); ++n; continue;}
+        if (prop == PIANO_MCA_BUS_VOLTAGE) source();
         if (prop == PIANO_MCA_PDOS) {
           for (size_t i = 0; i < pdo.size(); ++i) put32(resp + 24 + 4 * i, pdo[i]);
         } else if (prop == PIANO_MCA_CHARGE_ENABLE || prop == PIANO_MCA_INPUT_SUSPEND || prop == PIANO_MCA_AICL_ENABLE) {
@@ -360,7 +395,24 @@ struct Dsp {
         if (prop == PIANO_MCA_OTG_CFG)
           for (unsigned w = 0; w < 4; ++w) otg[w] = le32(out + 20 + 4 * w);
         writes.push_back({prop, value});
-        if (!retcodeFor.count(prop) || !retcodeFor[prop]) props[prop] = value;
+        if (prop == PIANO_MCA_ICL && iclMax && value > iclMax) put32(resp + 16, 1);
+        if (!retcodeFor.count(prop) || !retcodeFor[prop]) {
+          if (!(prop == PIANO_MCA_ICL && iclMax && value > iclMax)) props[prop] = value;
+        }
+        if (lateWrites) {
+          // taken by the firmware, the answer after the owner's window: the owner's timer fires first
+          lateWrites--;
+          held.emplace_back(resp, resp + sizeof resp);
+          if (hook) {
+            const bool write = m.in_flight && m.sent_write;
+            piano_mca_timeout(&m);
+            if (write) hook(hookCtx, m, -60);
+          } else {
+            piano_mca_timeout(&m);
+          }
+          ++n;
+          continue;
+        }
         if (prop == PIANO_MCA_PD_FIXED && value == 9000 && props.count(0xf9000)) props[PIANO_MCA_BUS_VOLTAGE] = props[0xf9000];
         if (prop == PIANO_MCA_PD_FIXED && value == 5000 && props.count(0xf5000)) props[PIANO_MCA_BUS_VOLTAGE] = props[0xf5000];
       }
@@ -395,6 +447,12 @@ struct Dsp {
   {
     unsigned n = 0;
     for (const Write &w : writes) n += w.property == property;
+    return n;
+  }
+  unsigned count(uint32_t property, uint32_t value) const
+  {
+    unsigned n = 0;
+    for (const Write &w : writes) n += w.property == property && w.value == value;
     return n;
   }
 };
@@ -838,7 +896,8 @@ struct LinkRig {
     // as PianoPower's receive loop: each write answer to the policy, and a decision after each finished cycle
     d.hook = [](void *ctx, PianoMca &mm, int r) {
       LinkRig *rig = static_cast<LinkRig *>(ctx);
-      if (r == McaWritten) rig->link.answered(mm);
+      // a write's answer, a late one, and the owner's timeout of a write (-60, as ChargeLink::timeout hands it on)
+      if (r == McaWritten || r == McaLateWritten || r == -60) rig->link.answered(mm);
       if (r == McaCycleDone) rig->stepOnce();
     };
     d.hookCtx = this;
@@ -913,7 +972,7 @@ struct LinkRig {
     }
     CHECK(!"the link never settled");
   }
-  void period(uint64_t dt = 5000) { now += dt; piano_mca_refresh(&m); settle(); }
+  void period(uint64_t dt = 5000) { now += dt; d.tripped = false; piano_mca_refresh(&m); settle(); }
   uint32_t take() { const uint32_t e = events; events = 0; return e; }
   int index(uint32_t property, unsigned from = 0) const
   {
@@ -927,7 +986,8 @@ struct LinkRig {
       const uint8_t bytes = w.property == PIANO_MCA_CHARGE_ENABLE || w.property == PIANO_MCA_CP_STATE ? 1
                             : w.property == PIANO_MCA_OTG_CFG ? 16 : 4;
       if (!piano_mca_write_allowed_for(&m, w.property, w.value, bytes)) return false;
-      if (w.property == PIANO_MCA_ICL && (w.value < 100 || w.value > 1600)) return false;
+      const uint32_t iclMax = opts.rp && opts.ramp && opts.rpMax > 1600 ? (opts.rpMax > 3000 ? 3000 : opts.rpMax) : 1600;
+      if (w.property == PIANO_MCA_ICL && (w.value < 100 || w.value > iclMax)) return false;
       if (w.property == PIANO_MCA_FCC && (w.value < 100 || w.value > 1500)) return false;
       if (w.property == PIANO_MCA_CHARGE_ENABLE && w.value == 0 && !link.cfg.limit) return false;
       if (w.property == PIANO_MCA_INPUT_SUSPEND || w.property == PIANO_MCA_TERM_VOLT) return false;
@@ -942,7 +1002,7 @@ static void testLinkCdp()
   LinkRig r{LinkOptions()};
   r.period();
   const int cp = r.index(PIANO_MCA_CP_STATE), cid = r.index(PIANO_MCA_CID_CFG), fcc = r.index(PIANO_MCA_FCC), icl = r.index(PIANO_MCA_ICL);
-  CHECK(cp >= 0 && cid >= 0 && r.index(PIANO_MCA_OTG_CFG) >= 0 && fcc > cid && icl > fcc);   // board first, then FCC, then ICL
+  CHECK(cp >= 0 && cid >= 0 && r.index(PIANO_MCA_OTG_CFG) >= 0 && icl > cid && fcc > icl);   // board first, then ICL (up), then FCC
   CHECK(r.d.last(PIANO_MCA_ICL) == 900 && r.d.last(PIANO_MCA_FCC) == 900 && r.d.count(PIANO_MCA_ICL) == 1);
   CHECK(r.link.plan.cls == PIANO_CHG_C_CDP && r.link.plan.icl_why == PIANO_CHG_ICL_ROW && r.link.plan.rp_ma == 0);
   CHECK(!r.d.count(PIANO_MCA_CHARGE_ENABLE) && !r.d.count(PIANO_MCA_PD_FIXED) && !r.d.count(PIANO_MCA_INPUT_SUSPEND));
@@ -980,8 +1040,10 @@ static void testLinkCdp()
 
 static void testLinkRp()
 {
+  // piano-power-ramp=0: the Rp limit at once, within the 1600 mA cap (the 2026-11-12 P2 behaviour)
   LinkOptions o;
   o.rp = true;
+  o.ramp = false;
   // Rp 3.0 A with the connectors reading 31 / 30 C: 1600 mA (the ceiling), the charge current still the CDP row
   {
     LinkRig r(o);
@@ -1057,6 +1119,214 @@ static void testLinkRp()
     r.d.props[PIANO_MCA_BUS_VOLTAGE] = 5200000;
     r.period();
     CHECK(r.d.last(PIANO_MCA_ICL) == 900);
+  }
+}
+
+// The codec's late answers (2026-11-12 P1/P2: "write ... = 900: no answer (-60)", and the limit read back as written the next cycle).
+static void testMcaLate()
+{
+  PianoMca m;
+  piano_mca_init(&m, 1, 0);
+  piano_mca_use_external_policy(&m, 0, 0);
+  piano_mca_link(&m, 1);
+  CHECK(piano_mca_queue(&m, PIANO_MCA_ICL, 1700, 4) == -1);            // above 1600 only with allow_icl
+  piano_mca_allow_icl(&m, 2500);
+  CHECK(m.icl_max == 2500 && piano_mca_write_allowed_for(&m, PIANO_MCA_ICL, 2500, 4) && !piano_mca_write_allowed_for(&m, PIANO_MCA_ICL, 2501, 4));
+  piano_mca_allow_icl(&m, 9000);
+  CHECK(m.icl_max == 3000 && !piano_mca_write_allowed_for(&m, PIANO_MCA_ICL, 3001, 4));
+  PianoMca plain;
+  piano_mca_init(&plain, 1, 0);
+  piano_mca_allow_icl(&plain, 3000);                                   // the built-in policy keeps its 1600
+  CHECK(plain.icl_max == 0 && !piano_mca_write_allowed_for(&plain, PIANO_MCA_ICL, 1700, 4));
+  // finish the link's first cycle so that the write goes out between cycles
+  Dsp d;
+  d.props[PIANO_MCA_BUS_VOLTAGE] = 5200000;
+  d.run(m);
+  CHECK(piano_mca_queue(&m, PIANO_MCA_ICL, 1500, 4) == 0);
+  uint8_t out[PIANO_MCA_REQUEST_BYTES];
+  CHECK(piano_mca_next(&m, out) == PIANO_MCA_REQUEST_BYTES && le32(out + 8) == PIANO_MCA_OP_WRITE && le32(out + 12) == PIANO_MCA_ICL);
+  const uint32_t seq = le32(out + 16);
+  piano_mca_timeout(&m);                                               // the owner's window passed
+  CHECK(m.last_result == -60 && m.writes_failed == 1 && m.late_pending && m.icl_set == 0);
+  // the read-back cycle starts; its first read is in flight when the late answer comes
+  CHECK(piano_mca_next(&m, out) && le32(out + 8) == PIANO_MCA_OP_READ);
+  const uint32_t readSeq = le32(out + 16);
+  uint8_t resp[PIANO_MCA_RESPONSE_BYTES] = {};
+  put32(resp, PIANO_MCA_OWNER); put32(resp + 4, 1); put32(resp + 8, PIANO_MCA_OP_WRITE); put32(resp + 12, PIANO_MCA_ICL);
+  put32(resp + 20, seq);
+  CHECK(piano_mca_receive(&m, resp, sizeof resp) == McaLateWritten);
+  CHECK(m.icl_set == 1500 && m.last_property == PIANO_MCA_ICL && m.last_value == 1500 && m.last_result == 0 && m.late_answers == 1);
+  CHECK(m.in_flight && m.seq == readSeq);                              // the read is still awaited
+  CHECK(piano_mca_receive(&m, resp, sizeof resp) == McaIgnored);       // the same answer twice: once only
+  CHECK(m.ignored_answers == 1 && m.ignored_property == PIANO_MCA_ICL && m.ignored_seq == seq && m.ignored_in_flight == readSeq);
+  // a late refusal is a refusal; a relink forgets the pending one
+  piano_mca_timeout(&m);                                               // the read times out (no late record for reads)
+  CHECK(!m.late_pending);
+  d.run(m);
+  CHECK(piano_mca_queue(&m, PIANO_MCA_FCC, 900, 4) == 0);
+  CHECK(piano_mca_next(&m, out) && le32(out + 12) == PIANO_MCA_FCC);
+  const uint32_t fccSeq = le32(out + 16);
+  piano_mca_timeout(&m);
+  put32(resp + 12, PIANO_MCA_FCC); put32(resp + 16, 3); put32(resp + 20, fccSeq);
+  CHECK(piano_mca_receive(&m, resp, sizeof resp) == McaLateWritten && m.last_result == 3 && m.fcc_set == 0);
+  d.run(m);
+  CHECK(piano_mca_queue(&m, PIANO_MCA_FCC, 900, 4) == 0);
+  CHECK(piano_mca_next(&m, out));
+  const uint32_t again = le32(out + 16);
+  piano_mca_timeout(&m);
+  piano_mca_link(&m, 0);
+  piano_mca_link(&m, 1);
+  put32(resp + 16, 0); put32(resp + 20, again);
+  CHECK(piano_mca_receive(&m, resp, sizeof resp) == McaIgnored && m.fcc_set == 0);
+}
+
+// The stepped Rp limit (piano-power-rp=1, piano-power-ramp=1, the default ramp) against the Mac's port as measured on 2026-11-12:
+// CDP, Rp 3.0 A, 5.23 V open, about 0.21 Ohm to the charger, the system and the battery taking more than it gives.
+static void testLinkRamp()
+{
+  LinkOptions o;
+  o.rp = true;
+  o.rpMax = 3000;
+  auto rig = [&](LinkOptions opts, int load = 3500, double ohms = 0.21) {
+    auto r = std::make_unique<LinkRig>(opts);
+    r->haveBoard = true;
+    r->d.loadMa = load;
+    r->d.ohms = ohms;
+    return r;
+  };
+  // the steps: the CDP row first (the input limit before the charge current), then 1500, 2000, 2500, 3000, each at least 10 s later
+  {
+    auto r = rig(o);
+    r->period();
+    const int icl = r->index(PIANO_MCA_ICL), fcc = r->index(PIANO_MCA_FCC);
+    CHECK(icl >= 0 && fcc > icl && r->d.last(PIANO_MCA_ICL) == 900 && r->d.last(PIANO_MCA_FCC) == 900);
+    CHECK(r->link.plan.icl_why == PIANO_CHG_ICL_RP && r->link.plan.rp_ma == 3000 && r->link.plan.ramp_target_ma == 3000);
+    std::vector<std::pair<uint64_t, uint32_t>> steps;
+    for (int i = 0; i < 30; ++i) {
+      const uint32_t before = r->d.last(PIANO_MCA_ICL);
+      r->period();
+      if (r->d.last(PIANO_MCA_ICL) != before) steps.push_back({r->now, r->d.last(PIANO_MCA_ICL)});
+    }
+    CHECK(steps.size() == 4 && steps[0].second == 1500 && steps[1].second == 2000 && steps[2].second == 2500 && steps[3].second == 3000);
+    for (size_t i = 1; i < steps.size(); ++i) CHECK(steps[i].first >= steps[i - 1].first + 10000);
+    CHECK(r->link.plan.ramp_wait == PIANO_CHG_RAMP_TOP && r->link.plan.icl_ma == 3000 && r->m.icl_set == 3000);
+    CHECK(r->d.props[PIANO_MCA_BUS_VOLTAGE] / 1000 == 5230 - 630 && !r->link.st.ramp_ceiling_ma);   // 4.6 V at 3 A: no sag
+    const uint32_t e = r->take();
+    CHECK((e & PIANO_CHG_EV_RAMP_STEP) && (e & PIANO_CHG_EV_RAMP_WAIT) && !(e & PIANO_CHG_EV_RAMP_BACK));
+    CHECK(r->allAllowed() && r->d.count(PIANO_MCA_ICL) == 5);
+    // the sleep handover: the row, not the steps; the wake starts the steps over from the row
+    r->sleep = true;
+    r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 900);
+    r->sleep = false;
+    r->wakes++;
+    r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 900 && r->link.plan.ramp_ma == 900);
+  }
+  // more resistance: the bus under 2.5 A reads 4.61 V (below the 4.65 V to go on): held at 2500, logged once
+  {
+    auto r = rig(o, 3500, 0.25);
+    for (int i = 0; i < 30; ++i) r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 2500 && r->link.plan.ramp_wait == PIANO_CHG_RAMP_BUS_LOW && !r->link.st.ramp_ceiling_ma);
+  }
+  // a source whose voltage gives way above 2.2 A: the bus sags below 4.5 V under 2.5 A: back to 2000, the ceiling for the boot; a
+  // new attach stops at 2000
+  {
+    auto r = rig(o);
+    r->d.kneeMa = 2200;
+    r->d.kneeOhms = 1.0;
+    for (int i = 0; i < 30; ++i) r->period();
+    CHECK((r->take() & PIANO_CHG_EV_RAMP_BACK) && r->link.st.ramp_ceiling_ma == 2000 && r->d.last(PIANO_MCA_ICL) == 2000);
+    CHECK(r->link.plan.ramp_back_why == PIANO_CHG_BACK_SAG || r->link.st.ramp_back_why == PIANO_CHG_BACK_SAG);
+    CHECK(r->d.count(PIANO_MCA_ICL) == 5);   // 900, 1500, 2000, 2500, back to 2000: no second try at 2500
+    r->d.loadMa = 0;
+    r->d.props[PIANO_MCA_BUS_VOLTAGE] = 100000;
+    r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 100);
+    r->d.loadMa = 3500;
+    for (int i = 0; i < 30; ++i) r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 2000 && r->link.plan.ramp_wait == PIANO_CHG_RAMP_TOP);
+    CHECK(r->allAllowed());
+  }
+  // the system takes 1.2 A: at 1500 the input is not used up, so no higher
+  {
+    auto r = rig(o, 1200);
+    for (int i = 0; i < 30; ++i) r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 1500 && r->link.plan.ramp_wait == PIANO_CHG_RAMP_NOT_USED);
+    r->d.loadMa = 3500;   // more load: the steps go on
+    for (int i = 0; i < 30; ++i) r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 3000);
+  }
+  // no connector reading: 1500 (BC 1.2's current and a 1.5 A Rp), noted once; a warm connector mid-way lowers it at once
+  {
+    auto r = rig(o);
+    r->haveBoard = false;
+    for (int i = 0; i < 20; ++i) r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 1500 && (r->take() & PIANO_CHG_EV_RP_WITHHELD));
+    auto w = rig(o);
+    for (int i = 0; i < 9; ++i) w->period();
+    CHECK(w->d.last(PIANO_MCA_ICL) >= 2000);
+    w->temps(30, 33, 52, 30);
+    w->period();
+    CHECK(w->d.last(PIANO_MCA_ICL) == 1500);
+    // a hot connector: 100 mA; cool again: the steps start over from the row, never straight back up
+    w->temps(30, 33, 61, 30);
+    w->period();
+    CHECK(w->d.last(PIANO_MCA_ICL) == 100);
+    w->temps(30, 33, 40, 40);
+    w->period();
+    CHECK(w->d.last(PIANO_MCA_ICL) == 900);
+  }
+  // the port cuts out above 2.1 A: the step to 2500 is followed by a detach: the ceiling 2000 for the boot
+  {
+    auto r = rig(o);
+    r->d.tripMa = 2100;
+    for (int i = 0; i < 40; ++i) r->period();
+    CHECK(r->link.st.ramp_ceiling_ma == 2000 && r->link.st.ramp_back_why == PIANO_CHG_BACK_DETACH);
+    CHECK(r->d.last(PIANO_MCA_ICL) == 2000 && r->d.count(PIANO_MCA_ICL, 2500) == 1);
+  }
+  // the firmware refuses limits above 2000: three refusals of 2500, then 2000 is the ceiling
+  {
+    auto r = rig(o);
+    r->d.iclMax = 2000;
+    for (int i = 0; i < 40; ++i) r->period();
+    CHECK(r->link.st.ramp_ceiling_ma == 2000 && r->link.st.ramp_back_why == PIANO_CHG_BACK_REFUSED && r->m.icl_set == 2000);
+    CHECK(r->d.count(PIANO_MCA_ICL, 2500) == 3);
+  }
+  // piano-power-rp-max=2000: the steps stop there
+  {
+    LinkOptions m2 = o;
+    m2.rpMax = 2000;
+    auto r = rig(m2);
+    for (int i = 0; i < 30; ++i) r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 2000 && r->link.plan.ramp_wait == PIANO_CHG_RAMP_TOP && r->allAllowed());
+  }
+  // a step's answer after the owner's window (as P2's first input limit write): the policy sends it again, which is answered; the
+  // late answer, when it comes, is recognised (not "unmatched") and changes nothing; the steps go on
+  {
+    auto r = rig(o);
+    r->period();
+    r->d.lateWrites = 1;
+    for (int i = 0; i < 10 && r->d.held.empty(); ++i) r->period();
+    CHECK(r->d.held.size() == 1 && r->m.timeouts == 1 && r->d.count(PIANO_MCA_ICL, 1500) == 2 && r->m.icl_set == 1500);
+    const uint32_t unmatched = r->m.ignored_answers;
+    CHECK(r->d.deliverLate(r->m) == 1 && r->m.late_answers == 1 && r->m.ignored_answers == unmatched && r->link.st.icl_set == 1500);
+    for (int i = 0; i < 30; ++i) r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 3000 && r->allAllowed());
+  }
+  // a DCP with Rp 3.0 A: its row (1500) first, then the steps; a PD source: its contract, no steps
+  {
+    auto r = rig(o);
+    r->d.props[PIANO_MCA_REAL_TYPE] = PIANO_MCA_TYPE_DCP;
+    r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 1500);
+    for (int i = 0; i < 30; ++i) r->period();
+    CHECK(r->d.last(PIANO_MCA_ICL) == 3000);
+    auto p = rig(o);
+    p->d.props[PIANO_MCA_REAL_TYPE] = PIANO_MCA_TYPE_PD;
+    p->d.pdo = {5000, 5000, 3000};
+    for (int i = 0; i < 20; ++i) p->period();
+    CHECK(p->d.last(PIANO_MCA_ICL) == 1500 && p->link.plan.icl_why == PIANO_CHG_ICL_ROW && !p->link.plan.ramp_ma);
   }
 }
 
@@ -1269,6 +1539,7 @@ static void testLinkThermal()
 {
   LinkOptions o;
   o.rp = true;
+  o.ramp = false;   // the holds against an immediate Rp limit (testLinkRamp has them against the steps)
   LinkRig r(o);
   r.haveBoard = true;
   r.period();
@@ -1323,14 +1594,20 @@ static void testLinkRandom()
     LinkOptions o;
     o.hv = rnd(3);
     o.rp = rnd(2);
+    o.ramp = rnd(3) != 0;
+    o.rpMax = rnd(2) ? 3000 : 1500 + 100 * rnd(16);
     o.health = rnd(2);
     o.writes = rnd(6) != 0;
     LinkRig r(o);
     r.haveBoard = rnd(2);
     r.d.props[0xf9000] = 8900000;
     r.d.props[0xf5000] = 5100000;
+    if (rnd(2)) r.d.loadMa = 500 + int(rnd(3000));   // the bus follows the limit (and sags with it) in half the runs
     for (int i = 0; i < 300; ++i) {
-      switch (rnd(24)) {
+      switch (rnd(27)) {
+      case 24: r.d.loadMa = rnd(4) ? 500 + int(rnd(3000)) : 0; break;
+      case 25: r.d.ohms = 0.05 * rnd(12); r.d.tripMa = rnd(3) ? 0 : 1000 + int(rnd(2200)); break;
+      case 26: r.d.lateWrites = rnd(3); if (rnd(2)) r.d.deliverLate(r.m); break;
       case 0: r.d.props[PIANO_MCA_BUS_VOLTAGE] = rnd(2) ? 5200000 : 100000; break;
       case 1: r.d.props[PIANO_MCA_REAL_TYPE] = rnd(16); break;
       case 2: r.d.pdo = rnd(2) ? std::vector<uint32_t>{5000, 5000, 3000, 9000, 9000, 2000} : std::vector<uint32_t>{5000, 5000, 1500}; break;
@@ -1476,6 +1753,8 @@ int main()
   testPortOwners();
   testLinkCdp();
   testLinkRp();
+  testMcaLate();
+  testLinkRamp();
   testLinkPd();
   testLinkDetachWakeGeneration();
   testLinkGates();

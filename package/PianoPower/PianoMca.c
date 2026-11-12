@@ -84,6 +84,7 @@ void piano_mca_link(PianoMca *m, int up)
     m->valid = 0;
     m->pdos = 0;
     m->settled = 0;
+    m->late_pending = 0;   /* an answer from before the link belongs to another generation */
     if (!up) {m->pan_enable = 0; return;}
     m->links++;
     m->icl_set = m->fcc_set = 0;   /* a started firmware is on its defaults */
@@ -139,6 +140,9 @@ int piano_mca_write_allowed_for(const PianoMca *m, uint32_t property, uint32_t v
 {
     if (!m->external) return piano_mca_write_allowed(property, value, bytes);
     switch (property) {
+    case PIANO_MCA_ICL:
+        return bytes == 4 && value >= PIANO_MCA_ICL_FLOOR &&
+               value <= (m->icl_max > PIANO_MCA_ICL_MAX_9V ? m->icl_max : PIANO_MCA_ICL_MAX_9V);
     case PIANO_MCA_CHARGE_ENABLE: return bytes == 1 && (value == 1 || (value == 0 && m->stop_allowed));
     case PIANO_MCA_PD_FIXED: return bytes == 4 && (value == 5000 || (value == 9000 && m->hv_allowed));
     case PIANO_MCA_PPS: {
@@ -281,6 +285,11 @@ void piano_mca_use_external_policy(PianoMca *m, int stop, int pps)
     m->external = 1;
     m->stop_allowed = m->policy && stop;
     m->pps_allowed = m->policy && pps;
+}
+
+void piano_mca_allow_icl(PianoMca *m, uint32_t max_ma)
+{
+    m->icl_max = m->policy && m->external && max_ma > PIANO_MCA_ICL_MAX_9V ? min32(max_ma, PIANO_MCA_ICL_MAX_RP) : 0;
 }
 
 int piano_mca_queue(PianoMca *m, uint32_t property, uint32_t value, uint8_t bytes)
@@ -428,11 +437,15 @@ void piano_mca_timeout(PianoMca *m)
     if (!m->in_flight) return;
     m->timeouts++;
     if (m->sent_write) {
-        /* the write counts as tried; its result is unknown */
+        /* the write counts as tried; its result is unknown until its answer comes after all (McaLateWritten) */
         m->in_flight = m->sent_write = 0;
         m->last_property = m->queue[0].property;
         m->last_value = m->queue[0].value;
         m->last_result = -60;
+        m->late_pending = 1;
+        m->late_seq = m->seq;
+        m->late_property = m->queue[0].property;
+        m->late_value = m->queue[0].value;
         m->writes_failed++;
         m->events |= McaEvWrite;
         drop_write(m);
@@ -512,6 +525,20 @@ static int receive_ucsi(PianoMca *m, const uint8_t *data, uint32_t length)
     return McaUcsiDone;
 }
 
+/* The firmware took a write. A limit it took may be written again if it later reads otherwise; the tries count refusals in a row.
+ * The enable bit is not: if the firmware clears it again, it means to. */
+static void taken(PianoMca *m, uint32_t property, uint32_t value)
+{
+    m->writes_ok++;
+    if (property == PIANO_MCA_ICL) {m->icl_set = value; m->icl_tries = 0;}
+    const uint8_t bit = property == PIANO_MCA_CP_STATE ? 1 : property == PIANO_MCA_OTG_CFG ? 2 : property == PIANO_MCA_CID_CFG ? 4 : 0;
+    if (bit && m->board_done != 7) {
+        m->board_done |= bit;
+        if (m->board_done == 7) m->events |= McaEvBoardDone;
+    }
+    if (property == PIANO_MCA_FCC) {m->fcc_set = value; m->fcc_tries = 0;}
+}
+
 int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length)
 {
     if (!data || length < 12) {m->ignored++; return McaIgnored;}
@@ -524,29 +551,37 @@ int piano_mca_receive(PianoMca *m, const uint8_t *data, uint32_t length)
         piano_mca_refresh(m);
         return McaNotified;
     }
-    if (type != PIANO_MCA_TYPE_REQUEST || length < 24 || !m->in_flight) {m->ignored++; return McaIgnored;}
+    if (type != PIANO_MCA_TYPE_REQUEST || length < 24) {m->ignored++; return McaIgnored;}
     const uint32_t property = le32(data + 12), retcode = le32(data + 16), seq = le32(data + 20);
-    if (seq != m->seq || property != m->sent_property || opcode != m->sent_opcode) {m->ignored++; return McaIgnored;}
+    /* the answer to a write the owner's timer gave up on: taken now (the request in flight, if any, has a later sequence) */
+    if (m->late_pending && opcode == PIANO_MCA_OP_WRITE && seq == m->late_seq && property == m->late_property &&
+        !(m->in_flight && seq == m->seq)) {
+        m->late_pending = 0;
+        m->late_answers++;
+        m->last_property = property;
+        m->last_value = m->late_value;
+        m->last_result = (int32_t)retcode;
+        if (!retcode) taken(m, property, m->late_value);
+        return McaLateWritten;
+    }
+    if (!m->in_flight || seq != m->seq || property != m->sent_property || opcode != m->sent_opcode) {
+        m->ignored++;
+        m->ignored_answers++;
+        m->ignored_opcode = opcode;
+        m->ignored_property = property;
+        m->ignored_seq = seq;
+        m->ignored_retcode = retcode;
+        m->ignored_in_flight = m->in_flight ? m->seq : 0;
+        return McaIgnored;
+    }
     if (m->sent_write) {
         m->in_flight = m->sent_write = 0;
         const uint32_t value = m->queue[0].value;
         m->last_property = property;
         m->last_value = value;
         m->last_result = (int32_t)retcode;
-        if (!retcode) {
-            /* A limit the firmware took may be written again if it later reads otherwise; the tries count refusals in a row. The
-             * enable bit is not: if the firmware clears it again, it means to. */
-            m->writes_ok++;
-            if (property == PIANO_MCA_ICL) {m->icl_set = value; m->icl_tries = 0;}
-            const uint8_t bit = property == PIANO_MCA_CP_STATE ? 1 : property == PIANO_MCA_OTG_CFG ? 2 : property == PIANO_MCA_CID_CFG ? 4 : 0;
-            if (bit && m->board_done != 7) {
-                m->board_done |= bit;
-                if (m->board_done == 7) m->events |= McaEvBoardDone;
-            }
-            if (property == PIANO_MCA_FCC) {m->fcc_set = value; m->fcc_tries = 0;}
-        } else {
-            m->writes_failed++;
-        }
+        if (!retcode) taken(m, property, value);
+        else m->writes_failed++;
         m->events |= McaEvWrite;
         drop_write(m);
         return McaWritten;
