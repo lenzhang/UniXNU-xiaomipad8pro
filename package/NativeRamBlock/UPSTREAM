@@ -39,7 +39,8 @@ UniXNU-piano changes of 2026-11-11 (docs/data-store.md):
 - The boot reservation and the fallbacks (2026-11-12, the first desktop session: at 1080 MiB held the 2 MiB IOMallocAligned failed
   87474 times, 13 writes were refused with no memory, APFS read their blocks back as zeros: container corruption). VolatilePool.h:
   chunk records (base, pages, allocator kind) that the refill thread grows; prefillPages taken at start (data-volatile-reserve-mib,
-  default the whole budget); fallback sizes 2 MiB, 512, 128, 32 KiB, a page, over three allocators (IOMallocData: the private
+  default 256 MiB: the pages are wired and the desktop runs short of RAM); the default budget capped at 2 GiB (was 4 GiB);
+  fallback sizes 2 MiB, 512, 128, 32 KiB, a page, over three allocators (IOMallocData: the private
   data range; IOMallocAligned: the shared data range, the GPU's; IOMalloc: the default heap); a reserve of 64 MiB that doubles
   after a wait up to 256 MiB; after a round with nothing, a backoff of 10 ms doubling to 1 s on an event the writers do not signal
   (the old one was cut short by every waiting writer: a busy loop). NativeRamBlock.cpp: a refused or short volatile write completes
