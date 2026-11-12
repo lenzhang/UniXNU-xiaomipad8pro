@@ -77,6 +77,9 @@
 "partition-style" = "macOS"
 "product-name" = "Xiaomi Pad 8 Pro"
 "product-description" = "Xiaomi Pad 8 Pro"
+# XNU's machdep.cpu.brand_string (bsd/dev/arm64/sysctl.c), System Information's Chip (2026-11-13 on s1c: "Unknown" without it), as
+# configs/k27-adt.toml has it.
+"product-soc-name" = "Snapdragon 8 Elite"
 
 ["adt"."product"."u32"]
 "artwork-device-subtype" = 0
