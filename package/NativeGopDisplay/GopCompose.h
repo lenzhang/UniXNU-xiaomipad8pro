@@ -503,6 +503,16 @@ inline bool vblStops(bool darkStop, bool dark, unsigned refreshLeft, bool unfini
 {
   return darkStop && dark && !refreshLeft && !unfinished && !waiting && !queued;
 }
+// The family's queue as swap_begin_gated leaves it (a VBL tick, a submission, a deferred completion; the periodic line's counters).
+// Behind: a swap queued behind the current one, which waits for its completion rule (native-gop-display-defer, flip mode):
+// WindowServer swapping faster than the copies go, the back-pressure that rule exists for (expected in animations and while the GPU
+// finishes slow first frames). Stalled: a swap queued while none is current, which nothing in progress will program (0 expected).
+enum class QueueTick : uint8_t {Idle, Behind, Stalled};
+inline QueueTick queueTick(bool queued, bool current)
+{
+  if (!queued) return QueueTick::Idle;
+  return current ? QueueTick::Behind : QueueTick::Stalled;
+}
 // On the copy thread, when a refresh job runs: whether it copies (covered: the last frame's copy waited for its fence and saw it
 // retired, so it read the finished frame).
 inline bool refreshNeeded(uint32_t policy, bool covered, bool last)

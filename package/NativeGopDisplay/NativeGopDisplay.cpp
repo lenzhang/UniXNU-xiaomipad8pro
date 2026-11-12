@@ -259,7 +259,12 @@ private:
     uint64_t fTicks, fDropped, fReported;
     uint64_t fWaitFailures, fWaitReleased;
     uint64_t fCopies, fCopyNs, fCopyMaxNs, fReadNs, fConvertNs, fWriteNs, fPrepareNs;
-    uint64_t fSubmitted, fStalled;
+    // The family's queue after each swap_begin_gated (a VBL tick, a submission, a deferred completion; GopCompose.h queueTick):
+    // fStalled ("ticks stalled"), a swap queued while none is current, which nothing in progress will program (0 expected, as in every
+    // log before 2026-11-12); fBehind (per period), a swap queued behind one that waits for its copy (native-gop-display-defer's
+    // back-pressure: WindowServer swapping faster than the copies go). Until 2026-11-12 one counter was both: with the deferred
+    // completions it climbed in every animation and looked like a stall (queue6's images, 114-400 a boot).
+    uint64_t fSubmitted, fStalled, fBehind;
     uint64_t fSubmitTime[16], fFenceWaits, fFenceWaitNs, fFenceWaitMaxNs;   // swap submitted -> programmed (IOSurface fences)
     uint64_t fLastFrameTime, fSecondStart, fSecondFrames, fPeakFps;
     uint64_t fCopyRequestTime, fWakeMaxNs, fWakeLate, fVBLDue, fVBLLateMaxNs, fVBLLate;
@@ -924,8 +929,17 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         fThumbRequested = true;
         queueRefresh(refresh);
     }
-    if (at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))
+    switch (gopcompose::queueTick(at<IOMFBSwapIORequest *>(this, kSwapQueueFirst) != nullptr,
+                                  at<IOMFBSwapIORequest *>(this, kCurrentSwap) != nullptr)) {
+    case gopcompose::QueueTick::Behind:
+        fBehind++;
+        break;
+    case gopcompose::QueueTick::Stalled:
         fStalled++;
+        break;
+    case gopcompose::QueueTick::Idle:
+        break;
+    }
     if (++fTicks % (10 * fRefreshHz) == 0 && fSubmitted + fFrames + fDropped + fStalled != fReported) {   // about every 10 s while swaps arrive
         fReported = fSubmitted + fFrames + fDropped + fStalled;
         GOPLOG("%llu swaps submitted, %llu shown, %llu dropped, %llu ticks stalled (current %p), last frame %llu.%llu%% "
@@ -945,16 +959,17 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         if (fCursorJobs)
             GOPLOG("cursor: %llu updates of its old and new rectangles, mean %llu us max %llu us, last at (%d, %d)\n", fCursorJobs,
                   fCursorNs / fCursorJobs / 1000, fCursorMaxNs / 1000, fCursorX, fCursorY);
-        if (fDeferred)
+        if (fDeferred || fBehind)
             GOPLOG("%llu swaps completed once the copy thread was done (native-gop-display-defer=%u), mean %llu us max %llu us after "
-                  "they were programmed\n", fDeferred, fDefer, fDeferNs / fDeferred / 1000, fDeferMaxNs / 1000);
+                  "they were programmed; %llu times a newer swap was queued behind the one waiting (not stalls)\n", fDeferred, fDefer,
+                  fDeferred ? fDeferNs / fDeferred / 1000 : 0, fDeferMaxNs / 1000, fBehind);
         if (fRefreshSkipped)
             GOPLOG("%llu refresh copies not needed (their frame's fence wait saw the GPU done)\n", fRefreshSkipped);
         if (fUnfinishedJobs || fRetries || fRefreshAborts)
             GOPLOG("%llu jobs left undrawn (the GPU had not finished their frame within %u ms: the previous one stayed), %llu tick "
                   "retries, %llu refresh copies cut short by a swap\n", fUnfinishedJobs, fGpuFenceWaitMs, fRetries, fRefreshAborts);
         fUnfinishedJobs = fRetries = fRefreshAborts = 0;
-        fCursorJobs = fCursorNs = fCursorMaxNs = fDeferred = fDeferNs = fDeferMaxNs = 0;
+        fCursorJobs = fCursorNs = fCursorMaxNs = fDeferred = fDeferNs = fDeferMaxNs = fBehind = 0;
         if (fFenceWaits)
             GOPLOG("%llu swaps from submit to programmed mean %llu us max %llu us\n", fFenceWaits,
                   fFenceWaitNs / fFenceWaits / 1000, fFenceWaitMaxNs / 1000);

@@ -551,6 +551,9 @@ static void testRefresh()
             for (int queued = 0; queued < 2; queued++)
               CHECK(vblStops(stop, dark, refresh, unfinished, waiting, queued) ==
                     (stop && dark && !refresh && !unfinished && !waiting && !queued));
+  // The queue at a tick: a swap behind one that waits for its copy is back-pressure, not a stall; only one with none current is.
+  CHECK(queueTick(false, false) == QueueTick::Idle && queueTick(false, true) == QueueTick::Idle);
+  CHECK(queueTick(true, true) == QueueTick::Behind && queueTick(true, false) == QueueTick::Stalled);
   CHECK(!refreshNeeded(kRefreshOff, false, true));
   CHECK(refreshNeeded(kRefreshUncovered, false, false) && !refreshNeeded(kRefreshUncovered, true, false) && refreshNeeded(kRefreshUncovered, true, true));
   CHECK(refreshNeeded(kRefreshAlways, true, false));
@@ -634,6 +637,7 @@ struct Result {
   unsigned torn = 0, garbage = 0, idleChecks = 0, idleMismatches = 0, timeouts = 0, frames = 0, swaps = 0, deferred = 0;
   unsigned copies = 0, cursorJobs = 0, skippedRefresh = 0, flips = 0, flippedWithCursor = 0;
   unsigned unfinished = 0, retries = 0, aborted = 0, earlyCompletions = 0;
+  unsigned behind = 0, stalled = 0;   // swap_begin_gated left a swap queued behind a waiting one / with none current
   bool finalMatches = false;
 };
 
@@ -854,6 +858,10 @@ private:
       hasCurrent = true;
       program();
     }
+    // the periodic line's counters, as swap_begin_gated keeps them
+    const QueueTick q = queueTick(!queue.empty(), hasCurrent);
+    if (q == QueueTick::Behind) result.behind++;
+    if (q == QueueTick::Stalled) result.stalled++;
     Job r;
     Job displaced;
     if (!framesThisCall && pipe.refreshJob(&r)) {
@@ -1134,11 +1142,14 @@ static void testSimulation()
         CHECK(r.idleChecks > 3 && r.idleMismatches == 0);
         CHECK(r.finalMatches);
         CHECK(r.frames > 30 && r.cursorJobs > 5 && r.deferred > 0);
+        // queue6 (2026-11-12): swaps faster than the copies queue behind the one that waits ("behind"), the queue never stalls
+        CHECK(r.stalled == 0);
+        if (defer == kDeferAlways) CHECK(r.behind > 0);
         aborted += r.aborted;
         if (seed == 1)
           std::printf("sim %u buffers, defer=%u refresh=%u: %u frames, %u swaps, %u deferred, %u full copies, %u cursor updates, %u "
-                      "refreshes skipped, %u cut short, %u idle checks\n", buffers, defer, c.policy, r.frames, r.swaps, r.deferred, r.copies,
-                      r.cursorJobs, r.skippedRefresh, r.aborted, r.idleChecks);
+                      "refreshes skipped, %u cut short, %u idle checks, %u behind, %u stalled\n", buffers, defer, c.policy, r.frames, r.swaps,
+                      r.deferred, r.copies, r.cursorJobs, r.skippedRefresh, r.aborted, r.idleChecks, r.behind, r.stalled);
       }
       // the race of 2026-11-11: completing every swap at once lets WindowServer draw into a surface the copy thread is reading
       Config old;
@@ -1149,6 +1160,7 @@ static void testSimulation()
       const Result r = World(old).run();
       if (buffers == 2) CHECK(r.torn > 0);   // with two framebuffers the one handed back is drawn next, at once
       CHECK(r.deferred == 0);
+      CHECK(r.behind == 0 && r.stalled == 0);   // every swap completes at once: nothing ever waits behind one
       CHECK(r.garbage == 0);    // the fence rule holds in every mode
       CHECK(r.finalMatches);    // the refresh copies hide it once everything stops
       if (seed == 1)
@@ -1171,6 +1183,8 @@ static void testSimulation()
       CHECK(r.timeouts > 0 && r.unfinished > 0 && r.retries > 0);
       CHECK(r.garbage == 0);
       CHECK(r.torn == 0);
+      CHECK(r.stalled == 0);   // a slow GPU holds swaps behind the waiting one (defer=2), it never stalls the queue
+      if (defer == kDeferAlways) CHECK(r.behind > 0);
       CHECK(r.finalMatches);
       CHECK(r.idleMismatches == 0);
       if (seed == 1)
@@ -1190,6 +1204,7 @@ static void testSimulation()
     CHECK(r.earlyCompletions == 0);
     CHECK(r.idleMismatches == 0 && r.finalMatches);
     CHECK(r.flips > 0 && r.copies > 0);
+    CHECK(r.stalled == 0 && r.behind > 0);   // flip mode always waits for the swap's own job
     if (seed == 1) std::printf("sim flip mode: %u flips, %u copies (cursor on or refused), %u cursor updates\n", r.flips, r.copies, r.cursorJobs);
   }
 }

@@ -135,13 +135,22 @@ NativeGopDisplay: cursor: surface 128x128, glyph X,Y WxH, hot spot (HX, HY) (ori
                   (X, Y) on the panel                                              (the first few cursor shapes)
 NativeGopDisplay: cursor: N updates of its old and new rectangles, mean N us max N us, last at (X, Y)       (in the 10 s block)
 NativeGopDisplay: N swaps completed once the copy thread was done (native-gop-display-defer=2), mean N us max N us after they were
-                  programmed
+                  programmed; N times a newer swap was queued behind the one waiting (not stalls)
 NativeGopDisplay: N refresh copies not needed (their frame's fence wait saw the GPU done)
 NativeGopDisplay: N jobs left undrawn (the GPU had not finished their frame within 1000 ms: the previous one stayed), N tick
                   retries, N refresh copies cut short by a swap                   (only when any)
 NativeGopDisplay: the GPU had not finished a frame after 1000 ms (fence N): not copied, the previous frame stays; retried at the
                   next ticks (N so far)                                           (the first 8, then every 100th)
 ```
+
+`ticks stalled` counts the times the work loop left a swap queued with none current: nothing in progress would program it (0 in
+every log so far, a stuck queue otherwise). A swap queued behind one that waits for its copy (`native-gop-display-defer=2`, flip
+mode) is not a stall but the back-pressure of the deferred completion: WindowServer swapping faster than the copies go (the clock's
+minute animation at about 44 frames a second, the GPU's slow first frames); it is the deferred line's `times a newer swap was queued
+behind`. Until 2026-11-12 one counter was both, so with the deferred completions `ticks stalled` climbed in every animation (114-400
+a boot in queue6's images, `logs/usb-console/20261112-0542*` to `-0637*`) while nothing stalled: in those logs the deferred
+completions take one copy (mean ~23 ms) at the login, 0 fence waits hit the 1000 ms guard and no job was left undrawn. Read the
+latency from `swaps from submit to programmed` and the deferred line's mean/max.
 
 The "last frame" figures and the thumbnail come from every 4th pixel of every 4th row as written to the panel, after conversion, in
 any source format. "Non-black" means a channel above 8 of 255. Before 2026-11-11 the line said `last frame N lit centre X`, and that
@@ -235,7 +244,7 @@ the next frame flips again. A cursor showing up over a flipped frame composes th
 (dpu.md §4.2.6) is later.
 
 **Host tests** (`package/NativeGopDisplay/tests/gop_host.cpp`, run by `tooling/k27/build-native-gop-display.sh` before the build,
-565 checks): rectangles and clamping, the cursor's damage; `round(a*b/255)` exhaustively, the blend against a reference over 200,000
+760 checks): rectangles and clamping, the cursor's damage; `round(a*b/255)` exhaustively, the blend against a reference over 200,000
 pixels, saturation; all 65536 half floats, the extended-range table, every base format; the glyph rectangle from the six words
 (missing, empty, outside, cut, hot spot outside); the cursor off each edge, far away, partly on; 600 random scenes of composed rows and
 damage rectangles against a per-pixel reference (every base format, narrow bases, no base, cursor sub-rectangles); the layer rules;
@@ -249,7 +258,8 @@ none reads a frame the GPU is drawing, with `=2` no swap completes before its jo
 every idle moment and at the end; with `defer=0` (before) the same workload with two framebuffers tears (8 torn reads in the first
 seed): the race of 2026-11-11 reproduced. A slow GPU (frames of 30-90 ms against a 50 ms guard) leaves jobs undrawn, the ticks retry,
 no frame in progress is ever read, and the finished frame ends on the panel. Flip mode never leaves a flipped frame on the panel while a
-cursor is on it.
+cursor is on it. In every mode the family's queue never stalls (a swap queued with none current); with `=2` and in flip mode swaps
+queue behind the one that waits (hundreds of times a run: queue6's climbing `ticks stalled` reproduced and told apart), with `=0` never.
 
 **The next attended run** (the desktop run of gpu-userspace.md, "The next desktop run (2026-11-12)": no argument of this
 section is needed, all is default):
