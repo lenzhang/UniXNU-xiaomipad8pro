@@ -32,6 +32,7 @@ export PIANO_K27_TREE=$T
 export K27_KERNEL=${K273_KERNEL:-$(ls -t "$T"/out/k27/kernel-k273-*-native.macho | head -1)}
 export KC_BASE=$I/kc/kc273-mac17j.bin
 export KC_BUILDER=k27/kc-build273-piano.py
+export KC_COMPACT_LINKEDIT=${KC_COMPACT_LINKEDIT:-1}
 export PIANO_ADT_IDENTITY=configs/k273-adt.toml
 export PIANO_VMM_PRESENT=${PIANO_VMM_PRESENT:-0}
 export PIANO_DATA_PERSIST=${PIANO_DATA_PERSIST:-0}

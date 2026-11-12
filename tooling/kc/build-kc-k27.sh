@@ -48,5 +48,10 @@ grep -q "^native placement ($KC_NATIVE_PLACEMENT)" "${OUT%.bin}.log" \
   || echo "note: the k27 tree's KC builder lacks patches/k27-kc/0001: native kexts placed first fit in link order (patches/k27-kc/README.md)"
 python3 "$PIANO_REPO/tooling/k27/kc-space.py" "$OUT" --brief || true
 python3 "$PIANO_REPO/tooling/k27/check-native-kexts.py" "$PIANO_REPO" --kc-log "${OUT%.bin}.log" || { rm -f "$OUT"; exit 2; }
+# KC_COMPACT_LINKEDIT=1 (the 27.3 line: tooling/k273/build-k273-image.sh): only the kept entries' symbols in __LINKEDIT
+# (tooling/k273/compact-kc-linkedit.py; 27.3's mac17j base carries the symbols of 370 kexts, 21 MB more than ours keeps).
+if [ "${KC_COMPACT_LINKEDIT:-0}" = 1 ]; then
+  python3 "$PIANO_REPO/tooling/k273/compact-kc-linkedit.py" "$OUT" "$OUT.compact" && mv "$OUT.compact" "$OUT" || { rm -f "$OUT" "$OUT.compact"; exit 1; }
+fi
 "$NM" -n "$KERNEL" > "${OUT%.bin}.nm"
 shasum -a 256 "$KERNEL" "$OUT" | tee "${OUT%.bin}.sha256"

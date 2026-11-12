@@ -75,6 +75,16 @@ if [ "$IDENTITY" != vma2 ]; then
   ADT=out/adt/desk-id-$IDENTITY.adt SUFFIX=-$IDENTITY
   python3 tooling/adt/set-identity.py "$ADT_BASE" "$ADT" --identity "$IDENTITY" | head -1
 fi
+# DESK_COMPACT_SEED=1: the input seed without the blocks of the files the Turnip stage replaced (tooling/k27/compact-seed.py: the
+# base seed's old Metal plugin, 32 MB), so the images stay under build-ram-images.py's IMAGE_MAX_BYTES with the 27.3 line's larger
+# kernel collection. A new seed identity (Data volatile, as every staged seed here).
+if [ "${DESK_COMPACT_SEED:-0}" = 1 ]; then
+  mkdir -p out/desk-stage
+  python3 tooling/k27/compact-seed.py "$SEED_IN" out/desk-stage/input-compact/scratch-data.img > out/desk-stage/input-compact.log 2>&1 \
+    || { tail -5 out/desk-stage/input-compact.log >&2; exit 1; }
+  tail -1 out/desk-stage/input-compact.log
+  SEED_IN=out/desk-stage/input-compact/scratch-data.img
+fi
 case $KBTYPE in 40|41|42) ;; *) echo "build-desktop-images: DESK_KEYBOARD_TYPE=$KBTYPE: 40 (ANSI), 41 (ISO) or 42 (JIS)" >&2; exit 1 ;; esac
 WALLPAPER=${DESK_WALLPAPER:-still}
 case $WALLPAPER in still|video) ;; *) echo "build-desktop-images: DESK_WALLPAPER=$WALLPAPER: still or video" >&2; exit 1 ;; esac

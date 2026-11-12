@@ -60,6 +60,12 @@ MU = RESEARCH / 'Mu-Silicium-piano'
 # UniXNU's BootShim (uefi-sheng 66421cb): image size covers shim + FD, the copied FD is cleaned to PoC and the I-cache
 # invalidated before the jump, literal pool before _Payload. Mu-Silicium e51cd877's older BootShim has none of these.
 SHIM_TREE = RESEARCH / 'uefi-sheng'
+# The largest boot image that leaves ABL: the UEFI map's "Kernel" region is 256 MiB at 0xA8000000 (docs/el1-hyp-notes.md), and ABL
+# loads the whole image there; 250 MB keeps a margin below it (2026-11-13: 294952960 bytes stayed in fastboot, 247767040 boot).
+# verify-ram-images.py checks the same limit.
+IMAGE_MAX_BYTES = int(os.environ.get('PIANO_IMAGE_MAX_BYTES', '250000000'))
+MIB = 1 << 20
+KERNEL_FIELD_ALLOWANCE = 4 * MIB   # BootShim + FD (3 MiB) + DTB + the v2 header pages, beside the payload
 MKBOOTIMG = Path(os.environ.get('PIANO_MKBOOTIMG', Path(os.path.expanduser(os.environ.get('PIANO_V110', str(Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/v1.1.0')))) / 'host-tools/aosp-mkbootimg-prefetched/mkbootimg.py'))
 MKBOOTIMG_SHA256 = '37d84b3d162e0bc62e36c1f4e1c63c85ea0caa9f29be023eb2f8efe006ad948c'   # the Ubuntu RAM set's (maintenance-manifest.json)
 V2 = ['--header_version', '2', '--pagesize', '4096', '--base', '0', '--kernel_offset', '0x00008000',
@@ -394,6 +400,13 @@ def macos_payload(work, kc, trust, seed, adt, utc):
         + menu_actions())
     content = sum(p.stat().st_size for p in stage.rglob('*') if p.is_file())
     size_mib = max(64, -(-int(content * 1.08) // (1 << 20)) + 8)
+    # A boot image past IMAGE_MAX_BYTES does not leave ABL (the UEFI's kernel region is 256 MiB: docs/k273-line.md §4); the usual
+    # 8 % + 8 MiB of free space in the FAT is then cut to 2 % + 4 MiB (FAT32's tables and the clusters' rounding need well under 1 %).
+    if size_mib * MIB + KERNEL_FIELD_ALLOWANCE > IMAGE_MAX_BYTES:
+        tight = max(64, -(-int(content * 1.02) // MIB) + 4)
+        print(f'payload: {size_mib} MiB would make the image larger than {IMAGE_MAX_BYTES} bytes: {tight} MiB '
+              f'({content} bytes of files)', file=sys.stderr)
+        size_mib = tight
     image = work / 'payload-macos.img'
     payload(stage, image, 'PIANOESP', size_mib)
     return image, {'cmdline_1cpu': one, 'cmdline_8cpu': smp, 'payload_mib': size_mib, 'fast_boot': fast_boot_level(),
@@ -475,6 +488,14 @@ def main():
     (a.out / f'build-{a.fd_name}.json').write_text(json.dumps(report, indent=2) + '\n')
     for name, info in report['images'].items():
         print(f'{name}: {info["bytes"]} bytes sha256 {info["sha256"]}')
+    # 2026-11-13: ram-k273-desk-dev-s1 (294952960 bytes) never left ABL after fastboot boot's OKAY; the 27.0.1 line's 247767040 boot.
+    too_big = {name: info['bytes'] for name, info in report['images'].items() if info['bytes'] > IMAGE_MAX_BYTES}
+    if too_big:
+        for name in too_big:
+            (a.out / name).unlink()
+        raise SystemExit(f'{", ".join(f"{n} ({b} bytes)" for n, b in too_big.items())}: larger than {IMAGE_MAX_BYTES} bytes '
+                         '(PIANO_IMAGE_MAX_BYTES), which does not leave ABL; removed. A smaller seed (tooling/k27/compact-seed.py), '
+                         'kernel collection or firmware addon.')
 
 
 if __name__ == '__main__':

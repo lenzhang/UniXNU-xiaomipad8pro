@@ -29,6 +29,7 @@ FIELDS = ('magic', 'kernel_size', 'kernel_addr', 'ramdisk_size', 'ramdisk_addr',
 SAME_AS_REFERENCE = ('magic', 'kernel_addr', 'ramdisk_addr', 'second_size', 'second_addr', 'tags_addr', 'page_size',
                      'header_version', 'os_version', 'name', 'recovery_dtbo_size', 'recovery_dtbo_offset', 'header_size',
                      'dtb_addr')
+IMAGE_MAX_BYTES = int(os.environ.get('PIANO_IMAGE_MAX_BYTES', '250000000'))   # build-ram-images.py's
 failures = []
 
 
@@ -155,6 +156,8 @@ def main():
         data = path.read_bytes()
         info = build['images'].get(path.name.replace('-signed.img', '.img'), {})
         print(f'\n== {path.name}  {len(data)} bytes  sha256 {hashlib.sha256(data).hexdigest()}')
+        # build-ram-images.py IMAGE_MAX_BYTES: a larger image stays in ABL (the UEFI's 256 MiB kernel region; 2026-11-13)
+        check(len(data) <= IMAGE_MAX_BYTES, f'image size {len(data)} <= {IMAGE_MAX_BYTES} bytes (PIANO_IMAGE_MAX_BYTES)')
         h = header(data)
         kernel, ramdisk, dtb, end = sections(data, h)
         for field in SAME_AS_REFERENCE:
