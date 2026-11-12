@@ -24,9 +24,13 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   touch screen's orientation on this unit and its controller watchdog recovery are fixed (built, to be run).
 - A USB-C debug console with a small kernel monitor (`package/PianoDwc3`, `tooling/native/usb-console.py`) and the buttons run;
   the monitor's `reset fastboot` returns the tablet to ABL fastboot without buttons.
-- Charging: the battery charges from a USB-C port without the DSP; the DSP charger path starts from macOS and is being tuned.
-- Latest results: [docs/results-2026-11-12.md](docs/results-2026-11-12.md) (the login window renders correctly with its video
-  wallpaper, touch is stable, the speakers play, the rear camera streams, Wi-Fi reaches mission mode); the day before:
+- The installed system (ESP v3.3d, 2026-11-12): 13 GiB of RAM, the machine identity Mac17,11 shown as "Xiaomi Pad 8 Pro" with
+  a "Snapdragon 8 Elite" chip and internal UFS disks ([docs/identity.md](docs/identity.md)), the USB root shell and ssh over the
+  cable, and charging that keeps going (level 2, the DSP started at once: 11-14 W in, no stop).
+- Wi-Fi: the WCN7860's firmware runs and answers (QMI, the transport, its message interface); the first scan stops the
+  firmware: next.
+- Latest results: [docs/results-2026-11-12.md](docs/results-2026-11-12.md) (the installed system's evening and midnight
+  sections; the login window with its video wallpaper, touch, the speakers, the rear camera); the day before:
   [docs/results-2026-11-11.md](docs/results-2026-11-11.md).
 - Most other drivers (power and charging, touch, keyboard cover, backlight, Wi-Fi, audio, sensors, thermal, USB host, video,
   Bluetooth, display processor, ...) are built and linked but inert behind their boot arguments, waiting for their tests on the
