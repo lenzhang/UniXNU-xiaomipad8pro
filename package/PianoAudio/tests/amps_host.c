@@ -166,6 +166,23 @@ int main(void)
     CHECK(audio_amps_start(&g, 160) == AudioAmpsErrStart && !g.started);
     m.fail_after = -1;
     for (int i = 0; i < 4; ++i) CHECK(m.amp[i].reg[FS19XX_REG_DACCTRL] == FS19XX_DACCTRL_MUTE);
+    // levels 8-10: the playing gain at most the cap asked for and never above the core's 192; muted and unmuted while powered;
+    // off and started again without a new configuration (the reset lines stay released)
+    model();
+    audio_amps_init(&g, &io);
+    audio_amps_probe(&g);
+    CHECK(audio_amps_configure(&g, fsm, fsm_bytes, 1) == AudioAmpsOk);
+    CHECK(audio_amps_start_capped(&g, 255, 215) == AudioAmpsOk);
+    for (int i = 0; i < 4; ++i) CHECK(m.amp[i].reg[FS19XX_REG_VOLCTRL] >> 8 == FS19XX_GAIN_CAP && m.amp[i].reg[FS19XX_REG_DACCTRL] == FS19XX_DACCTRL_MUTE);
+    CHECK(audio_amps_unmute(&g) == AudioAmpsOk && audio_amps_mute(&g) == 0);
+    for (int i = 0; i < 4; ++i) CHECK(m.amp[i].reg[FS19XX_REG_DACCTRL] == FS19XX_DACCTRL_MUTE && !(m.amp[i].reg[FS19XX_REG_PWRCTRL] & 1));
+    CHECK(!g.have_first && audio_amps_unmute(&g) == AudioAmpsOk && audio_amps_off(&g) == 0 && !g.started && g.configured == 0xf);
+    CHECK(audio_amps_start_capped(&g, 176, 192) == AudioAmpsOk);
+    for (int i = 0; i < 4; ++i) CHECK(m.amp[i].reg[FS19XX_REG_VOLCTRL] >> 8 == 176 && m.amp[i].released);
+    CHECK(audio_amps_off(&g) == 0 && audio_amps_start_capped(&g, 176, 160) == AudioAmpsOk);
+    for (int i = 0; i < 4; ++i) CHECK(m.amp[i].reg[FS19XX_REG_VOLCTRL] >> 8 == 160);
+    audio_amps_hold(&g);
+    CHECK(audio_amps_mute(&g) == 0 && audio_amps_start_capped(&g, 160, 160) == AudioAmpsErrState);
     printf("PASS amps: %u checks\n", checks);
     return 0;
 }

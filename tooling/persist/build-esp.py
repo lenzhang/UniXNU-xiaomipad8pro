@@ -59,7 +59,8 @@ The amplifiers (docs/drivers/audio.md section 10.3): --audio-preset FSM puts the
 (foursemi/piano/fs19xx.fsm of the tablet's odm_a, 4348 bytes) at EFI/UniXNU/piano-fs19xx.fsm, where PianoAudio level 5 reads it. It is
 checked as the kernel checks it (the container's size field and CRC16) and must be the stock file (size and SHA-256 as Ubuntu publishes
 them for OS3.0.303.0.WPYCNXM) unless --audio-preset-any; only its sha256 goes into the record. It is vendor data: never commit it, and
-keep the image local.
+keep the image local. Since PianoAudio pins the stock file (PianoAudio/fs19xx.fsm, below), the ESP carries it through the firmware
+directory anyway; --audio-preset is the older path, still read second, and the only one for a non-stock preset.
 The firmware (docs/kc-space.md, package/include/PianoFirmware.h): every file the collection's kexts pin (tooling/persist/firmware.py
 finds the pins in the KC, and in --prev-kc's) goes to EFI/UniXNU/firmware/<path>, taken from --firmware-dir (default <--from>/out/
 firmware, where the kexts' build scripts stage them; never committed) after its size and SHA-256 are checked against the pin. A pin

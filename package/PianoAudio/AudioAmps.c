@@ -135,10 +135,13 @@ int audio_amps_all_down(const AudioAmps *g)
     return 1;
 }
 
-int audio_amps_start(AudioAmps *g, unsigned gain)
+int audio_amps_start(AudioAmps *g, unsigned gain) {return audio_amps_start_capped(g, gain, AUDIO_AMPS_TEST_GAIN);}
+
+int audio_amps_start_capped(AudioAmps *g, unsigned gain, unsigned cap)
 {
     if (g->configured != (1u << AUDIO_AMPS) - 1u || g->started) return AudioAmpsErrState;
-    if (gain > AUDIO_AMPS_TEST_GAIN) gain = AUDIO_AMPS_TEST_GAIN;
+    if (cap > FS19XX_GAIN_CAP) cap = FS19XX_GAIN_CAP;
+    if (gain > cap) gain = cap;
     g->have_first = 0;
     int r = AudioAmpsOk;
     for (unsigned s = 0; !r && s < AUDIO_AMPS; ++s) {
@@ -160,6 +163,16 @@ int audio_amps_unmute(AudioAmps *g)
     done(g);
     if (r) audio_amps_off(g);
     return r;
+}
+
+unsigned audio_amps_mute(AudioAmps *g)
+{
+    unsigned bad = 0;
+    for (unsigned s = 0; s < AUDIO_AMPS; ++s)
+        if ((g->started >> s & 1u) && fs19xx_mute(&g->amp[s], 1)) bad |= 1u << s;
+    g->have_first = 0;
+    done(g);
+    return bad;
 }
 
 unsigned audio_amps_check(AudioAmps *g)

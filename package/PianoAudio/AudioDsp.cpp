@@ -4,8 +4,10 @@
 // qcom,intents), PianoPower's health is watched through AudioDspLink.h's guard, and one question goes to the DSP's graph manager:
 // is the framework ready (APM_CMD_GET_SPF_STATE from the port set's APM port: Ubuntu's port 1 by default, piano-audio-ports=N for
 // another, piano-audio-ports-try=1 to walk the others while nobody answers). Nothing else is sent at this level.
-// Levels 4-7 (piano_audio_levels, AudioSession.h) then run on the same channel, inbox and guard, with the hardware of AudioBoard.cpp.
-// PianoAudio never starts, stops or restarts the DSP and votes nothing: PianoPower owns it (piano-power>=2 in the same boot).
+// Levels 4-7 (piano_audio_levels, AudioSession.h) then run on the same channel, inbox and guard, with the hardware of AudioBoard.cpp;
+// from piano-audio=8 levels 8-10 (AudioLive.h) follow for the rest of the boot on what levels 5 and 6 set up, fed by the macOS
+// devices through the dsp transport defined here (AudioPcm.h). PianoAudio never starts, stops or restarts the DSP and votes nothing:
+// PianoPower owns it (piano-power>=2 in the same boot).
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
 #include <libkern/libkern.h>
@@ -15,6 +17,8 @@
 #include "AudioLog.h"
 #include "AudioBoard.h"
 #include "AudioDspLink.h"
+#include "AudioLive.h"
+#include "AudioPcm.h"
 #include "AudioSession.h"
 
 extern "C" {
@@ -22,6 +26,8 @@ extern "C" {
 volatile uint32_t piano_audio_dsp_word = 0;
 // Post-mortem: levels 4-7: the session's phase | the results of levels 4..7 << 8 (two bits each: AudioLevel*).
 volatile uint32_t piano_audio_levels_word = 0;
+// Post-mortem: levels 8-10: the speaker path's state | the mic path's << 4 | the speaker's mode << 8 | its starts << 16.
+volatile uint32_t piano_audio_live_word = 0;
 }
 
 namespace {
@@ -160,13 +166,141 @@ uint32_t levelsWord(const AudioSession &s)
     return w;
 }
 
+// ------------------------------------------------------------------------------------------------ levels 8-10
+// The dsp transport (AudioPcm.h): the devices' engine threads hand their periods to AudioLive.h's shared state; the first sound
+// while the speaker path is down, and every start or stop of a device, wakes the live thread (which otherwise sleeps 2 s).
+AudioLiveShared *gShared;
+AudioLive *gLive;
+IOLock *gWakeLock;
+bool gWake;
+
+void liveWake()
+{
+    if (!gWakeLock) return;
+    IOLockLock(gWakeLock);
+    gWake = true;
+    IOLockWakeup(gWakeLock, &gWake, true);
+    IOLockUnlock(gWakeLock);
+}
+
+void liveSleep(uint32_t ms)
+{
+    IOLockLock(gWakeLock);
+    if (!gWake) {
+        uint64_t deadline;
+        clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+        IOLockSleepDeadline(gWakeLock, &gWake, deadline, THREAD_UNINT);
+    }
+    gWake = false;
+    IOLockUnlock(gWakeLock);
+}
+
+void dspRunning(void *, int output, int input)
+{
+    audio_live_running(gShared, output, input);
+    liveWake();
+}
+uint32_t dspPlay(void *, const int16_t *stereo, uint32_t frames)
+{
+    int wake = 0;
+    const uint32_t n = audio_live_play(gShared, stereo, frames, nowMs(), &wake);
+    if (wake) liveWake();
+    return n;
+}
+uint32_t dspCapture(void *, int16_t *mono, uint32_t frames) {return audio_live_capture(gShared, mono, frames);}
+void dspControl(void *, int volume, int mute)
+{
+    audio_live_control(gShared, volume, mute);
+    liveWake();   // an unmute while sound plays brings the speaker path up again
+}
+const PianoPcmTransport kDsp = {"dsp", nullptr, AUDIO_LIVE_OUTPUT_LATENCY, AUDIO_LIVE_INPUT_LATENCY, dspRunning, dspPlay, dspCapture,
+                                dspControl};
+
+void liveSummary(const AudioLive &l, char *line, size_t size)
+{
+    snprintf(line, size, "level %u: speaker %s (%u starts, %u periods, %u with sound, %u underruns, %u slips), mic %s (%u starts, %u periods); "
+             "frames offered %llu, taken %llu, dropped %llu", l.cfg.level, audio_live_state(l.spk_state), l.spk_starts, l.periods,
+             l.sound_periods, l.underruns, l.drops + l.repeats, audio_live_state(l.mic_state), l.mic_starts, l.mic_periods,
+             (unsigned long long)l.sh->offered, (unsigned long long)l.sh->taken, (unsigned long long)l.sh->dropped);
+}
+
+uint32_t liveWord(const AudioLive &l)
+{
+    return (uint32_t(l.spk_state) & 0xfu) | (uint32_t(l.mic_state) & 0xfu) << 4 | (uint32_t(l.spk_mode) & 0xffu) << 8 | l.spk_starts << 16;
+}
+
+// For the rest of the boot (until PianoPower's health stops it): the live paths on the session's hardware.
+void liveRun(const PianoAudioLevelArgs *a)
+{
+    AudioLiveConfig lc;
+    audio_live_defaults(&lc, a->level);
+    if (a->liveGain) lc.gain = a->liveGain;
+    if (a->liveCeilingDb) lc.ceiling = audio_ceiling_db(a->liveCeilingDb);
+    if (a->liveIdleMs) lc.idle_ms = a->liveIdleMs;
+    gLive = IOMallocType(AudioLive);
+    if (!gLive || audio_live_init(gLive, &lc, &gSession, gShared)) {
+        piano_audio_log("live: levels 8-10 not run: %s", gLive ? "the session did not hand the hardware over" : "no memory");
+        if (gLive) IOFreeType(gLive, AudioLive);
+        gLive = nullptr;
+        return;
+    }
+    uint8_t in[AUDIO_INBOX_BYTES];
+    PianoAdspHealth h;
+    AdgObservation o;
+    char line[300] = "", last[300] = "";
+    uint32_t lastWord = ~0u;
+    while (!gLive->finished) {
+        const uint32_t now = nowMs();
+        bzero(&h, sizeof h);
+        piano_adsp_health(&h);
+        observe(o, h);
+        for (uint32_t n; (n = audio_inbox_get(&gInbox, in, sizeof in)) != 0;) audio_live_receive(gLive, in, n, now);
+        const uint32_t d = audio_live_tick(gLive, &o, now);
+        const uint32_t word = liveWord(*gLive);
+        piano_audio_live_word = word;
+        if (word != lastWord) {   // the registry follows the paths' states (not every period)
+            liveSummary(*gLive, line, sizeof line);
+            if (strcmp(line, last)) piano_audio_set_property("piano-audio-live", line);
+            strlcpy(last, line, sizeof last);
+            lastWord = word;
+        }
+        if (!d) break;
+        liveSleep(d);
+    }
+    liveSummary(*gLive, line, sizeof line);
+    piano_audio_set_property("piano-audio-live", line);
+    piano_audio_log("live: %s", line);
+}
+
 }  // namespace
+
+extern "C" const PianoPcmTransport *piano_pcm_dsp(void) {return gShared ? &kDsp : nullptr;}
+
+extern "C" int piano_audio_live_prepare(uint32_t volume_percent)
+{
+    if (gShared) return 0;
+    gWakeLock = IOLockAlloc();
+    AudioLiveShared *sh = gWakeLock ? IOMallocType(AudioLiveShared) : nullptr;
+    int16_t *out = sh ? static_cast<int16_t *>(IOMallocData(AUDIO_LIVE_RING_BYTES)) : nullptr;
+    int16_t *in = out ? static_cast<int16_t *>(IOMallocData(AUDIO_LIVE_MIC_RING_BYTES)) : nullptr;
+    if (!in) {   // kept for the boot otherwise (the devices' engines may run at any time)
+        if (out) IOFreeData(out, AUDIO_LIVE_RING_BYTES);
+        if (sh) IOFreeType(sh, AudioLiveShared);
+        return -1;
+    }
+    bzero(out, AUDIO_LIVE_RING_BYTES);
+    bzero(in, AUDIO_LIVE_MIC_RING_BYTES);
+    audio_live_shared_init(sh, out, in, audio_volume_q15(volume_percent > 100 ? 100 : int(volume_percent)));
+    gShared = sh;
+    return 0;
+}
 
 int piano_audio_levels(const PianoAudioLevelArgs *a, char *summary, size_t size)
 {
     AudioSessionConfig c;
     audio_session_defaults(&c);
-    c.level = a->level;
+    c.level = a->level > 7 ? 7 : a->level;
+    c.keep = a->level >= 8 && gShared;
     c.dsp = a->dsp && gChannel && gLink.state == AlReady;
     c.ports = gLink.set >= 0 ? gLink.set : AudioPortsUbuntu;
     c.lpass_read = int(a->lpassRead);
@@ -181,7 +315,7 @@ int piano_audio_levels(const PianoAudioLevelArgs *a, char *summary, size_t size)
     AudioSessionOps ops = {};
     ops.log = sessionLog;
     ops.send = sessionSend;
-    const pianoaudio::BoardArgs b = {a->level, a->i2cSwap, a->i2cHalfUs, a->smmu};
+    const pianoaudio::BoardArgs b = {a->level, a->i2cSwap, a->i2cHalfUs, a->smmu, a->micGain};
     pianoaudio::boardSetup(ops, b);
     audio_session_init(&gSession, &c, &ops, c.dsp ? &gLink.guard : nullptr);
     // A budget well beyond what the levels need (level 6's silence and level 7's walk are seconds; every command is answered or
@@ -213,7 +347,6 @@ int piano_audio_levels(const PianoAudioLevelArgs *a, char *summary, size_t size)
     piano_audio_levels_word = levelsWord(gSession);
     char board[400];
     pianoaudio::boardSummary(board, sizeof board);
-    pianoaudio::boardTeardown();
     size_t n = 0;
     int failed = 0;
     for (unsigned l = 4; l <= c.level && l <= 7 && n < size; ++l) {
@@ -221,5 +354,17 @@ int piano_audio_levels(const PianoAudioLevelArgs *a, char *summary, size_t size)
         failed |= gSession.result[l] == AudioLevelFailed;
     }
     piano_audio_log("levels: %s; %s", summary, board);
+    if (a->level >= 8) {
+        if (gSession.kept) {
+            piano_audio_set_property("piano-audio-levels", summary);
+            piano_audio_log("levels 8-%u: the macOS devices on the DSP (the hardware of levels 5 and 6 kept)", a->level);
+            liveRun(a);
+        } else {
+            piano_audio_log("levels 8-%u: not run: %s", a->level, !gShared ? "no dsp transport" : "levels 4, 5 and 6 must pass in the same boot");
+        }
+        if (n < size) n += size_t(snprintf(summary + n, size - n, ", 8-%u %s", a->level, gSession.kept ? "ran" : "not run"));
+        failed |= !gSession.kept;
+    }
+    pianoaudio::boardTeardown();
     return failed ? -1 : 0;
 }

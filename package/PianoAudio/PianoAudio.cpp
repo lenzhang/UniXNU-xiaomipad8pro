@@ -20,6 +20,13 @@
 //   piano-audio=6  also the speaker graphs with a silent stream (the amplifiers stay down) and the microphone graphs opened and
 //                  closed: the TDM pins muxed, the DSP's PCM streams through bypass, the buffers in the audio slice (PianoDspMemory.h).
 //   piano-audio=7  also the tone walk, only with piano-audio-tone=1 (<= -20 dBFS, <= 3 s of tone, gain 160, 5 s watchdog): attended.
+//   piano-audio=8  levels 4-6 (and 7 with piano-audio-tone=1), then for the rest of the boot the macOS Speaker on the DSP (AudioLive.h:
+//                  the dsp transport; the speaker plan comes up with the first sound and goes down after piano-audio-idle ms without
+//                  one): at this level gain 160 and full scale at -20 dBFS. Sound comes out of the speakers.
+//   piano-audio=9  also the daily level: piano-audio-gain=G (default 160, never above 192), piano-audio-ceiling=DB (full scale at -DB
+//                  dBFS, 1..40, default 6), piano-audio-volume=P (the kernel's master volume, percent, default 100) and the Speaker
+//                  device's properties piano-audio-volume / piano-audio-mute.
+//   piano-audio=10 also the Mic: the capture plan with the VA macro's DMIC path (piano-audio-mic-gain=G, 0..124, default 124 = +40 dB).
 // Other arguments: piano-audio-delay=S (wait S seconds first, default 0), piano-audio-repeat=S with piano-audio-samples=N (resample
 // the pins every S s, N times, default 3, one summary line each), piano-audio-smmu=0 (skip the SMMU reads; level 6 leaves the SMMU
 // alone), piano-audio-dsp=0 (skip the DSP link), piano-audio-dsp-wait=S (give it up after S seconds, default 300),
@@ -27,8 +34,8 @@
 // devices), piano-audio-ports=N (the GPR port set: 0 Ubuntu's, 1 sheng's, 2 SunUEFI's; AudioDspLink.h), piano-audio-ports-try=1
 // (walk the other sets while nobody answers), piano-audio-lpass-read=0, piano-audio-preset-any=1, piano-audio-i2c-swap=0|1|2 (2),
 // piano-audio-i2c-half=US (5), piano-audio-mic=0, piano-audio-silence=MS (2000), piano-audio-tone-mask=M (0xf),
-// piano-audio-tone-ms=MS (600), piano-audio-tone-gap=MS (150), piano-audio-tone-gain=G (160, never more). docs/drivers/audio.md
-// section 6 has them all. Without piano-audio the driver declines in probe() and maps nothing.
+// piano-audio-tone-ms=MS (600), piano-audio-tone-gap=MS (150), piano-audio-tone-gain=G (160, never more), piano-audio-idle=MS (3000).
+// docs/drivers/audio.md section 6 has them all. Without piano-audio the driver declines in probe() and maps nothing.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -52,7 +59,7 @@ volatile int32_t piano_audio_stage = 0;
 namespace {
 
 struct Args {
-  uint32_t level, smmu, delay, repeat, samples, dsp, dspWait, settle, device, power;
+  uint32_t level, smmu, delay, repeat, samples, dsp, dspWait, settle, device, power, volume;
   uint32_t ports, portsTry;
   PianoAudioLevelArgs levels;
 };
@@ -86,7 +93,7 @@ void readArgs()
   if (gArgs.ports > 2) gArgs.ports = 0;
   gArgs.portsTry = bootArg("piano-audio-ports-try", 0);
   PianoAudioLevelArgs &l = gArgs.levels;
-  l.level = gArgs.level > 7 ? 7 : gArgs.level;
+  l.level = gArgs.level > 10 ? 10 : gArgs.level;
   l.lpassRead = bootArg("piano-audio-lpass-read", 1);
   l.presetAny = bootArg("piano-audio-preset-any", 0);
   l.mic = bootArg("piano-audio-mic", 1);
@@ -99,6 +106,11 @@ void readArgs()
   l.i2cSwap = bootArg("piano-audio-i2c-swap", 2);
   l.i2cHalfUs = bootArg("piano-audio-i2c-half", 5);
   l.smmu = gArgs.smmu;
+  l.liveGain = bootArg("piano-audio-gain", 0);         // capped at 160 at level 8, 192 from level 9 (AudioLive.c)
+  l.liveCeilingDb = bootArg("piano-audio-ceiling", 0); // 1..40 dB below full scale, level 9 and up; 0: the level's own
+  l.liveIdleMs = bootArg("piano-audio-idle", 0);
+  l.micGain = bootArg("piano-audio-mic-gain", 0);
+  gArgs.volume = bootArg("piano-audio-volume", 100);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -113,6 +125,13 @@ void note(const char *fmt, ...)
 }
 
 }  // namespace
+
+IOService *gService;
+
+extern "C" void piano_audio_set_property(const char *key, const char *value)
+{
+  if (gService) gService->setProperty(key, value);
+}
 
 extern "C" void piano_audio_log(const char *fmt, ...)
 {
@@ -292,14 +311,18 @@ bool PianoAudio::start(IOService *provider)
   if (!IOService::start(provider)) return false;
   note("start: piano-audio=%u smmu=%u delay=%u repeat=%u samples=%u (4 x FS19xx on i2c hub 0 %#x, secondary TDM on gpio121-124)",
        gArgs.level, gArgs.smmu, gArgs.delay, gArgs.repeat, gArgs.samples, 0x980000u);
-  if (gArgs.level > 7) note("piano-audio=%u: levels 8 and up are not built (docs/drivers/audio.md section 8); running 1-7", gArgs.level);
+  if (gArgs.level > 10) note("piano-audio=%u: levels 11 and up are not built (docs/drivers/audio.md section 8); running 1-10", gArgs.level);
   note("level 1: loads only, nothing written%s%s", gArgs.level >= 2 ? "; level 2: the DSP link (one readiness query)" : "",
        gArgs.level >= 3 && gArgs.device ? "; level 3: the macOS devices on the null transport" : "");
   if (gArgs.level >= 4)
     note("levels 4-%u: %s%s%s%s", gArgs.levels.level, "4 the LPASS clocks (PRM)", gArgs.level >= 5 ? ", 5 the amplifiers (powered down)" : "",
          gArgs.level >= 6 ? ", 6 the graphs with silence" : "",
          gArgs.level >= 7 ? (gArgs.levels.tone == 1 ? ", 7 the TONE WALK (piano-audio-tone=1: attended)" : ", 7 not without piano-audio-tone=1") : "");
+  if (gArgs.level >= 8)
+    note("levels 8-%u: the Speaker%s on the DSP for the rest of the boot (SOUND from the speakers once levels 4-6 passed); %s", gArgs.levels.level,
+         gArgs.level >= 10 ? " and the Mic" : "", piano_audio_live_prepare(gArgs.volume) ? "no memory for the dsp transport: the devices stay silent" : "the dsp transport");
   setProperty("piano-audio", gArgs.level, 32);
+  gService = this;
   thread_t t = nullptr;
   if (kernel_thread_start(&PianoAudio::thread, this, &t) != KERN_SUCCESS) {
     stage(-1, "no thread");
@@ -331,15 +354,17 @@ void PianoAudio::devices()
     return;
   }
   matched->release();
-  const PianoPcmTransport *transport = piano_pcm_null();
+  const PianoPcmTransport *dsp = gArgs.level >= 8 ? piano_pcm_dsp() : nullptr;
+  const PianoPcmTransport *transport = dsp ? dsp : piano_pcm_null();
   const int r = piano_audio_devices_attach(transport);
-  char line[160];
+  char line[200];
   if (r < 0)
     snprintf(line, sizeof line, "none (stage %d: %s)", piano_audio_devices_stage(),
              piano_audio_devices_stage() == -2 ? "IOAudio2Family's IOAudio2Device / IOAudio2DeviceUserClient not found" : "publishing failed");
   else
-    snprintf(line, sizeof line, "%s%s%s as IOAudio2Devices on the %s transport (silence: nothing reaches the hardware)",
-             r & 1 ? "Speaker" : "", r == 3 ? " and " : "", r & 2 ? "Mic" : "", transport->name);
+    snprintf(line, sizeof line, "%s%s%s as IOAudio2Devices on the %s transport (%s)", r & 1 ? "Speaker" : "", r == 3 ? " and " : "",
+             r & 2 ? "Mic" : "", transport->name,
+             dsp ? "the speakers once levels 4-6 passed and the speaker plan runs; silence until then" : "silence: nothing reaches the hardware");
   setProperty("piano-audio-devices", line);
   note("devices: %s", line);
 }

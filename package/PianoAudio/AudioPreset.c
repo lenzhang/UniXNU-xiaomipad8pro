@@ -21,7 +21,7 @@ const char *audio_preset_load_error(int error)
 {
     switch (error) {
     case AP_OK: return "ok";
-    case AP_NOT_FOUND: return "no " AUDIO_PRESET_PATH " on the ESP (tooling/persist/build-esp.py --audio-preset)";
+    case AP_NOT_FOUND: return "no " AUDIO_PRESET_PATH " on the ESP either (stage the stock file for the pin, or build-esp.py --audio-preset)";
     case AP_EMPTY: return "the file on the ESP is empty";
     case AP_TOO_BIG: return "the file on the ESP is larger than 64 KiB";
     case AP_READ: return "the ESP could not be read";

@@ -372,6 +372,86 @@ static void testPump(void)
     CHECK(p.next == 7 && p.in_flight == 4);
 }
 
+// The capture pump (level 10): READs of empty slots to RD_SH, READ_DONE with the bytes filled; the bounds of what it may claim.
+static void testCapturePump(void)
+{
+    ArPump p;
+    CHECK(ar_pump_init_capture(&p, 0x19da10000ull, 0x99, AR_PORT_DATA, 8, 1920, 4, 250) == 0 && p.capture && p.token_base == 0x5000u);
+    uint8_t b[GPR_MAX_PACKET], rsp[GPR_MAX_PACKET];
+    GprPacket q;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t n = ar_pump_write(&p, b, sizeof b, 10);
+        CHECK(n && gpr_decode(b, n, &q) == GprOk && q.opcode == AR_OP_READ && q.dst_port == AR_IID_CAP_SHMEM && q.src_port == AR_PORT_DATA);
+        CHECK(le32(b + 24) == 0x9da10000u + 1920u * (uint32_t)i && le32(b + 28) == 1 && le32(b + 32) == 0x99 && le32(b + 36) == 1920);
+        CHECK(q.token == 0x5000u + (uint32_t)i);
+    }
+    ArAnswer a;
+    GprPacket r = {.dst_domain = GPR_DOMAIN_APPS, .src_domain = GPR_DOMAIN_ADSP, .src_port = AR_IID_CAP_SHMEM, .dst_port = AR_PORT_DATA,
+                   .token = 0x5001u, .opcode = AR_OP_READ_DONE};
+    uint32_t w[6] = {0, 0x9da10000u + 1920u, 1, 0x99, 1920, 0};
+    uint32_t m = gpr_encode(rsp, sizeof rsp, &r, w, 24);
+    CHECK(ar_parse(rsp, m, &a) == ArReadDone && ar_pump_done(&p, &a) == 1 && p.last_slot == 1 && p.in_flight == 3);
+    // a WRITE_DONE is not this pump's; more bytes than the slot, an offset past it: refused
+    r.opcode = AR_OP_WRITE_DONE;
+    uint32_t wd[4] = {0x9da10000u, 1, 0x99, 0};
+    m = gpr_encode(rsp, sizeof rsp, &r, wd, 16);
+    CHECK(ar_parse(rsp, m, &a) == ArWriteDone && ar_pump_done(&p, &a) == 0);
+    r.opcode = AR_OP_READ_DONE; r.token = 0x5002u; w[1] = 0x9da10000u + 3840u; w[4] = 1921;
+    m = gpr_encode(rsp, sizeof rsp, &r, w, 24);
+    CHECK(ar_parse(rsp, m, &a) == ArReadDone && ar_pump_done(&p, &a) == -1 && p.errors == 1);
+    r.token = 0x5003u; w[1] = 0x9da10000u + 5760u; w[4] = 960; w[5] = 1000;
+    m = gpr_encode(rsp, sizeof rsp, &r, w, 24);
+    CHECK(ar_parse(rsp, m, &a) == ArReadDone && ar_pump_done(&p, &a) == -1 && p.errors == 2);
+    // a READ_DONE with an error status
+    r.token = 0x5000u; w[0] = 7; w[1] = 0x9da10000u; w[4] = 1920; w[5] = 0;
+    m = gpr_encode(rsp, sizeof rsp, &r, w, 24);
+    CHECK(ar_parse(rsp, m, &a) == ArReadDone && ar_pump_done(&p, &a) == -1 && p.last_status == 7 && p.in_flight == 0);
+}
+
+// Level 10's capture plan: the fourteen commands with the VA macro's DMIC path between the prepares and the starts.
+static int va_log_on(void *owner) {(void)owner; snprintf(lg[lines++], sizeof lg[0], "VA ON"); return 0;}
+static int va_log_off(void *owner) {(void)owner; snprintf(lg[lines++], sizeof lg[0], "VA OFF"); return 0;}
+static int va_fails(void *owner) {(void)owner; snprintf(lg[lines++], sizeof lg[0], "VA ON"); return -1;}
+static void testMicLivePlan(void)
+{
+    ArMicPlan mp;
+    ar_mic_defaults(&mp);
+    mp.buffer_phys = 0x9da10000ull; mp.buffer_bytes = 8 * 1920;
+    unsigned count;
+    const ArStep *steps = ar_mic_live_steps(&count);
+    CHECK(count == 15 && !steps[12].build && steps[12].local && steps[12].undo_local && !strcmp(steps[13].name, "start mic device"));
+    // without the callbacks the local step does nothing: the fourteen commands as ar_mic_steps sends them
+    static const char *up[] = {"PRM VOTE 1", "PRM VOTE 2", "PRM REQ 0x30c 19200000", "OPEN 0x4008", "CFG 0x6080", "CFG 0x6081",
+                               "OPEN 0x4003", "CFG 0x6021", "CFG 0x6020", "MAP 0x19da10000", "PREPARE 0x4008", "PREPARE 0x4003",
+                               "START 0x4008", "START 0x4003"};
+    ArSeq s;
+    ar_seq_init(&s, steps, count, AR_PORT_APM, AR_PORT_PRM, 0x900, &mp);
+    lines = 0;
+    struct Dsp d = healthy();
+    drive(&s, &d);
+    CHECK(s.state == ArSeqUp && lines == 14);
+    for (unsigned i = 0; i < 14; ++i) CHECK(!strcmp(lg[i], up[i]));
+    // with them: on between "PREPARE 0x4003" and "START 0x4008"; off after "STOP 0x4008", before the unmap
+    mp.va_on = va_log_on; mp.va_off = va_log_off;
+    ar_seq_init(&s, steps, count, AR_PORT_APM, AR_PORT_PRM, 0x900, &mp);
+    lines = 0;
+    d = healthy();
+    drive(&s, &d);
+    CHECK(s.state == ArSeqUp && lines == 15 && !strcmp(lg[12], "VA ON") && !strcmp(lg[13], "START 0x4008"));
+    ar_seq_stop(&s);
+    drive(&s, &d);
+    CHECK(s.state == ArSeqDown && !strcmp(lg[15], "STOP 0x4003") && !strcmp(lg[16], "STOP 0x4008") && !strcmp(lg[17], "VA OFF") &&
+          !strcmp(lg[18], "UNMAP 0x77"));
+    // the DMIC path failing: undone too (it may have half run), then everything before it
+    mp.va_on = va_fails;
+    ar_seq_init(&s, steps, count, AR_PORT_APM, AR_PORT_PRM, 0x900, &mp);
+    lines = 0;
+    d = healthy();
+    drive(&s, &d);
+    CHECK(s.state == ArSeqFailed && s.error == ArSeqErrLocal && s.failed_step == 12 && !strcmp(lg[12], "VA ON") && !strcmp(lg[13], "VA OFF"));
+    CHECK(!strcmp(lg[14], "UNMAP 0x77"));
+}
+
 // ---- level 4's PRM plans and the microphone plan: the same rule, other steps. A plan's expected forward lines and the undo of each.
 struct PlanCase {const char *const *up, *const *undo; unsigned n;};
 static void run_plan(const ArStep *steps, unsigned count, void *context, uint32_t apm, uint32_t prm, const struct PlanCase *pc)
@@ -499,6 +579,8 @@ int main(void)
     testPump();
     testClockPlans();
     testMicPlan();
+    testCapturePump();
+    testMicLivePlan();
     printf("PASS sequence: %u checks\n", checks);
     return 0;
 }

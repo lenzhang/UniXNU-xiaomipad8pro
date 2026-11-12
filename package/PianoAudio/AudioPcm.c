@@ -26,7 +26,7 @@ static uint32_t null_capture(void *context, int16_t *mono, uint32_t frames)
     return 0;
 }
 
-static const PianoPcmTransport kNull = {"null", 0, 0, 0, null_running, null_play, null_capture};
+static const PianoPcmTransport kNull = {"null", 0, 0, 0, null_running, null_play, null_capture, 0};
 
 const PianoPcmTransport *piano_pcm_null(void) {return &kNull;}
 

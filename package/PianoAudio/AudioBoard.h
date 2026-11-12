@@ -14,6 +14,7 @@ struct BoardArgs {
   uint32_t i2cSwap;     // 0: SDA on gpio64 (the DT's lane order), 1: on gpio65, 2: gpio64, and gpio65 once when no amplifier answers
   uint32_t i2cHalfUs;   // the software bus's half bit time (5: about 80 kHz)
   uint32_t smmu;        // 0: the SMMU is left alone (the streams must bypass already)
+  uint32_t micGain;     // level 10: the VA decimators' gain (AudioVa.h: 0..124, 84 = 0 dB; 0 means the default 124)
 };
 
 // Fills the hardware half of ops (what the level needs; the rest stays null and the session reports it).

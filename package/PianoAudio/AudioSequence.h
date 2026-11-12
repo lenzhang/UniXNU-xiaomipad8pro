@@ -108,32 +108,49 @@ typedef struct {
     uint64_t buffer_phys;    /* the capture buffer: below 4 GiB, 4 KiB aligned */
     uint32_t buffer_bytes;
     uint32_t stream_id;      /* 0x1001 */
+    /* Level 10 (ar_mic_live_steps): the VA macro's DMIC path (the decimators, the DMIC clocks, the LPI DMIC pins) set up while the
+     * PRM votes and the mclk hold, after both graphs are prepared and before they start; undone after they stopped. 0 or an
+     * error; null: nothing to do. */
+    void *owner;
+    int (*va_on)(void *owner);
+    int (*va_off)(void *owner);
 } ArMicPlan;
 const ArStep *ar_mic_steps(unsigned *count, unsigned *prepared);
+/* Level 10's capture plan: ar_mic_steps' fourteen commands with the VA macro's DMIC path (va_on / va_off, a local step) between
+ * "prepare capture" and "start mic device". */
+const ArStep *ar_mic_live_steps(unsigned *count);
 void ar_mic_defaults(ArMicPlan *p);
 
 /* ---- the period pump: a running stream keeps up to `depth` periods queued at the DSP, each slot of the mapped buffer written by the
  * owner before its WRITE goes out, refilled as WRITE_DONE returns it. A WRITE_DONE with an error, for an unknown slot, or a period out
- * longer than late_ms is an error: the owner then zeroes, aborts the sequence and powers the amplifiers down. */
+ * longer than late_ms is an error: the owner then zeroes, aborts the sequence and powers the amplifiers down.
+ * The capture pump (level 10) is the same with READs of empty slots to the capture stream's RD_SH module, answered by READ_DONE with
+ * the bytes the DSP filled (data_bytes from offset into the slot); the owner copies them out before the slot goes out again. */
 #define AR_PUMP_MAX_SLOTS 16u
 typedef struct {
     uint64_t base;           /* the buffer's DSP address */
     uint32_t handle, port, token_base;
     uint32_t slots, period_bytes, depth, late_ms;
+    int capture;             /* READs (the capture stream) instead of WRITEs */
     uint32_t next;           /* the slot the next WRITE uses */
     uint32_t in_flight;
     uint32_t sent_ms[AR_PUMP_MAX_SLOTS];
     uint8_t busy[AR_PUMP_MAX_SLOTS];
+    uint32_t last_slot;      /* the slot of the last period returned */
     uint32_t sent, returned, errors, late, last_status;
 } ArPump;
 /* 0, or -1 for a geometry that does not fit (slots 2..16, depth 1..slots, period > 0). */
 int ar_pump_init(ArPump *p, uint64_t base, uint32_t handle, uint32_t port, uint32_t slots, uint32_t period_bytes, uint32_t depth,
                  uint32_t late_ms);
+/* The capture pump: the same geometry, READs (tokens from 0x5000). */
+int ar_pump_init_capture(ArPump *p, uint64_t base, uint32_t handle, uint32_t port, uint32_t slots, uint32_t period_bytes, uint32_t depth,
+                         uint32_t late_ms);
 /* The slot the owner fills next, or -1 when `depth` periods are in flight (or that slot is still the DSP's). */
 int ar_pump_free_slot(const ArPump *p);
-/* The WRITE for that slot (filled now), stamped now_ms; returns its size or 0. */
+/* The WRITE (the capture pump: the READ) for that slot, stamped now_ms; returns its size or 0. */
 uint32_t ar_pump_write(ArPump *p, uint8_t *out, uint32_t capacity, uint32_t now_ms);
-/* A parsed answer: 1 a period returned, 0 not this pump's, -1 an error (bad status, an unknown or idle slot). */
+/* A parsed answer: 1 a period returned (its slot in last_slot), 0 not this pump's, -1 an error (bad status, an unknown or idle slot;
+ * a capture's READ_DONE that claims more bytes than its slot holds). */
 int ar_pump_done(ArPump *p, const ArAnswer *a);
 /* -1 when a period has been out more than late_ms at now_ms, else 0. */
 int ar_pump_check(ArPump *p, uint32_t now_ms);

@@ -4,7 +4,8 @@
 // coreaudiod matches IOServiceMatching("IOAudio2Device") + IOObjectConformsTo), opened through an IOAudio2DeviceUserClient.
 // Everything above is stock: the HAL's HALS_IOA2Device/Engine, VirtualAudio (routes, ports, volume).
 // The IOAudio2Device top half of the VM-era audio kext (provenance: UPSTREAM), its virtio-snd transport replaced by AudioPcm.h's
-// interface: the null transport now (the devices run on their own clock into silence), the DSP's from level 7. The ABI notes below
+// interface: the null transport at levels 3-7 (the devices run on their own clock into silence), the DSP's from level 8 (AudioDsp.cpp,
+// AudioLive.h: the Speaker's periods to the speakers, the Mic's from the DMICs at level 10; the devices' clock stays the host's). The ABI notes below
 // come with it.
 //
 // VirtualAudio's DeviceFactory picks the physical-device class by the device UID string, with a single-transducer class per kind. Two
@@ -233,10 +234,23 @@ bool PianoAudioDevice::start(IOService *provider) {
 
 // The one property the HAL writes (HALB_UCObject::SetProperty, through the connection): "exclusive access owner", the pid holding
 // hog mode, or -1. VirtualAudio takes hog mode on the device before it builds its ports, and gives up ("Unable to take hog mode") if
-// it is refused. Other keys are accepted and ignored.
+// it is refused. On the Speaker, the kernel's own master volume and mute of level 9 (the transport's control; root through
+// IORegistryEntrySetCFProperties on the device): "piano-audio-volume" (0..100) and "piano-audio-mute" (a boolean). Other keys are
+// accepted and ignored.
 IOReturn PianoAudioDevice::apply(OSObject *properties, IORegistryEntry *client) {
     OSDictionary *d = OSDynamicCast(OSDictionary, properties);
     if (!d) return kIOReturnBadArgument;
+    if (!isInput && gTransport->control) {
+        OSNumber *volume = OSDynamicCast(OSNumber, d->getObject("piano-audio-volume"));
+        OSBoolean *mute = OSDynamicCast(OSBoolean, d->getObject("piano-audio-mute"));
+        const int v = volume && volume->unsigned32BitValue() <= 100 ? int(volume->unsigned32BitValue()) : -1;
+        const int m = mute ? (mute->isTrue() ? 1 : 0) : -1;
+        if (v >= 0 || m >= 0) {
+            gTransport->control(gTransport->context, v, m);
+            if (v >= 0) setNumber(this, "piano-audio-volume", uint32_t(v));
+            if (m >= 0) setProperty("piano-audio-mute", m ? kOSBooleanTrue : kOSBooleanFalse);
+        }
+    }
     if (OSNumber *owner = OSDynamicCast(OSNumber, d->getObject("exclusive access owner"))) {
         IOLockLock(lock);
         hogOwner = int32_t(owner->unsigned32BitValue());

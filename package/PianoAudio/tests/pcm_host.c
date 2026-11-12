@@ -187,6 +187,32 @@ static void testRing(void)
         read += got;
     }
     CHECK(ordered && written - read == audio_ring_fill(&r));
+    // skip: the oldest frames go, never more than are there
+    audio_ring_reset(&r);
+    for (int i = 0; i < 20 * 4; ++i) in[i] = (int16_t)i;
+    CHECK(audio_ring_write(&r, in, 20) == 20 && audio_ring_skip(&r, 5) == 5 && audio_ring_fill(&r) == 15);
+    CHECK(audio_ring_read(&r, out, 1) == 1 && out[0] == 5 * 4 && audio_ring_skip(&r, 100) == 14 && audio_ring_fill(&r) == 0);
+    CHECK(audio_ring_skip(&r, 3) == 0);
+}
+
+// A chain that resumes: silent from the next frame, fading in over 20 ms, the DC blocker cleared.
+static void testChainRestart(void)
+{
+    AudioChain c;
+    CHECK(audio_chain_init(&c, 4) == 0);
+    audio_chain_set_ceiling(&c, AUDIO_CEILING_MAX);
+    static int16_t q[AUDIO_FADE_FRAMES * 3 * 4];
+    for (unsigned i = 0; i < AUDIO_FADE_FRAMES * 3 * 4; ++i) q[i] = (int16_t)((i / 4) % 2 ? 20000 : -20000);
+    audio_chain_run(&c, q, AUDIO_FADE_FRAMES * 3);
+    CHECK(c.fade == AudioFadeSteady && c.fade_pos == c.fade_frames);
+    audio_chain_restart(&c);
+    CHECK(c.fade == AudioFadeIn && c.fade_pos == 0 && !audio_chain_silent(&c));
+    for (unsigned i = 0; i < AUDIO_FADE_FRAMES * 3 * 4; ++i) q[i] = (int16_t)((i / 4) % 2 ? 20000 : -20000);
+    audio_chain_run(&c, q, AUDIO_FADE_FRAMES * 3);
+    CHECK(q[0] == 0 && q[3] == 0);   // the first frame silent
+    int rising = 1;
+    for (unsigned i = 8; i < AUDIO_FADE_FRAMES; i += 8) rising &= abs(q[4 * i]) >= abs(q[4 * (i - 8)]) - 2;
+    CHECK(rising && abs(q[4 * (AUDIO_FADE_FRAMES / 2)]) < 12000 && abs(q[4 * (2 * AUDIO_FADE_FRAMES)]) > 15000);
 }
 
 static void testOutputPeriod(void)
@@ -276,6 +302,7 @@ int main(void)
     testTone();
     testGuard();
     testRing();
+    testChainRestart();
     testOutputPeriod();
     testWalk();
     printf("PASS pcm: %u checks\n", checks);

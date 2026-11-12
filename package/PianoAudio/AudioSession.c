@@ -459,12 +459,18 @@ static int speaker_prepare(AudioSession *s)
 
 static void finish(AudioSession *s, uint32_t now)
 {
-    if (s->amps.io.bus && (s->amps.present || s->amps.released)) {
+    /* levels 8-10 take over what levels 5 and 6 set up, when everything below them passed and nothing went off */
+    s->kept = s->cfg.keep && !s->off && s->cfg.dsp && s->amps_ready && s->speaker_ok && s->result[4] == AudioLevelPassed &&
+              s->result[5] == AudioLevelPassed && s->result[6] == AudioLevelPassed && s->result[7] != AudioLevelFailed &&
+              s->amps.configured == (1u << AUDIO_AMPS) - 1u && !s->amps.started;
+    if (s->kept) {
+        LOG(s, "the amplifiers stay configured, muted and powered down, the TDM pins muxed: levels 8 and up take them over");
+    } else if (s->amps.io.bus && (s->amps.present || s->amps.released)) {
         audio_amps_hold(&s->amps);
         LOG(s, "the amplifiers muted, powered down and held in reset");
     }
     if (s->smmu_done) dma_zero(s, 0, AUDIO_DMA_BYTES);
-    if (s->pins_on && s->ops.tdm_pins) {
+    if (s->pins_on && s->ops.tdm_pins && !s->kept) {
         (void)s->ops.tdm_pins(s->ops.ctx, 0);
         s->pins_on = 0;
     }

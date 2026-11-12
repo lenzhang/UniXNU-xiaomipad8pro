@@ -274,19 +274,38 @@ static uint32_t start_cap(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {r
 static uint32_t stop_cap(const ArSeq *s, uint8_t *o, uint32_t c, uint32_t t) {return ar_graph_command(o, c, s->port, t, AR_OP_GRAPH_STOP, AR_SG_CAPTURE);}
 
 #define MIC_PREPARED 12u
+#define MIC_DEVICE_STEPS \
+    {CMD("open mic device graph", open_mic, AR_OP_GRAPH_OPEN, ArBasicResult), UNDO(close_mic, AR_OP_GRAPH_CLOSE, ArBasicResult), 0}, \
+    {CMD("mic device VA TX0 codec DMA", mic_dev, AR_OP_SET_CFG, ArBasicResult), NOUNDO, 0}, \
+    {CMD("mic device logger", mic_log, AR_OP_SET_CFG, ArBasicResult), NOUNDO, 0}, \
+    {CMD("open capture stream graph", open_cap, AR_OP_GRAPH_OPEN, ArBasicResult), UNDO(close_cap, AR_OP_GRAPH_CLOSE, ArBasicResult), 0}, \
+    {CMD("capture MFC, converter and encoder", cap_cfg, AR_OP_SET_CFG, ArBasicResult), NOUNDO, 0}, \
+    {CMD("capture logger", cap_log, AR_OP_SET_CFG, ArBasicResult), NOUNDO, 0}, \
+    {CMD("map the capture buffer", map_cap, AR_OP_MEM_MAP, ArMapped), UNDO(unmap, AR_OP_MEM_UNMAP, ArBasicResult), 0}, \
+    {CMD("prepare mic device", prep_mic, AR_OP_GRAPH_PREPARE, ArBasicResult), NOUNDO, 0}, \
+    {CMD("prepare capture", prep_cap, AR_OP_GRAPH_PREPARE, ArBasicResult), NOUNDO, 0}
+#define MIC_START_STEPS \
+    {CMD("start mic device", start_mic, AR_OP_GRAPH_START, ArBasicResult), UNDO(stop_mic, AR_OP_GRAPH_STOP, ArBasicResult), 0}, \
+    {CMD("start capture", start_cap, AR_OP_GRAPH_START, ArBasicResult), UNDO(stop_cap, AR_OP_GRAPH_STOP, ArBasicResult), 0}
+static int va_on(const ArSeq *s) {const ArMicPlan *p = mic(s); return p->va_on ? p->va_on(p->owner) : 0;}
+static int va_off(const ArSeq *s) {const ArMicPlan *p = mic(s); return p->va_off ? p->va_off(p->owner) : 0;}
+static const ArStep kMicLive[] = {
+    VA_STEPS,
+    MIC_DEVICE_STEPS,
+    {"VA macro DMIC0/DMIC2 into DEC0/DEC1", 0, 0, 0, va_on, 0, 0, 0, va_off, 0},
+    MIC_START_STEPS,
+};
+
+const ArStep *ar_mic_live_steps(unsigned *count)
+{
+    *count = sizeof kMicLive / sizeof kMicLive[0];
+    return kMicLive;
+}
+
 static const ArStep kMic[] = {
     VA_STEPS,
-    {CMD("open mic device graph", open_mic, AR_OP_GRAPH_OPEN, ArBasicResult), UNDO(close_mic, AR_OP_GRAPH_CLOSE, ArBasicResult), 0},
-    {CMD("mic device VA TX0 codec DMA", mic_dev, AR_OP_SET_CFG, ArBasicResult), NOUNDO, 0},
-    {CMD("mic device logger", mic_log, AR_OP_SET_CFG, ArBasicResult), NOUNDO, 0},
-    {CMD("open capture stream graph", open_cap, AR_OP_GRAPH_OPEN, ArBasicResult), UNDO(close_cap, AR_OP_GRAPH_CLOSE, ArBasicResult), 0},
-    {CMD("capture MFC, converter and encoder", cap_cfg, AR_OP_SET_CFG, ArBasicResult), NOUNDO, 0},
-    {CMD("capture logger", cap_log, AR_OP_SET_CFG, ArBasicResult), NOUNDO, 0},
-    {CMD("map the capture buffer", map_cap, AR_OP_MEM_MAP, ArMapped), UNDO(unmap, AR_OP_MEM_UNMAP, ArBasicResult), 0},
-    {CMD("prepare mic device", prep_mic, AR_OP_GRAPH_PREPARE, ArBasicResult), NOUNDO, 0},
-    {CMD("prepare capture", prep_cap, AR_OP_GRAPH_PREPARE, ArBasicResult), NOUNDO, 0},
-    {CMD("start mic device", start_mic, AR_OP_GRAPH_START, ArBasicResult), UNDO(stop_mic, AR_OP_GRAPH_STOP, ArBasicResult), 0},
-    {CMD("start capture", start_cap, AR_OP_GRAPH_START, ArBasicResult), UNDO(stop_cap, AR_OP_GRAPH_STOP, ArBasicResult), 0},
+    MIC_DEVICE_STEPS,
+    MIC_START_STEPS,
 };
 _Static_assert(MIC_PREPARED < sizeof kMic / sizeof kMic[0], "the mic plan's prepared prefix");
 
@@ -318,6 +337,15 @@ int ar_pump_init(ArPump *p, uint64_t base, uint32_t handle, uint32_t port, uint3
     return 0;
 }
 
+int ar_pump_init_capture(ArPump *p, uint64_t base, uint32_t handle, uint32_t port, uint32_t slots, uint32_t period_bytes, uint32_t depth,
+                         uint32_t late_ms)
+{
+    if (ar_pump_init(p, base, handle, port, slots, period_bytes, depth, late_ms)) return -1;
+    p->capture = 1;
+    p->token_base = 0x5000u;
+    return 0;
+}
+
 int ar_pump_free_slot(const ArPump *p)
 {
     if (!p->slots || p->in_flight >= p->depth || p->busy[p->next]) return -1;
@@ -328,8 +356,10 @@ uint32_t ar_pump_write(ArPump *p, uint8_t *out, uint32_t capacity, uint32_t now_
 {
     const int slot = ar_pump_free_slot(p);
     if (slot < 0) return 0;
-    const uint32_t n = ar_write(out, capacity, p->port, p->token_base + (uint32_t)slot, p->base + (uint64_t)slot * p->period_bytes,
-                                p->handle, p->period_bytes);
+    const uint64_t at = p->base + (uint64_t)slot * p->period_bytes;
+    const uint32_t token = p->token_base + (uint32_t)slot;
+    const uint32_t n = p->capture ? ar_read(out, capacity, p->port, token, at, p->handle, p->period_bytes)
+                                  : ar_write(out, capacity, p->port, token, at, p->handle, p->period_bytes);
     if (!n) return 0;
     p->busy[slot] = 1; p->sent_ms[slot] = now_ms; p->in_flight++; p->sent++;
     p->next = (p->next + 1) % p->slots;
@@ -338,7 +368,7 @@ uint32_t ar_pump_write(ArPump *p, uint8_t *out, uint32_t capacity, uint32_t now_
 
 int ar_pump_done(ArPump *p, const ArAnswer *a)
 {
-    if (a->opcode != AR_OP_WRITE_DONE || a->dst_port != p->port) return 0;
+    if (a->opcode != (p->capture ? AR_OP_READ_DONE : AR_OP_WRITE_DONE) || a->dst_port != p->port) return 0;
     const uint64_t at = a->address - p->base;
     const uint32_t slot = (uint32_t)(at / p->period_bytes);
     if (a->address < p->base || at % p->period_bytes || slot >= p->slots || !p->busy[slot] || a->token != p->token_base + slot ||
@@ -348,6 +378,8 @@ int ar_pump_done(ArPump *p, const ArAnswer *a)
     }
     p->busy[slot] = 0; p->in_flight--;
     if (a->status) {p->errors++; p->last_status = a->status; return -1;}
+    if (p->capture && (a->offset > p->period_bytes || a->data_bytes > p->period_bytes - a->offset)) {p->errors++; return -1;}
+    p->last_slot = slot;
     p->returned++;
     return 1;
 }

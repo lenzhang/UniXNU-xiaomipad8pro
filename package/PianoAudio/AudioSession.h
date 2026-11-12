@@ -56,6 +56,8 @@ typedef struct {
     uint32_t tone_mask, tone_ms, gap_ms;   /* the walk: slots, each slot's tone, the silence between (AudioWalk's limits) */
     unsigned tone_gain;      /* the amplifiers' gain for the walk, at most AUDIO_AMPS_TEST_GAIN (160) */
     uint32_t answer_ms;      /* each DSP command's answer */
+    int keep;                /* levels 8-10 follow (AudioLive.h): when levels 4, 5 and 6 pass, the end leaves the amplifiers configured
+                              * and powered down (not held in reset), the TDM pins muxed and the slice mapped (zeroed): `kept` */
 } AudioSessionConfig;
 void audio_session_defaults(AudioSessionConfig *c);
 
@@ -82,6 +84,10 @@ typedef struct {
     uint64_t dma_phys;
     uint32_t dma_bytes;
     void (*publish)(void *ctx);
+    /* Level 10 (AudioLive.h): the VA macro's DMIC path (on 1: the LPI DMIC pins muxed, the macro's clocks, DMIC0 -> DEC0 and DMIC2 ->
+     * DEC1 at 48 kHz from 2.4 MHz DMIC clocks; on 0: all of it undone), called only while the PRM votes and the VA mclk hold. 0 or an
+     * error. May be null (the mic path then fails at that step). */
+    int (*va_mic)(void *ctx, int on);
 } AudioSessionOps;
 
 enum {AudioLevelNotRun = 0, AudioLevelPassed = 1, AudioLevelFailed = 2, AudioLevelSkipped = 3};
@@ -126,6 +132,7 @@ typedef struct {
     const char *failed_step[8];
     uint32_t failed_status[8];
     uint32_t sends, queue_full, received, stray, timeouts;
+    int kept;                            /* keep was asked and levels 4-6 passed: the hardware is left for AudioLive */
 } AudioSession;
 
 /* guard: level 2's (AudioLink.guard), null without the DSP. */

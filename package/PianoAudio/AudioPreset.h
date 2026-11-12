@@ -1,7 +1,10 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
-/* Where level 5 finds the amplifier preset: the owner's own copy of the stock foursemi/piano/fs19xx.fsm, staged on the ESP (GPT
- * partition "esp", FAT32 with 4096-byte sectors) by tooling/persist/build-esp.py --audio-preset FILE as EFI/UniXNU/piano-fs19xx.fsm,
- * and read here whole through FatVolume.h (the reader PianoPower's firmware and PianoSensors' pack use). The ESP is only read.
+/* Where level 5 finds the amplifier preset, the owner's own copy of the stock foursemi/piano/fs19xx.fsm: first through the shared
+ * firmware loader (<PianoFirmware.h>) against the kext's pin PianoAudio/fs19xx.fsm, from a RAM image's addon or the ESP's
+ * EFI/UniXNU/firmware/PianoAudio/fs19xx.fsm (AudioBoard.cpp presetPinned); then, as here, the copy tooling/persist/build-esp.py
+ * --audio-preset FILE stages on the ESP (GPT partition "esp", FAT32 with 4096-byte sectors) as EFI/UniXNU/piano-fs19xx.fsm, read
+ * whole through FatVolume.h (the reader PianoPower's firmware and PianoSensors' pack use); only this second path can give a valid
+ * preset that is not the stock file (piano-audio-preset-any=1). The ESP is only read.
  *
  * Why the ESP and not odm_a itself: odm_a is a logical partition inside "super" (LP metadata) holding an Android EROFS image (its
  * files may be LZ4-compressed): a reader for that is a new filesystem in the kernel for one 4348-byte file. The staged copy is the

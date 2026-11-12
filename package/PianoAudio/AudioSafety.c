@@ -29,7 +29,7 @@ void audio_dc_run(AudioDcBlocker *d, int16_t *frames, uint32_t count, unsigned c
     for (uint32_t i = 0; i < count; ++i)
         for (unsigned c = 0; c < channels; ++c) {
             const int32_t x = frames[i * channels + c];
-            const int64_t acc = ((int64_t)(x - d->x1[c]) << 15) + ((d->y1[c] * DC_POLE) >> 15);
+            const int64_t acc = (int64_t)(x - d->x1[c]) * 32768 + ((d->y1[c] * DC_POLE) >> 15);   /* a product: no shift of a negative */
             d->x1[c] = x;
             d->y1[c] = acc;
             frames[i * channels + c] = sat16((acc + (1 << 14)) >> 15);
@@ -63,6 +63,12 @@ int32_t audio_chain_set_gain(AudioChain *c, int32_t gain_q15)
 }
 
 void audio_chain_fade(AudioChain *c, int direction) {c->fade = direction > 0 ? AudioFadeIn : direction < 0 ? AudioFadeOut : AudioFadeSteady;}
+void audio_chain_restart(AudioChain *c)
+{
+    audio_dc_init(&c->dc);
+    c->fade_pos = 0;
+    c->fade = AudioFadeIn;
+}
 int audio_chain_silent(const AudioChain *c) {return c->fade_pos == 0 && c->fade != AudioFadeIn;}
 
 void audio_chain_run(AudioChain *c, int16_t *frames, uint32_t count)
@@ -243,6 +249,14 @@ uint32_t audio_ring_read(AudioRing *r, int16_t *frames, uint32_t count)
 void audio_ring_reset(AudioRing *r)
 {
     __atomic_store_n(&r->tail, __atomic_load_n(&r->head, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+}
+
+uint32_t audio_ring_skip(AudioRing *r, uint32_t count)
+{
+    const uint32_t tail = r->tail, fill = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE) - tail;
+    const uint32_t n = count < fill ? count : fill;
+    __atomic_store_n(&r->tail, tail + n, __ATOMIC_RELEASE);
+    return n;
 }
 
 uint32_t audio_output_period(AudioChain *c, AudioRing *r, const int16_t *stereo, uint32_t frames, int16_t *scratch_quad)

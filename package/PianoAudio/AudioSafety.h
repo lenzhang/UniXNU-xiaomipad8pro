@@ -52,6 +52,8 @@ int audio_chain_init(AudioChain *c, unsigned channels);
 int32_t audio_chain_set_ceiling(AudioChain *c, int32_t ceiling);
 int32_t audio_chain_set_gain(AudioChain *c, int32_t gain_q15);
 void audio_chain_fade(AudioChain *c, int direction);
+/* Silent from the next frame and fading in (the DC blocker cleared): a stream that resumes after its amplifiers were muted. */
+void audio_chain_restart(AudioChain *c);
 /* 1 when a fade-out has reached silence (the owner may stop then). */
 int audio_chain_silent(const AudioChain *c);
 /* One period in place. */
@@ -114,6 +116,8 @@ uint32_t audio_ring_fill(const AudioRing *r);
 uint32_t audio_ring_write(AudioRing *r, const int16_t *frames, uint32_t count);
 uint32_t audio_ring_read(AudioRing *r, int16_t *frames, uint32_t count);
 void audio_ring_reset(AudioRing *r);
+/* The consumer drops up to count of the oldest frames (a backlog, a drifting clock); returns how many. */
+uint32_t audio_ring_skip(AudioRing *r, uint32_t count);
 
 /* ---- one output period of the macOS engine for the DSP: stereo -> quad -> the chain -> the ring. Returns frames queued. */
 uint32_t audio_output_period(AudioChain *c, AudioRing *r, const int16_t *stereo, uint32_t frames, int16_t *scratch_quad);

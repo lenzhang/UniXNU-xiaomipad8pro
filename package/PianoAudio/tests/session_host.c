@@ -381,9 +381,16 @@ static const AudioSession *run(const struct Scenario *sc, void (*setup)(AudioSes
         w.now_us += 1000;
     }
     CHECK(session.finished);
-    // whatever happened: every amplifier held in reset, the pins given back, the buffer zeroed
-    for (int i = 0; i < 4; ++i) CHECK(!w.amp[i].released);
-    CHECK(!w.pins_on);
+    if (session.kept) {
+        // handed over to levels 8-10: every amplifier out of reset, configured, powered down and muted; the pins still muxed
+        for (int i = 0; i < 4; ++i)
+            CHECK(w.amp[i].released && (w.amp[i].reg[FS19XX_REG_PWRCTRL] & FS19XX_PWRCTRL_PWDN) && (w.amp[i].reg[FS19XX_REG_DACCTRL] & FS19XX_DACCTRL_MUTE_BIT));
+        CHECK(w.pins_on && session.cfg.keep && !w.clock_on && !w.mapped);
+    } else {
+        // whatever happened: every amplifier held in reset, the pins given back
+        for (int i = 0; i < 4; ++i) CHECK(!w.amp[i].released);
+        CHECK(!w.pins_on);
+    }
     for (unsigned i = 0; i < sizeof w.dma; ++i) if (w.dma[i]) {CHECK(!"the buffer is not zeroed at the end"); break;}
     return &session;
 }
@@ -681,6 +688,31 @@ static void testLinkInSilence(void)
     CHECK(s->result[6] == AudioLevelFailed && s->result[7] == AudioLevelSkipped && logged("guard OFF"));
 }
 
+// keep (levels 8-10 follow): the hardware is left for them only when levels 4, 5 and 6 passed (and 7 did not fail).
+static void keep(AudioSessionConfig *c, AudioSessionOps *o) {(void)o; c->keep = 1;}
+static void keep_missing(AudioSessionConfig *c, AudioSessionOps *o) {keep(c, o); w.amp[1].present = 0;}
+static void testKeep(void)
+{
+    struct Scenario sc = {6, 1, AudioPortsUbuntu, 0, 1, 1, 300, 60000, 0};
+    const AudioSession *s = run(&sc, keep);
+    CHECK(!w.violations && s->kept && w.power_ups == 0 && logged("levels 8 and up take them over"));
+    sc.level = 7; sc.tone = 1;   // after the walk too
+    s = run(&sc, keep);
+    CHECK(!w.violations && s->kept && s->result[7] == AudioLevelPassed && w.power_ups == 4);
+    sc.level = 6; sc.tone = 0;   // without keep: held in reset as always
+    s = run(&sc, 0);
+    CHECK(!s->kept);
+    s = run(&sc, keep_missing);  // level 5 failed: nothing kept
+    CHECK(!w.violations && !s->kept && s->result[5] == AudioLevelFailed);
+    sc.dsp = 0;                  // no DSP link: levels 4 and 6 skipped, nothing kept
+    s = run(&sc, keep);
+    CHECK(!s->kept && s->result[5] == AudioLevelPassed);
+    g_trip_ms = 0;               // the guard off in level 6's silence: nothing kept
+    sc = (struct Scenario){6, 1, AudioPortsUbuntu, 0, 1, 1, 1000, 60000, link_in_silence};
+    s = run(&sc, keep);
+    CHECK(!s->kept && logged("guard OFF"));
+}
+
 int main(void)
 {
     preset_bytes = sfsm_build(preset, sizeof preset, 0);
@@ -701,6 +733,7 @@ int main(void)
     testRefusedWalk();
     testQueueFull();
     testLinkInSilence();
+    testKeep();
     printf("PASS session: %u checks\n", checks);
     return 0;
 }

@@ -8,8 +8,9 @@
  * owner says otherwise; whatever it holds, Fs19xx.c's filter keeps every amplifier powered down, muted and capped while it is applied.
  *
  * The rules of this file: all four or none (a missing or failing amplifier shuts the others down and holds all four in reset); no
- * amplifier is powered up but by audio_amps_start, which caps the gain at FS19XX_GAIN_TEST (160, -35.6 dB: the unattended-test gain)
- * and leaves them muted; at the end they are held in reset (hardware shutdown), as Ubuntu leaves them unbound.
+ * amplifier is powered up but by audio_amps_start, which caps the gain at FS19XX_GAIN_TEST (160, -35.6 dB: the unattended-test gain),
+ * or by audio_amps_start_capped (levels 8-10's playing gain: never above the core's FS19XX_GAIN_CAP, 192), and both leave them muted;
+ * at the end they are held in reset (hardware shutdown), as Ubuntu leaves them unbound.
  * Portable C, new code for PianoAudio: the bus, the reset lines and the sleeps are the owner's. */
 #ifndef PIANO_AUDIO_AMPS_H
 #define PIANO_AUDIO_AMPS_H
@@ -74,6 +75,11 @@ unsigned audio_amps_read(AudioAmps *g);
 int audio_amps_all_down(const AudioAmps *g);
 /* Power all four configured amplifiers up, muted, at min(gain, AUDIO_AMPS_TEST_GAIN). 0; or all of them shut down again. */
 int audio_amps_start(AudioAmps *g, unsigned gain);
+/* The same at min(gain, cap, FS19XX_GAIN_CAP): levels 8-10's playing gain (cap 160 at level 8, at most the core's 192 from level 9). */
+int audio_amps_start_capped(AudioAmps *g, unsigned gain, unsigned cap);
+/* Mute the started amplifiers' DACs (they stay powered up, the stream's zeros keep their clocks): every write tried; the slots with a
+ * bus error. audio_amps_unmute undoes it. */
+unsigned audio_amps_mute(AudioAmps *g);
 /* Unmute the started amplifiers; on a bus error all are muted and powered down again. */
 int audio_amps_unmute(AudioAmps *g);
 /* After audio_amps_read while playing: the slots that look wrong (fs19xx_group_check against the first reading after the unmute). */
