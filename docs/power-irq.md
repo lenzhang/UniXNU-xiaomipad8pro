@@ -16,11 +16,12 @@ and measured: `ubuntu-history/kernel.md`, `ubuntu-history/device.md`), **inferre
 | PianoDwc3 (USB console, HID, net) | 1 ms after every quiet pass, forever | adaptive wait by the link's state (`UsbIdle.h`) | `piano-usb-irq=1`: the core's SPI 133 | ~1000 → 4 (no cable); 20 / 50 attached; with the IRQ 1 / 5 |
 | PianoDwc3's HID thread | 100 ms deadline, forever | 100 ms only while a key/button is held, else 60 s | – | 10 → ~0 |
 | PianoInput (power, vol keys) | 10 ms | 10 ms while a key is busy and 1 s after, else 40 ms | `piano-input-idle=MS` | 100 → 25 |
-| PianoTouch (NT36532E) | latch polled every 1 ms, every frame read (~120/s) | every frame while busy, one frame per 50 ms at rest (`TouchPace.h`) | `piano-touch-irq=1`: gpio162 on the TLMM summary SPI | ~1000 → ~60 (polled), ~40 (IRQ) |
+| PianoTouch (NT36532E) | latch polled every 1 ms, every frame read (~120/s) | every announced frame at once while busy; at rest the latch looked at once per 50 ms, a frame read only when announced (~0.7/s idling; `TouchPace.h`, 2026-11-12) | `piano-touch-irq=1`: gpio162 on the TLMM summary SPI | ~1000 → ~20 (one look per idle period, polled or by the IRQ) |
 | PianoKeyboard (cover) | (another change already made it adaptive: 4 / 30 / 200 ms) | – | §6: gpio97 on the TLMM summary SPI | 33 idle → ~2 with the IRQ |
 | PianoThermal (TSENS) | 1 s; 250 ms from 70 C; 10 ms near a trip or with a cluster above 2.5 GHz | unchanged | `piano-thermal-irq=1`: the four uplow SPIs 771-774, a proof at each start, at rest a 5 s base (`thermal.md` §13) | 1 (100 with a fast cluster) → 0.2 |
 
-`piano-usb-idle=0`, `piano-input-idle=0`, `piano-touch-idle=0` restore the old loops exactly (the A of the A/B).
+`piano-usb-idle=0`, `piano-input-idle=0`, `piano-touch-idle=0` restore the old loops exactly (the A of the A/B; the touch screen's
+reads stay on announced frames, `piano-touch-noedge=50` adds back the reads without one).
 
 ## 2. Interrupt facts
 
@@ -136,6 +137,11 @@ an idle sleep any more (that was why the level-1 run saw ~0.5 edges/s), a read w
 the line still high), at rest the idle period + 50 ms, never more than 250 ms unread (200 ms with the display off); the watchdog is
 downloaded again every 10 s, never given up; the k27 0061 latency hold covers each busy read burst when the kernel has it
 (`drivers/touch.md` §13).
+2026-11-12, after desk1 and desk-diag (the watchdog loop): a frame is read only when the controller announces it (an edge, or the
+line still high), never by a timer, as piano's stock driver and Ubuntu read only in their gpio162 interrupt thread. Nobody
+touching, the controller idles and announces a frame about every 1.5 s, so at rest the loop reads ~0.7 frames a second (was 10-20)
+and looks at the latch once per idle period (20 wake-ups a second; with `piano-touch-irq=1` the interrupt, waited for one idle
+period at a time); the display off, once per 200 ms. The old reads without an edge: `piano-touch-noedge=50` (A/B only).
 
 ## 5. Measuring: the A/B
 

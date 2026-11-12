@@ -132,6 +132,7 @@ frame ([boot-time.md](boot-time.md) §3.1). The desktop images have neither (§3
 |---|---|---|
 | Touch screen: slop 64 px (32), a drag only after 80 ms past it or past three times it (a lift before is the tap), two-finger taps up to 700 ms (500); the tap line says how far the finger went | `package/PianoTouch/TouchGesture.h`, `piano-touch-slop`, `piano-touch-drag-delay` | `touch_host`: drift taps, delayed and fast drags, a wobbling hold, a 560 ms two-finger tap |
 | Touch screen: after a download and start, no read without an edge until the first frame (2 s at most) | `TouchPace.h` `StartGrace`, `PianoTouch.cpp` | `touch_host`: the model with an 850 ms start reproduces desk1 without it, recovers after one download with it |
+| Touch screen (afternoon, after desk-diag looped all the same): a frame read only when the controller announces it (an edge), never by a timer; the reference of a quiet controller from its few frames; the stock start sequence (stylus off, idle baseline 1, op mode 2) | `TouchPace.h` `readOn`, `TouchMatrix.h` `matrixSettle`, `Nt36532.h` `start`, `PianoTouch.cpp`; [drivers/touch.md](drivers/touch.md) §13 | `touch_host`: the idling controller model loops under desk-diag's rules (117 downloads in 20 min), never under the new ones; the 20-minute proof image is touch.md §15.2 |
 | Cover touchpad: a resting thumb (bottom fifth, another contact above) not counted; two fingers pressing > 45 mm apart: left; taps up to 220 ms / 150 counts; a tap during a screen touch dropped; the press's button, the vetoed taps and every LED request logged; the alive line in two | `Wn8030Piano.h` `Pointer`, `PianoKeyboard.cpp`, `PianoTouchClient.h` (`PianoTouchContact`); `piano-keyboard-resting`, `-tap-ms`, `-tap-travel`, `-tap-veto` | `keyboard_host` `testRestingThumb` |
 | PianoKeyboard in the kext list | `configs/k27-native-kexts.txt` | the KC links (22 kexts) |
 | The desktop images: desk, quiet, plain, diag | `tooling/k27/build-desktop-images.sh` | built in a worktree (§3) |
@@ -193,7 +194,7 @@ Checked in an agent worktree (2026-11-12): the KC from this tree with the 0064 k
 | `ram-diag` | keyboard type + `desk-reports.sh` in the boot job | `exec-log=1 piano-policy=1` | one boot to name what §1.1 and §1.4 leave open: `grep -a 'desk-reports:' <capture>.txt` |
 
 Variants by environment: `DESK_TOUCH=0` (no touch screen: the fallback if it resets or its watchdog lines never stop),
-`DESK_EXTRA="piano-touch-idle=0"` (the touch screen's level-1 pace: every frame, more power), `DESK_KEYBOARD_TYPE=41|42` (ISO, JIS).
+`DESK_EXTRA="piano-touch-idle=0"` (the touch screen's latch looked at every 1 ms at rest too: more power), `DESK_KEYBOARD_TYPE=41|42` (ISO, JIS).
 
 The owner's own Data (persistent: a still wallpaper, warm caches and answered setup dialogs survive the reboot) is ESP v3 with the
 system layer ([persistent-boot.md](persistent-boot.md) §11); its RAM test with `PIANO_DATA_PERSIST=2` keeps the installed base seed,
@@ -216,8 +217,9 @@ afterwards `python3 tooling/native/boot-timeline.py logs/usb-console/<ts>-port0.
    'watchdogd|mobileactivation|xprotectd|PerfPower'`, or by the diag image's report.)
 2. **Touch screen at the login window**: tap the user / the password field, the four corners and the middle. Each tap lands under
    the finger (Y not mirrored), and logs `gesture: tap -> click (N ms, M px at most from the landing)`: note the largest M. Watch
-   for `frames: watchdog`: after a download the line `frames: the first edge N ms after start S` should follow and the touch come
-   back. If watchdog lines never stop: next boot with `DESK_EXTRA="piano-touch-idle=0"`, then `DESK_TOUCH=0`.
+   for `frames: watchdog` (expected none since the announced-frame rule, [drivers/touch.md](drivers/touch.md) §13): after a download
+   the touch should come back. If watchdog lines never stop: note the `the first read ...` part of the `11 watchdog frames in a row`
+   line and the `frames: reads ...` line's B, then the next boot with `DESK_TOUCH=0`.
 3. **Log in on the cover.** Note the time from Return to the desktop (stopwatch: 47-73 s before; diag's exec-log dates
    authorizationhost, 13 s before). Expected: no garbled frame (current NativeGopDisplay), no Keyboard Setup Assistant window
    (the keyboard type written by the boot job; if it still asks, answer it and note the keyboard it names).
@@ -257,6 +259,7 @@ watchdog lines that never stop, or clicks that still do not land (note where: sc
 - authorizationhost's 13 s (diag report first); the 26-56 s of CPU-side work after Dock starts (pipelines compiled from source:
   the plugin's binary archive support; a persistent store keeps caches).
 - The touch screen's display-off pace: desk1 also went into the watchdog state with the display still off at boot (T 105.9, reads
-  ~250 ms apart, no edges); counted only until the display returns, where the start grace now applies.
+  ~250 ms apart, no edges). Since the announced-frame rule (2026-11-12 afternoon) nothing is read without an edge, the display off
+  included ([drivers/touch.md](drivers/touch.md) §13, the proof run §15.2).
 - mobileactivationd as the exit-78 job is inferred; the diag report or `launchctl print system/com.apple.mobileactivationd`
   settles it.
