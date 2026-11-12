@@ -1,0 +1,78 @@
+frontend: render-pass memory barriers in panel-sized surface passes, a switch and a console line (piano-metal-barriers)
+
+The VM's frontend leaves out every render-pass memory barrier (RenderBox's in-encoder coverage read-backs, which the bridge implements
+by splitting the pass) in a pass whose colour target is an IOSurface of more than 4 Mpx: there a barrier locked the Adreno up at
+every 3200x2136 login in the VM (msm hangcheck; the bridge's split pass loads and stores the whole surface in GMEM). Natively the
+panel is 3200x2136 and every full-screen window's surface is past that limit (SecurityAgent's login UI included), while every pass
+renders in sysmem (the bridge's pipelines carry the colour-attachment feedback-loop flag, which disables GMEM in Turnip), where a
+split costs no GMEM load or store. Now:
+- piano-metal-barriers=all|small|none on the boot line (kern.bootargs), else the first word of /private/var/ngpu/debug/render-barriers
+  (readable where the boot line is not, as Turnip's tu-debug), else none with com.droidvm.nmb-no-render-barrier as before, else small
+  (the VM's rule, unchanged by default). A process whose policy is not small says so once on stderr.
+- Each barrier left out in a panel-sized pass is an NBLOG line ("native-metal: render memory barrier left out in a N-pixel surface
+  pass (M so far; piano-metal-barriers=all keeps them)"), rate-limited as every NBLOG on stderr: whether a client asks for them
+  at the login window and on the desktop was never measured.
+Applied by tooling/metal/build-turnip-a830.sh after 0001. MIT, as the file.
+
+--- a/frontend.mm
++++ b/frontend.mm
+@@ -2771,14 +2771,53 @@
+ // read-backs are in offscreen targets (icons, glyphs, their atlases -- some larger than 4 Mpx: all blank when every big pass
+ // lost its barriers), which keep them.
+ static constexpr uint64_t kBarrierMaxPassPixels = 4000000;
+-static bool nbRenderBarriers() {
+- static int on = -1;
+- if (on < 0) on = access("/Library/Preferences/com.droidvm.nmb-no-render-barrier", F_OK) != 0;
+- return on;
++// UniXNU-piano (tooling/metal/turnip-a830/frontend 0002): which render-pass barriers are kept, read once per process.
++//   all   every one, panel-sized surface passes included (natively every pass renders in sysmem, so the split costs no GMEM
++//         load and store of the whole surface: what the VM's hang was suspected of);
++//   small all but those in a panel-sized pass into an IOSurface (the VM's rule above; the default);
++//   none  no barrier at all (as com.droidvm.nmb-no-render-barrier).
++// From the boot argument piano-metal-barriers=all|small|none (kern.bootargs), else the first word of
++// /private/var/ngpu/debug/render-barriers (a sandboxed process that cannot read the boot line still reads that file, as Turnip's
++// tu-debug), else none while /Library/Preferences/com.droidvm.nmb-no-render-barrier exists, else small. A barrier left out in a
++// panel-sized pass is on stderr (NBLOG's rate limit: the first 8, then the 16th, 32nd, ... with the count).
++enum NBBarrierPolicy {NBBarriersNone,NBBarriersSmall,NBBarriersAll};
++static NBBarrierPolicy nbBarrierWord(const char *w,NBBarrierPolicy fallback) {
++ if(!strncmp(w,"all",3))return NBBarriersAll;
++ if(!strncmp(w,"small",5))return NBBarriersSmall;
++ if(!strncmp(w,"none",4))return NBBarriersNone;
++ return fallback;
+ }
++static NBBarrierPolicy nbBarrierPolicy() {
++ static const NBBarrierPolicy policy=[]{
++  const char *from="the default";
++  NBBarrierPolicy p=NBBarriersSmall;
++  char args[1024]={};size_t size=sizeof args-1;
++  const char *at=nullptr;
++  if(!sysctlbyname("kern.bootargs",args,&size,NULL,0)) {
++   static const char key[]="piano-metal-barriers=";
++   for(const char *s=args;(s=strstr(s,key));s+=sizeof key-1)if(s==args || s[-1]==' '){at=s+sizeof key-1;break;}
++  }
++  if(at){p=nbBarrierWord(at,p);from="boot argument piano-metal-barriers";}
++  else if(FILE *f=fopen("/private/var/ngpu/debug/render-barriers","r")) {
++   char w[32]={};if(fscanf(f,"%31s",w)==1){p=nbBarrierWord(w,p);from="/private/var/ngpu/debug/render-barriers";}
++   fclose(f);
++  } else if(access("/Library/Preferences/com.droidvm.nmb-no-render-barrier",F_OK)==0){p=NBBarriersNone;from="com.droidvm.nmb-no-render-barrier";}
++  if(p!=NBBarriersSmall)NBLOG(@"native-metal: render-pass memory barriers: %s (from %s)",p==NBBarriersAll?"all":"none",from);
++  return p;
++ }();
++ return policy;
++}
++static bool nbRenderBarriers() {return nbBarrierPolicy()!=NBBarriersNone;}
+ @implementation NBRenderEncoder
+-// A panel-sized pass into an IOSurface (WindowServer's and the windows' framebuffers): no barrier there (see kBarrierMaxPassPixels).
+-- (BOOL)barrierUnsafePass {return self.passPixels > kBarrierMaxPassPixels && (self.passKey >> 18 & 1);}
++// A panel-sized pass into an IOSurface (WindowServer's and the windows' framebuffers): no barrier there (see kBarrierMaxPassPixels)
++// unless piano-metal-barriers=all. Each one left out is on stderr (rate-limited), so a run shows whether a client asked for them.
++- (BOOL)barrierUnsafePass {
++ if(nbBarrierPolicy()==NBBarriersAll || !(self.passPixels > kBarrierMaxPassPixels && (self.passKey >> 18 & 1)))return NO;
++ static std::atomic<uint64_t> leftOut{0};
++ NBLOG(@"native-metal: render memory barrier left out in a %llu-pixel surface pass (%llu so far; piano-metal-barriers=all keeps them)",
++       (unsigned long long)self.passPixels,(unsigned long long)++leftOut);
++ return YES;
++}
+ // Render-pass memory barriers (the bridge splits the pass): RenderBox reads back, in the same encoder, the coverage an earlier draw
+ // accumulated in a render target; dropped, SwiftUI glyphs and IconRendering icons drew as blocks or nothing (piano, 2026-11-10).
+ - (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {

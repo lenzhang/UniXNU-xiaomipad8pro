@@ -1,0 +1,117 @@
+turnip: darwin, in a sysmem pass a draw that reads the attachments it renders to waits for the earlier draws' writes
+
+Metal's framebuffer fetch reaches Turnip as input attachments that are also colour attachments of the subpass (metal2vulkan's
+lowering: SubpassData reads in the fragment shader). Core Animation uses it for glass, backdrop and vibrancy layers (the host trace of
+2026-11-12: an SDF written into a memoryless colour attachment, then read by the glass draw of the same pass), and RenderBox for
+clips, blend modes and shadows, since the device answers MTLGPUFamilyApple1-3, which have programmable blending. metal2vulkan declares
+the colour attachments as input attachments of every subpass and puts the colour feedback-loop and rasterization-order flags on every
+pipeline; the feedback-loop flag disables GMEM (rp.disable_gmem), so these passes render in sysmem whatever TU_DEBUG says. There the
+fragment shader reads the image through UCHE while the earlier draws' pixels may still be in the CCU, and only SINGLE_PRIM_MODE
+(FLUSH_PER_OVERLAP_AND_OVERWRITE) keeps the two in step: a6xx's mechanism, never checked on the A830.
+
+Before each draw whose fragment shader reads an input attachment (one with non-bindless texture slots, ir3's num_samp: input
+attachments are the only descriptors that take them; or a dynamic pass's dynamic_input_attachments_used), a sysmem pass now cleans
+the CCU (colour and depth), invalidates UCHE, cleans the blit cache and waits for the writes and for idle, under CP_COND_REG_EXEC on
+the render mode, so GMEM passes and the binning pass skip it. In the host trace that was 1 draw in 30 for Core Animation's glass frame
+and 6 in 38 for RenderBox's clip, blend-mode and shadow shapes. The first such draw of a process says so once: "TU: info: draws that
+read the attachments they render to (first: <what made it one>): in a sysmem pass each waits ...". TU_DEBUG=nofbflush leaves it out
+(the A/B against 0001-0006); TU_DEBUG=fbflushall also flushes before every draw of a feedback-loop subpass or rasterization-order
+pipeline (every draw of these passes). Against the tree after 0001-0006. MIT, as the files.
+
+--- a/src/freedreno/vulkan/tu_util.h
++++ b/src/freedreno/vulkan/tu_util.h
+@@ -75,6 +75,8 @@
+    TU_DEBUG_NO_CONCURRENT_BINNING    = BITFIELD64_BIT(35),
+    TU_DEBUG_FORCE_CONCURRENT_BINNING = BITFIELD64_BIT(36),
+    TU_DEBUG_COMPUTE_ROUND_ROBIN      = BITFIELD64_BIT(37),
++   TU_DEBUG_NO_FB_FLUSH              = BITFIELD64_BIT(38),
++   TU_DEBUG_FB_FLUSH_ALL             = BITFIELD64_BIT(39),
+ };
+ 
+ struct tu_env {
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -63,6 +63,8 @@
+    { "nocb", TU_DEBUG_NO_CONCURRENT_BINNING },
+    { "forcecb", TU_DEBUG_FORCE_CONCURRENT_BINNING },
+    { "computeroundrobin", TU_DEBUG_COMPUTE_ROUND_ROBIN },
++   { "nofbflush", TU_DEBUG_NO_FB_FLUSH },
++   { "fbflushall", TU_DEBUG_FB_FLUSH_ALL },
+    { NULL, 0 }
+ };
+ 
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -8449,7 +8449,60 @@
+       cmd->state.renderpass_cache.flush_bits |=
+          TU_CMD_FLAG_CACHE_INVALIDATE | TU_CMD_FLAG_BLIT_CACHE_CLEAN |
+          TU_CMD_FLAG_WAIT_FOR_IDLE;
++   }
++}
++
++/* UniXNU-piano (Turnip 0007): a draw that reads the attachments it renders to (Metal's framebuffer fetch, which metal2vulkan lowers
++ * to input attachments of the pass: Core Animation's glass, backdrop and vibrancy draws) sees, in a GMEM pass, the earlier draws' pixels
++ * in GMEM. In a sysmem pass it reads the image through UCHE while those pixels may still be in the CCU, and then only SINGLE_PRIM_MODE
++ * (FLUSH_PER_OVERLAP_AND_OVERWRITE, tu6_emit_prim_mode_sysmem), a6xx's mechanism that nothing has checked on the A830, keeps the two in
++ * step. So before each such draw a sysmem pass cleans the CCU, invalidates UCHE and waits for the writes (CP_COND_REG_EXEC on the
++ * render mode: GMEM passes and the binning pass skip it). TU_DEBUG=nofbflush leaves it out (the A/B). */
++static const char *
++tu_draw_reads_own_attachments(const struct tu_cmd_buffer *cmd)
++{
++   const struct tu_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
++   if (fs && fs->fs.dynamic_input_attachments_used)
++      return "input attachments of a dynamic pass";
++   /* metal2vulkan declares the colour attachments as input attachments of every subpass, with the feedback-loop and
++    * rasterization-order flags on every pipeline, so those flags alone would put the flush before every draw. A fragment shader
++    * that reads an input attachment of the subpass is one with non-bindless texture slots (build_bindless: input attachments are
++    * the only descriptors that take them), hence ir3's num_samp. TU_DEBUG=fbflushall takes the flags as they are. */
++   if (fs && fs->variant && fs->variant->num_samp > 0 && cmd->state.subpass && cmd->state.subpass->input_count)
++      return "input attachments of the subpass";
++   if (!TU_DEBUG(FB_FLUSH_ALL))
++      return NULL;
++   if (cmd->state.subpass && (cmd->state.subpass->feedback_loop_color || cmd->state.subpass->feedback_loop_ds))
++      return "a subpass whose input attachment is also its colour or depth attachment (fbflushall)";
++   if (cmd->state.raster_order_attachment_access)
++      return "rasterization-order attachment access (fbflushall)";
++   if (cmd->state.pipeline_feedback_loops || cmd->vk.dynamic_graphics_state.feedback_loops)
++      return "an attachment feedback loop (fbflushall)";
++   return NULL;
++}
++
++template <chip CHIP>
++static void
++tu_sysmem_feedback_flush(struct tu_cmd_buffer *cmd, struct tu_cs *cs, const char *why)
++{
++   static bool told;
++   if (!told) {
++      told = true;
++      mesa_logi("draws that read the attachments they render to (first: %s): in a sysmem pass each waits for the colour and depth "
++                "writes before it (0007; TU_DEBUG=nofbflush leaves it out)", why);
+    }
++   /* tu6_emit_flushes' order for CCU_CLEAN_COLOR | CCU_CLEAN_DEPTH | CACHE_INVALIDATE | BLIT_CACHE_CLEAN | WAIT_MEM_WRITES |
++    * WAIT_FOR_IDLE | WAIT_FOR_ME. */
++   tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(RENDER_MODE) | CP_COND_REG_EXEC_0_SYSMEM);
++   tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
++   tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_DEPTH);
++   tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
++   if (CHIP >= A7XX)
++      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_BLIT_CACHE);
++   tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
++   tu_cs_emit_wfi(cs);
++   tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
++   tu_cond_exec_end(cs);
+ }
+ 
+ template <chip CHIP>
+@@ -8510,6 +8563,11 @@
+       tu_flush_dynamic_input_attachments(cmd);
+ 
+    tu_emit_cache_flush_renderpass<CHIP>(cmd);
++
++   if (!TU_DEBUG(NO_FB_FLUSH)) {
++      if (const char *why = tu_draw_reads_own_attachments(cmd))
++         tu_sysmem_feedback_flush<CHIP>(cmd, cs, why);
++   }
+ 
+   if (BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+                   MESA_VK_DYNAMIC_IA_PRIMITIVE_RESTART_ENABLE) ||
