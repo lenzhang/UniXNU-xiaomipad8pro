@@ -3,7 +3,8 @@
 // Integer only, no allocation, no I/O: tests/touch_host.cpp runs it on synthetic frames. The steps are Project-SunUEFI's
 // PianoTouchMatrix.c (UPSTREAM), itself an integer port of piano's Linux touch-view reader:
 //   - lock onto the dominant non-pen data type over the first 16 frames with a good checksum (pen types 6, 7, 9, 0x1d never);
-//   - the reference is the per-node median of the next 32 frames of that type;
+//   - the reference is the per-node median of the next 32 frames of that type (or, when the controller goes quiet first, of the
+//     at least 4 sampled so far: matrixSettle);
 //   - each later frame: delta = raw - reference, then the per-column median and the per-row median removed (line noise);
 //     while no node is near the threshold the reference follows the raw values by 1/8 (drift);
 //   - peaks: nodes >= threshold (200) that no 3 x 3 neighbour beats (ties to the first in scan order), each the weighted centroid
@@ -36,6 +37,7 @@
 namespace pianotouch {
 
 constexpr uint32_t kMaxNodes = 4096, kRefFrames = 32, kProbeFrames = 16, kMaxPoints = 16, kMaxCandidates = 64, kBlobPoints = 4;
+constexpr uint32_t kQuietFrames = 4;   // matrixSettle: the fewest frames a type or a reference is formed from
 constexpr uint32_t kMaxBlobs = 254;   // blob labels 1..254; 255 collects every blob past them (counted as one, large)
 constexpr int32_t kPanelW = 3200, kPanelH = 2136;
 
@@ -217,6 +219,23 @@ struct Point {
   int32_t cx, cy;   // with a calibration: pixels x 10, before the edge mapping and the orientation
 };
 inline int32_t clampTo(int64_t v, int32_t size) { return int32_t(v < 0 ? 0 : v >= size ? size - 1 : v); }
+// The type probe's verdict: the most frequent type of the frames probed so far.
+inline void lockType(Matrix &m)
+{
+  for (uint32_t n = 0; n < 256; ++n)
+    if (m.refType < 0 || m.probeTypes[n] > m.probeTypes[m.refType]) m.refType = int32_t(n);
+}
+// The reference: the per-node median of the frames sampled so far.
+inline void formReference(Matrix &m)
+{
+  int32_t column[kRefFrames];
+  for (uint32_t n = 0; n < m.nodes; ++n) {
+    for (uint32_t k = 0; k < m.refCount; ++k) column[k] = m.samples[k][n];
+    sort(column, m.refCount);
+    m.reference[n] = column[m.refCount / 2];
+  }
+  m.haveReference = true;
+}
 inline void toPanel(const Matrix &m, const Point &p, int32_t *x, int32_t *y)
 {
   if (m.calibrated) {
@@ -249,8 +268,7 @@ inline Feed matrixFeed(Matrix &m, const uint8_t *p, uint32_t len)
     if (type == 6 || type == 7 || type == 9 || type == 0x1d) return Feed::learning;
     ++m.probeTypes[type];
     if (++m.probeCount < kProbeFrames) return Feed::learning;
-    for (uint32_t n = 0; n < 256; ++n)
-      if (m.refType < 0 || m.probeTypes[n] > m.probeTypes[m.refType]) m.refType = int32_t(n);
+    lockType(m);
     return Feed::learning;
   }
   if (int32_t(type) != m.refType) { ++m.otherType; return Feed::otherType; }
@@ -263,15 +281,7 @@ inline Feed matrixFeed(Matrix &m, const uint8_t *p, uint32_t len)
     }
     if (rows != m.rows || cols != m.cols) { ++m.skipped; return Feed::skipped; }
     for (uint32_t n = 0; n < nodes; ++n) m.samples[m.refCount][n] = int16_t(le16(p + 64 + n * 2));
-    if (++m.refCount >= kRefFrames) {
-      int32_t column[kRefFrames];
-      for (uint32_t n = 0; n < m.nodes; ++n) {
-        for (uint32_t k = 0; k < m.refCount; ++k) column[k] = m.samples[k][n];
-        sort(column, m.refCount);
-        m.reference[n] = column[m.refCount / 2];
-      }
-      m.haveReference = true;
-    }
+    if (++m.refCount >= kRefFrames) formReference(m);
     return Feed::learning;
   }
   if (rows != m.rows || cols != m.cols) { ++m.skipped; return Feed::skipped; }
@@ -446,6 +456,24 @@ inline Feed matrixFeed(Matrix &m, const uint8_t *p, uint32_t len)
   m.x = bestX;
   m.y = bestY;
   return Feed::decoded;
+}
+
+// The controller announces few frames once it idles (desk-diag, 2026-11-12: about 12 after a start, then one every ~1.5 s), and
+// PianoTouch reads only announced frames (TouchPace.h): when it has gone quiet before the 16 probe and 32 reference frames came,
+// the type is the most frequent of at least minFrames probed so far, and the reference the median of at least minFrames samples
+// (the drift then follows the raw values by 1/8 as for any reference). The frames of a quiet controller are its idle scans: nobody
+// touches it. True once there is a reference.
+inline bool matrixSettle(Matrix &m, uint32_t minFrames = kQuietFrames)
+{
+  if (m.haveReference) return true;
+  if (minFrames < 1) minFrames = 1;
+  if (m.refType < 0) {
+    if (m.probeCount >= minFrames) detail::lockType(m);
+    return false;   // the samples come with the next frames
+  }
+  if (m.refCount < minFrames) return false;
+  detail::formReference(m);
+  return true;
 }
 
 // ----------------------------------------------------------------------------------------------------------- orientation

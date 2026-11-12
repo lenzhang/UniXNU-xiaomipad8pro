@@ -32,6 +32,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 using namespace pianotouch;
@@ -296,10 +297,12 @@ bool bringUp(Rig &r, const std::vector<uint8_t> &fw, const char *what)
                       r.m.bootChecks, r.m.bootFails);
   CHECK(rc == kOk && r.m.st == ChipModel::St::running && r.c.resetState >= 0xa0);
   CHECK(r.c.attempt == 1 && r.m.bootFails == 0);
-  CHECK(start(r.c, true, 2) == kOk && r.c.baselineRc == kOk && r.c.modeRc == kOk);
+  CHECK(start(r.c, true, 2) == kOk && r.c.stylusRc == kOk && r.c.baselineRc == kOk && r.c.modeRc == kOk);
   CHECK(r.c.payload == 5192 && r.c.payloadReported == 5192 && r.c.fwInfoValid && r.c.fwVersion == 0x21 && r.c.calibrated);
-  CHECK(r.m.hostCmds.size() == 2 && r.m.hostCmds[0].first == kCmdIdleBaseline && r.m.hostCmds[1].first == kCmdOpMode &&
-        r.m.hostCmds[1].second == 2);
+  // The stock driver's and Ubuntu's order and values: stylus scanning off, the idle baseline updated (1), operating mode 2.
+  CHECK(r.m.hostCmds.size() == 3 && r.m.hostCmds[0] == std::make_pair(uint8_t(kCmdStylus), uint16_t(0)) &&
+        r.m.hostCmds[1] == std::make_pair(uint8_t(kCmdIdleBaseline), uint16_t(1)) &&
+        r.m.hostCmds[2] == std::make_pair(uint8_t(kCmdOpMode), uint16_t(2)));
   return rc == kOk;
 }
 
@@ -332,8 +335,10 @@ void testBringUpBytes()
     Image im;
     parseImage(fw.data(), uint32_t(fw.size()), im);
     CHECK(identify(r.c) == kOk && download(r.c, im, fw.data(), uint32_t(fw.size())) == kOk);
-    CHECK(start(r.c, true, 2) == kOk && r.c.baselineRc == kErrTimeout && r.c.modeRc == kErrTimeout && r.m.hostCmds.size() == 10);
-    CHECK(start(r.c, false, 0x10000) == kOk && r.c.baselineRc == 1 && r.c.modeRc == 1);
+    CHECK(start(r.c, true, 2) == kOk && r.c.stylusRc == kErrTimeout && r.c.baselineRc == kErrTimeout && r.c.modeRc == kErrTimeout &&
+          r.m.hostCmds.size() == 15);
+    CHECK(start(r.c, false, 0x10000, false) == kOk && r.c.stylusRc == 1 && r.c.baselineRc == 1 && r.c.modeRc == 1 &&
+          r.m.hostCmds.size() == 15);
   }
   // No controller: the trim never matches.
   {
@@ -1606,36 +1611,96 @@ void testClock()
   CHECK(kVoteBits == 0x013c0000u && kGpio[kMiso] == 40 && kGpio[kCs] == 43 && kGpio[kIrq] == 162 && kGpio[kLcdId] == 100);
 }
 
-// The frame pace against a model of the NT36532E's frame handshake as the first level-2 runs on the tablet show it (TouchPace.h):
-// a frame is ready kScan us after the read of the previous one ended; it raises the line (a rising edge the host's TLMM latch keeps,
-// unless the test loses it) and waits. A read that starts before it is ready, or a frame left unread for kUnreadLimit us, puts the
-// controller into its watchdog state (transport 0xfd: no frames, the line low) until a download. Both triggers are the hypotheses
-// the runs agree with: attend1's display-off pace (reads ~500-560 ms apart) went to 0xfd while muted, the level-1 loop (200 ms
-// apart at most) never did, so the unread limit is modeled between them at 450 ms; attend2's three downloads went to 0xfd at once
-// while the 12 ms edge-less reads ran inside a ~12.6 ms cycle.
+// The frame pace against a model of the NT36532E (TouchPace.h). Active (a finger, a start): a frame is ready kScan us after the
+// read of the previous one ended; it raises the line (a rising edge the host's TLMM latch keeps, unless the test loses it) and
+// waits; a read that starts before it is ready, or an announced frame left unread for unreadLimit us, puts the controller into its
+// watchdog state (the attend1/attend2 hypotheses of 2026-11-11, kept). Idle (op mode 2, nobody touching, from idleAfter us after a
+// start or the last finger; idleAfter 0: never, the model of 2026-11-11): it announces a frame only every announce us and rewrites
+// its buffer by itself in between; a read it did not announce collides with that with the odds desk-diag gives (2026-11-12: about
+// one in 6 in the first second of idling, after a start, one in 700 later at the 100 ms rest pace): the watchdog state. In it the
+// line rises every kScan us (the tablet: ~150 edges a second), every frame a watchdog block, until a download. A finger wakes an
+// idle controller: its first frame announced wake us later.
 struct FeedModel {
   uint64_t scanUs = 6500, unreadLimitUs = 450000;
   uint64_t startUs = 0;   // the first frame after a download's start comes this much later than a scan (the tablet: ~850 ms)
-  uint64_t readyAt = 6500;
-  bool edgeOut = false, watchdog = false;
-  uint32_t collisions = 0, starvations = 0, downloads = 0;
+  uint64_t idleAfterUs = 0, announceUs = 1500000, wakeUs = 30000;
+  uint32_t entryOdds = 6, restOdds = 700;
+  uint64_t readyAt = 6500, lastActiveUs = 0, idleSinceUs = 0;
+  bool edgeOut = false, watchdog = false, idle = false;
+  uint32_t collisions = 0, starvations = 0, downloads = 0, unannounced = 0, idleCollisions = 0, idleEntries = 0, announces = 0;
+  uint64_t rng = 0x9e3779b97f4a7c15ull;
+  bool chance(uint32_t odds)
+  {
+    rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+    return (rng >> 33) % odds == 0;
+  }
   bool pending(uint64_t t) const { return !watchdog && t >= readyAt; }
+  // Each step: the finger (active from its landing on), the idle entry, the edge. Returns true when the line rose.
+  bool step(uint64_t t, bool finger)
+  {
+    if (finger && !watchdog) {
+      if (idle) {
+        idle = false;
+        readyAt = t + wakeUs;
+        edgeOut = false;
+      }
+      lastActiveUs = t;
+    }
+    if (!idle && !watchdog && idleAfterUs && !finger && t >= lastActiveUs + idleAfterUs) {
+      idle = true;
+      ++idleEntries;
+      idleSinceUs = t;
+      readyAt = t + announceUs;
+      edgeOut = false;
+    }
+    if (!edgeOut && t >= readyAt) {
+      edgeOut = true;
+      if (idle && !watchdog) ++announces;
+      return true;
+    }
+    return false;
+  }
   // A read from t for readUs: the frame (false: a watchdog frame, or a collision that starts the watchdog).
   bool read(uint64_t t, uint64_t readUs)
   {
-    if (watchdog) return false;
-    if (t < readyAt) {
-      ++collisions;
-      watchdog = true;
+    if (watchdog) {
+      readyAt = t + readUs + scanUs;   // its next 0xfd block
+      edgeOut = false;
       return false;
     }
+    if (idle) {
+      if (edgeOut) {   // an announced idle frame
+        readyAt = t + readUs + announceUs;
+        edgeOut = false;
+        return true;
+      }
+      ++unannounced;
+      if (chance(t - idleSinceUs < 1000000 ? entryOdds : restOdds)) {
+        ++idleCollisions;
+        ++collisions;
+        watchdog = true;
+        readyAt = t + readUs + scanUs;
+        edgeOut = false;
+        return false;
+      }
+      return true;   // a frame it was rewriting by itself (good or torn)
+    }
+    if (t < readyAt) {
+      ++collisions;
+      ++unannounced;
+      watchdog = true;
+      readyAt = t + readUs + scanUs;
+      edgeOut = false;
+      return false;
+    }
+    if (!edgeOut) ++unannounced;   // ready, its edge not out yet in this step: a read on the line's level (the model's line)
     readyAt = t + readUs + scanUs;
     edgeOut = false;
     return true;
   }
   void check(uint64_t t)
   {
-    if (!watchdog && t >= readyAt && t - readyAt > unreadLimitUs) {
+    if (!watchdog && edgeOut && t >= readyAt && t - readyAt > unreadLimitUs) {
       ++starvations;
       watchdog = true;
     }
@@ -1643,73 +1708,100 @@ struct FeedModel {
   void download(uint64_t t)
   {
     ++downloads;
-    watchdog = false;
+    watchdog = idle = false;
     readyAt = t + 190000 + scanUs + startUs;   // ~185 ms for the download, then the first frame (startUs: the controller's start)
+    lastActiveUs = t + 190000 + startUs;
     edgeOut = false;
   }
 };
 
-// The loop's rules: the current ones (TouchPace.h and PianoTouch::serve) or the previous ones (the attend images of 2026-11-11:
-// the latch dropped after each idle sleep, 12 ms without an edge while busy, the idle period + 10 ms at rest and blind after three
-// edge-less reads, 500 ms reads with 250 ms waits with the display off).
+// The loop's rules: the default ones (TouchPace.h readOn and PianoTouch::serve), the ones before 2026-11-12's announced-frame rule
+// (blind: piano-touch-noedge=50, the desk-diag image, with the start's grace; noGrace: without it, the desk1 image), or the attend
+// images' of 2026-11-11 (previous: the latch dropped after each idle sleep, 12 ms without an edge while busy, the idle period + 10
+// ms at rest and blind after three edge-less reads, 500 ms reads with 250 ms waits with the display off).
 struct LoopRules {
   bool previous = false;
-  bool noGrace = false;   // the current rules without TouchPace.h's StartGrace (before 2026-11-12's desk1 fix)
+  bool noGrace = false;
+  uint32_t blindMs = 0;
 };
+const LoopRules kDefaultRules{}, kAttendRules{true}, kDeskDiagRules{false, false, kNoEdgeBusyMs}, kDesk1Rules{false, true, kNoEdgeBusyMs};
 struct FeedRun {
-  unsigned reads = 0, frames = 0, wakeups = 0, edgeReads = 0, levelReads = 0, blindReads = 0, downloads = 0;
-  uint64_t firstSeenUs = 0, maxGapUs = 0;
+  unsigned reads = 0, frames = 0, wakeups = 0, edgeReads = 0, levelReads = 0, blindReads = 0, downloads = 0, watchdogFrames = 0;
+  unsigned stalls = 0, settled = 0, quiets = 0;
+  uint64_t firstSeenUs = 0, maxGapUs = 0, maxWaitUs = 0, learnedUs = 0, lastLiftUs = 0;
   FeedModel m;
 };
-// loseEdges: every Nth edge never reaches the latch (0: none; 1: none at all, the latch broken). mutedUntil: the display off
-// until then. A finger in [fingerOn, fingerOff). watchdogAt: the controller goes to 0xfd by itself then (0: never).
-static FeedRun simulateFeed(LoopRules rules, uint64_t durationUs, uint64_t mutedUntilUs, uint64_t fingerOn, uint64_t fingerOff,
-                            unsigned loseEdges = 0, uint64_t scanUs = 6500, uint64_t watchdogAt = 0, uint64_t startUs = 0)
+struct FeedSetup {
+  uint64_t durationUs = 0, mutedUntilUs = 0, fingerOn = ~0ull, fingerOff = ~0ull;
+  unsigned loseEdges = 0;          // every Nth edge never reaches the latch (0: none; 1: none at all, the latch broken)
+  uint64_t scanUs = 6500;
+  uint64_t watchdogAt = 0;         // the controller goes to 0xfd by itself then (0: never)
+  uint64_t startUs = 0;
+  uint64_t idleAfterUs = 0;        // the controller idles (0: never)
+};
+static FeedRun simulateFeed(LoopRules rules, const FeedSetup &s)
 {
   constexpr uint64_t kReadUs = 5100;
   FeedRun r;
-  r.m.scanUs = scanUs;
-  r.m.readyAt = scanUs;
-  r.m.startUs = startUs;
-  TouchPace pace = touchPace(kIdleReadMs, 0);
+  r.m.scanUs = s.scanUs;
+  r.m.readyAt = s.scanUs;
+  r.m.startUs = s.startUs;
+  r.m.idleAfterUs = s.idleAfterUs;
+  TouchPace pace = touchPace(kIdleReadMs, 0, rules.blindMs);
   WatchdogRecovery wd;
   StartGrace grace;
-  uint64_t t = 0, lastRead = 0;
-  bool latch = false, edgePending = false, rest = false, touching = false;
+  // The controller is stepped every millisecond; the loop runs its passes at the times it schedules (a wake-up each).
+  uint64_t t = 0, nextPass = 0, lastRead = 0;
+  bool latch = false, dropLatch = false, edgePending = false, rest = false, touching = false;
+  Quiet quiet;
   unsigned edgeCount = 0, wdtRun = 0, prevBlind = 0;
-  bool learning = true;
-  while (t < durationUs) {
-    ++r.wakeups;
-    if (watchdogAt && t >= watchdogAt && !r.m.watchdog && r.m.downloads == 0) r.m.watchdog = true;
-    if (!r.m.watchdog && !r.m.edgeOut && t >= r.m.readyAt) {   // the rising edge
-      r.m.edgeOut = true;
+  // The decoder's learning (TouchMatrix.h): 16 probe frames, 32 samples; with the controller quiet, 4 and 4 (matrixSettle).
+  unsigned probe = 0, samples = 0;
+  bool locked = false, learned = false;
+  auto relearn = [&] { probe = samples = 0; locked = learned = false; };
+  while (t < s.durationUs) {
+    const bool finger = t >= s.fingerOn && t < s.fingerOff;
+    if (s.watchdogAt && t >= s.watchdogAt && !r.m.watchdog && r.m.downloads == 0) r.m.watchdog = true;
+    if (r.m.step(t, finger)) {   // the rising edge, into TLMM's latch (unless lost)
       ++edgeCount;
-      if (!loseEdges || (loseEdges > 1 && edgeCount % loseEdges)) latch = true;
+      if (!s.loseEdges || (s.loseEdges > 1 && edgeCount % s.loseEdges)) latch = true;
     }
     r.m.check(t);
+    if (t < nextPass) {
+      t += 1000;
+      continue;
+    }
+    ++r.wakeups;
+    if (dropLatch) {   // the attend images dropped the latch after each idle sleep
+      dropLatch = false;
+      latch = false;
+    }
     if (latch) {
       latch = false;
       edgePending = true;
+      quiet.edge(t / 1000);
       grace.edge();
     }
-    const bool muted = t < mutedUntilUs;
+    const bool muted = t < s.mutedUntilUs;
     const uint64_t since = t - lastRead;
     const bool level = r.m.pending(t);
-    bool readNow;
+    ReadOn on = ReadOn::none;
     if (rules.previous) {
+      bool readNow;
       if (muted) readNow = since >= 500000;
       else if (rest) readNow = edgePending || since >= (prevBlind >= 3 ? kIdleReadMs : kIdleReadMs + 10) * 1000ull;
       else readNow = edgePending || since >= 12000;
+      if (readNow) on = edgePending ? ReadOn::edge : ReadOn::blind;
     } else {
       const bool levelPending = !edgePending && since >= kNoEdgeMinMs * 1000ull && level;
-      if (!rules.noGrace && grace.holds(t / 1000)) readNow = edgePending || levelPending;   // after a start: the first frame's edge
-      else if (muted) readNow = since >= kMutedReadMs * 1000ull;
-      else if (rest) readNow = since >= pace.idleMs * 1000ull && (edgePending || levelPending || since >= pace.noEdgeMs(true) * 1000ull);
-      else readNow = edgePending || levelPending || since >= pace.noEdgeMs(false) * 1000ull;
-      if (readNow && !edgePending) (levelPending ? r.levelReads : r.blindReads)++;
+      ReadCue cue{edgePending, levelPending, true, muted, rest, !rules.noGrace && grace.holds(t / 1000), since / 1000};
+      on = readOn(pace, cue);
     }
-    if (readNow) {
-      if (edgePending) ++r.edgeReads;
+    if (on != ReadOn::none) {
+      if (on == ReadOn::edge) ++r.edgeReads;
+      else if (on == ReadOn::level) ++r.levelReads;
+      else ++r.blindReads;
+      if (on != ReadOn::blind && r.m.pending(t) && t - r.m.readyAt > r.maxWaitUs) r.maxWaitUs = t - r.m.readyAt;
       if (rules.previous) prevBlind = edgePending ? 0 : prevBlind + 1;
       edgePending = false;
       if (lastRead && t - lastRead > r.maxGapUs) r.maxGapUs = t - lastRead;
@@ -1720,99 +1812,181 @@ static FeedRun simulateFeed(LoopRules rules, uint64_t durationUs, uint64_t muted
       if (frame) {
         ++r.frames;
         wdtRun = 0;
-        if (r.frames > 48) learning = false;   // the reference learned
-        touching = t >= fingerOn && t < fingerOff;
+        if (!learned) {
+          if (!locked && ++probe >= kProbeFrames) locked = true;
+          else if (locked && ++samples >= kRefFrames) learned = true;
+          if (learned && !r.learnedUs) r.learnedUs = t;
+        }
+        const bool was = touching;
+        touching = learned && finger;
         if (touching && !r.firstSeenUs) r.firstSeenUs = t;
-      } else if (++wdtRun >= kWatchdogRun && !muted) {
-        if (rules.previous ? r.m.downloads < 3 : wd.due(t / 1000)) {
-          wd.downloaded(t / 1000);
-          r.m.download(t);
-          t += 190000;
-          lastRead = t;   // as PianoTouch::serve: the edge-less wait starts again at the download's end
-          edgePending = false;
-          wdtRun = 0;
-          learning = true;
-          ++r.downloads;
-          grace.started(t / 1000);
+        if (was && !touching) r.lastLiftUs = t;
+      } else {
+        ++r.watchdogFrames;
+        if (++wdtRun >= kWatchdogRun && !muted) {
+          if (rules.previous ? r.m.downloads < 3 : wd.due(t / 1000)) {
+            wd.downloaded(t / 1000);
+            r.m.download(t);
+            t += 190000;
+            lastRead = t;   // as PianoTouch::serve: the wait starts again at the download's end
+            quiet.started(t / 1000);
+            edgePending = latch = false;   // firmware(): the latch emptied after the download
+            wdtRun = 0;
+            relearn();
+            ++r.downloads;
+            grace.started(t / 1000);
+          }
         }
       }
     }
+    // The controller quiet: the reference formed from what came (matrixSettle).
+    if (!rules.previous && quiet.step(t / 1000)) ++r.quiets;
+    if (!rules.previous && quiet.quiet && !locked && probe >= kQuietFrames) locked = true;
+    if (!rules.previous && quiet.quiet && !learned && locked && samples >= kQuietFrames) {
+      learned = true;
+      ++r.settled;
+      if (!r.learnedUs) r.learnedUs = t;
+    }
+    // A contact without frames (kStallMs): taken as the lift.
+    if (!rules.previous && stalled(touching, t / 1000, lastRead / 1000)) {
+      ++r.stalls;
+      touching = false;
+      r.lastLiftUs = t;
+    }
+    // The next pass.
     if (muted) {   // the display off
-      t += rules.previous ? 250000 : std::max<uint64_t>(1000, kMutedReadMs * 1000ull - (t - lastRead));
+      const uint64_t gone = t - lastRead;
+      nextPass = t + (rules.previous ? 250000 : gone >= kMutedReadMs * 1000ull ? kMutedReadMs * 1000ull : kMutedReadMs * 1000ull - gone);
       continue;
     }
+    const bool learning = !learned && (rules.previous || rules.blindMs || !quiet.quiet);
     const bool busy = touching || learning || wdtRun;
     rest = pace.idle(t / 1000, busy);
+    nextPass = t + 1000;   // busy: the latch every 1 ms
     if (rest && !edgePending) {
       const uint64_t due = lastRead + pace.idleMs * 1000ull;
-      if (t + (rules.previous && prevBlind < 3 ? 2000 : 0) < due) {
-        t = due - (rules.previous && prevBlind < 3 ? 2000 : 0);
-        if (rules.previous) {   // the latch dropped after the sleep
-          if (!r.m.watchdog && !r.m.edgeOut && t >= r.m.readyAt) r.m.edgeOut = true;
-          latch = false;
+      if (rules.previous) {
+        const uint64_t lead = prevBlind < 3 ? 2000 : 0;
+        if (t + lead < due) {
+          nextPass = due - lead;
+          dropLatch = true;
         }
-        continue;
+      } else if (t < due) {
+        nextPass = due;
+      } else if (!rules.blindMs) {
+        nextPass = t + pace.idleMs * 1000ull;   // the latch looked at again in one idle period
       }
     }
-    t += 1000;
   }
   return r;
 }
 
 static void testPace()
 {
-  CHECK(TouchPace::clampIdle(0) == 0 && TouchPace::clampIdle(1) == kIdleReadMinMs && TouchPace::clampIdle(9999) == kIdleReadMaxMs);
-  CHECK(kIdleReadMaxMs + kNoEdgeRestMs <= kMaxGapMs && kMutedReadMs <= kMaxGapMs && kNoEdgeMinMs * 1000 > kFrameCycleUs);
-  CHECK(touchPace(50, 0).noEdgeMs(false) == kNoEdgeBusyMs && touchPace(50, 0).noEdgeMs(true) == 100 && touchPace(0, 0).noEdgeMs(false) == 200);
-  CHECK(touchPace(50, 0, 1).noEdgeMs(false) == kNoEdgeMinMs && touchPace(50, 0, 999).noEdgeMs(false) == kNoEdgeOldMs);
-  const LoopRules current, previous{true};
-  // 1. The first runs, reproduced by the previous rules: the display off for 70 s at boot starves the controller (attend1); no
-  //    edges at all while a finger is down makes the 12 ms reads collide with the scan (attend2: 0xfd at once, three downloads, given
-  //    up). The current rules feed it in both.
+  // The decision itself (readOn): an announced frame (an edge, the line still high) is read at once while busy, after the idle
+  // period at rest, after kMutedReadMs with the display off; nothing else is ever read unless the old rules are asked for.
   {
-    const FeedRun prev = simulateFeed(previous, 80000000, 70000000, ~0ull, ~0ull);
-    const FeedRun now = simulateFeed(current, 80000000, 70000000, ~0ull, ~0ull);
-    std::printf("feed: display off 70 s at boot: previous rules %u watchdogs (max %llu ms unread), current %u (max gap %llu ms)\n",
-                prev.m.starvations + prev.m.collisions, (unsigned long long)(prev.maxGapUs / 1000), now.m.starvations + now.m.collisions,
-                (unsigned long long)(now.maxGapUs / 1000));
+    const TouchPace p = touchPace(50, 0), old = touchPace(50, 0, kNoEdgeBusyMs), every = touchPace(0, 0);
+    CHECK(TouchPace::clampIdle(0) == 0 && TouchPace::clampIdle(1) == kIdleReadMinMs && TouchPace::clampIdle(9999) == kIdleReadMaxMs);
+    CHECK(TouchPace::clampBlind(0) == 0 && TouchPace::clampBlind(1) == kNoEdgeMinMs && TouchPace::clampBlind(999) == kNoEdgeOldMs);
+    CHECK(p.blindMs == 0 && old.blindMs == kNoEdgeBusyMs && kNoEdgeMinMs * 1000 > kFrameCycleUs && kMaxWaitMs == 200);
+    auto cue = [](bool edge, bool level, bool muted, bool rest, uint64_t since, bool latch = true, bool grace = false) {
+      return ReadCue{edge, level, latch, muted, rest, grace, since};
+    };
+    CHECK(readOn(p, cue(true, false, false, false, 0)) == ReadOn::edge);
+    CHECK(readOn(p, cue(false, true, false, false, 30)) == ReadOn::level);
+    CHECK(readOn(p, cue(false, false, false, false, 100000)) == ReadOn::none);   // busy: never by a timer
+    CHECK(readOn(p, cue(true, false, false, true, 49)) == ReadOn::none && readOn(p, cue(true, false, false, true, 50)) == ReadOn::edge);
+    CHECK(readOn(p, cue(false, false, false, true, 100000)) == ReadOn::none);    // at rest: an idling controller is not read
+    CHECK(readOn(p, cue(true, false, true, false, 199)) == ReadOn::none && readOn(p, cue(true, false, true, false, 200)) == ReadOn::edge);
+    CHECK(readOn(p, cue(false, false, true, false, 100000)) == ReadOn::none);    // the display off: nor then
+    CHECK(readOn(every, cue(true, false, false, false, 0)) == ReadOn::edge && readOn(every, cue(false, false, false, false, 9999)) == ReadOn::none);
+    // Without a latch every read is blind, every kNoEdgeOldMs (the level-1 loop).
+    CHECK(readOn(p, cue(false, false, false, false, 199, false)) == ReadOn::none && readOn(p, cue(false, false, false, false, 200, false)) == ReadOn::blind);
+    // The old rules (piano-touch-noedge=50): busy 50 ms, at rest the idle period + 50, the display off 200; never in the start's grace.
+    CHECK(readOn(old, cue(false, false, false, false, 49)) == ReadOn::none && readOn(old, cue(false, false, false, false, 50)) == ReadOn::blind);
+    CHECK(readOn(old, cue(false, false, false, true, 99)) == ReadOn::none && readOn(old, cue(false, false, false, true, 100)) == ReadOn::blind);
+    CHECK(readOn(old, cue(false, false, true, false, 200)) == ReadOn::blind && readOn(old, cue(false, false, false, false, 50, true, true)) == ReadOn::none);
+    CHECK(stalled(true, 1250, 1000) && !stalled(true, 1249, 1000) && !stalled(false, 9999, 0) && !stalled(true, 10, 20));
+    // Quiet: no edge for kQuietMs; the single frames an idling controller announces keep it quiet, a burst of kActiveEdges ends it.
+    Quiet q;
+    CHECK(!q.step(399) && q.step(400) && q.quiet && q.quiets == 1 && !q.step(5000));
+    CHECK(!q.edge(6000) && !q.edge(7500) && !q.edge(9000) && q.quiet);   // an idling controller's frames, 1.5 s apart
+    CHECK(!q.edge(9010) && q.edge(9020) && !q.quiet && !q.edge(9030));    // a burst: active
+    CHECK(!q.step(9429) && q.step(9430) && q.quiets == 2);
+    q.started(20000);
+    CHECK(!q.quiet && !q.step(20399) && q.step(20400));
+    CHECK(std::string(readOnName(ReadOn::blind)) == "without either" && std::string(readOnName(ReadOn::edge)) == "on an edge");
+  }
+  // 1. The 2026-11-11 runs, reproduced by the attend images' rules on the model without idling: the display off for 70 s at boot
+  //    starves the controller (attend1); no edges at all while a finger is down makes the 12 ms reads collide with the scan
+  //    (attend2: 0xfd at once, three downloads, given up). The default rules keep it out of both.
+  {
+    const FeedSetup boot{80000000, 70000000};
+    const FeedRun prev = simulateFeed(kAttendRules, boot), now = simulateFeed(kDefaultRules, boot);
+    std::printf("feed: display off 70 s at boot: attend rules %u watchdogs (max %llu ms unread), default %u (an announced frame waits "
+                "at most %llu ms)\n", prev.m.starvations + prev.m.collisions, (unsigned long long)(prev.maxGapUs / 1000),
+                now.m.starvations + now.m.collisions, (unsigned long long)(now.maxWaitUs / 1000));
     CHECK(prev.m.starvations >= 1);
-    CHECK(now.m.starvations == 0 && now.m.collisions == 0 && now.downloads == 0 && now.maxGapUs <= kMaxGapMs * 1000ull);
+    CHECK(now.m.starvations == 0 && now.m.collisions == 0 && now.downloads == 0 && now.maxWaitUs <= kMaxWaitMs * 1000ull + 1000);
+    CHECK(now.blindReads == 0);
   }
   {
-    const FeedRun prev = simulateFeed(previous, 30000000, 0, 10000000, 20000000, 1, 7500);   // no edges, a 12.6 ms cycle
-    const FeedRun now = simulateFeed(current, 30000000, 0, 10000000, 20000000, 1, 7500);
-    std::printf("feed: no edges, a finger for 10 s: previous rules %u collisions, %u downloads; current %u, %u (%u reads on the line, "
+    FeedSetup noEdges{30000000, 0, 10000000, 20000000, 1, 7500};   // no edges, a 12.6 ms cycle
+    const FeedRun prev = simulateFeed(kAttendRules, noEdges), now = simulateFeed(kDefaultRules, noEdges);
+    std::printf("feed: no edges, a finger for 10 s: attend rules %u collisions, %u downloads; default %u, %u (%u reads on the line, "
                 "%u without)\n", prev.m.collisions, prev.downloads, now.m.collisions, now.downloads, now.levelReads, now.blindReads);
     CHECK(prev.m.collisions >= 1 && prev.downloads >= 1);
-    CHECK(now.m.collisions == 0 && now.m.starvations == 0 && now.downloads == 0 && now.frames > 300);
+    CHECK(now.m.collisions == 0 && now.m.starvations == 0 && now.downloads == 0 && now.frames > 300 && now.blindReads == 0);
   }
-  // 2. The current rules in every case: edges always, every 3rd edge lost, none at all; cycles of 11.6 and 16 ms; with and without a
-  //    finger; the display off at boot. Never a watchdog, at most kMaxGapMs between reads.
+  // 2. The default rules on the model without idling: edges always, every 3rd edge lost, none at all (then the line's level);
+  //    cycles of 11.6 and 16 ms; with and without a finger; the display off at boot. Never a watchdog, never a read without an
+  //    announced frame, an announced frame read within kMaxWaitMs.
   for (unsigned lose : {0u, 3u, 1u})
     for (uint64_t scan : {6500ull, 11000ull})
       for (uint64_t muted : {0ull, 5000000ull}) {
-        const FeedRun r = simulateFeed(current, 20000000, muted, 8000000, 12000000, lose, scan);
-        CHECK(r.m.collisions == 0 && r.m.starvations == 0 && r.downloads == 0 && r.maxGapUs <= kMaxGapMs * 1000ull);
+        const FeedRun r = simulateFeed(kDefaultRules, FeedSetup{20000000, muted, 8000000, 12000000, lose, scan});
+        CHECK(r.m.collisions == 0 && r.m.starvations == 0 && r.downloads == 0 && r.blindReads == 0 && r.m.unannounced <= r.levelReads);
+        CHECK(r.maxWaitUs <= kMaxWaitMs * 1000ull + 1000);
       }
-  // 3. Under a finger every frame on its edge (~80 a second at an 11.6 ms cycle); at rest ~20; a touch at rest read within an idle
-  //    period and a cycle.
+  // 3. desk-diag (2026-11-12): 20 minutes nobody touching; the controller idles ~0.3 s after each start (about 12 frames, then one
+  //    announced every 1.5 s). The rules of that image (reads without an edge: busy 50 ms, at rest 100 ms) put it into the watchdog
+  //    state ~2 s after every download and every minute or two at rest: the download loop. The default ones read only its
+  //    announced frames: no watchdog, the reference from the quiet controller's frames (matrixSettle) within seconds.
   {
-    const FeedRun busy = simulateFeed(current, 6000000, 0, 1000000, 7000000);
-    CHECK(busy.frames >= 380 && busy.edgeReads >= busy.reads - 5);
-    const FeedRun idle = simulateFeed(current, 12000000, 0, ~0ull, ~0ull);
-    std::printf("feed: at rest %u reads and %u wake-ups in 12 s (learning included); a finger: %u frames in 5 s\n", idle.reads,
-                idle.wakeups, busy.frames);
-    CHECK(idle.reads >= 300 && idle.reads <= 420 && idle.wakeups <= 4 * idle.reads);   // ~50 learning, ~120 the hold, ~210 at rest
+    const FeedSetup desk{1200000000, 0, ~0ull, ~0ull, 0, 6500, 0, 0, 300000};
+    const FeedRun old = simulateFeed(kDeskDiagRules, desk), now = simulateFeed(kDefaultRules, desk);
+    std::printf("feed: 20 min at rest, the controller idling: desk-diag's rules %u downloads (%u reads without an edge, %u collisions); "
+                "default %u downloads, %u collisions, %u reads (%u without an edge), %u wake-ups, the reference after %llu ms (%u settled)\n",
+                old.downloads, old.blindReads, old.m.collisions, now.downloads, now.m.collisions, now.reads, now.blindReads, now.wakeups,
+                (unsigned long long)(now.learnedUs / 1000), now.settled);
+    CHECK(old.downloads >= 20 && old.m.idleCollisions >= 20);
+    CHECK(now.downloads == 0 && now.m.collisions == 0 && now.m.starvations == 0 && now.blindReads == 0 && now.m.unannounced == 0);
+    CHECK(now.reads >= now.m.announces && now.reads <= now.m.announces + 40);   // the start's ~25, then every announced frame, nothing else
+    CHECK(now.learnedUs && now.learnedUs < 10000000 && now.settled == 1 && now.quiets == 1);
+    CHECK(now.wakeups <= 24 * 1200);   // a look at the latch per idle period: ~20 a second, ~0.7 reads
+    // desk1's (without the start's grace) as well.
+    const FeedRun desk1 = simulateFeed(kDesk1Rules, desk);
+    CHECK(desk1.downloads >= 20);
+  }
+  // 4. A touch on the idling controller (it wakes and announces every frame): read within an idle period and its wake, ~80 frames
+  //    a second under the finger, the lift seen in its frames (not a stall), then idle again; no watchdog, nothing unannounced.
+  {
     uint64_t worst = 0;
     for (uint64_t phase = 0; phase < 60000; phase += 1777) {
-      const uint64_t on = 8000000 + phase;
-      const FeedRun r = simulateFeed(current, on + 300000, 0, on, on + 300000);
-      CHECK(r.firstSeenUs && r.firstSeenUs - on <= (kIdleReadMs + 13 + 5) * 1000ull);
+      const uint64_t on = 20000000 + phase;
+      const FeedRun r = simulateFeed(kDefaultRules, FeedSetup{on + 3000000, 0, on, on + 1000000, 0, 6500, 0, 0, 300000});
+      CHECK(r.firstSeenUs && r.firstSeenUs - on <= (kIdleReadMs + 30 + 13 + 6) * 1000ull);
+      CHECK(r.m.collisions == 0 && r.downloads == 0 && r.blindReads == 0 && r.stalls == 0 && r.lastLiftUs >= on + 1000000);
       if (r.firstSeenUs) worst = std::max(worst, r.firstSeenUs - on);
     }
-    std::printf("feed: a touch at rest read at most %llu ms after it landed\n", (unsigned long long)(worst / 1000));
+    const FeedRun busy = simulateFeed(kDefaultRules, FeedSetup{26000000, 0, 20000000, 25000000, 0, 6500, 0, 0, 300000});
+    std::printf("feed: a touch on the idling controller read at most %llu ms after it landed; a finger: %u frames in 5 s\n",
+                (unsigned long long)(worst / 1000), busy.frames);
+    CHECK(busy.frames >= 380 && busy.edgeReads == busy.reads);
   }
-  // 4. The watchdog by itself (the controller's own): the download at once, then every 10 s while it comes back, never given up.
+  // 5. The watchdog by itself (the controller's own): the download at once, then every 10 s while it comes back, never given up;
+  //    its blocks are read as it announces them (the line rises all the time in that state).
   {
     WatchdogRecovery wd;
     CHECK(wd.due(1000));
@@ -1820,12 +1994,14 @@ static void testPace()
     CHECK(!wd.due(5000) && !wd.due(10999) && wd.due(11000));
     wd.downloaded(11000);
     CHECK(!wd.due(20000) && wd.due(21000) && wd.downloads == 2);
-    const FeedRun r = simulateFeed(current, 10000000, 0, ~0ull, ~0ull, 0, 6500, 3000000);
-    CHECK(r.downloads == 1 && !r.m.watchdog && r.frames > 100);   // it came back after the download
+    const FeedRun r = simulateFeed(kDefaultRules, FeedSetup{10000000, 0, ~0ull, ~0ull, 0, 6500, 3000000});
+    CHECK(r.downloads == 1 && !r.m.watchdog && r.frames > 100 && r.blindReads == 0);   // it came back after the download
+    const FeedRun idling = simulateFeed(kDefaultRules, FeedSetup{60000000, 0, ~0ull, ~0ull, 0, 6500, 3000000, 0, 300000});
+    CHECK(idling.downloads == 1 && !idling.m.watchdog && idling.m.collisions == 0 && idling.blindReads == 0);
   }
-  // 5. desk1 (2026-11-12): after a download the controller's first frame comes ~850 ms later. Without the start's grace the busy
-  //    pace reads 50 ms after the download without an edge, inside the start: the watchdog again, download after download (every
-  //    10 s, never back); with it the first read waits for the first edge and the controller comes back after one download.
+  // 6. desk1 (2026-11-12): after a download the controller's first frame comes ~850 ms later. Without the start's grace the old
+  //    rules read 50 ms after the download without an edge, inside the start: the watchdog again, download after download; the
+  //    grace and the default rules wait for the first edge.
   {
     StartGrace g;
     CHECK(!g.holds(0));
@@ -1833,18 +2009,46 @@ static void testPace()
     CHECK(g.holds(1500) && g.holds(2999) && !g.holds(3000) && g.expired == 1);
     g.started(5000);
     CHECK(g.holds(5100) && g.edge() && !g.edge() && !g.holds(5200) && g.edges == 1 && g.starts == 2);
-    const LoopRules before{false, true};
-    const FeedRun old = simulateFeed(before, 40000000, 0, ~0ull, ~0ull, 0, 6500, 3000000, 850000);
-    const FeedRun now = simulateFeed(current, 40000000, 0, ~0ull, ~0ull, 0, 6500, 3000000, 850000);
-    std::printf("feed: a start of 850 ms after each download: without the grace %u downloads, %u collisions (back: %s); with it %u, "
-                "%u (back: %s)\n", old.downloads, old.m.collisions, old.m.watchdog ? "no" : "yes", now.downloads, now.m.collisions,
-                now.m.watchdog ? "no" : "yes");
+    const FeedSetup start{40000000, 0, ~0ull, ~0ull, 0, 6500, 3000000, 850000};
+    const FeedRun old = simulateFeed(kDesk1Rules, start), grace = simulateFeed(kDeskDiagRules, start), now = simulateFeed(kDefaultRules, start);
+    std::printf("feed: a start of 850 ms after each download: desk1's rules %u downloads, %u collisions (back: %s); desk-diag's %u, %u; "
+                "default %u, %u (back: %s)\n", old.downloads, old.m.collisions, old.m.watchdog ? "no" : "yes", grace.downloads,
+                grace.m.collisions, now.downloads, now.m.collisions, now.m.watchdog ? "no" : "yes");
     CHECK(old.downloads >= 3 && old.m.collisions >= 2);
+    CHECK(grace.downloads == 1 && grace.m.collisions == 0);
     CHECK(now.downloads == 1 && now.m.collisions == 0 && !now.m.watchdog && now.frames > 300);
-    // The grace ends by itself: a line that never rises after the start is read without edges again 2 s later.
-    const FeedRun dead = simulateFeed(current, 20000000, 0, ~0ull, ~0ull, 1, 6500, 3000000, 850000);
+    // A line that never rises after the start: the old rules read without edges again 2 s later; the default ones wait.
+    const FeedRun dead = simulateFeed(kDeskDiagRules, FeedSetup{20000000, 0, ~0ull, ~0ull, 1, 6500, 3000000, 850000});
     CHECK(dead.reads > 50);
   }
+}
+
+// The reference of a controller that went quiet (TouchMatrix.h matrixSettle): the type from at least kQuietFrames probe frames, then
+// the median of at least kQuietFrames samples; a touch afterwards decodes as with a full reference.
+static void testSettle()
+{
+  static ChipModel cm;
+  static Matrix m;
+  matrixReset(m, MatrixConfig{});
+  auto frame = [&](int32_t (*extra)(uint32_t, uint32_t)) {
+    cm.produce(3, extra);
+    ++cm.counter;
+    std::vector<uint8_t> p(cm.payload);
+    for (uint32_t i = 0; i < cm.payload; ++i) p[i] = cm.get(cm.eventBuf() + 256 + i);
+    return matrixFeed(m, p.data(), uint32_t(p.size()));
+  };
+  auto none = [](uint32_t, uint32_t) { return 0; };
+  CHECK(!matrixSettle(m) && m.refType < 0);
+  for (unsigned n = 0; n < 3; ++n) CHECK(frame(none) == Feed::learning);
+  CHECK(!matrixSettle(m) && m.refType < 0);   // 3 probe frames: not yet
+  CHECK(frame(none) == Feed::learning && !matrixSettle(m) && m.refType == 3 && !m.haveReference);
+  for (unsigned n = 0; n < 3; ++n) CHECK(frame(none) == Feed::learning);
+  CHECK(!matrixSettle(m) && !m.haveReference);   // 3 samples
+  CHECK(frame(none) == Feed::learning && matrixSettle(m) && m.haveReference && m.refCount == kQuietFrames);
+  CHECK(frame(none) == Feed::decoded && !m.touching);
+  CHECK(frame([](uint32_t rr, uint32_t c) { return rr >= 19 && rr <= 21 && c >= 29 && c <= 31 ? (rr == 20 && c == 30 ? 900 : 400) : 0; }) ==
+            Feed::decoded && m.touching);
+  CHECK(matrixSettle(m, 0));   // with a reference: true, nothing changes
 }
 
 int main(int argc, char **argv)
@@ -1866,12 +2070,13 @@ int main(int argc, char **argv)
   testPower();
   testClock();
   testPace();
+  testSettle();
   if (failures) {
     std::printf("PianoTouch host tests: %d FAILED\n", failures);
     return 1;
   }
   std::printf("PASS: PianoTouch host tests (NT36532E model over whole transfers and by hand, %d real image(s), matrix, calibration, "
               "orientation, tip, HID, rotation, points, tracker, palms, gestures, gestures under rotation, burst hold, clocks, "
-              "pace, power states, the probe)\n", argc - 1);
+              "pace, the quiet reference, power states, the probe)\n", argc - 1);
   return 0;
 }

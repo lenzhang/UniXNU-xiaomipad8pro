@@ -85,7 +85,18 @@ Facts only, no code (their licences do not allow reuse here):
     xnu/files/bsd/dev/annibale/annibale_touch_bus_private.h (sha256 4aaeb3984f6d690c60efaefc0a5c8b3bb08efbdb5965d082f578373739a491bd):
     Redmi K90's touch on the same SE of the same SoC: vote bit 24 for wrap1 s2, its branch 0x1827c, divider 0x1828c, the QSPI
     reference RCG at 0x188c0 and its parents (Se2Bus.h).
-  Linux spi-geni-qcom.c, qcom-geni-se.c, gcc-sm8750.c, nt36532e / nt36xxx (GPL-2.0): as quoted by the sources above; not read here.
+  Linux spi-geni-qcom.c, qcom-geni-se.c, gcc-sm8750.c (GPL-2.0): as quoted by the sources above; not read here.
+  piano's stock touch driver, MiCode vendor_xiaomi_proprietary_touch-driver 6957f6b646d1c919e175e6f9000eb50c8635273c,
+    p81/nt36532/nt36xxx.c, nt36xxx.h, nt36xxx_ext_proc.c (GPL-2.0), and piano's Ubuntu transport, yzddmr6/linux-sm8750-piano
+    d2710cd13b337ef5172bd2394839e9d9673ff88a, drivers/input/touchscreen/nt36532e-thp/core.c and README.rst (GPL-2.0): read on
+    2026-11-12 for behaviour only, no code taken (TouchPace.h, Nt36532.h start, docs/drivers/touch.md §13): both read a frame only in
+    their gpio162 interrupt thread, one transfer per frame; the stock driver downloads again after more than ten 0xfd/0xfe transport
+    blocks in a row (0xfe: an idle software reset first) and has its ESD check (the 0x77 handshake, an IRQ timer) compiled out;
+    Ubuntu has no recovery; their start sequence is stylus scanning off (0x04 = 0), the idle baseline updated (0x19 = 1), operating
+    mode 2, which the stock driver's THP mode handler calls idle (active is 1); both send the external-power state (0x53/0x51).
+  xiaomipad-8pro-mainline device/piano-thp src/processor.cpp and src/live_pipeline.cpp (Apache-2.0): behaviour only, re-expressed
+    in TouchMatrix.h matrixSettle and PianoTouch.cpp's stall rule: a scan-mode-2 (idle) frame becomes the reference when there is
+    none, and a stream stalled for 100 ms releases its contacts.
   the local bring-up notes (touch-native-plan.md, not published): the hardware chain of piano's touch (DT, sizes, SIDs, payload
   5192 for BOE).
 

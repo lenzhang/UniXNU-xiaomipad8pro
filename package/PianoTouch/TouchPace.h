@@ -1,23 +1,36 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// PianoTouch's frame pace (docs/power-irq.md, docs/drivers/touch.md §13). Portable: tests/touch_host.cpp.
+// PianoTouch's frame pace (docs/drivers/touch.md §13, docs/power-irq.md). Portable: tests/touch_host.cpp runs readOn() against a
+// model of the controller.
 //
-// How the NT36532E feeds frames, from the first level-2 runs on the tablet (2026-11-11): it raises gpio162 when a frame is ready
-// and keeps it pending until the host has read that frame; it scans the next one only then. Edges equal reads, at most ~79 a second
-// (a 5.1 ms read and a ~7.5 ms scan), and a latched edge always means a frame that waits. Two ways put it into its watchdog state
-// (transport 0xfd: no frames until the download again): a read started before the next frame was ready (the 12 ms edge-less read
-// of the previous pace, inside the ~12.6 ms cycle; three downloads in a row failed that way), and a frame left unread for longer
-// than ~0.6 s (the display-off pace of 500 ms plus its 250 ms waits). The level-1 loop, which never had one, read on the edge and
-// at most 200 ms apart. So:
-//   - a latched edge is never dropped (it is the frame that waits); the latch is cleared before each read and again after it;
-//   - busy (a contact, a gesture, the decoder learning its reference, watchdog frames) and for kHoldMs after: the latch polled every
-//     piano-touch-poll ms, every frame read on its edge; no edge for kNoEdgeBusyMs (piano-touch-noedge, at least kNoEdgeMinMs: well
-//     past a cycle, so a frame waits by then): read anyway;
-//   - at rest (paced, piano-touch-idle): one frame per idle period: the thread sleeps to the due time, then reads on the latch (set
-//     during the sleep) or waits for the edge, at most to the idle period + kNoEdgeRestMs;
-//   - the display off (TouchPower.h): one frame per kMutedReadMs, the slowest tier;
-//   - never more than kMaxGapMs between two reads (the idle period is at most kIdleReadMaxMs);
-//   - not paced (piano-touch-idle=0): every frame on its edge, kNoEdgeOldMs without one (the level-1 loop).
-// The watchdog (WatchdogRecovery): the download again at once; when the watchdog comes back within kWatchdogQuietMs of a download,
+// The rule (2026-11-12, after desk1 and desk-diag): a frame is read only when the NT36532E announced it: a rising edge of gpio162
+// latched in TLMM (raw status), or the line still high when its edge was missed. Never by a timer. What the runs show:
+//   - the controller announces frames only while it is active (a finger, a start): every frame on its edge, then the next one
+//     scanned after the read (~79 a second, edges = reads; attend1's touch session: no read without an edge, no watchdog in 300 s);
+//   - op mode 2, which the start sets (the stock driver's "idle"), lets it idle when nobody touches: it then announces a frame
+//     about every 1.5 s (desk-diag at rest: 39 edges a minute) while it still rewrites the event buffer by itself;
+//   - every watchdog state (transport 0xfd/0xfe; the line then rises all the time, ~150 a second) began while the loop read without
+//     announced frames: 12 ms edge-less reads (attend2, the 01:32 run), the 50 ms busy reads once the controller idled ~0.3 s after a
+//     download's start (desk-diag: 0xfd 1.8-2.2 s after start, download after download), the 100 ms rest reads (every 50-110 s)
+//     and the 200 ms display-off reads (32-39 s); reads of the controller idling also caught half-written frames (bad checksums,
+//     isolated 0xfd blocks);
+//   - piano's stock driver and its Ubuntu read only in their gpio162 interrupt thread (Ubuntu has no watchdog recovery at all, and
+//     it is the touch path of its daily-use releases).
+// So:
+//   - busy (a contact, a gesture, watchdog frames, the decoder learning until the controller is quiet) and for kHoldMs after: the
+//     latch looked at every piano-touch-poll ms, every announced frame read at once;
+//   - at rest (paced, piano-touch-idle): the latch looked at once per idle period (or the TLMM interrupt waited for with
+//     piano-touch-irq=1): an announced frame waits at most that long; idling, the controller is not read at all;
+//   - the display off (TouchPower.h): the latch looked at once per kMutedReadMs;
+//   - a latched edge is never dropped (it is the frame that waits); the latch is cleared when taken, and once after each download
+//     (the edges before it were the old firmware's);
+//   - the controller quiet (Quiet: no edge for kQuietMs): a reference still being learned is formed from its frames so far
+//     (TouchMatrix.h matrixSettle);
+//   - a contact or a gesture without a frame for kStallMs (an active controller announces one every ~12.6 ms): taken as the lift,
+//     what is still going on released (piano-thp releases a stalled stream's contacts after 100 ms);
+//   - piano-touch-noedge=MS (25..200; default 0): the reads without an announced frame of before (busy MS after the last read,
+//     at rest the idle period + kNoEdgeRestMs, the display off every kMutedReadMs), only for an A/B; gpio162 not mapped (no
+//     latch): every kNoEdgeOldMs, as the level-1 loop.
+// The watchdog (WatchdogRecovery): the download again at once; when the watchdog comes back within kWatchdogRetryMs of a download,
 // again every kWatchdogRetryMs, never given up.
 #ifndef PIANO_TOUCH_PACE_H
 #define PIANO_TOUCH_PACE_H
@@ -25,35 +38,100 @@
 
 namespace pianotouch {
 
-constexpr uint32_t kIdleReadMs = 50, kIdleReadMinMs = 20, kIdleReadMaxMs = 200, kHoldMs = 1500;
-constexpr uint32_t kNoEdgeBusyMs = 50, kNoEdgeMinMs = 25, kNoEdgeRestMs = 50, kNoEdgeOldMs = 200, kMutedReadMs = 200, kMaxGapMs = 250;
+constexpr uint32_t kIdleReadMs = 50, kIdleReadMinMs = 20, kIdleReadMaxMs = 200, kHoldMs = 1500, kStallMs = 250;
+// The controller quiet: no edge for kQuietMs (active it announces a frame every ~12.6 ms, or one scan after each read at the rest
+// pace); active again after kActiveEdges edges (an idling one announces a single frame every ~1.5 s).
+constexpr uint32_t kQuietMs = 400, kActiveEdges = 3;
+struct Quiet {
+  bool quiet = false;
+  uint32_t edges = 0, quiets = 0;
+  uint64_t lastEdgeMs = 0;
+  // An edge taken: true when it makes the controller active again (kActiveEdges edges, each within kQuietMs of the one before).
+  bool edge(uint64_t nowMs)
+  {
+    const bool close = nowMs >= lastEdgeMs && nowMs - lastEdgeMs < kQuietMs;
+    lastEdgeMs = nowMs;
+    if (!quiet) return false;
+    edges = close ? edges + 1 : 1;
+    if (edges < kActiveEdges) return false;
+    quiet = false;
+    return true;
+  }
+  // Each pass: true when the controller has just gone quiet.
+  bool step(uint64_t nowMs)
+  {
+    if (quiet || nowMs < lastEdgeMs || nowMs - lastEdgeMs < kQuietMs) return false;
+    quiet = true;
+    edges = 0;
+    ++quiets;
+    return true;
+  }
+  // A download and start: active until it goes quiet.
+  void started(uint64_t nowMs)
+  {
+    quiet = false;
+    edges = 0;
+    lastEdgeMs = nowMs;
+  }
+};
+constexpr uint32_t kNoEdgeBusyMs = 50, kNoEdgeMinMs = 25, kNoEdgeRestMs = 50, kNoEdgeOldMs = 200, kMutedReadMs = 200;
+// An announced frame waits at most this long for its read (the idle period is at most kIdleReadMaxMs, the display off kMutedReadMs).
+constexpr uint32_t kMaxWaitMs = kIdleReadMaxMs > kMutedReadMs ? kIdleReadMaxMs : kMutedReadMs;
 constexpr uint32_t kFrameCycleUs = 12600;   // a read (5.1 ms at 9.6 MHz) and the next frame's scan (~7.5 ms), measured: ~79 a second
 
 struct TouchPace {
   uint32_t idleMs;   // 0: every frame (the old loop)
   uint64_t lastBusyMs;
-  uint32_t busyNoEdgeMs = kNoEdgeBusyMs;
+  uint32_t blindMs = 0;   // piano-touch-noedge: 0 never a read without an announced frame; else the busy delay of the old rules
   static uint32_t clampIdle(uint32_t ms) { return !ms ? 0 : ms < kIdleReadMinMs ? kIdleReadMinMs : ms > kIdleReadMaxMs ? kIdleReadMaxMs : ms; }
+  static uint32_t clampBlind(uint32_t ms) { return !ms ? 0 : ms < kNoEdgeMinMs ? kNoEdgeMinMs : ms > kNoEdgeOldMs ? kNoEdgeOldMs : ms; }
   // After each loop pass: whether the loop paces idle frames now (busy: the panel's state after the last decoded frame).
   bool idle(uint64_t nowMs, bool busy)
   {
     if (busy || nowMs < lastBusyMs) lastBusyMs = nowMs;
     return idleMs && nowMs - lastBusyMs >= kHoldMs;
   }
-  // At rest: how long to sleep before the next read is due (0: due now: read on the latch or wait for the edge).
+  // At rest: how long to sleep before the latch is looked at (0: the idle period is over: look now).
   uint32_t sleepMs(uint64_t nowMs, uint64_t lastReadMs) const
   {
     const uint64_t due = lastReadMs + idleMs;
     return nowMs < due ? uint32_t(due - nowMs) : 0;
   }
-  // How long after the last read a frame is read without an edge (rest: the pace's state after the last pass).
-  uint32_t noEdgeMs(bool rest) const { return !idleMs ? kNoEdgeOldMs : rest ? idleMs + kNoEdgeRestMs : busyNoEdgeMs; }
+  // The old rules (blindMs): how long after the last read a frame was read without an edge.
+  uint32_t noEdgeMs(bool rest) const { return !idleMs ? kNoEdgeOldMs : rest ? idleMs + kNoEdgeRestMs : blindMs; }
 };
-inline TouchPace touchPace(uint32_t idleMs, uint64_t startMs, uint32_t busyNoEdgeMs = kNoEdgeBusyMs)
+inline TouchPace touchPace(uint32_t idleMs, uint64_t startMs, uint32_t blindMs = 0)
 {
-  return TouchPace{TouchPace::clampIdle(idleMs), startMs,
-                   busyNoEdgeMs < kNoEdgeMinMs ? kNoEdgeMinMs : busyNoEdgeMs > kNoEdgeOldMs ? kNoEdgeOldMs : busyNoEdgeMs};
+  return TouchPace{TouchPace::clampIdle(idleMs), startMs, TouchPace::clampBlind(blindMs)};
 }
+
+// What a frame read starts on (none: not now).
+enum class ReadOn : uint8_t { none, edge, level, blind };
+struct ReadCue {
+  bool edge;          // a latched rising edge not read yet: a frame the controller announced
+  bool level;         // no edge, but the line high kNoEdgeMinMs or more after the last read started (its edge was missed)
+  bool latch;         // gpio162's latch works; false: nothing announces a frame, every read is blind (every kNoEdgeOldMs)
+  bool muted;         // the display off
+  bool rest;          // the pace's state after the last pass
+  bool grace;         // StartGrace holds: after a start no read without an edge, even under the old rules
+  uint64_t sinceMs;   // since the last read started
+};
+inline ReadOn readOn(const TouchPace &p, const ReadCue &c)
+{
+  if (!c.latch) return c.sinceMs >= (c.muted ? kMutedReadMs : kNoEdgeOldMs) ? ReadOn::blind : ReadOn::none;
+  if (c.sinceMs < (c.muted ? kMutedReadMs : c.rest ? p.idleMs : 0)) return ReadOn::none;
+  if (c.edge) return ReadOn::edge;
+  if (c.level) return ReadOn::level;
+  if (!p.blindMs || c.grace) return ReadOn::none;
+  return c.sinceMs >= (c.muted ? kMutedReadMs : p.noEdgeMs(c.rest)) ? ReadOn::blind : ReadOn::none;
+}
+inline const char *readOnName(ReadOn r)
+{
+  return r == ReadOn::edge ? "on an edge" : r == ReadOn::level ? "on the line still high" : r == ReadOn::blind ? "without either" : "none";
+}
+
+// A contact or a gesture that got no frame for kStallMs: released (frames lost).
+inline bool stalled(bool live, uint64_t nowMs, uint64_t lastReadMs) { return live && nowMs >= lastReadMs && nowMs - lastReadMs >= kStallMs; }
 
 // The watchdog's download again: at once, unless the last one for it was less than kWatchdogRetryMs ago (then at that time).
 // Never given up.
@@ -70,12 +148,10 @@ struct WatchdogRecovery {
   }
 };
 
-// After a download and start (the watchdog's, or the display's return when the controller had lost its state): its first frame
-// comes about 0.85 s later (the boot's first gpio162 edge came 842 ms after the start, every run), while the busy pace reads without
-// an edge 50 ms after the last read. Such a read is one before the frame is ready, which is what sends the controller into its
-// watchdog state: desk1 (2026-11-12, nobody touching) went round "download, start, watchdog again ~2.2 s after the download" for
-// most of the boot (10314 watchdog blocks among 17296 reads). So after a start nothing is read without an edge (or the line high)
-// until the first edge, for at most kStartGraceMs; then the usual rules (a line that never rises is read as before).
+// After a download and start (the watchdog's, or the display's return when the controller had lost its state): the first edge after
+// it, for the log ("frames: the first edge N ms after start S"), and under the old rules (piano-touch-noedge) no read without an
+// edge until then, for at most kStartGraceMs (desk1's fix of 2026-11-12, which did not stop the loop: desk-diag). Under the
+// default rules every read needs an announced frame anyway.
 constexpr uint32_t kStartGraceMs = 2000;
 struct StartGrace {
   bool waiting = false;

@@ -4,7 +4,8 @@
 // piano-display-power, which it publishes with piano-backlight=2; absent: on). Portable: tests/touch_host.cpp.
 //   on          frames read and decoded, the gestures reported (the frame pace of TouchPace.h)
 //   display off nothing reported (a touch on a dark screen must not click, nor wake it), every contact and gesture ended at the
-//               change, frames at the slowest pace (kIdleReadMaxMs, never busy: no CPU latency hold); read errors and watchdog
+//               change, the latch looked at once per kMutedReadMs and only announced frames read (never busy: no CPU latency
+//               hold); read errors and watchdog
 //               frames are only counted (a TDDI stops scanning with its panel, Ubuntu: the THP stream stopped at panel disable)
 //   suspended   no frame read at all (the facts give the NT36532E no sleep command of its own: stopping the reads is what stops
 //               the host's work; Ubuntu stopped touch transfers before the SPI bus suspended), the latency hold released, the

@@ -8,13 +8,16 @@ power states); provenance in UPSTREAM.
 
 Files: Nt36532.h (the controller's protocol), GeniSpi.c/.h (the SPI engine), Se2Bus.h (clocks, SPI by hand), TouchMatrix.h (frames
 to peaks and positions), TouchTrack.h (contacts with stable IDs, hysteresis, palm rejection), TouchGesture.h (contacts to pointer
-reports), TouchHid.h (the descriptor and reports), TouchPace.h (the frame pace, the no-edge reads, the CPU latency hold of a burst),
+reports), TouchHid.h (the descriptor and reports), TouchPace.h (the frame pace: a frame read only when announced; the CPU latency
+hold of a burst),
 TouchPower.h (suspend and the display off). Build: tooling/k27/build-native-piano-touch.sh (host tests, the pinned panel images
 staged into out/, the unit's private touchscreen calibration turned into an ignored header when PIANO_TOUCH_CALIBRATION names it,
 the objects, the resolved descriptor).
 
-Battery: at rest one frame per piano-touch-idle ms (default 50; TouchPace.h), the edge by 1 ms polls or, with piano-touch-irq=1,
-by gpio162 on the TLMM summary interrupt (package/common/PianoIrq.h); without an edge a frame is read anyway (blind at rest);
-docs/drivers/touch.md section 13, docs/power-irq.md.
+Frames and battery: a frame is read only when the controller announces it with a gpio162 edge, never by a timer (2026-11-12: reads
+without one sent the idling controller into its watchdog state, download after download); at rest the latch is looked at once per
+piano-touch-idle ms (default 50; TouchPace.h) or, with piano-touch-irq=1, its edge taken from the TLMM summary interrupt
+(package/common/PianoIrq.h); an idling controller announces about one frame every 1.5 s. docs/drivers/touch.md section 13,
+docs/power-irq.md.
 
 Level 1 ran on the tablet on 2026-11-11 (bus, ID, download, frames; nobody touched the panel); level 2 is host-tested, not run.

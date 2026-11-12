@@ -16,7 +16,8 @@
 //     (event + 0x60) 0xa0..0xaf within 10 x 10 ms; three attempts
 //   start: payload length from poll info bytes 2..3; firmware info at event + 0x78 (version, its complement, x and y counts);
 //     calibrated when the reset state reaches 0xa3; host commands {0xbf, cmd, 0, value LE16} at event + 0x50, taken when the
-//     first byte reads 0 (0x19: idle baseline update, 0x01: operating mode, 2 as piano's Ubuntu and sheng send)
+//     first byte reads 0, in the order and with the values piano's stock driver and its Ubuntu send (0x04 = 0: stylus scanning
+//     off, 0x19 = 1: the idle baseline updated, 0x01 = 2: operating mode 2, which the stock driver calls idle; 1 is active)
 //   frame: buffer[0] = 0, buffer[1..] = event buffer bytes 0..; a 257-byte transport block, then the THP packet: +0 marker,
 //     +2 counter LE16, +4 checksum LE16 (+12 its complement), +8 covered length in words LE32 (+16 its complement), +24 scan mode,
 //     +28 frame number LE16, +48 columns, +49 rows, +56 data type, +64 the rows x columns int16 LE matrix (row-major); the 16-bit
@@ -50,7 +51,10 @@ constexpr uint32_t kDlmDes = 0x1fb52c, kDlmLength = 0x1fb530, kDlmGolden = 0x1fb
 constexpr uint32_t kEventCascadeE = 0x11c400, kEventSingle = 0x125800, kPollInfoCascadeE = 0x1093d8;
 enum : uint8_t { kEvHostCmd = 0x50, kEvResetComplete = 0x60, kEvFwInfo = 0x78 };
 enum : uint8_t { kResetStateInit = 0xa0, kResetStateCalibrated = 0xa3, kResetStateMax = 0xaf };
-enum : uint8_t { kCmdOpMode = 0x01, kCmdIdleBaseline = 0x19 };
+enum : uint8_t { kCmdOpMode = 0x01, kCmdStylus = 0x04, kCmdIdleBaseline = 0x19 };
+// The idle-baseline command's value: 1 as the stock driver (nvt_xm_htc_set_idle_baseline_update) and piano's Ubuntu send it; 0 (sheng's,
+// ShengNovatekTouch) was sent here until 2026-11-12.
+constexpr uint16_t kIdleBaselineUpdate = 1;
 struct HwRegs {
   uint32_t trim, swrst;
 };
@@ -172,7 +176,7 @@ struct Chip {
   uint32_t payload = kDefaultPayload, payloadReported = 0;
   uint8_t fwVersion = 0, xNum = 0, yNum = 0, calibrated = 0;
   bool fwInfoValid = false;
-  int baselineRc = 1, modeRc = 1;   // 1: not sent; else the host command's result
+  int stylusRc = 1, baselineRc = 1, modeRc = 1;   // 1: not sent; else the host command's result
   // probeState: what it read last
   uint8_t probeVersion = 0, probeComplement = 0, probeReset = 0;
 };
@@ -372,11 +376,12 @@ inline int hostCommand(Chip &c, uint8_t cmd, uint16_t value)
   return kErrTimeout;
 }
 
-// After the download: the payload length, the firmware info, the calibration wait (reset state 0xa3), then the idle baseline
-// update (baseline) and the operating mode (mode <= 0xffff; > 0xffff: not sent). Neither the calibration nor a command that is
-// not taken stops it (Project-SunUEFI, the sequence that ran on piano, sends no baseline command): their results are in c.
-// kOk, or the first bus error.
-inline int start(Chip &c, bool baseline, uint32_t mode)
+// After the download: the payload length, the firmware info, the calibration wait (reset state 0xa3), then stylus scanning off
+// (stylusOff), the idle baseline update (baseline) and the operating mode (mode <= 0xffff; > 0xffff: not sent), the order of the
+// stock driver and of piano's Ubuntu ("disable unused stylus scanning before finger idle setup"). Neither the calibration nor a
+// command that is not taken stops it (Project-SunUEFI, the sequence that ran on piano, sends no baseline command): their results are
+// in c. kOk, or the first bus error.
+inline int start(Chip &c, bool baseline, uint32_t mode, bool stylusOff = true)
 {
   uint8_t b[40] = {};
   c.payload = kDefaultPayload;
@@ -397,8 +402,9 @@ inline int start(Chip &c, bool baseline, uint32_t mode)
     if (c.resetState >= kResetStateCalibrated && c.resetState <= kResetStateMax) { c.calibrated = 1; break; }
     sleepMs(c, 10);
   }
-  c.baselineRc = c.modeRc = 1;
-  if (baseline && (c.baselineRc = hostCommand(c, kCmdIdleBaseline, 0)) == kErrBus) return kErrBus;
+  c.stylusRc = c.baselineRc = c.modeRc = 1;
+  if (stylusOff && (c.stylusRc = hostCommand(c, kCmdStylus, 0)) == kErrBus) return kErrBus;
+  if (baseline && (c.baselineRc = hostCommand(c, kCmdIdleBaseline, kIdleBaselineUpdate)) == kErrBus) return kErrBus;
   if (mode <= 0xffff && (c.modeRc = hostCommand(c, kCmdOpMode, uint16_t(mode))) == kErrBus) return kErrBus;
   return kOk;
 }
