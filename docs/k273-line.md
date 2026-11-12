@@ -14,7 +14,7 @@ Approach (owner, 2026-11-12): migrate everything at once (every native kext of c
 
 | Piece | 27.0.1 line | 27.3 line | Where |
 |---|---|---|---|
-| Kernel | k27 tree: xnu-12377 + 0001-0052 + patches/k27 0053-0065, `K27_VARIANT=native` | the same source, relinked at the 27.3 collection's segment addresses | `tooling/k273/prepare-k27-tree.sh`, `patches/k273-kc/` |
+| Kernel | k27 tree: xnu-12377 + 0001-0052 + patches/k27 0053-0065, `K27_VARIANT=native` | the same source + `patches/k273` (0001: UniXNU's Darwin 26 system calls), relinked at the 27.3 collection's segment addresses | `tooling/k273/prepare-k27-tree.sh`, `patches/k273/`, `patches/k273-kc/` |
 | Apple kexts | vma2 kernelcache 26A434 (`$PIANO_K27_TREE/out/kc/kc27.bin`) | `kernelcache.release.mac17j` 26C5035r (sha256 d1003b51..., the profile's pin) | `tooling/k273/decompress-kernelcache.py` |
 | Kept kexts | `configs/kc-keep.txt` + the natives' libraries: 48 kexts | the same 48 (all present in mac17j; 0 kernel symbols they reference are missing from our kernel) | `tooling/k27/check-native-kexts.py` unchanged |
 | Native kexts | `configs/k27-native-kexts.txt` | the same list and objects; NativeGopDisplay with `NATIVE_GOP_IOMFB_ABI=2` (below) | `tooling/k27/build-native-gop-display.sh` |
@@ -84,6 +84,12 @@ First image (2026-11-13 00:10): `ram-k273-desk-dev` sha256 `5d998d3d5a70e8f0ba6f
 (KC `7bf32dc8...`: 48 Apple kexts of mac17j, 25 native kexts, every vtable check 0 problems; ADT `5bc3409f...`; trust `5e4d958e...`;
 seed: the 27.0.1 seed + Turnip + the desk-dev stage, identity `a53a3c05...`, data-persist=0), returns to fastboot after 1800 s
 (`piano-reset-after`, `piano-reset-to=bootloader`) or on `reset fastboot`. The Metal plugin is byte for byte the 27.0.1 line's.
+Second image (00:20): `ram-k273-desk-dev-s1` sha256 `344297d9a22986279f29ed0ff92f5624dc5f2bced8cc511078c786990eb338c9`, the same
+with `patches/k273/0001` (UniXNU's darwin26-syscalls: the Darwin 26 system calls k27 leaves as nosys) in the kernel, KC `725856ed...`;
+the added calls are inert unless called, so it is the one to boot first, the first image its control.
+
+The large inputs live on the external SSD (`/Volumes/ExtSSD/k273/`: the IPSW members, `root/root.img`, `root/systemos.img`), with
+links at their `out/inputs/k273/` paths.
 
 Checklist of the first 27.3 boot (each with the console line that answers it):
 
