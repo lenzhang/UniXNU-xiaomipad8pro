@@ -1,8 +1,9 @@
 # Boot guard (k27 0063, `piano-boot-guard=SECS`)
 
-Status 2026-11-11: **built, host-tested, linked into a KC with the current kext set; not run on the tablet.** Off without its
-argument; `tooling/persist/build-esp.py --profile daily` adds `piano-boot-guard=180`, so the installed system has it from its
-next ESP on.
+Status 2026-11-12: **G1-G4 ran on the tablet and behaved as designed** (no pings, a hang and no healthy exec each returned to ABL
+fastboot; a healthy boot was judged healthy at 60 s, restart reason normal, the watchdog fed 6 times, longest gap 10.0 s). G5 (the
+late hang into the installed system) and G6 (sleep) have not run. Off without its argument; `tooling/persist/build-esp.py
+--profile daily` adds `piano-boot-guard=180`: ESP v3 (`persistent-boot.md` §11) is the first installed system with it.
 
 Facts are marked **verified** (read from source, a binary, the running system or a run's log), **spec** (Gunyah or Linux read as
 the specification only; nothing copied), **inferred** or **needs-boot**.

@@ -22,10 +22,13 @@ A `fastboot boot` RAM image always wins over the installed copy (`firmware/patch
 
 `tooling/persist/build-esp.py --profile daily`: the A830 GPU, charging (`--charging 2`, the default since 2026-11-12: PianoPower
 level 2, the DSP's charger firmware with ChargePolicy and the stepped Type-C current, PianoThermal's ADC for the connector
-thermistors; `--charging 1`: level 1, battery and Type-C readout only, the PMIC charging on its own), the USB debug console (PianoDwc3)
-with the Mac's keyboard and pointer. **Build an ESP with `--charging 2` only after `ram-chg-ramp` passed on the tablet**
+thermistors; `--charging 1`: level 1, battery and Type-C readout only, the PMIC charging on its own), the USB debug console (PianoDwc3,
+its cold start on the normal boot path) with the Mac's keyboard and pointer, and since 2026-11-12 the desktop's input drivers as the
+desk images ran them (the keyboard cover with its touchpad and swipes, the backlight and its keys, the touch screen at level 2), the
+boot guard (180 s) and no verbose console. **Build an ESP with `--charging 2` only after `ram-chg-ramp` passed on the tablet**
 (`docs/drivers/charging-policy.md` §16); until then `--charging 1` is the installed configuration. Opt-in drivers join the profile
-only after a RAM test passed on the tablet (`docs/PROJECT-MAP.md` §7 lists their state).
+only after a RAM test passed on the tablet; `--arg NAME=VALUE` replaces one of the profile's (e.g. `--arg piano-touch=0`). The
+choices of ESP v3 and their reasons: `docs/persistent-boot.md` §11.2; installing it: `docs/install-esp-v3.md`.
 
 ## 3. From the Mac
 
@@ -75,9 +78,11 @@ The Metal plugin and our userland change; they are the **system layer**, install
    - Another `--seed` does not carry the owner's Data over: build-esp.py prints a loud note, and the store guard keeps the store and
      runs Data volatile. `--replace-data` is the explicit "start Data over", the owner's decision.
    - A trust cache that lacks a CDHash of the base's is refused: the resumed Data still has the base's plugin.
-5. Tablet to ABL fastboot (§3), then from the persist worktree (steps before options):
-   `python3 tooling/persist/maint-session.py maint-boot map backup esp-final check maint-exit --esp esp-daily<N>-macos.img --esp-final esp-daily<N>-macos.img --new-backup`
-   then `abl-final reboot`. Every write is preceded by a verified NAS backup and followed by a SHA-256 read-back.
+5. Tablet to ABL fastboot (§3), then on the install state of the persist worktree (`PIANO_PERSIST_OUT=<persist worktree>/out/persistent`,
+   with the image and its record copied there; this checkout's tooling; steps before options):
+   `python3 tooling/persist/maint-session.py maint-boot map backup [store-backup] esp-final check maint-exit --esp esp-daily<N>-macos.img --esp-final esp-daily<N>-macos.img --new-backup`
+   then `abl-final reboot`. Every write is preceded by a verified NAS backup and followed by a SHA-256 read-back. `store-backup`
+   adds a verified NAS copy of the Data store itself (12.9 GB; `rollback store-backup` restores it).
 6. With a layer: install it on the running system (`docs/userland.md` §7; the first time with the owner, `docs/persistent-boot.md` §11.6).
 
 ## 6. Recover
@@ -85,13 +90,12 @@ The Metal plugin and our userland change; they are the **system layer**, install
 | Situation | Way out |
 |---|---|
 | The installed macOS misbehaves | RAM-boot a known-good image (§4); the installed copy is untouched |
-| A bad ESP | ABL fastboot, then `maint-session.py ... esp-final` with the previous ESP image (the images stay in `out/persistent/`) |
+| A bad ESP | ABL fastboot, then `maint-session.py ... esp-final` with the previous ESP image (the images stay in `out/persistent/`). Once a system layer is installed whose CDHashes the previous ESP lacks, take the layer out first (the empty layer, `configs/userland-none.toml`) or restore the store backup with the ESP (`docs/persistent-boot.md` §11.9) |
 | Undo the install | `maint-session.py rollback boot-a`, `esp`, `store`, `gpt` (`docs/persistent-boot.md` §7) |
 | Back to Android or Ubuntu | `docs/persistent-boot.md` §7 |
 
 ## 7. Not there yet
 
-Charging control (level 1 only reads; whether a part-empty battery charges without the DSP is being measured), the keyboard cover
-and touch screen (drivers built, first tests pending), Wi-Fi (months: `docs/drivers/wifi.md`; a USB network to the Mac is built),
-audio, Bluetooth, cameras, sensors, sleep (CPU idle states and suspend-to-idle are built as k27 0061/0062, opt-in and not run yet:
-`docs/power.md`).
+Charging control (level 1 only reads; level 2's steps work, its battery current is being looked at), Wi-Fi (months:
+`docs/drivers/wifi.md`; a USB network to the Mac is built), audio by default (levels 4-8 ran; the daily level 9 not yet), Bluetooth,
+cameras, sensors, sleep (CPU idle states and suspend-to-idle are built as k27 0061/0062, opt-in and not run yet: `docs/power.md`).

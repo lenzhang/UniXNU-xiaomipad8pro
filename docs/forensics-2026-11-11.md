@@ -371,7 +371,8 @@ The session ran on 2026-11-12 (queue7; results in §7.5):
 
 So the cause is reproduced and the cure works, but the cold start was not safe on a core left in the host role. This tree fixes that
 (§7.6). C6b and C6c (§7.7) must pass before the daily ESP gets `piano-usb-cold=auto`; until then images and the ESP stay at
-`piano-usb-cold=0`.
+`piano-usb-cold=0`. **Later on 2026-11-12 both passed** (each one cold start after 15 s, then the planned reset), so ESP v3
+(`persistent-boot.md` §11) has the default `piano-usb-cold=auto`, and its daily profile refuses a collection without the role rule.
 
 | Outcome of C6b / C6c | Next |
 |---|---|

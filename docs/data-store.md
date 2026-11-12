@@ -308,7 +308,8 @@ before.
 - If T0 showed another store seed, the installed (old) kernel starts the store over here (state 3), as it always did.
 
 **T4, flatten (optional, tomorrow, with the owner's go-ahead).** It writes the store. A NAS copy of the store region first is
-cheap insurance: `maint-session.py` has no standalone step for it yet.
+cheap insurance: since 2026-11-12 `maint-session.py maint-boot map store-backup maint-exit` takes one (the store window at its
+installed place, verified on the NAS; `rollback store-backup` writes it back).
 
 ```sh
 python3 tooling/persist/store-test-images.py --installed-esp <…>/esp-daily-macos.img --flatten

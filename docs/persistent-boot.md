@@ -107,6 +107,7 @@ Outputs in `out/persistent/` (all gitignored; hashes in `artifacts/ARTIFACTS.md`
 | `base` | `k27/kc-k27-native.bin`, `adt/piano-k27.adt` (vmm-present 1), `inputs/kernel.macho.trustcache`, `inputs/scratch-data.img` (`cb50ceac…`) | `K27_ARGS` without `piano-reset-after`/`-to` |
 | `softgpu` | a KC with NativeSoftGpu (checked), `adt/piano-k27-vmm0.adt` (vmm-present 0, checked), `soft-metal/` seed and trust cache | + `panic_on_crash_disabled=1` (docs/drivers/soft-metal.md §10) |
 | `gpu` | a KC with PianoA830 and without NativeSoftGpu (checked), `adt/piano-k27.adt` built with `PIANO_VMM_PRESENT=0` (checked), `turnip-a830/stage/` seed and trust cache (the Turnip plugin) | + `piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1` (the A830 run that showed the login screen, 2026-11-11 07:45, without its reset and log arguments) |
+| `daily` | the pinned base's seed and trust cache (`--seed base --trust base`, or `--layer DIR`'s trust cache), a KC with PianoA830, PianoPower, PianoDwc3, PianoKeyboard, PianoTouch and PianoBacklight and their fixes, without NativeSoftGpu (checked), the vmm-present 0 ADT | gpu's + the USB console and the Mac's HID, `piano-gpu-hang-ms=10000`, the keyboard cover, the backlight, touch level 2, the charging level, `piano-boot-guard=180`, no `-v` (§11.2) |
 
 `--charging 1|2` (a profile with a charging level: `daily`, default 2) sets PianoPower's level and what comes with it
 (`docs/drivers/charging-policy.md` §16: 2 is level 2 with ChargePolicy, the stepped Type-C current and PianoThermal's ADC, refused
@@ -261,150 +262,250 @@ The store's format, the store guard (another seed's store is kept and Data runs 
 (`PIANO_INSTALLED_SEED`, `build-esp.py --replace-data/--flatten-data`, `store-test-images.py`) and the RAM test procedure that proves
 the guard without risking the installed store: [data-store.md](data-store.md).
 
-## 11. ESP v3: tonight's fixes, the owner's Data kept (planned 2026-11-12; not installed)
+## 11. ESP v3: the daily system with the owner's Data (built 2026-11-12; not installed)
 
-Built offline in an agent worktree, **not installed and not run**. It replaces the installed `esp-daily2-macos` (`e0acb375…`). It
-keeps the store through the store's base ([data-store.md](data-store.md) §9). Every step below follows §4-§5: verified NAS backup
-first, SHA-256 read-back after each write, the RAM-boot rollback. It writes only partition 37.
+Built offline in an agent worktree on main `3c7ebec` plus the change that wrote this section, after the day's tablet results
+([results-2026-11-12.md](results-2026-11-12.md)): the boot guard's G1-G4, PianoDwc3's cold start (C0-C5, C7 and the re-tests C6b and
+C6c), touch's announced-frame rule, Turnip 0007/0008 with frontend 0003, audio levels 4-8, charging level 2's input steps. **Not
+installed and not run.** It replaces the installed `esp-daily2-macos` (`e0acb375…`), keeps the store through the store's base
+([data-store.md](data-store.md) §9), and writes only partition 37. The owner's checklist and decisions: [install-esp-v3.md](install-esp-v3.md).
 
 ### 11.1 Contents
 
 | Payload file | Installed (`esp-daily2-macos`) | v3 (`esp-daily3-macos`) |
 |---|---|---|
-| `kernel.macho` (KC) | `3850545b…`: kernel without 0060 and 0063 (no RTC calendar, no boot guard) | `557420c4…`: k27 **0064** (0063's boot guard, 0060's RTC, 0061/0062/0064 opt-in), the kext list of this tree: PianoA830's BoMap fixes (524288 VM ranges, a pool of a quarter of RAM up to 2 GiB, refusal reasons), NativeGopDisplay's cursor layer and copy fence, PianoTouch's Y inversion and watchdog recovery (inert without `piano-touch`), NativeRamBlock's volatile pool, PianoDwc3's cold start (`piano-usb-cold=auto`), PianoPolicy (inert) |
-| `kernel.macho.adt` | `139af652…`, vmm-present 0 | `1532b37e…`, vmm-present 0 (`PIANO_VMM_PRESENT=0`) |
-| `scratch-data.img` (seed) | `23a5ec59…`, identity `8f333110…` | **the same file**: the pinned base |
-| `kernel.macho.trustcache` | `cd4aa536…`, 5 modules | `607c60ef…`: the same 5 modules plus 1 first, the layer's new CDHashes (Turnip with 0006, `pianousb-shell`, `piano-rotated`, `piano-torch`) |
-| `unixnu.toml` (`macos`) | the daily profile, `data-persist=2`, `data-store-replace=0xaced5bf9` (inert since that store is gone) | the daily profile (`piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-power=1 piano-usb=2 piano-usb-hid=1`), **`piano-boot-guard=180`**, `data-persist=2`, no `data-store-replace` |
+| `kernel.macho` (KC) | `3850545b…`: no 0060, no 0063 | `ed7430c4c6c2b7df…`: the k27 **0064** kernel `2fe50b346041ab9f…` (0060 RTC, 0061/0062/0064 opt-in, 0063 boot guard) and the 25 native kexts of `configs/k27-native-kexts.txt` (PianoKeyboard and PianoCamera now listed). `check-native-kexts.py`: 25 linked, none from outside this repository; every vtable check 0 problem slots |
+| `kernel.macho.adt` | `139af652…`, vmm-present 0 | `acea0fecbba9536c…`, vmm-present 0 |
+| `scratch-data.img` (seed) | `23a5ec59…`, identity `8f333110…` | **the same file**: the pinned base (pinned again in the worktree from the installed image: the same three files as the main checkout's `out/base/8f3331104e03c970`) |
+| `kernel.macho.trustcache` | `cd4aa536…`, 5 modules | `a83bbee6d2b01eab…`: the same 5 modules plus 1 first, the layer's 5 new CDHashes (§11.3) |
+| `firmware/` | none | `PianoAudio/fs19xx.fsm`, `PianoVideo/vpu35_4v.mbn`: the collection's pins (both drivers off in this profile) |
+| `unixnu.toml` (`macos`) | GPU, PianoPower 1, USB console + HID, `data-store-replace=0xaced5bf9` | §11.2: the daily profile, `piano-boot-guard=180`, `data-persist=2`, no `data-store-replace`; menu timeout 3 s, default `macos` |
 
-Opt-in drivers stay out until a RAM test passes on the tablet (`USING.md` §2): touch (`piano-touch`), the RTC calendar
-(`--rtc-offset`), the USB network (`piano-usb-net=1`, not run on hardware yet), suspend (0061/0062/0064).
+The kernel: the k27 tree's `out/k27/kernel-k27-0064-native.macho`, built at 06:39 from a scratch copy after 0061 and 0062 were amended
+that morning (0062: `machdep.piano_sleep` `CTLFLAG_KERN`; 0061: PSCI's SMC32 results sign-extended). No build record names a hash,
+and none can: the kernel's bytes depend on the tree's path (`__FILE__`). Checked instead:
+- every file 0060-0064 touch in the tree's `xnu` has the blob id of its patch's last post-image in this repository (16 files, 0
+  mismatches);
+- the binary has `machdep.piano_sleep` at oid_kind `0x81e00003` (`CTLFLAG_KERN`), where 0063 and the earlier `0064pre`
+  (`01d4ef0c…`) have `0x80e00003`;
+- it has six `sxtw` in `piano_pm_probe`; `0064pre` has none.
 
-How the store is kept: the seed is the store's base byte for byte, so NativeRamBlock finds its own seed in the header and resumes
-(state 2), with the old collection as with this one. The record says `data_store.same_seed: true`. The trust cache keeps every
-CDHash of the installed one (`data_store.trust.missing_cdhashes: 0`; build-esp.py refuses otherwise), so the base's Turnip plugin on
-Data loads as today. Until the layer is in (§11.6), Data keeps that plugin, without 0006.
+### 11.2 The daily profile (`build-esp.py --profile daily`, the driver choices)
 
-### 11.2 Build (Mac, offline, no device)
+The profile now carries the desk images' input drivers (`build-desktop-images.sh`, the levels that ran on the tablet) and no `-v`.
+It refuses a collection without the fixes those drivers need (`kc_markers`): touch's announced-frame rule, PianoDwc3's role rule,
+PianoA830's map limits, NativeGopDisplay's cursor layer and PianoKeyboard's resting thumb.
+
+| Driver, arguments | v3 | Why |
+|---|---|---|
+| GPU: `piano-gpu=2 piano-gpu-delay=20 piano-gpu-hang-ms=10000` | on | the login window and the desktop; a long full-panel pass at the login transition is no hang ([drivers/gpu-userspace.md](drivers/gpu-userspace.md)) |
+| USB console and the Mac's keyboard/pointer: `piano-usb=2 piano-usb-hid=1`; cold start `piano-usb-cold=auto` (the default: no argument) | on | the way in from the Mac on the normal boot path: C0-C5, C7, C6b and C6c passed ([forensics-2026-11-11.md](forensics-2026-11-11.md) §7) |
+| keyboard cover: `piano-keyboard=2 piano-keyboard-gestures=1` | on | keys and the touchpad delivered in attend1-4 (299 keys, 0 rollovers), the desk images |
+| backlight: `piano-backlight=2 piano-backlight-keys=1` | on | off with display sleep and back with a key (attend2); the brightness keys not pressed yet |
+| touch screen: `piano-touch=2` | on | the announced-frame rule: 25 minutes, 949 reads, one firmware download; this unit's Y from `PIANO_TOUCH_INVERT_Y` at build. `--arg piano-touch=0` is the fallback |
+| charging: `--charging 1` (`piano-power=1`) | level 1 | level 2's input steps work, but the battery stays near 0 mA at 81-93 % while plugged in (being investigated); `--charging 2` once that is settled |
+| RTC calendar: `--rtc-offset 1794397906` | on | the desk images' clock from the PMIC RTC; without it every boot starts at the ESP's build time |
+| boot guard: `piano-boot-guard=180` | on | G1-G4 behaved as designed (healthy at 60 s, the watchdog fed 6 times, longest gap 10.0 s) |
+| `--fast-boot 1` (no `-v`) | on | the desk and guard images ran so; 15-40 s less boot; the USB console and the mailbox keep every line. `--fast-boot 0` fits only with `--charging 1` (the 1000-byte line) |
+| audio: `piano-audio` | **off** | (1) the DSP link needs `piano-power=2`, so at charging level 1 the Speaker and Mic would be silent devices; (2) level 9, the daily level (gain up to 192, full scale up to -1 dBFS, no speaker protection), has not run: levels 4-8 passed today, level 9's first run is attended (`drivers/audio.md` §8.8 run 7); (3) every audio run had PianoPower's writes off (`piano-power-write=0`): audio beside the charging policy's writes is untested. Once charging level 2 is decided and run 7 passed: `--charging 2 --arg piano-audio=9 --arg piano-audio-gain=176 --arg piano-audio-ceiling=6` |
+| Wi-Fi, camera, Bluetooth, sensors, DisplayPort, video, USB host, the policy, the buttons (`piano-input`), CPU idle and sleep (0061/0062/0064) | off (inert in the KC) | not at a daily level, or not run with this profile (the buttons: the power key in macOS without `piano-sleep` is untried) |
+| `piano-usb-net=1` | off | not run on hardware: `ram-v3-net` (§11.6) is its first run; the layer's session image has it (§11.8) |
+| `piano-usb-shell=1` | off | an unauthenticated root shell on the cable: the owner's decision |
+
+The `macos` line (798 bytes; `macos-diag` 846, `fastboot` 530; the limit is 1000):
+
+```
+debug=0x14e kt_fixed_zones=120 -no_slto_panic tlto_us=0 -apfs_shared_datavolume offline-apfs-load=1 owner-staged-apps=1
+mac-amfi-launch-permissive=1 union-hide-lower=1 malloc-ranges-off=1 arm64_maxoffset=0x7FFE000000 droidvm-timebase-hz=24000000
+exec-env=com.apple.WebKit.WebContent:GIGACAGE_ENABLED=no rootauth=0 vm_compression_limit=1572864 droidvm-tz=Asia/Singapore
+pstore-console=0x9cb00000 pstore-console-size=0x700000 native-ufs-root=1 native-ufs-diagnostics=1 piano-gpu=2 piano-gpu-delay=20
+panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-gpu-hang-ms=10000 piano-keyboard=2 piano-keyboard-gestures=1
+piano-backlight=2 piano-backlight-keys=1 piano-touch=2 piano-power=1 piano-rtc=1 piano-rtc-offset=1794397906 piano-boot-guard=180
+data-persist=2 droidvm-utc=<build time> sheng-smp=1
+```
+
+### 11.3 The system layer
+
+`out/layer-v3` (`stage.py --live ... --gpu-bundle out/turnip-a830/NativeAdrenoMetal.bundle --installed-trust <the base's>`):
+`userland-update.tar` `69010daffa42b036e943bda93eb8cca509e485cd04d48ff1da838dba29e0af9c` (17 files, 7 units), `apply-update.sh`
+`f564e7edd4d73b34…` (the archive's sha256 inside), `kernel.macho.trustcache` `a83bbee6…`. The units:
+
+| Unit | What | New CDHash |
+|---|---|---|
+| `gpu-nativeadrenometal` | `/Library/GPUBundles/NativeAdrenoMetal.bundle`: Turnip 0001-0008 and frontend 0001-0003, built from scratch in the worktree and byte for byte main's bundle (`libvulkan_freedreno.dylib` `c19b14a3…`, `NativeAdrenoMetal` `575393ed…`, `Info.plist` `9595a4d2…`) | `33f6503b…`, `3b48e955…` |
+| `piano-still-wallpaper` (new) | the still login wallpaper, once a boot ([drivers/gpu-userspace.md](drivers/gpu-userspace.md)) | none |
+| `pianousb-shell`, `piano-rotated`, `piano-torch` | inert without their arguments | `83876bc9…`, `c401d51b…`, `f386f217…` |
+| `piano-policy-agent`, `piano-pmset-defaults` | scripts | none |
+
+v3 trusts all five, so the layer can go in on v3's first boot. Until it does, Data keeps the base's plugin (Turnip without 0006-0008:
+the boxes behind the login window's clock, no video wallpaper). The kernel side of the map fix is in v3 already. The undo is
+`out/layer-none` (`configs/userland-none.toml`, archive `50737a17…`): every unit out, the base's plugin files back.
+
+### 11.4 Build (Mac, offline, no device)
 
 ```sh
 K=$(sed -n 's/^PIANO_K27_TREE=//p' ~/.config/piano/env)
-K27_KERNEL=$K/out/k27/kernel-k27-0064-native.macho PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh   # KC, ADT, Turnip, out/ram
+K27_KERNEL=$K/out/k27/kernel-k27-0064-native.macho PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh   # KC, ADT, Turnip
 python3 tooling/persist/base-seed.py pin --esp <persist checkout>/out/persistent/esp-daily2-macos.img     # once; then: show
 python3 tooling/userland/stage.py --live out/layer-v3 --gpu-bundle out/turnip-a830/NativeAdrenoMetal.bundle \
         --installed-trust "$(python3 tooling/persist/base-seed.py path trust)"
-python3 tooling/persist/build-esp.py --profile daily --default macos --boot-guard 180 --layer out/layer-v3 \
-        --charging 1 --name esp-daily3-macos --out out/persistent
+python3 tooling/userland/stage.py --manifest configs/userland-none.toml --live out/layer-none --installed-trust out/layer-v3/kernel.macho.trustcache
+python3 tooling/persist/build-esp.py --profile daily --default macos --boot-guard 180 --layer out/layer-v3 --charging 1 \
+        --rtc-offset 1794397906 --name esp-daily3-macos --out out/persistent
 ```
 
-`--charging 1` keeps v3 at PianoPower level 1, as planned; the daily profile's default became level 2 on 2026-11-12
-(`docs/drivers/charging-policy.md` §16): drop the option once `ram-chg-ramp` has passed on the tablet.
+Built 2026-11-12 (`--utc 1794473979`): **`esp-daily3-macos.img` sha256 `fa5c0485a1d29634284ef77cdbd3bd4e608a56caa9a77cde8ebdf55e2aa29ca5`**,
+seed identity `8f3331104e03c970`. With the RTC in the profile the build time is only the fallback clock. A rebuild just before
+the install changes only `unixnu.toml` and the image hash.
 
-`build-esp.py` takes the KC and ADT from this checkout's `out/` and the seed from the pinned base, and the trust cache from the
-layer. The layer is `out/layer-v3/userland-update.tar` (`5f48c125…`, 12 files, 6 units with `gpu-nativeadrenometal`) with its
-trust cache `607c60ef…` (the base's `cd4aa536…` plus 4 CDHashes). Built 2026-11-12 (`--utc 1794427214`): `esp-daily3-macos.img` sha256 **`f6f7bb53658b3fd621d6dc5563bae6b1da2884613eb1b99a5767cbb484105309`**, seed identity `8f3331104e03c970`. The clock
-starts from `--utc` (no RTC in the profile): rebuild with the same command just before the install. Only `unixnu.toml` and the
-image hash change.
+### 11.5 Verify (offline; all done for the image above)
 
-### 11.3 Verify (offline)
+1. The record `esp-daily3-macos.json`: `seed.identity_sha256` `8f3331104e03c970…`, `inputs.seed.sha256` `23a5ec59…`;
+   `data_store.same_seed` true, `kc_has_store_guard` true, `trust.missing_cdhashes` 0, `base.source.sha256` `e0acb375…`;
+   `boot_guard` 180, `kc_has_boot_guard` true, `kc_has_rtc_calendar` true, `charging` 1, `fast_boot` 1; `kc_natives` 25, among
+   them PianoA830, PianoPower, PianoDwc3, PianoKeyboard, PianoTouch and PianoBacklight, no NativeSoftGpu.
+2. The image read back by the independent FAT32 reader: 7 files, each the record's sha256; the payload files are the build
+   inputs; `unixnu.toml` parses (default `macos`).
+3. `python3 tooling/persist/base-seed.py show`; `python3 tooling/k27/check-native-kexts.py --self-test` and
+   `check-native-kexts.py <repo> --kc-log out/k27/kc-k27-native.log`; `python3 tooling/metal/check-bundle-paths.py --self-test`
+   and on the bundle.
+4. `python3 tooling/persist/test-data-store.py`, `python3 tooling/persist/test-persist.py` (the session against a fake tablet,
+   `store-backup` and its rollback included), `python3 tooling/userland/test-stage.py` (the real layer and the empty one on a
+   scratch root): all PASS.
+5. The session as dry runs, on a copy of the installed session's state (nothing sent; the state file unchanged): `abl-check`;
+   `maint-boot map backup store-backup esp-final check maint-exit --esp esp-daily3-macos.img --esp-final esp-daily3-macos.img
+   --new-backup`; `abl-final reboot`; `rollback esp-final store-backup`; and the write-back of daily2.
 
-1. The record `out/persistent/esp-daily3-macos.json` has:
-   - `seed.identity_sha256` `8f3331104e03c970…` and `inputs.seed.sha256` `23a5ec59…`;
-   - `data_store.same_seed` true, `data_store.base.identity_sha256` the same, `data_store.trust.missing_cdhashes` 0;
-   - `boot_guard` 180 and `kc_has_boot_guard` true;
-   - `kc_natives` with PianoA830, PianoPower and PianoDwc3, and no NativeSoftGpu.
-2. `python3 tooling/persist/base-seed.py show`: the base's files are still the pinned ones.
-3. `python3 tooling/k27/check-native-kexts.py` (the native kext rule; build-esp.py also refuses VM-era bundles).
-4. `python3 tooling/persist/test-data-store.py`, `python3 tooling/userland/test-stage.py`, `python3 tooling/metal/check-bundle-paths.py --self-test`.
-5. The session as a dry run: no command reaches the tablet, ABL or the NAS (§11.5, with `--dry-run` before the steps).
+### 11.6 RAM tests of the exact payload (nothing written; unattended)
 
-### 11.4 RAM test of the exact payload (nothing written)
-
-The same KC, ADT, trust cache and seed as a RAM image, `data-persist=1` (read-only probe: the store is reported, not applied, and
-Data is the base, volatile). It resets into ABL fastboot after 600 s:
+Both images are the ESP's KC, ADT, trust cache and seed, built by `build-ram-images.py` with the `macos` line's arguments,
+`PIANO_FAST_BOOT=1`, `PIANO_DATA_PERSIST=1` (the read-only probe: the store is reported, not applied, Data is the base and volatile)
+and, instead of `piano-reset-after` (which would turn the guard off), the guard itself as the way back: `piano-reset-to=bootloader`
+(the reason stays bootloader when healthy) and `piano-boot-guard-test=hang-at=720` (every CPU stops at 720 s; the watchdog bites into
+ABL fastboot within 32 s). The dump image `out/ram-v3-dump` (`data-persist=0`, reset after 1 s) reads the mailbox afterwards.
 
 ```sh
-PIANO_SEED=$(python3 tooling/persist/base-seed.py path) PIANO_TRUST=out/layer-v3/kernel.macho.trustcache PIANO_DATA_PERSIST=1 \
-  PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=600 PIANO_A830_METAL=0 \
-  PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-power=1 piano-usb=2 piano-usb-hid=1 piano-boot-guard=180" \
-  K27_KERNEL=$K/out/k27/kernel-k27-0064-native.macho tooling/k27/build-native-image.sh && cp -R out/ram out/ram-v3-probe
-tooling/native/native-loop.sh out/ram-v3-probe/boot-piano-macos-ram-A-bundled.img     # with tooling/native/usb-console.py --capture 600
+P="piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-gpu-hang-ms=10000 piano-keyboard=2 \
+piano-keyboard-gestures=1 piano-backlight=2 piano-backlight-keys=1 piano-touch=2 piano-power=1 piano-rtc=1 piano-rtc-offset=1794397906 \
+piano-boot-guard=180"
+I=(--fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-k27-native.bin --trust out/layer-v3/kernel.macho.trustcache
+   --seed out/base/8f3331104e03c970/scratch-data.img --adt out/adt/piano-k27.adt --utc "$(date +%s)")
+PIANO_FAST_BOOT=1 PIANO_RESET_AFTER=0 PIANO_DATA_PERSIST=1 PIANO_EXTRA_ARGS="$P piano-reset-to=bootloader piano-boot-guard-test=hang-at=720" \
+  python3 tooling/bootimg/build-ram-images.py "${I[@]}" --out out/ram-v3-probe
+PIANO_FAST_BOOT=1 PIANO_RESET_AFTER=0 PIANO_DATA_PERSIST=1 PIANO_EXTRA_ARGS="$P piano-usb-net=1 piano-reset-to=bootloader piano-boot-guard-test=hang-at=720" \
+  python3 tooling/bootimg/build-ram-images.py "${I[@]}" --out out/ram-v3-net
+PIANO_FAST_BOOT=1 PIANO_RESET_AFTER=1 PIANO_DATA_PERSIST=0 python3 tooling/bootimg/build-ram-images.py "${I[@]}" --out out/ram-v3-dump
 ```
 
-(`PIANO_A830_METAL=0`: no restage; the image takes `PIANO_SEED`/`PIANO_TRUST`.) Expected:
-- `NativeRamBlock: read-only probe: the store's P pages are not applied to a large disk`, then `Data store state 6 … seed
-  8f333110, store seed 8f333110`;
-- `piano-boot-guard: armed`, then `healthy`, and the reset deferred to `piano-reset-after`;
-- the login window on the A830 with the base's plugin;
-- no `BoMap … NoResources` while using the desktop.
+Built (`verify-ram-images.py` PASS each): `ram-v3-probe` `098393ab8ea3ed65…` (858-byte line), `ram-v3-net` `4b747766a2a7de4e…`,
+`ram-v3-dump` `99d3cdf8b882c776…`. Queue lines (`TAG IMG DUMP SECS`, the directories absolute):
 
-### 11.5 Install (cable session)
+```
+v3-probe <this checkout>/out/ram-v3-probe <this checkout>/out/ram-v3-dump 800
+v3-net <this checkout>/out/ram-v3-net <this checkout>/out/ram-v3-dump 800 need=v3-probe:piano-boot-guard:_healthy_after_180_s
+```
 
-From the persist worktree, the checkout whose `out/persistent/session/state.json` installed daily2 (`USING.md` §5; steps before
-options):
+Expected in `v3-probe` (USB console, then the mailbox):
+- `PianoDwc3: cold: verdict (piano-usb-cold=auto): ...` (from ABL fastboot: a running device controller, as C1), enumeration;
+- `NativeRamBlock: read-only probe: the store's P pages are not applied to a large disk; Data is the seed's this boot`, then
+  `Data store state 6 ... seed 8f333110, store seed 8f333110`;
+- `piano-boot-guard: armed: restart reason bootloader until healthy, ...`, `exec of launchd at N s`, `healthy after 180 s, restart
+  reason stays bootloader (piano-reset-to)`, no `CPU N took no interrupt`;
+- `piano-rtc: count ... the calendar starts there`; `PianoKeyboard: start: piano-keyboard=2`, `PianoTouch: start: piano-touch=2`
+  and its `a frame read only when the controller announces it` rule, no endless `frames: watchdog` lines;
+  `PianoBacklight: start: piano-backlight=2`;
+- the login window on the A830 with the base's plugin (the boxes behind the clock are expected until the layer is in), no
+  `BoMap ... NoResources`, no `exit: pid N WindowServer`;
+- at 720 s `piano-boot-guard: test: every CPU stops now ...`, back in ABL fastboot within about 32 s.
+
+`v3-net` adds §14.6 of [drivers/usb-device-debug.md](drivers/usb-device-debug.md): `net: CDC-NCM network function requested`, the
+TX FIFO plan, `net: interface published`, `the Mac selected the NCM data interface`, `link up`, `macOS named the interface enN`, and
+the console port working beside it. It is the transport's first hardware run, which the layer's session needs (§11.8).
+
+Not for the queue: `out/ram-v3-layer` (`c3e77fb713d171c8…`) is the layer's session image: the same payload with `piano-usb-net=1`,
+`PIANO_DATA_PERSIST=2` (the owner's own Data, resumed and written) and no reset at all. It is booted only with the owner present.
+
+### 11.7 Install (cable session)
+
+The install state is the persist worktree's (`out/persistent/session/state.json`, the checkout that installed daily2), whose tooling
+is older than this tree's: it lacks the installed-store check and `store-backup`. So this checkout's `maint-session.py` runs on that
+state with `PIANO_PERSIST_OUT` (the session directory follows it):
 
 ```sh
-cp -c <this checkout>/out/persistent/esp-daily3-macos.img <this checkout>/out/persistent/esp-daily3-macos.json out/persistent/
+PERSIST=<persist checkout>/out/persistent
+cp -c out/persistent/esp-daily3-macos.img out/persistent/esp-daily3-macos.json $PERSIST/
+export PIANO_PERSIST_OUT=$PERSIST
 P=tooling/persist/maint-session.py
-python3 $P --dry-run maint-boot map backup esp-final check maint-exit --esp esp-daily3-macos.img --esp-final esp-daily3-macos.img
+python3 $P --dry-run maint-boot map backup store-backup esp-final check maint-exit --esp esp-daily3-macos.img --esp-final esp-daily3-macos.img --new-backup
 # tablet in ABL fastboot: power + volume-down (daily2's USB console does not enumerate on the normal boot path)
 python3 $P abl-check
-python3 $P maint-boot map backup esp-final check maint-exit --esp esp-daily3-macos.img --esp-final esp-daily3-macos.img --new-backup
+python3 $P maint-boot map backup store-backup esp-final check maint-exit --esp esp-daily3-macos.img --esp-final esp-daily3-macos.img --new-backup
 python3 $P abl-final reboot
 ```
 
-- `--new-backup` starts a new NAS set: the ESP region as it is now (daily2) is exported and verified (sha256 against the
-  tablet's, the NAS copy re-read without cache), with both GPT copies and the boot partitions. `rollback esp` then restores daily2
-  byte for byte.
-- `map` reads the store header at LBA 68119455 and says whether it is the one this ESP resumes: `ok    the store at LBA 68119455
-  (seed 8f3331104e03c970, …) IS the one this ESP resumes`. `esp` and `esp-final` refuse an ESP whose seed is not that store's,
-  unless its build record says `--replace-data`. Its boots would run the owner's Data volatile.
-  - Its older line `Data store is NOT usable with the ESP's seed … --store auto will let it start fresh` is about the store's place of
-    before the install (LBA 68381599). Only the `store` step acts on it, and this session does not run that step.
-  - A dry run reads no header and prints only that older line.
-- `esp-final` writes partition 37 and reads it back through the partition and through LUN 0 (= the record's sha256).
-- `check`, then `maint-exit`. Not written: `boot_a`, the GPT, the store, every other partition.
+- `--new-backup` starts a new NAS set: both GPT copies, the boot partitions and the ESP region as it is now (daily2), each exported,
+  checked against the tablet's sha256 and read back from the NAS without the cache. `rollback esp-final` restores daily2 from it.
+- `store-backup` (new, optional: the owner's decision) adds the installed store, 12.9 GB at LBA 68119455, verified the same way:
+  about 7 minutes out and 7 back. `rollback store-backup` puts the owner's Data back to that moment. Without it, leave the step out.
+- `map` must say `ok    the store at LBA 68119455 (seed 8f3331104e03c970, ...) IS the one this ESP resumes`. `esp-final` refuses
+  an ESP whose seed is not that store's. The older line `Data store is NOT usable with the ESP's seed ... start fresh` is about the
+  store's place of before the install (LBA 68381599): only the `store` step acts on it, and this session does not run it.
+- `esp-final` writes partition 37 and reads it back through the partition and through LUN 0 (= `fa5c0485…`). Not written:
+  `boot_a`, the GPT, the store, every other partition.
 
-First boot (`tooling/native/usb-console.py --capture 600`, if PianoDwc3's cold start enumerates; else the next RAM dump):
-- `NativeRamBlock: Data store state 2 (…), header 0, first LBA 68119455, 3145728 pages, direct 1, seed 8f333110, store seed
+First boot (`python3 tooling/native/usb-console.py --capture 600`; the cold start should now enumerate on this path):
+- `PianoDwc3: cold: verdict (piano-usb-cold=auto): the inherited state is NOT a running device controller (...)` and the cold
+  start, or the link watch's cold start after 15 s, then enumeration; the `cold: inherited` lines record the normal path's state;
+- `NativeRamBlock: Data store state 2 (...), header 0, first LBA 68119455, 3145728 pages, direct 1, seed 8f333110, store seed
   8f333110, flags 0, generation G, present P`;
-- `piano-boot-guard: … healthy`.
+- `piano-boot-guard: healthy after 180 s, restart reason normal`.
 
 **Stop** on `state 3`, `state 7`, `kept` or `started over`.
 
-Roll back, least invasive first:
-1. A boot that hangs: the boot guard lands in ABL fastboot within 180 s, or power + volume-down.
-2. RAM images still win (`ram-precedence`).
-3. `maint-boot map backup esp-final check maint-exit --esp esp-daily2-macos.img --esp-final esp-daily2-macos.img` (the old image,
-   still in `out/persistent`),
-   or `rollback esp` (the verified NAS copy of daily2).
+### 11.8 The system layer onto the owner's Data (owner present, once)
 
-Both collections resume the same store: the seed did not change.
+After v3 is installed (its trust cache must trust the layer before the files exist: ESP first, files after). The base's Data has no
+root shell and no network job, so the first time needs the owner at the keyboard and the USB network (after `v3-net` passed):
 
-### 11.6 Then: the system layer (owner present, once)
+1. From ABL fastboot: `fastboot -s $PIANO_SERIAL boot out/ram-v3-layer/boot-piano-macos-ram-A-bundled.img`, with
+   `python3 tooling/native/usb-console.py --capture 3600` running. It resumes the owner's Data (state 2) and writes into it.
+2. The owner logs in on the cover, as every day.
+3. The Mac: `python3 tooling/native/usb-console.py --list` names the network interface and its address (169.254.x.x when nothing
+   assigns one, after up to a minute; if it has none, System Settings › Network lists the new interface, set to DHCP); then
+   `cd out/layer-v3 && python3 -m http.server 8000 --bind <that address>`.
+4. The tablet, in Terminal (the Mac may type these lines with `piano-input.py type`; **the password only the owner types**, on the
+   cover or with `piano-input.py type --secret`, which reads it without echo and never logs it):
+   ```sh
+   for i in $(ifconfig -l); do ifconfig $i | grep -q 02:50:49:41:4e:02 && echo $i; done       # our interface, say en1
+   sudo ipconfig set en1 DHCP; sleep 20; ipconfig getifaddr en1                                 # 169.254.x.x without a server
+   cd /tmp && curl -O http://<the Mac's address>:8000/userland-update.tar -O http://<the Mac's address>:8000/apply-update.sh
+   shasum -a 256 userland-update.tar                                                            # 69010daffa42b036...
+   sudo sh apply-update.sh && sleep 15 && cat /private/var/db/piano-userland/live.log
+   sudo sh /private/var/piano/userland/install.sh --check
+   ```
+   `live.log` lists each file `installed`, the base's three plugin files `kept as /private/var/db/piano-userland/prev/...`, the
+   jobs loaded, `--live done: ok`; `--check` exits 0. `cat /private/var/log/piano-still-wallpaper.log`: `login picture written`
+   or `kept` per account.
+5. Optional, the same Terminal (attended-desktop.md §3; each undone with `launchctl enable` and a restart):
+   `sudo launchctl disable system/com.apple.PerfPowerServices` (1.7 cores at the idle login window), likewise
+   `system/com.apple.watchdogd`, `system/com.apple.mobileactivationd`, `system/com.apple.security.xprotectd`.
+6. Apple menu › Restart: past 180 s the guard has set the reason back to normal, so the installed v3 boots. WindowServer loads the
+   new plugin: no boxes behind the clock, the still picture at the login window.
 
-The plugin with 0006 and our userland go onto the owner's Data as files ([data-store.md](data-store.md) §9, `userland.md` §7):
-`out/layer-v3/userland-update.tar` and `apply-update.sh` (sha256 in the script). v3 already trusts their CDHashes. The base's Data
-has no root shell and no network job, so the first time needs the owner and a transport:
-1. RAM-boot the v3 payload plus `piano-usb-net=1` with `PIANO_DATA_PERSIST=2`: §11.4's command with `PIANO_DATA_PERSIST=2`,
-   `piano-usb-net=1` added and no `PIANO_RESET_AFTER`. It is the owner's own Data, resumed: the seed is the base.
-2. The owner logs in. In Terminal: `curl` the two files from the Mac over the link (`userland.md` §7.3), then
-   `sudo sh apply-update.sh` with the owner's password (`piano-input.py type --secret`).
-3. Check `install.sh --check` and `/private/var/db/piano-userland/live.log`.
-4. Reboot into the installed v3: WindowServer loads the 0006 plugin.
+The layer's own rollback: `out/layer-none` the same way (its two files, `sudo sh apply-update.sh`), then a restart.
 
-The installer keeps the base's three plugin files in `/private/var/db/piano-userland/prev/`. A rollback (`userland.md` §7.4 step 4)
-puts them back.
+### 11.9 Roll back, least invasive first
 
-### 11.7 Decisions for the owner
-
-- **The layer's first installation** (§11.6) needs the owner at the keyboard once, and the USB network's first hardware run. Until
-  then the 0006 fix is not active.
-- **`piano-usb-shell=1` in a later ESP** gives later layer updates without the owner, but opens an unauthenticated root shell on
-  the cable.
-- **A NAS copy of the store region** (13.96 GB, about 16 minutes) before v3's first boot. v3 changes no store code on the direct
-  path, but its NativeRamBlock is a newer build. `maint-session.py` has no standalone store backup step (data-store.md T4).
-- **Opt-in drivers** (§11.1) join a later ESP after their RAM tests.
+1. A boot that hangs or panics: the boot guard lands in ABL fastboot within 180 s (later: macOS restarts); always: power +
+   volume-down for 15-20 s. RAM images still win over the ESP (`ram-precedence`).
+2. A bad v3, **before the layer**: `maint-boot map backup esp-final check maint-exit --esp esp-daily2-macos.img --esp-final
+   esp-daily2-macos.img` (the old image, still in the persist checkout's `out/persistent`), or `maint-boot`, then `rollback
+   esp-final` (the verified NAS copy), then `maint-exit`: a rollback is its own command line. Both collections resume the same
+   store: the seed did not change.
+3. **After the layer**: daily2's trust cache lacks the layer's CDHashes, so with the new plugin on Data its WindowServer would
+   crash-loop. First the empty layer (§11.8, on v3 or `ram-v3-layer`), then step 2. Or, with the store backup: `maint-boot`,
+   `rollback esp-final store-backup`, `maint-exit`, which puts the ESP and the owner's Data back to the moment of the backup
+   together.
 
 ## Done 2026-11-11 (sessions 1-3)
 

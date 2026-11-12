@@ -19,6 +19,7 @@ Now there is one manifest, one staging tool, and one installer on the tablet.
 | `piano-rotated` | `/usr/local/libexec/piano-rotated` 0755, `/Library/LaunchAgents/com.unixnu.piano-rotated.plist` 0644 | on | `piano-rotate=N` (exits 0 without it; `KeepAlive SuccessfulExit false`) | its CDHash |
 | `piano-torch` | `/usr/local/bin/piano-torch` 0755 | installed (a command) | PianoTorch at `piano-torch=2` | its CDHash |
 | `piano-pmset-defaults` | `/usr/local/libexec/piano-pmset-defaults` 0755, `/Library/LaunchDaemons/com.unixnu.piano-pmset-defaults.plist` 0644 (one-shot) | on | sets each power source's timers once, unless the owner set them first (section 6) | none |
+| `piano-still-wallpaper` | `/usr/local/libexec/piano-still-wallpaper` 0755 (`tooling/k27/still-wallpaper.sh`), its three files in `/usr/local/share/piano/wallpaper/` 0644 (`still.png`, `Metadata.plist`, `Index.plist`: `tooling/k27/still-wallpaper.py`), `/Library/LaunchDaemons/com.unixnu.piano-still-wallpaper.plist` 0644 (one run a boot) | on | nothing: once a boot it writes the login window's still picture for every local account that has none, and the account's wallpaper store where it has none; it replaces nothing (`drivers/gpu-userspace.md`, the test images' still wallpaper; added 2026-11-12 for the installed system, whose seed is never restaged) | none (a script and data) |
 | `piano-wifi` | `/usr/local/bin/piano-wifi` | planned | the CLI of `drivers/wifi.md` §13.1 (not written: `status = "planned"`, listed and skipped) | — |
 
 Two changes to existing pieces came with this. `pianousb-shell` now exits at once (status 0) on `/dev/pianousb` when the kernel
@@ -42,7 +43,8 @@ forever. `piano-policy-agent` got a LaunchDaemon plist instead of the `launchctl
 
 `stage.py` refuses each of these, and every refusal is host-tested:
 
-- a destination outside `/Library/LaunchDaemons`, `/Library/LaunchAgents`, `/usr/local/bin`, `/usr/local/libexec`;
+- a destination outside `/Library/LaunchDaemons`, `/Library/LaunchAgents`, `/usr/local/bin`, `/usr/local/libexec`,
+  `/usr/local/share/piano/wallpaper` (data files only, since 2026-11-12) and a Metal plugin bundle's files (`--gpu-bundle`);
 - a mode writable by group or others;
 - a job file that is not `<Label>.plist` root:wheel 0644 (launchd refuses any other);
 - two jobs in one unit, or `default_on = false` without a job;
@@ -265,7 +267,12 @@ line with the installed seed.
 3. Transport (7.3), then on the tablet run `sudo sh apply-update.sh`, then `cat /private/var/db/piano-userland/live.log`, then
    `sudo sh /private/var/piano/userland/install.sh --check`.
 4. Rollback: `cd /private/var/piano && sudo mv userland userland.bad && sudo mv userland.prev userland && sudo sh
-   userland/install.sh --live`. Files the bad update added are removed through the receipt.
+   userland/install.sh --live`. Files the bad update added are removed through the receipt. The first update has no
+   `userland.prev`; it is undone by the empty layer instead: `python3 tooling/userland/stage.py --manifest
+   configs/userland-none.toml --live out/layer-none` on the Mac, then its two files to the tablet and `sudo sh apply-update.sh` as
+   in step 3. Its install.sh takes every unit out (jobs booted out, the files it installed removed when unchanged, every file it
+   had taken over put back from `/private/var/db/piano-userland/prev/`), which gives the base's Metal plugin back byte for byte
+   (host-tested: `test-stage.py` part 7).
 
 ### 7.5 The first time, on the owner's installed system
 
@@ -327,7 +334,9 @@ The parts:
    - the trust report and its ESP trust cache;
    - the archive's determinism and `SHA256SUMS`;
    - `configs/userland.toml` itself: all three Mach-Os thin arm64 with CDHashes, reproducible, installed on a scratch root with
-     the three daemons and the agent loaded, and `--check` clean.
+     the four daemons and the agent loaded, the still picture in `/usr/local/share/piano/wallpaper`, and `--check` clean;
+   - the same with a plugin bundle over a base's plugin, then the empty layer (`configs/userland-none.toml`): every unit out,
+     every job booted out, the base's plugin back byte for byte.
 
 ## 9. Batched tablet test list (RAM boots; Data volatile; the owner's store untouched)
 

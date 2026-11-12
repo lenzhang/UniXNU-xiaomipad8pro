@@ -649,7 +649,8 @@ DYLD_INSERT_LIBRARIES=$O/hostsim/libhostiokit.dylib HOSTSIM_GPU=a830 HOSTSIM_PAG
   §9) does not take files outside launchd's folders, `/usr/local` and the GPU bundle. Lifting the frontend's YCbCr cap for format 503
   would cost about 97 MB per surface and a conversion every frame; it is not done. Superseded the same day: the cap is lifted (the
   owner's call: a bug, not a policy) and the seeds carry a still wallpaper by default, see
-  [Allocation limits and the video wallpaper](#allocation-limits-and-the-video-wallpaper-2026-11-12).
+  [Allocation limits and the video wallpaper](#allocation-limits-and-the-video-wallpaper-2026-11-12); the installed system gets it
+  as the system layer's unit `piano-still-wallpaper` (its files under `/usr/local`).
 
 Bundle built 2026-11-12 (this tree, from scratch twice with the same result): `libvulkan_freedreno.dylib` CDHash `6c23e546dcf62259c14d69a081cba0225519fcbf`,
 `NativeAdrenoMetal` `21a1ded0176b1970a9934f49731b39e613d83a2f`. A new plugin is a new seed identity, so the installed store's seed keeps
@@ -812,6 +813,13 @@ drawable. `build-desktop-images.sh plain` keeps the stock seed (the video). Not 
 picture (macOS 26's code turns the live layer off once it has one), and that its wallpaper agent takes the hand-written store; if the
 desktop after the login still plays the aerial, the login window is still still (the boot job writes its picture at every boot of a
 volatile Data).
+
+**The installed system** (2026-11-12): its seed is the store's base and is never restaged ([data-store.md](../data-store.md) §9), so the
+same script and files come with the system layer as the unit `piano-still-wallpaper` (`configs/userland.toml`: the script as
+`/usr/local/libexec/piano-still-wallpaper`, its files in `/usr/local/share/piano/wallpaper`, a LaunchDaemon that runs it once a boot,
+log `/private/var/log/piano-still-wallpaper.log`). It runs at the layer's installation and at every boot after. On the owner's Data
+an account that already has a login picture (an export of a wallpaper chosen there) keeps it (`login picture kept`): then the still
+picture is the owner's choice in System Settings › Wallpaper (`/Library/Desktop Pictures/UniXNU Still.png`).
 
 ### The verification image
 
