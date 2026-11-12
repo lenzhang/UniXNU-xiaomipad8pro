@@ -1,0 +1,23 @@
+# Identity A (docs/identity.md section 4): an identity of this hardware's own, no Apple model identifier. Applied to a built ADT by
+# tooling/adt/set-identity.py (PIANO_IDENTITY=piano in tooling/k27/build-native-image.sh, DESK_IDENTITY=piano in
+# tooling/k27/build-desktop-images.sh); RAM test images only until a boot has passed docs/identity.md section 6.
+#
+# Only the values userland reads as the model (docs/identity.md section 2): no kext in the native collection matches on them, and the
+# kernel-side values (chip-id, /chosen, /defaults vmm-present, serial-number) stay configs/k27-adt.toml's. product-name,
+# product-description and product-soc-name are not set here: they stay configs/k27-adt.toml's (the display names are kept there).
+# Not "XiaomiPad8Pro,1": it contains "iPad" ("Xiaom-iPad-8Pro"), and the VM era's iPad7,1 identity is what made apsd abort.
+
+["identity"]
+"summary" = "Piano1,1 / Piano / PianoAP: the hardware's own identity, no Apple model"
+
+["root"."string"]
+"model" = "Piano1,1"
+"target-type" = "Piano"
+"target-sub-type" = "PianoAP"
+# Put first in the root compatible (hw.target is its first entry; the DTS's "xiaomi,piano" "qcom,sm8750" follow).
+"compatible" = "PianoAP"
+
+["product"."string"]
+"fdr-product-type" = "Piano1,1"
+"sub-product-type" = "Piano1,1"
+"unique-model" = "PianoAP"

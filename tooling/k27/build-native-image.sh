@@ -50,6 +50,16 @@ if [ -n "${PIANO_SENSOR_PACK:-}" ]; then ADT_OUT=out/adt/piano-k27-addon.adt; ex
 # needs an FD with firmware/patches/darwinboot/0001: tooling/firmware/build-fd.sh; 0x200000000 for an older FD).
 python3 tooling/adt/make-piano-adt.py "$ADT_OUT" --unique-chip-id "${UNIQUE_CHIP_ID:-47554e5941480001}" --data --trust \
   ${PIANO_SENSOR_PACK:+--addon} ${PIANO_VMM_PRESENT:+--vmm-present "$PIANO_VMM_PRESENT"} ${PIANO_RAM_WINDOW:+--ram-window "$PIANO_RAM_WINDOW"} > /dev/null
+# PIANO_IDENTITY=vma2|piano|k114c (docs/identity.md): the machine identity of this build's images. vma2 (the default) is
+# configs/k27-adt.toml's VirtualMac2,1; another is configs/k27-identity/NAME.toml applied by tooling/adt/set-identity.py to a copy,
+# out/adt/piano-k27-id-NAME.adt (the images in out/ram take it), so out/adt/piano-k27.adt, the one an ESP takes, keeps vma2
+# (build-esp.py also refuses an ADT with an identity mark unless PIANO_IDENTITY_INSTALL=1).
+if [ "${PIANO_IDENTITY:-vma2}" != vma2 ]; then
+  ID_ADT=out/adt/piano-k27-id-$PIANO_IDENTITY.adt
+  [ -z "${PIANO_SENSOR_PACK:-}" ] || ID_ADT=out/adt/piano-k27-addon-id-$PIANO_IDENTITY.adt
+  python3 tooling/adt/set-identity.py "$ADT_OUT" "$ID_ADT" --identity "$PIANO_IDENTITY" | head -1
+  ADT_OUT=$ID_ADT
+fi
 # The software Metal path (docs/drivers/soft-metal.md): when NativeSoftGpu is linked (the list or PIANO_EXTRA_KEXTS; PIANO_SOFT_METAL=0
 # leaves this out, =1 forces it), the NativeSoftMetal plugin is built and staged into a copy of the Data seed and the trust cache
 # (tooling/k27/stage-soft-metal.py, out/soft-metal), which the image then takes unless PIANO_SEED / PIANO_TRUST name others. The staging

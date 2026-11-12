@@ -56,6 +56,9 @@
 # leaves the touch screen out: the fallback when it resets or its controller keeps falling into its watchdog state; any other
 # value is piano-touch's), DESK_WALLPAPER (still, the default, or video: above), DESK_EXTRA (added to every image's arguments, e.g. piano-touch-idle=0: the touch screen's level-1 pace). The staged seeds go to out/desk-stage/<name>. A new seed is a new identity: the images run Data volatile
 # (data-persist=0), the owner's store is not touched.
+# DESK_IDENTITY=vma2|piano|k114c (docs/identity.md section 5): the machine identity of the images (default vma2, the input ADT's).
+# Another is configs/k27-identity/NAME.toml applied to a copy of the input ADT by tooling/adt/set-identity.py (out/adt/desk-id-NAME.adt),
+# and the images go to out/ram-<NAME>-<identity>/ (the dump image keeps the input ADT: it only reads the previous run's log).
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
 KC=${DESK_KC:-out/k27/kc-k27-native.bin}
@@ -66,6 +69,12 @@ TRUST_IN=${DESK_TRUST:-out/turnip-a830/stage/kernel.macho.trustcache}
 RESET=${DESK_RESET_AFTER:-3600}
 KBTYPE=${DESK_KEYBOARD_TYPE:-40}
 for f in "$KC" "$ADT" "$FD" "$SEED_IN" "$TRUST_IN"; do [ -f "$f" ] || { echo "build-desktop-images: $f is missing" >&2; exit 1; }; done
+ADT_BASE=$ADT SUFFIX=
+IDENTITY=${DESK_IDENTITY:-vma2}
+if [ "$IDENTITY" != vma2 ]; then
+  ADT=out/adt/desk-id-$IDENTITY.adt SUFFIX=-$IDENTITY
+  python3 tooling/adt/set-identity.py "$ADT_BASE" "$ADT" --identity "$IDENTITY" | head -1
+fi
 case $KBTYPE in 40|41|42) ;; *) echo "build-desktop-images: DESK_KEYBOARD_TYPE=$KBTYPE: 40 (ANSI), 41 (ISO) or 42 (JIS)" >&2; exit 1 ;; esac
 WALLPAPER=${DESK_WALLPAPER:-still}
 case $WALLPAPER in still|video) ;; *) echo "build-desktop-images: DESK_WALLPAPER=$WALLPAPER: still or video" >&2; exit 1 ;; esac
@@ -172,10 +181,11 @@ for n in $NAMES; do
   COMMON=(--fd "$FD" --fd-name A-bundled --kc "$KC" --trust "$TRUST" --seed "$SEED" --adt "$ADT" --utc "$(date +%s)")
   R=$RESET P=
   env PIANO_FAST_BOOT=1 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER="$R" PIANO_DENY_EXEC="$DENY" PIANO_EXTRA_ARGS="$PROFILE $A" \
-    ${P:+PIANO_DATA_PERSIST=$P} python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out "out/ram-$n" | tail -1
-  python3 tooling/bootimg/verify-ram-images.py "out/ram-$n/build-A-bundled.json" | tail -1
+    ${P:+PIANO_DATA_PERSIST=$P} python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out "out/ram-$n$SUFFIX" | tail -1
+  python3 tooling/bootimg/verify-ram-images.py "out/ram-$n$SUFFIX/build-A-bundled.json" | tail -1
 done
-COMMON=(--fd "$FD" --fd-name A-bundled --kc "$KC" --trust "$TRUST_IN" --seed "$SEED_IN" --adt "$ADT" --utc "$(date +%s)")
+COMMON=(--fd "$FD" --fd-name A-bundled --kc "$KC" --trust "$TRUST_IN" --seed "$SEED_IN" --adt "$ADT_BASE" --utc "$(date +%s)")
 PIANO_FAST_BOOT=1 PIANO_RESET_AFTER=1 PIANO_DATA_PERSIST=0 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" \
   --out out/ram-desk-dump | tail -1
-for n in $NAMES desk-dump; do shasum -a 256 "out/ram-$n/boot-piano-macos-ram-A-bundled.img"; done
+for n in $NAMES; do shasum -a 256 "out/ram-$n$SUFFIX/boot-piano-macos-ram-A-bundled.img"; done
+shasum -a 256 out/ram-desk-dump/boot-piano-macos-ram-A-bundled.img

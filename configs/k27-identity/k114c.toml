@@ -1,0 +1,26 @@
+# Identity C-light (docs/identity.md section 4): UniXNU's macOS 27.3 identity (profiles/os/macos-27.3-26C5035r: Mac17,11, K114c,
+# K114cAP) on this 27.0.1 line, so the identity of the 27.3 line can be tried before that line boots. Applied to a built ADT by
+# tooling/adt/set-identity.py (PIANO_IDENTITY=k114c / DESK_IDENTITY=k114c); RAM test images only.
+#
+# Only the model values: none of the profile's display-shape values (oled-display, partially-occluded-display: the notch,
+# has-round-cornered-mac-display, artwork-device-subtype 1986, Rec2020 gamut) and none of its /chosen values (board-id,
+# security-domain, boot-uuid), which describe K114c's hardware and boot chain, not this one. product-name, product-description and
+# product-soc-name stay configs/k27-adt.toml's (the display names).
+# macOS 27.0.1 does not know Mac17,11 (it is not in its shared cache's product tables, docs/identity.md section 2.3): ProductKit's
+# names and pictures fall back as for an unknown model; IOgPTPPlugin has no K114c entry (no temperature sensor looked for).
+
+["identity"]
+"summary" = "Mac17,11 / K114c / K114cAP: the macOS 27.3 profile's identity on the 27.0.1 line"
+
+["root"."string"]
+"model" = "Mac17,11"
+"target-type" = "K114c"
+"target-sub-type" = "K114cAP"
+"compatible" = "K114cAP"
+"manufacturer" = "Apple Inc."
+
+["product"."string"]
+"fdr-product-type" = "Mac17,11"
+"sub-product-type" = "Mac17,11"
+"unique-model" = "K114cAP"
+"compatible-device-fallback" = "Mac17,7"

@@ -298,6 +298,16 @@ def adt_vmm_present(path):
     return None
 
 
+def adt_identity(path):
+    """The root's unixnu-identity (tooling/adt/set-identity.py's mark of a test identity), or None."""
+    spec = common.importlib.util.spec_from_file_location('adt_dump', common.DEVICE / 'tooling/adt/adt-dump.py')
+    adt = common.importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(adt)
+    (props, _), _ = adt.parse(Path(path).read_bytes())
+    value = dict(props).get('unixnu-identity')
+    return value.rstrip(b'\0').decode(errors='replace') if value else None
+
+
 # The VM-era kexts' bundle identifiers (the native kext rule's denylist, tooling/k27/check-native-kexts.py): their legacy
 # "DroidVM" name and the virtio block kext. None may be in an installed collection.
 VM_ERA_BUNDLE = re.compile(rb'com\.[A-Za-z0-9.]*[Dd]roid[Vv][Mm][A-Za-z0-9.]*|com\.unixnu\.driver\.NativeVirtioBlock')
@@ -595,6 +605,12 @@ def main():
                 raise SystemExit(f'profile {a.profile} turns its driver on, and {inputs["kc"]} lacks {why} ("{marker.decode()}"): '
                                  'rebuild the collection from this tree (tooling/k27/build-native-image.sh)')
     for adt in {inputs['adt'], (a.prev_adt or inputs['adt']).resolve()}:
+        # A test identity (tooling/adt/set-identity.py's mark, docs/identity.md): RAM boots first, the installed system only on purpose.
+        identity = adt_identity(adt)
+        if identity and os.environ.get('PIANO_IDENTITY_INSTALL') != '1':
+            raise SystemExit(f'{adt} carries the test identity {identity} (unixnu-identity): an identity reaches the installed system only '
+                             'after its RAM boots passed docs/identity.md section 6 (then PIANO_IDENTITY_INSTALL=1); else use '
+                             'out/adt/piano-k27.adt')
         if common.adt_addon_slot(adt):
             raise SystemExit(f'{adt}: its /chosen/memory-map has the GpuAddon slot of a RAM test image carrying the sensor pack '
                              '(PIANO_SENSOR_PACK): DarwinBoot refuses that slot without Payloads/kernel.macho.gpuaddon, which an ESP never '
