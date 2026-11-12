@@ -60,7 +60,8 @@
 "sleep-disabled" = 1
 # Stays 1 natively (2026-11-11): with 0, watchdogd runs as on real hardware, exits twice (no watchdog device) and launchd panics
 # ("watchdogd[297] exited", about 150 s into a run); with 1 a 240 s run has no panic. The vma2 identity above (VirtualMac2,1,
-# VMA2MACOS) stays too: the vma2 kernel collection's kexts match on it.
+# VMA2MACOS) is the default; no kext of the native collection matches on it (docs/identity.md: the inventory, the candidates and
+# PIANO_IDENTITY / DESK_IDENTITY, which apply configs/k27-identity/NAME.toml to a test image's ADT).
 "vmm-present" = 1
 "kern.maxvnodes" = 131456
 

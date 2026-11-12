@@ -156,7 +156,7 @@ read: [k27-userland-args.md](k27-userland-args.md).
 
 | Item | Value | Why |
 |---|---|---|
-| `model`, `target-type`, `product-name`, `has-virtualization` | VirtualMac2,1, VMA2MACOS, "Apple Virtual Machine 1", set | the kernel collection is Apple's vma2 one, and its kexts match on this identity (plan R8: kept until WindowServer is tried with another one on real hardware) |
+| `model`, `target-type`, `product-name`, `has-virtualization` | VirtualMac2,1, VMA2MACOS, "Apple Virtual Machine 1", set | the VM era's identity, kept as the default. No kext of the native collection matches on it (the VM-era collection's platform kexts did); what reads it is userland, and another identity is a build switch for test images: [identity.md](identity.md) |
 | `vmm-present` | 1 (`PIANO_VMM_PRESENT` overrides it per build) | with 0 watchdogd runs as on real hardware, exits twice (no watchdog device) and launchd panics about 150 s into the run (`watchdogd[297] exited`); with 1 a 240 s run has no panic. Revisit with a watchdog driver |
 | `serial-number` | DVMPIANO001 | made up, not a unit serial; the Data seed was made with it |
 | `/arm-io/gop-display` | compatible `paravirtualizedgraphics,gpu` | IOMobileFramebuffer.framework only looks for displays on a node with that string (`docs/drivers/native-gop-display.md`) |
