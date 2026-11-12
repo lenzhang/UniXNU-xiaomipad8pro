@@ -273,6 +273,8 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-scanwait=MS` | 12000 | how long the scan itself may take. When it runs out and the scan had started, what it found stands and the teardown runs; when it had not started, the level fails |
 | `piano-wifi-band=N` | 1 | 1: the scan visits the 2.4 GHz band's 13 channels and the 5 GHz band's 9 non-radar ones; 0: only 2.4 GHz (the shorter boot, and the one that needs no regulatory answer for the upper band) |
 | `piano-wifi-bssid=1` | 0 | print a network's whole address in the log. By default only its first three bytes are printed and the rest is `**:**:**`, so that a pasted log cannot carry the owner's environment (§11). The registry property always carries the whole address, which is what a later join needs |
+| `piano-wifi-l6pre=N` | `0x3f` (from P22, §10.27) | the radio's set-up between the firmware's ready event and level 6's virtual device, as a bitmask: `0x01` the hardware mode (`WMI_PDEV_SET_HW_MODE`, two bands at once), `0x02` the radio's six parameters, `0x04` the channel list of its regulatory event (`WMI_SCAN_CHAN_LIST`; this driver's own list when no event came), `0x08` a usable device address (never all zeros), `0x10` wait for the regulatory event before the list, `0x20` pace the commands apart so a log names the last one before a firmware death, `0x40` **no scan at all** (the device is created, the level holds and tears down: it tells a death at the device from one at the scan). `0` is the behaviour of the 2026-11-12 boot that asserted the firmware |
+| `piano-wifi-l6regwait=MS`, `piano-wifi-l6pace=MS`, `piano-wifi-l6hold=MS` | 2000, 50, 8000 | how long level 6 waits for the regulatory event, how far apart it paces the radio's set-up, and how long `0x40` holds after the virtual device |
 
 ## 7. Build, kernel collection
 
@@ -886,6 +888,21 @@ else `image/`): `amss20.bin`, `regdb_xiaomi.bin`, `bd_p81.elf`, `phy_ucode20.elf
 |---|---|---|---|
 | 7a | `piano-wifi=6 piano-wifi-iova=1` | level 4 and steps 502–508 as in the seventh round; step 509's four `answer to 0x0025 … regdb_xiaomi.bin segment K of 4 … (accepted)` lines, the last with `the last`; step 510's board line (`bd_p81.elf for board 0xff`, 125272 bytes, 21 segments, kind 1) and its 21 accepted answers; 511 and 512 accepted; 513 accepted (or `refused` / `not answered`, which no longer ends the level); `indication 0x0038: the firmware is ready`; the `flow control:` line with as many RESUME_TX sent as asked for and `none owed`; with `piano-wifi=6` (`mode=1`) steps 515–517 accepted, `step 518: done`, then level 6's gates (§8.6: the transport's ready, the service-ready event, the scan's list) | a `(refused)` answer: its result/error and the segment name the message the firmware rejected (the board file's segments: the file or the kind; 511/512: the microcode's address or size); `unanswered` with `flow control: … one still owed` or fewer sent than asked: §10.26 is not finished; `unanswered` with the flow-control line healthy: the firmware itself stalled, and the `dma:` lines after it say whether its DMA left the window (an SMMU fault in bank N with a FAR) |
 
+7a ran on the installed v3.3d (23:33, 2026-11-12): level 5 finished (the firmware ready at +675 ms) and level 6 reached its
+virtual device and its scan, where the firmware asserted (P22, §10.27).
+
+**After §10.27 (P22).** The same image or ESP, with the radio's set-up on. One new argument with sub-values, so the kernel's
+command line grows by one: `piano-wifi-l6pre=N` (default `0x3f`; `piano-wifi-l6regwait`, `piano-wifi-l6pace`,
+`piano-wifi-l6hold` have working defaults and need not be given).
+
+| # | Boot args (beyond the image's) | Gate | Then |
+|---|---|---|---|
+| 8a | `piano-wifi=6 piano-wifi-iova=1` (the new default `piano-wifi-l6pre=0x3f` needs no argument) | level 4, level 5 and steps 601–606 as in v3.3d; then the four new lines in this order — `step 620: the radio's hardware mode`, `step 621: the radio's parameters`, `step 622: waiting for the regulatory event` (or straight to 623 when the event is already in), `step 623: the channel list`, then `step 607`, `608`, `609`; `level 6: the regulatory domain: country "…" … N rule(s)` with its rules; `level 6: the channel list: K channel(s) (P passive, R radar)`; `level 6: the radio's set-up: hardware mode sent (accepted), 6 of 6 parameter(s), the channel list sent from the firmware's regulatory event; the virtual device's address comes from …`; and then §8.6's gates: `started 1`, the scan's events, **at least one network** | the firmware asserts again: the `crash:` lines give the reason file and `level 6: … the last command went out at step N` names the command before it — 623 the channel list, 607 the device, 608 the scan. Next boot then: `piano-wifi-l6pre=0x7f` (the same without the scan): if it lives through the hold, the scan is the assert and the channel list or the data path is the gap; if it dies at 607 with a usable address, the device itself needs the data path (HTT, §10.20/§10.27) |
+| 8b | `piano-wifi=6 piano-wifi-iova=1 piano-wifi-l6pre=0x7f` | as 8a up to `step 607`, then `step 624: holding after the virtual device`, `the teardown: … the virtual device deleted`, `step 611: done` and no crash line | a crash during the hold: the device alone asserts the firmware (the address and the mode are then not the cause and the data path is next); a clean hold: the scan is where the firmware dies, and 8a's channel list did not satisfy it |
+
+Both answer their questions on the installed boot as well as in a RAM image; neither needs the scan to find a network to be
+useful, because the gate is the firmware living past step 607.
+
 ## 9. Fallback
 
 `piano-wifi=0` (the default): nothing runs. Network meanwhile: PianoNullEthernet's `en0` (no traffic) and, once built, the USB-C
@@ -1257,6 +1274,46 @@ network (§5.2 C).
    DSP service ever sets `confirm_rx` on that link was not checked (its owner's call: a service that does would go quiet after
    ten packets). (needs-boot: §8.8 boot 7a)
 
+27. **P22: the firmware asserts around the virtual device and the scan (ESP v3.3d, 23:33, 2026-11-12).** The first boot that
+   reached level 6: the transport up (2 credits of 2176 bytes, 5 endpoints, version 1; our endpoint 1 on pipes 3 out / 2 in),
+   the message interface connected, the capability event and two extended ones, the initialisation accepted, the firmware's
+   ready event at +829 ms (status 0, 16 peers, **1 extra address, its own address all zeros**). Then step 607 (the virtual
+   device) at +829 ms, step 608 (the passive scan, 22 channels) at +929 ms, and at **+1045 ms** `the chip reported a system
+   error or its crash dump environment`: EE RDDM, MHISTATUS `0000ff05` (SYSERR). The scan never started (0 scan events), 3
+   commands and 10 events had gone by, and **3 events this level knows nothing about** were counted but not named.
+   **What the crash dump gave (the P19 path working, its first real use):** 9 of 9 segments, a 12-entry header, and the
+   firmware's own reason out of `Q6-SFR.bin` — `cmnos_assert_patched.c:604 ... line#488`. A firmware assert, not a bus fault:
+   both ends' PCI status, the AER words, the SMMU's global fault and bank 80's FSR were clean, and the MSI sink had the chip's
+   write.
+   **Cause (inferred from Ubuntu's order, not yet proven on the tablet):** this level said nothing to the radio between the
+   firmware's ready event and its first virtual device, where Ubuntu's driver, for a **single-radio** chip of this family
+   (`wcn7860 hw2.0`: `single_pdev_only`), always sends first (a) the hardware mode (`WMI_PDEV_SET_HW_MODE`, "two bands at
+   once", on its own and **not** inside the initialisation, which carries no mode structure for such a chip), (b) six radio
+   parameters (protected-management-frame QoS on, dynamic bandwidth on, the ARP class override off, mesh multicast on, and the
+   two chain masks), and (c) **the channel list** (`WMI_SCAN_CHAN_LIST`) built from the firmware's own regulatory event — a
+   scan whose channels the radio has never been given is the most plausible assert of the three (§10.17 named exactly this
+   risk). And (d) its virtual device never carries an **all-zero address**: the address comes from the firmware's ready event,
+   and a host with none of its own makes a locally administered one rather than create a device with zeros, which is what this
+   level did.
+   **Changed (all four, in Ubuntu's order, behind one boot argument with sub-values, `piano-wifi-l6pre`):** bit 1 the hardware
+   mode (and its answer's status in the log), bit 2 the six parameters, bit 4 the channel list — the firmware's regulatory
+   event is read (both forms, with every rule's frequencies, bandwidth, power and flags) and turned into the channels its rules
+   allow, each with its passive and radar bits; with no event this driver sends its own list of WifiHw.h — bit 8 a usable
+   device address (the ready event's own, then the address its array carries, then `02:50:49:…` of piano's own; the address is
+   never logged, only where it came from), bit 16 wait up to `piano-wifi-l6regwait` ms for the regulatory event first, bit 32
+   pace the commands `piano-wifi-l6pace` ms apart so that a log names the last command before a death, bit 64 **no scan at
+   all**: the device is created, the level holds `piano-wifi-l6hold` ms and tears down, which tells a death at the device from
+   one at the scan. Default `0x3f` (everything but the last). Logging: the regulatory domain and its first eight rules, the
+   channel list's counts (and what it left out), the hardware mode's answer, where the device's address came from, the step
+   whose command went out last, and **the identifier of every event this level knows nothing about** (the first boot's three
+   were a count alone).
+   **Not changed, and the next suspects if the assert stays:** the data path. Ubuntu connects the firmware's data interface
+   (HTT, service `0x0300`) over the transport **before** the message interface and sends its version request right after the
+   initialisation; this level connects the message interface alone (§10.20). If `piano-wifi-l6pre=0x3f` still asserts, the
+   order to try is `0x7f` (the same without the scan, to place the death) and then the HTT connection, which is level 8's
+   first piece brought forward. (needs-boot: §8.8 boot 8a)
+
+
 ## 11. Licence note
 
 This repository's packages are BSD-2-Clause-Patent. Linux (`pcie-qcom`, `phy-qcom-qmp-pcie`, `pwrseq-qcom-wcn`, `mhi`, `qrtr`, ath12k,
@@ -1369,9 +1426,15 @@ model of the copy engine's registers and a firmware that speaks both protocols):
 7. **What level 6 does not do.** No association, no keys, no data path: those are levels 7 and 8.
 
 **Level 7 (association), what it needs**: the firmware's regulatory event read and the channel list sent
-(`WMI_SCAN_CHAN_LIST`, §10.17); the virtual device started on the owner's channel; a peer created for the access point; the
-four-way handshake run by a **user-space supplicant** over a control endpoint, with the keys installed by
-`WMI_VDEV_INSTALL_KEY`; and the management frames the handshake needs sent through `WMI_MGMT_TX`. **Level 8 (traffic)**: the
+(`WMI_SCAN_CHAN_LIST`, §10.17 — **built since P22**, §10.27: level 6 now sends it before its own scan, so level 7 inherits
+both the event's rules and the list); the virtual device started on the owner's channel; a peer created for the access point;
+the four-way handshake, with the keys installed by `WMI_VDEV_INSTALL_KEY`; and the management frames the handshake needs sent
+through `WMI_MGMT_TX`. The wire side of all of that is built and host-tested (`package/PianoWifi/WifiAssoc.h`,
+`tests/assoc_host.cpp`): the regulatory rules and the channel list, `WMI_VDEV_START`/`UP`/`STOP`/`DOWN` with the channel
+structure, `WMI_PEER_CREATE`/`DELETE`/`SET_PARAM`, `WMI_PEER_ASSOC` with the peer's flags and legacy rates,
+`WMI_VDEV_INSTALL_KEY` for a pairwise and a group key, and `WMI_MGMT_TX` with the frame in the 32-bit window. What is not
+built yet is the step machine that drives them (`piano-wifi=7`), the supplicant's four-way handshake and the path the
+passphrase takes — §13.2 is the plan, and none of it may run before level 6 passes on the tablet. **Level 8 (traffic)**: the
 data path's rings (the transmit-command, reorder and buffer-manager units whose head pointers §12's shadow list already names),
 the firmware's data interface (HTT) connected as a second transport service, and the receive and transmit paths wired to the
 Ethernet interface below — which is where `en1` gains its link.
@@ -1418,6 +1481,52 @@ The station the levels above build has to appear to macOS as something it can ro
    PianoNullEthernet dropped.
 6. No Wi-Fi menu, no AirDrop, no location by Wi-Fi: section 5.2 is where that trade is written down, and the USB-C network
    (section 5.2 C) stays the first network while this is built.
+
+### 13.2 Level 7 as planned: the step machine, the handshake, and how the passphrase gets in
+
+What is **built** (host-tested, inert: no boot argument reaches it yet) is the wire side in `package/PianoWifi/WifiAssoc.h`
+and its facts in `WifiHw.h`. What follows is the plan for the rest, in the order it will be built, and the one question the
+owner has to answer (the last paragraph).
+
+1. **The step machine (`piano-wifi=7`, steps 701-711).** After level 6's scan: the regulatory event and the channel list are
+   already sent (level 6 does it since §10.27); a **targeted scan** of the chosen network's channel refreshes its beacon and
+   keeps its elements (the RSN element decides what the handshake must be); `WMI_VDEV_START` on that channel and its start
+   response; `WMI_PEER_CREATE` for the access point; open authentication and the association request through `WMI_MGMT_TX`
+   with their answers read from the same management-frame events level 6 already parses; `WMI_PEER_ASSOC` with the peer's
+   capability, its legacy rates and the four-way-handshake flags; `WMI_VDEV_UP` with the network's address and the
+   association identifier. Every step keeps level 6's shape: one command outstanding, a deadline each, a bounded poll, no
+   allocation, the chip's health read every turn, and a teardown that deletes the peer and takes the device down and out.
+2. **The four-way handshake, in the kernel, for WPA2-PSK with CCMP first.** The key material never leaves the kernel and
+   never enters a log: the pairwise key is derived (PBKDF2-SHA1 over the passphrase and the network's name for the pairwise
+   master key, the SHA-1 pseudo-random function over the two addresses and the two nonces for the transient key), the
+   EAPOL-Key frames are built and checked (HMAC-SHA1 over the frame with the key-confirmation key), the group key is
+   unwrapped with AES key wrap, and both are installed with `WMI_VDEV_INSTALL_KEY` (pairwise first, then the group key, then
+   the peer authorised with `WMI_PEER_SET_PARAM`). The crypto is written fresh in this repository (`WifiSha256.h` is the
+   precedent); SHA-1, its HMAC, PBKDF2 and AES key unwrap are a few hundred lines and are host-tested against the published
+   test vectors of the standards, which carry no licence. **WPA3-SAE is not in the first version**: its handshake needs
+   elliptic-curve arithmetic over P-256, which is a package of its own; a WPA3-only network is reported as unsupported
+   rather than half-tried, and a transition network is joined with PSK.
+3. **How the passphrase reaches the kext — the proposal.** The owner's network name and passphrase are a local secret: they
+   must never be a boot argument (the command line is in every console log and in the ADT), never a log line, never in this
+   repository or a document. The path:
+   - a file on the installed Data store, `/private/var/db/piano-wifi/profile` (owner root, directory mode 700, file 600),
+     written once by the owner (or copied over the USB network from the Mac, standard input, never an argument);
+   - a tiny launch daemon (`com.unixnu.piano-wifi-join`, root, `RunAtLoad`) reads it and writes it **once** into a
+     write-only sysctl, `machdep.piano_wifi_join` (`CTLFLAG_WR | CTLFLAG_ANYBODY` off: root only, and a read returns
+     nothing but `set` or `not set`); the daemon then exits, so the secret lives in one process for milliseconds;
+   - the kext keeps the bytes in wired kernel memory, derives the pairwise master key once, and **zeroes the passphrase**;
+     the log only ever says `profile: a network name of N bytes and a passphrase of M bytes (set)`, never a byte of either.
+     The network's name is also a secret here (it names the owner's home), so the log prints its length and never its text;
+     the registry property keeps it no more than level 6's scan list already does.
+   - a boot argument switches the **feature** on (`piano-wifi=7`) and nothing else; with no profile set, level 7 stops after
+     the association request's refusal or simply holds, and says `no profile is set`.
+   The alternative, an `IOUserClient` with a command to hand the bytes over, buys a cleaner interface (and a place for
+   `join` / `leave` / `status`) at the cost of a user client and its entitlement checks in the first version. The sysctl is
+   the smaller step and is reversible: `tooling/native/piano-wifi join` can be taught either.
+4. **What stays out of the first version:** roaming, power save (the radio stays awake: `WMI_STA_POWERSAVE_MODE` off),
+   protected management frames beyond what the access point requires, and the data path. Without level 8 an association
+   gives `en1` a link that carries no traffic yet — which is still the gate this level has to pass: the firmware's
+   `WMI_VDEV_UP` accepted, the keys installed, and the access point's own log showing the tablet joined.
 
 ## 14. Level 6's message table
 

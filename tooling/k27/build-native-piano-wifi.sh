@@ -5,7 +5,10 @@
 # decoders, the SMMU scan, the cmd-db lookup and the PMIC survey; tests/bringup_host.cpp: the rail votes, the pin and PHY sequence
 # order, the link polls and their timeouts, the configuration space and BAR sizing, the MHI boot state machine;
 # tests/qmi_host.cpp: the QMI codec, the router, the MHI channels and the WLAN firmware's service; tests/wmi_host.cpp: the copy
-# engine's registers and rings, the transport's handshake and credits, the firmware's message interface, the scan and its list —
+# engine's registers and rings, the transport's handshake and credits, the firmware's message interface, the radio's set-up
+# before a virtual device (the hardware mode, the parameters, the regulatory event and the channel list: docs §10.27), the scan
+# and its list; tests/assoc_host.cpp: level 7's messages, built and read back the way the firmware reads them (the regulatory
+# rules, the channel list, a started station, a peer, its association, the keys, a management frame) —
 # each with its injected faults), then the objects in out/native-kexts/PianoWifi for tooling/k27/kext/PianoWifi.json. The macOS
 # side of level 6 (en1) is its own kext: tooling/k27/build-native-piano-wifi-ethernet.sh. Inert without the boot argument
 # piano-wifi (docs/drivers/wifi.md). No firmware is in the build: levels 4 and 5 read it at run time from the tablet's own
@@ -20,7 +23,7 @@ mkdir -p "$O/host-tests"
 "$D/package/include/tests/run.sh"   # PianoWcnRails.h: the rails shared with PianoBluetooth (docs/drivers/bluetooth.md section 7)
 # WifiQrtr.c (the copy of PianoPower's QRTR codec) is a C source: the level 5 test links its object.
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/WifiQrtr.c" -o "$O/host-tests/WifiQrtr.o"
-for t in wifi_host bringup_host qmi_host wmi_host; do
+for t in wifi_host bringup_host qmi_host wmi_host assoc_host; do
   EXTRA=; [ "$t" = qmi_host ] && EXTRA="$O/host-tests/WifiQrtr.o"
   "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/$t.cpp" $EXTRA -o "$O/host-tests/$t"
   "$O/host-tests/$t" || { echo "Error: PianoWifi host tests failed ($t)" >&2; exit 1; }
