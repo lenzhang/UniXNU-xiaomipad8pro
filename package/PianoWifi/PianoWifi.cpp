@@ -589,8 +589,8 @@ void reportPmic()
     const RailState &st = s.rails[i];
     const PmicPeripheral *p = st.reg();
     if (!p) {
-      note("rail %s %s (%s): no regulator found (ppid %03x %s type %02x%s)", r.supply, r.regulator, r.cmdDb, st.primary.ppid,
-           st.primary.present ? "present" : "absent", st.primary.type,
+      note("rail %s %s (%s): no regulator found (ppid %03x %s type %02x read %s%s)", r.supply, r.regulator, r.cmdDb, st.primary.ppid,
+           st.primary.present ? "present" : "absent", st.primary.type, resultName(st.primary.result),
            r.ldo ? (st.alternate.present ? ", alternate present" : ", alternate absent") : "");
       continue;
     }

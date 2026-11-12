@@ -356,9 +356,10 @@ static void testGuard()
   a.failReads = 1;
   CHECK(t.poll(301000, temps).lit);
   CHECK(t.poll(302000, temps).lit);
-  a.failReads = 1;
+  // spmiRead retries a failed command four times (SpmiObserver.h), so a single failed command no longer makes a poll unreadable:
+  // from here every read fails, the first unreadable poll is tolerated, the second is not
+  a.failReads = 1000;
   CHECK(t.poll(303000, temps).lit);
-  a.failReads = 3;
   o = t.poll(304000, temps);
   CHECK(!o.lit && o.reason == Reason::statusUnreadable);
   a.failReads = 0;

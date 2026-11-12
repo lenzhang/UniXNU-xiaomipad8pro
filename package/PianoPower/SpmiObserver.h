@@ -72,8 +72,8 @@ inline Apid spmiFindApid(const Io &io, const Arbiter &a, uint16_t ppid)
 
 enum class ReadResult : uint8_t { ok, error, timeout };
 
-// bytes (1..8) registers from `reg` of the peripheral at `apid`; *status gets the channel's last status word.
-inline ReadResult spmiRead(const Io &io, int apid, uint8_t reg, uint8_t *value, unsigned bytes, uint32_t *status = nullptr)
+// One observer command: bytes (1..8) registers from `reg` of the peripheral at `apid`; *status gets the channel's last status word.
+inline ReadResult spmiReadOnce(const Io &io, int apid, uint8_t reg, uint8_t *value, unsigned bytes, uint32_t *status = nullptr)
 {
   if (apid < 0 || bytes == 0 || bytes > 8 || unsigned(reg) + bytes > 0x100) return ReadResult::error;
   const uint32_t ch = kObsvStride * uint32_t(apid);
@@ -93,6 +93,22 @@ inline ReadResult spmiRead(const Io &io, int apid, uint8_t reg, uint8_t *value, 
   }
   if (status) *status = st;
   return ReadResult::timeout;
+}
+
+// spmiReadOnce, again up to four more times 500 us apart when the channel reports a failure or does not finish in time: with the DSP
+// starting (piano-power=2 piano-power-delay=0) and PianoThermal's ADC rounds on the bus, single observer reads came back failed (the
+// 2026-11-12 23:03 probe: three of PianoWifi's regulator TYPE reads, so level 2 found no regulator and stopped at step -201). Before
+// a retry the channel is given up to 5 ms to finish the command still in flight, so a new command never overtakes it.
+inline ReadResult spmiRead(const Io &io, int apid, uint8_t reg, uint8_t *value, unsigned bytes, uint32_t *status = nullptr)
+{
+  ReadResult r = spmiReadOnce(io, apid, reg, value, bytes, status);
+  for (unsigned attempt = 0; attempt < 4 && r != ReadResult::ok && apid >= 0 && bytes && bytes <= 8; ++attempt) {
+    const uint32_t ch = kObsvStride * uint32_t(apid);
+    for (unsigned i = 0; i < 5000 && !(io.rd(io.ctx, Window::obsv, ch + kObsvStatus) & kStatusDone); ++i) io.delayUs(io.ctx, 1);
+    io.delayUs(io.ctx, 500);
+    r = spmiReadOnce(io, apid, reg, value, bytes, status);
+  }
+  return r;
 }
 
 inline const char *resultName(ReadResult r) { return r == ReadResult::ok ? "ok" : r == ReadResult::error ? "error" : "timeout"; }
