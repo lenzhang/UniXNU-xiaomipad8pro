@@ -55,7 +55,26 @@
 #define RAMP_UP_MV 4650          /* the bus under a step must read this much for the next (the sag rule's 4.5 V plus headroom) */
 #define RAMP_BC12_MA 1500u       /* up to here without a connector reading: BC 1.2's CDP/DCP current and the 1.5 A Rp, as the DCP row */
 #define RAMP_USED_MIN_MA 100u    /* the input counts as used up within max(this, an eighth of the step) of the step */
+#define RAMP_AICL_SETTLE_MS 15000u   /* 0x2029 below the step and not risen for this long: the firmware's own limit is the one to use up
+                                      * (2026-11-12, chg-ramp: 1750-1800 under 2000 asked for eight minutes, the bus at 1.33-1.71 A) */
 static const uint32_t kRampSteps[] = {1500u, 2000u, 2500u, 3000u};
+/* The charging restart (cfg.kick, docs/drivers/charging-policy.md §17). 2026-11-12: in every native boot the charger stopped charging
+ * at about 40 s of uptime (level 1, the PMIC alone: +476 mA, then 0 or less for the rest of the boot), and once the DSP firmware ran
+ * and took the limits, the packs stayed at exactly 0 mA (the firmware's own 0x2027 too) while the bus current moved with the system
+ * under the limit: the input on, the battery not charged. 0x2003 is the firmware's charging enable (the stock AP driver's). */
+#define KICK_IDLE_MA 30          /* the packs within this of 0 mA: neither charged nor discharged */
+#define KICK_IDLE_MS 20000u      /* so over two gauge readings at least this far apart */
+#define KICK_SPARE_MA 150        /* the input at least this far below the limit it is held to */
+#define KICK_SOC_MAX 95          /* not near full: there 0 mA is the charger's termination */
+#define KICK_FV_MARGIN_MV 30     /* the higher pack at least this far below the float voltage in force */
+#define KICK_T_MIN_C 15          /* the coolest reading at least (the charge current's own floor below) */
+#define KICK_T_MAX_C 45          /* the warmest at most (the firmware's JEITA window is 0-55) */
+#define KICK_SETTLE_MS 15000u    /* the first gauge reading this long after the resume judges the restart */
+#define KICK_CHARGING_MA 50      /* the packs taking this much: charging again */
+#define KICK_GAP_MS 120000u      /* between two restarts */
+#define KICK_MAX 3               /* per attach, wake or generation */
+#define KICK_STAGE_MS 60000u     /* the restart's write not through within this: abandoned (the enable's rules still end at 1) */
+#define KICK_OFF_MS 5000u        /* the 0 held this long before the enable's rule lifts it (one charger cycle) */
 /* The board thermistors (docs/drivers/thermal.md 12.7): only ever more conservative. */
 #define CONN_HOT_C 60            /* a connector at or above: the input at 100 mA (the detach value) */
 #define CONN_COOL_C 50           /* until both read below; also the most an Rp limit is allowed with */
@@ -90,6 +109,7 @@ void piano_charge_config_default(PianoChargeConfig *c)
     c->resume_pct = 75;
     c->icl_cap_ma = PIANO_CHG_ICL_CAP;
     c->fcc_cap_ma = PIANO_CHG_FCC_CAP;
+    c->kick = 1;
 }
 
 int piano_charge_config_limit(PianoChargeConfig *c, unsigned on, unsigned stop_pct, unsigned resume_pct)
@@ -232,6 +252,39 @@ int piano_charge_soc_hold(int hold, int32_t soc_pct, unsigned stop_pct, unsigned
     return hold;
 }
 
+uint32_t piano_charge_used_limit(uint32_t step_ma, uint32_t aicl_ma, int settled)
+{
+    return settled && aicl_ma >= PIANO_CHG_ICL_DEFAULT && aicl_ma < step_ma ? aicl_ma : step_ma;
+}
+
+/* ----------------------------------------------------------------------------------------------------------- the balance line */
+#define BAL_MOVING_MA 50
+#define BAL_SPARE_MA 150
+
+void piano_charge_balance(const PianoChargeBalanceIn *in, PianoChargeBalance *o)
+{
+    zero(o, sizeof *o);
+    const int input = in->input_valid && in->bus_mv >= ONLINE_MV;
+    if (input) o->in_mw = (int32_t)((int64_t)in->bus_mv * in->ibus_ma / 1000);
+    if (in->battery_valid) o->bat_mw = (int32_t)((int64_t)in->vbat_mv * in->ibat_ma / 1000);
+    o->spare_ma = input && in->limit_ma > 0 ? in->limit_ma - in->ibus_ma : 0;
+    if (!in->battery_valid) {o->verdict = PIANO_CHG_BAL_UNKNOWN; return;}
+    /* the system: what the charger passes on (about 90 % of the input; not read) less what the battery takes */
+    o->sys_mw = (input ? o->in_mw / 10 * 9 : 0) - o->bat_mw;
+    if (!input) o->verdict = PIANO_CHG_BAL_ON_BATTERY;
+    else if (in->ibat_ma >= BAL_MOVING_MA) o->verdict = PIANO_CHG_BAL_CHARGING;
+    else if (in->ibat_ma <= -BAL_MOVING_MA) o->verdict = PIANO_CHG_BAL_DRAINING;
+    else if (in->limit_ma > 0 && o->spare_ma >= BAL_SPARE_MA) o->verdict = PIANO_CHG_BAL_SPARE;
+    else o->verdict = PIANO_CHG_BAL_USED_UP;
+}
+
+const char *piano_charge_balance_name(int verdict)
+{
+    static const char *const names[] = {"no battery reading", "on battery", "charging", "NOT CHARGING with input to spare",
+                                        "input used up by the system", "draining: the system takes more than the input"};
+    return verdict >= 0 && verdict <= PIANO_CHG_BAL_DRAINING ? names[verdict] : "?";
+}
+
 int piano_charge_write_allowed(const PianoChargeConfig *c, uint32_t property, uint32_t value, uint8_t bytes)
 {
     switch (property) {
@@ -267,12 +320,35 @@ static void reset_tries(PianoChargeState *s)
     for (unsigned i = 0; i < PIANO_CHG_SLOTS; ++i) s->tries[i] = s->mismatch[i] = s->rewrites[i] = 0;
 }
 
+/* A new step (or none): what was seen at the old one does not count for it. */
+static void ramp_moved(PianoChargeState *s)
+{
+    s->ramp_taken_ms = 0;
+    s->ramp_waits_shown = 0;
+    s->ramp_aicl_ma = 0;
+    s->ramp_aicl_ms = 0;
+}
+
 static void ramp_restart(PianoChargeState *s)
 {
     s->ramp_ma = 0;
-    s->ramp_taken_ms = s->ramp_step_ms = 0;
+    s->ramp_step_ms = 0;
     s->ramp_decisions = 0;
-    s->ramp_waits_shown = 0;
+    ramp_moved(s);
+}
+
+/* The charging restart back to idle; with count also its budget (a new attach, a wake, a new generation). */
+static void kick_reset(PianoChargeState *s, int count)
+{
+    s->kick_stage = PIANO_CHG_KICK_IDLE;
+    s->kick_idle_ms = 0;
+    if (count) {s->kick_count = 0; s->kick_ms = 0; s->kick_result = 0;}
+}
+
+/* The restart's 0 is held KICK_OFF_MS before the enable's rule lifts it (only there: a detach, a sleep or a shutdown lifts it at once). */
+static int kick_holding(const PianoChargeState *s, uint64_t now)
+{
+    return s->kick_stage == PIANO_CHG_KICK_STOPPING && now < s->kick_ms + KICK_OFF_MS;
 }
 
 /* The firmware is on its defaults (a new generation) or has to be told everything again (a wake): forget what it took. What is
@@ -294,6 +370,7 @@ static void forget(PianoChargeState *s, uint64_t now)
     s->wedge_since_ms = 0;
     s->rp_taken_ms = 0;   /* the trust itself and its strikes are about the source and stay */
     ramp_restart(s);      /* the steps start again from the row; this boot's ceiling is about the source and stays */
+    kick_reset(s, 1);     /* a stop of the restart that may be in force is s->disabled's: lifted by the enable's rules */
 }
 
 void piano_charge_init(PianoChargeState *s)
@@ -510,9 +587,9 @@ static void ramp_back(PianoChargeState *s, PianoChargePlan *p, uint8_t why, int3
     s->ramp_back_mv = bus_mv;
     if (!s->ramp_ceiling_ma || back < s->ramp_ceiling_ma) s->ramp_ceiling_ma = back;
     s->ramp_ma = back;
-    s->ramp_taken_ms = s->ramp_step_ms = 0;
+    s->ramp_step_ms = 0;
     s->ramp_decisions = 0;
-    s->ramp_waits_shown = 0;
+    ramp_moved(s);
     p->events |= PIANO_CHG_EV_RAMP_BACK;
     p->ramp_back_why = why;
     p->ramp_back_from_ma = s->ramp_back_from_ma;
@@ -522,10 +599,11 @@ static void ramp_back(PianoChargeState *s, PianoChargePlan *p, uint8_t why, int3
 
 /* The stepped Rp limit (cfg.ramp): from the class row to target (the Rp current within rp_cap and the connector rule) one step at
  * a time. A step goes up only when the one in force was taken, held RAMP_HOLD_MS and RAMP_HOLD_DECISIONS, the bus reads at least
- * RAMP_UP_MV under it and the bus current is within max(100 mA, an eighth) of it: the system and the battery take what it gives,
- * so more is of use, and the source has just shown it holds this much. A lower target applies at once. A sag below RP_SAG_MV under a
- * step above the row, or the firmware refusing a step three times: one step back and this boot's ceiling (a quick detach: in
- * detached()). Returns the input limit to plan. */
+ * RAMP_UP_MV under it and the bus current is within max(100 mA, an eighth) of the limit it is held to (the step, or the firmware's
+ * own 0x2029 once that has settled below the step: 1750-1800 under 2000 on the Mac's port, chg-ramp): the system and the battery
+ * take what it gives, so more is of use, and the source has just shown it holds this much. A lower target applies at once. A sag
+ * below RP_SAG_MV under a step above the row, or the firmware refusing a step three times: one step back and this boot's ceiling (a
+ * quick detach: in detached()). Returns the input limit to plan. */
 static uint32_t ramp(const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p, uint64_t now, uint32_t row,
                      uint32_t target)
 {
@@ -534,18 +612,27 @@ static uint32_t ramp(const PianoChargeInput *in, PianoChargeState *s, PianoCharg
     if (s->ramp_ceiling_ma && target > s->ramp_ceiling_ma) target = umax(s->ramp_ceiling_ma, row);
     s->ramp_row_ma = row;
     if (target <= row) {
+        if (s->ramp_ma != row) ramp_moved(s);
         s->ramp_ma = row;
         s->ramp_taken_ms = s->ramp_step_ms = 0;
         p->ramp_ma = row;
         ramp_wait(s, p, PIANO_CHG_RAMP_TOP);
         return row;
     }
-    if (s->ramp_ma < row) {s->ramp_ma = row; s->ramp_taken_ms = 0; s->ramp_waits_shown = 0;}   /* the start (or a higher row) */
-    if (s->ramp_ma > target) {s->ramp_ma = target; s->ramp_taken_ms = 0; s->ramp_waits_shown = 0;}   /* a lower target: at once */
+    if (s->ramp_ma < row) {s->ramp_ma = row; ramp_moved(s);}      /* the start (or a higher row) */
+    if (s->ramp_ma > target) {s->ramp_ma = target; ramp_moved(s);}   /* a lower target: at once */
     const int taken = s->icl_set == s->ramp_ma;
     if (!taken) s->ramp_taken_ms = 0;
     else if (!s->ramp_taken_ms) {s->ramp_taken_ms = now ? now : 1; s->ramp_decisions = 0;}
     else if (s->ramp_decisions < 255) s->ramp_decisions++;
+    /* the firmware's own limit under this step: its highest reading, and when that last rose */
+    if (taken && (in->valid & PIANO_CHG_IN_AICL) && in->aicl_ma > (int32_t)s->ramp_aicl_ma) {
+        s->ramp_aicl_ma = (uint32_t)in->aicl_ma;
+        s->ramp_aicl_ms = now ? now : 1;
+    }
+    const uint32_t used = taken ? piano_charge_used_limit(s->ramp_ma, s->ramp_aicl_ma, s->ramp_aicl_ma &&
+                                                          now >= s->ramp_aicl_ms + RAMP_AICL_SETTLE_MS) : s->ramp_ma;
+    p->ramp_used_ma = used;
     if (s->ramp_ma > row) {
         const int sag = taken && (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv < RP_SAG_MV;
         const int refused = !taken && s->want[PIANO_CHG_S_ICL] == s->ramp_ma && s->tries[PIANO_CHG_S_ICL] >= TRIES;
@@ -562,13 +649,12 @@ static uint32_t ramp(const PianoChargeInput *in, PianoChargeState *s, PianoCharg
     else if (now < s->ramp_taken_ms + RAMP_HOLD_MS || s->ramp_decisions < RAMP_HOLD_DECISIONS) wait = PIANO_CHG_RAMP_HOLDING;
     else if (!(in->valid & PIANO_CHG_IN_BUS) || in->bus_mv < RAMP_UP_MV) wait = PIANO_CHG_RAMP_BUS_LOW;
     else if (!(in->valid & PIANO_CHG_IN_IBUS)) wait = PIANO_CHG_RAMP_NO_CURRENT;
-    else if (in->ibus_ma + (int32_t)umax(RAMP_USED_MIN_MA, s->ramp_ma / 8) < (int32_t)s->ramp_ma) wait = PIANO_CHG_RAMP_NOT_USED;
+    else if (in->ibus_ma + (int32_t)umax(RAMP_USED_MIN_MA, used / 8) < (int32_t)used) wait = PIANO_CHG_RAMP_NOT_USED;
     else {
         p->ramp_from_ma = s->ramp_ma;
         s->ramp_ma = piano_charge_ramp_next(s->ramp_ma, target);
-        s->ramp_taken_ms = 0;
         s->ramp_step_ms = now ? now : 1;
-        s->ramp_waits_shown = 0;
+        ramp_moved(s);
         p->events |= PIANO_CHG_EV_RAMP_STEP;
         wait = PIANO_CHG_RAMP_WRITING;
     }
@@ -804,6 +890,7 @@ static void detached(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
     }
     s->rp_taken_ms = 0;
     ramp_restart(s);
+    kick_reset(s, 1);   /* a stop of a restart in force is lifted below with any stop of ours */
     s->attached = 0;
     s->type = -1;
     s->hv = PIANO_CHG_HV_OFF;
@@ -843,7 +930,11 @@ static void handover(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
         if (stop) {
             p->why_off = s->hold ? PIANO_CHG_OFF_LIMIT : s->hot ? PIANO_CHG_OFF_HOT : s->cold ? PIANO_CHG_OFF_COLD : PIANO_CHG_OFF_SLEEP;
             if (s->enable_set != 0) plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 0, 1);
+        } else if (s->disabled) {
+            /* a charging restart's stop (or one of battery health's being lifted): charging stays on for the sleep */
+            plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 1, 1);
         }
+        kick_reset(s, 0);
         if ((s->touched & (1u << PIANO_CHG_S_FCC)) && s->fcc_set != fcc) plan_write(c, s, p, now, PIANO_CHG_S_FCC, PIANO_CHG_FCC, fcc, 4);
         if ((s->touched & (1u << PIANO_CHG_S_ICL)) && s->icl_set != icl) plan_write(c, s, p, now, PIANO_CHG_S_ICL, PIANO_CHG_ICL, icl, 4);
         want_5v(s);
@@ -855,6 +946,87 @@ static void handover(const PianoChargeConfig *c, const PianoChargeInput *in, Pia
     }
     /* ready once nothing is left to send; a value refused three times is not waited for */
     p->sleep_ready = p->writes == 0 && s->pending == 0;
+}
+
+/* The float voltage in force: 0x2007 as read (2 mV - 3600), else the firmware's own 4400 mV. */
+static int32_t fv_in_force(const PianoChargeInput *in)
+{
+    return (in->valid & PIANO_CHG_IN_FV) && in->fv_raw > 0 ? (in->fv_raw + 3600) / 2 : (int32_t)PIANO_CHG_FV_DEFAULT;
+}
+
+/* The charging restart (cfg.kick, docs §17), after the enable's own rules in a decision. It starts only when those planned nothing
+ * for 0x2003 and no stop of ours is in force, so the stop is the restart's alone; the resume is the enable's own rule (a stop of
+ * ours is lifted at the next decision once the 0 is through), so a restart cut short anywhere (a refusal, no answer, a detach, a
+ * sleep, a shutdown, a new generation) still ends with 0x2003 = 1. Conditions to start: the policy's input limit and charge current
+ * taken and nothing of them in flight, charging allowed (battery health, its hot and cold stops), the firmware's own enable reading
+ * 1 (a 0 of its own is never overridden), both packs read at most 95 % and 30 mV below the float voltage in force, 15-45 degC, the
+ * packs within 30 mA of 0 on two gauge readings 20 s apart or more, and at the decision the bus at 4.65 V or more and its current
+ * 150 mA or more below the limit it is held to (limit_ma). */
+static void kick(const PianoChargeConfig *c, const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p, uint64_t now,
+                 const Temps *t, int charge_ok, uint32_t limit_ma)
+{
+    const uint64_t g = in->gauge_ms ? in->gauge_ms : now;
+    const uint8_t enable_bit = (uint8_t)(1u << PIANO_CHG_S_ENABLE);
+    if (!c->kick || !c->writes) {kick_reset(s, 0); goto out;}
+    /* the 0 held its time: the enable's rule plans the 1 (this decision already, or the next), whatever the 0's answer was */
+    if (s->kick_stage == PIANO_CHG_KICK_STOPPING && !kick_holding(s, now)) s->kick_stage = PIANO_CHG_KICK_RESUMING;
+    if (s->kick_stage == PIANO_CHG_KICK_RESUMING) {
+        if (s->enable_set == 1 && !s->disabled) {
+            s->kick_stage = PIANO_CHG_KICK_WATCHING;
+            s->kick_resumed_ms = now ? now : 1;
+            s->fcc_set = 0;   /* the charge current again (no read-back: the firmware may have dropped it with the enable) */
+            p->kick_events |= PIANO_CHG_KICK_EV_RESUMED;
+        } else if (now >= s->kick_ms + 2 * KICK_STAGE_MS) {
+            kick_reset(s, 0);
+            p->kick_events |= PIANO_CHG_KICK_EV_ABANDONED;
+        }
+        goto out;
+    }
+    if (s->kick_stage == PIANO_CHG_KICK_WATCHING) {
+        if (now >= s->kick_resumed_ms + 2 * KICK_STAGE_MS) {kick_reset(s, 0); goto out;}   /* no gauge reading to judge it by */
+        if (!soc_valid(in) || g < s->kick_resumed_ms + KICK_SETTLE_MS) goto out;
+        s->kick_ibat_ma = in->ibat_ma;
+        p->kick_ibat_ma = in->ibat_ma;
+        if (in->ibat_ma >= KICK_CHARGING_MA) {
+            s->kick_result = 1;
+            p->kick_events |= PIANO_CHG_KICK_EV_CHARGING;
+        } else {
+            s->kick_result = 2;
+            p->kick_events |= PIANO_CHG_KICK_EV_NONE;
+            if (s->kick_count >= KICK_MAX) p->kick_events |= PIANO_CHG_KICK_EV_GAVE_UP;
+        }
+        kick_reset(s, 0);
+        goto out;
+    }
+    if (s->kick_stage != PIANO_CHG_KICK_IDLE) goto out;
+    {
+        const int32_t spare = (int32_t)limit_ma - in->ibus_ma;
+        const int ready = charge_ok && !s->disabled && !(s->pending & (enable_bit | (1u << PIANO_CHG_S_FCC) | (1u << PIANO_CHG_S_ICL))) &&
+                          s->icl_set && s->fcc_set && s->kick_count < KICK_MAX && (!s->kick_count || now >= s->kick_ms + KICK_GAP_MS) &&
+                          (in->valid & PIANO_CHG_IN_ENABLE) && in->enable == 1 && s->hv != PIANO_CHG_HV_ASKED &&
+                          soc_valid(in) && in->soc_max_pct <= KICK_SOC_MAX && in->vbat_max_mv > 0 &&
+                          in->vbat_max_mv + KICK_FV_MARGIN_MV <= fv_in_force(in) &&
+                          t->valid && t->cool >= KICK_T_MIN_C && t->warm <= KICK_T_MAX_C;
+        const int idle = in->ibat_ma >= -KICK_IDLE_MA && in->ibat_ma <= KICK_IDLE_MA;
+        if (!ready || !idle) {s->kick_idle_ms = 0; goto out;}
+        if (!s->kick_idle_ms) {s->kick_idle_ms = g ? g : 1; goto out;}
+        const int spare_ok = (in->valid & PIANO_CHG_IN_BUS) && in->bus_mv >= RAMP_UP_MV && (in->valid & PIANO_CHG_IN_IBUS) &&
+                             limit_ma && spare >= KICK_SPARE_MA;
+        if (g < s->kick_idle_ms + KICK_IDLE_MS || !spare_ok) goto out;
+        plan_write(c, s, p, now, PIANO_CHG_S_ENABLE, PIANO_CHG_ENABLE, 0, 1);
+        if (!(s->pending & enable_bit)) goto out;   /* not planned (the plan is full): the next decision */
+        s->kick_stage = PIANO_CHG_KICK_STOPPING;
+        s->kick_count++;
+        s->kick_ms = now ? now : 1;
+        s->kick_idle_ms = 0;
+        s->kick_ibat_ma = in->ibat_ma;
+        p->kick_events |= PIANO_CHG_KICK_EV_START;
+        p->kick_ibat_ma = in->ibat_ma;
+        p->kick_spare_ma = spare;
+    }
+out:
+    p->kick_stage = s->kick_stage;
+    p->kick_count = s->kick_count;
 }
 
 void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in, PianoChargeState *s, PianoChargePlan *p)
@@ -909,6 +1081,7 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
         s->rp_noted = 0;
         s->rp_taken_ms = 0;
         reset_tries(s);
+        kick_reset(s, 1);
         p->events |= PIANO_CHG_EV_ATTACH;
     }
     /* the type: a failed read changes nothing; a new type starts its limits afresh */
@@ -981,7 +1154,11 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
     } else if (p->icl_why != PIANO_CHG_ICL_RP) {
         s->rp_taken_ms = 0;
     }
-    const uint32_t full = umin(piano_charge_fcc_full(cls, hv_on), fcc_cap(c));
+    /* the charge current: the class's; a source whose Type-C current the steps follow above its row is a 1.5 / 3 A source, so the
+     * DCP row's (2000, within the ceiling: 1500 at stage A); the derating is the same, and the input limit still governs the input */
+    uint32_t full = piano_charge_fcc_full(cls, hv_on);
+    if (!hv_on && ramped(c) && p->icl_why == PIANO_CHG_ICL_RP) full = umax(full, piano_charge_fcc_full(PIANO_CHG_C_DCP, 0));
+    full = umin(full, fcc_cap(c));
     const uint32_t fcc = fcc_target(s, full, &t, now);
     p->icl_ma = icl;
     p->fcc_ma = fcc;
@@ -1000,9 +1177,14 @@ void piano_charge_decide(const PianoChargeConfig *c, const PianoChargeInput *in,
     }
     plan_volt(c, s, p, now);
     if (charge_ok) {
-        if (s->disabled) plan_enable(c, in, s, p, now, 1);
+        if (s->disabled && !kick_holding(s, now)) plan_enable(c, in, s, p, now, 1);
         else if ((in->valid & PIANO_CHG_IN_ENABLE) && !in->enable && !s->fw_noted) {s->fw_noted = 1; p->events |= PIANO_CHG_EV_FW_DISABLED;}
     }
+    /* the restart: the input measured against the limit it is held to (the one taken, or the firmware's own when lower) */
+    uint32_t held = s->icl_set;
+    if ((in->valid & PIANO_CHG_IN_AICL) && in->aicl_ma >= (int32_t)PIANO_CHG_ICL_DEFAULT && (uint32_t)in->aicl_ma < held)
+        held = (uint32_t)in->aicl_ma;
+    kick(c, in, s, p, now, &t, charge_ok, held);
     plan_fv(c, in, s, p, now, &t);
     /* the stop's read-back: 0x2003 reads 0 and yet the packs take current a minute later */
     if (!charge_ok && !s->stop_noted && s->enable_set == 0 && (in->valid & PIANO_CHG_IN_ENABLE) && !in->enable &&

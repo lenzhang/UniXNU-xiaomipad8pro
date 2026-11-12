@@ -12,7 +12,8 @@
 //     policy's: a write it refuses is answered to the policy as refused (three refusals: given up until the next attach). Every
 //     answer, a timeout's included, goes back through piano_charge_ack(), and so does a late answer to a write the owner's timer had
 //     given up on (McaLateWritten: the owner calls answered() for it too). The codec's input limit bound follows the policy's
-//     (piano_mca_allow_icl(piano_charge_icl_max)): above 1600 mA only for the stepped Type-C current (charging-policy.md §15).
+//     (piano_mca_allow_icl(piano_charge_icl_max)): above 1600 mA only for the stepped Type-C current (charging-policy.md §15); its
+//     0x2003 = 0 only with battery health or the charging restart on (charging-policy.md §17).
 //   - Read-back: the input limit, the enable bit and the bus voltage request are compared with the first cycle read after they were
 //     taken (the policy itself writes a limit again after two disagreeing read-backs); the charge current has none (0x2005 reads 0).
 //   - Resync (a wake, Ubuntu #18): the plan's writes are not queued; the owner relinks the codec (board configuration, port enable,
@@ -36,6 +37,7 @@ struct LinkOptions {
   unsigned rpMax = 0;              // piano-power-rp-max: the stepped limit's ceiling, mA (0: the 1600 mA cap; at most 3000)
   bool health = false;             // piano-power-health: stop at stopPct, resume at resumePct
   unsigned stopPct = 80, resumePct = 75;
+  bool kick = true;                // piano-power-kick: the charging restart (ChargePolicy cfg.kick, charging-policy.md §17)
 };
 
 // What the owner knows besides the codec, for one decision.
@@ -45,6 +47,7 @@ struct LinkView {
   uint64_t chargerPdUpMs = 0;                 // when it was seen coming up (nowMs's clock; each up again moves it)
   const GaugeReading *packs = nullptr;        // the two packs' last reading, or none
   bool packsFresh = false;                    // that reading is recent enough to decide with
+  uint64_t packsMs = 0;                       // when it was taken (nowMs's clock; 0: not known)
   const PortState *port = nullptr;            // the charger PMIC's Type-C block, or not readable
   const piano_board_temps *board = nullptr;   // PianoThermal's last round, or PianoThermal not there
   uint32_t wakes = 0;                         // system wakes so far
@@ -108,9 +111,11 @@ class ChargeLink {
     cfg.rp = o.rp ? 1 : 0;
     cfg.ramp = o.rp && o.ramp ? 1 : 0;
     cfg.rp_cap_ma = uint16_t(cfg.ramp && o.rpMax ? (o.rpMax > PIANO_CHG_RP_ABS_MAX ? PIANO_CHG_RP_ABS_MAX : o.rpMax) : 0);
+    cfg.kick = o.kick ? 1 : 0;
     healthRefused = o.health && piano_charge_config_limit(&cfg, 1, o.stopPct, o.resumePct) != 0;
     piano_charge_init(&st);
-    piano_mca_use_external_policy(&m, cfg.limit, cfg.hv >= 2);
+    // 0x2003 = 0 through the codec only for battery health's stop and the charging restart's
+    piano_mca_use_external_policy(&m, cfg.limit || cfg.kick, cfg.hv >= 2);
     piano_mca_allow_icl(&m, piano_charge_icl_max(&cfg));   // the codec's bound follows the policy's (1600 unless stepped higher)
   }
 
@@ -138,6 +143,7 @@ class ChargeLink {
     if (has(McaTermVolt)) {x.valid |= PIANO_CHG_IN_FV; x.fv_raw = m.value[McaTermVolt];}
     if (has(McaVerify)) {x.valid |= PIANO_CHG_IN_VERIFY; x.verify = m.value[McaVerify];}
     if (has(McaTbat)) {x.valid |= PIANO_CHG_IN_TBAT; x.tbat_c = m.value[McaTbat];}
+    if (has(McaAiclStatus)) {x.valid |= PIANO_CHG_IN_AICL; x.aicl_ma = m.value[McaAiclStatus];}
     if (has(McaPdos)) {
       x.valid |= PIANO_CHG_IN_PDOS;
       x.pdos = m.pdos < 7 ? m.pdos : 7;
@@ -154,6 +160,7 @@ class ChargeLink {
       x.t_warm_dc = a.tempDeciC > b.tempDeciC ? a.tempDeciC : b.tempDeciC;
       x.t_cool_dc = a.tempDeciC > b.tempDeciC ? b.tempDeciC : a.tempDeciC;
       x.ibat_ma = a.currentMa + b.currentMa;
+      x.gauge_ms = v.packsMs;
     }
     if (v.port && v.port->ok) {
       x.valid |= PIANO_CHG_IN_TYPEC;

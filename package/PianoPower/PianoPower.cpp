@@ -29,6 +29,9 @@
 // the bus holds and the input is used up (piano-power-ramp=0: at once within 1600 mA; charging-policy.md §15), piano-power-health=1
 // stop at 80 %, resume at 75 % (piano-power-health-stop=N, -resume=N) with the charging-hold assertion. PianoPower then joins the
 // power tree. A charger write's answer is awaited piano-power-write-ms (3000; reads 1 s) and one that comes later is still taken.
+// With the policy, piano-power-kick=1 (the default; 0 leaves it out) restarts a charger that keeps both packs at 0 mA while the input
+// has current to spare (0x2003 = 0, 5 s, then 1; charging-policy.md §17), and every report ends with a `charging:` balance line
+// (input, battery, the system by difference) at every level.
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -68,7 +71,7 @@ namespace {
 struct Args {
   uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor, board, ucsi;
   uint32_t policy, rp, health, healthStop, healthResume;
-  uint32_t ramp, rpMax, writeMs;
+  uint32_t ramp, rpMax, writeMs, kick;
   bool hasRtcOffset;
   uint32_t rtcOffset;
 };
@@ -111,6 +114,9 @@ void readArgs()
   gArgs.writeMs = bootArg("piano-power-write-ms", 3000);
   if (gArgs.writeMs < 1000) gArgs.writeMs = 1000;
   if (gArgs.writeMs > 5000) gArgs.writeMs = 5000;
+  // with the policy: the charging restart (ChargePolicy cfg.kick, charging-policy.md §17): 0x2003 = 0 then 1 when the packs stay at
+  // 0 mA with input to spare; piano-power-kick=0 leaves it out
+  gArgs.kick = bootArg("piano-power-kick", 1);
   gArgs.rtcOffset = 0;
   gArgs.hasRtcOffset = PE_parse_boot_argn("piano-rtc-offset", &gArgs.rtcOffset, sizeof gArgs.rtcOffset);
 }
@@ -304,6 +310,7 @@ class PianoPower : public IOService {
   void logPolicy(const LinkOutcome &o, uint64_t now);
   void policyLine(char *line, size_t size);
   void inputLine(char *line, size_t size);
+  void chargingLine(char *line, size_t size);
   bool boardTemps(piano_board_temps &t, uint64_t now);
   void setHold(bool on);
   void relinkMca(uint64_t now, const char *why);
@@ -356,10 +363,17 @@ bool PianoPower::start(IOService *provider)
                       "(piano-power-ramp=0)"
                     : "the Type-C Rp current is not trusted: the class rows (a CDP gets 900 mA whatever its Rp says)");
     note("charger writes: an answer is awaited %u ms (reads 1000 ms); one that comes later is still taken and logged", gArgs.writeMs);
+    note("piano-power-kick=%u: %s", gArgs.kick && gArgs.write ? 1u : 0u,
+         gArgs.kick && gArgs.write
+             ? "the charging restart: when both packs read within 30 mA of 0 on two readings 20 s apart while the bus has 150 mA or "
+               "more to spare under its limit (below 95 %, 30 mV under the float voltage, 15-45 C, the firmware's own enable 1), "
+               "0x2003 = 0 then 1 and the charge current again; three per attach, 2 min apart"
+             : "no charging restart (0x2003 is written 0 only by battery health)");
     note("piano-power-health=%u%s; piano-power-hv=%u%s", gArgs.health ? 1u : 0u,
          gArgs.health ? ": charging stops at the stop charge (piano-power-health-stop, 80 %) and resumes at the resume charge "
                         "(-resume, 75 %), the higher pack's, with a charging hold against idle sleep below the stop"
-                      : " (battery health off: 0x2003 is never written 0)",
+                      : (gArgs.kick && gArgs.write ? " (battery health off: 0x2003 = 0 only within a charging restart)"
+                                                   : " (battery health off: 0x2003 is never written 0)"),
          gArgs.hv > 2 ? 2u : gArgs.hv, gArgs.hv ? " (9 V asked from a PD source 15 s after the attach)" : "");
     if (gArgs.unsuspend) note("piano-power-unsuspend=1 is the built-in policy's: not used with piano-power-policy=1");
   }
@@ -688,9 +702,14 @@ void PianoPower::report()
       inputLine(line, sizeof line);
       note("[%llus] %s", t, line);
     }
+    chargingLine(line, sizeof line);
+    note("[%llus] %s", t, line);
   } else {
     PianoAdspSurvey s;
     if (!piano_adsp_survey(&s)) note("[%llus] adsp: slave-kernel %d (not started at level 1)", t, s.slave);
+    char line[256];
+    chargingLine(line, sizeof line);
+    note("[%llus] %s", t, line);
   }
 }
 
@@ -736,6 +755,7 @@ void PianoPower::startCharger()
     o.health = gArgs.health != 0;
     o.stopPct = gArgs.healthStop;
     o.resumePct = gArgs.healthResume;
+    o.kick = gArgs.kick != 0;
     fLink.configure(fMca, o);
     if (fLink.healthRefused)
       note("policy: piano-power-health-stop=%u / -resume=%u refused (stop 50..100, resume 40..stop - 1): battery health stays off",
@@ -1074,6 +1094,52 @@ void PianoPower::inputLine(char *line, size_t size)
 #undef HAS
 }
 
+// The balance of each report (ChargePolicy.c piano_charge_balance, charging-policy.md §17.4), under the console's 255 characters: what
+// the input brings (the firmware's bus reading: level 2 only), what both packs take, the system by difference at 90 % conversion
+// (an estimate), the limit the input is held to (the request, or 0x2029 when lower) and the verdict. With `battery:` the line a
+// charging run is judged by: `charging: in 2480 mA at 4720 mV (11.7 W), battery +950 mA at 4300 mV (4.1 W), system ~6.4 W; ...`.
+void PianoPower::chargingLine(char *line, size_t size)
+{
+  const PianoMca &m = fMca;
+  const bool level2 = gArgs.level >= 2;
+  PianoChargeBalanceIn bi{};
+  bi.input_valid = level2 && piano_mca_has(&m, McaBusVoltage) && piano_mca_has(&m, McaBusCurrent) ? 1 : 0;
+  if (bi.input_valid) {
+    bi.bus_mv = m.value[McaBusVoltage] / 1000;
+    bi.ibus_ma = m.value[McaBusCurrent] / 1000;
+  }
+  const int32_t asked = level2 && piano_mca_has(&m, McaIcl) ? m.value[McaIcl] : -1;
+  const int32_t aicl = level2 && piano_mca_has(&m, McaAiclStatus) ? m.value[McaAiclStatus] : -1;
+  bi.limit_ma = asked > 0 ? asked : 0;
+  if (aicl >= 100 && (bi.limit_ma <= 0 || aicl < bi.limit_ma)) bi.limit_ma = aicl;
+  bi.battery_valid = fBattery.ok && fBattery.packs == 2 ? 1 : 0;
+  bi.vbat_mv = fBattery.voltageMv;
+  bi.ibat_ma = fBattery.currentMa;
+  PianoChargeBalance b;
+  piano_charge_balance(&bi, &b);
+  // watts with one decimal, signs kept (integers only: the kernel has no floating point here)
+  auto w = [](int32_t mw, char *out, size_t n) {
+    const int32_t a = mw < 0 ? -mw : mw;
+    snprintf(out, n, "%s%d.%d", mw < 0 ? "-" : "", int(a / 1000), int(a % 1000 / 100));
+  };
+  char in[16], bat[16], sys[16], restart[40] = "";
+  w(b.in_mw, in, sizeof in);
+  w(b.bat_mw, bat, sizeof bat);
+  w(b.sys_mw, sys, sizeof sys);
+  if (fPolicyOn && fLink.cfg.kick) snprintf(restart, sizeof restart, "; restarts %u", unsigned(fLink.st.kick_count));
+  if (!level2)
+    snprintf(line, size, "charging: in ? (level 1: no bus reading without the DSP), battery %+d mA at %d mV (%s W); %s",
+             bi.ibat_ma, bi.vbat_mv, bat, !bi.battery_valid ? "no battery reading" : bi.ibat_ma >= 50 ? "charging"
+                                                                     : bi.ibat_ma <= -50 ? "draining" : "not charging");
+  else if (!bi.input_valid)
+    snprintf(line, size, "charging: in ? (no bus reading yet), battery %+d mA at %d mV (%s W); %s%s", bi.ibat_ma, bi.vbat_mv, bat,
+             piano_charge_balance_name(b.verdict), restart);
+  else
+    snprintf(line, size, "charging: in %d mA at %d mV (%s W), battery %+d mA at %d mV (%s W), system ~%s W; limit %d asked, 0x2029 %d, "
+             "enable %d; %s%s", bi.ibus_ma, bi.bus_mv, in, bi.ibat_ma, bi.vbat_mv, bat, sys, asked, aicl,
+             piano_mca_has(&m, McaChargeEnable) ? m.value[McaChargeEnable] : -1, piano_charge_balance_name(b.verdict), restart);
+}
+
 void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
 {
   const uint64_t t = (now - fStartMs) / 1000;
@@ -1140,15 +1206,38 @@ void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
   if (e & PIANO_CHG_EV_RAMP_BACK)
     note("policy: input steps: back from %u mA: %s (bus %d mV); %u mA is the ceiling for the rest of this boot", pl.ramp_back_from_ma,
          kBack[pl.ramp_back_why < 4 ? pl.ramp_back_why : 0], pl.ramp_back_mv, pl.ramp_ceiling_ma);
+  // the limit the input was measured against: the step, or the firmware's own (0x2029) settled below it
+  char used[48] = "";
+  if (pl.ramp_used_ma && pl.ramp_used_ma != (e & PIANO_CHG_EV_RAMP_STEP ? pl.ramp_from_ma : pl.ramp_ma))
+    snprintf(used, sizeof used, " (the firmware's own limit 0x2029 %u mA)", pl.ramp_used_ma);
   if (e & PIANO_CHG_EV_RAMP_STEP)
-    note("policy: input steps: up %u -> %u mA (towards %u mA, Rp %u mA): it held %d mV with %d mA taken", pl.ramp_from_ma, pl.ramp_ma,
-         pl.ramp_target_ma, in.rp_ma, in.bus_mv, (in.valid & PIANO_CHG_IN_IBUS) ? in.ibus_ma : -1);
+    note("policy: input steps: up %u -> %u mA (towards %u mA, Rp %u mA): it held %d mV with %d mA taken%s", pl.ramp_from_ma, pl.ramp_ma,
+         pl.ramp_target_ma, in.rp_ma, in.bus_mv, (in.valid & PIANO_CHG_IN_IBUS) ? in.ibus_ma : -1, used);
   if (e & PIANO_CHG_EV_RAMP_WAIT) {
     char ceiling[40] = "";
     if (pl.ramp_ceiling_ma) snprintf(ceiling, sizeof ceiling, ", this boot's ceiling %u mA", pl.ramp_ceiling_ma);
-    note("policy: input steps: at %u mA (towards %u mA%s): %s; bus %d mV, %d mA", pl.ramp_ma, pl.ramp_target_ma, ceiling,
-         kWait[pl.ramp_wait < 7 ? pl.ramp_wait : 0], in.bus_mv, (in.valid & PIANO_CHG_IN_IBUS) ? in.ibus_ma : -1);
+    note("policy: input steps: at %u mA (towards %u mA%s): %s%s; bus %d mV, %d mA", pl.ramp_ma, pl.ramp_target_ma, ceiling,
+         kWait[pl.ramp_wait < 7 ? pl.ramp_wait : 0], pl.ramp_wait == PIANO_CHG_RAMP_NOT_USED ? used : "", in.bus_mv,
+         (in.valid & PIANO_CHG_IN_IBUS) ? in.ibus_ma : -1);
   }
+  // the charging restart (ChargePolicy.c kick(), charging-policy.md §17)
+  const uint32_t k = o.decided ? pl.kick_events : 0;   // a decision's own (the plan stays until the next one)
+  if (k & PIANO_CHG_KICK_EV_START)
+    note("policy: charging restart %u of 3: both packs at %d mA for 20 s or more while the input has %d mA to spare (bus %d mV %d mA, "
+         "limit %d, 0x2029 %d), %d %%, %d mV, %d.%d C: 0x2003 = 0, then 1", pl.kick_count, pl.kick_ibat_ma, pl.kick_spare_ma, in.bus_mv,
+         in.ibus_ma, in.icl_ma, (in.valid & PIANO_CHG_IN_AICL) ? in.aicl_ma : -1, in.soc_max_pct, in.vbat_max_mv, in.t_warm_dc / 10,
+         (in.t_warm_dc < 0 ? -in.t_warm_dc : in.t_warm_dc) % 10);
+  if (k & PIANO_CHG_KICK_EV_RESUMED)
+    note("policy: charging restart %u: 0x2003 = 1 taken again; the charge current (%u mA) is sent again; the first battery reading "
+         "15 s on judges it", pl.kick_count, pl.fcc_ma);
+  if (k & PIANO_CHG_KICK_EV_CHARGING)
+    note("policy: charging restart %u: the packs take %+d mA now: CHARGING again", pl.kick_count, pl.kick_ibat_ma);
+  if (k & PIANO_CHG_KICK_EV_NONE)
+    note("policy: charging restart %u: the packs at %+d mA: no change%s", pl.kick_count, pl.kick_ibat_ma,
+         k & PIANO_CHG_KICK_EV_GAVE_UP ? "; three without charging: none more until the next attach, wake or charger generation" : "");
+  if (k & PIANO_CHG_KICK_EV_ABANDONED)
+    note("policy: charging restart %u: a write of it was not through within a minute: given up (0x2003 = 1 stays planned until taken)",
+         pl.kick_count);
   for (unsigned i = 0; i < o.readbacks; ++i) {
     const LinkReadback &r = o.readback[i];
     const bool volt = r.property == PIANO_MCA_PD_FIXED || r.property == PIANO_MCA_PPS;
@@ -1205,6 +1294,7 @@ void PianoPower::stepPolicy(uint64_t now)
   v.chargerPdUpMs = fPdUpMs;
   v.packs = fPack;
   v.packsFresh = fGauges && fPackMs && now - fPackMs <= 3ull * gArgs.period * 1000;
+  v.packsMs = fPackMs;
   v.wakes = __atomic_load_n(&fWakes, __ATOMIC_ACQUIRE);
   v.willSleep = fHandover;
   v.shutdown = fShutdownSeen;

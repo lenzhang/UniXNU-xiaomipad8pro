@@ -24,6 +24,13 @@
  *     cfg.ramp reached in steps from the class row (1.5, 2.0, 2.5, 3.0 A, within cfg.rp_cap_ma), each step held, the bus at 4.65 V
  *     or more and the input used up before the next, and one step back for the rest of the boot when the bus sags under 4.5 V,
  *     the source goes within 30 s of a step or the firmware refuses one (the firmware's own input-current limiting reads off);
+ *   - the charge current of a source whose Type-C current is trusted above its row: the DCP row's (a 1.5 / 3.0 A Rp is a 1.5 / 3 A
+ *     source), within the ceiling and the same derating;
+ *   - the charging restart (cfg.kick, docs §17): the packs at 0 mA over two gauge readings 20 s apart while the input has current to
+ *     spare, below 95 % and the float voltage, 15-45 degC: 0x2003 = 0, then 1, the charge current sent again, and the next reading
+ *     judges it; three per attach at most, two minutes apart (2026-11-12: every native boot stopped charging at about 40 s of
+ *     uptime and the firmware, once started, kept the input on and the battery at 0 mA);
+ *   - the one-line balance of each report (piano_charge_balance: input, battery, the system by difference);
  *   - the direct-charging (SC8541) battery-current curve of an authenticated original adapter, as a specification for a later
  *     charge-pump driver (piano_charge_cp_ibat_ma; nothing calls it yet).
  * Every write passes piano_charge_write_allowed() before it is planned; the owner's own allowlist must admit the same set
@@ -36,7 +43,7 @@ extern "C" {
 #endif
 
 /* The properties the policy writes (the same ids as PianoMca.h; repeated so that this header stands alone). */
-#define PIANO_CHG_ENABLE 0x2003u     /* 1 byte: charging enabled (0 only from the battery-health stop and the sleep stop) */
+#define PIANO_CHG_ENABLE 0x2003u     /* 1 byte: charging enabled (0 only from the battery-health stop, the sleep stop and the restart) */
 #define PIANO_CHG_FCC 0x2005u        /* charge current, mA (reads back 0: the acknowledgement is the only confirmation) */
 #define PIANO_CHG_FV 0x2007u         /* float voltage: written in mV, reads 2 x mV - 3600 */
 #define PIANO_CHG_ICL 0x2008u        /* input current limit, mA (reads back the requested value, not the one in force) */
@@ -93,9 +100,12 @@ typedef struct {
                             * only while a connector reads below 50 degC; a sag, a quick detach or a refusal lowers this boot's
                             * ceiling by one step. 0: the Rp limit at once, within icl_cap_ma, and a sag ends the trust */
     uint16_t rp_cap_ma;    /* the stepped Rp limit's ceiling (0: icl_cap_ma; at most PIANO_CHG_RP_ABS_MAX); only with ramp */
+    uint8_t kick;          /* the charging restart (piano-power-kick, docs §17): a charger that keeps the battery at 0 mA with input to
+                            * spare gets 0x2003 = 0 and then 1 (at most three times per attach, two minutes apart) */
 } PianoChargeConfig;
 
-/* writes on, hv off, float off, limit off (80/75 kept for when it is turned on), sleep stop, the stage A ceilings, no steps. */
+/* writes on, hv off, float off, limit off (80/75 kept for when it is turned on), sleep stop, the stage A ceilings, no steps, the
+ * charging restart on. */
 void piano_charge_config_default(PianoChargeConfig *c);
 /* Preserve Battery Health: on/off and the thresholds (stop 50..100, resume 40..stop-1; resume 0 = stop - 5). Returns 0, or -1 when
  * the values are refused (the configuration is then unchanged). Stop 100 is the same as off. */
@@ -110,6 +120,8 @@ enum {
      * unknown, never cool */
     PIANO_CHG_IN_NTC = 1u << 10, PIANO_CHG_IN_CHGR = 1u << 11, PIANO_CHG_IN_CONN1 = 1u << 12, PIANO_CHG_IN_CONN2 = 1u << 13,
     PIANO_CHG_IN_IBUS = 1u << 14,   /* the firmware's bus current (0x20004): whether the input is used up (the steps) */
+    PIANO_CHG_IN_AICL = 1u << 15,   /* 0x2029, the input current the firmware holds itself to (it walks to the request, and on the Mac's
+                                     * port stopped at 1750-1800 under 2000) */
 };
 enum {PIANO_CHG_AWAKE = 0, PIANO_CHG_WILL_SLEEP = 1};
 
@@ -128,6 +140,7 @@ typedef struct {
     int32_t fv_raw;         /* 0x2007, as read (2 x mV - 3600) */
     int32_t verify;         /* 0x21002: non-zero while an adapter authentication runs */
     int32_t tbat_c;         /* 0x202a */
+    int32_t aicl_ma;        /* 0x2029 (PIANO_CHG_IN_AICL) */
     uint8_t pdos;           /* 0x21011: {min mV, max mV, max mA}, fixed when min == max */
     uint32_t pdo[7][3];
     /* the two gauges (PIANO_CHG_IN_GAUGES: both packs read) */
@@ -135,6 +148,7 @@ typedef struct {
     int32_t vbat_max_mv;                /* the higher pack's voltage */
     int32_t t_warm_dc, t_cool_dc;       /* the warmest and coolest pack, 0.1 degC */
     int32_t ibat_ma;                    /* both packs, + = charging */
+    uint64_t gauge_ms;                  /* when that reading was taken (now_ms's clock; 0: not known, taken as now) */
     /* the charger PMIC's Type-C block (PianoPower's level 1 view): a source's Rp is seen, and the current it advertises (0 none,
      * 500 the default, 1500, 3000; ChargerPmic.h rpMilliamps) */
     uint8_t typec_source;
@@ -194,8 +208,17 @@ typedef struct {
     uint8_t ramp_decisions, ramp_back_why, ramp_waits_shown;
     uint32_t ramp_back_from_ma;
     int32_t ramp_back_mv;
+    /* the firmware's own input limit (0x2029) at this step: the highest it read and when it last rose (the steps take it as the
+     * limit to use up once it has settled below the step) */
+    uint32_t ramp_aicl_ma;
+    uint64_t ramp_aicl_ms;
     /* the board thermistors: the connectors' and the charger's hot holds, the battery thermistor apart from the packs */
     uint8_t conn_hot, chgr_hot, ntc_apart;
+    /* the charging restart (cfg.kick): the stage (PIANO_CHG_KICK_*), restarts since the attach, when the last began, since when
+     * (the gauge reading's time) the packs read 0 mA with everything else in place, when the resume was taken, what judged it */
+    uint8_t kick_stage, kick_count, kick_result;
+    uint64_t kick_ms, kick_idle_ms, kick_resumed_ms;
+    int32_t kick_ibat_ma;
 } PianoChargeState;
 
 #define PIANO_CHG_MAX_WRITES 6
@@ -242,6 +265,16 @@ enum {
 };
 /* why it went one step back (plan.ramp_back_why) */
 enum {PIANO_CHG_BACK_NONE = 0, PIANO_CHG_BACK_SAG, PIANO_CHG_BACK_DETACH, PIANO_CHG_BACK_REFUSED};
+/* the charging restart (cfg.kick): its stages, and its events (plan.kick_events; the plan's events word is full) */
+enum {PIANO_CHG_KICK_IDLE = 0, PIANO_CHG_KICK_STOPPING, PIANO_CHG_KICK_RESUMING, PIANO_CHG_KICK_WATCHING};
+enum {
+    PIANO_CHG_KICK_EV_START = 1u << 0,     /* 0x2003 = 0 planned: the packs at 0 mA with input to spare (plan.kick_*) */
+    PIANO_CHG_KICK_EV_RESUMED = 1u << 1,   /* 0x2003 = 1 taken again: the charge current is sent again, the next reading judges */
+    PIANO_CHG_KICK_EV_CHARGING = 1u << 2,  /* the packs take current after it: charging again */
+    PIANO_CHG_KICK_EV_NONE = 1u << 3,      /* they still read 0 mA (or less) */
+    PIANO_CHG_KICK_EV_GAVE_UP = 1u << 4,   /* three restarts without charging: none more until the next attach, wake or generation */
+    PIANO_CHG_KICK_EV_ABANDONED = 1u << 5, /* a write of the restart not answered within a minute: left to the enable's own rules */
+};
 enum {PIANO_CHG_OFF_NONE = 0, PIANO_CHG_OFF_LIMIT, PIANO_CHG_OFF_HOT, PIANO_CHG_OFF_COLD, PIANO_CHG_OFF_SLEEP};
 /* where the input limit came from (plan.icl_why) */
 enum {PIANO_CHG_ICL_ROW = 0, PIANO_CHG_ICL_RP, PIANO_CHG_ICL_9V, PIANO_CHG_ICL_CONN, PIANO_CHG_ICL_CHGR};
@@ -265,6 +298,12 @@ typedef struct {
     uint8_t ramp_wait, ramp_back_why;
     uint32_t ramp_back_from_ma;
     int32_t ramp_back_mv;
+    uint32_t ramp_used_ma;   /* the limit the input was measured against for the step (the step, or 0x2029 settled below it) */
+    /* the charging restart: its events (PIANO_CHG_KICK_EV_*), the stage now, restarts so far, the packs' current that started or judged
+     * it, and the input current to spare when it started */
+    uint32_t kick_events;
+    uint8_t kick_stage, kick_count;
+    int32_t kick_ibat_ma, kick_spare_ma;
 } PianoChargePlan;
 
 void piano_charge_init(PianoChargeState *s);
@@ -304,6 +343,31 @@ uint32_t piano_charge_fv_target(uint8_t *term_hot, int t_valid, int32_t t_warm_c
 static inline int32_t piano_charge_fv_raw(uint32_t mv) {return 2 * (int32_t)mv - 3600;}
 /* The battery-health hysteresis: 1 = stopped. */
 int piano_charge_soc_hold(int hold, int32_t soc_pct, unsigned stop_pct, unsigned resume_pct);
+/* The limit the steps measure the input against: the step, or the firmware's own limit (0x2029) once it has settled below the step
+ * (aicl_ma its highest reading at this step, settled: it has not risen for 15 s); 0 aicl_ma: the step. */
+uint32_t piano_charge_used_limit(uint32_t step_ma, uint32_t aicl_ma, int settled);
+
+/* The balance of one report (docs §17.4): the input's power from the firmware's bus reading, the battery's from the gauges, the
+ * system's by difference at 90 % conversion (an estimate: the charger's efficiency is not read), and what they say together. */
+enum {
+    PIANO_CHG_BAL_UNKNOWN = 0,   /* no battery reading */
+    PIANO_CHG_BAL_ON_BATTERY,    /* no input (no bus reading above 4 V): the battery carries the system */
+    PIANO_CHG_BAL_CHARGING,      /* the packs take 50 mA or more */
+    PIANO_CHG_BAL_SPARE,         /* the packs within 50 mA of 0 and the input 150 mA or more below its limit: the charger does not
+                                  * charge (2026-11-12: every native boot after about 40 s) */
+    PIANO_CHG_BAL_USED_UP,       /* the packs within 50 mA of 0, the input at its limit: the system takes it all */
+    PIANO_CHG_BAL_DRAINING,      /* the packs give 50 mA or more while the input runs: the system takes more than the input */
+};
+typedef struct {
+    uint8_t input_valid;       /* a bus reading (0x20002, 0x20004) */
+    int32_t bus_mv, ibus_ma;
+    int32_t limit_ma;          /* the limit the input is held to (the request, or 0x2029 when lower); 0: not known */
+    uint8_t battery_valid;     /* both packs read */
+    int32_t vbat_mv, ibat_ma;  /* the packs' voltage and their summed current, + = charging */
+} PianoChargeBalanceIn;
+typedef struct {int32_t in_mw, bat_mw, sys_mw, spare_ma; uint8_t verdict;} PianoChargeBalance;
+void piano_charge_balance(const PianoChargeBalanceIn *in, PianoChargeBalance *out);
+const char *piano_charge_balance_name(int verdict);
 
 /* ---- direct charging (SC8541 2:1 from an authenticated original adapter's PPS APDO): the specification of the curve ----
  * The battery current (both cells) a direct-charging session may target, by the cells' voltage (the stock "normal" step table,

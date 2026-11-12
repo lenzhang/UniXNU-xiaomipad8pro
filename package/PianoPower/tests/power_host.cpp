@@ -885,6 +885,7 @@ struct LinkRig {
   uint64_t now = 0, pdUpMs = 0;       // pdUpMs: when charger_pd came up (LinkView.chargerPdUpMs)
   unsigned relinks = 0, handoverReady = 0, refused = 0, waitingPd = 0, waitingBoard = 0;
   uint32_t events = 0;              // every decision's events since the last take()
+  uint32_t kickEvents = 0;          // every decision's charging-restart events (PIANO_CHG_KICK_EV_*)
   std::vector<LinkReadback> readbacks;
 
   explicit LinkRig(LinkOptions o, bool boardCfg = true) : opts(o)
@@ -953,6 +954,7 @@ struct LinkRig {
     LinkOutcome o;
     link.step(m, view(), o);
     events |= o.events;
+    if (o.decided) kickEvents |= link.plan.kick_events;
     relinks += o.resync;
     handoverReady += o.handoverReady;
     refused += o.refused;
@@ -989,7 +991,7 @@ struct LinkRig {
       const uint32_t iclMax = opts.rp && opts.ramp && opts.rpMax > 1600 ? (opts.rpMax > 3000 ? 3000 : opts.rpMax) : 1600;
       if (w.property == PIANO_MCA_ICL && (w.value < 100 || w.value > iclMax)) return false;
       if (w.property == PIANO_MCA_FCC && (w.value < 100 || w.value > 1500)) return false;
-      if (w.property == PIANO_MCA_CHARGE_ENABLE && w.value == 0 && !link.cfg.limit) return false;
+      if (w.property == PIANO_MCA_CHARGE_ENABLE && w.value == 0 && !link.cfg.limit && !link.cfg.kick) return false;
       if (w.property == PIANO_MCA_INPUT_SUSPEND || w.property == PIANO_MCA_TERM_VOLT) return false;
     }
     return true;
@@ -1199,7 +1201,8 @@ static void testLinkRamp()
     auto r = rig(o);
     r->period();
     const int icl = r->index(PIANO_MCA_ICL), fcc = r->index(PIANO_MCA_FCC);
-    CHECK(icl >= 0 && fcc > icl && r->d.last(PIANO_MCA_ICL) == 900 && r->d.last(PIANO_MCA_FCC) == 900);
+    // the charge current of a source whose Rp the steps follow: the DCP row's within the 1500 mA ceiling (charging-policy.md §17)
+    CHECK(icl >= 0 && fcc > icl && r->d.last(PIANO_MCA_ICL) == 900 && r->d.last(PIANO_MCA_FCC) == 1500);
     CHECK(r->link.plan.icl_why == PIANO_CHG_ICL_RP && r->link.plan.rp_ma == 3000 && r->link.plan.ramp_target_ma == 3000);
     std::vector<std::pair<uint64_t, uint32_t>> steps;
     for (int i = 0; i < 30; ++i) {
@@ -1330,6 +1333,75 @@ static void testLinkRamp()
   }
 }
 
+// The charging restart through the codec (charging-policy.md §17) in the 2026-11-12 state: the Mac's port (CDP, Rp 3.0 A, 5.23 V,
+// 0.21 Ohm), the system at 1450 mA, both packs at exactly 0 mA at 93 % and 4362 mV, 34 C, a charger that does not charge until its
+// enable goes 0 and back to 1: the codec takes 0x2003 = 0 then 1 (one byte each), the charge current goes again, the packs' current
+// judges it, and the steps then go on with the battery's share of the input.
+static void testLinkKick()
+{
+  LinkOptions o;
+  o.rp = true;
+  o.rpMax = 3000;
+  auto stuck = [](LinkRig &r) {
+    r.haveBoard = true;
+    r.d.loadMa = 1450;
+    for (GaugeReading &g : r.packs) {g.voltageMv = 4362; g.currentMa = 0; g.tempDeciC = 340;}
+    r.soc(93);
+  };
+  // the charger model: once it has seen 0x2003 = 0 and then 1, both packs take 300 mA and the input 620 mA more
+  auto charger = [](LinkRig &r, bool clears) {
+    const int zero = r.index(PIANO_MCA_CHARGE_ENABLE);
+    if (!clears || zero < 0 || r.d.writes[size_t(zero)].value != 0 || r.d.last(PIANO_MCA_CHARGE_ENABLE) != 1) return;
+    for (GaugeReading &g : r.packs) g.currentMa = 300;
+    r.d.loadMa = 1450 + 620;
+  };
+  {
+    LinkRig r(o);
+    stuck(r);
+    for (int i = 0; i < 60; ++i) {r.period(); charger(r, true);}
+    CHECK(r.d.count(PIANO_MCA_CHARGE_ENABLE, 0) == 1 && r.d.last(PIANO_MCA_CHARGE_ENABLE) == 1);
+    CHECK((r.kickEvents & PIANO_CHG_KICK_EV_START) && (r.kickEvents & PIANO_CHG_KICK_EV_RESUMED) && (r.kickEvents & PIANO_CHG_KICK_EV_CHARGING));
+    CHECK(!(r.kickEvents & (PIANO_CHG_KICK_EV_NONE | PIANO_CHG_KICK_EV_ABANDONED)) && r.link.st.kick_count == 1);
+    // the charge current again after the resume (1500: the DCP row's within the ceiling), and the enable read back as 1
+    const int zero = r.index(PIANO_MCA_CHARGE_ENABLE);
+    CHECK(zero >= 0 && r.index(PIANO_MCA_FCC, unsigned(zero)) > zero && r.d.last(PIANO_MCA_FCC) == 1500);
+    CHECK(r.m.value[McaChargeEnable] == 1 && r.d.props[PIANO_MCA_CHARGE_ENABLE] == 1);
+    // the input: 2000 while the battery took nothing (1450 of it used), then the battery's share used it up: 2500
+    CHECK(r.d.last(PIANO_MCA_ICL) == 2500 && r.allAllowed());
+  }
+  // the restart without effect: three, then none; 0x2003 back at 1 each time; the restart off: no 0 at all
+  {
+    LinkRig r(o);
+    stuck(r);
+    for (int i = 0; i < 160; ++i) {r.period(); charger(r, false);}
+    CHECK(r.d.count(PIANO_MCA_CHARGE_ENABLE, 0) == 3 && r.d.last(PIANO_MCA_CHARGE_ENABLE) == 1 && r.d.props[PIANO_MCA_CHARGE_ENABLE] == 1);
+    CHECK((r.kickEvents & PIANO_CHG_KICK_EV_GAVE_UP) && !(r.kickEvents & PIANO_CHG_KICK_EV_CHARGING) && r.allAllowed());
+    LinkOptions off = o;
+    off.kick = false;
+    LinkRig n(off);
+    stuck(n);
+    for (int i = 0; i < 60; ++i) n.period();
+    CHECK(!n.d.count(PIANO_MCA_CHARGE_ENABLE) && !n.kickEvents && n.allAllowed());
+  }
+  // a detach between the 0 and the 1: the 1 goes with the detach's writes; a shutdown the same
+  {
+    LinkRig r(o);
+    stuck(r);
+    for (int i = 0; i < 40 && !(r.kickEvents & PIANO_CHG_KICK_EV_START); ++i) r.period();
+    CHECK(r.d.last(PIANO_MCA_CHARGE_ENABLE) == 0);
+    r.d.loadMa = 0;
+    r.d.props[PIANO_MCA_BUS_VOLTAGE] = 100000;
+    r.period();
+    CHECK(r.d.last(PIANO_MCA_CHARGE_ENABLE) == 1 && r.d.last(PIANO_MCA_ICL) == 100);
+    LinkRig t(o);
+    stuck(t);
+    for (int i = 0; i < 40 && !(t.kickEvents & PIANO_CHG_KICK_EV_START); ++i) t.period();
+    t.shutdown = true;
+    t.period();
+    CHECK(t.d.last(PIANO_MCA_CHARGE_ENABLE) == 1 && t.handoverReady);
+  }
+}
+
 static void testLinkPd()
 {
   // 5 V/3 A + 9 V/2 A, piano-power-hv=1: the 5 V offer (capped 1500) first, 9 V 15 s after the attach, then 1600 mA
@@ -1455,13 +1527,17 @@ static void testLinkHealth()
     CHECK(!r.link.hold);
     CHECK(r.allAllowed());
   }
-  // battery health off: never a 0, and the codec would refuse one
+  // battery health off: never a 0 (the packs discharge: no restart either); with the restart off too the codec refuses one
   {
     LinkRig r{LinkOptions()};
     r.soc(95);
     for (int i = 0; i < 3; ++i) r.period();
     CHECK(!r.d.count(PIANO_MCA_CHARGE_ENABLE) && !r.link.hold);
-    CHECK(piano_mca_queue(&r.m, PIANO_MCA_CHARGE_ENABLE, 0, 1) == -1);
+    CHECK(r.m.stop_allowed && r.link.cfg.kick);   // the restart's 0 (testLinkKick)
+    LinkOptions off;
+    off.kick = false;
+    LinkRig n(off);
+    CHECK(!n.link.cfg.kick && piano_mca_queue(&n.m, PIANO_MCA_CHARGE_ENABLE, 0, 1) == -1);
     LinkRig h(o);
     CHECK(piano_mca_queue(&h.m, PIANO_MCA_CHARGE_ENABLE, 0, 1) == 0);
   }
@@ -1469,6 +1545,7 @@ static void testLinkHealth()
   {
     LinkOptions bad = o;
     bad.stopPct = 30;
+    bad.kick = false;
     LinkRig r(bad);
     CHECK(r.link.healthRefused && !r.link.cfg.limit && !r.m.stop_allowed);
   }
@@ -1755,6 +1832,7 @@ int main()
   testLinkRp();
   testMcaLate();
   testLinkRamp();
+  testLinkKick();
   testLinkPd();
   testLinkDetachWakeGeneration();
   testLinkGates();

@@ -12,17 +12,30 @@
 #          old 1 s write window (piano-power-write-ms=1000): whether the firmware's answers to the first limit writes come late
 #          ("mca: late answer to the write of ...") or never
 #
-#   build-charge-test-images.sh [NAME ...]   default: ramp l1 late; out/ram-chg-<NAME>/ and out/ram-chg-dump/
+# and those of section 17 (the 0 mA of 2026-11-12: the charger stops charging at about 40 s of every native boot and the firmware,
+# once it runs, keeps the input on and the battery at 0 mA), 900 s each:
+#
+#   kick       ramp's arguments with this tree's PianoPower: the charging restart (piano-power-kick=1, the policy's default: 0x2003 =
+#              0 then 1 when both packs stay at 0 mA with input to spare), the charge current of a trusted Rp (1500 mA), the steps
+#              measured against the firmware's own 0x2029, and the `charging:` balance line every report
+#   kick-idle  kick without PerfPowerServices and audiomxd (PIANO_DENY_EXEC, k27-deny-exec: power.md 1.2, the p9 images' fix; in
+#              p9-off every CPU idled 98.7-99.9 %): the idle login window's load, so more of the input is left for the battery
+#
+#   build-charge-test-images.sh [NAME ...]   default: kick kick-idle; out/ram-chg-<NAME>/ and out/ram-chg-dump/
 #
 # Inputs (this repository's out/ unless set): CHG_KC (out/k27/kc-k27-native.bin with this tree's PianoPower, PianoThermal and
 # PianoA830: K27_KERNEL=<kernel-k27-0063-native.macho> PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh), CHG_ADT
 # (out/adt/piano-k27.adt), CHG_FD, CHG_SEED / CHG_TRUST (the Turnip stage, out/turnip-a830/stage: the login window as the daily
 # shows it), CHG_EXTRA (added to every image). Data is volatile (the staged seed is not the installed one).
 #
-# The verdict lines (grep -E 'PianoPower: (policy: input steps|\[[0-9]+s\] (battery|input|policy)|mca: (write|late))'): `input: bus V mV
-# I mA, limit L mA asked, 0x2029 N; steps S mA (...)` and `battery: V mV, I mA (charging|discharging)` every 30 s; pass for ramp: the
-# packs at or above 0 mA at the login window from about 120 s on, the bus current above l1's inferred 1.4-1.5 A, no `back from` line
-# (or one with its reason), no `FATAL`.
+# The verdict lines (grep -E 'PianoPower: (policy: (input steps|charging restart)|\[[0-9]+s\] (battery|input|policy|charging)|mca: (write|late))'):
+# `input: bus V mV I mA, limit L mA asked, 0x2029 N; steps S mA (...)`, `battery: V mV, I mA (charging|discharging)` and (this tree)
+# `charging: in I mA at V mV (W), battery +I mA at V mV (W), system ~W; ...; <verdict>` every 30 s; pass for ramp: the packs at or
+# above 0 mA at the login window from about 120 s on, the bus current above l1's inferred 1.4-1.5 A, no `back from` line (or one with
+# its reason), no `FATAL`. Pass for kick and kick-idle: `charging restart 1 of 3: ...` once the packs read 0 mA (about 150 s), then
+# `charging restart 1: the packs take +N mA now: CHARGING again` and `charging: ... charging` lines to the end, the steps on past
+# 2000 mA; `no change` three times means 0x2003 does not restart this charger (then the next suspect is the input's own suspend and
+# replug, attended: charging-policy.md §17.6).
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
 KC=${CHG_KC:-out/k27/kc-k27-native.bin}
@@ -31,26 +44,34 @@ FD=${CHG_FD:-out/fd/piano-uefi-A-bundled.fd}
 SEED=${CHG_SEED:-out/turnip-a830/stage/scratch-data.img}
 TRUST=${CHG_TRUST:-out/turnip-a830/stage/kernel.macho.trustcache}
 for f in "$KC" "$ADT" "$FD" "$SEED" "$TRUST"; do [ -f "$f" ] || { echo "build-charge-test-images: $f is missing" >&2; exit 1; }; done
-for s in com.unixnu.driver.PianoPower com.unixnu.driver.PianoThermal com.unixnu.driver.PianoA830 piano-power-rp-max; do
+NEED="com.unixnu.driver.PianoPower com.unixnu.driver.PianoThermal com.unixnu.driver.PianoA830 piano-power-rp-max"
+case " ${*:-kick} " in *" kick"*) NEED="$NEED piano-power-kick" ;; esac   # the restart and the balance line: this tree's PianoPower
+for s in $NEED; do
   grep -a -q "$s" "$KC" || { echo "build-charge-test-images: $KC has no $s (this tree's PianoPower, PianoThermal, PianoA830)" >&2; exit 1; }
 done
 # The daily profile's drivers (build-esp.py PROFILES['daily'] without the Mac's keyboard/pointer, which an unattended run does not
 # use) and PianoThermal's ADC, which the Rp steps above 1.5 A need for a connector temperature. No CPU frequency argument: the clocks
 # UEFI left, as the daily runs.
 BASE="piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-usb=2 piano-thermal=1 piano-thermal-adc=1 ${CHG_EXTRA:-}"
-ORDER="ramp l1 late"
+ORDER="kick kick-idle"
+ALL="ramp l1 late kick kick-idle"
+# the daemons that spun a core at the idle login window in every boot of 2026-11-12 (power.md 1.2)
+IDLE_DENY=/usr/libexec/PerfPowerServices,/usr/libexec/audiomxd
 image() {
+  R=600 DENY=
   case $1 in
     ramp) PW="piano-power=2 piano-power-policy=1 piano-power-rp=1" ;;
     l1)   PW="piano-power=1" ;;
     late) PW="piano-power=2 piano-power-policy=1 piano-power-rp=1 piano-power-ramp=0 piano-power-write-ms=1000" ;;
+    kick) PW="piano-power=2 piano-power-policy=1 piano-power-rp=1"; R=900 ;;
+    kick-idle) PW="piano-power=2 piano-power-policy=1 piano-power-rp=1"; R=900 DENY=$IDLE_DENY ;;
     *) return 1 ;;
   esac
 }
 COMMON=(--fd "$FD" --fd-name A-bundled --kc "$KC" --trust "$TRUST" --seed "$SEED" --adt "$ADT" --utc "$(date +%s)")
 for n in ${*:-$ORDER}; do
-  image "$n" || { echo "build-charge-test-images: no image $n (one of: $ORDER)" >&2; exit 2; }
-  PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=600 PIANO_EXTRA_ARGS="$PW $BASE" \
+  image "$n" || { echo "build-charge-test-images: no image $n (one of: $ALL)" >&2; exit 2; }
+  PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=$R PIANO_DENY_EXEC=$DENY PIANO_EXTRA_ARGS="$PW $BASE" \
     python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out "out/ram-chg-$n" | tail -1
 done
 PIANO_RESET_AFTER=1 PIANO_DATA_PERSIST=0 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram-chg-dump | tail -1

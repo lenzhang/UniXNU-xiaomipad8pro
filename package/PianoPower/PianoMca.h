@@ -143,7 +143,8 @@ typedef struct {
     /* the policy: 0 reads only, 1 writes at 5 V; hv_allowed adds the 9 V request */
     uint8_t policy, hv_allowed, attached, hv, hv_checks, attach_cycles;
     /* external: ChargePolicy decides (piano-power-policy=1): the built-in policy is left out, the board configuration stays, the owner
-     * queues through piano_mca_queue; stop_allowed admits 0x2003 = 0 (battery health on), pps_allowed the 9 V APDO request (hv 2) */
+     * queues through piano_mca_queue; stop_allowed admits 0x2003 = 0 (battery health on, or the charging restart: ChargePolicy
+     * cfg.kick), pps_allowed the 9 V APDO request (hv 2) */
     uint8_t external, stop_allowed, pps_allowed;
     uint32_t icl_max;                /* external: the input limit admitted up to this (the stepped Rp limit, <= 3000; 0: 1600) */
     /* the last write the owner's timer gave up on: its answer may still come (the firmware answered limit writes after the window
@@ -201,8 +202,8 @@ void piano_mca_allow_board(PianoMca *m, int allow);
 /* The gauges' temperature, used when the firmware's own reading is missing. */
 void piano_mca_battery_temperature(PianoMca *m, int valid, int32_t celsius);
 /* ChargePolicy decides instead of the built-in policy (docs/drivers/charging-policy.md §8): the cycle, the board configuration, the port
- * notifications and the UCSI probe stay; stop: battery health is on (0x2003 = 0 admitted); pps: hv 2 (0x21017's 9 V word admitted).
- * Without the policy (piano-power-write=0) the codec stays read only: piano_mca_queue refuses everything. */
+ * notifications and the UCSI probe stay; stop: battery health or the charging restart is on (0x2003 = 0 admitted); pps: hv 2
+ * (0x21017's 9 V word admitted). Without the policy (piano-power-write=0) the codec stays read only: piano_mca_queue refuses everything. */
 void piano_mca_use_external_policy(PianoMca *m, int stop, int pps);
 /* With the external policy: the input limit admitted up to max_ma (1600..3000; the stepped Type-C current, ChargePolicy's
  * cfg.rp_cap_ma); 0 or less keeps the 1600 mA bound. */

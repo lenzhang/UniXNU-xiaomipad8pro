@@ -52,6 +52,15 @@ struct Sim {
   // above kneeMa the source's voltage gives way by kneeOhms more
   int loadMa = 0, kneeMa = 0;
   double ohms = 0, kneeOhms = 0;
+  // the firmware's own input limit (0x2029): aiclCap > 0 holds it there below the request (the Mac's port: 1750-1800 under 2000)
+  int aiclCap = 0;
+  bool aiclRead = false;
+  // the charger (charger > 0, docs §17): stuck keeps the battery at 0 mA whatever the limits (every native boot of 2026-11-12 after
+  // about 40 s); a 0x2003 write of 0 followed by one of 1 clears it when toggleClears; otherwise the battery takes min(charger, fcc)
+  // and the system loadBase, so the input asked is loadBase plus what the battery takes
+  int charger = 0, loadBase = 0;
+  bool stuck = false, toggleClears = true, sawZero = false;
+  unsigned enableZeros = 0;
   // the battery
   int soc = 50, tbatC = 30, tWarmDc = 300, tCoolDc = 290, ibat = 1000, vbat = 3900;
   // the Type-C current and PianoThermal's board thermistors (0.1 degC; boardValid: PIANO_CHG_IN_NTC..CONN2 bits)
@@ -77,11 +86,24 @@ struct Sim {
     in.valid = PIANO_CHG_IN_BUS | PIANO_CHG_IN_TYPE | PIANO_CHG_IN_ICL | PIANO_CHG_IN_ENABLE | PIANO_CHG_IN_FV | PIANO_CHG_IN_VERIFY |
                PIANO_CHG_IN_TBAT | PIANO_CHG_IN_TYPEC;
     in.bus_mv = source ? busMv : 0;
+    if (charger > 0) {
+      // the battery's share: nothing while stuck or disabled, else what the charge current and the input left after the system allow
+      const int lim = aiclCap && aiclCap < int(icl) ? aiclCap : int(icl);
+      int take = stuck || !enable || !source ? 0 : std::min(charger, int(fcc));
+      if (loadBase + take > lim) take = std::max(lim - loadBase, 0);
+      ibat = take;
+      loadMa = loadBase + take;
+    }
+    const int held = aiclCap && aiclCap < int(icl) ? aiclCap : int(icl);
     if (source && loadMa > 0) {
-      const int ma = int(icl) < loadMa ? int(icl) : loadMa;
+      const int ma = held < loadMa ? held : loadMa;
       in.valid |= PIANO_CHG_IN_IBUS;
       in.ibus_ma = ma;
       in.bus_mv = busMv - int(ohms * ma) - (kneeMa && ma > kneeMa ? int(kneeOhms * (ma - kneeMa)) : 0);
+    }
+    if (source && (aiclCap || aiclRead)) {
+      in.valid |= PIANO_CHG_IN_AICL;
+      in.aicl_ma = held;
     }
     in.type = source ? type : 0;
     in.icl_ma = int32_t(icl);
@@ -125,7 +147,12 @@ struct Sim {
     case PIANO_CHG_ICL: if (refuseIcl) ret = 1; else icl = w.value; break;
     case PIANO_CHG_FCC: fcc = w.value; break;
     case PIANO_CHG_FV: if (!ignoreFv) fv = w.value; break;
-    case PIANO_CHG_ENABLE: enable = int(w.value); break;
+    case PIANO_CHG_ENABLE:
+      enable = int(w.value);
+      if (!w.value) {sawZero = true; enableZeros++;}
+      else if (sawZero && toggleClears) stuck = false;
+      if (w.value) sawZero = false;
+      break;
     case PIANO_CHG_PD_FIXED: busMv = w.value == 9000 && follows9v && offers9v() ? 9000 : 5000; break;
     case PIANO_CHG_PPS: busMv = follows9v && offers9v() ? int((w.value >> 16) * 20) : 5000; break;
     default: ret = 1;
@@ -158,7 +185,9 @@ struct Sim {
       if (w.property == PIANO_CHG_ICL && w.value > (cfg.icl_cap_ma ? cfg.icl_cap_ma : PIANO_CHG_ICL_CAP))
         CHECK(cfg.rp && cfg.ramp && plan.icl_why == PIANO_CHG_ICL_RP);   // above the cap only a stepped Rp limit
       if (w.property == PIANO_CHG_FCC) CHECK(w.value <= (cfg.fcc_cap_ma ? cfg.fcc_cap_ma : PIANO_CHG_FCC_CAP));
-      if (w.property == PIANO_CHG_ENABLE && w.value == 0) CHECK(cfg.limit);   // a stop only from battery health
+      // a stop only from battery health, or as the charging restart's first write (its start, in the plan that starts it)
+      if (w.property == PIANO_CHG_ENABLE && w.value == 0) CHECK(cfg.limit || (cfg.kick && (plan.kick_events & PIANO_CHG_KICK_EV_START)));
+      if (plan.kick_events & PIANO_CHG_KICK_EV_START) CHECK(cfg.kick && cfg.writes);
     }
     if (plan.hold_awake) CHECK(cfg.limit && cfg.writes);
   }
@@ -1070,7 +1099,7 @@ static void testRamp()
     mac(s);
     s.step();
     CHECK(s.plan.writes == 2 && s.plan.write[0].property == PIANO_CHG_ICL && s.plan.write[0].value == 900);
-    CHECK(s.plan.write[1].property == PIANO_CHG_FCC && s.plan.write[1].value == 900);
+    CHECK(s.plan.write[1].property == PIANO_CHG_FCC && s.plan.write[1].value == 1500);   // the DCP row's 2000 within the 1500 cap
     CHECK(s.plan.icl_why == PIANO_CHG_ICL_RP && s.plan.ramp_ma == 900 && s.plan.ramp_target_ma == 3000);
     std::vector<std::pair<uint64_t, uint32_t>> steps;
     unsigned waits = 0;
@@ -1235,6 +1264,10 @@ static void testRandom()
       case 17: s.rpMa = rnd(2) ? 3000 : rnd(2) ? 1500 : 500; break;
       case 18: s.boardValid = (rnd(16) << 10) & (PIANO_CHG_IN_NTC | PIANO_CHG_IN_CHGR | PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2); break;
       case 19: s.conn1Dc = int(rnd(800)); s.conn2Dc = int(rnd(800)); s.chgrDc = int(rnd(1000)); s.ntcDc = int(rnd(700)); break;
+      case 20: s.ibat = rnd(2) ? 0 : int(rnd(2000)) - 1000; break;
+      case 21: s.vbat = 3500 + int(rnd(1000)); break;
+      case 22: s.aiclCap = rnd(2) ? 0 : 500 + int(rnd(2500)); break;
+      case 23: s.cfg.kick = uint8_t(rnd(4) != 0); break;
       default: break;
       }
       s.soc += int(rnd(3)) - 1;
@@ -1254,7 +1287,265 @@ static void testRandom()
         if (s.cfg.ramp && s.st.ramp_ceiling_ma) CHECK(s.plan.icl_ma <= std::max(s.st.ramp_ceiling_ma, 900u) || s.plan.icl_ma <= 1500);
       }
       if (s.st.ramp_ceiling_ma) CHECK(s.cfg.rp && s.cfg.ramp);
+      // the restart: never more than three per attach; never while a sleep is handed over
+      CHECK(s.st.kick_count <= 3);
+      if (s.sleep == PIANO_CHG_WILL_SLEEP) CHECK(!(s.plan.kick_events & PIANO_CHG_KICK_EV_START));
     }
+  }
+}
+
+// ---------------------------------------------------------------------------------------- the balance line and the used-up limit
+static void testBalance()
+{
+  // chg-ramp at 2026-11-12 09:10 (93 %): 4911 mV and 1481 mA in under 2000 asked, 0x2029 1750, both packs at 0 mA at 4362 mV
+  PianoChargeBalanceIn i{};
+  i.input_valid = 1; i.bus_mv = 4911; i.ibus_ma = 1481; i.limit_ma = 1750; i.battery_valid = 1; i.vbat_mv = 4362; i.ibat_ma = 0;
+  PianoChargeBalance b;
+  piano_charge_balance(&i, &b);
+  CHECK(b.in_mw == 7273 && b.bat_mw == 0 && b.sys_mw == 6543 && b.spare_ma == 269 && b.verdict == PIANO_CHG_BAL_SPARE);
+  CHECK(std::strstr(piano_charge_balance_name(b.verdict), "NOT CHARGING"));
+  i.ibat_ma = 620;   // charging: the system is the input less the battery
+  piano_charge_balance(&i, &b);
+  CHECK(b.verdict == PIANO_CHG_BAL_CHARGING && b.bat_mw == 2704 && b.sys_mw == 6543 - 2704);
+  i.ibat_ma = -200;   // draining (the battery's power is negative: the system gets it on top of the input)
+  piano_charge_balance(&i, &b);
+  CHECK(b.verdict == PIANO_CHG_BAL_DRAINING && b.bat_mw == -872 && b.sys_mw == 6543 + 872);
+  i.ibat_ma = 10; i.ibus_ma = 1700;   // within 50 mA of 0, the input at its limit: used up by the system
+  piano_charge_balance(&i, &b);
+  CHECK(b.verdict == PIANO_CHG_BAL_USED_UP && b.spare_ma == 50);
+  i.limit_ma = 0;   // no limit known: not "to spare"
+  piano_charge_balance(&i, &b);
+  CHECK(b.verdict == PIANO_CHG_BAL_USED_UP && b.spare_ma == 0);
+  i.bus_mv = 300; i.ibus_ma = 0; i.ibat_ma = -1500;   // no input
+  piano_charge_balance(&i, &b);
+  CHECK(b.verdict == PIANO_CHG_BAL_ON_BATTERY && b.in_mw == 0 && b.sys_mw == 6543);
+  i.input_valid = 0; i.bus_mv = 5000;   // no bus reading (level 1) counts as no input for the sums
+  piano_charge_balance(&i, &b);
+  CHECK(b.verdict == PIANO_CHG_BAL_ON_BATTERY && b.in_mw == 0);
+  i.battery_valid = 0;
+  piano_charge_balance(&i, &b);
+  CHECK(b.verdict == PIANO_CHG_BAL_UNKNOWN && b.sys_mw == 0);
+  CHECK(std::strcmp(piano_charge_balance_name(99), "?") == 0);
+  // the limit the steps use up: the step, or the firmware's own once settled below it
+  CHECK(piano_charge_used_limit(2000, 1750, 1) == 1750 && piano_charge_used_limit(2000, 1750, 0) == 2000);
+  CHECK(piano_charge_used_limit(2000, 2000, 1) == 2000 && piano_charge_used_limit(2000, 0, 1) == 2000);
+  CHECK(piano_charge_used_limit(2000, 50, 1) == 2000 && piano_charge_used_limit(1500, 2500, 1) == 1500);
+}
+
+// The steps against the firmware's own limit: the Mac's port held 0x2029 at 1750-1800 under 2000 asked, the bus at 1.33-1.71 A.
+static void testRampAicl()
+{
+  const uint32_t conns = PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2;
+  auto mac = [&](Sim &s) {
+    s.type = PIANO_CHG_T_CDP;
+    s.cfg.rp = 1;
+    s.cfg.ramp = 1;
+    s.cfg.rp_cap_ma = 3000;
+    s.boardValid = conns;
+    s.busMv = 5230;
+    s.ohms = 0.21;
+  };
+  // the system and the battery take 2600 mA; the firmware holds 1750: at 2000 asked the bus reads 1750, which uses up its own limit
+  // once it has stayed so 15 s: the steps go on (the request rises; the firmware's own limit is its own)
+  {
+    Sim s;
+    mac(s);
+    s.loadMa = 2600;
+    s.aiclCap = 1750;
+    for (int i = 0; i < 40; ++i) s.step();
+    CHECK(s.icl == 3000 && s.plan.ramp_wait == PIANO_CHG_RAMP_TOP);
+    // without it read the old rule holds at 2000 (1750 + 250 < 2000)
+    Sim t;
+    mac(t);
+    t.loadMa = 2600;
+    t.aiclCap = 1750;
+    t.aiclRead = false;
+    Sim u = t;
+    u.aiclCap = 0;
+    u.loadMa = 1700;   // the bus current of chg-ramp (1.33-1.71 A), no 0x2029: not used up (1700 + 250 < 2000)
+    for (int i = 0; i < 40; ++i) u.step();
+    CHECK(u.icl == 2000 && u.plan.ramp_wait == PIANO_CHG_RAMP_NOT_USED && u.plan.ramp_used_ma == 2000);
+  }
+  // the firmware still walking its limit up (50 mA a decision): never settled, so the step is what is used up
+  {
+    Sim s;
+    mac(s);
+    s.loadMa = 1450;
+    s.aiclRead = true;
+    for (int i = 0; i < 10; ++i) s.step();
+    CHECK(s.icl == 2000);
+    s.aiclCap = 1100;
+    int steps = 0;
+    for (int i = 0; i < 12; ++i) {
+      s.step();
+      steps += (s.plan.events & PIANO_CHG_EV_RAMP_STEP) != 0;
+      if (s.aiclCap < 1950) s.aiclCap += 50;
+    }
+    CHECK(!steps && s.icl == 2000 && s.plan.ramp_used_ma == 2000);
+  }
+}
+
+// The charging restart (docs §17) against the 2026-11-12 state: the Mac's port, CDP, Rp 3.0 A, the system at 1450 mA, both packs at
+// 0 mA at 93 % and 4362 mV, 34 C, the charger not charging until its enable is toggled.
+static void testKick()
+{
+  const uint32_t conns = PIANO_CHG_IN_CONN1 | PIANO_CHG_IN_CONN2;
+  auto mac = [&](Sim &s) {
+    s.type = PIANO_CHG_T_CDP;
+    s.cfg.rp = 1;
+    s.cfg.ramp = 1;
+    s.cfg.rp_cap_ma = 3000;
+    s.boardValid = conns;
+    s.busMv = 5230;
+    s.ohms = 0.21;
+    s.soc = 93;
+    s.vbat = 4362;
+    s.temp(34);
+    s.charger = 1200;   // what the battery would take at most (its own acceptance); the charge current caps it
+    s.loadBase = 1450;
+    s.stuck = true;
+  };
+  CHECK([] { PianoChargeConfig c; piano_charge_config_default(&c); return c.kick == 1; }());
+  // the restart: 0x2003 = 0 alone, then 1, the charge current again, and the verdict; the steps then go on with the battery's load
+  {
+    Sim s;
+    mac(s);
+    uint64_t start = 0, resumed = 0, charging = 0;
+    unsigned starts = 0, fccAfter = 0;
+    for (int i = 0; i < 80; ++i) {
+      s.step();
+      const uint32_t k = s.plan.kick_events;
+      if (k & PIANO_CHG_KICK_EV_START) {
+        starts++;
+        start = s.now;
+        CHECK(s.plan.writes == 1 && s.wrote(PIANO_CHG_ENABLE, 0) && s.plan.kick_count == 1 && s.plan.kick_ibat_ma == 0);
+        CHECK(s.plan.kick_spare_ma >= 150 && s.st.disabled);
+      }
+      if (start && !resumed && s.now == start + 5000) CHECK(s.wrote(PIANO_CHG_ENABLE, 1));   // the next decision lifts it
+      if (k & PIANO_CHG_KICK_EV_RESUMED) resumed = s.now;
+      if (resumed && s.now > resumed && s.wrote(PIANO_CHG_FCC)) fccAfter++;
+      if (k & PIANO_CHG_KICK_EV_CHARGING) {charging = s.now; CHECK(s.plan.kick_ibat_ma >= 50);}
+      CHECK(!(k & (PIANO_CHG_KICK_EV_NONE | PIANO_CHG_KICK_EV_ABANDONED)));
+    }
+    CHECK(starts == 1 && resumed > start && charging >= resumed + 15000 && fccAfter == 1);
+    CHECK(s.enable == 1 && !s.stuck && s.enableZeros == 1 && s.fcc == 1500 && s.ibat > 0);
+    // the input before the restart: the steps waited at 2000 (not used up); after it the battery's share uses it up: 2500, 3000
+    CHECK(s.icl == 3000 && s.plan.ramp_wait == PIANO_CHG_RAMP_TOP);
+  }
+  // the restart does not help: three, two minutes apart, then none more until the next attach; 0x2003 ends at 1 each time
+  {
+    Sim s;
+    mac(s);
+    s.toggleClears = false;
+    std::vector<uint64_t> starts;
+    unsigned none = 0, gaveUp = 0;
+    for (int i = 0; i < 200; ++i) {
+      s.step();
+      if (s.plan.kick_events & PIANO_CHG_KICK_EV_START) starts.push_back(s.now);
+      none += (s.plan.kick_events & PIANO_CHG_KICK_EV_NONE) != 0;
+      gaveUp += (s.plan.kick_events & PIANO_CHG_KICK_EV_GAVE_UP) != 0;
+    }
+    CHECK(starts.size() == 3 && none == 3 && gaveUp == 1 && s.enable == 1 && !s.st.disabled && s.enableZeros == 3);
+    for (size_t i = 1; i < starts.size(); ++i) CHECK(starts[i] >= starts[i - 1] + 120000);
+    // a new attach: the budget again
+    s.source = false;
+    s.step();
+    s.source = true;
+    for (int i = 0; i < 20; ++i) s.step();   // 100 s: the row, the steps, 20 s at 0 mA, the restart
+    CHECK(s.st.kick_count == 1 && s.enableZeros == 4);
+  }
+  // when not: near full, at the float voltage, the input used up, warm, cold, the option or the writes off, the firmware's own 0,
+  // battery health holding, no gauge reading; and the packs reading 0 only once (a single reading is no evidence)
+  auto none = [&](void (*setup)(Sim &)) {
+    Sim s;
+    mac(s);
+    setup(s);
+    for (int i = 0; i < 60; ++i) {s.step(); if (s.plan.kick_events & PIANO_CHG_KICK_EV_START) return false;}
+    return s.enableZeros == 0 || s.cfg.limit;
+  };
+  CHECK(none([](Sim &s) {s.soc = 96;}));
+  CHECK(none([](Sim &s) {s.vbat = 4375;}));                 // within 30 mV of 4400
+  CHECK(none([](Sim &s) {s.loadBase = 1900; s.cfg.rp_cap_ma = 2000;}));   // 1900 of 2000: 100 mA to spare
+  CHECK(none([](Sim &s) {s.temp(46);}));
+  CHECK(none([](Sim &s) {s.temp(14);}));
+  CHECK(none([](Sim &s) {s.cfg.kick = 0;}));
+  CHECK(none([](Sim &s) {s.cfg.writes = 0;}));
+  CHECK(none([](Sim &s) {s.enable = 0;}));                  // the firmware's own disable: never overridden
+  CHECK(none([](Sim &s) {s.bothGauges = false;}));
+  CHECK(none([](Sim &s) {s.cfg.limit = 1; s.soc = 85;}));   // battery health holds: its own stop, not a restart
+  {
+    Sim s;
+    mac(s);
+    for (int i = 0; i < 6; ++i) s.step();
+    s.charger = 0;   // the packs move: -40 mA, then 0 again: the 20 s start over
+    s.stuck = false;
+    s.ibat = -40;
+    s.loadMa = 1450;
+    s.step();
+    s.charger = 1200;
+    s.stuck = true;
+    unsigned before = 0;
+    for (int i = 0; i < 4; ++i) {s.step(); before += (s.plan.kick_events & PIANO_CHG_KICK_EV_START) != 0;}
+    CHECK(!before);   // 0 mA again at +5..+20 s: not yet (20 s from the first reading back at 0)
+    s.step();
+    s.step();
+    CHECK(s.st.kick_count == 1);
+  }
+  // cut short: a detach after the 0 was taken plans 1 (and the firmware's own limits back); a shutdown too; a wake and a new
+  // generation still end at 1
+  {
+    Sim s;
+    mac(s);
+    for (int i = 0; i < 40 && !(s.plan.kick_events & PIANO_CHG_KICK_EV_START); ++i) s.step();
+    CHECK(s.enable == 0 && s.st.disabled);
+    s.source = false;
+    s.step();
+    CHECK(s.wrote(PIANO_CHG_ENABLE, 1) && s.enable == 1 && s.st.kick_stage == PIANO_CHG_KICK_IDLE && !s.st.kick_count);
+    Sim t;
+    mac(t);
+    for (int i = 0; i < 40 && !(t.plan.kick_events & PIANO_CHG_KICK_EV_START); ++i) t.step();
+    t.fill();
+    piano_charge_shutdown(&t.cfg, &t.in, &t.st, &t.plan);
+    t.check();
+    CHECK(t.wrote(PIANO_CHG_ENABLE, 1));
+    for (int g = 0; g < 2; ++g) {
+      Sim u;
+      mac(u);
+      for (int i = 0; i < 40 && !(u.plan.kick_events & PIANO_CHG_KICK_EV_START); ++i) u.step();
+      if (g) u.generation++; else u.wakes++;
+      for (int i = 0; i < 6; ++i) u.step();
+      CHECK(u.enable == 1 && !u.st.disabled);
+    }
+  }
+  // the firmware refuses the 0 (and later answers nothing): the enable's rules end at 1; the restart judges or gives up
+  {
+    Sim s;
+    mac(s);
+    s.toggleClears = false;
+    for (int i = 0; i < 40 && !(s.plan.kick_events & PIANO_CHG_KICK_EV_START); ++i) s.step();
+    // the 0 was planned and applied by the model; answer it as refused instead
+    s.enable = 1;
+    piano_charge_ack(&s.st, PIANO_CHG_ENABLE, 0, 1);
+    for (int i = 0; i < 20; ++i) s.step();
+    CHECK(s.enable == 1 && !s.st.disabled && s.st.kick_stage == PIANO_CHG_KICK_IDLE);
+  }
+  // asleep: never; the handover (with health off) plans no 0 either; a sleep between the 0 and the 1 lifts it for the sleep, and
+  // a decision within the 5 s the 0 is held plans no 1
+  {
+    Sim s;
+    mac(s);
+    s.sleep = PIANO_CHG_WILL_SLEEP;
+    for (int i = 0; i < 20; ++i) {s.step(); CHECK(!s.wrote(PIANO_CHG_ENABLE, 0));}
+    Sim t;
+    mac(t);
+    for (int i = 0; i < 40 && !(t.plan.kick_events & PIANO_CHG_KICK_EV_START); ++i) t.step();
+    t.step(2000);
+    CHECK(!t.wrote(PIANO_CHG_ENABLE) && t.enable == 0 && t.st.kick_stage == PIANO_CHG_KICK_STOPPING);
+    t.sleep = PIANO_CHG_WILL_SLEEP;
+    t.step(100);
+    CHECK(t.wrote(PIANO_CHG_ENABLE, 1) && t.enable == 1 && t.st.kick_stage == PIANO_CHG_KICK_IDLE);
+    t.step(100);
+    CHECK(t.plan.sleep_ready && !t.st.disabled);
   }
 }
 
@@ -1269,6 +1560,9 @@ int main()
   testCp();
   testRpAndBoard();
   testRamp();
+  testBalance();
+  testRampAicl();
+  testKick();
   testRandom();
   if (gFailures) {
     std::fprintf(stderr, "policy_host: %d failure(s)\n", gFailures);
