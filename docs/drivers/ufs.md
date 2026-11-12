@@ -103,6 +103,14 @@ UPIU and SCSI CDBs are built in the driver. The root is matched by volume UUID (
 `native-source-storage=1` (source-storage runtime), `apfs-boot-shim=1`, `log=1`. UniXNU-sheng's macOS set:
 `native-source-storage=1 native-ufs-root=1 log=1 data-persist=2 exec-log=1 apfs-boot-shim=1`.
 
+`piano-disk-identity=0` (NativeUfs and NativeRamBlock, `package/include/PianoDiskIdentity.h`; default 1 since 2026-11-12): the
+old identity. By default each root window and the Data disk publish "Protocol Characteristics" (UFS, Internal) and "Device
+Characteristics" (vendor Xiaomi, product "UFS 4.0 OS" / "UFS 4.0 SystemOS" / "UFS 4.0 Data" (RAM Data without a store),
+solid state), so diskutil lists them as "internal, physical" with Protocol UFS and Solid State Yes, and their media are named
+"Xiaomi UFS 4.0 OS Media" etc. (before: "external, physical", "Native OS Media", "Native Owned RAM block storage Media"). Names
+only: every lookup goes by volume UUID. The "Disk Image Driver for MacOS X" seen in ioreg is Apple's IOHDIXController (the disk
+image driver every Mac has), not one of these disks.
+
 ## 7. Kernel archive / component
 
 `components`: `ShengUfs` (pinned b11de87) + a piano SM8750 patch set in this repo (or the Odin3 `NativeUfs` if it
