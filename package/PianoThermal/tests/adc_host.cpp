@@ -480,14 +480,14 @@ static void testArbiterErrors()
     CHECK(b.adc.stopped == Err::spmiDenied && b.enabledCount() == 0 && b.eventCount == 1 && b.events[0].channel == 0);
     CHECK(m.writes.empty());
   }
-  {   // reads never complete: bounded (1000 x 1 us, then four retries of 5000 us drain + 500 us + 1000 us), stopped
+  {   // reads never complete: bounded (five tries of 1000 x 1 us and the 5000 us drain inside the hold, 500 us apart), stopped
     Model m;
     Board b;
     CHECK(attach(b, m) == Err::none);
     m.readsTimeOut = true;
     const uint64_t t0 = m.now;
     b.round();
-    CHECK(b.adc.stopped == Err::spmiTimeout && b.enabledCount() == 0 && m.now - t0 <= 27100 && m.writes.empty());
+    CHECK(b.adc.stopped == Err::spmiTimeout && b.enabledCount() == 0 && m.now - t0 <= 32100 && m.writes.empty());
   }
   {   // a write without enableWrites (the channel not mapped): refused before any store
     Model m;

@@ -255,7 +255,13 @@ struct PmicPeripheral {
 inline bool isLdo(uint8_t type) { return type == 0x04; }
 inline bool isSmps(uint8_t type) { return type == 0x03 || type == 0x1c || type == 0x21 || type == 0x22; }
 
-inline void pmicRead(const Io &io, const Arbiter &a, uint8_t sid, uint8_t page, PmicPeripheral &p, bool full, unsigned *commands)
+// The identity (TYPE/SUBTYPE) is read until two reads in a row agree (at most kIdentityReads): it decides whose registers the next
+// reads take for a regulator's, and on the 2026-11-13 01:19 probe (v34p) two identity reads ended "ok" with another register's value
+// (ldof3, an LDO, TYPE 0x00; smpi7, an SMPS, 0x04) while other kexts drove the arbiter, so level 2 had no PPID for two rails.
+// *unstable counts the pairs that disagreed; a read that fails (through spmiRead's retries) ends it, as before.
+constexpr unsigned kIdentityReads = 4;
+inline void pmicRead(const Io &io, const Arbiter &a, uint8_t sid, uint8_t page, PmicPeripheral &p, bool full, unsigned *commands,
+                     unsigned *unstable = nullptr)
 {
   p.ppid = uint16_t(sid << 8 | page);
   const Apid found = spmiFindApid(io, a, p.ppid);
@@ -263,10 +269,25 @@ inline void pmicRead(const Io &io, const Arbiter &a, uint8_t sid, uint8_t page, 
   p.owner = found.owner;
   if (p.apid < 0) return;
   p.present = true;
-  uint8_t id[2] = {0, 0};
-  ++*commands;
-  p.result = spmiRead(io, p.apid, 0x04, id, 2);
-  if (p.result != ReadResult::ok) return;
+  uint8_t id[2] = {0, 0}, last[2] = {0, 0};
+  bool have = false, agreed = false;
+  for (unsigned i = 0; i < kIdentityReads && !agreed; ++i) {
+    ++*commands;
+    p.result = spmiRead(io, p.apid, 0x04, id, 2);
+    if (p.result != ReadResult::ok) return;
+    if (have && id[0] == last[0] && id[1] == last[1]) {
+      agreed = true;
+    } else {
+      if (have && unstable) ++*unstable;
+      last[0] = id[0];
+      last[1] = id[1];
+      have = true;
+    }
+  }
+  if (!agreed) {
+    p.result = ReadResult::error;   // four answers, no two in a row alike
+    return;
+  }
   p.type = id[0];
   p.subtype = id[1];
   if (!full) return;
@@ -282,13 +303,35 @@ struct RailState {
   PmicPeripheral primary, alternate;   // LDOs: page 0xc0 + n and 0x40 + n - 1; SMPSs: primary only
   int chosen = -1;                     // 0 primary, 1 alternate, -1 neither is a regulator of the expected kind
   const PmicPeripheral *reg() const { return chosen == 0 ? &primary : chosen == 1 ? &alternate : nullptr; }
+  // No regulator chosen although the map has one of the pages and its identity read, as a kind other than expected: the survey
+  // takes it again (PianoWifi.cpp's re-survey), as it does a page whose reads failed.
+  bool unexpected() const
+  {
+    return chosen < 0 && ((primary.present && primary.result == ReadResult::ok) ||
+                          (alternate.present && alternate.result == ReadResult::ok));
+  }
 };
 struct PmicSurvey {
   Arbiter arbiter;
   RailState rails[kRailCount];
   PmicPeripheral pins[kPmicPinCount];
   unsigned commands = 0;
+  unsigned typeRetries = 0, typeUnstable = 0;   // identity reads again for an unexpected kind; identity pairs that disagreed
 };
+// The kind a rail's page must have: an SMPS (TYPE 0x03, 0x1c, 0x21, 0x22) or an LDO (0x04).
+inline bool kindOk(const Rail &r, const PmicPeripheral &p) { return p.result == ReadResult::ok && (r.smps ? isSmps(p.type) : isLdo(p.type)); }
+// A page whose identity read, but not as the expected kind, is read again (up to kKindTries reads in all) before it is given up:
+// a wrong value with an "ok" status was the failure of v34p.
+constexpr unsigned kKindTries = 3;
+inline void pmicReadKind(const Io &io, const Arbiter &a, const Rail &r, uint8_t page, PmicPeripheral &p, PmicSurvey &s)
+{
+  pmicRead(io, a, r.sid, page, p, false, &s.commands, &s.typeUnstable);
+  for (unsigned i = 1; i < kKindTries && p.present && p.result == ReadResult::ok && !kindOk(r, p); ++i) {
+    ++s.typeRetries;
+    io.delayUs(io.ctx, 1000);
+    pmicRead(io, a, r.sid, page, p, false, &s.commands, &s.typeUnstable);
+  }
+}
 inline void surveyPmic(const Io &io, PmicSurvey &s)
 {
   s.arbiter = spmiArbiter(io);
@@ -297,20 +340,24 @@ inline void surveyPmic(const Io &io, PmicSurvey &s)
     const Rail &r = kRails[i];
     RailState &st = s.rails[i];
     if (r.smps) {
-      pmicRead(io, s.arbiter, r.sid, smpsPage(r.smps), st.primary, false, &s.commands);
-      if (st.primary.result == ReadResult::ok && isSmps(st.primary.type)) st.chosen = 0;
+      pmicReadKind(io, s.arbiter, r, smpsPage(r.smps), st.primary, s);
+      if (kindOk(r, st.primary)) st.chosen = 0;
     } else {
-      pmicRead(io, s.arbiter, r.sid, ldoPage(r.ldo), st.primary, false, &s.commands);
-      if (st.primary.result == ReadResult::ok && isLdo(st.primary.type)) st.chosen = 0;
-      pmicRead(io, s.arbiter, r.sid, ldoPageAlt(r.ldo), st.alternate, false, &s.commands);
-      if (st.chosen < 0 && st.alternate.result == ReadResult::ok && isLdo(st.alternate.type)) st.chosen = 1;
+      pmicReadKind(io, s.arbiter, r, ldoPage(r.ldo), st.primary, s);
+      if (kindOk(r, st.primary)) st.chosen = 0;
+      if (st.chosen < 0) pmicReadKind(io, s.arbiter, r, ldoPageAlt(r.ldo), st.alternate, s);
+      else pmicRead(io, s.arbiter, r.sid, ldoPageAlt(r.ldo), st.alternate, false, &s.commands, &s.typeUnstable);
+      if (st.chosen < 0 && kindOk(r, st.alternate)) st.chosen = 1;
     }
     if (st.chosen >= 0) {
       PmicPeripheral &p = st.chosen == 0 ? st.primary : st.alternate;
-      pmicRead(io, s.arbiter, r.sid, uint8_t(p.ppid), p, true, &s.commands);
+      pmicRead(io, s.arbiter, r.sid, uint8_t(p.ppid), p, true, &s.commands, &s.typeUnstable);
+      // The full read takes the identity again: it must still be the kind chosen, else no regulator (the re-survey runs).
+      if (!kindOk(r, p)) st.chosen = -1;
     }
   }
-  for (unsigned i = 0; i < kPmicPinCount; ++i) pmicRead(io, s.arbiter, kPmicPins[i].sid, kPmicPins[i].page, s.pins[i], true, &s.commands);
+  for (unsigned i = 0; i < kPmicPinCount; ++i)
+    pmicRead(io, s.arbiter, kPmicPins[i].sid, kPmicPins[i].page, s.pins[i], true, &s.commands, &s.typeUnstable);
 }
 
 // --------------------------------------------------------------------------------------------------- apps SMMU, read only

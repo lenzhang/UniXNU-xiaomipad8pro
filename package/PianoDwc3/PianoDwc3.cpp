@@ -78,6 +78,7 @@
 #include "ChargerPmic.h"      // package/PianoPower: the PMIC's Type-C block, found read only (only where no other kext reads it)
 #include "../common/PianoIrq.h"
 #include <PianoPowerContract.h>
+#include <PianoSpmi.h>   // the SPMI lock and the transactions every kext shares
 
 using namespace pianousb;
 
@@ -587,15 +588,6 @@ void peek(uint64_t pa, uint64_t count)
 // ABL boots the installed OS after a reset unless the PMIC restart reason says otherwise: byte 0x48 of the SID 0 SDAM
 // (PPID 0x071), bits 1-7 (2 = bootloader), bit 0 kept. The same SPMI arbiter v7 access as k27 0057's piano-reset-to, here
 // for one reset on request, so an installed system (no piano-reset-to) can be sent to ABL fastboot from the Mac.
-bool spmiDone(uintptr_t status)
-{
-  for (int i = 0; i < 100000; i++) {
-    const uint32_t st = rd32(status);
-    if (st & 1) return (st & 0xe) == 0;
-  }
-  return false;
-}
-
 int setRestartReason(uint8_t reason)
 {
   constexpr uint64_t kCore = 0x0C400000, kCnfg = 0x0C42D000, kObsv = 0x0C440000, kChnl = 0x0C500000;
@@ -615,18 +607,24 @@ int setRestartReason(uint8_t reason)
     if (apid == count) err = -3;
     else if (!mapRegion(obsv, kObsv + 0x20ull * apid, 0x20) || !mapRegion(chnl, kChnl + 0x1000ull * apid, 0x20)) err = -4;
   }
+  // The three transactions (read, write, read back) are PianoSpmi.h's, each under the SPMI lock every kext shares.
+  const uintptr_t o = obsv.va, c = chnl.va;
+  auto obsRd = [o](uint32_t off) { return rd32(o + off); };
+  auto obsWr = [o](uint32_t off, uint32_t v) { wr32(o + off, v); };
+  auto chnRd = [c](uint32_t off) { return rd32(c + off); };
+  auto chnWr = [c](uint32_t off, uint32_t v) {
+    wr32(c + off, v);
+    if (off == pianospmi::kCmd) dsb();
+  };
+  auto spin = [](unsigned us) { IODelay(us); };
+  uint8_t old = 0;
+  if (!err && pianospmi::read(obsRd, obsWr, spin, uint8_t(kOffset), &old, 1) != pianospmi::Result::ok) err = -5;
   if (!err) {
-    wr32(obsv.va, (1u << 27) | (kOffset << 4));                 // read 1 byte
-    if (!spmiDone(obsv.va + 8)) err = -5;
-  }
-  if (!err) {
-    const uint8_t old = uint8_t(rd32(obsv.va + 24));
-    wr32(chnl.va + 16, uint32_t((old & 1) | uint8_t(reason << 1)));
-    wr32(chnl.va, (0u << 27) | (kOffset << 4));                 // write 1 byte
-    if (!spmiDone(chnl.va + 8)) err = -6;
-    wr32(obsv.va, (1u << 27) | (kOffset << 4));
-    (void)spmiDone(obsv.va + 8);
-    cprintf("SDAM restart reason %#04x -> %#04x (APID %u)\n", old, uint8_t(rd32(obsv.va + 24)), apid);
+    const uint8_t value = uint8_t((old & 1) | uint8_t(reason << 1));
+    if (pianospmi::write(chnRd, chnWr, spin, uint8_t(kOffset), &value, 1) != pianospmi::Result::ok) err = -6;
+    uint8_t now = 0;
+    (void)pianospmi::read(obsRd, obsWr, spin, uint8_t(kOffset), &now, 1);
+    cprintf("SDAM restart reason %#04x -> %#04x (APID %u)\n", old, now, apid);
   }
   Region *all[] = {&core, &cnfg, &obsv, &chnl};
   for (Region *r : all)
@@ -1125,17 +1123,14 @@ int spmiApid(uint32_t ppid)
   return found;
 }
 
+// One byte over EE 0's observer channel of `apid` (extended read): PianoSpmi.h's transaction under the SPMI lock every kext shares,
+// tried again after a failure as SpmiObserver.h's spmiRead.
 bool spmiRead(int apid, uint8_t offset, uint8_t *value)
 {
+  if (apid < 0 || apid >= 1024) return false;
   const uintptr_t ch = gSpmiObs.va + 0x20u * uint32_t(apid);
-  wr32(ch, 1u << 27 | uint32_t(offset) << 4);   // observer channel of EE 0: extended read, one byte
-  for (unsigned i = 0; i < 1000; ++i) {
-    const uint32_t status = rd32(ch + 8);
-    if (status & 0xeu) return false;
-    if (status & 1u) { *value = uint8_t(rd32(ch + 0x18)); return true; }
-    IODelay(1);
-  }
-  return false;
+  return pianospmi::read([ch](uint32_t off) { return rd32(ch + off); }, [ch](uint32_t off, uint32_t v) { wr32(ch + off, v); },
+                         [](unsigned us) { IODelay(us); }, offset, value, 1) == pianospmi::Result::ok;
 }
 
 void probeRepeater()
@@ -1445,15 +1440,15 @@ int coldSpmiWrite(uint16_t ppid, uint8_t reg, uint8_t v)
     if (!mapRegion(gChnl, kSpmiChnl + uint64_t(kSpmiChnlStride) * uint32_t(apid), 0x20)) return -12;
     gChnlApid = apid;
   }
-  wr32(gChnl.va + 0x10, v);
-  wr32(gChnl.va + 0x00, uint32_t(reg) << 4);   // opcode 0: extended write, one byte
-  dsb();
-  for (unsigned i = 0; i < 1000; ++i) {
-    const uint32_t st = rd32(gChnl.va + 0x08);
-    if (st & 1u) return (st & 0xeu) ? -5 : 0;
-    IODelay(1);
-  }
-  return -60;
+  // One byte (opcode 0, extended write): PianoSpmi.h's transaction under the SPMI lock every kext shares.
+  const uintptr_t c = gChnl.va;
+  const pianospmi::Result r = pianospmi::write([c](uint32_t off) { return rd32(c + off); },
+                                               [c](uint32_t off, uint32_t value) {
+                                                 wr32(c + off, value);
+                                                 if (off == pianospmi::kCmd) dsb();
+                                               },
+                                               [](unsigned us) { IODelay(us); }, reg, &v, 1);
+  return r == pianospmi::Result::ok ? 0 : r == pianospmi::Result::error ? -5 : -60;
 }
 
 // The PMIC's Type-C block (ChargerPmic.h's discovery), read only, and only where no other kext reads it: one observer channel serves

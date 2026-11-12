@@ -269,6 +269,7 @@ struct Arb {
   std::map<uint32_t, uint32_t> core, cnfg, obsv;
   std::map<uint32_t, uint8_t> regs;   // PPID << 8 | register
   std::map<uint32_t, uint32_t> apidPpid;
+  std::map<uint32_t, std::pair<unsigned, uint8_t>> glitch;   // PPID -> (TYPE reads left that answer "ok" with this value)
   unsigned commands = 0, otherWrites = 0, next = 10;
   Arb()
   {
@@ -299,7 +300,12 @@ struct Arb {
     CHECK(opcode == kOpExtReadL);
     uint32_t lo = 0, hi = 0;
     for (uint32_t b = 0; b < count; ++b) {
-      const uint32_t byte = a.regs[a.apidPpid[apid] << 8 | (reg + b)];
+      uint32_t byte = a.regs[a.apidPpid[apid] << 8 | (reg + b)];
+      auto g = a.glitch.find(a.apidPpid[apid]);
+      if (reg + b == 0x04 && g != a.glitch.end() && g->second.first) {
+        --g->second.first;
+        byte = g->second.second;
+      }
       (b < 4 ? lo : hi) |= byte << (8 * (b & 3));
     }
     a.obsv[o + kObsvStatus] = kStatusDone;
@@ -346,6 +352,39 @@ static void testPmic()
   CHECK(!t.arbiter.v7 && t.commands == 0 && old.commands == 0);
 }
 
+// The 01:19 probe (v34p): identities that read "ok" with another register's value. ldof3's first TYPE read 0x00, smpi7's first
+// three 0x04 (an LDO's): the survey reads each identity until two reads agree and reads a page of the wrong kind again, so both
+// are found; a TYPE that never reads the same twice is no regulator (and PianoWifi.cpp's re-survey runs).
+static void testPmicGlitch()
+{
+  Arb m;
+  m.place(0x5c3, 0x04, 0x52);
+  m.reg(0x5c3, 0x40, 1800 & 0xff);
+  m.reg(0x5c3, 0x41, 1800 >> 8);
+  m.place(0x8ad, 0x1c, 0x11);
+  m.reg(0x8ad, 0x40, 1312 & 0xff);
+  m.reg(0x8ad, 0x41, 1312 >> 8);
+  m.place(0x5a7, 0x1c, 0x11);   // smpf5: stable
+  m.glitch[0x5c3] = {1, 0x00};
+  m.glitch[0x8ad] = {3, 0x04};
+  PmicSurvey s;
+  surveyPmic(m.io(), s);
+  CHECK(s.rails[0].chosen == 0 && s.rails[0].reg()->ppid == 0x5c3 && s.rails[0].reg()->type == 0x04 &&
+        s.rails[0].reg()->millivolts() == 1800 && !s.rails[0].unexpected());
+  CHECK(s.rails[4].chosen == 0 && s.rails[4].reg()->ppid == 0x8ad && s.rails[4].reg()->type == 0x1c &&
+        s.rails[4].reg()->millivolts() == 1312);
+  CHECK(s.rails[2].chosen == 0 && s.rails[2].reg()->ppid == 0x5a7);
+  CHECK(s.typeUnstable == 2 && s.typeRetries == 1);
+  CHECK(m.otherWrites == 0 && m.commands == s.commands);
+  // A TYPE that alternates forever: no regulator, and the rail counts as one to survey again.
+  Arb f;
+  f.place(0x8ad, 0x1c, 0x11);
+  f.glitch[0x8ad] = {1000, 0x04};
+  PmicSurvey t;
+  surveyPmic(f.io(), t);
+  CHECK(t.rails[4].chosen == -1 && t.rails[4].primary.present && t.rails[4].unexpected());
+}
+
 int main()
 {
   testHandoverOff();
@@ -354,6 +393,7 @@ int main()
   testSmmu();
   testCmdDb();
   testPmic();
+  testPmicGlitch();
   if (failures) {
     std::printf("wifi_host: %d failures\n", failures);
     return 1;

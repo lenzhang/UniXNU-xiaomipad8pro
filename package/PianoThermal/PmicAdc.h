@@ -37,6 +37,7 @@
 #ifndef PIANO_THERMAL_PMIC_ADC_H
 #define PIANO_THERMAL_PMIC_ADC_H
 #include <stdint.h>
+#include "../include/PianoSpmi.h"   // the SPMI lock and the transactions every kext shares
 #include "AdcChannels.h"
 #include "Ntc.h"
 
@@ -195,53 +196,43 @@ struct Bus {
   uint32_t lastStatus = 0;
   uint32_t reads = 0, writeCount = 0;
 
-  Err wait(Win w, uint32_t channel)
+  // A transaction's end as this file's error: denied, failed (failure or dropped), timed out.
+  static Err errOf(pianospmi::Result r, uint32_t st)
   {
-    uint32_t st = 0;
-    for (unsigned i = 0; i < kChPolls; ++i) {
-      st = io.rd(io.ctx, w, channel + kChStatus);
-      if (st & kChDone) {
-        lastStatus = st;
-        return (st & kChDenied) ? Err::spmiDenied : (st & (kChFailure | kChDropped)) ? Err::spmiFailed : Err::none;
-      }
-      io.delayUs(io.ctx, 1);
-    }
-    lastStatus = st;
-    return Err::spmiTimeout;
+    return r == pianospmi::Result::ok        ? Err::none
+           : r == pianospmi::Result::timeout ? Err::spmiTimeout
+           : (st & kChDenied)                ? Err::spmiDenied
+                                             : Err::spmiFailed;
   }
+  // The transactions are package/include/PianoSpmi.h's, under the SPMI lock every kext shares: on the 2026-11-12/13 probes this
+  // round lost conversions to a dropped write (status 0x9) while PianoPower and PianoWifi drove the arbiter at the same time.
+  // A failed or unfinished observer read is tried again up to four times 500 us apart with the lock free (PianoSpmi.h read(), as
+  // PianoWifi's and PianoPower's SpmiObserver.h); a denial is final.
   Err readApid(int a, unsigned reg, uint8_t *buf, unsigned bytes)
   {
     if (a < 0 || uint32_t(a) >= kMaxApids || !bytes || bytes > 8 || reg + bytes > 0x100) return Err::refused;
     const uint32_t ch = kObsvStride * uint32_t(a);
-    // A failed or unfinished observer read is tried again up to four times 500 us apart (as PianoWifi's and PianoPower's
-    // SpmiObserver.h): on the 2026-11-12 probes with several drivers on the bus, single reads came back failed. Not a denial.
-    Err e = Err::none;
-    for (unsigned attempt = 0; attempt < 5; ++attempt) {
-      if (attempt) {
-        for (unsigned i = 0; i < 5000 && !(io.rd(io.ctx, Win::obsv, ch + kChStatus) & kChDone); ++i) io.delayUs(io.ctx, 1);
-        io.delayUs(io.ctx, 500);
-      }
-      io.wr(io.ctx, Win::obsv, ch + kChCmd, kOpExtReadL << 27 | uint32_t(reg) << 4 | (bytes - 1));
-      e = wait(Win::obsv, ch);
-      if (e != Err::spmiFailed && e != Err::spmiTimeout) break;
-    }
-    if (e != Err::none) return e;
-    const uint32_t lo = io.rd(io.ctx, Win::obsv, ch + kChRdata0), hi = bytes > 4 ? io.rd(io.ctx, Win::obsv, ch + kChRdata1) : 0;
-    for (unsigned b = 0; b < bytes; ++b) buf[b] = uint8_t((b < 4 ? lo : hi) >> (8 * (b & 3)));
-    ++reads;
-    return Err::none;
+    uint32_t st = 0;
+    const pianospmi::Result r = pianospmi::read([&](uint32_t off) { return io.rd(io.ctx, Win::obsv, ch + off); },
+                                                [&](uint32_t off, uint32_t v) { io.wr(io.ctx, Win::obsv, ch + off, v); },
+                                                [&](unsigned us) { io.delayUs(io.ctx, us); }, uint8_t(reg), buf, bytes, &st);
+    lastStatus = st;
+    const Err e = errOf(r, st);
+    if (e == Err::none) ++reads;
+    return e;
   }
   Err read(unsigned reg, uint8_t *buf, unsigned bytes) { return readApid(apid, reg, buf, bytes); }
+  // One write through the ADC APID's own channel (the data, the command, the poll in one hold). Not retried.
   Err write(unsigned reg, const uint8_t *buf, unsigned bytes)
   {
     if (!writes || apid < 0 || !writable(reg, bytes)) return Err::refused;
-    uint32_t lo = 0, hi = 0;
-    for (unsigned b = 0; b < bytes; ++b) (b < 4 ? lo : hi) |= uint32_t(buf[b]) << (8 * (b & 3));
-    io.wr(io.ctx, Win::chnl, kChWdata0, lo);
-    if (bytes > 4) io.wr(io.ctx, Win::chnl, kChWdata1, hi);
-    io.wr(io.ctx, Win::chnl, kChCmd, kOpExtWriteL << 27 | uint32_t(reg) << 4 | (bytes - 1));
+    uint32_t st = 0;
+    const pianospmi::Result r = pianospmi::write([&](uint32_t off) { return io.rd(io.ctx, Win::chnl, off); },
+                                                 [&](uint32_t off, uint32_t v) { io.wr(io.ctx, Win::chnl, off, v); },
+                                                 [&](unsigned us) { io.delayUs(io.ctx, us); }, uint8_t(reg), buf, bytes, &st);
     ++writeCount;
-    return wait(Win::chnl, 0);
+    lastStatus = st;
+    return errOf(r, st);
   }
 };
 

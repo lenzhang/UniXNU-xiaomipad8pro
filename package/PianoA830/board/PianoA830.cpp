@@ -50,6 +50,7 @@
 #include <kern/thread_call.h>
 #define PIANO_SCM_LOCK_KERNEL 1
 #include <PianoScmLock.h>
+#include <PianoSpmi.h>   // the SPMI lock's words (PianoSpmiWords), defined below
 #include <PianoPowerContract.h>
 #include "A830Suspend.h"
 #include "A830PowerState.h"
@@ -525,6 +526,13 @@ extern "C" volatile uint32_t piano_mm_votes_owner;
 volatile uint32_t piano_mm_votes_owner = 0;
 extern "C" volatile uint32_t piano_mm_votes[32];
 volatile uint32_t piano_mm_votes[32] = {};
+
+// The SPMI transaction lock (package/include/PianoSpmi.h, docs/spmi-lock.md): one transaction at a time on the PMIC arbiter across
+// every kext that drives it (PianoPower, PianoThermal, PianoWifi, PianoBluetooth, PianoCamera, PianoDwc3, PianoTorch, PianoInput,
+// PianoUsbHost): the owner word, the holder, the nesting and every kext's counts, kept here for the same reason as the words above.
+// PianoA830 itself never touches the arbiter.
+extern "C" PianoSpmiWords piano_spmi_words;
+PianoSpmiWords piano_spmi_words = {};
 
 namespace {
 __attribute__((format(printf, 1, 2))) void gpuLine(const char *format, ...)

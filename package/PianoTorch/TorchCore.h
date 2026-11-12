@@ -13,6 +13,7 @@
 #include <stdio.h>
 #endif
 #include "FlashHw.h"
+#include "../include/PianoSpmi.h"   // the SPMI lock and the transactions every kext shares
 
 namespace pianotorch {
 
@@ -28,22 +29,13 @@ struct ChnlIo {
 
 enum class WriteResult : uint8_t { ok, error, timeout };
 
-// One register write of one byte (spmi-pmic-arb v7: the data first, then the command; status bit 0 done, bits 1-3 failure).
+// One register write of one byte (spmi-pmic-arb v7: the data first, then the command; status bit 0 done, bits 1-3 failure): the
+// transaction is package/include/PianoSpmi.h's, under the SPMI lock every kext shares.
 inline WriteResult spmiWriteByte(const ChnlIo &io, uint8_t reg, uint8_t value, uint32_t *status = nullptr)
 {
-  io.wr(io.ctx, kChnlWdata0, value);
-  io.wr(io.ctx, kChnlCmd, kOpExtWriteL << 27 | uint32_t(reg) << 4 | 0u);
-  uint32_t st = 0;
-  for (unsigned i = 0; i < 1000; ++i) {
-    st = io.rd(io.ctx, kChnlStatus);
-    if (st & kStatusDone) {
-      if (status) *status = st;
-      return (st & kStatusErrors) ? WriteResult::error : WriteResult::ok;
-    }
-    io.delayUs(io.ctx, 1);
-  }
-  if (status) *status = st;
-  return WriteResult::timeout;
+  return WriteResult(uint8_t(pianospmi::write([&](uint32_t off) { return io.rd(io.ctx, off); },
+                                              [&](uint32_t off, uint32_t v) { io.wr(io.ctx, off, v); },
+                                              [&](unsigned us) { io.delayUs(io.ctx, us); }, reg, &value, 1, status)));
 }
 
 // ------------------------------------------------------------------------------------------------------------- the bus

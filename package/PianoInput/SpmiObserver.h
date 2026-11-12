@@ -11,6 +11,7 @@
 #ifndef PIANO_INPUT_SPMI_OBSERVER_H
 #define PIANO_INPUT_SPMI_OBSERVER_H
 #include <stdint.h>
+#include "../include/PianoSpmi.h"   // the SPMI lock and the transactions every kext shares
 
 namespace pianoinput {
 
@@ -64,26 +65,17 @@ inline Apid spmiFindApid(const Io &io, const Arbiter &a, uint16_t ppid)
   return found;
 }
 
-enum class ReadResult : uint8_t { ok, error, timeout };
+enum class ReadResult : uint8_t { ok, error, timeout };   // pianospmi::Result's values
 
-// One byte of register `reg` of the peripheral at `apid`; *status gets the channel's last status word.
+// One byte of register `reg` of the peripheral at `apid`; *status gets the channel's last status word. One try (the poll loop reads
+// again at its next sample). The transaction is package/include/PianoSpmi.h's, under the SPMI lock every kext shares.
 inline ReadResult spmiRead8(const Io &io, int apid, uint8_t reg, uint8_t *value, uint32_t *status = nullptr)
 {
+  if (apid < 0 || uint32_t(apid) >= kSpmiMaxApids) return ReadResult::error;
   const uint32_t ch = kObsvStride * uint32_t(apid);
-  io.wr(io.ctx, Window::obsv, ch + kObsvCmd, kOpExtReadL << 27 | uint32_t(reg) << 4);   // one byte
-  uint32_t st = 0;
-  for (unsigned i = 0; i < 1000; ++i) {
-    st = io.rd(io.ctx, Window::obsv, ch + kObsvStatus);
-    if (st & kStatusDone) {
-      if (status) *status = st;
-      if (st & kStatusErrors) return ReadResult::error;
-      *value = uint8_t(io.rd(io.ctx, Window::obsv, ch + kObsvData));
-      return ReadResult::ok;
-    }
-    io.delayUs(io.ctx, 1);
-  }
-  if (status) *status = st;
-  return ReadResult::timeout;
+  return ReadResult(uint8_t(pianospmi::readOnce([&](uint32_t off) { return io.rd(io.ctx, Window::obsv, ch + off); },
+                                                [&](uint32_t off, uint32_t v) { io.wr(io.ctx, Window::obsv, ch + off, v); },
+                                                [&](unsigned us) { io.delayUs(io.ctx, us); }, reg, value, 1, status)));
 }
 
 }  // namespace pianoinput

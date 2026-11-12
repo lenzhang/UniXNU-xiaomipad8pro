@@ -227,7 +227,7 @@ const Io gIo = {nullptr, ioRd, ioWr, ioDelay};
 // the arbiter v7 owner-channel write PianoDwc3 and PianoTorch make). The classes' allowlists decide what goes through; this only
 // refuses an APID without a mapped channel.
 constexpr uint64_t kSpmiChnls = 0x0c500000;
-constexpr uint32_t kChnlStride = 0x1000, kChnlCmd = 0x00, kChnlStatus = 0x08, kChnlWdata0 = 0x10;
+constexpr uint32_t kChnlStride = 0x1000;   // the channel's registers: PianoSpmi.h
 struct Chnl {
   Region page;
   int apid;
@@ -248,16 +248,14 @@ bool chnlWrite(void *, int apid, uint8_t reg, uint8_t value, uint32_t *status)
   for (const Chnl &k : gChnls)
     if (apid >= 0 && k.apid == apid && k.page.va) c = &k;
   if (!c) return false;
-  wr32(c->page.va + kChnlWdata0, value);
-  wr32(c->page.va + kChnlCmd, 0u << 27 | uint32_t(reg) << 4 | 0u);
+  // The transaction is PianoSpmi.h's, under the SPMI lock every kext shares (the data, the command and the poll in one hold).
+  const uintptr_t va = c->page.va;
   uint32_t st = 0;
-  for (unsigned i = 0; i < 1000; ++i) {
-    st = rd32(c->page.va + kChnlStatus);
-    if (st & kStatusDone) break;
-    IODelay(1);
-  }
+  const pianospmi::Result r = pianospmi::write([va](uint32_t off) { return rd32(va + off); },
+                                               [va](uint32_t off, uint32_t v) { wr32(va + off, v); },
+                                               [](unsigned us) { IODelay(us); }, reg, &value, 1, &st);
   if (status) *status = st;
-  return (st & kStatusDone) && !(st & kStatusErrors);
+  return r == pianospmi::Result::ok;
 }
 const SpmiWriter gWriter = {nullptr, chnlWrite};
 

@@ -416,13 +416,42 @@ void unmapAll()
 }
 
 // ------------------------------------------------------------------------------------------------------------- SPMI (observer)
-// The arbiter's windows (SpmiObserver.h): reads through load(); the one kind of store, the observer channel's read command, is
-// refused for any other window or offset.
+// The arbiter's windows (SpmiObserver.h): the core and owner tables read through load(); EE 0's observer channels through one
+// mapping of the whole window, made before the first command (spmiObserverMapped) and kept for the kext's life: every observer
+// command is a PianoSpmi.h transaction under the SPMI lock every kext shares, with interrupts masked, where nothing may map a page
+// (load()'s pages are mapped on first use). The one kind of store, the observer channel's read command, is refused for any other
+// window or offset. The counts change inside the lock's hold.
 unsigned gSpmiStores, gSpmiRefused;
+IOMemoryMap *gObsvMap;
+uintptr_t gObsvVa;
+bool spmiObserverMapped()
+{
+  if (__atomic_load_n(&gObsvVa, __ATOMIC_ACQUIRE)) return true;
+  IODeviceMemory *m = IODeviceMemory::withRange(kSpmiObsv, kSpmiObsvBytes);
+  IOMemoryMap *map = m ? m->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+  if (m) m->release();
+  if (!map) {
+    ++gMapFailures;
+    return false;
+  }
+  IOMemoryMap *expected = nullptr;
+  if (!__atomic_compare_exchange_n(&gObsvMap, &expected, map, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    map->release();   // another thread's mapping won: wait for its address
+    while (!__atomic_load_n(&gObsvVa, __ATOMIC_ACQUIRE)) IODelay(1);
+    return true;
+  }
+  __atomic_store_n(&gObsvVa, uintptr_t(map->getVirtualAddress()), __ATOMIC_RELEASE);
+  return true;
+}
 uint32_t spmiRd(void *, Window w, uint32_t off)
 {
-  const uint64_t base = w == Window::core ? kSpmiCore : w == Window::cnfg ? kSpmiCnfg : kSpmiObsv;
-  return load(base + off);
+  if (w == Window::obsv) {
+    const uintptr_t va = __atomic_load_n(&gObsvVa, __ATOMIC_ACQUIRE);
+    if (!va || off >= kSpmiObsvBytes || (off & 3)) return 0xffffffffu;   // a status of "done, failed": the read ends at once
+    ++gLoads;
+    return rd32(va + off);
+  }
+  return load((w == Window::core ? kSpmiCore : kSpmiCnfg) + off);
 }
 void spmiWr(void *, Window w, uint32_t off, uint32_t value)
 {
@@ -430,13 +459,20 @@ void spmiWr(void *, Window w, uint32_t off, uint32_t value)
     ++gSpmiRefused;
     return;
   }
-  const uintptr_t va = pageVa(kSpmiObsv + off);
+  const uintptr_t va = __atomic_load_n(&gObsvVa, __ATOMIC_ACQUIRE);
   if (!va) {
-    ++gMapFailures;
+    ++gSpmiRefused;
     return;
   }
   ++gSpmiStores;
-  __asm__ volatile("str %w0, [%1]" ::"r"(value), "r"(va + uintptr_t((kSpmiObsv + off) & 0xfff)) : "memory");
+  __asm__ volatile("str %w0, [%1]" ::"r"(value), "r"(va + uintptr_t(off)) : "memory");
+}
+// The SPMI lock's counts (PianoSpmi.h), one line a report.
+void reportSpmiLock(const char *when)
+{
+  char line[360];
+  pianospmi::format(line, sizeof line);
+  note("%s: %s", when, line);
 }
 void spmiDelay(void *, unsigned us) { IODelay(us); }
 const Io gSpmi = {nullptr, spmiRd, spmiWr, spmiDelay};
@@ -587,13 +623,15 @@ void reportCmdDb()
 }
 
 // Also keeps the arbiter for levels 2 and up (hwPmic reads one regulator through the same observer channel).
-// A regulator the arbiter maps whose reads failed, so the survey found no regulator for that rail.
+// A rail with no regulator although the arbiter maps one of its pages: its reads failed, or its identity read as another kind (the
+// 01:19 probe, v34p: ldof3's TYPE 0x00 and smpi7's 0x04 with an "ok" status), so the survey found no regulator for that rail.
 static bool railUnread(const PmicSurvey &s)
 {
   for (unsigned i = 0; i < kRailCount; ++i) {
     const RailState &st = s.rails[i];
     if (st.reg()) continue;
-    if ((st.primary.present && st.primary.result != ReadResult::ok) || (st.alternate.present && st.alternate.result != ReadResult::ok))
+    if ((st.primary.present && st.primary.result != ReadResult::ok) || (st.alternate.present && st.alternate.result != ReadResult::ok) ||
+        st.unexpected())
       return true;
   }
   return false;
@@ -602,10 +640,15 @@ static bool railUnread(const PmicSurvey &s)
 void reportPmic()
 {
   PmicSurvey s;
+  if (!spmiObserverMapped()) {
+    note("SPMI: the observer window %#llx does not map: no regulator read", (unsigned long long)kSpmiObsv);
+    return;
+  }
   surveyPmic(gSpmi, s);
   // The 23:03 and 23:18 probes (charging level 2, the DSP started at once, PianoThermal's ADC rounds): a regulator's reads kept
-  // failing for longer than spmiRead's retries, and level 2 then had no PPID for that rail (step -201). The survey again, 100 ms
-  // apart, for up to 3 s while any mapped regulator stays unread.
+  // failing for longer than spmiRead's retries, and level 2 then had no PPID for that rail (step -201); at 01:19 two identities read
+  // as the wrong kind with an "ok" status. The survey again, 100 ms apart, for up to 3 s while any mapped regulator stays unread
+  // or of another kind than its rail's.
   unsigned again = 0;
   while (again < 30 && s.arbiter.v7 && railUnread(s)) {
     IOSleep(100);
@@ -615,7 +658,7 @@ void reportPmic()
   }
   if (again)
     note("SPMI: the regulator survey taken %u more time(s), 100 ms apart: %s", again,
-         railUnread(s) ? "a mapped regulator is still unreadable" : "every mapped regulator read");
+         railUnread(s) ? "a mapped regulator is still unreadable or of another kind" : "every mapped regulator read");
   gArbiter = s.arbiter;
   gArbiterReady = s.arbiter.v7;
   if (!s.arbiter.v7) {
@@ -647,7 +690,9 @@ void reportPmic()
     note("pmic pin %s: ppid %03x type %02x/%02x status %02x mode %02x vin %02x pull %02x src %02x out %02x en %02x", kPmicPins[i].name,
          p.ppid, p.type, p.subtype, p.status, p.regs40[0], p.regs40[1], p.regs40[2], p.regs40[4], p.regs40[5], p.regs40[6]);
   }
-  note("SPMI: %u observer read commands, %u refused stores", s.commands, gSpmiRefused);
+  note("SPMI: %u observer read commands, %u refused stores; TYPE reads: %u tried again for a regulator of the expected kind, %u "
+       "read two different values", s.commands, gSpmiRefused, s.typeRetries, s.typeUnstable);
+  reportSpmiLock("SPMI");
 }
 
 // One line for ioreg and for the repeated samples.
@@ -1028,7 +1073,7 @@ void nocVote(bool on)
 // ---- one regulator over the SPMI observer channel (reads only, the same channel level 1 uses)
 int hwPmic(void *, uint16_t ppid, uint8_t *status, uint8_t *enable, uint8_t *mode, uint16_t *millivolts)
 {
-  if (!gArbiterReady || !ppid) return -19;
+  if (!gArbiterReady || !ppid || !spmiObserverMapped()) return -19;
   const Apid found = spmiFindApid(gSpmi, gArbiter, ppid);
   if (found.apid < 0) return -19;
   uint8_t regs[7] = {};
@@ -2925,6 +2970,7 @@ void PianoWifi::run()
     note("level 2: the PMU lock stayed held by %#x (PianoBluetooth): nothing written", piano_wcn_load(&piano_wcn_pmu_owner));
   }
   reportPower(power);
+  reportSpmiLock("level 2");
   writeSummary("level 2");
   if (rc) {
     stage(power.step, "level 2 stopped here");

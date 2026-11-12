@@ -709,17 +709,17 @@ int hwPmicWrite(void *, uint8_t reg, uint8_t value)
     return -13;
   }
   if (!mapRegion(gChnl, kSpmiChnls + uint64_t(kChnlStride) * uint32_t(gBtEn.apid), kChnlBytes)) return -14;
-  wr32(gChnl.va + kChnlWdata0, value);
-  wr32(gChnl.va + kChnlCmd, kOpExtWrite << 27 | uint32_t(reg) << 4 | 0u);
-  dsb();
+  // The transaction is PianoSpmi.h's, under the SPMI lock every kext shares (mapped above: nothing inside the hold maps or logs).
+  const uintptr_t va = gChnl.va;
   uint32_t st = 0;
-  for (unsigned i = 0; i < 1000; ++i) {
-    st = rd32(gChnl.va + kChnlStatus);
-    if (st & pianopower::kStatusDone) break;
-    IODelay(1);
-  }
+  const pianospmi::Result r = pianospmi::write([va](uint32_t off) { return rd32(va + off); },
+                                               [va](uint32_t off, uint32_t v) {
+                                                 wr32(va + off, v);
+                                                 if (off == pianospmi::kCmd) dsb();
+                                               },
+                                               [](unsigned us) { IODelay(us); }, reg, &value, 1, &st);
   ++gPmicWrites;
-  const bool ok = (st & pianopower::kStatusDone) && !(st & pianopower::kStatusErrors);
+  const bool ok = r == pianospmi::Result::ok;
   note("pmic write BT_EN %#04x = %02x: status %08x (%s)", reg, value, st, ok ? "done" : (st & 1u) ? "FAILED/denied" : "timed out");
   return ok ? 0 : -5;
 }

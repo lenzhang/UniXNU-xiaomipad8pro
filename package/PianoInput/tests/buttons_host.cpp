@@ -83,7 +83,8 @@ static void testSpmi()
   m.failStatus = 0;
   m.hang = true;
   const unsigned before = m.delays;
-  CHECK(spmiRead8(io, pon.apid, kRegRtStatus, &v) == ReadResult::timeout && m.delays - before == 1000);
+  // 1000 polls of 1 us, then (PianoSpmi.h) up to 5000 us more inside the hold for the command in flight to finish
+  CHECK(spmiRead8(io, pon.apid, kRegRtStatus, &v) == ReadResult::timeout && m.delays - before == 1000 + 5000);
 
   Arb old;
   old.core[0] = 0x50000000;   // v5: not read

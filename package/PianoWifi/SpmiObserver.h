@@ -12,6 +12,7 @@
 #ifndef PIANO_WIFI_SPMI_OBSERVER_H
 #define PIANO_WIFI_SPMI_OBSERVER_H
 #include <stdint.h>
+#include "../include/PianoSpmi.h"   // the SPMI lock and the transactions every kext shares
 
 namespace pianowifi {
 
@@ -71,45 +72,44 @@ inline Apid spmiFindApid(const Io &io, const Arbiter &a, uint16_t ppid)
   return found;
 }
 
-enum class ReadResult : uint8_t { ok, error, timeout };
+enum class ReadResult : uint8_t { ok, error, timeout };   // pianospmi::Result's values
+inline ReadResult fromShared(pianospmi::Result r) { return ReadResult(uint8_t(r)); }
 
 // One observer command: bytes (1..8) registers from `reg` of the peripheral at `apid`; *status gets the channel's last status word.
+// The transaction itself is package/include/PianoSpmi.h's, under the SPMI lock every kext shares (one transaction at a time on the
+// arbiter: the 2026-11-12/13 probes lost reads, and read wrong values with an "ok" status, while several kexts drove it at once).
 inline ReadResult spmiReadOnce(const Io &io, int apid, uint8_t reg, uint8_t *value, unsigned bytes, uint32_t *status = nullptr)
 {
-  if (apid < 0 || bytes == 0 || bytes > 8 || unsigned(reg) + bytes > 0x100) return ReadResult::error;
+  if (apid < 0 || uint32_t(apid) >= kSpmiMaxApids) return ReadResult::error;
   const uint32_t ch = kObsvStride * uint32_t(apid);
-  io.wr(io.ctx, Window::obsv, ch + kObsvCmd, kOpExtReadL << 27 | uint32_t(reg) << 4 | (bytes - 1));
-  uint32_t st = 0;
-  for (unsigned i = 0; i < 1000; ++i) {
-    st = io.rd(io.ctx, Window::obsv, ch + kObsvStatus);
-    if (st & kStatusDone) {
-      if (status) *status = st;
-      if (st & kStatusErrors) return ReadResult::error;
-      const uint32_t lo = io.rd(io.ctx, Window::obsv, ch + kObsvData0);
-      const uint32_t hi = bytes > 4 ? io.rd(io.ctx, Window::obsv, ch + kObsvData1) : 0;
-      for (unsigned b = 0; b < bytes; ++b) value[b] = uint8_t((b < 4 ? lo : hi) >> (8 * (b & 3)));
-      return ReadResult::ok;
-    }
-    io.delayUs(io.ctx, 1);
-  }
-  if (status) *status = st;
-  return ReadResult::timeout;
+  return fromShared(pianospmi::readOnce([&](uint32_t off) { return io.rd(io.ctx, Window::obsv, ch + off); },
+                                        [&](uint32_t off, uint32_t v) { io.wr(io.ctx, Window::obsv, ch + off, v); },
+                                        [&](unsigned us) { io.delayUs(io.ctx, us); }, reg, value, bytes, status));
 }
 
-// spmiReadOnce, again up to four more times 500 us apart when the channel reports a failure or does not finish in time: with the DSP
-// starting (piano-power=2 piano-power-delay=0) and PianoThermal's ADC rounds on the bus, single observer reads came back failed (the
-// 2026-11-12 23:03 probe: three of PianoWifi's regulator TYPE reads, so level 2 found no regulator and stopped at step -201). Before
-// a retry the channel is given up to 5 ms to finish the command still in flight, so a new command never overtakes it.
+// spmiReadOnce, again up to four more times 500 us apart when the channel reports a failure or does not finish in time (a denial is
+// final): with the DSP starting (piano-power=2 piano-power-delay=0) and PianoThermal's ADC rounds on the bus, single observer reads
+// came back failed (the 2026-11-12 23:03 probe: three of PianoWifi's regulator TYPE reads, so level 2 found no regulator and stopped
+// at step -201). PianoSpmi.h's read(): the lock is free between the tries, and a command that timed out was given up to 5 ms more
+// inside its hold, so a new command never overtakes it.
 inline ReadResult spmiRead(const Io &io, int apid, uint8_t reg, uint8_t *value, unsigned bytes, uint32_t *status = nullptr)
 {
-  ReadResult r = spmiReadOnce(io, apid, reg, value, bytes, status);
-  for (unsigned attempt = 0; attempt < 4 && r != ReadResult::ok && apid >= 0 && bytes && bytes <= 8; ++attempt) {
-    const uint32_t ch = kObsvStride * uint32_t(apid);
-    for (unsigned i = 0; i < 5000 && !(io.rd(io.ctx, Window::obsv, ch + kObsvStatus) & kStatusDone); ++i) io.delayUs(io.ctx, 1);
-    io.delayUs(io.ctx, 500);
-    r = spmiReadOnce(io, apid, reg, value, bytes, status);
-  }
-  return r;
+  if (apid < 0 || uint32_t(apid) >= kSpmiMaxApids) return ReadResult::error;
+  const uint32_t ch = kObsvStride * uint32_t(apid);
+  return fromShared(pianospmi::read([&](uint32_t off) { return io.rd(io.ctx, Window::obsv, ch + off); },
+                                    [&](uint32_t off, uint32_t v) { io.wr(io.ctx, Window::obsv, ch + off, v); },
+                                    [&](unsigned us) { io.delayUs(io.ctx, us); }, reg, value, bytes, status));
+}
+
+// spmiRead until two reads in a row agree (PianoSpmi.h readStable): for values whose misreading is dangerous, as a peripheral's
+// TYPE/SUBTYPE, which decides whose registers the next reads take for a regulator's (v34p: an LDO's TYPE read 0x00 "ok").
+inline ReadResult spmiReadStable(const Io &io, int apid, uint8_t reg, uint8_t *value, unsigned bytes, uint32_t *status = nullptr)
+{
+  if (apid < 0 || uint32_t(apid) >= kSpmiMaxApids) return ReadResult::error;
+  const uint32_t ch = kObsvStride * uint32_t(apid);
+  return fromShared(pianospmi::readStable([&](uint32_t off) { return io.rd(io.ctx, Window::obsv, ch + off); },
+                                          [&](uint32_t off, uint32_t v) { io.wr(io.ctx, Window::obsv, ch + off, v); },
+                                          [&](unsigned us) { io.delayUs(io.ctx, us); }, reg, value, bytes, status));
 }
 
 inline const char *resultName(ReadResult r) { return r == ReadResult::ok ? "ok" : r == ReadResult::error ? "error" : "timeout"; }

@@ -58,6 +58,8 @@ for source in args.sources:
         command += ['-I', include]
     # The headers several drivers share (PianoPowerContract.h: the power contract, docs/power.md §4), after the driver's own.
     command += ['-I', str(PIANO / 'package/include')]
+    # The kext's name, for the shared protocols that tag their holder with it (PianoSpmi.h: the SPMI lock's owner word).
+    command += [f'-DPIANO_KEXT_NAME="{args.name}"']
     for define in args.defines:
         command += ['-U', define[2:]] if define.startswith('U:') else ['-D', define]
     command += ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-c99-designator', '-Wno-reorder-init-list',
