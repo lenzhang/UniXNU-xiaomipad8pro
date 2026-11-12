@@ -88,6 +88,16 @@ Second image (00:20): `ram-k273-desk-dev-s1` sha256 `344297d9a22986279f29ed0ff92
 with `patches/k273/0001` (UniXNU's darwin26-syscalls: the Darwin 26 system calls k27 leaves as nosys) in the kernel, KC `725856ed...`;
 the added calls are inert unless called, so it is the one to boot first, the first image its control.
 
+**Size limit (2026-11-13).** `ram-k273-desk-dev-s1` (294952960 bytes) never left ABL after `fastboot boot`'s OKAY (owner's loop
+log 20261113-004027): the UEFI map's kernel region is 256 MiB, and the 27.0.1 line's 247767040-byte images boot. What had grown was
+the kernel collection (92.8 -> 135.9 MB: mac17j keeps the symbol tables of all its 370 kexts). Now:
+`tooling/k273/compact-kc-linkedit.py` (`KC_COMPACT_LINKEDIT=1`, the 27.3 line's default) keeps only the kept entries' symbols
+(114.2 MB), and `tooling/k27/compact-seed.py` (`DESK_COMPACT_SEED=1`) zeroes the seed's free blocks, which held the Metal plugin the
+Turnip stage replaced (124.7 -> 101.1 MB). `build-ram-images.py` refuses an image above `PIANO_IMAGE_MAX_BYTES` (250000000) and
+`verify-ram-images.py` fails one. `ram-k273-desk-dev-s1b`: 245669888 bytes, sha256
+`96e5ef285001ea36d92605f965ed54592d96fe5428d9ab2e6ff97ada7891cace` (KC `20b08b86...`, seed `57a354da...`); build it with
+`DESK_COMPACT_SEED=1` added to the desk-dev command above.
+
 The large inputs live on the external SSD (`/Volumes/ExtSSD/k273/`: the IPSW members, `root/root.img`, `root/systemos.img`), with
 links at their `out/inputs/k273/` paths.
 
