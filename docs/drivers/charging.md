@@ -92,14 +92,17 @@ levels (9 V opt-in), charge current conservative, battery state on the console; 
   with −300 mA/°C above 38 °C, PianoThermal's board thermistors, re-sent on a new generation and after a wake, the sleep and
   shutdown handovers; `piano-power-rp=1` the Type-C Rp current, in steps up to 3 A while the bus holds since 2026-11-12
   ([charging-policy.md](charging-policy.md) §15; `piano-power-ramp=0`: at once, ≤ 1600 mA), `piano-power-health=1` stop at 80 %,
-  resume at 75 %. A write's answer is awaited 3 s (`piano-power-write-ms`), a late one still taken.
+  resume at 75 %. A write's answer is awaited 3 s (`piano-power-write-ms`), a late one still taken. Since 2026-11-12 afternoon
+  (built, not run): the charging restart when both packs stay at 0 mA with input to spare (0x2003 = 0 then 1, `piano-power-kick`,
+  default on), 1500 mA charge current under a trusted Rp, and a `charging:` balance line every report
+  ([charging-policy.md](charging-policy.md) §17).
 - Not done (later): IOPMPowerSource, the SC8541 pump and PPS, MiPPS authentication, the OTG config write 0x201a (stock
   re-sends it to stop a DSP crash on dock unplug), float voltage/termination, sleep notifications.
 
 Boot arguments: `piano-power=0|1|2` (default 0: probe declines, nothing mapped), `piano-power-period=S` (30),
 `piano-power-gauge=0`, `piano-power-write=0` (level 2 without writes), `piano-power-hv=1`, `piano-power-fw=DIR`,
 `piano-power-policy=1` (with `piano-power-rp=1`, `piano-power-ramp=0|1`, `piano-power-rp-max=MA`, `piano-power-write-ms=MS`,
-`piano-power-health=1`, `-health-stop=N`, `-health-resume=N`: charging-policy.md §8, §15), and for the DSP
+`piano-power-health=1`, `-health-stop=N`, `-health-resume=N`, `piano-power-kick=0|1`: charging-policy.md §8, §15, §17), and for the DSP
 bring-up (§5a): `piano-power-delay=S` (30: seconds before the bring-up), `piano-power-stop=N` (stop before step N),
 `piano-power-rpmh=0` (no lcx/lmx proxy votes), `piano-power-qmp=0` (no AOSS load_state), `piano-power-trace=0`.
 
@@ -656,3 +659,26 @@ From the USB console logs (local, not published; `grep PianoPower`). **M** = mea
   write can suspend the input or brown the tablet out; the gain would be what level 2 gets through 0x2008 with read-backs.
 - **What follows**: the stepped Type-C current up to the Rp's 3 A with its guards, the write answers, the test images and the daily
   profile's level: [charging-policy.md](charging-policy.md) §15 and §16.
+
+## Measured 2026-11-12 afternoon (chg-ramp, chg-l1, chg-late, p8, p9: why the battery reads 0 mA on the cable)
+
+From the USB console logs (local, not published) and a survey of every native boot of 11-11 and 11-12 with PianoPower; the whole
+analysis, the fix and its images: [charging-policy.md](charging-policy.md) §17.
+
+- **The battery is really at 0 mA (M):** both gauges and the firmware's own pack current (0x2027) read 0, the remaining capacity does
+  not move for minutes, while the same reads move the voltage and the temperature; BatteryStatus 0x40 is the gauge's DSG bit
+  (discharge or relax mode, not charge mode), set ~55 s after the current reaches 0, with no FC or TCA bit.
+- **The input is not used up (M):** `chg-ramp` 7.2 W in (1334-1709 mA at 4.87-4.98 V under 2000 asked, the firmware's own 0x2029
+  1750-1800), `chg-late` 7.1 W (under 1600): the system about 6.4-6.5 W (I, at 90 %), the bus current swinging by up to 375 mA while
+  the packs stay at 0. The steps stopped at 2000 because the input was never used up.
+- **The charger stops charging at about 40 s of every native boot (M):** 0 of 42 level-1 boots that logged past 45 s had the packs
+  above +50 mA after it (+476 mA before, in 36 of 46); 0 of 16 at level 2, whatever the input limit; `p9-off`, with every CPU
+  98.7-99.9 % idle, 0 mA at 82 % from 70 s to 890 s. At 5 s resolution: 477 → 463 → 328 → 0 mA over 28-38 s with no discharge, the
+  DCDC block's status bytes changing in the same 5 s. The DSP starts after it (charger_pd up at 60-75 s) and keeps the input on and
+  the battery at 0: charging enable 1, input suspend 0, the charge current written, 4400 mV float, 30-35 °C.
+- **Inferred:** a not-charging state of the PMIC charger latched at ~40 s of uptime that the firmware neither reports nor clears (a
+  watchdog left by the boot stages, or a termination/inhibit decision: no register map to tell); not excluded, that this firmware does
+  not charge from a computer port at all (no Ubuntu result on one).
+- **Fix built (not run):** the charging restart (0x2003 = 0, 5 s, 1, the charge current again; three per attach), 1500 mA under a
+  trusted Rp, the steps against a settled 0x2029, the `charging:` line; images `ram-chg-kick` and `ram-chg-kick-idle`
+  (charging-policy.md §17.5); if the restart does not help, the attended next steps of §17.6 (a replug, an early DSP, a wall charger).

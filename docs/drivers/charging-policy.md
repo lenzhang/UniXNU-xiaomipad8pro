@@ -11,6 +11,11 @@ running (397 mA at 5.2 V while 0x2008 reads 100): the input limit is now worth w
 1594 mA; [charging.md](charging.md) "Measured 2026-11-12"). Since then (built, host-tested, not run): the Type-C current **in steps**
 up to 3 A (§15), the input limit written before the charge current when it rises, a write's answer awaited 3 s and a late one still
 taken (§15.3), and the daily profile's charging level 2 (§16; images `ram-chg-*`, §15.5).
+**2026-11-12 afternoon (§17):** the 0 mA of `chg-ramp` and `chg-late` is a charger that does not charge, not a system that takes the
+input and not a stale gauge: every native boot stops charging at about 40 s of uptime, before the DSP starts, and the firmware keeps
+the battery at 0 mA once it runs. Built and host-tested, not run: the charging restart (0x2003 = 0 then 1, `piano-power-kick`, default
+on with the policy), the charge current of a trusted Rp (1500 mA), the steps measured against the firmware's own limit (0x2029) and a
+`charging:` balance line every report; images `ram-chg-kick` and `ram-chg-kick-idle` (§17.5).
 
 ## 0. The answer
 
@@ -27,6 +32,8 @@ taken (§15.3), and the daily profile's charging level 2 (§16; images `ram-chg-
   immediate limit within 1600 mA, §13). The board thermistors PianoThermal publishes only ever make it more conservative (§1).
 - Defaults are today's caution: ceilings ICL 1600 / FCC 1500 mA (PianoMca's allowlist), 5 V only, no float change, Preserve
   Battery Health off. Every planned write passes `piano_charge_write_allowed()`; each new write has a read-back (§7).
+- A charger that keeps both packs at 0 mA while the input has current to spare is restarted (0x2003 = 0, 5 s, then 1, the charge
+  current again), at most three times per attach, two minutes apart (§17; `piano-power-kick=0` leaves it out).
 
 Sources: [device.md](../ubuntu-history/device.md) §2.5, [kernel.md](../ubuntu-history/kernel.md) §2.5, §3.5 (the Ubuntu history);
 `yzddmr6/linux-sm8750-piano` `drivers/power/supply/xiaomi_mca.c` at `piano/dev` 7f8d6bedde47 (GPL-2.0, read for behaviour and
@@ -176,7 +183,7 @@ PianoPower's contract (power.md §4): `setPowerState(off)` loops decide/send/ack
 |---|---|---|---|---|
 | 0x2008 input limit | 4 | 100..ceiling (A 1600, B 2500; the stepped Type-C current up to 3000, §15) | attach, type / 9 V / re-send, steps, sleep, detach (100) | 0x2008 (the requested value) ±50 mA, two disagreeing → again (three writes at most); verdict: the gauges' current and the bus current 0x20004 |
 | 0x2005 charge current | 4 | 100..ceiling (A 1500, B 3500) | the same, thermal steps | none (reads 0): the acknowledgement; verdict: positive gauges' current ≤ the value at 40–90 % |
-| 0x2003 charge enable | 1 | **0** and 1 | 0: battery-health stop, sleep stop; 1: lifting our stop | 0x2003 every cycle; `STOP_LEAK` |
+| 0x2003 charge enable | 1 | **0** and 1 | 0: battery-health stop, sleep stop, the charging restart (§17); 1: lifting our stop | 0x2003 every cycle; `STOP_LEAK`; the restart: the packs' current |
 | 0x2007 float voltage | 4 (mV) | 4400; 4480, 4060 with `full_charge` | float option | 0x2007 = 2 × mV − 3600 every cycle |
 | 0x21018 fixed PDO | 4 | 5000; 9000 with `hv` | §2 | bus 8.0–9.6 V within 15 s / 3 decisions, else 5 V and blocked |
 | 0x21017 PPS APDO | 4 | `450 << 16 \| mA/50`, 500..3000 mA, `hv` = 2 | §2 | the same |
@@ -185,7 +192,7 @@ PianoPower's contract (power.md §4): `setPowerState(off)` loops decide/send/ack
 and again by `piano_mca_next` before it is built; the policy's own `piano_charge_write_allowed` is checked first): PianoMca's
 (0x2008 100–1600, up to `piano-power-rp-max` (≤ 3000) only with the stepped Type-C current (`piano_mca_allow_icl`, set from the
 policy's `piano_charge_icl_max`), 0x2005 100–1500, 0x2003 = 1, 0x21018 = 5000, the three board values), plus 0x2003 = 0 **only with battery health
-on**, 0x21018 = 9000 only with `piano-power-hv` ≥ 1, 0x21017 only as the 9 V word (500–3000 mA) with `piano-power-hv=2`. Not
+or the charging restart on** (§17), 0x21018 = 9000 only with `piano-power-hv` ≥ 1, 0x21017 only as the 9 V word (500–3000 mA) with `piano-power-hv=2`. Not
 admitted: 0x2007 (the float option is not offered: `piano-power-fv` does not exist yet), 0x2019 (the built-in policy's opt-in
 un-suspend; it read 0 on 2026-11-11), stage B ceilings (not offered). A write the codec refuses goes back to the policy as refused
 (three: given up until the next attach). Never written: 0x2012 AICL, 0x21002 verify (nothing here authenticates), 0x2100c data
@@ -245,7 +252,8 @@ Default `piano-power-policy=0`: none of this runs, PianoMca.c's built-in policy 
 7. **Boot arguments**: `piano-power-policy=1`; `piano-power-rp=1` (§13) with `piano-power-ramp=0|1` (1, the default: the steps of
    §15) and `piano-power-rp-max=MA` (1500..3000, default 3000); `piano-power-write-ms=MS` (1000..5000, default 3000: how long a write's
    answer is awaited, §15.3); `piano-power-health=1`, `-health-stop=N`, `-health-resume=N`
-   (§5); `piano-power-hv=0|1|2` (2 adds the APDO); `piano-power-write=0` decides for the log only (nothing is sent). Not offered yet:
+   (§5); `piano-power-hv=0|1|2` (2 adds the APDO); `piano-power-kick=0|1` (1, the default: the charging restart, §17);
+   `piano-power-write=0` decides for the log only (nothing is sent). Not offered yet:
    `piano-power-fv`, the stage B ceilings, `sleep_charge`, the `setProperties()` switch. `piano-power-unsuspend` stays the built-in
    policy's.
 
@@ -456,7 +464,9 @@ from the source to the charger, so 3 A would leave about 4.6 V: above the 4.5 V 
 `piano-power-ramp=0` keeps the 2026-11-11 behaviour (the Rp limit at once within 1600 mA, a sag ends the trust).
 
 The charge current stays the class's (CDP 900 mA, derated −300 mA/°C from 39 °C): the steps raise what the system can take from the
-port, not how hard the cells are charged. JEITA (0–55 °C) and the 4400 mV float stay the firmware's.
+port, not how hard the cells are charged. JEITA (0–55 °C) and the 4400 mV float stay the firmware's. **Since §17** (built, not run):
+while the steps follow a trusted Rp the charge current is the DCP row's within the ceiling (1500 mA), and a step counts as used up
+against the firmware's own limit (0x2029) once that has settled below the step.
 
 ### 15.2 What the log says
 
@@ -535,7 +545,9 @@ not following the steps (the firmware clamps 0x2008: the `0x2029` field shows it
 
 **Level 2 with the stepped Type-C current** (`build-esp.py --profile daily` now defaults to `--charging 2`: `piano-power=2
 piano-power-policy=1 piano-power-rp=1 piano-thermal=1 piano-thermal-adc=1`), installed only after `ram-chg-ramp` passed; until then
-`--charging 1` (persistent-boot.md §11 pins v3 to it). Not "level 1 with an input-limit write".
+`--charging 1` (persistent-boot.md §11 pins v3 to it). Not "level 1 with an input-limit write". **Amended (§17):** `ram-chg-ramp`
+did not pass (0 mA at 93 %), and level 1 does not charge either after the first 40 s of a boot (42 of 42 boots); the gate is now
+`ram-chg-kick` (the same arguments, the restart on by default), and level 2 stays the only level that can restart the charger.
 
 Why:
 1. **Only level 2 can give more than the PMIC alone.** Level 1's input is about 1.5 A (inferred from the power balance; the PMIC's
@@ -554,3 +566,144 @@ about 25 mAh); (b) a DSP crash would put the firmware back on its defaults (the 
 restarts the DSP natively: none seen in any native run (the `adsp:` report line counts fatal reports); (c) off the cable a little polling
 (the 5 s charger cycle of 27 GLINK round trips, PianoAdsp's 20 ms doorbell poll: tens of wakeups a second against the ~12000 idle
 entries a second measured, power.md 1.1); (d) the steps above 1.6 A are host-tested only, hence the gate.
+
+## 17. The 0 mA of 2026-11-12 and the charging restart
+
+Runs (the USB console logs, local, not published; `grep -a PianoPower`): `chg-ramp` (09:05, level 2, the steps of §15, 93 %),
+`chg-l1` (09:27, level 1, 90 %), `chg-late` (14:59, level 2, 1600 mA at once, 81 %), `p8-idle`, `p8-idleold`, `p9-base`, `p9-off`
+(15:28-16:44, level 1, 82-83 %; `p9-off` without PerfPowerServices and audiomxd, [power.md](../power.md) §1.2), and the survey of
+every native boot of 11-11 and 11-12 with PianoPower (46 at level 1, 17 at level 2). **M** = measured, **I** = inferred.
+
+### 17.1 Not a stale gauge, not a system that takes the whole input
+
+| | `chg-ramp`, 132-582 s | `chg-late`, 132-582 s |
+|---|---|---|
+| Asked / the firmware's own (0x2029) | 2000 / 1750-1800 mA | 1600 / 1600 mA |
+| Bus (0x20002 / 0x20004) | 4.87-4.98 V, 1334-1709 mA, mean 1466 mA: **7.2 W** (6.6-8.4) | 4.88-4.95 V, 1134-1594 mA, mean 1450 mA: **7.1 W** (5.5-7.8) |
+| Both packs (gauges) | **0 mA** in all 16 reports, 7999 mAh unchanged for 8 min | 0 mA in 15 of 16 (−27 mA once, with the bus at 1591 mA) |
+| The firmware's pack current (0x2027) | 0 (it read 1118 mA, discharging, before the first write) | 0 |
+| The system (I: 90 % of the input less the battery) | about 6.5 W | about 6.4 W |
+
+- **The gauges are live (M).** In the same reads the packs' voltage moves (4360-4363 mV) and their temperature climbs (36.0 →
+  37.1 °C); the same gauges report a few milliamps elsewhere (−11, −13, −16 mA summed, "idle" in the log, which is our label for
+  |I| ≤ 20 mA, `Gauge.h`), so their deadband is a few mA per pack; the firmware's own battery current, an independent measurement,
+  reads 0 as well; the remaining capacity does not move. The units are right (+478 mA early in the same boots, −1215 mA under the
+  100 mA input). BatteryStatus 0x40 is bq27z561's DSG bit: "discharging or relax mode", i.e. not in charge mode; it is 0 while the
+  packs take +478 mA and turns 0x40 about 55 s after the current reaches 0 (the gauge's relax entry; 01:48 run at 5 s resolution):
+  a consequence of the 0 mA, not a cause. No FC (full) or TCA (terminate-charge alarm) bit is set.
+- **The input is not used up (M).** The bus current moves by up to 375 mA from report to report while both packs stay at exactly 0:
+  the battery is not the slack, the input is. In `chg-ramp` the firmware's own limit sat 40-470 mA above the bus current all the way
+  (mean about 310 mA): about 1.4 W at 90 % (≈ +310 mA into the packs at 4.36 V) went unused at 2000 mA asked, before any higher step.
+- **The steps stopped because of it (M).** Each step goes up only when the input is used up (§15.1); with the battery taking nothing,
+  the system's 1.3-1.7 A never came within 250 mA of 2000, so `steps 2000 mA (not used up)` for the rest of the run. More input would
+  not have helped: the charger did not use what it had.
+
+### 17.2 The charger stops charging at about 40 s of every native boot, before the DSP starts
+
+- **Level 1 (M):** the PMIC alone charges at +472..+481 mA at the first reports of 36 of the 46 level-1 boots of 11-11 and 11-12
+  (81-97 %; the other ten started at 0: seven at 97 %, on the float, and three at 82-93 % that followed another boot within a few
+  minutes). **Of the 42 boots that logged past 45 s of PianoPower's uptime, none had the packs
+  above +50 mA after it.** At 5 s resolution (01:48, 97 %): 477, 463 (28 s), 328 (33 s), 0 mA (38 s), with no discharge between, then
+  0 mA for 60 s and −200 mA once the login window loads the system. In the same 5 s the DCDC block's status bytes change
+  (`c3/83 19 06 0b 00 be 0a 24` → `87 00 06 0b 05 be 00 34`) and stay changed for the rest of the boot (no register map: the bytes
+  are only a marker). It is not the GPU's start (20.5 s in most boots, 33.9 s in that one: the stop is at ~40 s of XNU uptime in
+  both) and not the load: with `piano-cpufreq=3` the packs go negative at 20 s, but at the idle login window of `p9-off` (every CPU
+  98.7-99.9 % idle, the system at its lightest) the packs read exactly 0 mA from 70 s to 890 s at 82 % and 4.24 V.
+- **Level 2 (M):** the DSP's bring-up waits `piano-power-delay` (30 s) and takes another 30 s, so charger_pd comes up at 60-75 s,
+  after the stop. Of the 16 level-2 boots that logged past 45 s, **none** had the packs above +50 mA after it, whatever the input:
+  100 mA (−1.2 to −1.7 A), 900 mA (−0.7 to −0.9 A), 1600 mA (−173 → −46 mA, then 0), 2000 mA (0 mA).
+- **What the firmware reads (M):** charging enable 0x2003 = 1, input suspend 0x2019 = 0, the charge current written (900: `ok`;
+  0x2005 reads nothing back), the float 0x2007 = 5200 (4400 mV; the packs 40-170 mV below it), the battery 30-35 °C (0x202a; inside
+  the firmware's 0-55 °C JEITA window and below our 38 °C derating). 0x2001 reads 0x7 in every state (discharging at 100 mA, idle at
+  2000 mA, before and after every write) and so says nothing we can decode. Nothing in what is read says "not charging".
+- **Inferred:** a not-charging state of the PMIC's charger latched at about 40 s of uptime, which the DSP firmware, once started,
+  neither reports nor clears: it takes the limits and keeps the input on (the system runs from USB), and the battery stays at 0. What
+  sets it is not known: candidates, none provable without a PMIH010x register map, are a charger watchdog left armed by the boot
+  stages that nothing pets natively (our FD's charger DXE pets none, [charging.md](charging.md) §0; Linux starts the DSP within
+  seconds of its boot), or a termination or inhibit decision; a fixed time after the boot stages fits the ~40 s better than any event
+  of ours. Not excluded: that this firmware does not charge from a computer port (CDP) at all; Ubuntu has no computer-port result
+  ([device.md](../ubuntu-history/device.md) §2.5), every native run was on the Mac's port.
+
+### 17.3 The fix as built (ChargePolicy.c, `piano-power-policy=1`)
+
+1. **The charging restart** (`kick()`, `cfg.kick`, boot argument `piano-power-kick`, default 1 with the policy). When both packs read
+   within 30 mA of 0 on two gauge readings 20 s apart or more, while the bus is at 4.65 V or more and its current is 150 mA or more
+   below the limit it is held to (the one taken, or 0x2029 when lower), the policy's input limit and charge current are taken and
+   nothing of them is in flight, charging is allowed (battery health, its hot and cold stops), the firmware's own enable reads 1 (a
+   0 of its own is never overridden), the higher pack is at most 95 % and 30 mV or more below the float voltage in force, and the
+   packs read 15-45 °C: 0x2003 = 0, held 5 s (one charger cycle), then 1 by the enable's own rule (a stop of ours is lifted at the next
+   decision), then the charge current again (it has no read-back), and the first gauge reading 15 s on judges it: +50 mA or more is
+   `CHARGING again`, else `no change`. At most three per attach, wake or charger generation, two minutes apart; then
+   `none more until the next attach`. 0x2003 is the charging enable the stock AP driver writes (one byte, as xiaomi_mca records), the
+   one Ubuntu's battery protection stops and resumes with.
+2. **The charge current of a trusted Rp.** While the steps follow a 1.5 / 3.0 A Rp above the class row, the charge current is the DCP
+   row's (2000 mA) within the ceiling: **1500 mA** at stage A (CDP 900 before), derated −300 mA/°C from 39 °C as before. 1.5 A is
+   0.17 C for the 8.6 Ah of the two packs (Ubuntu measured 1.2-1.34 A per cell at 9 V); the input limit still governs the input, the
+   system first. `piano-power-ramp=0` keeps the row's.
+3. **The steps against the firmware's own limit.** 0x2029 (now a policy input) is taken as the limit to use up once it has stayed
+   below the step for 15 s (its highest reading at the step): in `chg-ramp` it held 1750-1800 under 2000 asked, so a charging battery
+   that took the input up to it would still have left the steps at 2000. While it still rises (the firmware walks it up ~50 mA a
+   cycle after a step) the step is the limit, as before. The request above it changes nothing the firmware does not allow; the sag,
+   quick-detach and refusal rules are unchanged.
+4. **The balance line, every report** (`piano_charge_balance()`, all levels), `chg-ramp`'s state as it would read:
+
+   ```
+   PianoPower: [282s] charging: in 1466 mA at 4911 mV (7.1 W), battery +0 mA at 4362 mV (0.0 W), system ~6.4 W; limit 2000 asked,
+     0x2029 1750, enable 1; NOT CHARGING with input to spare; restarts 0          (one line on the console)
+   ```
+
+   The system is 90 % of the input less the battery (an estimate: the charger's efficiency is not read); the verdict is `charging`
+   (+50 mA or more), `NOT CHARGING with input to spare` (within 50 mA of 0, 150 mA or more under the limit), `input used up by the
+   system`, `draining: the system takes more than the input`, `on battery`. At level 1 it has the battery half only.
+
+Safety (§15.4 holds): the only new write is 0x2003 = 0, admitted by the codec only with battery health or the restart on, planned
+only in the decision that starts a restart; every path that cuts a restart short ends at 1 (the enable's own rule after 5 s, a detach,
+the sleep handover, which now also lifts a restart's stop, the shutdown handover, a wake or a new generation, a refused or unanswered
+0); the worst case is a reset (`piano-reset-after`, a panic) inside the 5 s: charging off until the next DSP start, which is the state
+the restart answers anyway, with the system still on the input. The float voltage, JEITA and the input rules are untouched.
+
+### 17.4 Tests (host)
+
+`policy_host`: `testKick` (the 2026-11-12 state against a charger model that stays at 0 mA until its enable goes 0 and back to 1:
+the 0 alone in its plan, held 5 s, the 1, the charge current again, the verdict 15 s on, the steps then on to 3000 with the battery's
+share; a restart without effect: three, two minutes apart, then none until the next attach, 0x2003 at 1 each time; none near full, at
+the float voltage, with the input used up, warm, cold, with the option or the writes off, with the firmware's own 0, with battery
+health holding, without the gauges, on a single 0 reading; cut short by a detach, a shutdown, a wake, a generation, a refused 0, a
+sleep), `testRampAicl` (the steps on past 2000 under a settled 1750; held while 0x2029 still rises), `testBalance` (`chg-ramp`'s
+numbers and every verdict); the random walk with the packs at 0, a stuck charger and the firmware's own limit, checking that a 0 comes
+only from battery health or a restart's start and never more than three restarts. `power_host` `testLinkKick`: the same through the
+codec and the DSP model (0x2003 = 0 then 1 as one byte each through the codec's allowlist, the charge current again after it, the
+steps to 2500 once the packs take current; three without effect; none with `piano-power-kick=0`; a detach and a shutdown between the 0
+and the 1). Both also under ASan/UBSan.
+
+### 17.5 Test images (unattended, the Mac's cable, 900 s, RAM boots)
+
+`tooling/k27/build-charge-test-images.sh` (default now `kick kick-idle`), the arguments of §15.5's `ram-chg-ramp`
+(`piano-power=2 piano-power-policy=1 piano-power-rp=1` and the daily drivers), 900 s:
+
+| Image | Adds | Answers |
+|---|---|---|
+| `ram-chg-kick` | this tree's PianoPower (the restart on by default, 1500 mA, 0x2029, the balance line) | does 0x2003 = 0 → 1 restart charging at the login window; how far the steps go then |
+| `ram-chg-kick-idle` | `k27-deny-exec=…,/usr/libexec/PerfPowerServices,/usr/libexec/audiomxd` (`PIANO_DENY_EXEC`) | the same with the idle login window's load (p9-off's), so more of the input is left for the battery |
+
+Built 2026-11-12 in an agent worktree on main 8e64cc5 + this change (kernel 0064 `2fe50b346041ab9f…`; KC `204b760e153263e7…`,
+`native kext rule: 25 native kexts linked, none from outside this repository`; the Turnip-staged seed, so Data volatile), all three
+`verify-ram-images.py` PASS: `ram-chg-kick` `20c7b70cd98633cd…`, `ram-chg-kick-idle` `d4333cbfb22d2e9a…`, `ram-chg-dump`
+`23b13c86912e3d51…` (each build has its own hash: rebuild in the main checkout before a run). Queue lines (`TAG IMG DUMP SECS`):
+`chg-kick out/ram-chg-kick out/ram-chg-dump 930`, `chg-kick-idle out/ram-chg-kick-idle out/ram-chg-dump 930`.
+
+Read: `grep -aE 'PianoPower: (policy: (input steps|charging restart)|\[[0-9]+s\] (battery|charging)|mca: write)'`. Pass: `charging
+restart 1 of 3: both packs at 0 mA ...` after the steps settle (about 150-200 s), `charging restart 1: the packs take +N mA now:
+CHARGING again`, then `charging: ... ; charging` lines to the end, `input steps: up 2000 -> 2500` (and on) once the packs take
+current, the percentage rising; `kick-idle` with more battery current than `kick` at the same step. Fail: `no change` three times
+(0x2003 does not restart this charger: §17.6).
+
+### 17.6 If the restart does not restart it (attended, next)
+
+1. Unplug and replug the cable at the login window and read the `charging:` lines: a real re-attach makes the PMIC run its detection
+   and start a charge cycle; charging again says the state is the PMIC's and is cleared by an attach (then the input's own suspend,
+   0x2019 = 1 then 0, is the soft replug to try, attended only: a suspend that sticks would outlive a warm reset and leave the tablet
+   on battery in ABL).
+2. Start the DSP before the stop (`piano-power-delay=0`, the bring-up still takes ~30 s; or a shorter firmware read): charging from
+   the first write would say the stop is something the firmware prevents when it runs early, as under Linux.
+3. A wall charger (DCP or PD) instead of the Mac's port: whether a computer port is the condition.
