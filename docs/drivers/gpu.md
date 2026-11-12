@@ -396,6 +396,16 @@ outside it` with `gpu va/map: 0:WindowServer 1153/3584M pk1290 3120o 150kr 1:ico
 highest end reached in the window, mapping records, table ranges). Read the trend: ranges climbing toward the capacity, a window's
 `pk` near its size, records near 32768.
 
+**The first desktop sessions' wired memory (2026-11-12, desk-dev).** WindowServer aborted twice in five minutes on OutOfMemory(Device)
+for small textures: the runtime needed new blocks of 16-49 MiB, and the kernel answered `gpu BoAlloc refused: 49 MiB: pool 168 MiB free,
+largest 19; then no pages from XNU (0xe00002bd NoMemory)`: the pool (1024 MiB: S3 found no 2 GiB contiguous run) had room but no
+extent that large, and XNU refuses a kernel allocation outright when its wired pages plus the free target would pass `max_mem`
+(xnu `vm_page_alloc_list`; `vm_stat`: 5.8 GiB of 8 wired). The GPU's share then: the pool 1024 MiB, 872 MiB of own BOs outside it, about
+430 MiB of pinned imports: about 2.3 GiB. Since: a pooled BO may be cut from up to 64 free extents (`NativeAdrenoPoolMaxPieces`,
+write-combined pool, not for a one-span request), a new process's failures are counted (and written) apart from an earlier process
+of the same name, and Turnip 0009 gives idle caches back and asks every GPU process for its cache when a BoAlloc finds no memory.
+Evidence, figures and what is still open: gpu-userspace.md, "Out of device memory on the first desktop sessions".
+
 **The login screen's flicker and white bands (GPU side).** NativeGopDisplay copies WindowServer's frame into the framebuffer after
 the GPU's fence of the newest job handed out when the swap was programmed, at most 50 ms; then it copies anyway. In attend4 its 10 s
 lines show `6 gave up after 50 ms` in the first window of the login screen and 1-4 in many later ones (7-8 a run, in the 11-11 runs

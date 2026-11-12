@@ -75,18 +75,22 @@ case $DEVNET in auto|static|dhcp) ;; *) echo "build-desktop-images: DESK_DEV_NET
 # desk1's images had no PianoKeyboard at all) and the fixes the desktop needs: PianoA830's map limits (the render server's
 # reserve), NativeGopDisplay's cursor layer, NativeRamBlock's volatile pool with its boot reservation (2026-11-12: refused writes
 # corrupted desk-a's Data container), PianoTouch's watchdog download, drag delay and its announced-frame rule (no read without an
-# edge, 2026-11-12: the watchdog loop of desk1 and desk-diag), PianoKeyboard's resting thumb.
+# edge, 2026-11-12: the watchdog loop of desk1 and desk-diag), PianoKeyboard's resting thumb, PianoA830's pooled BOs from several
+# extents with the va/sizes lines (2026-11-12, desk-dev's OutOfMemory(Device): gpu-userspace.md).
 for s in 'start: piano-keyboard=%u' 'start: piano-touch=%u' 'start: piano-backlight=%u' 'start: piano-usb=%u' 'start: piano-power=%u' \
          "the render server's reserve of ranges" 'composition: layer 0 the frame, layer 1 the cursor' \
          'reserved at start (data-volatile-reserve-mib)' 'the download for the watchdog failed: again in' 'piano-touch-drag-delay' \
-         'a frame read only when the controller announces it' 'piano-keyboard-resting' "per-object limit of %llu MiB (its GPU window)"; do
+         'a frame read only when the controller announces it' 'piano-keyboard-resting' "per-object limit of %llu MiB (its GPU window)" \
+         'va/sizes: %u:%s <1M'; do
   grep -a -q -F "$s" "$KC" || { echo "build-desktop-images: $KC lacks \"$s\": rebuild it from this tree (tooling/k27/build-native-image.sh)" >&2; exit 1; }
 done
 # The seed's Metal plugin must have the day's GPU fixes (docs/results-2026-11-12.md): Turnip 0007 (a sysmem draw that reads its own
 # attachments waits for their writes: the login window's opaque boxes), 0008 (the per-object limit is the GPU window) and frontend
-# 0003 (the 16384 px textures and the 4K YCbCr frames): their messages in the staged libraries, as the seed's bytes hold them.
-for s in 'an attachment feedback loop (fbflushall)' 'is past the per-object limit of' 'YCbCr10p 4:2:0'; do
-  grep -a -q -F "$s" "$SEED_IN" || { echo "build-desktop-images: $SEED_IN lacks \"$s\" (Turnip 0007/0008, frontend 0003): restage the Turnip seed (tooling/k27/build-native-image.sh)" >&2; exit 1; }
+# 0003 (the 16384 px textures and the 4K YCbCr frames), 0009 (idle caches given back, every GPU process's cache asked for when a
+# BoAlloc finds no memory): their messages in the staged libraries, as the seed's bytes hold them.
+for s in 'an attachment feedback loop (fbflushall)' 'is past the per-object limit of' 'YCbCr10p 4:2:0' \
+         'every GPU process was asked for its cached BOs'; do
+  grep -a -q -F "$s" "$SEED_IN" || { echo "build-desktop-images: $SEED_IN lacks \"$s\" (Turnip 0007/0008/0009, frontend 0003): restage the Turnip seed (tooling/k27/build-native-image.sh)" >&2; exit 1; }
 done
 if [ -n "${DESK_RTC_OFFSET:-}" ]; then
   [[ $DESK_RTC_OFFSET =~ ^[0-9]+$ ]] || { echo "build-desktop-images: DESK_RTC_OFFSET=$DESK_RTC_OFFSET is not a number" >&2; exit 1; }

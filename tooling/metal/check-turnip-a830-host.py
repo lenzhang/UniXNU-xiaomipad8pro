@@ -237,6 +237,20 @@ def main():
     check('deferred_bo-pressure', [deferred, library, 'pressure'], {'TU_DARWIN_RETIRE_TRACE': '1', 'TU_DARWIN_BO_CACHE': '0'},
           growth_verdict)
 
+    # Turnip 0009 (2026-11-12): a BoAlloc without memory waits for the other processes' caches and is tried again (made after a wait
+    # or two, refused after the whole series, refused at once within the next second), its line on stderr; a cached BO goes back to
+    # the kernel by the idle trim with no further call.
+    def reclaim_verdict(result):
+        lines = [l for l in result.stdout.splitlines() if l.startswith('PASS:')]
+        made = [l for l in result.stderr.splitlines() if 'a BoAlloc found no memory' in l and ' made after ' in l]
+        none = [l for l in result.stderr.splitlines() if 'a BoAlloc found no memory' in l and 'still none after 5 waits' in l]
+        ok = result.returncode == 0 and bool(lines) and bool(made) and bool(none)
+        return ok, (f'{lines[0]}; stderr: "{made[0].split("NativeAdreno: ", 1)[-1]}" and the series that failed' if ok
+                    else (lines[0] if lines else 'no PASS line') + ('' if made else '; no "made after N waits" line') +
+                    ('' if none else '; no "still none" line'))
+    check('deferred_bo-no-memory', [deferred, library, 'no-memory'], {}, reclaim_verdict)
+    check('deferred_bo-idle-trim', [deferred, library, 'idle-trim'], {'TU_DARWIN_BO_CACHE_AGE_MS': '200'}, deferred_verdict)
+
     if not a.no_plugin_smoke:
         header = smoke_shaders(out)
         smoke_h = METAL / 'NativeTurnipSmoke.h'

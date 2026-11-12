@@ -1,0 +1,407 @@
+turnip: darwin, cached and freed BOs go back when idle; every GPU process gives its cache back when a BoAlloc finds no memory
+
+Every BO piano's kernel gives (PianoA830) is wired memory of the system. On the first macOS desktop sessions (2026-11-12, image
+desk-dev) XNU had no pages left to wire: WindowServer's BoAllocs failed (`gpu BoAlloc refused: 49 MiB: pool 168 MiB free, largest
+19; then no pages from XNU (0xe00002bd NoMemory)`), its textures were refused with OutOfMemory(Device) and SkyLight aborted, twice in
+five minutes. Nineteen GPU processes held GPU memory then, and none of them was under the memory pressure the frameworks purge on
+(memory_pressure: 22 % free): what each had cached or freed stayed. On the native darwin path:
+- A cached BO no allocation took within TU_DARWIN_BO_CACHE_AGE_MS (2000 by default; 0: kept for good, as before) goes back to the
+  kernel: at the next allocation, and by a one-shot dispatch timer (on a serial queue of the device's own) armed only while something
+  is cached or a freed BO waits for its fence, with a leeway of half the age (at most a second) so the system can coalesce its
+  wake-up. An idle process with nothing cached is never woken. The same timer reaps the freed BOs whose fence passed while the process
+  did nothing else (they waited for its next allocation or free before). The device's finish stops the timer (out of the device
+  list, cancelled, a running handler waited for) before the connection closes.
+- The cache budgets follow the connection's GPU window when TU_DARWIN_BO_CACHE_MB / TU_DARWIN_BO_CACHE_SMALL_MB are not set: the
+  render server's (2 GiB or more, or the VM's virtio GPU) 96 and 16 MiB as before, a large client's (512 MiB or more) 32 and 8, a
+  small one's 16 and 4.
+- A BoAlloc that finds no memory (kIOReturnNoMemory) after this process's own cache went back posts the Darwin notification
+  `org.unixnu.piano.gpu-reclaim` (at most every 50 ms per process): every GPU process registered for it (with the memory-pressure
+  source) gives its whole cache back now, through its timer. The BoAlloc is tried again after 4, 8, 16, 32 and 64 ms, reaping this
+  process's own freed BOs before each; once a whole series failed, none waits again for a second. On stderr, the first time and then
+  every 10th, 100th, ...: "TU: error: NativeAdreno: a BoAlloc found no memory; every GPU process was asked for its cached BOs; made
+  after N waits (K times)" or "... still none after 5 waits ...".
+- The cache's log line (every 4096 lookups and at the device's end) has a third line: the BOs given back after the age, the idle
+  trims, the reclaims asked and answered, the BoAlloc waits and how many made it.
+Against the tree after 0001-0008. MIT, as the files.
+
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -16,6 +16,7 @@
+ #include <IOKit/IOKitLib.h>
+ #include <dispatch/dispatch.h>
+ #include <mach/mach.h>
++#include <notify.h>
+ 
+ #include "NativeAdrenoABI.h"
+ #include "tu_knl_darwin_virtgpu.h"
+@@ -79,15 +80,26 @@
+  * (DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, warning or critical, the signal Apple's frameworks purge on) and when an allocation or a GPU range
+  * cannot be had (then the allocation is tried again). */
+ static volatile uint32_t darwin_memory_pressure;   /* bumped by the memory-pressure source; each device flushes once per change */
++/* UniXNU-piano (0009, 2026-11-12): every BO piano's kernel gives is wired memory of the system, and the first desktop sessions ran out of
++ * it (desk-dev: XNU had no pages to wire, WindowServer's BoAllocs failed and SkyLight aborted). Not one of the nineteen GPU processes was
++ * under the memory pressure the frameworks purge on (memory_pressure: 22 % free): what they held stayed. So a cached BO no allocation
++ * took within TU_DARWIN_BO_CACHE_AGE_MS (2000 by default; 0: kept, as before) goes back to the kernel, by a one-shot timer armed only
++ * while something is cached or waits for its fence (an idle process with nothing cached is never woken), and so do freed BOs whose
++ * fence passed while the process did nothing else. When a BoAlloc finds no memory even after this process's cache went back, every
++ * GPU process is asked to give its cache back now (the Darwin notification below, posted at most every 50 ms) and the allocation is
++ * tried again a few times over about 120 ms. */
++#define DARWIN_RECLAIM_NOTIFICATION "org.unixnu.piano.gpu-reclaim"
+ struct darwin_cached_bo {
+    uint64_t handle, iova, size, stamp;
+    void *mapping;
+    uint32_t token;
+    bool read_only;
++   uint64_t cached_ns;   /* os_time_get_nano() when it was cached (0009) */
+ };
+ struct darwin_bo_cache_stats {
+    uint64_t lookups, hits, inserts, evictions, flushes, bytes_peak;
+    uint64_t small_lookups, small_hits, small_evictions;   /* of BOs in the small budget (darwin_small) */
++   uint64_t aged, trims, reclaims_asked, reclaims_seen, retries, retry_wins;   /* 0009: the idle trim and the reclaim */
+ };
+ 
+ /* The GPU address space as two red-black trees over the free holes (Mesa's rb_tree, the same algorithm as XNU's libkern/tree.h): by
+@@ -118,6 +130,11 @@
+    uint32_t pressure_seen;
+    struct darwin_bo_cache_stats cache_stats;
+    struct darwin_va va;
++   /* 0009: the idle trim's one-shot timer (on a serial queue of its own; armed under `lock`) and its device. */
++   dispatch_queue_t trim_queue;
++   dispatch_source_t trim_timer;
++   bool trim_armed;
++   struct tu_device *dev;
+ };
+ static struct darwin_retire_state *darwin_stats_state;   /* for tu_darwin_bo_cache_stats */
+ 
+@@ -664,13 +681,27 @@
+  * 64 MiB blocks it frees took most of the shared budget, so the small BOs of command streams and descriptors went almost as soon
+  * as they were cached: 35 % of 20480 allocations reused, 11090 evictions, the misses' new BOs stalling Settings' opening, the app
+  * switcher and Spotlight 100-270 ms each. */
++/* 0009: the defaults follow the connection's GPU window (piano's kernel gives the render server 3.5 GiB, a large client 768 MiB, a
++ * small one 320 MiB): the render server (2 GiB or more, or a VM's virtio GPU) keeps 96 MiB and 16 MiB of small BOs as before, a large
++ * client 32 and 8, a small one 16 and 4. Nineteen GPU processes at 112 MiB each could have held 2 GiB of wired memory cached. */
+ static uint64_t
++darwin_cache_default_mb(bool small)
++{
++   const uint64_t window = dw.info.va_size;
++   if (dw.virtgpu || !window || window >= ((uint64_t)2 << 30))
++      return small ? 16 : 96;
++   if (window >= ((uint64_t)512 << 20))
++      return small ? 8 : 32;
++   return small ? 4 : 16;
++}
++
++static uint64_t
+ darwin_cache_small_budget(void)
+ {
+    static uint64_t budget = UINT64_MAX;
+    if (budget == UINT64_MAX) {
+       const char *text = getenv("TU_DARWIN_BO_CACHE_SMALL_MB");
+-      budget = (text && *text ? strtoull(text, NULL, 10) : 16) << 20;
++      budget = (text && *text ? strtoull(text, NULL, 10) : darwin_cache_default_mb(true)) << 20;
+    }
+    return budget;
+ }
+@@ -693,6 +724,10 @@
+    fprintf(stderr, "NativeAdreno BO cache: of BOs up to 1 MiB %llu allocations, %llu reused, %llu KiB cached now, %llu evicted\n",
+            (unsigned long long)st->small_lookups, (unsigned long long)st->small_hits, (unsigned long long)(retire->small_bytes >> 10),
+            (unsigned long long)st->small_evictions);
++   fprintf(stderr, "NativeAdreno BO cache: %llu given back after the age, %llu idle trims, %llu reclaims asked, %llu answered, %llu "
++           "BoAlloc waits for memory, %llu of them made it\n", (unsigned long long)st->aged, (unsigned long long)st->trims,
++           (unsigned long long)st->reclaims_asked, (unsigned long long)st->reclaims_seen, (unsigned long long)st->retries,
++           (unsigned long long)st->retry_wins);
+ }
+ 
+ /* Drops the cache entry at the index for real. VK_NOT_READY keeps it. */
+@@ -721,7 +756,7 @@
+    static uint64_t budget = UINT64_MAX;
+    if (budget == UINT64_MAX) {
+       const char *text = getenv("TU_DARWIN_BO_CACHE_MB");
+-      const uint64_t mb = text && *text ? strtoull(text, NULL, 10) : 96;
++      const uint64_t mb = text && *text ? strtoull(text, NULL, 10) : darwin_cache_default_mb(false);   /* 0009: by the window */
+       budget = mb ? mb << 20 : UINT64_MAX - 1;
+    }
+    return budget;
+@@ -744,7 +779,7 @@
+    if (bo->size > (darwin_small(bo->size) ? darwin_cache_small_budget() : darwin_cache_budget()))
+       return false;
+    retire->cache[retire->cache_count++] = {bo->handle, bo->iova, bo->size, ++retire->cache_stamp, bo->mapping, bo->token,
+-                                           bo->read_only};
++                                           bo->read_only, os_time_get_nano()};
+    retire->cache_bytes += bo->size;
+    const bool small = darwin_small(bo->size);
+    if (small)
+@@ -823,6 +858,97 @@
+       return;
+    retire->pressure_seen = pressure;
+    darwin_cache_flush(dev, retire);
++}
++
++/* 0009: how long a cached BO no allocation took stays (TU_DARWIN_BO_CACHE_AGE_MS, 2000 by default; 0: for good, as before). */
++static uint64_t
++darwin_cache_age_ns(void)
++{
++   static uint64_t age = UINT64_MAX;
++   if (age == UINT64_MAX) {
++      const char *text = getenv("TU_DARWIN_BO_CACHE_AGE_MS");
++      age = (text && *text ? strtoull(text, NULL, 10) : 2000) * 1000000ull;
++   }
++   return age;
++}
++
++/* 0009: called under retire->lock. The cached BOs older than the age go back to the kernel. */
++static void
++darwin_cache_age(struct tu_device *dev, struct darwin_retire_state *retire)
++{
++   const uint64_t age = darwin_cache_age_ns();
++   if (!age || !retire->cache_count)
++      return;
++   const uint64_t now = os_time_get_nano();
++   for (unsigned i = retire->cache_count; i-- > 0;) {
++      const struct darwin_cached_bo *e = &retire->cache[i];
++      if (now - e->cached_ns >= age && darwin_cache_evict(dev, retire, i) == VK_SUCCESS)
++         ++retire->cache_stats.aged;
++   }
++}
++
++/* 0009: called under retire->lock. While something is cached or waits for its fence, the idle trim runs once within the age (a second
++ * late at most: the timer's leeway lets the system coalesce its wake-up); nothing is armed while there is nothing to give back. */
++static void
++darwin_trim_arm(struct darwin_retire_state *retire)
++{
++   const uint64_t age = darwin_cache_age_ns();
++   if (!age || !retire->trim_timer || retire->trim_armed || (!retire->cache_count && !retire->count))
++      return;
++   retire->trim_armed = true;
++   dispatch_source_set_timer(retire->trim_timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)age), DISPATCH_TIME_FOREVER,
++                             age / 2 < 1000000000ull ? age / 2 : 1000000000ull);
++}
++
++/* 0009: the devices of this process, for the reclaim notification and the memory-pressure source (they wake each one's trim now). */
++static pthread_mutex_t darwin_devices_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct darwin_retire_state *darwin_devices[8];
++
++static void
++darwin_kick_devices(void)
++{
++   pthread_mutex_lock(&darwin_devices_lock);
++   for (unsigned i = 0; i < ARRAY_SIZE(darwin_devices); ++i) {
++      struct darwin_retire_state *retire = darwin_devices[i];
++      if (retire && retire->trim_timer)
++         dispatch_source_set_timer(retire->trim_timer, DISPATCH_TIME_NOW, DISPATCH_TIME_FOREVER, 0);
++   }
++   pthread_mutex_unlock(&darwin_devices_lock);
++}
++
++/* 0009: every GPU process gives its cache back (another one's BoAlloc found no memory), at most every 50 ms from this one. */
++static void
++darwin_ask_reclaim(struct darwin_retire_state *retire)
++{
++   static uint64_t last;
++   const uint64_t now = os_time_get_nano(), then = p_atomic_read(&last);
++   if (then && now - then < 50000000ull)
++      return;
++   p_atomic_set(&last, now);
++   ++retire->cache_stats.reclaims_asked;
++   notify_post(DARWIN_RECLAIM_NOTIFICATION);
++}
++
++static VkResult darwin_reap_locked(struct tu_device *dev, struct darwin_retire_state *retire);
++
++/* 0009: the trim timer's handler (its serial queue): the freed BOs whose fence passed and the cached BOs past the age go back; after a
++ * memory-pressure or reclaim notification everything cached does. Armed again while something is left. */
++static void
++darwin_trim_fire(void *context)
++{
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)context;
++   pthread_mutex_lock(&retire->lock);
++   retire->trim_armed = false;
++   ++retire->cache_stats.trims;
++   if (darwin_reap_locked(retire->dev, retire) == VK_SUCCESS) {
++      const uint32_t pressure = p_atomic_read(&darwin_memory_pressure);
++      if (pressure != retire->pressure_seen)
++         ++retire->cache_stats.reclaims_seen;
++      darwin_cache_trim(retire->dev, retire);
++      darwin_cache_age(retire->dev, retire);
++      darwin_trim_arm(retire);
++   }
++   pthread_mutex_unlock(&retire->lock);
+ }
+ 
+ /* The process's memory-pressure source, made once: libdispatch delivers the kernel's memorystatus levels to it. */
+@@ -831,6 +957,12 @@
+ {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, [] {
++      /* 0009: the reclaim notification of another GPU process (darwin_ask_reclaim): the cache goes back now, as on memory pressure. */
++      int token = 0;
++      notify_register_dispatch(DARWIN_RECLAIM_NOTIFICATION, &token, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(int) {
++         p_atomic_inc(&darwin_memory_pressure);
++         darwin_kick_devices();
++      });
+       /* Also the process's own limit (libdispatch's DISPATCH_MEMORYPRESSURE_PROC_LIMIT_WARN 0x10 and _CRITICAL 0x20, source_private.h):
+        * jetsam ends a process at its footprint limit with no system-wide level reached, and a cached BO's CPU view counts in that
+        * footprint (as IOKit-mapped memory) -- a widget extension or a daemon with a limit of tens of MiB. */
+@@ -844,7 +976,7 @@
+                                          dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+       if (!source)
+          return;
+-      dispatch_source_set_event_handler_f(source, [](void *) { p_atomic_inc(&darwin_memory_pressure); });
++      dispatch_source_set_event_handler_f(source, [](void *) { p_atomic_inc(&darwin_memory_pressure); darwin_kick_devices(); });
+       dispatch_activate(source);
+    });
+ }
+@@ -901,6 +1033,7 @@
+    for (unsigned i = kept; i < total; ++i)
+       retire->entries[(retire->head + i) % retire->capacity] = {};
+    retire->count = kept;
++   darwin_trim_arm(retire);   /* 0009: something cached or waiting: the idle trim gives it back if nothing else does */
+    return VK_SUCCESS;
+ }
+ 
+@@ -910,10 +1043,59 @@
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    pthread_mutex_lock(&retire->lock);
+    VkResult result = darwin_reap_locked(dev, retire);
+-   if (result == VK_SUCCESS)
++   if (result == VK_SUCCESS) {
+       darwin_cache_trim(dev, retire);
++      darwin_cache_age(dev, retire);   /* 0009 */
++   }
+    pthread_mutex_unlock(&retire->lock);
+    return result;
++}
++
++/* 0009: a BoAlloc that found no memory (darwin_bo_init) waits for the other GPU processes' caches: the first wait asks them for it
++ * (darwin_ask_reclaim), each one reaps this process's own freed BOs. False: give up (five waits, or a whole series failed less than a
++ * second ago). */
++static uint64_t darwin_retry_failed_ns;   /* when the last whole series failed; 0 after one that succeeded */
++static bool
++darwin_retry_wait(struct darwin_retire_state *retire, unsigned retries)
++{
++   if (retries >= 5)
++      return false;
++   if (!retries) {
++      const uint64_t failed = p_atomic_read(&darwin_retry_failed_ns);
++      if (failed && os_time_get_nano() - failed < 1000000000ull)
++         return false;
++      darwin_ask_reclaim(retire);
++   }
++   usleep(4000u << retries);
++   pthread_mutex_lock(&retire->lock);
++   ++retire->cache_stats.retries;
++   if (darwin_reap_locked(retire->dev, retire) == VK_SUCCESS)
++      darwin_cache_trim(retire->dev, retire);
++   pthread_mutex_unlock(&retire->lock);
++   return true;
++}
++
++/* 0009: the series' outcome, on stderr the first time and then every 10th, 100th, ... of each. */
++static void
++darwin_retry_done(struct darwin_retire_state *retire, unsigned retries, bool made)
++{
++   if (!retries)
++      return;
++   static uint64_t outcomes[2];
++   p_atomic_set(&darwin_retry_failed_ns, made ? 0 : os_time_get_nano());
++   if (made) {
++      pthread_mutex_lock(&retire->lock);
++      ++retire->cache_stats.retry_wins;
++      pthread_mutex_unlock(&retire->lock);
++   }
++   const uint64_t n = p_atomic_inc_return(&outcomes[made]);
++   uint64_t mark = 1;
++   while (mark < n)
++      mark *= 10;
++   if (mark == n)
++      mesa_loge("NativeAdreno: a BoAlloc found no memory; every GPU process was asked for its cached BOs; %s after %u wait%s "
++                "(%llu time%s)", made ? "made" : "still none", retries, retries == 1 ? "" : "s", (unsigned long long)n,
++                n == 1 ? "" : "s");
+ }
+ 
+ static VkResult
+@@ -1068,6 +1250,7 @@
+       }
+    }
+ 
++   unsigned retries = 0;   /* 0009 */
+    for (bool flushed = false; !reused;) {
+       VkResult result = VK_SUCCESS;
+       if (lazy_vma)
+@@ -1099,8 +1282,17 @@
+             if (any)
+                continue;
+          }
++         /* 0009: no memory even with this process's cache given back: every GPU process is asked for its cache and the BO is tried
++          * again after 4, 8, 16, 32 and 64 ms (once a whole series failed, not again for a second: a process that cannot have memory
++          * must not stall each allocation). */
++         if (kr == kIOReturnNoMemory && darwin_retry_wait(retire, retries)) {
++            ++retries;
++            continue;
++         }
++         darwin_retry_done(retire, retries, false);
+          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoAlloc failed: 0x%x", kr);
+       }
++      darwin_retry_done(retire, retries, true);
+ 
+       NativeAdrenoAbiBoMap map = {
+          .handle = reply.handle,
+@@ -1725,15 +1917,57 @@
+    darwin_stats_state = retire;
+    darwin_watch_memory_pressure();
+    retire->pressure_seen = p_atomic_read(&darwin_memory_pressure);
++   /* 0009: the idle trim's timer, never armed until something is cached or waits for its fence (darwin_trim_arm). Without it (no
++    * queue or source) the cache only ages at allocations, as before plus the age. */
++   retire->dev = dev;
++   retire->trim_queue = dispatch_queue_create("org.unixnu.piano.gpu-trim", DISPATCH_QUEUE_SERIAL);
++   if (retire->trim_queue)
++      retire->trim_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, retire->trim_queue);
++   if (retire->trim_timer) {
++      dispatch_set_context(retire->trim_timer, retire);
++      dispatch_source_set_event_handler_f(retire->trim_timer, darwin_trim_fire);
++      dispatch_source_set_timer(retire->trim_timer, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
++      dispatch_activate(retire->trim_timer);
++      pthread_mutex_lock(&darwin_devices_lock);
++      for (unsigned i = 0; i < ARRAY_SIZE(darwin_devices); ++i)
++         if (!darwin_devices[i]) {
++            darwin_devices[i] = retire;
++            break;
++         }
++      pthread_mutex_unlock(&darwin_devices_lock);
++   }
+    return VK_SUCCESS;
+ }
+ 
++/* 0009: the idle trim stops before anything it uses goes: out of the device list, the source cancelled, a handler that runs waited for. */
+ static void
++darwin_trim_stop(struct darwin_retire_state *retire)
++{
++   if (!retire->trim_timer)
++      return;
++   pthread_mutex_lock(&darwin_devices_lock);
++   for (unsigned i = 0; i < ARRAY_SIZE(darwin_devices); ++i)
++      if (darwin_devices[i] == retire)
++         darwin_devices[i] = NULL;
++   pthread_mutex_unlock(&darwin_devices_lock);
++   dispatch_source_cancel(retire->trim_timer);
++   dispatch_sync_f(retire->trim_queue, NULL, [](void *) {});
++   dispatch_release(retire->trim_timer);
++   retire->trim_timer = NULL;
++}
++
++static void
+ darwin_device_finish(struct tu_device *dev)
+ {
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   if (retire) {   /* 0009: before the connection closes (the handler calls the kernel) */
++      darwin_trim_stop(retire);
++      if (retire->trim_queue)
++         dispatch_release(retire->trim_queue);
++      retire->trim_queue = NULL;
++   }
+    /* Closing the connection makes the kernel drain the GPU and free every object this client created. */
+    dw_close_connection();
+-   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    if (retire) {
+       /* Some CreateDevice failure paths already destroyed the VMA heap/mutex.
+        * Never return ranges here: they are either gone or about to be destroyed. */

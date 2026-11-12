@@ -62,6 +62,14 @@ The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
   than all before it in the process: `TU: info: NativeAdreno: a BO of N MiB, the largest so far (per-object limit L MiB, GPU window W
   MiB)`. `tu_darwin_limits()` (exported) gives the frontend the limits it answers Metal with.
   [Allocation limits and the video wallpaper](#allocation-limits-and-the-video-wallpaper-2026-11-12).
+- `0009-turnip-darwin-idle-trim-reclaim.patch` (2026-11-12): every BO is wired memory of the system, and the first desktop sessions ran
+  out of it. A cached BO no allocation took within `TU_DARWIN_BO_CACHE_AGE_MS` (2000) goes back to the kernel, by a one-shot timer
+  armed only while something is cached or a freed BO waits for its fence (an idle process with nothing cached is never woken), which
+  also reaps the freed BOs of a process that went idle; the cache budgets follow the connection's window (render server 96 + 16 MiB as
+  before, a large client 32 + 8, a small one 16 + 4); a BoAlloc that finds no memory asks every GPU process for its cache (the Darwin
+  notification `org.unixnu.piano.gpu-reclaim`) and is tried again over about 120 ms (`TU: error: NativeAdreno: a BoAlloc found no
+  memory; every GPU process was asked for its cached BOs; made after N waits`).
+  [Out of device memory on the first desktop sessions](#out-of-device-memory-on-the-first-desktop-sessions-2026-11-12).
 
 The frontend patches (`tooling/metal/turnip-a830/frontend/`, applied in order after the k27 tree's `scripts/piano-frontend-patch.py`):
 - `0001-…patch`: the stderr copy of its `NBLOG` lines is rate-limited per call site (8 lines, then the 16th, 32nd, … with the count);
@@ -856,3 +864,108 @@ tint), with `still-wallpaper: ... login picture written` on the console and no V
 Built offline 2026-11-12 in an agent worktree (the 0064 kernel, 24 native kexts, every vtable check 0 problem slots, the native kext
 rule passed): KC `a5706b5b5e5c76f0…`; `ram-gfx-video` `5cba0b63fdb287cb…` (seed `921b5d98…`), `ram-gfx-fix` `7f36b4eaaf6223bf…` (seed
 `d10bc6d3…`), the dump `f07f312ad8e9116a…`; `verify-ram-images.py` PASS for each. Rebuild them in the main checkout before a run.
+
+## Out of device memory on the first desktop sessions, 2026-11-12
+
+The owner's first real desktop sessions (image desk-dev, built 17:20 from main; console `logs/usb-console/20261112-172703-port0`):
+WindowServer aborted twice within five minutes (17:32:22, pid 98; 17:34:05, pid 1463) and the session fell back to the login window.
+Both crash reports: SIGABRT in SkyLight's `MetalBacking::AbortWithTextureInfo` <- `MetalIOSurfaceBacking::PrepareForUse` <-
+`CaptureSurfaceMetal::Populate` <- `_XHWCaptureWindowListToIOSurface` (a window capture; SkyLight aborts by design when the texture
+over a window's surface cannot be made). WindowServer's log just before: `native-metal: texture (fmt 80 128x128x1 ...) refused:
+texture: OutOfMemory(Device)` (also 436x24, 448x64, 102x102), `texture over buffer refused: texture over buffer: OutOfMemory(Device)`,
+`surface texture 1720x998 fmt 80 plane 0 (at 0, row 6912): refused (5)`, SkyLight's `MTLTexture creation failed - Size=[1720 x 998]`.
+
+### Which limit: XNU's wired pages, behind a fragmented pool
+
+- **A small texture asks for a block.** The runtime (metal2vulkan) places textures and buffers in pooled blocks of `VkDeviceMemory`
+  and makes a new block when none has room (a request larger than half a block takes a dedicated one): a 128x128 texture refused
+  with OutOfMemory(Device) is a block that could not be made. The kernel's refusals of those minutes are all block-sized: 16, 24, 28,
+  34 and 49 MiB.
+- **The kernel's answer** (17:31:22, 60 s before the first abort): `gpu call failed: WindowServer[98] slot 0 BoAlloc -> 0xe00002bd
+  (NoMemory)`, `gpu BoAlloc refused: 49 MiB: pool 168 MiB free, largest 19; then no pages from XNU (0xe00002bd NoMemory)`; then 24
+  MiB (127 free, largest 16), 28 MiB (79 free, largest 14), WindowServer's 10th, 100th, 1000th and 10000th failure within 38 s, and
+  the same for Siri AI, iconservicesagent and Terminal (16 MiB each, `256 kept for the render server`). So: the BO pool (1024 MiB)
+  had room in total but no extent as large as the block (a pooled BO was one extent), and outside the pool XNU gave no pages.
+- **XNU's rule** (xnu `vm_page_alloc_list`, under `kernel_memory_allocate`, which IOBufferMemoryDescriptor's scattered allocation
+  reaches): when no free page can be taken and `ptoa(vm_page_wire_count + vm_page_free_target) + size > max_mem` the allocation is
+  refused at once (KERN_RESOURCE_SHORTAGE: the IOBufferMemoryDescriptor is null, NoMemory) instead of waiting for the pageout daemon.
+  That is a limit on *wired* memory, not on free memory: `memory_pressure` said 22 % free, no process was under memory pressure, and
+  `vm_stat` at 17:40 had 1,519,852 pages wired (5.8 GiB of the 8 GiB XNU sees), 40 MB free.
+- **The second WindowServer** (pid 1463) failed the same way unseen: the console's failure lines were counted by process name, and
+  pid 98's count was past 10000. Its neighbour's line at the time: `gpu BoAlloc refused: 34 MiB: pool 71 MiB free, largest 66, 256 kept
+  for the render server; then no pages from XNU` (VTDecoderXPCService[1966]). A new process now starts its own count (below).
+- **Not the limit**: the per-object limits and windows (WindowServer 1349 of 3584 MiB, VTDecoderXPCService 144 of 320, Siri AI 261 of
+  320), the VM's table ranges (333350 of 524288 at the worst, 63.5 %) and records (3569 of 32768), Turnip's heap, the import count
+  (`imp` 3507 then, back to 128 when WindowServer went: they follow the process; 1812 in the third session and flat).
+- **Why the pool is 1024, not 2048**: the board asks a quarter of the RAM (`board: BO pool 2048 MiB (a quarter of the RAM, 512..2048;
+  RAM 8192 MiB)`) and S3 halves the request until a physically contiguous reservation succeeds: 20 s into this boot there was no 2 GiB
+  run, 1 GiB was had (`row2 MEM pool 1024`).
+
+The GPU's share of the wired memory at the first abort (`gpu va/map: ... 2257 MiB mapped; pool 955/1024 MiB, 872 MiB outside it`):
+the pool, 1024 MiB (wired for the boot from S3 on, used or not), own BOs outside it 872 MiB (scattered wired pages), imports pinned
+about 430 MiB (the mapped total less the pool's use and the outside BOs), page tables and span records a few MiB: about 2.3 GiB. Beside
+it the volatile Data disk held 1378 MiB (NativeRamBlock, `held in chunks`). Who held the GPU memory: WindowServer 1349 MiB (own BOs
+about 1200, imports about 150), iconservicesagent 263 (its peak 766), Siri AI 261, VTDecoderXPCService 144 (peak 300), Dock 74,
+WallpaperAgent 66, Terminal 56, ControlCenter 26, eleven more 1 MiB each.
+
+### The fixes in this tree
+
+- **The pool's room is used (PianoA830).** A BO no single free extent holds is cut from several, the largest first and the last one
+  best fit, at most 64 (`NativeAdrenoPoolMaxPieces`; one span and one GPU range each, no kernel mapping), for a write-combined pool and
+  a BO that did not ask for one span (`NativeAdrenoMemory::allocatePooled`). The 49 MiB block of 17:31:22 would have been three or four
+  extents of the 168 MiB free, and every 16 MiB block after it came out of the pool's 79-140 MiB. Extents are counted per piece, so the
+  free list's bound holds; a BO's pieces all go back at its release. Host tests (`test_memory`, ADRENO830_MACOS): 12 MiB from three 4
+  MiB gaps (three spans in order, zeroed by span, write-combined by flag, given back and merged), a one-span request not cut, more than
+  is free refused with nothing taken, 65 pieces refused and 64 made from 200 single free pages, nothing lost.
+- **Each process's failures are named (PianoA830).** The failure lines' counts (`gpu call failed: ... N times`) restart for a new
+  process of the same name (the event key keeps the pid): a second WindowServer's first refused BoAlloc is on the console with its
+  reason (`test_vamap`: 10000 failures of pid 98, then pid 1463's first written).
+- **Idle processes give their memory back (Turnip 0009).** Cached BOs older than 2 s go back, by a one-shot timer that runs only while
+  something is cached or a freed BO waits for its fence, and reaps a process's freed BOs whose fence passed after it went idle (before,
+  both waited for the process's next allocation or free: an idle Siri AI or iconservicesagent kept its cache and its last frees for
+  good). The cache budgets follow the window: 96 + 16 MiB for the render server as before, 32 + 8 for a large client, 16 + 4 for a
+  small one (19 clients at 112 MiB each could have held 2 GiB).
+- **A BoAlloc without memory gets the others' caches (Turnip 0009).** After its own cache went back, the process posts
+  `org.unixnu.piano.gpu-reclaim`; every GPU process gives its whole cache back at once (its timer fires now), and the BoAlloc is tried
+  again after 4, 8, 16, 32 and 64 ms, reaping its own freed BOs before each. A whole series that failed makes the next BoAlloc fail at
+  once for a second (no allocation stalls 120 ms in a row). This is the transient refusal SkyLight's capture cannot survive: with it
+  the capture's surface texture is expected to be made after the wait instead of WindowServer aborting (not yet seen on the tablet).
+
+- **What a large client holds is on the console (PianoA830).** With the address-space lines, every 30 s while they change, each client
+  of 128 MiB or more gets `gpu va/sizes: 0:WindowServer <1M n/MiB 1-16M n/MiB 16-64M n/MiB 64M+ n/MiB imp n/MiB` (own BOs by size,
+  then imports): the runtime's blocks, large textures or conversions and imports told apart, for WindowServer's 1.2 GiB.
+
+Checked on the host: `run-a830-host-tests.py` (the whole suite in both passes with the kext build; test_memory's pool pieces,
+test_vamap's sizes line and per-process counts, test_userclient's size classes), `check-turnip-a830-host.py` 24 of 24, two of them
+new: `deferred_bo-no-memory` (BoAlloc answered NoMemory twice: made after the waits, with its stderr line; seven times: refused after
+the whole series, 124 ms at least; once more within the second: refused at once) and `deferred_bo-idle-trim` (a freed BO cached, then
+given back to the kernel with no further call, `TU_DARWIN_BO_CACHE_AGE_MS=200`); the image build below.
+
+### Still open (what to read on the next run)
+
+- Wired memory is the budget: every GPU byte is wired (the pool for the boot, a BO while it lives, an import while it is mapped).
+  Apple's GPUs page resources in and out; here a pageable BO design (pages wired while a job uses them) would be the real fix.
+  Until then: with XNU's 13 GiB window (being raised from 8 GiB) the pool's default stays a quarter of the RAM up to 2048 MiB, the
+  volatile Data disk's budget 2048 MiB (`data-volatile-mib`), and the GPU's peak above the pool goes to scattered wired pages; with
+  about 2.9 GiB wired by everything else (17:40: 5.8 GiB wired less the GPU's 1.47 and the disk's 1.44), a GPU peak of 2.5-3 GiB and
+  the disk's 2 GiB, about 5 GiB of the 13 stay pageable.
+- The runtime keeps one empty block per memory pool for good (metal2vulkan's `KEPT_EMPTY_BLOCKS`, the prebuilt bridge): Turnip's
+  timer cannot return memory the runtime still holds.
+- WindowServer's own 1.2 GiB: what it is (the runtime's blocks, its surface textures, the 4:4:4 video conversion of 92.8 MiB a
+  texture where the wallpaper is `'444v'`; the desktop's `'x420'` frames of the third session were sampled in place, `0.0M of device
+  memory`) needs the frontend's per-process allocation lines; the kernel lines only show the total.
+- Lines to read: `gpu BoAlloc refused: ...` per process; `gpu va/sizes: ...` (what WindowServer's own BOs are); `TU: error: NativeAdreno: a BoAlloc found no memory; ... made after N waits`
+  (the reclaim worked) or `... still none ...` (real exhaustion); the `NativeAdreno BO cache:` third line (given back after the age,
+  idle trims, reclaims asked and answered); `row2 MEM pool ... sc<MiB>` (own BOs outside the pool: should stay low while the pool has
+  room); `vm_stat`'s wired pages.
+
+Built offline 2026-11-12 in an agent worktree (the 0064 kernel, `PIANO_GPU=2 PIANO_VMM_PRESENT=0`): 25 native kexts, every vtable
+check 0 problem slots, the native kext rule passed; KC `8ec1c9ae2b1bfa04…` (it has `va/sizes: %u:%s <1M`), Turnip
+`libvulkan_freedreno.dylib` CDHash `7e41dda9bb1a8a9363f95c54e1f0b92d81cae6a0` (0001-0009), the plugin's `3b48e955…` unchanged, seed
+`1ee2a4ed…`; `build-desktop-images.sh desk` from them: `ram-desk` `a58e8fd2239540c2…`, its checks PASS. The desktop images now
+refuse a collection without the va/sizes line and a seed without 0009's message. In the main checkout, after this tree's commits:
+
+```sh
+K27_KERNEL=<k27 tree>/out/k27/kernel-k27-0064-native.macho PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh
+DESK_RTC_OFFSET=1794397906 tooling/k27/build-desktop-images.sh desk-dev
+```

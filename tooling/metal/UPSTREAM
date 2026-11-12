@@ -14,7 +14,11 @@ Mesa (MIT): https://github.com/Droid-VM/mesa cecc0e96d7193c72356a31abb0cc589e4fc
   of the subpass first cleans the CCU, invalidates UCHE and waits for the earlier draws' writes; TU_DEBUG=nofbflush / fbflushall),
   0008-turnip-darwin-object-limit-window.patch (2026-11-12: the per-object limit is Query's max_bo_bytes within the connection's GPU
   window, the device's own connection's when it differs from the probe's; a BO past its cache budget asked at its own size, not its
-  size class; the largest BOs on stderr; tu_darwin_limits for the Metal frontend)
+  size class; the largest BOs on stderr; tu_darwin_limits for the Metal frontend),
+  0009-turnip-darwin-idle-trim-reclaim.patch (2026-11-12: cached BOs older than TU_DARWIN_BO_CACHE_AGE_MS and freed BOs whose fence
+  passed go back by a one-shot timer armed only while something is held; cache budgets by the connection's window; a BoAlloc that
+  finds no memory asks every GPU process for its cache through the Darwin notification org.unixnu.piano.gpu-reclaim and is tried
+  again over about 120 ms)
   (MIT, as the files).
   Build options: UniXNU-turnip build-turnip-macos-piano.py's, with -Dtu-darwin-abi-dir pointing at the ABI below.
 Kernel ABI (MIT): https://github.com/Shad0w23333/Adreno830 1a1321056ffc5428ae925f4680093718b46ca7c2, NativeAdrenoABI.h
