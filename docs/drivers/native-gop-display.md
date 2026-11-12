@@ -13,6 +13,13 @@
 > copy of the frame that replaced it. All on by default; `native-gop-display-cursor=0` and `native-gop-display-defer=0` give the
 > old behaviour back (the fence rule stays).
 >
+> **2026-11-12 evening, damage copies (§5c; host-tested, built, not run on the tablet yet):** the idle desktop's kernel_task (38-60 %
+> in `top`, desk-dev) is the copy: every frame read whole (27 MB, 20-27 ms) at 10-20 frames a second. The swap carries WindowServer's
+> dirty region (the family keeps it at +417 of the request, found in its own code); a fence-covered frame now recomposes only that
+> region and the cursor's rectangles, an audit of 32 panel points outside it after each such frame turns damage off for the boot at the
+> first difference, and the whole panel is composed again every 10 s while frames come. The 60 Hz VBL tick stops while nothing moves.
+> `native-gop-display-damage=0` gives the behaviour before back (every frame whole, the tick while the display is on).
+>
 > **2026-11-12, the bluish verbose boot (§5b; host-tested, built, not run yet):** `start()` no longer paints the panel blue-grey.
 > Under `-v` it leaves the boot console's text alone (the console repaints only what changes, so the colour stayed around the text,
 > crossed by lines); otherwise it clears to black. `native-gop-display-fill=0x203050` brings the old colour back.
@@ -70,7 +77,9 @@ relaunched 6 times in 240 s. Without it and without a display, WindowServer laun
 | `native-gop-display-cursor=0\|1\|2` | 1 | layer 1, WindowServer's cursor (§5a): 0 not drawn (before 2026-11-12: the pointer is invisible); 1 its glyph rectangle (IOSurface's origin and extents) blended at the layer's origin; 2 the whole cursor surface (should the extents ever be wrong) |
 | `native-gop-display-defer=0\|1\|2` | 2 | when a swap completes (§5a): 0 at once (before 2026-11-12: the copy thread may still read a surface WindowServer draws into again); 1 at once unless the copy thread reads a surface the swap takes off the screen, then once that read is done; 2 once the swap's own job is done (flip mode always uses 2) |
 | `native-gop-display-gpu-fence-ms=N` | 1000 | the hang guard of the fence wait (10..10000): a job whose swap's GPU fence has not passed by then is not drawn (the previous frame stays), its swap completes, and the ticks retry until the fence passes. Before 2026-11-12: 50 ms, then copied anyway |
-| `native-gop-display-vbl=0` | 1 | the VBL tick (60 Hz) runs always, as before 2026-11-12. With 1 it stops while the display is off (`piano-display-power` false) once nothing is queued, waiting, refreshed or retried: a submitted swap starts it again, so does the display's power-on (line `display off: the VBL tick stopped, nothing queued or to refresh (stop N; ...)`). `docs/power.md` "Idle wakeups by driver" |
+| `native-gop-display-vbl=0\|1\|2` | 2 (1 with `native-gop-display-damage=0`) | the VBL tick (60 Hz). 0: it runs always, as before 2026-11-12. 1: it stops while the display is off (`piano-display-power` false) once nothing is queued, waiting, refreshed or retried: a submitted swap starts it again, so does the display's power-on (line `display off: the VBL tick stopped, nothing queued or to refresh (stop N; ...)`). 2 (§5c): it also stops while the display is on and nothing moves (no refresh counting down, no undrawn frame to retry, the queue empty or behind a waiting swap), flip mode's rule: the family calls `swap_begin_gated` itself when a swap becomes ready. The `period N ms: N VBL ticks, N times the tick stopped ...` line counts it. `docs/power.md` "Idle wakeups by driver" |
+| `native-gop-display-damage=0\|1` | 1 | §5c: 1 a fence-covered frame whose swap names its dirty region recomposes only that region and the cursor's rectangles (an audit after each, damage off for the boot at the first difference); 0 every frame composed whole and the tick as before (`native-gop-display-vbl=1`): the behaviour before 2026-11-12's damage copies |
+| `native-gop-display-damage-full=S` | 10 | §5c: with damage copies, the whole panel is composed again when S seconds passed since the last whole composition and a frame comes (0: never, 1..3600) |
 | `native-gop-display-thumb=N` | 30 | a thumbnail of the frame on the panel (see §5) on the first frame and then every N s; 0: none |
 | `native-gop-display-copy=BITS` | 0 | the copy's cost (§6 risk 3): bit 0 skips the refresh copies of a frame whose copy waited for the GPU's fence and saw it retired (the last one, tick 30, still runs): since 2026-11-12 that is the default (`native-gop-display-refresh=1`), and bit 0 turns `=2` back into it; bit 1 maps surfaces cacheable and cleans/invalidates by VA exactly the rows (or row spans) each job reads, after its fence wait. Bit 1 not run on the tablet yet; the periodic `copy mode ...` line says what it cost |
 | `piano-backlight=2` | off | (PianoBacklight's argument) each display power change is also handed to PianoBacklight ([backlight.md](backlight.md)) |
@@ -250,7 +259,7 @@ the next frame flips again. A cursor showing up over a flipped frame composes th
 (dpu.md §4.2.6) is later.
 
 **Host tests** (`package/NativeGopDisplay/tests/gop_host.cpp`, run by `tooling/k27/build-native-gop-display.sh` before the build,
-812 checks, 52 of them §5b's start fill): rectangles and clamping, the cursor's damage; `round(a*b/255)` exhaustively, the blend against a reference over 200,000
+1078 checks: 52 of them §5b's start fill, 266 §5c's damage): rectangles and clamping, the cursor's damage; `round(a*b/255)` exhaustively, the blend against a reference over 200,000
 pixels, saturation; all 65536 half floats, the extended-range table, every base format; the glyph rectangle from the six words
 (missing, empty, outside, cut, hot spot outside); the cursor off each edge, far away, partly on; 600 random scenes of composed rows and
 damage rectangles against a per-pixel reference (every base format, narrow bases, no base, cursor sub-rectangles); the layer rules;
@@ -266,6 +275,12 @@ seed): the race of 2026-11-11 reproduced. A slow GPU (frames of 30-90 ms against
 no frame in progress is ever read, and the finished frame ends on the panel. Flip mode never leaves a flipped frame on the panel while a
 cursor is on it. In every mode the family's queue never stalls (a swap queued with none current); with `=2` and in flip mode swaps
 queue behind the one that waits (hundreds of times a run: queue6's climbing `ticks stalled` reproduced and told apart), with `=0` never.
+Damage (§5c): the region's decoding (bit, sane words, clipping), the audit points (never in an excluded rectangle), the jobs' damage
+and its merges, the plans (first frame, flips, the cursor moved or not, a refresh's box, nothing to draw), the idle tick's rule; and the
+simulation with a scene WindowServer changes in parts and names in each swap: with damage copies the panel equals the reference at
+every idle moment and at the end in copy and flip mode, frames cost about a sixth of the pixels of whole copies, never a read of a
+frame in progress; a region that leaves a quarter of each change out trips the audit once (damage off) and the run still ends right; a
+slow GPU's frames (fence waits that gave up) are never composed from their damage.
 
 **The next attended run** (the desktop run of gpu-userspace.md, "The next desktop run (2026-11-12)": no argument of this
 section is needed, all is default):
@@ -352,6 +367,79 @@ PIANO_FAST_BOOT=1 PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=300 \
 PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-power=1" tooling/k27/build-native-image.sh   # gop-quiet
 ```
 
+## 5c. Damage copies and the idle tick (2026-11-12 evening)
+
+**What was measured.** In the desk-dev runs of 2026-11-12 (logged in, the desktop still, the still wallpaper) `top` over ssh had
+kernel_task at 38-60 % of a core. NativeGopDisplay's 10 s lines account for it: every frame was composed whole, and WindowServer
+swapped 10-20 frames a second with nothing visibly moving. `logs/usb-console/20261112-185044`: 99-212 copies a block at a mean of
+21.6-28.9 ms (read 17-18 ms of it: uncached loads of the 27 MB surface), 21-61 % of a core in copies alone; `20261112-204330`: about
+71 a block at 21.8 ms (15 %), 7-9 frames a second. Plus 60 VBL ticks a second while the display is on.
+
+**The ABI fact** (corrects risk 3 below, which said nothing in this ABI carries a dirty region). The family keeps the client's dirty
+region in the swap request: `IOMobileFramebufferLegacy::swap_submit(IOMFBSwapRec *, ...)` copies 16 bytes of the record (+664) to the
+request's +417 and the low bit of rec +716 to +552, and `getCurrentDirtyRegion_gated()` hands +417 out when that bit is set (kc27.bin,
+read with the k27 tree's `scripts/kc-disasm.py`, as the earlier offsets; `kSwapDirtyRegion` in the source has the addresses). The 16
+bytes are an `IOMFBRect`, the type of the layers' rectangles beside it (source +17 + 16 i, destination +81 + 16 i; layer 1's
+destination is the cursor's origin +97 that AppleParavirtDisplay passes as ints): x, y, width, height. Taken as panel pixels of what
+differs from the frame swapped before (a panel's partial update). Whether macOS 27's WindowServer fills it for this display, and in
+which units, is what the first run's `dirty region of swap N` lines say; the audit below guards the meaning.
+
+**The design** (`GopCompose.h`, host-tested; `NativeGopDisplay.cpp`):
+- `program_hardware_gated` reads the region with each new frame (`dirtyRegion`: only with the bit, words past 2^16, a float or a flag
+  word, are no region; clipped to the panel; an empty one means nothing of layer 0 changed) and logs the first ones with layer 0's own
+  rectangles.
+- A frame's job carries its damage, or needs the whole panel (no region, layer 0 off, damage off). Jobs merged in the copy thread's
+  slot keep the union: the frames merged were never drawn.
+- The copy thread composes a frame from its damage only when damage is on and no audit failed, the frame's GPU fence covered it (a frame
+  without fences, or whose wait gave up, is composed whole with its refresh copies, as before), the boot framebuffer is on the panel
+  and holds the composition (not the first frame, not after a flip or an undrawn frame), and the whole composition is not due
+  (`native-gop-display-damage-full`, every 10 s while frames come). The plan is the frame's damage plus, when the cursor moved or
+  changed, its old and new rectangles (an unchanged cursor stays drawn; where the damage meets it the row blends it again). A frame
+  with an empty region draws nothing. The last refresh (tick 30) of a covered frame recomposes the box of what was drawn since the last
+  whole composition.
+- The audit: after each damage frame 32 panel pixels outside the plan's rectangles and the cursor's (a small generator, other points
+  each time) are read from the new frame, converted as the composition does, and compared with the boot framebuffer (one uncached load
+  each way, ~20 us). One that differs means the region left a change out: damage goes off for the boot, the whole panel is composed at
+  once, and the line `damage: a frame's dirty region ... left out a change: panel (X, Y) showed #..., the frame has #...` says where.
+  The periodic whole composition mends what a region misses between audits within 10 s.
+- The VBL tick stops while nothing moves (`native-gop-display-vbl=2`, flip mode's rule: no refresh counting down, no undrawn frame,
+  the queue empty or behind a waiting swap). Nothing depends on it: the family calls `swap_begin_gated` when a swap becomes ready
+  (`swap_queue_finalize_gated` calls `on_swap_queued`, then `swap_begin_gated`), a deferred completion calls it, so does the power-on.
+  The 10 s lines are timed by the clock now (they counted calls) and say how long their period was.
+- A surface's memory is prepared once, when it is mapped, and completed when its map is dropped (before: around every job, the ~300 us
+  `prepare` of each copy, most of a small damage copy's cost).
+
+**What it costs, expected** (inference from the measured rates, not measured yet): a damage frame reads only its region (uncached at
+~1.6 GB/s: a 400x40 clock or menu bar item, 64 KB, ~40 us; a 128x128 cursor box 64 KB) plus the audit's ~20 us; the 10-20 frames a
+second of the still desktop then cost well under 1 % of a core instead of 15-60 %, if those frames' regions are small. A frame whose
+region is the whole panel (a video wallpaper, a full-screen animation, scrolling) costs what it did: flips are the answer there (dpu.md
+§4.2). The whole composition every 10 s is ~22 ms in 10 s (0.2 %). With the tick stopped the display adds no wakeups while nothing
+moves.
+
+**Console lines** (in the 10 s block, besides §5's):
+```
+NativeGopDisplay: damage: a fence-covered frame whose swap names its dirty region recomposes only that region ... (once, at start)
+NativeGopDisplay: dirty region of swap N: valid 1 words X Y W H -> rect X,Y WxH; layer 0 source 0,0 3200x2136 dest 0,0 3200x2136   (the first 12)
+NativeGopDisplay: period 10016 ms: N VBL ticks, N times the tick stopped while nothing moved
+NativeGopDisplay: damage: N of N frames from their dirty regions, mean P% of the panel, N us mean, N us max (N with nothing of the
+                  frame to draw, N refreshes of what was drawn); whole: N without a region, N not fence-covered, N periodic, N other
+                  (first, after a flip or an undrawn frame, damage off); N of N new frames named a region; audit N points, 0 differed
+```
+Reading them: `valid 0` in every `dirty region` line and `damage: none of WindowServer's first 100 frames named a dirty region`
+mean this WindowServer does not send one: every frame is whole as before (the tick still stops). `words` that look like 1600x1068
+coordinates (points, not pixels) trip the audit at once; the line names the point. `whole: N not fence-covered` large means the GPU's
+fence wait gives up (gpu.md). `copies mean` in the old line now counts only whole compositions.
+
+**The image** (2026-11-12, desk-dev's arguments; built from this worktree's KC; `piano-wifi=6 piano-wifi-iova=1` dropped, nothing of
+this needs them): see the commit's report for the path and digest. The owner logs in, leaves the desktop still for two minutes, moves
+the pointer, types in a text field, drags a window, then over ssh:
+```sh
+top -l 3 -s 5 -n 8 -o cpu -stats pid,command,cpu,time   # kernel_task, WindowServer
+```
+and the console's `damage:` and `period` lines. A/B: the same image with `DESK_EXTRA="native-gop-display-damage=0"` is the behaviour
+before (every frame whole, the tick while on). Proof: kernel_task's %CPU on the still desktop against the 38-60 % of the desk-dev runs,
+the `damage:` line's frames from their regions and their mean area, the `period` line's ticks near 0 while still.
+
 ## 6. Risks
 
 1. **WindowServer needs a Metal device. Natively there is none, and this blocks the desktop, not the display.** In the
@@ -386,9 +474,9 @@ PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-power=1" tooling/k
    ~39 ms, of which ~34 ms read the surface (~0.8 GB/s: single uncached loads), ~1.4 ms write the framebuffer (write-combined)
    and ~2.5 ms prepare/map. Each swap is followed by up to six refresh copies (ticks 1, 2, 4, 8, 16, 30), so even a blinking
    text cursor (about two swaps a second) can cost 12-14 copies a second, roughly half a CPU core. Evaluation (2026-11-11), for battery life:
-   - *Damage regions:* the family's swap gives the driver whole layer surfaces; nothing in the IOMFB ABI this kext uses carries a
-     dirty region. Comparing against the previous frame per tile still needs the whole source read, which is the cost (34 of
-     39 ms); it would only save the 1.4 ms write. Not done.
+   - *Damage regions:* (2026-11-11) "nothing in the IOMFB ABI this kext uses carries a dirty region" was wrong: the swap request
+     has WindowServer's dirty region at +417 (§5c, 2026-11-12, damage copies on by default). Comparing against the previous frame per
+     tile would still need the whole source read, which is the cost; the region avoids the read.
    - *Zero-copy scanout* (the DPU's source address at the swap's surface, `display.md` §4 "Direct flip"): needs the DPU pipe
      readout (M2b, not run), the display SMMU stream's context under Gunyah (unknown) and page tables for surfaces that are not
      physically contiguous. The facts are not solid: not done. Design and the read-only survey that settles the facts (B1a,
@@ -403,7 +491,8 @@ PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-power=1" tooling/k
    - *Since 2026-11-12, default:* bit 0's rule (`native-gop-display-refresh=1`; the 10 s block's `N refresh copies not needed`
      line counts what it saves), and a pointer move costs only its two rectangles (§5a; the `cursor: N updates ... mean N us`
      line), not a frame copy.
-   - Left: the 60 Hz VBL timer runs while nothing is shown (60 wakeups a second at idle).
+   - Left (until 2026-11-12): the 60 Hz VBL timer ran while nothing was shown (60 wakeups a second at idle); since §5c it stops while
+     nothing moves (`native-gop-display-vbl=2`).
 4. **The display is not `AppleParavirtDisplay`.** WindowServer's paravirt handling (`SLCADisplay::read_pv_preferences`,
    naming the display by `IOMFBUUID`) does not apply to it. The display UUID is then WindowServer's own, kept in the Data
    volume, and a touch driver cannot name the display by `IOMFBUUID` the way the VM-era HID kext did.

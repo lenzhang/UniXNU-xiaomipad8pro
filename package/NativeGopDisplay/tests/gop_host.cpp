@@ -609,6 +609,193 @@ static void testRefresh()
   CHECK(job.kind == Job::kFull && !job.base && pipe.refreshLeft == 0 && !pipe.refreshJob(&r) && !pipe.forcedRefreshJob(&r));
 }
 
+// --------------------------------------------------------------------------------------------------------------------- damage
+static void testDamage()
+{
+  // the swap's dirty region: only with its bit, words that are panel pixels, clipped to the panel
+  const uint32_t ok[4] = {100, 200, 300, 40}, past[4] = {3100, 2100, 300, 100}, empty[4] = {5, 5, 0, 9}, floaty[4] = {0x44480000, 0, 16, 16};
+  CHECK(!dirtyRegion(false, ok, 3200, 2136).known);
+  CHECK(!dirtyRegion(true, nullptr, 3200, 2136).known);
+  DirtyRegion d = dirtyRegion(true, ok, 3200, 2136);
+  CHECK(d.known && (d.rect == Rect{100, 200, 300, 40}));
+  d = dirtyRegion(true, past, 3200, 2136);
+  CHECK(d.known && (d.rect == Rect{3100, 2100, 100, 36}));
+  d = dirtyRegion(true, empty, 3200, 2136);
+  CHECK(d.known && d.rect.empty());                           // known: nothing of layer 0 changed
+  CHECK(!dirtyRegion(true, floaty, 3200, 2136).known);         // a float or a flag word is no region
+  const uint32_t big[4] = {0, 0, 65536, 65536}, bigger[4] = {0, 0, 65537, 10};
+  CHECK(dirtyRegion(true, big, 3200, 2136).known && (dirtyRegion(true, big, 3200, 2136).rect == panelRect(3200, 2136)));
+  CHECK(!dirtyRegion(true, bigger, 3200, 2136).known);
+  // the audit points: never inside an excluded rectangle, on the panel, other points each time, none when all is excluded
+  uint32_t state = 1;
+  const Rect ex[3] = {{0, 0, 1600, 2136}, {2000, 100, 128, 128}, {}};
+  bool outside = true, onPanel = true;
+  unsigned total = 0;
+  AuditPoints first = auditPoints(state, 3200, 2136, ex, 3);
+  for (int round = 0; round < 200; round++) {
+    const AuditPoints p = round ? auditPoints(state, 3200, 2136, ex, 3) : first;
+    total += p.count;
+    for (unsigned i = 0; i < p.count; i++) {
+      if (inside(ex[0], p.x[i], p.y[i]) || inside(ex[1], p.x[i], p.y[i])) outside = false;
+      if (p.x[i] < 0 || p.x[i] >= 3200 || p.y[i] < 0 || p.y[i] >= 2136) onPanel = false;
+    }
+  }
+  CHECK(outside && onPanel && first.count == kAuditPoints && total > 199 * kAuditPoints);
+  const AuditPoints second = auditPoints(state, 3200, 2136, ex, 3);
+  CHECK(second.x[0] != first.x[0] || second.y[0] != first.y[0]);
+  const Rect all = panelRect(64, 40);
+  CHECK(auditPoints(state, 64, 40, &all, 1).count == 0 && auditPoints(state, 0, 40, nullptr, 0).count == 0);
+  CHECK(auditPoints(state, 64, 40, nullptr, 0, 8).count == 8 && auditPoints(state, 64, 40, nullptr, 0, 99).count == kAuditPoints);
+  // the jobs: a frame with a region names it (damage on), without one or with damage off the whole panel; layer 0 off, whole;
+  // a cursor job nothing of layer 0; a countdown refresh no area; a forced one the whole panel
+  int a, b, k;
+  Pipeline pipe;
+  pipe.damage = true;
+  SwapLayers w;
+  w.mask = 1;
+  w.surface[0] = &a;
+  w.dirty = dirtyRegion(true, ok, 3200, 2136);
+  LayerChange ch;
+  Job j = pipe.swapJob(w, true, 1, false, &ch);
+  CHECK(j.kind == Job::kFull && !j.frameAll && (j.frameDamage == Rect{100, 200, 300, 40}));
+  w.surface[0] = &b;
+  w.dirty = DirtyRegion();
+  j = pipe.swapJob(w, true, 2, false, &ch);
+  CHECK(j.kind == Job::kFull && j.frameAll && j.frameDamage.empty());
+  pipe.damage = false;
+  w.surface[0] = &a;
+  w.dirty = dirtyRegion(true, ok, 3200, 2136);
+  CHECK(pipe.swapJob(w, true, 3, false, &ch).frameAll);
+  pipe.damage = true;
+  SwapLayers c;
+  c.mask = 2;
+  c.surface[1] = &k;
+  j = pipe.swapJob(c, false, 0, false, &ch);
+  CHECK(j.kind == Job::kCursor && !j.frameAll && j.frameDamage.empty());
+  SwapLayers off;
+  off.mask = 1;
+  off.dirty = dirtyRegion(true, ok, 3200, 2136);
+  CHECK(pipe.swapJob(off, false, 0, false, &ch).frameAll);   // layer 0 off: black everywhere
+  w.surface[0] = &b;
+  pipe.swapJob(w, true, 4, false, &ch);
+  Job r;
+  CHECK(pipe.refreshJob(&r) && r.refresh && !r.frameAll && r.frameDamage.empty());
+  CHECK(pipe.forcedRefreshJob(&r) && r.frameAll);
+  // merges: the union of what both had to compose; a whole one makes the whole
+  Job f1, f2;
+  f1.kind = f2.kind = Job::kFull;
+  f1.frameAll = f2.frameAll = false;
+  f1.frameDamage = {10, 10, 20, 20};
+  f2.frameDamage = {100, 50, 5, 5};
+  Job m = mergeJobs(f1, f2);
+  CHECK(!m.frameAll && (m.frameDamage == Rect{10, 10, 95, 45}));
+  Job cur;
+  cur.kind = Job::kCursor;
+  cur.frameAll = false;
+  m = mergeJobs(f1, cur);
+  CHECK(m.kind == Job::kFull && !m.frameAll && (m.frameDamage == f1.frameDamage));
+  m = mergeJobs(cur, f2);
+  CHECK(!m.frameAll && (m.frameDamage == f2.frameDamage));
+  Job whole;
+  whole.kind = Job::kFull;
+  CHECK(mergeJobs(f1, whole).frameAll && mergeJobs(whole, f2).frameAll && mergeJobs(whole, f2).frameDamage.empty());
+  // the plan
+  const Rect panel = panelRect(3200, 2136), cursorA{500, 500, 128, 128}, cursorB{520, 510, 128, 128};
+  PanelState p;
+  Job frame;
+  frame.kind = Job::kFull;
+  frame.base = &a;
+  frame.frameAll = false;
+  frame.frameDamage = {100, 200, 300, 40};
+  Plan plan = planJob(p, frame, Rect{}, panel, true);
+  CHECK(plan.full && !plan.damage);                          // the first frame: the boot framebuffer does not hold it yet
+  commitJob(p, plan, false, cursorA);
+  CHECK(p.current && p.sinceFull.empty());
+  plan = planJob(p, frame, cursorA, panel, false);
+  CHECK(plan.full && !plan.damage);                          // no damage verdict: whole, as before
+  plan = planJob(p, frame, cursorA, panel, true);
+  CHECK(plan.damage && !plan.full && plan.count == 1 && (plan.rect[0] == frame.frameDamage) && (plan.frameRect == frame.frameDamage));
+  CHECK(planArea(plan) == 300 * 40);
+  commitJob(p, plan, false, cursorA);
+  CHECK(p.current && (p.sinceFull == frame.frameDamage) && (p.cursor == cursorA));
+  plan = planJob(p, frame, cursorB, panel, true);           // the frame and a cursor move: the damage, the cursor's box
+  CHECK(plan.damage && plan.count == 2 && (plan.rect[0] == frame.frameDamage) && (plan.rect[1] == unite(cursorA, cursorB)));
+  commitJob(p, plan, false, cursorB);
+  Job near = frame;
+  near.frameDamage = {600, 560, 100, 100};                   // overlapping the cursor, whose image changed: one rectangle
+  near.overlayChanged = true;
+  plan = planJob(p, near, cursorB, panel, true);
+  CHECK(plan.count == 1 && (plan.rect[0] == unite(near.frameDamage, cursorB)) && (plan.frameRect == near.frameDamage));
+  commitJob(p, plan, false, cursorB);
+  CHECK((p.sinceFull == unite(frame.frameDamage, near.frameDamage)));
+  Job nearSame = near;                                       // the same, the cursor unchanged: only the frame (blended where they meet)
+  nearSame.overlayChanged = false;
+  plan = planJob(p, nearSame, cursorB, panel, true);
+  CHECK(plan.count == 1 && (plan.rect[0] == nearSame.frameDamage));
+  Job nothing = frame;
+  nothing.frameDamage = Rect();
+  plan = planJob(p, nothing, cursorB, panel, true);
+  CHECK(plan.damage && plan.count == 0);                     // nothing changed: nothing drawn
+  plan = planJob(p, nothing, Rect{}, panel, true);
+  CHECK(plan.damage && plan.count == 1 && (plan.rect[0] == cursorB));   // the cursor hides: only its rectangle
+  Job past2 = frame;
+  past2.frameDamage = {3100, 2100, 500, 500};
+  plan = planJob(p, past2, cursorB, panel, true);
+  CHECK((plan.frameRect == Rect{3100, 2100, 100, 36}));      // clipped
+  Job refresh;
+  refresh.kind = Job::kFull;
+  refresh.refresh = true;
+  refresh.frameAll = false;
+  refresh.base = &a;
+  plan = planJob(p, refresh, cursorB, panel, true);         // a refresh of a covered frame: what was drawn since the last whole one
+  CHECK(plan.damage && (plan.frameRect == p.sinceFull) && plan.count == 1);
+  plan = planJob(p, refresh, cursorB, panel, false);
+  CHECK(plan.full);                                          // not covered: the whole panel, as before
+  Job everything = frame;
+  everything.frameAll = true;
+  CHECK(planJob(p, everything, cursorB, panel, true).full);
+  plan = planJob(p, everything, cursorB, panel, true);
+  commitJob(p, plan, false, cursorB);
+  CHECK(p.sinceFull.empty());
+  // flip mode: a frame without a cursor is offered to the DPU; flipped, the next frame with a cursor is whole (the boot framebuffer
+  // is stale); back on it, frames are damage copies again
+  Job fl = frame;
+  fl.flip = true;
+  plan = planJob(p, fl, Rect{}, panel, true);
+  CHECK(plan.tryFlip && plan.damage && !plan.bootBack);
+  commitJob(p, plan, true, Rect{});
+  CHECK(p.flipped && !p.current && p.sinceFull.empty());
+  plan = planJob(p, fl, cursorA, panel, true);
+  CHECK(plan.full && plan.bootBack && plan.cursorForced && !plan.tryFlip);
+  commitJob(p, plan, false, cursorA);
+  plan = planJob(p, fl, cursorA, panel, true);
+  CHECK(plan.damage && plan.cursorForced && !plan.bootBack && !plan.tryFlip);
+  plan = planJob(p, fl, Rect{}, panel, true);
+  CHECK(plan.tryFlip && plan.damage);
+  commitJob(p, plan, false, Rect{});                         // refused: composed from its damage, still the boot framebuffer
+  CHECK(!p.flipped && p.current);
+  // addRect: overlaps folded, three at most
+  Plan q;
+  addRect(q, Rect{0, 0, 10, 10});
+  addRect(q, Rect{100, 0, 10, 10});
+  addRect(q, Rect{5, 5, 100, 2});                            // reaches both: one rectangle
+  CHECK(q.count == 1 && (q.rect[0] == Rect{0, 0, 110, 10}));
+  addRect(q, Rect{});
+  addRect(q, Rect{0, 100, 1, 1});
+  addRect(q, Rect{0, 200, 1, 1});
+  addRect(q, Rect{0, 300, 1, 1});
+  CHECK(q.count == 3);
+  // the damage verdict and the idle tick
+  CHECK(damageAllowed(true, true, false) && !damageAllowed(false, true, false) && !damageAllowed(true, false, false) &&
+        !damageAllowed(true, true, true));
+  for (int stop = 0; stop < 2; stop++)
+    for (unsigned left : {0u, 1u, kRefreshTicks})
+      for (int unfinished = 0; unfinished < 2; unfinished++)
+        for (int waiting = 0; waiting < 2; waiting++)
+          for (int queued = 0; queued < 2; queued++)
+            CHECK(vblIdleStops(stop, left, unfinished, waiting, queued) == (stop && !left && !unfinished && (waiting || !queued)));
+}
+
 // ------------------------------------------------------------------------------------------------------------------ simulation
 namespace sim {
 static constexpr int64_t kVbl = 16667;   // us
@@ -635,12 +822,20 @@ struct Config {
   int64_t duration = 3000000;
   unsigned seed = 3;
   bool flipRefusesSome = false;
+  // Damage (2026-11-12): what WindowServer's swaps say of their dirty region (0: nothing, the valid bit clear; 1: the part of the scene
+  // the frame changed; 2: only the top-left quarter of it, a region that leaves changes out), and the driver's side
+  // (native-gop-display-damage, the periodic whole composition).
+  int dirty = 0;
+  bool damageMode = false;
+  int64_t fullPeriod = 400000;
 };
 struct Result {
   unsigned torn = 0, garbage = 0, idleChecks = 0, idleMismatches = 0, timeouts = 0, frames = 0, swaps = 0, deferred = 0;
   unsigned copies = 0, cursorJobs = 0, skippedRefresh = 0, flips = 0, flippedWithCursor = 0;
   unsigned unfinished = 0, retries = 0, aborted = 0, earlyCompletions = 0;
   unsigned behind = 0, stalled = 0;   // swap_begin_gated left a swap queued behind a waiting one / with none current
+  unsigned damageCopies = 0, auditTrips = 0, auditPoints = 0, periodic = 0;
+  int64_t damageArea = 0, copiedArea = 0;   // pixels composed by damage copies / by every frame's composition
   bool finalMatches = false;
 };
 
@@ -665,6 +860,7 @@ public:
       surfaces.push_back(s);
     }
     panel.assign(kW * kH, 0xff203050);
+    pipe.damage = cfg.damageMode;
   }
   Result run()
   {
@@ -723,7 +919,13 @@ private:
   uint32_t submitted = 0, retired = 0;
   int64_t gpuBusyUntil = 0;
   std::map<uint32_t, int64_t> retireTime;
-  // WindowServer
+  // WindowServer: the scene its frames show (each frame changes a part of it and draws all of it into its framebuffer)
+  std::vector<uint32_t> scene = std::vector<uint32_t>(kW * kH, 0);
+  bool sceneMade = false;
+  // damage on the driver's side
+  bool damageOff = false;
+  uint32_t auditState = 12345;
+  int64_t lastFull = 0;
   int frameNumber = 0;
   int cursorX = -20, cursorY = 3, cursorDx = 3, cursorDy = 2, cursorImage = 0;
   bool cursorVisible = true;
@@ -783,24 +985,47 @@ private:
       gpuBusyUntil = end;
       const uint32_t fence = ++submitted;
       retireTime[fence] = end;
+      // what this frame changes of the scene: mostly a small part, sometimes all of it, sometimes nothing
+      Rect changed;
+      const unsigned roll = random() % 10;
+      if (!sceneMade || roll == 0) {
+        changed = panelRect(kW, kH);
+        sceneMade = true;
+      } else if (roll != 1) {
+        const int32_t w = 1 + int32_t(random() % (cfg.dirty == 2 ? 30 : 16)), h = 1 + int32_t(random() % (cfg.dirty == 2 ? 20 : 10));
+        changed = intersect(Rect{int32_t(random() % kW), int32_t(random() % kH), w, h}, panelRect(kW, kH));
+      }
+      for (int32_t y = changed.y; y < changed.bottom(); y++)
+        for (int32_t x = changed.x; x < changed.right(); x++) scene[size_t(y) * kW + x] = pattern(99, frame, uint32_t(x), uint32_t(y));
+      std::vector<uint32_t> picture = scene;
+      DirtyRegion dirty;
+      if (cfg.dirty) {
+        Rect said = changed;
+        if (cfg.dirty == 2 && !changed.empty()) said = Rect{changed.x, changed.y, (changed.w + 1) / 2, (changed.h + 1) / 2};
+        const uint32_t words[4] = {uint32_t(said.x), uint32_t(said.y), uint32_t(said.w), uint32_t(said.h)};
+        dirty = dirtyRegion(true, words, kW, kH);
+      }
       at(start, [this, &s] {
         markWrite(s);
         s.writing = true;
         for (uint32_t y = 0; y < kH; y++)
           for (uint32_t x = 0; x < kW; x++) *s.pixels.word(x, y) = kGarbage;
       });
-      at(end, [this, &s, frame, fence] {
-        fill(s, frame);
+      at(end, [this, &s, frame, fence, picture] {
+        s.frame = frame;
+        for (uint32_t y = 0; y < kH; y++)
+          for (uint32_t x = 0; x < kW; x++) *s.pixels.word(x, y) = picture[size_t(y) * kW + x];
         s.writing = false;
         retired = std::max(retired, fence);
         wakeFence();
       });
       // the swap goes when the command buffer is scheduled, before the GPU finished it
-      at(now + 200, [this, &s] {
+      at(now + 200, [this, &s, dirty] {
         s.claimed = false;
         SwapLayers l;
         l.mask = 1;
         l.surface[0] = &s;
+        l.dirty = dirty;
         submit(l);
       });
       result.frames++;
@@ -964,6 +1189,27 @@ private:
     }
     return o;
   }
+  // NativeGopDisplay's auditDamage and runJob's answer: points outside the plan and the cursor's rectangles must show the new frame;
+  // one that does not turns damage off and the whole panel is composed at once (the plan given back is that one).
+  void audit(Plan &plan, Surface &base, const Rect &on, const Job &j, const Overlay &o)
+  {
+    Rect exclude[5];
+    unsigned n = 0;
+    for (unsigned i = 0; i < plan.count; i++) exclude[n++] = plan.rect[i];
+    exclude[n++] = panelState.cursor;
+    exclude[n++] = on;
+    const AuditPoints points = auditPoints(auditState, kW, kH, exclude, n, 8);
+    result.auditPoints += points.count;
+    bool bad = false;
+    for (unsigned i = 0; i < points.count; i++)
+      if (panel[size_t(points.y[i]) * kW + points.x[i]] != referencePixel(points.x[i], points.y[i], &base.pixels, nullptr, Overlay(), tables))
+        bad = true;
+    if (!bad) return;
+    result.auditTrips++;
+    damageOff = true;
+    plan = planJob(panelState, j, on, panelRect(kW, kH), false);
+    composeRows(plan, j, o, on, INT64_MAX);
+  }
   // The plan's rows into the panel, the first rows of them only (a refresh stopped part way).
   void composeRows(const Plan &plan, const Job &j, const Overlay &o, const Rect &on, int64_t rows)
   {
@@ -1002,7 +1248,10 @@ private:
       Surface *cursor = nullptr;
       const Overlay o = overlayFor(job, &cursor);
       const Rect on = overlayOnPanel(o, kW, kH);
-      const Plan plan = planJob(panelState, job, on, panelRect(kW, kH));
+      const bool fullDue = cfg.fullPeriod && lastFull && now - lastFull >= cfg.fullPeriod;
+      const bool damageOk = damageAllowed(cfg.damageMode && !damageOff, job.refresh ? frameCovered : covered, fullDue);
+      Plan plan = planJob(panelState, job, on, panelRect(kW, kH), damageOk);
+      if (plan.full && fullDue && !job.refresh && cfg.damageMode && !damageOff && !job.frameAll) result.periodic++;
       if (plan.tryFlip) {
         flipped = !(cfg.flipRefusesSome && random() % 4 == 0);
         if (flipped) {
@@ -1014,6 +1263,7 @@ private:
       if (!flipped && plan.count) {
         Surface *base = job.base ? &surf(job.base) : nullptr;
         cost = plan.full ? cfg.fullCopy : cfg.cursorCopy;
+        if (plan.damage) cost = std::max(cfg.cursorCopy, cfg.fullCopy * planArea(plan) / int64_t(kW * kH));
         unsigned reads = 0;
         for (Surface *s : {base, cursor}) {
           if (!s) continue;
@@ -1033,10 +1283,17 @@ private:
           if (reads < 2) refreshReads[reads] = nullptr;
         } else {
           composeRows(plan, job, o, on, INT64_MAX);
+          if (plan.damage && base) audit(plan, *base, on, job, o);
           commitJob(panelState, plan, false, on);
           if (plan.full) unfinished = false;
         }
-        if (plan.full) result.copies++; else result.cursorJobs++;
+        if (plan.full) lastFull = now;
+        if (!job.refresh && (plan.full || plan.damage)) result.copiedArea += planArea(plan);
+        if (plan.damage && !job.refresh) {
+          result.damageCopies++;
+          result.damageArea += planArea(plan);
+        }
+        if (plan.full) result.copies++; else if (!plan.damage) result.cursorJobs++;
         if (plan.bootBack) flippedSurface = nullptr;
       } else {
         commitJob(panelState, plan, flipped, on);
@@ -1171,6 +1428,64 @@ static void testSimulation()
     }
   }
   CHECK(aborted > 0);   // refresh copies in the way of a swap were cut short
+  // Damage (2026-11-12): WindowServer's frames change a part of the scene and say so in their dirty region. With damage copies the
+  // panel still equals the reference whenever everything is idle and at the end, no copy reads a frame in progress or a surface being
+  // drawn, and the frames cost their region, not the panel; a region that leaves changes out trips the audit once (damage off, the
+  // whole panel at once) and the run still ends right; swaps without a region, or damage off, compose every frame whole.
+  for (unsigned seed = 1; seed <= 6; seed++)
+    for (unsigned buffers : {2u, 3u})
+      for (int flip = 0; flip < 2; flip++) {
+        Config c;
+        c.seed = seed;
+        c.buffers = buffers;
+        c.flipMode = flip;
+        c.flipRefusesSome = flip && seed % 2;
+        c.dirty = 1;
+        c.damageMode = true;
+        const Result r = World(c).run();
+        CHECK(r.torn == 0 && r.garbage == 0 && r.earlyCompletions == 0 && r.stalled == 0);
+        CHECK(r.idleChecks > 3 && r.idleMismatches == 0 && r.finalMatches);
+        CHECK(r.auditTrips == 0 && r.auditPoints > 0);
+        CHECK(r.damageCopies > (flip ? 0u : 20u) && r.damageArea < int64_t(r.damageCopies) * 48 * 32 / 2);   // the cursor is 16x16 of 48x32
+        CHECK(r.flippedWithCursor == 0);
+        if (seed == 1 && buffers == 3)
+          std::printf("sim damage%s: %u frames, %u from their region (mean %lld of %u pixels), %u whole (%u periodic), %u flips, %u audit "
+                      "points\n", flip ? " + flip mode" : "", r.frames, r.damageCopies,
+                      (long long)(r.damageArea / (r.damageCopies ? r.damageCopies : 1)), 48u * 32u, r.copies, r.periodic, r.flips, r.auditPoints);
+        // the same frames whole (damage off, or no region in the swaps): the area every frame cost
+        Config wholeRun = c;
+        wholeRun.damageMode = seed % 2;
+        wholeRun.dirty = seed % 2 ? 0 : 1;
+        const Result w = World(wholeRun).run();
+        CHECK(w.damageCopies == 0 && w.idleMismatches == 0 && w.finalMatches && w.torn == 0 && w.garbage == 0);
+        if (!flip) CHECK(r.copiedArea * 3 < w.copiedArea);
+        if (seed == 1 && buffers == 3 && !flip)
+          std::printf("sim damage: %lld pixels composed for the frames, %lld whole (%s)\n", (long long)r.copiedArea,
+                      (long long)w.copiedArea, wholeRun.damageMode ? "no region in the swaps" : "damage off");
+      }
+  for (unsigned seed = 1; seed <= 6; seed++) {   // a region that leaves part of the change out
+    Config c;
+    c.seed = seed;
+    c.dirty = 2;
+    c.damageMode = true;
+    const Result r = World(c).run();
+    CHECK(r.auditTrips == 1);
+    CHECK(r.finalMatches && r.torn == 0 && r.garbage == 0);
+    if (seed == 1)
+      std::printf("sim damage, a region that leaves changes out: the audit tripped after %u damage copies; %u idle mismatches before\n",
+                  r.damageCopies, r.idleMismatches);
+  }
+  {   // a slow GPU: frames whose fence wait gave up are never composed from their damage (whole, once finished), and it ends right
+    Config c;
+    c.dirty = 1;
+    c.damageMode = true;
+    c.gpuMin = 30000;
+    c.gpuMax = 90000;
+    c.frameMin = 20000;
+    c.frameMax = 80000;
+    const Result r = World(c).run();
+    CHECK(r.timeouts > 0 && r.unfinished > 0 && r.garbage == 0 && r.torn == 0 && r.finalMatches && r.idleMismatches == 0 && r.auditTrips == 0);
+  }
   // a slow GPU (frames of 30-90 ms, the fence wait's hang guard at 50 ms): a frame is never read before the GPU finished it (the
   // previous one stays), the swap completes all the same, the ticks retry, and the finished frame ends on the panel
   for (unsigned seed = 1; seed <= 3; seed++) {
@@ -1376,6 +1691,7 @@ int main()
   testJobs();
   testPanel();
   testRefresh();
+  testDamage();
   testSimulation();
   testStartFill();
   std::printf("%s: %d checks, %d failures\n", failures ? "FAIL" : "ok", checks, failures);

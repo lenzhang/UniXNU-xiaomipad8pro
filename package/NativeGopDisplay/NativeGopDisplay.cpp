@@ -88,6 +88,15 @@ static constexpr unsigned kSwapLayerCount = gopcompose::kLayers;
 // position. So the words are where the surface's pixel (0, 0) goes on the panel. A null layer-1 surface there hides the cursor.
 static constexpr size_t kSwapLayer1X = 97;
 static constexpr size_t kSwapLayer1Y = 101;
+// The swap's dirty region (added 2026-11-12, read the same way from the family's own code in kc27.bin):
+// IOMobileFramebufferLegacy::swap_submit(IOMFBSwapRec *, ...) copies 16 bytes of the client's record (+664) to the request's +417
+// (str q0, [x9, #417]) and the low bit of rec +716 to +552; IOMobileFramebufferLegacy::getCurrentDirtyRegion_gated() (0xfffffe00094c8fec)
+// returns current swap + 417 when +552 bit 0 is set. The 16 bytes are an IOMFBRect (x, y, width, height; GopCompose.h dirtyRegion).
+// The layers' source and destination rectangles beside it: +17 + 16 i and +81 + 16 i (layer 1's destination is +97, the cursor's origin).
+static constexpr size_t kSwapDirtyRegion = 417;
+static constexpr size_t kSwapDirtyValid = 552;
+static constexpr size_t kSwapLayerSourceRect = 17;
+static constexpr size_t kSwapLayerDestRect = 81;
 static constexpr size_t kSwapNext = 3384;          // TAILQ entry of the queue
 static constexpr size_t kSwapPrev = 3392;
 // IOMFBNotifyRequest
@@ -193,7 +202,7 @@ private:
     void stopCopies();
     // The composition (GopCompose.h): the jobs the swaps and the refresh ticks hand the copy thread, what it draws.
     struct Mapped {                   // a surface opened for one job
-        IOMemoryDescriptor *memory;   // prepared
+        IOMemoryDescriptor *memory;   // prepared while its map is kept (SurfaceMap)
         bool cached;
     };
     bool openSource(IOSurface *, gopcompose::RowSource *, Mapped *, bool base);
@@ -201,6 +210,7 @@ private:
     void runJob(const Job &, bool retired, bool covered, bool *flipped);
     bool overlayOf(IOSurface *, int32_t x, int32_t y, gopcompose::Overlay *);
     bool compose(const gopcompose::Plan &, const Job &, IOSurface *base, IOSurface *cursor, const gopcompose::Overlay &, const Rect &onPanel);
+    void auditDamage(const gopcompose::Plan &, const gopcompose::RowSource &base, bool cached, const Rect &cursorNow);
     void queueRefresh(const Job &);
     static void retainJob(const Job &);
     static void releaseJob(const Job &);
@@ -268,12 +278,15 @@ private:
     uint64_t fSubmitTime[16], fFenceWaits, fFenceWaitNs, fFenceWaitMaxNs;   // swap submitted -> programmed (IOSurface fences)
     uint64_t fLastFrameTime, fSecondStart, fSecondFrames, fPeakFps;
     uint64_t fCopyRequestTime, fWakeMaxNs, fWakeLate, fVBLDue, fVBLLateMaxNs, fVBLLate;
-    // The kernel mappings of the last surfaces copied (WindowServer swaps a few framebuffers in turn).
+    // The kernel mappings of the last surfaces copied (WindowServer swaps a few framebuffers in turn). Since 2026-11-12 a surface's
+    // memory is prepared once, when it is mapped, and completed when its map is dropped (it was prepared and completed around every
+    // job: the ~300 us "prepare" of each copy, which would be most of a small damage copy's cost).
     struct SurfaceMap {
         IOSurface *surface;   // retained while mapped
         IOMemoryMap *map;
         uint64_t used;
     };
+    static void dropSurfaceMap(SurfaceMap &);
     static constexpr unsigned kSurfaceMaps = 8;   // the frames and the cursor's images
     SurfaceMap fSurfaceMaps[kSurfaceMaps];
     uint64_t fSurfaceMapClock;
@@ -334,6 +347,27 @@ private:
     // 60 wakeups a second for nothing. native-gop-display-vbl=0: the tick runs always, as before.
     bool fVblDarkStop, fVblStopped;
     uint32_t fVblStops;
+    // native-gop-display-vbl=2 (the default with damage copies, 2026-11-12): the tick also stops while the display is on and nothing
+    // moves (GopCompose.h vblIdleStops); a submitted swap, a deferred completion and the power-on call swap_begin_gated anyway.
+    bool fVblIdleStop, fVblIdle;
+    uint64_t fIdleStops, fTickRuns, fReportNext, fReportStart;
+    // Damage copies (native-gop-display-damage, default 1, 2026-11-12; docs/drivers/native-gop-display.md §5c): a new frame whose
+    // swap carries a dirty region (kSwapDirtyRegion) and whose GPU work was fence-covered recomposes only that region and the cursor's
+    // rectangles, not 27 MB. After each such frame kAuditPoints panel pixels outside the region are compared with the new frame; one
+    // that differs turns damage off for the boot and composes the whole panel at once. The whole panel is composed again at least every
+    // native-gop-display-damage-full seconds (default 10, 0 never) while frames come. 0: every frame whole, the tick as before
+    // (native-gop-display-vbl=1): the behaviour before 2026-11-12's damage copies.
+    uint32_t fDamageMode, fDamageFullS;
+    bool fDamageAuditOff;
+    uint32_t fAuditState, fDirtyLogs;
+    uint64_t fLastFullCompose;
+    uint64_t fDirtyFrames, fPeriodFrames, fDirtyFramesAll;   // new frames whose swap named a region / new frames (this period), named (boot)
+    uint64_t fDamageCopies, fDamageNs, fDamageMaxNs, fDamagePixels, fDamageNothing, fDamageRefreshes;
+    uint64_t fWholeNoRegion, fWholeUncovered, fWholePeriodic, fWholeOther;
+    uint64_t fAuditSamples, fAuditMismatches;
+    bool fAuditFailedNow;                     // copy thread: the job's audit found a pixel the region did not name
+    int32_t fAuditX, fAuditY;
+    uint32_t fAuditShown, fAuditWanted, fAuditBad, fAuditCount;
     void publishDisplayPower(bool on);
     void backlightCallout(bool on);
     // Zero-copy flips (boot-arg native-gop-display-flip=1, with PianoDpu's piano-dpu=2 piano-dpu-flip=4; docs/drivers/dpu.md §4.1;
@@ -597,9 +631,24 @@ bool NativeGopDisplay::start(IOService *provider)
     // piano-display-power is messaged, so PianoPolicy (and any other reader) needs no polling. D6's instance publishes neither.
     if (!fExternal)
         setProperty("piano-display-power-messages", true);
-    unsigned vbl = 1;
+    // Damage copies (2026-11-12, §5c): native-gop-display-damage=0 brings back every frame copied whole and, unless
+    // native-gop-display-vbl says otherwise, the 60 Hz tick while the display is on.
+    fDamageMode = 1;
+    PE_parse_boot_argn("native-gop-display-damage", &fDamageMode, sizeof(fDamageMode));
+    if (fDamageMode > 1)
+        fDamageMode = 1;
+    if (fExternal)   // D6's RAM surface: nothing scans it, nothing to save
+        fDamageMode = 0;
+    fPipe.damage = fDamageMode != 0;
+    fDamageFullS = 10;
+    PE_parse_boot_argn("native-gop-display-damage-full", &fDamageFullS, sizeof(fDamageFullS));
+    if (fDamageFullS > 3600)
+        fDamageFullS = 10;
+    fAuditState = 0x9e3779b9u;
+    unsigned vbl = fDamageMode ? 2 : 1;
     PE_parse_boot_argn("native-gop-display-vbl", &vbl, sizeof(vbl));
     fVblDarkStop = vbl != 0 && !fExternal;
+    fVblIdleStop = vbl >= 2 && !fExternal;
     unsigned backlight = 0;
     PE_parse_boot_argn("piano-backlight", &backlight, sizeof(backlight));
     fBacklightCallout = backlight >= 2 && !fExternal;
@@ -641,6 +690,15 @@ bool NativeGopDisplay::start(IOService *provider)
            fCursorMode == 0 ? "not drawn (native-gop-display-cursor=0)" : fCursorMode == 2 ? "blended, its whole surface" :
                                                                                             "blended (its glyph rectangle, premultiplied alpha)",
            deferNames[fDefer], refreshNames[fRefreshPolicy], fGpuFenceWaitMs);
+    if (fDamageMode)
+        GOPLOG("damage: a fence-covered frame whose swap names its dirty region recomposes only that region and the cursor's (its "
+               "refreshes what was drawn since the last whole one); %u panel pixels outside it are checked after each, one that "
+               "differs turns damage off for the boot; the whole panel again every %u s while frames come%s; the VBL tick %s "
+               "(native-gop-display-damage=0: every frame whole, as before)\n", gopcompose::kAuditPoints, fDamageFullS,
+               fDamageFullS ? "" : " (0: never)", fVblIdleStop ? "stops while nothing moves" : "runs while the display is on");
+    else if (!fExternal)
+        GOPLOG("damage copies off (native-gop-display-damage=0): every frame composed whole; the VBL tick %s\n",
+               fVblIdleStop ? "stops while nothing moves (native-gop-display-vbl=2)" : "runs while the display is on");
     if (fExternal) {
         if (!setupRamSurface()) {
             provider->setProperty("DisplayPortCount", 1ULL, 32);   // WindowServer then waits for the panel alone
@@ -890,6 +948,7 @@ void NativeGopDisplay::plugFired(OSObject *owner, IOTimerEventSource *timer)
 void NativeGopDisplay::vblFired(OSObject *owner, IOTimerEventSource *)
 {
     auto *display = static_cast<NativeGopDisplay *>(owner);
+    display->fTickRuns++;
     uint64_t now = mach_absolute_time(), late = 0;
     if (display->fVBLDue && now > display->fVBLDue)
         absolutetime_to_nanoseconds(now - display->fVBLDue, &late);
@@ -965,8 +1024,40 @@ IOReturn NativeGopDisplay::swap_begin_gated()
     case gopcompose::QueueTick::Idle:
         break;
     }
-    if (++fTicks % (10 * fRefreshHz) == 0 && fSubmitted + fFrames + fDropped + fStalled != fReported) {   // about every 10 s while swaps arrive
+    // About every 10 s while swaps arrive (by the clock since 2026-11-12: the tick stops while nothing moves, so counting its calls no
+    // longer measures time; a period that spans such a stop is longer, and its length is logged).
+    fTicks++;
+    const uint64_t reportNow = mach_absolute_time();
+    uint64_t tenSeconds = 0;
+    nanoseconds_to_absolutetime(10000000000ull, &tenSeconds);
+    if (!fReportNext) {
+        fReportStart = reportNow;
+        fReportNext = reportNow + tenSeconds;
+    }
+    if (reportNow >= fReportNext && fSubmitted + fFrames + fDropped + fStalled != fReported) {
         fReported = fSubmitted + fFrames + fDropped + fStalled;
+        uint64_t periodNs = 0;
+        absolutetime_to_nanoseconds(reportNow - fReportStart, &periodNs);
+        fReportStart = reportNow;
+        fReportNext = reportNow + tenSeconds;
+        GOPLOG("period %llu ms: %llu VBL ticks, %llu times the tick stopped while nothing moved%s\n", periodNs / 1000000, fTickRuns,
+              fIdleStops, fVblIdleStop || fFlipMode ? "" : " (native-gop-display-vbl < 2: it runs while the display is on)");
+        fTickRuns = fIdleStops = 0;
+        if (fDamageMode) {
+            const uint64_t frames = fDamageCopies + fDamageNothing + fWholeNoRegion + fWholeUncovered + fWholePeriodic + fWholeOther;
+            GOPLOG("damage: %llu of %llu frames from their dirty regions, mean %llu.%llu%% of the panel, %llu us mean, %llu us max "
+                  "(%llu with nothing of the frame to draw, %llu refreshes of what was drawn); whole: %llu without a region, %llu not "
+                  "fence-covered, %llu periodic, %llu other (first, after a flip or an undrawn frame, damage off); %llu of %llu new "
+                  "frames named a region; audit %llu points, %llu differed%s\n",
+                  fDamageCopies, frames, fDamageCopies ? fDamagePixels * 1000 / fDamageCopies / (fVideo.v_width * fVideo.v_height) / 10 : 0,
+                  fDamageCopies ? fDamagePixels * 1000 / fDamageCopies / (fVideo.v_width * fVideo.v_height) % 10 : 0,
+                  fDamageCopies ? fDamageNs / fDamageCopies / 1000 : 0, fDamageMaxNs / 1000, fDamageNothing, fDamageRefreshes,
+                  fWholeNoRegion, fWholeUncovered, fWholePeriodic, fWholeOther, fDirtyFrames, fPeriodFrames,
+                  fAuditSamples, fAuditMismatches, fDamageAuditOff ? " (damage off for this boot)" : "");
+            fDamageCopies = fDamageNs = fDamageMaxNs = fDamagePixels = fDamageNothing = fDamageRefreshes = 0;
+            fWholeNoRegion = fWholeUncovered = fWholePeriodic = fWholeOther = fDirtyFrames = fPeriodFrames = 0;
+            fAuditSamples = fAuditMismatches = 0;
+        }
         GOPLOG("%llu swaps submitted, %llu shown, %llu dropped, %llu ticks stalled (current %p), last frame %llu.%llu%% "
               "non-black mean #%06llx centre #%06llx; %llu copies mean %llu us (prepare %llu read %llu convert %llu write %llu) max %llu us, "
               "%llu waits released\n",
@@ -1023,12 +1114,17 @@ IOReturn NativeGopDisplay::swap_begin_gated()
         fVBLDue = 0;
         return kIOReturnSuccess;
     }
-    // Flip mode: no tick while nothing needs one (a deferred swap completes from jobDoneAction, a submitted one calls this anyway).
-    if (fFlipMode && !fPipe.refreshLeft && !__atomic_load_n(&fUnfinished, __ATOMIC_ACQUIRE) &&
-        (fWaitingSwap || !at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))) {
+    // Flip mode, and native-gop-display-vbl=2 (the default with damage copies): no tick while nothing needs one (a deferred swap
+    // completes from jobDoneAction, a ready one makes the family call this, swap_queue_finalize_gated).
+    if (gopcompose::vblIdleStops(fFlipMode || fVblIdleStop, fPipe.refreshLeft, __atomic_load_n(&fUnfinished, __ATOMIC_ACQUIRE),
+                                 fWaitingSwap != nullptr, at<IOMFBSwapIORequest *>(this, kSwapQueueFirst) != nullptr)) {
+        if (!fVblIdle)
+            fIdleStops++;
+        fVblIdle = true;
         fVBLDue = 0;
         return kIOReturnSuccess;
     }
+    fVblIdle = false;
     // The display off: no tick while nothing needs one (the panel is dark; a submitted swap calls this anyway, the power-on restarts it).
     if (gopcompose::vblStops(fVblDarkStop, fPowerPublished && !fPowerPublishedOn, fPipe.refreshLeft,
                              __atomic_load_n(&fUnfinished, __ATOMIC_ACQUIRE), fWaitingSwap != nullptr,
@@ -1098,7 +1194,7 @@ IOReturn NativeGopDisplay::do_power_state_change_gated()
             GOPLOG("display %s: no PianoDpu service (piano-dpu-panel needs piano-dpu=1)\n", on ? "on" : "off");
     }
     powerstate_notify(true, on);
-    if (on && fVblStopped)   // the tick stopped while the display was off: again from now
+    if (on && (fVblStopped || fVblIdle))   // the tick stopped while the display was off (or nothing moved): again from now
         swap_begin_gated();
     return kIOReturnSuccess;
 }
@@ -1188,6 +1284,31 @@ void NativeGopDisplay::program_hardware_gated()
     if (layers.mask & 2) {   // unaligned words
         memcpy(&layers.x1, reinterpret_cast<const uint8_t *>(swap) + kSwapLayer1X, sizeof(layers.x1));
         memcpy(&layers.y1, reinterpret_cast<const uint8_t *>(swap) + kSwapLayer1Y, sizeof(layers.y1));
+    }
+    if ((layers.mask & 1) && layers.surface[0]) {   // a new frame: what of it changed, if the swap says (unaligned words)
+        uint32_t dirty[4];
+        memcpy(dirty, reinterpret_cast<const uint8_t *>(swap) + kSwapDirtyRegion, sizeof(dirty));
+        const bool valid = at<uint8_t>(swap, kSwapDirtyValid) & 1;
+        layers.dirty = gopcompose::dirtyRegion(valid, dirty, uint32_t(fVideo.v_width), uint32_t(fVideo.v_height));
+        fPeriodFrames++;
+        if (layers.dirty.known) {
+            fDirtyFrames++;
+            fDirtyFramesAll++;
+        }
+        // The first regions, with the layer's own rectangles beside them (what WindowServer means by them is read from these lines).
+        if (fDamageMode && (valid || fDirtyLogs < 2) && fDirtyLogs < 12) {
+            fDirtyLogs++;
+            uint32_t source[4], dest[4];
+            memcpy(source, reinterpret_cast<const uint8_t *>(swap) + kSwapLayerSourceRect, sizeof(source));
+            memcpy(dest, reinterpret_cast<const uint8_t *>(swap) + kSwapLayerDestRect, sizeof(dest));
+            GOPLOG("dirty region of swap %u: valid %u words %u %u %u %u -> %s %d,%d %dx%d; layer 0 source %u,%u %ux%u dest %u,%u %ux%u\n",
+                   swapID, valid ? 1u : 0u, dirty[0], dirty[1], dirty[2], dirty[3],
+                   layers.dirty.known ? (layers.dirty.rect.empty() ? "nothing changed:" : "rect") : "none (the frame is composed whole):",
+                   layers.dirty.rect.x, layers.dirty.rect.y, layers.dirty.rect.w, layers.dirty.rect.h, source[0], source[1], source[2],
+                   source[3], dest[0], dest[1], dest[2], dest[3]);
+        }
+        if (fDamageMode && fFrames == 99 && !fDirtyFramesAll)
+            GOPLOG("damage: none of WindowServer's first 100 frames named a dirty region: every frame is composed whole\n");
     }
     noteLayers(layers, swapID);
     if (!fCursorMode) {   // native-gop-display-cursor=0: layer 1 is neither drawn nor held
@@ -1493,22 +1614,51 @@ void NativeGopDisplay::runJob(const Job &job, bool retired, bool covered, bool *
     gopcompose::Overlay o;
     overlayOf(cursor, job.x1, job.y1, &o);
     const uint32_t width = static_cast<uint32_t>(fVideo.v_width), height = static_cast<uint32_t>(fVideo.v_height);
-    const Rect onPanel = gopcompose::overlayOnPanel(o, width, height);
-    const gopcompose::Plan plan = gopcompose::planJob(fPanel, job, onPanel, gopcompose::panelRect(width, height));
+    const Rect onPanel = gopcompose::overlayOnPanel(o, width, height), whole = gopcompose::panelRect(width, height);
+    // Damage (§5c): only for a frame the GPU's fence covered (a refresh: the frame on screen was), never once an audit failed, and not
+    // when the periodic whole composition is due.
+    const uint64_t jobStart = mach_absolute_time();
+    bool fullDue = false;
+    if (fDamageFullS && fLastFullCompose) {
+        uint64_t period = 0;
+        nanoseconds_to_absolutetime(uint64_t(fDamageFullS) * 1000000000ull, &period);
+        fullDue = jobStart - fLastFullCompose >= period;
+    }
+    const bool frameCovered = job.refresh ? fFrameCovered : covered;
+    gopcompose::Plan plan = gopcompose::planJob(fPanel, job, onPanel, whole,
+                                                gopcompose::damageAllowed(fDamageMode && !fDamageAuditOff, frameCovered, fullDue));
     PianoDpuFlipRequest request;
     if (plan.tryFlip && dpuFlip(base, &request)) {
         *flipped = true;
         fFlips++;
+    }
+    if (fDamageMode && !*flipped && job.kind == Job::kFull && !job.refresh) {   // why a frame was composed whole, or that none of it was
+        if (plan.full)
+            ++*(job.frameAll ? &fWholeNoRegion : !frameCovered ? &fWholeUncovered : fullDue ? &fWholePeriodic : &fWholeOther);
+        else if (plan.damage && !plan.count)
+            fDamageNothing++;
     }
     if (!*flipped && plan.count && compose(plan, job, base, cursor, o, onPanel)) {   // a refresh a swap cut short
         fRefreshAborts++;
         gopcompose::abortedJob(fPanel, plan, onPanel);
         return;
     }
+    if (fAuditFailedNow) {   // the region left out a pixel that changed: damage off, the whole panel now
+        fAuditFailedNow = false;
+        fDamageAuditOff = true;
+        GOPLOG("damage: a frame's dirty region %d,%d %dx%d left out a change: panel (%d, %d) showed #%08x, the frame has #%08x (%u of "
+               "%u points differ); damage copies off for this boot, the whole panel composed now (the cursor %d,%d %dx%d)\n",
+               plan.frameRect.x, plan.frameRect.y, plan.frameRect.w, plan.frameRect.h, fAuditX, fAuditY, fAuditShown, fAuditWanted,
+               fAuditBad, fAuditCount, onPanel.x, onPanel.y, onPanel.w, onPanel.h);
+        plan = gopcompose::planJob(fPanel, job, onPanel, whole, false);
+        compose(plan, job, base, cursor, o, onPanel);
+    }
+    if (!*flipped && plan.full && plan.count)
+        fLastFullCompose = jobStart;
     if (!*flipped && plan.count) {
         if (plan.bootBack)   // the copy never shows half done: the boot framebuffer goes back on the panel only now
             dpuFlip(nullptr, &request);
-        if (job.flip && plan.full) {
+        if (job.flip && (plan.full || plan.damage) && !job.refresh) {
             fFlipCopies++;
             if (plan.cursorForced && !fCursorForced++)
                 GOPLOG("flip mode: a cursor is on the panel: frames are composed into the boot framebuffer (the DPU has no cursor "
@@ -1654,11 +1804,10 @@ const uint8_t *NativeGopDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescri
         if (entry.used < slot->used)
             slot = &entry;
     }
-    if (slot->surface) {
-        slot->map->release();
-        reinterpret_cast<OSObject *>(slot->surface)->release();
-        *slot = {};
-    }
+    if (slot->surface)
+        dropSurfaceMap(*slot);
+    if (memory->prepare() != kIOReturnSuccess)
+        return nullptr;
     IOMemoryMap *map = nullptr;
     if (fCopyMode & kCopyCachedRead) {   // native-gop-display-copy bit 1: cacheable, invalidated before each read (compose)
         map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly | kIOMapCopybackCache);
@@ -1670,8 +1819,10 @@ const uint8_t *NativeGopDisplay::surfaceBytes(IOSurface *surface, IOMemoryDescri
     }
     if (!map)
         map = memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
-    if (!map)
+    if (!map) {
+        memory->complete();
         return nullptr;
+    }
     reinterpret_cast<OSObject *>(surface)->retain();
     *slot = {surface, map, ++fSurfaceMapClock};
     *cached = (map->getMapOptions() & kIOMapCacheMask) == kIOMapCopybackCache;
@@ -1733,15 +1884,21 @@ void NativeGopDisplay::stopCopies()
     fCopyLock = nullptr;
 }
 
+// A kept map let go: its memory's prepare() completed (the map's descriptor is the one prepared), the map and the surface released.
+void NativeGopDisplay::dropSurfaceMap(SurfaceMap &entry)
+{
+    if (IOMemoryDescriptor *memory = entry.map->getMemoryDescriptor())
+        memory->complete();
+    entry.map->release();
+    reinterpret_cast<OSObject *>(entry.surface)->release();
+    entry = {};
+}
+
 void NativeGopDisplay::releaseSurfaceMaps()
 {
-    for (SurfaceMap &entry : fSurfaceMaps) {
-        if (!entry.surface)
-            continue;
-        entry.map->release();
-        reinterpret_cast<OSObject *>(entry.surface)->release();
-        entry = {};
-    }
+    for (SurfaceMap &entry : fSurfaceMaps)
+        if (entry.surface)
+            dropSurfaceMap(entry);
 }
 
 // The row buffers (the panel's width) and the conversion tables, once.
@@ -1807,12 +1964,9 @@ bool NativeGopDisplay::openSource(IOSurface *surface, gopcompose::RowSource *sou
                   width, height, format, rowBytes, offset, memory ? static_cast<uint64_t>(memory->getLength()) : 0ull);
         return false;
     }
-    if (memory->prepare() != kIOReturnSuccess)
-        return false;
     bool cached = false;
-    const uint8_t *bytes = surfaceBytes(surface, memory, &cached);
+    const uint8_t *bytes = surfaceBytes(surface, memory, &cached);   // mapped and prepared once, kept for the next jobs
     if (!bytes) {
-        memory->complete();
         GOPLOG("cannot map a %llux%llu surface\n", width, height);
         return false;
     }
@@ -1911,14 +2065,24 @@ bool NativeGopDisplay::compose(const gopcompose::Plan &plan, const Job &job, IOS
             lap(writeNs);
         }
     }
-    if (haveBase)
-        baseMap.memory->complete();
-    if (haveCursor)
-        cursorMap.memory->complete();
+    if (plan.damage && !refresh && !aborted && haveBase)   // a frame from its region: what it left out must still be on the panel
+        auditDamage(plan, baseRows, baseMap.cached, onPanel);
     if (aborted)   // no statistics, no thumbnail (it is taken again)
         return true;
     uint64_t ns;
     absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+    if (plan.damage) {   // a frame (or its refresh) from its damage: the damage line's figures
+        if (refresh) {
+            fDamageRefreshes++;
+            return false;
+        }
+        fDamageCopies++;
+        fDamageNs += ns;
+        if (ns > fDamageMaxNs)
+            fDamageMaxNs = ns;
+        fDamagePixels += uint64_t(gopcompose::planArea(plan));
+        return false;
+    }
     if (!full) {
         fCursorJobs++;
         fCursorNs += ns;
@@ -1954,6 +2118,47 @@ bool NativeGopDisplay::compose(const gopcompose::Plan &plan, const Job &job, IOS
         GOPLOG("frame %llu: %llu of %llu sampled pixels non-black, %llu nonzero in the source, centre #%06x\n", fFrames,
               stats.lit, stats.samples, stats.raw, stats.centre);
     return false;
+}
+
+// After a frame composed from its damage (the copy thread, its surface still prepared): kAuditPoints panel pixels outside the plan's
+// rectangles and the cursor's old and new ones (GopCompose.h auditPoints) must show what the new frame has there, since its dirty
+// region said nothing changed there. Each point's base pixel is read and converted as compose() does and compared with the boot
+// framebuffer (one uncached load each way: some 20 us for the lot; copy mode bit 1 invalidates the pixel's line first). A difference
+// sets fAuditFailedNow (runJob turns damage off).
+void NativeGopDisplay::auditDamage(const gopcompose::Plan &plan, const gopcompose::RowSource &base, bool cached, const Rect &cursorNow)
+{
+    Rect exclude[5];
+    unsigned excluded = 0;
+    for (unsigned i = 0; i < plan.count && i < 3; i++)
+        exclude[excluded++] = plan.rect[i];
+    exclude[excluded++] = fPanel.cursor;   // not committed yet: where the cursor was drawn before this job
+    exclude[excluded++] = cursorNow;
+    const gopcompose::AuditPoints points = gopcompose::auditPoints(fAuditState, uint32_t(fVideo.v_width), uint32_t(fVideo.v_height),
+                                                                  exclude, excluded);
+    unsigned bad = 0;
+    for (unsigned i = 0; i < points.count; i++) {
+        const int32_t x = points.x[i], y = points.y[i];
+        if (cached && uint32_t(x) < base.width && uint32_t(y) < base.height)   // copy mode bit 1: this pixel from memory, as the rows were
+            invalidateForRead(base.bytes + uint64_t(y) * base.rowBytes + uint64_t(x) * gopcompose::bytesPerPixel(base.format),
+                              gopcompose::bytesPerPixel(base.format));
+        const uint32_t count = gopcompose::readBaseSpan(fLine, fRow, y, x, x + 1, &base);
+        gopcompose::convertBaseSpan(fLine, fRow, x, x + 1, count, &base, *fTables);
+        const uint32_t wanted = fLine[x];
+        const uint32_t shown = reinterpret_cast<const volatile uint32_t *>(fScanout + uint64_t(y) * fVideo.v_rowBytes)[x];
+        if (shown != wanted && !bad++) {
+            fAuditX = x;
+            fAuditY = y;
+            fAuditShown = shown;
+            fAuditWanted = wanted;
+        }
+    }
+    fAuditSamples += points.count;
+    fAuditMismatches += bad;
+    if (bad) {
+        fAuditFailedNow = true;
+        fAuditBad = bad;
+        fAuditCount = points.count;
+    }
 }
 
 // One sampled row (every kSampleStep-th pixel of LINE, 0xAARRGGBB as written to the panel) into STATS, and into the thumbnail's cells.

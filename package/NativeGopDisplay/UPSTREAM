@@ -46,3 +46,14 @@ rule: a job is drawn only once the GPU retired its swap's fence (before: 50 ms, 
 (1000) is the hang guard, after which the job is left undrawn and the ticks retry; refresh copies after fence-covered frames only the
 last by default (native-gop-display-refresh=1; 2 the old default), and fence-checked. Flip mode offers a frame to PianoDpu only while
 no cursor is on the panel. native-gop-display-cursor=0 leaves layer 1 undrawn as before.
+
+UniXNU-piano (2026-11-12): damage copies and the idle tick (new code, GopCompose.h, host-tested; docs/drivers/native-gop-display.md
+§5c), on by default, native-gop-display-damage=0 the behaviour before. The swap's dirty region (16 bytes at +417 of the swap request,
+valid when +552 bit 0 is set) and the layers' source and destination rectangles (+17 + 16 i, +81 + 16 i) were read from the family's
+own code in the same collection (IOMobileFramebufferLegacy::swap_submit, which copies them from the client's IOMFBSwapRec +664 / +716 /
++172 / +268, and getCurrentDirtyRegion_gated(); kc27.bin, the k27 tree's scripts/kc-disasm.py), the addresses recorded at
+kSwapDirtyRegion. A fence-covered frame with a region recomposes only it and the cursor's rectangles; points outside it are compared
+with the panel after each such frame (one that differs turns damage off for the boot); the whole panel at least every
+native-gop-display-damage-full seconds. The VBL tick stops while the display is on and nothing moves (native-gop-display-vbl=2, flip
+mode's rule; the family calls swap_begin_gated when a swap becomes ready, swap_queue_finalize_gated); the periodic lines are timed by
+the clock instead of by tick counts.

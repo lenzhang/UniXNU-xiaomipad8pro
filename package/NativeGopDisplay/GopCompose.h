@@ -18,6 +18,9 @@
 //   - The panel (copy thread): flipped or not, whether the boot framebuffer holds the composition, where the cursor was drawn; the
 //     plan of a job (flip it, compose the whole panel, or only the cursor's old and new rectangles).
 //   - Refresh copies: the ticks after a frame (1, 2, 4, 8, 16, 30) and which of them a fence-covered frame still needs.
+//   - Damage (2026-11-12): the swap's dirty region (IOMFBSwapRec's, as the family keeps it in the request), so a frame whose GPU work
+//     was fence-covered recomposes only what changed since the frame before it; the audit points that check the region against the
+//     panel, and the plan's rules for when the whole panel is composed instead.
 //   - The panel before the first frame: left to a verbose boot's text console, black otherwise (startPlan).
 #pragma once
 #include <stdint.h>
@@ -268,14 +271,71 @@ inline void composeRow(uint32_t *line, void *scratch, int32_t y, int32_t x0, int
   blendOverlayRow(line, scratch, y, x0, x1, overlay, o, onPanel);
 }
 
+// --------------------------------------------------------------------------------------------------------------------- damage
+// The swap's dirty region (2026-11-12): IOMobileFramebufferLegacy::swap_submit copies 16 bytes of the client's IOMFBSwapRec (+664)
+// into the request at +417 and the low bit of rec +716 to +552; getCurrentDirtyRegion_gated() hands +417 out when that bit is set
+// (the k27 collection's IOMobileGraphicsFamily, read with the k27 tree's scripts/kc-disasm.py). The 16 bytes are an IOMFBRect, the type
+// of the layers' rectangles beside it (+17 + 16 i source, +81 + 16 i destination, whose words AppleParavirtDisplay passes as ints):
+// x, y, width, height in panel pixels. What the region means is WindowServer's: taken as the part of the frame that differs from the
+// frame swapped before it (a panel's partial update); the audit below checks that against the panel and turns damage off if not.
+// Words that cannot be panel pixels (a coordinate or size past 2^16: a float, a flag word) are no region: the frame is composed whole.
+struct DirtyRegion {
+  bool known = false;   // the swap says what changed (its bit, sane words)
+  Rect rect;            // with known: clipped to the panel; empty means nothing in layer 0 changed
+};
+inline DirtyRegion dirtyRegion(bool valid, const uint32_t *words, uint32_t panelWidth, uint32_t panelHeight)
+{
+  DirtyRegion d;
+  if (!valid || !words) return d;
+  const uint32_t limit = 1u << 16;
+  if (words[0] >= limit || words[1] >= limit || words[2] > limit || words[3] > limit) return d;
+  d.known = true;
+  d.rect = intersect(makeRect(words[0], words[1], int64_t(words[0]) + words[2], int64_t(words[1]) + words[3]),
+                     panelRect(panelWidth, panelHeight));
+  return d;
+}
+// Up to kAuditPoints panel pixels outside a plan's rectangles and the cursor's old and new rectangles (where the panel must still
+// show the frame before: the dirty region said nothing changed there), spread over the panel by a small generator whose state the
+// caller keeps (each job samples other points). The caller compares each point's composition from the new frame with the panel.
+static constexpr unsigned kAuditPoints = 32;
+struct AuditPoints {
+  unsigned count = 0;
+  int32_t x[kAuditPoints], y[kAuditPoints];
+};
+inline uint32_t auditRandom(uint32_t &state)
+{
+  state = state * 1664525u + 1013904223u;   // Numerical Recipes' LCG; the high bits are the usable ones
+  return state >> 8;
+}
+inline bool inside(const Rect &r, int32_t x, int32_t y) {return !r.empty() && x >= r.x && x < r.right() && y >= r.y && y < r.bottom();}
+inline AuditPoints auditPoints(uint32_t &state, uint32_t panelWidth, uint32_t panelHeight, const Rect *exclude, unsigned excludeCount,
+                               unsigned want = kAuditPoints)
+{
+  AuditPoints p;
+  if (!panelWidth || !panelHeight) return p;
+  if (want > kAuditPoints) want = kAuditPoints;
+  for (unsigned tries = 0; tries < 4 * want && p.count < want; tries++) {
+    const int32_t x = int32_t(auditRandom(state) % panelWidth), y = int32_t(auditRandom(state) % panelHeight);
+    bool excluded = false;
+    for (unsigned i = 0; i < excludeCount && !excluded; i++) excluded = inside(exclude[i], x, y);
+    if (excluded) continue;
+    p.x[p.count] = x;
+    p.y[p.count] = y;
+    p.count++;
+  }
+  return p;
+}
+
 // --------------------------------------------------------------------------------------------------------------------- layers
 // One swap as the family hands it over (IOMFBSwapIORequest): bit i of the mask (+984) says layer i is part of it; its surface (+2944
 // + 8 * i) is what the layer shows from then on, nullptr turning it off (AppleParavirtDisplay: a null layer-1 surface hides its host
-// cursor); a layer whose bit is clear stays as it is. Layer 1's origin on the panel (+97, +101) is read when bit 1 is set.
+// cursor); a layer whose bit is clear stays as it is. Layer 1's origin on the panel (+97, +101) is read when bit 1 is set. dirty: the
+// swap's dirty region (above), used for a new frame on layer 0.
 struct SwapLayers {
   uint32_t mask = 0;
   const void *surface[kLayers] = {};
   int32_t x1 = 0, y1 = 0;
+  DirtyRegion dirty;
 };
 struct LayerState {   // what each layer shows
   const void *surface[kLayers] = {};
@@ -326,12 +386,19 @@ struct Job {
   bool fenced = false;    // wait for the GPU's fence first
   uint32_t fence = 0;
   bool flip = false;      // flip mode: a full job may be shown by the DPU itself
+  // What of layer 0 the job must compose (damage, 2026-11-12): frameAll, the whole panel (a frame without a dirty region, layer 0
+  // off, a forced refresh); else only frameDamage (a frame's dirty region, possibly empty; a cursor job's is empty). A refresh of the
+  // countdown has neither: the copy thread recomposes what it drew since its last whole composition, or the whole panel (planJob).
+  bool frameAll = true;
+  Rect frameDamage;
+  bool overlayChanged = false;   // layer 1 was shown, moved, given another image or hidden (a damage plan then redraws its rectangles)
   const void *base = nullptr;      // layer 0 (nullptr: black)
   const void *overlay = nullptr;   // layer 1 (nullptr: hidden)
   int32_t x1 = 0, y1 = 0;
   uint64_t serial = 0;    // the order of the jobs: they run in increasing serials
 };
-// A waiting job and a newer one: the newer state, the larger kind, a refresh only if both were, the fence of whichever has one.
+// A waiting job and a newer one: the newer state, the larger kind, a refresh only if both were, the fence of whichever has one, the
+// union of what both had to compose of layer 0 (the frames merged were never drawn, so each one's change is still to show).
 inline Job mergeJobs(const Job &older, const Job &newer)
 {
   Job j = newer;
@@ -342,6 +409,9 @@ inline Job mergeJobs(const Job &older, const Job &newer)
     j.fenced = true;
     j.fence = older.fence;
   }
+  j.overlayChanged = older.overlayChanged || newer.overlayChanged;
+  j.frameAll = older.frameAll || newer.frameAll;
+  j.frameDamage = j.frameAll ? Rect() : unite(older.frameDamage, newer.frameDamage);
   return j;
 }
 struct Slot {   // the copy thread's one waiting job (under the caller's lock)
@@ -432,17 +502,45 @@ struct PanelState {   // the copy thread's
   bool flipped = false;   // the DPU scans a WindowServer surface, not the boot framebuffer
   bool current = false;   // the boot framebuffer holds the composition (false before the first and while a surface is flipped)
   Rect cursor;            // where the overlay is drawn in the boot framebuffer (empty: nowhere)
+  Rect sinceFull;         // the bounding box of the frames' damage composed since the last whole composition (a refresh's area)
 };
 struct Plan {
   bool tryFlip = false;      // offer the base to the DPU first (flip mode, a swap's full job, no cursor on the panel)
   unsigned count = 0;        // the rectangles to compose into the boot framebuffer (when not flipped)
-  Rect rect[2];
+  Rect rect[3];
   bool full = false;         // rect[0] is the whole panel (statistics and thumbnails come from those)
+  bool damage = false;       // a frame (or its refresh) composed from its damage: frameRect and the cursor's rectangles
+  Rect frameRect;            // with damage: the part of layer 0 recomposed (possibly empty)
   bool bootBack = false;     // then ask the DPU for the boot framebuffer back (flip mode)
   bool cursorForced = false; // flip mode composes because a cursor is on the panel (the DPU has no cursor pipe yet)
 };
-// cursor: the overlay's rectangle on the panel for this job (overlayOnPanel; empty when hidden).
-inline Plan planJob(const PanelState &panel, const Job &job, const Rect &cursor, const Rect &whole)
+// One more rectangle of a damage plan: every rectangle it overlaps is folded into it (again while it grows), then it is added. Composing
+// a pixel twice would be harmless, but costs; a plan gets at most three (the frame's damage and the cursor's two).
+inline void addRect(Plan &plan, const Rect &r)
+{
+  if (r.empty()) return;
+  Rect merged = r;
+  for (bool grew = true; grew;) {
+    grew = false;
+    for (unsigned i = 0; i < plan.count; i++)
+      if (!intersect(plan.rect[i], merged).empty()) {
+        merged = unite(merged, plan.rect[i]);
+        plan.rect[i] = plan.rect[--plan.count];
+        grew = true;
+        break;
+      }
+  }
+  if (plan.count < 3)
+    plan.rect[plan.count++] = merged;
+  else
+    plan.rect[2] = unite(plan.rect[2], merged);
+}
+// cursor: the overlay's rectangle on the panel for this job (overlayOnPanel; empty when hidden). damageOk (the copy thread's verdict,
+// 2026-11-12): a frame may be composed from its damage: damage copies are on for the boot, the frame's GPU work was fence-covered (a
+// refresh: the frame on screen was), no whole composition is due. Then a frame whose job knows its damage, on a boot framebuffer that
+// is on the panel and holds the composition, recomposes only that damage and the cursor's old and new rectangles; every other frame
+// the whole panel, as before.
+inline Plan planJob(const PanelState &panel, const Job &job, const Rect &cursor, const Rect &whole, bool damageOk = false)
 {
   Plan plan;
   if (job.kind == Job::kNone) return plan;
@@ -452,6 +550,16 @@ inline Plan planJob(const PanelState &panel, const Job &job, const Rect &cursor,
     if (panel.flipped && !fullJob && cursor.empty()) return plan;   // still no cursor over the flipped surface
     if (job.flip && !job.refresh && fullJob && job.base && cursor.empty()) plan.tryFlip = true;
     plan.cursorForced = job.flip && !cursor.empty();
+    if (damageOk && fullJob && !job.frameAll && panel.current && !panel.flipped) {
+      plan.damage = true;
+      plan.frameRect = intersect(job.refresh ? panel.sinceFull : job.frameDamage, whole);
+      addRect(plan, plan.frameRect);
+      if (job.overlayChanged || !(panel.cursor == cursor)) {   // an unchanged cursor stays drawn where the frame did not change
+        const Damage d = cursorDamage(panel.cursor, cursor);
+        for (unsigned i = 0; i < d.count; i++) addRect(plan, d.rect[i]);
+      }
+      return plan;
+    }
     plan.rect[0] = whole;
     plan.count = 1;
     plan.full = true;
@@ -462,6 +570,13 @@ inline Plan planJob(const PanelState &panel, const Job &job, const Rect &cursor,
   plan.count = damage.count;
   for (unsigned i = 0; i < damage.count; i++) plan.rect[i] = damage.rect[i];
   return plan;
+}
+// The pixels a plan composes (its rectangles may overlap only by a merge's bounding box, so this is what it costs).
+inline int64_t planArea(const Plan &plan)
+{
+  int64_t area = 0;
+  for (unsigned i = 0; i < plan.count; i++) area += plan.rect[i].area();
+  return area;
 }
 // A refresh stopped part way (abortBusy): its rows were the same frame again, the cursor drawn where it was or where the job had it;
 // the next damage covers both.
@@ -475,12 +590,23 @@ inline void commitJob(PanelState &panel, const Plan &plan, bool flipped, const R
     panel.flipped = true;
     panel.current = false;
     panel.cursor = Rect();
+    panel.sinceFull = Rect();
     return;
   }
   if (!plan.count) return;
-  if (plan.full) panel.current = true;
+  if (plan.full) {
+    panel.current = true;
+    panel.sinceFull = Rect();
+  }
+  if (plan.damage) panel.sinceFull = unite(panel.sinceFull, plan.frameRect);
   panel.cursor = cursor;
   if (plan.bootBack) panel.flipped = false;
+}
+// The copy thread's damage verdict for one job (planJob's damageOk). enabled: native-gop-display-damage and no failed audit;
+// covered: the job's frame (a refresh: the frame on screen) was fence-covered; fullDue: the periodic whole composition is due.
+inline bool damageAllowed(bool enabled, bool covered, bool fullDue)
+{
+  return enabled && covered && !fullDue;
 }
 
 // ------------------------------------------------------------------------------------------------------------- refresh copies
@@ -503,6 +629,14 @@ inline bool refreshTick(unsigned &left, bool *last)
 inline bool vblStops(bool darkStop, bool dark, unsigned refreshLeft, bool unfinished, bool waiting, bool queued)
 {
   return darkStop && dark && !refreshLeft && !unfinished && !waiting && !queued;
+}
+// The tick while the display is on and nothing moves (2026-11-12, native-gop-display-vbl=2, flip mode's rule since 2026-11-11): none
+// once no refresh is counting down, no undrawn job waits for a retry, and the queue is empty or its head waits behind a swap whose
+// completion (jobDoneAction) programs it. The family calls swap_begin_gated itself when a swap becomes ready
+// (swap_queue_finalize_gated: on_swap_queued, then swap_begin_gated), so nothing waits for a tick.
+inline bool vblIdleStops(bool idleStop, unsigned refreshLeft, bool unfinished, bool waiting, bool queued)
+{
+  return idleStop && !refreshLeft && !unfinished && (waiting || !queued);
 }
 // The family's queue as swap_begin_gated leaves it (a VBL tick, a submission, a deferred completion; the periodic line's counters).
 // Behind: a swap queued behind the current one, which waits for its completion rule (native-gop-display-defer, flip mode):
@@ -545,6 +679,7 @@ struct Pipeline {
   unsigned refreshLeft = 0;
   bool pending = false;     // the current swap waits for its completion rule
   uint64_t waitSerial = 0;  // ... the job it waits for (admitSwap)
+  bool damage = false;      // native-gop-display-damage: a new frame's job takes its swap's dirty region
 
   void snapshot(Job &job) const
   {
@@ -554,20 +689,26 @@ struct Pipeline {
     job.y1 = layers.y1;
   }
   // The job a swap needs (kind kNone: none; it then completes at once) and what it did to the layers. A new frame starts the refresh
-  // countdown; layer 0 off ends it.
+  // countdown; layer 0 off ends it. A new frame with a dirty region (and damage on) names what of layer 0 changed; one without, or
+  // layer 0 turned off, needs the whole panel; a cursor change alone, nothing of layer 0.
   Job swapJob(const SwapLayers &swap, bool fenced, uint32_t fence, bool flip, LayerChange *change)
   {
     *change = applySwap(layers, swap);
     Job job;
-    if (change->base || change->baseOff)
+    if (change->base || change->baseOff) {
       job.kind = Job::kFull;
-    else if (change->overlay)
+      job.frameAll = !(change->base && damage && swap.dirty.known);
+      if (!job.frameAll) job.frameDamage = swap.dirty.rect;
+    } else if (change->overlay) {
       job.kind = Job::kCursor;
+      job.frameAll = false;
+    }
     if (change->base)
       refreshLeft = kRefreshTicks;
     else if (change->baseOff)
       refreshLeft = 0;
     if (job.kind == Job::kNone) return job;
+    job.overlayChanged = change->overlay;
     job.fenced = fenced;
     job.fence = fence;
     job.flip = flip;
@@ -575,7 +716,9 @@ struct Pipeline {
     job.serial = ++serial;
     return job;
   }
-  // A VBL tick that programmed no new frame: the refresh job due, if any (none while a swap waits, or with nothing on layer 0).
+  // A VBL tick that programmed no new frame: the refresh job due, if any (none while a swap waits, or with nothing on layer 0). It
+  // names no area: the copy thread recomposes the whole panel, or after a fence-covered frame only what it drew since its last whole
+  // composition (planJob).
   bool refreshJob(Job *job)
   {
     if (pending || !layers.surface[0] || !refreshLeft) return false;
@@ -585,11 +728,12 @@ struct Pipeline {
     job->kind = Job::kFull;
     job->refresh = true;
     job->last = last;
+    job->frameAll = false;
     snapshot(*job);
     job->serial = ++serial;
     return true;
   }
-  // A refresh asked for out of the countdown (a thumbnail that is due on a static screen): it always runs.
+  // A refresh asked for out of the countdown (a thumbnail that is due on a static screen): it always runs, over the whole panel.
   bool forcedRefreshJob(Job *job)
   {
     if (pending || !layers.surface[0]) return false;
