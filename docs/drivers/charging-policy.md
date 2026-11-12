@@ -7,6 +7,10 @@ unchanged) through `package/PianoPower/ChargeLink.h`, host-tested against the DS
 linked into a test KC; **not run on the tablet** (images and expected lines: §14). Backlog B4 (`docs/BACKLOG-hardware.md`).
 The evening runs of 2026-11-11 ([charging.md](charging.md), "Measured 2026-11-11 evening") showed the input path is open with the DSP
 running (397 mA at 5.2 V while 0x2008 reads 100): the input limit is now worth writing.
+**2026-11-12:** run on the tablet (P1, P2, pol-chargesleep): the firmware takes 0x2008 and the bus follows it (900 → 897 mA, 1600 →
+1594 mA; [charging.md](charging.md) "Measured 2026-11-12"). Since then (built, host-tested, not run): the Type-C current **in steps**
+up to 3 A (§15), the input limit written before the charge current when it rises, a write's answer awaited 3 s and a late one still
+taken (§15.3), and the daily profile's charging level 2 (§16; images `ram-chg-*`, §15.5).
 
 ## 0. The answer
 
@@ -17,8 +21,10 @@ running (397 mA at 5.2 V while 0x2008 reads 100): the input limit is now worth w
   30 s report, a notification, `setPowerState`, alike.
 - With `piano-power-policy=1` it replaces PianoMca.c's `policy()` (§8). PianoMca keeps the codec, the one-request queue, the board
   configuration (always first), the port notifications and the UCSI probe.
-- A computer port (CDP) gets the CDP row, 900 mA, whatever its Type-C Rp advertises; `piano-power-rp=1` trusts a 1.5 / 3.0 A Rp up
-  to the 1600 mA ceiling (§13). The board thermistors PianoThermal publishes only ever make it more conservative (§1).
+- A computer port (CDP) gets the CDP row, 900 mA, whatever its Type-C Rp advertises; `piano-power-rp=1` trusts a 1.5 / 3.0 A Rp,
+  since 2026-11-12 in steps from the row up to the Rp current (3 A at most, `piano-power-rp-max`), each step only while the bus holds
+  and the input is used up, one step back for the boot on a sag, a quick detach or a refusal (§15; `piano-power-ramp=0`: the old
+  immediate limit within 1600 mA, §13). The board thermistors PianoThermal publishes only ever make it more conservative (§1).
 - Defaults are today's caution: ceilings ICL 1600 / FCC 1500 mA (PianoMca's allowlist), 5 V only, no float change, Preserve
   Battery Health off. Every planned write passes `piano_charge_write_allowed()`; each new write has a read-back (§7).
 
@@ -67,7 +73,10 @@ bit; a missing one is unknown, never cool. They only ever make charging more con
 **The Type-C current** (`piano-power-rp=1`, §13): a source without a PD contract (SDP, CDP, DCP, float, Type-C) whose Rp advertises
 1.5 A or 3.0 A gets min(Rp, ceiling) when that is above its row; only while a connector thermistor reads and every one that reads is
 below 50 °C; never during a sleep (the row). A bus below 4.5 V under such a limit, or two detaches within 30 s of one taking, end the
-trust for the boot (`RP_DISTRUST`). PD sources keep their contract's 5 V offer.
+trust for the boot (`RP_DISTRUST`). PD sources keep their contract's 5 V offer. **Stepped** (`piano-power-ramp=1`, the default with
+`piano-power-rp=1` since 2026-11-12, §15): from the row in steps of 1500, 2000, 2500, 3000 mA up to min(Rp, `piano-power-rp-max`);
+up to 1500 mA without a connector reading (BC 1.2's CDP/DCP current and the 1.5 A Rp, which the DCP row takes without a thermistor),
+above it only with one below 50 °C; the sag, the quick detach and a refusal each cost one step for the boot instead of the trust.
 
 ## 2. 9 V: fixed PDO and PPS APDO (opt-in, `hv` 1 or 2)
 
@@ -165,7 +174,7 @@ PianoPower's contract (power.md §4): `setPowerState(off)` loops decide/send/ack
 
 | Property | Bytes | Values | When | Read-back |
 |---|---|---|---|---|
-| 0x2008 input limit | 4 | 100..ceiling (A 1600, B 2500) | attach, type / 9 V / re-send, sleep, detach (100) | 0x2008 (the requested value) ±50 mA, two disagreeing → again (three writes at most); verdict: the gauges' current |
+| 0x2008 input limit | 4 | 100..ceiling (A 1600, B 2500; the stepped Type-C current up to 3000, §15) | attach, type / 9 V / re-send, steps, sleep, detach (100) | 0x2008 (the requested value) ±50 mA, two disagreeing → again (three writes at most); verdict: the gauges' current and the bus current 0x20004 |
 | 0x2005 charge current | 4 | 100..ceiling (A 1500, B 3500) | the same, thermal steps | none (reads 0): the acknowledgement; verdict: positive gauges' current ≤ the value at 40–90 % |
 | 0x2003 charge enable | 1 | **0** and 1 | 0: battery-health stop, sleep stop; 1: lifting our stop | 0x2003 every cycle; `STOP_LEAK` |
 | 0x2007 float voltage | 4 (mV) | 4400; 4480, 4060 with `full_charge` | float option | 0x2007 = 2 × mV − 3600 every cycle |
@@ -174,13 +183,16 @@ PianoPower's contract (power.md §4): `setPowerState(off)` loops decide/send/ack
 
 **The codec's allowlist with the policy** (`piano_mca_write_allowed_for`, checked by `piano_mca_queue` before a write is queued
 and again by `piano_mca_next` before it is built; the policy's own `piano_charge_write_allowed` is checked first): PianoMca's
-(0x2008 100–1600, 0x2005 100–1500, 0x2003 = 1, 0x21018 = 5000, the three board values), plus 0x2003 = 0 **only with battery health
+(0x2008 100–1600, up to `piano-power-rp-max` (≤ 3000) only with the stepped Type-C current (`piano_mca_allow_icl`, set from the
+policy's `piano_charge_icl_max`), 0x2005 100–1500, 0x2003 = 1, 0x21018 = 5000, the three board values), plus 0x2003 = 0 **only with battery health
 on**, 0x21018 = 9000 only with `piano-power-hv` ≥ 1, 0x21017 only as the 9 V word (500–3000 mA) with `piano-power-hv=2`. Not
 admitted: 0x2007 (the float option is not offered: `piano-power-fv` does not exist yet), 0x2019 (the built-in policy's opt-in
 un-suspend; it read 0 on 2026-11-11), stage B ceilings (not offered). A write the codec refuses goes back to the policy as refused
 (three: given up until the next attach). Never written: 0x2012 AICL, 0x21002 verify (nothing here authenticates), 0x2100c data
 role, the MiPPS VDMs 0x21003–0x2100a. Order inside a plan: stop,
-charge current, input limit, bus voltage, resume, float. A plan is idempotent: a write the owner could not queue comes back at the
+charge current, input limit, bus voltage, resume, float; since 2026-11-12 an input limit that **rises** goes before the charge
+current (the system gets the input first; the first charge current write made while the input was still at the firmware's 100 mA
+request was answered late twice, every one after the input limit at once: §15.3). A plan is idempotent: a write the owner could not queue comes back at the
 next decision; one planned and unanswered for 10 s is planned again; 3 refusals of one value give up until the next attach, wake
 or generation.
 
@@ -230,7 +242,9 @@ Default `piano-power-policy=0`: none of this runs, PianoMca.c's built-in policy 
 6. **The charging hold**: created on first use (`createPMAssertion(kIOPMDriverAssertionPreventSystemIdleSleepBit, Off, this,
    "com.unixnu.driver.PianoPower.charging-hold")`), set to `plan.hold_awake` after each decision (off during a handover), released at
    shutdown; on only with battery health on.
-7. **Boot arguments**: `piano-power-policy=1`; `piano-power-rp=1` (§13); `piano-power-health=1`, `-health-stop=N`, `-health-resume=N`
+7. **Boot arguments**: `piano-power-policy=1`; `piano-power-rp=1` (§13) with `piano-power-ramp=0|1` (1, the default: the steps of
+   §15) and `piano-power-rp-max=MA` (1500..3000, default 3000); `piano-power-write-ms=MS` (1000..5000, default 3000: how long a write's
+   answer is awaited, §15.3); `piano-power-health=1`, `-health-stop=N`, `-health-resume=N`
    (§5); `piano-power-hv=0|1|2` (2 adds the APDO); `piano-power-write=0` decides for the log only (nothing is sent). Not offered yet:
    `piano-power-fv`, the stage B ceilings, `sleep_charge`, the `setProperties()` switch. `piano-power-unsuspend` stays the built-in
    policy's.
@@ -271,6 +285,13 @@ generations, sleeps, refusals) in which every write the model saw passes the cod
 `policy_host.cpp` adds the Rp row function, the sag, the board holds and the thermistor's derating as pure tests, and the Rp and the
 board temperatures to its random walk (an Rp limit only with the option, a connector reading and no PD contract; a connector hold
 always wins). Both pass under ASan/UBSan.
+2026-11-12 (§15): `policy_host` `testRamp` (the step functions, the allowlist's ceiling, the climb 900 → 3000 at one step per 15 s
+against a 0.21 Ω source, a sag, a quick detach, a refusal, the input not used up, no bus current, a low bus, no connector reading,
+writes off, ramp off, a board hold mid-climb) and the random walk with the steps, a source resistance and a sagging source;
+`power_host` `testMcaLate` (the codec's late answers, unmatched answers, the ICL bound) and `testLinkRamp` (the same against the
+DSP model whose bus follows the limit with the Mac port's 5.23 V and 0.21 Ω, a source that gives way above 2.2 A, a port that trips
+above 2.1 A, a firmware that refuses above 2000 mA, `piano-power-rp-max=2000`, a late answer, a DCP and a PD source), and the link's
+random walk with steps, loads, resistances, trips and late answers.
 
 Covered: every table row and piece; the decisions against a firmware model (writes taken or refused, read back as the real
 firmware does) and a PD source model: 5 V types, refusals, lost limits, generations, thermal steps, the float voltage and its
@@ -406,3 +427,124 @@ sagged under 1.6 A or the port cut out: the Mac's port does not deliver its Rp c
 **Battery health** (`piano-power-health=1`) is not built as a default image: at 97 % it stops charging at once (0x2003 = 0), and the
 reset at the end of a RAM test bypasses the shutdown handover, so the stop would stay in the PMIC until the next DSP start. Run it as
 §7's session L, attended, at 80–90 %, and unplug the cable before the reset (a detach lifts the stop).
+
+## 15. The stepped Type-C current and the write answers (2026-11-12)
+
+Why ([charging.md](charging.md) "Measured 2026-11-12" has the evidence and what is inferred): on the Mac's port the PMIC alone
+(level 1) gives about 1.5 A in (inferred), P2's 1.6 A (measured: 1594 mA) left the packs at −46 mA at the login window, and the
+port advertises 3.0 A on its Rp. More input is the only lever on the cable, and the firmware's own input-current limiting is off
+(0x2012 = 0): nothing walks a limit down that the source or the cable cannot hold. So the policy finds the limit itself, upwards
+only on evidence, and remembers for the boot where it failed.
+
+### 15.1 The steps (`piano-power-rp=1`, `piano-power-ramp=1`, ChargePolicy.c `ramp()`)
+
+| Rule | Value | Why |
+|---|---|---|
+| Target | min(the Rp current, `piano-power-rp-max` (3000), the board holds); a source without a PD contract only | the source's own advertisement (USB Type-C: the Type-C current before BC 1.2); 3.0 A is the most a 5 V Rp can say |
+| Without a connector reading below 50 °C | at most 1500 mA (`RP_WITHHELD` once) | BC 1.2's CDP/DCP current and the 1.5 A Rp: what the DCP row takes without any thermistor |
+| First step | the class row (CDP 900, DCP 1500, …) | what Linux and the earlier runs wrote first; I and P1 had 100 → 900 answered at once |
+| Steps | 1500, 2000, 2500, 3000 mA (≤ 600 mA each) | each firmware ramp short (§15.3); a sag found at most one step late |
+| Up when | the step taken (acknowledged), held 10 s and two decisions after the decision that saw it taken (15 s with the 5 s cycle), the bus ≥ 4.65 V under it, the bus current ≥ the step − max(100 mA, step / 8) | the source has just held this much, and the system and the battery take it all, so more is of use; demand-driven: a light load never climbs |
+| Down at once | a lower target (the Rp gone, a connector at 50 °C, a PD contract, a type change) | |
+| Back one step, ceiling for the boot | the bus < 4.5 V under a step above the row; a detach within 30 s of a step up (planned or taken); the firmware refusing a step three times | a sag means the source or the cable is at its end; a port's over-current cut looks like a detach; a refusal is the firmware's own ceiling |
+| Restart from the row | every attach, a new charger generation, a wake, a board hold (a hot connector or charger) released, 9 V | never straight back up to a step reached before |
+| Sleep handover | the row (as before: nothing watches the bus while asleep) | |
+
+The ceiling only goes down, survives detaches, generations and wakes, and ends with the boot (a different cable tomorrow starts
+fresh). Measured basis for the margins (P1, P2 on the Mac's port): 5.22 V open, 5.05 V at 897 mA, 4.89 V at 1594 mA, about 0.21 Ω
+from the source to the charger, so 3 A would leave about 4.6 V: above the 4.5 V sag rule, below the 4.65 V needed to go higher.
+`piano-power-ramp=0` keeps the 2026-11-11 behaviour (the Rp limit at once within 1600 mA, a sag ends the trust).
+
+The charge current stays the class's (CDP 900 mA, derated −300 mA/°C from 39 °C): the steps raise what the system can take from the
+port, not how hard the cells are charged. JEITA (0–55 °C) and the 4400 mV float stay the firmware's.
+
+### 15.2 What the log says
+
+```
+PianoPower: piano-power-rp=1 piano-power-ramp=1: a source without PD that advertises 1.5 or 3.0 A on its Rp is stepped from its class row to that current, at most 3000 mA ...
+PianoPower: charger writes: an answer is awaited 3000 ms (reads 1000 ms); one that comes later is still taken and logged
+PianoPower: mca: write input limit (0x2008) = 900: ok (0)            (the input first when it rises, then the charge current)
+PianoPower: mca: write charge current (0x2005) = 900: ok (0)
+PianoPower: policy: input steps: up 900 -> 1500 mA (towards 3000 mA, Rp 3000 mA): it held 5040 mV with 897 mA taken
+PianoPower: policy: input steps: at 2500 mA (towards 3000 mA): the bus is below 4.65 V under it; bus 4610 mV, 2498 mA   (once per step and reason)
+PianoPower: policy: input steps: back from 2500 mA: the bus sagged below 4.5 V under it (bus 4420 mV); 2000 mA is the ceiling for the rest of this boot
+PianoPower: [126s] input: bus 4720 mV 2490 mA, limit 2500 mA asked, 0x2029 2500; steps 2500 mA (holding) of 3000, ceiling 0; writes 9 ok 0 no answer 0 late, 0 unmatched
+PianoPower: mca: late answer to the write of input limit (0x2008) = 1600: ok (0), after the 1000 ms window (1 late so far): handed to the policy
+PianoPower: mca: an answer that matches no request: opcode 2, input limit (0x2008), sequence 41, return code 0 (in flight: 43); 1 so far
+```
+
+### 15.3 The "no answer" to 0x2005 (and 0x2008)
+
+Evidence (2026-11-12): in P1 and P2 the first charge current write (900 mA, the first policy write after the board configuration,
+the input still at the firmware's 100 mA request) got `no answer (-60)` from the codec's 1 s window; in P2 the input limit write
+(100 → 1600) did too, **and the next cycle read 0x2008 = 1600 and 0x2029 = 0x4e2 (1250), then 0x640 (1600) and the bus at
+1594 mA**: the write was taken and applied, only its answer missed the window (or was lost). The writes planned again were answered
+`ok (0)` at once. With the built-in policy (input limit first, image I and usbhost-u0) and in pol-chargesleep (charge current 500,
+about the firmware's own) no write ever went unanswered; no read ever timed out in any run.
+
+Inferred: the firmware answers a current write once it has applied it, and 0x2029 walking 100 → 1250 → 1600 is that application
+taking more than a second for a large change. Not excluded: answers lost on the way (the console cannot place the sends: USB
+capture with backlog, 255-character lines that cut the diag line's "ignored" counter).
+
+Changes: a write's answer is awaited 3 s (`piano-power-write-ms`, reads stay 1 s); the answer to a write given up on is still taken
+(`McaLateWritten`: logged, handed to the policy as the acknowledgement) and the first 8 answers that match no request are logged
+with their property and sequence; the input limit goes first when it rises; the steps keep each change ≤ 600 mA. A write the
+firmware never answers is planned again after 10 s as before (three times, then left until the next attach). `ram-chg-late`
+(§15.5) repeats P2 with the old 1 s window: `late answer` lines mean late, `no answer` without them means lost.
+
+### 15.4 Safety summary
+
+Never above what the source advertises (the Rp current; a 1.5 A Rp or no connector reading: 1.5 A; the class rows otherwise, PD:
+its contract); every write through two allowlists (the policy's `piano_charge_write_allowed`, the codec's
+`piano_mca_write_allowed_for`, both bounded by `piano_charge_icl_max` ≤ 3000); the battery's limits are the firmware's (JEITA,
+float) plus the policy's derating; on any error (a refusal, a sag, a quick detach, no reading) the limit goes down or stays, never
+up; the connector thermistors' 60 °C hold (100 mA) and the charger's 85 °C hold (500 mA) win over every step. Nothing here starts,
+stops or restarts the DSP.
+
+### 15.5 Test images (unattended, the Mac's cable, 600 s, RAM boots)
+
+`tooling/k27/build-charge-test-images.sh [ramp l1 late]` builds them from a KC of this tree (`K27_KERNEL=<kernel-k27-0063-native.macho>
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh`), the Turnip-staged seed (the login window) and the FD A. Every
+image has `piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-usb=2 piano-thermal=1 piano-thermal-adc=1
+piano-reset-after=600` (the daily profile's drivers without the Mac's keyboard, plus PianoThermal's ADC), Data volatile, plus:
+
+| Image | PianoPower arguments | Answers |
+|---|---|---|
+| `ram-chg-ramp` | `piano-power=2 piano-power-policy=1 piano-power-rp=1` (ramp, rp-max 3000, write window 3000 by default) | the candidate daily: how far the Mac's port goes, the packs' sign at the login window |
+| `ram-chg-l1` | `piano-power=1` | the A/B partner: the PMIC alone in the same build and the same queue |
+| `ram-chg-late` | `piano-power=2 piano-power-policy=1 piano-power-rp=1 piano-power-ramp=0 piano-power-write-ms=1000` | P2 again (1600 mA at once, now the input first) with the old window: late answers or lost ones |
+
+Run in this order with `tooling/native/native-loop.sh out/ram-chg-<name>/boot-piano-macos-ram-A-bundled.img
+out/ram-chg-dump/boot-piano-macos-ram-A-bundled.img` and a capture of at least 640 s. Read:
+`grep -E 'PianoPower: (policy: input steps|\[[0-9]+s\] (battery|input|policy)|mca: (write|late|an answer))'`.
+
+Pass for `ram-chg-ramp`: `charger_pd is up`, the board configuration taken, `write input limit (0x2008) = 900: ok` before the charge
+current, then `input steps: up` lines while `input: bus` reads ≥ 4.65 V, the bus current following each step (within ~10 %), and from
+about 150 s on `battery: ... mA (charging)` (or ≥ 0) at the login window, better than `ram-chg-l1`'s at the same time; no `FATAL`, no
+`WARNING`. A `back from` line with its reason is a pass of the guard, and its ceiling is the Mac port's (or this cable's) value.
+Fail: the packs still negative at 3000 mA (then the load, not the input, is the problem: P11's spinning daemons), or the bus current
+not following the steps (the firmware clamps 0x2008: the `0x2029` field shows its own value).
+
+## 16. The daily profile's charging level (decision, 2026-11-12)
+
+**Level 2 with the stepped Type-C current** (`build-esp.py --profile daily` now defaults to `--charging 2`: `piano-power=2
+piano-power-policy=1 piano-power-rp=1 piano-thermal=1 piano-thermal-adc=1`), installed only after `ram-chg-ramp` passed; until then
+`--charging 1` (persistent-boot.md §11 pins v3 to it). Not "level 1 with an input-limit write".
+
+Why:
+1. **Only level 2 can give more than the PMIC alone.** Level 1's input is about 1.5 A (inferred from the power balance; the PMIC's
+   own configuration, unreadable without the DSP or a register map) and its charge current about 480 mA (measured: the flat
+   +472..480 mA in 12 boots). Level 2 measured 1.6 A with the packs at −46 mA (level 1 at the same point: −63..−90 mA) and can step
+   to 3 A, about 13 W usable on a ~7.5 W login window (with the spinning daemons) or ~10 W of ordinary use.
+2. **Level 2 is proven on this tablet**: the DSP bring-up and charger_pd up in 6 of 6 boots since the charger_pd gate (11-11 20:22 to
+   11-12 06:19), 0 FATAL; the board configuration, the policy's writes and their read-backs every time; the 0x2008 write followed
+   by the bus within 6 mA.
+3. **The level 1 write is not available safely**: the USBIN and charger blocks are this processor's (owner EE 0 in every boot), but
+   there is no licence-clean PMIH010x register map, a guessed power-path write can suspend the input or brown the tablet out, and it
+   would give up the firmware's JEITA, PD stack and the telemetry (bus current, 0x2029) that makes the steps safe.
+
+The costs, accepted: (a) each boot spends 30–60 s at the firmware's ~400 mA before the first write (−1.2..−1.7 A for under a minute,
+about 25 mAh); (b) a DSP crash would put the firmware back on its defaults (the 400 mA drain) until the next boot, since nothing
+restarts the DSP natively: none seen in any native run (the `adsp:` report line counts fatal reports); (c) off the cable a little polling
+(the 5 s charger cycle of 27 GLINK round trips, PianoAdsp's 20 ms doorbell poll: tens of wakeups a second against the ~12000 idle
+entries a second measured, power.md 1.1); (d) the steps above 1.6 A are host-tested only, hence the gate.

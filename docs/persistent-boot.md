@@ -108,6 +108,9 @@ Outputs in `out/persistent/` (all gitignored; hashes in `artifacts/ARTIFACTS.md`
 | `softgpu` | a KC with NativeSoftGpu (checked), `adt/piano-k27-vmm0.adt` (vmm-present 0, checked), `soft-metal/` seed and trust cache | + `panic_on_crash_disabled=1` (docs/drivers/soft-metal.md §10) |
 | `gpu` | a KC with PianoA830 and without NativeSoftGpu (checked), `adt/piano-k27.adt` built with `PIANO_VMM_PRESENT=0` (checked), `turnip-a830/stage/` seed and trust cache (the Turnip plugin) | + `piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1` (the A830 run that showed the login screen, 2026-11-11 07:45, without its reset and log arguments) |
 
+`--charging 1|2` (a profile with a charging level: `daily`, default 2) sets PianoPower's level and what comes with it
+(`docs/drivers/charging-policy.md` §16: 2 is level 2 with ChargePolicy, the stepped Type-C current and PianoThermal's ADC, refused
+for a collection whose PianoPower lacks the steps; 1 is level 1, read only).
 `--arg NAME=VALUE` adds or replaces one argument (for example `--arg piano-power=1`: battery gauges in the log, read only). Every
 line is checked against DarwinBoot's 1000-byte limit. For `softgpu`, first build its inputs in the source checkout:
 `PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/NativeSoftGpu.json PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh` with
@@ -291,8 +294,11 @@ python3 tooling/persist/base-seed.py pin --esp <persist checkout>/out/persistent
 python3 tooling/userland/stage.py --live out/layer-v3 --gpu-bundle out/turnip-a830/NativeAdrenoMetal.bundle \
         --installed-trust "$(python3 tooling/persist/base-seed.py path trust)"
 python3 tooling/persist/build-esp.py --profile daily --default macos --boot-guard 180 --layer out/layer-v3 \
-        --name esp-daily3-macos --out out/persistent
+        --charging 1 --name esp-daily3-macos --out out/persistent
 ```
+
+`--charging 1` keeps v3 at PianoPower level 1, as planned; the daily profile's default became level 2 on 2026-11-12
+(`docs/drivers/charging-policy.md` §16): drop the option once `ram-chg-ramp` has passed on the tablet.
 
 `build-esp.py` takes the KC and ADT from this checkout's `out/` and the seed from the pinned base, and the trust cache from the
 layer. The layer is `out/layer-v3/userland-update.tar` (`5f48c125…`, 12 files, 6 units with `gpu-nativeadrenometal`) with its

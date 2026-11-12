@@ -90,14 +90,16 @@ levels (9 V opt-in), charge current conservative, battery state on the console; 
   **With `piano-power-policy=1`** ChargePolicy replaces this table ([charging-policy.md](charging-policy.md) §8): after charger_pd is
   up and the board configuration is through, the class rows (CDP 900 mA, DCP 1500, PD its 5 V offer), the charge current by class
   with −300 mA/°C above 38 °C, PianoThermal's board thermistors, re-sent on a new generation and after a wake, the sleep and
-  shutdown handovers; `piano-power-rp=1` the Type-C Rp current (≤ 1600 mA), `piano-power-health=1` stop at 80 %, resume at 75 %.
+  shutdown handovers; `piano-power-rp=1` the Type-C Rp current, in steps up to 3 A while the bus holds since 2026-11-12
+  ([charging-policy.md](charging-policy.md) §15; `piano-power-ramp=0`: at once, ≤ 1600 mA), `piano-power-health=1` stop at 80 %,
+  resume at 75 %. A write's answer is awaited 3 s (`piano-power-write-ms`), a late one still taken.
 - Not done (later): IOPMPowerSource, the SC8541 pump and PPS, MiPPS authentication, the OTG config write 0x201a (stock
   re-sends it to stop a DSP crash on dock unplug), float voltage/termination, sleep notifications.
 
 Boot arguments: `piano-power=0|1|2` (default 0: probe declines, nothing mapped), `piano-power-period=S` (30),
 `piano-power-gauge=0`, `piano-power-write=0` (level 2 without writes), `piano-power-hv=1`, `piano-power-fw=DIR`,
-`piano-power-policy=1` (with `piano-power-rp=1`, `piano-power-health=1`, `-health-stop=N`, `-health-resume=N`: charging-policy.md
-§8), and for the DSP
+`piano-power-policy=1` (with `piano-power-rp=1`, `piano-power-ramp=0|1`, `piano-power-rp-max=MA`, `piano-power-write-ms=MS`,
+`piano-power-health=1`, `-health-stop=N`, `-health-resume=N`: charging-policy.md §8, §15), and for the DSP
 bring-up (§5a): `piano-power-delay=S` (30: seconds before the bring-up), `piano-power-stop=N` (stop before step N),
 `piano-power-rpmh=0` (no lcx/lmx proxy votes), `piano-power-qmp=0` (no AOSS load_state), `piano-power-trace=0`.
 
@@ -615,3 +617,42 @@ its input limit written, and the limit is now worth writing: [charging-policy.md
 the Rp current opt-in, and the budget: 900 mA in is about −1.1 A on the packs at 9 W, 1600 mA about −0.4 A) and §14 (images P1 and
 P2 with their expected lines: the input limit write ok, the bus current above 397 mA, the packs' current toward 0). P1 asks image
 I's question (the board configuration, then 900 mA on the CDP) through ChargePolicy; either answers it.
+
+## Measured 2026-11-12 (the night's queue on the Mac's USB-C port: level 1 in 16 boots, level 2 in I, P1, P2, pol-chargesleep, usbhost-u0)
+
+From the USB console logs (local, not published; `grep PianoPower`). **M** = measured, **I** = inferred.
+
+| | Level 1 (no DSP: the PMIC alone) | Level 2, before the first write | Level 2, 0x2008 = 900 (I, P1) | Level 2, 0x2008 = 1600 (P2, Rp trusted) |
+|---|---|---|---|---|
+| Bus (firmware's 0x20002 / 0x20004) | not readable | 5.22–5.23 V, **397 mA** (M) | 5.04–5.05 V, **897 mA** (M) | 4.89–4.93 V, **1453–1594 mA** (M) |
+| 0x2008 / 0x2029 | — | 100 / 0x64 (M) | 900 / 0x384 (M) | 1600 / 0x640, passing 0x4e2 a second after the write (M) |
+| Input | about **1.4–1.5 A** (I: the power balance below; equal to BC 1.2's CDP current) | ~2.1 W | ~4.5 W | ~7.8 W |
+| Packs at the idle login window, 89–92 % | **about −75 mA** steady, 0 to −195 mA (M; 0 mA at 97 % on float; −0.7 to −1.7 A with the uncapped governor, pol-observe) | −1.2 to −1.7 A (M) | −0.68 to −0.92 A (M, P1) | **−173 → −46 mA** (M) |
+| Packs early in the boot (light load) | **+472 to +480 mA**, flat, in 12 of the 16 boots at 89–97 % (M; the other 4 started on float at 0 mA): the PMIC's own charge current (I) | — | — | — |
+
+- **Why level 2 holds the input near 400 mA at first** (M): with no host write the firmware's request is its power-on 100 mA
+  (0x2008 reads 100, 0x2029 0x64) and the bus reads 397 mA (287–397; Linux saw 394 mA on an SDP, `ubuntu-history/kernel.md` §2.5).
+  It ignores the port's CDP type and its 3.0 A Rp on its own: those are a host client's to act on (Linux's `charge_policy=1`).
+  (I) The ~400 mA under a 100 mA request is the firmware's hardware floor. After a write the bus follows the request within 6 mA
+  (900 → 897, 1600 → 1594), so 0x2008 is the lever and the firmware does take it on this port.
+- **The input at level 1** (I): the PMIC runs on the configuration the boot stages left; its input is not readable (no DSP, no
+  register map: the `usbin`/`chgr` status bytes ChargerPmic.h reads are all zero). At the login window level 1 and P2 (1594 mA) end at
+  the same packs' current (−63..−90 vs −46 mA) under the same load, so level 1's limit is about 1.5 A; early in the boot the packs
+  take a flat ~477 mA whatever the charge level: the charge current the PMIC regulates to by itself. Its AICL and type detection are
+  the hardware's; nothing here can read or set them.
+- **What the system draws** (I, from P1 and P2 at ~90 % conversion): about **7.5 W** at the idle login window (P1: 4.1 W from the
+  input + 2.9–4.0 W from the packs; P2: 7.0 W + 0.2–0.75 W), with PerfPowerServices and audiomxd spinning a core (power.md 1.2, P11)
+  and cluster 0 at UEFI's 1996 MHz; about **10–11.5 W** with the governor at 3.5 GHz (pol-chargesleep). Without the spinning daemons
+  it should be lower; ordinary use adds the GPU and the apps.
+- **0x2005 "no answer"** (M): the first charge current write after the board configuration (input still at 100 mA) timed out in the
+  codec's 1 s window in P1 and P2, and in P2 the first input limit write too, although the next cycle read it back as written with
+  0x2029 moving to it: taken and applied, the answer late or lost. Writes made after the input limit (I, usbhost-u0) and a charge
+  current of 500 (pol-chargesleep) were always answered at once; no read ever timed out. Changes and the test that tells late from
+  lost: [charging-policy.md](charging-policy.md) §15.3.
+- **The level 1 SPMI write** (M, every boot): `charger: PMIH010x model 0x56, charger block 0x2200 (subtype 0xba, APID 698, owner EE 0),
+  DCDC 0x2600 (APID 702, EE 0), USBIN 0x2800 (APID 704, EE 0), Type-C 0x2b00 (APID 707, EE 0)`: the arbiter would let this processor
+  write them. Not done: there is no licence-clean register map of this PMIC's USBIN/charger blocks (mainline's SCHG maps are other
+  generations' subtypes; piano's stock charger driver runs in the DSP and its binaries are not read here), and a guessed power-path
+  write can suspend the input or brown the tablet out; the gain would be what level 2 gets through 0x2008 with read-backs.
+- **What follows**: the stepped Type-C current up to the Rp's 3 A with its guards, the write answers, the test images and the daily
+  profile's level: [charging-policy.md](charging-policy.md) §15 and §16.

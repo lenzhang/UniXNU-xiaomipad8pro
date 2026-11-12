@@ -287,6 +287,23 @@ def main():
     lines = esp.args_of(ns, daily, 1)
     check('piano-boot-guard-exec=loginwindow' in lines['macos'].split() and 'piano-boot-guard=180' in lines['macos'].split() and
           'piano-boot-guard' not in lines['fastboot'], '--arg piano-boot-guard-exec with the default guard; neither on fastboot')
+    # the charging level (docs/drivers/charging-policy.md section 16): daily 2 by default, --charging 1 the read-only level, --arg
+    # replaces one of its arguments, none of them on fastboot, nothing on a profile without a level
+    ns.arg = []
+    words = esp.args_of(ns, daily, 1)['macos'].split()
+    check(all(x in words for x in ('piano-power=2', 'piano-power-policy=1', 'piano-power-rp=1', 'piano-thermal=1',
+                                   'piano-thermal-adc=1')) and 'piano-power=1' not in words, 'daily: charging 2 by default')
+    ns.charging = 1
+    lines = esp.args_of(ns, daily, 1)
+    check('piano-power=1' in lines['macos'].split() and 'piano-power-policy=1' not in lines['macos'] and
+          'piano-thermal' not in lines['macos'], '--charging 1: piano-power=1 only')
+    ns.charging, ns.arg = None, ['piano-power-rp=0']
+    lines = esp.args_of(ns, daily, 1)
+    check(lines['macos'].split().count('piano-power-rp=0') == 1 and 'piano-power-rp=1' not in lines['macos'].split() and
+          not any(x.startswith(('piano-power', 'piano-thermal')) for x in lines['fastboot'].split()),
+          '--arg piano-power-rp=0 replaces the level\'s; fastboot has none of them')
+    ns.arg = []
+    check(not any(x.startswith('piano-power') for x in esp.args_of(ns, profile, 1)['macos'].split()), 'base: no charging level')
 
     base_tests(tmp, esp, a, trust, h, (x, y, z), (seed_x, seed_y), (t_old, t_new, t_union))
 

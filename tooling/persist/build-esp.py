@@ -108,21 +108,36 @@ PROFILES = {
         'args': ['piano-gpu=2', 'piano-gpu-delay=20', 'panic_on_crash_disabled=1'], 'vmm_present': 0,
         'kexts': ['com.unixnu.driver.PianoA830'], 'kexts_absent': ['com.unixnu.driver.NativeSoftGpu']},
     'daily': {
-        'about': 'the installed configuration from 2026-11-11 evening: gpu + PianoPower level 1 (battery and Type-C readout, no writes, '
-                 'the DSP not started) + the USB debug console (PianoDwc3: kernel console, monitor with "reset fastboot", user pipe) '
-                 '+ the keyboard and pointer from the Mac (piano-usb-hid=1)',
+        'about': 'the installed configuration: gpu + charging (--charging, default 2: PianoPower level 2 with ChargePolicy and the '
+                 'stepped Type-C current, PianoThermal\'s ADC for the connector thermistors; 1: level 1, the 2026-11-11 evening '
+                 'configuration, battery and Type-C readout only, the DSP not started) + the USB debug console (PianoDwc3: kernel '
+                 'console, monitor with "reset fastboot", user pipe) + the keyboard and pointer from the Mac (piano-usb-hid=1)',
         # the Data store's base (base-seed.py): the installed seed and its trust cache, never a restaged seed (docs/data-store.md
         # section 9); the Metal plugin and our userland come as the system layer (--layer), not in the seed
         'kc': 'out/k27/kc-k27-native.bin', 'adt': 'out/adt/piano-k27.adt', 'trust': 'base', 'seed': 'base',
-        'args': ['piano-gpu=2', 'piano-gpu-delay=20', 'panic_on_crash_disabled=1', 'piano-power=1', 'piano-usb=2', 'piano-usb-hid=1'],
+        'args': ['piano-gpu=2', 'piano-gpu-delay=20', 'panic_on_crash_disabled=1', 'piano-usb=2', 'piano-usb-hid=1'],
         'vmm_present': 0,
         'kexts': ['com.unixnu.driver.PianoA830', 'com.unixnu.driver.PianoPower', 'com.unixnu.driver.PianoDwc3'],
         'kexts_absent': ['com.unixnu.driver.NativeSoftGpu'],
         # k27 0063 (docs/boot-guard.md): the installed system always guards its boot; --boot-guard 0 leaves it out
-        'boot_guard': 180},
+        'boot_guard': 180,
+        'charging': 2},
+}
+# The charging level of a profile that has one (--charging; docs/drivers/charging-policy.md section 15, the decision in section 16).
+#   1  PianoPower level 1: the PMIC charges on its own (measured 2026-11-12 on the Mac's port: +0.48 A light, about -0.07 A at the
+#      login window, the input inferred at about 1.5 A); read only, the DSP not started.
+#   2  level 2: the DSP's charger firmware, ChargePolicy, the Type-C current stepped up to 3 A while the bus holds (P2 took 1.6 A:
+#      1594 mA in, the packs at -46 mA); PianoThermal level 1 with its ADC for the connector thermistors the steps above 1.5 A need.
+CHARGING = {
+    1: {'args': ['piano-power=1'], 'kexts': []},
+    2: {'args': ['piano-power=2', 'piano-power-policy=1', 'piano-power-rp=1', 'piano-thermal=1', 'piano-thermal-adc=1'],
+        'kexts': ['com.unixnu.driver.PianoThermal'],
+        # the collection's PianoPower must have the steps (a 2026-11-11 one would take the Rp current at once): its boot argument
+        'kc_marker': b'piano-power-rp-max'},
 }
 # Profile arguments the menu's "fastboot" entry (a reset after 1 s) leaves out.
-NOT_IN_FASTBOOT = ('piano-gpu', 'piano-gpu-delay', 'piano-power', 'piano-usb', 'piano-usb-hid')
+NOT_IN_FASTBOOT = ('piano-gpu', 'piano-gpu-delay', 'piano-power', 'piano-usb', 'piano-usb-hid', 'piano-power-policy', 'piano-power-rp',
+                   'piano-thermal', 'piano-thermal-adc')
 DROPPED = ('piano-reset-after', 'piano-reset-to', 'data-persist', 'droidvm-utc')
 # Set only by their own options (--replace-data, --flatten-data; data-persist is always 2 here), so the intent is explicit and recorded.
 STORE_ARGS = ('data-persist', 'data-store-replace', 'data-store-flatten')
@@ -305,13 +320,23 @@ def rtc_args(value):
     return ['piano-rtc=1', f'piano-rtc-offset={int(value)}']
 
 
+def charging_of(a, profile):
+    """The charging level (CHARGING): --charging, else the profile's; None when neither has one (nothing added)."""
+    level = getattr(a, 'charging', None)
+    return profile.get('charging') if level is None else level
+
+
 def args_of(a, profile, utc):
     ram = common.ram_images()
     base = [x for x in ram.K27_ARGS if x.split('=', 1)[0] not in DROPPED]
     if a.rtc_offset is not None and any(x.split('=', 1)[0] in ('piano-rtc', 'piano-rtc-offset') for x in a.arg):
         raise SystemExit('--rtc-offset and --arg piano-rtc...: one of them')
     guard = boot_guard(a, profile)
-    extra = profile['args'] + a.arg + rtc_args(a.rtc_offset) + ([f'{GUARD_PREFIX}={guard}'] if guard else [])
+    level = charging_of(a, profile)
+    charging = CHARGING[level]['args'] if level else []
+    given = {x.split('=', 1)[0] for x in a.arg}
+    charging = [x for x in charging if x.split('=', 1)[0] not in given]   # --arg NAME=VALUE replaces the same NAME
+    extra = profile['args'] + charging + a.arg + rtc_args(a.rtc_offset) + ([f'{GUARD_PREFIX}={guard}'] if guard else [])
     names = {x.split('=', 1)[0] for x in extra}
     if names & set(STORE_ARGS):
         raise SystemExit(f'--arg {", ".join(sorted(names & set(STORE_ARGS)))}: the Data store arguments come from --replace-data / '
@@ -353,7 +378,8 @@ def config_text(a, lines, prev, guard=0):
     text = ('# piano persistent boot (docs/persistent-boot.md): the ESP on UFS LUN 0, partition 37. boot_a holds only BootShim + FD; a\n'
             '# "fastboot boot" image with its own payload still wins (firmware/patches/unixnu/0001).\n'
             f'# profile {a.profile}{f"; fast boot {a.fast_boot}" if a.fast_boot else ""}'
-            f'{f"; boot guard {guard} s" if guard else ""}; clock: {clock_text(a)}\n'
+            f'{f"; boot guard {guard} s" if guard else ""}'
+            f'{f"; charging {charging_of(a, PROFILES[a.profile])}" if charging_of(a, PROFILES[a.profile]) else ""}; clock: {clock_text(a)}\n'
             'version = 1\n[boot]\ntimeout = ' + str(a.timeout) + '\ndefault = "' + a.default + '"\n[kits]\nautoload = false\n')
     text += entry.format(id='macos', title='macOS (native)', dir='', args=lines['macos'])
     text += entry.format(id='macos-diag', title=f'macOS, reset to fastboot after {a.diag_reset_after} s', dir='', args=lines['macos-diag'])
@@ -477,6 +503,10 @@ def main():
     p.add_argument('--boot-guard', type=int, metavar='SECS',
                    help='piano-boot-guard=SECS on the macos entries (k27 0063, docs/boot-guard.md): the watchdog held from the start, '
                    'the restart reason bootloader until healthy at SECS s; 0 none. Default: the profile\'s (daily 180, others none)')
+    p.add_argument('--charging', type=int, choices=sorted(CHARGING),
+                   help='the charging level (docs/drivers/charging-policy.md section 16): 2 PianoPower level 2 with ChargePolicy and the '
+                   'stepped Type-C current (+ PianoThermal\'s ADC), 1 level 1 (the PMIC on its own, read only). Default: the '
+                   'profile\'s (daily 2, others none)')
     p.add_argument('--replace-data', nargs='?', const='1', metavar='1|HEX8',
                    help='data-store-replace on the macos entries: an intended one-time switch to this seed that STARTS THE DATA STORE '
                    'OVER when it belongs to another seed (1: any other seed\'s store; HEX8: only the store of that seed, the 8 hex '
@@ -516,7 +546,11 @@ def main():
         raise SystemExit(f'--boot-guard {guard} (profile {a.profile}\'s default unless given): the kernel in {inputs["kc"]} has no k27 '
                          '0063 (build the collection with K27_KERNEL=<kernel-k27-0063-native.macho> tooling/k27/build-native-image.sh), '
                          'or say --boot-guard 0')
-    for bundle in profile['kexts']:
+    level = charging_of(a, profile)
+    if level and CHARGING[level].get('kc_marker') and CHARGING[level]['kc_marker'] not in inputs['kc'].read_bytes():
+        raise SystemExit(f'--charging {level} (profile {a.profile}\'s default unless given): the PianoPower in {inputs["kc"]} has no '
+                         'stepped Type-C current (piano-power-rp-max): rebuild the collection from this tree, or say --charging 1')
+    for bundle in profile['kexts'] + (CHARGING[level]['kexts'] if level else []):
         if bundle not in natives:
             raise SystemExit(f'profile {a.profile} needs {bundle} in the kernel collection; {inputs["kc"]} has {natives} '
                              f'(build it with PIANO_EXTRA_KEXTS=$PWD/out/k27/kext/<kext>.json tooling/k27/build-native-image.sh)')
@@ -608,7 +642,7 @@ def main():
         'profile': a.profile, 'about': profile['about'], 'extra_args': a.arg, 'fast_boot': a.fast_boot, 'deny_exec': a.deny_exec,
         'default': a.default,
         'timeout': a.timeout,
-        'utc': a.utc, 'rtc_offset': a.rtc_offset, 'kc_has_rtc_calendar': kc_rtc, 'boot_guard': guard,
+        'utc': a.utc, 'rtc_offset': a.rtc_offset, 'kc_has_rtc_calendar': kc_rtc, 'boot_guard': guard, 'charging': level,
         'kc_has_boot_guard': kc_guard, 'cmdlines': lines,
         'inputs': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in inputs.items()},
         'previous': {n: {'path': str(path), 'sha256': common.sha(path)} for n, path in prev.items()} if prev else None,

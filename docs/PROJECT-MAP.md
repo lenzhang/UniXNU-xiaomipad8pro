@@ -135,5 +135,7 @@ Drivers and their state (each inert without its boot argument; pages in `docs/dr
 | PianoBacklight (2x KTZ8866: boot level, off on display sleep, key steps) | built, host-tested and linked, not run (`backlight.md`) |
 | PianoInput (buttons) | runs on the tablet |
 
-Tonight's results: `docs/results-2026-11-11.md`. The installed profile (`build-esp.py --profile daily`: GPU + PianoPower level 1 + the USB console and the Mac's keyboard/pointer)
-replaces the first install's GPU-only profile at the next install session.
+Tonight's results: `docs/results-2026-11-11.md`. The installed profile (`build-esp.py --profile daily`: GPU + charging + the USB console and the Mac's keyboard/pointer)
+replaces the first install's GPU-only profile at the next install session. Charging: `--charging 2` (the default since 2026-11-12:
+PianoPower level 2 with the stepped Type-C current) once `ram-chg-ramp` passed, else `--charging 1` (level 1, read only;
+`docs/drivers/charging-policy.md` §16).

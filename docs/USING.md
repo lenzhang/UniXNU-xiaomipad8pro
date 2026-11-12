@@ -20,9 +20,12 @@ A `fastboot boot` RAM image always wins over the installed copy (`firmware/patch
 
 ## 2. The installed profile
 
-`tooling/persist/build-esp.py --profile daily`: the A830 GPU, PianoPower level 1 (battery and Type-C readout, read only), the USB
-debug console (PianoDwc3) with the Mac's keyboard and pointer. Opt-in drivers join the profile only after a RAM test passed on the
-tablet (`docs/PROJECT-MAP.md` §7 lists their state).
+`tooling/persist/build-esp.py --profile daily`: the A830 GPU, charging (`--charging 2`, the default since 2026-11-12: PianoPower
+level 2, the DSP's charger firmware with ChargePolicy and the stepped Type-C current, PianoThermal's ADC for the connector
+thermistors; `--charging 1`: level 1, battery and Type-C readout only, the PMIC charging on its own), the USB debug console (PianoDwc3)
+with the Mac's keyboard and pointer. **Build an ESP with `--charging 2` only after `ram-chg-ramp` passed on the tablet**
+(`docs/drivers/charging-policy.md` §16); until then `--charging 1` is the installed configuration. Opt-in drivers join the profile
+only after a RAM test passed on the tablet (`docs/PROJECT-MAP.md` §7 lists their state).
 
 ## 3. From the Mac
 
