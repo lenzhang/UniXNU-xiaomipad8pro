@@ -151,7 +151,9 @@ class NativeRamBlock : public IOBlockStorageDevice {
     uint32_t mib = 0;
     if (PE_parse_boot_argn("data-volatile-mib", &mib, sizeof mib) && mib >= 64 && mib <= 65536) return mib * 256ULL;
     uint64_t pages = gPhysSize / 4 / 4096;          // a quarter of the memory this kernel manages
-    return pages < 65536 ? 65536 : pages > 1048576 ? 1048576 : pages;   // 256 MiB .. 4 GiB
+    // At most 2 GiB until k27 0065 is in the kernel: with the 13 GiB window kmem's private data range is 2611 MiB, and a budget
+    // past it sends chunks into the shared range, where a failed contiguous allocation leaks gobbled pages (0065, bringup-debugging.md §6).
+    return pages < 65536 ? 65536 : pages > 524288 ? 524288 : pages;   // 256 MiB .. 2 GiB
   }
   // The boot reservation, taken by the refill thread as soon as the disk is set up, before the GPU and the desktop take memory and
   // the kernel's address ranges (2026-11-12: at 1080 MiB held no 2 MiB was left in the range IOMallocAligned uses). Default a sixth of
