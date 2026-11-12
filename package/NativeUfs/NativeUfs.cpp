@@ -2766,7 +2766,17 @@ bool NativeUfs::start (IOService *provider)
   if (!PE_parse_boot_argn ("native-ufs-suspend-cancel", &gCancelArg, sizeof (gCancelArg)) || gCancelArg != 1) gCancelArg = 0;
   if (!PE_parse_boot_argn ("native-ufs-suspend-abort-test", &gAbortTest, sizeof (gAbortTest))) gAbortTest = 0;
   if (!gPowerArg) gPowerJoin = -1;
-  IOLog ("NativeUfs: start on %s probe=%u root=%u\n", provider ? provider->getName () : "?", probe, rootMode);
+  // UniXNU-piano: native-ufs-root-part=NAME, the GPT partition holding the SHNGROOT root image (default UFS_ROOT_PARTITION,
+  // linux_rootfs: the installed 27.0.1 system). The 27.3 line's root image is on linux_data (docs/k273-line.md).
+  char part[32] = {};
+  if (PE_parse_boot_arg_str ("native-ufs-root-part", part, sizeof (part))) {
+    if (rootPartitionNameValid (part)) {
+      strlcpy (gRootPartition, part, sizeof (gRootPartition));
+    } else {
+      IOLog ("NativeUfs: native-ufs-root-part: not a partition name (a-z, 0-9, _; 1-31): the root stays on %s\n", gRootPartition);
+    }
+  }
+  IOLog ("NativeUfs: start on %s probe=%u root=%u root-part=%s\n", provider ? provider->getName () : "?", probe, rootMode, gRootPartition);
   native_ufs_probe_requested = probe != 0;
   // Default: match for observability only, never touch the controller. Hardware work runs once,
   // from the root-device personality; the ufshc nub match stays observation-only.

@@ -28,6 +28,24 @@ struct RootLayout {
 // __bss does not fit).
 static uint8_t *gScratch;
 
+// UniXNU-piano: the GPT name of the root partition (at most 31 characters, as make-root-manifest.py's window names).
+#ifdef UFS_ROOT_PARTITION
+static char gRootPartition[32] = UFS_ROOT_PARTITION;
+#else
+static char gRootPartition[32] = "userdata";
+#endif
+
+// native-ufs-root-part=NAME: lower-case letters, digits and '_' only, 1 to 31 of them; anything else keeps the default.
+static bool rootPartitionNameValid (const char *name)
+{
+  size_t n = 0;
+  for (; name[n]; ++n) {
+    char c = name[n];
+    if (n >= 31 || !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
+  }
+  return n > 0;
+}
+
 static uint32_t le32 (const uint8_t *at)
 {
   return uint32_t (at[0]) | (uint32_t (at[1]) << 8) | (uint32_t (at[2]) << 16) | (uint32_t (at[3]) << 24);
@@ -107,11 +125,11 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     *why = "GPT entries CRC";
     return false;
   }
-#ifdef UFS_ROOT_PARTITION
-  static const char wanted[] = UFS_ROOT_PARTITION;   // UniXNU-piano: the board names its root partition (linux_rootfs)
-#else
-  static const char wanted[] = "userdata";
-#endif
+  // UniXNU-piano: the board names its root partition (UFS_ROOT_PARTITION, linux_rootfs); native-ufs-root-part=NAME picks another
+  // (gRootPartition, set in NativeUfs::start: the 27.3 line's root image on linux_data). The name is compared with its NUL, so a
+  // partition whose name merely starts with it does not match.
+  const char *wanted = gRootPartition;
+  const size_t wantedBytes = strlen (gRootPartition) + 1;
   bool found = false;
   for (uint32_t index = 0; index < count; index++) {
     const uint8_t *entry = gScratch + index * 128;
@@ -129,7 +147,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
       }
     }
     bool match = true;
-    for (unsigned c = 0; c < sizeof (wanted); c++) {
+    for (unsigned c = 0; c < wantedBytes; c++) {
       if (entry[56 + 2 * c] != static_cast<uint8_t> (wanted[c]) || entry[57 + 2 * c] != 0) {
         match = false;
         break;

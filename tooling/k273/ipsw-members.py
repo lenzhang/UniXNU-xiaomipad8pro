@@ -14,9 +14,11 @@ Deflated members (small plists) are inflated after the download.
 Nothing fetched here is committed: Apple payloads stay under out/.
 """
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import plistlib
+import shutil
 import struct
 import subprocess
 import sys
@@ -27,6 +29,7 @@ from pathlib import Path
 
 URL = ('https://updates.cdn-apple.com/2026FallSeed/53df7654-4865-4259-8dae-30177b76f104/'
        'UniversalMac_27.3_26C5035r_Restore.ipsw')
+STREAMS = 4
 # The components the line uses (UniXNU profile [ipsw].fetch + the userdata windows).
 DEFAULT = ['KernelCache', 'DeviceTree', 'StaticTrustCache', 'Cryptex1,SystemTrustCache', 'Cryptex1,AppTrustCache',
            'SystemVolume', 'Cryptex1,SystemVolume', 'Cryptex1,AppVolume', 'OS', 'Cryptex1,SystemOS', 'Cryptex1,AppOS']
@@ -125,13 +128,44 @@ def fetch(z, name, out):
     start = z.data_offset(name)
     total = entry['csize']
     print(f'{name}: {total >> 20} MiB ({"stored" if entry["method"] == 0 else "deflated"})', flush=True)
-    while (have := partial.stat().st_size if partial.exists() else 0) < total:
-        result = subprocess.run(['curl', '-sS', '--fail', '--retry', '20', '--retry-delay', '5', '--speed-limit', '20000',
-                                 '--speed-time', '60', '-r', f'{start + have}-{start + total - 1}', z.url],
-                                stdout=partial.open('ab'))
-        if result.returncode:
-            print(f'{name}: curl {result.returncode} at {have >> 20} MiB; resuming', file=sys.stderr, flush=True)
-            time.sleep(5)
+    # A large member goes in STREAMS ranges at once (one curl each; the CDN serves one connection at about 4 MiB/s). The split
+    # is recorded beside the download (.split), so a later run resumes every range where it stopped; the ranges are appended
+    # to the first one in order at the end.
+    split = target.with_name(target.name + '.split')
+    have = partial.stat().st_size if partial.exists() else 0
+    if split.is_file():
+        cuts = json.loads(split.read_text())
+    else:
+        streams = max(1, min(STREAMS, (total - have) // (256 << 20)))
+        step = (total - have) // streams
+        cuts = [0] + [have + step * k for k in range(1, streams)] + [total]
+        split.write_text(json.dumps(cuts))
+    pieces = [(partial if k == 0 else target.with_name(f'{target.name}.partial{k}'), cuts[k], cuts[k + 1]) for k in range(len(cuts) - 1)]
+
+    def get(piece):
+        path, low, high = piece
+        while (got := path.stat().st_size if path.exists() else 0) < high - low:
+            result = subprocess.run(['curl', '-sS', '--fail', '--retry', '20', '--retry-delay', '5', '--speed-limit', '20000',
+                                     '--speed-time', '60', '-r', f'{start + low + got}-{start + high - 1}', z.url],
+                                    stdout=path.open('ab'))
+            if result.returncode:
+                print(f'{path.name}: curl {result.returncode} at {got >> 20} MiB; resuming', file=sys.stderr, flush=True)
+                time.sleep(5)
+        if path.stat().st_size != high - low:
+            raise SystemExit(f'{path.name}: {path.stat().st_size} bytes, expected {high - low}')
+
+    with concurrent.futures.ThreadPoolExecutor(len(pieces)) as pool:
+        list(pool.map(get, pieces))
+    with partial.open('ab') as sink:
+        for path, low, high in pieces[1:]:
+            if partial.stat().st_size == low:
+                with path.open('rb') as source:
+                    shutil.copyfileobj(source, sink, 64 << 20)
+                sink.flush()
+            else:
+                raise SystemExit(f'{partial.name}: {partial.stat().st_size} bytes before {path.name}, expected {low}: remove the pieces and fetch again')
+            path.unlink()
+    split.unlink()
     if partial.stat().st_size != total:
         raise SystemExit(f'{name}: {partial.stat().st_size} bytes, expected {total}')
     digest, crc = hashlib.sha256(), 0

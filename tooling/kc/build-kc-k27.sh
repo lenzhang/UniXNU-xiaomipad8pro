@@ -10,6 +10,8 @@
 #              layout are read, nothing is written there
 #   NATIVE     the native kext JSONs linked into the KC (required; the native set is configs/k27-native-kexts.txt)
 #   KC_BASE    the Apple 27.0.1 (26A434) vma2 kernelcache the KC is built from (default $PIANO_K27_TREE/out/kc/kc27.bin)
+#   KC_BUILDER the tree's builder (default k27/kc-build27-piano.py; the 27.3 line: k27/kc-build273-piano.py of its tree,
+#              tooling/k273/prepare-k27-tree.sh)
 #   KC_NATIVE_PLACEMENT  best-fit (the default here): the native kexts' segments largest first into the smallest gaps that hold
 #              them, with patches/k27-kc/0001 applied to the tree's builder (without it: first fit in link order, and a note);
 #              first-fit: as the unpatched builder. KC_NATIVE_CONST_TO_TEXT=1 (patches/k27-kc/0002): relocation-free constant
@@ -39,7 +41,7 @@ python3 "$PIANO_REPO/tooling/k27/check-native-kexts.py" --self-test >&2 || exit 
 python3 "$PIANO_REPO/tooling/k27/check-native-kexts.py" "$PIANO_REPO" $NATIVE >&2 || exit 2
 export KC_NATIVE_PLACEMENT=${KC_NATIVE_PLACEMENT:-best-fit}
 # shellcheck disable=SC2046,SC2086
-python3 k27/kc-build27-piano.py "$KC_BASE" "$KERNEL" "$OUT" --keep $(cat configs/kc-keep.txt) $DI --native $NATIVE > "${OUT%.bin}.log" 2>&1 \
+python3 "${KC_BUILDER:-k27/kc-build27-piano.py}" "$KC_BASE" "$KERNEL" "$OUT" --keep $(cat configs/kc-keep.txt) $DI --native $NATIVE > "${OUT%.bin}.log" 2>&1 \
   || { tail -20 "${OUT%.bin}.log"; exit 1; }
 grep -E "problem|wrote" "${OUT%.bin}.log" | cut -c1-120
 grep -q "^native placement ($KC_NATIVE_PLACEMENT)" "${OUT%.bin}.log" \
