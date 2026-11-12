@@ -448,6 +448,16 @@ def main():
     report = {'status': 'OFFLINE_CANDIDATE_NOT_DEVICE_TESTED', 'scope': 'fastboot boot only; never flash',
               'fd': {'file': a.fd.name, 'name': a.fd_name, 'sha256': sha(a.fd)}, 'dtb_sha256': sha(a.dtb),
               'mkbootimg_sha256': MKBOOTIMG_SHA256, 'images': {}}
+    if a.kc and a.adt:
+        # XNU's RAM window (configs/k27-adt.toml owned_memory_size): an FD whose DarwinBoot lacks firmware/patches/darwinboot/0001
+        # refuses an ADT asking for more than 8 GiB, and the image would not boot.
+        common = persist_common()
+        window, bound = common.adt_ram_window(a.adt), common.fd_ram_window(a.fd)
+        if window is not None and window > bound:
+            raise SystemExit(f'{a.adt} asks for a {window >> 20} MiB RAM window but {a.fd}\'s DarwinBoot takes at most {bound >> 20} MiB '
+                             f'(no {a.fd.name}.ram-window stamp for it: tooling/firmware/build-fd.sh makes the FD with '
+                             'firmware/patches/darwinboot/0001); or make the ADT with tooling/adt/make-piano-adt.py --ram-window 0x200000000')
+        report['ram_window'] = {'adt_bytes': window, 'fd_bound': bound}
     with tempfile.TemporaryDirectory(prefix='piano-ram-') as scratch:
         work = Path(scratch)
         ramdisk = uefi_payload(work)

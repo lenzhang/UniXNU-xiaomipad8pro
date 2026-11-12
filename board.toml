@@ -66,7 +66,8 @@
 "chip_id" = "8011"
 "unique_chip_id" = "required"
 "packed_data_ramdisk" = true
-"owned_memory_size" = "0x200000000"
+# XNU's window in the 13 GiB run above (configs/k27-adt.toml's note: 13 GiB less the kernel's 2 MiB block offset).
+"owned_memory_size" = "0x33fe00000"
 
 
 ["bootimg"]

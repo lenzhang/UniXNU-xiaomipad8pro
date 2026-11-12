@@ -46,8 +46,10 @@ fi
 # takes (out/adt/piano-k27.adt) never has it (build-esp.py refuses one that does).
 ADT_OUT=out/adt/piano-k27.adt
 if [ -n "${PIANO_SENSOR_PACK:-}" ]; then ADT_OUT=out/adt/piano-k27-addon.adt; export PIANO_SENSOR_PACK; fi
+# PIANO_RAM_WINDOW=BYTES: XNU's RAM window for this build (else configs/k27-adt.toml's owned_memory_size, 13 GiB less 2 MiB, which
+# needs an FD with firmware/patches/darwinboot/0001: tooling/firmware/build-fd.sh; 0x200000000 for an older FD).
 python3 tooling/adt/make-piano-adt.py "$ADT_OUT" --unique-chip-id "${UNIQUE_CHIP_ID:-47554e5941480001}" --data --trust \
-  ${PIANO_SENSOR_PACK:+--addon} ${PIANO_VMM_PRESENT:+--vmm-present "$PIANO_VMM_PRESENT"} > /dev/null
+  ${PIANO_SENSOR_PACK:+--addon} ${PIANO_VMM_PRESENT:+--vmm-present "$PIANO_VMM_PRESENT"} ${PIANO_RAM_WINDOW:+--ram-window "$PIANO_RAM_WINDOW"} > /dev/null
 # The software Metal path (docs/drivers/soft-metal.md): when NativeSoftGpu is linked (the list or PIANO_EXTRA_KEXTS; PIANO_SOFT_METAL=0
 # leaves this out, =1 forces it), the NativeSoftMetal plugin is built and staged into a copy of the Data seed and the trust cache
 # (tooling/k27/stage-soft-metal.py, out/soft-metal), which the image then takes unless PIANO_SEED / PIANO_TRUST name others. The staging

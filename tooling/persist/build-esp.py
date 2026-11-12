@@ -599,6 +599,13 @@ def main():
             raise SystemExit(f'{adt}: its /chosen/memory-map has the GpuAddon slot of a RAM test image carrying the sensor pack '
                              '(PIANO_SENSOR_PACK): DarwinBoot refuses that slot without Payloads/kernel.macho.gpuaddon, which an ESP never '
                              'carries; use the ADT made without it (out/adt/piano-k27.adt)')
+        # The ESP is booted by the installed boot_a's FD, not by this checkout's: until that FD has firmware/patches/darwinboot/0001
+        # (and PIANO_BOOT_FD_RAM_WINDOW=1 says so), an ADT asking for more than 8 GiB would not boot.
+        window = common.adt_ram_window(adt)
+        if window is not None and window > common.OLD_DARWINBOOT_WINDOW_MAX and os.environ.get('PIANO_BOOT_FD_RAM_WINDOW') != '1':
+            raise SystemExit(f'{adt} asks for a {window >> 20} MiB RAM window; the installed boot_a\'s DarwinBoot takes at most 8192 MiB '
+                             'unless its FD was built with firmware/patches/darwinboot/0001 (then PIANO_BOOT_FD_RAM_WINDOW=1). Else make '
+                             'the ESP\'s ADT with tooling/adt/make-piano-adt.py --ram-window 0x200000000')
     vmm = adt_vmm_present(inputs['adt'])
     if profile['vmm_present'] is not None and vmm != profile['vmm_present']:
         raise SystemExit(f'profile {a.profile} needs an ADT with vmm-present {profile["vmm_present"]}; {inputs["adt"]} has {vmm}')

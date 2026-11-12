@@ -81,6 +81,9 @@ def main():
     # A test ADT's /defaults vmm-present (configs/k27-adt.toml has 1; see its note). 0 is the truthful value natively: Core Animation then
     # gives WindowServer 8-bit framebuffers instead of the half-float ones of a virtual machine (docs/drivers/soft-metal.md §9).
     p.add_argument('--vmm-present', type=int, choices=(0, 1))
+    # XNU's RAM window (/chosen darwinboot-memory-size) instead of configs/k27-adt.toml's owned_memory_size: 0x200000000 for an image
+    # or ESP booted by an FD whose DarwinBoot lacks firmware/patches/darwinboot/0001 (it refuses more than 8 GiB).
+    p.add_argument('--ram-window', type=lambda v: int(v, 0), help='bytes, 2 MiB steps, 256 MiB to 13 GiB')
     p.add_argument('--bt-address-file', type=Path, help='the unit Bluetooth address (default: private/bluetooth-address if present)')
     p.add_argument('--no-bt-address', action='store_true', help='no /arm-io/piano-bt node')
     a = p.parse_args()
@@ -96,6 +99,8 @@ def main():
     config = merge(board, load_toml(DEVICE / 'configs/k27-adt.toml'))
     if a.vmm_present is not None:
         config['adt']['defaults']['u32']['vmm-present'] = a.vmm_present
+    if a.ram_window is not None:
+        config['payload']['adt']['owned_memory_size'] = hex(a.ram_window)
     extra = []
     if a.gop_display:
         nodes = load_toml(DEVICE / 'configs/k27-gop-display.toml').get('arm-io', {})

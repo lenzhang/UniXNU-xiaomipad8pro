@@ -11,7 +11,13 @@
 # No /arm-io/data-store natively: the Data seed is a RAM disk, but /chosen must not say ephemeral-storage (usermanagerd
 # then skips its persona manager and loginwindow never launches the desktop; piano-macos-boot.py's note).
 "persistent_data" = true
-"owned_memory_size" = "0x200000000"
+# XNU's RAM (/chosen darwinboot-memory-size: DarwinBoot allocates this window and hands XNU exactly it, boot_args
+# PhysicalBase/MemorySize). 13 GiB less 2 MiB: the hole-free run 0x8c0000000..0xc00000000 of dts/piano.dts is 13 GiB and DarwinBoot
+# starts the window at the kernel collection's offset in its 2 MiB block (0x4000), so 0x8c0004000 + 0x33fe00000 = 0xbffe04000 is
+# the largest window in it. Needs an FD with firmware/patches/darwinboot/0001 (an older DarwinBoot refuses more than 8 GiB:
+# EFI_COMPROMISED_DATA, no boot); that DarwinBoot shrinks a request it cannot place whole to the largest run, never below 8 GiB.
+# tooling/adt/make-piano-adt.py --ram-window overrides it (0x200000000 for an image with an older FD).
+"owned_memory_size" = "0x33fe00000"
 # The OS volume of the VM's os.img (macOS 27.0.1); natively nothing provides it before the UFS work (M3), so the kernel waits
 # for root there. Kept so the same ADT works the moment a block device with this volume appears.
 "root_match_volume_uuid" = "C73696D4-CAC4-40A0-90CB-7D0463E4E3E6"

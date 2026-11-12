@@ -41,6 +41,35 @@ BOOT_PARTITION_BYTES = 100663296
 BOOT_A_START_512, BOOT_A_SIZE_512 = 618800, 196608   # /sys/class/block/<boot_a>/{start,size}
 
 
+# XNU's RAM window (/chosen darwinboot-memory-size, configs/k27-adt.toml owned_memory_size): DarwinBoot before
+# firmware/patches/darwinboot/0001 refuses an ADT asking for more than this (EFI_COMPROMISED_DATA: no boot).
+OLD_DARWINBOOT_WINDOW_MAX = 0x200000000
+
+
+def adt_ram_window(path):
+    """The ADT's /chosen darwinboot-memory-size (bytes), or None without one (DarwinBoot then takes 256 MiB)."""
+    spec = importlib.util.spec_from_file_location('adt_dump', DEVICE / 'tooling/adt/adt-dump.py')
+    adt = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(adt)
+    (_, children), _ = adt.parse(Path(path).read_bytes())
+    for props, _ in children:
+        named = dict(props)
+        if named.get('name', b'').rstrip(b'\0') == b'chosen' and len(named.get('darwinboot-memory-size', b'')) == 8:
+            return struct.unpack('<Q', named['darwinboot-memory-size'])[0]
+    return None
+
+
+def fd_ram_window(fd):
+    """The window bound of the FD's DarwinBoot: its <fd>.ram-window stamp (tooling/firmware/build-fd.sh) when the stamp names this
+    FD's SHA-256, else the bound of DarwinBoot without firmware/patches/darwinboot/0001."""
+    stamp = Path(str(fd) + '.ram-window')
+    if stamp.is_file():
+        fields = stamp.read_text().split()
+        if len(fields) == 2 and fields[0] == sha(fd):
+            return int(fields[1], 0)
+    return OLD_DARWINBOOT_WINDOW_MAX
+
+
 def adt_addon_slot(path):
     """True when the ADT's /chosen/memory-map has a GpuAddon slot (UniXNU's generator with addon=True: make-piano-adt.py --addon).
     DarwinBoot then needs Payloads/kernel.macho.gpuaddon next to the kernel and refuses the boot without it (EFI_COMPROMISED_DATA), and
