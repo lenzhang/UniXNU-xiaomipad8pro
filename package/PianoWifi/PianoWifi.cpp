@@ -1273,8 +1273,8 @@ void msiSink(const LinkState &link)
   const bool on = msiEnable(gMsi, cfgRd, msiWr, link.endpointMsiCap, bus, kMsiSinkData);
   note("level 4: msi: cap %#x control %04x -> %04x (%s addresses), address %08x:%08x data %04x, command %08x: %s%s",
        gMsi.cap, gMsi.ctlBefore, gMsi.ctl, gMsi.is64 ? "64-bit" : "32-bit", gMsi.addressHi, gMsi.addressLo, gMsi.data, gMsi.command,
-       on ? "one vector into the sink at " : "not enabled: ", on ? "" : gMsi.why);
-  if (on) note("level 4: msi: the sink is at bus %#llx", (unsigned long long)bus);
+       on ? "one vector into the sink page" : "not enabled: ", on ? "" : gMsi.why);
+  if (on) note("level 4: msi: the sink page is at bus %#llx", (unsigned long long)bus);
 }
 
 // What the chip wrote into the sink: the first changed words (an MSI write is one word, the data in its low half).
