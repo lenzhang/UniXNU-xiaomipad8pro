@@ -79,7 +79,7 @@ kernel side must provide (2026-11-11).
 | `piano-gpu-status=0..3` | 2 at N=2 | status rows (2: the diagnostic page) |
 | other `piano-gpu-*`, `piano-screenoff`, `piano-diag` | driver's | Adreno830's `pagani-*` knobs renamed (README of `package/PianoA830/adreno830`), e.g. `piano-gpu-profile`, `piano-gpu-dcvs-max` |
 | `piano-screenoff=2` (driver's, bit 1) | 0 | the DCVS screen rule: the GPU slumbers (CX kept; with bit 3 the full collapse) once the display has been off and the GPU quiet for 1 s. Since 2026-11-12 the board feeds the rule's word (`pagani_screen_state`: bit 0 off, the changes above it) from NativeGopDisplay's display power, so the rule can act natively; without the bit nothing reads it (default unchanged). Proposed default after a run: 2 (`docs/power.md` "Idle wakeups by driver") |
-| `piano-gpu-pool=<MiB>` | a quarter of the RAM, 512..2048 (2048 on piano: XNU reports 8192 MiB, about 13300 MiB with the 13 GiB window; the cap stays: S0 and NativeAdrenoMemory take at most 2 GiB) | the write-combined BO pool S3 reserves (halved until it succeeds, 64..2048); §8, "The BO pool" |
+| `piano-gpu-pool=<MiB>` | a quarter of the RAM, 512..2048 (2048 on piano: XNU reports 8192 MiB, about 13300 MiB with the 13 GiB window; S0 takes at most 2048, but XNU maps no block of 2 GiB, so S3 starts at 1024: `NativeAdrenoContiguousMaxBytes`) | the write-combined BO pool S3 reserves (halved until it succeeds, 64..2048); §8, "The BO pool" |
 | `piano-gpu-metal-opens=<n>` | 0 (no limit) | connections ever granted to the plugin |
 | `piano-gpu-hang-ms=<ms>` | 0 (2000) | the time without progress (fence, ring read pointer, BR's IB1) the fence and recovery watchdogs call a hang, 1000..60000; 10000 for the first desktop sessions ([gpu-userspace.md](gpu-userspace.md), desktop section) |
 | `piano-gpu-idle=0/1/2` | 1 | the GPU's idle power (§8, "GPU idle power"): 0 as before; 1 the DCVS floor (no wake boost, a 250 ms window while idle at 160 MHz, no touch pre-wake); 2 also the boot DDR vote dropped to the display's floor at S10, the host CX/MX votes lowered after `piano-gpu-idle-ms` quiet, and P1's full slumber |
@@ -349,7 +349,11 @@ been scattered. The default was then an eighth of the RAM; XNU reports 8192 MiB 
 used 936 of it and had 701 MiB of own BOs outside it (below). Since 2026-11-12 it is a quarter of the RAM in 256 MiB steps,
 512..2048 MiB (`piano_a830_pool_default`, compile-time checked): 2048 MiB on piano (`board: BO pool 2048 MiB (a quarter of the RAM,
 512..2048; RAM 8192 MiB)`; S3 halves it until a reservation succeeds, as before; `piano-gpu-pool=<MiB>` wins, 64..2048). The `MEM`
-row shows pool and use; S3's time grows with the pool (1.0 s for 512 MiB, 1.8 s for 1024).
+row shows pool and use; S3's time grows with the pool (1.0 s for 512 MiB, 1.8 s for 1024). The 2048 MiB was never granted: XNU's
+kernel map refuses one mapping above 2 GiB less a page, and only after `kmem_alloc_contig` has taken the contiguous pages, which
+k27 up to 0064 gives back to the free list still gobbled: phantom wired pages (17:27, 8 GiB: 1.6 GiB counted twice) and the 13 GiB
+boot's `vm_page_unwire` panic (`docs/bringup-debugging.md` §6, `patches/k27/0065`). Since that boot S3 does not ask for it
+(`NativeAdrenoContiguousMaxBytes`, also the bound of a contiguous BO) and starts at 1024 MiB, what every boot got.
 
 **The per-object limit (2026-11-12).** Upstream's BoAlloc and BoImport refuse more than 256 MiB (`NativeAdrenoAbiMaxBoBytesShift`,
 Query's `max_bo_bytes`) whatever the client's window, so Metal's 16384x16384 textures (1 GiB at 4 bytes a texel) never reached the
@@ -398,9 +402,10 @@ highest end reached in the window, mapping records, table ranges). Read the tren
 
 **The first desktop sessions' wired memory (2026-11-12, desk-dev).** WindowServer aborted twice in five minutes on OutOfMemory(Device)
 for small textures: the runtime needed new blocks of 16-49 MiB, and the kernel answered `gpu BoAlloc refused: 49 MiB: pool 168 MiB free,
-largest 19; then no pages from XNU (0xe00002bd NoMemory)`: the pool (1024 MiB: S3 found no 2 GiB contiguous run) had room but no
+largest 19; then no pages from XNU (0xe00002bd NoMemory)`: the pool (1024 MiB: the 2048 MiB is never granted, §8 "The BO pool") had room but no
 extent that large, and XNU refuses a kernel allocation outright when its wired pages plus the free target would pass `max_mem`
-(xnu `vm_page_alloc_list`; `vm_stat`: 5.8 GiB of 8 wired). The GPU's share then: the pool 1024 MiB, 872 MiB of own BOs outside it, about
+(xnu `vm_page_alloc_list`; `vm_stat`: 5.8 GiB of 8 wired, of which about 1.6 GiB were phantom: the 2048 MiB pool request's
+pages, given back gobbled and still counted as wired, `docs/bringup-debugging.md` §6). The GPU's share then: the pool 1024 MiB, 872 MiB of own BOs outside it, about
 430 MiB of pinned imports: about 2.3 GiB. Since: a pooled BO may be cut from up to 64 free extents (`NativeAdrenoPoolMaxPieces`,
 write-combined pool, not for a one-span request), a new process's failures are counted (and written) apart from an earlier process
 of the same name, and Turnip 0009 gives idle caches back and asks every GPU process for its cache when a BoAlloc finds no memory.

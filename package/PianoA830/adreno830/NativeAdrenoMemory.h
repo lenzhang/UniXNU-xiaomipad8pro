@@ -58,6 +58,13 @@ static inline IOReturn NativeAdrenoMaintainRuns(uintptr_t address,size_t bytes,s
 enum : uint64_t {NativeAdrenoMemoryMaxBytes=UINT64_C(0xFFFFF000)};
 /* UniXNU-piano (2026-11-12): the most free extents of the BO pool one BO is cut from when none holds it whole (allocatePooled). */
 enum : size_t {NativeAdrenoPoolMaxPieces=64};
+/* UniXNU-piano (2026-11-12, the 13 GiB boot's vm_resident.c:6226 "!mem->vmp_gobbled" panic): the largest physically contiguous block
+ * reservePool and allocate ask XNU for. k27's kernel map refuses a single mapping above vm_map_kernel_max_simple_mappable_size() (2 GiB
+ * less a page; vm_map_kernel_alloc_limit_mode REJECT), and kmem_alloc_contig() finds that out only after cpm_allocate() has taken the
+ * contiguous pages: its error path gives them back to the free list still marked gobbled (k27 up to 0064; patches/k27/0065), and the
+ * first such page an IOPL wires and later unwires stops the kernel. The pool's first request was 2048 MiB on every board since
+ * 2026-11-12 (a quarter of the RAM, at most 2048): never granted, it now goes unasked and the halving starts at 1024. */
+enum : uint64_t {NativeAdrenoContiguousMaxBytes=(UINT64_C(2)<<30)-4096};
 #else
 enum : uint64_t {NativeAdrenoMemoryMaxBytes=UINT64_C(256)*1024*1024};
 #endif

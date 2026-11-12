@@ -26,7 +26,9 @@ unsigned piano_a830_smmu_routes(const char *when);
 
 // The write-combined BO pool's default (piano-gpu-pool=<MiB> wins; S0 keeps it in 64..2048, S3 halves it until a reservation succeeds):
 // a quarter of the RAM in 256 MiB steps, 512..2048 MiB. piano's XNU reports 8192 MiB (max_mem), about 13300 MiB with the 13 GiB window
-// (configs/k27-adt.toml): 2048 either way; the cap is S0's and NativeAdrenoMemory's (a pool is at most 2 GiB). The login screen alone used 486
+// (configs/k27-adt.toml): 2048 either way; the cap is S0's. XNU maps no block of 2 GiB (NativeAdrenoContiguousMaxBytes, 2 GiB less a page),
+// so S3 never asks for the 2048 and starts at 1024, the size every boot since 2026-11-12 got: asking had cost 2 GiB of pages k27 gave back
+// gobbled (the 13 GiB boot's vm_page_unwire panic, patches/k27/0065; with 8 GiB the phantom wired pages of 17:27). The login screen alone used 486
 // MiB of the 13T board's 512 (6 clients, WindowServer 446 MiB); the first desktop (run attend4, 24 clients) used 936 of a 1024 MiB pool
 // and 701 MiB of own BOs outside it, scattered: 3 ms a BO and 90-130 ms a surface-sized one of page attribute changes, and a range of
 // the GPU table per page, until the table's ranges ran out (docs/drivers/gpu.md §8, "The BO pool").

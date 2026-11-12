@@ -168,3 +168,34 @@ our own customisation. It is `out/inputs/kernel.macho.trustcache` (the OS image'
 Data seed; once the tablet's store is flattened, [data-store.md](data-store.md), it only starts new stores) and the OS and
 SystemOS windows on linux_rootfs, which carry that era's userland changes (`settime.sh` and its boot job `org.droidvm.run.0`,
 the staged Metal plugin).
+
+## 6. A kernel panic in the mailbox log (2026-11-12: the 13 GiB boot's `vm_page_unwire`)
+
+The native kernel runs unslid: `atos -o "$PIANO_K27_TREE/out/k27/kernel-k27-00NN-native.macho" -arch arm64e <pc> <lr>` names the
+addresses of the panic line directly (the kexts' addresses: the KC's descriptor). An `Assertion failed` stops in a `<function>.cold.N`
+stub (`brk #0xbffc`, esr `0xf200bffc`), so pc names the function, and lr is in the same function; the console prints no backtrace,
+so the caller comes from the registers: x19-x28 are the caller's wherever the asserting function had not yet changed them (its
+prologue and the path to the stub, `llvm-objdump -d`), and a constant the caller keeps in one of them (here `mov w26, #0x14` and
+`adrp x28, vm_pageout_debug` in `vm_page_do_delayed_work`) gives it away. The mailbox copy may still have single bit errors after the
+majority (here x24 = x0 with bit 45 cleared); the USB capture (`logs/usb-console/`) is exact up to where it stopped.
+
+The 13 GiB boot of 19:17 (`logs/native-runs/20261112-191724-loop`): `vm_resident.c:6226 Assertion failed: !mem->vmp_gobbled`, pc
+`vm_page_unwire.cold.3`, lr `vm_page_unwire+860`, the caller `vm_page_do_delayed_work`'s `DW_vm_page_unwire` (an IOPL's
+`upl_commit_range`/`upl_abort_range` slow path), the page's object a zone `vm_object`. Evidence vs inference:
+
+| Item | State | Evidence |
+|---|---|---|
+| In k27 only `vm_page_find_contiguous(wire=FALSE)` sets `vmp_gobbled` (`kmem_alloc_contig_guard()` → `cpm_allocate()`); `kernel_memory_populate_object_and_unlock()` and `vm_page_wire()` clear it; `vm_object_iopl_wire_empty()` wires a fresh page without either | verified (source) | `osfmk/vm/vm_resident.c`, `vm_kern.c`, `vm_pageout.c` |
+| `kmem_alloc_guard_internal()` takes the contiguous pages before `kmem_find_space()`; on its failure `vm_page_free_list(..., FALSE)` puts them on the free list still gobbled and still in `vm_page_wire_count`/`vm_page_gobble_count`; `vm_page_grab()` hands them out as they are | verified (source) | `vm_kern.c` `out_error` |
+| The kernel map refuses one mapping above `vm_map_kernel_max_simple_mappable_size()` (2 GiB less a page, mode REJECT) in `vm_map_locate_space_anywhere()`, after the pages were taken | verified (source) | `vm_map.c` |
+| PianoA830's S3 asks for a 2048 MiB pool first on every boot since 2026-11-12 (a quarter of the RAM, at most 2048), never granted (`row2 MEM pool 1024`, 512 or 64) | verified (logs, source) | `logs/usb-console/*`; `NativeAdrenoMemory::reservePoolBestEffort` |
+| When that search finds 2 GiB of contiguous pages, 2 GiB of gobbled pages leak: the 17:27 session (8 GiB) shows it as phantom wired pages, `vm_stat` free + active + inactive + speculative + wired = 2,517,918 pages for the 2,097,152 of the RAM (1.6 GiB counted twice) | verified (log arithmetic) / inferred (that the 2048 MiB search was what leaked, and that the phantom wired count is what made XNU refuse the GPU's BoAllocs of 17:40) | `logs/usb-console/20261112-172703-port0.txt` `DD7:` lines |
+| The 13 GiB boot's panic is such a page, wired by an IOPL and unwired through `vm_page_unwire()` | inferred (no other source of a gobbled page in k27 short of memory corruption; if `vm_pages[0]` is the window's first page, the page is about 9.2 GiB into the window, in RAM only the 13 GiB window has) | the registers: x0 - x13 = 2365929 x 48 (x13 taken for the `vm_pages` base, x11 = 0x30 the 48-byte `struct vm_page`) |
+| With the 13 GiB window the kmem ranges are 2611 MiB each instead of about 4.5 GiB (the physmap takes the rest), so a full range is the other way a contiguous allocation fails after its search | verified (console) / inferred (that it happens) | the boot's VM range lines |
+| The A/B image (same KC, 8 GiB ADT, 19:40) reserved a 64 MiB pool: the contiguous searches failed (the boot reservation of the volatile Data disk spreads wired pages), so its 2048 MiB request most likely leaked nothing | verified (console) / inferred | `logs/usb-console/20261112-194044-port0.txt` |
+
+The fix: PianoA830 never asks XNU for a contiguous block above 2 GiB less a page (`NativeAdrenoContiguousMaxBytes`: the pool from
+2048 MiB starts at 1024, the size every boot got; a contiguous BO above it is refused unasked; host-tested in `test_memory`), and k27
+patch 0065 (`patches/k27/0065-*`) gives a failed contiguous allocation's pages back ungobbled with both counts fixed and refuses a size
+the map would refuse before the search. Until 0065 is in the kernel, a contiguous allocation that fails on a full kmem range (13 GiB:
+the shared data range holds the GPU's buffers and the Data disk's fallback chunks) can still leak.

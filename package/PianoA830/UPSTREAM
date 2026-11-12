@@ -100,7 +100,7 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       2026-11-11: the board hooks boot_progress_gpu_event and adreno830_board_hang_ms, declared and given weak defaults.
     A830Recovery.h          be274c0781de5ed0e44c01da50f1e45467fbd89f6efdb8a5c3ab3d941284630c -> 18729f79ba9d0813a241deb76211a17862e7636553a46eda041bd29629c31a50
       2026-11-11: native_adreno_note_hang_snapshot declared.
-    NativeAdrenoMemory.cpp  ea99b5e92be53377467c830bb63e5043597e543692ec20087711ba4d67770b1c -> 383bc04d9f59fc00d694af48f5b5a7e5c04471aeca92867f9471442c066c6dec
+    NativeAdrenoMemory.cpp  ea99b5e92be53377467c830bb63e5043597e543692ec20087711ba4d67770b1c -> d902dab1ee66cc96004252fe276e6c162eae38751cc8e211ebce7d381b70a722
       the pool's 128 KiB extent table on the heap, allocated with the pool (same __DATA reason). 2026-11-12: the backing objects'
       bound NativeAdrenoMemoryMaxBytes (NativeAdrenoMemory.h) in allocatePooled, allocate, importTask and importDevice, and
       poolLargestFree (the largest free extent, for the BoAlloc refusal line).
@@ -109,11 +109,15 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       first, the last one best fit; each piece one span, counted in the extents bound), never for a one-span request (takePooled's
       `contiguous`); such a BO has no kernel mapping (finishPooled zeroes it by span, makeWriteCombined takes the flag), and release
       gives every span's extent back; native_adreno_pool_split counts them.
-    NativeAdrenoMemory.h    40f40ae2a6c52e3a873dadbb21449a09506c6ae19a118f12a76ca85400173a56 -> 304fb0b00bb4e170611a8cc3ad3ae333b4216b1a361e602a2b5ab3b5c51af0cc
+      2026-11-12 (the 13 GiB boot's vm_page_unwire panic): reservePool refuses a block above NativeAdrenoContiguousMaxBytes
+      (2 GiB less a page) and allocate a contiguous BO above it, unasked: XNU's kernel map refuses such a mapping only after
+      kmem_alloc_contig has taken the pages, which k27 up to 0064 gives back gobbled (patches/k27/0065).
+    NativeAdrenoMemory.h    40f40ae2a6c52e3a873dadbb21449a09506c6ae19a118f12a76ca85400173a56 -> b9a89ab454748c7f8f4be2e6184008da8b2ef825e0667877fe5b361e9636435e
       2026-11-12: NativeAdrenoMemoryMaxBytes, 4 GiB less a page (the largest allocation Turnip's size fields describe) instead of
       upstream's 256 MiB (Metal's 16384x16384 textures are 1 GiB at 4 bytes a texel), the same 256 MiB in upstream builds;
       poolLargestFree declared.
       2026-11-12: NativeAdrenoPoolMaxPieces (64) and allocatePooled's `contiguous` (default false).
+      2026-11-12: NativeAdrenoContiguousMaxBytes (2 GiB less a page, XNU's largest kernel mapping).
     NativeAdrenoVm.h        bc1cb145ab04473c45e639b9de4508179d5c25cc855ce7077596e51f26744a30 -> f8eb5d48e5810949cb1a8c0b7b5ce119cfbb0bb03bb4361f2a0c6ce6b038cda6
     NativeAdrenoVm.cpp      20a64d996dc2b11747c3fea2a268b03a8ed313667fd378a2476aff7dcb25b263 -> d671ef7521e99e4e89a0f44b0d14f738a8b8ddb3f913d45ac58a3049081aaf77
       2026-11-12: the table's range capacity 524288 (NativeAdrenoVmMaxSpans, twice upstream's: WindowServer's BoMap answered
@@ -140,7 +144,7 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       2026-11-12 (desk-dev): a connection's live objects by size (NativeAdrenoVaSizesLine).
     tests/test_vm.cpp       d81e652885397fbbd091f939e601c42afa4a5655d39ab21bd66fb1253ce446cd -> fc2c707d2ed7bb85b06b04466cd6f30b95c873165f933eac4e48db403130a8b0
     tests/test_userclient.cpp 882247d5763651ac02c1ae26f676d2ffcc3457f28ee6bc1411998b16072bea54 -> bc34fadedebb630dce16a92b110574d71db11e733fb7463af391b19d4e2bf6e9
-    tests/test_memory.cpp   88303705f4af24de2a10528f1a7ac7e4b3cae304f3f90448ea18824ebb2ed6f9 -> b4f843ecb4463388d206ec264025e68362087aede6ef2642b4c0607ca91cd51d
+    tests/test_memory.cpp   88303705f4af24de2a10528f1a7ac7e4b3cae304f3f90448ea18824ebb2ed6f9 -> 3d2146debb6f47cc19f600161c899ba4df852ebfdac6c46bacdaf4ef26afd9f7
     tests/test_client.cpp   a2d6eaad86f785e16dc42d367c9ffcf04640ca9a5b7d873603e253df2b596618 -> 21d4cecff1c8fde68dfbbcceced13b7365ceff72f8e69ae5288da8234d63bfa9
     tests/test_vamap.cpp    (new)                                                            -> a28424f4be27e15ea767febcd3c11f1bcfde8d9347b8b0d92e824bbd5ea5933b
     tests/hostsim/host_gpu_service.cpp 10a70158b87ef0c1b65de905970ad43475dcb941a3e233c20c9215520b4b3713 -> 4815bea8d8f65610b85844eadf55731b0effd0f0b41528848b49dc229c312228
@@ -159,6 +163,8 @@ Adreno830 (github.com/Shad0w23333/Adreno830; local unixnu-research/Adreno830), m
       write-combined by flag, every piece given back and merged), a one-span request not cut, more than is free refused with nothing
       taken, 64 pieces made and 65 refused; test_vamap the va/sizes line and the failure counts per process; test_userclient the size
       classes; deferred_bo's no-memory and idle-trim modes for Turnip 0009 (tooling/metal/check-turnip-a830-host.py).
+      2026-11-12: test_memory (ADRENO830_MACOS) the best-effort pool from 2048 MiB asks 1024 first and nothing of 2 GiB or more,
+      reservePool and a contiguous BO of 2 GiB refused unasked, 2 GiB less a page asked, a scattered 2 GiB BO still asked.
   Not compiled into the kext: NativeAdrenoAccelerator.cpp (the iPadOS IOAcceleratorES class), NativeAdrenoClient.cpp and
   NativeAdrenoBoard.cpp (host-only), tests/ and scripts/ (host tools). The source lists are those of scripts/build-adreno830.py.
   NativeAdrenoABI.h (the v2 user-client ABI Turnip's darwin KMD includes) is unchanged, byte for byte.

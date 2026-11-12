@@ -184,6 +184,38 @@ static unsigned bestEffortPool()
     CHECK(NativeAdrenoMemory::reservePoolBestEffort(36,512,16,true,nullptr)==kIOReturnBadArgument);
     CHECK(NativeAdrenoMemory::reservePoolBestEffort(33,512,16,true,&reserved)==kIOReturnBadArgument && !reserved);controls+=2;
     CHECK(NativeAdrenoMemory::reservePoolBestEffort(36,0,16,true,&reserved)==kIOReturnSuccess && !reserved);++controls;
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (2026-11-12): XNU is never asked for a contiguous block of 2 GiB or more (NativeAdrenoContiguousMaxBytes: the kernel
+     * map refuses it after cpm_allocate took the pages, which go back gobbled). The board's 2048 MiB pool is not requested, the halving
+     * asks 1024 first; 2 GiB less a page is the largest request there is; a contiguous BO above it is refused unasked. Nothing is
+     * allocated here (every request the fixture sees fails), so the host never maps the sizes. */
+    {
+        static size_t first_bytes,largest_bytes;static unsigned asked,scattered;
+        first_bytes=largest_bytes=0;asked=scattered=0;
+        fixture.allocation_hook=[](unsigned options,size_t bytes) {
+            if(!(options&kIOMemoryPhysicallyContiguous)) {++scattered;return;}
+            if(!asked++)first_bytes=bytes;
+            if(bytes>largest_bytes)largest_bytes=bytes;
+        };
+        fixture.allocation_fail=true;
+        CHECK(NativeAdrenoMemory::reservePoolBestEffort(40,2048,64,true,&reserved)==kIOReturnSuccess && !reserved);
+        CHECK(asked==5 && first_bytes==(size_t(1024)<<20) && largest_bytes==(size_t(1024)<<20));++controls;   /* 1024..64 */
+        asked=0;largest_bytes=0;
+        CHECK(NativeAdrenoMemory::reservePool(40,size_t(2)<<30)==kIOReturnBadArgument && !asked);
+        CHECK(NativeAdrenoMemory::reservePool(40,size_t(NativeAdrenoContiguousMaxBytes))==kIOReturnNoMemory &&
+              asked==1 && largest_bytes==size_t(NativeAdrenoContiguousMaxBytes));++controls;
+        asked=0;
+        NativeAdrenoMemory big;
+        CHECK(big.allocate((size_t(2)<<30),40,true,(size_t(2)<<30))==kIOReturnNoMemory && !asked && !big.backed());
+        CHECK(big.allocate(size_t(NativeAdrenoContiguousMaxBytes),40,true,size_t(NativeAdrenoContiguousMaxBytes))==kIOReturnNoMemory &&
+              asked==1);++controls;
+        /* Scattered (non-contiguous) BOs keep their own bound, NativeAdrenoMemoryMaxBytes: the kernel allocates those without cpm. */
+        asked=0;
+        CHECK(big.allocate((size_t(2)<<30),40,false,(size_t(2)<<30))==kIOReturnNoMemory && !asked && scattered==1);++controls;
+        fixture.allocation_fail=false;fixture.allocation_hook=nullptr;
+        CHECK(fixture.live.empty());
+    }
+#endif
     fixture.contiguous_limit=64u<<20;   /* a fragmented boot: 512, 256 and 128 MiB fail */
     CHECK(NativeAdrenoMemory::reservePoolBestEffort(36,512,256,true,&reserved)==kIOReturnSuccess && !reserved);++controls;
     /* Not write-combined yet: the zero fill's failure below needs the clean a cacheable pool takes. */

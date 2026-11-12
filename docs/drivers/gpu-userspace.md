@@ -947,7 +947,8 @@ given back to the kernel with no further call, `TU_DARWIN_BO_CACHE_AGE_MS=200`);
   Apple's GPUs page resources in and out; here a pageable BO design (pages wired while a job uses them) would be the real fix.
   Until then: with XNU's 13 GiB window (being raised from 8 GiB) the pool's default stays a quarter of the RAM up to 2048 MiB, the
   volatile Data disk's budget 2048 MiB (`data-volatile-mib`), and the GPU's peak above the pool goes to scattered wired pages; with
-  about 2.9 GiB wired by everything else (17:40: 5.8 GiB wired less the GPU's 1.47 and the disk's 1.44), a GPU peak of 2.5-3 GiB and
+  about 2.9 GiB wired by everything else (17:40: 5.8 GiB wired less the GPU's 1.47 and the disk's 1.44; about 1.6 GiB of it phantom,
+  the pool's never-granted 2048 MiB request's pages counted as wired, `docs/bringup-debugging.md` §6), a GPU peak of 2.5-3 GiB and
   the disk's 2 GiB, about 5 GiB of the 13 stay pageable.
 - The runtime keeps one empty block per memory pool for good (metal2vulkan's `KEPT_EMPTY_BLOCKS`, the prebuilt bridge): Turnip's
   timer cannot return memory the runtime still holds.

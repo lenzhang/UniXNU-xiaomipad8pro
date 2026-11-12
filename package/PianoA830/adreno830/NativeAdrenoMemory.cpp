@@ -195,6 +195,10 @@ IOReturn NativeAdrenoMemory::reservePool(unsigned bits,size_t bytes)
 {
     if(pool.descriptor)return kIOReturnBusy;
     if(!bytes || (bytes&4095) || (bytes>>12)>UINT32_MAX || !outputWidth(bits))return kIOReturnBadArgument;
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (2026-11-12): never a block the kernel map refuses after taking its pages (NativeAdrenoContiguousMaxBytes). */
+    if(bytes>NativeAdrenoContiguousMaxBytes)return kIOReturnBadArgument;
+#endif
 #if defined(ADRENO830_MACOS) && !defined(ADRENO830_HOST_TEST)
     if(!pool.free)pool.free=IONewZeroData(PoolExtent,PoolExtentCapacity);
     if(!pool.free)return kIOReturnNoMemory;
@@ -332,6 +336,11 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
     }
     /* From here on nothing the pool or another BO shares: the caller needs no Memory lock (allocatePooled); the figures are atomic. */
     IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
+#ifdef ADRENO830_MACOS
+    /* UniXNU-piano (2026-11-12): a contiguous BO the kernel map would refuse after taking its pages is not asked for
+     * (NativeAdrenoContiguousMaxBytes); as XNU's refusal it is no memory. */
+    if(contiguous && bytes>NativeAdrenoContiguousMaxBytes)return kIOReturnNoMemory;
+#endif
     if(contiguous)options|=kIOMemoryPhysicallyContiguous;
     descriptor_=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,bytes,(limit-1)&~UINT64_C(4095));
     if(!descriptor_)return kIOReturnNoMemory;
