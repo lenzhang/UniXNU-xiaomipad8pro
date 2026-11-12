@@ -134,3 +134,32 @@ Checklist of the first 27.3 boot (each with the console line that answers it):
 - The UniXNU profile's root list keeps more kexts (IOGPUFamily, the USB device/host stacks, IOBluetoothFamily, IO80211Family,
   EndpointSecurity, AppleHIDKeyboard ...); this line keeps the 27.0.1 line's set, whose drivers stand in for the hardware ones.
 - The 27.0.1 seed with the 27.3 system skips the Data migration of an update; a fresh 27.3 seed is step 6.
+
+## 6. The dual-boot entry on the installed ESP (2026-11-13)
+
+`tooling/k273/build-dual-esp.py` makes the installed ESP (its build record, default `out/persistent/installed.json`'s image) with
+one entry more, `macos-27.3`, and nothing else changed: every file and every entry of the base (the default `macos`, its timeout,
+`macos-diag`, `fastboot`, the actions) byte for byte, checked against the base's record. The new entry boots
+`Payloads/k273/{kernel.macho,.adt,.trustcache}` with `Payloads/k273/scratch-data.img`, and its arguments are the base's `macos` line
+plus `native-ufs-root-part=linux_data data-store-lba=N` (the daily profile's drivers and levels: charging 2 with
+`piano-power-delay=0`, USB net and shell, keyboard, touch, backlight, Wi-Fi 6, boot guard 180; 989 of DarwinBoot's 1000 bytes).
+
+Its Data store is its own, and the two can never resume each other:
+
+| | 27.0.1 (`macos`) | 27.3 (`macos-27.3`) |
+|---|---|---|
+| root partition | linux_rootfs | linux_data (`native-ufs-root-part`) |
+| store window | end of linux_rootfs, LBA 68119455 | end of linux_data below the 1 GiB reserve: LBA 117998394-124290042 (the root image ends at 76901119) |
+| seed | 8f333110 (12 GiB), unbound | 89860516 (24 GiB: `compact-seed.py --grow-gib 24` of the desk-dev seed) |
+| binding | none (its collection has no `data-store-lba`) | `data-store-lba=117998394`: NativeUfs refuses any other window place; NativeRamBlock keeps any valid store not bound to that LBA (`PersistOverlay.h` `kBound`, the LBA in the header's extension) and binds its new store to it |
+
+A kernel that never names linux_data (the installed 27.0.1 collection) cannot open the 27.3 window; the 27.3 kernel with its
+arguments cannot open any window but its own, and keeps an unbound store (the 27.0.1 one) even of its own seed (host tests:
+`package/NativeRamBlock/Test/guard.cpp`, the binding section). The seed identities differ as well, so the seed guard separates them
+too. Tools: `common.check_store_size` takes a linux_data store of any size only with its `data-store-lba`; `maint-session.py
+k273-store` reads both store headers (the 27.3 one blank or bound to its LBA with its seed; the installed one unbound).
+
+The 27.3 store's seed is its base from now on: every later ESP's `macos-27.3` must take the same seed file
+(`out/inputs/k273/store-seed/scratch-data.img`, identity 89860516...), as the 27.0.1 line keeps its base seed (docs/data-store.md §9).
+Its RAM test: `build-ram-images.py` with `PIANO_EXACT_ARGS` = the entry's line (`out/ram-k273-entry`): the same payload and the same
+arguments, `data-persist=2` on the new store (its first boot creates the store; the installed entry then resumes it).

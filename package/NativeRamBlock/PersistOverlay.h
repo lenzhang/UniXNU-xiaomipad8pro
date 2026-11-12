@@ -31,10 +31,16 @@
 #include <stdint.h>
 #include <string.h>
 
+// Window binding (UniXNU-piano, 2026-11-13: the 27.3 line's second store, docs/k273-line.md): a store made with a binding (kBound,
+// the window's absolute first LBA at bytes 88..95 of the extension) is resumed only by a kernel that opens it at that LBA and asks
+// for it (data-store-lba=N); a kernel asking for a binding keeps every valid store that is not bound to its LBA (Kept, as another
+// seed's), and makes its new stores bound. Without the request nothing changes: old stores, old kernels, byte for byte. A kernel
+// without the binding reads a bound store as an ordinary one of its seed (it ignores the flag).
 namespace persist {
 constexpr uint32_t kBlock = 4096;
 constexpr uint32_t kHeaderBytes = 64;
 constexpr uint32_t kSelfContained = 1;   // extension flag: every seed page is in the window; a clear bit reads as zero
+constexpr uint32_t kBound = 2;           // extension flag: the store belongs to the window at bytes 88..95's LBA
 
 // zlib's crc32: crc32(b, n, crc32(a, m)) is the CRC of a followed by b.
 inline uint32_t crc32 (const uint8_t *data, size_t bytes, uint32_t prior = 0)
@@ -62,8 +68,9 @@ inline uint64_t pageBlock (uint64_t pages, uint64_t index) { return 1 + bitmapBl
 
 // flags 0: a plain version 1 header (bytes 64.. zero), byte for byte what every earlier kernel wrote.
 inline void encodeHeader (uint8_t block[kBlock], uint64_t pages, const uint8_t seed[32], uint64_t generation, uint32_t flags = 0,
-                          uint64_t flattened = 0)
+                          uint64_t flattened = 0, uint64_t boundLba = 0)
 {
+  if (boundLba) flags |= kBound;
   memset (block, 0, kBlock);
   memcpy (block, "SHNGDATA", 8);
   put32 (block + 8, 1);
@@ -77,11 +84,12 @@ inline void encodeHeader (uint8_t block[kBlock], uint64_t pages, const uint8_t s
   memcpy (block + 64, "SHNGEXT1", 8);
   put32 (block + 72, flags);
   put64 (block + 80, flattened);
+  if (flags & kBound) put64 (block + 88, boundLba);
   put32 (block + 124, extensionCrc (block));
 }
 
 struct HeaderInfo {
-  uint64_t pages = 0, generation = 0, flattened = 0;
+  uint64_t pages = 0, generation = 0, flattened = 0, boundLba = 0;   // boundLba: 0 unless flags has kBound
   uint32_t flags = 0;              // 0 unless the extension is present and intact
   uint8_t seed[32] = {};
 };
@@ -95,9 +103,11 @@ inline int parseHeader (const uint8_t block[kBlock], HeaderInfo *info)
   memcpy (info->seed, block + 24, 32);
   info->flags = 0;
   info->flattened = 0;
+  info->boundLba = 0;
   if (!memcmp (block + 64, "SHNGEXT1", 8) && get32 (block + 124) == extensionCrc (block)) {
     info->flags = get32 (block + 72);
     info->flattened = get64 (block + 80);
+    if (info->flags & kBound) info->boundLba = get64 (block + 88);
   }
   return 0;
 }
@@ -129,6 +139,8 @@ struct Overlay {
   bool sameSeed = false;           // the header names this seed (and size)
   bool replaced = false;           // Fresh because a valid store of another seed (or this one) was replaced on request
   uint8_t storeSeed[32] = {};      // the seed digest in the header (zero when there is no valid header)
+  uint64_t boundLba = 0;           // the window LBA the store is bound to (kBound), 0 when unbound
+  bool boundElsewhere = false;     // open(bindLba): a valid store not bound to bindLba, kept as another seed's
 
   bool has (uint64_t i) const { return bitmap[i >> 3] >> (i & 7) & 1; }
 
@@ -136,11 +148,13 @@ struct Overlay {
   // initialised: bitmap first, header last, so a tear leaves no valid header. Another seed's valid store is Kept unless `discard`
   // (start over whatever the store holds: sheng-data-reset) or `replace` asks for it: 1 replaces any other seed's store, any other
   // nonzero value only the store whose seedTag it is (data-store-replace=0x<8 hex>).
+  // `bindLba` (data-store-lba): this window's LBA; a valid store bound elsewhere or not bound is Kept (as header 3), a new store is
+  // bound to it. 0: no binding asked for, every store as before.
   template <class Ops> Open open (Ops &ops, uint64_t pageCount, const uint8_t seed[32], bool ro, uint8_t *bits, bool discard = false,
-                                  uint32_t replace = 0)
+                                  uint32_t replace = 0, uint64_t bindLba = 0)
   {
     pages = pageCount; bitmap = bits; readOnly = ro; present = 0; active = false;
-    flags = 0; flattened = 0; selfContained = sameSeed = replaced = false; generation = 0;
+    flags = 0; flattened = 0; selfContained = sameSeed = replaced = boundElsewhere = false; generation = 0; boundLba = 0;
     memset (storeSeed, 0, sizeof storeSeed);
     uint64_t bb = bitmapBlocks (pages);
     uint8_t block[kBlock];
@@ -154,6 +168,11 @@ struct Overlay {
       memcpy (storeSeed, info.seed, 32);
       sameSeed = info.pages == pages && !memcmp (info.seed, seed, 32);
       header = checkHeader (block, pages, seed, nullptr);
+      boundLba = info.boundLba;
+      if (bindLba && boundLba != bindLba) {   // another window's store (or one made without a binding): never used here
+        boundElsewhere = true;
+        header = 3;
+      }
       selfContained = header == 0 && (flags & kSelfContained);
     }
     const bool replaceIt = replace == 1 || (replace && replace == seedTag (storeSeed));
@@ -182,9 +201,9 @@ struct Overlay {
     if (!ops.sync ()) return Open::Failed;
     generation = (header == 3 || header == 0) ? generation + 1 : 1;
     replaced = startOver;
-    encodeHeader (block, pages, seed, generation);
+    encodeHeader (block, pages, seed, generation, 0, 0, bindLba);
     if (!ops.write (0, 1, block) || !ops.sync ()) return Open::Failed;
-    flags = 0; flattened = 0; selfContained = false; sameSeed = true;
+    flags = bindLba ? kBound : 0; flattened = 0; selfContained = false; sameSeed = true; boundLba = bindLba; boundElsewhere = false;
     memcpy (storeSeed, seed, 32);
     active = true;
     return Open::Fresh;
@@ -258,7 +277,7 @@ struct Overlay {
     if (!ops.read (0, 1, now)) return -1;
     encodeHeader (block, pages, storeSeed, generation);
     if (memcmp (now, block, kHeaderBytes)) return -1;        // the header on the medium is not the one this store was opened with
-    encodeHeader (block, pages, storeSeed, generation, flags | kSelfContained, flattened + *written);
+    encodeHeader (block, pages, storeSeed, generation, flags | kSelfContained, flattened + *written, boundLba);
     if (!ops.write (0, 1, block) || !ops.sync ()) return -1;
     flags |= kSelfContained;
     flattened += *written;

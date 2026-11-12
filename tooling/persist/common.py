@@ -22,6 +22,9 @@ GPT_PRIMARY_SHA256 = '90a9d3bb038bca211aa60a6ea28dc787f8b744c0d213da156a19ab6541
 GPT_BACKUP_SHA256 = '21b04d671244d063d6eb6d8da618992a820dada5f81e9a1c093eb6e58e4455d3'
 ROOTFS_INDEX, ROOTFS_FIRST, ROOTFS_LAST = 34, 56060928, 71789567
 DATA_INDEX, DATA_FIRST = 35, 71789568
+# linux_data's last LBA (the GPT's, out/persistent/gpt.json): the 27.3 line's root image from DATA_FIRST, its Data store window at the
+# end below the reserve (docs/k273-line.md), bound to its LBA with data-store-lba.
+DATA_LAST = 124552186
 ESP_INDEX = 36                                   # partition 37
 ESP_BLOCKS = 262144                              # 1 GiB
 ESP_FIRST = ROOTFS_LAST + 1 - ESP_BLOCKS         # 71527424 = bs=1M seek=279404
@@ -174,14 +177,39 @@ def seed_info(path):
 
 
 SELF_CONTAINED = 1   # PersistOverlay.h kSelfContained
+BOUND = 2            # PersistOverlay.h kBound: the store belongs to the window at its bound_lba (data-store-lba)
 # The installed store's page count (a 12 GiB Data disk). The window's place depends on its size (store_first), so a seed of another
 # size looks for its header elsewhere, finds a "blank" window inside the installed store and initialises it over the owner's pages:
 # the store guard cannot see that. The tools refuse data-persist=2 for such a seed unless PIANO_DATA_STORE_RELAYOUT=1.
 INSTALLED_STORE_PAGES = 3145728
 
 
-def check_store_size(seed):
-    """SystemExit when SEED (seed_info) would put its store window somewhere else than the installed store's."""
+def k273_store_first(seed):
+    """The first LBA of the 27.3 line's store window for SEED (seed_info): the end of linux_data below the reserve."""
+    return store_first(DATA_LAST, seed['store_blocks'])
+
+
+def store_args_of(args):
+    """(root partition, data-store-lba or None) of a kernel argument list."""
+    named = dict(x.split('=', 1) for x in args if '=' in x)
+    lba = named.get('data-store-lba')
+    return named.get('native-ufs-root-part', 'linux_rootfs'), int(lba, 0) if lba else None
+
+
+def check_store_size(seed, args=()):
+    """SystemExit when SEED (seed_info) would put its store window somewhere else than the installed store's. A store on linux_data
+    (ARGS: native-ufs-root-part=linux_data, the 27.3 line) is not the installed one: any size, but only bound to its window
+    (data-store-lba = k273_store_first(seed)), so it can never open another place."""
+    part, lba = store_args_of(args)
+    if part == 'linux_data':
+        if lba != k273_store_first(seed):
+            raise SystemExit(f'a Data store on linux_data needs data-store-lba={k273_store_first(seed)} (its window for this '
+                             f'{seed["logical_bytes"]}-byte seed), not {lba}: the binding keeps it from opening any other place')
+        return
+    if part != 'linux_rootfs':
+        raise SystemExit(f'native-ufs-root-part={part}: no Data store layout is known there')
+    if lba is not None:
+        raise SystemExit('data-store-lba on linux_rootfs: the installed store is unbound (docs/data-store.md)')
     if seed['pages'] != INSTALLED_STORE_PAGES and os.environ.get('PIANO_DATA_STORE_RELAYOUT') != '1':
         raise SystemExit(f'this seed is {seed["logical_bytes"]} bytes ({seed["pages"]} pages), the installed store {INSTALLED_STORE_PAGES} '
                          'pages: its store window would start elsewhere, inside the installed store, and a first boot with '
@@ -206,6 +234,8 @@ def store_header(raw):
             struct.unpack_from('<I', raw, 124)[0] == zlib.crc32(raw[64:124], zlib.crc32(raw[:60])) & 0xffffffff:
         flags, = struct.unpack_from('<I', raw, 72)
         info.update(flags=flags, self_contained=bool(flags & SELF_CONTAINED), flattened=struct.unpack_from('<Q', raw, 80)[0])
+        if flags & BOUND:
+            info['bound_lba'] = struct.unpack_from('<Q', raw, 88)[0]
     return info
 
 

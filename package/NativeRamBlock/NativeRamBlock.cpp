@@ -243,6 +243,10 @@ public:
   static bool discardRequested() { uint32_t v = 0; return PE_parse_boot_argn("sheng-data-reset", &v, sizeof v) && (v == 1 || v == 2); }
   static uint32_t replaceRequested() { uint32_t v = 0; return PE_parse_boot_argn("data-store-replace", &v, sizeof v) ? v : 0; }
   static bool flattenRequested() { uint32_t v = 0; return PE_parse_boot_argn("data-store-flatten", &v, sizeof v) && v == 1; }
+  //   data-store-lba=N       UniXNU-piano (2026-11-13, a second store: docs/k273-line.md): the store window must start at LBA N
+  //                          (NativeUfs refuses another place) and the store must be bound to it (PersistOverlay.h kBound): a valid
+  //                          store not bound to N is kept as another seed's; a new store is bound to N. 0 or absent: as before.
+  static uint64_t bindRequested() { uint64_t v = 0; return PE_parse_boot_argn("data-store-lba", &v, sizeof v) ? v : 0; }
   static void seedText(const uint8_t digest[32], char out[9]) { snprintf(out, 9, "%08x", persist::seedTag(digest)); }
   static constexpr uint32_t kFlattenPages = 256;   // 1 MiB per flatten run
   // data-store-flatten (PersistOverlay.h flatten): only this seed's store, open read-write. Runs before the disk is published.
@@ -314,9 +318,14 @@ public:
         if (gStoreTrace) ops.traceBitmap = bb;
         storeTrace("window open at LBA %llu; opening the store (%s, data-store-replace %#x, sheng-data-reset %d)", first,
                    mode == 1 ? "read only" : "read-write", replaceRequested(), discardRequested() ? 1 : 0);
+        const uint64_t bind = bindRequested();
         persist::Open result = overlayBits && stage ? overlay.open(ops, pages, seedHash, mode == 1, overlayBits, discardRequested(),
-                                                                   replaceRequested())
+                                                                   replaceRequested(), bind)
                                                     : persist::Open::Failed;
+        if (bind)
+          IOLog("NativeRamBlock: data-store-lba=%llu: window at LBA %llu, store %s\n", bind, first,
+                overlay.boundElsewhere ? (overlay.boundLba ? "bound to another window: kept" : "not bound to a window: kept")
+                : result == persist::Open::Fresh ? "new, bound to it" : overlay.boundLba == bind ? "bound to it" : "-");
         storeTrace("store opened: %s (header check %d, generation %llu, present %llu)",
                    result == persist::Open::Resumed ? "resumed" : result == persist::Open::Fresh ? "fresh"
                    : result == persist::Open::Blank ? "blank" : result == persist::Open::Kept ? "kept" : "FAILED",

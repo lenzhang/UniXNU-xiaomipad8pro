@@ -2,7 +2,12 @@
 """A Data seed without the pages of deleted files: the volume's free space is overwritten with zeros, which the packed format
 (DarwinBoot's DBRDISK1: nonzero pages only) leaves out.
 
-  compact-seed.py IN.img OUT.img [--work DIR]
+  compact-seed.py IN.img OUT.img [--work DIR] [--grow-gib N]
+
+--grow-gib N: the disk and its APFS container grown to N GiB first (diskutil apfs resizeContainer on the whole-disk container; the
+Data volume keeps its UUID and files): the 27.3 line's store seed (docs/k273-line.md), whose window on linux_data has room for more
+than the 27.0.1 line's 12 GiB. A seed of another size is another store layout: only a store bound to its window (data-store-lba)
+may use one (tooling/persist/common.py check_store_size).
 
 Why: a staging step that replaces files (tooling/k27/stage-soft-metal.py replaces the base seed's Metal plugin bundle, 40 MB)
 frees the old file's blocks, but they keep their bytes, so the packed seed carries both the old and the new copy: the 27.0.1
@@ -37,6 +42,7 @@ def main():
     p.add_argument('seed', type=Path)
     p.add_argument('out', type=Path)
     p.add_argument('--work', type=Path)
+    p.add_argument('--grow-gib', type=int)
     a = p.parse_args()
     a.out.parent.mkdir(parents=True, exist_ok=True)
     before = packed_ramdisk.inspect(a.seed)[0]
@@ -48,11 +54,19 @@ def main():
             for offset, data in extents:
                 handle.seek(offset)
                 handle.write(data)
+            if a.grow_gib:
+                if a.grow_gib << 30 <= logical:
+                    raise SystemExit(f'--grow-gib {a.grow_gib}: the seed is {logical} bytes already')
+                handle.truncate(a.grow_gib << 30)
         run('hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nomount', '-nobrowse', str(raw), stdout=subprocess.DEVNULL)
         disk_of = [sys.executable, str(D / 'tooling/k273/disk-of.py')]
         whole = subprocess.run([*disk_of, 'whole', str(raw)], check=True, capture_output=True, text=True).stdout.strip()
         try:
             volume = subprocess.run([*disk_of, 'volume', whole], check=True, capture_output=True, text=True).stdout.strip()
+            if a.grow_gib:
+                container = volume.rsplit('s', 1)[0]   # /dev/diskNs1 -> /dev/diskN, the container on the image's disk
+                run('diskutil', 'apfs', 'resizeContainer', container, '0', stdout=subprocess.DEVNULL)
+                print(f'{container}: grown to {a.grow_gib} GiB')
             mount = Path(scratch) / 'mnt'
             mount.mkdir()
             run('diskutil', 'mount', '-mountPoint', str(mount), volume, stdout=subprocess.DEVNULL)

@@ -257,6 +257,41 @@ int main() {
     CHECK(directDiskIO(T.disk, r, m, st.data(), 8, false, 0, T.disk.bytes, bb, &err) == T.disk.bytes && out == flat(S));
   }
 
+  // --- the window binding (data-store-lba, kBound): a second store must never be resumed as the first, nor the first as it ---------
+  {
+    const uint64_t here = 117998394, there = 68119455;
+    std::vector<uint8_t> o3 = flat(X);
+    Medium m(windowBlocks(pages));                 // junk: a window never written
+    Overlay o; CHECK(o.open(m, pages, X.digest, false, bits.data(), false, 0, here) == Open::Fresh && o.boundLba == here &&
+                     (o.flags & kBound) && !o.boundElsewhere);
+    writeAt(X, o, m, o3, 8192, 9000, 77);
+    HeaderInfo info; CHECK(parseHeader(m.blocks.data(), &info) == 0 && (info.flags & kBound) && info.boundLba == here);
+    Overlay same; CHECK(same.open(m, pages, X.digest, false, bits.data(), false, 0, here) == Open::Resumed && image(X, same, m) == o3);
+    Medium copy = m.fork();                        // the same blocks at another window (a moved partition, a wrong LBA)
+    Overlay other; CHECK(other.open(copy, pages, X.digest, false, bits.data(), false, 0, there) == Open::Kept && other.boundElsewhere &&
+                         copy.writes == 0);
+    // a kernel that asks for no binding (the 27.0.1 line's) reads it as an ordinary store of its seed, unchanged
+    Overlay plain; CHECK(plain.open(m, pages, X.digest, true, bits.data()) == Open::Resumed && image(X, plain, m) == o3);
+    // another seed under the binding: still the seed guard
+    Overlay y; CHECK(y.open(m, pages, Y.digest, false, bits.data(), false, 0, here) == Open::Kept && !y.boundElsewhere);
+    // a store made without a binding (the first store) is never taken by a kernel asking for one, even with its own seed
+    Medium first(windowBlocks(pages));
+    std::vector<uint8_t> o4 = flat(X);
+    { Overlay f; CHECK(f.open(first, pages, X.digest, false, bits.data()) == Open::Fresh && !(f.flags & kBound));
+      writeAt(X, f, first, o4, 4096, 5000, 91); }
+    Medium firstCopy = first.fork();
+    Overlay b; CHECK(b.open(firstCopy, pages, X.digest, false, bits.data(), false, 0, here) == Open::Kept && b.boundElsewhere &&
+                     b.sameSeed && firstCopy.writes == 0);
+    Overlay back; CHECK(back.open(firstCopy, pages, X.digest, false, bits.data()) == Open::Resumed && image(X, back, firstCopy) == o4);
+    // a flatten keeps the binding
+    Overlay fl; CHECK(fl.open(m, pages, X.digest, false, bits.data(), false, 0, here) == Open::Resumed);
+    std::vector<uint8_t> st(8 * kBlock); uint64_t written = 0;
+    CHECK(fl.flatten(m, X.disk, st.data(), 8, &written) == 1);
+    CHECK(parseHeader(m.blocks.data(), &info) == 0 && (info.flags & kBound) && (info.flags & kSelfContained) && info.boundLba == here);
+    Overlay after; CHECK(after.open(m, pages, Y.digest, false, bits.data(), false, 0, there) == Open::Kept);   // self-contained, but bound elsewhere
+    Overlay ok2; CHECK(ok2.open(m, pages, Y.digest, false, bits.data(), false, 0, here) == Open::Resumed && ok2.selfContained);
+  }
+
   printf("%s: %u checks, %u failures (flatten: %llu writes, %u power cuts)\n", failures ? "FAIL" : "PASS", checks, failures,
          (unsigned long long) totalWrites, cuts);
   return failures ? 1 : 0;

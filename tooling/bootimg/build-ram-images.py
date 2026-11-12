@@ -235,7 +235,7 @@ def firmware_addon(payloads, kc, adt, addon):
     return record, addon
 
 
-def data_store_args(seed, kc):
+def data_store_args(seed, kc, extra=()):
     """The Data store arguments of a RAM test image (docs/data-store.md): (arguments, record).
     PIANO_DATA_PERSIST=0|1|2 when set; else 2 only when the image's seed is the installed one (PIANO_INSTALLED_SEED, or
     out/persistent/installed.json), 0 when it is another seed's, and when the installed seed is unknown 2 with a kernel collection that
@@ -264,7 +264,7 @@ def data_store_args(seed, kc):
         raise SystemExit(f'{kc}: no store guard in this kernel collection (NativeRamBlock before docs/data-store.md): it knows neither '
                          'data-store-replace nor data-store-flatten')
     if mode == '2':
-        common.check_store_size(info)
+        common.check_store_size(info, extra)
     if mode == '2' and not same and not guard and not replace:
         raise SystemExit(f'data-persist=2 with seed {this} and a kernel collection WITHOUT the store guard: its NativeRamBlock would '
                          f'replace a store of any other seed (installed: {theirs or "unknown"}, {source}), dropping the owner\'s Data. '
@@ -381,9 +381,22 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     if store:
         raise SystemExit(f'PIANO_EXTRA_ARGS: {", ".join(sorted(store))}: use PIANO_DATA_PERSIST / PIANO_DATA_STORE_REPLACE / '
                          'PIANO_DATA_STORE_FLATTEN (checked against the installed seed, docs/data-store.md)')
-    persist, store_record = data_store_args(seed, kc)
-    base = deny_exec(fast_boot(K27_ARGS, extra), extra, deny_exec_env())
-    base = [x for x in base if not x.startswith('data-persist=')] + persist + [f'droidvm-utc={utc}'] + extra
+    # PIANO_EXACT_ARGS: an installed entry's arguments verbatim (tooling/k273/build-dual-esp.py's record "k273.cmdline"), for the RAM
+    # test of that entry: its data-persist (and data-store-lba) checked as PIANO_DATA_PERSIST's would be, PIANO_EXTRA_ARGS after it
+    # (e.g. piano-reset-after=N piano-reset-to=bootloader), the 1-CPU entry with cpus=1 for sheng-smp=1.
+    exact = os.environ.get('PIANO_EXACT_ARGS', '').split()
+    if exact:
+        mode = dict(x.split('=', 1) for x in exact if '=' in x).get('data-persist', '0')
+        if os.environ.get('PIANO_DATA_PERSIST', mode) != mode:
+            raise SystemExit(f'PIANO_EXACT_ARGS says data-persist={mode}, PIANO_DATA_PERSIST={os.environ["PIANO_DATA_PERSIST"]}')
+        os.environ['PIANO_DATA_PERSIST'] = mode
+        persist, store_record = data_store_args(seed, kc, exact + extra)
+        names = {x.split('=', 1)[0] for x in extra}
+        base = [x for x in exact if x != 'sheng-smp=1' and x.split('=', 1)[0] not in names] + extra
+    else:
+        persist, store_record = data_store_args(seed, kc, extra)
+        base = deny_exec(fast_boot(K27_ARGS, extra), extra, deny_exec_env())
+        base = [x for x in base if not x.startswith('data-persist=')] + persist + [f'droidvm-utc={utc}'] + extra
     one = ' '.join(base + ['cpus=1'])
     smp = ' '.join(base + ['sheng-smp=1'])
     for line in (one, smp):

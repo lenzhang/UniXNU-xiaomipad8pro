@@ -1606,7 +1606,14 @@ extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const
       // The reserve at the end of the partition belongs to the diagnostic log (its last 32 MiB, with the export region below them);
       // the store ends just below it.
       uint64_t first = gStoreGeometry.last + 1 - reserve - blocks;
-      if (storeMode () == 2 && !hostStoreOpen (first, blocks)) reason = "window refused";
+      // UniXNU-piano: data-store-lba=N (a second store, docs/k273-line.md): the window only at LBA N. Another place (another
+      // partition, seed size or reserve) is refused before anything is read or written there.
+      uint64_t expected = 0;
+      if (PE_parse_boot_argn ("data-store-lba", &expected, sizeof (expected)) && expected && expected != first) {
+        IOLog ("NativeUfs: store window would start at LBA %llu, data-store-lba=%llu: refused\n", first, expected);
+        reason = "not at data-store-lba";
+      }
+      else if (storeMode () == 2 && !hostStoreOpen (first, blocks)) reason = "window refused";
       else {
         gStoreRegionFirst = first;
         gStoreRegionBlocks = blocks;

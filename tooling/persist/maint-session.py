@@ -615,6 +615,40 @@ def linux_data_root(s):
     s.need(got == s.a.root_sha256.lower() if s.execute else None, f'linux_data read back over {n} bytes: {got} = {s.a.root_sha256[:16]}')
 
 
+@step('k273-store', 'maintenance, read only')
+def k273_store(s):
+    """The 27.3 entry's Data store on linux_data (tooling/k273/build-dual-esp.py, docs/k273-line.md §6), from --esp's record
+    ("k273.store"): the window lies inside linux_data, after the root image and below the reserve, clear of linux_rootfs; its header
+    block is blank (no SHNGDATA: before the entry's first data-persist=2 boot) or a valid store of the record's seed bound to that
+    LBA (PersistOverlay.h kBound). The installed store's header in linux_rootfs is read too: unbound, the installed seed's."""
+    record = s.esp_record(s.a.esp)
+    k = (record or {}).get('k273')
+    if not k:
+        raise Stop(f'{s.a.esp}: its record has no k273 entry (tooling/k273/build-dual-esp.py)')
+    store = k['store']
+    first, blocks = store['first_lba'], store['blocks']
+    root_end = (store.get('root_last_lba') or 0) + 1 or None
+    s.need(common.DATA_FIRST <= first and first + blocks <= common.DATA_LAST + 1 - common.RESERVE_BLOCKS,
+           f'store window LBA {first}-{first + blocks - 1} inside linux_data ({common.DATA_FIRST}-{common.DATA_LAST}) below the reserve')
+    if root_end:
+        s.need(first >= root_end, f'store window after the root image (which ends before LBA {root_end})')
+    s.need(first > common.ROOTFS_LAST, 'store window clear of linux_rootfs')
+    map_nodes(s)
+    dev = s.nodes.get('linux_data')
+    h = s.t('peek', dev, first - common.DATA_FIRST, 0, 128) if dev else None
+    if h:
+        header = common.store_header(bytes.fromhex(h['hex']))
+        s.log(f'  info  27.3 store header at LBA {first}: {header}')
+        ok = header['state'] == 'blank' or (header['state'] == 'valid' and header.get('bound_lba') == first and
+                                             header['identity'][:16] == k['seed']['identity_sha256'][:16])
+        s.need(ok, f'27.3 store: blank, or bound to LBA {first} with seed {k["seed"]["identity_sha256"][:16]}')
+    h = s.t('peek', s.nodes['rootfs'], rel(store_new(s)), 0, 128)
+    if h:
+        header = common.store_header(bytes.fromhex(h['hex']))
+        s.log(f'  info  installed store header at LBA {store_new(s)}: {header}')
+        s.need(header['state'] != 'valid' or 'bound_lba' not in header, 'installed store unbound (only the 27.3 kernel binds)')
+
+
 @step('abl-check', 'ABL fastboot, read only')
 def abl_check(s):
     """fastboot getvar from ABL (read only): identity, unlock, slot A state, battery, boot_a size."""
