@@ -49,6 +49,11 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBSD.h>
 #include <IOKit/IODeviceMemory.h>
+#include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSData.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSString.h>
 #include <libkern/libkern.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -58,6 +63,7 @@
 #include "ChargerPmic.h"
 #include "ChargerWdog.h"
 #include "ChargerEnable.h"
+#include "ChargerFix.h"
 #include "Gauge.h"
 #include "PianoBattery.h"
 #include "Servreg.h"
@@ -86,7 +92,7 @@ struct Args {
   uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor, board, ucsi;
   uint32_t policy, rp, health, healthStop, healthResume;
   uint32_t ramp, rpMax, writeMs, kick;
-  uint32_t wdog, chgen;
+  uint32_t wdog, chgen, chgfix, chgwatch;
   bool hasRtcOffset;
   uint32_t rtcOffset;
 };
@@ -141,6 +147,13 @@ void readArgs()
   // pulse an enable that reads on while the charger reads disabled (bit 0 cleared for 2 s, then set)
   gArgs.chgen = bootArg("piano-power-chgen", 1);
   if (gArgs.chgen > 2) gArgs.chgen = 2;
+  // the recovery of a charger that reads DISABLED with its enable command on (ChargerFix.h, charging-policy.md §20), level 1 only:
+  // 0 (default) none, 1 step A (the enable command pulsed) then B (AICL restarted), 2 also C (the USB input suspended 1 s)
+  gArgs.chgfix = bootArg("piano-power-chgfix", 0);
+  if (gArgs.chgfix > 2) gArgs.chgfix = 2;
+  // the 2 s watch of the charger's state from PianoPower's start, in seconds (0: none; read only)
+  gArgs.chgwatch = bootArg("piano-power-chgwatch", 180);
+  if (gArgs.chgwatch > 1800) gArgs.chgwatch = 1800;
   gArgs.rtcOffset = 0;
   gArgs.hasRtcOffset = PE_parse_boot_argn("piano-rtc-offset", &gArgs.rtcOffset, sizeof gArgs.rtcOffset);
 }
@@ -202,20 +215,24 @@ void ioWr(void *, Window w, uint32_t offset, uint32_t value) { wr32(windowBase(w
 void ioDelay(void *, unsigned us) { IODelay(us); }
 const Io gIo = {nullptr, ioRd, ioWr, ioDelay};
 
-// The two write channels PianoPower maps: the charger MISC APID's (the watchdog, ChargerWdog.h) and the CHGR APID's (the charging
-// enable command, ChargerEnable.h), each only when its gates pass (chnls 0x0C500000 + 0x1000 * APID, data +0x10, command +0x00 with
-// opcode 0, status +0x08: the arbiter v7 owner-channel write PianoDwc3 and PianoTorch make). The two classes' allowlists decide what
-// goes through; this only refuses an APID without a mapped channel.
+// The three write channels PianoPower maps: the charger MISC APID's (the watchdog, ChargerWdog.h; ChargerFix.h's AICL restart), the
+// CHGR APID's (the charging enable command, ChargerEnable.h) and the USBIN APID's (ChargerFix.h's input suspend, piano-power-chgfix
+// only), each only when its gates pass (chnls 0x0C500000 + 0x1000 * APID, data +0x10, command +0x00 with opcode 0, status +0x08:
+// the arbiter v7 owner-channel write PianoDwc3 and PianoTorch make). The classes' allowlists decide what goes through; this only
+// refuses an APID without a mapped channel.
 constexpr uint64_t kSpmiChnls = 0x0c500000;
 constexpr uint32_t kChnlStride = 0x1000, kChnlCmd = 0x00, kChnlStatus = 0x08, kChnlWdata0 = 0x10;
 struct Chnl {
   Region page;
   int apid;
 };
-Chnl gChnls[2] = {{{nullptr, 0}, -1}, {{nullptr, 0}, -1}};   // [0] MISC's, [1] CHGR's
+constexpr unsigned kChnlSlots = 3;
+Chnl gChnls[kChnlSlots] = {{{nullptr, 0}, -1}, {{nullptr, 0}, -1}, {{nullptr, 0}, -1}};   // [0] MISC's, [1] CHGR's, [2] USBIN's
 bool mapChnl(unsigned slot, int apid)
 {
-  if (slot >= 2 || apid < 0 || !mapRegion(gChnls[slot].page, kSpmiChnls + uint64_t(kChnlStride) * uint32_t(apid), 0x20)) return false;
+  if (slot >= kChnlSlots || apid < 0) return false;
+  if (gChnls[slot].page.va) return gChnls[slot].apid == apid;   // mapped already (one APID a slot)
+  if (!mapRegion(gChnls[slot].page, kSpmiChnls + uint64_t(kChnlStride) * uint32_t(apid), 0x20)) return false;
   gChnls[slot].apid = apid;
   return true;
 }
@@ -335,6 +352,23 @@ class PianoPower : public IOService {
   void chgenWriteLine(uint64_t t, const ChgEnWrite &r);
   void chgenStep(uint64_t t, const PortState *p, char *why, size_t whySize);
   char fChgenWhy[96] = "";   // the last report's reason for no enable write while the charger read disabled
+  ChgEnInputs chgenInputs(const PortState *p);
+  // The charger complex (ChargerFix.h, charging-policy.md §20): its snapshot with every report, the 2 s watch of its state, the
+  // recovery (piano-power-chgfix), and the picture in the IORegistry (PianoCharger, PianoChargerText, PianoChargerChanges).
+  ChargerComplex fCx;
+  ChargerWatch fWatch;
+  ChargerFix fFix;
+  CxSnapshot fCxLast;
+  bool fCxHave = false;
+  static constexpr unsigned kChanges = 8;
+  char fChanges[kChanges][300] = {};
+  unsigned fChangesNext = 0, fChangesCount = 0;
+  void startFix();
+  void fixPoll(uint64_t now);
+  void fixEventLine(uint64_t now, const FixEvent &ev);
+  void watchLine(const CxTransition &x);
+  void keepChange(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+  void publishCharger();
   void readRtcLine(char *line, size_t size);
   void surveyAdsp();
   void probeGauges();
@@ -407,6 +441,9 @@ bool PianoPower::start(IOService *provider)
   if (!IOService::start(provider)) return false;
   note("start: piano-power=%u period %u s, gauges %s; %s", gArgs.level, gArgs.period, gArgs.gauge ? "on" : "off",
        gArgs.level >= 2 ? "level 2: the DSP's charger firmware is started and its charger properties are managed"
+                        : gArgs.chgfix ? "level 1: the DSP is not started; the only PMIC writes are the charger watchdog's "
+                                         "(piano-power-wdog), the charging enable command's (piano-power-chgen) and the recovery's "
+                                         "(piano-power-chgfix)"
                         : gArgs.wdog || gArgs.chgen ? "level 1: the DSP is not started; the only PMIC writes are the charger watchdog's "
                                                       "(piano-power-wdog) and the charging enable command's (piano-power-chgen)"
                                                     : "level 1: read only (no PMIC register written, the DSP is not started)");
@@ -585,6 +622,7 @@ void PianoPower::startWdog()
   if (!fWdog.located) {
     note("wdog: %s", fWdog.why);
     note("chgen: CHGR not located: no write");
+    note("complex: the charger's blocks are not located: no snapshot, no watch, no recovery");
     return;
   }
   const WdogBlock &m = fWdog.misc, &c = fWdog.chgr;
@@ -615,6 +653,218 @@ void PianoPower::startWdog()
   else if (!fWdog.why[0] && fWdog.mode != WdogMode::off)
     note("wdog: not armed (WD_CFG bit 0/1 clear): no pet, no clear%s", fWdog.refused ? " (refused writes!)" : "");
   startChgen(before);
+  startFix();
+}
+
+// The charger complex (ChargerFix.h, charging-policy.md §20): its seven blocks, their configuration as the boot stages left it (one
+// line a block, read only), the watch from now (piano-power-chgwatch), and with piano-power-chgfix the recovery's channels and the
+// start guard.
+void PianoPower::startFix()
+{
+  fCx.locate(gIo, fArbiter, fCharger);
+  fFix.mode = FixMode(gArgs.chgfix);
+  fFix.locate(fCx, fChgEn);
+  if (!fCx.located) {
+    note("complex: not located (no Type-C block): no snapshot, no watch, no recovery");
+    return;
+  }
+  char line[480];
+  {
+    CxText t(line, sizeof line);
+    t.text("complex: the blocks at their SCHG places from Type-C (inferred):");
+    for (unsigned i = 0; i < kCxBlocks; ++i) {
+      const CxBlock &b = fCx.b[i];
+      char one[64];
+      snprintf(one, sizeof one, "%s %s%#06x APID %d EE %u type %02x/%02x", i ? "," : "", cxName(i), b.address, b.apid, b.owner, b.type,
+               b.subtype);
+      t.text(one);
+    }
+  }
+  note("%s", line);
+  const uint64_t now = nowMs();
+  fCxLast = fCx.read(gIo, true, now);
+  fCxHave = true;
+  fWatch.see(fCxLast, nullptr);
+  cxStatusText(fCxLast, line, sizeof line);
+  note("complex: status +06..+0f, rt: %s", line);
+  // the configuration once (what the boot stages left: currents, float voltage, JEITA, timers, AICL, thermal sources), +40..+bf
+  for (unsigned i = 0; i < kCxBlocks; ++i) {
+    const CxRegs &r = fCxLast.r[i];
+    CxText t(line, sizeof line);
+    for (unsigned k = 0; k < kCxCfgBytes; ++k) {
+      if (k % 8 == 0 && k) t.put(k % 32 ? ' ' : '|');
+      if (r.cfgOk & (1u << (k / 8))) t.hex(r.cfg[k]);
+      else t.text("--");
+    }
+    note("complex: %s %#06x +40..+bf: %s", cxName(i), fCx.b[i].address, line);
+  }
+  if (gArgs.chgwatch) {
+    fWatch.extend(now, uint64_t(gArgs.chgwatch) * 1000);
+    note("complex: watching the charger's state every 2 s for %u s (piano-power-chgwatch; read only)", gArgs.chgwatch);
+  }
+  if (fFix.mode != FixMode::off && !fFix.why[0]) {
+    // the channels: CHGR's (when chgen=0 left it unmapped), MISC's (when the watchdog's mode left it unmapped), USBIN's
+    const bool chgr = mapChnl(1, fFix.chgr.apid), misc = !fFix.misc.ours() || mapChnl(0, fFix.misc.apid),
+               usbin = !fFix.usbin.ours() || mapChnl(2, fFix.usbin.apid);
+    if (!chgr) fFix.why = "CHGR's write channel does not map";
+    if (!misc || !usbin) note("chgfix: %s's write channel does not map: its step fails", !misc ? "MISC" : "USBIN");
+  }
+  note("chgfix: piano-power-chgfix=%u (%s)%s%s%s", gArgs.chgfix, fixModeName(fFix.mode),
+       gArgs.level >= 2 && fFix.mode != FixMode::off ? "; level 2: no step (the DSP's firmware owns the charger)" : "",
+       fFix.why[0] ? "; no write: " : "", fFix.why);
+  const PortState p = readPort(gIo, fCharger);
+  fixEventLine(now, fFix.startGuard(gIo, gWriter, p.ok && p.sourceSeen));
+  publishCharger();
+}
+
+void PianoPower::keepChange(const char *fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(fChanges[fChangesNext], sizeof fChanges[0], fmt, ap);
+  va_end(ap);
+  fChangesNext = (fChangesNext + 1) % kChanges;
+  if (fChangesCount < kChanges) fChangesCount++;
+}
+
+// The watch saw CHGR's state change between two ticks: the line, the record, the picture published at once.
+void PianoPower::watchLine(const CxTransition &x)
+{
+  const uint64_t a = x.fromMs > fStartMs ? x.fromMs - fStartMs : 0, b = x.toMs > fStartMs ? x.toMs - fStartMs : 0;
+  note("[%llus] chgr: watch: CHGR state %u (%s) -> %u (%s)%s between +%llu.%llu s and +%llu.%llu s (XNU uptime %llu.%llu s): %s",
+       b / 1000, x.from, chargerStateName(x.from), x.to, chargerStateName(x.to), x.stop ? ", the STOP," : "", a / 1000, a % 1000 / 100,
+       b / 1000, b % 1000 / 100, x.toMs / 1000, x.toMs % 1000 / 100, x.diff);
+  keepChange("+%llu.%llu s (uptime %llu.%llu s) state %u -> %u: %s", b / 1000, b % 1000 / 100, x.toMs / 1000, x.toMs % 1000 / 100,
+             x.from, x.to, x.diff);
+  publishCharger();
+}
+
+void PianoPower::fixEventLine(uint64_t now, const FixEvent &ev)
+{
+  if (ev.kind == FixEvent::none) return;
+  const uint64_t t = now > fStartMs ? (now - fStartMs) / 1000 : 0;
+  switch (ev.kind) {
+    case FixEvent::skipped:
+      note("[%llus] chgfix: step %c: %s", t, fixStepLetter(ev.step), ev.why);
+      break;
+    case FixEvent::wrote:
+    case FixEvent::guard:
+      note("[%llus] chgfix: %s%s (attempt %u): %s %#06x +%#04x %#04x -> %#04x: %s, read back %s%#04x, CHGR state now %u (%s) (channel "
+           "status %#x)%s%s",
+           t, ev.kind == FixEvent::guard ? "" : "step ", ev.kind == FixEvent::guard ? "start guard" : fixStepName(ev.step),
+           ev.attempt, ev.block, ev.address, ev.reg, ev.before, ev.value, ev.ok ? "ok" : "FAILED", ev.readBack ? "" : "not read, ",
+           ev.after, ev.state, chargerStateName(ev.state), ev.status, ev.why[0] ? "; " : "", ev.why);
+      keepChange("+%llu s chgfix %s %s +%#04x %#04x -> %#04x %s", t, ev.kind == FixEvent::guard ? "guard" : ev.what, ev.block, ev.reg,
+                 ev.before, ev.value, ev.ok ? "ok" : "FAILED");
+      break;
+    case FixEvent::judged:
+      note("[%llus] chgfix: after step %s (attempt %u): CHGR state %u (%s), the packs %+d mA: %s", t, fixStepName(ev.step), ev.attempt,
+           ev.state, chargerStateName(ev.state), ev.packsMa, ev.why);
+      keepChange("+%llu s chgfix step %c judged: state %u, %+d mA: %s", t, fixStepLetter(ev.step), ev.state, ev.packsMa, ev.why);
+      break;
+    case FixEvent::finished:
+      note("[%llus] chgfix: %s (%u attempts, %u worked)", t, ev.why, fFix.attempts, fFix.successes);
+      break;
+    default:
+      break;
+  }
+  publishCharger();
+}
+
+// The recovery's turn (ChargerFix::poll): at its own deadlines, with every watch tick and every report. The port read afresh; the
+// packs read afresh for a judge.
+void PianoPower::fixPoll(uint64_t now)
+{
+  if (fFix.mode == FixMode::off || fFix.why[0]) return;
+  if (fFix.judgeDue(now)) sampleGauges();
+  const PortState p = readPort(gIo, fCharger);
+  const ChgEnInputs in = chgenInputs(&p);
+  const FixEvent ev = fFix.poll(gIo, gWriter, fChgEn, in, gArgs.level == 1, fBattery.ok ? fBattery.currentMa : 0, now);
+  if (ev.kind == FixEvent::wrote || ev.kind == FixEvent::judged) fWatch.extend(now, 90000);   // a restart, and a stop again, timed
+  fixEventLine(now, ev);
+}
+
+// The picture for a shell (read only; refreshed with every report, watch change and recovery event):
+//   PianoCharger         a dictionary: time-s, uptime-ms, state, state-name, packs-mA (text, signed), packs-mV, soc, the status
+//                        bytes +0x06..+0x10 of each block (data, named CHGR .. MISC), the configuration +0x40..+0xbf (CHGR-40 ..),
+//                        stops, first-stop-s, chgfix, chgfix-attempts;
+//   PianoChargerText     the same in one line;
+//   PianoChargerChanges  the last eight changes (watch transitions, recovery writes and judges), oldest first.
+void PianoPower::publishCharger()
+{
+  if (!fCx.located || !fCxHave) return;
+  const uint64_t now = nowMs(), t = (now - fStartMs) / 1000;
+  OSDictionary *d = OSDictionary::withCapacity(24);
+  if (!d) return;
+  auto num = [&](const char *key, uint64_t v) {
+    if (OSNumber *n = OSNumber::withNumber((unsigned long long)v, 64)) {
+      d->setObject(key, n);
+      n->release();
+    }
+  };
+  auto str = [&](const char *key, const char *v) {
+    if (OSString *s = OSString::withCString(v)) {
+      d->setObject(key, s);
+      s->release();
+    }
+  };
+  auto data = [&](const char *key, const void *bytes, unsigned n) {
+    if (OSData *o = OSData::withBytes(bytes, n)) {
+      d->setObject(key, o);
+      o->release();
+    }
+  };
+  const CxSnapshot &s = fCxLast;
+  num("time-s", t);
+  num("uptime-ms", now);
+  num("snapshot-s", s.ms > fStartMs ? (s.ms - fStartMs) / 1000 : 0);
+  num("state", s.chgrState());
+  str("state-name", chargerStateName(s.chgrState()));
+  char ma[16], text[160];
+  snprintf(ma, sizeof ma, "%+d", fBattery.ok ? fBattery.currentMa : 0);
+  str("packs-mA", fBattery.ok ? ma : "?");
+  num("packs-mV", fBattery.ok ? uint64_t(fBattery.voltageMv) : 0);
+  num("soc", fBattery.ok ? uint64_t(fBattery.socPct) : 0);
+  for (unsigned i = 0; i < kCxBlocks; ++i) {
+    const CxRegs &r = s.r[i];
+    if (r.statusOk) data(cxName(i), r.status, kCxStatusBytes);
+    if (s.full && r.cfgOk == 0xffff) {
+      char key[16];
+      snprintf(key, sizeof key, "%s-40", cxName(i));
+      data(key, r.cfg, kCxCfgBytes);
+    }
+  }
+  num("stops", fWatch.stops);
+  num("first-stop-s", fWatch.firstStopMs > fStartMs ? (fWatch.firstStopMs - fStartMs) / 1000 : 0);
+  num("first-stop-uptime-ms", fWatch.firstStopMs);
+  num("watching", fWatch.active ? 1 : 0);
+  snprintf(text, sizeof text, "piano-power-chgfix=%u: %s%s%c (attempt %u)", gArgs.chgfix, fFix.statusWhat,
+           fFix.statusStep != FixStep::none ? "; step " : "", fFix.statusStep != FixStep::none ? fixStepLetter(fFix.statusStep) : ' ',
+           fFix.statusAttempt);
+  str("chgfix", text);
+  num("chgfix-attempts", fFix.attempts);
+  setProperty("PianoCharger", d);
+  d->release();
+  char line[600];
+  const int n = snprintf(line, sizeof line, "[%llus] state %u (%s), packs %s mA %d mV %d %%, stops %u, %s | ", t, s.chgrState(),
+                         chargerStateName(s.chgrState()), fBattery.ok ? ma : "?", fBattery.voltageMv, fBattery.socPct, fWatch.stops,
+                         text);
+  if (n > 0 && unsigned(n) < sizeof line) cxStatusText(s, line + n, unsigned(sizeof line - unsigned(n)));
+  if (OSString *o = OSString::withCString(line)) {
+    setProperty("PianoChargerText", o);
+    o->release();
+  }
+  if (OSArray *a = OSArray::withCapacity(kChanges)) {
+    for (unsigned k = 0; k < fChangesCount; ++k) {
+      const unsigned i = (fChangesNext + kChanges - fChangesCount + k) % kChanges;
+      if (OSString *o = OSString::withCString(fChanges[i])) {
+        a->setObject(o);
+        o->release();
+      }
+    }
+    setProperty("PianoChargerChanges", a);
+    a->release();
+  }
 }
 
 // The charging enable command (ChargerEnable.h, charging-policy.md §19): CHGR from ChargerWdog's locate, its EE 0 APID the only one
@@ -650,10 +900,9 @@ void PianoPower::chgenWriteLine(uint64_t t, const ChgEnWrite &r)
 
 // With every report, after the watchdog's read: what changed in CHGR and MISC since the last report, who changed the enable command
 // (not us: ours are logged as they are made), then the decision. *why gets the reason no write was made (for the charging: line).
-void PianoPower::chgenStep(uint64_t t, const PortState *p, char *why, size_t whySize)
+// The battery and the port as the gates of ChargerEnable and ChargerFix take them: the latest gauge readings, the port state given.
+ChgEnInputs PianoPower::chgenInputs(const PortState *p)
 {
-  if (why && whySize) why[0] = 0;
-  if (!fChgEn.located) return;
   ChgEnInputs in;
   in.packsOk = fPack[0].ok && fPack[1].ok;
   for (unsigned i = 0; i < 2; ++i) {
@@ -672,10 +921,19 @@ void PianoPower::chgenStep(uint64_t t, const PortState *p, char *why, size_t why
     piano_adsp_status(&s);
     in.dspOwns = s.slave >= 0 && (s.slave & 2);
   }
+  return in;
+}
+
+void PianoPower::chgenStep(uint64_t t, const PortState *p, char *why, size_t whySize)
+{
+  if (why && whySize) why[0] = 0;
+  if (!fChgEn.located) return;
+  const ChgEnInputs in = chgenInputs(p);
   char diff[400];
   const ChgEnResult r = fChgEn.check(gIo, gWriter, fWdog.last, in, nowMs(), diff, sizeof diff);
   const uint64_t since = r.sinceMs > fStartMs ? (r.sinceMs - fStartMs) / 1000 : 0;
-  if (r.changed) note("[%llus] chgr: changed since [%llus]: %s", t, since, diff);
+  // the changes of CHGR and MISC alone, when the complex's snapshot (all seven blocks, report()) is not there to say them
+  if (r.changed && !fCx.located) note("[%llus] chgr: changed since [%llus]: %s", t, since, diff);
   if (r.cmdCleared || r.cmdSet)
     note("[%llus] chgen: the enable command went %#04x -> %#04x between [%llus] and [%llus], not by PianoPower; CHGR state %u -> %u (%s); %s",
          t, r.cmdWas, r.cmdNow, since, t, r.stateWas, fWdog.last.state(), chargerStateName(fWdog.last.state()),
@@ -918,6 +1176,23 @@ void PianoPower::report()
     wdogLine(line, sizeof line, t);
     note("%s", line);
     chgenStep(t, havePort && p.ok ? &p : nullptr, fChgenWhy, sizeof fChgenWhy);
+  }
+  if (fCx.located) {
+    // the whole complex (ChargerFix.h): what changed since the last report, the watch's state, the recovery's turn, the picture
+    const uint64_t now = nowMs();
+    const CxSnapshot s = fCx.read(gIo, true, now);
+    if (fCxHave) {
+      char diff[480];
+      if (cxDiff(fCxLast, s, diff, sizeof diff))
+        note("[%llus] chgr: changed since [%llus]: %s", t, fCxLast.ms > fStartMs ? (fCxLast.ms - fStartMs) / 1000 : 0, diff);
+    }
+    CxTransition x;
+    const bool moved = fWatch.see(s, &x);
+    fCxLast = s;
+    fCxHave = true;
+    if (moved) watchLine(x);
+    fixPoll(now);
+    publishCharger();
   }
   if (gArgs.ps) publishBattery(t, havePort && p.ok ? &p : nullptr);
   if (gArgs.level >= 2) {
@@ -1614,6 +1889,13 @@ void PianoPower::run()
     if (fWdog.petIfDue(gWriter, now, &pet) && !pet.ok) wdogWriteLine("pet", pet);
     ChgEnWrite pulseOn;
     if (fChgEn.restoreIfDue(gIo, gWriter, now, &pulseOn)) chgenWriteLine((now - fStartMs) / 1000, pulseOn);
+    if (fCx.located && !fSleepReports.quiet) {
+      // the 2 s watch of the charger's state (ChargerFix.h), each tick also the recovery's turn; the recovery's own deadlines
+      CxTransition x;
+      const uint32_t ticks = fWatch.ticks;
+      if (fWatch.tick(gIo, fCx, now, &x)) watchLine(x);
+      if (fWatch.ticks != ticks || (fFix.nextDue() && now >= fFix.nextDue())) fixPoll(now);
+    }
     serviceMca(now);
     // The USB-C relay (UsbcRelay.h): its client is ready once the generation is linked, the quiet is down and our UCSI read is through.
     if (fChannel)
@@ -1644,6 +1926,8 @@ void PianoPower::run()
     if (fReadyWarnDue && fReadyWarnDue < next) next = fReadyWarnDue;
     if (fWdog.nextDue() && fWdog.nextDue() < next) next = fWdog.nextDue();
     if (fChgEn.nextDue() && fChgEn.nextDue() < next) next = fChgEn.nextDue();
+    if (fWatch.nextDue() && fWatch.nextDue() < next) next = fWatch.nextDue();
+    if (fFix.nextDue() && fFix.nextDue() < next) next = fFix.nextDue();
     if (fHandover && !fHandoverAcked && fHandoverUntil < next) next = fHandoverUntil;
     if (fShutdownSeen && !fPolicyEnded && fShutdownUntil < next) next = fShutdownUntil;
     const uint32_t wait = next > now ? uint32_t(next - now < 60000 ? next - now : 60000) : 1;

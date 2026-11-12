@@ -177,8 +177,8 @@ struct CxText {
 };
 
 // "CHGR +06 c3>87 +10 22>20; DCDC +07 1e>14; MISC +44 00>02" for every byte read in both snapshots that differs (the configuration
-// part only when both are full). Returns how many differ.
-inline unsigned cxDiff(const CxSnapshot &a, const CxSnapshot &b, char *out, unsigned size)
+// part only when both are full and `cfg`). Returns how many differ.
+inline unsigned cxDiff(const CxSnapshot &a, const CxSnapshot &b, char *out, unsigned size, bool cfg = true)
 {
   CxText t(out, size);
   unsigned n = 0;
@@ -203,7 +203,7 @@ inline unsigned cxDiff(const CxSnapshot &a, const CxSnapshot &b, char *out, unsi
     const CxRegs &x = a.r[i], &y = b.r[i];
     if (x.statusOk && y.statusOk)
       for (unsigned k = 0; k < kCxStatusBytes; ++k) one(uint8_t(kCxStatus + k), x.status[k], y.status[k]);
-    if (a.full && b.full)
+    if (cfg && a.full && b.full)
       for (unsigned k = 0; k < kCxCfgBytes; ++k)
         if ((x.cfgOk & y.cfgOk) & (1u << (k / 8))) one(uint8_t(kCxCfg + k), x.cfg[k], y.cfg[k]);
   }
@@ -297,9 +297,7 @@ class ChargerWatch {
         if (!firstStopMs) firstStopMs = s.ms;
         lastStopMs = s.ms;
       }
-      CxSnapshot a = last, b = s;
-      a.full = b.full = false;   // the status part only: both readings have it
-      x.changed = cxDiff(a, b, x.diff, sizeof x.diff);
+      x.changed = cxDiff(last, s, x.diff, sizeof x.diff, false);   // the status part only: both readings have it
       if (t) *t = x;
     }
     if (s.chgrOk()) {
