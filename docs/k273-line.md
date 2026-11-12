@@ -72,6 +72,18 @@ linux_data is overwritten (owner decision).
 
 `tooling/k273/build-k273-image.sh` (`K273_ROOT=k273`, the default: root on linux_data; `K273_ROOT=k27`: the 27.3 collection and
 identity on the installed 27.0.1 root, no write needed). Data volatile, `native-ufs-root-part=linux_data` for the 27.3 root.
+The owner's test image is the desk-dev profile on top of it:
+
+```sh
+PIANO_GPU=2 tooling/k273/build-k273-image.sh            # KC, ADT, Turnip stage (27.3 trust) in out/
+DESK_EXTRA=native-ufs-root-part=linux_data DESK_RESET_AFTER=1800 PIANO_DATA_PERSIST=0 PIANO_K27_TREE=$PWD/out/k273/k27-tree \
+  tooling/k27/build-desktop-images.sh desk-dev            # out/ram-desk-dev, out/ram-desk-dump
+```
+
+First image (2026-11-13 00:10): `ram-k273-desk-dev` sha256 `5d998d3d5a70e8f0ba6f0524b6e82150a97a7c63bafda91d65b999a53d693d67`
+(KC `7bf32dc8...`: 48 Apple kexts of mac17j, 25 native kexts, every vtable check 0 problems; ADT `5bc3409f...`; trust `5e4d958e...`;
+seed: the 27.0.1 seed + Turnip + the desk-dev stage, identity `a53a3c05...`, data-persist=0), returns to fastboot after 1800 s
+(`piano-reset-after`, `piano-reset-to=bootloader`) or on `reset fastboot`. The Metal plugin is byte for byte the 27.0.1 line's.
 
 Checklist of the first 27.3 boot (each with the console line that answers it):
 
