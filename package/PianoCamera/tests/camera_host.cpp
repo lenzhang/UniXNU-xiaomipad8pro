@@ -15,6 +15,7 @@
 #include "CameraPower.h"
 #include "CameraRpmh.h"
 #include "CameraSurvey.h"
+#include "CameraStream.h"
 #include "CameraTables.h"
 #include <algorithm>
 #include <cstdarg>
@@ -184,9 +185,23 @@ struct Board {
   std::vector<uint32_t> readFifo;
   unsigned railVotes = 0;
   std::vector<std::string> vrmLog;
+  // Level 3: CAMCC PLL0, the CAMSS blocks, the SMMU, the frame buffer, the frames.
+  bool pll0NoLock = false, csidResetStuck = false, sensorMute = false, framePadded = false, dmaFail = false;
+  unsigned extraLines = 0;   // a frame longer than the mode by this many lines (an overflow)
+  bool mm1On = false;
+  uint64_t memPa = 0x880000000ull, tablePa = 0x8f0000000ull;
+  std::vector<uint8_t> mem;
+  std::vector<uint64_t> tableMem;
+  std::vector<uint32_t> aupFifo;   // the write master's latched addresses (address >> 8)
+  bool rupPending = false;
+  uint64_t nextFrameAt = 0;
+  unsigned framesWritten = 0, framesDropped = 0, smmuFaults = 0, allocs = 0, frees = 0, cleans = 0, invalidates = 0;
+  unsigned rgb[8][4];              // the colour bars: each band's value per Bayer position (10 bits)
 
   Board()
   {
+    for (unsigned b = 0; b < 8; ++b)
+      for (unsigned p = 0; p < 4; ++p) rgb[b][p] = 64 + 100 * b + 20 * p;
     for (auto &x : at) x = -1;
     // GCC: the AHB/XO branches on (their reset state), the AXI ones off.
     for (uint32_t o : {kGccCameraAhb, kGccCameraXo, kGccMclkAhb}) r[kGcc + o] = 0x1;
@@ -231,9 +246,14 @@ struct Board {
     pin(5, 1u << 6 | kTlmmEgpioPresent | kTlmmEgpioEnable, 0);
     // CCI0
     r[kCci0 + kCciHwVersion] = 0x20000000;
-    // SMMU: 64 groups, 64 banks, NUMPAGENDXB 7 (256 global pages, then the banks)
-    r[kSmmu + 0x20] = 64;
+    // SMMU: 64 groups (stage 1 supported), 83 banks, NUMPAGENDXB 6 (128 global pages, then the banks); 40-bit output, 4 KiB tables
+    r[kSmmu + 0x20] = 64 | 1u << 30;
     r[kSmmu + 0x24] = 6u << 28 | 83;   // the tablet's (PianoVideo's survey: 128 pages, 83 banks)
+    r[kSmmu + 0x28] = 2u << 4 | 1u << 12;
+    r[kSmmu] = 0x002d0406;             // c1's SCR0 (USFCFG set: an unmatched stream faults)
+    // Level 3's other CAMCC branches, PLL0 off
+    for (uint32_t o : {kCcCamnocNrtAxi, kCcCamnocRtIfeLite, kCcQdssDebugXo}) r[kCamCc + o] = 0x80000000u;
+    for (uint32_t o = 0; o <= 0x30; o += 4) r[kCamCc + kCcPll0 + o] = 0;
     // PMIC: the camera LDOs off; the CSIPHY ones on. L1I and L3I at the SM8550 page (0x40 + n - 1), the rest at 0xc0 + n.
     int apid = 100;
     for (unsigned i = 0; i < kRailCount; ++i) {
@@ -288,6 +308,12 @@ struct Board {
     if (inRange(pa, kCci0, kCci0Bytes) && !(camAhb && running(kCamCc + kCcCci0))) return "CCI0 unpowered or unclocked";
     for (const Block &b : kBlocks)
       if (inRange(pa, b.pa, 0x1000) && !(camAhb && running(kCamCc + b.branch))) return "a CAMSS block unpowered or unclocked";
+    if (inRange(pa, kTfeLite0, kTfeLiteBytes) && !(camAhb && running(kCamCc + kCcIfeLite) && running(kCamCc + kCcIfeLiteAhb)))
+      return "TFE-lite0 unpowered or unclocked";
+    if (inRange(pa, kCsidLite0, 0x1000) && !running(kCamCc + kCcIfeLiteCphyRx)) return "CSID-lite0 without its PHY RX clock";
+    for (unsigned n : {1u, 4u})
+      if (inRange(pa, csiphyBase(n), kCsiphyBytes) && !(camAhb && running(kCamCc + csiphyBranch(n)) && running(kCamCc + csiTimerBranch(n))))
+        return "a CSIPHY unpowered or unclocked";
     if (inRange(pa, kQup2Se1, 0x4000)) return "QUP2 SE1 (never clocked in this model)";
     return nullptr;
   }
@@ -379,15 +405,27 @@ struct Board {
       return;
     }
     if (inRange(pa, kCci0, kCci0Bytes)) return cciWrite(uint32_t(pa - kCci0), value);
+    if (inRange(pa, kCsidLite0, kCsidLiteBytes)) return csidWrite(uint32_t(pa - kCsidLite0), value);
+    if (pa == kCamCc + kCcPll0 || pa == kCamCc + kCcPll0 + kPllOpmode) {
+      r[pa] = value;
+      const uint64_t p = kCamCc + kCcPll0;
+      const uint32_t mode = v(p), op = v(p + kPllOpmode);
+      const bool lock = (mode & kPllResetN) && (op & 1u) && v(p + kTaycanL) == kPll0LVal && v(p + kTaycanConfigCtl) == kPll0ConfigCtl &&
+                        mxcVoted && !pll0NoLock;
+      r[p] = (mode & ~kPllLockDet) | (lock ? kPllLockDet : 0);
+      return;
+    }
     // CBCRs, GDSCs, RCGs, the PLL: by address.
     const uint64_t g = kCamCc + kGdscTitanTop;
     if (pa == g) {
+      const bool wasOn = titan();
       r[pa] = value;
       const bool on = !(value & kGdscCollapse) && running(kCamCc + kCcGdscClk) && !titanStuck;
       if (on) {
         r[pa] |= kGdscPwrOn;
         r[pa + 4] = kGdscCfgUpDone;
       } else {
+        if (wasOn) resetCamss();   // collapsed: CSID, TFE and CSIPHY registers lose their state
         r[pa] &= ~kGdscPwrOn;
         r[pa + 4] = (value & kGdscCollapse) ? kGdscCfgDownDone : 0;
         if (!(value & kGdscCollapse)) {
@@ -408,7 +446,11 @@ struct Board {
       return;
     }
     if (isRcgCmd(pa)) {
-      uint32_t x = value & ~kRcgUpdate;   // the update completes at once
+      // The update completes at once, if the configured source runs (a CAMCC PLL0 output: only with PLL0 locked, outputs on).
+      const unsigned src = rcgSource(v(pa + kRcgCfg));
+      bool camcc = false;   // level 3's sources only (level 2's found-on-a-PLL slow AHB keeps its old model)
+      for (const L3Rcg &l : kL3Rcgs) camcc = camcc || pa == kCamCc + (l.off ? l.off : kCcCsi1TimerRcg) || pa == kCamCc + kCcCsi4TimerRcg;
+      uint32_t x = (value & kRcgUpdate) && camcc && src >= 1 && src <= 3 && !pll0Running() ? value : value & ~kRcgUpdate;
       if (value & kRcgRootEn) x &= ~kRcgRootOff;
       else x |= kRcgRootOff;
       r[pa] = x;
@@ -426,10 +468,12 @@ struct Board {
   }
   bool isCbcr(uint64_t pa) const
   {
-    for (uint32_t o : {kGccCameraAhb, kGccCameraXo, kGccMclkAhb})
+    for (uint32_t o : {kGccCameraAhb, kGccCameraXo, kGccMclkAhb, kGccCameraHfAxi})
       if (pa == kGcc + o) return true;
     for (const Reg &b : kCcBranches)
       if (pa == kCamCc + b.off) return true;
+    for (uint32_t o : {kCcCamnocNrtAxi, kCcCamnocRtIfeLite, kCcQdssDebugXo})
+      if (pa == kCamCc + o) return true;
     for (unsigned n = 0; n < kMclkCount; ++n)
       if (pa == kMclkCc + mclkBranch(n)) return true;
     return false;
@@ -449,7 +493,200 @@ struct Board {
     if (pa == kCamCc + kCcCamTopAhb || pa == kCamCc + kCcCci0) return titan();
     if (pa == kMclkCc + mclkBranch(1) && rcgSource(v(kMclkCc + mclkRcg(1) + 4)) == 3)
       return v(kMclkCc + kMclkPll) & kPllLockDet;
+    // Level 3's branches: under TITAN_TOP, and only with their source running (a PLL0 output needs PLL0).
+    if (inRange(pa, kCamCc, kCamCcBytes))
+      if (const uint32_t rcg = rcgOfBranch(uint32_t(pa - kCamCc))) {
+        if (!titan()) return false;
+        const unsigned src = rcgSource(v(kCamCc + rcg + kRcgCfg));
+        return src == 0 || (src <= 3 && pll0Running());
+      }
     return true;
+  }
+  static uint32_t rcgOfBranch(uint32_t off)
+  {
+    switch (off) {
+    case kCcCsiphy1: case kCcCsiphy4: case kCcIfeLiteCphyRx: case kCcCsidCsiphyRx: return kCcCphyRxRcg;
+    case kCcCsi1Timer: return kCcCsi1TimerRcg;
+    case kCcCsi4Timer: return kCcCsi4TimerRcg;
+    case kCcCamnocRtAxi: case kCcCamnocNrtAxi: return kCcCamnocRtAxiRcg;
+    case kCcIfeLite: case kCcCamnocRtIfeLite: return kCcIfeLiteRcg;
+    case kCcIfeLiteCsid: return kCcIfeLiteCsidRcg;
+    case kCcIfeLiteAhb: return kCcSlowAhbRcg;
+    case kCcCamTopFastAhb: return kCcFastAhbRcg;
+    case kCcQdssDebugXo: return kCcXoRcg;
+    default: return 0;
+    }
+  }
+  bool pll0Running() const
+  {
+    const uint64_t p = kCamCc + kCcPll0;
+    return (v(p) & kPllLockDet) && (v(p) & kPllOutctrl) && (v(p + kPllOpmode) & 1u) && (v(p + kTaycanUserCtl) & kPllOutputs) == kPllOutputs;
+  }
+
+  // ------------------------------------------------------------------------------------------------- level 3's CAMSS
+  void resetCamss()
+  {
+    for (auto it = r.begin(); it != r.end();) {
+      const uint64_t pa = it->first;
+      const bool camss = inRange(pa, kCsidLite0, kCsidLiteBytes) || inRange(pa, kTfeLite0, kTfeLiteBytes) ||
+                         inRange(pa, csiphyBase(1), kCsiphyBytes) || inRange(pa, csiphyBase(4), kCsiphyBytes);
+      it = camss ? r.erase(it) : std::next(it);
+    }
+    aupFifo.clear();
+    rupPending = false;
+    nextFrameAt = 0;
+  }
+  void csidWrite(uint32_t off, uint32_t value)
+  {
+    const uint64_t c = kCsidLite0;
+    switch (off) {
+    case kCsidRstCmd:
+      if (!csidResetStuck) r[c + kCsidTopStatus] |= kCsidRstDone;
+      aupFifo.clear();
+      return;
+    case kCsidTopClear: r[c + kCsidTopStatus] &= ~value; return;
+    case kCsidBufClear: r[c + kCsidBufStatus] &= ~value; return;
+    case kCsidRxClear: r[c + kCsidRxStatus] &= ~value; return;
+    case kCsidRdiClear: r[c + kCsidRdiStatus] &= ~value; return;
+    case kCsidIrqCmd: return;
+    case kCsidRupAup:
+      // Each write with the AUP bit latches the write master's address; the RUP bit takes effect at the next frame's start.
+      if (value & kCsidAupRdi0) aupFifo.push_back(v(kTfeLite0 + kWm0 + kWmImageAddr));
+      if (aupFifo.size() > 4) aupFifo.erase(aupFifo.begin());
+      if (value & kCsidRupRdi0) rupPending = true;
+      r[c + off] = value;
+      return;
+    default: r[c + off] = value; return;
+    }
+  }
+  unsigned phyOf() const
+  {
+    const uint32_t cfg = v(kCsidLite0 + kCsidRxCfg0);
+    return (cfg >> 20) ? (cfg >> 20) - 1 : 99;
+  }
+  bool phyReady(unsigned n) const
+  {
+    const uint64_t b = csiphyBase(n), cm = b + kCsiphyTableCommon;
+    if (v(cm + 4 * 5) != 0xd5 || v(cm + 4 * 6) != 1 || v(cm + 4 * 7) != 2) return false;
+    const uint8_t settle = csiphySettle(kSensors[n == 1 ? 0 : 1].linkHz, 400000000);
+    for (const CsiphyLaneReg &e : kCsiphyLaneRegs) {
+      if (e.kind == 7) continue;
+      if (v(b + e.offset) != (e.kind == 2 ? settle : e.value)) {
+        // a register written twice (0x094: 0x00, then 0x07) holds its last value: only the last entry per offset counts
+        bool later = false;
+        for (const CsiphyLaneReg *q = &e + 1; q < kCsiphyLaneRegs + sizeof kCsiphyLaneRegs / sizeof kCsiphyLaneRegs[0]; ++q)
+          later = later || (q->offset == e.offset && q->kind != 7);
+        if (!later) return false;
+      }
+    }
+    return true;
+  }
+  bool streamReady() const
+  {
+    const unsigned n = phyOf();
+    if (n != 1 && n != 4) return false;
+    const bool rear = n == 1;
+    const Slave &s = rear ? rearSlave : frontSlave;
+    auto it = s.reg.find(0x0100);
+    const bool sensorOn = it != s.reg.end() && (it->second & 1) && !sensorMute && sensorReady(rear) &&
+                          (!rear || rcgSource(v(kMclkCc + mclkRcg(1) + kRcgCfg)) == 3);   // the rear streams only at 24 MHz
+    const uint64_t c = kCsidLite0;
+    const bool csid = v(c + kCsidRxCfg0) == csidRxCfg0(4, n) && (v(c + kCsidRdiCfg0) & kRdiCfg0Enable) && v(c + kCsidRdiCtrl) == 1 &&
+                      running(kCamCc + kCcIfeLiteCsid) && running(kCamCc + kCcIfeLiteCphyRx);
+    const bool wm = v(kTfeLite0 + kWm0 + kWmCfg) == (kWmEnable | kWmFrameMode) && running(kCamCc + kCcIfeLite) &&
+                    running(kCamCc + kCcCamnocRtAxi) && (v(kGcc + kGccCameraHfAxi) & kCbcrEnable) && mm1On;
+    return titan() && sensorOn && phyReady(n) && csid && wm;
+  }
+  // The SMMU for stream 0x1c00: 0 when the write faults.
+  uint64_t smmuTranslate(uint64_t bus) const
+  {
+    const unsigned groups = v(kSmmu + 0x20) & 0xffu, pages = 1u << (((v(kSmmu + 0x24) >> 28) & 7u) + 1);
+    for (unsigned i = 0; i < groups; ++i) {
+      const uint32_t smr = v(kSmmu + 0x800 + 4 * i);
+      if (!(smr & 0x80000000u) || ((smr ^ kCamStream) & 0x7fffu & ~((smr >> 16) & 0x7fffu))) continue;
+      const uint32_t s2cr = v(kSmmu + 0xc00 + 4 * i), type = (s2cr >> 16) & 3u;
+      if (type == 1) return bus;
+      if (type != 0) return 0;
+      const unsigned b = s2cr & 0xffu;
+      const uint64_t cb = kSmmu + uint64_t(pages + b) * 4096;
+      if (!(v(cb) & 1u)) return (v(kSmmu + 0x1800 + 4 * b) & 1u) ? bus : bus & 0xffffffffull;
+      if (bus >> 32) return 0;
+      const uint64_t ttbr = uint64_t(v(cb + 0x20)) | uint64_t(v(cb + 0x24) & 0xffffu) << 32;
+      if (ttbr < tablePa || ttbr + 8192 > tablePa + tableMem.size() * 8) return 0;
+      const uint64_t l1 = tableMem[(ttbr - tablePa) / 8 + ((bus >> 30) & 3)];
+      if ((l1 & 3) != 3) return 0;
+      const uint64_t l2pa = l1 & 0x0000fffffffff000ull;
+      if (l2pa < tablePa || l2pa + 4096 > tablePa + tableMem.size() * 8) return 0;
+      const uint64_t l2 = tableMem[(l2pa - tablePa) / 8 + ((bus >> 21) & 511)];
+      if ((l2 & 3) != 1) return 0;
+      return (l2 & 0x0000fffffffff000ull & ~0x1fffffull) | (bus & 0x1fffffull);
+    }
+    return 0;   // unmatched: USFCFG faults it
+  }
+  uint64_t cachedPage = ~0ull, cachedPa = 0;   // one 4 KiB page's translation (a frame's writes walk the pages in order)
+  void dmaWrite(uint64_t bus, uint8_t byte)
+  {
+    if ((bus >> 12) != cachedPage) {
+      cachedPage = bus >> 12;
+      cachedPa = smmuTranslate(cachedPage << 12);
+    }
+    const uint64_t pa = cachedPa ? cachedPa + (bus & 0xfff) : 0;
+    if (!pa || pa < memPa || pa >= memPa + mem.size()) {
+      ++smmuFaults;
+      if (pa && (pa < memPa || pa >= memPa + mem.size())) violations.push_back("a write master store outside the frame buffer");
+      return;
+    }
+    mem[pa - memPa] = byte;
+  }
+  // One frame: the colour bars (the rear's test pattern) or a flat grey scene, RAW10 MIPI-packed, the lines unpadded (or padded to
+  // 16 bytes with framePadded), written through the SMMU at the latched address; SOF/EOF, BUF_DONE, RUP_DONE.
+  void produceFrame()
+  {
+    const uint64_t c = kCsidLite0;
+    const bool rear = phyOf() == 1;
+    const unsigned width = rear ? kRearL3Width : kFrontL3Width, height = (rear ? kRearL3Height : kFrontL3Height) + extraLines;
+    r[c + kCsidRdiStatus] |= kRdiInputSof | kRdiCamifSof;
+    if (rupPending) {
+      r[c + kCsidRdiStatus] |= kRdiRupDone;
+      rupPending = false;
+    }
+    cachedPage = ~0ull;   // the SMMU may have changed since the last frame
+    if (aupFifo.empty()) {
+      ++framesDropped;
+      r[c + kCsidRdiStatus] |= 1u << 18;
+      return;
+    }
+    const uint64_t base = uint64_t(aupFifo.front()) << 8;
+    aupFifo.erase(aupFifo.begin());
+    const uint32_t bpl = raw10Bytes(width), stride = framePadded ? (bpl + 15u) & ~15u : bpl;
+    const bool bars = rear && rearSlave.reg.count(0x0601) && rearSlave.reg.at(0x0601) == 2;
+    for (unsigned y = 0; y < height; ++y)
+      for (unsigned x = 0; x < width; x += 4) {
+        uint8_t g[5] = {};
+        for (unsigned k = 0; k < 4; ++k) {
+          const unsigned px = x + k, pos = (y & 1u) * 2 + (px & 1u);
+          const unsigned val = bars ? rgb[px * 8 / width][pos] : 300 + pos;
+          g[k] = uint8_t(val >> 2);
+          g[4] |= uint8_t((val & 3u) << (2 * k));
+        }
+        for (unsigned k = 0; k < 5; ++k) dmaWrite(base + uint64_t(y) * stride + x / 4 * 5 + k, g[k]);
+      }
+    r[c + kCsidRdiStatus] |= kRdiInputEof | kRdiCamifEof;
+    r[c + kCsidBufStatus] |= kCsidBufRdi0;
+    r[c + kCsidTopStatus] |= kCsidTopBufDone;
+    ++framesWritten;
+  }
+  void tick()
+  {
+    if (!streamReady()) {
+      nextFrameAt = 0;
+      return;
+    }
+    if (!nextFrameAt) nextFrameAt = now + 33333;
+    while (now >= nextFrameAt) {
+      produceFrame();
+      nextFrameAt += 33333;
+    }
   }
 
   // --------------------------------------------------------------------------------------------------------------- CCI
@@ -620,8 +857,9 @@ static bool same(const std::map<uint64_t, uint32_t> &a, const std::map<uint64_t,
   bool ok = true;
   for (auto &[pa, v] : b) {
     auto it = a.find(pa);
-    if (it == a.end() || it->second != v) {
-      std::printf("  changed: %#llx: %08x -> %08x\n", (unsigned long long)pa, it == a.end() ? 0xdeadbeefu : it->second, v);
+    const uint32_t was = it == a.end() ? 0u : it->second;   // a register never written reads 0 in the model
+    if (was != v) {
+      std::printf("  changed: %#llx: %08x -> %08x\n", (unsigned long long)pa, was, v);
       ok = false;
     }
   }
@@ -647,7 +885,41 @@ struct TestOps {
     b.now += us;
     b.syncSlave(true);
     b.syncSlave(false);
+    b.tick();
   }
+  // Level 3's additions.
+  std::vector<bool> mmBusCalls;
+  bool mmBusFail = false;
+  int mmBus(bool on)
+  {
+    mmBusCalls.push_back(on);
+    if (mmBusFail) return -5;
+    b.mm1On = on;
+    return 0;
+  }
+  bool dmaAlloc(uint64_t bytes, bool tables, Dma &d)
+  {
+    if (b.dmaFail) return false;
+    b.mem.assign(bytes, 0x5a);
+    d.pa = b.memPa;
+    d.bytes = bytes;
+    d.cpu = b.mem.data();
+    if (tables) {
+      b.tableMem.assign(1024, 0x1234567812345678ull);   // two pages, not zeroed: the window builder must clear them
+      d.tablePa = b.tablePa;
+      d.tables = b.tableMem.data();
+    }
+    ++b.allocs;
+    return true;
+  }
+  void dmaFree(Dma &d)
+  {
+    ++b.frees;
+    d = Dma();
+  }
+  void cacheClean(const void *, uint64_t) { ++b.cleans; }
+  void cacheInvalidate(const void *, uint64_t) { ++b.invalidates; }
+  uint64_t nowUs() { return b.now; }
   void msleep(unsigned ms) { udelay(ms * 1000); }
   int vrm(unsigned rail, const VrmCmd *cmds, unsigned n) { return b.vrm(rail, cmds, n); }
   int pmic(unsigned rail, RailState &r)
@@ -1231,6 +1503,249 @@ static void testTables()
   }
 }
 
+// ========================================================================================================== level 3
+// The board as c1 found it, with the camera AHB's source on the XO (a consistent state: PLL0 is off).
+struct L3Rig : Rig {
+  L3Rig()
+  {
+    tabletC1(b);
+    b.r[kCamCc + kCcSlowAhbRcg + 4] = 0;
+  }
+  StreamResult run(Sensor w, StreamOptions o = StreamOptions(), PowerOptions po = PowerOptions())
+  {
+    po.camss = true;
+    po.votes = true;
+    po.mclk24 = w == Sensor::rear;
+    Survey s = survey();
+    Session<TestOps> session(ops, po);
+    Stream<TestOps> st(ops, session, o);
+    StreamResult res = st.run(w, loader, pmic, so, s);
+    plan = st.routePlan();
+    return res;
+  }
+  RoutePlan plan;
+};
+// What level 3 leaves changed on purpose: CAMCC PLL0's and the MCLK PLL's configuration words (Linux writes them once, at its probe,
+// and leaves the PLL configured in standby with RESET_N), the window's table pages.
+static std::map<uint64_t, uint32_t> l3Snapshot(const Board &b)
+{
+  std::map<uint64_t, uint32_t> s = b.snapshot();
+  for (uint32_t o = 0; o <= 0x30; o += 4) s.erase(kCamCc + kCcPll0 + o);
+  for (uint32_t o : {0x0u, 0x10u, 0x1cu, 0x20u, 0x24u}) s.erase(kMclkCc + kMclkPll + o);
+  // The SMMU's TLB invalidate and sync words are commands (write-only), not state.
+  for (auto it = s.begin(); it != s.end();) {
+    const uint64_t pa = it->first;
+    const bool command = pa == kSmmu + 0x68 || pa == kSmmu + 0x70 ||
+                         (pa >= kSmmu + 128 * 4096 && pa < kSmmu + kSmmuBytes && ((pa & 0xfff) == 0x618 || (pa & 0xfff) == 0x7f0));
+    it = command ? s.erase(it) : std::next(it);
+  }
+  return s;
+}
+static void checkBars(const StreamResult &r, const Board &b)
+{
+  bool exact = true;
+  for (unsigned band = 0; band < 8; ++band)
+    for (unsigned p = 0; p < 4; ++p) exact = exact && r.stats.band[band][p] == b.rgb[band][p];
+  CHECK(exact);
+  CHECK(r.stats.ch[0].min == b.rgb[0][0] && r.stats.ch[3].max == b.rgb[7][3]);
+}
+
+static void testL3Rear()
+{
+  L3Rig r;
+  const auto before = l3Snapshot(r.b);
+  const StreamResult res = r.run(Sensor::rear);
+  CHECK(res.ok && res.cleanOff && res.bufferFreed && res.failedStep == 0);
+  for (auto &v : r.b.violations) std::printf("  violation: %s\n", v.c_str());
+  CHECK(r.b.violations.empty() && res.refusedStores == 0);
+  CHECK(res.route == Route::window && res.busAddr == kIovaWindowBase && res.pa == r.b.memPa && res.bytes == 16u << 20);
+  CHECK(res.bufDone == 2 && res.sof >= 2 && res.eof >= 2 && res.lateFrames == 0 && r.b.smmuFaults == 0 && r.b.framesWritten >= 2);
+  CHECK(res.settle == 29 && res.phyWritten == 87 && res.phySkipped == 16);
+  CHECK(res.tableWrites == 7 + 30 + 278 + 1 + 1 && res.controlWrites == 5);   // start, init, the mode, on, off; 5 controls
+  CHECK(res.stats.done && res.stats.guardIntact && res.stats.stride == 5100 && res.stats.written == 5100ull * 3072);
+  checkBars(res, r.b);
+  for (unsigned p = 0; p < 4; ++p) CHECK(res.stats.ch[p].count == 4080ull * 3072 / 4);
+  // Everything as found: votes withdrawn, MM1 off, the SMMU's group and bank as found, TITAN_TOP collapsed (the CAMSS blocks
+  // reset), the clocks, the branches, GCC, the pins and the rails.
+  CHECK(same(before, l3Snapshot(r.b)));
+  CHECK(!r.b.mm1On && !r.b.mxcVoted && r.ops.mmBusCalls.size() == 2 && r.ops.mmCalls.size() == 2);
+  CHECK(r.b.allocs == 1 && r.b.frees == 1 && r.b.invalidates == 1 && r.b.cleans == 2);
+  // The window's table: the buffer's eight 2 MiB blocks at 0x20000000, nothing else.
+  unsigned blocks = 0;
+  for (unsigned i = 0; i < 512; ++i) blocks += (r.b.tableMem[512 + i] & 3) == 1;
+  CHECK(blocks == 8 && (r.b.tableMem[0] & 3) == 3);
+  // The CSIPHY's version needs no store besides SHOW_REV_ID; the PLL0 configuration stays (standby, RESET_N).
+  CHECK((r.b.v(kCamCc + kCcPll0) & kPllResetN) && !(r.b.v(kCamCc + kCcPll0) & kPllOutctrl) && r.b.v(kCamCc + kCcPll0 + kPllOpmode) == 0);
+}
+
+static void testL3Variants()
+{
+  // Frame mode pads the lines to 16 bytes: the statistics find the stride from the written extent.
+  {
+    L3Rig r;
+    r.b.framePadded = true;
+    const StreamResult res = r.run(Sensor::rear);
+    CHECK(res.ok && res.stats.stride == 5104 && res.stats.written == 5104ull * 3072);
+    checkBars(res, r.b);
+  }
+  // The scene (no test pattern): the flat grey of the model.
+  {
+    L3Rig r;
+    StreamOptions o;
+    o.pattern = false;
+    o.frames = 3;
+    const StreamResult res = r.run(Sensor::rear, o);
+    CHECK(res.ok && res.bufDone == 3 && res.stats.ch[0].mean() == 300 && res.stats.ch[3].mean() == 303);
+    CHECK(res.stats.ch[1].hist[300 >> 7] == res.stats.ch[1].count);
+  }
+  // The front: CSIPHY4, its 3264x1836 mode over the software I2C (880 writes), MCLK4 from the XO.
+  {
+    L3Rig r;
+    const auto before = l3Snapshot(r.b);
+    const StreamResult res = r.run(Sensor::front);
+    for (auto &v : r.b.violations) std::printf("  violation: %s\n", v.c_str());
+    CHECK(res.ok && res.cleanOff && r.b.violations.empty() && res.bytes == 8u << 20);
+    CHECK(res.tableWrites == 1 + 811 + 54 + 4 + 4 && res.controlWrites == 0 && res.settle == 29);
+    CHECK(res.stats.stride == 4080 && res.stats.ch[2].mean() == 302);
+    CHECK(same(before, l3Snapshot(r.b)));
+  }
+  // A bypass the boot chain left: physical addresses, no SMMU store at all.
+  {
+    L3Rig r;
+    r.b.r[kSmmu + 0x800 + 4 * 7] = 0x80000000u | kCamStream;
+    r.b.r[kSmmu + 0xc00 + 4 * 7] = 1u << 16;
+    const unsigned smmuStores = 0;
+    const StreamResult res = r.run(Sensor::rear);
+    CHECK(res.ok && res.route == Route::bypass && res.busAddr == r.b.memPa && r.b.tableMem.empty());
+    unsigned stores = smmuStores;
+    for (auto &[pa, v] : r.b.r) stores += pa >= kSmmu && pa < kSmmu + kSmmuBytes && pa != kSmmu + 0x800 + 4 * 7 && pa != kSmmu + 0xc00 + 4 * 7 &&
+                                       pa > kSmmu + 0x28;
+    CHECK(stores == 0);
+    checkBars(res, r.b);
+  }
+  // A group that translates through someone's bank: refused before any stream; nothing of the SMMU or the sensor's stream touched.
+  {
+    L3Rig r;
+    r.b.r[kSmmu + 0x800 + 4 * 9] = 0x80000000u | kCamStream;
+    r.b.r[kSmmu + 0xc00 + 4 * 9] = 12;
+    r.b.r[kSmmu + (128 + 12) * 4096] = 1;   // the bank's SCTLR.M
+    const auto before = l3Snapshot(r.b);
+    const StreamResult res = r.run(Sensor::rear);
+    CHECK(!res.ok && res.failure == StreamFailure::refused && res.failedStep == -kStepL3Smmu && res.cleanOff && r.b.allocs == 0);
+    CHECK(same(before, l3Snapshot(r.b)) && r.b.violations.empty() && r.b.framesWritten == 0);
+  }
+}
+
+static void testL3Failures()
+{
+  struct Case {
+    const char *what;
+    std::function<void(L3Rig &)> inject;
+    int step;
+    StreamFailure failure;
+  };
+  const Case cases[] = {
+    {"PLL0 never locks", [](L3Rig &r) { r.b.pll0NoLock = true; }, kStepL3Pll, StreamFailure::pll},
+    {"MM1 refused", [](L3Rig &r) { r.ops.mmBusFail = true; }, kStepL3Bus, StreamFailure::votes},
+    {"no frame buffer", [](L3Rig &r) { r.b.dmaFail = true; }, kStepL3Memory, StreamFailure::memory},
+    {"CSID reset stuck", [](L3Rig &r) { r.b.csidResetStuck = true; }, kStepL3CsidReset, StreamFailure::csidReset},
+    {"the sensor never streams", [](L3Rig &r) { r.b.sensorMute = true; }, kStepL3Stream, StreamFailure::noFrame},
+    {"the sensor is missing", [](L3Rig &r) { r.b.rearAbsent = true; }, kStepL3Sensor, StreamFailure::sensor},
+  };
+  for (const Case &k : cases) {
+    L3Rig r;
+    k.inject(r);
+    const auto before = l3Snapshot(r.b);
+    const StreamResult res = r.run(Sensor::rear);
+    const bool ok = !res.ok && res.failedStep == -k.step && res.failure == k.failure && res.cleanOff && r.b.violations.empty() &&
+                    same(before, l3Snapshot(r.b)) && !r.b.mm1On && !r.b.mxcVoted && r.b.frees == r.b.allocs;
+    if (!ok)
+      std::printf("  L3 %s: step %d failure %s clean %d violations %zu\n", k.what, -res.failedStep, streamFailureName(res.failure),
+                  res.cleanOff, r.b.violations.size());
+    CHECK(ok);
+  }
+  // TITAN_TOP already on (someone else's CAMSS): refused before any level 3 store.
+  {
+    L3Rig r;
+    r.b.r[kCamCc + kCcGdscClk] = 1;
+    r.b.r[kCamCc + kGdscTitanTop] = kGdscPwrOn | 0x00222000;   // powered and requested on (someone else's)
+    r.b.r[kCamCc + kGdscTitanTop + 4] = kGdscCfgUpDone;
+    const StreamResult res = r.run(Sensor::rear);
+    CHECK(!res.ok && res.failure == StreamFailure::refused && res.failedStep == -kStepL3Sensor && res.writes == 0);
+  }
+  // An overflow into the guard (64 lines more than the mode): reported, not ok, still clean.
+  {
+    L3Rig r;
+    r.b.extraLines = 64;
+    const StreamResult res = r.run(Sensor::rear);
+    CHECK(!res.ok && res.bufDone == 2 && !res.stats.guardIntact && res.cleanOff && r.b.violations.empty() && r.b.smmuFaults == 0);
+  }
+  // An overflow past the buffer: the window faults it (nothing reaches other memory), the guard says so.
+  {
+    L3Rig r;
+    r.b.extraLines = 400;
+    const StreamResult res = r.run(Sensor::rear);
+    CHECK(!res.ok && !res.stats.guardIntact && r.b.smmuFaults > 0 && r.b.violations.empty() && res.cleanOff);
+  }
+}
+
+static void testL3Stops()
+{
+  for (int step : {kStepL3Sensor, kStepL3Axi, kStepL3Pll, kStepL3Clocks, kStepL3Versions, kStepL3Smmu, kStepL3Memory, kStepL3CsidReset,
+                   kStepL3Wm, kStepL3Csid, kStepL3Phy, kStepL3Sensor2}) {
+    L3Rig r;
+    StreamOptions o;
+    o.stopAt = step;
+    const auto before = l3Snapshot(r.b);
+    const StreamResult res = r.run(Sensor::rear, o);
+    const bool ok = res.failure == StreamFailure::stopped && res.failedStep == -step && res.cleanOff && r.b.violations.empty() &&
+                    same(before, l3Snapshot(r.b)) && r.b.frees == r.b.allocs && !r.b.mm1On;
+    if (!ok) std::printf("  L3 stop at %d: failure %s clean %d\n", step, streamFailureName(res.failure), res.cleanOff);
+    CHECK(ok);
+  }
+}
+
+static void testL3Allowlist()
+{
+  Board b;
+  TestOps ops{b};
+  Session<TestOps> s(ops, PowerOptions());
+  Stream<TestOps> st(ops, s, StreamOptions());
+  CHECK(st.writable(kGcc + kGccCameraHfAxi) && st.writable(csiphyBase(1) + 0x1014) && st.writable(kCsidLite0 + kCsidRdiCfg0));
+  CHECK(st.writable(kTfeLite0 + kWm0 + kWmCfg) && st.writable(kCamCc + kCcCphyRxRcg + 4) && st.writable(kCamCc + kCcCsiphy1));
+  CHECK(!st.writable(csiphyBase(4)) && !st.writable(kCamCc + kCcCsiphy4) && !st.writable(kTfeLite0 + kWm0 + 0x100));
+  CHECK(!st.writable(kGcc + kGccCameraAhb) && !st.writable(kCamCc + kGdscTfe0) && !st.writable(kCamCc + kGdscTitanTop));
+  CHECK(!st.writable(kSmmu + 0x800) && !st.writable(kSmmu + 0x68) && !st.writable(kBlocks[0].pa) && !st.writable(kCsidLite0 + 0xa00));
+  CHECK(!st.writable(kCamCc + 0x1000) && !st.writable(kTfeLite0 + 0x1000) && !st.writable(kCci0));
+}
+
+// The statistics alone: RAW10 unpacking (the low bits in the fifth byte), the bands, the histogram, the guard.
+static void testFrameStats()
+{
+  const unsigned w = 16, h = 4;
+  std::vector<uint8_t> buf(4096, 0);
+  for (unsigned y = 0; y < h; ++y)
+    for (unsigned x = 0; x < w; x += 4) {
+      uint8_t *g = buf.data() + y * raw10Bytes(w) + x / 4 * 5;
+      for (unsigned k = 0; k < 4; ++k) {
+        const unsigned v = (x + k) * 64 + y;   // 10 bits
+        g[k] = uint8_t(v >> 2);
+        g[4] |= uint8_t((v & 3u) << (2 * k));
+      }
+    }
+  const uint32_t frame = raw10Bytes(w) * h;
+  for (uint32_t i = frame; i < 4096; ++i) buf[i] = 0xa5;
+  FrameStats s;
+  frameStats(buf.data(), 4096, frame, w, h, s);
+  CHECK(s.done && s.guardIntact && s.stride == 20 && s.written == frame);
+  CHECK(s.ch[0].min == 0 && s.ch[1].max == 15 * 64 + 2 && s.ch[3].count == 16);
+  CHECK(s.band[0][0] == 1 && s.band[0][1] == 65 && s.band[7][3] == 15 * 64 + 2);   // two pixels a band, rows 0 and 2 (or 1 and 3)
+  CHECK(s.ch[0].hist[0] == 2 && s.ch[0].hist[7] == 2);   // x = 0, 2 (v < 128) and x = 14 (896..): the 8 bins of 128
+  buf[frame + 10] = 0;
+  frameStats(buf.data(), 4096, frame, w, h, s);
+  CHECK(!s.guardIntact && s.guardFirstBad == 10);
+}
+
 int main()
 {
   testSurvey();
@@ -1243,6 +1758,12 @@ int main()
   testAllowlist();
   testCci();
   testTables();
+  testFrameStats();
+  testL3Allowlist();
+  testL3Rear();
+  testL3Variants();
+  testL3Failures();
+  testL3Stops();
   if (failures) {
     std::printf("camera_host: %d check(s) FAILED\n", failures);
     return 1;

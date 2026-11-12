@@ -172,6 +172,7 @@ class Session {
   void end() { powerDown(); }
   const SensorResult &result() const { return r_; }
   bool viaCci() const { return rear_ && opt.rearCci; }
+  bool ownsTitan() const { return u_.titan; }   // TITAN_TOP was found collapsed and powered by this session
   // One register write over the sensor's bus (level 3: its tables and controls): the 16-bit register address, then `bytes` (1..3)
   // of the value, big-endian. Only while begin()'s bus is up.
   bool sensorWrite(uint16_t reg, unsigned bytes, uint32_t value)
@@ -181,7 +182,9 @@ class Session {
     for (unsigned i = 0; i < bytes; ++i) b[2 + i] = uint8_t(value >> (8 * (bytes - 1 - i)));
     bool ok;
     if (viaCci()) {
+      quietBus_ = true;
       r_.cci = cci_.write(f_->address, b, 2 + bytes);
+      quietBus_ = false;
       ok = r_.cci == CciResult::ok;
     } else {
       r_.i2c = bit_.write(f_->address, b, 2 + bytes);
@@ -566,7 +569,13 @@ class Session {
 
   // -------------------------------------------------------------------------------------------------------------- bus
   static uint32_t cciRd(void *c, uint32_t off) { return static_cast<Session *>(c)->ops.rd(kCci0 + off); }
-  static void cciWr(void *c, uint32_t off, uint32_t v, const char *what) { static_cast<Session *>(c)->put(kCci0 + off, v, what); }
+  // The CCI's register stores: logged, except during level 3's table writes (counted: several hundred transfers)
+  static void cciWr(void *c, uint32_t off, uint32_t v, const char *what)
+  {
+    Session *s = static_cast<Session *>(c);
+    if (s->quietBus_) s->putQuiet(kCci0 + off, v);
+    else s->put(kCci0 + off, v, what);
+  }
   static void cciDelay(void *c, unsigned us) { static_cast<Session *>(c)->ops.udelay(us); }
   unsigned sdaPin() const { return rear_ ? kPinCciSda : kPinFrontSda; }
   unsigned sclPin() const { return rear_ ? kPinCciScl : kPinFrontScl; }
@@ -776,6 +785,7 @@ class Session {
   Undo u_;
   Survey found_;
   bool rear_ = true;
+  bool quietBus_ = false;
   const SensorFacts *f_ = &kSensors[0];
   CciMaster cci_{CciIo{}};
   BitI2c bit_;

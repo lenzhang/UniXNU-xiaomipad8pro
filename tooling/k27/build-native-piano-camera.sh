@@ -19,7 +19,8 @@ mkdir -p "$O/host-tests" "$G"
 python3 "$D/tooling/camera/sensor-tables.py" --self-test
 python3 "$D/tooling/camera/sensor-tables.py" check "$D/data/camera" || { echo "Error: data/camera does not match its MANIFEST" >&2; exit 1; }
 python3 "$D/tooling/camera/sensor-tables.py" header "$D/data/camera" "$G/CameraTables.h"
-"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror "${INC[@]}" -I "$D/package/include" -I "$G" "$P/tests/camera_host.cpp" \
+# (-O1: level 3's model writes whole 16 MiB frames)
+"${CXX:-c++}" -std=c++20 -O1 -Wall -Wextra -Werror "${INC[@]}" -I "$D/package/include" -I "$G" "$P/tests/camera_host.cpp" \
   -o "$O/host-tests/camera_host"
 PIANO_CAMERA_MANIFEST="$D/data/camera/MANIFEST" "$O/host-tests/camera_host" || { echo "Error: PianoCamera host tests failed" >&2; exit 1; }
 # The survey headers hold no store: no str instruction and no assignment through a volatile pointer (level 1's only store is the SPMI
@@ -27,10 +28,16 @@ PIANO_CAMERA_MANIFEST="$D/data/camera/MANIFEST" "$O/host-tests/camera_host" || {
 if grep -nE '"str|volatile[^;]*\*[^;]*[^=!<>]=[^=]' "$P/CameraHw.h" "$P/CameraSurvey.h"; then
   echo "Error: a survey header has a store" >&2; exit 1
 fi
-if grep -nE 'ops\.wr(Quiet)?\(' "$P/CameraPower.h" | grep -vE '^[0-9]+:    ops\.wr(Quiet)?\(pa, v(alue)?(, what)?\);$'; then
-  echo "Error: CameraPower.h stores outside put()/putQuiet()" >&2; exit 1
+for f in CameraPower.h CameraStream.h; do   # level 3 likewise through CameraStream.h's put()/putQuiet() (its own allowlist)
+  if grep -nE 'ops\.wr(Quiet)?\(' "$P/$f" | grep -vE '^[0-9]+:    ops\.wr(Quiet)?\(pa, v(alue)?(, what)?\);$'; then
+    echo "Error: $f stores outside put()/putQuiet()" >&2; exit 1
+  fi
+done
+# The SMMU route's headers store only through the Write they are given (level 3 routes it through put()).
+if grep -nE 'asm|"str[ \\]|volatile[^;]*\*[^;]*[^=!<>]=[^=]|ops\.' "$P/CameraSmmu.h" "$P/CameraSmmuWindow.h"; then
+  echo "Error: an SMMU header stores other than through its Write" >&2; exit 1
 fi
-python3 "$D/tooling/k27/build-native-kext.py" PianoCamera "$P/PianoCamera.cpp" "$D/tooling/k27/NativeKextGlue.cpp" "${INC[@]}" \
+python3 "$D/tooling/k27/build-native-kext.py" PianoCamera "$P/PianoCamera.cpp" "$D/tooling/k27/NativeKextGlue.cpp" "${INC[@]}" -I "$G" \
   --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 # PianoA830's lock words (DRV-2, GCC votes) and the shared multimedia votes' words come from that kext (a library in

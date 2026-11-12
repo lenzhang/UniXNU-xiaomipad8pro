@@ -20,8 +20,17 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
   package/include/PianoWcnRails.h: the rail rules (read the PMIC first, vote mode/voltage/enable in one transaction, read back, withdraw
     only the enables this driver added, mode and set point left), re-expressed in CameraPower.h for rails no other driver uses.
   package/include/PianoPowerContract.h: the power-tree join.
-  The sensor tables in data/camera (data only; their provenance is data/camera/README.md) are read by the host tests through the
-    header tooling/camera/sensor-tables.py generates; the kext uses them from level 3 on.
+  package/include/PianoMmVotes.h: the shared MXC/MMCX/MM1 votes (with PianoVideo), included, not copied (its words are PianoA830's):
+    CAMCC's domains at levels 2-3, MM1 at level 3.
+  package/PianoWifi/WifiSmmuWindow.h (sha256 0e48005c9b635b92249d4611e6ec026aaf0227c2035ebb1584f043339aa642e5): copied as
+    CameraSmmuWindow.h with the namespace changed, WifiHw.h replaced by CameraHw.h (and its two window constants), and a provenance
+    header added (the translating bank of our own with a 32-bit window of 2 MiB blocks; its plan and apply).
+  package/PianoDwc3/SmmuStream.h (sha256 8f566938f259730d15407aa2d84abb3f6ec3b06c7bf3dabaef78c7e7fbb930a3): the rule that an entry
+    the boot chain left bypasses (S2CR bypass, or a bank with translation off and VA64), re-expressed in CameraSmmu.h planRoute.
+  package/PianoVideo/PianoVideo.cpp (sha256 034fa12422992b90e29760cc5aca39ceb42a9e7074612317c4b45b4f82670278): the physically contiguous
+    IOBufferMemoryDescriptor with a physical mask and the clean-to-PoC loop, re-expressed in PianoCamera.cpp's level 3 Ops.
+  The register tables in data/camera (data only; their provenance is data/camera/README.md): the sensors' and the CSIPHY's lane
+    table, read by the host tests and the kext (level 3) through the header tooling/camera/sensor-tables.py generates.
 
 The piano boot DT (out/inputs/piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840): the camera
 clock controllers' places and power domains, cci@ac7b000, isp@ad27000, the camera rails and their consumers, the TLMM reserved ranges.
@@ -41,7 +50,14 @@ Specifications only (no code, comment or table copied; facts in CameraHw.h with 
       commands, reset/halt/recovery protocol and the timing sets (the 19.2 MHz ones taken);
     drivers/media/i2c/s5kjn1.c (4d1e2dad37d06fb594ac044903fe2eb674b3bf1ab3135da56913b53d6b244a92), ov32d40.c
       (f784a23f088de3dccc165d61b7ebbce6484c4f7a7c0420cf901ede417ffba684): chip IDs, power sequences and waits, control registers;
-    drivers/media/platform/qcom/camss/camss-csid.c, camss-vfe.c (hashes in the fetch script): HW_VERSION at +0.
+    drivers/media/platform/qcom/camss/camss-csid.c, camss-vfe.c (hashes in the fetch script): HW_VERSION at +0;
+    level 3 (hashes in the fetch script): camss.c (sm8750's CSIPHY/CSID/VFE-lite clocks and rates, the interconnect paths, the
+      lane positions), camss-csiphy-3ph-1-0.c (the common block's reset, version, lane enable and interrupt masks, the settle count;
+      its lane table is data), camss-csid-980.c (the lite CSID's reset, RX and RDI configuration, register updates, interrupts),
+      camss-csid-680.c (the RDI interrupt bits at the same offset, inferred for the 980-lite), camss-vfe-gen4.c (the TFE-lite bus and
+      its RDI write master in frame mode), drivers/clk/qcom/camcc-sm8750.c and clk-alpha-pll.c/.h (PLL0's configuration and the
+      Taycan ELU configure/enable/disable order, the RCGs' frequency tables, the branches' halt checks), drivers/interconnect/qcom/
+      sm8750.c (MM1's nodes), gcc-sm8750.c (the HF AXI branch's halt check, the kept-on list).
   the Ubuntu device repository (yzddmr6/xiaomipad-8pro-mainline; MIT): device/camera/source.json and piano-camerad.c (the rear's vflip
     for its mounting, the modes the daemon uses, the AE/AWB constants docs/drivers/camera.md cites for level 4): behaviour.
 Not read and not used for anything: any Qualcomm or Xiaomi binary, any Apple binary.

@@ -9,8 +9,15 @@
 //   piano-camera=2  the survey, then each sensor in turn (CameraPower.h): its bus, its rails (RPMh under PianoA830's DRV-2 lock,
 //                   read back over SPMI), its supply enable and reset pins, its MCLK from the XO, the chip ID read (0x38e1 / 0x5632),
 //                   and everything taken back down in reverse order, exactly what was changed. No sensor register is written.
-// Without piano-camera the driver declines in probe() and maps nothing. Levels 3-5 (raw frames, the software ISP, the macOS camera
-// device) are designed in camera.md, not built.
+//   piano-camera=3  RAW10 frames from one sensor (CameraStream.h): level 2's power-up with TITAN_TOP for either bus, MM1 and CAMCC's
+//                   domains through the shared votes (PianoMmVotes.h), CAMCC PLL0 and the stream's clocks, the SMMU route of stream
+//                   0x1c00 (bypass as the boot chain left it, else our window), a contiguous buffer, CSID-lite0, TFE-lite0's write
+//                   master 0, the CSIPHY with data/camera's lane table, the sensor's tables, a bounded stream, one frame's
+//                   statistics, everything down in reverse. piano-camera-sensor=2 the front, else the rear; piano-camera-frames=N
+//                   (1..8, 2), piano-camera-pattern=0|1 (the rear's colour bars, 1), piano-camera-timeout-ms=MS (500..10000, 3000),
+//                   piano-camera-gain=CODE (32..2048, 64), piano-camera-mclk24 (1 here), piano-camera-stop=3xx.
+// Without piano-camera the driver declines in probe() and maps nothing. Levels 4-5 (the software ISP, the macOS camera device) are
+// designed in camera.md, not built. piano-camera-votes=0 (levels 2-3: no shared votes; level 3 always votes), piano-camera-mmcx-floor.
 // Other arguments: piano-camera-sensor=1 rear | 2 front | 3 both (default 3, rear first), piano-camera-rear-bus=1 (software I2C on
 // gpio115/116 instead of CCI0), piano-camera-mclk24=1 (the rear's MCLK at 24 MHz from the MCLK PLL), piano-camera-cci-khz=100|400,
 // piano-camera-i2c-half-us=N (2..50, default 5), piano-camera-pull=1, piano-camera-blind=1, piano-camera-hold=MS (0..10000),
@@ -20,6 +27,7 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/libkern.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -27,6 +35,7 @@
 #include <stdarg.h>
 #include <PianoPowerContract.h>
 #include "CameraPower.h"
+#include "CameraStream.h"
 #include "CameraRpmh.h"
 #include "CameraSurvey.h"
 #include "SpmiObserver.h"
@@ -55,6 +64,7 @@ struct Args {
   uint32_t level, sensor, rearBus, mclk24, cciKhz, halfUs, pull, blind, hold, stop, cycles, delay;
   uint32_t cc, mclkcc, blocks, qup, spmi, smmu;
   uint32_t votes, mmcxFloor;
+  uint32_t frames, pattern, timeoutMs, gain;
 };
 Args gArgs;
 
@@ -71,7 +81,7 @@ void readArgs()
   gArgs.level = bootArg("piano-camera", 0);
   gArgs.sensor = clampArg(bootArg("piano-camera-sensor", 3), 1, 3);
   gArgs.rearBus = bootArg("piano-camera-rear-bus", 0) ? 1 : 0;
-  gArgs.mclk24 = bootArg("piano-camera-mclk24", 0) ? 1 : 0;
+  gArgs.mclk24 = bootArg("piano-camera-mclk24", gArgs.level >= 3 ? 1 : 0) ? 1 : 0;   // level 3: Linux's 24 MHz by default
   gArgs.cciKhz = bootArg("piano-camera-cci-khz", 400) == 100 ? 100 : 400;
   gArgs.halfUs = clampArg(bootArg("piano-camera-i2c-half-us", 5), 2, 50);
   gArgs.pull = bootArg("piano-camera-pull", 0) ? 1 : 0;
@@ -88,6 +98,10 @@ void readArgs()
   gArgs.smmu = bootArg("piano-camera-smmu", 1);
   gArgs.votes = bootArg("piano-camera-votes", 1) ? 1 : 0;
   gArgs.mmcxFloor = clampArg(bootArg("piano-camera-mmcx-floor", kCamMmcxFloor), 0, 0x1000);
+  gArgs.frames = clampArg(bootArg("piano-camera-frames", 2), 1, 8);
+  gArgs.pattern = bootArg("piano-camera-pattern", 1) ? 1 : 0;
+  gArgs.timeoutMs = clampArg(bootArg("piano-camera-timeout-ms", 3000), 500, 10000);
+  gArgs.gain = clampArg(bootArg("piano-camera-gain", 64), 32, 2048);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -624,6 +638,76 @@ class Ops {
     va_end(ap);
     IOLog("PianoCamera: %s\n", line);
   }
+  // Level 3: the frame buffer (one physically contiguous range, 2 MiB aligned, below 1 TiB: the write master's reach), a cacheable
+  // kernel view; the window's two table pages (one 16 KiB XNU page, contiguous).
+  bool dmaAlloc(uint64_t bytes, bool tables, Dma &d)
+  {
+    d = Dma();
+    IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), bytes, 0x000000ffffe00000ull);
+    if (!buf || buf->prepare() != kIOReturnSuccess) {
+      if (buf) buf->release();
+      ::note("dma: no physically contiguous %llu bytes (2 MiB aligned) for the frame buffer", (unsigned long long)bytes);
+      return false;
+    }
+    IOByteCount length = 0;
+    d.pa = buf->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
+    d.bytes = bytes;
+    d.cpu = static_cast<uint8_t *>(buf->getBytesNoCopy());
+    d.cookie = buf;
+    if (!d.pa || length < bytes || !d.cpu) {
+      ::note("dma: the frame buffer is not one segment (%#llx, %llu of %llu bytes)", (unsigned long long)d.pa, (unsigned long long)length,
+             (unsigned long long)bytes);
+      dmaFree(d);
+      return false;
+    }
+    if (tables) {
+      tableMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+          kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), 0x4000, 0x000000fffffff000ull);
+      if (!tableMem || tableMem->prepare() != kIOReturnSuccess) {
+        if (tableMem) tableMem->release();
+        tableMem = nullptr;
+        dmaFree(d);
+        return false;
+      }
+      d.tablePa = tableMem->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+      d.tables = static_cast<uint64_t *>(tableMem->getBytesNoCopy());
+    }
+    ::note("dma: frame buffer %llu bytes at %#llx (cpu %p)%s", (unsigned long long)bytes, (unsigned long long)d.pa, (void *)d.cpu,
+           tables ? "; the window's tables follow" : "");
+    if (tables) ::note("dma: the window's tables at %#llx", (unsigned long long)d.tablePa);
+    return true;
+  }
+  void dmaFree(Dma &d)
+  {
+    if (IOBufferMemoryDescriptor *buf = static_cast<IOBufferMemoryDescriptor *>(d.cookie)) {
+      buf->complete();
+      buf->release();
+    }
+    if (tableMem) {
+      tableMem->complete();
+      tableMem->release();
+      tableMem = nullptr;
+    }
+    d = Dma();
+  }
+  static void cacheLines(const void *p, uint64_t n)
+  {
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    const uintptr_t line = uintptr_t(4) << ((ctr >> 16) & 15);
+    for (uintptr_t a = uintptr_t(p) & ~(line - 1); a < uintptr_t(p) + n; a += line) __asm__ volatile("dc civac, %0" ::"r"(a) : "memory");
+    dsb();
+  }
+  void cacheClean(const void *p, uint64_t n) { cacheLines(p, n); }        // clean + invalidate to the PoC before the device writes
+  void cacheInvalidate(const void *p, uint64_t n) { cacheLines(p, n); }   // and after: the CPU wrote nothing in between
+  uint64_t nowUs()
+  {
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    return ns / 1000;
+  }
+  IOBufferMemoryDescriptor *tableMem = nullptr;
   const Survey *survey = nullptr;
   bool gccHeld = false;
 };
@@ -660,6 +744,64 @@ void reportResult(const SensorResult &r)
   else snprintf(out, sizeof gResult[0], "failed at step %d: %s", -r.failedStep, failureName(r.failure));
 }
 
+// ---------------------------------------------------------------------------------------------------------------- level 3
+char gL3[240];
+void reportStream(const StreamResult &r)
+{
+  const SensorFacts &f = kSensors[r.which == Sensor::rear ? 0 : 1];
+  const uint32_t bpl = raw10Bytes(r.width), padded = (bpl + 15u) & ~15u;
+  if (r.failedStep)
+    note("level 3: %s %s %ux%u RAW10: FAILED at step %d: %s%s%s", f.name, f.part, r.width, r.height, -r.failedStep,
+         streamFailureName(r.failure), r.why ? ": " : "", r.why ? r.why : "");
+  else
+    note("level 3: %s %s %ux%u RAW10: %s", f.name, f.part, r.width, r.height, r.ok ? "OK" : "streamed, but see the checks below");
+  note("route: %s (%s); bus %#llx -> pa %#llx, %llu bytes (frame %u = %u x %u + a guard)", routeName(r.route), r.routeWhy ? r.routeWhy : "-",
+       (unsigned long long)r.busAddr, (unsigned long long)r.pa, (unsigned long long)r.bytes, r.frameBytes, padded, r.height);
+  note("versions: csid-lite0 %08x tfe-lite0 %08x csiphy%u %08x; settle %u; lane table %u written, %u skipped; sensor %u table writes, %u "
+       "controls (pattern %u, gain %u)",
+       r.csidVersion, r.tfeVersion, f.csiphy, r.phyVersion, r.settle, r.phyWritten, r.phySkipped, r.tableWrites, r.controlWrites,
+       gArgs.pattern, gArgs.gain);
+  note("stream: %u frame(s) (BUF_DONE) in %llu us: the first after %llu us, the last interval %llu us; SOF %u EOF %u RUP_DONE %u; late %u; "
+       "%u polls",
+       r.bufDone, (unsigned long long)r.streamUs, (unsigned long long)r.firstFrameUs, (unsigned long long)r.lastIntervalUs, r.sof, r.eof,
+       r.rupDone, r.lateFrames, r.polls);
+  note("irq seen: top %08x buf-done %08x csi2-rx %08x rdi0 %08x (error bits %08x)", r.topOr, r.bufOr, r.rxOr, r.rdiOr, r.rdiOr & kRdiErrors);
+  note("csiphy%u status 0-10: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", f.csiphy, r.phyStatus[0] & 0xff, r.phyStatus[1] & 0xff,
+       r.phyStatus[2] & 0xff, r.phyStatus[3] & 0xff, r.phyStatus[4] & 0xff, r.phyStatus[5] & 0xff, r.phyStatus[6] & 0xff,
+       r.phyStatus[7] & 0xff, r.phyStatus[8] & 0xff, r.phyStatus[9] & 0xff, r.phyStatus[10] & 0xff);
+  if (r.fault.fsr) note("smmu: the window's bank FSR %08x FAR %08x%08x FSYNR0 %08x GFSR %08x", r.fault.fsr, r.fault.farHi, r.fault.farLo,
+                        r.fault.fsynr0, r.fault.gfsr);
+  const FrameStats &s = r.stats;
+  if (s.done) {
+    note("frame: written %llu bytes (%u unpadded, %u padded lines), stride %u; guard %s", (unsigned long long)s.written, bpl * r.height,
+         padded * r.height, s.stride, s.guardIntact ? "intact" : "DAMAGED");
+    if (!s.guardIntact) note("frame: the guard's first changed byte at +%u: the write master wrote past the frame", s.guardFirstBad);
+    static const char *const pos[4] = {"r0c0", "r0c1", "r1c0", "r1c1"};
+    for (unsigned p = 0; p < 4; ++p)
+      note("frame: %s min %u mean %u max %u; histogram (128 a bin) %u %u %u %u %u %u %u %u", pos[p], s.ch[p].min, s.ch[p].mean(), s.ch[p].max,
+           s.ch[p].hist[0], s.ch[p].hist[1], s.ch[p].hist[2], s.ch[p].hist[3], s.ch[p].hist[4], s.ch[p].hist[5], s.ch[p].hist[6],
+           s.ch[p].hist[7]);
+    char line[360];
+    int n = 0;
+    for (unsigned b = 0; b < 8 && n < int(sizeof line) - 40; ++b)
+      n += snprintf(line + n, sizeof line - n, "%sb%u %u/%u/%u/%u", b ? " " : "", b, s.band[b][0], s.band[b][1], s.band[b][2], s.band[b][3]);
+    note("frame: eight vertical bands, mean r0c0/r0c1/r1c0/r1c1: %s", line);
+    n = 0;
+    for (unsigned i = 0; i < sizeof s.head && n < int(sizeof line) - 4; ++i) n += snprintf(line + n, sizeof line - n, "%02x", s.head[i]);
+    note("frame: first %u bytes %s", unsigned(sizeof s.head), line);
+  }
+  note("level 3: %u writes logged, %u quiet (the lane table, the stream's status clears), %u refused, %u off-side warnings; power down %s; "
+       "buffer %s",
+       r.writes, r.quietWrites, r.refusedStores, r.offWarnings, r.cleanOff ? "complete (everything as found)" : "INCOMPLETE",
+       r.bufferFreed ? "freed" : r.pa ? "KEPT (not confirmed idle)" : "never allocated");
+  if (r.failedStep)
+    snprintf(gL3, sizeof gL3, "%s: failed at step %d: %s", f.name, -r.failedStep, streamFailureName(r.failure));
+  else
+    snprintf(gL3, sizeof gL3, "%s: %u frames, %s, guard %s, means %u/%u/%u/%u, power down %s", f.name, r.bufDone, routeName(r.route),
+             s.guardIntact ? "intact" : "damaged", s.ch[0].mean(), s.ch[1].mean(), s.ch[2].mean(), s.ch[3].mean(),
+             r.cleanOff ? "complete" : "incomplete");
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------------ the service
@@ -691,10 +833,13 @@ bool PianoCamera::start(IOService *provider)
        gArgs.level, gArgs.sensor, gArgs.rearBus ? "gpio" : "cci", gArgs.mclk24, gArgs.cciKhz, gArgs.halfUs, gArgs.pull, gArgs.blind,
        gArgs.hold, gArgs.stop, gArgs.cycles, gArgs.delay, gArgs.cc, gArgs.mclkcc, gArgs.blocks, gArgs.qup, gArgs.spmi, gArgs.smmu,
        gArgs.votes, gArgs.mmcxFloor);
-  if (gArgs.level > 2) {
-    note("piano-camera=%u: levels 3-5 are designed, not built (docs/drivers/camera.md section 4); running 2", gArgs.level);
-    gArgs.level = 2;
+  if (gArgs.level > 3) {
+    note("piano-camera=%u: levels 4-5 are designed, not built (docs/drivers/camera.md section 4); running 3", gArgs.level);
+    gArgs.level = 3;
   }
+  if (gArgs.level == 3)
+    note("level 3: %s sensor, frames=%u pattern=%u timeout=%u ms gain=%u mclk24=%u", gArgs.sensor == 2 ? "the front" : "the rear", gArgs.frames,
+         gArgs.pattern, gArgs.timeoutMs, gArgs.gain, gArgs.mclk24);
   if (gArgs.level == 1) note("level 1: loads only, nothing written (the SPMI observer's read command is the only store)");
   setProperty("piano-camera", gArgs.level, 32);
   gSequenceLock = IOLockAlloc();
@@ -762,7 +907,7 @@ void PianoCamera::run()
     return;
   }
 
-  stage(3, "level 2: power each sensor, read its chip ID, power it down");
+  if (gArgs.level == 2) stage(3, "level 2: power each sensor, read its chip ID, power it down");
   PowerOptions po;
   po.rearCci = !gArgs.rearBus;
   po.mclk24 = gArgs.mclk24 != 0;
@@ -775,6 +920,34 @@ void PianoCamera::run()
   po.votes = gArgs.votes != 0;
   Ops ops;
   ops.survey = &s;
+  if (gArgs.level == 3) {
+    // One sensor (piano-camera-sensor=2: the front; else the rear), TITAN_TOP and CAMCC's domains for either bus, the rear's MCLK at
+    // Linux's 24 MHz (piano-camera-mclk24 defaults to 1 here); piano-camera-stop below 300 stops level 2's part.
+    const Sensor w = gArgs.sensor == 2 ? Sensor::front : Sensor::rear;
+    po.camss = true;
+    po.votes = true;
+    po.stopAt = gArgs.stop < 300 ? int(gArgs.stop) : 0;
+    StreamOptions o;
+    o.frames = gArgs.frames;
+    o.pattern = gArgs.pattern != 0;
+    o.timeoutMs = gArgs.timeoutMs;
+    o.gain = gArgs.gain;
+    o.stopAt = gArgs.stop >= 300 ? int(gArgs.stop) : 0;
+    stage(5, "level 3: RAW10 frames through CSIPHY, CSID-lite0 and TFE-lite0's RDI0 into memory");
+    IOLockLock(gSequenceLock);
+    Session<Ops> session(ops, po);
+    Stream<Ops> stream(ops, session, o);
+    const StreamResult r = stream.run(w, gLoader, gPmic, so, s);
+    IOLockUnlock(gSequenceLock);
+    reportResult(r.sensor);
+    reportStream(r);
+    setProperty("piano-camera-level3", gL3);
+    stage(r.failedStep ? -6 : 6, r.ok ? "done (level 3)" : "done (level 3, see the lines above)");
+    note("done: level 3 %s; %llu MMIO loads, %llu stores logged, %llu quiet stores, %u map failures", r.ok ? "ok" : "not ok",
+         (unsigned long long)gLoads, (unsigned long long)gStores, (unsigned long long)gQuietStores, gMapFailures);
+    cmdDbFree();
+    return;
+  }
   unsigned passed[2] = {0, 0}, attempted[2] = {0, 0};
   bool refused[2] = {false, false};   // a sensor the checks refused is not tried again in later cycles
   for (unsigned cycle = 0; cycle < gArgs.cycles; ++cycle) {
