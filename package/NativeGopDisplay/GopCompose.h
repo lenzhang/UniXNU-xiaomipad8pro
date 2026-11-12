@@ -702,6 +702,7 @@ struct Pipeline {
   bool pending = false;     // the current swap waits for its completion rule
   uint64_t waitSerial = 0;  // ... the job it waits for (admitSwap)
   bool damage = false;      // native-gop-display-damage: a new frame's job takes its swap's dirty region
+  bool afterOff = false;    // layer 0 was turned off since the last frame: the panel shows black, not the frame the region is about
 
   void snapshot(Job &job) const
   {
@@ -711,16 +712,18 @@ struct Pipeline {
     job.y1 = layers.y1;
   }
   // The job a swap needs (kind kNone: none; it then completes at once) and what it did to the layers. A new frame starts the refresh
-  // countdown; layer 0 off ends it. A new frame with a dirty region (and damage on) names what of layer 0 changed; one without, or
-  // layer 0 turned off, needs the whole panel; a cursor change alone, nothing of layer 0.
+  // countdown; layer 0 off ends it. A new frame with a dirty region (and damage on) names what of layer 0 changed; one without, the
+  // first after layer 0 was off (the panel is black then, not the frame before), or layer 0 turned off, needs the whole panel; a cursor
+  // change alone, nothing of layer 0.
   Job swapJob(const SwapLayers &swap, bool fenced, uint32_t fence, bool flip, LayerChange *change)
   {
     *change = applySwap(layers, swap);
     Job job;
     if (change->base || change->baseOff) {
       job.kind = Job::kFull;
-      job.frameAll = !(change->base && damage && swap.dirty.known);
+      job.frameAll = !(change->base && damage && swap.dirty.known && !afterOff);
       if (!job.frameAll) job.frameDamage = swap.dirty.rect;
+      afterOff = change->baseOff;
     } else if (change->overlay) {
       job.kind = Job::kCursor;
       job.frameAll = false;

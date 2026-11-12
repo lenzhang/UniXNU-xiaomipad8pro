@@ -367,7 +367,8 @@ private:
     uint64_t fAuditSamples, fAuditMismatches;
     bool fAuditFailedNow;                     // copy thread: the job's audit found a pixel the region did not name
     gopcompose::SwapSequence fSequence;       // the swaps programmed, by number: a gap makes the next frame whole
-    uint64_t fSwapGaps;
+    uint64_t fSwapGaps, fShapeChanges;
+    uint64_t fLastShape;                      // the last frame's surface: width, height, format, row bytes (another one: whole)
     int32_t fAuditX, fAuditY;
     uint32_t fAuditShown, fAuditWanted, fAuditBad, fAuditCount;
     void publishDisplayPower(bool on);
@@ -1298,6 +1299,17 @@ void NativeGopDisplay::program_hardware_gated()
             fDirtyFrames++;
             fDirtyFramesAll++;
         }
+        // Another size, format or row length than the frame before (a display mode change): its region is about another picture.
+        IOSurface *frame = static_cast<IOSurface *>(const_cast<void *>(layers.surface[0]));
+        const uint64_t shape = (ioSurfaceWidth(frame) & 0xffff) << 48 | (ioSurfaceHeight(frame) & 0xffff) << 32 |
+                               uint64_t(ioSurfacePixelFormat(frame) ^ uint32_t(ioSurfaceBytesPerRow(frame)));
+        if (shape != fLastShape && fFrames && layers.dirty.known) {
+            layers.dirty.known = false;
+            if (++fShapeChanges <= 4)
+                GOPLOG("damage: swap %u's frame is a %llux%llu surface of another shape than the last one: composed whole\n", swapID,
+                       ioSurfaceWidth(frame), ioSurfaceHeight(frame));
+        }
+        fLastShape = shape;
         // A swap that never reached this driver since the last frame (dropped, aborted, cancelled) took its change along: whole.
         if (fSequence.takeGap() && layers.dirty.known && fFrames) {
             layers.dirty.known = false;

@@ -259,7 +259,7 @@ the next frame flips again. A cursor showing up over a flipped frame composes th
 (dpu.md §4.2.6) is later.
 
 **Host tests** (`package/NativeGopDisplay/tests/gop_host.cpp`, run by `tooling/k27/build-native-gop-display.sh` before the build,
-1107 checks: 52 of them §5b's start fill, 295 §5c's damage): rectangles and clamping, the cursor's damage; `round(a*b/255)` exhaustively, the blend against a reference over 200,000
+1109 checks: 52 of them §5b's start fill, 297 §5c's damage): rectangles and clamping, the cursor's damage; `round(a*b/255)` exhaustively, the blend against a reference over 200,000
 pixels, saturation; all 65536 half floats, the extended-range table, every base format; the glyph rectangle from the six words
 (missing, empty, outside, cut, hot spot outside); the cursor off each edge, far away, partly on; 600 random scenes of composed rows and
 damage rectangles against a per-pixel reference (every base format, narrow bases, no base, cursor sub-rectangles); the layer rules;
@@ -396,7 +396,9 @@ which units, is what the first run's `dirty region of swap N` lines say; the aud
   drops those with drop reasons, and a cancelled swap never comes. The family numbers the swaps it starts (+980, one after the other,
   cursor swaps included), so a programmed swap whose number does not follow the last one makes the next frame whole (`SwapSequence`;
   line `damage: swap N does not follow the last one programmed (N such gaps): its frame is composed whole`). A cancelled swap's gap
-  only costs a whole composition.
+  only costs a whole composition. Also whole: the first frame after layer 0 was off (the `0x5` swap before display sleep leaves the
+  panel black, not the frame the region is about), and a frame whose surface has another size, format or row length than the one
+  before (a display mode change; `damage: swap N's frame is a WxH surface of another shape ...`).
 - The copy thread composes a frame from its damage only when damage is on and no audit failed, the frame's GPU fence covered it (a frame
   without fences, or whose wait gave up, is composed whole with its refresh copies, as before), the boot framebuffer is on the panel
   and holds the composition (not the first frame, not after a flip or an undrawn frame), and the whole composition is not due

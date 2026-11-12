@@ -677,7 +677,8 @@ static void testDamage()
   off.dirty = dirtyRegion(true, ok, 3200, 2136);
   CHECK(pipe.swapJob(off, false, 0, false, &ch).frameAll);   // layer 0 off: black everywhere
   w.surface[0] = &b;
-  pipe.swapJob(w, true, 4, false, &ch);
+  CHECK(pipe.swapJob(w, true, 4, false, &ch).frameAll);      // the first frame after it: the panel is black, not the frame before
+  CHECK(!pipe.swapJob(w, true, 5, false, &ch).frameAll);     // the next one is from its region again
   Job r;
   CHECK(pipe.refreshJob(&r) && r.refresh && !r.frameAll && r.frameDamage.empty());
   CHECK(pipe.forcedRefreshJob(&r) && r.frameAll);
