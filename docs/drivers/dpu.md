@@ -1,6 +1,10 @@
 # Native DPU display path: survey (B1a), zero-copy flips (B1b), refresh (B1c), Night Light (B1d), panel off/on (B1e)
 
-Status, 2026-11-11: **B1a built and host-tested** (`package/PianoDpu`, `piano-dpu=1`, in the kext list, inert without the argument);
+Status, 2026-11-12: **B1a passed on the tablet** with `piano-dpu-ahb-vote=1` (dpu-ahb1, `logs/usb-console/20261112-083454`): VIG0+VIG1
+1600x2136 from the splash (stride 12800, 'BGRA' with SRCC3_EN, source split: VIG1's source and output at x 1600, both pipes at stage
+5 of LM0 and LM1, blend op 0x400, constant alpha 0xffff0000), ctl0 video mode on INTF1+INTF2, DSC 03, 119.878 Hz, DMA0..5 and VIG2/3
+idle, the SMMU route 0x800 -> bank 2 (stage 1, AArch64), translation off: B1b's bank-off route. B1b's ladder is next (§8: its images
+need no other argument than `piano-dpu=2 piano-dpu-flip=N` since the vote rule is level 2's default). Status, 2026-11-11: **B1a built and host-tested** (`package/PianoDpu`, `piano-dpu=1`, in the kext list, inert without the argument);
 not run on the tablet. **B1b built and host-tested** (`piano-dpu=2` with the ladder `piano-dpu-flip=1..4`, NativeGopDisplay's opt-in
 `native-gop-display-flip=1`; §4.2, §8); not run on the tablet. **B1c, B1d, B1e built and host-tested**
 (`piano-dpu-refresh`, `piano-dpu-pcc`, `piano-dpu-panel`, each opt-in on top of `piano-dpu` >= 1; `DpuSlices.cpp`, NativeGopDisplay's
@@ -129,8 +133,28 @@ the live stream reset the SoC on Linux); the bank itself is reprogrammed in plac
    NativeGopDisplay copies). A revert while idle leaves the last copied frame in the boot framebuffer on the panel until the next swap.
 6. *Cursor*: since 2026-11-12 NativeGopDisplay composes WindowServer's cursor layer over the frame in the boot framebuffer
    (native-gop-display.md §5a); in flip mode a frame is offered to the DPU only while no cursor is on the panel, else composed and
-   the boot framebuffer put back (flips resume once the cursor hides). A free DMA pipe staged above in LM0/LM1 (two rects across the
-   split) for the cursor, so the frame can stay flipped under it, is B1b's last step: not built.
+   the boot framebuffer put back (flips resume once the cursor hides). Since the evening of 2026-11-12 the frames under a cursor are
+   damage copies (native-gop-display.md §5c), so flip mode with a cursor costs one whole composition when the cursor shows up over a
+   flipped frame and then only each frame's dirty region. *The cursor plane* (step 5, designed, not built: the frame stays flipped
+   under the cursor), from the survey and msm's SM8750 catalog and v12 code read as the specification:
+   - the pipe: DMA4 (msm marks DMA4/DMA5 cursor-capable), idle in the survey; one rect (no multirect); SRC_SIZE/SRC_XY the glyph
+     rectangle of WindowServer's 128x128 cursor surface, OUT_SIZE/OUT_XY its place in panel coordinates (the survey: VIG1's output is
+     at x 1600, so with source split a pipe's output is in the mixer pair's coordinates, and msm leaves a pipe narrower than
+     max_linewidth (8192) whole across the LM0/LM1 boundary, staged in both LMs), clipped at the panel's edges; SRC0_ADDR the cursor
+     surface through an SMMU window of its own (16 pages, a fifth small slot), YSTRIDE0 its row bytes; SRC_FORMAT 0x000237ff and
+     UNPACK 0x03020001 as VIG0's, with SRCC3_EN kept (per-pixel alpha); SRC_OP_MODE 0x80000000 (PE_OVERRIDE, as msm and VIG0); the
+     QoS, CDP and clock-control registers left as reset (a 128x128 pipe is ~8 MB/s at 120 Hz) unless the step's underrun check says
+     otherwise;
+   - the mixers: LM0 and LM1 stage 6 (0x40 + 0x30 * 6, above the splash pipes' stage 5): FG_SRC_SEL byte 0 = DMA type 0, rect 0, id 4
+     (0x04), byte 1 none (0xc0); BLEND_OP 0x600 (FG constant alpha, BG alpha from the FG pixel, inverted: premultiplied over, msm's
+     DRM_MODE_BLEND_PREMULTI with an opaque plane), CONST_ALPHA 0x03ff0000 (v12: 10-bit, fg << 16 | bg); hidden: FG_SRC_SEL 0xc0c0;
+   - the CTL: PIPE_ACTIVE and FETCH_ACTIVE with DMA4's bit (4) added, CTL_FLUSH DMA4's bit (13) plus LM0/LM1's (6, 7) when the
+     staging changes, a move or a new image only DMA4's; one flush with the frame's VIG0/VIG1 bits when both change;
+   - NativeGopDisplay: with the plane serving, a frame flips whatever the cursor does and a cursor-only swap is a cursor request
+     (position, image, hidden), not a copy; the plane's fault and underrun checks are the flips' (a revert hides it).
+   Ladder: step 5 = step 4 plus a test cursor (a 128x128 checker with a transparent hole) shown at the panel's centre, across the
+   LM split at x 1600 and off the right edge, 1 s each, over the boot framebuffer, then hidden; pass: visible at each place, the
+   hole shows the panel through it, fsr 0, no underrun.
 
 **4.3 Refresh switching (B1c).** 120 ↔ 60 Hz is a VFP-only change: no DCS command (B2/B3 are the same), no clock change, no DSC or
 touch impact (SunUEFI ran 30/48/50/60/120 seamlessly). At a frame boundary, on both links: DSI DB_MODE = 1, TOTAL.V_TOTAL = 4620 − 1
@@ -226,6 +250,7 @@ All from the IOMobileFramebufferLegacy hooks (the 27.0.1 ABI generated at build 
 | Argument | Default | Meaning |
 |---|---|---|
 | `piano-dpu` | 0 | 1: the read-only survey (loads only); 2: the survey, then B1b's ladder (`piano-dpu-flip`) |
+| `piano-dpu-ahb-vote=0\|1\|2` | 0 at level 1, 1 at level 2 (2026-11-12) | §8 "B1a with the AHB vote": 1 the gate takes Linux's rule for GCC's hardware-gated display AHB branch (CLK_ENABLE set only if clear: nothing written on the tablet), 2 also forces it on. Level 2 needs the survey's path, which needs the gate open: dpu-ahb1 passed with 1 |
 | `piano-dpu-flip=N` | 1 | B1b's steps (§8): 1 the boot framebuffer's addresses flushed again ×3; 2 + shifted 64 rows for 2 s and back; 3 + the DPU's SMMU bank in place, a test pattern through window 0 for 2 s, the fault status after a minute, the bank back as found; 4 the bank in place and flips served to NativeGopDisplay |
 | `piano-dpu-irq=0` | 1 | CTL_FLUSH polled every ~1 ms instead of the vsync interrupt (SPI 83) |
 | `piano-dpu-clean=N` | 1 | a surface's fetched rows cleaned from the CPU caches before each flip: 0 never, 1 through a cacheable alias when XNU makes one, 2 refuse a surface without one |
@@ -233,7 +258,7 @@ All from the IOMobileFramebufferLegacy hooks (the 27.0.1 ABI generated at build 
 | `piano-dpu-underrun=0` | 1 | an underrun neither stops the ladder nor reverts |
 | `piano-dpu-latch=MS` | 50 | the latch timeout (10..500): past it, a revert and flips off for the boot |
 | `piano-dpu-watch=S` | 10 | the fault/underrun check while a surface is on the panel (0 off; nothing wakes while the boot framebuffer is) |
-| `native-gop-display-flip=1` | 0 | (NativeGopDisplay's) each swap's surface to PianoDpu's flip, the copy when refused; needs `piano-dpu=2 piano-dpu-flip=4` |
+| `native-gop-display-flip=0\|1` | 1 with `piano-dpu=2 piano-dpu-flip=4`, else 0 (2026-11-12) | (NativeGopDisplay's) each swap's surface to PianoDpu's flip, the copy (damage copies, native-gop-display.md §5c) when refused or while a cursor is on the panel; 0 keeps the copy at step 4 |
 | `piano-dpu-smmu=N` | 2 | 0 skip the SMMU; 1 global pages; 2 also the bank's registers (B1b steps 3-4 need them); 3 also walk the bank's translation (loads from the boot loader's table memory: opt-in; with it B1b may take over a bank the boot loader translates) |
 | `piano-dpu-measure=MS` | 1000 | the frame-counter interval (20..10000) |
 | `piano-dpu-delay=S`, `piano-dpu-repeat=S`, `piano-dpu-samples=N` | 0, 0, 3 | wait first; re-measure every S s, N times (after WindowServer starts, across display sleep) |
@@ -358,10 +383,13 @@ or two of PianoDpu's start, long before WindowServer; steps 1-3 change nothing a
 # N = 1, 2, 3 (5 minutes is plenty)
 PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=300 PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-dpu=2 piano-dpu-flip=N" \
   tooling/k27/build-native-image.sh && rm -rf out/ram-dpu2-N && cp -R out/ram out/ram-dpu2-N
-# step 4: the desktop through flips, 30 minutes ('BGRA' frames need vmm-present 0)
+# step 4: the desktop through flips, 30 minutes ('BGRA' frames need vmm-present 0); since 2026-11-12 NativeGopDisplay's flip mode is
+# on by itself with piano-dpu=2 piano-dpu-flip=4 (native-gop-display-flip=0 keeps the copy)
 PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=2100 \
-  PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-dpu=2 piano-dpu-flip=4 native-gop-display-flip=1" \
+  PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-dpu=2 piano-dpu-flip=4" \
   tooling/k27/build-native-image.sh && rm -rf out/ram-dpu2-4 && cp -R out/ram out/ram-dpu2-4
+# or step 4 on the desk-dev desktop (its arguments are 959 bytes; these 29 more stay under DarwinBoot's limit)
+DESK_RTC_OFFSET=... DESK_EXTRA="piano-dpu=2 piano-dpu-flip=4" tooling/k27/build-desktop-images.sh desk-dev
 grep -a "PianoDpu\|NativeGopDisplay: flip" logs/usb-console/<newest>-port0.txt
 ```
 (`...` = values to record; the latch times are anywhere from a few µs to one frame, 8.3 ms at 120 Hz.)

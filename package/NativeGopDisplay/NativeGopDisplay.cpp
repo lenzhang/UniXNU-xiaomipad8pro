@@ -673,7 +673,12 @@ bool NativeGopDisplay::start(IOService *provider)
         GOPLOG("copy mode %#x:%s%s (native-gop-display-copy)\n", fCopyMode,
               fCopyMode & kCopyFencedRefresh ? " refresh copies only when no GPU fence covered the frame (and the last one)" : "",
               fCopyMode & kCopyCachedRead ? " cached surface reads with DC CIVAC first" : "");
-    unsigned flip = 0;
+    // Flip mode is on by default where PianoDpu serves flips (piano-dpu=2 with piano-dpu-flip=4 or more, 2026-11-12): the ladder's
+    // last step needs no argument of this driver; native-gop-display-flip=0 keeps the copy, =1 asks PianoDpu whatever its level.
+    unsigned dpuLevel = 0, dpuFlip = 1;
+    PE_parse_boot_argn("piano-dpu", &dpuLevel, sizeof(dpuLevel));
+    PE_parse_boot_argn("piano-dpu-flip", &dpuFlip, sizeof(dpuFlip));
+    unsigned flip = dpuLevel >= 2 && dpuFlip >= 4 ? 1 : 0;
     PE_parse_boot_argn("native-gop-display-flip", &flip, sizeof(flip));
     fFlipMode = flip != 0 && !fExternal;
     if (fFlipMode) {

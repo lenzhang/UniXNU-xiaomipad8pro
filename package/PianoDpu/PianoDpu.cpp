@@ -15,7 +15,8 @@
 // piano-dpu-repeat=S with piano-dpu-samples=N (re-measure every S s, N times, default 3: one line each, to see a change after
 // WindowServer starts or the display sleeps). Without piano-dpu the driver declines in probe() and maps nothing. NativeGopDisplay is
 // not touched: this driver never registers a display.
-//   piano-dpu-ahb-vote=N (default 0: level 1 stores nothing at all) the GCC display AHB branch before the survey (DpuAhbVote.h): 1 its
+//   piano-dpu-ahb-vote=N (default 0 at level 1: it stores nothing at all; 1 at level 2, since 2026-11-12) the GCC display AHB branch
+//                before the survey (DpuAhbVote.h): 1 its
 //                CLK_ENABLE set if clear (under PianoA830's GCC vote lock) and the gate's GCC check by Linux's rule (enabled and
 //                hardware-gated counts as on), 2 also its HW_CTL cleared (forced on, CLK_OFF must read clear); the only stores of
 //                level 1, all to GCC_DISP_AHB_CBCR, undone after the survey unless a later stage reads MDSS.
@@ -80,7 +81,9 @@ void readArgs()
   if (gArgs.repeat > 3600) gArgs.repeat = 3600;
   gArgs.samples = bootArg("piano-dpu-samples", 3);
   if (gArgs.samples > 100) gArgs.samples = 100;
-  gArgs.ahbVote = bootArg("piano-dpu-ahb-vote", 0);
+  // B1b's levels (piano-dpu=2) need the survey's path, which needs the gate open: the AHB vote's rule 1 by default there (2026-11-12:
+  // dpu-ahb1 passed with it; it writes nothing while CLK_ENABLE reads set, as on the tablet). Level 1 keeps 0, loads only.
+  gArgs.ahbVote = bootArg("piano-dpu-ahb-vote", gArgs.level >= 2 ? 1 : 0);
   if (gArgs.ahbVote > 2) gArgs.ahbVote = 0;   // an unknown value writes nothing
 }
 
