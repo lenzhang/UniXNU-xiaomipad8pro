@@ -579,7 +579,7 @@ def map_nodes(s):
     if not r:
         return None
     nodes, sizes = {'lun0': r['lun0']}, {}
-    for key, name in (('rootfs', 'linux_rootfs'), ('esp', 'esp'), ('boot_a', 'boot_a'), ('boot_b', 'boot_b'),
+    for key, name in (('rootfs', 'linux_rootfs'), ('linux_data', 'linux_data'), ('esp', 'esp'), ('boot_a', 'boot_a'), ('boot_b', 'boot_b'),
                       ('vendor_boot_a', 'vendor_boot_a'), ('init_boot_a', 'init_boot_a')):
         fields = r.get(name, 'none').split()
         nodes[key] = fields[0] if fields != ['none'] else None
@@ -588,6 +588,31 @@ def map_nodes(s):
     s.nodes, s.sizes = nodes, sizes
     s.save(nodes=nodes, sizes=sizes, map=r)
     return r
+
+
+@step('linux-data-root', 'maintenance, WRITE linux_data from its first block (a second root image)',
+      writes='LUN 0 partition linux_data, from its first block, the root image\'s size')
+def linux_data_root(s):
+    """--root-image IMG (a root image: manifest and windows, docs/drivers/ufs.md; the macOS 27.3 line's) streamed onto
+    linux_data from its first block, then read back from the medium. The owner (2026-11-12) gave Linux's space to macOS and does
+    not need linux_data's old contents, so there is no backup of them; the image is checked against --root-sha256 on the host
+    first (without the page cache) and again on the medium after the write. Nothing else is written: no GPT change, linux_rootfs
+    (the installed system's windows and the owner's Data store) untouched."""
+    map_nodes(s)
+    dev, size = s.nodes.get('linux_data'), s.sizes.get('linux_data')
+    s.need(bool(dev) and bool(size) if s.execute else None, f'linux_data found: /dev/{dev}, {size} bytes')
+    if not s.a.root_image or not s.a.root_sha256:
+        raise Stop('linux-data-root needs --root-image IMG and --root-sha256 HEX')
+    img = Path(s.a.root_image).expanduser()
+    n = img.stat().st_size if img.is_file() else 0
+    s.need(n > 0 and n % B == 0 and (not size or n <= size), f'{img.name}: {n} bytes, a whole number of {B}-byte blocks inside linux_data')
+    if s.execute:
+        s.need(s.sha_nocache(img) == s.a.root_sha256.lower(), f'{img.name} hashes to {s.a.root_sha256[:16]} on the host')
+    s.serve({'root.img': img})
+    if s.write(f'{img.name} -> /dev/{dev} from block 0 ({n // B} blocks of {B} bytes)'):
+        s.job('root-write', 'restore', 'root.img', dev, 0, B, s.a.http_port, timeout=4 * 3600)
+    got = s.region_sha(dev, 0, n // B, B, name='root-check')
+    s.need(got == s.a.root_sha256.lower() if s.execute else None, f'linux_data read back over {n} bytes: {got} = {s.a.root_sha256[:16]}')
 
 
 @step('abl-check', 'ABL fastboot, read only')
@@ -1256,6 +1281,8 @@ def main():
                    help='Data store: move it 1 GiB down (keeps Data; needs its 14 GB backup) or let it start fresh; auto: move '
                         'when its seed identity is the ESP\'s')
     p.add_argument('--esp', default='esp-base-diag.img', help='the ESP image of step esp (out/persistent)')
+    p.add_argument('--root-image', help='step linux-data-root: the root image written onto linux_data')
+    p.add_argument('--root-sha256', help='step linux-data-root: its sha256')
     p.add_argument('--esp-final', default='esp-base-macos.img', help='the ESP image of step esp-final')
     p.add_argument('--boot-image', default='boot-piano-macos-persistent-v4-signed.img', help='the boot_a image (out/persistent)')
     p.add_argument('--dump-image', default=str(D / 'out/ram-dump/boot-piano-macos-ram-A-bundled.img'))
