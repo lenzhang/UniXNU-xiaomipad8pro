@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* package/PianoPower/QcomQrtr.h of this repository, copied with the include guard changed, these provenance lines added and the two
- * additions marked "PianoWifi addition" below (UPSTREAM has its sha256): PianoPower is not modified, so level 5's QMI path carries
+ * additions marked "PianoWifi addition" below, with the "PianoWifi change" of the flow-control answer (UPSTREAM has its sha256):
+ * PianoPower is not modified, so level 5's QMI path carries
  * its own copy. The link is a different one (the Wi-Fi chip's MHI IPCR channels, not the DSP's GLINK), and the messages are far
  * larger than the DSP's, which is what the additions are for.
  *
@@ -46,6 +47,9 @@ struct QcomQrtr {
     uint32_t remote_count;
     /* counters for the log */
     uint32_t rx_packets, rx_data, rx_bad, rx_unrouted, tx_packets, tx_refused, resumes_sent;
+    /* PianoWifi change (P21): data packets that asked for a flow-control answer, and an answer the link refused, kept for
+     * qcom_qrtr_poll (the sender's node and port, and our port the answer names) */
+    uint32_t rx_confirms, resume_owed, resume_node, resume_port, resume_from;
 };
 
 void qcom_qrtr_init(QcomQrtr *q, uint32_t local_node, QcomQrtrSend send, void *send_context);
@@ -75,6 +79,11 @@ int qcom_qrtr_find_remote(const QcomQrtr *q, uint32_t service);
  * fit the buffer or the send was refused. */
 int qcom_qrtr_send_buffer(QcomQrtr *q, uint8_t *buffer, uint32_t capacity, uint32_t from_port, uint32_t node, uint32_t port,
                           uint32_t length);
+/* PianoWifi change (P21): a flow-control answer (RESUME_TX) that the link refused when it was due, sent again. Returns 1 when one
+ * went out, 0 when none was owed, -1 when the link refused it again (it stays owed). qcom_qrtr_receive sends the answer for every
+ * data packet whose header asks for it: it names our port (the packet's destination) as the destination the sender resumes, and
+ * goes from that port to the sender's node:port. */
+int qcom_qrtr_poll(QcomQrtr *q);
 /* PianoWifi addition: the node and port of a remote service in the list (both filled when it returns 0, -1 when it is not
  * announced). The WLFW service is matched on its instance word as well (version | instance << 8), as the router's own lookups do:
  * the Wi-Fi firmware announces one service of several versions on this link. */

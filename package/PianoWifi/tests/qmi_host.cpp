@@ -342,6 +342,10 @@ struct DeviceSide {
 
 // =================================================================================== the simulated firmware (QRTR and QMI)
 constexpr uint32_t kFirmwareNode = 7, kFirmwarePort = 0x19;
+// The board identifiers the simulated firmware gives (its capability answers are built by capture-less builders): the radio's
+// capability's, and the chip capability's board information (absent when gSimCapBoard is false).
+static uint32_t gSimPhyBoard = 0x21, gSimBoard = 0x21;
+static bool gSimCapBoard = true;
 
 struct Firmware {
   DeviceSide *device = nullptr;
@@ -358,12 +362,55 @@ struct Firmware {
   unsigned pipes = 0, services = 0;
   uint32_t mode = 0xffffffffu;
   bool iniSeen = false, cfgSeen = false, ready = false, memReadySent = false;
-  bool refuseBoard = false, refuseHostCap = false, answerPhyCap = true;
+  bool refuseBoard = false, refuseHostCap = false, answerPhyCap = true, refuseQdss = false;
+  uint32_t lastFileId = 0;
   bool wrongTransaction = false, earlyMemReady = false, earlyMemRequest = false, earlyFwReady = false;
   uint32_t bigRegion = 0;              // a first memory request with one region this big
   uint32_t hostNode = 0, hostPort = 0;
+  // Its router's flow control, the protocol's sending side as net/qrtr has it (and as the WLAN firmware showed on the tablet: ten
+  // data packets to our port, then nothing): it counts the data packets sent to our port since the last RESUME_TX, asks for one on
+  // the fifth (confirm_rx), and holds every packet from the tenth on in its own queue until a RESUME_TX names our node and port
+  // (the destination it resumes). A RESUME_TX that names anything else resumes nothing (the copied router's old form: the sender).
+  static constexpr unsigned kFlowLow = 5, kFlowHigh = 10;
+  bool flowControl = true;
+  unsigned pendingTx = 0, dataSent = 0, confirmsAsked = 0, resumes = 0, misaddressedResumes = 0;
+  uint32_t resumeFromNode = 0, resumeFromPort = 0, resumeToNode = 0, resumeToPort = 0;
+  std::vector<std::vector<uint8_t>> held;
 
   void queue(std::vector<uint8_t> packet) { device->d.toHost.push_back(std::move(packet)); }
+  void sendData(std::vector<uint8_t> packet)
+  {
+    if (flowControl && pendingTx >= kFlowHigh) {
+      held.push_back(std::move(packet));
+      return;
+    }
+    ++pendingTx;
+    ++dataSent;
+    if (flowControl && pendingTx == kFlowLow) {
+      put32(packet.data() + 16, 1);   // confirm_rx: answer with a RESUME_TX
+      ++confirmsAsked;
+    }
+    queue(std::move(packet));
+  }
+  // A RESUME_TX from the host: its header, and its payload's client address.
+  void onResume(const std::vector<uint8_t> &packet)
+  {
+    const uint32_t size = get32(packet.data() + 20);
+    resumeFromNode = get32(packet.data() + 8);
+    resumeFromPort = get32(packet.data() + 12);
+    resumeToNode = get32(packet.data() + 24);
+    resumeToPort = get32(packet.data() + 28);
+    if (size < 12 || get32(packet.data() + QCOM_QRTR_HEADER) != QCOM_QRTR_RESUME_TX ||
+        get32(packet.data() + QCOM_QRTR_HEADER + 4) != hostNode || get32(packet.data() + QCOM_QRTR_HEADER + 8) != hostPort) {
+      ++misaddressedResumes;
+      return;
+    }
+    ++resumes;
+    pendingTx = 0;
+    std::vector<std::vector<uint8_t>> waiting;
+    waiting.swap(held);
+    for (auto &p : waiting) sendData(std::move(p));
+  }
 
   void control(uint32_t command, const uint32_t words[4])
   {
@@ -402,7 +449,7 @@ struct Firmware {
     put32(packet.data() + 24, hostNode);
     put32(packet.data() + 28, hostPort);
     std::memcpy(packet.data() + QCOM_QRTR_HEADER, message, length);
-    queue(std::move(packet));
+    sendData(std::move(packet));
   }
   void respond(uint16_t transaction, uint16_t message, uint16_t result, uint16_t error,
                void (*extra)(QmiWriter &) = nullptr)
@@ -479,7 +526,7 @@ struct Firmware {
       }
       respond(m.transaction, m.message, kQmiResultSuccess, 0, [](QmiWriter &w) {
         qmiU8(w, 0x10, 2);          // two radios
-        qmiU32(w, 0x11, 0x21);      // the board identifier
+        qmiU32(w, 0x11, gSimPhyBoard);   // the board identifier (only logged by the client)
         qmiU8(w, 0x13, 1);          // single-chip multi-link
       });
       return;
@@ -570,9 +617,11 @@ struct Firmware {
         qmiLe(w, 0x20, 4);
         qmiLe(w, 0x4b, 4);
         qmiTlvEnd(w);
-        qmiTlvBegin(w, 0x11);          // board
-        qmiLe(w, 0x21, 4);
-        qmiTlvEnd(w);
+        if (gSimCapBoard) {
+          qmiTlvBegin(w, 0x11);        // board
+          qmiLe(w, gSimBoard, 4);
+          qmiTlvEnd(w);
+        }
         qmiTlvBegin(w, 0x12);          // the system on chip
         qmiLe(w, 0x400, 4);
         qmiTlvEnd(w);
@@ -593,7 +642,8 @@ struct Firmware {
       uint8_t valid = 0, end = 0, type = 0;
       uint32_t id = 0, total = 0, segment = 0, size = 0;
       CHECK(qmiReadU8(m, 0x01, &valid) && valid == 1);
-      CHECK(qmiReadU32(m, 0x10, &id) && id == 0x21);     // the board identifier the capability answer gave
+      CHECK(qmiReadU32(m, 0x10, &id) && id == (gSimCapBoard ? gSimBoard : kBoardIdDefault));   // the chip capability's board
+      lastFileId = id;
       CHECK(qmiReadU32(m, 0x11, &total));
       CHECK(qmiReadU32(m, 0x12, &segment));
       const uint8_t *data = qmiFind(m, 0x13, &size);
@@ -629,6 +679,11 @@ struct Firmware {
       CHECK(qmiReadU8(m, 0x13, &end) && end == (total == bytes ? 1 : 0));
       qdss.append(reinterpret_cast<const char *>(data + 2), bytes);
       ++qdssSegments;
+      if (refuseQdss) {   // a firmware that does not take the trace configuration, and starts all the same
+        respond(m.transaction, m.message, 1, 0x2f);
+        indicate(kWlfwFwReadyInd);
+        return;
+      }
       if (end && earlyFwReady) {   // "ready" before the answer to the last segment
         indicate(kWlfwFwReadyInd);
         respond(m.transaction, m.message, kQmiResultSuccess, 0);
@@ -718,8 +773,9 @@ struct Host {
   std::unique_ptr<DeviceSide> owned;
   DeviceSide *side = nullptr;
   std::map<std::string, std::string> files;
-  unsigned steps = 0, lastStep = 0, sendRefusals = 0, fileReads = 0;
+  unsigned steps = 0, lastStep = 0, sendRefusals = 0, fileReads = 0, refuseResumes = 0, resumeRefusals = 0;
   bool fileFails = false;
+  std::vector<WlfwEvent> events;   // what the client told its owner (WlfwIo::event)
 
   uint8_t *memoryAt(uint64_t bus, uint32_t bytes) { return device.at(bus, bytes); }
 
@@ -727,6 +783,10 @@ struct Host {
   static int send(void *ctx, const uint8_t *packet, uint32_t length)
   {
     Host &h = *static_cast<Host *>(ctx);
+    if (h.refuseResumes && length >= 8 && get32(packet + 4) == QCOM_QRTR_RESUME_TX) {   // a link that loses the answer
+      ++h.resumeRefusals;
+      return h.refuseResumes == 1 ? (h.refuseResumes = 0, -1) : -1;                     // 1: once, 2: always
+    }
     for (unsigned i = 0; i < kIpcrOutBuffers; ++i)
       if (h.transport.tx[i].va == packet) return h.transport.started[0] && ipcrSubmitTx(h.transport, h.device.io(), i, length)
                                                       ? 0 : (++h.sendRefusals, -1);
@@ -789,6 +849,10 @@ struct Host {
     ++h.steps;
     h.lastStep = unsigned(step);
   }
+  static void event(void *ctx, const WlfwEvent &e)
+  {
+    static_cast<Host *>(ctx)->events.push_back(e);
+  }
   // ---- a data packet for our port: the client's ----
   static void receive(void *ctx, QcomQrtr *, uint32_t, uint32_t, uint32_t, const uint8_t *data, uint32_t length)
   {
@@ -808,6 +872,10 @@ struct Host {
     if (type == QCOM_QRTR_HELLO) {
       if (!h.firmware.helloSent) h.firmware.hello();
       if (!h.firmware.announced) h.firmware.announce();
+      return;
+    }
+    if (type == QCOM_QRTR_RESUME_TX) {
+      h.firmware.onResume(packet);
       return;
     }
     if (type != QCOM_QRTR_DATA || port != kFirmwarePort) return;
@@ -857,6 +925,7 @@ struct Host {
       qcom_qrtr_receive(&router, va, length);
     });
     ipcrPostRx(transport, io);   // as the driver's pump: after every walk (the transport itself refuses before 21 runs)
+    qcom_qrtr_poll(&router);     // and a flow-control answer the link refused, again
     return packets;
   }
   // The link up: the two channels started, the inbound buffers posted, the hello said and the service announcement in.
@@ -900,6 +969,7 @@ static WlfwIo ioOf(Host &h)
   io.file_read = &Host::fileRead;
   io.memory = &Host::memory;
   io.step = &Host::step;
+  io.event = &Host::event;
   return io;
 }
 
@@ -1174,6 +1244,54 @@ static void testRouter()
   // A payload that does not fit the buffer is refused, not truncated.
   CHECK(qcom_qrtr_send_buffer(&h.router, buffer, 64, kQrtrClientPort, node, port, 4096) == -1);
 
+  // The flow-control answer (P21): a data packet from the firmware's port 1 on node 7 to our port that asks for one gets a
+  // RESUME_TX from our port to that node:port, naming *our* node and port (the destination the sender resumes) — not the sender's.
+  {
+    struct Capture {
+      std::vector<uint8_t> last;
+      unsigned sent = 0, refuse = 0;
+    } cap;
+    QcomQrtr r;
+    qcom_qrtr_init(&r, kQrtrLocalNode, [](void *ctx, const uint8_t *p, uint32_t n) {
+      Capture &c = *static_cast<Capture *>(ctx);
+      if (c.refuse) return --c.refuse, -1;
+      c.last.assign(p, p + n);
+      ++c.sent;
+      return 0;
+    }, &cap);
+    CHECK(qcom_qrtr_add_client(&r, kQrtrClientPort, [](void *, QcomQrtr *, uint32_t, uint32_t, uint32_t, const uint8_t *,
+                                                       uint32_t) {}, nullptr) == 0);
+    std::vector<uint8_t> data(QCOM_QRTR_HEADER + 8, 0);
+    put32(data.data(), 1);
+    put32(data.data() + 4, QCOM_QRTR_DATA);
+    put32(data.data() + 8, 7);                 // from node 7
+    put32(data.data() + 12, 1);                // port 1 (the WLAN service's, as on the tablet)
+    put32(data.data() + 16, 1);                // confirm_rx
+    put32(data.data() + 20, 7);
+    put32(data.data() + 24, kQrtrLocalNode);
+    put32(data.data() + 28, kQrtrClientPort);
+    CHECK(qcom_qrtr_receive(&r, data.data(), uint32_t(data.size())) == 0);
+    CHECK(r.rx_confirms == 1 && r.resumes_sent == 1 && !r.resume_owed && cap.sent == 1);
+    CHECK(cap.last.size() == QCOM_QRTR_HEADER + 20);
+    const uint8_t *p = cap.last.data();
+    CHECK(get32(p) == 1 && get32(p + 4) == QCOM_QRTR_RESUME_TX);
+    CHECK(get32(p + 8) == kQrtrLocalNode && get32(p + 12) == kQrtrClientPort);   // from our port
+    CHECK(get32(p + 16) == 0 && get32(p + 20) == 20);                            // no confirmation asked, 20 bytes
+    CHECK(get32(p + 24) == 7 && get32(p + 28) == 1);                             // to the sender's node:port
+    CHECK(get32(p + 32) == QCOM_QRTR_RESUME_TX);
+    CHECK(get32(p + 36) == kQrtrLocalNode && get32(p + 40) == kQrtrClientPort);  // naming us, the flow's destination
+    // One the link refuses is owed, and sent by the next poll; a poll with nothing owed sends nothing.
+    cap.refuse = 1;
+    CHECK(qcom_qrtr_receive(&r, data.data(), uint32_t(data.size())) == 0);
+    CHECK(r.rx_confirms == 2 && r.resumes_sent == 1 && r.resume_owed && cap.sent == 1 && r.tx_refused == 1);
+    CHECK(qcom_qrtr_poll(&r) == 1 && !r.resume_owed && r.resumes_sent == 2 && cap.sent == 2);
+    CHECK(get32(cap.last.data() + 24) == 7 && get32(cap.last.data() + 28) == 1 && get32(cap.last.data() + 40) == kQrtrClientPort);
+    CHECK(qcom_qrtr_poll(&r) == 0 && cap.sent == 2);
+    // A data packet that asks for nothing gets nothing.
+    put32(data.data() + 16, 0);
+    CHECK(qcom_qrtr_receive(&r, data.data(), uint32_t(data.size())) == 0 && r.rx_confirms == 2 && cap.sent == 2);
+  }
+
   // The protocol's version 2 header (16 bytes, 16-bit nodes and ports, 0xffff the control port, optional words after it), which a
   // remote may use while this side sends version 1: a hello, an announcement and a data packet are read as their version 1 forms.
   QcomQrtr v2;
@@ -1268,6 +1386,146 @@ static void testClient()
   CHECK(h.client.requests == h.client.responses);
   // Every step was announced once, in order, and the last one is the mode.
   CHECK(h.lastStep == kWlfwStepDone);
+  for (unsigned i = 0; i < 4; ++i) h.turn();   // the last flow-control answer reaches the firmware's model
+  // The firmware's router asked for flow-control answers (more than ten packets came to our port) and every one resumed it.
+  CHECK(h.firmware.dataSent > Firmware::kFlowHigh && h.firmware.confirmsAsked >= 2 && h.firmware.held.empty());
+  CHECK(h.firmware.resumes == h.firmware.confirmsAsked && h.firmware.misaddressedResumes == 0);
+  CHECK(h.router.rx_confirms == h.firmware.confirmsAsked && h.router.resumes_sent == h.firmware.confirmsAsked);
+  // The owner heard every response with its codes and every indication, the downloads with their segments.
+  unsigned responses = 0, indications = 0, regdbSegments = 0;
+  for (const WlfwEvent &e : h.events) {
+    CHECK(e.kind != kWlfwEventUnexpected);
+    if (e.kind == kWlfwEventIndication) {
+      ++indications;
+      continue;
+    }
+    ++responses;
+    CHECK(e.hasResult && e.result == kQmiResultSuccess && e.error == 0);
+    if (e.message == kWlfwBdfDownload && e.file && std::strcmp(e.file, kRegdbName) == 0) {
+      CHECK(e.segment == int32_t(regdbSegments) && e.segments == 3 && e.last == (regdbSegments == 2));
+      CHECK(e.bytes == (regdbSegments < 2 ? kWlfwMaxDataBytes : 13000 - 2 * kWlfwMaxDataBytes));
+      ++regdbSegments;
+    }
+    if (e.message != kWlfwBdfDownload && e.message != kWlfwQdssDownload) CHECK(e.segment == -1);
+  }
+  CHECK(responses == h.client.responses && indications == h.client.indications && regdbSegments == 3);
+  CHECK(h.client.havePhyBoard && h.client.phyBoardId == 0x21 && h.client.haveCapBoard && h.client.capBoardId == 0x21);
+}
+
+// P21 (2026-11-12): the tablet's exchange with the stock files' sizes. The firmware's router stops sending to our port after its
+// tenth packet until a RESUME_TX names our port; the copied router's answer named the sender, so on the tablet the answer to the
+// regulatory database's fourth and last segment never came: 9 requests, 8 responses, 2 indications, 4 download segments, a step
+// timed out. A link that loses every answer reproduces exactly that; the fixed answer takes the exchange to the firmware's ready.
+static void stockFiles(Host &h)
+{
+  h.files["regdb_xiaomi.bin"] = std::string(24278, 'r');        // 4 segments, the last 5846 bytes
+  h.files["bd_p81.elf"] = std::string(125272, 'b');             // 21 segments
+  h.files["phy_ucode20.elf"] = std::string(290816, 'm');
+  h.files["aux_ucode20.elf"] = std::string(61440, 'a');
+  h.files["qdss_trace_config_v2.cfg"] = std::string(6241, 'q');  // 2 segments
+}
+
+static void testFlowControl()
+{
+  {   // the tablet's failure, reproduced: every flow-control answer lost
+    Host h;
+    h.bring();
+    stockFiles(h);
+    h.refuseResumes = 2;
+    CHECK(wlfwStart(h.client, ioOf(h), 0, 0));
+    CHECK(h.run(256) == kWlfwStepRegdb);
+    CHECK(h.client.waiting && h.client.requests == 9 && h.client.responses == 8 && h.client.indications == 2);
+    CHECK(h.client.segments == 4 && h.firmware.regdbSegments == 4);   // the chip has the whole file
+    CHECK(h.firmware.dataSent == Firmware::kFlowHigh && h.firmware.held.size() == 1 && h.router.rx_data == 10);
+    CHECK(h.client.outSegment == 3 && h.client.outSegments == 4 && h.client.outBytes == 24278 - 3 * kWlfwMaxDataBytes &&
+          h.client.outLast && h.client.pendingMessage == kWlfwBdfDownload);
+    CHECK(h.router.resume_owed && h.router.rx_confirms == 1 && h.router.resumes_sent == 0);
+    CHECK(wlfwTimedOut(h.client) == kWlfwStepStopped && h.client.timedOutWaiting && h.client.failedStep == kWlfwStepRegdb);
+  }
+  {   // the old answer (naming the sender, from the control port) resumes nothing: the firmware's model holds it to the protocol
+    Host h;
+    h.bring();
+    stockFiles(h);
+    h.refuseResumes = 2;
+    CHECK(wlfwStart(h.client, ioOf(h), 0, 0));
+    CHECK(h.run(256) == kWlfwStepRegdb);
+    std::vector<uint8_t> old(QCOM_QRTR_HEADER + 20, 0);
+    put32(old.data(), 1);
+    put32(old.data() + 4, QCOM_QRTR_RESUME_TX);
+    put32(old.data() + 8, kQrtrLocalNode);
+    put32(old.data() + 12, QCOM_QRTR_PORT_CTRL);
+    put32(old.data() + 20, 20);
+    put32(old.data() + 24, kFirmwareNode);
+    put32(old.data() + 28, QCOM_QRTR_PORT_CTRL);
+    put32(old.data() + QCOM_QRTR_HEADER, QCOM_QRTR_RESUME_TX);
+    put32(old.data() + QCOM_QRTR_HEADER + 4, kFirmwareNode);
+    put32(old.data() + QCOM_QRTR_HEADER + 8, kFirmwarePort);
+    h.firmware.onResume(old);
+    CHECK(h.firmware.misaddressedResumes == 1 && h.firmware.held.size() == 1);
+    // and the right one, once the link takes it again, lets the held answer out and the exchange run to the end
+    h.refuseResumes = 0;
+    CHECK(h.run(512) == kWlfwStepDone);
+    CHECK(h.firmware.resumes >= 1 && h.firmware.held.empty() && h.client.error == kWlfwErrNone);
+  }
+  {   // the fix: the stock sizes run through, a first lost answer is sent again by the poll
+    Host h;
+    h.bring();
+    stockFiles(h);
+    h.refuseResumes = 1;
+    CHECK(wlfwStart(h.client, ioOf(h), 0, 0));
+    CHECK(h.run(512) == kWlfwStepDone);
+    CHECK(h.client.error == kWlfwErrNone && h.resumeRefusals == 1 && !h.router.resume_owed);
+    CHECK(h.firmware.regdbSegments == 4 && h.firmware.boardSegments == 21 && h.firmware.qdssSegments == 2);
+    CHECK(h.firmware.regdb == h.files["regdb_xiaomi.bin"] && h.firmware.board == h.files["bd_p81.elf"]);
+    for (unsigned i = 0; i < 4; ++i) h.turn();   // the last answer reaches the firmware's model
+    CHECK(h.firmware.confirmsAsked == h.firmware.resumes && h.firmware.misaddressedResumes == 0 && h.firmware.held.empty());
+    CHECK(h.firmware.dataSent == h.client.responses + h.client.indications);
+  }
+  {   // this unit's board identifier: the chip names none (0xff, also in the radio's capability); every download carries 0xff and
+      // the board file is the stock API-1 default, as the chip's own driver chooses
+    gSimPhyBoard = 0xff;
+    gSimBoard = 0xff;
+    Host h;
+    h.bring();
+    stockFiles(h);
+    CHECK(wlfwStart(h.client, ioOf(h), 0, 0));
+    CHECK(h.run(512) == kWlfwStepDone);
+    CHECK(h.client.boardId == 0xff && h.firmware.lastFileId == 0xff && h.client.phyBoardId == 0xff);
+    const char *why = nullptr;
+    CHECK(std::strcmp(wlfwBoardFile(h.client.boardId, &why), "bd_p81.elf") == 0 && why && std::strstr(why, "0xff"));
+    gSimPhyBoard = gSimBoard = 0x21;
+  }
+  {   // a chip capability without board information: 0xff, whatever the radio's capability said (it is only logged)
+    gSimCapBoard = false;
+    Host h;
+    h.bring();
+    CHECK(wlfwStart(h.client, ioOf(h), 0, 0));
+    CHECK(h.run(256) == kWlfwStepDone);
+    CHECK(h.client.boardId == kBoardIdDefault && !h.client.haveCapBoard && h.client.havePhyBoard && h.client.phyBoardId == 0x21);
+    CHECK(h.firmware.lastFileId == kBoardIdDefault);
+    gSimCapBoard = true;
+  }
+  {   // the trace configuration refused: noted, the rest of it not sent, and the firmware's ready still awaited and taken
+    Host h;
+    h.bring();
+    stockFiles(h);
+    h.firmware.refuseQdss = true;
+    CHECK(wlfwStart(h.client, ioOf(h), 0, 0));
+    CHECK(h.run(512) == kWlfwStepDone);
+    CHECK(h.client.qdssRefused && h.client.qdssResult == 1 && h.client.qdssError == 0x2f && h.firmware.qdssSegments == 1);
+  }
+  {   // no trace configuration on the partition: skipped
+    Host h;
+    h.bring();
+    h.files.erase("qdss_trace_config_v2.cfg");
+    h.firmware.earlyFwReady = false;
+    CHECK(wlfwStart(h.client, ioOf(h), 0, 0));
+    // the simulated firmware says "ready" after the trace configuration's last segment; without one it never would: say it here
+    for (unsigned i = 0; i < 256 && h.client.step != kWlfwStepFwReady && h.client.step != kWlfwStepStopped; ++i) h.turn();
+    CHECK(h.client.step == kWlfwStepFwReady && h.client.qdssSkipped && h.firmware.qdssSegments == 0);
+    h.firmware.indicate(kWlfwFwReadyInd);
+    CHECK(h.run() == kWlfwStepDone);
+  }
 }
 
 static void testClientGate()
@@ -1816,6 +2074,7 @@ int main()
   testClient();
   testClientGate();
   testClientFaults();
+  testFlowControl();
   testShadowList();
   testWindow();
   std::printf(failures ? "qmi_host: %d check(s) failed\n" : "qmi_host: all passed\n", failures);

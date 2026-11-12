@@ -20,7 +20,9 @@
 //   511 the PHY microcode          request 0x003c {address, size}   -> phy_ucode20.elf, in our window
 //   512 the auxiliary microcode    request 0x005a {address, size}   -> aux_ucode20.elf, in our window (this chip asks for it)
 //   513 the trace configuration    request 0x0044 in 6 KiB segments -> qdss_trace_config_v2.cfg (this chip does not set the
-//                                                                     "configuration missing" feature bit, so it is sent)
+//                                                                     "configuration missing" feature bit, so it is sent; a
+//                                                                     refusal, or no such file, is noted and the exchange goes on:
+//                                                                     the trace is a debugging aid, not part of the firmware's start)
 //   514 the firmware is ready      indication 0x0038                <- **level 5's gate**
 //   515 the firmware's own options request 0x002f                   -> firmware logging on        (only with piano-wifi-mode=1)
 //   516 the host's configuration   request 0x0023                   -> the copy engine's pipes, the services' pipes, and the
@@ -28,6 +30,13 @@
 //   517 the mode                   request 0x0022 {normal}          -> the firmware starts its radio; level 6's doorway
 // No file is ever held whole: a download segment is read from the stock partition straight into the message being built, and the
 // two microcodes are read straight into the window the chip reads them from.
+//
+// The file identifier every download carries is the board identifier of the chip's capability answer (its OTP's), or 0xff when it
+// gives none, as the chip's own driver does; the radio's capability carries a board identifier as well, which that driver only
+// logs, and so does this one. With 0xff (an unprogrammed OTP, this unit) that driver finds no entry in a board-2 container (the
+// stock image has none) and falls back to its single API-1 board file, which for this tablet is the stock China-region bd_p81.elf:
+// wlfwBoardFile says so for the log. Every response and indication goes to the owner's `event` callback with its result and error
+// codes and, for a download, which segment it answered.
 #pragma once
 #include <stdint.h>
 #include "WifiHw.h"
@@ -157,6 +166,34 @@ struct WlfwMemRegion {
   uint8_t *va = nullptr;
 };
 
+// What the firmware said, one message at a time, for the owner's log: a response with its result and error codes (and, when it
+// answers a download segment, which one), or an indication.
+enum WlfwEventKind : uint8_t { kWlfwEventResponse = 0, kWlfwEventIndication = 1, kWlfwEventUnexpected = 2 };
+struct WlfwEvent {
+  int step = 0;                 // the step the client was in when it came
+  uint8_t kind = kWlfwEventResponse;
+  uint16_t message = 0, transaction = 0;
+  bool hasResult = false;       // a response without the result TLV is itself a failure (except the radio's capability)
+  uint16_t result = 0, error = 0;
+  int32_t segment = -1;         // the download segment it answers (from 0), -1 when it answers no download
+  uint32_t segments = 0, bytes = 0;
+  bool last = false;            // that segment carried the end flag
+  const char *file = nullptr;   // the file of that download
+};
+
+// The file the board-file step sends for a board identifier, and why (for the log). The stock image carries one board file for this
+// tablet's region and no board-2 container, so every identifier gets it; 0xff is the identifier of a chip whose OTP names no board,
+// for which the chip's own driver takes its API-1 default board file, which is this one.
+inline const char *wlfwBoardFile(uint32_t boardId, const char **why)
+{
+  if (why)
+    *why = boardId == kBoardIdDefault
+             ? "the chip names no board (0xff: its OTP carries no board identifier), so the stock API-1 default board file, as the "
+               "chip's own driver chooses with no board-2 container (the stock image has none)"
+             : "the stock image's only board file for this tablet's region (no board-2 container to choose a variant from)";
+  return kBoardName;
+}
+
 struct WlfwIo {
   void *ctx = nullptr;
   // A transport buffer to build the next message in, and its capacity; null when none is free.
@@ -169,6 +206,8 @@ struct WlfwIo {
   // `bytes` of the window for the chip to read or write: the address the chip must use, 0 when there is no room.
   uint64_t (*memory)(void *ctx, uint32_t bytes, uint8_t **va) = nullptr;
   void (*step)(void *ctx, int step, const char *what) = nullptr;
+  // Every response that belongs to the request outstanding, and every indication, as it arrives (optional).
+  void (*event)(void *ctx, const WlfwEvent &event) = nullptr;
 };
 
 struct WlfwClient {
@@ -182,6 +221,9 @@ struct WlfwClient {
   uint8_t radios = 0, macs = 0;
   bool singleChipMlo = false;
   uint32_t boardId = kBoardIdDefault, chipId = 0, chipFamily = 0, socId = 0, fwVersion = 0, otpVersion = 0, voltageMv = 0;
+  // the two board identifiers as given: the radio's capability (only logged) and the chip's (the file identifier)
+  uint32_t phyBoardId = 0, capBoardId = 0;
+  bool havePhyBoard = false, haveCapBoard = false;
   uint64_t fwStatus = 0, fwCaps = 0;
   char buildTimestamp[33] = {};
   // the memory the firmware asked for
@@ -195,6 +237,15 @@ struct WlfwClient {
   const char *fileName = nullptr;
   uint32_t fileBytes = 0, fileOffset = 0, segmentId = 0;
   uint8_t fileType = 0;
+  // the request outstanding, as the log names it: a download's segment (-1: none), its size, its end flag
+  int32_t outSegment = -1;
+  uint32_t outSegments = 0, outBytes = 0;
+  bool outLast = false;
+  const char *outFile = nullptr;
+  bool timedOutWaiting = false;          // the step that timed out had a request out (its fields above say which)
+  // the trace configuration's outcome: refused (with the codes) or skipped (no file); neither stops the exchange
+  bool qdssRefused = false, qdssSkipped = false;
+  uint16_t qdssResult = 0, qdssError = 0;
   // counters for the log
   unsigned requests = 0, responses = 0, indications = 0, segments = 0, unexpected = 0;
   uint32_t shadowCount = 0;
@@ -239,6 +290,10 @@ inline bool request(WlfwClient &c, uint16_t message, Build build)
   c.pending = c.transaction;
   c.pendingMessage = message;
   c.waiting = true;
+  c.outSegment = -1;                     // a download says which segment this is right after (download below)
+  c.outSegments = c.outBytes = 0;
+  c.outLast = false;
+  c.outFile = nullptr;
   ++c.requests;
   return true;
 }
@@ -290,6 +345,11 @@ inline bool download(WlfwClient &c)
     if (!read) fail(c, kWlfwErrFile);
     return false;
   }
+  c.outSegment = int32_t(segment);
+  c.outSegments = (c.fileBytes + kWlfwMaxDataBytes - 1) / kWlfwMaxDataBytes;
+  c.outBytes = take;
+  c.outLast = last != 0;
+  c.outFile = name;
   c.fileOffset += take;
   ++c.segmentId;
   ++c.segments;
@@ -447,6 +507,10 @@ inline bool wlfwEnter(WlfwClient &c, int step)
   case kWlfwStepAuxUc:
     return byAddress(c, kWlfwAuxUcInfo, kAuxUcName);
   case kWlfwStepQdss:
+    if (!c.io.file_size || !c.io.file_size(c.io.ctx, kQdssName)) {   // no trace configuration: the firmware starts without one
+      c.qdssSkipped = true;
+      return wlfwEnter(c, kWlfwStepFwReady);
+    }
     return startDownload(c, kQdssName, 0, 0);
   case kWlfwStepIni:
     return request(c, kWlfwWlanIni, [](QmiWriter &w) { qmiU8(w, 0x10, 1); });   // the firmware's own log on
@@ -495,7 +559,10 @@ inline void readPhyCap(WlfwClient &c, const QmiMessage &m)
   uint8_t radios = 0, mlo = 0;
   uint32_t board = 0;
   if (qmiReadU8(m, 0x10, &radios) && radios) c.radios = radios;
-  if (qmiReadU32(m, 0x11, &board)) c.boardId = board;
+  if (qmiReadU32(m, 0x11, &board)) {     // only noted: the file identifier is the chip capability's board (readChipCap)
+    c.phyBoardId = board;
+    c.havePhyBoard = true;
+  }
   if (qmiReadU8(m, 0x13, &mlo)) c.singleChipMlo = mlo != 0;
 }
 
@@ -507,9 +574,13 @@ inline void readChipCap(WlfwClient &c, const QmiMessage &m)
     c.chipFamily = uint32_t(qmiTake(chip, 4));
   }
   QmiTlvReader board = qmiTlvReader(m, 0x11);
+  c.boardId = kBoardIdDefault;           // no board information: the default identifier, as the chip's own driver uses
   if (!board.bad) {
     const uint32_t id = uint32_t(qmiTake(board, 4));
-    if (!board.bad) c.boardId = id;
+    if (!board.bad) {
+      c.boardId = c.capBoardId = id;
+      c.haveCapBoard = true;
+    }
   }
   QmiTlvReader soc = qmiTlvReader(m, 0x12);
   if (!soc.bad) c.socId = uint32_t(qmiTake(soc, 4));
@@ -572,6 +643,28 @@ inline bool readMemRequest(WlfwClient &c, const QmiMessage &m)
 
 // One QMI message from the firmware's service port. Returns the step the client is in afterwards; kWlfwStepStopped means it ended
 // (`error` says why). Anything that does not belong to the step it is in is counted and ignored, never acted on.
+namespace wlfwdetail {
+// The owner's log line for one message (WlfwIo::event).
+inline void tell(WlfwClient &c, const QmiMessage &m, uint8_t kind)
+{
+  if (!c.io.event) return;
+  WlfwEvent e;
+  e.step = c.step;
+  e.kind = kind;
+  e.message = m.message;
+  e.transaction = m.transaction;
+  e.hasResult = qmiResult(m, &e.result, &e.error);
+  if (kind == kWlfwEventResponse && c.outSegment >= 0) {
+    e.segment = c.outSegment;
+    e.segments = c.outSegments;
+    e.bytes = c.outBytes;
+    e.last = c.outLast;
+    e.file = c.outFile;
+  }
+  c.io.event(c.io.ctx, e);
+}
+}  // namespace wlfwdetail
+
 inline int wlfwReceive(WlfwClient &c, const uint8_t *data, uint32_t length)
 {
   using namespace wlfwdetail;
@@ -583,6 +676,11 @@ inline int wlfwReceive(WlfwClient &c, const uint8_t *data, uint32_t length)
   }
   if (m.type == kQmiIndication) {
     ++c.indications;
+    const bool known = m.message == kWlfwRequestMemInd || m.message == kWlfwFwMemReadyInd || m.message == kWlfwFwReadyInd;
+    const bool early = (m.message == kWlfwRequestMemInd && c.step < kWlfwStepHostCap) ||
+                       (m.message == kWlfwFwMemReadyInd && c.step < kWlfwStepRespondMem) ||
+                       (m.message == kWlfwFwReadyInd && c.step < kWlfwStepChipCap);
+    tell(c, m, known && !early ? kWlfwEventIndication : kWlfwEventUnexpected);
     switch (m.message) {
     case kWlfwRequestMemInd:
       // Only after this host has said what it is (the firmware asks for memory in answer to that); the regions are read and
@@ -618,10 +716,12 @@ inline int wlfwReceive(WlfwClient &c, const uint8_t *data, uint32_t length)
   }
   if (m.type != kQmiResponse || !c.waiting || m.transaction != c.pending || m.message != c.pendingMessage) {
     ++c.unexpected;
+    tell(c, m, kWlfwEventUnexpected);
     return c.step;
   }
   ++c.responses;
   c.waiting = false;
+  tell(c, m, kWlfwEventResponse);
   switch (c.step) {
   case kWlfwStepPhyCap:
     // Optional: a firmware that refuses it, or answers without a result, is not a failure (two links are then assumed, as this
@@ -653,9 +753,18 @@ inline int wlfwReceive(WlfwClient &c, const uint8_t *data, uint32_t length)
     readChipCap(c, m);
     wlfwEnter(c, kWlfwStepRegdb);
     return c.step;
+  case kWlfwStepQdss:
+    if (qmiResult(m, &c.result, &c.resultError) && c.result != kQmiResultSuccess) {
+      // A refused trace configuration is noted and the rest of the file is not sent: the firmware starts without it.
+      c.qdssRefused = true;
+      c.qdssResult = c.result;
+      c.qdssError = c.resultError;
+      wlfwEnter(c, kWlfwStepFwReady);
+      return c.step;
+    }
+    [[fallthrough]];
   case kWlfwStepRegdb:
   case kWlfwStepBoard:
-  case kWlfwStepQdss:
     if (!resultOk(c, m)) return fail(c, kWlfwErrResult), c.step;
     if (c.fileOffset < c.fileBytes) {        // the same step: the next segment
       download(c);
@@ -693,6 +802,7 @@ inline int wlfwReceive(WlfwClient &c, const uint8_t *data, uint32_t length)
 inline int wlfwTimedOut(WlfwClient &c)
 {
   if (c.step == kWlfwStepDone || c.step == kWlfwStepStopped) return c.step;
+  c.timedOutWaiting = c.waiting;         // the request outstanding stays in pending/pendingMessage/out* for the log
   wlfwdetail::fail(c, kWlfwErrTimeout);
   return c.step;
 }

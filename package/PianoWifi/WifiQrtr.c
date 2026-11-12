@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* package/PianoPower/QcomQrtr.c of this repository, copied with these provenance lines, the include of the copied header and the
  * additions marked "PianoWifi addition": two at the end, and the received header in either version (before qcom_qrtr_receive,
- * which reads it through that; UPSTREAM has the original's sha256). PianoPower is not modified. */
+ * which reads it through that; UPSTREAM has the original's sha256); and one "PianoWifi change": the address of the flow-control
+ * answer (resume_tx, before qcom_qrtr_receive). PianoPower is not modified. */
 #include "WifiQrtr.h"
 
 static uint16_t le16(const uint8_t *p) {return (uint16_t)(p[0] | (uint16_t)p[1] << 8);}
@@ -136,6 +137,32 @@ static uint32_t header(const uint8_t *p, uint32_t length, uint32_t *type, uint32
     return bytes;
 }
 
+/* PianoWifi change (2026-11-12, P21 in docs/drivers/wifi.md section 10.26): the flow-control answer as the router protocol has it.
+ * A sender that sets confirm_rx counts the packets it has sent to one destination node:port and stops sending to it at its
+ * high-water mark (net/qrtr: ten packets, the confirmation asked for on the fifth) until a RESUME_TX names that destination. The
+ * payload's client node and port are therefore the *receiver's* own address (ours: the data packet's destination), and the packet
+ * goes from that port to the sender's node:port (net/qrtr's form, which the WLAN firmware answers on Ubuntu). The copied file put
+ * the sender's own address in the payload and sent it from the control port: the WLAN firmware matched it to no flow and sent
+ * nothing more after its tenth packet to our port (the 2026-11-12 boots: 10 data packets in, the answer to the regulatory
+ * database's last segment never came). An answer the link refuses is kept and sent again by qcom_qrtr_poll. */
+static int resume_tx(QcomQrtr *q, uint32_t node, uint32_t port, uint32_t our_port)
+{
+    uint8_t pkt[CTRL_BYTES] = {0};
+    put32(pkt, QCOM_QRTR_RESUME_TX);
+    put32(pkt + 4, q->local_node);
+    put32(pkt + 8, our_port);
+    if (!emit(q, QCOM_QRTR_RESUME_TX, our_port, node, port, pkt, sizeof pkt)) {
+        q->resumes_sent++;
+        q->resume_owed = 0;
+        return 0;
+    }
+    q->resume_owed = 1;
+    q->resume_node = node;
+    q->resume_port = port;
+    q->resume_from = our_port;
+    return -1;
+}
+
 int qcom_qrtr_receive(QcomQrtr *q, const uint8_t *packet, uint32_t length)
 {
     uint32_t type = 0, src_node = 0, src_port = 0, confirm = 0, size = 0, dst_port = 0;
@@ -150,9 +177,9 @@ int qcom_qrtr_receive(QcomQrtr *q, const uint8_t *packet, uint32_t length)
         while (i < q->local_count && q->local[i].port != dst_port) ++i;
         if (i < q->local_count) q->local[i].receive(q->local[i].context, q, dst_port, src_node, src_port, data, size);
         else q->rx_unrouted++;
-        if (confirm) {  /* the sender waits for this before it sends more to the port */
-            const uint32_t words[4] = {src_node, src_port, 0, 0};
-            if (!control(q, QCOM_QRTR_RESUME_TX, words)) q->resumes_sent++;
+        if (confirm) {  /* the sender waits for this before it sends more to the port (PianoWifi change: resume_tx) */
+            q->rx_confirms++;
+            resume_tx(q, src_node, src_port, dst_port);
         }
         return 0;
     }
@@ -185,6 +212,13 @@ int qcom_qrtr_send_data(QcomQrtr *q, uint32_t from_port, uint32_t node, uint32_t
 }
 
 /* ---- PianoWifi additions (WifiQrtr.h) ---- */
+/* PianoWifi change (P21): a flow-control answer the link refused, sent again (the owner calls this on every turn). */
+int qcom_qrtr_poll(QcomQrtr *q)
+{
+    if (!q || !q->resume_owed) return 0;
+    return resume_tx(q, q->resume_node, q->resume_port, q->resume_from) ? -1 : 1;
+}
+
 int qcom_qrtr_send_buffer(QcomQrtr *q, uint8_t *buffer, uint32_t capacity, uint32_t from_port, uint32_t node, uint32_t port,
                           uint32_t length)
 {
