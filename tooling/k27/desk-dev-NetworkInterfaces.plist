@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The desk-dev image's /Library/Preferences/SystemConfiguration/NetworkInterfaces.plist (tooling/k27/build-desktop-images.sh
+     desk-dev; docs/drivers/usb-device-debug.md section 14.8): configd's InterfaceNamer database with the two Ethernet interfaces of
+     a native boot, by their fixed MACs: PianoNullEthernet's built-in en0 (02:50:49:41:4e:01) and PianoUsbNet's en1, the USB network
+     (02:50:49:41:4e:02). InterfaceNamer names an interface whose prefix and MAC are in its database at once ("Assigned unit N (from
+     database)"); a new one only once the IOKit registry is quiet, which on piano it never is, so after the 240 s WaitQuietTimeout
+     (desk-dev 2026-11-12 17:27: en0 and en1 attached 242 s after launchd started). The Data volume is volatile, so without this every
+     boot's interfaces are new. No Model key: InterfaceNamer discards a database made on another hw.model and keeps one that has none
+     (PersistentInterfaceListLoad); it writes its own, with the model, at the next quiet. -->
+<plist version="1.0">
+<dict>
+	<key>Interfaces</key>
+	<array>
+		<dict>
+			<key>BSD Name</key>
+			<string>en0</string>
+			<key>IOBuiltin</key>
+			<true/>
+			<key>IOInterfaceNamePrefix</key>
+			<string>en</string>
+			<key>IOInterfaceType</key>
+			<integer>6</integer>
+			<key>IOInterfaceUnit</key>
+			<integer>0</integer>
+			<key>IOMACAddress</key>
+			<data>AlBJQU4B</data>
+			<key>SCNetworkInterfaceType</key>
+			<string>Ethernet</string>
+		</dict>
+		<dict>
+			<key>BSD Name</key>
+			<string>en1</string>
+			<key>IOBuiltin</key>
+			<false/>
+			<key>IOInterfaceNamePrefix</key>
+			<string>en</string>
+			<key>IOInterfaceType</key>
+			<integer>6</integer>
+			<key>IOInterfaceUnit</key>
+			<integer>1</integer>
+			<key>IOMACAddress</key>
+			<data>AlBJQU4C</data>
+			<key>SCNetworkInterfaceType</key>
+			<string>Ethernet</string>
+		</dict>
+	</array>
+</dict>
+</plist>

@@ -39,7 +39,10 @@
 #   desk-dev desk + the ways in from the Mac (docs/attended-desktop.md section 3): piano-usb-shell=1 with the userland stage's
 #          pianousb-shell in the seed (tooling/userland/stage.py, its pmset defaults off: no display sleep after 2 min while
 #          debugging), piano-usb-net=1, sshd with a key of this Mac's (out/desk-dev/id_ed25519, made here once; the public half
-#          staged as each account's authorized_keys by tooling/k27/desk-dev.sh, which also prints the USB network's address);
+#          staged as each account's authorized_keys by tooling/k27/desk-dev.sh, which also sets and prints the USB network's
+#          address: DESK_DEV_NET auto (default: a DHCP lease within 20 s, else the fixed 169.254.80.2), static or dhcp; the Mac's side
+#          is tooling/native/desk-ssh.sh), and configd's interface database (tooling/k27/desk-dev-NetworkInterfaces.plist: en0 and the
+#          USB network's en1 named at once, not after InterfaceNamer's 240 s wait for an IOKit quiet that never comes);
 #          reset after 3600 s (DESK_RESET_AFTER) as desk. The owner logs in himself (or tooling/native/desk-login.sh types his
 #          password from the ignored private/login.secret)
 #
@@ -66,6 +69,8 @@ for f in "$KC" "$ADT" "$FD" "$SEED_IN" "$TRUST_IN"; do [ -f "$f" ] || { echo "bu
 case $KBTYPE in 40|41|42) ;; *) echo "build-desktop-images: DESK_KEYBOARD_TYPE=$KBTYPE: 40 (ANSI), 41 (ISO) or 42 (JIS)" >&2; exit 1 ;; esac
 WALLPAPER=${DESK_WALLPAPER:-still}
 case $WALLPAPER in still|video) ;; *) echo "build-desktop-images: DESK_WALLPAPER=$WALLPAPER: still or video" >&2; exit 1 ;; esac
+DEVNET=${DESK_DEV_NET:-auto}
+case $DEVNET in auto|static|dhcp) ;; *) echo "build-desktop-images: DESK_DEV_NET=$DEVNET: auto, static or dhcp" >&2; exit 1 ;; esac
 # The collection must have the drivers (each one's own start line: another kext's text may name a driver it watches; attend5's and
 # desk1's images had no PianoKeyboard at all) and the fixes the desktop needs: PianoA830's map limits (the render server's
 # reserve), NativeGopDisplay's cursor layer, NativeRamBlock's volatile pool with its boot reservation (2026-11-12: refused writes
@@ -140,8 +145,11 @@ for n in $NAMES; do
         --off piano-pmset-defaults > out/desk-stage/desk-dev-userland.log 2>&1 || { tail -5 out/desk-stage/desk-dev-userland.log >&2; exit 1; }
       mkdir -p out/desk-dev
       [ -f out/desk-dev/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C desk-dev -f out/desk-dev/id_ed25519
+      # configd's interface database with en0 and the USB network's en1 by their MACs: named at once, not after the 240 s quiet timeout
       X=(${WALL[@]+"${WALL[@]}"} --boot-run "$KEYBOARDS" --file tooling/k27/desk-dev.sh:private/var/piano/desk-dev.sh
-         --file out/desk-dev/id_ed25519.pub:private/var/piano/dev/authorized_keys --boot-run "sh /private/var/piano/desk-dev.sh")
+         --file out/desk-dev/id_ed25519.pub:private/var/piano/dev/authorized_keys
+         --file tooling/k27/desk-dev-NetworkInterfaces.plist:Library/Preferences/SystemConfiguration/NetworkInterfaces.plist
+         --boot-run "sh /private/var/piano/desk-dev.sh $DEVNET")
       for j in $LOOPS; do X+=(--disable-job "$j"); done
       DENY=$DENY_DESK
       python3 tooling/k27/stage-boot-run.py --seed out/desk-stage/desk-dev-userland/scratch-data.img \

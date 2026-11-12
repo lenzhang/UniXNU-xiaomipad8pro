@@ -195,6 +195,31 @@ signed, at `/usr/local/libexec/pianousb-shell` with `com.unixnu.pianousb-shell.p
 at once with status 0 and launchd leaves it stopped. Without the helper, `/dev/pianousb` still carries anything a LaunchDaemon
 writes to it (e.g. `log stream --style compact`).
 
+**The deaf shell of desk-dev (2026-11-12 17:27), and its fix.** The job ran (launchd: running, never exited), `/dev/pianousb`
+existed, but `usb-console.py --port 1 --send 'echo HELLO'` got no byte back, and the console said
+`process pianousb-shell[450] ... caught burning CPU! It used more than 50% CPU over 180 seconds`. The cause is XNU's `poll()`, which
+is kqueue underneath (`poll_nocancel` registers an `EVFILT_READ` knote per descriptor): for a character device `spec_kqfilter`
+sends the knote to `filt_specattach`, which refuses it with `EINVAL` unless the cdevsw is marked kqueue-capable
+(`cdevsw_setkqueueok`, `CDEVSW_SELECT_KQUEUE`) or the caller asks `NOTE_LOWAT` 1, which `poll()` never does. A refused knote is
+`POLLNVAL` at once, every call. The helper polled and acted only on `POLLIN | POLLHUP | POLLERR`, so it spun and never read what the
+Mac sent: the shell got no input, so it printed nothing (its banner and first prompt were written before the Mac opened port 1, and
+writes then are dropped by design). Port 1's transmit path was never at fault: PianoDwc3 logged `port 1 opened (DTR/RTS 3)`, and
+nothing reached `/dev/pianousb`'s write side to send.
+
+- `pianousb-shell.c` waits with `select()`, which goes to the cdevsw's `d_select` (`selscan`, `fo_select`) for any device: the fix
+  that works with every kernel collection already built. A bad descriptor from `select()` reopens the device.
+- PianoDwc3 marks its cdevsw kqueue-capable after `cdevsw_add` (`cdevsw_setkqueueok`, the kernel's export), so `poll()` and kevent
+  work on the node too. `puSelect` returns the byte count when ready, and `selrecord`s otherwise, as that contract asks. The line
+  `/dev/pianousb created (major N): port 1 is the user pipe; select, poll and kqueue` says so.
+- Host test: `python3 tooling/native/pianousb-shell/test_pianousb_shell.py` (macOS). The device is a pty, and an interposed `poll()`
+  (DYLD_INSERT_LIBRARIES) answers `POLLNVAL` on it, as XNU did for `/dev/pianousb`. A probe checks that the shim does that. The
+  helper must then relay a command and its output both ways, start a new shell after `exit`, and stay idle (under 0.5 s of CPU in
+  1.5 s). The 17:27 helper fails it exactly as the tablet did: nothing came back.
+
+Use: `tooling/native/usb-console.py --port 1`, interactive, or unattended
+`tooling/native/usb-console.py --port 1 --send 'echo HELLO' --capture 10`. The first bytes to arrive are the echo of what you sent:
+the banner and the first prompt went out before the port was open.
+
 ## 7. Build, kernel collection, RAM image
 
 ```sh
@@ -548,6 +573,7 @@ PianoDwc3: net: link up, en1 up; to the Mac 12 frames 1480 bytes (9 NTBs), from 
 | link up here, `status: inactive` on the Mac | the notifications: `usb` shows 2 notifications per selection; an interrupt read the Mac never completes |
 | `NTB from the host refused (<reason>)` | the Mac's NTBs differ from the parser's reading of NCM 1.0: the reason names the field |
 | no `macOS named the interface` | configd has not named it (user space not up yet, or InterfaceNamer skipped it): `ioreg -c PianoUsbNet` in the shell |
+| `macOS named the interface` only about 240 s after launchd started | InterfaceNamer's quiet timeout: the MAC was not in its database (§14.8) |
 | `drops: send N` growing | the link is down, the interface is down (`ifconfig en1 up`), or the queue is full (the Mac is not reading) |
 
 ### 14.7 Risks
@@ -561,9 +587,68 @@ PianoDwc3: net: link up, en1 up; to the Mac 12 frames 1480 bytes (9 NTBs), from 
 - **TX FIFO writes** change the ports' FIFOs too (only with `piano-usb-net=1`); `piano-usb-net-fifo=0` is the way back.
 - **Naming**: the interface is not built-in, so it depends on configd's InterfaceNamer; a Data volume whose
   `NetworkInterfaces.plist` lists VM-era interfaces may give it a higher unit than en1. en0 and TimeSync are untouched by design.
+  A MAC that is not in that database is named only once the IOKit registry is quiet, or after 240 s (§14.8).
 - **Throughput**: one 16 KiB NTB in flight each way on a polled loop; fine for ssh and NTP, slow for large copies.
 - **Security**: whatever the tablet serves on this link (sshd, a shell) is reachable from the Mac (and with Internet Sharing from
   nothing else: NAT); development tablets only, as the user pipe.
+
+### 14.8 The interface's name and address on desk-dev (2026-11-12)
+
+**What desk-dev at 17:27 showed.** The Mac had its end at once (its NCM interface, MAC 02:50:49:41:4e:03, active, self-assigned 169.254).
+The tablet logged `net: interface published` during boot. But for minutes after login, `ifconfig -a` there listed only `lo0` and
+`utun*`, so `desk-dev.sh` gave up: `no interface with MAC 02:50:49:41:4e:02 after 120s`. Both `en0` and `en1` were attached
+together, 242 s after launchd started (`ifnet_attach: ... en0`, `... en1`, then `net: macOS named the interface en1`). A self-assigned
+169.254 address followed on en1 (the Mac's ARP table had it). The night's `net` run, about 190 s after login, was the same wait.
+
+**The cause** is configd's InterfaceNamer (configd's `Plugins/InterfaceNamer/ifnamer.c`, the same in the Mac's 26.6 configd, whose
+strings include `waiting for quiet` and `WaitQuietTimeout`). It registers an interface with IONetworkStack, which creates the BSD
+interface, in one of two ways:
+- **Known MAC:** the prefix (`en`) and the MAC are in `/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist`. It is
+  named at once: `Assigned unit N (from database)`.
+- **New MAC:** `copyUnitForEstablishedInterface` defers it ("new interface, wait until registry quiesces") until the IOKit
+  registry is quiet, or until `WAIT_QUIET_TIMEOUT_DEFAULT`, 240 s after IONetworkStack appears.
+
+On piano the registry never goes quiet (some service stays busy). The desk images' Data is volatile, so their database never keeps
+a boot's names, and every boot's en0 and en1 are new: 240 s. The same wait holds `SCNetworkInterfaceCopyAll`'s callers
+(`__wait_for_IOKit_to_quiesce`, quiet or timeout) and with them configd's own configuration of new interfaces. So the 169.254
+address came only then.
+
+**The fix (desk-dev).**
+- The seed gets `tooling/k27/desk-dev-NetworkInterfaces.plist` as that database: en0 (02:50:49:41:4e:01, PianoNullEthernet,
+  built-in) and en1 (02:50:49:41:4e:02, PianoUsbNet). Both are named as soon as InterfaceNamer finds IONetworkStack. The file has
+  no `Model` key, because InterfaceNamer discards a database made on another `hw.model` and keeps one with none. It writes its own,
+  with the model, at the next quiet.
+- `tooling/k27/desk-dev.sh` looks for the interface for up to 300 s (it was 120 s, less than the timeout), then sets the address by
+  `DESK_DEV_NET` (the builder's variable, the script's argument):
+
+| Mode | Address |
+|---|---|
+| `auto` (default) | `ipconfig set en1 DHCP`. A lease within 20 s that is not 169.254 (Internet Sharing on the Mac) is kept. Otherwise `ipconfig set en1 MANUAL 169.254.80.2 255.255.0.0`, the **fixed link-local address** |
+| `static` | 169.254.80.2/16 at once |
+| `dhcp` | DHCP only: a lease, or IPConfiguration's self-assigned 169.254 address |
+
+  Once configd has run 260 s (past the timeout, when the system's own configuration of the interface may replace an address), the
+  script checks the fixed address and sets it again if it is gone. It then prints the IOKit registry's busy leaves (up to 6), which
+  are what to fix so that the registry goes quiet.
+- **On the Mac:** `tooling/native/desk-ssh.sh` (no root) finds the Mac's end by its MAC and runs
+  `ssh -B <that interface> -i out/desk-dev/id_ed25519 <account>@169.254.80.2`. The `-B` is needed because macOS routes 169.254/16
+  to its primary interface (Wi-Fi: `route -n get 169.254.80.2` says `en0`), not to the cable. A socket bound to the cable's
+  address takes the route scoped to it. Options: `-a ADDRESS` (the one the console line printed: a DHCP lease, or `fe80::...`, to
+  which the interface is added as its scope), `-u ACCOUNT` (default `DESK_SSH_USER`, else the Mac's user name), `-n` (print the
+  command). No host key is kept or checked: the tablet's are new every boot (volatile Data), and the link is the cable.
+
+Lines to look for (`grep -a 'desk-dev:'`):
+
+```
+desk-dev: ssh: port 22 answers
+desk-dev: usb net: en1 is ours (named after 0s); mode auto
+desk-dev: usb net: en1 inet 169.254.80.2 (fixed link-local) inet6 fe80::...
+desk-dev: usb net: on the Mac: tooling/native/desk-ssh.sh -a 169.254.80.2 (ssh -B <the Mac's end> -i out/desk-dev/id_ed25519)
+desk-dev: iokit busy (configd 260+ s): <name> (<class>) busy 1 (<ms>)       the registry's busy leaves, or "none"
+```
+
+`named after Ns` with N near 240 means the database did not match: check the MAC in `ifconfig en1`, and
+`/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist` on the tablet. Not yet run on the tablet (2026-11-12 evening).
 
 ## 15. Power: the USB thread's wait (`piano-usb-idle`, `piano-usb-irq`)
 

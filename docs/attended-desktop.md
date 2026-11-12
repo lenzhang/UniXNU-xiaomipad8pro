@@ -198,9 +198,12 @@ Checked in an agent worktree (2026-11-12): the KC from this tree with the 0064 k
 `private/login.secret`: it waits in the running console capture for `PianoA830: SecurityAgent opens the accelerator` and a lit
 frame, types the password on stdin to `piano-input.py type --stdin --enter`, never echoed, and reports when the Finder opens the
 accelerator; `--now` types at once; nothing is typed when the Finder already runs). Then, from the Mac:
-`tooling/native/usb-console.py --port 1` (the root shell), or `ssh -i out/desk-dev/id_ed25519 <account>@<address>` with the address
-of the `desk-dev: usb net: enN inet ...` line (the Mac's side of the USB network left at "Using DHCP": both ends self-assign
-169.254 addresses; or Internet Sharing, [drivers/usb-device-debug.md](drivers/usb-device-debug.md) §14.5). The key pair is made
+`tooling/native/usb-console.py --port 1` (the root shell), or `tooling/native/desk-ssh.sh` (ssh with the key, bound to the Mac's
+end of the cable, to the fixed 169.254.80.2, or to `-a <address>` of the `desk-dev: usb net: enN inet ...` line; the Mac's side of
+the USB network left at "Using DHCP" self-assigns a 169.254 address; Internet Sharing gives the tablet a lease instead,
+[drivers/usb-device-debug.md](drivers/usb-device-debug.md) §14.5 and §14.8). The 17:27 run's two failures and their fixes: the
+root shell's helper spun on `poll()`'s `POLLNVAL` and never read (now `select()`, and the device is kqueue-capable: §6 there); en1
+was named only after configd's 240 s quiet timeout (now the seed has configd's interface database with both MACs: §14.8). The key pair is made
 once into the ignored `out/desk-dev/` by the builder; the seed holds only its public half. Data is volatile (a restaged seed), as
 for every desk image. Built in an agent worktree from the main checkout's collection, ADT and Turnip stage (17:12): verify PASS,
 the command line 959 bytes. In the main checkout:
