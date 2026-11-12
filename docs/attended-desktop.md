@@ -192,6 +192,32 @@ Checked in an agent worktree (2026-11-12): the KC from this tree with the 0064 k
 | `ram-quiet` | + audiomxd disabled | — | if desk is still slow (media playback may need audiomxd) |
 | `ram-plain` | the Turnip stage's, unchanged | — | when desk misbehaves: the same drivers with the stock userland |
 | `ram-diag` | keyboard type + `desk-reports.sh` in the boot job | `exec-log=1 piano-policy=1` | one boot to name what §1.1 and §1.4 leave open: `grep -a 'desk-reports:' <capture>.txt` |
+| `ram-desk-dev` | desk's + the userland stage (pianousb-shell; its pmset defaults off) + `desk-dev.sh` in the boot job (sshd loaded, this Mac's key as each account's authorized_keys, the USB network's interface on DHCP and its address printed) | `piano-usb-shell=1 piano-usb-net=1`, reset 3600 s | the owner's desktop with ways in from the Mac: `grep -a 'desk-dev:' <capture>.txt` |
+
+**desk-dev** (2026-11-12 evening): the owner logs in (or `tooling/native/desk-login.sh` types the password he left in the ignored
+`private/login.secret`: it waits in the running console capture for `PianoA830: SecurityAgent opens the accelerator` and a lit
+frame, types the password on stdin to `piano-input.py type --stdin --enter`, never echoed, and reports when the Finder opens the
+accelerator; `--now` types at once; nothing is typed when the Finder already runs). Then, from the Mac:
+`tooling/native/usb-console.py --port 1` (the root shell), or `ssh -i out/desk-dev/id_ed25519 <account>@<address>` with the address
+of the `desk-dev: usb net: enN inet ...` line (the Mac's side of the USB network left at "Using DHCP": both ends self-assign
+169.254 addresses; or Internet Sharing, [drivers/usb-device-debug.md](drivers/usb-device-debug.md) §14.5). The key pair is made
+once into the ignored `out/desk-dev/` by the builder; the seed holds only its public half. Data is volatile (a restaged seed), as
+for every desk image. Built in an agent worktree from the main checkout's collection, ADT and Turnip stage (17:12): verify PASS,
+the command line 959 bytes. In the main checkout:
+
+```sh
+DESK_RTC_OFFSET=1794397906 tooling/k27/build-desktop-images.sh desk-dev
+tooling/native/desk-login.sh             # once the run's console capture has started; then usb-console.py --port 1 or ssh
+```
+
+Since the evening of 2026-11-12 the builder also refuses a collection without PianoA830's per-object limit (`per-object limit of
+%llu MiB (its GPU window)`) and a seed whose Metal plugin lacks Turnip 0007 and 0008 and frontend 0003 (their messages in the seed's
+bytes). The owner's attended image with all of the day's fixes (the touch announced-frame rule, GPU 0007/0008, the still wallpaper
+by default), in the main checkout:
+
+```sh
+DESK_RTC_OFFSET=1794397906 tooling/k27/build-desktop-images.sh desk     # after build-native-image.sh above when a marker is missing
+```
 
 Variants by environment: `DESK_TOUCH=0` (no touch screen: the fallback if it resets or its watchdog lines never stop),
 `DESK_EXTRA="piano-touch-idle=0"` (the touch screen's latch looked at every 1 ms at rest too: more power), `DESK_KEYBOARD_TYPE=41|42` (ISO, JIS).

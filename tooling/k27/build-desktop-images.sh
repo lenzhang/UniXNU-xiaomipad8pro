@@ -36,6 +36,13 @@
 #          unified log of loginwindow, WindowServer, Dock, Finder, SecurityAgent, authorizationhost ... around the login (what the
 #          wait after the password is), the busiest processes after the login; one run answers what the console cannot
 #
+#   desk-dev desk + the ways in from the Mac (docs/attended-desktop.md section 3): piano-usb-shell=1 with the userland stage's
+#          pianousb-shell in the seed (tooling/userland/stage.py, its pmset defaults off: no display sleep after 2 min while
+#          debugging), piano-usb-net=1, sshd with a key of this Mac's (out/desk-dev/id_ed25519, made here once; the public half
+#          staged as each account's authorized_keys by tooling/k27/desk-dev.sh, which also prints the USB network's address);
+#          reset after 3600 s (DESK_RESET_AFTER) as desk. The owner logs in himself (or tooling/native/desk-login.sh types his
+#          password from the ignored private/login.secret)
+#
 #   build-desktop-images.sh [NAME ...]   default: desk; out/ram-<NAME>/ and out/ram-desk-dump/ (the loop's dump image)
 #
 # Inputs (this checkout's out/ unless set): DESK_KC (out/k27/kc-k27-native.bin: tooling/k27/build-native-image.sh with
@@ -66,8 +73,14 @@ case $WALLPAPER in still|video) ;; *) echo "build-desktop-images: DESK_WALLPAPER
 for s in 'start: piano-keyboard=%u' 'start: piano-touch=%u' 'start: piano-backlight=%u' 'start: piano-usb=%u' 'start: piano-power=%u' \
          "the render server's reserve of ranges" 'composition: layer 0 the frame, layer 1 the cursor' \
          '(data-volatile-mib), in 2 MiB chunks' 'the download for the watchdog failed: again in' 'piano-touch-drag-delay' \
-         'a frame read only when the controller announces it' 'piano-keyboard-resting'; do
+         'a frame read only when the controller announces it' 'piano-keyboard-resting' "per-object limit of %llu MiB (its GPU window)"; do
   grep -a -q -F "$s" "$KC" || { echo "build-desktop-images: $KC lacks \"$s\": rebuild it from this tree (tooling/k27/build-native-image.sh)" >&2; exit 1; }
+done
+# The seed's Metal plugin must have the day's GPU fixes (docs/results-2026-11-12.md): Turnip 0007 (a sysmem draw that reads its own
+# attachments waits for their writes: the login window's opaque boxes), 0008 (the per-object limit is the GPU window) and frontend
+# 0003 (the 16384 px textures and the 4K YCbCr frames): their messages in the staged libraries, as the seed's bytes hold them.
+for s in 'an attachment feedback loop (fbflushall)' 'is past the per-object limit of' 'YCbCr10p 4:2:0'; do
+  grep -a -q -F "$s" "$SEED_IN" || { echo "build-desktop-images: $SEED_IN lacks \"$s\" (Turnip 0007/0008, frontend 0003): restage the Turnip seed (tooling/k27/build-native-image.sh)" >&2; exit 1; }
 done
 if [ -n "${DESK_RTC_OFFSET:-}" ]; then
   [[ $DESK_RTC_OFFSET =~ ^[0-9]+$ ]] || { echo "build-desktop-images: DESK_RTC_OFFSET=$DESK_RTC_OFFSET is not a number" >&2; exit 1; }
@@ -88,7 +101,7 @@ DENY_DESK=/usr/libexec/watchdogd,/usr/libexec/PerfPowerServices
 # The cover (0x504b = 20555) and PianoDwc3's keyboard (0x5055 = 20565), vendor 0x1af4 = 6900: "product-vendor-0" => type.
 KEYBOARDS="defaults write /Library/Preferences/com.apple.keyboardtype keyboardtype -dict-add 20555-6900-0 -int $KBTYPE 20565-6900-0 -int $KBTYPE"
 ORDER="desk"
-ALL="desk quiet plain diag"
+ALL="desk quiet plain diag desk-dev"
 
 stage() {   # stage NAME [stage-boot-run.py arguments]: out/desk-stage/NAME from the input seed
   local name=$1
@@ -120,6 +133,21 @@ for n in $NAMES; do
       if [ "$n" = quiet ]; then X+=(--disable-job com.apple.audiomxd); DENY=$DENY,/usr/libexec/audiomxd; fi
       stage "$n" "${X[@]}" ;;
     plain) ;;
+    desk-dev)
+      # the userland stage first (pianousb-shell and its trust cache entry), then desk's additions and the ways in
+      python3 tooling/userland/stage.py --seed "$SEED_IN" --trust "$TRUST_IN" --out out/desk-stage/desk-dev-userland \
+        --off piano-pmset-defaults > out/desk-stage/desk-dev-userland.log 2>&1 || { tail -5 out/desk-stage/desk-dev-userland.log >&2; exit 1; }
+      mkdir -p out/desk-dev
+      [ -f out/desk-dev/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C desk-dev -f out/desk-dev/id_ed25519
+      X=(${WALL[@]+"${WALL[@]}"} --boot-run "$KEYBOARDS" --file tooling/k27/desk-dev.sh:private/var/piano/desk-dev.sh
+         --file out/desk-dev/id_ed25519.pub:private/var/piano/dev/authorized_keys --boot-run "sh /private/var/piano/desk-dev.sh")
+      for j in $LOOPS; do X+=(--disable-job "$j"); done
+      DENY=$DENY_DESK
+      python3 tooling/k27/stage-boot-run.py --seed out/desk-stage/desk-dev-userland/scratch-data.img \
+        --trust out/desk-stage/desk-dev-userland/kernel.macho.trustcache --out out/desk-stage/desk-dev "${X[@]}" \
+        > out/desk-stage/desk-dev.log 2>&1 || { tail -5 out/desk-stage/desk-dev.log >&2; exit 1; }
+      tail -1 out/desk-stage/desk-dev.log
+      A="piano-usb-shell=1 piano-usb-net=1" ;;
     diag)
       stage diag ${WALL[@]+"${WALL[@]}"} --file tooling/k27/desk-reports.sh:private/var/piano/desk-reports.sh \
         --boot-run "$KEYBOARDS" --boot-run "sh /private/var/piano/desk-reports.sh 40"
@@ -127,8 +155,10 @@ for n in $NAMES; do
   esac
   if [ "$n" != plain ]; then SEED=out/desk-stage/$n/scratch-data.img TRUST=out/desk-stage/$n/kernel.macho.trustcache; fi
   COMMON=(--fd "$FD" --fd-name A-bundled --kc "$KC" --trust "$TRUST" --seed "$SEED" --adt "$ADT" --utc "$(date +%s)")
-  PIANO_FAST_BOOT=1 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=$RESET PIANO_DENY_EXEC=$DENY PIANO_EXTRA_ARGS="$PROFILE $A" \
-    python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out "out/ram-$n" | tail -1
+  R=$RESET P=
+  env PIANO_FAST_BOOT=1 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER="$R" PIANO_DENY_EXEC="$DENY" PIANO_EXTRA_ARGS="$PROFILE $A" \
+    ${P:+PIANO_DATA_PERSIST=$P} python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out "out/ram-$n" | tail -1
+  python3 tooling/bootimg/verify-ram-images.py "out/ram-$n/build-A-bundled.json" | tail -1
 done
 COMMON=(--fd "$FD" --fd-name A-bundled --kc "$KC" --trust "$TRUST_IN" --seed "$SEED_IN" --adt "$ADT" --utc "$(date +%s)")
 PIANO_FAST_BOOT=1 PIANO_RESET_AFTER=1 PIANO_DATA_PERSIST=0 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" \
