@@ -12,7 +12,7 @@ SM8750 pieces to be shared later (the code still lives here, and the build pins 
 is the frozen archive of the earlier Linux + Gunyah guest path. The map of repositories, local trees and rules:
 [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md).
 
-## State (2026-11-11)
+## State (2026-11-12)
 
 - macOS boots natively on the tablet, also by itself from power-on (an installed copy, see below); root and Data are on UFS
   (`package/NativeUfs`, `package/NativeRamBlock`).
@@ -25,7 +25,9 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
 - A USB-C debug console with a small kernel monitor (`package/PianoDwc3`, `tooling/native/usb-console.py`) and the buttons run;
   the monitor's `reset fastboot` returns the tablet to ABL fastboot without buttons.
 - Charging: the battery charges from a USB-C port without the DSP; the DSP charger path starts from macOS and is being tuned.
-- Latest results: [docs/results-2026-11-11.md](docs/results-2026-11-11.md).
+- Latest results: [docs/results-2026-11-12.md](docs/results-2026-11-12.md) (the login window renders correctly with its video
+  wallpaper, touch is stable, the speakers play, the rear camera streams, Wi-Fi reaches mission mode); the day before:
+  [docs/results-2026-11-11.md](docs/results-2026-11-11.md).
 - Most other drivers (power and charging, touch, keyboard cover, backlight, Wi-Fi, audio, sensors, thermal, USB host, video,
   Bluetooth, display processor, ...) are built and linked but inert behind their boot arguments, waiting for their tests on the
   tablet. Per-driver state: [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md) §7 and [docs/drivers/README.md](docs/drivers/README.md).
