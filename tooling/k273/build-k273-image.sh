@@ -25,6 +25,8 @@ T=${K273_TREE:-$D/out/k273/k27-tree}
 I=${K273_INPUTS:-$D/out/inputs/k273}
 [ -f "$T/k27/kc-build273-piano.py" ] || { echo "no 27.3 k27 tree at $T: tooling/k273/prepare-k27-tree.sh" >&2; exit 1; }
 [ -f "$I/kc/kc273-mac17j.bin" ] || { echo "no $I/kc/kc273-mac17j.bin: tooling/k273/decompress-kernelcache.py" >&2; exit 1; }
+# Turnip's Mesa tree sits next to the configured k27 tree (tooling/metal/build-turnip-a830.sh's default), not next to the clone.
+export TURNIP_TREE=${TURNIP_TREE:-$(dirname "$(. "$D/tooling/k27/k27-tree.sh"; echo "$PIANO_K27_TREE")")/UniXNU-turnip}
 export PIANO_K27_TREE=$T
 export K27_KERNEL=${K273_KERNEL:-$T/out/k27/kernel-k273-0065-native.macho}
 export KC_BASE=$I/kc/kc273-mac17j.bin
@@ -32,7 +34,6 @@ export KC_BUILDER=k27/kc-build273-piano.py
 export PIANO_ADT_IDENTITY=configs/k273-adt.toml
 export PIANO_VMM_PRESENT=${PIANO_VMM_PRESENT:-0}
 export PIANO_DATA_PERSIST=${PIANO_DATA_PERSIST:-0}
-export TURNIP_TREE=${TURNIP_TREE:-$(dirname "$(. "$D/tooling/k27/k27-tree.sh"; echo "$PIANO_K27_TREE")")/UniXNU-turnip}
 case ${K273_ROOT:-k273} in
   k273)
     R=$I/root
