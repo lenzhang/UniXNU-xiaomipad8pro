@@ -26,9 +26,16 @@ done
 OS_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$OS.json")
 [ "$OS_SHA" = 40d8282eb8650da9b4d7437a981764c48d47ee4bdc5b8b362248f25ecbce0e70 ] || { echo "$OS: sha256 $OS_SHA is not the profile's" >&2; exit 1; }
 mkdir -p "$O/manifest"
+# An image assembled from the same windows (the manifest's layout names their sha256s) is kept: a later run only redoes the rest.
+if [ -f "$O/root.img.sha256" ] && [ -f "$O/manifest/layout.json" ] && [ "$O/root.img.sha256" -nt "$SYS" ] && [ "$O/root.img.sha256" -nt "$OS" ] \
+   && cmp -s <(dd if="$O/root.img" bs=4096 count=1 2> /dev/null) "$O/manifest/manifest.bin"; then
+  IMAGE_BYTES=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_bytes"])' "$O/manifest/layout.json")
+  ROOT_SHA=$(cat "$O/root.img.sha256")
+  echo "root.img: kept (sha256 $ROOT_SHA)"
+else
 python3 tooling/native/make-root-manifest.py "$O/manifest" "OS=$OS" "SystemOS=$SYS"
 IMAGE_BYTES=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_bytes"])' "$O/manifest/layout.json")
-rm -f "$O/root.img"
+rm -f "$O/root.img" "$O/root.img.sha256"
 mkfile -n "$IMAGE_BYTES" "$O/root.img"
 dd if="$O/manifest/manifest.bin" of="$O/root.img" bs=4096 count=1 conv=notrunc 2> /dev/null
 python3 - "$O/manifest/layout.json" "$O/root.img" <<'EOF'
@@ -43,6 +50,8 @@ with open(image, 'r+b') as target:
         print(f"{w['name']}: {w['size']} bytes at {w['offset']:#x}")
 EOF
 ROOT_SHA=$(shasum -a 256 "$O/root.img" | cut -d' ' -f1)
+echo "$ROOT_SHA" > "$O/root.img.sha256"
+fi
 python3 tooling/k273/make-trust.py out/inputs/kernel.macho.trustcache "$M/141-22233-021.dmg.aea.trustcache" \
   "$M/141-22145-021.dmg.aea.trustcache" "$M/141-22106-021.dmg.trustcache" "$O/kernel.macho.trustcache"
 cp "${K273_SEED:-out/inputs/scratch-data.img}" "$O/scratch-data.img"

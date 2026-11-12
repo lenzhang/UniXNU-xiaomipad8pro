@@ -38,7 +38,7 @@ def im4p_module(path):
 
 
 def check(module, what):
-    if struct.unpack_from('<I', module)[0] != 2 or len(module) != 24 + struct.unpack_from('<I', module, 20)[0] * 22:
+    if struct.unpack_from('<I', module)[0] != 2 or len(module) != 24 + struct.unpack_from("<I", module, 20)[0] * 24:
         sys.exit(f'{what}: not a complete version-2 trust cache')
     return module
 
