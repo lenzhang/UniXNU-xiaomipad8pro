@@ -5,7 +5,13 @@
 //   the codec: every scalar, string and counted-data field round-trips; a message that would not fit its buffer is refused whole,
 //             and a half-open TLV is refused too;
 //   the router: the chip's hello is answered, its service announcement is remembered with its instance word, a data packet built
-//             in a transport buffer carries the right header, and a received packet reaches our port's callback;
+//             in a transport buffer carries the right header, and a received packet reaches our port's callback; a packet that asks
+//             for flow control gets a RESUME_TX from our port to the sender naming our node and port (P21), an answer the link
+//             refuses is owed and sent by the next poll;
+//   flow control (P21): the simulated firmware's router asks on its fifth packet to our port and holds everything from its tenth
+//             until a RESUME_TX names our port; with every answer lost the tablet's stop is reproduced exactly (9 requests, 8
+//             responses, 2 indications, 4 segments, step 509 waiting on the regulatory database's last segment), the old answer
+//             (naming the sender) resumes nothing, and the fixed one runs the stock files' sizes to the ready indication;
 //   the channels: the two contexts carry only their fixed fields before the start (disabled, burst mode disabled, the type, the
 //             event ring; every other channel untouched), a start before the channel is prepared is refused by the chip model,
 //             a start prepares the ring (base a multiple of its length, both pointers at the base) and enables the channel before
@@ -27,7 +33,10 @@
 //             address, the trace configuration, the ready indication (level 5's gate), then with piano-wifi-mode=1 the options,
 //             the configuration (nine pipes, fourteen services, the shadow list with piano-wifi-shadow=1) and the mode;
 //   its faults: a refused request, a missing file, a region larger than the window (the "ask again smaller" form, and the smaller
-//             request answered), a response with the wrong transaction, an indication in the wrong step, and a timeout;
+//             request answered), a response with the wrong transaction, an indication in the wrong step, and a timeout; the
+//             trace configuration refused, unanswered (given up by the owner) or absent, each going on to the ready indication;
+//   the board: the file identifier is the chip capability's board (0xff without one, the radio capability's only noted), the
+//             board file's kind from its own magic, bd_p81.elf for 0xff; every answer reaches the owner with its codes;
 //   the window: the plan's choice of group and bank, the table's descriptors and the translation of every block, the apply order
 //             with its read-backs, and each refusal (no free bank, a masked group, a 32-bit output size).
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. qmi_host.cpp ../WifiQrtr.c -o /tmp/qmi_host && /tmp/qmi_host
@@ -362,8 +371,9 @@ struct Firmware {
   unsigned pipes = 0, services = 0;
   uint32_t mode = 0xffffffffu;
   bool iniSeen = false, cfgSeen = false, ready = false, memReadySent = false;
-  bool refuseBoard = false, refuseHostCap = false, answerPhyCap = true, refuseQdss = false;
+  bool refuseBoard = false, refuseHostCap = false, answerPhyCap = true, refuseQdss = false, ignoreQdss = false;
   uint32_t lastFileId = 0;
+  uint8_t boardType = 0xff;            // the kind the board file's segments carried
   bool wrongTransaction = false, earlyMemReady = false, earlyMemRequest = false, earlyFwReady = false;
   uint32_t bigRegion = 0;              // a first memory request with one region this big
   uint32_t hostNode = 0, hostPort = 0;
@@ -654,13 +664,14 @@ struct Firmware {
       CHECK(qmiReadU8(m, 0x15, &type));
       CHECK(total >= bytes);
       CHECK(end == (total == bytes ? 1 : 0));
+      if (type != kBdfTypeRegdb) boardType = type;
       std::string &sink = type == kBdfTypeRegdb ? regdb : board;
       CHECK(segment == (type == kBdfTypeRegdb ? regdbSegments : boardSegments));
       sink.append(reinterpret_cast<const char *>(data + 2), bytes);
       if (type == kBdfTypeRegdb) ++regdbSegments;
       else ++boardSegments;
       ++downloads;
-      if (refuseBoard && type == kBdfTypeElf) {
+      if (refuseBoard && type != kBdfTypeRegdb) {
         respond(m.transaction, m.message, 1, 0x53);
         return;
       }
@@ -679,6 +690,7 @@ struct Firmware {
       CHECK(qmiReadU8(m, 0x13, &end) && end == (total == bytes ? 1 : 0));
       qdss.append(reinterpret_cast<const char *>(data + 2), bytes);
       ++qdssSegments;
+      if (ignoreQdss) return;   // a firmware that never answers the trace configuration
       if (refuseQdss) {   // a firmware that does not take the trace configuration, and starts all the same
         respond(m.transaction, m.message, 1, 0x2f);
         indicate(kWlfwFwReadyInd);
@@ -1369,6 +1381,7 @@ static void testClient()
   // The downloads: the whole files, in segments of at most 6 KiB, and nothing else.
   CHECK(h.firmware.regdb == h.files["regdb_xiaomi.bin"] && h.firmware.regdbSegments == 3);
   CHECK(h.firmware.board == h.files["bd_p81.elf"] && h.firmware.boardSegments == 1);
+  CHECK(h.firmware.boardType == kBdfTypeBin);   // no ELF magic: the binary kind
   CHECK(h.firmware.qdss == h.files["qdss_trace_config_v2.cfg"] && h.firmware.qdssSegments == 1);
   CHECK(h.firmware.m3Bytes == h.files["phy_ucode20.elf"].size());
   CHECK(h.firmware.auxBytes == h.files["aux_ucode20.elf"].size());
@@ -1419,7 +1432,9 @@ static void testClient()
 static void stockFiles(Host &h)
 {
   h.files["regdb_xiaomi.bin"] = std::string(24278, 'r');        // 4 segments, the last 5846 bytes
-  h.files["bd_p81.elf"] = std::string(125272, 'b');             // 21 segments
+  std::string board(125272, 'b');                               // 21 segments, an ELF as the stock one
+  board[0] = 0x7f, board[1] = 'E', board[2] = 'L', board[3] = 'F';
+  h.files["bd_p81.elf"] = board;
   h.files["phy_ucode20.elf"] = std::string(290816, 'm');
   h.files["aux_ucode20.elf"] = std::string(61440, 'a');
   h.files["qdss_trace_config_v2.cfg"] = std::string(6241, 'q');  // 2 segments
@@ -1476,6 +1491,7 @@ static void testFlowControl()
     CHECK(h.run(512) == kWlfwStepDone);
     CHECK(h.client.error == kWlfwErrNone && h.resumeRefusals == 1 && !h.router.resume_owed);
     CHECK(h.firmware.regdbSegments == 4 && h.firmware.boardSegments == 21 && h.firmware.qdssSegments == 2);
+    CHECK(h.firmware.boardType == kBdfTypeElf);   // the ELF kind, from the file's own magic
     CHECK(h.firmware.regdb == h.files["regdb_xiaomi.bin"] && h.firmware.board == h.files["bd_p81.elf"]);
     for (unsigned i = 0; i < 4; ++i) h.turn();   // the last answer reaches the firmware's model
     CHECK(h.firmware.confirmsAsked == h.firmware.resumes && h.firmware.misaddressedResumes == 0 && h.firmware.held.empty());
@@ -1513,6 +1529,18 @@ static void testFlowControl()
     CHECK(wlfwStart(h.client, ioOf(h), 0, 0));
     CHECK(h.run(512) == kWlfwStepDone);
     CHECK(h.client.qdssRefused && h.client.qdssResult == 1 && h.client.qdssError == 0x2f && h.firmware.qdssSegments == 1);
+  }
+  {   // the trace configuration never answered: the owner's deadline gives that step up, the ready indication is still taken;
+      // in any other step the same give-up is refused (the owner then times the client out)
+    Host h;
+    h.bring();
+    h.firmware.ignoreQdss = true;
+    CHECK(wlfwStart(h.client, ioOf(h), 0, 0));
+    CHECK(!wlfwQdssGiveUp(h.client));
+    CHECK(h.run(256) == kWlfwStepQdss && h.client.waiting);
+    CHECK(wlfwQdssGiveUp(h.client) && h.client.qdssTimedOut && h.client.step == kWlfwStepFwReady);
+    h.firmware.indicate(kWlfwFwReadyInd);
+    CHECK(h.run() == kWlfwStepDone && h.client.error == kWlfwErrNone);
   }
   {   // no trace configuration on the partition: skipped
     Host h;

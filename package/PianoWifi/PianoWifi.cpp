@@ -2334,6 +2334,13 @@ int level5(PowerState &power, const Options &opt)
     }
     if (nowMs() > deadline || levelLate()) {
       if (levelLate()) note("level 5: the level's hard deadline (%u ms) passed during %s", gArgs.deadlineMs, wlfwStepName(last));
+      else if (wlfwQdssGiveUp(gClient)) {   // the trace configuration unanswered: given up, the ready indication still awaited
+        note("level 5: the trace configuration's request %#06x (transaction %u) unanswered after %u ms: given up, waiting for "
+             "the firmware's ready", gClient.pendingMessage, gClient.pending, gArgs.qmiTimeoutMs);
+        last = gClient.step;
+        deadline = nowMs() + gArgs.qmiTimeoutMs;
+        continue;
+      }
       wlfwTimedOut(gClient);
       break;
     }
@@ -2354,9 +2361,9 @@ int level5(PowerState &power, const Options &opt)
        gClient.haveCapBoard ? "" : "gave none, so ", gClient.haveCapBoard ? gClient.capBoardId : kBoardIdDefault,
        gClient.havePhyBoard ? "" : "gave none: ", gClient.havePhyBoard ? gClient.phyBoardId : kBoardIdDefault,
        wlfwBoardFile(gClient.boardId, nullptr));
-  if (gClient.qdssRefused || gClient.qdssSkipped)
-    note("level 5: the trace configuration %s; the exchange went on without it", gClient.qdssSkipped ? "is not on the partition"
-                                                                                                     : "was refused");
+  if (gClient.qdssRefused || gClient.qdssSkipped || gClient.qdssTimedOut)
+    note("level 5: the trace configuration %s; the exchange went on without it",
+         gClient.qdssSkipped ? "is not on the partition" : gClient.qdssRefused ? "was refused" : "was not answered");
   if (gClient.qdssRefused) note("level 5: its refusal: result %u error %#x", gClient.qdssResult, gClient.qdssError);
   note("level 5: the firmware: version %#x built %s, capabilities %#llx, status %#llx, %u MAC(s), %u mV", gClient.fwVersion,
        gClient.buildTimestamp[0] ? gClient.buildTimestamp : "?", (unsigned long long)gClient.fwCaps,

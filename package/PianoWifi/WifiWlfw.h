@@ -244,7 +244,7 @@ struct WlfwClient {
   const char *outFile = nullptr;
   bool timedOutWaiting = false;          // the step that timed out had a request out (its fields above say which)
   // the trace configuration's outcome: refused (with the codes) or skipped (no file); neither stops the exchange
-  bool qdssRefused = false, qdssSkipped = false;
+  bool qdssRefused = false, qdssSkipped = false, qdssTimedOut = false;
   uint16_t qdssResult = 0, qdssError = 0;
   // counters for the log
   unsigned requests = 0, responses = 0, indications = 0, segments = 0, unexpected = 0;
@@ -500,8 +500,16 @@ inline bool wlfwEnter(WlfwClient &c, int step)
     return request(c, kWlfwCap, [](QmiWriter &) {});
   case kWlfwStepRegdb:
     return startDownload(c, kRegdbName, kBdfTypeRegdb, 0);
-  case kWlfwStepBoard:
-    return startDownload(c, kBoardName, kBdfTypeElf, kBoardFileLimit);
+  case kWlfwStepBoard: {
+    // The kind is the file's own: an ELF board file (the stock one is) is kind 1, anything else the binary kind 0, as the chip's
+    // own driver tells them apart by the first four bytes.
+    const char *name = wlfwBoardFile(c.boardId, nullptr);
+    uint8_t magic[4] = {};
+    const bool elf = c.io.file_read && c.io.file_size && c.io.file_size(c.io.ctx, name) >= sizeof magic &&
+                     !c.io.file_read(c.io.ctx, name, 0, magic, sizeof magic) && magic[0] == 0x7f && magic[1] == 'E' &&
+                     magic[2] == 'L' && magic[3] == 'F';
+    return startDownload(c, name, elf ? kBdfTypeElf : kBdfTypeBin, kBoardFileLimit);
+  }
   case kWlfwStepM3:
     return byAddress(c, kWlfwM3Info, kM3Name);
   case kWlfwStepAuxUc:
@@ -805,6 +813,18 @@ inline int wlfwTimedOut(WlfwClient &c)
   c.timedOutWaiting = c.waiting;         // the request outstanding stays in pending/pendingMessage/out* for the log
   wlfwdetail::fail(c, kWlfwErrTimeout);
   return c.step;
+}
+
+// The owner's deadline passed during the trace configuration: that step is given up (noted) and the client waits for the
+// firmware's ready indication instead, since the trace is not part of the firmware's start. Returns false in any other step (the
+// owner then times the client out as usual).
+inline bool wlfwQdssGiveUp(WlfwClient &c)
+{
+  if (c.step != kWlfwStepQdss) return false;
+  c.qdssTimedOut = true;
+  c.waiting = false;
+  wlfwEnter(c, kWlfwStepFwReady);
+  return true;
 }
 
 inline bool wlfwFinished(const WlfwClient &c) { return c.step == kWlfwStepDone; }
