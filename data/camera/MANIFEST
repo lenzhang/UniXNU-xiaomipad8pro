@@ -1,0 +1,4 @@
+# The tables PianoCamera accepts: file, SHA-256, every section's write count (tooling/camera/sensor-tables.py check).
+# Regenerated only after a deliberate re-extraction: sensor-tables.py manifest data/camera > data/camera/MANIFEST
+ov32d40.tbl 202fff87f22cbb0fef47aa650d228609db5c1f38e27f0c0e25f647b911f4510e start:start=1 init:init=811 mode:6528x4896=54 mode:3264x2448=54 mode:3264x1836=54 on:on=4 off:off=4
+s5kjn1.tbl ea7a19dcdb71020818577fa2c38cc950613ca9093ded7312319c17f732465aee start:start=7 init:init=30 mode:4080x3072=278 mode:8160x6144=277 on:on=1 off:off=1
