@@ -128,7 +128,24 @@ for board `0xff` is logged (`bd_p81.elf`, the stock API-1 default board file: Ub
 is taken from its ELF magic, and the trace configuration can be refused or go unanswered without ending the level. Next: §8.8
 boot 7a.
 
-Association, keys and the data path (levels 7 and 8) are design only (§12 has level 5's message table, §14 level 6's, §13 what levels 7 and 8 need and the macOS side's remaining plan). Template: `README.md`.
+**Eighth round (2026-11-12 23:33, the installed ESP v3.3d, `piano-wifi=6 piano-wifi-iova=1`): level 6 reached.** Level 5
+finished (the firmware ready at +675 ms, P21's fix working), the host transport came up (2 credits of 2176 bytes, 5 endpoints;
+our endpoint 1 on pipes 3 out / 2 in), the message interface connected, the capability event and two extended ones read, the
+initialisation accepted and the firmware's **ready event at +829 ms** (status 0, 16 peers, its own address all zeros and one
+extra address announced). Then the virtual device (+829 ms) and the passive scan (+929 ms), and at **+1045 ms the firmware
+asserted**: EE RDDM, MHISTATUS SYSERR, the scan never started. P19's crash-dump path worked on its first real use and gave the
+firmware's own reason out of `Q6-SFR.bin` — `cmnos_assert_patched.c`, line 488 — with every bus-level register clean. **Cause
+(P22, §10.27, inferred from Ubuntu's order):** nothing was said to the radio between the ready event and the device, where
+Ubuntu's driver sends the hardware mode, six radio parameters and the channel list of the firmware's own regulatory event
+first, and never creates a device with an all-zero address. All four are in behind `piano-wifi-l6pre` (default on), the
+regulatory event is read and turned into the channel list, and the log now names the last command before a death and every
+unknown event. Next: §8.8 boots 8a and 8b.
+
+Level 7's **messages** are built and host-tested (`package/PianoWifi/WifiAssoc.h`, `tests/assoc_host.cpp`): the regulatory
+rules, `WMI_SCAN_CHAN_LIST`, `WMI_VDEV_START`/`UP`/`STOP`/`DOWN`, `WMI_PEER_CREATE`/`ASSOC`/`SET_PARAM`,
+`WMI_VDEV_INSTALL_KEY` and `WMI_MGMT_TX`; the step machine that drives them, the four-way handshake and the path the
+passphrase takes are §13.2's plan and wait for level 6 to pass on the tablet. The data path is level 8 (§13). Template:
+`README.md`.
 
 ## 1. Purpose and gate
 
