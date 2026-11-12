@@ -213,8 +213,18 @@ struct Bus {
   {
     if (a < 0 || uint32_t(a) >= kMaxApids || !bytes || bytes > 8 || reg + bytes > 0x100) return Err::refused;
     const uint32_t ch = kObsvStride * uint32_t(a);
-    io.wr(io.ctx, Win::obsv, ch + kChCmd, kOpExtReadL << 27 | uint32_t(reg) << 4 | (bytes - 1));
-    const Err e = wait(Win::obsv, ch);
+    // A failed or unfinished observer read is tried again up to four times 500 us apart (as PianoWifi's and PianoPower's
+    // SpmiObserver.h): on the 2026-11-12 probes with several drivers on the bus, single reads came back failed. Not a denial.
+    Err e = Err::none;
+    for (unsigned attempt = 0; attempt < 5; ++attempt) {
+      if (attempt) {
+        for (unsigned i = 0; i < 5000 && !(io.rd(io.ctx, Win::obsv, ch + kChStatus) & kChDone); ++i) io.delayUs(io.ctx, 1);
+        io.delayUs(io.ctx, 500);
+      }
+      io.wr(io.ctx, Win::obsv, ch + kChCmd, kOpExtReadL << 27 | uint32_t(reg) << 4 | (bytes - 1));
+      e = wait(Win::obsv, ch);
+      if (e != Err::spmiFailed && e != Err::spmiTimeout) break;
+    }
     if (e != Err::none) return e;
     const uint32_t lo = io.rd(io.ctx, Win::obsv, ch + kChRdata0), hi = bytes > 4 ? io.rd(io.ctx, Win::obsv, ch + kChRdata1) : 0;
     for (unsigned b = 0; b < bytes; ++b) buf[b] = uint8_t((b < 4 ? lo : hi) >> (8 * (b & 3)));

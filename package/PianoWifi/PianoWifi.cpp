@@ -574,10 +574,35 @@ void reportCmdDb()
 }
 
 // Also keeps the arbiter for levels 2 and up (hwPmic reads one regulator through the same observer channel).
+// A regulator the arbiter maps whose reads failed, so the survey found no regulator for that rail.
+static bool railUnread(const PmicSurvey &s)
+{
+  for (unsigned i = 0; i < kRailCount; ++i) {
+    const RailState &st = s.rails[i];
+    if (st.reg()) continue;
+    if ((st.primary.present && st.primary.result != ReadResult::ok) || (st.alternate.present && st.alternate.result != ReadResult::ok))
+      return true;
+  }
+  return false;
+}
+
 void reportPmic()
 {
   PmicSurvey s;
   surveyPmic(gSpmi, s);
+  // The 23:03 and 23:18 probes (charging level 2, the DSP started at once, PianoThermal's ADC rounds): a regulator's reads kept
+  // failing for longer than spmiRead's retries, and level 2 then had no PPID for that rail (step -201). The survey again, 100 ms
+  // apart, for up to 3 s while any mapped regulator stays unread.
+  unsigned again = 0;
+  while (again < 30 && s.arbiter.v7 && railUnread(s)) {
+    IOSleep(100);
+    ++again;
+    s = PmicSurvey();
+    surveyPmic(gSpmi, s);
+  }
+  if (again)
+    note("SPMI: the regulator survey taken %u more time(s), 100 ms apart: %s", again,
+         railUnread(s) ? "a mapped regulator is still unreadable" : "every mapped regulator read");
   gArbiter = s.arbiter;
   gArbiterReady = s.arbiter.v7;
   if (!s.arbiter.v7) {
@@ -994,8 +1019,13 @@ int hwPmic(void *, uint16_t ppid, uint8_t *status, uint8_t *enable, uint8_t *mod
   const Apid found = spmiFindApid(gSpmi, gArbiter, ppid);
   if (found.apid < 0) return -19;
   uint8_t regs[7] = {};
-  if (spmiRead(gSpmi, found.apid, 0x08, status, 1) != ReadResult::ok) return -5;
-  if (spmiRead(gSpmi, found.apid, 0x40, regs, 7) != ReadResult::ok) return -5;
+  // As reportPmic: reads that keep failing through spmiRead's retries are tried again 50 ms apart, for up to 1 s.
+  bool ok = false;
+  for (unsigned attempt = 0; attempt < 20 && !ok; ++attempt) {
+    if (attempt) IOSleep(50);
+    ok = spmiRead(gSpmi, found.apid, 0x08, status, 1) == ReadResult::ok && spmiRead(gSpmi, found.apid, 0x40, regs, 7) == ReadResult::ok;
+  }
+  if (!ok) return -5;
   if (millivolts) *millivolts = uint16_t(uint16_t(regs[0]) | uint16_t(regs[1]) << 8);
   if (mode) *mode = regs[5];
   if (enable) *enable = regs[6];
