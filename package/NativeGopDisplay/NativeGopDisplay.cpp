@@ -381,6 +381,10 @@ private:
     // frame), and the VBL timer runs only while refresh copies or a stalled queue need it. The DPU has no cursor pipe yet: while a
     // cursor is on the panel every frame is composed into the boot framebuffer (and that put back), flips resume once it hides.
     bool fFlipMode;
+    // native-gop-display-builtin=1 (default 0): the panel published as a built-in display ("external" false, as a Mac's internal
+    // panel), so System Settings and CGDisplayIsBuiltin call it built-in. Off by default: WindowServer treats a built-in display
+    // differently (CoreBrightness's backlight service, docs/drivers/backlight.md section 5), not yet tried on the tablet.
+    bool fBuiltin;
     IOService *fDpu;                  // retained once found
     const OSSymbol *fDpuFlipSymbol;
     uint64_t fDpuLookupNext;          // mach time of the next lookup while none was found
@@ -568,6 +572,9 @@ bool NativeGopDisplay::start(IOService *provider)
     PE_parse_boot_argn("native-gop-display-hz", &fRefreshHz, sizeof(fRefreshHz));
     if (fRefreshHz < 30 || fRefreshHz > 240)
         fRefreshHz = 60;
+    uint32_t builtin = 0;
+    PE_parse_boot_argn("native-gop-display-builtin", &builtin, sizeof(builtin));
+    fBuiltin = builtin == 1 && !fExternal;   // D6's second display stays external
     fWidthMM = adtNumber(node, "panel-width-mm", &number) ? static_cast<uint32_t>(number) : 239;
     fHeightMM = adtNumber(node, "panel-height-mm", &number) ? static_cast<uint32_t>(number) : 163;
     char mm[32] = {};
@@ -2314,8 +2321,11 @@ bool NativeGopDisplay::createDisplayAttributes()
         if (!colors->setObject(color) || !timingColors->setObject(color) || !timings->setObject(timing))
             break;
         ioavTimingSetColorElements(timing, timingColors);
-        // The serial number is the size: WindowServer keeps the chosen mode per display identity.
-        if (!(appendString(product, "ManufacturerID", "XMI") && appendNumber(product, "ProductID", fExternal ? pianodp::kFakeProductId : 0x8750) &&
+        // The serial number is the size: WindowServer keeps the chosen mode per display identity. LegacyManufacturerID is the EDID
+        // vendor code of the three letters ("XMI": 24 << 10 | 13 << 5 | 9 = 0x61a9), what a panel's EDID gives IOMFB and what
+        // CGDisplayVendorNumber returns (0 without it).
+        if (!(appendString(product, "ManufacturerID", "XMI") && appendNumber(product, "LegacyManufacturerID", 0x61a9) &&
+              appendNumber(product, "ProductID", fExternal ? pianodp::kFakeProductId : 0x8750) &&
               appendNumber(product, "SerialNumber", width << 16 | height) &&
               appendString(product, "ProductName", fExternal ? pianodp::kFakeProductName : "Xiaomi Pad 8 Pro") &&
               appendNumber(product, "WeekOfManufacture", 1) && appendNumber(product, "YearOfManufacture", 2025)))
@@ -2345,8 +2355,8 @@ bool NativeGopDisplay::createDisplayAttributes()
         setProperty("IOMFBUUID", fExternal ? pianodp::kFakeUuid : "4E474F50-4449-5350-0000-000000008750");
         // External, display index 0: the attributes macOS 27's WindowServer accepted on the VM-era display (UPSTREAM). D6's display:
         // external too, "primary" as piano-dp-fake-primary says (default 0, the panel's value; what WindowServer makes of it is D6's
-        // question).
-        setProperty("external", true);
+        // question). native-gop-display-builtin=1: the panel built-in instead (fBuiltin).
+        setProperty("external", !fBuiltin);
         setProperty("primary", fExternal ? static_cast<unsigned long long>(fFake.primary) : 0ULL, 32);
         done = setProperty("DisplayAttributes", attributes) && setProperty("Transport", transport) &&
             setProperty("ColorElements", colors) && setProperty("TimingElements", timings) &&
