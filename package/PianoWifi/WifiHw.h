@@ -670,4 +670,132 @@ constexpr uint32_t kDot11ElementSsid = 0, kDot11ElementDsParams = 3;
 constexpr uint32_t kWmiTimeoutMs = 10000;         // the deadline of each level 6 step (the firmware's own is five seconds)
 constexpr uint32_t kScanWaitMsDefault = 12000;    // how long the scan itself may take before the level gives up on it
 
+// ---- level 7: the regulatory event, the channel list, a started station, a peer, the association (WifiSta.h, WifiAssoc.h) ----
+// Wire facts of the same Ubuntu tree (docs/drivers/wifi.md section 3): the identifiers count up from their group's first
+// command or event (the group in bits 23:12, the first of a group is 1), the tags are positions in the firmware's tag list. No
+// code, comment or table of that tree is here.
+enum WmiStaCommand : uint32_t {
+  kWmiCmdVdevStart = 0x05003, kWmiCmdVdevUp = 0x05005, kWmiCmdVdevStop = 0x05006, kWmiCmdVdevDown = 0x05007,
+  kWmiCmdVdevSetParam = 0x05008, kWmiCmdVdevInstallKey = 0x05009, kWmiCmdPeerCreate = 0x06001, kWmiCmdPeerDelete = 0x06002,
+  kWmiCmdPeerSetParam = 0x06004, kWmiCmdPeerAssoc = 0x06005, kWmiCmdMgmtTxSend = 0x07008, kWmiCmdStaPowersaveMode = 0x09001,
+};
+enum WmiStaEvent : uint32_t {
+  kWmiEvtVdevStartResp = 0x05001, kWmiEvtVdevStopped = 0x05002, kWmiEvtVdevInstallKeyComplete = 0x05003,
+  kWmiEvtPeerStaKickout = 0x06001, kWmiEvtPeerAssocConf = 0x06006, kWmiEvtPeerDeleteResp = 0x06007,
+  kWmiEvtMgmtTxCompletion = 0x07006,
+};
+enum WmiStaTag : uint32_t {
+  kWmiTagVdevStartRespEvent = 0x028, kWmiTagVdevStoppedEvent = 0x029, kWmiTagPeerStaKickoutEvent = 0x02b,
+  kWmiTagScanChanListCmd = 0x04f, kWmiTagVdevStartCmd = 0x058, kWmiTagVdevUpCmd = 0x05c, kWmiTagVdevStopCmd = 0x05d,
+  kWmiTagVdevDownCmd = 0x05e, kWmiTagVdevSetParamCmd = 0x05f, kWmiTagPeerCreateCmd = 0x061, kWmiTagPeerDeleteCmd = 0x062,
+  kWmiTagPeerSetParamCmd = 0x064, kWmiTagPeerAssocCmd = 0x065, kWmiTagVhtRateSet = 0x066, kWmiTagStaPowersaveModeCmd = 0x06c,
+  kWmiTagMgmtTxSendCmd = 0x1a6, kWmiTagMgmtTxComplEvent = 0x1a7, kWmiTagPeerAssocConfEvent = 0x1b2,
+  kWmiTagPeerDeleteRespEvent = 0x1c3, kWmiTagRegRule = 0x260, kWmiTagRegChanListCcEvent = 0x261, kWmiTagRegRuleExt = 0x3a9,
+  kWmiTagRegChanListCcExtEvent = 0x3aa, kWmiTagMloPeerCreateParams = 0x3d5,
+};
+// The regulatory event (both forms begin with the same fourteen words: status, radio, country (two characters in the low half),
+// radios, country number, domain, radar region, radio bitmap, the two bands' least and largest bandwidths, the two bands' rule
+// counts); the extended form follows them with its 6 GHz words. Then one array of rules: the 2.4 GHz band's first, then the
+// 5 GHz band's (then the 6 GHz band's, which this driver reads past). A rule is its header and three words (four in the
+// extended form): start (15:0) and end (31:16) frequency; largest bandwidth (15:0), power in dBm (23:16) and antenna gain
+// (31:24); its flags (15:0).
+constexpr uint32_t kRegEventWords = 14, kRegExtEventWords = 78;
+constexpr uint32_t kRegRuleWords = 3, kRegRuleExtWords = 4;
+constexpr uint32_t kRegRuleFlagDisabled = 1u << 0, kRegRuleFlagNoIr = 1u << 1, kRegRuleFlagRadar = 1u << 3,
+                   kRegRuleFlagNoOfdm = 1u << 6, kRegRuleFlagIndoorOnly = 1u << 9;
+constexpr unsigned kRegRulesMax = 16;             // per band; a country has a handful
+// The channel list (WMI_SCAN_CHAN_LIST): the fixed structure (channel count, flags, radio), then an array of channel
+// structures, each its header and six words: frequency, the two centre frequencies, the information word, and two of
+// regulatory power. The information word: the radio mode (5:0), passive (7), radar (10), HT (11), VHT (12), HE (17). The first
+// power word carries the least (7:0), largest (15:8) and regulatory (23:16) power and the class (31:24); the second the antenna
+// gain (7:0) and the largest transmit power (15:8). The channel list's powers are in half dBm, a started device's in dBm.
+constexpr uint32_t kWmiChannelWords = 6;
+constexpr uint32_t kWmiChanInfoModeMask = 0x3f, kWmiChanInfoPassive = 1u << 7, kWmiChanInfoDfs = 1u << 10,
+                   kWmiChanInfoAllowHt = 1u << 11, kWmiChanInfoAllowVht = 1u << 12, kWmiChanInfoAllowHe = 1u << 17;
+constexpr uint32_t kWmiChanListAppend = 1u << 0;
+constexpr unsigned kWmiChanListMax = 58;          // channels per command, as this firmware's own host sends them
+// Radio modes of the channel and the peer: legacy only at this level (no HT, VHT or HE element goes out in the association).
+constexpr uint32_t kWmiModeLegacy5 = 0, kWmiModeLegacy24 = 1, kWmiModeLegacy24Cck = 2;
+// The channels level 7 may put in that list, as centre frequencies: the 2.4 GHz band's 13 and the 5 GHz band's 25 (36-64,
+// 100-144, 149-165); the regulatory event's rules decide which go out and which are passive or radar channels.
+constexpr uint32_t kAssocChannels24[] = {2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472};
+constexpr uint32_t kAssocChannels5[] = {5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580,
+                                        5600, 5620, 5640, 5660, 5680, 5700, 5720, 5745, 5765, 5785, 5805, 5825};
+constexpr unsigned kAssocChannelCount = sizeof kAssocChannels24 / sizeof kAssocChannels24[0] +
+                                        sizeof kAssocChannels5 / sizeof kAssocChannels5[0];
+// A started station (WMI_VDEV_START_REQUEST): the fixed structure is 28 words after its header — the device (0), requestor
+// (1), beacon interval (2), DTIM period (3), flags (4: LDPC receive bit 3, hidden network bit 0, protected management frames
+// bit 1), the name's length and 32 bytes (5-13; a station sends none), beacon rate and power, notice-of-absence count,
+// hardware acknowledgement off (14-17), the preferred transmit and receive streams (18, 19), HE operation (20), radar wait
+// (21), domain (22), least data rate (23), multiple-network flags (24: bit 0 "not a multiple-network AP") and device (25), EHT
+// operation (26) and the puncturing bitmap (27), which this firmware's own host sends as the complement of its own (all
+// ones for an unpunctured channel). Then the channel structure on its own (its own header), then an empty array of
+// notice-of-absence descriptors.
+constexpr uint32_t kWmiVdevStartWords = 28;
+constexpr uint32_t kWmiVdevStartLdpcRx = 1u << 3, kWmiVdevStartPmf = 1u << 1;
+constexpr uint32_t kWmiMbssidNonMbssidAp = 1u << 0;
+constexpr uint32_t kWmiVdevStartOk = 0;
+// The station up (WMI_VDEV_UP): device (0), association identifier (1), the network's address (2-3), the transmitting
+// network's address (4-5) and two multiple-network words (6, 7), the last four zero for a plain network. Stop and down: the
+// device alone. The start's answer (WMI_VDEV_START_RESP) is twelve words: the device (0), the requestor (1), what it answers
+// (2: 0 a start, 1 a restart), the status (3: 0 taken), the chain mask (4) and the stream mode (5).
+constexpr uint32_t kWmiVdevUpWords = 8, kWmiVdevStartRespWords = 6;
+// A device parameter (WMI_VDEV_SET_PARAM): device, parameter, value. The one this level sets is the stream count.
+constexpr uint32_t kWmiVdevParamNss = 0x22;
+// The station's power save (WMI_STA_POWERSAVE_MODE): device, mode (0 off). Off at this level: the radio stays awake.
+constexpr uint32_t kWmiStaPsOff = 0;
+// A peer (WMI_PEER_CREATE): device, the peer's address (two words), its type (0 default); then an array holding one
+// multi-link parameter structure (its header and a flags word, zero: not a multi-link peer), which this firmware's own host
+// always sends. Delete: device and address. A peer parameter (WMI_PEER_SET_PARAM): device, address, parameter, value.
+constexpr uint32_t kWmiPeerTypeDefault = 0;
+constexpr uint32_t kWmiPeerParamAuthorize = 3;
+// The peer's association (WMI_PEER_ASSOC): the fixed structure is 61 words after its header — the address (0-1), device (2), a
+// new association (3), the association identifier (4), the flags (5), the capability (6), the listen interval (7), HT
+// capability, largest A-MPDU and its density (8-10), the rate capability (11), streams (12), VHT capability (13), the radio
+// mode (14), two HT information words (15, 16), the legacy and HT rate counts (17, 18), a bandwidth/stream override (19), a
+// 10-word HE threshold block (20-29), HE words (30-39), the station type (40), BSS idle (41), authentication mode (42), extended
+// flags (43), puncturing (44), EHT words (45-50) and a second 10-word threshold block (51-60). Then the legacy rates as
+// bytes, the HT rates as bytes, the VHT rate set structure on its own (five words: the receive side's largest rate and its
+// set, the transmit side's two, and a stream/rate word; all zero for a legacy peer),
+// and four arrays of structures (HE rate sets, multi-link parameters, EHT rate sets, multi-link partners), all empty here.
+constexpr uint32_t kWmiPeerAssocWords = 61, kWmiVhtRateSetWords = 5;
+// The keys (WMI_VDEV_INSTALL_KEY): the fixed structure is 25 words after its header — the device (0), the peer's address
+// (1-2), the key's index (3), its kind (4: 0 pairwise, 1 group), the cipher (5: 0 none, 2 TKIP, 4 CCMP, 7 CMAC), the receive
+// sequence counter as 64 bits (6-7), the group one (8-9) and the transmit one (10-11), two 16-byte WAPI counters (12-19), the
+// key's length (20), the two TKIP microcode lengths (21, 22), and whether a group-key identifier follows and that identifier
+// (23, 24). Then the key itself as a byte array, padded to a whole word (its real length is word 20).
+constexpr uint32_t kWmiInstallKeyWords = 25;
+constexpr uint32_t kWmiKeyPairwise = 0, kWmiKeyGroup = 1;
+constexpr uint32_t kWmiCipherNone = 0, kWmiCipherTkip = 2, kWmiCipherCcmp = 4, kWmiCipherCmac = 7;
+constexpr uint32_t kWmiPeerFlagAuth = 0x1, kWmiPeerFlagQos = 0x2, kWmiPeerFlagNeedPtk4Way = 0x4, kWmiPeerFlagNeedGtk2Way = 0x10,
+                   kWmiPeerFlagPmf = 0x08000000;
+constexpr uint32_t kWmiRateCck = 0x80;            // a legacy rate byte: 500 kb/s units, bit 7 for the CCK rates
+constexpr uint32_t kAssocListenInterval = 5;      // beacons, as this firmware's own host and its 802.11 layer send it
+// A management frame out (WMI_MGMT_TX_SEND): device, a descriptor number of the host's (it comes back in the completion), the
+// frequency (0: the device's own channel), the frame's bus address (low, high), the frame's length, how many of its bytes are
+// copied into the command too, and "transmit parameters valid" (0). Then those first bytes (at most 64) as a byte array. The
+// firmware reads the whole frame from the bus address: it must be in the 32-bit window.
+constexpr uint32_t kWmiMgmtTxWords = 8, kWmiMgmtTxInlineMax = 64;
+constexpr uint32_t kWmiMgmtTxStatusOk = 0;        // the completion's status: 0 acknowledged, anything else not
+// 802.11 frames of the association (the frame control's first byte, type management, and the fields each body begins with).
+constexpr uint8_t kDot11AssocRequest = 0x00, kDot11AssocResponse = 0x10, kDot11Disassoc = 0xa0, kDot11Auth = 0xb0,
+                  kDot11Deauth = 0xc0;
+constexpr uint32_t kDot11AuthOpen = 0, kDot11AuthBodyBytes = 6, kDot11AssocRespFixedBytes = 6;
+constexpr uint16_t kDot11CapEss = 0x0001, kDot11CapPrivacy = 0x0010, kDot11CapShortPreamble = 0x0020,
+                   kDot11CapShortSlot = 0x0400;
+constexpr uint32_t kDot11ElementRates = 1, kDot11ElementTim = 5, kDot11ElementRsn = 48, kDot11ElementExtRates = 50;
+constexpr uint16_t kDot11ReasonLeaving = 3;
+// RSN suites: the 00-0F-AC organisation; ciphers 2 TKIP, 4 CCMP; key management 2 PSK, 6 PSK with SHA-256, 8 SAE. RSN
+// capability bits 6 (management frame protection required) and 7 (capable).
+constexpr uint32_t kRsnOui = 0x000fac;
+constexpr uint8_t kRsnCipherTkip = 2, kRsnCipherCcmp = 4, kRsnAkmPsk = 2, kRsnAkmPskSha256 = 6, kRsnAkmSae = 8;
+constexpr uint16_t kRsnCapMfpRequired = 1u << 6, kRsnCapMfpCapable = 1u << 7;
+// How long level 7 waits, by default (piano-wifi-assoc's bits change none of them).
+constexpr uint32_t kAssocProfileWaitMs = 600000;  // for the join profile (machdep.piano_wifi_join), after level 6's scan
+constexpr uint32_t kAssocFrameWaitMs = 500, kAssocFrameTries = 3;   // an authentication or association answer, and retries
+constexpr uint32_t kAssocHoldMs = 30000;          // associated: how long the level watches the link before its teardown
+constexpr uint32_t kAssocScanDwellMs = 300;       // the targeted scan's passive dwell on the network's channel
+constexpr uint32_t kAssocScanId = 0xa001;
+constexpr uint32_t kAssocFrameBuffers = 4, kAssocFrameBytes = 1024;
+
 }  // namespace pianowifi
