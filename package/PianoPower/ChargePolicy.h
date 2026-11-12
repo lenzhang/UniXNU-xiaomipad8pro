@@ -227,8 +227,9 @@ enum {
     PIANO_CHG_EV_RAMP_STEP = 1u << 29,     /* the stepped Rp limit goes up one step (plan.ramp_from_ma -> plan.ramp_ma) */
     PIANO_CHG_EV_RAMP_BACK = 1u << 30,     /* one step back, this boot's ceiling lowered (plan.ramp_back_*: a sag, a quick detach, a
                                             * refusal) */
-    PIANO_CHG_EV_RAMP_WAIT = 1u << 31,     /* the steps wait for a reason not yet logged at this step (plan.ramp_wait) */
 };
+/* the steps wait for a reason not yet logged at this step (plan.ramp_wait); bit 31, outside the enum (an int's range before C23) */
+#define PIANO_CHG_EV_RAMP_WAIT (1u << 31)
 /* why the stepped Rp limit does not go up (plan.ramp_wait) */
 enum {
     PIANO_CHG_RAMP_OFF = 0,       /* not stepping: no Rp limit above the row, or cfg.ramp off */
