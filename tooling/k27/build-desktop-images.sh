@@ -10,7 +10,7 @@
 #          - the launchd overrides of the jobs that only loop natively (disabled: launchd never loads them, so none runs or
 #            advertises its Mach services; a client gets an invalid connection at once):
 #            com.apple.watchdogd            SIGTRAP at every start (no IOWatchdog natively), relaunched every 10 s, each time a
-#                                           ReportCrash run: 15-21 crashes a boot (attend1-4, 2026-11-11/12)
+#                                           ReportCrash run: 15-17 crashes a boot (attend1-4, 2026-11-11/12)
 #            com.apple.mobileactivationd    exec denied by the kernel (k27-deny-exec's default), so launchd's spawn fails (xpcproxy
 #                                           exit 78) every 10 s for as long as a client keeps its request queued
 #            com.apple.security.xprotectd   KeepAlive, exits 1 at once at every start: one spawn every 10 s (25 a boot)

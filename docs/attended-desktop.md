@@ -56,8 +56,8 @@ with a lit, non-grey frame):
 
 | Process | Per boot | Reason (evidence) | State |
 |---|---|---|---|
-| watchdogd | 15-21 | `exit ... status 0x5 reason 2:5` (SIGTRAP) soon after each start; no IOWatchdog natively; KeepAlive, relaunched every 10 s, each crash a `Denying core dump` and a ReportCrashService run of ~1 s | disabled in the desk images (§2) |
-| locationd | 0-1 | `status 0xb` (SIGSEGV), attend1/2, once | left |
+| watchdogd | 15-17 | `exit ... status 0x5 reason 2:5` (SIGTRAP) soon after each start; no IOWatchdog natively; KeepAlive, relaunched every 10 s, each crash a `Denying core dump` and a ReportCrashService run of ~1 s | disabled in the desk images (§2) |
+| locationd | 0-1 | `status 0xb` (SIGSEGV), once, in attend2 only | left |
 | WindowServer | 1 (attend4) | `BoMap -> 0xe00002be (NoResources)` at 366.4, then `status 0x6`: the session back at the login window | fixed (GPU map limits, Turnip 0006; [drivers/gpu.md](drivers/gpu.md) §8) |
 | the whole system | attend1-3 | resets 1-2 min after login, attend3's console stops at ~807 | fixed (the volatile Data disk's pool, [data-store.md](data-store.md)) |
 
