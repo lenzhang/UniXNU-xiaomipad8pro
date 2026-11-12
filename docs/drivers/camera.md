@@ -478,7 +478,7 @@ grep -a "PianoCamera" logs/usb-console/<newest>-port0.txt
 | `c3rs` | `piano-camera=3 piano-camera-sensor=1 piano-camera-pattern=0 piano-camera-frames=4 piano-camera-delay=20` | **yes**, after `c3r` | the rear's scene: four frames, the means with the room light |
 | `c3f` | `piano-camera=3 piano-camera-sensor=2 piano-camera-delay=20` | **yes**, after `c2f` and `c3r` | the front's scene over CSIPHY4 |
 | `cplan` | `piano-camera=3 piano-camera-plan=c3rp,c2f,c3r,c3rs,c3f piano-camera-delay=20` | **yes** | the ladder on one boot in its gated order, each with its image's arguments, the next only after a complete power-down (`CameraPlan.h`; host-tested on c1's board model: five runs, the same free SMMU group and bank each time, everything as found after the last). Ran 2026-11-13 with c2fx in c2f's place (§8.4) |
-| `c5` | `piano-camera=5 piano-camera-grab=1 piano-camera-delay=20 piano-usb-shell=1` (the root shell on USB port 1 for the PPMs), the userland's seed (`CAM_SEED=out/userland/stage/scratch-data.img CAM_TRUST=out/userland/stage/kernel.macho.trustcache`) | **yes** | level 5's first version (§4.5.1): `piano-camera-grab`'s boot job captures the front, then the rear, through the user client; its lines and thumbnails on the console (`tooling/camera/console-thumb.py`), the PPMs in /private/var/tmp |
+| `c5` | `piano-camera=5 piano-camera-plan=c3r,c3rs,c3f piano-camera-grab=1 piano-camera-delay=20 piano-usb-shell=1` (the root shell on USB port 1 for the PPMs), the userland's seed (`CAM_SEED=out/userland/stage/scratch-data.img CAM_TRUST=out/userland/stage/kernel.macho.trustcache`) | **yes** | **cae's plan first** (its whole report before anything new runs), then level 5's first version (§4.5.1): `piano-camera-grab`'s boot job captures the front, then the rear, through the user client; its lines and thumbnails on the console (`tooling/camera/console-thumb.py`), the PPMs in /private/var/tmp. One boot answers cae and c5; cae alone is the fallback when c5's userland or user client fails |
 | `cae` | `piano-camera=3 piano-camera-plan=c3r,c3rs,c3f piano-camera-delay=20` | **yes** | the exposure loop on both scenes: the rear's colour bars first (the stream's regression check after the loop's rework), then the rear's and the front's scenes, each from its driver's defaults to 160 above black, a non-flat histogram where light reaches the sensor (§8.2 "cae") |
 
 Each runs `piano-reset-after=300`. The order is `c1` → (`c1x`) → `c1b` → `c2f` → `c2r` → `c2rg`/`c2r24` as needed → `c3rp` → `c3r` →
@@ -659,8 +659,9 @@ the desk is the expected case; for the front facing the lit room it would point 
 `read back FAILED` or other values than written = the control registers themselves; a lit `ae 1` sample already at the drivers'
 defaults with c3f's black frames of 11-13 = the missing controls were the cause (the tables alone are dark).
 
-**c5** (level 5; the userland's seed): the survey as usual, then `level 5: the user client PianoCameraUserClient (...)` at start
-and `stage 7: level 5: ready for captures (PianoCameraUserClient)`. Once launchd runs the job (about 30-60 s after XNU starts):
+**c5** (level 5; the userland's seed): `level 5: the user client PianoCameraUserClient (...)` and `plan: c3r,c3rs,c3f (...)` at
+start; the survey as usual; cae's plan with its lines (above) and `plan: 3 of 3 run`; then `stage 7: level 5: ready for captures
+(PianoCameraUserClient)`. Once launchd runs the job (about 30-60 s after XNU starts):
 ```
 piano-camera-grab: --boot: waiting for PianoCamera's level 5
 PianoCamera: level 5: capture 1: the front, the scene, exposure loop on (target 160)

@@ -57,10 +57,10 @@ image() {
     # colour bars (the stream's regression check).
     cplan) A="piano-camera=3 piano-camera-plan=c3rp,c2f,c3r,c3rs,c3f piano-camera-delay=20" ;;
     cae)   A="piano-camera=3 piano-camera-plan=c3r,c3rs,c3f piano-camera-delay=20" ;;
-    # Level 5's first version: the user client, and piano-camera-grab's boot job capturing both cameras through it (front, then
+    # Level 5's first version, after cae's plan (the same boot answers both): the user client, and piano-camera-grab's boot job capturing both cameras through it (front, then
     # rear) with their thumbnails on the console. Needs the userland's seed: CAM_SEED=out/userland/stage/scratch-data.img
     # CAM_TRUST=out/userland/stage/kernel.macho.trustcache (tooling/userland/stage.py); refused with a seed that lacks the tool.
-    c5)    A="piano-camera=5 piano-camera-grab=1 piano-camera-delay=20 piano-usb-shell=1" ;;   # + the root shell on USB port 1 (the PPMs)
+    c5)    A="piano-camera=5 piano-camera-plan=c3r,c3rs,c3f piano-camera-grab=1 piano-camera-delay=20 piano-usb-shell=1" ;;   # cae first; the root shell (the PPMs)
     *) return 1 ;;
   esac
 }

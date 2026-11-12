@@ -1110,16 +1110,18 @@ void PianoCamera::run()
     return;
   }
   char verdict[240];
-  if (gArgs.level >= 5) {
-    serve();   // never returns
-    return;
-  }
   if (!gPlan.count) {
+    if (gArgs.level >= 5) {
+      serve();   // never returns
+      return;
+    }
     sequence(verdict, sizeof verdict);
     cmdDbFree();
     return;
   }
-  // The plan (CameraPlan.h): each item with its image's arguments, the next only after a complete power-down.
+  // The plan (CameraPlan.h): each item with its image's arguments, the next only after a complete power-down; at level 5 the
+  // plan first (its items' own arguments), then the user client with the image's.
+  const Args image = gArgs;
   static char results[kPlanMax][240];
   unsigned ran = 0;
   bool stopped = false;
@@ -1142,6 +1144,16 @@ void PianoCamera::run()
   for (unsigned i = 0; i < ran; ++i) note("plan result %u/%u %s: %s", i + 1, gPlan.count, gPlan.item[i]->name, results[i]);
   note("plan: %u of %u run%s", ran, gPlan.count, stopped ? " (stopped)" : "");
   setProperty("piano-camera-plan", gPlanText);
+  gArgs = image;
+  if (gArgs.level >= 5) {
+    if (stopped) {
+      stage(-7, "level 5 not started: the plan stopped (a power-down was not complete)");
+      return;
+    }
+    reportStack();
+    serve();   // never returns
+    return;
+  }
   cmdDbFree();
 }
 
