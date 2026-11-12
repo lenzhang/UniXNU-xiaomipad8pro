@@ -18,6 +18,7 @@
 //   - The panel (copy thread): flipped or not, whether the boot framebuffer holds the composition, where the cursor was drawn; the
 //     plan of a job (flip it, compose the whole panel, or only the cursor's old and new rectangles).
 //   - Refresh copies: the ticks after a frame (1, 2, 4, 8, 16, 30) and which of them a fence-covered frame still needs.
+//   - The panel before the first frame: left to a verbose boot's text console, black otherwise (startPlan).
 #pragma once
 #include <stdint.h>
 #include <string.h>
@@ -614,5 +615,33 @@ struct Pipeline {
     if (flipped) refreshLeft = 0;
   }
 };
+
+// ------------------------------------------------------------------------------------------- the panel before the first frame
+// What start() leaves on the boot framebuffer until WindowServer's first frame (2026-11-12). XNU's text console (a verbose boot)
+// cleared the panel to its background, black, when it started (gc_enable) and from then on writes only what changes: a scroll
+// repaints only the cells whose character changed (gc_scroll_up), and in those only the pixels where the new glyph differs from the
+// old one (vc_paint_char_32); a new character is painted whole. A colour painted under the console therefore stays wherever no glyph
+// pixel changed, and the strokes that scroll away leave black in it at the glyphs' common stem and bar positions: the bluish
+// background with horizontal and vertical lines of 2026-11-12 (the fill 0xff203050 of before). So a text console's framebuffer is
+// left as it is; a graphics boot's (nothing draws on it) is cleared to black. native-gop-display-fill=0xRRGGBB asks for a colour
+// (0x203050, the old one, shows that the mapping reaches the panel; under a text console it leaves those lines), the bars win over it.
+enum class StartFill : uint8_t {Keep, Black, Colour, Bars};
+struct StartPlan {
+  StartFill kind;
+  uint32_t pixel;   // Black, Colour: the panel's 0xAARRGGBB
+};
+inline StartPlan startPlan(bool bars, bool fillGiven, uint32_t fillRgb, bool textConsole)
+{
+  if (bars) return {StartFill::Bars, 0};
+  if (fillGiven) return {StartFill::Colour, kBlack | (fillRgb & 0xffffffu)};
+  if (textConsole) return {StartFill::Keep, 0};
+  return {StartFill::Black, kBlack};
+}
+// XNU's own choice (PE_create_console, pexpert/arm/pe_init.c of the k27 tree): the graphics console only when the boot framebuffer
+// has a display mode (boot_args Video.v_display, DarwinBoot's) and neither -v nor vc-text is set; the text console otherwise.
+inline bool textConsole(uint64_t display, bool verbose, uint32_t vcText)
+{
+  return !display || verbose || vcText;
+}
 
 }  // namespace gopcompose

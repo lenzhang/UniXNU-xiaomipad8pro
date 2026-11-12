@@ -663,20 +663,45 @@ bool NativeGopDisplay::start(IOService *provider)
         fScanout = reinterpret_cast<uint8_t *>(fScanoutMap->getVirtualAddress());
         GOPLOG("framebuffer mapped write-combined at %p (%lu bytes)\n", fScanout, fVideo.v_rowBytes * fVideo.v_height);
     }
-    // A solid colour until the first frame (or the bars): the screen shows that this mapping reaches the panel. The boot console keeps
-    // drawing its text over it until WindowServer's first frame.
+    // The panel until WindowServer's first frame (GopCompose.h startPlan): a verbose boot's text console keeps the framebuffer as it
+    // drew it (it repaints only what changes, so a colour under it stays around the text, crossed by lines: the bluish background of
+    // 2026-11-12), a graphics boot's is cleared to black; native-gop-display-fill=0xRRGGBB paints a colour, -bars=1 the colour bars.
+    // The boot console stops drawing at WindowServer's first frame.
     unsigned bars = 0;
     PE_parse_boot_argn("native-gop-display-bars", &bars, sizeof(bars));
-    if (bars) {
+    uint32_t fillRgb = 0;
+    const bool fillGiven = PE_parse_boot_argn("native-gop-display-fill", &fillRgb, sizeof(fillRgb));
+    int verbose = 0;
+    uint32_t vcText = 0;
+    PE_parse_boot_argn("-v", &verbose, sizeof(verbose));
+    PE_parse_boot_argn("vc-text", &vcText, sizeof(vcText));
+    const bool textConsole = !fExternal && gopcompose::textConsole(fVideo.v_display, verbose != 0, vcText);
+    const gopcompose::StartPlan plan = gopcompose::startPlan(bars != 0, fillGiven, fillRgb, textConsole);
+    if (plan.kind == gopcompose::StartFill::Bars) {
         drawBars();
-    } else {
+    } else if (plan.kind != gopcompose::StartFill::Keep) {
         for (unsigned long y = 0; y < fVideo.v_height; y++) {
             auto *row = reinterpret_cast<volatile uint32_t *>(fScanout + y * fVideo.v_rowBytes);
             for (unsigned long x = 0; x < fVideo.v_width; x++)
-                row[x] = 0xff203050;
+                row[x] = plan.pixel;
         }
     }
-    GOPLOG("framebuffer %s\n", bars ? "shows the colour bars" : "cleared");
+    switch (plan.kind) {
+    case gopcompose::StartFill::Bars:
+        GOPLOG("framebuffer shows the colour bars\n");
+        break;
+    case gopcompose::StartFill::Colour:
+        GOPLOG("framebuffer filled with #%06x (native-gop-display-fill)%s\n", plan.pixel & 0xffffff,
+               textConsole ? "; the verbose console's text is drawn over it, around which the colour stays" : "");
+        break;
+    case gopcompose::StartFill::Keep:
+        GOPLOG("framebuffer left to the boot console's text (%s) until WindowServer's first frame\n",
+               verbose ? "-v" : vcText ? "vc-text" : "no graphics mode");
+        break;
+    case gopcompose::StartFill::Black:
+        GOPLOG("framebuffer cleared to black\n");
+        break;
+    }
     fCopyLock = IOLockAlloc();
     thread_t copier = nullptr;
     if (!fCopyLock || kernel_thread_start(copyThreadMain, this, &copier) != KERN_SUCCESS) {

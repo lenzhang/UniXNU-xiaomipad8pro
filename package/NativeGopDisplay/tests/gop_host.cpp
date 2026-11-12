@@ -15,7 +15,10 @@
 //     draws into at once), the VBL timer, the GPU's fences and the copy thread (20 ms full copies): with native-gop-display-defer=1 or
 //     2 no copy ever reads a surface WindowServer is drawing, the panel equals the reference composition whenever everything is idle and
 //     at the end; with defer=0 (before 2026-11-12) the same workload tears (the race of 2026-11-11, reproduced); a slow GPU (fence
-//     waits that give up) still ends with the right frame; flip mode never shows a flipped surface while a cursor is on.
+//     waits that give up) still ends with the right frame; flip mode never shows a flipped surface while a cursor is on;
+//   - the panel before the first frame (startPlan): the rule's table, XNU's console choice, and a model of the text console's painting
+//     rules over twenty screens of log: the framebuffer kept under -v is exactly the console's text; the old fill (#203050) stays
+//     behind the text with black stroke lines through it (the bluish background of 2026-11-12, reproduced).
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. gop_host.cpp -o /tmp/gop_host && /tmp/gop_host
 #include <cmath>
 #include <cstdio>
@@ -1209,6 +1212,160 @@ static void testSimulation()
   }
 }
 
+// ------------------------------------------------------------------------------------------- the panel before the first frame
+// A model of XNU's text console as it paints the boot framebuffer (the rules, from osfmk/console/video_console.c's behaviour; a
+// synthetic font): the panel cleared to the background when it starts; a new character painted whole (all 8x16 pixels); a line feed
+// on the last row scrolls, repainting only the cells whose character changed and in them only the pixels where the new glyph differs
+// from the old one; the freed last row clears only the old glyphs' pixels. start() paints by startPlan at some point in the boot.
+struct ConsoleModel {
+  static constexpr int kCols = 60, kRows = 20, kCw = 8, kCh = 16;
+  static constexpr uint32_t kFore = 0xffffffffu, kBack = 0;   // the console's white and black (vc_color_fore, vc_color_back)
+  std::vector<uint8_t> glyph = std::vector<uint8_t>(256 * kCw * kCh);   // [ch][y][x], 1: a stroke
+  std::vector<uint32_t> panel = std::vector<uint32_t>(kCols * kCw * kRows * kCh, kBack);
+  std::vector<uint8_t> cells = std::vector<uint8_t>(kCols * kRows, ' ');
+  int x = 0, y = 0;
+  explicit ConsoleModel(uint32_t seed)
+  {
+    std::mt19937 rng(seed);
+    for (int ch = 33; ch < 127; ch++)   // ' ' has no stroke; glyphs in a 5x9 box share stems and bars, as a font's do
+      for (int py = 3; py < 12; py++)
+        for (int px = 1; px < 6; px++)
+          glyph[(ch * kCh + py) * kCw + px] = (px == 1 || px == 5 || py == 3 || py == 7 || py == 11) ? rng() % 3 != 0 : rng() % 8 == 0;
+  }
+  uint32_t &pixel(int col, int row, int px, int py) {return panel[(row * kCh + py) * kCols * kCw + col * kCw + px];}
+  bool on(uint8_t ch, int px, int py) const {return glyph[(ch * kCh + py) * kCw + px] != 0;}
+  void paint(int col, int row, uint8_t ch, int previous)   // previous < 0: the whole cell
+  {
+    for (int py = 0; py < kCh; py++)
+      for (int px = 0; px < kCw; px++)
+        if (previous < 0 || on(ch, px, py) != on(uint8_t(previous), px, py))
+          pixel(col, row, px, py) = on(ch, px, py) ? kFore : kBack;
+  }
+  void scroll()
+  {
+    for (int row = 0; row + 1 < kRows; row++)
+      for (int col = 0; col < kCols; col++) {
+        uint8_t &cell = cells[row * kCols + col];
+        const uint8_t below = cells[(row + 1) * kCols + col];
+        if (cell != below) {
+          paint(col, row, below, cell);
+          cell = below;
+        }
+      }
+    for (int col = 0; col < kCols; col++) {
+      uint8_t &cell = cells[(kRows - 1) * kCols + col];
+      if (cell != ' ') {
+        paint(col, kRows - 1, ' ', cell);
+        cell = ' ';
+      }
+    }
+  }
+  void newline()
+  {
+    if (y == kRows - 1) scroll();
+    else y++;
+    x = 0;
+  }
+  void put(uint8_t ch)
+  {
+    if (ch == '\n') return newline();
+    if (x >= kCols) newline();
+    cells[y * kCols + x] = ch;
+    paint(x, y, ch, -1);
+    x++;
+  }
+  void line(std::mt19937 &rng)   // a log line: words of 1-12 characters, sometimes longer than a row (it wraps)
+  {
+    const unsigned length = rng() % 4 == 0 ? rng() % (2 * kCols) : rng() % kCols;
+    for (unsigned i = 0; i < length; i++)
+      put(rng() % 7 == 0 ? ' ' : uint8_t(33 + rng() % 94));
+    put('\n');
+  }
+  void start(const StartPlan &plan)   // NativeGopDisplay::start, as the kernel does it (bars: not modelled)
+  {
+    if (plan.kind == StartFill::Black || plan.kind == StartFill::Colour)
+      for (uint32_t &p : panel) p = plan.pixel;
+  }
+  uint64_t differences() const   // pixels not as the console means them (its cells drawn whole); the scan-out ignores the alpha byte
+  {
+    uint64_t n = 0;
+    for (int row = 0; row < kRows; row++)
+      for (int col = 0; col < kCols; col++)
+        for (int py = 0; py < kCh; py++)
+          for (int px = 0; px < kCw; px++)
+            n += ((panel[(row * kCh + py) * kCols * kCw + col * kCw + px] ^ (on(cells[row * kCols + col], px, py) ? kFore : kBack)) &
+                  0xffffffu) != 0;
+    return n;
+  }
+};
+
+static void testStartFill()
+{
+  // the rule: bars, then an asked-for colour, then a text console kept, else black
+  for (int bars = 0; bars < 2; bars++)
+    for (int given = 0; given < 2; given++)
+      for (int text = 0; text < 2; text++) {
+        const StartPlan p = startPlan(bars, given, 0x123456, text);
+        if (bars) CHECK(p.kind == StartFill::Bars);
+        else if (given) CHECK(p.kind == StartFill::Colour && p.pixel == 0xff123456);
+        else if (text) CHECK(p.kind == StartFill::Keep);
+        else CHECK(p.kind == StartFill::Black && p.pixel == kBlack);
+      }
+  CHECK(startPlan(false, true, 0xff203050, false).pixel == 0xff203050);   // the alpha byte is the driver's, whatever was given
+  CHECK(startPlan(false, true, 0, true).kind == StartFill::Colour && startPlan(false, true, 0, true).pixel == kBlack);
+  // XNU's choice of console (PE_create_console): graphics only with a display mode and neither -v nor vc-text
+  CHECK(!textConsole(1, false, 0));
+  CHECK(!textConsole(2, false, 0));
+  CHECK(textConsole(1, true, 0) && textConsole(1, false, 1) && textConsole(0, false, 0) && textConsole(0, true, 7));
+
+  // A verbose boot: the console ran a while (the screen full of text), then the driver started, then the log went on.
+  for (uint32_t seed = 1; seed <= 3; seed++) {
+    struct Case { bool given; uint32_t rgb; } cases[] = {{false, 0}, {true, 0x203050}, {true, 0}};
+    for (const Case &k : cases) {
+      ConsoleModel console(seed);
+      std::mt19937 rng(seed * 7919);
+      for (int i = 0; i < 40; i++) console.line(rng);
+      CHECK(console.differences() == 0);   // before the driver, the console's picture is its cells
+      const StartPlan plan = startPlan(false, k.given, k.rgb, textConsole(1, true, 0));
+      console.start(plan);
+      for (int i = 0; i < 3; i++) console.line(rng);
+      const uint64_t early = console.differences();
+      for (int i = 3; i < 400; i++) console.line(rng);   // twenty screens of log
+      uint64_t fill = 0, black = 0, other = 0;
+      for (uint32_t p : console.panel) {
+        fill += k.given && p == plan.pixel;
+        black += p == ConsoleModel::kBack;
+        other += p != ConsoleModel::kBack && p != ConsoleModel::kFore && !(k.given && p == plan.pixel);
+      }
+      const uint64_t total = console.panel.size();
+      CHECK(other == 0);
+      if (!k.given) {
+        // the default under -v: the framebuffer kept, so the panel is exactly the console's text on black, all along
+        CHECK(plan.kind == StartFill::Keep);
+        CHECK(early == 0 && console.differences() == 0);
+      } else if (k.rgb == 0x203050) {
+        // the driver before 2026-11-12: the colour stays behind the text (most of the panel) and the strokes that went away left
+        // black in it, the "bluish background with lines": reproduced
+        CHECK(fill * 2 > total);
+        CHECK(black > 0);
+        CHECK(console.differences() > total / 2);
+        if (seed == 1)
+          std::printf("console model, fill #203050 under -v: %.1f%% of the panel keeps the fill, %.1f%% black after 20 screens of log\n",
+                      100.0 * double(fill) / double(total), 100.0 * double(black) / double(total));
+      } else {
+        // a black fill under -v: no colour, but it erases the text on the screen, and the console redraws only what changes: strokes
+        // are missing until their cells change (why the framebuffer is kept instead)
+        CHECK(plan.pixel == kBlack);
+        CHECK(early > 0);
+        if (seed == 1)
+          std::printf("console model, black fill under -v: %llu of %llu pixels not as the console means them 3 lines later, %llu after "
+                      "20 screens\n", static_cast<unsigned long long>(early), static_cast<unsigned long long>(total),
+                      static_cast<unsigned long long>(console.differences()));
+      }
+    }
+  }
+}
+
 int main()
 {
   testGeometry();
@@ -1220,6 +1377,7 @@ int main()
   testPanel();
   testRefresh();
   testSimulation();
+  testStartFill();
   std::printf("%s: %d checks, %d failures\n", failures ? "FAIL" : "ok", checks, failures);
   return failures ? 1 : 0;
 }

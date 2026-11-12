@@ -12,6 +12,10 @@
 > the ticks retry), and a swap completes only once its own job is done, so a surface goes back to WindowServer only after the
 > copy of the frame that replaced it. All on by default; `native-gop-display-cursor=0` and `native-gop-display-defer=0` give the
 > old behaviour back (the fence rule stays).
+>
+> **2026-11-12, the bluish verbose boot (§5b; host-tested, built, not run yet):** `start()` no longer paints the panel blue-grey.
+> Under `-v` it leaves the boot console's text alone (the console repaints only what changes, so the colour stayed around the text,
+> crossed by lines); otherwise it clears to black. `native-gop-display-fill=0x203050` brings the old colour back.
 
 First step of [display.md](display.md) (M2a, GOP adoption); no DPU register is written.
 
@@ -60,7 +64,8 @@ relaunched 6 times in 240 s. Without it and without a display, WindowServer laun
 | `native-gop-display=0` / `=1` | the ADT marker (1 in `configs/k27-gop-display.toml`) | 0: NativeGopDisplay leaves the nub (no display); 1: it takes it even on a node without the marker |
 | `native-gop-display-hz=N` | ADT `refresh-hz`, else 60 | rate told to WindowServer and of the VBL timer (30..240). The panel stays at ABL's 120 Hz |
 | `native-gop-display-mm=WxH` | ADT, else 239x163 | physical size, so the density and macOS's HiDPI ("looks like 1600x1068") modes |
-| `native-gop-display-bars=1` | off | 8 colour bars instead of the solid colour until the first frame (left to right: white, yellow, cyan, green, magenta, red, blue, black) to check channel order |
+| `native-gop-display-bars=1` | off | 8 colour bars until the first frame (left to right: white, yellow, cyan, green, magenta, red, blue, black) to check channel order |
+| `native-gop-display-fill=0xRRGGBB` | none | a solid colour until the first frame, to see that the mapping reaches the panel (`0x203050`, the blue-grey every boot had before 2026-11-12). Without it: a verbose boot's framebuffer is left to the boot console, any other is cleared to black (§5b). Under `-v` the colour stays around the text, crossed by lines (§5b) |
 | `native-gop-display-refresh=0\|1\|2` | 1 | the refresh copies of the frame on screen on ticks 1, 2, 4, 8, 16 and 30 after a swap (for a GPU that finishes after the swap): 0 none; 1 all six after a frame no GPU fence covered (no PianoA830, or the wait gave up), only the last (tick 30) after one it did; 2 all six after every frame (the default before 2026-11-12) |
 | `native-gop-display-cursor=0\|1\|2` | 1 | layer 1, WindowServer's cursor (§5a): 0 not drawn (before 2026-11-12: the pointer is invisible); 1 its glyph rectangle (IOSurface's origin and extents) blended at the layer's origin; 2 the whole cursor surface (should the extents ever be wrong) |
 | `native-gop-display-defer=0\|1\|2` | 2 | when a swap completes (§5a): 0 at once (before 2026-11-12: the copy thread may still read a surface WindowServer draws into again); 1 at once unless the copy thread reads a surface the swap takes off the screen, then once that read is done; 2 once the swap's own job is done (flip mode always uses 2) |
@@ -107,8 +112,9 @@ comes first, from the nub. Then:
 NativeGopDisplay: probe on AppleParavirtGPU (ADT gop-display): taking it         | "...: off (boot-arg native-gop-display=0)..." -> no display
 NativeGopDisplay: start on AppleParavirtGPU (ADT gop-display)
 NativeGopDisplay: boot framebuffer 0xfc800000 3200x2136 row 12800 depth 32       | "no boot framebuffer" / "unusable framebuffer"
-NativeGopDisplay: framebuffer mapped write-combined at 0x... (27340800 bytes)    -> the panel turns blue-grey (or shows the bars)
-NativeGopDisplay: framebuffer cleared
+NativeGopDisplay: framebuffer mapped write-combined at 0x... (27340800 bytes)
+NativeGopDisplay: framebuffer cleared to black                                     | a verbose boot: "framebuffer left to the boot console's
+                  text (-v) until WindowServer's first frame"; "framebuffer filled with #RRGGBB (native-gop-display-fill)..."; "...shows the colour bars"
 NativeGopDisplay: copy thread started
 NativeGopDisplay: display attributes published (one 3200x2136@60 timing, 8-bit SDR sRGB)
 NativeGopDisplay: hardware started (VBL timer 60 Hz, power states registered, hot plug 1)
@@ -244,7 +250,7 @@ the next frame flips again. A cursor showing up over a flipped frame composes th
 (dpu.md §4.2.6) is later.
 
 **Host tests** (`package/NativeGopDisplay/tests/gop_host.cpp`, run by `tooling/k27/build-native-gop-display.sh` before the build,
-760 checks): rectangles and clamping, the cursor's damage; `round(a*b/255)` exhaustively, the blend against a reference over 200,000
+812 checks, 52 of them §5b's start fill): rectangles and clamping, the cursor's damage; `round(a*b/255)` exhaustively, the blend against a reference over 200,000
 pixels, saturation; all 65536 half floats, the extended-range table, every base format; the glyph rectangle from the six words
 (missing, empty, outside, cut, hot spot outside); the cursor off each edge, far away, partly on; 600 random scenes of composed rows and
 damage rectangles against a per-pixel reference (every base format, narrow bases, no base, cursor sub-rectangles); the layer rules;
@@ -281,6 +287,70 @@ copy thread was done ..., mean N us` (about one copy, ~20-40 ms), the fence line
 if the GPU stalled. If the pointer is off by a fixed offset, its hot spot is the likely amount (risk 9); drawn only in part:
 `native-gop-display-cursor=2`; the desktop at about 10 frames a second: `native-gop-display-defer=1`, then `=0` (risk 10), each
 added to `PIANO_EXTRA_ARGS`.
+
+## 5b. The panel before WindowServer's first frame: the bluish verbose boot (2026-11-12)
+
+**What was seen.** The owner, at the tablet, during a `-v` boot (run `chg-l1`, `logs/usb-console/20261112-092748`): the scrolling
+kernel text is correctly landscape, but the background is clearly bluish instead of black, with horizontal and vertical lines. The
+Mac's webcam at 09:29:31, about 80 s after XNU started, shows the same thing: the text in the left part of the panel, the rest dark
+blue, and fine vertical stripes over the whole width the long log lines once reached. Its log puts that frame between
+`framebuffer cleared` (09:28:23, 12 s after XNU started) and WindowServer's `first frame` (09:30:22). Where the blue starts, from
+the webcam every 2 s through the next `-v` run (`au3`, `20261112-115443`): ABL's FASTBOOT on black (11:54:46), the UEFI logo on
+black with DarwinBoot's text at the top left (11:54:58), the UniXNU menu on near-black (11:55:06), XNU's verbose text white on
+**black** (11:55:08, 11:55:10), the same console on **blue** with the lattice of lines from 11:55:12 on, until the login window
+(11:57:57; `first frame` 11:57:19). The USB console's first burst (its lines arrive from 11:55:18) has `NativeGopDisplay: start`
+and `framebuffer cleared` as its lines 105-108: the one write to the whole panel in that window is the driver's fill. Non-verbose
+runs show the same fill without text: `desk-diag` (`20261112-093853`, every 15 s): dark at 09:39:37, the whole panel a uniform
+dark blue at 09:39:56 and 09:40:10, dark again at 09:40:27 (WindowServer's first frame, `thumb frame 1 ... mean #000000`), then
+the login window; `gfx-ctl` (10:54, every 2 s): the UEFI logo on black, then 40 s of uniform blue with only XNU's small progress
+mark at the bottom centre (drawn over the fill), black, the login window. The login window's frame data is neutral grey
+(`desk-diag`'s `thumb frame 189 ... mean #909090`, the lock screen's `#a6a5a5` in `chg-l1`), so nothing tints WindowServer's frames:
+the light boxes behind the clock and the avatar are WindowServer's own drawing ([gpu-userspace.md](gpu-userspace.md), the login
+window's materials), not the display path. No one logged in during these runs, so the desktop was not seen; its frames take
+the same copy (inference: no tint and no lines there either, since the fill is gone at WindowServer's first frame).
+
+**The cause (evidence).** `start()` filled the whole boot framebuffer with `0xff203050` (R 0x20, G 0x30, B 0x50: dark blue-grey),
+a bring-up aid that showed the mapping reaches the panel, while the boot console keeps drawing until WindowServer's first frame
+(risk 8). XNU's text console (`osfmk/console/video_console.c` of the k27 tree) clears the panel to black once, when it starts
+(`gc_enable`: `vc_clear_screen`), and from then on writes only what changes. A new character is painted whole, but a line feed on
+the last row repaints only the cells whose character changed (`gc_scroll_up` compares its character buffer row by row), and in
+those only the pixels where the new glyph differs from the old one (`vc_paint_char_32`, `val != *theCharPrevious`). So the fill
+stays wherever no glyph pixel ever changed (all of the panel right of the text, and the blank part of every glyph cell), and every
+stroke that scrolls away writes a black pixel into it. Glyphs share their stems and bars, so those black pixels line up into
+vertical lines every 8 pixels and horizontal lines every 16: the lines the owner saw. Replaying the `chg-l1` console log through
+these rules on a 3200x2136 buffer reproduces the photo (dark blue, text, a lattice of fine black lines over the columns the long
+lines reached); without the fill the same replay is white text on black. Non-verbose boots had no lines, only the blue screen
+between the driver's start and WindowServer's first frame (under a minute in `desk-diag`; `chg-l1`'s text phase on blue lasted two).
+
+Ruled out on the way: the pixel format and stride (SimpleFbDxe reports `PixelBlueGreenRedReserved8BitPerColor` with
+`PixelsPerScanLine` = 3200, DarwinBoot accepts only that format and passes `row 12800 depth 32 display 1`, XNU's
+`v_pixelFormat` is `BBBBBBBBGGGGGGGGRRRRRRRR`, and the console's black cells are black on the panel); a DPU layer or border colour
+(no image of these runs set a `piano-dpu*` argument, so no DPU register is written); the UniXNU menu (its background is `#0B0C0F`,
+and the text console clears the panel at its start anyway); DarwinBoot (console text and a green bar over the top 1/16 before XNU,
+no blue).
+
+**The fix** (`GopCompose.h` `startPlan`, host-tested): with XNU's text console (`-v`, `vc-text`, or a boot framebuffer without a
+graphics mode: `PE_create_console`'s own rule, `textConsole`), `start()` leaves the framebuffer as the console drew it (log line
+`framebuffer left to the boot console's text (-v) until WindowServer's first frame`). Otherwise it clears it to black
+(`framebuffer cleared to black`): the graphics boot then goes from DarwinBoot's last picture to black to the login window, with no
+blue phase. A black fill under `-v` would be wrong too: it erases the text on the screen, and the console, which redraws only what
+changes, leaves strokes missing until their cells change. `native-gop-display-fill=0xRRGGBB` paints a colour on purpose (`0x203050`
+for the old check that the mapping reaches the panel); `native-gop-display-bars=1` still wins over everything. The host tests
+(`testStartFill`) check the rule's table and run a model of the console's painting rules (synthetic font, twenty screens of log):
+the kept framebuffer equals the console's text at every point; the old fill leaves about 60% of the panel blue with about 30% black
+stroke pixels (the bug, reproduced); a black fill leaves missing strokes just after it.
+
+**To verify** (webcam, nothing else needed): a `-v` image with this driver shows white text on black during the whole text phase
+(no blue, no lines) and then the login window; the console has `framebuffer left to the boot console's text (-v) ...` in place of
+`framebuffer cleared`. A `PIANO_FAST_BOOT=1` image (no `-v`) shows no blue screen before the login; its line is
+`framebuffer cleared to black`. The two images of 2026-11-12 (`gop-v`, `gop-quiet`; the A830 seed of `out/turnip-a830/stage`):
+
+```sh
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=300 \
+PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-power=1" tooling/k27/build-native-image.sh   # gop-v
+PIANO_FAST_BOOT=1 PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=300 \
+PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-power=1" tooling/k27/build-native-image.sh   # gop-quiet
+```
 
 ## 6. Risks
 
@@ -345,8 +415,8 @@ added to `PIANO_EXTRA_ARGS`.
 7. **No power control.** "display off" stops nothing on the panel. There is no DPMS (display.md, later); with `piano-backlight=2` the
    display power goes to PianoBacklight, which turns the backlight off and on (backlight.md); with `piano-dpu-panel=1` also to
    PianoDpu, which puts the panel to sleep and stops the DPU's timing engines (dpu.md §4.5, not run yet).
-8. The boot console keeps drawing over the solid colour until WindowServer's first frame
-   (`PE_initialize_console(kPEDisableScreen)`).
+8. The boot console keeps drawing until WindowServer's first frame (`PE_initialize_console(kPEDisableScreen)`). Since 2026-11-12
+   nothing is painted under a verbose boot's console (§5b).
 9. **The cursor's place** (§5a). The origin words come from AppleParavirtDisplay's code, and their meaning (where the surface's pixel
    (0, 0) goes) from the arithmetic there (hot spot + words = the host's hot-spot position). Should the pointer be drawn off from
    where clicks land by its hot spot, the `cursor: ... hot spot (HX, HY) ...` line gives the offset to correct; should it be drawn
