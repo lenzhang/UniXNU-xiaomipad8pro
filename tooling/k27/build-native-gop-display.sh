@@ -18,9 +18,31 @@ mkdir -p "$O/host-tests"
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/gop_host.cpp" -o "$O/host-tests/gop_host"
 "$O/host-tests/gop_host" || { echo "Error: NativeGopDisplay host tests failed" >&2; exit 1; }
 CACHE=$D/out/k27/iomfb-abi/$(shasum -a 256 "$KC_BASE" | cut -c1-16)
-if [ ! -f "$CACHE/IOMobileFramebufferABI.h" ]; then
+# The family layout the driver's offsets are for (NativeGopDisplay.cpp NATIVE_GOP_IOMFB_ABI): 1, the 27.0.1 vma2 collection's;
+# 2, the 27.3 mac17j collection's (IOMobileFramebufferLegacy 9120 bytes, IOMFBSwapIORequest 4056; tooling/k273/diff-field-offsets.py).
+# A collection without AppleParavirtDisplay (a Mac's: no IOMobileFramebufferLegacy subclass names the pure virtual slots) takes the
+# declarations generated from IOMFB_ABI_REFERENCE_KC (default the k27 tree's kc27.bin) once tooling/k273/check-family-abi.py has
+# found the classes' vtables the same there, with the target's instance size.
+if [ ! -f "$CACHE/IOMobileFramebufferABI.h" ] || [ ! -f "$CACHE/abi" ]; then
   mkdir -p "$CACHE"
-  python3 "$K/scripts/gen-iomfb-abi.py" "$KC_BASE" "$CACHE/IOMobileFramebufferABI.h.tmp" && mv "$CACHE/IOMobileFramebufferABI.h.tmp" "$CACHE/IOMobileFramebufferABI.h"
+  if python3 "$K/scripts/kc-vtable.py" "$KC_BASE" AppleParavirtDisplay > /dev/null 2>&1; then
+    python3 "$K/scripts/gen-iomfb-abi.py" "$KC_BASE" "$CACHE/IOMobileFramebufferABI.h.tmp" && mv "$CACHE/IOMobileFramebufferABI.h.tmp" "$CACHE/IOMobileFramebufferABI.h"
+    echo 1 > "$CACHE/abi"
+  else
+    REF=${IOMFB_ABI_REFERENCE_KC:-$K/out/kc/kc27.bin}
+    python3 "$D/tooling/k273/check-family-abi.py" --vtables-only "$REF" "$KC_BASE" IOMobileFramebuffer@com.apple.iokit.IOMobileGraphicsFamily \
+      IOMobileFramebufferLegacy@com.apple.iokit.IOMobileGraphicsFamily IOMFBSwapIORequest@com.apple.iokit.IOMobileGraphicsFamily > "$CACHE/abi-check.txt" \
+      || { cat "$CACHE/abi-check.txt" >&2; echo "Error: the IOMobileFramebuffer vtables of $KC_BASE are not $REF's" >&2; exit 1; }
+    SIZES=$(awk '$1 == "size" {printf "%s:%s:%s ", $2, $3, $4}' "$CACHE/abi-check.txt")
+    case " $SIZES " in
+      *" IOMobileFramebuffer:144:144 IOMobileFramebufferLegacy:7640:9120 IOMFBSwapIORequest:3400:4056 "*) ABI=2 ;;
+      *) echo "Error: no NativeGopDisplay offsets for this IOMobileGraphicsFamily layout ($SIZES)" >&2; exit 1 ;;
+    esac
+    python3 "$K/scripts/gen-iomfb-abi.py" "$REF" "$CACHE/IOMobileFramebufferABI.h.ref"
+    sed -e 's/0x1dd8/0x23a0/g' "$CACHE/IOMobileFramebufferABI.h.ref" > "$CACHE/IOMobileFramebufferABI.h"
+    grep -q 'sizeof(IOMobileFramebufferLegacy) == 0x23a0' "$CACHE/IOMobileFramebufferABI.h" || { echo "Error: instance size not replaced" >&2; exit 1; }
+    echo $ABI > "$CACHE/abi"
+  fi
 fi
 python3 "$D/tooling/k27/build-native-kext.py" NativeGopDisplay "$D/package/NativeGopDisplay/NativeGopDisplay.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
-  -I "$CACHE" --obj "${K27_OBJ:-k27-native-obj}"
+  -I "$CACHE" -D "NATIVE_GOP_IOMFB_ABI=$(cat "$CACHE/abi")" --obj "${K27_OBJ:-k27-native-obj}"

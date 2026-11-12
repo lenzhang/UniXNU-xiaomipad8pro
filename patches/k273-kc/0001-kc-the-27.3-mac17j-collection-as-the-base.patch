@@ -1,0 +1,124 @@
+diff --git a/k27/kc-build273-piano.py b/k27/kc-build273-piano.py
+new file mode 100644
+index 0000000..a097f5b
+--- /dev/null
++++ b/k27/kc-build273-piano.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++"""scripts/kc-build.py for the macOS 27 kernelcache: same arguments (KC KERNEL OUTPUT --keep ... --native ...), with kc27's layout.
++
++The top-level segment starts come from k27/segaddrs.json (k27/kc27-layout.py, the layout the kernel was linked with).
++"""
++import importlib.util
++import json
++import os
++import sys
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++spec = importlib.util.spec_from_file_location('kc_build', HERE.parent / 'scripts/kc-build.py')
++source = spec.loader.get_data(spec.origin).decode()
++source = source[:source.rindex('\nmain()')]          # the module without its trailing main() call
++module = importlib.util.module_from_spec(spec)
++sys.modules['kc_build'] = module
++sys.path.insert(0, str(HERE.parent / 'scripts'))
++exec(compile(source, spec.origin, 'exec'), module.__dict__)
++
++layout = json.loads(Path(os.environ.get('KC_SEGADDRS_JSON', HERE / 'segaddrs.json')).read_text())
++module.DATA_CONST_START = layout['DATA_CONST_START']
++module.DATA_START = layout['DATA_START']
++# No kept kext's bytes are patched: Sandbox's Data volume prefix (/System/Volumes/Data) was rewritten to /private/var/.data until
++# the root's writable entries became real firmlinks (kern_exec.c native_owner_firmlinks_prepare).
++# AMFI's only reference to PAGE_SHIFT_CONST (its GOT slot, used by CoreEntitlements' CEElementIterate alone) goes to the kernel's
++# k27_amfi_page_shift (31): that check fails when sp is within 0x80 of a page start, a fixed outcome on a fixed call chain over page
++# aligned kernel stacks, and with our kernel's frames every spawn's entitlement dictionary copy failed ("failed to create OSDictionary
++# copy: 14" panic). The kext's bytes stay as shipped.
++# The slot is the second of AMFI's __DATA_CONST,__got in the 27.2 vma2 kernelcache (0xfffffe0007b439c8 in 27.0.1's).
++# The slot is found by its target (Apple's _PAGE_SHIFT_CONST) in AMFI's segments, so any base collection works: 0xfffffe0007b439c8 in
++# 27.0.1's vma2 collection, 0xfffffe00081d4630 in 27.3's mac17j one (the second slot of AMFI's __DATA_CONST,__got in both).
++def amfi_page_shift_slot(path):
++    kc = module.fileset_kc.Kernelcache(Path(path).read_bytes())
++    old = kc.macho('com.apple.kernel')
++    shift_const = {value for name, kind, sect, desc, value in kc.symbols(old) if name == '_PAGE_SHIFT_CONST'}
++    amfi = [(s['va'], s['va'] + s['size']) for s in kc.macho('com.apple.driver.AppleMobileFileIntegrity')['segments']
++            if s['size'] and s['name'] != '__LINKEDIT']
++    sites = [site for site, value, target, *_ in kc.chained_sites() if target in shift_const and any(a <= site < b for a, b in amfi)]
++    if len(sites) != 1:
++        raise SystemExit(f'AMFI has {len(sites)} pointers to _PAGE_SHIFT_CONST, expected one')
++    print(f'AMFI _PAGE_SHIFT_CONST slot {sites[0]:#x} -> _k27_amfi_page_shift')
++    return sites[0]
++
++
++module.KEPT_POINTER_REBINDS = [(amfi_page_shift_slot([a for a in sys.argv[1:] if not a.startswith('-')][0]), '_k27_amfi_page_shift')]
++
++# Symbols of the native kexts as linked (for k27/sym.py), next to the output: OUTPUT.natives.json {symbol: address}.
++natives = {}
++link = module.kc_native.link
++
++
++def recording_link(*args, **kwargs):
++    linked = link(*args, **kwargs)
++    natives.update(linked['symbols'])
++    return linked
++
++
++module.kc_native.link = recording_link
++module.main()
++output = Path([a for a in sys.argv[1:] if not a.startswith('-')][2])
++output.with_suffix('.natives.json').write_text(json.dumps(natives))
+diff --git a/k27/kc27-layout.py b/k27/kc27-layout.py
+index f186423..cbfff7b 100755
+--- a/k27/kc27-layout.py
++++ b/k27/kc27-layout.py
+@@ -62,6 +62,8 @@ def main():
+     p.add_argument('kc', nargs='?', default=str(ROOT / 'out/kc/kc27.bin'))
+     p.add_argument('kernel', nargs='?', default=str(ROOT / 'out/x12377/kernel12377e-osx-kc.macho'))
+     p.add_argument('--write')
++    # The native kexts' descriptors whose libraries may be kept (UniXNU-piano: out/k27/kext or tooling/k27/kext), else overlay/kext.
++    p.add_argument('--natives', default=str(ROOT / 'overlay/kext'))
+     a = p.parse_args()
+     kc = fileset_kc.Kernelcache(Path(a.kc).read_bytes())
+     base = kc.base
+@@ -74,7 +76,7 @@ def main():
+     by_id = {e['CFBundleIdentifier']: e for e in info}
+     roots = (ROOT / 'configs/kc-keep.txt').read_text().split()
+     stand_ins = set()
+-    for spec in (ROOT / 'overlay/kext').glob('*.json'):
++    for spec in Path(a.natives).glob('*.json'):
+         j = json.loads(spec.read_text())
+         roots += list(j.get('libraries', {}))
+         stand_ins |= set(j.get('stands_in_for', []))
+@@ -109,7 +111,9 @@ def main():
+     empties = ['__PRELINK_DATA', '__PRELINK_INFO', '__PLK_TEXT_EXEC', '__PLK_DATA_CONST', '__PLK_LLVM_COV', '__PLK_LINKEDIT']
+ 
+     bad = False
+-    checks = [('__TEXT', top['__PRELINK_TEXT']), ('__DATA_CONST', top['__DATA_CONST']), ('__LASTDATA_CONST', top['__DATA_CONST']),
++    # A KC whose header takes more than a page (the 27.3 mac17j collection: 0x8000) leaves its second page to the kernel's __TEXT:
++    # kc-build writes a one-page header.
++    checks = [('__TEXT', (0x4000, top['__PRELINK_TEXT'][1])), ('__DATA_CONST', top['__DATA_CONST']), ('__LASTDATA_CONST', top['__DATA_CONST']),
+               ('__TEXT_EXEC', top['__TEXT_EXEC']), ('__KLD', top['__TEXT_EXEC']), ('__LAST', top['__TEXT_EXEC']),
+               ('__KLDDATA', (top['__PRELINK_INFO'][0], top['__DATA'][1])), ('__DATA', (top['__PRELINK_INFO'][0], top['__DATA'][1])),
+               ('__BOOTDATA', top['__DATA'])]
+diff --git a/scripts/kc-build.py b/scripts/kc-build.py
+index 9d6d035..6b0f7e8 100644
+--- a/scripts/kc-build.py
++++ b/scripts/kc-build.py
+@@ -495,6 +495,18 @@ def build(args):
+             name = cstr(raw[8:24])
+             if name == '__LINKEDIT':
+                 raw = segment_command(name, NEW_BASE + linkedit_start, linkedit_end - linkedit_start, linkedit_start, linkedit_end - linkedit_start, raw)
++            elif name not in layout:
++                # A top-level segment that only Apple's kernel and dropped kexts use (the 27.3 mac17j collection's __DATA_SPTM and
++                # __TEXT_BOOT_EXEC, SPTM kernel parts): left out, once it is clear that nothing kept or linked lies in it.
++                low, high = struct.unpack_from('<2Q', raw, 24)
++                high += low
++                inside = [n for n in keep for seg in kc.macho(n)['segments'] if seg['size'] and seg['name'] != '__LINKEDIT'
++                          and seg['va'] < high and low < seg['va'] + seg['size']]
++                inside += [seg['name'] for seg in placed if seg['va'] - shift < high and low < seg['va'] - shift + seg['size']]
++                if inside:
++                    raise SystemExit(f'top-level segment {name} is not rebuilt, but holds {sorted(set(inside))[:4]}')
++                print(f'top-level segment {name} ({low:#x}-{high:#x}) left out: nothing kept in it')
++                continue
+             else:
+                 start, size = layout[name]
+                 raw = segment_command(name, NEW_BASE + start, size, start, size, raw)

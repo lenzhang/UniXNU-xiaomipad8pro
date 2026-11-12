@@ -56,6 +56,53 @@ extern "C" task_t kernel_task;
 // Every line of an instance names it: "NativeGopDisplay: " (the panel), "NativeGopDisplay-ext: " (D6's second display).
 #define GOPLOG(fmt, ...) IOLog("NativeGopDisplay%s: " fmt, logTag(), ##__VA_ARGS__)
 
+// NATIVE_GOP_IOMFB_ABI (tooling/k27/build-native-gop-display.sh, from the collection the kernel collection is built from):
+// 1 (the default), macOS 27.0.1's vma2 collection, the offsets below; 2, macOS 27.3's mac17j collection (the 27.3 line,
+// docs/k273-line.md), whose IOMobileGraphicsFamily is built for a Mac: IOMobileFramebufferLegacy is 9120 bytes (7640 in vma2) and
+// IOMFBSwapIORequest 4056 (3400), same vtables. Its offsets follow the #else: each is the one the family's own functions use where
+// vma2's use the 27.0.1 offset, instruction for instruction (tooling/k273/diff-field-offsets.py over the 1105 functions of the same
+// length in both, every offset unambiguous); the 27.0.1 offsets read from AppleParavirtDisplay's code alone keep their value where
+// the family's code shows them unchanged (the swap's rectangles, dirty region, the notify request, the IOAVElement).
+#ifndef NATIVE_GOP_IOMFB_ABI
+#define NATIVE_GOP_IOMFB_ABI 1
+#endif
+#if NATIVE_GOP_IOMFB_ABI == 2
+// IOMobileFramebufferLegacy (instance 0x23a0)
+static constexpr size_t kCurrentSwap = 8192;
+static constexpr size_t kSwapQueueFirst = 8200;
+static constexpr size_t kSwapQueueLast = 8208;
+static constexpr size_t kDisplayWidth = 8624;
+static constexpr size_t kDisplayHeight = 8628;
+static constexpr size_t kLastCompletedSwap = 8636;
+static constexpr size_t kSystemPowerState = 8652;
+static constexpr size_t kAPIPowerState = 8656;
+static constexpr size_t kHardwarePowered = 8660;
+// 27.0.1's kSwapInfoHeld (+7634) is AppleParavirtDisplay's own field in the family's tail padding (no family function touches it,
+// and a NativeGopDisplay never writes it: always 0 there); in 27.3's larger instance that place is the family's. Not read: never held.
+static constexpr size_t kSwapInfoTime = 264;
+static constexpr size_t kHardwareStarted = 140;
+// IOMFBSwapIORequest
+static constexpr size_t kSwapLayers = 1144;
+static constexpr size_t kSwapID = 1140;
+static constexpr size_t kSwapDropReasons = 1164;
+static constexpr size_t kSwapInfoA = 1072;
+static constexpr size_t kSwapInfoB = 1136;
+static constexpr size_t kSwapMainSurface = 3336;
+static constexpr unsigned kSwapLayerCount = gopcompose::kLayers;
+static constexpr size_t kSwapLayer1X = 97;
+static constexpr size_t kSwapLayer1Y = 101;
+static constexpr size_t kSwapDirtyRegion = 417;
+static constexpr size_t kSwapDirtyValid = 552;
+static constexpr size_t kSwapLayerSourceRect = 17;
+static constexpr size_t kSwapLayerDestRect = 81;
+static constexpr size_t kSwapNext = 4040;
+static constexpr size_t kSwapPrev = 4048;
+static constexpr size_t kNotifyAsyncReference = 24;
+static constexpr size_t kNotifyMask = 120;
+static constexpr size_t kNotifyLastTime = 128;
+static constexpr size_t kElementID = 16;
+static constexpr size_t kElementScore = 24;
+#else
 // macOS 27.0.1's (26A434, the k27 collection's) offsets, each read from AppleParavirtDisplay's code (provenance: UPSTREAM).
 // IOMobileFramebufferLegacy (instance 0x1dd8)
 static constexpr size_t kCurrentSwap = 6720;       // the swap being programmed
@@ -106,8 +153,20 @@ static constexpr size_t kNotifyLastTime = 128;        // the time of the previou
 // IOAVElement: the element ID and its score
 static constexpr size_t kElementID = 16;
 static constexpr size_t kElementScore = 24;
+#endif
 
 template <typename T> static T &at(void *base, size_t offset) {return *reinterpret_cast<T *>(static_cast<uint8_t *>(base) + offset);}
+
+// Swap info notifications held (27.0.1: the u16 at kSwapInfoHeld; 27.3: never, see above).
+static inline bool swapInfoHeld(void *display)
+{
+#if NATIVE_GOP_IOMFB_ABI == 2
+    (void) display;
+    return false;
+#else
+    return at<uint16_t>(display, kSwapInfoHeld) != 0;
+#endif
+}
 
 // Kernel interfaces of the collection's kexts with no header here.
 void iomfbUpdateSwapInfoState(IOMobileFramebufferLegacy *, IOMFBSwapIORequest *, uint32_t)
@@ -2501,7 +2560,7 @@ IOReturn NativeGopDisplay::notify_swap_done_gated(unsigned int swapID, ::SwapInf
         return kIOReturnUnsupported;
     SwapInfo *info = &fSwapInfo[fSwapInfoWrite];
     *info = {swapID, {at<uint64_t>(this, kSwapInfoTime), 0, at<uint64_t>(swap, kSwapInfoA), at<uint32_t>(swap, kSwapInfoB), 0}};
-    if (at<uint16_t>(this, kSwapInfoHeld)) {
+    if (swapInfoHeld(this)) {
         fSwapInfoWrite = (fSwapInfoWrite + 1) % kSwapInfoRing;
         return kIOReturnSuccess;
     }
