@@ -16,6 +16,11 @@ input and not a stale gauge: every native boot stops charging at about 40 s of u
 the battery at 0 mA once it runs. Built and host-tested, not run: the charging restart (0x2003 = 0 then 1, `piano-power-kick`, default
 on with the policy), the charge current of a trusted Rp (1500 mA), the steps measured against the firmware's own limit (0x2029) and a
 `charging:` balance line every report; images `ram-chg-kick` and `ram-chg-kick-idle` (§17.5).
+**2026-11-12 night (§19):** dev14 read the charger watchdog **off** (§18's hypothesis fails) and the charging enable command
+**on** (CHGR +0x42 = 0x05, bit 0 set, the command register in control) while the charger read disabled: neither disables it, and no
+driver of ours writes the charger blocks. Built and host-tested, not run: `piano-power-chgen` (default 1: the enable command set
+again when it reads off; 2: a 2 s pulse of it when it reads on and the charger disabled) and a `chgr: changed since` record of every
+register change between two reports, which the next boot that starts charging turns into the stop's exact register picture.
 
 ## 0. The answer
 
@@ -710,7 +715,7 @@ current, the percentage rising; `kick-idle` with more battery current than `kick
    the first write would say the stop is something the firmware prevents when it runs early, as under Linux.
 3. A wall charger (DCP or PD) instead of the Mac's port: whether a computer port is the condition.
 
-## 18. The charger watchdog (2026-11-12 evening; built, not run)
+## 18. The charger watchdog (2026-11-12 evening; run at dev14: not armed, §19)
 
 The hypothesis for §17.2's stop: the charger PMIC's BARK/BITE watchdog. In Qualcomm's SCHG charger family a host must pet a watchdog
 in the MISC block; its configuration can make a bite **disable charging** (input kept on), and the boot stages leave it armed. Natively
@@ -810,3 +815,116 @@ refused. Also under ASan/UBSan. A mutation (pet period twice the bark) fails eig
   AICL and power path status in the SMB5 layout); then §17.6 (a replug, an early DSP, a wall charger).
 - **Map wrong:** MISC's TYPE not 0x02 or no APID at 0x2c00: `no write: ...`; the block survey shows where TYPE 0x02 blocks are and
   which one holds a watchdog-like +0x51..+0x53.
+
+## 19. The charging enable command, and what dev14 rules out (2026-11-12 night; built, not run)
+
+Run: `dev14` (20:18, the desk-dev image with ChargerWdog.h, level 1, the Mac's port; its USB console log, local, and the boot line's
+tail from the tablet's unified log, where the console had cut it). **M** = measured, **I** = inferred, **F** = a register fact of
+PMI8998 (Linux's `qcom_smbx.c`, read for the facts only).
+
+### 19.1 What dev14 read
+
+| Register | Read (M) | Decode (F, its place on piano I) |
+|---|---|---|
+| MISC 0x2c00 +0x51, +0x53 | 0x00, 0x00 | the watchdog off, "a bite disables charging" clear: nothing to pet or clear |
+| CHGR 0x2600 +0x06 | 0x87 from the first report (0 s) to the last (210 s) | state 7, DISABLED |
+| CHGR +0x40, +0x41, +0x42 | 0x04, 0x45, **0x05** | +0x42 bit 0 set: the charging enable command is **on** |
+| CHGR +0x51, +0x52, +0x53 | **0x07**, 0x05, 0x02 | CHGR_CFG2 bits 7/6 clear: the **command register** decides (not the pin), active high; bit 2 AUTO_RECHG, bit 1 analog drop, bit 0 CHARGER_INHIBIT (Linux writes 0x01 on PMI8998) |
+| SID 7 0x2200-0x2d00 | every block mapped twice: APIDs 547-558 owner EE 3, 698-708 owner EE 0, the same bytes | EE 0 is this processor; EE 3 (I) the audio DSP's channel, whose charger firmware drives these blocks under Linux; EE 4 owns the regulators and the RTC (the AOP's) |
+
+The per-report `wdog:` line's `cmd 04 45 05` is +0x40, +0x41, +0x42: the 0x04 is +0x40, not the enable command. The boot line's own
+decode (`+0x42 enable command 0x05, +0x51 cfg2 0x07`) is in the tablet's unified log (`log show` with the predicate
+`eventMessage CONTAINS "PianoPower: wdog: as"` over desk-ssh, read only).
+
+### 19.2 What that rules out, and what is left
+
+- **Not the watchdog (M, one caveat).** Off as the boot stages left it. Caveat: dev14 started already disabled (below), so the stop
+  itself has not been watched with the new code; the boot stages run anew at every reset, and a watchdog they arm would read armed
+  in this boot as well, so it is very unlikely (I).
+- **Not the enable command (M + F).** It reads on, with the command register in control, while the charger reads disabled. In the
+  family's semantics the command asks for nothing more: the disable comes from another input of the charger's state machine. The
+  default-on rule of §19.3 (set the bit when it reads off) is a guard for the next boots, not the fix of dev14's state.
+- **Not our drivers (M).** Every SPMI write path in the repository: PianoPower (MISC +0x43/+0x53 only, gated; dev14 made none,
+  `pets 0, clears 0`; dev8n, dev13w and the v3 boots ran the read-only level 1 and stopped all the same); PianoDwc3 (the eUSB2 repeater
+  at SID 7 0xfd00, the SDAM restart reason at SID 0 0x7148 on request); PianoTorch (SID 1 0xee00); PianoThermal (the ADC SDAM at SID
+  0 0x9000, and not in the desk-dev images at all: no `PianoThermal:` line in dev13w or dev14, so its charger-thermistor hold is not
+  the writer); PianoBluetooth (a SID 5 GPIO); PianoWifi and PianoUsbHost read only. None writes SID 7 0x22xx-0x2fxx.
+- **The stop is one transition in several registers (M).** In the five boots of 11-12 that started charging (v3-first, v3-layer,
+  v3-boot2, dev13w, desk-dev1), between the 0/30 s and the 30/60 s reports, always together: CHGR +0x06 `c3`→`87`, +0x07 `19`→`00`,
+  +0x0a `00`→`05`, +0x0c `0a`/`14`→`00`, +0x0d `28`→`38`/`18`; CHGR rt `0x22`/`0x02`→`0x20`/`0`; 0x2800's rt bit 6 (`0x40`) → 0;
+  the Type-C block unchanged (attached, 3.0 A Rp). +0x0a is the one byte that is 0 while charging and set after: the best marker of
+  the reason. PMI8998's status map does not decode this generation (+0x07 `0x19` while charging would read "battery terminal missing,
+  too cold").
+- **It survives a warm reset (M).** dev8n, the second boot of dev13w and dev14 (each a few minutes after a boot that had stopped,
+  through ABL) started at `87`; v3-boot2's second boot, after a boot of 600 s and more, started charging (`c3`), as did 36 of the 46
+  level-1 boots of §17.2. So the latch is cleared by something the boot stages or time do, not by every reset (I).
+- **Who writes it (I).** Nothing of ours; the DSP does not run at level 1, so EE 3's channel is idle; what is left is the PMIC itself
+  (its charger state machine or a PBS sequence), acting on a condition this map does not name, at a fixed time (~40 s of XNU's uptime
+  whatever the load).
+
+### 19.3 The fix as built (`ChargerEnable.h`, PianoPower at both levels until the DSP runs, default on)
+
+`piano-power-chgen=1` (default; `=0` reads and logs only). With every report, after the watchdog's read, CHGR +0x42 is written with
+bit 0 set (the value read a moment before, every other bit kept), read back with the state byte, when all of these hold:
+
+- CHGR located (Type-C − 0x500), the EE 0 entry of its PPID (EE 3's mapping is named in the start line and never written), TYPE 0x02,
+  and +0x06..+0x0d, +0x40..+0x47, +0x50..+0x57 read;
+- CHGR_CFG2 bits 7 and 6 read 0 (the command register decides, active high);
+- the charger reads DISABLED (state 7) and the enable command's bit 0 reads 0;
+- a source on the port (Type-C attached, a source's Rp); the DSP not running (level 2: its firmware owns the enable from then);
+- both packs read, neither full (FC bit, 100 %), both below 4350 mV (the DSP firmware's 4400 mV float less 50; stock 4480 mV), both
+  15-45 °C;
+- at most five sets per boot.
+
+The next report judges it (`after the set at [N s]: ... CHARGING again`, `the charger left DISABLED` or `no change`). The allowlist
+(`ChargerEnable::allowed`): CHGR +0x42 alone, bit 0 alone, set from clear, through CHGR's own write channel page (mapped only when the
+gate passes; the watchdog's MISC page is the other). The float voltage, the currents, JEITA, the inhibit and every other bit stay.
+
+`piano-power-chgen=2` (opt-in) also **pulses** an enable that reads on while the charger reads disabled, under the same gates: bit 0
+cleared, 2 s on PianoPower's thread, set again (read back; retried every second until it reads set), at most three per boot, two
+minutes apart. It tests the one cheap hypothesis dev14 leaves: that an edge of the command restarts this charger's state machine.
+Its cost is a 2 s "off" of a charger that is not charging; a reset inside the 2 s leaves the command at 0, which the default rule sets
+at the next boot's first report.
+
+The record (every level and mode): each report compares CHGR's +0x06..+0x0d, rt, +0x40..+0x47, +0x50..+0x57 and MISC's +0x06..+0x0d,
+rt, +0x51, +0x53 with the previous report's and logs what changed; a change of the enable command that is not ours is named with its
+time window. Log lines (all `PianoPower: `; the `[60s]` ones as a boot that starts charging would read if the command were cleared):
+
+```
+chgen: piano-power-chgen=1 (set the enable command when it reads off); CHGR 0x2600 APID 702 (EE 0: the one written), also APID 551
+  (EE 3: the DSP's channel (inferred), never written); +0x42 0x05 (the enable command ON), +0x51 0x07 (the command decides, active
+  high, inhibit on)
+[60s] chgr: changed since [30s]: CHGR +06 c3>87 +07 19>00 +0a 00>05 +0c 0a>00 +0d 28>38 +10 22>20 +42 05>04
+[60s] chgen: the enable command went 0x05 -> 0x04 between [30s] and [60s], not by PianoPower; CHGR state 3 -> 7 (DISABLED); ...
+[60s] chgen: set: CHGR 0x2600 +0x42 0x04 -> 0x05 (bit 0, the charging enable command): ok, read back 0x05, state now 7 (DISABLED)
+[90s] chgen: after the set at [60s]: CHGR state 3 (full-on), +0x42 0x05, the packs +470 mA: CHARGING again
+[90s] charging: in ? (level 1: ...), battery +0 mA ...; not charging; CHGR state 7 (DISABLED), enable command 0x05, cfg2 0x07;
+  chgen: the enable command is on: the charger is disabled by something else; wdog pets 0, chgen sets 0, pulses 0     (dev14's state)
+```
+
+### 19.4 Tests (host)
+
+`power_host` `testChgEn`: dev14's complex (every block mapped for EE 3, then for EE 0) with a charger model (DISABLED while bit 0 is
+clear, charging after an edge unless stuck): the EE 0 APID chosen, EE 3's found and never written; dev14's state (0x05, 0x07,
+DISABLED): no write in ten minutes, the reason kept; a cleared command: one set (0x04 → 0x05, read back), judged at the next report,
+nothing else written; cleared again by another at 40 s: the 60 s report names the change, its window and the changed bytes, and
+sets it again; a clear that keeps coming: five sets, then none; each gate alone keeps the write out (the pin, bit 6, charging,
+terminated, EE 3, TYPE, off, the DSP, no source, one pack, the FC bit, 100 %, 4350 mV, 14.9 and 45.1 °C) and the limits themselves let
+it through; a set that does not read back, or is refused: failures, five at most; no writer: refused, nothing sent; `=2`: the pulse
+(0x05 → 0x04, 2 s, → 0x05) restarts the model, three pulses two minutes apart on a stuck one with the command never off for more than
+2 s, a refused second half retried every second until it goes through; `diffViews` on the stop's bytes. Also under ASan/UBSan. A
+mutation (no state gate) fails four checks.
+
+### 19.5 The next boots (pass / fail)
+
+`grep -aE 'PianoPower: (chgen|wdog|\[[0-9]+s\] (battery|charging|chgr|chgen|wdog))'`.
+
+- **A boot that starts charging** (after a long off time) answers what the stop is: its `chgr: changed since` line has every byte
+  that moved. +0x42 among them: something cleared the command (the line says not us), the default sets it again, and `CHARGING
+  again` is the fix (`no change`: the command is not the cause). +0x42 not among them: the reason is in the bytes that move (+0x0a
+  first).
+- **A boot that starts disabled** (dev14's state): the default writes nothing (`the enable command is on`); `piano-power-chgen=2`
+  tests the pulse: `pulse off ... ok`, `pulse on ... ok`, then `after the pulse: ... CHARGING again` (make it the default) or `no
+  change` three times (an edge does not restart it; next §17.6: a replug at the login window, an early DSP, a wall charger).
+- The desk-dev image's command line is 990 bytes against the limit of 1000: `piano-power-chgen=2` does not fit there and goes in an
+  image with a shorter line (e.g. `out/ram` of `tooling/k27/build-native-image.sh` with `PIANO_EXTRA_ARGS`).

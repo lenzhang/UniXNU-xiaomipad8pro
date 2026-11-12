@@ -692,3 +692,15 @@ analysis, the fix and its images: [charging-policy.md](charging-policy.md) §17.
 - **Fix built (not run):** the charging restart (0x2003 = 0, 5 s, 1, the charge current again; three per attach), 1500 mA under a
   trusted Rp, the steps against a settled 0x2029, the `charging:` line; images `ram-chg-kick` and `ram-chg-kick-idle`
   (charging-policy.md §17.5); if the restart does not help, the attended next steps of §17.6 (a replug, an early DSP, a wall charger).
+
+## Measured 2026-11-12 night (dev14: the watchdog and the enable command read)
+
+- **The watchdog is off (M):** MISC 0x2c00 `WD_CFG` 0x00 and +0x53 0x00 as the boot stages left them: no pet, no clear (`wdog: not
+  armed`). The hypothesis of the evening fails ([charging-policy.md](charging-policy.md) §19.2, with its one caveat).
+- **The enable command is on (M):** CHGR 0x2600 +0x42 = 0x05 (bit 0 set; the `cmd 04 45 05` of the `wdog:` line is +0x40..+0x42),
+  CHGR_CFG2 +0x51 = 0x07 (the command register in control, active high) while the state byte reads 0x87 (disabled) from the first
+  report: dev14 started disabled, a few minutes after a boot that had stopped, and so did dev8n and dev13w's second boot.
+- **Not ours (M):** no driver in this repository writes SID 7 0x22xx-0x2fxx, and the read-only level-1 boots stop all the same.
+- **Every charger block is mapped twice** in the arbiter, once for EE 3 (inferred: the DSP's channel) and once for EE 0 (ours).
+- **Built (not run):** `piano-power-chgen` (default: set the enable command when it reads off; `=2`: a 2 s pulse of it when it reads
+  on and the charger disabled) and the `chgr: changed since` record of every register change between two reports (§19.3-19.5).

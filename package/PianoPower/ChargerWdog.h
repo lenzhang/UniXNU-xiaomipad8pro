@@ -10,8 +10,8 @@
 //               interrupt, 2 the watchdog interrupt starts the safety timer, 1 the timer starts on a plug-in, 0 the timer is on;
 //         +0x53 SNARL_BARK_BITE_WD_CFG: bit 7 a bite disables charging, 6:4 snarl, 3:2 bark (16 s << n), 1:0 bite (1 s << n);
 //   CHGR  +0x06 BATTERY_CHARGER_STATUS_1, bits 2:0 the state: 0 trickle, 1 pre-charge, 2 fast, 3 full-on, 4 taper, 5 terminated,
-//               6 inhibited, 7 DISABLED; +0x42 bit 0 the charging enable command; +0x51 CHGR_CFG2 (bit 7 enable by command, bit 0
-//               inhibit).
+//               6 inhibited, 7 DISABLED; +0x42 bit 0 the charging enable command; +0x51 CHGR_CFG2 (bit 7 CHG_EN_SRC: 0 the command
+//               register decides, 1 the pin; bit 6 the pin's polarity; bit 0 inhibit). Written by ChargerEnable.h, not here.
 //   The blocks' places relative to each other: CHGR, DCDC +0x100, BATIF +0x200, USBIN +0x300, DCIN +0x400, Type-C +0x500, MISC
 //   +0x600 (Linux's MISC at CHGR + 0x600; PM8150B's Type-C at CHGR + 0x500).
 // On piano (PMIH010x, inferred, needs-boot): the Type-C block ChargerPmic.h finds at 0x2b00 is verified (attach, CC, Rp), so CHGR =
@@ -22,8 +22,8 @@
 // The gates before any write: MISC found at Type-C + 0x100, owned by EE 0 (this processor), TYPE 0x02, its configuration read; a pet
 // only while the watchdog reads armed (WD_CFG bit 0 or 1), the clear only while bit 7 of +0x53 is set and not after the DSP's
 // firmware has taken the charger (level 2). The clear is a read-modify-write of bit 7 alone, read back. Nothing else is written:
-// the float voltage, the charge and input currents, JEITA, the safety timer and the enable command stay the boot stages' (or the
-// DSP firmware's) values.
+// the float voltage, the charge and input currents, JEITA and the safety timer stay the boot stages' (or the DSP firmware's) values;
+// the enable command is ChargerEnable.h's (2026-11-12 dev14: this watchdog read off, WD_CFG 0x00 and +0x53 0x00).
 #ifndef PIANO_POWER_CHARGER_WDOG_H
 #define PIANO_POWER_CHARGER_WDOG_H
 #include <stdint.h>

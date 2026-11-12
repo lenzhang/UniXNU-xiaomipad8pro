@@ -12,6 +12,7 @@
 #include "SpmiObserver.h"
 #include "ChargerPmic.h"
 #include "ChargerWdog.h"
+#include "ChargerEnable.h"
 #include "Gauge.h"
 #include "RtcReadout.h"
 #include <algorithm>
@@ -397,6 +398,346 @@ static void testWdog()
     w.locate(io, arb, discoverCharger(io, arb));
     w.check(io, SpmiWriter{}, 5000, nullptr, nullptr);
     CHECK(p.writes.empty() && w.refused == 1 && w.petFailures == 1);
+  }
+}
+
+// --------------------------------------------------------------------------------- the charging enable command (ChargerEnable.h)
+// piano's charger complex as dev14 read it (2026-11-12): every charger block mapped twice, first for EE 3 (APIDs 547-558) and then
+// for EE 0 (698-708); CHGR 0x2600 +0x06 0x87 (DISABLED), +0x40..+0x42 04 45 05, +0x51..+0x53 07 05 02; MISC 0x2c00 with the watchdog
+// off. The charger model: with bit 0 of +0x42 clear the state is DISABLED; an edge 0 -> 1 starts charging (full-on) unless `stuck`
+// (the dev14 state: disabled whatever the command, an edge or not), or `edgeOnly` (disabled until an edge, which a set from 0 is too).
+struct ChgPmic {
+  Arb a;
+  int chgr = -1, chgr3 = -1, misc = -1, typec = -1;
+  struct W {int apid; uint8_t reg, value;};
+  std::vector<W> writes;
+  bool stuck = false, refuse = false, ignore = false;
+  explicit ChgPmic(uint8_t cmd = 0x05, uint8_t cfg2 = 0x07, uint8_t state = 0x87, uint32_t chgrOwner = 0, uint8_t chgrType = kSchgType)
+  {
+    a.add(7, 0x0100, 0x51, 0x56, 0);
+    for (uint16_t b = 0x2200; b <= 0x2d00; b += 0x100) {   // the EE 3 mappings first, as the arbiter lists them
+      const int i = a.add(7, b, 0x02, uint8_t(0xba + (b - 0x2200) / 0x100), 3);
+      if (b == 0x2600) chgr3 = i;
+    }
+    for (uint16_t b = 0x2200; b <= 0x2c00; b += 0x100) {
+      const int i = a.add(7, b, b == 0x2600 ? chgrType : 0x02, uint8_t(0xba + (b - 0x2200) / 0x100), b == 0x2600 ? chgrOwner : 0);
+      if (b == 0x2600) chgr = i;
+      if (b == 0x2b00) typec = i;
+      if (b == 0x2c00) misc = i;
+    }
+    for (int i : {chgr, chgr3}) {
+      uint8_t *r = a.apids[size_t(i)].regs;
+      r[0x06] = state;
+      r[0x07] = 0x00;
+      r[0x0a] = 0x05;
+      r[0x0b] = 0xbe;
+      r[0x40] = 0x04;
+      r[0x41] = 0x45;
+      r[kChgrEnableCmd] = cmd;
+      r[kChgrCfg2] = cfg2;
+      r[0x52] = 0x05;
+      r[0x53] = 0x02;
+    }
+  }
+  uint8_t &reg(uint8_t r) { return a.apids[size_t(chgr)].regs[r]; }
+  void mirror() { std::memcpy(a.apids[size_t(chgr3)].regs + 6, a.apids[size_t(chgr)].regs + 6, 250); }   // one PPID, one register file
+  static bool write(void *ctx, int apid, uint8_t r, uint8_t value, uint32_t *status)
+  {
+    ChgPmic *p = static_cast<ChgPmic *>(ctx);
+    p->writes.push_back({apid, r, value});
+    if (status) *status = p->refuse ? (kStatusDone | 0x4) : kStatusDone;
+    if (p->refuse) return false;
+    if (p->ignore || apid != p->chgr) return true;
+    const uint8_t was = p->reg(r);
+    p->reg(r) = value;
+    if (r == kChgrEnableCmd) {
+      if (!(value & kChgEnableBit)) p->reg(0x06) = 0x87;
+      else if (!(was & kChgEnableBit) && !p->stuck) p->reg(0x06) = 0xc3;   // an edge: charging (full-on)
+    }
+    p->mirror();
+    return true;
+  }
+  void clearByOther()   // someone else (the PMIC, another EE) clears the command: the charger stops
+  {
+    reg(kChgrEnableCmd) &= uint8_t(~kChgEnableBit);
+    reg(0x06) = 0x87;
+    mirror();
+  }
+  SpmiWriter writer() { return SpmiWriter{this, write}; }
+  unsigned count(int apid, uint8_t r, int value = -1) const
+  {
+    unsigned n = 0;
+    for (const W &w : writes) n += w.apid == apid && w.reg == r && (value < 0 || w.value == value);
+    return n;
+  }
+  bool onlyEnable() const
+  {
+    for (const W &w : writes)
+      if (w.apid != chgr || w.reg != kChgrEnableCmd) return false;
+    return true;
+  }
+};
+
+// The battery and the port as dev14's first report read them: 4267/4266 mV, 85/84 %, 29.9/28.5 C, a 3.0 A source on CC1.
+static ChgEnInputs dev14Inputs()
+{
+  ChgEnInputs in;
+  in.packsOk = true;
+  in.maxPackMv = 4267;
+  in.minDeciC = 285;
+  in.maxDeciC = 299;
+  in.maxSocPct = 85;
+  in.sourcePresent = true;
+  return in;
+}
+
+struct ChgRig {
+  ChgPmic &p;
+  Io io;
+  Arbiter arb;
+  ChargerWdog w;
+  ChargerEnable e;
+  explicit ChgRig(ChgPmic &pm, ChgEnMode mode = ChgEnMode::restore) : p(pm), io(pm.a.io()), arb(spmiArbiter(io))
+  {
+    w.mode = WdogMode::off;
+    w.locate(io, arb, discoverCharger(io, arb));
+    e.mode = mode;
+    e.locate(w);
+  }
+  // One report: the watchdog's read (no write: mode off), then the enable's check.
+  ChgEnResult report(uint64_t t, const ChgEnInputs &in = dev14Inputs(), char *diff = nullptr, unsigned n = 0)
+  {
+    const WdogView v = w.check(io, SpmiWriter{}, t, nullptr, nullptr);
+    return e.check(io, p.writer(), v, in, t, diff, n);
+  }
+  // The thread between reports: the pulse's second half when due, 500 ms steps.
+  void between(uint64_t from, uint64_t to)
+  {
+    for (uint64_t t = from; t < to; t += 500) e.restoreIfDue(io, p.writer(), t);
+  }
+};
+
+static void testChgEn()
+{
+  // The places: CHGR's EE 0 APID chosen and written, EE 3's mapping found and never written; the view decodes dev14's bytes.
+  {
+    ChgPmic p;
+    ChgRig r(p);
+    CHECK(r.e.located && r.e.chgr.address == 0x2600 && r.e.chgr.apid == p.chgr && r.e.chgr.owner == 0 && r.e.why[0] == 0);
+    const Apid other = otherMapping(r.io, r.arb, 0x2600, r.e.chgr.apid);
+    CHECK(other.apid == p.chgr3 && other.owner == 3);
+    CHECK(otherMapping(r.io, r.arb, 0x2c00, p.misc).apid >= 0 && otherMapping(r.io, r.arb, 0x2900, -1).apid >= 0);
+    const WdogView v = r.w.read(r.io);
+    CHECK(v.chgrCmdOk && v.chgrCfgOk && v.chgrCmd[0] == 0x04 && v.chgrCmd[1] == 0x45 && v.chgrCmd[2] == 0x05 && v.chgrCfg[1] == 0x07);
+    CHECK(v.state() == kChgrDisabled);
+    // the allowlist: +0x42 bit 0 alone, set from clear; a clear only in pulse mode; nothing else, CHGR's EE 0 APID only
+    CHECK(r.e.allowed(p.chgr, kChgrEnableCmd, 0x05, 0x04, false) && !r.e.allowed(p.chgr, kChgrEnableCmd, 0x07, 0x04, false));
+    CHECK(!r.e.allowed(p.chgr, kChgrEnableCmd, 0x05, 0x05, false) && !r.e.allowed(p.chgr, kChgrEnableCmd, 0x04, 0x05, true));
+    CHECK(!r.e.allowed(p.chgr3, kChgrEnableCmd, 0x05, 0x04, false) && !r.e.allowed(p.misc, kChgrEnableCmd, 0x05, 0x04, false));
+    CHECK(!r.e.allowed(p.chgr, kChgrCfg2, 0x07, 0x06, false) && !r.e.allowed(p.chgr, 0x70, 0x01, 0x00, false));
+    ChargerEnable pulse;
+    pulse.mode = ChgEnMode::pulse;
+    pulse.locate(r.w);
+    CHECK(pulse.allowed(p.chgr, kChgrEnableCmd, 0x04, 0x05, true) && !pulse.allowed(p.chgr, kChgrEnableCmd, 0x00, 0x05, true));
+    ChargerEnable off;
+    off.mode = ChgEnMode::off;
+    off.locate(r.w);
+    CHECK(!off.allowed(p.chgr, kChgrEnableCmd, 0x05, 0x04, false));
+  }
+
+  // dev14 as it was: the enable command already on (0x05), the command decides (cfg2 0x07), DISABLED: the default writes nothing and
+  // says why, report after report; nothing changed, nothing logged as changed.
+  {
+    ChgPmic p;
+    p.stuck = true;
+    ChgRig r(p);
+    for (uint64_t t = 0; t <= 600000; t += 30000) {
+      const ChgEnResult c = r.report(t);
+      CHECK(!c.write.done && std::strstr(c.why, "enable command is on") && !c.changed && !c.cmdCleared);
+    }
+    CHECK(p.writes.empty() && r.e.sets == 0 && r.e.refused == 0);
+  }
+
+  // The command cleared (0x04) with the command in control: the first report sets it (0x04 -> 0x05, read back), the model charges,
+  // the next report judges it; no other register written; once charging, nothing more.
+  {
+    ChgPmic p(0x04);
+    ChgRig r(p);
+    ChgEnResult c = r.report(0);
+    CHECK(c.write.done && c.write.ok && std::strcmp(c.write.what, "set") == 0 && c.write.before == 0x04 && c.write.value == 0x05);
+    CHECK(c.write.readBack && c.write.after == 0x05 && c.write.stateAfter == 3 && r.e.sets == 1 && c.why[0] == 0);
+    c = r.report(30000);
+    CHECK(c.judged && std::strcmp(c.judgedWhat, "set") == 0 && c.judgedWriteMs == 0 && !c.cmdSet && !c.cmdCleared);
+    char diff[400];
+    c = r.report(60000, dev14Inputs(), diff, sizeof diff);
+    CHECK(!c.changed && diff[0] == 0);
+    for (uint64_t t = 90000; t <= 600000; t += 30000) CHECK(!r.report(t).write.done);
+    CHECK(p.count(p.chgr, kChgrEnableCmd) == 1 && p.onlyEnable() && p.reg(kChgrEnableCmd) == 0x05 && r.e.sets == 1);
+    CHECK(p.a.apids[size_t(p.chgr3)].regs[kChgrEnableCmd] == 0x05);   // the same register seen through EE 3's mapping
+    CHECK(p.count(p.chgr3, kChgrEnableCmd) == 0);
+  }
+
+  // Someone else clears it at 40 s: the 60 s report names the change (0x05 -> 0x04 between [30 s] and [60 s], not ours), logs the
+  // changed bytes, and sets it again. A clear that keeps coming: five sets in all, then none.
+  {
+    ChgPmic p(0x04);
+    ChgRig r(p);
+    r.report(0);
+    r.report(30000);
+    p.clearByOther();
+    char diff[400];
+    ChgEnResult c = r.report(60000, dev14Inputs(), diff, sizeof diff);
+    CHECK(c.cmdCleared && c.cmdWas == 0x05 && c.cmdNow == 0x04 && c.sinceMs == 30000 && c.stateWas == 3 && c.changed);
+    CHECK(std::strstr(diff, "CHGR +06 c3>87") && std::strstr(diff, "+42 05>04") && !std::strstr(diff, "MISC"));
+    CHECK(c.write.done && c.write.ok && r.e.sets == 2 && r.e.clearedByOthers == 1);
+    for (uint64_t t = 90000; t <= 900000; t += 30000) {
+      p.clearByOther();
+      r.report(t);
+    }
+    CHECK(r.e.sets == kChgEnMaxSets && p.count(p.chgr, kChgrEnableCmd) == kChgEnMaxSets && p.onlyEnable());
+    CHECK(std::strstr(r.report(930000).why, "five sets"));
+  }
+
+  // The gates: each one alone keeps the write out.
+  {
+    struct Case { const char *name; uint8_t cmd, cfg2, state; uint32_t owner; uint8_t type; ChgEnMode mode; void (*edit)(ChgEnInputs &);
+                  const char *why; };
+    const Case cases[] = {
+        {"pin", 0x04, 0x87, 0x87, 0, kSchgType, ChgEnMode::restore, nullptr, "pin's"},
+        {"polarity", 0x04, 0x47, 0x87, 0, kSchgType, ChgEnMode::restore, nullptr, "bit 6"},
+        {"charging", 0x04, 0x07, 0xc3, 0, kSchgType, ChgEnMode::restore, nullptr, ""},
+        {"terminated", 0x04, 0x07, 0x85, 0, kSchgType, ChgEnMode::restore, nullptr, ""},
+        {"EE 3", 0x04, 0x07, 0x87, 3, kSchgType, ChgEnMode::restore, nullptr, "another EE"},
+        {"type", 0x04, 0x07, 0x87, 0, 0x05, ChgEnMode::restore, nullptr, "TYPE"},
+        {"off", 0x04, 0x07, 0x87, 0, kSchgType, ChgEnMode::off, nullptr, "read only"},
+        {"dsp", 0x04, 0x07, 0x87, 0, kSchgType, ChgEnMode::restore, [](ChgEnInputs &i) { i.dspOwns = true; }, "DSP"},
+        {"no source", 0x04, 0x07, 0x87, 0, kSchgType, ChgEnMode::restore, [](ChgEnInputs &i) { i.sourcePresent = false; }, "source"},
+        {"one pack", 0x04, 0x07, 0x87, 0, kSchgType, ChgEnMode::restore, [](ChgEnInputs &i) { i.packsOk = false; }, "both"},
+        {"full bit", 0x04, 0x07, 0x87, 0, kSchgType, ChgEnMode::restore, [](ChgEnInputs &i) { i.anyFull = true; }, "full"},
+        {"100 %", 0x04, 0x07, 0x87, 0, kSchgType, ChgEnMode::restore, [](ChgEnInputs &i) { i.maxSocPct = 100; }, "full"},
+        {"float", 0x04, 0x07, 0x87, 0, kSchgType, ChgEnMode::restore, [](ChgEnInputs &i) { i.maxPackMv = 4350; }, "4350"},
+        {"cold", 0x04, 0x07, 0x87, 0, kSchgType, ChgEnMode::restore, [](ChgEnInputs &i) { i.minDeciC = 149; }, "15-45"},
+        {"hot", 0x04, 0x07, 0x87, 0, kSchgType, ChgEnMode::restore, [](ChgEnInputs &i) { i.maxDeciC = 451; }, "15-45"},
+    };
+    for (const Case &k : cases) {
+      ChgPmic p(k.cmd, k.cfg2, k.state, k.owner, k.type);
+      ChgRig r(p, k.mode);
+      ChgEnInputs in = dev14Inputs();
+      if (k.edit) k.edit(in);
+      const ChgEnResult c = r.report(0, in);
+      const bool ok = !c.write.done && p.writes.empty() && (k.why[0] ? std::strstr(c.why, k.why) != nullptr : c.why[0] == 0);
+      if (!ok) std::fprintf(stderr, "chgen gate case %s: why \"%s\"\n", k.name, c.why);
+      CHECK(ok);
+    }
+    // the limits themselves are inside: 4349 mV, 15.0 and 45.0 C, 99 %
+    ChgPmic p(0x04);
+    ChgRig r(p);
+    ChgEnInputs in = dev14Inputs();
+    in.maxPackMv = 4349;
+    in.minDeciC = 150;
+    in.maxDeciC = 450;
+    in.maxSocPct = 99;
+    CHECK(r.report(0, in).write.ok);
+  }
+
+  // A set that does not read back (the register ignores it): a failure, tried with each report, five in all; the channel's refusal
+  // alike; no writer: refused and counted, nothing sent.
+  {
+    ChgPmic p(0x04);
+    p.ignore = true;
+    ChgRig r(p);
+    for (uint64_t t = 0; t <= 300000; t += 30000) r.report(t);
+    CHECK(r.e.setFailures == kChgEnMaxSets && r.e.sets == 0 && p.count(p.chgr, kChgrEnableCmd) == kChgEnMaxSets);
+  }
+  {
+    ChgPmic p(0x04);
+    p.refuse = true;
+    ChgRig r(p);
+    const ChgEnResult c = r.report(0);
+    CHECK(c.write.done && !c.write.ok && (c.write.status & kStatusErrors) && r.e.setFailures == 1);
+  }
+  {
+    ChgPmic p(0x04);
+    ChgRig r(p);
+    const WdogView v = r.w.check(r.io, SpmiWriter{}, 0, nullptr, nullptr);
+    const ChgEnResult c = r.e.check(r.io, SpmiWriter{}, v, dev14Inputs(), 0);
+    CHECK(c.write.done && !c.write.ok && r.e.refused == 1 && p.writes.empty());
+  }
+
+  // piano-power-chgen=2 on dev14's state with a charger that restarts on an edge: 0x05 -> 0x04, 2 s, 0x04 -> 0x05, charging; the
+  // next report judges it; no more pulses while it charges.
+  {
+    ChgPmic p;
+    ChgRig r(p, ChgEnMode::pulse);
+    ChgEnResult c = r.report(0);
+    CHECK(c.write.done && c.write.ok && std::strcmp(c.write.what, "pulse off") == 0 && c.write.before == 0x05 && c.write.value == 0x04);
+    CHECK(r.e.pulseOpen && r.e.nextDue() == kChgEnPulseHoldMs && p.reg(kChgrEnableCmd) == 0x04);
+    ChgEnWrite on;
+    CHECK(!r.e.restoreIfDue(r.io, p.writer(), 1500, &on));
+    CHECK(r.e.restoreIfDue(r.io, p.writer(), 2000, &on) && on.ok && on.before == 0x04 && on.value == 0x05 && on.stateAfter == 3);
+    CHECK(!r.e.pulseOpen && r.e.pulses == 1 && r.e.nextDue() == 0 && p.reg(kChgrEnableCmd) == 0x05);
+    c = r.report(30000);
+    CHECK(c.judged && std::strcmp(c.judgedWhat, "pulse") == 0 && !c.cmdSet && !c.cmdCleared && !c.write.done);
+    for (uint64_t t = 60000; t <= 600000; t += 30000) CHECK(!r.report(t).write.done);
+    CHECK(p.count(p.chgr, kChgrEnableCmd) == 2 && p.onlyEnable());
+  }
+
+  // A pulse on a stuck charger: three, two minutes apart, each ending at 0x05; then none more. The command never stays at 0x04
+  // past its 2 s.
+  {
+    ChgPmic p;
+    p.stuck = true;
+    ChgRig r(p, ChgEnMode::pulse);
+    bool low = false;
+    uint64_t lowAt = 0, longestLow = 0;
+    for (uint64_t t = 0; t <= 900000; t += 500) {
+      if (t % 30000 == 0) r.report(t);
+      r.e.restoreIfDue(r.io, p.writer(), t);
+      if (!(p.reg(kChgrEnableCmd) & 1)) {
+        if (!low) lowAt = t;
+        low = true;
+        if (t - lowAt > longestLow) longestLow = t - lowAt;
+      } else {
+        low = false;
+      }
+    }
+    CHECK(r.e.pulses == kChgEnMaxPulses && p.count(p.chgr, kChgrEnableCmd, 0x04) == kChgEnMaxPulses);
+    CHECK(p.count(p.chgr, kChgrEnableCmd, 0x05) == kChgEnMaxPulses && p.reg(kChgrEnableCmd) == 0x05 && longestLow <= kChgEnPulseHoldMs);
+    CHECK(std::strstr(r.report(930000).why, "three pulses"));
+  }
+
+  // The pulse's second half refused by the channel: tried again every second until it goes through.
+  {
+    ChgPmic p;
+    p.stuck = true;
+    ChgRig r(p, ChgEnMode::pulse);
+    r.report(0);
+    CHECK(r.e.pulseOpen);
+    p.refuse = true;
+    r.between(2000, 6000);
+    CHECK(r.e.pulseOpen && r.e.restoreTries == 4 && p.reg(kChgrEnableCmd) == 0x04);
+    p.refuse = false;
+    r.between(6000, 7000);
+    CHECK(!r.e.pulseOpen && p.reg(kChgrEnableCmd) == 0x05);
+    CHECK(!r.report(30000).write.done);   // a pulse two minutes after the last only
+  }
+
+  // diffViews: the stop as the v3-boot2 / dev13w reports read it, CHGR and MISC both.
+  {
+    WdogView a, b;
+    a.chgrOk = b.chgrOk = a.miscOk = b.miscOk = a.cfgOk = b.cfgOk = true;
+    const uint8_t before[8] = {0xc3, 0x19, 0x0a, 0x03, 0x00, 0xbe, 0x0a, 0x28}, after[8] = {0x87, 0x00, 0x0a, 0x03, 0x05, 0xbe, 0x00, 0x38};
+    std::memcpy(a.chgr, before, 8);
+    std::memcpy(b.chgr, after, 8);
+    a.chgrRt = 0x22;
+    b.chgrRt = 0x20;
+    b.timeouts = 0x80;
+    char out[200];
+    CHECK(diffViews(a, b, out, sizeof out) == 7);
+    CHECK(std::strcmp(out, "CHGR +06 c3>87 +07 19>00 +0a 00>05 +0c 0a>00 +0d 28>38 +10 22>20; MISC +53 00>80") == 0);
+    char tiny[12];
+    CHECK(diffViews(a, b, tiny, sizeof tiny) == 7 && std::strlen(tiny) == sizeof tiny - 1);
+    CHECK(diffViews(a, a, out, sizeof out) == 0 && out[0] == 0);
   }
 }
 
@@ -2087,6 +2428,7 @@ int main()
   testRtc();
   testCharger();
   testWdog();
+  testChgEn();
   testGauge();
   testMcaCodec();
   testMcaPolicy();

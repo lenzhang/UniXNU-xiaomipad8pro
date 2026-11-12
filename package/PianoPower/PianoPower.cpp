@@ -3,7 +3,7 @@
 //
 // The charger (the buck stage of the PMIH010x PMIC) belongs to the audio DSP's firmware; this processor reads it over SPMI and writes
 // only its watchdog (below). The DSP is not running when our UEFI hands over, and without it the PMIC charges on whatever configuration
-// the boot stages left. So there are two levels:
+// the boot stages left (this side also writes the charging enable command: ChargerEnable.h). So there are two levels:
 //   piano-power=1  Every 30 s one report on the console: the battery from its two fuel gauges (voltage, current, state of charge,
 //                  temperature), the USB-C port from the charger PMIC's Type-C block (attached, a source's Rp), the charger watchdog
 //                  and state, the DSP's state from SMEM. The DSP is not started; the only writes are the charger watchdog's (pet, and
@@ -19,7 +19,13 @@
 // BARK/BITE watchdog armed with "a bite disables charging", and nothing pets it natively: the charger stops at about 40 s of every
 // boot. piano-power-wdog=2 (default) pets it every quarter of its bark time (4-15 s) from this thread and clears that one bit (MISC
 // +0x53 bit 7, read-modify-write, read back), as Linux's SCHG host driver does; =1 pets only; =0 reads and logs only. Every write is
-// logged with its before/after values; the battery limits (float, currents, JEITA, safety timer, the enable) are not written.
+// logged with its before/after values; the battery limits (float, currents, JEITA, safety timer) are not written. 2026-11-12 dev14:
+// the watchdog read off (not armed) at a boot that started with the charger already disabled.
+// The charging enable command (ChargerEnable.h, charging-policy.md §19), at both levels until the DSP runs: piano-power-chgen=1
+// (default) sets CHGR +0x42 bit 0 again when it reads clear while CHGR_CFG2 says the command decides, the charger reads disabled, a
+// source is on the port and both packs are below 4350 mV, not full, 15-45 C (at most five a boot); =2 also pulses an enable that
+// reads on (bit 0 cleared 2 s, then set; three a boot, two minutes apart); =0 reads only. Every change of CHGR's and MISC's registers
+// between two reports is logged ("chgr: changed since"), and a change of the enable command that is not ours says so.
 // Further boot arguments: piano-power-period=S (report interval, default 30), piano-power-gauge=0 (no gauge reads),
 // piano-power-write=0 (level 2 without the charger writes: the DSP runs on its own defaults), piano-power-hv=1 (level 2 also asks a PD
 // source with a fixed 9 V PDO for 9 V and then allows 1.6 A), piano-power-fw=DIR (the DSP's images as DIR/adsp.mbn and
@@ -51,6 +57,7 @@
 #include "SpmiObserver.h"
 #include "ChargerPmic.h"
 #include "ChargerWdog.h"
+#include "ChargerEnable.h"
 #include "Gauge.h"
 #include "PianoBattery.h"
 #include "Servreg.h"
@@ -79,7 +86,7 @@ struct Args {
   uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor, board, ucsi;
   uint32_t policy, rp, health, healthStop, healthResume;
   uint32_t ramp, rpMax, writeMs, kick;
-  uint32_t wdog;
+  uint32_t wdog, chgen;
   bool hasRtcOffset;
   uint32_t rtcOffset;
 };
@@ -129,6 +136,11 @@ void readArgs()
   // and clear "a bite disables charging" (MISC +0x53 bit 7), as Linux's host driver for the SCHG family does
   gArgs.wdog = bootArg("piano-power-wdog", 2);
   if (gArgs.wdog > 2) gArgs.wdog = 2;
+  // the charging enable command (ChargerEnable.h, charging-policy.md §19): 0 read and log only, 1 (default) set CHGR +0x42 bit 0 when
+  // it reads clear with the charger disabled under command control (the battery below its limits, a source on the port), 2 also
+  // pulse an enable that reads on while the charger reads disabled (bit 0 cleared for 2 s, then set)
+  gArgs.chgen = bootArg("piano-power-chgen", 1);
+  if (gArgs.chgen > 2) gArgs.chgen = 2;
   gArgs.rtcOffset = 0;
   gArgs.hasRtcOffset = PE_parse_boot_argn("piano-rtc-offset", &gArgs.rtcOffset, sizeof gArgs.rtcOffset);
 }
@@ -190,21 +202,34 @@ void ioWr(void *, Window w, uint32_t offset, uint32_t value) { wr32(windowBase(w
 void ioDelay(void *, unsigned us) { IODelay(us); }
 const Io gIo = {nullptr, ioRd, ioWr, ioDelay};
 
-// The one write channel PianoPower maps: the charger MISC APID's (chnls 0x0C500000 + 0x1000 * APID, data +0x10, command +0x00 with
-// opcode 0, status +0x08: the arbiter v7 owner-channel write PianoDwc3 and PianoTorch make). ChargerWdog's allowlist decides what goes
-// through it; this only refuses another APID.
+// The two write channels PianoPower maps: the charger MISC APID's (the watchdog, ChargerWdog.h) and the CHGR APID's (the charging
+// enable command, ChargerEnable.h), each only when its gates pass (chnls 0x0C500000 + 0x1000 * APID, data +0x10, command +0x00 with
+// opcode 0, status +0x08: the arbiter v7 owner-channel write PianoDwc3 and PianoTorch make). The two classes' allowlists decide what
+// goes through; this only refuses an APID without a mapped channel.
 constexpr uint64_t kSpmiChnls = 0x0c500000;
 constexpr uint32_t kChnlStride = 0x1000, kChnlCmd = 0x00, kChnlStatus = 0x08, kChnlWdata0 = 0x10;
-Region gMiscChnl;
-int gMiscChnlApid = -1;
+struct Chnl {
+  Region page;
+  int apid;
+};
+Chnl gChnls[2] = {{{nullptr, 0}, -1}, {{nullptr, 0}, -1}};   // [0] MISC's, [1] CHGR's
+bool mapChnl(unsigned slot, int apid)
+{
+  if (slot >= 2 || apid < 0 || !mapRegion(gChnls[slot].page, kSpmiChnls + uint64_t(kChnlStride) * uint32_t(apid), 0x20)) return false;
+  gChnls[slot].apid = apid;
+  return true;
+}
 bool chnlWrite(void *, int apid, uint8_t reg, uint8_t value, uint32_t *status)
 {
-  if (apid < 0 || apid != gMiscChnlApid || !gMiscChnl.va) return false;
-  wr32(gMiscChnl.va + kChnlWdata0, value);
-  wr32(gMiscChnl.va + kChnlCmd, 0u << 27 | uint32_t(reg) << 4 | 0u);
+  const Chnl *c = nullptr;
+  for (const Chnl &k : gChnls)
+    if (apid >= 0 && k.apid == apid && k.page.va) c = &k;
+  if (!c) return false;
+  wr32(c->page.va + kChnlWdata0, value);
+  wr32(c->page.va + kChnlCmd, 0u << 27 | uint32_t(reg) << 4 | 0u);
   uint32_t st = 0;
   for (unsigned i = 0; i < 1000; ++i) {
-    st = rd32(gMiscChnl.va + kChnlStatus);
+    st = rd32(c->page.va + kChnlStatus);
     if (st & kStatusDone) break;
     IODelay(1);
   }
@@ -275,6 +300,7 @@ class PianoPower : public IOService {
   ChargerLayout fCharger;
   bool fSpmi = false;
   ChargerWdog fWdog;   // the charger's watchdog (ChargerWdog.h)
+  ChargerEnable fChgEn;   // the charging enable command (ChargerEnable.h)
   RtcReading fRtc;
   bool fRtcProbed = false;
   // gauges
@@ -305,6 +331,10 @@ class PianoPower : public IOService {
   void startWdog();
   void wdogWriteLine(const char *what, const WdogWrite &r);
   void wdogLine(char *line, size_t size, uint64_t t);
+  void startChgen(const WdogView &v);
+  void chgenWriteLine(uint64_t t, const ChgEnWrite &r);
+  void chgenStep(uint64_t t, const PortState *p, char *why, size_t whySize);
+  char fChgenWhy[96] = "";   // the last report's reason for no enable write while the charger read disabled
   void readRtcLine(char *line, size_t size);
   void surveyAdsp();
   void probeGauges();
@@ -377,8 +407,9 @@ bool PianoPower::start(IOService *provider)
   if (!IOService::start(provider)) return false;
   note("start: piano-power=%u period %u s, gauges %s; %s", gArgs.level, gArgs.period, gArgs.gauge ? "on" : "off",
        gArgs.level >= 2 ? "level 2: the DSP's charger firmware is started and its charger properties are managed"
-                        : gArgs.wdog ? "level 1: the DSP is not started; the only PMIC writes are the charger watchdog's (piano-power-wdog)"
-                                     : "level 1: read only (no PMIC register written, the DSP is not started)");
+                        : gArgs.wdog || gArgs.chgen ? "level 1: the DSP is not started; the only PMIC writes are the charger watchdog's "
+                                                      "(piano-power-wdog) and the charging enable command's (piano-power-chgen)"
+                                                    : "level 1: read only (no PMIC register written, the DSP is not started)");
   fPolicyOn = gArgs.level >= 2 && gArgs.policy != 0;
   if (gArgs.level >= 2 && !fPolicyOn)
     note("level 2 policy: %s%s", gArgs.write ? "input limit by charger type (<= 1.5 A at 5 V), charge current 1.0 A in 15-38 C"
@@ -553,6 +584,7 @@ void PianoPower::startWdog()
   fWdog.locate(gIo, fArbiter, fCharger);
   if (!fWdog.located) {
     note("wdog: %s", fWdog.why);
+    note("chgen: CHGR not located: no write");
     return;
   }
   const WdogBlock &m = fWdog.misc, &c = fWdog.chgr;
@@ -560,8 +592,7 @@ void PianoPower::startWdog()
        gArgs.wdog, wdogModeName(fWdog.mode), c.address, c.apid, c.owner, c.type, c.subtype, m.address, m.apid, m.owner, m.type,
        m.subtype, fWdog.why[0] ? ": no write: " : "", fWdog.why);
   if (!fWdog.why[0] && fWdog.mode != WdogMode::off) {
-    if (!mapRegion(gMiscChnl, kSpmiChnls + uint64_t(kChnlStride) * uint32_t(m.apid), 0x20)) note("wdog: MISC's write channel does not map: no write");
-    else gMiscChnlApid = m.apid;
+    if (!mapChnl(0, m.apid)) note("wdog: MISC's write channel does not map: no write");
   }
   const WdogView before = fWdog.read(gIo);
   if (before.cfgOk)
@@ -583,6 +614,79 @@ void PianoPower::startWdog()
     note("wdog: petting every %u ms from this thread (a quarter of the %u s bark time, 4-15 s)", fWdog.petMs, barkSeconds(fWdog.last.timeouts));
   else if (!fWdog.why[0] && fWdog.mode != WdogMode::off)
     note("wdog: not armed (WD_CFG bit 0/1 clear): no pet, no clear%s", fWdog.refused ? " (refused writes!)" : "");
+  startChgen(before);
+}
+
+// The charging enable command (ChargerEnable.h, charging-policy.md §19): CHGR from ChargerWdog's locate, its EE 0 APID the only one
+// written (its channel mapped only when the gate passes), the other mapping of the same PPID named; the decisions are the reports'.
+void PianoPower::startChgen(const WdogView &v)
+{
+  fChgEn.mode = ChgEnMode(gArgs.chgen);
+  fChgEn.locate(fWdog);
+  const WdogBlock &c = fChgEn.chgr;
+  const Apid other = fChgEn.located ? otherMapping(gIo, fArbiter, c.address, c.apid) : Apid();
+  if (!fChgEn.why[0] && fChgEn.mode != ChgEnMode::off && !mapChnl(1, c.apid)) {
+    note("chgen: CHGR's write channel does not map: no write");
+    fChgEn.mode = ChgEnMode::off;
+  }
+  const uint8_t cmd = v.chgrCmd[2], cfg2 = v.chgrCfg[1];
+  note("chgen: piano-power-chgen=%u (%s); CHGR %#06x APID %d (EE %u: the one written), %s APID %d (EE %u%s); +0x42 %#04x (the "
+       "enable command %s), +0x51 %#04x (%s, %s, inhibit %s)%s%s",
+       gArgs.chgen, chgEnModeName(fChgEn.mode), c.address, c.apid, c.owner, other.apid >= 0 ? "also" : "no other mapping:",
+       other.apid, other.owner, other.apid >= 0 && other.owner == 3 ? ": the DSP's channel (inferred), never written" : "", cmd,
+       !v.chgrCmdOk ? "not read" : cmd & kChgEnableBit ? "ON" : "OFF", cfg2, !v.chgrCfgOk ? "not read" : cfg2 & kChgEnSrcPin ? "the PIN decides" : "the command decides",
+       cfg2 & kChgEnPolarity ? "pin active low" : "active high", cfg2 & 1 ? "on" : "off", fChgEn.why[0] ? "; no write: " : "",
+       fChgEn.why);
+}
+
+void PianoPower::chgenWriteLine(uint64_t t, const ChgEnWrite &r)
+{
+  if (!r.done) return;
+  note("[%llus] chgen: %s: CHGR %#06x +0x42 %#04x -> %#04x (bit 0, the charging enable command): %s, read back %s%#04x, state now %u "
+       "(%s) (channel status %#x)%s",
+       t, r.what, fChgEn.chgr.address, r.before, r.value, r.ok ? "ok" : "FAILED", r.readBack ? "" : "not read, ", r.after,
+       r.stateAfter, chargerStateName(r.stateAfter), r.status, fChgEn.refused ? "; refused writes!" : "");
+}
+
+// With every report, after the watchdog's read: what changed in CHGR and MISC since the last report, who changed the enable command
+// (not us: ours are logged as they are made), then the decision. *why gets the reason no write was made (for the charging: line).
+void PianoPower::chgenStep(uint64_t t, const PortState *p, char *why, size_t whySize)
+{
+  if (why && whySize) why[0] = 0;
+  if (!fChgEn.located) return;
+  ChgEnInputs in;
+  in.packsOk = fPack[0].ok && fPack[1].ok;
+  for (unsigned i = 0; i < 2; ++i) {
+    const GaugeReading &g = fPack[i];
+    if (!g.ok) continue;
+    if (g.voltageMv > in.maxPackMv) in.maxPackMv = g.voltageMv;
+    if (g.socPct > in.maxSocPct) in.maxSocPct = g.socPct;
+    in.anyFull |= (g.status & kGaugeFc) != 0;
+    if (i == 0 || !fPack[0].ok || g.tempDeciC < in.minDeciC) in.minDeciC = g.tempDeciC;
+    if (i == 0 || !fPack[0].ok || g.tempDeciC > in.maxDeciC) in.maxDeciC = g.tempDeciC;
+  }
+  in.sourcePresent = p && p->ok && p->sourceSeen;
+  in.dspOwns = fWdog.dspOwns;
+  if (gArgs.level >= 2 && !in.dspOwns) {
+    PianoAdspStatus s;
+    piano_adsp_status(&s);
+    in.dspOwns = s.slave >= 0 && (s.slave & 2);
+  }
+  char diff[400];
+  const ChgEnResult r = fChgEn.check(gIo, gWriter, fWdog.last, in, nowMs(), diff, sizeof diff);
+  const uint64_t since = r.sinceMs > fStartMs ? (r.sinceMs - fStartMs) / 1000 : 0;
+  if (r.changed) note("[%llus] chgr: changed since [%llus]: %s", t, since, diff);
+  if (r.cmdCleared || r.cmdSet)
+    note("[%llus] chgen: the enable command went %#04x -> %#04x between [%llus] and [%llus], not by PianoPower; CHGR state %u -> %u (%s); %s",
+         t, r.cmdWas, r.cmdNow, since, t, r.stateWas, fWdog.last.state(), chargerStateName(fWdog.last.state()),
+         in.dspOwns ? "the DSP runs: its firmware, or the PMIC" : "the DSP is not running: the PMIC itself or another EE");
+  if (r.judged)
+    note("[%llus] chgen: after the %s at [%llus]: CHGR state %u (%s), +0x42 %#04x, the packs %+d mA: %s", t, r.judgedWhat,
+         r.judgedWriteMs > fStartMs ? (r.judgedWriteMs - fStartMs) / 1000 : 0, fWdog.last.state(), chargerStateName(fWdog.last.state()),
+         r.cmdNow, fBattery.currentMa, fBattery.currentMa >= 50 ? "CHARGING again"
+                                       : fWdog.last.state() != kChgrDisabled ? "the charger left DISABLED" : "no change");
+  chgenWriteLine(t, r.write);
+  if (why && whySize && r.why[0] && fWdog.last.state() == kChgrDisabled) strlcpy(why, r.why, whySize);
 }
 
 // "wdog: ..." with every report: the watchdog and charger state as read now and what the pets have done.
@@ -813,6 +917,7 @@ void PianoPower::report()
     char line[512];
     wdogLine(line, sizeof line, t);
     note("%s", line);
+    chgenStep(t, havePort && p.ok ? &p : nullptr, fChgenWhy, sizeof fChgenWhy);
   }
   if (gArgs.ps) publishBattery(t, havePort && p.ok ? &p : nullptr);
   if (gArgs.level >= 2) {
@@ -851,7 +956,7 @@ void PianoPower::report()
   } else {
     PianoAdspSurvey s;
     if (!piano_adsp_survey(&s)) note("[%llus] adsp: slave-kernel %d (not started at level 1)", t, s.slave);
-    char line[256];
+    char line[448];
     chargingLine(line, sizeof line);
     note("[%llus] %s", t, line);
   }
@@ -1271,14 +1376,17 @@ void PianoPower::chargingLine(char *line, size_t size)
   w(b.bat_mw, bat, sizeof bat);
   w(b.sys_mw, sys, sizeof sys);
   if (fPolicyOn && fLink.cfg.kick) snprintf(restart, sizeof restart, "; restarts %u", unsigned(fLink.st.kick_count));
-  char state[64] = "";
+  char state[200] = "";
   if (fWdog.located && fWdog.last.chgrOk)
-    snprintf(state, sizeof state, "; CHGR state %u (%s)", fWdog.last.state(), chargerStateName(fWdog.last.state()));
+    snprintf(state, sizeof state, "; CHGR state %u (%s), enable command %#04x, cfg2 %#04x%s%s", fWdog.last.state(),
+             chargerStateName(fWdog.last.state()), fWdog.last.chgrCmd[2], fWdog.last.chgrCfg[1], fChgenWhy[0] ? "; chgen: " : "",
+             fChgenWhy);
   if (!level2)
-    snprintf(line, size, "charging: in ? (level 1: no bus reading without the DSP), battery %+d mA at %d mV (%s W); %s%s; wdog pets %u",
+    snprintf(line, size, "charging: in ? (level 1: no bus reading without the DSP), battery %+d mA at %d mV (%s W); %s%s; wdog pets %u, "
+             "chgen sets %u, pulses %u",
              bi.ibat_ma, bi.vbat_mv, bat, !bi.battery_valid ? "no battery reading" : bi.ibat_ma >= 50 ? "charging"
                                                                      : bi.ibat_ma <= -50 ? "draining" : "not charging", state,
-             fWdog.pets);
+             fWdog.pets, fChgEn.sets, fChgEn.pulses);
   else if (!bi.input_valid)
     snprintf(line, size, "charging: in ? (no bus reading yet), battery %+d mA at %d mV (%s W); %s%s", bi.ibat_ma, bi.vbat_mv, bat,
              piano_charge_balance_name(b.verdict), restart);
@@ -1504,6 +1612,8 @@ void PianoPower::run()
     uint64_t now = nowMs();
     WdogWrite pet;
     if (fWdog.petIfDue(gWriter, now, &pet) && !pet.ok) wdogWriteLine("pet", pet);
+    ChgEnWrite pulseOn;
+    if (fChgEn.restoreIfDue(gIo, gWriter, now, &pulseOn)) chgenWriteLine((now - fStartMs) / 1000, pulseOn);
     serviceMca(now);
     // The USB-C relay (UsbcRelay.h): its client is ready once the generation is linked, the quiet is down and our UCSI read is through.
     if (fChannel)
@@ -1533,6 +1643,7 @@ void PianoPower::run()
     }
     if (fReadyWarnDue && fReadyWarnDue < next) next = fReadyWarnDue;
     if (fWdog.nextDue() && fWdog.nextDue() < next) next = fWdog.nextDue();
+    if (fChgEn.nextDue() && fChgEn.nextDue() < next) next = fChgEn.nextDue();
     if (fHandover && !fHandoverAcked && fHandoverUntil < next) next = fHandoverUntil;
     if (fShutdownSeen && !fPolicyEnded && fShutdownUntil < next) next = fShutdownUntil;
     const uint32_t wait = next > now ? uint32_t(next - now < 60000 ? next - now : 60000) : 1;

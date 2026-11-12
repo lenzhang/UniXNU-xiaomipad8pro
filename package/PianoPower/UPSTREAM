@@ -111,3 +111,11 @@ and that the host driver disables the watchdog's charging stop; arch/arm64/boot/
 bbca66e6618c1f6003c80753273059c17ba15be425787fece9a73b1e6108ab3a): the vbus regulator at the charger + 0x100 and Type-C at + 0x500.
 Their places on PMIH010x are this repository's inference from its own logs. The owner-channel write in PianoPower.cpp is the arbiter
 v7 write PianoDwc3 (setRestartReason) and PianoTorch (TorchCore.h) already make, re-expressed.
+
+ChargerEnable.h (the charging enable command, 2026-11-12, docs/drivers/charging-policy.md §19) is new code (BSD-2-Clause-Patent).
+Register facts only, from the same qcom_smbx.c (same sha256), read and never copied: CHGR +0x42 bit 0 the charging enable command;
+CHGR_CFG2 +0x51 bit 7 CHG_EN_SRC (0 the command register, 1 the pin), bit 6 the pin's polarity, bits 5..0 (pre-to-fast, BAT_OV ECC,
+I_TERM, AUTO_RECHG, analog drop, CHARGER_INHIBIT) and the host driver's value for it (software control, active high, inhibit on);
+the pulse of piano-power-chgen=2 is this repository's experiment (that an edge of the command restarts this charger is a hypothesis,
+not a fact of that source).
+The arbiter's duplicate APID mappings of one PPID (one per EE) are what this repository's dev14 log shows.
