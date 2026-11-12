@@ -19,6 +19,14 @@ if [ ! -d "$T" ]; then
   mkdir -p "$(dirname "$T")"
   cp -c -R "$SRC" "$T"
 fi
+# The tree's links to its sibling checkouts (sources/UniXNU -> ../../UniXNU: DarwinBoot's packed_ramdisk, ...) are relative: in
+# the clone they would point next to the clone. Point them where the original's resolve.
+for l in "$T"/sources/*; do
+  if [ -L "$l" ] && [ "$(readlink "$l")" != "$(cd "$SRC/sources" && cd "$(readlink "$l")" 2> /dev/null && pwd -P)" ]; then
+    target=$(cd "$SRC/sources" && cd "$(readlink "$l")" && pwd -P)
+    rm "$l"; ln -s "$target" "$l"
+  fi
+done
 for p in "$D"/patches/k273-kc/*.patch; do
   if git -C "$T" apply --check "$p" 2> /dev/null; then git -C "$T" apply "$p"; echo "applied $(basename "$p")"
   elif git -C "$T" apply --reverse --check "$p" 2> /dev/null; then echo "$(basename "$p"): applied already"
