@@ -2564,7 +2564,9 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
   const uint64_t started = nowMs();
   linkBegin(gLink, gCe, gChipIo, options, started);
   gLinkRunning = true;
-  const uint64_t overall = started + uint64_t(gArgs.wmiTimeoutMs) * 6 + gArgs.scanWaitMs;
+  // Six message steps, the four of the radio's set-up (P22) and the scan — or the hold instead of it.
+  const uint64_t overall = started + uint64_t(gArgs.wmiTimeoutMs) * 10 + gArgs.l6regwait +
+                           ((gArgs.l6pre & kPreNoScan) ? gArgs.l6hold : gArgs.scanWaitMs);
   int step = gLink.step;
   while (step != kLinkDone && step != kLinkStopped) {
     if (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE)) {
@@ -3052,7 +3054,8 @@ void PianoWifi::run()
   // ---- level 6 ---------------------------------------------------------------------------------------------------------
   // level 6's own overall bound (six message steps and the scan) is inside its hard deadline
   {
-    const uint32_t own = gArgs.wmiTimeoutMs * 6 + gArgs.scanWaitMs + 5000;
+    const uint32_t own = gArgs.wmiTimeoutMs * 10 + gArgs.l6regwait +
+                         ((gArgs.l6pre & kPreNoScan) ? gArgs.l6hold : gArgs.scanWaitMs) + 5000;
     levelBegin(6, own > gArgs.deadlineMs ? own : gArgs.deadlineMs);
   }
   rc = level6(this, power, opt);
