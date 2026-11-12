@@ -265,6 +265,15 @@ public:
   }
 
   bool inBusy(unsigned port) const { return ep[physOf(bulkEp(port), true)].busy; }
+  // The port's bulk IN bytes that may not have reached the host: the transfer in flight now, plus those a bus reset or an
+  // unconfigure ended unfinished since the last call (which clears them). PianoDwc3's console resumes behind them.
+  unsigned takeInUnconfirmed(unsigned port)
+  {
+    const unsigned in = physOf(bulkEp(port), true);
+    const unsigned n = inEnded[port] + (ep[in].busy ? ep[in].posted : 0u);
+    inEnded[port] = 0;
+    return n;
+  }
   // A control transfer past its SETUP (data or status stage): the host is waiting for us (UsbIdle.h keeps the loop fast).
   bool ep0Active() const { return phase == kData || phase == kWaitStatus || phase == kStatus; }
 
@@ -364,6 +373,7 @@ private:
   uint64_t lastSetupUs;               // the last SETUP packet
   uint32_t snapshots, reconnects;
   EpState ep[kPhys];
+  uint32_t inEnded[kPorts] = {};   // takeInUnconfirmed(): bulk IN bytes ended unfinished
   Phase phase;
   bool threeStage, highSpeed;
   uint8_t statusPhys, dataPhys;
@@ -474,6 +484,8 @@ private:
   {
     using namespace dwc3;
     if (!ep[phys].busy) return;
+    for (unsigned p = 0; p < kPorts; ++p)   // a port's bulk IN ended unfinished: its bytes may not have reached the host
+      if (phys == physOf(bulkEp(p), true)) inEnded[p] += ep[phys].posted;
     cmd(phys, CMD_ENDTRANSFER | DEPCMD_FORCERM | depcmdParam(ep[phys].resource), 0, 0, 0, nullptr);
     h->udelay(1000);
     ep[phys].busy = false;

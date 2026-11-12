@@ -3,12 +3,13 @@
 # function; the ACM-only descriptors against their bytes from before it), NTB16 framing, the frame queue and the TX FIFO plan, the
 # SMMU planner against an SMMU model, the input port's command parser and its reports against PianoKeyboard's HID descriptors, the
 # USB thread's wait tiers and the interrupt handler's decision (UsbIdle.h), the system sleep's steps and the QSCRATCH guard (UsbSleep.h),
-# the controller hand-off's decisions (UsbHandoff.h), the cold start against a model of the USB hardware (UsbCold.h).
+# the controller hand-off's decisions (UsbHandoff.h), the cold start against a model of the USB hardware (UsbCold.h), the console's
+# reader of the kernel log ring against racing writers (LogCursor.h).
 #   package/PianoDwc3/tests/run.sh [v]     v: print the gadget core's notes (the event trace) and the cold start's lines
 set -euo pipefail
 P=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-for t in usb_gadget_host ncm_host smmu_stream_host hid_input_host usb_idle_host usb_sleep_host usb_handoff_host usb_cold_host; do
+for t in usb_gadget_host ncm_host smmu_stream_host hid_input_host usb_idle_host usb_sleep_host usb_handoff_host usb_cold_host log_cursor_host; do
   c++ -std=c++20 -Wall -Wextra -Werror -Wno-unused-parameter -I "$P" -I "$P/../PianoKeyboard" "$P/tests/$t.cpp" -o "$T/$t"
   "$T/$t" "$@"
 done

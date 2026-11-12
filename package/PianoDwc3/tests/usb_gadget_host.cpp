@@ -888,7 +888,11 @@ static void sleepCycle(bool quiet)
   bool busy = false;
   for (unsigned phys = 2; phys < kPhys; ++phys) busy = busy || h.eps[phys].active;
   CHECK(busy);   // the ports' bulk transfers queued while configured
+  h.tx[0] = std::string(300, 'x');   // console bytes in a bulk IN the host has not taken yet
+  g.pump();
+  CHECK(g.inBusy(0) && g.takeInUnconfirmed(0) == 300 && g.takeInUnconfirmed(0) == 300);   // in flight: counted while it is
   CHECK(g.sleepDisconnect());
+  CHECK(g.takeInUnconfirmed(0) == 300 && g.takeInUnconfirmed(0) == 0);   // ended unfinished by the disconnect: counted once
   CHECK(!(h.regs[DCTL] & DCTL_RUN_STOP) && (h.regs[DSTS] & DSTS_DEVCTRLHLT));
   CHECK(!g.configured() && g.stats.address == 0 && ((h.regs[DCFG] >> 3) & 0x7f) == 0);
   for (unsigned phys = 0; phys < kPhys; ++phys) CHECK(!h.eps[phys].active);

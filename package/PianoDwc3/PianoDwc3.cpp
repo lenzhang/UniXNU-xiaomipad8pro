@@ -73,6 +73,7 @@
 #include "UsbSleep.h"         // a system sleep's steps and the QSCRATCH guard
 #include "UsbHandoff.h"       // the controller hand-off to PianoUsbHost (piano-usb-handoff=1)
 #include "UsbCold.h"          // the cold start (piano-usb-cold)
+#include "LogCursor.h"        // the console's reader of the kernel log ring
 #include "BtRpmh.h"           // package/PianoBluetooth: one VRM transaction on apps DRV-2 (and PianoKeyboard's CmdDb.h lookup)
 #include "ChargerPmic.h"      // package/PianoPower: the PMIC's Type-C block, found read only (only where no other kext reads it)
 #include "../common/PianoIrq.h"
@@ -105,7 +106,8 @@ struct Args {
   uint32_t delay;     // piano-usb-delay=<s> before the takeover
   uint32_t shell;     // piano-usb-shell=1: /dev/pianousb on port 1
   uint32_t poke;      // piano-usb-poke=1: the monitor may write physical addresses
-  uint32_t replay;    // piano-usb-replay: 1 (default) replay the retained log when the console port opens
+  uint32_t replay;    // piano-usb-replay: 1 (default) the first open replays the retained log, a later one resumes where the last
+                      // session stopped; 2 every open replays it; 0 every session starts from now
   uint32_t phyread;   // piano-usb-phyread: 1 (default) read the M31 PHY in the probe
   uint32_t spmi;      // piano-usb-spmi: 1 (default) read the repeater over SPMI in the probe
   uint32_t pid;       // piano-usb-pid: USB product ID
@@ -405,14 +407,16 @@ void cnotice(const char *fmt, ...)
 // ------------------------------------------------------------------------------------------------------ the kernel log tail
 // k27 0055/0058 pstore-console: header then the ring stored 11 times; copy 0 is read live. "DBGR" (0058): {start, size} at
 // words 4/5, data at +256, capacity (bytes - 256) / 11. "DBGB" (0055 alone): words 1/2, data at +12, (bytes - 16) / 11.
-// Without the boot argument: the kernel's message buffer.
+// Without the boot argument: the kernel's message buffer. The header's start can step back (0055's writers are lock-free, each
+// stores it from its own end): LogCursor.h keeps the reader's and the writer's positions (desk1, usb-device-debug.md section 18).
 struct LogTail {
   Region map;
   const volatile uint32_t *hdr;
   const volatile uint8_t *data;
   uint32_t cap, startWord, sizeWord;
   bool ok, msgbuf;
-  uint32_t lastStart, rdPos, avail;
+  LogCursor cur;
+  uint64_t lostShown;   // cur.lost as last reported on the console
 
   uint32_t start() const
   {
@@ -461,48 +465,53 @@ void logInit()
     gLog.ok = true;
     note("log source: the kernel message buffer (%u bytes)", gLog.cap);
   }
+  if (gLog.ok) gLog.cur.init(gLog.cap, gLog.start(), gLog.size(), nowNs() / 1000);
 }
 
-// From the oldest retained byte (replay) or from now.
-void logRewind(bool replay)
+void consoleClosed();   // below the gadget
+
+// The writer's position taken (LogCursor::sync): every pass, and once a second through piano-usb-delay.
+void logSync()
 {
-  if (!gLog.ok) return;
-  const uint32_t s = gLog.start();
-  gLog.lastStart = s;
-  gLog.avail = replay ? gLog.size() : 0;
-  gLog.rdPos = (s + gLog.cap - gLog.avail) % gLog.cap;
+  if (gLog.ok) gLog.cur.sync(gLog.start(), nowNs() / 1000);
 }
 
-// True when it moved bytes (the USB thread's activity).
+// Every pass of the USB thread, the port open or not (the writer's position stays known); sends while the port is open and live.
+// True when it moved bytes (the USB thread's activity), or when bytes wait for their settle time (the next pass comes soon).
 bool logPump()
 {
+  if (!gLog.ok) return false;
+  logSync();
   if (const int request = gRewindRequest) {
     gRewindRequest = 0;
-    logRewind(request == 1);
+    gLog.cur.rewind(request == 1);
   }
-  if (!gLog.ok || !(gLines[0] & 1) || !gLive) return false;
+  if (!(gLines[0] & 1) || !gLive) return false;
   bool moved = false;
-  const uint32_t s = gLog.start(), delta = (s + gLog.cap - gLog.lastStart) % gLog.cap;
-  gLog.lastStart = s;
-  gLog.avail = gLog.avail + delta > gLog.cap ? gLog.cap : gLog.avail + delta;
   char chunk[512];
-  for (unsigned round = 0; round < 32 && gLog.avail; ++round) {
+  for (unsigned round = 0; round < 32; ++round) {
+    const uint32_t avail = gLog.cur.readable();   // a reader the writer overtook skips to the oldest byte first (counted)
+    if (gLog.cur.lost > gLog.lostShown) {
+      cnotice("\n[PianoDwc3: %llu bytes of the log were overwritten before the console could send them]\n",
+              (unsigned long long)(gLog.cur.lost - gLog.lostShown));
+      gLog.lostShown = gLog.cur.lost;
+    }
+    if (!avail) break;
     IOLockLock(gLock);
     const uint32_t room = gTx[0].space();
     IOLockUnlock(gLock);
-    if (room < 2 * sizeof chunk) return moved;   // '\n' may double
+    if (room < 2 * sizeof chunk) return moved;   // '\n' may double; the host is behind (the wait tiers see the full queue)
     uint32_t n = 0, taken = 0;
-    while (taken < gLog.avail && n < sizeof chunk) {
-      const uint8_t c = gLog.at(gLog.rdPos);
-      gLog.rdPos = (gLog.rdPos + 1) % gLog.cap;
+    while (taken < avail && n < sizeof chunk) {
+      const uint8_t c = gLog.at(gLog.cur.index(gLog.cur.sent + taken));
       ++taken;
       if (c) chunk[n++] = char(c);   // the message buffer starts zero-filled
     }
-    gLog.avail -= taken;
+    gLog.cur.consume(taken);
     consoleWrite(chunk, n, false);
     moved = true;
   }
-  return moved;
+  return moved || gLog.cur.unsettled();
 }
 
 // ------------------------------------------------------------------------------------------------------------ the monitor
@@ -914,16 +923,24 @@ struct KernelHal {
   }
   void lineState(unsigned port, uint16_t state)
   {
-    const bool opened = (state & 1) && !(gLines[port] & 1);
+    const bool opened = (state & 1) && !(gLines[port] & 1), closed = !(state & 1) && (gLines[port] & 1);
+    if (port == kPortConsole && closed) consoleClosed();   // before the queue is dropped: its bytes are sent again next time
     IOLockLock(gLock);
     gLines[port] = state;
     if (opened) gTx[port].head = gTx[port].tail;   // nothing stale from an earlier session
     IOLockUnlock(gLock);
     note("port %u %s (DTR/RTS %x)", port, state & 1 ? "opened" : "closed", state);
-    if (port == 0 && opened) {
-      cnotice("\nPianoDwc3: piano kernel console on USB (piano-usb=%u)%s. Type 'help'.\n", gArgs.level,
-              gArgs.replay ? "; the retained boot log follows" : "");
-      logRewind(gArgs.replay != 0);
+    if (port == kPortConsole && opened) {
+      // The boot's first session replays the retained log (piano-usb-replay=1, the default; 2: every session does); a later one
+      // resumes where the last stopped, so a host that reconnects gets each line once (desk1, usb-device-debug.md section 18).
+      const LogCursor::Start how = gLog.ok ? gLog.cur.open(gArgs.replay != 0, gArgs.replay == 2) : LogCursor::Start::now;
+      if (how == LogCursor::Start::resume)
+        cnotice("\nPianoDwc3: piano kernel console on USB (piano-usb=%u), session %u: the log resumes where the last session stopped "
+                "(%llu bytes; a few lines may repeat). Type 'help'.\n", gArgs.level, gLog.cur.sessions,
+                (unsigned long long)gLog.cur.behind());
+      else
+        cnotice("\nPianoDwc3: piano kernel console on USB (piano-usb=%u)%s. Type 'help'.\n", gArgs.level,
+                how == LogCursor::Start::replay ? "; the retained boot log follows" : "");
       gLive = true;
     }
     if (port == kPortInput && !(state & 1)) {   // nothing stays pressed once the Mac's end is gone
@@ -966,6 +983,17 @@ struct KernelHal {
 KernelHal gHal;
 Gadget<KernelHal> gGadget;
 bool gRunning;
+
+// Port 0 closed (the host closed it, a bus reset, a cold restart): what had not reached the host (queued for the port, or in its
+// bulk IN) is sent again when it opens next; '\r's and the monitor's own lines in the queue make it a little more, never less.
+void consoleClosed()
+{
+  if (!gLog.ok) return;
+  IOLockLock(gLock);
+  const uint32_t queued = gTx[0].used();
+  IOLockUnlock(gLock);
+  gLog.cur.close(uint64_t(queued) + gGadget.takeInUnconfirmed(kPortConsole));
+}
 
 // ------------------------------------------------------------------------------------------------------- hardware: probe
 // The GCC pages this driver reads: the USB block 0x39000, the USB3 PHY's 0x50000, the M31's BCR 0x12000, GPLL0 at 0 and the vote
@@ -1694,8 +1722,11 @@ void usbStatus()
   cprintf("bulk in %u transfers %llu bytes, out %u transfers %llu bytes; ports DTR %x/%x; tx0 %u dropped %llu, tx1 %u dropped %llu\n",
           s.inTransfers, s.inBytes, s.outTransfers, s.outBytes, gLines[0], gLines[1], gTx[0].used(), gTx[0].dropped, gTx[1].used(),
           gTx[1].dropped);
-  cprintf("log: %s capacity %u avail %u; /dev/pianousb %s\n", !gLog.ok ? "none" : gLog.msgbuf ? "msgbuf" : "pstore", gLog.cap, gLog.avail,
-          gDevNode ? "present" : "absent");
+  const LogCursor &lc = gLog.cur;
+  cprintf("log: %s capacity %u; written %llu sent %llu (behind %llu), session %u, %llu bytes lost to an overtaking writer (%u times), "
+          "%u header steps back ignored; /dev/pianousb %s\n", !gLog.ok ? "none" : gLog.msgbuf ? "msgbuf" : "pstore", gLog.cap,
+          (unsigned long long)lc.written, (unsigned long long)lc.sent, (unsigned long long)lc.behind(), lc.sessions,
+          (unsigned long long)lc.lost, lc.laps, lc.backSteps, gDevNode ? "present" : "absent");
   cprintf("sleep: %s (piano-sleep-usb=%u); %u sleeps, %u wakes; QSCRATCH writes recorded %u (lost %u)\n", sleepStateName(gSleep.state()),
           gArgs.sleepUsb, gSleep.sleeps(), gSleep.wakes(), gSleep.deferred(), gSleep.lost());
   cprintf("wait: %s, tier %s; SPI 133: %s, %llu handled, %llu strays, %u missed\n",
@@ -1928,6 +1959,7 @@ bool coldRestart(uint32_t sim, const char *why)
     gHal.wr(dwc3::GEVNTSIZ, dwc3::GEVNTSIZ_INTMASK | Layout::kEventBytes);
     gHal.barrier();
   }
+  if (gLines[kPortConsole] & 1) consoleClosed();   // the next session resumes behind what had not reached the Mac
   IOLockLock(gLock);
   for (uint16_t &line : gLines) line = 0;   // every port closed: the Mac opens them again after it enumerates
   IOLockUnlock(gLock);
@@ -1952,7 +1984,10 @@ void usbThread(void *, wait_result_t)
   if (gArgs.handoff) handoffSet(kHoStarting);
   if (gArgs.delay) {
     note("waiting %u s (piano-usb-delay)", gArgs.delay);
-    IOSleep(gArgs.delay * 1000);
+    for (uint32_t s = 0; s < gArgs.delay; ++s) {   // the log cursor follows the writer meanwhile (a step < cap - 64 KiB a sync)
+      IOSleep(1000);
+      logSync();
+    }
   }
   waitAwake();
   // The inherited state read (after the test hook, piano-usb-cold-sim) and the decision (piano-usb-cold), then the takeover.
@@ -2045,7 +2080,10 @@ void usbThread(void *, wait_result_t)
     if (ns - lastReport > 1000000000ull) {   // DSTS once a second while it changes (link state before the first reset)
       lastReport = ns;
       const uint32_t dsts = gHal.rd(dwc3::DSTS);
-      if ((dsts & ~0x3fff8u) != (gLastDsts & ~0x3fff8u))   // ignore the frame number
+      // Ignore the frame number and COREIDLE: COREIDLE follows the console's own traffic, so it made a line a second, and with it
+      // more traffic, for as long as the console streamed (desk1: 5000 of these lines in 20 minutes).
+      constexpr uint32_t kNoise = 0x3fff8u | dwc3::DSTS_COREIDLE;
+      if ((dsts & ~kNoise) != (gLastDsts & ~kNoise))
         gHal.note("DSTS %08x (link state %u, connected speed %u), %u events so far", dsts, dwc3::dstsLinkState(dsts), dsts & 7u,
              gGadget.stats.events);
       gLastDsts = dsts;

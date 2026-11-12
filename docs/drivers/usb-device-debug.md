@@ -161,7 +161,7 @@ IOPlatformExpertDevice ── PianoDwc3 (start, matching thread)   read-only pro
 | `piano-usb-delay=S` | 0 | wait S seconds before the takeover |
 | `piano-usb-shell=1` | 0 | create `/dev/pianousb` for port 1 |
 | `piano-usb-poke=1` | 0 | allow the monitor's `poke` |
-| `piano-usb-replay=0` | 1 | port 0 starts at "now" instead of replaying the retained log |
+| `piano-usb-replay=0` / `=2` | 1 | 1: port 0's first open of the boot replays the retained log, and a later open (a reconnect) resumes where the last session stopped (§18); 0: every session starts at "now"; 2: every open replays the retained log (the behaviour before 2026-11-12). The monitor's `log` replays it on request |
 | `piano-usb-phyread=0`, `piano-usb-spmi=0` | 1 | skip the M31 / repeater reads of the probe |
 | `piano-usb-pid=N` | 1 (`1209:0001`, pid.codes test PID) | another USB product ID |
 | `piano-usb-trace=N` | 400 | log the first N controller events after each bus reset one by one (raw word, EP0 phase, TRB words); 0 off |
@@ -801,3 +801,64 @@ The DWC3 facts these rest on (Dwc3Regs.h, UsbCold.h):
   role's are C6's.
 - The xHCI: USBCMD.RS (bit 0) and INTE (bit 2) at CAPLENGTH. USBSTS.HCHalted (bit 0) is 1 by default and 0 while it executes.
 - piano's reset value after `USB30_PRIM_BCR` is GCTL `00102004`, the device role (C7).
+
+## 18. The console stream on long, busy runs (desk1, 2026-11-12)
+
+**Symptom.** desk1 was a GPU desktop image at the login window, 1200 s. Its USB capture
+(`logs/usb-console/20261112-081349-port0.txt`, 100 k lines) holds this boot's first 5-10 k lines 12 times, and never the live tail.
+The mailbox dump of the same boot (`logs/native-runs/20261112-081349-loop/`) shows the run went on normally.
+
+**What the capture shows.**
+- `usb-console.py` connected once and disconnected once, at the planned reset.
+- The 12 copies of `port 0 opened` and `bus reset (DSTS 000e0001)` are copies of the one original line. The mailbox's last 667 KB
+  hold no bus reset and no open.
+- Each copy is preceded by lines of decayed bytes, then this boot's byte 0 ("Darwin Kernel Version"). Each arrives within 0.1-0.4 s.
+- All 12 fall between +90 and +180 s, the boot-to-login burst. Afterwards about 4 lines/s arrived until the end, all of them old:
+  at +300 s the stream showed lines from 95 s of uptime.
+
+So it was neither a reconnect nor a replay on open. The reader of the log ring ran a whole lap: past the write position, through the
+region this boot had not written yet (the previous boot's decayed bytes), and on into byte 0. After that it stayed behind.
+
+**The cause.** k27 0055's mirror writer (`console_pstore_put`, before `console_write`'s lock, on every CPU) is lock-free. It reserves
+its bytes with an atomic add, copies them (11 copies), then stores the header's `start = end % cap` from its own end. Two writers
+that finish out of order therefore move `start` back by up to one write: two CPUs at once, or an interrupt inside a write.
+
+The old `logPump` took a step back of b bytes as a step forward of cap - b, and re-read a lap. When the reader was behind at that
+moment (the host slower than the boot's burst), its clamp of `avail` at the ring's size broke `rdPos + avail == start`. From then on
+it read the right number of bytes from the wrong place, roughly a ring behind, at the log's own rate.
+
+`tests/log_cursor_host.cpp` reproduces both halves with a replica of the old reader against a model of the racing writers.
+
+**The fix** (`package/PianoDwc3/LogCursor.h`, PianoDwc3.cpp's `logPump`, `consoleClosed`, `lineState`):
+- **Absolute positions.** The writer's position only moves forward. A step back of at most 64 KiB (a quarter of a small ring) is a
+  late writer's, counted (`usb`: `header steps back ignored`) and ignored. The USB thread syncs every pass, open or not, and once a
+  second through `piano-usb-delay`.
+- **A settle time.** A byte is sent 1 ms after the header first covered it. A late writer's copy is done by then, so no stale bytes
+  are sent.
+- **An overtaken reader** (the host stalled for more than a ring) skips to the oldest retained byte, 16 KiB from the writer. It says
+  so on the console: `[PianoDwc3: N bytes of the log were overwritten before the console could send them]`.
+- **Sessions** (`piano-usb-replay`, §6). The boot's first open replays the retained log. A later open (the host closed the port, a
+  bus reset, a cold restart) resumes where the last session stopped: the banner says `session N: the log resumes where the last
+  session stopped (M bytes ...)`. Behind the stop point it resends what had not reached the host: the bytes still queued for port 0,
+  and port 0's bulk IN if it was in flight or ended unfinished (`Gadget::takeInUnconfirmed`). A few lines may repeat; none is
+  skipped. `piano-usb-replay=2` keeps the old every-open replay. The monitor's `log` replays everything retained, `live on` goes
+  on from now.
+- **DSTS noise.** The once-a-second DSTS line ignores COREIDLE now. COREIDLE followed the console's own traffic, so the line came
+  every second while streaming: about 5000 of them in desk1's 20 minutes, each one more traffic.
+
+Not changed: the kernel side. Its header can still step back, and a reader that copies the ring while a write is in flight still
+sees the old bytes for that write. The reader above tolerates both. The other mailbox reader (`tooling/native/xnu-log.py`) takes the
+header after the reset, when no writer runs. A kernel fix (the header stored only by the writer that completes the furthest end)
+would be a separate k27 patch.
+
+The capture itself starts mid-line (`de000 (65M)`, about 1 KB into the log). The tool's first read came after the Mac's driver had
+received the open's first bytes. That is host side and harmless now: a later open resumes, and `log` replays on request.
+
+**Re-test.** Build any GPU desktop image (desk1's arguments) from this tree, then run `python3 tooling/native/usb-console.py --capture
+1300` for the whole run. Expect:
+- one replay at the start;
+- then the live tail up to `piano-reset-after: 1200 s reached`, with no second `Darwin Kernel Version`;
+- `usb` from the monitor: `header steps back ignored` above 0 on a busy boot, `lost 0` while the Mac keeps reading.
+
+To check the resume, unplug and replug the cable once: the banner says `session 2: the log resumes ...`, and the capture goes on
+without a second replay.
