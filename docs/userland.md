@@ -24,7 +24,10 @@ Now there is one manifest, one staging tool, and one installer on the tablet.
 
 Two changes to existing pieces came with this. `pianousb-shell` now exits at once (status 0) on `/dev/pianousb` when the kernel
 argument `piano-usb-shell` is missing, and its job is `KeepAlive SuccessfulExit false`. Before, it retried the open every 2 s
-forever. `piano-policy-agent` got a LaunchDaemon plist instead of the `launchctl submit` line.
+forever. `piano-policy-agent` got a LaunchDaemon plist instead of the `launchctl submit` line. Since 2026-11-12 evening
+`pianousb-shell` waits with `select()`. Its `poll()` got `POLLNVAL` from `/dev/pianousb` at once, every call, so it spun and never
+read ([drivers/usb-device-debug.md](drivers/usb-device-debug.md) §6). Its host test is
+`tooling/native/pianousb-shell/test_pianousb_shell.py`.
 
 ## 2. The manifest
 

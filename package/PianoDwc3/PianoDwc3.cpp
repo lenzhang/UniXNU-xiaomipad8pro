@@ -91,6 +91,8 @@ volatile int32_t piano_dwc3_cold = 0;
 // PianoTouch, PianoKeyboard, PianoWifi and PianoBluetooth. The protocol is A830's: 0 free, else the holder's tag, compare-exchange.
 extern volatile uint32_t sm8750_gcc_vote_owner;
 extern volatile uint32_t sm8750_rpmh_drv2_owner;
+// sys/conf.h's KERNEL_PRIVATE declaration (bsd_stubs.c, exported by the kernel): /dev/pianousb's cdevsw marked kqueue-capable.
+int cdevsw_setkqueueok(int, const struct cdevsw *, int);
 }
 
 class PianoUsbHID;   // the HID input devices (piano-usb-hid=1), below
@@ -830,14 +832,18 @@ int puWrite(dev_t, struct uio *uio, int ioflag)
   return error;
 }
 
+// select() and (the cdevsw being kqueue-capable, shellThread) poll() and kevent: the bytes ready (to read; room to write, a full ring
+// when the Mac's end is closed, since writes are then dropped), or 0 with the selinfo recorded. kevent's data is this count.
 int puSelect(dev_t, int which, void *wql, struct proc *p)
 {
   int ready = 0;
   IOLockLock(gLock);
   if (which == FREAD) {
-    if (gRx1.used()) ready = 1; else selrecord(p, &gSelRead, wql);
+    if (gRx1.used()) ready = int(gRx1.used()); else selrecord(p, &gSelRead, wql);
   } else if (which == FWRITE) {
-    if (gTx[1].space() || !(gLines[1] & 1)) ready = 1; else selrecord(p, &gSelWrite, wql);
+    if (!(gLines[1] & 1)) ready = gTx[1].size ? int(gTx[1].size) : 1;
+    else if (gTx[1].space()) ready = int(gTx[1].space());
+    else selrecord(p, &gSelWrite, wql);
   }
   IOLockUnlock(gLock);
   return ready;
@@ -857,8 +863,13 @@ void shellThread(void *, wait_result_t)
   }
   gMajor = cdevsw_add(-1, &gCdev);
   if (gMajor < 0) { note("/dev/pianousb: cdevsw_add failed"); return; }
+  // poll() is kqueue in XNU, and a character device's knote attaches only when its cdevsw is marked kqueue-capable (spec_kqfilter,
+  // filt_specattach: EINVAL, so poll() answers POLLNVAL at once): unmarked, pianousb-shell's poll() loop spun and never read
+  // (desk-dev, 2026-11-12). puSelect keeps the contract (a count when ready, selrecord otherwise). The helper uses select() anyway.
+  const int kq = cdevsw_setkqueueok(gMajor, &gCdev, 0);
   gDevNode = devfs_make_node(makedev(gMajor, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "pianousb");
-  note("/dev/pianousb %s (major %d): port 1 is the user pipe", gDevNode ? "created" : "NOT created", gMajor);
+  note("/dev/pianousb %s (major %d): port 1 is the user pipe; select%s", gDevNode ? "created" : "NOT created", gMajor,
+       kq == 0 ? ", poll and kqueue" : " only (cdevsw_setkqueueok refused)");
 }
 
 // ------------------------------------------------------------------------------------------------------- the gadget's Hal

@@ -7,16 +7,23 @@
 // On /dev/pianousb it runs only when the kernel was booted with piano-usb-shell=1 (the argument that makes the kernel create the
 // node): without it, it exits at once with status 0 and its job (KeepAlive SuccessfulExit false) is not started again, so an
 // installed profile without the argument has no shell and no polling for the node. Another DEVICE (a test pty) skips the check.
+// Waits with select(), never poll(): XNU's poll() is kqueue underneath, and a character device's knote attaches only when its
+// cdevsw is marked kqueue-capable (spec_kqfilter, filt_specattach: EINVAL otherwise) or the caller asks NOTE_LOWAT 1, which poll()
+// never does; so poll() on /dev/pianousb as k27 built it returns POLLNVAL at once, every time. The helper of 2026-11-12 polled and
+// took only POLLIN/POLLHUP/POLLERR: it spun at full CPU ("pianousb-shell caught burning CPU", desk-dev 17:27) and never read a byte
+// the Mac sent, so the shell got no input and sent nothing back. select() goes to the cdevsw's d_select (selscan, fo_select) for
+// any device; PianoDwc3 now also marks its cdevsw kqueue-capable. Host test: test_pianousb_shell.py (a device whose poll() answers
+// POLLNVAL, as /dev/pianousb's did).
 // Build on the Mac (arm64, ad-hoc signed by the linker): clang -O2 -Wall -Wextra -o pianousb-shell pianousb-shell.c
 // Installed by configs/userland.toml (tooling/userland/stage.py, docs/userland.md).
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -85,18 +92,21 @@ int main(int argc, char **argv)
       static const char banner[] = "\r\npianousb-shell: a new shell on the tablet (exit starts another)\r\n";
       (void)write(fd, banner, sizeof banner - 1);
       int deviceGone = 0;
-      for (;;) {
-        struct pollfd p[2] = {{.fd = fd, .events = POLLIN}, {.fd = master, .events = POLLIN}};
-        if (poll(p, 2, -1) < 0) {
+      if (fd >= FD_SETSIZE || master >= FD_SETSIZE) deviceGone = 1;   // never with launchd's few descriptors
+      while (!deviceGone) {
+        fd_set r;
+        FD_ZERO(&r);
+        FD_SET(fd, &r);
+        FD_SET(master, &r);
+        const int n = select((fd > master ? fd : master) + 1, &r, NULL, NULL, NULL);
+        if (n < 0) {
           if (errno == EINTR) continue;
+          fprintf(stderr, "pianousb-shell: select: %s: %s reopened\n", strerror(errno), device);
+          deviceGone = 1;   // a descriptor went bad: start again from the open
           break;
         }
-        if (p[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-          if (copy(fd, master) < 0) { deviceGone = 1; break; }
-        }
-        if (p[1].revents & (POLLIN | POLLHUP | POLLERR)) {
-          if (copy(master, fd) < 0) break;   // the shell exited
-        }
+        if (FD_ISSET(fd, &r) && copy(fd, master) < 0) { deviceGone = 1; break; }
+        if (FD_ISSET(master, &r) && copy(master, fd) < 0) break;   // the shell exited
       }
       close(master);
       kill(pid, SIGHUP);
