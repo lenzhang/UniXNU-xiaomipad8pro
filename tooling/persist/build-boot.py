@@ -24,6 +24,7 @@ Series 5 = the FD with firmware/patches/darwinboot/0001 (XNU's RAM window up to 
                                             tablet: the kernel field must be theirs byte for byte (the same shim, FD and DTB)
   build-boot.py --verify [--series N] [--out out/persistent]     after signing: check the -signed images, assemble macos-set*/
 """
+import os
 import argparse
 import json
 import shutil
@@ -39,9 +40,10 @@ import common  # noqa: E402
 V4_NAME, V2_NAME = 'boot-piano-macos-persistent-v4', 'boot-piano-esp-test-v2'
 V4 = ['--header_version', '4', '--pagesize', '4096', '--os_version', '15.0.0', '--os_patch_level', '2026-02', '--cmdline', '']
 UBUNTU_OS_VERSION = 0x1e0001a2           # 15.0.0, 2026-02 (13-boot_a header)
-AVBTOOL = Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/v1.1.0/upstream/xiaomipad-8pro-mainline-1.1.0/tools/local/aosp-avb/avbtool.py'
+V110 = Path(os.path.expanduser(os.environ.get('PIANO_V110', str(Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/v1.1.0'))))   # the Ubuntu v1.1.0 release (or its few files)
+AVBTOOL = V110 / 'upstream/xiaomipad-8pro-mainline-1.1.0/tools/local/aosp-avb/avbtool.py'
 AVBTOOL_SHA256 = 'e5a664a38db623da00f080219bc0ee60a640a9dc4a872803616fae4938ac749b'
-PROFILE = Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/v1.1.0/release/boot/boot-profile.json'
+PROFILE = V110 / 'release/boot/boot-profile.json'
 PUBKEY_SHA1 = 'f5151930dc69791637b2a48505cb175f5f78a522'   # the key that signed this tablet's boot_a (13-boot_a)
 failures = []
 

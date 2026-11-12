@@ -60,7 +60,7 @@ MU = RESEARCH / 'Mu-Silicium-piano'
 # UniXNU's BootShim (uefi-sheng 66421cb): image size covers shim + FD, the copied FD is cleaned to PoC and the I-cache
 # invalidated before the jump, literal pool before _Payload. Mu-Silicium e51cd877's older BootShim has none of these.
 SHIM_TREE = RESEARCH / 'uefi-sheng'
-MKBOOTIMG = Path(os.environ.get('PIANO_MKBOOTIMG', Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/v1.1.0/host-tools/aosp-mkbootimg-prefetched/mkbootimg.py'))
+MKBOOTIMG = Path(os.environ.get('PIANO_MKBOOTIMG', Path(os.path.expanduser(os.environ.get('PIANO_V110', str(Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/v1.1.0')))) / 'host-tools/aosp-mkbootimg-prefetched/mkbootimg.py'))
 MKBOOTIMG_SHA256 = '37d84b3d162e0bc62e36c1f4e1c63c85ea0caa9f29be023eb2f8efe006ad948c'   # the Ubuntu RAM set's (maintenance-manifest.json)
 V2 = ['--header_version', '2', '--pagesize', '4096', '--base', '0', '--kernel_offset', '0x00008000',
       '--ramdisk_offset', '0x01000000', '--tags_offset', '0x00000100', '--dtb_offset', '0x01f00000']
