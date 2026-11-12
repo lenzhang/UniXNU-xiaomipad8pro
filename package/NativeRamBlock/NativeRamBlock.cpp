@@ -27,6 +27,7 @@
 #include <IOKit/storage/IOStorage.h>
 #include "PowerHold.h"
 #include <PianoPowerContract.h>   // UniXNU-piano: the Data disk's part of a system sleep (native-ufs-suspend=1, PowerHold.h)
+#include <PianoDiskIdentity.h>    // UniXNU-piano: the Data disk as an internal disk to diskutil (piano-disk-identity)
 
 extern "C" {
 extern unsigned long gPhysBase, gPhysSize;
@@ -132,6 +133,9 @@ class NativeRamBlock : public IOBlockStorageDevice {
   uint8_t *memory = nullptr;
   uint64_t capacity = 0;
   bool online = false;
+  // UniXNU-piano: the IOMedia's and diskutil's name (PianoDiskIdentity.h): "UFS 4.0 Data" with the store on UFS (data-persist), "RAM
+  // Data" without; nullptr with piano-disk-identity=0 (the old "Native Owned RAM block storage").
+  const char *product = nullptr;
   RamSparseDisk sparse = {};
   // A disk above 2 GiB keeps only the nonzero pages of its seed (SeedDisk.h), in memory proportional to the content, and is served by the
   // direct (store-backed) path when the persistent store is open read-write; otherwise (UniXNU-piano) by the volatile disk below.
@@ -458,8 +462,8 @@ public:
   IOReturn doEjectMedia() override { return kIOReturnUnsupported; }
   IOReturn doFormatMedia(UInt64) override { return kIOReturnUnsupported; }
   UInt32 doGetFormatCapacities(UInt64 *, UInt32) const override { return 0; }
-  char *getVendorString() override { return const_cast<char *>("Native"); }
-  char *getProductString() override { return const_cast<char *>("Owned RAM block storage"); }
+  char *getVendorString() override { return const_cast<char *>(product ? pianodisk::kVendor : "Native"); }
+  char *getProductString() override { return const_cast<char *>(product ? product : "Owned RAM block storage"); }
   char *getRevisionString() override { return const_cast<char *>("1.0"); }
   char *getAdditionalDeviceInfoString() override { return const_cast<char *>("volatile storage; no persistent trust claim"); }
   IOReturn reportBlockSize(UInt64 *value) override { *value = 512; return kIOReturnSuccess; }
@@ -579,6 +583,10 @@ bool NativeRamBlock::start(IOService *provider)
   native_ram_block_resident_bytes=isBig?big.resident:sparse.pages?sparse.resident:logical;
   online = true;
   native_ram_block_ready = 1;
+  {   // UniXNU-piano: internal, solid state, Xiaomi's (PianoDiskIdentity.h); before the publish thread registers the disk
+    const char *name = (&native_ufs_store_mode && native_ufs_store_mode()) ? "UFS 4.0 Data" : "RAM Data";
+    if (pianodisk::publish(this, name, "1.0")) product = name;
+  }
   retain();
   thread_t thread;
   if (kernel_thread_start(publishWhenBSDMatched, this, &thread) != KERN_SUCCESS) {

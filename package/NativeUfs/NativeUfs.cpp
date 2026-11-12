@@ -40,6 +40,7 @@ extern const uint8_t verified_root_key[];
 #include <kern/debug.h>
 #include <stdarg.h>
 #include <PianoPowerContract.h>   // UniXNU-piano: native-ufs-suspend=1 (RootPower.h)
+#include <PianoDiskIdentity.h>    // UniXNU-piano: the windows as internal UFS disks to diskutil (piano-disk-identity)
 #include "GccUfs.h"
 #include "RootDiagnostics.h"
 #include "TransferPoll.h"
@@ -1943,6 +1944,7 @@ class NativeUfsBlock : public IOBlockStorageDevice {
   uint64_t absolute = 0;      // byte offset of the window on LUN 0
   uint64_t bytes = 0;
   char label[32] = {};
+  char product[48] = {};      // the IOMedia's and diskutil's name (PianoDiskIdentity.h); empty: the old "Native <label>"
   // Requests run concurrently, each with its own bounce buffer from the pool: a request verifies and copies the snapshot in its
   // own buffer, so no lock is held across the read, the integrity check or the copy (RootWindowRead.h).
   static constexpr unsigned kBounces = 4;
@@ -1986,8 +1988,8 @@ public:
   IOReturn doEjectMedia () override { return kIOReturnUnsupported; }
   IOReturn doFormatMedia (UInt64) override { return kIOReturnNotWritable; }
   UInt32 doGetFormatCapacities (UInt64 *, UInt32) const override { return 0; }
-  char *getVendorString () override { return const_cast<char *> ("Native"); }
-  char *getProductString () override { return label; }
+  char *getVendorString () override { return const_cast<char *> (product[0] ? pianodisk::kVendor : "Native"); }
+  char *getProductString () override { return product[0] ? product : label; }
   char *getRevisionString () override { return const_cast<char *> ("1.0"); }
   char *getAdditionalDeviceInfoString () override { return const_cast<char *> ("UFS LUN 0 userdata window, read-only"); }
   IOReturn reportBlockSize (UInt64 *value) override { *value = 512; return kIOReturnSuccess; }
@@ -2061,6 +2063,7 @@ bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint6
     return false;
   }
   strlcpy (label, name, sizeof (label));
+  if (pianodisk::enabled ()) snprintf (product, sizeof (product), "UFS 4.0 %s", label);   // "Xiaomi UFS 4.0 OS Media"
   absolute = absoluteOffset;
   bytes = size;
   windowLock = IOLockAlloc ();
@@ -2271,6 +2274,7 @@ bool NativeUfsBlock::start (IOService *provider)
     return false;
   }
   online = true;
+  if (product[0] && !pianodisk::publish (this, product, "1.0")) product[0] = 0;   // internal, UFS, solid state (PianoDiskIdentity.h)
   registerService ();
   return true;
 }
