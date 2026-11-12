@@ -75,9 +75,9 @@ meanings: `docs/drivers/wifi.md`.
 | `WifiChannels.h` | portable: level 5's transport — the two IPC router channels' contexts and rings, their preparation and start commands, the receive buffers (only on a running channel 21), a send, the event walk (a completion names the ring element: per-element buffer records and the host's read pointer, §10.25), and the M0 answer |
 | `WifiRddm.h` | portable: the firmware's crash dump (RDDM) over BHIe — the segments and vector table given before the boot, the receive status, and the bounded decode (the header's files, the failure reason, error-like strings only when there is no reason; the serial masked) |
 | `WifiQmi.h` | portable: the QMI message writer and the typed readers over the copied codec's parse |
-| `WifiWlfw.h` | portable: the WLAN firmware's message set and the step machine, the memory answer, the downloads, the copy-engine configuration and the shadow list |
+| `WifiWlfw.h` | portable: the WLAN firmware's message set and the step machine, the memory answer, the downloads, the copy-engine configuration and the shadow list, every answer and indication to the owner with its result and error codes, the board file for a board identifier |
 | `WifiSmmuWindow.h` | portable: the 32-bit window for stream 0x1401 (a translating context bank and its two-page table), copies of PianoDpu's and PianoUsbHost's SMMU pieces (`UPSTREAM`) |
-| `WifiQrtr.c/.h` | the IPC router and QMI codec, a copy of PianoPower's with two additions (`UPSTREAM`; PianoPower is not modified) |
+| `WifiQrtr.c/.h` | the IPC router and QMI codec, a copy of PianoPower's with its additions and one change, the flow-control answer naming our port (P21; `UPSTREAM`; PianoPower is not modified) |
 | `WifiFirmware.c/.h` | the firmware ranges read in place from `modem_a` through NativeUfs (no file is held whole) |
 | `WifiCe.h` | portable: level 6's copy engine — the three rings of a pipe, their registers, a send, the receive buffers, the event walk, the teardown |
 | `WifiHtc.h` | portable: the host transport — the header, the ready message, a service connected, set-up complete, the credit records |

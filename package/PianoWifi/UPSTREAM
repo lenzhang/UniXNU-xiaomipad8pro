@@ -69,8 +69,17 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
         firmware's service (69, version 1, instance 1) is told from another version of itself on the same link;
       and (WifiQrtr.c only, 2026-11-12 sixth round) the received header read by a helper that takes the protocol's version 2
         header as well as version 1 (qcom_qrtr_receive's first lines changed to call it; the rest of it as copied), since the
-        chip's router may speak version 2 while this side sends version 1 (net/qrtr's two header layouts, facts only).
-    PianoPower is not modified; its own QRTR path (the DSP) keeps using its file.
+        chip's router may speak version 2 while this side sends version 1 (net/qrtr's two header layouts, facts only);
+      and one "PianoWifi change" (2026-11-12 seventh round, P21 in docs/drivers/wifi.md section 10.26): the flow-control answer.
+        The copied qcom_qrtr_receive answered a data packet's confirm_rx with control(RESUME_TX, {sender's node, sender's port})
+        from the control port; it now calls resume_tx, which sends RESUME_TX from our port to the sender's node:port with our
+        node and port in the payload, and keeps an answer the link refuses for qcom_qrtr_poll (new, with the rx_confirms /
+        resume_owed / resume_node / resume_port / resume_from fields in QcomQrtr). Facts from net/qrtr/af_qrtr.c (behaviour only,
+        no code): a sender counts its packets per destination node:port, sets confirm_rx on the fifth (QRTR_TX_FLOW_LOW) and
+        waits at the tenth (QRTR_TX_FLOW_HIGH) until a RESUME_TX whose payload's client node and port are that destination; the
+        receiver sends it from the packet's destination to its source, filling the payload with its own address.
+    PianoPower is not modified; its own QRTR path (the DSP) keeps using its file (which still has the old answer: noted in
+    wifi.md section 10.26 for its owner).
   package/PianoDpu/DpuSmmu.h (sha256 9cc7d830e27084905081222f6ab4ebe17786709dac869649e706504303f1ae30) and
   package/PianoUsbHost/SmmuIdentity.h (sha256 d0cdab46fc2815d45895d6c652e610b0d9969b5bdbed6496aea3ecd5b4cba949) -> WifiSmmuWindow.h:
     reused by copying, in this namespace: from DpuSmmu.h the context bank register offsets and their fields, the VMSAv8-64
@@ -206,6 +215,14 @@ register and layout facts as these hosts are publicly known to behave, no code, 
     arrives (the radio's capability, the indication registration, the host capability with the internal sleep clock bit).
   net/qrtr/ns.c: that the host's name service answers a remote's hello (with its own hello and its servers) rather than speaking
     first on a new link; level 5 now waits 500 ms for the chip's hello before saying its own.
+  (2026-11-12 seventh round) drivers/net/wireless/ath/ath12k/qmi.c and core.c of the same tree: the file download's fields (the
+    remaining size in total_size, the end flag on the last segment, the file identifier = the target capability's board or 0xff
+    without one, the board file's kind from its ELF magic, the 256 KiB cap), that the radio capability's board identifier is only
+    logged, that with no board-2.bin the API-1 board file and regdb.bin are used, and the order target capability -> regulatory
+    database -> board file -> PHY microcode -> auxiliary microcode (no TME-L request); wifi7/hw.c's WCN7860 entry (the auxiliary
+    microcode downloaded, the feature list PERST_NO_PULL | AUX_UC); xiaomipad-8pro-mainline firmware/piano-wlan.json (the stock
+    files Ubuntu ships, their sizes, no TME-L file). Project-SunUEFI 0003-input-wireless.patch (GPL-2.0, facts only): another
+    SM8750 + peach tree's TME-L request (0x005b) and its stock refusal 83, which this driver does not send.
   The vendor MHI host (msm kernels, GPL-2.0), for the crash dump's header layout only: a version and the header's size, then one
   64-byte entry per file (device address, physical address, size, a 20-byte description, a 20-byte file name), the files back to
   back after the header across the segments, and the failure reason in the file whose name says SFR. WifiRddm.h's decode accepts

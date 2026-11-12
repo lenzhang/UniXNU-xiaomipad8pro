@@ -105,6 +105,29 @@ completion and both channels' and the data event ring's pointers in the log; the
 phase change and within a second (a hung ladder can no longer stay silent, desk-dev8n) and a hard deadline for each level
 (`piano-wifi-deadline`). Next: §8.8 boot 6a.
 
+**Seventh round (2026-11-12 21:18, the RAM image `ram-v32-probe`, and 21:31, the installed ESP v3.2a, both `piano-wifi=6
+piano-wifi-iova=1`):** level 4 as before (mission mode at 483 ms), and level 5 now **works up to the downloads**: 63 receive
+buffers posted, the chip's hello answered, service 69 instance `0x101` on port 1, the radio's capability (2 radios), the
+indication registration, the host capability, the firmware's memory request (3 regions, 11284 KiB: host memory 7232 KiB, the
+calibration database 4048 KiB, 4 KiB shared with the audio DSP, all in the window) answered and its "memory ready", the chip's
+capability (chip `0x2` family `0x4` SoC `0x40210200`, board `0xff`, firmware `0x100d002f` built 2025-08-26). Then step 509, the
+regulatory database (`regdb_xiaomi.bin`, 24278 bytes: four segments, the last 5846 bytes): the first three answered and
+accepted, the fourth (the last) never answered; `a step timed out` after 10 s, stage 504. Both boots identical, down to `11
+packets out` and `10 data` packets in. **Cause (P21, §10.26; the count is evidence, the mechanism inferred from the router
+protocol and reproduced by the host test):** the firmware's router asks for a flow-control answer (RESUME_TX) on its fifth
+packet to a port and sends nothing more to it from its tenth until one names that port; the router this driver copied answered
+with the *sender's* address, from the control port, which resumes nothing, so the firmware's eleventh packet to us (the answer to
+the last segment) stayed in its queue. The `11 packets out` were the hello, nine requests and that one misaddressed answer. Not
+the cause: the file (it is the one Ubuntu sends as `regdb.bin`, same size), its message (kind 4, file identifier `0xff`, the
+remaining size, the end flag on the last segment: Ubuntu's form), the board identifier (`0xff` is what this unit's OTP gives, and
+Ubuntu sends `0xff` too), TME-L (Ubuntu's kernel for this tablet sends none before the regulatory database and stages no such
+file). Changed: RESUME_TX goes from our port to the sender's node:port naming our node and port (net/qrtr's form), an answer the
+link refuses is sent again; every QMI answer and indication is logged with its result and error codes (and the segment it
+answers), the request outstanding at a timeout is named, the flow-control counters have their own line, the board file's choice
+for board `0xff` is logged (`bd_p81.elf`, the stock API-1 default board file: Ubuntu's choice with no board-2 container), its kind
+is taken from its ELF magic, and the trace configuration can be refused or go unanswered without ending the level. Next: §8.8
+boot 7a.
+
 Association, keys and the data path (levels 7 and 8) are design only (§12 has level 5's message table, §14 level 6's, §13 what levels 7 and 8 need and the macOS side's remaining plan). Template: `README.md`.
 
 ## 1. Purpose and gate
@@ -227,7 +250,7 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-stop=N` | 0 | return after step N (201–205 level 2, 301–311 level 3), so a boot can stop just before the step being studied |
 | `piano-wifi-dma=M` | 24 (64 at level 5) | the DMA window in MiB (12–96, rounded down to whole 2 MiB blocks). Level 5 also carries the firmware's regions, the two microcodes and the router's buffers in it |
 | `piano-wifi-fwtimeout=MS` | 20000 | the deadline of each MHI phase |
-| `piano-wifi-qmitimeout=MS` | 10000 | the deadline of each level 5 step (the service's own request timeout) |
+| `piano-wifi-qmitimeout=MS` | 10000 | the deadline of each level 5 request (the service's own request timeout): it starts again at every step and at every answer or indication, so a download of many segments gets it per segment; the level's hard deadline (`piano-wifi-deadline`) still bounds the whole. At the trace configuration (step 513) it gives that step up instead of ending the level |
 | `piano-wifi-iova=1` | 0 | give the endpoint's stream 0x1401 a translating context bank whose 32-bit window (`0x20000000` + the window's size, 2 MiB blocks) maps the DMA window, and hand the chip those addresses instead of physical ones. The only way to give this chip a 32-bit address, which its own driver uses for the data path's rings (§10.11); the page table is a buffer of its own, outside the window the chip can reach |
 | `piano-wifi-mode=1` | 0 | level 5 also sends the firmware's options (logging), the host's copy-engine configuration and the mode — the three messages that start the radio and open level 6. By default level 5 stops at the ready indication |
 | `piano-wifi-shadow=1` | 0 | put the shadow register list in that configuration (40 addresses computed from the chip's register map for the rings level 8's data path will create; level 6 writes the real registers through the window instead, §10.18, and §10.19 is what to try if that turns out to be the wrong path) |
@@ -237,7 +260,7 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-ctxearly=1` | 0 | also write the MHI context and host-range registers before the doorbell (what every boot before the fourth round did). By default they are written once the device reports READY, as the MHI host does |
 | `piano-wifi-ras=0` | 1 | no TLP counters. By default level 4 switches on the DesignWare RAS DES counters of both ends of the link before the doorbell (TLPs by kind, UR, CA, completion timeouts) and logs their deltas (§8.4) |
 | `piano-wifi-rddm=0` | 1 (from the fifth round) | no crash dump. By default level 4 gives the chip the crash dump's vector table before the boot loader's doorbell (nine 512 KiB segments of the DMA window, 0x420000 bytes as this chip's host reserves, right after the receive block's clear, as the MHI host does), and when the firmware reports its crash dump environment or a system error at any level the dump is waited for (at most 4 s) and decoded into a few lines: the header's files, the firmware's failure reason, nothing else (`package/PianoWifi/WifiRddm.h`, §10.24) |
-| `piano-wifi-defer=0`, `=2` | 1 (from the fifth round) | print every line when it is written. By default the ladder's lines from the boot loader's doorbell on are held in a heap buffer (320 lines; more are counted, not kept; a crash prints them at once and its own lines directly), each with `[+N ms]` since the doorbell, and printed by a helper thread (sixth round): at every phase change (a stage, a level 4 phase, a level 5 or 6 step) and any line held for a second, so the console stalls the helper and never the ladder (wifi-4a: the console held the ladder's thread for 2 s right after mission mode and the firmware was dead when it came back, §10.24), and a ladder that hangs still has its lines out (desk-dev8n: printed only at the ladder's end, which never came). `=2`: held and printed only when the ladder stops, with no helper and no deadline watch (the fifth round's way: the A/B if the helper's console traffic is ever suspected) |
+| `piano-wifi-defer=0`, `=2` | 1 (from the fifth round) | print every line when it is written. By default the ladder's lines from the boot loader's doorbell on are held in a heap buffer (480 lines, 320 before the seventh round; more are counted, not kept; a crash prints them at once and its own lines directly), each with `[+N ms]` since the doorbell, and printed by a helper thread (sixth round): at every phase change (a stage, a level 4 phase, a level 5 or 6 step) and any line held for a second, so the console stalls the helper and never the ladder (wifi-4a: the console held the ladder's thread for 2 s right after mission mode and the firmware was dead when it came back, §10.24), and a ladder that hangs still has its lines out (desk-dev8n: printed only at the ladder's end, which never came). `=2`: held and printed only when the ladder stops, with no helper and no deadline watch (the fifth round's way: the A/B if the helper's console traffic is ever suspected) |
 | `piano-wifi-deadline=MS` | 60000 (from the sixth round) | the hard deadline of each of levels 4, 5 and 6 as a whole (level 6: at least its own overall bound and 5 s), 10000 to 600000. Every wait inside a level has its own shorter bound; this one ends the level whatever it waits for (a `hard deadline … passed` line, then the level's usual failure), and the helper thread prints `watchdog: level N is … ms past its hard deadline` (every 30 s) when the ladder's thread does not come back from it |
 | `piano-wifi-wake=0` | 1 (from the fifth round) | no device wake doorbell. By default mission mode asserts it (channel 127's doorbell = 1), as the MHI host's mission-mode transition does, it stays asserted while the levels run and is released when the ladder ends well; an M1 the chip reports anyway is answered with M2 and a wake toggle, an M0 by ringing every event ring and running channel again |
 | `piano-wifi-smmu=N` | 1 | 0: the SMMU is left alone (level 4 then needs stream 0x1401 to bypass already); 1: the endpoint's stream 0x1401 through a bypass context bank; 2: also the root port's 0x1400 |
@@ -517,8 +540,8 @@ PianoWifi: log: N line(s) held for M ms, K printed by the helper thread and L no
 ```
 
 Every line held from the doorbell on carries `[+N ms]`, its time after the doorbell: the gaps between them are the host's own, not
-the console's (wifi-4a's 2 s gap was the console's, §10.24). A `log: N later line(s) did not fit` line means more than 320 lines
-were written; the first 320 are the ones kept. A crash ends the holding: the held lines are printed first, then the `crash:`
+the console's (wifi-4a's 2 s gap was the console's, §10.24). A `log: N later line(s) did not fit` line means more than 480 lines
+were written (320 before the seventh round); the first 480 are the ones kept. A crash ends the holding: the held lines are printed first, then the `crash:`
 lines as they are written, so the report of a death is never what a full buffer drops. A `watchdog: level N is … ms past its hard
 deadline` line (from the helper, every 30 s) means the ladder's thread is stuck inside that level: the last held lines above it and
 the stage in the line say where.
@@ -601,24 +624,40 @@ PianoWifi: level 5: router: the chip said hello first and was answered      (or:
 PianoWifi: level 5: router: our answer to the chip's hello completed on channel 20 N ms after the router began (code 0x2, 1 packet(s) out, 1 completed)
 PianoWifi: level 5: the router is up (our node 1 port 0x4000, the chip's node N; the firmware's service 69 instance 0x101 on port P)
 PianoWifi: step 502: the radio's capability
+PianoWifi: step 502: answer to 0x0057 (transaction 1) after N ms: result 0 error 0 (accepted)     (one such line per answer)
 PianoWifi: step 503: registering for the firmware's indications
 PianoWifi: step 504: this host's capability
 PianoWifi: step 505: waiting for the firmware's memory request
+PianoWifi: step 505: indication 0x0035: the firmware asks for memory                              (one such line per indication)
 PianoWifi: step 506: answering the memory request
 PianoWifi: step 507: waiting for the firmware's memory to be ready
 PianoWifi: step 508: the chip's capability
 PianoWifi: step 509: the regulatory database
+PianoWifi: step 509: board identifiers: the chip's capability 0xff, the radio's capability 0xff; the downloads carry 0xff
+PianoWifi: step 509: the regulatory database (kind 4): regdb_xiaomi.bin, 24278 bytes, 4 segment(s) of at most 6144, file identifier 0xff
+PianoWifi: step 509: answer to 0x0025 (transaction 6, regdb_xiaomi.bin segment 1 of 4, 6144 bytes) after N ms: result 0 error 0 (accepted)
+  ... segments 2 and 3 ...
+PianoWifi: step 509: answer to 0x0025 (transaction 9, regdb_xiaomi.bin segment 4 of 4, 5846 bytes, the last) after N ms: result 0 error 0 (accepted)
 PianoWifi: step 510: the board file
+PianoWifi: step 510: board file bd_p81.elf for board 0xff: the chip names no board (0xff: its OTP carries no board identifier), so the stock API-1 default board file, ...
+PianoWifi: step 510: the board file (kind 1, at most 256 KiB sent): bd_p81.elf, 125272 bytes, 21 segment(s) of at most 6144, file identifier 0xff
+  ... 21 answer lines ...
 PianoWifi: step 511: the PHY microcode
+PianoWifi: step 511: phy_ucode20.elf, 290816 bytes, by address
 PianoWifi: step 512: the auxiliary microcode
+PianoWifi: step 512: aux_ucode20.elf, 61440 bytes, by address
 PianoWifi: step 513: the trace configuration
+PianoWifi: step 513: the trace configuration: qdss_trace_config_v2.cfg, 6241 bytes, 2 segment(s) of at most 6144, file identifier 0xff
 PianoWifi: step 514: waiting for the firmware to be ready
+PianoWifi: step 514: indication 0x0038: the firmware is ready
 PianoWifi: level 5: the chip: chip 0x..... family 0x..... system-on-chip 0x....., board 0x.., 1 radio(s)
+PianoWifi: level 5: board identifiers: the chip's capability 0xff, the radio's capability 0xff (only noted); board file bd_p81.elf
 PianoWifi: level 5: the firmware: version 0x........ built ................, capabilities 0x........, status 0x...., 1 MAC(s), .... mV
 PianoWifi: level 5: memory: 1 request(s), N region(s) of .... KiB asked for, .... KiB given
 PianoWifi: level 5: region 0: .... KiB of host memory at 0x........      (one line per region, at most eight)
 PianoWifi: level 5: N requests, N responses, 3 indications, M download segments, 0 shadow registers, 0 unexpected messages
 PianoWifi: level 5: the transport: N packets out, N in, N completions, 2 commands, 0 events dropped, 0 refused claims; the router: N packets in, N data, 0 unrouted, 0 refused sends
+PianoWifi: level 5: flow control: N data packet(s) asked for an answer, N RESUME_TX sent (from our port 0x4000 to the sender, naming node 1 port 0x4000), none owed
 PianoWifi: level 5: the firmware is ready after NNNN ms (step 518: done)
 PianoWifi: level 5: MHI after mission mode: N M0 event(s) answered by ringing every doorbell, 0 M1 answered with M2
 PianoWifi: level 5: at the firmware's ready: channel 20 state 0x2, the chip's read pointer at element N, ours N, written to N (0 owed), N completion(s) (last code 0x2), N doorbell(s); channel 21 state 0x2, ... (63 buffers posted), N completion(s) (last code 0x2, N bytes), N doorbell(s); data event ring: the chip at element N, this host at N; 0 event(s) dropped, 0 element(s) given back unread, 0 error code(s), 0 doorbell-mode event(s)
@@ -664,10 +703,17 @@ the result and error — the firmware did not like what it was told (the board f
 a file identifier that is not the board identifier it reported); `a firmware file could not be read` — the file is not in
 `image/peach/` of `modem_a` (the names are in §2), or `NativeUfs` stopped answering; `the window has no room for what the firmware
 asked for` — a region this driver must answer did not fit and was too small for the "ask again in smaller pieces" fallback (the
-memory line says how much was asked for); `a step timed out` — the firmware stopped answering, and the transport counters say
-whether anything came back at all; `the chip reported a system error or its crash dump environment` (or, before that, `the chip
+memory line says how much was asked for); `a step timed out` — the firmware stopped answering: the `unanswered: request …` line
+names the request (and the segment), the transport counters say whether anything came back at all, and the `flow control:` line
+whether the firmware's router was left waiting for us (P21, §10.26: `one still owed`, or a data count stuck at a multiple of ten
+with fewer answers sent than asked for, is this host's fault, not the firmware's); with a live chip the `dma:` lines that follow
+(TLP counters, AER, the SMMU's global and window bank fault registers, the MSI sink) say whether its DMA left the window or a
+request of it was refused on the link; `the chip reported a system error or its crash dump environment` (or, before that, `the chip
 died while channel N was being started`) — the firmware started and died, the step's name says where, and the `crash:` lines
-after it say why: the dump the firmware wrote into the segments level 4 gave it, decoded (§10.24's table).
+after it say why: the dump the firmware wrote into the segments level 4 gave it, decoded (§10.24's table). Each answer's own line
+carries the firmware's result and error codes: `(refused)` with an error is the firmware saying no to that message (for a
+download, to that segment). The trace configuration (step 513) is the one step whose refusal or silence does not end the level:
+`the trace configuration was refused` / `was not answered` / `is not on the partition`, then the wait for the ready indication.
 
 ### 8.6 Level 6 (the copy engine, the transport and a passive scan): one RAM boot
 
@@ -828,6 +874,17 @@ piano-usb-cold=0 piano-wifi=6 piano-wifi-iova=1 piano-wifi-band=0`, RAM boots wi
 | # | Boot args (beyond the image's) | Gate | Then |
 |---|---|---|---|
 | 6a | `piano-wifi=6 piano-wifi-iova=1` (the defaults: `deadline=60000`, `defer=1`) | the held lines coming out while the ladder runs (batches with `[+N ms]`, not only at the end); level 4 as in desk-dev14; then `63 receive buffers posted (channel 21's ring written to element 63, 1 doorbell(s))`, `router: the chip said hello first and was answered`, `our answer to the chip's hello completed on channel 20`, `the router is up … service 69 instance 0x101`, steps 502–518 with `3 indications`, the ring line with `0 event(s) dropped`, then level 6's gates (§8.6) | stops at 502 again: the ring line says which side did not move (channel 21's read pointer, the data event ring's positions, the hello's completion); a refusal or timeout in 502–514: §8.5's step meanings; `crash:` lines: §10.24's table (the host capability's sleep-clock bit is the first suspect if the firmware dies right after step 504) |
+
+6a ran as `ram-v32-probe` and on the installed v3.2a (the seventh round): level 5 reached step 509 and stopped there (P21, §10.26).
+
+**After §10.26 (the seventh round).** The installed system (its ESP carrying `piano-wifi=6 piano-wifi-iova=1`), or any RAM image
+with this driver and those two arguments. The firmware files are read at run time from the tablet's own `modem_a` (`image/peach/`,
+else `image/`): `amss20.bin`, `regdb_xiaomi.bin`, `bd_p81.elf`, `phy_ucode20.elf`, `aux_ucode20.elf`, `qdss_trace_config_v2.cfg`
+(the last may be absent); nothing for Wi-Fi is staged on the ESP or in a RAM image's addon.
+
+| # | Boot args (beyond the image's) | Gate | Then |
+|---|---|---|---|
+| 7a | `piano-wifi=6 piano-wifi-iova=1` | level 4 and steps 502–508 as in the seventh round; step 509's four `answer to 0x0025 … regdb_xiaomi.bin segment K of 4 … (accepted)` lines, the last with `the last`; step 510's board line (`bd_p81.elf for board 0xff`, 125272 bytes, 21 segments, kind 1) and its 21 accepted answers; 511 and 512 accepted; 513 accepted (or `refused` / `not answered`, which no longer ends the level); `indication 0x0038: the firmware is ready`; the `flow control:` line with as many RESUME_TX sent as asked for and `none owed`; with `piano-wifi=6` (`mode=1`) steps 515–517 accepted, `step 518: done`, then level 6's gates (§8.6: the transport's ready, the service-ready event, the scan's list) | a `(refused)` answer: its result/error and the segment name the message the firmware rejected (the board file's segments: the file or the kind; 511/512: the microcode's address or size); `unanswered` with `flow control: … one still owed` or fewer sent than asked: §10.26 is not finished; `unanswered` with the flow-control line healthy: the firmware itself stalled, and the `dma:` lines after it say whether its DMA left the window (an SMMU fault in bank N with a FAR) |
 
 ## 9. Fallback
 
@@ -1158,7 +1215,47 @@ network (§5.2 C).
    of levels 4, 5 and 6 has a hard deadline (`piano-wifi-deadline`, default 60 s) that ends its waits, with the helper's
    `watchdog:` line when the ladder's thread does not come back. The service's instance word is the one this family was expected to
    announce (`0x101`); another instance of service 69 is now taken with a line saying so, rather than costing a boot.
-   (needs-boot: §8.8 boot 6a)
+   (needs-boot: §8.8 boot 6a) **Confirmed on the tablet** by the seventh round: buffers posted, hello, service, steps 502–508.
+26. **P21: the firmware's router stopped sending after its tenth packet (ram-v32-probe 21:18, installed v3.2a 21:31,
+   2026-11-12).** Both boots: steps 502–508 answered, then step 509 (the regulatory database, four segments) with three answers
+   and no fourth; `9 requests, 8 responses, 2 indications, 4 download segments`, `11 packets out, 12 in`, `the router: 12 packets
+   in, 10 data`, stopped after 10018 ms, stage 504. The firmware alive (no RDDM, no system error).
+   **Evidence:** the firmware sent exactly ten data packets to our port (eight answers, two indications) and nothing after them,
+   with its eleventh (the answer to the last segment, which completed on channel 20 like every other request) due; the `11
+   packets out` are the hello, the nine requests and exactly one more, which can only have been the router's flow-control answer
+   (the copied router sends no other packet on its own). Ten is the router protocol's high-water mark.
+   **Mechanism (inferred from the protocol, reproduced by the host test):** a sender that sets `confirm_rx` counts what it has
+   sent to one destination node:port, asks for the confirmation on the fifth packet and stops sending to that destination at the
+   tenth until a RESUME_TX arrives whose payload names it (net/qrtr: `QRTR_TX_FLOW_HIGH` 10, `QRTR_TX_FLOW_LOW` 5; the resume is
+   matched on the payload's client node and port, which the receiver fills with its *own* address). `package/PianoPower/QcomQrtr.c`,
+   which `WifiQrtr.c` copies, answered with the *sender's* node and port in the payload, from the control port to the remote's
+   control port: a resume of a flow the firmware does not have. The firmware therefore asked once (its fifth packet, the answer
+   to the memory response), got nothing it recognised, and held its eleventh. The test's simulated firmware now does the
+   protocol's flow control: with every answer lost it stops exactly where the tablet did (the same nine/eight/two/four counts,
+   step 509 waiting on segment 4 of 4), the old answer resumes nothing, and the new one runs the stock files' sizes to the ready
+   indication.
+   **Ruled out (evidence):** the file and its message: `regdb_xiaomi.bin` (24278 bytes, the stock file Ubuntu ships as
+   `regdb.bin`), kind 4, file identifier `0xff`, the remaining size in `0x11`, the end flag on the last segment — the form of
+   Ubuntu's ath12k (read for facts), and the firmware accepted the first three segments of it with result 0 (a segment it rejects
+   is answered with a failure, not with silence). The board identifier: the chip's capability gives `0xff` (no board in this unit's
+   OTP) and Ubuntu's driver uses its default `0xff` the same way, then, with no board-2 container, its single API-1 board file —
+   `bd_p81.elf`, which is what step 510 sends (no board data had been sent yet: the four segments were all the regulatory
+   database's). TME-L (the security engine's patch, request `0x005b`, which another SM8750 tree sends before the regulatory
+   database and whose stock answer is the refusal 83): Ubuntu's kernel for this tablet goes from the chip's capability straight to
+   the regulatory database and its firmware lock (`piano-wlan.json`) has no TME-L file, and its Wi-Fi works — not needed
+   (inference from Ubuntu's source and file set; a boot would show it if the firmware ever asked).
+   **Changed:** the RESUME_TX goes from our port to the sender's node:port with our node and port in the payload (`WifiQrtr.c`'s
+   "PianoWifi change", `UPSTREAM`); one the link refuses is owed and sent again on the next turn (`qcom_qrtr_poll`); the
+   counters (`rx_confirms`, `resumes_sent`, `resume_owed`) in a `flow control:` line. Logging, so that the next stop names
+   itself: every answer and indication with its result and error codes and the segment it answers, the board identifiers of
+   both capabilities and the board file's reason, each download's file, size, segments and identifier, the unanswered request at
+   a timeout, the ring report in three lines (one 300-byte held line had cut it), the `dma:` lines at a stop with a live chip.
+   Behaviour aligned with Ubuntu on the way: the file identifier is the chip capability's board (0xff without one; the radio
+   capability's is only noted), the board file's kind comes from its ELF magic, each request has its own 10 s (an answer
+   restarts it), and the trace configuration (which Ubuntu's kernel may not send at all) no longer ends the level when refused or
+   unanswered. **Also affected, not changed here:** PianoPower's own `QcomQrtr.c` (the DSP's link) has the same answer; whether a
+   DSP service ever sets `confirm_rx` on that link was not checked (its owner's call: a service that does would go quiet after
+   ten packets). (needs-boot: §8.8 boot 7a)
 
 ## 11. Licence note
 
@@ -1194,6 +1291,13 @@ begins with its element count (one byte here, two for the data of a download); a
 A response always carries tag `0x02`: a 16-bit result then a 16-bit error, result 0 being success. The tags below are what this
 driver writes and reads (`package/PianoWifi/WifiWlfw.h`, host-tested in `tests/qmi_host.cpp` against a simulated firmware).
 
+One layer down, in the router that carries every message, flow control (P21, §10.26): the firmware's router sets `confirm_rx` on its fifth data packet to
+our port and sends nothing more to it from its tenth until a RESUME_TX arrives that names our port. This side answers every
+packet that asks, at once: a version 1 control packet of type 7 from our node and port (`1`, `0x4000`) to the sender's node and
+port, its 20-byte payload the command (7) then **our** node and port. This side never sets `confirm_rx` itself, which the
+firmware does not require. Every answer and indication is logged with its result and error codes (`answer to 0x…`,
+`indication 0x…`), and a request still outstanding when its deadline passes is named (`unanswered: request …`).
+
 | Step | Message | Id | Direction | What is in it |
 |---|---|---|---|---|
 | 502 | radio capability | `0x0057` | request / response | request: empty. Response: `0x10` radios (1), `0x11` board identifier (4), `0x13` single-chip multi-link (1). Optional: a refusal is not a failure |
@@ -1203,10 +1307,10 @@ driver writes and reads (`package/PianoWifi/WifiWlfw.h`, host-tested in `tests/q
 | 506 | the addresses | `0x0036` | request / response | `0x01`: a one-byte count, then per region: address (8), size (4), type (4), restore (1) = 0. A count of 0 is the "ask again in smaller pieces" form, which the firmware answers with a failure and a fresh request. This driver answers types 1, 3, 4, 9 and 0xb with memory of its window and every other type with the address 0 |
 | 507 | the memory is ready | `0x0037` | indication | empty |
 | 508 | chip capability | `0x0024` | request / response | request: empty. Response: `0x10` {chip (4), family (4)}, `0x11` {board (4)}, `0x12` {system-on-chip (4)}, `0x13` {firmware version (4), build time as a counted string}, `0x14` build identifier (a string of its own), `0x15` radios (1), `0x16` millivolts (4), `0x17` timer frequency (4), `0x18` one-time-programmable version (4), `0x19` calibration read timeout (4), `0x1a` capabilities (8), `0x1b` chain capability (4), `0x1c` four {start (8), size (8)} device-memory entries |
-| 509, 510 | a file in segments | `0x0025` | request / response | `0x01` valid (1) = 1, `0x10` file identifier (4) = the board identifier the chip reported, `0x11` what is still to come including this segment (4), `0x12` segment number (4), `0x13` the data (a two-byte count then at most 6144 bytes), `0x14` last segment (1), `0x15` kind (1): 4 the regulatory database (`regdb_xiaomi.bin`), 1 an ELF board file (`bd_p81.elf`, capped at 256 KiB - this chip's board-file size) |
+| 509, 510 | a file in segments | `0x0025` | request / response | `0x01` valid (1) = 1, `0x10` file identifier (4) = the board of the chip capability's `0x11` (`0xff` when it gives none; the radio capability's board is not used), `0x11` what is still to come including this segment (4), `0x12` segment number (4), `0x13` the data (a two-byte count then at most 6144 bytes), `0x14` last segment (1), `0x15` kind (1): 4 the regulatory database (`regdb_xiaomi.bin`, 24278 bytes: 4 segments), 1 an ELF board file or 0 one that is not (from the file's first four bytes; `bd_p81.elf` is an ELF, 125272 bytes: 21 segments, capped at 256 KiB - this chip's board-file size). One answer per segment. This unit's chip gives board `0xff` (no board in its OTP): with no board-2 container in the stock image, the board file is the single API-1 one, `bd_p81.elf` (the choice the chip's own driver makes, §10.26) |
 | 511 | the PHY microcode | `0x003c` | request / response | `0x01` address (8), `0x02` size (4): `phy_ucode20.elf` read into the window |
 | 512 | the auxiliary microcode | `0x005a` | request / response | the same two tags: `aux_ucode20.elf`. This chip's entry asks for it; the WCN7850's does not |
-| 513 | the trace configuration | `0x0044` | request / response | `0x10` what is still to come (4), `0x11` segment number (4), `0x12` the data (a two-byte count then at most 6144 bytes), `0x13` last segment (1): `qdss_trace_config_v2.cfg`. This chip does not set the "configuration missing" feature bit, so it is sent |
+| 513 | the trace configuration | `0x0044` | request / response | `0x10` what is still to come (4), `0x11` segment number (4), `0x12` the data (a two-byte count then at most 6144 bytes), `0x13` last segment (1): `qdss_trace_config_v2.cfg`. This chip does not set the "configuration missing" feature bit, so it is sent; a refusal, no answer within the request's deadline, or no such file is logged and the client goes on to wait for the ready indication |
 | 514 | the firmware is ready | `0x0038` | indication | empty. **Level 5's gate** |
 | 515 | the firmware's options | `0x002f` | request / response | `0x10` firmware logging (1) = 1 (only with `piano-wifi-mode=1`) |
 | 516 | the host's configuration | `0x0023` | request / response | `0x10` host version (a string of its own) = `WIN`, `0x11` the copy engine's pipes: a count then per pipe {number, direction, entries, largest transfer, flags} (nine of them, below), `0x12` the services' pipes: a count then per entry {service, direction, pipe} (fourteen, below), `0x17` the shadow registers: a count then one 32-bit address each (40 with `piano-wifi-shadow=1`, none otherwise) |
