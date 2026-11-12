@@ -2215,8 +2215,10 @@ int level5(PowerState &power, const Options &opt)
          chipFirst ? "answer to the chip's hello" : "hello", gRouter.hello_sent ? "sent and never completed" : "not sent",
          gIpcr.sent);
   if (died || !gRouter.hello_received || !wlfwFind(&node, &port)) {
-    note("level 5: hello %s, %u services announced, %u packets in (%u unrouted)%s", gRouter.hello_received ? "answered" : "unanswered",
-         gRouter.remote_count, gRouter.rx_packets, gRouter.rx_unrouted, levelLate() ? "; the level's hard deadline passed" : "");
+    note("level 5: hello %s, %u services announced, %u packets in (%u unrouted), %u received that were not router packets (the "
+         "transport delivered %u)%s",
+         gRouter.hello_received ? "answered" : "unanswered", gRouter.remote_count, gRouter.rx_packets, gRouter.rx_unrouted,
+         gRouter.rx_bad, gIpcr.received, levelLate() ? "; the level's hard deadline passed" : "");
     ipcrReport("waiting for the firmware's service");
     for (uint32_t r = 0; r < gRouter.remote_count && r < 8; ++r)
       note("level 5: the chip announced service %u instance %#x on node %u port %#x", gRouter.remote[r].service,

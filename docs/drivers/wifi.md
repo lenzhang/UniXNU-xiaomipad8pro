@@ -1151,6 +1151,7 @@ network (§5.2 C).
    | Ring-full check | the host's own pointers | the chip's context read pointer | the host's read pointer |
    | Send on a channel that does not run | refused | queued | refused, the claim given back |
    | Event ring doorbells | the high half first | low first (level 4's acknowledgements) | high first (`doorbell64`) |
+   | Router header | net/qrtr reads version 1 and version 2 headers and sends version 1 | version 1 only (anything else counted as bad, silently) | both read (`WifiQrtr.c`'s third addition, `UPSTREAM`), version 1 sent; the bad count in the stage 502 line |
    | Diagnostics | — | none | the ring line (both channels and the data event ring, the chip's and this host's pointers), the hello's completion, the services the chip announced |
    Also (desk-dev8n, 2026-11-12 19:41: the boot hung after the doorbell and printed nothing for 30 minutes, because every line was
    held until the ladder's end): the held lines are printed by a helper thread at every phase change and within a second, and each

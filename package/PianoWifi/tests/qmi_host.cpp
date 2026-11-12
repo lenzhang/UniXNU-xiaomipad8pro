@@ -1173,6 +1173,59 @@ static void testRouter()
   CHECK(buffer[QCOM_QRTR_HEADER + 5] == 0 && buffer[QCOM_QRTR_HEADER + 7] == 0);   // the padding is zeroed
   // A payload that does not fit the buffer is refused, not truncated.
   CHECK(qcom_qrtr_send_buffer(&h.router, buffer, 64, kQrtrClientPort, node, port, 4096) == -1);
+
+  // The protocol's version 2 header (16 bytes, 16-bit nodes and ports, 0xffff the control port, optional words after it), which a
+  // remote may use while this side sends version 1: a hello, an announcement and a data packet are read as their version 1 forms.
+  QcomQrtr v2;
+  unsigned v2Data = 0;
+  uint32_t v2From = 0, v2Length = 0;
+  qcom_qrtr_init(&v2, kQrtrLocalNode, [](void *, const uint8_t *, uint32_t) { return 0; }, nullptr);
+  CHECK(qcom_qrtr_add_client(&v2, kQrtrClientPort, [](void *ctx, QcomQrtr *, uint32_t, uint32_t, uint32_t from, const uint8_t *,
+                                                      uint32_t length) {
+          auto *seen = static_cast<std::pair<unsigned *, std::pair<uint32_t *, uint32_t *>> *>(ctx);
+          ++*seen->first;
+          *seen->second.first = from;
+          *seen->second.second = length;
+        }, nullptr) == 0);
+  std::pair<unsigned *, std::pair<uint32_t *, uint32_t *>> seen{&v2Data, {&v2From, &v2Length}};
+  v2.local[0].context = &seen;
+  auto v2Packet = [](uint8_t type, uint8_t flags, uint8_t optWords, uint16_t srcNode, uint16_t srcPort, uint16_t dstNode,
+                     uint16_t dstPort, const std::vector<uint8_t> &payload) {
+    std::vector<uint8_t> p(16 + 4 * optWords + payload.size(), 0);
+    p[0] = 3;
+    p[1] = type;
+    p[2] = flags;
+    p[3] = optWords;
+    put32(p.data() + 4, uint32_t(payload.size()));
+    p[8] = uint8_t(srcNode), p[9] = uint8_t(srcNode >> 8), p[10] = uint8_t(srcPort), p[11] = uint8_t(srcPort >> 8);
+    p[12] = uint8_t(dstNode), p[13] = uint8_t(dstNode >> 8), p[14] = uint8_t(dstPort), p[15] = uint8_t(dstPort >> 8);
+    std::memcpy(p.data() + 16 + 4 * optWords, payload.data(), payload.size());
+    return p;
+  };
+  std::vector<uint8_t> hello(20, 0);
+  put32(hello.data(), QCOM_QRTR_HELLO);
+  CHECK(qcom_qrtr_receive(&v2, v2Packet(QCOM_QRTR_HELLO, 0, 0, 7, 0xffff, 0xffff, 0xffff, hello).data(), 36) == 0);
+  CHECK(v2.hello_received && v2.remote_node == 7 && v2.hello_sent);
+  std::vector<uint8_t> server(20, 0);
+  put32(server.data(), QCOM_QRTR_NEW_SERVER);
+  put32(server.data() + 4, kWlfwService);
+  put32(server.data() + 8, kWlfwInstanceWord);
+  put32(server.data() + 12, 7);
+  put32(server.data() + 16, 0x1d);
+  const std::vector<uint8_t> announce = v2Packet(QCOM_QRTR_NEW_SERVER, 0, 1, 7, 0xffff, 1, 0xffff, server);   // one optional word
+  CHECK(qcom_qrtr_receive(&v2, announce.data(), uint32_t(announce.size())) == 0);
+  uint32_t n2 = 0, p2 = 0;
+  CHECK(qcom_qrtr_find_service(&v2, kWlfwService, kWlfwInstanceWord, &n2, &p2) == 0 && n2 == 7 && p2 == 0x1d);
+  const std::vector<uint8_t> data = v2Packet(QCOM_QRTR_DATA, 1, 0, 7, 0x1d, 1, uint16_t(kQrtrClientPort), {1, 2, 3, 4, 5});
+  const uint32_t resumes = v2.resumes_sent;
+  CHECK(qcom_qrtr_receive(&v2, data.data(), uint32_t(data.size())) == 0);
+  CHECK(v2Data == 1 && v2From == 0x1d && v2Length == 5 && v2.resumes_sent == resumes + 1);   // flags bit 0: RESUME_TX answered
+  // A version 2 header that claims more than the packet holds, and a version nobody has, are refused.
+  std::vector<uint8_t> lying = v2Packet(QCOM_QRTR_DATA, 0, 0, 7, 0x1d, 1, uint16_t(kQrtrClientPort), {1, 2, 3, 4});
+  put32(lying.data() + 4, 400);
+  CHECK(qcom_qrtr_receive(&v2, lying.data(), uint32_t(lying.size())) == -1);
+  lying[0] = 2;
+  CHECK(qcom_qrtr_receive(&v2, lying.data(), uint32_t(lying.size())) == -1 && v2.rx_bad == 2);
 }
 
 // ========================================================================================================= the WLFW client

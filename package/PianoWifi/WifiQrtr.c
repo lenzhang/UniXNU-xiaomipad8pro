@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause-Patent */
 /* package/PianoPower/QcomQrtr.c of this repository, copied with these provenance lines, the include of the copied header and the
- * two additions marked "PianoWifi addition" at the end (UPSTREAM has its sha256). PianoPower is not modified. */
+ * additions marked "PianoWifi addition": two at the end, and the received header in either version (before qcom_qrtr_receive,
+ * which reads it through that; UPSTREAM has the original's sha256). PianoPower is not modified. */
 #include "WifiQrtr.h"
 
 static uint16_t le16(const uint8_t *p) {return (uint16_t)(p[0] | (uint16_t)p[1] << 8);}
@@ -112,13 +113,36 @@ static void remote_server(QcomQrtr *q, const uint8_t *w, int add)
     q->remote_count++;
 }
 
+/* PianoWifi addition: the header of a received packet in either version the router protocol has. Version 1 (the first word 1):
+ * 32 bytes of 32-bit words, as this file sends. Version 2 (the first byte 3): version, type, flags (bit 0: the sender wants a
+ * RESUME_TX), the count of optional 32-bit words, a 32-bit size, then 16-bit source node and port and destination node and port
+ * (port 0xffff is the control port), and the optional words; a remote may use it on a link where this side sends version 1.
+ * Returns the header's length, 0 when it is not a header. */
+static uint32_t header(const uint8_t *p, uint32_t length, uint32_t *type, uint32_t *src_node, uint32_t *src_port,
+                       uint32_t *confirm, uint32_t *size, uint32_t *dst_port)
+{
+    if (length >= QCOM_QRTR_HEADER && le32(p) == 1) {
+        *type = le32(p + 4); *src_node = le32(p + 8); *src_port = le32(p + 12);
+        *confirm = le32(p + 16); *size = le32(p + 20); *dst_port = le32(p + 28);
+        return QCOM_QRTR_HEADER;
+    }
+    if (length < 16 || p[0] != 3) return 0;
+    const uint32_t bytes = 16u + 4u * p[3];
+    if (length < bytes) return 0;
+    *type = p[1]; *confirm = p[2] & 1u; *size = le32(p + 4);
+    *src_node = le16(p + 8); *src_port = le16(p + 10); *dst_port = le16(p + 14);
+    if (*src_port == 0xffffu) *src_port = QCOM_QRTR_PORT_CTRL;
+    if (*dst_port == 0xffffu) *dst_port = QCOM_QRTR_PORT_CTRL;
+    return bytes;
+}
+
 int qcom_qrtr_receive(QcomQrtr *q, const uint8_t *packet, uint32_t length)
 {
-    if (length < QCOM_QRTR_HEADER || le32(packet) != 1) {q->rx_bad++; return -1;}
-    const uint32_t type = le32(packet + 4), src_node = le32(packet + 8), src_port = le32(packet + 12);
-    const uint32_t confirm = le32(packet + 16), size = le32(packet + 20), dst_port = le32(packet + 28);
-    if (size > length - QCOM_QRTR_HEADER) {q->rx_bad++; return -1;}
-    const uint8_t *data = packet + QCOM_QRTR_HEADER;
+    uint32_t type = 0, src_node = 0, src_port = 0, confirm = 0, size = 0, dst_port = 0;
+    const uint32_t bytes = header(packet, length, &type, &src_node, &src_port, &confirm, &size, &dst_port);
+    if (!bytes) {q->rx_bad++; return -1;}
+    if (size > length - bytes) {q->rx_bad++; return -1;}
+    const uint8_t *data = packet + bytes;
     q->rx_packets++;
     if (type == QCOM_QRTR_DATA) {
         q->rx_data++;

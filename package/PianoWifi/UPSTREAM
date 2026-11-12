@@ -66,7 +66,10 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
         the calibration data's 6144-byte segments are never copied again and never stand on a kernel stack (the copied
         qcom_qrtr_send_data builds its packet on the stack and is bounded by QCOM_QRTR_MAX_DATA = 1024);
       qcom_qrtr_find_service: the node and port of a remote service matched on its instance word as well, which is how the WLAN
-        firmware's service (69, version 1, instance 1) is told from another version of itself on the same link.
+        firmware's service (69, version 1, instance 1) is told from another version of itself on the same link;
+      and (WifiQrtr.c only, 2026-11-12 sixth round) the received header read by a helper that takes the protocol's version 2
+        header as well as version 1 (qcom_qrtr_receive's first lines changed to call it; the rest of it as copied), since the
+        chip's router may speak version 2 while this side sends version 1 (net/qrtr's two header layouts, facts only).
     PianoPower is not modified; its own QRTR path (the DSP) keeps using its file.
   package/PianoDpu/DpuSmmu.h (sha256 9cc7d830e27084905081222f6ab4ebe17786709dac869649e706504303f1ae30) and
   package/PianoUsbHost/SmmuIdentity.h (sha256 d0cdab46fc2815d45895d6c652e610b0d9969b5bdbed6496aea3ecd5b4cba949) -> WifiSmmuWindow.h:
