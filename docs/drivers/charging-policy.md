@@ -21,6 +21,11 @@ on with the policy), the charge current of a trusted Rp (1500 mA), the steps mea
 driver of ours writes the charger blocks. Built and host-tested, not run: `piano-power-chgen` (default 1: the enable command set
 again when it reads off; 2: a 2 s pulse of it when it reads on and the charger disabled) and a `chgr: changed since` record of every
 register change between two reports, which the next boot that starts charging turns into the stop's exact register picture.
+**2026-11-12 late (§20):** the 21:18 and 21:31 boots' record decoded against the family's public layouts: nothing in CHGR names a
+reason beyond "disabled" (+0x0a bit 0 is set exactly while DISABLED), the input path reads healthy, and the level-2 boots show that a
+DSP ready before the stop keeps the charger charging. Built and host-tested, not run: the whole complex (seven blocks, status and
+configuration) logged and diffed with every report, a 2 s watch of the stop's moment, the picture in the IORegistry for a shell, and
+`piano-power-chgfix` (default 0; 1: the enable command pulsed, then AICL restarted; 2: also the USB input suspended 1 s), level 1.
 
 ## 0. The answer
 
@@ -928,3 +933,168 @@ mutation (no state gate) fails four checks.
   change` three times (an edge does not restart it; next §17.6: a replug at the login window, an early DSP, a wall charger).
 - The desk-dev image's command line is 990 bytes against the limit of 1000: `piano-power-chgen=2` does not fit there and goes in an
   image with a shorter line (e.g. `out/ram` of `tooling/k27/build-native-image.sh` with `PIANO_EXTRA_ARGS`).
+
+## 20. What the stop's bytes say, the whole complex in view, and a gated recovery (2026-11-12 late; built, not run)
+
+Runs (the USB console logs, local, not published): the 21:18 RAM boot (`v32-probe`, level 1, 84-85 %, +480 mA at the start), the
+installed system's 21:31 boot (v3.2a, level 1, 85 %, +823 mA at the start), dev14, dev15 and v3.1 (20:18-21:00, the block survey),
+and the survey of every native boot of 11-11 and 11-12 with PianoPower (the `dcdc` field of the `usb:` line is CHGR 0x2600). **M** =
+measured, **F** = a register fact of another generation of the family, read for the facts only (SMB5: the downstream charger driver
+of the PM8150B generation, `smb5-reg.h`, `qpnp-smb5.c`, `smb5-lib.c` and its vendor DT; PMI8998: mainline `qcom_smbx.c`; all GPL),
+**I** = inferred. No PMIH010x register map is public; every name below is the family's, placed on piano by inference.
+
+### 20.1 The blocks
+
+| piano (TYPE/SUBTYPE) | Family place (PM8150B) | Evidence |
+|---|---|---|
+| 0x2b00 (02/c3) Type-C | 0x1500 | M: attach, CC and Rp in every boot; SMB5's status decode fits byte for byte (F): +0x06 0x02 SNK_RP_3P0, +0x09 0x63 bit 5 the attach state, +0x0b 0x29 attached on CC1 with the debounce done |
+| 0x2600 (02/be) CHGR | Type-C − 0x500 | I: +0x06 bits 2:0 read 3 while the packs take +470..+970 mA and 7 when they take 0, in every boot (M); 3 is full-on and 7 disable in both enums (F; SMB5: 0 inhibit, 1 trickle, 2 pre, 3 full-on, 4 taper, 5 terminate, 6 pause, 7 disable) |
+| 0x2700 (02/bf) DCDC | − 0x400 | I: +0x06..+0x09 0x1e = 30 × 50 mA = 1500 mA, SMB5's ICL_MAX_STATUS, ICL_STATUS and AICL_ICL_STATUS in 50 mA steps (F): a CDP's 1.5 A; +0x0a 0x01 AICL_DONE (F); rt 0x80 switcher-power-ok in SMB5's interrupt order (F); the same in boots that start charging and boots that start disabled (M) |
+| 0x2800 (02/c0) BATIF | − 0x300 | I: status bytes 0; rt 0x40 while charging and 0 after (M); bit 6 is "buck-oc" in SMB5's order (F), which a charger would not run with: the bits differ here |
+| 0x2900 (02/c1) USBIN | − 0x200 | I: rt 0x11 in every boot (M), bit 4 usbin-plugin (F); +0x07/+0x08 do not read as SMB5's APSD status (+0x08 0x0f names four charger types) |
+| 0x2a00 (02/c2) DCIN | − 0x100 | I: status 0, rt 0x04 |
+| 0x2c00 (02/c4) MISC | + 0x100 | I: watchdog off (§19); +0x08 0x02 in every boot (SMB5: SKIN_TEMP_UB, F); +0x06 bit 6 follows the load (§20.2); rt 0 always (M; SMB5: bark 1, aicl-fail 2, F) |
+| 0x2300 (02/bb) | none | M: +0x06 0x87, +0x0a 0x05, +0x0c 0, +0x0d 0x10, +0x51..53 07 03 02 in every boot, charging or not: a second charger-state block that is always DISABLED (I) |
+
+### 20.2 The CHGR bytes, charging and DISABLED (every boot of 11-11/11-12)
+
+| CHGR | Charging (M) | DISABLED (M) | Reading |
+|---|---|---|---|
+| +0x06 | 0xc3, 0x83 | 0x87 | state 3 → 7 |
+| +0x07 | 0x19 | 0x00 | set only while charging, so not error bits (an error would appear at the stop); PMI8998's layout reads 0x19 as "terminal missing, too cold", SMB5 names bit 1 only (BAT_OV): the layout differs (I) |
+| +0x08, +0x09 | 0a/03, 06/0b, 0e/0b, 02/03 | the same | toggle in both states together with +0x0d bits 3/2: comparator-like status, not the stop (M) |
+| **+0x0a** | 0x00 or 0x04 | **0x05**, always | **bit 0 set exactly while DISABLED**, in every boot and in 0x2300 too; bit 2 varies in both states. A "disabled" flag, or a reason field whose only value ever seen is 1 (I); PMI8998's +0x0a (the post-JEITA charge current) does not fit |
+| +0x0b | 0xbe; 0xa0 once the DSP ran | the same | not the stop (M); the DSP's firmware changes it (I: it writes a configuration this byte mirrors) |
+| +0x0c | 0x0a, 0x14 | 0x00 | the charge current in force, 50 mA steps (I): 0x0a = 500 mA with the packs at +472..+481 mA, 0x14 = 1000 mA with +823..+971 mA (M) |
+| +0x0d | 28, 24, 14, 04, 34, 38, 08, 18 | the same set | bit 3 or bit 2, never both or neither; bits 5/4 follow the load (0x18 while the packs discharge, 0x38 at 0 mA). SMB5's battery-temperature bits would read hot and cold at once: not those (I); not the stop (M) |
+| rt +0x10 | 0x22, 0x02 | 0x20, 0x00 | bit 1 exactly while charging (SMB5: chg-state-change, F), bit 5 varies; bit 0 (chgr-error) never set (M) |
+| +0x40..+0x47, +0x50..+0x57 | | | unchanged across every stop the change logger saw (M): not the enable command, not CHGR_CFG2 |
+
+MISC +0x06 bit 6 (the 21:31 boot: set at [30 s] with +502 mA, clear at [60 s] after the stop): SMB5's THERM_REG_ACTIVE (F). It is
+also set while DISABLED with the packs discharging (21:31 [150 s] −558 mA; dev14 [330 s] −255 mA) and before v3.1's stop (+553 mA),
+and the 21:18 and dev15 boots stopped without it (M): a regulation flag that follows the load, not a warning of the stop (I).
+
+### 20.3 What is ruled out, and the new fact
+
+- **No reason code beyond "disabled".** What changes at the stop is its consequence (the current to 0, the charging bits off,
+  +0x0a bit 0 on), and 0x2300, which never charges, shows the same signature (M, I). The CHGR error interrupt never asserts (M).
+- **Not the input**: DCDC (1500 mA, AICL done) and USBIN (plug-in) read the same in boots that start charging and boots that start
+  disabled, and the system runs from USB after the stop (M).
+- **Not a family safety timer** (192-1536 min for fast charge, CHGR +0xA2, F; a pre-charge timer does not stop a full-on charge),
+  **not an AICL rerun** (AICL reads done after the stop, M). The 30-60 s remains unexplained by any named timer.
+- **New (M): a DSP that runs before the stop keeps the charger charging.** Of the level-2 boots of 11-11/11-12, the two whose DSP
+  was ready before the stop (`03:26` and `13:19`, the DSP's bring-up at 30-60 s of PianoPower) kept CHGR at 0xc3 for 56 and 31
+  reports to the end (they drained only because the firmware's input limit was 100 mA, §17); every other one stopped before its
+  DSP was ready and stayed DISABLED with the DSP running. So the stop is what this PMIC does when no charger host has taken over in
+  time; the firmware prevents it when it is early and does not undo it when it is late (I). This makes §17.6's second test (the DSP
+  early, `piano-power=2 piano-power-delay=0`) the most promising one, and the snapshot below shows what the firmware writes.
+
+### 20.4 Built: the whole complex in view (every level, read only, on by default)
+
+`ChargerFix.h` (`ChargerComplex`, `ChargerWatch`) and PianoPower.cpp:
+
+- At start: the seven blocks at their places from Type-C, and their configuration as the boot stages left it, `+0x40..+0xbf` of
+  each (one line a block): the charge current (+0x61), float (+0x70), inhibit (+0x72), JEITA (+0x90..), safety timer (+0xA0/A2), the
+  AICL rerun time (MISC +0x61), the thermal-regulation sources (MISC +0x70), USBIN's ICL and AICL options (+0x70, +0x80) in the
+  family's places.
+- With every report: all seven blocks (+0x06..+0x10 and +0x40..+0xbf, 126 reads of 8 bytes) and one `chgr: changed since` line of
+  every byte that moved (it replaces §19's CHGR/MISC-only line). At level 2 the report after the DSP's start lists what its firmware
+  wrote.
+- The watch (`piano-power-chgwatch=S`, default 180, 0 off): the status bytes of the seven blocks every 2 s for the first S seconds
+  and for 90 s after each recovery step; a change of CHGR's state is a `chgr: watch:` line with the two ticks' times, the XNU uptime
+  and every status byte that moved within those 2 s. Then nothing (no polling past the window).
+- The IORegistry (§20.6), refreshed with every report, watch change and recovery event.
+
+```
+complex: the blocks at their SCHG places from Type-C (inferred): CHGR 0x2600 APID 702 EE 0 type 02/be, DCDC 0x2700 ..., MISC 0x2c00 ...
+complex: status +06..+0f, rt: CHGR c3 19 0a 03 00 be 0a 28 00 00 rt 22 | DCDC 1e 1e 1e 1e 01 e2 08 00 .. rt 80 | ... | MISC 00 00 02 ...
+complex: CHGR 0x2600 +40..+bf: 04450500... (16 groups of 8 bytes, "--" for a group that did not read)
+complex: watching the charger's state every 2 s for 180 s (piano-power-chgwatch; read only)
+[38s] chgr: watch: CHGR state 3 (full-on) -> 7 (DISABLED), the STOP, between +36.0 s and +38.0 s (XNU uptime 52.4 s): CHGR +06 c3>87 ...
+[60s] chgr: changed since [30s]: CHGR +06 c3>87 +07 19>00 +0a 00>05 +0c 0a>00 +0d 28>38 +10 22>20; BATIF +10 40>00; ...
+```
+
+### 20.5 Built: the recovery (`piano-power-chgfix`, level 1 only, default 0)
+
+When CHGR has read DISABLED for 20 s with its enable command on, CHGR_CFG2 bits 7/6 clear, and every gate of §19.3's set passing (a
+source on the port, both packs read, below 4350 mV, not full, 15-45 °C; level 1, not with the DSP), one step at a time, each judged
+15 s after its last write (the CHGR state and the packs read afresh: `CHARGING again` at +50 mA, `the charger reads a charging state`,
+`the charger left DISABLED`, or `no change`):
+
+| Step | `chgfix` | Write (each read back and logged) | Why (F) |
+|---|---|---|---|
+| A | 1, 2 | CHGR +0x42 bit 0 cleared, 2 s, set again (ChargerEnable's allowlist, `fixPulse`) | SMB5 toggles the enable command off and on around a JEITA zone change (its soft-JEITA arbitration) |
+| B | 1, 2 | MISC +0x44 = 0x02 (only when it reads 0x00, a command register at rest; else passed over) | SMB5's AICL_CMD: bit 1 restart, bit 0 rerun |
+| C | 2 | USBIN +0x40 bit 0 set, 1 s, cleared (only with USBIN rt bit 4 set and bit 0 clear before; the clear retried every second until it reads back) | SMB5's USBIN_CMD_IL suspend: the driver's input suspend, also its charge-termination workaround (a soft replug) |
+
+The next step 15 s after a `no change`; a step that works is the one used again on a later stop (two minutes apart); six attempts
+a boot; when no step works, `no step brought charging back: none more this boot`. The allowlist (`ChargerFix::allowed`) lets
+through MISC +0x44 0x00 → 0x02 and USBIN +0x40 bit 0 alone, each only while that step's write is armed; CHGR +0x42 goes through
+ChargerEnable's. No limit is written (currents, float, JEITA, timers, inhibit). A reset inside step A's 2 s leaves the command
+off: chgen=1 (the default) sets it at the next boot's first report. A reset inside step C's second leaves the input suspended: with
+`chgfix` 1 or 2 the next boot clears it at start (`chgfix: start guard`) when a source is attached. Not taken: an APSD rerun (USBIN
++0x41; it redoes BC1.2 on the data lines the USB console and network use), a charge-current write (a limit), the DSP's "charger
+reset" (no DSP at level 1; no public PMIC register).
+
+Log lines (all `PianoPower: `):
+
+```
+chgfix: piano-power-chgfix=1 (steps A (the enable command pulsed) and B (AICL restarted))
+[60s] chgfix: step A (the enable command pulsed) (attempt 1): CHGR 0x2600 +0x42 0x05 -> 0x04: ok, read back 0x04, CHGR state now 7 (DISABLED) (channel status 0x1)
+[62s] chgen: chgfix pulse on: CHGR 0x2600 +0x42 0x04 -> 0x05 (bit 0, the charging enable command): ok, read back 0x05, state now ...
+[64s] chgr: watch: CHGR state 7 (DISABLED) -> 3 (full-on) between ...           (when A works)
+[77s] chgfix: after step A (the enable command pulsed) (attempt 1): CHGR state 3 (full-on), the packs +468 mA: CHARGING again
+[92s] chgfix: step B (AICL restarted) (attempt 2): MISC 0x2c00 +0x44 0x00 -> 0x02: ok, read back 0x00, CHGR state now 7 (DISABLED) ...
+[107s] chgfix: after step B (AICL restarted) (attempt 2): CHGR state 7 (DISABLED), the packs +0 mA: no change
+[107s] chgfix: no step brought charging back: none more this boot (2 attempts, 0 worked)
+```
+
+### 20.6 Watching the charger live on the installed system (read only, no reboot)
+
+PianoPower publishes on its IORegistry entry (class `PianoPower`; the owner's shell reads it, no root needed):
+
+- `PianoChargerText`: one line, `[Ns] state 7 (DISABLED), packs +0 mA 4266 mV 84 %, stops 1, piano-power-chgfix=1: ... | CHGR 87 00
+  0a 03 05 be 00 38 00 00 rt 20 | DCDC ... | BATIF ... | USBIN ... | DCIN ... | TYPEC ... | MISC ...`;
+- `PianoCharger`: a dictionary: `time-s`, `uptime-ms`, `snapshot-s`, `state`, `state-name`, `packs-mA` (text, signed), `packs-mV`,
+  `soc`, each block's status bytes +0x06..+0x10 as data (`CHGR`, `DCDC`, `BATIF`, `USBIN`, `DCIN`, `TYPEC`, `MISC`), each block's
+  +0x40..+0xbf (`CHGR-40` ..), `stops`, `first-stop-s`, `first-stop-uptime-ms`, `watching`, `chgfix`, `chgfix-attempts`;
+- `PianoChargerChanges`: the last eight watch changes and recovery writes/judges, oldest first.
+
+```sh
+ioreg -r -c PianoPower -l -w0 -d1 | grep -E '"PianoCharger(Text|Changes)"'      # the line and the last changes
+ioreg -r -c PianoPower -l -w0 -d1 | grep '"PianoCharger" ='                      # the dictionary (block bytes as <hex>)
+while sleep 10; do ioreg -r -c PianoPower -l -w0 -d1 | grep '"PianoChargerText"'; done
+sudo /usr/bin/log show --last 10m --style compact --predicate 'eventMessage CONTAINS "PianoPower: "' \
+  | grep -E 'complex|chgr|chgfix|\[[0-9]+s\] (battery|charging)'                  # the kernel lines (root; zsh's log is a builtin)
+```
+
+The picture is refreshed every report (30 s), at once on a watch change and on each recovery event; nothing is read on demand.
+
+### 20.7 Tests (host)
+
+`power_host` `testChgFix`: the 21:18 boot's complex (dev14's arbiter map, the DCDC, USBIN and MISC bytes) against a charger model
+that charges until 40 s and then reads DISABLED with its command on, restarted by one chosen step: the places and both snapshot
+parts, the diff (status only unless both are full; a cut line ends in `...`) and the status line; `chgfix=0`: the watch catches the
+stop between two ticks (40.0-42.0 s) with its bytes, 91 ticks, then none, nothing written in 10 minutes; `=1` with a charger an edge
+restarts: A at 60 s (stop + 20 s), its restore at 62 s, the judge at 77 s `CHARGING again`, nothing but +0x42 written, chgen counts
+none of it as another's; an AICL-cured charger: A `no change`, B at 92 s, charging; a charger neither cures at `=1`: A, B, then none
+more, no USBIN write; `=2` with a suspend-cured one: A, B, C (the input suspended at most 1.5 s); the lift refused by the channel:
+again every second until it reads back clear; a step that works and a charger that stops a minute later: the same step six times,
+at least two minutes apart; each gate alone (level 2, no source, one pack, full, 4350 mV, 45.1/14.9 °C, the DSP, the pin decides)
+keeps every write out with its reason logged once, the limits themselves let it through; a command that reads off: no write (that
+is chgen's); MISC +0x44 not at 0x00: B passed over; USBIN's plug-in bit clear: C passed over; the start guard (cleared at `=1` with a
+source, left at `=0` and without one); the allowlist with nothing armed; no writer: refused; chgen's own pulses and judge untouched
+by the fix's. Also under ASan/UBSan. `testChgEn` passes unchanged (its gates now share `chgBatteryGate`).
+
+### 20.8 The next boots (pass / fail)
+
+`grep -aE 'PianoPower: (complex|chgfix|\[[0-9]+s\] (battery|charging|chgr|chgfix))'`, or §20.6 on the installed system.
+
+- **Any boot (read only):** the `complex:` configuration lines (what the boot stages set), the `chgr: watch:` line of the stop with
+  every status byte that moved within 2 s and the XNU uptime (a fixed uptime across boots says a timer from the boot stages, a fixed
+  time after PianoPower's start says something of ours), the `chgr: changed since` lines over all seven blocks.
+- **`piano-power-chgfix=1`** (default off this time): `after step A ...: CHARGING again` → the enable edge restarts it (make A the
+  default, keep the watch to time any second stop); `no change` for A and B → `chgfix=2` (C, the soft replug) next, then the early
+  DSP (§20.3).
+- **Level 2 with the DSP early** (`piano-power=2 piano-power-delay=0`, the policy for the input limit): CHGR stays at 3 past 60 s and
+  the `chgr: changed since` line of the report after the DSP's start names the firmware's writes.

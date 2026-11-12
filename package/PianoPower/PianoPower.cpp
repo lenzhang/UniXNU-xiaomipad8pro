@@ -26,6 +26,12 @@
 // source is on the port and both packs are below 4350 mV, not full, 15-45 C (at most five a boot); =2 also pulses an enable that
 // reads on (bit 0 cleared 2 s, then set; three a boot, two minutes apart); =0 reads only. Every change of CHGR's and MISC's registers
 // between two reports is logged ("chgr: changed since"), and a change of the enable command that is not ours says so.
+// The charger complex (ChargerFix.h, charging-policy.md §20), at both levels: its seven blocks' configuration logged at start, all of
+// them read and diffed with every report, their status every 2 s for the first piano-power-chgwatch seconds (180; 0 none) and after
+// each recovery step (the stop's moment), and the picture in the IORegistry (PianoCharger, PianoChargerText, PianoChargerChanges);
+// read only. piano-power-chgfix=1 (level 1; default 0) restarts a charger that reads DISABLED with its enable command on: the
+// command pulsed (2 s), then AICL restarted (MISC +0x44); =2 also suspends the USB input for 1 s (USBIN +0x40); each step judged by
+// the next reading, six attempts a boot, every write read back and logged, no limit written.
 // Further boot arguments: piano-power-period=S (report interval, default 30), piano-power-gauge=0 (no gauge reads),
 // piano-power-write=0 (level 2 without the charger writes: the DSP runs on its own defaults), piano-power-hv=1 (level 2 also asks a PD
 // source with a fixed 9 V PDO for 9 V and then allows 1.6 A), piano-power-fw=DIR (the DSP's images as DIR/adsp.mbn and

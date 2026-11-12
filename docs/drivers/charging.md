@@ -704,3 +704,15 @@ analysis, the fix and its images: [charging-policy.md](charging-policy.md) §17.
 - **Every charger block is mapped twice** in the arbiter, once for EE 3 (inferred: the DSP's channel) and once for EE 0 (ours).
 - **Built (not run):** `piano-power-chgen` (default: set the enable command when it reads off; `=2`: a 2 s pulse of it when it reads
   on and the charger disabled) and the `chgr: changed since` record of every register change between two reports (§19.3-19.5).
+
+## Measured 2026-11-12 late (the 21:18 RAM boot and the installed 21:31 boot: the stop's bytes)
+
+- **The stop, recorded (M):** between two reports CHGR +0x06 c3/83 → 87 (full-on → DISABLED), +0x07 19 → 00, +0x0a 00 → 05, +0x0c
+  (the charge current, 50 mA steps, I) 0a/14 → 00, rt 22 → 20; the enable command and CHGR_CFG2 unchanged; MISC +0x06 bit 6 follows
+  the load and is no warning ([charging-policy.md](charging-policy.md) §20.2).
+- **Decoded against the family's public layouts (I):** no byte names a reason beyond "disabled"; the input path (DCDC ICL 1500 mA,
+  AICL done; USBIN plug-in) reads healthy in both states; no family timer is 30-60 s (§20.3).
+- **New (M):** the two level-2 boots whose DSP was ready before the stop never stopped; every other one stopped before its DSP and
+  stayed so: the early DSP (`piano-power-delay=0`) is the most promising next test.
+- **Built (not run):** the whole complex logged and diffed with every report, the 2 s watch of the stop, the IORegistry picture for
+  a shell (`PianoChargerText`, `PianoCharger`, `PianoChargerChanges`), and `piano-power-chgfix` (default 0; level 1) (§20.4-20.8).
