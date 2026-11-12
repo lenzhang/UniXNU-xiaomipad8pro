@@ -153,7 +153,9 @@ the same script with `--live`, and `--check` changes nothing.
   system/<label>` and `launchctl bootout system/<label>` (kept in the store's override database; undone with `launchctl enable` and
   a reboot); in a test image's seed `tooling/k27/stage-boot-run.py --disable-job <label>` (the same database, written into a copy
   of the seed, so `data-persist=0`); by kernel argument `PIANO_DENY_EXEC` / `build-esp.py --deny-exec PATH` (k27-deny-exec: no
-  seed change; launchd retries the spawn every ~10 s). None is a default yet.
+  seed change; launchd retries the spawn every ~10 s). None is a default yet. The desktop images (`tooling/k27/build-desktop-images.sh`,
+  [attended-desktop.md](attended-desktop.md) §2) disable watchdogd, mobileactivationd, xprotectd and PerfPowerServices in their
+  seed's override database (and audiomxd in `quiet`), and write the keyboard type of our two keyboards from the boot job.
 - **Removal**: `/private/var/db/piano-userland/receipt.tsv` lists what the installer put in place. A file the manifest no longer
   has is removed, its job booted out, when it is unchanged since. Anything else is left (host-tested).
 - **Files it did not put there** (2026-11-12, for the system layer of `data-store.md` §9): before the installer first takes over

@@ -5,6 +5,8 @@ MCU booted, cover attached, commands acknowledged. No key or touchpad report see
 DRV-2 lock not run. 2026-11-12 (offline, host-tested, not run): the touchpad tuned for macOS (§6a), the battery work (§6b), the
 gpio97 interrupt (opt-in, §6b), the panel's brightness keys and the state other drivers watch (§6c). 2026-11-11 (host-tested,
 linked, not run): the power policy parts of `docs/policy.md` §5.4 and the system-sleep contract of `docs/power.md` §4 (§6d).
+In the kext list (`configs/k27-native-kexts.txt`) since 2026-11-12; before, only `PIANO_EXTRA_KEXTS` linked it, and the attend5
+and desk1 images had none ([attended-desktop.md](../attended-desktop.md) §1.6).
 Sources: `package/PianoKeyboard` (design and boot arguments at the top of `PianoKeyboard.cpp`, the codec in `Wn8030Piano.h`, the
 descriptors in `HidDescriptors.h`, provenance in `UPSTREAM`). Template: `README.md`.
 

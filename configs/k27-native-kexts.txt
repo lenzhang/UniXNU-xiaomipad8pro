@@ -12,6 +12,7 @@ PianoBacklight       # the panel backlight (2x KTZ8866 over software I2C, docs/d
 PianoDpu             # the display processor (docs/drivers/dpu.md): level 1, a read-only survey of the DPU/DSI state; inert without piano-dpu=N
 PianoDwc3            # USB device-mode debug channel (CDC-ACM console); inert without piano-usb=N; after PianoA830 (its lock words: the cold start's GCC vote and DRV-2 rail votes)
 PianoInput           # the buttons (power, vol-, vol+) as HID consumer keys; inert without piano-input=N
+PianoKeyboard        # the keyboard cover (WN8030: keys, touchpad, hall sensor; docs/drivers/keyboard.md); inert without piano-keyboard=N; after PianoA830 (its DRV-2 lock word). Listed 2026-11-12: it was linked only with PIANO_EXTRA_KEXTS, so attend5's and desk1's images had none
 PianoNullEthernet    # a built-in en0 without hardware: TimeSync (and so WindowServer) needs a built-in interface
 PianoPower           # battery gauges, charger port, the DSP charger path; inert without piano-power=N
 PianoTorch           # the rear torch (PM8550 flash LED, docs/drivers/torch.md): 1 read-only survey, 2 control (read-back, time limit, thermal guard); inert without piano-torch=N

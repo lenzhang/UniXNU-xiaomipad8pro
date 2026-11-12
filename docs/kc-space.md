@@ -68,7 +68,8 @@ here), so its largest-first numbers are what the builder would do. `--json OUT` 
 | **all natives** | 308.1 | 1318.2 | 833.7 | 197.8 | 2657.8 |
 | kept Apple kexts (48) | 2696.1 | 8586.1 | 1687.7 | 857.0 | |
 
-PianoKeyboard (not in the list; linked with `PIANO_EXTRA_KEXTS`): 13.4 / 44.0 / **87.3** / 1.0 KiB. A later main build with it (22
+PianoKeyboard (not in the list then; linked with `PIANO_EXTRA_KEXTS`; in the list since 2026-11-12, after PianoInput):
+13.4 / 44.0 / **87.3** / 1.0 KiB. A later main build with it (22
 kexts) left `__DATA_CONST` 3102.9 KiB free (largest 565.7) and `__DATA` 333.3 KiB (largest 63.9).
 
 | Region | Free | Gaps | Largest gap | Largest native segment |
