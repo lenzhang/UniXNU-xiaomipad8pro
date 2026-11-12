@@ -27,8 +27,10 @@ D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
 KC=${AU_KC:-out/k27/kc-k27-native.bin}
 ADT=${AU_ADT:-out/adt/piano-k27.adt}
 FD=${AU_FD:-out/fd/piano-uefi-A-bundled.fd}
+GPU_SEED=${AU_SEED:+given}   # the desktop images' piano-gpu=2 needs a seed with the GPU's Metal plugin (gpu.md 6): the Turnip stage
 if [ -f out/turnip-a830/stage/scratch-data.img ]; then
   SEED=${AU_SEED:-out/turnip-a830/stage/scratch-data.img}; TRUST=${AU_TRUST:-out/turnip-a830/stage/kernel.macho.trustcache}
+  GPU_SEED=yes
 else
   SEED=${AU_SEED:-out/inputs/scratch-data.img}; TRUST=${AU_TRUST:-out/inputs/kernel.macho.trustcache}
 fi
@@ -59,6 +61,10 @@ image() {
 COMMON=(--fd "$FD" --fd-name A-bundled --kc "$KC" --trust "$TRUST" --seed "$SEED" --adt "$ADT" --utc "$(date +%s)")
 for n in ${*:-$ORDER}; do
   image "$n" || { echo "build-audio-test-images: no image $n (one of: amp graphs tone desktop mic)" >&2; exit 2; }
+  case $A in *piano-gpu=2*) [ -n "$GPU_SEED" ] || {
+    echo "build-audio-test-images: $n is a desktop image (piano-gpu=2) and there is no Turnip stage (out/turnip-a830/stage: a build" \
+         "without PIANO_A830_METAL=0) nor AU_SEED/AU_TRUST: a seed without the GPU's Metal plugin sends WindowServer into a crash loop" >&2
+    exit 1; } ;; esac
   PIANO_FW_ADDON=1 PIANO_FAST_BOOT=1 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=$R PIANO_EXTRA_ARGS="$A $BASE" \
     python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out "out/ram-au-$n" | tail -1
   python3 tooling/bootimg/verify-ram-images.py "out/ram-au-$n/build-A-bundled.json" | tail -1
