@@ -103,13 +103,19 @@ def manifest_tests(tmp):
     print('1. manifest')
     plan = stage.load_manifest(D / 'configs/userland.toml')
     names = {u['name']: u for u in plan['units']}
-    check(set(names) >= {'pianousb-shell', 'piano-policy-agent', 'piano-rotated', 'piano-torch', 'piano-pmset-defaults', 'piano-wifi'},
-          'configs/userland.toml: the six units')
+    check(set(names) >= {'pianousb-shell', 'piano-policy-agent', 'piano-rotated', 'piano-torch', 'piano-pmset-defaults',
+                         'piano-still-wallpaper', 'piano-wifi'}, 'configs/userland.toml: the seven units')
+    wall = {f['dest']: f for f in names['piano-still-wallpaper']['files']}
+    check(sorted(wall) == ['/Library/LaunchDaemons/com.unixnu.piano-still-wallpaper.plist', '/usr/local/libexec/piano-still-wallpaper',
+                           '/usr/local/share/piano/wallpaper/Index.plist', '/usr/local/share/piano/wallpaper/Metadata.plist',
+                           '/usr/local/share/piano/wallpaper/still.png'] and
+          all(not f['trust'] and f['mode'] == '0644' for d, f in wall.items() if d.startswith('/usr/local/share/')),
+          'piano-still-wallpaper: the script, its job and its three data files (0644, no CDHash)')
     check(names['piano-wifi']['planned'] and not any(u['planned'] for n, u in names.items() if n != 'piano-wifi'),
           'piano-wifi is the one planned unit')
     check(all(u['on'] for u in plan['units']), 'every unit is on in the installed profile')
     dests = [f['dest'] for u in plan['units'] for f in u['files']]
-    check(len(dests) == len(set(dests)) and all(d.rsplit('/', 1)[0] in stage.DIRS for d in dests), 'destinations unique, in the four directories')
+    check(len(dests) == len(set(dests)) and all(d.rsplit('/', 1)[0] in stage.DIRS for d in dests), 'destinations unique, in the allowed directories')
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         stage.show_plan(plan)
@@ -126,7 +132,7 @@ def manifest_tests(tmp):
 
     check(load(unit_toml('a', [good_tool, good_job]))['units'][0]['files'][1]['kind'] == 'daemon', 'a good manifest loads')
     bad = {
-        'a dest outside the four directories': (unit_toml('a', [{**good_tool, 'dest': '/usr/bin/tool'}]), 'dest must be'),
+        'a dest outside the allowed directories': (unit_toml('a', [{**good_tool, 'dest': '/usr/bin/tool'}]), 'dest must be'),
         'a group-writable mode': (unit_toml('a', [{**good_tool, 'mode': '0775'}]), 'not writable'),
         'a job file not 0644': (unit_toml('a', [good_tool, {**good_job, 'mode': '0755'}]), 'launchd refuses'),
         'a job file not root\'s': (unit_toml('a', [good_tool, {**good_job, 'owner': 'nobody:wheel'}]), 'launchd refuses'),
@@ -187,12 +193,13 @@ def manifest_tests(tmp):
     check(refused(stage.add_gpu_bundles, load(unit_toml('a', [good_tool])), [b], match='neither a file'), 'refused: a symlink in the bundle')
     (b / 'Contents/MacOS/link').unlink()
     ok = ['/Library/GPUBundles/A.bundle/Contents/Info.plist', '/Library/GPUBundles/A.bundle/Contents/MacOS/A',
-          '/Library/GPUBundles/A.bundle/Contents/Resources/x.metallib', '/usr/local/bin/x']
+          '/Library/GPUBundles/A.bundle/Contents/Resources/x.metallib', '/usr/local/bin/x', '/usr/local/share/piano/wallpaper/x.png']
     no = ['/Library/GPUBundles/A.bundle/Info.plist', '/Library/GPUBundles/A.bundle/Contents/MacOS/../../x',
           '/Library/GPUBundles/A.bundle/Contents/MacOS/.hidden', '/Library/GPUBundles/x', '/Library/GPUBundles/A.kext/Contents/Info.plist',
-          '/Library/GPUBundles/A.bundle/Contents/MacOS/sub/x', '/System/Library/Extensions/A.bundle/Contents/Info.plist']
+          '/Library/GPUBundles/A.bundle/Contents/MacOS/sub/x', '/System/Library/Extensions/A.bundle/Contents/Info.plist',
+          '/usr/local/share/x', '/usr/local/share/piano/x', '/usr/local/share/piano/wallpaper/sub/x']
     check(all(stage.dest_kind(d) == 'file' for d in ok) and not any(stage.dest_kind(d) for d in no),
-          'dest_kind: a bundle\'s Contents/Info.plist, MacOS/ and Resources/ files only')
+          'dest_kind: a bundle\'s Contents/Info.plist, MacOS/ and Resources/ files only; /usr/local/share/piano/wallpaper/ only')
 
 
 # ---- 2. the installer --------------------------------------------------------------------------------------------------------
@@ -726,11 +733,37 @@ def live_tests(tmp):
         shutil.copytree(tmp / 'real/live/staging', tmp / 'real/rig/stage')
         code, out = rig.run()
         want = {'system/com.unixnu.pianousb-shell', 'system/com.unixnu.piano-policy-agent', 'system/com.unixnu.piano-pmset-defaults',
-                f'gui/{rig.uid}/com.unixnu.piano-rotated'}
-        check(code == 0 and rig.loaded() == want and rig.root('/usr/local/bin/piano-torch').is_file(),
-              'the real staging installed on a scratch root: three daemons and the agent loaded, piano-torch in /usr/local/bin')
+                'system/com.unixnu.piano-still-wallpaper', f'gui/{rig.uid}/com.unixnu.piano-rotated'}
+        check(code == 0 and rig.loaded() == want and rig.root('/usr/local/bin/piano-torch').is_file() and
+              rig.root('/usr/local/share/piano/wallpaper/still.png').read_bytes()[:8] == b'\x89PNG\r\n\x1a\n',
+              'the real staging installed on a scratch root: four daemons and the agent loaded, piano-torch in /usr/local/bin, '
+              'the still picture in /usr/local/share/piano/wallpaper')
         code, out = rig.run('--check')
         check(code == 0, 'and --check passes on it')
+        # The owner's Data: the base's Metal plugin in place; the real layer with --gpu-bundle over it, then the empty layer
+        # (configs/userland-none.toml) takes it all out again (docs/persistent-boot.md section 11.6, the layer's rollback).
+        b = tmp / 'real/T.bundle'
+        write(b / 'Contents/Info.plist', plistlib.dumps({'CFBundleExecutable': 'T'}))
+        write(b / 'Contents/MacOS/T', b'#!/bin/sh\necho the layer\'s plugin\n', 0o755)   # no Mach-O: no CDHash to compute
+        code, text = stage_run('--live', tmp / 'real/live-gpu', '--installed-trust', installed, '--gpu-bundle', b)
+        rig = Rig(tmp / 'real/rig2', SHELLS[0])
+        base = {'/Library/GPUBundles/T.bundle/Contents/Info.plist': b'<plist>the base\'s</plist>',
+                '/Library/GPUBundles/T.bundle/Contents/MacOS/T': b'the base\'s plugin'}
+        for dest, data in base.items():
+            write(rig.root(dest), data, 0o755)
+        shutil.rmtree(tmp / 'real/rig2/stage')
+        shutil.copytree(tmp / 'real/live-gpu/staging', tmp / 'real/rig2/stage')
+        code1, _ = rig.run('--live')
+        installed_files = [f['dest'] for f in json.loads((tmp / 'real/live-gpu/live.json').read_text())['files']]
+        code2, text2 = stage_run('--manifest', D / 'configs/userland-none.toml', '--live', tmp / 'real/none', '--installed-trust', installed)
+        shutil.rmtree(tmp / 'real/rig2/stage')
+        shutil.copytree(tmp / 'real/none/staging', tmp / 'real/rig2/stage')
+        code3, out = rig.run('--live')
+        left = [d for d in installed_files if d not in base and rig.root(d).exists()]
+        check(code1 == 0 and code2 == 0 and code3 == 0 and not left and rig.loaded() == set() and
+              all(rig.root(d).read_bytes() == data for d, data in base.items()),
+              'the empty layer (configs/userland-none.toml) after the real one: every unit out, every job booted out, the base\'s '
+              'plugin back byte for byte' + (f' (left: {left})' if left else ''))
 
 
 def main():

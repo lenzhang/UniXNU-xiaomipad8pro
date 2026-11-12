@@ -14,10 +14,17 @@
 #  - The picture itself at /Library/Desktop Pictures/UniXNU Still.png, which the choices name.
 # Nothing that exists is replaced: a choice made on the tablet, kept by a persistent Data store, stays. One line per account on the
 # console (stderr-log=1): "still-wallpaper: uid 501: login picture written, store written".
-S=/private/var/piano/wallpaper
+# The installed system (the owner's Data, whose seed is the store's base and never restaged: docs/data-store.md section 9) gets the
+# same script and files from the system layer instead (configs/userland.toml unit piano-still-wallpaper): the script as
+# /usr/local/libexec/piano-still-wallpaper, its files in /usr/local/share/piano/wallpaper, run once a boot by its launchd job. The
+# files are taken from the directory given as $1, else the first of those two places that has all three.
+S=
+for d in ${1:+"$1"} /private/var/piano/wallpaper /usr/local/share/piano/wallpaper; do
+  [ -f "$d/still.png" ] && [ -f "$d/Metadata.plist" ] && [ -f "$d/Index.plist" ] && { S=$d; break; }
+done
 W=/private/var/db/Wallpapers
 P="/Library/Desktop Pictures/UniXNU Still.png"
-[ -f "$S/still.png" ] && [ -f "$S/Metadata.plist" ] && [ -f "$S/Index.plist" ] || { echo "still-wallpaper: no files in $S"; exit 0; }
+[ -n "$S" ] || { echo "still-wallpaper: no files in ${1:+$1, }/private/var/piano/wallpaper or /usr/local/share/piano/wallpaper"; exit 0; }
 install -d -o root -g wheel -m 755 "/Library/Desktop Pictures" "$W"
 [ -f "$P" ] || install -o root -g wheel -m 644 "$S/still.png" "$P"
 # The login window's picture of one GeneratedUID: "written", or "kept" when one is there already.

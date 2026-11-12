@@ -68,7 +68,8 @@ import common  # noqa: E402  (tooling/persist/common.py: seed identity, trust ca
 
 FORMAT = 1   # the staged layout's version: part of the stamp; raise it when the same inputs are to be staged differently
 INSTALLER = D / 'tooling/userland/install.sh'
-DIRS = {'/Library/LaunchDaemons': 'daemon', '/Library/LaunchAgents': 'agent', '/usr/local/bin': 'file', '/usr/local/libexec': 'file'}
+DIRS = {'/Library/LaunchDaemons': 'daemon', '/Library/LaunchAgents': 'agent', '/usr/local/bin': 'file', '/usr/local/libexec': 'file',
+        '/usr/local/share/piano/wallpaper': 'file'}   # the last: the still wallpaper's data files (unit piano-still-wallpaper)
 # A Metal plugin bundle's files (IOGPU looks for <MetalPluginName>.bundle in /Library/GPUBundles first; docs/data-store.md section 5):
 # Contents/Info.plist, Contents/MacOS/<file>, Contents/Resources/<file>.
 GPU_BUNDLES = '/Library/GPUBundles'

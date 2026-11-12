@@ -112,17 +112,37 @@ PROFILES = {
         'about': 'the installed configuration: gpu + charging (--charging, default 2: PianoPower level 2 with ChargePolicy and the '
                  'stepped Type-C current, PianoThermal\'s ADC for the connector thermistors; 1: level 1, the 2026-11-11 evening '
                  'configuration, battery and Type-C readout only, the DSP not started) + the USB debug console (PianoDwc3: kernel '
-                 'console, monitor with "reset fastboot", user pipe) + the keyboard and pointer from the Mac (piano-usb-hid=1)',
+                 'console, monitor with "reset fastboot", user pipe; its cold start piano-usb-cold=auto by default) + the keyboard and '
+                 'pointer from the Mac (piano-usb-hid=1) + the desktop\'s input drivers as the desk images ran them on 2026-11-12 '
+                 '(docs/attended-desktop.md section 3: the keyboard cover with its touchpad and swipes, the backlight with its keys, '
+                 'the touch screen at level 2, the GPU hang check at 10 s), no verbose console (--fast-boot 1 by default)',
         # the Data store's base (base-seed.py): the installed seed and its trust cache, never a restaged seed (docs/data-store.md
         # section 9); the Metal plugin and our userland come as the system layer (--layer), not in the seed
         'kc': 'out/k27/kc-k27-native.bin', 'adt': 'out/adt/piano-k27.adt', 'trust': 'base', 'seed': 'base',
-        'args': ['piano-gpu=2', 'piano-gpu-delay=20', 'panic_on_crash_disabled=1', 'piano-usb=2', 'piano-usb-hid=1'],
+        'args': ['piano-gpu=2', 'piano-gpu-delay=20', 'panic_on_crash_disabled=1', 'piano-usb=2', 'piano-usb-hid=1',
+                 # docs/drivers/gpu-userspace.md: a long full-panel pass at the login transition is no hang (2 s was too short)
+                 'piano-gpu-hang-ms=10000',
+                 # the desk images' input drivers (tooling/k27/build-desktop-images.sh PROFILE), each a level that ran on the tablet
+                 'piano-keyboard=2', 'piano-keyboard-gestures=1', 'piano-backlight=2', 'piano-backlight-keys=1', 'piano-touch=2'],
         'vmm_present': 0,
-        'kexts': ['com.unixnu.driver.PianoA830', 'com.unixnu.driver.PianoPower', 'com.unixnu.driver.PianoDwc3'],
+        'kexts': ['com.unixnu.driver.PianoA830', 'com.unixnu.driver.PianoPower', 'com.unixnu.driver.PianoDwc3',
+                  'com.unixnu.driver.PianoKeyboard', 'com.unixnu.driver.PianoTouch', 'com.unixnu.driver.PianoBacklight'],
         'kexts_absent': ['com.unixnu.driver.NativeSoftGpu'],
+        # the fixes those drivers need on the desktop (the desk images' own checks, build-desktop-images.sh): a collection without
+        # one is refused, since its driver is on in this profile
+        'kc_markers': [
+            (b'a frame read only when the controller announces it', 'PianoTouch\'s announced-frame rule (the watchdog loop of desk1, '
+             'docs/drivers/touch.md section 13)'),
+            (b'role rule: %u core accesses refused so far', 'PianoDwc3\'s cold start with the role rule (C6b and C6c, '
+             'docs/forensics-2026-11-11.md section 7.6)'),
+            (b"the render server's reserve of ranges", 'PianoA830\'s map limits (WindowServer\'s BoMap NoResources)'),
+            (b'composition: layer 0 the frame, layer 1 the cursor', 'NativeGopDisplay\'s cursor layer'),
+            (b'piano-keyboard-resting', 'PianoKeyboard\'s resting thumb')],
         # k27 0063 (docs/boot-guard.md): the installed system always guards its boot; --boot-guard 0 leaves it out
         'boot_guard': 180,
-        'charging': 2},
+        'charging': 2,
+        # build-ram-images.py PIANO_FAST_BOOT=1 (docs/boot-time.md): no -v, as the desk and boot guard images ran; --fast-boot 0 for -v
+        'fast_boot': 1},
 }
 # The charging level of a profile that has one (--charging; docs/drivers/charging-policy.md section 15, the decision in section 16).
 #   1  PianoPower level 1: the PMIC charges on its own (measured 2026-11-12 on the Mac's port: +0.48 A light, about -0.07 A at the
@@ -138,7 +158,8 @@ CHARGING = {
 }
 # Profile arguments the menu's "fastboot" entry (a reset after 1 s) leaves out.
 NOT_IN_FASTBOOT = ('piano-gpu', 'piano-gpu-delay', 'piano-power', 'piano-usb', 'piano-usb-hid', 'piano-power-policy', 'piano-power-rp',
-                   'piano-thermal', 'piano-thermal-adc')
+                   'piano-thermal', 'piano-thermal-adc', 'piano-gpu-hang-ms', 'piano-keyboard', 'piano-keyboard-gestures',
+                   'piano-backlight', 'piano-backlight-keys', 'piano-touch')
 DROPPED = ('piano-reset-after', 'piano-reset-to', 'data-persist', 'droidvm-utc')
 # Set only by their own options (--replace-data, --flatten-data; data-persist is always 2 here), so the intent is explicit and recorded.
 STORE_ARGS = ('data-persist', 'data-store-replace', 'data-store-flatten')
@@ -321,6 +342,12 @@ def rtc_args(value):
     return ['piano-rtc=1', f'piano-rtc-offset={int(value)}']
 
 
+def fast_boot_of(a, profile):
+    """The fast-boot level (build-ram-images.py PIANO_FAST_BOOT): --fast-boot, else the profile's (daily 1), else 0."""
+    level = getattr(a, 'fast_boot', None)
+    return profile.get('fast_boot', 0) if level is None else level
+
+
 def charging_of(a, profile):
     """The charging level (CHARGING): --charging, else the profile's; None when neither has one (nothing added)."""
     level = getattr(a, 'charging', None)
@@ -337,14 +364,15 @@ def args_of(a, profile, utc):
     charging = CHARGING[level]['args'] if level else []
     given = {x.split('=', 1)[0] for x in a.arg}
     charging = [x for x in charging if x.split('=', 1)[0] not in given]   # --arg NAME=VALUE replaces the same NAME
-    extra = profile['args'] + charging + a.arg + rtc_args(a.rtc_offset) + ([f'{GUARD_PREFIX}={guard}'] if guard else [])
+    own = [x for x in profile['args'] if x.split('=', 1)[0] not in given]   # the profile's too (e.g. --arg piano-touch=0)
+    extra = own + charging + a.arg + rtc_args(a.rtc_offset) + ([f'{GUARD_PREFIX}={guard}'] if guard else [])
     names = {x.split('=', 1)[0] for x in extra}
     if names & set(STORE_ARGS):
         raise SystemExit(f'--arg {", ".join(sorted(names & set(STORE_ARGS)))}: the Data store arguments come from --replace-data / '
                          '--flatten-data (data-persist is always 2 on the macos entries)')
     # --fast-boot N: build-ram-images.py's PIANO_FAST_BOOT=N (docs/boot-time.md), given here explicitly so that an environment
     # variable left set for a RAM test never changes an installed ESP.
-    base = ram.fast_boot(base, extra, a.fast_boot)
+    base = ram.fast_boot(base, extra, fast_boot_of(a, profile))
     # --deny-exec PATH: k27-deny-exec with the kernel's default (and --fast-boot 2's watchdogd) plus PATH, one argument
     base = ram.deny_exec(base, extra, getattr(a, 'deny_exec', None) or [])
     base = [x for x in base if x.split('=', 1)[0] not in names] + extra
@@ -495,9 +523,10 @@ def main():
     p.add_argument('--utc', type=int, default=int(time.time()), help='droidvm-utc: the clock when the RTC gives none')
     p.add_argument('--rtc-offset', metavar='N|sdam', help='the calendar from the PMIC RTC (k27 0060): piano-rtc=1 and '
                    'piano-rtc-offset=N (tooling/native/rtc-offset.py), or "sdam" for the PMIC\'s own offset cell')
-    p.add_argument('--fast-boot', type=int, choices=(0, 1, 2), default=0,
-                   help='build-ram-images.py PIANO_FAST_BOOT: 1 no -v (no console text drawn) and no droidvm-disable-jobs; '
-                   '2 also k27-deny-exec for watchdogd (docs/boot-time.md)')
+    p.add_argument('--fast-boot', type=int, choices=(0, 1, 2),
+                   help='build-ram-images.py PIANO_FAST_BOOT: 0 -v (the console text drawn on the panel); 1 no -v and no '
+                   'droidvm-disable-jobs; 2 also k27-deny-exec for watchdogd (docs/boot-time.md). Default: the profile\'s (daily 1, '
+                   'others 0)')
     p.add_argument('--deny-exec', action='append', default=[], metavar='PATH',
                    help='k27-deny-exec for PATH too (repeatable), with the kernel\'s default mobileactivationd and --fast-boot 2\'s '
                    'watchdogd: e.g. /usr/libexec/PerfPowerServices (docs/power.md 1.2)')
@@ -529,6 +558,7 @@ def main():
     p.add_argument('--out', type=Path, default=common.DEVICE / 'out/persistent')
     a = p.parse_args()
     profile = PROFILES[a.profile]
+    a.fast_boot = fast_boot_of(a, profile)
     inputs, base, layer = resolve_inputs(a, profile)
     for n, path in inputs.items():
         if not path.is_file():
@@ -558,6 +588,12 @@ def main():
     for bundle in profile.get('kexts_absent', []):
         if bundle in natives:
             raise SystemExit(f'profile {a.profile}: {inputs["kc"]} links {bundle}, which this profile excludes')
+    if profile.get('kc_markers'):
+        kc_bytes = inputs['kc'].read_bytes()
+        for marker, why in profile['kc_markers']:
+            if marker not in kc_bytes:
+                raise SystemExit(f'profile {a.profile} turns its driver on, and {inputs["kc"]} lacks {why} ("{marker.decode()}"): '
+                                 'rebuild the collection from this tree (tooling/k27/build-native-image.sh)')
     for adt in {inputs['adt'], (a.prev_adt or inputs['adt']).resolve()}:
         if common.adt_addon_slot(adt):
             raise SystemExit(f'{adt}: its /chosen/memory-map has the GpuAddon slot of a RAM test image carrying the sensor pack '

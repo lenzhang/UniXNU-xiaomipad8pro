@@ -21,6 +21,8 @@ Order (sessions as in the plan; s = the maintenance RAM image, a = ABL fastboot)
   a  ram-esp-test ram-v4-signed ram-precedence       fastboot boot only (RAM)
   s  maint-boot map backup boot-a [esp-final] [slot-success] check maint-exit
   a  abl-final reboot
+  later, an ESP update on the installed tablet (docs/persistent-boot.md section 11):
+  s  maint-boot map backup [store-backup] esp-final check maint-exit --esp E --esp-final E --new-backup
 Never used: fastboot flash, erase, set_active, any oem to ABL; nothing is written to xbl, abl, tz, hyp, vbmeta, dtbo, persist or
 any _b partition (boot_b is backed up only); vendor_boot_a and init_boot_a are only read and backed up. No password anywhere.
 The tablet side is tooling/persist/tablet.sh (served over HTTP from the host's USB-link address, a fixed list of files, sha256
@@ -44,7 +46,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common  # noqa: E402
 
 D = common.DEVICE
-# (PIANO_PERSIST_OUT and PIANO_MAINT_SHELL only for tooling/persist/test-persist.py, which runs this against a fake tablet)
+# PIANO_PERSIST_OUT: the out/persistent this session's images, records, installed.json and (by default) session/ live in. Default
+# this checkout's; set it to run this checkout's tooling on the install state of the checkout that installed the tablet
+# (docs/persistent-boot.md section 11.5). tooling/persist/test-persist.py sets it, and PIANO_MAINT_SHELL, for its fake tablet.
 OUT = Path(os.environ.get('PIANO_PERSIST_OUT', D / 'out/persistent'))
 MAINT_SHELL = Path(os.environ.get('PIANO_MAINT_SHELL', D / 'tooling/native/maint-shell.py'))
 TABLET_SH = D / 'tooling/persist/tablet.sh'
@@ -732,6 +736,32 @@ def store_back(s):
         s.save(store_moved=False)
 
 
+@step('store-backup', 'maintenance, read only on the tablet; writes the NAS backup of the installed Data store')
+def store_backup(s):
+    """Optional, on an installed tablet (the new GPT, the store at its place): a verified NAS backup of the Data store as it is now,
+    the window at LBA 68119455 (3145825 blocks, 12.9 GB: the owner's Data at this moment), e.g. before the first boot of a new ESP.
+    Read only on the tablet; about 7 minutes to the NAS and as long to read it back. Its own backup (linux_rootfs-store-now), not
+    the move's (linux_rootfs-store); in a backup set that has one already, a store that changed since stops it (--new-backup).
+    rollback store-backup puts the owner's Data back to this moment."""
+    if s.execute and s.state.get('gpt_state') != 'new':
+        raise Stop('the store lives at its installed place only with the new GPT (an installed tablet): run step map first')
+    current = s.state.get('store_new') or {}
+    if s.execute and current.get('state') != 'valid':
+        raise Stop(f'no valid store header at LBA {store_new(s)} (step map read {current.get("magic", "nothing")}): nothing to back up')
+    map_nodes(s)
+    s.backup('linux_rootfs-store-now', s.nodes['lun0'], store_new(s), store_window(s), B,
+             f'LUN 0 LBA {store_new(s)}-{store_new(s) + store_window(s) - 1}: the installed Data store (seed '
+             f'{current.get("identity", "?")[:16]}, generation {current.get("generation", "?")})')
+
+
+@rollback('store-backup')
+def store_backup_back(s):
+    """The installed Data store as step store-backup saved it (linux_rootfs-store-now, from the NAS), read back: the owner's Data
+    as it was then; whatever changed since is gone. Only with the ESP of that store's seed on the tablet afterwards."""
+    map_nodes(s)
+    s.restore('linux_rootfs-store-now', s.nodes['lun0'], store_new(s), B)
+
+
 def write_esp(s, image_name):
     record = s.esp_record(image_name)
     if not record:
@@ -782,6 +812,10 @@ def esp_back(s):
     if s.execute:
         s.save(esp_written=None, esp_sha256=None)
         (OUT / 'installed.json').unlink(missing_ok=True)   # the region holds what it held before this install
+
+
+# esp-final writes the same region as esp, so its rollback is the same (the step's own hint names it)
+ROLLBACKS['esp-final'] = ROLLBACKS['esp']
 
 
 @step('check', 'maintenance, read only')

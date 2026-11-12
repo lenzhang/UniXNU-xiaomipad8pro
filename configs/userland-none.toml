@@ -1,0 +1,8 @@
+# The empty system layer (docs/userland.md section 7.4, docs/persistent-boot.md section 11.6): no unit. Applied as a live update
+# (tooling/userland/stage.py --manifest configs/userland-none.toml --live out/layer-none, then apply-update.sh on the tablet), its
+# install.sh takes every unit of the layer before it out: their jobs booted out, the files it installed removed when unchanged since,
+# and every file it had taken over (the base's Metal plugin) put back from its kept copy, byte for byte. The way back to the base's
+# Data files without a store restore; needed before an ESP whose trust cache lacks the layer's CDHashes (esp-daily2) is written back.
+
+format = 1
+staging = "/private/var/piano/userland"

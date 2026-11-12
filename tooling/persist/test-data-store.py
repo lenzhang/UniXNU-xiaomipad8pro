@@ -267,8 +267,8 @@ def main():
     check('data-store-replace=1 data-store-flatten=1' in lines['macos'] and 'data-store-replace' in lines['macos-diag'] and
           'data-store' not in lines['fastboot'] and 'data-persist=0' in lines['fastboot'], 'the macos entries carry them, fastboot not')
     # k27 0063's boot guard (docs/boot-guard.md): the daily profile's default on the macos entries, never on fastboot
-    ns = SimpleNamespace(arg=[], rtc_offset=None, fast_boot=0, diag_reset_after=240, replace_data=None, flatten_data=False,
-                         boot_guard=None)
+    ns = SimpleNamespace(arg=[], rtc_offset=None, fast_boot=None, diag_reset_after=240, replace_data=None, flatten_data=False,
+                         boot_guard=None)   # fast_boot None: each profile's own (daily 1: no -v, which its lines need with charging 2)
     daily = esp.PROFILES['daily']
     lines = esp.args_of(ns, daily, 1)
     check('piano-boot-guard=180' in lines['macos'].split() and 'piano-boot-guard=180' in lines['macos-diag'].split() and
@@ -304,6 +304,30 @@ def main():
           '--arg piano-power-rp=0 replaces the level\'s; fastboot has none of them')
     ns.arg = []
     check(not any(x.startswith('piano-power') for x in esp.args_of(ns, profile, 1)['macos'].split()), 'base: no charging level')
+    # the desktop's input drivers (the desk images' levels) and no -v: on daily's macos entries, never on fastboot
+    inputs_on = ('piano-keyboard=2', 'piano-keyboard-gestures=1', 'piano-backlight=2', 'piano-backlight-keys=1', 'piano-touch=2',
+                 'piano-gpu-hang-ms=10000')
+    ns.fast_boot = None
+    lines = esp.args_of(ns, daily, 1)
+    words, fast = lines['macos'].split(), lines['fastboot'].split()
+    check(all(x in words and x in lines['macos-diag'].split() for x in inputs_on) and
+          not any(x.split('=', 1)[0] in ('piano-keyboard', 'piano-backlight', 'piano-touch', 'piano-gpu-hang-ms') for x in fast),
+          'daily: keyboard, touchpad swipes, backlight and its keys, touch level 2, the 10 s GPU hang check; none on fastboot')
+    check('-v' not in words and '-v' not in fast and '-v' in esp.args_of(ns, profile, 1)['macos'].split(),
+          'daily: fast boot 1 by default (no -v); base keeps -v')
+    ns.fast_boot = 0
+    check(refused(esp.args_of, ns, daily, 1) is not None, 'daily --fast-boot 0 with charging 2: refused (a line past 1000 bytes)')
+    ns.charging = 1
+    check('-v' in esp.args_of(ns, daily, 1)['macos'].split(), 'daily --fast-boot 0 --charging 1: -v again, the lines fit')
+    ns.charging = None
+    ns.fast_boot, ns.arg = None, ['piano-touch=0']
+    words = esp.args_of(ns, daily, 1)['macos'].split()
+    check(words.count('piano-touch=0') == 1 and 'piano-touch=2' not in words, '--arg piano-touch=0 replaces the profile\'s level')
+    ns.arg = []
+    check({m for m, _ in daily['kc_markers']} >= {b'a frame read only when the controller announces it',
+                                                  b'role rule: %u core accesses refused so far'} and
+          {'com.unixnu.driver.PianoKeyboard', 'com.unixnu.driver.PianoTouch', 'com.unixnu.driver.PianoBacklight'} <= set(daily['kexts']),
+          'daily: needs the input kexts and the touch and USB cold-start fixes in the collection')
 
     base_tests(tmp, esp, a, trust, h, (x, y, z), (seed_x, seed_y), (t_old, t_new, t_union))
 

@@ -10,7 +10,8 @@
 #                installed (default_on must be true).
 # [[unit.file]]  one installed file:
 #   dest         its path on the tablet: /Library/LaunchDaemons/<Label>.plist, /Library/LaunchAgents/<Label>.plist (a launchd job,
-#                root:wheel 0644: launchd refuses any other), /usr/local/bin/<name> (commands), /usr/local/libexec/<name> (helpers)
+#                root:wheel 0644: launchd refuses any other), /usr/local/bin/<name> (commands), /usr/local/libexec/<name> (helpers),
+#                /usr/local/share/piano/wallpaper/<name> (the still wallpaper's data files)
 #   owner, mode  default "root:wheel"; mode in octal ("0755" programs and scripts, "0644" job files)
 #   build        "copy": `source` as it is
 #                "cc": xcrun clang for `arch` (arm64, or arm64e), macOS `min_os` (default 14.0), -O2 -Wall -Wextra -Werror, `cflags`,
@@ -106,6 +107,50 @@ mode = "0755"
 source = "tooling/userland/com.unixnu.piano-pmset-defaults.plist"
 build = "copy"
 dest = "/Library/LaunchDaemons/com.unixnu.piano-pmset-defaults.plist"
+mode = "0644"
+
+[[unit]]
+name = "piano-still-wallpaper"
+about = "the still login wallpaper (docs/drivers/gpu-userspace.md): once a boot, the login window's picture for every local account that has none (no software video decode at the login window); replaces nothing"
+default_on = true
+
+[[unit.file]]
+source = "tooling/k27/still-wallpaper.sh"
+build = "copy"
+dest = "/usr/local/libexec/piano-still-wallpaper"
+mode = "0755"
+
+[[unit.file]]
+build = "script"
+command = ["python3", "tooling/k27/still-wallpaper.py", "out/still-wallpaper"]
+output = "out/still-wallpaper/still.png"
+inputs = ["tooling/k27/still-wallpaper.py"]
+dest = "/usr/local/share/piano/wallpaper/still.png"
+mode = "0644"
+trust = false
+
+[[unit.file]]
+build = "script"
+command = ["python3", "tooling/k27/still-wallpaper.py", "out/still-wallpaper"]
+output = "out/still-wallpaper/Metadata.plist"
+inputs = ["tooling/k27/still-wallpaper.py"]
+dest = "/usr/local/share/piano/wallpaper/Metadata.plist"
+mode = "0644"
+trust = false
+
+[[unit.file]]
+build = "script"
+command = ["python3", "tooling/k27/still-wallpaper.py", "out/still-wallpaper"]
+output = "out/still-wallpaper/Index.plist"
+inputs = ["tooling/k27/still-wallpaper.py"]
+dest = "/usr/local/share/piano/wallpaper/Index.plist"
+mode = "0644"
+trust = false
+
+[[unit.file]]
+source = "tooling/userland/com.unixnu.piano-still-wallpaper.plist"
+build = "copy"
+dest = "/Library/LaunchDaemons/com.unixnu.piano-still-wallpaper.plist"
 mode = "0644"
 
 [[unit]]

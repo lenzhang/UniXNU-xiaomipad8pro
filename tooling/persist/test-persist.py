@@ -399,6 +399,18 @@ def test_session(tmp):
     run('backup')   # again, after the writes: must keep the originals as the rollback sources
     state2 = json.loads((tmp / 'session/state.json').read_text())
     check(state2['backups'] == state['backups'], 'a second backup run keeps the original backups')
+    # store-backup: the installed store as it is now (the owner's Data before a new ESP's first boot), and its rollback
+    window_now = sha_region(lun0, new * B, window * B)
+    run('map', 'store-backup')
+    entry = json.loads((tmp / 'session/state.json').read_text())['backups'].get('linux_rootfs-store-now') or {}
+    check(entry.get('sha256') == window_now and entry.get('skip') == new and entry.get('count') == window and
+          common.sha(bdir / entry['file']) == window_now,
+          'store-backup: the store window at its installed place, verified on the NAS')
+    write_at(lun0, (new + 5) * B, b'macOS wrote Data since')
+    log = run('map', 'store-backup', expect=3)
+    check('changed since its verified backup' in log, 'store-backup again in the same set after the store changed: stops (--new-backup)')
+    run('rollback', 'store-backup')
+    check(sha_region(lun0, new * B, window * B) == window_now, 'rollback store-backup: the store as it was backed up')
     run('rollback', 'esp', 'store', 'gpt', 'boot-a')
     after = snapshot(root, window, old)
     for key in before:
