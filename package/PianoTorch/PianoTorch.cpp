@@ -381,6 +381,11 @@ void PianoTorch::run()
   summary(gSurvey, refusal, line, sizeof line);
   setProperty(kPropertySurvey, line);
   note("summary: %s", line);
+  {   // the SPMI lock every kext shares (PianoSpmi.h): this kext's transactions and waits, and every kext's
+    char lockLine[360];
+    pianospmi::format(lockLine, sizeof lockLine);
+    note("%s", lockLine);
+  }
 
   if (gArgs.level < 2) {
     stage(3, "done");

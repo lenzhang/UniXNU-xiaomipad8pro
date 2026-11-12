@@ -3,9 +3,8 @@
 # PianoWcnRails.h (the WCN7860 PMU's rails shared by Wi-Fi and Bluetooth, docs/drivers/bluetooth.md §7.1) and PianoMmVotes.h (the
 # MXC/MMCX/MM1 votes shared by video and camera, docs/drivers/camera.md §4.3.1) and PianoSpmi.h (the SPMI transaction lock every
 # kext that drives the PMIC arbiter shares, docs/spmi-lock.md: its test runs PianoWifi's, PianoPower's, PianoInput's, PianoThermal's
-# and PianoTorch's own accessors at once on a model of the arbiter). The build scripts of their users (PianoA830, PianoPower,
-# PianoVideo, PianoCamera, PianoBluetooth, PianoWifi, PianoThermal, PianoTorch, PianoInput, PianoDwc3, PianoUsbHost) run it before
-# their own tests.
+# and PianoTorch's own accessors at once on a model of the arbiter). The build scripts of PianoA830, PianoPower, PianoVideo,
+# PianoCamera, PianoBluetooth and PianoWifi run it before their own tests (one full image build runs it several times already).
 set -euo pipefail
 P=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT

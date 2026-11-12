@@ -562,6 +562,11 @@ void PianoInput::describe(uint64_t seconds)
 {
   note("alive at %llu s: %llu samples, %u read errors, %u key edges, %u reports, keys %02x, PON [10] %02x, GPIO6 [10] %02x", seconds,
        fSamples, fReadErrors, fEdges, fReports, fDown, fPon, fGpio);
+  char lockLine[300];   // the SPMI lock every kext shares (PianoSpmi.h): ours, then every kext's (two lines: ours are 320 bytes)
+  pianospmi::format(lockLine, sizeof lockLine, PianoSpmiLineOurs);
+  note("%s", lockLine);
+  pianospmi::format(lockLine, sizeof lockLine, PianoSpmiLineAll);
+  note("%s", lockLine);
   OSIterator *interfaces = fButtons->getChildIterator(gIOServicePlane);
   while (OSObject *object = interfaces ? interfaces->getNextObject() : nullptr) {
     IOService *interface = OSDynamicCast(IOService, object);

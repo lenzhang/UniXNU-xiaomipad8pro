@@ -1175,6 +1175,11 @@ void PianoPower::report()
     else
       note("[%llus] usb: Type-C status not readable", t);
   }
+  if (fSpmi) {   // the SPMI lock every kext shares (PianoSpmi.h): this kext's transactions and waits, and every kext's
+    char line[360];
+    pianospmi::format(line, sizeof line);
+    note("[%llus] %s", t, line);
+  }
   if (fWdog.located) {
     WdogWrite clear, pet;
     fWdog.check(gIo, gWriter, nowMs(), &clear, &pet);

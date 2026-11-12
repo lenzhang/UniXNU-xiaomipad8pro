@@ -28,4 +28,4 @@ fi
 python3 "$D/tooling/k27/build-native-kext.py" PianoTorch "$P/PianoTorch.cpp" "$D/tooling/k27/NativeKextGlue.cpp" "${INC[@]}" \
   --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
-[ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" | cut -c1-160 >&2
+[ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" --library-prefix _piano_spmi_words | cut -c1-160 >&2

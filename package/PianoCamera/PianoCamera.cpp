@@ -1033,6 +1033,11 @@ void PianoCamera::run()
   }
   note("survey: %llu MMIO loads, %u observer reads (%u failed), %u map failures", (unsigned long long)gLoads, s.pmicReads, s.pmicFailures,
        gMapFailures);
+  {   // the SPMI lock every kext shares (PianoSpmi.h): this kext's transactions and waits, and every kext's
+    char lockLine[360];
+    pianospmi::format(lockLine, sizeof lockLine);
+    note("%s", lockLine);
+  }
   if (gArgs.level < 2) {
     stage(2, "done (level 1)");
     note("done: %llu MMIO loads, 0 stores", (unsigned long long)gLoads);

@@ -43,4 +43,4 @@ python3 "$D/tooling/k27/build-native-kext.py" PianoThermal "$P/PianoThermal.cpp"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 # The GPU hooks (adreno830_dcvs_park, adreno830_thermal_state) come from PianoA830, a library of the descriptor, resolved by the KC link.
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" --library-prefix _adreno830_dcvs_park \
-  --library-prefix _adreno830_thermal_state | cut -c1-160 >&2
+  --library-prefix _adreno830_thermal_state --library-prefix _piano_spmi_words | cut -c1-160 >&2

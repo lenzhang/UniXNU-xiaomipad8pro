@@ -59,4 +59,4 @@ python3 "$D/tooling/k27/build-native-kext.py" PianoPower "$P/PianoPower.cpp" "$P
 . "$D/tooling/k27/k27-tree.sh"
 KERNEL=${K27_KERNEL:-$PIANO_K27_TREE/out/k27/kernel-k27-0059-native.macho}
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$D/out/native-kexts/PianoPower/objects.json" "$KERNEL" \
-  --library-prefix _native_ufs_part_ --library-prefix _sm8750_rpmh_drv2_owner --library-prefix _sm8750_scm_owner | cut -c1-160 >&2
+  --library-prefix _native_ufs_part_ --library-prefix _sm8750_rpmh_drv2_owner --library-prefix _sm8750_scm_owner --library-prefix _piano_spmi_words | cut -c1-160 >&2

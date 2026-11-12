@@ -31,4 +31,4 @@ KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 # PianoPower's USB-C relay (package/include/PianoUsbcContract.h) and port-event functions (PianoAdspContract.h) come from PianoPower
 # (listed before PianoUsbHost, named as a library by the descriptor): the KC link resolves them by name.
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" --library-prefix _piano_usbc_ \
-  --library-prefix _piano_port_ | cut -c1-200 >&2
+  --library-prefix _piano_port_ --library-prefix _piano_spmi_words | cut -c1-200 >&2

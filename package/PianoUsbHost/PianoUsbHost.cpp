@@ -1867,6 +1867,11 @@ void PianoUsbHost::run()
   summary(v, t.ok, p, c, k, q, r, line, sizeof line);
   setProperty("piano-usbhost-survey", line);
   note("summary: %s", line);
+  {   // the SPMI lock every kext shares (PianoSpmi.h): this kext's transactions and waits, and every kext's
+    char lockLine[360];
+    pianospmi::format(lockLine, sizeof lockLine);
+    note("%s", lockLine);
+  }
 
   if (gArgs.level == 5 || gArgs.level == 6) {
     char host[200];

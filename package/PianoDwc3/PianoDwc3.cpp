@@ -646,6 +646,7 @@ void execute(const char *line)
             "  echo on|off    echo typed characters\n"
             "  usb            controller and channel state\n"
             "  usb cold [sim M]  a cold start of the controller now (piano-usb-cold), after the test hook M (piano-usb-cold-sim)\n"
+            "  spmi           the SPMI lock every kext shares: its owner now, every kext's counts, this kext's\n"
             "  ioreg [depth]  the IOService plane (default and limit: depth 32); Ctrl-C stops it\n"
             "  peek PA [n]    n 32-bit words at physical address PA (uncached mapping)\n"
             "  poke PA V      write V at PA (needs piano-usb-poke=1)\n"
@@ -675,6 +676,14 @@ void execute(const char *line)
       return;
     }
     usbStatus();
+  } else if (word(s, "spmi")) {   // PianoSpmi.h: the shared words (every kext's counts) and this kext's own
+    char line[300], owner[5];
+    piano_spmi_tag_text(__atomic_load_n(&piano_spmi_words.owner, __ATOMIC_ACQUIRE), owner);
+    cprintf("SPMI lock: owner now %s, depth %u\n", owner, piano_spmi_words.depth);
+    pianospmi::format(line, sizeof line, PianoSpmiLineAll);
+    cprintf("%s\n", line);
+    pianospmi::format(line, sizeof line, PianoSpmiLineOurs);
+    cprintf("PianoDwc3's: %s\n", line);
   } else if (word(s, "ioreg")) {
     if (!parseNumber(s, &a) || a > 32) a = 32;
     dumpEntry(IORegistryEntry::getRegistryRoot(), 0, unsigned(a));

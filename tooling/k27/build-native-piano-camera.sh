@@ -48,4 +48,4 @@ KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 # PianoA830's lock words (DRV-2, GCC votes) and the shared multimedia votes' words come from that kext (a library in
 # PianoCamera.json, linked before PianoCamera in configs/k27-native-kexts.txt), resolved by the KC link.
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" --library-prefix _sm8750_rpmh_drv2_owner \
-  --library-prefix _sm8750_gcc_vote_owner --library-prefix _piano_mm_votes | cut -c1-160 >&2
+  --library-prefix _sm8750_gcc_vote_owner --library-prefix _piano_mm_votes --library-prefix _piano_spmi_words | cut -c1-160 >&2

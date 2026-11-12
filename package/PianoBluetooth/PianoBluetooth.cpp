@@ -1044,6 +1044,11 @@ void PianoBluetooth::survey()
   stage(6, "the survey is done");
   note("level 1: %llu MMIO loads, 0 MMIO stores; %u SPMI observer reads; %u pages mapped, %u map failures", (unsigned long long)gLoads,
        gSpmiReads, gPageCount, gMapFailures);
+  {   // the SPMI lock every kext shares (PianoSpmi.h): this kext's transactions and waits, and every kext's
+    char lockLine[360];
+    pianospmi::format(lockLine, sizeof lockLine);
+    note("%s", lockLine);
+  }
   unmapAll();
 }
 

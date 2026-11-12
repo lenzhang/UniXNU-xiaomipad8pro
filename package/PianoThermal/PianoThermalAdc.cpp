@@ -264,6 +264,10 @@ void statsLine()
        "status clears; %u SPMI reads, %u writes",
        upS(), gBoard.rounds, a.conversions, a.failures, (unsigned long long)(a.conversions ? a.totalUs / a.conversions : 0), a.maxUs,
        gBoard.enabledCount(), kChannelCount, a.staleClears, a.bus.reads, a.bus.writeCount);
+  // The SPMI lock every kext shares (PianoSpmi.h): this kext's transactions and waits, and every kext's.
+  char line[360];
+  pianospmi::format(line, sizeof line);
+  note("[%us] adc: %s", upS(), line);
 }
 
 void publishProperties(uint32_t state)
