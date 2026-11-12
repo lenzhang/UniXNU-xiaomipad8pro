@@ -52,6 +52,19 @@ struct ChgEnInputs {
   bool dspOwns = false;        // level 2 with the DSP running: its firmware owns the enable
 };
 
+// The battery and port gates every charger write of ours shares (ChargerEnable's set and pulse, ChargerFix.h's steps): nullptr when
+// they all pass, else the reason.
+inline const char *chgBatteryGate(const ChgEnInputs &in)
+{
+  if (in.dspOwns) return "the DSP runs: its firmware owns the enable";
+  if (!in.sourcePresent) return "no source on the port";
+  if (!in.packsOk) return "the packs did not both read";
+  if (in.anyFull || in.maxSocPct >= 100) return "a pack reads full";
+  if (in.maxPackMv >= kChgEnMaxPackMv) return "a pack is at 4350 mV or above";
+  if (in.minDeciC < kChgEnMinDeciC || in.maxDeciC > kChgEnMaxDeciC) return "a pack is outside 15-45 C";
+  return nullptr;
+}
+
 struct ChgEnWrite {
   bool done = false, ok = false, readBack = false;
   const char *what = "";       // "set", "pulse off", "pulse on"
@@ -144,7 +157,9 @@ class ChargerEnable {
   bool located = false;
   const char *why = "not located";   // the block gate (empty: writes allowed)
   uint32_t sets = 0, setFailures = 0, pulses = 0, pulseFailures = 0, clearedByOthers = 0, refused = 0;
+  uint32_t fixPulses = 0, fixPulseFailures = 0;   // the pulses ChargerFix.h asked for (piano-power-chgfix step A), counted apart
   bool pulseOpen = false;            // bit 0 cleared by a pulse and not yet set again
+  bool fixOpen = false;              // the open pulse is ChargerFix's (its restore goes through whatever the mode)
   uint64_t pulseDue = 0, lastPulseMs = 0;
   uint32_t restoreTries = 0;
 
@@ -158,11 +173,41 @@ class ChargerEnable {
 
   // The allowlist: CHGR +0x42 alone, bit 0 alone changed from the value read before it: set from clear (any mode but off), clear
   // from set only while a pulse is started (mode pulse).
+  // ChargerFix's pulse (fixOpen) goes through in every mode, read only (=0) included: piano-power-chgfix asked for it, and its
+  // second half must always be let through.
   bool allowed(int apid, uint8_t reg, uint8_t value, uint8_t before, bool pulseOff) const
   {
-    if (apid < 0 || apid != chgr.apid || why[0] || reg != kChgrEnableCmd || mode == ChgEnMode::off) return false;
+    if (apid < 0 || apid != chgr.apid || why[0] || reg != kChgrEnableCmd || (mode == ChgEnMode::off && !fixOpen)) return false;
     if (!pulseOff) return !(before & kChgEnableBit) && value == uint8_t(before | kChgEnableBit);
-    return mode == ChgEnMode::pulse && (before & kChgEnableBit) && value == uint8_t(before & ~kChgEnableBit);
+    return (mode == ChgEnMode::pulse || fixOpen) && (before & kChgEnableBit) && value == uint8_t(before & ~kChgEnableBit);
+  }
+
+  // ChargerFix's step A (ChargerFix.h): bit 0 of an enable that reads on cleared now and set again by restoreIfDue
+  // kChgEnPulseHoldMs later, as a chgen=2 pulse but outside its count and spacing (ChargerFix keeps its own) and not judged here.
+  // false (nothing written, *out untouched) when the block gate fails, a pulse is open or the command does not read on.
+  bool fixPulse(const Io &io, const SpmiWriter &w, uint64_t now, ChgEnWrite *out)
+  {
+    if (why[0] || pulseOpen) return false;
+    uint8_t cmd = 0;
+    if (spmiRead(io, chgr.apid, kChgrEnableCmd, &cmd, 1) != ReadResult::ok || !(cmd & kChgEnableBit)) return false;
+    fixOpen = true;
+    const ChgEnWrite r = writeBit(io, w, "chgfix pulse off", cmd, true);
+    if (r.ok) {
+      pulseOpen = true;
+      pulseDue = now + kChgEnPulseHoldMs;
+      restoreTries = 0;
+    } else if (r.readBack && !(r.after & kChgEnableBit)) {
+      pulseOpen = pulseOffFailed = true;   // cleared without reading back as asked: set again at once
+      pulseDue = now;
+      restoreTries = 0;
+      fixPulseFailures++;
+    } else {
+      fixOpen = false;
+      fixPulseFailures++;
+    }
+    if (havePrev && r.readBack) prev.chgrCmd[2] = r.after;
+    if (out) *out = r;
+    return true;
   }
 
   // One check with every report, on the view ChargerWdog::check just read: the changes since the previous check, then (by the mode
@@ -217,17 +262,22 @@ class ChargerEnable {
       r.what = "pulse on (already set)";
       r.before = r.value = r.after = cmd;
     } else {
-      r = writeBit(io, w, "pulse on", cmd, false);
+      r = writeBit(io, w, fixOpen ? "chgfix pulse on" : "pulse on", cmd, false);
     }
     restoreTries++;
     if (r.readBack && havePrev) prev.chgrCmd[2] = r.after;   // the next diff shows others' changes only
     if (r.ok) {
       pulseOpen = false;
-      if (!pulseOffFailed) pulses++;   // a failed clear is counted as a failure already
+      if (fixOpen) {
+        if (!pulseOffFailed) fixPulses++;   // ChargerFix judges its own pulse
+        fixOpen = false;
+      } else {
+        if (!pulseOffFailed) pulses++;   // a failed clear is counted as a failure already
+        judgePending = true;
+        judgeWhat = "pulse";
+        judgeMs = now;
+      }
       pulseOffFailed = false;
-      judgePending = true;
-      judgeWhat = "pulse";
-      judgeMs = now;
     } else {
       pulseDue = now + (restoreTries < 10 ? kChgEnRestoreRetryMs : 30000);   // every second, after ten tries every 30 s
     }
@@ -284,12 +334,7 @@ class ChargerEnable {
     if (cfg2 & kChgEnSrcPin) return "the enable is the pin's (CHGR_CFG2 bit 7): not the command register's";
     if (cfg2 & kChgEnPolarity) return "CHGR_CFG2 bit 6 is set: not the software-control configuration this rule knows";
     if (v.state() != kChgrDisabled) return "";   // charging or done by its own rules: nothing to do
-    if (in.dspOwns) return "the DSP runs: its firmware owns the enable";
-    if (!in.sourcePresent) return "no source on the port";
-    if (!in.packsOk) return "the packs did not both read";
-    if (in.anyFull || in.maxSocPct >= 100) return "a pack reads full";
-    if (in.maxPackMv >= kChgEnMaxPackMv) return "a pack is at 4350 mV or above";
-    if (in.minDeciC < kChgEnMinDeciC || in.maxDeciC > kChgEnMaxDeciC) return "a pack is outside 15-45 C";
+    if (const char *g = chgBatteryGate(in)) return g;
     if (!(cmd & kChgEnableBit)) {
       if (sets + setFailures >= kChgEnMaxSets) return "five sets this boot: none more";
       *out = writeBit(io, w, "set", cmd, false);
