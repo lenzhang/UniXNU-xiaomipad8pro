@@ -23,6 +23,7 @@
 // the step's deadline is what decides. Nothing here allocates, maps or sleeps.
 #pragma once
 #include <stdint.h>
+#include "WifiAssoc.h"
 #include "WifiCe.h"
 #include "WifiHtc.h"
 #include "WifiWmi.h"
@@ -33,6 +34,9 @@ enum LinkStep : int {
   kLinkIdle = 600, kLinkTransport = 601, kLinkConnect = 602, kLinkSetup = 603, kLinkCapability = 604, kLinkInit = 605,
   kLinkReadyWait = 606, kLinkVdev = 607, kLinkScanStart = 608, kLinkScanning = 609, kLinkTeardown = 610, kLinkDone = 611,
   kLinkStopped = 612,
+  // The radio's set-up between the firmware's ready event and the virtual device (P22, docs §10.27), each behind a bit of
+  // piano-wifi-l6pre. They run in this order, and their numbers are above the ladder's so that 601-612 keep their meaning.
+  kLinkHwMode = 620, kLinkPdevParams = 621, kLinkRegWait = 622, kLinkChanList = 623, kLinkHold = 624,
 };
 
 enum LinkError : int {
@@ -43,7 +47,7 @@ enum LinkError : int {
 // What the machine still has to send. One at a time: the firmware answers each before the next is due.
 enum LinkPending : uint32_t {
   kLinkSendNothing = 0, kLinkSendConnect, kLinkSendSetup, kLinkSendInit, kLinkSendVdev, kLinkSendScan, kLinkSendStopScan,
-  kLinkSendDeleteVdev,
+  kLinkSendDeleteVdev, kLinkSendHwMode, kLinkSendPdevParam, kLinkSendChanList,
 };
 
 inline const char *linkStepName(int step)
@@ -61,6 +65,11 @@ inline const char *linkStepName(int step)
   case kLinkScanning: return "the scan's results";
   case kLinkTeardown: return "the teardown";
   case kLinkDone: return "done";
+  case kLinkHwMode: return "the radio's hardware mode";
+  case kLinkPdevParams: return "the radio's parameters";
+  case kLinkRegWait: return "waiting for the regulatory event";
+  case kLinkChanList: return "the channel list";
+  case kLinkHold: return "holding after the virtual device (piano-wifi-l6pre bit 6)";
   default: return "stopped";
   }
 }
@@ -90,6 +99,11 @@ struct LinkOptions {
   bool passive = true;
   uint32_t settleMs = 100;        // between the virtual device and the scan, as this firmware's own host leaves it
   uint32_t extWaitMs = 500;       // after the chip's capability, for the extended ones that follow it (step 604)
+  // The radio's set-up before the virtual device (P22, §10.27): piano-wifi-l6pre and its three times.
+  uint32_t pre = kPreDefault;
+  uint32_t regWaitMs = kPreRegWaitMsDefault;
+  uint32_t paceMs = kPrePaceMsDefault;
+  uint32_t holdMs = kPreHoldMsDefault;
 };
 
 struct Link {
@@ -108,10 +122,22 @@ struct Link {
   bool ext2Seen = false;          // the second extended capability event: the last the firmware sends before it waits
   bool scanStarted = false, scanCompleted = false, scanTimedOut = false, stopped = false, deleted = false;
   uint32_t scanReason = 0, scanChannels = 0, scanEventsSeen = 0;
+  // the radio's set-up (P22, §10.27)
+  RegDomain reg;
+  ChanList chanList;
+  uint32_t paramsSent = 0, hwModeStatus = 0, chanListChannels = 0;
+  bool hwModeSent = false, hwModeAnswered = false, chanListSent = false, chanListFromEvent = false;
+  uint64_t pace = 0, hold = 0, regDeadline = 0;
+  uint8_t vdevMac[6] = {};
+  const char *vdevMacFrom = "the firmware's ready event";
   // counters for the log
   uint32_t commands = 0, events = 0, unexpected = 0, mgmtFrames = 0, controlMessages = 0, creditWaits = 0,
            badMessages = 0, extEvents = 0;
   uint32_t lastEvent = 0;
+  // every event this level knows nothing about, so that a log names them instead of a count alone
+  uint32_t unknownEvent[8] = {};
+  uint32_t unknownEvents = 0;
+  int lastCommandStep = 0;        // the step whose command went out last: what a firmware death comes after
   void (*note)(void *ctx, int step, const char *what) = nullptr;
   void *noteCtx = nullptr;
 };
@@ -141,9 +167,39 @@ inline int fail(Link &link, int error)
 inline void enter(Link &link, int step, uint64_t nowMs)
 {
   link.step = step;
-  link.deadline = nowMs + (step == kLinkScanning ? link.options.scanWaitMs : link.options.timeoutMs);
+  link.deadline = nowMs + (step == kLinkScanning ? link.options.scanWaitMs
+                           : step == kLinkRegWait ? link.options.regWaitMs + link.options.timeoutMs
+                           : step == kLinkHold    ? link.options.holdMs + link.options.timeoutMs
+                                                  : link.options.timeoutMs);
   if (link.note) link.note(link.noteCtx, step, linkStepName(step));
 }
+
+// The address the virtual device is created with: the firmware's own when it reports one, then the address its ready event
+// carries behind it, and last — only with piano-wifi-l6pre bit 3 — a locally administered one of piano's own. A virtual
+// device with an all-zero address is what this firmware's own host never creates (P22, §10.27). The address itself is never
+// logged here: only where it came from.
+inline void chooseVdevMac(Link &link)
+{
+  const uint8_t *from = nullptr;
+  if (wmiMacUsable(link.ready.mac)) {
+    from = link.ready.mac;
+    link.vdevMacFrom = "the firmware's ready event";
+  } else if (link.ready.extraMacSeen) {
+    from = link.ready.extraMac;
+    link.vdevMacFrom = "the address behind the ready event";
+  } else if (link.options.pre & kPreVdevMac) {
+    from = kLocalMac;
+    link.vdevMacFrom = "a locally administered address of piano's own (the firmware reported none)";
+  } else {
+    link.vdevMacFrom = "the firmware's ready event (all zeros: piano-wifi-l6pre bit 3 is off)";
+  }
+  for (unsigned i = 0; i < 6; ++i) link.vdevMac[i] = from ? from[i] : 0;
+}
+
+// Where the ladder goes after the firmware's ready event: the first of the radio's set-up steps the options ask for, and the
+// virtual device when they ask for none.
+inline void afterReady(Link &link, uint64_t nowMs);
+inline void afterPre(Link &link, int from, uint64_t nowMs);
 
 // The pipes a service uses are not negotiated: they are the entries level 5 sent the firmware (WifiHw.h kCeServices).
 inline bool pipesOf(uint32_t service, uint8_t &ulPipe, uint8_t &dlPipe)
@@ -228,13 +284,58 @@ inline bool sendPending(Link &link, uint64_t nowMs)
   }
   case kLinkSendVdev: {
     const uint32_t chains = chainCountOf(link.caps.rfChains);
-    const uint8_t *mac = link.ready.mac;
+    const uint8_t *mac = link.vdevMac;
     rc = send(link, uint8_t(link.endpoint), [&](uint8_t *at, uint32_t capacity) {
       WmiWriter w;
       return wmiBuildVdevCreate(w, at, capacity, vdevId, mac, kWmiPdevIdSoc, chains);
     });
     // A virtual device is answered by no event of its own: the scan follows a settle time later.
     if (rc == 1) link.settle = nowMs + link.options.settleMs;
+    break;
+  }
+  case kLinkSendHwMode:
+    rc = send(link, uint8_t(link.endpoint), [](uint8_t *at, uint32_t capacity) {
+      WmiWriter w;
+      return assocBuildSetHwMode(w, at, capacity, kWmiHwModeDbs);
+    });
+    if (rc == 1) {
+      link.hwModeSent = true;
+      link.pace = nowMs + link.options.paceMs;
+    }
+    break;
+  case kLinkSendPdevParam: {
+    PdevParam plan[kPdevParamCount];
+    const uint32_t count = pdevParamPlan(plan, kPdevParamCount, chainMaskOf(link.caps.rfChains));
+    if (link.paramsSent >= count) {
+      link.pending = kLinkSendNothing;
+      return false;
+    }
+    const PdevParam one = plan[link.paramsSent];
+    rc = send(link, uint8_t(link.endpoint), [&](uint8_t *at, uint32_t capacity) {
+      WmiWriter w;
+      return assocBuildPdevSetParam(w, at, capacity, one.param, one.value);
+    });
+    if (rc == 1) {
+      ++link.paramsSent;
+      link.pace = nowMs + link.options.paceMs;
+      if (link.paramsSent < count) {
+        link.pending = kLinkSendPdevParam;   // the next one on a later turn
+        link.lastCommandStep = link.step;
+        return true;
+      }
+    }
+    break;
+  }
+  case kLinkSendChanList: {
+    const ChanList list = link.chanList;
+    rc = send(link, uint8_t(link.endpoint), [&](uint8_t *at, uint32_t capacity) {
+      WmiWriter w;
+      return assocBuildChanList(w, at, capacity, list, false);
+    });
+    if (rc == 1) {
+      link.chanListSent = true;
+      link.pace = nowMs + link.options.paceMs;
+    }
     break;
   }
   case kLinkSendScan:
@@ -261,8 +362,52 @@ inline bool sendPending(Link &link, uint64_t nowMs)
   default:
     return false;
   }
-  if (rc == 1) link.pending = kLinkSendNothing;
+  if (rc == 1) {
+    link.pending = kLinkSendNothing;
+    link.lastCommandStep = link.step;
+  }
   return rc == 1;
+}
+
+// The order of the radio's set-up: the hardware mode, the parameters, the regulatory event, the channel list, and then the
+// virtual device (or the hold, with piano-wifi-l6pre bit 6). Each piece is skipped when its bit is off.
+inline void afterPre(Link &link, int from, uint64_t nowMs)
+{
+  const uint32_t pre = link.options.pre;
+  link.pace = 0;
+  if (from < kLinkPdevParams && (pre & kPrePdevParams)) {
+    enter(link, kLinkPdevParams, nowMs);
+    link.pending = kLinkSendPdevParam;
+    return;
+  }
+  if (from < kLinkRegWait && (pre & kPreChanList) && (pre & kPreRegWait) && !link.reg.seen) {
+    enter(link, kLinkRegWait, nowMs);
+    link.regDeadline = nowMs + link.options.regWaitMs;
+    return;
+  }
+  if (from < kLinkChanList && (pre & kPreChanList)) {
+    // The firmware's own domain when its event arrived, and the static list of WifiHw.h when it did not.
+    if (link.reg.seen) chanListBuild(link.chanList, link.reg, link.options.with5GHz);
+    if (link.reg.seen && link.chanList.count) link.chanListFromEvent = true;
+    else chanListFallback(link.chanList, link.options.with5GHz);
+    link.chanListChannels = link.chanList.count;
+    enter(link, kLinkChanList, nowMs);
+    link.pending = kLinkSendChanList;
+    return;
+  }
+  chooseVdevMac(link);
+  enter(link, kLinkVdev, nowMs);
+  link.pending = kLinkSendVdev;
+}
+
+inline void afterReady(Link &link, uint64_t nowMs)
+{
+  if (link.options.pre & kPreHwMode) {
+    enter(link, kLinkHwMode, nowMs);
+    link.pending = kLinkSendHwMode;
+    return;
+  }
+  afterPre(link, kLinkHwMode, nowMs);
 }
 
 inline void onControl(Link &link, const HtcRx &rx, uint64_t nowMs)
@@ -347,8 +492,7 @@ inline void onEvent(Link &link, const uint8_t *message, uint32_t length, uint64_
       fail(link, kLinkErrMessage);
       return;
     }
-    enter(link, kLinkVdev, nowMs);
-    link.pending = kLinkSendVdev;
+    afterReady(link, nowMs);
     return;
   case kWmiEvtScan: {
     WmiScanEvent ev;
@@ -394,17 +538,32 @@ inline void onEvent(Link &link, const uint8_t *message, uint32_t length, uint64_
     ++link.extEvents;
     if (id == uint32_t(kWmiEvtServiceReadyExt2)) link.ext2Seen = true;
     return;
-  case kWmiEvtServiceAvailable:
   case kWmiEvtRegChanListCc:
   case kWmiEvtRegChanListCcExt:
+    // The firmware sends its regulatory domain by itself after the initialisation: it is what the channel list is built from
+    // (P22, §10.27). A second one replaces the first, as a domain change would.
+    if (!regParse(link.reg, payload, payloadLength, id == uint32_t(kWmiEvtRegChanListCcExt))) ++link.badMessages;
+    return;
+  case kWmiEvtPdevSetHwModeResp: {
+    link.hwModeAnswered = true;
+    uint32_t size = 0;
+    const uint8_t *ev = wmiFind(payload, payloadLength, kWmiTagPdevSetHwModeResp, &size);
+    if (ev && size >= 4) link.hwModeStatus = wmiGet(ev, 0);
+    return;
+  }
+  case kWmiEvtServiceAvailable:
   case kWmiEvtChanInfo:
-  case kWmiEvtPdevSetHwModeResp:
   case kWmiEvtVdevDeleteResp:
   case kWmiEvtDebugMessage:
   case kWmiEvtDiag:
     return;                     // read and counted, acted on by no step of this level
   default:
     ++link.unexpected;
+    // The identifier of an event this level knows nothing about: a count alone said nothing about the three the first level 6
+    // boot saw (§10.27), so the first eight are kept for the log.
+    if (link.unknownEvents < sizeof link.unknownEvent / sizeof link.unknownEvent[0])
+      link.unknownEvent[link.unknownEvents] = id;
+    ++link.unknownEvents;
     return;
   }
 }
@@ -485,11 +644,42 @@ inline int linkRun(Link &link, uint64_t nowMs)
     sendPending(link, nowMs);
     return link.step;
   }
-  // The scan follows the virtual device once the settle time has passed.
+  // The radio's set-up: each piece moves on once its command is out and the pace time has passed (with piano-wifi-l6pre bit
+  // 5; without it the next turn goes straight on, as before).
+  if (link.pending == kLinkSendNothing &&
+      (link.step == kLinkHwMode || link.step == kLinkPdevParams || link.step == kLinkChanList)) {
+    const bool paced = !(link.options.pre & kPrePace) || !link.pace || nowMs >= link.pace;
+    if (paced) {
+      afterPre(link, link.step, nowMs);
+      sendPending(link, nowMs);
+      return link.step;
+    }
+  }
+  // The regulatory event, or the wait for it running out.
+  if (link.step == kLinkRegWait && link.pending == kLinkSendNothing && (link.reg.seen || nowMs >= link.regDeadline)) {
+    afterPre(link, kLinkRegWait, nowMs);
+    sendPending(link, nowMs);
+    return link.step;
+  }
+  // The scan follows the virtual device once the settle time has passed — or, with piano-wifi-l6pre bit 6, the level holds
+  // there instead, so that a firmware death after the virtual device cannot be blamed on the scan.
   if (link.step == kLinkVdev && link.pending == kLinkSendNothing && link.settle && nowMs >= link.settle) {
     link.settle = 0;
+    if (link.options.pre & kPreNoScan) {
+      enter(link, kLinkHold, nowMs);
+      link.hold = nowMs + link.options.holdMs;
+      return link.step;
+    }
     enter(link, kLinkScanStart, nowMs);
     link.pending = kLinkSendScan;
+    sendPending(link, nowMs);
+    return link.step;
+  }
+  // The hold's end: the teardown, as a completed scan reaches it.
+  if (link.step == kLinkHold && nowMs >= link.hold) {
+    enter(link, kLinkTeardown, nowMs);
+    link.stopped = true;   // no scan ran
+    link.pending = kLinkSendDeleteVdev;
     sendPending(link, nowMs);
     return link.step;
   }

@@ -104,6 +104,7 @@ struct Args {
   uint32_t gen, physeq, rcg, blind, release, stop, dmaMib, fwTimeoutMs;
   uint32_t iova, mode, shadow, qmiTimeoutMs;
   uint32_t wmiTimeoutMs, scanWaitMs, band, bssid;
+  uint32_t l6pre, l6regwait, l6pace, l6hold;
   uint32_t noc, socreset, msi, ctxearly, ras;
   uint32_t rddm, defer, wake;
   uint32_t deadlineMs;
@@ -156,6 +157,14 @@ void readArgs()
   if (gArgs.scanWaitMs < 1000 || gArgs.scanWaitMs > 60000) gArgs.scanWaitMs = kScanWaitMsDefault;
   gArgs.band = bootArg("piano-wifi-band", 1);
   gArgs.bssid = bootArg("piano-wifi-bssid", 0);
+  // piano-wifi-l6pre=N: which of the radio's set-up steps level 6 does between the firmware's ready event and its virtual
+  // device (P22, docs section 10.27). Bit 0 the hardware mode, 1 the radio's six parameters, 2 the channel list, 3 a usable
+  // virtual-device address, 4 wait for the regulatory event first, 5 pace the commands apart, 6 no scan (hold after the
+  // virtual device instead, so that a death cannot be blamed on the scan). Default: everything but the last.
+  gArgs.l6pre = bootArg("piano-wifi-l6pre", kPreDefault);
+  gArgs.l6regwait = bootArg("piano-wifi-l6regwait", kPreRegWaitMsDefault);
+  gArgs.l6pace = bootArg("piano-wifi-l6pace", kPrePaceMsDefault);
+  gArgs.l6hold = bootArg("piano-wifi-l6hold", kPreHoldMsDefault);
   // piano-wifi-noc=0: no vote for the PCIe NoC's bus clock manager (SN4) before level 3's clocks (the A/B test of docs §10.21)
   gArgs.noc = bootArg("piano-wifi-noc", 1);
   // The fourth round's alignments with the chip's own host (docs §10.23, WifiPbl.h), each on by default and each with its A/B:
@@ -2540,6 +2549,16 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
   options.scanWaitMs = gArgs.scanWaitMs;
   options.with5GHz = gArgs.band != 0;
   options.passive = true;
+  options.pre = gArgs.l6pre;
+  options.regWaitMs = gArgs.l6regwait;
+  options.paceMs = gArgs.l6pace;
+  options.holdMs = gArgs.l6hold;
+  note("level 6: before the virtual device (piano-wifi-l6pre=%#x): hardware mode %u, the radio's parameters %u, the channel "
+       "list %u (the regulatory event waited for %u, up to %u ms), a usable device address %u, paced %u ms, no scan %u",
+       gArgs.l6pre, (gArgs.l6pre & kPreHwMode) ? 1u : 0u, (gArgs.l6pre & kPrePdevParams) ? 1u : 0u,
+       (gArgs.l6pre & kPreChanList) ? 1u : 0u, (gArgs.l6pre & kPreRegWait) ? 1u : 0u, gArgs.l6regwait,
+       (gArgs.l6pre & kPreVdevMac) ? 1u : 0u, (gArgs.l6pre & kPrePace) ? gArgs.l6pace : 0u,
+       (gArgs.l6pre & kPreNoScan) ? 1u : 0u);
   gLink.note = linkNote;
   gLink.noteCtx = nullptr;
   const uint64_t started = nowMs();
@@ -2584,6 +2603,10 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
       zero = zero && gLink.ready.mac[i] == 0;
     }
     scanFormatBssid(asAddress, gArgs.bssid != 0, mac, sizeof mac);
+    note("level 6: the address behind the ready event: %s", gLink.ready.extraMacs
+             ? (gLink.ready.extraMacSeen ? "usable (it is what the virtual device takes when the firmware's own is zeros)"
+                                         : "announced but not usable (zeros or a group address)")
+             : "none announced");
     note("level 6: the firmware is ready: status %#x, %u peer(s), %u extra address(es); the chip's own address %s%s",
          gLink.ready.status, gLink.ready.totalPeers, gLink.ready.extraMacs, zero ? "is all zeros" : mac,
          zero ? " (this chip's firmware reports none: the unit's own is in the persist partition, section 13.1)" : "");
@@ -2596,6 +2619,45 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
         bytes->release();
       }
     }
+  }
+  // The radio's set-up (P22, docs section 10.27): what went out before the virtual device, and what the firmware's own
+  // regulatory event said. The device's address is never printed, only where it came from.
+  note("level 6: the radio's set-up: hardware mode %s%s, %u of %u parameter(s), the channel list %s; the virtual device's "
+       "address comes from %s; the last command went out at step %d",
+       gLink.hwModeSent ? "sent" : "not sent",
+       gLink.hwModeSent ? (gLink.hwModeAnswered ? gLink.hwModeStatus ? " (refused)" : " (accepted)" : " (not answered)") : "",
+       gLink.paramsSent, kPdevParamCount,
+       gLink.chanListSent ? (gLink.chanListFromEvent ? "sent from the firmware's regulatory event" : "sent from this driver's "
+                                                                                                     "own list")
+                          : "not sent",
+       gLink.vdevMacFrom, gLink.lastCommandStep);
+  if (gLink.chanListSent)
+    note("level 6: the channel list: %u channel(s) (%u passive, %u radar), %u left out of the 2.4 GHz band and %u of the "
+         "5 GHz band",
+         gLink.chanList.count, gLink.chanList.passive, gLink.chanList.radar, gLink.chanList.left24, gLink.chanList.left5);
+  if (gLink.reg.seen)
+    note("level 6: the regulatory domain: country \"%s\" (%#x), country number %u, domain %#x, radar region %u, status %u, "
+         "radios %u, bandwidths 2.4 GHz %u-%u MHz 5 GHz %u-%u MHz, %u rule(s) (%u of the 2.4 GHz band, %u of the 5 GHz band; "
+         "%u read, %u not read)%s",
+         gLink.reg.alpha2, gLink.reg.country, gLink.reg.countryId, gLink.reg.domainCode, gLink.reg.dfsRegion,
+         gLink.reg.status, gLink.reg.numPhy, gLink.reg.minBw24, gLink.reg.maxBw24, gLink.reg.minBw5, gLink.reg.maxBw5,
+         gLink.reg.rules24 + gLink.reg.rules5, gLink.reg.rules24, gLink.reg.rules5, gLink.reg.ruleCount,
+         gLink.reg.rulesDropped, gLink.reg.extended ? " (the extended event)" : "");
+  else
+    note("level 6: the regulatory domain: the firmware sent no regulatory event%s",
+         (gArgs.l6pre & kPreChanList) ? " (the channel list is this driver's own)" : "");
+  for (uint32_t i = 0; i < gLink.reg.ruleCount && i < 8; ++i)
+    note("level 6: regulatory rule %u: %u-%u MHz, up to %u MHz wide, %d dBm, flags %#x%s%s%s", i, gLink.reg.rule[i].startKhz,
+         gLink.reg.rule[i].endKhz, gLink.reg.rule[i].maxBwMhz, int(gLink.reg.rule[i].powerDbm), gLink.reg.rule[i].flags,
+         (gLink.reg.rule[i].flags & kRegRuleFlagDisabled) ? " disabled" : "",
+         (gLink.reg.rule[i].flags & kRegRuleFlagNoIr) ? " passive" : "",
+         (gLink.reg.rule[i].flags & kRegRuleFlagRadar) ? " radar" : "");
+  if (gLink.unknownEvents) {
+    char ids[120] = {};
+    uint32_t at = 0;
+    for (uint32_t i = 0; i < gLink.unknownEvents && i < 8 && at + 12 < sizeof ids; ++i)
+      at += uint32_t(snprintf(ids + at, sizeof ids - at, "%s%#x", i ? ", " : "", gLink.unknownEvent[i]));
+    note("level 6: %u event(s) this level knows nothing about: %s", gLink.unknownEvents, ids);
   }
   note("level 6: the scan: %u channel(s) asked for, started %u, %u scan event(s), %u channel visit(s), %s%s",
        gLink.request.channelCount, gLink.scanStarted ? 1u : 0u, gLink.scanEventsSeen, gLink.scanChannels,

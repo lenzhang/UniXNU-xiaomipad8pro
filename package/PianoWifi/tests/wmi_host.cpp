@@ -175,9 +175,18 @@ struct Firmware {
   uint32_t credits = 4, creditSize = 1024, endpoints = 8;
   uint8_t wmiEndpoint = 2;
   uint8_t mac[6] = {0x02, 0x50, 0x49, 0x41, 0x4e, 0x02};
+  uint8_t extraMac[6] = {0x02, 0x50, 0x49, 0x41, 0x4e, 0x03};
+  uint32_t extraMacs = 0;              // how many addresses the array behind the ready event carries
   // what it has seen, and what it checks
   bool readySent = false, connectSeen = false, setupSeen = false, initSeen = false, vdevSeen = false, scanSeen = false,
        stopSeen = false, deleteSeen = false;
+  // the radio's set-up (P22): the hardware mode, the parameters and the channel list
+  bool hwModeSeen = false, chanListSeen = false, answerHwMode = true, sendReg = true, regExtended = false;
+  uint32_t hwModeIndex = 0, hwModePdev = 0, hwModeBands = 0, hwModeStatus = 0;
+  uint32_t paramsSeen = 0, chanListCount = 0, chanListFlags = 0, chanListPdev = 0;
+  std::vector<std::pair<uint32_t, uint32_t>> params;     // (parameter, value) in the order they arrived
+  std::vector<std::pair<uint32_t, uint32_t>> chanEntries;   // (frequency, information word)
+  std::vector<uint32_t> commandOrder;                    // every command identifier, in order
   uint32_t initWords = 0, scanChannels = 0, scanFlags = 0, scanBssids = 0, scanSsids = 0, vdevStreams = 0, vdevType = 0;
   std::vector<uint32_t> channelList;
   uint8_t vdevMac[6] = {};
@@ -195,7 +204,7 @@ struct Firmware {
     std::vector<uint8_t> message(kHtcHeaderBytes + length, 0);
     const uint32_t trailerBytes = giveCredit ? kHtcRecordHeaderBytes + kHtcCreditReportBytes : 0;
     if (trailerBytes) message.resize(kHtcHeaderBytes + length + trailerBytes, 0);
-    std::memcpy(message.data() + kHtcHeaderBytes, payload, length);
+    if (length) std::memcpy(message.data() + kHtcHeaderBytes, payload, length);
     if (trailerBytes) {
       uint8_t *trailer = message.data() + kHtcHeaderBytes + length;
       trailer[0] = kHtcRecordCredits;
@@ -285,14 +294,57 @@ struct Firmware {
 
   void sendReadyEvent()
   {
-    uint8_t buffer[128] = {};
+    uint8_t buffer[256] = {};
     const uint32_t words = 15;
     put32(buffer, (words * 4) | uint32_t(kWmiTagReadyEvent) << kWmiTlvTagShift);
     std::memcpy(buffer + 4 + 24, mac, 6);
     put32(buffer + 4 + 4 * 8, 0);        // status: the firmware came up
-    put32(buffer + 4 + 4 * 10, 0);       // no extra addresses
+    put32(buffer + 4 + 4 * 10, extraMacs);
     put32(buffer + 4 + 4 * 11, 16);      // the peers it has room for
-    event(kWmiEvtReady, buffer, 4 + words * 4);
+    uint32_t length = 4 + words * 4;
+    if (extraMacs) {   // the array of addresses behind it, as the chip on the tablet sends one (P22)
+      put32(buffer + length, (extraMacs * 8) | uint32_t(kWmiTagArrayFixedStruct) << kWmiTlvTagShift);
+      std::memcpy(buffer + length + 4, extraMac, 6);
+      length += 4 + extraMacs * 8;
+    }
+    event(kWmiEvtReady, buffer, length);
+    if (sendReg) sendRegEvent();
+  }
+
+  // The firmware's regulatory domain, which it sends by itself after the initialisation: fourteen words and then its rules,
+  // each an own-header structure of three words (four in the extended form).
+  void sendRegEvent()
+  {
+    uint8_t buffer[512] = {};
+    const uint32_t words = regExtended ? kRegExtEventWords : kRegEventWords;
+    const uint32_t ruleWords = regExtended ? kRegRuleExtWords : kRegRuleWords;
+    const uint32_t tag = regExtended ? uint32_t(kWmiTagRegChanListCcExtEvent) : uint32_t(kWmiTagRegChanListCcEvent);
+    put32(buffer, (words * 4) | tag << kWmiTlvTagShift);
+    put32(buffer + 4 + 4 * 2, uint32_t('C') | uint32_t('N') << 8);   // the country, two characters
+    put32(buffer + 4 + 4 * 3, 1);                                    // one radio
+    put32(buffer + 4 + 4 * 6, 2);                                    // its radar region
+    put32(buffer + 4 + 4 * 8, 20);
+    put32(buffer + 4 + 4 * 9, 40);
+    put32(buffer + 4 + 4 * 10, 20);
+    put32(buffer + 4 + 4 * 11, 80);
+    put32(buffer + 4 + 4 * 12, 1);                                   // one rule of the 2.4 GHz band
+    put32(buffer + 4 + 4 * 13, 2);                                   // two of the 5 GHz band
+    uint32_t length = 4 + words * 4;
+    const uint32_t stride = 4 + ruleWords * 4;
+    put32(buffer + length, (3 * stride) | uint32_t(kWmiTagArrayStruct) << kWmiTlvTagShift);
+    length += 4;
+    struct Rule { uint32_t start, end, bw, power, flags; };
+    // 2412-2472 the whole lower band; 5170-5250 of the upper one; 5250-5330 with radar detection (passive).
+    const Rule rules[3] = {{2402, 2482, 40, 20, 0}, {5170, 5250, 80, 23, 0}, {5250, 5330, 80, 23, kRegRuleFlagRadar}};
+    for (unsigned i = 0; i < 3; ++i) {
+      uint8_t *at = buffer + length + i * stride;
+      put32(at, (ruleWords * 4) | uint32_t(regExtended ? kWmiTagRegRuleExt : kWmiTagRegRule) << kWmiTlvTagShift);
+      put32(at + 4, rules[i].start | rules[i].end << 16);
+      put32(at + 8, rules[i].bw | rules[i].power << 16);
+      put32(at + 12, rules[i].flags);
+    }
+    length += 3 * stride;
+    event(regExtended ? kWmiEvtRegChanListCcExt : kWmiEvtRegChanListCc, buffer, length);
   }
 
   void sendScanEvent(uint32_t type, uint32_t reason, uint32_t freq)
@@ -372,7 +424,59 @@ struct Firmware {
     const uint32_t id = get32(payload) & kWmiCmdIdMask;
     const uint8_t *tlvs = payload + kWmiCmdHeaderBytes;
     const uint32_t left = length - kWmiCmdHeaderBytes;
+    commandOrder.push_back(id);
     switch (id) {
+    case kWmiCmdPdevSetHwMode: {
+      hwModeSeen = true;
+      uint32_t size = 0;
+      const uint8_t *cmd = wmiFind(tlvs, left, kWmiTagPdevSetHwModeCmd, &size);
+      CHECK(cmd && size == 3 * 4);
+      if (!cmd) return;
+      hwModePdev = wmiGet(cmd, 0);
+      hwModeIndex = wmiGet(cmd, 1);
+      hwModeBands = wmiGet(cmd, 2);
+      if (!answerHwMode) return;
+      uint8_t buffer[64] = {};
+      put32(buffer, (6 * 4) | uint32_t(kWmiTagPdevSetHwModeResp) << kWmiTlvTagShift);
+      put32(buffer + 4, hwModeStatus);
+      event(kWmiEvtPdevSetHwModeResp, buffer, 4 + 6 * 4);
+      return;
+    }
+    case kWmiCmdPdevSetParam: {
+      uint32_t size = 0;
+      const uint8_t *cmd = wmiFind(tlvs, left, kWmiTagPdevSetParamCmd, &size);
+      CHECK(cmd && size == 3 * 4);
+      if (!cmd) return;
+      CHECK(wmiGet(cmd, 0) == kWmiPdevIdSoc);
+      params.push_back({wmiGet(cmd, 1), wmiGet(cmd, 2)});
+      ++paramsSeen;
+      return;
+    }
+    case kWmiCmdScanChanList: {
+      chanListSeen = true;
+      uint32_t size = 0;
+      const uint8_t *cmd = wmiFind(tlvs, left, kWmiTagScanChanListCmd, &size);
+      CHECK(cmd && size == 3 * 4);
+      if (!cmd) return;
+      chanListCount = wmiGet(cmd, 0);
+      chanListFlags = wmiGet(cmd, 1);
+      chanListPdev = wmiGet(cmd, 2);
+      uint32_t arraySize = 0;
+      const uint8_t *array = wmiFind(tlvs, left, kWmiTagArrayStruct, &arraySize);
+      const uint32_t stride = kWmiTlvHeaderBytes + kWmiChannelWords * 4;
+      CHECK(array && arraySize == chanListCount * stride);
+      chanEntries.clear();
+      if (array)
+        for (uint32_t i = 0; i < chanListCount; ++i) {
+          const uint8_t *at = array + i * stride;
+          CHECK((get32(at) >> kWmiTlvTagShift) == uint32_t(kWmiTagChannel));
+          CHECK((get32(at) & kWmiTlvLenMask) == kWmiChannelWords * 4);
+          const uint8_t *fields = at + kWmiTlvHeaderBytes;
+          CHECK(wmiGet(fields, 1) == wmiGet(fields, 0));   // a 20 MHz channel is its own centre frequency
+          chanEntries.push_back({wmiGet(fields, 0), wmiGet(fields, 3)});
+        }
+      return;
+    }
     case kWmiCmdInit: {
       initSeen = true;
       uint32_t size = 0;
@@ -398,6 +502,8 @@ struct Firmware {
       CHECK(wmiGet(cmd, 0) == 0);
       vdevType = wmiGet(cmd, 1);
       std::memcpy(vdevMac, cmd + 12, 6);
+      // No firmware of this family is ever given an all-zero device address (P22, docs section 10.27).
+      CHECK(vdevMac[0] || vdevMac[1] || vdevMac[2] || vdevMac[3] || vdevMac[4] || vdevMac[5]);
       vdevStreams = wmiGet(cmd, 5);
       CHECK(wmiGet(cmd, 6) == kWmiPdevIdSoc);
       const uint8_t *array = wmiFind(tlvs, left, kWmiTagArrayStruct, &size);
@@ -473,9 +579,16 @@ struct Firmware {
       const uint8_t endpoint = uint8_t(word0 & kHtcHdrEndpointMask);
       const uint32_t payload = (word0 >> kHtcHdrLengthShift) & 0xffffu;
       CHECK(payload + kHtcHeaderBytes <= message.size());
-      if (endpoint == 0) onControl(message.data() + kHtcHeaderBytes, payload);
-      else if (endpoint == wmiEndpoint) onCommand(message.data() + kHtcHeaderBytes, payload);
-      else CHECK(false);
+      if (endpoint == 0) {
+        onControl(message.data() + kHtcHeaderBytes, payload);
+      } else if (endpoint == wmiEndpoint) {
+        onCommand(message.data() + kHtcHeaderBytes, payload);
+        // The credit the firmware gives back when it has taken a message out of one of its receive buffers: without it a
+        // host that sends several commands in a row (the radio's set-up of P22) would run out of credits.
+        if ((word0 >> kHtcHdrFlagsShift) & kHtcFlagNeedCreditUpdate) toHost(wmiEndpoint, nullptr, 0, true);
+      } else {
+        CHECK(false);
+      }
     }
   }
 };
@@ -677,13 +790,24 @@ static void testLadder()
   // The teardown: nothing to stop (the scan ended by itself), the virtual device deleted.
   CHECK(!h.firmware.stopSeen && h.firmware.deleteSeen);
   CHECK(h.link.unexpected == 0 && h.ce.dropped == 0 && h.ce.refused == 0);
-  // Every step was announced once, in order.
+  // Every step was announced once, in the ladder's order: 601 to 606, then the radio's set-up (620-623, whose numbers are
+  // above the ladder's so that the older ones keep their meaning), then 607 to 611.
   CHECK(h.steps.size() >= 9);
   CHECK(h.steps.front().first == kLinkTransport && h.steps.back().first == kLinkDone);
-  int previous = 0;
+  static const int order[] = {kLinkTransport, kLinkConnect,    kLinkSetup,     kLinkCapability, kLinkInit,
+                              kLinkReadyWait, kLinkHwMode,     kLinkPdevParams, kLinkRegWait,   kLinkChanList,
+                              kLinkVdev,      kLinkScanStart,  kLinkScanning,  kLinkHold,       kLinkTeardown,
+                              kLinkDone};
+  const auto place = [](int step) {
+    for (unsigned i = 0; i < sizeof order / sizeof order[0]; ++i)
+      if (order[i] == step) return int(i);
+    return -1;
+  };
+  int previous = -1;
   for (const auto &step : h.steps) {
-    CHECK(step.first > previous || step.first == previous);
-    previous = step.first;
+    const int at = place(step.first);
+    CHECK(at >= 0 && at > previous);
+    previous = at;
   }
   // The address in a log line: masked unless the owner asked for all of it.
   char masked[32] = {}, full[32] = {};
@@ -691,6 +815,155 @@ static void testLadder()
   scanFormatBssid(h.link.scan.entries[0], true, full, sizeof full);
   CHECK(std::string(masked) == "02:11:22:**:**:**");
   CHECK(std::string(full) == "02:11:22:33:44:55");
+}
+
+// ====================================================== the radio's set-up before the virtual device (P22, section 10.27)
+static void testRadioSetup()
+{
+  {   // the whole order: the hardware mode, the six parameters, the regulatory event, the channel list, the device, the scan
+    Host h;
+    CHECK(h.start());
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run(800) == kLinkDone);
+    CHECK(h.firmware.hwModeSeen && h.firmware.hwModeIndex == kWmiHwModeDbs && h.firmware.hwModePdev == kWmiPdevIdSoc);
+    CHECK(h.firmware.hwModeBands == 0);
+    CHECK(h.link.hwModeSent && h.link.hwModeAnswered && h.link.hwModeStatus == 0);
+    CHECK(h.firmware.paramsSeen == kPdevParamCount && h.firmware.params.size() == kPdevParamCount);
+    CHECK(h.firmware.params[0].first == kWmiPdevParamPmfQos && h.firmware.params[0].second == 1);
+    CHECK(h.firmware.params[1].first == kWmiPdevParamDynamicBw && h.firmware.params[1].second == 1);
+    CHECK(h.firmware.params[2].first == kWmiPdevParamArpAcOverride && h.firmware.params[2].second == 0);
+    CHECK(h.firmware.params[3].first == kWmiPdevParamMeshMcastEnable && h.firmware.params[3].second == 1);
+    CHECK(h.firmware.params[4].first == kWmiPdevParamTxChainMask && h.firmware.params[4].second == 0x3);
+    CHECK(h.firmware.params[5].first == kWmiPdevParamRxChainMask && h.firmware.params[5].second == 0x3);
+    // The regulatory event the firmware sent, as the driver read it.
+    CHECK(h.link.reg.seen && !h.link.reg.extended && std::string(h.link.reg.alpha2) == "CN");
+    CHECK(h.link.reg.rules24 == 1 && h.link.reg.rules5 == 2 && h.link.reg.ruleCount == 3 && h.link.reg.rulesDropped == 0);
+    CHECK(h.link.reg.dfsRegion == 2 && h.link.reg.maxBw5 == 80);
+    // The channel list: only the channels its rules allow, the radar ones marked passive.
+    CHECK(h.firmware.chanListSeen && h.link.chanListSent && h.link.chanListFromEvent);
+    CHECK(h.firmware.chanListPdev == kWmiPdevIdSoc && h.firmware.chanListFlags == 0);
+    CHECK(h.firmware.chanListCount == h.link.chanList.count && h.firmware.chanListCount > 0);
+    CHECK(h.link.chanList.count == 13 + 4 + 4);     // the lower band whole, 5180-5240 and 5260-5320
+    CHECK(h.link.chanList.radar == 4 && h.link.chanList.passive == 4);
+    CHECK(h.link.chanList.left5 == 17);             // every 5 GHz channel outside the rules
+    bool found5180 = false, found5260Passive = false, found5500 = false;
+    for (const auto &entry : h.firmware.chanEntries) {
+      if (entry.first == 5180) found5180 = (entry.second & kWmiChanInfoModeMask) == kWmiModeLegacy5;
+      if (entry.first == 5260) found5260Passive = (entry.second & kWmiChanInfoPassive) && (entry.second & kWmiChanInfoDfs);
+      if (entry.first == 5500) found5500 = true;
+    }
+    CHECK(found5180 && found5260Passive && !found5500);
+    // The order the commands went out in: the mode, the parameters, the list, the device, the scan.
+    const std::vector<uint32_t> &order = h.firmware.commandOrder;
+    CHECK(order.size() >= 10);
+    CHECK(order[0] == uint32_t(kWmiCmdInit));
+    CHECK(order[1] == uint32_t(kWmiCmdPdevSetHwMode));
+    for (unsigned i = 0; i < kPdevParamCount; ++i) CHECK(order[2 + i] == uint32_t(kWmiCmdPdevSetParam));
+    CHECK(order[2 + kPdevParamCount] == uint32_t(kWmiCmdScanChanList));
+    CHECK(order[3 + kPdevParamCount] == uint32_t(kWmiCmdVdevCreate));
+    CHECK(order[4 + kPdevParamCount] == uint32_t(kWmiCmdStartScan));
+    CHECK(h.link.scan.count == 3 && h.link.unexpected == 0 && h.link.unknownEvents == 0);
+  }
+  {   // the extended regulatory event: the same rules, read through the longer header and the wider rule
+    Host h;
+    CHECK(h.start());
+    h.firmware.regExtended = true;
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run(800) == kLinkDone);
+    CHECK(h.link.reg.seen && h.link.reg.extended && h.link.reg.ruleCount == 3);
+    CHECK(h.link.chanListFromEvent && h.link.chanList.count == 21 && h.link.chanList.radar == 4);
+  }
+  {   // a firmware that sends no regulatory event: the wait runs out and the list is this driver's own
+    Host h;
+    CHECK(h.start());
+    h.firmware.sendReg = false;
+    LinkOptions options;
+    options.regWaitMs = 60;
+    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run(800) == kLinkDone);
+    CHECK(!h.link.reg.seen && h.link.chanListSent && !h.link.chanListFromEvent);
+    CHECK(h.link.chanList.count == kAssocChannelCount && h.link.chanList.radar > 0);
+    CHECK(h.firmware.chanListCount == kAssocChannelCount);
+  }
+  {   // the address of the virtual device: the firmware's own when it has one
+    Host h;
+    CHECK(h.start());
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run(800) == kLinkDone);
+    CHECK(std::memcmp(h.firmware.vdevMac, h.firmware.mac, 6) == 0);
+    CHECK(std::string(h.link.vdevMacFrom).find("ready event") != std::string::npos);
+  }
+  {   // the firmware's own address is all zeros but one address follows the event: that one is used (the tablet's case)
+    Host h;
+    CHECK(h.start());
+    std::memset(h.firmware.mac, 0, sizeof h.firmware.mac);
+    h.firmware.extraMacs = 1;
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run(800) == kLinkDone);
+    CHECK(h.link.ready.extraMacSeen);
+    CHECK(std::memcmp(h.firmware.vdevMac, h.firmware.extraMac, 6) == 0);
+  }
+  {   // no address anywhere: a locally administered one of piano's own, and never all zeros
+    Host h;
+    CHECK(h.start());
+    std::memset(h.firmware.mac, 0, sizeof h.firmware.mac);
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run(800) == kLinkDone);
+    CHECK(std::memcmp(h.firmware.vdevMac, kLocalMac, 6) == 0);
+    CHECK((h.firmware.vdevMac[0] & 0x3) == 0x2);   // locally administered, not a group address
+  }
+  {   // every piece off: the ladder is the one of the first level 6 boot (a device straight after the ready event)
+    Host h;
+    CHECK(h.start());
+    LinkOptions options;
+    options.pre = 0;
+    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run(800) == kLinkDone);
+    CHECK(!h.firmware.hwModeSeen && h.firmware.paramsSeen == 0 && !h.firmware.chanListSeen);
+    CHECK(h.firmware.commandOrder[1] == uint32_t(kWmiCmdVdevCreate));
+  }
+  {   // bit 6: no scan at all — the device is created, the level holds, then the teardown deletes it
+    Host h;
+    CHECK(h.start());
+    LinkOptions options;
+    options.pre = kPreDefault | kPreNoScan;
+    options.holdMs = 60;
+    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run(800) == kLinkDone);
+    CHECK(h.firmware.vdevSeen && !h.firmware.scanSeen && h.firmware.deleteSeen);
+    CHECK(h.link.scan.count == 0 && h.link.error == kLinkErrNone);
+  }
+  {   // a hardware mode the firmware refuses: logged, and the ladder goes on (its own host does not wait for the answer)
+    Host h;
+    CHECK(h.start());
+    h.firmware.hwModeStatus = 1;
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    CHECK(h.run(800) == kLinkDone);
+    CHECK(h.link.hwModeAnswered && h.link.hwModeStatus == 1 && h.link.error == kLinkErrNone);
+  }
+  {   // an event this level knows nothing about: its identifier is kept for the log
+    Host h;
+    CHECK(h.start());
+    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.firmware.sendReady();
+    for (unsigned i = 0; i < 800 && h.link.step != kLinkScanning; ++i) h.turn();
+    uint8_t buffer[32] = {};
+    put32(buffer, 16u | uint32_t(0x123) << kWmiTlvTagShift);
+    h.firmware.event(0x04044, buffer, 4 + 16);
+    h.turn();
+    h.turn();
+    CHECK(h.link.unknownEvents == 1 && h.link.unknownEvent[0] == 0x04044);
+    CHECK(h.run(800) == kLinkDone);
+  }
 }
 
 static void testOneBand()
@@ -1024,6 +1297,7 @@ int main()
   testTransport();
   testRings();
   testLadder();
+  testRadioSetup();
   testOneBand();
   testFaults();
   std::printf(failures ? "wmi_host: %d check(s) failed\n" : "wmi_host: all passed\n", failures);

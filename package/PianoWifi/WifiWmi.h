@@ -228,8 +228,19 @@ inline uint32_t wmiBuildInit(WmiWriter &w, uint8_t *buffer, uint32_t capacity, u
 struct WmiReady {
   bool seen = false;
   uint8_t mac[6] = {};
+  uint8_t extraMac[6] = {};      // the first of the addresses the array behind the event carries, when there is one
+  bool extraMacSeen = false;
   uint32_t status = 0, dscpTables = 0, extraMacs = 0, totalPeers = 0, maxAstIndex = 0;
 };
+
+// An address is usable for a virtual device when it is neither all zeros nor a group address (bit 0 of its first byte).
+inline bool wmiMacUsable(const uint8_t *mac)
+{
+  if (!mac || (mac[0] & 1)) return false;
+  for (unsigned i = 0; i < 6; ++i)
+    if (mac[i]) return true;
+  return false;
+}
 
 inline bool wmiParseReady(WmiReady &out, const uint8_t *payload, uint32_t length)
 {
@@ -243,6 +254,17 @@ inline bool wmiParseReady(WmiReady &out, const uint8_t *payload, uint32_t length
   out.extraMacs = wmiGet(ev, 10);
   out.totalPeers = wmiGet(ev, 11);
   if (size >= 4 * 14) out.maxAstIndex = wmiGet(ev, 13);
+  // Behind the event the firmware may carry an array of addresses (as many as word 10 says). This chip's own host only uses
+  // them when it has more than one radio, but on this unit the event's own address is all zeros and one such address is
+  // announced, so it is read here and used when it is usable (P22, docs §10.27).
+  if (out.extraMacs) {
+    uint32_t arraySize = 0;
+    const uint8_t *array = wmiFind(payload, length, kWmiTagArrayFixedStruct, &arraySize);
+    if (array && arraySize >= 8) {
+      for (unsigned i = 0; i < 6; ++i) out.extraMac[i] = array[i];
+      out.extraMacSeen = wmiMacUsable(out.extraMac);
+    }
+  }
   return true;
 }
 

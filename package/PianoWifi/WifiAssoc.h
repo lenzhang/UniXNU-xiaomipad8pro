@@ -218,6 +218,91 @@ inline uint32_t assocBuildChanList(WmiWriter &w, uint8_t *buffer, uint32_t capac
   return wmiEnd(w);
 }
 
+// ------------------------------------------------------- what the firmware wants first (P22, docs §10.27): radio set-up
+// The hardware mode: on a single-radio chip of this family the host sends this on its own, right after the firmware's ready
+// event, and sends no mode structure inside the initialisation. Three words: the radio (the whole chip), the mode, and how
+// many band-to-radio entries follow (none).
+inline uint32_t assocBuildSetHwMode(WmiWriter &w, uint8_t *buffer, uint32_t capacity, uint32_t mode)
+{
+  wmiBegin(w, buffer, capacity, kWmiCmdPdevSetHwMode);
+  uint8_t *cmd = wmiStruct(w, kWmiTagPdevSetHwModeCmd, 3);
+  if (cmd) {
+    wmiPut(cmd, 0, kWmiPdevIdSoc);
+    wmiPut(cmd, 1, mode);
+    wmiPut(cmd, 2, 0);
+  }
+  return wmiEnd(w);
+}
+
+// A radio parameter: the radio, the parameter, the value.
+inline uint32_t assocBuildPdevSetParam(WmiWriter &w, uint8_t *buffer, uint32_t capacity, uint32_t param, uint32_t value)
+{
+  wmiBegin(w, buffer, capacity, kWmiCmdPdevSetParam);
+  uint8_t *cmd = wmiStruct(w, kWmiTagPdevSetParamCmd, 3);
+  if (cmd) {
+    wmiPut(cmd, 0, kWmiPdevIdSoc);
+    wmiPut(cmd, 1, param);
+    wmiPut(cmd, 2, value);
+  }
+  return wmiEnd(w);
+}
+
+// The six parameters this chip's own host sends before it creates anything, in its order. The last two are the chain masks,
+// whose value is the mask the capability reported.
+struct PdevParam {
+  uint32_t param, value;
+};
+
+inline uint32_t pdevParamPlan(PdevParam *out, uint32_t capacity, uint32_t chainMask)
+{
+  const PdevParam list[] = {
+      {kWmiPdevParamPmfQos, 1},
+      {kWmiPdevParamDynamicBw, 1},
+      {kWmiPdevParamArpAcOverride, 0},
+      {kWmiPdevParamMeshMcastEnable, 1},
+      {kWmiPdevParamTxChainMask, chainMask},
+      {kWmiPdevParamRxChainMask, chainMask},
+  };
+  const uint32_t count = sizeof list / sizeof list[0];
+  if (!out || capacity < count) return 0;
+  for (uint32_t i = 0; i < count; ++i) out[i] = list[i];
+  return count;
+}
+
+constexpr uint32_t kPdevParamCount = 6;
+
+// The channel list a chip with no usable regulatory event still takes: every channel of WifiHw.h, the 5 GHz band's radar
+// channels marked passive, which is what a host's own regulatory database would have said about them. Used only when the
+// firmware's event did not arrive (the event is always preferred: it is the chip's own domain).
+inline void chanListFallback(ChanList &list, bool with5GHz)
+{
+  list = ChanList{};
+  for (unsigned band = 0; band < 2; ++band) {
+    if (band == 1 && !with5GHz) break;
+    const uint32_t *channels = band ? kAssocChannels5 : kAssocChannels24;
+    const unsigned count = band ? unsigned(sizeof kAssocChannels5 / sizeof kAssocChannels5[0])
+                                : unsigned(sizeof kAssocChannels24 / sizeof kAssocChannels24[0]);
+    for (unsigned i = 0; i < count; ++i) {
+      if (list.count == kWmiChanListMax) return;
+      RegChannel channel;
+      channel.freq = channels[i];
+      channel.allowed = true;
+      // 5260-5700 MHz are the radar channels of every domain this unit can be in: passive, never transmitted on blind.
+      channel.radar = band && channels[i] >= 5260 && channels[i] <= 5700;
+      channel.passive = channel.radar;
+      channel.powerDbm = 20;
+      ChanListEntry &entry = list.entry[list.count++];
+      entry.freq = channel.freq;
+      entry.info = chanInfoWord(channel, band ? kWmiModeLegacy5 : kWmiModeLegacy24);
+      const uint32_t halfDbm = uint32_t(uint8_t(channel.powerDbm * 2));
+      entry.reg1 = halfDbm << 8 | halfDbm << 16;
+      entry.reg2 = halfDbm << 8;
+      if (channel.passive) ++list.passive;
+      if (channel.radar) ++list.radar;
+    }
+  }
+}
+
 // --------------------------------------------------------------------------------------------- 704: the station started
 struct VdevStart {
   uint32_t vdevId = 0, freq = 0, mode = kWmiModeLegacy5;

@@ -598,7 +598,8 @@ enum WmiTag : uint32_t {
   kWmiTagHostMemoryChunk = 0x04c, kWmiTagStartScanCmd = 0x04d, kWmiTagStopScanCmd = 0x04e, kWmiTagChannel = 0x050,
   kWmiTagPdevSetParamCmd = 0x052, kWmiTagVdevCreateCmd = 0x056, kWmiTagVdevDeleteCmd = 0x057,
   kWmiTagVdevTxrxStreams = 0x19b, kWmiTagServiceReadyExtEvent = 0x1ac, kWmiTagVdevDeleteRespEvent = 0x1c2,
-  kWmiTagPdevSetHwModeCmd = 0x203, kWmiTagServiceAvailableEvent = 0x22f, kWmiTagPdevBandToMac = 0x24b,
+  kWmiTagPdevSetHwModeCmd = 0x203, kWmiTagPdevSetHwModeResp = 0x206, kWmiTagServiceAvailableEvent = 0x22f,
+  kWmiTagPdevBandToMac = 0x24b,
   kWmiTagServiceReadyExt2Event = 0x334,
 };
 // The resource configuration this chip's firmware wants (its own entry's values; the structure is 72 words after the TLV header,
@@ -670,6 +671,27 @@ constexpr uint32_t kDot11ElementSsid = 0, kDot11ElementDsParams = 3;
 constexpr uint32_t kWmiTimeoutMs = 10000;         // the deadline of each level 6 step (the firmware's own is five seconds)
 constexpr uint32_t kScanWaitMsDefault = 12000;    // how long the scan itself may take before the level gives up on it
 
+// ---- what the firmware wants before a virtual device and a scan (P22, docs §10.27) ----
+// On a single-radio chip of this family the host sends, after the firmware's ready event and before it creates anything: the
+// hardware mode (WMI_PDEV_SET_HW_MODE, "two bands at once"), four radio parameters, the chain masks, and the channel list its
+// regulatory event allows (WMI_SCAN_CHAN_LIST). Its virtual device is never created with an all-zero address either: a host
+// that has none of its own makes a locally administered one. Facts of the same Ubuntu tree (§3), behaviour only.
+constexpr uint32_t kWmiHwModeDbs = 1;             // the mode a single-radio chip of this family is put in
+constexpr uint32_t kWmiPdevParamTxChainMask = 0x01, kWmiPdevParamRxChainMask = 0x02, kWmiPdevParamDynamicBw = 0x0a,
+                   kWmiPdevParamPmfQos = 0x22, kWmiPdevParamArpAcOverride = 0x23, kWmiPdevParamMeshMcastEnable = 0x8f;
+// The address a virtual device takes when the firmware reports none: locally administered (bit 1 of the first byte), not a
+// group address, and piano's own three middle bytes so that two tablets on one network cannot collide by construction. The
+// unit's own address is in the persist partition and is never built into an image (docs §13.1).
+constexpr uint8_t kLocalMac[6] = {0x02, 0x50, 0x49, 0x41, 0x4e, 0x01};
+// The bits of piano-wifi-l6pre: which of those pieces level 6 does before it creates its virtual device, so that one boot can
+// take Ubuntu's whole order and the next can leave a piece out without a rebuild.
+constexpr uint32_t kPreHwMode = 1u << 0, kPrePdevParams = 1u << 1, kPreChanList = 1u << 2, kPreVdevMac = 1u << 3,
+                   kPreRegWait = 1u << 4, kPrePace = 1u << 5, kPreNoScan = 1u << 6;
+constexpr uint32_t kPreDefault = kPreHwMode | kPrePdevParams | kPreChanList | kPreVdevMac | kPreRegWait | kPrePace;
+constexpr uint32_t kPreRegWaitMsDefault = 2000;   // for the firmware's regulatory event, which it sends after the init
+constexpr uint32_t kPrePaceMsDefault = 50;        // between the pieces, so that a log names the last command before a death
+constexpr uint32_t kPreHoldMsDefault = 8000;      // with kPreNoScan: how long the level holds after the virtual device
+
 // ---- level 7: the regulatory event, the channel list, a started station, a peer, the association (WifiSta.h, WifiAssoc.h) ----
 // Wire facts of the same Ubuntu tree (docs/drivers/wifi.md section 3): the identifiers count up from their group's first
 // command or event (the group in bits 23:12, the first of a group is 1), the tags are positions in the firmware's tag list. No
@@ -687,7 +709,8 @@ enum WmiStaEvent : uint32_t {
 enum WmiStaTag : uint32_t {
   kWmiTagVdevStartRespEvent = 0x028, kWmiTagVdevStoppedEvent = 0x029, kWmiTagPeerStaKickoutEvent = 0x02b,
   kWmiTagScanChanListCmd = 0x04f, kWmiTagVdevStartCmd = 0x058, kWmiTagVdevUpCmd = 0x05c, kWmiTagVdevStopCmd = 0x05d,
-  kWmiTagVdevDownCmd = 0x05e, kWmiTagVdevSetParamCmd = 0x05f, kWmiTagPeerCreateCmd = 0x061, kWmiTagPeerDeleteCmd = 0x062,
+  kWmiTagVdevInstallKeyCompleteEvent = 0x02a, kWmiTagVdevDownCmd = 0x05e, kWmiTagVdevSetParamCmd = 0x05f,
+  kWmiTagVdevInstallKeyCmd = 0x060, kWmiTagPeerCreateCmd = 0x061, kWmiTagPeerDeleteCmd = 0x062,
   kWmiTagPeerSetParamCmd = 0x064, kWmiTagPeerAssocCmd = 0x065, kWmiTagVhtRateSet = 0x066, kWmiTagStaPowersaveModeCmd = 0x06c,
   kWmiTagMgmtTxSendCmd = 0x1a6, kWmiTagMgmtTxComplEvent = 0x1a7, kWmiTagPeerAssocConfEvent = 0x1b2,
   kWmiTagPeerDeleteRespEvent = 0x1c3, kWmiTagRegRule = 0x260, kWmiTagRegChanListCcEvent = 0x261, kWmiTagRegRuleExt = 0x3a9,
