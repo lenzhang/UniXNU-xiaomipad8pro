@@ -66,9 +66,9 @@ struct PowerOptions {
   bool votes = true;
   // TITAN_TOP (with CAMCC's domains, GCC's camera AHB and the camera top AHB) for either sensor and bus: both sensor nodes of the
   // KDTS name TITAN_TOP as their power domain, so Linux has it on whenever a sensor is powered, its MCLK enabled (c2f, 2026-11-12:
-  // the front's MCLK4 never ran with it and GCC's camera XO both off; which one it needs is c2fx's question); level 3 needs it for
-  // CSIPHY, CSID and TFE.
-  // piano-camera-camss=0 (level 2 only): the minimal path of before (the rear over CCI0 still powers it for CCI0).
+  // the front's MCLK4 never ran with it and GCC's camera XO both off; c2fx, 2026-11-13: nor with the camera XO on and TITAN_TOP and
+  // CAMCC's domains off, while c3f's path ran it); level 3 needs it for CSIPHY, CSID and TFE. The kernel always sets it (the boot
+  // argument piano-camera-camss is gone); false, the minimal path of before, stays for the host model's tests only.
   bool camss = true;
 };
 

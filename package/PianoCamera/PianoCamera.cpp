@@ -18,7 +18,7 @@
 //                   piano-camera-gain=CODE (32..2048, 64), piano-camera-mclk24 (1 here), piano-camera-stop=3xx.
 // Without piano-camera the driver declines in probe() and maps nothing. Levels 4-5 (the software ISP, the macOS camera device) are
 // designed in camera.md, not built. piano-camera-votes=0 (levels 2-3: no shared votes; level 3 always votes), piano-camera-mmcx-floor,
-// piano-camera-camss=0 (level 2: TITAN_TOP only for the rear over CCI0, not as the sensors' power domain; level 3 always powers it).
+// piano-camera-ae=0 (level 3: no exposure loop), piano-camera-ae-target=N (16..800, 160 above black), piano-camera-ae-steps=N (1..8).
 // Other arguments: piano-camera-sensor=1 rear | 2 front | 3 both (default 3, rear first), piano-camera-rear-bus=1 (software I2C on
 // gpio115/116 instead of CCI0), piano-camera-mclk24=1 (the rear's MCLK at 24 MHz from the MCLK PLL), piano-camera-cci-khz=100|400,
 // piano-camera-i2c-half-us=N (2..50, default 5), piano-camera-pull=1, piano-camera-blind=1, piano-camera-hold=MS (0..10000),
@@ -69,8 +69,9 @@ constexpr uint32_t kTag = 0x43414d31u;   // "CAM1" in the lock words
 struct Args {
   uint32_t level, sensor, rearBus, mclk24, cciKhz, halfUs, pull, blind, hold, stop, cycles, delay;
   uint32_t cc, mclkcc, blocks, qup, spmi, smmu;
-  uint32_t votes, mmcxFloor, camss;
+  uint32_t votes, mmcxFloor;
   uint32_t frames, pattern, timeoutMs, gain;
+  uint32_t ae, aeTarget, aeSteps;
 };
 Args gArgs;
 char gPlanText[160];   // piano-camera-plan as given
@@ -105,12 +106,14 @@ void readArgs()
   gArgs.spmi = bootArg("piano-camera-spmi", 1);
   gArgs.smmu = bootArg("piano-camera-smmu", 1);
   gArgs.votes = bootArg("piano-camera-votes", 1) ? 1 : 0;
-  gArgs.camss = bootArg("piano-camera-camss", 1) ? 1 : 0;   // level 2: TITAN_TOP for either sensor (the sensors' DT power domain)
   gArgs.mmcxFloor = clampArg(bootArg("piano-camera-mmcx-floor", kCamMmcxFloor), 0, 0x1000);
   gArgs.frames = clampArg(bootArg("piano-camera-frames", 2), 1, 8);
   gArgs.pattern = bootArg("piano-camera-pattern", 1) ? 1 : 0;
   gArgs.timeoutMs = clampArg(bootArg("piano-camera-timeout-ms", 3000), 500, 10000);
   gArgs.gain = clampArg(bootArg("piano-camera-gain", 64), 32, 2048);
+  gArgs.ae = bootArg("piano-camera-ae", 1) ? 1 : 0;   // level 3: the exposure loop for the scene (CameraStream.h)
+  gArgs.aeTarget = clampArg(bootArg("piano-camera-ae-target", 160), 16, 800);
+  gArgs.aeSteps = clampArg(bootArg("piano-camera-ae-steps", 8), 1, 8);
   // piano-camera-plan (CameraPlan.h): its level for probe and the power tree; a plan that does not parse leaves level 1 (the survey
   // and the plan's error line, nothing written).
   gPlanText[0] = 0;
@@ -124,7 +127,6 @@ void applyPlanItem(const PlanItem &p)
 {
   gArgs.level = p.level;
   gArgs.sensor = p.sensor;
-  gArgs.camss = p.camss;
   gArgs.rearBus = p.rearBus;
   gArgs.mclk24 = p.mclk24;
   gArgs.pattern = p.pattern;
@@ -884,9 +886,9 @@ void reportStream(const StreamResult &r)
   if (r.failedStep)
     snprintf(gL3, sizeof gL3, "%s: failed at step %d: %s", f.name, -r.failedStep, streamFailureName(r.failure));
   else
-    snprintf(gL3, sizeof gL3, "%s: %u frames, %s, guard %s, means %u/%u/%u/%u, power down %s", f.name, r.bufDone, routeName(r.route),
-             s.guardIntact ? "intact" : "damaged", s.ch[0].mean(), s.ch[1].mean(), s.ch[2].mean(), s.ch[3].mean(),
-             r.cleanOff ? "complete" : "incomplete");
+    snprintf(gL3, sizeof gL3, "%s: %u frames, %s, guard %s, means %u/%u/%u/%u, ae %s (exposure %u gain %u), power down %s", f.name,
+             r.bufDone, routeName(r.route), s.guardIntact ? "intact" : "damaged", s.ch[0].mean(), s.ch[1].mean(), s.ch[2].mean(),
+             s.ch[3].mean(), aeVerdictShort(r.aeVerdict), r.exposure, r.gain, r.cleanOff ? "complete" : "incomplete");
 }
 
 // ------------------------------------------------------------------------------------------- the sequence's objects, off the stack
@@ -952,17 +954,17 @@ bool PianoCamera::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
   note("start: piano-camera=%u sensor=%u rear-bus=%s mclk24=%u cci=%u kHz i2c-half=%u us pull=%u blind=%u hold=%u ms stop=%u cycles=%u "
-       "delay=%u s; survey cc=%u mclkcc=%u blocks=%u qup=%u spmi=%u smmu=%u; votes=%u mmcx-floor=%#x camss=%u",
+       "delay=%u s; survey cc=%u mclkcc=%u blocks=%u qup=%u spmi=%u smmu=%u; votes=%u mmcx-floor=%#x ae=%u target=%u",
        gArgs.level, gArgs.sensor, gArgs.rearBus ? "gpio" : "cci", gArgs.mclk24, gArgs.cciKhz, gArgs.halfUs, gArgs.pull, gArgs.blind,
        gArgs.hold, gArgs.stop, gArgs.cycles, gArgs.delay, gArgs.cc, gArgs.mclkcc, gArgs.blocks, gArgs.qup, gArgs.spmi, gArgs.smmu,
-       gArgs.votes, gArgs.mmcxFloor, gArgs.camss);
+       gArgs.votes, gArgs.mmcxFloor, gArgs.ae, gArgs.aeTarget);
   if (gArgs.level > 3) {
     note("piano-camera=%u: levels 4-5 are designed, not built (docs/drivers/camera.md section 4); running 3", gArgs.level);
     gArgs.level = 3;
   }
   if (gPlanText[0] && gPlan.error)
     note("plan: '%s' not run (%s): the survey only", gPlanText,
-         gPlan.error == -1 ? "an unknown name (one of c1b c2f c2fx c2r c2rg c2r24 c3rp c3r c3rs c3f)"
+         gPlan.error == -1 ? "an unknown name (one of c1b c2f c2r c2rg c2r24 c3rp c3r c3rs c3f)"
          : gPlan.error == -2 ? "more than 8 names" : "empty");
   else if (gPlan.count)
     note("plan: %s (%u sequences after the survey, each with its image's arguments, the next only after a complete power-down)",
@@ -1062,8 +1064,8 @@ void PianoCamera::run()
     const PlanItem &p = *gPlan.item[i];
     if (i) IOSleep(500);   // the rails off a while between two sequences (each powers its sensor up from reset anyway)
     applyPlanItem(p);
-    note("plan %u/%u: %s (level %u, the %s; camss %u rear-bus %s mclk24 %u pattern %u frames %u stop %u)", i + 1, gPlan.count, p.name,
-         p.level, p.sensor == 2 ? "front" : "rear", p.camss, p.rearBus ? "gpio" : "cci", p.mclk24, p.pattern, p.frames, p.stop);
+    note("plan %u/%u: %s (level %u, the %s; rear-bus %s mclk24 %u pattern %u frames %u stop %u)", i + 1, gPlan.count, p.name, p.level,
+         p.sensor == 2 ? "front" : "rear", p.rearBus ? "gpio" : "cci", p.mclk24, p.pattern, p.frames, p.stop);
     const bool goesOn = sequence(verdict, sizeof verdict);
     snprintf(results[i], sizeof results[i], "%s", verdict);
     ++ran;
@@ -1100,7 +1102,7 @@ bool PianoCamera::sequence(char *verdict, size_t size)
   po.holdMs = gArgs.hold;
   po.stopAt = int(gArgs.stop);
   po.votes = gArgs.votes != 0;
-  po.camss = gArgs.camss != 0;
+  po.camss = true;   // TITAN_TOP and CAMCC's domains for either sensor (c2fx, 2026-11-13: the front's MCLK4 needs them)
   Ops &ops = k.ops;
   ops.survey = &s;
   if (gArgs.level == 3) {
@@ -1116,6 +1118,9 @@ bool PianoCamera::sequence(char *verdict, size_t size)
     o.pattern = gArgs.pattern != 0;
     o.timeoutMs = gArgs.timeoutMs;
     o.gain = gArgs.gain;
+    o.ae = gArgs.ae != 0;
+    o.aeTarget = gArgs.aeTarget;
+    o.aeSteps = gArgs.aeSteps;
     o.stopAt = gArgs.stop >= 300 ? int(gArgs.stop) : 0;
     stage(5, "level 3: RAW10 frames through CSIPHY, CSID-lite0 and TFE-lite0's RDI0 into memory");
     IOLockLock(gSequenceLock);

@@ -56,9 +56,92 @@ struct StreamOptions {
   unsigned timeoutMs = 3000;      // the stream's hard bound from stream-on (piano-camera-timeout-ms, 500..10000)
   unsigned firstFrameMs = 1000, frameMs = 200, pollUs = 100, lateMs = 100;
   unsigned staleUs = 1000;        // a BUF_DONE this soon after stream-on or the previous frame is stale, not a frame (30 fps: 33 ms)
-  unsigned gain = 64;             // the rear's analogue gain code (32 = 1x; piano-camera-gain)
+  unsigned gain = 64;             // the rear's analogue gain code with its colour bars (32 = 1x; piano-camera-gain)
   int stopAt = 0;                 // piano-camera-stop: power down after this step (300..331)
+  // The exposure loop (the scene: the front always, the rear without its colour bars; piano-camera-ae=0 leaves it out): from the
+  // driver's defaults, a sample of every frame after a change, exposure x gain scaled toward aeTarget above black, aeSteps samples
+  // at most, aeSettle frames after each change before its sample (the sensors apply a new exposure a frame or two later).
+  bool ae = true;
+  unsigned aeTarget = 160, aeSteps = 8, aeSettle = 2;
 };
+
+// One exposure-loop sample: rows in pairs (all four Bayer positions) spread over the frame.
+struct AeStep {
+  uint32_t exposure = 0, gain = 0;
+  uint32_t mean[4] = {};          // per Bayer position, with the black level
+  uint32_t above = 0;             // the mean of all four less the black level (0 at or below it)
+  uint32_t hist[8] = {};          // all samples, 128 a bin
+  uint32_t satPermille = 0;       // samples at or above kRawSaturated, per mille
+  uint32_t samples = 0;
+};
+enum class AeVerdict : uint8_t { none, converged, dark, dim, bright, noResponse, steps, failed };
+inline const char *aeVerdictName(AeVerdict v)
+{
+  switch (v) {
+  case AeVerdict::none: return "not run";
+  case AeVerdict::converged: return "converged (the mean within a quarter of the target)";
+  case AeVerdict::dark: return "DARK at the longest exposure and the highest gain (no light reaches the sensor, or its analogue path is off)";
+  case AeVerdict::bright: return "saturated at the shortest exposure and the lowest gain";
+  case AeVerdict::noResponse: return "the mean does NOT follow exposure x gain (the controls do not reach the pixels)";
+  case AeVerdict::steps: return "not converged within its steps";
+  case AeVerdict::failed: return "a control write failed";
+  case AeVerdict::dim: return "below the target at the longest exposure and the highest gain (a dim scene)";
+  }
+  return "?";
+}
+inline const char *aeVerdictShort(AeVerdict v)
+{
+  static const char *const names[] = {"off", "converged", "DARK", "dim", "saturated", "NO RESPONSE", "not converged", "write failed"};
+  return unsigned(v) < sizeof names / sizeof names[0] ? names[unsigned(v)] : "?";
+}
+
+// The loop's rule, after a sample at exposure x gain `ev` (the sample before at `prevEv`, when there was one): a verdict that ends
+// the loop, or none and the next exposure x gain in `next`. Converged within a quarter of the target with under 5 % saturated; more
+// than a quarter saturated: a quarter of it; no signal (under 4 above black): 8 times it; else scaled to the target, by 8 at most
+// either way; within the sensor's range. A change of 1.4 times or more that moved a mean of 8 or more by under 10 % is no response.
+inline AeVerdict aeRule(const AeStep &s, const AeStep *prev, uint64_t ev, uint64_t prevEv, uint64_t evMin, uint64_t evMax,
+                        unsigned target, uint64_t &next)
+{
+  const uint32_t m = s.above, sat = s.satPermille;
+  next = ev;
+  if (m + target / 4 >= target && m <= target + target / 4 && sat < 50) return AeVerdict::converged;
+  if (prev && prev->above >= 8 && m >= 8 && sat < 900 && prev->satPermille < 900) {
+    const bool moved = ev * 10 >= prevEv * 14 || prevEv * 10 >= ev * 14;
+    const bool still = uint64_t(m) * 10 < uint64_t(prev->above) * 11 && uint64_t(prev->above) * 10 < uint64_t(m) * 11;
+    if (moved && still) return AeVerdict::noResponse;
+  }
+  uint64_t n;
+  if (sat > 250) {
+    n = ev / 4;
+  } else if (m < 4) {
+    n = ev * 8;
+  } else {
+    n = ev * target / m;
+    if (n > ev * 8) n = ev * 8;
+    if (n < ev / 8) n = ev / 8;
+  }
+  if (n < evMin) n = evMin;
+  if (n > evMax) n = evMax;
+  if (n == ev) {
+    if (ev >= evMax) return m < 4 ? AeVerdict::dark : AeVerdict::dim;
+    if (ev <= evMin) return AeVerdict::bright;
+    return AeVerdict::steps;
+  }
+  next = n;
+  return AeVerdict::none;
+}
+// Exposure x gain as the two controls: the exposure first (as long as the frame allows, at the lowest gain), then the gain.
+inline void aeSplit(const ExposureFacts &f, uint32_t eMax, uint64_t ev, uint32_t &e, uint32_t &g)
+{
+  uint64_t x = ev / f.gMin;
+  if (x > eMax) x = eMax;
+  if (x < f.eMin) x = f.eMin;
+  uint64_t y = (ev + x / 2) / x;
+  if (y < f.gMin) y = f.gMin;
+  if (y > f.gMax) y = f.gMax;
+  e = uint32_t(x);
+  g = uint32_t(y);
+}
 
 enum : int {
   kStepL3Sensor = 300, kStepL3Bus = 301, kStepL3Axi = 302, kStepL3Pll = 303, kStepL3Clocks = 304, kStepL3Versions = 305,
@@ -157,6 +240,14 @@ struct StreamResult {
   bool faultRead = false;
   Release release;              // what the window's release kept (CameraSmmu.h)
   FrameStats stats;
+  // The exposure loop: its samples, the verdict, the controls the final frames had, and what the sensor read back after the first.
+  static constexpr unsigned kAeLog = 8;
+  AeStep ae[kAeLog];
+  unsigned aeCount = 0, aeFrames = 0, aeWrites = 0;
+  AeVerdict aeVerdict = AeVerdict::none;
+  uint32_t exposure = 0, gain = 0;
+  bool readBack = false;
+  uint32_t readExposure = 0, readGain = 0;
   SensorResult sensor;
 };
 
@@ -272,6 +363,9 @@ inline void reportStream(O &ops, const StreamResult &r, bool pattern, unsigned g
            r.csidVersion, r.tfeVersion, f.csiphy, r.phyVersion, r.settle, r.phyWritten, r.phySkipped, r.tableWrites, r.controlWrites,
            pattern ? 1u : 0u, gain);
   if (!r.streamed) return;
+  if (r.aeVerdict != AeVerdict::none)
+    ops.note("ae: %u sample(s) over %u frames, %u control writes: %s; the frames below at exposure %u gain %u", r.aeCount, r.aeFrames,
+             r.aeWrites, aeVerdictName(r.aeVerdict), r.exposure, r.gain);
   ops.note("stream: before stream-on: top %08x buf-done %08x csi2-rx %08x rdi0 %08x (cleared)", r.preTop, r.preBuf, r.preRx, r.preRdi);
   ops.note("stream: %u frame(s) (BUF_DONE) in %llu us: the first after %llu us, the last interval %llu us; SOF %u EOF %u RUP_DONE %u; "
            "stale BUF_DONE %u; late %u; %u polls",
@@ -334,6 +428,8 @@ class Stream {
     renew(plan_);
     rup_ = 0;
     wmEver_ = false;
+    mode_ = nullptr;
+    aeStride_ = 0;
     r_.attempted = true;
     r_.which = which;
     rear_ = which == Sensor::rear;
@@ -726,11 +822,30 @@ class Stream {
     mode[n] = 0;
     const CameraTableMode *m = tableMode(rear_ ? "s5kjn1" : "ov32d40", r_.width, r_.height);
     if (!m) return fail(kStepL3Sensor2, StreamFailure::table, "the mode's parameters are missing");
+    mode_ = m;
     if (!section("start", nullptr) || !section("init", nullptr) || !section("mode", mode)) return false;
-    if (rear_) {   // exposure (the mode's default lines), analogue gain, frame length, native orientation, the test pattern
-      if (!control(kS5kOrientation, 1, 0) || !control(0x0202, 2, m->c) || !control(0x0204, 2, opt.gain) || !control(0x0340, 2, m->b) ||
-          !control(kS5kTestPattern, 2, opt.pattern ? 2u : 0u))
+    // The controls (CameraHw.h ExposureFacts): the rear's exposure (the mode's default lines), analogue gain (its colour bars: the
+    // option's; the scene: the driver's default, where the exposure loop starts), frame length, native orientation, the test pattern;
+    // the front's exposure and gain at its driver's defaults and its test pattern off, as its driver's control setup writes them.
+    const ExposureFacts &f = xf();
+    r_.exposure = rear_ ? m->c : f.eDefault;
+    r_.gain = rear_ && !aeOn() ? opt.gain : f.gDefault;
+    if (rear_) {
+      if (!control(kS5kOrientation, 1, 0) || !control(f.eReg, f.eBytes, r_.exposure) || !control(f.gReg, f.gBytes, r_.gain) ||
+          !control(0x0340, 2, m->b) || !control(kS5kTestPattern, 2, opt.pattern ? 2u : 0u))
         return false;
+    } else {
+      if (!control(f.eReg, f.eBytes, r_.exposure) || !control(f.gReg, f.gBytes, r_.gain) || !control(kOvPatternCtl, 1, kOvPatternCtlOff) ||
+          !control(kOvTestPattern, 1, 0))
+        return false;
+    }
+    {   // what the sensor holds now (a register the sensor does not keep reads back otherwise)
+      uint8_t e[3] = {}, g[2] = {};
+      r_.readBack = s.sensorRead(f.eReg, e, f.eBytes) && s.sensorRead(f.gReg, g, f.gBytes);
+      for (unsigned i = 0; i < f.eBytes; ++i) r_.readExposure = r_.readExposure << 8 | e[i];
+      for (unsigned i = 0; i < f.gBytes; ++i) r_.readGain = r_.readGain << 8 | g[i];
+      ops.note("controls: exposure %u (%#x) gain %u (%#x) written; read back %s: exposure %u gain %u", r_.exposure, f.eReg, r_.gain, f.gReg,
+               r_.readBack ? "ok" : "FAILED", r_.readExposure, r_.readGain);
     }
     if (stopHere(kStepL3Sensor2)) {
       ops.note("stopped before stream-on (piano-camera-stop=%d): the tables and controls written, the stream-on table not", opt.stopAt);
@@ -757,28 +872,44 @@ class Stream {
   }
 
   // ------------------------------------------------------------------------------------------------------------- stream
-  // Every poll reads the four status words (each cleared once seen), so nothing set between polls is lost; a frame is a BUF_DONE of
-  // RDI0 at least opt.staleUs after stream-on and after the previous frame (a stale one is counted apart and ends nothing). Bounded:
-  // the first frame within firstFrameMs, each next within frameMs, all within timeoutMs.
+  // The exposure loop first when it runs (the scene: exposureLoop), then opt.frames frames (waitFrame).
   void stream()
   {
     ops.step(kStepL3Stream, "the stream: SOF/EOF/BUF_DONE polled, the write master re-armed after each frame");
+    t0_ = ops.nowUs();
+    // the exposure loop's frames on top of the stream's own bound
+    const uint64_t loopUs = aeOn() ? uint64_t(opt.aeSteps) * (opt.aeSettle + 1) * opt.frameMs * 1000 : 0;
+    deadline_ = t0_ + uint64_t(opt.timeoutMs) * 1000 + loopUs;
+    frameDeadline_ = t0_ + uint64_t(opt.firstFrameMs) * 1000;
+    last_ = t0_;
+    rdiSince_ = rxSince_ = 0;
+    sofLogged_ = eofLogged_ = 0;
+    if (!aeOn() || exposureLoop())
+      while (r_.bufDone < opt.frames && waitFrame(true)) {
+      }
+    r_.streamUs = ops.nowUs() - t0_;
+    readPhyStatus(r_.phyStatus);
+  }
+
+  // One frame (a BUF_DONE of RDI0 at least opt.staleUs after stream-on and after the previous frame), re-arming the write master
+  // with the same buffer after it: `final` frames are the stream's (counted, timed, the last one not re-armed: only it is
+  // analysed); the exposure loop's are counted apart and always re-armed. Every poll reads the four status words (each cleared once
+  // seen), so nothing set between polls is lost. False (and the stream failed) when no frame came in time: the first within
+  // firstFrameMs, each next within frameMs, all within the stream's bound.
+  bool waitFrame(bool final)
+  {
     const uint64_t c = kCsidLite0, wm = kTfeLite0 + kWm0;
-    const uint64_t t0 = ops.nowUs(), deadline = t0 + uint64_t(opt.timeoutMs) * 1000;
-    uint64_t frameDeadline = t0 + uint64_t(opt.firstFrameMs) * 1000, last = t0;
-    uint32_t rdiSince = 0, rxSince = 0;
-    unsigned sofLogged = 0, eofLogged = 0;
-    while (r_.bufDone < opt.frames) {
+    for (;;) {
       ++r_.polls;
       const uint32_t top = ops.rd(c + kCsidTopStatus), buf = ops.rd(c + kCsidBufStatus), rx = ops.rd(c + kCsidRxStatus),
                      rdi = ops.rd(c + kCsidRdiStatus);
-      const uint64_t now = ops.nowUs(), at = now - t0;
+      const uint64_t now = ops.nowUs(), at = now - t0_;
       r_.topOr |= top;
       r_.bufOr |= buf;
       r_.rxOr |= rx;
       r_.rdiOr |= rdi;
-      rdiSince |= rdi;
-      rxSince |= rx;
+      rdiSince_ |= rdi;
+      rxSince_ |= rx;
       if (rx && !r_.rxFirst) {
         r_.rxFirst = rx;
         r_.rxFirstUs = at;
@@ -787,13 +918,13 @@ class Stream {
         r_.rdiErrFirst = rdi & kRdiErrors;
         r_.rdiErrFirstUs = at;
       }
-      if (rdi & kRdiInputSof) {
+      if (final && (rdi & kRdiInputSof)) {
         ++r_.sof;
-        if (sofLogged < StreamResult::kFrameLog && sofLogged <= r_.bufDone) r_.sofUs[sofLogged++] = at;
+        if (sofLogged_ < StreamResult::kFrameLog && sofLogged_ <= r_.bufDone) r_.sofUs[sofLogged_++] = at;
       }
-      if (rdi & kRdiInputEof) {
+      if (final && (rdi & kRdiInputEof)) {
         ++r_.eof;
-        if (eofLogged < StreamResult::kFrameLog && eofLogged <= r_.bufDone) r_.eofUs[eofLogged++] = at;
+        if (eofLogged_ < StreamResult::kFrameLog && eofLogged_ <= r_.bufDone) r_.eofUs[eofLogged_++] = at;
       }
       if (rdi & kRdiRupDone) {
         ++r_.rupDone;
@@ -807,43 +938,163 @@ class Stream {
         putQuiet(c + kCsidIrqCmd, 1);
       }
       if (buf & kCsidBufRdi0) {
-        if (now - last < opt.staleUs) {   // too soon after stream-on or the last frame: not a frame of the sensor's
+        if (now - last_ < opt.staleUs) {   // too soon after stream-on or the last frame: not a frame of the sensor's
           ++r_.staleBufDone;
         } else {
-          const unsigned i = r_.bufDone++;
-          if (i < StreamResult::kFrameLog) {
-            r_.bufUs[i] = at;
-            r_.frameRdi[i] = rdiSince;
-            r_.frameRx[i] = rxSince;
-          }
-          rdiSince = rxSince = 0;
-          if (sofLogged < r_.bufDone) sofLogged = r_.bufDone;   // keep the per-frame columns aligned when an SOF was not seen
-          if (eofLogged < r_.bufDone) eofLogged = r_.bufDone;
-          if (r_.bufDone == 1) {
+          if (!r_.firstFrameUs) {
             r_.firstFrameUs = at;
             readPhyStatus(r_.phyStatusFirst);
             r_.phyFirstRead = true;
           } else {
-            r_.lastIntervalUs = now - last;
+            r_.lastIntervalUs = now - last_;
           }
-          last = now;
-          frameDeadline = now + uint64_t(opt.frameMs) * 1000;
-          if (r_.bufDone < opt.frames) {   // the same buffer again (only the last frame is analysed)
+          bool rearm = true;
+          if (final) {
+            const unsigned i = r_.bufDone++;
+            if (i < StreamResult::kFrameLog) {
+              r_.bufUs[i] = at;
+              r_.frameRdi[i] = rdiSince_;
+              r_.frameRx[i] = rxSince_;
+            }
+            if (sofLogged_ < r_.bufDone) sofLogged_ = r_.bufDone;   // keep the per-frame columns aligned when an SOF was not seen
+            if (eofLogged_ < r_.bufDone) eofLogged_ = r_.bufDone;
+            rearm = r_.bufDone < opt.frames;   // the same buffer again (only the last frame is analysed)
+          } else {
+            ++r_.aeFrames;
+          }
+          rdiSince_ = rxSince_ = 0;
+          last_ = now;
+          frameDeadline_ = now + uint64_t(opt.frameMs) * 1000;
+          if (rearm) {
             putQuiet(wm + kWmImageAddr, uint32_t(r_.busAddr >> 8));
             rup_ |= kCsidAupRdi0;
             putQuiet(c + kCsidRupAup, rup_);
           }
-          continue;
+          return true;
         }
       }
-      if (now >= frameDeadline || now >= deadline) {
-        fail(kStepL3Stream, r_.bufDone ? StreamFailure::frameTimeout : StreamFailure::noFrame);
-        break;
+      if (now >= frameDeadline_ || now >= deadline_) {
+        fail(kStepL3Stream, r_.bufDone || r_.aeFrames ? StreamFailure::frameTimeout : StreamFailure::noFrame);
+        return false;
       }
       ops.udelay(opt.pollUs);
     }
-    r_.streamUs = ops.nowUs() - t0;
-    readPhyStatus(r_.phyStatus);
+  }
+
+  // ------------------------------------------------------------------------------------------------------- exposure loop
+  bool aeOn() const { return opt.ae && (!rear_ || !opt.pattern); }
+  const ExposureFacts &xf() const { return rear_ ? kRearExposure : kFrontExposure; }
+  uint32_t eMax() const { return mode_ ? (rear_ ? mode_->b : mode_->c) - xf().eMargin : xf().eDefault; }
+  bool aeApply(uint32_t e, uint32_t g)
+  {
+    const ExposureFacts &f = xf();
+    if (!s.sensorWrite(f.eReg, f.eBytes, e) || !s.sensorWrite(f.gReg, f.gBytes, g)) return false;
+    r_.aeWrites += 2;
+    r_.exposure = e;
+    r_.gain = g;
+    return true;
+  }
+  // The line stride the write master uses, from where the first frame ends (the buffer was zeroed; the statistics' rule): the
+  // packed line, or rounded up to 16 bytes when the frame runs past packed lines (the tablet's rear: 5104).
+  uint32_t aeStride()
+  {
+    const uint32_t bpl = raw10Bytes(r_.width), padded = (bpl + 15u) & ~15u;
+    if (padded == bpl || !aeStride_) {
+      if (padded == bpl) return aeStride_ = bpl;
+      const uint64_t from = r_.frameBytes > 65536 ? r_.frameBytes - 65536 : 0;
+      ops.cacheInvalidate(d_.cpu + from, r_.frameBytes - from);
+      uint64_t last = 0;
+      for (uint64_t i = r_.frameBytes; i-- > from;)
+        if (d_.cpu[i]) {
+          last = i + 1;
+          break;
+        }
+      aeStride_ = last > uint64_t(bpl) * r_.height ? padded : bpl;
+    }
+    return aeStride_;
+  }
+  // Rows in pairs at 64 places down the frame (all four Bayer positions), every pixel of them, from the buffer the last frame was
+  // written to (invalidated from the caches first).
+  void aeSample(AeStep &st)
+  {
+    const uint32_t bpl = raw10Bytes(r_.width), stride = aeStride();
+    uint64_t sum[4] = {}, count[4] = {};
+    uint32_t sat = 0;
+    for (unsigned k = 0; k < 64; ++k) {
+      const unsigned y0 = (k * (r_.height / 2) / 64) * 2;
+      for (unsigned dy = 0; dy < 2; ++dy) {
+        const unsigned y = y0 + dy;
+        if (uint64_t(y) * stride + bpl > r_.frameBytes) break;
+        const uint8_t *line = d_.cpu + uint64_t(y) * stride;
+        ops.cacheInvalidate(line, bpl);
+        for (unsigned x = 0; x + 3 < r_.width; x += 4) {
+          const uint8_t *g = line + x / 4 * 5;
+          for (unsigned j = 0; j < 4; ++j) {
+            const uint32_t v = uint32_t(g[j]) << 2 | ((g[4] >> (2 * j)) & 3u);
+            const unsigned pos = (y & 1u) * 2 + ((x + j) & 1u);
+            sum[pos] += v;
+            ++count[pos];
+            ++st.hist[v >> 7];
+            sat += v >= kRawSaturated;
+          }
+        }
+      }
+    }
+    uint64_t all = 0, n = 0;
+    for (unsigned p = 0; p < 4; ++p) {
+      st.mean[p] = count[p] ? uint32_t(sum[p] / count[p]) : 0;
+      all += sum[p];
+      n += count[p];
+    }
+    st.samples = uint32_t(n);
+    const uint32_t mean = n ? uint32_t(all / n) : 0;
+    st.above = mean > kRawBlack ? mean - kRawBlack : 0;
+    st.satPermille = n ? uint32_t(uint64_t(sat) * 1000 / n) : 0;
+  }
+  // From the driver's defaults: each sample (the first after stream-on, then aeSettle frames after each change and the next one)
+  // logged as it is taken; the loop's rule (aeRule) gives the next exposure x gain or its verdict. The last controls stay for the
+  // stream's frames. False when the stream failed.
+  bool exposureLoop()
+  {
+    const ExposureFacts &f = xf();
+    const uint64_t evMin = uint64_t(f.eMin) * f.gMin, evMax = uint64_t(eMax()) * f.gMax;
+    ops.note("ae: the exposure loop: target %u above black (%u), at most %u samples, %u frames after each change; exposure %u..%u, "
+             "gain %u..%u (%u = 1x)",
+             opt.aeTarget, kRawBlack, opt.aeSteps, opt.aeSettle, f.eMin, eMax(), f.gMin, f.gMax, f.gUnit);
+    unsigned wait = 1;
+    for (unsigned k = 0; k < opt.aeSteps; ++k) {
+      for (unsigned i = 0; i < wait; ++i)
+        if (!waitFrame(false)) return false;
+      AeStep &st = r_.ae[r_.aeCount < StreamResult::kAeLog ? r_.aeCount : StreamResult::kAeLog - 1];
+      st = AeStep();
+      st.exposure = r_.exposure;
+      st.gain = r_.gain;
+      aeSample(st);
+      const AeStep *prev = r_.aeCount ? &r_.ae[r_.aeCount - 1] : nullptr;
+      if (r_.aeCount < StreamResult::kAeLog) ++r_.aeCount;
+      const uint64_t ev = uint64_t(st.exposure) * st.gain, prevEv = prev ? uint64_t(prev->exposure) * prev->gain : 0;
+      uint64_t next = ev;
+      AeVerdict v = aeRule(st, prev, ev, prevEv, evMin, evMax, opt.aeTarget, next);
+      if (v == AeVerdict::none && k + 1 == opt.aeSteps) v = AeVerdict::steps;
+      ops.note("ae %u: exposure %u gain %u (%u.%02ux): means %u/%u/%u/%u, %u above black; histogram %u %u %u %u %u %u %u %u; "
+               "saturated %u.%u %%%s%s",
+               k + 1, st.exposure, st.gain, st.gain / f.gUnit, st.gain % f.gUnit * 100 / f.gUnit, st.mean[0], st.mean[1], st.mean[2],
+               st.mean[3], st.above, st.hist[0], st.hist[1], st.hist[2], st.hist[3], st.hist[4], st.hist[5], st.hist[6], st.hist[7],
+               st.satPermille / 10, st.satPermille % 10, v == AeVerdict::none ? "" : ": ", v == AeVerdict::none ? "" : aeVerdictShort(v));
+      if (v != AeVerdict::none) {
+        r_.aeVerdict = v;
+        return true;
+      }
+      uint32_t e = 0, g = 0;
+      aeSplit(f, eMax(), next, e, g);
+      if (!aeApply(e, g)) {
+        r_.aeVerdict = AeVerdict::failed;
+        ops.note("ae: a control write failed (exposure %u gain %u): the stream goes on with the last controls", e, g);
+        return true;
+      }
+      wait = opt.aeSettle + 1;
+    }
+    return true;
   }
   void readPhyStatus(uint32_t *w)
   {
@@ -979,6 +1230,12 @@ class Stream {
   bool wmEver_ = false;
   bool rear_ = true;
   const SensorFacts *f_ = &kSensors[0];
+  const CameraTableMode *mode_ = nullptr;
+  uint32_t aeStride_ = 0;
+  // the stream's clock and its per-frame bookkeeping (waitFrame)
+  uint64_t t0_ = 0, deadline_ = 0, frameDeadline_ = 0, last_ = 0;
+  uint32_t rdiSince_ = 0, rxSince_ = 0;
+  unsigned sofLogged_ = 0, eofLogged_ = 0;
 };
 
 }  // namespace pianocamera

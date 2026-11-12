@@ -425,10 +425,33 @@ constexpr uint64_t kWmAddressLimit = 1ull << 40;   // address >> 8 in 32 bits
 // --- the sensors at level 3 (S5K, OV; data/camera's tables): the smallest mode of each, the controls written between the mode and
 // stream-on. Rear: 4080 x 3072 (the only mode with 24 MHz EXTCLK PLL words for 30 fps; the other is 8160 x 6144), its test pattern
 // register 0x0600 (16 bits: 2 = colour bars), orientation 0x0101 (8 bits; 0 native: the colour-bars check needs no flip). Front:
-// 3264 x 1836 (the smallest of its three), no control (its own exposure/gain from its tables; its test pattern register is
-// unverified in the driver).
+// 3264 x 1836 (the smallest of its three), its exposure, gain and the test pattern's off values below (no test pattern: its
+// register is unverified in the driver).
 constexpr uint16_t kS5kTestPattern = 0x0600, kS5kOrientation = 0x0101;
 constexpr unsigned kRearL3Width = 4080, kRearL3Height = 3072, kFrontL3Width = 3264, kFrontL3Height = 1836;
 inline uint32_t raw10Bytes(unsigned width) { return width / 4 * 5; }
+
+// --- exposure and gain (level 3's scene, CameraStream.h's exposure loop): each sensor's registers, limits and its driver's
+// stream-start defaults (the drivers write their control defaults before stream-on). S5K: coarse integration 0x0202 (16 bits,
+// lines: 8 .. the mode's vts - exposure_margin, 4266 at 4080 x 3072; default the mode's 3840), analogue gain 0x0204 (16 bits: 32 =
+// 1x .. 2048; default 192). OV: exposure 0x3500 (24 bits, rows of the sensor's VTS: 4 .. VTS - 12, 2808 at 3264 x 1836; default
+// 1024), analogue gain 0x3508 (16 bits: 288 .. 15872; default 7936; 256 = 1x is inferred from the range, the driver does not say),
+// and the test pattern's registers written off (0x3019 = 0xd2, 0x4308 = 0), as the driver's control setup does at every stream
+// start. The OV init table alone sets 0x3501/0x3502 (258 rows) and leaves the gain at its reset value: c3f of 2026-11-13 wrote no
+// control and its frames read black level (64) in a lit room.
+struct ExposureFacts {
+  uint16_t eReg;
+  uint8_t eBytes;
+  uint32_t eMin, eMargin, eDefault;
+  uint16_t gReg;
+  uint8_t gBytes;
+  uint32_t gMin, gMax, gDefault, gUnit;   // gUnit: the code of 1x
+};
+constexpr ExposureFacts kRearExposure = {0x0202, 2, 8, 22, 3840, 0x0204, 2, 32, 2048, 192, 32};
+constexpr ExposureFacts kFrontExposure = {0x3500, 3, 4, 12, 1024, 0x3508, 2, 288, 15872, 7936, 256};
+constexpr uint16_t kOvPatternCtl = 0x3019, kOvTestPattern = 0x4308;
+constexpr uint8_t kOvPatternCtlOff = 0xd2;
+constexpr unsigned kRawBlack = 64;      // RAW10 black level of both (c3rs and c3f's dark frames: 63-64)
+constexpr unsigned kRawSaturated = 1000;
 
 }  // namespace pianocamera

@@ -192,7 +192,7 @@ struct Board {
   bool mm1On = false;
   // The tablet's rules (tabletC1/tabletC3): an MCLK RCG on the XO has a root and its branch runs only while GCC's camera XO branch
   // is enabled (inferred from c2r/c2f, 2026-11-12); a BUF_DONE set at once at stream-on, before any frame (a stale bit).
-  bool mclkNeedsCameraXo = false, staleBufDoneAtStart = false, staleSeen = false, bufDoneAtRdiStart = false;
+  bool mclkNeedsCameraXo = false, mclkNeedsTitan = false, staleBufDoneAtStart = false, staleSeen = false, bufDoneAtRdiStart = false;
   unsigned smmuStores = 0;
   // The order of the power-down's events (the teardown check): "wm off", "rdi stop", "smmu sync", "camnoc off", "hf axi off",
   // "mm1 off", "titan off", "mxc off".
@@ -211,6 +211,19 @@ struct Board {
   uint64_t nextFrameAt = 0;
   unsigned framesWritten = 0, framesDropped = 0, smmuFaults = 0, allocs = 0, frees = 0, cleans = 0, invalidates = 0;
   unsigned rgb[8][4];              // the colour bars: each band's value per Bayer position (10 bits)
+  // The scene: 0 the flat grey 300 + position (exposure and gain ignored); else a lit scene whose value above the black level (64)
+  // is scene * exposure * gain / 1x / 1000 (at most 1023), with the controls a frame late (they apply at the next frame).
+  uint64_t scene[2] = {0, 0};      // rear, front
+  uint64_t sceneEg[2] = {0, 0};    // exposure x gain / 1x as latched for the frame being written
+  unsigned sceneEgSet[2] = {0, 0};
+  bool sceneBlack = false;         // no light at all: the black level whatever the controls
+  uint64_t controlsEg(bool rear) const
+  {
+    const Slave &s = rear ? rearSlave : frontSlave;
+    auto at = [&](uint16_t a) -> uint64_t { return s.reg.count(a) ? s.reg.at(a) : 0; };
+    if (rear) return (at(0x0202) << 8 | at(0x0203)) * (at(0x0204) << 8 | at(0x0205)) / 32;
+    return (at(0x3500) << 16 | at(0x3501) << 8 | at(0x3502)) * (at(0x3508) << 8 | at(0x3509)) / 256;
+  }
 
   Board()
   {
@@ -601,7 +614,12 @@ struct Board {
     default: return 0;
     }
   }
-  bool mclkXo() const { return !mclkNeedsCameraXo || (v(kGcc + kGccCameraXo) & kCbcrEnable); }
+  // An MCLK runs from the XO only with GCC's camera XO (mclkNeedsCameraXo: c2f) and TITAN_TOP up (mclkNeedsTitan: c2fx of
+  // 2026-11-13, the minimal path with the camera XO on, did not run MCLK4; c3f's path with TITAN_TOP and CAMCC's domains did).
+  bool mclkXo() const
+  {
+    return (!mclkNeedsCameraXo || (v(kGcc + kGccCameraXo) & kCbcrEnable)) && (!mclkNeedsTitan || titan());
+  }
   bool pll0Running() const
   {
     const uint64_t p = kCamCc + kCcPll0;
@@ -749,12 +767,18 @@ struct Board {
     aupFifo.erase(aupFifo.begin());
     const uint32_t bpl = raw10Bytes(width), stride = framePadded ? (bpl + 15u) & ~15u : bpl;
     const bool bars = rear && rearSlave.reg.count(0x0601) && rearSlave.reg.at(0x0601) == 2;
+    const unsigned si = rear ? 0 : 1;
+    const uint64_t eg = sceneEgSet[si] ? sceneEg[si] : controlsEg(rear);   // the controls of the frame before
+    sceneEg[si] = controlsEg(rear);
+    sceneEgSet[si] = 1;
+    const uint64_t lit = scene[si] * eg / 1000;
+    const unsigned sceneValue = sceneBlack ? 64 : scene[si] ? unsigned(64 + (lit > 959 ? 959 : lit)) : 300;
     for (unsigned y = 0; y < height; ++y)
       for (unsigned x = 0; x < width; x += 4) {
         uint8_t g[5] = {};
         for (unsigned k = 0; k < 4; ++k) {
           const unsigned px = x + k, pos = (y & 1u) * 2 + (px & 1u);
-          const unsigned val = bars ? rgb[px * 8 / width][pos] : 300 + pos;
+          const unsigned val = bars ? rgb[px * 8 / width][pos] : (sceneValue + pos > 1023 ? 1023 : sceneValue + pos);
           g[k] = uint8_t(val >> 2);
           g[4] |= uint8_t((val & 3u) << (2 * k));
         }
@@ -1353,6 +1377,18 @@ static void testFrontCamss()
     CHECK(res.voted == camss && r.ops.mmCalls.size() == (camss ? 2u : 0u) && !r.b.mxcVoted);
     CHECK(r.b.cciStarts == 0);
   }
+  // The tablet (c2fx, 2026-11-13): the minimal path's MCLK4 does not run (step 214, everything as found); level 3's path runs it.
+  for (bool camss : {false, true}) {
+    Rig r;
+    tabletC1(r.b);
+    r.b.mclkNeedsTitan = true;
+    const auto before = r.b.snapshot();
+    PowerOptions po;
+    po.camss = camss;
+    const SensorResult res = r.run(Sensor::front, po);
+    CHECK(res.cleanOff && r.b.violations.empty() && same(before, r.b.snapshot()));
+    CHECK(camss ? res.idOk : !res.idOk && (res.failure == Failure::branch || res.failure == Failure::rcg) && res.failedStep == -kStepMclk);
+  }
 }
 
 static void testFailures()
@@ -1812,6 +1848,9 @@ static void testL3Variants()
     const StreamResult res = r.run(Sensor::rear, o);
     CHECK(res.ok && res.bufDone == 3 && res.stats.ch[0].mean() == 300 && res.stats.ch[3].mean() == 303);
     CHECK(res.stats.ch[1].hist[300 >> 7] == res.stats.ch[1].count);
+    // the flat grey ignores the controls: the exposure loop's second sample says so and ends it
+    CHECK(res.aeVerdict == AeVerdict::noResponse && res.aeCount == 2 && res.ae[0].exposure == 3840 && res.ae[0].gain == 192);
+    CHECK(res.readBack && res.readExposure == 3840 && res.readGain == 192);
   }
   // The front: CSIPHY4, its 3264x1836 mode over the software I2C (880 writes), MCLK4 from the XO.
   {
@@ -1820,7 +1859,10 @@ static void testL3Variants()
     const StreamResult res = r.run(Sensor::front);
     for (auto &v : r.b.violations) std::printf("  violation: %s\n", v.c_str());
     CHECK(res.ok && res.cleanOff && r.b.violations.empty() && res.bytes == 8u << 20);
-    CHECK(res.tableWrites == 1 + 811 + 54 + 4 + 4 && res.controlWrites == 0 && res.settle == 29);
+    // its driver's control defaults (exposure 1024, gain 7936, the test pattern off), read back
+    CHECK(res.tableWrites == 1 + 811 + 54 + 4 + 4 && res.controlWrites == 4 && res.settle == 29);
+    CHECK(res.readBack && res.readExposure == 1024 && res.readGain == 7936 && r.b.frontSlave.reg[0x3019] == 0xd2);
+    CHECK(res.aeVerdict == AeVerdict::noResponse);
     CHECK(res.stats.stride == 4080 && res.stats.ch[2].mean() == 302);
     CHECK(asFound(before, res, r.plan, r.b));
   }
@@ -2054,15 +2096,105 @@ static void testFrameStats()
   CHECK(!s.guardIntact && s.guardFirstBad == 10);
 }
 
+// The exposure loop (CameraStream.h): on the model's lit scene (its value follows exposure x gain a frame late) both sensors reach
+// the target from their drivers' defaults, the final frames' means with them; a black scene ends DARK at the longest exposure and
+// the highest gain, a blinding one saturated at the shortest and lowest; the colour bars never run it; piano-camera-ae=0 neither.
+static void testExposureLoop()
+{
+  const unsigned target = StreamOptions().aeTarget;
+  auto near = [&](uint32_t mean) { return mean >= 64 + target - target / 4 && mean <= 64 + target + target / 4; };
+  for (Sensor w : {Sensor::rear, Sensor::front}) {
+    for (uint64_t scene : {20ull, 1ull, 400ull}) {   // too bright at the defaults, too dim, much too bright
+      L3Rig r;
+      r.b.scene[w == Sensor::rear ? 0 : 1] = scene;
+      StreamOptions o;
+      o.pattern = false;
+      const StreamResult res = r.run(w, o);
+      const bool ok = res.ok && res.aeVerdict == AeVerdict::converged && near(res.stats.ch[0].mean()) && near(res.ae[res.aeCount - 1].mean[0]);
+      if (!ok)
+        std::printf("  ae %s scene %llu: %s after %u samples, final mean %u (exposure %u gain %u)\n", w == Sensor::rear ? "rear" : "front",
+                    (unsigned long long)scene, aeVerdictName(res.aeVerdict), res.aeCount, res.stats.ch[0].mean(), res.exposure, res.gain);
+      if (!ok)
+        for (unsigned i = 0; i < res.aeCount; ++i)
+          std::printf("    sample %u: exposure %u gain %u means %u/%u/%u/%u above %u sat %u\n", i + 1, res.ae[i].exposure, res.ae[i].gain,
+                      res.ae[i].mean[0], res.ae[i].mean[1], res.ae[i].mean[2], res.ae[i].mean[3], res.ae[i].above, res.ae[i].satPermille);
+      CHECK(ok && res.cleanOff && r.b.violations.empty());
+      CHECK(res.aeCount >= 2 && res.aeFrames >= 1 + 3 * (res.aeCount - 1) && res.bufDone == 2);
+      const ExposureFacts &f = w == Sensor::rear ? kRearExposure : kFrontExposure;
+      CHECK(res.ae[0].exposure == (w == Sensor::rear ? 3840u : f.eDefault) && res.ae[0].gain == f.gDefault);
+      CHECK(res.exposure >= f.eMin && res.gain >= f.gMin && res.gain <= f.gMax);
+    }
+  }
+  {   // the tablet's padded rear lines (5104): the samples find the stride
+    L3Rig r;
+    r.b.framePadded = true;
+    r.b.scene[0] = 20;
+    StreamOptions o;
+    o.pattern = false;
+    const StreamResult res = r.run(Sensor::rear, o);
+    CHECK(res.ok && res.aeVerdict == AeVerdict::converged && near(res.stats.ch[0].mean()) && res.stats.stride == 5104);
+    CHECK(res.ae[0].mean[0] + 3 == res.ae[0].mean[3]);   // whole pixel groups: the four positions 0..3 apart, as the model writes them
+  }
+  {   // no light
+    L3Rig r;
+    r.b.sceneBlack = true;
+    const StreamResult res = r.run(Sensor::front);
+    CHECK(res.ok && res.aeVerdict == AeVerdict::dark && res.exposure == 2820 - 12 && res.gain == kFrontExposure.gMax);
+    CHECK(std::any_of(r.ops.log.begin(), r.ops.log.end(), [](const std::string &l) { return l.find("DARK at the longest") != std::string::npos; }));
+  }
+  {   // blinding
+    L3Rig r;
+    r.b.scene[0] = 1000000;
+    StreamOptions o;
+    o.pattern = false;
+    const StreamResult res = r.run(Sensor::rear, o);
+    CHECK(res.ok && res.aeVerdict == AeVerdict::bright && res.exposure == kRearExposure.eMin && res.gain == kRearExposure.gMin);
+  }
+  {   // the colour bars and piano-camera-ae=0: no loop; the bars keep the option's gain
+    L3Rig r;
+    r.b.scene[0] = 20;
+    const StreamResult bars = r.run(Sensor::rear);
+    CHECK(bars.ok && bars.aeVerdict == AeVerdict::none && bars.aeFrames == 0 && bars.gain == 64);
+    L3Rig q;
+    q.b.scene[1] = 20;
+    StreamOptions o;
+    o.ae = false;
+    const StreamResult off = q.run(Sensor::front, o);
+    CHECK(off.ok && off.aeVerdict == AeVerdict::none && off.exposure == 1024 && off.gain == 7936);
+  }
+  // the rule alone: converged inside a quarter, no response, the limits
+  uint64_t next = 0;
+  AeStep s;
+  s.above = 150;
+  CHECK(aeRule(s, nullptr, 1000, 0, 10, 100000, 160, next) == AeVerdict::converged);
+  s.above = 40;
+  CHECK(aeRule(s, nullptr, 1000, 0, 10, 100000, 160, next) == AeVerdict::none && next == 4000);
+  AeStep p = s;
+  CHECK(aeRule(s, &p, 4000, 1000, 10, 100000, 160, next) == AeVerdict::noResponse);
+  s.above = 0;
+  CHECK(aeRule(s, nullptr, 100000, 0, 10, 100000, 160, next) == AeVerdict::dark);
+  s.above = 30;
+  CHECK(aeRule(s, nullptr, 100000, 0, 10, 100000, 160, next) == AeVerdict::dim);
+  s.above = 900;
+  s.satPermille = 600;
+  CHECK(aeRule(s, nullptr, 10, 0, 10, 100000, 160, next) == AeVerdict::bright);
+  uint32_t e = 0, g = 0;
+  aeSplit(kFrontExposure, 2808, 1024ull * 7936, e, g);
+  CHECK(e == 2808 && g >= 2893 && g <= 2895);   // the exposure first, at the lowest gain, then the gain
+  aeSplit(kRearExposure, 4266, 100ull * 32, e, g);
+  CHECK(e == 100 && g == 32);
+}
+
 // The plan (CameraPlan.h): the names parse to their images' arguments; on one board (c1's tablet) c3rp, c2fx, c3r, c3rs and c3f run
 // one after another, each from what the one before left (the SMMU words the release keeps, PLL0's configuration), each with its
 // power-down complete, the board as found after the last.
 static void testPlan()
 {
-  const Plan p = parsePlan("c3rp,c2fx,c3r,c3rs,c3f");
+  const Plan p = parsePlan("c3rp,c2f,c3r,c3rs,c3f");
   CHECK(!p.error && p.count == 5 && p.level == 3);
   CHECK(!std::strcmp(p.item[0]->name, "c3rp") && p.item[0]->level == 3 && p.item[0]->sensor == 1 && p.item[0]->stop == 312);
-  CHECK(p.item[1]->level == 2 && p.item[1]->sensor == 2 && p.item[1]->camss == 0 && p.item[1]->stop == 0);
+  CHECK(p.item[1]->level == 2 && p.item[1]->sensor == 2 && p.item[1]->stop == 0);
+  CHECK(parsePlan("c2fx").error == -1);   // answered on the tablet (2026-11-13): the minimal path is gone
   CHECK(p.item[2]->pattern == 1 && p.item[2]->frames == 2 && p.item[3]->pattern == 0 && p.item[3]->frames == 4);
   CHECK(p.item[4]->level == 3 && p.item[4]->sensor == 2);
   const Plan bad = parsePlan("c3r,c3x");
@@ -2101,7 +2233,6 @@ static void testPlan()
       CHECK(last.route == Route::window && r.plan.slot == 5 && r.plan.bank == 81);   // the same free group and bank each time
     } else {
       PowerOptions po;
-      po.camss = it.camss != 0;
       po.mclk24 = it.mclk24 != 0;
       po.rearCci = !it.rearBus;
       po.stopAt = it.stop;
@@ -2136,6 +2267,7 @@ int main()
   testSmmuRules();
   testL3Teardown();
   testL3Diagnostics();
+  testExposureLoop();
   testPlan();
   if (failures) {
     std::printf("camera_host: %d check(s) FAILED\n", failures);
