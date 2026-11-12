@@ -67,6 +67,28 @@ identity, an **MSI sink** (does a chip write reach the window), and BHI's fuse-d
 cause is **not yet proven**: the two candidates the boot loader most plausibly consults are the fuse-blow supply (it checks the
 image's signature against fused key hashes) and the early host-range registers (inference). Next: §8.8 boots 4a and 4b.
 
+**Fifth round (2026-11-12, wifi-4a `piano-wifi=6 piano-wifi-iova=1 piano-wifi-band=0` on §10.23's pre-boot path, and wifi-4b, the
+old one):** 4b refused as every boot before it (`ffffffff` / `ef0e0003` at +46 ms), now with the counters to say how: the boot
+loader **read** the image (21520 reads from the chip, every one answered with data, no UR, CA or completion timeout, the window
+holding the stock bytes before and after) and refused it. **4a took it:** BHI complete at +46 ms, READY at 58, the second ELF over
+BHIe complete (`8000ec88`, our session) at 426, **mission mode at 477 ms**, 70389 reads served, the chip's writes and its MSI in the
+window. So one of §10.23's pre-boot changes cured P18 (which one is an A/B for later: `ctxearly=1`, `socreset=0`, `msi=0` on 4a's
+arguments). Then the firmware died. The line after mission mode came out of the console **2027 ms** after the one before it (the
+root volume was mounting and launchd starting), the register read after it found **EE RDDM**, level 5's first walk of the control
+event ring found the AMSS event followed by a SYS_ERR state change, and the start of channel 20 was never answered. Nothing read the
+crash dump (no vector table had been given), so the firmware's reason is not known. What is known is that this host said nothing to
+the firmware for 2 s after mission mode, where Ubuntu's MHI host and ath12k assert the wake doorbell, start channels 20 and 21,
+answer the router's hello and send the host capability within milliseconds; §10.24 compares the whole window with them, item by
+item. Changed (P19, §10.24): the crash dump's table given to the chip before the boot, and read back and decoded on any later death
+(`piano-wifi-rddm`, `package/PianoWifi/WifiRddm.h`); the ladder's lines held in memory from the doorbell to its end, so that the
+console cannot stall the host while the firmware waits (`piano-wifi-defer`); the device wake doorbell at mission mode and the MHI
+host's answers to M0 and M1 (`piano-wifi-wake`); every MHI ring at a multiple of its own length (the data event ring, which
+channels 20 and 21 report on, was not); channels 20 and 21 with their fixed fields before the boot and their rings only at their
+start; the chip's health read on every turn of levels 5 and 6. The cause is **not proven**; the leading inference is a bounded
+wait of the firmware for its host — the host capability is also where this host tells the firmware to use its internal sleep
+clock, and natively the PMK8550 sleep clock pin is an input (no 32 kHz is driven to the chip; piano's DT names neither pin nor
+clock, so Ubuntu most likely leaves it so too). Next: §8.8 boots 5a and 5b; their crash lines, if any, name the reason.
+
 Association, keys and the data path (levels 7 and 8) are design only (§12 has level 5's message table, §14 level 6's, §13 what levels 7 and 8 need and the macOS side's remaining plan). Template: `README.md`.
 
 ## 1. Purpose and gate
@@ -198,6 +220,9 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-msi=0` | 1 | leave the endpoint's MSI off. By default one vector, its address a sink page of the DMA window, its data `0x4d53`, INTx off, as the host boots the chip with MSI on; the sink is reported after the boot (§10.23) |
 | `piano-wifi-ctxearly=1` | 0 | also write the MHI context and host-range registers before the doorbell (what every boot before the fourth round did). By default they are written once the device reports READY, as the MHI host does |
 | `piano-wifi-ras=0` | 1 | no TLP counters. By default level 4 switches on the DesignWare RAS DES counters of both ends of the link before the doorbell (TLPs by kind, UR, CA, completion timeouts) and logs their deltas (§8.4) |
+| `piano-wifi-rddm=0` | 1 (from the fifth round) | no crash dump. By default level 4 gives the chip the crash dump's vector table before the boot loader's doorbell (nine 512 KiB segments of the DMA window, 0x420000 bytes as this chip's host reserves, right after the receive block's clear, as the MHI host does), and when the firmware reports its crash dump environment or a system error at any level the dump is waited for (at most 4 s) and decoded into a few lines: the header's files, the firmware's failure reason, nothing else (`package/PianoWifi/WifiRddm.h`, §10.24) |
+| `piano-wifi-defer=0` | 1 (from the fifth round) | print every line when it is written. By default the ladder's lines from the boot loader's doorbell on are held in a heap buffer (320 lines; more are counted, not kept; a crash prints them at once and its own lines directly) and printed when the ladder stops, each with `[+N ms]` since the doorbell: the console held this thread for 2 s right after mission mode in wifi-4a, and the firmware was dead when it came back (§10.24) |
+| `piano-wifi-wake=0` | 1 (from the fifth round) | no device wake doorbell. By default mission mode asserts it (channel 127's doorbell = 1), as the MHI host's mission-mode transition does, it stays asserted while the levels run and is released when the ladder ends well; an M1 the chip reports anyway is answered with M2 and a wake toggle, an M0 by ringing every event ring and running channel again |
 | `piano-wifi-smmu=N` | 1 | 0: the SMMU is left alone (level 4 then needs stream 0x1401 to bypass already); 1: the endpoint's stream 0x1401 through a bypass context bank; 2: also the root port's 0x1400 |
 | `piano-wifi-spmi=1` | 0 | add the eight supplies' PMIC regulators and the BT_EN / sleep clock pins over the SPMI observer (the only stores: the observer's read commands) |
 | `piano-wifi-hwcg=1` | 0 | count a hardware-gated branch that reads CLK_OFF while voted and under HW_CTL as running for the read gates |
@@ -451,22 +476,32 @@ PianoWifi: firmware: in the window: boot loader sha256 c0e4bb91... (the stock fi
 PianoWifi: level 4: chip power-on reset: chip LTSSM ........ -> 00000111 (N writes), GCC hot reset ........ -> ........, interrupts cleared, QFPROM power ........ -> ........ (VDD4BLOW was on, now off | was off), BHIe vector words cleared, Q6 cookie ........
 PianoWifi: level 4: chip power-on reset: warm entry ........ -> 00000000, reset cause ........, global reset ........ -> ........, MHISTATUS ........ -> ........ after MHICTRL's reset, EE ........; 7 receive vector words cleared
 PianoWifi: level 4: BHI identity after the chip's reset: ...                  (the same digest as at the start: the boot loader's fuse read did not change)
+PianoWifi: level 4: crash dump: 9 segments of 512 KiB from bus 0x20......, the vector table at 0x20...... (144 bytes), given to the chip before the boot with session 0x........ (receive status 00000000)
 PianoWifi: level 4: msi: cap 0x50 control .... -> .... (64-bit addresses), address 00000000:2070.000 data 4d53, command 00100406: one vector into the sink page
 PianoWifi: level 4: msi: the sink page is at bus 0x2070....
+PianoWifi: level 4: channels 20 and 21 planned before the boot (state disabled, burst mode disabled, the data event ring)      (levels 5 and up)
 PianoWifi: level 4: contexts at 0x........ (channels 128, event rings 2: ...), given to the device at READY, as the MHI host does
 PianoWifi: level 4: the image: 524288 bytes at bus 0x20000000 (the 32-bit window, translated by the SMMU), aligned to 512 KiB; the vector table at 0x20700000
 PianoWifi: level 4: before the doorbell: MHI +00: ........ x8        (6 lines MHI, 3 lines BHI with +40 the serial number as --------, 4 lines BHIe)
 PianoWifi: level 4: TLP counters: root port at 0x..., (11 of 11 on), endpoint at 0x... (N of 11 on)        (or "none": the capability is not there)
-PianoWifi: level 4: boot begun in phase boot loader over BHI (EE PBL); BHI status 00000000 before, 00000000 after this host cleared it (the clear took)
-PianoWifi: level 4: after the doorbell +0 ms: MHISTATUS 00000000 (state 0x0), EE 00000000, BHI status 00000000, error code ........, BHIe status ........
-PianoWifi: level 4: changed +N ms: MHISTATUS ... BHI status 80000000 ...     (one line per change, at most 48)
-PianoWifi: level 4: waiting for READY after N ms (EE PBL, state 0x7)
-PianoWifi: level 4: contexts needed after N ms (EE PBL, state 0x1)
-PianoWifi: level 4: waiting for the boot loader to run after N ms (EE PBL, state 0x2)
-PianoWifi: level 4: image over BHIe after N ms (EE SBL, state 0x2)
-PianoWifi: level 4: mission mode after N ms (EE AMSS (mission mode), state 0x2)
-PianoWifi: level 4: mission mode after N ms, M steps, 2 context writes, K event acknowledgements; EE AMSS (mission mode), ...
+PianoWifi: log: from here until the ladder stops, this thread's lines are held and printed afterwards with their time since now (piano-wifi-defer=0 prints them at once)
+   ... nothing more from PianoWifi until the ladder stops; then:
+PianoWifi: log: N line(s) held for M ms follow
+PianoWifi: level 4: boot begun in phase boot loader over BHI (EE PBL); BHI status 00000000 before, 00000000 after this host cleared it (the clear took) [+0 ms]
+PianoWifi: level 4: after the doorbell +0 ms: MHISTATUS 00000000 (state 0x0), EE 00000000, BHI status 00000000, error code ........, BHIe status ........ [+0 ms]
+PianoWifi: level 4: changed +N ms: MHISTATUS ... BHI status 80000000 ... [+N ms]     (one line per change, at most 48)
+PianoWifi: level 4: waiting for READY after N ms (EE PBL, state 0x7) [+N ms]
+PianoWifi: level 4: contexts needed after N ms (EE PBL, state 0x1) [+N ms]
+PianoWifi: level 4: image over BHIe after N ms (EE SBL, state 0x2) [+N ms]
+PianoWifi: level 4: mission mode after N ms (EE AMSS (mission mode), state 0x2) [+N ms]
+PianoWifi: level 4: mission mode after N ms, M steps, 1 context writes, K event acknowledgements; EE AMSS (mission mode), ... [+N ms]
+PianoWifi: level 4: device wake asserted (channel 127's doorbell = 1) [+N ms]
 ```
+
+Every line held from the doorbell on carries `[+N ms]`, its time after the doorbell: the gaps between them are the host's own, not
+the console's (wifi-4a's 2 s gap was the console's, §10.24). A `log: N later line(s) did not fit` line means more than 320 lines
+were written; the first 320 are the ones kept. A crash ends the holding: the held lines are printed first, then the `crash:`
+lines as they are written, so the report of a death is never what a full buffer drops.
 
 **What the first level 4 boot must show before level 5 is designed against it**: `EE PBL` at the start (the chip is in its primary
 boot loader — `EE AMSS` already there would mean something else booted it), the firmware line with the 6930496-byte file split at
@@ -481,7 +516,7 @@ address), debug words naming the image's address and size mean it had started on
 00080000`, 45 ms after the doorbell, §10.23); since the 2026-11-12 fix an all-ones status counts as an error too, as in Ubuntu's MHI
 host, unless it is the register's own power-on value that this host could not clear (`the clear did not take`, and it never
 changed); `BHIe reported an error` — the vector table or a segment; `the device reported a system error` / `went to its crash
-dump environment` — the firmware started and died (level 5 adds the RDDM dump that says where); `a phase timed out` — the device
+dump environment` — the firmware started and died, and the `crash:` lines that follow (§10.24's table) say why, from its own dump; `a phase timed out` — the device
 stopped answering, which with `MHISTATUS ffffffff` means its PCIe core restarted under us (PAGANI re-applies BAR0 and the decode
 bits there; this driver does not yet), or, with MHISTATUS and EE still answering and BHI's status unchanged since the doorbell
 (now the 0 this host wrote), the boot loader never finished reading the image (how 2026-11-12's first four boots were read,
@@ -540,7 +575,9 @@ level: `piano-wifi-dma=M` changes it.
 
 ```
 PianoWifi: level 5: channels 20 and 21 planned (64 elements each, 536 KiB of buffers), channel doorbells at 0x..., event doorbells at 0x...
-PianoWifi: level 5: both channels run (states 0x2 / 0x2), 63 receive buffers posted
+PianoWifi: level 5: the chip reports environment AMSS (mission mode)        (the control ring's events since level 4's last acknowledgement)
+PianoWifi: level 5: both channels run (states 0x2 / 0x2) N ms after level 5 began, 63 receive buffers posted
+PianoWifi: level 5: router: the chip said hello first and was answered      (or: "no hello from the chip within 500 ms: ours went first")
 PianoWifi: level 5: the router is up (our node 1 port 0x4000, the chip's node N; the firmware's service 69 instance 0x101 on port P)
 PianoWifi: step 502: the radio's capability
 PianoWifi: step 503: registering for the firmware's indications
@@ -562,6 +599,7 @@ PianoWifi: level 5: region 0: .... KiB of host memory at 0x........      (one li
 PianoWifi: level 5: N requests, N responses, 3 indications, M download segments, 0 shadow registers, 0 unexpected messages
 PianoWifi: level 5: the transport: N packets out, N in, N completions, 2 commands, 0 events dropped, 0 refused claims; the router: N packets in, N data, 0 unrouted, 0 refused sends
 PianoWifi: level 5: the firmware is ready after NNNN ms (step 518: done)
+PianoWifi: level 5: MHI after mission mode: N M0 event(s) answered by ringing every doorbell, 0 M1 answered with M2
 PianoWifi: level 5: the firmware is ready; WMI, the scan and the station are levels 6 and up (docs/drivers/wifi.md section 13)
 ```
 
@@ -595,7 +633,9 @@ a file identifier that is not the board identifier it reported); `a firmware fil
 `image/peach/` of `modem_a` (the names are in §2), or `NativeUfs` stopped answering; `the window has no room for what the firmware
 asked for` — a region this driver must answer did not fit and was too small for the "ask again in smaller pieces" fallback (the
 memory line says how much was asked for); `a step timed out` — the firmware stopped answering, and the transport counters say
-whether anything came back at all; `the chip went to its crash dump environment` — the firmware started and died, and the step's name says where (level 5 does not dump it: that is the RDDM work of §10.13).
+whether anything came back at all; `the chip reported a system error or its crash dump environment` (or, before that, `the chip
+died while channel N was being started`) — the firmware started and died, the step's name says where, and the `crash:` lines
+after it say why: the dump the firmware wrote into the segments level 4 gave it, decoded (§10.24's table).
 
 ### 8.6 Level 6 (the copy engine, the transport and a passive scan): one RAM boot
 
@@ -737,6 +777,20 @@ piano-usb-cold=0`, RAM boots with the queue's usual reset backstop:
 The two are chosen so that each result says something whichever way the other goes: 4a is the best chance of the boot loader
 taking the image and runs the ladder as far as it goes; 4b is the measured control.
 
+**Results (2026-11-12 13:57 and 14:03):** 4a passed level 4 — mission mode at 477 ms, the stock image in the window, every read
+served — and the firmware was in its crash dump environment at the next register read, 2 s later (the console had held this
+thread), so level 5 stopped at stage 501 with no answer to channel 20's start. 4b, the control, failed at stage 401 as 3a did, the
+counters showing that the boot loader read the image (21520 reads served) before refusing it. P18 is cured by §10.23's pre-boot
+path; P19 is §10.24.
+
+**The next two unattended boots (after §10.24's changes).** Both on the queue's base `panic_on_crash_disabled=1 piano-usb=2
+piano-usb-cold=0 piano-wifi=6 piano-wifi-iova=1 piano-wifi-band=0`, RAM boots with the usual reset backstop (300 s):
+
+| # | Boot args (beyond the base) | Gate | Then |
+|---|---|---|---|
+| 5a | none: the fifth round's defaults (`rddm=1 defer=1 wake=1`) | level 4 as in 4a plus the `crash dump: 9 segments … given to the chip before the boot` and `channels 20 and 21 planned before the boot` lines; after the ladder, the held lines: `mission mode` at about +480 ms, `device wake asserted`, `both channels run … N ms after level 5 began` with N in the tens of milliseconds, `router: the chip said hello …`, the service line, steps 502–518 with `3 indications`, then level 6's gates (§8.6) | passes level 5: the host's 2 s of silence was the cause (inference made evidence by 5b, below); stops with `crash:` lines: §10.24's table — the failure reason line is the answer, whatever the step was |
+| 5b | `piano-wifi-defer=0 piano-wifi-wake=0` | the control: 4a's host behaviour (every line printed at once, no wake doorbell) with the crash dump armed and the new MHI layout. If the console stalls again after mission mode and the firmware dies, the `crash:` lines give the reason for 4a's death | read with 5a: 5a passing and 5b dying names the silence (or the wake doorbell) as the cause; both dying with the same reason names something neither changes (the reason line says what); both passing means either that 5b's console did not stall this time (the USB console's per-line timestamps show the gap after mission mode, or its absence) or that the MHI layout or the channels' early fields were it; `ctxearly`/`socreset`/`msi` remain the A/B for P18 |
+
 ## 9. Fallback
 
 `piano-wifi=0` (the default): nothing runs. Network meanwhile: PianoNullEthernet's `en0` (no traffic) and, once built, the USB-C
@@ -754,7 +808,10 @@ network (§5.2 C).
    read-only observer channel (its single kind of store is a read command), so that would mean adding a write path to a PMIC this
    driver otherwise only reads. If level 3's PHY or link step fails and SW_CTRL reads 0, this is the first suspect, and the step to
    add then is an `RPMH_RF_CLK1` vote — a cmd-db resource through the VRM path level 2 already has, cheaper and safer than a PMIC
-   GPIO write. (level 1 reads the pin, level 2 reports it, nothing drives it)
+   GPIO write. (level 1 reads the pin, level 2 reports it, nothing drives it) Measured since: the pin reads `mode 00 … pull 04`
+   (a digital input with a pull-down: no 32 kHz out) in every boot that read it, and the chip reached mission mode without it, so
+   its boot loaders need neither; whether the running firmware does before the host capability tells it to use its internal
+   sleep clock is §10.24's leading inference for P19.
 4. The v7 PHY sequence (`package/PianoWifi/WifiPhySeq.h`): mainline's table is GPL (not copyable); the 128 writes come from
    PaganiWifi (BSD), which took them from the 13T's **running device tree** (`qcom,phy-sequence`), and they differ from mainline's
    tables in five places (both lanes' RX_MODE_01/10_HIGH4 0x8f against 0x9c, 0x5e4 = 0x0f instead of EQ_CONFIG2 at 0x5e0, and two
@@ -800,9 +857,12 @@ network (§5.2 C).
    host transport's control messages on those pipes — which level 6 provides and level 5 does not. The chip is left in that state
    until the session ends (boot 6 of §8.8 is attended for exactly that reason), and nothing in level 5 writes a ring the firmware
    could follow into host memory other than the regions it asked for.
-13. The crash dump (RDDM) is not read. Level 5 reports the environment change and stops; what the firmware's own log would say
-   needs the dump regions and the vector interface that reads them back, which is its own piece of work (the donor has it;
-   `UPSTREAM` records it as design read, not taken).
+13. The crash dump (RDDM) **is read since the fifth round** (§10.24, `package/PianoWifi/WifiRddm.h`): the table is given before the
+   boot, the firmware writes its dump into nine 512 KiB segments of the window when it dies, and the log gets a decode of a few
+   lines (the header's files, the failure reason). The dump itself never leaves the tablet's memory: nothing writes it to a file,
+   and nothing of it beyond the decode's short lines is printed or committed. Open: whether this firmware's dump carries the
+   failure-reason file the vendor host looks for (the decode falls back to at most four error-like strings of the first segment
+   when it does not), and whether its header's first two words are in the order the vendor host has (the decode takes either).
 14. **The suspend hook is one way.** The power contract (`package/include/PianoPowerContract.h`) is answered from level 2 on, and
    the only state change this driver makes is `kOff`: the scan is stopped, the virtual device deleted, the rings disabled,
    WLAN_EN taken low and PERST# asserted — and **nothing is brought back on the wake**. The rails stay voted (Bluetooth shares
@@ -971,6 +1031,62 @@ network (§5.2 C).
    through the window as the chip reads it (the boot loader against `c0e4bb91…`, the file against Ubuntu's `02bbc028…`), and the
    boot loader's fuse-derived identity words (MSM hardware ID, OEM public key hash) as counts and a digest, never as values.
    (needs-boot: §8.8 boots 4a, 4b)
+   **Result:** 4a (this path) passed level 4 and 4b (the old one) failed as before after the boot loader had read the image: one of
+   (1)–(4) is the cause, which one is not yet separated (§8.8).
+24. **P19: the firmware dies about 2 s after mission mode (wifi-4a, 2026-11-12).**
+   Evidence, from the USB console log and its per-line timestamps (the pstore copy has bit errors in that stretch):
+   - Level 4, the fourth round's path: BHI complete (`8000ec87`) at +46 ms, READY at +58, M0 asked for and the contexts given,
+     the second ELF over BHIe complete (`8000ec88`, the session this host wrote) at +426, BHI's error code `cafecace` at +471 (the
+     boot loader's own hand-over word, not an error: BHI's status stayed complete), **EE AMSS at +477 ms**, MHISTATUS `00000201`
+     (M0, ready) throughout.
+   - The very next line from this thread (`mission mode after 477 ms`, a plain IOLog) reached the console **2027 ms** after the
+     line before it; the lines between them on the console are the root volume's mount and launchd's start. The summary line
+     after it read the environment at **+2503 ms: RDDM**. The TLP counters then: 70389 reads from the chip, all answered with
+     data, 19 writes from it, no UR, CA or completion timeout; the MSI sink held the chip's MSI.
+   - Level 5's first walk of the control event ring delivered the AMSS environment event and then a **SYS_ERR** state change
+     (state `0xff`); no M0 or M1 event came after AMSS. Channel 20's start command got no completion in 2 s; stage 501.
+   - Nothing read the dump: no receive vector table had been given (the block was only zeroed), so the reason is not known; the
+     SMMU's fault registers are printed only on a level 4 failure and were not read (needs-boot: the crash report now prints them).
+   What the MHI host and ath12k do in that window, against what this host did (behaviour only; Ubuntu's kernel, `UPSTREAM`):
+   | Item | Linux (mainline MHI host, ath12k, qrtr) | This host in wifi-4a | Now |
+   |---|---|---|---|
+   | Time from mission mode to the first channel command | the mission-mode transition creates the devices at once; qrtr-mhi's probe prepares channel 20 then 21 and queues the receive buffers: milliseconds | 2 s of nothing (one console line), then a start the dead firmware never answered | all lines held in memory from the doorbell (`defer`); the channels' rings planned before the boot, so only doorbells and two commands are left after mission mode |
+   | Device wake (channel 127's doorbell) | asserted at the mission-mode transition (and at every M0 transition and around each command) | never written | asserted at mission mode, held while the levels run, released at the end of a ladder that succeeded (`wake`) |
+   | M0 handshake | M0 asked for at READY (after the event ring doorbells); on an M0 event in mission mode every event ring, the command ring with work and every channel rung again | M0 at READY, the same order; M0 events not acted on | the M0 answer in level 5's walk |
+   | M1 / M2 | a device that idles (M1) is answered with M2, then woken again if the host still needs it | not handled | M1 answered with M2 and a wake toggle (none was seen in wifi-4a) |
+   | M3, time sync | M3 is suspend only; the mainline host and ath12k use no MHI time sync | — | nothing to do |
+   | Channel contexts 20 and 21 | the fixed fields (disabled, burst mode disabled, type, event ring 1) written before the power-up; ring and enabled state at the channel's preparation, right before its start command | all zero until level 5, then everything at once | as Linux (`mhiContextsPlan`, `ipcrPrepare`) |
+   | Ring alignment | every ring's base a multiple of its length; the context arrays separate allocations | the 4 KiB data event ring (the one channels 20/21 report on) 512 bytes into a page | every ring at a multiple of its length, the arrays on pages of their own |
+   | Element sizes, doorbell mode, event rings | 16-byte elements; burst mode disabled on both channels and rings; 32 and 256 event elements, vectors 1 and 2, 1 ms moderation on the second | the same | — |
+   | Command ring | 128 elements | 8 (two commands are ever issued) | — |
+   | Crash dump (RDDM) | 0x420000 bytes in 512 KiB segments given before the power-up, right after the receive block's clear; on RDDM the host waits for the receive status and collects | block zeroed, no table: the firmware had nowhere to write | as Linux (`rddm`), plus a bounded decode |
+   | SYSERR | the interrupt handler reads the state and environment on every MSI; RDDM with a dump table is the crash callback | the state was read only by the next step; a SYS_ERR event was only logged | MHISTATUS and EE read on every level 5 turn and in level 6's loop; a death ends in the crash report |
+   | QRTR | the host's name service answers the chip's hello (it never speaks first on a new link), then the chip announces its services | our hello first, then the chip's | the chip's hello awaited 500 ms, then ours |
+   | QMI timing | on the WLFW service's arrival: the radio's capability, the indication registration, the host capability, within milliseconds | not reached | the same order (§12), no console in between |
+   | Host memory (request memory, M3 dump) | asked for by the firmware after the indication registration; types 1, 3, 4, 9, 0xb answered, others with 0, regions over 2 MiB asked again smaller | not reached | unchanged (§12) |
+   | The image over BHIe ("paging") | the full boot chain's segments kept until power-down | complete with our session; the segments stay in the window for the session | — |
+   | Board, regulatory, calibration data | QMI downloads after the memory exchange | not reached | unchanged |
+   | DMA window | the chip may reach 36 bits; ath12k's rings 32 bits | 64 MiB at `0x20000000`; every read served; faults not read | the crash report prints the SMMU bank's FSR/FAR (a fault there means the chip went outside the window) |
+   Reading (inference unless marked): the firmware lived about 2 s with a host that had not yet spoken to it, and died; the
+   logged difference from Linux in that window is the host's silence (no wake doorbell, no channel, no hello answered, no host
+   capability) — the rest of the table is either identical or not reached. Why silence would kill it is not documented; the most
+   specific candidate is the host capability's platform bits, by which ath12k tells a non-Qualcomm platform's chip to use its
+   **internal sleep clock**: natively the PMK8550 sleep clock pin reads as a digital input with a pull-down (`mode 00 … pull 04`,
+   level 1's SPMI survey, every boot that read it; piano's DT names neither the pin nor a clock for the chip, so Ubuntu most likely
+   leaves it the same), so the chip gets no external 32 kHz and depends on that bit; a firmware that
+   waits a bounded time for its host and then assumes otherwise would die like this. Only the dump can say (5a/5b, §8.8).
+   How to read the crash lines (`crash:` …, after the held lines):
+   | What the lines show | Meaning | Next |
+   |---|---|---|
+   | `the firmware's failure reason (file "…SFR…"): "…"` | the firmware's own account (a source file and line, an assertion, an error name) | act on what it names; it is the answer to P19 |
+   | `dump complete`, a header with files but no reason, `error-like text …` lines | the dump arrived but has no failure-reason file; the strings are the best text of its first segment | read them as hints only; the file table (names, sizes) is worth recording in this page |
+   | `dump not complete after N ms`, `the dump is all zeros` | the firmware never wrote the dump: the table was not taken (session `not ours`), or it died below its dump code | `crash: the chip is not in its crash dump environment` with it: a system error without RDDM; the BHI error words on the first `crash:` line are then the only account |
+   | `dump header not decoded`, with strings | a dump of another shape: the first words are printed | compare the words with the vendor layout (§10.13) |
+   | the SMMU bank's `fsr` with a fault bit, `far` outside `0x20000000` + 64 MiB | the chip's DMA left the window | the address names what the firmware wanted: a region it expected from the host |
+   Changed (`WifiRddm.h`, `WifiMhi.h`, `WifiChannels.h`, `PianoWifi.cpp`; host tests in `tests/qmi_host.cpp` and
+   `tests/bringup_host.cpp`): the crash dump, the held log, the wake doorbell and the M0/M1 answers, the ring alignment, the
+   channels' two-step preparation, the health checks, the hello wait (the table's last column), each with its A/B
+   (`piano-wifi-rddm=0`, `piano-wifi-defer=0`, `piano-wifi-wake=0`). (needs-boot: §8.8 boots 5a, 5b)
 
 ## 11. Licence note
 
