@@ -4,13 +4,16 @@
 # clock controllers (only if c1 hangs), c1b c1's re-test (level 2 stopped after its checks: GCC's camera branches enabled and
 # CAMCC's domains voted, so the step-202 survey reads both clock controllers, then all as found; c1 found them unreadable),
 # c2f/c2r/c2rg/c2r24 level 2 (one sensor powered, its chip ID read, powered down again) for the front, the rear over CCI0, the rear
-# over software I2C, the rear with the 24 MHz MCLK. All unattended (camera.md 8.1 has why), c2* only after c1 passed. Level 3
-# (camera.md 8.3): c3rp the rear prepared to the sensor's tables and stopped before stream-on, c3r the rear's colour bars (two
+# over software I2C, the rear with the 24 MHz MCLK; c2fx the front on the minimal path (piano-camera-camss=0: no TITAN_TOP, only
+# GCC's camera XO added since c2f failed: which of the two MCLK4 needs). All unattended (camera.md 8.1 has why), c2* only after c1
+# passed. Level 3 (camera.md 8.3): c3rp the rear prepared to the sensor's tables and stopped before the stream-on table (the
+# power-down's test: the SMMU window released first, the found words this SMMU refuses kept), c3r the rear's colour bars (two
 # frames), c3rs the rear's scene (four frames), c3f the front (two frames); each only after the previous one passed (c3rp after
-# c2r24). Each is a RAM image of the GPU profile (PianoA830, the Turnip stage, ADT vmm-present 0) with the USB console and
+# c2r24; c3f after c2f). Images built before 2026-11-12 evening abort in level 3's power-down (c3rp/c3r): rebuild them. Each is a
+# RAM image of the GPU profile (PianoA830, the Turnip stage, ADT vmm-present 0), or CAM_PROFILE=plain, with the USB console and
 # piano-reset-after as the backstop; PIANO_FAST_BOOT=1 keeps the command line short.
 #
-#   build-camera-test-images.sh [NAME ...]    default: c1 c1x c1b c2f c2r c2rg c2r24 c3rp c3r c3rs c3f
+#   build-camera-test-images.sh [NAME ...]    default: c1 c1x c1b c2f c2fx c2r c2rg c2r24 c3rp c3r c3rs c3f
 #                                             out/ram-cam-<NAME>/ and out/ram-cam-dump/
 #
 # Inputs (this repository's out/ unless set): CAM_KC (out/k27/kc-k27-native.bin, built by
@@ -35,17 +38,18 @@ for f in "$KC" "$ADT" "$FD" "$SEED" "$TRUST"; do [ -f "$f" ] || { echo "build-ca
 for s in com.unixnu.driver.PianoCamera com.unixnu.driver.PianoA830; do
   grep -a -q "$s" "$KC" || { echo "build-camera-test-images: $KC has no $s (build it with tooling/k27/build-native-image.sh)" >&2; exit 1; }
 done
-ORDER="c1 c1x c1b c2f c2r c2rg c2r24 c3rp c3r c3rs c3f"
+ORDER="c1 c1x c1b c2f c2fx c2r c2rg c2r24 c3rp c3r c3rs c3f"
 image() {
   case $1 in
     c1)    A="piano-camera=1 piano-camera-delay=20" ;;                                                       # the survey
     c1x)   A="piano-camera=1 piano-camera-cc=0 piano-camera-mclkcc=0 piano-camera-delay=20" ;;              # without CAMCC/MCLK-CC
     c1b)   A="piano-camera=2 piano-camera-sensor=1 piano-camera-stop=203 piano-camera-delay=20" ;;           # c1's re-test: the controllers
-    c2f)   A="piano-camera=2 piano-camera-sensor=2 piano-camera-delay=20" ;;                                 # front, software I2C
+    c2f)   A="piano-camera=2 piano-camera-sensor=2 piano-camera-delay=20" ;;                                 # front, software I2C, TITAN_TOP
+    c2fx)  A="piano-camera=2 piano-camera-sensor=2 piano-camera-camss=0 piano-camera-delay=20" ;;           # front, camera XO only
     c2r)   A="piano-camera=2 piano-camera-sensor=1 piano-camera-delay=20" ;;                                 # rear, CCI0
     c2rg)  A="piano-camera=2 piano-camera-sensor=1 piano-camera-rear-bus=1 piano-camera-delay=20" ;;         # rear, software I2C
     c2r24) A="piano-camera=2 piano-camera-sensor=1 piano-camera-mclk24=1 piano-camera-delay=20" ;;           # rear, 24 MHz MCLK
-    c3rp)  A="piano-camera=3 piano-camera-sensor=1 piano-camera-stop=312 piano-camera-delay=20" ;;           # rear, all but stream-on
+    c3rp)  A="piano-camera=3 piano-camera-sensor=1 piano-camera-stop=312 piano-camera-delay=20" ;;           # rear, all but the stream-on table
     c3r)   A="piano-camera=3 piano-camera-sensor=1 piano-camera-delay=20" ;;                                 # rear, colour bars
     c3rs)  A="piano-camera=3 piano-camera-sensor=1 piano-camera-pattern=0 piano-camera-frames=4 piano-camera-delay=20" ;;   # rear scene
     c3f)   A="piano-camera=3 piano-camera-sensor=2 piano-camera-delay=20" ;;                                 # front, its scene

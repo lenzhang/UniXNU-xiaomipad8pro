@@ -21,21 +21,22 @@
 // address before the read.
 //
 // Rear (S5KJN1, CCI0 master 1 or software I2C on gpio115/116), steps:
-//   201 on the CAMCC path (the rear on CCI0, or level 3): CAMCC's domains voted (MXC, MMCX: the shared helper), GCC's camera AHB and
-//       camera XO; always the MCLK controller's AHB; each where off (a hardware-gated branch counts on once enabled: Linux's rule;
-//       the c1 survey found all three off)                                     202 the survey again (the controllers readable now)
+//   201 on the CAMCC path (the rear on CCI0, or `camss`: by default both sensors at either level, the KDTS power domain of both
+//       sensor nodes being TITAN_TOP): CAMCC's domains voted (MXC, MMCX: the shared helper), GCC's camera AHB; always GCC's camera XO
+//       and the MCLK controller's AHB (Linux keeps all three on); each where off (a hardware-gated branch counts on once enabled:
+//       Linux's rule; the c1 survey found all three off)                       202 the survey again (the controllers readable now)
 //   203 refusals (CameraSurvey.h sensorRefusal)
 //   205 the bus, first (as Linux has it up from its probe): CAMCC's critical branches, TITAN_TOP, the top AHB from the XO, CCI0's
-//       clock from the XO (19.2 MHz), its pins, the controller reset and timed (400 kHz, or 100 with piano-camera-cci-khz=100); or the
-//       software I2C's pins (GPIO, released)
+//       clock from the XO (19.2 MHz), its pins, the controller reset and timed (400 kHz, or 100 with piano-camera-cci-khz=100); or
+//       (`camss`: TITAN_TOP and the top AHB, then) the software I2C's pins (GPIO, released)
 //   210 pins: reset low (asserted), the supply enable low, the MCLK pin's function
 //   211 vddd (L1I 1096 mV) on and read back; 2 ms                               212 vdda (gpio175 high; 100 us)
 //   213 vddio (L6B 1800 mV), afvdd (L7B 2800 mV) on and read back               214 MCLK1: XO 19.2 MHz (or 24 MHz from PLL0
-//       with piano-camera-mclk24=1), its branch on                              215 reset released (gpio6 high); 15 ms
+//       with piano-camera-mclk24=1) by Linux's shared-RCG enable, its branch on 215 reset released (gpio6 high); 15 ms
 //   230 chip ID 0x0000 == 0x38e1 (three tries, 10 ms apart)                     240 power down (Undo, reverse order)
-// Front (OV32D40, software I2C on gpio4/5): 201 (MCLK controller's AHB), 202, 203, 205 the software I2C's pins, 210 reset low, MCLK
-//   pin; 213 vddio (L10B 1800), dvdd (L2G 1200) on and read back, avdd (gpio176 high); 6 ms; 214 MCLK4 XO 19.2 MHz, branch; 12 ms;
-//   215 reset released; 25 ms; 230 chip ID 0x300a == 0x5632 (five tries, 12 ms apart); 240.
+// Front (OV32D40, software I2C on gpio4/5): 201, 202, 203, 205 (TITAN_TOP with `camss`) the software I2C's pins, 210 reset low, MCLK
+//   pin; 213 vddio (L10B 1800), dvdd (L2G 1200) on and read back, avdd (gpio176 high); 6 ms; 214 MCLK4 XO 19.2 MHz (Linux's shared-
+//   RCG enable), branch; 12 ms; 215 reset released; 25 ms; 230 chip ID 0x300a == 0x5632 (five tries, 12 ms apart); 240.
 #pragma once
 #include <stdint.h>
 #include "BitI2c.h"
@@ -63,8 +64,11 @@ struct PowerOptions {
   // 2026-11-12: GCC's camera AHB was off, so CAMCC's first access is this level's); withdrawn after the power-down.
   // piano-camera-votes=0 leaves them out.
   bool votes = true;
-  // Level 3: TITAN_TOP, the camera AHB and GCC's camera AHB/XO for either sensor and bus (CSIPHY, CSID and TFE are under it).
-  bool camss = false;
+  // TITAN_TOP (with CAMCC's domains, GCC's camera AHB and the camera top AHB) for either sensor and bus: both sensor nodes of the
+  // KDTS name TITAN_TOP as their power domain, so Linux has it on whenever a sensor is powered, its MCLK enabled (c2f, 2026-11-12:
+  // the front's MCLK4 never ran without it, nor without GCC's camera XO); level 3 needs it for CSIPHY, CSID and TFE.
+  // piano-camera-camss=0 (level 2 only): the minimal path of before (the rear over CCI0 still powers it for CCI0).
+  bool camss = true;
 };
 
 enum : int {
@@ -462,15 +466,29 @@ class Session {
         return fail(step, Failure::rcg);
       r_.mclkHz = 24000000;
     } else {
-      if (!rcgIsXoUndivided(cfg)) {
-        u_.mclkRcg = true;
-        if (!rcgSet(rcg, kRcgCfgXo, false, 0, 0, 0, "MCLK RCG CFG: XO / 1 (19.2 MHz)")) return fail(step, Failure::rcg);
+      // Linux's shared-RCG enable even when the RCG is found at the XO (clk_rcg2_shared_ops: the root forced on, CFG, UPDATE, the
+      // root released): a root that does not come on says the RCG's source is not running (c2f: MCLK4's branch never ran, its RCG's
+      // root stayed off). Only a changed configuration is taken back.
+      u_.mclkRcg = !rcgIsXoUndivided(cfg);
+      if (!rcgSet(rcg, kRcgCfgXo, false, 0, 0, 0, "MCLK RCG CFG: XO / 1 (19.2 MHz)")) {
+        mclkReport(n, "its RCG's root did not come on (no XO into the MCLK controller?)");
+        return fail(step, Failure::rcg);
       }
       r_.mclkHz = uint32_t(kXoHz);
     }
     u_.mclkBranch = true;
-    if (!branchOn(kMclkCc + mclkBranch(n), "MCLK branch on")) return fail(step, Failure::branch);
+    if (!branchOn(kMclkCc + mclkBranch(n), "MCLK branch on")) {
+      mclkReport(n, "its branch did not run");
+      return fail(step, Failure::branch);
+    }
     return true;
+  }
+  void mclkReport(unsigned n, const char *what)
+  {
+    const uint64_t rcg = kMclkCc + mclkRcg(n);
+    ops.note("mclk%u: %s: branch %08x, rcg cmd %08x cfg %08x; gcc camera xo %08x, mclk-cc ahb %08x; mclk pll0 mode %08x", n, what,
+             ops.rd(kMclkCc + mclkBranch(n)), ops.rd(rcg), ops.rd(rcg + kRcgCfg), ops.rd(kGcc + kGccCameraXo), ops.rd(kGcc + kGccMclkAhb),
+             ops.rd(kMclkCc + kMclkPll));
   }
   void mclkOff()
   {
@@ -639,16 +657,16 @@ class Session {
     const bool camcc = (rear_ && opt.rearCci) || opt.camss;   // this path touches CAMCC
     ops.step(kStepGcc, camcc ? (opt.votes ? "CAMCC's domains (MXC, MMCX: shared votes); GCC: camera AHB, camera XO, MCLK controller AHB (on where off)"
                                           : "GCC: camera AHB, camera XO, MCLK controller AHB (on where off)")
-                             : "GCC: MCLK controller AHB (on where off)");
+                             : "GCC: camera XO, MCLK controller AHB (on where off)");
     if (camcc && opt.votes) {
       if (ops.mmRails(true)) return fail(kStepGcc, Failure::votes);
       u_.votes = true;
       r_.voted = true;
     }
-    if (camcc) {
-      if (!gccBranchOn(0, kGccCameraAhb, "GCC camera AHB on") || !gccBranchOn(1, kGccCameraXo, "GCC camera XO on"))
-        return fail(kStepGcc, Failure::gcc);
-    }
+    if (camcc && !gccBranchOn(0, kGccCameraAhb, "GCC camera AHB on")) return fail(kStepGcc, Failure::gcc);
+    // GCC's camera XO on every path (Linux keeps it on from GCC's probe): the camera clock controllers' XO (inferred for the MCLK
+    // controller: c2r's MCLK1 ran from the XO with it on, c2f's MCLK4 did not with it off, their RCG and branch words alike).
+    if (!gccBranchOn(1, kGccCameraXo, "GCC camera XO on")) return fail(kStepGcc, Failure::gcc);
     if (!gccBranchOn(2, kGccMclkAhb, "GCC MCLK controller AHB on")) return fail(kStepGcc, Failure::gcc);
     if (stopHere(kStepGcc)) return false;
     ops.step(kStepResurvey, "the survey again, with the controllers' AHB running");

@@ -189,6 +189,19 @@ struct Board {
   bool pll0NoLock = false, csidResetStuck = false, sensorMute = false, framePadded = false, dmaFail = false;
   unsigned extraLines = 0;   // a frame longer than the mode by this many lines (an overflow)
   bool mm1On = false;
+  // The tablet's rules (tabletC1/tabletC3): an MCLK RCG on the XO has a root and its branch runs only while GCC's camera XO branch
+  // is enabled (inferred from c2r/c2f, 2026-11-12); a BUF_DONE set at once at stream-on, before any frame (a stale bit).
+  bool mclkNeedsCameraXo = false, staleBufDoneAtStart = false, staleSeen = false, bufDoneAtRdiStart = false;
+  unsigned smmuStores = 0;
+  // The order of the power-down's events (the teardown check): "wm off", "rdi stop", "smmu sync", "camnoc off", "hf axi off",
+  // "mm1 off", "titan off", "mxc off".
+  std::vector<std::string> events;
+  long lastEvent(const char *what) const
+  {
+    for (size_t i = events.size(); i-- > 0;)
+      if (events[i] == what) return long(i);
+    return -1;
+  }
   uint64_t memPa = 0x880000000ull, tablePa = 0x8f0000000ull;
   std::vector<uint8_t> mem;
   std::vector<uint64_t> tableMem;
@@ -298,11 +311,20 @@ struct Board {
            int64_t(now) >= at[tFrontReset] + 20000;
   }
   bool inRange(uint64_t pa, uint64_t base, uint64_t bytes) const { return pa >= base && pa < base + bytes; }
-  // Whether an access to pa would complete on the real bus.
+  bool camssRange(uint64_t pa) const
+  {
+    for (const Block &b : kBlocks)
+      if (inRange(pa, b.pa, 0x1000)) return true;
+    return inRange(pa, kCci0, kCci0Bytes) || inRange(pa, kTfeLite0, kTfeLiteBytes) || inRange(pa, csiphyBase(1), kCsiphyBytes) ||
+           inRange(pa, csiphyBase(4), kCsiphyBytes);
+  }
+  // Whether an access to pa would complete on the real bus: every block's register access with its block's clocks, its power
+  // domain and the votes under them held.
   const char *gate(uint64_t pa) const
   {
     if (inRange(pa, kCamCc, kCamCcBytes) && !gccClockOn(v(kGcc + kGccCameraAhb))) return "CAMCC without GCC's camera AHB";
     if (inRange(pa, kCamCc, kCamCcBytes) && requireMxc && !mxcVoted) return "CAMCC without MXC";
+    if (camssRange(pa) && requireMxc && !mxcVoted) return "a CAMSS block without CAMCC's domains (MXC)";
     if (inRange(pa, kMclkCc, kMclkCcBytes) && !gccClockOn(v(kGcc + kGccMclkAhb))) return "the MCLK controller without its AHB";
     const bool camAhb = gccClockOn(v(kGcc + kGccCameraAhb)) && titan() && running(kCamCc + kCcCamTopAhb);
     if (inRange(pa, kCci0, kCci0Bytes) && !(camAhb && running(kCamCc + kCcCci0))) return "CCI0 unpowered or unclocked";
@@ -376,12 +398,66 @@ struct Board {
     s.masterScl = pulled(scl) && !ourLow(scl);
     s.update();
   }
+  // Our window is live: the camera stream's group valid and translating through a bank with translation on and our table.
+  bool windowLive() const
+  {
+    const unsigned groups = v(kSmmu + 0x20) & 0xffu, pages = 1u << (((v(kSmmu + 0x24) >> 28) & 7u) + 1);
+    for (unsigned i = 0; i < groups; ++i) {
+      const uint32_t smr = v(kSmmu + 0x800 + 4 * i);
+      if (!(smr & 0x80000000u) || (smr & 0x7fffu) != kCamStream) continue;
+      const uint32_t s2cr = v(kSmmu + 0xc00 + 4 * i);
+      const uint64_t cb = kSmmu + uint64_t(pages + (s2cr & 0xffu)) * 4096;
+      const uint64_t ttbr = uint64_t(v(cb + 0x20)) | uint64_t(v(cb + 0x24) & 0xffffu) << 32;
+      return ((s2cr >> 16) & 3u) == 0 && (v(cb) & 1u) && ttbr == tablePa;
+    }
+    return false;
+  }
+  bool wmEnabled() const { return v(kTfeLite0 + kWm0 + kWmCfg) & kWmEnable; }
+  bool cameraNocUp() const
+  {
+    return mm1On && (v(kGcc + kGccCameraHfAxi) & kCbcrEnable) && running(kCamCc + kCcCamnocRtAxi);
+  }
+  // The apps SMMU as the hypervisor presents it (c1: IDR0 0x4c017e7f, stage 1 only): a store of a configuration it does not have
+  // aborts (c3rp/c3r: the free group's S2CR 0x0300006e written back, "Unhandled implementation specific error"); the TLB
+  // maintenance of the camera's stream needs the camera NoC (the camera TBU: inferred, the conservative rule).
+  void smmuStore(uint32_t off, uint32_t value)
+  {
+    ++smmuStores;
+    const uint32_t idr0 = v(kSmmu + 0x20), idr1 = v(kSmmu + 0x24);
+    const unsigned banks = idr1 & 0xffu, pages = 1u << (((idr1 >> 28) & 7u) + 1);
+    char why[160] = {};
+    if (off >= 0xc00 && off < 0xc00 + 4 * 128) {
+      const uint32_t type = (value >> 16) & 3u;
+      if (type == 3 || (type == 0 && (value & 0xffu) >= banks))
+        std::snprintf(why, sizeof why, "SMMU abort: S2CR %u := %08x (bank %u of %u)", (off - 0xc00) / 4, value, value & 0xffu, banks);
+    } else if (off >= 0x1000 && off < 0x1000 + 4 * 128) {
+      const uint32_t type = (value >> 16) & 3u;
+      if (type == 1 ? !(idr0 & (1u << 30)) : !(idr0 & (1u << 29)))
+        std::snprintf(why, sizeof why, "SMMU abort: CBAR %u := %08x (a context type this SMMU lacks)", (off - 0x1000) / 4, value);
+    } else if (off == 0x68 || off == 0x70 || (off >= pages * 4096 && ((off & 0xfff) == 0x618 || (off & 0xfff) == 0x7f0))) {
+      if (!cameraNocUp()) std::snprintf(why, sizeof why, "SMMU TLB maintenance (%#x) without the camera NoC voted and clocked", off);
+      if (off == 0x70) events.push_back("smmu sync");
+    }
+    if (why[0]) {
+      violations.push_back(why);
+      return;
+    }
+    r[kSmmu + off] = value;
+  }
   void wr(uint64_t pa, uint32_t value)
   {
     ++stores;
     if (const char *g = gate(pa)) {
       violations.push_back(std::string("store stalled: ") + g);
       return;
+    }
+    if (inRange(pa, kSmmu, kSmmuBytes)) return smmuStore(uint32_t(pa - kSmmu), value);
+    if (pa == kTfeLite0 + kWm0 + kWmCfg && !(value & kWmEnable) && wmEnabled()) events.push_back("wm off");
+    if (pa == kCsidLite0 + kCsidRdiCtrl && !(value & 1u) && (v(pa) & 1u)) events.push_back("rdi stop");
+    if ((pa == kGcc + kGccCameraHfAxi || pa == kCamCc + kCcCamnocRtAxi) && !(value & kCbcrEnable) && (v(pa) & kCbcrEnable)) {
+      events.push_back(pa == kGcc + kGccCameraHfAxi ? "hf axi off" : "camnoc off");
+      if (wmEnabled()) violations.push_back("the camera NoC's clock off while the write master is enabled");
+      if (windowLive()) violations.push_back("the camera NoC's clock off while the SMMU window is live");
     }
     if (inRange(pa, kTlmm, 0x200000)) {
       const unsigned gpio = unsigned((pa - kTlmm) / kTlmmStride);
@@ -425,7 +501,12 @@ struct Board {
         r[pa] |= kGdscPwrOn;
         r[pa + 4] = kGdscCfgUpDone;
       } else {
-        if (wasOn) resetCamss();   // collapsed: CSID, TFE and CSIPHY registers lose their state
+        if (wasOn) {
+          events.push_back("titan off");
+          if (wmEnabled()) violations.push_back("TITAN_TOP collapsed with the write master enabled");
+          if (windowLive()) violations.push_back("TITAN_TOP collapsed while the SMMU window is live");
+          resetCamss();   // collapsed: CSID, TFE and CSIPHY registers lose their state
+        }
         r[pa] &= ~kGdscPwrOn;
         r[pa + 4] = (value & kGdscCollapse) ? kGdscCfgDownDone : 0;
         if (!(value & kGdscCollapse)) {
@@ -451,7 +532,7 @@ struct Board {
       bool camcc = false;   // level 3's sources only (level 2's found-on-a-PLL slow AHB keeps its old model)
       for (const L3Rcg &l : kL3Rcgs) camcc = camcc || pa == kCamCc + (l.off ? l.off : kCcCsi1TimerRcg) || pa == kCamCc + kCcCsi4TimerRcg;
       uint32_t x = (value & kRcgUpdate) && camcc && src >= 1 && src <= 3 && !pll0Running() ? value : value & ~kRcgUpdate;
-      if (value & kRcgRootEn) x &= ~kRcgRootOff;
+      if ((value & kRcgRootEn) && !(inRange(pa, kMclkCc, kMclkCcBytes) && src == 0 && !mclkXo())) x &= ~kRcgRootOff;
       else x |= kRcgRootOff;
       r[pa] = x;
       return;
@@ -460,7 +541,7 @@ struct Board {
       r[pa] = value;
       const uint32_t mode = v(kMclkCc + kMclkPll), op = v(kMclkCc + kMclkPll + 4);
       const bool lock = (mode & 4u) && (op & 1u) && v(kMclkCc + kMclkPll + kPllRivianL) == 0x32 &&
-                        v(kMclkCc + kMclkPll + 0x1c) == 0x12000000 && !pllNoLock;
+                        v(kMclkCc + kMclkPll + 0x1c) == 0x12000000 && !pllNoLock && mclkXo();
       r[kMclkCc + kMclkPll] = (mode & ~kPllLockDet) | (lock ? kPllLockDet : 0);
       return;
     }
@@ -493,6 +574,8 @@ struct Board {
     if (pa == kCamCc + kCcCamTopAhb || pa == kCamCc + kCcCci0) return titan();
     if (pa == kMclkCc + mclkBranch(1) && rcgSource(v(kMclkCc + mclkRcg(1) + 4)) == 3)
       return v(kMclkCc + kMclkPll) & kPllLockDet;
+    for (unsigned n = 0; n < kMclkCount; ++n)   // an MCLK from the XO (and the MCLK PLL's reference): GCC's camera XO (the tablet's)
+      if (pa == kMclkCc + mclkBranch(n) && !mclkXo()) return false;
     // Level 3's branches: under TITAN_TOP, and only with their source running (a PLL0 output needs PLL0).
     if (inRange(pa, kCamCc, kCamCcBytes))
       if (const uint32_t rcg = rcgOfBranch(uint32_t(pa - kCamCc))) {
@@ -517,6 +600,7 @@ struct Board {
     default: return 0;
     }
   }
+  bool mclkXo() const { return !mclkNeedsCameraXo || (v(kGcc + kGccCameraXo) & kCbcrEnable); }
   bool pll0Running() const
   {
     const uint64_t p = kCamCc + kCcPll0;
@@ -549,6 +633,10 @@ struct Board {
     case kCsidRxClear: r[c + kCsidRxStatus] &= ~value; return;
     case kCsidRdiClear: r[c + kCsidRdiStatus] &= ~value; return;
     case kCsidIrqCmd: return;
+    case kCsidRdiCtrl:   // (an injection: a BUF_DONE left set when RDI0 starts, before any frame)
+      if ((value & 1u) && bufDoneAtRdiStart) r[c + kCsidBufStatus] |= kCsidBufRdi0;
+      r[c + off] = value;
+      return;
     case kCsidRupAup:
       // Each write with the AUP bit latches the write master's address; the RUP bit takes effect at the next frame's start.
       if (value & kCsidAupRdi0) aupFifo.push_back(v(kTfeLite0 + kWm0 + kWmImageAddr));
@@ -681,6 +769,10 @@ struct Board {
     if (!streamReady()) {
       nextFrameAt = 0;
       return;
+    }
+    if (staleBufDoneAtStart && !staleSeen) {   // a BUF_DONE at once, no frame behind it
+      staleSeen = true;
+      r[kCsidLite0 + kCsidBufStatus] |= kCsidBufRdi0;
     }
     if (!nextFrameAt) nextFrameAt = now + 33333;
     while (now >= nextFrameAt) {
@@ -894,6 +986,11 @@ struct TestOps {
   {
     mmBusCalls.push_back(on);
     if (mmBusFail) return -5;
+    if (!on && b.mm1On) {   // the camera NoC's vote withdrawn: nothing may still use it
+      b.events.push_back("mm1 off");
+      if (b.wmEnabled()) b.violations.push_back("MM1 withdrawn with the write master enabled");
+      if (b.windowLive()) b.violations.push_back("MM1 withdrawn while the SMMU window is live");
+    }
     b.mm1On = on;
     return 0;
   }
@@ -953,10 +1050,19 @@ struct TestOps {
   {
     mmCalls.push_back(on);
     if (mmFail) return -5;
+    if (!on && b.mxcVoted) {   // CAMCC's domains withdrawn: TITAN_TOP and every CAMCC branch must be off by now
+      b.events.push_back("mxc off");
+      if (b.titan()) b.violations.push_back("CAMCC's domains withdrawn with TITAN_TOP on");
+    }
     b.mxcVoted = on;
     return 0;
   }
-  void step(int n, const char *) { steps.push_back(n); }
+  std::vector<std::string> log;   // the steps and notes in their order
+  void step(int n, const char *)
+  {
+    steps.push_back(n);
+    log.push_back("step " + std::to_string(n));
+  }
   void note(const char *fmt, ...)
   {
     char line[400];
@@ -965,6 +1071,15 @@ struct TestOps {
     std::vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
     notes.push_back(line);
+    log.push_back(line);
+    // The console cuts a line at 255 characters with its "PianoCamera: " prefix (c3r): every line must fit.
+    if (std::strlen(line) + 13 > 254) b.violations.push_back(std::string("a log line too long for the console: ") + line);
+  }
+  long logIndex(const char *prefix) const
+  {
+    for (size_t i = 0; i < log.size(); ++i)
+      if (!log[i].compare(0, std::strlen(prefix), prefix)) return long(i);
+    return -1;
   }
 };
 
@@ -1125,6 +1240,7 @@ static void testRearGpio()
   const auto before = r.b.snapshot();
   PowerOptions po;
   po.rearCci = false;
+  po.camss = false;   // the minimal path (piano-camera-camss=0)
   const SensorResult res = r.run(Sensor::rear, po);
   CHECK(res.idOk && res.id == 0x38e1);
   CHECK(res.cleanOff && r.b.violations.empty());
@@ -1134,6 +1250,13 @@ static void testRearGpio()
   checkRearTiming(r.b);
   // No CAMCC store at all on this path.
   CHECK(r.b.v(kCamCc + kGdscTitanTop) == 0x00222001);
+  // The default (camss): TITAN_TOP up for the sensor as well (its DT power domain), all as found after.
+  Rig q;
+  const auto beforeQ = q.b.snapshot();
+  PowerOptions pq;
+  pq.rearCci = false;
+  const SensorResult rq = q.run(Sensor::rear, pq);
+  CHECK(rq.idOk && rq.cleanOff && q.b.violations.empty() && same(beforeQ, q.b.snapshot()) && q.b.cciStarts == 0);
 }
 
 static void testRearMclk24()
@@ -1177,6 +1300,7 @@ static void testFront()
   Rig r;
   const auto before = r.b.snapshot();
   PowerOptions po;
+  po.camss = false;   // the minimal path (piano-camera-camss=0); the default is testFrontCamss's
   const SensorResult res = r.run(Sensor::front, po);
   CHECK(res.idOk && res.id == 0x5632 && res.tries == 1);
   CHECK(res.cleanOff && r.b.violations.empty());
@@ -1188,10 +1312,46 @@ static void testFront()
     CHECK(r.b.vrmLog[0] == "ldob10 8=7 0=1800 4=1" && r.b.vrmLog[1] == "ldog2 8=7 0=1200 4=1");
     CHECK(r.b.vrmLog[2] == "ldog2 4=0" && r.b.vrmLog[3] == "ldob10 4=0");
   }
-  // The front path never touches CAMCC, GCC's camera AHB/XO or CCI0.
+  // The minimal front path never touches CAMCC or CCI0.
   CHECK(r.b.v(kCamCc + kGdscTitanTop) == 0x00222001 && r.b.cciStarts == 0);
   // gpio7's egpio bit was not ours: set while in use (as Linux claims the pin), back as found after.
   CHECK(!(r.b.v(tlmmCfg(7)) & kTlmmEgpioEnable));
+}
+
+static void tabletC1(Board &b);
+// c2f (2026-11-12): the front's MCLK4 never ran ("a clock branch did not run", its CBCR 0x88000000) with GCC's camera XO off and
+// TITAN_TOP down; the rear's MCLK1 did (c2r) with both on. Against the tablet's model (an MCLK from the XO only with GCC's camera
+// XO enabled): the minimal path now turns the camera XO on (and off again), the default path powers TITAN_TOP too (the sensors' DT
+// power domain), both find 0x5632 and leave everything as found; the MCLK RCG gets Linux's shared-RCG enable even at the XO.
+static void testFrontCamss()
+{
+  // The model's rule itself: with the camera XO off, MCLK4's RCG root and branch stay off.
+  {
+    Board b;
+    tabletC1(b);
+    b.r[kGcc + kGccMclkAhb] = 0x88000003u;
+    b.wr(kMclkCc + mclkRcg(4), kRcgRootEn);
+    b.wr(kMclkCc + mclkBranch(4), kCbcrEnable);
+    CHECK((b.v(kMclkCc + mclkRcg(4)) & kRcgRootOff) && (b.v(kMclkCc + mclkBranch(4)) & kCbcrClkOff));
+    b.r[kGcc + kGccCameraXo] = 0x08000001u;
+    b.wr(kMclkCc + mclkRcg(4), kRcgRootEn);
+    b.wr(kMclkCc + mclkBranch(4), kCbcrEnable);
+    CHECK(!(b.v(kMclkCc + mclkRcg(4)) & kRcgRootOff) && !(b.v(kMclkCc + mclkBranch(4)) & kCbcrClkOff));
+  }
+  for (bool camss : {false, true}) {
+    Rig r;
+    tabletC1(r.b);
+    const auto before = r.b.snapshot();
+    PowerOptions po;
+    po.camss = camss;
+    const SensorResult res = r.run(Sensor::front, po);
+    for (auto &v : r.b.violations) std::printf("  violation: %s\n", v.c_str());
+    CHECK(res.idOk && res.id == 0x5632 && res.cleanOff && r.b.violations.empty());
+    CHECK(same(before, r.b.snapshot()));
+    checkFrontTiming(r.b);
+    CHECK(res.voted == camss && r.ops.mmCalls.size() == (camss ? 2u : 0u) && !r.b.mxcVoted);
+    CHECK(r.b.cciStarts == 0);
+  }
 }
 
 static void testFailures()
@@ -1304,6 +1464,10 @@ static void testFailures()
 // 0x88000002 (all off; both AHBs hardware-gated), HF AXI 0x8a200000; CAMCC readable only with MXC voted (the strict model). Level 1
 // reads neither controller; level 2 votes CAMCC's domains, enables the three branches (the hardware-gated ones counting on without
 // CLK_OFF clearing, Linux's rule), finds both IDs, and leaves everything as found (votes withdrawn, the branches' enables cleared).
+// With what the c2/c3 runs (2026-11-12) taught: an MCLK from the XO runs only with GCC's camera XO enabled (c2f's MCLK4 did not run
+// with it off, c2r's MCLK1 did with it on: inferred), and the apps SMMU as the hypervisor presents it: IDR0 0x4c017e7f (127 groups,
+// stage 1 only), IDR1 83 banks, five groups in use (c1: 122 of 127 free; their streams and banks stand in, NativeUfs's bank 82
+// among them), every free group's S2CR reading 0x0300006e (c3r's, written back by the old release: the abort).
 static void tabletC1(Board &b)
 {
   b.r[kGcc + kGccCameraAhb] = 0x88000002u;
@@ -1311,6 +1475,18 @@ static void tabletC1(Board &b)
   b.r[kGcc + kGccMclkAhb] = 0x88000002u;
   b.r[kGcc + kGccCameraHfAxi] = b.r[kGcc + kGccCameraSfAxi] = 0x8a200000u;
   b.requireMxc = true;
+  b.mclkNeedsCameraXo = true;
+  b.r[kSmmu + 0x20] = 0x4c017e7fu;
+  const struct {
+    uint16_t stream;
+    unsigned bank;
+    uint32_t sctlr;
+  } used[5] = {{0x0400, 0, 1}, {0x0060, 82, 0}, {0x0800, 1, 0x27}, {0x0040, 3, 0xe0}, {0x0c00, 2, 0x27}};
+  for (unsigned i = 0; i < 127; ++i) {
+    b.r[kSmmu + 0x800 + 4 * i] = i < 5 ? 0x80000000u | used[i].stream : 0;
+    b.r[kSmmu + 0xc00 + 4 * i] = i < 5 ? used[i].bank : 0x0300006eu;
+  }
+  for (const auto &u : used) b.r[kSmmu + (128 + u.bank) * 4096] = u.sctlr;
 }
 static void testTabletC1()
 {
@@ -1331,9 +1507,8 @@ static void testTabletC1()
     CHECK(res.idOk && res.cleanOff && q.b.violations.empty());
     for (auto &v : q.b.violations) std::printf("  violation: %s\n", v.c_str());
     CHECK(same(before, q.b.snapshot()));
-    // The rear (CAMCC through CCI0) votes CAMCC's domains first and withdraws them last; the front never touches CAMCC.
-    if (w == Sensor::rear) CHECK(q.ops.mmCalls.size() == 2 && q.ops.mmCalls[0] && !q.ops.mmCalls[1] && res.voted && !q.b.mxcVoted);
-    else CHECK(q.ops.mmCalls.empty() && !res.voted);
+    // Both sensors (the rear through CCI0, the front for TITAN_TOP, its power domain) vote CAMCC's domains first, withdraw them last.
+    CHECK(q.ops.mmCalls.size() == 2 && q.ops.mmCalls[0] && !q.ops.mmCalls[1] && res.voted && !q.b.mxcVoted);
   }
   // c1b: level 2 stopped after step 202 (the rear's path): GCC's branches enabled and CAMCC's domains voted, both controllers read
   // (the survey handed to the kernel's log), then everything as found: no rail, pin or CAMCC store.
@@ -1557,6 +1732,26 @@ static std::map<uint64_t, uint32_t> l3Snapshot(const Board &b)
   }
   return s;
 }
+// The words the window's release keeps on purpose (CameraSmmu.h: a found value this SMMU would refuse): each must hold the kept value
+// (S2CR fault; CBAR/CBA2R our stage-1 words), and they are then left out of the as-found comparison.
+static std::map<uint64_t, uint32_t> withoutKept(std::map<uint64_t, uint32_t> s, const StreamResult &res, const RoutePlan &p, const Board &b)
+{
+  if (p.route != Route::window) return s;
+  if (res.release.s2crKept) {
+    CHECK(b.v(kSmmu + 0xc00 + 4 * p.slot) == kS2crFault);
+    s.erase(kSmmu + 0xc00 + 4 * p.slot);
+  }
+  if (res.release.cbarKept) {
+    CHECK(b.v(kSmmu + 0x1000 + 4 * p.bank) == iova::kCbarStage1 && b.v(kSmmu + 0x1800 + 4 * p.bank) == 1);
+    s.erase(kSmmu + 0x1000 + 4 * p.bank);
+    s.erase(kSmmu + 0x1800 + 4 * p.bank);
+  }
+  return s;
+}
+static bool asFound(const std::map<uint64_t, uint32_t> &before, const StreamResult &res, const RoutePlan &p, const Board &b)
+{
+  return same(withoutKept(before, res, p, b), withoutKept(l3Snapshot(b), res, p, b));
+}
 static void checkBars(const StreamResult &r, const Board &b)
 {
   bool exact = true;
@@ -1581,9 +1776,12 @@ static void testL3Rear()
   CHECK(res.stats.done && res.stats.guardIntact && res.stats.stride == 5100 && res.stats.written == 5100ull * 3072);
   checkBars(res, r.b);
   for (unsigned p = 0; p < 4; ++p) CHECK(res.stats.ch[p].count == 4080ull * 3072 / 4);
-  // Everything as found: votes withdrawn, MM1 off, the SMMU's group and bank as found, TITAN_TOP collapsed (the CAMSS blocks
-  // reset), the clocks, the branches, GCC, the pins and the rails.
-  CHECK(same(before, l3Snapshot(r.b)));
+  // Everything as found: votes withdrawn, MM1 off, the SMMU's group and bank as found (but the found words this SMMU refuses: the
+  // tablet's free S2CR 0x0300006e and a free bank's stage-2 CBAR 0, kept at fault and at our stage-1 words), TITAN_TOP collapsed
+  // (the CAMSS blocks reset), the clocks, the branches, GCC, the pins and the rails.
+  CHECK(res.release.s2crKept && res.release.cbarKept && !res.release.error);
+  CHECK(r.plan.slot == 5 && r.plan.bank == 81 && r.plan.foundS2cr == 0x0300006eu);   // c3r's group and bank
+  CHECK(asFound(before, res, r.plan, r.b));
   CHECK(!r.b.mm1On && !r.b.mxcVoted && r.ops.mmBusCalls.size() == 2 && r.ops.mmCalls.size() == 2);
   CHECK(r.b.allocs == 1 && r.b.frees == 1 && r.b.invalidates == 1 && r.b.cleans == 2);
   // The window's table: the buffer's eight 2 MiB blocks at 0x20000000, nothing else.
@@ -1623,21 +1821,28 @@ static void testL3Variants()
     CHECK(res.ok && res.cleanOff && r.b.violations.empty() && res.bytes == 8u << 20);
     CHECK(res.tableWrites == 1 + 811 + 54 + 4 + 4 && res.controlWrites == 0 && res.settle == 29);
     CHECK(res.stats.stride == 4080 && res.stats.ch[2].mean() == 302);
-    CHECK(same(before, l3Snapshot(r.b)));
+    CHECK(asFound(before, res, r.plan, r.b));
   }
   // A bypass the boot chain left: physical addresses, no SMMU store at all.
   {
     L3Rig r;
     r.b.r[kSmmu + 0x800 + 4 * 7] = 0x80000000u | kCamStream;
     r.b.r[kSmmu + 0xc00 + 4 * 7] = 1u << 16;
-    const unsigned smmuStores = 0;
     const StreamResult res = r.run(Sensor::rear);
     CHECK(res.ok && res.route == Route::bypass && res.busAddr == r.b.memPa && r.b.tableMem.empty());
-    unsigned stores = smmuStores;
-    for (auto &[pa, v] : r.b.r) stores += pa >= kSmmu && pa < kSmmu + kSmmuBytes && pa != kSmmu + 0x800 + 4 * 7 && pa != kSmmu + 0xc00 + 4 * 7 &&
-                                       pa > kSmmu + 0x28;
-    CHECK(stores == 0);
+    CHECK(r.b.smmuStores == 0 && r.b.violations.empty());
     checkBars(res, r.b);
+  }
+  // The stream's own exact group left faulting by the boot chain (redirected in place, then given back as found: its fault S2CR is
+  // a configuration this SMMU has).
+  {
+    L3Rig r;
+    r.b.r[kSmmu + 0x800 + 4 * 6] = 0x80000000u | kCamStream;
+    r.b.r[kSmmu + 0xc00 + 4 * 6] = kS2crFault;
+    const auto before = l3Snapshot(r.b);
+    const StreamResult res = r.run(Sensor::rear);
+    CHECK(res.ok && res.route == Route::window && r.plan.window.reuse && r.plan.slot == 6 && !res.release.s2crKept && res.release.cbarKept);
+    CHECK(r.b.violations.empty() && asFound(before, res, r.plan, r.b) && r.b.v(kSmmu + 0x800 + 4 * 6) == (0x80000000u | kCamStream));
   }
   // A group that translates through someone's bank: refused before any stream; nothing of the SMMU or the sensor's stream touched.
   {
@@ -1648,7 +1853,8 @@ static void testL3Variants()
     const auto before = l3Snapshot(r.b);
     const StreamResult res = r.run(Sensor::rear);
     CHECK(!res.ok && res.failure == StreamFailure::refused && res.failedStep == -kStepL3Smmu && res.cleanOff && r.b.allocs == 0);
-    CHECK(same(before, l3Snapshot(r.b)) && r.b.violations.empty() && r.b.framesWritten == 0);
+    for (auto &v : r.b.violations) std::printf("  violation: %s\n", v.c_str());
+    CHECK(asFound(before, res, r.plan, r.b) && r.b.violations.empty() && r.b.framesWritten == 0 && r.b.smmuStores == 0);
   }
 }
 
@@ -1674,7 +1880,7 @@ static void testL3Failures()
     const auto before = l3Snapshot(r.b);
     const StreamResult res = r.run(Sensor::rear);
     const bool ok = !res.ok && res.failedStep == -k.step && res.failure == k.failure && res.cleanOff && r.b.violations.empty() &&
-                    same(before, l3Snapshot(r.b)) && !r.b.mm1On && !r.b.mxcVoted && r.b.frees == r.b.allocs;
+                    asFound(before, res, r.plan, r.b) && !r.b.mm1On && !r.b.mxcVoted && r.b.frees == r.b.allocs;
     if (!ok)
       std::printf("  L3 %s: step %d failure %s clean %d violations %zu\n", k.what, -res.failedStep, streamFailureName(res.failure),
                   res.cleanOff, r.b.violations.size());
@@ -1715,9 +1921,94 @@ static void testL3Stops()
     const auto before = l3Snapshot(r.b);
     const StreamResult res = r.run(Sensor::rear, o);
     const bool ok = res.failure == StreamFailure::stopped && res.failedStep == -step && res.cleanOff && r.b.violations.empty() &&
-                    same(before, l3Snapshot(r.b)) && r.b.frees == r.b.allocs && !r.b.mm1On;
+                    asFound(before, res, r.plan, r.b) && r.b.frees == r.b.allocs && !r.b.mm1On;
     if (!ok) std::printf("  L3 stop at %d: failure %s clean %d\n", step, streamFailureName(res.failure), res.cleanOff);
     CHECK(ok);
+  }
+}
+
+// The model's SMMU rules themselves (the tablet's c1 SMMU): the old release's store of c3r's found S2CR, a stage-2 CBAR on a stage-1
+// only SMMU, and TLB maintenance without the camera NoC are each caught as a violation (each was, or could be, an abort).
+static void testSmmuRules()
+{
+  Board b;
+  tabletC1(b);
+  b.wr(kSmmu + 0xc00 + 4 * 5, 0x0300006eu);   // c3rp/c3r: "Unhandled implementation specific error" right after this store
+  CHECK(b.violations.size() == 1 && b.violations[0].find("S2CR 5") != std::string::npos);
+  b.wr(kSmmu + 0x1000 + 4 * 81, 0);           // CBAR "stage 2" (IDR0 has no S2TS)
+  CHECK(b.violations.size() == 2);
+  b.wr(kSmmu + 0x70, 0xffffffffu);            // TLB sync with MM1 off, HF AXI off, the camera NoC unclocked
+  CHECK(b.violations.size() == 3);
+  b.wr(kSmmu + 0xc00 + 4 * 5, kS2crFault);    // what the release now leaves
+  b.wr(kSmmu + 0x1000 + 4 * 81, iova::kCbarStage1);
+  CHECK(b.violations.size() == 3 && b.v(kSmmu + 0xc00 + 4 * 5) == kS2crFault);
+  CHECK(!s2crRestorable(0x0300006eu, 83) && s2crRestorable(kS2crFault, 83) && s2crRestorable(1u << 16, 83) && s2crRestorable(82, 83));
+  CHECK(!cbarRestorable(0, 0x4c017e7fu) && cbarRestorable(iova::kCbarStage1, 0x4c017e7fu) && cbarRestorable(0, 0x6c017e7fu));
+}
+
+// c3rp/c3r's teardown (2026-11-12): the window released while the camera NoC is voted and clocked, before anything it depends on goes;
+// the found words this SMMU refuses kept; the report (the chip ID first) logged before the power-down; the order of the events.
+static void testL3Teardown()
+{
+  for (int stop : {0, int(kStepL3Sensor2)}) {   // c3r, and c3rp (stopped before stream-on)
+    L3Rig r;
+    StreamOptions o;
+    o.stopAt = stop;
+    const auto before = l3Snapshot(r.b);
+    const StreamResult res = r.run(Sensor::rear, o);
+    for (auto &v : r.b.violations) std::printf("  violation: %s\n", v.c_str());
+    CHECK(r.b.violations.empty() && res.cleanOff && res.bufferFreed && asFound(before, res, r.plan, r.b));
+    CHECK(stop ? (res.failure == StreamFailure::stopped && res.failedStep == -kStepL3Sensor2 && !res.streamed) : res.ok);
+    const Board &b = r.b;
+    const long wm = b.lastEvent("wm off"), rdi = b.lastEvent("rdi stop"), sync = b.lastEvent("smmu sync"), camnoc = b.lastEvent("camnoc off"),
+               hf = b.lastEvent("hf axi off"), mm1 = b.lastEvent("mm1 off"), titan = b.lastEvent("titan off"), mxc = b.lastEvent("mxc off");
+    CHECK(wm >= 0 && wm < rdi && rdi < sync && sync < camnoc && camnoc < hf && hf < mm1 && mm1 < titan && titan < mxc);
+    const long id = r.ops.logIndex("rear S5KJN1: chip ID 0x38e1 (expected 0x38e1): OK over CCI0 master 1"),
+               report = r.ops.logIndex("level 3 (before the power-down): rear S5KJN1 4080x3072 RAW10"), down = r.ops.logIndex("step 340"),
+               kept = r.ops.logIndex("smmu: group 5's S2CR left at fault (00020000): the found 0300006e"),
+               found = r.ops.logIndex("smmu: window: group 5 (found smr 00000000 s2cr 0300006e: not restorable), bank 81 of 83");
+    CHECK(id >= 0 && found > id && report > found && down > report && kept > down);
+    CHECK(r.ops.logIndex("route: our translating window") > report && r.ops.logIndex("route: our translating window") < down);
+    if (stop) CHECK(r.ops.logIndex("stopped before stream-on (piano-camera-stop=312)") > 0 && r.b.framesWritten == 0);
+    else CHECK(r.ops.logIndex("frame: row 3071: 4080 of 5100 bytes not the fill") > report && r.ops.logIndex("stream: frame 2: SOF +") > report);
+  }
+}
+
+// The stream's diagnostics: per-frame times, a stale BUF_DONE at stream-on (not a frame), a BUF_DONE left before stream-on (logged
+// and cleared), the first rows' bytes.
+static void testL3Diagnostics()
+{
+  {
+    L3Rig r;
+    const StreamResult res = r.run(Sensor::rear);
+    CHECK(res.ok && res.bufDone == 2 && res.staleBufDone == 0 && res.preBuf == 0);
+    CHECK(res.bufUs[0] >= 33000 && res.bufUs[1] >= res.bufUs[0] + 33000 && res.bufUs[1] <= res.bufUs[0] + 34000);
+    CHECK(res.sofUs[0] && res.sofUs[0] <= res.bufUs[0] && res.eofUs[1] > res.bufUs[0] && res.eofUs[1] <= res.bufUs[1]);
+    CHECK(res.phyFirstRead && res.firstFrameUs == res.bufUs[0] && res.lastIntervalUs >= 33000);
+    // The bars' values have no low bits: each group's fifth byte is 0, so 4 of 5 bytes of a row are not the fill.
+    CHECK(res.stats.rowIndex[0] == 0 && res.stats.rowIndex[4] == 3071 && res.stats.rowNonzero[0] == 4080 && res.stats.rowNonzero[4] == 4080);
+    CHECK(!std::memcmp(res.stats.rowHead[0], res.stats.head, 16) && res.stats.rowHead[1][0] == uint8_t(r.b.rgb[0][2] >> 2));
+  }
+  {
+    L3Rig r;
+    r.b.staleBufDoneAtStart = true;
+    const StreamResult res = r.run(Sensor::rear);
+    CHECK(res.ok && res.staleBufDone == 1 && res.bufDone == 2 && res.bufUs[0] >= 33000 && r.b.violations.empty());
+  }
+  {
+    L3Rig r;
+    r.b.bufDoneAtRdiStart = true;
+    const StreamResult res = r.run(Sensor::rear);
+    CHECK(res.ok && res.preBuf == kCsidBufRdi0 && res.staleBufDone == 0 && res.bufDone == 2 && res.bufUs[0] >= 33000);
+    CHECK(r.ops.logIndex("stream: before stream-on: top 00000000 buf-done 00000002") > 0);
+  }
+  {   // no frame at all: the deadline, the report still before the power-down
+    L3Rig r;
+    r.b.sensorMute = true;
+    const StreamResult res = r.run(Sensor::rear);
+    CHECK(res.failure == StreamFailure::noFrame && res.cleanOff && r.b.violations.empty() && res.streamUs >= 1000000);
+    CHECK(r.ops.logIndex("level 3 (before the power-down): rear S5KJN1 4080x3072 RAW10: FAILED at step 320") <
+          r.ops.logIndex("step 340"));
   }
 }
 
@@ -1769,6 +2060,7 @@ int main()
   testRearGpio();
   testRearMclk24();
   testFront();
+  testFrontCamss();
   testFailures();
   testTabletC1();
   testAllowlist();
@@ -1780,6 +2072,9 @@ int main()
   testL3Variants();
   testL3Failures();
   testL3Stops();
+  testSmmuRules();
+  testL3Teardown();
+  testL3Diagnostics();
   if (failures) {
     std::printf("camera_host: %d check(s) FAILED\n", failures);
     return 1;

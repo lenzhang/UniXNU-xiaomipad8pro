@@ -27,12 +27,20 @@
 //       register updates (AUP, RUP, twice), RDI0 start       311 the CSIPHY: reset, version, lanes, the 103-entry table with the
 //       settle count, interrupts masked                       312 the sensor's start/init/mode tables, the rear's controls (test
 //       pattern, orientation, exposure, gain, frame length), stream on last
-//   320 the stream: BUF_DONE polled (first frame <= 1 s, each next <= 200 ms, all <= piano-camera-timeout-ms), the write master
-//       re-armed with the same buffer after each, SOF/EOF/RUP/error bits counted
-//   330 stop: write master off, RDI0 stopped, the PHY's lanes off, the sensor's off table; late frames counted for 100 ms
-//   331 the statistics (min/max/mean and an 8-bin histogram per Bayer position, eight vertical bands, the written extent, the guard)
-//   340 down in reverse: branches, clock sources (before PLL0), PLL0, HF AXI, MM1, the SMMU route; level 2's power-down; the
-//       buffer freed only once the write master read back stopped and its clock off (else kept, and said so)
+//   320 the stream: the four status words read and cleared just before stream-on (logged: what was set before any frame), then
+//       BUF_DONE polled (first frame <= 1 s, each next <= 200 ms, all <= piano-camera-timeout-ms); a BUF_DONE less than 1 ms after
+//       stream-on or after the previous frame is counted as stale, not as a frame; the write master re-armed with the same buffer
+//       after each frame; per frame the times of SOF, EOF and BUF_DONE; the first CSI2 RX and RDI error words with their times; the
+//       CSIPHY's status words at the first frame and at the end
+//   330 stop: write master off, RDI0 stopped, the PHY's lanes off, the sensor's off table; late frames counted for 100 ms (three
+//       frame times: the write master and the CSID are idle after it)
+//   331 the statistics (min/max/mean and an 8-bin histogram per Bayer position, eight vertical bands, the written extent, the guard,
+//       the first rows' bytes); everything level 3 found is logged here, before the power-down (c3rp/c3r, 2026-11-12: an abort in
+//       the old power-down lost every line of the report, the chip ID's included)
+//   340 down, nothing touched after its clock, power or vote is gone (c3rp/c3r): the SMMU route first, while MM1, GCC's HF AXI and
+//       the camera NoC's clocks still run (its TLB maintenance reaches the camera's TBU, inferred); then the branches, the clock
+//       sources (before PLL0), PLL0, HF AXI, MM1; level 2's power-down (the sensor's bus, TITAN_TOP, the MCLK, the rails, GCC,
+//       CAMCC's domains last); the buffer freed only once the write master read back stopped, its clock off and the route released
 #pragma once
 #include <stdint.h>
 #include <string.h>
@@ -47,6 +55,7 @@ struct StreamOptions {
   bool pattern = true;            // the rear's colour bars (piano-camera-pattern; 0: the scene)
   unsigned timeoutMs = 3000;      // the stream's hard bound from stream-on (piano-camera-timeout-ms, 500..10000)
   unsigned firstFrameMs = 1000, frameMs = 200, pollUs = 100, lateMs = 100;
+  unsigned staleUs = 1000;        // a BUF_DONE this soon after stream-on or the previous frame is stale, not a frame (30 fps: 33 ms)
   unsigned gain = 64;             // the rear's analogue gain code (32 = 1x; piano-camera-gain)
   int stopAt = 0;                 // piano-camera-stop: power down after this step (300..331)
 };
@@ -108,6 +117,11 @@ struct FrameStats {
   bool guardIntact = false;
   uint32_t guardFirstBad = 0;   // offset into the guard of its first changed byte (when not intact)
   uint8_t head[32] = {};
+  // The first rows' bytes (rows 0..3 and the last, at the stride found): each row's first 16 bytes and how many of its bytes per line
+  // (bpl) are not the fill: a row the write master never reached reads 0 of bpl.
+  unsigned rowIndex[5] = {};
+  uint8_t rowHead[5][16] = {};
+  uint32_t rowNonzero[5] = {};
 };
 
 struct StreamResult {
@@ -123,13 +137,25 @@ struct StreamResult {
   uint32_t csidVersion = 0, tfeVersion = 0, phyVersion = 0;
   uint8_t settle = 0;
   unsigned tableWrites = 0, controlWrites = 0, phyWritten = 0, phySkipped = 0;
-  unsigned bufDone = 0, sof = 0, eof = 0, rupDone = 0, lateFrames = 0, polls = 0;
+  unsigned bufDone = 0, sof = 0, eof = 0, rupDone = 0, lateFrames = 0, polls = 0, staleBufDone = 0;
   uint32_t topOr = 0, bufOr = 0, rxOr = 0, rdiOr = 0;
+  uint32_t preTop = 0, preBuf = 0, preRx = 0, preRdi = 0;   // the status words just before stream-on (then cleared)
+  // Per frame (up to kFrameLog): the time from stream-on of its SOF, EOF and BUF_DONE (the poll that saw them; 0: not seen), the
+  // RDI0 and CSI2 RX words seen since the previous frame.
+  static constexpr unsigned kFrameLog = 8;
+  uint64_t sofUs[kFrameLog] = {}, eofUs[kFrameLog] = {}, bufUs[kFrameLog] = {};
+  uint32_t frameRdi[kFrameLog] = {}, frameRx[kFrameLog] = {};
+  uint32_t rxFirst = 0, rdiErrFirst = 0;       // the first nonzero CSI2 RX word and the first RDI0 error bits
+  uint64_t rxFirstUs = 0, rdiErrFirstUs = 0;
+  bool phyFirstRead = false;
+  uint32_t phyStatusFirst[11] = {};            // the CSIPHY's status words at the first frame (or the stream's end without one)
   uint32_t phyStatus[11] = {};
   uint64_t firstFrameUs = 0, lastIntervalUs = 0, streamUs = 0;
   unsigned writes = 0, quietWrites = 0, refusedStores = 0, offWarnings = 0;
   uint32_t lastValue = 0;
   iova::Fault fault;            // the window's bank before its release (FSR nonzero: the write master went outside the buffer)
+  bool faultRead = false;
+  Release release;              // what the window's release kept (CameraSmmu.h)
   FrameStats stats;
   SensorResult sensor;
 };
@@ -168,6 +194,14 @@ inline void frameStats(const uint8_t *buf, uint64_t bytes, uint32_t frameBytes, 
       break;
     }
   memcpy(s.head, buf, sizeof s.head);
+  for (unsigned k = 0; k < 5; ++k) {
+    const unsigned y = k < 4 ? k : (height ? height - 1 : 0);
+    s.rowIndex[k] = y;
+    const uint64_t at = uint64_t(y) * s.stride;
+    if (at + s.bpl > frameBytes) continue;
+    memcpy(s.rowHead[k], buf + at, s.bpl < 16 ? s.bpl : 16);
+    for (uint32_t i = 0; i < s.bpl; ++i) s.rowNonzero[k] += buf[at + i] != 0;
+  }
   uint64_t bandSum[8][4] = {}, bandCount[8][4] = {};
   for (unsigned y = 0; y < height; ++y) {
     const uint8_t *line = buf + uint64_t(y) * s.stride;
@@ -207,6 +241,82 @@ inline const CameraTableMode *tableMode(const char *sensor, unsigned width, unsi
   return nullptr;
 }
 
+// Bytes as hex digits (no printf in the portable part: the kernel and the host tests format the rest).
+inline const char *hexBytes(char *out, const uint8_t *p, unsigned n)
+{
+  static const char digits[] = "0123456789abcdef";
+  for (unsigned i = 0; i < n; ++i) {
+    out[2 * i] = digits[p[i] >> 4];
+    out[2 * i + 1] = digits[p[i] & 15u];
+  }
+  out[2 * n] = 0;
+  return out;
+}
+
+// Everything level 3 found, through ops.note: Stream::run logs it after the statistics and before its power-down, so that a fault in
+// the power-down cannot lose it (c3rp/c3r, 2026-11-12, lost every line, the chip ID's too); the kernel adds the power-down's lines.
+template <class O>
+inline void reportStream(O &ops, const StreamResult &r, bool pattern, unsigned gain)
+{
+  const SensorFacts &f = kSensors[r.which == Sensor::rear ? 0 : 1];
+  const uint32_t bpl = raw10Bytes(r.width), padded = (bpl + 15u) & ~15u;
+  if (r.failedStep)
+    ops.note("level 3 (before the power-down): %s %s %ux%u RAW10: FAILED at step %d: %s%s%s", f.name, f.part, r.width, r.height,
+             -r.failedStep, streamFailureName(r.failure), r.why ? ": " : "", r.why ? r.why : "");
+  else
+    ops.note("level 3 (before the power-down): %s %s %ux%u RAW10: %u frame(s) collected", f.name, f.part, r.width, r.height, r.bufDone);
+  ops.note("route: %s (%s); bus %#llx -> pa %#llx, %llu bytes (frame %u = %u x %u + a guard)", routeName(r.route), r.routeWhy ? r.routeWhy : "-",
+           (unsigned long long)r.busAddr, (unsigned long long)r.pa, (unsigned long long)r.bytes, r.frameBytes, padded, r.height);
+  ops.note("versions: csid-lite0 %08x tfe-lite0 %08x csiphy%u %08x; settle %u; lane table %u written, %u skipped; sensor %u table writes, "
+           "%u controls (pattern %u, gain %u)",
+           r.csidVersion, r.tfeVersion, f.csiphy, r.phyVersion, r.settle, r.phyWritten, r.phySkipped, r.tableWrites, r.controlWrites,
+           pattern ? 1u : 0u, gain);
+  if (!r.streamed) return;
+  ops.note("stream: before stream-on: top %08x buf-done %08x csi2-rx %08x rdi0 %08x (cleared)", r.preTop, r.preBuf, r.preRx, r.preRdi);
+  ops.note("stream: %u frame(s) (BUF_DONE) in %llu us: the first after %llu us, the last interval %llu us; SOF %u EOF %u RUP_DONE %u; "
+           "stale BUF_DONE %u; late %u; %u polls",
+           r.bufDone, (unsigned long long)r.streamUs, (unsigned long long)r.firstFrameUs, (unsigned long long)r.lastIntervalUs, r.sof,
+           r.eof, r.rupDone, r.staleBufDone, r.lateFrames, r.polls);
+  for (unsigned i = 0; i < r.bufDone && i < StreamResult::kFrameLog; ++i)
+    ops.note("stream: frame %u: SOF +%llu us, EOF +%llu us, BUF_DONE +%llu us; rdi0 %08x csi2-rx %08x since the frame before", i + 1,
+             (unsigned long long)r.sofUs[i], (unsigned long long)r.eofUs[i], (unsigned long long)r.bufUs[i], r.frameRdi[i], r.frameRx[i]);
+  ops.note("irq seen: top %08x buf-done %08x csi2-rx %08x rdi0 %08x (error bits %08x); first csi2-rx word %08x at +%llu us, first rdi0 "
+           "error %08x at +%llu us",
+           r.topOr, r.bufOr, r.rxOr, r.rdiOr, r.rdiOr & kRdiErrors, r.rxFirst, (unsigned long long)r.rxFirstUs, r.rdiErrFirst,
+           (unsigned long long)r.rdiErrFirstUs);
+  for (unsigned k = 0; k < 2; ++k) {
+    const uint32_t *w = k ? r.phyStatus : r.phyStatusFirst;
+    if (!k && !r.phyFirstRead) continue;
+    ops.note("csiphy%u status 0-10 %s: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", f.csiphy,
+             k ? "at the end" : "at the first frame", w[0] & 0xff, w[1] & 0xff, w[2] & 0xff, w[3] & 0xff,
+             w[4] & 0xff, w[5] & 0xff, w[6] & 0xff, w[7] & 0xff, w[8] & 0xff, w[9] & 0xff, w[10] & 0xff);
+  }
+  if (r.faultRead)
+    ops.note("smmu: the window's bank FSR %08x FAR %08x%08x FSYNR0 %08x GFSR %08x (%s)", r.fault.fsr, r.fault.farHi, r.fault.farLo,
+             r.fault.fsynr0, r.fault.gfsr, (r.fault.fsr & iova::kFsrFaults) ? "a fault: the write master left the buffer" : "no fault");
+  const FrameStats &s = r.stats;
+  if (!s.done) return;
+  ops.note("frame: written %llu bytes (%u unpadded, %u padded lines), stride %u; guard %s", (unsigned long long)s.written, bpl * r.height,
+           padded * r.height, s.stride, s.guardIntact ? "intact" : "DAMAGED");
+  if (!s.guardIntact) ops.note("frame: the guard's first changed byte at +%u: the write master wrote past the frame", s.guardFirstBad);
+  static const char *const pos[4] = {"r0c0", "r0c1", "r1c0", "r1c1"};
+  for (unsigned p = 0; p < 4; ++p)
+    ops.note("frame: %s min %u mean %u max %u; histogram (128 a bin) %u %u %u %u %u %u %u %u", pos[p], s.ch[p].min, s.ch[p].mean(), s.ch[p].max,
+             s.ch[p].hist[0], s.ch[p].hist[1], s.ch[p].hist[2], s.ch[p].hist[3], s.ch[p].hist[4], s.ch[p].hist[5], s.ch[p].hist[6],
+             s.ch[p].hist[7]);
+  // (each line under 240 characters: the console cuts a line at 255 with its prefix, and loses its newline: c3r's camcc lines)
+  ops.note("frame: bands r0c0/r0c1/r1c0/r1c1: b0 %u/%u/%u/%u b1 %u/%u/%u/%u b2 %u/%u/%u/%u b3 %u/%u/%u/%u "
+           "b4 %u/%u/%u/%u b5 %u/%u/%u/%u b6 %u/%u/%u/%u b7 %u/%u/%u/%u",
+           s.band[0][0], s.band[0][1], s.band[0][2], s.band[0][3], s.band[1][0], s.band[1][1], s.band[1][2], s.band[1][3], s.band[2][0],
+           s.band[2][1], s.band[2][2], s.band[2][3], s.band[3][0], s.band[3][1], s.band[3][2], s.band[3][3], s.band[4][0], s.band[4][1],
+           s.band[4][2], s.band[4][3], s.band[5][0], s.band[5][1], s.band[5][2], s.band[5][3], s.band[6][0], s.band[6][1], s.band[6][2],
+           s.band[6][3], s.band[7][0], s.band[7][1], s.band[7][2], s.band[7][3]);
+  char hex[2 * 32 + 1];
+  ops.note("frame: first %u bytes %s", unsigned(sizeof s.head), hexBytes(hex, s.head, sizeof s.head));
+  for (unsigned k = 0; k < 5; ++k)
+    ops.note("frame: row %u: %u of %u bytes not the fill; first 16 %s", s.rowIndex[k], s.rowNonzero[k], s.bpl, hexBytes(hex, s.rowHead[k], 16));
+}
+
 template <class O>
 class Stream {
  public:
@@ -236,6 +346,11 @@ class Stream {
     } else if (u_.streaming || u_.wm) {
       stop();
     }
+    if (u_.route) {   // the window's bank while it is live (FSR nonzero: the write master went outside the buffer)
+      r_.fault = iova::fault(plan_.window, [this](uint32_t off) { return ops.rd(kSmmu + off); });
+      r_.faultRead = true;
+    }
+    reportStream(ops, r_, opt.pattern, opt.gain);   // before the power-down: nothing found is lost if it goes wrong
     down();
     r_.sensor = s.result();
     r_.ok = !r_.failedStep && r_.bufDone >= opt.frames && r_.stats.done && r_.stats.guardIntact && !(r_.fault.fsr & iova::kFsrFaults) &&
@@ -335,6 +450,11 @@ class Stream {
   {
     ops.step(kStepL3Sensor, "the sensor: level 2's power-up and chip ID (TITAN_TOP, CAMCC's domains, the rear's MCLK at 24 MHz)");
     if (!s.begin(which, loader, pmic, so, survey)) return fail(kStepL3Sensor, StreamFailure::sensor, failureName(s.result().failure));
+    {   // the chip ID now (level 2's line comes after the power-down: c3rp/c3r never printed it)
+      const SensorResult &id = s.result();
+      ops.note("%s %s: chip ID %#06x (expected %#06x): OK over %s after %u tr%s; MCLK %u Hz", f_->name, f_->part, id.id, f_->idValue, id.bus,
+               id.tries, id.tries == 1 ? "y" : "ies", id.mclkHz);
+    }
     if (!s.ownsTitan()) return fail(kStepL3Sensor, StreamFailure::refused, "TITAN_TOP was already on (someone else's CAMSS)");
     if (stopHere(kStepL3Sensor)) return false;
 
@@ -379,12 +499,23 @@ class Stream {
     ops.step(kStepL3Versions, "CSID-lite0 and TFE-lite0 HW_VERSION");
     r_.csidVersion = ops.rd(kCsidLite0);
     r_.tfeVersion = ops.rd(kTfeLite0);
+    ops.note("csid-lite0 HW_VERSION %08x, tfe-lite0 HW_VERSION %08x", r_.csidVersion, r_.tfeVersion);
     if (stopHere(kStepL3Versions)) return false;
 
-    ops.step(kStepL3Smmu, "the SMMU route of stream 0x1c00 (as the boot chain left it, else our window)");
+    ops.step(kStepL3Smmu, "the SMMU route of stream 0x1c00 on apps_smmu 0x15000000 (as the boot chain left it, else our window)");
     plan_ = planRoute(kSmmuBytes, [this](uint32_t off) { return ops.rd(kSmmu + off); });
     r_.route = plan_.route;
     r_.routeWhy = plan_.why;
+    if (plan_.route == Route::window) {   // what the release puts back (CameraSmmu.h: only what this SMMU accepts)
+      ops.note("smmu: window: group %u (found smr %08x s2cr %08x%s), bank %u of %u (found sctlr %08x cbar %08x%s cba2r %08x; tcr %08x "
+               "ttbr0 %08x%08x mair0 %08x)",
+               plan_.slot, plan_.foundSmr, plan_.foundS2cr, s2crRestorable(plan_.foundS2cr, plan_.window.banks) ? "" : ": not restorable",
+               plan_.bank, plan_.window.banks, plan_.foundSctlr, plan_.foundCbar, cbarRestorable(plan_.foundCbar, plan_.window.idr0) ? "" : ": not restorable",
+               plan_.foundCba2r, plan_.foundBank[1], plan_.foundBank[3], plan_.foundBank[2], plan_.foundBank[7]);
+    } else {
+      ops.note("smmu: route %s (%s): group %u smr %08x s2cr %08x", routeName(plan_.route), plan_.why ? plan_.why : "-", plan_.slot,
+               plan_.smr, plan_.s2cr);
+    }
     if (plan_.route == Route::refused) return fail(kStepL3Smmu, StreamFailure::refused, plan_.why);
     if (stopHere(kStepL3Smmu)) return false;
 
@@ -600,7 +731,24 @@ class Stream {
           !control(kS5kTestPattern, 2, opt.pattern ? 2u : 0u))
         return false;
     }
-    if (stopHere(kStepL3Sensor2)) return false;
+    if (stopHere(kStepL3Sensor2)) {
+      ops.note("stopped before stream-on (piano-camera-stop=%d): the tables and controls written, the stream-on table not", opt.stopAt);
+      return false;
+    }
+    // What CSID-lite0 holds before any frame (a BUF_DONE or error set now is not the sensor's), logged and cleared, so the stream
+    // counts only what comes after stream-on.
+    const uint64_t c = kCsidLite0;
+    r_.preTop = ops.rd(c + kCsidTopStatus);
+    r_.preBuf = ops.rd(c + kCsidBufStatus);
+    r_.preRx = ops.rd(c + kCsidRxStatus);
+    r_.preRdi = ops.rd(c + kCsidRdiStatus);
+    if (r_.preTop | r_.preBuf | r_.preRx | r_.preRdi) {
+      putQuiet(c + kCsidTopClear, r_.preTop);
+      putQuiet(c + kCsidBufClear, r_.preBuf);
+      putQuiet(c + kCsidRxClear, r_.preRx);
+      putQuiet(c + kCsidRdiClear, r_.preRdi);
+      putQuiet(c + kCsidIrqCmd, 1);
+    }
     u_.streaming = true;
     if (!section("on", nullptr)) return false;
     r_.streamed = true;
@@ -608,22 +756,44 @@ class Stream {
   }
 
   // ------------------------------------------------------------------------------------------------------------- stream
+  // Every poll reads the four status words (each cleared once seen), so nothing set between polls is lost; a frame is a BUF_DONE of
+  // RDI0 at least opt.staleUs after stream-on and after the previous frame (a stale one is counted apart and ends nothing). Bounded:
+  // the first frame within firstFrameMs, each next within frameMs, all within timeoutMs.
   void stream()
   {
-    ops.step(kStepL3Stream, "the stream: BUF_DONE polled, the write master re-armed after each frame");
+    ops.step(kStepL3Stream, "the stream: SOF/EOF/BUF_DONE polled, the write master re-armed after each frame");
     const uint64_t c = kCsidLite0, wm = kTfeLite0 + kWm0;
     const uint64_t t0 = ops.nowUs(), deadline = t0 + uint64_t(opt.timeoutMs) * 1000;
     uint64_t frameDeadline = t0 + uint64_t(opt.firstFrameMs) * 1000, last = t0;
+    uint32_t rdiSince = 0, rxSince = 0;
+    unsigned sofLogged = 0, eofLogged = 0;
     while (r_.bufDone < opt.frames) {
       ++r_.polls;
       const uint32_t top = ops.rd(c + kCsidTopStatus), buf = ops.rd(c + kCsidBufStatus), rx = ops.rd(c + kCsidRxStatus),
                      rdi = ops.rd(c + kCsidRdiStatus);
+      const uint64_t now = ops.nowUs(), at = now - t0;
       r_.topOr |= top;
       r_.bufOr |= buf;
       r_.rxOr |= rx;
       r_.rdiOr |= rdi;
-      if (rdi & kRdiInputSof) ++r_.sof;
-      if (rdi & kRdiInputEof) ++r_.eof;
+      rdiSince |= rdi;
+      rxSince |= rx;
+      if (rx && !r_.rxFirst) {
+        r_.rxFirst = rx;
+        r_.rxFirstUs = at;
+      }
+      if ((rdi & kRdiErrors) && !r_.rdiErrFirst) {
+        r_.rdiErrFirst = rdi & kRdiErrors;
+        r_.rdiErrFirstUs = at;
+      }
+      if (rdi & kRdiInputSof) {
+        ++r_.sof;
+        if (sofLogged < StreamResult::kFrameLog && sofLogged <= r_.bufDone) r_.sofUs[sofLogged++] = at;
+      }
+      if (rdi & kRdiInputEof) {
+        ++r_.eof;
+        if (eofLogged < StreamResult::kFrameLog && eofLogged <= r_.bufDone) r_.eofUs[eofLogged++] = at;
+      }
       if (rdi & kRdiRupDone) {
         ++r_.rupDone;
         rup_ &= ~(kCsidRupRdi0 | kCsidAupRdi0);   // the hardware consumed them (the driver clears its copy here)
@@ -635,19 +805,35 @@ class Stream {
         putQuiet(c + kCsidRdiClear, rdi);
         putQuiet(c + kCsidIrqCmd, 1);
       }
-      const uint64_t now = ops.nowUs();
       if (buf & kCsidBufRdi0) {
-        ++r_.bufDone;
-        if (r_.bufDone == 1) r_.firstFrameUs = now - t0;
-        else r_.lastIntervalUs = now - last;
-        last = now;
-        frameDeadline = now + uint64_t(opt.frameMs) * 1000;
-        if (r_.bufDone < opt.frames) {   // the same buffer again (only the last frame is analysed)
-          putQuiet(wm + kWmImageAddr, uint32_t(r_.busAddr >> 8));
-          rup_ |= kCsidAupRdi0;
-          putQuiet(c + kCsidRupAup, rup_);
+        if (now - last < opt.staleUs) {   // too soon after stream-on or the last frame: not a frame of the sensor's
+          ++r_.staleBufDone;
+        } else {
+          const unsigned i = r_.bufDone++;
+          if (i < StreamResult::kFrameLog) {
+            r_.bufUs[i] = at;
+            r_.frameRdi[i] = rdiSince;
+            r_.frameRx[i] = rxSince;
+          }
+          rdiSince = rxSince = 0;
+          if (sofLogged < r_.bufDone) sofLogged = r_.bufDone;   // keep the per-frame columns aligned when an SOF was not seen
+          if (eofLogged < r_.bufDone) eofLogged = r_.bufDone;
+          if (r_.bufDone == 1) {
+            r_.firstFrameUs = at;
+            readPhyStatus(r_.phyStatusFirst);
+            r_.phyFirstRead = true;
+          } else {
+            r_.lastIntervalUs = now - last;
+          }
+          last = now;
+          frameDeadline = now + uint64_t(opt.frameMs) * 1000;
+          if (r_.bufDone < opt.frames) {   // the same buffer again (only the last frame is analysed)
+            putQuiet(wm + kWmImageAddr, uint32_t(r_.busAddr >> 8));
+            rup_ |= kCsidAupRdi0;
+            putQuiet(c + kCsidRupAup, rup_);
+          }
+          continue;
         }
-        continue;
       }
       if (now >= frameDeadline || now >= deadline) {
         fail(kStepL3Stream, r_.bufDone ? StreamFailure::frameTimeout : StreamFailure::noFrame);
@@ -656,7 +842,11 @@ class Stream {
       ops.udelay(opt.pollUs);
     }
     r_.streamUs = ops.nowUs() - t0;
-    for (unsigned n = 0; n < 11; ++n) r_.phyStatus[n] = ops.rd(status(n));
+    readPhyStatus(r_.phyStatus);
+  }
+  void readPhyStatus(uint32_t *w)
+  {
+    for (unsigned n = 0; n < 11; ++n) w[n] = ops.rd(status(n));
   }
 
   // The write master first (nothing more reaches memory), then RDI0, the PHY's lanes, the sensor; late frames counted.
@@ -707,9 +897,36 @@ class Stream {
   }
 
   // ---------------------------------------------------------------------------------------------------------------- down
+  // Nothing is touched after its clock, power or vote is gone (c3rp/c3r): the SMMU window first, while the camera NoC is still voted
+  // (MM1) and clocked (GCC's HF AXI, the CAMNOC branches): its release ends with the TLB invalidate and sync, which reach the camera's
+  // TBU (inferred); the write master and CSID-lite0 were stopped and left idle for opt.lateMs by stop(). Then the clocks in reverse,
+  // PLL0, HF AXI, MM1; then level 2's power-down (the sensor's bus, TITAN_TOP collapsed, the MCLK, the rails, GCC, CAMCC's domains).
   void down()
   {
-    ops.step(kStepL3Down, "power down (reverse order, only what level 3 changed), then level 2's");
+    ops.step(kStepL3Down, "power down: the SMMU window first (MM1 and the camera NoC's clocks on), the clocks, PLL0, HF AXI, MM1, then "
+                          "level 2's");
+    if (u_.route) {
+      unsigned spins = 0;
+      r_.release = releaseRoute(plan_, [this](uint32_t off) { return ops.rd(kSmmu + off); },
+                                [this](uint32_t off, uint32_t v) { put(kSmmu + off, v, "SMMU: the window released"); },
+                                [this, &spins]() {
+                                  ops.udelay(1);
+                                  return ++spins > 10000;
+                                });
+      if (r_.release.s2crKept)
+        ops.note("smmu: group %u's S2CR left at fault (%08x): the found %08x is not a configuration of this SMMU (%u banks)", plan_.slot,
+                 r_.release.s2cr, plan_.foundS2cr, plan_.window.banks);
+      if (r_.release.cbarKept)
+        ops.note("smmu: bank %u's CBAR/CBA2R left at %08x/%08x (stage 1, translation off): the found %08x/%08x is a context type "
+                 "this SMMU lacks (IDR0 %08x)",
+                 plan_.bank, r_.release.cbar, r_.release.cba2r, plan_.foundCbar, plan_.foundCba2r, plan_.window.idr0);
+      if (r_.release.error) {
+        ++r_.offWarnings;
+        ops.note("smmu: release: %s", r_.release.error);
+      } else {
+        u_.route = false;
+      }
+    }
     bool ifeLiteOff = true;
     for (unsigned i = kL3BranchCount; i-- > 0;) {
       if (!u_.branch[i]) continue;
@@ -736,22 +953,6 @@ class Stream {
     if (u_.mm1) {
       if (ops.mmBus(false)) ++r_.offWarnings;
       else u_.mm1 = false;
-    }
-    if (u_.route) {
-      r_.fault = iova::fault(plan_.window, [this](uint32_t off) { return ops.rd(kSmmu + off); });
-      unsigned spins = 0;
-      const char *e = releaseRoute(plan_, [this](uint32_t off) { return ops.rd(kSmmu + off); },
-                                   [this](uint32_t off, uint32_t v) { put(kSmmu + off, v, "SMMU: the window released"); },
-                                   [this, &spins]() {
-                                     ops.udelay(1);
-                                     return ++spins > 10000;
-                                   });
-      if (e) {
-        ++r_.offWarnings;
-        ops.note("smmu: release: %s", e);
-      } else {
-        u_.route = false;
-      }
     }
     s.end();   // level 2's power-down: the sensor, its bus, TITAN_TOP collapsed, the MCLK, the rails, GCC, CAMCC's domains
     if (u_.dma) {

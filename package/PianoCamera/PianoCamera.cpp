@@ -17,7 +17,8 @@
 //                   (1..8, 2), piano-camera-pattern=0|1 (the rear's colour bars, 1), piano-camera-timeout-ms=MS (500..10000, 3000),
 //                   piano-camera-gain=CODE (32..2048, 64), piano-camera-mclk24 (1 here), piano-camera-stop=3xx.
 // Without piano-camera the driver declines in probe() and maps nothing. Levels 4-5 (the software ISP, the macOS camera device) are
-// designed in camera.md, not built. piano-camera-votes=0 (levels 2-3: no shared votes; level 3 always votes), piano-camera-mmcx-floor.
+// designed in camera.md, not built. piano-camera-votes=0 (levels 2-3: no shared votes; level 3 always votes), piano-camera-mmcx-floor,
+// piano-camera-camss=0 (level 2: TITAN_TOP only for the rear over CCI0, not as the sensors' power domain; level 3 always powers it).
 // Other arguments: piano-camera-sensor=1 rear | 2 front | 3 both (default 3, rear first), piano-camera-rear-bus=1 (software I2C on
 // gpio115/116 instead of CCI0), piano-camera-mclk24=1 (the rear's MCLK at 24 MHz from the MCLK PLL), piano-camera-cci-khz=100|400,
 // piano-camera-i2c-half-us=N (2..50, default 5), piano-camera-pull=1, piano-camera-blind=1, piano-camera-hold=MS (0..10000),
@@ -63,7 +64,7 @@ constexpr uint32_t kTag = 0x43414d31u;   // "CAM1" in the lock words
 struct Args {
   uint32_t level, sensor, rearBus, mclk24, cciKhz, halfUs, pull, blind, hold, stop, cycles, delay;
   uint32_t cc, mclkcc, blocks, qup, spmi, smmu;
-  uint32_t votes, mmcxFloor;
+  uint32_t votes, mmcxFloor, camss;
   uint32_t frames, pattern, timeoutMs, gain;
 };
 Args gArgs;
@@ -97,6 +98,7 @@ void readArgs()
   gArgs.spmi = bootArg("piano-camera-spmi", 1);
   gArgs.smmu = bootArg("piano-camera-smmu", 1);
   gArgs.votes = bootArg("piano-camera-votes", 1) ? 1 : 0;
+  gArgs.camss = bootArg("piano-camera-camss", 1) ? 1 : 0;   // level 2: TITAN_TOP for either sensor (the sensors' DT power domain)
   gArgs.mmcxFloor = clampArg(bootArg("piano-camera-mmcx-floor", kCamMmcxFloor), 0, 0x1000);
   gArgs.frames = clampArg(bootArg("piano-camera-frames", 2), 1, 8);
   gArgs.pattern = bootArg("piano-camera-pattern", 1) ? 1 : 0;
@@ -421,6 +423,38 @@ const char *branchWord(uint32_t v)
   return branchHwGated(v) ? "off (hardware-gated)" : "off";
 }
 
+// Items joined into lines of at most ~200 characters, each line under its title (a continuation says "(cont.)").
+class Lines {
+ public:
+  explicit Lines(const char *title) : title_(title) {}
+  void add(const char *fmt, ...) __attribute__((format(printf, 2, 3)))
+  {
+    char item[120];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(item, sizeof item, fmt, ap);
+    va_end(ap);
+    const size_t len = strlen(item);
+    if (n_ && n_ + 2 + len > kWidth) flush();
+    n_ += snprintf(line_ + n_, sizeof line_ - n_, "%s%s", n_ ? ", " : "", item);
+  }
+  void flush()
+  {
+    if (!n_) return;
+    note("%s%s: %s", title_, parts_ ? " (cont.)" : "", line_);
+    ++parts_;
+    n_ = 0;
+    line_[0] = 0;
+  }
+
+ private:
+  static constexpr size_t kWidth = 190;
+  const char *title_;
+  char line_[kWidth + 130] = {};
+  size_t n_ = 0;
+  unsigned parts_ = 0;
+};
+
 // GCC's camera branches, the two clock controllers, the CAMSS blocks and CCI0 (level 1's survey; again after level 2's step 201).
 void reportControllers(const Survey &s)
 {
@@ -435,26 +469,21 @@ void reportControllers(const Survey &s)
   if (!c.read) {
     note("camcc: not read (%s)", c.why);
   } else {
-    char line[360];
-    int n = 0;
-    for (unsigned i = 0; i < kCcGdscCount && n < int(sizeof line) - 40; ++i)
-      n += snprintf(line + n, sizeof line - n, "%s%s %08x/%08x (%s)", i ? ", " : "", kCcGdscs[i].name, c.gdsc[i].gdscr, c.gdsc[i].cfg,
-                    gdscOn(c.gdsc[i].gdscr) ? "ON" : "off");
-    note("camcc gdsc: %s", line);
-    n = 0;
-    for (unsigned i = 0; i < kCcBranchCount && n < int(sizeof line) - 32; ++i)
-      n += snprintf(line + n, sizeof line - n, "%s%s %08x", i ? " " : "", kCcBranches[i].name, c.branch[i]);
-    note("camcc branches: %s", line);
-    n = 0;
-    for (unsigned i = 0; i < kCcRcgCount && n < int(sizeof line) - 48; ++i)
-      n += snprintf(line + n, sizeof line - n, "%s%s %08x/%08x src %u%s", i ? ", " : "", kCcRcgs[i].name, c.rcg[i].cmd, c.rcg[i].cfg,
-                    rcgSource(c.rcg[i].cfg), c.rcg[i].rootOff ? " root-off" : "");
-    note("camcc rcgs: %s", line);
-    n = 0;
-    for (unsigned p = 0; p < kCcPllCount && n < int(sizeof line) - 48; ++p)
-      n += snprintf(line + n, sizeof line - n, "%spll%u mode %08x op %x L %#x (%s)", p ? ", " : "", p, c.pllMode[p], c.pllOpmode[p],
-                    c.pllL[p], pllRunning(c.pllMode[p], c.pllOpmode[p]) ? "RUNNING" : pllLocked(c.pllMode[p]) ? "locked" : "off");
-    note("camcc plls: %s", line);
+    // Lines of at most ~200 characters: the console cuts a line at 255 with its prefix and loses its newline (c3r, 2026-11-12: the
+    // branches, RCGs and PLLs ran into one cut line).
+    Lines gdsc("camcc gdsc"), branches("camcc branches"), rcgs("camcc rcgs"), plls("camcc plls");
+    for (unsigned i = 0; i < kCcGdscCount; ++i)
+      gdsc.add("%s %08x/%08x (%s)", kCcGdscs[i].name, c.gdsc[i].gdscr, c.gdsc[i].cfg, gdscOn(c.gdsc[i].gdscr) ? "ON" : "off");
+    gdsc.flush();
+    for (unsigned i = 0; i < kCcBranchCount; ++i) branches.add("%s %08x", kCcBranches[i].name, c.branch[i]);
+    branches.flush();
+    for (unsigned i = 0; i < kCcRcgCount; ++i)
+      rcgs.add("%s %08x/%08x src %u%s", kCcRcgs[i].name, c.rcg[i].cmd, c.rcg[i].cfg, rcgSource(c.rcg[i].cfg), c.rcg[i].rootOff ? " root-off" : "");
+    rcgs.flush();
+    for (unsigned p = 0; p < kCcPllCount; ++p)
+      plls.add("pll%u mode %08x op %x L %#x (%s)", p, c.pllMode[p], c.pllOpmode[p], c.pllL[p],
+               pllRunning(c.pllMode[p], c.pllOpmode[p]) ? "RUNNING" : pllLocked(c.pllMode[p]) ? "locked" : "off");
+    plls.flush();
   }
   const MclkState &m = s.mclk;
   if (!m.read) {
@@ -745,7 +774,7 @@ void reportResult(const SensorResult &r)
     const RailRecord &x = r.rails[i];
     note("%s rail %s (%s): found %u mV en %02x; on %u mV en %02x status %02x; off en %02x%s", f.name, kRails[first + i].supply,
          kRails[first + i].cmdDb, x.found.mv, x.found.en, x.on.mv, x.on.en, x.on.status, x.off.en,
-         x.voted ? (x.ours ? "" : " (vote failed)") : " (not voted: found on)");
+         x.voted ? (x.ours ? "" : " (vote failed)") : x.found.found ? " (not voted: found on)" : " (not reached)");
   }
   note("%s: %u writes logged, %u software I2C line changes, %u refused, %u off-side warnings; power down %s", f.name, r.writes,
        r.quietWrites, r.refusedStores, r.offWarnings, r.cleanOff ? "complete (everything as found)" : "INCOMPLETE");
@@ -757,50 +786,19 @@ void reportResult(const SensorResult &r)
 
 // ---------------------------------------------------------------------------------------------------------------- level 3
 char gL3[240];
+// After the power-down: the verdict and the power-down's line (everything the stream found was logged before the power-down by
+// Stream::run, CameraStream.h reportStream).
 void reportStream(const StreamResult &r)
 {
   const SensorFacts &f = kSensors[r.which == Sensor::rear ? 0 : 1];
-  const uint32_t bpl = raw10Bytes(r.width), padded = (bpl + 15u) & ~15u;
+  const FrameStats &s = r.stats;
   if (r.failedStep)
     note("level 3: %s %s %ux%u RAW10: FAILED at step %d: %s%s%s", f.name, f.part, r.width, r.height, -r.failedStep,
          streamFailureName(r.failure), r.why ? ": " : "", r.why ? r.why : "");
   else
-    note("level 3: %s %s %ux%u RAW10: %s", f.name, f.part, r.width, r.height, r.ok ? "OK" : "streamed, but see the checks below");
-  note("route: %s (%s); bus %#llx -> pa %#llx, %llu bytes (frame %u = %u x %u + a guard)", routeName(r.route), r.routeWhy ? r.routeWhy : "-",
-       (unsigned long long)r.busAddr, (unsigned long long)r.pa, (unsigned long long)r.bytes, r.frameBytes, padded, r.height);
-  note("versions: csid-lite0 %08x tfe-lite0 %08x csiphy%u %08x; settle %u; lane table %u written, %u skipped; sensor %u table writes, %u "
-       "controls (pattern %u, gain %u)",
-       r.csidVersion, r.tfeVersion, f.csiphy, r.phyVersion, r.settle, r.phyWritten, r.phySkipped, r.tableWrites, r.controlWrites,
-       gArgs.pattern, gArgs.gain);
-  note("stream: %u frame(s) (BUF_DONE) in %llu us: the first after %llu us, the last interval %llu us; SOF %u EOF %u RUP_DONE %u; late %u; "
-       "%u polls",
-       r.bufDone, (unsigned long long)r.streamUs, (unsigned long long)r.firstFrameUs, (unsigned long long)r.lastIntervalUs, r.sof, r.eof,
-       r.rupDone, r.lateFrames, r.polls);
-  note("irq seen: top %08x buf-done %08x csi2-rx %08x rdi0 %08x (error bits %08x)", r.topOr, r.bufOr, r.rxOr, r.rdiOr, r.rdiOr & kRdiErrors);
-  note("csiphy%u status 0-10: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", f.csiphy, r.phyStatus[0] & 0xff, r.phyStatus[1] & 0xff,
-       r.phyStatus[2] & 0xff, r.phyStatus[3] & 0xff, r.phyStatus[4] & 0xff, r.phyStatus[5] & 0xff, r.phyStatus[6] & 0xff,
-       r.phyStatus[7] & 0xff, r.phyStatus[8] & 0xff, r.phyStatus[9] & 0xff, r.phyStatus[10] & 0xff);
-  if (r.fault.fsr) note("smmu: the window's bank FSR %08x FAR %08x%08x FSYNR0 %08x GFSR %08x", r.fault.fsr, r.fault.farHi, r.fault.farLo,
-                        r.fault.fsynr0, r.fault.gfsr);
-  const FrameStats &s = r.stats;
-  if (s.done) {
-    note("frame: written %llu bytes (%u unpadded, %u padded lines), stride %u; guard %s", (unsigned long long)s.written, bpl * r.height,
-         padded * r.height, s.stride, s.guardIntact ? "intact" : "DAMAGED");
-    if (!s.guardIntact) note("frame: the guard's first changed byte at +%u: the write master wrote past the frame", s.guardFirstBad);
-    static const char *const pos[4] = {"r0c0", "r0c1", "r1c0", "r1c1"};
-    for (unsigned p = 0; p < 4; ++p)
-      note("frame: %s min %u mean %u max %u; histogram (128 a bin) %u %u %u %u %u %u %u %u", pos[p], s.ch[p].min, s.ch[p].mean(), s.ch[p].max,
-           s.ch[p].hist[0], s.ch[p].hist[1], s.ch[p].hist[2], s.ch[p].hist[3], s.ch[p].hist[4], s.ch[p].hist[5], s.ch[p].hist[6],
-           s.ch[p].hist[7]);
-    char line[360];
-    int n = 0;
-    for (unsigned b = 0; b < 8 && n < int(sizeof line) - 40; ++b)
-      n += snprintf(line + n, sizeof line - n, "%sb%u %u/%u/%u/%u", b ? " " : "", b, s.band[b][0], s.band[b][1], s.band[b][2], s.band[b][3]);
-    note("frame: eight vertical bands, mean r0c0/r0c1/r1c0/r1c1: %s", line);
-    n = 0;
-    for (unsigned i = 0; i < sizeof s.head && n < int(sizeof line) - 4; ++i) n += snprintf(line + n, sizeof line - n, "%02x", s.head[i]);
-    note("frame: first %u bytes %s", unsigned(sizeof s.head), line);
-  }
+    note("level 3: %s %s %ux%u RAW10: %s (%u frames, %u stale BUF_DONE; guard %s; window fault %s)", f.name, f.part, r.width, r.height,
+         r.ok ? "OK" : "streamed, but see the checks", r.bufDone, r.staleBufDone, s.done ? (s.guardIntact ? "intact" : "DAMAGED") : "not read",
+         (r.fault.fsr & iova::kFsrFaults) ? "YES" : "none");
   note("level 3: %u writes logged, %u quiet (the lane table, the stream's status clears), %u refused, %u off-side warnings; power down %s; "
        "buffer %s",
        r.writes, r.quietWrites, r.refusedStores, r.offWarnings, r.cleanOff ? "complete (everything as found)" : "INCOMPLETE",
@@ -840,10 +838,10 @@ bool PianoCamera::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
   note("start: piano-camera=%u sensor=%u rear-bus=%s mclk24=%u cci=%u kHz i2c-half=%u us pull=%u blind=%u hold=%u ms stop=%u cycles=%u "
-       "delay=%u s; survey cc=%u mclkcc=%u blocks=%u qup=%u spmi=%u smmu=%u; votes=%u mmcx-floor=%#x",
+       "delay=%u s; survey cc=%u mclkcc=%u blocks=%u qup=%u spmi=%u smmu=%u; votes=%u mmcx-floor=%#x camss=%u",
        gArgs.level, gArgs.sensor, gArgs.rearBus ? "gpio" : "cci", gArgs.mclk24, gArgs.cciKhz, gArgs.halfUs, gArgs.pull, gArgs.blind,
        gArgs.hold, gArgs.stop, gArgs.cycles, gArgs.delay, gArgs.cc, gArgs.mclkcc, gArgs.blocks, gArgs.qup, gArgs.spmi, gArgs.smmu,
-       gArgs.votes, gArgs.mmcxFloor);
+       gArgs.votes, gArgs.mmcxFloor, gArgs.camss);
   if (gArgs.level > 3) {
     note("piano-camera=%u: levels 4-5 are designed, not built (docs/drivers/camera.md section 4); running 3", gArgs.level);
     gArgs.level = 3;
@@ -929,6 +927,7 @@ void PianoCamera::run()
   po.holdMs = gArgs.hold;
   po.stopAt = int(gArgs.stop);
   po.votes = gArgs.votes != 0;
+  po.camss = gArgs.camss != 0;
   Ops ops;
   ops.survey = &s;
   if (gArgs.level == 3) {
