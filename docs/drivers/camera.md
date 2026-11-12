@@ -1,9 +1,11 @@
 # Cameras (B11): PianoCamera, the level ladder
 
-Status, 2026-11-12: **levels 1-3 built and host-tested** (`package/PianoCamera`, in the kext list, inert without `piano-camera`).
-Level 1 **ran on the tablet** (c1, §8.4: no hang, 0 stores; GCC's camera and MCLK-controller AHB branches off and hardware-gated, so
-neither clock controller was readable; no SMMU group for stream 0x1c00); levels 2 and 3 adjusted to it and **not run yet**. Levels
-4-5 designed (§4.4-4.5). The sensors' register tables and the CSIPHY's lane table are in the repository as data (`data/camera`,
+Status, 2026-11-12 (evening): **levels 1-3 built and host-tested** (`package/PianoCamera`, in the kext list, inert without
+`piano-camera`). On the tablet (§8.4): level 1 passed (c1); level 2 read the **rear's chip ID 0x38e1** over CCI0 at 19.2 and 24 MHz
+with a clean power-down (c2r, c2r24); the **front failed at its MCLK4** (c2f), fixed since (§4.2 "After c2f"); level 3 (c3rp, c3r)
+ran the whole rear path to stream-on and, by its timing, two frames, then **aborted in its power-down** at the SMMU window's release
+(an S2CR value the hypervisor-mediated SMMU refuses; the report, printed only after the power-down, was lost): fixed since (§4.3
+"After c3"), the next images in §8.1. Levels 4-5 designed (§4.4-4.5). The sensors' register tables and the CSIPHY's lane table are in the repository as data (`data/camera`,
 §11); the multimedia votes are shared with PianoVideo (`package/include/PianoMmVotes.h`, §4.3.1). Backlog item B11
 (`../BACKLOG-hardware.md`). Template: `README.md`.
 
@@ -28,13 +30,13 @@ facts as code, each with its source.
 | Clock controllers | CAMCC `ade0000` (0x20000; domains MMCX + MXC at low_svs; GCC's camera AHB `0x26004`), cambistmclkcc `1760000` (0x6000; MMCX + MX; GCC `0xa0004`). Linux keeps GCC `0x26004`, `0x26034` (camera XO), `0xa0004` on from GCC's probe (CLK_ENABLE only), and CAMCC's DRV AHB/XO, GDSC clock and sleep clock (`0x113c4/0x113c0/0x1137c/0x11398`) on from CAMCC's. **At XNU (c1)**: GCC `0x26004` = 0x88000002, `0x26034` = 0x88000000, `0xa0004` = 0x88000002: all three off (CLK_ENABLE clear), both AHBs with HW_CTL (hardware gating: CLK_OFF reads set while idle even when enabled, as the display's 0x88000003); HF/SF AXI 0x8a200000 off; neither controller readable at level 1 | DT, msm; tablet | verified (source); GCC state verified (c1); CAMCC/MCLK-CC: needs-boot (L2) |
 | GDSCs | TITAN_TOP `+0x1134c` (parent of all; CFG completion bits, RETAIN_FF), TFE0/1/2 `+0x11004/0x11084/0x110ec`; Linux's set-up: wait values 2/8/2, HW control and SW override off; on: un-collapse, POWER_UP_COMPLETE within 2 ms, 1 µs, RETAIN_FF | msm (`gdsc.c`) | verified (source) |
 | CAMCC PLL0 | Taycan ELU, 19.2 MHz × 62.5 = 1200 MHz (L 0x3e, alpha 0x8000); even /2 = 600, odd /3 = 400 MHz: the CSIPHY/CSID/TFE-lite sources (400 MHz = main /3), CAMNOC RT AXI 200 (even /3), slow AHB 80 (even /7.5). Every CAMCC source's selector 0 is the XO (19.2 MHz), the reset state | msm | verified (source) |
-| MCLKs | cambistmclkcc PLL0 Rivian ELU 960 MHz (L 0x32, CONFIG_CTL 0x12000000/0x00890263/0x1af04237); MCLK n RCG `+0x4000` + 0x1c·n, branch `+0x4018` + 0x1c·n; table 12 / 19.2 (XO) / 24 / 68.57 MHz; 24 MHz = PLL0 / 10 × 1/4 (source 3, CFG 0x2313, M 1, N reg 0xfc, D reg 0xfb). KDTS: rear MCLK1 24 MHz (gpio90 `cam_mclk`, 4 mA), front MCLK4 19.2 MHz (gpio93 `cam_aon_mclk4`, 2 mA) | msm, KDTS | verified (source) |
+| MCLKs | cambistmclkcc PLL0 Rivian ELU 960 MHz (L 0x32, CONFIG_CTL 0x12000000/0x00890263/0x1af04237); MCLK n RCG `+0x4000` + 0x1c·n, branch `+0x4018` + 0x1c·n; table 12 / 19.2 (XO) / 24 / 68.57 MHz; 24 MHz = PLL0 / 10 × 1/4 (source 3, CFG 0x2313, M 1, N reg 0xfc, D reg 0xfb). KDTS: rear MCLK1 24 MHz (gpio90 `cam_mclk`, 4 mA), front MCLK4 19.2 MHz (gpio93 `cam_aon_mclk4`, 2 mA); MCLK4 is the same kind of RCG/branch as the others (`+0x4070`/`+0x4088`, no GDSC of its own; the controller's domains MMCX + MX at low_svs); both sensor nodes name TITAN_TOP as their power domain. **On the tablet**: MCLK1 ran from the XO (c2r) and from PLL0 at 24 MHz (c2r24) with GCC's camera XO on; MCLK4's branch did not run with GCC's camera XO and TITAN_TOP off (c2f: 0x88000000), its RCG and branch words as MCLK1's (*inferred*: the camera XO feeds the MCLK controller; `c2fx` tells it from TITAN_TOP) | msm, KDTS; tablet | verified (source); MCLK1 verified (c2r); MCLK4: needs-boot (c2f/c2fx) |
 | CCI | only **CCI0** `ac7b000`, SPI 426, master 1 (KDTS 1 MHz Fast-mode Plus with the CCI clock at 37.5 MHz from PLL0), SDA gpio115, SCL gpio116 (`cci_i2c_*`, 4 mA, no bias); registers per master 0x100·m, queues 0x300 + 0x200·m + 0x100·n, IRQ 0xc00..0xc0c; commands SET_PARAM 1, REPORT 8, WRITE 9, READ 10; queues of 64/16 words, writes ≤ 11 bytes, reads ≤ 12; timing sets for a 19.2 MHz CCI clock (100/400 kHz) and a 37.5 MHz one (100/400/1000 kHz) | DT, msm | verified (source) |
 | Rear S5KJN1 | CCI0 m1 **0x10**; CSIPHY1, 4 lanes (D-PHY), 700 MHz link (1.4 Gbit/s a lane); reset gpio6 active low; vddd L1I 1.096 V (`ldoi1`), vdda 2.8 V fixed (gpio175 enable, 100 µs), vddio L6B 1.8 V (`ldob6`), afvdd L7B 2.8 V (`ldob7`); on: vddd, 1–2 ms, vdda, vddio, afvdd, MCLK, reset release, 10–15 ms; off: reset, MCLK, afvdd, vddio, vdda, 1–2 ms, vddd; ID 0x0000 = 0x38e1; modes 4080×3072@30 (HTS 4352, VTS 4288), 8160×6144@10; RAW10, mounted rotated 180° (Ubuntu sets vflip: BGGR); controls exposure 0x0202, gain 0x0204 (32 = 1×, 32..2048), frame length 0x0340, orientation 0x0101, test pattern 0x0600 (2 = colour bars), stream 0x0100; flash = PianoTorch's lamp | DT, msm | verified (source) |
 | Front OV32D40 | **not on CCI**: QUP2 SE1's pins (`i2c@884000`, SDA gpio4, SCL gpio5, `qup2_se1`, 2 mA, no bias; Ubuntu ran GENI I2C at 1 MHz) **0x10**; CSIPHY4, 4 lanes, 842.4 MHz; reset gpio7 active low; vddio L10B 1.8 V (`ldob10`), dvdd L2G 1.2 V (`ldog2`), avdd 2.8 V fixed (gpio176); on: reset asserted, supplies, 5–6 ms, MCLK, 10–12 ms, reset release, 20–25 ms; ID 0x300a = 0x5632 (five reads, 10–12 ms apart); modes 3264×2448@30, 3264×1836@30, 6528×4896@10; SBGGR10; controls exposure 0x3500 (24 bits), gain 0x3508 (256 = 1×, 288..15872), frame length 0x380e | DT, msm | verified (source) |
 | Rails | the five sensor LDOs supply only the cameras in the DT (L6B/L7B also the disabled VCM); RPMh VRM (+0 mV, +4 enable, +8 mode, 7 = HPM, the DT's initial mode); PMIC letters are SPMI SIDs (b 1, f 5, g 6, i 8); an LDO n at page 0xc0 + n or 0x40 + n − 1 (decided by TYPE 0x04). CSIPHY rails L3G 1.2 V (also the UFS/DSI PHY PLL: never voted), L1F 0.88 V (CSIPHY0/1/3/5), L3I 0.88 V (CSIPHY2/4), both always-on. **At XNU (c1)**: every PPID at 0xc0 + n (L1I 0x8c1, L6B 0x1c6, L7B 0x1c7, L10B 0x1ca, L2G 0x6c2, L3G 0x6c3, L1F 0x5c1, L3I 0x8c3), owner EE 4; the five sensor LDOs disabled (L1I 944 mV, L7B 1800 mV: the votes set the DT's values); L3G 1200, L1F 880, L3I 880 mV enabled and ready; all eight cmd-db addresses found | DT, `PianoWcnRails.h`; tablet | verified (c1) |
 | Pins | none of the ten is in TLMM's reserved ranges (36–39, 48–51, 74); gpio4–7 and 175/176 have the egpio bit (Linux sets EGPIO_ENABLE when it selects a function); sleep states pull down, reset/enable output low. **At XNU (c1)**: all ten GPIO inputs with pull-down at 2 mA (cfg 0x1; the egpio ones 0x801: present, not claimed by apps), none driven. eGPIO (pinctrl-msm.c's set_mux, behaviour): an eGPIO-capable pin with EGPIO_ENABLE clear is the other owner's (the `egpio` function); selecting any other function, GPIO included, sets EGPIO_ENABLE (the apps TLMM claims it), which is how Ubuntu's camera pinctrl states take gpio4-7/175/176. Levels 2-3 do the same whenever they configure such a pin and give it back with the configuration as found at the power-down (host-tested: gpio7) | DT, msm; tablet | verified (c1) |
-| SMMU | `iommus = <apps_smmu 0x1c00 0x0>`: one stream for every camera write master; Linux's DMA mask 32 bits; the write master's address register holds address >> 8 (40-bit reach). **At XNU (c1)**: SCR0 0x002d0406 (USFCFG set: an unmatched stream faults), IDR0 0x4c017e7f, IDR1 0x60000053: 127 groups (122 free), 83 banks; **no group covers 0x1c00..0x1c1f** (level 3 takes its own window) | DT, msm; tablet | verified (c1) |
+| SMMU | `iommus = <apps_smmu 0x1c00 0x0>` (the boot DT: phandle 0x28 = `iommu@15000000`, the apps SMMU; the only other one is the GPU's at 0x3da0000): one stream for every camera write master; Linux's DMA mask 32 bits; the write master's address register holds address >> 8 (40-bit reach). **At XNU (c1)**: SCR0 0x002d0406 (USFCFG set: an unmatched stream faults), IDR0 0x4c017e7f (stage 1 only: no S2TS), IDR1 0x60000053: 127 groups (122 free), 83 banks; **no group covers 0x1c00..0x1c1f** (level 3 takes its own window). **c3rp/c3r**: the window (group 5, bank 81) applied and every store of it accepted; a free group's S2CR reads **0x0300006e** (translate through bank 110 of 83), and writing it back **aborted** (§8.4): the SMMU is reached through the hypervisor (Qualcomm's trapped SMMU MMIO) | DT, msm; tablet | verified (c1, c3r) |
 | Firmware | **none** on this path (no `request_firmware`; no ICP/CDM users); `camera_mem` carve-outs exist but are unused | msm, device `source.json` | verified (source) |
 | Focus | GT9764 at CCI0 m1 0x0c, **disabled** ("register protocol unverified"): fixed focus, as in Ubuntu | DT | verified |
 
@@ -58,8 +60,8 @@ sensor powers; a sensor's runtime resume is its power-on sequence (§2); streami
 | Level | `piano-camera=` | What it does | Writes | Pass | State |
 |---|---|---|---|---|---|
 | L1 | 1 | read-only survey: CAMSS/CAMCC GDSCs and clocks, CCI0, the sensors' rails/pins/MCLKs as the boot chain left them, the SMMU streams; level 2's verdict | none (the SPMI observer's read command) | no hang, `0 stores`, the lines of §8.2 | **built**, host-tested; **passed on the tablet** (c1, §8.4) |
-| L2 | 2 | one sensor at a time: its bus, rails (RPMh under the shared lock, read back over SPMI), supply enable and reset GPIOs, MCLK; the chip ID over its bus (both sensors); powered down exactly as found | allowlisted camera registers only (§4.2); CAMCC's domains through the shared votes on the CAMCC path | 0x38e1 and 0x5632, `power down complete` for both | **built**, host-tested; adjusted after c1 (§4.2) |
-| L3 | 3 | RAW10 frames from one sensor through CSIPHY → CSID-lite0 → RDI0 → TFE-lite0's write master 0 into memory, no ISP; a bounded number of frames, one frame's statistics (the rear's colour bars by default, or a scene) | + CAMCC PLL0 and the stream's clocks, MM1 (shared helper), GCC's camera HF AXI, our SMMU window for stream 0x1c00, CSID-lite0, TFE-lite0's write master 0, the CSIPHY's lane table, the sensor's tables | the bars' known band pattern; a scene's per-channel means move with the light; the guard intact; `power down complete` | **built**, host-tested (§4.3) |
+| L2 | 2 | one sensor at a time: its bus, rails (RPMh under the shared lock, read back over SPMI), supply enable and reset GPIOs, MCLK; the chip ID over its bus (both sensors); powered down exactly as found | allowlisted camera registers only (§4.2); CAMCC's domains through the shared votes on the CAMCC path | 0x38e1 and 0x5632, `power down complete` for both | **built**, host-tested; **rear passed** (c2r, c2r24); the front failed at MCLK4 (c2f), fixed after it (§4.2) |
+| L3 | 3 | RAW10 frames from one sensor through CSIPHY → CSID-lite0 → RDI0 → TFE-lite0's write master 0 into memory, no ISP; a bounded number of frames, one frame's statistics (the rear's colour bars by default, or a scene) | + CAMCC PLL0 and the stream's clocks, MM1 (shared helper), GCC's camera HF AXI, our SMMU window for stream 0x1c00, CSID-lite0, TFE-lite0's write master 0, the CSIPHY's lane table, the sensor's tables | the bars' known band pattern; a scene's per-channel means move with the light; the guard intact; `power down complete` | **built**, host-tested; c3rp/c3r reached stream-on and aborted in the power-down, fixed after them (§4.3) |
 | L4 | 4 | a software ISP: black level, white balance, demosaic, colour matrix, gamma, simple AE → NV12 at 1280×960 / 1920×1440 | + the sensor's exposure/gain registers | a usable image; AE converges within 1 s | designed (§4.4) |
 | L5 | 5 | a macOS camera device for apps: the kext's user client + a CoreMediaIO camera extension | + the user client's ring | Photo Booth/FaceTime/QuickTime/Safari list and use both cameras | designed (§4.5); C5 test first |
 
@@ -95,14 +97,17 @@ AHB enabled: a store, which is level 2's step 201).
    un-collapse, CFG completion within 2 ms, RETAIN_FF), the slow AHB and CCI0 sources on **the XO** (their reset state; switched
    only if found elsewhere, the root forced on for the switch), the top AHB and CCI0 branches, gpio115/116 to `cci_i2c_*`, CCI0's IRQ
    mask, reset (RST_DONE within 100 ms) and master 1's timing for **400 kHz at a 19.2 MHz CCI clock** (`piano-camera-cci-khz=100`:
-   100 kHz). Front (and the rear with `piano-camera-rear-bus=1`): the two pins as GPIO, output value 0, released: a **software I2C**
+   100 kHz). Front (and the rear with `piano-camera-rear-bus=1`): since c2f first TITAN_TOP and the top AHB (CAMCC's domains voted at
+   201; `piano-camera-camss=0` leaves them out), then the two pins as GPIO, output value 0, released: a **software I2C**
    (`BitI2c.h`, PianoKeyboard's, ~80–100 kHz; `piano-camera-i2c-half-us`), open drain, the board's pull-ups (`piano-camera-pull=1`
    adds the pads').
 3. **210** reset low (asserted), the supply enable low, the MCLK pin to its function. **211–213** the rails in the driver's order
    with its waits: each one VRM transaction (mode HPM, the DT's exact voltage, enable) on apps DRV-2 under `sm8750_rpmh_drv2_owner`,
    1 ms, then read back over SPMI: enabled, ready, within 8 mV of the DT value, else the step fails. A rail found already on at its
    voltage is used and neither voted nor withdrawn. The fixed 2.8 V supply by its GPIO (100 µs).
-4. **214** the MCLK: 19.2 MHz from the XO (the RCG's reset state; the front's rate; the rear's at L2, see below), its branch.
+4. **214** the MCLK: 19.2 MHz from the XO (the RCG's reset state; the front's rate; the rear's at L2, see below) by Linux's
+   shared-RCG enable (root forced on, CFG, UPDATE, root released: also when found at the XO, since c2f), its branch; a failure logs
+   `mclkN: ...: branch .., rcg cmd .. cfg ..; gcc camera xo .., mclk-cc ahb ..; mclk pll0 mode ..`.
    `piano-camera-mclk24=1`: the rear's 24 MHz from the MCLK PLL (configured only when not running: Linux's CONFIG_CTL words, L 0x32,
    standby, RESET_N | BYPASSNL; then RUN, LOCK_DET within 1.5 ms, outputs, OUTCTRL), the RCG to PLL0 / 10 with M/N 1/4.
    **215** reset released; 15 ms (rear) / 25 ms (front).
@@ -128,6 +133,19 @@ helper (§4.3.1: MXC low_svs; MMCX is the boot display's, at NOM_L1: no vote of 
 up before it touches CAMCC; the power-down withdraws them last. `piano-camera-votes=0` leaves them out (the strict model then
 stalls on CAMCC: the reason for the change). The L1 verdict reads `pending: ... step 201 turns them on` instead of a refusal.
 
+**After c2f (2026-11-12).** The front failed at step 214: MCLK4's branch never ran (`last value 88000000`); the rear's MCLK1 ran
+from the XO in c2r with the same RCG and branch words (both RCGs 0x80000000/0x00100000, both branches 0x88000000 before). The
+difference between the two paths: the rear's (CCI0) had voted CAMCC's domains, enabled GCC's camera AHB and **camera XO**
+(0x26034: found 0x88000000, off) and powered **TITAN_TOP**; the front's had only the MCLK controller's AHB. MCLK4 is an ordinary
+cambistmclkcc RCG/branch pair (no GDSC of its own, the XO as source 0, the controller's domains MMCX + MX, both held by the display
+and the GPU), so its missing input is the XO or the sensor's power domain (both sensor nodes of the KDTS name TITAN_TOP; Linux keeps
+GCC's camera XO on from its probe): *inferred*, not told apart by c2f. Changes, host-tested against a model in which an MCLK from
+the XO runs only with GCC's camera XO enabled (`testFrontCamss`): (1) step 201 turns GCC's camera XO on for **every** path (as
+Linux); (2) level 2 powers TITAN_TOP (with CAMCC's domains and the camera AHB) for **either sensor and bus** by default, the sensors'
+DT power domain (`piano-camera-camss=0`: the minimal path, now with the camera XO); (3) the MCLK RCG gets Linux's shared-RCG enable
+even at the XO, so a missing source shows as `its RCG's root did not come on`. `c2f` (default) and `c2fx` (`camss=0`) tell the two
+inputs apart.
+
 **Deviations from Linux, on purpose.** CCI0 and the rear's MCLK run from the XO at L2 (no CAMCC PLL); 400 kHz instead of 1 MHz. The
 rear sensor's EXTCLK range is not in any source: Linux refuses anything but 24 MHz because its mode's PLL words assume it. Reading
 the ID at 19.2 MHz is *inferred* to work (sensors of this class take 6–27 MHz); a rear `idRead` failure with the front passing is
@@ -139,7 +157,7 @@ GDSCR, the four critical branches, the top AHB and CCI0 branches, the slow AHB s
 MCLK controller's MCLK1/MCLK4 sources and branches and PLL0's registers; the ten camera pins' CFG/IO; CCI0's registers. Never: any
 QUP vote word, any other GDSC, the CSIPHY/CSID/TFE blocks, the SMMU, any other pin.
 
-### 4.3 L3: RAW frames into memory (built, host-tested; not run)
+### 4.3 L3: RAW frames into memory (built, host-tested; c3rp/c3r ran, fixed after them)
 
 `CameraStream.h` (`Stream`, over level 2's ops) for one sensor: `piano-camera=3` (the rear by default, `piano-camera-sensor=2` the
 front). Specification: `camss.c` `*_res_8750`, `camss-csiphy-3ph-1-0.c`, `camss-csid-980.c`, `camss-vfe-gen4.c`, `camcc-sm8750.c`,
@@ -162,10 +180,10 @@ its own (TITAN_TOP only) and fewer clocks than a full TFE (whose RDI0 is write m
 | 310 | CSID-lite0: RX_CFG0 = 3 \| 0x3210 << 4 \| (PHY + 1) << 20 (0x00232103 rear, 0x00532103 front), RX_CFG1 = ECC correction; RDI0 CFG0 = RAW10 (0x2b), payload only (0xf), VC 0, timestamps, then enable; CFG1 = MIPI packing; RX interrupt mask all, RDI0 mask SOF/EOF/RUP_DONE/errors (polled: no interrupt is attached); the register updates as the driver's loop (AUP, RUP, twice: the address latched); RDI0 start |
 | 311 | the CSIPHY: reset (CTRL0 = 1, 8 ms, 0), version (CTRL6 = SHOW_REV_ID, STATUS12..15), CTRL5 = 0xd5 (clock + data lanes 0-3), CTRL6 = 1, CTRL7 = 2, CTRL0 = 0; the 103-entry lane table from `data/camera/csiphy-v2.4.tbl` (87 written, five with 209 µs after them, the five settle entries take **29** = (85 ns + 6 × UI/2) / 2.5 ns − 6 for both sensors' link rates at a 400 MHz timer; the 16 skew-calibration entries not written, as the driver); CTRL11..21 = 0 (interrupts masked) |
 | 312 | the sensor: its `start`, `init` and mode tables (rear `4080x3072`: 315 writes over CCI0, the CCI's own register stores counted, not logged; front `3264x1836`: 866 over the software I2C), the rear's controls (orientation 0 (native), exposure 0x0202 = the mode's 3840 lines, analogue gain 0x0204 = `piano-camera-gain` (64: 2×), frame length 0x0340 = 4288, test pattern 0x0600 = 2 colour bars unless `piano-camera-pattern=0`), then `on` (stream on, last) |
-| 320 | the stream: CSID-lite0's TOP/BUF_DONE/RX/RDI0 status polled every 100 µs (cleared when set), SOF/EOF/RUP_DONE/error bits counted; each BUF_DONE re-arms the write master with the same buffer (IMAGE_ADDR, AUP); `piano-camera-frames` (2) frames [the first within 1 s, each next within 200 ms, all within `piano-camera-timeout-ms` (3000)]; the CSIPHY's status words 0-10 read |
-| 330 | stop: write master 0 off first (read back: nothing more reaches memory), RDI0 stopped and disabled, the PHY's CTRL5/CTRL6 = 0, the sensor's `off` table; late BUF_DONEs counted for 100 ms |
-| 331 | the statistics (the buffer invalidated from the caches first): per Bayer position (row/column parity) min/mean/max and an 8-bin histogram (128 a bin), the eight vertical bands' means per position (the colour bars' step pattern), the written extent and the stride it implies (packed 5100 bytes or padded 5104 for the rear: the open question 7, settled by the first frame), the guard (intact, or the first changed byte), the first 32 bytes |
-| 340 | down in reverse, only what level 3 changed: the branches (reverse), the sources back to what they were (before PLL0 stops), PLL0 (OUTCTRL off, outputs off, standby; its configuration stays, as Linux's probe leaves it), GCC's HF AXI, MM1; the window released (the stream made to fault first, the group's SMR/S2CR, the bank's SCTLR, every other word it wrote, CBAR/CBA2R as found, our faults cleared after they are logged, the TLBs invalidated); level 2's power-down (sensor, bus, TITAN_TOP collapsed: the CSID/TFE/CSIPHY registers with it, MCLK, rails, pins, GCC, CAMCC's domains); the buffer freed only when the write master read back stopped and its IFE-lite clock stopped and the window is released (else kept and said so) |
+| 320 | before the stream-on table: CSID-lite0's four status words read, logged (`stream: before stream-on: ...`) and cleared; then the stream: TOP/BUF_DONE/RX/RDI0 status polled every 100 µs (each cleared when seen), SOF/EOF/RUP_DONE/error bits counted; a BUF_DONE less than 1 ms after stream-on or after the previous frame is **stale** (counted apart, not a frame: a sensor frame takes 33 ms); per frame the times of its SOF, EOF and BUF_DONE and the RDI0/RX words since the frame before; the first CSI2 RX word and the first RDI0 error bits with their times; each frame re-arms the write master with the same buffer (IMAGE_ADDR, AUP); `piano-camera-frames` (2) frames [the first within 1 s, each next within 200 ms, all within `piano-camera-timeout-ms` (3000)]; the CSIPHY's status words 0-10 at the first frame and at the end |
+| 330 | stop: write master 0 off first (read back: nothing more reaches memory), RDI0 stopped and disabled, the PHY's CTRL5/CTRL6 = 0, the sensor's `off` table; late BUF_DONEs counted for 100 ms (three frame times: the write master and the CSID idle after it) |
+| 331 | the statistics (the buffer invalidated from the caches first): per Bayer position (row/column parity) min/mean/max and an 8-bin histogram (128 a bin), the eight vertical bands' means per position (the colour bars' step pattern), the written extent and the stride it implies (packed 5100 bytes or padded 5104 for the rear: the open question 7, settled by the first frame), the guard (intact, or the first changed byte), the first 32 bytes, rows 0-3 and the last (each: how many of its bytes are not the fill, its first 16); then the window's bank FSR/FAR and **the whole report, before the power-down** (`level 3 (before the power-down): ...`) |
+| 340 | down, nothing touched after its clock, power or vote is gone: **the SMMU window first**, while MM1, GCC's HF AXI and the CAMNOC branches still run (its TLB invalidate and sync reach the camera's TBU, *inferred*): the stream made to fault, the group's SMR as found, its S2CR as found only when a configuration of this SMMU (else left at fault), the bank's SCTLR (translation off), our faults cleared, its other words as found, CBAR/CBA2R as found only when a context type this SMMU implements (else our stage-1 words stay), TLBIALLNSNH and the sync; then the branches (reverse), the sources back to what they were (before PLL0 stops), PLL0 (OUTCTRL off, outputs off, standby; its configuration stays, as Linux's probe leaves it), GCC's HF AXI, MM1; level 2's power-down (sensor, bus, TITAN_TOP collapsed: the CSID/TFE/CSIPHY registers with it, MCLK, rails, pins, GCC, CAMCC's domains last); the buffer freed only when the write master read back stopped and its IFE-lite clock stopped and the window is released (else kept and said so) |
 
 **Allowlist** (`Stream::writable`; level 2's own for the sensor, its bus and power): GCC's camera HF AXI; CAMCC PLL0 (+0..+0x30),
 the five sources' CMD/CFG (the sensor's PHY timer only), the eleven branches (the sensor's CSIPHY and timer only); the sensor's
@@ -173,6 +191,26 @@ CSIPHY block (0x2000); CSID-lite0 (0xa00); TFE-lite0's CGC override and test bus
 route's own group (SMR, S2CR), bank (its page, CBAR, CBA2R) and the global TLB invalidate and sync, only for our window. Never: the
 other CSIPHY, CSID or TFE, any other write master, any GDSC but level 2's TITAN_TOP, any other SMMU word, a bypass route's group.
 The build greps CameraStream.h for stores outside `put()`/`putQuiet()` and the SMMU headers for any store but their Write.
+
+**After c3 (c3rp, c3r, 2026-11-12; §8.4).** Both runs went through every step to the sensor's tables (c3r: and stream-on, two
+BUF_DONEs in 98 ms) and then aborted in step 340 with XNU's platform-error panic (`Unhandled implementation specific error`, then
+`MACH Reboot`) right after the release's store of group 5's S2CR **as found, 0x0300006e** (translate through bank 110; IDR1 says 83
+banks). The release then came after MM1's withdrawal and GCC's HF AXI off, but its two stores before that one (S2CR = fault,
+SMR = 0) were accepted with MM1 off, so the order was not what aborted; the value was (*inferred* from the last line logged before
+the abort; the 21 earlier window stores were all accepted). Every line of the report (the chip ID's, the stream's, the frame's) was
+printed after the power-down and was lost with it. Changes, each host-tested (the model aborts on an S2CR naming a bank the SMMU
+lacks and on a stage-2 CBAR when IDR0 has no stage 2, refuses TLB maintenance without the camera NoC voted and clocked, flags MM1,
+the CAMNOC clocks, HF AXI or TITAN_TOP going while the write master is enabled or the window is live, and CAMCC's domains going with
+TITAN_TOP on; a mutation of each old behaviour fails the tests): (1) `releaseRoute` writes a found word back only when it is a
+configuration of this SMMU (`s2crRestorable`, `cbarRestorable`), else the group's S2CR stays at fault and the bank's CBAR/CBA2R at
+our stage-1 words (both logged: `smmu: group 5's S2CR left at fault ...`), which leaves the group (its SMR invalid) and the bank
+(translation off) free for every plan in this repository; (2) the window is released **first** in step 340, while MM1, HF AXI and
+the CAMNOC branches still run, then the clocks, PLL0, HF AXI, MM1, then level 2's (TITAN_TOP, then CAMCC's domains last); (3) the
+chip ID (`rear S5KJN1: chip ID 0x38e1 ... OK`), the versions (305) and the window's found words (306) are logged when found, the
+stream's and the frame's report after step 331, before the power-down; (4) the stream's diagnostics of step 320 and the rows of
+331; (5) every console line under 240 characters (the console cuts a line at 255 and loses its newline, as c3r's `camcc branches`
+line ran into the next). The rear's smallest mode is already the one used (4080×3072 is the 2×2-binned mode; the only other is
+8160×6144), and the drivers have no other link rate (one PLL setting, 700 MHz: 1.4 Gbit/s a lane): nothing lower to choose.
 
 **Memory safety.** On c1's tablet the route is our window: the write master can reach only the buffer's 16 MiB (anything else
 faults in the SMMU, logged from the bank's FSR/FAR before the release), the guard catches an overflow inside it, and the buffer is
@@ -292,6 +330,7 @@ installs on our boot), PianoTorch (the photo flash, B12, built).
 | `piano-camera-delay` | 0 | wait first (s) |
 | `piano-camera-cc`, `-mclkcc`, `-blocks`, `-qup`, `-spmi`, `-smmu` | 1 | 0 leaves that part of the survey out (`-cc=0` also refuses the rear on CCI0) |
 | `piano-camera-votes` | 1 | 0: level 2 votes no CAMCC domain (§4.2 after c1); level 3 always votes |
+| `piano-camera-camss` | 1 | level 2: TITAN_TOP (with CAMCC's domains and the camera AHB) for either sensor and bus, the sensors' DT power domain (§4.2 after c2f); 0: the minimal path (only the rear over CCI0 powers it); level 3 always 1 |
 | `piano-camera-mmcx-floor` | 0x140 | the MMCX floor this client declares to the shared votes (the boot display's NOM_L1; never lower than another client's) |
 | `piano-camera-frames` | 2 | level 3: frames to collect (1..8) |
 | `piano-camera-pattern` | 1 | level 3: the rear's colour bars (0x0600 = 2); 0: the scene |
@@ -313,7 +352,13 @@ stream's clock sources, the CAMSS blocks (reset by TITAN_TOP's collapse), the SM
 that writes the model's frames only when the sensor streams, the PHY's table and settle count are right, CSID-lite0 is configured
 for that PHY and the write master is armed: the colour bars band by band, padded and unpadded lines, a scene, the front, a boot-chain
 bypass, a refused route, failures at each step, every stop step, overflows into the guard and past the buffer, the allowlist,
-everything as found after each), `package/include/tests/run.sh` (the shared votes), store checks (the survey headers store nothing;
+everything as found after each); since c2f/c3: every register access with its block's clock, power domain and votes held (a CAMSS
+block also needs CAMCC's domains), the tablet's SMMU (IDR0 0x4c017e7f, five groups in use, the free S2CRs at 0x0300006e) aborting
+the stores c3r did and any stage-2 CBAR, TLB maintenance only with the camera NoC voted and clocked, MM1/HF AXI/CAMNOC/TITAN_TOP
+never going while the write master or the window is live, CAMCC's domains never before TITAN_TOP, the teardown's order of events
+(`testL3Teardown`), the report before the power-down, stale and early BUF_DONEs, the per-frame times and the rows, an MCLK from the
+XO only with GCC's camera XO (`testFrontCamss`), every log line short enough for the console; `package/include/tests/run.sh` (the
+shared votes), store checks (the survey headers store nothing;
 CameraPower.h and CameraStream.h store only through their allowlisted `put()`/`putQuiet()`; the SMMU headers only through their
 Write), the objects (with the generated tables' header), the import check (PianoA830's lock and vote words). `PianoCamera` is in
 `configs/k27-native-kexts.txt` after PianoA830.
@@ -328,7 +373,8 @@ GPU path):
 
 ```sh
 PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh   # the KC with PianoCamera
-tooling/k27/build-camera-test-images.sh                              # out/ram-cam-<name>/ for c1 c1x c2f c2r c2rg c2r24 c3rp c3r c3rs c3f
+tooling/k27/build-camera-test-images.sh                              # out/ram-cam-<name>/ for c1 c1x c1b c2f c2fx c2r c2rg c2r24 c3rp c3r c3rs c3f
+# (or: PIANO_A830_METAL=0 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh, then CAM_PROFILE=plain tooling/k27/build-camera-test-images.sh)
 python3 tooling/native/usb-console.py --capture 1000 &               # then each image: tooling/native/native-loop.sh out/ram-cam-c1/boot-piano-macos-ram-A-bundled.img
 grep -a "PianoCamera" logs/usb-console/<newest>-port0.txt
 ```
@@ -338,25 +384,29 @@ grep -a "PianoCamera" logs/usb-console/<newest>-port0.txt
 | `c1` | `piano-camera=1 piano-camera-delay=20` | **yes** | the survey: CAMCC/MCLK readable at the boot rails, the rails' PPIDs, the pins, the SMMU (**passed**, §8.4) |
 | `c1x` | `piano-camera=1 piano-camera-cc=0 piano-camera-mclkcc=0 piano-camera-delay=20` | **yes** | only if `c1` hangs after its `gcc:` line: the rest of the survey without the clock controllers |
 | `c1b` | `piano-camera=2 piano-camera-sensor=1 piano-camera-stop=203 piano-camera-delay=20` | **yes** (c1 passed) | c1's re-test: level 2's steps 201-203 only (CAMCC's domains voted, GCC's three camera branches enabled), the `step 202: the controllers ...` lines (CAMCC's GDSCs, branches, sources, PLLs; the MCLK controller; TITAN_TOP's state) that c1 could not read, then everything as found: no rail, pin, CAMCC or CCI store |
-| `c2f` | `piano-camera=2 piano-camera-sensor=2 piano-camera-delay=20` | **yes**, after `c1` passed | the front: rails, software I2C, 0x5632; no CAMCC write |
-| `c2r` | `piano-camera=2 piano-camera-sensor=1 piano-camera-delay=20` | **yes**, after `c1` passed | the rear over CCI0 (TITAN_TOP, XO clocks), 0x38e1 |
+| `c2f` | `piano-camera=2 piano-camera-sensor=2 piano-camera-delay=20` | **yes**, after `c1` passed | the front: rails, software I2C, 0x5632; since c2f with GCC's camera XO and TITAN_TOP (its DT power domain; CAMCC's domains voted, the camera AHB): the rear's c2r path minus CCI0 (failed 11-12 before that: MCLK4, §8.4) |
+| `c2fx` | `piano-camera=2 piano-camera-sensor=2 piano-camera-camss=0 piano-camera-delay=20` | **yes**, after `c2f` | the front on the minimal path, only GCC's camera XO added: whether MCLK4 needed the camera XO (passes) or TITAN_TOP/MXC (fails at 214 with `mclk4: ...`, powered down) |
+| `c2r` | `piano-camera=2 piano-camera-sensor=1 piano-camera-delay=20` | **yes**, after `c1` passed | the rear over CCI0 (TITAN_TOP, XO clocks), 0x38e1 (**passed**, §8.4) |
 | `c2rg` | `piano-camera=2 piano-camera-sensor=1 piano-camera-rear-bus=1 piano-camera-delay=20` | **yes** | the rear over software I2C (separates CCI0 from the sensor when `c2r` fails) |
-| `c2r24` | `piano-camera=2 piano-camera-sensor=1 piano-camera-mclk24=1 piano-camera-delay=20` | **yes** | the rear with Linux's 24 MHz MCLK (the MCLK PLL) |
+| `c2r24` | `piano-camera=2 piano-camera-sensor=1 piano-camera-mclk24=1 piano-camera-delay=20` | **yes** | the rear with Linux's 24 MHz MCLK (the MCLK PLL) (**passed**, §8.4) |
 | (later) | `piano-camera=2 piano-camera-cycles=20` | yes | 20 power cycles of both, no leak |
-| `c3rp` | `piano-camera=3 piano-camera-sensor=1 piano-camera-stop=312 piano-camera-delay=20` | **yes**, after `c2r24` passed | level 3 prepared to the sensor's tables, stopped before stream-on: PLL0's lock, the clocks, the SMMU window, CSID-lite0's reset, the versions, the CSIPHY; then the full power-down |
-| `c3r` | `piano-camera=3 piano-camera-sensor=1 piano-camera-delay=20` | **yes**, after `c3rp` passed | the rear's colour bars: two frames, the band pattern, the stride, the guard |
+| `c3rp` | `piano-camera=3 piano-camera-sensor=1 piano-camera-stop=312 piano-camera-delay=20` | **yes**, after `c2r24` passed | level 3 prepared to the sensor's tables and controls, stopped before the stream-on table: PLL0's lock, the clocks, the SMMU window, CSID-lite0's reset, the versions, the CSIPHY; then the full power-down: **the test of the fixed power-down** (11-12 before it: the abort, §8.4); look for `smmu: group 5's S2CR left at fault`, `power down complete`, `done: level 3` |
+| `c3r` | `piano-camera=3 piano-camera-sensor=1 piano-camera-delay=20` | **yes**, after `c3rp` passed | the rear's colour bars: two frames with their times, the band pattern, the stride, the rows, the guard |
 | `c3rs` | `piano-camera=3 piano-camera-sensor=1 piano-camera-pattern=0 piano-camera-frames=4 piano-camera-delay=20` | **yes**, after `c3r` | the rear's scene: four frames, the means with the room light |
 | `c3f` | `piano-camera=3 piano-camera-sensor=2 piano-camera-delay=20` | **yes**, after `c2f` and `c3r` | the front's scene over CSIPHY4 |
 
 Each runs `piano-reset-after=300`. The order is `c1` → (`c1x`) → `c1b` → `c2f` → `c2r` → `c2rg`/`c2r24` as needed → `c3rp` → `c3r` →
 `c3rs` → `c3f`. **Rebuild the c2 images from this commit on**: images built before it wait at step 201 for CLK_OFF on the
 hardware-gated AHB branches c1 found and stop there (harmlessly: `FAILED at step 201: a GCC branch did not run`, power down
-complete).
+complete). **The next queue (from the c2f/c3 fixes on, 2026-11-12 evening)**: `c3rp` → `c3r` → `c2f` → `c2fx` → `c3rs` → `c3f`
+(c3rs after c3r showed frames; c3f after c2f passed). Images built before these fixes abort in level 3's power-down (c3rp/c3r) and
+fail the front at MCLK4 (c2f): rebuild them.
 
 **Why level 2 is safe unattended** (and what could go wrong). What it changes: five LDO votes that, in the boot DT, supply nothing
 but the cameras (L6B/L7B also the disabled VCM), at the DT's exact voltages, each read back (any other voltage: off at once); ten
 TLMM pins that only the cameras use (none reserved by the secure world); GCC's three camera branches, only if found off; CAMCC's
-TITAN_TOP and the CCI's clocks from the XO (rear on CCI0 only); one MCLK branch; CCI0; on the rear's CCI0 path, MXC at low_svs through
+TITAN_TOP and the camera top AHB (both sensors since c2f; c2r ran exactly this on the tablet), the CCI's clocks from the XO (rear on
+CCI0 only); one MCLK RCG (its root forced on for the switch, CFG as found) and branch; CCI0; on the CAMCC path, MXC at low_svs through
 the shared votes (raised for under a second, then withdrawn; nothing else natively votes it) and the MMCX floor declared (no MMCX
 vote of its own). It writes no sensor register, sends no MMCX, CX or L3G vote, starts no PLL by default, touches no partition and
 not the ADSP. The sensors are powered for well under a second, in Linux's order, and everything is taken back. What could go wrong:
@@ -442,34 +492,53 @@ PianoCamera: votes: mxc.lvl 0x..... (.. levels, top vlvl 0x...), mmcx.lvl 0x....
 PianoCamera: rsc: shared votes: 1 command(s) (0x.....=0x.) through TCS . completed after . ms
 PianoCamera: votes: CAMCC's domains up: ok; mxc hlvl . (vlvl 0x40, others 0), mmcx hlvl . (vlvl 0x140, floor 0x140, others 0); 1 command(s) sent (MXC only: MMCX stays the boot display's)
 PianoCamera: step 201 ... step 230 (level 2's lines, §8.2)
+PianoCamera: rear S5KJN1: chip ID 0x38e1 (expected 0x38e1): OK over CCI0 master 1 after 1 try; MCLK 24000000 Hz
 PianoCamera: step 301: MM1 on (the camera NoC; the shared multimedia votes)
 PianoCamera: votes: the camera NoC (MM1) on: ok; MM1 60000001 (other clients do not need it); 1 command(s) sent
 PianoCamera: step 302 ... 305 (write lines: GCC HF AXI, PLL0's configuration, RUN, outputs, OUTCTRL, the RCG switches, the branches)
-PianoCamera: step 306: the SMMU route of stream 0x1c00 (as the boot chain left it, else our window)
+PianoCamera: csid-lite0 HW_VERSION ........, tfe-lite0 HW_VERSION ........
+PianoCamera: step 306: the SMMU route of stream 0x1c00 on apps_smmu 0x15000000 (as the boot chain left it, else our window)
+PianoCamera: smmu: window: group 5 (found smr 00000000 s2cr 0300006e: not restorable), bank 81 of 83 (found sctlr .. cbar ..: not restorable cba2r ..; ...)
 PianoCamera: step 307: ...; dma: frame buffer 16777216 bytes at 0x.........; the window's tables at 0x.........
 PianoCamera: write 0x15...... = ........ (SMMU: the window)   (the bank, then S2CR, SMR, TLBIALLNSNH, sync)
-PianoCamera: step 308 ... 311; csiphy1: version ........; the lane table: 87 entries written (settle 29 for 700000000 Hz), 16 skipped ...
+PianoCamera: step 308 ... 311; csiphy1: version 40010000; the lane table: 87 entries written (settle 29 for 700000000 Hz), 16 skipped ...
 PianoCamera: step 312: the S5KJN1's tables (start, init, mode 4080x3072), its controls, stream on
-PianoCamera: step 320: the stream: BUF_DONE polled, the write master re-armed after each frame
-PianoCamera: step 330 ... 331 ... 340
-PianoCamera: level 3: rear S5KJN1 4080x3072 RAW10: OK
+PianoCamera: step 320: the stream: SOF/EOF/BUF_DONE polled, the write master re-armed after each frame
+PianoCamera: step 330 ... 331
+PianoCamera: level 3 (before the power-down): rear S5KJN1 4080x3072 RAW10: 2 frame(s) collected
 PianoCamera: route: our translating window (a free group and bank of ours); bus 0x20000000 -> pa 0x........., 16777216 bytes (frame 15679488 = 5104 x 3072 + a guard)
-PianoCamera: versions: csid-lite0 ........ tfe-lite0 ........ csiphy1 ........; settle 29; lane table 87 written, 16 skipped; sensor 317 table writes, 5 controls (pattern 1, gain 64)
-PianoCamera: stream: 2 frame(s) (BUF_DONE) in ..... us: the first after ..... us, the last interval ~33000 us; SOF . EOF . RUP_DONE .; late 0; ... polls
-PianoCamera: irq seen: top ........ buf-done 00000002 csi2-rx ........ rdi0 ........ (error bits 00000000)
+PianoCamera: versions: csid-lite0 ........ tfe-lite0 ........ csiphy1 40010000; settle 29; lane table 87 written, 16 skipped; sensor 317 table writes, 5 controls (pattern 1, gain 64)
+PianoCamera: stream: before stream-on: top ........ buf-done ........ csi2-rx ........ rdi0 ........ (cleared)
+PianoCamera: stream: 2 frame(s) (BUF_DONE) in ..... us: the first after ..... us, the last interval ~33000 us; SOF . EOF . RUP_DONE .; stale BUF_DONE 0; late 0; ... polls
+PianoCamera: stream: frame 1: SOF +..... us, EOF +..... us, BUF_DONE +..... us; rdi0 ........ csi2-rx ........ since the frame before   (and frame 2)
+PianoCamera: irq seen: top ........ buf-done 00000002 csi2-rx ........ rdi0 ........ (error bits 00000000); first csi2-rx word ........ at +.. us, first rdi0 error ........ at +.. us
+PianoCamera: csiphy1 status 0-10 at the first frame: .. .. ..    (and at the end)
+PianoCamera: smmu: the window's bank FSR 00000000 FAR ................ FSYNR0 ........ GFSR ........ (no fault)
 PianoCamera: frame: written 15667200 bytes (15667200 unpadded, 15679488 padded lines), stride 5100; guard intact
 PianoCamera: frame: r0c0 min .. mean .. max ..; histogram (128 a bin) ...   (four lines)
-PianoCamera: frame: eight vertical bands, mean r0c0/r0c1/r1c0/r1c1: b0 ../../../.. ... b7 ../../../..   (the colour bars: eight distinct steps)
+PianoCamera: frame: bands r0c0/r0c1/r1c0/r1c1: b0 ../../../.. ... b7 ../../../..   (the colour bars: eight distinct steps)
+PianoCamera: frame: first 32 bytes ................................................................
+PianoCamera: frame: row 0: .... of 5100 bytes not the fill; first 16 ................................   (rows 0-3 and 3071)
+PianoCamera: step 340: power down: the SMMU window first (MM1 and the camera NoC's clocks on), the clocks, PLL0, HF AXI, MM1, then level 2's
+PianoCamera: write 0x15000c14 = 00020000 (SMMU: the window released)   (SMR, SCTLR, the bank's words, TLBIALLNSNH, sync)
+PianoCamera: smmu: group 5's S2CR left at fault (00020000): the found 0300006e is not a configuration of this SMMU (83 banks)
+PianoCamera: smmu: bank 81's CBAR/CBA2R left at 0001f300/00000001 (stage 1, translation off): the found ../.. is a context type this SMMU lacks (IDR0 4c017e7f)
+PianoCamera: write 0xadf1348 = 08000000 (qdss-debug-xo)   ... the branches, the sources, PLL0, GCC HF AXI, MM1, level 2's power-down
+PianoCamera: level 3: rear S5KJN1 4080x3072 RAW10: OK (2 frames, 0 stale BUF_DONE; guard intact; window fault none)
 PianoCamera: level 3: N writes logged, M quiet (...), 0 refused, 0 off-side warnings; power down complete (everything as found); buffer freed
 PianoCamera: stage 6: done (level 3)
 ```
+A bank whose found CBAR is a stage-1 type is restored as found (no `left at` line); the two `left at` lines are what c1's SMMU gives.
 Failure lines: `FAILED at step 303: ... no LOCK_DET within 1.5 ms` (PLL0: its MODE in `last value`; MXC's vote line above),
 `FAILED at step 306: refused: ...` (the SMMU's state: report the survey's smmu lines), `FAILED at step 308: CSID-lite0 did not
 reset`, `FAILED at step 320: no frame arrived` (report the `irq seen` and `csiphy1 status` lines: a CSI-2 RX error says the PHY saw
 the lanes; nothing at all says the sensor did not stream or the PHY's settle/lane table; next: the scene `c3rs` with
 `piano-camera-pattern=0`, then a longer `piano-camera-timeout-ms`), `guard DAMAGED` (the write master wrote past the frame: report
 the written extent and the smmu fault line), `power down INCOMPLETE` / `buffer KEPT` (report the warnings). A hang after a `step 3xx`
-line: report it (`piano_camera_stage` has the number).
+line: report it (`piano_camera_stage` has the number). Frames that are not the sensor's: `stale BUF_DONE` above 0 (a BUF_DONE with
+no frame time behind it), BUF_DONE times closer than ~33 ms, rows with `0 of 5100 bytes` (the write master wrote nothing there) or
+a written extent of 0 with frames counted (BUF_DONE without data). An abort (`Unhandled implementation specific error`) in step
+340: the last `write` line names the store; everything found was printed before it.
 
 ### 8.3 Level 3 unattended?
 
@@ -478,7 +547,9 @@ step can damage hardware or leave persistent state. What it changes beyond level
 only, all taken back; PLL0's configuration words stay, as Linux's probe leaves them), GCC's camera HF AXI branch (if found off),
 CSID-lite0, TFE-lite0's write master 0 and one CSIPHY (reset with TITAN_TOP's collapse), the sensor's own registers (its drivers'
 tables, gone with its power), BCM MM1 on for the stream's duration, MXC at low_svs (as level 2), one free stream-match group and
-one free context bank of the apps SMMU (every word restored as found after the stream: the stream made to fault first), and 16 MiB
+one free context bank of the apps SMMU (after the stream: the stream made to fault first, every word restored as found where this
+SMMU accepts the found value; on c1's SMMU the free group's S2CR stays at fault and the bank's CBAR/CBA2R at our stage-1 words,
+translation off: both still free for every plan here; the next reset restores the hypervisor's own view in any case), and 16 MiB
 of contiguous memory. It does not vote MMCX (the boot display's vote stays exactly), touches no other CAMSS block, no partition, not
 the ADSP, the display, the torch or the battery. The stream is bounded (two frames by default, 3 s at most from stream-on, every wait
 bounded), then everything is taken down in reverse.
@@ -492,8 +563,11 @@ Linux's clock lists; the hardware may want more): a hang until `piano-reset-afte
 use by someone it cannot see (the same plan as PianoWifi's level 5 window and PianoVideo's bank; PianoWifi's ran on this tablet):
 the symptom would be another device's DMA faults for the stream's few seconds; (3) MXC's DRV-2 vote goes to 0 at the end (as
 PianoVideo's power-off does): nothing else natively votes it; (4) a sensor that streams in a way its tables do not describe: the
-window bounds it. The first streaming run (`c3r`) is the first time anything natively drives CAMSS: attended is not required, but
-the webcam view of the panel is worth keeping (the display should not change at all).
+window bounds it; (5) an SMMU store the hypervisor refuses (c3rp/c3r: one did, the found S2CR): XNU's platform-error panic and
+`MACH Reboot`, a reboot of a RAM boot, nothing persistent, everything found already logged (since the c3 fixes). The first streaming
+run (`c3r`) is the first time anything natively drives CAMSS: attended is not required, but the webcam view of the panel is worth
+keeping (the display should not change at all). **c3rp and c3r ran unattended on 2026-11-12** (§8.4): risks (1)-(4) did not happen
+(no stall on any CAMSS access, PLL0 locked under MXC low_svs, the window took); (5) did, as a reboot.
 
 ### 8.4 Results
 
@@ -506,6 +580,41 @@ the five sensor LDOs disabled, L3G 1200 / L1F 880 / L3I 880 mV enabled and ready
 IDR0 0x4c017e7f, IDR1 0x60000053: 127 groups (122 free), 83 banks, no group for 0x1c00..0x1c1f. What changed in response: §4.2
 "After c1" (the hardware-gated rule; CAMCC's domains voted before its first access) and level 3's route (our window; §4.3 step 306).
 
+**c1b, 2026-11-12** (image b48e4b39b7b0cd19; `logs/usb-console/20261112-124354-port0.txt`): passed. MXC voted (hlvl 2), GCC's three
+branches enabled (both AHBs `88000003`: on, hardware-gated, idle; XO `08000001`), the first CAMCC and MCLK-controller readout under
+XNU: every GDSC collapsed (`0222f801/04088000`), of the critical branches the GDSC and sleep clocks on (`08000001`) and DRV AHB/XO
+off, every other branch off; MCLK0..7 RCGs `80000000/00100000`
+(source 0, root off), branches `88000000`; then stopped at 203, 6 writes, `power down complete`, the votes withdrawn.
+
+**c2r and c2r24** (17a1520a1f25330a, 5f6631cd1b8ec6ca; `20261112-125615`, `20261112-135100`): **passed**. `rear S5KJN1: chip ID 0x38e1
+(expected 0x38e1): OK over CCI0 master 1 after 1 try` at MCLK 19.2 MHz (XO) and at 24 MHz (MCLK PLL0 locked); CCI0 HW_VERSION
+`10070000`; the three rails at 1096/1800/2800 mV, read back, off again; 69 and 96 writes, `power down complete`. Open question 3
+answered: the rear answers at 19.2 MHz.
+
+**c2f** (7ef6c1a164b1194e; `20261112-125005`): `front OV32D40: FAILED at step 214: a clock branch did not run (... last value
+88000000)`, powered down cleanly (26 writes, `power down complete`); both rails came up at 1800/1200 mV and went off. MCLK4's RCG
+`80000000/00100000` and branch `88000000` read as MCLK1's in c2r. Cause (**inferred**, §4.2 "After c2f"): the front path enabled
+neither GCC's camera XO (found `88000000`) nor TITAN_TOP, both on in c2r's working MCLK1 run; evidence: the two runs' words and
+paths. Not the bus: step 214 comes before any I2C. `c3f` was not run.
+
+**c3rp and c3r** (404d2ae0e77ac933, 08476bf2ebef917c; `20261112-143541`, `20261112-144121`; the console of each run in
+`logs/native-runs/<ts>-loop/xnu-console.txt`). Evidence: every step from 300 to 312 ran with every write logged: the chip ID read
+(the CCI queue's RD_DONE cleared, and level 3 goes on to 301 only when the ID matched), MM1 on, GCC's HF AXI, **CAMCC PLL0 locked**
+under MXC at low_svs (open question 6), the five sources and eleven branches (each CLK_OFF cleared: no `FAILED at 304`), **no stall
+on any CSID-lite0, TFE-lite0 or CSIPHY access** (open question 10: Linux's clock lists suffice), CSID-lite0's reset done, CSIPHY1
+version `40010000`, the lane table (87 written, settle 29), the window applied (group 5, bank 81, 21 stores, all read back); c3rp
+stopped before the stream-on table as asked (stop=312 runs the tables and controls; its step title names stream-on). c3r: the
+sensor's 315 table writes and 5 controls in 66 ms (step 312 → 320), stream-on, **step 320 for 98 ms** (`.090` → `.188`), step 331
+ran (so BUF_DONE was counted at least once and the write master read back stopped), 46 ms of statistics. Then both: step 340's
+release, `write 0x15000c14 = 00020000`, `write 0x15000814 = 00000000`, `write 0x15000c14 = 0300006e`, **`Unhandled implementation
+specific error`** (XNU's platform-error panic: an external abort or SError), `MACH Reboot`. Inferred: (a) the abort is the store of
+the found S2CR (translate through bank 110 of 83): the line is logged before its store, the next store's line never came, the two
+stores just before it reached the same SMMU with MM1 already withdrawn and were accepted; the hypervisor-mediated SMMU refuses a
+configuration it does not have; (b) c3r's two BUF_DONEs were frames (98 ms is three frame times at 30 fps: the sensor's first frame
+and the next), not an instant stale return (two polls would take 0.2 ms), but no frame number or byte of them reached the log; (c)
+the missing chip-ID and frame lines are not a separate fault: level 3 printed its whole report, and level 2's line, only after the
+power-down. Fixed: §4.3 "After c3" (the release's rules, the order, the report before the power-down, the diagnostics).
+
 ## 9. Fallback
 
 Without `piano-camera` nothing is mapped. A refusal writes nothing for that sensor. Any failure runs the full power-down. A
@@ -514,17 +623,22 @@ system sleep during a sequence waits for its power-down (the kext joins the powe
 ## 10. Open questions
 
 1. CAMCC and the MCLK controller readable at the boot rails (MMCX on for the display; MXC unknown)? → `c1`: not readable at all
-   (their GCC AHB off); level 2 enables the AHB and, for CAMCC, votes MXC first → `c2r` (its step 202) answers it.
+   (their GCC AHB off); level 2 enables the AHB and, for CAMCC, votes MXC first → `c1b`/`c2r`: **answered**, both readable then.
 2. The rails' PPIDs (both page rules), their state at XNU time, the pins' states → `c1`: **answered** (§8.4).
-3. Does the rear answer at a 19.2 MHz MCLK? → `c2r` / `c2r24`.
-4. The front bus's pull-ups (the sensor's vddio, or always-on) → `c2f` (else `piano-camera-pull=1`).
+3. Does the rear answer at a 19.2 MHz MCLK? → `c2r`: **yes** (and at 24 MHz, `c2r24`).
+4. The front bus's pull-ups (the sensor's vddio, or always-on) → `c2f` (else `piano-camera-pull=1`); c2f stopped before the bus.
 5. Stream 0x1c00's SMMU entry at XNU time; bypass allowed? → `c1`: **no entry** (unmatched streams fault): L3 takes its window.
 6. The shared multimedia votes (MXC, MMCX, MM BCMs) between camera, video and display → **built** (§4.3.1); whether MXC at low_svs
-   suffices for PLL0 at 1200 MHz → `c3rp` (step 303).
-7. Frame mode's line padding for 4080-pixel lines → L3's first frame (`c3r`: `frame: written ..., stride ...`).
-10. Are Linux's clock lists all the CAMSS blocks need (no stall on a CSID-lite0/TFE-lite0/CSIPHY access)? → `c3rp`.
-11. The CSID-lite 980's RDI interrupt bits (SOF 12, EOF 9: inferred from the 680's layout at the same offset) → `c3r`'s `irq seen`
-    line (two frames: two SOF/EOF pairs).
+   suffices for PLL0 at 1200 MHz → `c3rp`: **yes** (PLL0 locked).
+7. Frame mode's line padding for 4080-pixel lines → L3's first frame (`c3r`: `frame: written ..., stride ...`; lost in c3r's abort).
+10. Are Linux's clock lists all the CAMSS blocks need (no stall on a CSID-lite0/TFE-lite0/CSIPHY access)? → `c3rp`/`c3r`: **yes**.
+11. The CSID-lite 980's RDI interrupt bits (SOF 12, EOF 9: inferred from the 680's layout at the same offset) → `c3r`'s per-frame
+    lines (`stream: frame 1: SOF +.. EOF +.. BUF_DONE +..`).
+12. What MCLK4 needs besides its RCG and branch: GCC's camera XO or TITAN_TOP (c2f had neither) → `c2f` (both) and `c2fx` (the XO).
+13. Which SMMU words the hypervisor refuses besides an S2CR naming a missing bank (c3r): the release keeps every found word that is
+    not a valid configuration (§4.3 "After c3"); `c3rp`'s `left at` lines and its clean end confirm the rest.
+14. The CSI2 RX status bits of the lite 980 (not named in the specification): `c3r`'s raw words (`first csi2-rx word`) with the
+    frames' times.
 8. Does sysextd activate an ad-hoc, trust-cached camera extension on 27 (C5)? → before L5.
 9. QUP2 SE1's GENI firmware (protocol 3?) for a hardware I2C later → `c1`'s `qup2 se1` line (only when clocked).
 
