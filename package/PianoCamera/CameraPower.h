@@ -10,6 +10,7 @@
 //   bool gccLock(bool take);                    PianoA830's GCC vote lock word around every GCC write
 //   int mmRails(bool on);                       CAMCC's domains through the shared multimedia votes (PianoMmVotes.h: MXC and MMCX
 //                                               at low_svs, MMCX with the display's floor; off: this client's needs withdrawn)
+//   void surveyed(const Survey &s);             step 202's survey (the kernel logs its clock-controller and CAMSS lines)
 //   void step(int n, const char *what);         void note(const char *fmt, ...);
 //
 // Every store goes through put(), which refuses an address outside this level's allowlist (writable(): the camera branches of GCC
@@ -653,6 +654,7 @@ class Session {
     ops.step(kStepResurvey, "the survey again, with the controllers' AHB running");
     s = survey(loader, pmic, so);
     found_ = s;
+    ops.surveyed(s);   // the controllers as step 201 made them readable (logged: c1 could not read them)
     ops.step(kStepRefusals, "level 2's checks");
     BusChoice bus;
     bus.rearCci = opt.rearCci;

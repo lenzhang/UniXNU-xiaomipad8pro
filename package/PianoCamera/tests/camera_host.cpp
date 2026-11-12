@@ -943,6 +943,9 @@ struct TestOps {
     (take ? gccLocks : gccUnlocks)++;
     return true;
   }
+  // Step 202's survey (the kernel logs its controller lines).
+  std::vector<Survey> surveys;
+  void surveyed(const Survey &s) { surveys.push_back(s); }
   // The shared votes as the board sees them: CAMCC (and so every CAMSS block) is readable only with MXC voted (Board::mxc).
   std::vector<bool> mmCalls;
   bool mmFail = false;
@@ -1331,6 +1334,19 @@ static void testTabletC1()
     // The rear (CAMCC through CCI0) votes CAMCC's domains first and withdraws them last; the front never touches CAMCC.
     if (w == Sensor::rear) CHECK(q.ops.mmCalls.size() == 2 && q.ops.mmCalls[0] && !q.ops.mmCalls[1] && res.voted && !q.b.mxcVoted);
     else CHECK(q.ops.mmCalls.empty() && !res.voted);
+  }
+  // c1b: level 2 stopped after step 202 (the rear's path): GCC's branches enabled and CAMCC's domains voted, both controllers read
+  // (the survey handed to the kernel's log), then everything as found: no rail, pin or CAMCC store.
+  {
+    Rig q;
+    tabletC1(q.b);
+    const auto before = q.b.snapshot();
+    PowerOptions po;
+    po.stopAt = kStepResurvey;
+    const SensorResult res = q.run(Sensor::rear, po);
+    CHECK(res.failure == Failure::stopped && res.cleanOff && q.b.violations.empty() && same(before, q.b.snapshot()));
+    CHECK(q.ops.surveys.size() == 1 && q.ops.surveys[0].cc.read && q.ops.surveys[0].mclk.read && q.b.railVotes == 0);
+    CHECK(q.ops.mmCalls.size() == 2 && !q.b.mxcVoted);
   }
   // Without the votes (piano-camera-votes=0) the strict model stalls on CAMCC: the reason the votes come first.
   {

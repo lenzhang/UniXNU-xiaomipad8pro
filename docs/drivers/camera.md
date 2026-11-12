@@ -33,7 +33,7 @@ facts as code, each with its source.
 | Rear S5KJN1 | CCI0 m1 **0x10**; CSIPHY1, 4 lanes (D-PHY), 700 MHz link (1.4 Gbit/s a lane); reset gpio6 active low; vddd L1I 1.096 V (`ldoi1`), vdda 2.8 V fixed (gpio175 enable, 100 µs), vddio L6B 1.8 V (`ldob6`), afvdd L7B 2.8 V (`ldob7`); on: vddd, 1–2 ms, vdda, vddio, afvdd, MCLK, reset release, 10–15 ms; off: reset, MCLK, afvdd, vddio, vdda, 1–2 ms, vddd; ID 0x0000 = 0x38e1; modes 4080×3072@30 (HTS 4352, VTS 4288), 8160×6144@10; RAW10, mounted rotated 180° (Ubuntu sets vflip: BGGR); controls exposure 0x0202, gain 0x0204 (32 = 1×, 32..2048), frame length 0x0340, orientation 0x0101, test pattern 0x0600 (2 = colour bars), stream 0x0100; flash = PianoTorch's lamp | DT, msm | verified (source) |
 | Front OV32D40 | **not on CCI**: QUP2 SE1's pins (`i2c@884000`, SDA gpio4, SCL gpio5, `qup2_se1`, 2 mA, no bias; Ubuntu ran GENI I2C at 1 MHz) **0x10**; CSIPHY4, 4 lanes, 842.4 MHz; reset gpio7 active low; vddio L10B 1.8 V (`ldob10`), dvdd L2G 1.2 V (`ldog2`), avdd 2.8 V fixed (gpio176); on: reset asserted, supplies, 5–6 ms, MCLK, 10–12 ms, reset release, 20–25 ms; ID 0x300a = 0x5632 (five reads, 10–12 ms apart); modes 3264×2448@30, 3264×1836@30, 6528×4896@10; SBGGR10; controls exposure 0x3500 (24 bits), gain 0x3508 (256 = 1×, 288..15872), frame length 0x380e | DT, msm | verified (source) |
 | Rails | the five sensor LDOs supply only the cameras in the DT (L6B/L7B also the disabled VCM); RPMh VRM (+0 mV, +4 enable, +8 mode, 7 = HPM, the DT's initial mode); PMIC letters are SPMI SIDs (b 1, f 5, g 6, i 8); an LDO n at page 0xc0 + n or 0x40 + n − 1 (decided by TYPE 0x04). CSIPHY rails L3G 1.2 V (also the UFS/DSI PHY PLL: never voted), L1F 0.88 V (CSIPHY0/1/3/5), L3I 0.88 V (CSIPHY2/4), both always-on. **At XNU (c1)**: every PPID at 0xc0 + n (L1I 0x8c1, L6B 0x1c6, L7B 0x1c7, L10B 0x1ca, L2G 0x6c2, L3G 0x6c3, L1F 0x5c1, L3I 0x8c3), owner EE 4; the five sensor LDOs disabled (L1I 944 mV, L7B 1800 mV: the votes set the DT's values); L3G 1200, L1F 880, L3I 880 mV enabled and ready; all eight cmd-db addresses found | DT, `PianoWcnRails.h`; tablet | verified (c1) |
-| Pins | none of the ten is in TLMM's reserved ranges (36–39, 48–51, 74); gpio4–7 and 175/176 have the egpio bit (Linux sets EGPIO_ENABLE when it selects a function); sleep states pull down, reset/enable output low. **At XNU (c1)**: all ten GPIO inputs with pull-down at 2 mA (cfg 0x1; the egpio ones 0x801: present, not claimed by apps), none driven | DT, msm; tablet | verified (c1) |
+| Pins | none of the ten is in TLMM's reserved ranges (36–39, 48–51, 74); gpio4–7 and 175/176 have the egpio bit (Linux sets EGPIO_ENABLE when it selects a function); sleep states pull down, reset/enable output low. **At XNU (c1)**: all ten GPIO inputs with pull-down at 2 mA (cfg 0x1; the egpio ones 0x801: present, not claimed by apps), none driven. eGPIO (pinctrl-msm.c's set_mux, behaviour): an eGPIO-capable pin with EGPIO_ENABLE clear is the other owner's (the `egpio` function); selecting any other function, GPIO included, sets EGPIO_ENABLE (the apps TLMM claims it), which is how Ubuntu's camera pinctrl states take gpio4-7/175/176. Levels 2-3 do the same whenever they configure such a pin and give it back with the configuration as found at the power-down (host-tested: gpio7) | DT, msm; tablet | verified (c1) |
 | SMMU | `iommus = <apps_smmu 0x1c00 0x0>`: one stream for every camera write master; Linux's DMA mask 32 bits; the write master's address register holds address >> 8 (40-bit reach). **At XNU (c1)**: SCR0 0x002d0406 (USFCFG set: an unmatched stream faults), IDR0 0x4c017e7f, IDR1 0x60000053: 127 groups (122 free), 83 banks; **no group covers 0x1c00..0x1c1f** (level 3 takes its own window) | DT, msm; tablet | verified (c1) |
 | Firmware | **none** on this path (no `request_firmware`; no ICP/CDM users); `camera_mem` carve-outs exist but are unused | msm, device `source.json` | verified (source) |
 | Focus | GT9764 at CCI0 m1 0x0c, **disabled** ("register protocol unverified"): fixed focus, as in Ubuntu | DT | verified |
@@ -337,6 +337,7 @@ grep -a "PianoCamera" logs/usb-console/<newest>-port0.txt
 |---|---|---|---|
 | `c1` | `piano-camera=1 piano-camera-delay=20` | **yes** | the survey: CAMCC/MCLK readable at the boot rails, the rails' PPIDs, the pins, the SMMU (**passed**, §8.4) |
 | `c1x` | `piano-camera=1 piano-camera-cc=0 piano-camera-mclkcc=0 piano-camera-delay=20` | **yes** | only if `c1` hangs after its `gcc:` line: the rest of the survey without the clock controllers |
+| `c1b` | `piano-camera=2 piano-camera-sensor=1 piano-camera-stop=203 piano-camera-delay=20` | **yes** (c1 passed) | c1's re-test: level 2's steps 201-203 only (CAMCC's domains voted, GCC's three camera branches enabled), the `step 202: the controllers ...` lines (CAMCC's GDSCs, branches, sources, PLLs; the MCLK controller; TITAN_TOP's state) that c1 could not read, then everything as found: no rail, pin, CAMCC or CCI store |
 | `c2f` | `piano-camera=2 piano-camera-sensor=2 piano-camera-delay=20` | **yes**, after `c1` passed | the front: rails, software I2C, 0x5632; no CAMCC write |
 | `c2r` | `piano-camera=2 piano-camera-sensor=1 piano-camera-delay=20` | **yes**, after `c1` passed | the rear over CCI0 (TITAN_TOP, XO clocks), 0x38e1 |
 | `c2rg` | `piano-camera=2 piano-camera-sensor=1 piano-camera-rear-bus=1 piano-camera-delay=20` | **yes** | the rear over software I2C (separates CCI0 from the sensor when `c2r` fails) |
@@ -347,7 +348,7 @@ grep -a "PianoCamera" logs/usb-console/<newest>-port0.txt
 | `c3rs` | `piano-camera=3 piano-camera-sensor=1 piano-camera-pattern=0 piano-camera-frames=4 piano-camera-delay=20` | **yes**, after `c3r` | the rear's scene: four frames, the means with the room light |
 | `c3f` | `piano-camera=3 piano-camera-sensor=2 piano-camera-delay=20` | **yes**, after `c2f` and `c3r` | the front's scene over CSIPHY4 |
 
-Each runs `piano-reset-after=300`. The order is `c1` → (`c1x`) → `c2f` → `c2r` → `c2rg`/`c2r24` as needed → `c3rp` → `c3r` →
+Each runs `piano-reset-after=300`. The order is `c1` → (`c1x`) → `c1b` → `c2f` → `c2r` → `c2rg`/`c2r24` as needed → `c3rp` → `c3r` →
 `c3rs` → `c3f`. **Rebuild the c2 images from this commit on**: images built before it wait at step 201 for CLK_OFF on the
 hardware-gated AHB branches c1 found and stop there (harmlessly: `FAILED at step 201: a GCC branch did not run`, power down
 complete).
@@ -414,6 +415,15 @@ PianoCamera: front rail front vddio (ldob10): found .. mV en 00; on 1800 mV en 8
 PianoCamera: front: N writes logged, M software I2C line changes, 0 refused, 0 off-side warnings; power down complete (everything as found)
 PianoCamera: done: rear 0/0, front 1/1 (chip ID and a clean power-down); ...
 ```
+**c1b** (and the start of every c2/c3 run since c1): `step 201: CAMCC's domains (MXC, MMCX: shared votes); GCC: camera AHB, camera XO,
+MCLK controller AHB (on where off)`, `votes: CAMCC's domains up: ok; mxc hlvl . (vlvl 0x40, ...); 1 command(s) sent`, the three GCC
+writes (`... (GCC camera AHB on)`: CLK_ENABLE only), `step 202: the controllers with GCC's branches enabled (the survey again):` with
+`gcc: camera ahb 88000003 (on (hardware-gated, idle)) ...`, the `camcc gdsc/branches/rcgs/plls`, `mclk-cc` and `mclk0..7` lines
+(the first CAMCC readout under XNU: record them), the CAMSS blocks and CCI0 `not read (TITAN_TOP GDSC off)`; then `step 203`,
+`FAILED at step 203: stopped (piano-camera-stop)` (or a refusal: report it), the power-down (the branches' CLK_ENABLE cleared,
+`votes: CAMCC's domains withdrawn: ok`) and `power down complete`. A hang right after `step 202`: CAMCC is not readable even so
+(report the last lines; c2r would hang the same way).
+
 **c2r**: the same shape with `step 205: the bus: TITAN_TOP, CCI0's clocks from the XO, its pins, the controller`, the TITAN_TOP and
 CCI writes, `rear: CCI0 HW_VERSION ........`, three rails, `rear S5KJN1: chip ID 0x38e1 (expected 0x38e1): OK over CCI0 master 1`.
 

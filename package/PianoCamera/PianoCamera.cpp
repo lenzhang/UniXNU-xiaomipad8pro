@@ -421,7 +421,8 @@ const char *branchWord(uint32_t v)
   return branchHwGated(v) ? "off (hardware-gated)" : "off";
 }
 
-void reportSurvey(const Survey &s)
+// GCC's camera branches, the two clock controllers, the CAMSS blocks and CCI0 (level 1's survey; again after level 2's step 201).
+void reportControllers(const Survey &s)
 {
   const GccState &g = s.gcc;
   note("gcc: camera ahb %08x (%s) xo %08x (%s) mclk-cc ahb %08x (%s) hf-axi %08x (%s) sf-axi %08x (%s); qmip %08x %08x %08x",
@@ -480,6 +481,11 @@ void reportSurvey(const Survey &s)
          s.cci.curCount[1], s.cci.readLevel);
   else
     note("cci0: not read (%s)", s.cci.why);
+}
+
+void reportSurvey(const Survey &s)
+{
+  reportControllers(s);
   if (s.se1.read)
     note("qup2 se1: GENI fw revision %08x (protocol %u%s), status %08x", s.se1.fwRevision, s.se1.protocol(),
          s.se1.protocol() == 3 ? ": I2C" : "", s.se1.status);
@@ -613,6 +619,11 @@ class Ops {
       note("GCC vote lock held by %#x for 50 ms: the camera branch is written anyway (no other driver writes it)",
            __atomic_load_n(&sm8750_gcc_vote_owner, __ATOMIC_ACQUIRE));
     return gccHeld;
+  }
+  void surveyed(const Survey &s)
+  {
+    note("step 202: the controllers with GCC's branches enabled (the survey again):");
+    reportControllers(s);
   }
   int mmRails(bool on)
   {

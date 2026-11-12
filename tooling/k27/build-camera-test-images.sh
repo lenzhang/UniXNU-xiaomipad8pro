@@ -1,14 +1,17 @@
 #!/bin/bash
 # SPDX-License-Identifier: BSD-2-Clause-Patent
 # The test images of docs/drivers/camera.md section 8.1 (PianoCamera, B11): c1 the read-only survey, c1x the survey without the
-# clock controllers (only if c1 hangs), c2f/c2r/c2rg/c2r24 level 2 (one sensor powered, its chip ID read, powered down again) for
-# the front, the rear over CCI0, the rear over software I2C, the rear with the 24 MHz MCLK. All unattended (camera.md 8.1 has why),
-# c2* only after c1 passed. Level 3 (camera.md 8.3): c3rp the rear prepared to the sensor's tables and stopped before stream-on,
-# c3r the rear's colour bars (two frames), c3rs the rear's scene (four frames), c3f the front (two frames); each only after the
-# previous one passed (c3rp after c2r24). Each is a RAM image of the GPU profile (PianoA830, the Turnip stage, ADT vmm-present 0) with the USB
-# console and piano-reset-after as the backstop; PIANO_FAST_BOOT=1 keeps the command line short.
+# clock controllers (only if c1 hangs), c1b c1's re-test (level 2 stopped after its checks: GCC's camera branches enabled and
+# CAMCC's domains voted, so the step-202 survey reads both clock controllers, then all as found; c1 found them unreadable),
+# c2f/c2r/c2rg/c2r24 level 2 (one sensor powered, its chip ID read, powered down again) for the front, the rear over CCI0, the rear
+# over software I2C, the rear with the 24 MHz MCLK. All unattended (camera.md 8.1 has why), c2* only after c1 passed. Level 3
+# (camera.md 8.3): c3rp the rear prepared to the sensor's tables and stopped before stream-on, c3r the rear's colour bars (two
+# frames), c3rs the rear's scene (four frames), c3f the front (two frames); each only after the previous one passed (c3rp after
+# c2r24). Each is a RAM image of the GPU profile (PianoA830, the Turnip stage, ADT vmm-present 0) with the USB console and
+# piano-reset-after as the backstop; PIANO_FAST_BOOT=1 keeps the command line short.
 #
-#   build-camera-test-images.sh [NAME ...]    default: c1 c1x c2f c2r c2rg c2r24 c3rp c3r c3rs c3f; out/ram-cam-<NAME>/ and out/ram-cam-dump/
+#   build-camera-test-images.sh [NAME ...]    default: c1 c1x c1b c2f c2r c2rg c2r24 c3rp c3r c3rs c3f
+#                                             out/ram-cam-<NAME>/ and out/ram-cam-dump/
 #
 # Inputs (this repository's out/ unless set): CAM_KC (out/k27/kc-k27-native.bin, built by
 #   PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh), CAM_ADT (out/adt/piano-k27.adt from the same build), CAM_FD,
@@ -32,11 +35,12 @@ for f in "$KC" "$ADT" "$FD" "$SEED" "$TRUST"; do [ -f "$f" ] || { echo "build-ca
 for s in com.unixnu.driver.PianoCamera com.unixnu.driver.PianoA830; do
   grep -a -q "$s" "$KC" || { echo "build-camera-test-images: $KC has no $s (build it with tooling/k27/build-native-image.sh)" >&2; exit 1; }
 done
-ORDER="c1 c1x c2f c2r c2rg c2r24 c3rp c3r c3rs c3f"
+ORDER="c1 c1x c1b c2f c2r c2rg c2r24 c3rp c3r c3rs c3f"
 image() {
   case $1 in
     c1)    A="piano-camera=1 piano-camera-delay=20" ;;                                                       # the survey
     c1x)   A="piano-camera=1 piano-camera-cc=0 piano-camera-mclkcc=0 piano-camera-delay=20" ;;              # without CAMCC/MCLK-CC
+    c1b)   A="piano-camera=2 piano-camera-sensor=1 piano-camera-stop=203 piano-camera-delay=20" ;;           # c1's re-test: the controllers
     c2f)   A="piano-camera=2 piano-camera-sensor=2 piano-camera-delay=20" ;;                                 # front, software I2C
     c2r)   A="piano-camera=2 piano-camera-sensor=1 piano-camera-delay=20" ;;                                 # rear, CCI0
     c2rg)  A="piano-camera=2 piano-camera-sensor=1 piano-camera-rear-bus=1 piano-camera-delay=20" ;;         # rear, software I2C
