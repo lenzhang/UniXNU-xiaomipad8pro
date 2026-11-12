@@ -41,7 +41,11 @@ volatile int32_t piano_camera_stage = 0;
 // PianoCamera.json, so the KC link resolves both to its one copy (as for PianoWifi, PianoTouch, PianoBluetooth).
 extern volatile uint32_t sm8750_gcc_vote_owner;
 extern volatile uint32_t sm8750_rpmh_drv2_owner;
+// The shared multimedia votes (package/include/PianoMmVotes.h: MXC, MMCX, MM1 with PianoVideo), PianoA830's words too.
+extern volatile uint32_t piano_mm_votes_owner;
+extern volatile uint32_t piano_mm_votes[32];
 }
+#include <PianoMmVotes.h>
 
 namespace {
 
@@ -50,6 +54,7 @@ constexpr uint32_t kTag = 0x43414d31u;   // "CAM1" in the lock words
 struct Args {
   uint32_t level, sensor, rearBus, mclk24, cciKhz, halfUs, pull, blind, hold, stop, cycles, delay;
   uint32_t cc, mclkcc, blocks, qup, spmi, smmu;
+  uint32_t votes, mmcxFloor;
 };
 Args gArgs;
 
@@ -81,6 +86,8 @@ void readArgs()
   gArgs.qup = bootArg("piano-camera-qup", 1);
   gArgs.spmi = bootArg("piano-camera-spmi", 1);
   gArgs.smmu = bootArg("piano-camera-smmu", 1);
+  gArgs.votes = bootArg("piano-camera-votes", 1) ? 1 : 0;
+  gArgs.mmcxFloor = clampArg(bootArg("piano-camera-mmcx-floor", kCamMmcxFloor), 0, 0x1000);
 }
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -307,9 +314,98 @@ bool mapRsc()
   return true;
 }
 
+// ------------------------------------------------------------------ the shared multimedia votes (PianoMmVotes.h): MXC, MMCX, MM1
+// This kext is the helper's camera client: CAMCC's domains (levels 2 and 3), MM1 for the camera NoC (level 3). The resources from
+// the cmd-db copy (the helper's reader), each transaction one TCS on apps DRV-2 under the DRV-2 lock (rpmhSend).
+PianoMmArc gArc[2];   // mxc.lvl, mmcx.lvl
+uint32_t gMm1Addr;
+int gMmLookup = 1;    // 1 not looked up, 0 found, negative missing
+const char *gMmMissing = "";
+int mmLookup()
+{
+  if (gMmLookup <= 0) return gMmLookup;
+  uint32_t any = 0;
+  (void)cmdDbLookup(nullptr, "mxc.lvl", &any);   // the copy, made once
+  if (!gCmdDb) {
+    gMmMissing = "cmd-db";
+    return gMmLookup = -12;
+  }
+  int rc = piano_mm_cmd_db_arc(gCmdDb, kCmdDbBytes, "mxc.lvl", &gArc[0]);
+  if (rc) gMmMissing = "mxc.lvl";
+  if (!rc && (rc = piano_mm_cmd_db_arc(gCmdDb, kCmdDbBytes, "mmcx.lvl", &gArc[1]))) gMmMissing = "mmcx.lvl";
+  if (!rc && (rc = piano_mm_cmd_db(gCmdDb, kCmdDbBytes, "MM1", PIANO_MM_SLAVE_BCM, &gMm1Addr, nullptr, nullptr))) gMmMissing = "MM1";
+  if (!rc && (gArc[0].addr == gArc[1].addr || gMm1Addr == gArc[0].addr || gMm1Addr == gArc[1].addr)) {
+    rc = -3;
+    gMmMissing = "distinct addresses";
+  }
+  gMmLookup = rc ? rc : 0;
+  if (!rc)
+    note("votes: mxc.lvl %#x (%u levels, top vlvl %#x), mmcx.lvl %#x (%u levels), MM1 %#x", gArc[0].addr, gArc[0].count,
+         gArc[0].vlvl[gArc[0].count - 1], gArc[1].addr, gArc[1].count, gMm1Addr);
+  return gMmLookup;
+}
+uint32_t mmAddress(void *, unsigned r) { return r == PIANO_MM_MXC ? gArc[0].addr : r == PIANO_MM_MMCX ? gArc[1].addr : r == PIANO_MM_MM1 ? gMm1Addr : 0; }
+int mmLevel(void *, unsigned r, uint32_t vlvl, uint32_t *hlvl) { return r < 2 ? piano_mm_arc_level(&gArc[r], vlvl, hlvl) : -3; }
+int mmSend(void *, const PianoMmCmd *cmds, unsigned n)
+{
+  if (!mapRsc()) return -19;
+  uint32_t waits = 0;
+  const uint32_t held = __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE);
+  if (held) note("rsc: the DRV-2 lock is held by %#x; waiting (at most 2 s)", held);
+  if (!lockAcquire(&sm8750_rpmh_drv2_owner, &waits, 200000)) {
+    note("rsc: the DRV-2 lock stayed held by %#x for 2 s: the shared votes not sent", __atomic_load_n(&sm8750_rpmh_drv2_owner, __ATOMIC_ACQUIRE));
+    return -16;
+  }
+  RpmhCmd c[3];
+  for (unsigned i = 0; i < n && i < 3; ++i) c[i] = {cmds[i].addr, cmds[i].data};
+  VrmResult res;
+  const int rc = rpmhSend(gRsc, gRscIo, c, n, res);
+  lockRelease(&sm8750_rpmh_drv2_owner);
+  note("rsc: shared votes: %u command(s) (%#x=%#x%s) through TCS %d %s after %u ms", n, c[0].addr, c[0].data, n > 1 ? ", ..." : "", res.tcs,
+       res.done ? "completed" : rc == -16 ? "NOT sent (no idle TCS)" : "NOT completed (left in flight, not used again)", res.waited);
+  return rc;
+}
+void mmSleep(void *, uint32_t ms) { IOSleep(ms); }
+void mmReport(void *, uint32_t event, uint32_t a, uint32_t b)
+{
+  if (event == PianoMmLockWaiting) note("votes: the shared vote lock is held by %#x; waiting", a);
+  else if (event == PianoMmLockGot) note("votes: the shared vote lock taken after %u ms (from %#x)", b, a);
+  else if (event == PianoMmLockBusy) note("votes: the shared vote lock stayed held by %#x for %u ms: nothing voted", a, b);
+  else if (event == PianoMmLockLost) note("votes: the shared vote lock was found held by %#x when given back", a);
+}
+const PianoMmVotesOps gMmOps = {nullptr, mmAddress, mmLevel, mmSend, mmSleep, mmReport};
+PianoMmVotes gMm;
+int mmUpdate(uint32_t mask, const uint32_t need[PIANO_MM_RESOURCES], const char *what)
+{
+  if (mmLookup()) {
+    note("votes: %s: cmd-db lacks %s: nothing voted", what, gMmMissing);
+    return -19;
+  }
+  gMm.words = piano_mm_votes;
+  gMm.lock = &piano_mm_votes_owner;
+  gMm.tag = PianoMmTagCamera;
+  gMm.client = PIANO_MM_CAMERA;
+  gMm.floor[PIANO_MM_MMCX] = gArgs.mmcxFloor;
+  gMm.ops = &gMmOps;
+  const int rc = piano_mm_votes_update(&gMm, mask, need);
+  if (mask & (1u << PIANO_MM_MXC))
+    note("votes: %s: %s; mxc hlvl %u (vlvl %#x, others %#x), mmcx hlvl %u (vlvl %#x, floor %#x, others %#x); %u command(s) sent", what,
+         rc ? "FAILED" : "ok", gMm.level[PIANO_MM_MXC], gMm.vote[PIANO_MM_MXC], gMm.others[PIANO_MM_MXC], gMm.level[PIANO_MM_MMCX],
+         gMm.vote[PIANO_MM_MMCX], gArgs.mmcxFloor, gMm.others[PIANO_MM_MMCX], gMm.count);
+  else
+    note("votes: %s: %s; MM1 %08x (other clients %s it); %u command(s) sent", what, rc ? "FAILED" : "ok", gMm.level[PIANO_MM_MM1],
+         gMm.others[PIANO_MM_MM1] ? "need" : "do not need", gMm.count);
+  return rc;
+}
+
 // --------------------------------------------------------------------------------------------------------------- the report
 const char *onOff(bool on) { return on ? "on" : "off"; }
-const char *branchWord(uint32_t v) { return branchRunning(v) ? (branchEnabled(v) ? "on" : "on (not ours: voted/hw)") : branchEnabled(v) ? "ENABLED but halted" : "off"; }
+const char *branchWord(uint32_t v)
+{
+  if (branchRunning(v)) return branchEnabled(v) ? "on" : "on (not ours: voted/hw)";
+  if (branchEnabled(v)) return branchHwGated(v) ? "on (hardware-gated, idle)" : "ENABLED but halted";
+  return branchHwGated(v) ? "off (hardware-gated)" : "off";
+}
 
 void reportSurvey(const Survey &s)
 {
@@ -419,7 +515,7 @@ void summary(const Survey &s, char *out, unsigned size)
     on += s.rails[i].enabled();
   }
   snprintf(out, size, "gcc cam-ahb %s mclk-ahb %s; camcc %s titan %s; mclk-cc %s mclk1 %s mclk4 %s; cci0 %s; rails %u/%u read, %u on; smmu %u group(s)",
-           onOff(branchRunning(s.gcc.cameraAhb)), onOff(branchRunning(s.gcc.mclkAhb)), s.cc.read ? "read" : "not read",
+           onOff(gccClockOn(s.gcc.cameraAhb)), onOff(gccClockOn(s.gcc.mclkAhb)), s.cc.read ? "read" : "not read",
            s.cc.read ? onOff(s.cc.titanOn()) : "?", s.mclk.read ? "read" : "not read",
            s.mclk.read ? onOff(branchRunning(s.mclk.branch[1])) : "?", s.mclk.read ? onOff(branchRunning(s.mclk.branch[4])) : "?",
            s.cci.read ? "read" : "gated", read, kRailCount, on, s.smmu.count);
@@ -504,6 +600,16 @@ class Ops {
            __atomic_load_n(&sm8750_gcc_vote_owner, __ATOMIC_ACQUIRE));
     return gccHeld;
   }
+  int mmRails(bool on)
+  {
+    const uint32_t need[PIANO_MM_RESOURCES] = {on ? kCamMxcNeed : 0u, on ? kCamMmcxNeed : 0u, 0u};
+    return mmUpdate(1u << PIANO_MM_MXC | 1u << PIANO_MM_MMCX, need, on ? "CAMCC's domains up" : "CAMCC's domains withdrawn");
+  }
+  int mmBus(bool on)
+  {
+    const uint32_t need[PIANO_MM_RESOURCES] = {0u, 0u, on ? PIANO_MM_BCM_ON : 0u};
+    return mmUpdate(1u << PIANO_MM_MM1, need, on ? "the camera NoC (MM1) on" : "the camera NoC (MM1) withdrawn");
+  }
   void step(int n, const char *what)
   {
     piano_camera_stage = n;
@@ -581,9 +687,10 @@ bool PianoCamera::start(IOService *provider)
 {
   if (!IOService::start(provider)) return false;
   note("start: piano-camera=%u sensor=%u rear-bus=%s mclk24=%u cci=%u kHz i2c-half=%u us pull=%u blind=%u hold=%u ms stop=%u cycles=%u "
-       "delay=%u s; survey cc=%u mclkcc=%u blocks=%u qup=%u spmi=%u smmu=%u",
+       "delay=%u s; survey cc=%u mclkcc=%u blocks=%u qup=%u spmi=%u smmu=%u; votes=%u mmcx-floor=%#x",
        gArgs.level, gArgs.sensor, gArgs.rearBus ? "gpio" : "cci", gArgs.mclk24, gArgs.cciKhz, gArgs.halfUs, gArgs.pull, gArgs.blind,
-       gArgs.hold, gArgs.stop, gArgs.cycles, gArgs.delay, gArgs.cc, gArgs.mclkcc, gArgs.blocks, gArgs.qup, gArgs.spmi, gArgs.smmu);
+       gArgs.hold, gArgs.stop, gArgs.cycles, gArgs.delay, gArgs.cc, gArgs.mclkcc, gArgs.blocks, gArgs.qup, gArgs.spmi, gArgs.smmu,
+       gArgs.votes, gArgs.mmcxFloor);
   if (gArgs.level > 2) {
     note("piano-camera=%u: levels 3-5 are designed, not built (docs/drivers/camera.md section 4); running 2", gArgs.level);
     gArgs.level = 2;
@@ -634,8 +741,13 @@ void PianoCamera::run()
   const Sensor both[2] = {Sensor::rear, Sensor::front};
   for (Sensor w : both) {
     const char *why = sensorRefusal(s, w, bus);
-    note("level 2 verdict, %s: %s%s", kSensors[w == Sensor::rear ? 0 : 1].name, why ? "would refuse: " : "ready",
-         why ? why : " (its rails, pins and MCLK are as level 2 expects)");
+    if (why && !s.mclk.read && gArgs.mclkcc && !gccClockOn(s.gcc.mclkAhb))
+      note("level 2 verdict, %s: pending: the clock controllers were not readable (GCC's AHB off); level 2's step 201 turns them on "
+           "(for the rear on CCI0 after voting CAMCC's domains) and checks again at step 203",
+           kSensors[w == Sensor::rear ? 0 : 1].name);
+    else
+      note("level 2 verdict, %s: %s%s", kSensors[w == Sensor::rear ? 0 : 1].name, why ? "would refuse: " : "ready",
+           why ? why : " (its rails, pins and MCLK are as level 2 expects)");
   }
   note("survey: %llu MMIO loads, %u observer reads (%u failed), %u map failures", (unsigned long long)gLoads, s.pmicReads, s.pmicFailures,
        gMapFailures);
@@ -660,6 +772,7 @@ void PianoCamera::run()
   po.blind = gArgs.blind != 0;
   po.holdMs = gArgs.hold;
   po.stopAt = int(gArgs.stop);
+  po.votes = gArgs.votes != 0;
   Ops ops;
   ops.survey = &s;
   unsigned passed[2] = {0, 0}, attempted[2] = {0, 0};

@@ -6,7 +6,9 @@
 // sm8750_rpmh_drv2_owner) around it, as every other user does.
 // package/PianoBluetooth/BtRpmh.h of this repository (UPSTREAM has its sha256) with the namespace and the command type changed
 // (CameraPower.h's VrmCmd for PianoWcnRails.h's PianoWcnVrmCmd); the sequence is unchanged (PianoWifi's vrmLocked and PianoKeyboard's
-// voteLocked are the same). The register layout is package/PianoKeyboard/CmdDb.h's (included, not copied).
+// voteLocked are the same). The register layout is package/PianoKeyboard/CmdDb.h's (included, not copied). Level 3 split it in two:
+// rpmhSend takes each command with its full address (the shared multimedia votes: an ARC's and a BCM's in one TCS), vrmSend adds a
+// VRM resource's base to its registers and calls it; the register sequence is the same.
 #pragma once
 #include <stdint.h>
 #include "CmdDb.h"
@@ -39,12 +41,30 @@ struct VrmResult {
   uint32_t status[3] = {0, 0, 0};
 };
 
+// One command at its full RPMh address (an ARC's or a BCM's: level 3's shared multimedia votes, PianoMmVotes.h).
+struct RpmhCmd {
+  uint32_t addr, data;
+};
+
 // `base` is the resource's RPMh address (cmd-db); each command's register is an offset from it. 0, -16 (no idle TCS), -22 (bad
 // arguments) or -60 (not completed within 100 ms).
+inline int rpmhSend(Rsc &rsc, const RscIo &io, const RpmhCmd *cmds, unsigned count, VrmResult &res);
 inline int vrmSend(Rsc &rsc, const RscIo &io, uint32_t base, const VrmCmd *cmds, unsigned count, VrmResult &res)
 {
   res = VrmResult();
   if (!io.rd || !io.wr || !io.sleepMs || !base || !cmds || !count || count > 3) return -22;
+  RpmhCmd full[3];
+  for (unsigned c = 0; c < count; ++c) full[c] = {base + cmds[c].reg, cmds[c].value};
+  return rpmhSend(rsc, io, full, count, res);
+}
+
+// The transaction itself (BtRpmh.h's sequence, unchanged, over commands that each carry their address). Same answers as vrmSend.
+inline int rpmhSend(Rsc &rsc, const RscIo &io, const RpmhCmd *cmds, unsigned count, VrmResult &res)
+{
+  res = VrmResult();
+  if (!io.rd || !io.wr || !io.sleepMs || !cmds || !count || count > 3) return -22;
+  for (unsigned c = 0; c < count; ++c)
+    if (!cmds[c].addr) return -22;
   const RscLayout &l = rsc.layout;
   static const unsigned kOrder[3] = {2, 1, 0};
   for (unsigned k = 0; k < 3 && res.tcs < 0; ++k)
@@ -55,8 +75,8 @@ inline int vrmSend(Rsc &rsc, const RscIo &io, uint32_t base, const VrmCmd *cmds,
   for (unsigned c = 0; c < count; ++c) {
     const uint32_t cmd = at + l.cmdStride * c;
     io.wr(io.ctx, cmd + l.cmdMsgid, kMsgidWriteResp);
-    io.wr(io.ctx, cmd + l.cmdAddr, base + cmds[c].reg);
-    io.wr(io.ctx, cmd + l.cmdData, cmds[c].value);
+    io.wr(io.ctx, cmd + l.cmdAddr, cmds[c].addr);
+    io.wr(io.ctx, cmd + l.cmdData, cmds[c].data);
   }
   io.wr(io.ctx, at + l.waitForCmpl, mask);
   io.wr(io.ctx, at + l.cmdEnable, mask);

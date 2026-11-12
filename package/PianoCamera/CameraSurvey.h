@@ -41,6 +41,11 @@ struct SurveyOptions {
 // ------------------------------------------------------------------------------------------------------------- decoders
 inline bool branchRunning(uint32_t cbcr) { return !(cbcr & kCbcrClkOff); }
 inline bool branchEnabled(uint32_t cbcr) { return (cbcr & kCbcrEnable) != 0; }
+// A GCC branch with hardware clock gating (HW_CTL, bit 1) reads CLK_OFF set while idle even when enabled (the tablet's camera and
+// MCLK-controller AHB branches, c1 2026-11-12: 0x88000002 off; the display's 0x88000003 enabled and idle, dpu.md §2): Linux's rule
+// (clk-branch.c skips the halt check in hardware gating mode) counts it on when enabled; otherwise a branch is on when CLK_OFF is clear.
+inline bool branchHwGated(uint32_t cbcr) { return (cbcr & kCbcrHwCtl) != 0; }
+inline bool gccClockOn(uint32_t cbcr) { return branchRunning(cbcr) || (branchEnabled(cbcr) && branchHwGated(cbcr)); }
 inline bool gdscOn(uint32_t gdscr) { return (gdscr & kGdscPwrOn) != 0; }
 inline bool gdscRequestedOn(uint32_t gdscr) { return !(gdscr & kGdscCollapse); }
 inline bool pllLocked(uint32_t mode) { return (mode & kPllLockDet) != 0; }
@@ -178,10 +183,10 @@ class Surveyor {
     gcc(s);
     // A clock controller is read only while GCC clocks its AHB interface (Linux keeps both branches on from GCC's probe).
     if (!o_.cc) s.cc.why = "piano-camera-cc=0";
-    else if (!branchRunning(s.gcc.cameraAhb)) s.cc.why = "GCC camera AHB off (its registers are not clocked)";
+    else if (!gccClockOn(s.gcc.cameraAhb)) s.cc.why = "GCC camera AHB off (its registers are not clocked)";
     else camcc(s);
     if (!o_.mclkcc) s.mclk.why = "piano-camera-mclkcc=0";
-    else if (!branchRunning(s.gcc.mclkAhb)) s.mclk.why = "GCC MCLK-controller AHB off (its registers are not clocked)";
+    else if (!gccClockOn(s.gcc.mclkAhb)) s.mclk.why = "GCC MCLK-controller AHB off (its registers are not clocked)";
     else mclkcc(s);
     if (o_.blocks) blocks(s);
     if (o_.qup) se1(s);
@@ -453,7 +458,8 @@ inline const char *sensorRefusal(const Survey &s, Sensor which, const BusChoice 
 {
   const bool rear = which == Sensor::rear;
   const SensorFacts &f = kSensors[rear ? 0 : 1];
-  if (!s.mclk.read) return "the MCLK controller was not read (piano-camera-mclkcc=0)";
+  if (!s.mclk.read) return s.mclk.why && !strcmp(s.mclk.why, "piano-camera-mclkcc=0") ? "the MCLK controller was not read (piano-camera-mclkcc=0)"
+                                                                                       : "the MCLK controller was not read (its GCC AHB is off)";
   if (branchEnabled(s.mclk.branch[f.mclk]) || branchRunning(s.mclk.branch[f.mclk])) return "its MCLK branch is already on";
   const unsigned reset = rear ? kPinRearReset : kPinFrontReset, avdd = rear ? kPinRearAvdd : kPinFrontAvdd;
   if (pinDrivenHigh(s.pins[reset].cfg, s.pins[reset].io)) return "its reset line is driven high (the sensor is in use)";

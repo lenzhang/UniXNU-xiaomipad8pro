@@ -290,4 +290,143 @@ constexpr SensorFacts kSensors[2] = {
 constexpr unsigned kRearVdddToVddaUs = 2000, kRearResetToIdUs = 15000, kRearOffVdddUs = 2000;
 constexpr unsigned kFrontSupplyToMclkUs = 6000, kFrontMclkToResetUs = 12000, kFrontResetToIdUs = 25000;
 
+// ================================================================================================================= level 3
+// Sources besides the above: CSIPHY = drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c (the common block's writes; the lane
+// table itself is data: data/camera/csiphy-v2.4.tbl), CSID980 = camss-csid-980.c (the lite CSID's registers), CSID680 =
+// camss-csid-680.c (the RDI interrupt bits, whose lite-980 register is at the same offset 0xec: the bits are *inferred* to match),
+// VFE4 = camss-vfe-gen4.c (the TFE-lite bus and its write masters), CAMSS = camss.c (sm8750's clocks and rates, the interconnect
+// paths), ICC = drivers/interconnect/qcom/sm8750.c (MM1's nodes), DTCAM = sm8750-xiaomi-piano-camera.dtsi (the camss node).
+
+// --- CAMCC PLL0 (Taycan ELU; CAMCC, PLL): MODE +0 (31 LOCK_DET, 2 RESET_N, 1 BYPASSNL, 0 OUTCTRL), OPMODE +4 (1 run), L_VAL +0x10
+// (15:0 L, 31:16 CAL_L), ALPHA +0x14, USER_CTL +0x18 (2:0 the main/even/odd outputs, 13:10 the even divider, 17:14 the odd
+// divider), USER_CTL_U +0x1c, CONFIG_CTL +0x20, _U +0x24, _U1 +0x28. Linux's configuration (written only when the PLL is not running;
+// zero words are not written): L 0x3e with CAL_L 0x44 (19.2 MHz x 62.5 = 1200 MHz with alpha 0x8000), CONFIG_CTL 0x19660387 /
+// 0x098060a0 / 0xb416cb20, USER_CTL 0x00008400 (even /2 = 600 MHz, odd /3 = 400 MHz), USER_CTL_U 2; then OUTCTRL off, standby,
+// RESET_N. Enable: RESET_N, RUN, LOCK_DET within 1500 us, the three outputs, OUTCTRL. Disable: OUTCTRL off, outputs off, standby.
+constexpr uint32_t kCcPll0 = 0x0;
+constexpr uint32_t kTaycanL = 0x10, kTaycanAlpha = 0x14, kTaycanUserCtl = 0x18, kTaycanUserCtlU = 0x1c, kTaycanConfigCtl = 0x20,
+                   kTaycanConfigCtlU = 0x24, kTaycanConfigCtlU1 = 0x28;
+constexpr uint32_t kPll0LVal = 0x3eu | 0x44u << 16, kPll0Alpha = 0x8000, kPll0ConfigCtl = 0x19660387, kPll0ConfigCtlU = 0x098060a0,
+                   kPll0ConfigCtlU1 = 0xb416cb20, kPll0UserCtl = 0x00008400, kPll0UserCtlU = 0x00000002, kPllOutputs = 7;
+constexpr uint32_t kPllResetN = 1u << 2, kPllBypassNl = 1u << 1;
+constexpr unsigned kPllLockUs = 1500;
+constexpr uint64_t kPll0Hz = 1200000000ull;
+
+// --- the clocks level 3 runs (CAMSS sm8750: csiphy n {csiphyN, csiN_timer, cpas_ahb, cpas_fast_ahb}, the lite CSID
+// {vfe_lite_csid, vfe_lite_cphy_rx}, the lite TFE {gcc_axi_hf, vfe_lite_ahb, vfe_lite, cpas_vfe_lite, camnoc_rt_axi,
+// camnoc_nrt_axi, qdss_debug_xo}; CAMCC: their parents). RCG CFG words (half divider 2 d - 1 | source << 8; the parent maps: 0 XO,
+// 1 PLL0 main, 2 PLL0 even, 3 PLL0 odd): cphy_rx, the CSIPHY timers, ife_lite and ife_lite_csid at 400 MHz = PLL0 main / 3 (0x105);
+// camnoc_rt_axi at 200 MHz = PLL0 even / 3 (0x205). The AHBs (slow, fast) stay on the XO, their reset state (Linux gives them no
+// rate: it leaves them where they are). The branches are BRANCH_HALT (CLK_OFF follows) except camnoc_nrt_axi (voted halt with
+// hardware gating: not waited on).
+constexpr uint32_t kRcgCfg400 = 5u | 1u << 8, kRcgCfg200Even = 5u | 2u << 8;
+constexpr uint32_t kCcCamnocNrtAxi = 0x11310, kCcCamnocRtIfeLite = 0x11178, kCcQdssDebugXo = 0x11348;
+struct L3Rcg {
+  const char *name;
+  uint32_t off, cfg;
+  uint64_t hz;
+};
+// The RCGs in their enable order (the PHY timer of the sensor's CSIPHY is chosen at run time: index kL3RcgTimer).
+constexpr L3Rcg kL3Rcgs[] = {
+  {"cphy-rx", kCcCphyRxRcg, kRcgCfg400, 400000000},       {"csi-timer", 0, kRcgCfg400, 400000000},
+  {"ife-lite", kCcIfeLiteRcg, kRcgCfg400, 400000000},     {"ife-lite-csid", kCcIfeLiteCsidRcg, kRcgCfg400, 400000000},
+  {"camnoc-rt-axi", kCcCamnocRtAxiRcg, kRcgCfg200Even, 200000000},
+};
+constexpr unsigned kL3RcgCount = sizeof kL3Rcgs / sizeof kL3Rcgs[0], kL3RcgTimer = 1;
+struct L3Branch {
+  const char *name;
+  uint32_t off;
+  bool halt;   // CLK_OFF is waited on
+};
+// The branches, in their enable order (the sensor's CSIPHY and timer branches chosen at run time: indexes kL3BranchPhy/Timer).
+constexpr L3Branch kL3Branches[] = {
+  {"top-fast-ahb", kCcCamTopFastAhb, true}, {"csiphy", 0, true},          {"csi-timer", 0, true},
+  {"camnoc-rt-axi", kCcCamnocRtAxi, true},  {"camnoc-nrt-axi", kCcCamnocNrtAxi, false}, {"camnoc-rt-ife-lite", kCcCamnocRtIfeLite, true},
+  {"ife-lite-ahb", kCcIfeLiteAhb, true},    {"ife-lite", kCcIfeLite, true}, {"ife-lite-csid", kCcIfeLiteCsid, true},
+  {"ife-lite-cphy-rx", kCcIfeLiteCphyRx, true}, {"qdss-debug-xo", kCcQdssDebugXo, true},
+};
+constexpr unsigned kL3BranchCount = sizeof kL3Branches / sizeof kL3Branches[0], kL3BranchPhy = 1, kL3BranchTimer = 2;
+inline uint32_t csiphyBranch(unsigned n) { return n == 1 ? kCcCsiphy1 : kCcCsiphy4; }
+inline uint32_t csiTimerBranch(unsigned n) { return n == 1 ? kCcCsi1Timer : kCcCsi4Timer; }
+inline uint32_t csiTimerRcg(unsigned n) { return n == 1 ? kCcCsi1TimerRcg : kCcCsi4TimerRcg; }
+
+// --- the votes (package/include/PianoMmVotes.h): CAMCC's power domains MMCX and MXC at low_svs (DT camcc required-opps; its PLLs
+// run on MXC); MMCX's floor is the boot display's NOM_L1 (piano-camera-mmcx-floor); BCM MM1 on: the hf path qnm_camnoc_hf is one of
+// MM1's nodes (ICC). The rest of the camera's interconnect paths (MM0 qns_mem_noc_hf, SH1, SH0/MC0/ACV for DDR, CN0 for the ahb
+// path) are not voted: the display (MM0, from the boot) and PianoA830 (DDR at its host level, CN0) hold them above what a bounded
+// RAW stream moves (4080 x 3072 RAW10 at 30 fps: 470 MB/s; Linux's hf_mnoc vote 472/926 MB/s).
+constexpr uint32_t kCamMxcNeed = 0x40, kCamMmcxNeed = 0x40, kCamMmcxFloor = 0x140;
+
+// --- CSIPHY (CSIPHY): the common block at +kCsiphyTableCommon (0x1000, from the table's data), CTRLn at common + 4 n, STATUSn at
+// common + status (0x138) + 4 n. Reset: CTRL0 = 1, 5..8 ms, CTRL0 = 0. Version: CTRL6 = SHOW_REV_ID (bit 1), then STATUS12..15 (one
+// byte each, low first). Enable: CTRL5 = CLK_ENABLE (bit 7) | bit (2 pos) per data lane (0xd5 for lanes 0..3), CTRL6 =
+// COMMON_PWRDN_B (bit 0), CTRL7 = 2, CTRL0 = 0; the lane table (settle entries take the count); CTRL11..21 = 0 (interrupts masked).
+// Disable: CTRL5 = 0, CTRL6 = 0. Settle count: (85 ns + 6 x UI / 2) / timer period - 6, UI = 1 / link frequency (integer ps).
+constexpr uint32_t kCsiphyBytes = 0x2000;
+constexpr uint32_t kCsiphyClkEnable = 1u << 7, kCsiphyPwrdnB = 1u << 0, kCsiphyShowRevId = 1u << 1, kCsiphyCtrl7 = 2;
+constexpr unsigned kCsiphyResetUs = 8000;
+inline uint32_t csiphyLaneMask(unsigned lanes)
+{
+  uint32_t v = kCsiphyClkEnable;
+  for (unsigned i = 0; i < lanes; ++i) v |= 1u << (2 * i);
+  return v;
+}
+inline uint8_t csiphySettle(uint64_t linkHz, uint64_t timerHz)
+{
+  if (!linkHz || !timerHz) return 0;
+  const uint32_t ui = uint32_t(1000000000000ull / linkHz) / 2, settle = 85000 + 6 * ui, period = uint32_t(1000000000000ull / timerHz);
+  return uint8_t(settle / period - 6);
+}
+
+// --- CSID-lite (CSID980; lite offsets): RST_CFG 0xc (RST_MODE bit 0, RST_LOCATION bit 4), RST_CMD 0x10 (HW reset bit 0, IRQ reset
+// bit 2), IRQ_CMD 0x14 (bit 0 clear), RUP_AUP_CMD 0x18 (RUP of RDI n bit 4 + n, AUP bit 20 + n: kept as one register value that
+// accumulates, as the driver does), TOP_IRQ status/mask/clear 0x7c/0x80/0x84 (bit 0 RST_DONE, bit 13 BUF_DONE), BUF_DONE status/mask/
+// clear 0x8c/0x90/0x94 (RDI n at bit 1 + n), CSI2 RX status/mask/clear 0x9c/0xa0/0xa4, RX_CFG0 0x200 (lanes - 1, PHY index + 1 at 20,
+// the lane map 0x3210 at 4), RX_CFG1 0x204 (bit 0 ECC correction), RDI0 CFG0 0x500 (5 RETIME_BS, 6 TIMESTAMP_EN, 8 TIMESTAMP_STB_SEL,
+// 15:12 decode format 0xf "payload only", 21:16 data type, 26:22 VC, 28:27 DT_ID, 31 enable), RDI0 CTRL 0x504 (bit 0 start), RDI0 CFG1
+// 0x510 (bit 15 MIPI packing). The RDI interrupt status/mask/clear 0xec/0xf0/0xf4 (CSID980 names RUP_DONE bit 23 there; CSID680, the
+// same offsets: INPUT_SOF 12, INPUT_EOF 9, CAMIF_SOF 4, CAMIF_EOF 3, FIFO_OVERFLOW 2, pixel/line count errors 13/14, the error
+// recovery overflow/frame drop 19/18, the width/height violations 27/26: *inferred* for the 980-lite). Reset completes within 500 ms.
+constexpr uint64_t kCsidLite0 = 0x0ad6d000, kCsidLiteBytes = 0xa00;
+constexpr uint32_t kCsidRstCfg = 0xc, kCsidRstCmd = 0x10, kCsidIrqCmd = 0x14, kCsidRupAup = 0x18;
+constexpr uint32_t kCsidTopStatus = 0x7c, kCsidTopMask = 0x80, kCsidTopClear = 0x84;
+constexpr uint32_t kCsidBufStatus = 0x8c, kCsidBufMask = 0x90, kCsidBufClear = 0x94;
+constexpr uint32_t kCsidRxStatus = 0x9c, kCsidRxMask = 0xa0, kCsidRxClear = 0xa4;
+constexpr uint32_t kCsidRxCfg0 = 0x200, kCsidRxCfg1 = 0x204;
+constexpr uint32_t kCsidRdiCfg0 = 0x500, kCsidRdiCtrl = 0x504, kCsidRdiCfg1 = 0x510;
+constexpr uint32_t kCsidRdiStatus = 0xec, kCsidRdiMask = 0xf0, kCsidRdiClear = 0xf4;
+constexpr uint32_t kCsidRstDone = 1u << 0, kCsidTopBufDone = 1u << 13, kCsidBufRdi0 = 1u << 1;
+constexpr uint32_t kCsidRstValue = 1u << 4 | 1u << 0, kCsidRstCmdValue = 1u << 0 | 1u << 2;
+constexpr uint32_t kCsidRupRdi0 = 1u << 4, kCsidAupRdi0 = 1u << 20;
+constexpr uint32_t kRdiRupDone = 1u << 23, kRdiInputSof = 1u << 12, kRdiInputEof = 1u << 9, kRdiCamifSof = 1u << 4,
+                   kRdiCamifEof = 1u << 3, kRdiFifoOverflow = 1u << 2;
+constexpr uint32_t kRdiErrors = 1u << 2 | 1u << 13 | 1u << 14 | 1u << 18 | 1u << 19 | 1u << 26 | 1u << 27;
+constexpr uint32_t kRdiMaskL3 = kRdiRupDone | kRdiInputSof | kRdiInputEof | kRdiCamifSof | kRdiCamifEof | kRdiErrors;
+constexpr unsigned kCsidResetMs = 500;
+constexpr uint32_t kMipiRaw10 = 0x2b, kDecodePayloadOnly = 0xf;
+constexpr uint32_t kRdiCfg0Base = 1u << 5 | 1u << 6 | 1u << 8 | kDecodePayloadOnly << 12 | kMipiRaw10 << 16;   // VC 0, DT_ID 0
+constexpr uint32_t kRdiCfg0Enable = 1u << 31, kRdiCfg1Mipi = 1u << 15;
+inline uint32_t csidRxCfg0(unsigned lanes, unsigned phy) { return (lanes - 1) | 0x3210u << 4 | (phy + 1) << 20; }
+
+// --- TFE-lite (VFE4; the lite bus at +0x200 on the 980 generation): CGC override +0x208 (0x7ffffff: no clock gating at the bus
+// input), the test bus +0x328, write master n at +0x700 + 0x100 n: CFG +0 (bit 0 enable, bit 16 frame-based mode), IMAGE_ADDR +4
+// (address >> 8), FRAME_INCR +8 (ALIGN(bytes per line, 16) x height >> 8), IMAGE_CFG_0 +0xc (0xffff: the default width), IMAGE_CFG_2
+// +0x14 (0xffff: the default stride), PACKER +0x18 (0), IRQ subsample period/pattern +0x30/+0x34 (0/1), MMU prefetch cfg/max +0x60/
+// +0x64 (1/0xffffffff). RDI0 is write master 0 on the lite TFE. The lite TFE has no frame-drop registers.
+constexpr uint64_t kTfeLite0 = 0x0ad6e000, kTfeLiteBytes = 0x3000;
+constexpr uint32_t kTfeCgcOverride = 0x208, kTfeTestBus = 0x328, kWm0 = 0x700;
+constexpr uint32_t kWmCfg = 0x0, kWmImageAddr = 0x4, kWmFrameIncr = 0x8, kWmImageCfg0 = 0xc, kWmImageCfg2 = 0x14, kWmPacker = 0x18,
+                   kWmSubPeriod = 0x30, kWmSubPattern = 0x34, kWmPrefetch = 0x60, kWmPrefetchMax = 0x64;
+constexpr uint32_t kWmEnable = 1u << 0, kWmFrameMode = 1u << 16, kWmCgcAll = 0x7ffffff;
+constexpr uint64_t kWmAddressLimit = 1ull << 40;   // address >> 8 in 32 bits
+
+// --- the sensors at level 3 (S5K, OV; data/camera's tables): the smallest mode of each, the controls written between the mode and
+// stream-on. Rear: 4080 x 3072 (the only mode with 24 MHz EXTCLK PLL words for 30 fps; the other is 8160 x 6144), its test pattern
+// register 0x0600 (16 bits: 2 = colour bars), orientation 0x0101 (8 bits; 0 native: the colour-bars check needs no flip). Front:
+// 3264 x 1836 (the smallest of its three), no control (its own exposure/gain from its tables; its test pattern register is
+// unverified in the driver).
+constexpr uint16_t kS5kTestPattern = 0x0600, kS5kOrientation = 0x0101;
+constexpr unsigned kRearL3Width = 4080, kRearL3Height = 3072, kFrontL3Width = 3264, kFrontL3Height = 1836;
+inline uint32_t raw10Bytes(unsigned width) { return width / 4 * 5; }
+
 }  // namespace pianocamera

@@ -15,6 +15,7 @@ P=$D/package/PianoCamera; O=$D/out/native-kexts/PianoCamera; G=$O/gen
 INC=(-I "$P" -I "$D/package/PianoPower" -I "$D/package/PianoKeyboard")
 mkdir -p "$O/host-tests" "$G"
 # The tables: the tool's own test, then data/camera as pinned (a changed or truncated table stops the build), then the header.
+"$D/package/include/tests/run.sh"   # the shared protocols (PianoMmVotes.h: the MXC/MMCX/MM1 votes this kext shares with PianoVideo)
 python3 "$D/tooling/camera/sensor-tables.py" --self-test
 python3 "$D/tooling/camera/sensor-tables.py" check "$D/data/camera" || { echo "Error: data/camera does not match its MANIFEST" >&2; exit 1; }
 python3 "$D/tooling/camera/sensor-tables.py" header "$D/data/camera" "$G/CameraTables.h"
@@ -32,7 +33,7 @@ fi
 python3 "$D/tooling/k27/build-native-kext.py" PianoCamera "$P/PianoCamera.cpp" "$D/tooling/k27/NativeKextGlue.cpp" "${INC[@]}" \
   --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
-# PianoA830's lock words (DRV-2, GCC votes) come from that kext (a library in PianoCamera.json, linked before PianoCamera in
-# configs/k27-native-kexts.txt), resolved by the KC link.
+# PianoA830's lock words (DRV-2, GCC votes) and the shared multimedia votes' words come from that kext (a library in
+# PianoCamera.json, linked before PianoCamera in configs/k27-native-kexts.txt), resolved by the KC link.
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" --library-prefix _sm8750_rpmh_drv2_owner \
-  --library-prefix _sm8750_gcc_vote_owner | cut -c1-160 >&2
+  --library-prefix _sm8750_gcc_vote_owner --library-prefix _piano_mm_votes | cut -c1-160 >&2

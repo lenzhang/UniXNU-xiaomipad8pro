@@ -8,6 +8,8 @@
 //   int vrm(unsigned rail, const VrmCmd *cmds, unsigned n);   one RPMh VRM transaction for kRails[rail] under the DRV-2 lock
 //   int pmic(unsigned rail, RailState &r);      the rail's PMIC state again over the SPMI observer (reads only)
 //   bool gccLock(bool take);                    PianoA830's GCC vote lock word around every GCC write
+//   int mmRails(bool on);                       CAMCC's domains through the shared multimedia votes (PianoMmVotes.h: MXC and MMCX
+//                                               at low_svs, MMCX with the display's floor; off: this client's needs withdrawn)
 //   void step(int n, const char *what);         void note(const char *fmt, ...);
 //
 // Every store goes through put(), which refuses an address outside this level's allowlist (writable(): the camera branches of GCC
@@ -18,7 +20,9 @@
 // address before the read.
 //
 // Rear (S5KJN1, CCI0 master 1 or software I2C on gpio115/116), steps:
-//   201 GCC: camera AHB, camera XO, the MCLK controller's AHB on where off      202 the survey again (the controllers readable now)
+//   201 on the CAMCC path (the rear on CCI0, or level 3): CAMCC's domains voted (MXC, MMCX: the shared helper), GCC's camera AHB and
+//       camera XO; always the MCLK controller's AHB; each where off (a hardware-gated branch counts on once enabled: Linux's rule;
+//       the c1 survey found all three off)                                     202 the survey again (the controllers readable now)
 //   203 refusals (CameraSurvey.h sensorRefusal)
 //   205 the bus, first (as Linux has it up from its probe): CAMCC's critical branches, TITAN_TOP, the top AHB from the XO, CCI0's
 //       clock from the XO (19.2 MHz), its pins, the controller reset and timed (400 kHz, or 100 with piano-camera-cci-khz=100); or the
@@ -53,6 +57,13 @@ struct PowerOptions {
   bool blind = false;        // vote a rail whose PMIC state could not be read
   unsigned holdMs = 0;       // keep the sensor powered this long after the ID (piano-camera-hold)
   int stopAt = 0;            // piano-camera-stop: power down after this step
+  // Before the first CAMCC access (the rear on CCI0, or `camss`): CAMCC's power domains voted through the shared multimedia-vote
+  // helper (ops.mmRails: MXC and MMCX at low_svs, MMCX with the display's floor), as Linux has them up before it touches CAMCC (c1,
+  // 2026-11-12: GCC's camera AHB was off, so CAMCC's first access is this level's); withdrawn after the power-down.
+  // piano-camera-votes=0 leaves them out.
+  bool votes = true;
+  // Level 3: TITAN_TOP, the camera AHB and GCC's camera AHB/XO for either sensor and bus (CSIPHY, CSID and TFE are under it).
+  bool camss = false;
 };
 
 enum : int {
@@ -61,7 +72,7 @@ enum : int {
 };
 
 enum class Failure : uint8_t {
-  none, refused, allowlist, gcc, rail, railVoltage, gdsc, branch, rcg, pll, cci, bus, idMismatch, idRead, stopped,
+  none, refused, allowlist, gcc, rail, railVoltage, gdsc, branch, rcg, pll, cci, bus, idMismatch, idRead, stopped, votes,
 };
 inline const char *failureName(Failure f)
 {
@@ -81,6 +92,7 @@ inline const char *failureName(Failure f)
   case Failure::idMismatch: return "the chip ID is not the expected one";
   case Failure::idRead: return "the chip ID read failed";
   case Failure::stopped: return "stopped (piano-camera-stop)";
+  case Failure::votes: return "the shared multimedia votes (MXC/MMCX) were not sent";
   }
   return "?";
 }
@@ -105,6 +117,8 @@ struct SensorResult {
   uint32_t cciVersion = 0, lastValue = 0;
   RailRecord rails[3];
   unsigned writes = 0, quietWrites = 0, refusedStores = 0, offWarnings = 0;
+  bool voted = false;          // CAMCC's domains voted (and withdrawn at the power-down)
+  unsigned sensorWrites = 0, sensorWriteFailures = 0;   // level 3's register writes over the sensor's bus
 };
 
 // What was changed, so that powerDown() takes back exactly that.
@@ -123,6 +137,7 @@ struct Undo {
   bool rail[kRailCount] = {};
   bool cciUp = false;
   uint32_t cciIrqMask = 0;
+  bool votes = false;
 };
 
 template <class O>
@@ -135,6 +150,14 @@ class Session {
   // Powers `which`, reads its ID, powers it down. `s` is level 1's survey (re-read here after step 201).
   SensorResult run(Sensor which, const Loader &loader, const Pmic &pmic, const SurveyOptions &so, Survey &s)
   {
+    begin(which, loader, pmic, so, s);
+    end();
+    return r_;
+  }
+  // Level 3's halves of run(): begin() powers the sensor and reads its ID (true: the ID matched and it stays powered, its bus up);
+  // end() powers it down (always, after begin, whatever begin returned).
+  bool begin(Sensor which, const Loader &loader, const Pmic &pmic, const SurveyOptions &so, Survey &s)
+  {
     r_ = SensorResult();
     u_ = Undo();
     r_.attempted = true;
@@ -144,8 +167,36 @@ class Session {
     r_.bus = rear_ ? (opt.rearCci ? "CCI0 master 1" : "software I2C gpio115/116") : "software I2C gpio4/5";
     found_ = s;
     if (bringUp(loader, pmic, so, s)) readId();
-    powerDown();
-    return r_;
+    return r_.idOk;
+  }
+  void end() { powerDown(); }
+  const SensorResult &result() const { return r_; }
+  bool viaCci() const { return rear_ && opt.rearCci; }
+  // One register write over the sensor's bus (level 3: its tables and controls): the 16-bit register address, then `bytes` (1..3)
+  // of the value, big-endian. Only while begin()'s bus is up.
+  bool sensorWrite(uint16_t reg, unsigned bytes, uint32_t value)
+  {
+    if (!bytes || bytes > 3 || !r_.idOk) return false;
+    uint8_t b[5] = {uint8_t(reg >> 8), uint8_t(reg)};
+    for (unsigned i = 0; i < bytes; ++i) b[2 + i] = uint8_t(value >> (8 * (bytes - 1 - i)));
+    bool ok;
+    if (viaCci()) {
+      r_.cci = cci_.write(f_->address, b, 2 + bytes);
+      ok = r_.cci == CciResult::ok;
+    } else {
+      r_.i2c = bit_.write(f_->address, b, 2 + bytes);
+      ok = r_.i2c == I2c::ok;
+    }
+    ++r_.sensorWrites;
+    if (!ok) ++r_.sensorWriteFailures;
+    return ok;
+  }
+  bool sensorRead(uint16_t reg, uint8_t *out, unsigned n)
+  {
+    if (!n || n > 4 || !r_.idOk) return false;
+    if (viaCci()) return (r_.cci = cci_.readReg(f_->address, reg, 2, out, n)) == CciResult::ok;
+    const uint8_t a[2] = {uint8_t(reg >> 8), uint8_t(reg)};
+    return (r_.i2c = bit_.writeRead(f_->address, a, 2, out, n)) == I2c::ok;
   }
 
   // ------------------------------------------------------------------------------------------------------ the allowlist
@@ -233,15 +284,19 @@ class Session {
     if (!put(cbcr, v & ~kCbcrEnable, what)) return;
     if (!poll(cbcr, kCbcrClkOff, kCbcrClkOff, kBranchPollUs)) ++r_.offWarnings;   // a branch another vote keeps running
   }
+  // GCC's camera branches: CLK_ENABLE set where clear; then, by Linux's rule, a hardware-gated branch (HW_CTL: the tablet's camera
+  // and MCLK-controller AHB, c1 2026-11-12) counts as on without a CLK_OFF wait (it reads CLK_OFF set while idle); any other must
+  // show CLK_OFF clear within 500 us.
   bool gccBranchOn(unsigned i, uint32_t off, const char *what)
   {
     const uint32_t v = ops.rd(kGcc + off);
-    if ((v & kCbcrEnable) && branchRunning(v)) return true;
+    if (branchEnabled(v) && gccClockOn(v)) return true;
     ops.gccLock(true);
     const bool ok = put(kGcc + off, v | kCbcrEnable, what);
     ops.gccLock(false);
     if (!ok) return false;
     u_.gcc[i] = !(v & kCbcrEnable);
+    if (branchHwGated(v)) return true;
     return poll(kGcc + off, kCbcrClkOff, 0, kBranchPollUs);
   }
   void gccBranchOff(unsigned i, uint32_t off, const char *what)
@@ -469,17 +524,17 @@ class Session {
       }
   }
   // The CCI's clocks: the slow AHB source and CCI0's source on the XO (their reset state; programmed only if found otherwise), the
-  // top AHB and CCI0 branches.
-  bool cciClocksOn(int step)
+  // top AHB and CCI0 branches. withCci false (level 3 without CCI0): the AHB part only.
+  bool cciClocksOn(int step, bool withCci = true)
   {
     const uint64_t slow = kCamCc + kCcSlowAhbRcg, cci = kCamCc + kCcCci0Rcg;
-    const uint32_t slowCfg = ops.rd(slow + kRcgCfg), cciCfg = ops.rd(cci + kRcgCfg);
+    const uint32_t slowCfg = ops.rd(slow + kRcgCfg), cciCfg = withCci ? ops.rd(cci + kRcgCfg) : 0;
     if (!rcgIsXoUndivided(slowCfg)) {
       u_.slowAhbRcg = true;
       u_.slowAhbCfg = slowCfg;
       if (!rcgSet(slow, kRcgCfgXo, false, 0, 0, 0, "slow AHB RCG CFG: XO / 1")) return fail(step, Failure::rcg);
     }
-    if (!rcgIsXoUndivided(cciCfg)) {
+    if (withCci && !rcgIsXoUndivided(cciCfg)) {
       u_.cci0Rcg = true;
       u_.cci0Words[0] = cciCfg;
       u_.cci0Words[1] = ops.rd(cci + kRcgM);
@@ -487,12 +542,12 @@ class Session {
       u_.cci0Words[3] = ops.rd(cci + kRcgD);
       if (!rcgSet(cci, kRcgCfgXo, false, 0, 0, 0, "CCI0 RCG CFG: XO / 1 (19.2 MHz)")) return fail(step, Failure::rcg);
     }
-    const uint32_t top = ops.rd(kCamCc + kCcCamTopAhb), c0 = ops.rd(kCamCc + kCcCci0);
+    const uint32_t top = ops.rd(kCamCc + kCcCamTopAhb), c0 = withCci ? ops.rd(kCamCc + kCcCci0) : 0;
     if (!((top & kCbcrEnable) && branchRunning(top))) {
       u_.topAhb = true;
       if (!branchOn(kCamCc + kCcCamTopAhb, "camera top AHB branch on")) return fail(step, Failure::branch);
     }
-    if (!((c0 & kCbcrEnable) && branchRunning(c0))) {
+    if (withCci && !((c0 & kCbcrEnable) && branchRunning(c0))) {
       u_.cci0 = true;
       if (!branchOn(kCamCc + kCcCci0, "CCI0 branch on")) return fail(step, Failure::branch);
     }
@@ -550,6 +605,7 @@ class Session {
       if (rc != CciResult::ok) return fail(step, Failure::cci);
       return true;
     }
+    if (opt.camss && (!titanOn(step) || !cciClocksOn(step, false))) return false;   // level 3: CAMSS without CCI0
     if (!pinOpenDrain(sdaPin(), "I2C SDA: GPIO, open drain (released)") || !pinOpenDrain(sclPin(), "I2C SCL: GPIO, open drain (released)"))
       return fail(step, Failure::allowlist);
     bit_.configure(LineIo{this, sdaLine, sclLine, sdaRead, sclRead, lineDelay}, opt.bitHalfUs, 20000);
@@ -563,17 +619,23 @@ class Session {
     }
     pinRestore(sdaPin());
     pinRestore(sclPin());
-    if (rear_) {
-      cciClocksOff();
-      titanOff();
-    }
+    cciClocksOff();   // each part only when it was ours (the rear on CCI0, or level 3's CAMSS)
+    titanOff();
   }
 
   // ------------------------------------------------------------------------------------------------------------ the run
   bool bringUp(const Loader &loader, const Pmic &pmic, const SurveyOptions &so, Survey &s)
   {
-    ops.step(kStepGcc, rear_ ? "GCC: camera AHB, camera XO, MCLK controller AHB (on where off)" : "GCC: MCLK controller AHB (on where off)");
-    if (rear_ && opt.rearCci) {
+    const bool camcc = (rear_ && opt.rearCci) || opt.camss;   // this path touches CAMCC
+    ops.step(kStepGcc, camcc ? (opt.votes ? "CAMCC's domains (MXC, MMCX: shared votes); GCC: camera AHB, camera XO, MCLK controller AHB (on where off)"
+                                          : "GCC: camera AHB, camera XO, MCLK controller AHB (on where off)")
+                             : "GCC: MCLK controller AHB (on where off)");
+    if (camcc && opt.votes) {
+      if (ops.mmRails(true)) return fail(kStepGcc, Failure::votes);
+      u_.votes = true;
+      r_.voted = true;
+    }
+    if (camcc) {
       if (!gccBranchOn(0, kGccCameraAhb, "GCC camera AHB on") || !gccBranchOn(1, kGccCameraXo, "GCC camera XO on"))
         return fail(kStepGcc, Failure::gcc);
     }
@@ -700,10 +762,14 @@ class Session {
     gccBranchOff(2, kGccMclkAhb, "GCC MCLK controller AHB off (as found)");
     gccBranchOff(1, kGccCameraXo, "GCC camera XO off (as found)");
     gccBranchOff(0, kGccCameraAhb, "GCC camera AHB off (as found)");
+    if (u_.votes) {   // CAMCC's domains last, as Linux's runtime suspend drops them after the clocks
+      if (ops.mmRails(false)) ++r_.offWarnings;
+      else u_.votes = false;
+    }
     bool clean = true;
     for (bool b : u_.rail) clean = clean && !b;
     for (bool b : u_.pin) clean = clean && !b;
-    r_.cleanOff = clean && !u_.titan && !u_.mclkBranch && !u_.pll && !u_.cciUp;
+    r_.cleanOff = clean && !u_.titan && !u_.mclkBranch && !u_.pll && !u_.cciUp && !u_.votes;
   }
 
   SensorResult r_;

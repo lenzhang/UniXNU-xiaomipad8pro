@@ -167,6 +167,7 @@ struct Board {
   unsigned loads = 0, stores = 0, quietStores = 0, cciStarts = 0;
   // injections
   bool titanStuck = false, rearAbsent = false, frontAbsent = false, sdaStuck = false, pllNoLock = false;
+  bool requireMxc = false, mxcVoted = false;   // CAMCC stalls without MXC (the tablet's case is unknown: the strict model)
   uint16_t rearId = 0x38e1, frontId = 0x5632;
   int vrmFail = -1, wrongMv = -1;
   uint16_t wrongMvValue = 0;
@@ -280,9 +281,10 @@ struct Board {
   // Whether an access to pa would complete on the real bus.
   const char *gate(uint64_t pa) const
   {
-    if (inRange(pa, kCamCc, kCamCcBytes) && !running(kGcc + kGccCameraAhb)) return "CAMCC without GCC's camera AHB";
-    if (inRange(pa, kMclkCc, kMclkCcBytes) && !running(kGcc + kGccMclkAhb)) return "the MCLK controller without its AHB";
-    const bool camAhb = running(kGcc + kGccCameraAhb) && titan() && running(kCamCc + kCcCamTopAhb);
+    if (inRange(pa, kCamCc, kCamCcBytes) && !gccClockOn(v(kGcc + kGccCameraAhb))) return "CAMCC without GCC's camera AHB";
+    if (inRange(pa, kCamCc, kCamCcBytes) && requireMxc && !mxcVoted) return "CAMCC without MXC";
+    if (inRange(pa, kMclkCc, kMclkCcBytes) && !gccClockOn(v(kGcc + kGccMclkAhb))) return "the MCLK controller without its AHB";
+    const bool camAhb = gccClockOn(v(kGcc + kGccCameraAhb)) && titan() && running(kCamCc + kCcCamTopAhb);
     if (inRange(pa, kCci0, kCci0Bytes) && !(camAhb && running(kCamCc + kCcCci0))) return "CCI0 unpowered or unclocked";
     for (const Block &b : kBlocks)
       if (inRange(pa, b.pa, 0x1000) && !(camAhb && running(kCamCc + b.branch))) return "a CAMSS block unpowered or unclocked";
@@ -397,7 +399,8 @@ struct Board {
     if (isCbcr(pa)) {
       const bool mclk1 = pa == kMclkCc + mclkBranch(1), mclk4 = pa == kMclkCc + mclkBranch(4);
       const bool was = running(pa);
-      r[pa] = (value & ~kCbcrClkOff) | (branchCanRun(pa, value) ? 0 : kCbcrClkOff);
+      // A hardware-gated branch (HW_CTL) reads CLK_OFF set while idle, enabled or not (the tablet's GCC AHB branches).
+      r[pa] = (value & ~kCbcrClkOff) | (branchCanRun(pa, value) && !(value & kCbcrHwCtl) ? 0 : kCbcrClkOff);
       if (mclk1 && running(pa) && !was) at[tRearMclk] = int64_t(now);
       if (mclk1 && !running(pa) && was) at[tRearMclkOff] = int64_t(now);
       if (mclk4 && running(pa) && !was) at[tFrontMclk] = int64_t(now);
@@ -667,6 +670,16 @@ struct TestOps {
   {
     (take ? gccLocks : gccUnlocks)++;
     return true;
+  }
+  // The shared votes as the board sees them: CAMCC (and so every CAMSS block) is readable only with MXC voted (Board::mxc).
+  std::vector<bool> mmCalls;
+  bool mmFail = false;
+  int mmRails(bool on)
+  {
+    mmCalls.push_back(on);
+    if (mmFail) return -5;
+    b.mxcVoted = on;
+    return 0;
   }
   void step(int n, const char *) { steps.push_back(n); }
   void note(const char *fmt, ...)
@@ -1012,6 +1025,62 @@ static void testFailures()
   }
 }
 
+// The tablet as the c1 survey found it (2026-11-12): GCC's camera AHB 0x88000002, camera XO 0x88000000 and MCLK-controller AHB
+// 0x88000002 (all off; both AHBs hardware-gated), HF AXI 0x8a200000; CAMCC readable only with MXC voted (the strict model). Level 1
+// reads neither controller; level 2 votes CAMCC's domains, enables the three branches (the hardware-gated ones counting on without
+// CLK_OFF clearing, Linux's rule), finds both IDs, and leaves everything as found (votes withdrawn, the branches' enables cleared).
+static void tabletC1(Board &b)
+{
+  b.r[kGcc + kGccCameraAhb] = 0x88000002u;
+  b.r[kGcc + kGccCameraXo] = 0x88000000u;
+  b.r[kGcc + kGccMclkAhb] = 0x88000002u;
+  b.r[kGcc + kGccCameraHfAxi] = b.r[kGcc + kGccCameraSfAxi] = 0x8a200000u;
+  b.requireMxc = true;
+}
+static void testTabletC1()
+{
+  Rig r;
+  tabletC1(r.b);
+  const Survey s = r.survey();
+  CHECK(r.b.stores == 0 && r.b.violations.empty());
+  CHECK(!s.cc.read && !s.mclk.read && !s.cci.read);
+  CHECK(!gccClockOn(s.gcc.cameraAhb) && !gccClockOn(s.gcc.mclkAhb));
+  BusChoice bus;
+  const char *why = sensorRefusal(s, Sensor::rear, bus);
+  CHECK(why && std::strstr(why, "GCC AHB is off"));   // the level 1 verdict; level 2's step 201 turns the AHB on first
+  for (Sensor w : {Sensor::rear, Sensor::front}) {
+    Rig q;
+    tabletC1(q.b);
+    const auto before = q.b.snapshot();
+    const SensorResult res = q.run(w, PowerOptions());
+    CHECK(res.idOk && res.cleanOff && q.b.violations.empty());
+    for (auto &v : q.b.violations) std::printf("  violation: %s\n", v.c_str());
+    CHECK(same(before, q.b.snapshot()));
+    // The rear (CAMCC through CCI0) votes CAMCC's domains first and withdraws them last; the front never touches CAMCC.
+    if (w == Sensor::rear) CHECK(q.ops.mmCalls.size() == 2 && q.ops.mmCalls[0] && !q.ops.mmCalls[1] && res.voted && !q.b.mxcVoted);
+    else CHECK(q.ops.mmCalls.empty() && !res.voted);
+  }
+  // Without the votes (piano-camera-votes=0) the strict model stalls on CAMCC: the reason the votes come first.
+  {
+    Rig q;
+    tabletC1(q.b);
+    PowerOptions po;
+    po.votes = false;
+    q.run(Sensor::rear, po);
+    CHECK(!q.b.violations.empty());
+  }
+  // A vote that is refused: nothing of CAMCC is touched, the step fails, the power-down is clean.
+  {
+    Rig q;
+    tabletC1(q.b);
+    q.ops.mmFail = true;
+    const auto before = q.b.snapshot();
+    const SensorResult res = q.run(Sensor::rear, PowerOptions());
+    CHECK(!res.idOk && res.failure == Failure::votes && res.failedStep == -kStepGcc && res.cleanOff && q.b.violations.empty());
+    CHECK(same(before, q.b.snapshot()));
+  }
+}
+
 static void testAllowlist()
 {
   Board b;
@@ -1170,6 +1239,7 @@ int main()
   testRearMclk24();
   testFront();
   testFailures();
+  testTabletC1();
   testAllowlist();
   testCci();
   testTables();
