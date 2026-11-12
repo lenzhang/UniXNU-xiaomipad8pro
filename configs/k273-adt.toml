@@ -1,0 +1,95 @@
+# The ADT identity of the 27.3 line (macOS 27.3 26C5035r, the UniXNU macos-27.3-26C5035r profile's Mac17,11 / K114c) on piano,
+# used by tooling/adt/make-piano-adt.py --identity configs/k273-adt.toml (PIANO_ADT_IDENTITY) in place of configs/k27-adt.toml.
+# The kernel collection's Apple kexts come from 27.3's kernelcache.release.mac17j (tooling/k273/, docs/k273-line.md). The rest is
+# configs/k27-adt.toml's (the k27 kernel's needs: the packed Data seed, the RAM window, the SystemOS carrier, the boot manifest hash),
+# and the hardware part comes from dts/piano.dts as for the 27.0.1 line.
+# The product names are the tablet's: the identity (model, target-type, compatible, fdr-product-type) is Mac17,11's, what the
+# userland's device tables match on; the names only show in About This Mac and System Information.
+
+["payload"."adt"]
+# Mac17,11's SoC (the profile's [ipsw] chip_id 24656 = 0x6050) instead of the VM's 0x8011.
+"chip_id" = "6050"
+"unique_chip_id" = "required"
+"packed_data_ramdisk" = true
+# No /arm-io/data-store natively: configs/k27-adt.toml's note.
+"persistent_data" = true
+# configs/k27-adt.toml's note: 13 GiB less 2 MiB, needs an FD with firmware/patches/darwinboot/0001.
+"owned_memory_size" = "0x33fe00000"
+# The System volume of 27.3's OS image (141-22233-021.dmg, the profile's [root] os_volume_uuid), the OS window of the 27.3 root
+# image on linux_data (tooling/k273/make-root-image.sh). make-piano-adt.py --root-volume-uuid overrides it.
+"root_match_volume_uuid" = "84581E99-85BE-4957-AC53-2947E887B3E4"
+
+["adt"."root"."string"]
+"model" = "Mac17,11"
+"target-type" = "K114c"
+"target-sub-type" = "K114cAP"
+"compatible" = "K114cAP"
+# Not a unit's serial: a made-up IOPlatformSerialNumber (11 characters), as the 27.0.1 line's.
+"serial-number" = "DVMPIANO001"
+
+["adt"."chosen"."string"]
+"osenvironment" = "main"
+"crypto-hash-method" = "sha2-384"
+# The SystemOS volume k27 union-mounts over / (tooling/k273/make-systemos.sh writes its UUID beside the image;
+# make-piano-adt.py --systemos-uuid gives it).
+"owner-systemos-uuid" = "00000000-0000-0000-0000-000000000000"
+
+["adt"."chosen"."u32"]
+# Mac17,11's board (the profile's [ipsw] board_id): MobileDevice looks chip-id and board-id up in its device map.
+"board-id" = 4
+"security-domain" = 1
+"amfi-only-platform-code" = 1
+"certificate-production-status" = 0
+"certificate-security-mode" = 1
+"effective-production-status-ap" = 0
+"effective-security-mode-sep" = 1
+"kernel-ctrr-to-be-enabled" = 0
+"display-scale" = 2
+"display-rotation" = 0
+
+["adt"."chosen"."bytes"]
+# configs/k27-adt.toml's note: 27's Image4 kext seeds its nonce magazine from it (no boot manifest: zeros, SHA-384 size).
+"boot-manifest-hash" = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+["adt"."chosen"."asmb"."u64"]
+"lp-sip0" = 2
+
+["adt"."chosen"."asmb"."u32"]
+"lp-sip1" = 1
+
+["adt"."defaults"."u32"]
+"sleep-disabled" = 1
+# 0, the truthful value natively (the 27.0.1 line's images set it with PIANO_VMM_PRESENT=0; configs/k27-adt.toml's note on
+# watchdogd: the desk images carry panic_on_crash_disabled=1 and leave watchdogd out).
+"vmm-present" = 0
+"kern.maxvnodes" = 131456
+
+["adt"."product"."string"]
+"model" = "xiaomi,piano"
+"artwork-device-idiom" = "mac"
+"artwork-display-gamut" = "sRGB"
+"compatible-app-variant" = "MacFamily20,1"
+"compatible-device-fallback" = "Mac17,7"
+"app-macho-architecture" = "arm64"
+"fdr-product-type" = "Mac17,11"
+"sub-product-type" = "Mac17,11"
+"unique-model" = "K114cAP"
+"partition-style" = "macOS"
+"product-name" = "Xiaomi Pad 8 Pro"
+"product-description" = "Xiaomi Pad 8 Pro"
+
+["adt"."product"."u32"]
+"artwork-device-subtype" = 0
+"artwork-scale-factor" = 2
+"has-virtualization" = 1
+"thin-bezel" = 1
+
+["adt"."buttons"."string"]
+"compatible" = "buttons"
+"device_type" = "buttons"
+
+["adt"."buttons"."strings"]
+"button-names" = ["hold", "voldown", "volup"]
+
+["adt"."buttons"."u32"]
+"home-button-type" = 2

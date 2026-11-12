@@ -5,6 +5,10 @@ set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
 . "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 LIST=$(sed -e 's/#.*//' "${PIANO_KEXT_LIST:-configs/k27-native-kexts.txt}" | awk 'NF {print $1}')
+# PIANO_BASE_SEED / PIANO_BASE_TRUST: the OS line's Data seed and trust cache the stages start from (default out/inputs/: the 27.0.1
+# line's; the 27.3 line's are made by tooling/k273/, docs/k273-line.md).
+BASE_SEED=${PIANO_BASE_SEED:-out/inputs/scratch-data.img}
+BASE_TRUST=${PIANO_BASE_TRUST:-out/inputs/kernel.macho.trustcache}
 # PIANO_USBHOST_STACK=1: Apple's USB host stack in the collection for PianoUsbHost level 6 (docs/drivers/usb-host.md H6, path A1):
 # PianoUsbHostStandIn (the seven Apple SoC kexts the stack reaches) and the codeless PianoUsbHostStack (its libraries keep AppleUSBXHCI,
 # IOUSBHostFamily, the hub, HID, mass storage and USB Ethernet; AppleUSBXHCI's personality on PianoUsbHostNub; the stack's IOResources
@@ -75,11 +79,11 @@ if [ -z "$SOFT_METAL" ]; then
 fi
 if [ "$SOFT_METAL" = 1 ]; then
   tooling/k27/build-soft-metal-plugin.sh > out/k27/build-soft-metal-plugin.log 2>&1 || { grep -E "error" out/k27/build-soft-metal-plugin.log | head; exit 1; }
-  STAMP=$( { shasum -a 256 out/inputs/scratch-data.img out/inputs/kernel.macho.trustcache tooling/k27/stage-soft-metal.py
+  STAMP=$( { shasum -a 256 "$BASE_SEED" "$BASE_TRUST" tooling/k27/stage-soft-metal.py
              find out/soft-metal/NativeSoftMetal.bundle -type f | sort | xargs shasum -a 256; echo "log ${PIANO_SOFT_METAL_LOG:-} rt ${PIANO_REDUCE_TRANSPARENCY:-1}"; } | shasum -a 256 | cut -c1-16)
   if [ "$(cat out/soft-metal/stamp 2>/dev/null)" != "$STAMP" ] || [ ! -f out/soft-metal/scratch-data.img ]; then
     RT=; [ "${PIANO_REDUCE_TRANSPARENCY:-1}" = 1 ] && RT=--reduce-transparency
-    python3 tooling/k27/stage-soft-metal.py ${PIANO_SOFT_METAL_LOG:+--log-errors "$PIANO_SOFT_METAL_LOG"} $RT > out/k27/stage-soft-metal.log 2>&1 \
+    python3 tooling/k27/stage-soft-metal.py --seed "$BASE_SEED" --trust "$BASE_TRUST" ${PIANO_SOFT_METAL_LOG:+--log-errors "$PIANO_SOFT_METAL_LOG"} $RT > out/k27/stage-soft-metal.log 2>&1 \
       || { tail -5 out/k27/stage-soft-metal.log; exit 1; }
     echo "$STAMP" > out/soft-metal/stamp
   fi
@@ -107,7 +111,7 @@ if [ "$A830_METAL" = 1 ]; then
   # PIANO_A830_LOG=PREDICATE: the seed's boot job also prints the os_log errors and faults of the processes PREDICATE names
   # (stage-soft-metal.py --log-errors, as PIANO_SOFT_METAL_LOG): a WindowServer, Dock or Finder that aborts after the login says why
   # there (SkyLight, Core Animation, Metal), not on stderr. Off by default; a changed predicate is a new seed.
-  STAMP=$( { shasum -a 256 out/inputs/scratch-data.img out/inputs/kernel.macho.trustcache tooling/k27/stage-soft-metal.py
+  STAMP=$( { shasum -a 256 "$BASE_SEED" "$BASE_TRUST" tooling/k27/stage-soft-metal.py
              find out/turnip-a830/NativeAdrenoMetal.bundle -type f | sort | xargs shasum -a 256; echo "tu-debug $A830_TU_DEBUG"
              if [ -n "${PIANO_A830_LOG:-}" ]; then echo "log $PIANO_A830_LOG"; fi; } | shasum -a 256 | cut -c1-16)
   if [ "$(cat out/turnip-a830/stage/stamp 2>/dev/null)" != "$STAMP" ] || [ ! -f out/turnip-a830/stage/scratch-data.img ]; then
@@ -116,7 +120,7 @@ if [ "$A830_METAL" = 1 ]; then
       printf '%s\n' "$A830_TU_DEBUG" > out/turnip-a830/tu-debug
       FILES=(--file out/turnip-a830/tu-debug:private/var/ngpu/debug/tu-debug)
     fi
-    python3 tooling/k27/stage-soft-metal.py --out out/turnip-a830/stage ${PIANO_A830_LOG:+--log-errors "$PIANO_A830_LOG"} \
+    python3 tooling/k27/stage-soft-metal.py --seed "$BASE_SEED" --trust "$BASE_TRUST" --out out/turnip-a830/stage ${PIANO_A830_LOG:+--log-errors "$PIANO_A830_LOG"} \
       ${FILES[@]+"${FILES[@]}"} out/turnip-a830/NativeAdrenoMetal.bundle \
       > out/k27/stage-turnip-a830.log 2>&1 || { tail -5 out/k27/stage-turnip-a830.log; exit 1; }
     echo "$STAMP" > out/turnip-a830/stage/stamp
@@ -137,8 +141,8 @@ fi
 # The Data store (docs/data-store.md): out/ram opens it (data-persist=2) only when its seed is the installed one (PIANO_INSTALLED_SEED in
 # ~/.config/piano/env), else Data is volatile; build-ram-images.py prints which on stderr. PIANO_DATA_PERSIST=0|1|2 overrides it,
 # PIANO_DATA_STORE_REPLACE=1|<8 hex> and PIANO_DATA_STORE_FLATTEN=1 add data-store-replace / data-store-flatten=1.
-COMMON=(--fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-k27-native.bin --trust "${PIANO_TRUST:-out/inputs/kernel.macho.trustcache}"
-        --seed "${PIANO_SEED:-out/inputs/scratch-data.img}" --adt "${PIANO_ADT:-$ADT_OUT}" --utc "$(date +%s)")
+COMMON=(--fd out/fd/piano-uefi-A-bundled.fd --fd-name A-bundled --kc out/k27/kc-k27-native.bin --trust "${PIANO_TRUST:-$BASE_TRUST}"
+        --seed "${PIANO_SEED:-$BASE_SEED}" --adt "${PIANO_ADT:-$ADT_OUT}" --utc "$(date +%s)")
 # The dump image only lets our UEFI read the previous run's log; its XNU never touches the Data store (data-persist=0), so a dump
 # image with another seed cannot reset the store of the installed system (docs/persistent-boot.md).
 PIANO_RESET_AFTER=1 PIANO_DATA_PERSIST=0 python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out out/ram-dump > out/k27/build-ram-dump.log 2>&1 &

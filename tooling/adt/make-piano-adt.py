@@ -86,6 +86,11 @@ def main():
     p.add_argument('--ram-window', type=lambda v: int(v, 0), help='bytes, 2 MiB steps, 256 MiB to 13 GiB')
     p.add_argument('--bt-address-file', type=Path, help='the unit Bluetooth address (default: private/bluetooth-address if present)')
     p.add_argument('--no-bt-address', action='store_true', help='no /arm-io/piano-bt node')
+    # The OS line's identity table (default configs/k27-adt.toml, or PIANO_ADT_IDENTITY): configs/k273-adt.toml is the 27.3 line's
+    # (Mac17,11). Its root and SystemOS volume UUIDs can be given here for a root image other than the table's.
+    p.add_argument('--identity', type=Path, default=Path(os.environ.get('PIANO_ADT_IDENTITY', DEVICE / 'configs/k27-adt.toml')))
+    p.add_argument('--root-volume-uuid', default=os.environ.get('PIANO_ROOT_VOLUME_UUID'))
+    p.add_argument('--systemos-uuid', default=os.environ.get('PIANO_SYSTEMOS_UUID'))
     a = p.parse_args()
     dtb = a.dtb_out or a.output.with_suffix('.hw.dtb')
     dtb.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +101,12 @@ def main():
     board = load_toml(DEVICE / 'board.toml')
     board.pop('adt', None)
     board.get('payload', {}).pop('adt', None)
-    config = merge(board, load_toml(DEVICE / 'configs/k27-adt.toml'))
+    identity = a.identity if a.identity.is_absolute() else DEVICE / a.identity
+    config = merge(board, load_toml(identity))
+    if a.root_volume_uuid:
+        config['payload']['adt']['root_match_volume_uuid'] = a.root_volume_uuid.upper()
+    if a.systemos_uuid:
+        config['adt']['chosen']['string']['owner-systemos-uuid'] = a.systemos_uuid.upper()
     if a.vmm_present is not None:
         config['adt']['defaults']['u32']['vmm-present'] = a.vmm_present
     if a.ram_window is not None:
@@ -112,7 +122,7 @@ def main():
         tree = generate(dtb, config, unique_chip_id=a.unique_chip_id, data=a.data, trust=a.trust, addon=a.addon)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.write_bytes(tree)
-    print(f'{a.output}: {len(tree)} bytes (hardware {dtb}){", with /arm-io/gop-display" if a.gop_display else ""}'
+    print(f'{a.output}: {len(tree)} bytes (hardware {dtb}, identity {identity.name}){", with /arm-io/gop-display" if a.gop_display else ""}'
           f'{", with the GpuAddon slot" if a.addon else ""}'
           f'{", with /arm-io/piano-bt (a private Bluetooth address)" if address else ""}')
 
