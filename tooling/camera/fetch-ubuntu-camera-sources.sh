@@ -1,6 +1,6 @@
 #!/bin/bash
 # Fetch the Ubuntu piano kernel's camera files at the pinned commit into the ignored out/upstream/ (never committed): the source of
-# data/camera's sensor tables (tooling/camera/sensor-tables.py extract / check --src) and the specification docs/drivers/camera.md
+# data/camera's sensor and CSIPHY tables (tooling/camera/sensor-tables.py extract / check --src) and the specification docs/drivers/camera.md
 # cites. Each file is checked against its SHA-256 below; a mismatch is an error (the pin moved: change COMMIT and the hashes together,
 # re-extract, review the diff of data/camera, regenerate data/camera/MANIFEST).
 #   fetch-ubuntu-camera-sources.sh [--check]   --check: verify what out/upstream has, fetch nothing

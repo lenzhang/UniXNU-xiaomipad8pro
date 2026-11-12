@@ -142,9 +142,9 @@ From the specification (`camss.c` `*_res_8750`, `camss-csiphy-3ph-1-0.c`, `camss
   the data lanes' bits = 0xd5 for 4 lanes, CTRL6 = 0x01, CTRL7 = 0x02, CTRL0 = 0; then the **103-entry lane table** (4 data lanes ×
   21 at +0x000/0x400/0x800/0xc00 and the clock lane's 19 at +0xe00; five entries carry a 209 µs delay; Linux skips its 16 skew-
   calibration entries) with the **settle count** (85 ns + 6 UI) / 2.5 ns − 6 = **29** for both sensors (400 MHz timer); interrupts
-  masked (CTRL11..21 = 0). The table is a vendor-tuned PHY table, not a sensor's: the same kind as B8's DP PHY tables, whose
-  question is still open (`../BACKLOG-hardware.md` §4). With the owner's word it goes into `data/camera/csiphy-v2.3.tbl` (same format,
-  provenance and checker); without it, L3 stops here. Stop: CTRL5 = CTRL6 = 0.
+  masked (CTRL11..21 = 0). The table is a vendor-tuned PHY table, not a sensor's; by the owner's decision of 2026-11-12 it is carried
+  as data: `data/camera/csiphy-v2.4.tbl` (the same tool, format rules, provenance note and MANIFEST as the sensors' tables). Stop:
+  CTRL5 = CTRL6 = 0.
 - **CSID-lite** (RX_CFG0/1 at +0x200/0x204; RDI n CFG0/CTRL/CFG1 at +0x500/0x504/0x510 + 0x100 n; combined RUP/AUP at +0x18; IRQ
   top/buf-done/RX/RDI status): reset (RST_CFG, RST_CMD, RST_DONE), RX_CFG0 = lanes − 1 | lane map 0x3210 << 4 | (PHY + 1) << 20
   (0x00232103 for CSIPHY1, 0x00532103 for CSIPHY4), RX_CFG1 = ECC correction; RDI0: data type 0x2b (RAW10), VC 0, decode "payload
@@ -398,7 +398,9 @@ sensors' register tables** exist only in those drivers. Owner's decision (2026-1
 repository as data: `data/camera/s5kjn1.tbl` and `ov32d40.tbl`, extracted by our own tool (`tooling/camera/sensor-tables.py`)
 from the pinned driver files into our own format, pinned by `data/camera/MANIFEST` (file SHA-256 and every section's write count),
 with the provenance (project, driver, commit, file hash) in `data/camera/README.md`; the build checks them and generates the C header
-the kext reads. The CSIPHY lane table L3 needs is a PHY tuning table, not a sensor's: it waits for the owner's word (§4.3). Per-unit data (this tablet's lens shading or OTP, if any is ever
+the kext reads. The CSIPHY lane table L3 needs is a PHY tuning table, not a sensor's; the owner's second decision of 2026-11-12 (PHY
+tuning tables from the Linux drivers as data in their own directory, with a provenance note, nothing rewritten for licence reasons)
+put it in `data/camera/csiphy-v2.4.tbl`, extracted by the same tool from `camss-csiphy-3ph-1-0.c` at the same pin. Per-unit data (this tablet's lens shading or OTP, if any is ever
 read) is not committed. Ubuntu's TFE pixel-path programming, itself derived from Qualcomm's CamX settings code, is not used. The
 camera extension (L5) uses only public SDK headers (CoreMediaIO, CoreVideo, IOKit, SystemExtensions); no Apple binary is read, no
 vendor blob.

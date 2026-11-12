@@ -1090,13 +1090,21 @@ static void testTables()
   CHECK(f != nullptr);
   if (!f) return;
   char line[512];
-  unsigned checked = 0;
+  unsigned checked = 0, phyLines = 0;
   while (std::fgets(line, sizeof line, f)) {
     if (line[0] == '#') continue;
     char file[32], sha[80];
     int at = 0;
     if (std::sscanf(line, "%31s %79s %n", file, sha, &at) != 2) continue;
     std::string sensor(file);
+    if (sensor == std::string(kCsiphyTableName) + ".tbl") {
+      // The PHY table: one section, its entry count.
+      char item[80];
+      CHECK(std::sscanf(line + at, "%79s", item) == 1);
+      CHECK(std::string(item) == "lanes:dphy-4lane=" + std::to_string(sizeof kCsiphyLaneRegs / sizeof kCsiphyLaneRegs[0]));
+      ++phyLines;
+      continue;
+    }
     sensor = sensor.substr(0, sensor.find('.'));
     const char *p = line + at;
     char item[80];
@@ -1122,6 +1130,20 @@ static void testTables()
   }
   std::fclose(f);
   CHECK(checked == sizeof kCameraTableSections / sizeof kCameraTableSections[0]);
+  CHECK(phyLines == 1);
+  // The PHY table: 103 entries (4 data lanes x 21 at 0x000/0x400/0x800/0xc00, the clock lane's 19 at 0xe00), five settle entries
+  // (one per lane), five 209 us delays, 16 skew entries; the common block at 0x1000, its status words at +0x138.
+  unsigned settle = 0, skew = 0, delays = 0, lanes[5] = {};
+  for (const CsiphyLaneReg &e : kCsiphyLaneRegs) {
+    settle += e.kind == 2;
+    skew += e.kind == 7;
+    delays += e.delayUs == 209;
+    CHECK(e.offset < kCsiphyTableCommon && !(e.offset & 3) && (e.kind == 0 || e.kind == 2 || e.kind == 7));
+    ++lanes[e.offset >= 0xe00 ? 4 : e.offset >> 10];
+  }
+  CHECK(settle == 5 && skew == 16 && delays == 5);
+  CHECK(lanes[0] == 21 && lanes[1] == 21 && lanes[2] == 21 && lanes[3] == 21 && lanes[4] == 19);
+  CHECK(kCsiphyTableCommon == 0x1000 && kCsiphyTableStatus == 0x138);
   // Spot checks: the rear's init starts with the page register; each mode's parameters; delays decode.
   const CameraTableSection *init = nullptr;
   for (const CameraTableSection &s : kCameraTableSections)
