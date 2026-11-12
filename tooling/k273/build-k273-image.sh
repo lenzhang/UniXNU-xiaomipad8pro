@@ -10,7 +10,7 @@
 # Environment (defaults in this checkout's out/):
 #   K273_TREE    the 27.3 line's k27 tree (tooling/k273/prepare-k27-tree.sh: a clone of PIANO_K27_TREE with patches/k273-kc and the
 #                27.3 segment addresses, its kernel relinked): out/k273/k27-tree
-#   K273_KERNEL  the relinked kernel: $K273_TREE/out/k27/kernel-k273-0065-native.macho
+#   K273_KERNEL  the relinked kernel (default the newest $K273_TREE/out/k27/kernel-k273-*-native.macho)
 #   K273_INPUTS  the IPSW-derived inputs (tooling/k273/ipsw-members.py, decompress-kernelcache.py, make-*.sh): out/inputs/k273
 #   K273_ROOT    k273 (default): the 27.3 root image on linux_data (native-ufs-root-part=linux_data), its seed and trust cache from
 #                $K273_INPUTS/root; k27: the installed 27.0.1 root on linux_rootfs with its seed and trust cache (out/inputs), to
@@ -29,7 +29,7 @@ I=${K273_INPUTS:-$D/out/inputs/k273}
 export TURNIP_K27_TREE=${TURNIP_K27_TREE:-$(. "$D/tooling/k27/k27-tree.sh"; echo "$PIANO_K27_TREE")}
 export TURNIP_TREE=${TURNIP_TREE:-$(dirname "$TURNIP_K27_TREE")/UniXNU-turnip}
 export PIANO_K27_TREE=$T
-export K27_KERNEL=${K273_KERNEL:-$T/out/k27/kernel-k273-0065-native.macho}
+export K27_KERNEL=${K273_KERNEL:-$(ls -t "$T"/out/k27/kernel-k273-*-native.macho | head -1)}
 export KC_BASE=$I/kc/kc273-mac17j.bin
 export KC_BUILDER=k27/kc-build273-piano.py
 export PIANO_ADT_IDENTITY=configs/k273-adt.toml
