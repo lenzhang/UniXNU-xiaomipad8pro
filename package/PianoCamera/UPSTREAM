@@ -1,0 +1,47 @@
+PianoCamera is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE): piano's two cameras (backlog B11). What it takes from other
+work, and from where:
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoTorch/PianoTorch.cpp (sha256 c4c761fccfb0f66bfed228c876d20d8f77fbccb3891fc2c91ddf220b1a4a4b40) and
+  package/PianoBluetooth/PianoBluetooth.cpp (sha256 91ad1ed3f14ebf37c9c2e0fcd7aeca5df94c438c2913df466b151c508131fa5c): the kext's
+    shape (probe gate on the boot argument, a thread, the post-mortem stage word, pages mapped uncached on demand and loaded with an
+    explicit ldr, the SPMI observer windows, the cmd-db copy, the lock words' compare-exchange with its 10 us steps, the DRV-2 mapping),
+    re-written for this driver.
+  package/PianoBluetooth/BtRpmh.h (sha256 e5c33751acf1a043685fa14367cbe1334a6694d0aa2d434a2cc4e397e2c75eea): copied as CameraRpmh.h
+    with the namespace and the command type changed (the VRM transaction on apps DRV-2; the same sequence as PianoWifi's vrmLocked).
+  package/PianoKeyboard/BitI2c.h (sha256 c63c87803997d89a4a09be877d7f04712e5d02e3d00bae30f41bb288beb76767): copied as BitI2c.h with
+    the namespace, include guard and header comment changed, the code unchanged (the software I2C master).
+  package/PianoKeyboard/CmdDb.h (sha256 794cf39c76e2c903d79cc1146ae25d946946862daa9b8848d616e9ad8107c716) and
+  package/PianoPower/SpmiObserver.h (sha256 4805d4fb7af91c210d75b9791e125f3789b7671e895afe6f80af27a36a849b07): included, not copied.
+  package/PianoVideo/VideoPower.h (sha256 871cd834c9bb422e3fd9aa93cfd087a0c84efa1ee0fee3f4f8c4a17ab878e531) and
+  package/PianoVideo/VideoSurvey.h (sha256 a2ca231576ecd9f824d53a63198141ad987d99313075d417531efb05a2e8d4f2): the approach (a GDSC's
+    on/off with its CFG completion bits, the shared RCG switch with the root forced on, the clock controller read only behind its GCC
+    AHB, the SMMU groups of a stream range), re-expressed in CameraPower.h and CameraSurvey.h.
+  package/include/PianoWcnRails.h: the rail rules (read the PMIC first, vote mode/voltage/enable in one transaction, read back, withdraw
+    only the enables this driver added, mode and set point left), re-expressed in CameraPower.h for rails no other driver uses.
+  package/include/PianoPowerContract.h: the power-tree join.
+  The sensor tables in data/camera (data only; their provenance is data/camera/README.md) are read by the host tests through the
+    header tooling/camera/sensor-tables.py generates; the kext uses them from level 3 on.
+
+The piano boot DT (out/inputs/piano-boot.dtb, sha256 50636effb5f54306ec0ab9a3061cd163d7f003d8797e04585a33205918856840): the camera
+clock controllers' places and power domains, cci@ac7b000, isp@ad27000, the camera rails and their consumers, the TLMM reserved ranges.
+
+Specifications only (no code, comment or table copied; facts in CameraHw.h with their source):
+  the Ubuntu piano kernel (yzddmr6/linux-sm8750-piano, piano/dev 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01; GPL-2.0), fetched with
+  their hashes by tooling/camera/fetch-ubuntu-camera-sources.sh:
+    arch/arm64/boot/dts/qcom/sm8750-xiaomi-piano-camera.dtsi (fb551d4e604587b323c25585f0472d4c8868ae9c8e44bcb95319636f97e5bbbd): the
+      sensors' supplies, pins and states, buses and addresses, MCLK rates, link frequencies, lanes;
+    drivers/clk/qcom/camcc-sm8750.c (191c1754ca0f1408cdd9e2e1c9caaa290b5f707633f7bb84e443dfde08f29b93), cambistmclkcc-sm8750.c
+      (b9368cf617af714f47273b24f674677213a2b6189cf51ff02b61b9e7b7568dfa), gcc-sm8750.c (0cefef94a558b310be2a903d9ad883b1226cc1897a7bed517b119b97794f39bd),
+      clk-alpha-pll.c (d81f628af746854dbdd6ef8b0f2e36f85ba38858404690759199a026cac77109), gdsc.c (04c66019948835d4b0def6f96d940500a85eb3e9c277f69de06c953f7d6475d2):
+      offsets, bits, the critical branches, the MCLK PLL's configuration and enable order, the GDSC order and bounds;
+    drivers/pinctrl/qcom/pinctrl-sm8750.c (9772d7520ee7a6271d7fd7f3ecba58d3fe86073387569604d589d8c907d5ffff), pinctrl-msm.c
+      (d6638c03c09f5c0b24d9e343e19fb04ad7d483ec4f1c5fdabde4efc3570d59f8): the pins' functions, the TLMM fields, the egpio ownership bit;
+    drivers/i2c/busses/i2c-qcom-cci.c (9f62536ad0f0f0b4f0c802da79e047d2a9a9c7f5104a31655438b679e437b8c4): the CCI registers, queue
+      commands, reset/halt/recovery protocol and the timing sets (the 19.2 MHz ones taken);
+    drivers/media/i2c/s5kjn1.c (4d1e2dad37d06fb594ac044903fe2eb674b3bf1ab3135da56913b53d6b244a92), ov32d40.c
+      (f784a23f088de3dccc165d61b7ebbce6484c4f7a7c0420cf901ede417ffba684): chip IDs, power sequences and waits, control registers;
+    drivers/media/platform/qcom/camss/camss-csid.c, camss-vfe.c (hashes in the fetch script): HW_VERSION at +0.
+  the Ubuntu device repository (yzddmr6/xiaomipad-8pro-mainline; MIT): device/camera/source.json and piano-camerad.c (the rear's vflip
+    for its mounting, the modes the daemon uses, the AE/AWB constants docs/drivers/camera.md cites for level 4): behaviour.
+Not read and not used for anything: any Qualcomm or Xiaomi binary, any Apple binary.
