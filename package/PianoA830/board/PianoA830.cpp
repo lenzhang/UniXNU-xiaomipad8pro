@@ -518,6 +518,14 @@ volatile uint32_t piano_wcn_rails_state = 0;
 extern "C" volatile uint32_t piano_wcn_pmu_owner;
 volatile uint32_t piano_wcn_pmu_owner = 0;
 
+// The shared multimedia votes (package/include/PianoMmVotes.h, docs/drivers/camera.md §4.3.1): MXC, MMCX and BCM MM1 on apps DRV-2,
+// reference-counted between PianoVideo and PianoCamera (the display's floor in its own word): the lock and the state words, kept
+// here for the same reason as the words above. PianoA830 itself never touches them (it votes none of the three).
+extern "C" volatile uint32_t piano_mm_votes_owner;
+volatile uint32_t piano_mm_votes_owner = 0;
+extern "C" volatile uint32_t piano_mm_votes[32];
+volatile uint32_t piano_mm_votes[32] = {};
+
 namespace {
 __attribute__((format(printf, 1, 2))) void gpuLine(const char *format, ...)
 {

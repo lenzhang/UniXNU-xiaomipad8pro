@@ -322,6 +322,14 @@ complete is left as evidence and never reused):
 | BCM `MM1` (enable mask) | `0x60000001` (commit, valid, x 0, y 1) | `0x40000000` (commit, valid 0) | the video path `qnm_video_mvp` → `qns_mem_noc_sf` is MM1's; the display rides MM0 |
 | SH1, SH0, MC0, ACV, CN0 | not voted | — | SH1 (`qnm_mnoc_sf`) also carries `chm_apps`, the CPUs' own traffic: necessarily on. SH0/MC0/ACV are the DDR vote, one per DRV: PianoA830 (or the boot loader) holds it, at or above the display's 3.28 GB/s, far above what V1-V3 move (no frames); a shared DDR aggregator with PianoA830 is V7's (Linux's decode table: 294 MB/s for 1080p30). CN0 (`cpu-cfg`) is keepalive |
 
+**Shared with the camera (2026-11-12).** MXC, MMCX and MM1 are PianoCamera's too (its level 3: MXC low_svs for CAMCC's PLLs,
+MMCX low_svs, MM1 for `qnm_camnoc_hf`). Both drivers' needs go through `package/include/PianoMmVotes.h` (words in PianoA830,
+[camera.md](camera.md) §4.3.1): each records what it needs, the vote is the maximum of the needs with the highest MMCX floor any
+client declared, only what changes is sent, under the helper's own lock (then the DRV-2 lock). With PianoVideo alone the commands
+are the table's exactly (host-tested against the rules above over every sequence of up to six operations); with the camera
+streaming, the video core's power-off gives MXC back to the camera's low_svs instead of 0 and sends nothing for MM1
+(`tests/bringup_host.cpp` testSharedVotes).
+
 The sequence (Linux's `iris_vpu_power_on`/`_off` with VPU 3.5's ops, and the clock framework underneath; bounds in brackets):
 
 | Step | On |

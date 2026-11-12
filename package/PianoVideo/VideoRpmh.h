@@ -15,10 +15,14 @@
 //   that does not complete is left triggered with its interrupt masked, as evidence, and marked stuck.
 // - the votes this driver holds (docs/drivers/video.md section 12.1): MXC at svs and MMCX at max(low_svs, the display's floor)
 //   while the core is powered; MXC back to 0 at power-off, MMCX never below the floor (the boot framebuffer's display needs NOM_L1
-//   and a DRV-2 vote replaces the DRV's earlier one); MM1 on while powered, off after. Only what changes is sent.
-// The Hw adds to VideoOps.h's: bool drv2Take(uint32_t *waits) (the owner word; false after 2 s), void drv2Give().
+//   and a DRV-2 vote replaces the DRV's earlier one); MM1 on while powered, off after. Only what changes is sent. Since 2026-11-12
+//   these needs go through the shared multimedia-vote helper (package/include/PianoMmVotes.h): the vote is the maximum of every
+//   client's need (PianoCamera's level 3 is the other client) with the highest floor any client declares; alone, the same commands.
+// The Hw adds to VideoOps.h's: bool drv2Take(uint32_t *waits) (the owner word; false after 2 s), void drv2Give(), and the shared
+// votes' words: volatile uint32_t *mmWords(), volatile uint32_t *mmLock().
 #pragma once
 #include <stdint.h>
+#include <PianoMmVotes.h>
 #include "VideoOps.h"
 
 namespace pianovideo {
@@ -265,80 +269,121 @@ inline Resources resources(const uint8_t *db, uint32_t bytes)
   return r;
 }
 
+// The votes go through the shared multimedia-vote helper (package/include/PianoMmVotes.h, PianoA830's words): the video core is
+// one client; PianoCamera's level 3 is another; the display's floor is the highest MMCX floor any client declares. With PianoVideo
+// alone the commands are exactly those this file sent before the helper (railsUp: MXC svs and MMCX max(low_svs, floor) in one TCS,
+// only what changes; railsDown: MXC 0, MMCX to the floor, only what changes and only for what was sent; bus: MM1 on/off when it
+// changes); with another client the maximum of the needs is voted, so the video core's release never drops the camera's need.
+// The Hw adds: volatile uint32_t *mmWords() (piano_mm_votes), volatile uint32_t *mmLock() (piano_mm_votes_owner).
 struct Votes {
   uint32_t floorVlvl = kMmcxDisplayFloor;   // MMCX is never voted or lowered below this (piano-video-mmcx-floor)
-  bool mxcSent = false, mmcxSent = false, mm1On = false;
-  uint32_t mxcHlvl = 0, mmcxHlvl = 0;       // what DRV-2 holds from us (valid once sent)
+  bool mm1On = false;                       // the video core's own MM1 need
   bool stuck[kRscActiveTcs] = {};
   uint32_t requests = 0, unchanged = 0;
   TcsResult last;
+  PianoMmVotes mm{};                        // this client's view of the shared votes (its counters persist)
 };
-inline uint32_t maxu(uint32_t a, uint32_t b) { return a > b ? a : b; }
+static_assert(kDrv2Tag == PianoMmTagVideo, "the shared votes' video tag is PianoVideo's DRV-2 tag");
+static_assert(kBcmMm1On == PIANO_MM_BCM_ON && kBcmMm1Off == PIANO_MM_BCM_OFF, "MM1's command words");
+
+template <class O>
+struct MmContext {
+  O *ops;
+  const Resources *res;
+  Votes *v;
+  static uint32_t address(void *c, unsigned r)
+  {
+    const Resources &x = *static_cast<MmContext *>(c)->res;
+    return r == PIANO_MM_MXC ? x.mxc.addr : r == PIANO_MM_MMCX ? x.mmcx.addr : r == PIANO_MM_MM1 ? x.mm1 : 0;
+  }
+  static int arcLevel(void *c, unsigned r, uint32_t vlvl, uint32_t *hlvl)
+  {
+    const Resources &x = *static_cast<MmContext *>(c)->res;
+    if (r != PIANO_MM_MXC && r != PIANO_MM_MMCX) return -3;
+    return level(r == PIANO_MM_MXC ? x.mxc : x.mmcx, vlvl, hlvl) ? 0 : -3;
+  }
+  static int sendCmds(void *c, const PianoMmCmd *cmds, unsigned n)
+  {
+    MmContext &k = *static_cast<MmContext *>(c);
+    Cmd out[PIANO_MM_RESOURCES];
+    for (unsigned i = 0; i < n && i < PIANO_MM_RESOURCES; ++i) out[i] = {cmds[i].addr, cmds[i].data};
+    ++k.v->requests;
+    return send(*k.ops, out, n, (1u << n) - 1, k.v->stuck, &k.v->last) ? -1 : 0;
+  }
+  static void sleepMs(void *c, uint32_t ms) { static_cast<MmContext *>(c)->ops->hw.sleepMs(ms); }
+  static void report(void *c, uint32_t event, uint32_t a, uint32_t b)
+  {
+    if (event == PianoMmLockWaiting || event == PianoMmLockBusy || event == PianoMmLockLost)
+      static_cast<MmContext *>(c)->ops->hw.note("rpmh: the shared multimedia-vote lock %s %#x%s", event == PianoMmLockWaiting ? "is held by"
+                                                : event == PianoMmLockBusy ? "stayed held by" : "was lost to", a,
+                                                event == PianoMmLockBusy ? ": nothing voted" : "");
+    (void)b;
+  }
+};
+// One update of the video client's needs (mask: the resources it changes). 0 or kErrRpmh.
+template <class O>
+int mmUpdate(O &ops, const Resources &res, Votes &v, uint32_t mask, const uint32_t need[PIANO_MM_RESOURCES])
+{
+  MmContext<O> ctx{&ops, &res, &v};
+  const PianoMmVotesOps mmOps = {&ctx, MmContext<O>::address, MmContext<O>::arcLevel, MmContext<O>::sendCmds, MmContext<O>::sleepMs,
+                                 MmContext<O>::report};
+  v.mm.words = ops.hw.mmWords();
+  v.mm.lock = ops.hw.mmLock();
+  v.mm.tag = PianoMmTagVideo;
+  v.mm.client = PIANO_MM_VIDEO;
+  v.mm.floor[PIANO_MM_MMCX] = v.floorVlvl;
+  v.mm.ops = &mmOps;
+  const int rc = piano_mm_votes_update(&v.mm, mask, need);
+  v.mm.ops = nullptr;
+  if (!rc && !v.mm.count) ++v.unchanged;
+  return rc ? kErrRpmh : kOk;
+}
 
 // The rails for a powered core: MXC to svs, MMCX to max(low_svs, floor), one TCS, only what changes. 0 or kErrRpmh.
 template <class O>
 int railsUp(O &ops, const Resources &res, Votes &v)
 {
-  uint32_t mxc = 0, mmcx = 0;
-  if (res.error || !level(res.mxc, kMxcNeed, &mxc) || !level(res.mmcx, maxu(kMmcxNeed, v.floorVlvl), &mmcx)) return kErrRpmh;
-  Cmd cmds[2];
-  unsigned n = 0;
-  if (!v.mxcSent || v.mxcHlvl != mxc) cmds[n++] = {res.mxc.addr, mxc};
-  if (!v.mmcxSent || v.mmcxHlvl != mmcx) cmds[n++] = {res.mmcx.addr, mmcx};
-  if (!n) {
-    ++v.unchanged;
-    return kOk;
-  }
-  ++v.requests;
-  const int rc = send(ops, cmds, n, (1u << n) - 1, v.stuck, &v.last);
-  ops.hw.note("rpmh: rails up: mxc.lvl hlvl %u (vlvl %#x), mmcx.lvl hlvl %u (vlvl %#x, floor %#x): %u command(s), TCS %d, %s after %u ms",
-              mxc, res.mxc.vlvl[mxc], mmcx, res.mmcx.vlvl[mmcx], v.floorVlvl, n, int(v.last.tcs), rc ? "FAILED" : "completed",
-              v.last.polls);
-  if (rc) return rc;
-  v.mxcSent = v.mmcxSent = true;
-  v.mxcHlvl = mxc;
-  v.mmcxHlvl = mmcx;
-  return kOk;
+  if (res.error) return kErrRpmh;
+  const uint32_t need[PIANO_MM_RESOURCES] = {kMxcNeed, kMmcxNeed, 0};
+  const int rc = mmUpdate(ops, res, v, 1u << PIANO_MM_MXC | 1u << PIANO_MM_MMCX, need);
+  const PianoMmVotes &m = v.mm;
+  if (m.count)
+    ops.hw.note("rpmh: rails up: mxc.lvl hlvl %u (vlvl %#x), mmcx.lvl hlvl %u (vlvl %#x, floor %#x; others mxc %#x mmcx %#x): %u "
+                "command(s), TCS %d, %s after %u ms",
+                m.level[PIANO_MM_MXC], m.vote[PIANO_MM_MXC], m.level[PIANO_MM_MMCX], m.vote[PIANO_MM_MMCX], v.floorVlvl,
+                m.others[PIANO_MM_MXC], m.others[PIANO_MM_MMCX], m.count, int(v.last.tcs), rc ? "FAILED" : "completed", v.last.polls);
+  else if (rc)
+    ops.hw.note("rpmh: rails up: nothing sent (%s)", m.error == PianoMmBusy ? "the shared vote lock stayed held" : "no level or address");
+  return rc;
 }
-// After the power-off: MXC to hlvl 0, MMCX to the floor (nothing when it already is there: the usual case). Only what changes.
+// After the power-off: MXC to hlvl 0, MMCX to the floor (nothing when it already is there: the usual case). Only what changes; with
+// another client's need (the camera's), its level instead.
 template <class O>
 int railsDown(O &ops, const Resources &res, Votes &v)
 {
-  uint32_t mmcx = 0;
   if (res.error) return kErrRpmh;
-  if (v.floorVlvl && !level(res.mmcx, v.floorVlvl, &mmcx)) return kErrRpmh;
-  Cmd cmds[2];
-  unsigned n = 0;
-  if (v.mxcSent && v.mxcHlvl != 0) cmds[n++] = {res.mxc.addr, 0};
-  if (v.mmcxSent && v.mmcxHlvl != mmcx) cmds[n++] = {res.mmcx.addr, mmcx};
-  if (!n) {
-    ++v.unchanged;
-    return kOk;
-  }
-  ++v.requests;
-  const int rc = send(ops, cmds, n, (1u << n) - 1, v.stuck, &v.last);
-  ops.hw.note("rpmh: rails down: mxc.lvl hlvl 0, mmcx.lvl %s hlvl %u: %u command(s), TCS %d, %s after %u ms",
-              v.mmcxSent && v.mmcxHlvl != mmcx ? "to" : "stays at", v.mmcxSent && v.mmcxHlvl != mmcx ? mmcx : v.mmcxHlvl, n,
-              int(v.last.tcs), rc ? "FAILED" : "completed", v.last.polls);
-  if (rc) return rc;
-  if (v.mxcSent) v.mxcHlvl = 0;
-  if (v.mmcxSent) v.mmcxHlvl = mmcx;
-  return kOk;
+  const uint32_t need[PIANO_MM_RESOURCES] = {0, 0, 0};
+  const int rc = mmUpdate(ops, res, v, 1u << PIANO_MM_MXC | 1u << PIANO_MM_MMCX, need);
+  const PianoMmVotes &m = v.mm;
+  if (m.count)
+    ops.hw.note("rpmh: rails down: mxc.lvl hlvl %u (others %#x), mmcx.lvl hlvl %u (vlvl %#x): %u command(s), TCS %d, %s after %u ms",
+                m.level[PIANO_MM_MXC], m.others[PIANO_MM_MXC], m.level[PIANO_MM_MMCX], m.vote[PIANO_MM_MMCX], m.count,
+                int(v.last.tcs), rc ? "FAILED" : "completed", v.last.polls);
+  return rc;
 }
-// BCM MM1 on (x 0, y 1, commit) or off (commit, valid 0); waited on.
+// BCM MM1 on (x 0, y 1, commit) or off (commit, valid 0); waited on. Off is sent only when no other client needs it.
 template <class O>
 int bus(O &ops, const Resources &res, Votes &v, bool on)
 {
   if (res.error) return kErrRpmh;
-  if (v.mm1On == on) {
-    ++v.unchanged;
-    return kOk;
-  }
-  const Cmd c = {res.mm1, on ? kBcmMm1On : kBcmMm1Off};
-  ++v.requests;
-  const int rc = send(ops, &c, 1, 1, v.stuck, &v.last);
-  ops.hw.note("rpmh: MM1 %s (%08x): TCS %d, %s after %u ms", on ? "on" : "off", c.data, int(v.last.tcs), rc ? "FAILED" : "completed",
-              v.last.polls);
+  const uint32_t need[PIANO_MM_RESOURCES] = {0, 0, on ? kBcmMm1On : 0u};
+  const int rc = mmUpdate(ops, res, v, 1u << PIANO_MM_MM1, need);
+  const PianoMmVotes &m = v.mm;
+  if (m.count)
+    ops.hw.note("rpmh: MM1 %s (%08x): TCS %d, %s after %u ms", on ? "on" : "off", m.level[PIANO_MM_MM1], int(v.last.tcs),
+                rc ? "FAILED" : "completed", v.last.polls);
+  else if (!rc && !on && m.others[PIANO_MM_MM1])
+    ops.hw.note("rpmh: MM1 stays on (another client needs it)");
   if (!rc) v.mm1On = on;
   return rc;
 }

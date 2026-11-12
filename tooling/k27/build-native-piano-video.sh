@@ -20,7 +20,7 @@ D=$(cd "$(dirname "$0")/../.." && pwd)
 . "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
 P=$D/package/PianoVideo; O=$D/out/native-kexts/PianoVideo
 mkdir -p "$O/host-tests" "$O/gen"
-"$D/package/include/tests/run.sh"   # PianoScmLock.h: the secure-call lock around every SCM request and the PAS 9 sequence (docs/scm-lock.md)
+"$D/package/include/tests/run.sh"   # PianoScmLock.h (the secure-call lock around every SCM request and the PAS 9 sequence, docs/scm-lock.md), PianoMmVotes.h (the shared MXC/MMCX/MM1 votes)
 python3 "$D/package/common/tests/run-firmware-tests.py"   # the shared firmware loader (docs/kc-space.md §6)
 # The copies stay byte for byte their originals (but for their provenance lines), which their owners never have to change.
 for f in FatVolume.c FatVolume.h QcomMdt.c QcomMdt.h; do
@@ -34,7 +34,8 @@ done
 "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/video_host.cpp" -o "$O/host-tests/video_host"
 "$O/host-tests/video_host" || { echo "Error: PianoVideo host tests failed (level 1)" >&2; exit 1; }
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/QcomMdt.c" -o "$O/host-tests/QcomMdt.o"
-"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/bringup_host.cpp" "$O/host-tests/QcomMdt.o" -o "$O/host-tests/bringup_host"
+"${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" -I "$D/package/include" "$P/tests/bringup_host.cpp" "$O/host-tests/QcomMdt.o" \
+  -o "$O/host-tests/bringup_host"
 FW=${PIANO_VIDEO_FW:-$D/../xiaomipad-8pro-mainline/firmware/qcom/sm8750/vpu35_4v.mbn}
 [ -f "$FW" ] || FW=$HOME/Downloads/XiaomiPad8Pro-Ubuntu/xiaomipad-8pro-mainline/firmware/qcom/sm8750/vpu35_4v.mbn   # a worktree
 VIDEO_HOST_FW=$([ -f "$FW" ] && echo "$FW" || true) "$O/host-tests/bringup_host" \
@@ -47,7 +48,7 @@ python3 "$D/tooling/k27/build-native-kext.py" PianoVideo "$P/PianoVideo.cpp" "$D
   "$D/package/common/PianoFirmwareZlib.c" "$O/gen/PianoVideoFirmware.c" -I "$P" -I "$D/package/common" -I "$O/gen" \
   --obj "${K27_OBJ:-k27-native-obj}"
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
-# PianoA830's lock words (DRV-2, the secure-call lock) and NativeUfs's partition reader (the firmware loader's ESP source) come from
+# PianoA830's lock words (DRV-2, the secure-call lock, the shared multimedia votes' lock and state) and NativeUfs's partition reader (the firmware loader's ESP source) come from
 # those kexts (libraries in PianoVideo.json, both linked before PianoVideo in configs/k27-native-kexts.txt), resolved by the KC link.
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" --library-prefix _sm8750_rpmh_drv2_owner \
-  --library-prefix _sm8750_scm_owner --library-prefix _native_ufs_part_ | cut -c1-160 >&2
+  --library-prefix _sm8750_scm_owner --library-prefix _piano_mm_votes --library-prefix _native_ufs_part_ | cut -c1-160 >&2

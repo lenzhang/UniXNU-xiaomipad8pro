@@ -50,6 +50,8 @@ UniXNU-piano (this repository), BSD-2-Clause-Patent:
     stream-match groups, the banks in use and IDR0.CTTW added.
   package/PianoDpu/tests/dpu_host.cpp (sha256 b768c18a2f7be03b281561cf850f85fba9b3e9cc63d7917636e50c97b656ca77): the register-model
     harness (Soc, CHECK), re-used in tests/video_host.cpp.
+  package/include/PianoMmVotes.h: the shared MXC/MMCX/MM1 votes (with PianoCamera), included, not copied; its words are
+    PianoA830's (board/PianoA830.cpp) -> VideoRpmh.h railsUp/railsDown/bus.
 
 Specifications only (no code, comment or table copied; GPL-2.0): the Ubuntu piano kernel (unixnu-research/ubuntu-ref/kernel, branch
 piano/dev, 7f8d6bedde479a01f4a05d6d0581b43c7fd20a01):

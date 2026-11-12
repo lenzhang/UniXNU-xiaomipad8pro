@@ -51,6 +51,10 @@ extern "C" {
 // free, else the holder's tag. PianoA830 is listed before PianoVideo in configs/k27-native-kexts.txt and named as a library in
 // PianoVideo.json, so the KC linker resolves it (and sm8750_scm_owner, PianoScmLock.h) to A830's single copy.
 extern volatile uint32_t sm8750_rpmh_drv2_owner;
+// The shared multimedia votes (package/include/PianoMmVotes.h): MXC, MMCX and MM1 reference-counted with PianoCamera; the words are
+// PianoA830's too (board/PianoA830.cpp).
+extern volatile uint32_t piano_mm_votes_owner;
+extern volatile uint32_t piano_mm_votes[32];
 // Post-mortem breadcrumb (also in the console log): the last stage reached, negative when it failed there.
 volatile int32_t piano_video_stage = 0;
 }
@@ -389,6 +393,8 @@ struct KernelHw {
     uint32_t expected = kDrv2Tag;
     __atomic_compare_exchange_n(&sm8750_rpmh_drv2_owner, &expected, 0u, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
   }
+  volatile uint32_t *mmWords() { return piano_mm_votes; }
+  volatile uint32_t *mmLock() { return &piano_mm_votes_owner; }
 
   // The AOP command database: copied once with aligned loads (no-map reserved memory, a device mapping).
   uint8_t *db = nullptr;

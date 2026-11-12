@@ -286,6 +286,12 @@ struct Model {
     if (!drv2Held) violation("the DRV-2 lock given without a hold");
     drv2Held = false;
   }
+  // The shared multimedia votes' words (PianoA830's piano_mm_votes / piano_mm_votes_owner in the kernel): PianoVideo the only client
+  // unless a test adds the camera's needs.
+  volatile uint32_t mmWords_[PIANO_MM_WORDS] = {};
+  volatile uint32_t mmLock_ = 0;
+  volatile uint32_t *mmWords() { return mmWords_; }
+  volatile uint32_t *mmLock() { return &mmLock_; }
   void vote(uint32_t addr, uint32_t data)
   {
     if (addr == kAddrMxc) {
@@ -1165,6 +1171,62 @@ static void testMmcxFloor()
   quiet(*x.m, "V1 floor 0");
 }
 
+// The shared votes (package/include/PianoMmVotes.h) with the camera as the other client: the camera already holds MXC at low_svs
+// (hlvl 3), MMCX at the floor (hlvl 8) and MM1 on. A V1 cycle raises MXC to svs and, at its power-off, gives MXC back to the
+// camera's level instead of 0 and leaves MM1 on: the video core's release never drops the camera's need. Then the camera's own
+// release (as PianoCamera makes it) takes MXC to 0 and MM1 off.
+static void testSharedVotes()
+{
+  Run x(2);
+  Model &m = *x.m;
+  volatile uint32_t *w = m.mmWords();
+  w[piano_mm_need_index(PIANO_MM_MXC, PIANO_MM_CAMERA)] = 0x40;
+  w[piano_mm_need_index(PIANO_MM_MMCX, PIANO_MM_CAMERA)] = 0x40;
+  w[piano_mm_need_index(PIANO_MM_MM1, PIANO_MM_CAMERA)] = PIANO_MM_BCM_ON;
+  w[piano_mm_floor_index(PIANO_MM_MMCX)] = kVlvlNomL1;
+  w[piano_mm_sent_index(PIANO_MM_MXC)] = 3;
+  w[piano_mm_sent_index(PIANO_MM_MMCX)] = 8;
+  w[piano_mm_sent_index(PIANO_MM_MM1)] = PIANO_MM_BCM_ON;
+  w[PIANO_MM_SENT_VALID] = PIANO_MM_ALL;
+  m.mxc = 3;
+  m.mm1 = kBcmMm1On;
+  CHECK(x.go() == kOk);
+  quiet(m, "V1 with the camera's votes");
+  CHECK(m.count("vote mxc 4") == 1 && m.count("vote mxc 3") == 1 && m.count("vote mxc 0") == 0);
+  CHECK(m.count("mm1 on") == 0 && m.count("mm1 off") == 0 && m.mm1 == kBcmMm1On && m.mxc == 3);
+  CHECK(m.count("vote mmcx 8") == 0 && m.mmcx == kMmcxNomL1);
+  CHECK(x.b->votes.requests == 2);   // MXC up, MXC back to the camera's level; MM1 needed by the camera throughout
+  CHECK(piano_mm_need(&x.b->votes.mm, PIANO_MM_MXC, PIANO_MM_VIDEO) == 0 && w[piano_mm_sent_index(PIANO_MM_MXC)] == 3);
+  // The camera's release through the same words (its kext's half, simulated with the video model's DRV-2 as the transport).
+  struct Cam {
+    Model *m;
+    static uint32_t addr(void *, unsigned r) { return r == PIANO_MM_MXC ? kAddrMxc : r == PIANO_MM_MMCX ? kAddrMmcx : kAddrMm1; }
+    static int level(void *, unsigned, uint32_t vlvl, uint32_t *h)
+    {
+      *h = vlvl == 0 ? 0 : vlvl <= 0x40 ? 3 : 8;
+      return 0;
+    }
+    static int send(void *c, const PianoMmCmd *cmds, unsigned n)
+    {
+      for (unsigned i = 0; i < n; ++i) static_cast<Cam *>(c)->m->vote(cmds[i].addr, cmds[i].data);
+      return 0;
+    }
+    static void sleep(void *, uint32_t) {}
+  } cam{&m};
+  const PianoMmVotesOps ops = {&cam, Cam::addr, Cam::level, Cam::send, Cam::sleep, nullptr};
+  PianoMmVotes c{};
+  c.words = w;
+  c.lock = m.mmLock();
+  c.tag = PianoMmTagCamera;
+  c.client = PIANO_MM_CAMERA;
+  c.floor[PIANO_MM_MMCX] = kVlvlNomL1;
+  c.ops = &ops;
+  CHECK(piano_mm_votes_bus(&c, 0) == 0 && m.mm1 == kBcmMm1Off);
+  CHECK(piano_mm_votes_rails(&c, 0, 0) == 0 && m.mxc == 0 && m.mmcx == kMmcxNomL1);
+  CHECK(m.allOff() && *m.mmLock() == 0);
+  quiet(m, "the camera's release");
+}
+
 static void testNoCmdDb()
 {
   Run x(2);
@@ -1613,6 +1675,7 @@ int main()
   testV1Stops();
   testV1OffWarnings();
   testMmcxFloor();
+  testSharedVotes();
   testNoCmdDb();
   testV2();
   testV2Refusals();
