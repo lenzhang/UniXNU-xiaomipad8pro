@@ -729,7 +729,7 @@ PianoDwc3: cold c2 stop: core 33313130, was role 1 (GCTL 00101005): nothing ran 
      retention flops); now GCTL 00102004", the FIFO line "after the block reset ...", "block reset (USB30_PRIM_BCR) done"
 PianoDwc3: cold: cmd-db: ldod2 0x..., ldob15 0x..., ldob5 0x...
 PianoDwc3: cold: rsc: apps DRV-2 id 0x... (version 3.0), TCS block +0xd00
-PianoDwc3: cold: rsc: ldod2 (0x...) mode 7, set point, enable 1: TCS 2 completed after 1 ms (status ...; DRV-2 lock after 0 waits of 10 us)
+PianoDwc3: cold: rsc: ldod2 (0x...) mode 7, set point, enable 1: TCS 2 completed after N us (status ...; DRV-2 lock after 0 waits of 10 us)
 PianoDwc3: cold c3 rail vreg_l2d_0p88 (ldod2, M31 vdd, QMP vdda-phy): PPID 0x... before status 80 enable 80 880 mV (on); voted 880 mV, mode 7, enable: done; after ...: on
 PianoDwc3: cold c4 repeater: before status 80 enable 80 force 00/00 tune [51] .. ; enable, the tuning kept (it was on), device mode: written; after status 80 enable 80 ...: ready
 PianoDwc3: cold c5 PHY (M31: reset, the stock init): before [3c] 01 [50] 00 [54] 6b [64] 07 [94] 00, after 01 00 6b 07 00: ready

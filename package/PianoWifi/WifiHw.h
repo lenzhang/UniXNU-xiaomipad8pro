@@ -229,10 +229,10 @@ constexpr uint32_t kChipPcieIntAllClear = 0x01e08228, kChipWlaonWarmSwEntry = 0x
 // The endpoint's DMA leaves the controller through the PCIe aggregate NoC: Ubuntu's sm8750 interconnect driver has MASTER_PCIE_0
 // (xm_pcie3) -> qns_pcie_mem_noc, whose bus clock manager is "SN4", not keep-alive, the only manager of that NoC; the gem NoC's
 // SH0 and DDR's MC0 behind it are keep-alive. pcie-qcom votes this path ("pcie-mem") before it enables the controller's clocks
-// and raises it to width x speed once the link is up; nothing votes it on native piano, and sheng (SM8550) had to vote the same
-// manager (SN7 there) before its chip's DMA worked. The vote is a BCM command: bit 30 commit, bit 29 valid, the average in 27:14,
-// the peak in 13:0, in the manager's units: peak kB/s x aux width / the node's bus width (8 bytes), x 1000 / aux unit (cmd-db's
-// aux data: u32 unit, u16 width, u8 clock domain), a non-zero value never rounded to 0, at most 0x3fff.
+// and raises it to width x speed once the link is up; nothing votes it on native piano, and sheng (SM8550, hardware-verified)
+// votes the same manager (SN7 there) at link-up, before its chip's first DMA. The vote is a BCM command: bit 30 commit, bit 29
+// valid, the average in 27:14, the peak in 13:0, in the manager's units: peak kB/s x aux width / the node's bus width (8 bytes),
+// x 1000 / aux unit (cmd-db's aux data: u32 unit, u16 width, u8 clock domain), a non-zero value never rounded to 0, at most 0x3fff.
 constexpr const char *kNocBcmName = "SN4";
 constexpr uint16_t kNocBusWidth = 8;
 constexpr unsigned kPcieLanes = 2;

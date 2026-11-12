@@ -499,7 +499,7 @@ PianoBluetooth: stage 200: level 2: the shared rails and BT_EN
 PianoBluetooth: step 201: the PMU lock and the shared rails (PianoWcnRails.h)
 PianoBluetooth: cmd-db: ldof3 0x....., ldof2 0x....., smpf5 0x....., smpd4 0x....., smpi7 0x....., smpg3 0x.....
 PianoBluetooth: rsc: apps DRV-2 id 0x...... (version 3.N), TCS block +0xd00
-PianoBluetooth: rsc: ldof3 (0x.....): 3 commands through TCS 2 completed after N ms (status 0x10100 0x10100 0x10100)      (six lines: ldof3 ldof2 smpf5 smpd4 smpi7 smpg3)
+PianoBluetooth: rsc: ldof3 (0x.....): 3 commands through TCS 2 completed after N us (status 0x10100 0x10100 0x10100)      (six lines: ldof3 ldof2 smpf5 smpd4 smpi7 smpg3; a busy poll under the DRV-2 lock, docs/drivers/wifi.md §10.22)
 PianoBluetooth: wcn rails (ours 0x42544831): the six rails voted and read back (N with a voltage): state 0x8000..02
 PianoBluetooth: step 202: BT_EN (pm8550ve-f gpio3): its APID's owner, its kind, its registers
 PianoBluetooth: step 203: BT_EN to the DT's state (output, VIN1, no bias, normal), low first

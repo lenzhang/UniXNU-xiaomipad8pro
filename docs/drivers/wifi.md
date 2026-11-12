@@ -26,8 +26,28 @@ the contexts and the image were at 0x9aab08000, above 4 GiB, which the chip (32-
 reach; level 4 needs the window (`piano-wifi-iova=1`). With the window, the bank read back everything as written except SCTLR's
 ASIDPNE (wrote 0x1027, read 0x27; FSR 0x400 is only its format field): piano's SMMU keeps that bit at 0. Fixed: ASIDPNE is no
 longer required, and the window's ASID is its bank number (TTBR0[55:48]) so the shared ASID namespace cannot mix it with another
-bank's entries (host test models piano's SMMU). Next: `piano-wifi=5 piano-wifi-iova=1`, then level 6. Association, keys and the data path (levels 7 and 8) are design only (§12 has level
-5's message table, §14 level 6's, §13 what levels 7 and 8 need and the macOS side's remaining plan). Template: `README.md`.
+bank's entries (host test models piano's SMMU).
+
+**Third round (2026-11-12, wifi-l5ic / wifi-l6c with the window working, then offline):** the window translates (`stream 0x1401
+translates through bank 81`, the boot loader at bus `0x20000000`) and level 4 fails exactly as before: `EE PBL, state 0, BHI
+status ffffffff, error code ef0e0003 (a phase timed out)` after 20 s, so the address width was not the cause. The register offsets,
+the order of BHI's writes, the 512 KiB image, its 512 KiB alignment, the window's address being the one the chip gets and the
+cache handling were all checked against the MHI host's behaviour and found right (§10.21). Two differences from Ubuntu's path
+were found and fixed. (1) **The PCIe NoC's bus clock manager (`SN4`) is never voted natively**: it is the only manager of the
+NoC the chip's DMA crosses, it is not keep-alive, pcie-qcom votes it before the controller's clocks, and sheng (SM8550, hardware
+verified) votes its own (SN7) before its chip's first DMA; with it off, a DMA read that never completes leaves the boot
+loader waiting and BHI's status untouched, which is what both address modes showed. Level 3 now votes it (`piano-wifi-noc=1`, the
+default) and every give-up withdraws it. That is the likely cause, **inferred, not proven**: the next boot decides. (2) BHI's
+status was never cleared before the doorbell (Ubuntu's MHI host writes 0 to it first: its power-on value is undefined), so
+`ffffffff` / `ef0e0003` were most likely the register's untouched power-on contents, not an answer; the driver now clears it,
+counts an error (bits 31:30 = 3, all ones included) only when the clear took or the value changed, and reads ERRDBG1–3. Level 4
+also dumps the MHI/BHI/BHIe block before the doorbell and at the end, logs every change of MHISTATUS/EE/BHI status/error code/
+BHIe status, and after a failure the PCI status and AER words of both ends and the SMMU's global and bank fault registers
+(where the DMA went). `piano-wifi-socreset=1` adds the chip-side reset Ubuntu's ath12k runs before MHI. P17 (the GPU's S1 failing
+next to level 2) was the DRV-2 lock: one of our transactions slept and logged while holding it and spanned PianoA830's whole 2 s
+wait (§10.22); fixed here and in PianoBluetooth's `BtRpmh.h`. Next: §8.8 boots 3a and 3b.
+
+Association, keys and the data path (levels 7 and 8) are design only (§12 has level 5's message table, §14 level 6's, §13 what levels 7 and 8 need and the macOS side's remaining plan). Template: `README.md`.
 
 ## 1. Purpose and gate
 
@@ -153,6 +173,8 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-iova=1` | 0 | give the endpoint's stream 0x1401 a translating context bank whose 32-bit window (`0x20000000` + the window's size, 2 MiB blocks) maps the DMA window, and hand the chip those addresses instead of physical ones. The only way to give this chip a 32-bit address, which its own driver uses for the data path's rings (§10.11); the page table is a buffer of its own, outside the window the chip can reach |
 | `piano-wifi-mode=1` | 0 | level 5 also sends the firmware's options (logging), the host's copy-engine configuration and the mode — the three messages that start the radio and open level 6. By default level 5 stops at the ready indication |
 | `piano-wifi-shadow=1` | 0 | put the shadow register list in that configuration (40 addresses computed from the chip's register map for the rings level 8's data path will create; level 6 writes the real registers through the window instead, §10.18, and §10.19 is what to try if that turns out to be the wrong path) |
+| `piano-wifi-noc=0` | 1 | no vote for the PCIe NoC's bus clock manager `SN4` before level 3's clocks. By default level 3 votes it at the link's peak (Gen × 2 lanes, as pcie-qcom does), and every level that gives the chip up withdraws it (§10.21). `=0` is only the A/B test of that vote |
+| `piano-wifi-socreset=1` | 0 | level 4 runs the chip-side reset Ubuntu's ath12k runs at every power-up before MHI: the chip's PCIe interrupts cleared, the warm-boot entry word cleared, the reset cause read, the SoC global reset (BAR0 + `0x3008` bit 0, 10 ms each way), MHICTRL's reset; one line with the values (§10.21) |
 | `piano-wifi-smmu=N` | 1 | 0: the SMMU is left alone (level 4 then needs stream 0x1401 to bypass already); 1: the endpoint's stream 0x1401 through a bypass context bank; 2: also the root port's 0x1400 |
 | `piano-wifi-spmi=1` | 0 | add the eight supplies' PMIC regulators and the BT_EN / sleep clock pins over the SPMI observer (the only stores: the observer's read commands) |
 | `piano-wifi-hwcg=1` | 0 | count a hardware-gated branch that reads CLK_OFF while voted and under HW_CTL as running for the read gates |
@@ -307,8 +329,9 @@ PianoWifi: wcn rails (ours 0x57494649): the six rails voted and read back (6 wit
    (or, when PianoBluetooth already has them: "the six rails were up and read back enabled: owners now 0x80003f03")
 PianoWifi: step 201: the rails as the PMIC has them (SPMI observer reads)
 PianoWifi: step 202: the six PMU rails by RPMh: mode NPM, voltage, enable (DRV-2 lock per transaction)
-PianoWifi: rsc: ldof3 (0x.....): 3 commands through TCS 2 completed after 0 ms (status 00010100 00010100 00010100)
-   (six such lines, in the order ldof3, ldof2, smpf5, smpd4, smpi7, smpg3)
+PianoWifi: rsc: ldof3 (0x.....): 3 command(s) through TCS 2 completed after N us (status 0x10101 0x10101 0x10101); the DRV-2 lock held N us, taken after 0 waits
+   (six such lines, in the order ldof3, ldof2, smpf5, smpd4, smpi7, smpg3; the hold is the TCS's own completion time, expected
+   well under a millisecond (not yet measured): a hold near 100 ms or above is the P17 hazard of §10.22 coming back)
 PianoWifi: step 203: the rails after the votes; the UFS PHY's supplies unchanged
 PianoWifi: rail pmu vddaon vreg_s5f_0p88 (smpf5) 0x.....: before read 500 mV mode .. en 00 -> sent mode 7, voltage, enable -> after read 876 mV mode 07 en 80 (rc 0)
 PianoWifi: rail phy vdda-pll vreg_l3g_1p2 (ldog3): 1200 mV en 80 -> 1200 mV en 80; never voted (the UFS PHY's and the DSI PHY's PLL: never voted, never lowered)
@@ -337,9 +360,14 @@ Step 204/205 — a TLMM word did not read back, which would mean the pin is owne
 the GCC collapse word (two bits cleared, under the vote lock), the aux and rchng RCG CFG + update bits, the pipe mux (twice: TCXO,
 then the PHY), the two branch vote words (bits only set), the TCSR reference gate, two BCR pulses, 12 PARF words, the 128-write PHY
 sequence, 256 cleared BDF-to-SID words plus one entry, the root port's bus numbers / memory window / command / link control 2, one
-PERST# release, the LTSSM enable, two iATU regions, the endpoint's BAR0 and command, and one SMMU group + bank.
+PERST# release, the LTSSM enable, two iATU regions, the endpoint's BAR0 and command, and one SMMU group + bank. Before all of it,
+one RPMh command: the PCIe NoC's bus clock manager `SN4` voted at the link's peak (§10.21; `piano-wifi-noc=0` skips it).
 
 ```
+PianoWifi: cmd-db: SN4 (the PCIe NoC's bus clock manager) 0x50020: unit N, width W, clock domain D      (level 1's stage 5)
+PianoWifi: options: noc 1 (the PCIe NoC's bus clock manager voted before level 3's clocks), socreset 0 (the chip-side reset before BHI)
+PianoWifi: rsc: SN4 (0x50020): 1 command(s) through TCS 2 completed after N us (status 0x10101 0 0); the DRV-2 lock held N us, taken after 0 waits
+PianoWifi: PCIe NoC: SN4 voted: peak 1000000 kB/s (Gen2 x2) -> vote V (unit N, width W, bus width 8), command 6000VVVV: taken (0)
 PianoWifi: step 301: the PCIe0 and PCIe0 PHY power domains out of collapse
 PianoWifi: step 302: the aux/rchng sources, the pipe mux on TCXO, the branch votes, the TCSR reference gate
 PianoWifi: step 303: the PCIe0 and PCIe0 PHY block resets, pulsed
@@ -374,6 +402,8 @@ too fast for what cx/mx are voted at (`piano-wifi-gen=1`); 310 `the endpoint did
 up but configuration requests do not reach the chip (the iATU or the BDF-to-SID entry), `0001` in the low half means it is still
 asking for a retry; 311 `BAR0 could not be sized or placed`. A hang (no line after a step) is a bus stall or an EL2 abort: the
 breadcrumb `piano_wifi_stage` holds the step number, and the next boot should use `piano-wifi-stop=N` to stop just before it.
+`PCIe NoC: SN4 ... NOT taken` or `SN4 is not in cmd-db` does not stop level 3 (configuration and BAR accesses go the other way,
+CPU to chip, through keep-alive managers), but the chip's DMA at level 4 then most likely never completes (§10.21).
 
 ### 8.4 Level 4 (the firmware over MHI): one RAM boot
 
@@ -391,7 +421,11 @@ PianoWifi: firmware partition modem_a (LUN 4, NNNNN blocks of 4 KiB)
 PianoWifi: firmware: image/peach/amss20.bin on modem_a, 6930496 bytes: boot loader 524288 bytes, a second ELF image 6406208 bytes at 524288
 PianoWifi: firmware: in the window: boot loader at 0x........, 13 segments, vector table at 0x........ (13 entries)
 PianoWifi: level 4: contexts at 0x........ (channels 128, event rings 2: control at ..., data at ..., command ring at ...)
-PianoWifi: level 4: boot begun in phase boot loader over BHI (EE PBL)
+PianoWifi: level 4: the image: 524288 bytes at bus 0x20000000 (the 32-bit window, translated by the SMMU), aligned to 512 KiB; the vector table at 0x20700000
+PianoWifi: level 4: before the doorbell: MHI +00: ........ x8        (6 lines MHI, 3 lines BHI with +40 the serial number as --------, 4 lines BHIe)
+PianoWifi: level 4: boot begun in phase boot loader over BHI (EE PBL); BHI status ffffffff before, 00000000 after this host cleared it (the clear took)
+PianoWifi: level 4: after the doorbell +0 ms: MHISTATUS 00000000 (state 0x0), EE 00000000, BHI status 00000000, error code ........, BHIe status ........
+PianoWifi: level 4: changed +N ms: MHISTATUS ... BHI status 80000000 ...     (one line per change, at most 48)
 PianoWifi: level 4: waiting for READY after N ms (EE PBL, state 0x7)
 PianoWifi: level 4: contexts needed after N ms (EE PBL, state 0x1)
 PianoWifi: level 4: waiting for the boot loader to run after N ms (EE PBL, state 0x2)
@@ -407,11 +441,35 @@ boot loader — `EE AMSS` already there would mean something else booted it), th
 
 Failure meanings: `the MHI register layout is not usable` — BAR0 does not carry the MHI block where sheng and PAGANI have it;
 `no partition` — NativeUfs had not published `modem_a` yet (level 4 does not wait: rerun, or add `piano-wifi-delay=20`);
-`BHI reported an error` with an error code — the boot loader refused the image (its address alignment, or the wrong file);
-`BHIe reported an error` — the vector table or a segment; `the device reported a system error` / `went to its crash dump
-environment` — the firmware started and died (level 5 adds the RDDM dump that says where); `a phase timed out` — the device stopped
-answering, which with `MHISTATUS ffffffff` means its PCIe core restarted under us (PAGANI re-applies BAR0 and the decode bits
-there; this driver does not yet).
+`BHI reported an error` with an error code and three debug words — the boot loader refused the image (its address alignment, or
+the wrong file), or its read of it failed; since the 2026-11-12 fix an all-ones status counts as an error too, as in Ubuntu's MHI
+host, unless it is the register's own power-on value that this host could not clear (`the clear did not take`, and it never
+changed); `BHIe reported an error` — the vector table or a segment; `the device reported a system error` / `went to its crash
+dump environment` — the firmware started and died (level 5 adds the RDDM dump that says where); `a phase timed out` — the device
+stopped answering, which with `MHISTATUS ffffffff` means its PCIe core restarted under us (PAGANI re-applies BAR0 and the decode
+bits there; this driver does not yet), or, with MHISTATUS and EE still answering and BHI's status unchanged since the doorbell
+(now the 0 this host wrote), the boot loader never finished reading the image (what 2026-11-12's four boots showed, before the
+NoC vote and the clear: §10.21).
+
+After any failure the level prints what the chip and the SoC say about the DMA, and those lines decide the next step:
+
+```
+PianoWifi: level 4: failed in phase boot loader over BHI: BHI error code ........, debug ........ ........ ........; BHI status ffffffff before the clear, 00000000 after (it took); N register change line(s)
+PianoWifi: level 4: at the end +N ms: MHISTATUS ... EE ... BHI status ... error code ... BHIe status ...
+PianoWifi: level 4: at the end: MHI / BHI / BHIe ...                               (the same 13 lines as before the doorbell)
+PianoWifi: dma: endpoint command/status 00100006, device control/status ........; AER uncorrectable ........ correctable ........
+PianoWifi: dma: root port command/status ........, secondary status ...., device control/status ........, BAR0 ........ BAR1 ........; AER uncorrectable ........ correctable ........; PARF interrupt status ........
+PianoWifi: dma: SMMU sCR0 ........, global fault sGFSR ........ sGFSYNR0 ........ sGFSYNR1 ........ (stream 0x....) sGFSYNR2 ........ sGFAR ........:........
+PianoWifi: dma: SMMU bank 81 (the 32-bit window): sctlr 00000027 fsr ........ far ........:........ fsynr0 ........
+```
+
+How to read them: an endpoint status with bit 29 (received master abort) or 28 (received target abort), or AER uncorrectable bit
+20 (unsupported request) or 15 (completer abort) — the root complex or the SMMU refused the chip's read; a non-zero `sGFSR` with
+bit 1 (an unidentified stream) — the chip's requests carry another stream than 0x1401 (`sGFSYNR1`'s stream says which: then the
+BDF-to-SID entry of step 306 is not what the controller uses); a bank `fsr` with a fault bit and `far` inside or outside
+`0x20000000` + the window — a translation fault at that address; AER bit 14 (completion timeout) in the endpoint — its read went
+out and nothing came back (the NoC again, or the TBU); every word clean and BHI's status still 0 — the boot loader never issued
+the read at all, which is what `piano-wifi-socreset=1` is the next test of (§10.21).
 
 ### 8.5 Level 5 (the firmware's QMI service): one RAM boot
 
@@ -584,7 +642,7 @@ the next is built: a level that fails is not retried at a higher level, and noth
 |---|---|---|---|
 | 1 | `piano-usb=2 piano-wifi=2` | the helper's `wcn rails … voted and read back` line, then every PMU rail `en 80` at or above the voted voltage; the two PHY LDOs unchanged; `WLAN_EN cfg ... io 00000002`; the log reaching `level 2: done`; the tablet alive afterwards (§8.2) | read §8.2's failure meanings; `SW_CTRL in 0` is not itself a failure but is the first suspect at boot 2 |
 | 2 | `piano-usb=2 piano-wifi=3` | `PCS status1 ... (ready)`, `LTSSM 0x11 L0` with `debug1 ... (up)`, `id 110e17cb`, a BAR0 placed inside the window, `command ...6`, the SMMU line (§8.3) | §8.3; `piano-wifi-gen=1`, `piano-wifi-physeq=0` and `piano-wifi-stop=N` are the next boots' tools |
-| 3 | `piano-usb=2 piano-wifi=4` | `EE PBL` at the start, the 6930496-byte file split at 512 KiB, `boot loader over BHI` → `contexts needed` → `image over BHIe` → `mission mode`, the tablet alive (§8.4) | §8.4; `piano-wifi-delay=20` when `modem_a` was not published yet |
+| 3 | `piano-usb=2 piano-wifi=4` | `EE PBL` at the start, the 6930496-byte file split at 512 KiB, `boot loader over BHI` → `contexts needed` → `image over BHIe` → `mission mode`, the tablet alive (§8.4) | §8.4; `piano-wifi-delay=20` when `modem_a` was not published yet. Failed four times on 2026-11-12 (§10.21): boots 3a and 3b below |
 | 4 | `piano-usb=2 piano-wifi=5` | both channels running, the firmware's service announced, the memory request answered, the four files read, `3 indications`, `0 unexpected messages`, the ready line with step 518 (§8.5) | §8.5 |
 | 5 | `piano-usb=2 piano-wifi=5 piano-wifi-iova=1` | the two `iova:` lines, then everything boot 4 showed: the chip works with 32-bit addresses, which level 6's rings need (§10.11) | if the `iova:` lines are there but a step then times out, the translating bank is the suspect: bank, table and fault registers are in the line, and boot 4's result stands as the comparison |
 | 6 | `piano-usb=2 piano-wifi=5 piano-wifi-iova=1 piano-wifi-mode=1 piano-wifi-shadow=1` | the three extra steps (515, 516, 517), `40 shadow registers`, step 518, and the tablet alive for a minute afterwards with the firmware's radio running | a refusal at 516 means the copy-engine tables or the shadow list are not what this firmware wants (§12); at 517 it means the mode itself was refused |
@@ -598,6 +656,17 @@ needed settled (32-bit addresses, and whether the firmware accepts this host's c
 and 8–10 are the three questions level 7 needs settled (the upper band, whether the 32-bit window is required, and that a
 suspend leaves the tablet healthy). Every boot ends with WLAN_EN low and PERST# asserted on a failure, the rails still voted
 (§8.7).
+
+**The next two unattended boots (after §10.21's fixes; boot 3 of the table, which has now failed four times).** Both on the
+queue's base `panic_on_crash_disabled=1 piano-usb=2 piano-usb-cold=0`, RAM boots with the queue's usual reset backstop:
+
+| # | Boot args (beyond the base) | Gate | Then |
+|---|---|---|---|
+| 3a | `piano-wifi=4 piano-wifi-iova=1` | `cmd-db: SN4 ... unit N, width W`; `PCIe NoC: SN4 voted ... taken (0)`; `BHI status ffffffff before, 00000000 after this host cleared it (the clear took)`; a `changed` line with BHI status `80000000`, then `waiting for READY` → `contexts needed` → `image over BHIe` → `mission mode`; the GPU up as usual (P17's lock hold now in each `rsc:` line) | passes: the NoC vote was the cause (that boot is the evidence; `piano-wifi-noc=0` on a later boot would confirm it by failing again). Fails: the `dma:` lines say where the read went (§8.4's reading guide); a clean set with BHI's status still 0 points at the chip-side reset of 3b |
+| 3b | `piano-wifi=6 piano-wifi-iova=1 piano-wifi-band=0 piano-wifi-socreset=1` | the `chip-side reset` line (global reset not `ffffffff`, the link still up), then everything 3a must show, then §8.8 boots 4–7's gates in one run (levels 5 and 6, a 2.4 GHz scan) | after a 3a that passed: the whole ladder on the Linux-like path; a failure at level 4 here with 3a passing means the reset itself hurts (keep `socreset=0`). After a 3a that failed: whether the reset is what the boot loader was missing |
+
+3b is chosen to be useful whichever way 3a goes. If the owner prefers the ladder without a second variable, 3b without
+`piano-wifi-socreset=1` is the alternative (it then only repeats 3a's question when 3a failed).
 
 ## 9. Fallback
 
@@ -707,6 +776,68 @@ network (§5.2 C).
    nowhere to go. The scan needs none (its results are management frames on the message interface), and nothing was observed to
    stall at the host test's level — but on hardware the firmware may log about the missing data interface (HTT), and a level 6
    boot should not be left running for long (§8.7).
+21. **P16: the boot loader never took the image, and the PCIe NoC (2026-11-12).** Four boots (wifi-l4b and l5b with physical
+   36-bit addresses, wifi-l5ic and l6c with the 32-bit window translating through bank 81) ended alike: MHI open (MHIREGLEN 0x100,
+   BHIOFF 0x100, BHIEOFF 0x224), EE PBL, TCSR 40210200, the doorbell rung, then 20 s, 3550 polls, no event, `EE PBL, state 0, BHI
+   status ffffffff, error code ef0e0003 (a phase timed out)`. State 0 is MHI's RESET: never READY, and no SYSERR in any poll (a
+   SYSERR ends the phase with its own message); EE read PBL at the start and at the end, so the device answered and BHI sits
+   where BHIOFF says.
+   Checked against the MHI host's behaviour (Ubuntu's `drivers/bus/mhi`, behaviour only), with the evidence:
+   - **Offsets** (code): BHI + 0x08 IMGADDR_LOW, 0x0c HIGH, 0x10 IMGSIZE, 0x18 IMGTXDB, 0x20 INTVEC, 0x28 EXECENV, 0x2c STATUS,
+     0x30 ERRCODE, 0x34–0x3c ERRDBG1–3, 0x40 the serial number; BHIe + 0x2c/0x30/0x34/0x3c/0x44. The "BHI status" read was BAR0 +
+     0x12c and the error code BAR0 + 0x130, the EE that read 0 BAR0 + 0x128. All as the MHI host has them.
+   - **Order** (code): the host writes BHI's status 0, the address high, then low, the size, then the doorbell with a non-zero
+     30-bit session number; INTVEC 0 at power-up and again after a reset. This driver had everything but the status clear.
+   - **The address** (log, code): with `piano-wifi-iova=1` the arena's bus base is the window, the image at `0x20000000`, the bank
+     translating to the physical window; without it the physical `0x9aa400000`. Both failed alike: the address is not it.
+   - **Size, alignment, contiguity** (log, code): 524288 bytes, the host's `sbl_size` (the first 512 KiB of the file), in one
+     physically contiguous window, 512 KiB aligned (the arena's rule); the second ELF in 13 segments of 512 KiB, the vector table
+     13 × 16 bytes, as the host builds them.
+   - **Caches** (code): the window's cacheable alias is cleaned and invalidated to the point of coherency after zeroing, the image
+     is written only through the write-combined mapping, a DSB precedes the doorbell, and the window bank's attribute is Normal
+     non-cacheable, so the chip reads DRAM. A stale image would anyway fail the boot loader's check with an error, not silence
+     (inference).
+   - **MSI / INTVEC** (inference): the host enables MSI and lets vector 0 wake its wait, but BHI's progress is a register it can
+     poll, and nothing in its path makes the device wait for an interrupt being enabled. This driver polls and leaves MSI off.
+   - **`ef0e0003`**: no public decoding (the MHI specification leaves the error code to the implementation). The same value with
+     the same all-ones status in four boots and both address modes, and a status nothing had ever cleared: most likely both are
+     the registers' power-on contents and the boot loader never wrote either (inference).
+   What Ubuntu does before BHI that the native path did not (read for behaviour: `pcie-qcom.c`, `interconnect/qcom/sm8750.c`,
+   `bcm-voter.c`, ath12k `pci.c`): **(a)** pcie-qcom votes the "pcie-mem" path before the controller's clocks (its authors note
+   that some Qualcomm platforms need the bandwidth set first) and at width × speed once the link is up; on SM8750 that path is
+   MASTER_PCIE_0 → qns_pcie_mem_noc, whose bus clock manager **SN4** is not keep-alive and is that NoC's only one, then the gem
+   NoC (SH0) and DDR (MC0), both keep-alive. Nothing votes SN4 natively; sheng (SM8550, hardware-verified to traffic) votes its
+   counterpart (SN7) at link-up "since nothing has done that here". Configuration, BAR and the chip's register window go the
+   other way (CPU to chip, keep-alive managers), which is everything levels 3 and 4 showed working; the chip's read of the
+   image is the first thing that crosses the PCIe NoC. A read that never completes leaves the boot loader waiting and BHI
+   untouched, address mode regardless. **Likely cause, inferred**; level 3 now votes SN4 (`piano-wifi-noc=1`, the vote at Gen ×
+   2 lanes, the aux data from cmd-db, average 0 as pcie-qcom asks) and withdraws it wherever the chip is given up and in the
+   suspend hook (PCIe0 is Wi-Fi's alone; it costs power only while the chip is up). **(b)** The status clear before the
+   doorbell (fixed; an error now needs bits 31:30 = 3 with MHISTATUS answering and the clear taken or the value changed;
+   ERRDBG1–3 read with the code). **(c)** ath12k's chip-side reset at every power-up (the PCIe interrupt clear, for an
+   interrupt a hot reset leaves pending, the warm-boot entry, the reset cause, the SoC global reset, MHICTRL's reset):
+   `piano-wifi-socreset=1`, off by default, boot 3b of §8.8. **(d)** ASPM is disabled during the download (never enabled
+   natively) and MSI enabled (above). Not done natively and not found necessary: the receive vector's clear (only the crash
+   dump uses it). The diagnostics added so that the next failure says where the read went: §8.4. The A/B of (a) is
+   `piano-wifi-noc=0`. (needs-boot: §8.8 boots 3a, 3b)
+22. **P17: the GPU's bring-up and the DRV-2 lock (wifi-l5ib, 2026-11-12).** PianoA830's `S1 step 0x10 reason 9 ... reg 0x1 value
+   0xfffffffffffffff0 expect 0xffffffff` decodes (Adreno830Start.h, Sm8750Rpmh.h) as: S1's mx/cx vote, reason RPMh, the RPMh
+   result's step 1 (the lock), status -16 (busy), no TCS chosen: A830 waited its whole 2 s for `sm8750_rpmh_drv2_owner` and never
+   reached a TCS (evidence). The console's own order (pstore) is: our smpd4 line, A830's S1 begin, A830's failure 2.96 s later,
+   then our smpi7 line "completed after 1 ms", with no "the DRV-2 lock is held" line of ours (the lock was free when we took it)
+   and nothing between two of our votes but the loop (evidence). So **our smpi7 transaction held the lock across A830's whole
+   wait**: it polled with `IOSleep(1)` (the "1 ms" counted polls, not time) and printed its line with IOLog before releasing — a
+   sleep and a console write under a word another driver spins on for at most 2 s. Which of the two took seconds is not known
+   (inferred: boot-time scheduling of the sleeping thread, or the console). Fixed: the poll is a busy wait (10 µs steps against a
+   100 ms clock), the line comes after the release with the hold time in it, and the reclaim clears WAIT_FOR_CMPL too — A830 takes
+   a TCS as idle only with CONTROL, CMD_ENABLE and WAIT_FOR_CMPL all 0, so a TCS 2 that Wi-Fi or Bluetooth had used stayed "busy"
+   for A830 for the rest of the session (harmless while A830 finds TCS 0 or 1, a TCS lost otherwise). PianoBluetooth's
+   `BtRpmh.h` (also PianoDwc3's cold path) slept under the lock the same way: it now takes a `delayUs` callback and both owners
+   pass IODelay (host test: no sleep, 10 µs steps, the reclaim). Which TCS each uses: A830 0, 1, 2 in that order; Wi-Fi, Bluetooth
+   and PianoDwc3 2, 1, 0; the lock serialises them, so no two program a TCS at once, and a TCS that timed out stays triggered and
+   is never idle again for anyone. Not changed (other packages, noted for their owners): PianoPower's `PianoAdsp.cpp` voteLocked
+   logs every write under the lock, and PianoKeyboard's voteLocked sleeps 1 ms per poll under it. (needs-boot: any boot with
+   `piano-wifi` ≥ 2 and the GPU: the `rsc:` lines' hold times)
 
 ## 11. Licence note
 
