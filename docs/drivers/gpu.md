@@ -351,6 +351,19 @@ used 936 of it and had 701 MiB of own BOs outside it (below). Since 2026-11-12 i
 512..2048; RAM 8192 MiB)`; S3 halves it until a reservation succeeds, as before; `piano-gpu-pool=<MiB>` wins, 64..2048). The `MEM`
 row shows pool and use; S3's time grows with the pool (1.0 s for 512 MiB, 1.8 s for 1024).
 
+**The per-object limit (2026-11-12).** Upstream's BoAlloc and BoImport refuse more than 256 MiB (`NativeAdrenoAbiMaxBoBytesShift`,
+Query's `max_bo_bytes`) whatever the client's window, so Metal's 16384x16384 textures (1 GiB at 4 bytes a texel) never reached the
+memory. In the macOS build the limit is the connection's GPU window (`NativeAdrenoUserClient::maxObjectBytes`: the render server's 3.5
+GiB, a large client's 768 MiB, a small one's 320 MiB; at most 4 GiB less a page, `NativeAdrenoMemoryMaxBytes`, the largest size Turnip
+can describe): a larger object could never be mapped. Behind it the real limits: the BO pool (a 1 GiB BO is one extent of it when one
+is free; else scattered wired pages, one table range each: 262144 of the VM's 524288 for 1 GiB, so two such BOs would fill the table: `gpu BoMap refused by the VM: table ranges full`), the
+pages XNU gives, the window's room. A refused BoAlloc or BoImport now says why after its `call failed` line, as BoMap does: `gpu
+BoAlloc refused: 1026 MiB is past this connection's per-object limit of 320 MiB (its GPU window)`, `gpu BoAlloc refused: 1088 MiB:
+pool 412 MiB free, largest 96, 512 kept for the render server; then no pages from XNU (0xe00002bd NoMemory)`, `gpu BoImport refused:
+26 MiB at 0x...: the task's pages were not pinned (0x... VMError, stage 18)`. Turnip takes the window's limit before any kernel call
+(0008), and Metal reports it (`maxBufferLength`): gpu-userspace.md, "Allocation limits and the video wallpaper". Host-checked: a 1 GiB
+BO mapped as one span, as 263168 scattered spans and out of a 1536 MiB pool (`check-turnip-a830-host.py`'s macOS runs).
+
 **The first desktop's address space (2026-11-12, run attend4).** The owner logged in on the A830 for the first time: Dock, the menu
 bar, Finder, Control Center, WallpaperAerials and VTDecoderXPCService among 24 Metal clients, none refused a slot. After a few minutes
 `gpu call failed: WindowServer[146] slot 0 BoMap -> 0xe00002be (NoResources)`, then loginwindow, Dock, Finder and SystemUIServer

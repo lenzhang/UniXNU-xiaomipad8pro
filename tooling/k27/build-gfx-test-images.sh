@@ -18,6 +18,14 @@
 #        render-pass barriers kept in panel-sized surface passes (SecurityAgent's full-screen window included)
 #   ubwc (by name only) tu-debug "sysmem,noubwc": no UBWC compression, for the seam along a full-screen draw's diagonal (a block shared
 #        by its two triangles read back half-written)
+#   video (by name only) as fix but with the login window's default aerial video wallpaper whatever DESK_WALLPAPER says, and the
+#        decoder's and the wallpaper's processes in the log predicate: the 4096x2160 YCbCr 4:4:4 frames (Metal format 503) drawn since
+#        frontend 0003 (docs/drivers/gpu-userspace.md, "Allocation limits and the video wallpaper, 2026-11-12")
+#
+# The wallpaper (DESK_WALLPAPER, as build-desktop-images.sh): still (the default) stages tooling/k27/still-wallpaper.sh and its files
+# (tooling/k27/still-wallpaper.py) into every seed, run first by the boot job after the clock: the login window shows a still picture
+# (one dark ochre colour) instead of the aerial video (a software HEVC decode and a 4K conversion every frame: battery); video stages
+# none (the stock behaviour: the aerial video).
 #
 # Each tu-debug value is its own Data seed (staged once into out/turnip-a830/stage-gfx-<name>/ by tooling/k27/stage-soft-metal.py):
 # a sandboxed client that cannot read the boot line takes the seed's file, so the A/B holds for SecurityAgent too, not only for
@@ -38,6 +46,12 @@ INPUT_SEED=${GFX_INPUT_SEED:-out/inputs/scratch-data.img}
 INPUT_TRUST=${GFX_INPUT_TRUST:-out/inputs/kernel.macho.trustcache}
 BUNDLE=${GFX_BUNDLE:-out/turnip-a830/NativeAdrenoMetal.bundle}
 LOG=${GFX_LOG-'process == "WindowServer" OR process == "SecurityAgent" OR process == "loginwindow"'}
+WALLPAPER=${DESK_WALLPAPER:-still}
+case $WALLPAPER in still|video) ;; *) echo "build-gfx-test-images: DESK_WALLPAPER=$WALLPAPER: still or video" >&2; exit 1 ;; esac
+# The still wallpaper's files and boot command (tooling/k27/still-wallpaper.py, .sh): --file and --boot-run arguments.
+STILL=(--file tooling/k27/still-wallpaper.sh:private/var/piano/still-wallpaper.sh)
+while read -r flag spec; do STILL+=("$flag" "$spec"); done < <(python3 tooling/k27/still-wallpaper.py out/wallpaper)
+STILL+=(--boot-run "sh /private/var/piano/still-wallpaper.sh")
 for f in "$KC" "$ADT" "$FD" "$INPUT_SEED" "$INPUT_TRUST"; do [ -f "$f" ] || { echo "build-gfx-test-images: $f is missing" >&2; exit 1; }; done
 grep -a -q com.unixnu.driver.PianoA830 "$KC" || { echo "build-gfx-test-images: $KC has no PianoA830" >&2; exit 1; }
 [ -f "$BUNDLE/Contents/MacOS/libvulkan_freedreno.dylib" ] || tooling/metal/build-turnip-a830.sh > out/k27/build-turnip-a830.log 2>&1
@@ -52,10 +66,11 @@ if [ "${GFX_SLEEP:-240}" != 0 ]; then
   BASE="$BASE piano-sleep=1 piano-sleep-state=1 piano-sleep-test=${GFX_SLEEP:-240} piano-sleep-test-count=1 piano-sleep-max=30"
 fi
 ORDER="fix ctl all coh bar"
-image() {   # TU: the seed's tu-debug; FILES: more --file arguments; A: the image's own arguments
-  TU=sysmem FILES=() A=
+image() {   # TU: the seed's tu-debug; FILES: more --file arguments; A: the image's own arguments; WALL: the wallpaper; ILOG: the log
+  TU=sysmem FILES=() A= WALL=$WALLPAPER ILOG=$LOG
   case $1 in
     fix) ;;
+    video) WALL=video ILOG=${LOG:+$LOG OR process == \"VTDecoderXPCService\" OR process BEGINSWITH \"WallpaperAerials\"} ;;
     ctl) TU=sysmem,nofbflush ;;
     all) TU=sysmem,fbflushall ;;
     ubwc) TU=sysmem,noubwc ;;
@@ -69,19 +84,22 @@ image() {   # TU: the seed's tu-debug; FILES: more --file arguments; A: the imag
 stage() {   # stage NAME: the Data seed and trust cache for image NAME's tu-debug and files, once per input change
   local out=out/turnip-a830/stage-gfx-$1 stamp
   printf '%s\n' "$TU" > "out/turnip-a830/tu-debug-gfx-$1"
+  local wall=()
+  if [ "$WALL" = still ]; then wall=("${STILL[@]}"); fi
   stamp=$( { shasum -a 256 "$INPUT_SEED" "$INPUT_TRUST" tooling/k27/stage-soft-metal.py "out/turnip-a830/tu-debug-gfx-$1"
-             find "$BUNDLE" -type f | sort | xargs shasum -a 256; echo "log $LOG ${FILES[*]+${FILES[*]}}"; } | shasum -a 256 | cut -c1-16)
+             find "$BUNDLE" -type f | sort | xargs shasum -a 256; echo "log $ILOG ${FILES[*]+${FILES[*]}} wallpaper $WALL"
+             if [ "$WALL" = still ]; then shasum -a 256 tooling/k27/still-wallpaper.sh out/wallpaper/*; fi; } | shasum -a 256 | cut -c1-16)
   if [ "$(cat "$out/stamp" 2>/dev/null)" != "$stamp" ] || [ ! -f "$out/scratch-data.img" ]; then
     mkdir -p "$out"
-    python3 tooling/k27/stage-soft-metal.py --seed "$INPUT_SEED" --trust "$INPUT_TRUST" --out "$out" ${LOG:+--log-errors "$LOG"} \
-      --file "out/turnip-a830/tu-debug-gfx-$1:private/var/ngpu/debug/tu-debug" ${FILES[@]+"${FILES[@]}"} "$BUNDLE" \
+    python3 tooling/k27/stage-soft-metal.py --seed "$INPUT_SEED" --trust "$INPUT_TRUST" --out "$out" ${ILOG:+--log-errors "$ILOG"} \
+      --file "out/turnip-a830/tu-debug-gfx-$1:private/var/ngpu/debug/tu-debug" ${FILES[@]+"${FILES[@]}"} ${wall[@]+"${wall[@]}"} "$BUNDLE" \
       > "$out/stage.log" 2>&1 || { tail -5 "$out/stage.log" >&2; exit 1; }
     echo "$stamp" > "$out/stamp"
   fi
   SEED=$out/scratch-data.img TRUST=$out/kernel.macho.trustcache
 }
 for n in ${*:-$ORDER}; do
-  image "$n" || { echo "build-gfx-test-images: no image $n (one of: $ORDER ubwc)" >&2; exit 2; }
+  image "$n" || { echo "build-gfx-test-images: no image $n (one of: $ORDER ubwc video)" >&2; exit 2; }
   case $n in coh) stage fix ;; *) stage "$n" ;; esac
   PIANO_FAST_BOOT=1 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=${GFX_RESET:-720} PIANO_EXTRA_ARGS="$BASE $A" \
     python3 tooling/bootimg/build-ram-images.py --fd "$FD" --fd-name A-bundled --kc "$KC" --trust "$TRUST" --seed "$SEED" --adt "$ADT" \

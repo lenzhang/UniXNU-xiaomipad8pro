@@ -14,8 +14,8 @@ Natively it uses its NativeAdreno backend (open type 0x4147) on Adreno830's user
 
 | Piece | Natively | Source |
 |---|---|---|
-| `Contents/MacOS/NativeAdrenoMetal` (plugin + frontend + bridge) | the VM's plugin and bridge, its frontend with one patch, plus an abort reporter, linked here (CDHash `9c42e844…` since the evening of 2026-11-11; the login run had the VM's binary, `ea549d13…`). The objects are compiled without objc_msgSend selector stubs, which makes the link reproducible | the VM-era plugin (`overlay/metal` of the k27 tree), UniXNU-turnip `drivers/AdrenoMetal` + `tooling/metal/turnip-a830/frontend/`, `tooling/metal/turnip-a830/abort_reporter.mm`, bridge `out/metal/bridge` |
-| `Contents/MacOS/libvulkan_freedreno.dylib` (Turnip) | rebuilt: the VM's Mesa tree, `NativeAdrenoABI.h` v2, 6 patches (CDHash `5efbe639…` with 0006; `205e665f…` with 0004/0005, `031df58a…` with 3, `eaa367a2…` with 2 in the login run; cold builds byte-identical) | Mesa `cecc0e9` + 23 VM-era patches (`tooling/metal/UPSTREAM`) + `tooling/metal/turnip-a830/mesa/` |
+| `Contents/MacOS/NativeAdrenoMetal` (plugin + frontend + bridge) | the VM's plugin and bridge, its frontend with one patch, plus an abort reporter, linked here (CDHash `3b48e955…` with frontend 0003, 2026-11-12; `9c42e844…` since the evening of 2026-11-11; the login run had the VM's binary, `ea549d13…`). The objects are compiled without objc_msgSend selector stubs, which makes the link reproducible | the VM-era plugin (`overlay/metal` of the k27 tree), UniXNU-turnip `drivers/AdrenoMetal` + `tooling/metal/turnip-a830/frontend/`, `tooling/metal/turnip-a830/abort_reporter.mm`, bridge `out/metal/bridge` |
+| `Contents/MacOS/libvulkan_freedreno.dylib` (Turnip) | rebuilt: the VM's Mesa tree, `NativeAdrenoABI.h` v2, 8 patches (CDHash `33f6503b…` with 0008, 2026-11-12; `5efbe639…` with 0006; `205e665f…` with 0004/0005, `031df58a…` with 3, `eaa367a2…` with 2 in the login run; cold builds byte-identical) | Mesa `cecc0e9` + 23 VM-era patches (`tooling/metal/UPSTREAM`) + `tooling/metal/turnip-a830/mesa/` |
 | `Contents/Info.plist` | the VM's (`org.droidvm.NativeAdrenoMetal`, a legacy bundle identifier kept as staged; principal class `NativeAdrenoMetalDevice`) | |
 
 The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
@@ -37,6 +37,8 @@ The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
   kernel call (`NativeAdreno: a BO of N MiB is past the kernel's per-object limit of 256 MiB (maxMemoryAllocationSize); refused (1
   time)`). Metal follows: `MTLDevice.maxBufferLength` is 256 MiB (was 4095), a buffer of exactly that is made, one byte more and an
   8192x8192 RGBA8 texture are refused by the frontend without a kernel call (`check-turnip-a830-host.py`, plugin_host section 5).
+  Since 2026-11-12 piano's kernel answers the connection's GPU window there (0008 and
+  [Allocation limits and the video wallpaper](#allocation-limits-and-the-video-wallpaper-2026-11-12)).
 - `0005-turnip-darwin-tu-debug-boot-arg.patch`: `piano-tu-debug=<flags>` on the boot line (read through `kern.bootargs`) stands in for
   `TU_DEBUG` and wins over the seed's `tu-debug` file; `piano-tu-debug=none` means none at all (Turnip picks GMEM or sysmem per
   render pass). WindowServer says which: `TU: info: TU_DEBUG=sysmem from /private/var/ngpu/debug/tu-debug` or `... from boot
@@ -52,6 +54,14 @@ The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
   shadows) first cleans the CCU, invalidates UCHE and waits for the earlier draws' writes, under `CP_COND_REG_EXEC` on the render mode
   (GMEM and binning skip it). `TU_DEBUG=nofbflush` leaves it out, `fbflushall` puts it before every draw of the plugin's feedback-loop
   subpasses. Why: [The login window's rendering](#the-login-windows-rendering-2026-11-12).
+- `0008-turnip-darwin-object-limit-window.patch` (2026-11-12): the per-object limit (0004's `max_bo_size`: `maxMemoryAllocationSize`,
+  `maxBufferSize`, images' `maxResourceSize`, the refusal before the kernel) is Query's `max_bo_bytes` within the connection's GPU
+  window, and the device's own connection takes its own when it differs from the probe's (`TU: error: NativeAdreno: this device's
+  per-object limit is N MiB, the enumeration probe's was M MiB; the device takes its own`). A BO larger than its cache budget is asked
+  at its own size, not its size class (a 16384x16384 texture would have asked 1.25 GiB for 1 GiB). Each BO of 256 MiB or more larger
+  than all before it in the process: `TU: info: NativeAdreno: a BO of N MiB, the largest so far (per-object limit L MiB, GPU window W
+  MiB)`. `tu_darwin_limits()` (exported) gives the frontend the limits it answers Metal with.
+  [Allocation limits and the video wallpaper](#allocation-limits-and-the-video-wallpaper-2026-11-12).
 
 The frontend patches (`tooling/metal/turnip-a830/frontend/`, applied in order after the k27 tree's `scripts/piano-frontend-patch.py`):
 - `0001-…patch`: the stderr copy of its `NBLOG` lines is rate-limited per call site (8 lines, then the 16th, 32nd, … with the count);
@@ -61,6 +71,11 @@ The frontend patches (`tooling/metal/turnip-a830/frontend/`, applied in order af
   on the boot line, else the first word of `/private/var/ngpu/debug/render-barriers`, else `none` with `com.droidvm.nmb-no-render-barrier`,
   else `small` (the VM's rule: none in a pass into an IOSurface of more than 4 Mpx, which every full-screen window's surface is natively).
   Each barrier left out in such a pass is an `NBLOG` line (`render memory barrier left out in a N-pixel surface pass (M so far; ...)`).
+- `0003-frontend-surface-texture-sizes-limits.patch` (2026-11-12): no fixed cap on two-plane YCbCr surface textures (the VM's rule
+  refused every one over 1 Mpx but 4:2:0 plane 0 in WindowServer, the login window's aerial frames among them); every refused or large
+  texture, buffer and surface texture is on the console with its geometry and the memory it took; the device's texture dimensions,
+  `recommendedMaxWorkingSetSize` and `currentAllocatedSize` answered from Turnip (`tu_darwin_limits`) and the runtime, and a `native-metal:
+  limits: ...` line per process. [Allocation limits and the video wallpaper](#allocation-limits-and-the-video-wallpaper-2026-11-12).
 
 The abort reporter (`abort_reporter.mm`, ours) is NativeSoftMetal's, see the desktop section.
 
@@ -342,7 +357,8 @@ use Metal for Core ML and video (media and photo analysis, more VTDecoderXPCServ
 (512 MiB: Dock, WallpaperAgent, iconservicesagent), 28 small (448 MiB) for everyone else; a process on neither list gets a small slot
 only while more than 4 are free. Each connection holds up to 4096 objects (16384 for WindowServer, 8192 for a large client). Memory
 beyond the 512 MiB pool comes from contiguous or scattered pages; one BO is at most 256 MiB (Query's `max_bo_bytes`, which Turnip does
-not take as its allocation limit: an 8192x8192 RGBA8 texture is refused with BadArgument, found by the host check).
+not take as its allocation limit: an 8192x8192 RGBA8 texture is refused with BadArgument, found by the host check). Since 2026-11-12:
+the connection's window, see [Allocation limits and the video wallpaper](#allocation-limits-and-the-video-wallpaper-2026-11-12).
 
 Metal features the login screen did not use, and where each stands:
 
@@ -354,7 +370,7 @@ Metal features the login screen did not use, and where each stands:
 | MTLSharedEvent | checked offline (signalled by a command buffer, read back) |
 | MSAA | 4x with resolve checked offline |
 | Compute | MPS's serial encoders as in the VM; a concurrent compute encoder (Core ML, MPSGraph) failed its whole command buffer, now it runs serially (frontend patch) |
-| Large textures | 3200x2136 and 4096x2160 at the login screen; 8192x4096 checked offline; above 256 MiB per BO refused |
+| Large textures | 3200x2136 and 4096x2160 at the login screen; 8192x4096 checked offline; above 256 MiB per BO refused (since 2026-11-12: up to the connection's window, 16384x16384 checked offline) |
 
 Surface sync (§8.3): not needed for the desktop. The frontend's tickets need `IOAcceleratorES` and open type 0x4149, which macOS never
 had, so the VM's desktop (Dock, Finder, Safari, Settings) ran without them. Their known user is WebKit's canvases (putImageData read
@@ -552,7 +568,8 @@ binding, draw and barrier they ask for. The Objective-C runtime is used to reach
 
 ```sh
 xcrun clang++ -target arm64e-apple-macos14.0 -fobjc-arc -std=c++17 -O1 -x objective-c++ tooling/metal/turnip-a830/render_trace_host.mm \
-  -o /tmp/rth -framework Foundation -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework QuartzCore
+  -o /tmp/rth -framework Foundation -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework QuartzCore \
+  -framework CoreVideo
 O=out/turnip-a830; B=$O/NativeAdrenoMetal.bundle/Contents/MacOS; mkdir -p /tmp/rth-cache
 DYLD_INSERT_LIBRARIES=$O/hostsim/libhostiokit.dylib HOSTSIM_GPU=a830 HOSTSIM_PAGE_SIZE=4096 TU_DARWIN_SERVICE=AGXAccelerator \
   TU_DEBUG=sysmem CA_MODE=1 CA_GLASS=1 CA_BACKDROP=1 /tmp/rth plugin 3200 2136 $B/NativeAdrenoMetal $B/libvulkan_freedreno.dylib /tmp/rth-cache
@@ -605,7 +622,8 @@ DYLD_INSERT_LIBRARIES=$O/hostsim/libhostiokit.dylib HOSTSIM_GPU=a830 HOSTSIM_PAG
    back to the aerial video. VTDecoderXPCService decodes it in software, and WindowServer wraps each 4096x2160 frame as a format-503
    texture (`YCBCR8_444_2P` in metal2vulkan's table). The frontend refuses every YCbCr surface texture over 1 Mpx except plane 0 of
    500/505 (`textureOnSurface`: `surface texture refused: 4096x2160 YCbCr format 503`). That is a policy against the conversion's memory,
-   about 97 MB per surface, not a limit of the A830 (`maxImageDimension2D` 16384, 256 MiB per BO). The layer then gets no picture,
+   about 97 MB per surface, not a limit of the A830 (`maxImageDimension2D` 16384, 256 MiB per BO); lifted 2026-11-12, with the 97 MB
+   explained ([Allocation limits and the video wallpaper](#allocation-limits-and-the-video-wallpaper-2026-11-12)). The layer then gets no picture,
    and what remains is the login's tint and material over nothing: flat grey, every thumbnail `screen unchanged`. Meanwhile
    VTDecoderXPCService keeps decoding about 9 frames a second. Earlier lines of this file said Core Animation converts these frames on
    the CPU; it does not, and they are corrected above.
@@ -629,7 +647,9 @@ DYLD_INSERT_LIBRARIES=$O/hostsim/libhostiokit.dylib HOSTSIM_GPU=a830 HOSTSIM_PAG
   on. That also ends the software HEVC decode at the login window (battery). A RAM image cannot carry it without the account's
   GeneratedUID and the export's `Metadata.plist` format (not read; the seed's `dslocal` is root-only). The system layer (data-store.md
   §9) does not take files outside launchd's folders, `/usr/local` and the GPU bundle. Lifting the frontend's YCbCr cap for format 503
-  would cost about 97 MB per surface and a conversion every frame; it is not done.
+  would cost about 97 MB per surface and a conversion every frame; it is not done. Superseded the same day: the cap is lifted (the
+  owner's call: a bug, not a policy) and the seeds carry a still wallpaper by default, see
+  [Allocation limits and the video wallpaper](#allocation-limits-and-the-video-wallpaper-2026-11-12).
 
 Bundle built 2026-11-12 (this tree, from scratch twice with the same result): `libvulkan_freedreno.dylib` CDHash `6c23e546dcf62259c14d69a081cba0225519fcbf`,
 `NativeAdrenoMetal` `21a1ded0176b1970a9934f49731b39e613d83a2f`. A new plugin is a new seed identity, so the installed store's seed keeps
@@ -661,6 +681,7 @@ none).
 | `ram-gfx-coh` | `sysmem` | `piano-gpu-cohtest=1` | the kernel's V9b/V9c; with level 2, GPU-written imports become IO-coherent: stale CPU-written pages |
 | `ram-gfx-bar` | `sysmem`, `render-barriers` `all` | `piano-metal-barriers=all` | RenderBox's barriers kept in full-screen surfaces |
 | `ram-gfx-ubwc` (by name) | `sysmem,noubwc` | | the 45° line, if a UBWC block is read half-written |
+| `ram-gfx-video` (by name, 2026-11-12) | `sysmem`, no still wallpaper | | the aerial video drawn (frontend 0003): [the verification image](#the-verification-image) |
 
 Console lines (`grep -E` on the USB console):
 - `TU: info: TU_DEBUG=sysmem(,nofbflush|,fbflushall|,noubwc)? from /private/var/ngpu/debug/tu-debug`: WindowServer's mode.
@@ -675,7 +696,8 @@ Console lines (`grep -E` on the USB console):
 - None of: `gpu recovery`, `gpu hang snapshot`, `gpu DEVICE LOST`, `MESA: error: device lost`, `TU: error: NativeAdreno: kernel`,
   `exit: pid N WindowServer`.
 - `surface texture refused: 4096x2160 YCbCr format 503` and grey thumbnails stay in every image: the wallpaper is not part of this
-  matrix.
+  matrix. Since the images of [Allocation limits and the video wallpaper](#allocation-limits-and-the-video-wallpaper-2026-11-12) these
+  images have the still picture (`DESK_WALLPAPER=still`, the default), and `ram-gfx-video` (by name) the aerial video, drawn.
 
 The decisive reading is a picture of the login window per image, twice: before the test sleep (`piano-sleep: test sleep 1 of 1`) and
 after its wake (`woke after 30.0 s by timer`). The thumbnails' 40x79-pixel cells cannot show a diamond or the boxes. The Mac's webcam
@@ -691,3 +713,138 @@ slots) `dd4e7b22c65db32a…`. Images (`verify-ram-images.py` PASS each; command 
 (seed `e32722ed…`), `ram-gfx-ctl` `61fabf033b49bf59…` (seed `d8f330bc…`), `ram-gfx-all` `633ff36739d65269…` (seed `866ea0f5…`),
 `ram-gfx-coh` `871c5cc94eeebc39…` (fix's seed), `ram-gfx-bar` `f0aad23b9507b487…` (seed `ce90a139…`), the dump `8df7b15ae95a3123…`.
 Rebuild them in the main checkout before a run (the kernel's and the seeds' bytes depend on where they were built).
+
+## Allocation limits and the video wallpaper, 2026-11-12
+
+The owner's report: a fixed per-surface cap of about 97 MB is not acceptable for macOS, whose clients assume Apple's 16384x16384 textures
+(1 GiB at 4 bytes a texel), and the login window's aerial video wallpaper is a bug to fix. Both are fixed in this tree: no fixed cap
+remains, each layer's limit is a real resource, and each refusal says which one on the console.
+
+### The failing surface, and the 97 MB
+
+- **The frame.** WindowServer's texture over each frame of the login window's aerial: 4096x2160, Metal pixel format 503 (`YCBCR8_444_2P`:
+  YCbCr 8-bit 4:4:4 over two planes). Core Animation asks format 503 for a CoreVideo `'444v'` surface (host trace, `render_trace_host`
+  `CA_VIDEO=444v`, on the Mac's own GPU and through the plugin). Its planes as CoreVideo lays them out: luma 4096x2160, 1 byte a
+  texel, rows of 4096 bytes (8.4 MiB); chroma 4096x2160 Cb/Cr pairs, 2 bytes, rows of 8192 bytes (16.9 MiB); 25.3 MiB in all. The
+  tablet's own fourcc, row alignment and offsets are on its console with frontend 0003 (lines below): it may be `'444f'` (full range).
+- **Why it was refused.** Not by size: the VM's frontend refused every two-plane YCbCr surface texture of more than 1 Mpx (1024x1024
+  pixels), whatever its bytes, but plane 0 of a 4:2:0 one (500/505) in WindowServer, whose planes the runtime reads in place
+  (`METAL2VULKAN_YCBCR_PLANES_ONLY`). The frontend computed no size at all: no wrong bytes per texel, no plane sum, mip levels, UBWC
+  factor or slice count. Its message ("converts on the CPU") was wrong for this runtime too.
+- **The 97 MB.** The memory the runtime (metal2vulkan) makes such a texture with: an `R16G16B16A16_SFLOAT` image of the converted texels,
+  8 bytes a texel (it holds every value of Metal's 1/2048 grid exactly): 4096x2160x8 = 67.5 MiB, plus a staging copy of both planes,
+  25.3 MiB: 92.8 MiB = 97.3 MB per texture. Measured on the host: `native-metal: surface texture 4096x2160 fmt 503 YCbCr8 4:4:4 plane 0:
+  made, 92.8M of device memory for it`; the kernel saw a BO of 80 MiB (the image in Turnip's size class) and one of 28 MiB (the staging),
+  108 MiB. WindowServer keeps a texture of each surface of the decoder's pool (the VM-era note in the k27 tree's frontend patch script),
+  so a pool of N surfaces holds about N x 108 MiB of BOs.
+- **The conversion runs on the GPU**: a refresh dispatch compares the planes with the staging copy and a conversion dispatch writes the
+  image only where they changed. On the host, a pass sampling the texture with new planes each time took 0.11 ms of CPU (a BGRA8
+  surface texture's 0.07 ms), creating it 22 ms (the hostsim's zero fill of 108 MiB). The GPU's share on the A830 (about 25 MB read and
+  70 MB written per new frame) is for the tablet's meter lines.
+- VTDecoderXPCService's own textures over 4K frames (formats 501 and 543 in the attended runs) met the same rule and are made now too;
+  it is a small client (320 MiB window).
+
+### The limits, end to end
+
+| Layer | Limit | Refused with |
+|---|---|---|
+| Kernel, per object (PianoA830 macOS builds) | Query's `max_bo_bytes` = the connection's GPU window (the render server's 3.5 GiB, large 768 MiB, small 320 MiB; at most 4 GiB less a page, the largest size Turnip's fields describe; upstream 256 MiB) | `PianoA830: gpu call failed: <proc>[pid] slot N BoAlloc -> 0xe00002c2 (BadArgument)` then `gpu BoAlloc refused: N MiB is past this connection's per-object limit of W MiB (its GPU window)` (BoImport alike) |
+| Kernel, memory | the BO pool (a quarter of the RAM up to 2 GiB; a 1 GiB BO is one extent when one is free), else scattered wired pages from XNU | `gpu BoAlloc refused: N MiB: pool F MiB free, largest L; then no pages from XNU (0xe00002bd NoMemory)` |
+| Kernel, the shared VM | 524288 table ranges (a scattered 1 GiB BO takes 262144 of them), 32768 mapping records | `gpu BoMap refused by the VM: table ranges full, N needed, M free of 524288 (...)` |
+| Kernel, the window | each mapping inside the connection's window | `gpu BoMap refused: iova ... + N KiB ends past this connection's window ...` |
+| Turnip (0004, 0008) | `maxMemoryAllocationSize`, `maxBufferSize`, images' `maxResourceSize` = the per-object limit within the window; images 16384 (1D, 2D, cube), 2048 (3D), 2048 layers | `TU: error: NativeAdreno: a BO of N MiB is past the per-object limit of L MiB (maxMemoryAllocationSize: the kernel's K MiB, GPU window W MiB); refused`; a full window: `TU: error: darwin: no GPU address range of N bytes: U of W bytes in use, H holes` |
+| Metal (frontend 0003) | `maxBufferLength` = Turnip's per-object limit; `maxTextureWidth2D`/`Height2D` 16384 (the runtime's), `maxTextureDimensionCube` 16384, `maxTextureWidth3D`/`Height3D`/`Depth3D` 2048, `maxTextureWidth1D` 16384, `maxTextureLayers` 2048, `maxTextureBufferWidth` Turnip's `maxTexelBufferElements` (all of these but the 2D ones answered 0 before); `recommendedMaxWorkingSetSize` Turnip's heap (the window, at most its share of the RAM) | `native-metal: texture (fmt F WxHxD, L levels, S slices, layout N, maxBufferLength M) refused: <the runtime's reason>`; `native-metal: buffer of N (options O, maxBufferLength M) refused: ...`; surface textures below |
+| IOSurface | Apple's own maximum (16384x16384 on the build Mac); an import is one BO within the per-object limit | `native-metal: surface texture WxH fmt F plane P (at O, row R): refused (4): import: ...` |
+
+Each Metal process says what its device reports once, at open: `native-metal: limits: 2D 16384, cube 16384, 3D 2048, layers 2048;
+buffer 3584.0M (kernel object 3584.0M, window 3584.0M), heap 3584.0M; IOSurface 16384x16384` (WindowServer; a small client 320.0M).
+Turnip names each BO of 256 MiB or more larger than any before it: `TU: info: NativeAdreno: a BO of 1028 MiB, the largest so far
+(per-object limit 3584 MiB, GPU window 3584 MiB)`. The frontend's surface lines, two per texture (8 per call site, then the 16th, 32nd,
+...): every refused one, every one that took 64 MiB or more or lies over a surface of 256 MiB or more, and every YCbCr one over 1 Mpx:
+```
+native-metal: surface texture 4096x2160 fmt 503 YCbCr8 4:4:4 plane 0: made, 92.8M of device memory for it
+native-metal: surface '444v' 4096x2160 25.3M, p0 4096x2160 1B r4096/4096 @512 8.4M p1 4096x2160 2B r8192/4096 @8847872 16.9M
+```
+(the surface's code, size and allocation, then per plane its size, bytes per element, row bytes / their alignment, offset and rows x
+height). Large plain textures and buffers: `native-metal: texture 16384x16384x1 fmt 80 L1 s1 a1: made, 1032.0M by the runtime's layout
+(maxBufferLength 3584.0M)`.
+
+### Host checks (all pass, 22 of 22)
+
+`check-turnip-a830-host.py` builds the hostsim twice: as upstream (256 MiB) and as piano's kext (`-DADRENO830_MACOS`, with the 16 GiB
+aperture, `HOSTSIM_VA=16`). plugin_host's new sections, per run:
+
+| Run | Per-object limit | 16384x16384 BGRA8 texture, and over a 16384x16384 IOSurface | 4096x2160 frames |
+|---|---|---|---|
+| `plugin_host-16k`, `-4k` (upstream, slot 0) | 256 MiB (window 1536) | refused before the kernel; a 256 MiB buffer made, one past it and 8192x8192 RGBA8 refused before the kernel | `'444v'` as 503 sampled (108 MiB of BOs), `'420v'` as 500 sampled in place |
+| `-slot4`, `-reslot` (upstream, 124 MiB window) | 124 MiB | refused before the kernel | none (below 256 MiB) |
+| `plugin_host-macos` | 3584 MiB | made and rendered into: a BO of 1028 MiB (one VM range), an import of 1024 MiB | both sampled |
+| `-macos-scatter` (`HOSTSIM_SCATTER=1`, as outside the pool) | 3584 MiB | made: 263168 VM ranges for the BO | both sampled |
+| `-macos-pool` (`HOSTSIM_POOL_MIB=1536`) | 3584 MiB | made: 1028 MiB of the pool, one range | both sampled |
+| `-macos-slot4` (a small client) | 320 MiB | refused before the kernel (Turnip's line) | both sampled |
+
+`run-a830-host-tests.py`: 46 passed in both passes (1 known), with the window limit, the refusal reasons and lines, a 288 MiB BO. The render
+trace (`render_trace_host plugin 3200 2136 ...` with `CA_MODE=1 CA_VIDEO=444v`, build line in its header, now with `-framework CoreVideo`):
+the old plugin refuses Core Animation's 503 texture at each frame (`surface texture refused: 4096x2160 YCbCr format 503 converts on the
+CPU`, 8 draws), this one makes it (24 draws, as on the Mac's own GPU). The bundle of these checks: `NativeAdrenoMetal` CDHash
+`3b48e955889824ef61d273680a777cde4da59eeb`, `libvulkan_freedreno.dylib` `33f6503bfd94aa7414663e10d19ed81ffdcb2e08`.
+
+### The wallpaper of the test images: still by default, the video on request
+
+Before any login, macOS's login window (SecurityAgent's loginwindow plugin) reads the account's picture from
+`/var/db/Wallpapers/<GeneratedUID>/Wallpaper.png` (what `wallpaperexportd` writes after a login) and plays the default aerial video only
+without it: the tablet's console shows SecurityAgent's `[com.apple.wallpaper:access] Failed to load wallpaper image for user with UUID ...`
+and ImageIO's `can't open '/var/db/Wallpapers/...'`, then VTDecoderXPCService's start and WindowServer's `Failed to allocate MTLTexture
+from IOSurface 0x12` every 100 ms (runs `20261112-104004` and `-105345`: 14559 and 12286 of them, one surface each). The path and the
+fallback are macOS 26's code (this Mac's, read for behaviour); macOS 27's binaries are not here, its console agrees.
+
+`DESK_WALLPAPER=still` (the default of `tooling/k27/build-desktop-images.sh` and `tooling/k27/build-gfx-test-images.sh`) stages
+`tooling/k27/still-wallpaper.sh` and its files (`tooling/k27/still-wallpaper.py`: a 3200x2136 picture of one colour, `#5A4A2E`, a dark
+ochre that is neither an undrawn wallpaper's grey nor black nor the boot screen's blue; the `Metadata.plist` of an image choice; a
+wallpaper store `Index.plist` with the same choice) into each staged seed, and the boot job runs the script first after the clock, as
+root (SecurityAgent reads the picture about 7 s later). For every local account (uid 501 or more, its GeneratedUID read from the local
+directory node at boot: only root may read it, so it cannot be staged) and for root's and _securityagent's fallback ids it writes
+`/var/db/Wallpapers/<id>/Wallpaper.png` and `Metadata.plist` (root's, 0644, as `wallpaperexportd` leaves them), the picture as
+`/Library/Desktop Pictures/UniXNU Still.png`, and the account's store when it has none (so the desktop after the login is still too).
+Nothing that exists is replaced. Console: `still-wallpaper: root and _securityagent: login picture written, written`, `still-wallpaper:
+uid 501: login picture written, store written`. `DESK_WALLPAPER=video` stages none of it: the aerial video, the path this fix makes
+drawable. `build-desktop-images.sh plain` keeps the stock seed (the video). Not verified on the tablet: that macOS 27 shows only the
+picture (macOS 26's code turns the live layer off once it has one), and that its wallpaper agent takes the hand-written store; if the
+desktop after the login still plays the aerial, the login window is still still (the boot job writes its picture at every boot of a
+volatile Data).
+
+### The verification image
+
+```sh
+K27_KERNEL=<k27 tree>/out/k27/kernel-k27-0064-native.macho PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh
+tooling/k27/build-gfx-test-images.sh video fix     # out/ram-gfx-video (the aerial video kept), out/ram-gfx-fix (the still default)
+tooling/native/native-loop.sh out/ram-gfx-video/boot-piano-macos-ram-A-bundled.img
+```
+
+`ram-gfx-video` is `ram-gfx-fix` (Turnip 0001-0008, frontend 0001-0003, `TU_DEBUG=sysmem`, the test sleep at 240 s,
+`piano-reset-after=720`) with the default aerial video and VTDecoderXPCService's and the aerial extension's errors in the boot job's log.
+Console lines, in order (`grep -a -E` on the USB console):
+- `native-metal: limits: 2D 16384, cube 16384, 3D 2048, layers 2048; buffer 3584.0M (kernel object 3584.0M, window 3584.0M)` from
+  WindowServer; 320.0M from the small clients, 768.0M from the large ones.
+- **`WindowServer: native-metal: surface texture 4096x2160 fmt 503 YCbCr8 4:4:4 plane 0: made, 92.8M of device memory for it`**, then
+  `native-metal: surface '444v' 4096x2160 ...` (or `'444f'`: the frame's code, its planes' rows, alignment and offsets): the frame's
+  geometry on the tablet. One pair per surface of the decoder's pool (8, then the 16th, 32nd, ... on stderr).
+- No `surface texture refused: 4096x2160 YCbCr format 503 converts on the CPU` (the old frontend's line) and no `Failed to allocate
+  MTLTexture from IOSurface` from WindowServer (CoreAnimation's, in the boot job's error log).
+- A refusal instead says which limit: `surface texture ... refused (5): <why>`, Turnip's `NativeAdreno: a BO of N MiB is past ...`
+  or `darwin: no GPU address range ...`, the kernel's `gpu BoAlloc refused: ...`; and `PianoA830: gpu va/map: 0:WindowServer U/3584M`
+  every 30 s while it changes: WindowServer's mapped MiB, about 108 MiB more per frame surface.
+- VTDecoderXPCService: its own textures (formats 501/543 in earlier runs) made or refused with these lines, in its 320 MiB window.
+- The cost: `PianoA830: t gpu meter rs N a/b ms` (the render server's mean and longest GPU time per job, the conversion included)
+  and `row0 GPU RUN <MHz>`, against `ram-gfx-fix`'s still picture.
+- None of `gpu recovery`, `gpu DEVICE LOST`, `MESA: error: device lost`, `exit: pid N WindowServer`.
+
+The webcam (`imagesnap -d "HD Pro Webcam C920" -w 1.5 cam-$(date +%H%M%S).jpg`): `ram-gfx-video` shows the login window over a moving
+aerial landscape (sky, sea, terrain: its colours change between two pictures a few seconds apart), where every run so far showed flat
+grey (`mean #909090`); `NativeGopDisplay: thumb frame ...` lines then report a non-grey mean that changes from thumbnail to thumbnail.
+`ram-gfx-fix` shows the login window over the uniform dark ochre picture (thumbnails' mean near `#5a4a2e` under the login window's
+tint), with `still-wallpaper: ... login picture written` on the console and no VTDecoderXPCService start before a login.
+
+Built offline 2026-11-12 in an agent worktree (the 0064 kernel, 24 native kexts, every vtable check 0 problem slots, the native kext
+rule passed): KC `a5706b5b5e5c76f0…`; `ram-gfx-video` `5cba0b63fdb287cb…` (seed `921b5d98…`), `ram-gfx-fix` `7f36b4eaaf6223bf…` (seed
+`d10bc6d3…`), the dump `f07f312ad8e9116a…`; `verify-ram-images.py` PASS for each. Rebuild them in the main checkout before a run.

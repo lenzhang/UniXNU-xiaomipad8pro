@@ -22,11 +22,17 @@
 #            PianoDwc3, product 0x5055) as ANSI (40, DESK_KEYBOARD_TYPE) in /Library/Preferences/com.apple.keyboardtype.plist, written
 #            by the boot job as root: Keyboard Setup Assistant asks for an unknown keyboard's type, and it came up after every login
 #            of attend1-4 (a window in front of the new desktop).
+#          - the still wallpaper (DESK_WALLPAPER=still, the default; docs/drivers/gpu-userspace.md, "Allocation limits and the video
+#            wallpaper, 2026-11-12"): tooling/k27/still-wallpaper.sh and its files (tooling/k27/still-wallpaper.py), run first by the boot
+#            job after the clock, give the login window (and the account's desktop, where it has no wallpaper store yet) one dark ochre
+#            picture instead of the default aerial video: no software HEVC decode and no 4K conversion every frame at the login window
+#            (battery). DESK_WALLPAPER=video stages none: the aerial video, drawn since frontend 0003, for testing that path.
 #   quiet  desk + com.apple.audiomxd disabled too (it spins on configd without an audio device: 0.3-0.5 cores, docs/power.md 1.2);
 #          media playback may need it (VM-era note), hence not in desk
-#   plain  desk's profile with the stock seed (no override, no deny, no keyboard type): the A/B partner when desk misbehaves
-#   diag   plain + the keyboard type + exec-log=1 + piano-policy=1 (the cover's decisions logged, nothing acted on) +
-#          tooling/k27/desk-reports.sh in the boot job: the failing jobs by name (which job exits 78), xprotectd's own log, the
+#   plain  desk's profile with the stock seed (no override, no deny, no keyboard type, no wallpaper: the aerial video): the A/B
+#          partner when desk misbehaves
+#   diag   plain + the keyboard type + the still wallpaper (as desk's) + exec-log=1 + piano-policy=1 (the cover's decisions logged,
+#          nothing acted on) + tooling/k27/desk-reports.sh in the boot job: the failing jobs by name (which job exits 78), xprotectd's own log, the
 #          unified log of loginwindow, WindowServer, Dock, Finder, SecurityAgent, authorizationhost ... around the login (what the
 #          wait after the password is), the busiest processes after the login; one run answers what the console cannot
 #
@@ -38,7 +44,7 @@
 # then runs until the owner's reset), DESK_RTC_OFFSET (piano-rtc=1 piano-rtc-offset=N: the calendar from the PMIC RTC from the start,
 # k27 0060, tooling/native/rtc-offset.py), DESK_KEYBOARD_TYPE (40 ANSI, 41 ISO, 42 JIS), DESK_TOUCH (default 2: piano-touch=2; 0
 # leaves the touch screen out: the fallback when it resets or its controller keeps falling into its watchdog state; any other
-# value is piano-touch's), DESK_EXTRA (added to every image's arguments, e.g. piano-touch-idle=0: the touch screen's level-1 pace). The staged seeds go to out/desk-stage/<name>. A new seed is a new identity: the images run Data volatile
+# value is piano-touch's), DESK_WALLPAPER (still, the default, or video: above), DESK_EXTRA (added to every image's arguments, e.g. piano-touch-idle=0: the touch screen's level-1 pace). The staged seeds go to out/desk-stage/<name>. A new seed is a new identity: the images run Data volatile
 # (data-persist=0), the owner's store is not touched.
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
@@ -51,6 +57,8 @@ RESET=${DESK_RESET_AFTER:-3600}
 KBTYPE=${DESK_KEYBOARD_TYPE:-40}
 for f in "$KC" "$ADT" "$FD" "$SEED_IN" "$TRUST_IN"; do [ -f "$f" ] || { echo "build-desktop-images: $f is missing" >&2; exit 1; }; done
 case $KBTYPE in 40|41|42) ;; *) echo "build-desktop-images: DESK_KEYBOARD_TYPE=$KBTYPE: 40 (ANSI), 41 (ISO) or 42 (JIS)" >&2; exit 1 ;; esac
+WALLPAPER=${DESK_WALLPAPER:-still}
+case $WALLPAPER in still|video) ;; *) echo "build-desktop-images: DESK_WALLPAPER=$WALLPAPER: still or video" >&2; exit 1 ;; esac
 # The collection must have the drivers (each one's own start line: another kext's text may name a driver it watches; attend5's and
 # desk1's images had no PianoKeyboard at all) and the fixes the desktop needs: PianoA830's map limits (the render server's
 # reserve), NativeGopDisplay's cursor layer, NativeRamBlock's volatile pool, PianoTouch's watchdog download, drag delay and start
@@ -90,6 +98,14 @@ stage() {   # stage NAME [stage-boot-run.py arguments]: out/desk-stage/NAME from
   tail -1 "out/desk-stage/$name.log"
 }
 mkdir -p out/desk-stage
+# The still wallpaper's files and boot command, first in each staged seed's boot job (the login window reads its picture about 7 s
+# after the clock): none with DESK_WALLPAPER=video.
+WALL=()
+if [ "$WALLPAPER" = still ]; then
+  WALL=(--file tooling/k27/still-wallpaper.sh:private/var/piano/still-wallpaper.sh)
+  while read -r flag spec; do WALL+=("$flag" "$spec"); done < <(python3 tooling/k27/still-wallpaper.py out/wallpaper)
+  WALL+=(--boot-run "sh /private/var/piano/still-wallpaper.sh")
+fi
 NAMES=${*:-$ORDER}
 for n in $NAMES; do
   case " $ALL " in *" $n "*) ;; *) echo "build-desktop-images: no image $n (one of: $ALL)" >&2; exit 2 ;; esac
@@ -98,14 +114,14 @@ for n in $NAMES; do
   SEED=$SEED_IN TRUST=$TRUST_IN DENY= A=
   case $n in
     desk|quiet)
-      X=(--boot-run "$KEYBOARDS")
+      X=(${WALL[@]+"${WALL[@]}"} --boot-run "$KEYBOARDS")
       for j in $LOOPS; do X+=(--disable-job "$j"); done
       DENY=$DENY_DESK
       if [ "$n" = quiet ]; then X+=(--disable-job com.apple.audiomxd); DENY=$DENY,/usr/libexec/audiomxd; fi
       stage "$n" "${X[@]}" ;;
     plain) ;;
     diag)
-      stage diag --file tooling/k27/desk-reports.sh:private/var/piano/desk-reports.sh \
+      stage diag ${WALL[@]+"${WALL[@]}"} --file tooling/k27/desk-reports.sh:private/var/piano/desk-reports.sh \
         --boot-run "$KEYBOARDS" --boot-run "sh /private/var/piano/desk-reports.sh 40"
       A="exec-log=1 piano-policy=1" ;;
   esac

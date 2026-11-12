@@ -222,7 +222,10 @@ afterwards `python3 tooling/native/boot-timeline.py logs/usb-console/<ts>-port0.
    authorizationhost, 13 s before). Expected: no garbled frame (current NativeGopDisplay), no Keyboard Setup Assistant window
    (the keyboard type written by the boot job; if it still asks, answer it and note the keyboard it names).
 4. **Set a still wallpaper** (System Settings › Wallpaper, a photo or a colour, not a video one) and note whether the desktop is
-   more responsive (Dock magnification, opening Finder). On volatile Data it lasts this boot only.
+   more responsive (Dock magnification, opening Finder). On volatile Data it lasts this boot only. Since 2026-11-12 the desk images
+   carry one by default (`DESK_WALLPAPER=still`: a dark ochre picture at the login window and on the desktop,
+   [drivers/gpu-userspace.md](drivers/gpu-userspace.md), "Allocation limits and the video wallpaper"); `DESK_WALLPAPER=video` keeps
+   the aerial video, which is drawn now. Note which one the desktop shows after the login.
 5. **Clicks on the cover touchpad**: one-finger press with the thumb resting at the bottom edge → left click (console: `pressed
    (left)`, `a resting thumb left out`); two fingers close together pressed → right click (`pressed (right)`); one-finger tap →
    click; two-finger tap → context menu; double-click a Finder folder by tapping twice; two-finger scroll in a Finder window and
