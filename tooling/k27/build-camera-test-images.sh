@@ -60,7 +60,7 @@ image() {
     # Level 5's first version: the user client, and piano-camera-grab's boot job capturing both cameras through it (front, then
     # rear) with their thumbnails on the console. Needs the userland's seed: CAM_SEED=out/userland/stage/scratch-data.img
     # CAM_TRUST=out/userland/stage/kernel.macho.trustcache (tooling/userland/stage.py); refused with a seed that lacks the tool.
-    c5)    A="piano-camera=5 piano-camera-grab=1 piano-camera-delay=20" ;;
+    c5)    A="piano-camera=5 piano-camera-grab=1 piano-camera-delay=20 piano-usb-shell=1" ;;   # + the root shell on USB port 1 (the PPMs)
     *) return 1 ;;
   esac
 }
