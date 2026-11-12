@@ -310,6 +310,17 @@ and 16.1 ms, with and without the display off, never more than 250 ms between re
 rest. The latency at rest: one idle period if the waiting frame is current, two if the controller scanned it right after the last
 read (the model samples the finger at the read; the run tells which, open question 8).
 
+**After a start** (2026-11-12, `StartGrace`, host-tested, not run). desk1 (the attend5 image from main, unattended, nobody
+touching) ran these rules for the first time and its controller was in the watchdog state most of the boot: 10314 watchdog blocks
+among 17296 reads by 1051 s, the downloads every 10 s each followed by `watchdog (state 0xfd) again 2233 ms after its download`.
+The controller's first frame after a start comes ~0.85 s later (the boot's first edge 842 ms after the start, every run), but after
+the watchdog's download (and the display's return when it had lost its state) the busy pace read without an edge 50 ms after the
+download: a read before the frame is ready, which is one of the two ways into the watchdog state. The model now gives the start
+that delay (`FeedModel::startUs`) and reproduces desk1 without the grace (4 downloads, never back); with it the controller comes
+back after one. After every download and start nothing is read without an edge or the line high until the first edge, for at most
+2 s (`frames: the first edge N ms after start S (no read without one before it)`; `frames: no edge within 2000 ms of start S:
+reading without one again`).
+
 **The watchdog** (`WatchdogRecovery`): eleven watchdog transport blocks in a row (0xfd, or 0xfe: idled first, swrst <- 0xaa) and the
 download again at once; while it comes back sooner than 10 s after a download, the next one 10 s after it, and so on, never given
 up (2026-11-11: three downloads in a row, then `FAILED at step 7` and no touch for the boot). With the display off it is only

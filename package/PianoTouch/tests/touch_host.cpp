@@ -1615,6 +1615,7 @@ void testClock()
 // while the 12 ms edge-less reads ran inside a ~12.6 ms cycle.
 struct FeedModel {
   uint64_t scanUs = 6500, unreadLimitUs = 450000;
+  uint64_t startUs = 0;   // the first frame after a download's start comes this much later than a scan (the tablet: ~850 ms)
   uint64_t readyAt = 6500;
   bool edgeOut = false, watchdog = false;
   uint32_t collisions = 0, starvations = 0, downloads = 0;
@@ -1643,7 +1644,7 @@ struct FeedModel {
   {
     ++downloads;
     watchdog = false;
-    readyAt = t + 190000 + scanUs;   // ~185 ms for the download, then the first frame
+    readyAt = t + 190000 + scanUs + startUs;   // ~185 ms for the download, then the first frame (startUs: the controller's start)
     edgeOut = false;
   }
 };
@@ -1653,6 +1654,7 @@ struct FeedModel {
 // edge-less reads, 500 ms reads with 250 ms waits with the display off).
 struct LoopRules {
   bool previous = false;
+  bool noGrace = false;   // the current rules without TouchPace.h's StartGrace (before 2026-11-12's desk1 fix)
 };
 struct FeedRun {
   unsigned reads = 0, frames = 0, wakeups = 0, edgeReads = 0, levelReads = 0, blindReads = 0, downloads = 0;
@@ -1662,14 +1664,16 @@ struct FeedRun {
 // loseEdges: every Nth edge never reaches the latch (0: none; 1: none at all, the latch broken). mutedUntil: the display off
 // until then. A finger in [fingerOn, fingerOff). watchdogAt: the controller goes to 0xfd by itself then (0: never).
 static FeedRun simulateFeed(LoopRules rules, uint64_t durationUs, uint64_t mutedUntilUs, uint64_t fingerOn, uint64_t fingerOff,
-                            unsigned loseEdges = 0, uint64_t scanUs = 6500, uint64_t watchdogAt = 0)
+                            unsigned loseEdges = 0, uint64_t scanUs = 6500, uint64_t watchdogAt = 0, uint64_t startUs = 0)
 {
   constexpr uint64_t kReadUs = 5100;
   FeedRun r;
   r.m.scanUs = scanUs;
   r.m.readyAt = scanUs;
+  r.m.startUs = startUs;
   TouchPace pace = touchPace(kIdleReadMs, 0);
   WatchdogRecovery wd;
+  StartGrace grace;
   uint64_t t = 0, lastRead = 0;
   bool latch = false, edgePending = false, rest = false, touching = false;
   unsigned edgeCount = 0, wdtRun = 0, prevBlind = 0;
@@ -1686,6 +1690,7 @@ static FeedRun simulateFeed(LoopRules rules, uint64_t durationUs, uint64_t muted
     if (latch) {
       latch = false;
       edgePending = true;
+      grace.edge();
     }
     const bool muted = t < mutedUntilUs;
     const uint64_t since = t - lastRead;
@@ -1697,7 +1702,8 @@ static FeedRun simulateFeed(LoopRules rules, uint64_t durationUs, uint64_t muted
       else readNow = edgePending || since >= 12000;
     } else {
       const bool levelPending = !edgePending && since >= kNoEdgeMinMs * 1000ull && level;
-      if (muted) readNow = since >= kMutedReadMs * 1000ull;
+      if (!rules.noGrace && grace.holds(t / 1000)) readNow = edgePending || levelPending;   // after a start: the first frame's edge
+      else if (muted) readNow = since >= kMutedReadMs * 1000ull;
       else if (rest) readNow = since >= pace.idleMs * 1000ull && (edgePending || levelPending || since >= pace.noEdgeMs(true) * 1000ull);
       else readNow = edgePending || levelPending || since >= pace.noEdgeMs(false) * 1000ull;
       if (readNow && !edgePending) (levelPending ? r.levelReads : r.blindReads)++;
@@ -1727,6 +1733,7 @@ static FeedRun simulateFeed(LoopRules rules, uint64_t durationUs, uint64_t muted
           wdtRun = 0;
           learning = true;
           ++r.downloads;
+          grace.started(t / 1000);
         }
       }
     }
@@ -1815,6 +1822,28 @@ static void testPace()
     CHECK(!wd.due(20000) && wd.due(21000) && wd.downloads == 2);
     const FeedRun r = simulateFeed(current, 10000000, 0, ~0ull, ~0ull, 0, 6500, 3000000);
     CHECK(r.downloads == 1 && !r.m.watchdog && r.frames > 100);   // it came back after the download
+  }
+  // 5. desk1 (2026-11-12): after a download the controller's first frame comes ~850 ms later. Without the start's grace the busy
+  //    pace reads 50 ms after the download without an edge, inside the start: the watchdog again, download after download (every
+  //    10 s, never back); with it the first read waits for the first edge and the controller comes back after one download.
+  {
+    StartGrace g;
+    CHECK(!g.holds(0));
+    g.started(1000);
+    CHECK(g.holds(1500) && g.holds(2999) && !g.holds(3000) && g.expired == 1);
+    g.started(5000);
+    CHECK(g.holds(5100) && g.edge() && !g.edge() && !g.holds(5200) && g.edges == 1 && g.starts == 2);
+    const LoopRules before{false, true};
+    const FeedRun old = simulateFeed(before, 40000000, 0, ~0ull, ~0ull, 0, 6500, 3000000, 850000);
+    const FeedRun now = simulateFeed(current, 40000000, 0, ~0ull, ~0ull, 0, 6500, 3000000, 850000);
+    std::printf("feed: a start of 850 ms after each download: without the grace %u downloads, %u collisions (back: %s); with it %u, "
+                "%u (back: %s)\n", old.downloads, old.m.collisions, old.m.watchdog ? "no" : "yes", now.downloads, now.m.collisions,
+                now.m.watchdog ? "no" : "yes");
+    CHECK(old.downloads >= 3 && old.m.collisions >= 2);
+    CHECK(now.downloads == 1 && now.m.collisions == 0 && !now.m.watchdog && now.frames > 300);
+    // The grace ends by itself: a line that never rises after the start is read without edges again 2 s later.
+    const FeedRun dead = simulateFeed(current, 20000000, 0, ~0ull, ~0ull, 1, 6500, 3000000, 850000);
+    CHECK(dead.reads > 50);
   }
 }
 

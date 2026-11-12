@@ -454,6 +454,8 @@ class PianoTouch : public IOService {
   const char *volatile fRotationSource = "none";
   // The uptime (ms) of the last frame with a finger on the screen (not a palm), for "PianoTouchContact" (PianoTouchClient.h).
   volatile uint64_t fLastContactMs = 0;
+  // After a download and start: no read without an edge until the first one (TouchPace.h StartGrace, desk1 2026-11-12).
+  StartGrace fStart;
 
   static void threadMain(void *self, wait_result_t);
   static bool eventServicePublished(void *target, void *refCon, IOService *service, IONotifier *notifier);
@@ -1421,6 +1423,7 @@ bool PianoTouch::restart(bool fromSuspend, const MatrixConfig &mc)
   }
   fFramesStopped = plan == Restart::giveUp;
   if (plan == Restart::relearn) matrixReset(*fMatrix, mc);
+  if (tried && plan == Restart::relearn) fStart.started(nowMs());   // a download and start: the first frame's edge first
   trackerReset(fTracker, trackConfig());
   gestureReset(fGesture, gestureConfig());
   fWdtRun = fConsecutive = 0;
@@ -1604,6 +1607,9 @@ void PianoTouch::serve()
       wr32(pinVa(kIrq) + kIntrStatus, 0);
       dsb();
       if (!fEdgeSeen) note("frames: first gpio162 edge after %llu ms", (unsigned long long)(now - begin));
+      if (fStart.edge() && (fStart.edges <= 10 || fStart.edges % 20 == 0))
+        note("frames: the first edge %llu ms after start %u (no read without one before it)",
+             (unsigned long long)(now - fStart.sinceMs), fStart.starts);
       fEdgeSeen = fEdgePending = true;
       ++fEdges;
       ++fEdgesSinceStats;
@@ -1613,7 +1619,10 @@ void PianoTouch::serve()
     // A frame waits without an edge we saw: the line still high two cycles after the last read started.
     const bool levelPending = !fEdgePending && fIrqArmed && since >= kNoEdgeMinMs && level(kIrq);
     bool readNow;
-    if (muted)
+    const uint32_t expiredBefore = fStart.expired;
+    if (fStart.holds(now))
+      readNow = fEdgePending || levelPending;   // after a start (TouchPace.h StartGrace): a read before its first frame is a collision
+    else if (muted)
       readNow = since >= kMutedReadMs;   // the display off: one frame per 200 ms, waiting by then
     else if (fBus == BusKind::gpio)
       readNow = since >= minGapMs && (fEdgePending || since >= 100);
@@ -1623,6 +1632,9 @@ void PianoTouch::serve()
       readNow = since >= pace.idleMs && (fEdgePending || levelPending || since >= pace.noEdgeMs(true));
     else
       readNow = fEdgePending || levelPending || since >= pace.noEdgeMs(false);
+    if (fStart.expired != expiredBefore && (fStart.expired <= 5 || fStart.expired % 20 == 0))
+      note("frames: no edge within %u ms of start %u: reading without one again (%u times)", kStartGraceMs, fStart.starts,
+           fStart.expired);
     if (readNow) {
       if (levelPending) ++fLevelReads;
       else if (!fEdgePending) ++fBlindReads;
@@ -1675,8 +1687,12 @@ void PianoTouch::serve()
           fWatchdog.downloaded(nowMs());
           fWdtRun = 0;
           fWdtWaitNoted = false;
-          if (firmware() && startScanning()) matrixReset(*fMatrix, mc);
-          else note("frames: the download for the watchdog failed: again in %u s", kWatchdogRetryMs / 1000);
+          if (firmware() && startScanning()) {
+            matrixReset(*fMatrix, mc);
+            fStart.started(nowMs());   // its first frame comes ~0.85 s later: no read without its edge before it
+          } else {
+            note("frames: the download for the watchdog failed: again in %u s", kWatchdogRetryMs / 1000);
+          }
           fEdgePending = false;
           fLastReadMs = nowMs();
         } else if (!fWdtWaitNoted) {

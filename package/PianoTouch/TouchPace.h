@@ -70,6 +70,42 @@ struct WatchdogRecovery {
   }
 };
 
+// After a download and start (the watchdog's, or the display's return when the controller had lost its state): its first frame
+// comes about 0.85 s later (the boot's first gpio162 edge came 842 ms after the start, every run), while the busy pace reads without
+// an edge 50 ms after the last read. Such a read is one before the frame is ready, which is what sends the controller into its
+// watchdog state: desk1 (2026-11-12, nobody touching) went round "download, start, watchdog again ~2.2 s after the download" for
+// most of the boot (10314 watchdog blocks among 17296 reads). So after a start nothing is read without an edge (or the line high)
+// until the first edge, for at most kStartGraceMs; then the usual rules (a line that never rises is read as before).
+constexpr uint32_t kStartGraceMs = 2000;
+struct StartGrace {
+  bool waiting = false;
+  uint64_t sinceMs = 0;
+  uint32_t starts = 0, edges = 0, expired = 0;
+  void started(uint64_t nowMs)
+  {
+    waiting = true;
+    sinceMs = nowMs;
+    ++starts;
+  }
+  // An edge taken: the first frame after the start is there. Returns true for the first one (for the log).
+  bool edge()
+  {
+    if (!waiting) return false;
+    waiting = false;
+    ++edges;
+    return true;
+  }
+  // Whether a read still needs an edge or the line's level; the grace ends by itself after kStartGraceMs.
+  bool holds(uint64_t nowMs)
+  {
+    if (waiting && nowMs - sinceMs >= kStartGraceMs) {
+      waiting = false;
+      ++expired;
+    }
+    return waiting;
+  }
+};
+
 // The CPU latency hold of a read burst (piano-touch-cpu-hold; piano_cpuidle_latency_hold, k27 0061, docs/power.md §2): taken at
 // the first busy pass, released kHoldMs after the last one, so frames read on every edge while a finger is on the panel are never
 // started late by a CPU leaving a deep idle state (Ubuntu: reads 43-51 % slow without its 2000 us hold), and the idle frames
