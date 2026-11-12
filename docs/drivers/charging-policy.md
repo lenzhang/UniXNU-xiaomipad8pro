@@ -514,6 +514,12 @@ piano-reset-after=600` (the daily profile's drivers without the Mac's keyboard, 
 | `ram-chg-l1` | `piano-power=1` | the A/B partner: the PMIC alone in the same build and the same queue |
 | `ram-chg-late` | `piano-power=2 piano-power-policy=1 piano-power-rp=1 piano-power-ramp=0 piano-power-write-ms=1000` | P2 again (1600 mA at once, now the input first) with the old window: late answers or lost ones |
 
+Built 2026-11-12 in an agent worktree on main 04472f0 + this change (kernel 0063 `ee596f39be1ded3c…`; KC `2befbe8dc7e550e9…`,
+`native kext rule: 23 native kexts linked, none from outside this repository`, `com.unixnu.driver.PianoPower: linked, ..., 800
+pointers`; the Turnip-staged seed `f6176467`, so Data volatile), all four `verify-ram-images.py` PASS: `ram-chg-ramp`
+`2db44271fc63d682…`, `ram-chg-l1` `dcb9f670afaace35…`, `ram-chg-late` `0ef0733577572aae…`, `ram-chg-dump` `973cf1e8d3054bb1…`
+(each build has its own hash: it carries the build time as `droidvm-utc`; rebuild in the main checkout before a run).
+
 Run in this order with `tooling/native/native-loop.sh out/ram-chg-<name>/boot-piano-macos-ram-A-bundled.img
 out/ram-chg-dump/boot-piano-macos-ram-A-bundled.img` and a capture of at least 640 s. Read:
 `grep -E 'PianoPower: (policy: input steps|\[[0-9]+s\] (battery|input|policy)|mca: (write|late|an answer))'`.

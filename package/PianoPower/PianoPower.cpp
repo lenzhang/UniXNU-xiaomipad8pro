@@ -1119,8 +1119,9 @@ void PianoPower::logPolicy(const LinkOutcome &o, uint64_t now)
     note("policy: the Rp limit is not trusted for the rest of the boot (the bus sagged below 4.5 V under it, or the source went "
          "twice within 30 s of it): the class rows");
   if (e & PIANO_CHG_EV_RP_WITHHELD)
-    note("policy: the source advertises %u mA on its Rp, but no connector temperature reads below 50 C (%s): the class row",
-         in.rp_ma, fThermal ? "PianoThermal's connector channels" : "PianoThermal is not there");
+    note("policy: the source advertises %u mA on its Rp, but no connector temperature reads below 50 C (%s): %s", in.rp_ma,
+         fThermal ? "PianoThermal's connector channels" : "PianoThermal is not there",
+         fLink.cfg.ramp ? "the steps stop at 1500 mA (BC 1.2's current) until one does" : "the class row");
   if (e & PIANO_CHG_EV_NTC_APART)
     note("policy: the battery thermistor (%d C) and the packs (%d C) are more than 10 C apart: the warmer counts", whole(in.t_ntc_dc),
          whole(in.t_warm_dc));
