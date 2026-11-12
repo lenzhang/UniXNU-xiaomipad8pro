@@ -14,6 +14,11 @@ system running for 2.4 h, while PianoDwc3 never saw a host (`no-host`, `link sta
 PianoDwc3's cold start (§7; `docs/drivers/usb-device-debug.md` §17), built and host-tested. It is to be proven from ABL fastboot by
 the RAM images C0-C8 (§7.3) before the ESP is rebuilt.
 
+**Update 2026-11-12, after queue7** (§7.5). C2a and C2b reproduce the installed ESP's symptom, and C3 and C4 cure it. C0, C1, C5 and
+C7 pass. C6 (every leftover at once) stopped the whole system: the cold start left the core in the host role, and the takeover
+soft-reset it there before switching it to device. The fix is in this tree (§7.6: the role switch in c2, the takeover's gate, the
+role rule). The ESP waits for the re-test images C6b and C6c (§7.7).
+
 Short answer: (A) is **not** a hang on the GPU_CC read. The bring-up had already returned successfully; the GPU_CC lines are a
 logger backlog. The system stopped about 1 s after the bring-up, at a place the asynchronous trace cannot show. For (B) the leading
 suspect is new: this was the first boot ever of PianoDwc3 and PianoPower on the normal (non-fastboot) boot path. The diagnostic
@@ -285,11 +290,15 @@ PianoDwc3 no longer trusts the state ABL fastboot happens to leave. Design, step
 - **Decision** (`piano-usb-cold=auto`, the default): the cold start runs when the inherited state is not a running device
   controller (11 named reasons). Every check is derived from the fastboot path's probe values, so on the fastboot path the verdict
   is "a running device controller" and the takeover of before runs unchanged.
-- **Cold start** c1-c5: power (GDSC, GPLL0's vote under PianoA830's GCC vote lock, branches, RCGs, reference clock), stop (a running
-  device controller or xHCI; an opt-in block reset), rails (`ldod2`, `ldob15`, `ldob5` through RPMh DRV-2 under PianoA830's DRV-2
-  lock), the repeater (enable, the board's DT tuning when it was off, device mode), and the M31 PHY (reset plus the stock init). Then
-  the old takeover runs (UTMI as PIPE, soft reset, device role, VBUS/session override, RUN_STOP). The ADSP, the QMP PHY, the DIO4485
-  and the shared CX/MX and bandwidth votes are not touched.
+- **Cold start** c1-c5: power (GDSC, GPLL0's vote under PianoA830's GCC vote lock, branches, RCGs, reference clock), stop and the
+  device role (a running device controller halted; in the host role the xHCI halted, then the programming model's switch, or the
+  block reset when that switch is not shown done or c1 found the GDSC collapsed: §7.6), rails (`ldod2`, `ldob15`, `ldob5` through
+  RPMh DRV-2 under PianoA830's DRV-2 lock), the repeater (enable, the board's DT tuning when it was off, device mode), and the M31
+  PHY (reset plus the stock init). Then the takeover runs: its gate checks the device role first (in every mode), then UTMI as PIPE,
+  soft reset, high speed, VBUS/session override, RUN_STOP. The ADSP, the QMP PHY, the DIO4485 and the shared CX/MX and bandwidth votes
+  are not touched.
+- **The role rule** (since C6, §7.6): no device register is read or written while GCTL reads another role, no xHCI register outside
+  the host role. The cold start, the gadget core and the kernel's register access each enforce it.
 - **No hang, retries**: every poll is bounded. A failed takeover gets another cold start 2 s later, up to 3 per boot. The link
   watch runs a cold start when no host resets the device within 15 s of RUN_STOP (then 30 and 60 s).
 - **Test hook and monitor**: `piano-usb-cold-sim=MASK` leaves the hardware the way the normal path may leave it before the decision
@@ -304,7 +313,7 @@ PianoDwc3 no longer trusts the state ABL fastboot happens to leave. Design, step
 | 1 | The repeater's rails (`vreg_l5b_3p1` drives the USB 2 side, `vreg_l15b_1p8`) and the M31's `vreg_l2d_0p88` never voted when ABL does not run USB | link state 3: the device sees an idle bus and the Mac never resets it, which is how a pull-up that does not reach the connector looks; the takeover passed the soft reset, so the M31 had a clock | c3 (votes, read back), then c4, c5 | `sim=16` |
 | 2 | The repeater disabled, or left in host mode (its 19.2 MHz clock forced) | as 1 | c4 | `sim=1` |
 | 3 | The M31 PHY not initialised (VBUS-valid/suspend bits) | a PHY without its UTMI clock would have failed stage 16; a configured clock with other bits off would not | c5 | `sim=2` |
-| 4 | The core left in the host role | the old takeover sets PRTCAPDIR itself: not the cause alone | reported (reason), c2 stops a running xHCI | `sim=4` |
+| 4 | The core left in the host role | not the installed ESP's symptom (that boot reached stage 20). But C6 showed that the old takeover's order on a host-role core stops the whole system (§7.6) | c2's role switch and the takeover's gate (§7.6) | `sim=4` (C6c); with the collapse `sim=31` (C6b) |
 | 5 | Clocks or the GDSC off | excluded for this boot (stage 20 needs them); the worst case anyway | c1 | `sim=8` |
 | 6 | The DIO4485 mux, the EUD, the cable | not readable without an I2C transaction (writes to pins and QUP) | not covered: the link watch's `given up` line points here | — |
 
@@ -353,10 +362,169 @@ C8 needs the console attached. A hang in any of them shows the step: each c-line
 
 ### 7.4 Decision after the session
 
-| Outcome | Next |
+The session ran on 2026-11-12 (queue7; results in §7.5):
+
+- C0 and C1 enumerate.
+- C2a and C2b reproduce the installed ESP's "no host".
+- C3 and C4 cure it; C5 and C7 enumerate.
+- **C6 stopped the whole system.**
+
+So the cause is reproduced and the cure works, but the cold start was not safe on a core left in the host role. This tree fixes that
+(§7.6). C6b and C6c (§7.7) must pass before the daily ESP gets `piano-usb-cold=auto`; until then images and the ESP stay at
+`piano-usb-cold=0`.
+
+| Outcome of C6b / C6c | Next |
 |---|---|
-| C0, C1 enumerate; C3-C7 enumerate; C2a or C2b shows "no host" | the cause is reproduced and fixed: rebuild the daily ESP from this tree (`build-esp.py --profile daily`, `USING.md` §5), install it, and on its first boot run `usb-console.py --capture 600` (as R4). Expect `verdict ... NOT a running device controller (...)` or the link watch's cold start, then enumeration. Its `cold: inherited` lines record the normal path's state |
-| C0, C1, C3-C7 enumerate; neither C2 reproduces | the normal path's cause is not modelled. Rebuild anyway: the cold start and the watch cover more than before, and the installed boot's `cold: inherited` lines and verdict will name its state. If the console still fails there, the watch's `given up` line points at the DIO4485 / EUD path (§7.2 row 6) |
-| C1 fails where C0 enumerates | the auto decision or the watch misfires on the fastboot path; its verdict line names the reason. Fix that before any ESP |
-| C3-C7: a `cold cN FAILED` or `NOT ready`, or no enumeration | fix that step first. The installed ESP stays as it is (its system runs; only the console is missing) |
-| an image stops early (no reset at 300 s, a parked tablet) | button reset; the last `cold` line names the step and its access. Images go back to `piano-usb-cold=0` until it is fixed |
+| both enumerate (C6b with `block reset c1 found the GDSC collapsed`, C6c with `soft switch PROVEN` or with the block reset) | rebuild the daily ESP from this tree (`build-esp.py --profile daily`, `USING.md` §5) with the default `piano-usb-cold=auto`, install it, and capture its first boot with `usb-console.py --capture 600` (as R4). Expect `verdict ... NOT a running device controller (...)` or the link watch's cold start, then enumeration. The `cold: inherited` lines record the normal path's state |
+| C6b enumerates; C6c stops the system after `soft switch PROVEN` | the proof is not enough on this core, so the soft switch is not to be trusted. Until the code takes the block reset for every role switch, the ESP carries `piano-usb-cold-steps=0x1f` (C7's: the block reset always, proven from the device role by C7 and from the host role by C6b). Report C6c's last lines |
+| C6b stops the system | the block reset of a core that was a host is not safe either. Keep `piano-usb-cold=0` on the ESP and report the last `cold c2 role:` line. The installed ESP's own symptom (C2a's and C2b's) does not need the host-role path, so the next candidate is a build whose c2 refuses the host role (no takeover, a line saying so) |
+| `cold c2 FAILED: the xHCI does not halt within 100 ms` | by design the controller is left alone (no reset under a DMA master that may still run); report the `cold c2 role:` line's USBSTS |
+| `FAILED at takeover: the device role` | the gate refused; its `takeover: role:` line says why |
+| an image stops early (no reset at 300 s) | button reset; the last `cold` line names the step and its access |
+
+### 7.5 The session's results (queue7, 2026-11-12)
+
+Logs: `logs/usb-console/20261112-07*-port0.txt` and `logs/native-runs/20261112-07*-loop/`. C2a, C2b and C6 have no USB console
+stream; their lines are in the loop's mailbox dump. All runs booted from ABL fastboot without the GPU: WindowServer exits without an
+accelerator, as expected.
+
+| Step | Result | Key lines |
+|---|---|---|
+| C0 (`piano-usb-cold=0`) | PASS: enumerates | inherited state: GDSC on, role 2 (device), M31 ready, repeater ready and enabled, `ldod2` 880 mV / `ldob15` 1800 mV / `ldob5` 3104 mV on, Type-C CC1 attached with VBUS (sink); verdict `... a running device controller (none): taken as it is`; `no link watch`; SET_CONFIGURATION 1 |
+| C1 (`auto`, the default) | PASS: enumerates | the same state and verdict; the watch armed, then `a host reset the device: the watch ends (0 cold starts this boot)` |
+| C2a (`=0`, `sim=1`) | the control: **the installed ESP's symptom reproduced** | `NOT a running device controller (the repeater is not enabled/ready; the repeater has the host-mode clock forced): taken as it is anyway`, then `no-host ...; link state 3, configuration 0` for the whole run |
+| C2b (`=0`, `sim=16`) | the control: no host, as in C2a | the three DRV-2 votes withdrawn (TCS 2, 1 ms each). Only `ldob5` (the repeater's vdd3, 3104 mV) went off: `ldod2` and `ldob15` have another voter. Repeater `NOT ready/enabled, status 00`; `no-host ..., link state 3, configuration 0` |
+| C3 (`sim=1`) | PASS: the repeater step cures C2a's state | `cold c4 repeater: ... the board's tuning (DT), device mode: written; after status 80 enable 80 force 00/00 tune 0e 01 07 03 06: ready` (ABL had `[51] 0a`, `[57] 03`); 1 cold start; enumerates |
+| C4 (`sim=16`) | PASS: the rails step cures C2b's state | `cold c3 rail vreg_l5b_3p1 ... before status 03 enable 00 (OFF); voted 3104 mV, mode 7, enable: done; after ... on`. c4 then found the repeater ready again (tuning kept); enumerates |
+| C5 (`sim=2`) | PASS: the PHY step | verdict `the USB2 reference clock is off`; `cold c5 PHY ...: before ... [54] 49 ..., after 01 00 6b 07 00: ready`; `soft reset done`; enumerates |
+| C6 (`sim=31`) | **FAIL: the whole system stopped**; the Gunyah watchdog reset it (ABL after 72 s, not at the planned 300 s) | every reason in the verdict; c1 `the USB30 GDSC is collapsed`, `RCG usb30_master ... (updated)`, 5 branches switched on; **`cold c2 stop: ... was role 1 (GCTL 00101005): nothing ran; no block reset ...; now GCTL 00101005`**; c3 `ldob5` OFF to on, c4 ready (DT tuning), c5 ready; `soft failures 0`; `soft reset done ...: GCTL 00101005`; last line `stage takeover: run`. See §7.6 |
+| C7 (`=1`, `steps=31`) | PASS: the opt-in block reset works | `cold c2 stop: ... was role 2 (GCTL 00102005): nothing ran; block reset (USB30_PRIM_BCR) done`; afterwards GCTL `00102004`, TX FIFOs `00000043 0043030d ...`, RX `00000313`; c4 and c5 ready; enumerates |
+
+C8 (the live `usb cold sim 31`, attended) was not part of queue7. It takes C6's path, so it waits for the fixed build and C6b.
+
+### 7.6 C6: why the system stopped, and the fix
+
+**What the run shows.** Sources: `logs/native-runs/20261112-072600-loop/xnu-console.txt` (the mailbox dump), compared with C5
+(`...071956...`) and C7 (`...073140...`).
+
+1. **The core came up in a mixed state.** The test hook set GCTL to the host role (bit 4), then collapsed the GDSC with RETAIN_FF
+   set (bit 8). After c1 powered it up again, the core read `GCTL 00101005` and `GSTS 7e800001` (CURMOD host).
+   - Retained as the firmware left them: GUCTL1, DCFG, DCTL, DEVTEN, DALEPENA and GEVNTSIZ.
+   - Not retained: GEVNTADR read 0. The TX FIFO sizes read `00000025 00258082 00a700c4 016b8103 026e028b ...` and RX `00000028`.
+     Every other run shows `00000043 0043030d 03500083 ...` and RX `00000313`, which C7 shows are the reset values after the block
+     reset. These are not device sizes: TXFRAMNUM (bit 15 on DWC_usb31) is set on FIFOs 1, 3, 5 and 7, and FIFOs 6 and 7 have no
+     depth.
+2. **c2 left the host role.** It read role 1 and the xHCI's run bit 0 (`nothing ran`). The block reset was opt-in, so it took none.
+3. **The takeover inverted the switch.** In this order, all in the host role:
+   - the halt: a DCTL write and DSTS polls;
+   - the soft reset: DCTL.CSFTRST, `soft reset done in 20000 us: GCTL 00101005`;
+   - the TX FIFO readout, still `00000025 00258082 ...`.
+
+   Only stage 17, after the soft reset, wrote PRTCAPDIR = device (in the gadget's init). DCFG and about 16 endpoint commands followed
+   (DEPSTARTCFG, DEPCFG, SETTRANSFRESOURCE). All of them completed: a timeout or a command error ends the stage with
+   `FAILED at takeover: endpoint commands`, and stage 18 printed instead. Stage 18's QSCRATCH session override printed its readback.
+4. **The log stops inside a bounded stage.** The last line of the whole log is `PianoDwc3: stage takeover: run` (stage 19). Stage 19
+   cannot run on: STARTTRANSFER on EP0 waits at most 10 ms, then RUN_STOP, then DSTS is polled for at most 50 ms, then
+   `stage 20 running` goes out through the note thread. Neither that line nor a timeout note appeared, and no other thread printed
+   anything. In C7 the root mount's `dev_init` and `nx_mount` lines follow `stage takeover: run` in the same burst; in C6 they never
+   came.
+5. **The watchdog reset it.** The tablet was back in ABL fastboot 72 s after `fastboot boot`, not after the planned PSCI reset at
+   300 s. 0056's watchdog pings had stopped, and the Gunyah watchdog bit 32 s after the last one.
+
+**What that rules out.**
+- DMA from a running xHCI: c2 read its run bit 0, and the test hook never starts it.
+- A device-register access in the host role that stalls the bus by itself: the halt, the soft reset, the probe's DCFG, DCTL, DSTS
+  and DEVTEN reads, and c2's own DCTL and DSTS reads were all made in the host role, and all of them returned.
+- An endpoint command in the host role: none was issued before PRTCAPDIR read device, and the ones that followed completed.
+- A bounded poll that failed: it would have returned, and its note would have been printed.
+
+**The cause (an inference: the log cannot say which access it was).** The device side was started in a core that was switched from
+host to device after its soft reset, not before. So it had no device soft reset in the device role, it still had the host role's
+FIFO sizes, and it kept whatever internal state the collapse with retention left.
+
+The DWC3 programming model orders the host-to-device switch like this: halt the xHCI, soft-reset the core where the core needs it,
+set PRTCAPDIR = device, then DCTL.CSFTRST, then the device init. Linux's dwc3 core (read as the behaviour reference) follows that
+order. It added these resets after someone reported a lockup without them on another SoC. C6 inverted the last two steps.
+
+Stage 19 is where the device controller first does DMA: STARTTRANSFER makes it fetch EP0's TRB, and RUN_STOP starts the link and the
+event writes. One of these, or a CPU read behind them, stopped the interconnect for every CPU: no thread printed again, and the pings
+stopped. §2.3's caveat applies, since one stuck CPU strands its own timers, the pet's included. Here, though, the other threads went
+silent too (the root mount was in progress), which points at more than one CPU.
+
+**The fix.** In this tree: `package/PianoDwc3/UsbCold.h` (`toDevice()` and `ensureDevice()`), `Dwc3Gadget.h` and `PianoDwc3.cpp`.
+It is host-tested and not yet run on the tablet.
+- **c2 always leaves the device role.**
+  1. In the host role it first stops the xHCI: it clears RS and the interrupt enable, then waits at most 100 ms for HCHalted. If the
+     xHCI does not report halted, c2 fails and writes nothing more, so nothing is reset under a DMA master that may still run.
+     HCHalted is 1 by default and 0 only while the xHCI still executes.
+  2. Then it switches as the programming model orders: both PHYs awake, then GCTL.CORESOFTRESET where the core needs it (DWC_usb3,
+     and DWC_usb31 before 1.90a, as in Linux and PianoUsbHost; piano's 2.00a does not), then PRTCAPDIR = device. It waits up to
+     10 ms for GSTS.CURMOD, and only then sets DCTL.CSFTRST (250 ms bound, 50 ms settling).
+- **The switch counts only when it is shown.** Every check must pass:
+  - PRTCAPDIR and CURMOD read device;
+  - CSFTRST clears;
+  - DEVCTRLHLT is set;
+  - TX FIFOs 0-6 are a device layout: each has a depth, they are contiguous from word 0 and inside the TX RAM, TXFRAMNUM is clear,
+    and the RX FIFO has a depth. C7's sizes pass this check; C6's fail it.
+
+  Otherwise c2 takes the block reset (`USB30_PRIM_BCR`). It also takes it when the xHCI's registers do not answer, when the role is
+  neither host nor device, when c1 found the GDSC collapsed (C6's mixed retained state), and with steps bit 3. After the block reset
+  the core comes up in the device role (C7: `00102004`); if it does not, c2 writes PRTCAPDIR. c2 fails if GCTL does not read the
+  device role at the end.
+- **The takeover's gate.** `ensureDevice` runs before stage 12's first device register, in every mode: with `piano-usb-cold=0` and
+  after a hand-off's reclaim too. A core that does not read the device role gets the same switch there. If it still does not, the
+  takeover stops with `FAILED at takeover: the device role` and touches no device register.
+- **The role rule everywhere.**
+  - The cold start's inspection, the test hook and c2 read the device registers only in the device role, and the xHCI's only in the
+    host role.
+  - The gadget's halt, soft reset, init and run refuse outside the device role, and its init no longer switches the role.
+  - The kernel's `coreRd` and `coreWr` remember the role from every GCTL access ("unknown" after a hand-off's release). They refuse a
+    device-register access outside the device role, and an xHCI access outside the host role, and count each refusal:
+    `role rule: N core accesses refused` appears in the takeover's notes and in `usb`.
+- **Tests** (`package/PianoDwc3/tests/usb_cold_host.cpp`):
+  - The model now has piano's reset values (C7), C6's retention, and the host role's FIFO sizes. It flags every device-register
+    access outside the device role, an xHCI access outside the host role, a role change under a running xHCI, a block reset of a
+    running controller, and RUN_STOP with the host role's FIFO sizes.
+  - sim 4, sim 31 and host boot paths (the xHCI halted or running), against every combination of the two unknown FIFO behaviours,
+    all end in the device role. The gadget then replays the takeover to RUN_STOP on the same model.
+  - The edges: an xHCI that does not halt, registers that do not answer, the OTG role and no role, and DWC_usb31 1.80a with
+    GCTL.CORESOFTRESET.
+  - The gate, with and without a cold start.
+  - C6's own order is flagged, and a mutant without the role switch fails 83 checks, one that reads the device registers in any role 64.
+
+### 7.7 Re-test images C6b and C6c (the same base as §7.3)
+
+Use the `cold_img` function of §7.3 with a collection built from this tree:
+
+```sh
+cold_img C6b "piano-usb-cold-sim=31"
+cold_img C6c "piano-usb-cold-sim=4"
+```
+
+The images' PianoDwc3 arguments are then `piano-usb=2 piano-usb-hid=1 piano-usb-cold-sim=31` (C6b) and
+`piano-usb=2 piano-usb-hid=1 piano-usb-cold-sim=4` (C6c), with `PIANO_DATA_PERSIST=0 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300` as
+before. For each run, start `python3 tooling/native/usb-console.py --capture 300 &`, then
+`tooling/native/native-loop.sh out/ram-cold-C6b/boot-piano-macos-ram-A-bundled.img` (C6c alike).
+
+**C6b: expected lines**, in order:
+1. C6's verdict and c1 lines.
+2. `cold c2 role: found role 1 (host, GCTL 00101005); xHCI halted already (...); soft switch not tried (...); block reset c1 found the GDSC collapsed (the core kept only its retention flops); now GCTL 00102004 (role 2: device)`
+3. `cold c2 role: TX FIFOs 0-6 after the block reset 00000043 0043030d ...: a device layout`
+4. `cold c2 stop: ... was role 1 (GCTL 00101005): nothing ran (the xHCI was halted); block reset (USB30_PRIM_BCR) done; now GCTL 00102004 (role 2) ...`
+5. c3-c5 ready; `cold: done: ..., block reset; soft failures 0`.
+6. No `takeover: role:` line; `soft reset done ...: GCTL 0010200x`; `stage 20 running`.
+7. Enumeration; the watch ends with 1 cold start.
+
+C6b answers whether the block reset gets a console from a collapsed host-role core: C6's state.
+
+**C6c: expected lines**, in order:
+1. Verdict `NOT a running device controller (the core is not in the device role)`.
+2. `cold: inherited core ... (role 1: host) ...; the device registers are not read (not the device role); xHCI halted: ...`
+3. Either `cold c2 role: found role 1 ...; soft switch PROVEN (... CURMOD device 1, CSFTRST cleared 1 ..., halted 1); block reset not taken; now GCTL 0010200x (role 2: device)` with the FIFO line `after the soft switch ...: a device layout`, or `soft switch NOT proven: ...` followed by the block reset.
+4. The rest as in C6b, then enumeration.
+
+C6c answers whether the programming model's switch works on this core without the block reset. If the switch is not proven, it
+shows which check failed and what FIFO sizes a DCTL.CSFTRST leaves.
+
+Optional, after both pass: C6d, `cold_img C6d "piano-usb-cold=0 piano-usb-cold-sim=4"`. It shows the takeover's gate on its own:
+`takeover: role: found role 1 ...`, then enumeration without a cold start.
