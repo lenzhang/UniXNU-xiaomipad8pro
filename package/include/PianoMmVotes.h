@@ -6,8 +6,9 @@
 // for a rail), and only what changes is sent. Include it as <PianoMmVotes.h> (tooling/k27/build-native-kext.py puts package/include on
 // every kext's include path). docs/drivers/camera.md §4.3.1 is the reference.
 //
-// Who votes what (2026-11-12): PianoVideo (V1-V3: MXC svs, MMCX low_svs, MM1 on while the core is powered) and PianoCamera (level 3:
-// MXC low_svs for CAMCC's PLLs, MMCX low_svs, MM1 on for the camera NoC's qnm_camnoc_hf while a stream runs). The display has no
+// Who votes what (2026-11-12): PianoVideo (V1-V3: MXC svs, MMCX low_svs, MM1 on while the core is powered) and PianoCamera (levels
+// 2-3: MXC low_svs for CAMCC, MMCX no need of its own (the boot display's vote covers CAMCC's low_svs) but its floor declared, MM1 on
+// for the camera NoC's qnm_camnoc_hf while a level 3 stream runs). The display has no
 // driver that votes (the boot framebuffer: ABL left MMCX at NOM_L1, and nothing natively lowers it): its need is the MMCX floor every
 // client declares (PianoVideo's piano-video-mmcx-floor, PianoCamera's piano-camera-mmcx-floor, both 0x140 by default); the floor word
 // keeps the highest floor any client declared, so no client's vote ever goes below another's floor. PianoA830 votes CX, MX, the DDR

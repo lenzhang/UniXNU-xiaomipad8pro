@@ -231,6 +231,19 @@ static void testTwoUsers()
     CHECK(piano_mm_votes_rails(&v2.v, 0, 0) == 0 && e.held[kMmcxAddr] == lvl(PIANO_MM_MMCX, kVlvlNomL1) && e.held[kMxcAddr] == 0);
     CHECK(w2[piano_mm_floor_index(PIANO_MM_MMCX)] == kVlvlNomL1);
   }
+  // PianoCamera's actual needs (MXC low_svs, no MMCX need: the boot display's vote covers it): MMCX is never sent by the camera,
+  // so the boot's DRV-2 MMCX vote stays exactly; the video core's later MMCX vote still honours the camera's declared floor.
+  {
+    volatile uint32_t w4[PIANO_MM_WORDS] = {};
+    volatile uint32_t l4 = 0;
+    Drv2 e;
+    Client v4, c4;
+    setup(v4, e, w4, &l4, PianoMmTagVideo, PIANO_MM_VIDEO, 0);
+    setup(c4, e, w4, &l4, PianoMmTagCamera, PIANO_MM_CAMERA, kVlvlNomL1);
+    CHECK(piano_mm_votes_rails(&c4.v, kVlvlLowSvs, 0) == 0 && e.log.size() == 1 && e.log[0].size() == 1 && e.log[0][0].addr == kMxcAddr);
+    CHECK(piano_mm_votes_rails(&c4.v, 0, 0) == 0 && e.log.size() == 2 && e.log[1].size() == 1 && e.held[kMxcAddr] == 0 && !e.held.count(kMmcxAddr));
+    CHECK(piano_mm_votes_rails(&v4.v, kVlvlSvs, kVlvlLowSvs) == 0 && e.held[kMmcxAddr] == lvl(PIANO_MM_MMCX, kVlvlNomL1));
+  }
   // A need above the floor: the maximum is voted, and the release goes back to the floor.
   {
     volatile uint32_t w3[PIANO_MM_WORDS] = {};

@@ -351,11 +351,13 @@ inline uint32_t csiTimerBranch(unsigned n) { return n == 1 ? kCcCsi1Timer : kCcC
 inline uint32_t csiTimerRcg(unsigned n) { return n == 1 ? kCcCsi1TimerRcg : kCcCsi4TimerRcg; }
 
 // --- the votes (package/include/PianoMmVotes.h): CAMCC's power domains MMCX and MXC at low_svs (DT camcc required-opps; its PLLs
-// run on MXC); MMCX's floor is the boot display's NOM_L1 (piano-camera-mmcx-floor); BCM MM1 on: the hf path qnm_camnoc_hf is one of
-// MM1's nodes (ICC). The rest of the camera's interconnect paths (MM0 qns_mem_noc_hf, SH1, SH0/MC0/ACV for DDR, CN0 for the ahb
+// run on MXC). MXC is voted (nothing else natively holds it). MMCX is not: the boot display's vote (DRV-2, NOM_L1, which the lit
+// panel's MDP needs) already holds it above low_svs, and any DRV-2 MMCX vote of ours would replace the boot's (need 0: the helper
+// sends nothing for a resource no client needs); the floor (piano-camera-mmcx-floor) is still declared, so another client's MMCX
+// vote never goes below it. BCM MM1 on: the hf path qnm_camnoc_hf is one of MM1's nodes (ICC). The rest of the camera's interconnect paths (MM0 qns_mem_noc_hf, SH1, SH0/MC0/ACV for DDR, CN0 for the ahb
 // path) are not voted: the display (MM0, from the boot) and PianoA830 (DDR at its host level, CN0) hold them above what a bounded
 // RAW stream moves (4080 x 3072 RAW10 at 30 fps: 470 MB/s; Linux's hf_mnoc vote 472/926 MB/s).
-constexpr uint32_t kCamMxcNeed = 0x40, kCamMmcxNeed = 0x40, kCamMmcxFloor = 0x140;
+constexpr uint32_t kCamMxcNeed = 0x40, kCamMmcxNeed = 0, kCamMmcxFloor = 0x140;
 
 // --- CSIPHY (CSIPHY): the common block at +kCsiphyTableCommon (0x1000, from the table's data), CTRLn at common + 4 n, STATUSn at
 // common + status (0x138) + 4 n. Reset: CTRL0 = 1, 5..8 ms, CTRL0 = 0. Version: CTRL6 = SHOW_REV_ID (bit 1), then STATUS12..15 (one
