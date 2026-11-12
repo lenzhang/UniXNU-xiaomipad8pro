@@ -36,3 +36,13 @@ UniXNU-piano changes of 2026-11-11 (docs/data-store.md):
   (IOMallocZero) inside the gate and could deadlock with pageout. Unmap (doUnmap, IOStorageFeatures Unmap, volatile only,
   data-volatile-unmap=0 off) gives APFS's freed blocks back. The status line "NativeRamBlock: volatile: N pages, M MiB resident ..."
   from the refill thread, rate-limited. VolatileDisk.h: volatileNeed, volatileUnmap. Test/volatile-stress.cpp (new).
+- The boot reservation and the fallbacks (2026-11-12, the first desktop session: at 1080 MiB held the 2 MiB IOMallocAligned failed
+  87474 times, 13 writes were refused with no memory, APFS read their blocks back as zeros: container corruption). VolatilePool.h:
+  chunk records (base, pages, allocator kind) that the refill thread grows; prefillPages taken at start (data-volatile-reserve-mib,
+  default the whole budget); fallback sizes 2 MiB, 512, 128, 32 KiB, a page, over three allocators (IOMallocData: the private
+  data range; IOMallocAligned: the shared data range, the GPU's; IOMalloc: the default heap); a reserve of 64 MiB that doubles
+  after a wait up to 256 MiB; after a round with nothing, a backoff of 10 ms doubling to 1 s on an event the writers do not signal
+  (the old one was cut short by every waiting writer: a busy loop). NativeRamBlock.cpp: a refused or short volatile write completes
+  with kIOReturnIOError (was kIOReturnNoSpace / kIOReturnNoMemory); the admit deadline 10 s (was 2 s); the status line also from the
+  backoff, with ready MiB, the reserve and the fallback counts; a line when the reservation is complete. Test/volatile-pool.cpp
+  (new): the incident's model, fragmentation, the backoff, bursts, unmap and the reads after it.

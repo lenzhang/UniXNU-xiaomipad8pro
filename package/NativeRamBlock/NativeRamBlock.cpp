@@ -136,21 +136,50 @@ class NativeRamBlock : public IOBlockStorageDevice {
   SeedDisk big = {};
   bool isBig = false;
   // UniXNU-piano: the volatile disk of a large seed (VolatileDisk.h), set up by attachStore whenever the store is not open read-write.
-  // Its pages come from `pool` (VolatilePool.h), which a refill thread fills in 2 MiB chunks; the I/O path never allocates.
+  // Its pages come from `pool` (VolatilePool.h), which a refill thread fills in chunks (2 MiB, smaller ones when those fail) and which
+  // takes the boot reservation (data-volatile-reserve-mib) at once; the I/O path never allocates.
   VolatileDisk vol = {};
   VolatilePool pool;
-  bool refillStop = false, unmapOn = false;
+  bool refillStop = false, unmapOn = false;        // the refill thread's backoff sleeps on &refillStop: only stop() wakes it
   uint8_t spareEvent = 0;                          // writers wait on &spareEvent, the refill thread on &pool
-  uint64_t statusShown = ~0ULL, refusalsShown = 0, statusAt = 0;
-  static constexpr uint32_t kAdmitMs = 2000;       // the longest a write waits for pages before it is refused
+  uint64_t statusShown = ~0ULL, refusalsShown = 0, statusAt = 0, refillStartedAt = 0;
+  bool reserveShown = false;
+  static constexpr uint32_t kAdmitMs = 10000;      // the longest a write waits for pages before it is refused (an I/O error)
   static uint64_t volatileBudgetPages() {
     uint32_t mib = 0;
     if (PE_parse_boot_argn("data-volatile-mib", &mib, sizeof mib) && mib >= 64 && mib <= 65536) return mib * 256ULL;
     uint64_t pages = gPhysSize / 4 / 4096;          // a quarter of the memory this kernel manages
     return pages < 65536 ? 65536 : pages > 1048576 ? 1048576 : pages;   // 256 MiB .. 4 GiB
   }
+  // The boot reservation, taken by the refill thread as soon as the disk is set up: before the GPU and the desktop take the kernel's
+  // address ranges (2026-11-12: at 1080 MiB held, no 2 MiB was left in the range IOMallocAligned uses). Default the whole budget, so
+  // a write under the budget never waits for the system; data-volatile-reserve-mib=N reserves N MiB (0: none, the pool grows as
+  // Data is written, as before).
+  static uint64_t volatileReservePages(uint64_t budget) {
+    uint32_t mib = 0;
+    if (PE_parse_boot_argn("data-volatile-reserve-mib", &mib, sizeof mib) && mib <= 65536)
+      return mib * 256ULL < budget ? mib * 256ULL : budget;
+    return budget;
+  }
+  // The refill thread's allocators, in the order it tries them at each chunk size (VolatilePool.h kinds): 0 IOMallocData, kmem's
+  // private data range (kalloc_large: KMA_DATA); 1 IOMallocAligned, the shared data range (KMA_DATA_SHARED, where the GPU's kernel
+  // buffers are); 2 IOMalloc, the default heap (kmem's pointer ranges; a zone for a single page). All wired, none from the I/O path.
+  static constexpr uint32_t kChunkKinds = 3;
+  static uint8_t *volatileAllocChunk(uint32_t pages, uint32_t kind) {
+    const vm_size_t bytes = (vm_size_t) pages * 4096;
+    if (kind == 0) return static_cast<uint8_t *>(IOMallocData(bytes));
+    if (kind == 1) return static_cast<uint8_t *>(IOMallocAligned(bytes, 4096));
+    return static_cast<uint8_t *>(IOMalloc(bytes));
+  }
+  static void volatileFreeChunk(uint8_t *chunk, uint32_t pages, uint32_t kind) {
+    const vm_size_t bytes = (vm_size_t) pages * 4096;
+    if (kind == 0) IOFreeData(chunk, bytes);
+    else if (kind == 1) IOFreeAligned(chunk, bytes);
+    else IOFree(chunk, bytes);
+  }
   static void volatileRefillThread(void *argument, wait_result_t);
   void volatileStatus(bool always);
+  void volatileReserveShown();
   uint8_t seedHash[32] = {};
   persist::Overlay overlay;
   uint8_t *overlayBits = nullptr, *stage = nullptr;   // stage: kStagePages pages, one write or read run
@@ -361,8 +390,10 @@ public:
       // pages from a budgeted pool that a refill thread fills (VolatilePool.h): the I/O path never allocates.
       vol.bytes = big.bytes;
       pool.budgetPages = volatileBudgetPages();
+      pool.prefillPages = volatileReservePages(pool.budgetPages);
       pool.chunkCapacity = VolatilePool::capacityFor(pool.budgetPages);
-      pool.chunks = static_cast<uint8_t **>(IOMallocZero(pool.chunkCapacity * sizeof(uint8_t *)));
+      pool.chunks = static_cast<VolatileChunk *>(IOMallocZero(pool.chunkCapacity * sizeof(VolatileChunk)));
+      refillStartedAt = mach_absolute_time();
       vol.dir = static_cast<uint8_t ***>(IOMallocZero(VolatileDisk::entries(vol.bytes) * sizeof(uint8_t **)));
       thread_t refill = nullptr;
       if (vol.dir && pool.chunks) {
@@ -372,7 +403,7 @@ public:
       }
       if (!refill) {
         if (vol.dir) IOFree(vol.dir, VolatileDisk::entries(vol.bytes) * sizeof(uint8_t **));
-        if (pool.chunks) IOFree(pool.chunks, pool.chunkCapacity * sizeof(uint8_t *));
+        if (pool.chunks) IOFree(pool.chunks, pool.chunkCapacity * sizeof(VolatileChunk));
         vol.dir = nullptr; pool.chunks = nullptr; pool.chunkCapacity = 0;
         IOLog("NativeRamBlock: the volatile disk could not be set up: Data writes are refused this boot\n");
       } else {
@@ -387,9 +418,10 @@ public:
             features->release();
           }
         }
-        IOLog("NativeRamBlock: volatile: budget %llu MiB (data-volatile-mib), in 2 MiB chunks; writes past it are refused (no space), "
-              "a write that waits %u ms for pages is refused (no memory); unmap %s\n",
-              pool.budgetPages / 256, kAdmitMs, unmapOn ? "on" : "off (data-volatile-unmap=0)");
+        IOLog("NativeRamBlock: volatile: budget %llu MiB (data-volatile-mib), %llu MiB reserved at start (data-volatile-reserve-mib), "
+              "chunks of 2 MiB down to a page; a write past the budget (no space) or after %u ms without pages (no memory) fails as an "
+              "I/O error; unmap %s\n",
+              pool.budgetPages / 256, pool.prefillPages / 256, kAdmitMs, unmapOn ? "on" : "off (data-volatile-unmap=0)");
       }
     }
     if (!direct)
@@ -589,7 +621,10 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
   if(isBig && !direct){
     // Volatile large disk (VolatileDisk.h): the pages written this boot in RAM, every other page from the seed; the store is not used.
     // A write first admits the pages it may take from the pool (VolatilePool.h): refused past the budget, or after kAdmitMs of waiting
-    // for the refill thread (the gate released while it sleeps). volatileDiskIO then only takes pages that are there.
+    // for the refill thread (the gate released while it sleeps). volatileDiskIO then only takes pages that are there. A refused or
+    // short write completes with kIOReturnIOError (EIO), what a disk that could not store the data says, never as written; the reason
+    // is in the pool's counts (the status line). 2026-11-12: after kIOReturnNoMemory (ENOMEM) refusals APFS read those blocks back
+    // as zeros (container corruption); with the boot reservation a write under the budget is not refused at all.
     struct VolatileOps {
       IOMemoryDescriptor *buffer;VolatilePool *pool;
       uint8_t *allocate(){return pool->take();}
@@ -606,12 +641,12 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
       } env={this,0,block*512,bytes};
       clock_interval_to_deadline(kAdmitMs,kMillisecondScale,&env.deadline);
       VolatileAdmit admit=volatileAdmit(pool,env);
-      if(admit==VolatileAdmit::NoSpace)refused=kIOReturnNoSpace;
-      else if(admit==VolatileAdmit::NoMemory)refused=kIOReturnNoMemory;
+      if(admit!=VolatileAdmit::Ok)refused=kIOReturnIOError;
       if(!online){IOLockUnlock(gate);return kIOReturnNotReady;}   // it may have slept
     }
     actual=refused?0:volatileDiskIO(big,vol,write,block*512,bytes,vops,vops,noMemory);
-    if(refused && pool.refusedNoSpace+pool.refusedNoMemory==1)IOLockWakeup(gate,&pool,false);   // the status line says it at once
+    if(noMemory){refused=kIOReturnIOError;++pool.refusedNoMemory;}   // a page missing after the admit (a bug): an I/O error as well
+    if(refused)IOLockWakeup(gate,&pool,false);   // the status line says it within a second
     if(write)__atomic_fetch_add(&native_ram_block_writes,1,__ATOMIC_RELAXED);
     else __atomic_fetch_add(&native_ram_block_reads,1,__ATOMIC_RELAXED);
     native_ram_block_volatile_bytes=vol.resident;
@@ -681,14 +716,16 @@ void NativeRamBlock::stop(IOService *provider)
     if (power.on()) IOLockWakeup(gate, &power, false);   // held requests see !online and fail
     refillStop = true;                                   // the refill thread ends (and releases its reference)
     IOLockWakeup(gate, &pool, false);
+    IOLockWakeup(gate, &refillStop, false);              // its backoff
     IOLockWakeup(gate, &spareEvent, false);              // waiting writers see !online and fail
     IOLockUnlock(gate);
   }
   IOBlockStorageDevice::stop(provider);
 }
 
-// UniXNU-piano: the volatile disk's refill thread (VolatilePool.h volatileRefill): 2 MiB chunks with no lock held, as long as the
-// pool wants them (its reserve, a waiting write's need) and the budget allows; the status line at most every 10 s when it changed.
+// UniXNU-piano: the volatile disk's refill thread (VolatilePool.h volatileRefill): first the boot reservation, then chunks as the
+// pool wants them (its reserve, a waiting write's need) up to the budget, all with no lock held: 2 MiB, smaller when those fail, over
+// kChunkKinds allocators. The status line at most every 10 s when it changed (also while it backs off), the reservation's once.
 void NativeRamBlock::volatileRefillThread(void *argument, wait_result_t)
 {
   NativeRamBlock *self = static_cast<NativeRamBlock *>(argument);
@@ -696,6 +733,7 @@ void NativeRamBlock::volatileRefillThread(void *argument, wait_result_t)
     NativeRamBlock *self;
     bool stopping() { return self->refillStop; }
     void idle() {
+      self->volatileReserveShown();
       AbsoluteTime deadline;
       clock_interval_to_deadline(10, kSecondScale, &deadline);
       IOLockSleepDeadline(self->gate, &self->pool, deadline, THREAD_UNINT);
@@ -703,13 +741,17 @@ void NativeRamBlock::volatileRefillThread(void *argument, wait_result_t)
     }
     void unlock() { IOLockUnlock(self->gate); }
     void lock() { IOLockLock(self->gate); }
-    uint8_t *allocChunk() { return static_cast<uint8_t *>(IOMallocAligned(VolatilePool::kChunkBytes, 4096)); }
-    void freeChunk(uint8_t *chunk) { IOFreeAligned(chunk, VolatilePool::kChunkBytes); }
+    uint32_t kinds() { return kChunkKinds; }
+    uint8_t *allocChunk(uint32_t pages, uint32_t kind) { return volatileAllocChunk(pages, kind); }
+    void freeChunk(uint8_t *chunk, uint32_t pages, uint32_t kind) { volatileFreeChunk(chunk, pages, kind); }
+    VolatileChunk *allocRecords(uint64_t n) { return static_cast<VolatileChunk *>(IOMallocZero(n * sizeof(VolatileChunk))); }
+    void freeRecords(VolatileChunk *records, uint64_t n) { IOFree(records, n * sizeof(VolatileChunk)); }
     void wakeWriters() { IOLockWakeup(self->gate, &self->spareEvent, false); }
-    void backoff() {
+    void backoff(uint32_t ms) {   // on an event the writers do not signal: a waiting write cannot turn this into a busy loop
       AbsoluteTime deadline;
-      clock_interval_to_deadline(50, kMillisecondScale, &deadline);
-      IOLockSleepDeadline(self->gate, &self->pool, deadline, THREAD_UNINT);
+      clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+      IOLockSleepDeadline(self->gate, &self->refillStop, deadline, THREAD_UNINT);
+      self->volatileStatus(false);
     }
   } env = { self };
   IOLockLock(self->gate);
@@ -734,11 +776,28 @@ void NativeRamBlock::volatileStatus(bool always)
   refusalsShown = refusals;
   const uint64_t held = pool.heldBytes() >> 20, budget = pool.budgetPages / 256, peak = pool.peak / 256;
   const uint64_t noSpace = pool.refusedNoSpace, noMemory = pool.refusedNoMemory, waits = pool.waits, failures = pool.chunkFailures;
-  const uint64_t unmapped = pool.unmapped;
+  const uint64_t unmapped = pool.unmapped, fallbacks = pool.fallbackChunks, exhausted = pool.exhaustedRounds;
+  const uint64_t ready = pool.available() / 256, reserve = pool.reservePages / 256;
   IOLockUnlock(gate);   // IOLog without the disk's lock
   IOLog("NativeRamBlock: volatile: %llu pages, %llu MiB resident (%llu MiB held in chunks, peak %llu MiB, budget %llu MiB); "
-        "%llu pages unmapped; writes refused: %llu no space, %llu no memory; %llu waits, %llu chunk failures\n",
-        pages, pages / 256, held, peak, budget, unmapped, noSpace, noMemory, waits, failures);
+        "%llu pages unmapped; writes refused: %llu no space, %llu no memory; %llu waits, %llu chunk failures; %llu MiB ready "
+        "(reserve %llu MiB), %llu fallback chunks, %llu rounds with nothing to be had\n",
+        pages, pages / 256, held, peak, budget, unmapped, noSpace, noMemory, waits, failures, ready, reserve, fallbacks, exhausted);
+  IOLockLock(gate);
+}
+
+// "NativeRamBlock: volatile: N MiB reserved at start in T ms ..." once, when the boot reservation is complete (called with the gate
+// held, from the refill thread).
+void NativeRamBlock::volatileReserveShown()
+{
+  if (reserveShown || !pool.prefilled()) return;
+  reserveShown = true;
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time() - refillStartedAt, &ns);
+  const uint64_t held = pool.heldBytes() >> 20, chunks = pool.chunkCount, fallbacks = pool.fallbackChunks, failures = pool.chunkFailures;
+  IOLockUnlock(gate);
+  IOLog("NativeRamBlock: volatile: %llu MiB reserved at start in %llu ms (%llu chunks, %llu of them fallbacks, %llu failed "
+        "allocations): writes under it never wait for memory\n", held, ns / 1000000, chunks, fallbacks, failures);
   IOLockLock(gate);
 }
 
@@ -819,9 +878,9 @@ void NativeRamBlock::free()
   if (stage) { IOFree(stage, kStagePages * persist::kBlock); stage = nullptr; }
   // The volatile disk's pages and leaves all live in the pool's chunks (the refill thread, which holds a reference, is gone by now).
   if (pool.chunks) {
-    struct Release { void operator()(uint8_t *chunk) { IOFreeAligned(chunk, VolatilePool::kChunkBytes); } } release;
+    struct Release { void operator()(uint8_t *chunk, uint32_t pages, uint32_t kind) { volatileFreeChunk(chunk, pages, kind); } } release;
     pool.release(release);
-    IOFree(pool.chunks, pool.chunkCapacity * sizeof(uint8_t *));
+    IOFree(pool.chunks, pool.chunkCapacity * sizeof(VolatileChunk));
     pool.chunks = nullptr;
   }
   if (vol.dir) {

@@ -68,11 +68,12 @@ WALLPAPER=${DESK_WALLPAPER:-still}
 case $WALLPAPER in still|video) ;; *) echo "build-desktop-images: DESK_WALLPAPER=$WALLPAPER: still or video" >&2; exit 1 ;; esac
 # The collection must have the drivers (each one's own start line: another kext's text may name a driver it watches; attend5's and
 # desk1's images had no PianoKeyboard at all) and the fixes the desktop needs: PianoA830's map limits (the render server's
-# reserve), NativeGopDisplay's cursor layer, NativeRamBlock's volatile pool, PianoTouch's watchdog download, drag delay and its
-# announced-frame rule (no read without an edge, 2026-11-12: the watchdog loop of desk1 and desk-diag), PianoKeyboard's resting thumb.
+# reserve), NativeGopDisplay's cursor layer, NativeRamBlock's volatile pool with its boot reservation (2026-11-12: refused writes
+# corrupted desk-a's Data container), PianoTouch's watchdog download, drag delay and its announced-frame rule (no read without an
+# edge, 2026-11-12: the watchdog loop of desk1 and desk-diag), PianoKeyboard's resting thumb.
 for s in 'start: piano-keyboard=%u' 'start: piano-touch=%u' 'start: piano-backlight=%u' 'start: piano-usb=%u' 'start: piano-power=%u' \
          "the render server's reserve of ranges" 'composition: layer 0 the frame, layer 1 the cursor' \
-         '(data-volatile-mib), in 2 MiB chunks' 'the download for the watchdog failed: again in' 'piano-touch-drag-delay' \
+         'reserved at start (data-volatile-reserve-mib)' 'the download for the watchdog failed: again in' 'piano-touch-drag-delay' \
          'a frame read only when the controller announces it' 'piano-keyboard-resting' "per-object limit of %llu MiB (its GPU window)"; do
   grep -a -q -F "$s" "$KC" || { echo "build-desktop-images: $KC lacks \"$s\": rebuild it from this tree (tooling/k27/build-native-image.sh)" >&2; exit 1; }
 done

@@ -72,40 +72,60 @@ struct Oracle {                                   // page index -> content, for 
     for (uint64_t i = (at + 4095) / 4096; i < (at + len) / 4096; ++i) pages.erase(i);
   }
 };
-struct Provider {                                 // the system's memory for chunks
+struct Provider {                                 // the system's memory for chunks (any size: the pool falls back to smaller ones)
   std::mutex m;
   uint64_t limitChunks = ~0ULL, given = 0, refusals = 0;
   std::atomic<int> stallMs{0};                    // each allocation waits this long (VM_PAGE_WAIT)
   std::vector<uint8_t *> live;
-  uint8_t *alloc() {
+  uint8_t *alloc(uint32_t pages = VolatilePool::kChunkPages) {
     if (int ms = stallMs.load()) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
     std::lock_guard<std::mutex> g(m);
     if (given >= limitChunks) { ++refusals; return nullptr; }
     ++given;
-    uint8_t *c = (uint8_t *) malloc(VolatilePool::kChunkBytes);
-    memset(c, 0xA5, VolatilePool::kChunkBytes);    // not zeroed: take() must zero
+    uint8_t *c = (uint8_t *) malloc(pages * 4096ULL);
+    memset(c, 0xA5, pages * 4096ULL);              // not zeroed: take() must zero
     live.push_back(c);
     return c;
   }
   ~Provider() { for (auto c : live) free(c); }
 };
-static void setupPool(VolatilePool &p, std::vector<uint8_t *> &chunks, uint64_t budgetPages) {
+static void setupPool(VolatilePool &p, uint64_t budgetPages) {
+  free(p.chunks);
   p = VolatilePool();
   p.budgetPages = budgetPages;
   p.chunkCapacity = VolatilePool::capacityFor(budgetPages);
-  chunks.assign(p.chunkCapacity, nullptr);
-  p.chunks = chunks.data();
+  p.chunks = (VolatileChunk *) calloc(p.chunkCapacity, sizeof(VolatileChunk));   // records grow with calloc/free (the envs below)
 }
 
 // ---- A: one thread; "sleep" runs the refill thread's work synchronously, and the deadline is a number of sleeps -------------------
+struct SyncRefill {                               // the refill thread's Env with no thread: no lock, one kind
+  Provider &prov;
+  bool stopping() { return false; }
+  void unlock() {}
+  void lock() {}
+  uint32_t kinds() { return 1; }
+  uint8_t *allocChunk(uint32_t pages, uint32_t) { return prov.alloc(pages); }
+  void freeChunk(uint8_t *, uint32_t, uint32_t) {}
+  void wakeWriters() {}
+};
+static void refillNow(VolatilePool &pool, Provider &prov) {   // what the refill thread does until it would idle or back off
+  SyncRefill r{prov};
+  while (pool.wantsRefill()) {
+    if (pool.needsRecords()) {
+      uint64_t cap = pool.recordsWanted();
+      VolatileChunk *n = (VolatileChunk *) calloc(cap, sizeof *n);
+      memcpy(n, pool.chunks, pool.chunkCount * sizeof *n);
+      free(pool.chunks); pool.chunks = n; pool.chunkCapacity = cap;
+      continue;
+    }
+    if (!volatileRefillOnce(pool, r)) break;
+  }
+}
 struct SyncEnv {
   VolatilePool &pool; Provider &prov; VolatileDisk &d; uint64_t off, len; int sleepsLeft;
   uint64_t need() { return volatileNeed(d, off, len); }
   void wakeRefill() {}
-  bool sleep() {
-    while (pool.wantsRefill()) { uint8_t *c = prov.alloc(); if (!c) { ++pool.chunkFailures; break; } pool.addChunk(c); }
-    return --sleepsLeft > 0;
-  }
+  bool sleep() { refillNow(pool, prov); return --sleepsLeft > 0; }
 };
 static VolatileAdmit writeA(const Seed &seed, VolatilePool &pool, Provider &prov, VolatileDisk &d, Oracle &o, uint64_t off, uint64_t len,
                             unsigned salt, unsigned *nulls) {
@@ -127,9 +147,10 @@ static bool readA(const Seed &seed, VolatileDisk &d, const Oracle &o, uint64_t o
 }
 
 static void partA(const Seed &seed) {
-  VolatilePool pool; std::vector<uint8_t *> chunks; Provider prov;
+  VolatilePool pool; Provider prov;
   const uint64_t budget = 16384;                                          // 64 MiB
-  setupPool(pool, chunks, budget);
+  setupPool(pool, budget);
+  pool.reservePages = pool.reserveMaxPages = 2048;                       // the old 8-chunk reserve: the budget is reached by writes
   VolatileDisk d; d.bytes = kLogical; std::vector<uint8_t **> dir(VolatileDisk::entries(kLogical), nullptr); d.dir = dir.data();
   Oracle o(seed);
   std::mt19937_64 rng(5);
@@ -140,11 +161,11 @@ static void partA(const Seed &seed) {
     if (op % 3 == 0) off &= ~4095ULL;
     VolatileAdmit a = writeA(seed, pool, prov, d, o, off, len, (unsigned) op, &nulls);
     if (a == VolatileAdmit::Ok) ++ok; else if (a == VolatileAdmit::NoSpace) ++noSpace; else ++noMem;
-    CHECK(pool.inUse <= pool.chunkCount * VolatilePool::kChunkPages && pool.chunkCount <= pool.chunkCapacity);
+    CHECK(pool.inUse <= pool.ownedPages && pool.ownedPages <= budget && pool.chunkCount <= pool.chunkCapacity);
     if (op % 500 == 0) CHECK(readA(seed, d, o, off, len));
   }
   CHECK(noSpace == 1 && noMem == 0 && nulls == 0 && ok > 100);
-  CHECK(pool.inUse + 1000 > budget && pool.heldBytes() <= (pool.chunkCapacity * VolatilePool::kChunkBytes));
+  CHECK(pool.inUse + 1000 > budget && pool.heldBytes() <= budget * 4096);
   CHECK(d.resident / 4096 + d.leaves == pool.inUse);
   // At the budget: a write that needs a new page is refused at once, nothing changed; overwrites of resident pages still work.
   uint64_t resident = 0; while (!d.find(resident)) ++resident;
@@ -174,8 +195,8 @@ static void partA(const Seed &seed) {
   // Low memory, far below the budget: the provider gives 3 chunks and then nothing; new pages are refused with no memory once the
   // deadline passes (never no space: the budget has room), overwrites and reads go on.
   {
-    VolatilePool p2; std::vector<uint8_t *> c2; Provider prov2; prov2.limitChunks = 3;
-    setupPool(p2, c2, 262144);                                         // 1 GiB budget
+    VolatilePool p2; Provider prov2; prov2.limitChunks = 3;
+    setupPool(p2, 262144);                                             // 1 GiB budget
     VolatileDisk d2; d2.bytes = kLogical; std::vector<uint8_t **> dir2(VolatileDisk::entries(kLogical), nullptr); d2.dir = dir2.data();
     Oracle o2(seed);
     unsigned memRefused = 0, okHere = 0, spaceRefused = 0;
@@ -190,7 +211,9 @@ static void partA(const Seed &seed) {
     for (int k = 0; k < 300; ++k) { uint64_t off = (rng() % (kPages / 64)) * 4096; CHECK(readA(seed, d2, o2, off, 4096)); }
     printf("  A low memory: %u writes ok, %u refused with no memory, %llu provider refusals\n", okHere, memRefused,
            (unsigned long long) prov2.refusals);
+    free(p2.chunks);
   }
+  free(pool.chunks);
   printf("  A: %u writes ok, refused %llu no space / %llu no memory, %llu waits, peak %llu pages, %llu chunks, %llu unmapped\n",
          ok, (unsigned long long) pool.refusedNoSpace, (unsigned long long) pool.refusedNoMemory, (unsigned long long) pool.waits,
          (unsigned long long) pool.peak, (unsigned long long) pool.chunkCount, (unsigned long long) pool.freePages);
@@ -199,11 +222,12 @@ static void partA(const Seed &seed) {
 // ---- B: threads ----------------------------------------------------------------------------------------------------------------
 struct Disk {                                    // the kernel's arrangement: one lock over pool and disk
   std::mutex gate;
-  std::condition_variable spare, refill;         // writers wait on spare, the refill thread on refill
-  VolatilePool pool; std::vector<uint8_t *> chunks;
+  std::condition_variable spare, refill, backoff;   // writers wait on spare, the refill thread on refill (backoff: only stop)
+  VolatilePool pool;
   VolatileDisk d; std::vector<uint8_t **> dir;
   bool stop = false;
   Provider prov;
+  ~Disk() { free(pool.chunks); }
 };
 static void refillThread(Disk &k) {
   std::unique_lock<std::mutex> l(k.gate);
@@ -213,10 +237,13 @@ static void refillThread(Disk &k) {
     void idle() { k.refill.wait_for(l, std::chrono::milliseconds(200)); }
     void unlock() { l.unlock(); }
     void lock() { l.lock(); }
-    uint8_t *allocChunk() { return k.prov.alloc(); }
-    void freeChunk(uint8_t *) {}                  // the provider frees at the end
+    uint32_t kinds() { return 1; }
+    uint8_t *allocChunk(uint32_t pages, uint32_t) { return k.prov.alloc(pages); }
+    void freeChunk(uint8_t *, uint32_t, uint32_t) {}   // the provider frees at the end
+    VolatileChunk *allocRecords(uint64_t n) { return (VolatileChunk *) calloc(n, sizeof(VolatileChunk)); }
+    void freeRecords(VolatileChunk *r, uint64_t) { free(r); }
     void wakeWriters() { k.spare.notify_all(); }
-    void backoff() { k.refill.wait_for(l, std::chrono::milliseconds(5)); }
+    void backoff(uint32_t ms) { k.backoff.wait_for(l, std::chrono::milliseconds(ms)); }
   } env{k, l};
   volatileRefill(k.pool, env);
 }
@@ -269,7 +296,7 @@ static void writerThread(Disk &k, const Seed &seed, unsigned id, uint64_t region
 }
 static bool partB(const Seed &seed, const char *name, uint64_t budget, uint64_t limitChunks, int stallMs, int threads, int ops) {
   Disk k;
-  setupPool(k.pool, k.chunks, budget);
+  setupPool(k.pool, budget);
   k.d.bytes = kLogical; k.dir.assign(VolatileDisk::entries(kLogical), nullptr); k.d.dir = k.dir.data();
   k.prov.limitChunks = limitChunks; k.prov.stallMs = stallMs;
   Stats st; std::atomic<bool> bad{false}, done{false};
@@ -284,12 +311,12 @@ static bool partB(const Seed &seed, const char *name, uint64_t budget, uint64_t 
   });
   for (auto &w : writers) w.join();
   { std::lock_guard<std::mutex> g(k.gate); k.stop = true; }
-  k.refill.notify_all();
+  k.refill.notify_all(); k.backoff.notify_all();
   refill.join();
   done = true;
   watchdog.join();
   double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  bool ok = !bad && st.nulls == 0 && k.pool.inUse <= k.pool.chunkCount * VolatilePool::kChunkPages &&
+  bool ok = !bad && st.nulls == 0 && k.pool.inUse <= k.pool.ownedPages && k.pool.ownedPages <= budget &&
             k.pool.chunkCount <= k.pool.chunkCapacity && k.pool.chunkCount <= limitChunks &&
             k.d.resident / 4096 + k.d.leaves == k.pool.inUse;
   CHECK(ok);
@@ -318,7 +345,7 @@ struct Memory {
 };
 static bool partC(const Seed &seed, bool oldDesign) {
   Disk k; Memory mem;
-  setupPool(k.pool, k.chunks, 262144);
+  setupPool(k.pool, 262144);
   k.d.bytes = kLogical; k.dir.assign(VolatileDisk::entries(kLogical), nullptr); k.d.dir = k.dir.data();
   std::atomic<uint64_t> progress{0}; std::atomic<bool> finished{false};
   std::vector<uint8_t> io(64 * 4096, 0x5A);
@@ -331,10 +358,13 @@ static bool partC(const Seed &seed, bool oldDesign) {
       void idle() { k.refill.wait_for(l, std::chrono::milliseconds(50)); }
       void unlock() { l.unlock(); }
       void lock() { l.lock(); }
-      uint8_t *allocChunk() { mem.waitFor(VolatilePool::kChunkPages); return k.prov.alloc(); }
-      void freeChunk(uint8_t *) {}
+      uint32_t kinds() { return 1; }
+      uint8_t *allocChunk(uint32_t pages, uint32_t) { mem.waitFor(pages); return k.prov.alloc(pages); }
+      void freeChunk(uint8_t *, uint32_t, uint32_t) {}
+      VolatileChunk *allocRecords(uint64_t n) { return (VolatileChunk *) calloc(n, sizeof(VolatileChunk)); }
+      void freeRecords(VolatileChunk *r, uint64_t) { free(r); }
       void wakeWriters() { k.spare.notify_all(); }
-      void backoff() { k.refill.wait_for(l, std::chrono::milliseconds(5)); }
+      void backoff(uint32_t ms) { k.backoff.wait_for(l, std::chrono::milliseconds(ms)); }
     } env{k, mem, l};
     volatileRefill(k.pool, env);
   });
@@ -378,7 +408,7 @@ static bool partC(const Seed &seed, bool oldDesign) {
   mem.release();                                   // let a deadlocked writer out so the test can end
   writer.join(); pageout.join();
   { std::lock_guard<std::mutex> g(k.gate); k.stop = true; }
-  k.refill.notify_all();
+  k.refill.notify_all(); k.backoff.notify_all();
   if (refill.joinable()) refill.join();
   if (oldDesign) {                                 // the old pages were calloc'ed one by one
     struct Free { void operator()(uint8_t *p) { free(p); } } f;

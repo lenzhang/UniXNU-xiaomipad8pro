@@ -92,36 +92,73 @@ import: every kernel line stopped at once, and the Gunyah watchdog reset the tab
 
 `Test/volatile-stress.cpp` part C reproduces that deadlock in a model.
 
+**The second problem: refused writes corrupt the volume (2026-11-12, the first desktop session).** 26 minutes into the session
+(owner logged in, Finder, Dock, Terminal; `logs/usb-console/20261112-170043-port0.txt`, data-persist=0), at 1080 MiB held of a
+2048 MiB budget, the status line said `writes refused: 0 no space, 13 no memory; 55 waits, 87474 chunk failures`. The console then
+showed `disk2s1: memory allocation error.` (3393 times) and `cluster_push() failed with 12`, then `disk2: memory allocation error.`
+(a container write), and right after it APFS read that object (`oid 0x7f2 ... paddr 0x14458`) as zeros:
+`obj_checksum_verify ... cksum 0x0, oid 0x0` and `nx_corruption_detected_int` (28275 times).
+- Evidence: the refusals (no memory, `kIOReturnNoMemory`, ENOMEM to APFS), the container write's error, and then the zeros of that
+  write's block. A block never stored reads as before the write: the seed's page, here zeros.
+- Evidence (the code): every 2 MiB chunk was one `IOMallocAligned`, which is `kernel_memory_allocate` with `KMA_DATA_SHARED`. On
+  this kernel that is kmem's shared data range, 4536 MiB (`kmem_data_shared_range` in the boot log). The GPU's kernel buffers
+  (`IOBufferMemoryDescriptor` in `kernel_task`) live in the same range: PianoA830's 1 GiB BO pool and 920 MiB of BOs outside it.
+  A chunk short of physical pages waits in `vm_page_alloc_list` (`VM_PAGE_WAIT`); it does not fail.
+- Inference: the 87474 fast failures were that address range (exhausted or without a 2 MiB hole), not RAM. No jetsam or
+  memory-pressure line appeared in the session.
+- A second bug: after a failed chunk the refill thread woke the writers and slept 50 ms on the event the writers wake it with. Each
+  waiting writer cut the backoff short: a busy loop (87474 failures in seconds), and no status line after it (the line came only
+  from the idle path).
+
 Now:
-- **Allocation.** The pages come from 2 MiB chunks (`IOMallocAligned`, which is `kernel_memory_allocate` into the kernel map's
-  data range, not a zone). A refill thread allocates them with no lock held and may wait for memory as long as the VM needs. It
-  keeps 16 MiB ready, more while a write waits.
+- **The boot reservation.** The refill thread starts when the disk is set up, before the GPU and the desktop. It first takes
+  `data-volatile-reserve-mib` (default: the whole budget, 2048 MiB on piano) while memory and the kernel's ranges are unfragmented.
+  A write under the reservation never waits for the system, so under the budget nothing is refused. Once it is complete:
+  `NativeRamBlock: volatile: N MiB reserved at start in T ms (...)`.
+- **Allocation.** Chunks are taken by the refill thread with no lock held. It may wait for memory as long as the VM needs. Each chunk
+  is as large as can be had: 2 MiB, then 512, 128 and 32 KiB, then a single page. At each size it tries three allocators, in this
+  order:
+  - `IOMallocData`: kmem's private data range (`kalloc_large`, `KMA_DATA`), not the GPU's;
+  - `IOMallocAligned`: the shared data range;
+  - `IOMalloc`: the default heap's pointer ranges, or a zone for a single page.
+  The records of the chunks grow as needed. Only when every size of every allocator failed does the thread back off: 10 ms, doubling
+  to 1 s, on an event the writers do not signal. Beyond the reservation it keeps 64 MiB ready, doubled after each wait up to 256 MiB.
 - **Writes.** The I/O path takes only pages that are already there. A write first admits every page it may take (its data pages
   and leaves):
-  - past the **budget** it is refused at once with `kIOReturnNoSpace`;
-  - otherwise it waits at most **2 s** for the refill thread, the lock released, then is refused with `kIOReturnNoMemory`.
-  Reads and overwrites of resident pages need nothing.
-- **What happens at N GiB.** The disk holds at most the budget: writes needing new pages fail with an error and never wait without
-  a bound. What APFS makes of a refused write is APFS's: an error to the writer, possibly a forced unmount or a panic. Either way
-  the boot does not hang.
+  - past the **budget** it is refused at once;
+  - otherwise it waits at most **10 s** (was 2 s) for the refill thread, the lock released, then is refused.
+  A refused write, or a short one, completes with `kIOReturnIOError` (EIO, what a disk says when it cannot store the data). It was
+  `kIOReturnNoSpace` / `kIOReturnNoMemory`. It is never reported as written. Reads and overwrites of resident pages need nothing.
+- **What happens at the budget.** The disk holds at most the budget: writes needing new pages fail with an I/O error and never wait
+  without a bound. What APFS makes of a failed write is APFS's (the session above: a corrupt container). The budget is the RAM
+  limit, not a feature: it should stay above what the session writes. With unmap that is about the live new data.
 - **Unmap.** The disk advertises `Unmap` (only when volatile; it is decided before the disk is published). APFS's freed blocks
   then go back to the pool, so the disk holds about the live data, not every block APFS ever wrote. Copy-on-write metadata and
-  Spotlight's index churn a lot of blocks.
+  Spotlight's index churn a lot of blocks. An unmapped whole page reads as the seed's page (zeros where the seed has none) until it
+  is written again. Parts of pages are kept. A page given back is zeroed (and the seed copied) before it is reused for any block.
+  APFS trims only blocks its space manager has freed, so it never reads them back expecting data (`Test/volatile-pool.cpp` part U).
 
 | Boot argument | Default | Meaning |
 |---|---|---|
-| `data-volatile-mib=N` | a quarter of the memory XNU manages (about 1.9 GiB here), within 256 MiB to 4 GiB | the budget (64 to 65536) |
+| `data-volatile-mib=N` | a quarter of the memory XNU manages (2048 MiB on piano), within 256 MiB to 4 GiB | the budget (64 to 65536) |
+| `data-volatile-reserve-mib=N` | the budget | taken at start (0: none, the pool grows as Data is written, as before 2026-11-12) |
 | `data-volatile-unmap=0` | 1 | do not advertise unmap |
+
+The default reservation costs the budget in wired RAM for the whole boot (2 GiB of piano's 8), used or not. A test image that needs
+the RAM more than a safe Data disk can set `data-volatile-reserve-mib=1024`, for example. Writes past the reservation then depend
+on the fallbacks.
 
 Lines:
 
 ```
-NativeRamBlock: volatile: budget 1966 MiB (data-volatile-mib), in 2 MiB chunks; writes past it are refused (no space), a write that waits 2000 ms for pages is refused (no memory); unmap on
-NativeRamBlock: volatile: N pages, M MiB resident (H MiB held in chunks, peak P MiB, budget B MiB); U pages unmapped; writes refused: X no space, Y no memory; W waits, F chunk failures
+NativeRamBlock: volatile: budget 2048 MiB (data-volatile-mib), 2048 MiB reserved at start (data-volatile-reserve-mib), chunks of 2 MiB down to a page; a write past the budget (no space) or after 10000 ms without pages (no memory) fails as an I/O error; unmap on
+NativeRamBlock: volatile: 2048 MiB reserved at start in T ms (C chunks, F of them fallbacks, A failed allocations): writes under it never wait for memory
+NativeRamBlock: volatile: N pages, M MiB resident (H MiB held in chunks, peak P MiB, budget B MiB); U pages unmapped; writes refused: X no space, Y no memory; W waits, F chunk failures; R MiB ready (reserve S MiB), K fallback chunks, E rounds with nothing to be had
 ```
 
-The second line comes from the refill thread, never from the I/O path. It appears at most every 10 s while the numbers move, and
-within a second of a new refusal.
+The third line comes from the refill thread, never from the I/O path. It appears at most every 10 s while the numbers move, and
+within a second of a new refusal (also while the thread backs off). On a healthy run `writes refused` stays `0 no space, 0 no
+memory`. `H` is the reservation from the start.
 
 What this does not cover: small seeds (up to 2 GiB: `SparseDisk.h ramSparseIO`) still take a zone page per written page in the lock.
 No current seed is that small (all are 12 GiB).
@@ -358,13 +395,27 @@ Log in and use the desktop as in the hung runs (let Spotlight import). Expected 
 If the budget is reached, the line shows `writes refused: X no space` and APFS reports write errors. That is the designed limit,
 not a hang. To see the limit on purpose, add `data-volatile-mib=512` to `PIANO_EXTRA_ARGS` for a second image.
 
+Since the boot reservation (2026-11-12), also expected:
+- `NativeRamBlock: volatile: 2048 MiB reserved at start in T ms` within a second or so of the first line;
+- `H MiB held in chunks` = 2048 from the start;
+- `0 no memory` for the whole session.
+A `no memory` count above 0 with the default reservation is a bug.
+
 ## 8. Risks and open items
 
 - Nothing here has run on the tablet. The volatile large disk is new code on the boot path of every boot without the store
   (test images, `data-persist=0`). Its first version hung the tablet under load (section 3). The pool version is host-tested:
   sustained writes, budget, low memory, unmap, threads and the hang's own model (`Test/volatile-stress.cpp`).
-  - At the budget, APFS gets write errors.
-  - Whether APFS actually sends unmaps to this disk is not yet seen on the tablet. The `pages unmapped` count will tell.
+  - At the budget, APFS gets write errors, and a failed metadata write corrupts the container (2026-11-12, section 3).
+  - APFS sends unmaps to this disk: 100817 pages in the 2026-11-12 desktop session.
+  - The boot reservation (2026-11-12) has not run on the tablet yet. It is host-tested against the session's model
+    (`Test/volatile-pool.cpp`: the old pool refuses, the reserved one does not; fragmented and exhausted ranges; the backoff;
+    bursts; unmap and the reads after it). Things to watch on the first run:
+    - the `reserved at start` line;
+    - `0 no memory` in the status line;
+    - the GPU's `PianoA830: row2 MEM pool N` still 1024. The reservation's 2 GiB is taken before the GPU reserves its physically
+      contiguous BO pool. Our chunks need no contiguous pages, but they take 2 GiB of free memory first.
+    - `EIO` instead of `ENOMEM` if a refusal still happens (APFS's handling of either is its own).
 - Until the ESP has the new collection (T5), the installed system itself has no guard. Any RAM image **built before this change**
   with `data-persist=2` and another seed still wipes the store: the installed system's kernel does not protect it, the test image's
   does.
