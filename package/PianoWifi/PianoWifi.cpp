@@ -172,7 +172,8 @@ void readArgs()
   // After wifi-4a (docs §10.24), each on by default with its A/B:
   // piano-wifi-rddm=0: no crash dump segments for the chip (WifiRddm.h);
   gArgs.rddm = bootArg("piano-wifi-rddm", 1);
-  // piano-wifi-defer=0: every line printed at once, even while the firmware starts (see note() below);
+  // piano-wifi-defer=0: every line printed at once, even while the firmware starts (see note() below); =2: held, and printed only
+  //   when the ladder stops, with no helper thread (the fifth round's way);
   gArgs.defer = bootArg("piano-wifi-defer", 1);
   // piano-wifi-wake=0: no device wake doorbell at mission mode.
   gArgs.wake = bootArg("piano-wifi-wake", 1);
@@ -292,14 +293,17 @@ void deferStart()
   gDeferThread = current_thread();
   __atomic_store_n(&gPrinterRun, 1u, __ATOMIC_RELEASE);
   __atomic_store_n(&gPrinterExited, 0u, __ATOMIC_RELEASE);
+  // piano-wifi-defer=2: no helper (the fifth round's way: everything at the ladder's end, and no watch of the deadlines), the
+  // A/B should the helper's console traffic ever be suspected of disturbing the firmware's start.
   thread_t printer = nullptr;
-  const bool helper = kernel_thread_start(&deferPrinter, buffer, &printer) == KERN_SUCCESS;
+  const bool helper = gArgs.defer != 2 && kernel_thread_start(&deferPrinter, buffer, &printer) == KERN_SUCCESS;
   if (helper) thread_deallocate(printer);
   else __atomic_store_n(&gPrinterExited, 1u, __ATOMIC_RELEASE);
   note("log: from here until the ladder stops, this thread's lines are held with their time since now and printed by %s "
        "(piano-wifi-defer=0 prints them at once)",
-       helper ? "a helper thread at every phase change and within a second" : "this thread when the ladder stops (no helper "
-       "thread)");
+       helper              ? "a helper thread at every phase change and within a second"
+       : gArgs.defer == 2 ? "this thread when the ladder stops (piano-wifi-defer=2: no helper thread, no deadline watch)"
+                          : "this thread when the ladder stops (no helper thread)");
   gDeferBuf = buffer;
 }
 
