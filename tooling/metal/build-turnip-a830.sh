@@ -29,6 +29,9 @@ D=$(cd "$(dirname "$0")/../.." && pwd)
 export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
 H=$HOME/Downloads/XiaomiPad8Pro-Ubuntu
 . "$D/tooling/k27/k27-tree.sh"; K=$PIANO_K27_TREE
+# TURNIP_K27_TREE: the k27 tree whose plugin source and bridge this reads, when the build's PIANO_K27_TREE is another (the 27.3
+# line's clone, tooling/k273/build-k273-image.sh): the bridge's path is in the plugin, so the plugin is the same from either line.
+K=${TURNIP_K27_TREE:-$K}
 T=${TURNIP_TREE:-$(dirname "$K")/UniXNU-turnip}   # default: the UniXNU-turnip checkout next to the k27 tree
 A=${ADRENO830_TREE:-$H/unixnu-research/Adreno830}
 P=$D/tooling/metal/turnip-a830
