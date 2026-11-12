@@ -14,7 +14,7 @@ symbols only, no disassembly. "verified" = read in those sources or on the table
 
 ## 1. The result in short
 
-- **No kext matches on the identity.** Not one personality in the native collection (Apple's 54 kexts or ours) matches on the
+- **No kext matches on the identity.** Not one personality in the native collection (Apple's 55 bundles or our 25 kexts) matches on the
   root's model, target-type or compatible; ours match `IOPlatformExpertDevice` by class, the platform expert is ArmDTPlatform
   (`IONameMatch` `device-tree`, the root node's name). The vma2 base's own platform expert (AppleVirtualPlatformARMPE, compatible
   `AppleVirtualPlatformARM`) and the 27.3 kernelcache's (AppleARMPE, compatible `AppleARM`) are not linked or do not match. The
@@ -45,7 +45,7 @@ symbols only, no disassembly. "verified" = read in those sources or on the table
 
 | Collection | Identity matching | Identity read in code | State |
 |---|---|---|---|
-| native (`kc-k27-native.bin`: kc-keep.txt + DiskImages + their closure, 54 Apple kexts, + this repository's) | none: Apple's personalities match IOResources, IOMedia, IOHIDInterface, `defaults`, child-node names (`scaler,s5l8960x`, `iommu-mapper`, `audio-data,hdmi`); ours `IOPlatformExpertDevice` by class, `paravirtualizedgraphics,gpu`, IOResources | IOgPTPPlugin: `target-type` must exist (`targetTypeStr != nullptr`), then its `TemperatureSensor` table (J274 ... J493, "PMU tdevN") names a HID temperature sensor for clock drift; no entry for VMA2MACOS, K114c or Piano. AppleM2ScalerCSCDriver reads `target-type` (inert: no scaler node). Image4/AppleImage4/AMFI/sandbox/IOCryptoAccelerator: chip-id, board-id, `kern.hv_vmm_present` | verified |
+| native (`kc-k27-native.bin`: kc-keep.txt + DiskImages + their closure, 55 Apple bundles, 7 of them KPI pseudo-kexts, + this repository's) | none: Apple's personalities match IOResources, IOMedia, IOHIDInterface, `defaults`, child-node names (`scaler,s5l8960x`, `iommu-mapper`, `audio-data,hdmi`); ours `IOPlatformExpertDevice` by class, `paravirtualizedgraphics,gpu`, IOResources | IOgPTPPlugin: `target-type` must exist (`targetTypeStr != nullptr`), then its `TemperatureSensor` table (J274 ... J493, "PMU tdevN") names a HID temperature sensor for clock drift; no entry for VMA2MACOS, K114c or Piano. AppleM2ScalerCSCDriver reads `target-type` (inert: no scaler node). Image4/AppleImage4/AMFI/sandbox/IOCryptoAccelerator: chip-id, board-id, `kern.hv_vmm_present` | verified |
 | vma2 base `kc27.bin` (VM era) | AppleVirtualPlatformARMPE on root compatible `AppleVirtualPlatformARM`; the paravirtual kexts on virtio IDs | - | verified; not in native boots (`check-native-kexts.py`) |
 | 27.3 `kernelcache.release.mac17j` | AppleARMPE on root compatible `AppleARM` (the 27.3 profile's compatible `K114cAP` leaves it out, ArmDTPlatform stays the platform expert) | AppleTopCaseDriverV2: per-model personalities `Mac MTP Actuator/MT/Keyboard - <model>` with `ModelNumber` (Mac14,2 ... Mac18,1, Mac17,11 among them) on `IOHIDInterface` with `Transport` FIFO: only an Apple internal keyboard/trackpad (MTP) would meet them; IOgPTPPlugin's same table (no K114c) | verified (Info.plists) |
 | this repository's kexts | `IOPlatformExpertDevice` by class | none reads model, target-type or compatible (grep) | verified |
@@ -110,7 +110,7 @@ Machine 1"); host name Apple-Virtual-Machine-1.local; `pmset -g batt` only AC Po
 
 **C's cost** (UniXNU `profiles/os/macos-27.3-26C5035r`, run by UniXNU-sheng on SM8550): the Mac17,11 kernelcache as the KC base
 with its roots list (AppleARMPlatform, ApplePMGR, AppleARMWatchdogTimer, IOGPUFamily, IOMobileGraphicsFamily, the USB device and
-host stacks, IO80211Family, IOBluetoothFamily, AppleTopCase, EndpointSecurity, ...: the 27.0.1 native collection keeps 15 roots
+host stacks, IO80211Family, IOBluetoothFamily, AppleTopCase, EndpointSecurity, ...: the 27.0.1 native collection keeps 16 roots (kc-keep.txt)
 + DiskImages), xnu-12377 rebuilt as `target = "macosx"` with the macOS series (Darwin 26 KPIs, shared-region size, ...); every
 native kext rebuilt and its Apple ABIs re-derived against the 27.3 collection (IOMobileFramebuffer for NativeGopDisplay, IOGPU /
 IOAccelerator for PianoA830, IOHID, IONetworking/Skywalk, IOAudio2); the Metal plugin's frontend against 27.3's Metal; the OS,
