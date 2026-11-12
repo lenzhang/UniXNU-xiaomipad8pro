@@ -181,3 +181,43 @@ On the boot, from the Mac (`tooling/native/desk-ssh.sh`), after the owner's logi
 4. Moving the installed system to a new identity, when it is chosen: on its first boot configd starts new network
    preferences and interface database (2.3: stage a model-less NetworkInterfaces.plist as desk-dev does, or accept one 240 s
    wait), delete the store's MobileGestalt cache once, and turn automatic Software Update checks off for an Apple model.
+
+## 8. The 240 s network wait under k114c (2026-11-13) and its cause, AppleImage4
+
+**Seen (the coordinator, installed ESP v3.3d with k114c, 01:33-01:45):** configd's InterfaceNamer logs `waiting for quiet`, then
+4 minutes later `timed out waiting for IOKit to quiesce`, and only then names the interfaces (the USB network among them).
+`ioreg`: `/defaults` (IOPlatformDevice) `busy 1` for the whole uptime, its parents ArmDTPlatform and K114cAP too; its child
+AppleImage4 `!registered, !matched, active, busy 0`.
+
+**Not the identity (verified, logs).** The registry was never quiet on vma2 either: every vma2 desk-dev boot of 2026-11-12
+(19:40-20:27, `logs/usb-console/20261112-*`) has `desk-dev: iokit busy (configd 260+ s): defaults (IOPlatformDevice) busy 1`, and
+the k114c RAM desk-dev boots of 01:02 and 01:24 the same. What hid it: InterfaceNamer names an interface that is in its database at
+once and waits for the quiet only for a new one. desk-dev stages a model-less database (`named after 0s` on both identities); the
+installed store had one with `Model` VirtualMac2,1. Under Mac17,11 that database is moved aside (section 2.3), en0/en1 are new, and
+they wait for a quiet that never comes: the 240 s timeout.
+
+**The cause (verified: the call sequence in 27.0.1's AppleImage4, strings and the resolved stubs; no code copied).**
+`AppleImage4::start` finalizes its expert (`kmod_expert_finalize`, once), which calls `IOService::serviceMatching("IOAESAccelerator")`
+and `IOService::waitForMatchingService(that, UINT64_MAX)`: it waits without a timeout for a registered IOAESAccelerator, then
+finalizes the supervisor and registers. Natively there has been none since 2026-11-11, when NativeAES (UniXNU's SoftwareAES, the VM
+era's AES accelerator) was dropped as unused. So AppleImage4's start never returns, its provider `/defaults` stays busy, and IOKit
+never goes quiet, on every identity. The same sequence is in 27.3's AppleImage4 (`kernelcache.release.mac17j`), so the 27.3 line
+(`configs/k273-adt.toml`, the same native kext list) has it too. No ADT property changes it (the wait is unconditional), and the
+root `compatible` plays no part.
+
+**The fix:** `package/SoftwareAES` back in `configs/k27-native-kexts.txt` (UniXNU's SoftwareAES 4a45326, UPSTREAM): NativeAES, an
+IOAESAccelerator doing AES-CBC in software, matched on IOResources/IOBSD, registered after its known-answer tests. It also serves
+the device key, selector 2212, with a fixed software key: once finalized, AppleImage4 entangles the nonce slots it resets with that
+key and panics if the accelerator refuses it (the VM era's finding; the NativeAES-era native boot of 2026-11-11 01:33 got through
+this step: `Image4: resetting: pdmg ...`, no panic). Its instance size (0x120) is the one both collections' IOCryptoAcceleratorFamily
+gives IOAESAccelerator (their metaclass constructors).
+
+**The boot's check (desk-dev, any identity):**
+
+| Question | Command / line | Pass |
+|---|---|---|
+| the accelerator is there | console `SoftwareAES: NativeAES registered as the IOAESAccelerator ...`; `ioreg -r -c NativeAES -d 1` | the line; one NativeAES, registered |
+| AppleImage4 finished | `ioreg -w0 -r -n defaults -d 2 \| grep -E 'defaults\|AppleImage4'` | `defaults` `busy 0`; AppleImage4 `registered, matched` |
+| nonce entanglement | console `SoftwareAES: device key 2212 asked for ...`; no `panic: encryption failed` | (the line may be absent: only when AppleImage4 resets slots) |
+| the registry goes quiet | console `desk-dev: iokit busy (configd 260+ s): none` | `none` |
+| the interfaces without the staged database (`DESK_DEV_NETDB=0` image) | console `desk-dev: usb net: en1 is ours (named after Ns)`; on the tablet `ifconfig -l` | N well under 240 (seconds after configd starts), en0 and en1 listed |

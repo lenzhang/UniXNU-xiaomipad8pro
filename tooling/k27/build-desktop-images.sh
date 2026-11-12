@@ -170,11 +170,14 @@ for n in $NAMES; do
         --off piano-pmset-defaults > out/desk-stage/desk-dev-userland.log 2>&1 || { tail -5 out/desk-stage/desk-dev-userland.log >&2; exit 1; }
       mkdir -p out/desk-dev
       [ -f out/desk-dev/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C desk-dev -f out/desk-dev/id_ed25519
-      # configd's interface database with en0 and the USB network's en1 by their MACs: named at once, not after the 240 s quiet timeout
+      # configd's interface database with en0 and the USB network's en1 by their MACs: named at once, not after the 240 s quiet timeout.
+      # DESK_DEV_NETDB=0 stages none: InterfaceNamer then names them when the IOKit registry goes quiet (the test of that quiet,
+      # docs/identity.md section 8: SoftwareAES), desk-dev.sh's "named after Ns" the time
       X=(${WALL[@]+"${WALL[@]}"} --boot-run "$KEYBOARDS" --file tooling/k27/desk-dev.sh:private/var/piano/desk-dev.sh
          --file out/desk-dev/id_ed25519.pub:private/var/piano/dev/authorized_keys
-         --file tooling/k27/desk-dev-NetworkInterfaces.plist:Library/Preferences/SystemConfiguration/NetworkInterfaces.plist
          --boot-run "sh /private/var/piano/desk-dev.sh $DEVNET")
+      [ "${DESK_DEV_NETDB:-1}" = 0 ] ||
+        X+=(--file tooling/k27/desk-dev-NetworkInterfaces.plist:Library/Preferences/SystemConfiguration/NetworkInterfaces.plist)
       for j in $LOOPS; do X+=(--disable-job "$j"); done
       DENY=$DENY_DESK
       python3 tooling/k27/stage-boot-run.py --seed out/desk-stage/desk-dev-userland/scratch-data.img \
