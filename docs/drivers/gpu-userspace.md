@@ -47,11 +47,22 @@ The Turnip patches (`tooling/metal/turnip-a830/mesa/`):
   address heap is seeded, and says so once: `TU: error: NativeAdreno: this device's GPU window is 0x... + 0x..., the enumeration
   probe's was 0x... + 0x... (another slot); the device takes its own` (not an error: a note that it happened). gpu.md §8, "The first
   desktop's address space".
+- `0007-turnip-darwin-sysmem-feedback-flush.patch` (2026-11-12): in a sysmem pass, a draw whose fragment shader reads an input attachment
+  of the subpass (Metal's framebuffer fetch: Core Animation's glass, backdrop and vibrancy draws, RenderBox's clips, blend modes and
+  shadows) first cleans the CCU, invalidates UCHE and waits for the earlier draws' writes, under `CP_COND_REG_EXEC` on the render mode
+  (GMEM and binning skip it). `TU_DEBUG=nofbflush` leaves it out, `fbflushall` puts it before every draw of the plugin's feedback-loop
+  subpasses. Why: [The login window's rendering](#the-login-windows-rendering-2026-11-12).
 
-The frontend patch (`tooling/metal/turnip-a830/frontend/0001-…patch`, applied after the k27 tree's `scripts/piano-frontend-patch.py`): the
-stderr copy of its `NBLOG` lines is rate-limited per call site (8 lines, then the 16th, 32nd, … with the count); `no device answer`
-goes to the unified log only; `computeCommandEncoderWithDispatchType:` with a concurrent type returns the serial encoder instead of
-failing the command buffer. The abort reporter (`abort_reporter.mm`, ours) is NativeSoftMetal's, see the desktop section.
+The frontend patches (`tooling/metal/turnip-a830/frontend/`, applied in order after the k27 tree's `scripts/piano-frontend-patch.py`):
+- `0001-…patch`: the stderr copy of its `NBLOG` lines is rate-limited per call site (8 lines, then the 16th, 32nd, … with the count);
+  `no device answer` goes to the unified log only; `computeCommandEncoderWithDispatchType:` with a concurrent type returns the serial
+  encoder instead of failing the command buffer.
+- `0002-frontend-render-barrier-policy.patch` (2026-11-12): which render-pass memory barriers are kept, `piano-metal-barriers=all|small|none`
+  on the boot line, else the first word of `/private/var/ngpu/debug/render-barriers`, else `none` with `com.droidvm.nmb-no-render-barrier`,
+  else `small` (the VM's rule: none in a pass into an IOSurface of more than 4 Mpx, which every full-screen window's surface is natively).
+  Each barrier left out in such a pass is an `NBLOG` line (`render memory barrier left out in a N-pixel surface pass (M so far; ...)`).
+
+The abort reporter (`abort_reporter.mm`, ours) is NativeSoftMetal's, see the desktop section.
 
 ABI: `NativeAdrenoABI.h` from `package/PianoA830/` when the kernel side has it, else Adreno830 `1a13210`'s
 (sha256 `20ac9298…70d2`, pinned in the build script; a different header is used but noted). The backend also uses one name v2
@@ -282,7 +293,7 @@ come from fuzzy matching (± a few lines). No USB console was recorded for it. T
 | `NativeAdrenoMetal: <proc>: device Adreno (TM) 830 (raytracing disabled)` | 6 + 1 | WindowServer, Installer Progress, loginwindow, SecurityAgent, iconservicesagent, VTDecoderXPCService, and MenuBarAgent (its line garbled). The meter says `conn 6/6`: 6 connections live at most, no slot refused (`nos 0`) |
 | `native-metal: no device answer: the device has no answer for <selector>` | ~24 | 3-6 per client (maxVertexAmplificationCount, supportsComputeCompressedTextureWrite, supportsConditionalLoadStore, gpuCoreCount, maxComputeThreadgroupMemory, isLargeMRTSupported). Harmless (`harmlessProblem`); the frontend patch keeps them off the console now |
 | `native-metal: heap N bytes type 0 options 0x220 -> N` | 11 | WindowServer and SecurityAgent; an information line per heap. Rate-limited now |
-| `native-metal: surface texture refused: 4096x2160 YCbCr format 501/503 converts on the CPU` | 4 (the frontend's own cap) | WindowServer, from about the time the login screen appears: the wallpaper video's frames. Only formats 500/505 (4:2:0) have the planes-only path (`METAL2VULKAN_YCBCR_PLANES_ONLY`); these Core Animation converts on the CPU. As in the VM |
+| `native-metal: surface texture refused: 4096x2160 YCbCr format 501/503 converts on the CPU` | 4 (the frontend's own cap) | WindowServer, from about the time the login screen appears: the wallpaper video's frames. Only formats 500/505 (4:2:0) have the planes-only path (`METAL2VULKAN_YCBCR_PLANES_ONLY`); these the frontend refuses (its own cap, not a hardware limit), and the wallpaper layer is then not drawn at all: corrected 2026-11-12, [The login window's rendering](#the-login-windows-rendering-2026-11-12) |
 | `native-metal: binary archive refused: BinaryArchive(InvalidFile …RenderBox…)` | 1 | SecurityAgent: pipelines compile from source. Harmless, as in the VM |
 | `NativeAdrenoMetal: SecurityAgent: stubbed NBTexture allocatedSize` | 1 | the stub survey; answers 0 |
 | `setBackgroundGPUPriority:2` / `setGPUPriority:1` | 2 | iconservicesagent; kept, nothing schedules by them |
@@ -318,8 +329,8 @@ starts, so `piano-gpu-delay=20` costs nothing here (0 would save nothing either;
 default). The GPU does 2.5 ms a frame, so `TU_DEBUG=sysmem` is no limit and stays for tonight (GMEM is untested natively). The time goes
 to macOS's own boot until WindowServer (~65 s), then ~85 s until loginwindow has its window (boot tasks, the seed's boot job, first-use
 shader translation in every process with a cold m2v cache), then the camera. At the login screen the frame rate (~10 a second) is
-WindowServer's CPU: the 4096x2160 wallpaper video, decoded in software by VTDecoderXPCService, converted to RGB on the CPU (formats
-501/503 above). Nothing is cut tonight.
+WindowServer's CPU: the 4096x2160 wallpaper video, decoded in software by VTDecoderXPCService, whose frames (formats 501/503 above) the
+frontend refuses, so none of them reaches the screen (2026-11-12: the flat grey login wallpaper). Nothing is cut tonight.
 
 ### After the login: what changes
 
@@ -506,3 +517,174 @@ this device's GPU window ...` note at most, and a device. The display (native-go
 under the pointer's tip; `0 gave up after 1000 ms` in the fence line, and if a `jobs left undrawn` line comes, its count (each was a
 frame the GPU had not finished: the previous one stayed). Fallbacks, added to `PIANO_EXTRA_ARGS`: `native-gop-display-cursor=2`
 (the pointer drawn in part or with a frame around it), `native-gop-display-defer=1` (the desktop slow, about 10 frames a second).
+
+## The login window's rendering, 2026-11-12
+
+Three photos of the login window, from runs `logs/usb-console/20261112-073745-port0.txt` (`ram-pol-gpuslot`), `20261112-074855-port0.txt`
+(`ram-pm-cancel0`) and `20261112-091642-port0.txt` (`au2`, built from main about 09:10). All three images had `data-persist=0`, so
+every boot was a first boot with cold shader caches. The first two had the same seed (`f6176467…`: Turnip 0001-0006,
+`TU_DEBUG=sysmem`). None had `stderr-log=1`, so no plugin line is in their logs. The display copies WindowServer's frame correctly,
+so the defects are in what the GPU drew. What was seen:
+
+| # | Defect | 073745 (no sleep) | 074855 (three test sleeps, the photo after them) | 091642 (no sleep) |
+|---|---|---|---|---|
+| 1 | Curves drawn as straight lines between their end points | avatar, "?" and the unfocused password capsule round, a lighter strip with a slanted end under the field | the avatar a diamond (the person icon cut by it), the focused password field a white hexagon with sharp left and right points | avatar and "?" round, the capsule with a white strip with a slanted right end |
+| 2 | A thin bright line at 45° across the screen, about (421,2136) to (2545,0), hidden under the UI | yes | no | no |
+| 3 | The translucent panels (date, clock, the user column, the message) as flat, lighter, opaque boxes | yes | no | yes |
+| 4 | The wallpaper flat neutral grey (every thumbnail R=G=B, e.g. `mean #909090`) | yes | yes (`#a5a5a5`) | yes |
+
+Two kinds of boot, then. In a boot that shows the login window as first drawn (073745, 091642), the materials are flat boxes and the
+avatar is round. After the three sleeps and wakes of 074855, which drew the window again, the boxes were gone, so the materials
+rendered live, and the glass shapes came out as polygons. The field's white fill has the pointed end in all three: in the boxed
+boots its middle is hidden by the column's and the message's boxes, which leaves the slanted strip. So 3 looks like the first
+render's state of the materials, kept because nothing redraws a still login window. 1 is in the glass shapes whenever they render.
+The same binaries gave both kinds, so this is a race or a coherence problem, not a shader translation error. The VM drew the same
+glass login with this plugin and Mesa round, at 1280x800 (the VM-era screenshot `vma2-login.png`, 2026-11-10).
+
+### How the login window's renderers use the device (host trace)
+
+`tooling/metal/turnip-a830/render_trace_host.mm` (new) drives RenderBox and Core Animation on the build Mac through the staged
+plugin over Adreno830's hostsim (no shader runs there), and through the Mac's own GPU for comparison. It prints every pass, pipeline,
+binding, draw and barrier they ask for. The Objective-C runtime is used to reach the frameworks; only their behaviour is observed.
+
+```sh
+xcrun clang++ -target arm64e-apple-macos14.0 -fobjc-arc -std=c++17 -O1 -x objective-c++ tooling/metal/turnip-a830/render_trace_host.mm \
+  -o /tmp/rth -framework Foundation -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework QuartzCore
+O=out/turnip-a830; B=$O/NativeAdrenoMetal.bundle/Contents/MacOS; mkdir -p /tmp/rth-cache
+DYLD_INSERT_LIBRARIES=$O/hostsim/libhostiokit.dylib HOSTSIM_GPU=a830 HOSTSIM_PAGE_SIZE=4096 TU_DARWIN_SERVICE=AGXAccelerator \
+  TU_DEBUG=sysmem CA_MODE=1 CA_GLASS=1 CA_BACKDROP=1 /tmp/rth plugin 3200 2136 $B/NativeAdrenoMetal $B/libvulkan_freedreno.dylib /tmp/rth-cache
+```
+
+(`$O/hostsim` is made by `check-turnip-a830-host.py`.) What it showed:
+
+- **The device answers `MTLGPUFamilyApple1` to `Apple3`** to every caller but RenderBox (frontend `familyForCaller`), not `Apple4` and
+  later, nor `Mac2`. Those families have programmable blending, so Core Animation reads the framebuffer in its shaders.
+- **Core Animation's glass and backdrop** (a `CASDFLayer` with `CASDFElementLayer` circle and capsule elements, `CASDFGlassDisplacementEffect`,
+  and a `CABackdropLayer` with a blur). The last pass into the target surface draws the elements' SDF pieces (`…S1…_Iscd`, `…_Irsd`)
+  into a memoryless RGBA16F colour attachment 1, then the glass draw (`…Tdgd…_IsrcM1`) reads attachments 0 and 1 back in the same
+  pass. The bridge translates that read to SPIR-V `SubpassData` input attachments (`InputAttachmentIndex 0` and `1`). The backdrop is
+  copied out and blurred in passes of its own.
+- **RenderBox** (SwiftUI) draws circles, capsules and rounded rects analytically: `primitive__vertex` with per-shape fragment
+  variants, a 10-index strip per shape, an opaque pass with depth writes and then a translucent pass. Its pass has a memoryless
+  `Depth32Float_Stencil8` and two memoryless colour attachments. It makes no barrier and no framebuffer read for plain shapes. It does
+  read its attachments for a clip, a blend mode (`plusLighter`) and a shadow: 6 of 38 draws.
+- **Every pass of the plugin** declares its colour attachments as input attachments of the subpass, and every pipeline carries the
+  colour feedback-loop and rasterization-order flags. A pipeline with the feedback-loop flag disables GMEM in Turnip (`rp.disable_gmem`
+  wins over `TU_DEBUG=gmem`). So these passes render in **sysmem whatever `TU_DEBUG` says**, the VM's included, and an A/B against
+  GMEM cannot be made with `piano-tu-debug`.
+- In sysmem, a draw that reads an attachment fetches the image through UCHE, while the earlier draws' pixels may still be in the CCU.
+  Upstream Turnip relies on `SINGLE_PRIM_MODE = FLUSH_PER_OVERLAP_AND_OVERWRITE` (the a6xx blob's setting) to keep the two in step.
+  Nothing has checked that on the A830 (gen8).
+
+### Causes (evidence against inference)
+
+1. **Curves.** Evidence: the glass shapes are an SDF written into a memoryless attachment and read back by the next draw of the same
+   pass (trace above), in sysmem. Inference, not yet measured on the tablet: in some boots that read gets stale pixels of the SDF
+   pieces. Which pieces win depends on the cache, so the shape degenerates to the polygon through the arcs' end points: a diamond for
+   a circle, a hexagon for a capsule. In the boxed boots the avatar's glass is not drawn (the image under it is round), but the
+   field's white fill still has its pointed end. A second candidate, tested apart: CPU-written surface pages that the GPU reads stale. The kernel maps GPU-writable imports (every
+   IOSurface Turnip imports: permissions 3) non-coherent at coherence level 1 and cleans them only when it maps them. The frontend's
+   `sys_dcache_flush` at commit does no maintenance on Apple's arm64 (a barrier), which the frontend's own comment says of iPadOS 27.
+2. **The 45° line.** Inference only. Two candidates. (a) The same read-back, within one draw: a full-screen draw that reads the
+   framebuffer (the login's tint or vibrancy over the wallpaper) is two triangles. Along their shared edge, a UBWC block or a cache
+   line holds pixels of both, and `SINGLE_PRIM_MODE` flushes only for a pixel that overlaps. (b) Guard-band clipping of a quad far
+   larger than the panel. At 3200 wide the guard band is ±19.5 viewports, and the two triangles are clipped apart. 0007 cannot help
+   within one draw; the `ubwc` image tests (a).
+3. **The opaque panels.** Inference: the window as first drawn has the materials in a fallback, and nothing redraws a still login
+   window until a wake does (the photos above). Two candidates for the fallback. (a) The materials read the framebuffer behind them
+   (backdrop, vibrancy) and composite over stale or cleared pixels: 0007 again. (b) A first-use state of a cold boot: every boot of
+   these images starts with empty shader caches, and the backdrop's source (the wallpaper video) never has a picture. The images below
+   take one test sleep to see the window drawn first and again, in one boot. Reduce transparency is not the cause: the A830 seeds do not stage it (no `com.apple.universalaccess`
+   preference anywhere in seed `f6176467`, checked read-only 2026-11-12), and `build-native-image.sh` passes `--reduce-transparency` only
+   for NativeSoftGpu.
+4. **The grey wallpaper.** Evidence: the login window plays the default aerial wallpaper. The seed chooses no wallpaper
+   (`/var/db/Wallpapers`, the wallpaper store and the loginwindow preferences are all absent), and SecurityAgent's LoginUIKit falls
+   back to the aerial video. VTDecoderXPCService decodes it in software, and WindowServer wraps each 4096x2160 frame as a format-503
+   texture (`YCBCR8_444_2P` in metal2vulkan's table). The frontend refuses every YCbCr surface texture over 1 Mpx except plane 0 of
+   500/505 (`textureOnSurface`: `surface texture refused: 4096x2160 YCbCr format 503`). That is a policy against the conversion's memory,
+   about 97 MB per surface, not a limit of the A830 (`maxImageDimension2D` 16384, 256 MiB per BO). The layer then gets no picture,
+   and what remains is the login's tint and material over nothing: flat grey, every thumbnail `screen unchanged`. Meanwhile
+   VTDecoderXPCService keeps decoding about 9 frames a second. Earlier lines of this file said Core Animation converts these frames on
+   the CPU; it does not, and they are corrected above.
+
+### Fixes in this tree
+
+- **Turnip `0007-turnip-darwin-sysmem-feedback-flush.patch`** (§1). Before each draw whose fragment shader reads an input attachment of
+  the subpass, it flushes. Such a shader is one with non-bindless texture slots (ir3's `num_samp`), because input attachments are the
+  only descriptors Turnip gives them. The flush, in sysmem only: CCU clean (colour and depth), UCHE invalidate, blit cache clean, wait
+  for memory writes, for idle and for ME. In the trace that is 1 draw in 30 of Core Animation's glass frame and 6 in 38 of RenderBox's
+  clip, blend and shadow scene, so the cost is a few waits a frame. Each process says once `TU: info: draws that read the attachments
+  they render to (first: input attachments of the subpass): in a sysmem pass each waits ...`. `TU_DEBUG=nofbflush` is the control;
+  `fbflushall` puts the flush before every draw of those passes. Host checks: all 18 pass (`check-turnip-a830-host.py`). The trace
+  shows the line for the glass and backdrop scene and for RenderBox's clip, blend and shadow scene, and none for plain shapes.
+- **Frontend `0002-frontend-render-barrier-policy.patch`** (§1). `piano-metal-barriers=all` keeps RenderBox's render-pass barriers in
+  panel-sized surface passes (SecurityAgent's full-screen window), and each barrier left out is now on the console. The default is
+  unchanged (`small`). The VM's lock-up with them was a GMEM split of the whole surface, and these passes render in sysmem. None
+  occurred in the traced scenes, so whether the login window asks for any is the run's question.
+- **Wallpaper: a still picture, nothing built.** On the installed system, the owner chooses a still wallpaper once (System Settings,
+  Wallpaper). `wallpaperexportd` then writes `/var/db/Wallpapers/<GeneratedUID>/`, and the login window shows it from the next login
+  on. That also ends the software HEVC decode at the login window (battery). A RAM image cannot carry it without the account's
+  GeneratedUID and the export's `Metadata.plist` format (not read; the seed's `dslocal` is root-only). The system layer (data-store.md
+  §9) does not take files outside launchd's folders, `/usr/local` and the GPU bundle. Lifting the frontend's YCbCr cap for format 503
+  would cost about 97 MB per surface and a conversion every frame; it is not done.
+
+Bundle built 2026-11-12 (this tree, from scratch twice with the same result): `libvulkan_freedreno.dylib` CDHash `6c23e546dcf62259c14d69a081cba0225519fcbf`,
+`NativeAdrenoMetal` `21a1ded0176b1970a9934f49731b39e613d83a2f`. A new plugin is a new seed identity, so the installed store's seed keeps
+the old one until the system layer (data-store.md §9: `stage.py --live DIR --gpu-bundle out/turnip-a830/NativeAdrenoMetal.bundle
+--installed-trust <the base's trust cache>`, then `build-esp.py --layer DIR` and the owner's `apply-update.sh`) installs it.
+
+### Test images (unattended, 12 minutes each)
+
+```sh
+K27_KERNEL=<kernel-k27-0064-native.macho> PIANO_EXTRA_KEXTS=$(tooling/k27/build-native-piano-keyboard.sh | tail -1) \
+  PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh     # the KC, as the queue's (the test sleep needs 0062 or later)
+tooling/k27/build-gfx-test-images.sh                                    # out/ram-gfx-{fix,ctl,all,coh,bar}/ and out/ram-gfx-dump/
+tooling/native/native-loop.sh out/ram-gfx-fix/boot-piano-macos-ram-A-bundled.img     # then ctl, all, coh, bar; ubwc by name
+```
+
+Every image has `piano-gpu=2 piano-gpu-delay=20 panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-input=1 piano-power=1
+piano-power-ps=1 piano-power-period=10 piano-thermal=1 piano-cpufreq=2 piano-keyboard=2 piano-backlight=2 exec-log=1 stderr-log=1
+piano-gpu-hang-ms=10000`, one test sleep (`piano-sleep=1 piano-sleep-state=1 piano-sleep-test=240 piano-sleep-test-count=1
+piano-sleep-max=30`: the window drawn first, then again after the wake; `GFX_SLEEP=0` leaves it out) and `piano-reset-after=720`.
+Each seed's boot job prints the error and fault messages of
+`process == "WindowServer" OR process == "SecurityAgent" OR process == "loginwindow"` (`GFX_LOG` sets another predicate, `GFX_LOG=`
+none).
+
+| Image | Seed `tu-debug` | Own arguments | Question |
+|---|---|---|---|
+| `ram-gfx-fix` | `sysmem` | | 0007 on: are the avatar and the field round, no line, no boxes? |
+| `ram-gfx-ctl` | `sysmem,nofbflush` | | the same binaries without 0007 (the photos' behaviour) |
+| `ram-gfx-all` | `sysmem,fbflushall` | | if fix is not enough: the flush before every draw of those passes |
+| `ram-gfx-coh` | `sysmem` | `piano-gpu-cohtest=1` | the kernel's V9b/V9c; with level 2, GPU-written imports become IO-coherent: stale CPU-written pages |
+| `ram-gfx-bar` | `sysmem`, `render-barriers` `all` | `piano-metal-barriers=all` | RenderBox's barriers kept in full-screen surfaces |
+| `ram-gfx-ubwc` (by name) | `sysmem,noubwc` | | the 45° line, if a UBWC block is read half-written |
+
+Console lines (`grep -E` on the USB console):
+- `TU: info: TU_DEBUG=sysmem(,nofbflush|,fbflushall|,noubwc)? from /private/var/ngpu/debug/tu-debug`: WindowServer's mode.
+- `TU: info: draws that read the attachments they render to (first: input attachments of the subpass)`: in WindowServer and SecurityAgent
+  (and the agents with glass) in fix, all, coh, bar and ubwc; absent in ctl. Absent in fix as well would mean the login window reads no
+  attachment, and the cause is elsewhere: then compare coh.
+- `native-metal: render memory barrier left out in a 6835200-pixel surface pass (N so far ...)`: whether a client asks for barriers in
+  a full-screen surface (fix, ctl); in bar instead `render-pass memory barriers: all (from boot argument piano-metal-barriers)` and no
+  left-out line.
+- coh: the S8 row `COH V4 p V9a p V9b <p/f> V9c <p/f>` and the MEM row's `coh 2` (`coh 1` if V9b or V9c failed: then coh equals fix).
+- The cost: `PianoA830: t gpu meter rs N a/b ms` (mean and longest GPU time per render-server job), fix against ctl; `row0 ... NNC`.
+- None of: `gpu recovery`, `gpu hang snapshot`, `gpu DEVICE LOST`, `MESA: error: device lost`, `TU: error: NativeAdreno: kernel`,
+  `exit: pid N WindowServer`.
+- `surface texture refused: 4096x2160 YCbCr format 503` and grey thumbnails stay in every image: the wallpaper is not part of this
+  matrix.
+
+The decisive reading is a picture of the login window per image, twice: before the test sleep (`piano-sleep: test sleep 1 of 1`) and
+after its wake (`woke after 30.0 s by timer`). The thumbnails' 40x79-pixel cells cannot show a diamond or the boxes. The Mac's webcam
+sees the panel: `imagesnap -d "HD Pro Webcam C920" -w 1.5 cam-$(date +%H%M%S).jpg`, then the time against the console's. The verdicts:
+- fix right and ctl wrong: 0007 is the fix.
+- Both right: the photos' runs were chance; repeat ctl.
+- Both wrong and coh right: the cause is CPU-written pages, and the kernel's coherence level is the lever.
+- All wrong: read `ram-gfx-all` and `ram-gfx-bar`.
+- Boxes before the sleep and none after it, in fix as in ctl: the boxes are the first render's state, not 0007's business.
+
+Built offline 2026-11-12 in an agent worktree: KC (the 0064 kernel, PianoKeyboard, 24 native kexts, every vtable check 0 problem
+slots) `dd4e7b22c65db32a…`. Images (`verify-ram-images.py` PASS each; command lines 930-955 bytes): `ram-gfx-fix` `ed9447fcbddaef9e…`
+(seed `e32722ed…`), `ram-gfx-ctl` `61fabf033b49bf59…` (seed `d8f330bc…`), `ram-gfx-all` `633ff36739d65269…` (seed `866ea0f5…`),
+`ram-gfx-coh` `871c5cc94eeebc39…` (fix's seed), `ram-gfx-bar` `f0aad23b9507b487…` (seed `ce90a139…`), the dump `8df7b15ae95a3123…`.
+Rebuild them in the main checkout before a run (the kernel's and the seeds' bytes depend on where they were built).
