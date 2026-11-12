@@ -47,6 +47,26 @@ BHIe status, and after a failure the PCI status and AER words of both ends and t
 next to level 2) was the DRV-2 lock: one of our transactions slept and logged while holding it and spanned PianoA830's whole 2 s
 wait (§10.22); fixed here and in PianoBluetooth's `BtRpmh.h`. Next: §8.8 boots 3a and 3b.
 
+**Fourth round (2026-11-12, wifi-3a `piano-wifi=4 piano-wifi-iova=1` and wifi-3b `piano-wifi=6 … piano-wifi-socreset=1`, both
+with every fix above):** SN4 voted and taken, the window translating, and level 4 stops at stage 401 in both, now with the
+cause's shape visible: BHI's status read **0** before this host's clear (so the morning's `ffffffff` was not a power-on value),
+then **45 ms after the doorbell the boot loader itself wrote `ffffffff` / `ef0e0003`**, with ERRDBG1–3 `20000000 00000000
+00080000` — the image's address (low, high) and size exactly as written. EE stayed PBL, MHI state RESET, no SYSERR; both ends'
+PCI status, device status and AER clean, PARF only "link up", the SMMU's global fault and bank 81's FSR empty; 3b's partial chip
+reset changed nothing. So the PBL refuses the boot loader, and no PCI-level error came with it: either it never read the image,
+or every read it made was answered with data (a refused read leaves UR/CA, a lost one a completion timeout, §10.23). The file
+is right by structure (checked offline against Ubuntu's pinned `amss.bin`: a signed 32-bit ARM ELF padded to 512 KiB, then the
+Hexagon ELF from 512 KiB to the end, which is what the MHI host splits), but whether the window *holds* it was never measured.
+What Ubuntu does before that doorbell and this driver did not (§10.23): ath12k's **whole** power-on reset (the chip's LTSSM word,
+its GCC hot-reset bit, the **QFPROM's fuse-blow supply bit cleared**, the BHIe vector words — 3b had only the last four steps),
+the MHI host's clear of the BHIe receive block, **MSI enabled**, and the MHI context and host-range registers written only at
+READY (this driver wrote them, with a 36-bit range, before the doorbell). All of that is now the default, each with an A/B switch,
+and level 4 now measures what decides the question: the **TLP counters of both ends** (how many reads the chip sent, how many
+completions with and without data came back), the **image hashed through the window as the chip reads it** against the stock
+identity, an **MSI sink** (does a chip write reach the window), and BHI's fuse-derived identity words as counts and a digest. The
+cause is **not yet proven**: the two candidates the boot loader most plausibly consults are the fuse-blow supply (it checks the
+image's signature against fused key hashes) and the early host-range registers (inference). Next: §8.8 boots 4a and 4b.
+
 Association, keys and the data path (levels 7 and 8) are design only (§12 has level 5's message table, §14 level 6's, §13 what levels 7 and 8 need and the macOS side's remaining plan). Template: `README.md`.
 
 ## 1. Purpose and gate
@@ -174,7 +194,10 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-mode=1` | 0 | level 5 also sends the firmware's options (logging), the host's copy-engine configuration and the mode — the three messages that start the radio and open level 6. By default level 5 stops at the ready indication |
 | `piano-wifi-shadow=1` | 0 | put the shadow register list in that configuration (40 addresses computed from the chip's register map for the rings level 8's data path will create; level 6 writes the real registers through the window instead, §10.18, and §10.19 is what to try if that turns out to be the wrong path) |
 | `piano-wifi-noc=0` | 1 | no vote for the PCIe NoC's bus clock manager `SN4` before level 3's clocks. By default level 3 votes it at the link's peak (Gen × 2 lanes, as pcie-qcom does), and every level that gives the chip up withdraws it (§10.21). `=0` is only the A/B test of that vote |
-| `piano-wifi-socreset=1` | 0 | level 4 runs the chip-side reset Ubuntu's ath12k runs at every power-up before MHI: the chip's PCIe interrupts cleared, the warm-boot entry word cleared, the reset cause read, the SoC global reset (BAR0 + `0x3008` bit 0, 10 ms each way), MHICTRL's reset; one line with the values (§10.21) |
+| `piano-wifi-socreset=0` | 1 (from the fourth round; 0 before) | skip the chip's power-on reset before BHI. By default level 4 runs all of ath12k's power-up recipe: the chip's PARF LTSSM word (`0x1e081b0` := `0x111`), its GCC hot-reset bit (`0x1e65304` bit 4), the PCIe interrupts cleared, the QFPROM power control's VDD4BLOW bit (`0x1f8031c` bit 2) cleared, the BHIe vector doorbell/status words, the Q6 cookie read, the warm-boot entry cleared, the reset cause read, the SoC global reset (BAR0 + `0x3008` bit 0, 10 ms each way), MHICTRL's reset; then the MHI host's clear of the BHIe receive block. Two lines with every value (§10.23) |
+| `piano-wifi-msi=0` | 1 | leave the endpoint's MSI off. By default one vector, its address a sink page of the DMA window, its data `0x4d53`, INTx off, as the host boots the chip with MSI on; the sink is reported after the boot (§10.23) |
+| `piano-wifi-ctxearly=1` | 0 | also write the MHI context and host-range registers before the doorbell (what every boot before the fourth round did). By default they are written once the device reports READY, as the MHI host does |
+| `piano-wifi-ras=0` | 1 | no TLP counters. By default level 4 switches on the DesignWare RAS DES counters of both ends of the link before the doorbell (TLPs by kind, UR, CA, completion timeouts) and logs their deltas (§8.4) |
 | `piano-wifi-smmu=N` | 1 | 0: the SMMU is left alone (level 4 then needs stream 0x1401 to bypass already); 1: the endpoint's stream 0x1401 through a bypass context bank; 2: also the root port's 0x1400 |
 | `piano-wifi-spmi=1` | 0 | add the eight supplies' PMIC regulators and the BT_EN / sleep clock pins over the SPMI observer (the only stores: the observer's read commands) |
 | `piano-wifi-hwcg=1` | 0 | count a hardware-gated branch that reads CLK_OFF while voted and under HW_CTL as running for the read gates |
@@ -359,13 +382,15 @@ Step 204/205 — a TLMM word did not read back, which would mean the pin is owne
 `PIANO_EXTRA_ARGS="piano-usb=2 piano-wifi=3"`, everything else as §8.2 (`--out out/ram-wifi-l3`). What it writes, beyond level 2's:
 the GCC collapse word (two bits cleared, under the vote lock), the aux and rchng RCG CFG + update bits, the pipe mux (twice: TCXO,
 then the PHY), the two branch vote words (bits only set), the TCSR reference gate, two BCR pulses, 12 PARF words, the 128-write PHY
-sequence, 256 cleared BDF-to-SID words plus one entry, the root port's bus numbers / memory window / command / link control 2, one
+sequence, 256 cleared BDF-to-SID words plus one entry, the root port's bus numbers / memory window / its unused I/O and prefetchable
+windows closed (six words, from the fourth round) / command / link control 2, one
 PERST# release, the LTSSM enable, two iATU regions, the endpoint's BAR0 and command, and one SMMU group + bank. Before all of it,
 one RPMh command: the PCIe NoC's bus clock manager `SN4` voted at the link's peak (§10.21; `piano-wifi-noc=0` skips it).
 
 ```
 PianoWifi: cmd-db: SN4 (the PCIe NoC's bus clock manager) 0x50020: unit N, width W, clock domain D      (level 1's stage 5)
-PianoWifi: options: noc 1 (the PCIe NoC's bus clock manager voted before level 3's clocks), socreset 0 (the chip-side reset before BHI)
+PianoWifi: options: noc 1 (the PCIe NoC's bus clock manager voted before level 3's clocks)
+PianoWifi: options: socreset 1 (the chip's power-on reset before BHI), msi 1 (MSI into a sink page), ctxearly 0 (MHI contexts before the doorbell), ras 1 (TLP counters)   (level 4 and up)
 PianoWifi: rsc: SN4 (0x50020): 1 command(s) through TCS 2 completed after N us (status 0x10101 0 0); the DRV-2 lock held N us, taken after 0 waits
 PianoWifi: PCIe NoC: SN4 voted: peak 1000000 kB/s (Gen2 x2) -> vote V (unit N, width W, bus width 8), command 6000VVVV: taken (0)
 PianoWifi: step 301: the PCIe0 and PCIe0 PHY power domains out of collapse
@@ -379,6 +404,7 @@ PianoWifi: step 307: the root port: bus numbers, memory window, target link spee
 PianoWifi: step 308: PERST# released (>= 100 ms low), then the LTSSM enabled
 PianoWifi: step 309: link training to L0
 PianoWifi: link: debug0 ........ (LTSSM 0x11 L0) debug1 ........ (up) status ........ (Gen2 x2) after N ms
+PianoWifi: root port: windows as found: I/O .... upper ........, prefetchable ........ upper ........:........; closed: I/O 00f0, prefetchable 0000fff0
 PianoWifi: step 310: iATU region 0 (configuration window), then the endpoint's identity
 PianoWifi: endpoint: id 110e17cb (17cb:110e, the WCN7860) class 02800002 subsystem ........ pcie cap 0x.. msi cap 0x.. after N polls
 PianoWifi: step 311: iATU region 1 (the memory window), BAR0's size and address, the endpoint's command
@@ -417,13 +443,21 @@ PianoWifi: SMMU stream 0x1401: bypass set (slot N: smr 80001401 s2cr 000000NN)
 PianoWifi: dma: 24 MiB at 0x........ (write-combined mapping 0x........), the endpoint's bus addresses are physical (stream 0x1401 bypasses)
 PianoWifi: level 4: BAR0 mapped (0x40400000 + 0x200000); MHI version ........, BHIOFF ........, BHIEOFF ........, MHISTATUS ........
 PianoWifi: level 4: BHI at 0x..., BHIe at 0x..., EE PBL, state 0x7; chip TCSR version ........ (major 2)
+PianoWifi: level 4: BHI identity at the start: MSM hardware ID N of 6 words non-zero, OEM public key hash N of 24 non-zero (N all ones), digest ........
 PianoWifi: firmware partition modem_a (LUN 4, NNNNN blocks of 4 KiB)
 PianoWifi: firmware: image/peach/amss20.bin on modem_a, 6930496 bytes: boot loader 524288 bytes, a second ELF image 6406208 bytes at 524288
 PianoWifi: firmware: in the window: boot loader at 0x........, 13 segments, vector table at 0x........ (13 entries)
-PianoWifi: level 4: contexts at 0x........ (channels 128, event rings 2: control at ..., data at ..., command ring at ...)
+PianoWifi: firmware: in the window: boot loader sha256 c0e4bb91... (the stock file's first 512 KiB), the file as the window holds it, 6930496 bytes, sha256 02bbc028... (the stock amss20.bin Ubuntu runs)
+PianoWifi: level 4: chip power-on reset: chip LTSSM ........ -> 00000111 (N writes), GCC hot reset ........ -> ........, interrupts cleared, QFPROM power ........ -> ........ (VDD4BLOW was on, now off | was off), BHIe vector words cleared, Q6 cookie ........
+PianoWifi: level 4: chip power-on reset: warm entry ........ -> 00000000, reset cause ........, global reset ........ -> ........, MHISTATUS ........ -> ........ after MHICTRL's reset, EE ........; 7 receive vector words cleared
+PianoWifi: level 4: BHI identity after the chip's reset: ...                  (the same digest as at the start: the boot loader's fuse read did not change)
+PianoWifi: level 4: msi: cap 0x50 control .... -> .... (64-bit addresses), address 00000000:2070.000 data 4d53, command 00100406: one vector into the sink page
+PianoWifi: level 4: msi: the sink page is at bus 0x2070....
+PianoWifi: level 4: contexts at 0x........ (channels 128, event rings 2: ...), given to the device at READY, as the MHI host does
 PianoWifi: level 4: the image: 524288 bytes at bus 0x20000000 (the 32-bit window, translated by the SMMU), aligned to 512 KiB; the vector table at 0x20700000
 PianoWifi: level 4: before the doorbell: MHI +00: ........ x8        (6 lines MHI, 3 lines BHI with +40 the serial number as --------, 4 lines BHIe)
-PianoWifi: level 4: boot begun in phase boot loader over BHI (EE PBL); BHI status ffffffff before, 00000000 after this host cleared it (the clear took)
+PianoWifi: level 4: TLP counters: root port at 0x..., (11 of 11 on), endpoint at 0x... (N of 11 on)        (or "none": the capability is not there)
+PianoWifi: level 4: boot begun in phase boot loader over BHI (EE PBL); BHI status 00000000 before, 00000000 after this host cleared it (the clear took)
 PianoWifi: level 4: after the doorbell +0 ms: MHISTATUS 00000000 (state 0x0), EE 00000000, BHI status 00000000, error code ........, BHIe status ........
 PianoWifi: level 4: changed +N ms: MHISTATUS ... BHI status 80000000 ...     (one line per change, at most 48)
 PianoWifi: level 4: waiting for READY after N ms (EE PBL, state 0x7)
@@ -442,26 +476,46 @@ boot loader — `EE AMSS` already there would mean something else booted it), th
 Failure meanings: `the MHI register layout is not usable` — BAR0 does not carry the MHI block where sheng and PAGANI have it;
 `no partition` — NativeUfs had not published `modem_a` yet (level 4 does not wait: rerun, or add `piano-wifi-delay=20`);
 `BHI reported an error` with an error code and three debug words — the boot loader refused the image (its address alignment, or
-the wrong file), or its read of it failed; since the 2026-11-12 fix an all-ones status counts as an error too, as in Ubuntu's MHI
+the wrong file), or its read of it failed; debug words that are all 0 mean it refused before any transfer (sheng's page-aligned
+address), debug words naming the image's address and size mean it had started one (wifi-3a/3b: `ef0e0003`, `20000000 00000000
+00080000`, 45 ms after the doorbell, §10.23); since the 2026-11-12 fix an all-ones status counts as an error too, as in Ubuntu's MHI
 host, unless it is the register's own power-on value that this host could not clear (`the clear did not take`, and it never
 changed); `BHIe reported an error` — the vector table or a segment; `the device reported a system error` / `went to its crash
 dump environment` — the firmware started and died (level 5 adds the RDDM dump that says where); `a phase timed out` — the device
 stopped answering, which with `MHISTATUS ffffffff` means its PCIe core restarted under us (PAGANI re-applies BAR0 and the decode
 bits there; this driver does not yet), or, with MHISTATUS and EE still answering and BHI's status unchanged since the doorbell
-(now the 0 this host wrote), the boot loader never finished reading the image (what 2026-11-12's four boots showed, before the
-NoC vote and the clear: §10.21).
+(now the 0 this host wrote), the boot loader never finished reading the image (how 2026-11-12's first four boots were read,
+before the NoC vote and the clear: §10.21; the fourth round showed they were most likely the same refusal, which the old rule
+mistook for an untouched register and waited out).
 
 After any failure the level prints what the chip and the SoC say about the DMA, and those lines decide the next step:
 
 ```
-PianoWifi: level 4: failed in phase boot loader over BHI: BHI error code ........, debug ........ ........ ........; BHI status ffffffff before the clear, 00000000 after (it took); N register change line(s)
+PianoWifi: level 4: failed in phase boot loader over BHI: BHI error code ........, debug ........ ........ ........; BHI status 00000000 before the clear, 00000000 after (it took); N register change line(s)
 PianoWifi: level 4: at the end +N ms: MHISTATUS ... EE ... BHI status ... error code ... BHIe status ...
 PianoWifi: level 4: at the end: MHI / BHI / BHIe ...                               (the same 13 lines as before the doorbell)
 PianoWifi: dma: endpoint command/status 00100006, device control/status ........; AER uncorrectable ........ correctable ........
 PianoWifi: dma: root port command/status ........, secondary status ...., device control/status ........, BAR0 ........ BAR1 ........; AER uncorrectable ........ correctable ........; PARF interrupt status ........
 PianoWifi: dma: SMMU sCR0 ........, global fault sGFSR ........ sGFSYNR0 ........ sGFSYNR1 ........ (stream 0x....) sGFSYNR2 ........ sGFAR ........:........
 PianoWifi: dma: SMMU bank 81 (the 32-bit window): sctlr 00000027 fsr ........ far ........:........ fsynr0 ........
+PianoWifi: dma: TLPs since the doorbell, root port: tx MRd N tx MWr N tx CplD N tx Cpl N rx MRd N rx MWr N rx CplD N rx Cpl N UR N CA N CTO N   (- for a counter that would not switch on)
+PianoWifi: dma: TLPs since the doorbell, endpoint: ...
+PianoWifi: dma: the chip asked for data N time(s); the root port answered with N completion(s) with data and N without (...)   (or: "received no read request from the chip")
+PianoWifi: dma: msi sink at the end: untouched (...) | N word(s) changed, the first at +0x.. = 00004d53 (an MSI): the chip's writes reach the window
+PianoWifi: firmware: after the failure: the boot loader in the window is still the stock file's first 512 KiB (sha256 c0e4bb91...)
+PianoWifi: level 4: BHI identity at the end: ...
 ```
+
+The fourth round's lines (§10.23) say which of the two remaining explanations holds, and what to change next:
+
+| What the lines show | Meaning | Next |
+|---|---|---|
+| root port `rx MRd 0` (and the endpoint's `tx MRd 0`) | the boot loader refused before it fetched a byte: its parameters or the chip's state | the address and size are Linux's; the state is what `socreset`, `msi`, `ctxearly` change: their A/B decides |
+| `rx MRd` about 1024 (512 KiB in 512-byte reads), `tx CplD` 4096 or more, `tx Cpl 0`, the image `the stock …` | the chip got the right bytes and refused them: its signature check against its fuses | the BHI identity line (an OEM key hash that is zero, all ones or changes means the boot loader could not read its fuses) and the QFPROM line (VDD4BLOW) |
+| `rx MRd` > 0 with `tx Cpl` > 0, or `UR`/`CA` > 0 | the root complex or the SMMU refused the reads with an error completion | bank 81's `fsr`/`far` and `sGFSR`: the stream or the translation |
+| `rx MRd` > 0 and `tx CplD 0`, no `tx Cpl` | the reads went in and nothing came back (AXI/NoC/TBU) | the SN4 line, the TBU clock (`ddrss_sf_qtb`), the AXI master halt bit |
+| the image `NOT the stock …` | the window does not hold the file (the UFS read into the write-combined window) | the copy path, not the chip |
+| sink changed with `4d53` | the chip's writes reach the window through bank 81 (or the bypass): the path works both ways | — |
 
 How to read them: an endpoint status with bit 29 (received master abort) or 28 (received target abort), or AER uncorrectable bit
 20 (unsupported request) or 15 (completer abort) — the root complex or the SMMU refused the chip's read; a non-zero `sGFSR` with
@@ -642,7 +696,7 @@ the next is built: a level that fails is not retried at a higher level, and noth
 |---|---|---|---|
 | 1 | `piano-usb=2 piano-wifi=2` | the helper's `wcn rails … voted and read back` line, then every PMU rail `en 80` at or above the voted voltage; the two PHY LDOs unchanged; `WLAN_EN cfg ... io 00000002`; the log reaching `level 2: done`; the tablet alive afterwards (§8.2) | read §8.2's failure meanings; `SW_CTRL in 0` is not itself a failure but is the first suspect at boot 2 |
 | 2 | `piano-usb=2 piano-wifi=3` | `PCS status1 ... (ready)`, `LTSSM 0x11 L0` with `debug1 ... (up)`, `id 110e17cb`, a BAR0 placed inside the window, `command ...6`, the SMMU line (§8.3) | §8.3; `piano-wifi-gen=1`, `piano-wifi-physeq=0` and `piano-wifi-stop=N` are the next boots' tools |
-| 3 | `piano-usb=2 piano-wifi=4` | `EE PBL` at the start, the 6930496-byte file split at 512 KiB, `boot loader over BHI` → `contexts needed` → `image over BHIe` → `mission mode`, the tablet alive (§8.4) | §8.4; `piano-wifi-delay=20` when `modem_a` was not published yet. Failed four times on 2026-11-12 (§10.21): boots 3a and 3b below |
+| 3 | `piano-usb=2 piano-wifi=4` | `EE PBL` at the start, the 6930496-byte file split at 512 KiB, `boot loader over BHI` → `contexts needed` → `image over BHIe` → `mission mode`, the tablet alive (§8.4) | §8.4; `piano-wifi-delay=20` when `modem_a` was not published yet. Failed four times on 2026-11-12 (§10.21), then in boots 3a and 3b below (§10.23): boots 4a and 4b below |
 | 4 | `piano-usb=2 piano-wifi=5` | both channels running, the firmware's service announced, the memory request answered, the four files read, `3 indications`, `0 unexpected messages`, the ready line with step 518 (§8.5) | §8.5 |
 | 5 | `piano-usb=2 piano-wifi=5 piano-wifi-iova=1` | the two `iova:` lines, then everything boot 4 showed: the chip works with 32-bit addresses, which level 6's rings need (§10.11) | if the `iova:` lines are there but a step then times out, the translating bank is the suspect: bank, table and fault registers are in the line, and boot 4's result stands as the comparison |
 | 6 | `piano-usb=2 piano-wifi=5 piano-wifi-iova=1 piano-wifi-mode=1 piano-wifi-shadow=1` | the three extra steps (515, 516, 517), `40 shadow registers`, step 518, and the tablet alive for a minute afterwards with the firmware's radio running | a refusal at 516 means the copy-engine tables or the shadow list are not what this firmware wants (§12); at 517 it means the mode itself was refused |
@@ -667,6 +721,21 @@ queue's base `panic_on_crash_disabled=1 piano-usb=2 piano-usb-cold=0`, RAM boots
 
 3b is chosen to be useful whichever way 3a goes. If the owner prefers the ladder without a second variable, 3b without
 `piano-wifi-socreset=1` is the alternative (it then only repeats 3a's question when 3a failed).
+
+**Results (2026-11-12 12:31 and 12:37):** both failed at stage 401 the same way: SN4 taken, `BHI status 00000000 before`, then at
++45 ms the boot loader's own `ffffffff` / `ef0e0003` with debug `20000000 00000000 00080000`, every `dma:` word clean (3b's
+partial reset: global reset `4 -> 4`, warm entry 0, cause 0). Neither the NoC vote nor that reset was the cause (§10.23).
+
+**The next two unattended boots (after §10.23's changes).** Both on the queue's base `panic_on_crash_disabled=1 piano-usb=2
+piano-usb-cold=0`, RAM boots with the queue's usual reset backstop:
+
+| # | Boot args (beyond the base) | Gate | Then |
+|---|---|---|---|
+| 4a | `piano-wifi=6 piano-wifi-iova=1 piano-wifi-band=0` | the new defaults, i.e. Ubuntu's pre-boot path: the two `chip power-on reset` lines (`chip LTSSM … -> 00000111`, the QFPROM line, global reset not `ffffffff`), `msi: … one vector into the sink page`, `contexts … given to the device at READY`, `TLP counters: root port at …`, the firmware's `sha256 … (the stock amss20.bin Ubuntu runs)`; then a `changed` line with BHI status `80000000`, `waiting for READY` → `contexts needed` → `image over BHIe` → `mission mode`, and §8.8 boots 4–7's gates (levels 5 and 6, a 2.4 GHz scan) | passes: one of §10.23's five changes was the cause, and 4b's failure (the control) makes that evidence; the A/B that names it is one switch per later boot (`ctxearly=1`, then `socreset=0`, then `msi=0`, each on 4a's arguments). Fails at level 4: §8.4's table on the `dma:` lines; fails later: that level's own meanings (§8.5, §8.6) |
+| 4b | `piano-wifi=4 piano-wifi-iova=1 piano-wifi-socreset=0 piano-wifi-msi=0 piano-wifi-ctxearly=1` | the control: 3a's pre-boot path (no chip reset, MSI off, the contexts before the doorbell) with the new measurements. Expected to fail as 3a did; what it must show is the `TLPs since the doorbell` lines, the `the chip asked for data …` / `received no read request` line, the sink line and the image's hash | read with §8.4's table: it answers, for the configuration that failed all day, whether the chip's DMA reached the buffer and whether the buffer held the stock file. If 4b passes, what is new in it is all that is left: the root port's windows closed (step 307) and the counters switched on (a write to each end's counter control), and a boot with `piano-wifi-ras=0` separates the two |
+
+The two are chosen so that each result says something whichever way the other goes: 4a is the best chance of the boot loader
+taking the image and runs the ladder as far as it goes; 4b is the measured control.
 
 ## 9. Fallback
 
@@ -820,6 +889,11 @@ network (§5.2 C).
    natively) and MSI enabled (above). Not done natively and not found necessary: the receive vector's clear (only the crash
    dump uses it). The diagnostics added so that the next failure says where the read went: §8.4. The A/B of (a) is
    `piano-wifi-noc=0`. (needs-boot: §8.8 boots 3a, 3b)
+   **Corrected by the fourth round (§10.23):** (a) was not the cause (3a, 3b failed with SN4 taken), and the reading of `ffffffff`
+   / `ef0e0003` as untouched power-on contents was wrong: 3a and 3b read BHI's status 0 before the clear and saw the boot loader
+   write both 45 ms after the doorbell. The morning's boots, whose last values were the same, most likely saw that refusal too and
+   waited 20 s because the old rule ignored an all-ones status. The receive vector clear listed above as "not found necessary" is
+   done since the fourth round, as part of the MHI host's pre-boot path.
 22. **P17: the GPU's bring-up and the DRV-2 lock (wifi-l5ib, 2026-11-12).** PianoA830's `S1 step 0x10 reason 9 ... reg 0x1 value
    0xfffffffffffffff0 expect 0xffffffff` decodes (Adreno830Start.h, Sm8750Rpmh.h) as: S1's mx/cx vote, reason RPMh, the RPMh
    result's step 1 (the lock), status -16 (busy), no TCS chosen: A830 waited its whole 2 s for `sm8750_rpmh_drv2_owner` and never
@@ -838,6 +912,65 @@ network (§5.2 C).
    is never idle again for anyone. Not changed (other packages, noted for their owners): PianoPower's `PianoAdsp.cpp` voteLocked
    logs every write under the lock, and PianoKeyboard's voteLocked sleeps 1 ms per poll under it. (needs-boot: any boot with
    `piano-wifi` ≥ 2 and the GPU: the `rsc:` lines' hold times)
+   wifi-3a and 3b (2026-11-12): fourteen `rsc:` lines each, the lock held 32–94 µs, taken after 0 waits; PianoA830 ran to stage 15
+   in both. Its S1 had finished before level 2 began in both logs, so the overlap that failed is not re-tested yet (evidence for
+   the hold times, not for the race).
+23. **P18: the boot loader refuses the boot loader image itself (wifi-3a, wifi-3b, 2026-11-12).**
+   Evidence, from the two logs (USB console and pstore, the serial number masked in the dumps):
+   - BHI's status read `00000000` before this host's clear (the clear took) in both. After the doorbell (session `0xe63d` in 3a,
+     `0xf2ad` in 3b) nothing changed until the poll at **+45 ms**, which read BHI status `ffffffff` (bits 31:30 = 3, an error)
+     and error code `ef0e0003`. ERRDBG1–3 read `20000000 00000000 00080000`: IMGADDR_LOW, IMGADDR_HIGH and IMGSIZE as written.
+     IMGTXDB kept the session number, INTVEC 0, EE `PBL` and MHISTATUS `00000000` (RESET, no SYSERR) to the end.
+   - The `dma:` lines, read 3 s after the refusal in 3a and 2 ms after it in 3b: endpoint command/status `00100006` (status
+     `0010`: the capability list only), device control/status `00102810` (status `0010`: AUX power only, none of the four
+     error-detected bits), AER uncorrectable and correctable 0 at both ends, root port secondary status 0, PARF interrupt status
+     `00002000` (link up only), SMMU sCR0 `00290406`/`002d0406` with sGFSR 0, bank 81's sctlr `00000027` and fsr `00000400` (the
+     format field only: no fault; its FAR the bank's power-on contents).
+   - 3b ran the old partial chip reset first: global reset `00000004 -> 00000004`, warm entry 0, reset cause 0, MHISTATUS, EE and
+     BHI status 0 afterwards; the result was identical to 3a's to the register.
+   - The morning's boots (wifi-l4b/l5b with physical addresses, l5ic/l6c with the window) ended with the same status and code;
+     the old rule ignored an all-ones status and waited 20 s, and nothing read the status before the doorbell.
+   Reading (inference unless marked):
+   - **No PCI-level error came with the refusal.** A read the root complex or the SMMU refused comes back as an Unsupported
+     Request or Completer Abort completion, which sets the requester's "received master/target abort" status bit and a device
+     status error bit; a read that is never answered ends in a completion timeout (AER bit 14), also with a device status bit; a
+     poisoned completion sets AER bit 12. None is set at either end; the AER status registers record an error whether or not
+     it is masked or reported (PCIe base specification), and 3a read them 3 s after the refusal, long after any completion
+     timeout (50 ms at most by default) would have expired. So either the boot loader never issued a read, or every read it
+     issued was answered with data. sheng saw a refusal *before* any transfer (a page-aligned address) leave the debug words at 0; here they name the
+     transfer, so most likely the transfer had started.
+   - **The bytes, by structure (evidence, offline):** the stock file Ubuntu pins (`xiaomipad-8pro-mainline` piano-wlan.json,
+     6930496 bytes, the size modem_a's has) is a signed 32-bit ARM ELF (seven program headers, the hash segment among them,
+     0x2e630 bytes of segments) padded with zeros to 512 KiB, then a Hexagon ELF exactly from 512 KiB to the end. BHI's 512 KiB and
+     BHIe's "second ELF" are what the mainline MHI host does with such a file (`mhi_fw_load_handler`: `sbl_size` over BHI; when an
+     ELF header follows at `sbl_size`, only the rest over BHIe), and ath12k configures this chip with a 512 KiB boot loader and
+     512 KiB segments. The size register is the 512 KiB the host writes too (it caps `sbl_size` at the file's size), the address
+     registers are written high then low as the host does, the session number is a non-zero 30-bit value as the host's is, and
+     the address is 32-bit as the host's coherent mask makes it. Whether the window **holds** those bytes was never measured:
+     NativeUfs's zero-copy read DMAs into the write-combined window's pages and invalidates by the destination address, and
+     nothing writes the window through a cacheable alias after its clean, so it should (inference); the fourth round hashes it.
+   - **What Ubuntu does before the doorbell that this driver did not** (ath12k `pci.c` power-up, the MHI host's
+     `mhi_prepare_for_power_up` / `mhi_async_power_up` / `mhi_ready_state_transition`, behaviour only):
+     (1) ath12k's whole power-on `sw_reset`: besides the four steps 3b ran, the chip's PARF LTSSM word set to `0x111`, the
+     hot-reset bit of its GCC (`0x1e65304`, the QCC2072 register set WCN7860 uses), the BHIe vector doorbell and status words, and
+     the **QFPROM power control's VDD4BLOW bit cleared** — the fuse-blow supply; the boot loader checks the image's signature
+     against key hashes it reads from those fuses, so this is the step that bears most directly on a signature refusal
+     (inference); (2) the BHIe receive block zeroed (its power-on values are undefined; piano's read garbage there);
+     (3) MSI enabled before MHI starts; (4) the MHI context registers, including the host's control and data address ranges, written
+     only once the device is READY — this driver wrote them before the doorbell (from the donors' note that the loader wanted them),
+     with a 36-bit range: the range registers are the one thing in this list the boot loader's DMA could consult (inference);
+     (5) the root port's unused I/O and prefetchable windows closed by the enumeration (bridge housekeeping: a window over the
+     image's address would have refused the reads with an error, which did not happen, so this one is not the cause).
+   - Not different, checked: the offsets (BHIEOFF `0x224` also matches ath12k's absolute vector offsets `0x360`…`0x39c`), the
+     order of the BHI writes, the session number, the size, the 512 KiB alignment, the window's address (sheng's working window
+     for the same chip family started at `0x10000000`, so a low IOVA is not it), the file.
+   Changed (`WifiPbl.h`, `WifiMhi.h`, `WifiBringup.h`; host tests in `tests/bringup_host.cpp`): (1)–(5) are now the default, each
+   with its A/B (`piano-wifi-socreset=0`, `piano-wifi-msi=0`, `piano-wifi-ctxearly=1`; step 307 always). Measured from now on, so
+   that the next failure decides between "never read" and "read and refused" (§8.4's table): the RAS DES counters of both ends
+   (reads sent and received, completions with and without data, UR/CA/completion timeouts), the MSI sink, the image hashed
+   through the window as the chip reads it (the boot loader against `c0e4bb91…`, the file against Ubuntu's `02bbc028…`), and the
+   boot loader's fuse-derived identity words (MSM hardware ID, OEM public key hash) as counts and a digest, never as values.
+   (needs-boot: §8.8 boots 4a, 4b)
 
 ## 11. Licence note
 
