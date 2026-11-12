@@ -31,6 +31,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOUserClient.h>
 #include <libkern/libkern.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -42,6 +43,7 @@
 #include "CameraRpmh.h"
 #include "CameraSurvey.h"
 #include "CameraPlan.h"
+#include "PianoCameraABI.h"
 #include "SpmiObserver.h"
 
 using namespace pianocamera;
@@ -76,6 +78,19 @@ struct Args {
 Args gArgs;
 char gPlanText[160];   // piano-camera-plan as given
 Plan gPlan;
+
+// Level 5 (the user client, first version: one capture per call; PianoCameraABI.h): the request words under gServeLock, the last
+// capture's description, and memory type 0 (the last capture's RAW10 frame, kRawCap bytes: the rear's 16 MiB frame buffer's worth).
+constexpr uint64_t kRawCap = 16ull << 20;
+IOLock *gServeLock;
+bool gRequestPending, gRequestDone, gServing;
+PianoCameraCaptureArgs gRequest;
+PianoCameraFrameInfo gInfo;
+IOBufferMemoryDescriptor *gRawMem;
+uint8_t *gRawBytes;
+bool gKeepFrame;      // the next level-3 frameReady copies the frame into gRawMem
+uint64_t gKept;       // the bytes it copied
+uint32_t gCaptures;
 
 uint32_t bootArg(const char *name, uint32_t fallback)
 {
@@ -827,6 +842,15 @@ class Ops {
     absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
     return ns / 1000;
   }
+  // Level 5: the stream's last frame (the write master stopped, the buffer invalidated by the statistics) into memory type 0.
+  void frameReady(const uint8_t *buf, const StreamResult &r)
+  {
+    const uint64_t n = uint64_t(r.stats.stride) * r.height;
+    gKept = 0;
+    if (!gKeepFrame || !gRawBytes || !n || n > kRawCap) return;
+    memcpy(gRawBytes, buf, n);
+    gKept = n;
+  }
   IOBufferMemoryDescriptor *tableMem = nullptr;
   const Survey *survey = nullptr;
   bool gccHeld = false;
@@ -891,6 +915,36 @@ void reportStream(const StreamResult &r)
              s.ch[3].mean(), aeVerdictShort(r.aeVerdict), r.exposure, r.gain, r.cleanOff ? "complete" : "incomplete");
 }
 
+// Level 5: the last capture's description from its stream's result.
+void fillInfo(const StreamResult &r)
+{
+  PianoCameraFrameInfo &i = gInfo;
+  const bool rear = r.which == Sensor::rear;
+  const ExposureFacts &f = rear ? kRearExposure : kFrontExposure;
+  memset(&i, 0, sizeof i);
+  i.version = kPianoCameraABIVersion;
+  i.status = gKept ? 0u : r.failedStep ? uint32_t(-r.failedStep) : 2u;
+  i.sensor = rear ? kPianoCameraRear : kPianoCameraFront;
+  i.width = r.width;
+  i.height = r.height;
+  i.stride = r.stats.stride;
+  i.bayer = rear ? kPianoCameraGRBG : kPianoCameraBGGR;
+  i.black = kRawBlack;
+  i.bytes = gKept;
+  i.exposure = r.exposure;
+  i.gain = r.gain;
+  i.gainUnit = f.gUnit;
+  i.aeVerdict = uint32_t(r.aeVerdict);
+  i.aeSamples = r.aeCount;
+  for (unsigned p = 0; p < 4; ++p) i.means[p] = r.stats.ch[p].mean();
+  i.sequence = ++gCaptures;
+  i.level = 5;
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+  i.timeNs = ns;
+  snprintf(i.verdict, sizeof i.verdict, "%s", gL3);
+}
+
 // ------------------------------------------------------------------------------------------- the sequence's objects, off the stack
 // One object in static storage, built in place for each use and destroyed after it (level 2's Session per cycle, level 3's Session
 // and Stream): a Session is 2.6 KiB with its survey copy, a Stream 1.9 KiB with its result, on a 16 KiB stack (see stackMark).
@@ -933,6 +987,7 @@ class PianoCamera : public IOService {
   OSDeclareDefaultStructors(PianoCamera)
   void run();
   bool sequence(char *verdict, size_t size);
+  void serve();
   static void thread(void *self, wait_result_t);
 
  public:
@@ -958,9 +1013,12 @@ bool PianoCamera::start(IOService *provider)
        gArgs.level, gArgs.sensor, gArgs.rearBus ? "gpio" : "cci", gArgs.mclk24, gArgs.cciKhz, gArgs.halfUs, gArgs.pull, gArgs.blind,
        gArgs.hold, gArgs.stop, gArgs.cycles, gArgs.delay, gArgs.cc, gArgs.mclkcc, gArgs.blocks, gArgs.qup, gArgs.spmi, gArgs.smmu,
        gArgs.votes, gArgs.mmcxFloor, gArgs.ae, gArgs.aeTarget);
-  if (gArgs.level > 3) {
-    note("piano-camera=%u: levels 4-5 are designed, not built (docs/drivers/camera.md section 4); running 3", gArgs.level);
-    gArgs.level = 3;
+  if (gArgs.level > 3) {   // 4 (the software ISP) lives in user space: both are level 5's kernel side
+    if (gArgs.level != 5) note("piano-camera=%u: level 4 is the user-space ISP (docs/drivers/camera.md 4.4); running 5", gArgs.level);
+    gArgs.level = 5;
+    note("level 5: the user client PianoCameraUserClient (a capture per call: the sensor up, the exposure loop, the last RAW10 frame "
+         "kept in memory 0, everything down; an administrator only)");
+    setProperty("IOUserClientClass", "PianoCameraUserClient");
   }
   if (gPlanText[0] && gPlan.error)
     note("plan: '%s' not run (%s): the survey only", gPlanText,
@@ -975,8 +1033,9 @@ bool PianoCamera::start(IOService *provider)
   if (gArgs.level == 1) note("level 1: loads only, nothing written (the SPMI observer's read command is the only store)");
   setProperty("piano-camera", gArgs.level, 32);
   gSequenceLock = IOLockAlloc();
+  gServeLock = IOLockAlloc();
   thread_t t = nullptr;
-  if (!gSequenceLock || kernel_thread_start(&PianoCamera::thread, this, &t) != KERN_SUCCESS) {
+  if (!gSequenceLock || !gServeLock || kernel_thread_start(&PianoCamera::thread, this, &t) != KERN_SUCCESS) {
     stage(-1, "no lock or no thread; nothing done");
     return true;
   }
@@ -1051,6 +1110,10 @@ void PianoCamera::run()
     return;
   }
   char verdict[240];
+  if (gArgs.level >= 5) {
+    serve();   // never returns
+    return;
+  }
   if (!gPlan.count) {
     sequence(verdict, sizeof verdict);
     cmdDbFree();
@@ -1130,6 +1193,7 @@ bool PianoCamera::sequence(char *verdict, size_t size)
     IOLockUnlock(gSequenceLock);
     reportResult(r.sensor);
     reportStream(r);
+    if (gKeepFrame) fillInfo(r);   // after reportStream: the description carries its result line
     setProperty("piano-camera-level3", gL3);
     stage(r.failedStep ? -6 : 6, r.ok ? "done (level 3)" : "done (level 3, see the lines above)");
     note("done: level 3 %s; %llu MMIO loads, %llu stores logged, %llu quiet stores, %u map failures", r.ok ? "ok" : "not ok",
@@ -1170,6 +1234,154 @@ bool PianoCamera::sequence(char *verdict, size_t size)
   if (gArgs.sensor == 3) snprintf(verdict, size, "rear %s; front %s", gResult[0], gResult[1]);
   else snprintf(verdict, size, "%s %s", kSensors[gArgs.sensor == 2 ? 1 : 0].name, gResult[gArgs.sensor == 2 ? 1 : 0]);
   return planGoesOn(clean, false);
+}
+
+// Level 5: the camera thread waits for a user client's capture (gRequest), runs it as a level-3 sequence with the request's sensor,
+// pattern and exposure loop (one frame after the loop), keeps the frame in memory type 0 and its description in gInfo, and is idle
+// (everything powered down) between captures.
+void PianoCamera::serve()
+{
+  gRawMem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryKernelUserShared),
+                                                     kRawCap, 16384);
+  gRawBytes = gRawMem ? static_cast<uint8_t *>(gRawMem->getBytesNoCopy()) : nullptr;
+  memset(&gInfo, 0, sizeof gInfo);
+  gInfo.version = kPianoCameraABIVersion;
+  gInfo.status = 1;
+  gInfo.level = 5;
+  if (!gRawBytes) {
+    stage(-7, "level 5: no memory for the frame (16 MiB); no user client");
+    return;
+  }
+  IOLockLock(gServeLock);
+  gServing = true;
+  IOLockUnlock(gServeLock);
+  stage(7, "level 5: ready for captures (PianoCameraUserClient)");
+  for (;;) {
+    IOLockLock(gServeLock);
+    while (!gRequestPending) IOLockSleep(gServeLock, &gRequestPending, THREAD_UNINT);
+    const PianoCameraCaptureArgs q = gRequest;
+    IOLockUnlock(gServeLock);
+    note("level 5: capture %u: the %s, %s, exposure loop %s (target %u)", gCaptures + 1, q.sensor == kPianoCameraFront ? "front" : "rear",
+         q.pattern ? "colour bars" : "the scene", q.ae ? "on" : "off", q.aeTarget ? q.aeTarget : gArgs.aeTarget);
+    const Args saved = gArgs;
+    gArgs.level = 3;
+    gArgs.sensor = q.sensor == kPianoCameraFront ? 2 : 1;
+    gArgs.pattern = q.pattern ? 1 : 0;
+    gArgs.ae = q.ae ? 1 : 0;
+    if (q.aeTarget) gArgs.aeTarget = clampArg(q.aeTarget, 16, 800);
+    gArgs.frames = 1;
+    gArgs.stop = 0;
+    gArgs.mclk24 = 1;
+    gKeepFrame = true;
+    gKept = 0;
+    char verdict[240];
+    sequence(verdict, sizeof verdict);
+    gKeepFrame = false;
+    gArgs = saved;
+    reportStack();
+    note("level 5: capture %u: %s; %llu bytes kept (status %u)", gInfo.sequence, gInfo.verdict, (unsigned long long)gInfo.bytes,
+         gInfo.status);
+    IOLockLock(gServeLock);
+    gRequestPending = false;
+    gRequestDone = true;
+    IOLockWakeup(gServeLock, &gRequestDone, false);
+    IOLockUnlock(gServeLock);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------------- the user client
+class PianoCameraUserClient : public IOUserClient {
+  OSDeclareDefaultStructors(PianoCameraUserClient)
+
+ public:
+  bool initWithTask(task_t owningTask, void *securityToken, UInt32 type, OSDictionary *properties) override;
+  IOReturn clientClose() override;
+  IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *a, IOExternalMethodDispatch *dispatch, OSObject *target,
+                          void *reference) override;
+  IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) override;
+};
+
+OSDefineMetaClassAndStructors(PianoCameraUserClient, IOUserClient)
+
+// An administrator only, in this version (the camera extension, sandboxed and not root, needs an entitlement check: camera.md 4.5).
+bool PianoCameraUserClient::initWithTask(task_t owningTask, void *securityToken, UInt32 type, OSDictionary *properties)
+{
+  if (clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) != kIOReturnSuccess) return false;
+  return IOUserClient::initWithTask(owningTask, securityToken, type, properties);
+}
+
+IOReturn PianoCameraUserClient::clientClose()
+{
+  if (!isInactive()) terminate();
+  return kIOReturnSuccess;
+}
+
+// One capture: posted to the camera thread, waited for (at most the request's timeout); one at a time.
+static IOReturn capture(const PianoCameraCaptureArgs &args, PianoCameraFrameInfo &out)
+{
+  IOLockLock(gServeLock);
+  if (!gServing) {
+    IOLockUnlock(gServeLock);
+    return kIOReturnNotReady;
+  }
+  if (gRequestPending) {
+    IOLockUnlock(gServeLock);
+    return kIOReturnBusy;
+  }
+  gRequest = args;
+  gRequestDone = false;
+  gRequestPending = true;
+  IOLockWakeup(gServeLock, &gRequestPending, false);
+  uint64_t deadline = 0;
+  clock_interval_to_deadline(args.timeoutMs ? args.timeoutMs : 20000, kMillisecondScale, &deadline);
+  while (!gRequestDone) {
+    if (IOLockSleepDeadline(gServeLock, &gRequestDone, deadline, THREAD_UNINT) == THREAD_TIMED_OUT && !gRequestDone) {
+      IOLockUnlock(gServeLock);
+      return kIOReturnTimeout;   // the capture goes on; a later info call reads its result
+    }
+  }
+  out = gInfo;
+  IOLockUnlock(gServeLock);
+  return kIOReturnSuccess;
+}
+
+IOReturn PianoCameraUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a, IOExternalMethodDispatch *, OSObject *,
+                                               void *)
+{
+  if (!a || !a->structureOutput || a->structureOutputSize < sizeof(PianoCameraFrameInfo)) return kIOReturnBadArgument;
+  PianoCameraFrameInfo info;
+  IOReturn rc = kIOReturnSuccess;
+  switch (selector) {
+  case kPianoCameraInfo:
+    IOLockLock(gServeLock);
+    info = gInfo;
+    IOLockUnlock(gServeLock);
+    break;
+  case kPianoCameraCapture: {
+    PianoCameraCaptureArgs args;
+    if (!a->structureInput || a->structureInputSize != sizeof args) return kIOReturnBadArgument;
+    memcpy(&args, a->structureInput, sizeof args);
+    if (args.version != kPianoCameraABIVersion || (args.sensor != kPianoCameraRear && args.sensor != kPianoCameraFront))
+      return kIOReturnBadArgument;
+    rc = capture(args, info);
+    if (rc) return rc;
+    break;
+  }
+  default:
+    return kIOReturnUnsupported;
+  }
+  memcpy(a->structureOutput, &info, sizeof info);
+  a->structureOutputSize = sizeof info;
+  return rc;
+}
+
+IOReturn PianoCameraUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
+{
+  if (type != kPianoCameraMemoryRaw || !gRawMem) return kIOReturnBadArgument;
+  gRawMem->retain();
+  *memory = gRawMem;
+  *options = kIOMapReadOnly;
+  return kIOReturnSuccess;
 }
 
 // A sequence is short (well under a second) and always ends powered down: a power transition only waits for it.

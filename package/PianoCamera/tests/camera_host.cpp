@@ -17,6 +17,8 @@
 #include "CameraSurvey.h"
 #include "CameraStream.h"
 #include "CameraPlan.h"
+#include "CameraIsp.h"
+#include "PianoCameraABI.h"
 #include "CameraTables.h"
 #include <algorithm>
 #include <cstdarg>
@@ -2188,6 +2190,59 @@ static void testExposureLoop()
   CHECK(e == 100 && g == 32);
 }
 
+// Level 5's pieces off the tablet: the stream's last frame handed to ops.frameReady (the kernel copies it into memory type 0), and
+// the first software ISP (CameraIsp.h) on it and on a synthetic frame: the Bayer orders, grey world, the digital gain, the sizes.
+static void testIsp()
+{
+  CHECK(pianoBayerChannel(kPianoCameraGRBG, 0, 0) == 1 && pianoBayerChannel(kPianoCameraGRBG, 0, 1) == 0 &&
+        pianoBayerChannel(kPianoCameraGRBG, 1, 0) == 2 && pianoBayerChannel(kPianoCameraBGGR, 0, 0) == 2 &&
+        pianoBayerChannel(kPianoCameraBGGR, 1, 1) == 0 && pianoBayerChannel(kPianoCameraRGGB, 0, 0) == 0);
+  // GRBG 64 x 32, R 400, G 200, B 100 above black (64), packed with a padded stride
+  const uint32_t w = 64, h = 32, stride = raw10Bytes(w) + 16;
+  std::vector<uint8_t> raw(stride * h, 0);
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; x += 4) {
+      uint8_t g[5] = {};
+      for (uint32_t k = 0; k < 4; ++k) {
+        const int ch = pianoBayerChannel(kPianoCameraGRBG, y & 1, (x + k) & 1);
+        const uint32_t v = 64 + (ch == 0 ? 400 : ch == 1 ? 200 : 100);
+        g[k] = uint8_t(v >> 2);
+        g[4] |= uint8_t((v & 3u) << (2 * k));
+      }
+      std::memcpy(&raw[y * stride + x / 4 * 5], g, 5);
+    }
+  CHECK(pianoRaw10(&raw[0], 0) == 264 && pianoRaw10(&raw[0], 1) == 464 && pianoRaw10(&raw[stride], 0) == 164);
+  for (uint32_t scale : {1u, 2u}) {
+    const uint32_t ow = w / 2 / scale, oh = h / 2 / scale;
+    std::vector<float> work(ow * oh * 3);
+    std::vector<uint8_t> rgb(ow * oh * 3);
+    PianoIspStats st;
+    CHECK(pianoIsp(raw.data(), w, h, stride, kPianoCameraGRBG, 64, scale, work.data(), rgb.data(), &st) == 0);
+    CHECK(st.width == ow && st.height == oh && std::fabs(st.mean[0] - 400) < 0.5f && std::fabs(st.mean[1] - 200) < 0.5f &&
+          std::fabs(st.mean[2] - 100) < 0.5f && std::fabs(st.gain[0] - 0.5f) < 0.01f && std::fabs(st.gain[2] - 2.f) < 0.01f);
+    CHECK(rgb[0] == rgb[1] && rgb[1] == rgb[2] && rgb[0] > 200);   // grey after the balance, put near the top by the digital gain
+  }
+  CHECK(pianoIsp(raw.data(), 2, 2, stride, 0, 64, 1, nullptr, nullptr, nullptr) == -1);
+  uint8_t img[4 * 2 * 3] = {}, thumb[2 * 1 * 3] = {};
+  for (unsigned i = 0; i < sizeof img; ++i) img[i] = uint8_t(i < 12 ? 10 : 200);   // the first row dark, the second bright
+  pianoThumb(img, 4, 2, 2, 1, thumb);
+  CHECK(thumb[0] == 105 && thumb[3] == 105);
+  // the model's front scene: the kept frame is the stream's last, the ISP reads it as BGGR
+  L3Rig r;
+  r.b.scene[1] = 5;
+  const StreamResult res = r.run(Sensor::front);
+  CHECK(res.ok && r.ops.kept.size() == uint64_t(res.stats.stride) * res.height && res.stats.stride == 4080);
+  if (r.ops.kept.size() == uint64_t(res.stats.stride) * res.height) {
+    const uint32_t ow = res.width / 2 / 4, oh = res.height / 2 / 4;
+    std::vector<float> work(ow * oh * 3);
+    std::vector<uint8_t> rgb(ow * oh * 3);
+    PianoIspStats st;
+    CHECK(pianoIsp(r.ops.kept.data(), res.width, res.height, res.stats.stride, kPianoCameraBGGR, 64, 4, work.data(), rgb.data(), &st) == 0);
+    // the model's positions 0..3 (B G G R for BGGR) add 0..3 to the scene: R is the brightest, B the darkest
+    CHECK(st.width == 408 && st.height == 229 && st.mean[0] > st.mean[1] && st.mean[1] > st.mean[2] && st.mean[1] > 100);
+  }
+}
+
 // The plan (CameraPlan.h): the names parse to their images' arguments; on one board (c1's tablet) c3rp, c2fx, c3r, c3rs and c3f run
 // one after another, each from what the one before left (the SMMU words the release keeps, PLL0's configuration), each with its
 // power-down complete, the board as found after the last.
@@ -2271,6 +2326,7 @@ int main()
   testL3Teardown();
   testL3Diagnostics();
   testExposureLoop();
+  testIsp();
   testPlan();
   if (failures) {
     std::printf("camera_host: %d check(s) FAILED\n", failures);

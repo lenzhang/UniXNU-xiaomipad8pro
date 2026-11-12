@@ -57,12 +57,21 @@ image() {
     # colour bars (the stream's regression check).
     cplan) A="piano-camera=3 piano-camera-plan=c3rp,c2f,c3r,c3rs,c3f piano-camera-delay=20" ;;
     cae)   A="piano-camera=3 piano-camera-plan=c3r,c3rs,c3f piano-camera-delay=20" ;;
+    # Level 5's first version: the user client, and piano-camera-grab's boot job capturing both cameras through it (front, then
+    # rear) with their thumbnails on the console. Needs the userland's seed: CAM_SEED=out/userland/stage/scratch-data.img
+    # CAM_TRUST=out/userland/stage/kernel.macho.trustcache (tooling/userland/stage.py); refused with a seed that lacks the tool.
+    c5)    A="piano-camera=5 piano-camera-grab=1 piano-camera-delay=20" ;;
     *) return 1 ;;
   esac
 }
 COMMON=(--fd "$FD" --fd-name A-bundled --kc "$KC" --trust "$TRUST" --seed "$SEED" --adt "$ADT" --utc "$(date +%s)")
 for n in ${*:-$ORDER}; do
-  image "$n" || { echo "build-camera-test-images: no image $n (one of: $ORDER)" >&2; exit 2; }
+  image "$n" || { echo "build-camera-test-images: no image $n (one of: $ORDER c5)" >&2; exit 2; }
+  if [ "$n" = c5 ] && ! grep -q '/usr/local/bin/piano-camera-grab' "$(dirname "$SEED")/userland.json" 2>/dev/null; then
+    echo "build-camera-test-images: c5 needs the userland's seed with piano-camera-grab (CAM_SEED=out/userland/stage/scratch-data.img" \
+         "CAM_TRUST=out/userland/stage/kernel.macho.trustcache after tooling/userland/stage.py)" >&2
+    exit 2
+  fi
   PIANO_FAST_BOOT=1 PIANO_MENU_TIMEOUT=0 PIANO_RESET_AFTER=300 PIANO_EXTRA_ARGS="$PROFILE $A ${CAM_EXTRA:-}" \
     python3 tooling/bootimg/build-ram-images.py "${COMMON[@]}" --out "out/ram-cam-$n" | tail -1
 done

@@ -93,6 +93,26 @@ dest = "/usr/local/bin/piano-torch"
 mode = "0755"
 
 [[unit]]
+name = "piano-camera-grab"
+about = "one capture per camera through PianoCamera's user client (docs/drivers/camera.md section 4.5): sudo piano-camera-grab [front|rear|both] writes /private/var/tmp/piano-camera-<sensor>.ppm; its job runs once at boot only with the kernel arguments piano-camera=5 piano-camera-grab=1 and prints its results and thumbnails on the console"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-camera-grab/piano-camera-grab.c"
+build = "cc"
+arch = "arm64"
+cflags = ["-I", "package/PianoCamera"]
+frameworks = ["IOKit", "CoreFoundation"]
+dest = "/usr/local/bin/piano-camera-grab"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/native/piano-camera-grab/com.unixnu.piano-camera-grab.plist"
+build = "copy"
+dest = "/Library/LaunchDaemons/com.unixnu.piano-camera-grab.plist"
+mode = "0644"
+
+[[unit]]
 name = "piano-pmset-defaults"
 about = "the recommended pmset timers (docs/policy.md section 7) set once per power source, unless the owner set that source's timers first"
 default_on = true

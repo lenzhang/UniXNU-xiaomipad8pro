@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- UniXNU-piano: one capture of each camera at boot through PianoCamera's user client (docs/drivers/camera.md section 4.5), its
+     results and thumbnails on the console. Only with the kernel boot arguments piano-camera=5 piano-camera-grab=1: otherwise
+     piano-camera-grab exits at once with status 0. Runs once (no KeepAlive). Install as
+     /Library/LaunchDaemons/com.unixnu.piano-camera-grab.plist (root:wheel 644) with /usr/local/bin/piano-camera-grab
+     (configs/userland.toml installs both). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.unixnu.piano-camera-grab</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/piano-camera-grab</string>
+    <string>--boot</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/dev/console</string>
+  <key>StandardErrorPath</key><string>/dev/console</string>
+</dict>
+</plist>
