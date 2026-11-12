@@ -142,7 +142,7 @@ gets an invalid connection at once): `com.apple.watchdogd`, `com.apple.mobileact
 `com.apple.PerfPowerServices` (and `com.apple.audiomxd` in quiet), with `k27-deny-exec` for watchdogd and PerfPowerServices as well
 in case a 27.0.1 label differs. And `/Library/Preferences/com.apple.keyboardtype.plist` with our two keyboards as ANSI (`20555-6900-0`
 the cover, `20565-6900-0` PianoDwc3's: product-vendor-0 => 40), written by the boot job as root, so Keyboard Setup Assistant does not
-ask. Risk (inference): a client that needs one of those daemons fails at once instead of finding a crashing or spinning one; none
+ask (inference: the preference administrators pre-set for the same purpose; checklist step 3 checks it). Risk (inference): a client that needs one of those daemons fails at once instead of finding a crashing or spinning one; none
 of them answered before either. The plain image is the A/B partner.
 
 ## 3. The desktop image
@@ -207,16 +207,20 @@ so no seed change: there the same quieting is the owner's, once, in Terminal (ea
 The owner types his password himself, on the cover. Console: `python3 tooling/native/usb-console.py --capture 3640` from the boot;
 afterwards `python3 tooling/native/boot-timeline.py logs/usb-console/<ts>-port0.times.txt --loop <loop.log>`.
 
-1. **Boot `ram-desk`.** At the login window (T ~110-150): the pointer visible and following the cover's touchpad; the menu bar
+1. **Boot `ram-desk`.** No kernel text on the panel while it boots (no `-v`: the console is on the Mac only). At the login window
+   (T ~110-150): the pointer visible and following the cover's touchpad; the menu bar
    clock shows today's time (the RTC calendar; a wrong date: rebuild without `DESK_RTC_OFFSET`). Console: `PianoKeyboard: start:
-   piano-keyboard=2`, `touchpad: a tap at most 220 ms ...`, no `Denying core dump for pid N (watchdogd)`, no `xprotectd`, no
-   `xpcproxy status 0x4e00` every 10 s, no `caught burning CPU` for PerfPowerServices.
+   piano-keyboard=2`, `touchpad: a tap at most 220 ms ...`, no `Denying core dump for pid N (watchdogd)` (before: one every
+   10 s), and 3 minutes in no `caught burning CPU` for PerfPowerServices. (desk has no exec-log, so spawns are not on the console:
+   the disabled jobs are checked in Terminal after the login, `launchctl print-disabled system | grep -E
+   'watchdogd|mobileactivation|xprotectd|PerfPower'`, or by the diag image's report.)
 2. **Touch screen at the login window**: tap the user / the password field, the four corners and the middle. Each tap lands under
    the finger (Y not mirrored), and logs `gesture: tap -> click (N ms, M px at most from the landing)`: note the largest M. Watch
    for `frames: watchdog`: after a download the line `frames: the first edge N ms after start S` should follow and the touch come
    back. If watchdog lines never stop: next boot with `DESK_EXTRA="piano-touch-idle=0"`, then `DESK_TOUCH=0`.
-3. **Log in on the cover.** Note the time from Return to the desktop (stopwatch); the console's `exec: pid N authorizationhos`
-   and its exit (13 s before). Expected: no garbled frame (current NativeGopDisplay), no Keyboard Setup Assistant window.
+3. **Log in on the cover.** Note the time from Return to the desktop (stopwatch: 47-73 s before; diag's exec-log dates
+   authorizationhost, 13 s before). Expected: no garbled frame (current NativeGopDisplay), no Keyboard Setup Assistant window
+   (the keyboard type written by the boot job; if it still asks, answer it and note the keyboard it names).
 4. **Set a still wallpaper** (System Settings › Wallpaper, a photo or a colour, not a video one) and note whether the desktop is
    more responsive (Dock magnification, opening Finder). On volatile Data it lasts this boot only.
 5. **Clicks on the cover touchpad**: one-finger press with the thumb resting at the bottom edge → left click (console: `pressed
