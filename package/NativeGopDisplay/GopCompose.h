@@ -294,6 +294,28 @@ inline DirtyRegion dirtyRegion(bool valid, const uint32_t *words, uint32_t panel
                      panelRect(panelWidth, panelHeight));
   return d;
 }
+// The swaps programmed must follow one another: a region names what changed since the frame before it, so a swap that never reached
+// the driver (the family drops obsolete, aborted, no-op and dummy swaps in clean_queue_gated, the driver those with drop reasons; a
+// cancelled one never comes) takes its change along. The family numbers the swaps it starts (+980, one after the other, cursor swaps
+// included): a programmed swap whose number does not follow the last one makes the next frame whole (the gap may have been a frame
+// even when the swap after it moves only the cursor; also the first swap, and a number that goes back). Spurious gaps (a cancelled
+// swap) only cost a whole composition.
+struct SwapSequence {
+  bool have = false, gap = true;
+  uint32_t last = 0;
+  void next(uint32_t id)   // every programmed swap, in order
+  {
+    if (!have || id != last + 1) gap = true;
+    have = true;
+    last = id;
+  }
+  bool takeGap()           // a new frame: whether a swap went missing since the last frame (then it is whole)
+  {
+    const bool g = gap;
+    gap = false;
+    return g;
+  }
+};
 // Up to kAuditPoints panel pixels outside a plan's rectangles and the cursor's old and new rectangles (where the panel must still
 // show the frame before: the dirty region said nothing changed there), spread over the panel by a small generator whose state the
 // caller keeps (each job samples other points). The caller compares each point's composition from the new frame with the panel.

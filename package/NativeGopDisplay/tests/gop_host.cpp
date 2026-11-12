@@ -785,6 +785,21 @@ static void testDamage()
   addRect(q, Rect{0, 200, 1, 1});
   addRect(q, Rect{0, 300, 1, 1});
   CHECK(q.count == 3);
+  // the swap numbers: the first frame, a gap (even one a cursor swap hides), a number that goes back
+  SwapSequence seq;
+  seq.next(5);
+  CHECK(seq.takeGap() && !seq.takeGap());
+  seq.next(6);
+  CHECK(!seq.takeGap());
+  seq.next(8);   // 7 never came (a cursor swap or a frame: unknown)
+  seq.next(9);
+  CHECK(seq.takeGap() && !seq.takeGap());
+  seq.next(9);   // back or repeated
+  CHECK(seq.takeGap());
+  seq.next(10);
+  seq.next(0xffffffffu);
+  seq.next(0);   // wraps
+  CHECK(seq.takeGap());
   // the damage verdict and the idle tick
   CHECK(damageAllowed(true, true, false) && !damageAllowed(false, true, false) && !damageAllowed(true, false, false) &&
         !damageAllowed(true, true, true));
@@ -828,13 +843,15 @@ struct Config {
   int dirty = 0;
   bool damageMode = false;
   int64_t fullPeriod = 400000;
+  unsigned dropOneIn = 0;    // the family drops a queued frame swap that a newer frame swap follows, one in N (0: never)
+  bool gapGuard = true;      // the driver makes a frame whole after a swap-number gap (SwapSequence)
 };
 struct Result {
   unsigned torn = 0, garbage = 0, idleChecks = 0, idleMismatches = 0, timeouts = 0, frames = 0, swaps = 0, deferred = 0;
   unsigned copies = 0, cursorJobs = 0, skippedRefresh = 0, flips = 0, flippedWithCursor = 0;
   unsigned unfinished = 0, retries = 0, aborted = 0, earlyCompletions = 0;
   unsigned behind = 0, stalled = 0;   // swap_begin_gated left a swap queued behind a waiting one / with none current
-  unsigned damageCopies = 0, auditTrips = 0, auditPoints = 0, periodic = 0;
+  unsigned damageCopies = 0, auditTrips = 0, auditPoints = 0, periodic = 0, familyDrops = 0, gaps = 0;
   int64_t damageArea = 0, copiedArea = 0;   // pixels composed by damage copies / by every frame's composition
   bool finalMatches = false;
 };
@@ -889,6 +906,7 @@ private:
   };
   struct FamilySwap {
     SwapLayers layers;
+    uint32_t id = 0;   // the family's number (+980): one after the other
   };
   Config cfg;
   std::mt19937 random;
@@ -901,6 +919,8 @@ private:
   Result result;
   // the family
   std::deque<FamilySwap> queue;
+  uint32_t nextId = 0;
+  SwapSequence sequence;
   bool hasCurrent = false;
   FamilySwap current;
   LayerState shown;   // what the family has on screen (completed swaps)
@@ -1060,7 +1080,7 @@ private:
   // ---------------------------------------------------------------- the family
   void submit(const SwapLayers &l)
   {
-    queue.push_back({l});
+    queue.push_back({l, ++nextId});
     result.swaps++;
     swapBegin();
   }
@@ -1081,6 +1101,12 @@ private:
   {
     framesThisCall = 0;
     while (!hasCurrent && !queue.empty()) {
+      // dropObsoleteSwaps_gated, as far as it matters here: a queued frame that a newer queued frame replaces may never be shown
+      if (cfg.dropOneIn && queue.size() >= 2 && queue[0].layers.mask == 1 && queue[1].layers.mask == 1 && random() % cfg.dropOneIn == 0) {
+        queue.pop_front();
+        result.familyDrops++;
+        continue;
+      }
       current = queue.front();
       queue.pop_front();
       hasCurrent = true;
@@ -1112,6 +1138,11 @@ private:
   }
   void program()
   {
+    sequence.next(current.id);   // program_hardware_gated: a frame after a gap in the numbers is whole
+    if ((current.layers.mask & 1) && current.layers.surface[0] && sequence.takeGap() && current.layers.dirty.known && cfg.gapGuard) {
+      current.layers.dirty.known = false;
+      result.gaps++;
+    }
     LayerChange change;
     const Job job = pipe.swapJob(current.layers, true, submitted, cfg.flipMode, &change);
     currentJob = job.kind != Job::kNone ? job.serial : 0;
@@ -1474,6 +1505,28 @@ static void testSimulation()
     if (seed == 1)
       std::printf("sim damage, a region that leaves changes out: the audit tripped after %u damage copies; %u idle mismatches before\n",
                   r.damageCopies, r.idleMismatches);
+  }
+  // The family drops queued frames (dropObsoleteSwaps_gated): the next frame's region does not name the dropped one's change. With
+  // the swap numbers' gap rule the frame after a drop is whole and nothing is missed; without it the audit has to catch it.
+  for (unsigned seed = 1; seed <= 6; seed++) {
+    Config c;
+    c.seed = seed;
+    c.dirty = 1;
+    c.damageMode = true;
+    c.dropOneIn = 2;
+    c.frameMin = 2000;   // frames faster than the copies: they queue behind one another, so the family has some to drop
+    c.frameMax = 12000;
+    const Result r = World(c).run();
+    CHECK(r.familyDrops > 0 && r.gaps > 0);
+    CHECK(r.auditTrips == 0 && r.idleMismatches == 0 && r.finalMatches && r.torn == 0 && r.garbage == 0);
+    CHECK(r.damageCopies > 0);
+    Config unguarded = c;
+    unguarded.gapGuard = false;
+    const Result u = World(unguarded).run();
+    CHECK(u.familyDrops > 0 && u.finalMatches);   // the audit or the whole compositions mend it, but only after the fact
+    if (seed == 1)
+      std::printf("sim damage, the family drops frames: %u dropped, %u frames whole after a gap, %u audit trips (without the gap rule: "
+                  "%u trips, %u idle mismatches)\n", r.familyDrops, r.gaps, r.auditTrips, u.auditTrips, u.idleMismatches);
   }
   {   // a slow GPU: frames whose fence wait gave up are never composed from their damage (whole, once finished), and it ends right
     Config c;

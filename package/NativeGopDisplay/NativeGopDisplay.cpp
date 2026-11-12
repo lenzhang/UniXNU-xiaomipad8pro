@@ -366,6 +366,8 @@ private:
     uint64_t fWholeNoRegion, fWholeUncovered, fWholePeriodic, fWholeOther;
     uint64_t fAuditSamples, fAuditMismatches;
     bool fAuditFailedNow;                     // copy thread: the job's audit found a pixel the region did not name
+    gopcompose::SwapSequence fSequence;       // the swaps programmed, by number: a gap makes the next frame whole
+    uint64_t fSwapGaps;
     int32_t fAuditX, fAuditY;
     uint32_t fAuditShown, fAuditWanted, fAuditBad, fAuditCount;
     void publishDisplayPower(bool on);
@@ -1285,6 +1287,7 @@ void NativeGopDisplay::program_hardware_gated()
         memcpy(&layers.x1, reinterpret_cast<const uint8_t *>(swap) + kSwapLayer1X, sizeof(layers.x1));
         memcpy(&layers.y1, reinterpret_cast<const uint8_t *>(swap) + kSwapLayer1Y, sizeof(layers.y1));
     }
+    fSequence.next(swapID);
     if ((layers.mask & 1) && layers.surface[0]) {   // a new frame: what of it changed, if the swap says (unaligned words)
         uint32_t dirty[4];
         memcpy(dirty, reinterpret_cast<const uint8_t *>(swap) + kSwapDirtyRegion, sizeof(dirty));
@@ -1294,6 +1297,13 @@ void NativeGopDisplay::program_hardware_gated()
         if (layers.dirty.known) {
             fDirtyFrames++;
             fDirtyFramesAll++;
+        }
+        // A swap that never reached this driver since the last frame (dropped, aborted, cancelled) took its change along: whole.
+        if (fSequence.takeGap() && layers.dirty.known && fFrames) {
+            layers.dirty.known = false;
+            if (++fSwapGaps <= 4 || fSwapGaps % 100 == 0)
+                GOPLOG("damage: swap %u does not follow the last one programmed (%llu such gaps): its frame is composed whole\n", swapID,
+                       fSwapGaps);
         }
         // The first regions, with the layer's own rectangles beside them (what WindowServer means by them is read from these lines).
         if (fDamageMode && (valid || fDirtyLogs < 2) && fDirtyLogs < 12) {
