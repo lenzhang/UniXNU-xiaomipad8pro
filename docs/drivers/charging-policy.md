@@ -623,6 +623,8 @@ every native boot of 11-11 and 11-12 with PianoPower (46 at level 1, 17 at level
   seconds of its boot), or a termination or inhibit decision; a fixed time after the boot stages fits the ~40 s better than any event
   of ours. Not excluded: that this firmware does not charge from a computer port (CDP) at all; Ubuntu has no computer-port result
   ([device.md](../ubuntu-history/device.md) §2.5), every native run was on the Mac's port.
+- **2026-11-12 evening:** the charger watchdog is the hypothesis with the most support (the CHGR state byte reads full-on → disabled
+  at the stop, the 40 s fits a 32 s bark + 8 s bite); the fix (pet it, clear "a bite disables charging") is §18.
 
 ### 17.3 The fix as built (ChargePolicy.c, `piano-power-policy=1`)
 
@@ -707,3 +709,104 @@ current, the percentage rising; `kick-idle` with more battery current than `kick
 2. Start the DSP before the stop (`piano-power-delay=0`, the bring-up still takes ~30 s; or a shorter firmware read): charging from
    the first write would say the stop is something the firmware prevents when it runs early, as under Linux.
 3. A wall charger (DCP or PD) instead of the Mac's port: whether a computer port is the condition.
+
+## 18. The charger watchdog (2026-11-12 evening; built, not run)
+
+The hypothesis for §17.2's stop: the charger PMIC's BARK/BITE watchdog. In Qualcomm's SCHG charger family a host must pet a watchdog
+in the MISC block; its configuration can make a bite **disable charging** (input kept on), and the boot stages leave it armed. Natively
+nothing pets it (our FD's charger DXE pets none, §0 of [charging.md](charging.md); the DSP starts after the stop or not at all), so
+the bite ends charging ~40 s into every boot and it stays so. **M** = measured, **I** = inferred, **F** = a register fact of another
+generation of the family.
+
+### 18.1 Register facts and where they are on piano
+
+Read for the facts only (no code copied): Linux's `drivers/power/supply/qcom_smbx.c` (GPL-2.0, PMI8998: the family's one mainline host
+driver) and the PM8150B DT (`pm8150b.dtsi`: vbus regulator @1100, Type-C @1500 for the charger @1000).
+
+| Block, register | Fact (F) | On piano (I) |
+|---|---|---|
+| MISC +0x43 `BARK_BITE_WDOG_PET` | bit 0 pets | 0x2c43 |
+| MISC +0x51 `WD_CFG` | 7 AFP on a bite, 6 bark irq, 5 bite irq, 4:3 safety timer after the irq, 2 the irq starts it, 1 timer on at plug-in, 0 timer on | 0x2c51 |
+| MISC +0x53 `SNARL_BARK_BITE_WD_CFG` | **7 a bite disables charging**, 6:4 snarl, 3:2 bark 16 s << n (16/32/64/128), 1:0 bite 1 s << n (1/2/4/8) | 0x2c53 |
+| CHGR +0x06 `BATTERY_CHARGER_STATUS_1` | 2:0 state: 0 trickle, 1 pre, 2 fast, 3 full-on, 4 taper, 5 terminated, 6 inhibited, 7 disabled | 0x2606 |
+| CHGR +0x42, +0x51 | charging enable command bit 0; `CHGR_CFG2` (7 enable by command, 0 inhibit) | 0x2642, 0x2651 |
+| Block order | CHGR, DCDC +0x100, BATIF +0x200, USBIN +0x300, DCIN +0x400, Type-C +0x500, MISC +0x600 | CHGR = Type-C − 0x500 = 0x2600, MISC = Type-C + 0x100 = 0x2c00 |
+
+The Type-C block at 0x2b00 is verified (attach, CC, Rp in every boot). The MISC offsets are the same in two generations (PMI8998's
++0x643 from the charger base, the vendor SMB5 MISC + 0x43/0x51/0x53), hence the best guess for PMIH010x; this generation's own map is
+not public. ChargerPmic.h's names (from SunUEFI) call 0x2600 "DCDC" and 0x2800 "USBIN"; in this layout they are CHGR and BATIF.
+
+### 18.2 Evidence
+
+For:
+- **The state byte (M + decode I).** 0x2600 +0x06 read `c3`/`83` while the packs took +470 mA and `87` from the stop on, in this
+  boot (`v3-boot2`: `dcdc c3 19 02 03 00 be 14 28` at 0 and 30 s, `87 00 0a 03 05 be 00 38` from 60 s) and in the 01:48 run at 5 s
+  resolution (§17.2). Bits 2:0 go 3 → 7: **full-on → disabled**, not terminated (5) or inhibited (6), and the input stays up (the
+  system runs from USB; at level 2 the firmware's bus current flows). A bite that disables charging does exactly that.
+- **The timing (M).** ~40 s of uptime in every native boot, at both levels, whatever the load (idle login window or a busy boot):
+  a fixed timer, not an event of ours. Bark 32 s + bite 8 s = 40 s in the family's encodings (I, a fit, not a measurement).
+- **Ownership (M).** The charger complex's APIDs are EE 0's: this processor is the charger's host as far as the arbiter is concerned,
+  which is where a host watchdog is expected to be petted from.
+- **Level 2 does not recover (M)**: a latched bite fits a firmware that, started after it, reads its own enable 1 and changes nothing.
+
+Not yet known (the next boot logs it): MISC's configuration itself. No log has ever read 0x2c00. The status bytes past +0x06 do not
+decode sensibly with PMI8998's layout (+0x0d `28` → `38` would be "too cold"), so this generation's status map differs in places; the
+MISC offsets are the guess with the most support, not a certainty. The fall over 28-38 s (477 → 463 → 328 → 0 mA) is the gauge's ~1 s
+average catching a step.
+
+### 18.3 The fix as built (`ChargerWdog.h`, PianoPower at both levels, default on)
+
+`piano-power-wdog=2` (default): right after the SPMI probe, before the gauges (PianoPower starts in the first seconds of XNU's uptime:
+its `[30s]` report still shows the packs charging; the stop is at ~40 s), PianoPower locates CHGR and MISC from the Type-C block, logs the watchdog as the boot stages left it, clears **bit 7 of
+MISC +0x53 alone** (read-modify-write, read back; Linux's PMI8998 driver writes the whole register 0 and clears AFP/plug-in/bark in
+`WD_CFG`; we keep the timer, its timeouts and `WD_CFG` as they are) and pets the watchdog at once, then every quarter of the bark time
+(4-15 s; 8 s for a 32 s bark) from its own thread (one SPMI write; the thread already wakes every 30 s). `=1` pets only (the vendor
+driver's way); `=0` reads and logs only. The clear is tried at most three times per boot, never once the DSP runs (level 2: its
+firmware owns the configuration from then; the pets go on). With the bit clear a stop is also impossible while the system sleeps and
+the thread cannot pet.
+
+Gates before any write: MISC present at Type-C + 0x100, owner EE 0, TYPE 0x02 (every SCHG block's; ChargerPmic.h's charger block is
+one), its configuration read; a pet only while `WD_CFG` reads armed (bit 0 or 1), the clear only then and while bit 7 is set. The
+allowlist (`ChargerWdog::allowed`): MISC +0x43 = 0x01 and MISC +0x53 = (its value without bit 7); the write channel mapped is MISC's
+page alone. The float voltage, charge and input currents, JEITA, the safety timer and the enable command are not written. Worst case
+if the map is wrong: one write of 0x01 to a register 0x2c43 and bit 7 of 0x2c53 cleared, logged with before/after.
+
+Log lines (all `PianoPower: `):
+
+```
+wdog: piano-power-wdog=2 (pet and clear the bite's charging stop); CHGR 0x2600 (APID 702, EE 0, type 02/..), MISC 0x2c00 (APID 708, ...)
+wdog: as the boot stages left it: WD_CFG (+0x51) 0x.. (timer on, on plug-in on, ...), timeouts (+0x53) 0x.. (a bite DISABLES charging,
+  bark 32 s, bite 8 s, ...); MISC rt ..; CHGR state 3 (full-on), +0x42 enable command .., +0x51 cfg2 ..
+wdog: start: MISC 0x2c00 +0x53 0x87 -> 0x07 (bit 7, a bite disables charging, cleared; bark 32 s, bite 8 s kept): ok, read back 0x07
+wdog: first: MISC 0x2c00 +0x43 = 0x01 (pet): ok (channel status 0x1)
+wdog: petting every 8000 ms from this thread (a quarter of the 32 s bark time, 4-15 s)
+charger block 0x2200: APID 698 EE 0, type 02/ba, +06 ..., rt .., +51..53 .. .. ..      (one per block 0x2200-0x2f00, once)
+[30s] wdog: WD_CFG .. timeouts .. (bite does not disable charging), MISC ... ; CHGR state 3 (full-on) ...; pets 5 (0 failed), clears 1
+[30s] charging: in ? (level 1: ...), battery +470 mA at 4287 mV (2.0 W); charging; CHGR state 3 (full-on); wdog pets 5
+```
+
+### 18.4 Tests (host)
+
+`power_host` `testWdog`: piano's complex (charger block 0x2200 subtype 0xba, CHGR 0x2600, Type-C 0x2b00, MISC 0x2c00) against a model
+of the watchdog armed with a 32 s bark and an 8 s bite that disables charging: without our writes the model stops at 40 s (state 3 →
+7, for good); with the default the clear (0x87 → 0x07, read back) and the first pet at once, a pet every 8 s, no stop in 10 minutes,
+`WD_CFG` never written, nothing but the two allowed writes; pets alone also hold it; a 16 s bark pets every 4 s; no write with MISC owned
+by another EE, of another TYPE, absent, or the watchdog not armed; the bit already clear: pets only; a clear that does not read back:
+three tries in all; a refusing channel: three failed pets, then none; no clear once the DSP owns the charger; no writer: every write
+refused. Also under ASan/UBSan. A mutation (pet period twice the bark) fails eight checks.
+
+### 18.5 Reading the next boot (pass / fail)
+
+`grep -aE 'PianoPower: (wdog|charger block|\[[0-9]+s\] (battery|charging|wdog))'`.
+
+- **Pass:** `as the boot stages left it` shows the timer on and `a bite DISABLES charging`; `start: ... -> ...: ok`; the packs stay
+  at +400..+480 mA past 60 s (the `charging:` lines say `charging`, `CHGR state 3` or another charging state), percentage rising.
+- **The hypothesis fails** if the watchdog reads not armed or without bit 7 (then no write is made: `wdog: not armed`), or if the
+  writes are made and the stop still comes (`CHGR state 7` at ~40 s with `pets` rising). Then, in this order, from the same log
+  (the block survey and the `wdog:` line already read every one): the **charging enable command** CHGR +0x42 bit 0 and its source,
+  `CHGR_CFG2` +0x51 bit 7/6 (a 0 at the stop: something cleared it; the source bit set: a pin decides); **inhibit** (`CHGR_CFG2` bit
+  0, state 6); **termination** (state 5, status bit 6 soft-terminate; `+0x07` changes 0x19 → 0x00 at the stop); the **safety timer**
+  (`WD_CFG` 4:3 and 2: a watchdog interrupt that starts it); **AICL/input** (DCDC 0x2700 and USBIN 0x2900: +0x06..+0x0b, the ICL,
+  AICL and power path status in the SMB5 layout); then §17.6 (a replug, an early DSP, a wall charger).
+- **Map wrong:** MISC's TYPE not 0x02 or no APID at 0x2c00: `no write: ...`; the block survey shows where TYPE 0x02 blocks are and
+  which one holds a watchdog-like +0x51..+0x53.

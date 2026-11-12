@@ -11,6 +11,7 @@
 #include <vector>
 #include "SpmiObserver.h"
 #include "ChargerPmic.h"
+#include "ChargerWdog.h"
 #include "Gauge.h"
 #include "RtcReadout.h"
 #include <algorithm>
@@ -133,6 +134,270 @@ static void testCharger()
   c.add(7, 0x0100, 0x51, 0x33, 0);
   const Io io3 = c.io();
   CHECK(!discoverCharger(io3, spmiArbiter(io3)).found);
+}
+
+// --------------------------------------------------------------------------------- the charger watchdog (ChargerWdog.h)
+// piano's charger complex as the logs show it (charger block 0x2200 subtype 0xba, Type-C 0x2b00) with MISC at 0x2c00 and CHGR at
+// 0x2600, and a model of the watchdog: armed by the boot stages with a 32 s bark and an 8 s bite that disables charging (CHGR state
+// 3 -> 7), which is the ~40 s stop of 2026-11-12 if the hypothesis holds.
+struct WdogPmic {
+  Arb a;
+  int chgr = -1, misc = -1, typec = -1;
+  struct W {int apid; uint8_t reg, value;};
+  std::vector<W> writes;
+  uint64_t now = 0, lastPet = 0;
+  bool bitten = false, refuse = false, ignoreConfig = false;
+  explicit WdogPmic(uint32_t miscOwner = 0, uint8_t miscType = kSchgType, uint8_t wdCfg = 0x43, uint8_t timeouts = 0x87)
+  {
+    a.add(7, 0x0100, 0x51, 0x56, 0);
+    a.add(7, 0x2200, 0x02, 0xba, 0);
+    chgr = a.add(7, 0x2600, 0x02, 0xbb, 0);
+    a.add(7, 0x2800, 0x02, 0xbc, 0);
+    typec = a.add(7, 0x2b00, 0x02, 0xbe, 0);
+    misc = a.add(7, 0x2c00, miscType, 0xbf, miscOwner);
+    a.apids[size_t(chgr)].regs[0x06] = 0xc3;   // full-on, as at the first reports
+    a.apids[size_t(misc)].regs[kMiscWdCfg] = wdCfg;
+    a.apids[size_t(misc)].regs[kMiscWdTimeouts] = timeouts;
+  }
+  static bool write(void *ctx, int apid, uint8_t reg, uint8_t value, uint32_t *status)
+  {
+    WdogPmic *p = static_cast<WdogPmic *>(ctx);
+    p->writes.push_back({apid, reg, value});
+    if (status) *status = p->refuse ? (kStatusDone | 0x4) : kStatusDone;
+    if (p->refuse) return false;
+    if (apid == p->misc && reg == kMiscPet) {
+      if (value & kMiscPetBit) p->lastPet = p->now;
+    } else if (!p->ignoreConfig) {
+      p->a.apids[size_t(apid)].regs[reg] = value;
+    }
+    return true;
+  }
+  void advance(uint64_t t)
+  {
+    now = t;
+    const uint8_t cfg = a.apids[size_t(misc)].regs[kMiscWdCfg], to = a.apids[size_t(misc)].regs[kMiscWdTimeouts];
+    if ((cfg & 3) && now - lastPet >= uint64_t(barkSeconds(to) + biteSeconds(to)) * 1000) {
+      if (!bitten && (to & kWdBiteStopsCharging)) a.apids[size_t(chgr)].regs[0x06] = 0x87;   // disabled, and it stays so
+      bitten = true;
+    }
+  }
+  SpmiWriter writer() { return SpmiWriter{this, write}; }
+  unsigned count(uint8_t reg) const
+  {
+    unsigned n = 0;
+    for (const W &w : writes) n += w.apid == misc && w.reg == reg;
+    return n;
+  }
+  bool onlyAllowed() const
+  {
+    for (const W &w : writes)
+      if (w.apid != misc || !((w.reg == kMiscPet && w.value == kMiscPetBit) || w.reg == kMiscWdTimeouts)) return false;
+    return true;
+  }
+};
+
+// Runs the thread's part from 5 s (PianoPower's start) to `until`: a check at the start and every 30 s, the pets in between.
+static void runWdog(WdogPmic &p, ChargerWdog &w, uint64_t until)
+{
+  const Io io = p.a.io();
+  const SpmiWriter wr = p.writer();
+  uint64_t reportDue = 0;
+  for (uint64_t t = 5000; t <= until; t += 500) {
+    p.advance(t);
+    if (t >= reportDue) {
+      w.check(io, wr, t, nullptr, nullptr);
+      reportDue = t + 30000;
+    }
+    w.petIfDue(wr, t);
+  }
+}
+
+static void testWdog()
+{
+  CHECK(barkSeconds(0x87) == 32 && biteSeconds(0x87) == 8 && barkSeconds(0x00) == 16 && biteSeconds(0x00) == 1);
+  CHECK(petPeriodMs(0x00) == 4000 && petPeriodMs(0x04) == 8000 && petPeriodMs(0x08) == 15000 && petPeriodMs(0x0c) == 15000);
+  CHECK(std::strcmp(chargerStateName(3), "full-on") == 0 && std::strcmp(chargerStateName(0x87), "DISABLED") == 0);
+
+  // The layout: CHGR = Type-C - 0x500, MISC = Type-C + 0x100, TYPE/SUBTYPE read.
+  {
+    WdogPmic p;
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    const ChargerLayout l = discoverCharger(io, arb);
+    CHECK(l.found && l.typec.address == 0x2b00 && l.dcdc.address == 0x2600);
+    ChargerWdog w;
+    w.locate(io, arb, l);
+    CHECK(w.located && w.chgr.address == 0x2600 && w.chgr.apid == p.chgr && w.misc.address == 0x2c00 && w.misc.apid == p.misc);
+    CHECK(w.misc.idOk && w.misc.type == 0x02 && w.misc.subtype == 0xbf && w.why[0] == 0);
+    const WdogView v = w.read(io);
+    CHECK(v.cfgOk && v.wdCfg == 0x43 && v.timeouts == 0x87 && v.armed() && v.biteStops() && v.chgrOk && v.state() == 3);
+    // The allowlist: a pet, the clear of bit 7 alone; nothing else, MISC only.
+    CHECK(w.allowed(p.misc, kMiscPet, 0x01, 0) && !w.allowed(p.misc, kMiscPet, 0x03, 0) && !w.allowed(p.chgr, kMiscPet, 0x01, 0));
+    CHECK(w.allowed(p.misc, kMiscWdTimeouts, 0x07, 0x87) && !w.allowed(p.misc, kMiscWdTimeouts, 0x00, 0x87));
+    CHECK(!w.allowed(p.misc, kMiscWdTimeouts, 0x07, 0x07) && !w.allowed(p.misc, kMiscWdCfg, 0x00, 0x43));
+    CHECK(!w.allowed(p.misc, kChgrEnableCmd, 0x01, 0) && !w.allowed(-1, kMiscPet, 0x01, 0));
+    CHECK(p.writes.empty() && p.a.writesOutsideCommands == 0);
+  }
+
+  // Without our writes (piano-power-wdog=0) the model reproduces the stop: CHGR full-on -> DISABLED at 40 s, for good.
+  {
+    WdogPmic p;
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.mode = WdogMode::off;
+    w.locate(io, arb, discoverCharger(io, arb));
+    runWdog(p, w, 600000);
+    CHECK(p.writes.empty() && p.bitten && w.last.state() == kChgrDisabled && w.pets == 0 && !w.petting);
+  }
+
+  // piano-power-wdog=2 (the default): the clear at the first check (0x87 -> 0x07, read back), the first pet at once, then one every
+  // 8 s; no bite, CHGR stays full-on for 10 minutes; nothing written but the two allowed registers.
+  {
+    WdogPmic p;
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.locate(io, arb, discoverCharger(io, arb));
+    WdogWrite clear, pet;
+    p.advance(5000);
+    w.check(io, p.writer(), 5000, &clear, &pet);
+    CHECK(clear.done && clear.ok && clear.reg == kMiscWdTimeouts && clear.before == 0x87 && clear.value == 0x07);
+    CHECK(clear.readBack && clear.after == 0x07 && w.clears == 1 && !w.last.biteStops());
+    CHECK(pet.done && pet.ok && w.petting && w.petMs == 8000 && w.pets == 1 && w.nextDue() == 13000);
+    runWdog(p, w, 600000);
+    CHECK(!p.bitten && w.last.state() == 3 && p.count(kMiscWdTimeouts) == 1 && w.clears == 1 && w.clearFailures == 0);
+    CHECK(w.pets >= 74 && w.pets <= 76 && p.count(kMiscPet) == w.pets && w.petFailures == 0 && p.onlyAllowed() && w.refused == 0);
+    CHECK(p.a.apids[size_t(p.misc)].regs[kMiscWdCfg] == 0x43);   // WD_CFG is never written
+  }
+
+  // piano-power-wdog=1: the pets alone keep the watchdog from biting; +0x53 is never written.
+  {
+    WdogPmic p;
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.mode = WdogMode::pet;
+    w.locate(io, arb, discoverCharger(io, arb));
+    runWdog(p, w, 600000);
+    CHECK(!p.bitten && w.last.state() == 3 && p.count(kMiscWdTimeouts) == 0 && w.pets > 70 && p.onlyAllowed());
+    CHECK(w.last.biteStops());
+  }
+
+  // A 16 s bark: pets every 4 s, no bite.
+  {
+    WdogPmic p(0, kSchgType, 0x43, 0x83);
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.mode = WdogMode::pet;
+    w.locate(io, arb, discoverCharger(io, arb));
+    runWdog(p, w, 300000);
+    CHECK(w.petMs == 4000 && !p.bitten && w.last.state() == 3);
+  }
+
+  // The gates: MISC owned by another EE, MISC of another TYPE, no MISC at all: no write, the reason kept, the bite happens.
+  {
+    WdogPmic p(3);
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.locate(io, arb, discoverCharger(io, arb));
+    runWdog(p, w, 120000);
+    CHECK(p.writes.empty() && std::strstr(w.why, "another EE") && p.bitten && w.last.state() == kChgrDisabled);
+  }
+  {
+    WdogPmic p(0, 0x05);
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.locate(io, arb, discoverCharger(io, arb));
+    runWdog(p, w, 120000);
+    CHECK(p.writes.empty() && std::strstr(w.why, "TYPE") && !w.petting);
+  }
+  {
+    WdogPmic p;
+    p.a.apids[size_t(p.misc)].ppid = uint16_t(7 << 8 | 0x2d);   // nothing at 0x2c00
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.locate(io, arb, discoverCharger(io, arb));
+    runWdog(p, w, 60000);
+    CHECK(p.writes.empty() && std::strstr(w.why, "no MISC") && w.misc.apid < 0);
+  }
+
+  // Not armed (WD_CFG bits 0/1 clear): neither a pet nor the clear, whatever +0x53 says.
+  {
+    WdogPmic p(0, kSchgType, 0x40, 0x87);
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.locate(io, arb, discoverCharger(io, arb));
+    runWdog(p, w, 120000);
+    CHECK(p.writes.empty() && !w.petting && !p.bitten && w.last.state() == 3);
+  }
+
+  // The bit already clear: pets only.
+  {
+    WdogPmic p(0, kSchgType, 0x43, 0x07);
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.locate(io, arb, discoverCharger(io, arb));
+    runWdog(p, w, 120000);
+    CHECK(p.count(kMiscWdTimeouts) == 0 && w.pets > 10 && !p.bitten);
+  }
+
+  // A clear that does not read back: a failure, tried again at the next checks, three in all; the pets go on.
+  {
+    WdogPmic p;
+    p.ignoreConfig = true;
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.locate(io, arb, discoverCharger(io, arb));
+    runWdog(p, w, 600000);
+    CHECK(p.count(kMiscWdTimeouts) == ChargerWdog::kMaxClears && w.clearFailures == ChargerWdog::kMaxClears && w.clears == 0);
+    CHECK(w.last.biteStops() && w.pets > 70 && !p.bitten);
+  }
+
+  // A channel that refuses (denied): three failed pets, then no more; nothing else is tried.
+  {
+    WdogPmic p;
+    p.refuse = true;
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.mode = WdogMode::pet;
+    w.locate(io, arb, discoverCharger(io, arb));
+    runWdog(p, w, 600000);
+    CHECK(w.petFailures == ChargerWdog::kMaxPetFailRun && w.pets == 0 && !w.petting && p.count(kMiscPet) == ChargerWdog::kMaxPetFailRun);
+    CHECK((w.lastPetStatus & kStatusErrors) != 0);
+  }
+
+  // Once the DSP owns the charger (level 2): no clear, the pets go on.
+  {
+    WdogPmic p;
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.dspOwns = true;
+    w.locate(io, arb, discoverCharger(io, arb));
+    runWdog(p, w, 120000);
+    CHECK(p.count(kMiscWdTimeouts) == 0 && w.pets > 10 && w.last.biteStops());
+  }
+
+  // No writer (a kext whose channel did not map): every write refused and counted, nothing reaches the model.
+  {
+    WdogPmic p;
+    const Io io = p.a.io();
+    const Arbiter arb = spmiArbiter(io);
+    ChargerWdog w;
+    w.mode = WdogMode::pet;
+    w.locate(io, arb, discoverCharger(io, arb));
+    w.check(io, SpmiWriter{}, 5000, nullptr, nullptr);
+    CHECK(p.writes.empty() && w.refused == 1 && w.petFailures == 1);
+  }
 }
 
 // --------------------------------------------------------------------------------------------------------- I2C gauge model
@@ -1821,6 +2086,7 @@ int main()
 {
   testRtc();
   testCharger();
+  testWdog();
   testGauge();
   testMcaCodec();
   testMcaPolicy();

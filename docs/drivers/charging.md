@@ -67,9 +67,12 @@ levels (9 V opt-in), charge current conservative, battery state on the console; 
   partition, SMP2P "slave-kernel" bits, GLINK items, crash reason) → both gauges. Then every 30 s: pack voltage (mean), current
   (sum, + = charging), state of charge (by full-charge capacity), temperature (the warmer pack), each pack's status word; the
   Type-C state (attached, source Rp seen = charger present) with the raw Type-C/USBIN/DCDC/charger status bytes; the DSP's
-  SMP2P bits; the PMIC RTC's count and date (`rtc: ...`, [rtc.md](rtc.md), with every report once IOBSD is published). Writes: none to any
-  PMIC register; the SPMI observer channel's command; the four gauge pins' TLMM configuration
-  (GPIO, pull-up, output value 0, output enable toggled: open drain, never driven high), restored after each read.
+  SMP2P bits; the PMIC RTC's count and date (`rtc: ...`, [rtc.md](rtc.md), with every report once IOBSD is published). Writes: since
+  2026-11-12 evening the charger watchdog's only (at both levels, `piano-power-wdog`, default 2: a pet every quarter of the bark time
+  and bit 7 of MISC +0x53, "a bite disables charging", cleared, each write logged with before/after; `=1` pets only, `=0` none:
+  [charging-policy.md](charging-policy.md) §18), otherwise none to any PMIC register; the SPMI observer channel's command; the four
+  gauge pins' TLMM configuration (GPIO, pull-up, output value 0, output enable toggled: open drain, never driven high), restored after
+  each read. Every report adds a `wdog:` line (the watchdog's configuration, the CHGR state, the pets) and the `charging:` line.
 - **Level 2, charging.** Level 1 plus `piano_adsp_start` (after `piano-power-delay`, sheng's order in numbered steps, §5a:
   firmware from modem_a via NativeUfs + FAT → SMP2P item 429 → doorbells → AOSS `load_state adsp` → lcx/lmx at max through an
   idle active TCS of RSC drv-2 → DTB image PAS 36 → DSP image PAS 1 → ready on SMP2P (5 s) → votes dropped at handover → GLINK
@@ -102,7 +105,8 @@ levels (9 V opt-in), charge current conservative, battery state on the console; 
 Boot arguments: `piano-power=0|1|2` (default 0: probe declines, nothing mapped), `piano-power-period=S` (30),
 `piano-power-gauge=0`, `piano-power-write=0` (level 2 without writes), `piano-power-hv=1`, `piano-power-fw=DIR`,
 `piano-power-policy=1` (with `piano-power-rp=1`, `piano-power-ramp=0|1`, `piano-power-rp-max=MA`, `piano-power-write-ms=MS`,
-`piano-power-health=1`, `-health-stop=N`, `-health-resume=N`, `piano-power-kick=0|1`: charging-policy.md §8, §15, §17), and for the DSP
+`piano-power-health=1`, `-health-stop=N`, `-health-resume=N`, `piano-power-kick=0|1`: charging-policy.md §8, §15, §17),
+`piano-power-wdog=0|1|2` (the charger watchdog: read only, pet, pet and clear the bite's charging stop (default); §18), and for the DSP
 bring-up (§5a): `piano-power-delay=S` (30: seconds before the bring-up), `piano-power-stop=N` (stop before step N),
 `piano-power-rpmh=0` (no lcx/lmx proxy votes), `piano-power-qmp=0` (no AOSS load_state), `piano-power-trace=0`.
 
@@ -128,7 +132,7 @@ sha256 `ec5267bc9e40a74e…` (`com.unixnu.driver.PianoPower: linked, header at 0
    out/ram-power/level1/boot-piano-macos-ram-A-bundled.img`, `grep PianoPower logs/native-runs/<ts>-loop/xnu-console.txt`, then
    `battery-voltage` again. Expected (the numbers are examples):
    ```
-   PianoPower: start: piano-power=1 period 30 s, gauges on; level 1: read only (no PMIC register written, the DSP is not started)
+   PianoPower: start: piano-power=1 period 30 s, gauges on; level 1: the DSP is not started; the only PMIC writes are the charger watchdog's (piano-power-wdog)
    PianoPower: spmi: arbiter version 0x7..., N APIDs
    PianoPower: charger PMIC (SID 7): N peripherals, owned by EE0 a, EE1 b, EE2 c, ...
    PianoPower: charger: PMIH010x model 0x47, charger block 0x..00 (subtype 0x.., APID n, owner EE m), ... Type-C 0x..00 (...)
@@ -657,6 +661,8 @@ From the USB console logs (local, not published; `grep PianoPower`). **M** = mea
   write them. Not done: there is no licence-clean register map of this PMIC's USBIN/charger blocks (mainline's SCHG maps are other
   generations' subtypes; piano's stock charger driver runs in the DSP and its binaries are not read here), and a guessed power-path
   write can suspend the input or brown the tablet out; the gain would be what level 2 gets through 0x2008 with read-backs.
+  Since 2026-11-12 evening one exception, the charger watchdog's pet and its "a bite disables charging" bit, behind gates and an
+  allowlist of two MISC registers ([charging-policy.md](charging-policy.md) §18).
 - **What follows**: the stepped Type-C current up to the Rp's 3 A with its guards, the write answers, the test images and the daily
   profile's level: [charging-policy.md](charging-policy.md) §15 and §16.
 
@@ -679,6 +685,10 @@ analysis, the fix and its images: [charging-policy.md](charging-policy.md) §17.
 - **Inferred:** a not-charging state of the PMIC charger latched at ~40 s of uptime that the firmware neither reports nor clears (a
   watchdog left by the boot stages, or a termination/inhibit decision: no register map to tell); not excluded, that this firmware does
   not charge from a computer port at all (no Ubuntu result on one).
+- **Evening (I):** the block at 0x2600 ("DCDC" above) is the charger's CHGR in the SCHG family's layout (Type-C − 0x500), and its
+  +0x06 goes `c3`/`83` → `87` at the stop: state full-on → **disabled** (not terminated or inhibited). The charger watchdog (MISC
+  0x2c00, never read so far) is the lead; PianoPower now reads it, pets it and clears "a bite disables charging" by default
+  ([charging-policy.md](charging-policy.md) §18).
 - **Fix built (not run):** the charging restart (0x2003 = 0, 5 s, 1, the charge current again; three per attach), 1500 mA under a
   trusted Rp, the steps against a settled 0x2029, the `charging:` line; images `ram-chg-kick` and `ram-chg-kick-idle`
   (charging-policy.md §17.5); if the restart does not help, the attended next steps of §17.6 (a replug, an early DSP, a wall charger).

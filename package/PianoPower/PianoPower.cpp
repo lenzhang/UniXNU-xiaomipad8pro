@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // PianoPower: battery and charging for macOS 27 on piano (SM8750), native at EL1. Design and test plan: docs/drivers/charging.md.
 //
-// The charger (the buck stage of the PMIH010x PMIC) belongs to the audio DSP's firmware; this processor may only read it over SPMI.
-// The DSP is not running when our UEFI hands over, and without it the PMIC charges on whatever configuration the boot stages left.
-// So there are two levels:
-//   piano-power=1  read only. Every 30 s one report on the console: the battery from its two fuel gauges (voltage, current, state of
-//                  charge, temperature), the USB-C port from the charger PMIC's Type-C block (attached, a source's Rp), the DSP's
-//                  state from SMEM. No PMIC register is written and the DSP is not started; the only writes are the SPMI observer
-//                  channel's command and the four gauge pins' TLMM configuration (taken as GPIOs for the read, then given back).
+// The charger (the buck stage of the PMIH010x PMIC) belongs to the audio DSP's firmware; this processor reads it over SPMI and writes
+// only its watchdog (below). The DSP is not running when our UEFI hands over, and without it the PMIC charges on whatever configuration
+// the boot stages left. So there are two levels:
+//   piano-power=1  Every 30 s one report on the console: the battery from its two fuel gauges (voltage, current, state of charge,
+//                  temperature), the USB-C port from the charger PMIC's Type-C block (attached, a source's Rp), the charger watchdog
+//                  and state, the DSP's state from SMEM. The DSP is not started; the only writes are the charger watchdog's (pet, and
+//                  the bite's charging stop cleared: piano-power-wdog below), the SPMI observer channel's command and the four gauge
+//                  pins' TLMM configuration (taken as GPIOs for the read, then given back).
 //   piano-power=2  the same, and the charger: the DSP is started (its images from modem_a, PAS) with GLINK and the IPC router's service
 //                  locator, then the charger properties are read every 5 s and the conservative policy of PianoMca.c is applied: input
 //                  current limit by charger type (at most 1.5 A at 5 V), charge current 1.0 A between 15 and 38 degC (0.5 A outside or
 //                  without a temperature), the charger's enable bit set if it is clear, back to the firmware's own 100 mA / 500 mA on
 //                  detach. USB-C port notifications are acknowledged (and handed, read only, to the port-event clients:
 //                  PortEvents.c, PianoDp). Nothing else is written.
+// The charger watchdog (ChargerWdog.h, docs/drivers/charging-policy.md §18), at both levels: the boot stages leave the charger PMIC's
+// BARK/BITE watchdog armed with "a bite disables charging", and nothing pets it natively: the charger stops at about 40 s of every
+// boot. piano-power-wdog=2 (default) pets it every quarter of its bark time (4-15 s) from this thread and clears that one bit (MISC
+// +0x53 bit 7, read-modify-write, read back), as Linux's SCHG host driver does; =1 pets only; =0 reads and logs only. Every write is
+// logged with its before/after values; the battery limits (float, currents, JEITA, safety timer, the enable) are not written.
 // Further boot arguments: piano-power-period=S (report interval, default 30), piano-power-gauge=0 (no gauge reads),
 // piano-power-write=0 (level 2 without the charger writes: the DSP runs on its own defaults), piano-power-hv=1 (level 2 also asks a PD
 // source with a fixed 9 V PDO for 9 V and then allows 1.6 A), piano-power-fw=DIR (the DSP's images as DIR/adsp.mbn and
@@ -44,6 +50,7 @@
 #include <stdarg.h>
 #include "SpmiObserver.h"
 #include "ChargerPmic.h"
+#include "ChargerWdog.h"
 #include "Gauge.h"
 #include "PianoBattery.h"
 #include "Servreg.h"
@@ -72,6 +79,7 @@ struct Args {
   uint32_t level, period, gauge, write, hv, unsuspend, ps, psFloor, board, ucsi;
   uint32_t policy, rp, health, healthStop, healthResume;
   uint32_t ramp, rpMax, writeMs, kick;
+  uint32_t wdog;
   bool hasRtcOffset;
   uint32_t rtcOffset;
 };
@@ -117,6 +125,10 @@ void readArgs()
   // with the policy: the charging restart (ChargePolicy cfg.kick, charging-policy.md §17): 0x2003 = 0 then 1 when the packs stay at
   // 0 mA with input to spare; piano-power-kick=0 leaves it out
   gArgs.kick = bootArg("piano-power-kick", 1);
+  // the charger PMIC's BARK/BITE watchdog (ChargerWdog.h, charging-policy.md §18): 0 read and log only, 1 pet it, 2 (default) pet it
+  // and clear "a bite disables charging" (MISC +0x53 bit 7), as Linux's host driver for the SCHG family does
+  gArgs.wdog = bootArg("piano-power-wdog", 2);
+  if (gArgs.wdog > 2) gArgs.wdog = 2;
   gArgs.rtcOffset = 0;
   gArgs.hasRtcOffset = PE_parse_boot_argn("piano-rtc-offset", &gArgs.rtcOffset, sizeof gArgs.rtcOffset);
 }
@@ -177,6 +189,29 @@ uint32_t ioRd(void *, Window w, uint32_t offset) { return rd32(windowBase(w) + o
 void ioWr(void *, Window w, uint32_t offset, uint32_t value) { wr32(windowBase(w) + offset, value); }
 void ioDelay(void *, unsigned us) { IODelay(us); }
 const Io gIo = {nullptr, ioRd, ioWr, ioDelay};
+
+// The one write channel PianoPower maps: the charger MISC APID's (chnls 0x0C500000 + 0x1000 * APID, data +0x10, command +0x00 with
+// opcode 0, status +0x08: the arbiter v7 owner-channel write PianoDwc3 and PianoTorch make). ChargerWdog's allowlist decides what goes
+// through it; this only refuses another APID.
+constexpr uint64_t kSpmiChnls = 0x0c500000;
+constexpr uint32_t kChnlStride = 0x1000, kChnlCmd = 0x00, kChnlStatus = 0x08, kChnlWdata0 = 0x10;
+Region gMiscChnl;
+int gMiscChnlApid = -1;
+bool chnlWrite(void *, int apid, uint8_t reg, uint8_t value, uint32_t *status)
+{
+  if (apid < 0 || apid != gMiscChnlApid || !gMiscChnl.va) return false;
+  wr32(gMiscChnl.va + kChnlWdata0, value);
+  wr32(gMiscChnl.va + kChnlCmd, 0u << 27 | uint32_t(reg) << 4 | 0u);
+  uint32_t st = 0;
+  for (unsigned i = 0; i < 1000; ++i) {
+    st = rd32(gMiscChnl.va + kChnlStatus);
+    if (st & kStatusDone) break;
+    IODelay(1);
+  }
+  if (status) *status = st;
+  return (st & kStatusDone) && !(st & kStatusErrors);
+}
+const SpmiWriter gWriter = {nullptr, chnlWrite};
 
 // ------------------------------------------------------------------------------------------------- the gauges' pins (TLMM)
 // TLMM (DT pinctrl@f100000): pin n's configuration at n * 0x1000 (pull 1:0, function 5:2, drive 8:6, output enable 9), its input
@@ -239,6 +274,7 @@ class PianoPower : public IOService {
   Arbiter fArbiter;
   ChargerLayout fCharger;
   bool fSpmi = false;
+  ChargerWdog fWdog;   // the charger's watchdog (ChargerWdog.h)
   RtcReading fRtc;
   bool fRtcProbed = false;
   // gauges
@@ -265,6 +301,10 @@ class PianoPower : public IOService {
   uint64_t fStartMs = 0;
 
   bool probeSpmi();
+  void surveyChargerBlocks();
+  void startWdog();
+  void wdogWriteLine(const char *what, const WdogWrite &r);
+  void wdogLine(char *line, size_t size, uint64_t t);
   void readRtcLine(char *line, size_t size);
   void surveyAdsp();
   void probeGauges();
@@ -337,7 +377,8 @@ bool PianoPower::start(IOService *provider)
   if (!IOService::start(provider)) return false;
   note("start: piano-power=%u period %u s, gauges %s; %s", gArgs.level, gArgs.period, gArgs.gauge ? "on" : "off",
        gArgs.level >= 2 ? "level 2: the DSP's charger firmware is started and its charger properties are managed"
-                        : "level 1: read only (no PMIC register written, the DSP is not started)");
+                        : gArgs.wdog ? "level 1: the DSP is not started; the only PMIC writes are the charger watchdog's (piano-power-wdog)"
+                                     : "level 1: read only (no PMIC register written, the DSP is not started)");
   fPolicyOn = gArgs.level >= 2 && gArgs.policy != 0;
   if (gArgs.level >= 2 && !fPolicyOn)
     note("level 2 policy: %s%s", gArgs.write ? "input limit by charger type (<= 1.5 A at 5 V), charge current 1.0 A in 15-38 C"
@@ -468,6 +509,96 @@ bool PianoPower::probeSpmi()
   fSpmi = true;
   stage(1, "SPMI");
   return true;
+}
+
+// Once, read only: every SID 7 peripheral from the charger block to Type-C + 0x400 with its TYPE/SUBTYPE, owner, status bytes and
+// real-time interrupt status, so a log shows the charger complex's map (ChargerWdog.h's places are inferred).
+void PianoPower::surveyChargerBlocks()
+{
+  if (!fCharger.found) return;
+  const uint16_t first = fCharger.charger.address, last = uint16_t(fCharger.typec.address + 0x400);
+  for (uint32_t i = 0; i < fArbiter.count; ++i) {
+    const uint32_t map = spmiMap(gIo, i);
+    const uint16_t ppid = spmiPpid(map);
+    if (!map || (ppid >> 8) != kChargerSid) continue;
+    const uint16_t address = uint16_t((ppid & 0xff) << 8);
+    if (address < first || address > last) continue;
+    uint8_t id[2] = {}, st[8] = {}, rt = 0, cfg[3] = {};
+    const bool idOk = spmiRead(gIo, int(i), 4, id, 2) == ReadResult::ok;
+    const bool stOk = spmiRead(gIo, int(i), 0x06, st, 8) == ReadResult::ok;
+    spmiRead(gIo, int(i), kBlockRt, &rt, 1);
+    const bool cfgOk = spmiRead(gIo, int(i), 0x51, cfg, 3) == ReadResult::ok;
+    note("charger block %#06x: APID %u EE %u, type %s%02x/%02x, +06 %02x %02x %02x %02x %02x %02x %02x %02x%s, rt %#x, +51..53 %02x %02x %02x%s",
+         address, i, spmiOwner(gIo, i), idOk ? "" : "? ", id[0], id[1], st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7],
+         stOk ? "" : " (not read)", rt, cfg[0], cfg[1], cfg[2], cfgOk ? "" : " (not read)");
+  }
+}
+
+void PianoPower::wdogWriteLine(const char *what, const WdogWrite &r)
+{
+  if (!r.done) return;
+  if (r.reg == kMiscPet)
+    note("wdog: %s: MISC %#06x +0x43 = 0x01 (pet): %s (channel status %#x)", what, fWdog.misc.address, r.ok ? "ok" : "FAILED", r.status);
+  else
+    note("wdog: %s: MISC %#06x +0x53 %#04x -> %#04x (bit 7, a bite disables charging, cleared; bark %u s, bite %u s kept): %s, "
+         "read back %s%#04x (channel status %#x)", what, fWdog.misc.address, r.before, r.value, barkSeconds(r.before),
+         biteSeconds(r.before), r.ok ? "ok" : "FAILED", r.readBack ? "" : "not read, ", r.after, r.status);
+}
+
+// After the SPMI probe, before anything else that takes time: locate MISC and CHGR, log the watchdog as the boot stages left it,
+// then (by piano-power-wdog) the clear and the first pet.
+void PianoPower::startWdog()
+{
+  fWdog.mode = WdogMode(gArgs.wdog);
+  fWdog.locate(gIo, fArbiter, fCharger);
+  if (!fWdog.located) {
+    note("wdog: %s", fWdog.why);
+    return;
+  }
+  const WdogBlock &m = fWdog.misc, &c = fWdog.chgr;
+  note("wdog: piano-power-wdog=%u (%s); CHGR %#06x (APID %d, EE %u, type %02x/%02x), MISC %#06x (APID %d, EE %u, type %02x/%02x)%s%s",
+       gArgs.wdog, wdogModeName(fWdog.mode), c.address, c.apid, c.owner, c.type, c.subtype, m.address, m.apid, m.owner, m.type,
+       m.subtype, fWdog.why[0] ? ": no write: " : "", fWdog.why);
+  if (!fWdog.why[0] && fWdog.mode != WdogMode::off) {
+    if (!mapRegion(gMiscChnl, kSpmiChnls + uint64_t(kChnlStride) * uint32_t(m.apid), 0x20)) note("wdog: MISC's write channel does not map: no write");
+    else gMiscChnlApid = m.apid;
+  }
+  const WdogView before = fWdog.read(gIo);
+  if (before.cfgOk)
+    note("wdog: as the boot stages left it: WD_CFG (+0x51) %#04x (timer %s, on plug-in %s, bark irq %u, bite irq %u, AFP on bite %u), "
+         "timeouts (+0x53) %#04x (a bite %s charging, bark %u s, bite %u s, snarl field %u); MISC rt %#x; CHGR state %u (%s), "
+         "+0x42 enable command %#04x, +0x51 cfg2 %#04x",
+         before.wdCfg, before.wdCfg & kWdTimerOn ? "on" : "off", before.wdCfg & kWdOnPlugin ? "on" : "off",
+         before.wdCfg & kWdBarkIrq ? 1u : 0u, before.wdCfg & kWdBiteIrq ? 1u : 0u, before.wdCfg & kWdAfp ? 1u : 0u, before.timeouts,
+         before.biteStops() ? "DISABLES" : "does not disable", barkSeconds(before.timeouts), biteSeconds(before.timeouts),
+         (before.timeouts >> 4) & 7u, before.miscRt, before.state(), chargerStateName(before.state()), before.chgrCmd[2],
+         before.chgrCfg[1]);
+  else
+    note("wdog: MISC's configuration does not read");
+  WdogWrite clear, pet;
+  fWdog.check(gIo, gWriter, nowMs(), &clear, &pet);
+  wdogWriteLine("start", clear);
+  wdogWriteLine("first", pet);
+  if (fWdog.petting)
+    note("wdog: petting every %u ms from this thread (a quarter of the %u s bark time, 4-15 s)", fWdog.petMs, barkSeconds(fWdog.last.timeouts));
+  else if (!fWdog.why[0] && fWdog.mode != WdogMode::off)
+    note("wdog: not armed (WD_CFG bit 0/1 clear): no pet, no clear%s", fWdog.refused ? " (refused writes!)" : "");
+}
+
+// "wdog: ..." with every report: the watchdog and charger state as read now and what the pets have done.
+void PianoPower::wdogLine(char *line, size_t size, uint64_t t)
+{
+  const WdogView &v = fWdog.last;
+  snprintf(line, size,
+           "[%llus] wdog: WD_CFG %#04x timeouts %#04x (bite %s charging), MISC %02x %02x %02x %02x %02x %02x %02x %02x rt %#x; CHGR "
+           "state %u (%s) %02x %02x %02x %02x %02x %02x %02x %02x rt %#x cmd %02x %02x %02x; pets %u (%u failed%s), clears %u (%u "
+           "failed)%s%s",
+           t, v.wdCfg, v.timeouts, v.biteStops() ? "disables" : "does not disable", v.misc[0], v.misc[1], v.misc[2], v.misc[3],
+           v.misc[4], v.misc[5], v.misc[6], v.misc[7], v.miscRt, v.state(), chargerStateName(v.state()), v.chgr[0], v.chgr[1],
+           v.chgr[2], v.chgr[3], v.chgr[4], v.chgr[5], v.chgr[6], v.chgr[7], v.chgrRt, v.chgrCmd[0], v.chgrCmd[1], v.chgrCmd[2],
+           fWdog.pets, fWdog.petFailures, fWdog.petting ? "" : ", not petting", fWdog.clears, fWdog.clearFailures,
+           fWdog.dspOwns ? "; the DSP owns the configuration" : "", fWdog.why[0] ? "; no write: " : "");
+  if (fWdog.why[0]) strlcat(line, fWdog.why, size);
 }
 
 // "rtc: COUNT (DATE UTC, offset N from SOURCE), enabled E": tooling/native/rtc-offset.py pairs these lines with the Mac's clock.
@@ -674,10 +805,23 @@ void PianoPower::report()
     else
       note("[%llus] usb: Type-C status not readable", t);
   }
+  if (fWdog.located) {
+    WdogWrite clear, pet;
+    fWdog.check(gIo, gWriter, nowMs(), &clear, &pet);
+    wdogWriteLine("again", clear);
+    wdogWriteLine("first", pet);
+    char line[512];
+    wdogLine(line, sizeof line, t);
+    note("%s", line);
+  }
   if (gArgs.ps) publishBattery(t, havePort && p.ok ? &p : nullptr);
   if (gArgs.level >= 2) {
     PianoAdspStatus s;
     piano_adsp_status(&s);
+    if (fWdog.located && !fWdog.dspOwns && s.slave >= 0 && (s.slave & 2)) {
+      fWdog.dspOwns = true;
+      note("wdog: the DSP runs: its firmware owns the charger's configuration from here (no clear of ours); the pets go on");
+    }
     uint32_t open = 0, delivered = 0, refused = 0;
     piano_qrtr_port_counters(&open, &delivered, &refused);
     PianoAdspHealth h;
@@ -1127,10 +1271,14 @@ void PianoPower::chargingLine(char *line, size_t size)
   w(b.bat_mw, bat, sizeof bat);
   w(b.sys_mw, sys, sizeof sys);
   if (fPolicyOn && fLink.cfg.kick) snprintf(restart, sizeof restart, "; restarts %u", unsigned(fLink.st.kick_count));
+  char state[64] = "";
+  if (fWdog.located && fWdog.last.chgrOk)
+    snprintf(state, sizeof state, "; CHGR state %u (%s)", fWdog.last.state(), chargerStateName(fWdog.last.state()));
   if (!level2)
-    snprintf(line, size, "charging: in ? (level 1: no bus reading without the DSP), battery %+d mA at %d mV (%s W); %s",
+    snprintf(line, size, "charging: in ? (level 1: no bus reading without the DSP), battery %+d mA at %d mV (%s W); %s%s; wdog pets %u",
              bi.ibat_ma, bi.vbat_mv, bat, !bi.battery_valid ? "no battery reading" : bi.ibat_ma >= 50 ? "charging"
-                                                                     : bi.ibat_ma <= -50 ? "draining" : "not charging");
+                                                                     : bi.ibat_ma <= -50 ? "draining" : "not charging", state,
+             fWdog.pets);
   else if (!bi.input_valid)
     snprintf(line, size, "charging: in ? (no bus reading yet), battery %+d mA at %d mV (%s W); %s%s", bi.ibat_ma, bi.vbat_mv, bat,
              piano_charge_balance_name(b.verdict), restart);
@@ -1342,6 +1490,10 @@ void PianoPower::run()
 {
   fStartMs = nowMs();
   if (!probeSpmi()) note("continuing without the SPMI view");
+  if (fSpmi) {
+    startWdog();
+    surveyChargerBlocks();
+  }
   surveyAdsp();
   probeGauges();
   if (gArgs.level >= 2) startCharger();
@@ -1350,6 +1502,8 @@ void PianoPower::run()
   stage(5, "reporting");
   for (;;) {
     uint64_t now = nowMs();
+    WdogWrite pet;
+    if (fWdog.petIfDue(gWriter, now, &pet) && !pet.ok) wdogWriteLine("pet", pet);
     serviceMca(now);
     // The USB-C relay (UsbcRelay.h): its client is ready once the generation is linked, the quiet is down and our UCSI read is through.
     if (fChannel)
@@ -1378,6 +1532,7 @@ void PianoPower::run()
       if (fPanDue && fPanDue < next) next = fPanDue;
     }
     if (fReadyWarnDue && fReadyWarnDue < next) next = fReadyWarnDue;
+    if (fWdog.nextDue() && fWdog.nextDue() < next) next = fWdog.nextDue();
     if (fHandover && !fHandoverAcked && fHandoverUntil < next) next = fHandoverUntil;
     if (fShutdownSeen && !fPolicyEnded && fShutdownUntil < next) next = fShutdownUntil;
     const uint32_t wait = next > now ? uint32_t(next - now < 60000 ? next - now : 60000) : 1;

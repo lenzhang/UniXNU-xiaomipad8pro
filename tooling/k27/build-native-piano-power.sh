@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build package/PianoPower (battery and charging: the fuel gauges, the charger PMIC's port state, the audio DSP's charger firmware) as a
 # k27 native kext: the host tests first (tests/power_host.cpp: the PMIC RTC readout and its date math (PmicRtc.h, RtcReadout.h), the
-# charger PMIC discovery over an SPMI model, the software I2C bus against a bq27z561 model, the MCA codec and charging policy against a
+# charger PMIC discovery and the charger watchdog's gates, pets and clear (ChargerWdog.h) over an SPMI model, the software I2C bus against a bq27z561 model, the MCA codec and charging policy against a
 # model of the DSP, and ChargePolicy wired to the codec (ChargeLink.h, piano-power-policy=1) against the same model; tests/policy_host.cpp:
 # ChargePolicy.c alone against a firmware and source model; tests/port_events_host.cpp: the USB-C port events' fan-out), then the
 # objects in out/native-kexts/PianoPower for tooling/k27/kext/PianoPower.json. Inert without the boot argument piano-power

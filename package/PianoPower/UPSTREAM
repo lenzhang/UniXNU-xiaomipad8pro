@@ -101,3 +101,13 @@ ChargePolicy.c/.h (the charging policy, backlog B4) and ChargeLink.h (its wiring
 xiaomi_mca driver read as a specification (docs/drivers/charging-policy.md §12), the board-thermistor rules from
 docs/drivers/thermal.md §12.7, the precedence of a sink's sources of current (PD, Type-C current, BC 1.2, default USB power) from
 the USB Type-C specification. Nothing copied.
+
+ChargerWdog.h (the charger watchdog, 2026-11-12, docs/drivers/charging-policy.md §18) is new code (BSD-2-Clause-Patent). Register facts
+only, read and never copied (GPL-2.0): the Ubuntu piano kernel tree (unixnu-research/ubuntu-ref/kernel, Linux 7.2.15)
+drivers/power/supply/qcom_smbx.c (sha256 228d32a70853a7488bc299f9ddb9e34f1d942c7834d9ec049ad3d8fc76efed3c; PMI8998): the MISC
+watchdog registers (+0x43 pet bit 0, +0x51 WD_CFG and its bits, +0x53 with bit 7 "a bite disables charging" and the bark/bite fields),
+MISC at the charger base + 0x600, the CHGR status 1 state field and its values, the charging enable command +0x42 and CHGR_CFG2 +0x51,
+and that the host driver disables the watchdog's charging stop; arch/arm64/boot/dts/qcom/pm8150b.dtsi (sha256
+bbca66e6618c1f6003c80753273059c17ba15be425787fece9a73b1e6108ab3a): the vbus regulator at the charger + 0x100 and Type-C at + 0x500.
+Their places on PMIH010x are this repository's inference from its own logs. The owner-channel write in PianoPower.cpp is the arbiter
+v7 write PianoDwc3 (setRestartReason) and PianoTorch (TorchCore.h) already make, re-expressed.
