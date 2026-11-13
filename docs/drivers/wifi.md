@@ -1719,6 +1719,10 @@ through `linkSendWmi`, the teardown after), `tests/profile_host.cpp` (the parser
   name length at 13, passphrase length at 14, a zero byte at 15, the name at 16 (32 bytes), the access point at 48 (6), the
   station address at 54 (6), the passphrase at 60 (64); written with `sysctlbyname("machdep.piano_wifi_join", NULL, NULL, &p,
   124)` as root, read back as a status line of lengths only.
+- **The 27.3 collection with level 7 links** (`tooling/k273/build-k273-image.sh`, the 0066 kernel, 2026-11-13 12:10: 26 native
+  kexts, none from outside this repository; PianoWifiEthernet's vtable check 0 problem slots; `out/k27/kc-k27-native.bin` of
+  this branch's worktree, 114212864 bytes, sha256 `5a8ca2a4...`). That script's own RAM image (the Turnip-staged 27.3 root
+  seed) came out at 251961344 bytes and was refused by the 250 MB rule, as expected for that seed: it is not the probe.
 - **The probe image** (§8.8 boot 10a): not built. The recipe is boot 9a's (`/tmp/a18-build-probe.sh` in the main agent's notes:
   the installed 27.3 entry's line with `data-persist=0`, `PIANO_EXTRA_ARGS="piano-reset-after=900 piano-reset-to=bootloader"`,
   the store seed and its trust cache, the 27.3 collection with the 0066 kernel) with `piano-wifi=6` replaced by `piano-wifi=7`
