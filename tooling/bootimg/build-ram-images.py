@@ -235,6 +235,20 @@ def firmware_addon(payloads, kc, adt, addon):
     return record, addon
 
 
+def boot_args_module():
+    """tooling/adt/boot_args.py (k27 0066: the arguments beyond DarwinBoot's budget in the ADT), loaded by path."""
+    spec = importlib.util.spec_from_file_location('piano_boot_args', DEVICE / 'tooling/adt/boot_args.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# k27 0066 (tooling/adt/boot_args.py): when a line would reach DarwinBoot's budget (or PIANO_BOOT_ARGS_SPLIT=1), the piano-* arguments
+# but the reset and guard ones go into the payload ADT's /chosen/piano-boot-args-ram and both lines say piano-boot-args=ram; the
+# kernel appends the set to the boot-args before anything reads them. Needs 0066 in the collection's kernel (checked).
+BOOT_ARGS_SET = 'ram'
+
+
 def data_store_args(seed, kc, extra=()):
     """The Data store arguments of a RAM test image (docs/data-store.md): (arguments, record).
     PIANO_DATA_PERSIST=0|1|2 when set; else 2 only when the image's seed is the installed one (PIANO_INSTALLED_SEED, or
@@ -385,6 +399,10 @@ def macos_payload(work, kc, trust, seed, adt, utc):
     # test of that entry: its data-persist (and data-store-lba) checked as PIANO_DATA_PERSIST's would be, PIANO_EXTRA_ARGS after it
     # (e.g. piano-reset-after=N piano-reset-to=bootloader), the 1-CPU entry with cpus=1 for sheng-smp=1.
     exact = os.environ.get('PIANO_EXACT_ARGS', '').split()
+    ba = boot_args_module()
+    if any(x.split('=', 1)[0] == ba.PROP for x in exact + extra):
+        raise SystemExit(f'PIANO_EXACT_ARGS / PIANO_EXTRA_ARGS: no {ba.PROP}= (give the whole arguments: an entry record\'s merged line; '
+                         'this tool makes the selector and the ADT set)')
     if exact:
         mode = dict(x.split('=', 1) for x in exact if '=' in x).get('data-persist', '0')
         if os.environ.get('PIANO_DATA_PERSIST', mode) != mode:
@@ -397,11 +415,27 @@ def macos_payload(work, kc, trust, seed, adt, utc):
         persist, store_record = data_store_args(seed, kc, extra)
         base = deny_exec(fast_boot(K27_ARGS, extra), extra, deny_exec_env())
         base = [x for x in base if not x.startswith('data-persist=')] + persist + [f'droidvm-utc={utc}'] + extra
+    base, tail = ba.fit(base, BOOT_ARGS_SET, reserve=len(' sheng-smp=1'), force=os.environ.get('PIANO_BOOT_ARGS_SPLIT', '0') == '1')
     one = ' '.join(base + ['cpus=1'])
     smp = ' '.join(base + ['sheng-smp=1'])
     for line in (one, smp):
-        if len(line) >= 1000:
+        if len(line) >= ba.LINE_MAX:
             raise SystemExit(f'kernel command line is {len(line)} bytes; DarwinBoot passes at most 1023')
+    boot_args = None
+    if tail:
+        if not ba.kc_has_boot_args(kc):
+            raise SystemExit(f'the arguments need the ADT\'s piano-boot-args ({len(" ".join(tail))} bytes beyond the line), and the kernel '
+                             f'in {kc} has no k27 0066: build the collection with K27_KERNEL=<a 0066 kernel>')
+        adt_file = payloads / 'kernel.macho.adt'
+        adt_file.write_bytes(ba.with_set(adt_file.read_bytes(), BOOT_ARGS_SET, tail))
+        merged, status = ba.merged(smp, adt_file.read_bytes())
+        if status != 'appended':
+            raise SystemExit(f'piano-boot-args: the payload ADT does not give the kernel its set ({status})')
+        boot_args = {'set': BOOT_ARGS_SET, 'property': ba.prop_name(BOOT_ARGS_SET), 'tail': ' '.join(tail),
+                     'tail_bytes': len(' '.join(tail)), 'boot_args_8cpu': merged, 'boot_args_bytes_8cpu': len(merged),
+                     'adt_sha256': sha(adt_file)}
+        print(f'piano-boot-args: {len(tail)} argument(s), {boot_args["tail_bytes"]} bytes in /chosen/{boot_args["property"]}; lines '
+              f'{len(one)}/{len(smp)} bytes, boot-args {len(merged)} bytes (8 CPUs)', file=sys.stderr)
     entry = ('[[entry]]\nid = "{id}"\ntitle = "{title}"\ntype = "xnu"\npath = "Payloads/kernel.macho"\n'
              'initrd = "Payloads/scratch-data.img"\nargs = "{args}"\n')
     (stage / 'EFI/UniXNU/unixnu.toml').write_text(
@@ -422,7 +456,7 @@ def macos_payload(work, kc, trust, seed, adt, utc):
         size_mib = tight
     image = work / 'payload-macos.img'
     payload(stage, image, 'PIANOESP', size_mib)
-    return image, {'cmdline_1cpu': one, 'cmdline_8cpu': smp, 'payload_mib': size_mib, 'fast_boot': fast_boot_level(),
+    return image, {'cmdline_1cpu': one, 'cmdline_8cpu': smp, 'boot_args': boot_args, 'payload_mib': size_mib, 'fast_boot': fast_boot_level(),
                    'deny_exec': deny_exec_env(),
                    'data_store': store_record, 'sensor_pack': sensor_pack, 'firmware': firmware}
 
@@ -496,7 +530,8 @@ def main():
             report['images'][image.name] = {**info, **extra, 'payload_sha256': sha(ramdisk), 'payload_bytes': ramdisk.stat().st_size,
                                             'kc_sha256': sha(a.kc), 'trust_sha256': sha(a.trust),
                                             # the payload's ADT: the input's, or its copy with the firmware addon's slot
-                                            'adt_sha256': extra['firmware'].get('adt_sha256') or sha(a.adt),
+                                            'adt_sha256': (extra['boot_args'] or {}).get('adt_sha256') or extra['firmware'].get('adt_sha256')
+                                            or sha(a.adt),
                                             'seed_sha256': sha(a.seed), 'sha256': sha(image), 'bytes': image.stat().st_size}
     (a.out / f'build-{a.fd_name}.json').write_text(json.dumps(report, indent=2) + '\n')
     for name, info in report['images'].items():

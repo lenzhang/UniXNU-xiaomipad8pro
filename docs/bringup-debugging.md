@@ -152,6 +152,25 @@ five points: root mounted from UFS, Data resumed from its store, the same launch
 The arguments every image carries, who reads each, and the four legacy `droidvm-*` names the k27 kernel and the OS image still
 read: [k27-userland-args.md](k27-userland-args.md).
 
+**Beyond DarwinBoot's 1023 bytes (k27 0066, 2026-11-13).** DarwinBoot copies at most 1023 bytes of command line into
+`boot_args.CommandLine` (the bootloader ABI, `BOOT_LINE_LENGTH` 1024), and the tools keep a line under 1000. With patch 0066 in the
+kernel the rest lives in the ADT: the line's `piano-boot-args=NAME` makes the kernel append `/chosen/piano-boot-args-NAME` (a string)
+to a copy of the line, right after the device tree is set up and before any tunable or kext reads an argument
+(`piano-boot-args=0`: none; no selector: `/chosen/piano-boot-args` if the ADT has it). `PE_boot_args()` returns the copy (4096
+bytes), so every `PE_parse_boot_argn()` / `bootArg()` sees both with no change in the kexts; without the property and the selector
+nothing changes. One console line says what happened: `piano-boot-args: /chosen/piano-boot-args-ram (P bytes): T bytes appended,
+boot-args M bytes (line L)` (or why nothing was appended: no such set, a byte outside printable ASCII, too long for 4095).
+`kern.bootargs` keeps its 1024-byte answer, cut after the last whole argument; the USB console's `args` prints the whole line.
+static-if keys (`validation_disables`, `serverperfmode`, `lcks`, `wdt`) must stay on the line (read before the device tree).
+
+The tools split only a line that would reach the budget (`PIANO_BOOT_ARGS_SPLIT=1` forces it): every `piano-*` argument moves to the
+ADT except `piano-reset-after`, `piano-reset-to` and `piano-boot-guard*` (the way back to fastboot even under a kernel without 0066);
+the rest (k27 arguments, `native-ufs-*`, `data-*`, `pstore-*`, `droidvm-*`, `cpus`/`sheng-smp`) stays, order kept within each part, so
+for one name the last value still wins. `tooling/adt/boot_args.py` (`--show ADT --line LINE` prints the sets and the boot-args the
+kernel makes; `--self-test`), `build-ram-images.py` (set `ram` in the payload's ADT; refuses a collection whose kernel lacks 0066).
+Host test: `tooling/k27/test-piano-bootargs.sh`. `build-esp.py` and `tooling/k273/build-dual-esp.py` do not split yet (the next ESP
+is the 27.3 line's only; its entry would take its own set, `piano-boot-args=<entry id>`, in its kernel's ADT).
+
 ### 5.3 The ADT identity (`configs/k27-adt.toml`, `configs/k27-gop-display.toml`)
 
 | Item | Value | Why |

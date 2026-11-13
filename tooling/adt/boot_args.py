@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""k27 0066's host side: the kernel arguments beyond DarwinBoot's budget live in the ADT (docs/bringup-debugging.md §4a).
+"""k27 0066's host side: the kernel arguments beyond DarwinBoot's budget live in the ADT (docs/bringup-debugging.md §5.2).
 
 DarwinBoot passes at most 1023 bytes of command line, and the tools keep the line under LINE_MAX (1000). With k27 0066 in the kernel,
 the line's piano-boot-args=NAME makes it append the ADT's /chosen/piano-boot-args-NAME to the boot-args (piano-boot-args=0 none; no
