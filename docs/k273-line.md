@@ -125,6 +125,22 @@ Checklist of the first 27.3 boot (each with the console line that answers it):
 7. Login with the debug account; Dock, Finder; Metal clients (`log show` of WindowServer for Metal plugin errors: new MTLDevice
    selectors in 27.3 abort here).
 
+**The boot-args beyond 1023 bytes (k27 0066, 2026-11-13; [bringup-debugging.md](bringup-debugging.md) §5.2).** The installed 27.3
+entry's line is 989 bytes; with 0066 in the kernel the `piano-*` driver arguments move into the ADT (`/chosen/piano-boot-args-NAME`,
+the line says `piano-boot-args=NAME`) and the kernel appends them to the boot-args before anything reads them. Kernel:
+`tooling/k273/prepare-k27-tree.sh` on a k27 tree with 0066 applied (`kernel-k273-0066-s0001-native.macho`, sha256 `8b70f531...`).
+First RAM test `ram-k273-bootargs` (sha256 `48bbc4ac...`, 237281280 bytes): the installed entry's line with `data-persist=0` plus
+`piano-audio=1 piano-reset-after=900 piano-reset-to=bootloader`, built with
+`PIANO_DATA_PERSIST=0 PIANO_EXACT_ARGS="<line>" PIANO_EXTRA_ARGS="piano-audio=1 piano-reset-after=900 piano-reset-to=bootloader"
+build-ram-images.py --kc <27.3 KC with the 0066 kernel> --seed/--trust out/inputs/k273/store-seed/... --adt out/adt/piano-k27.adt`:
+line 663 bytes (8 CPUs) with `piano-boot-args=ram`, 23 arguments (407 bytes) in `/chosen/piano-boot-args-ram`, boot-args 1071 bytes;
+the seed 89860516 and `data-store-lba=117998394` as the entry's. Checklist: (1) console `piano-boot-args: /chosen/piano-boot-args-ram
+(408 bytes): 407 bytes appended, boot-args 1071 bytes (line 663)`; (2) `PianoAudio: start: piano-audio=1 ...` and `PianoAudio: survey
+done: ...` (the kext's probe declines without `piano-audio`, which only the ADT carries); (3) the drivers whose arguments all moved
+come up as on the installed entry: the USB console (`piano-usb=2`), the root shell and USB network, the A830 desktop, touch, Wi-Fi
+level 6; (4) on the USB console `args` prints the 1071-byte line; `sysctl kern.bootargs` the same (under 1024: whole); (5) the
+reset after 900 s (it stayed on the line) or `reset fastboot`.
+
 ## 5. Open questions and blockers
 
 - Trust/signing: the System volume of the IPSW is unsealed ("Sealed: No") and the k27 dev build publishes the windows unverified
