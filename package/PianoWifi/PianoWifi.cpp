@@ -2500,6 +2500,8 @@ int level5(PowerState &power, const Options &opt)
 // level 5 described to the firmware, and everything is polled from this one thread: no MSI, no interrupt, no allocation after
 // the window. Every wait is bounded by piano-wifi-wmitimeout (and piano-wifi-scanwait for the scan).
 Ce gCe;
+HttRx gHtt;                         // the receive rings and their buffers (P23), out of the same window
+bool gHttPlanned;
 Link gLink;
 volatile bool gLinkRunning;         // the ladder's thread is inside level 6: the power hook asks it to stop instead of racing
 volatile uint32_t gStopRequested;   // set by the power hook, read by the ladder each turn
@@ -2558,9 +2560,16 @@ void publishScan(IOService *owner, const ScanList &list, bool full)
     const ScanEntry &entry = list.entries[i];
     char bssid[24] = {};
     scanFormatBssid(entry, full, bssid, sizeof bssid);
-    note("level 6: network %u: ssid \"%s\"%s bssid %s channel %u (%u MHz) signal %d dBm, %u beacon(s) %u probe(s)", i,
-         entry.ssidLength ? entry.ssid : "", entry.hidden ? " (it does not say its name)" : "", bssid, entry.channel,
-         entry.freq, int(entry.rssi), entry.beacons, entry.probes);
+    // A network's name is the owner's environment as much as its address: the log carries its length only, unless the owner
+    // asked for whole names and addresses (piano-wifi-bssid=1); the registry property keeps both for the tablet's own tool.
+    char name[48] = {};
+    if (full)
+      snprintf(name, sizeof name, "\"%s\"", entry.ssidLength ? entry.ssid : "");
+    else
+      snprintf(name, sizeof name, "of %u byte(s)", unsigned(entry.ssidLength));
+    note("level 6: network %u: a name %s%s, bssid %s channel %u (%u MHz) signal %d dBm, %u beacon(s) %u probe(s)", i, name,
+         entry.hidden ? " (it does not say its name)" : "", bssid, entry.channel, entry.freq, int(entry.rssi), entry.beacons,
+         entry.probes);
   }
 }
 
@@ -2583,10 +2592,24 @@ void linkTeardown()
 int level6(IOService *owner, PowerState &power, const Options &opt)
 {
   stage(600, "level 6: the copy engine, the host transport and the firmware's messages");
-  if (!cePlan(gCe, gArena)) {
+  // P23: with the receive buffers asked for, pipe 4 (the data interface's messages out) gets a ring too, and the receive rings
+  // and their buffers come out of the window and are filled before anything is announced. A window without room for them
+  // only leaves them out.
+  const bool wantRx = (gArgs.l6pre & kPreRxRings) != 0;
+  if (!cePlan(gCe, gArena, wantRx ? kCePipeMaskWithHtt : kCePipeMaskLevel6)) {
     stage(-600, "level 6: the DMA window has no room for the copy engine's rings and buffers");
     safeOff(gHw, power, opt);
     return -1;
+  }
+  gHttPlanned = false;
+  if (wantRx) {
+    gHttPlanned = httPlan(gHtt, gArena, (gArgs.l6pre & kPreRbmSw1) != 0);
+    if (gHttPlanned) httFill(gHtt);
+    note("level 6: the receive rings: %s (a refill ring of %u buffers of %u bytes for the firmware, %u radio buffer rings of "
+         "%u, an error ring of %u, %u status rings of %u buffers; the buffers return to %s)",
+         gHttPlanned ? "planned and filled, announced after the first scan" : "not planned: the window has no room for them",
+         kRxRefillEntries - 1, kRxBufferBytes, kRxRadios, kRxMacBufEntries, kRxErrDstEntries, kRxRadios,
+         kRxMonStatusEntries - 1, (gArgs.l6pre & kPreRbmSw1) ? "software ring 1" : "the firmware's own manager");
   }
   ceProgram(gCe, gChipIo);
   unsigned posted = 0;
@@ -2602,6 +2625,7 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
   options.regWaitMs = gArgs.l6regwait;
   options.paceMs = gArgs.l6pace;
   options.holdMs = gArgs.l6hold;
+  options.htt = gHttPlanned ? &gHtt : nullptr;
   note("level 6: before the virtual device (piano-wifi-l6pre=%#x): hardware mode %u, the radio's parameters %u, the channel "
        "list %u (the regulatory event waited for %u, up to %u ms), a usable device address %u, paced %u ms, no scan %u",
        gArgs.l6pre, (gArgs.l6pre & kPreHwMode) ? 1u : 0u, (gArgs.l6pre & kPrePdevParams) ? 1u : 0u,
@@ -2614,8 +2638,11 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
   linkBegin(gLink, gCe, gChipIo, options, started);
   gLinkRunning = true;
   // Six message steps, the four of the radio's set-up (P22) and the scan — or the hold instead of it.
-  const uint64_t overall = started + uint64_t(gArgs.wmiTimeoutMs) * 10 + gArgs.l6regwait +
-                           ((gArgs.l6pre & kPreNoScan) ? gArgs.l6hold : gArgs.scanWaitMs);
+  // P23 adds the data interface's connection, two statistics waits, its version, the rings and a second scan.
+  const uint64_t overall = started + uint64_t(gArgs.wmiTimeoutMs) * 12 + gArgs.l6regwait +
+                           ((gArgs.l6pre & kPreNoScan) ? gArgs.l6hold : gArgs.scanWaitMs) +
+                           ((gArgs.l6pre & kPreRxRings) ? gArgs.scanWaitMs + 4000u : 0u) +
+                           ((gArgs.l6pre & kPreDiag) ? 2000u : 0u);
   int step = gLink.step;
   while (step != kLinkDone && step != kLinkStopped) {
     if (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE)) {
@@ -2709,6 +2736,57 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
     for (uint32_t i = 0; i < gLink.unknownEvents && i < 8 && at + 12 < sizeof ids; ++i)
       at += uint32_t(snprintf(ids + at, sizeof ids - at, "%s%#x", i ? ", " : "", gLink.unknownEvent[i]));
     note("level 6: %u event(s) this level knows nothing about: %s", gLink.unknownEvents, ids);
+  }
+  // P23: what each scan round saw (the first without the receive buffers, the second with them), the radio's own counters,
+  // the data interface and the rings, and every event identifier with its count.
+  if (gArgs.l6pre & kPreRxRings)
+    note("level 6: the data interface: %s, version %s%u.%u, %u message(s) out, %u in (types %#x %#x %#x %#x), %u peer map(s); "
+         "rings announced %u of %u; refill: %u buffer(s) given, the firmware's tail at %u; status buffers given back %u; error "
+         "entries %u; radio buffer rings filled to %u and %u",
+         gLink.httRefused ? "refused" : gLink.httEndpoint > 0 ? "connected" : "not connected",
+         gHtt.versionSeen ? "" : "not answered, ", gHtt.versionMajor, gHtt.versionMinor, gLink.httMessages, gHtt.t2hMessages,
+         gHtt.t2hTypes[0], gHtt.t2hTypes[1], gHtt.t2hTypes[2], gHtt.t2hTypes[3], gHtt.peerMaps, gHtt.announced, kHttRings,
+         gHtt.refillPosted, gHtt.refillTaken, gHtt.statusRecycled, gHtt.errorsSeen, gHtt.macBufFilled[0],
+         gHtt.macBufFilled[1]);
+  for (uint32_t r = 0; r < 2; ++r) {
+    const ScanRound &round = gLink.rounds[r];
+    if (!round.ran) continue;
+    note("level 6: scan round %u (%s): %s, %u scan event(s), %u channel visit(s), %u management frame(s), %u network(s) new "
+         "in this round",
+         r + 1, r ? "with the receive buffers" : "before the receive buffers",
+         round.completed ? wmiScanReasonName(round.reason) : round.started ? "it did not report an end" : "it did not start",
+         round.scanEvents, round.channels, round.mgmtFrames, round.networks);
+    // The channel visits: frequency, noise floor, and the busy and receiving shares of the visit's cycles (a radio that hears
+    // the air has busy and receiving cycles even when it keeps no frame).
+    for (uint32_t i = 0; i < round.visits; i += 6) {
+      char line[260] = {};
+      uint32_t at = 0;
+      for (uint32_t k = i; k < round.visits && k < i + 6 && at + 40 < sizeof line; ++k) {
+        const ChanVisit &v = round.visit[k];
+        const uint32_t busy = v.cycles ? uint32_t(uint64_t(v.busy) * 100 / v.cycles) : 0;
+        const uint32_t rx = v.cycles ? uint32_t(uint64_t(v.rxFrames) * 100 / v.cycles) : 0;
+        at += uint32_t(snprintf(line + at, sizeof line - at, "%s%u: nf %d busy %u%% rx %u%%", k > i ? "; " : "", v.freq,
+                                int(v.noiseFloor), busy, rx));
+      }
+      note("level 6: round %u visits: %s", r + 1, line);
+    }
+    if (round.stats.seen)
+      note("level 6: round %u radio: nf %d, cycles %u (busy %u, receiving %u, transmitting %u), PHY errors %u; received: "
+           "statuses %u, MPDUs to the host %u and to the firmware %u (MSDUs %u and %u), MPDU errors %u, PHY errors %u (%u "
+           "dropped)",
+           r + 1, int(round.stats.noiseFloor), round.stats.cycles, round.stats.busyCycles, round.stats.rxCycles,
+           round.stats.txCycles, round.stats.phyErrCount, round.stats.statusRcvd, round.stats.httMpdus, round.stats.locMpdus,
+           round.stats.httMsdus, round.stats.locMsdus, round.stats.mpduErrs, round.stats.phyErrs, round.stats.phyErrDrop);
+    else if (gArgs.l6pre & kPreDiag)
+      note("level 6: round %u radio: the statistics were not answered", r + 1);
+  }
+  for (uint32_t i = 0; i < gLink.eventKinds; i += 8) {
+    char line[200] = {};
+    uint32_t at = 0;
+    for (uint32_t k = i; k < gLink.eventKinds && k < i + 8 && at + 20 < sizeof line; ++k)
+      at += uint32_t(snprintf(line + at, sizeof line - at, "%s%#x x%u", k > i ? ", " : "", gLink.eventCount[k].id,
+                              gLink.eventCount[k].count));
+    note("level 6: events by identifier: %s%s", line, gLink.eventKindsDropped && i + 8 >= gLink.eventKinds ? " (and more)" : "");
   }
   note("level 6: the scan: %u channel(s) asked for, started %u, %u scan event(s), %u channel visit(s), %s%s",
        gLink.request.channelCount, gLink.scanStarted ? 1u : 0u, gLink.scanEventsSeen, gLink.scanChannels,
@@ -3104,8 +3182,10 @@ void PianoWifi::run()
   // ---- level 6 ---------------------------------------------------------------------------------------------------------
   // level 6's own overall bound (six message steps and the scan) is inside its hard deadline
   {
-    const uint32_t own = gArgs.wmiTimeoutMs * 10 + gArgs.l6regwait +
-                         ((gArgs.l6pre & kPreNoScan) ? gArgs.l6hold : gArgs.scanWaitMs) + 5000;
+    const uint32_t own = gArgs.wmiTimeoutMs * 12 + gArgs.l6regwait +
+                         ((gArgs.l6pre & kPreNoScan) ? gArgs.l6hold : gArgs.scanWaitMs) +
+                         ((gArgs.l6pre & kPreRxRings) ? gArgs.scanWaitMs + 4000u : 0u) +
+                         ((gArgs.l6pre & kPreDiag) ? 2000u : 0u) + 5000;
     levelBegin(6, own > gArgs.deadlineMs ? own : gArgs.deadlineMs);
   }
   rc = level6(this, power, opt);

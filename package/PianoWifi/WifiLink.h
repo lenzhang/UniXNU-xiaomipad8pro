@@ -26,6 +26,7 @@
 #include "WifiAssoc.h"
 #include "WifiCe.h"
 #include "WifiHtc.h"
+#include "WifiHtt.h"
 #include "WifiWmi.h"
 
 namespace pianowifi {
@@ -37,6 +38,10 @@ enum LinkStep : int {
   // The radio's set-up between the firmware's ready event and the virtual device (P22, docs §10.27), each behind a bit of
   // piano-wifi-l6pre. They run in this order, and their numbers are above the ladder's so that 601-612 keep their meaning.
   kLinkHwMode = 620, kLinkPdevParams = 621, kLinkRegWait = 622, kLinkChanList = 623, kLinkHold = 624,
+  // The receive buffers and the scan's diagnostics (P23, docs §10.28): the data interface connected before the message
+  // interface, the radio's statistics after a scan, the data interface's version, the receive rings announced, and then the
+  // second scan.
+  kLinkConnectHtt = 625, kLinkStats = 626, kLinkHttVersion = 627, kLinkRxRings = 628,
 };
 
 enum LinkError : int {
@@ -47,7 +52,8 @@ enum LinkError : int {
 // What the machine still has to send. One at a time: the firmware answers each before the next is due.
 enum LinkPending : uint32_t {
   kLinkSendNothing = 0, kLinkSendConnect, kLinkSendSetup, kLinkSendInit, kLinkSendVdev, kLinkSendScan, kLinkSendStopScan,
-  kLinkSendDeleteVdev, kLinkSendHwMode, kLinkSendPdevParam, kLinkSendChanList,
+  kLinkSendDeleteVdev, kLinkSendHwMode, kLinkSendPdevParam, kLinkSendChanList, kLinkSendConnectHtt, kLinkSendStats,
+  kLinkSendHttVersion, kLinkSendSrng,
 };
 
 inline const char *linkStepName(int step)
@@ -70,6 +76,10 @@ inline const char *linkStepName(int step)
   case kLinkRegWait: return "waiting for the regulatory event";
   case kLinkChanList: return "the channel list";
   case kLinkHold: return "holding after the virtual device (piano-wifi-l6pre bit 6)";
+  case kLinkConnectHtt: return "connecting the firmware's data interface";
+  case kLinkStats: return "the radio's statistics";
+  case kLinkHttVersion: return "the data interface's version";
+  case kLinkRxRings: return "the receive rings";
   default: return "stopped";
   }
 }
@@ -104,6 +114,38 @@ struct LinkOptions {
   uint32_t regWaitMs = kPreRegWaitMsDefault;
   uint32_t paceMs = kPrePaceMsDefault;
   uint32_t holdMs = kPreHoldMsDefault;
+  // P23: the receive rings the owner planned and filled (null: no receive buffers, whatever the bit says), how long the
+  // statistics and the data interface's version are waited for, and how long the rings settle before the second scan.
+  HttRx *htt = nullptr;
+  uint32_t statsWaitMs = 1000, httVersionWaitMs = 2000, ringSettleMs = 300;
+};
+
+// One channel visit as the firmware's channel-information event ends it.
+struct ChanVisit {
+  uint32_t freq = 0, busy = 0, cycles = 0, rxFrames = 0, txFrames = 0, clockMhz = 0;
+  int32_t noiseFloor = 0;
+};
+constexpr unsigned kChanVisitsMax = 32;
+
+// The radio's statistics, as one record of the stats event carries them (the counters this level logs).
+struct PdevStats {
+  bool seen = false;
+  int32_t noiseFloor = 0;
+  uint32_t txCycles = 0, rxCycles = 0, busyCycles = 0, cycles = 0, phyErrCount = 0;
+  uint32_t statusRcvd = 0, httMsdus = 0, httMpdus = 0, locMsdus = 0, locMpdus = 0, phyErrs = 0, phyErrDrop = 0, mpduErrs = 0;
+};
+
+// What one scan round saw (the first without the receive buffers, the second with them).
+struct ScanRound {
+  bool ran = false, started = false, completed = false;
+  uint32_t reason = 0, scanEvents = 0, channels = 0, mgmtFrames = 0, frames = 0, networks = 0;
+  ChanVisit visit[kChanVisitsMax];
+  uint32_t visits = 0, visitStarts = 0;
+  PdevStats stats;
+};
+
+struct EventCount {
+  uint32_t id = 0, count = 0;
 };
 
 struct Link {
@@ -138,6 +180,15 @@ struct Link {
   uint32_t unknownEvent[8] = {};
   uint32_t unknownEvents = 0;
   int lastCommandStep = 0;        // the step whose command went out last: what a firmware death comes after
+  // P23: the data interface's endpoint, the two scan rounds, every event identifier with its count
+  int httEndpoint = -1;
+  bool httRefused = false, httVersionSent = false;
+  uint32_t srngSent = 0, httMessages = 0;
+  uint32_t round = 0;             // the scan round running (0 the first, 1 the second)
+  ScanRound rounds[2];
+  uint64_t statsDeadline = 0, httDeadline = 0, ringSettle = 0;
+  EventCount eventCount[24];
+  uint32_t eventKinds = 0, eventKindsDropped = 0;
   void (*note)(void *ctx, int step, const char *what) = nullptr;
   void *noteCtx = nullptr;
 };
@@ -293,6 +344,56 @@ inline bool sendPending(Link &link, uint64_t nowMs)
     if (rc == 1) link.settle = nowMs + link.options.settleMs;
     break;
   }
+  case kLinkSendConnectHtt:
+    // The data interface: no credit flow control and no receive credits, as this chip's own host connects it.
+    rc = send(link, 0, [](uint8_t *at, uint32_t capacity) {
+      return htcBuildConnect(at, capacity, uint16_t(kSvcHttData), 0, false);
+    });
+    break;
+  case kLinkSendStats:
+    rc = send(link, uint8_t(link.endpoint), [](uint8_t *at, uint32_t capacity) {
+      WmiWriter w;
+      wmiBegin(w, at, capacity, kWmiCmdRequestStats);
+      uint8_t *cmd = wmiStruct(w, kWmiTagRequestStatsCmd, 5);
+      if (cmd) {
+        wmiPut(cmd, 0, kWmiStatsPdev);
+        wmiPut(cmd, 1, 0);          // the device: none (the radio's own counters)
+        wmiPut(cmd, 4, kWmiPdevIdSoc);
+      }
+      return wmiEnd(w);
+    });
+    break;
+  case kLinkSendHttVersion:
+    rc = send(link, uint8_t(link.httEndpoint), [](uint8_t *at, uint32_t capacity) { return httBuildVersionReq(at, capacity); });
+    if (rc == 1) {
+      link.httVersionSent = true;
+      ++link.httMessages;
+    }
+    break;
+  case kLinkSendSrng: {
+    HttRx *rx = link.options.htt;
+    if (!rx || link.srngSent >= kHttRings) {
+      link.pending = kLinkSendNothing;
+      return false;
+    }
+    const HttRing ring = rx->ring[link.srngSent];
+    rc = send(link, uint8_t(link.httEndpoint), [&](uint8_t *at, uint32_t capacity) {
+      return httBuildSrngSetup(at, capacity, ring);
+    });
+    if (rc == 1) {
+      rx->ring[link.srngSent].announced = true;
+      ++rx->announced;
+      ++link.srngSent;
+      ++link.httMessages;
+      if (link.srngSent < kHttRings) {
+        link.pending = kLinkSendSrng;   // the next ring on a later turn
+        link.lastCommandStep = link.step;
+        return true;
+      }
+      link.ringSettle = nowMs + link.options.ringSettleMs;
+    }
+    break;
+  }
   case kLinkSendHwMode:
     rc = send(link, uint8_t(link.endpoint), [](uint8_t *at, uint32_t capacity) {
       WmiWriter w;
@@ -410,6 +511,84 @@ inline void afterReady(Link &link, uint64_t nowMs)
   afterPre(link, kLinkHwMode, nowMs);
 }
 
+// Every event identifier with its count (P23): the first 24 kinds are kept, the rest counted together.
+inline void countEvent(Link &link, uint32_t id)
+{
+  for (uint32_t i = 0; i < link.eventKinds; ++i)
+    if (link.eventCount[i].id == id) {
+      ++link.eventCount[i].count;
+      return;
+    }
+  if (link.eventKinds < sizeof link.eventCount / sizeof link.eventCount[0]) {
+    link.eventCount[link.eventKinds].id = id;
+    link.eventCount[link.eventKinds].count = 1;
+    ++link.eventKinds;
+    return;
+  }
+  ++link.eventKindsDropped;
+}
+
+// The round's own counts, taken when it ends (the scan list and the frame counters run on across both rounds).
+inline void closeRound(Link &link)
+{
+  ScanRound &r = link.rounds[link.round < 2 ? link.round : 1];
+  if (!r.ran) return;
+  uint32_t framesBefore = 0, mgmtBefore = 0, eventsBefore = 0, channelsBefore = 0, networksBefore = 0;
+  if (link.round == 1) {
+    framesBefore = link.rounds[0].frames;
+    mgmtBefore = link.rounds[0].mgmtFrames;
+    eventsBefore = link.rounds[0].scanEvents;
+    channelsBefore = link.rounds[0].channels;
+    networksBefore = link.rounds[0].networks;
+  }
+  r.frames = link.scan.frames - framesBefore;
+  r.mgmtFrames = link.mgmtFrames - mgmtBefore;
+  r.scanEvents = link.scanEventsSeen - eventsBefore;
+  r.channels = link.scanChannels - channelsBefore;
+  r.networks = link.scan.count - networksBefore;
+  r.started = link.scanStarted;
+  r.completed = link.scanCompleted;
+  r.reason = link.scanReason;
+}
+
+// After a scan round: the radio's statistics (bit 8), then — after the first round, with the receive buffers asked for and the
+// data interface connected — the data interface's version, the receive rings and the second round; then the teardown.
+inline void afterScan(Link &link, uint64_t nowMs)
+{
+  const uint32_t pre = link.options.pre;
+  ScanRound &r = link.rounds[link.round < 2 ? link.round : 1];
+  if ((pre & kPreDiag) && !r.stats.seen && link.step != kLinkStats) {
+    enter(link, kLinkStats, nowMs);
+    link.statsDeadline = nowMs + link.options.statsWaitMs;
+    link.pending = kLinkSendStats;
+    return;
+  }
+  closeRound(link);
+  if (link.round == 0 && (pre & kPreRxRings) && link.options.htt && link.httEndpoint > 0) {
+    enter(link, kLinkHttVersion, nowMs);
+    link.httDeadline = nowMs + link.options.httVersionWaitMs;
+    link.pending = kLinkSendHttVersion;
+    return;
+  }
+  enter(link, kLinkTeardown, nowMs);
+  link.stopped = true;   // nothing to stop: the scan ended by itself
+  link.pending = kLinkSendDeleteVdev;
+}
+
+// The second round: a fresh scan identifier (so that a late event of the first is not taken for one of the second), and
+// the flags of a scan that has not run yet.
+inline void startRound2(Link &link, uint64_t nowMs)
+{
+  link.round = 1;
+  link.rounds[1].ran = true;
+  link.request.scanId = kWmiScanId + 2;
+  link.scanStarted = false;
+  link.scanCompleted = false;
+  link.scanReason = 0;
+  enter(link, kLinkScanStart, nowMs);
+  link.pending = kLinkSendScan;
+}
+
 inline void onControl(Link &link, const HtcRx &rx, uint64_t nowMs)
 {
   switch (rx.message) {
@@ -427,11 +606,32 @@ inline void onControl(Link &link, const HtcRx &rx, uint64_t nowMs)
       fail(link, kLinkErrState);
       return;
     }
+    // P23: the data interface is connected before the message interface, as this chip's own host does, when the receive
+    // buffers are asked for and the owner planned them (and pipe 4 with them).
+    if ((link.options.pre & kPreRxRings) && link.options.htt) {
+      enter(link, kLinkConnectHtt, nowMs);
+      link.pending = kLinkSendConnectHtt;
+      return;
+    }
     enter(link, kLinkConnect, nowMs);
     link.pending = kLinkSendConnect;
     return;
   }
   case kHtcMsgConnectServiceResp: {
+    if (link.step == kLinkConnectHtt) {
+      // The data interface's answer. A refusal is not the level's failure: the receive buffers are then left out and the
+      // message interface is connected as before.
+      HtcConnect answer;
+      uint8_t ul = 0, dl = 0;
+      if (htcParseConnectResp(link.htc, rx.payload, rx.length, answer) && answer.service == kSvcHttData &&
+          pipesOf(answer.service, ul, dl) && htcEndpointOpen(link.htc, answer, ul, dl, false, 0))
+        link.httEndpoint = int(answer.endpoint);
+      else
+        link.httRefused = true;
+      enter(link, kLinkConnect, nowMs);
+      link.pending = kLinkSendConnect;
+      return;
+    }
     if (link.step != kLinkConnect) {
       ++link.unexpected;
       return;
@@ -465,6 +665,7 @@ inline void onEvent(Link &link, const uint8_t *message, uint32_t length, uint64_
   const uint32_t payloadLength = length - kWmiCmdHeaderBytes;
   ++link.events;
   link.lastEvent = id;
+  countEvent(link, id);
   switch (id) {
   case kWmiEvtServiceReady:
     if (link.step != kLinkCapability) {
@@ -515,12 +716,59 @@ inline void onEvent(Link &link, const uint8_t *message, uint32_t length, uint64_
     if (ev.type & (kWmiScanEvCompleted | kWmiScanEvDequeued)) {
       link.scanCompleted = true;
       link.scanReason = ev.reason;
-      if (link.step != kLinkTeardown) {   // the teardown may already be running (it is what asked the scan to stop)
-        enter(link, kLinkTeardown, nowMs);
-        link.stopped = true;             // nothing to stop: the scan ended by itself
-        link.pending = kLinkSendDeleteVdev;
-      }
+      if (link.step != kLinkTeardown) afterScan(link, nowMs);   // the teardown may already be running (it asked it to stop)
     }
+    return;
+  }
+  case kWmiEvtChanInfo: {
+    // The channel visit's counters (P23): one event at its start and one at its end; the end's are kept for the round.
+    uint32_t size = 0;
+    const uint8_t *ev = wmiFind(payload, payloadLength, kWmiTagChanInfoEvent, &size);
+    if (!ev || size < 13 * 4) return;
+    ScanRound &r = link.rounds[link.round < 2 ? link.round : 1];
+    if (wmiGet(ev, 2) == 0) {
+      ++r.visitStarts;
+      return;
+    }
+    if (r.visits == kChanVisitsMax) return;
+    ChanVisit &v = r.visit[r.visits++];
+    v.freq = wmiGet(ev, 1);
+    v.noiseFloor = int32_t(wmiGet(ev, 3));
+    v.busy = wmiGet(ev, 4);
+    v.cycles = wmiGet(ev, 5);
+    v.rxFrames = wmiGet(ev, 8);
+    v.txFrames = wmiGet(ev, 11);
+    v.clockMhz = wmiGet(ev, 12);
+    return;
+  }
+  case kWmiEvtUpdateStats: {
+    // The radio's statistics (P23): the fixed structure says how many records of each kind the byte array carries; the
+    // radio's come after the device and beacon records, as the chip's own host reads them.
+    uint32_t size = 0;
+    const uint8_t *fixed = wmiFind(payload, payloadLength, kWmiTagStatsEvent, &size);
+    uint32_t dataSize = 0;
+    const uint8_t *data = wmiFind(payload, payloadLength, kWmiTagArrayByte, &dataSize);
+    if (!fixed || size < 9 * 4 || !data) return;
+    const uint32_t pdevs = wmiGet(fixed, 1), vdevs = wmiGet(fixed, 2), bcns = wmiGet(fixed, 8);
+    if (!pdevs || vdevs || bcns) return;   // only the radio's record was asked for
+    if (dataSize < kWmiPdevStatsWords * 4) return;
+    PdevStats &st = link.rounds[link.round < 2 ? link.round : 1].stats;
+    st.seen = true;
+    st.noiseFloor = int32_t(wmiGet(data, 0));
+    st.txCycles = wmiGet(data, 1);
+    st.rxCycles = wmiGet(data, 2);
+    st.busyCycles = wmiGet(data, 3);
+    st.cycles = wmiGet(data, 4);
+    st.phyErrCount = wmiGet(data, 5);
+    const uint8_t *rxs = data + kWmiPdevStatsRxAt * 4;
+    st.statusRcvd = wmiGet(rxs, 1);
+    st.httMsdus = wmiGet(rxs, 6);
+    st.httMpdus = wmiGet(rxs, 7);
+    st.locMsdus = wmiGet(rxs, 8);
+    st.locMpdus = wmiGet(rxs, 9);
+    st.phyErrs = wmiGet(rxs, 11);
+    st.phyErrDrop = wmiGet(rxs, 12);
+    st.mpduErrs = wmiGet(rxs, 13);
     return;
   }
   case kWmiEvtMgmtRx: {
@@ -552,7 +800,6 @@ inline void onEvent(Link &link, const uint8_t *message, uint32_t length, uint64_
     return;
   }
   case kWmiEvtServiceAvailable:
-  case kWmiEvtChanInfo:
   case kWmiEvtVdevDeleteResp:
   case kWmiEvtDebugMessage:
   case kWmiEvtDiag:
@@ -604,6 +851,10 @@ inline void linkReceive(Link &link, const uint8_t *data, uint32_t length, uint64
     onControl(link, rx, nowMs);
     return;
   case kHtcPayload:
+    if (link.httEndpoint > 0 && int(rx.endpoint) == link.httEndpoint) {
+      if (link.options.htt) httReceive(*link.options.htt, rx.payload, rx.length);
+      return;
+    }
     if (int(rx.endpoint) != link.endpoint || rx.length < kWmiCmdHeaderBytes) {
       ++link.unexpected;
       return;
@@ -630,10 +881,36 @@ inline int linkRun(Link &link, uint64_t nowMs)
     if (kind == kCeReceived) linkReceive(link, va, length, nowMs);
   });
   for (unsigned i = 0; i < kCeHostPipeCount; ++i) cePostRx(*link.ce, link.io, i);
+  // The receive rings the hardware consumes, kept from running dry (P23), every turn once they are announced.
+  if (link.options.htt && link.options.htt->announced) httTurn(*link.options.htt);
   if (link.step == kLinkDone || link.step == kLinkStopped) return link.step;
   if (link.pending != kLinkSendNothing) {
     sendPending(link, nowMs);
     if (link.step == kLinkStopped) return link.step;
+  }
+  // P23: the radio's statistics arrived, or their wait ran out.
+  if (link.step == kLinkStats && link.pending == kLinkSendNothing &&
+      (link.rounds[link.round < 2 ? link.round : 1].stats.seen || nowMs >= link.statsDeadline)) {
+    const bool answered = link.rounds[link.round < 2 ? link.round : 1].stats.seen;
+    if (!answered) link.options.pre &= ~kPreDiag;   // no answer: not asked again this level
+    afterScan(link, nowMs);
+    sendPending(link, nowMs);
+    return link.step;
+  }
+  // P23: the data interface's version answered (or not), then the rings announced one per turn, then the second round.
+  if (link.step == kLinkHttVersion && link.pending == kLinkSendNothing &&
+      (link.options.htt->versionSeen || nowMs >= link.httDeadline)) {
+    enter(link, kLinkRxRings, nowMs);
+    link.pending = kLinkSendSrng;
+    sendPending(link, nowMs);
+    return link.step;
+  }
+  if (link.step == kLinkRxRings && link.pending == kLinkSendNothing && link.srngSent == kHttRings && link.ringSettle &&
+      nowMs >= link.ringSettle) {
+    link.ringSettle = 0;
+    startRound2(link, nowMs);
+    sendPending(link, nowMs);
+    return link.step;
   }
   // The initialisation follows the chip's capability once its extended events are in (or the short wait is over).
   if (link.step == kLinkCapability && link.caps.seen && link.pending == kLinkSendNothing && link.extSettle &&
@@ -671,6 +948,7 @@ inline int linkRun(Link &link, uint64_t nowMs)
       return link.step;
     }
     enter(link, kLinkScanStart, nowMs);
+    link.rounds[0].ran = true;
     link.pending = kLinkSendScan;
     sendPending(link, nowMs);
     return link.step;
@@ -703,7 +981,17 @@ inline int linkRun(Link &link, uint64_t nowMs)
     // runs. Anything else at a deadline is.
     if (link.step == kLinkScanning && link.scanStarted) {
       link.scanTimedOut = true;
+      closeRound(link);
       enter(link, kLinkTeardown, nowMs);
+      return link.step;
+    }
+    // The statistics, the data interface's version and the rings have their own waits above; a deadline there is not the
+    // level's failure either: the teardown runs with what the first round found.
+    if (link.step == kLinkStats || link.step == kLinkHttVersion || link.step == kLinkRxRings) {
+      closeRound(link);
+      enter(link, kLinkTeardown, nowMs);
+      link.stopped = true;
+      link.pending = kLinkSendDeleteVdev;
       return link.step;
     }
     return fail(link, kLinkErrTimeout);

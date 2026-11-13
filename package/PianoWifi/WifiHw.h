@@ -538,12 +538,16 @@ constexpr uint32_t kCeStatusLenShift = 16, kCeStatusLenMask = 0xffffu;
 struct CeHostPipe { uint8_t pipe; uint32_t srcEntries, dstEntries, bufferBytes; };
 constexpr CeHostPipe kCeHostPipes[] = {
   {0, 16, 0, 0},        // the transport's control messages out
-  {1, 0, 32, 2048},     // the firmware's data messages in (unused before level 7, kept so a copy cannot stall)
+  {1, 0, 32, 2048},     // the firmware's data messages in (its data interface's answers, P23)
   {2, 0, 64, 2048},     // the firmware's and the transport's messages in
   {3, 32, 0, 0},        // the host's messages out
+  {4, 32, 0, 0},        // the host's data-interface messages out (P23: only when the receive buffers are asked for)
 };
 constexpr unsigned kCeHostPipeCount = sizeof kCeHostPipes / sizeof kCeHostPipes[0];
-constexpr unsigned kCePipeCtrlOut = 0, kCePipeDataIn = 1, kCePipeMsgIn = 2, kCePipeMsgOut = 3;
+constexpr unsigned kCePipeCtrlOut = 0, kCePipeDataIn = 1, kCePipeMsgIn = 2, kCePipeMsgOut = 3, kCePipeHttOut = 4;
+// The pipes a level plans and programs, by pipe number: level 6's four, and pipe 4 as well with the receive buffers (P23), so
+// that a boot without them programs exactly the registers it always did.
+constexpr uint32_t kCePipeMaskLevel6 = 0x0fu, kCePipeMaskWithHtt = 0x1fu;
 constexpr uint32_t kCeSendBuffers = 8;            // ours: the messages in flight on the two outbound pipes
 constexpr uint32_t kCeSendBufferBytes = 2048;     // the largest message either outbound pipe carries
 constexpr uint32_t kCeDstKeepFree = 2;            // elements of a destination ring left without a buffer
@@ -687,10 +691,67 @@ constexpr uint8_t kLocalMac[6] = {0x02, 0x50, 0x49, 0x41, 0x4e, 0x01};
 // take Ubuntu's whole order and the next can leave a piece out without a rebuild.
 constexpr uint32_t kPreHwMode = 1u << 0, kPrePdevParams = 1u << 1, kPreChanList = 1u << 2, kPreVdevMac = 1u << 3,
                    kPreRegWait = 1u << 4, kPrePace = 1u << 5, kPreNoScan = 1u << 6;
-constexpr uint32_t kPreDefault = kPreHwMode | kPrePdevParams | kPreChanList | kPreVdevMac | kPreRegWait | kPrePace;
+// P23 (docs §10.28): bit 7 the receive buffers — the data interface connected, its version, the receive rings with their
+// buffers, and a **second scan** after them, so one boot compares a scan without them with one with them; bit 8 the scan's
+// diagnostics (the channel-information counters and the radio's statistics after each scan); bit 9 the receive buffers
+// return to "software ring 1", as the chip's own host has them, instead of to the firmware's own manager.
+constexpr uint32_t kPreRxRings = 1u << 7, kPreDiag = 1u << 8, kPreRbmSw1 = 1u << 9;
+constexpr uint32_t kPreDefault = kPreHwMode | kPrePdevParams | kPreChanList | kPreVdevMac | kPreRegWait | kPrePace |
+                                 kPreRxRings | kPreDiag;
 constexpr uint32_t kPreRegWaitMsDefault = 2000;   // for the firmware's regulatory event, which it sends after the init
 constexpr uint32_t kPrePaceMsDefault = 50;        // between the pieces, so that a log names the last command before a death
 constexpr uint32_t kPreHoldMsDefault = 8000;      // with kPreNoScan: how long the level holds after the virtual device
+
+// ---- the receive buffers and the scan's diagnostics (P23, docs §10.28) ----
+// On this chip family the receive DMA has no buffers of its own: the host fills a ring of empty buffers for the firmware
+// (host to firmware, "software to software"), and the firmware hands them on to one buffer ring per radio, which the host
+// also provides (empty). No frame — not even a beacon the firmware would forward as a management-frame event — can be received
+// before that. The rings are announced through the firmware's data interface (HTT, transport service 0x0300 on pipes 4 out /
+// 1 in, connected before the message interface, no credit flow control and no receive credits), with a version request after
+// the firmware's ready event. Facts of the Ubuntu tree of §3 (dp_htt, dp_rx, hal): behaviour, message layouts and values only.
+constexpr uint32_t kHttMsgVersionReq = 0x00, kHttMsgSrngSetup = 0x0b, kHttMsgRxRingSelectionCfg = 0x0c;
+constexpr uint32_t kHttT2hVersionConf = 0x00, kHttT2hPeerMap = 0x03;
+constexpr uint32_t kHttVersionMajor = 3;          // the major version this host speaks
+// The version request: word 0 the message type (7:0); word 1 one option — tag (7:0) 5 "TCL metadata version", length (15:8) 4,
+// value (31:16) 2. Its answer: word 0 type (7:0), minor (15:8), major (23:16).
+constexpr uint32_t kHttOptionTclMetadataVersion = 5, kHttOptionTclMetadataLength = 4, kHttTclMetadataV2 = 2;
+// A ring set up (HTT_SRING_SETUP, 13 words): word 0 type (7:0), the radio (15:8: the radio's number plus one for a ring of the
+// receive DMA, the radio itself for a host-to-firmware ring), the ring (23:16), its kind (31:24); 1-2 its base; 3 its size in
+// words (15:0), an entry's size in words (23:16) and "no loop count" (bit 25, rings the host produces into the hardware); 4-5
+// where the head pointer lives, 6-7 the tail pointer (both in host memory: these rings belong to the radio's own units); 8-10
+// the MSI address and data (none); 11 interrupt batching (none); 12 low threshold and "answer wanted" (none).
+constexpr uint32_t kHttSrngSetupWords = 13;
+constexpr uint32_t kHttSrngLoopCountDisable = 1u << 25;
+enum HttRingKind : uint32_t { kHttHwToSw = 0, kHttSwToHw = 1, kHttSwToSw = 2 };
+enum HttRingId : uint32_t {
+  kHttRingRxdmaHostBuf = 0, kHttRingRxdmaMonitorStatus = 1, kHttRingHost1ToFwRxbuf = 5, kHttRingRxdmaNonMonitorDest = 7,
+};
+// A receive-buffer entry: word 0 the buffer's address (31:0); word 1 its high bits (7:0), the manager it returns to (11:8) and
+// a cookie of the host's (31:12). The returning manager this chip's host gives its receive buffers is "software ring 1" (6);
+// "the firmware's own" is 4, which keeps a buffer the firmware has finished with inside the chip (the host's release rings are
+// level 8's). The destination ring of the receive DMA's errors has entries of 8 words.
+constexpr uint32_t kRxBufEntryWords = 2, kRxDmaDstEntryWords = 8;
+constexpr uint32_t kRxBufRbmFw = 4, kRxBufRbmSw1 = 6;
+constexpr uint32_t kRxBufAddrHiMask = 0xffu, kRxBufRbmShift = 8, kRxBufCookieShift = 12, kRxBufCookieMask = 0xfffffu;
+// How many of each this host makes (the chip's own host uses 2048/4096/1024; the firmware takes the sizes from the messages).
+constexpr uint32_t kRxRefillEntries = 512, kRxMacBufEntries = 512, kRxErrDstEntries = 128, kRxMonStatusEntries = 64;
+constexpr uint32_t kRxBufferBytes = 2048, kRxRadios = 2;
+// The scan's diagnostics: the firmware's channel-information event (one at the start and one at the end of every channel visit:
+// its counters of busy and receiving cycles and its noise floor say whether the radio hears anything at all), and its radio
+// statistics (WMI_REQUEST_STATS for the radio, answered by WMI_UPDATE_STATS: the receive counters say whether frames reached
+// the firmware). Channel information: error (0), frequency (1), start 0 / end 1 (2), noise floor (3), busy cycles (4), all
+// cycles (5), two power words (6, 7), receiving cycles (8), our network's (9), 11b data time (10), transmitting cycles (11),
+// the counters' clock in MHz (12), the device (13).
+constexpr uint32_t kWmiEvtUpdateStats = 0x1d004;
+constexpr uint32_t kWmiCmdRequestStats = 0x16001;
+constexpr uint32_t kWmiTagChanInfoEvent = 0x026, kWmiTagRequestStatsCmd = 0x08f, kWmiTagStatsEvent = 0x046;
+constexpr uint32_t kWmiStatsPdev = 1u << 2;
+// The stats event: its fixed structure (stats kind, then how many radio, device, peer, beacon-filter, channel, MIB records,
+// the radio, beacon and two extended peer counts) and a byte array of records. A radio record is 44 words: 7 of its own (noise
+// floor, transmitting, receiving, busy and all cycles, PHY errors, power), 23 of transmission, 14 of reception (mid-PPDU route
+// changes, statuses received, four fragment counters, MSDUs and MPDUs through the data interface, MSDUs and MPDUs delivered
+// to the firmware itself, oversize A-MSDUs, PHY errors, PHY errors dropped, MPDU errors).
+constexpr uint32_t kWmiStatsEventWords = 11, kWmiPdevStatsWords = 44, kWmiPdevStatsRxAt = 30;
 
 // ---- level 7: the regulatory event, the channel list, a started station, a peer, the association (WifiSta.h, WifiAssoc.h) ----
 // Wire facts of the same Ubuntu tree (docs/drivers/wifi.md section 3): the identifiers count up from their group's first

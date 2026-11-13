@@ -180,11 +180,12 @@ inline uint32_t freeEntries(const CeRing &r)
 }  // namespace cedetail
 
 // The rings, the buffers and the block of pointers out of the arena. False when the arena has no room for all of it.
-inline bool cePlan(Ce &ce, Arena &arena)
+inline bool cePlan(Ce &ce, Arena &arena, uint32_t pipeMask = kCePipeMaskLevel6)
 {
   using namespace cedetail;
   uint32_t rings = 0;
-  for (const CeHostPipe &p : kCeHostPipes) rings += (p.srcEntries ? 1u : 0u) + (p.dstEntries ? 2u : 0u);
+  for (const CeHostPipe &p : kCeHostPipes)
+    if (pipeMask & (1u << p.pipe)) rings += (p.srcEntries ? 1u : 0u) + (p.dstEntries ? 2u : 0u);
   uint64_t pointersBus = 0;
   uint8_t *pointers = arenaAlloc(arena, 4 * rings, &pointersBus);   // the chip's own pointers, in one block of its own
   if (!pointers) return false;
@@ -194,6 +195,7 @@ inline bool cePlan(Ce &ce, Arena &arena)
     const CeHostPipe &want = kCeHostPipes[i];
     CePipe &pipe = ce.pipes[i];
     pipe.pipe = want.pipe;
+    if (!(pipeMask & (1u << want.pipe))) continue;   // a pipe this level does not use: no ring, no register written
     const uint32_t srcUnit = kUnitCe0Src + want.pipe * kCeUnitStride;
     const uint32_t dstUnit = kUnitCe0Dst + want.pipe * kCeUnitStride;
     if (want.srcEntries) {

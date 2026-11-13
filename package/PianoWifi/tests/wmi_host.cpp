@@ -197,9 +197,76 @@ struct Firmware {
   bool answerScanStarted = true, answerScanCompleted = true, sendBeacons = true, badFrameLength = false,
        shortBeacon = false, manyNetworks = false, wrongStepEvent = false, sendExtended = true, badStatus = false;
   uint32_t creditsGivenBack = 0;
+  // P23: the data interface, its rings as the firmware reads them from the set-up messages, and a radio that — like the chip
+  // on the tablet — keeps no frame unless the host gave it receive buffers (rxNeedsRings).
+  uint8_t httEndpoint = 1;
+  bool httConnectSeen = false, httVersionSeen = false, rxNeedsRings = true, answerStats = true, answerHtt = true;
+  uint32_t scanIdSeen = kWmiScanId, scansSeen = 0;
+  uint32_t httOption = 0, statsRequests = 0, framesDelivered = 0, framesDropped = 0, statusTaken = 0, chanInfoSent = 0;
+  struct Ring {
+    bool seen = false;
+    uint32_t kind = 0, htt = 0, radio = 0, sizeWords = 0, entryWords = 0, flags = 0;
+    uint64_t base = 0, head = 0, tail = 0;
+  };
+  std::vector<Ring> rings;
+  uint32_t srngSeen = 0, refillRbm = 0xff, refillCookieMax = 0;
 
-  // A message to the host on pipe 2, with the transport's header and (for the message interface's endpoint) a credit report.
-  void toHost(uint8_t endpoint, const uint8_t *payload, uint32_t length, bool giveCredit)
+  Ring *ringOf(uint32_t htt, uint32_t radio)
+  {
+    for (Ring &r : rings)
+      if (r.htt == htt && r.radio == radio) return &r;
+    return nullptr;
+  }
+  uint32_t word(uint64_t bus)
+  {
+    const uint8_t *at = device->at(bus, 4);
+    return at ? get32(at) : 0;
+  }
+  void setWord(uint64_t bus, uint32_t v)
+  {
+    uint8_t *at = device->at(bus, 4);
+    if (at) put32(at, v);
+  }
+  // One receive buffer taken from the refill ring, as the firmware does before the receive DMA can write a frame: false when
+  // the host gave none (or none is left). The entry must name a buffer inside the window and the manager the host chose.
+  bool takeRefillBuffer()
+  {
+    Ring *refill = ringOf(kHttRingHost1ToFwRxbuf, 0);
+    if (!refill || !refill->entryWords) return false;
+    const uint32_t head = word(refill->head), tail = word(refill->tail);
+    if (head == tail) return false;
+    const uint8_t *entry = device->at(refill->base + uint64_t(tail) * 4, 8);
+    if (!entry) return false;
+    const uint64_t bus = uint64_t(get32(entry)) | uint64_t(get32(entry + 4) & kRxBufAddrHiMask) << 32;
+    CHECK(device->at(bus, kRxBufferBytes) != nullptr);
+    refillRbm = (get32(entry + 4) >> kRxBufRbmShift) & 0xfu;
+    const uint32_t cookie = get32(entry + 4) >> kRxBufCookieShift;
+    if (cookie > refillCookieMax) refillCookieMax = cookie;
+    setWord(refill->tail, (tail + refill->entryWords) % refill->sizeWords);
+    return true;
+  }
+  // One status buffer of a radio taken by the receive DMA (its tail moved), as the hardware does for every PPDU it receives.
+  void takeStatusBuffer(uint32_t radio)
+  {
+    Ring *status = ringOf(kHttRingRxdmaMonitorStatus, radio + 1);
+    if (!status || !status->entryWords) return;
+    const uint32_t head = word(status->head), tail = word(status->tail);
+    if (head == tail) return;
+    setWord(status->tail, (tail + status->entryWords) % status->sizeWords);
+    ++statusTaken;
+  }
+  // An error entry from the receive DMA (its head moved), which the host must give back by moving its tail.
+  void pushError()
+  {
+    Ring *errors = ringOf(kHttRingRxdmaNonMonitorDest, 1);
+    if (!errors || !errors->entryWords) return;
+    const uint32_t head = word(errors->head);
+    setWord(errors->head, (head + errors->entryWords) % errors->sizeWords);
+  }
+
+  // A message to the host (on pipe 2, or pipe 1 for the data interface), with the transport's header and (for the message
+  // interface's endpoint) a credit report.
+  void toHost(uint8_t endpoint, const uint8_t *payload, uint32_t length, bool giveCredit, uint8_t pipe = 2)
   {
     std::vector<uint8_t> message(kHtcHeaderBytes + length, 0);
     const uint32_t trailerBytes = giveCredit ? kHtcRecordHeaderBytes + kHtcCreditReportBytes : 0;
@@ -217,7 +284,7 @@ struct Firmware {
     put32(message.data(), uint32_t(endpoint) | (trailerBytes ? uint32_t(kHtcFlagTrailerPresent) << kHtcHdrFlagsShift : 0u) |
                               (payloadLength & 0xffffu) << kHtcHdrLengthShift);
     put32(message.data() + 4, trailerBytes & 0xffu);
-    device->toHost.push_back({2, message});
+    device->toHost.push_back({pipe, message});
   }
 
   void sendReady()
@@ -236,13 +303,24 @@ struct Firmware {
     const uint32_t word0 = get32(payload);
     const uint16_t id = uint16_t(word0 & kHtcMsgIdMask);
     if (id == kHtcMsgConnectService) {
-      connectSeen = true;
       const uint16_t service = uint16_t(word0 >> kHtcServiceShift);
-      CHECK(service == kSvcWmiControl);
       const uint32_t flags = get32(payload + 4);
-      CHECK((flags & kHtcConnFlagDisableCreditFlow) == 0);   // the message interface keeps credit flow control
       uint8_t answer[12] = {};
       put32(answer, uint32_t(kHtcMsgConnectServiceResp) | uint32_t(service) << kHtcServiceShift);
+      if (service == kSvcHttData) {
+        // The data interface, which must come before the message interface: no credit flow control, no credits.
+        httConnectSeen = true;
+        CHECK(!connectSeen);
+        CHECK((flags & kHtcConnFlagDisableCreditFlow) != 0);
+        CHECK(((flags >> kHtcConnRecvAllocShift) & 0xffu) == 0);
+        put32(answer + 4, uint32_t(answerHtt ? 0 : 1) | uint32_t(httEndpoint) << kHtcRespEndpointShift |
+                              uint32_t(256) << kHtcRespMaxMessageShift);
+        toHost(0, answer, sizeof answer, false);
+        return;
+      }
+      connectSeen = true;
+      CHECK(service == kSvcWmiControl);
+      CHECK((flags & kHtcConnFlagDisableCreditFlow) == 0);   // the message interface keeps credit flow control
       put32(answer + 4, uint32_t(connectStatus) | uint32_t(wmiEndpoint) << kHtcRespEndpointShift |
                             uint32_t(2048) << kHtcRespMaxMessageShift);
       toHost(0, answer, sizeof answer, false);
@@ -356,16 +434,21 @@ struct Firmware {
     put32(buffer + 8, reason);
     put32(buffer + 12, freq);
     put32(buffer + 16, kWmiScanRequestorId);
-    put32(buffer + 20, kWmiScanId);
+    put32(buffer + 20, scanIdSeen);
     put32(buffer + 24, 0);
     event(kWmiEvtScan, buffer, 4 + words * 4);
   }
 
   // A beacon (or a probe answer) as the firmware hands it over: the header with the channel and the signal strength, then the
-  // frame itself.
+  // frame itself. A radio that needs the host's receive buffers keeps none without them (P23).
   void sendBeacon(const char *ssid, const uint8_t *bssid, uint32_t freq, int32_t rssi, uint8_t channel, bool probe,
                   bool truncate = false)
   {
+    if (rxNeedsRings && !takeRefillBuffer()) {
+      ++framesDropped;
+      return;
+    }
+    ++framesDelivered;
     std::vector<uint8_t> frame;
     const uint32_t ssidLength = ssid ? uint32_t(std::strlen(ssid)) : 0;
     frame.resize(kDot11HeaderBytes + kDot11BeaconFixedBytes + 2 + ssidLength + 3, 0);
@@ -397,9 +480,32 @@ struct Firmware {
     event(kWmiEvtMgmtRx, buffer, length);
   }
 
+  // The channel-information events of one visit: its start, then its end with the counters (the radio hears the air whether
+  // or not it has buffers: the counters are not zero either way, which is what tells "no buffers" from "a deaf radio").
+  void sendChanInfo(uint32_t freq, bool end)
+  {
+    uint8_t buffer[96] = {};
+    put32(buffer, (14 * 4) | uint32_t(kWmiTagChanInfoEvent) << kWmiTlvTagShift);
+    put32(buffer + 4 + 4 * 1, freq);
+    put32(buffer + 4 + 4 * 2, end ? 1u : 0u);
+    put32(buffer + 4 + 4 * 3, uint32_t(-96));
+    put32(buffer + 4 + 4 * 4, end ? 4000u : 0u);
+    put32(buffer + 4 + 4 * 5, end ? 10000u : 0u);
+    put32(buffer + 4 + 4 * 8, end ? 1500u : 0u);
+    put32(buffer + 4 + 4 * 12, 160);
+    event(kWmiEvtChanInfo, buffer, 4 + 14 * 4);
+    ++chanInfoSent;
+  }
+
   void runScan()
   {
     if (answerScanStarted) sendScanEvent(kWmiScanEvStarted, 0, 2412);
+    for (uint32_t freq : channelList) {
+      sendChanInfo(freq, false);
+      takeStatusBuffer(0);
+      sendChanInfo(freq, true);
+    }
+    if (ringOf(kHttRingRxdmaNonMonitorDest, 1)) pushError();
     if (sendBeacons) {
       const uint8_t one[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
       const uint8_t two[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x66};
@@ -450,6 +556,33 @@ struct Firmware {
       CHECK(wmiGet(cmd, 0) == kWmiPdevIdSoc);
       params.push_back({wmiGet(cmd, 1), wmiGet(cmd, 2)});
       ++paramsSeen;
+      return;
+    }
+    case kWmiCmdRequestStats: {
+      ++statsRequests;
+      uint32_t size = 0;
+      const uint8_t *cmd = wmiFind(tlvs, left, kWmiTagRequestStatsCmd, &size);
+      CHECK(cmd && size == 5 * 4);
+      if (!cmd) return;
+      CHECK(wmiGet(cmd, 0) == kWmiStatsPdev && wmiGet(cmd, 4) == kWmiPdevIdSoc);
+      if (!answerStats) return;
+      // the fixed structure, then one radio record in a byte array
+      std::vector<uint8_t> buffer(4 + kWmiStatsEventWords * 4 + 4 + kWmiPdevStatsWords * 4, 0);
+      put32(buffer.data(), (kWmiStatsEventWords * 4) | uint32_t(kWmiTagStatsEvent) << kWmiTlvTagShift);
+      put32(buffer.data() + 4 + 4 * 0, kWmiStatsPdev);
+      put32(buffer.data() + 4 + 4 * 1, 1);
+      uint8_t *array = buffer.data() + 4 + kWmiStatsEventWords * 4;
+      put32(array, (kWmiPdevStatsWords * 4) | uint32_t(kWmiTagArrayByte) << kWmiTlvTagShift);
+      uint8_t *record = array + 4;
+      put32(record + 4 * 0, uint32_t(-96));
+      put32(record + 4 * 2, 30000);            // receiving cycles: the radio hears
+      put32(record + 4 * 3, 80000);
+      put32(record + 4 * 4, 200000);
+      uint8_t *rx = record + kWmiPdevStatsRxAt * 4;
+      put32(rx + 4 * 1, 40 + framesDelivered);  // statuses received
+      put32(rx + 4 * 9, framesDelivered);       // MPDUs delivered to the firmware itself
+      put32(rx + 4 * 13, framesDropped);        // MPDU errors
+      event(kWmiEvtUpdateStats, buffer.data(), uint32_t(buffer.size()));
       return;
     }
     case kWmiCmdScanChanList: {
@@ -523,7 +656,9 @@ struct Firmware {
       const uint8_t *cmd = wmiFind(tlvs, left, kWmiTagStartScanCmd, &size);
       CHECK(cmd && size == kWmiStartScanWords * 4);
       if (!cmd) return;
-      CHECK(wmiGet(cmd, 0) == kWmiScanId);
+      scanIdSeen = wmiGet(cmd, 0);
+      ++scansSeen;
+      CHECK(scanIdSeen == kWmiScanId || scanIdSeen == kWmiScanId + 2);   // the second round has its own identifier (P23)
       CHECK(wmiGet(cmd, 1) == kWmiScanRequestorId);
       CHECK(wmiGet(cmd, 2) == 0);
       CHECK(wmiGet(cmd, 5) == kWmiScanDwellActiveMs && wmiGet(cmd, 6) == kWmiScanDwellPassiveMs);
@@ -550,7 +685,7 @@ struct Firmware {
       uint32_t size = 0;
       const uint8_t *cmd = wmiFind(tlvs, left, kWmiTagStopScanCmd, &size);
       CHECK(cmd && size == 5 * 4);
-      if (cmd) CHECK(wmiGet(cmd, 1) == kWmiScanId && wmiGet(cmd, 2) == kWmiStopScanOne);
+      if (cmd) CHECK(wmiGet(cmd, 1) == scanIdSeen && wmiGet(cmd, 2) == kWmiStopScanOne);
       if (cmd) CHECK(wmiGet(cmd, 0) == 0 && wmiGet(cmd, 3) == 0 && wmiGet(cmd, 4) == kWmiPdevIdSoc);
       sendScanEvent(kWmiScanEvCompleted, kWmiScanReasonCancelled, 0);
       return;
@@ -568,6 +703,48 @@ struct Firmware {
     }
   }
 
+  // The data interface's messages: the version request answered on pipe 1, a ring's set-up read the way the firmware reads it.
+  void onHtt(const uint8_t *payload, uint32_t length)
+  {
+    CHECK(length >= 4);
+    const uint32_t type = get32(payload) & 0xffu;
+    if (type == kHttMsgVersionReq) {
+      CHECK(length == 8);
+      httVersionSeen = true;
+      httOption = get32(payload + 4);
+      uint8_t answer[8] = {};
+      put32(answer, kHttT2hVersionConf | 0x1u << 8 | kHttVersionMajor << 16);
+      toHost(httEndpoint, answer, 4, false, 1);
+      return;
+    }
+    if (type == kHttMsgSrngSetup) {
+      CHECK(length == kHttSrngSetupWords * 4);
+      ++srngSeen;
+      Ring r;
+      r.seen = true;
+      const uint32_t w0 = get32(payload);
+      r.radio = (w0 >> 8) & 0xffu;
+      r.htt = (w0 >> 16) & 0xffu;
+      r.kind = (w0 >> 24) & 0xffu;
+      r.base = uint64_t(get32(payload + 4)) | uint64_t(get32(payload + 8)) << 32;
+      const uint32_t w3 = get32(payload + 12);
+      r.sizeWords = w3 & 0xffffu;
+      r.entryWords = (w3 >> 16) & 0xffu;
+      r.flags = w3 & ~0xffffffu;
+      r.head = uint64_t(get32(payload + 16)) | uint64_t(get32(payload + 20)) << 32;
+      r.tail = uint64_t(get32(payload + 24)) | uint64_t(get32(payload + 28)) << 32;
+      // what the firmware would check before it programs anything: everything inside the window, whole entries
+      CHECK(r.entryWords && r.sizeWords % r.entryWords == 0);
+      CHECK(device->at(r.base, r.sizeWords * 4) != nullptr);
+      CHECK(device->at(r.head, 4) != nullptr && device->at(r.tail, 4) != nullptr);
+      CHECK((r.kind == kHttSwToHw) == ((r.flags & kHttSrngLoopCountDisable) != 0));
+      for (unsigned i = 8; i < kHttSrngSetupWords; ++i) CHECK(get32(payload + 4 * i) == 0);   // no MSI, no interrupts
+      rings.push_back(r);
+      return;
+    }
+    CHECK(false);   // a data-interface message this firmware does not know
+  }
+
   // Everything the chip took from the host this turn.
   void drain()
   {
@@ -581,6 +758,9 @@ struct Firmware {
       CHECK(payload + kHtcHeaderBytes <= message.size());
       if (endpoint == 0) {
         onControl(message.data() + kHtcHeaderBytes, payload);
+      } else if (endpoint == httEndpoint && httConnectSeen) {
+        CHECK(device->fromHost.empty() || true);
+        onHtt(message.data() + kHtcHeaderBytes, payload);
       } else if (endpoint == wmiEndpoint) {
         onCommand(message.data() + kHtcHeaderBytes, payload);
         // The credit the firmware gives back when it has taken a message out of one of its receive buffers: without it a
@@ -598,6 +778,8 @@ struct Host {
   Device device;
   Arena arena;
   Ce ce;
+  HttRx htt;
+  bool hasHtt = false;
   Link link;
   Firmware firmware;
   uint64_t now = 1000;
@@ -609,16 +791,25 @@ struct Host {
     h.steps.push_back({step, what});
   }
 
-  bool start()
+  // The receive rings, planned and filled the way the kext does it when piano-wifi-l6pre asks for them (P23); withHtt=false
+  // is the level 6 of the first two tablet boots (four pipes, no rings).
+  bool start(bool withHtt = true, bool rbmSw1 = false)
   {
     arenaInit(arena, device.memory.data(), kBusBase, uint32_t(device.memory.size()));
-    if (!cePlan(ce, arena)) return false;
+    if (!cePlan(ce, arena, withHtt ? kCePipeMaskWithHtt : kCePipeMaskLevel6)) return false;
     ceProgram(ce, device.io());
     for (unsigned i = 0; i < kCeHostPipeCount; ++i) cePostRx(ce, device.io(), i);
+    hasHtt = withHtt && httPlan(htt, arena, rbmSw1);
+    if (hasHtt) httFill(htt);
     firmware.device = &device;
     link.note = &Host::note;
     link.noteCtx = this;
-    return true;
+    return withHtt ? hasHtt : true;
+  }
+  void begin(LinkOptions options = LinkOptions{})
+  {
+    if (hasHtt) options.htt = &htt;
+    linkBegin(link, ce, device.io(), options, now);
   }
   // One turn: the chip, the firmware, then the driver.
   void turn(uint32_t ms = 5)
@@ -745,7 +936,7 @@ static void testLadder()
   Host h;
   CHECK(h.start());
   LinkOptions options;
-  linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+  h.begin(options);
   h.firmware.sendReady();
   CHECK(h.run() == kLinkDone);
   CHECK(h.link.error == kLinkErrNone && linkFinished(h.link));
@@ -790,25 +981,16 @@ static void testLadder()
   // The teardown: nothing to stop (the scan ended by itself), the virtual device deleted.
   CHECK(!h.firmware.stopSeen && h.firmware.deleteSeen);
   CHECK(h.link.unexpected == 0 && h.ce.dropped == 0 && h.ce.refused == 0);
-  // Every step was announced once, in the ladder's order: 601 to 606, then the radio's set-up (620-623, whose numbers are
-  // above the ladder's so that the older ones keep their meaning), then 607 to 611.
-  CHECK(h.steps.size() >= 9);
-  CHECK(h.steps.front().first == kLinkTransport && h.steps.back().first == kLinkDone);
-  static const int order[] = {kLinkTransport, kLinkConnect,    kLinkSetup,     kLinkCapability, kLinkInit,
-                              kLinkReadyWait, kLinkHwMode,     kLinkPdevParams, kLinkRegWait,   kLinkChanList,
-                              kLinkVdev,      kLinkScanStart,  kLinkScanning,  kLinkHold,       kLinkTeardown,
-                              kLinkDone};
-  const auto place = [](int step) {
-    for (unsigned i = 0; i < sizeof order / sizeof order[0]; ++i)
-      if (order[i] == step) return int(i);
-    return -1;
-  };
-  int previous = -1;
-  for (const auto &step : h.steps) {
-    const int at = place(step.first);
-    CHECK(at >= 0 && at > previous);
-    previous = at;
-  }
+  // Every step was announced, in the ladder's order: 601, the data interface (625), 602 to 606, the radio's set-up (620-623,
+  // whose numbers are above the ladder's so that the older ones keep their meaning), 607 to 609, the statistics (626), the
+  // data interface's version and the receive rings (627, 628), the second round (608, 609, 626), the teardown and done.
+  static const int expected[] = {kLinkTransport, kLinkConnectHtt, kLinkConnect,    kLinkSetup,      kLinkCapability,
+                                 kLinkInit,      kLinkReadyWait,  kLinkHwMode,     kLinkPdevParams, kLinkChanList,
+                                 kLinkVdev,      kLinkScanStart,  kLinkScanning,   kLinkStats,      kLinkHttVersion,
+                                 kLinkRxRings,   kLinkScanStart,  kLinkScanning,   kLinkStats,      kLinkTeardown,
+                                 kLinkDone};
+  CHECK(h.steps.size() == sizeof expected / sizeof expected[0]);
+  for (unsigned i = 0; i < h.steps.size() && i < sizeof expected / sizeof expected[0]; ++i) CHECK(h.steps[i].first == expected[i]);
   // The address in a log line: masked unless the owner asked for all of it.
   char masked[32] = {}, full[32] = {};
   scanFormatBssid(h.link.scan.entries[0], false, masked, sizeof masked);
@@ -823,7 +1005,7 @@ static void testRadioSetup()
   {   // the whole order: the hardware mode, the six parameters, the regulatory event, the channel list, the device, the scan
     Host h;
     CHECK(h.start());
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run(800) == kLinkDone);
     CHECK(h.firmware.hwModeSeen && h.firmware.hwModeIndex == kWmiHwModeDbs && h.firmware.hwModePdev == kWmiPdevIdSoc);
@@ -869,7 +1051,7 @@ static void testRadioSetup()
     Host h;
     CHECK(h.start());
     h.firmware.regExtended = true;
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run(800) == kLinkDone);
     CHECK(h.link.reg.seen && h.link.reg.extended && h.link.reg.ruleCount == 3);
@@ -881,7 +1063,7 @@ static void testRadioSetup()
     h.firmware.sendReg = false;
     LinkOptions options;
     options.regWaitMs = 60;
-    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.begin(options);
     h.firmware.sendReady();
     CHECK(h.run(800) == kLinkDone);
     CHECK(!h.link.reg.seen && h.link.chanListSent && !h.link.chanListFromEvent);
@@ -891,7 +1073,7 @@ static void testRadioSetup()
   {   // the address of the virtual device: the firmware's own when it has one
     Host h;
     CHECK(h.start());
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run(800) == kLinkDone);
     CHECK(std::memcmp(h.firmware.vdevMac, h.firmware.mac, 6) == 0);
@@ -902,7 +1084,7 @@ static void testRadioSetup()
     CHECK(h.start());
     std::memset(h.firmware.mac, 0, sizeof h.firmware.mac);
     h.firmware.extraMacs = 1;
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run(800) == kLinkDone);
     CHECK(h.link.ready.extraMacSeen);
@@ -912,7 +1094,7 @@ static void testRadioSetup()
     Host h;
     CHECK(h.start());
     std::memset(h.firmware.mac, 0, sizeof h.firmware.mac);
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run(800) == kLinkDone);
     CHECK(std::memcmp(h.firmware.vdevMac, kLocalMac, 6) == 0);
@@ -923,7 +1105,7 @@ static void testRadioSetup()
     CHECK(h.start());
     LinkOptions options;
     options.pre = 0;
-    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.begin(options);
     h.firmware.sendReady();
     CHECK(h.run(800) == kLinkDone);
     CHECK(!h.firmware.hwModeSeen && h.firmware.paramsSeen == 0 && !h.firmware.chanListSeen);
@@ -935,7 +1117,7 @@ static void testRadioSetup()
     LinkOptions options;
     options.pre = kPreDefault | kPreNoScan;
     options.holdMs = 60;
-    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.begin(options);
     h.firmware.sendReady();
     CHECK(h.run(800) == kLinkDone);
     CHECK(h.firmware.vdevSeen && !h.firmware.scanSeen && h.firmware.deleteSeen);
@@ -945,7 +1127,7 @@ static void testRadioSetup()
     Host h;
     CHECK(h.start());
     h.firmware.hwModeStatus = 1;
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run(800) == kLinkDone);
     CHECK(h.link.hwModeAnswered && h.link.hwModeStatus == 1 && h.link.error == kLinkErrNone);
@@ -953,7 +1135,7 @@ static void testRadioSetup()
   {   // an event this level knows nothing about: its identifier is kept for the log
     Host h;
     CHECK(h.start());
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     for (unsigned i = 0; i < 800 && h.link.step != kLinkScanning; ++i) h.turn();
     uint8_t buffer[32] = {};
@@ -966,13 +1148,151 @@ static void testRadioSetup()
   }
 }
 
+// ================================================= the receive buffers and the scan's diagnostics (P23, section 10.28)
+static void testReceiveBuffers()
+{
+  {   // the tablet's case: a radio that keeps no frame without the host's buffers — none in the first round, all in the second
+    Host h;
+    CHECK(h.start());
+    h.begin(LinkOptions{});
+    h.firmware.sendReady();
+    CHECK(h.run(1200) == kLinkDone);
+    CHECK(h.link.error == kLinkErrNone);
+    // the data interface, before the message interface, then its version
+    CHECK(h.firmware.httConnectSeen && h.link.httEndpoint == int(h.firmware.httEndpoint) && !h.link.httRefused);
+    CHECK(h.link.endpoint == int(h.firmware.wmiEndpoint));
+    CHECK(h.link.htc.ep[h.firmware.httEndpoint].ulPipe == 4 && h.link.htc.ep[h.firmware.httEndpoint].dlPipe == 1);
+    CHECK(!h.link.htc.ep[h.firmware.httEndpoint].creditFlow);
+    CHECK(h.firmware.httVersionSeen && h.htt.versionSeen && h.htt.versionMajor == kHttVersionMajor);
+    CHECK(h.firmware.httOption == (kHttOptionTclMetadataVersion | kHttOptionTclMetadataLength << 8 | kHttTclMetadataV2 << 16));
+    // the six rings, as the firmware read them
+    CHECK(h.firmware.srngSeen == kHttRings && h.htt.announced == kHttRings && h.link.srngSent == kHttRings);
+    const auto *refill = h.firmware.ringOf(kHttRingHost1ToFwRxbuf, 0);
+    CHECK(refill && refill->kind == kHttSwToSw && refill->entryWords == kRxBufEntryWords);
+    CHECK(refill && refill->sizeWords == kRxRefillEntries * kRxBufEntryWords && !(refill->flags & kHttSrngLoopCountDisable));
+    for (uint32_t radio = 1; radio <= kRxRadios; ++radio) {
+      const auto *mac = h.firmware.ringOf(kHttRingRxdmaHostBuf, radio);
+      CHECK(mac && mac->kind == kHttSwToHw && mac->sizeWords == kRxMacBufEntries * kRxBufEntryWords);
+      CHECK(mac && (mac->flags & kHttSrngLoopCountDisable));
+      const auto *status = h.firmware.ringOf(kHttRingRxdmaMonitorStatus, radio);
+      CHECK(status && status->kind == kHttSwToHw && status->sizeWords == kRxMonStatusEntries * kRxBufEntryWords);
+    }
+    const auto *errors = h.firmware.ringOf(kHttRingRxdmaNonMonitorDest, 1);
+    CHECK(errors && errors->kind == kHttHwToSw && errors->entryWords == kRxDmaDstEntryWords);
+    // the two rounds: nothing without the buffers, everything with them
+    CHECK(h.link.rounds[0].ran && h.link.rounds[0].completed && h.link.rounds[0].mgmtFrames == 0);
+    CHECK(h.link.rounds[1].ran && h.link.rounds[1].completed && h.link.rounds[1].mgmtFrames == 4);
+    CHECK(h.link.rounds[1].networks == 3 && h.link.scan.count == 3);
+    CHECK(h.firmware.framesDropped == 4 && h.firmware.framesDelivered == 4 && h.firmware.scansSeen == 2);
+    // the buffers the firmware took are the refill ring's; the manager they return to is the firmware's own by default
+    CHECK(h.firmware.refillRbm == kRxBufRbmFw && h.firmware.refillCookieMax < kRxRefillEntries);
+    // the status buffers the hardware took were given back, and so was every error entry
+    CHECK(h.firmware.statusTaken > 0 && h.htt.statusRecycled == h.firmware.statusTaken);
+    CHECK(h.htt.errorsSeen == 1);   // the one error entry of the second round (no ring existed in the first)
+    CHECK(h.firmware.word(errors->tail) == h.firmware.word(errors->head));
+    // the channel visits and the radio's statistics of each round: the radio hears in both
+    CHECK(h.link.rounds[0].visits == kScanChannelMax && h.link.rounds[1].visits == kScanChannelMax);
+    CHECK(h.link.rounds[0].visitStarts == kScanChannelMax);
+    CHECK(h.link.rounds[0].visit[0].freq == kScanChannels24[0] && h.link.rounds[0].visit[0].rxFrames == 1500);
+    CHECK(h.link.rounds[0].visit[0].noiseFloor == -96 && h.link.rounds[0].visit[0].busy == 4000);
+    CHECK(h.link.rounds[0].stats.seen && h.link.rounds[0].stats.locMpdus == 0 && h.link.rounds[0].stats.rxCycles == 30000);
+    CHECK(h.link.rounds[1].stats.seen && h.link.rounds[1].stats.locMpdus == 4 && h.link.rounds[1].stats.mpduErrs == 4);
+    CHECK(h.firmware.statsRequests == 2);
+    // the event counts: every channel-information event and every management frame, by identifier
+    uint32_t chanInfo = 0, mgmt = 0, stats = 0;
+    for (uint32_t i = 0; i < h.link.eventKinds; ++i) {
+      if (h.link.eventCount[i].id == kWmiEvtChanInfo) chanInfo = h.link.eventCount[i].count;
+      if (h.link.eventCount[i].id == kWmiEvtMgmtRx) mgmt = h.link.eventCount[i].count;
+      if (h.link.eventCount[i].id == kWmiEvtUpdateStats) stats = h.link.eventCount[i].count;
+    }
+    CHECK(chanInfo == 4 * kScanChannelMax && mgmt == 4 && stats == 2 && h.link.eventKindsDropped == 0);
+    CHECK(h.link.unexpected == 0 && h.link.unknownEvents == 0 && h.ce.dropped == 0);
+  }
+  {   // bit 9: the buffers return to software ring 1, as the chip's own host has them
+    Host h;
+    CHECK(h.start(true, true));
+    LinkOptions options;
+    options.pre = kPreDefault | kPreRbmSw1;
+    h.begin(options);
+    h.firmware.sendReady();
+    CHECK(h.run(1200) == kLinkDone);
+    CHECK(h.firmware.refillRbm == kRxBufRbmSw1 && h.link.rounds[1].mgmtFrames == 4);
+  }
+  {   // a firmware that refuses the data interface: no rings, one round, and the level still finishes
+    Host h;
+    CHECK(h.start());
+    h.firmware.answerHtt = false;
+    h.begin(LinkOptions{});
+    h.firmware.sendReady();
+    CHECK(h.run(1200) == kLinkDone);
+    CHECK(h.link.httRefused && h.link.httEndpoint < 0 && h.firmware.srngSeen == 0);
+    CHECK(!h.link.rounds[1].ran && h.link.rounds[0].mgmtFrames == 0 && h.firmware.scansSeen == 1);
+  }
+  {   // statistics that never come: the wait runs out, they are not asked for again, the second round still runs
+    Host h;
+    CHECK(h.start());
+    h.firmware.answerStats = false;
+    LinkOptions options;
+    options.statsWaitMs = 40;
+    h.begin(options);
+    h.firmware.sendReady();
+    CHECK(h.run(1200) == kLinkDone);
+    CHECK(!h.link.rounds[0].stats.seen && h.firmware.statsRequests == 1);
+    CHECK(h.link.rounds[1].mgmtFrames == 4);
+  }
+  {   // without bit 7: no data interface, four pipes' worth of messages, one round
+    Host h;
+    CHECK(h.start());
+    LinkOptions options;
+    options.pre = kPreDefault & ~kPreRxRings;
+    h.begin(options);
+    h.firmware.sendReady();
+    CHECK(h.run(1200) == kLinkDone);
+    CHECK(!h.firmware.httConnectSeen && h.link.httEndpoint < 0 && h.firmware.scansSeen == 1);
+    CHECK(h.link.rounds[0].stats.seen && h.link.rounds[0].mgmtFrames == 0);
+  }
+  {   // the first two tablet boots' level 6 (no pipe 4, no rings planned): the bit alone changes nothing
+    Host h;
+    CHECK(h.start(false));
+    h.begin(LinkOptions{});
+    h.firmware.sendReady();
+    CHECK(h.run(1200) == kLinkDone);
+    CHECK(!h.firmware.httConnectSeen && h.firmware.scansSeen == 1 && !h.ce.pipes[4].hasSrc);
+  }
+  {   // the rings themselves: full before they are announced, one entry always free, the cookies naming their buffers
+    Host h;
+    CHECK(h.start());
+    const HttRing &refill = h.htt.ring[kHttRefill];
+    CHECK(*refill.head == (kRxRefillEntries - 1) * kRxBufEntryWords && *refill.tail == 0);
+    CHECK(h.htt.refillPosted == kRxRefillEntries - 1);
+    uint8_t message[64] = {};
+    CHECK(httBuildSrngSetup(message, sizeof message, refill) == kHttSrngSetupWords * 4);
+    CHECK(httBuildSrngSetup(message, 16, refill) == 0);
+    uint8_t version[8] = {};
+    CHECK(httBuildVersionReq(version, sizeof version) == 8 && httBuildVersionReq(version, 4) == 0);
+    // a status ring whose hardware took everything is refilled whole, never past the one free entry
+    HttRing &status = h.htt.ring[kHttStatus0];
+    status.announced = true;
+    *status.tail = *status.head;   // the hardware took every buffer
+    httTurn(h.htt);
+    CHECK(h.htt.statusRecycled == kRxMonStatusEntries - 1);
+    CHECK(*status.head == ((*status.tail / kRxBufEntryWords + kRxMonStatusEntries - 1) % kRxMonStatusEntries) * kRxBufEntryWords);
+    // a window too small for the rings: refused, and level 6 goes on without them
+    HttRx small;
+    Arena tiny;
+    std::vector<uint8_t> little(256 * 1024, 0);
+    arenaInit(tiny, little.data(), kBusBase, uint32_t(little.size()));
+    CHECK(!httPlan(small, tiny, false));
+  }
+}
+
 static void testOneBand()
 {
   Host h;
   CHECK(h.start());
   LinkOptions options;
   options.with5GHz = false;
-  linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+  h.begin(options);
   h.firmware.sendReady();
   CHECK(h.run() == kLinkDone);
   CHECK(h.firmware.scanChannels == kScanChannelCount24);
@@ -984,7 +1304,7 @@ static void testFaults()
     Host h;
     CHECK(h.start());
     h.firmware.connectStatus = 1;
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run() == kLinkStopped);
     CHECK(h.link.error == kLinkErrRefused && h.link.failedStep == kLinkConnect);
@@ -993,7 +1313,7 @@ static void testFaults()
     Host h;
     CHECK(h.start());
     h.firmware.memRequests = 3;
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run() == kLinkStopped);
     CHECK(h.link.error == kLinkErrMemory && h.link.failedStep == kLinkCapability);
@@ -1004,7 +1324,7 @@ static void testFaults()
     CHECK(h.start());
     LinkOptions options;
     options.timeoutMs = 50;
-    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.begin(options);
     CHECK(h.run(40) == kLinkStopped);
     CHECK(h.link.error == kLinkErrTimeout && h.link.failedStep == kLinkTransport);
     CHECK(h.ce.sent == 0);
@@ -1017,7 +1337,7 @@ static void testFaults()
     h.firmware.answerScanCompleted = false;
     LinkOptions options;
     options.scanWaitMs = 60;
-    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.begin(options);
     h.firmware.sendReady();
     CHECK(h.run() == kLinkStopped);
     CHECK(h.link.error == kLinkErrTimeout && h.link.failedStep == kLinkScanning);
@@ -1027,9 +1347,10 @@ static void testFaults()
     Host h;
     CHECK(h.start());
     h.firmware.answerScanCompleted = false;
+    h.firmware.rxNeedsRings = false;   // a radio that keeps frames without the host's buffers: the first round finds them
     LinkOptions options;
     options.scanWaitMs = 60;
-    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.begin(options);
     h.firmware.sendReady();
     CHECK(h.run() == kLinkDone);
     CHECK(h.link.error == kLinkErrNone && h.link.scanTimedOut && h.link.scanCompleted);
@@ -1040,7 +1361,7 @@ static void testFaults()
     Host h;
     CHECK(h.start());
     h.firmware.badFrameLength = true;
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run() == kLinkDone);
     CHECK(h.link.scan.count == 0 && h.link.unexpected >= 4);
@@ -1049,7 +1370,7 @@ static void testFaults()
     Host h;
     CHECK(h.start());
     h.firmware.shortBeacon = true;
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run() == kLinkDone);
     CHECK(h.link.scan.ignored == 2 && h.link.scan.count == 2);
@@ -1058,7 +1379,7 @@ static void testFaults()
     Host h;
     CHECK(h.start());
     h.firmware.manyNetworks = true;
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run() == kLinkDone);
     CHECK(h.link.scan.count == kScanEntriesMax && h.link.scan.dropped >= 4);
@@ -1068,10 +1389,10 @@ static void testFaults()
     Host h;
     CHECK(h.start());
     h.firmware.wrongStepEvent = true;
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run() == kLinkDone);
-    CHECK(h.link.unexpected == 1);
+    CHECK(h.link.unexpected == 2);   // one in each scan round
   }
   {   // a firmware that sends no extended capability event: the initialisation goes out when the short wait is over
     Host h;
@@ -1079,7 +1400,7 @@ static void testFaults()
     h.firmware.sendExtended = false;
     LinkOptions options;
     options.extWaitMs = 40;
-    linkBegin(h.link, h.ce, h.device.io(), options, h.now);
+    h.begin(options);
     h.firmware.sendReady();
     CHECK(h.run() == kLinkDone);
     CHECK(h.link.extEvents == 0 && h.firmware.initSeen && h.link.error == kLinkErrNone);
@@ -1088,7 +1409,7 @@ static void testFaults()
     Host h;
     CHECK(h.start());
     h.firmware.badStatus = true;
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     CHECK(h.run() == kLinkDone);
     CHECK(h.link.scan.count == 0 && h.link.scan.badFrames == 4 && h.link.scan.ignored == 0);
@@ -1096,7 +1417,7 @@ static void testFaults()
   {   // a message the transport cannot read is dropped and counted, and the ladder goes on
     Host h;
     CHECK(h.start());
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     for (unsigned i = 0; i < 400 && h.link.step != kLinkScanning; ++i) h.turn();
     std::vector<uint8_t> rubbish(kHtcHeaderBytes + 4, 0);
@@ -1111,7 +1432,7 @@ static void testFaults()
     CHECK(h.start());
     h.firmware.answerScanCompleted = false;
     h.firmware.sendBeacons = false;
-    linkBegin(h.link, h.ce, h.device.io(), LinkOptions{}, h.now);
+    h.begin(LinkOptions{});
     h.firmware.sendReady();
     for (unsigned i = 0; i < 400 && !h.link.scanStarted; ++i) h.turn();
     CHECK(h.link.step == kLinkScanning && h.link.scanStarted);
@@ -1298,6 +1619,7 @@ int main()
   testRings();
   testLadder();
   testRadioSetup();
+  testReceiveBuffers();
   testOneBand();
   testFaults();
   std::printf(failures ? "wmi_host: %d check(s) failed\n" : "wmi_host: all passed\n", failures);
