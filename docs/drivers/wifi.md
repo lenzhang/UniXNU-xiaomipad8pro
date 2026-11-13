@@ -1379,6 +1379,12 @@ network (§5.2 C).
    file or the calibration). **Also changed:** the scan list's log lines no longer print a network's name, only its length
    (with `piano-wifi-bssid=1` the whole name and address): the owner's networks must not reach a console log; the registry
    property, which `tooling/native/piano-wifi` reads on the tablet, keeps both. (needs-boot: §8.8 boot 9a)
+   **Confirmed on the tablet (27.3 RAM boot 2026-11-13 10:40, `ram-k273-wifi-p23`):** round 1 empty as before; the data
+   interface version 3.137, the six rings announced, the refill ring's 511 buffers taken by the firmware (its tail at 511), and
+   **round 2 heard 29 management frames (28 beacons): 18 networks**, the owner's among them on both bands. One of the owner's
+   networks was missing: the scan's static 22 channels leave out the radar ones. **P23b:** the scan now visits every channel of
+   the list built from the firmware's regulatory event (CN: 26 channels, the four radar channels 5260-5320 among them, scanned
+   passively as the whole scan is); the static table is only used when no event came.
 
 ## 11. Licence note
 

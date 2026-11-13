@@ -21,6 +21,7 @@
 //             event in the wrong step, and the teardown of a ladder that is given up on.
 //   c++ -std=c++20 -Wall -Wextra -Werror -I.. wmi_host.cpp -o /tmp/wmi_host && /tmp/wmi_host
 #include "WifiLink.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -966,9 +967,12 @@ static void testLadder()
   // The scan: passive, every channel of the two bands, and no network asked for by name.
   CHECK(h.firmware.scanSeen && (h.firmware.scanFlags & kWmiScanFlagPassive));
   CHECK(h.firmware.scanFlags & kWmiScanFlagChanStatEvent);
-  CHECK(h.firmware.scanChannels == kScanChannelMax && h.firmware.channelList.size() == kScanChannelMax);
-  CHECK(h.firmware.channelList[0] == kScanChannels24[0]);
+  // P23b: the channels the firmware's regulatory event allows (the model's: the lower band, 5180-5240 and the radar channels
+  // 5260-5320), not the static 22 — the radar ones included, which a passive scan may listen on.
+  CHECK(h.link.chanListFromEvent && h.firmware.scanChannels == h.link.chanList.count && h.firmware.scanChannels == 21);
+  CHECK(h.firmware.channelList.size() == 21 && h.firmware.channelList[0] == kScanChannels24[0]);
   CHECK(h.firmware.channelList[kScanChannelCount24] == kScanChannels5[0]);
+  CHECK(std::find(h.firmware.channelList.begin(), h.firmware.channelList.end(), 5260u) != h.firmware.channelList.end());
   CHECK(h.firmware.scanSsids == 0 && h.firmware.scanBssids == 1);
   // What the scan found: three networks, the strongest signal of the repeated one, the one with no name marked.
   CHECK(h.link.scanStarted && h.link.scanCompleted && h.link.scanReason == kWmiScanReasonCompleted);
@@ -1191,8 +1195,8 @@ static void testReceiveBuffers()
     CHECK(h.htt.errorsSeen == 1);   // the one error entry of the second round (no ring existed in the first)
     CHECK(h.firmware.word(errors->tail) == h.firmware.word(errors->head));
     // the channel visits and the radio's statistics of each round: the radio hears in both
-    CHECK(h.link.rounds[0].visits == kScanChannelMax && h.link.rounds[1].visits == kScanChannelMax);
-    CHECK(h.link.rounds[0].visitStarts == kScanChannelMax);
+    CHECK(h.link.rounds[0].visits == 21 && h.link.rounds[1].visits == 21);   // the regulatory list's channels
+    CHECK(h.link.rounds[0].visitStarts == 21);
     CHECK(h.link.rounds[0].visit[0].freq == kScanChannels24[0] && h.link.rounds[0].visit[0].rxFrames == 1500);
     CHECK(h.link.rounds[0].visit[0].noiseFloor == -96 && h.link.rounds[0].visit[0].busy == 4000);
     CHECK(h.link.rounds[0].stats.seen && h.link.rounds[0].stats.locMpdus == 0 && h.link.rounds[0].stats.rxCycles == 30000);
@@ -1205,7 +1209,7 @@ static void testReceiveBuffers()
       if (h.link.eventCount[i].id == kWmiEvtMgmtRx) mgmt = h.link.eventCount[i].count;
       if (h.link.eventCount[i].id == kWmiEvtUpdateStats) stats = h.link.eventCount[i].count;
     }
-    CHECK(chanInfo == 4 * kScanChannelMax && mgmt == 4 && stats == 2 && h.link.eventKindsDropped == 0);
+    CHECK(chanInfo == 4 * 21 && mgmt == 4 && stats == 2 && h.link.eventKindsDropped == 0);
     CHECK(h.link.unexpected == 0 && h.link.unknownEvents == 0 && h.ce.dropped == 0);
   }
   {   // bit 9: the buffers return to software ring 1, as the chip's own host has them

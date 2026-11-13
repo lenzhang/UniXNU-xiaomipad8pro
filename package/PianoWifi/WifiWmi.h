@@ -312,7 +312,7 @@ inline uint32_t wmiBuildVdevDelete(WmiWriter &w, uint8_t *buffer, uint32_t capac
 // ------------------------------------------------------------------------------------------------ 605: a passive scan
 struct WmiScanRequest {
   uint32_t scanId = kWmiScanId, requestorId = kWmiScanRequestorId, vdevId = 0;
-  uint32_t channels[kScanChannelMax] = {};
+  uint32_t channels[kAssocChannelCount] = {};   // the static table's 22, or every channel of the regulatory list (P23b)
   uint32_t channelCount = 0;
   bool passive = true;
   uint32_t dwellActiveMs = kWmiScanDwellActiveMs, dwellPassiveMs = kWmiScanDwellPassiveMs;

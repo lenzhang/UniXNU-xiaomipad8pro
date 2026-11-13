@@ -492,6 +492,14 @@ inline void afterPre(Link &link, int from, uint64_t nowMs)
     if (link.reg.seen && link.chanList.count) link.chanListFromEvent = true;
     else chanListFallback(link.chanList, link.options.with5GHz);
     link.chanListChannels = link.chanList.count;
+    // P23b: the scan visits every channel the firmware's own domain allows — its radar channels too, which a passive scan may
+    // listen on (the 10:40 boot missed a network the static 22 left out) — instead of the static table. Only a list that came
+    // from the regulatory event is used this way: the fallback names channels the domain may not allow.
+    if (link.chanListFromEvent && link.chanList.count) {
+      link.request.channelCount = 0;
+      for (uint32_t i = 0; i < link.chanList.count && i < sizeof link.request.channels / sizeof link.request.channels[0]; ++i)
+        link.request.channels[link.request.channelCount++] = link.chanList.entry[i].freq;
+    }
     enter(link, kLinkChanList, nowMs);
     link.pending = kLinkSendChanList;
     return;
