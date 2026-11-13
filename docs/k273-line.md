@@ -138,7 +138,7 @@ the seed 89860516 and `data-store-lba=117998394` as the entry's. Checklist: (1) 
 (408 bytes): 407 bytes appended, boot-args 1071 bytes (line 663)`; (2) `PianoAudio: start: piano-audio=1 ...` and `PianoAudio: survey
 done: ...` (the kext's probe declines without `piano-audio`, which only the ADT carries); (3) the drivers whose arguments all moved
 come up as on the installed entry: the USB console (`piano-usb=2`), the root shell and USB network, the A830 desktop, touch, Wi-Fi
-level 6; (4) on the USB console `args` prints the 1071-byte line; `sysctl kern.bootargs` the same (under 1024: whole); (5) the
+level 6; (4) on the USB console `args` prints the 1071-byte line; `sysctl kern.bootargs` its first 1017 bytes (cut after the last whole argument under 1024: it ends at `piano-power-delay=0`); (5) the
 reset after 900 s (it stayed on the line) or `reset fastboot`.
 
 ## 5. Open questions and blockers
