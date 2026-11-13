@@ -80,6 +80,7 @@
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include <PianoPowerContract.h>
+#include <sys/sysctl.h>
 #include "SmmuStream.h"
 #include "WifiBringup.h"
 #include "WifiChannels.h"
@@ -87,6 +88,7 @@
 #include "WifiLink.h"
 #include "WifiMhi.h"
 #include "WifiPbl.h"
+#include "WifiProfile.h"
 #include "WifiRddm.h"
 #include "WifiSmmuWindow.h"
 #include "WifiSurvey.h"
@@ -2826,10 +2828,13 @@ PowerState *gPowerState;
 Options gPowerOptions;
 bool gRadioStopped;
 
+void profileClear();
+
 void stopRadio(const char *why)
 {
   if (gRadioStopped || gArgs.level < 2) return;
   gRadioStopped = true;
+  profileClear();   // the join profile does not outlive the radio
   __atomic_store_n(&gStopRequested, 1u, __ATOMIC_RELEASE);
   const uint64_t deadline = nowMs() + 2000;
   while (gLinkRunning && nowMs() < deadline) IOSleep(10);
@@ -2847,6 +2852,92 @@ void stopRadio(const char *why)
   }
 }
 
+// ------------------------------------------------------------------------------- level 7's join profile (docs §13.2)
+// machdep.piano_wifi_join: written once by root (the LaunchDaemon com.unixnu.piano-wifi-join, from the root-only file
+// /private/var/db/piano-wifi/profile) with a struct piano_wifi_profile; read by anyone as a status line of lengths only. No byte
+// of the name, the addresses or the passphrase is ever logged or returned; the profile is wiped when the radio stops.
+IOLock *gProfileLock;
+piano_wifi_profile gProfile;
+uint32_t gProfileGeneration;   // under gProfileLock
+bool gProfileSet;
+
+void profileClear()
+{
+  if (!gProfileLock) return;
+  IOLockLock(gProfileLock);
+  piano_wifi_profile_wipe(&gProfile);
+  gProfileSet = false;
+  IOLockUnlock(gProfileLock);
+}
+
+int sysctlJoin(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  char line[200];
+  IOLockLock(gProfileLock);
+  if (gProfileSet)
+    snprintf(line, sizeof line, "set (generation %u): a network name of %u byte(s), %s%s, the access point %s, the station's "
+             "address %s", gProfileGeneration, unsigned(gProfile.ssid_len), piano_wifi_security_name(gProfile.security),
+             gProfile.psk_len ? " with a passphrase" : "", (gProfile.flags & PianoWifiProfileBssid) ? "given" : "not given",
+             (gProfile.flags & PianoWifiProfileMac) ? "given" : "not given");
+  else
+    snprintf(line, sizeof line, "not set");
+  IOLockUnlock(gProfileLock);
+  int err = SYSCTL_OUT(req, line, strlen(line) + 1);
+  if (err || !req->newptr) return err;
+  if (req->newlen != sizeof(piano_wifi_profile)) return EINVAL;
+  piano_wifi_profile incoming;
+  err = SYSCTL_IN(req, &incoming, sizeof incoming);
+  if (err) {
+    piano_wifi_profile_wipe(&incoming);
+    return err;
+  }
+  const char *problem = piano_wifi_profile_problem(&incoming, sizeof incoming);
+  if (problem) {
+    piano_wifi_profile_wipe(&incoming);
+    note("join profile refused: %s (nothing of it kept)", problem);
+    return EINVAL;
+  }
+  IOLockLock(gProfileLock);
+  gProfile = incoming;
+  gProfileSet = true;
+  const uint32_t generation = ++gProfileGeneration;
+  IOLockUnlock(gProfileLock);
+  note("join profile set (generation %u): a network name of %u byte(s), %s%s, the access point %s, the station's address %s "
+       "(none of it is logged)",
+       generation, unsigned(incoming.ssid_len), piano_wifi_security_name(incoming.security),
+       incoming.psk_len ? " with a passphrase" : "", (incoming.flags & PianoWifiProfileBssid) ? "given" : "not given",
+       (incoming.flags & PianoWifiProfileMac) ? "given" : "not given");
+  piano_wifi_profile_wipe(&incoming);
+  return 0;
+}
+
+// Filled in at run time rather than by SYSCTL_OID's static initializer: its parent and handler are signed pointers on arm64e
+// (the same pattern as PianoPolicy's).
+struct sysctl_oid gOidJoin;
+
+}  // namespace
+
+SYSCTL_DECL(_machdep);
+
+namespace {
+void registerJoinSysctl()
+{
+  gProfileLock = IOLockAlloc();
+  if (!gProfileLock) return;
+  gOidJoin.oid_parent = &sysctl__machdep_children;
+  gOidJoin.oid_number = OID_AUTO;
+  // a string to read (the status line); a write needs root, as every sysctl without CTLFLAG_ANYBODY does
+  gOidJoin.oid_kind = int(CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gOidJoin.oid_arg1 = nullptr;
+  gOidJoin.oid_arg2 = 0;
+  gOidJoin.oid_name = "piano_wifi_join";
+  gOidJoin.oid_handler = sysctlJoin;
+  gOidJoin.oid_fmt = "A";
+  gOidJoin.oid_descr = "PianoWifi's join profile: written once by root (piano-wifi-join), read as lengths only";
+  gOidJoin.oid_version = SYSCTL_OID_VERSION;
+  gOidJoin.oid_refcnt = 0;
+  sysctl_register_oid(&gOidJoin);
+}
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------------ the service
@@ -2901,6 +2992,8 @@ bool PianoWifi::start(IOService *provider)
   note("level 1: loads only, nothing written%s", gArgs.spmi || gArgs.level >= 2 ? "; SPMI observer read commands for the PMIC part"
                                                                                : "");
   setProperty("piano-wifi", gArgs.level, 32);
+  // Level 7's join profile has a way in from level 6 on (the scan's list is what a join picks from); nothing reads it below.
+  if (gArgs.level >= 6) registerJoinSysctl();
   // From level 2 on something is powered, so the driver joins the power tree: its kOff stops the radio (the power contract,
   // package/include/PianoPowerContract.h). Below level 2 nothing of the chip is on and there is nothing to do.
   if (gArgs.level >= 2) {

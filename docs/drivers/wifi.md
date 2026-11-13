@@ -1589,6 +1589,26 @@ owner has to answer (the last paragraph).
    The alternative, an `IOUserClient` with a command to hand the bytes over, buys a cleaner interface (and a place for
    `join` / `leave` / `status`) at the cost of a user client and its entitlement checks in the first version. The sysctl is
    the smaller step and is reversible: `tooling/native/piano-wifi join` can be taught either.
+   **Built (2026-11-13), the path itself:** `package/PianoWifi/WifiProfile.h` (the profile's structure and its rules, shared by
+   both ends, host-tested in `tests/profile_host.cpp`), the sysctl `machdep.piano_wifi_join` in PianoWifi (registered from
+   `piano-wifi=6`; a write needs root and exactly one profile; a read returns `not set` or `set (generation N): a network name
+   of N byte(s), WPA2-PSK with a passphrase, the access point given/not given, the station's address given/not given`; the
+   profile is wiped when the radio stops), and the userland unit `piano-wifi-join` (`configs/userland.toml`):
+   `/usr/local/libexec/piano-wifi-join`, run once at boot by `com.unixnu.piano-wifi-join`, which refuses a profile file that is
+   not root's with mode 600 in a directory of root's with mode 700, reads it, hands it over and wipes its copy; its log
+   (`/private/var/log/piano-wifi-join.log`) and the kernel's line carry lengths only. **The file the owner writes**
+   (`/private/var/db/piano-wifi/profile`, `chmod 700` the directory and `600` the file, `chown root:wheel` both):
+
+   ```
+   ssid=<the network's name>
+   security=wpa2-psk
+   psk=<the passphrase>
+   # optional: bssid=<the access point's address, aa:bb:cc:dd:ee:ff>
+   # optional: mac=<the station's own address, locally administered: 02:…>
+   ```
+
+   Nothing reads the profile yet: level 7's step machine is the next piece, and it waits for level 6 to deliver beacons
+   (P23).
 4. **What stays out of the first version:** roaming, power save (the radio stays awake: `WMI_STA_POWERSAVE_MODE` off),
    protected management frames beyond what the access point requires, and the data path. Without level 8 an association
    gives `en1` a link that carries no traffic yet — which is still the gate this level has to pass: the firmware's

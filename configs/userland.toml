@@ -191,6 +191,24 @@ dest = "/Library/LaunchDaemons/com.unixnu.piano-still-wallpaper.plist"
 mode = "0644"
 
 [[unit]]
+name = "piano-wifi-join"
+about = "hands PianoWifi the join profile once at boot, from the root-only file /private/var/db/piano-wifi/profile (the owner places it; never in a repository) into the root-only sysctl machdep.piano_wifi_join; logs lengths only (docs/drivers/wifi.md section 13.2); exits at once with no profile or no PianoWifi"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-wifi-join/piano-wifi-join.c"
+build = "cc"
+arch = "arm64"
+dest = "/usr/local/libexec/piano-wifi-join"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/native/piano-wifi-join/com.unixnu.piano-wifi-join.plist"
+build = "copy"
+dest = "/Library/LaunchDaemons/com.unixnu.piano-wifi-join.plist"
+mode = "0644"
+
+[[unit]]
 name = "piano-wifi"
 about = "the Wi-Fi command-line tool of docs/drivers/wifi.md section 13.1 (scan, join, status over PianoWifi's control socket); not written yet"
 status = "planned"
