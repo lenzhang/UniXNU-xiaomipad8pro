@@ -221,3 +221,14 @@ gives IOAESAccelerator (their metaclass constructors).
 | nonce entanglement | console `SoftwareAES: device key 2212 asked for ...`; no `panic: encryption failed` | (the line may be absent: only when AppleImage4 resets slots) |
 | the registry goes quiet | console `desk-dev: iokit busy (configd 260+ s): none` | `none` |
 | the interfaces without the staged database (`DESK_DEV_NETDB=0` image) | console `desk-dev: usb net: en1 is ours (named after Ns)`; on the tablet `ifconfig -l` | N well under 240 (seconds after configd starts), en0 and en1 listed |
+
+Images (2026-11-13 02:10, this branch on main 9db4334: the KC rebuilt with SoftwareAES, kernel 0065, `PIANO_GPU=2
+PIANO_VMM_PRESENT=0`, `NativeAES vs IOAESAccelerator: 0 problem slots`, 26 native kexts; main's Turnip seed; desk-dev,
+`DESK_RTC_OFFSET=1794397906`, Data volatile, command line 959 bytes, `verify-ram-images.py` PASS; out/ is not committed):
+
+| Image (out/) | Identity | Interface database | boot image sha256 |
+|---|---|---|---|
+| `ram-desk-dev-aes-k114c` | k114c | none (`DESK_DEV_NETDB=0`): the quiet test | `cf369a40ef1a2a61...` |
+| `ram-desk-dev-aes-k114c-netdb` | k114c | staged, as desk-dev before | `0e61978a0bb61cc2...` |
+| `ram-desk-dev-aes-vma2` | vma2 | staged | `f2eb4c849585fcfc...` |
+| `ram-desk-dev-aes-dump` | the loop's dump image | - | `b37c9c421a2a34d1...` |
