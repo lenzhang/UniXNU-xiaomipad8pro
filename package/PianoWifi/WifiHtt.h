@@ -40,8 +40,19 @@ struct HttRing {
 constexpr unsigned kHttRings = 6;             // refill, two radio buffer rings, errors, two status rings
 enum HttRingIndex : unsigned { kHttRefill = 0, kHttMacBuf0 = 1, kHttMacBuf1 = 2, kHttErrDst = 3, kHttStatus0 = 4, kHttStatus1 = 5 };
 
+// A peer the firmware's data interface named (level 7 waits for its own): the device, the peer identifier the data path
+// carries, the hardware peer, and the address — kept for the join's own comparison, never logged.
+struct HttPeerMap {
+  uint32_t type = 0, vdevId = 0, peerId = 0, hwPeerId = 0;
+  uint8_t mac[6] = {};
+  bool unmapped = false;
+};
+constexpr unsigned kHttPeerMapsKept = 4;
+
 struct HttRx {
   HttRing ring[kHttRings];
+  HttPeerMap peer[kHttPeerMapsKept];   // the last four peer maps and unmaps, the newest at (peerEvents - 1) % 4
+  uint32_t peerEvents = 0, peerUnmaps = 0;
   // the buffers: the refill ring's, then each status ring's
   uint64_t refillBus[kRxRefillEntries] = {};
   uint64_t statusBus[kRxRadios][kRxMonStatusEntries] = {};
@@ -216,9 +227,42 @@ inline void httReceive(HttRx &rx, const uint8_t *payload, uint32_t length)
     rx.versionSeen = true;
     rx.versionMinor = (word0 >> 8) & 0xffu;
     rx.versionMajor = (word0 >> 16) & 0xffu;
-  } else if (type == kHttT2hPeerMap) {
-    ++rx.peerMaps;
+  } else if (type == kHttT2hPeerMap || type == kHttT2hPeerMap2 || type == kHttT2hPeerMap3 || type == kHttT2hPeerUnmap ||
+             type == kHttT2hPeerUnmap2) {
+    if (length < 12) return;
+    const bool unmap = type == kHttT2hPeerUnmap || type == kHttT2hPeerUnmap2;
+    HttPeerMap &p = rx.peer[rx.peerEvents % kHttPeerMapsKept];
+    p = HttPeerMap{};
+    p.type = type;
+    p.unmapped = unmap;
+    p.vdevId = (word0 >> 8) & 0xffu;
+    p.peerId = (word0 >> 16) & 0xffffu;
+    const uint32_t lo = get32(payload + 4), word2 = get32(payload + 8);
+    for (unsigned i = 0; i < 4; ++i) p.mac[i] = uint8_t(lo >> (8 * i));
+    p.mac[4] = uint8_t(word2 & 0xffu);
+    p.mac[5] = uint8_t((word2 >> 8) & 0xffu);
+    if (!unmap) {
+      if (type == kHttT2hPeerMap3) p.hwPeerId = length >= 16 ? (get32(payload + 12) & 0xffffu) : 0;
+      else p.hwPeerId = (word2 >> 16) & 0xffffu;
+      ++rx.peerMaps;
+    } else {
+      ++rx.peerUnmaps;
+    }
+    ++rx.peerEvents;
   }
+}
+
+// The newest peer map for an address and a device, or null.
+inline const HttPeerMap *httPeerMapOf(const HttRx &rx, uint32_t vdevId, const uint8_t *mac)
+{
+  const uint32_t kept = rx.peerEvents < kHttPeerMapsKept ? rx.peerEvents : kHttPeerMapsKept;
+  for (uint32_t i = 0; i < kept; ++i) {
+    const HttPeerMap &p = rx.peer[(rx.peerEvents - 1 - i) % kHttPeerMapsKept];
+    bool same = p.vdevId == vdevId || p.unmapped;   // an unmap names no device
+    for (unsigned k = 0; k < 6 && same; ++k) same = p.mac[k] == mac[k];
+    if (same) return p.unmapped ? nullptr : &p;
+  }
+  return nullptr;
 }
 
 // One turn: the refill ring's tail read (what the firmware has taken so far), each status ring's buffers the hardware took

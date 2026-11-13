@@ -420,9 +420,20 @@ inline const char *wmiScanReasonName(uint32_t reason)
 // One network the scan found. The identifier and the address are kept so that the macOS side can list them; neither is ever
 // part of a committed file (docs/drivers/wifi.md section 11), and the driver's own log masks the address unless it is asked not
 // to (piano-wifi-bssid=1).
+// What a join needs of a network's elements (level 7, WifiSta.h): its RSN element read into suites (the 00-0F-AC types as bits;
+// a suite of another organisation sets the "other" bit), whether it also speaks WPA1 or HT, its rates as it announces them.
+struct ScanSecurity {
+  bool rsn = false, wpa1 = false;
+  uint8_t groupCipher = 0;          // the 00-0F-AC type, 0 when none or another organisation's
+  uint32_t pairwise = 0, akm = 0;   // bit N: 00-0F-AC type N; bit 31: a suite of another organisation
+  uint16_t rsnCaps = 0;
+  bool truncated = false;           // the element ended inside a field: nothing after that field is believed
+};
+
 struct ScanEntry {
   uint8_t bssid[6] = {};
   char ssid[kSsidMax + 1] = {};
+  uint8_t ssidRaw[kSsidMax] = {};   // the name's bytes as they came (a join compares these; ssid[] is the printable form)
   uint8_t ssidLength = 0;
   bool hidden = false;
   uint32_t freq = 0;
@@ -430,6 +441,12 @@ struct ScanEntry {
   int32_t rssi = 0;
   uint32_t beacons = 0, probes = 0;
   uint16_t capability = 0;
+  uint16_t beaconInterval = 0;      // in TU, from the frame's fixed fields
+  uint8_t dtimPeriod = 0;           // from the TIM element (beacons only), 0 when none was seen
+  uint8_t rates[16] = {};           // the supported and extended rates, as the frame carries them (bit 7: basic)
+  uint8_t rateCount = 0;
+  bool ht = false;
+  ScanSecurity security;
 };
 
 struct ScanList {
@@ -472,6 +489,49 @@ inline bool wmiParseMgmtRx(WmiMgmtRx &out, const uint8_t *payload, uint32_t leng
 // The identifier and the address out of a beacon or a probe answer: the frame's third address is the network's, and its body
 // carries the elements, of which element 0 is the name and element 3 the channel. An element that runs past the frame ends the
 // walk (a frame from the air is never trusted for its own length).
+// The RSN element's body (version, group suite, pairwise suites, key-management suites, capabilities), from the air: every
+// count is checked against what is left, and a field cut short ends the read with `truncated` (what came before stands).
+inline void wmiParseRsn(ScanSecurity &out, const uint8_t *body, uint32_t bytes)
+{
+  out.rsn = true;
+  uint32_t at = 2;   // the version
+  auto suite = [&](uint32_t from, uint8_t &type) {
+    const bool ours = body[from] == 0x00 && body[from + 1] == 0x0f && body[from + 2] == 0xac;
+    type = ours ? body[from + 3] : 0;
+    return ours;
+  };
+  if (bytes < at + 4) {
+    // An element of the version alone means the defaults: CCMP both ways and PSK (802.11's own rule for an omitted field).
+    out.groupCipher = kRsnCipherCcmp;
+    out.pairwise = 1u << kRsnCipherCcmp;
+    out.akm = 1u << kRsnAkmPsk;
+    out.truncated = bytes < at;
+    return;
+  }
+  uint8_t type = 0;
+  if (suite(at, type)) out.groupCipher = type;
+  at += 4;
+  for (unsigned list = 0; list < 2; ++list) {
+    uint32_t &bits = list ? out.akm : out.pairwise;
+    if (bytes < at + 2) {
+      if (!bits) bits = list ? (1u << kRsnAkmPsk) : (1u << kRsnCipherCcmp);
+      if (bytes != at) out.truncated = true;
+      return;
+    }
+    const uint32_t count = uint32_t(body[at] | body[at + 1] << 8);
+    at += 2;
+    if (count > 16 || bytes < at + 4 * count) {
+      out.truncated = true;
+      return;
+    }
+    for (uint32_t i = 0; i < count; ++i, at += 4) {
+      if (suite(at, type) && type < 31) bits |= 1u << type;
+      else bits |= 1u << 31;
+    }
+  }
+  if (bytes >= at + 2) out.rsnCaps = uint16_t(body[at] | body[at + 1] << 8);
+}
+
 inline bool wmiParseBeacon(ScanEntry &out, const uint8_t *frame, uint32_t length, bool &isProbe)
 {
   if (!frame || length < kDot11HeaderBytes + kDot11BeaconFixedBytes) return false;
@@ -481,21 +541,38 @@ inline bool wmiParseBeacon(ScanEntry &out, const uint8_t *frame, uint32_t length
   if (subtype != kDot11SubtypeBeacon && subtype != kDot11SubtypeProbeResponse) return false;
   isProbe = subtype == kDot11SubtypeProbeResponse;
   for (unsigned i = 0; i < 6; ++i) out.bssid[i] = frame[16 + i];   // the third address
+  out.beaconInterval = uint16_t(frame[kDot11HeaderBytes + 8] | frame[kDot11HeaderBytes + 9] << 8);
   out.capability = uint16_t(frame[kDot11HeaderBytes + 10] | frame[kDot11HeaderBytes + 11] << 8);
   uint32_t at = kDot11HeaderBytes + kDot11BeaconFixedBytes;
   while (at + 2 <= length) {
     const uint32_t id = frame[at], bytes = frame[at + 1];
     if (at + 2 + bytes > length) break;
+    const uint8_t *body = frame + at + 2;
     if (id == kDot11ElementSsid && bytes <= kSsidMax) {
       out.ssidLength = uint8_t(bytes);
       for (uint32_t i = 0; i < bytes; ++i) {
-        const uint8_t c = frame[at + 2 + i];
+        const uint8_t c = body[i];
+        out.ssidRaw[i] = c;
         out.ssid[i] = (c >= 0x20 && c < 0x7f) ? char(c) : '?';   // printable only: a name is logged, never a byte string
       }
       out.ssid[bytes] = 0;
-      out.hidden = bytes == 0;
+      // A hidden network sends an empty name or a name of zero bytes of its real length.
+      bool zeros = bytes > 0;
+      for (uint32_t i = 0; i < bytes; ++i) zeros = zeros && body[i] == 0;
+      out.hidden = bytes == 0 || zeros;
     } else if (id == kDot11ElementDsParams && bytes == 1) {
-      out.channel = frame[at + 2];
+      out.channel = body[0];
+    } else if ((id == kDot11ElementRates || id == kDot11ElementExtRates) && bytes) {
+      for (uint32_t i = 0; i < bytes && out.rateCount < sizeof out.rates; ++i) out.rates[out.rateCount++] = body[i];
+    } else if (id == kDot11ElementTim && bytes >= 2) {
+      out.dtimPeriod = body[1];
+    } else if (id == kDot11ElementRsn && bytes >= 2) {
+      wmiParseRsn(out.security, body, bytes);
+    } else if (id == kDot11ElementHtCap) {
+      out.ht = true;
+    } else if (id == kDot11ElementVendor && bytes >= 4 && body[0] == 0x00 && body[1] == 0x50 && body[2] == 0xf2 &&
+               body[3] == 0x01) {
+      out.security.wpa1 = true;
     }
     at += 2 + bytes;
   }
@@ -531,13 +608,24 @@ inline ScanEntry *scanAdd(ScanList &list, const WmiMgmtRx &rx)
     for (unsigned k = 0; k < 6; ++k) same = same && have.bssid[k] == found.bssid[k];
     if (!same) continue;
     if (found.rssi > have.rssi) have.rssi = found.rssi;
-    if (found.ssidLength && !have.ssidLength) {
+    if (found.ssidLength && !found.hidden && (!have.ssidLength || have.hidden)) {
       have.ssidLength = found.ssidLength;
       for (unsigned k = 0; k <= kSsidMax; ++k) have.ssid[k] = found.ssid[k];
+      for (unsigned k = 0; k < kSsidMax; ++k) have.ssidRaw[k] = found.ssidRaw[k];
       have.hidden = false;
     }
     if (found.channel) have.channel = found.channel;
     if (found.freq) have.freq = found.freq;
+    // The newest frame's elements stand (a probe answer carries no TIM, so the DTIM period is kept from a beacon).
+    if (found.beaconInterval) have.beaconInterval = found.beaconInterval;
+    if (found.dtimPeriod) have.dtimPeriod = found.dtimPeriod;
+    if (found.rateCount) {
+      have.rateCount = found.rateCount;
+      for (unsigned k = 0; k < sizeof have.rates; ++k) have.rates[k] = found.rates[k];
+    }
+    have.capability = found.capability;
+    have.ht = have.ht || found.ht;
+    if (found.security.rsn || found.security.wpa1) have.security = found.security;
     if (isProbe) ++have.probes;
     else ++have.beacons;
     return &have;

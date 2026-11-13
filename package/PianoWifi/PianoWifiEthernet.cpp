@@ -45,7 +45,10 @@ class PianoWifiEthernet : public IOEthernetController {
   OSDeclareDefaultStructors(PianoWifiEthernet)
 
   IOEthernetInterface *fInterface = nullptr;
-  IOEthernetAddress fAddress = {{0x02, 0x50, 0x49, 0x41, 0x4e, 0x03}};   // locally administered, "PIAN"; not the unit's own
+  // Locally administered, "PIAN"; not the unit's own. The same as WifiHw.h kLocalMac, the virtual device's address when the
+  // firmware reports none: en1 must carry the station's address (a frame from it with another source address is the
+  // firmware's to drop). PianoWifi publishes the address the device really took as piano-wifi-mac, which wins.
+  IOEthernetAddress fAddress = {{0x02, 0x50, 0x49, 0x41, 0x4e, 0x01}};
   UInt64 fTxDrops = 0;
 
   void takeScanList(IOService *wifi);
@@ -94,7 +97,7 @@ void PianoWifiEthernet::takeScanList(IOService *wifi)
     OSData *bytes = OSDynamicCast(OSData, mac);
     if (bytes && bytes->getLength() == sizeof fAddress.bytes) {
       memcpy(fAddress.bytes, bytes->getBytesNoCopy(), sizeof fAddress.bytes);
-      note("the interface takes the address the firmware reported (its first three bytes %02x:%02x:%02x)", fAddress.bytes[0],
+      note("the interface takes the virtual device's address (its first three bytes %02x:%02x:%02x)", fAddress.bytes[0],
            fAddress.bytes[1], fAddress.bytes[2]);
     }
     mac->release();

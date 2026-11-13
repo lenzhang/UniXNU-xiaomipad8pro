@@ -91,6 +91,7 @@
 #include "WifiProfile.h"
 #include "WifiRddm.h"
 #include "WifiSmmuWindow.h"
+#include "WifiSta.h"
 #include "WifiSurvey.h"
 #include "WifiWlfw.h"
 #define PIANO_WCN_RAILS_KERNEL
@@ -114,6 +115,7 @@ struct Args {
   uint32_t noc, socreset, msi, ctxearly, ras;
   uint32_t rddm, defer, wake;
   uint32_t deadlineMs;
+  uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step;
 };
 Args gArgs;
 
@@ -198,6 +200,25 @@ void readArgs()
   // lines from the doorbell on and printed nothing for 30 minutes).
   gArgs.deadlineMs = bootArg("piano-wifi-deadline", 60000);
   if (gArgs.deadlineMs < 10000 || gArgs.deadlineMs > 600000) gArgs.deadlineMs = 60000;
+  // Level 7, the join (WifiSta.h, docs/drivers/wifi.md §13.3): piano-wifi-l7=N its switches (WifiSta.h kStaFlag*; default
+  // 0x3f), piano-wifi-l7wait=MS how long it waits for the join profile after the scan (default 600000: a RAM probe's profile
+  // is written over the USB shell after the boot), piano-wifi-l7hold=MS how long an association is watched (default 30000; 0
+  // until a suspend), piano-wifi-l7tries=N the tries of each frame (3), piano-wifi-l7scans=N the scans of its own when the
+  // network is not in the list (2), piano-wifi-l7frame=MS the wait for each answer (500; the association's is twice that),
+  // piano-wifi-l7step=MS the wait for a command's answer (3000).
+  gArgs.l7 = bootArg("piano-wifi-l7", kStaFlagsDefault);
+  gArgs.l7wait = bootArg("piano-wifi-l7wait", kAssocProfileWaitMs);
+  if (gArgs.l7wait > 3600000) gArgs.l7wait = kAssocProfileWaitMs;
+  gArgs.l7hold = bootArg("piano-wifi-l7hold", kAssocHoldMs);
+  if (gArgs.l7hold > 3600000) gArgs.l7hold = kAssocHoldMs;
+  gArgs.l7tries = bootArg("piano-wifi-l7tries", kAssocFrameTries);
+  if (!gArgs.l7tries || gArgs.l7tries > 10) gArgs.l7tries = kAssocFrameTries;
+  gArgs.l7scans = bootArg("piano-wifi-l7scans", 2);
+  if (gArgs.l7scans > 10) gArgs.l7scans = 2;
+  gArgs.l7frame = bootArg("piano-wifi-l7frame", kAssocFrameWaitMs);
+  if (gArgs.l7frame < 50 || gArgs.l7frame > 10000) gArgs.l7frame = kAssocFrameWaitMs;
+  gArgs.l7step = bootArg("piano-wifi-l7step", 3000);
+  if (gArgs.l7step < 200 || gArgs.l7step > 30000) gArgs.l7step = 3000;
 }
 
 uint64_t nowMs();
@@ -2505,8 +2526,9 @@ Ce gCe;
 HttRx gHtt;                         // the receive rings and their buffers (P23), out of the same window
 bool gHttPlanned;
 Link gLink;
-volatile bool gLinkRunning;         // the ladder's thread is inside level 6: the power hook asks it to stop instead of racing
+volatile bool gLinkRunning;         // the ladder's thread is inside level 6 or 7: the power hook asks it to stop instead of racing
 volatile uint32_t gStopRequested;   // set by the power hook, read by the ladder each turn
+bool profileOwnMac(uint8_t *mac);   // level 7's join profile (below): the station's address, when it names one
 
 void linkNote(void *, int step, const char *what)
 {
@@ -2628,6 +2650,10 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
   options.paceMs = gArgs.l6pace;
   options.holdMs = gArgs.l6hold;
   options.htt = gHttPlanned ? &gHtt : nullptr;
+  // Level 7 joins on this level's virtual device: the ladder keeps it after the last scan and hands its transport over. A
+  // join profile already set that names the station's address gives the device that address (en1 takes the same).
+  options.handOff = gArgs.level >= 7 && !(gArgs.l6pre & kPreNoScan);
+  if (gArgs.level >= 7) options.ownMacSet = profileOwnMac(options.ownMac);
   note("level 6: before the virtual device (piano-wifi-l6pre=%#x): hardware mode %u, the radio's parameters %u, the channel "
        "list %u (the regulatory event waited for %u, up to %u ms), a usable device address %u, paced %u ms, no scan %u",
        gArgs.l6pre, (gArgs.l6pre & kPreHwMode) ? 1u : 0u, (gArgs.l6pre & kPrePdevParams) ? 1u : 0u,
@@ -2646,7 +2672,7 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
                            ((gArgs.l6pre & kPreRxRings) ? gArgs.scanWaitMs + 4000u : 0u) +
                            ((gArgs.l6pre & kPreDiag) ? 2000u : 0u);
   int step = gLink.step;
-  while (step != kLinkDone && step != kLinkStopped) {
+  while (step != kLinkDone && step != kLinkStopped && step != kLinkHandOff) {
     if (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE)) {
       note("level 6: a suspend asked the radio to stop during %s", linkStepName(step));
       break;
@@ -2690,14 +2716,15 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
     note("level 6: the firmware is ready: status %#x, %u peer(s), %u extra address(es); the chip's own address %s%s",
          gLink.ready.status, gLink.ready.totalPeers, gLink.ready.extraMacs, zero ? "is all zeros" : mac,
          zero ? " (this chip's firmware reports none: the unit's own is in the persist partition, section 13.1)" : "");
-    // An address the firmware does report is what the macOS side's en1 takes (PianoWifiEthernet); it is never logged whole
-    // unless piano-wifi-bssid=1, and never committed (section 11).
-    if (!zero) {
-      OSData *bytes = OSData::withBytes(gLink.ready.mac, sizeof gLink.ready.mac);
-      if (bytes) {
-        owner->setProperty("piano-wifi-mac", bytes);
-        bytes->release();
-      }
+  }
+  // en1 must carry the virtual device's own address (the station's frames carry it; a level 8 frame from en1 with another
+  // source address would be the firmware's to drop): the address the device was created with is what PianoWifiEthernet
+  // takes. It is never logged whole unless piano-wifi-bssid=1, and never committed (section 11).
+  if (wmiMacUsable(gLink.vdevMac)) {
+    OSData *bytes = OSData::withBytes(gLink.vdevMac, sizeof gLink.vdevMac);
+    if (bytes) {
+      owner->setProperty("piano-wifi-mac", bytes);
+      bytes->release();
     }
   }
   // The radio's set-up (P22, docs section 10.27): what went out before the virtual device, and what the firmware's own
@@ -2801,12 +2828,16 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
        gLink.commands, gLink.events, gLink.extEvents, gLink.mgmtFrames, gLink.scan.badFrames, gLink.scan.ignored,
        gLink.unexpected, gLink.badMessages, gLink.creditWaits, gCe.sent, gCe.bytesOut, gCe.received, gCe.bytesIn,
        gCe.completions, gCe.refused, gCe.dropped);
-  const bool done = gLink.step == kLinkDone;
+  const bool handOff = gLink.step == kLinkHandOff;
+  const bool done = gLink.step == kLinkDone || handOff;
   note("level 6: %s after %llu ms (step %d: %s%s%s)", done ? "the scan is done" : "stopped",
        (unsigned long long)(nowMs() - started), done ? gLink.step : gLink.failedStep,
        linkStepName(done ? gLink.step : gLink.failedStep), done ? "" : ", ", done ? "" : linkErrorName(gLink.error));
-  linkTeardown();
-  gLinkRunning = false;
+  // Level 7 keeps the device and the rings: its own teardown comes after the join (level7()).
+  if (!handOff) {
+    linkTeardown();
+    gLinkRunning = false;
+  }
   char state[200];
   snprintf(state, sizeof state, "step %d %s%s%s; %u network(s), endpoint %d, %u credits", done ? gLink.step : gLink.failedStep,
            linkStepName(done ? gLink.step : gLink.failedStep), done ? "" : ": ", done ? "" : linkErrorName(gLink.error),
@@ -2836,9 +2867,9 @@ void stopRadio(const char *why)
   gRadioStopped = true;
   profileClear();   // the join profile does not outlive the radio
   __atomic_store_n(&gStopRequested, 1u, __ATOMIC_RELEASE);
-  const uint64_t deadline = nowMs() + 2000;
+  const uint64_t deadline = nowMs() + 2500;   // level 7's fast teardown (each answer 300 ms) fits in it
   while (gLinkRunning && nowMs() < deadline) IOSleep(10);
-  note("%s: stopping the radio (the ladder's thread %s)", why, gLinkRunning ? "did not finish in 2 s" : "is done");
+  note("%s: stopping the radio (the ladder's thread %s)", why, gLinkRunning ? "did not finish in 2.5 s" : "is done");
   if (!gLinkRunning && gLink.ce) linkTeardown();
   if (gPowerState && gWin[kWinTlmm].va) {
     safeOff(gHw, *gPowerState, gPowerOptions);
@@ -2938,6 +2969,262 @@ void registerJoinSysctl()
   gOidJoin.oid_refcnt = 0;
   sysctl_register_oid(&gOidJoin);
 }
+
+// ============================================================================================ level 7: the join (WifiSta.h)
+// On level 6's virtual device and transport: the profile's network chosen from the scan list and joined in this chip's own
+// order (docs/drivers/wifi.md §13.3). Polled from the ladder's thread like level 6; the log carries step names, status codes,
+// counts and lengths, never the network's name, an address or a key.
+Sta gSta;
+StaDma gStaFrames[kAssocFrameBuffers];
+StaDma gStaReoq;
+bool gStaPlanned;
+
+bool profileOwnMac(uint8_t *mac)
+{
+  if (!gProfileLock || !mac) return false;
+  IOLockLock(gProfileLock);
+  const bool given = gProfileSet && (gProfile.flags & PianoWifiProfileMac);
+  if (given)
+    for (unsigned i = 0; i < 6; ++i) mac[i] = gProfile.mac[i];
+  IOLockUnlock(gProfileLock);
+  return given;
+}
+
+// The profile into the join once it is set (the sysctl may be written at any time while the join waits for it). Only the
+// name, the security and the preferred access point cross; the passphrase stays in the profile (the four-way handshake is
+// user space's, piece 3).
+bool profileToSta(Sta &s, uint32_t &generationSeen)
+{
+  if (!gProfileLock) return false;
+  bool handed = false;
+  IOLockLock(gProfileLock);
+  if (gProfileSet && gProfileGeneration != generationSeen) {
+    handed = staSetProfile(s, gProfile.ssid, gProfile.ssid_len, gProfile.security,
+                           (gProfile.flags & PianoWifiProfileBssid) ? gProfile.bssid : nullptr);
+    generationSeen = gProfileGeneration;
+  }
+  IOLockUnlock(gProfileLock);
+  return handed;
+}
+
+bool staHook(void *, uint32_t id, const uint8_t *payload, uint32_t length, uint64_t now)
+{
+  return staOnEvent(gSta, id, payload, length, now);
+}
+
+void staNote(void *, int step, const char *what)
+{
+  piano_wifi_stage = step;
+  note("step %d: %s", step, what);
+  deferPhase();
+}
+
+void staReport(void *, uint32_t what, uint32_t a, uint32_t b)
+{
+  switch (what) {
+  case kStaRepChosen: {
+    const StaChoice &c = gSta.choice;
+    note("level 7: the network: entry %u of the scan list (%u access point(s) carry the profile's name, %u on a radar channel "
+         "left out): %u MHz, channel %u (%s GHz%s%s), signal %d dBm",
+         a, b, c.excludedRadar, c.freq, c.channel, c.band5 ? "5" : "2.4", c.passive ? ", passive" : "", c.radar ? ", radar" : "",
+         int(c.rssi));
+    const ScanSecurity &sec = c.net.security;
+    note("level 7: its elements: beacon interval %u TU, DTIM %u, %u rate(s)%s, capability %#x; %s (group %u, pairwise %#x, key "
+         "management %#x, capabilities %#x%s%s)",
+         c.net.beaconInterval, c.net.dtimPeriod, c.net.rateCount, c.net.ht ? ", HT" : "", c.net.capability,
+         sec.rsn ? "RSN" : (c.net.capability & kDot11CapPrivacy) ? "privacy without RSN" : "open", sec.groupCipher,
+         sec.pairwise, sec.akm, sec.rsnCaps, sec.wpa1 ? ", WPA1 too" : "", sec.truncated ? ", cut short" : "");
+    return;
+  }
+  case kStaRepPeerMap:
+    if (a == 0xffffffffu)
+      note("level 7: the data interface did not name the peer within %u ms (the join goes on)", gArgs.l7step);
+    else
+      note("level 7: the data interface named the peer: peer %u, hardware peer %u", a, b);
+    return;
+  case kStaRepStartResp:
+    note("level 7: the device's start response: status %u (%s) after %u ms", a, a ? "refused" : "started", b);
+    return;
+  case kStaRepAuthAnswer:
+    note("level 7: the authentication answer: status %u (%s) after %u ms", a, dot11StatusName(uint16_t(a)), b);
+    return;
+  case kStaRepAssocAnswer:
+    note("level 7: the association answer: status %u (%s), AID %u, after %u ms", a, dot11StatusName(uint16_t(a)), b,
+         gSta.assocMs);
+    return;
+  case kStaRepTxStatus:
+    note("level 7: frame %u: %s (completion status %u)", a, b == kWmiMgmtTxStatusOk ? "acknowledged" : "not acknowledged", b);
+    return;
+  case kStaRepPeerAssocConf:
+    note(a ? "level 7: the peer's association confirmed after %u ms"
+           : "level 7: the peer's association not confirmed within %u ms (the join goes on)", b);
+    return;
+  case kStaRepDisconnect:
+    note("level 7: the association ended: %s, reason %u (%s), %u ms after the station came up", staDisconnectName(a), b,
+         (a == kStaDiscDeauth || a == kStaDiscDisassoc) ? dot11ReasonName(uint16_t(b)) : "the firmware's code",
+         gSta.disconnectMs);
+    return;
+  case kStaRepTry:
+    note("level 7: %s: try %u of %u", staStepName(int(a)), b, gArgs.l7tries);
+    return;
+  case kStaRepScanDone:
+    note("level 7: our scan %u is done: the list has %u network(s)", a, b);
+    return;
+  case kStaRepTeardown:
+    note("level 7: the teardown: %s%s",
+         a == kStaTdDeauth ? "our deauthentication sent" : a == kStaTdDown ? "the station down" : a == kStaTdPeerDelete ? "the peer deleted" : "the device stopped",
+         (a == kStaTdPeerDelete || a == kStaTdStop) ? (b ? " (answered)" : " (not answered in time)") : "");
+    return;
+  default:
+    return;
+  }
+}
+
+int level7(IOService *owner)
+{
+  using namespace stadetail;
+  stage(700, "level 7: the join on level 6's virtual device");
+  // Window memory: the frames (the firmware reads each by DMA until its completion) and the 17 reorder queues.
+  if (!gStaPlanned) {
+    bool ok = true;
+    for (unsigned i = 0; i < kAssocFrameBuffers && ok; ++i) {
+      gStaFrames[i].va = arenaAlloc(gArena, kAssocFrameBytes, &gStaFrames[i].bus);
+      gStaFrames[i].bytes = kAssocFrameBytes;
+      ok = gStaFrames[i].va != nullptr;
+    }
+    if (ok) {
+      gStaReoq.va = arenaAlloc(gArena, kStaReoqBytes, &gStaReoq.bus);
+      gStaReoq.bytes = kStaReoqBytes;
+      ok = gStaReoq.va != nullptr;
+    }
+    gStaPlanned = ok;
+  }
+  if (!gStaPlanned) {
+    stage(-700, "level 7: the DMA window has no room for the frames and the reorder queues");
+    return -1;
+  }
+  StaOptions o;
+  o.flags = gArgs.l7;
+  o.vdevId = gLink.options.vdevId;
+  o.chains = linkdetail::chainCountOf(gLink.caps.rfChains);
+  o.profileWaitMs = gArgs.l7wait;
+  o.stepMs = gArgs.l7step;
+  o.frameWaitMs = gArgs.l7frame;
+  o.frameTries = gArgs.l7tries;
+  o.holdMs = gArgs.l7hold;
+  o.rescans = gArgs.l7scans;
+  o.scanWaitMs = gArgs.scanWaitMs;
+  StaEnv env;
+  env.ownMac = gLink.vdevMac;
+  env.scan = &gLink.scan;
+  env.reg = &gLink.reg;
+  env.chanList = &gLink.chanList;
+  env.htt = (gHttPlanned && gLink.httEndpoint > 0) ? &gHtt : nullptr;
+  for (unsigned i = 0; i < kAssocFrameBuffers; ++i) env.frame[i] = gStaFrames[i];
+  env.reoq = gStaReoq;
+  note("level 7: piano-wifi-l7=%#x (parameters %u, peer data %u, peer map %u, 5 GHz first %u, radar %u, deauth %u, %s frames, "
+       "dry run %u); the profile waited for up to %u ms, %u try(s) of %u ms per frame, watched %u ms%s, %u scan(s) of our own",
+       o.flags, (o.flags & kStaFlagParams) ? 1u : 0u, (o.flags & kStaFlagPeerData) ? 1u : 0u, (o.flags & kStaFlagPeerMap) ? 1u : 0u,
+       (o.flags & kStaFlagPrefer5) ? 1u : 0u, (o.flags & kStaFlagRadarOk) ? 1u : 0u, (o.flags & kStaFlagDeauth) ? 1u : 0u,
+       (o.flags & kStaFlagNativeWifi) ? "native Wi-Fi" : "802.3", (o.flags & kStaFlagNoJoin) ? 1u : 0u, o.profileWaitMs, o.frameTries,
+       o.frameWaitMs, o.holdMs, o.holdMs ? "" : " (until a suspend)", o.rescans);
+  note("level 7: the device %u (its address from %s), %u chain(s), %u network(s) in the list, the data interface %s; %u frame "
+       "buffer(s) and %u bytes of reorder queues in the window",
+       o.vdevId, gLink.vdevMacFrom, o.chains, gLink.scan.count, env.htt ? "connected (the peer map is waited for)" : "not connected",
+       kAssocFrameBuffers, kStaReoqBytes);
+  gSta.note = staNote;
+  gSta.report = staReport;
+  gSta.ctx = nullptr;
+  const uint64_t started = nowMs();
+  staBegin(gSta, o, env, started);
+  gLink.hook = staHook;
+  uint32_t generation = 0;
+  bool stopping = false, profileNoted = false;
+  uint64_t stopAt = 0;
+  uint32_t sendWaits = 0;
+  const char *why = nullptr;
+  while (!staFinished(gSta)) {
+    const uint64_t now = nowMs();
+    if (!stopping && (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE) || levelLate())) {
+      const bool suspend = __atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE) != 0;
+      note("level 7: %s during %s: the join is taken down",
+           suspend ? "a suspend asked the radio to stop" : "the level's hard deadline passed", staStepName(gSta.step));
+      // a suspend's power hook waits 2.5 s for this thread: each answer of the teardown is then waited for 300 ms at most
+      staStop(gSta, now, suspend ? 300u : 0u);
+      stopping = true;
+      stopAt = now;
+    }
+    if (stopping && now > stopAt + (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE) ? 1500u : 8000u)) {
+      why = "the teardown did not finish in time";
+      break;
+    }
+    linkRun(gLink, now);
+    if (gLink.step == kLinkStopped) {
+      why = linkErrorName(gLink.error);
+      break;
+    }
+    if (!gSta.profileSet && profileToSta(gSta, generation) && !profileNoted) {
+      profileNoted = true;
+      note("level 7: the join profile was handed over after %llu ms: a network name of %u byte(s), %s, the access point %s "
+           "(none of it is logged)",
+           (unsigned long long)(now - started), unsigned(gSta.ssidLength), piano_wifi_security_name(gSta.security),
+           gSta.bssidGiven ? "given" : "not given");
+    }
+    staRun(gSta, now);
+    if (gSta.outLength) {
+      const int rc = linkSendWmi(gLink, gSta.out, gSta.outLength);
+      if (rc == 1) staSent(gSta, now);
+      else if (rc == 0) ++sendWaits;
+      else {
+        why = "the copy engine refused a command";
+        break;
+      }
+    }
+    if (mhiHealth(gMhiIo, gBoot.bhi).dead()) {
+      note("level 7: the chip reported a system error or its crash dump environment during %s (the last command went out at "
+           "step %u)",
+           staStepName(gSta.step), gSta.lastCommandStep);
+      gChipDead = true;
+      why = "the chip died";
+      break;
+    }
+    IOSleep(gSta.step == kStaProfileWait ? 20 : 2);
+  }
+  gLink.hook = nullptr;
+  if (why) note("level 7: the loop ended early: %s (step %d: %s)", why, gSta.step, staStepName(gSta.step));
+  const bool done = gSta.step == kStaDone;
+  const int at = done ? gSta.step : gSta.failedStep;
+  note("level 7: %s after %llu ms (step %d: %s%s%s); %s", done ? "done" : "stopped", (unsigned long long)(nowMs() - started), at,
+       staStepName(at), done ? "" : ", ", done ? "" : staErrorName(gSta.error),
+       gSta.rsn ? "WPA2-PSK (CCMP, PSK)" : gSta.profileSet ? "open" : "no profile");
+  note("level 7: %u command(s) (%u transport wait(s)), %u event(s), %u management frame(s) of the join and %u of others, %u "
+       "frame(s) sent, %u acknowledged",
+       gSta.commands, sendWaits, gSta.events, gSta.mgmtOurs, gSta.mgmtOthers, gSta.descId, gSta.txAcked);
+  note("level 7: the join: the peer %s%s, %u reorder queue(s), the device %s, authentication %s (status %u), association %s "
+       "(status %u, AID %u), the station %s%s; the end: %s%s",
+       gSta.peerCreated ? "created" : "not created", gSta.peerMapped ? " and mapped" : "", gSta.tidsSent,
+       gSta.vdevStarted ? "started" : "not started", gSta.authAnswered ? "answered" : "not answered", gSta.authStatus,
+       gSta.assocAnswered ? "answered" : "not answered", gSta.assocStatus, gSta.aid, gSta.vdevUp ? "up" : "not up",
+       gSta.authorized ? " and authorised" : gSta.rsn && gSta.vdevUp ? " (the keys are piece 3's: not authorised)" : "",
+       staDisconnectName(gSta.disconnect), gSta.disconnect ? "" : (gSta.vdevUp ? " (the watch ran out)" : ""));
+  if (gHttPlanned)
+    note("level 7: the data interface: %u peer map(s), %u unmap(s), %u message(s) in; refill: the firmware's tail at %u; radio "
+         "buffer rings filled to %u and %u; status buffers given back %u, error entries %u",
+         gHtt.peerMaps, gHtt.peerUnmaps, gHtt.t2hMessages, gHtt.refillTaken, gHtt.macBufFilled[0], gHtt.macBufFilled[1],
+         gHtt.statusRecycled, gHtt.errorsSeen);
+  char state[200];
+  snprintf(state, sizeof state, "step %d %s%s%s; aid %u, status %u/%u, %s", at, staStepName(at), done ? "" : ": ",
+           done ? "" : staErrorName(gSta.error), gSta.aid, gSta.authStatus, gSta.assocStatus, staDisconnectName(gSta.disconnect));
+  owner->setProperty("piano-wifi-level7", state);
+  // The profile's copy in the join is wiped: the name is the owner's environment.
+  for (unsigned i = 0; i < kSsidMax; ++i) gSta.ssid[i] = 0;
+  for (unsigned i = 0; i < kSsidMax; ++i) gSta.choice.net.ssidRaw[i] = 0;
+  for (unsigned i = 0; i < sizeof gSta.choice.net.ssid; ++i) gSta.choice.net.ssid[i] = 0;
+  gSta.ssidLength = 0;
+  linkTeardown();
+  gLinkRunning = false;
+  return done ? 0 : -1;
+}
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------------ the service
@@ -2975,7 +3262,7 @@ bool PianoWifi::start(IOService *provider)
          "phase timeout %u ms, qmi timeout %u ms, iova %u, mode %u, shadow %u, wmi timeout %u ms, scan wait %u ms, band %u, "
          "bssid %u)",
          gArgs.level >= 4 ? ", 4 MHI firmware" : "", gArgs.level >= 5 ? ", 5 QMI" : "",
-         gArgs.level >= 6 ? ", 6 the copy engine, the transport and a scan" : "", gArgs.gen, gArgs.physeq, gArgs.rcg,
+         gArgs.level >= 7 ? ", 6 the copy engine, the transport and a scan, 7 the join" : gArgs.level >= 6 ? ", 6 the copy engine, the transport and a scan" : "", gArgs.gen, gArgs.physeq, gArgs.rcg,
          gArgs.blind, gArgs.release, gArgs.stop, gArgs.dmaMib, gArgs.fwTimeoutMs, gArgs.qmiTimeoutMs, gArgs.iova, gArgs.mode,
          gArgs.shadow, gArgs.wmiTimeoutMs, gArgs.scanWaitMs, gArgs.band, gArgs.bssid);
   if (gArgs.level >= 3)
@@ -2988,7 +3275,7 @@ bool PianoWifi::start(IOService *provider)
     note("options: rddm %u (crash dump), defer %u (lines held from the doorbell, printed by a helper thread), wake %u (device "
          "wake), deadline %u ms (each level's hard deadline)",
          gArgs.rddm, gArgs.defer, gArgs.wake, gArgs.deadlineMs);
-  if (gArgs.level > 6) note("piano-wifi=%u: levels above 6 are not implemented; running up to level 6", gArgs.level);
+  if (gArgs.level > 7) note("piano-wifi=%u: levels above 7 are not implemented; running up to level 7", gArgs.level);
   note("level 1: loads only, nothing written%s", gArgs.spmi || gArgs.level >= 2 ? "; SPMI observer read commands for the PMIC part"
                                                                                : "");
   setProperty("piano-wifi", gArgs.level, 32);
@@ -3287,13 +3574,36 @@ void PianoWifi::run()
   writeSummary("level 6");
   stage(rc ? -613 : 613, rc ? "level 6 stopped before the scan was done" : "level 6: the scan is done");
   note("level 6: %s; %s", rc ? "the scan did not finish" : "the scan is done",
-       rc ? "the ladder ends here" : "association, keys and the data path are levels 7 and 8 (docs/drivers/wifi.md section 13)");
+       rc ? "the ladder ends here"
+          : gArgs.level >= 7 && gLink.step == kLinkHandOff
+              ? "level 7 joins on its virtual device (docs/drivers/wifi.md section 13.3)"
+              : "association, keys and the data path are levels 7 and 8 (docs/drivers/wifi.md section 13)");
   if (!rc) {
-    releaseWake();
-    // The gate PianoWifiEthernet waits for: en1 appears (link down, with the scan list) only when level 6 came up.
+    // The gate PianoWifiEthernet waits for: en1 appears (link down, with the scan list and the virtual device's address) only
+    // when level 6 came up — before level 7's join, so that en1 is there when the link comes up.
     publishResource("PianoWifiLink");
     note("level 6: the resource PianoWifiLink is published: PianoWifiEthernet's en1 may come up (link down, the scan list in "
          "the property piano-wifi-scan; tooling/native/piano-wifi prints it)");
   }
+  const bool level6Up = rc == 0;   // the chip is alive and its link up: only then may the wake doorbell be written
+  if (!rc && gLink.step == kLinkHandOff) {
+    // ---- level 7 -------------------------------------------------------------------------------------------------------
+    // Its own hard deadline: the profile's wait, its scans, the join's steps and the watch, with room for the teardown. A
+    // watch without end (piano-wifi-l7hold=0) has none.
+    const uint64_t own = uint64_t(gArgs.l7wait) + uint64_t(gArgs.l7scans) * gArgs.scanWaitMs +
+                         uint64_t(gArgs.l7step) * 30 + uint64_t(gArgs.l7frame) * gArgs.l7tries * 3 + gArgs.l7hold + 15000;
+    if (gArgs.l7hold) levelBegin(7, own > 0xffffffffull ? 0xffffffffu : uint32_t(own));
+    else levelEnd();
+    rc = level7(this);
+    levelEnd();
+    writeSummary("level 7");
+    stage(rc ? -718 : 718, rc ? "level 7 stopped before its end" : "level 7: the join ran to its end");
+    if (gChipDead) {
+      crashReport("level 7");
+      safeOff(gHw, power, opt);
+      chipPut();
+    }
+  }
+  if (level6Up && !gChipDead) releaseWake();
   unmapAll();
 }

@@ -54,6 +54,14 @@ Nothing above level 1 has run on hardware yet: read one boot's log before raisin
   `piano-wifi-bssid=1`) and published as the property `piano-wifi-scan`. Then the teardown: the scan stopped, the device
   deleted, the rings disabled. `piano-wifi-band=0` scans only the 2.4 GHz band; `piano-wifi-wmitimeout` and
   `piano-wifi-scanwait` are the deadlines. `piano-wifi=6` implies `piano-wifi-mode=1`. No association, no keys, no data path.
+- `piano-wifi=7`: level 6 keeps its virtual device and the transport after the scan, and **the join** runs on them
+  (`WifiSta.h`, docs/drivers/wifi.md §13.3): the network of the join profile (`machdep.piano_wifi_join`, written by root;
+  waited for up to `piano-wifi-l7wait` ms) chosen from the scan list — the strongest access point of the name, a 5 GHz one first
+  — then the station's parameters (802.3 both ways, power save off), the peer and its HTT peer map, its default routing and 17
+  reorder queues, the start on the network's channel, Open System authentication and the association request as management
+  frames, the peer's association (WPA2: the four-way handshake still to come), the station up; watched for
+  `piano-wifi-l7hold` ms or until the access point ends it, then taken down. The log has states, status codes, the AID and
+  lengths, never a name, an address or a key. `piano-wifi-l7=N` switches its pieces (WifiSta.h `kStaFlag*`).
 - The macOS side (`PianoWifiEthernet.cpp`, its own kext): an `IOEthernetController` publishing `en1` built in and **link down**
   with that scan list, gated on the resource `PianoWifiLink` which only a level 6 that came up publishes. On the tablet,
   `tooling/native/piano-wifi` prints the list (addresses masked, `--full` for all of it, `status` for the ladder's result).
@@ -82,14 +90,18 @@ meanings: `docs/drivers/wifi.md`.
 | `WifiCe.h` | portable: level 6's copy engine — the three rings of a pipe, their registers, a send, the receive buffers, the event walk, the teardown |
 | `WifiHtc.h` | portable: the host transport — the header, the ready message, a service connected, set-up complete, the credit records |
 | `WifiWmi.h` | portable: the firmware's message interface — the codec, the initialisation, the capability and ready events, a virtual device, the scan, the management-frame parse and the scan list |
-| `WifiLink.h` | portable: level 6's ladder over those three, as one step machine with a clock and one outstanding command |
+| `WifiLink.h` | portable: level 6's ladder over those three, as one step machine with a clock and one outstanding command; with level 7 it keeps the device after the scan and hands its transport over (an event hook, `linkSendWmi`) |
+| `WifiSta.h` | portable: level 7, the join — the profile's network chosen from the scan list, the station's parameters, the peer and its HTT peer map, its default routing and 17 reorder queues, the start, Open System authentication, the association, the peer's association, the station up, the watch, the teardown |
+| `WifiDot11.h` | portable: the 802.11 frames of the join (authentication, association request with the RSN element, the answers, deauthentication), from IEEE 802.11 |
+| `WifiProfile.h` | the join profile's structure and rules, shared with `tooling/native/piano-wifi-join` |
 | `PianoWifiEthernet.cpp` | the macOS side: `en1` (built in, link down) with the scan list; its own kext, gated on the resource `PianoWifiLink` |
 | `WifiHw.h` | the register facts, each with its source |
 | `SpmiObserver.h`, `SmmuStream.h`, `FatVolume.c/.h` | copies of PianoPower's and PianoDwc3's (`UPSTREAM`; those packages are not modified) |
 | `tests/wifi_host.cpp` | host tests of level 1 against register models (gates, decoders, SMMU, cmd-db, PMIC) |
 | `tests/bringup_host.cpp` | host tests of levels 2–4: the rail votes and their rules, the pin and PHY order, the link polls and timeouts, configuration space and BAR sizing, the MHI boot, each with injected faults |
 | `tests/qmi_host.cpp` | host tests of level 5: the QMI codec, the copied router, the two MHI channels, the firmware's service and the 32-bit window, each with injected faults |
-| `tests/wmi_host.cpp` | host tests of level 6: the copy engine's registers and rings against a model of the chip, the transport's handshake and credits, the initialisation's TLVs, the scan and its list, each with injected faults |
+| `tests/wmi_host.cpp` | host tests of level 6: the copy engine's registers and rings against a model of the chip, the transport's handshake and credits, the initialisation's TLVs, the scan and its list, the hand-off to level 7, each with injected faults |
+| `tests/assoc_host.cpp`, `tests/sta_host.cpp` | host tests of level 7: its messages read back as the firmware reads them; the frames, the choice, the reorder queues, the peer map and the whole join against a firmware and access-point model (refusals, silence, a late profile, a disconnect, a stop) |
 
 Build: `tooling/k27/build-native-piano-wifi.sh` (the four host test programs, the `FatVolume.c` drift check, the objects, the
 import check) and `tooling/k27/build-native-piano-wifi-ethernet.sh` for the macOS side. Both are in

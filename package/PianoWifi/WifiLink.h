@@ -42,6 +42,9 @@ enum LinkStep : int {
   // interface, the radio's statistics after a scan, the data interface's version, the receive rings announced, and then the
   // second scan.
   kLinkConnectHtt = 625, kLinkStats = 626, kLinkHttVersion = 627, kLinkRxRings = 628,
+  // Level 7 (WifiSta.h): the scan is done and the virtual device is kept; the transport keeps running and every event goes to
+  // the owner's hook first. The level's teardown is then the owner's, after its join.
+  kLinkHandOff = 629,
 };
 
 enum LinkError : int {
@@ -80,6 +83,7 @@ inline const char *linkStepName(int step)
   case kLinkStats: return "the radio's statistics";
   case kLinkHttVersion: return "the data interface's version";
   case kLinkRxRings: return "the receive rings";
+  case kLinkHandOff: return "the scan is done: the virtual device stays for level 7";
   default: return "stopped";
   }
 }
@@ -118,6 +122,13 @@ struct LinkOptions {
   // statistics and the data interface's version are waited for, and how long the rings settle before the second scan.
   HttRx *htt = nullptr;
   uint32_t statsWaitMs = 1000, httVersionWaitMs = 2000, ringSettleMs = 300;
+  // Level 7: after the last scan the virtual device is kept and the ladder hands its transport over (kLinkHandOff) instead of
+  // tearing it down.
+  bool handOff = false;
+  // The station's own address when the join profile names one (set before the virtual device is created): it wins over every
+  // other source, and en1 takes the same.
+  bool ownMacSet = false;
+  uint8_t ownMac[6] = {};
 };
 
 // One channel visit as the firmware's channel-information event ends it.
@@ -191,6 +202,10 @@ struct Link {
   uint32_t eventKinds = 0, eventKindsDropped = 0;
   void (*note)(void *ctx, int step, const char *what) = nullptr;
   void *noteCtx = nullptr;
+  // Level 7's hook: every event of the message interface goes to it first, and one it takes (returns true) goes nowhere else.
+  bool (*hook)(void *ctx, uint32_t id, const uint8_t *payload, uint32_t length, uint64_t nowMs) = nullptr;
+  void *hookCtx = nullptr;
+  uint32_t hooked = 0;
 };
 
 namespace linkdetail {
@@ -232,7 +247,10 @@ inline void enter(Link &link, int step, uint64_t nowMs)
 inline void chooseVdevMac(Link &link)
 {
   const uint8_t *from = nullptr;
-  if (wmiMacUsable(link.ready.mac)) {
+  if (link.options.ownMacSet && wmiMacUsable(link.options.ownMac)) {
+    from = link.options.ownMac;
+    link.vdevMacFrom = "the join profile's address";
+  } else if (wmiMacUsable(link.ready.mac)) {
     from = link.ready.mac;
     link.vdevMacFrom = "the firmware's ready event";
   } else if (link.ready.extraMacSeen) {
@@ -578,6 +596,11 @@ inline void afterScan(Link &link, uint64_t nowMs)
     link.pending = kLinkSendHttVersion;
     return;
   }
+  if (link.options.handOff) {
+    enter(link, kLinkHandOff, nowMs);   // level 7 joins on the same device; its teardown is the owner's
+    link.pending = kLinkSendNothing;
+    return;
+  }
   enter(link, kLinkTeardown, nowMs);
   link.stopped = true;   // nothing to stop: the scan ended by itself
   link.pending = kLinkSendDeleteVdev;
@@ -674,6 +697,10 @@ inline void onEvent(Link &link, const uint8_t *message, uint32_t length, uint64_
   ++link.events;
   link.lastEvent = id;
   countEvent(link, id);
+  if (link.hook && link.hook(link.hookCtx, id, payload, payloadLength, nowMs)) {
+    ++link.hooked;
+    return;
+  }
   switch (id) {
   case kWmiEvtServiceReady:
     if (link.step != kLinkCapability) {
@@ -831,12 +858,16 @@ inline void linkBegin(Link &link, Ce &ce, const ChipIo &io, const LinkOptions &o
 {
   const auto note = link.note;
   void *const ctx = link.noteCtx;
+  const auto hook = link.hook;
+  void *const hookCtx = link.hookCtx;
   link = Link{};
   link.ce = &ce;
   link.io = io;
   link.options = options;
   link.note = note;
   link.noteCtx = ctx;
+  link.hook = hook;
+  link.hookCtx = hookCtx;
   link.began = nowMs;
   htcBegin(link.htc);
   link.request.scanId = kWmiScanId;
@@ -879,18 +910,40 @@ inline void linkReceive(Link &link, const uint8_t *data, uint32_t length, uint64
   }
 }
 
-// One turn of the ladder: the copy engine's events, the buffers given back, the one command outstanding if it can go out, the
-// steps that move by themselves (the scan after its settle time, the teardown), then the step's deadline. Returns the step.
-inline int linkRun(Link &link, uint64_t nowMs)
+// The transport's own turn: the copy engine's events (each message through the transport and into the step machine or the
+// hook), the buffers given back, the receive rings kept from running dry.
+inline void linkPump(Link &link, uint64_t nowMs)
 {
-  using namespace linkdetail;
-  if (!link.ce || link.step == kLinkDone || link.step == kLinkStopped) return link.step;
+  if (!link.ce) return;
   cePoll(*link.ce, link.io, [&](uint32_t kind, uint32_t, uint8_t *va, uint32_t length, uint32_t) {
     if (kind == kCeReceived) linkReceive(link, va, length, nowMs);
   });
   for (unsigned i = 0; i < kCeHostPipeCount; ++i) cePostRx(*link.ce, link.io, i);
   // The receive rings the hardware consumes, kept from running dry (P23), every turn once they are announced.
   if (link.options.htt && link.options.htt->announced) httTurn(*link.options.htt);
+}
+
+// A message of the owner's (level 7's commands, already built with their WMI header) on the message interface's endpoint.
+// Returns 1 sent, 0 "not now" (no credits or no transport buffer: the next turn tries again), -1 failed for good.
+inline int linkSendWmi(Link &link, const uint8_t *message, uint32_t length)
+{
+  if (link.endpoint <= 0 || !message || !length) return -1;
+  const int rc = linkdetail::send(link, uint8_t(link.endpoint), [&](uint8_t *at, uint32_t capacity) -> uint32_t {
+    if (length > capacity) return 0;
+    for (uint32_t i = 0; i < length; ++i) at[i] = message[i];
+    return length;
+  });
+  return rc;
+}
+
+// One turn of the ladder: the copy engine's events, the buffers given back, the one command outstanding if it can go out, the
+// steps that move by themselves (the scan after its settle time, the teardown), then the step's deadline. Returns the step.
+inline int linkRun(Link &link, uint64_t nowMs)
+{
+  using namespace linkdetail;
+  if (!link.ce || link.step == kLinkDone || link.step == kLinkStopped) return link.step;
+  linkPump(link, nowMs);
+  if (link.step == kLinkHandOff) return link.step;   // level 7's: the transport only
   if (link.step == kLinkDone || link.step == kLinkStopped) return link.step;
   if (link.pending != kLinkSendNothing) {
     sendPending(link, nowMs);
@@ -1044,6 +1097,6 @@ inline void linkDisable(Link &link)
   ceStop(*link.ce, link.io);
 }
 
-inline bool linkFinished(const Link &link) { return link.step == kLinkDone; }
+inline bool linkFinished(const Link &link) { return link.step == kLinkDone || link.step == kLinkHandOff; }
 
 }  // namespace pianowifi

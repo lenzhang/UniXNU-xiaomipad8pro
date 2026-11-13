@@ -229,6 +229,30 @@ register and layout facts as these hosts are publicly known to behave, no code, 
   either order of the first two words, since only the layout was taken, not the code.
 Not read and not used: any Qualcomm binary; no dump is kept, committed or printed beyond the decode's short lines.
 
+Specifications only for level 7, the join (2026-11-13; docs/drivers/wifi.md section 13.3; behaviour, identifiers, field
+places and bit positions, no code, comment or table copied), the same Ubuntu kernel (unixnu-research/ubuntu-ref):
+  drivers/net/wireless/ath/ath12k/wifi7/hw.c: the WCN7860 entry (vdev_start_delay, rx_mac_buf_ring, reoq_lut_support off, the
+    QCC2072 operations); wifi7/hal.c: WCN7860 takes QCC2072's HAL and registers and WCN7850's transmit-ring map and parameters
+    (receive buffers return to software ring 1).
+  mac.c, peer.c, dp.c: the order of a station's join on a chip with vdev_start_delay (the peer, its HTT peer map, the default
+    routing value hash | ring << 1, one reorder queue per traffic identifier 0-16 with a window of 1, then the delayed start,
+    the peer's association and the station up after the association); the station's parameters after a virtual device (the
+    transmit encapsulation and receive decapsulation, the stream count, the three power-save parameters and their values, power
+    save off); the peer's association fields of a legacy peer (the rate form 500 kb/s | bit 7 for CCK, the four-way-handshake
+    flag clearing the authorisation); a station's start (passive with "no initiating radiation", the beacon interval and DTIM).
+  dp_rx.c, wifi7/dp_rx.c, wifi7/hal_rx.c, wifi7/hal_desc.h, hal.h: the reorder queue descriptor (its 32 words, the header's owner,
+    kind and debug pattern, the queue number, info0's valid / counter / access category / retry / window / PN / ignore-A-MPDU
+    bits, the start sequence number, the three extension descriptors of a QoS identifier, the 128-byte alignment), the
+    identifier-to-access-category rule, WMI_PEER_REORDER_QUEUE_SETUP's fields.
+  wmi.h, wmi.c: the command and event identifiers (counted out of their enumerations) and tags of the station power-save
+    parameter, the reorder queue set-up, the roam event; the device parameter numbers of the encapsulation, decapsulation and
+    stream count; the peer parameter "default routing"; the frame modes (raw 0, native Wi-Fi 1, Ethernet 2); the management
+    frame command's fields and its 64-byte inline copy; the roam event's reason values.
+  dp_htt.c, dp_htt.h: the HTT peer map messages (types 3, 0x1e, 0x2b; unmap 4, 0x1f) and their fields.
+The 802.11 frames of the join (WifiDot11.h: the authentication, the association request and its elements' order, the RSN element
+and its suites, the answers, the status and reason codes) are written from IEEE Std 802.11 itself; no driver's code was read
+for them.
+
 Specifications only (no code, comment or table copied): mainline Linux drivers/clk/qcom/gcc-sm8750.c and tcsrcc-sm8750.c,
 include/dt-bindings/clock/qcom,sm8750-gcc.h, drivers/pci/controller/dwc/pcie-qcom.c and pcie-designware.h,
 drivers/phy/qualcomm/phy-qcom-qmp-pcie.c and phy-qcom-qmp-pcs-v7.h, drivers/pinctrl/qcom/pinctrl-sm8750.c (register offsets, bit

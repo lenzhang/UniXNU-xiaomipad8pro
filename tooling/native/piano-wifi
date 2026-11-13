@@ -41,7 +41,7 @@ raw)
   exit 0
   ;;
 status)
-  for name in piano-wifi piano-wifi-level6 piano-wifi-link piano-wifi-scan-summary; do
+  for name in piano-wifi piano-wifi-level6 piano-wifi-level7 piano-wifi-link piano-wifi-scan-summary; do
     line=$(property "$name")
     [ -n "$line" ] && echo "$line" | sed 's/^[ |]*//'
   done

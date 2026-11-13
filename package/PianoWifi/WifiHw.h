@@ -879,7 +879,69 @@ constexpr uint32_t kAssocProfileWaitMs = 600000;  // for the join profile (machd
 constexpr uint32_t kAssocFrameWaitMs = 500, kAssocFrameTries = 3;   // an authentication or association answer, and retries
 constexpr uint32_t kAssocHoldMs = 30000;          // associated: how long the level watches the link before its teardown
 constexpr uint32_t kAssocScanDwellMs = 300;       // the targeted scan's passive dwell on the network's channel
-constexpr uint32_t kAssocScanId = 0xa001;
+constexpr uint32_t kAssocScanId = 0xa010;          // level 7's own scans: clear of level 6's 0xa000 and 0xa002
 constexpr uint32_t kAssocFrameBuffers = 4, kAssocFrameBytes = 1024;
+
+// ---- level 7, the join as this chip's own host runs it (WifiSta.h; docs/drivers/wifi.md §13.3) ----
+// Facts of the Ubuntu tree of §3 (mac.c, peer.c, dp.c, dp_rx.c, wifi7/hal_rx.c, wifi7/hal_desc.h, wmi.[ch], dp_htt.[ch]):
+// identifiers, tags, field places and bit positions, read for those facts only; no code, comment or table of it is here.
+// This chip family starts a station's virtual device only once its peer exists ("vdev_start_delay"): the order is the peer, the
+// firmware's data interface naming it (HTT peer map), the peer's data set-up (its default routing, then one receive reorder
+// queue per traffic identifier, 0-16), the virtual device started on the network's channel, Open System authentication and the
+// association request as management frames of the message interface, the peer's association, the station up; the keys and the
+// authorisation come after the four-way handshake (piece 3, user space).
+// The station's parameters this chip's host sends right after its virtual device is created: the transmit encapsulation and
+// the receive decapsulation (2 = 802.3: en1 is an Ethernet interface), the stream count, three power-save parameters (wake on
+// receive, wake on every transmit, no PS-Poll limit) and power save off.
+constexpr uint32_t kWmiVdevParamTxEncapType = 0x30, kWmiVdevParamRxDecapType = 0x5b;
+constexpr uint32_t kWmiTxRxRaw = 0, kWmiTxRxNativeWifi = 1, kWmiTxRxEthernet = 2;
+constexpr uint32_t kWmiCmdStaPowersaveParam = 0x09002, kWmiTagStaPowersaveParamCmd = 0x06d;
+constexpr uint32_t kWmiStaPsParamRxWakePolicy = 0, kWmiStaPsParamTxWakeThreshold = 1, kWmiStaPsParamPspollCount = 2;
+constexpr uint32_t kWmiStaPsRxWakePolicyWake = 0, kWmiStaPsTxWakeThresholdAlways = 1, kWmiStaPsPspollCountNoMax = 0;
+// The peer's data set-up: WMI_PEER_SET_PARAM "default routing" = hash steering on (bit 0) and the receive ring the peer's
+// frames go to in 3:1 (the ring's number counts from 1: radio 0's ring is 1); then WMI_PEER_REORDER_QUEUE_SETUP for each
+// traffic identifier 0-16 (16 is the non-QoS one): the device, the peer's address, the identifier, the queue descriptor's bus
+// address (low, high), the queue number (the identifier again), "window size valid" and the window size (1: no block ack yet).
+constexpr uint32_t kWmiPeerParamDefaultRouting = 19;
+constexpr uint32_t kDpRxHashEnable = 1, kDpReoDestRing = 1;
+constexpr uint32_t kWmiCmdPeerReorderQueueSetup = 0x06013, kWmiTagReorderQueueSetupCmd = 0x225;
+constexpr uint32_t kWmiReorderQueueSetupWords = 9;
+constexpr uint32_t kStaTids = 17, kStaNonQosTid = 16;
+// The receive reorder queue descriptor in host memory (128-byte aligned, the hardware's own): a 32-word queue descriptor and,
+// for a QoS identifier, three 32-word extension descriptors (enough for a window of 256). Word 0 of each is its header: the
+// owner (3:0, 4 = the reorder unit), the kind (7:4: 8 a queue, 9 an extension) and a debug pattern (31:8). Word 1 the queue
+// number (15:0). Word 2: valid (0), which link-descriptor counter (2:1, 1), the access category (6:5), retry check (8), the
+// window size less one (20:11), PN check (21), PN size (26:25), "ignore the A-MPDU flag" (27). Word 3: the start sequence
+// number (12:1). A window of 1 on a QoS identifier is written as 2 (the hardware's rule); a window of 1 on the non-QoS
+// identifier sets the retry check instead.
+constexpr uint32_t kReoQueueAlign = 128, kReoQueueWords = 32, kReoQueueExtWords = 32, kReoQueueExtCount = 3;
+constexpr uint32_t kReoQueueQosBytes = (kReoQueueWords + kReoQueueExtCount * kReoQueueExtWords) * 4;   // 512
+constexpr uint32_t kReoQueueNonQosBytes = kReoQueueWords * 4;                                          // 128
+constexpr uint32_t kReoDescOwnerReo = 4, kReoDescTypeQueue = 8, kReoDescTypeQueueExt = 9;
+constexpr uint32_t kReoQueueMagic0 = 0xddbeef, kReoQueueMagic1 = 0xadbeef, kReoQueueMagic2 = 0xbdbeef,
+                   kReoQueueMagic3 = 0xcdbeef;
+constexpr uint32_t kReoQueueVld = 1u << 0, kReoQueueAssocLinkCounterShift = 1, kReoQueueAcShift = 5, kReoQueueRetry = 1u << 8,
+                   kReoQueueBaWindowShift = 11, kReoQueueBaWindowMask = 0x3ffu, kReoQueuePnCheck = 1u << 21,
+                   kReoQueuePnSizeShift = 25, kReoQueueIgnoreAmpdu = 1u << 27, kReoQueueSsnShift = 1, kReoQueueSsnMask = 0xfffu;
+// The firmware's data interface names a created peer: HTT_T2H peer map (3; the second and third forms 0x1e, 0x2b with the
+// hardware peer identifier in other places), word 0 the type (7:0), the device (15:8) and the peer identifier (31:16), word 1
+// the address's first four bytes, word 2 its last two (15:0) and (forms 3 and 0x1e) the hardware peer (31:16); unmap is 4 / 0x1f.
+constexpr uint32_t kHttT2hPeerUnmap = 0x04, kHttT2hPeerMap2 = 0x1e, kHttT2hPeerUnmap2 = 0x1f, kHttT2hPeerMap3 = 0x2b;
+// The events level 7 waits for besides those above: the device stopped, a peer deleted, a roam event (the firmware's beacon
+// miss among its reasons), each with its tag.
+constexpr uint32_t kWmiTagRoamEvent = 0x030;
+constexpr uint32_t kWmiEvtRoam = 0x0b001;
+constexpr uint32_t kWmiRoamReasonMask = 0xf, kWmiRoamReasonBeaconMiss = 2;
+// 802.11 element and capability facts the association request needs: the band's rates (500 kb/s units; the CCK ones 1, 2,
+// 5.5 and 11 Mb/s are 2, 4, 11 and 22), the TIM element's DTIM period, the vendor element of WPA1 (00:50:F2 type 1), spectrum
+// management (capability bit 8: the access point wants the power capability and the supported channels elements), and the
+// status codes the log names.
+constexpr uint16_t kDot11CapSpectrumMgmt = 0x0100, kDot11CapQos = 0x0200;
+constexpr uint32_t kDot11ElementPowerCap = 33, kDot11ElementSupportedChannels = 36, kDot11ElementHtCap = 45,
+                   kDot11ElementVendor = 221;
+constexpr uint32_t kDot11AuthRespSeq = 2, kDot11AssocRespFixed = 6;
+constexpr uint16_t kDot11StatusSuccess = 0;
+constexpr uint32_t kStaFrameSeqShift = 4;
+constexpr uint32_t kStaListenInterval = kAssocListenInterval;   // what the association request and the peer's association say
 
 }  // namespace pianowifi

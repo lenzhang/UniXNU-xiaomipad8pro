@@ -420,6 +420,69 @@ inline uint32_t assocBuildPowersaveOff(WmiWriter &w, uint8_t *buffer, uint32_t c
   return wmiEnd(w);
 }
 
+// One of the station's power-save parameters: the device, the parameter, the value.
+inline uint32_t assocBuildStaPsParam(WmiWriter &w, uint8_t *buffer, uint32_t capacity, uint32_t vdevId, uint32_t param,
+                                     uint32_t value)
+{
+  wmiBegin(w, buffer, capacity, kWmiCmdStaPowersaveParam);
+  uint8_t *cmd = wmiStruct(w, kWmiTagStaPowersaveParamCmd, 3);
+  if (cmd) {
+    wmiPut(cmd, 0, vdevId);
+    wmiPut(cmd, 1, param);
+    wmiPut(cmd, 2, value);
+  }
+  return wmiEnd(w);
+}
+
+// ----------------------------------------------------------------- the peer's receive reorder queues (its data set-up)
+// One queue descriptor in host memory, as the reorder unit reads it (WifiHw.h has the words): `at` is 128-byte aligned and
+// zeroed by the caller for kReoQueueQosBytes (a QoS identifier) or kReoQueueNonQosBytes (the non-QoS one). The access
+// category of an identifier is 802.1D's: 0 and 3 best effort, 1 and 2 background, 4 and 5 video, 6 and 7 voice (and the
+// higher identifiers voice too).
+inline uint32_t reoTidAc(uint32_t tid) { return (tid == 0 || tid == 3) ? 0u : (tid == 1 || tid == 2) ? 1u : (tid == 4 || tid == 5) ? 2u : 3u; }
+
+inline uint32_t reoQueueBytes(uint32_t tid) { return tid == kStaNonQosTid ? kReoQueueNonQosBytes : kReoQueueQosBytes; }
+
+inline void reoQueueInit(uint8_t *at, uint32_t tid, uint32_t baWindow, uint32_t ssn)
+{
+  if (!at) return;
+  const uint32_t bytes = reoQueueBytes(tid);
+  for (uint32_t i = 0; i < bytes; ++i) at[i] = 0;
+  auto header = [](uint32_t type, uint32_t magic) { return kReoDescOwnerReo | type << 4 | (magic & 0xffffffu) << 8; };
+  wmiPut(at, 0, header(kReoDescTypeQueue, kReoQueueMagic0));
+  wmiPut(at, 1, tid & 0xffffu);
+  uint32_t window = baWindow ? baWindow : 1;
+  if (window == 1 && tid != kStaNonQosTid) window = 2;
+  uint32_t info0 = kReoQueueVld | 1u << kReoQueueAssocLinkCounterShift | reoTidAc(tid) << kReoQueueAcShift |
+                   ((window - 1) & kReoQueueBaWindowMask) << kReoQueueBaWindowShift | kReoQueueIgnoreAmpdu;
+  if (window == 1) info0 |= kReoQueueRetry;
+  wmiPut(at, 2, info0);
+  wmiPut(at, 3, ssn <= kReoQueueSsnMask ? (ssn & kReoQueueSsnMask) << kReoQueueSsnShift : 0u);
+  if (tid == kStaNonQosTid) return;
+  const uint32_t magic[kReoQueueExtCount] = {kReoQueueMagic1, kReoQueueMagic2, kReoQueueMagic3};
+  for (uint32_t e = 0; e < kReoQueueExtCount; ++e)
+    wmiPut(at + (kReoQueueWords + e * kReoQueueExtWords) * 4, 0, header(kReoDescTypeQueueExt, magic[e]));
+}
+
+// The command that hands the firmware one of them.
+inline uint32_t assocBuildReorderQueueSetup(WmiWriter &w, uint8_t *buffer, uint32_t capacity, uint32_t vdevId,
+                                            const uint8_t *peer, uint32_t tid, uint64_t queueBus, uint32_t baWindow)
+{
+  wmiBegin(w, buffer, capacity, kWmiCmdPeerReorderQueueSetup);
+  uint8_t *cmd = wmiStruct(w, kWmiTagReorderQueueSetupCmd, kWmiReorderQueueSetupWords);
+  if (cmd) {
+    wmiPut(cmd, 0, vdevId);
+    for (unsigned i = 0; i < 6; ++i) cmd[1 * 4 + i] = peer ? peer[i] : 0;
+    wmiPut(cmd, 3, tid);
+    wmiPut(cmd, 4, uint32_t(queueBus & 0xffffffffu));
+    wmiPut(cmd, 5, uint32_t(queueBus >> 32));
+    wmiPut(cmd, 6, tid);
+    wmiPut(cmd, 7, 1);
+    wmiPut(cmd, 8, baWindow);
+  }
+  return wmiEnd(w);
+}
+
 // ------------------------------------------------------------------------------------------------------- 705: a peer
 inline uint32_t assocBuildPeerCreate(WmiWriter &w, uint8_t *buffer, uint32_t capacity, uint32_t vdevId, const uint8_t *peer)
 {
@@ -551,6 +614,45 @@ inline bool assocParseKickout(PeerKickout &out, const uint8_t *payload, uint32_t
   for (unsigned i = 0; i < 6; ++i) out.peer[i] = ev[i];
   out.reason = wmiGet(ev, 2);
   if (size >= 4 * 4) out.rssi = int32_t(wmiGet(ev, 3));
+  return true;
+}
+
+// The device stopped, a peer deleted, a roam event: what the teardown and the watch wait for.
+inline bool assocParseVdevStopped(uint32_t &vdevId, const uint8_t *payload, uint32_t length)
+{
+  uint32_t size = 0;
+  const uint8_t *ev = wmiFind(payload, length, kWmiTagVdevStoppedEvent, &size);
+  if (!ev || size < 4) return false;
+  vdevId = wmiGet(ev, 0);
+  return true;
+}
+
+inline bool assocParsePeerDeleteResp(uint32_t &vdevId, uint8_t *peer, const uint8_t *payload, uint32_t length)
+{
+  uint32_t size = 0;
+  const uint8_t *ev = wmiFind(payload, length, kWmiTagPeerDeleteRespEvent, &size);
+  if (!ev || size < 3 * 4) return false;
+  vdevId = wmiGet(ev, 0);
+  if (peer)
+    for (unsigned i = 0; i < 6; ++i) peer[i] = ev[4 + i];
+  return true;
+}
+
+struct RoamEvent {
+  bool seen = false;
+  uint32_t vdevId = 0, reason = 0;
+  int32_t rssi = 0;
+};
+
+inline bool assocParseRoam(RoamEvent &out, const uint8_t *payload, uint32_t length)
+{
+  uint32_t size = 0;
+  const uint8_t *ev = wmiFind(payload, length, kWmiTagRoamEvent, &size);
+  if (!ev || size < 3 * 4) return false;
+  out.seen = true;
+  out.vdevId = wmiGet(ev, 0);
+  out.reason = wmiGet(ev, 1) & kWmiRoamReasonMask;
+  out.rssi = int32_t(wmiGet(ev, 2));
   return true;
 }
 

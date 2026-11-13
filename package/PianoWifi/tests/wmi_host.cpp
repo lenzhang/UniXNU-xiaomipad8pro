@@ -188,6 +188,7 @@ struct Firmware {
   std::vector<std::pair<uint32_t, uint32_t>> params;     // (parameter, value) in the order they arrived
   std::vector<std::pair<uint32_t, uint32_t>> chanEntries;   // (frequency, information word)
   std::vector<uint32_t> commandOrder;                    // every command identifier, in order
+  std::vector<std::pair<uint32_t, uint32_t>> vdevParams;  // level 7's device parameters (the hand-off test)
   uint32_t initWords = 0, scanChannels = 0, scanFlags = 0, scanBssids = 0, scanSsids = 0, vdevStreams = 0, vdevType = 0;
   std::vector<uint32_t> channelList;
   uint8_t vdevMac[6] = {};
@@ -691,6 +692,13 @@ struct Firmware {
       sendScanEvent(kWmiScanEvCompleted, kWmiScanReasonCancelled, 0);
       return;
     }
+    case kWmiCmdVdevSetParam: {   // level 7's (the hand-off test sends one through linkSendWmi)
+      uint32_t size = 0;
+      const uint8_t *cmd = wmiFind(tlvs, left, kWmiTagVdevSetParamCmd, &size);
+      CHECK(cmd && size == 3 * 4);
+      if (cmd) vdevParams.push_back({wmiGet(cmd, 1), wmiGet(cmd, 2)});
+      return;
+    }
     case kWmiCmdVdevDelete: {
       deleteSeen = true;
       uint32_t size = 0;
@@ -825,7 +833,7 @@ struct Host {
   {
     for (unsigned i = 0; i < turns; ++i) {
       turn();
-      if (link.step == kLinkDone || link.step == kLinkStopped) break;
+      if (link.step == kLinkDone || link.step == kLinkStopped || link.step == kLinkHandOff) break;
     }
     settle();
     return link.step;
@@ -1302,6 +1310,71 @@ static void testOneBand()
   CHECK(h.firmware.scanChannels == kScanChannelCount24);
 }
 
+// ============================================================== level 7's hand-off: the device kept, the transport its
+static unsigned gHooked;
+static uint32_t gHookedId;
+static bool handOffHook(void *, uint32_t id, const uint8_t *, uint32_t, uint64_t)
+{
+  ++gHooked;
+  gHookedId = id;
+  return id == uint32_t(kWmiEvtVdevStartResp);   // the hook takes this one; everything else goes on to the ladder
+}
+
+static void testHandOff()
+{
+  Host h;
+  CHECK(h.start());
+  LinkOptions options;
+  options.handOff = true;
+  const uint8_t own[6] = {0x02, 0x50, 0x49, 0x41, 0x4e, 0x07};
+  options.ownMacSet = true;
+  std::memcpy(options.ownMac, own, 6);
+  h.begin(options);
+  h.firmware.sendReady();
+  CHECK(h.run() == kLinkHandOff);
+  CHECK(linkFinished(h.link) && h.link.error == kLinkErrNone);
+  // both rounds ran, nothing was deleted, and the device took the profile's address
+  CHECK(h.firmware.scansSeen == 2 && !h.firmware.deleteSeen);
+  CHECK(std::memcmp(h.firmware.vdevMac, own, 6) == 0 && std::string(h.link.vdevMacFrom) == "the join profile's address");
+  CHECK(h.steps.back().first == kLinkHandOff);
+  // the hook sees the events first; one it takes goes nowhere else, one it leaves is the ladder's
+  h.link.hook = &handOffHook;
+  gHooked = 0;
+  const uint32_t unexpectedBefore = h.link.unexpected;
+  uint8_t resp[4 + 6 * 4] = {};
+  put32(resp, (6 * 4) | uint32_t(kWmiTagVdevStartRespEvent) << kWmiTlvTagShift);
+  h.firmware.event(kWmiEvtVdevStartResp, resp, sizeof resp);
+  for (unsigned i = 0; i < 4; ++i) h.turn();
+  CHECK(gHooked == 1 && gHookedId == uint32_t(kWmiEvtVdevStartResp) && h.link.hooked == 1);
+  CHECK(h.link.unexpected == unexpectedBefore);
+  // level 7's own command through the ladder's endpoint, credits and all
+  uint8_t msg[128] = {};
+  WmiWriter w;
+  const uint32_t length = assocBuildVdevSetParam(w, msg, sizeof msg, 0, kWmiVdevParamNss, 2);
+  CHECK(length && linkSendWmi(h.link, msg, length) == 1);
+  for (unsigned i = 0; i < 4; ++i) h.turn();
+  CHECK(h.firmware.vdevParams.size() == 1 && h.firmware.vdevParams[0].first == kWmiVdevParamNss &&
+        h.firmware.vdevParams[0].second == 2);
+  CHECK(h.link.step == kLinkHandOff);
+  // the owner's teardown after its join: the device deleted, the rings disabled
+  bool idle = false;
+  for (unsigned i = 0; i < 20 && !idle; ++i) {
+    h.device.run();
+    h.firmware.drain();
+    h.device.run();
+    h.now += 5;
+    idle = linkStopRequest(h.link, h.now);
+  }
+  h.settle();
+  CHECK(idle && h.firmware.deleteSeen);
+  // without the hand-off the same ladder tears down as before
+  Host plain;
+  CHECK(plain.start());
+  plain.begin(LinkOptions{});
+  plain.firmware.sendReady();
+  CHECK(plain.run() == kLinkDone && plain.firmware.deleteSeen);
+}
+
 static void testFaults()
 {
   {   // the firmware refuses the service
@@ -1625,6 +1698,7 @@ int main()
   testRadioSetup();
   testReceiveBuffers();
   testOneBand();
+  testHandOff();
   testFaults();
   std::printf(failures ? "wmi_host: %d check(s) failed\n" : "wmi_host: all passed\n", failures);
   return failures ? 1 : 0;

@@ -149,6 +149,17 @@ refill ring the firmware hands on to the radios. Built: the data interface, its 
 buffers, and a second scan after them on the same boot (the first is the control), with the channel visits' counters and the
 radio's statistics to tell "no buffers" from "a deaf radio". The scan lines no longer print a network's name. Next: §8.8 boot 9a.
 
+**Level 7, the join, is built (2026-11-13, `piano-wifi=7`, §13.3; not yet run on the tablet).** Level 6 keeps its virtual
+device and the transport after the second scan and hands them over; level 7 waits for the join profile (`machdep.piano_wifi_join`),
+chooses the profile's network out of the scan list (the strongest access point of the name, a 5 GHz one first), and joins in this
+chip's own order: the station's parameters, the peer, its HTT peer map, its default routing and 17 reorder queues, the start on
+the network's channel, Open System authentication and the association request through `WMI_MGMT_TX` with their answers as
+`WMI_MGMT_RX`, the peer's association (WPA2: the four-way handshake flag), the station up. The log carries steps, status codes,
+the AID and lengths, never a name, an address or a key; en1 now carries the virtual device's own address. The keys (the
+four-way handshake in user space) and the data path are the next two pieces; until the keys come, a WPA2 access point ends the
+association after a few seconds, and level 7 logs how. Host-tested in `tests/sta_host.cpp` against a firmware and access-point
+model. Next: §8.8 boot 10a.
+
 Level 7's **messages** are built and host-tested (`package/PianoWifi/WifiAssoc.h`, `tests/assoc_host.cpp`): the regulatory
 rules, `WMI_SCAN_CHAN_LIST`, `WMI_VDEV_START`/`UP`/`STOP`/`DOWN`, `WMI_PEER_CREATE`/`ASSOC`/`SET_PARAM`,
 `WMI_VDEV_INSTALL_KEY` and `WMI_MGMT_TX`; the step machine that drives them, the four-way handshake and the path the
@@ -266,7 +277,7 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 
 | Boot arg | Default | Effect |
 |---|---|---|
-| `piano-wifi=N` | 0 (probe() declines, nothing mapped) | 1: the read-only survey (loads only); 2: + the power sequence; 3: + the link, BAR0 and the SMMU stream; 4: + the firmware over MHI; 5: + the IPC router channels, QRTR and the firmware's QMI service; 6: + the copy engine, the host transport, the firmware's message interface and a passive scan (and `piano-wifi-mode` defaults to 1, since level 6 needs the firmware's radio running); above 6: runs level 6 |
+| `piano-wifi=N` | 0 (probe() declines, nothing mapped) | 1: the read-only survey (loads only); 2: + the power sequence; 3: + the link, BAR0 and the SMMU stream; 4: + the firmware over MHI; 5: + the IPC router channels, QRTR and the firmware's QMI service; 6: + the copy engine, the host transport, the firmware's message interface and a passive scan (and `piano-wifi-mode` defaults to 1, since level 6 needs the firmware's radio running); 7: + the join on level 6's virtual device (§13.3); above 7: runs level 7 |
 | `piano-wifi-gen=N` | 2 | the root port's target link speed (1–3). Gen3 needs cx/mx at NOM, which nothing here votes |
 | `piano-wifi-physeq=0` | 1 | apply only the PHY sequence's frame writes (power-down, reset release, start), not the 128-write table: tells "the table is wrong for piano" from "the PHY does not come up at all" |
 | `piano-wifi-rcg=0` | 1 | leave the aux / rchng RCG sources as the boot stages left them |
@@ -300,6 +311,9 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-bssid=1` | 0 | print a network's whole address in the log. By default only its first three bytes are printed and the rest is `**:**:**`, so that a pasted log cannot carry the owner's environment (§11). The registry property always carries the whole address, which is what a later join needs |
 | `piano-wifi-l6pre=N` | `0x1bf` = 447 (P22 §10.27, P23 §10.28; a decimal value is always safe to write) | the radio's set-up between the firmware's ready event and level 6's virtual device, as a bitmask: `0x01` the hardware mode (`WMI_PDEV_SET_HW_MODE`, two bands at once), `0x02` the radio's six parameters, `0x04` the channel list of its regulatory event (`WMI_SCAN_CHAN_LIST`; this driver's own list when no event came), `0x08` a usable device address (never all zeros), `0x10` wait for the regulatory event before the list, `0x20` pace the commands apart so a log names the last one before a firmware death, `0x40` **no scan at all** (the device is created, the level holds and tears down: it tells a death at the device from one at the scan), `0x80` **the receive buffers** (the data interface, its version, the six receive rings, and a second scan after them: the first scan is the A/B control), `0x100` the scan's diagnostics (channel-visit counters, the radio's statistics after each round, event counts), `0x200` the receive buffers return to software ring 1 instead of the firmware's own manager. `0` is the 2026-11-12 boot that asserted the firmware; `63` the 02:05 boot that scanned and kept no frame |
 | `piano-wifi-l6regwait=MS`, `piano-wifi-l6pace=MS`, `piano-wifi-l6hold=MS` | 2000, 50, 8000 | how long level 6 waits for the regulatory event, how far apart it paces the radio's set-up, and how long `0x40` holds after the virtual device |
+| `piano-wifi-l7=N` | `0x3f` = 63 (a decimal value is always safe to write) | level 7's pieces (§13.3, `WifiSta.h` `kStaFlag*`): `0x01` the station's parameters after the virtual device (802.3 out and in, the stream count, three power-save parameters, power save off), `0x02` the peer's data set-up (its default routing and one reorder queue per traffic identifier 0-16), `0x04` wait for the data interface's peer map, `0x08` a 5 GHz access point before a 2.4 GHz one (unless it is weaker than -82 dBm), `0x10` a radar channel may be chosen (joined passively), `0x20` a deauthentication of ours at the teardown, `0x40` native Wi-Fi frames instead of 802.3 (the A/B of `0x01`'s format), `0x80` **a dry run**: the network is chosen and logged, nothing is created |
+| `piano-wifi-l7wait=MS`, `piano-wifi-l7hold=MS` | 600000, 30000 | how long level 7 waits for the join profile after the scan (a RAM probe's profile is written over the USB shell after the boot), and how long an association is watched before the teardown (`0`: until a suspend; the level then has no hard deadline) |
+| `piano-wifi-l7tries=N`, `piano-wifi-l7frame=MS`, `piano-wifi-l7step=MS`, `piano-wifi-l7scans=N` | 3, 500, 3000, 2 | the tries of the authentication and of the association request, the wait for each answer (the association's is twice it), the wait for a command's answer (the start response, the peer map, the confirmation, the teardown's), and how many scans of its own level 7 runs when the network is not in the list |
 
 ## 7. Build, kernel collection
 
