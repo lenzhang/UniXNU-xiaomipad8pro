@@ -1,0 +1,400 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: UniXNU-piano <noreply@unixnu-piano.invalid>
+Date: Fri, 13 Nov 2026 10:05:32 +0800
+Subject: [PATCH] k27: piano-boot-args: /chosen/piano-boot-args appended to the
+ boot-args (the arguments beyond DarwinBoot's 1023 bytes)
+
+DarwinBoot copies at most 1023 bytes of command line into boot_args.CommandLine (BOOT_LINE_LENGTH 1024, the bootloader ABI);
+the installed 27.3 entry's line was 989 bytes, so no further driver could be switched on there. The arguments past that budget
+now live in the ADT, and every PE_parse_boot_argn() sees them with no change in the kexts.
+
+- PE_boot_args_extend(), called by PE_init_platform(FALSE) right after SecureDTInit() (before pe_identify_machine, the
+  tunables of kernel_startup_bootstrap and any kext): the line's piano-boot-args=NAME selects /chosen/piano-boot-args-NAME
+  (NAME 1-15 of A-Z a-z 0-9 . _ -), piano-boot-args=0 none, no selector /chosen/piano-boot-args. Its string (up to its NUL,
+  printable ASCII only, outer spaces dropped) goes after a copy of the line and one space into a 4096-byte buffer in
+  __DATA,__const next to arm_init's const_boot_args, written as early; a tail that does not fit is not appended at all.
+- PE_boot_args() returns the merged copy once it exists, else the line as before: PE_parse_boot_argn, PE_parse_boot_arg_str,
+  the TUNABLEs and every kext read both. Without the property and the selector nothing changes and nothing is printed.
+- One console line once the console is up (PE_init_platform(TRUE), after the pstore mirror):
+  "piano-boot-args: /chosen/NAME (P bytes): T bytes appended, boot-args M bytes (line L)", or why nothing was appended.
+- kern.bootargs keeps its 1024-byte answer (userland reads it into fixed buffers): the merged line cut after its last whole
+  argument (PE_boot_args_clip). The stackshot's boot-args record keeps DarwinBoot's line (PE_boot_args_bootloader).
+- static_if_init() still reads the line itself (arm_static_if_init, before the device tree): static-if keys
+  (validation_disables, serverperfmode, lcks, wdt) stay on the line.
+
+The string handling is pexpert/arm/piano_bootargs_policy.h = UniXNU-piano tooling/k27/piano-bootargs/piano_bootargs_policy.h
+(host-tested: tooling/k27/test-piano-bootargs.sh).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bsd/kern/kern_sysctl.c              |   6 ++
+ osfmk/kern/kern_stackshot.c         |   7 ++
+ pexpert/arm/pe_bootargs.c           | 125 ++++++++++++++++++++++
+ pexpert/arm/pe_init.c               |   6 ++
+ pexpert/arm/piano_bootargs_policy.h | 156 ++++++++++++++++++++++++++++
+ 5 files changed, 300 insertions(+)
+ create mode 100644 pexpert/arm/piano_bootargs_policy.h
+
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+index 94a949b..0cbe61d 100644
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2360,7 +2360,13 @@ sysctl_sysctl_bootargs
+ 	int error;
+ 	char buf[BOOT_LINE_LENGTH];
+ 
++#if defined(__arm64__)
++	/* k27 0066: the boot-args with the ADT's tail can be longer than this answer: cut after the last whole argument */
++	extern size_t PE_boot_args_clip(char *buf, size_t size);
++	PE_boot_args_clip(buf, sizeof(buf));
++#else
+ 	strlcpy(buf, PE_boot_args(), BOOT_LINE_LENGTH);
++#endif
+ 	error = sysctl_io_string(req, buf, BOOT_LINE_LENGTH, 0, NULL);
+ 	return error;
+ }
+diff --git a/osfmk/kern/kern_stackshot.c b/osfmk/kern/kern_stackshot.c
+index fd92243..9f59b14 100644
+--- a/osfmk/kern/kern_stackshot.c
++++ b/osfmk/kern/kern_stackshot.c
+@@ -5433,8 +5433,15 @@ kdp_stackshot_kcdata_format(void)
+ 		kcd_exit_on_error(kcdata_push_data(stackshot_kcdata_p, STACKSHOT_KCTYPE_OS_BUILD_VERSION, length_to_copy, (void *)osversion));
+ 
+ 
++#if defined(__arm64__)
++		/* k27 0066: DarwinBoot's line (always under BOOT_LINE_LENGTH), not the one with the ADT's tail */
++		extern char *PE_boot_args_bootloader(void);
++		length_to_copy =  MIN((uint32_t)(strlen(PE_boot_args_bootloader()) + 1), BOOT_LINE_LENGTH);
++		kcd_exit_on_error(kcdata_push_data(stackshot_kcdata_p, STACKSHOT_KCTYPE_BOOTARGS, length_to_copy, PE_boot_args_bootloader()));
++#else
+ 		length_to_copy =  MIN((uint32_t)(strlen(PE_boot_args()) + 1), BOOT_LINE_LENGTH);
+ 		kcd_exit_on_error(kcdata_push_data(stackshot_kcdata_p, STACKSHOT_KCTYPE_BOOTARGS, length_to_copy, PE_boot_args()));
++#endif
+ 
+ 		kcd_exit_on_error(kcdata_push_data(stackshot_kcdata_p, KCDATA_TYPE_TIMEBASE, sizeof(timebase), &timebase));
+ 	} else {
+diff --git a/pexpert/arm/pe_bootargs.c b/pexpert/arm/pe_bootargs.c
+index c6b87b0..11c5532 100644
+--- a/pexpert/arm/pe_bootargs.c
++++ b/pexpert/arm/pe_bootargs.c
+@@ -3,10 +3,135 @@
+  */
+ #include <pexpert/pexpert.h>
+ #include <pexpert/boot.h>
++#include <pexpert/device_tree.h>
++#include "piano_bootargs_policy.h"
++
++char *PE_boot_args_bootloader(void);
++size_t PE_boot_args_clip(char *buf, size_t size);
++void PE_boot_args_extend(void);
++void PE_boot_args_report(void);
++
++/*
++ * k27 0066: the boot-args beyond DarwinBoot's 1023 bytes. PE_boot_args_extend() (PE_init_platform, right after the device tree is
++ * set up, before any tunable or kext reads an argument) appends /chosen/piano-boot-args (or /chosen/piano-boot-args-NAME for the
++ * line's piano-boot-args=NAME; piano-boot-args=0: none) to a copy of the line; PE_boot_args() then returns the copy, so every
++ * PE_parse_boot_argn() sees both. Without the property (and without the selector) nothing changes. The copy lives next to
++ * arm_init's const_boot_args, written as early as it is.
++ */
++#ifndef __BUILDING_XNU_LIBRARY__
++#define PIANO_BOOT_ARGS_ATTR __attribute__((section("__DATA, __const")))
++#else
++#define PIANO_BOOT_ARGS_ATTR
++#endif
++
++static char piano_boot_args[PIANO_BOOT_ARGS_SIZE] PIANO_BOOT_ARGS_ATTR;
++static struct {
++	int      done;
++	int      status;
++	uint32_t prop_bytes;
++	uint32_t tail_len;
++	uint32_t total_len;
++	uint32_t line_len;
++	char     name[PIANO_BOOT_ARGS_NAME_SIZE];
++} piano_boot_args_state PIANO_BOOT_ARGS_ATTR;
+ 
+ char *
+ PE_boot_args(
+ 	void)
+ {
++	if (piano_boot_args[0] != '\0') {
++		return piano_boot_args;
++	}
+ 	return (char *)((boot_args *)PE_state.bootArgs)->CommandLine;
+ }
++
++/* The line DarwinBoot passed, without the ADT's tail (kern.bootargs' and the stackshot's fixed-size copies take it clipped). */
++char *
++PE_boot_args_bootloader(void)
++{
++	return (char *)((boot_args *)PE_state.bootArgs)->CommandLine;
++}
++
++/* kern.bootargs: the merged line, cut after its last whole argument that fits SIZE - 1 bytes. */
++size_t
++PE_boot_args_clip(char *buf, size_t size)
++{
++	return piano_bootargs_clip(buf, size, PE_boot_args());
++}
++
++void
++PE_boot_args_extend(void)
++{
++	char selector[PIANO_BOOT_ARGS_NAME_SIZE];
++	DTEntry chosen;
++	void const *value;
++	unsigned int size;
++	boolean_t have_selector;
++	size_t tail = 0, total = 0, n = 0;
++	const char *line = PE_boot_args_bootloader();
++
++	if (piano_boot_args_state.done) {
++		return;
++	}
++	piano_boot_args_state.done = 1;
++	while (n + 1 < BOOT_LINE_LENGTH && line[n] != '\0') {
++		n++;
++	}
++	piano_boot_args_state.line_len = (uint32_t)n;
++	have_selector = PE_parse_boot_arg_str(PIANO_BOOT_ARGS_PROP, selector, sizeof(selector));
++	piano_boot_args_state.status = piano_bootargs_property(have_selector ? selector : NULL, piano_boot_args_state.name);
++	if (piano_boot_args_state.status != 0) {
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, piano_boot_args_state.name, &value, &size) != kSuccess) {
++		piano_boot_args_state.status = have_selector ? PIANO_BA_MISSING : PIANO_BA_NONE;
++		return;
++	}
++	piano_boot_args_state.prop_bytes = size;
++	piano_boot_args_state.status = piano_bootargs_merge(piano_boot_args, sizeof(piano_boot_args), line, BOOT_LINE_LENGTH,
++	    (const unsigned char *)value, size, &tail, &total);
++	piano_boot_args_state.tail_len = (uint32_t)tail;
++	piano_boot_args_state.total_len = (uint32_t)total;
++}
++
++/* One console line about it, once the console is up (PE_init_platform(TRUE)); nothing for a boot without the property. */
++void
++PE_boot_args_report(void)
++{
++	static int reported;
++	const char *name = piano_boot_args_state.name;
++	unsigned int prop = piano_boot_args_state.prop_bytes, tail = piano_boot_args_state.tail_len;
++	unsigned int total = piano_boot_args_state.total_len, line = piano_boot_args_state.line_len;
++
++	if (reported || !piano_boot_args_state.done) {
++		return;
++	}
++	reported = 1;
++	switch (piano_boot_args_state.status) {
++	case PIANO_BA_APPENDED:
++		printf("piano-boot-args: /chosen/%s (%u bytes): %u bytes appended, boot-args %u bytes (line %u)\n", name, prop, tail, total, line);
++		break;
++	case PIANO_BA_OFF:
++		printf("piano-boot-args: off (piano-boot-args=0), boot-args %u bytes\n", line);
++		break;
++	case PIANO_BA_BAD_SET:
++		printf("piano-boot-args: the set the line names is not 1-%d of A-Z a-z 0-9 . _ -: nothing appended\n", PIANO_BOOT_ARGS_SET_MAX);
++		break;
++	case PIANO_BA_MISSING:
++		printf("piano-boot-args: no /chosen/%s in the device tree: nothing appended, boot-args %u bytes\n", name, line);
++		break;
++	case PIANO_BA_EMPTY:
++		printf("piano-boot-args: /chosen/%s (%u bytes) holds no argument: nothing appended\n", name, prop);
++		break;
++	case PIANO_BA_BAD_CHAR:
++		printf("piano-boot-args: /chosen/%s (%u bytes) has a byte outside printable ASCII: nothing appended\n", name, prop);
++		break;
++	case PIANO_BA_TOO_LONG:
++		printf("piano-boot-args: /chosen/%s (%u bytes): %u bytes do not fit after the %u-byte line (%u of %u): nothing appended\n",
++		    name, prop, tail, line, total, PIANO_BOOT_ARGS_SIZE - 1);
++		break;
++	default:
++		break;
++	}
++}
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 980a575..244a108 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -479,12 +479,18 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 		 * can be used..
+ 		 */
+ 		SecureDTInit(PE_state.deviceTreeHead, PE_state.deviceTreeSize);
++		/* k27 0066: /chosen/piano-boot-args appended to the boot-args before anything else reads them */
++		extern void PE_boot_args_extend(void);
++		PE_boot_args_extend();
+ 		pe_identify_machine(boot_args_ptr);
+ 	} else {
+ 		pe_arm_init_interrupts(args);
+ 		/* k27 0055: the console mirror into a Linux ramoops zone (pstore-console=), once ml_io_map works */
+ 		extern void console_pstore_init(void);
+ 		console_pstore_init();
++		/* k27 0066: its one console line */
++		extern void PE_boot_args_report(void);
++		PE_boot_args_report();
+ 	}
+ 
+ 	if (!vm_initialized) {
+diff --git a/pexpert/arm/piano_bootargs_policy.h b/pexpert/arm/piano_bootargs_policy.h
+new file mode 100644
+index 0000000..a48fd1c
+--- /dev/null
++++ b/pexpert/arm/piano_bootargs_policy.h
+@@ -0,0 +1,156 @@
++/*
++ * SPDX-License-Identifier: BSD-2-Clause-Patent
++ *
++ * k27 0066's string handling (UniXNU-piano tooling/k27/piano-bootargs/piano_bootargs_policy.h, host-tested by
++ * tooling/k27/test-piano-bootargs.sh; the patch adds this file byte for byte as pexpert/arm/piano_bootargs_policy.h).
++ *
++ * DarwinBoot passes at most 1023 bytes of command line (boot_args.CommandLine, BOOT_LINE_LENGTH 1024). The rest of the arguments
++ * lives in the ADT: /chosen/piano-boot-args, or /chosen/piano-boot-args-NAME when the line says piano-boot-args=NAME
++ * (piano-boot-args=0: none). The kernel appends that string to a copy of the line, PE_boot_args() returns the copy, and every
++ * PE_parse_boot_argn() sees both. Pure functions: no kernel or libc calls, so the host test compiles this same text.
++ */
++#ifndef PIANO_BOOTARGS_POLICY_H
++#define PIANO_BOOTARGS_POLICY_H
++
++#include <stddef.h>
++
++#define PIANO_BOOT_ARGS_SIZE      4096   /* the merged line's buffer: the line, a space, the tail, the NUL */
++#define PIANO_BOOT_ARGS_PROP      "piano-boot-args"   /* the /chosen property and the line's selector */
++#define PIANO_BOOT_ARGS_SET_MAX   15     /* "piano-boot-args-" + 15 = 31 characters, an ADT property name's limit */
++#define PIANO_BOOT_ARGS_NAME_SIZE 32
++
++enum {
++	PIANO_BA_NONE = 0,   /* no selector and no /chosen/piano-boot-args: nothing appended, nothing logged (the boot of before) */
++	PIANO_BA_APPENDED,   /* the tail is appended */
++	PIANO_BA_OFF,        /* piano-boot-args=0 on the line */
++	PIANO_BA_BAD_SET,    /* the selector is not 1-15 of A-Z a-z 0-9 . _ - */
++	PIANO_BA_MISSING,    /* the selector names a set the ADT lacks */
++	PIANO_BA_EMPTY,      /* the property holds no argument */
++	PIANO_BA_BAD_CHAR,   /* a byte outside printable ASCII (0x20-0x7e) before the property's NUL */
++	PIANO_BA_TOO_LONG,   /* the line, a space and the tail do not fit PIANO_BOOT_ARGS_SIZE */
++};
++
++static inline int
++piano_bootargs_set_char(char c)
++{
++	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
++}
++
++/*
++ * The property a boot takes. SELECTOR: the line's piano-boot-args value, NULL when the line has none. Returns 0 with the property
++ * name in NAME (PIANO_BOOT_ARGS_NAME_SIZE bytes), or PIANO_BA_OFF / PIANO_BA_BAD_SET with NAME empty.
++ */
++static inline int
++piano_bootargs_property(const char *selector, char *name)
++{
++	static const char prefix[] = PIANO_BOOT_ARGS_PROP;
++	size_t i, n;
++
++	name[0] = '\0';
++	if (selector != NULL && selector[0] == '0' && selector[1] == '\0') {
++		return PIANO_BA_OFF;
++	}
++	if (selector != NULL) {
++		for (n = 0; selector[n] != '\0'; n++) {
++			if (n >= PIANO_BOOT_ARGS_SET_MAX || !piano_bootargs_set_char(selector[n])) {
++				return PIANO_BA_BAD_SET;
++			}
++		}
++		if (n == 0) {
++			return PIANO_BA_BAD_SET;
++		}
++	}
++	for (i = 0; prefix[i] != '\0'; i++) {
++		name[i] = prefix[i];
++	}
++	if (selector != NULL) {
++		name[i++] = '-';
++		for (n = 0; selector[n] != '\0'; n++) {
++			name[i++] = selector[n];
++		}
++	}
++	name[i] = '\0';
++	return 0;
++}
++
++/*
++ * OUT (OUT_SIZE bytes, not LINE's storage) = LINE + ' ' + the arguments of the property VALUE (VALUE_SIZE bytes, read up to its
++ * first NUL, leading and trailing spaces dropped). LINE is read up to its NUL, at most LINE_MAX - 1 bytes. Returns PIANO_BA_APPENDED
++ * with *TAIL_LEN and *TOTAL_LEN (OUT's strlen); else PIANO_BA_EMPTY, PIANO_BA_BAD_CHAR or PIANO_BA_TOO_LONG with OUT untouched,
++ * *TAIL_LEN the tail's length when it was measured and *TOTAL_LEN the length the merge would have had.
++ */
++static inline int
++piano_bootargs_merge(char *out, size_t out_size, const char *line, size_t line_max, const unsigned char *value, size_t value_size,
++    size_t *tail_len, size_t *total_len)
++{
++	size_t line_len = 0, start = 0, end = 0, i, at = 0;
++
++	*tail_len = 0;
++	*total_len = 0;
++	while (line_len + 1 < line_max && line[line_len] != '\0') {
++		line_len++;
++	}
++	while (end < value_size && value[end] != 0) {
++		end++;
++	}
++	for (i = 0; i < end; i++) {
++		if (value[i] < 0x20 || value[i] > 0x7e) {
++			return PIANO_BA_BAD_CHAR;
++		}
++	}
++	while (start < end && value[start] == ' ') {
++		start++;
++	}
++	while (end > start && value[end - 1] == ' ') {
++		end--;
++	}
++	*tail_len = end - start;
++	if (*tail_len == 0) {
++		return PIANO_BA_EMPTY;
++	}
++	*total_len = line_len + (line_len ? 1 : 0) + *tail_len;
++	if (out_size == 0 || *total_len > out_size - 1) {
++		return PIANO_BA_TOO_LONG;
++	}
++	for (i = 0; i < line_len; i++) {
++		out[at++] = line[i];
++	}
++	if (line_len) {
++		out[at++] = ' ';
++	}
++	for (i = start; i < end; i++) {
++		out[at++] = (char)value[i];
++	}
++	out[at] = '\0';
++	return PIANO_BA_APPENDED;
++}
++
++/*
++ * kern.bootargs keeps its BOOT_LINE_LENGTH answer (userland reads it into fixed buffers): DST (SIZE bytes) gets SRC, a merged line
++ * longer than SIZE - 1 cut after its last whole argument. Returns DST's strlen.
++ */
++static inline size_t
++piano_bootargs_clip(char *dst, size_t size, const char *src)
++{
++	size_t n = 0;
++
++	if (size == 0) {
++		return 0;
++	}
++	while (n + 1 < size && src[n] != '\0') {
++		dst[n] = src[n];
++		n++;
++	}
++	if (src[n] != '\0' && src[n] != ' ') {
++		while (n > 0 && dst[n - 1] != ' ') {
++			n--;
++		}
++	}
++	while (n > 0 && dst[n - 1] == ' ') {
++		n--;
++	}
++	dst[n] = '\0';
++	return n;
++}
++
++#endif /* PIANO_BOOTARGS_POLICY_H */
