@@ -24,11 +24,14 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   touch screen's orientation on this unit and its controller watchdog recovery are fixed (built, to be run).
 - A USB-C debug console with a small kernel monitor (`package/PianoDwc3`, `tooling/native/usb-console.py`) and the buttons run;
   the monitor's `reset fastboot` returns the tablet to ABL fastboot without buttons.
-- The installed system (ESP v3.3d, 2026-11-12): 13 GiB of RAM, the machine identity Mac17,11 shown as "Xiaomi Pad 8 Pro" with
-  a "Snapdragon 8 Elite" chip and internal UFS disks ([docs/identity.md](docs/identity.md)), the USB root shell and ssh over the
-  cable, and charging that keeps going (level 2, the DSP started at once: 11-14 W in, no stop).
-- Wi-Fi: the WCN7860's firmware runs and answers (QMI, the transport, its message interface); the first scan stops the
-  firmware: next.
+- The installed system (2026-11-13): **macOS 27.3 (26C5035r)** as the default, Mac17,11 shown as "Xiaomi Pad 8 Pro" with a
+  "Snapdragon 8 Elite" chip, 13 GiB of RAM, its own Data store at the end of `linux_data`; macOS 27.0.1 with the owner's
+  earlier Data stays as the second menu entry ([docs/k273-line.md](docs/k273-line.md), [docs/identity.md](docs/identity.md)).
+  The USB root shell and ssh over the cable; charging that keeps going (level 2, the DSP started at once).
+- Cameras: frames from both sensors and the first pictures through a user client (`piano-camera-grab`); a macOS camera
+  extension is next ([docs/drivers/camera.md](docs/drivers/camera.md)).
+- Wi-Fi: the WCN7860's firmware runs a full passive scan (regulatory domain, channel list, station device); the beacons do
+  not reach the host yet: next, then association.
 - Latest results: [docs/results-2026-11-12.md](docs/results-2026-11-12.md) (the installed system's evening and midnight
   sections; the login window with its video wallpaper, touch, the speakers, the rear camera); the day before:
   [docs/results-2026-11-11.md](docs/results-2026-11-11.md).
