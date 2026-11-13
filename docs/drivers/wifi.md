@@ -141,6 +141,14 @@ first, and never creates a device with an all-zero address. All four are in behi
 regulatory event is read and turned into the channel list, and the log now names the last command before a death and every
 unknown event. Next: §8.8 boots 8a and 8b.
 
+**Ninth round (2026-11-13 02:05, the SPMI-lock probe, the same arguments): no assert, the scan complete, no frame.** P22's
+set-up all accepted (hardware mode, 6 parameters, country CN with 4 rules into a 26-channel list, the device with piano's own
+address), the scan started, visited all 22 channels and completed — and **0 management frames** reached the host. **Cause
+(P23, §10.28, inferred from the chip's own host):** this family's receive DMA has no buffers of its own; the host must fill a
+refill ring the firmware hands on to the radios. Built: the data interface, its version, the six receive rings with their
+buffers, and a second scan after them on the same boot (the first is the control), with the channel visits' counters and the
+radio's statistics to tell "no buffers" from "a deaf radio". The scan lines no longer print a network's name. Next: §8.8 boot 9a.
+
 Level 7's **messages** are built and host-tested (`package/PianoWifi/WifiAssoc.h`, `tests/assoc_host.cpp`): the regulatory
 rules, `WMI_SCAN_CHAN_LIST`, `WMI_VDEV_START`/`UP`/`STOP`/`DOWN`, `WMI_PEER_CREATE`/`ASSOC`/`SET_PARAM`,
 `WMI_VDEV_INSTALL_KEY` and `WMI_MGMT_TX`; the step machine that drives them, the four-way handshake and the path the
@@ -290,7 +298,7 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-scanwait=MS` | 12000 | how long the scan itself may take. When it runs out and the scan had started, what it found stands and the teardown runs; when it had not started, the level fails |
 | `piano-wifi-band=N` | 1 | 1: the scan visits the 2.4 GHz band's 13 channels and the 5 GHz band's 9 non-radar ones; 0: only 2.4 GHz (the shorter boot, and the one that needs no regulatory answer for the upper band) |
 | `piano-wifi-bssid=1` | 0 | print a network's whole address in the log. By default only its first three bytes are printed and the rest is `**:**:**`, so that a pasted log cannot carry the owner's environment (§11). The registry property always carries the whole address, which is what a later join needs |
-| `piano-wifi-l6pre=N` | `0x3f` = 63 (from P22, §10.27; a decimal value is always safe to write) | the radio's set-up between the firmware's ready event and level 6's virtual device, as a bitmask: `0x01` the hardware mode (`WMI_PDEV_SET_HW_MODE`, two bands at once), `0x02` the radio's six parameters, `0x04` the channel list of its regulatory event (`WMI_SCAN_CHAN_LIST`; this driver's own list when no event came), `0x08` a usable device address (never all zeros), `0x10` wait for the regulatory event before the list, `0x20` pace the commands apart so a log names the last one before a firmware death, `0x40` **no scan at all** (the device is created, the level holds and tears down: it tells a death at the device from one at the scan). `0` is the behaviour of the 2026-11-12 boot that asserted the firmware |
+| `piano-wifi-l6pre=N` | `0x1bf` = 447 (P22 §10.27, P23 §10.28; a decimal value is always safe to write) | the radio's set-up between the firmware's ready event and level 6's virtual device, as a bitmask: `0x01` the hardware mode (`WMI_PDEV_SET_HW_MODE`, two bands at once), `0x02` the radio's six parameters, `0x04` the channel list of its regulatory event (`WMI_SCAN_CHAN_LIST`; this driver's own list when no event came), `0x08` a usable device address (never all zeros), `0x10` wait for the regulatory event before the list, `0x20` pace the commands apart so a log names the last one before a firmware death, `0x40` **no scan at all** (the device is created, the level holds and tears down: it tells a death at the device from one at the scan), `0x80` **the receive buffers** (the data interface, its version, the six receive rings, and a second scan after them: the first scan is the A/B control), `0x100` the scan's diagnostics (channel-visit counters, the radio's statistics after each round, event counts), `0x200` the receive buffers return to software ring 1 instead of the firmware's own manager. `0` is the 2026-11-12 boot that asserted the firmware; `63` the 02:05 boot that scanned and kept no frame |
 | `piano-wifi-l6regwait=MS`, `piano-wifi-l6pace=MS`, `piano-wifi-l6hold=MS` | 2000, 50, 8000 | how long level 6 waits for the regulatory event, how far apart it paces the radio's set-up, and how long `0x40` holds after the virtual device |
 
 ## 7. Build, kernel collection
@@ -920,6 +928,15 @@ default `piano-wifi-l6pre=63` is Ubuntu's whole order); 8b adds one, so the kern
 Both answer their questions on the installed boot as well as in a RAM image; neither needs the scan to find a network to be
 useful, because the gate is the firmware living past step 607.
 
+8a ran at 02:05 on 2026-11-13 (the SPMI-lock probe): no assert, the scan complete, **0 management frames** (P23, §10.28).
+
+**After §10.28 (P23).** The same arguments: the new default `piano-wifi-l6pre=447` (`0x1bf`) adds the receive buffers and the
+diagnostics, so **no new argument** is needed.
+
+| # | Boot args (beyond the image's) | Gate | Then |
+|---|---|---|---|
+| 9a | `piano-wifi=6 piano-wifi-iova=1` | level 6 as at 02:05, with in addition: `step 625: connecting the firmware's data interface` before 602; after the first scan `step 626: the radio's statistics`, `step 627: the data interface's version`, `step 628: the receive rings`, then a second `608`/`609` and `626` again; then `level 6: the data interface: connected, version 3.N … rings announced 6 of 6; refill: 511 buffer(s) given, the firmware's tail at T …`; `level 6: scan round 1 (before the receive buffers): … 0 management frame(s)`; `level 6: scan round 2 (with the receive buffers): … M management frame(s), K network(s)`; the `round N visits:` lines and the `round N radio:` lines; `events by identifier:`. **Gate: K ≥ 1 in round 2** — and on the tablet `piano-wifi` lists the owner's networks (names are no longer in the log) | **Round 2 also 0** and the visits show busy/receiving cycles: if the refill tail `T` moved and `MPDUs to the firmware` is > 0, frames reach the firmware and something after it drops them; if `T` stayed 0, the firmware never took the buffers (the ring's set-up or its kind is wrong — bit 9, `piano-wifi-l6pre=959`, is the A/B of the return manager). **No receiving cycles at all** in either round: the radio does not hear (RF, the board file, calibration). **An assert** after step 628: the `crash:` reason and the last command name it; boot 8b's `l6pre=127` (no rings, no scan) is the control |
+
 ## 9. Fallback
 
 `piano-wifi=0` (the default): nothing runs. Network meanwhile: PianoNullEthernet's `en0` (no traffic) and, once built, the USB-C
@@ -1330,6 +1347,38 @@ network (§5.2 C).
    order to try is `0x7f` (the same without the scan, to place the death) and then the HTT connection, which is level 8's
    first piece brought forward. (needs-boot: §8.8 boot 8a)
 
+28. **P23: the scan ran and no frame reached the host (the SPMI-lock probe, 2026-11-13 02:05).** P22's set-up worked: the
+   hardware mode accepted, 6 of 6 parameters, the regulatory event (country CN, 4 rules: 2402-2482, 5170-5250, 5250-5330 radar,
+   5735-5835) turned into a 26-channel list, the virtual device created with piano's locally administered address, and a scan
+   that **started, visited all 22 channels and completed** — with **0 management frames**, while two of the owner's networks
+   were in range on both bands. 194 events, 3 of kinds this level did not know: `0x16005` (the firmware's memory-dump update),
+   `0xb00b` and `0x1d021` (not in the chip's own host's list; neither can carry scan results).
+   **Cause (inferred from the chip's own host, which says it in so many words):** on this chip family (`rx_mac_buf_ring`) the
+   receive DMA takes every buffer it writes a frame into from rings the **host** provides — the host fills a host-to-firmware
+   refill ring ("host fills rx buffer to fw and fw fills to rxbuf ring for each rxdma"), the firmware hands those buffers on to
+   one buffer ring per radio (also host memory), and only then can any frame be received, management frames for the firmware
+   included. This level gave it none, so the radio could tune, dwell and count but keep nothing. The other candidates do not
+   fit: management frames do come as `WMI_MGMT_RX` on this family; the receive filter the host programs concerns data frames
+   (management frames are not in it); the 2.4 GHz band's single rule is the whole band; the dwell times are the chip's host's.
+   **Changed (`package/PianoWifi/WifiHtt.h`, behind `piano-wifi-l6pre` bit 7, on by default):** the firmware's data interface
+   (HTT, transport service `0x0300` on pipes 4 out / 1 in, connected **before** the message interface, no credit flow) and its
+   version exchange; the six rings the chip's own host announces with `HTT_SRING_SETUP` — the refill ring (511 buffers of 2
+   KiB, host to firmware), the two radio buffer rings (empty: the firmware fills them), the receive DMA's error ring (its tail
+   moved up to the hardware's head every turn), the two status rings (63 buffers each, given back as the hardware takes them)
+   — all in the 32-bit window with every pointer in host memory. Pipe 4 gets its ring only with the bit, so a boot without it
+   programs exactly what it did before. The buffers return to the firmware's own manager by default (bit 9: to "software ring
+   1", as the chip's own host has them — whose release ring is level 8's and does not exist yet, hence not the default).
+   **One boot, A/B:** the first scan runs as on 02:05; then the radio's statistics; then the version, the rings and a
+   **second scan** with its own identifier; then the statistics again. **Diagnostics (bit 8, on by default):** every channel
+   visit's noise floor and the busy and receiving shares of its cycles, the radio's receive counters after each round
+   (statuses received, MPDUs delivered to the firmware and to the host, MPDU and PHY errors), and every event identifier with
+   its count. Together they say which of three things is true: a radio that hears (busy and receiving cycles) but keeps nothing
+   without buffers (round 1 empty, round 2 with networks: the cause above, confirmed); one that hears and still keeps nothing
+   with them (the firmware's counters then say whether the frames reached it: the rest of the data path, level 8's REO and
+   release rings, is next); or one that does not hear at all (no receiving cycles, an odd noise floor: the RF side, the board
+   file or the calibration). **Also changed:** the scan list's log lines no longer print a network's name, only its length
+   (with `piano-wifi-bssid=1` the whole name and address): the owner's networks must not reach a console log; the registry
+   property, which `tooling/native/piano-wifi` reads on the tablet, keeps both. (needs-boot: §8.8 boot 9a)
 
 ## 11. Licence note
 
