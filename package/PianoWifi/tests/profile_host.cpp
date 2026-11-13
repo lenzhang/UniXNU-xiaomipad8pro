@@ -92,6 +92,23 @@ int main()
   for (unsigned i = 0; i < sizeof p; ++i) clean = clean && !bytes[i];
   CHECK(clean);
   CHECK(std::strcmp(piano_wifi_security_name(PianoWifiSecWpa2Psk), "WPA2-PSK") == 0);
+  // the file's text (piano_wifi_profile_parse, shared by the helper and the kext)
+  {
+    const char text[] = "# the owner's network\r\nssid=my home\r\nsecurity=wpa2-psk\r\npsk=correct horse\r\n\r\n"
+                        "bssid=3c:52:a1:10:20:30\n";
+    piano_wifi_profile q;
+    CHECK(piano_wifi_profile_parse(reinterpret_cast<const uint8_t *>(text), sizeof text - 1, &q) == nullptr);
+    CHECK(q.ssid_len == 7 && std::memcmp(q.ssid, "my home", 7) == 0 && q.security == PianoWifiSecWpa2Psk);
+    CHECK(q.psk_len == 13 && (q.flags & PianoWifiProfileBssid) && q.bssid[0] == 0x3c && q.bssid[5] == 0x30);
+    const char open[] = "ssid=cafe\nsecurity=open";   // no final newline
+    CHECK(piano_wifi_profile_parse(reinterpret_cast<const uint8_t *>(open), sizeof open - 1, &q) == nullptr);
+    CHECK(q.security == PianoWifiSecOpen && q.psk_len == 0 && q.ssid_len == 4);
+    const char *bad[] = {"ssid=x\nsecurity=wep\n", "ssid=x\n", "ssid=x\nsecurity=open\ncolour=blue\n",
+                         "ssid=x\nsecurity=wpa2-psk\npsk=short\n", "ssid=x\nsecurity=open\nmac=02:00:00:00:00\n",
+                         "ssid=012345678901234567890123456789012\nsecurity=open\n"};
+    for (const char *b : bad)
+      CHECK(piano_wifi_profile_parse(reinterpret_cast<const uint8_t *>(b), uint32_t(std::strlen(b)), &q) != nullptr);
+  }
   std::printf(failures ? "profile_host: %d check(s) failed\n" : "profile_host: all passed\n", failures);
   return failures ? 1 : 0;
 }

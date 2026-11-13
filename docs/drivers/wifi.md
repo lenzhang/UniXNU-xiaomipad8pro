@@ -951,6 +951,15 @@ diagnostics, so **no new argument** is needed.
 |---|---|---|---|
 | 9a | `piano-wifi=6 piano-wifi-iova=1` (built for the 27.3 line as `ram-k273-wifi-p23`: the installed 27.3 entry's line with `data-persist=0`, `piano-reset-after=900 piano-reset-to=bootloader`, the store seed, the 0066 kernel, the driver arguments in `/chosen/piano-boot-args-ram`) | level 6 as at 02:05, with in addition: `step 625: connecting the firmware's data interface` before 602; after the first scan `step 626: the radio's statistics`, `step 627: the data interface's version`, `step 628: the receive rings`, then a second `608`/`609` and `626` again; then `level 6: the data interface: connected, version 3.N … rings announced 6 of 6; refill: 511 buffer(s) given, the firmware's tail at T …`; `level 6: scan round 1 (before the receive buffers): … 0 management frame(s)`; `level 6: scan round 2 (with the receive buffers): … M management frame(s), K network(s)`; the `round N visits:` lines and the `round N radio:` lines; `events by identifier:`. **Gate: K ≥ 1 in round 2** — and on the tablet `piano-wifi` lists the owner's networks (names are no longer in the log) | **Round 2 also 0** and the visits show busy/receiving cycles: if the refill tail `T` moved and `MPDUs to the firmware` is > 0, frames reach the firmware and something after it drops them; if `T` stayed 0, the firmware never took the buffers (the ring's set-up or its kind is wrong — bit 9, `piano-wifi-l6pre=959`, is the A/B of the return manager). **No receiving cycles at all** in either round: the radio does not hear (RF, the board file, calibration). **An assert** after step 628: the `crash:` reason and the last command name it; boot 8b's `l6pre=127` (no rings, no scan) is the control |
 
+**After §13.3 (level 7, the join).** A 27.3 RAM image built like boot 9a's (`ram-k273-wifi-p23`), with `piano-wifi=7` instead of 6.
+The join profile is written over the root shell after the boot (the image never carries it): see the steps in the table's first
+row.
+
+| # | Boot args (beyond the image's) | Gate | Then |
+|---|---|---|---|
+| 10a | `piano-wifi=7 piano-wifi-iova=1` (all other level 6/7 switches at their defaults: `l6pre=447`, `l7=63`, `l7wait=600000`, `l7hold=30000`); after the desktop, as root: place `/private/var/db/piano-wifi/profile` (700/600, root:wheel; the owner's 5 GHz network, `security=wpa2-psk`) and run `/usr/local/libexec/piano-wifi-join` once | level 6 as in 9a up to round 2 (`K ≥ 1` networks), then `step 629: the scan is done: the virtual device stays for level 7`, `level 6: the resource PianoWifiLink is published` and PianoWifiEthernet's `the interface takes the virtual device's address (its first three bytes 02:50:49)`; `stage 700`, the two `level 7:` option lines, `step 701: waiting for the join profile`; after the helper: `join profile set (generation 1): a network name of N byte(s), WPA2-PSK with a passphrase ...` and `level 7: the join profile was handed over after N ms`; then `step 702`, `level 7: the network: entry E of the scan list (C access point(s) ...): F MHz, channel X (5 GHz), signal S dBm` and `its elements: ... RSN (group 4, pairwise 0x10, key management 0x4 ...)`; `step 704`, `705`, `706` with `the data interface named the peer: peer P`, `707`, `708` with `the device's start response: status 0 (started)`, `709` with `frame 1: acknowledged` and `the authentication answer: status 0 (success)`, `710` with `frame 2: acknowledged` and **`the association answer: status 0 (success), AID A`**, `711` with `the peer's association confirmed`, `712`, `714`; then (WPA2 without piece 3) `the association ended: a deauthentication (or disassociation), reason R (...)` a few seconds later, `715` with the teardown's four pieces, `step 716: done`, the two summary lines and `level 7: the data interface: ...`. On the tablet: `ifconfig en1` shows `ether 02:50:49:41:4e:01`; `ioreg -l | grep piano-wifi-level7` the end state. **Gate: the association answer with status 0 and an AID** | **No profile handed over** (`step 701` until `no join profile was set` after 10 min): the helper is missing from the image's Data or refused the file — its log `/private/var/log/piano-wifi-join.log` says which. **`not in the scan list`** after two scans of its own: the name in the profile differs from the network's bytes, or the network is hidden. **`security ... not supported`**: the network requires management frame protection or is WPA3-only (the `its elements` line's numbers say which). **No start response / `refused to start`**: the start command's channel or mode; next boot `piano-wifi-l7=61` (`0x3d`, without the peer data set-up) to see whether 707 is the cause. **Authentication not answered** with `frame 1: not acknowledged`: the frame never reached the air (the device's channel, the transmit path); acknowledged but no answer: the answer did not come back up (the receive buffers: `refill: the firmware's tail` and the radio rings' fill in the last line). **Association refused**: the status names why (18: our rates; 10 or 40: an element of ours). **A crash after 710** (`crash:` lines, `the last command went out at step N`): the first data frame (EAPOL) met the unprogrammed reorder rings — level 8's rings are the fix, and `piano-wifi-l7=61` the control |
+
+
 ## 9. Fallback
 
 `piano-wifi=0` (the default): nothing runs. Network meanwhile: PianoNullEthernet's `en0` (no traffic) and, once built, the USB-C
@@ -1633,6 +1642,125 @@ owner has to answer (the last paragraph).
    protected management frames beyond what the access point requires, and the data path. Without level 8 an association
    gives `en1` a link that carries no traffic yet — which is still the gate this level has to pass: the firmware's
    `WMI_VDEV_UP` accepted, the keys installed, and the access point's own log showing the tablet joined.
+
+### 13.3 Level 7 as built: the join (2026-11-13)
+
+`piano-wifi=7` runs level 6 as before up to its second scan; there the ladder keeps its virtual device and hands the transport
+over (`step 629: the scan is done: the virtual device stays for level 7`) instead of tearing them down, and level 7
+(`package/PianoWifi/WifiSta.h`, steps 701-717, host-tested in `tests/sta_host.cpp`) joins on them. Every event of the message
+interface goes to the join first (`WifiLink.h` hook); every command it builds goes out on level 6's endpoint (`linkSendWmi`),
+one at a time and paced 20 ms. Its order is this chip's own (`wcn7860 hw2.0`: `vdev_start_delay`, read from Ubuntu's ath12k for
+behaviour, `UPSTREAM`):
+
+| Step | What | Answer waited for | Fails with |
+|---|---|---|---|
+| 701 | the join profile (`machdep.piano_wifi_join`, §13.2), up to `piano-wifi-l7wait` ms | the sysctl written | `no join profile was set` |
+| 702 | the network: the scan list's entries whose name is the profile's byte for byte; the profile's access point if it names one in the list, else the strongest, a 5 GHz one first (bit 3) unless weaker than -82 dBm; a radar channel only with bit 4 (then joined passively). The security must fit: an open profile an open network; WPA2-PSK an RSN element with PSK and CCMP and no required management frame protection | — | `not in the scan list` (after 703), `security ... not supported` |
+| 703 | a passive scan of our own over the regulatory list (id `0xa010` + n), at most `piano-wifi-l7scans` | its completion | — |
+| 704 | the station's parameters (bit 0): `WMI_VDEV_SET_PARAM` transmit encapsulation and receive decapsulation 2 (802.3; bit 6: 1, native Wi-Fi), the stream count; `WMI_STA_POWERSAVE_PARAM` receive wake policy 0 (wake), transmit wake threshold 1 (always), PS-Poll count 0 (no limit); `WMI_STA_POWERSAVE_MODE` 0 (off) | — | — |
+| 705 | `WMI_PEER_CREATE` for the access point | — | — |
+| 706 | the HTT peer map naming it (bit 2; types 3, 0x1e or 0x2b on the data interface) | the map, `piano-wifi-l7step` ms | goes on, logged |
+| 707 | its data set-up (bit 1): `WMI_PEER_SET_PARAM` 19 default routing = 3 (hash steering, receive ring 1), then `WMI_PEER_REORDER_QUEUE_SETUP` (`0x6013`) for traffic identifiers 0-16, each a 128-byte-aligned queue descriptor in the window (512 bytes for 0-15, 128 for 16), window 1 | — | — |
+| 708 | `WMI_VDEV_START` on the network's frequency: 11a or 11g (legacy only), its beacon interval and DTIM period, passive on a passive channel | `WMI_VDEV_START_RESP` | `refused to start the device` (status) / timeout |
+| 709 | Open System authentication (`WMI_MGMT_TX`, the frame in the window), up to `piano-wifi-l7tries` tries of `piano-wifi-l7frame` ms | the access point's answer as `WMI_MGMT_RX` (sequence 2): its status | `refused the authentication`, `did not answer` |
+| 710 | the association request: capability (ESS, privacy, 2.4 GHz short preamble and slot, spectrum management when asked), listen interval 5, the name, the rates (supported + extended), the power capability and supported channels when spectrum management is asked, the RSN element (version 1, the network's group cipher, CCMP, PSK, no capabilities) | the association answer: status and AID | `refused the association` (status), `did not answer` |
+| 711 | `WMI_PEER_ASSOC`: AID, the answer's capability, the legacy rates in the firmware's form, 11a/11g, WPA2: need-PTK-4-way (and no authorisation) | `WMI_PEER_ASSOC_CONF` | goes on, logged |
+| 712 | `WMI_VDEV_UP` with the AID and the network's address | — | — |
+| 713 | an open network's peer authorised (`WMI_PEER_SET_PARAM` 3 = 1); WPA2 waits for the keys (piece 3) | — | — |
+| 714 | associated, watched for `piano-wifi-l7hold` ms: a deauthentication or disassociation from the access point (to us or broadcast), the firmware's kickout, a roam event with "beacon miss" end it, each logged with its reason | — | — (a disconnect is logged, not a failure) |
+| 715 | the teardown: our deauthentication (bit 5, reason 3; only while up and not already ended), `WMI_VDEV_DOWN`, `WMI_PEER_DELETE` (its answer waited for), `WMI_VDEV_STOP` (its answer waited for); then level 6's own teardown deletes the device and disables the rings | `PEER_DELETE_RESP`, `VDEV_STOPPED` (logged when absent) | — |
+
+What the log says (`level 7: ...` lines): the options, the network's list index, how many access points carry the name, its
+frequency, channel, band, passive/radar, signal, beacon interval, DTIM, rate count and RSN suites as numbers; the profile's
+hand-over (the name's length, the security); the peer map's peer identifiers; each answer's status code (with the standard's
+name), the AID, each frame's completion status; how the association ended and its reason; the teardown's pieces. **Never** the
+network's name, an access point's address, a passphrase or a key. `piano-wifi-level7` (registry) has the end state.
+
+The address: en1 (`PianoWifiEthernet`) now takes the virtual device's own address (`piano-wifi-mac`, published by level 6
+whatever it came from): before, the device was created with piano's `...:4e:01` and en1 kept `...:4e:03`, so a level 8 frame
+from en1 would have carried a source address the firmware does not know. A profile that gives `mac=` and is already set when
+level 6 creates its device gives the device that address.
+
+**What a WPA2 join does without piece 3:** the association succeeds (status 0, an AID), the access point sends the first
+EAPOL-Key frame as data, nothing answers it (no data path yet, no supplicant), and after its handshake timeout (a few seconds)
+the access point sends a deauthentication or disassociation, typically reason 15 ("the four-way handshake timed out") or 2;
+level 7 logs it and tears down. Data frames between the association and that end meet a receive path whose reorder rings are
+not programmed yet (level 8): that is the probe's main risk (§8.8 boot 10a, "a crash after 710").
+
+**The boundary for piece 3 (user-space key management):** the kernel side will deliver received 802.1X (EAPOL) frames, accept
+802.1X frames to send and keys to install, and authorise the peer once the pairwise and group keys are in (`WMI_VDEV_INSTALL_KEY`,
+then `WMI_PEER_SET_PARAM` 3); that interface lives with the data path (level 8), which is what carries EAPOL in both directions.
+
+### 13.4 Status of levels 7 and 8 (2026-11-13, work paused by the owner)
+
+**Landed (branch commits, host-tested, not yet run on the tablet):**
+- Piece 1, the join (`piano-wifi=7`, §13.3): `WifiSta.h`, `WifiDot11.h`, the level 7 parts of `WifiAssoc.h`, `WifiHtt.h`
+  (peer maps), `WifiWmi.h` (the scan entry's raw name, rates, RSN suites, beacon interval, DTIM), `WifiLink.h` (the hand-off
+  at step 629, the event hook, `linkSendWmi`, the profile's station address), `PianoWifi.cpp` (level 7, its arguments, its
+  deadline, the fast teardown on a suspend, `piano-wifi-level7`), en1 on the virtual device's address (`PianoWifiEthernet.cpp`).
+- The profile file's parser shared by the helper and the kext (`WifiProfile.h` `piano_wifi_profile_parse`).
+- The kexts build (`tooling/k27/build-native-piano-wifi.sh`, `build-native-piano-wifi-ethernet.sh`: objects and the import
+  check, 344 kernel imports, no new library).
+
+**Host-tested:** `tests/sta_host.cpp` (the frames byte for byte, the answers, the RSN parse, the reorder queue descriptors, the
+peer maps, the choice of network, and the whole join against a firmware and access-point model: WPA2 and open, the command
+order, every field the firmware reads, a transport that makes every command wait, no answer, refusals of the start, the
+authentication and the association, a late profile, no profile, a network found only by its own scan, no peer map, a
+kickout, a disconnect, a stop, the dry run, the A/B switches), `tests/wmi_host.cpp` (the hand-off: device kept, hook, a command
+through `linkSendWmi`, the teardown after), `tests/profile_host.cpp` (the parser); every older test unchanged and passing.
+
+**Still open:**
+- **The profile on a RAM probe.** The helper `piano-wifi-join` (configs/userland.toml) was added after the 27.3 store seed was
+  made (helper 2026-11-13 09:52, seed 01:42), so a probe built on that seed most likely has no `/usr/local/libexec/piano-wifi-join`.
+  Two ways: (a) the kext reads the root-only file itself while level 7 waits (the parser is in; the read through the vnode
+  KPI, as PianoPower's `PianoAdspFirmware.c` reads files, is **not written yet**); (b) write the sysctl with a helper copied to
+  the tablet. The sysctl's input is one `struct piano_wifi_profile` of **124 bytes**, little endian: magic `0x314a5750` at 0,
+  version 1 at 4, flags at 8 (bit 0 access point given, bit 1 station address given), security at 12 (0 open, 1 WPA2-PSK),
+  name length at 13, passphrase length at 14, a zero byte at 15, the name at 16 (32 bytes), the access point at 48 (6), the
+  station address at 54 (6), the passphrase at 60 (64); written with `sysctlbyname("machdep.piano_wifi_join", NULL, NULL, &p,
+  124)` as root, read back as a status line of lengths only.
+- **The probe image** (§8.8 boot 10a): not built. The recipe is boot 9a's (`/tmp/a18-build-probe.sh` in the main agent's notes:
+  the installed 27.3 entry's line with `data-persist=0`, `PIANO_EXTRA_ARGS="piano-reset-after=900 piano-reset-to=bootloader"`,
+  the store seed and its trust cache, the 27.3 collection with the 0066 kernel) with `piano-wifi=6` replaced by `piano-wifi=7`
+  in the line's driver arguments (they move into `/chosen/piano-boot-args-ram`).
+- **Piece 2, the data path (level 8):** not started in code. Gathered so far (facts of Ubuntu's ath12k for WCN7860, which
+  takes QCC2072's HAL and registers): the UMAC units (REO `0xa38000`, TCL `0xa44000`, WBM `0xa34000`), QCC2072's R0 offsets
+  (TCL1 ring base `0x918`, REO1 `0x500`, REO2SW0 exception `0x8c0`, WBM idle link `0xd3c`, WBM2SW0 release `0xe08`, WBM2SW1
+  `0xe80`, the TCL bank register `0xa4408c`) and the common R2 offsets (TCL1 HP `0x2000`, REO1 HP `0x3048`, REO2SW0 `0x3088`,
+  idle link `0x30b8`, WBM2SW0 `0x30c8`), the register sequence of a ring (the copy engine's, which level 6 already drives),
+  the ring identifiers (REO2SW1 1, SW2TCL1 24, WBM idle link 120, WBM2SW0 128, WBM2SW3 131 the receive error ring), the
+  transmit-ring map (TCL 0 -> WBM2SW0, RBM SW0) and the receive buffers' manager (software ring 1). Still to read: the TCL
+  data command and bank fields, the WBM release entry, the REO destination entry, the QCC2072 receive descriptor, the REO
+  general/routing registers, the idle link list, the HTT receive-ring selection.
+- **Piece 3's boundary** (EAPOL in and out, keys in, the peer authorised): rides on piece 2; not built.
+
+**What the next 27.3 boot (10a) must answer, with its log lines** (the full table is §8.8 boot 10a):
+1. Level 6 unchanged: `level 6: scan round 2 (with the receive buffers): ... K network(s)` with K >= 1.
+2. The hand-off: `step 629: the scan is done: the virtual device stays for level 7`; no `the teardown:` line of level 6 yet.
+3. en1's address: `PianoWifiEthernet: the interface takes the virtual device's address (its first three bytes 02:50:49)`;
+   on the tablet `ifconfig en1 | grep ether` gives `02:50:49:41:4e:01`.
+4. Level 7 starts: `stage 700: level 7: the join on level 6's virtual device`, `level 7: piano-wifi-l7=0x3f ...`,
+   `step 701: waiting for the join profile`.
+5. The profile: `join profile set (generation 1): a network name of N byte(s), WPA2-PSK with a passphrase ...` then
+   `level 7: the join profile was handed over after N ms: a network name of N byte(s), WPA2-PSK ...`.
+6. The choice: `step 702: the network`, `level 7: the network: entry E of the scan list (C access point(s) carry the profile's
+   name, ...): F MHz, channel X (5 GHz), signal S dBm`, `level 7: its elements: ... RSN (group 4, pairwise 0x10, key management
+   0x4, ...)`.
+7. The set-up: `step 704`, `step 705: the peer`, `step 706: the peer's map` with `level 7: the data interface named the peer:
+   peer P, hardware peer H`, `step 707: the peer's data set-up`.
+8. The start: `step 708: the device started`, `level 7: the device's start response: status 0 (started) after N ms`.
+9. Authentication: `step 709: authentication`, `level 7: authentication: try 1 of 3`, `level 7: frame 1: acknowledged
+   (completion status 0)`, `level 7: the authentication answer: status 0 (success) after N ms`.
+10. **The gate:** `step 710: the association`, `level 7: frame 2: acknowledged ...`, **`level 7: the association answer:
+    status 0 (success), AID A, after N ms`**.
+11. After it: `step 711: the peer's association` with `level 7: the peer's association confirmed after N ms`, `step 712: the
+    station up`, `step 714: associated`; then (WPA2, no keys yet) `level 7: the association ended: a deauthentication (or a
+    disassociation), reason R (...), N ms after the station came up`.
+12. The teardown: `step 715: the teardown`, `level 7: the teardown: the station down`, `... the peer deleted (answered)`,
+    `... the device stopped (answered)`, `step 716: done`, `level 7: done after N ms ...`, `level 6: the teardown: ... the
+    virtual device deleted, the rings disabled`, `stage 718: level 7: the join ran to its end`; no `crash:` line.
+A crash after step 710 is the unprogrammed receive rings meeting the first data frame (level 8 fixes it; `piano-wifi-l7=61`
+is the control without the peer data set-up). Each other failure's meaning is in §8.8 boot 10a's last column.
 
 ## 14. Level 6's message table
 

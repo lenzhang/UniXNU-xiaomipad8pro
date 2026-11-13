@@ -73,6 +73,94 @@ static inline const char *piano_wifi_security_name(uint8_t security)
   return security == PianoWifiSecOpen ? "open" : security == PianoWifiSecWpa2Psk ? "WPA2-PSK" : "unknown";
 }
 
+// The profile file's text (the owner's file, root:wheel 600 in a root 700 directory) into the structure: lines `key=value`,
+// the value to the end of the line (a trailing CR is dropped), `#` comments and empty lines skipped; keys ssid, security
+// (open | wpa2-psk), psk, bssid and mac (aa:bb:cc:dd:ee:ff). Returns what is wrong, or 0. Shared by the helper
+// (piano-wifi-join) and the kext, which reads the same file itself while level 7 waits for a profile; neither ever prints a
+// byte of it. No library function is used, so the kernel and the host run the same code.
+static inline int piano_wifi_profile_hex(uint8_t c)
+{
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+static inline int piano_wifi_profile_mac(const uint8_t *s, uint32_t n, uint8_t out[6])
+{
+  uint32_t i;
+  if (n != 17) return -1;
+  for (i = 0; i < 6; ++i) {
+    const int hi = piano_wifi_profile_hex(s[3 * i]), lo = piano_wifi_profile_hex(s[3 * i + 1]);
+    if (hi < 0 || lo < 0 || (i < 5 && s[3 * i + 2] != ':')) return -1;
+    out[i] = (uint8_t)(hi << 4 | lo);
+  }
+  return 0;
+}
+
+static inline int piano_wifi_profile_key(const uint8_t *key, uint32_t n, const char *want)
+{
+  uint32_t i;
+  for (i = 0; i < n; ++i)
+    if (!want[i] || key[i] != (uint8_t)want[i]) return 0;
+  return want[n] == 0;
+}
+
+static inline const char *piano_wifi_profile_parse(const uint8_t *text, uint32_t length, struct piano_wifi_profile *p)
+{
+  uint32_t at = 0, i;
+  int bad = 0;
+  if (!p) return "no profile to fill";
+  {
+    volatile uint8_t *z = (volatile uint8_t *)p;
+    for (i = 0; i < sizeof *p; ++i) z[i] = 0;
+  }
+  p->magic = PIANO_WIFI_PROFILE_MAGIC;
+  p->version = PIANO_WIFI_PROFILE_VERSION;
+  p->security = 0xff;
+  if (!text) return "no text";
+  while (at < length && !bad) {
+    uint32_t end = at, n, eq;
+    while (end < length && text[end] != '\n') ++end;
+    n = end - at;
+    if (n && text[at + n - 1] == '\r') --n;
+    for (eq = 0; eq < n && text[at + eq] != '='; ++eq) {}
+    if (n && text[at] != '#' && eq < n) {
+      const uint8_t *key = text + at, *value = text + at + eq + 1;
+      const uint32_t vn = n - eq - 1;
+      if (piano_wifi_profile_key(key, eq, "ssid")) {
+        if (vn < 1 || vn > 32) bad = 1;
+        else {
+          for (i = 0; i < vn; ++i) p->ssid[i] = value[i];
+          p->ssid_len = (uint8_t)vn;
+        }
+      } else if (piano_wifi_profile_key(key, eq, "security")) {
+        if (piano_wifi_profile_key(value, vn, "open")) p->security = PianoWifiSecOpen;
+        else if (piano_wifi_profile_key(value, vn, "wpa2-psk")) p->security = PianoWifiSecWpa2Psk;
+        else bad = 2;
+      } else if (piano_wifi_profile_key(key, eq, "psk")) {
+        if (vn > 64) bad = 3;
+        else {
+          for (i = 0; i < vn; ++i) p->psk[i] = value[i];
+          p->psk_len = (uint8_t)vn;
+        }
+      } else if (piano_wifi_profile_key(key, eq, "bssid")) {
+        if (piano_wifi_profile_mac(value, vn, p->bssid)) bad = 4;
+        else p->flags |= PianoWifiProfileBssid;
+      } else if (piano_wifi_profile_key(key, eq, "mac")) {
+        if (piano_wifi_profile_mac(value, vn, p->mac)) bad = 5;
+        else p->flags |= PianoWifiProfileMac;
+      } else {
+        bad = 6;
+      }
+    }
+    at = end + 1;
+  }
+  if (bad) return "a line the profile does not allow (its key or the form of its value)";
+  if (p->security == 0xff) return "no security line (security=open or security=wpa2-psk)";
+  return piano_wifi_profile_problem(p, sizeof *p);
+}
+
 // Wipes a profile so that the compiler cannot drop the stores (the helper's copy and the kernel's when the radio stops).
 static inline void piano_wifi_profile_wipe(struct piano_wifi_profile *p)
 {
