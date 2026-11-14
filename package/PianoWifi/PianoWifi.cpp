@@ -124,7 +124,7 @@ struct Args {
   uint32_t rddm, defer, wake;
   uint32_t deadlineMs;
   uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step, l7file, l7cands;
-  uint32_t l8, l8status;
+  uint32_t l8, l8status, l8blocks, l8tracems;
 };
 Args gArgs;
 
@@ -199,7 +199,7 @@ void readArgs()
   // piano-wifi-rddm=0: no crash dump segments for the chip (WifiRddm.h);
   gArgs.rddm = bootArg("piano-wifi-rddm", 1);
   // piano-wifi-defer=0: every line printed at once, even while the firmware starts (see note() below); =2: held, and printed only
-  //   when the ladder stops, with no helper thread (the fifth round's way);
+  //   when the ladder stops, with no helper thread (the fifth round's way); =3: held during levels 4 and 5, then printed at once;
   gArgs.defer = bootArg("piano-wifi-defer", 1);
   // piano-wifi-wake=0: no device wake doorbell at mission mode.
   gArgs.wake = bootArg("piano-wifi-wake", 1);
@@ -242,6 +242,14 @@ void readArgs()
   gArgs.l8 = bootArg("piano-wifi-l8", kL8Default);
   gArgs.l8status = bootArg("piano-wifi-l8status", 5000);
   if (gArgs.l8status && gArgs.l8status < 500) gArgs.l8status = 500;
+  // After boot 10c (the tablet reset right after the firmware's mode, with the rings programmed at level 6's start and none of
+  // the lines printed): piano-wifi-l8blocks=N programs the data path's register blocks 0..N only (WifiDp.h DpBlock: 0 reads
+  // only, 7 all, the default), and piano-wifi-l8tracems=MS how long the ladder waits after each block's line, printed at once
+  // (not held) so that the console and the kernel log have it before the block's first access (50; 0 no wait).
+  gArgs.l8blocks = bootArg("piano-wifi-l8blocks", kDpBlocks - 1);
+  if (gArgs.l8blocks >= kDpBlocks) gArgs.l8blocks = kDpBlocks - 1;
+  gArgs.l8tracems = bootArg("piano-wifi-l8tracems", 50);
+  if (gArgs.l8tracems > 2000) gArgs.l8tracems = 50;
 }
 
 uint64_t nowMs();
@@ -270,6 +278,13 @@ uint32_t gPrinterRun, gPrinterExited;  // the helper runs / has returned (atomic
 // The current level's hard deadline (ms since boot; 0 none), for the ladder's own checks and the helper's watch.
 uint64_t gLevelDeadline;
 uint32_t gLevelNow;
+// Lines of the ladder's thread printed at once instead of held (level 8's register blocks, after boot 10c): the held ones are
+// printed first, in order, so the kernel log has everything up to the block about to be touched.
+volatile uint32_t gSyncNotes;
+// piano-wifi-defer=3: held while the firmware starts (levels 4 and 5, where a console stall once let the firmware die) and
+// printed at once from level 6's start on (after boot 10c, whose last lines were held when the tablet reset).
+volatile uint32_t gSyncAfterLevel5;
+unsigned deferPrintHeld(const char *buffer);
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void note(const char *fmt, ...)
@@ -279,6 +294,11 @@ void note(const char *fmt, ...)
   va_start(ap, fmt);
   vsnprintf(line, sizeof line, fmt, ap);
   va_end(ap);
+  if (gDeferBuf && current_thread() == gDeferThread && (gSyncNotes || gSyncAfterLevel5)) {
+    deferPrintHeld(gDeferBuf);
+    IOLog("PianoWifi: %s [+%llu ms, printed at once]\n", line, (unsigned long long)(nowMs() - gDeferSince));
+    return;
+  }
   if (gDeferBuf && current_thread() == gDeferThread) {
     // A ring of kDeferLines: a line is written over only once the helper has printed it (level 8 runs for minutes after the
     // ladder's start, and its lines would not fit a buffer that is only filled once).
@@ -2630,6 +2650,35 @@ void publishScan(IOService *owner, const ScanList &list, bool full)
   }
 }
 
+// Level 8's rings out of the window and programmed block by block, each block's line printed at once (and a short wait) before
+// its first access: a block that takes the system down is the last line in the console and in the kernel log.
+void level8Program(const char *where)
+{
+  const uint32_t before = gArena.used;
+  gDpPlanned = dpPlan(gDp, gArena, &gHtt);
+  gSyncNotes = 1;
+  note("level 8: the data path's rings %s %s (%u bytes of the window; %u of %u used); programming blocks 0-%u, each line "
+       "printed at once and %u ms before the block's first access",
+       gDpPlanned ? "planned" : "NOT planned: the window has no room for them", where, gArena.used - before, gArena.used,
+       gArena.bytes, gArgs.l8blocks, gArgs.l8tracems);
+  if (gDpPlanned) {
+    dpProgramBlocks(gDp, gChipIo, gArgs.l8blocks, [](uint32_t block) {
+      const DpBlockRange g = dpBlockRange(gDp, block);
+      if (g.r2)
+        note("level 8: block %u: %s: registers %#x-%#x and %#x-%#x", block, dpBlockName(block), g.first, g.last, g.r2,
+             g.r2 + 4);
+      else
+        note("level 8: block %u: %s: registers %#x-%#x", block, dpBlockName(block), g.first, g.last);
+      if (gArgs.l8tracems) IOSleep(gArgs.l8tracems);
+    });
+    note("level 8: %u of %u block(s) done, %u register writes%s; the reads of block 0: REO1_GEN_ENABLE %#x, the idle link "
+         "ring's misc %#x",
+         gDp.blocksDone, kDpBlocks, gDp.writes, gDp.programmed ? "" : " (piano-wifi-l8blocks stops before the end: level 8 "
+         "does not run)", gDp.probeGen, gDp.probeIdleMisc);
+  }
+  gSyncNotes = 0;
+}
+
 // The teardown: the scan stopped and the virtual device deleted, waited for (bounded), then the rings disabled.
 void linkTeardown()
 {
@@ -2668,18 +2717,11 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
          kRxRefillEntries - 1, kRxBufferBytes, kRxRadios, kRxMacBufEntries, kRxErrDstEntries, kRxRadios,
          kRxMonStatusEntries - 1, gHtt.rbm == kRxBufRbmSw1 ? "software ring 1" : "the firmware's own manager");
   }
-  // Level 8: the data path's rings (WifiDp.h) out of the window and programmed now, before the receive rings are announced
-  // and before anything is associated: a frame the reorder unit pushes must find its destination ring and the receive DMA
-  // its link descriptors from the first data frame on.
+  // Level 8: the data path's rings (WifiDp.h). By default they are planned and programmed at level 7's start (level8Begin),
+  // once level 6 has run exactly as on boot 10b; piano-wifi-l8 bit 5 programs them here, before the copy engine, which is
+  // boot 10c's placement (the tablet reset right after the firmware's mode, nothing of it printed).
   gDpPlanned = false;
-  if (gArgs.level >= 8 && gHttPlanned && (gArgs.l8 & kL8Rings)) {
-    const uint32_t before = gArena.used;
-    gDpPlanned = dpPlan(gDp, gArena, &gHtt);
-    if (gDpPlanned) dpProgram(gDp, gChipIo);
-    note("level 8: the data path's rings %s (%u bytes of the window; %u of %u used)",
-         gDpPlanned ? "planned and programmed" : "NOT planned: the window has no room for them", gArena.used - before,
-         gArena.used, gArena.bytes);
-  }
+  if (gArgs.level >= 8 && gHttPlanned && (gArgs.l8 & kL8Rings) && (gArgs.l8 & kL8AtLevel6)) level8Program("at level 6's start");
   ceProgram(gCe, gChipIo);
   unsigned posted = 0;
   for (unsigned i = 0; i < kCeHostPipeCount; ++i) posted += cePostRx(gCe, gChipIo, i);
@@ -3520,14 +3562,17 @@ void level8Status(uint64_t now, const char *why)
 void level8Begin(uint64_t now)
 {
   gL8 = Level8{};
+  if (!gDpPlanned && gHttPlanned && (gArgs.l8 & kL8Rings)) level8Program("at level 7's start");
   gL8.on = gDpPlanned && gDp.programmed;
   gL8.lastStatus = now;
   if (!gL8.on) {
-    note("level 8: not run: the data path's rings were %s", gDpPlanned ? "planned but not programmed" : "not planned");
+    note("level 8: not run: the data path's rings were %s",
+         gDpPlanned ? "planned but not all programmed" : !(gArgs.l8 & kL8Rings) ? "switched off (piano-wifi-l8 bit 2)"
+                                                                               : "not planned");
     return;
   }
   note("level 8: piano-wifi-l8=%#x (buffers to software ring 1 %u, the receive ring selection %u, the transmit side %u, "
-       "EAPOL also to en0 %u); the rings: transmit %u, its completions %u, received %u, exceptions %u, released 2 x %u, idle "
+       "EAPOL also to en0 %u); the rings: transmit %u, its completions %u, received %u, exceptions %u, released %u, idle "
        "link %u (%u link descriptors), %u transmit buffers; %u register writes; cookie conversion %s (%#x, %#x)",
        gArgs.l8, (gArgs.l8 & kL8RbmSw1) ? 1u : 0u, (gArgs.l8 & kL8RxSelection) ? 1u : 0u, (gArgs.l8 & kL8Tx) ? 1u : 0u,
        (gArgs.l8 & kL8EapolToEn0) ? 1u : 0u, kDpTclEntries, kDpTxCompEntries, kDpReoEntries, kDpReoExcEntries, kDpRelEntries,
@@ -4417,6 +4462,10 @@ void PianoWifi::run()
   }
 
   // ---- level 6 ---------------------------------------------------------------------------------------------------------
+  if (gArgs.defer == 3) {
+    gSyncAfterLevel5 = 1;
+    note("log: piano-wifi-defer=3: from here every line is printed at once (the held ones first)");
+  }
   // level 6's own overall bound (six message steps and the scan) is inside its hard deadline
   {
     const uint32_t own = gArgs.wmiTimeoutMs * 12 + gArgs.l6regwait +

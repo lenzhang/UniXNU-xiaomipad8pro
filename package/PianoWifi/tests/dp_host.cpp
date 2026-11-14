@@ -396,6 +396,39 @@ int main()
   dpTxStop(dp);
   CHECK(!dpSend(dp, io, out.data(), uint32_t(out.size())));
 
+  // ---- block by block (boot 10c's reset): the trace comes before each block's first access, and the owner may stop early
+  {
+    Arena a2;
+    uint8_t *w2 = static_cast<uint8_t *>(std::aligned_alloc(1u << 20, 4u << 20));
+    arenaInit(a2, w2, 0x2000'0000ull, 4u << 20);
+    Dp d2;
+    CHECK(dpPlan(d2, a2, &rx));
+    Chip c2;
+    ChipIo io2{&c2, chipRead, chipWrite};
+    std::vector<std::pair<uint32_t, size_t>> traced;   // block, accesses before it
+    dpProgramBlocks(d2, io2, kDpBlockReo, [&](uint32_t block) { traced.push_back({block, c2.writes.size()}); });
+    CHECK(traced.size() == 4 && traced[0].first == kDpBlockProbe && traced[3].first == kDpBlockReo);
+    CHECK(traced[0].second == 0 && traced[1].second == 0);   // block 0 only reads
+    CHECK(!d2.programmed && d2.blocksDone == 4);
+    CHECK(written(c2, kDpTcl1R0) && written(c2, kDpWbm2Sw0R0) && written(c2, kDpReo2Sw1R0));
+    CHECK(!written(c2, kDpReo2Sw0R0) && !written(c2, kDpIdleLinkR0) && !written(c2, kDpReoDestIx2));
+    // each block's first write is inside the range the trace names
+    for (size_t i = 1; i < traced.size(); ++i) {
+      const DpBlockRange g = dpBlockRange(d2, traced[i].first);
+      const uint32_t first = c2.writes[traced[i].second].first;
+      CHECK(first >= g.first && first <= g.last);
+    }
+    Dp d3;
+    CHECK(dpPlan(d3, a2, &rx));
+    Chip c3;
+    ChipIo io3{&c3, chipRead, chipWrite};
+    uint32_t calls = 0;
+    dpProgramBlocks(d3, io3, kDpBlocks - 1, [&](uint32_t) { ++calls; });
+    CHECK(calls == kDpBlocks && d3.programmed && d3.blocksDone == kDpBlocks && c3.regs[kDpReoDestIx3] == 0x11111111u);
+    for (uint32_t b = 0; b < kDpBlocks; ++b) CHECK(dpBlockName(b)[0] != '?');
+    std::free(w2);
+  }
+
   // ---- a window too small for the data path: dpPlan says so
   {
     Arena tiny;

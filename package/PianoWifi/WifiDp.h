@@ -36,9 +36,12 @@ constexpr uint32_t kDpFrameMax = 1600;   // an 802.3 frame of en0 (1514 and a VL
 
 // piano-wifi-l8=N, level 8's switches (each the A/B of a default): bit 0 the receive buffers return to software ring 1 (the
 // refill ring's manager; off: the firmware's own, as levels 6 and 7 have it), bit 1 the receive ring selection sent for both
-// radio buffer rings, bit 2 the data path's rings programmed at level 6's start (off: level 8 does nothing), bit 3 EAPOL frames
+// radio buffer rings, bit 2 the data path's rings programmed at all (off: level 8 does nothing), bit 3 EAPOL frames
 // also to en0 (by default only to the 802.1X port), bit 4 the transmit side (off: nothing is sent, the receive side runs).
-constexpr uint32_t kL8RbmSw1 = 1u << 0, kL8RxSelection = 1u << 1, kL8Rings = 1u << 2, kL8EapolToEn0 = 1u << 3, kL8Tx = 1u << 4;
+// Bit 5: the rings programmed at level 6's start, before the copy engine (boot 10c's placement, which reset the tablet right
+// after the firmware's mode); by default they are programmed at level 7's start, once level 6 has run as on boot 10b.
+constexpr uint32_t kL8RbmSw1 = 1u << 0, kL8RxSelection = 1u << 1, kL8Rings = 1u << 2, kL8EapolToEn0 = 1u << 3, kL8Tx = 1u << 4,
+                   kL8AtLevel6 = 1u << 5;
 constexpr uint32_t kL8Default = kL8RbmSw1 | kL8RxSelection | kL8Rings | kL8Tx;
 
 struct DpTxBuf {
@@ -71,6 +74,8 @@ struct Dp {
   uint32_t vdevId = 0, pdevId = 0, bank = 0, tclMetadata = 0, searchIndex = 0, cacheSet = 0, tid = 0;
   uint32_t writes = 0;
   uint32_t reoCookieCfg = 0, wbmCookieConvert = 0;   // read back at programming, for the log (WifiHw.h)
+  uint32_t probeGen = 0, probeIdleMisc = 0;          // block 0's two reads
+  uint32_t blocksDone = 0;                           // how many of dpProgramBlocks' blocks ran
   DpStats st;
 };
 
@@ -205,42 +210,123 @@ inline bool dpPlan(Dp &dp, Arena &arena, HttRx *rx)
   return true;
 }
 
-// The rings' registers, the idle link ring filled with every link descriptor, and the reorder unit's set-up. Before any of
-// the receive DMA's buffers can carry a frame for the host (level 6 programs this before its receive rings are announced).
-inline void dpProgram(Dp &dp, const ChipIo &io)
+// The register blocks dpProgram writes, in order (boot 10c, 2026-11-14, reset the tablet right after the firmware's mode with
+// these programmed at level 6's start and no line of it printed: each block is now named, with its addresses, before its first
+// access, and the owner may stop after any of them). Block 0 only reads.
+enum DpBlock : uint32_t {
+  kDpBlockProbe = 0,    // reads: the reorder unit's general enable, the idle link ring's misc
+  kDpBlockTcl = 1,      // TCL data ring 1
+  kDpBlockTxComp = 2,   // WBM2SW0, its completions
+  kDpBlockReo = 3,      // REO2SW1
+  kDpBlockReoExc = 4,   // REO2SW0
+  kDpBlockRel = 5,      // WBM2SW3
+  kDpBlockIdle = 6,     // the WBM idle link ring, its 1023 entries and its head
+  kDpBlockReoSetup = 7, // the reorder unit's set-up and the cookie conversion's enables (read)
+  kDpBlocks = 8
+};
+
+inline const char *dpBlockName(uint32_t block)
+{
+  switch (block) {
+  case kDpBlockProbe: return "two reads of the data path's units (REO1_GEN_ENABLE, the WBM idle link ring's misc)";
+  case kDpBlockTcl: return "TCL data ring 1 (transmit)";
+  case kDpBlockTxComp: return "WBM2SW0 (transmit completions)";
+  case kDpBlockReo: return "REO2SW1 (received MSDUs)";
+  case kDpBlockReoExc: return "REO2SW0 (the reorder unit's exceptions)";
+  case kDpBlockRel: return "WBM2SW3 (the receive error release ring)";
+  case kDpBlockIdle: return "the WBM idle link ring (its entries and head)";
+  case kDpBlockReoSetup: return "the reorder unit's set-up (general enable, misc, aging, the hash's destinations; the cookie enables read)";
+  default: return "?";
+  }
+}
+
+// A block's addresses: its R0 range and its R2 pair, or for the set-up blocks the lowest and highest register they touch.
+struct DpBlockRange {
+  uint32_t first = 0, last = 0, r2 = 0;
+};
+inline DpBlockRange dpBlockRange(const Dp &dp, uint32_t block)
+{
+  auto ring = [](const CeRing &r, bool hostProduces) {
+    DpBlockRange g;
+    g.first = r.r0;
+    g.last = r.r0 + (hostProduces ? kSrcRingConsumerInt1 : kDstRingProducerInt);
+    g.r2 = r.r2;
+    return g;
+  };
+  switch (block) {
+  case kDpBlockProbe: return DpBlockRange{kDpReoGenEnable, kDpIdleLinkR0 + kRingMisc, 0};
+  case kDpBlockTcl: return ring(dp.tcl, true);
+  case kDpBlockTxComp: return ring(dp.txComp, false);
+  case kDpBlockReo: return ring(dp.reo, false);
+  case kDpBlockReoExc: return ring(dp.reoExc, false);
+  case kDpBlockRel: return ring(dp.rel3, false);
+  case kDpBlockIdle: return ring(dp.idle, true);
+  case kDpBlockReoSetup: return DpBlockRange{kDpReoGenEnable, kDpReoMiscCtrl, 0};
+  default: return DpBlockRange{};
+  }
+}
+
+// The rings' registers, the idle link ring filled with every link descriptor, and the reorder unit's set-up, block by block.
+// `trace(ctx, block)` runs before each block's first access (the owner logs it and lets the console take the line); blocks
+// above `lastBlock` are left out, and then the data path is not "programmed" (nothing polls a half-made set of rings).
+template <class Trace>
+inline void dpProgramBlocks(Dp &dp, const ChipIo &io, uint32_t lastBlock, Trace trace)
 {
   using namespace dpdetail;
   if (!dp.planned) return;
-  program(dp, io, dp.tcl, true);
-  program(dp, io, dp.txComp, false);
-  program(dp, io, dp.reo, false);
-  program(dp, io, dp.reoExc, false);
-  program(dp, io, dp.rel3, false);
-  program(dp, io, dp.idle, true, true);
-  // the link descriptors: each one entry of the idle ring (its address, manager "WBM idle descriptor list", cookie = its index)
-  for (uint32_t i = 0; i < dp.linkDescs; ++i) {
-    uint8_t *e = dp.idle.va + i * dp.idle.words * 4;
-    const uint64_t bus = dp.linkBus + uint64_t(i) * kDpLinkDescBytes;
-    put32(e, uint32_t(bus & 0xffffffffu));
-    put32(e + 4, uint32_t((bus >> 32) & 0xffu) | kDpRbmIdleDescDev0 << 8 | (i & 0xfffffu) << 12);
+  for (uint32_t block = 0; block < kDpBlocks; ++block) {
+    if (block > lastBlock) return;
+    trace(block);
+    switch (block) {
+    case kDpBlockProbe:
+      dp.probeGen = io.read(io.ctx, kDpReoGenEnable);
+      dp.probeIdleMisc = io.read(io.ctx, kDpIdleLinkR0 + kRingMisc);
+      break;
+    case kDpBlockTcl: program(dp, io, dp.tcl, true); break;
+    case kDpBlockTxComp: program(dp, io, dp.txComp, false); break;
+    case kDpBlockReo: program(dp, io, dp.reo, false); break;
+    case kDpBlockReoExc: program(dp, io, dp.reoExc, false); break;
+    case kDpBlockRel: program(dp, io, dp.rel3, false); break;
+    case kDpBlockIdle: {
+      program(dp, io, dp.idle, true, true);
+      // each link descriptor one entry of the idle ring (its address, manager "WBM idle descriptor list", cookie = its index)
+      for (uint32_t i = 0; i < dp.linkDescs; ++i) {
+        uint8_t *e = dp.idle.va + i * dp.idle.words * 4;
+        const uint64_t bus = dp.linkBus + uint64_t(i) * kDpLinkDescBytes;
+        put32(e, uint32_t(bus & 0xffffffffu));
+        put32(e + 4, uint32_t((bus >> 32) & 0xffu) | kDpRbmIdleDescDev0 << 8 | (i & 0xfffffu) << 12);
+      }
+      dp.idle.ours = dp.linkDescs;
+      publishBarrier();
+      write(dp, io, dp.idle.r2, dp.idle.ours * dp.idle.words);
+      break;
+    }
+    case kDpBlockReoSetup: {
+      // aging on, fragments and BARs to the exception ring, the aging thresholds, every hash entry to REO2SW1
+      const uint32_t gen = io.read(io.ctx, kDpReoGenEnable);
+      write(dp, io, kDpReoGenEnable, gen | kDpReoGenAgingList | kDpReoGenAgingFlush);
+      const uint32_t misc = io.read(io.ctx, kDpReoMiscCtrl) & ~(kDpReoMiscFragMask | kDpReoMiscBarMask);
+      write(dp, io, kDpReoMiscCtrl, misc | kDpRingIdReo2Sw0 << 17 | kDpRingIdReo2Sw0 << 21);
+      write(dp, io, kDpReoAgingIx0 + 0, kDpReoAgingBeUs);
+      write(dp, io, kDpReoAgingIx0 + 4, kDpReoAgingBeUs);
+      write(dp, io, kDpReoAgingIx0 + 8, kDpReoAgingBeUs);
+      write(dp, io, kDpReoAgingIx0 + 12, kDpReoAgingVoUs);
+      write(dp, io, kDpReoDestIx2, kDpReoHashAllSw1);
+      write(dp, io, kDpReoDestIx3, kDpReoHashAllSw1);
+      dp.reoCookieCfg = io.read(io.ctx, kDpReoSwCookieCfg1);
+      dp.wbmCookieConvert = io.read(io.ctx, kDpWbmCookieConvert);
+      break;
+    }
+    default: break;
+    }
+    dp.blocksDone = block + 1;
   }
-  dp.idle.ours = dp.linkDescs;
-  publishBarrier();
-  write(dp, io, dp.idle.r2, dp.idle.ours * dp.idle.words);
-  // the reorder unit: aging on, fragments and BARs to the exception ring, the aging thresholds, every hash entry to REO2SW1
-  const uint32_t gen = io.read(io.ctx, kDpReoGenEnable);
-  write(dp, io, kDpReoGenEnable, gen | kDpReoGenAgingList | kDpReoGenAgingFlush);
-  const uint32_t misc = io.read(io.ctx, kDpReoMiscCtrl) & ~(kDpReoMiscFragMask | kDpReoMiscBarMask);
-  write(dp, io, kDpReoMiscCtrl, misc | kDpRingIdReo2Sw0 << 17 | kDpRingIdReo2Sw0 << 21);
-  write(dp, io, kDpReoAgingIx0 + 0, kDpReoAgingBeUs);
-  write(dp, io, kDpReoAgingIx0 + 4, kDpReoAgingBeUs);
-  write(dp, io, kDpReoAgingIx0 + 8, kDpReoAgingBeUs);
-  write(dp, io, kDpReoAgingIx0 + 12, kDpReoAgingVoUs);
-  write(dp, io, kDpReoDestIx2, kDpReoHashAllSw1);
-  write(dp, io, kDpReoDestIx3, kDpReoHashAllSw1);
-  dp.reoCookieCfg = io.read(io.ctx, kDpReoSwCookieCfg1);
-  dp.wbmCookieConvert = io.read(io.ctx, kDpWbmCookieConvert);
   dp.programmed = true;
+}
+
+inline void dpProgram(Dp &dp, const ChipIo &io)
+{
+  dpProgramBlocks(dp, io, kDpBlocks - 1, [](uint32_t) {});
 }
 
 // True when the hardware would rewrite the entries' cookies (something else set conversion up): the log says so.
