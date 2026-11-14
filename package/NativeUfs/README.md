@@ -76,4 +76,9 @@ ShengUfs b11de87 (`UPSTREAM`) with the piano/SM8750 deltas, built as a k27 nativ
 - `gScratch` allocated at start (the KC has no gap for a 128 KiB `__bss`).
 - Power (`RootPower.h`, opt-in): `native-ufs-suspend=1` puts the link into Hibern8 for a system sleep and undoes everything on any
   failure; `native-ufs-ahit=MS` the controller's auto-hibernate at run time. [docs/drivers/ufs.md](../../docs/drivers/ufs.md) §12.
-- Host tests: `tests/run-tests.sh` (the command, queue, link and power code against `tests/UfsModel.h`).
+- Read path speed (opt-in, all off by default): `native-ufs-perf=1` (per-second timing with `native-ufs-iolog`),
+  `native-ufs-async=N` (read workers), `native-ufs-bounce=KiB` (up to 1 MiB per command), `native-ufs-maxio=KiB`,
+  `native-ufs-nap=US`, `native-ufs-direct=1` (DMA into the client's pages), `native-ufs-fast=1`.
+  [docs/drivers/ufs.md](../../docs/drivers/ufs.md) §13.
+- Host tests: `tests/run-tests.sh` (the command, queue, link and power code against `tests/UfsModel.h`; the window reader's bounce
+  sizes, `tests/RootWindowRead.cpp`; the direct reads' PRDT and command, `tests/RootDirect.cpp`).

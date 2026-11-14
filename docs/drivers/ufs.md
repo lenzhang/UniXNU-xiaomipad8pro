@@ -369,3 +369,33 @@ everything and why U1 isolates the UFS part with the CPUs in WFI.
 - I/O that arrives in the sleep window waits; a kernel thread the sleep itself depends on that did root-disk I/O in that window
   would deadlock the sleep (none known: user tasks are suspended and the file systems synced before the drivers' off; the panic
   path does not wait).
+
+## 13. Read path speed (the boot-time lane, 2026-11-14)
+
+**Why.** bt1 (installed v4 line as a RAM boot, `native-ufs-iolog=120`) read about 2.4 GB from the root windows between launchd's
+exec (iolog second 1) and `dyld cache mapped system-wide` (between seconds 39 and 40) at a steady 60-80 MiB/s, about 600 handed-up
+pieces of up to 128 KiB a second: about 1.6 ms per 128 KiB, the 40 s stretch I/O-bound. From the code (as of 4b468d6), each window
+read runs in the caller's thread (`doAsyncReadWrite` completes before it returns, so read-ahead issued "async" blocks its issuer),
+through one of four 128 KiB bounces (`ufsReadWindow` reads at most one bounce per command), one UFS command at a time per caller,
+its completion a 2 us `IODelay` spin (`NATIVE_UFS_POLL_ONLY`). Per 128 KiB the CPU cleans and invalidates the bounce (2 x 2048 cache
+lines by VA), copies it into the client with `IOMemoryDescriptor::writeBytes`, whose `copypv` (flags 0x75, `cppvFsnk`) cleans and
+invalidates the sink again (this kernel is not built with coherent I/O). No upper-layer limit is published (`IOMaximum*` absent), so
+the layers above may send any size. Which of device time, link gear, cache maintenance or the serial issue dominates is not
+readable from the code: `native-ufs-perf=1` measures it.
+
+**Switches** (all off by default: the read path above, byte for byte; writes, the store, the log and the sync never change):
+
+| Argument | Effect |
+|---|---|
+| `native-ufs-perf=1` | Two lines per iolog second (starts the iolog for 120 s when absent): `perf N s: req …` (window reads: count, KiB, average/max time to completion, read-worker queue wait, copy us/MiB, time-weighted depth and busy share, size histogram <=4K/8K/16K/32K/64K/128K/256K/512K/1M/more, reads not on whole 4 KiB blocks, bounce waits, direct reads) and `perf N s: cmd …` (READ(10)s: zero-copy/slot/direct, average time, device time avg/max, MB/s while the device is busy, clean/invalidate/slot-copy/flush us/MiB, slot wait, depth and busy share). Once after the bring-up: `perf link:` the PA gears, lanes, power mode, HS series and terminations (DME_GET), AHIT, slots, list mode, zero copy, DMA limit. Observation only. |
+| `native-ufs-async=N` | N (1-16) read worker threads: a window read is queued (pool of 256; full: served by the caller as before) and served by a worker with the unchanged read code, its completion called from the worker. Each window gets N bounces. |
+| `native-ufs-bounce=KiB` | 128-1024: the windows' bounces that big, physically contiguous and DMA-reachable (else 128 KiB from `IOMalloc` as before), so one zero-copy command fills one: up to 1 MiB per READ(10) instead of 128 KiB. |
+| `native-ufs-maxio=KiB` | 64-16384: `IOMaximumByteCountRead` and `IOMaximumBlockCountRead` on each window (what IOBlockStorageDriver and the BSD client's `DKIOCGETMAXBYTECOUNTREAD` give the file systems). The write keys stay absent. |
+| `native-ufs-nap=US` | 1-1000, with async: a read worker whose command has run longer than `native-ufs-nap-spin=US` (default 30) sleeps US microseconds between doorbell polls (a timed wait without leeway) instead of spinning. Every other caller spins as before. |
+| `native-ufs-direct=1` | Reads of whole device blocks into whole, page-aligned, reachable pages are DMA'd straight into the client's pages (`hostPrdsFromSegments`, `hostReadPrd`; one command per MiB, at most 64 entries), the pages cleaned and invalidated by physical address before and after (`dcache_incoherent_io_flush64`, `remaining` 0: never a set/way flush). No bounce, no copy. The whole request is checked before the first command; anything else goes through a bounce. Development (unverified) builds only. |
+| `native-ufs-fast=1` | async 8, bounce 1024, maxio 1024, nap 25 (explicit arguments win; not direct). |
+
+Host tests: `tests/RootWindowRead.cpp` (bounces of 4 KiB to 1 MiB hand up the same bytes and verified blocks as 128 KiB, one device
+read per bounce, partial progress on a failed read), `tests/RootDirect.cpp` (the direct PRDT's rules; the command's descriptor, no
+data maintenance in the command path, refusals before the controller, busy retries, quarantine). Tablet: not run yet (probes ufs0,
+ufs1, ufs2 in `private/host-checks/20261114-ufs1/`).
