@@ -327,6 +327,8 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-sleepoff=M` | 2 at level 8, 1 below | what a system sleep does to the radio. 2 (level 8's default since boot 10k): the ladder's thread stops the join (our deauthentication), powers the radio down (WLAN_EN low, PERST# asserted, the rails given back) and parks; the wake runs the ladder again from level 2 (the restart, below). 1: powered off until the next boot. 0: kept on through the sleep (boot 10k: the firmware died during a 60 s sleep, `cmnos_assert`, SYSERR at the wake) |
 | `piano-wifi-restart=0` | 1 at level 8 | when the firmware dies (SYSERR or its crash dump environment) or a level fails, end the ladder as before. By default the radio is powered down and the ladder runs again from level 2 with every level's state reset (the DMA window's allocations from its start; the window, its translation, the SMMU's stream, the mappings, the join profile, the 802.1X port and en0's attachment kept) after 1, 5, 15, 30, 60, then 120 s; the wake from a system sleep restarts at once |
 | `piano-wifi-restarts=N` | 6 | at most N restarts in a row without the port opening in between; then the radio stays down until the next wake |
+| `piano-wifi-fastrestart=0` | 1 | every restart scans as the boot does (level 6's two passive scans, about 5 s). By default a restart at a wake or after the firmware died skips them and joins the network of the last open port directly (its access point and channel, the join's own copy; its name is never logged); a fast join that does not open the port ends the pass, and the next restart scans |
+| `piano-wifi-haltwatch=0` | 1 | no watch of the shutdown. By default, from this driver's shutdown notice, a helper thread names at +8 s and +20 s the services whose shutdown is not acknowledged (the power manager's `PMShutdown` property) and the power-plane services with a power change in progress (`MachineState` in their power-management record). Reads only |
 | `piano-wifi-crashtest=S` | 0 | a test: S s after the port first opens on a pass a restart began, the chip is asked once for its crash dump environment (MHI's SoC reset request, as the MHI host forces a dump), so that one unattended boot shows the restart after a crash |
 | `piano-wifi-rejoin=0` | 1 at level 8 | when an association ends (the access point's deauthentication or disassociation, a beacon miss, a kickout, the 802.1X client's `LEAVE`, our own leave) or a join fails, end the level (as before). By default level 7 joins again from the profile after 2, 5, 10, 20, 30, then 60 s (back to 2 s after a port that opened); never after a stop, a dead chip or no profile |
 | `piano-wifi-droptest=S` | 0 | a test: S s after the port first opens the station leaves its association once (our deauthentication), so that an unattended boot shows the rejoin |
@@ -1311,6 +1313,42 @@ each with its time in the log; only then is ours registered as the primary built
 | the link's up | `PianoWifiEthernet: ... en0 (attached to the network stack) ... (up 1, running 1)` | — |
 | the shell | `ifconfig -a` en0 (`...:01`, ours: `ioreg -l -w0 -c PianoWifiEthernet` has the interface en0) and en1; DHCP and ping on en0 | an address, 5/5 |
 | the desktop | the login window and the USB shell stay up (TimeSync took its clock from the null at its start) | — |
+
+**10m ran on 2026-11-14 18:00 and passed every gate (`private/host-checks/20261114-10m`):** the first join, the drop test's
+rejoin (generation 2), the sleep (`the radio is parked for system sleep 1 (239 ms after the sleep's stop)`), the wake's restart
+(`restart 1 (the wake from a system sleep): Wi-Fi is back: the port opened 6939 ms after the restart began (pass 2)`, the
+supplicant's generation 3), the crash test's restart (`restart 2 (the firmware died): Wi-Fi is back: the port opened 6945 ms
+...`, generation 4), DHCP, the gateway 5/5, the Internet 3/3, DNS and HTTPS after each; the registry `2 restart(s): 1 at a wake,
+1 after the firmware died, 0 after a failed level`. The least free stack was 12 984 bytes on every pass. Of the 6.9 s, about
+4.9 s were level 6's two passive scans: the fast restart below skips them.
+
+**10m-en0 (18:15):** the stand-down itself worked (`PianoNullEthernet's interface is there, BSD name none yet` — nothing was
+named yet —, `the interface is detached (synchronously)`, `free after 0 ms`, ours registered as the primary built-in one), but
+the controller's `terminate()` let IOResources' next matching start a second PianoNullEthernet during launchd's boot tasks,
+which took en0 again (`interface name en0 is unavailable` for ours). Now the controller is kept without its interface, and an
+instance started later does not come up (`PianoNullEthernet: not started again: en0 is Wi-Fi's for this boot`).
+
+**The halt timeout:** `Halt/Restart Timed Out @IOPlatformExpert.cpp:884` ends every reboot of the 27.3 line, also on a run
+of 2026-11-13 without PianoWifi at all: it is not this driver's. It is IOPlatformExpert's panic 30 s after the halt began
+(`reset fastboot` calls `PEHaltRestart` directly); no `PMRD: ... still waiting on` line and no `IOPlatformHaltRestartAction ->`
+line appear before it, so the halt does not get past the power manager's notifications or its quiesce (inferred). The halt
+watch names what holds it.
+
+**Boots 10n and 10n-en0: the fast restart, the halt watch (and the en0 take-over)** (built 2026-11-14 from branch commit `2a3c725`
+(main merged), collection `6e3ac172...`, the v2 recipe, each 237281280 bytes, `verify-ram-images.py` PASS: `out/ram-k273-wifi-10n` sha256
+`9f8051ac3758635cef311d9ea4355d8175ef3de862d67014bd6b052fc0542573`, `out/ram-k273-wifi-10n-en0` sha256 `0a04bfff3afbf3c5db88330449f3a2190cf3411f27a6e6d3adfe8d60d12d5ce7`; the collection and ADT next to each). Arguments: 10m's (the drop test, the test
+sleep at 420 s for 60 s, `piano-wifi-crashtest=120`, `piano-reset-after=1200`); 10n-en0 adds `piano-wifi-en0=1` (the interface
+is then en0 with `...:01`; 10n's is found by `...:04`).
+
+| When | Line / command | Expected |
+|---|---|---|
+| the first join, the drop test, the rejoin, the sleep's park | as 10m | as 10m |
+| the wake | `restart 1 begins (the wake from a system sleep), N ms after pass 1 ended ...; levels 2 to 8 follow, fast (no scan: the last network directly)`, `level 6: a fast restart: no scan ...`, `level 7: the fast restart: the last network (5200 MHz, channel 40) is joined directly, without a scan` | no `step 608` or `step 609` line (the scan's) in pass 2 |
+| Wi-Fi back | `restart 1 (the wake from a system sleep): Wi-Fi is back: the port opened N ms after the restart began (pass 2)`; DHCP, the gateway, the Internet | N about 2 000 to 3 000 (10m: 6939); an address, 5/5 |
+| the crash test | as 10m, then `restart 2 begins (the firmware died) ... fast (no scan ...)` and `restart 2 (the firmware died): Wi-Fi is back: the port opened N ms ...`; DHCP, the gateway, the Internet | N about 2 000 to 3 000 |
+| a fast join that fails (only if the network moved) | `level 7: the fast restart's join did not open the port (...): the pass ends; the next restart scans as the boot does`, `restart: pass N ended at level 7 (the fast join did not open the port) ... in 1000 ms`, `restart N+1 begins (...), ... with the scans` | Wi-Fi back on the pass after |
+| the run's end (`reset fastboot`) | `PianoWifi: halt watch: armed ...`, then at +8 s and +20 s `PianoWifi: halt watch +8 s: the halt has not ended; N service(s) with the shutdown not acknowledged: ...` and `PianoWifi: halt watch +8 s: N of M power-plane service(s) with a power change in progress: NAME (ID, state S), ...` | the names of what holds the halt |
+| 10n-en0 only, PianoWifiEthernet's start | as 10m-en0's (`en0: before the stand-down ...`, `the interface is detached`, `free after N ms`, the publish line `primary (en0 was freed)`), and later no `PianoNullEthernet: en0 (built-in ...)` line again (or `PianoNullEthernet: not started again: en0 is Wi-Fi's for this boot`) | `ifconfig -a`: en0 is ours (`...:01`), en1; the network checks on en0 |
 
 **10k-en0** (the same collection, 10i's arguments and `piano-wifi-en0=1`, no tests): `PianoWifiEthernet: en0: PianoNullEthernet
 is asked to stand down (piano-wifi-en0=1)`, `en0: free after N ms`, at the link's up `en0 (attached to the network stack) ...
