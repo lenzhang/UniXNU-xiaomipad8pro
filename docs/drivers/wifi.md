@@ -149,7 +149,7 @@ refill ring the firmware hands on to the radios. Built: the data interface, its 
 buffers, and a second scan after them on the same boot (the first is the control), with the channel visits' counters and the
 radio's statistics to tell "no buffers" from "a deaf radio". The scan lines no longer print a network's name. Next: §8.8 boot 9a.
 
-**Level 7, the join, is built (2026-11-13, `piano-wifi=7`, §13.3; not yet run on the tablet).** Level 6 keeps its virtual
+**Level 7, the join (`piano-wifi=7`, §13.3), associates on the tablet (boot 10b, 2026-11-14: status 0, AID 20, 5200 MHz).** Level 6 keeps its virtual
 device and the transport after the second scan and hands them over; level 7 waits for the join profile (`machdep.piano_wifi_join`),
 chooses the profile's network out of the scan list (the strongest access point of the name, a 5 GHz one first), and joins in this
 chip's own order: the station's parameters, the peer, its HTT peer map, its default routing and 17 reorder queues, the start on
@@ -984,6 +984,18 @@ directory); the kext reads it itself within 2 s (no helper needed; the sysctl st
 |---|---|---|---|
 | 10b | `piano-wifi=7 piano-wifi-iova=1` | as 10a up to `step 701`; then either `join profile read from its root-only file (generation 1): a network name of N byte(s), WPA2-PSK with a passphrase ...` or the sysctl's `join profile set ...`, and `level 7: the join profile was handed over after N ms`. **Hidden name (attempt A's profile):** `level 7: our scan 1: active, a probe naming the profile's network, 5 GHz (not radar) on 4+ channel(s)` (and scan 2 on 2.4 GHz), then `step 702` with `level 7: the network: entry E ... (C access point(s) carry the profile's name ...)`. **Each candidate:** `level 7: candidate K of N: 5 GHz, not radar \| 5 GHz, radar (passive) \| 2.4 GHz, F MHz channel X, ...`, its steps 705-708, `level 7: frame D check whole (0xfff): ...`, `level 7: frame D: acknowledged`, `the authentication answer: status 0`, then 710: **`level 7: the association answer: status 0 (success), AID A`**; a candidate that fails: `level 7: candidate K ended: <reason> (<class>); the next one follows its teardown`. Level 6's list lines show `(5200 MHz, heard at 5260 MHz)` where a network was heard off its channel, and level 7's `its frames were heard while the radio was on ... MHz` for the chosen one. `PianoWifiEthernet: the scan list has N network(s)` and `the interface takes the virtual device's address (... 02:50:49)`; on the tablet `ifconfig en0` shows `ether 02:50:49:41:4e:01`. **Gate: the association answer with status 0 and an AID** | **Every candidate's frames `not acknowledged`** with the check `whole`: the frames are right and do not reach the access point — compare the classes: only radar/passive ones failing points at transmission on a passive channel; all classes failing at the transmit path (power, the device's channel) — next boot `piano-wifi-l7=0x63f` (no power limits) as its A/B. **A check `NOT whole`**: the bit named `NO` is the bug. **Hidden name still not found** after both directed scans: the probes were not answered (the network may not answer a directed probe on that band); `bssid=` in the profile pins the access point. **A crash after 710**: as 10a's last column |
 
+**10b ran on 2026-11-14 08:45 (`ram-k273-wifi-10b`, `18f142f5...`): the association gate passed.** The profile read by the kext
+from its root-only file (generation 1, an 8-byte name, placed about 100 s after the boot); PianoWifiEthernet found the scan
+list (17 networks) and took the virtual device's address (en0 `02:50:49:41:4e:01`); level 7: 4 access points of the name, 7
+nameless entries in the list; candidate 1 of 4 the 5 GHz not-radar one on 5200 MHz channel 40 at -39 dBm (`its frames were
+heard while the radio was on 5260 MHz: the channel the network names (40) is the one joined`); steps 704-708 (peer 2,
+hardware peer 58, 17 queues, start status 0); both frame checks whole (`0xfff`); **`the authentication answer: status 0
+(success) after 5 ms`, `the association answer: status 0 (success), AID 20, after 4 ms`**, the peer's association confirmed
+after 5 ms, the station up, `step 714: associated`; 7.3 s later `the association ended: a beacon miss, reason 2` (no keys: the
+four-way handshake never ran), the teardown (station down, peer deleted and device stopped, both answered), `step 716: done`,
+no crash. Confirmed on the tablet: the off-channel frequency was boot 10a's cause; level 7's join works up to the keys.
+Next: the data path (level 8), whose gate is the access point's first EAPOL-Key frame received and counted.
+
 ## 9. Fallback
 
 `piano-wifi=0` (the default): nothing runs. Network meanwhile: PianoNullEthernet's `en0` (no traffic) and, once built, the USB-C
@@ -1737,7 +1749,8 @@ then `WMI_PEER_SET_PARAM` 3); that interface lives with the data path (level 8),
 
 ### 13.4 Status of levels 7 and 8 (2026-11-13, updated 2026-11-14 after boot 10a)
 
-**2026-11-14:** boot 10a's two failures are understood and fixed (§8.8 after 10a: the off-channel frequency; the hidden
+**2026-11-14, boot 10b: the association works on the tablet** (AID 20 on 5200 MHz; §8.8 after 10b). **2026-11-14:** boot
+10a's two failures are understood and fixed (§8.8 after 10a: the off-channel frequency; the hidden
 name); the candidates, directed probes, frame checks, power limits and the kext's own read of the profile file are in, host
 tested, and probe `ram-k273-wifi-10b` carries them (§8.8 boot 10b). The parts below are the state of 2026-11-13.
 
