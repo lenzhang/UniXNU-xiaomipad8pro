@@ -1,6 +1,9 @@
 # The macOS Wi-Fi menu: PianoWifi under Apple's Wi-Fi stack (design, 2026-11-14)
 
-Status: **M1 built and host-tested (2026-11-14, §5), not run on the tablet yet**: probe `ram-k273-wm1` (§5.8). The link itself works since boot 10i (2026-11-14: WPA2, DHCP, the internet over
+Status: **M1 ran on the tablet (wm1, 2026-11-14 19:01, §6.1)**: the interface is "Wi-Fi" for SystemConfiguration and `ifconfig`,
+airportd starts by itself, binds and scans it (17 networks served, the list's end answered), but WiFiManager/corewifi does not
+adopt it (`wdutil`: Interface Name (null)), so CoreWLAN and the menu see no interface. M1b (accept modes, §6.2) built: probe
+`ram-k273-wm2` (§6.3). The link itself works since boot 10i (2026-11-14: WPA2, DHCP, the internet over
 `PianoWifiEthernet`, an Ethernet-like interface, with our own supplicant; [wifi.md](wifi.md) §8.8, §13). The owner's next step:
 the Wi-Fi menu, Settings › Wi-Fi and CoreWLAN, through airportd and IO80211Family, as on a Mac.
 
@@ -239,3 +242,78 @@ trust cache `57063d6d...`; 27 arguments (492 bytes) in `/chosen/piano-boot-args-
 `65ac4f35165d32b1245ab837823f9dc73750501084fd0f7d0a4e4f9492f02f1d`, the same collection). `piano-cwscan` is beside the image.
 The image's own control is boot 10i/10l (the same line without the switch): their `PianoWifiEthernet:` lines are what
 `PianoWifi80211`'s parent must still print.
+
+## 6. M1 on the tablet, and M1b
+
+### 6.1 wm1 (2026-11-14 19:01-19:18; private/host-checks/20261114-wm1)
+
+**Confirmed on the tablet:**
+- SystemConfiguration: `networksetup -listallhardwareports` lists `Hardware Port: Wi-Fi`, `Device: en2`; `ifconfig -v en2` says
+  `type: Wi-Fi` and carries the agent domain `WiFiManager ... desc:"WiFi"`; `ioreg` shows the role and
+  `piano-wifi-apple80211-answering = en2`. The subfamily was taken (`type 6, family 2, subfamily 3` in the filter's line).
+- airportd started by itself (`state = running`, pid 132), through launchd's IOKit match on the class name: the starter unit is
+  not needed (§5.6 inferred it; now measured).
+- The bind and set-up: CARD_CAPABILITIES (23 bytes), DRIVER_VERSION (384), COUNTRY_CODE, PHY_MODE, OP_MODE, NOISE, POWER get and
+  set, POWERSAVE set (value 7), SUPPORTED_CHANNELS (272 bytes written): all answered `-> 0`. The events 1, 4 and 10 were posted
+  `-> 0`.
+- Scans over ioctls work: `SCAN_REQ len 5528 -> 0` with 17 networks, `SCAN_RESULT` one per call (`cursor 1 of 17` ...) and the end
+  `-> 5`, repeated (57 scans, 969 results served in the run's summaries): the end-of-list question of §5.7 item 1 is answered,
+  airportd does not fail the scan.
+- SSID, BSSID, CHANNEL, RSSI, CURRENT_NETWORK `-> 2` (not associated), as designed.
+
+**Not working:** `wdutil info` reports `Interface Name: (null)`, `Power: Off`, `Op Mode: None`, `Supported Channels: (null)`;
+airportd's log keeps scheduling scans and says `AUTO-JOIN: -- no_alt_interface`, and corewifi logs
+`-[CWFXPCRequestProxy __apple80211WithVirtualInterfaceRole:parentInterfaceName:] ... Failed to match ...` (the line was cut by
+the capture). So airportd's corewifi side has not adopted en2 as its Wi-Fi interface although every request it sends is answered;
+CoreWLAN's `scanForNetworks` did not return within minutes (it held the session's ssh: `piano-cwscan` now ends itself).
+
+The requests airportd asked that we refused (`-> 102`), by kind: get 207 CHANNELS_INFO (10016 bytes), get 96 VIRTUAL_IF_ROLE,
+set 512 INFRA_ENUMERATED (1 byte), set 85 (2068), set 490 (300), set 469 (8), set 575 (4), get 108 (88), get 115 (2600), get 97
+(16), get 87 (8), get 174 (24), get 175 (16), get 194 (8), get 353 / 393 / 55 / 57 (no buffer).
+
+### 6.2 M1b: what the next boot varies
+
+The adoption is decided in airportd/corewifi; which of its inputs is missing cannot be read off our log. M1b therefore makes the
+answers to the refused requests a **run-time switch**, so that one boot tries each and the tablet shows which one changes
+`wdutil`'s Interface Name. No layout is guessed beyond "accepted" and "zeros":
+
+| `machdep.piano_wifi_a80211` bit | Effect |
+|---|---|
+| 0x1 (the default) | INFRA_ENUMERATED (512) set accepted |
+| 0x2 | every other set without a handler accepted (0), its value ignored; never the join's sets (ASSOCIATE, DISASSOCIATE, DEAUTH, CIPHER_KEY, AUTH_TYPE, RSN_IE: M2) |
+| 0x4 | every other get without a handler answered with zeros of the asked length (0 in `req_val` without a buffer); not VIRTUAL_IF_ROLE |
+| 0x8 | VIRTUAL_IF_ROLE (96) get answered 0 in `req_val` (else refused: an answer may make airportd take the interface for a virtual one) |
+
+`piano-wifi-apple80211-accept=N` sets the mode at boot; `sudo sysctl machdep.piano_wifi_a80211=N` changes it at run time and logs
+`PianoWifi80211: en2: accept mode 0xN (was 0xM, machdep.piano_wifi_a80211): every request kind is logged again from here`; the
+one-line-per-kind log starts over, so the requests airportd asks after the change (and their answers, `[accept mode]` marked)
+are all in the log again. airportd sets the interface up once, at its start: after a change, `launchctl kickstart -k
+system/com.apple.airportd` makes it start over with the new answers. The summary line carries the mode and how many requests it
+answered.
+
+### 6.3 Probe wm2 and its checklist
+
+`out/ram-k273-wm2`, the installed v5 entry's recipe (`out/persistent/esp-k273-v5.json`'s line and tail, `data-persist=0`, the v2
+seed `seed-200.img`, the v4 layer's trust cache) and `piano-wifi-apple80211=1 piano-reset-after=900 piano-reset-to=bootloader`;
+its build is in §6.4. No join profile in this boot.
+
+Every tablet command has a time limit. Over ssh, the Mac's side limits the session; on the tablet, `bash -c` with this helper
+(the commands below use it):
+
+    tmo() { s=$1; shift; "$@" & p=$!; i=0; while kill -0 $p 2>/dev/null && [ $i -lt $s ]; do sleep 1; i=$((i+1)); done; kill -9 $p 2>/dev/null; wait $p 2>/dev/null; }
+
+`piano-cwscan scan 45` ends itself after 45 s. `wdutil` is `sudo wdutil info | sed -n '/^WIFI/,/^BLUETOOTH/p' | grep -E 'Interface
+Name|Power|Op Mode|Supported Channels'` (W below). The adoption log (A below):
+`tmo 30 log show --last 3m --style compact --predicate 'process == "airportd"' | grep -iE 'Failed to match|no_alt_interface|interfaceName|virtualInterfaceRole|primary|adopt|attach|BSD driver' | head -40`
+(keep the lines whole; record the interface names only, never a network's).
+
+| Step | Command / line | Read |
+|---|---|---|
+| boot | the M1 lines of §5.8 again, then `PianoWifi80211: accept mode 0x1 (machdep.piano_wifi_a80211 changes it at run time: ...)` and `en2: set 512 INFRA_ENUMERATED len 1 ... -> 0 (...) [accept mode]` | the default mode in effect |
+| mode 0x1, 2 min after the controller's registration | W; A; `sysctl machdep.piano_wifi_a80211` | the control: Interface Name (null) as on wm1, or not |
+| mode 0x3 | `sudo sysctl machdep.piano_wifi_a80211=3`; `sudo launchctl kickstart -k system/com.apple.airportd`; wait 60 s; W; A | the new kinds' lines (`[accept mode]`), Interface Name |
+| mode 0x7 | `=7`, kickstart -k, 60 s, W, A | the same |
+| mode 0xf | `=15`, kickstart -k, 60 s, W, A | the same; VIRTUAL_IF_ROLE `-> 0 [accept mode]` |
+| at the first mode where Interface Name is `en2` | `tmo 50 ./piano-cwscan scan 45`; `tmo 40 system_profiler SPAirPortDataType > /tmp/ap.txt; grep -c 'Security:' /tmp/ap.txt`; webcam the menu bar, open the Wi-Fi menu (`piano-input.py`), photograph it | CoreWLAN's count and the menu's list (counts only) |
+| if no mode changes it | the summary lines (`accept mode 0x.. (N answered by it)`), the full lines of A for each mode | what airportd still lacks: the next step is the IOUserClient bind (§5.7 item 1's selectors), decided on this evidence |
+| the end | console `reset fastboot` | — |
