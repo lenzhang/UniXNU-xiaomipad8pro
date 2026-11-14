@@ -660,7 +660,7 @@ python3 $P abl-final reboot
 - The FD build is not bit-reproducible: v5 is identified by hashes (`out/fd/piano-uefi-A-bundled.fd` = `ce719ffb…`; its `.prev` is
   v4's FD).
 
-## 13. macOS 27.3 only: retiring 27.0.1 (built 2026-11-14; not installed)
+## 13. macOS 27.3 only: retiring 27.0.1 (installed 2026-11-14; the whole-disk layout of 13.8 installed the same day)
 
 Owner decision 2026-11-14: (1) replace the installed dual ESP with a 27.3-only ESP; (2) only after that passes, back up and clear
 `linux_rootfs`, which holds the 27.0.1 system volume and its Data store. `boot_a` (v5, DarwinBoot's 13 GiB window) stays as it is,
