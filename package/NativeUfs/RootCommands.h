@@ -11,6 +11,7 @@ enum : unsigned {
   kUfsPerfSlotCopy,    // memcpy out of the slot's data area (a read that did not qualify for zero copy)
   kUfsPerfCommand,     // one hostRead4k command through the slot's data area, retries included
   kUfsPerfCommandZc,   // one hostRead4k command straight into the caller's buffer (zero copy)
+  kUfsPerfCommandDirect,   // one hostReadPrd command into a window client's physical pages (native-ufs-direct)
   kUfsPerfCommandKinds
 };
 // One command slot (RootTransportLayout.h): its request list entry, command descriptor and data area.
@@ -98,11 +99,15 @@ static constexpr unsigned kMaxPrds = (kUcdStride - kPrdtOffset) / 16;
 static constexpr uint32_t kXferMax = 1U << 20, kPrdMax = 256U << 10;
 static bool gZeroCopy = true;
 
+// UniXNU-piano: dataSynced (native-ufs-direct's reads, hostReadPrd only): the PRDT names physical pages the caller cleans before and
+// invalidates after the command itself (they have no single kernel address), so the data's cache maintenance here is skipped.
 static IOReturn hostIssue (const UfsSlot &slot, uint32_t direction, uint32_t dataBytes, uint32_t timeoutUs, uint64_t *deadline,
-                           uint32_t *ocs, const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr)
+                           uint32_t *ocs, const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr,
+                           bool dataSynced = false)
 {
   *ocs = 15;
-  if (prds > kMaxPrds || (prds && !buffer)) return kIOReturnBadArgument;
+  if (prds > kMaxPrds || (prds && !buffer && !dataSynced) || (dataSynced && (!prds || buffer || direction != 2)))
+    return kIOReturnBadArgument;
   if (!timeoutUs || dataBytes > (prds ? kXferMax : kDataMax) || (dataBytes & 3) ||
       (dataBytes ? (direction != 1 && direction != 2) : direction != 0)) return kIOReturnBadArgument;
   if (gHost.poisoned) return kIOReturnNotReady;
@@ -156,7 +161,7 @@ static IOReturn hostIssue (const UfsSlot &slot, uint32_t direction, uint32_t dat
   }
   if (!gListUncached) cacheCivac (slot.utrd, 32);
   cacheCivac (slot.ucd, kPrdtOffset + 16 * (entries ? entries : 1U));
-  if (dataBytes) {
+  if (dataBytes && !dataSynced) {
     const uint64_t cleanStart = hostPerfNow ();
     cacheCivac (prds ? buffer : slot.data, dataBytes);
     hostPerfSpan (kUfsPerfClean, cleanStart, dataBytes);
@@ -169,7 +174,8 @@ static IOReturn hostIssue (const UfsSlot &slot, uint32_t direction, uint32_t dat
   return kIOReturnSuccess;
 }
 
-static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t deadline, uint32_t *ocs, const void *buffer = nullptr)
+static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t deadline, uint32_t *ocs, const void *buffer = nullptr,
+                           bool dataSynced = false)
 {
   HardwareTransferPort port = { slot, deadline, 0 };
   UfsTransferPoll state;
@@ -190,7 +196,7 @@ static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t dea
     return recordTransport (end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
   }
   cacheInvalidate (slot.ucd, kPrdtOffset);
-  if (dataBytes) {
+  if (dataBytes && !dataSynced) {
     const uint64_t invalidateStart = hostPerfNow ();
     cacheInvalidate (buffer ? buffer : slot.data, dataBytes);
     hostPerfSpan (kUfsPerfInval, invalidateStart, dataBytes);
@@ -274,7 +280,7 @@ static IOReturn hostNop (void)
 // hostScsiAwait waits for it and checks its response; hostScsiDir runs both.
 static IOReturn hostScsiIssue (const UfsSlot &slot, uint8_t lun, const uint8_t *cdb, unsigned cdbLength, unsigned direction,
                                uint32_t dataBytes, uint32_t timeoutUs, uint64_t *deadline, uint32_t *scsiStatus,
-                               const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr)
+                               const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr, bool dataSynced = false)
 {
   *scsiStatus = 0xffff;
   if (!cdb || !cdbLength || cdbLength > 16 || dataBytes > (prds ? kXferMax : kDataMax) || direction > 2 ||
@@ -291,15 +297,15 @@ static IOReturn hostScsiIssue (const UfsSlot &slot, uint8_t lun, const uint8_t *
     ucd[16 + index] = cdb[index];
   }
   uint32_t ocs = 0xf;
-  return hostIssue (slot, direction ? direction : 0U, dataBytes, timeoutUs, deadline, &ocs, prd, prds, buffer);
+  return hostIssue (slot, direction ? direction : 0U, dataBytes, timeoutUs, deadline, &ocs, prd, prds, buffer, dataSynced);
 }
 
 static IOReturn hostScsiAwait (const UfsSlot &slot, uint8_t lun, uint32_t dataBytes, uint64_t deadline, uint32_t *scsiStatus,
-                               const void *buffer = nullptr)
+                               const void *buffer = nullptr, bool dataSynced = false)
 {
   *scsiStatus = 0xffff;
   uint32_t ocs = 0xf;
-  IOReturn status = hostAwait (slot, dataBytes, deadline, &ocs, buffer);
+  IOReturn status = hostAwait (slot, dataBytes, deadline, &ocs, buffer, dataSynced);
   if (status != kIOReturnSuccess) return status;
   const uint8_t tag = static_cast<uint8_t> (slot.entry);
   status = hostResponseHeader (slot, 0x21, lun, tag);
@@ -326,11 +332,13 @@ static IOReturn hostScsiAwait (const UfsSlot &slot, uint8_t lun, uint32_t dataBy
 
 static IOReturn hostScsiDir (const UfsSlot &slot, uint8_t lun, const uint8_t *cdb, unsigned cdbLength, unsigned direction,
                              uint32_t dataBytes, uint32_t timeoutUs, uint32_t *scsiStatus,
-                             const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr)
+                             const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr, bool dataSynced = false)
 {
   uint64_t deadline = 0;
-  IOReturn status = hostScsiIssue (slot, lun, cdb, cdbLength, direction, dataBytes, timeoutUs, &deadline, scsiStatus, prd, prds, buffer);
-  return status != kIOReturnSuccess ? status : hostScsiAwait (slot, lun, dataBytes, deadline, scsiStatus, prds ? buffer : nullptr);
+  IOReturn status = hostScsiIssue (slot, lun, cdb, cdbLength, direction, dataBytes, timeoutUs, &deadline, scsiStatus, prd, prds, buffer,
+                                   dataSynced);
+  return status != kIOReturnSuccess ? status : hostScsiAwait (slot, lun, dataBytes, deadline, scsiStatus, prds ? buffer : nullptr,
+                                                              dataSynced);
 }
 
 // The original read-only entry point: data, when present, always flows device -> host.
@@ -529,6 +537,70 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   }
   hostSlotGive (slot, pooled);
   hostPerfSpan (prds ? kUfsPerfCommandZc : kUfsPerfCommand, commandStart, blocks * 4096U);
+  return status;
+}
+
+// UniXNU-piano, native-ufs-direct=1: a window read DMAs straight into the client's pages. hostPrdsFromSegments builds the PRDT of
+// `bytes` at `offset` of a client buffer from its physical segments (segments(at, &length): the address of byte `at` and how many bytes
+// follow contiguously; 0: none). It qualifies only when every segment starts on a page and every piece is whole pages (so the caller's
+// cache maintenance never shares a line with other data), every address is below `limit` (the stream's reach) and the table fits
+// kMaxPrds entries of at most kPrdMax; 0 otherwise (the caller then reads through its bounce). Adjacent segments merge.
+template <class Segments>
+static unsigned hostPrdsFromSegments (Segments &segments, uint64_t offset, uint64_t bytes, UfsPrd *prd, uint64_t limit)
+{
+  if (!bytes || (bytes & 4095) || bytes > kXferMax) return 0;
+  unsigned count = 0;
+  for (uint64_t at = 0; at < bytes;) {
+    uint64_t length = 0;
+    const uint64_t address = segments (offset + at, &length);
+    if (!address || (address & 4095) || length < 4096) return 0;
+    if (length > bytes - at) length = bytes - at;
+    if ((length & 4095) || address >= limit || limit - address < length) return 0;
+    for (uint64_t done = 0; done < length;) {
+      const uint64_t piece = length - done;
+      if (count && prd[count - 1].addr + prd[count - 1].bytes == address + done && prd[count - 1].bytes < kPrdMax) {
+        const uint64_t room = kPrdMax - prd[count - 1].bytes, take = piece < room ? piece : room;
+        prd[count - 1].bytes += static_cast<uint32_t> (take);
+        done += take;
+      } else {
+        if (count == kMaxPrds) return 0;
+        const uint64_t take = piece < kPrdMax ? piece : kPrdMax;
+        prd[count].addr = address + done;
+        prd[count].bytes = static_cast<uint32_t> (take);
+        ++count;
+        done += take;
+      }
+    }
+    at += length;
+  }
+  return count;
+}
+
+// READ(10) of `blocks` 4096-byte blocks into the physical pages of `prd` (hostPrdsFromSegments): one command, busy retries as
+// hostRead4k. The caller cleans the pages before and invalidates them after (dataSynced); nothing is copied.
+static IOReturn hostReadPrd (uint8_t lun, uint64_t lba, uint32_t blocks, const UfsPrd *prd, unsigned prds)
+{
+  if (!gHost.ready || !prd || !prds || prds > kMaxPrds || !blocks || blocks > kXferMax / 4096 || lba > 0xffffffffULL - (blocks - 1))
+    return kIOReturnBadArgument;
+  uint64_t sum = 0;
+  for (unsigned i = 0; i < prds; ++i) sum += prd[i].bytes;
+  if (sum != uint64_t (blocks) * 4096) return kIOReturnBadArgument;
+  bool pooled;
+  const uint64_t takeStart = hostPerfNow ();
+  const UfsSlot slot = hostSlotTake (&pooled);
+  hostPerfSpan (kUfsPerfTake, takeStart, 0);
+  const uint64_t commandStart = hostPerfNow ();
+  gRootDiagnostic.lba = lba;
+  uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
+                      0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
+  uint32_t scsi = 0;
+  IOReturn status;
+  for (unsigned attempt = 0;; ++attempt) {
+    status = hostScsiDir (slot, lun, cdb, 10, 2, blocks * 4096U, 1000000, &scsi, prd, prds, nullptr, true);
+    if (!hostRetryable (status, scsi, attempt)) break;
+  }
+  hostSlotGive (slot, pooled);
+  hostPerfSpan (kUfsPerfCommandDirect, commandStart, blocks * 4096U);
   return status;
 }
 

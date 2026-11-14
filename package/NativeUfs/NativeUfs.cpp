@@ -1129,8 +1129,12 @@ static uint32_t gSpinTicksUs = ~0U;
 //                            size their reads to it. Absent: no property, as before. Read side only.
 //   native-ufs-nap=US        a read worker whose command has run longer than native-ufs-nap-spin=US (default 30) sleeps US
 //                            microseconds between polls (1..1000) instead of spinning. Only the workers; every other caller spins.
-//   native-ufs-fast=1        async 8, bounce 1024, maxio 1024, nap 25 (each explicit switch above wins).
-static bool gPerf = false;
+//   native-ufs-direct=1      a window read whose start and length are whole device blocks and whose buffer is whole, reachable pages is
+//                            read by DMA straight into those pages (one command per 1 MiB, the pages cleaned before and invalidated
+//                            after by physical address), no bounce and no copy; any other read goes through a bounce as before.
+//                            Development (unverified) builds only: a verified window must check a snapshot the client cannot touch.
+//   native-ufs-fast=1        async 8, bounce 1024, maxio 1024, nap 25 (each explicit switch above wins; not direct).
+static bool gPerf = false, gDirect = false;
 static unsigned gReadWorkers = 0;
 static uint32_t gBounceBytes = kDataMax, gMaxIoBytes = 0, gNapUs = 0, gNapSpinUs = 30;
 static uint64_t gNapSpinTicks = 0;
@@ -1145,7 +1149,8 @@ static bool hostIsReadWorker (void)
 
 // native-ufs-perf=1: sums of spans (count, time, bytes, longest) per kind, the request size histogram, and the time-weighted depth of
 // the requests in the windows and of the commands on the device (from which the busy share of each second).
-enum : unsigned { kUfsPerfRequest = kUfsPerfCommandKinds, kUfsPerfQueue, kUfsPerfCopy, kUfsPerfBounceWait, kUfsPerfKinds };
+enum : unsigned { kUfsPerfRequest = kUfsPerfCommandKinds, kUfsPerfQueue, kUfsPerfCopy, kUfsPerfBounceWait, kUfsPerfDirect, kUfsPerfFlush,
+                  kUfsPerfKinds };
 struct UfsPerfSum { uint64_t count, ticks, bytes, maxTicks; };
 static UfsPerfSum gPerfSum[kUfsPerfKinds];
 static constexpr unsigned kPerfSizeBuckets = 10;   // <=4K, 8K, 16K, 32K, 64K, 128K, 256K, 512K, 1M, more
@@ -1235,6 +1240,21 @@ static uint64_t hostDmaAddress (const void *va)
 {
   const uint64_t address = ml_vtophys (reinterpret_cast<vm_offset_t> (va));
   return address && address < gDmaLimit && gDmaLimit - address >= 4096 ? address : 0;
+}
+// native-ufs-direct: clean and invalidate physical pages to the point of coherency (the kernel's own routine for incoherent I/O, by the
+// physical aperture or a CPU window per page). `remaining` 0 always: a larger one would let it flush the whole cache by set/way.
+extern "C" void dcache_incoherent_io_flush64 (addr64_t pa, unsigned int count, unsigned int remaining, unsigned int *res);
+static void hostFlushPhys (const UfsPrd *prd, unsigned prds)
+{
+  const uint64_t start = hostPerfNow ();
+  uint64_t bytes = 0;
+  for (unsigned i = 0; i < prds; ++i) {
+    unsigned int result = 0;
+    dcache_incoherent_io_flush64 (prd[i].addr, prd[i].bytes, 0, &result);
+    bytes += prd[i].bytes;
+  }
+  __asm__ volatile ("dsb sy" ::: "memory");
+  hostPerfSpan (kUfsPerfFlush, start, bytes);
 }
 extern "C" void native_ufs_set_zero_copy (int on) { gZeroCopy = on != 0; }
 extern "C" void native_ufs_set_spin (uint32_t us) { gSpinUs = us; }
@@ -2143,6 +2163,8 @@ public:
   IOReturn doAsyncReadWrite (IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *) override;
   // One window read, start to completion (the caller's thread, or a read worker with native-ufs-async).
   void serveRead (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, IOStorageCompletion completion, uint64_t requestStart);
+  // native-ufs-direct: the read straight into the buffer's pages; false (nothing read) when it does not qualify.
+  bool readDirect (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, UfsWindowResult *outcome);
 };
 OSDefineMetaClassAndStructors (NativeUfsBlock, IOBlockStorageDevice)
 
@@ -2628,9 +2650,12 @@ void NativeUfsBlock::serveRead (IOMemoryDescriptor *buffer, UInt64 block, UInt64
     , &verified
 #endif
   };
-  const unsigned bounceIndex = takeBounce ();
-  UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounces[bounceIndex], bounceBytes[bounceIndex]);
-  giveBounce (bounceIndex);
+  UfsWindowResult outcome;
+  if (!gDirect || !readDirect (buffer, block, count, &outcome)) {
+    const unsigned bounceIndex = takeBounce ();
+    outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounces[bounceIndex], bounceBytes[bounceIndex]);
+    giveBounce (bounceIndex);
+  }
   IOReturn result = outcome.status;
   uint64_t done = outcome.done;
   if (result != kIOReturnSuccess) {
@@ -2643,6 +2668,62 @@ void NativeUfsBlock::serveRead (IOMemoryDescriptor *buffer, UInt64 block, UInt64
     perfDepth (gPerfRequests, -1);
   }
   completion.action (completion.target, completion.parameter, result, done);
+}
+
+// native-ufs-direct=1 (UniXNU-piano, 2026-11-14): the request's device blocks DMA'd into the client's own pages. The buffer is prepared
+// (wired) for the read and completed after it; the whole request is checked before the first command (whole device blocks, every
+// segment page aligned, whole pages, within the stream's reach, at most kMaxPrds entries per 1 MiB), so a request either goes
+// entirely this way or entirely through a bounce. Each command's pages are cleaned and invalidated before it and invalidated after it
+// (nothing writes them meanwhile: a read is in flight into them). A command that leaves the host quarantined (timeout, fatal status)
+// keeps the buffer prepared: the controller may still own its pages.
+bool NativeUfsBlock::readDirect (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, UfsWindowResult *outcome)
+{
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  (void) buffer; (void) block; (void) count; (void) outcome;
+  return false;
+#else
+  const uint64_t start = absolute + block * 512, length = count * 512;
+  if (((start | length) & 4095) || !gDmaLimit) return false;
+  if (buffer->prepare (kIODirectionIn) != kIOReturnSuccess) return false;
+  struct Segments {
+    IOMemoryDescriptor *buffer;
+    uint64_t operator() (uint64_t at, uint64_t *length) {
+      IOByteCount segment = 0;
+      const addr64_t address = buffer->getPhysicalSegment (at, &segment, kIOMemoryMapperNone);
+      *length = segment;
+      return address;
+    }
+  } segments = { buffer };
+  UfsPrd prd[kMaxPrds];
+  for (uint64_t at = 0; at < length; at += kXferMax) {
+    const uint64_t piece = length - at < kXferMax ? length - at : kXferMax;
+    if (!hostPrdsFromSegments (segments, at, piece, prd, gDmaLimit)) {
+      buffer->complete (kIODirectionIn);
+      return false;
+    }
+  }
+  const uint64_t directStart = hostPerfNow ();
+  UfsWindowResult result = { kIOReturnSuccess, 0 };
+  for (uint64_t at = 0; at < length; at += kXferMax) {
+    const uint64_t piece = length - at < kXferMax ? length - at : kXferMax;
+    const unsigned prds = hostPrdsFromSegments (segments, at, piece, prd, gDmaLimit);
+    if (!prds) { result.status = kIOReturnIOError; break; }   // checked above; the buffer is wired and cannot change
+    hostFlushPhys (prd, prds);
+    const uint64_t t0 = timerTicks ();
+    result.status = hostReadPrd (0, (start + at) / 4096, static_cast<uint32_t> (piece / 4096), prd, prds);
+    __atomic_fetch_add (&native_ufs_read_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
+    if (gHost.poisoned) break;   // the controller may still own the pages: no CPU access, buffer left prepared
+    hostFlushPhys (prd, prds);
+    if (result.status != kIOReturnSuccess) break;
+    result.done += piece;
+    __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add (&native_ufs_bytes_read, piece, __ATOMIC_RELAXED);
+  }
+  if (!gHost.poisoned) buffer->complete (kIODirectionIn);
+  hostPerfSpan (kUfsPerfDirect, directStart, result.done);
+  *outcome = result;
+  return true;
+#endif
 }
 
 // Development build: 512-byte sectors written onto 4 KiB UFS blocks; partial blocks at the edges are read first.
@@ -2903,26 +2984,27 @@ static void perfLines (unsigned second, uint64_t windowTicks, bool print)
   const UfsPerfSum req = perfTake (kUfsPerfRequest), queue = perfTake (kUfsPerfQueue), copy = perfTake (kUfsPerfCopy),
                    bounce = perfTake (kUfsPerfBounceWait), take = perfTake (kUfsPerfTake), clean = perfTake (kUfsPerfClean),
                    dev = perfTake (kUfsPerfDevice), inval = perfTake (kUfsPerfInval), slotCopy = perfTake (kUfsPerfSlotCopy),
-                   cmdSlot = perfTake (kUfsPerfCommand), cmdZc = perfTake (kUfsPerfCommandZc);
+                   cmdSlot = perfTake (kUfsPerfCommand), cmdZc = perfTake (kUfsPerfCommandZc),
+                   cmdDirect = perfTake (kUfsPerfCommandDirect), direct = perfTake (kUfsPerfDirect), flush = perfTake (kUfsPerfFlush);
   uint64_t size[kPerfSizeBuckets];
   for (unsigned i = 0; i < kPerfSizeBuckets; ++i) size[i] = __atomic_exchange_n (&gPerfSize[i], 0, __ATOMIC_RELAXED);
   const uint64_t unaligned = __atomic_exchange_n (&gPerfUnaligned, 0, __ATOMIC_RELAXED);
   const UfsPerfDepth rq = perfDepthTake (gPerfRequests, now), cq = perfDepthTake (gPerfCommands, now);
   const uint64_t rqx10 = rq.area * 10 / windowTicks, cqx10 = cq.area * 10 / windowTicks;
   const uint64_t busyUs = perfMicros (cq.busy);
-  const uint64_t cmds = cmdSlot.count + cmdZc.count, cmdBytes = cmdSlot.bytes + cmdZc.bytes;
-  const uint64_t cmdAvg = cmds ? perfMicros (cmdSlot.ticks + cmdZc.ticks) / cmds : 0;
+  const uint64_t cmds = cmdSlot.count + cmdZc.count + cmdDirect.count, cmdBytes = cmdSlot.bytes + cmdZc.bytes + cmdDirect.bytes;
+  const uint64_t cmdAvg = cmds ? perfMicros (cmdSlot.ticks + cmdZc.ticks + cmdDirect.ticks) / cmds : 0;
   if (!print) return;
   IOLog ("NativeUfs: perf %u s: req %llu (%llu KiB) avg %llu us max %llu us, queue %llu us, copy %llu us/MiB; qd %llu.%llu max %u busy "
-         "%llu%%; sizes %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu, unaligned %llu, bounce waits %llu\n",
+         "%llu%%; sizes %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu, unaligned %llu, bounce waits %llu, direct %llu\n",
          second, req.count, req.bytes >> 10, perfAvg (req), perfMicros (req.maxTicks), perfAvg (queue), perfPerMiB (copy),
          rqx10 / 10, rqx10 % 10, rq.max, rq.busy * 100 / windowTicks, size[0], size[1], size[2], size[3], size[4], size[5], size[6],
-         size[7], size[8], size[9], unaligned, bounce.count);
-  IOLog ("NativeUfs: perf %u s: cmd %llu zc + %llu slot (%llu KiB) avg %llu us; dev avg %llu us max %llu us, %llu MB/s busy; clean %llu "
-         "inval %llu slotcopy %llu us/MiB; take %llu us; qd %llu.%llu max %u busy %llu%%\n",
-         second, cmdZc.count, cmdSlot.count, cmdBytes >> 10, cmdAvg, perfAvg (dev), perfMicros (dev.maxTicks),
-         busyUs ? dev.bytes / busyUs : 0, perfPerMiB (clean), perfPerMiB (inval), perfPerMiB (slotCopy), perfAvg (take), cqx10 / 10,
-         cqx10 % 10, cq.max, cq.busy * 100 / windowTicks);
+         size[7], size[8], size[9], unaligned, bounce.count, direct.count);
+  IOLog ("NativeUfs: perf %u s: cmd %llu zc + %llu slot + %llu direct (%llu KiB) avg %llu us; dev avg %llu us max %llu us, %llu MB/s "
+         "busy; clean %llu inval %llu slotcopy %llu flush %llu us/MiB; take %llu us; qd %llu.%llu max %u busy %llu%%\n",
+         second, cmdZc.count, cmdSlot.count, cmdDirect.count, cmdBytes >> 10, cmdAvg, perfAvg (dev), perfMicros (dev.maxTicks),
+         busyUs ? dev.bytes / busyUs : 0, perfPerMiB (clean), perfPerMiB (inval), perfPerMiB (slotCopy), perfPerMiB (flush),
+         perfAvg (take), cqx10 / 10, cqx10 % 10, cq.max, cq.busy * 100 / windowTicks);
 }
 
 // native-ufs-perf=1, once after the bring-up (no command is in flight then): the link as the boot firmware left it (UniPro PA
@@ -3187,7 +3269,7 @@ bool NativeUfs::start (IOService *provider)
   }
   // UniXNU-piano: the read path switches (all off by default: the read path as before); see "Read path switches" above.
   {
-    uint32_t fast = 0, perf = 0, workers = 0, bounceKiB = 0, maxioKiB = 0, nap = 0, napSpin = 30;
+    uint32_t fast = 0, perf = 0, workers = 0, bounceKiB = 0, maxioKiB = 0, nap = 0, napSpin = 30, direct = 0;
     PE_parse_boot_argn ("native-ufs-fast", &fast, sizeof (fast));
     fast = fast == 1;
     if (fast) { workers = 8; bounceKiB = 1024; maxioKiB = 1024; nap = 25; }
@@ -3197,6 +3279,10 @@ bool NativeUfs::start (IOService *provider)
     PE_parse_boot_argn ("native-ufs-maxio", &maxioKiB, sizeof (maxioKiB));
     PE_parse_boot_argn ("native-ufs-nap", &nap, sizeof (nap));
     PE_parse_boot_argn ("native-ufs-nap-spin", &napSpin, sizeof (napSpin));
+    PE_parse_boot_argn ("native-ufs-direct", &direct, sizeof (direct));
+#if !(defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK)
+    gDirect = direct == 1;
+#endif
     gPerf = perf == 1;
     if (gPerf && !(gPerfLock = IOSimpleLockAlloc ())) gPerf = false;
     if (workers > 16) workers = 16;
@@ -3206,9 +3292,10 @@ bool NativeUfs::start (IOService *provider)
     nanoseconds_to_absolutetime (uint64_t (gNapSpinUs) * 1000, &gNapSpinTicks);
     gReadWorkers = readWorkersStart (workers);
     gNapUs = gReadWorkers && nap >= 1 && nap <= 1000 ? nap : 0;
-    if (fast || gPerf || workers || gBounceBytes != kDataMax || gMaxIoBytes || gNapUs)
-      IOLog ("NativeUfs: read path: fast %u, async %u of %u workers, bounce %u KiB, maxio %u KiB, nap %u us after %u us, perf %u\n", fast,
-             gReadWorkers, workers, gBounceBytes >> 10, gMaxIoBytes >> 10, gNapUs, gNapSpinUs, gPerf ? 1 : 0);
+    if (fast || gPerf || workers || gBounceBytes != kDataMax || gMaxIoBytes || gNapUs || gDirect)
+      IOLog ("NativeUfs: read path: fast %u, async %u of %u workers, bounce %u KiB, maxio %u KiB, nap %u us after %u us, direct %u, "
+             "perf %u\n", fast, gReadWorkers, workers, gBounceBytes >> 10, gMaxIoBytes >> 10, gNapUs, gNapSpinUs, gDirect ? 1 : 0,
+             gPerf ? 1 : 0);
   }
   unsigned iolog = 0;
   if ((PE_parse_boot_argn ("native-ufs-iolog", &iolog, sizeof (iolog)) && iolog) || (gPerf && (iolog = 120))) {
