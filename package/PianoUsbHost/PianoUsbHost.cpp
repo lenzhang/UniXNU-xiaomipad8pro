@@ -27,7 +27,10 @@
 //                    over SPI 133 or polled) through the codeless personality of tooling/k27/kext/PianoUsbHostStack.json, with the
 //                    stream 0x40 identity-mapped write-back (SmmuIdentity.h) for coherency; the host stack's resource gate
 //                    PianoUsbHostStack published first (the stack is linked only with PIANO_USBHOST_STACK=1, and its
-//                    IOResources personalities wait for that gate). No subclass, no vtable fixture (A2 is the owner's decision).
+//                    IOResources personalities wait for that gate). With piano-usbhost-a2=1 the client is **our own**
+//                    PianoXhciHost instead (path A2: package/PianoXhciHost, three overrides of the collection's AppleUSBXHCI -
+//                    always-on power, and the 64-bit register read/write pair a DWC3 needs; linked with PIANO_USBHOST_A2=1,
+//                    whose collection has no A1 personality, so only one client can ever match the nub).
 // Levels 5 and 6 refuse while PianoDwc3 owns the controller (piano-usb >= 2), except level 5 with piano-usbhost-back=S and a
 // piano-usb-delay that starts PianoDwc3's takeover at least 30 s after the host session ends (a hand-off by time, no PianoDwc3 code).
 // Other arguments: piano-usbhost-delay=S (wait first, default 0), piano-usbhost-xhci=0|1|2 (default 1; 2 walks the xHCI registers
@@ -37,7 +40,8 @@
 // piano-usbhost-back=S (0: stay in host mode), -csr=0|1|2 (GCTL soft reset: never, always, Linux's rule; default 2), -utmi=0|1
 // (default 1), -reset=0|1 (a connected USB 2 port reset, default 0), -smmu=0|1|2 (none, bypass, identity; default 1 at level 5,
 // 2 at level 6), -slots=N (default 8); level 6: -attach=0|1|2 (nub only, the personality, a direct allocation; default 1),
-// -irq=0|1 (polled, SPI 133; default 1), -probe=0|1 (our No-Op probe before Apple's driver, default 1).
+// -irq=0|1 (polled, SPI 133; default 1), -probe=0|1 (our No-Op probe before Apple's driver, default 1), -a2=0|1 (default 0:
+// Apple's class itself; 1: our PianoXhciHost subclass, which needs a PIANO_USBHOST_A2=1 collection).
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -77,7 +81,7 @@ namespace {
 
 struct Args {
   uint32_t level, delay, xhci, qmp, spmi, watch, period;
-  uint32_t back, csr, utmi, reset, smmu, slots, attach, irq, probe;   // levels 5 and 6
+  uint32_t back, csr, utmi, reset, smmu, slots, attach, irq, probe, a2;   // levels 5 and 6 (a2: our own subclass, path A2)
   uint32_t handoff, debounce, uor;                                    // levels 3 and 4
 };
 Args gArgs;
@@ -118,6 +122,9 @@ void readArgs()
   if (gArgs.attach > 2) gArgs.attach = 1;
   gArgs.irq = bootArg("piano-usbhost-irq", 1) != 0;
   gArgs.probe = bootArg("piano-usbhost-probe", 1) != 0;
+  // piano-usbhost-a2=1 (level 6): the controller class is our own PianoXhciHost (path A2: three overrides of the collection's
+  // AppleUSBXHCI, docs/drivers/usb-host.md §5.4), linked only into a PIANO_USBHOST_A2=1 collection. 0: Apple's class itself (A1).
+  gArgs.a2 = bootArg("piano-usbhost-a2", 0) != 0;
   gArgs.handoff = bootArg("piano-usbhost-handoff", 0);   // levels 3/4: 0 the decision only, 5 host with our probe, 6 with Apple's xHCI
   if (gArgs.handoff != 5 && gArgs.handoff != 6) gArgs.handoff = 0;
   gArgs.debounce = bootArg("piano-usbhost-debounce", 1000);
@@ -1014,33 +1021,43 @@ unsigned usbDevices(uint32_t *vidPid)
   return count;
 }
 
-// AppleUSBXHCI's kext and class: loaded on demand (its libraries: IOUSBHostFamily, IOAccessoryManager, IOPortFamily, ...).
-bool appleXhciPresent()
+// The controller class level 6 attaches to the nub: Apple's own (path A1) or our three-override subclass (path A2,
+// piano-usbhost-a2=1; docs/drivers/usb-host.md §5.4), each with the kext that defines it.
+const char *controllerClass() { return gArgs.a2 ? "PianoXhciHost" : "AppleUSBXHCI"; }
+const char *controllerKext() { return gArgs.a2 ? "com.unixnu.driver.PianoXhciHost" : "com.apple.driver.usb.AppleUSBXHCI"; }
+
+// The controller class's kext and metaclass: Apple's is loaded on demand (its libraries: IOUSBHostFamily, IOAccessoryManager,
+// IOPortFamily, ...); ours is in the collection and loaded at boot (it names those libraries itself), so the load is a no-op.
+bool controllerClassPresent()
 {
-  const OSReturn loaded = OSKextLoadKextWithIdentifier("com.apple.driver.usb.AppleUSBXHCI");
-  const OSSymbol *name = OSSymbol::withCString("AppleUSBXHCI");
+  const OSReturn loaded = OSKextLoadKextWithIdentifier(controllerKext());
+  const OSSymbol *name = OSSymbol::withCString(controllerClass());
   const OSMetaClass *meta = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
   if (name) name->release();
-  note("AppleUSBXHCI: kext load %#x, class %s (instance size %u)%s", loaded, meta ? "registered" : "NOT registered",
-       meta ? meta->getClassSize() : 0, meta ? "" : ": the host stack is not in this kernel collection (PIANO_USBHOST_STACK=1)");
+  note("%s: kext load %#x, class %s (instance size %u)%s", controllerClass(), loaded, meta ? "registered" : "NOT registered",
+       meta ? meta->getClassSize() : 0,
+       meta ? (gArgs.a2 ? " (path A2: our subclass of the collection's AppleUSBXHCI; 3976 = 0xf88 is the original's size)" : "")
+            : (gArgs.a2 ? ": this collection has no PianoXhciHost (PIANO_USBHOST_A2=1 links it)"
+                        : ": the host stack is not in this kernel collection (PIANO_USBHOST_STACK=1)"));
   return meta != nullptr;
 }
 
 // piano-usbhost-attach=2: the class by name, as QcomDwc3 starts its subclass (init, attach, start), without one.
 IOService *attachDirect(PianoUsbHostNub *nub)
 {
-  OSObject *object = OSMetaClass::allocClassWithName("AppleUSBXHCI");
+  OSObject *object = OSMetaClass::allocClassWithName(controllerClass());
   IOService *driver = OSDynamicCast(IOService, object);
   if (!driver) {
-    note("attach: allocClassWithName(AppleUSBXHCI) gave %s: an abstract class? (A1 cannot work then; A2 is the owner's decision)",
-         object ? "no IOService" : "nothing");
+    note("attach: allocClassWithName(%s) gave %s: an abstract class?%s", controllerClass(), object ? "no IOService" : "nothing",
+         gArgs.a2 ? " (our own subclass is concrete: a missing class means it is not in this collection)"
+                  : " (A1 cannot work then; path A2 gives a concrete subclass: piano-usbhost-a2=1)");
     OSSafeReleaseNULL(object);
     return nullptr;
   }
   OSDictionary *table = OSDictionary::withCapacity(4);
   if (table) {
-    const char *const pairs[3][2] = {{"IOClass", "AppleUSBXHCI"}, {"IOProviderClass", "PianoUsbHostNub"},
-                                     {"CFBundleIdentifier", "com.apple.driver.usb.AppleUSBXHCI"}};
+    const char *const pairs[3][2] = {{"IOClass", controllerClass()}, {"IOProviderClass", "PianoUsbHostNub"},
+                                     {"CFBundleIdentifier", controllerKext()}};
     for (const auto &pair : pairs) {
       const OSSymbol *value = OSSymbol::withCStringNoCopy(pair[1]);
       if (value) {
@@ -1056,7 +1073,7 @@ IOService *attachDirect(PianoUsbHostNub *nub)
     started = driver->start(nub);
     if (!started) driver->detach(nub);
   }
-  note("attach: AppleUSBXHCI allocated (%u bytes), init %u, start %s", driver->getMetaClass()->getClassSize(), initialised,
+  note("attach: %s allocated (%u bytes), init %u, start %s", controllerClass(), driver->getMetaClass()->getClassSize(), initialised,
        started ? "true" : "FALSE");
   if (!started) {
     driver->release();
@@ -1116,7 +1133,7 @@ void appleUp()
   const OSObject *cable = IOService::getResourceService()->getProperty("AppleUSBCableType");
   const OSString *cableName = OSDynamicCast(OSString, cable);   // an OSSymbol too
   note("stack: resource AppleUSBCableType %s", cableName ? cableName->getCStringNoCopy() : cable ? "(not a string)" : "(none)");
-  const bool present = appleXhciPresent();
+  const bool present = controllerClassPresent();
   stage(31, "PianoUsbHostNub: usb-host0, the core's first 32 KiB, bus-number 0, interrupt source 0");
   gNubIrq.polled = !gArgs.irq;
   gNub = makeNub();
@@ -1126,12 +1143,16 @@ void appleUp()
   }
   note("nub: %s attached to the platform expert (memory %#llx + %#x, interrupt 0 = %s)", gNub->getName(), (unsigned long long)kXhci,
        kXhciBytes, gArgs.irq ? "SPI 133 through ArmCpu" : "polled (piano-usbhost-irq=0)");
-  stage(32, gArgs.attach == 1 ? "AppleUSBXHCI through the codeless personality (registerService)" :
-            gArgs.attach == 2 ? "AppleUSBXHCI allocated by name, init/attach/start (no personality)" : "nub only (piano-usbhost-attach=0)");
+  char what[120] = "nub only (piano-usbhost-attach=0)";
+  if (gArgs.attach == 1)
+    snprintf(what, sizeof what, "%s through its personality (registerService)", controllerClass());
+  else if (gArgs.attach == 2)
+    snprintf(what, sizeof what, "%s allocated by name, init/attach/start (no personality)", controllerClass());
+  stage(32, what);
   if (gArgs.attach == 0) {
     note("attach: none (piano-usbhost-attach=0): the nub is not registered");
   } else if (!present) {
-    note("attach: skipped: no AppleUSBXHCI class");
+    note("attach: skipped: no %s class", controllerClass());
   } else if (gArgs.attach == 2) {
     gAppleXhci = attachDirect(gNub);
   } else {
@@ -1237,15 +1258,17 @@ void hostSession(char *line, size_t size)
     probe = xhciProbe(pr) ? "PASS" : pr.running ? "FAIL" : "not reached";
     if (pr.running) {
       const StopResult st = xhciStop(gHal, pr.x);
-      note("xHCI stop before Apple's driver: halted and reset: USBSTS %08x: %s", st.usbsts, st.ok ? "ok" : st.why);
+      note("xHCI stop before %s: halted and reset: USBSTS %08x: %s", gArgs.a2 ? "our subclass of Apple's driver" : "Apple's driver",
+           st.usbsts, st.ok ? "ok" : st.why);
     }
   }
   appleStack(x, session);
   uint32_t vidPid = 0;
   const unsigned devices = usbDevices(&vidPid);
-  snprintf(line, size, "switch ok | probe %s | nub %s | AppleUSBXHCI %s | USB devices %u (last %04x:%04x) | interrupt %s | %s", probe,
-           gNub ? "up" : "none", gAppleXhci ? "attached" : "not attached", devices, vidPid >> 16, vidPid & 0xffff,
-           gNubIrq.polled ? "polled" : gNubIrq.line.up ? "SPI 133" : "-", gArgs.back ? "back to device" : "host kept");
+  snprintf(line, size, "switch ok | probe %s | nub %s | %s %s | USB devices %u (last %04x:%04x) | interrupt %s | %s", probe,
+           gNub ? "up" : "none", controllerClass(), gAppleXhci ? "attached" : "not attached", devices, vidPid >> 16,
+           vidPid & 0xffff, gNubIrq.polled ? "polled" : gNubIrq.line.up ? "SPI 133" : "-",
+           gArgs.back ? "back to device" : "host kept");
   if (gArgs.back) {
     appleDown(x);
     hostEnd(nullptr, sw, true);
@@ -1793,9 +1816,14 @@ bool PianoUsbHost::start(IOService *provider)
   } else {
     note("level %u: %s; back=%u csr=%u utmi=%u reset=%u smmu=%u slots=%u%s", gArgs.level,
          gArgs.level == 5 ? "host mode with our own xHCI probe (writes the core, its glue and the xHCI; polled)"
-                          : "host mode with Apple's AppleUSBXHCI on PianoUsbHostNub (path A1: no subclass)",
+                          : gArgs.a2 ? "host mode with our PianoXhciHost on PianoUsbHostNub (path A2: three overrides of the "
+                                       "collection's AppleUSBXHCI)"
+                                     : "host mode with Apple's AppleUSBXHCI on PianoUsbHostNub (path A1: no subclass)",
          gArgs.back, gArgs.csr, gArgs.utmi, gArgs.reset, gArgs.smmu, gArgs.slots, gArgs.level == 6 ? "" : "");
-    if (gArgs.level == 6) note("level 6: attach=%u irq=%u probe=%u", gArgs.attach, gArgs.irq, gArgs.probe);
+    if (gArgs.level == 6)
+      note("level 6: attach=%u irq=%u probe=%u a2=%u (%s)", gArgs.attach, gArgs.irq, gArgs.probe, gArgs.a2,
+           gArgs.a2 ? "our own subclass: slot 292 power on, slot 419 read64 low-high, slot 421 write64 high-low"
+                    : "Apple's class itself, whose 64-bit write reaches a 4-byte helper in this collection");
     if (gArgs.smmu) {
       stage(9, gArgs.smmu == 2 ? "SMMU: stream 0x40 through an identity-mapped write-back context bank" : "SMMU: stream 0x40 through a bypass bank");
       if (!smmuSetup(gArgs.smmu)) {

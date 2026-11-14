@@ -1,0 +1,36 @@
+PianoXhciHost is new code for UniXNU-piano (BSD-2-Clause-Patent, LICENSE): the three-override subclass of the kernel
+collection's generic Apple xHCI driver that PianoUsbHost's nub needs (path A2, docs/drivers/usb-host.md §5.4). What it takes
+from other work, and from where:
+
+UniXNU-piano (this repository), BSD-2-Clause-Patent:
+  package/PianoUsbHost/XhciHost.h: the 64-bit register order (wr64 high half first, rd64 low half first) and its reasoning;
+    Reg64.h is the same rule written for Apple's accessor shape (a base pointer and an offset) and host-tested on its own.
+  package/PianoUsbHostStandIn/PianoUsbHostStandIn.cpp: the shape of a kext that exists only in the USB-host-stack build.
+  data/usb-xhci/abi-26C5035r-mac17j.json: the ABI data the generated declarations come from (its own provenance:
+    data/usb-xhci/README.md).
+
+QcomDwc3 (unixnu-research/QcomDwc3, main e4efe95c903a737e0f5955e5b50a8fb4d2a7d718; BSD-2-Clause-Patent). QcomDwc3.cpp
+(sha256 4b29c0aa6ed893c9b11b1c129795a2c1ddd9bf44e39ad79e2294de61113250f2) has the same idea for SM8550 on iPadOS 27: a
+subclass of the original AppleUSBXHCI with exactly three overrides (always-on desired power; the hi-lo 64-bit accessors).
+Its `QcomDwc3Xhci` was read as the **design decision** - which three slots, and why each one - and the reasoning is recorded
+in PianoXhciHost.cpp's comments; the code here is written anew against our own generated declarations, with our own register
+model, our own logging and our own build gates. Its PHY headers (GPL-2.0-only) were not read.
+
+UniXNU-sheng (unixnu-research/UniXNU-sheng, main 00ba90984e831e4c6ce30ec3d8a56e6434e9f1af; BSD-2-Clause-Patent): the
+reviewed ABI fixture of this exact kernel collection (scripts/usb-xhci-26C5035r.json, sha256
+c6d7ad3855b213b794b11f5a6efc4922cc957cf6285e000ad69dac7ab661946b) is the source of the slot roles, the synthetic declaration
+names and the original bindings in our data file (data/usb-xhci/README.md records the match of the collection SHA-256 and our
+own re-derivation). Two build-time ideas are theirs, implemented anew in tooling/k27/xhci-abi.py: generating the opaque
+base-class declarations from such a fixture, and checking the compiled object's vtable slot by slot against the collection
+(every entry's PAC diversity, the instance size) before linking; and binding a fabricated declaration name to the
+collection's symbol with a `bti c` + branch thunk (theirs over absolute addresses; ours are resolved by name by the
+collection builder).
+
+The macOS 27.3 (26C5035r) mac17j kernel collection: only the vtable slot numbers, PAC diversities, symbol names and the
+instance size of one class, through our data file. No Apple code was copied, no Apple binary or payload is in this
+repository, and the generated header (OriginalUsbXhciABI.h, opaque storage plus declarations) is a build output under
+out/native-kexts/PianoXhciHost, never committed. The offline analysis that established the layout, and the owner's approval
+of it (2026-11-14), are in private/host-checks/20261114-xhci/REPORT.md (local only).
+
+Specifications only: Linux (GPL-2.0) drivers/usb/host/xhci-plat.c and drivers/usb/dwc3/host.c for the
+`write-64-hi-lo-quirk` fact (every DWC3 host carries it), cited as behaviour; nothing pasted.

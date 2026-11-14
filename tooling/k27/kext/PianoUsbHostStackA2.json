@@ -1,0 +1,32 @@
+{
+  "name": "PianoUsbHostStackA2",
+  "bundle": "com.unixnu.driver.PianoUsbHostStackA2",
+  "version": "1.0.0",
+  "libraries": {
+    "com.apple.driver.usb.AppleUSBXHCI": "1.2",
+    "com.apple.iokit.IOUSBHostFamily": "1.2",
+    "com.apple.driver.usb.AppleUSBHub": "1.2",
+    "com.apple.driver.usb.AppleUSBHostCompositeDevice": "1.2",
+    "com.apple.driver.usb.IOUSBHostHIDDevice": "1.2",
+    "com.apple.iokit.IOUSBMassStorageDriver": "283",
+    "com.apple.driver.usb.cdc.ncm": "5.0.0",
+    "com.apple.driver.usb.cdc.ecm": "5.0.0",
+    "com.apple.driver.usb.ethernet.asix": "5.0.0"
+  },
+  "personalities": {},
+  "patch_personalities": {
+    "com.apple.iokit.IOUSBHostFamily": {
+      "AppleUSBHostResources": {
+        "IOResourceMatch": "PianoUsbHostStack"
+      },
+      "AppleUSBHostResourcesTypeC": {
+        "IOResourceMatch": "PianoUsbHostStack"
+      }
+    },
+    "com.apple.iokit.IOUSBMassStorageDriver": {
+      "IOUSBMassStorageResource": {
+        "IOResourceMatch": "PianoUsbHostStack"
+      }
+    }
+  }
+}

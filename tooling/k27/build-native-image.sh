@@ -17,17 +17,29 @@ BASE_TRUST=${PIANO_BASE_TRUST:-out/inputs/kernel.macho.trustcache}
 # (485 KiB) after PianoA830 (it links first: PianoTouch imports its lock word) with first-fit placement, so PIANO_USBHOST_STACK_DROP
 # (default PianoTouch: inert without piano-touch=N) is left out; with patches/k27-kc/0001 in the k27 tree's KC builder (best-fit
 # placement, docs/kc-space.md) it fits, and the default is to drop nothing. Checked after the link: tooling/k27/check-usbhost-stack.py.
+# PIANO_USBHOST_A2=1 (docs/drivers/usb-host.md §5.4, path A2) implies the stack and replaces A1's codeless personality with our own
+# subclass PianoXhciHost (three overrides of the collection's AppleUSBXHCI; it carries the stack's libraries and the gate, so the
+# codeless bundle loses its personality: PianoUsbHostStackA2). Exactly one automatic client on the nub either way
+# (check-usbhost-stack.py refuses two). The A2 subclass is matched by piano-usbhost=6 piano-usbhost-a2=1.
+if [ "${PIANO_USBHOST_A2:-0}" = 1 ]; then
+  export PIANO_USBHOST_A2
+  PIANO_USBHOST_STACK=1
+fi
 if [ "${PIANO_USBHOST_STACK:-0}" = 1 ]; then
   export PIANO_USBHOST_STACK
   DROP_DEFAULT=PianoTouch
   if grep -q KC_NATIVE_PLACEMENT "$K/scripts/kc-build.py" && [ "${KC_NATIVE_PLACEMENT:-best-fit}" = best-fit ]; then DROP_DEFAULT=; fi
   KEPT=
   for k in $LIST; do case " ${PIANO_USBHOST_STACK_DROP-$DROP_DEFAULT} " in *" $k "*) echo "PIANO_USBHOST_STACK=1: $k left out" >&2 ;; *) KEPT="$KEPT $k" ;; esac; done
-  LIST="$KEPT PianoUsbHostStandIn PianoUsbHostStack"
+  if [ "${PIANO_USBHOST_A2:-0}" = 1 ]; then
+    LIST="$KEPT PianoUsbHostStandIn PianoUsbHostStackA2 PianoXhciHost"
+  else
+    LIST="$KEPT PianoUsbHostStandIn PianoUsbHostStack"
+  fi
 fi
 for k in $LIST; do   # the kexts' objects: tooling/k27/build-native-<name>.sh
-  [ "$k" != PianoUsbHostStack ] || continue   # codeless (a plist entry only): nothing to build
-  case $k in ARMPlatformStandIn) b=standin ;; NativeUfs) b=ufs ;; NativeRamBlock) b=ram-block ;; NativeGopDisplay) b=gop-display ;; PianoDwc3) b=piano-dwc3 ;; PianoInput) b=piano-input ;; PianoNullEthernet) b=null-ethernet ;; PianoPower) b=piano-power ;; NativeSoftGpu) b=soft-gpu ;; PianoA830) b=piano-a830 ;; PianoBacklight) b=piano-backlight ;; PianoKeyboard) b=piano-keyboard ;; PianoWifi) b=piano-wifi ;; PianoWifiEthernet) b=piano-wifi-ethernet ;; PianoAudio) b=piano-audio ;; PianoTouch) b=piano-touch ;; PianoThermal) b=piano-thermal ;; PianoUsbHost) b=piano-usbhost ;; PianoDpu) b=piano-dpu ;; PianoDp) b=piano-dp ;; PianoVideo) b=piano-video ;; PianoTorch) b=piano-torch ;; PianoCamera) b=piano-camera ;; PianoSensors) b=piano-sensors ;; PianoBluetooth) b=piano-bluetooth ;; PianoPolicy) b=piano-policy ;; PianoUsbHostStandIn) b=usbhost-standin ;; SoftwareAES) b=software-aes ;; *) b= ;; esac
+  case $k in PianoUsbHostStack|PianoUsbHostStackA2) continue ;; esac   # codeless (a plist entry only): nothing to build
+  case $k in ARMPlatformStandIn) b=standin ;; NativeUfs) b=ufs ;; NativeRamBlock) b=ram-block ;; NativeGopDisplay) b=gop-display ;; PianoDwc3) b=piano-dwc3 ;; PianoInput) b=piano-input ;; PianoNullEthernet) b=null-ethernet ;; PianoPower) b=piano-power ;; NativeSoftGpu) b=soft-gpu ;; PianoA830) b=piano-a830 ;; PianoBacklight) b=piano-backlight ;; PianoKeyboard) b=piano-keyboard ;; PianoWifi) b=piano-wifi ;; PianoWifiEthernet) b=piano-wifi-ethernet ;; PianoAudio) b=piano-audio ;; PianoTouch) b=piano-touch ;; PianoThermal) b=piano-thermal ;; PianoUsbHost) b=piano-usbhost ;; PianoDpu) b=piano-dpu ;; PianoDp) b=piano-dp ;; PianoVideo) b=piano-video ;; PianoTorch) b=piano-torch ;; PianoCamera) b=piano-camera ;; PianoSensors) b=piano-sensors ;; PianoBluetooth) b=piano-bluetooth ;; PianoPolicy) b=piano-policy ;; PianoUsbHostStandIn) b=usbhost-standin ;; PianoXhciHost) b=piano-xhcihost ;; SoftwareAES) b=software-aes ;; *) b= ;; esac
   [ -n "$b" ] || { echo "no build script for $k" >&2; exit 1; }
   tooling/k27/build-native-$b.sh > out/k27/build-native-$b.log 2>&1 || { grep -E "error:|Error" out/k27/build-native-$b.log | head; exit 1; }
 done
