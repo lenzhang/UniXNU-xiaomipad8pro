@@ -283,7 +283,8 @@ void note(const char *fmt, ...)
     // A ring of kDeferLines: a line is written over only once the helper has printed it (level 8 runs for minutes after the
     // ladder's start, and its lines would not fit a buffer that is only filled once).
     const unsigned n = gDeferCount;
-    if (n - __atomic_load_n(&gDeferPrinted, __ATOMIC_ACQUIRE) < kDeferLines) {
+    // (a margin of 8 lines: a slot the helper has claimed and is still printing is never written over)
+    if (n - __atomic_load_n(&gDeferPrinted, __ATOMIC_ACQUIRE) < kDeferLines - 8) {
       snprintf(gDeferBuf + (n % kDeferLines) * kDeferBytes, kDeferBytes, "%s [+%llu ms]", line,
                (unsigned long long)(nowMs() - gDeferSince));
       __atomic_store_n(&gDeferCount, n + 1, __ATOMIC_RELEASE);   // the helper reads the line only after this
