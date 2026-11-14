@@ -43,6 +43,13 @@ public:
     IOReturn setPromiscuousMode(bool) override { return kIOReturnSuccess; }
     IOReturn setMulticastMode(bool) override { return kIOReturnSuccess; }
     IOReturn setMulticastList(IOEthernetAddress *, UInt32) override { return kIOReturnSuccess; }
+    // piano-wifi-en0=1: PianoWifiEthernet takes en0 over and asks this controller to stand down (callPlatformFunction
+    // "PianoNullEthernetStandDown", found by its class): the interface is detached synchronously, so that IONetworkStack drops it,
+    // and the BSD name en0 with it, before Wi-Fi's interface is registered as the primary built-in one (boots 10j and 10k-en0: a
+    // terminate() of the controller left en0 the null's).
+    using IOEthernetController::callPlatformFunction;
+    IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3,
+                                  void *param4) override;
 };
 
 OSDefineMetaClassAndStructors(PianoNullEthernet, IOEthernetController)
@@ -76,6 +83,21 @@ bool PianoNullEthernet::start(IOService *provider)
     IOLog("PianoNullEthernet: en0 (built-in, no hardware: every packet dropped), MAC %02x:%02x:%02x:%02x:%02x:%02x; TimeSync released\n",
           m[0], m[1], m[2], m[3], m[4], m[5]);
     return true;
+}
+
+IOReturn PianoNullEthernet::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2,
+                                                void *param3, void *param4)
+{
+    if (functionName && functionName->isEqualTo("PianoNullEthernetStandDown")) {
+        if (!fInterface)
+            return kIOReturnSuccess;
+        IOLog("PianoNullEthernet: en0 stands down for Wi-Fi (piano-wifi-en0=1): the interface is detached (synchronously)\n");
+        detachInterface(fInterface, true);
+        OSSafeReleaseNULL(fInterface);
+        IOLog("PianoNullEthernet: the interface is detached; %llu packet(s) were dropped while it was en0\n", fTxDrops);
+        return kIOReturnSuccess;
+    }
+    return IOEthernetController::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
 }
 
 void PianoNullEthernet::stop(IOService *provider)

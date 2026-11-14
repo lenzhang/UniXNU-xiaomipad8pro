@@ -240,6 +240,52 @@ UInt32 PianoWifiEthernet::outputPacket(mbuf_t packet, void *)
 // registers with the same address (02:50:49:41:4e:01, which PianoWifi then gives the firmware's virtual device too), built
 // in and primary — so configd's saved naming gives it en0 again. Off by default: the interface takes its own address and the
 // next free unit (boot 10i). Returns true once no interface is named en0 any more.
+// The stack's own view of en0: an ifnet of that name (ifnet_find_by_name), and an interface in the registry that carries it.
+static bool ifnetNamed(const char *name)
+{
+  ifnet_t ifp = nullptr;
+  if (ifnet_find_by_name(name, &ifp) != 0 || !ifp) return false;
+  ifnet_release(ifp);
+  return true;
+}
+
+static bool registryNamed(const char *name)
+{
+  OSDictionary *named = IOService::serviceMatching("IONetworkInterface");
+  OSDictionary *props = OSDictionary::withCapacity(1);
+  OSString *bsd = OSString::withCString(name);
+  IOService *found = nullptr;
+  if (named && props && bsd) {
+    props->setObject(kIOBSDNameKey, bsd);
+    named->setObject(gIOPropertyMatchKey, props);
+    found = IOService::copyMatchingService(named);
+  }
+  OSSafeReleaseNULL(named);
+  OSSafeReleaseNULL(props);
+  OSSafeReleaseNULL(bsd);
+  if (!found) return false;
+  found->release();
+  return true;
+}
+
+// The null controller's own interface (its child in the service plane), retained, or null once it is gone.
+static IONetworkInterface *nullInterface(IOService *null)
+{
+  IONetworkInterface *found = nullptr;
+  if (OSIterator *children = null->getChildIterator(gIOServicePlane)) {
+    while (OSObject *child = children->getNextObject()) {
+      IONetworkInterface *iface = OSDynamicCast(IONetworkInterface, child);
+      if (iface && !iface->isInactive()) {
+        found = iface;
+        found->retain();
+        break;
+      }
+    }
+    children->release();
+  }
+  return found;
+}
+
 bool PianoWifiEthernet::takeOverEn0()
 {
   // PianoNullEthernet never calls registerService() on itself (only its interface is registered), so matching does not find
@@ -258,35 +304,58 @@ bool PianoWifiEthernet::takeOverEn0()
       children->release();
     }
   }
-  if (null) {
-    note("en0: PianoNullEthernet is asked to stand down (piano-wifi-en0=1)");
-    null->terminate();
-    null->release();
-  } else {
-    note("en0: no PianoNullEthernet to stand down");
+  if (!null) {
+    note("en0: no PianoNullEthernet to stand down (ifnet en0 %s)", ifnetNamed("en0") ? "exists" : "does not exist");
+    return !ifnetNamed("en0") && !registryNamed("en0");
   }
-  for (unsigned i = 0; i < 100; ++i) {
-    OSDictionary *named = IOService::serviceMatching("IONetworkInterface");
-    OSDictionary *props = OSDictionary::withCapacity(1);
-    OSString *en0 = OSString::withCString("en0");
-    IOService *still = nullptr;
-    if (named && props && en0) {
-      props->setObject(kIOBSDNameKey, en0);
-      named->setObject(gIOPropertyMatchKey, props);
-      still = IOService::copyMatchingService(named);
+  // Before: whether the stack has named anything en0 yet (configd names the interfaces; at this point of the boot it may not
+  // have), and the null's interface with its BSD name.
+  IONetworkInterface *theirs = nullInterface(null);
+  OSString *theirName = theirs ? OSDynamicCast(OSString, theirs->getProperty(kIOBSDNameKey)) : nullptr;
+  note("en0: before the stand-down: ifnet en0 %s, an interface named en0 in the registry %s; PianoNullEthernet's interface %s%s",
+       ifnetNamed("en0") ? "exists" : "does not exist", registryNamed("en0") ? "exists" : "does not exist",
+       theirs ? "is there, BSD name " : "is not there", theirs ? (theirName ? theirName->getCStringNoCopy() : "none yet") : "");
+  OSSafeReleaseNULL(theirs);
+  // Boots 10j and 10k-en0: terminate() left en0 the null's (its interface stayed attached and named, ours never got a name).
+  // The null detaches its interface itself, synchronously; terminate() is only the fallback for a null without the call.
+  const OSSymbol *standDown = OSSymbol::withCString("PianoNullEthernetStandDown");
+  const IOReturn rc = standDown ? null->callPlatformFunction(standDown, true, nullptr, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
+  OSSafeReleaseNULL(standDown);
+  note("en0: PianoNullEthernet is asked to stand down (piano-wifi-en0=1): %s (%#x)",
+       rc == kIOReturnSuccess ? "its interface was detached" : "no stand-down call: the controller is terminated instead", rc);
+  if (rc != kIOReturnSuccess) null->terminate();
+  // Free means the stack's real state: no ifnet named en0, no interface in the registry named en0, and the null's interface
+  // gone from the registry; the times at which each came are logged.
+  uint64_t ifnetGoneMs = ~0ull, nameGoneMs = ~0ull, ifaceGoneMs = ~0ull;
+  bool free = false;
+  unsigned waited = 0;
+  for (; waited <= 10000; waited += 100) {
+    const bool ifnetThere = ifnetNamed("en0"), nameThere = registryNamed("en0");
+    IONetworkInterface *iface = nullInterface(null);
+    const bool ifaceThere = iface != nullptr;
+    OSSafeReleaseNULL(iface);
+    if (!ifnetThere && ifnetGoneMs == ~0ull) ifnetGoneMs = waited;
+    if (!nameThere && nameGoneMs == ~0ull) nameGoneMs = waited;
+    if (!ifaceThere && ifaceGoneMs == ~0ull) ifaceGoneMs = waited;
+    if (!ifnetThere && !nameThere && !ifaceThere) {
+      free = true;
+      break;
     }
-    OSSafeReleaseNULL(named);
-    OSSafeReleaseNULL(props);
-    OSSafeReleaseNULL(en0);
-    if (!still) {
-      note("en0: free after %u ms", i * 100);
-      return true;
-    }
-    still->release();
     IOSleep(100);
   }
-  note("en0: still taken after 10 s: the interface keeps its own name");
-  return false;
+  if (rc == kIOReturnSuccess) null->terminate();   // the controller follows its interface (nothing of it is in use any more)
+  null->release();
+  auto at = [](uint64_t ms) { return ms == ~0ull ? -1 : int(ms); };
+  if (free)
+    note("en0: free after %u ms (ifnet en0 gone at %d ms, the registry's name at %d ms, the null's interface at %d ms): this "
+         "interface is registered as the primary built-in one",
+         waited, at(ifnetGoneMs), at(nameGoneMs), at(ifaceGoneMs));
+  else
+    note("en0: still taken after 10 s (ifnet en0 %s, the registry's name %s, the null's interface %s): this interface is "
+         "registered as a secondary one",
+         ifnetGoneMs == ~0ull ? "still there" : "gone", nameGoneMs == ~0ull ? "still there" : "gone",
+         ifaceGoneMs == ~0ull ? "still there" : "gone");
+  return free;
 }
 
 bool PianoWifiEthernet::start(IOService *provider)
@@ -336,10 +405,11 @@ bool PianoWifiEthernet::start(IOService *provider)
   fAttached = rc == 0;
   // The BSD name comes later, from configd (the counters' lines carry it): getUnitNumber() is 0 until then, which is why boot
   // 10a's "en0 published" was taken for the BSD name it never had.
-  note("the interface is published (MAC %02x:%02x:%02x:..:%02x, built in, not primary, link down until the station's port is "
+  note("the interface is published (MAC %02x:%02x:%02x:..:%02x, built in, %s, link down until the station's port is "
        "authorized, its own work loop %s; macOS names it); PianoWifi's data path %s; the scan list is the property "
        "piano-wifi-scan",
-       fAddress.bytes[0], fAddress.bytes[1], fAddress.bytes[2], fAddress.bytes[5], fWorkLoop ? "running" : "MISSING",
+       fAddress.bytes[0], fAddress.bytes[1], fAddress.bytes[2], fAddress.bytes[5], en0Free ? "primary (en0 was freed)" : "not primary",
+       fWorkLoop ? "running" : "MISSING",
        fAttached ? "attached" : rc == ENODEV ? "not there (below level 6)" : "refused the attach");
   return true;
 }
