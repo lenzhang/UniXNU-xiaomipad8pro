@@ -1100,6 +1100,49 @@ piano-wifi-l7hold=180000 piano-wifi-defer=3` and the rings at level 6's start (`
 A scan without networks in 10f-a (and not in 10f-b) means software ring 1 is not for level 6; its `released N` line says
 whether the firmware hands the management frames' buffers back.
 
+**10f-a, 10f-b and 10f-c ran on 2026-11-14 13:20-13:50 (report `private/host-checks/20261114-10f`). Confirmed on the tablet:
+the receive buffers must name software ring 1.** 10f-a (software ring 1, no transmit side) passed its gate: message 1 of the
+four-way handshake received 124 ms after the association (and again at 1.1 s and 2.2 s, the access point repeating it as no
+message 2 could go out), no crash, the least free stack 12136 bytes, nothing released during level 6. 10f-b (the firmware's
+manager, otherwise the same) asserted as 10e did. **10f-c (software ring 1 with the transmit side): the whole four-way
+handshake ran** — message 1 (124 ms), our message 2, message 3 (132 ms, its MIC checked by the supplicant), our message 4,
+the pairwise key installed, the group key installed, the port authorized, `PianoWifiEthernet: the link is up` (113033 ms).
+The access point's group cipher is TKIP (pairwise CCMP). Then, in 139 s: 2 received entries (the two EAPOL frames), 1891
+receive buffers back on the release ring (all posted again), nothing to en0, and en0 handed PianoWifi no frame at all (the
+queue: 2 sent, both EAPOL); no IPv4 address, no default route. Both EAPOL frames completed through the firmware (`firmware 2`,
+not `acked`), and they evidently reached the access point (message 3 came).
+
+**Causes found in the code (inferred, the next boot confirms):** (1) the TKIP group key went to the firmware with Michael key
+lengths 0 and 0 (this chip's host gives 8 and 8 for TKIP) and in the GTK KDE's order, the authenticator's transmit Michael
+key first, where a station's driver gets the station's order — so every TKIP-protected group frame (broadcast ARP, DHCP
+offers sent to the broadcast address, ...) failed its check and was released: fixed in the kext (the lengths, and the two
+halves swapped; the client keeps handing the KDE's bytes as they come, PianoWifiNet.h). (2) en0 sent nothing: either the
+stack never brought the interface up (no network service for en0 in this system's network settings, so nobody starts DHCP)
+or something dropped its frames; nothing in 10f-c's log can tell which. **Added:** PianoWifiEthernet logs `the interface is
+brought up (enable N)`, the interface's flags, every output drop by reason, the first six frames each way, and counters at
+each link change and every 256 frames; PianoWifi counts its send answers; and each released buffer's reason (source, push
+reason, error code; group or unicast; the descriptor's error bits; the Ethernet type) is counted and the first 16 logged.
+Software ring 1 and the rings at level 6's start are now the default (`piano-wifi-l8=0x37`).
+
+**Boot 10g: DHCP and a gateway ping** (built 2026-11-14 13:54 from branch commit `fc67a96` (main merged, 398e43b), collection `1420ffd9...` (0066 kernel, 26 native kexts, NativeUfs with data-store-part), the 27.3 line and tail of `out/persistent/esp-k273-v2.json` without `piano-boot-args=macos` and `data-store-lba`, `data-persist=0`, the v2 seed `9bd6f902...` with its trust cache, `piano-reset-after=900 piano-reset-to=bootloader`: `out/ram-k273-wifi-10g` 237281280 bytes, sha256 `6dd90a684148249d84b1ad14ee7addf4669cd557a9521be008dc36d1c7b7df9d`, `verify-ram-images.py` PASS), on the whole-disk v2 layout (root on `linux_rootfs`, the store on
+`linux_data`; the v2 seed `9bd6f902`, `data-persist=0`). Arguments `piano-wifi=8 piano-wifi-iova=1 piano-wifi-l8=55
+piano-wifi-defer=3` (the association is held until a suspend). After the boot, place the profile and start the supplicant as
+for 10f-c; after `the port is open`, on the tablet as root:
+
+    ifconfig en0; networksetup -listallhardwareports | grep -A2 en0; scutil --nwi
+    ipconfig getifaddr en0 || { ipconfig set en0 DHCP; sleep 15; ipconfig getifaddr en0; }
+    R=$(ipconfig getoption en0 router); echo "router ${R:+given}"; ping -c 5 "$R"; ipconfig getsummary en0 | head -40
+
+| Line / command | Expected | If not |
+|---|---|---|
+| `level 8: the group key sent to the firmware (index 1, 32 bytes, TKIP)`, `the group key: installed` | as 10f-c | — |
+| `PianoWifiEthernet: the interface is brought up (enable 1)`, then at the link's up `interface flags 0x...(up 1, running 1)` | the stack brings en0 up (at the boot or at `ipconfig set`) | no enable line: the interface is never brought up — `ipconfig set en0 DHCP` brings it up |
+| `PianoWifiEthernet: out: frame 1, 342 bytes, type 0x0800, group addressed: handed to PianoWifi (0)` | the DHCP discover | `dropped (N)`: the reason; none at all: nothing sends on en0 (the network settings) |
+| `level 8 ...: sent N frames ... completions N (acked N ...)` | data frames acknowledged (`acked`, not only `firmware`) | `not N, last reason R`: the transmit path's reason |
+| `PianoWifiEthernet: in: frame 1, N bytes, type 0x0800 (or 0x0806)` and `received N entries, N frames ... to en0 N` | the DHCP offer and ARP from the access point | `released ... RXDMA N (errors c:n)`: the release lines and `level 8: release K: ...` say which error |
+| `ipconfig getifaddr en0` | an address (not logged) | no address with frames in: the DHCP answer did not reach the stack |
+| `ping -c 5 <router>` | 5 answers | — |
+
 ## 9. Fallback
 
 `piano-wifi=0` (the default): nothing runs. Network meanwhile: PianoNullEthernet's `en0` (no traffic) and, once built, the USB-C
