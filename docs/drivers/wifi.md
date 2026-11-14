@@ -1010,7 +1010,7 @@ Next: the data path (level 8), whose gate is the access point's first EAPOL-Key 
 piano-wifi-l8=22` in the line's driver arguments (the hold only so that the level's end lines are printed within the run; the
 WPA2 access point ends the association by itself without the handshake; `l8=22` = `0x16` keeps the receive buffers with the
 firmware's own manager, as levels 6 and 7 had them on 10b, so that the gate does not also depend on the scan working with
-software ring 1 — the kext's default `0x17`, this chip's own host's choice, is boot 10d's question once 10c passes): `out/ram-k273-wifi-10c` (@PROBE@). The profile is placed as for 10b.
+software ring 1 — the kext's default `0x17`, this chip's own host's choice, is boot 10d's question once 10c passes): `out/ram-k273-wifi-10c` (built 2026-11-14 09:42 from branch commit `8a4ef68`: 237281280 bytes, sha256 `57124af1ab2f603bd00f005ffb79d3157445381ee0dcae61197877607c29328a`, `verify-ram-images.py` PASS; the 27.3 collection `179147b7...` with the 0066 kernel, 26 native kexts, PianoWifiEthernet 0 problem slots; `data-persist=0` on the store seed `89860516...`; `piano-reset-after=900 piano-reset-to=bootloader`). The profile is placed as for 10b.
 No 802.1X client is needed for the gate (none exists yet: the frames are counted and logged by length and message number).
 **Same boot, second question (the boundary):** copy `out/piano-wifi-port` (§13.7) to the tablet and run it as root before the
 profile is placed, `piano-wifi-port 600`: it should print `connected`, `LINK: idle, generation 0`, then after the association
