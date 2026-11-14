@@ -1293,6 +1293,24 @@ after the first port open, after the rejoin, after the wake, after the crash's r
 Should the wake's restart fail: the pass's failing level (`FAILED at stage ...`) and `restart 1 (...) did not bring Wi-Fi back:
 pass 2 ended at level L`, then the back-off's next restart; that line names the level to look at.
 
+**10k-en0 ran on 2026-11-14 and the take-over failed again:** `en0: PianoNullEthernet is asked to stand down`, `en0: free after
+0 ms`, ours at the link's up `no BSD name yet (not attached)`, and `en0` in ifconfig still the null's (one interface with
+`...:01`). The check looked for an interface named en0 before configd had named anything, so it found none at once, and the
+controller's `terminate()` did not take its interface out of the stack. Now (`piano-wifi-en0=1` only): PianoNullEthernet detaches
+its interface itself, synchronously, when PianoWifiEthernet asks (`callPlatformFunction` `PianoNullEthernetStandDown`); free means
+the stack's state (no ifnet `en0` by `ifnet_find_by_name`, no interface named en0 in the registry, the null's interface gone),
+each with its time in the log; only then is ours registered as the primary built-in interface, and the publish line says which.
+
+**Boot 10m-en0** (built 2026-11-14 from branch commit `ac2ea03`, collection `d9a938d7...`, the v2 recipe: `out/ram-k273-wifi-10m-en0` sha256
+`ad33979eede829e9e39ed17896beacc96d42fed9f241b649de140e6bdbab2bbb`, 237281280 bytes, `verify-ram-images.py` PASS; 10i's arguments and `piano-wifi-en0=1`, no tests):
+
+| When | Line / command | Expected |
+|---|---|---|
+| PianoWifiEthernet's start | `en0: before the stand-down: ifnet en0 ..., an interface named en0 in the registry ...; PianoNullEthernet's interface is there, BSD name ...`, `PianoNullEthernet: en0 stands down for Wi-Fi (piano-wifi-en0=1): the interface is detached (synchronously)`, `PianoNullEthernet: the interface is detached ...`, `en0: PianoNullEthernet is asked to stand down (piano-wifi-en0=1): its interface was detached (0)`, `en0: free after N ms (ifnet en0 gone at ..., the registry's name at ..., the null's interface at ...)`, the publish line `MAC 02:50:49:..:01, built in, primary (en0 was freed)` | no `still taken after 10 s`; the start does not hang after `asked to stand down` |
+| the link's up | `PianoWifiEthernet: ... en0 (attached to the network stack) ... (up 1, running 1)` | — |
+| the shell | `ifconfig -a` en0 (`...:01`, ours: `ioreg -l -w0 -c PianoWifiEthernet` has the interface en0) and en1; DHCP and ping on en0 | an address, 5/5 |
+| the desktop | the login window and the USB shell stay up (TimeSync took its clock from the null at its start) | — |
+
 **10k-en0** (the same collection, 10i's arguments and `piano-wifi-en0=1`, no tests): `PianoWifiEthernet: en0: PianoNullEthernet
 is asked to stand down (piano-wifi-en0=1)`, `en0: free after N ms`, at the link's up `en0 (attached to the network stack) ...
 (up 1, running 1)`, `ifconfig -a` en0 (`...:01`, ours) and en1 only, DHCP and ping on en0; the desktop and the USB shell stay up.
