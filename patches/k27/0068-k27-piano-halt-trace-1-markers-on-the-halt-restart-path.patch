@@ -1,0 +1,363 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: UniXNU-piano
+Date: Sat, 14 Nov 2026 21:30:00 +0800
+Subject: [PATCH] k27: piano-halt-trace=1: markers on the halt/restart path
+
+Every restart or shutdown of the tablet ends in "Halt/Restart Timed Out @IOPlatformExpert.cpp:884":
+the 30 s thread call PEHaltRestartInternal arms before handlePlatformHaltRestart, whose ARM form
+panics without the phase. With piano-halt-trace=1 (default 0: nothing changes) the console, and so
+the pstore mailbox, gets "piano-halt: ..." lines that name the waiter:
+- PEHaltRestart's entry and handlePlatformHaltRestart's return; the platform's haltRestart (its
+  class, whether PE_halt_restart is set) and its return;
+- each phase of handlePlatformHaltRestart with its uptime, NVRAM sync before and after, every
+  priority client handler before and after, notifySystemShutdown's return;
+- the halt/restart platform actions: how many, each one's return (the kernel already logs the entry),
+  and the end of the walk;
+- the PM quiesce: quiescePowerTree's result, the request's attachment with the work queue's length,
+  every quiesce-blocking request attached (at the start and later) and retired with its target and
+  type, the request's retirement, the callback, "PM quiesced";
+- halt_all_cpus: the PSCI SYSTEM_OFF/SYSTEM_RESET call and its signed result if it returns;
+- at the timeout: the uptime, then IOPMrootDomain::panicWithShutdownLog (the phase that did not end,
+  as the x86 kernel panics) instead of the bare panic.
+---
+diff --git a/iokit/Kernel/IOPMrootDomain.cpp b/iokit/Kernel/IOPMrootDomain.cpp
+--- a/iokit/Kernel/IOPMrootDomain.cpp
++++ b/iokit/Kernel/IOPMrootDomain.cpp
+@@ -6044,6 +6044,17 @@
+ 	IOServiceInterestHandler    handler;
+ } gHaltRestartCtx;
+ 
++
++/* k27 0068: piano-halt-trace=1 (osfmk/arm64/machine_routines.c): markers on the halt/restart path, to the console */
++extern "C" uint32_t piano_halt_trace;
++static inline uint64_t
++piano_halt_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000;
++}
++
+ const char *
+ shutdownPhase2String(shutdownPhase_t phase)
+ {
+@@ -6086,8 +6097,14 @@
+ 	}
+ 
+ 	clock_get_uptime(&startTime);
++	if (piano_halt_trace) {
++		printf("piano-halt: priority client %u handler %p ->\n", ctx->Counter, notifier ? (void *)VM_KERNEL_UNSLIDE(notifier->handler) : NULL);
++	}
+ 	ctx->RootDomain->messageClient( ctx->MessageType, object, (void *)&notify );
+ 	deltaTime = computeDeltaTimeMS(&startTime, &elapsedTime);
++	if (piano_halt_trace) {
++		printf("piano-halt: priority client %u returned after %u ms\n", ctx->Counter, deltaTime);
++	}
+ 
+ 	if ((deltaTime > kPMHaltTimeoutMS) && notifier) {
+ 		LOG("%s handler %p took %u ms\n",
+@@ -6102,6 +6119,9 @@
+ static void
+ quiescePowerTreeCallback( void * target, void * param )
+ {
++	if (piano_halt_trace) {
++		printf("piano-halt: PM quiesce callback at t=%llu ms\n", piano_halt_ms());
++	}
+ 	IOLockLock(gPMHaltLock);
+ 	gPMQuiesced = true;
+ 	thread_wakeup(param);
+@@ -6150,10 +6170,19 @@
+ 	}
+ 
+ 	if (nvramSync) {
++		if (piano_halt_trace) {
++			printf("piano-halt: %s: NVRAM sync ->\n", gHaltRestartCtx.LogString);
++		}
+ 		PESyncNVRAM();
++		if (piano_halt_trace) {
++			printf("piano-halt: NVRAM sync returned at t=%llu ms\n", piano_halt_ms());
++		}
+ 	}
+ 
+ 	gHaltRestartCtx.phase = kNotifyPriorityClients;
++	if (piano_halt_trace) {
++		printf("piano-halt: phase '%s' at t=%llu ms\n", shutdownPhase2String(gHaltRestartCtx.phase), piano_halt_ms());
++	}
+ 	// Notify legacy clients
+ 	applyToInterested(gIOPriorityPowerStateInterest, platformHaltRestartApplier, &gHaltRestartCtx);
+ 
+@@ -6168,11 +6197,20 @@
+ 
+ 	if (kPEPagingOff != pe_type) {
+ 		gHaltRestartCtx.phase = kNotifyPowerPlaneDrivers;
++		if (piano_halt_trace) {
++			printf("piano-halt: phase '%s' at t=%llu ms\n", shutdownPhase2String(gHaltRestartCtx.phase), piano_halt_ms());
++		}
+ 		// Notify in power tree order
+ 		notifySystemShutdown(this, gHaltRestartCtx.MessageType);
++		if (piano_halt_trace) {
++			printf("piano-halt: notifySystemShutdown returned at t=%llu ms\n", piano_halt_ms());
++		}
+ 	}
+ 
+ 	gHaltRestartCtx.phase = kNotifyHaltRestartAction;
++	if (piano_halt_trace) {
++		printf("piano-halt: phase '%s' at t=%llu ms\n", shutdownPhase2String(gHaltRestartCtx.phase), piano_halt_ms());
++	}
+ #if defined(XNU_TARGET_OS_OSX)
+ 	IOCPURunPlatformHaltRestartActions(pe_type);
+ #else /* !defined(XNU_TARGET_OS_OSX) */
+@@ -6185,16 +6223,25 @@
+ 	if ((kPEPagingOff != pe_type) && gPMHaltLock) {
+ 		gHaltRestartCtx.phase = kQuiescePM;
+ 		AbsoluteTime quiesceTime = mach_absolute_time();
++		if (piano_halt_trace) {
++			printf("piano-halt: phase '%s' at t=%llu ms\n", shutdownPhase2String(gHaltRestartCtx.phase), piano_halt_ms());
++		}
+ 
+ 		IOLockLock(gPMHaltLock);
+ 		gPMQuiesced = false;
+-		if (quiescePowerTree(this, &quiescePowerTreeCallback, &gPMQuiesced) ==
+-		    kIOReturnSuccess) {
++		IOReturn piano_quiesce = quiescePowerTree(this, &quiescePowerTreeCallback, &gPMQuiesced);
++		if (piano_halt_trace) {
++			printf("piano-halt: quiescePowerTree returned 0x%x; waiting for the callback\n", piano_quiesce);
++		}
++		if (piano_quiesce == kIOReturnSuccess) {
+ 			while (!gPMQuiesced) {
+ 				IOLockSleep(gPMHaltLock, &gPMQuiesced, THREAD_UNINT);
+ 			}
+ 		}
+ 		IOLockUnlock(gPMHaltLock);
++		if (piano_halt_trace) {
++			printf("piano-halt: PM quiesced at t=%llu ms\n", piano_halt_ms());
++		}
+ 		deltaTime = computeDeltaTimeMS(&quiesceTime, &elapsedTime);
+ 		DLOG("PM quiesce took %u ms\n", deltaTime);
+ 		halt_log_enter("Quiesce", NULL, elapsedTime);
+diff --git a/iokit/Kernel/IOPlatformActions.cpp b/iokit/Kernel/IOPlatformActions.cpp
+--- a/iokit/Kernel/IOPlatformActions.cpp
++++ b/iokit/Kernel/IOPlatformActions.cpp
+@@ -39,6 +39,16 @@
+ #include <IOKit/IOPlatformActions.h>
+ #include "IOKitKernelInternal.h"
+ 
++/* k27 0068: piano-halt-trace=1 (osfmk/arm64/machine_routines.c): markers on the halt/restart path, to the console */
++extern "C" uint32_t piano_halt_trace;
++static inline uint64_t
++piano_halt_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000;
++}
++
+ static IOLock *gIOPlatformActionsLock;
+ 
+ typedef kern_return_t (*iocpu_platform_action_t)(void * refcon0, void * refcon1, uint32_t priority,
+@@ -160,6 +170,18 @@
+ 		return kIOReturnNotReady;
+ 	}
+ 	cpu_event_debug_log(PLATFORM_HALT_RESTART, 0);
++	if (piano_halt_trace) {
++		unsigned int actions = 0;
++		iocpu_platform_action_entry_t * entry;
++		queue_iterate(&gActionQueues[kQueueHaltRestart], entry, iocpu_platform_action_entry_t *, link) {
++			actions++;
++		}
++		printf("piano-halt: halt/restart actions: %u registered, message 0x%x ->\n", actions, message);
++		kern_return_t piano_ret = iocpu_run_platform_actions(&gActionQueues[kQueueHaltRestart], 0, 0U - 1,
++		    (void *)(uintptr_t) message, NULL, NULL, PLATFORM_ACTION_FLAGS_ALLOW_NESTED_CALLOUTS);
++		printf("piano-halt: halt/restart actions done (0x%x) at t=%llu ms\n", piano_ret, piano_halt_ms());
++		return piano_ret;
++	}
+ 	return iocpu_run_platform_actions(&gActionQueues[kQueueHaltRestart], 0, 0U - 1,
+ 	           (void *)(uintptr_t) message, NULL, NULL, PLATFORM_ACTION_FLAGS_ALLOW_NESTED_CALLOUTS);
+ }
+@@ -264,6 +286,9 @@
+ 
+ 	ret = service->callPlatformFunction(function, false,
+ 	    (void *)(uintptr_t) priority, param1, param2, param3);
++	if (piano_halt_trace && function == gIOPlatformHaltRestartActionKey) {
++		printf("piano-halt: %s <- %s returned 0x%x at t=%llu ms\n", function->getCStringNoCopy(), service_name, ret, piano_halt_ms());
++	}
+ 
+ 	SOCD_TRACE_XNU_END(PLATFORM_ACTION,
+ 	    ADDR(function->getCStringNoCopy()),
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -867,7 +867,18 @@
+ 		}
+ 	}
+ }
++
+ 
++/* k27 0068: piano-halt-trace=1 (osfmk/arm64/machine_routines.c): markers on the halt/restart path, to the console */
++extern "C" uint32_t piano_halt_trace;
++static inline uint64_t
++piano_halt_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000;
++}
++
+ /* IOShutdownNotificationsTimedOut
+  * - Called from a timer installed by PEHaltRestart
+  */
+@@ -880,6 +891,14 @@
+ 	thread_call_param_t p1)
+ {
+ #if !defined(__x86_64__)
++	/* k27 0068: with piano-halt-trace=1 the phase that did not end (IOPMrootDomain's own log, as x86 panics) */
++	if (piano_halt_trace) {
++		IOPMrootDomain *pmRootDomain = IOService::getPMRootDomain();
++		printf("piano-halt: timed out after %u s at t=%llu ms\n", (uint32_t)(uintptr_t)p1, piano_halt_ms());
++		if (pmRootDomain) {
++			pmRootDomain->panicWithShutdownLog((uint32_t)(uintptr_t)p1 * 1000);
++		}
++	}
+ 	/* 30 seconds has elapsed - panic */
+ 	panic("Halt/Restart Timed Out");
+ 
+@@ -1053,7 +1072,15 @@
+ 			thread_call_enter1_delayed( shutdown_hang, (thread_call_param_t)(uintptr_t)timeout, deadline );
+ 		}
+ 
++		uint64_t piano_halt_start = piano_halt_ms();
++		if (piano_halt_trace) {
++			printf("piano-halt: PEHaltRestart type %u at t=%llu ms (timeout %u s): handlePlatformHaltRestart ->\n", type,
++			    piano_halt_start, timeout);
++		}
+ 		pmRootDomain->handlePlatformHaltRestart(type);
++		if (piano_halt_trace) {
++			printf("piano-halt: handlePlatformHaltRestart returned after %llu ms\n", piano_halt_ms() - piano_halt_start);
++		}
+ 		/* This notification should have few clients who all do
+ 		 *  their work synchronously.
+ 		 *
+@@ -1108,6 +1135,13 @@
+ 	if (gIOPlatform) {
+ 		// note that this will not necessarily halt or restart the system...
+ 		// Implementors of this function will check the type and take action accordingly
++		if (piano_halt_trace && (type == kPEHaltCPU || type == kPERestartCPU || type == kPEUPSDelayHaltCPU)) {
++			printf("piano-halt: %s::haltRestart(%u) -> (PE_halt_restart %s) at t=%llu ms\n", gIOPlatform->getMetaClass()->getClassName(),
++			    type, PE_halt_restart ? "set" : "NULL", piano_halt_ms());
++			int piano_ret = gIOPlatform->haltRestart(type);
++			printf("piano-halt: haltRestart returned %d at t=%llu ms\n", piano_ret, piano_halt_ms());
++			return piano_ret;
++		}
+ 		return gIOPlatform->haltRestart(type);
+ 	} else {
+ 		return -1;
+diff --git a/iokit/Kernel/IOServicePM.cpp b/iokit/Kernel/IOServicePM.cpp
+--- a/iokit/Kernel/IOServicePM.cpp
++++ b/iokit/Kernel/IOServicePM.cpp
+@@ -61,6 +61,16 @@
+ #include "IOServicePrivate.h"
+ #include "IOServicePMPrivate.h"
+ #include "IOKitKernelInternal.h"
++
++/* k27 0068: piano-halt-trace=1 (osfmk/arm64/machine_routines.c): markers on the halt/restart path, to the console */
++extern "C" uint32_t piano_halt_trace;
++static inline uint64_t
++piano_halt_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000;
++}
+ 
+ #if USE_SETTLE_TIMER
+ static void settle_timer_expired(thread_call_param_t, thread_call_param_t);
+@@ -9182,6 +9192,10 @@
+ 	} else if (fQuiesceRequest && request->isQuiesceBlocker()) {
+ 		// Attach the new quiesce blocker to the blocked quiesce request
+ 		request->attachNextRequest(fQuiesceRequest);
++		if (piano_halt_trace) {
++			printf("piano-halt: quiesce blocker (late) %s type 0x%x request %p\n", request->getTarget() ? request->getTarget()->getName() : "?",
++			    (uint32_t)request->getType(), (void *)VM_KERNEL_ADDRPERM(request));
++		}
+ 	}
+ 
+ 	// Add new request to the tail of the per-service request queue.
+@@ -9240,6 +9254,12 @@
+ 
+ 		if (request == fQuiesceRequest) {
+ 			fQuiesceRequest = NULL;
++			if (piano_halt_trace) {
++				printf("piano-halt: quiesce request retired at t=%llu ms\n", piano_halt_ms());
++			}
++		} else if (piano_halt_trace && fQuiesceStartTime && request->isQuiesceBlocker()) {
++			printf("piano-halt: quiesce blocker retired %s type 0x%x request %p\n", target ? target->getName() : "?",
++			    (uint32_t)request->getType(), (void *)VM_KERNEL_ADDRPERM(request));
+ 		}
+ 
+ 		queue_remove_first(requestQueue, request, typeof(request), fCommandChain);
+@@ -9338,6 +9358,10 @@
+ 	IOServicePM *   entry;
+ 	IOPMRequest *   request;
+ 
++	if (piano_halt_trace) {
++		printf("piano-halt: quiesce request %p: %s work queue (%u services) at t=%llu ms\n", (void *)VM_KERNEL_ADDRPERM(quiesceRequest),
++		    queue_empty(&fWorkQueue) ? "an empty" : "the", fQueueLength, piano_halt_ms());
++	}
+ 	if (queue_empty(&fWorkQueue)) {
+ 		return;
+ 	}
+@@ -9352,6 +9376,10 @@
+ 
+ 			if (request->isQuiesceBlocker()) {
+ 				request->attachNextRequest(quiesceRequest);
++				if (piano_halt_trace) {
++					printf("piano-halt: quiesce blocker %s type 0x%x request %p\n", request->getTarget() ? request->getTarget()->getName() : "?",
++					    (uint32_t)request->getType(), (void *)VM_KERNEL_ADDRPERM(request));
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1601,6 +1601,15 @@
+ 	return 0;
+ }
+ #endif /* defined(XNU_VM_GUEST) */
++
++/*
++ * k27 0068: piano-halt-trace=1. Markers on the halt/restart path ("piano-halt: ..." on the console, so the pstore mailbox keeps
++ * them): PEHaltRestart's entry and exit, each phase of IOPMrootDomain::handlePlatformHaltRestart, every priority client and
++ * halt/restart platform action with its return, the IOPM quiesce request and every request that blocks it (attach and retire),
++ * the platform's haltRestart, here the PSCI call and its result if it returns; at the 30 s timeout the phase that did not end.
++ * Off by default: nothing changes.
++ */
++TUNABLE(uint32_t, piano_halt_trace, "piano-halt-trace", 0);
+ 
+ __attribute__((noreturn))
+ void
+@@ -1621,12 +1630,21 @@
+ 	 * SMC, which Gunyah does not route to PSCI. Natively (the HLOS at EL1) it is "smc", the firmware's PSCI.
+ 	 */
+ 	{
++		if (piano_halt_trace) {
++			printf("piano-halt: PSCI %s (0x%x) through %s\n", reboot ? "SYSTEM_RESET" : "SYSTEM_OFF", reboot ? 0x84000009U : 0x84000008U,
++			    ml_psci_conduit == ML_PSCI_CONDUIT_SMC ? "smc" : "hvc");
++			__builtin_arm_dsb(0xf);
++		}
+ 		register uint64_t x0 __asm__("x0") = reboot ? 0x84000009ULL : 0x84000008ULL;
+ 		if (ml_psci_conduit == ML_PSCI_CONDUIT_SMC) {
+ 			__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+ 		} else {
+ 			__asm__ volatile ("hvc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+ 		}
++		if (piano_halt_trace) {
++			printf("piano-halt: PSCI %s returned %d\n", reboot ? "SYSTEM_RESET" : "SYSTEM_OFF", (int32_t)x0);
++			__builtin_arm_dsb(0xf);
++		}
+ 	}
+ #endif
+ 	while (1) {
+-- 
+2.39.0
+
