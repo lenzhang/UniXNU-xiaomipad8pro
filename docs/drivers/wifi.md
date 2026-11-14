@@ -327,6 +327,7 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-sleepoff=1` | 0 at level 8, 1 below | power the radio off at a system sleep (it then stays off until the next boot). By default at level 8 the radio stays on through the sleep: nothing is stopped (suspend-to-idle freezes the ladder's thread with every other); at the wake the association is as the firmware kept it, or it ended and the rejoin takes it up |
 | `piano-wifi-rejoin=0` | 1 at level 8 | when an association ends (the access point's deauthentication or disassociation, a beacon miss, a kickout, the 802.1X client's `LEAVE`, our own leave) or a join fails, end the level (as before). By default level 7 joins again from the profile after 2, 5, 10, 20, 30, then 60 s (back to 2 s after a port that opened); never after a stop, a dead chip or no profile |
 | `piano-wifi-droptest=S` | 0 | a test: S s after the port first opens the station leaves its association once (our deauthentication), so that an unattended boot shows the rejoin |
+| `piano-wifi-clientwait=MS` | 30000 at level 8, 0 below | a WPA2 profile is handed to the join only once an 802.1X client is connected to the port, waited for up to MS on each join; then the join goes ahead anyway (its handshake is missed and the rejoin tries again). 0: no wait; none either when the port is not registered. The installed v3 boot of 2026-11-14 associated before its supplicant was connected and was dropped after 3.3 s (reason 15) |
 | `piano-wifi-en0=1` | 0 | the Wi-Fi interface takes over the built-in `en0`: PianoWifiEthernet terminates PianoNullEthernet when it starts (after level 6; TimeSync and WindowServer have had their built-in interface since the boot), waits for `en0` to leave the network stack (at most 10 s) and registers built in and primary with PianoNullEthernet's address `02:50:49:41:4e:01`, which level 6 then gives the firmware's virtual device too, so the saved naming (NetworkInterfaces.plist) gives it `en0`. Off: the station has its own address `...:04` and the next free unit (since boot 10i) |
 | `piano-wifi-l8blocks=N`, `piano-wifi-l8tracems=MS` | 7, 5 (50 before boot 10f) | program the data path's register blocks 0..N only (`WifiDp.h` `DpBlock`: 0 two reads, 1 TCL ring 1, 2 WBM2SW0, 3 REO2SW1, 4 REO2SW0, 5 WBM2SW3, 6 the idle link ring, 7 the reorder unit's set-up; below 7 level 8 does not run), and how long the ladder waits after each block's line (printed at once, not held) before the block's first access |
 | `piano-wifi-l8status=MS` | 5000 | how often level 8 logs its counters while associated (at least 500; `0`: only at the association's end) |
@@ -1242,6 +1243,20 @@ by its address (`...:04`), three times: after the first port open, after the rej
 | boot + 420 s | `piano-sleep: test sleep 1 of 1`, `PianoWifi: power: a system sleep (1): the radio stays on (piano-wifi-sleepoff=0)`, `piano-sleep: suspend 1: ...`, `piano-sleep: suspend 1: woke after 60.0 s by timer`, `PianoWifi: power: the wake (1): the ladder looks at the association`, `level 7: woke from system sleep 1 during associated (the association ...)` | the system wakes; no `crash:` line |
 | after the wake | either the association still up (a ping works at once), or `level 7: join N ended (the association ended: a beacon miss / a deauthentication ...)` and a rejoin with the handshake (generation 3); then `ipconfig getifaddr $I`, `ping -c 5 <router>`; `sysctl machdep.piano_sleep` | an address, 5/5 |
 | the run's end (`reset fastboot`) | `level 7: a shutdown or restart asked the radio to stop during ...`, `stage 718: level 7: stopped on request (a suspend or a shutdown), its normal end`; no `FAILED at stage 718` | — |
+
+**The installed v3 boot (2026-11-14 16:42, `private/host-checks/20261114-v3`) missed its first join by a race:** the profile
+was placed after the boot, the kext read it at +307 s and associated, but the supplicant (exiting every 10 s while it had no
+profile) connected about 4 s later: the three message 1s were counted only (`no 802.1X client is connected`) and the access
+point dropped us (reason 15, the handshake timed out). The supplicant now stays connected (main `0ebff98`); the kext waits
+for a client before a WPA2 join (`piano-wifi-clientwait`), and with the rejoin a missed handshake heals itself.
+
+**Boot 10l: 10k and the wait for the 802.1X client** (built 2026-11-14 from branch commit `ff01ffe` (main merged), collection
+`c1a106fa...`, the v2 recipe: `out/ram-k273-wifi-10l` sha256 `67204f95d977c9286dafa41fb36c03625aefb54ffb39403758364dd73bcf30e2`, 237281280 bytes, `verify-ram-images.py` PASS). 10k's arguments and its
+checklist, and one line more before the first join:
+
+| When | Line / command | Expected |
+|---|---|---|
+| the profile's hand-over | if the supplicant is not connected yet: `level 7: waiting for the 802.1X client (a WPA2 profile, no client on the port, N connect(s) so far): up to 30 s before the join goes ahead (piano-wifi-clientwait)`, then `level 7: the 802.1X client connected after N ms of the wait (connect M): the join goes ahead`, or after 30 s `level 7: no 802.1X client after 30 s of waiting: the join goes ahead without one ...` and, after the missed handshake, a rejoin; with the supplicant connected first, no wait line | then `the join profile was handed over`; no `no 802.1X client is connected: counted only` on message 1 |
 
 **10k-en0** (the same collection, 10i's arguments and `piano-wifi-en0=1`, no tests): `PianoWifiEthernet: en0: PianoNullEthernet
 is asked to stand down (piano-wifi-en0=1)`, `en0: free after N ms`, at the link's up `en0 (attached to the network stack) ...
