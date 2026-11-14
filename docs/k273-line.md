@@ -1,11 +1,11 @@
 # The 27.3 line: macOS 27.3 (26C5035r) as Mac17,11 on piano
 
-Owner decision 2026-11-12 22:40: move off the VM identity. Today's system is macOS 27.0.1 (26A434) from Apple's VM build: its
-kernel collection takes Apple's kexts from the vma2 kernelcache and the ADT says VirtualMac2,1 / VMA2MACOS (configs/k27-adt.toml).
-The 27.3 line runs macOS 27.3 (26C5035r) from the UniversalMac restore IPSW of the UniXNU `macos-27.3-26C5035r` profile, with the
-profile's identity Mac17,11 / K114c / K114cAP, as a parallel line: the 27.0.1 line stays the owner's daily system (installed on
-linux_rootfs) until this line reaches a stable desktop in RAM boots. Root on linux_data (owner decision 2026-11-12: Linux is not
-needed any more, all of linux_data is the 27.3 line's).
+Owner decision 2026-11-12 22:40: move off the VM identity. The first 27.3 line ran macOS 27.3 (26C5035r) from the UniversalMac
+restore IPSW of the UniXNU `macos-27.3-26C5035r` profile, with the profile's identity Mac17,11 / K114c / K114cAP, beside the
+then-installed 27.0.1 (26A434) VirtualMac2,1 line. **Since 2026-11-14 the installed daily system is macOS 27.3 only**: the
+27.0.1 line is retired and its old volume/store was cleared. The current root is on `linux_rootfs`; the owner's 200 GiB Data
+store spans `linux_data` (LBA 71859642, seed `9bd6f902`; [persistent-boot.md](persistent-boot.md) §13.8,
+[results-2026-11-14.md](results-2026-11-14.md)).
 
 Approach (owner, 2026-11-12): migrate everything at once (every native kext of configs/k27-native-kexts.txt, the k27 kernel with
 0053-0065, the ADT and board pieces, the image tooling, the Turnip plugin), build the first RAM image fast, then fix by booting.
@@ -19,7 +19,7 @@ Approach (owner, 2026-11-12): migrate everything at once (every native kext of c
 | Kept kexts | `configs/kc-keep.txt` + the natives' libraries: 48 kexts | the same 48 (all present in mac17j; 0 kernel symbols they reference are missing from our kernel) | `tooling/k27/check-native-kexts.py` unchanged |
 | Native kexts | `configs/k27-native-kexts.txt` | the same list and objects; NativeGopDisplay with `NATIVE_GOP_IOMFB_ABI=2` (below) | `tooling/k27/build-native-gop-display.sh` |
 | ADT identity | `configs/k27-adt.toml` (VirtualMac2,1, chip 0x8011) | `configs/k273-adt.toml` (Mac17,11, K114c, K114cAP, chip 0x6050, board 4; product name "Xiaomi Pad 8 Pro"; vmm-present 0) | `make-piano-adt.py --identity` |
-| Root | linux_rootfs: SHNGROOT + OS (27.0.1) + SystemOS | linux_data: SHNGROOT + OS (27.3 System volume, unchanged IPSW image) + SystemOS (made like 27.0.1's from the 27.3 cryptexes) | `tooling/k273/make-systemos.sh`, `make-root-image.sh`; NativeUfs `native-ufs-root-part=linux_data` |
+| Root | linux_rootfs: SHNGROOT + OS (27.0.1) + SystemOS (retired and cleared 2026-11-14) | **linux_rootfs since 2026-11-14**: SHNGROOT + OS (27.3 System volume) + SystemOS; `linux_data` held the root before §13.8 and now holds the 200 GiB Data store | `tooling/k273/make-systemos.sh`, `make-root-image.sh`; NativeUfs `native-ufs-root-part=linux_rootfs` |
 | Trust | 27.0.1 bundle | the same own module + 27.3's static, System and App trust caches | `tooling/k273/make-trust.py` |
 | Data seed | out/inputs/scratch-data.img | first images: the same seed (the daily Data as before an update), volatile (`data-persist=0`) | `make-root-image.sh` (`K273_SEED` for another) |
 | GPU userland | Turnip on ABI v2 + NativeAdrenoMetal.bundle | the same bundle, staged into the 27.3 seed copy | `tooling/metal/build-turnip-a830.sh` |
@@ -70,9 +70,12 @@ linux_data is overwritten (owner decision).
 
 ## 4. RAM images
 
-`tooling/k273/build-k273-image.sh` (`K273_ROOT=k273`, the default: root on linux_data; `K273_ROOT=k27`: the 27.3 collection and
-identity on the installed 27.0.1 root, no write needed). Data volatile, `native-ufs-root-part=linux_data` for the 27.3 root.
-The owner's test image is the desk-dev profile on top of it:
+`tooling/k273/build-k273-image.sh` builds the 27.3 KC, ADT and RAM images with `K273_KERNEL`. **2026-11-14 layout caveat:**
+its `K273_ROOT=k273` default still names `native-ufs-root-part=linux_data`, and `K273_ROOT=k27` names the cleared 27.0.1 root;
+neither describes the current installation. For the current root on `linux_rootfs` and store on `linux_data`, use
+`tooling/k273/build-k273-esp.py --root-part linux_rootfs` and the §13.8 recipe in [persistent-boot.md](persistent-boot.md),
+whose RAM test is `out/ram-k273-v2ro`. The old `K273_ROOT` choices and the desk-dev recipe below are retained only as the
+first-line build record; do not use them against the current layout.
 
 ```sh
 PIANO_GPU=2 tooling/k273/build-k273-image.sh            # KC, ADT, Turnip stage (27.3 trust) in out/
@@ -175,8 +178,10 @@ arguments cannot open any window but its own, and keeps an unbound store (the 27
 too. Tools: `common.check_store_size` takes a linux_data store of any size only with its `data-store-lba`; `maint-session.py
 k273-store` reads both store headers (the 27.3 one blank or bound to its LBA with its seed; the installed one unbound).
 
-The 27.3 store's seed is its base from now on: every later ESP's `macos-27.3` must take the same seed file
-(`out/inputs/k273/store-seed/scratch-data.img`, identity 89860516...), as the 27.0.1 line keeps its base seed (docs/data-store.md §9).
+The 27.3 store's seed was its base for the first installed line: every later ESP of that step took the same seed file
+(`out/inputs/k273/store-seed/scratch-data.img`, then identity 89860516...). **2026-11-14:** that seed was grown to 200 GiB and
+carried over with the owner's store; the current identity is `9bd6f902` at LBA 71859642 on `linux_data`
+([persistent-boot.md](persistent-boot.md) §13.8). The retired 27.0.1 line no longer keeps a base store.
 Its RAM test: `build-ram-images.py` with `PIANO_EXACT_ARGS` = the entry's line (`out/ram-k273-entry`): the same payload and the same
 arguments, `data-persist=2` on the new store (its first boot creates the store; the installed entry then resumes it).
 
@@ -194,12 +199,17 @@ Result: `esp-k273-only.img`, sha256 `9fe17e65015f8c16743bd1faf3c64e060003784a934
 the line with `piano-reset-after/-to` is 1037 bytes, over DarwinBoot's 1000 (k27 0066's ADT arguments, §4, would make room once the
 installed kernel has it).
 
-The store facts come from the inputs, so a later ESP can point at another window: the partition and LBA from the line
+For the first 27.3-only ESP, the store facts came from the inputs: the partition and LBA from the line
 (`native-ufs-root-part=linux_data data-store-lba=117998394`), the window's size from the seed (89860516, 24 GiB: 6291649 blocks).
-The record's `seed` and `store` are the 27.3 store's; `maint-session.py` checks that store on the tablet before it writes the ESP
+That was the superseded step-1 layout. **The installed v2/v3 line uses `native-ufs-root-part=linux_rootfs`,
+`data-store-part=linux_data`, LBA 71859642, 52430401 blocks and seed `9bd6f902` (200 GiB)** ([persistent-boot.md](persistent-boot.md)
+§13.8). The record's `seed` and `store` are the installed store's; `maint-session.py` checks that store on the tablet before it writes the ESP
 (bound to its LBA, of that seed, at NativeUfs's place in linux_data as mapped), and `rootfs-clear` accepts only such an ESP on the
 tablet. The RAM test of this payload and line is `out/ram-k273-entry2` (the same four files, the same line, the v5 FD), and the
-dual ESP has booted the entry as its default since 2026-11-13: no new RAM image is needed.
+dual ESP had booted the entry as its default from 2026-11-13 until the 27.3-only ESP replaced it on 2026-11-14
+([results-2026-11-14.md](results-2026-11-14.md)): no new RAM image was needed.
 
-After step 2 linux_rootfs (LBA 56060928-71527423, 59 GiB) is discarded and free for the 27.3 line; the GPT is unchanged, and its
-later use (a larger root or Data store) is designed separately.
+After step 2 the old 27.0.1 contents of linux_rootfs (LBA 56060928-71527423, 59 GiB) were discarded. **Later on 2026-11-14 the
+whole-disk layout was installed, not merely designed:** the 20.9 GB 27.3 root image moved onto `linux_rootfs`, and the owner's
+Data grew to 200 GiB over `linux_data` ([persistent-boot.md](persistent-boot.md) §13.8,
+[results-2026-11-14.md](results-2026-11-14.md)).

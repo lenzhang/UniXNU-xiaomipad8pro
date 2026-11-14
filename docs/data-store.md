@@ -1,13 +1,15 @@
 # The Data store: format, the store guard, flatten, plugin staging
 
-Status 2026-11-12: section 9 (the store's base and the system layer) is the way an installed ESP changes without losing the
-owner's Data: built and host-tested offline, not run on the tablet. Status 2026-11-11: **built and host-tested offline; nothing of it has run on the tablet.** The installed ESP (`esp-daily-macos`,
-docs/USING.md §2; before it `esp-gpu-macos`, the same seed `aced5bf9…`) still has the kernel collection from before this change:
-it has no store guard and no flatten. The guard protects the owner's store from RAM images built with the new collection; section 7 is the test procedure.
+Status 2026-11-14: the installed 27.3 collection carries the store guard, and the installed store is protected. The owner's store
+was carried into a 200 GiB window over `linux_data` (`data-store-part=linux_data`, LBA 71859642, 52430401 blocks, seed `9bd6f902`;
+[persistent-boot.md](persistent-boot.md) §13.8). The 2026-11-11/12 notes below record the original guard and system-layer work:
+the old `esp-daily-macos` / `esp-gpu-macos` collection and seed `aced5bf9…` belonged to the retired 27.0.1 line. Section 7 is the
+original test procedure, not a recipe to run unchanged against today's layout.
 
 The installed system's Data volume is `package/NativeRamBlock`: a RAM **seed** (the payload's `scratch-data.img`) plus a persistent
-**store** of the pages the system changed, in a window at the end of `linux_rootfs` served by `package/NativeUfs`
-(`native_ufs_store_open/read/write/sync`). Until this change, a store made for one seed was silently re-initialised by any boot
+**store** of the pages the system changed, in a 200 GiB window over `linux_data` served by `package/NativeUfs`
+(`data-store-part=linux_data`, LBA 71859642; `native_ufs_store_open/read/write/sync`). Before the 2026-11-14 layout this window
+was at the end of `linux_rootfs`. Until this change, a store made for one seed was silently re-initialised by any boot
 with another seed (`Data store state 3`, fresh). A rebuilt Turnip plugin, a staged file or a RAM test image with another seed
 dropped every Data change. The store at the old place had generation 10 at the install: it had been started over about ten
 times that day.
@@ -16,9 +18,9 @@ times that day.
 
 | | What | Where |
 |---|---|---|
-| seed | packed `DBRDISK1` disk, 12 GiB logical (3145728 pages), about 30 000 nonzero pages kept in RAM (`SeedDisk.h`) | `EFI/UniXNU/Payloads/scratch-data.img` on the ESP or in a RAM image |
-| seed identity | `SeedDisk.h seedIdentity`: SHA-256 of `SHNGSEED2`, the size and every nonzero page with its index (plain SHA-256 of the disk up to 2 GiB). `tooling/persist/common.py seed_info` computes the same; checked on the installed seed (`aced5bf9…`) with `Test/seed-identity.cpp` | the store header; printed as 8 hex digits |
-| store window | W = 1 + 96 + 3145728 = 3145825 blocks of 4096 bytes, first LBA = `linux_rootfs` end + 1 - 1 GiB reserve - W = **68119455** since the ESP install | LUN 0, inside `linux_rootfs` |
+| seed | packed `DBRDISK1` disk (12 GiB logical in the original example; the installed seed is 200 GiB), with its nonzero pages kept in RAM (`SeedDisk.h`) | `EFI/UniXNU/Payloads/scratch-data.img` on the ESP or in a RAM image |
+| seed identity | `SeedDisk.h seedIdentity`: SHA-256 of `SHNGSEED2`, the size and every nonzero page with its index (plain SHA-256 of the disk up to 2 GiB). `tooling/persist/common.py seed_info` computes the same; checked on the then-installed seed (`aced5bf9…`) with `Test/seed-identity.cpp`; the installed seed is now `9bd6f902…` | the store header; printed as 8 hex digits |
+| store window | current: 52430401 blocks of 4096 bytes (200 GiB), first LBA **71859642** in `linux_data`; the retired 12 GiB example was W = 3145825 blocks at LBA 68119455 in `linux_rootfs` | LUN 0 |
 | `data-persist` | 0 off; 1 read only (NativeUfs refuses every store write); 2 read-write (direct mode) | boot argument |
 
 In direct mode (`data-persist=2`, `DirectDisk.h`) a changed page lives only in the window. A page whose bitmap bit is set is read
@@ -190,9 +192,10 @@ Not done (options for the RAM, 2026-11-12):
   a new region of `linux_rootfs` for test boots, which this repository does not have yet.
 
 What this does not cover: small seeds (up to 2 GiB: `SparseDisk.h ramSparseIO`) still take a zone page per written page in the lock.
-No current seed is that small (all are 12 GiB).
+No seed in the original 2026-11-12 test set was that small (all were 12 GiB). The installed seed is now 200 GiB; only RAM-test
+seeds may remain small.
 
-Console lines (`grep NativeRamBlock`):
+Console lines (`grep NativeRamBlock`; the `aced5bf9` / LBA 68119455 examples are from the retired 12 GiB store):
 
 ```
 NativeRamBlock: the store belongs to seed aced5bf9 (this seed 469ed440): kept; Data is volatile this boot; data-store-replace=1 starts over
@@ -203,6 +206,8 @@ NativeRamBlock: Data is volatile this boot (state S, data-persist=N): its change
 NativeRamBlock: Data store state S (1 blank, 2 resumed, 3 fresh, 4 failed, 7 kept), header H, first LBA 68119455, 3145728 pages,
                 direct D, seed <this>, store seed <store's>, flags F, generation G, present P
 ```
+
+The current installed boot instead reports first LBA 71859642 and 52430401 blocks, with seed/store seed `9bd6f902`.
 
 The old collection's line is `Data store state S (1 blank, 2 resumed, 3 fresh, 4 failed), header H, first LBA L, 3145728 pages,
 direct D`. `generation` and `present` describe the store as found (or as made). A boot after a kept one shows the same two
@@ -230,8 +235,8 @@ FUA already) and holds new requests until the link is back; a failed sync keeps 
 3. Last, block 0 is rewritten: the same bytes 0-63 plus the extension with `kSelfContained`.
 
 From then on the store is **self-contained**. `DirectDisk.h` reads a clear bit as zero, the store is resumed with any seed of its
-page count, and a seed only matters when a store is started (blank, `sheng-data-reset`, `data-store-replace`). For the installed
-seed, the pass writes at most 30433 pages (118 MiB, 261 extents), about 400 runs.
+page count, and a seed only matters when a store is started (blank, `sheng-data-reset`, `data-store-replace`). For the retired 12 GiB `aced5bf9` seed, the pass wrote at most 30433 pages (118 MiB, 261 extents), about 400 runs. The 2026-11-14
+carry-over of the owner's current store instead copied 554062 present pages ([results-2026-11-14.md](results-2026-11-14.md)).
 
 Power loss. Every run leaves a valid store of the same seed with more pages present, so a cut anywhere means the next boot
 resumes the same disk. `data-store-flatten=1` again skips what is there and finishes. Two cases are left to check:
@@ -306,8 +311,8 @@ new seed.
 | Tool | Data store behaviour |
 |---|---|
 | `tooling/bootimg/build-ram-images.py` | `data-persist` of a RAM macOS image (`data_store_args`, note on stderr). Without `PIANO_DATA_PERSIST`: **2 only when the image's seed is the installed one**; another seed gets **0**; an unknown installed seed gets 2 with a collection that has the guard, else 0. `PIANO_DATA_PERSIST=0\|1\|2` overrides, but 2 is refused when the seed is not known to be the installed one and the collection has no guard. `PIANO_DATA_STORE_REPLACE=1\|<8 hex>` and `PIANO_DATA_STORE_FLATTEN=1` (need 2 and the guard). `data-*` in `PIANO_EXTRA_ARGS` is refused, and so is 2 for a seed whose size is not the installed store's (section 8). The build record has `data_store` |
-| installed seed | `PIANO_INSTALLED_SEED` (environment or `~/.config/piano/env`): the identity (8 to 64 hex digits) or an ESP build record (`.json`); else `out/persistent/installed.json`, which `maint-session.py` writes with every ESP it installs (and removes on its rollback). For the installed ESP: `PIANO_INSTALLED_SEED=aced5bf9794b42f3c8ffeeef3078a408ff506f5b0b374e02eed6f0ab56e52616` |
-| `tooling/k27/build-native-image.sh` | `out/ram` as above; the dump image `out/ram-dump` keeps `data-persist=0` |
+| installed seed | `PIANO_INSTALLED_SEED` (environment or `~/.config/piano/env`): the identity (8 to 64 hex digits) or an ESP build record (`.json`); else `out/persistent/installed.json`, which `maint-session.py` writes with every ESP it installs (and removes on its rollback). For the installed 200 GiB store: `PIANO_INSTALLED_SEED=9bd6f902…` (or the installed `esp-k273-v3` record) |
+| `tooling/k273/build-k273-image.sh` | current 27.3 builder with `K273_KERNEL`: `out/ram` as above; the dump image `out/ram-dump` keeps `data-persist=0`; root-layout caveat in `k273-line.md` §4 |
 | `tooling/persist/base-seed.py` | section 9: `pin` the installed ESP's seed and trust cache as the store's base (`out/base/<identity16>/`, read only, never replaced); `show`, `path`, `diff` |
 | `tooling/persist/build-esp.py` | the daily profile takes the pinned base's seed and trust cache (`--seed base --trust base`); `--layer DIR` the system layer's trust cache (section 9). The macos entries keep `data-persist=2`. `--replace-data [1\|HEX8]` adds `data-store-replace` for an intended one-time switch; `--flatten-data` adds `data-store-flatten=1` (a no-op once the store is self-contained). A seed that is not the installed one gets a loud note (with the guard: kept, Data volatile, unless the store is self-contained). With a collection without the guard it is refused unless `--replace-data`. The installed trust cache's CDHashes are checked against the new one (`--installed-trust`). `--arg data-*` is refused. The record has `data_store` |
 | `tooling/persist/store-test-images.py` | the RAM images of section 7: `out/ram-store-probe` (`data-persist=1`, reset 90 s), `out/ram-store-guard` (`=2`, another seed, 240 s), `--flatten`: `out/ram-store-flatten` (the installed seed, trust cache and ADT from `--installed-esp`, `data-store-flatten=1`, 180 s) |
@@ -321,15 +326,14 @@ python3 tooling/persist/test-data-store.py            # header reader vs the dri
 python3 tooling/persist/test-persist.py               # the install session against a fake tablet (needs out/persistent's inputs)
 ```
 
-## 7. Procedure (RAM boots only; nothing here writes the owner's store before step T4)
+## 7. Procedure (historical 2026-11-11/12 RAM test; use the current §13.8 layout and k273 images now)
 
 On the Mac, from a checkout with these commits. The installed ESP image is the one `maint-session.py` wrote, in the persist
 checkout's `out/persistent/`:
 
 ```sh
-grep -q PIANO_INSTALLED_SEED ~/.config/piano/env || \
-  echo 'PIANO_INSTALLED_SEED=aced5bf9794b42f3c8ffeeef3078a408ff506f5b0b374e02eed6f0ab56e52616' >> ~/.config/piano/env
-PIANO_A830_METAL=0 tooling/k27/build-native-image.sh       # the collection with the guard, out/ram-dump (about 8 min)
+# Set PIANO_INSTALLED_SEED to the installed esp-k273-v3.json record (seed prefix 9bd6f902), not the retired aced5bf9 identity.
+PIANO_A830_METAL=0 K273_KERNEL=<prepared kernel-k273-...-native.macho> tooling/k273/build-k273-image.sh  # current builder; root-layout caveat in k273-line.md §4
 python3 tooling/persist/store-test-images.py --installed-esp <persist checkout>/out/persistent/esp-daily-macos.img
 ```
 
@@ -346,6 +350,8 @@ NativeRamBlock: the store belongs to seed aced5bf9 (this seed 469ed440): kept; D
 NativeRamBlock: Data is volatile this boot (state 7, data-persist=1): its changes stay in RAM and are gone at the next boot
 NativeRamBlock: Data store state 7 (…), header 3, first LBA 68119455, 3145728 pages, direct 0, seed 469ed440, store seed aced5bf9, flags 0, generation G, present P
 ```
+
+For the current installed store the equivalent identity is `9bd6f902`, first LBA 71859642, 52430401 blocks (200 GiB).
 
 Write down G and P. Other outcomes:
 - `store seed 469ed440`, state 6: a store an earlier RAM test left, not the owner's. Rebuild the guard image with another seed
@@ -364,14 +370,13 @@ same three lines with `data-persist=2` in the second one and the **same G and P*
 
 **T2, probe again** (the T0 image): the same lines as T0, the same G and P. T1 wrote nothing.
 
-**T3, the installed boot**: `fastboot -s $PIANO_SERIAL reboot`. The owner's macOS (old collection) comes up with its Data as
-before.
-- With the daily ESP's USB console, `tooling/native/usb-console.py --capture 200` shows
-  `NativeRamBlock: Data store state 2 (1 blank, 2 resumed, 3 fresh, 4 failed), header 0, first LBA 68119455, 3145728 pages, direct 1`.
+**T3, the installed boot**: `fastboot -s $PIANO_SERIAL reboot`. The owner's macOS comes up with its Data as before; the current
+installed collection is 27.3 with the store guard.
+- With the daily ESP's USB console, `tooling/native/usb-console.py --capture 200` shows the resumed store. The historical example
+  was `state 2 ..., first LBA 68119455, 3145728 pages, direct 1`; the current installed boot resumes the grown `linux_data` store
+  at LBA 71859642 (52430401 blocks, seed/store seed `9bd6f902`).
   The console's `reset fastboot` gets back to ABL.
-- Without the console (`esp-gpu-macos`): power + volume-down, then T2 once more: `store seed aced5bf9`, the same G (a resume
-  never changes it), present at least P.
-- If T0 showed another store seed, the installed (old) kernel starts the store over here (state 3), as it always did.
+- The old `esp-gpu-macos` / old-kernel cases below belonged to the retired collection and are not current outcomes.
 
 **T4, flatten (optional, tomorrow, with the owner's go-ahead).** It writes the store. A NAS copy of the store region first is
 cheap insurance: since 2026-11-12 `maint-session.py maint-boot map store-backup maint-exit` takes one (the store window at its
@@ -382,7 +387,8 @@ python3 tooling/persist/store-test-images.py --installed-esp <…>/esp-daily-mac
 tooling/native/native-loop.sh out/ram-store-flatten/boot-piano-macos-ram-A-bundled.img
 ```
 
-Expected (M at most 30433, a few seconds):
+Historical expected output for the retired `aced5bf9` / 12 GiB store (M at most 30433, a few seconds); not the current 200 GiB
+store's expected line:
 
 ```
 NativeRamBlock: flatten: seed aced5bf9, P of 3145728 pages present; writing the seed's other pages into the store
@@ -398,8 +404,8 @@ Then:
 
 From now on the guard image (`data-persist=2`, any seed) resumes the owner's Data. Do not boot it unless that is meant.
 
-**T5, later (cable session): the guard on the installed system.** Build an ESP from a collection with these commits. Keep the
-installed seed and trust cache, so the plugin stays the one the store has:
+**T5 (done on the installed system): the guard.** The installed 27.3 collection carries it. The original build recipe below is a
+retired 27.0.1 record, not a command for the current installation:
 `PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh`, then `build-esp.py --profile daily --default macos` (since section 9 its
 default seed and trust cache are the pinned base's: `--seed base --trust base`), then `maint-session.py … esp-final …`
 (docs/persistent-boot.md §11). Once the store is self-contained, the ESP's seed may change; the trust cache rule of section 4 still
@@ -447,9 +453,8 @@ or a bug.
     - `0 no memory` in the status line;
     - `EIO` instead of `ENOMEM` if a refusal still happens (APFS's handling of either is its own).
   - The RAM: Data's pages are wired. A desktop session can hold 1.5 GiB of them (section 3), which the GPU then lacks.
-- Until the ESP has the new collection (T5), the installed system itself has no guard. Any RAM image **built before this change**
-  with `data-persist=2` and another seed still wipes the store: the installed system's kernel does not protect it, the test image's
-  does.
+- The installed 27.3 collection has the guard, so the installed store is protected today. Any RAM image **built before the guard**
+  with `data-persist=2` and another seed remains unsafe; use the current k273 collection and the store checks.
 - After a flatten the guard no longer separates test images from the owner's Data (section 4). Staged files no longer reach it,
   and the trust cache must keep the store's plugin CDHashes.
 - `data-store-replace=1` left in an ESP replaces any store that is not its seed's (a test image's, after a `sheng-data-reset`

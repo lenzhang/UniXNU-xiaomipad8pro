@@ -117,12 +117,10 @@ piano-boot-guard)` when another holder keeps it.
 ## 6. Build
 
 ```sh
-# kernel: in $PIANO_K27_TREE/out/k27/xnu (at 0062): git am <this repo>/patches/k27/0063-*.patch
-K27_VARIANT=native "$PIANO_K27_TREE/build-k27-piano.sh"         # copy .../mach.development.bcm2837.unstripped to
-                                                                  #   $PIANO_K27_TREE/out/k27/kernel-k27-0063-native.macho
+tooling/k273/prepare-k27-tree.sh 0063                             # current 27.3 kernel and tree
 tooling/k27/test-piano-guard.sh                                   # host tests (the policy header, and the patch carries it)
 python3 tooling/persist/test-data-store.py                        # build-esp.py's --boot-guard among its checks
-K27_KERNEL=$PIANO_K27_TREE/out/k27/kernel-k27-0063-native.macho PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh
+K273_KERNEL=<prepared kernel-k273-0063-...-native.macho> PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k273/build-k273-image.sh
 tooling/k27/build-guard-test-images.sh                            # out/ram-guard-{ping0,hang,nohealth,healthy,latehang,sleep}
 ```
 

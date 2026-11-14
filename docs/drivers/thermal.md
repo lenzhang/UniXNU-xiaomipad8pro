@@ -2,9 +2,11 @@
 
 Status: code, 2026-11-11. `package/PianoThermal` is built, host-tested (`thermal_host: all passed`; the sensor map checked against
 the DT: 47 sensors) and linked into the native KC (kernel 0059: `com.unixnu.driver.PianoThermal: linked, ... 374 pointers`, none
-from outside this repository), inert without `piano-thermal` / `piano-cpufreq`; **not run on hardware**. Template: `README.md`. B6, the eleven
+from outside this repository), inert without `piano-thermal` / `piano-cpufreq`; **`piano-thermal=1 piano-cpufreq=3` ran on the
+tablet 2026-11-12 in the thermal probes `ram-pol-observe` and `ram-pol-suspend` (§8 item 8)**; the level 2 protection steps and the
+sleep hooks have not run. Template: `README.md`. B6, the eleven
 PMIC board thermistors (battery, charger, connectors, skin, ...) and `piano_thermal_board_temps()` for charging safety: §12
-(`piano-thermal-adc=1`, host-tested, linked, not run). 2026-11-11 (host-tested, linked, not run): PianoPolicy's
+(`piano-thermal-adc=1`, host-tested, linked; **ran on the tablet 2026-11-12**, §12.10; all 11 channels by 2026-11-13, [results-2026-11-13.md](../results-2026-11-13.md)). 2026-11-11 (host-tested, linked, not run): PianoPolicy's
 `"piano-thermal-profile"` (§5, `docs/policy.md` §5.2) and the power-tree join for system sleep (§5, `docs/power.md` §4).
 2026-11-11 (host-tested, linked, not run): the TSENS upper/lower threshold interrupts behind `piano-thermal-irq=1` (§13; default
 off; native SPI delivery under Gunyah unproven, the batched test §13.8 settles it).

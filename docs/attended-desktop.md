@@ -140,8 +140,8 @@ frame ([boot-time.md](boot-time.md) §3.1). The desktop images have neither (§3
 
 The desk seed's launchd overrides (disabled, so launchd never loads them and their Mach services are not advertised; a client
 gets an invalid connection at once): `com.apple.watchdogd`, `com.apple.mobileactivationd`, `com.apple.security.xprotectd`,
-`com.apple.PerfPowerServices` (and `com.apple.audiomxd` in quiet), with `k27-deny-exec` for watchdogd and PerfPowerServices as well
-in case a 27.0.1 label differs. And `/Library/Preferences/com.apple.keyboardtype.plist` with our two keyboards as ANSI (`20555-6900-0`
+`com.apple.PerfPowerServices` (and `com.apple.audiomxd` in quiet), with `k27-deny-exec` for watchdogd and PerfPowerServices as well;
+that extra guard was for a possible 27.0.1 label difference. New images use the 27.3 labels. And `/Library/Preferences/com.apple.keyboardtype.plist` with our two keyboards as ANSI (`20555-6900-0`
 the cover, `20565-6900-0` PianoDwc3's: product-vendor-0 => 40), written by the boot job as root, so Keyboard Setup Assistant does not
 ask (inference: the preference administrators pre-set for the same purpose; checklist step 3 checks it). Risk (inference): a client that needs one of those daemons fails at once instead of finding a crashing or spinning one; none
 of them answered before either. The plain image is the A/B partner.
@@ -151,10 +151,13 @@ of them answered before either. The plain image is the A/B partner.
 Built from main, after these commits (the KC with the k27 0064 kernel for the RTC calendar):
 
 ```sh
-K=$(sed -n 's/^PIANO_K27_TREE=//p' ~/.config/piano/env)
-K27_KERNEL=$K/out/k27/kernel-k27-0064-native.macho PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh
-DESK_RTC_OFFSET=1794397906 tooling/k27/build-desktop-images.sh desk quiet plain diag
+tooling/k273/prepare-k27-tree.sh 0064
+K273_KERNEL=<prepared kernel-k273-0064-...-native.macho> PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k273/build-k273-image.sh
+DESK_RTC_OFFSET=1794397906 tooling/k27/build-desktop-images.sh desk quiet plain diag  # packaging the 27.3 KC
 ```
+
+The original 27.0.1 `K27_KERNEL=... tooling/k27/build-native-image.sh` command is retired. Current images use the k273 builder
+(root-layout caveat: [k273-line.md](k273-line.md) §4).
 
 `build-native-image.sh` restages the Turnip seed only when its inputs changed (the same seed as attend5's otherwise). The RTC
 offset is the rtc run's (`tooling/native/rtc-offset.py`, 2026-11-12, the same within 1 s across PSCI resets); without
@@ -209,7 +212,7 @@ for every desk image. Built in an agent worktree from the main checkout's collec
 the command line 959 bytes. In the main checkout:
 
 ```sh
-DESK_RTC_OFFSET=1794397906 tooling/k27/build-desktop-images.sh desk-dev
+DESK_RTC_OFFSET=1794397906 tooling/k27/build-desktop-images.sh desk-dev  # package the k273-built 27.3 KC, not the retired 27.0.1 builder
 tooling/native/desk-login.sh             # once the run's console capture has started; then usb-console.py --port 1 or ssh
 ```
 
@@ -219,7 +222,7 @@ bytes). The owner's attended image with all of the day's fixes (the touch announ
 by default), in the main checkout:
 
 ```sh
-DESK_RTC_OFFSET=1794397906 tooling/k27/build-desktop-images.sh desk     # after build-native-image.sh above when a marker is missing
+DESK_RTC_OFFSET=1794397906 tooling/k27/build-desktop-images.sh desk     # after the k273 build above when a marker is missing
 ```
 
 Variants by environment: `DESK_TOUCH=0` (no touch screen: the fallback if it resets or its watchdog lines never stop),

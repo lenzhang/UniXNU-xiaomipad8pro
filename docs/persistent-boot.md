@@ -1,8 +1,11 @@
 # Persistent native macOS boot on piano (no `fastboot boot`)
 
-Status 2026-11-11: **prepared and tested offline only** (nothing has been written to the tablet). The owner approved making native
-macOS boot by itself from power-on, replacing Ubuntu, with plan option A1 (local notes, `persistent-boot-plan.md`, not
-published). On 06:42 the owner set the rules for the install session, which this procedure follows:
+Status 2026-11-14: **installed and updated on the tablet**. The installed system is macOS 27.3 only on the §13.8 whole-disk
+layout: root on `linux_rootfs`, the owner's 200 GiB Data store over `linux_data` (LBA 71859642, seed `9bd6f902`), `boot_a` v5,
+and `esp-k273-v2` with the v3 delta ([results-2026-11-14.md](results-2026-11-14.md)). The original 2026-11-11 procedure below
+was prepared and tested offline first; persistent boot was then installed on 2026-11-11/13 and updated on 2026-11-14. The owner
+approved making native macOS boot by itself from power-on, replacing Ubuntu, with plan option A1 (local notes,
+`persistent-boot-plan.md`, not published). On 06:42 the owner set the rules for the install session, which this procedure follows:
 
 - no question before each write step (the script has `--dry-run` to see everything first);
 - before any write, a **verified NAS backup** of every affected region;
@@ -14,7 +17,7 @@ This is the one exception to the RAM-boot-only rule of `docs/PROJECT-MAP.md` §6
 the regions in §1, by `dd` from the Ubuntu release's maintenance RAM image. It never uses `fastboot flash`, `erase`, `set_active`,
 or any `oem` command to ABL.
 
-## 1. What is written where
+## 1. What is written where (the initial 2026-11-11 layout; current layout: §13.8)
 
 LUN 0 has 4096-byte LBAs (124552192 blocks). The partition numbers are the GPT's (1-based).
 
@@ -83,7 +86,7 @@ UniXNU checkout (reverse-check idiom); `tooling/persist/build-all.sh` (FD=1) reb
 
 ```sh
 FD=1 tooling/persist/build-all.sh          # FD A with the patch, boot_a candidates, ESP images (ESP_PROFILE), GPT, SHA256SUMS
-RAM=1 tooling/persist/build-all.sh         # optional: also out/ram + out/ram-dump with that FD (or tooling/k27/build-native-image.sh)
+RAM=1 tooling/persist/build-all.sh         # optional historical build; current 27.3 RAM images use K273_KERNEL=... tooling/k273/build-k273-image.sh (root-layout caveat: k273-line.md §4)
 tooling/persist/sign.sh                    # on the signing host: -signed images, offline AVB check, out/persistent/macos-set/
 python3 tooling/persist/test-persist.py    # host-only tests: tablet.sh, and the whole session against a fake tablet
 ```
@@ -263,7 +266,10 @@ The store's format, the store guard (another seed's store is kept and Data runs 
 (`PIANO_INSTALLED_SEED`, `build-esp.py --replace-data/--flatten-data`, `store-test-images.py`) and the RAM test procedure that proves
 the guard without risking the installed store: [data-store.md](data-store.md).
 
-## 11. ESP v3: the daily system with the owner's Data (built 2026-11-12; not installed)
+## 11. ESP v3: the daily system with the owner's Data (**retired 27.0.1 plan; built 2026-11-12, never installed**)
+
+**Do not run this section's 27.0.1 build or install commands.** The installed system is now 27.3-only on §13.8's layout. This
+section remains as the dated v3 design and verification record.
 
 Built offline in an agent worktree on main `3c7ebec` plus the change that wrote this section, after the day's tablet results
 ([results-2026-11-12.md](results-2026-11-12.md)): the boot guard's G1-G4, PianoDwc3's cold start (C0-C5, C7 and the re-tests C6b and
@@ -273,7 +279,7 @@ installed and not run.** It replaces the installed `esp-daily2-macos` (`e0acb375
 
 ### 11.1 Contents
 
-| Payload file | Installed (`esp-daily2-macos`) | v3 (`esp-daily3-macos`) |
+| Payload file | Then-installed (`esp-daily2-macos`, retired) | v3 (`esp-daily3-macos`, never installed) |
 |---|---|---|
 | `kernel.macho` (KC) | `3850545b…`: no 0060, no 0063 | `ed7430c4c6c2b7df…`: the k27 **0064** kernel `2fe50b346041ab9f…` (0060 RTC, 0061/0062/0064 opt-in, 0063 boot guard) and the 25 native kexts of `configs/k27-native-kexts.txt` (PianoKeyboard and PianoCamera now listed). `check-native-kexts.py`: 25 linked, none from outside this repository; every vtable check 0 problem slots |
 | `kernel.macho.adt` | `139af652…`, vmm-present 0 | `acea0fecbba9536c…`, vmm-present 0 |
@@ -342,7 +348,10 @@ v3 trusts all five, so the layer can go in on v3's first boot. Until it does, Da
 the boxes behind the login window's clock, no video wallpaper). The kernel side of the map fix is in v3 already. The undo is
 `out/layer-none` (`configs/userland-none.toml`, archive `50737a17…`): every unit out, the base's plugin files back.
 
-### 11.4 Build (Mac, offline, no device)
+### 11.4 Build (Mac, offline, no device) — historical 27.0.1 recipe, do not run
+
+Current images use `tooling/k273/build-k273-image.sh` with `K273_KERNEL`; the current root-layout caveat is in
+[k273-line.md](k273-line.md) §4. The commands below are the retired v3 build record.
 
 ```sh
 K=$(sed -n 's/^PIANO_K27_TREE=//p' ~/.config/piano/env)
@@ -426,7 +435,7 @@ the console port working beside it. It is the transport's first hardware run, wh
 Not for the queue: `out/ram-v3-layer` (`c3e77fb713d171c8…`) is the layer's session image: the same payload with `piano-usb-net=1`,
 `PIANO_DATA_PERSIST=2` (the owner's own Data, resumed and written) and no reset at all. It is booted only with the owner present.
 
-### 11.7 Install (cable session)
+### 11.7 Install (retired cable session; do not run)
 
 The install state is the persist worktree's (`out/persistent/session/state.json`, the checkout that installed daily2), whose tooling
 is older than this tree's: it lacks the installed-store check and `store-backup`. So this checkout's `maint-session.py` runs on that
@@ -508,12 +517,12 @@ The layer's own rollback: `out/layer-none` the same way (its two files, `sudo sh
    `rollback esp-final store-backup`, `maint-exit`, which puts the ESP and the owner's Data back to the moment of the backup
    together.
 
-## 12. boot_a v5: the FD with DarwinBoot's 13 GiB window (built 2026-11-12; not signed, not installed)
+## 12. boot_a v5: the FD with DarwinBoot's 13 GiB window (built 2026-11-12; **signed and installed 2026-11-13**)
 
 The RAM images carry FD A built with `firmware/patches/darwinboot/0001` since 2026-11-12 18:40 (`tooling/firmware/build-fd.sh`), so
-XNU gets 13310 MiB there; the installed `boot_a` (v4, `1b212281…`) carries the FD of 2026-11-11 (`6d15f0f8…`), whose DarwinBoot
-refuses an ADT asking for more than 8192 MiB. The installed system gets the 13 GiB window with `boot_a` v5 **and** an ESP whose ADT
-asks for it, in that order (§12.3). `boot_b` and every other partition stay untouched.
+XNU gets 13310 MiB there. The previous `boot_a` (v4, `1b212281…`) carried the FD of 2026-11-11 (`6d15f0f8…`), whose DarwinBoot
+refused an ADT asking for more than 8192 MiB. The installed system has the 13 GiB window with `boot_a` **v5** (FD `ce719ffb…`)
+and a matching ESP ([results-2026-11-12.md](results-2026-11-12.md) "Midnight"). `boot_b` and every other partition stay untouched.
 
 ### 12.1 The image
 
@@ -523,7 +532,7 @@ python3 tooling/persist/build-boot.py --series 5 --fd out/fd/piano-uefi-A-bundle
 tooling/persist/sign.sh out/persistent 5        # on the signing host (§12.2), then build-boot.py --verify --series 5
 ```
 
-| | v4 (installed) | v5 |
+| | v4 (previously installed) | v5 (installed 2026-11-13) |
 |---|---|---|
 | unsigned image | `605c3a60…`, 3301376 bytes | **`d1363bb16351281adb60e044944c344729ad7f53c667377725d7b4f38c135360`**, 3301376 bytes |
 | boot v4 header (page 4096, os_version 15.0.0, patch level 2026-02, no ramdisk, empty command line) | | byte for byte v4's (first 4096 bytes equal) |
@@ -531,7 +540,7 @@ tooling/persist/sign.sh out/persistent 5        # on the signing host (§12.2), 
 | FD (3 MiB) | `6d15f0f8…`: unixnu/0001 | `ce719ffbe9998b0960e7f142a2bbd684046e24611f903e0cd5a11ba0f8d802af`: unixnu/0001 and darwinboot/0001 (both `build-fd.sh` stamps; bound `0x340000000`) |
 | boot DTB | `50636eff…` | the same bytes |
 | kernel field | `a1df7f14…` | `72bd1c28742090d64e0bcfc53cdc4878775de03ad7ee64c8b11b1eb689b30c59`: **the kernel field of the RAM images that ran on the tablet today** (desk-dev8n, -13, -14, -15: `--same-kernel-as` checks it) |
-| signed | `1b212281…` (key sha1 `f5151930…`) | pending: 100663296 bytes, the same key |
+| signed | `1b212281…` (key sha1 `f5151930…`) | signed and installed 2026-11-13: 100663296 bytes, the same key |
 
 The record `boot-v5.json` keeps the FD's bound (`fd.ram_window` = 13312 MiB); `maint-session.py` reads `boot.json` and every
 `boot-v*.json` of its directory. `build-boot.py --verify` now records an image as signed only when every check passed (before, an
@@ -574,9 +583,9 @@ input, else the ADT read out of the image. `test-persist.py` runs both orders an
 
 ### 12.4 The ESP that goes with it
 
-Any daily ESP built with the 13 GiB ADT (`out/adt/piano-k27.adt` of `PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh`,
-`/chosen darwinboot-memory-size 0x33fe00000`) and `PIANO_BOOT_FD_RAM_WINDOW=1` (`build-esp.py`'s own gate: it states that `boot_a`
-gets v5 first; the session checks it):
+The 2026-11-12 daily-ESP recipe below used the retired 27.0.1 `tooling/k27/build-native-image.sh` path; **do not run it now**.
+The installed v5 + 13 GiB pair already exists. Current 27.3 images use `tooling/k273/build-k273-image.sh` with `K273_KERNEL`
+(root-layout caveat: [k273-line.md](k273-line.md) §4), and the installed ESP uses `build-k273-esp.py` (§13.8). Historical recipe:
 
 ```sh
 PIANO_BOOT_FD_RAM_WINDOW=1 python3 tooling/persist/build-esp.py --profile daily --default macos --boot-guard 180 \
@@ -650,11 +659,10 @@ python3 $P abl-final reboot
 
 ### 12.8 Risks
 
-- Signing needs the signing host (§12.2); until it signs, nothing can be installed (`boot-a` refuses an unsigned image).
-- v5's ESP path has not run: the RAM boots that proved FD `ce719ffb…` all carried their payload in RAM (UniXNU's RAM disk first);
-  the UniXNU in this FD is newer than v4's. `ram-boot-a` closes that gap without a write.
-- The 13 GiB window with the direct store (`data-persist=2`) has not run (the 13 GiB boots were `data-persist=0`): `store-backup`,
-  and a RAM test of the new ESP's payload with the read-only probe (`PIANO_DATA_PERSIST=1`, §11.6) before the install.
+- Signing and installation are done: v5 was signed and installed 2026-11-13; the installed 27.3 system boots under it
+  ([results-2026-11-12.md](results-2026-11-12.md) "Midnight").
+- v5's ESP path has run: the installed system boots its payload from partition 37 under v5.
+- The 13 GiB window with the direct store (`data-persist=2`) has run on the installed 27.3 entry, including the §13.8 layout.
 - If v5 never reaches XNU, the boot guard cannot act (it lives in XNU): power + volume-down needs the owner. `ram-boot-a` shows ABL
   takes v5 and the UEFI reaches the ESP.
 - The FD build is not bit-reproducible: v5 is identified by hashes (`out/fd/piano-uefi-A-bundled.fd` = `ce719ffb…`; its `.prev` is
@@ -663,16 +671,20 @@ python3 $P abl-final reboot
 ## 13. macOS 27.3 only: retiring 27.0.1 (installed 2026-11-14; the whole-disk layout of 13.8 installed the same day)
 
 Owner decision 2026-11-14: (1) replace the installed dual ESP with a 27.3-only ESP; (2) only after that passes, back up and clear
-`linux_rootfs`, which holds the 27.0.1 system volume and its Data store. `boot_a` (v5, DarwinBoot's 13 GiB window) stays as it is,
-and nothing on `linux_data` is written: the 27.3 root from its block 0 and the 27.3 Data store at its end (LBA 117998394-124290042,
-bound to that LBA). No GPT change in either step. The 27.3 line itself: [k273-line.md](k273-line.md) §7.
+`linux_rootfs`, which held the 27.0.1 system volume and its Data store. `boot_a` (v5, DarwinBoot's 13 GiB window) stayed unchanged.
+The first step left `linux_data` with the 27.3 root at block 0 and a 24 GiB store at its end (LBA 117998394, seed 89860516).
+**Later the same day §13.8 superseded that layout:** the root moved to `linux_rootfs`, and the owner's store grew to 200 GiB over
+`linux_data` (LBA 71859642, seed `9bd6f902`). The 27.3 line itself: [k273-line.md](k273-line.md) §7.
 
 ### 13.1 The image
 
 ```sh
+# Historical step-1 build (esp-k273-only rollback target), not the current v2/v3 layout:
 python3 tooling/k273/build-k273-esp.py --base out/persistent/esp-dual33d-k273d.json --out out/persistent \
         --expect-seed 89860516 --expect-store-lba 117998394 --expect-store-part linux_data
 ```
+
+For the current installation use §13.8's `--root-part linux_rootfs` build, seed `9bd6f902` and store LBA 71859642.
 
 `esp-k273-only.img`, 1073741824 bytes, sha256 **`9fe17e65015f8c16743bd1faf3c64e060003784a934c409261a021134a4dff3b`** (the same
 bytes on every build from the same base), record `esp-k273-only.json` beside it:
@@ -682,7 +694,7 @@ bytes on every build from the same base), record `esp-k273-only.json` beside it:
 | base | `esp-dual33d-k273d.img` (`93baea7a…`, installed since 2026-11-13 09:45), read by the independent FAT reader and by mtools, both checked against its record and against each other |
 | payload, byte for byte | `Payloads/k273/kernel.macho` `3fd3ed71…`, `.adt` `7e1ce73d…` (13310 MiB window), `.trustcache` `72ebcaf8…`, `scratch-data.img` `848c8252…` (seed 89860516, 24 GiB) |
 | firmware | what the 27.3 collection pins, the base's files: `PianoAudio/fs19xx.fsm` `ab060b84…`, `PianoVideo/vpu35_4v.mbn` `95c5882f…` |
-| `macos-27.3` (default, timeout 3 s) | the base's entry, every key byte for byte; the line 989 bytes with `native-ufs-root-part=linux_data data-store-lba=117998394 data-persist=2` |
+| `macos-27.3` (default, timeout 3 s) | the base's entry, every key byte for byte; the step-1/rollback line 989 bytes with `native-ufs-root-part=linux_data data-store-lba=117998394 data-persist=2` (current v2/v3: root `linux_rootfs`, store LBA 71859642) |
 | `fastboot` | the 27.3 payload with the line minus the UFS root, the store, the console mirror and every `piano-*` driver, plus `data-persist=0 piano-reset-after=1 piano-reset-to=bootloader` (490 bytes) |
 | `reset`, `shutdown`, `tools` | the standard actions |
 | not there | the 27.0.1 payload (`Payloads/kernel.macho` and its three files), the `macos`, `macos-diag` entries; `macos-27.3-diag` (1037 bytes with the reset: over DarwinBoot's 1000) |
@@ -691,15 +703,16 @@ The builder takes the store facts from its inputs, nothing fixed: the partition 
 from the seed, and `common.check_store_size` checks that the LBA is NativeUfs's place for that seed; `--expect-*` only assert them.
 It refuses a menu with any entry that uses linux_rootfs (`common.entry_uses_rootfs`: an entry that mounts a UFS root or opens a
 store without `native-ufs-root-part` uses it as much as one that names it). After writing, the image is read back by both readers:
-every 27.3 file and the line must be the base's. The record's `seed` and `store` are the 27.3 store's (`store.partition linux_data`,
-`first_lba 117998394`, `blocks 6291649`, `bound`), which is what `maint-session.py` gates on (§13.3).
+every 27.3 file and the line must be the base's. The step-1 record's `seed` and `store` are its 27.3 store's (`store.partition linux_data`,
+`first_lba 117998394`, `blocks 6291649`, `bound`), which is what `maint-session.py` gated on then (§13.3). The installed v2/v3
+record instead gates on LBA 71859642, 52430401 blocks and seed `9bd6f902` (§13.8 step 4).
 
 ### 13.2 Its RAM test: `out/ram-k273-entry2` counts
 
 No new RAM boot. `ram-k273-entry2` (`3fb5519b…`) carries exactly this entry: its collection, ADT, trust cache and seed hash to the
 four payload files above, its 8-CPU line is the entry's line byte for byte (989 bytes), its firmware files are the same, and its FD
-is v5's (`ce719ffb…`). And the installed dual ESP has booted this entry from these files as its default every day since 2026-11-13
-09:45 (results-2026-11-13.md). What a RAM image cannot exercise is only what changes: the FAT layout and `unixnu.toml`, which UniXNU
+is v5's (`ce719ffb…`). The installed dual ESP had booted this entry from these files as its default from 2026-11-13 until the
+27.3-only ESP replaced it on 2026-11-14 ([results-2026-11-13.md](results-2026-11-13.md), [results-2026-11-14.md](results-2026-11-14.md)). What a RAM image cannot exercise is only what changes: the FAT layout and `unixnu.toml`, which UniXNU
 reads from partition 37 alone. Those are covered by the host read-backs (two readers), the session's read-back of partition 37, and
 the first boot, with `rollback esp-final` behind it. Running entry2 again would add nothing and would open the owner's 27.3 store
 read-write (`data-persist=2`): leave it.
@@ -707,22 +720,25 @@ read-write (`data-persist=2`): leave it.
 ### 13.3 What maint-session.py checks for a 27.3-only record
 
 A record whose `store` names its partition and first LBA (`esp_store`) is gated on that store, not on linux_rootfs's:
-- `map` (with `--esp esp-k273-only.img`, else the ESP this install last wrote): linux_data's block 0 is the SHNGROOT manifest with
-  the image + 1024 blocks below the window; the window lies inside linux_data as mapped and at NativeUfs's place for its size there;
-  its header is valid, of the record's seed, bound to that LBA. The line a script gates on:
+- For the step-1 `esp-k273-only` record, `map` checked linux_data's block 0 for the SHNGROOT manifest and its old 24 GiB window;
+  the line a script gated on was:
   `ok    the store at LBA 117998394 on linux_data (seed 89860516f973e537, generation G, bound to LBA 117998394) IS the one this ESP resumes (seed 89860516f973e537)`.
-  linux_rootfs is only reported (`no entry of esp-k273-only.img uses it`; its block 0 as the 27.0.1 manifest or `zero (cleared)`).
+  **Current v2/v3:** the root manifest is on `linux_rootfs`; `linux_data` starts the grown store at LBA 71859642, with 52430401
+  blocks and seed `9bd6f902`. The current gate is `ok ... LBA 71859642 ... seed 9bd6f902 ... IS the one this ESP resumes` (§13.8).
+  Before §13.8, linux_rootfs was only reported (`no entry of esp-k273-only.img uses it`; its block 0 as the 27.0.1 manifest or
+  `zero (cleared)`); it now holds the 27.3 root manifest.
 - `esp-final` reads the same store again and refuses on any mismatch (bound elsewhere, unbound, another seed, blank, a window that
   is not NativeUfs's place); the pair rule as before (v5's DarwinBoot takes 13310 MiB).
-- `check`: linux_data's manifest block as `map` read it, the store again.
+- `check`: the root manifest block for the selected layout (linux_data for step 1, linux_rootfs for v2/v3), then the store again.
 - `rollback esp(-final)` restores the backed-up ESP and now writes `installed.json` for it (its record's seed); it refuses an ESP
   whose default entry boots from linux_rootfs while linux_rootfs holds no root image (after `rootfs-clear`: `rollback rootfs-clear`
   first).
 
 ### 13.4 Step 1: install the ESP (session A)
 
-The install state is the main checkout's `out/persistent` (`installed.json`: `esp-dual33d-k273d.img`, `session/state.json`). Run
-there, or from another checkout with `export PIANO_PERSIST_OUT=<main checkout>/out/persistent` and the image and record copied
+The install state was the main checkout's `out/persistent` (`installed.json` then named `esp-dual33d-k273d.img`; after this step
+it names what `esp-final` last wrote: `esp-k273-v2`, then the v3 delta). For another checkout, set
+`PIANO_PERSIST_OUT=<main checkout>/out/persistent` and copy the image and record
 into it (`cp -c out/persistent/esp-k273-only.{img,json} $PIANO_PERSIST_OUT/`). `PIANO_BACKUP_DIR` (the external SSD) mounted.
 
 ```sh
@@ -740,12 +756,14 @@ python3 $P abl-final reboot
   dual ESP from it.
 - `map` must print the `ok ... IS the one this ESP resumes` line of §13.3. `esp-final` writes partition 37 and reads it back
   through `sda37` and through LUN 0 (= `9fe17e65…`); `check` then reads everything else as unchanged.
-- Then set `PIANO_INSTALLED_SEED` in `~/.config/piano/env` to `89860516` (or `<checkout>/out/persistent/esp-k273-only.json`): it
-  wins over `installed.json` and still names the 27.0.1 seed, which the image builders would otherwise compare against.
+- After step 1, `PIANO_INSTALLED_SEED` was set to `89860516` (or `esp-k273-only.json`). **After §13.8, set it to `9bd6f902`
+  (or the installed `esp-k273-v3` record)** so image builders compare against the grown 200 GiB store, not a retired identity.
 
 First boot (`python3 tooling/native/usb-console.py --capture 600`, started before `reboot`); the owner need not be there:
-- `NativeUfs: ... root-part=linux_data`, the windows published, the root mounted;
-- `NativeRamBlock: Data store state 2 (...), ... first LBA 117998394, 6291456 pages, ... seed 89860516, store seed 89860516, ...`;
+- Step 1 expected `NativeUfs: ... root-part=linux_data`; **current v2/v3 boots log `root-part=linux_rootfs`**, with the windows
+  published and the root mounted;
+- Step 1 expected `NativeRamBlock: Data store state 2 (...), ... first LBA 117998394, 6291456 pages, ... seed 89860516, store seed
+  89860516, ...`; **current boots resume LBA 71859642, 52430401 blocks, seed/store seed `9bd6f902`**;
 - `piano-boot-guard: healthy after 180 s, restart reason normal`;
 - the USB console and network up: `tooling/native/pianousb-shell` or `desk-ssh.sh` answers, `sw_vers` 27.3 26C5035r; the desktop on
   the webcam (`imagesnap`), login with `desk-login.sh`.
@@ -810,10 +828,9 @@ and the 27.3 store's header are hashed before and after: unchanged. Expected lin
 
 ### 13.7 Afterwards
 
-linux_rootfs (LUN 0 LBA 56060928-71527423, 59 GiB) is free: discarded, its GPT entry unchanged, used by no entry. It can be taken for
-27.3 (a larger root or Data, with linux_data's unused middle) by the repartition designed separately; nothing here fixes its role
-or size: the steps take every partition from the map, the 27.3-only builder takes the store window from its base's line, and
-`maint-session.py` checks the store where the record says it is.
+After the initial rootfs-clear step, linux_rootfs (LUN 0 LBA 56060928-71527423, 59 GiB) was free. **§13.8 then used it the same
+day:** it now holds the 20.9 GB 27.3 root image used by the installed entry. `linux_data` holds the grown 200 GiB Data store;
+neither partition is unused.
 
 Host tests (no tablet): `tooling/persist/test-k273-only.py` makes every fixture in a temporary directory (a dual ESP by mtools, a
 GPT, the fake tablet of `test-persist.py`) and covers the builder, `tablet.sh`'s guard, the gate, both rootfs steps with their

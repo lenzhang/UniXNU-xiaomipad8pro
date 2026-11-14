@@ -121,7 +121,7 @@ Every restage makes a new seed identity, because APFS writes times and transacti
 
 | The tablet's store | An ESP or RAM image with `out/userland/stage`'s seed |
 |---|---|
-| the installed seed's, not flattened (today: `aced5bf9…`) | **kept untouched, Data volatile**. The installer installs everything at every boot, and it is all gone at the next. `build-esp.py --replace-data <8 hex>` starts the store over from this seed and **drops the owner's Data changes** |
+| the installed seed's, not flattened (2026-11-14: `9bd6f902…`, 200 GiB over `linux_data`, LBA 71859642, 52430401 blocks) | **kept untouched, Data volatile**. The installer installs everything at every boot, and it is all gone at the next. `build-esp.py --replace-data <8 hex>` starts the store over from this seed and **drops the owner's Data changes** |
 | flattened (self-contained) | resumed. The seed is **not read**: none of these files reach Data. Use the live update (section 7) |
 | blank, `data-store-replace`, `sheng-data-reset` | a new store from this seed: everything installed at its first boot, then kept |
 | RAM test images (`build-ram-images.py`: another seed → `data-persist=0`) | volatile Data with the files, the store untouched: the tablet tests of section 9 |
@@ -346,11 +346,11 @@ The parts:
 Build, on the Mac, from a checkout with these commits:
 
 ```sh
-PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh              # once: the KC and the current Turnip stage
+PIANO_GPU=2 PIANO_VMM_PRESENT=0 K273_KERNEL=<prepared kernel-k273-...-native.macho> tooling/k273/build-k273-image.sh  # KC and Turnip stage; root-layout caveat in k273-line.md §4
 python3 tooling/userland/test-stage.py && python3 tooling/userland/stage.py   # out/userland/stage (prints its identity)
 PIANO_SEED=out/userland/stage/scratch-data.img PIANO_TRUST=out/userland/stage/kernel.macho.trustcache PIANO_GPU=2 PIANO_VMM_PRESENT=0 \
   PIANO_RESET_AFTER=1200 PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 piano-usb-hid=1 piano-usb-shell=1 piano-power=1 piano-policy=1 stderr-log=1" \
-  tooling/k27/build-native-image.sh                                            # image U (out/ram)
+  K273_KERNEL=<prepared kernel-k273-...-native.macho> tooling/k273/build-k273-image.sh                       # image U (out/ram; 27.3 only)
 tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
 python3 tooling/native/usb-console.py --port 1                                # the root shell, from U2 on
 ```

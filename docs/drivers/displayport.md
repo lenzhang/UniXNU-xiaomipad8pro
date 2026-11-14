@@ -308,8 +308,7 @@ display port and the panel's lines are what they were; a D6 display that cannot 
 
 The msm DP/DPU drivers, the QMP combo PHY, DISPCC, pmic_glink_altmode, fsa4480 and dwc3-qcom (GPL-2.0) are the specification only
 (offsets, fields, sequences). The QMP DP serdes/TX tables (about 20 register/value pairs per rate, plus the 4×4 swing and
-pre-emphasis matrices) are vendor tuning values that exist only as tables in that driver: taking them is the same **owner
-decision** as B7's H7 (USB3 PHY tables) and the camera sensor tables (`camera.md` §10). The clean alternative is to measure them:
+pre-emphasis matrices) are vendor tuning values that exist only as tables in that driver. The owner decided on **2026-11-12** that the DP PHY tables may be committed as extracted data, in their own directory with a provenance note and our own extractor and format ([BACKLOG-hardware.md](../BACKLOG-hardware.md) §4); they are **not extracted yet**. The clean alternative is to measure them:
 dump the DP PHY's registers on the tablet while Ubuntu drives a monitor at each rate (reads only, values of the hardware's state).
 No Apple binary is read beyond the facts already in `native-gop-display.md` (the framework's behaviour observed in the VM); no vendor
 blob. As built (`package/PianoDp/UPSTREAM`): offsets, bit names, the clock order, the notification layout, the pin-to-mode mapping

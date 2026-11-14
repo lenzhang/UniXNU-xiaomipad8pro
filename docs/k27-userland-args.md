@@ -1,8 +1,9 @@
 # The k27 boot arguments and their readers
 
-The arguments every native image carries (`K27_ARGS` in `tooling/bootimg/build-ram-images.py`; the ESP's set in
-`tooling/persist/build-esp.py`), checked 2026-11-11. They came with the macOS 27.0.1 install the tablet runs, which was first
-brought up under a hypervisor; only the ones something native reads were kept.
+The arguments every native image carries (`K27_ARGS` in `tooling/bootimg/build-ram-images.py`; the installed 27.3 ESP's set is
+built by `tooling/k273/build-k273-esp.py`, while `tooling/persist/build-esp.py` belongs to the retired daily line), checked
+2026-11-11. They came with the VM-era macOS 27.0.1 install; the tablet now runs macOS 27.3, and only the ones something native
+reads were kept.
 
 ## Legacy names
 
@@ -19,7 +20,8 @@ renaming one means changing the kernel (`patches/k27` or the baseline series) an
 
 `offline-apfs-load`, `owner-staged-apps`, `union-hide-lower`, `malloc-ranges-off`, `mac-amfi-launch-permissive`, `rootauth=0`,
 `exec-env`, `kt_fixed_zones`, `tlto_us`, `-no_slto_panic`, `vm_compression_limit`, `arm64_maxoffset`: read by the k27 kernel
-(the baseline series). They make the macOS 27.0.1 userland run on a machine that is not a Mac. `-apfs_shared_datavolume` is
+(the baseline series). They make the macOS 27.3 userland run on a machine that is not a Mac; their names and origin are from the
+retired 27.0.1 VM-era line. `-apfs_shared_datavolume` is
 Apple's APFS's (not verified), kept until shown unused. The piano arguments (`native-ufs-*`, `data-persist`, `pstore-console*`,
 `piano-*`) are this repository's: [bringup-debugging.md](bringup-debugging.md), [data-store.md](data-store.md) and the driver pages.
 

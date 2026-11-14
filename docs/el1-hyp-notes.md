@@ -10,7 +10,7 @@ read-only (`cat`, `dmesg`, cpufreq sysfs); evidence files are in `hyp-evidence/`
 | Fact | State | Evidence |
 |---|---|---|
 | Linux runs at EL1 ("All CPU(s) started at EL1"), Gunyah 51/v1 at EL2, `/dev/gunyah` present, no `/dev/kvm` | verified | plan §2 (tablet dmesg) |
-| arm64e k27 (xnu-12377 + 0001-0054) already runs the macOS 27.0.1 userland at EL1 under this Gunyah, as a VM guest | verified | the earlier VM-based port's accept path |
+| arm64e k27 (xnu-12377 + 0001-0054) ran the macOS 27.0.1 userland at EL1 under this Gunyah as a VM guest in the earlier VM-based port (historical: that install was retired and its volume cleared on 2026-11-14; the tablet now runs the macOS 27.3 userland natively at EL1) | verified then; the userland it ran no longer exists | the earlier VM-based port's accept path; [persistent-boot.md](persistent-boot.md) §13 |
 | UniXNU ports on SM8750 (OnePlus 13T, Ace 6, Odin 3) run XNU at EL1 as the HLOS under the same hypervisor | verified (their records) | `UniXNU/devices.toml`, `UniXNU-Pagani_SM8750` |
 
 ## 1. Watchdogs

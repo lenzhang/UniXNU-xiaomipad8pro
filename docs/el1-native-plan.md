@@ -16,7 +16,8 @@ feasibility work: `../../unixnu-research/PIANO-XNU-PLAN.zh-CN.md` (2026-11-08, U
 **Goal.** Boot macOS 27 natively on the tablet in the UniXNU style: an Android `boot.img` whose kernel field is
 BootShim + a Project Mu UEFI firmware volume, UEFI runs `UniXNU.efi` and `DarwinBoot.efi`, DarwinBoot starts a
 source-built, patched XNU (our k27: xnu-12377 + 52 patches, 4 KiB pages, arm64e) **at EL1 as the HLOS** with Gunyah left
-in place at EL2. Apple's kexts come from the 27.0.1 kernel collection as today; the hardware is driven by Darwin drivers
+in place at EL2. Apple's kexts came from the 27.0.1 kernel collection when this plan was written; the installed 27.3 line now
+uses the mac17j collection ([k273-line.md](k273-line.md)); the hardware is driven by Darwin drivers
 written against IOKit/IOMFB/IOGPU/IOHID, with the Ubuntu drivers used as the behavioural specification.
 
 End state for the first release: power on → UniXNU menu → macOS login window on the panel at the panel's native size,

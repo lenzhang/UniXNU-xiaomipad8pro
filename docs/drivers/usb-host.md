@@ -197,7 +197,7 @@ stream 0x40 (a stage-1 context; IOMapper is our source-built kernel's class), if
 **needs-boot** (read DCBAAP/ERSTBA after its start). Without a mapper the identity stage-1 map of §4 gives coherency only.
 
 **Verdict.** No xHCI class in our KC attaches to a platform nub as shipped, but the generic Apple xHCI and its whole client stack
-are present and link natively (§5.2). Go A1 → A2 (with the owner's approval of the fixture) → B; C only if Apple's xHCI cannot be
+are present and link natively (§5.2). Go A1 → A2 (the fixture's binary analysis was approved 2026-11-14 15:33, §5.3) → B; C only if Apple's xHCI cannot be
 made to run. Effort to "keyboard, mouse and stick on an OTG adapter at high speed": ~3–4 weeks of code plus attended sessions; to
 Ubuntu parity (5 Gbit/s both orientations, docks with pass-through charging, role switching with the Mac): ~6–9 weeks (§8).
 **2026-11-14:** A2 is built (§5.4). It is the better first boot of the two, because A1's two open risks (an abstract class, and a
@@ -648,7 +648,7 @@ PianoUsbHost: host summary: switch ok | probe PASS | nub up | AppleUSBXHCI attac
 
 What each outcome means (the order of the questions in §10): no `kext load 0` / `class NOT registered` → the image was not built
 with `PIANO_USBHOST_STACK=1`. `no client within 10 s` → H6b: `allocClassWithName … gave nothing` (abstract) or `start FALSE` (the
-base class wants something only a subclass gives) are **A2's trigger** (the owner's decision, §5.3). A client with `USBCMD` RS 1, a
+base class wants something only a subclass gives) are **A2's trigger** (the analysis was approved 2026-11-14 15:33, §5.3). A client with `USBCMD` RS 1, a
 growing `entries`, and HCH set again after a while with the power state falling → the idle-power risk (QcomDwc3's subclass keeps the
 controller on: also A2). DCBAAP/ERSTBA above 4 GiB with `HSE` or no events → the 64-bit write order (Apple's base class writing the
 low half first): our own 32-bit IOMapper on stream 0x40 (no Apple ABI) or A2's 64-bit write override. A device on the port (with
@@ -775,8 +775,11 @@ piano-usbhost-probe=1 piano-usbhost-smmu=2 piano-usbhost-watch=600 piano-usbhost
 piano-reset-after=900 piano-reset-to=bootloader
 ```
 
-Run it like the other RAM probes: `tooling/native/native-loop.sh out/ram-a2/boot-piano-macos-ram-A-bundled.img
-out/ram-a2-dump/boot-piano-macos-ram-A-bundled.img`, then
+Built 2026-11-14 from the A2 collection `660bced2…` (the ADT, trust cache and seed of the installed layout): the probe is
+**238,329,856 bytes**, sha256 `18e0ca97916e97d6264b89e65830ccbb226659f3d6a21c069e5226d91f457117`, its dump companion
+`a0e0a6e92acd44f4362830aac42aa3894421b0127be95b00a953f15f3ed643fa`; both `verify-ram-images.py PASS: 0 failure(s)` and below the
+250,000,000-byte limit. Run it like the other RAM probes: `tooling/native/native-loop.sh
+out/ram-a2/boot-piano-macos-ram-A-bundled.img out/ram-a2-dump/boot-piano-macos-ram-A-bundled.img`, then
 `grep -E 'PianoXhciHost|PianoUsbHost' logs/native-runs/<ts>-loop/xnu-console.txt`. Nothing needs a hand on the tablet; with
 nothing in the port the probe still answers questions 1–9 below. **`piano-touch=2` is in the line but PianoTouch is not in this
 collection** (the stack's kexts keep their addresses and leave no `__DATA_CONST` gap for it, §5.2a): expect no `PianoTouch:` line
@@ -794,7 +797,7 @@ to wait out the 900 s.
 | 5 | Does the identity-mapped SMMU bank still come up? | `PianoUsbHost: smmu: stream 0x40: identity map of DRAM from 2 GiB, write-back inner shareable (coherent) …` |
 | 6 | Does IOKit matching find our personality on the nub? | `PianoUsbHost: attach: a client on the nub` then `attach: client PianoXhciHost, power state N`. If not: `no client within 10 s …: allocating the class by name now (piano-usbhost-attach=3)` followed by `attach: PianoXhciHost allocated (3976 bytes), init 1, start true|FALSE` — the same boot then also answers whether `start()` accepts this nub |
 | 7 | Does Apple's `start()` accept our nub (A1's first open risk)? | `start true` (attach=3's line), or a client appearing at all; `start FALSE` names the base class's refusal as the next thing to read |
-| 8 | **Does the 64-bit write override get used, and in the right order?** (the A2 reason) | `PianoXhciHost: write64 #1 +0x30 = 0x… (high 0x… first, then low 0x…)` … up to #8, and `read64 #…` lines. The offsets should be the ring registers (DCBAAP `+0x30`, CRCR `+0x38`, ERSTBA `+0x30` of the interrupter, ERDP `+0x38`); **no `write64` line at all** means Apple's driver never used the 64-bit accessor (then the DCBAAP/ERSTBA values of question 9 say whether it wrote the halves itself) |
+| 8 | **Does the 64-bit write override get used, and in the right order?** (the A2 reason) | `PianoXhciHost: write64 #1 base 0x… +0x30 = 0x… (high 0x… first, then low 0x…)` … up to #8, and `read64 #…` lines. The offsets should be the ring registers (DCBAAP `+0x30`, CRCR `+0x38`, ERSTBA `+0x30` of the interrupter, ERDP `+0x38`); **no `write64` line at all** means Apple's driver never used the 64-bit accessor (then the DCBAAP/ERSTBA values of question 9 say whether it wrote the halves itself). The `base` value is the second thing to read here: that the accessor's base argument is the mapped register window is **inferred** from QcomDwc3; an implausible value, or a fault at the first 64-bit access, means it is something else |
 | 9 | Are Apple's structures where we can see them, and does the controller run? | `PianoUsbHost: Apple xHCI +0 s: USBCMD 0000000… USBSTS … PORTSC … DCBAAP 0x… ERSTBA 0x… ERDP 0x… (below 4 GiB \| 64-bit addresses: the write order matters); power state N; USB devices 0 …; interrupt SPI 133: N entries 0 strays 0 polls …` — read USBCMD bit 0 (RS) and USBSTS bit 0 (HCH): running and not halted is the pass. Rings above 4 GiB with correct high halves are the strongest evidence the override works |
 | 10 | Does the power override hold (A1's third risk)? | `power state 3` in every `Apple xHCI +…` line for the whole watch, and `USBCMD` keeping RS 1 (A1 was expected to idle to off) |
 | 11 | Does the interrupt line work or does it have to be polled? | the `interrupt SPI 133: N entries …` counters growing in later lines; `0 entries` with events arriving means the poll fallback is doing the work (`piano-usbhost-irq=0` isolates it) |

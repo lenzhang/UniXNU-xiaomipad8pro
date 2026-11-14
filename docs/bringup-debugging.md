@@ -2,7 +2,9 @@
 
 Learned during the first native RAM boots, 2026-11-10 (the local bring-up notes `el1-home-ram-boot-result.md`, not published;
 session log `logs/home-ram-boot-session-20261110.md`). Rules that never change:
-- RAM boots only (`fastboot boot`). Never `flash`, `erase`, `set_active`, `flashing` or a partition write.
+- Routine tests are RAM boots (`fastboot boot`). Partition writes are allowed only through the owner-approved maintenance plan in
+  `docs/persistent-boot.md` (ESP, `boot_a`, GPT and the Linux-era root/Data regions, with backups and read-back). Never write
+  firmware/calibration partitions or any `_b` partition; never `flash_all_lock`.
 - `oem` goes only to our own in-RAM UEFI (`-s piano-uefi`), never to ABL.
 - Never `systemctl isolate` on the tablet.
 
@@ -20,12 +22,12 @@ ABL (fastboot boot) ─► BootShim (kernel field) ─► Mu-Silicium UEFI (FD a
 | Stage | Requirement | Symptom when it is missing |
 |---|---|---|
 | ABL → kernel | The kernel field's ARM64 header must look like a Linux Image: `text_offset 0`, `flags 0xa`, `image_size` covering shim + FD (`build-ram-images.py` rewrites Mu's BootShim header, which carries the FD base in `text_offset`) | `fastboot boot` answers OKAY, the panel goes black, the tablet is back in ABL fastboot about 80 s later, and every further `boot` in that ABL session fails with `Load Error` (reset ABL with `fastboot reboot bootloader`) |
-| UEFI drivers | FD **A** (piano-uefi's bundled DXEs). FD B (this tablet's own OS3.0.303 DXEs) resets after 10–15 s | early reset back to Ubuntu ~26 s after `fastboot boot` |
+| UEFI drivers | FD **A** (piano-uefi's bundled DXEs). FD B (this tablet's own OS3.0.303 DXEs) resets after 10–15 s | early reset about 26 s after `fastboot boot`; it returned to Ubuntu when Ubuntu was installed, while a current reboot reaches ABL/ESP (macOS 27.3) or Android |
 | UEFI → UniXNU payload | SEC must keep x0 (the DT from ABL) in the entry-argument HOB: `firmware/patches/mu-silicium/0001` | Piano_Log: `UNIXNURAMDISK: no entry argument HOB`; the menu has only the built-in entries and falls through to the UEFI shell |
 | DarwinBoot → XNU | A linear BGRA GOP: `firmware/patches/0002` (SimpleFbDxe instead of piano-uefi's Blt-only ScaledFbDxe) | console: `DARWINBOOT: boot refused: Unsupported; firmware retained`; the menu redraws (looks like a flash) |
 | DarwinBoot → XNU: RAM | XNU's window (`configs/k27-adt.toml` `owned_memory_size`, 13 GiB less 2 MiB since 2026-11-12) needs FD A built with `firmware/patches/darwinboot/0001` (`tooling/firmware/build-fd.sh`: the `.ram-window` stamp `build-ram-images.py` checks); an older FD refuses an ADT asking for more than 8 GiB. Console check: `NativeRamBlock: RAM window 0x8c0004000..0xbffe04000 (13310 MiB) in DRAM 0x8c0000000..0xc00000000` (8192 MiB with an 8 GiB ADT) | older FD: the menu redraws after `DARWINBOOT: boot refused` (Compromised Data); no run for the window: `NO WINDOW <size> BIG RUN ...` and the free runs drawn on the panel; a shrunk window: `DARWINBOOT: window 0x33fe00000 requested, <size> taken (largest run)` and a smaller RAM window line |
 | XNU CPUs | Boot with all 8 ADT CPUs (`sheng-smp=1`), **not** `cpus=1` | `cpus=1`: `Kernel data abort` in `recount_switch_thread+0x84` (far 0xfffffff36ee62004, esr 0x96000007) |
-| XNU root | NativeUfs (`package/NativeUfs`, `native-ufs-root=1`): the SHNGROOT windows OS + SystemOS in linux_rootfs (`tooling/native/make-root-manifest.py`); Data = the RAM seed with its changed pages in NativeUfs's store window at the end of linux_rootfs (`data-persist=2`, `tooling/k27/build-native-ram-block.sh`) | `Waiting on <dict> IOMedia … UUID C73696D4…` |
+| XNU root | NativeUfs (`package/NativeUfs`, `native-ufs-root=1`, current `native-ufs-root-part=linux_rootfs`): the SHNGROOT windows OS + SystemOS; Data = the RAM seed with its changed pages in the 200 GiB NativeUfs store over `linux_data` (`data-store-part=linux_data`, LBA 71859642) | `Waiting on <dict> IOMedia … UUID C73696D4…` |
 | UFS: SMMU | piano's firmware leaves SID 0x60 on context bank 1 (PKX110: bank 0); the entry is redirected to the bypass bank | `SMMU plan for stream 0x60: conflicting UFS stream mapping (slot 1 smr 80000060 s2cr 1)` |
 | UFS: link | the link is in Hibern8 when XNU starts: UniXNU-Odin3's SM8750 link handling (AHIT off, Hibern8 exit, IACR off) | `FAILED at NOP OUT` (LINK tx=1) |
 | UFS: writes | the development build writes the windows in place (`NATIVE_UFS_UNVERIFIED_ROOT`); without it APFS's writes fail | `disk5s1: device is not ready.` by the hundred |
@@ -45,12 +47,13 @@ fastboot -s piano-uefi oem dump D7F00000 100000 && fastboot -s piano-uefi get_st
 ```
 
 The DEBUG log has every driver load, `UNIXNU:` and `UNIXNURAMDISK:` line. `reboot-bootloader` is not supported there;
-`fastboot -s piano-uefi reboot` goes back to Ubuntu. The USB timeline alone tells the stage: `<serial> fastboot` (ABL) →
+`fastboot -s piano-uefi reboot` returns through ABL to the installed ESP (macOS 27.3) or the selected Android path, not Ubuntu. The USB timeline alone tells the stage: `<serial> fastboot` (ABL) →
 nothing → `piano-uefi fastboot` (our UEFI) → nothing (DarwinBoot handed over to XNU).
 
 **In XNU**, k27 patch 0055 (`pstore-console=0x9cb00000 pstore-console-size=0x700000`) mirrors every console byte into
-a RAM mailbox, `cvp@9cb00000` (7 MiB, no-map, used by neither Ubuntu nor the firmware), which Ubuntu reads back through
-`/dev/mem` (`tooling/native/xnu-log.py`, aligned 8-byte accesses only: unaligned ones raise SIGBUS on Device memory).
+a RAM mailbox, `cvp@9cb00000` (7 MiB, no-map, used by neither the installed OS nor the firmware). The unattended loop's dump image
+pulls it with `fastboot -s piano-uefi oem dump 9cb00000 700000` + `get_staged` (`tooling/native/xnu-log.py`, aligned 8-byte
+accesses only). Ubuntu originally read it through `/dev/mem`; that installation no longer exists.
 Measured 2026-11-10:
 - Ubuntu's own `ramoops@a3500000` does not survive even an Ubuntu reboot: the region is `Display_Demura` in the firmware's
   memory map.
@@ -58,7 +61,7 @@ Measured 2026-11-10:
   the ring is stored 11 times, and the reader takes the bitwise majority (residual ~2e-6 per bit).
 - A hard power-off (power + volume-down) loses everything.
 
-**Live, over the USB-C cable** (not yet run on the tablet): with `piano-usb=2` in the image's arguments, `package/PianoDwc3`
+**Live, over the USB-C cable** (running on the tablet since 2026-11-12, [results-2026-11-12.md](results-2026-11-12.md)): with `piano-usb=2` in the image's arguments, `package/PianoDwc3`
 takes the USB controller over in device mode once XNU runs; the USB timeline then continues with `1209:0001 piano macOS debug`
 (two CDC-ACM ports). `tooling/native/usb-console.py` on the Mac shows the console live (the retained log first) and talks to
 a small kernel monitor. Design, levels and test steps: `docs/drivers/usb-device-debug.md`.
@@ -75,7 +78,7 @@ character. DarwinBoot loads the kernel at its link address (no slide), so pc/lr 
 ## 3. The unattended loop (no Ubuntu, 2026-11-11)
 
 ```sh
-tooling/k27/build-native-image.sh                                    # kexts -> KC -> out/ram (test) + out/ram-dump (reset after 1 s)
+K273_KERNEL=<prepared kernel-k273-...-native.macho> tooling/k273/build-k273-image.sh  # 27.3 kexts -> KC -> out/ram + out/ram-dump; root-layout caveat in k273-line.md §4
 tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
 ```
 
@@ -94,23 +97,27 @@ A person is needed only when the tablet is parked (no reset, no fastboot): power
 ## 4. Rebuild after a change
 
 ```sh
-K27_VARIANT=native "$PIANO_K27_TREE/build-k27-piano.sh"   # kernel: the k27 tree with patches/k27 0053-0062 applied to its out/k27/xnu
+tooling/k273/prepare-k27-tree.sh                             # current kernel: patches/k27 0053-0066 + patches/k273
 tooling/unixnu.sh build firmware --skip-preflight          # FD (A: Binaries/piano -> the bundled set)
-tooling/k27/build-native-image.sh                          # kexts (package/) -> KC -> ADT -> out/ram + out/ram-dump
+K273_KERNEL=<path printed by prepare-k27-tree.sh> tooling/k273/build-k273-image.sh
 python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
 ```
 
-`tooling/build-slice1.sh` runs all of it. The native kext set is `configs/k27-native-kexts.txt` (§5).
+`tooling/build-slice1.sh` still calls the retired `tooling/k27/build-native-image.sh`; **do not use it for the current line**.
+The native kext set is `configs/k27-native-kexts.txt` (§5). Only 27.3 images are built; see the `K273_ROOT` layout caveat in
+[k273-line.md](k273-line.md) §4.
 
-**The k27 tree** is the local XNU 27.0.1 kernel tree: xnu-12377 + the baseline series 0001-0052 (pin `k27` of `unixnu.lock`),
-with this repository's `patches/k27` (0053-0062) on top. The build only reads it, and no committed file names its place: set
+**The k27 tree** is the local XNU source tree: xnu-12377 + the baseline series 0001-0052 (pin `k27` of `unixnu.lock`),
+with this repository's `patches/k27` (0053-0066) and, for the current 27.3 build, `patches/k273` applied by
+`tooling/k273/prepare-k27-tree.sh`. The build only reads it, and no committed file names its place: set
 `PIANO_K27_TREE` in the environment or as a line `PIANO_K27_TREE=/path` in `~/.config/piano/env`. Every script that needs it
 goes through `tooling/k27/k27-tree.sh` (shell) or `tooling/k27/k27_tree.py` (Python) and stops with what to set when it is
 missing. What the native build reads from it:
-- the kernel (`out/k27/kernel-k27-NNNN-native.macho`, `K27_KERNEL` picks another) and its objects' compile recipes
+- the relinked 27.3 kernel (`out/k27/kernel-k273-...-native.macho`, selected by `K273_KERNEL`) and its objects' compile recipes
   (`out/x12377/build/xnu/k27-native-obj`), which every kext is compiled with (`tooling/k27/build-native-kext.py`);
 - the generated headers under `out/x12377` (storage ABI, xnu's osfmk, IOKit hid/net/gfx) the kexts include;
-- the KC base, Apple's macOS 27.0.1 vma2 kernelcache (`out/kc/kc27.bin`, an Apple payload: never published);
+- the current KC base, Apple's macOS 27.3 mac17j kernelcache (an Apple payload: never published); the 27.0.1 vma2 `out/kc/kc27.bin`
+  base belongs to the retired line;
 - the KC builder (`k27/kc-build27-piano.py`, `k27/kc27-layout.py`, `k27/segaddrs.sh`, `configs/kc-keep.txt`, `scripts/kc-build.py`,
   `kc_native.py`, `fileset_kc.py`, `ptrauth_disc.py`; its placement patches, applied there by hand: `patches/k27-kc`,
   [kc-space.md](kc-space.md)) and `scripts/gen-iomfb-abi.py` (its output is cached in `out/k27/iomfb-abi/`);
@@ -132,8 +139,8 @@ repository`). Code native piano needs from the VM era is this repository's packa
 
 ### 5.1 The VM-era kexts in native boots
 
-The macOS 27.0.1 install the tablet runs was first brought up under the hypervisor, with paravirtual kexts for its virtual
-devices. What they did in native boots (runs in `logs/native-runs/`, 2026-11-11), and what replaced them:
+The retired macOS 27.0.1 install was first brought up under the hypervisor, with paravirtual kexts for its virtual
+devices. The tablet now runs macOS 27.3. What those kexts did in native boots (runs in `logs/native-runs/`, 2026-11-11), and what replaced them:
 
 | Kext(s) natively | Effect | Natively now |
 |---|---|---|
@@ -182,11 +189,10 @@ is the 27.3 line's only; its entry would take its own set, `piano-boot-args=<ent
 
 ### 5.4 The macOS install
 
-The OS image is the macOS 27.0.1 install of the VM era; replacing it means reinstalling from Apple's 27.0.1 restore image with
-our own customisation. It is `out/inputs/kernel.macho.trustcache` (the OS image's binaries), `out/inputs/scratch-data.img` (the
-Data seed; once the tablet's store is flattened, [data-store.md](data-store.md), it only starts new stores) and the OS and
-SystemOS windows on linux_rootfs, which carry that era's userland changes (`settime.sh` and its boot job `org.droidvm.run.0`,
-the staged Metal plugin).
+The installed OS is macOS 27.3 only since 2026-11-14; the VM-era 27.0.1 volume was cleared. Replacing the root means installing
+the 27.3 root onto `linux_rootfs` with the §13.8 maintenance recipe in [persistent-boot.md](persistent-boot.md), not restoring
+27.0.1. The installed Data seed identity is `9bd6f902`; its 200 GiB store is on `linux_data`. The old 27.0.1 OS/SystemOS windows
+and Data seed on `linux_rootfs` were cleared before the 27.3 root moved there ([persistent-boot.md](persistent-boot.md) §13).
 
 ## 6. A kernel panic in the mailbox log (2026-11-12: the 13 GiB boot's `vm_page_unwire`)
 

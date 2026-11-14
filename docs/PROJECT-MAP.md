@@ -4,10 +4,10 @@
 
 三个公开仓库都在 GitHub 账号 [lenzhang](https://github.com/lenzhang) 下，全部公开。
 
-- [`UniXNU-piano`](https://github.com/lenzhang/UniXNU-xiaomipad8pro) 是小米平板 8 Pro（代号 piano，SM8750）的**设备仓库**，也是当前主线：在 EL1 上原生启动 macOS。只做 `fastboot boot` **内存启动**，不刷写任何分区。
+- [`UniXNU-piano`](https://github.com/lenzhang/UniXNU-xiaomipad8pro) 是小米平板 8 Pro（代号 piano，SM8750）的**设备仓库**，也是当前主线：在 EL1 上原生启动 macOS。日常测试用 `fastboot boot` **内存启动**；所有者批准的持久安装与布局维护按 `docs/persistent-boot.md` 执行，2026-11-14 已安装 27.3 并调整 ESP、`boot_a`、`linux_rootfs`、`linux_data`。固件 / 校准分区和所有 `_b` 分区仍绝不写入。
 - [`UniXNU-sm8750-common`](https://github.com/lenzhang/UniXNU-sm8750-common) 是骁龙 8 至尊版（SM8750）的**公共层占位仓库**。芯片通用代码暂时仍在 `UniXNU-piano` 里，稳定后再拆过来。注意：当前构建通过 `UniXNU-piano/feeds.toml` 钉住的是上游 [`IssacL04/UniXNU-sm8750-common`](https://github.com/IssacL04/UniXNU-sm8750-common)（OnePlus 13T 谱系）。这两个仓库不要混用，在拆分完成前不要改这个 pin。
 - [`veil`](https://github.com/lenzhang/veil) 存放已于 2026-11-10 冻结的精简 Linux + Gunyah 客户机路线的**公开归档**。完整的本地归档仍在本机 VM 时期工作目录的 `archive/gunyah-guest` 分支。主线请看 `UniXNU-piano`。
-- Ubuntu 的修复继续提交到上游 [`yzddmr6/xiaomipad-8pro-mainline`](https://github.com/yzddmr6/xiaomipad-8pro-mainline)（内核 [`yzddmr6/linux-sm8750-piano`](https://github.com/yzddmr6/linux-sm8750-piano)），不另建仓库。
+- Ubuntu 只作为硬件行为与寄存器事实的参考。所有者于 2026-11-12 决定本机不再需要 Linux/Ubuntu；当前设备工作不继续这条安装路线，也不另建 Ubuntu 仓库。
 - 权威备份在 NAS 上（具体路径只记在本机，不进公开仓库）。其他机器上的副本不是权威副本。
 - 密码不要写进文件、命令行参数或日志；需要 sudo 时在 tmux 里手工输入。厂商固件、分区镜像、Apple 内核 / KC / IPSW 派生产物不得进入公开仓库。
 - 原生启动**只加载本仓库的 kext**：原生内核集合只链接本仓库 `package/` 里的驱动，VM 时期的半虚拟化 kext（显示、GPU、网卡、音频、输入、virtio 块设备等）一个也不链接，构建时由 `check-native-kexts.py` 强制检查（每次构建前先自检）。2026-11-11 的实测证据见 `docs/bringup-debugging.md` 第 5 节。
@@ -93,10 +93,10 @@ Build outputs (`UniXNU-piano/out/`, `build/`), signing keys (`private/`), vendor
 
 ## 6. Hard rules
 
-1. **RAM boot only.** Use `fastboot boot`. Never `fastboot flash`, `erase`, `set_active`, `oem`, or any other command that writes a partition. Never run `flash_all_lock`.
-   One exception, approved by the owner on 2026-11-11: the persistent install of [`docs/persistent-boot.md`](persistent-boot.md), which
-   writes LUN 0's GPT, the end of `linux_rootfs` and `boot_a` by `dd` from the maintenance RAM image, after verified NAS backups of
-   every region; never `xbl`, `abl`, `tz`, `hyp`, `vbmeta`, `dtbo`, `persist` or any `_b` partition.
+1. **RAM boot for routine tests; partition writes only under the approved persistent-install plan.** Use `fastboot boot` for test
+   images. The maintenance procedure of [`docs/persistent-boot.md`](persistent-boot.md) may write the documented ESP, `boot_a`, GPT
+   and Linux-era `linux_rootfs` / `linux_data` regions after verified backups and read-back checks. Never write `xbl`, `abl`, `tz`,
+   `hyp`, `vbmeta`, `dtbo`, `persist`, firmware/calibration partitions or any `_b` partition. Never run `flash_all_lock`.
 2. **Never boot or flash `-signed` images** as a way to persist a new OS. Signed RAM images, if built, are a verification artifact only.
    (Exception: the signed `boot_a` image of `docs/persistent-boot.md`, under rule 1's exception.)
 3. **Never `systemctl isolate`** on the tablet. It has stopped `piano-charging` and `piano-thp` and drained the battery / killed the touchscreen.
@@ -113,15 +113,14 @@ Build outputs (`UniXNU-piano/out/`, `build/`), signing keys (`private/`), vendor
    after it), and `tooling/persist/build-esp.py` refuses an ESP whose collection has a VM-era bundle. Evidence, the boot
    arguments still read under legacy names, and the ADT identity: `docs/bringup-debugging.md` §5.
 
-## 7. Current bring-up note (2026-11-11 21:30)
+## 7. Current bring-up note (2026-11-14)
 
-Native macOS is installed on piano and boots by itself: boot_a = BootShim + FD (signed v4), the UniXNU payload on an ESP (LUN 0
-partition 37, carved from linux_rootfs), the macOS root and Data on linux_rootfs (NativeUfs). The A830 GPU (PianoA830 + Turnip on
-ABI v2) composites the login screen. Dev work continues with RAM boots (`fastboot boot`, which take priority over the installed
-copy); verified backups of every written region are on the NAS and `tooling/persist/maint-session.py rollback ...` restores them.
-See `docs/persistent-boot.md`. The Data store (its format, the store guard that keeps the installed store from RAM images with
-another seed, flatten, the test procedure): `docs/data-store.md`. What this repository installs in macOS's userland (the manifest,
-the staging into the seed, the installer, the live update): `docs/userland.md`.
+Native macOS 27.3 only is installed on piano and boots by itself: boot_a = BootShim + FD (signed v5), the UniXNU payload on an ESP
+(LUN 0 partition 37), the 27.3 root on `linux_rootfs`, and the owner's 200 GiB Data store over `linux_data` (LBA 71859642, seed
+`9bd6f902`). The retired 27.0.1 volume/store was cleared and has no menu entry. Wi-Fi passed scan, association, WPA2, DHCP,
+gateway/Internet ping, DNS and HTTPS (boot 10i). Dev work continues with RAM boots (`fastboot boot`, which take priority over the
+installed copy); the maintenance session backs up and reads back every written region. See `docs/persistent-boot.md` §13.8 and
+`docs/results-2026-11-14.md`. The Data store format and guard: `docs/data-store.md`. The userland layer: `docs/userland.md`.
 
 Drivers and their state (each inert without its boot argument; pages in `docs/drivers/`):
 
@@ -131,11 +130,10 @@ Drivers and their state (each inert without its boot argument; pages in `docs/dr
 | PianoPower (gauges, Type-C; DSP charger path) | level 1 runs and the battery charges from the Mac's port without the DSP; level 2 starts the DSP, which holds the input near 400 mA (input limit write pending: image I) |
 | PianoKeyboard (WN8030 cover + touchpad, hall gpio80) | MCU boots and the cover attaches; key/touchpad reports not yet seen with someone typing |
 | PianoTouch (NT36532E on QUP1 SE2) | level 1 passed on the tablet (identify, firmware, calibrated frames); level 2 (gestures, palms, the power contract) host-tested and queued (`touch.md` §14-16) |
-| PianoWifi (WCN7860 on PCIe0) | level 1 ran (matches the design); levels 2-6 built and host-tested (power, the PCIe link, the firmware over MHI, its QMI service, then the copy engine, the host transport and a passive scan), level 2 queued; `PianoWifiEthernet` publishes `en1` link down with the scan list; association and the data path are levels 7 and 8 (`wifi.md`) |
+| PianoWifi (WCN7860 on PCIe0) | levels 2–6 ran on the tablet (scan: 18 networks); association and the WPA2 four-way handshake passed; the level-8 data path, DHCP, gateway/Internet ping, DNS and HTTPS passed in boot 10i (2026-11-14). Pending: the built-in `en0` handoff and sleep/rejoin validation (`wifi.md`, `results-2026-11-14.md`) |
 | PianoBacklight (2x KTZ8866: boot level, off on display sleep, key steps) | built, host-tested and linked, not run (`backlight.md`) |
 | PianoInput (buttons) | runs on the tablet |
 
-Tonight's results: `docs/results-2026-11-11.md`. The installed profile (`build-esp.py --profile daily`: GPU + charging + the USB console and the Mac's keyboard/pointer)
-replaces the first install's GPU-only profile at the next install session. Charging: `--charging 2` (the default since 2026-11-12:
-PianoPower level 2 with the stepped Type-C current) once `ram-chg-ramp` passed, else `--charging 1` (level 1, read only;
-`docs/drivers/charging-policy.md` §16).
+Results: `docs/results-2026-11-14.md`. The installed 27.3-only ESP comes from `tooling/k273/build-k273-esp.py` and the
+maintenance session in `docs/persistent-boot.md` §13.8; the first install's GPU-only profile and the retired `build-esp.py`
+daily profile have both been replaced. Charging policy state: `docs/drivers/charging-policy.md`.

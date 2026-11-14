@@ -219,7 +219,7 @@ store resumes (check point 1 below). Record the USB console with the Mac's times
 # run B (the change); run A is the same with PIANO_FAST_BOOT=0 (the baseline on a resumed store)
 PIANO_FAST_BOOT=1 PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=600 \
 PIANO_EXTRA_ARGS="panic_on_crash_disabled=1 piano-usb=2 exec-log=1 stderr-log=1 piano-gpu-hang-ms=10000 pc-sample=30" \
-  tooling/k27/build-native-image.sh
+  K273_KERNEL=<prepared kernel-k273-...-native.macho> tooling/k273/build-k273-image.sh  # 27.3 only; root-layout caveat in k273-line.md §4
 tooling/native/usb-console.py --capture 720 &          # logs/usb-console/<time>-port0.txt and .times.txt
 tooling/native/native-loop.sh out/ram/boot-piano-macos-ram-A-bundled.img
 python3 tooling/native/boot-timeline.py logs/usb-console/<time>-port0.times.txt --loop logs/native-runs/<ts>-loop/loop.log

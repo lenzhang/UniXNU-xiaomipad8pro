@@ -2,7 +2,8 @@
 
 Native macOS 27 on the Xiaomi Pad 8 Pro (`piano`, Snapdragon 8 Elite SM8750), as a [UniXNU](https://github.com/UniXNU/UniXNU)
 device repository: https://github.com/lenzhang/UniXNU-xiaomipad8pro (formerly lenzhang/UniXNU-piano; the local
-checkout keeps the name UniXNU-piano). The k27 XNU kernel (XNU 27.0.1) runs as the HLOS at EL1, with
+checkout keeps the name UniXNU-piano). The 27.3 line's k273 XNU build (the k27 source tree with `patches/k27` 0053-0066 and
+`patches/k273`) runs as the HLOS at EL1, with
 Gunyah staying at EL2. Boot chain: ABL → BootShim → Mu-Silicium UEFI (the FD, piano-uefi's `pianoPkg` with this repository's
 deltas) → the UniXNU payload and menu → DarwinBoot → XNU. UniXNU core, Mu-Silicium, piano-uefi, DarwinBoot and the SoC module
 are pinned dependencies (`unixnu.lock`, `feeds.toml`), not forks.
@@ -12,7 +13,7 @@ SM8750 pieces to be shared later (the code still lives here, and the build pins 
 is the frozen archive of the earlier Linux + Gunyah guest path. The map of repositories, local trees and rules:
 [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md).
 
-## State (2026-11-12)
+## State (2026-11-14)
 
 - macOS boots natively on the tablet, also by itself from power-on (an installed copy, see below); root and Data are on UFS
   (`package/NativeUfs`, `package/NativeRamBlock`).
@@ -24,18 +25,19 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   touch screen's orientation on this unit and its controller watchdog recovery are fixed (built, to be run).
 - A USB-C debug console with a small kernel monitor (`package/PianoDwc3`, `tooling/native/usb-console.py`) and the buttons run;
   the monitor's `reset fastboot` returns the tablet to ABL fastboot without buttons.
-- The installed system (2026-11-13): **macOS 27.3 (26C5035r)** as the default, Mac17,11 shown as "Xiaomi Pad 8 Pro" with a
-  "Snapdragon 8 Elite" chip, 13 GiB of RAM, its own Data store at the end of `linux_data`; macOS 27.0.1 with the owner's
-  earlier Data stays as the second menu entry ([docs/k273-line.md](docs/k273-line.md), [docs/identity.md](docs/identity.md)).
+- The installed system (2026-11-14): **macOS 27.3 (26C5035r) only**, Mac17,11 shown as "Xiaomi Pad 8 Pro" with a
+  "Snapdragon 8 Elite" chip, 13 GiB of RAM. Its root is on `linux_rootfs`; the owner's 200 GiB Data store spans `linux_data`
+  (LBA 71859642, seed `9bd6f902`). The retired 27.0.1 volume/store was cleared and has no menu entry
+  ([docs/persistent-boot.md](docs/persistent-boot.md) §13.8, [docs/results-2026-11-14.md](docs/results-2026-11-14.md)).
   The USB root shell and ssh over the cable; charging that keeps going (level 2, the DSP started at once).
 - Cameras: frames from both sensors and the first pictures through a user client (`piano-camera-grab`); a macOS camera
   extension is next ([docs/drivers/camera.md](docs/drivers/camera.md)).
-- Wi-Fi: the WCN7860's firmware runs a full passive scan (regulatory domain, channel list, station device); the beacons do
-  not reach the host yet: next, then association.
-- Latest results: [docs/results-2026-11-12.md](docs/results-2026-11-12.md) (the installed system's evening and midnight
-  sections; the login window with its video wallpaper, touch, the speakers, the rear camera); the day before:
-  [docs/results-2026-11-11.md](docs/results-2026-11-11.md).
-- Most other drivers (power and charging, touch, keyboard cover, backlight, Wi-Fi, audio, sensors, thermal, USB host, video,
+- Wi-Fi: scan, association, the WPA2 four-way handshake, DHCP, gateway and Internet pings, DNS and HTTPS passed on the tablet
+  (boot 10i, 2026-11-14). The built-in `en0` handoff and sleep/rejoin probes are next
+  ([docs/drivers/wifi.md](docs/drivers/wifi.md), [docs/results-2026-11-14.md](docs/results-2026-11-14.md)).
+- Latest results: [docs/results-2026-11-14.md](docs/results-2026-11-14.md) (Wi-Fi internet and the installed 27.3-only
+  whole-disk layout); the day before: [docs/results-2026-11-13.md](docs/results-2026-11-13.md).
+- Most other drivers (power and charging, touch, keyboard cover, backlight, audio, sensors, thermal, USB host, video,
   Bluetooth, display processor, ...) are built and linked but inert behind their boot arguments, waiting for their tests on the
   tablet. Per-driver state: [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md) §7 and [docs/drivers/README.md](docs/drivers/README.md).
 
@@ -43,13 +45,14 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
 
 | Path | What |
 | --- | --- |
-| `patches/k27/` | the k27 kernel patches 0053-0063 on top of the k27 tree (xnu-12377 + the baseline series 0001-0052, XNU 27.0.1) |
+| `patches/k27/` | the k27 kernel patches 0053-0066 on top of the k27 source tree (xnu-12377 + the baseline series 0001-0052) |
+| `patches/k273/` | the 27.3 line's kernel series on top of `patches/k27` |
 | `patches/k27-kc/` | the KC builder's native placement (best fit, relocation-free constants in `__TEXT`), applied by hand to the k27 tree ([docs/kc-space.md](docs/kc-space.md)) |
 | `patches/xnu/` | the device series of the UniXNU macOS 27.3 line (empty: none yet) |
 | `package/` | the native kexts; each is inert without its boot argument |
 | `configs/` | the native kext list (`k27-native-kexts.txt`), the ADT identity and display node (`k27-adt.toml`, `k27-gop-display.toml`), the 27.3 line's kernel config |
 | `dts/piano.dts` | piano's hardware for the ADT |
-| `tooling/` | `k27/build-native-image.sh` (kexts → kernel collection → ADT → RAM images), `kc/` (the KC build), `adt/`, `bootimg/` (RAM images and their verification), `native/` (the test loop, the USB console, input), `persist/` (the installed copy), `firmware/` (the FD) |
+| `tooling/` | `k273/build-k273-image.sh` (the 27.3 kexts → kernel collection → ADT → RAM images, `K273_KERNEL`), `k273/build-k273-esp.py` (the installed 27.3 ESP), `kc/` (the KC build), `adt/`, `bootimg/` (RAM images and their verification), `native/` (the test loop, the USB console, input), `persist/` (the installed copy), `firmware/` (the FD) |
 | `firmware/` | deltas to piano-uefi's `pianoPkg`, Mu-Silicium and UniXNU |
 | `docs/` | bring-up notes, driver pages (`drivers/`), plans and evidence |
 | `logs/`, `artifacts/ARTIFACTS.md` | committed verification logs; SHA-256 of built artifacts and inputs |
@@ -62,11 +65,16 @@ Inputs: the k27 tree, a local kernel tree the build only reads (its place is `PI
 `artifacts/ARTIFACTS.md`, never committed).
 
 ```sh
-K27_VARIANT=native "$PIANO_K27_TREE/build-k27-piano.sh"    # the kernel, with patches/k27 applied in the k27 tree
+tooling/k273/prepare-k27-tree.sh                             # the 27.3 tree and its relinked kernel; prints K273_KERNEL's path
 tooling/unixnu.sh build firmware --skip-preflight           # the FD
-tooling/k27/build-native-image.sh                           # kexts -> KC -> ADT -> out/ram (test) + out/ram-dump
+K273_KERNEL=<path printed by prepare-k27-tree.sh> tooling/k273/build-k273-image.sh
 python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
 ```
+
+Only the 27.3 line is built. The retired `tooling/k27/build-native-image.sh` 27.0.1 path is not used. **Layout note
+(2026-11-14):** the root is now on `linux_rootfs` and Data on `linux_data`; `build-k273-image.sh`'s `K273_ROOT=k273` default
+still emits the superseded `native-ufs-root-part=linux_data`, so do not use that default for the current layout. The installed
+ESP recipe uses `build-k273-esp.py --root-part linux_rootfs` ([docs/persistent-boot.md](docs/persistent-boot.md) §13.8).
 
 Details, the boot arguments and what is read from the k27 tree: [docs/bringup-debugging.md](docs/bringup-debugging.md) §4.
 

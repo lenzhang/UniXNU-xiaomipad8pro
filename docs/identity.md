@@ -50,7 +50,10 @@ symbols only, no disassembly. "verified" = read in those sources or on the table
 | 27.3 `kernelcache.release.mac17j` | AppleARMPE on root compatible `AppleARM` (the 27.3 profile's compatible `K114cAP` leaves it out, ArmDTPlatform stays the platform expert) | AppleTopCaseDriverV2: per-model personalities `Mac MTP Actuator/MT/Keyboard - <model>` with `ModelNumber` (Mac14,2 ... Mac18,1, Mac17,11 among them) on `IOHIDInterface` with `Transport` FIFO: only an Apple internal keyboard/trackpad (MTP) would meet them; IOgPTPPlugin's same table (no K114c) | verified (Info.plists) |
 | this repository's kexts | `IOPlatformExpertDevice` by class | none reads model, target-type or compatible (grep) | verified |
 
-### 2.3 macOS 27.0.1's userland (the tablet's system volume and shared cache)
+### 2.3 macOS 27.0.1's userland (the retired VM-era system volume; historical inventory)
+
+This inventory describes the 27.0.1 binaries analysed before the 27.3 migration, not the tablet's current userland. The tablet's
+system volume is macOS 27.3 since 2026-11-14; the old 27.0.1 volume was cleared ([persistent-boot.md](persistent-boot.md) §13).
 
 | What | Who (images whose strings name it) | Effect / note |
 |---|---|---|
@@ -67,12 +70,12 @@ symbols only, no disassembly. "verified" = read in those sources or on the table
 | Data volume, written at runtime | configd `preferences.plist` and InterfaceNamer `NetworkInterfaces.plist` carry `Model` = hw.model; a file made on another model is moved aside (`preferences-<model>.plist`, `NetworkInterfaces.plist-<model>`) and a new one started; ComputerName / LocalHostName / SMB `NetBIOSName` default from the model and product name | **verified on the installed store**: the seed's files (made on iPad7,1) were moved aside at its first VirtualMac2,1 boot (2026-11-11 20:31). A new identity does the same once: network services new, and the interface database empty, so en0/en1 wait for InterfaceNamer's IOKit-quiet timeout (240 s) unless a model-less database is staged (desk-dev does: `tooling/k27/desk-dev-NetworkInterfaces.plist`) |
 | the Data seed | no MobileGestalt cache, no eligibility cache, no `Model` other than the seed era's iPad7,1 | RAM images with any identity start clean; the installed store may hold a MobileGestalt cache made under VirtualMac2,1 (root-only, not read: inferred risk, delete it at the first boot of a new identity) |
 
-### 2.4 What the tablet shows today (installed system, 27.0.1)
+### 2.4 What the tablet shows today (installed system, 2026-11-14: 27.3)
 
-`hw.model` / `hw.product` VirtualMac2,1, `hw.target` xiaomi,piano, `hw.targettype` VMA2MACOS, `kern.hv_vmm_present` 0;
-System Information: Model Identifier VirtualMac2,1, Chip Unknown (before the display-names change: Model Name "Apple Virtual
-Machine 1"); host name Apple-Virtual-Machine-1.local; `pmset -g batt` only AC Power (no InternalBattery on that boot's profile),
-`pmset -g cap` without `lowpowermode`.
+`hw.model` Mac17,11, `hw.target` K114cAP, `kern.hv_vmm_present` 0; System Information: Model Name "Xiaomi Pad 8 Pro", Chip
+"Snapdragon 8 Elite", 13 GB. `pmset -g batt` lists InternalBattery-0, the desktop has the battery icon, and Wi-Fi passed DHCP,
+gateway/Internet ping, DNS and HTTPS (boot 10i). The retired 27.0.1 system showed VirtualMac2,1 / VMA2MACOS and, on its old
+profile, no InternalBattery ([results-2026-11-14.md](results-2026-11-14.md)).
 
 ### 2.5 This repository
 
@@ -97,7 +100,10 @@ Machine 1"); host name Apple-Virtual-Machine-1.local; `pmset -g batt` only AC Po
 
 ## 4. Candidates
 
-| | vma2 (today) | A `piano` | B a real portable (e.g. Mac14,2 / J413) | C the 27.3 line (Mac17,11 / K114c) | C-light `k114c` |
+The tablet installed candidate C on 2026-11-14: 27.3 userland, Mac17,11 shown as "Xiaomi Pad 8 Pro". The option table below
+retains the 2026-11-12 comparison; "vma2" is now the retired line, and its 27.0.1-specific rows describe that option, not today.
+
+| | vma2 (retired 2026-11-14) | A `piano` | B a real portable (e.g. Mac14,2 / J413) | C the 27.3 line (Mac17,11 / K114c) | C-light `k114c` |
 |---|---|---|---|---|---|
 | model / target-type / sub-type / compatible[0] | VirtualMac2,1 / VMA2MACOS / VMA2MACOSAP / xiaomi,piano | Piano1,1 / Piano / PianoAP / PianoAP | Mac14,2 / J413 / J413AP / J413AP | Mac17,11 / K114c / K114cAP / K114cAP | as C, on 27.0.1 |
 | kernel side (section 3) | - | unchanged | unchanged | new KC base, new kernel line | unchanged |

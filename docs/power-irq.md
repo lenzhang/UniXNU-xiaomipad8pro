@@ -171,8 +171,8 @@ Test images (RAM boot only, `piano-reset-after`; built 2026-11-11 from this chan
 | `ram-touch-irq` | `piano-usb=2 piano-touch=1 piano-touch-irq=1` | 240 s | `b073dcac98371c02` |
 | `ram-power-B-dump` | the dump image (reset after 1 s, `data-persist=0`) for all of them | 1 s | `4f7e672c3e476852` |
 
-(all with `panic_on_crash_disabled=1`). Rebuild: `PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=900 PIANO_EXTRA_ARGS="..."
-tooling/k27/build-native-image.sh`.
+(all with `panic_on_crash_disabled=1`). Rebuild on the 27.3 line: `PIANO_GPU=2 PIANO_VMM_PRESENT=0 PIANO_RESET_AFTER=900 PIANO_EXTRA_ARGS="..."
+K273_KERNEL=<prepared kernel-k273-...-native.macho> tooling/k273/build-k273-image.sh` (root-layout caveat: `k273-line.md` §4).
 
 Plan (owner present, tablet in ABL fastboot, same brightness, Wi-Fi/none, the screen on at the login window, no input):
 

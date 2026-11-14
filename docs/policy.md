@@ -273,7 +273,7 @@ sleep); profile Power Saver (on battery); GPU ceiling 0 MHz (written 0, client 1
 **Build** (main checkout; the k27 tree at 0062 or 0063, which contains it):
 ```sh
 KB=$(tooling/k27/build-native-piano-keyboard.sh | tail -1)
-K27_KERNEL=$K/out/k27/kernel-k27-0063-native.macho PIANO_EXTRA_KEXTS=$KB PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k27/build-native-image.sh
+K273_KERNEL=<prepared kernel-k273-0063-...-native.macho> PIANO_EXTRA_KEXTS=$KB PIANO_GPU=2 PIANO_VMM_PRESENT=0 tooling/k273/build-k273-image.sh  # 27.3 only
 tooling/k27/build-policy-test-images.sh        # out/ram-pol-{observe,lock,sleep,lpm,suspend,gpuslot} and out/ram-pol-dump
 tooling/k27/build-policy-test-images.sh chargesleep                  # P6 by name (PianoPower level 2)
 ```
@@ -302,7 +302,8 @@ choice for every image. Built so from an agent worktree (2026-11-12, the KC of `
 2026-11-12 (client 1, P7): the KC with the 0064 kernel (any kernel from 0062 does for these images) and PianoKeyboard, 24 native
 kexts, `ram-pol-gpuslot` `593e2fd733b9335a…` (`verify-ram-images.py` PASS, command line 819 bytes); the default 0059 build links
 23 kexts with this PianoPolicy (`check-kext-imports`: 330 kernel imports and `_piano_thermal_state`, none unresolved). P7 is in
-`power.md` §6's next unattended queue.
+`power.md` §6's next unattended queue. **2026-11-12:** `ram-pol-gpuslot` did boot as a GPU-rendering probe
+([gpu-userspace.md](drivers/gpu-userspace.md) "The login window's rendering"), but not with P7's LPM checklist; P7's own test remains unrun.
 Prerequisites: `keyboard.md` §8 (a)/(b) and the hall polarity (§10.3) before any `piano-policy-lid=1` image; `power.md` §6 S1-S4
 before `sleep`.
 
