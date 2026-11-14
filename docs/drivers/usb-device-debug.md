@@ -40,7 +40,7 @@ Mac sees a composite USB device with two CDC-ACM serial ports (no driver to inst
 
 | Port | Mac node | Tablet side |
 |---|---|---|
-| 0 "piano kernel console" | `/dev/cu.usbmodem…` | the console log streamed live; on open, the whole retained log (the pstore ring, ~650 KB) is replayed first; a line-based kernel monitor (`help`, `usb`, `ioreg`, `peek`, `args`, `uptime`, `reset`, `reset fastboot` (PMIC restart reason bootloader: ABL fastboot after this reset, also on an installed system), `panic`, `log`, `live`) |
+| 0 "piano kernel console" | `/dev/cu.usbmodem…` | the console log streamed live; on open, the whole retained log (the pstore ring, ~650 KB) is replayed first; a line-based kernel monitor (`help`, `usb`, `ioreg`, `peek`, `args`, `uptime`, `reset`, `reset fastboot` (PMIC restart reason bootloader: ABL fastboot after this reset, also on an installed system; both first mark the restart begun, `machdep.piano_restart_started`, so the boot guard leaves the reason alone, and with k27 0069 the reset is immediate, `docs/halt.md`), `panic`, `log`, `live`) |
 | 1 "piano user pipe" | `/dev/cu.usbmodem…` | `/dev/pianousb` (`piano-usb-shell=1`): a byte pipe to user space for a root shell (`tooling/native/pianousb-shell`) or `log stream > /dev/pianousb` |
 | 2 "piano input" (only with `piano-usb-hid=1`) | `/dev/cu.usbmodemPIANODBG5` (expected) | keyboard and mouse input from the Mac (`tooling/native/piano-input.py`) into two HID devices, §12 |
 | "piano network" (only with `piano-usb-net=1`; not a serial port) | an Ethernet interface `en…`, MAC 02:50:49:41:4e:03 | `PianoUsbNet`, an Ethernet interface `en…` (configd names it), MAC 02:50:49:41:4e:02: IP over the cable, §14 |

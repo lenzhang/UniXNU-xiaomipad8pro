@@ -3,7 +3,10 @@
 Status (2026-11-14): every restart or shutdown of the tablet ended in `Halt/Restart Timed Out @IOPlatformExpert.cpp:884` after
 30 s, then the panic's own reboot (`MACH Reboot`). The cause of the USB console's reset is **confirmed on the tablet** (boot 10p,
 `PianoDwc3: reset: PEHaltRestart returned -1 after 242 ms`): the shutdown notifications finish in a quarter of a second and the
-platform has no restart, so nothing resets until the timer panics. Fix: k27 0069 `piano-psci-halt` (default on, section below),
+platform has no restart, so nothing resets until the timer panics. halt1 (`piano-halt-trace=1`, confirmed on the tablet):
+`handlePlatformHaltRestart` returned after 38 ms (4 priority clients at 0 ms, no halt/restart action, an empty PM quiesce), then
+`ArmDTPlatform::haltRestart(1) -> (PE_halt_restart NULL)` and `haltRestart returned -1`, nothing until `timed out after 30 s`; the
+panic's restart then ended in `PSCI SYSTEM_RESET (0x84000009) through smc`. Fix: k27 0069 `piano-psci-halt` (default on, section below),
 with the boot guard's restart-reason fix; probe `ram-k273-halt2` (`private/host-checks/20261114-halt/CHECKLIST-halt2.txt`). Tracing:
 k27 0068 `piano-halt-trace=1`, probe `ram-k273-halt1`.
 
@@ -100,6 +103,11 @@ a two-thread race included) is marked at `PEHaltRestart`'s entry for the halt/re
 kernel answers ENOENT and PianoDwc3 says so). Once marked, the guard's decision does not write the reason
 (`piano-boot-guard: healthy after 180 s, but a restart began at N ms (machdep.piano_restart_started): the restart reason is left as it
 is`); a marker that writes a reason of its own waits (200 ms at most) for a guard write already in flight, so its write comes last.
+
+The callers whose outcome changes (every other caller is `halt_all_cpus()`, which made the same PSCI call right after): PianoDwc3's
+`reset`, and IOPMrootDomain's sleep/wake watchdog (`takeStackshot`: with `swd_panic=0` a restart; after a repeated failure a
+power-off). Those are Apple's intended outcomes; the power-off needs the previous boot's `SleepWakeFailurePanic` NVRAM key, which
+this NVRAM does not keep (no NVRAM controller, inferred).
 
 What 0069 does not do: the console `reset` still restarts without a file-system sync (as before: it calls `PEHaltRestart` directly;
 `shutdown -r` over ssh syncs and unmounts first). `SYSTEM_OFF` was not run on the tablet before (inferred to power it off like the
