@@ -949,4 +949,105 @@ constexpr uint16_t kDot11StatusSuccess = 0;
 constexpr uint32_t kStaFrameSeqShift = 4;
 constexpr uint32_t kStaListenInterval = kAssocListenInterval;   // what the association request and the peer's association say
 
+// ---- level 8, the data path (WifiDp.h; docs/drivers/wifi.md §13.6) ----
+// Facts of the Ubuntu tree of §3 for WCN7860, which takes QCC2072's HAL and registers and WCN7850's transmit-ring map
+// (wifi7/hal.c, wifi7/hal_qcc2072.c, wifi7/hal.h, wifi7/hal_desc.h, wifi7/hal_rx_desc.h, wifi7/dp_tx.c, wifi7/dp_rx.c, dp.c,
+// dp_htt.[ch], hal.h): register offsets, ring identifiers, field places and bit positions, read for those facts only.
+//
+// The rings the host programs itself (the UMAC's "SRNG" rings, the copy engine's register layout: base low, base high | size
+// in words << 8, ring identifier << 8 | entry words, misc at +0x10 (bit 6 enable, bit 1 no loop count for a source ring, bit 0
+// no ring identifier for the idle link ring), the other side's pointer in host memory at +0x1c/+0x20 (source) or +0x14/+0x18
+// (destination); the host's own pointer in the R2 group, +4 the tail for a destination ring):
+//   TCL data 1 (host -> TCL, the transmit ring): R0 0x918, R2 0x2000 of the TCL unit, 8-word entries
+//   WBM2SW0 (its completions; TCL ring 0 returns its buffers there, manager "software 0"), WBM2SWn at +0x78 * n, R2 +8 * n
+//   WBM2SW1 and WBM2SW3 (released receive buffers: SW1 is their manager, SW3 the receive error ring of this chip's host)
+//   REO2SW1 (received MSDUs, reordered), REO2SW0 (the reorder unit's exceptions, fragments and BARs), 8-word entries
+//   WBM idle link (host -> WBM: the link descriptors REO and the receive DMA build their lists from), 2-word entries
+constexpr uint32_t kDpTcl1R0 = kUnitTcl + 0x918, kDpTcl1R2 = kUnitTcl + 0x2000;
+constexpr uint32_t kDpWbm2Sw0R0 = kUnitWbm + 0xe08, kDpWbm2Sw0R2 = kUnitWbm + 0x30c8;
+constexpr uint32_t kDpWbm2SwR0Stride = 0xe80 - 0xe08, kDpWbm2SwR2Stride = 8;
+constexpr uint32_t kDpReo2Sw1R0 = kUnitReo + 0x500, kDpReo2Sw1R2 = kUnitReo + 0x3048;
+constexpr uint32_t kDpReo2Sw0R0 = kUnitReo + 0x8c0, kDpReo2Sw0R2 = kUnitReo + 0x3088;
+constexpr uint32_t kDpIdleLinkR0 = kUnitWbm + 0xd3c, kDpIdleLinkR2 = kUnitWbm + 0x30b8;
+constexpr uint32_t kDpRingIdReo2Sw0 = 0, kDpRingIdReo2Sw1 = 1, kDpRingIdWbm2Sw0 = 128;
+constexpr uint32_t kDpTclEntryWords = 8, kDpWbmEntryWords = 8, kDpReoEntryWords = 8, kDpIdleEntryWords = 2;
+constexpr uint32_t kRingMiscNoRingId = 1u << 0;
+// The reorder unit's own set-up (this chip's host, at its start): REO1_GEN_ENABLE (+0) gains the aging list and the aging
+// flush (bits 2, 3); MISC_CTRL (+0xba0) sends fragments (20:17) and BARs (24:21) to REO2SW0; the four aging thresholds
+// (+0xb2c..+0xb38, microseconds: 100 ms for BE/BK/VI, 40 ms for VO); and the 32 hash entries of DEST_RING_CTRL_IX_2/IX_3
+// (+0xc, +0x10: four bits each, 1 = REO2SW1) all to the one ring this host reads.
+constexpr uint32_t kDpReoGenEnable = kUnitReo + 0x0, kDpReoMiscCtrl = kUnitReo + 0xba0, kDpReoAgingIx0 = kUnitReo + 0xb2c;
+constexpr uint32_t kDpReoDestIx2 = kUnitReo + 0x0c, kDpReoDestIx3 = kUnitReo + 0x10;
+constexpr uint32_t kDpReoGenAgingList = 1u << 2, kDpReoGenAgingFlush = 1u << 3;
+constexpr uint32_t kDpReoMiscFragMask = 0xfu << 17, kDpReoMiscBarMask = 0xfu << 21;
+constexpr uint32_t kDpReoAgingBeUs = 100 * 1000, kDpReoAgingVoUs = 40 * 1000;
+constexpr uint32_t kDpReoHashAllSw1 = 0x11111111u;
+// The transmit "bank" registers (the TCL's per-bank configuration, 0xa4408c + 4 * bank): EPD (0), encapsulation (2:1: 0 raw,
+// 1 native Wi-Fi, 2 Ethernet), encryption (6:3), index lookup (9), address X search (10), address Y search (11), mesh (13:12),
+// vdev identifier check (14), radio (16:15). A station's bank: Ethernet, index lookup, address Y search, the vdev check.
+constexpr uint32_t kDpTclBankConfig = 0x00a4408c;
+constexpr uint32_t kDpBankEncapEthernet = 2u << 1, kDpBankIndexLookup = 1u << 9, kDpBankAddrY = 1u << 11,
+                   kDpBankVdevCheck = 1u << 14;
+constexpr uint32_t kDpBankStation = kDpBankEncapEthernet | kDpBankIndexLookup | kDpBankAddrY | kDpBankVdevCheck;
+// A transmit descriptor (TCL data command, 8 words): the buffer (address low; address high 7:0, its manager 11:8 = 5 "software
+// 0", a cookie of ours 31:12); info0 (desc type 1: 0 a buffer, bank 7:2); info1 the TCL metadata in 31:16 (type 1 "vdev
+// based" 1:0, vdev 10:3, radio 12:11); info2 the length (15:0), "to firmware" (21), the packet offset (31:23); info3 "overwrite
+// the TID" (0), the TID (7:4), the radio (10:9), the vdev (31:24); info4 the search index (19:0) and the cache set (23:20);
+// info5 0.
+constexpr uint32_t kDpRbmSw0 = 5, kDpRbmSw1 = 6, kDpRbmIdleDescDev0 = 1;
+constexpr uint32_t kDpTclBankShift = 2, kDpTclCmdNumShift = 16, kDpTclVdevShift = 24, kDpTclTidShift = 4, kDpTclPmacShift = 9;
+constexpr uint32_t kDpTclTidOverwrite = 1u << 0, kDpTclToFw = 1u << 21, kDpTclCacheSetShift = 20;
+constexpr uint32_t kDpTclMetaVdevType = 1, kDpTclMetaVdevShift = 3, kDpTclMetaPdevShift = 11;
+// A WBM release entry (8 words, no cookie conversion): the buffer address info (the cookie in 31:12 of word 1, the manager in
+// 11:8), info0 the release source (2:0: 0 TQM, 1 receive DMA, 2 REO, 3 firmware, 4 software), the descriptor type (8:6), the
+// TQM's reason (18:13 for a transmit completion: 0 acknowledged), the REO's push reason (25:24) and error (30:26).
+// A transmit completion on WBM2SW0 has the same first words (the buffer's address info, as no cookie conversion runs) and the
+// TQM's reason in 16:13 of info0.
+constexpr uint32_t kDpRelSrcMask = 0x7, kDpRelSrcTqm = 0, kDpRelSrcRxdma = 1, kDpRelSrcReo = 2, kDpRelSrcFw = 3;
+constexpr uint32_t kDpTqmReasonShift = 13, kDpTqmReasonMask = 0xf;
+// Cookie conversion (the hardware turning a cookie into a host address through tables in the chip's memory): this host does
+// not set it up, so the release and destination entries keep the address and cookie the host wrote. Its two enables are read
+// back for the log only: REO1_SW_COOKIE_CFG1 (REO + 0x70: enable 19, global enable 20) and WBM_SW_COOKIE_CONVERT_CFG (WBM +
+// 0x94: WBM2SW0..4 1..5, global 8).
+constexpr uint32_t kDpReoSwCookieCfg1 = kUnitReo + 0x70, kDpWbmCookieConvert = kUnitWbm + 0x94;
+constexpr uint32_t kDpReoCookieEnables = (1u << 19) | (1u << 20), kDpWbmCookieEnables = 0x13e;
+// A REO destination entry (8 words): the MSDU buffer's address info (word 0-1: the cookie), the MPDU info (word 2: MSDU count
+// 7:0), the peer's metadata (word 3), the MSDU info (word 4: first 0, last 1, continuation 2, length 16:3), two words of a
+// converted address (unused here), info0 (word 7: buffer type 0, push reason 2:1, error 7:3, ring 27:20).
+constexpr uint32_t kDpMsduFirst = 1u << 0, kDpMsduLast = 1u << 1, kDpMsduContinuation = 1u << 2;
+constexpr uint32_t kDpMsduLenShift = 3, kDpMsduLenMask = 0x3fff;
+constexpr uint32_t kDpReoBufTypeLinkDesc = 1u << 0, kDpReoPushShift = 1, kDpReoErrShift = 3;
+// The receive buffer: QCC2072's descriptor (392 bytes) and then the frame at 392 + the L3 padding. In it: msdu_end's tag at 0
+// and its fields from 4 — info5 (16 bits at 46: L3 padding 11:10, first MSDU 12, last MSDU 13), info10 (at 76: the MSDU length
+// 13:0), info11 (at 80: the decapsulation 9:8: 0 raw, 1 native Wi-Fi, 2 Ethernet II, 3 802.3), info13 (at 124: multicast or
+// broadcast 2, null data 7, A-MSDU error 12, overflow 16, MSDU length error 17, MPDU length error 27, TKIP MIC 28, decryption
+// 29, FCS 31),
+// info14 (at 128: the decryption status 12:10, MSDU done 31); mpdu_start's tag at 140, its info2 at 148 (the TID 18:15), info4
+// at 176, the software peer at 186; the 802.11 header's TLV at 264.
+constexpr uint32_t kRxDescBytes = 392, kRxDescInfo5 = 46, kRxDescInfo10 = 76, kRxDescInfo11 = 80, kRxDescInfo13 = 124,
+                   kRxDescInfo14 = 128, kRxDescMpduInfo2 = 148, kRxDescPeerId = 186;
+constexpr uint32_t kRxDescMsduEndTag = 0, kRxDescMpduStartTag = 140, kRxDescPktHdr = 264;
+constexpr uint32_t kRxDescL3PadShift = 10, kRxDescL3PadMask = 0x3, kRxDescFirstMsdu = 1u << 12, kRxDescLastMsdu = 1u << 13;
+constexpr uint32_t kRxDescMsduLenMask = 0x3fff, kRxDescDecapShift = 8, kRxDescDecapMask = 0x3;
+constexpr uint32_t kRxDescMcbc = 1u << 2, kRxDescNullData = 1u << 7;
+constexpr uint32_t kRxDescErrors = (1u << 31) | (1u << 29) | (1u << 28) | (1u << 27) | (1u << 17) | (1u << 16) | (1u << 12);
+constexpr uint32_t kRxDescMsduDone = 1u << 31, kRxDescTidShift = 15, kRxDescTidMask = 0xf;
+constexpr uint32_t kRxDecapRaw = 0, kRxDecapNativeWifi = 1, kRxDecapEthernet = 2, kRxDecap8023 = 3;
+// The receive DMA's ring selection (HTT_H2T 0x0c, 18 words), as this chip's host sends it for each radio buffer ring: word 0
+// the type, the radio + 1 (15:8), the ring (23:16: 0 the radio's buffer ring), "offsets valid" (26) and "monitor enabled" (28,
+// the host leaves it on); word 1 the buffer size (15:0); words 2-5 the frame filters (none for management, BAR for control in
+// word 4 bit 24, multicast, unicast and null data in word 5 bits 18, 21, 24); word 6 the TLVs (MPDU start 0, packet 2, MSDU
+// end 3); word 7 the packet's offset (15:0) and the 802.11 header's (31:16); word 8 the MPDU start's (31:16); word 9 the MSDU
+// end's (15:0); the rest 0.
+constexpr uint32_t kHttRxSelectionWords = 18;
+constexpr uint32_t kHttRxSelOffsetValid = 1u << 26, kHttRxSelRxMon = 1u << 28;
+constexpr uint32_t kHttRxSelCtrlBar = 1u << 24;
+constexpr uint32_t kHttRxSelDataMcast = 1u << 18, kHttRxSelDataUcast = 1u << 21, kHttRxSelDataNull = 1u << 24;
+constexpr uint32_t kHttRxSelTlvs = (1u << 0) | (1u << 2) | (1u << 3);
+// The 802.1X frames (EAPOL) of the four-way handshake: Ethernet type 0x888e.
+constexpr uint16_t kEtherTypeEapol = 0x888e;
+// The radio's identifier the data path names (the transmit metadata's radio field): a chip of this family that runs as one
+// radio (both bands on one device, as this one does) has its host name radio 0 whatever the capability event's entries say.
+constexpr uint32_t kDpPdevSingle = 0;
+
 }  // namespace pianowifi

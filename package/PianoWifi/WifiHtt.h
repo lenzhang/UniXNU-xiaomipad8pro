@@ -42,10 +42,12 @@ enum HttRingIndex : unsigned { kHttRefill = 0, kHttMacBuf0 = 1, kHttMacBuf1 = 2,
 
 // A peer the firmware's data interface named (level 7 waits for its own): the device, the peer identifier the data path
 // carries, the hardware peer, and the address — kept for the join's own comparison, never logged.
+// The second and third forms also carry the address search entry the transmit descriptor names (its index, the hardware
+// peer, and its hash); the first carries none (hasSearch false: the transmit side then names index 0, as this chip's host does).
 struct HttPeerMap {
-  uint32_t type = 0, vdevId = 0, peerId = 0, hwPeerId = 0;
+  uint32_t type = 0, vdevId = 0, peerId = 0, hwPeerId = 0, astHash = 0;
   uint8_t mac[6] = {};
-  bool unmapped = false;
+  bool unmapped = false, hasSearch = false;
 };
 constexpr unsigned kHttPeerMapsKept = 4;
 
@@ -55,6 +57,7 @@ struct HttRx {
   uint32_t peerEvents = 0, peerUnmaps = 0;
   // the buffers: the refill ring's, then each status ring's
   uint64_t refillBus[kRxRefillEntries] = {};
+  uint8_t *refillVa[kRxRefillEntries] = {};   // level 8 reads the received frames out of them
   uint64_t statusBus[kRxRadios][kRxMonStatusEntries] = {};
   uint32_t statusSlotBuffer[kRxRadios][kRxMonStatusEntries] = {};   // status ring slot -> which of its buffers sits there
   uint32_t rbm = kRxBufRbmFw;
@@ -150,7 +153,7 @@ inline bool httPlan(HttRx &rx, Arena &arena, bool rbmSw1)
       return false;
   // The buffers: 2 KiB each, from the window (at least 128-byte aligned: the arena aligns them to their own size).
   for (uint32_t i = 0; i + 1 < kRxRefillEntries; ++i)
-    if (!arenaAlloc(arena, kRxBufferBytes, &rx.refillBus[i])) return false;
+    if (!(rx.refillVa[i] = arenaAlloc(arena, kRxBufferBytes, &rx.refillBus[i]))) return false;
   for (uint32_t radio = 0; radio < kRxRadios; ++radio)
     for (uint32_t i = 0; i + 1 < kRxMonStatusEntries; ++i)
       if (!arenaAlloc(arena, kRxBufferBytes, &rx.statusBus[radio][i])) return false;
@@ -242,14 +245,48 @@ inline void httReceive(HttRx &rx, const uint8_t *payload, uint32_t length)
     p.mac[4] = uint8_t(word2 & 0xffu);
     p.mac[5] = uint8_t((word2 >> 8) & 0xffu);
     if (!unmap) {
-      if (type == kHttT2hPeerMap3) p.hwPeerId = length >= 16 ? (get32(payload + 12) & 0xffffu) : 0;
-      else p.hwPeerId = (word2 >> 16) & 0xffffu;
+      const uint32_t word3 = length >= 16 ? get32(payload + 12) : 0;
+      if (type == kHttT2hPeerMap3) {
+        p.hwPeerId = word3 & 0xffffu;
+        p.astHash = word3 >> 16;
+      } else {
+        p.hwPeerId = (word2 >> 16) & 0xffffu;
+        p.astHash = type == kHttT2hPeerMap2 ? (word3 & 0xffffu) : 0;
+      }
+      p.hasSearch = type != kHttT2hPeerMap && length >= 16;
       ++rx.peerMaps;
     } else {
       ++rx.peerUnmaps;
     }
     ++rx.peerEvents;
   }
+}
+
+// Level 8: the refill ring kept full. A buffer that came back to the host (out of the reorder unit's ring or a release ring,
+// WifiDp.h) goes into the refill ring again; the firmware hands it on to a radio's buffer ring. One entry always stays free
+// (the two pointers alone tell full from empty).
+inline uint32_t httRefillFree(const HttRx &rx)
+{
+  using namespace httdetail;
+  const HttRing &r = rx.ring[kHttRefill];
+  if (!r.planned || !r.entries) return 0;
+  const uint32_t tail = r.announced ? slotOf(r, load(r.tail)) : 0;
+  const uint32_t used = (r.ours + r.entries - tail) % r.entries;
+  return r.entries - 1 - used;
+}
+
+// Buffer `buffer` (its cookie) into the refill ring again; false when it is not one of the refill ring's or there is no room.
+inline bool httRefillPost(HttRx &rx, uint32_t buffer)
+{
+  using namespace httdetail;
+  HttRing &r = rx.ring[kHttRefill];
+  if (buffer + 1 >= kRxRefillEntries || !r.planned) return false;
+  if (!httRefillFree(rx)) return false;
+  putBuffer(r.va + r.ours * r.entryWords * 4, rx.refillBus[buffer], rx.rbm, buffer);
+  r.ours = (r.ours + 1) % r.entries;
+  store(r.head, r.ours * r.entryWords);
+  ++rx.refillPosted;
+  return true;
 }
 
 // The newest peer map for an address and a device, or null.

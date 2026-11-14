@@ -936,6 +936,19 @@ inline int linkSendWmi(Link &link, const uint8_t *message, uint32_t length)
   return rc;
 }
 
+// A message of the owner's on the data interface's endpoint (level 8's receive ring selection): the same contract.
+inline int linkSendHtt(Link &link, const uint8_t *message, uint32_t length)
+{
+  if (link.httEndpoint <= 0 || !message || !length) return -1;
+  const int rc = linkdetail::send(link, uint8_t(link.httEndpoint), [&](uint8_t *at, uint32_t capacity) -> uint32_t {
+    if (length > capacity) return 0;
+    for (uint32_t i = 0; i < length; ++i) at[i] = message[i];
+    return length;
+  });
+  if (rc == 1) ++link.httMessages;
+  return rc;
+}
+
 // One turn of the ladder: the copy engine's events, the buffers given back, the one command outstanding if it can go out, the
 // steps that move by themselves (the scan after its settle time, the teardown), then the step's deadline. Returns the step.
 inline int linkRun(Link &link, uint64_t nowMs)

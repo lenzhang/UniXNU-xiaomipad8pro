@@ -23,7 +23,7 @@ mkdir -p "$O/host-tests"
 "$D/package/include/tests/run.sh"   # PianoWcnRails.h: the rails shared with PianoBluetooth (docs/drivers/bluetooth.md section 7)
 # WifiQrtr.c (the copy of PianoPower's QRTR codec) is a C source: the level 5 test links its object.
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -c "$P/WifiQrtr.c" -o "$O/host-tests/WifiQrtr.o"
-for t in wifi_host bringup_host qmi_host wmi_host assoc_host profile_host sta_host; do
+for t in wifi_host bringup_host qmi_host wmi_host assoc_host profile_host sta_host dp_host; do
   EXTRA=; [ "$t" = qmi_host ] && EXTRA="$O/host-tests/WifiQrtr.o"
   "${CXX:-c++}" -std=c++20 -Wall -Wextra -Werror -I "$P" "$P/tests/$t.cpp" $EXTRA -o "$O/host-tests/$t"
   "$O/host-tests/$t" || { echo "Error: PianoWifi host tests failed ($t)" >&2; exit 1; }
