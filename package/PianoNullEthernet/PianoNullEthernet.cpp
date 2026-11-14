@@ -21,6 +21,9 @@
 
 namespace {
 constexpr UInt64 linkSpeed = 1000 * 1000000ULL;
+// The stand-down is for the boot: an instance that IOResources' matching starts later (any published resource re-runs it) does
+// not come back as en0 (boot 10m-en0: a second instance took en0 again during launchd's boot tasks).
+bool sStoodDown;
 }
 
 class PianoNullEthernet : public IOEthernetController {
@@ -56,6 +59,10 @@ OSDefineMetaClassAndStructors(PianoNullEthernet, IOEthernetController)
 
 bool PianoNullEthernet::start(IOService *provider)
 {
+    if (sStoodDown) {
+        IOLog("PianoNullEthernet: not started again: en0 is Wi-Fi's for this boot (piano-wifi-en0=1)\n");
+        return false;
+    }
     if (!IOEthernetController::start(provider))
         return false;
     OSDictionary *media = OSDictionary::withCapacity(1);
@@ -91,6 +98,7 @@ IOReturn PianoNullEthernet::callPlatformFunction(const OSSymbol *functionName, b
     if (functionName && functionName->isEqualTo("PianoNullEthernetStandDown")) {
         if (!fInterface)
             return kIOReturnSuccess;
+        sStoodDown = true;
         IOLog("PianoNullEthernet: en0 stands down for Wi-Fi (piano-wifi-en0=1): the interface is detached (synchronously)\n");
         detachInterface(fInterface, true);
         OSSafeReleaseNULL(fInterface);

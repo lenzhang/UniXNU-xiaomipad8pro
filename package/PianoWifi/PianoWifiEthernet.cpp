@@ -343,7 +343,8 @@ bool PianoWifiEthernet::takeOverEn0()
     }
     IOSleep(100);
   }
-  if (rc == kIOReturnSuccess) null->terminate();   // the controller follows its interface (nothing of it is in use any more)
+  // The controller itself stays (without its interface): terminating it let IOResources' next matching start a new instance,
+  // which took en0 again (boot 10m-en0).
   null->release();
   auto at = [](uint64_t ms) { return ms == ~0ull ? -1 : int(ms); };
   if (free)
