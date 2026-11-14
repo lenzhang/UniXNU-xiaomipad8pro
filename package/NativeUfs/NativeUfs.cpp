@@ -2,6 +2,7 @@
 // Native sheng SM8550 UFS bring-up. Default-off: no MMIO is touched unless
 // native-ufs-probe=1 is present. This is a register probe, not a storage driver.
 #include <IOKit/IOService.h>
+#include <IOKit/IOKitKeys.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <libkern/crypto/sha2.h>
@@ -1056,6 +1057,10 @@ static uint32_t hostCompletionCount (unsigned slot);
 static bool hostInterruptMode (void);
 static void hostWaitCompletion (unsigned slot, uint32_t seen, uint64_t started);
 static uint64_t hostDmaAddress (const void *va);
+// native-ufs-perf=1's accounting (defined with the completion wait below).
+static uint64_t hostPerfNow (void);
+static void hostPerfSpan (unsigned kind, uint64_t start, uint64_t bytes);
+static void hostPerfDepth (int delta);
 #include "RootCommands.h"
 
 #if defined(NATIVE_UFS_SM8750) && NATIVE_UFS_SM8750
@@ -1107,11 +1112,91 @@ static uint32_t hostCompletionCount (unsigned slot) { return __atomic_load_n (&g
 static bool hostInterruptMode (void) { return gIrqMode && !gHostPanic; }
 static uint64_t gSpinTicks = 0;
 static uint32_t gSpinTicksUs = ~0U;
+
+// ---- Read path switches (UniXNU-piano, 2026-11-14, the boot-time lane) --------------------------------------------------------------
+// The 27.3 boot reads about 2.4 GB from the root windows between launchd's exec and dyld's shared cache (bt1: 60-80 MB/s, about 600
+// copies of up to 128 KiB a second). Every switch is off by default, which is the read path as it was: each window read runs in the
+// caller's thread through one of four 128 KiB bounces, one command at a time, its wait a 2 us IODelay spin.
+//   native-ufs-perf=1        per-second timing lines with native-ufs-iolog (it starts the iolog for 120 s when absent): requests,
+//                            their sizes and queue depth, the commands' slot wait, cache clean, device, invalidate and copy times; the
+//                            link's gear and lanes once after the bring-up. Observation only.
+//   native-ufs-async=N       N read worker threads (1..16): a window read is queued and the caller goes on; each worker serves one read
+//                            at a time with its own bounce, so up to N commands are on the device at once. A full request pool serves
+//                            the read in the caller's thread as before. Writes never go through the workers.
+//   native-ufs-bounce=KiB    each window's bounces this big (128..1024; physically contiguous, DMA-reachable, else 128 KiB as before):
+//                            one command of up to 1 MiB per bounce instead of 128 KiB.
+//   native-ufs-maxio=KiB     publish IOMaximumByteCountRead / IOMaximumBlockCountRead on each window (64..16384), so the layers above
+//                            size their reads to it. Absent: no property, as before. Read side only.
+//   native-ufs-nap=US        a read worker whose command has run longer than native-ufs-nap-spin=US (default 30) sleeps US
+//                            microseconds between polls (1..1000) instead of spinning. Only the workers; every other caller spins.
+//   native-ufs-fast=1        async 8, bounce 1024, maxio 1024, nap 25 (each explicit switch above wins).
+static bool gPerf = false;
+static unsigned gReadWorkers = 0;
+static uint32_t gBounceBytes = kDataMax, gMaxIoBytes = 0, gNapUs = 0, gNapSpinUs = 30;
+static uint64_t gNapSpinTicks = 0;
+static thread_t gReadThread[16];
+static unsigned gReadThreads = 0;
+static bool hostIsReadWorker (void)
+{
+  const thread_t self = current_thread ();
+  for (unsigned i = 0; i < gReadThreads; ++i) if (gReadThread[i] == self) return true;
+  return false;
+}
+
+// native-ufs-perf=1: sums of spans (count, time, bytes, longest) per kind, the request size histogram, and the time-weighted depth of
+// the requests in the windows and of the commands on the device (from which the busy share of each second).
+enum : unsigned { kUfsPerfRequest = kUfsPerfCommandKinds, kUfsPerfQueue, kUfsPerfCopy, kUfsPerfBounceWait, kUfsPerfKinds };
+struct UfsPerfSum { uint64_t count, ticks, bytes, maxTicks; };
+static UfsPerfSum gPerfSum[kUfsPerfKinds];
+static constexpr unsigned kPerfSizeBuckets = 10;   // <=4K, 8K, 16K, 32K, 64K, 128K, 256K, 512K, 1M, more
+static uint64_t gPerfSize[kPerfSizeBuckets], gPerfUnaligned = 0;
+struct UfsPerfDepth { uint32_t now, max; uint64_t last, area, busy; };
+static UfsPerfDepth gPerfRequests = {}, gPerfCommands = {};
+static IOSimpleLock *gPerfLock = nullptr;
+
+static uint64_t hostPerfNow (void) { return gPerf ? mach_absolute_time () : 0; }
+static void hostPerfSpan (unsigned kind, uint64_t start, uint64_t bytes)
+{
+  if (!start || kind >= kUfsPerfKinds) return;
+  const uint64_t spent = mach_absolute_time () - start;
+  UfsPerfSum &sum = gPerfSum[kind];
+  __atomic_fetch_add (&sum.count, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add (&sum.ticks, spent, __ATOMIC_RELAXED);
+  __atomic_fetch_add (&sum.bytes, bytes, __ATOMIC_RELAXED);
+  uint64_t seen = __atomic_load_n (&sum.maxTicks, __ATOMIC_RELAXED);
+  while (spent > seen && !__atomic_compare_exchange_n (&sum.maxTicks, &seen, spent, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+}
+static void perfDepth (UfsPerfDepth &depth, int delta)
+{
+  if (!gPerf || !gPerfLock || gHostPanic) return;
+  const uint64_t now = mach_absolute_time ();
+  IOSimpleLockLock (gPerfLock);
+  if (depth.last && now > depth.last) {
+    depth.area += (now - depth.last) * depth.now;
+    if (depth.now) depth.busy += now - depth.last;
+  }
+  depth.last = now;
+  if (delta > 0) ++depth.now;
+  else if (depth.now) --depth.now;
+  if (depth.now > depth.max) depth.max = depth.now;
+  IOSimpleLockUnlock (gPerfLock);
+}
+static void hostPerfDepth (int delta) { perfDepth (gPerfCommands, delta); }
+
 static void hostWaitCompletion (unsigned slot, uint32_t seen, uint64_t started)
 {
   const uint32_t spinUs = *static_cast<volatile uint32_t *> (&gSpinUs);
   if (spinUs != gSpinTicksUs) { nanoseconds_to_absolutetime (uint64_t (spinUs) * 1000, &gSpinTicks); gSpinTicksUs = spinUs; }
   if (!hostInterruptMode () || mach_absolute_time () - started < gSpinTicks || !ml_get_interrupts_enabled ()) {
+    // native-ufs-nap=US: a read worker past its spin budget sleeps between polls (a timed wait without leeway; nothing wakes it
+    // early, the next poll comes after US microseconds). Never in a panic, with interrupts masked, or in any other thread.
+    if (gNapUs && !gHostPanic && mach_absolute_time () - started >= gNapSpinTicks && ml_get_interrupts_enabled () &&
+        preemption_enabled () && hostIsReadWorker ()) {
+      assert_wait_timeout_with_leeway ((event_t) &gNapUs, THREAD_UNINT, TIMEOUT_URGENCY_SYS_CRITICAL | TIMEOUT_URGENCY_LEEWAY, gNapUs, 0,
+                                       NSEC_PER_USEC);
+      thread_block (THREAD_CONTINUE_NULL);
+      return;
+    }
     IODelay (2);
     return;
   }
@@ -1984,26 +2069,37 @@ class NativeUfsBlock : public IOBlockStorageDevice {
   char product[48] = {};      // the IOMedia's and diskutil's name (PianoDiskIdentity.h); empty: the old "Native <label>"
   // Requests run concurrently, each with its own bounce buffer from the pool: a request verifies and copies the snapshot in its
   // own buffer, so no lock is held across the read, the integrity check or the copy (RootWindowRead.h).
-  static constexpr unsigned kBounces = 4;
+  // UniXNU-piano: 4 bounces of kDataMax by default (as before); native-ufs-async=N gives N (one per read worker, at most kBounces),
+  // native-ufs-bounce=KiB makes them bigger (physically contiguous, so one command fills one; bounceMd keeps their descriptors).
+  static constexpr unsigned kBounces = 16;
   uint8_t *bounces[kBounces] = {};
+  uint32_t bounceBytes[kBounces] = {};
+  IOBufferMemoryDescriptor *bounceMd[kBounces] = {};
   uint32_t bounceFree = 0;
   IOLock *windowLock = nullptr;   // guards bounceFree
   bool online = false;
   bool writable = false;      // development build only (NATIVE_UFS_UNVERIFIED_ROOT)
   IOReturn writeWindow (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, uint64_t *done);
-  uint8_t *takeBounce ()
+  bool allocBounce (unsigned k);
+  unsigned takeBounce ()
   {
+    const uint64_t waitStart = hostPerfNow ();
+    bool waited = false;
     IOLockLock (windowLock);
-    while (!bounceFree) IOLockSleep (windowLock, &bounceFree, THREAD_UNINT);
+    while (!bounceFree) {
+      waited = true;
+      IOLockSleep (windowLock, &bounceFree, THREAD_UNINT);
+    }
     const unsigned k = static_cast<unsigned> (__builtin_ctz (bounceFree));
     bounceFree &= ~(1U << k);
     IOLockUnlock (windowLock);
-    return bounces[k];
+    if (waited) hostPerfSpan (kUfsPerfBounceWait, waitStart, 0);
+    return k;
   }
-  void giveBounce (uint8_t *buffer)
+  void giveBounce (unsigned k)
   {
     IOLockLock (windowLock);
-    for (unsigned k = 0; k < kBounces; ++k) if (bounces[k] == buffer) bounceFree |= 1U << k;
+    bounceFree |= 1U << k;
     IOLockWakeup (windowLock, &bounceFree, true);
     IOLockUnlock (windowLock);
   }
@@ -2045,6 +2141,8 @@ public:
   IOReturn getWriteCacheState (bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn setWriteCacheState (bool) override { return kIOReturnUnsupported; }
   IOReturn doAsyncReadWrite (IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *) override;
+  // One window read, start to completion (the caller's thread, or a read worker with native-ufs-async).
+  void serveRead (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, IOStorageCompletion completion, uint64_t requestStart);
 };
 OSDefineMetaClassAndStructors (NativeUfsBlock, IOBlockStorageDevice)
 
@@ -2106,14 +2204,19 @@ bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint6
   bytes = size;
   windowLock = IOLockAlloc ();
   if (!windowLock) return false;
-  for (unsigned k = 0; k < kBounces; ++k) {
-    bounces[k] = static_cast<uint8_t *> (IOMalloc (kDataMax));
-    if (!bounces[k]) {
+  const unsigned wanted = gReadWorkers > 4 ? (gReadWorkers < kBounces ? gReadWorkers : kBounces) : 4;
+  unsigned big = 0;
+  for (unsigned k = 0; k < wanted; ++k) {
+    if (!allocBounce (k)) {
       if (!k) return false;
       break;
     }
+    if (bounceBytes[k] > kDataMax) ++big;
     bounceFree |= 1U << k;
   }
+  if (gReadWorkers || gBounceBytes > kDataMax || gPerf)
+    IOLog ("NativeUfs: %s window: %u bounces, %u of them %u KiB (physically contiguous), the others %u KiB\n", label,
+           static_cast<unsigned> (__builtin_popcount (bounceFree)), big, gBounceBytes >> 10, kDataMax >> 10);
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
   // Reads are served only after each 4096-byte integrity block verifies against the owner-signed
   // policy; without a matching policy the device is never published.
@@ -2306,6 +2409,117 @@ extern "C" int native_ufs_block_authenticates (IOService *provider, const char *
 }
 #endif
 
+// ---- native-ufs-async=N: the read workers (UniXNU-piano, 2026-11-14) --------------------------------------------------------------
+// doAsyncReadWrite queues a window read here and returns; a worker serves it (NativeUfsBlock::serveRead, the same code the caller's
+// thread runs without the switch) and calls its completion, as a controller's interrupt path would. The requests come from a fixed
+// pool, so queueing never allocates; with the pool empty the read runs in the caller's thread as before. FIFO; reads only.
+struct UfsReadRequest {
+  UfsReadRequest *next;
+  NativeUfsBlock *device;
+  IOMemoryDescriptor *buffer;
+  UInt64 block, count;
+  IOStorageCompletion completion;
+  uint64_t requestStart, queued;
+};
+static constexpr unsigned kReadRequests = 256;
+static UfsReadRequest *gReadPool = nullptr, *gReadFree = nullptr, *gReadHead = nullptr, *gReadTail = nullptr;
+static IOLock *gReadLock = nullptr;
+extern "C" volatile uint64_t native_ufs_async_queued = 0, native_ufs_async_inline = 0;
+
+static void readWorker (void *, wait_result_t)
+{
+  for (;;) {
+    IOLockLock (gReadLock);
+    while (!gReadHead) IOLockSleep (gReadLock, &gReadHead, THREAD_UNINT);
+    UfsReadRequest *request = gReadHead;
+    gReadHead = request->next;
+    if (!gReadHead) gReadTail = nullptr;
+    IOLockUnlock (gReadLock);
+    hostPerfSpan (kUfsPerfQueue, request->queued, 0);
+    request->device->serveRead (request->buffer, request->block, request->count, request->completion, request->requestStart);
+    request->buffer->release ();
+    request->device->release ();
+    IOLockLock (gReadLock);
+    request->next = gReadFree;
+    gReadFree = request;
+    IOLockUnlock (gReadLock);
+  }
+}
+
+// Called once from NativeUfs::start, before any window exists. Returns the number of workers running (0: the switch stays off).
+static unsigned readWorkersStart (unsigned wanted)
+{
+  if (!wanted) return 0;
+  gReadLock = IOLockAlloc ();
+  gReadPool = static_cast<UfsReadRequest *> (IOMalloc (sizeof (UfsReadRequest) * kReadRequests));
+  if (!gReadLock || !gReadPool) return 0;
+  bzero (gReadPool, sizeof (UfsReadRequest) * kReadRequests);
+  for (unsigned i = 0; i < kReadRequests; ++i) {
+    gReadPool[i].next = gReadFree;
+    gReadFree = &gReadPool[i];
+  }
+  for (unsigned i = 0; i < wanted && i < 16; ++i) {
+    thread_t thread = nullptr;
+    if (kernel_thread_start (readWorker, nullptr, &thread) != KERN_SUCCESS) break;
+    thread_set_thread_name (thread, "NativeUfs.read");
+    gReadThread[i] = thread;        // kept (never deallocated): hostIsReadWorker compares against it
+    gReadThreads = i + 1;
+  }
+  return gReadThreads;
+}
+
+// Queue a window read; false when no worker or no free request (the caller then serves it itself).
+static bool readQueue (NativeUfsBlock *device, IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
+                       const IOStorageCompletion &completion, uint64_t requestStart)
+{
+  if (!gReadThreads || gHostPanic) return false;
+  IOLockLock (gReadLock);
+  UfsReadRequest *request = gReadFree;
+  if (request) gReadFree = request->next;
+  IOLockUnlock (gReadLock);
+  if (!request) {
+    __atomic_fetch_add (&native_ufs_async_inline, 1, __ATOMIC_RELAXED);
+    return false;
+  }
+  buffer->retain ();
+  device->retain ();
+  *request = { nullptr, device, buffer, block, count, completion, requestStart, hostPerfNow () };
+  IOLockLock (gReadLock);
+  if (gReadTail) gReadTail->next = request; else gReadHead = request;
+  gReadTail = request;
+  IOLockWakeup (gReadLock, &gReadHead, true);
+  IOLockUnlock (gReadLock);
+  __atomic_fetch_add (&native_ufs_async_queued, 1, __ATOMIC_RELAXED);
+  return true;
+}
+
+// One bounce of the window: today's kDataMax from IOMalloc, or with native-ufs-bounce one physically contiguous, DMA-reachable buffer
+// of gBounceBytes (hostRead4k then reads it with one zero-copy command); a refusal falls back to kDataMax.
+bool NativeUfsBlock::allocBounce (unsigned k)
+{
+  if (gBounceBytes > kDataMax) {
+    IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions (
+      kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
+      static_cast<IOOptionBits> (kIOMemoryMapperNone), gBounceBytes, 4096);
+    if (md) {
+      uint8_t *va = static_cast<uint8_t *> (md->getBytesNoCopy ());
+      IOByteCount contiguous = 0;
+      const uint64_t pa = md->getPhysicalSegment (0, &contiguous, kIOMemoryMapperNone);
+      if (va && pa && !(pa & 4095) && !(reinterpret_cast<uintptr_t> (va) & 4095) && contiguous >= gBounceBytes &&
+          hostDmaAddress (va) == pa && hostDmaAddress (va + gBounceBytes - 4096) == pa + gBounceBytes - 4096) {
+        bounces[k] = va;
+        bounceBytes[k] = gBounceBytes;
+        bounceMd[k] = md;
+        return true;
+      }
+      md->release ();
+    }
+  }
+  bounces[k] = static_cast<uint8_t *> (IOMalloc (kDataMax));
+  bounceBytes[k] = kDataMax;
+  return bounces[k] != nullptr;
+}
+
 bool NativeUfsBlock::start (IOService *provider)
 {
   if (!bounceFree || !windowLock || !IOBlockStorageDevice::start (provider)) {
@@ -2313,6 +2527,12 @@ bool NativeUfsBlock::start (IOService *provider)
   }
   online = true;
   if (product[0] && !pianodisk::publish (this, product, "1.0")) product[0] = 0;   // internal, UFS, solid state (PianoDiskIdentity.h)
+  // native-ufs-maxio=KiB: the read size the layers above may send (IOBlockStorageDriver, the BSD client's DKIOCGETMAXBYTECOUNTREAD that
+  // sizes the file systems' clusters); set before registerService, which starts IOBlockStorageDriver. Write keys stay absent.
+  if (gMaxIoBytes) {
+    setProperty (kIOMaximumByteCountReadKey, gMaxIoBytes, 64);
+    setProperty (kIOMaximumBlockCountReadKey, gMaxIoBytes / 512, 64);
+  }
   registerService ();
   return true;
 }
@@ -2340,6 +2560,24 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
   if (buffer->getDirection () != kIODirectionIn) {
     return kIOReturnNotWritable;
   }
+  // native-ufs-perf: the request's size and alignment on the 4 KiB device blocks, and its time from here to its completion.
+  const uint64_t requestStart = hostPerfNow ();
+  if (requestStart) {
+    const uint64_t length = count * 512;
+    unsigned bucket = 0;
+    while (bucket < kPerfSizeBuckets - 1 && length > (4096ULL << bucket)) ++bucket;
+    __atomic_fetch_add (&gPerfSize[bucket], 1, __ATOMIC_RELAXED);
+    if (((absolute + block * 512) | length) & 4095) __atomic_fetch_add (&gPerfUnaligned, 1, __ATOMIC_RELAXED);
+    perfDepth (gPerfRequests, 1);
+  }
+  if (readQueue (this, buffer, block, count, *completion, requestStart)) return kIOReturnSuccess;
+  serveRead (buffer, block, count, *completion, requestStart);
+  return kIOReturnSuccess;
+}
+
+void NativeUfsBlock::serveRead (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, IOStorageCompletion completion,
+                                uint64_t requestStart)
+{
   struct Operations {
     IOMemoryDescriptor *buffer;
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
@@ -2376,7 +2614,9 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
       return kIOReturnSuccess;
     }
     uint64_t copy (uint64_t offset, const void *data, uint64_t length) {
+      const uint64_t copyStart = hostPerfNow ();
       uint64_t copied = buffer->writeBytes (offset, data, length);
+      hostPerfSpan (kUfsPerfCopy, copyStart, length);
       if (copied == length) {
         __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add (&native_ufs_bytes_read, length, __ATOMIC_RELAXED);
@@ -2388,9 +2628,9 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     , &verified
 #endif
   };
-  uint8_t *bounce = takeBounce ();
-  UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounce);
-  giveBounce (bounce);
+  const unsigned bounceIndex = takeBounce ();
+  UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounces[bounceIndex], bounceBytes[bounceIndex]);
+  giveBounce (bounceIndex);
   IOReturn result = outcome.status;
   uint64_t done = outcome.done;
   if (result != kIOReturnSuccess) {
@@ -2398,14 +2638,18 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     gRootDiagnostic.result = static_cast<uint32_t> (result);
     rootDiagnosticFailure ("root window read failed");
   }
-  completion->action (completion->target, completion->parameter, result, done);
-  return kIOReturnSuccess;
+  if (requestStart) {
+    hostPerfSpan (kUfsPerfRequest, requestStart, done);
+    perfDepth (gPerfRequests, -1);
+  }
+  completion.action (completion.target, completion.parameter, result, done);
 }
 
 // Development build: 512-byte sectors written onto 4 KiB UFS blocks; partial blocks at the edges are read first.
 IOReturn NativeUfsBlock::writeWindow (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, uint64_t *done)
 {
-  uint8_t *bounce = takeBounce ();
+  const unsigned bounceIndex = takeBounce ();
+  uint8_t *bounce = bounces[bounceIndex];   // every bounce has at least kDataMax; writes use that much, as before
   const uint64_t start = absolute + block * 512;
   uint64_t remaining = count * 512;
   IOReturn status = kIOReturnSuccess;
@@ -2426,7 +2670,7 @@ IOReturn NativeUfsBlock::writeWindow (IOMemoryDescriptor *buffer, UInt64 block, 
     *done += usable;
     remaining -= usable;
   }
-  giveBounce (bounce);
+  giveBounce (bounceIndex);
   return status;
 }
 
@@ -2439,8 +2683,11 @@ void NativeUfsBlock::free ()
   }
 #endif
   for (unsigned k = 0; k < kBounces; ++k) {
-    if (bounces[k]) IOFree (bounces[k], kDataMax);
+    if (bounceMd[k]) bounceMd[k]->release ();
+    else if (bounces[k]) IOFree (bounces[k], kDataMax);
+    bounceMd[k] = nullptr;
     bounces[k] = nullptr;
+    bounceBytes[k] = 0;
   }
   bounceFree = 0;
   if (windowLock) {
@@ -2609,16 +2856,103 @@ extern int nprocs;
 // native-ufs-iolog=S (UniXNU-piano, 2026-11-14, the boot-time question): for S seconds after NativeUfs starts, one line a second with
 // the reads and MiB handed up in that second, so a boot log tells an I/O-bound stretch (launchd's 40 s before its first line) from
 // a CPU-bound one. Off by default; nothing else changes.
+// native-ufs-perf=1: two lines after each iolog second with reads in it (UniXNU-piano, 2026-11-14). Times in microseconds.
+//   perf N s: req R (K KiB) avg A us max M us, queue Q us, copy C us/MiB; qd D max X busy B%; sizes s4K/8K/16K/32K/64K/128K/256K/512K/
+//             1M/more, unaligned U, bounce waits W
+//   perf N s: cmd Z zc + S slot (K KiB) avg A us; dev avg D us max M us, F MB/s busy; clean C inval I slotcopy P us/MiB; take T us;
+//             qd D max X busy B%
+// req: window reads handed to NativeUfs (from doAsyncReadWrite to the completion; queue: waiting for a read worker); cmd: the UFS
+// READ(10) commands (zc straight into the bounce, slot through the slot's 128 KiB data area); dev: doorbell to completion seen;
+// qd/busy: the time-weighted number in flight and the share of the second with at least one.
+static uint64_t perfMicros (uint64_t ticks)
+{
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds (ticks, &ns);
+  return ns / 1000;
+}
+static UfsPerfSum perfTake (unsigned kind)
+{
+  UfsPerfSum &sum = gPerfSum[kind];
+  UfsPerfSum out;
+  out.count = __atomic_exchange_n (&sum.count, 0, __ATOMIC_RELAXED);
+  out.ticks = __atomic_exchange_n (&sum.ticks, 0, __ATOMIC_RELAXED);
+  out.bytes = __atomic_exchange_n (&sum.bytes, 0, __ATOMIC_RELAXED);
+  out.maxTicks = __atomic_exchange_n (&sum.maxTicks, 0, __ATOMIC_RELAXED);
+  return out;
+}
+static UfsPerfDepth perfDepthTake (UfsPerfDepth &depth, uint64_t now)
+{
+  IOSimpleLockLock (gPerfLock);
+  if (depth.last && now > depth.last) {
+    depth.area += (now - depth.last) * depth.now;
+    if (depth.now) depth.busy += now - depth.last;
+  }
+  depth.last = now;
+  UfsPerfDepth out = depth;
+  depth.area = depth.busy = 0;
+  depth.max = depth.now;
+  IOSimpleLockUnlock (gPerfLock);
+  return out;
+}
+static uint64_t perfAvg (const UfsPerfSum &sum) { return sum.count ? perfMicros (sum.ticks) / sum.count : 0; }
+static uint64_t perfPerMiB (const UfsPerfSum &sum) { return sum.bytes ? perfMicros (sum.ticks) * 1048576 / sum.bytes : 0; }
+static void perfLines (unsigned second, uint64_t windowTicks, bool print)
+{
+  if (!gPerf || !gPerfLock || !windowTicks) return;
+  const uint64_t now = mach_absolute_time ();
+  const UfsPerfSum req = perfTake (kUfsPerfRequest), queue = perfTake (kUfsPerfQueue), copy = perfTake (kUfsPerfCopy),
+                   bounce = perfTake (kUfsPerfBounceWait), take = perfTake (kUfsPerfTake), clean = perfTake (kUfsPerfClean),
+                   dev = perfTake (kUfsPerfDevice), inval = perfTake (kUfsPerfInval), slotCopy = perfTake (kUfsPerfSlotCopy),
+                   cmdSlot = perfTake (kUfsPerfCommand), cmdZc = perfTake (kUfsPerfCommandZc);
+  uint64_t size[kPerfSizeBuckets];
+  for (unsigned i = 0; i < kPerfSizeBuckets; ++i) size[i] = __atomic_exchange_n (&gPerfSize[i], 0, __ATOMIC_RELAXED);
+  const uint64_t unaligned = __atomic_exchange_n (&gPerfUnaligned, 0, __ATOMIC_RELAXED);
+  const UfsPerfDepth rq = perfDepthTake (gPerfRequests, now), cq = perfDepthTake (gPerfCommands, now);
+  const uint64_t rqx10 = rq.area * 10 / windowTicks, cqx10 = cq.area * 10 / windowTicks;
+  const uint64_t busyUs = perfMicros (cq.busy);
+  const uint64_t cmds = cmdSlot.count + cmdZc.count, cmdBytes = cmdSlot.bytes + cmdZc.bytes;
+  const uint64_t cmdAvg = cmds ? perfMicros (cmdSlot.ticks + cmdZc.ticks) / cmds : 0;
+  if (!print) return;
+  IOLog ("NativeUfs: perf %u s: req %llu (%llu KiB) avg %llu us max %llu us, queue %llu us, copy %llu us/MiB; qd %llu.%llu max %u busy "
+         "%llu%%; sizes %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu, unaligned %llu, bounce waits %llu\n",
+         second, req.count, req.bytes >> 10, perfAvg (req), perfMicros (req.maxTicks), perfAvg (queue), perfPerMiB (copy),
+         rqx10 / 10, rqx10 % 10, rq.max, rq.busy * 100 / windowTicks, size[0], size[1], size[2], size[3], size[4], size[5], size[6],
+         size[7], size[8], size[9], unaligned, bounce.count);
+  IOLog ("NativeUfs: perf %u s: cmd %llu zc + %llu slot (%llu KiB) avg %llu us; dev avg %llu us max %llu us, %llu MB/s busy; clean %llu "
+         "inval %llu slotcopy %llu us/MiB; take %llu us; qd %llu.%llu max %u busy %llu%%\n",
+         second, cmdZc.count, cmdSlot.count, cmdBytes >> 10, cmdAvg, perfAvg (dev), perfMicros (dev.maxTicks),
+         busyUs ? dev.bytes / busyUs : 0, perfPerMiB (clean), perfPerMiB (inval), perfPerMiB (slotCopy), perfAvg (take), cqx10 / 10,
+         cqx10 % 10, cq.max, cq.busy * 100 / windowTicks);
+}
+
+// native-ufs-perf=1, once after the bring-up (no command is in flight then): the link as the boot firmware left it (UniPro PA
+// attributes through DME_GET), the slots and the DMA reach.
+static void perfLinkLine (void)
+{
+  static const uint16_t kAttr[] = { 0x1568, 0x1560, 0x1561, 0x1583, 0x1580, 0x1581, 0x1571, 0x156a, 0x1569, 0x1584 };
+  uint32_t v[sizeof (kAttr) / sizeof (kAttr[0])];
+  for (unsigned i = 0; i < sizeof (kAttr) / sizeof (kAttr[0]); ++i)
+    if (!native_ufs_dme_get (kAttr[i], 0, &v[i])) v[i] = 0xffffffffU;
+  IOLog ("NativeUfs: perf link: tx gear %u lanes %u of %u, rx gear %u lanes %u of %u, pwrmode %02x (rx<<4|tx: 1 fast, 2 slow, 4 fastauto,"
+         " 5 slowauto), hs series %u (1 A, 2 B), termination tx %u rx %u; ahit %08x; slots %u, list mode %u, zero copy %d, dma limit %llx\n",
+         v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], read32 (gHost.hc, 0x18), native_ufs_slots, native_ufs_list_mode,
+         gZeroCopy ? 1 : 0, static_cast<unsigned long long> (gDmaLimit));
+}
+
 static void ioLogThread (void *argument, wait_result_t)
 {
   unsigned seconds = static_cast<unsigned> (reinterpret_cast<uintptr_t> (argument));
   uint64_t lastReads = native_ufs_block_reads, lastBytes = native_ufs_bytes_read, totalBytes = 0;
+  uint64_t lastTick = mach_absolute_time ();
   for (unsigned s = 1; s <= seconds; s++) {
     IOSleep (1000);
     uint64_t reads = native_ufs_block_reads, bytes = native_ufs_bytes_read;
     uint64_t dr = reads - lastReads, db = bytes - lastBytes;
     totalBytes += db;
     if (dr) IOLog ("NativeUfs: iolog %u s: %llu reads, %llu KiB (%llu MiB so far)\n", s, dr, db >> 10, totalBytes >> 20);
+    const uint64_t tick = mach_absolute_time ();
+    perfLines (s, tick - lastTick, dr != 0);   // a second without reads: its sums are taken and dropped
+    lastTick = tick;
     lastReads = reads;
     lastBytes = bytes;
   }
@@ -2851,8 +3185,33 @@ bool NativeUfs::start (IOService *provider)
     }
     bzero (gScratch, kDataMax);
   }
+  // UniXNU-piano: the read path switches (all off by default: the read path as before); see "Read path switches" above.
+  {
+    uint32_t fast = 0, perf = 0, workers = 0, bounceKiB = 0, maxioKiB = 0, nap = 0, napSpin = 30;
+    PE_parse_boot_argn ("native-ufs-fast", &fast, sizeof (fast));
+    fast = fast == 1;
+    if (fast) { workers = 8; bounceKiB = 1024; maxioKiB = 1024; nap = 25; }
+    PE_parse_boot_argn ("native-ufs-perf", &perf, sizeof (perf));
+    PE_parse_boot_argn ("native-ufs-async", &workers, sizeof (workers));
+    PE_parse_boot_argn ("native-ufs-bounce", &bounceKiB, sizeof (bounceKiB));
+    PE_parse_boot_argn ("native-ufs-maxio", &maxioKiB, sizeof (maxioKiB));
+    PE_parse_boot_argn ("native-ufs-nap", &nap, sizeof (nap));
+    PE_parse_boot_argn ("native-ufs-nap-spin", &napSpin, sizeof (napSpin));
+    gPerf = perf == 1;
+    if (gPerf && !(gPerfLock = IOSimpleLockAlloc ())) gPerf = false;
+    if (workers > 16) workers = 16;
+    gBounceBytes = bounceKiB > kDataMax / 1024 ? (bounceKiB >= kXferMax / 1024 ? kXferMax : (bounceKiB * 1024) & ~(kDataMax - 1)) : kDataMax;
+    gMaxIoBytes = maxioKiB >= 64 && maxioKiB <= 16384 ? maxioKiB * 1024 : 0;
+    gNapSpinUs = napSpin <= 1000 ? napSpin : 1000;
+    nanoseconds_to_absolutetime (uint64_t (gNapSpinUs) * 1000, &gNapSpinTicks);
+    gReadWorkers = readWorkersStart (workers);
+    gNapUs = gReadWorkers && nap >= 1 && nap <= 1000 ? nap : 0;
+    if (fast || gPerf || workers || gBounceBytes != kDataMax || gMaxIoBytes || gNapUs)
+      IOLog ("NativeUfs: read path: fast %u, async %u of %u workers, bounce %u KiB, maxio %u KiB, nap %u us after %u us, perf %u\n", fast,
+             gReadWorkers, workers, gBounceBytes >> 10, gMaxIoBytes >> 10, gNapUs, gNapSpinUs, gPerf ? 1 : 0);
+  }
   unsigned iolog = 0;
-  if (PE_parse_boot_argn ("native-ufs-iolog", &iolog, sizeof (iolog)) && iolog) {
+  if ((PE_parse_boot_argn ("native-ufs-iolog", &iolog, sizeof (iolog)) && iolog) || (gPerf && (iolog = 120))) {
     if (iolog > 600) iolog = 600;
     thread_t thread = nullptr;
     if (kernel_thread_start (ioLogThread, reinterpret_cast<void *> (static_cast<uintptr_t> (iolog)), &thread) == KERN_SUCCESS) {
@@ -2981,6 +3340,7 @@ bool NativeUfs::startRoot (IOService *provider)
     return false;
   }
   native_ufs_root_step = 2;
+  if (gPerf) perfLinkLine ();
   RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
   if (!layout || !findRootLayout (layout, &why)) {
     rootDiagnosticFailure (layout ? why : "root layout allocation failed");

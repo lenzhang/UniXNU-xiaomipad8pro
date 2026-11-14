@@ -65,6 +65,10 @@ static uint32_t hostCompletionCount (unsigned) { return 0; }
 static bool hostInterruptMode () { return false; }
 static void hostWaitCompletion (unsigned, uint32_t, uint64_t) { IODelay (2); }
 static uint64_t hostDmaAddress (const void *) { return 0; }   // no zero copy in the host model
+// native-ufs-perf's accounting off (the kext's default): the command path's spans and depth hooks do nothing.
+static uint64_t hostPerfNow () { return 0; }
+static void hostPerfSpan (unsigned, uint64_t, uint64_t) {}
+static void hostPerfDepth (int) {}
 #include "../RootQueue.h"
 #include "../RootCommands.h"
 // RootPower.h's port.

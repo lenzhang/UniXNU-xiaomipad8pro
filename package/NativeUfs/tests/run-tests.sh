@@ -10,7 +10,7 @@ B=$(mktemp -d); trap 'rm -rf "$B"' EXIT
 FLAGS=(-std=c++17 -UNDEBUG -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function -Wno-unused-variable
        -DNATIVE_UFS_SM8750=1 -DNATIVE_UFS_UNVERIFIED_ROOT=1)
 fail=0
-for t in RootCommands RootPower; do
+for t in RootCommands RootPower RootWindowRead; do
   for mode in plain san; do
     extra=(-O2); [ $mode = san ] && extra=(-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all)
     if ! clang++ "${FLAGS[@]}" "${extra[@]}" -o "$B/$t-$mode" "$T/$t.cpp" 2> "$B/$t-$mode.log"; then

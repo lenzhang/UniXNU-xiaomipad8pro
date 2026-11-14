@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Shared production command path. Included inside the root transport namespace.
 // The host harness replaces only MMIO, DMA synchronization, clock and lock primitives.
+// UniXNU-piano: timing of the command path for native-ufs-perf=1 (the port's hostPerfNow/hostPerfSpan/hostPerfDepth; hostPerfNow is 0
+// and the others return at once while it is off, so nothing here changes what a command does). Kinds of span:
+enum : unsigned {
+  kUfsPerfTake,        // waiting for a command slot
+  kUfsPerfClean,       // the data buffer's clean and invalidate before the doorbell
+  kUfsPerfDevice,      // doorbell to the completion seen (the device's time plus the poll's granularity)
+  kUfsPerfInval,       // the data buffer's invalidate after the completion
+  kUfsPerfSlotCopy,    // memcpy out of the slot's data area (a read that did not qualify for zero copy)
+  kUfsPerfCommand,     // one hostRead4k command through the slot's data area, retries included
+  kUfsPerfCommandZc,   // one hostRead4k command straight into the caller's buffer (zero copy)
+  kUfsPerfCommandKinds
+};
 // One command slot (RootTransportLayout.h): its request list entry, command descriptor and data area.
 struct UfsSlot {
   unsigned index;
@@ -144,11 +156,16 @@ static IOReturn hostIssue (const UfsSlot &slot, uint32_t direction, uint32_t dat
   }
   if (!gListUncached) cacheCivac (slot.utrd, 32);
   cacheCivac (slot.ucd, kPrdtOffset + 16 * (entries ? entries : 1U));
-  if (dataBytes) cacheCivac (prds ? buffer : slot.data, dataBytes);
+  if (dataBytes) {
+    const uint64_t cleanStart = hostPerfNow ();
+    cacheCivac (prds ? buffer : slot.data, dataBytes);
+    hostPerfSpan (kUfsPerfClean, cleanStart, dataBytes);
+  }
   if (!hostInterruptMode ()) hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence. With interrupts the handler does.
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, deadline);
   __atomic_or_fetch (&gOutstanding, slot.bit, __ATOMIC_RELEASE);
   hostWrite (0x58, slot.bit);
+  hostPerfDepth (1);
   return kIOReturnSuccess;
 }
 
@@ -156,7 +173,10 @@ static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t dea
 {
   HardwareTransferPort port = { slot, deadline, 0 };
   UfsTransferPoll state;
+  const uint64_t deviceStart = hostPerfNow ();
   UfsTransferEnd end = pollUfsTransfer (port, state);
+  hostPerfDepth (-1);
+  hostPerfSpan (kUfsPerfDevice, deviceStart, dataBytes);
   if (end == UfsTransferEnd::Completed) __atomic_and_fetch (&gOutstanding, ~slot.bit, __ATOMIC_RELEASE);
   gRootDiagnostic.polls = state.polls;
   gRootDiagnostic.dbSeen = state.doorbellSeen;
@@ -170,7 +190,11 @@ static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t dea
     return recordTransport (end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
   }
   cacheInvalidate (slot.ucd, kPrdtOffset);
-  if (dataBytes) cacheInvalidate (buffer ? buffer : slot.data, dataBytes);
+  if (dataBytes) {
+    const uint64_t invalidateStart = hostPerfNow ();
+    cacheInvalidate (buffer ? buffer : slot.data, dataBytes);
+    hostPerfSpan (kUfsPerfInval, invalidateStart, dataBytes);
+  }
   gRootDiagnostic.response = loadBe32 (slot.ucd + kRspOffset);
   return recordTransport (*ocs == 0 ? kIOReturnSuccess : kIOReturnIOError, *ocs);
 }
@@ -485,7 +509,10 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
     return kIOReturnSuccess;
   }
   bool pooled;
+  const uint64_t takeStart = hostPerfNow ();
   const UfsSlot slot = hostSlotTake (&pooled);
+  hostPerfSpan (kUfsPerfTake, takeStart, 0);
+  const uint64_t commandStart = hostPerfNow ();
   gRootDiagnostic.lba = lba;
   uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
@@ -496,9 +523,12 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
     if (!hostRetryable (status, scsi, attempt)) break;
   }
   if (status == kIOReturnSuccess && !prds) {
+    const uint64_t copyStart = hostPerfNow ();
     memcpy (dst, slot.data, blocks * 4096U);
+    hostPerfSpan (kUfsPerfSlotCopy, copyStart, blocks * 4096U);
   }
   hostSlotGive (slot, pooled);
+  hostPerfSpan (prds ? kUfsPerfCommandZc : kUfsPerfCommand, commandStart, blocks * 4096U);
   return status;
 }
 
