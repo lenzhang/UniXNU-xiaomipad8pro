@@ -1065,6 +1065,41 @@ S); level K begins`.
 | 10e-ctl | `piano-wifi=7 piano-wifi-iova=1` | 10b's path as 10d-ctl's row; plus `stack: ... the least so far M (at stage S); level 6 begins` and `level 7 begins` with M well above 6000. **Gate: the association answer with status 0** | A stack line with M under 4000: a frame the static check does not see (the kernel's paths) |
 | 10e | `piano-wifi=8 piano-wifi-iova=1 piano-wifi-l7hold=180000 piano-wifi-l8=22 piano-wifi-defer=3` | 10d's row (the eight blocks, `8 of 8 block(s) done`), the stack lines at each level's start and `level 8 ends` (M well above 6000), then 10c's checklist. **Gate: `EAPOL frame 1 from the access point: ... message 1 of the four-way handshake`** | As 10d's row |
 
+**10e-ctl and 10e ran on 2026-11-14 12:40-13:00 (report `private/host-checks/20261114-10e`).** 10e-ctl passed (20 networks,
+the association, the teardown; the least free stack 12136 bytes: the stack fix confirmed on the tablet). 10e: the eight
+blocks done (63 writes; block 0 read REO1_GEN_ENABLE `0x800a1f01` and the idle ring's misc `0x80`), the ring selection sent,
+the association (AID 20), the data path live, the station up 12 ms later with the transmit side's bank written — and **the
+firmware asserted 236 ms after the association** (`cmnos_assert_patched.c:604 ... line#2093`, crash dump read), with nothing
+in our rings (received 0 entries) and no EAPOL frame; the user-space supplicant connected and saw the association. The
+counter lines were cut by the console at about 250 bytes, so the release and exception counts never came out.
+
+**Analysis (inferred, from the code and Linux's order; not confirmed):** what 10e did and 10e-ctl did not is (1) the ring
+selection, which sends the station's data frames into host buffers, (2) the data path's rings and the reorder unit's set-up,
+(3) the transmit bank written at the station's up. The ring selection is right word for word (checked again against the
+descriptor's measured layout: 392 bytes, MSDU end 0, MPDU start 140, header 264; the filters and TLVs as this chip's host
+has them); the reorder queues match Linux's (128 + 3 x 128 bytes, the same fields, window 2, SSN 0, the WMI command's nine
+words); the rings and the reorder unit match too. **The one thing that differs from Linux on the receive side: 10c-10e ran
+with `piano-wifi-l8=22`, the receive buffers carrying the firmware's own manager** (my choice, to keep level 6 as on 10b),
+while this chip's host gives them software ring 1. Once data frames land in host buffers, any buffer the hardware releases (a
+broadcast frame it cannot decrypt before the keys, a reorder drop) goes back to the manager named in it — with `l8=22` the
+firmware's, which then holds a buffer it never gave out. That fits an assert shortly after the association, when the access
+point's first data frames come. The transmit bank is the other candidate (nothing was sent through it, but it was written 224
+ms before the assert). **Changed:** shorter counter lines; the rings' pointers logged at the association, every 50 ms for a
+second and every second to 10 s; with the rings at level 6's start they are polled during level 6 too (a buffer released
+during the scan goes back at once), and the release ring has 256 entries.
+
+**Boot 10f: one or two boots separate the candidates** (built 2026-11-14 13:20 from branch commit `7dba892` (main merged), collection `d0a7ec6b...` (0066 kernel, 26 native kexts), store seed `89860516...`, `data-persist=0`, `piano-reset-after=900 piano-reset-to=bootloader`, `piano-wifi-l8tracems=5`, each 237281280 bytes and `verify-ram-images.py` PASS: `out/ram-k273-wifi-10f-a` sha256 `668ac84496de1b0a3339385ad16273805bd58a5b12d1ff9c3b2b74fa7678ae14`, `-10f-b` `dfa0c17ad1c7c4e3d7c4aa078bf649bd514ccac94fd52b0b49c503d8700f72d1`, `-10f-c` `8e519073a614f5173670a8c56245501a7a2d35463475ecb68540145f96b52ae5`). All three: `piano-wifi=8 piano-wifi-iova=1
+piano-wifi-l7hold=180000 piano-wifi-defer=3` and the rings at level 6's start (`l8` bit `0x20`):
+
+| # | `piano-wifi-l8` | Buffers' manager / transmit side | Expected lines | Reading |
+|---|---|---|---|---|
+| 10f-a (first) | `39` = `0x27` | software ring 1 / off | level 6: `level 8: the data path's rings planned at level 6's start`, the eight blocks, `the receive rings: ... return to software ring 1`, round 2 with K ≥ 1 networks, `level 8 during level 6: received N entries, released N ...`; level 7 as 10e up to `the association is live`, `level 8 rings at the association`, the 50 ms pointer lines, `the station is up ...: the transmit side off`; **gate: `EAPOL frame 1 from the access point: ... message 1 of the four-way handshake`**, no `crash:` | passes: the manager was the cause (b's crash confirms it) or the transmit bank (b passes too) |
+| 10f-b (control) | `38` = `0x26` | the firmware's / off | as 10f-a with `the firmware's own manager` | crashes as 10e: the manager is the cause; passes with a: the transmit bank; both crash: the receive path itself (the pointer lines say which ring moved before the assert) |
+| 10f-c (next) | `55` = `0x37` | software ring 1 / on | as 10f-a with `the transmit side ready (bank 0x4a04 ...)` | after a passes: the transmit side's turn (then the handshake with the supplicant) |
+
+A scan without networks in 10f-a (and not in 10f-b) means software ring 1 is not for level 6; its `released N` line says
+whether the firmware hands the management frames' buffers back.
+
 ## 9. Fallback
 
 `piano-wifi=0` (the default): nothing runs. Network meanwhile: PianoNullEthernet's `en0` (no traffic) and, once built, the USB-C
