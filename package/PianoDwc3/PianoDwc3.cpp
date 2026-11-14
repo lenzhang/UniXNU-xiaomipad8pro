@@ -94,6 +94,9 @@ extern volatile uint32_t sm8750_gcc_vote_owner;
 extern volatile uint32_t sm8750_rpmh_drv2_owner;
 // sys/conf.h's KERNEL_PRIVATE declaration (bsd_stubs.c, exported by the kernel): /dev/pianousb's cdevsw marked kqueue-capable.
 int cdevsw_setkqueueok(int, const struct cdevsw *, int);
+// The kernel's sysctl by name (bsd/kern/kern_newsysctl.c), as PianoPolicy uses it: k27 0069's machdep.piano_restart_started, by name,
+// so this kext still links and runs with a kernel that lacks it.
+int kernel_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 }
 
 class PianoUsbHID;   // the HID input devices (piano-usb-hid=1), below
@@ -712,6 +715,12 @@ void execute(const char *line)
     const uint64_t ns = nowNs();
     cprintf("%llu.%03llu s\n", ns / 1000000000ull, ns / 1000000ull % 1000);
   } else if (word(s, "reset")) {
+    // k27 0069: the restart begins here, before any reason is written: the boot guard's health decision (machine_routines.c) then
+    // never writes the restart reason again, even if it falls in the restart (on 2026-11-14 one at 180 s set normal under a
+    // "reset fastboot" sent at 170 s). The kernel waits for a guard write already in flight. Older kernels: ENOENT, as before.
+    int one = 1;
+    const int marked = kernel_sysctlbyname("machdep.piano_restart_started", nullptr, nullptr, &one, sizeof one);
+    if (marked) cprintf("reset: no machdep.piano_restart_started (%d): the boot guard may still rewrite the restart reason\n", marked);
     if (word(s, "fastboot")) {
       const int err = setRestartReason(2);
       if (err) { cprintf("reset fastboot: SDAM write failed (%d); not restarting\n", err); return; }

@@ -1,0 +1,381 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: UniXNU-piano
+Date: Sat, 14 Nov 2026 22:30:00 +0800
+Subject: [PATCH] k27: piano-psci-halt: restart and power-off through PSCI; the
+ guard keeps a started restart's reason
+
+The platform expert (ArmDTPlatform, an IODTPlatformExpert) has no haltRestart and nothing sets
+PE_halt_restart (AppleARMPlatform's expert, which does, is not in the KC), so
+IOPlatformExpert::haltRestart answered -1 for every type. PianoDwc3's console reset
+(PEHaltRestart(kPERestartCPU) from its thread) returned -1 and the 30 s halt timer panicked
+("Halt/Restart Timed Out"); during that hang the boot guard's health decision at 180 s set the
+restart reason back to normal, so a "reset fastboot" sent near 170 s booted the installed system.
+
+- piano-psci-halt (default 1; 0: off, as before): at EARLY_BOOT, natively (the SMC conduit) and
+  only when PE_halt_restart is unset, it becomes a handler: kPERestartCPU is PSCI SYSTEM_RESET,
+  kPEHaltCPU PSCI SYSTEM_OFF, through the conduit piano_psci_reset uses; the PMIC restart reason
+  is not touched. Every other type answers -1 as before (the panic restart still ends in
+  halt_all_cpus' PSCI SYSTEM_RESET). machdep.piano_psci_halt switches it at run time.
+- The restart word (osfmk/arm64/piano_halt_policy.h, host-tested): PEHaltRestart's entry for the
+  halt/restart types and machdep.piano_restart_started=1 (PianoDwc3's reset, before it writes its
+  reason) mark a restart begun; from then on the guard's health decision does not write the
+  restart reason. A writer that marks waits for a guard write already in flight.
+---
+diff --git a/bsd/dev/arm64/sysctl.c b/bsd/dev/arm64/sysctl.c
+--- a/bsd/dev/arm64/sysctl.c
++++ b/bsd/dev/arm64/sysctl.c
+@@ -186,6 +186,50 @@
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_piano_boot_guard, "A",
+     "piano-boot-guard: armed/healthy, the restart reason, the watchdog and its pings");
++
++/* piano (k27 0069): a restart has begun (the boot guard no longer writes the restart reason); PE_halt_restart through PSCI */
++extern void piano_restart_begin(const char *who, int wait);
++extern int piano_restart_started(void);
++extern int piano_psci_halt_get(void);
++extern int piano_psci_halt_set(int on);
++
++static int
++sysctl_piano_restart_started SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	int new_value = 0, changed = 0;
++	int error = sysctl_io_number(req, piano_restart_started(), sizeof(int), &new_value, &changed);
++	if (error == 0 && changed) {
++		if (new_value != 1) {
++			return EINVAL;
++		}
++		piano_restart_begin("machdep.piano_restart_started", 1);
++	}
++	return error;
++}
++
++SYSCTL_PROC(_machdep, OID_AUTO, piano_restart_started,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_piano_restart_started, "I",
++    "piano: 1 once a restart or power-off has begun (write 1 before a restart reason of your own): the boot guard leaves it alone");
++
++static int
++sysctl_piano_psci_halt SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	int new_value = 0, changed = 0;
++	int error = sysctl_io_number(req, piano_psci_halt_get(), sizeof(int), &new_value, &changed);
++	if (error == 0 && changed) {
++		int err = piano_psci_halt_set(new_value);
++		error = err == 0 ? 0 : err == -1 ? EINVAL : err == -2 ? ENOTSUP : EBUSY;
++	}
++	return error;
++}
++
++SYSCTL_PROC(_machdep, OID_AUTO, piano_psci_halt,
++    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_piano_psci_halt, "I",
++    "piano-psci-halt: 1 a restart is PSCI SYSTEM_RESET, a power-off PSCI SYSTEM_OFF (PE_halt_restart); 0 off");
+ #endif /* defined(XNU_VM_GUEST) */
+ 
+ #if defined(HAS_IPI)
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -879,6 +879,11 @@
+ 	return ns / 1000000;
+ }
+ 
++#if defined(__arm64__) && defined(XNU_VM_GUEST)
++/* k27 0069 (osfmk/arm64/machine_routines.c): once a restart or power-off has begun the boot guard never writes the restart reason */
++extern "C" void piano_restart_begin(const char *who, int wait);
++#endif
++
+ /* IOShutdownNotificationsTimedOut
+  * - Called from a timer installed by PEHaltRestart
+  */
+@@ -1025,6 +1030,10 @@
+ 	static boolean_t  panic_begin_called = FALSE;
+ 
+ 	if (type == kPEHaltCPU || type == kPERestartCPU || type == kPEUPSDelayHaltCPU) {
++#if defined(__arm64__) && defined(XNU_VM_GUEST)
++		/* k27 0069: an explicit restart or power-off begins here, before the 30 s timer: the boot guard leaves the reason alone */
++		piano_restart_begin("PEHaltRestart", 0);
++#endif
+ 		/* If we're in the panic path, the locks and memory allocations required below
+ 		 *  could fail. So just try to reboot instead of risking a nested panic.
+ 		 */
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -974,6 +974,7 @@
+ #include <kern/processor.h>
+ #include <arm64/piano_pm.h>
+ #include "piano_guard_policy.h"
++#include "piano_halt_policy.h"
+ #define GH_WDT_CONTROL  0x86000005ULL
+ #define GH_WDT_STATUS   0x86000006ULL
+ #define GH_WDT_PING     0x86000007ULL
+@@ -1227,8 +1228,134 @@
+ 	uint64_t ns;
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+ 	return ns;
++}
++
++/*
++ * k27 0069: an explicit restart or power-off has begun: PEHaltRestart(kPERestartCPU / kPEHaltCPU) (IOPlatformExpert.cpp marks it at
++ * its entry, before its 30 s timer) or PianoDwc3's console reset (machdep.piano_restart_started=1, before it writes its own restart
++ * reason). From then on the boot guard never writes the restart reason again: on 2026-11-14 a "reset fastboot" at 170 s of an
++ * installed boot set bootloader, the restart hung for its 30 s, the guard's health decision at 180 s set normal during the hang and
++ * the panic restart booted the installed system instead of ABL fastboot. The word and its order are piano_halt_policy.h's
++ * (host-tested, tooling/k27/test-piano-halt.sh); STARTED is never cleared in a boot.
++ */
++static uint32_t piano_restart_word;
++static uint64_t piano_restart_ns;
++static const char *piano_restart_who = "";
++
++void
++piano_restart_begin(const char *who, int wait)
++{
++	const uint32_t old = piano_restart_mark(&piano_restart_word);
++	if ((old & PIANO_RESTART_STARTED) == 0) {
++		piano_restart_ns = piano_guard_uptime_ns();
++		piano_restart_who = who;
++		if (piano_guard_state == PIANO_GUARD_ARMED) {
++			printf("piano-boot-guard: a restart began at %llu ms (%s): the health decision will leave the restart reason alone\n",
++			    piano_restart_ns / NSEC_PER_MSEC, who);
++		}
++	}
++	/* WAIT: the caller writes a restart reason of its own next, after a guard write already in flight (200 ms at most) */
++	for (int i = 0; wait && i < 2000 && piano_restart_guard_busy(&piano_restart_word); i++) {
++		delay(100);
++	}
++}
++
++int
++piano_restart_started(void)
++{
++	return piano_restart_is_started(&piano_restart_word) ? 1 : 0;
++}
++
++/*
++ * k27 0069: piano-psci-halt (default 1; 0: off, the course before). ArmDTPlatform, the platform expert here, has no haltRestart of
++ * its own and nothing sets PE_halt_restart (AppleARMPlatform's expert, which does, is not in the KC), so IOPlatformExpert::haltRestart
++ * answered -1 for every type: PianoDwc3's console reset (PEHaltRestart(kPERestartCPU) from its thread) returned and the 30 s halt
++ * timer panicked ("Halt/Restart Timed Out"): 30 s and a panic report per reset; shutdown -r / -h reached halt_all_cpus' own PSCI call
++ * only once PEHaltRestart had returned. With it PE_halt_restart is set at EARLY_BOOT, natively (the SMC conduit) and only when
++ * nothing set it: kPERestartCPU is PSCI SYSTEM_RESET, kPEHaltCPU PSCI SYSTEM_OFF, through the conduit of piano_psci_reset (the
++ * resets of piano-reset-after and of the guard). The PMIC restart reason is not touched: the one in place (the guard's,
++ * piano-reset-to's, PianoDwc3's) decides where ABL goes. Every other type answers -1 as before (piano_halt_policy.h): the panic
++ * restart still ends in halt_all_cpus' PSCI SYSTEM_RESET. machdep.piano_psci_halt switches it at run time (0 off, 1 on).
++ */
++TUNABLE(uint32_t, piano_psci_halt_arg, "piano-psci-halt", 1);
++static uint32_t piano_psci_halt_on;
++
++static int32_t
++piano_psci_call(uint32_t fn)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	if (ml_psci_conduit == ML_PSCI_CONDUIT_SMC) {
++		__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	} else {
++		__asm__ volatile ("hvc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	}
++	return (int32_t)x0;
++}
++
++static int
++piano_pe_halt_restart(unsigned int type)
++{
++	const uint32_t fn = piano_halt_psci_function(type, os_atomic_load(&piano_psci_halt_on, relaxed) != 0);
++	if (fn == 0) {
++		return -1;
++	}
++	const char *name = fn == PIANO_PSCI_SYSTEM_RESET ? "SYSTEM_RESET" : "SYSTEM_OFF";
++	piano_restart_begin("PE_halt_restart", 0);
++	printf("piano-psci-halt: PE_halt_restart(%u) at %llu ms: PSCI %s (0x%x) through %s, the restart reason as it is\n", type,
++	    piano_guard_uptime_ns() / NSEC_PER_MSEC, name, fn, ml_psci_conduit == ML_PSCI_CONDUIT_SMC ? "smc" : "hvc");
++	__builtin_arm_dsb(0xf);
++	const int32_t ret = piano_psci_call(fn);
++	printf("piano-psci-halt: PSCI %s returned %d\n", name, ret);
++	return ret != 0 ? ret : -1;
+ }
+ 
++static void
++piano_psci_halt_init(void)
++{
++	if (ml_psci_conduit != ML_PSCI_CONDUIT_SMC) {
++		return;   /* a VM: halt_all_cpus' hvc ends it, as before */
++	}
++	if (piano_psci_halt_arg == 0) {
++		printf("piano-psci-halt=0: off: PE_halt_restart stays unset, a restart takes the 30 s halt timeout as before\n");
++		return;
++	}
++	if (PE_halt_restart != NULL) {
++		printf("piano-psci-halt: PE_halt_restart is set already: left alone\n");
++		return;
++	}
++	os_atomic_store(&piano_psci_halt_on, 1u, relaxed);
++	PE_halt_restart = piano_pe_halt_restart;
++	printf("piano-psci-halt: on: a restart is PSCI SYSTEM_RESET, a power-off PSCI SYSTEM_OFF, through smc (piano-psci-halt=0: off)\n");
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, piano_psci_halt_init);
++
++int
++piano_psci_halt_get(void)
++{
++	return PE_halt_restart == piano_pe_halt_restart && os_atomic_load(&piano_psci_halt_on, relaxed) != 0 ? 1 : 0;
++}
++
++/* machdep.piano_psci_halt=ON: 0 done, -1 not 0/1, -2 not native, -3 PE_halt_restart is someone else's */
++int
++piano_psci_halt_set(int on)
++{
++	if (on != 0 && on != 1) {
++		return -1;
++	}
++	if (ml_psci_conduit != ML_PSCI_CONDUIT_SMC) {
++		return -2;
++	}
++	if (PE_halt_restart != NULL && PE_halt_restart != piano_pe_halt_restart) {
++		return -3;
++	}
++	os_atomic_store(&piano_psci_halt_on, on ? 1u : 0u, relaxed);
++	if (on && PE_halt_restart == NULL) {
++		PE_halt_restart = piano_pe_halt_restart;
++	}
++	printf("piano-psci-halt: machdep.piano_psci_halt=%d: %s\n", on, on ? "on" : "off, a restart takes the 30 s halt timeout as before");
++	return 0;
++}
++
+ /* kern_exec, every image activation: the milestone is the first exec whose p_comm is its name. */
+ void
+ piano_boot_guard_exec(const char *comm)
+@@ -1299,8 +1426,13 @@
+ 	piano_guard_state = PIANO_GUARD_HEALTHY;
+ 	if (piano_guard_keep_reason) {
+ 		printf("piano-boot-guard: healthy after %u s, restart reason stays bootloader (piano-reset-to)\n", piano_guard_secs);
++	} else if (!piano_restart_guard_enter(&piano_restart_word)) {
++		/* k27 0069: a restart has begun; its reason (bootloader for "reset fastboot") must survive until the reset */
++		printf("piano-boot-guard: healthy after %u s, but a restart began at %llu ms (%s): the restart reason is left as it is\n",
++		    piano_guard_secs, piano_restart_ns / NSEC_PER_MSEC, piano_restart_who);
+ 	} else {
+ 		int err = piano_set_restart_reason(0, "piano-boot-guard");
++		piano_restart_guard_leave(&piano_restart_word);
+ 		piano_guard_reason_err = err;
+ 		if (err == 0) {
+ 			piano_guard_reason = 0;
+diff --git a/osfmk/arm64/piano_halt_policy.h b/osfmk/arm64/piano_halt_policy.h
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm64/piano_halt_policy.h
+@@ -0,0 +1,90 @@
++/*
++ * piano (k27 0069): the restart/power-off decisions that touch no hardware (osfmk/arm64/machine_routines.c), as plain inline C so
++ * that they are host-tested (UniXNU-piano tooling/k27/piano-halt: this file byte for byte, and test_piano_halt_policy.c).
++ * No kernel headers: the compiler's __atomic builtins, which the kernel's os_atomic is made of as well.
++ */
++#ifndef PIANO_HALT_POLICY_H
++#define PIANO_HALT_POLICY_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* PEHaltRestart's types (IOKit/IOPlatformExpert.h's enum, in its order) that PE_halt_restart sees. IOPlatformExpert::haltRestart
++ * answers kPEPanicSync and kPEHangCPU itself and turns kPEUPSDelayHaltCPU into kPEHaltCPU before it calls PE_halt_restart. */
++#define PIANO_PE_HALT_CPU               0u
++#define PIANO_PE_RESTART_CPU            1u
++#define PIANO_PE_UPS_DELAY_HALT_CPU     3u
++
++#define PIANO_PSCI_SYSTEM_OFF           0x84000008u
++#define PIANO_PSCI_SYSTEM_RESET         0x84000009u
++
++/* piano-psci-halt's PE_halt_restart(TYPE) with the switch ON: the PSCI function to call, 0 for none (then it answers -1, what no
++ * PE_halt_restart answered: the panic path's types, kPEPagingOff and the rest keep today's course, the panic restart still ends in
++ * halt_all_cpus' own PSCI SYSTEM_RESET). */
++static inline uint32_t
++piano_halt_psci_function(unsigned int type, bool on)
++{
++	if (!on) {
++		return 0;
++	}
++	if (type == PIANO_PE_RESTART_CPU) {
++		return PIANO_PSCI_SYSTEM_RESET;
++	}
++	if (type == PIANO_PE_HALT_CPU || type == PIANO_PE_UPS_DELAY_HALT_CPU) {
++		return PIANO_PSCI_SYSTEM_OFF;
++	}
++	return 0;
++}
++
++/* PEHaltRestart's types that begin an explicit restart or power-off (the ones its 30 s timer covers). */
++static inline bool
++piano_halt_type_begins(unsigned int type)
++{
++	return type == PIANO_PE_HALT_CPU || type == PIANO_PE_RESTART_CPU || type == PIANO_PE_UPS_DELAY_HALT_CPU;
++}
++
++/*
++ * The restart word: STARTED once an explicit restart or power-off has begun (PEHaltRestart, PianoDwc3's console reset through
++ * machdep.piano_restart_started), never cleared in a boot; WRITING while the boot guard writes the restart reason. The guard writes
++ * only from 0 (piano_restart_guard_enter), so after STARTED it never writes again; a restarter that writes a reason of its own marks
++ * first and waits while WRITING is set (piano_restart_guard_busy), so its write comes after any guard write already in flight and
++ * no guard write comes after it.
++ */
++#define PIANO_RESTART_STARTED           0x1u
++#define PIANO_RESTART_WRITING           0x2u
++
++/* The guard, about to write the restart reason: true (WRITING now set) when no restart has begun, false: leave the reason alone. */
++static inline bool
++piano_restart_guard_enter(uint32_t *word)
++{
++	uint32_t expected = 0;
++	return __atomic_compare_exchange_n(word, &expected, PIANO_RESTART_WRITING, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++}
++
++/* The guard's write is done. */
++static inline void
++piano_restart_guard_leave(uint32_t *word)
++{
++	(void)__atomic_fetch_and(word, ~PIANO_RESTART_WRITING, __ATOMIC_RELEASE);
++}
++
++/* A restart or power-off begins: the word before (STARTED in it: not the first; WRITING: the guard's write is in flight). */
++static inline uint32_t
++piano_restart_mark(uint32_t *word)
++{
++	return __atomic_fetch_or(word, PIANO_RESTART_STARTED, __ATOMIC_ACQ_REL);
++}
++
++static inline bool
++piano_restart_guard_busy(const uint32_t *word)
++{
++	return (__atomic_load_n(word, __ATOMIC_ACQUIRE) & PIANO_RESTART_WRITING) != 0;
++}
++
++static inline bool
++piano_restart_is_started(const uint32_t *word)
++{
++	return (__atomic_load_n(word, __ATOMIC_ACQUIRE) & PIANO_RESTART_STARTED) != 0;
++}
++
++#endif /* PIANO_HALT_POLICY_H */
+diff --git a/osfmk/arm64/piano_pm.h b/osfmk/arm64/piano_pm.h
+--- a/osfmk/arm64/piano_pm.h
++++ b/osfmk/arm64/piano_pm.h
+@@ -73,6 +73,16 @@
+ /* k27 0063: piano-boot-guard. kern_exec's hook for its milestone (every exec's p_comm); machdep.piano_boot_guard (string). */
+ void piano_boot_guard_exec(const char *comm);
+ size_t piano_boot_guard_format(char *buf, size_t len);
++/*
++ * k27 0069: an explicit restart or power-off has begun (WHO for the log; WAIT: the caller writes a restart reason of its own next):
++ * the boot guard never writes the restart reason again. PEHaltRestart's entry (IOPlatformExpert.cpp) and
++ * machdep.piano_restart_started=1 (PianoDwc3's console reset) call it; piano_restart_started() answers whether one has.
++ */
++void piano_restart_begin(const char *who, int wait);
++int piano_restart_started(void);
++/* k27 0069: piano-psci-halt, PE_halt_restart through PSCI; machdep.piano_psci_halt (get 0/1; set 0 done, -1/-2/-3 refused). */
++int piano_psci_halt_get(void);
++int piano_psci_halt_set(int on);
+ __END_DECLS
+ 
+ #define PIANO_WAKE_NONE         0
+-- 
+2.39.0
+
