@@ -40,9 +40,11 @@ SERIES=
 for p in "$D"/patches/k273/*.patch; do
   [ -e "$p" ] || continue
   n=$(basename "$p" .patch)
-  if git -C "$T/out/k27/xnu" log --format=%s | grep -qxF "k273 $n"; then echo "$n: applied already"
+  # (grep without -q reads the whole log: -q's early exit gave git log a SIGPIPE, which pipefail took for "not committed")
+  if git -C "$T/out/k27/xnu" log --format=%s | grep -xF "k273 $n" > /dev/null; then echo "$n: applied already"
   elif git -C "$T/out/k27/xnu" apply --reverse --check "$p" 2> /dev/null; then echo "$n: in the source already (not committed)"
-  else git -C "$T/out/k27/xnu" apply "$p" && git -C "$T/out/k27/xnu" add -A && git -C "$T/out/k27/xnu" commit -q -m "k273 $n" && echo "applied $n"; fi
+  else git -C "$T/out/k27/xnu" apply "$p" || { echo "$n does not apply to $T/out/k27/xnu" >&2; exit 1; }
+    git -C "$T/out/k27/xnu" add -A && git -C "$T/out/k27/xnu" commit -q -m "k273 $n" && echo "applied $n"; fi
   SERIES=-s${n%%-*}
 done
 # patches/k27 newer than the configured k27 tree carries (K27_TREE_TOP, default 0066: its series ends there), each committed in the
@@ -54,9 +56,10 @@ for p in "$D"/patches/k27/0*.patch; do
   [ -e "$p" ] || continue
   n=$(basename "$p" .patch); num=${n%%-*}
   [ "$((10#$num))" -gt "$((10#${K27_TREE_TOP:-0066}))" ] || continue
-  if git -C "$T/out/k27/xnu" log --format=%s | grep -qxF "k27 $n"; then echo "$num: applied already"
+  if git -C "$T/out/k27/xnu" log --format=%s | grep -xF "k27 $n" > /dev/null; then echo "$num: applied already"
   elif git -C "$T/out/k27/xnu" apply --reverse --check "$p" 2> /dev/null; then echo "$num: in the source already (not committed)"
-  else git -C "$T/out/k27/xnu" apply "$p" && git -C "$T/out/k27/xnu" add -A && git -C "$T/out/k27/xnu" commit -q -m "k27 $n" && echo "applied $num"; fi
+  else git -C "$T/out/k27/xnu" apply "$p" || { echo "$n does not apply to $T/out/k27/xnu: no kernel without it" >&2; exit 1; }
+    git -C "$T/out/k27/xnu" add -A && git -C "$T/out/k27/xnu" commit -q -m "k27 $n" && echo "applied $num"; fi
   KTAG=$num
 done
 cd "$T"
