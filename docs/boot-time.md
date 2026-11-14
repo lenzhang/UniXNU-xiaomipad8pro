@@ -277,3 +277,54 @@ installed ESP keeps its arguments until it is rebuilt (`build-esp.py --profile d
   (PianoPower/PianoA830, not changed here).
 - launchd's boot tasks: fips (cc_fips_test) and dirhelper take about 6 s each in text mode. They are part of the OS image.
 - CPU frequency: XNU has no CPU DVFS natively, so the cores run at whatever the firmware left. Not measured.
+
+## 9. The 27.3 dyld stretch: the native 4K code-signing pre-hash of the compressed shared cache (2026-11-14)
+
+**Measured (bt1 18:20, ufs1 19:36, RAM boots of the installed line).** Between launchd's exec and `dyld cache mapped
+system-wide` the root windows hand up ~2.4 GB, mostly 512 KiB reads (the cluster layer's SSD read-ahead size). With the old read
+path (bt1) that took until iolog second 39; with `native-ufs-async=8 -bounce=1024 -maxio=1024 -nap=25` (ufs1) until second 36:
+the device then delivers 1.5-1.9 GB/s while busy but is busy only 4-6 % of each second (`qd 0.1`). The disk is not the limit;
+launchd is (confirmed on the tablet). The 2026-11-12 `pc-sample=30` boot (27.0.1 line) had launchd at 1955 kernel and 0 user
+samples in that stretch, its hottest kernel pcs in corecrypto's SHA-256 block function (ARMv8 `sha256h`/`sha256h2`, located with
+`tooling/native/pc-sample-symbolize.py`).
+
+**What the kernel does (our source, xnu-12377 + k27, `XNU_NATIVE_CS_HASH_CACHE=1` in the k27 tree's `build-k27-piano.sh`):**
+- The native kernel runs 4 KiB pages (`el1-native-plan.md`); Apple's arm64e signatures hash 16 KiB pages. `ubc_cs_blob_add`
+  (`bsd/kern/ubc_subr.c:4753`) calls `cs_native4k_prepare` (`:4988`) before publishing a signature: `:5876-5970` read the whole
+  signed range with `vn_rdwr` 16 KiB at a time (`:5913-5927`), SHA-256 each 16 KiB block against the signature, then SHA-256 each of
+  its four 4 KiB pages again (`:5948`) into a table that the fault path's `cs_validate_hash` (`:6036-6062`) uses, one 4 KiB hash per
+  page-in. Counters: `cs_native4k_full_blocks`, `_ready_blobs`, `_page_checks` (`:5864-5866`).
+- dyld adds each shared-cache file's signature with `fcntl(F_ADDFILESIGS*)` (`bsd/kern/kern_descrip.c:4066-4069` -> `ubc_cs_blob_add` at `:4198`) before it maps them,
+  so the whole cache is read and hashed twice in launchd's thread, one file after the other, before `dyld cache mapped`.
+- The mapping and the slide are lazy: `vm_shared_region_auth_remap` (`osfmk/vm/vm_shared_region.c:1259`) maps a pager over the
+  auth sections and pages are slid on fault (`vm_shared_region_pager.c`); `shared_region_map_and_slide_2_np`'s own checks
+  (`bsd/vm/vm_unix.c:1634-1700`) read only the signature blob and the trust cache.
+- **The cache is compressed.** All 87 `dyld_shared_cache_arm64e*` files of the 27.3 SystemOS are `UF_COMPRESSED`, decmpfs type
+  14 (LZBITMAP, data in the resource fork): 6,919 MiB of file content in 2,444 MiB of resource forks
+  (`tooling/k273/apfs-file-flags.py systemos.img dyld_shared_cache`; Apple's own SystemOS cryptex `141-22145-021.dmg` is the same,
+  so this is how 27.3 ships, not our `make-systemos.sh`). Each `vn_rdwr` of a compressed file goes through
+  `decmpfs_read_compressed` (`bsd/kern/decmpfs.c:1649`, the compressed data lock taken shared, `:1677`), which decompresses in the
+  caller. So the stretch is: 2.4 GB read (the 512 KiB reads), 6.9 GB LZBITMAP-decompressed, 13.8 GB SHA-256 (two passes), in
+  ~440,000 `vn_rdwr` calls of 16 KiB, on one CPU. At ~37 s that is ~187 MiB/s of file content, ~84 us per call.
+- On a 16 KiB-page Mac none of this runs at map time: each page is validated (and decompressed) when it is first touched.
+
+**Where exactly the ~84 us per 16 KiB goes** (decompression, the two hash passes, the per-call VFS/decmpfs overhead, waits) is the
+one open number. Probe **ufs3** (`private/host-checks/20261114-ufs1/CHECKLIST-ufs3.txt`): ufs1's switches plus
+`pc-sample=2 pc-sample-hz=500 sample-name=launchd sample-period=2` (the k27 profilers, `osfmk/kern/exception.c:273-771`: the CPU
+split per task, the hottest kernel pcs, launchd's threads and their kernel stacks every 2 s) and NativeUfs's third perf line, the
+`cs native4k` counters per second (16 KiB blocks pre-hashed and their MiB: compare with the iolog's MiB, x2.8 for the compression).
+`tooling/native/pc-sample-symbolize.py LOG --kc out/k273-ufs3/kernel.macho --kernel <the 0066 kernel>
+--natives out/k273-ufs3/kernel.macho.natives.json` names the pcs (kernel symbols, kext + offset, `[sha256 insns]`).
+
+**Fixes, in order (each needs a k27 patch; none built yet):**
+1. `cs_native4k_prepare` in parallel and in large reads: split the signed range over N kernel threads (6 of 8 CPUs), each reading
+   1 MiB per `vn_rdwr` (decmpfs serves concurrent readers of one file: shared lock), verifying its 16 KiB blocks and filling its
+   part of the 4 KiB table; publish only after every block passed, as now. Same security; inferred ~37 s -> ~7-10 s (the disk
+   has 15x headroom).
+2. Validate lazily as a 16 KiB kernel does: at a fault, hash the 16 KiB block from its four resident 4 KiB pages (page-in clusters
+   are 16 KiB aligned), no vnode I/O under the object lock; the eager pass only for what is not resident. Saves the whole stretch
+   and the same cost at every exec after launchd (every Apple binary's signature is pre-hashed at exec too). Larger change.
+3. Not an option without the owner: skipping the verification, or a cross-boot cache of derived hashes on the writable Data volume.
+
+`native-ufs-fast` alone gave ~3 s (dyld mapped at iolog 36 vs 39, `Early boot complete` T 38.7 vs 41.8 s) and nothing after
+launchd (loginwindow at iolog 70 vs 73: the same ~31 s after `Early boot complete`; the windows busy 5-30 % of each second there).

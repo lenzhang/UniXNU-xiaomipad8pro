@@ -397,5 +397,15 @@ readable from the code: `native-ufs-perf=1` measures it.
 
 Host tests: `tests/RootWindowRead.cpp` (bounces of 4 KiB to 1 MiB hand up the same bytes and verified blocks as 128 KiB, one device
 read per bounce, partial progress on a failed read), `tests/RootDirect.cpp` (the direct PRDT's rules; the command's descriptor, no
-data maintenance in the command path, refusals before the controller, busy retries, quarantine). Tablet: not run yet (probes ufs0,
-ufs1, ufs2 in `private/host-checks/20261114-ufs1/`).
+data maintenance in the command path, refusals before the controller, busy retries, quarantine).
+
+**Tablet, 2026-11-14 (RAM boots of the installed line, `private/host-checks/20261114-ufs1/`).** ufs1 (perf, async 8, bounce 1024,
+maxio 1024, nap 25) and ufs2 (the same plus direct) reached SecurityAgent with no NativeUfs error. `perf link: tx gear 5 lanes 2 of
+2, rx gear 5 lanes 2 of 2, pwrmode 11, hs series 2`: HS-G5B x2 fast. The device delivers 1.5-1.9 GB/s while busy (1 MiB zero-copy
+commands, dev ~550-650 us each), slot waits 0, bounce waits 0; ufs2 served 26,687 reads straight into client pages. But the windows
+are busy only 4-6 % of each second of the dyld stretch (`qd 0.1`) and 5-30 % after launchd: the stretch is the requester's
+(`../boot-time.md` §9, the native 4K code-signing pre-hash of the compressed shared cache). Gain over bt1: ~3 s (dyld mapped at
+iolog 36 instead of 39, `Early boot complete` T 38.7 instead of 41.8 s), nothing after launchd. Also from the code: with
+`cpu_idle_latency` 0 (`osfmk/arm64/cpu.c:853`) `ml_delay_should_spin` is always false (`osfmk/arm64/machine_routines.c:3561`), so
+every `IODelay(2)` of the old completion poll is a timed sleep (`osfmk/kern/clock.c:1593-1610`): the 2026-11-12 profile counted
+211,821 such waits from launchd's reads in 30 s.
