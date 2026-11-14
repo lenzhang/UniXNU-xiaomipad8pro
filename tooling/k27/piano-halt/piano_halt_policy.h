@@ -19,8 +19,8 @@
 #define PIANO_PSCI_SYSTEM_RESET         0x84000009u
 
 /* piano-psci-halt's PE_halt_restart(TYPE) with the switch ON: the PSCI function to call, 0 for none (then it answers -1, what no
- * PE_halt_restart answered: the panic path's types, kPEPagingOff and the rest keep today's course, the panic restart still ends in
- * halt_all_cpus' own PSCI SYSTEM_RESET). */
+ * PE_halt_restart answered: kPEPanicRestartCPU, kPEPagingOff and the rest keep their course; a panic restart then calls
+ * halt_all_cpus(TRUE), whose PEHaltRestart(kPERestartCPU) gets SYSTEM_RESET here, the call halt_all_cpus would make next). */
 static inline uint32_t
 piano_halt_psci_function(unsigned int type, bool on)
 {

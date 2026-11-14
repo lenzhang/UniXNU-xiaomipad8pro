@@ -58,6 +58,12 @@ it every 5 s whoever holds it, since every thread call, the guard's included, is
 4. Deferral: with `piano-reset-after=N` (N > 0) the guard stays off, since that run owns the watchdog and the restart reason as
    before. With `piano-reset-to=bootloader` alone the guard runs but leaves the reason at bootloader when healthy, so the
    argument's promise (every reset into ABL) holds.
+5. A restart that has begun keeps its reason (k27 0069, `halt.md`): once `PEHaltRestart` was entered for a restart or
+   power-off, or PianoDwc3's `reset` wrote `machdep.piano_restart_started=1` (it does so before its own reason), the health
+   decision does not write the reason. Before 0069 a `reset fastboot` sent at 170 s set bootloader, the restart hung for its
+   30 s, the decision at 180 s set normal during the hang and the panic restart booted the installed system
+   (2026-11-14). With `piano-psci-halt` (0069, default on) the restart no longer hangs, so the window was the 0.25 s of the
+   shutdown notifications; the word closes it too (`tooling/k27/test-piano-halt.sh`).
 
 Why launchd and not a later process: the decision must never reset a sound boot into fastboot, which only the Mac can undo, and
 launchd's exec comes well before 180 s in every boot logged. The CPU check covers what the milestone does not: a bring-up hang
@@ -73,7 +79,7 @@ What each event lands in:
 | Panic (restarts: no `panic-spin`) | → ABL fastboot | → the installed system |
 | No milestone by SECS | PSCI reset → ABL fastboot | — |
 | A restart from macOS, or the USB console's `reset` | → ABL fastboot (`fastboot reboot` goes on to macOS) | → the installed system |
-| The USB console's `reset fastboot` | → ABL fastboot | → ABL fastboot (PianoDwc3 writes 2 itself) |
+| The USB console's `reset fastboot` | → ABL fastboot (since 0069 also when it falls on the decision: the decision leaves the reason) | → ABL fastboot (PianoDwc3 writes 2 itself) |
 | A userland hang with the kernel well (ticks on time, every CPU takes interrupts, launchd ran) | not caught | not caught |
 
 ## 4. Boot arguments
@@ -109,6 +115,13 @@ piano-boot-guard: not healthy after 60 s (no exec of piano-nosuch yet): PSCI res
 piano-boot-guard: CPU 3 took no interrupt across 2 ticks (a nop IPI each): hung; no more pings, PSCI reset into ABL fastboot
 piano-boot-guard: test: no pings (piano-boot-guard-ping=0): the watchdog bites about 32 s from now, into ABL fastboot
 piano-boot-guard: test: every CPU stops now with interrupts masked (piano-boot-guard-test=hang-at=40): the watchdog resets into ABL fastboot within 32 s
+```
+
+A restart begun before the decision (k27 0069; the first line only while the guard is armed):
+
+```
+piano-boot-guard: a restart began at 171234 ms (machdep.piano_restart_started): the health decision will leave the restart reason alone
+piano-boot-guard: healthy after 180 s, but a restart began at 171234 ms (machdep.piano_restart_started): the restart reason is left as it is
 ```
 
 0062's wake window now ends with `piano-sleep: the wake went through: the Gunyah watchdog stays on (held by piano-reset-after or

@@ -1,8 +1,11 @@
 # Halt and restart: the 30 s "Halt/Restart Timed Out"
 
-Status (2026-11-14): every restart or shutdown of the tablet ends in `Halt/Restart Timed Out @IOPlatformExpert.cpp:884` after
-30 s, then the panic's own reboot (`MACH Reboot`). The cause is not known yet; k27 patch 0068 (`piano-halt-trace=1`) names it in
-one boot. Probe: `ram-k273-halt1` (`private/host-checks/20261114-halt/CHECKLIST-halt1.txt`).
+Status (2026-11-14): every restart or shutdown of the tablet ended in `Halt/Restart Timed Out @IOPlatformExpert.cpp:884` after
+30 s, then the panic's own reboot (`MACH Reboot`). The cause of the USB console's reset is **confirmed on the tablet** (boot 10p,
+`PianoDwc3: reset: PEHaltRestart returned -1 after 242 ms`): the shutdown notifications finish in a quarter of a second and the
+platform has no restart, so nothing resets until the timer panics. Fix: k27 0069 `piano-psci-halt` (default on, section below),
+with the boot guard's restart-reason fix; probe `ram-k273-halt2` (`private/host-checks/20261114-halt/CHECKLIST-halt2.txt`). Tracing:
+k27 0068 `piano-halt-trace=1`, probe `ram-k273-halt1`.
 
 ## What times out
 
@@ -60,4 +63,46 @@ Default 0: nothing changes. With it, `piano-halt: ...` lines on the console (the
 | PSCI marker, then `PSCI ... returned R` | the firmware refused (R a PSCI error); not a driver |
 | PSCI marker and nothing after | the SMC did not return and did not reset: the conduit/firmware path |
 
-Source walk and the probe's design: `private/host-checks/20261114-halt/REPORT.md` (local). Patch: `patches/k27/0068-*`.
+## k27 0069: `piano-psci-halt`, the restart and the power-off through PSCI
+
+Why -1 (source, and the 10p line): the platform expert is `ArmDTPlatform`, an `IODTPlatformExpert` with no `haltRestart` of its
+own; `IOPlatformExpert::haltRestart()` (`IOPlatformExpert.cpp:339-368`) answers `kPEPanicSync` and `kPEHangCPU` itself and
+otherwise calls the function pointer `PE_halt_restart` if it is set, else returns -1. Nothing sets it here: Apple's platform
+expert of `AppleARMPlatform` does, and it is not in the native KC; ARMPlatformStandIn (our stand-in for its classes) has no
+platform expert. So `PEHaltRestart(kPERestartCPU)` and `PEHaltRestart(kPEHaltCPU)` both return -1 after the notifications:
+
+- PianoDwc3's `reset` / `reset fastboot` (a thread calling `PEHaltRestart(kPERestartCPU)`) returned, the system ran on, and the
+  30 s timer panicked; the panic restart then went through `halt_all_cpus()`'s PSCI `SYSTEM_RESET`.
+- `shutdown -r` / `-h` (`reboot_kernel` -> `halt_all_cpus()`) got the -1 too, and `halt_all_cpus()` issues its own PSCI call right
+  after `PEHaltRestart` returns; whether that path also waits out the timer is what halt1/halt2 show (inferred: it does not).
+
+The fix, in the kernel next to the boot guard (`osfmk/arm64/machine_routines.c`; a kernel patch because the guard and the PSCI
+conduit live there and ArmDTPlatform is not our code):
+
+| | |
+|---|---|
+| `piano-psci-halt=1` (default) | at EARLY_BOOT, natively (the SMC conduit) and only when `PE_halt_restart` is unset, it becomes a handler: `kPERestartCPU` -> PSCI `SYSTEM_RESET` (0x84000009), `kPEHaltCPU` -> PSCI `SYSTEM_OFF` (0x84000008), through the conduit of `piano_psci_reset` (the resets of `piano-reset-after` and the guard). The PMIC restart reason is not touched: the one in place (the guard's, `piano-reset-to`'s, PianoDwc3's) decides where ABL goes. Every other type answers -1 as before (`kPEPanicRestartCPU` among them); the panic restart's `halt_all_cpus(TRUE)` then gets the same `SYSTEM_RESET` from the handler, the call `halt_all_cpus()` would make next |
+| `piano-psci-halt=0` | off: `PE_halt_restart` stays unset, exactly the course before (the 30 s timeout) |
+| `sysctl machdep.piano_psci_halt=0/1` | the same switch at run time (root); reads 1 while the handler is in force |
+| `sysctl machdep.piano_restart_started` | 1 once a restart or power-off has begun (below); writing 1 marks it |
+
+Lines: `piano-psci-halt: on: a restart is PSCI SYSTEM_RESET, a power-off PSCI SYSTEM_OFF, through smc (piano-psci-halt=0: off)` at
+boot; at a restart `piano-psci-halt: PE_halt_restart(1) at N ms: PSCI SYSTEM_RESET (0x84000009) through smc, the restart reason as
+it is`, and only if the firmware refuses, `piano-psci-halt: PSCI SYSTEM_RESET returned R` (PEHaltRestart then returns R and the
+caller goes on as before).
+
+**The boot guard's restart reason** (`boot-guard.md` §3): on 2026-11-14 a `reset fastboot` sent at 170 s of an installed boot set
+bootloader, the restart hung in the 30 s timeout, the guard's health decision at 180 s set the reason back to normal during the
+hang, and the panic restart booted the installed system (`private/host-checks/20261114-a2run/WHY.md`). Since 0069 a restart word
+(`osfmk/arm64/piano_halt_policy.h` = `tooling/k27/piano-halt/piano_halt_policy.h`, host-tested by `tooling/k27/test-piano-halt.sh`,
+a two-thread race included) is marked at `PEHaltRestart`'s entry for the halt/restart types and by
+`machdep.piano_restart_started=1`, which PianoDwc3's `reset` writes **before** its own reason (`kernel_sysctlbyname`; an older
+kernel answers ENOENT and PianoDwc3 says so). Once marked, the guard's decision does not write the reason
+(`piano-boot-guard: healthy after 180 s, but a restart began at N ms (machdep.piano_restart_started): the restart reason is left as it
+is`); a marker that writes a reason of its own waits (200 ms at most) for a guard write already in flight, so its write comes last.
+
+What 0069 does not do: the console `reset` still restarts without a file-system sync (as before: it calls `PEHaltRestart` directly;
+`shutdown -r` over ssh syncs and unmounts first). `SYSTEM_OFF` was not run on the tablet before (inferred to power it off like the
+panic path's PSCI calls work; an unattended test cannot press the power key afterwards, so the halt2 checklist leaves it out).
+
+Source walk and the probe's design: `private/host-checks/20261114-halt/REPORT.md` (local). Patches: `patches/k27/0068-*`, `0069-*`.

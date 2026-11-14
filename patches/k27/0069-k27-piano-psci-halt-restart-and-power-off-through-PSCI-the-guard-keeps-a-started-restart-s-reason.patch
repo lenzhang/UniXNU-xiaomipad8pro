@@ -162,8 +162,8 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
 + * only once PEHaltRestart had returned. With it PE_halt_restart is set at EARLY_BOOT, natively (the SMC conduit) and only when
 + * nothing set it: kPERestartCPU is PSCI SYSTEM_RESET, kPEHaltCPU PSCI SYSTEM_OFF, through the conduit of piano_psci_reset (the
 + * resets of piano-reset-after and of the guard). The PMIC restart reason is not touched: the one in place (the guard's,
-+ * piano-reset-to's, PianoDwc3's) decides where ABL goes. Every other type answers -1 as before (piano_halt_policy.h): the panic
-+ * restart still ends in halt_all_cpus' PSCI SYSTEM_RESET. machdep.piano_psci_halt switches it at run time (0 off, 1 on).
++ * piano-reset-to's, PianoDwc3's) decides where ABL goes. Every other type answers -1 as before (piano_halt_policy.h); a panic
++ * restart's halt_all_cpus(TRUE) gets the same SYSTEM_RESET here. machdep.piano_psci_halt switches it at run time (0 off, 1 on).
 + */
 +TUNABLE(uint32_t, piano_psci_halt_arg, "piano-psci-halt", 1);
 +static uint32_t piano_psci_halt_on;
@@ -287,8 +287,8 @@ new file mode 100644
 +#define PIANO_PSCI_SYSTEM_RESET         0x84000009u
 +
 +/* piano-psci-halt's PE_halt_restart(TYPE) with the switch ON: the PSCI function to call, 0 for none (then it answers -1, what no
-+ * PE_halt_restart answered: the panic path's types, kPEPagingOff and the rest keep today's course, the panic restart still ends in
-+ * halt_all_cpus' own PSCI SYSTEM_RESET). */
++ * PE_halt_restart answered: kPEPanicRestartCPU, kPEPagingOff and the rest keep their course; a panic restart then calls
++ * halt_all_cpus(TRUE), whose PEHaltRestart(kPERestartCPU) gets SYSTEM_RESET here, the call halt_all_cpus would make next). */
 +static inline uint32_t
 +piano_halt_psci_function(unsigned int type, bool on)
 +{
