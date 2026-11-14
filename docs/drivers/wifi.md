@@ -973,7 +973,10 @@ and the authentication sent on 5260 MHz, where the access point is not. Fixed: a
 DS parameter set, else the HT operation, else the header's channel number; §13.3). Also: the Wi-Fi interface is **en0** on the
 27.3 line (en1 is the USB network), and PianoWifiEthernet never found PianoWifi's properties (unregistered service; fixed).
 
-**After 10a.** The same recipe (`out/ram-k273-wifi-10b`): `piano-wifi=7 piano-wifi-iova=1`, every level 7 switch at its new
+**After 10a.** The same recipe (`out/ram-k273-wifi-10b`, built 2026-11-14 08:43 from branch commit `2afe838`: 237281280 bytes,
+sha256 `18f142f5421edc49614e7c123ddc77435a8e1025339394e15ed5e12b3019f61d`, `verify-ram-images.py` PASS; the 27.3 collection
+`550c006f...` with the 0066 kernel, 26 native kexts; `data-persist=0` on the store seed `89860516...`; `piano-reset-after=900
+piano-reset-to=bootloader`): `piano-wifi=7 piano-wifi-iova=1`, every level 7 switch at its new
 default (`l7=0x73f`, `l7cands=4`, `l7scans=3`, `l7file=1`). The profile is placed as before (root:wheel, `600` in a `700`
 directory); the kext reads it itself within 2 s (no helper needed; the sysctl still works).
 
