@@ -11,7 +11,8 @@
 //   psk=PASSPHRASE       for wpa2-psk: 8 to 63 printable characters, or 64 hex digits
 //   bssid=aa:bb:cc:dd:ee:ff   optional: the access point to prefer
 //   mac=02:..:..:..:..:..     optional: the station's own address (locally administered)
-// Lines starting with # are comments. The profile goes into the kernel through the sysctl machdep.piano_wifi_join — never a
+// Lines starting with # are comments; every line ends with a newline, the last one too (a file still being written is
+// refused: replace the file by a rename). The profile goes into the kernel through the sysctl machdep.piano_wifi_join — never a
 // command-line argument, never a log line: this program prints only what was wrong, or the lengths it handed over — and every
 // copy of it in this process is wiped before it exits. With no file, or no PianoWifi (the sysctl is absent without
 // piano-wifi=6 or higher), it exits quietly with 0.
@@ -29,26 +30,6 @@ static void wipe(void *p, size_t n)
 {
   volatile unsigned char *at = (volatile unsigned char *)p;
   while (n--) *at++ = 0;
-}
-
-static int hexval(int c)
-{
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
-}
-
-static int parse_mac(const char *s, size_t n, uint8_t out[6])
-{
-  // six pairs of hex digits separated by colons: exactly 17 characters
-  if (n != 17) return -1;
-  for (int i = 0; i < 6; ++i) {
-    const int hi = hexval(s[3 * i]), lo = hexval(s[3 * i + 1]);
-    if (hi < 0 || lo < 0 || (i < 5 && s[3 * i + 2] != ':')) return -1;
-    out[i] = (uint8_t)(hi << 4 | lo);
-  }
-  return 0;
 }
 
 // The file's permissions, checked on the open descriptor and on its directory before a byte is read.
@@ -103,55 +84,11 @@ int main(int argc, char **argv)
     wipe(text, sizeof text);
     return 1;
   }
-  text[got] = 0;
+  // The shared parser (WifiProfile.h): the kext's and this helper's rules are one, the supplicant's the same (a last line
+  // without its newline is a file still being written: refused, review of 2026-11-14 R1/R2).
   struct piano_wifi_profile p;
-  memset(&p, 0, sizeof p);
-  p.magic = PIANO_WIFI_PROFILE_MAGIC;
-  p.version = PIANO_WIFI_PROFILE_VERSION;
-  p.security = 0xff;
-  int bad = 0;
-  for (char *line = text; line && *line && !bad;) {
-    char *end = strchr(line, '\n');
-    if (end) *end = 0;
-    size_t n = strlen(line);
-    if (n && line[n - 1] == '\r') line[--n] = 0;
-    char *eq = strchr(line, '=');
-    if (n && line[0] != '#' && eq) {
-      const char *key = line, *value = eq + 1;
-      *eq = 0;
-      const size_t vn = strlen(value);
-      if (!strcmp(key, "ssid")) {
-        if (vn < 1 || vn > 32) bad = 1;
-        else {
-          memcpy(p.ssid, value, vn);
-          p.ssid_len = (uint8_t)vn;
-        }
-      } else if (!strcmp(key, "security")) {
-        if (!strcmp(value, "open")) p.security = PianoWifiSecOpen;
-        else if (!strcmp(value, "wpa2-psk")) p.security = PianoWifiSecWpa2Psk;
-        else bad = 2;
-      } else if (!strcmp(key, "psk")) {
-        if (vn > 64) bad = 3;
-        else {
-          memcpy(p.psk, value, vn);
-          p.psk_len = (uint8_t)vn;
-        }
-      } else if (!strcmp(key, "bssid")) {
-        if (parse_mac(value, vn, p.bssid)) bad = 4;
-        else p.flags |= PianoWifiProfileBssid;
-      } else if (!strcmp(key, "mac")) {
-        if (parse_mac(value, vn, p.mac)) bad = 5;
-        else p.flags |= PianoWifiProfileMac;
-      } else {
-        bad = 6;
-      }
-    }
-    line = end ? end + 1 : NULL;
-  }
+  const char *problem = piano_wifi_profile_parse((const uint8_t *)text, (uint32_t)got, &p);
   wipe(text, sizeof text);
-  if (p.security == 0xff) bad = bad ? bad : 2;
-  const char *problem = bad ? "a line the profile does not allow (its key or the form of its value)"
-                            : piano_wifi_profile_problem(&p, sizeof p);
   if (problem) {
     fprintf(stderr, "piano-wifi-join: the profile is not usable: %s; nothing handed over\n", problem);
     piano_wifi_profile_wipe(&p);

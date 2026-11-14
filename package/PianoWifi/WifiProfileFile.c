@@ -59,7 +59,12 @@ int piano_wifi_profile_file_stamp(struct piano_wifi_profile_stamp *stamp)
     vfs_context_t ctx = vfs_context_kernel();
     vnode_t vp = NULLVP;
     const char *problem;
-    if (vnode_lookup(PIANO_WIFI_PROFILE_PATH, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) return ENOENT;
+    {
+        // only a file that is not there is ENOENT (the caller drops a profile for it); any other failure of the lookup is not
+        // that (review of 2026-11-14, R4)
+        const int error = vnode_lookup(PIANO_WIFI_PROFILE_PATH, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
+        if (error) return error == ENOENT ? ENOENT : EIO;
+    }
     problem = checkOwner(vp, ctx, 0, 0, stamp);
     vnode_put(vp);
     return problem ? EPERM : 0;

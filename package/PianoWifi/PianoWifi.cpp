@@ -2694,6 +2694,7 @@ struct PassEnd {
   bool failed = false;        // that level failed
   bool opened = false;        // the port opened on this pass (Wi-Fi was back)
   bool fast = false;          // a restart's fast join: no scan, the last network directly (piano-wifi-fastrestart)
+  bool fastJoinFailed = false;   // the fast join ended without the port opening (not a stopped link, not a dead chip)
   uint64_t profileAt = 0;     // when the join profile was handed to this pass's first join (boot 10o: a restart's "Wi-Fi is
                               // back after 103 s" was the wait for a profile placed after the boot)
 };
@@ -4691,6 +4692,7 @@ int level7(IOService *owner)
     note("level 7: the fast restart's join did not open the port (%s): the pass ends; the next restart scans as the boot does",
          gSta.disconnect ? staDisconnectName(gSta.disconnect) : staErrorName(gSta.error));
     why = "the fast join did not open the port";
+    gPass.fastJoinFailed = true;
   } else if (gArgs.level >= 8 && gArgs.rejoin && joinEndedByItself) {
     const bool wasUp = gSta.vdevUp;
     if (gSta.authorized) rejoinStep = 0;   // a port that opened: the next one starts the back-off afresh
@@ -5120,6 +5122,7 @@ int PianoWifi::runPass(uint32_t pass, PowerState &power, const Options &opt)
   e.level = 0;
   e.failed = e.opened = false;
   e.fast = pass > 1 && gFastNext;
+  e.fastJoinFailed = false;
   e.profileAt = 0;
   bool wakeReleased = false;
   // A ladder that ended well lets the device idle again (the wake doorbell back to 0, as the MHI host's last release does),
@@ -5382,7 +5385,7 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
     why = "the firmware died";
   } else if (e.failed && e.level == 7 && gSta.error == kStaErrNoProfile) {
     why = "no join profile came";   // nothing to restart for: the chip stays as it is
-  } else if (e.failed && e.fast && !e.opened && e.level == 7) {
+  } else if (e.failed && e.fastJoinFailed) {
     next = kNextFailure;
     why = "the fast join did not open the port";
   } else if (e.failed) {
@@ -5432,6 +5435,8 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
         __atomic_store_n(&gParked, 1u, __ATOMIC_SEQ_CST);
         __atomic_store_n(&gParkedFor, __atomic_load_n(&gSleeps, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
       }
+      // still parked: a later sleep's number too (review R12: a second kOff without a wake waits for its own number)
+      __atomic_store_n(&gParkedFor, __atomic_load_n(&gSleeps, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
       if (__atomic_load_n(&gWakes, __ATOMIC_SEQ_CST) >= __atomic_load_n(&gSleeps, __ATOMIC_SEQ_CST)) {
         __atomic_store_n(&gParked, 0u, __ATOMIC_SEQ_CST);
         __atomic_store_n(&gStopRequested, 0u, __ATOMIC_SEQ_CST);
