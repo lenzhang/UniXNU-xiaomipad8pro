@@ -177,8 +177,7 @@ bool PianoWifi80211::start(IOService *provider)
   refreshScanLocked();
   const uint32_t networks = fState->scan.count;
   IOLockUnlock(fLock);
-  setProperty("piano-wifi-apple80211", true);   // what the airportd starter (tooling/userland/piano-airportd-kick) waits for
-  setProperty("IO80211InterfaceRole", "Infrastructure");
+  setProperty("piano-wifi-apple80211", true);
   note80211("started (piano-wifi-apple80211=1): %u network(s) in PianoWifi's scan list%s; waiting for the BSD interface",
             unsigned(networks), fWifi ? "" : " (PianoWifi not found: no scan list)");
   arm(fAttachCall, kAttachTickMs);
@@ -218,6 +217,7 @@ void PianoWifi80211::attachStep()
   pianowifi::a80211::LinkEvent down = {};
   down.down = 1;
   postEvent(pianowifi::a80211::kEvLinkChanged, &down, sizeof down);
+  setProperty("piano-wifi-apple80211-answering", fIfName);   // the BSD name; the airportd starter waits for this key
   registerService();
   fRegistered = true;
   note80211("%s: the controller is registered (class chain PianoWifi80211 < IO80211Controller < PianoWifiEthernet): airportd's "

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- UniXNU-piano: airportd started once PianoWifi80211 answers the apple80211 requests (docs/drivers/wifi-menu.md section 5);
+     does nothing without the kernel argument piano-wifi-apple80211=1. Install as
+     /Library/LaunchDaemons/com.unixnu.piano-airportd-kick.plist (root:wheel 644) with the script at
+     /usr/local/libexec/piano-airportd-kick (root:wheel 755): configs/userland.toml, docs/userland.md. Runs once per boot. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.unixnu.piano-airportd-kick</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>/usr/local/libexec/piano-airportd-kick</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>

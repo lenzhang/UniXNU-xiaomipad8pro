@@ -227,6 +227,23 @@ dest = "/Library/LaunchDaemons/com.unixnu.piano-wifi-join.plist"
 mode = "0644"
 
 [[unit]]
+name = "piano-airportd-kick"
+about = "airportd started (launchctl kickstart, once) when PianoWifi80211 answers the apple80211 requests and launchd's IO80211Controller match has not started it within 10 s (docs/drivers/wifi-menu.md section 5); does nothing without the kernel argument piano-wifi-apple80211=1 (the controller never appears); a script, no Mach-O"
+default_on = true
+
+[[unit.file]]
+source = "tooling/userland/piano-airportd-kick/piano-airportd-kick.sh"
+build = "copy"
+dest = "/usr/local/libexec/piano-airportd-kick"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/userland/piano-airportd-kick/com.unixnu.piano-airportd-kick.plist"
+build = "copy"
+dest = "/Library/LaunchDaemons/com.unixnu.piano-airportd-kick.plist"
+mode = "0644"
+
+[[unit]]
 name = "piano-wifi"
 about = "the Wi-Fi command-line tool of docs/drivers/wifi.md section 13.1 (scan, join, status over PianoWifi's control socket); not written yet"
 status = "planned"
