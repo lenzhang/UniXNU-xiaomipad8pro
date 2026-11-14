@@ -8,12 +8,16 @@
 #   hash DEV SKIP COUNT [BS]              sha256 of COUNT blocks of BS (default 4096) bytes at block SKIP, page cache dropped first
 #   zero-sha COUNT [BS]                   sha256 of COUNT zero blocks (to tell an all-zero region)
 #   peek DEV LBA OFFSET LENGTH            hex of LENGTH bytes at OFFSET in 4096-byte block LBA
-#   send DEV SKIP COUNT BS PORT           stream the blocks to the host's TCP PORT (maint-session.py receives and checks)
+#   send DEV SKIP COUNT BS PORT           stream the blocks to the host's TCP PORT (maint-session.py receives and checks);
+#                                         fails when the read (dd) or nc fails, both statuses reported (the shell has no pipefail)
+#   send-list FILE DEV PORT               FILE's runs streamed as one stream; the same failure rule
 #   fetch NAME SHA256 PORT                wget http://HOST:PORT/NAME to /run/pp/NAME and check its sha256
 #   file-sha FILE                         sha256 of a file in /run/pp
 #   copy DEV SKIP SEEK COUNT              WRITE: dd within DEV, 4096-byte blocks, forward (SEEK < SKIP is safe), conv=notrunc,fsync
 #   write FILE DEV SEEK BS                WRITE: dd FILE onto DEV at block SEEK of BS bytes, conv=notrunc,fsync
-#   restore NAME DEV SEEK BS PORT         WRITE: stream http://HOST:PORT/NAME (a verified backup) onto DEV at block SEEK
+#   restore NAME DEV SEEK BS PORT         WRITE: stream http://HOST:PORT/NAME (a verified backup) onto DEV at block SEEK;
+#                                         fails when wget fails (a short body fails wget through the server's Content-Length)
+#   restore-list FILE DEV PORT NAME       WRITE: FILE's runs from the host's NAME@K, at their DST blocks; the same failure rule
 #   job NAME SUBCOMMAND...                run a subcommand detached (setsid): /run/pp/NAME.{log,rc}; survives the telnet session
 #   job-status NAME                       rc=<exit status> when done, else running=1
 #   drop-caches                           sync; echo 3 > /proc/sys/vm/drop_caches (read-backs then come from the medium)
@@ -23,8 +27,8 @@
 #                                         at START with SIZE (512-byte units, sysfs; blockdev too), never a whole disk
 #   zero NODE NAME START SIZE             WRITE: zeros over the whole partition NODE (dd from /dev/zero, conv=fsync), the same guard
 set -u
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-P=${PIANO_PP_DIR:-/run/pp}   # (PIANO_PP_DIR, PIANO_DEV_DIR and PIANO_HOST_IP only for a host-side test of this script)
+export PATH=${PIANO_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+P=${PIANO_PP_DIR:-/run/pp}   # (PIANO_PP_DIR, PIANO_DEV_DIR, PIANO_PATH and PIANO_HOST_IP only for a host-side test of this script)
 DEV=${PIANO_DEV_DIR:-/dev}   # discard and zero only
 mkdir -p "$P"
 host_ip() { [ -n "${PIANO_HOST_IP:-}" ] || . /etc/piano-network; echo "$PIANO_HOST_IP"; }
@@ -92,9 +96,13 @@ peek)
 	dd if="/dev/$1" bs=4096 skip="$2" count=1 2>/dev/null | od -A n -t x1 -v -j "$3" -N "$4" | tr -d ' \n' | sed 's/^/hex=/'
 	echo
 	;;
-send)
-	dd if="/dev/$1" bs="$4" skip="$2" count="$3" 2>/dev/null | nc "$(host_ip)" "$5"
-	echo "sent=$?"
+send)   # both statuses collected in files: the pipeline's own status would be nc's alone (no pipefail in this shell)
+	rm -f "$P/dd.rc" "$P/nc.rc"
+	{ dd if="/dev/$1" bs="$4" skip="$2" count="$3" 2>/dev/null; echo $? > "$P/dd.rc"; } | { nc "$(host_ip)" "$5"; echo $? > "$P/nc.rc"; }
+	if [ "$(cat "$P/dd.rc" 2>/dev/null)" != "0" ] || [ "$(cat "$P/nc.rc" 2>/dev/null)" != "0" ]; then
+		die "send $1+$3: dd rc $(cat "$P/dd.rc" 2>/dev/null), nc rc $(cat "$P/nc.rc" 2>/dev/null)"
+	fi
+	echo "sent=0"
 	;;
 fetch)
 	rm -f "$P/$1"
@@ -113,7 +121,7 @@ copy)
 copy-list)   # FILE DEV: FILE's lines "SRC DST COUNT" (4096-byte blocks of /dev/DEV), each run copied, then one sync
 	[ -f "$P/$1" ] || die "no $1"
 	n=0
-	while read -r s d c; do
+	while read -r s d c || [ -n "$s" ]; do   # the || takes a last line with no final newline too
 		dd if="/dev/$2" of="/dev/$2" bs=4096 skip="$s" seek="$d" count="$c" conv=notrunc 2>"$P/dd.err" || { cat "$P/dd.err"; die "dd copy-list"; }
 		n=$((n + c))
 	done < "$P/$1"
@@ -123,23 +131,29 @@ copy-list)   # FILE DEV: FILE's lines "SRC DST COUNT" (4096-byte blocks of /dev/
 hash-list)   # FILE DEV COLUMN: the SHA-256 of FILE's runs read from the medium in order (COLUMN 1: the SRC blocks, 2: the DST blocks)
 	[ -f "$P/$1" ] || die "no $1"
 	sync; { echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null
-	while read -r s d c; do
+	while read -r s d c || [ -n "$s" ]; do
 		if [ "$3" = 1 ]; then at=$s; else at=$d; fi
 		dd if="/dev/$2" bs=4096 skip="$at" count="$c" 2>/dev/null
 	done < "$P/$1" | sha256sum | cut -d' ' -f1 | sed 's/^/sha256=/'
 	;;
 send-list)   # FILE DEV PORT: FILE's runs (column 1: the SRC blocks, COUNT) read from /dev/DEV in order, one stream to the host
 	[ -f "$P/$1" ] || die "no $1"
-	while read -r s d c; do
-		dd if="/dev/$2" bs=4096 skip="$s" count="$c" 2>/dev/null
-	done < "$P/$1" | nc "$(host_ip)" "$3"
-	echo "sent=$?"
+	rm -f "$P/dd.rc" "$P/nc.rc"
+	while read -r s d c || [ -n "$s" ]; do
+		{ dd if="/dev/$2" bs=4096 skip="$s" count="$c" 2>/dev/null; echo $? >> "$P/dd.rc"; }
+	done < "$P/$1" | { nc "$(host_ip)" "$3"; echo $? > "$P/nc.rc"; }
+	if grep -qv '^0$' "$P/dd.rc" 2>/dev/null || [ "$(cat "$P/nc.rc" 2>/dev/null)" != "0" ]; then
+		die "send-list: dd rcs '$(tr '\n' ' ' < "$P/dd.rc" 2>/dev/null)', nc rc $(cat "$P/nc.rc" 2>/dev/null)"
+	fi
+	echo "sent=0"
 	;;
 restore-list)   # FILE DEV PORT NAME: run K of FILE from the host's NAME@K, written at its DST blocks (column 2) of /dev/DEV; one sync
 	[ -f "$P/$1" ] || die "no $1"
 	k=0; n=0
-	while read -r s d c; do
-		wget -q -O - "http://$(host_ip):$3/$4@$k" | dd of="/dev/$2" bs=4096 seek="$d" conv=notrunc 2>"$P/dd.err" || { cat "$P/dd.err"; die "restore-list run $k"; }
+	while read -r s d c || [ -n "$s" ]; do
+		rm -f "$P/wget.rc"
+		{ wget -q -O - "http://$(host_ip):$3/$4@$k" || echo $? > "$P/wget.rc"; } | dd of="/dev/$2" bs=4096 seek="$d" conv=notrunc 2>"$P/dd.err" || { cat "$P/dd.err"; die "restore-list run $k: dd"; }
+		if [ -s "$P/wget.rc" ]; then die "restore-list run $k: $4@$k: wget rc $(cat "$P/wget.rc")"; fi
 		k=$((k + 1)); n=$((n + c))
 	done < "$P/$1"
 	sync
@@ -150,7 +164,9 @@ write)
 	tail -1 "$P/dd.err"; echo "written=$1"
 	;;
 restore)
-	wget -q -O - "http://$(host_ip):$5/$1" | dd of="/dev/$2" bs="$4" seek="$3" conv=notrunc,fsync 2>"$P/dd.err" || { cat "$P/dd.err"; die "restore $1"; }
+	rm -f "$P/wget.rc"
+	{ wget -q -O - "http://$(host_ip):$5/$1" || echo $? > "$P/wget.rc"; } | dd of="/dev/$2" bs="$4" seek="$3" conv=notrunc,fsync 2>"$P/dd.err" || { cat "$P/dd.err"; die "restore $1: dd"; }
+	if [ -s "$P/wget.rc" ]; then die "restore $1: wget rc $(cat "$P/wget.rc")"; fi
 	tail -1 "$P/dd.err"; echo "restored=$1"
 	;;
 job)

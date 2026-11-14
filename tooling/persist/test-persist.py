@@ -296,6 +296,126 @@ def test_tablet_sh(tmp):
     (tmp / 'pp' / 'w.bin').write_bytes(b'\xab' * (2 * B))
     run('write', 'w.bin', dev, 5, B)
     check(disk.read_bytes()[5 * B:7 * B] == b'\xab' * (2 * B), 'write FILE DEV SEEK BS')
+
+    # The review of 2026-11-14 §6 (a runs file whose last line has no newline must still be served whole) and §2 (restore and
+    # restore-list must fail when wget fails; send and send-list must fail when nc or the read fails — the tablet's shell has no
+    # pipefail, so the statuses are collected in files). A local HTTP server stands in for the host's, a wget shim for the
+    # tablet's busybox wget (FAKE_WGET_FAIL=1 makes it fail once), and a Python listener for the host's nc receiver.
+    import threading
+
+    import http.server
+
+    def run_rc(*argv):
+        r = subprocess.run(['sh', str(HERE / 'tablet.sh'), *map(str, argv)], capture_output=True, text=True, env=env, cwd=tmp)
+        return r.returncode, dict(line.split('=', 1) for line in r.stdout.splitlines() if '=' in line)
+
+    pp = tmp / 'pp'
+    pp.joinpath('runs.txt').write_text('40 10 2\n50 20 1')   # no final newline: the last run must not be dropped
+    runs_data = data[40 * B:42 * B] + data[50 * B:51 * B]
+    check(run('hash-list', 'runs.txt', dev, 1)['sha256'] == hashlib.sha256(runs_data).hexdigest(),
+          'hash-list: the last run of a file with no final newline is hashed')
+    run('copy-list', 'runs.txt', dev)
+    check(disk.read_bytes()[10 * B:12 * B] == data[40 * B:42 * B] and disk.read_bytes()[20 * B:21 * B] == data[50 * B:51 * B],
+          'copy-list: the last run of a file with no final newline is copied')
+
+    pp.joinpath('pieces@0').write_bytes(b'\xaa' * (2 * B))
+    pp.joinpath('pieces@1').write_bytes(b'\xbb' * B)
+
+    class Served(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            f = pp / self.path.lstrip('/')
+            if f.is_file():
+                self.send_response(200)
+                self.send_header('Content-Length', str(f.stat().st_size))
+                self.end_headers()
+                self.wfile.write(f.read_bytes())
+            else:
+                self.send_error(404)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Served)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    hport = httpd.server_address[1]
+    shim = tmp / 'bin'
+    shim.mkdir()
+    shim.joinpath('wget').write_text(
+        '#!/bin/sh\n'
+        '# test shim of the tablet busybox wget: wget -q -O TARGET URL; FAKE_WGET_FAIL=1 fails the first fetch (rc 8)\n'
+        'out=; url=; prev=\n'
+        'for a in "$@"; do\n'
+        '  [ "$prev" = "-O" ] && out=$a\n'
+        '  case "$a" in http://*) url=$a ;; esac\n'
+        '  prev=$a\n'
+        'done\n'
+        '[ -n "$url" ] || exit 2\n'
+        'if [ -n "$FAKE_WGET_FAIL" ] && [ ! -f wget.failed ]; then : > wget.failed; exit 8; fi\n'
+        'exec python3 - "$out" "$url" <<"PY"\n'
+        'import sys, urllib.request\n'
+        'out, url = sys.argv[1], sys.argv[2]\n'
+        'data = urllib.request.urlopen(url, timeout=30).read()\n'
+        'sys.stdout.buffer.write(data) if out == "-" else open(out, "wb").write(data)\n'
+        'PY\n')
+    shim.joinpath('wget').chmod(0o755)
+    env['PIANO_PATH'] = f'{shim}{os.pathsep}/usr/sbin:/usr/bin:/sbin:/bin'   # tablet.sh exports its own PATH otherwise
+
+    def sink():
+        srv = socket.socket()
+        srv.bind(('127.0.0.1', 0))
+        srv.listen(1)
+        box, done = {}, threading.Event()
+
+        def take():
+            c, _ = srv.accept()
+            buf = b''
+            while True:
+                chunk = c.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            c.close()
+            srv.close()
+            box['data'] = buf
+            done.set()
+
+        threading.Thread(target=take).start()
+        return srv.getsockname()[1], box, done
+
+    disk.write_bytes(data)   # back to the original for the restore checks
+    rc, v = run_rc('restore-list', 'runs.txt', dev, hport, 'pieces')
+    ok = (rc == 0 and v.get('restored') == '3' and disk.read_bytes()[10 * B:12 * B] == b'\xaa' * (2 * B)
+          and disk.read_bytes()[20 * B:21 * B] == b'\xbb' * B)
+    check(ok, f'restore-list: every run of a file with no final newline restored (rc {rc}, {v.get("restored")})')
+    rc, v = run_rc('restore', 'pieces@0', dev, 7, B, hport)
+    check(rc == 0 and v.get('restored') == 'pieces@0' and disk.read_bytes()[7 * B:9 * B] == b'\xaa' * (2 * B),
+          f'restore streams a served file onto the device (rc {rc})')
+
+    env['FAKE_WGET_FAIL'] = '1'
+    (tmp / 'wget.failed').unlink(missing_ok=True)   # the shim marks its one failure in its cwd (= tmp)
+    rc, v = run_rc('restore-list', 'runs.txt', dev, hport, 'pieces')
+    check(rc != 0 and 'wget' in v.get('error', ''), f'restore-list fails when wget fails (rc {rc}: {v.get("error")})')
+    (tmp / 'wget.failed').unlink(missing_ok=True)
+    rc, v = run_rc('restore', 'pieces@0', dev, 9, B, hport)
+    check(rc != 0 and 'wget' in v.get('error', ''), f'restore fails when wget fails (rc {rc}: {v.get("error")})')
+    del env['FAKE_WGET_FAIL']
+
+    nport, box, done = sink()
+    rc, v = run_rc('send-list', 'runs.txt', dev, nport)
+    done.wait(10)
+    check(rc == 0 and v.get('sent') == '0' and box.get('data') == runs_data,
+          f'send-list streams every run of a file with no final newline (rc {rc}, {len(box.get("data", b""))} bytes)')
+    nport, box, done = sink()
+    rc, v = run_rc('send', dev, 40, 2, B, nport)
+    done.wait(10)
+    check(rc == 0 and v.get('sent') == '0' and box.get('data') == data[40 * B:42 * B], f'send streams its blocks (rc {rc})')
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    dead = s.getsockname()[1]
+    s.close()
+    rc, v = run_rc('send-list', 'runs.txt', dev, dead)
+    check(rc != 0 and 'nc' in v.get('error', ''), f'send-list fails when nc fails (rc {rc}: {v.get("error")})')
+    httpd.shutdown()
     # map, on a fake sysfs (a copy of tablet.sh with /sys pointing there): LUN 0 by UFS target 0, partitions by PARTNAME, LUN 0's
     # own entries (linux_*, esp) only on LUN 0 even if another LUN has a partition of the same name
     fs = tmp / 'fs'
