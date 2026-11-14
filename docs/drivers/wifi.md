@@ -1143,6 +1143,33 @@ for 10f-c; after `the port is open`, on the tablet as root:
 | `ipconfig getifaddr en0` | an address (not logged) | no address with frames in: the DHCP answer did not reach the stack |
 | `ping -c 5 <router>` | 5 answers | — |
 
+**10g-old ran on 2026-11-14 14:02 (the 10g build on the then-current layout; report `private/host-checks/20261114-10g`).**
+The handshake and both keys again (the group key `(index 1, 32 bytes, TKIP)` installed), the port open — and no frame to or
+from en0. **Confirmed on the tablet:** (1) en0 was never enabled: at the link's up `interface flags 0 (up 0, running 0),
+enables 0`, no `the interface is brought up` line ever, no `out:` line, en0's sends 0; after `ipconfig set en0 DHCP`
+ifconfig showed en0 UP, RUNNING, `status: active`, and still neither an enable call nor an output reached the driver. (2) After
+the keys, every group frame of the access point (ARP, IPv4 broadcasts, type `0x9000`; 60-453 bytes) came back on the release
+ring from the reorder unit, push reason 0 and error 0, with no descriptor error (`errors 0x4` is only the group-addressed
+bit): decrypted and whole. The two RXDMA decryption errors were group frames 50 and 101 ms after the association, before the
+keys (the keys came at 140 ms): expected. **Causes (from the code):** (1) PianoWifiEthernet had no work loop of its own — its
+provider is IOResources, so the family's command gate had none to run on, and the interface's enable and output never
+reached the controller; PianoUsbNet (which carries ssh over USB) creates its own. Fixed the same way. (2) The reorder unit's
+error 0 means "no queue descriptor for the frame's TID", which this chip's host treats as a normal case for group frames that
+are not routed to the non-QoS queue: it passes them up after the usual checks. WifiDp.h now does the same (the release ring's
+no-queue frames go through the same checks as REO2SW1's and are delivered).
+
+**Boot 10h: DHCP and a gateway ping, again** (built 2026-11-14 14:32 from branch commit `d5f07e0` (main merged), collection `b032506b...` (0066 kernel, 26 native kexts), the v2 recipe of 10g (the esp-k273-v2.json line and tail, `data-persist=0`, the v2 seed `9bd6f902...`): `out/ram-k273-wifi-10h` 237281280 bytes, sha256 `bdbe545f70f8e7b144505362451117b645b2b95d41b51b8f642c6280424e621c`, `verify-ram-images.py` PASS), on the v2 layout with the same recipe and arguments as 10g. The
+procedure and the table of 10g hold; the lines that must now change:
+
+| Line | Expected |
+|---|---|
+| `PianoWifiEthernet: en0 published (..., its own work loop running)` | at level 6 |
+| `PianoWifiEthernet: the interface is brought up (enable 1)` | at the boot or at `ipconfig set en0 DHCP` |
+| `PianoWifiEthernet: out: frame 1, ~342 bytes, type 0x0800, group addressed: handed to PianoWifi (0)` | the DHCP discover |
+| `level 8 ...: released N (N delivered: no queue; ...)` and `PianoWifiEthernet: in: frame 1, ..., type 0x0806/0x0800, group addressed` | the access point's broadcasts reach en0 |
+| `level 8 ...: sent N frames ...; completions N (acked N ...)` | data frames acknowledged |
+| `ipconfig getifaddr en0`, `ping -c 5 <router>` | an address, 5 answers |
+
 ## 9. Fallback
 
 `piano-wifi=0` (the default): nothing runs. Network meanwhile: PianoNullEthernet's `en0` (no traffic) and, once built, the USB-C
