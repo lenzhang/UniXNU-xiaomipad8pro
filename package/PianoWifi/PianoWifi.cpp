@@ -128,7 +128,7 @@ struct Args {
   uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step, l7file, l7cands;
   uint32_t l8, l8status, l8blocks, l8tracems;
   uint32_t sleepOff, rejoin, dropTest, clientWaitMs;
-  uint32_t restart, restartCap, crashTest;
+  uint32_t restart, restartCap, crashTest, fastRestart, haltWatch;
 };
 Args gArgs;
 
@@ -287,6 +287,14 @@ void readArgs()
   if (!gArgs.restartCap || gArgs.restartCap > 100) gArgs.restartCap = 6;
   gArgs.crashTest = bootArg("piano-wifi-crashtest", 0);
   if (gArgs.crashTest > 3600) gArgs.crashTest = 0;
+  // piano-wifi-fastrestart=0: every restart scans as the boot does (level 6's two passive scans, about 5 s). By default a restart
+  // at a wake or after the firmware died skips them and joins the network of the last open port directly (its access point and
+  // channel); a fast join that does not open the port ends the pass, and the next restart scans.
+  gArgs.fastRestart = bootArg("piano-wifi-fastrestart", 1);
+  // piano-wifi-haltwatch=0: no watch of the shutdown. By default, from this driver's shutdown notice, a helper thread names at
+  // +8 s and +20 s the services whose shutdown is not acknowledged yet and those with a power change in progress: macOS's own
+  // "Halt/Restart Timed Out" (30 s, every reboot of the 27.3 line, with or without this driver) names nothing.
+  gArgs.haltWatch = bootArg("piano-wifi-haltwatch", 1);
   if (gArgs.sleepOff == 2 && !(gArgs.level >= 8 && gArgs.restart)) gArgs.sleepOff = 1;   // no restart: nothing brings it back
 }
 
@@ -2647,6 +2655,18 @@ int level5(PowerState &power, const Options &opt)
 // The rings come out of the same window as levels 4 and 5 (the firmware's regions are already in it), the pipes are the ones
 // level 5 described to the firmware, and everything is polled from this one thread: no MSI, no interrupt, no allocation after
 // the window. Every wait is bounded by piano-wifi-wmitimeout (and piano-wifi-scanwait for the scan).
+// The ladder's passes (level 8's restart, after boot 10k): the current one, and the restarts so far.
+struct PassEnd {
+  uint32_t pass = 0;
+  int level = 0;              // the level the pass reached
+  bool failed = false;        // that level failed
+  bool opened = false;        // the port opened on this pass (Wi-Fi was back)
+  bool fast = false;          // a restart's fast join: no scan, the last network directly (piano-wifi-fastrestart)
+};
+PassEnd gPass;
+bool gFastNext;               // the next pass is a fast one (restartWait decides)
+ScanEntry gLastNet;           // the network of the last open port (a copy of the join's choice; its name is never logged)
+bool gLastNetValid;
 Ce gCe;
 HttRx gHtt;                         // the receive rings and their buffers (P23), out of the same window
 bool gHttPlanned;
@@ -2836,6 +2856,9 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
   // Level 7 joins on this level's virtual device: the ladder keeps it after the last scan and hands its transport over. A
   // join profile already set that names the station's address gives the device that address (en1 takes the same).
   options.handOff = gArgs.level >= 7 && !(gArgs.l6pre & kPreNoScan);
+  options.noScan = gPass.fast && options.handOff;
+  if (options.noScan)
+    note("level 6: a fast restart: no scan (the last network is joined directly; piano-wifi-fastrestart=0 scans as the boot)");
   if (gArgs.level >= 7) options.ownMacSet = profileOwnMac(options.ownMac);
   // piano-wifi-en0=1: the station takes PianoNullEthernet's address, as PianoWifiEthernet then takes over its en0.
   if (!options.ownMacSet && bootArg("piano-wifi-en0", 0)) {
@@ -3018,7 +3041,7 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
        gLink.request.channelCount, gLink.scanStarted ? 1u : 0u, gLink.scanEventsSeen, gLink.scanChannels,
        gLink.scanCompleted ? wmiScanReasonName(gLink.scanReason) : "it did not report an end",
        gLink.scanTimedOut ? " (after this driver stopped waiting for it)" : "");
-  publishScan(owner, gLink.scan, gArgs.bssid != 0);
+  if (!gPass.fast) publishScan(owner, gLink.scan, gArgs.bssid != 0);   // a fast pass keeps the last scan's list
   note("level 6: %u commands, %u events (%u extended capability), %u management frames (%u refused by the firmware's own "
        "checks, %u unreadable), %u unexpected messages, %u messages dropped, %u credit waits; the copy engine: %u out "
        "(%u bytes), %u in (%u bytes), %u completions, %u refused claims, %u dropped",
@@ -3199,14 +3222,6 @@ StaDma gStaFrames[kAssocFrameBuffers];
 StaDma gStaReoq, gStaReoq2;      // the second for the rejoin: the queues of two peers in a row never share memory
 bool gL7EndedOnRequest;
 bool gStaPlanned;
-// The ladder's passes (level 8's restart, after boot 10k): the current one, and the restarts so far.
-struct PassEnd {
-  uint32_t pass = 0;
-  int level = 0;              // the level the pass reached
-  bool failed = false;        // that level failed
-  bool opened = false;        // the port opened on this pass (Wi-Fi was back)
-};
-PassEnd gPass;
 uint32_t gRestarts, gRestartRun, gRestartsWake, gRestartsCrash, gRestartsFail;   // gRestartRun: in a row, without a port open
 uint64_t gRestartBegan;
 const char *gRestartWhy = "";
@@ -4226,6 +4241,8 @@ __attribute__((noinline)) void restartTurn(IOService *owner, uint64_t now, uint6
   PassEnd &e = gPass;
   if (!e.opened) {
     e.opened = true;
+    gLastNet = gSta.choice.net;   // the next fast restart joins it directly
+    gLastNetValid = true;
     if (e.pass > 1) {
       note("restart %u (%s): Wi-Fi is back: the port opened %llu ms after the restart began (pass %u)", gRestarts, gRestartWhy,
            (unsigned long long)(now - gRestartBegan), e.pass);
@@ -4398,6 +4415,13 @@ int level7(IOService *owner)
   uint64_t firstOpenAt = 0;
   const char *why = nullptr;
   uint32_t sendWaits = 0;
+  if (gPass.fast && gLastNetValid) {
+    // the fast restart: the last network as the only entry of the list (level 6 did not scan)
+    gLink.scan.entries[0] = gLastNet;
+    gLink.scan.count = 1;
+    note("level 7: the fast restart: the last network (%u MHz, channel %u) is joined directly, without a scan", gLastNet.freq,
+         unsigned(gLastNet.channel));
+  }
   for (;;) {
   ++joins;
   if (joins > 1) {
@@ -4528,7 +4552,12 @@ int level7(IOService *owner)
   // ---- the rejoin's decision: only an association that ended or a join that failed, never a stop, a dead chip, a dead link
   // or a missing profile
   const bool joinEndedByItself = !why && !stoppedOnRequest && gSta.error != kStaErrNoProfile;
-  if (gArgs.level >= 8 && gArgs.rejoin && joinEndedByItself) {
+  if (gArgs.level >= 8 && gPass.fast && !firstOpenAt && joinEndedByItself) {
+    // a fast join that did not open the port: the pass ends, and the restart that follows scans (the network may have moved)
+    note("level 7: the fast restart's join did not open the port (%s): the pass ends; the next restart scans as the boot does",
+         gSta.disconnect ? staDisconnectName(gSta.disconnect) : staErrorName(gSta.error));
+    why = "the fast join did not open the port";
+  } else if (gArgs.level >= 8 && gArgs.rejoin && joinEndedByItself) {
     const bool wasUp = gSta.vdevUp;
     if (gSta.authorized) rejoinStep = 0;   // a port that opened: the next one starts the back-off afresh
     const uint32_t waitMs = kRejoinBackoffMs[rejoinStep < 6 ? rejoinStep : 5];
@@ -4585,6 +4614,83 @@ int level7(IOService *owner)
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------------ the service
+// ---- the shutdown's watch (piano-wifi-haltwatch) ----
+// macOS's "Halt/Restart Timed Out" (IOPlatformExpert's panic 30 s after a halt or restart began) ends every reboot of the 27.3
+// line, with this driver or without it (a run of 2026-11-13 had no PianoWifi at all), and names nothing. From this driver's own
+// shutdown notice a helper thread names, at +8 s and +20 s, the services whose shutdown is not acknowledged yet (the power
+// manager's halt worker leaves its "PMShutdown" property on a service while its handler runs) and the power-plane services
+// with a power change in progress (the power manager's own record, IOPowerManagement, carries MachineState then): what holds
+// the halt. Reads only.
+static const char *findText(const char *text, const char *word)   // the kernel has no strstr
+{
+  for (; text && *text; ++text) {
+    const char *a = text, *b = word;
+    while (*a && *b && *a == *b) ++a, ++b;
+    if (!*b) return text;
+  }
+  return nullptr;
+}
+
+static void haltWatchReport(unsigned atS)
+{
+  char pending[320] = "", changing[320] = "";
+  unsigned nPending = 0, nChanging = 0, nPower = 0;
+  size_t pAt = 0, cAt = 0;
+  if (IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively)) {
+    while (IORegistryEntry *entry = it->getNextObject()) {
+      if (!entry->propertyExists("PMShutdown")) continue;
+      ++nPending;
+      if (pAt + 48 < sizeof pending)
+        pAt += size_t(snprintf(pending + pAt, sizeof pending - pAt, "%s%s (%#llx)", pAt ? ", " : "", entry->getName(),
+                               (unsigned long long)entry->getRegistryEntryID()));
+    }
+    it->release();
+  }
+  IOLog("PianoWifi: halt watch +%u s: the halt has not ended; %u service(s) with the shutdown not acknowledged%s%s\n", atS,
+        nPending, nPending ? ": " : "", pending);
+  if (IORegistryIterator *it = IORegistryIterator::iterateOver(gIOPowerPlane, kIORegistryIterateRecursively)) {
+    while (IORegistryEntry *entry = it->getNextObject()) {
+      OSObject *pm = entry->copyProperty("IOPowerManagement");
+      if (!pm) continue;
+      ++nPower;
+      OSSerialize *text = OSSerialize::withCapacity(512);
+      if (text && pm->serialize(text)) {
+        const char *t = text->text();
+        const char *m = t ? findText(t, "MachineState") : nullptr;
+        if (m) {
+          ++nChanging;
+          // the number after the key: <key>MachineState</key><integer size="32">0x..</integer>
+          const char *v = findText(m, "<integer");
+          v = v ? strchr(v, '>') : nullptr;
+          char value[16] = "?";
+          if (v) {
+            unsigned i = 0;
+            for (++v; *v && *v != '<' && i + 1 < sizeof value; ++v) value[i++] = *v;
+            value[i] = 0;
+          }
+          if (cAt + 56 < sizeof changing)
+            cAt += size_t(snprintf(changing + cAt, sizeof changing - cAt, "%s%s (%#llx, state %s)", cAt ? ", " : "",
+                                   entry->getName(), (unsigned long long)entry->getRegistryEntryID(), value));
+        }
+      }
+      OSSafeReleaseNULL(text);
+      pm->release();
+    }
+    it->release();
+  }
+  IOLog("PianoWifi: halt watch +%u s: %u of %u power-plane service(s) with a power change in progress%s%s\n", atS, nChanging,
+        nPower, nChanging ? ": " : "", changing);
+}
+
+static void haltWatch(void *, wait_result_t)
+{
+  thread_set_thread_name(current_thread(), "piano-wifi-haltwatch");
+  IOSleep(8000);
+  haltWatchReport(8);
+  IOSleep(12000);
+  haltWatchReport(20);
+}
+
 constexpr int kPassEnd = 0, kPassUnmap = 1;   // how a pass of the ladder ended (PianoWifi::runPass)
 
 class PianoWifi : public IOService {
@@ -4749,6 +4855,16 @@ void PianoWifi::parkThread(void *self, wait_result_t)
 
 void PianoWifi::systemWillShutdown(IOOptionBits specifier)
 {
+  static bool watching;
+  if (gArgs.haltWatch && !watching && (specifier == kIOMessageSystemWillPowerOff || specifier == kIOMessageSystemWillRestart)) {
+    watching = true;
+    thread_t t = nullptr;
+    if (kernel_thread_start(&haltWatch, nullptr, &t) == KERN_SUCCESS) {
+      thread_deallocate(t);
+      IOLog("PianoWifi: halt watch: armed (+8 s and +20 s from this driver's shutdown notice; piano-wifi-haltwatch=0 turns it "
+            "off)\n");
+    }
+  }
   if (specifier == kIOMessageSystemWillPowerOff || specifier == kIOMessageSystemWillRestart) stopRadio("shutdown");
   IOService::systemWillShutdown(specifier);
 }
@@ -4867,6 +4983,7 @@ int PianoWifi::runPass(uint32_t pass, PowerState &power, const Options &opt)
   e.pass = pass;
   e.level = 0;
   e.failed = e.opened = false;
+  e.fast = pass > 1 && gFastNext;
   bool wakeReleased = false;
   // A ladder that ended well lets the device idle again (the wake doorbell back to 0, as the MHI host's last release does),
   // since nothing answers it after this thread is gone.
@@ -5128,6 +5245,9 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
     why = "the firmware died";
   } else if (e.failed && e.level == 7 && gSta.error == kStaErrNoProfile) {
     why = "no join profile came";   // nothing to restart for: the chip stays as it is
+  } else if (e.failed && e.fast && !e.opened && e.level == 7) {
+    next = kNextFailure;
+    why = "the fast join did not open the port";
   } else if (e.failed) {
     next = kNextFailure;
     why = e.level == 7 ? "level 7 failed (the link to the firmware stopped)" : "a level failed";
@@ -5200,6 +5320,9 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
     else ++gRestartsFail;
     gRestartWhy = why;
   }
+  // A fast pass after a wake or the firmware's death, when a port has opened before and the pass that just ended was not a fast
+  // one that failed to open it; a failed level, or that, restarts with the scans.
+  gFastNext = gArgs.fastRestart && gLastNetValid && (woke || gChipDead) && !(e.fast && !e.opened);
   gRestartBegan = nowMs();
   char line[200];
   snprintf(line, sizeof line, "%u restart(s): %u at a wake, %u after the firmware died, %u after a failed level; the last: %s",
@@ -5208,8 +5331,9 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
   if (chipOn) chipDown(power, opt);
   ladderReset();
   note("restart %u begins (%s), %llu ms after pass %u ended: every level's state as at the boot, the window's %u MiB free "
-       "again; levels 2 to 8 follow",
-       gRestarts, gRestartWhy, (unsigned long long)(gRestartBegan - ended), pass, gArena.bytes >> 20);
+       "again; levels 2 to 8 follow, %s",
+       gRestarts, gRestartWhy, (unsigned long long)(gRestartBegan - ended), pass, gArena.bytes >> 20,
+       gFastNext ? "fast (no scan: the last network directly)" : "with the scans");
   deferPhase();
   return true;
 }

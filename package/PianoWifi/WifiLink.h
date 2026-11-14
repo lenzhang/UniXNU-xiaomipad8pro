@@ -125,6 +125,9 @@ struct LinkOptions {
   // Level 7: after the last scan the virtual device is kept and the ladder hands its transport over (kLinkHandOff) instead of
   // tearing it down.
   bool handOff = false;
+  // A restart's fast join (level 8, piano-wifi-fastrestart): with the hand-off, no scan at all. The virtual device, the data
+  // interface's version and the receive rings are as with the scans; level 7 then joins the network it joined last.
+  bool noScan = false;
   // The station's own address when the join profile names one (set before the virtual device is created): it wins over every
   // other source, and en1 takes the same.
   bool ownMacSet = false;
@@ -982,6 +985,11 @@ inline int linkRun(Link &link, uint64_t nowMs)
   if (link.step == kLinkRxRings && link.pending == kLinkSendNothing && link.srngSent == kHttRings && link.ringSettle &&
       nowMs >= link.ringSettle) {
     link.ringSettle = 0;
+    if (link.options.noScan && link.options.handOff) {   // no second round either: the hand-off
+      enter(link, kLinkHandOff, nowMs);
+      link.pending = kLinkSendNothing;
+      return link.step;
+    }
     startRound2(link, nowMs);
     sendPending(link, nowMs);
     return link.step;
@@ -1016,6 +1024,19 @@ inline int linkRun(Link &link, uint64_t nowMs)
   // there instead, so that a firmware death after the virtual device cannot be blamed on the scan.
   if (link.step == kLinkVdev && link.pending == kLinkSendNothing && link.settle && nowMs >= link.settle) {
     link.settle = 0;
+    if (link.options.noScan && link.options.handOff) {
+      // no first round: the data interface's version and the rings (as after it), or the hand-off at once
+      if ((link.options.pre & kPreRxRings) && link.options.htt && link.httEndpoint > 0) {
+        enter(link, kLinkHttVersion, nowMs);
+        link.httDeadline = nowMs + link.options.httVersionWaitMs;
+        link.pending = kLinkSendHttVersion;
+      } else {
+        enter(link, kLinkHandOff, nowMs);
+        link.pending = kLinkSendNothing;
+      }
+      sendPending(link, nowMs);
+      return link.step;
+    }
     if (link.options.pre & kPreNoScan) {
       enter(link, kLinkHold, nowMs);
       link.hold = nowMs + link.options.holdMs;

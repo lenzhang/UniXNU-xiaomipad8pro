@@ -40,7 +40,7 @@ python3 "$D/tooling/k27/build-native-kext.py" PianoWifi "$P/PianoWifi.cpp" "$D/t
 # thread's entry, the function-pointer targets of the I/O tables, the hooks and en0's callbacks included (an over-estimate).
 IND=spmiRd,spmiWr,spmiDelay,hwRead,hwWrite,hwUdelay,hwMsleep,hwNow,hwVoteLock,hwVrm,hwPmic,hwStep,barRd,barWr,chipIoRead,chipIoWrite
 IND=$IND,linkNote,staNote,staReport,staHook,wlfwClaim,wlfwSendMessage,wlfwFileSize,wlfwFileRead,wlfwMemory,wlfwStepNote,wlfwEventNote
-for entry in __ZN9PianoWifi6threadEPvi __ZN9PianoWifi10stopThreadEPvi __ZN9PianoWifi10parkThreadEPvi deferPrinter portSend; do
+for entry in __ZN9PianoWifi6threadEPvi __ZN9PianoWifi10stopThreadEPvi __ZN9PianoWifi10parkThreadEPvi deferPrinter portSend haltWatch; do
   python3 "$D/tooling/k27/check-kext-stack.py" "$O/PianoWifi.o" "$entry" --max 6144 --brief --indirect "$IND" >&2
 done
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
