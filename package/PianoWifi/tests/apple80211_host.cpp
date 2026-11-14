@@ -313,6 +313,31 @@ int main()
     CHECK(s.count == Seen::kMax && s.overflow > 0);
   }
 
+  // ---- the front end's memory: three fixed allocations at its start (the state, the scratch buffer, the kind table), none per
+  // request (the handler has no allocator: every answer is built in the scratch buffer). wm3's boot failed for kernel memory
+  // (decmpfs ENOMEM); this bounds what PianoWifi80211 can have taken: under 16 KiB for the whole boot, whatever airportd asks.
+  {
+    const size_t total = sizeof(State) + kScratchBytes + sizeof(Seen);
+    CHECK(total < 16 * 1024);
+    Rig r;
+    r.st.scan.bss[0] = network(1, "a", 2412, -50, false);
+    r.st.scan.count = 1;
+    r.st.accept = kAcceptInfraEnumerated | kAcceptUnknownSets | kAcceptUnknownGets | kAcceptVirtualRole;
+    // every request kind, both ways, many times over: nothing grows (the state is a fixed block; its counters only count)
+    for (int round = 0; round < 50; ++round)
+      for (int32_t t = 0; t < 700; ++t) {
+        r.ask(false, t, 64);
+        r.ask(true, t, 64);
+      }
+    CHECK(r.st.cursor <= r.st.scan.count && r.st.scan.count <= 1);   // (SCANCACHE_CLEAR among the requests empties it)
+    // the largest zero answer is clipped at 64 KiB however long a request says it is
+    Rig big;
+    big.user.mem.resize(80 * 1024, 0xa5);
+    big.st.accept = kAcceptUnknownGets;
+    Answer a = big.ask(false, 9999, 0x7fffffff);
+    CHECK(a.error == 0 && a.wrote == 64 * 1024 && big.rq.length == 64 * 1024);
+  }
+
   if (failures) {
     std::printf("apple80211_host: %d failure(s)\n", failures);
     return 1;
