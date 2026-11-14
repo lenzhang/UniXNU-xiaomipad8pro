@@ -9,9 +9,17 @@
     "com.apple.kpi.iokit": "18.0.0",
     "com.apple.kpi.libkern": "18.0.0",
     "com.apple.kpi.mach": "18.0.0",
-    "com.apple.driver.usb.AppleUSBXHCI": "1.2",
-    "com.apple.iokit.IOUSBHostFamily": "1.2"
+    "com.apple.driver.usb.AppleUSBXHCI": "1.2"
   },
+  "comment": [
+    "Path A2 (docs/drivers/usb-host.md §5.4): PianoXhciHost derives from the collection's AppleUSBXHCI, which is the only kext",
+    "named as a library on purpose. com.apple.iokit.IOUSBHostFamily is *not* listed, although the class's base lives there:",
+    "AppleUSBXHCI's own bundle already depends on the family, so it is loaded either way, and some inherited slots reach a method",
+    "that the collection has as a local symbol in both kexts (AppleUSBHostController::getBusNumber, inlined into each). The",
+    "collection builder resolves a local symbol only when exactly one library defines it, so naming the family here would make",
+    "those slots ambiguous and the link would fail. tooling/k27/xhci-abi.py check-imports proves this list resolves every import",
+    "to the address the ABI data records."
+  ],
   "personalities": {
     "PianoXhciHost on PianoUsbHostNub": {
       "CFBundleIdentifier": "com.unixnu.driver.PianoXhciHost",
@@ -20,5 +28,14 @@
       "IONameMatch": "usb-host0",
       "IOProbeScore": 1000
     }
+  },
+  "vtable": {
+    "class": "PianoXhciHost",
+    "base": "AppleUSBXHCI",
+    "base_kext": "com.apple.driver.usb.AppleUSBXHCI",
+    "slots": 427,
+    "ignore_slots": [
+      16
+    ]
   }
 }

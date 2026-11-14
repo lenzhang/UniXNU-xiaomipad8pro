@@ -414,6 +414,57 @@ def check_object(abi, path, symbol_name=SUBCLASS_VTABLE, data=None, thunks=None)
             f'{sorted(replaced)}; every entry IA + address-diversified with the collection\'s diversity{note}')
 
 
+# ------------------------------------------------------- gate 3: every import resolves, to the address the ABI data records
+def check_imports(abi, kc, objects, libraries):
+    """The collection builder resolves a native kext's imports by name: a symbol exported by exactly one kept kext, else a local
+    symbol of exactly one of the kext's **libraries**. This gate plays that rule out offline for the objects of PianoXhciHost, so
+    an ambiguity stops the build with a readable reason instead of an `unresolved symbol` in the middle of the link, and it
+    compares each resolved address with the one the ABI data records for that slot (name-based binding cannot see addresses;
+    the collection builder's own vtable check and this one do).
+
+    One symbol makes this necessary: the collection has `AppleUSBHostController::getBusNumber` inlined as a local symbol in both
+    AppleUSBXHCI and IOUSBHostFamily, so a descriptor that names both as libraries cannot resolve it. Naming only AppleUSBXHCI is
+    right anyway (that is the class we derive from, and its own bundle depends on the family).
+    """
+    sys.path.insert(0, str(k27_tree() / 'scripts'))
+    import fileset_kc                                     # noqa: E402
+    collection = fileset_kc.Kernelcache(Path(kc).read_bytes())
+    exported, private = {}, {}
+    for name in collection.entries:
+        for sym, kind, _sect, _desc, value in collection.symbols(collection.macho(name)):
+            if kind & 0x0f == 0x0f and not kind & 0xe0:
+                exported.setdefault(sym, []).append(value)
+            elif kind & 0xef == 0x0e:
+                private.setdefault(name, {})[sym] = value
+    defined, wanted = set(), set()
+    for path in objects:
+        obj = MachObject(bytearray(Path(path).read_bytes()))
+        for s in obj.symbols:
+            if s['type'] & 0x0f == 0x0f:
+                defined.add(s['name'])
+            elif s['type'] & 0x0e == 0 and s['type'] & 1 and not s['value']:
+                wanted.add(s['name'])
+    by_slot = {sym: slot for slot, (_t, _d, sym) in enumerate(abi['slots'])}
+    resolved, ambiguous = 0, []
+    for sym in sorted(wanted - defined):
+        found = exported.get(sym, [])
+        if len(found) != 1:
+            found = [private[lib][sym] for lib in libraries if sym in private.get(lib, {})]
+        if len(found) != 1:
+            ambiguous.append(f'{sym} ({len(exported.get(sym, []))} exported, '
+                             f'{len([lib for lib in libraries if sym in private.get(lib, {})])} local in the libraries)')
+            continue
+        if sym in by_slot and found[0] != int(abi['slots'][by_slot[sym]][0], 16):
+            ambiguous.append(f'{sym} resolves to {found[0]:#x}, the data file records {abi["slots"][by_slot[sym]][0]} for slot '
+                             f'{by_slot[sym]}')
+            continue
+        resolved += 1
+    if ambiguous:
+        raise Refused('imports the collection builder could not resolve to the recorded address with libraries '
+                      f'{list(libraries)}: ' + '; '.join(ambiguous))
+    return f'{resolved} imports resolve in the collection, each to the address the ABI data records'
+
+
 def thunk_targets(obj):
     """{thunk symbol: the symbol its branch goes to} for every global of the assembled thunk object. A thunk must be exactly a
     `bti c` and one branch: anything else (a stray instruction, two branches, a missing relocation) is refused."""
@@ -565,8 +616,10 @@ def k27_tree():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', choices=('header', 'thunks', 'check-kc', 'check-object', 'self-test', 'show'))
+    parser.add_argument('command', choices=('header', 'thunks', 'check-kc', 'check-object', 'check-imports', 'self-test', 'show'))
     parser.add_argument('path', nargs='?')
+    parser.add_argument('--objects', type=Path, nargs='*', default=(), help='check-imports: the kext\'s objects')
+    parser.add_argument('--descriptor', type=Path, help='check-imports: tooling/k27/kext/PianoXhciHost.json (its libraries)')
     parser.add_argument('--abi', type=Path, default=DEFAULT_ABI)
     parser.add_argument('--out', type=Path)
     parser.add_argument('--thunks', type=Path, help='check-object: the assembled xhci-thunks.o that binds the inherited slots')
@@ -591,6 +644,11 @@ def main():
             print(f'xHCI ABI: {Path(args.path).name}: {check_kc(abi, args.path, args.abi)}')
         elif args.command == 'check-object':
             print(f'xHCI ABI: {Path(args.path).name}: {check_object(abi, args.path, thunks=args.thunks)}')
+        elif args.command == 'check-imports':
+            if not args.path or not args.objects or not args.descriptor:
+                sys.exit('check-imports needs KC.bin --objects OBJ... --descriptor KEXT.json')
+            libraries = [lib for lib in json.loads(args.descriptor.read_text())['libraries'] if not lib.startswith('com.apple.kpi.')]
+            print(f'xHCI ABI: {Path(args.path).name}: {check_imports(abi, args.path, args.objects, libraries)}')
         elif args.command == 'self-test':
             print(self_test(abi))
         else:

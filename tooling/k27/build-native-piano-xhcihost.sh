@@ -34,6 +34,8 @@ python3 "$D/tooling/k27/build-native-kext.py" PianoXhciHost "$P/PianoXhciHost.cp
 python3 "$D/tooling/k27/xhci-abi.py" thunks "$O/PianoXhciHost.o" --out "$O"
 xcrun clang -arch arm64e -c "$O/xhci-thunks.S" -o "$O/xhci-thunks.o"
 python3 "$D/tooling/k27/xhci-abi.py" check-object "$O/PianoXhciHost.o" --thunks "$O/xhci-thunks.o"
+python3 "$D/tooling/k27/xhci-abi.py" check-imports "$KC" --objects "$O/PianoXhciHost.o" "$O/xhci-thunks.o" \
+  --descriptor "$D/tooling/k27/kext/PianoXhciHost.json"
 # Both objects go into the kext (tooling/k27/kext/PianoXhciHost.json reads this list).
 python3 -c 'import json,sys; json.dump([sys.argv[1], sys.argv[2]], open(sys.argv[3], "w"), indent=1)' \
   "$O/PianoXhciHost.o" "$O/xhci-thunks.o" "$O/objects.json"

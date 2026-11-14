@@ -40,7 +40,8 @@
 // piano-usbhost-back=S (0: stay in host mode), -csr=0|1|2 (GCTL soft reset: never, always, Linux's rule; default 2), -utmi=0|1
 // (default 1), -reset=0|1 (a connected USB 2 port reset, default 0), -smmu=0|1|2 (none, bypass, identity; default 1 at level 5,
 // 2 at level 6), -slots=N (default 8); level 6: -attach=0|1|2 (nub only, the personality, a direct allocation; default 1),
-// -irq=0|1 (polled, SPI 133; default 1), -probe=0|1 (our No-Op probe before Apple's driver, default 1), -a2=0|1 (default 0:
+// -irq=0|1 (polled, SPI 133; default 1; -attach=3 tries the personality and then the allocation, one boot for both),
+// -probe=0|1 (our No-Op probe before Apple's driver, default 1), -a2=0|1 (default 0:
 // Apple's class itself; 1: our PianoXhciHost subclass, which needs a PIANO_USBHOST_A2=1 collection).
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -118,8 +119,8 @@ void readArgs()
   gArgs.slots = bootArg("piano-usbhost-slots", 8);
   if (gArgs.slots < 1) gArgs.slots = 1;
   if (gArgs.slots > 255) gArgs.slots = 255;
-  gArgs.attach = bootArg("piano-usbhost-attach", 1);
-  if (gArgs.attach > 2) gArgs.attach = 1;
+  gArgs.attach = bootArg("piano-usbhost-attach", 1);   // 0 nub only, 1 the personality, 2 an allocation by name, 3 one then the other
+  if (gArgs.attach > 3) gArgs.attach = 1;
   gArgs.irq = bootArg("piano-usbhost-irq", 1) != 0;
   gArgs.probe = bootArg("piano-usbhost-probe", 1) != 0;
   // piano-usbhost-a2=1 (level 6): the controller class is our own PianoXhciHost (path A2: three overrides of the collection's
@@ -1143,11 +1144,14 @@ void appleUp()
   }
   note("nub: %s attached to the platform expert (memory %#llx + %#x, interrupt 0 = %s)", gNub->getName(), (unsigned long long)kXhci,
        kXhciBytes, gArgs.irq ? "SPI 133 through ArmCpu" : "polled (piano-usbhost-irq=0)");
-  char what[120] = "nub only (piano-usbhost-attach=0)";
+  char what[160] = "nub only (piano-usbhost-attach=0)";
   if (gArgs.attach == 1)
     snprintf(what, sizeof what, "%s through its personality (registerService)", controllerClass());
   else if (gArgs.attach == 2)
     snprintf(what, sizeof what, "%s allocated by name, init/attach/start (no personality)", controllerClass());
+  else if (gArgs.attach == 3)
+    snprintf(what, sizeof what, "%s through its personality, then allocated by name if no client matched (one boot answers both)",
+             controllerClass());
   stage(32, what);
   if (gArgs.attach == 0) {
     note("attach: none (piano-usbhost-attach=0): the nub is not registered");
@@ -1161,8 +1165,14 @@ void appleUp()
       IOSleep(100);
       gAppleXhci = copyClient(gNub);
     }
-    note("attach: %s", gAppleXhci ? "a client on the nub" : "no client within 10 s (the personality did not match, or its start failed: "
-                                                            "piano-usbhost-attach=2 logs the allocation and start)");
+    note("attach: %s", gAppleXhci ? "a client on the nub" :
+         gArgs.attach == 3 ? "no client within 10 s (the personality did not match, or its start failed): allocating the class by "
+                             "name now (piano-usbhost-attach=3)"
+                           : "no client within 10 s (the personality did not match, or its start failed: "
+                             "piano-usbhost-attach=2 logs the allocation and start)");
+    // piano-usbhost-attach=3: one boot answers both questions - did IOKit matching find our personality, and does the class's
+    // start() accept this nub at all (the matching path keeps IOKit's own reasons out of sight).
+    if (!gAppleXhci && gArgs.attach == 3) gAppleXhci = attachDirect(gNub);
   }
   if (gAppleXhci)
     note("attach: client %s, power state %u", gAppleXhci->getMetaClass()->getClassName(), unsigned(gAppleXhci->getPowerState()));

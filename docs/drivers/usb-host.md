@@ -183,7 +183,7 @@ largest-first or best-fit placement in the KC builder (the k27 tree's, read-only
 | | Option | Private ABI | Effort | Main risks |
 |---|---|---|---|---|
 | **A1** | `AppleUSBXHCI` on our nub through a **codeless personality** (IOClass AppleUSBXHCI, IOProviderClass `PianoUsbHostNub`), QcomDwc3's nub (memory, name, bus-number, interrupts) | none (IOService public; the stand-in symbols) | ~1 week after H5; **prepared** (§5.2a, §6.5a, H6 images §8.2) | the class may be abstract; the base class's 64-bit write order (DWC3 needs hi-lo); the controller idling to off with no Type-C transport to wake it |
-| **A2** | QcomDwc3's subclass (3 overrides) | AppleUSBXHCI's vtable for 26A434 (slot indices + PAC diversities; UniXNU-sheng's fixtures are for 24A446 and 26C5035r) | +1 week over A1 | deriving the fixture is binary analysis beyond this task's rule: **owner decision** |
+| **A2** | our own subclass with 3 overrides (`package/PianoXhciHost`) | AppleUSBXHCI's vtable of the 27.3 mac17j collection (slot numbers + PAC diversities): **our data file** `data/usb-xhci/abi-26C5035r-mac17j.json` | **built and host-tested** 2026-11-14 (§5.4); owner approved the analysis the same day | the slot layout is pinned to one collection (the build gate refuses another); a thunk-bound inherited slot; the same hi-lo, coherency and idle-power questions until a tablet log |
 | **B** | a fake PCI host bridge: our `IOPCIBridge` subclass with a software config space (class 0x0c0330, BAR0 = 0xa600000/32 KiB, no MSI capability), an `IOPCIDevice` nub, our IOInterruptController over `armcpu_spi_attach`; Apple's `AppleUSBXHCIPCI` unchanged | IOPCIBridge/IOPCIDevice public SDK headers; IOPCIFamily is open source (APSL) to follow its behaviour | 3–6 weeks | IOPCIFamily's configurator, power and link management expecting a real host bridge; the same hi-lo order question |
 | **C** | our own minimal host stack without IOUSBHostFamily: xHCI + hub + HID boot protocol + bulk-only mass storage + CDC-NCM/ECM host, publishing IOHIDDevice / IOBlockStorageDevice / IOEthernetController (all proven here) | none | 6–10 weeks for that set | narrow device coverage (no USB audio, no vendor class drivers) |
 | D | user space (`AppleUSBUserHCI`) | private user-client protocol | — | no |
@@ -196,6 +196,65 @@ stream 0x40 (a stage-1 context; IOMapper is our source-built kernel's class), if
 are present and link natively (§5.2). Go A1 → A2 (with the owner's approval of the fixture) → B; C only if Apple's xHCI cannot be
 made to run. Effort to "keyboard, mouse and stick on an OTG adapter at high speed": ~3–4 weeks of code plus attended sessions; to
 Ubuntu parity (5 Gbit/s both orientations, docks with pass-through charging, role switching with the Mac): ~6–9 weeks (§8).
+**2026-11-14:** A2 is built (§5.4). It is the better first boot of the two, because A1's two open risks (an abstract class, and a
+64-bit write that reaches a 4-byte helper in this collection) are exactly what A2 removes; A1 stays in the tree as the control.
+
+### 5.4 Path A2: `PianoXhciHost`, our subclass of the collection's `AppleUSBXHCI` (built, host-tested, not booted)
+
+The owner approved the binary analysis on 2026-11-14; the offline result is `private/host-checks/20261114-xhci/REPORT.md` (local
+only). What it established about the 27.3 mac17j collection (`out/inputs/k273/kc/kc273-mac17j.bin`, sha256 `d1003b51…`): the class
+has **427 slots**, instance size **0xf88**, no pure virtual slot; the minimal subclass needs exactly three overrides, and the
+reviewed UniXNU-sheng fixture pins **this exact collection**, so no new extraction was needed.
+
+**The data file.** `data/usb-xhci/abi-26C5035r-mac17j.json` (+ `data/usb-xhci/README.md`) is ours: slot numbers, PAC diversities,
+the symbol every slot must reach, the instance size, the fabricated declarations of the private slots, and the three slots we
+implement. Provenance (the fixture's repository, commit and sha256; the collection's sha256) is in the file, and every value was
+re-derived from our own collection with `tooling/k27/xhci-abi.py check-kc`. No Apple code, no Apple bytes; the generated header is
+a build output.
+
+**The subclass** (`package/PianoXhciHost`, BSD-2-Clause-Patent, own code): no instance field, three overrides —
+
+| Slot | Override | Why |
+|---:|---|---|
+| 292 | desired/default power state = 3 (on) | with no Apple Type-C transport, an idle root port would let the controller fall to a state nothing wakes it from; our role manager creates it only while a peripheral is on the cable |
+| 419 | 64-bit read: two 32-bit loads, low half first | symmetry with the write; one 8-byte access is not promised by this controller |
+| 421 | 64-bit write: high half first, barrier, low half, barrier | Linux's `write-64-hi-lo-quirk` for every DWC3 host. **The base class's 64-bit write reaches a 4-byte helper in this collection**, so a ring above 4 GiB would be latched with half an address; `regOr64` / `regAnd64` dispatch through 419 and 421, so these two fix them too |
+
+Nothing else moves into the class: the window, the interrupt, the role switch, the PHY, VBUS, clocks, the SMMU route and the
+halted/reset controller stay in `PianoUsbHost` (§6.5a). `AppleUSBXHCIARM` and the SoC leaves are **not** the base class (they want
+`AppleARMIODevice`, Apple's Type-C PHY, mapper and clock sessions, and they leave the 64-bit accessors at the base anyway).
+
+**The gate (the build fails closed on ABI drift)** — `tooling/k27/build-native-piano-xhcihost.sh`, in order:
+1. `xhci-abi.py self-test`: synthetic objects prove the gates still refuse a changed diversity, an added virtual method, a stolen
+   slot, a missing slot, another signing key, an unsigned pointer, a foreign binding, the original's destructor in our slot, and a
+   collection with another sha256 (9 cases).
+2. `tests/reg64_host` on the Mac: the hi-lo order, the barriers, addresses above 4 GiB, the round trips.
+3. `xhci-abi.py check-kc $KC_BASE`: the collection is the pinned one — sha256, all **427** slot targets (by symbol name), all 427
+   PAC diversities, IA + address diversification on every entry, instance size `0xf88`. A new seed therefore stops the A2 build.
+4. `xhci-abi.py header`: `OriginalUsbXhciABI.h` generated (opaque storage, 155 private declarations, `static_assert` on the size).
+5. the subclass compiled with the kernel's own recipe.
+6. `xhci-abi.py thunks` + `clang`: a fabricated declaration makes the compiler emit `AppleUSBXHCI::<name>`, which no collection
+   defines (the collection has, for example, `AppleUSBHostController::setProperties` in slot 100). An assembler label cannot fix
+   that: clang then signs the slot with the label's hash instead of the declaration's, which is the one discriminator that must not
+   change. So each such name becomes a `bti c; b <the collection's symbol>` thunk, and the collection builder resolves the branch
+   **by name** — no address is hard-coded anywhere, and a tail branch keeps the arguments, the link register and Apple's caller.
+7. `xhci-abi.py check-object`: the compiled vtable, slot for slot. Measured on 2026-11-14: **427 slots, 250 bound to the
+   collection by name, 173 through a checked thunk, ours exactly [292, 419, 421]**, every entry IA + address-diversified with the
+   collection's diversity. One slot of the kernel itself (16) holds our kernel's reserved entry where 27.3's has
+   `OSMetaClassBase::Dispatch(IORPC)`: our kernel's slot to fill, printed rather than refused.
+
+**The collection.** `PIANO_USBHOST_A2=1 tooling/k273/build-k273-image.sh` implies `PIANO_USBHOST_STACK=1` and links
+`PianoXhciHost` + `PianoUsbHostStackA2` (the same codeless bundle and gate as A1 **without** A1's `AppleUSBXHCI` personality), so
+only one automatic client can ever match the nub; `tooling/k27/check-usbhost-stack.py` now refuses zero or two personalities on
+`PianoUsbHostNub`. One difference from A1, printed by that check rather than refused: our subclass names `AppleUSBXHCI` and
+`IOUSBHostFamily` as libraries, so those two kexts load **at boot** instead of on demand. They still match nothing — the generic
+`AppleUSBXHCI` has no personality of its own, the family's boot personalities stay behind the gate resource
+`PianoUsbHostStack`, and our personality waits for `PianoUsbHostNub`, which only `piano-usbhost=6` creates.
+
+**Running it.** `piano-usbhost=6 piano-usbhost-a2=1`: level 6 as in §6.5a, but the class loaded, allocated and attached is
+`PianoXhciHost`. `piano-usbhost-attach=3` (new) tries the personality first and, if no client matches within 10 s, allocates the
+class by name and calls init/attach/start itself — one boot answers both "did IOKit matching find our personality" and "does
+`start()` accept this nub". The A1 path is unchanged (`piano-usbhost-a2=0` on an A1 collection).
 
 ## 6. Design
 
