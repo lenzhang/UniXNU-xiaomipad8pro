@@ -1010,6 +1010,11 @@ Next: the data path (level 8), whose gate is the access point's first EAPOL-Key 
 the line's driver arguments (the hold only so that the level's end lines are printed within the run; the WPA2 access point
 ends the association by itself without the handshake): `out/ram-k273-wifi-10c` (@PROBE@). The profile is placed as for 10b.
 No 802.1X client is needed for the gate (none exists yet: the frames are counted and logged by length and message number).
+**Same boot, second question (the boundary):** copy `out/piano-wifi-port` (§13.7) to the tablet and run it as root before the
+profile is placed, `piano-wifi-port 600`: it should print `connected`, `LINK: idle, generation 0`, then after the association
+`LINK: associated (port closed), generation 1, AID A, F MHz, security 1 (pairwise 4 group 4 AKM 2), RSN elements N/22 bytes`
+and `EAPOL_RX: generation 1, PDU P bytes, four-way message 1` for each message 1, and `LINK: idle ... reason R` at the end;
+the kext's EAPOL lines then say `handed to the 802.1X port`.
 
 | # | Boot args (beyond the image's) | Gate | Then |
 |---|---|---|---|
@@ -1963,6 +1968,11 @@ a request of another generation is refused with `ESTALE` (a late client never in
 
 **What never crosses either interface:** the network's name, the passphrase and the PMK (the client has them); the log
 carries none of the addresses, frames or keys either.
+
+**A listener for the tablet:** `tooling/native/piano-wifi-port.c` (built on the Mac: `clang -O2 -Wall -Wextra -I
+package/PianoWifi tooling/native/piano-wifi-port.c -o out/piano-wifi-port`) connects to the port as root, asks for the LINK
+message and prints every message by type, state, generation, length and handshake message number (nothing private), for
+`SECONDS` (default 300). It answers nothing; it is the boundary's first check and a skeleton for the client.
 
 ## 14. Level 6's message table
 
