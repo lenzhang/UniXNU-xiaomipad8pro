@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: UniXNU-piano
+Date: Sat, 14 Nov 2026 23:00:00 +0800
+Subject: [PATCH] k27: cs-native4k-skip accepts only the blobs it published (review M4)
+
+0067's cs_validate_hash accepted the 4 KiB pages of any native-4K blob without a table when
+cs-native4k-skip=1. Today only the skip's own blobs are table-less there, but a later path that
+published a blob without its table would have been accepted silently. The skip now marks the
+blob it publishes (csb_native4k_hash_count = (vm_size_t)-1, the table NULL / 0) and the fault
+path accepts unhashed only a marked blob; any other table-less blob is refused (tainted) as
+without 0067. With cs-native4k-skip=0 (the default) nothing changes.
+---
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -5894,6 +5894,12 @@
+  * Default 0: today's verification. One summary line, cs-native4k-skip-report seconds (default 120) after the first skip.
+  */
+ static TUNABLE(uint32_t, cs_native4k_skip, "cs-native4k-skip", 0);
++/*
++ * k27 0070 (review M4): a blob that cs-native4k-skip published without its table carries this mark in csb_native4k_hash_count
++ * (its table pointer and size stay NULL / 0), and cs_validate_hash accepts unhashed only such a blob: a table-less blob from any
++ * other path is refused as before 0067 (tainted), not accepted.
++ */
++#define CS_NATIVE4K_SKIP_PUBLISHED      ((vm_size_t)-1)
+ static TUNABLE(uint32_t, cs_native4k_skip_report_s, "cs-native4k-skip-report", 120);
+ uint64_t cs_native4k_skipped_blobs = 0, cs_native4k_skipped_bytes = 0, cs_native4k_skipped_pages = 0;
+ static uint32_t cs_native4k_skip_reported = 0;
+@@ -6098,6 +6104,9 @@
+ 	if (cs_native4k_skip) {
+ 		/* cs-native4k-skip=1: no table; cs_validate_hash accepts this signature's 4 KiB pages unhashed */
+ 		cs_native4k_note_skip(limit);
++		blob->csb_native4k_hashes = NULL;
++		blob->csb_native4k_hashes_size = 0;
++		blob->csb_native4k_hash_count = CS_NATIVE4K_SKIP_PUBLISHED;   /* k27 0070: published by the skip */
+ 		return 0;
+ 	}
+ 	count = (limit + PAGE_MASK) >> PAGE_SHIFT;
+@@ -6278,7 +6287,10 @@
+ 					return TRUE;
+ 				}
+ 				int skip_nx = 0;
+-				if (cs4k_skip_accepts(cs_native4k_skip, blob->csb_native4k_hashes != NULL, (uint64_t)offset,
++				/* k27 0070: only a blob the skip published (its mark) is table-less on purpose */
++				const int skip_published = blob->csb_native4k_hashes == NULL &&
++				    blob->csb_native4k_hash_count == CS_NATIVE4K_SKIP_PUBLISHED;
++				if (cs4k_skip_accepts(cs_native4k_skip, !skip_published, (uint64_t)offset,
+ 				    (uint64_t)codeLimit, &skip_nx)) {
+ 					/* cs-native4k-skip=1: published without a table (cs_native4k_prepare): accepted unhashed */
+ 					*bytes_processed = PAGE_SIZE;
+-- 
+2.39.0
+
