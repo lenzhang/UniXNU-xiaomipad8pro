@@ -1,0 +1,419 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: UniXNU-piano
+Date: Sat, 14 Nov 2026 20:30:00 +0800
+Subject: [PATCH] k27: cs-native4k-threads=N: the native 4K code-signing
+ pre-hash in parallel and in large reads
+
+On the 4 KiB-page native kernel ubc_cs_blob_add authenticates a 16 KiB-page signature up front
+(cs_native4k_prepare, XNU_NATIVE_CS_HASH_CACHE): the whole signed range read with vn_rdwr 16 KiB at
+a time, each block hashed against the signature and its four 4 KiB pages hashed again. dyld adds the
+shared cache's signatures before it maps the cache; 27.3's cache is 87 LZBITMAP-compressed files,
+6.9 GB of content in 2.4 GB: launchd spent ~37 s in this loop on one CPU, the disk idle 95 %.
+
+cs-native4k-threads=N (1..16, at most the CPUs): the caller and N-1 kernel threads claim chunks of
+cs-native4k-read-kib (default 1024) and read each with one vn_rdwr per buffer, verify every block and
+derive its 4 KiB digests into their slots (bsd/kern/cs_native4k_policy.h = UniXNU-piano's
+tooling/k27/cs-native4k/cs_native4k_policy.h, host-tested). The first error stops every participant
+and is returned; nothing is published until every helper has finished and none failed: the same
+table and the same refusals as the one-thread loop. The helpers read with the caller's credential
+while the caller holds the vnode's iocount and waits for them. Default (threads 1, no read size):
+the original loop, unchanged. cs-native4k-log=MiB: a console line per signature of at least that
+size (time, threads, read size, result, running totals); counters cs_native4k_prepare_count, _bytes,
+_ns for every signature.
+---
+ bsd/kern/cs_native4k_policy.h | new file
+ bsd/kern/ubc_subr.c           | the parallel pass, the tunables, the log
+ 2 files changed
+
+diff --git a/bsd/kern/cs_native4k_policy.h b/bsd/kern/cs_native4k_policy.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/kern/cs_native4k_policy.h
+@@ -0,0 +1,156 @@
++/*
++ * SPDX-License-Identifier: BSD-2-Clause-Patent
++ *
++ * cs_native4k_policy.h: the work split of k27 patch 0067's cs_native4k_prepare (bsd/kern/ubc_subr.c), the authentication of a
++ * 16 KiB-page code signature on the 4 KiB-page native kernel. Written for UniXNU-piano; the kernel carries this file unchanged as
++ * bsd/kern/cs_native4k_policy.h (tooling/k27/test-cs-native4k.sh checks the copy and runs the host test).
++ *
++ * The signed range [0, limit) is cut into chunks of `chunk` bytes (a multiple of 16 KiB, 1 MiB by default). Every participant (the
++ * caller and up to CS4K_MAX_THREADS - 1 helper threads) claims the next chunk with one atomic add and processes it alone: it reads the
++ * chunk in pieces of its buffer (one read per piece), verifies each 16 KiB block against the signature, then derives the block's
++ * 4 KiB page digests into their slots. Slots are indexed by page, so the order of chunks does not change the table. The first error
++ * any participant meets is kept (later ones are dropped) and makes every participant stop claiming; the caller publishes nothing
++ * unless no error was recorded, after every helper has finished. Nothing here allocates, locks or sleeps: the port supplies the
++ * read, the two digests and the atomics' memory (plain uint64_t / int words, accessed only with these functions).
++ */
++#ifndef CS_NATIVE4K_POLICY_H
++#define CS_NATIVE4K_POLICY_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#define CS4K_BLOCK          16384u
++#define CS4K_PAGE           4096u
++#define CS4K_MAX_THREADS    16u
++#define CS4K_DEFAULT_CHUNK  (1024u * 1024u)
++#define CS4K_MAX_CHUNK      (16u * 1024u * 1024u)
++
++/* The chunk (= the parallel path's read size) for cs-native4k-read-kib=K: whole 16 KiB blocks, 16 KiB .. 16 MiB; 0: 1 MiB. */
++static inline uint32_t
++cs4k_chunk_bytes(uint32_t read_kib)
++{
++	uint64_t bytes = read_kib ? (uint64_t)read_kib * 1024u : CS4K_DEFAULT_CHUNK;
++	if (bytes < CS4K_BLOCK) {
++		bytes = CS4K_BLOCK;
++	}
++	if (bytes > CS4K_MAX_CHUNK) {
++		bytes = CS4K_MAX_CHUNK;
++	}
++	return (uint32_t)(bytes & ~(uint64_t)(CS4K_BLOCK - 1));
++}
++
++static inline uint64_t
++cs4k_chunks(uint64_t limit, uint32_t chunk)
++{
++	return chunk ? (limit + chunk - 1) / chunk : 0;
++}
++
++/* Participants for cs-native4k-threads=T on ncpu CPUs: at least 1, at most T, CS4K_MAX_THREADS, ncpu (when known) and chunks. */
++static inline uint32_t
++cs4k_participants(uint32_t threads, uint32_t ncpu, uint64_t chunks)
++{
++	uint32_t n = threads ? threads : 1;
++	if (n > CS4K_MAX_THREADS) {
++		n = CS4K_MAX_THREADS;
++	}
++	if (ncpu && n > ncpu) {
++		n = ncpu;
++	}
++	if (n > chunks) {
++		n = (uint32_t)chunks;
++	}
++	return n ? n : 1;
++}
++
++/* Chunk i of [0, limit): [*offset, *offset + *length). */
++static inline void
++cs4k_chunk_range(uint64_t i, uint64_t limit, uint32_t chunk, uint64_t *offset, uint64_t *length)
++{
++	uint64_t start = i * (uint64_t)chunk;
++	*offset = start < limit ? start : limit;
++	*length = start < limit ? (limit - start < chunk ? limit - start : chunk) : 0;
++}
++
++/* The next chunk to process, or `chunks` when none is left or an error stopped the pass. */
++static inline uint64_t
++cs4k_claim(uint64_t *next, const int *error, uint64_t chunks)
++{
++	if (__atomic_load_n(error, __ATOMIC_ACQUIRE) != 0) {
++		return chunks;
++	}
++	uint64_t i = __atomic_fetch_add(next, 1, __ATOMIC_RELAXED);
++	return i < chunks ? i : chunks;
++}
++
++/* Keep the first error only. */
++static inline void
++cs4k_fail(int *error, int value)
++{
++	int none = 0;
++	if (value != 0) {
++		(void)__atomic_compare_exchange_n(error, &none, value, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
++	}
++}
++
++/*
++ * The port: read `length` bytes at signed-range offset `position` into `buffer` (0, or an errno: a short read is an error); verify
++ * the 16 KiB block `block` (its `length` bytes: 16 KiB, less for the last) against the signature (0, or an errno); derive the digest
++ * of 4 KiB page `page` (its `length` bytes) into its slot.
++ */
++struct cs4k_ops {
++	int (*read)(void *context, uint8_t *buffer, uint32_t length, uint64_t position);
++	int (*verify)(void *context, uint64_t block, const uint8_t *data, uint32_t length);
++	void (*derive)(void *context, uint64_t page, const uint8_t *data, uint32_t length);
++};
++
++/*
++ * One chunk [offset, offset + length) of [0, limit), through a buffer of `buffer_bytes` (a multiple of 16 KiB, at least one block):
++ * pieces read in order, each piece's blocks verified and split in order. Stops at the first error, or before the next piece once
++ * *error is set by another participant (then returns 0: that error is the pass's).
++ */
++static inline int
++cs4k_process_chunk(const struct cs4k_ops *ops, void *context, uint64_t offset, uint64_t length, uint64_t limit, uint8_t *buffer,
++    uint32_t buffer_bytes, const int *error)
++{
++	if (buffer_bytes < CS4K_BLOCK || (buffer_bytes % CS4K_BLOCK) || (offset % CS4K_BLOCK) || offset + length > limit) {
++		return 22; /* EINVAL */
++	}
++	for (uint64_t done = 0; done < length;) {
++		if (__atomic_load_n(error, __ATOMIC_ACQUIRE) != 0) {
++			return 0;
++		}
++		uint64_t position = offset + done;
++		uint32_t piece = (uint32_t)(length - done < buffer_bytes ? length - done : buffer_bytes);
++		int status = ops->read(context, buffer, piece, position);
++		if (status != 0) {
++			return status;
++		}
++		for (uint32_t at = 0; at < piece; at += CS4K_BLOCK) {
++			uint32_t block_bytes = piece - at < CS4K_BLOCK ? piece - at : CS4K_BLOCK;
++			status = ops->verify(context, (position + at) / CS4K_BLOCK, buffer + at, block_bytes);
++			if (status != 0) {
++				return status;
++			}
++			for (uint32_t sub = 0; sub < block_bytes; sub += CS4K_PAGE) {
++				uint32_t page_bytes = block_bytes - sub < CS4K_PAGE ? block_bytes - sub : CS4K_PAGE;
++				ops->derive(context, (position + at + sub) / CS4K_PAGE, buffer + at + sub, page_bytes);
++			}
++		}
++		done += piece;
++	}
++	return 0;
++}
++
++/* A participant's whole share: claim chunks until none is left or the pass stopped; its error goes to *error. */
++static inline void
++cs4k_participate(const struct cs4k_ops *ops, void *context, uint64_t limit, uint32_t chunk, uint64_t chunks, uint64_t *next,
++    int *error, uint8_t *buffer, uint32_t buffer_bytes)
++{
++	for (uint64_t i; (i = cs4k_claim(next, error, chunks)) < chunks;) {
++		uint64_t offset, length;
++		cs4k_chunk_range(i, limit, chunk, &offset, &length);
++		cs4k_fail(error, cs4k_process_chunk(ops, context, offset, length, limit, buffer, buffer_bytes, error));
++	}
++}
++
++#endif /* CS_NATIVE4K_POLICY_H */
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -106,6 +106,10 @@
+ static kern_return_t ubc_cs_convert_to_multilevel_hash(struct cs_blob *blob);
+ #if defined(XNU_NATIVE_CS_HASH_CACHE) && XNU_NATIVE_CS_HASH_CACHE
+ #include <mach/mach_vm.h>   /* mach_vm_protect */
++#include <kern/startup.h>   /* TUNABLE: k27 0067's cs-native4k-* */
++#include <machine/machine_routines.h>   /* ml_get_max_cpu_number */
++#include <mach/thread_act.h>   /* thread_terminate */
++#include "cs_native4k_policy.h"
+ static int cs_native4k_prepare(vnode_t vp, struct cs_blob *blob);
+ #endif
+ 
+@@ -5864,7 +5868,159 @@
+ unsigned long cs_native4k_full_blocks = 0;
+ unsigned long cs_native4k_page_checks = 0;
+ unsigned long cs_native4k_ready_blobs = 0;
++
++/*
++ * k27 0067 (UniXNU-piano, 2026-11-14): the pass below in parallel and in large reads. On piano's 4 KiB pages the dyld shared cache's
++ * signatures (6.9 GB of LZBITMAP-compressed files in 27.3) made launchd read, decompress and hash it in 16 KiB vn_rdwr calls on one
++ * CPU for ~37 s before `dyld cache mapped`. cs-native4k-threads=N (1..16, at most the CPUs): the caller and N-1 helper threads claim
++ * chunks of cs-native4k-read-kib (default 1024) and read each with one vn_rdwr per buffer, verify every 16 KiB block against the
++ * signature and derive its 4 KiB digests into their slots (cs_native4k_policy.h, host-tested: tooling/k27/test-cs-native4k.sh).
++ * The first error stops the pass and is returned; nothing is published until every helper has finished and no error was recorded,
++ * so the result is the one-thread pass's (the same table, the same refusals). cs-native4k-threads=1 and no read size (the default):
++ * the original loop, unchanged. cs-native4k-log=MiB: one console line per signature of at least that many MiB (its time, threads,
++ * read size, result) with running totals; 0 (default) logs nothing.
++ */
++static TUNABLE(uint32_t, cs_native4k_threads, "cs-native4k-threads", 1);
++static TUNABLE(uint32_t, cs_native4k_read_kib, "cs-native4k-read-kib", 0);
++static TUNABLE(uint32_t, cs_native4k_log_mib, "cs-native4k-log", 0);
++uint64_t cs_native4k_prepare_count = 0, cs_native4k_prepare_bytes = 0, cs_native4k_prepare_ns = 0;
++
++struct cs4k_job {
++	vnode_t vp;
++	kauth_cred_t cred;
++	proc_t proc;
++	const CS_CodeDirectory *cd;
++	const struct cs_hash *md;
++	const char *lower, *upper;
++	off_t base;
++	uint64_t limit;
++	uint32_t chunk;
++	uint64_t chunks;
++	vm_offset_t storage;
++	uint64_t next;          /* the next chunk to claim (cs4k_claim) */
++	int error;              /* the first error (cs4k_fail) */
++	uint32_t active;        /* helpers still running */
++};
+ 
++static int
++cs4k_read(void *context, uint8_t *buffer, uint32_t length, uint64_t position)
++{
++	struct cs4k_job *job = context;
++	off_t at;
++	int resid = 0, error;
++	if (os_add_overflow(job->base, (off_t)position, &at)) {
++		return EOVERFLOW;
++	}
++	error = vn_rdwr(UIO_READ, job->vp, (caddr_t)buffer, (int)length, at, UIO_SYSSPACE, 0, job->cred, &resid, job->proc);
++	return error ? error : (resid ? EIO : 0);
++}
++
++static int
++cs4k_verify(void *context, uint64_t block, const uint8_t *data, uint32_t length)
++{
++	struct cs4k_job *job = context;
++	union cs_hash_union ctx;
++	uint8_t digest[CS_HASH_MAX_SIZE];
++	const uint8_t *expected = hashes(job->cd, (uint32_t)block, job->md->cs_size, job->lower, job->upper);
++	if (expected == NULL) {
++		return EBADEXEC;
++	}
++	job->md->cs_init(&ctx);
++	job->md->cs_update(&ctx, data, length);
++	job->md->cs_final(digest, &ctx);
++	if (bcmp(expected, digest, job->md->cs_size)) {
++		os_atomic_inc(&cs_validate_page_bad_hash, relaxed);
++		return EBADEXEC;
++	}
++	os_atomic_inc(&cs_native4k_full_blocks, relaxed);
++	return 0;
++}
++
++static void
++cs4k_derive(void *context, uint64_t page, const uint8_t *data, uint32_t length)
++{
++	struct cs4k_job *job = context;
++	union cs_hash_union ctx;
++	uint8_t digest[CS_HASH_MAX_SIZE];
++	job->md->cs_init(&ctx);
++	job->md->cs_update(&ctx, data, length);
++	job->md->cs_final(digest, &ctx);
++	memcpy((void *)(job->storage + page * job->md->cs_size), digest, job->md->cs_size);
++}
++
++static const struct cs4k_ops cs4k_ops = { cs4k_read, cs4k_verify, cs4k_derive };
++
++/*
++ * A participant with its own buffer (a chunk; a block when that allocation fails): its share of the chunks. A helper without any
++ * buffer just does not take part (the others claim its share); only the caller without one fails the pass.
++ */
++static void
++cs4k_share(struct cs4k_job *job, bool caller)
++{
++	uint32_t bytes = job->chunk;
++	uint8_t *buffer = kalloc_data(bytes, Z_WAITOK);
++	if (buffer == NULL) {
++		bytes = CS4K_BLOCK;
++		buffer = kalloc_data(bytes, Z_WAITOK);
++	}
++	if (buffer == NULL) {
++		if (caller) {
++			cs4k_fail(&job->error, ENOMEM);
++		}
++		return;
++	}
++	cs4k_participate(&cs4k_ops, job, job->limit, job->chunk, job->chunks, &job->next, &job->error, buffer, bytes);
++	kfree_data(buffer, bytes);
++}
++
++static void
++cs4k_helper(void *arg, __unused wait_result_t wr)
++{
++	struct cs4k_job *job = arg;
++	cs4k_share(job, false);
++	/* the last access to the job (on the caller's stack): the caller may return as soon as active reaches 0 */
++	if (os_atomic_dec(&job->active, release) == 0) {
++		thread_wakeup((event_t)&job->active);
++	}
++	thread_terminate(current_thread());
++	/* NOTREACHED */
++}
++
++/* The parallel pass over [0, limit) into storage; 0 or the first error. *participants: how many took part. */
++static int
++cs4k_prepare_parallel(vnode_t vp, struct cs_blob *blob, vm_offset_t storage, uint64_t limit, uint32_t *participants)
++{
++	struct cs4k_job job = {
++		.vp = vp, .cred = vfs_context_ucred(vfs_context_current()), .proc = current_proc(),
++		.cd = blob->csb_cd, .md = blob->csb_hashtype, .lower = blob->csb_mem_kaddr,
++		.upper = (const char *)blob->csb_mem_kaddr + blob->csb_mem_size, .base = blob->csb_base_offset, .limit = limit,
++		.chunk = cs4k_chunk_bytes(cs_native4k_read_kib), .storage = storage,
++	};
++	job.chunks = cs4k_chunks(limit, job.chunk);
++	uint32_t n = cs4k_participants(cs_native4k_threads, (uint32_t)ml_get_max_cpu_number() + 1, job.chunks);
++	*participants = 1;
++	for (uint32_t i = 1; i < n; i++) {
++		thread_t helper = THREAD_NULL;
++		os_atomic_inc(&job.active, relaxed);
++		if (kernel_thread_start(cs4k_helper, &job, &helper) != KERN_SUCCESS) {
++			os_atomic_dec(&job.active, relaxed);
++			break;
++		}
++		thread_deallocate(helper);
++		(*participants)++;
++	}
++	cs4k_share(&job, true);
++	while (os_atomic_load(&job.active, acquire) != 0) {
++		assert_wait((event_t)&job.active, THREAD_UNINT);
++		if (os_atomic_load(&job.active, acquire) == 0) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			break;
++		}
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	return os_atomic_load(&job.error, acquire);
++}
++
+ /* The original signed 16K hash authenticates the whole immutable input
+  * buffer first. Only then derive native-page digests from that same buffer.
+  * Publish nothing until every original block has passed, and make the
+@@ -5910,6 +6066,16 @@
+ 	if (kr != KERN_SUCCESS) {
+ 		return ENOMEM;
+ 	}
++	const uint64_t started = mach_absolute_time();
++	uint32_t participants = 1;
++	const bool parallel = cs_native4k_threads > 1 || cs_native4k_read_kib != 0;
++	if (parallel) {
++		/* k27 0067: the same pass, in parallel and in large reads (above); its result is the loop's below */
++		error = cs4k_prepare_parallel(vp, blob, storage, limit, &participants);
++		if (error) {
++			goto out;
++		}
++	} else {
+ 	buffer = kalloc_data(16384, Z_WAITOK);
+ 	for (offset = 0; offset < limit; offset += 16384) {
+ 		union cs_hash_union ctx;
+@@ -5954,6 +6120,7 @@
+ 			memcpy((void *)(storage + index * md->cs_size), digest, md->cs_size);
+ 		}
+ 	}
++	}
+ 	kr = mach_vm_protect(kernel_map, storage, allocation, TRUE, VM_PROT_READ);
+ 	if (kr != KERN_SUCCESS) {
+ 		error = EPERM;
+@@ -5966,9 +6133,27 @@
+ 	os_atomic_inc(&cs_native4k_ready_blobs, relaxed);
+ 	error = 0;
+ out:
+-	kfree_data(buffer, 16384);
++	if (buffer) {
++		kfree_data(buffer, 16384);
++	}
+ 	if (storage) {
+ 		kmem_free(kernel_map, storage, allocation);
++	}
++	{
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - started, &ns);
++		os_atomic_inc(&cs_native4k_prepare_count, relaxed);
++		os_atomic_add(&cs_native4k_prepare_bytes, limit, relaxed);
++		os_atomic_add(&cs_native4k_prepare_ns, ns, relaxed);
++		if (cs_native4k_log_mib && limit >= (uint64_t)cs_native4k_log_mib << 20) {
++			const char *name = vnode_getname_printable(vp);
++			printf("cs_native4k: %s: %llu KiB (%llu blocks) in %llu ms, %u thread%s, %u KiB reads: %s %d; total %llu signatures, "
++			    "%llu MiB, %llu ms\n", name, limit >> 10, (limit + 16383) >> 14, ns / 1000000, participants,
++			    participants == 1 ? "" : "s", parallel ? cs4k_chunk_bytes(cs_native4k_read_kib) >> 10 : 16,
++			    error ? "error" : "ok", error, os_atomic_load(&cs_native4k_prepare_count, relaxed),
++			    os_atomic_load(&cs_native4k_prepare_bytes, relaxed) >> 20, os_atomic_load(&cs_native4k_prepare_ns, relaxed) / 1000000);
++			vnode_putname_printable(name);
++		}
+ 	}
+ 	return error;
+ }
+-- 
+2.39.0
+

@@ -8,7 +8,8 @@
 # The kernel is the k27 tree's source (xnu-12377 + 0001-0052 + patches/k27 0053-...) with patches/k273 on top (the 27.3 line's
 # kernel series: patches/k273/README.md), linked at the 27.3 collection's addresses; the kernel file is named after the k27 tag and
 # the k273 series' last patch (kernel-k273-0065-s0001-native.macho). The clone's first build recompiles everything once (its objects'
-# recipes name the other tree's paths), a few minutes.
+# recipes name the other tree's paths), a few minutes. patches/k27 patches past the configured tree's series (K27_TREE_TOP, 0066)
+# are applied to the clone too, after patches/k273, and then name the kernel (0067: kernel-k273-0067-s0001-native.macho).
 set -euo pipefail
 D=$(cd "$(dirname "$0")/../.." && pwd); cd "$D"
 . "$D/tooling/k27/k27-tree.sh"
@@ -40,8 +41,23 @@ for p in "$D"/patches/k273/*.patch; do
   [ -e "$p" ] || continue
   n=$(basename "$p" .patch)
   if git -C "$T/out/k27/xnu" log --format=%s | grep -qxF "k273 $n"; then echo "$n: applied already"
+  elif git -C "$T/out/k27/xnu" apply --reverse --check "$p" 2> /dev/null; then echo "$n: in the source already (not committed)"
   else git -C "$T/out/k27/xnu" apply "$p" && git -C "$T/out/k27/xnu" add -A && git -C "$T/out/k27/xnu" commit -q -m "k273 $n" && echo "applied $n"; fi
   SERIES=-s${n%%-*}
+done
+# patches/k27 newer than the configured k27 tree carries (K27_TREE_TOP, default 0066: its series ends there), each committed in the
+# clone as "k27 NAME" (a source that already has it, committed or not, is left as it is): a new patches/k27 patch reaches the 27.3
+# kernel without the configured tree being changed. The kernel is then named after the newest (kernel-k273-0067-s0001-native.macho);
+# the layout below still measures the k27 kernel of TAG.
+KTAG=$TAG
+for p in "$D"/patches/k27/0*.patch; do
+  [ -e "$p" ] || continue
+  n=$(basename "$p" .patch); num=${n%%-*}
+  [ "$((10#$num))" -gt "$((10#${K27_TREE_TOP:-0066}))" ] || continue
+  if git -C "$T/out/k27/xnu" log --format=%s | grep -qxF "k27 $n"; then echo "$num: applied already"
+  elif git -C "$T/out/k27/xnu" apply --reverse --check "$p" 2> /dev/null; then echo "$num: in the source already (not committed)"
+  else git -C "$T/out/k27/xnu" apply "$p" && git -C "$T/out/k27/xnu" add -A && git -C "$T/out/k27/xnu" commit -q -m "k27 $n" && echo "applied $num"; fi
+  KTAG=$num
 done
 cd "$T"
 python3 k27/kc27-layout.py "$KC" "out/k27/kernel-k27-$TAG-native.macho" --natives "$D/tooling/k27/kext" --write k27/segaddrs.sh
@@ -49,6 +65,6 @@ OBJ=out/x12377/build/xnu/k27-native-obj/DEVELOPMENT_ARM64_BCM2837
 rm -rf "$OBJ"/mach.development.bcm2837 "$OBJ"/mach.development.bcm2837.ctf "$OBJ"/mach.development.bcm2837.unstripped \
   "$OBJ"/mach.development.bcm2837.unstripped.noctf "$OBJ"/mach.development.bcm2837.dSYM
 K27_VARIANT=native ./build-k27-piano.sh > "$D/out/k273/kernel-relink.log" 2>&1 || { tail -20 "$D/out/k273/kernel-relink.log"; exit 1; }
-cp "$OBJ/mach.development.bcm2837.unstripped.noctf" "out/k27/kernel-k273-$TAG$SERIES-native.macho"
-python3 k27/kc27-layout.py "$KC" "out/k27/kernel-k273-$TAG$SERIES-native.macho" --natives "$D/tooling/k27/kext" | tail -1
-echo "$T/out/k27/kernel-k273-$TAG$SERIES-native.macho"
+cp "$OBJ/mach.development.bcm2837.unstripped.noctf" "out/k27/kernel-k273-$KTAG$SERIES-native.macho"
+python3 k27/kc27-layout.py "$KC" "out/k27/kernel-k273-$KTAG$SERIES-native.macho" --natives "$D/tooling/k27/kext" | tail -1
+echo "$T/out/k27/kernel-k273-$KTAG$SERIES-native.macho"

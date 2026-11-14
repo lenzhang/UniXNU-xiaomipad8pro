@@ -316,14 +316,30 @@ split per task, the hottest kernel pcs, launchd's threads and their kernel stack
 `tooling/native/pc-sample-symbolize.py LOG --kc out/k273-ufs3/kernel.macho --kernel <the 0066 kernel>
 --natives out/k273-ufs3/kernel.macho.natives.json` names the pcs (kernel symbols, kext + offset, `[sha256 insns]`).
 
-**Fixes, in order (each needs a k27 patch; none built yet):**
-1. `cs_native4k_prepare` in parallel and in large reads: split the signed range over N kernel threads (6 of 8 CPUs), each reading
-   1 MiB per `vn_rdwr` (decmpfs serves concurrent readers of one file: shared lock), verifying its 16 KiB blocks and filling its
-   part of the 4 KiB table; publish only after every block passed, as now. Same security; inferred ~37 s -> ~7-10 s (the disk
-   has 15x headroom).
-2. Validate lazily as a 16 KiB kernel does: at a fault, hash the 16 KiB block from its four resident 4 KiB pages (page-in clusters
-   are 16 KiB aligned), no vnode I/O under the object lock; the eager pass only for what is not resident. Saves the whole stretch
-   and the same cost at every exec after launchd (every Apple binary's signature is pre-hashed at exec too). Larger change.
+**Fixes, in order:**
+1. **Built: k27 0067, `cs-native4k-threads=N`** (`patches/k27/0067-*`, `patches/k27/README.md`): `cs_native4k_prepare` on the
+   caller and N-1 kernel threads, each claiming 1 MiB chunks (`cs-native4k-read-kib`) and reading each with one `vn_rdwr` (decmpfs
+   serves concurrent readers of one file: its compressed-data lock is taken shared), verifying the chunk's 16 KiB blocks and
+   filling their 4 KiB slots; the first error stops everyone and is returned; publication only after every helper finished without
+   error, as before. Default 1: the original loop. `cs-native4k-log=MiB` logs each signature's time. The work split is host-tested
+   with real threads (`tooling/k27/test-cs-native4k.sh`: the same table as one thread for 1-16 threads, every block verified once,
+   bad blocks and read errors fail the pass; plain, ASan/UBSan, TSan). Inferred ~37 s -> ~7-10 s with 6 threads (decompression and
+   hashing spread over the CPUs; the disk has 15x headroom). Probe ufs4 (`private/host-checks/20261114-ufs1/CHECKLIST-ufs4.txt`).
+2. **Design note only: validate lazily, per 16 KiB block, at fault time** (what a 16 KiB-page kernel does per page). Today the 4 KiB
+   table must exist before the signature is published because the fault path (`vm_fault_enter` -> `vm_page_validate_cs` ->
+   `cs_validate_hash`) runs with the VM object locked and the page busy, where no vnode I/O is allowed. The lazy form:
+   - publish the signature with no table; `cs_validate_hash` for a 4 KiB page P looks up P's three siblings of its 16 KiB block
+     in the same VM object; when all are resident and not busy, map them, hash the 16 KiB against the signature and mark the block
+     validated (a per-blob bitmap, written once, read without locks), then answer P from that;
+   - make the vnode pager's page-ins 16 KiB aligned and at least 16 KiB (the cluster already is for sequential reads), so P's
+     siblings arrive with P in one UPL and are resident when P is validated;
+   - when a sibling is missing (reclaimed between page-in and validation), never taint P: return a retry to `vm_fault` (it already
+     restarts faults after dropping its locks), read the 16 KiB block through `vn_rdwr` outside the object lock into a private
+     buffer, verify it, set the block's bit, and retry the fault.
+   It removes the whole eager pass (the ~37 s stretch, and the same pre-hash at every exec after launchd: every Apple binary's
+   signature is authenticated when it is added): only touched blocks are decompressed and hashed, at their first fault. Risks:
+   vm_fault's busy-page and lock ordering, the pageout race on siblings, a page modified through write() on a writable volume
+   (the 16 KiB kernels' tainting rules apply per block). A larger change, after 0067's numbers.
 3. Not an option without the owner: skipping the verification, or a cross-boot cache of derived hashes on the writable Data volume.
 
 `native-ufs-fast` alone gave ~3 s (dyld mapped at iolog 36 vs 39, `Early boot complete` T 38.7 vs 41.8 s) and nothing after
