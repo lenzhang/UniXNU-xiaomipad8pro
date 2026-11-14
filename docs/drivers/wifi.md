@@ -1350,6 +1350,29 @@ is then en0 with `...:01`; 10n's is found by `...:04`).
 | the run's end (`reset fastboot`) | `PianoWifi: halt watch: armed ...`, then at +8 s and +20 s `PianoWifi: halt watch +8 s: the halt has not ended; N service(s) with the shutdown not acknowledged: ...` and `PianoWifi: halt watch +8 s: N of M power-plane service(s) with a power change in progress: NAME (ID, state S), ...` | the names of what holds the halt |
 | 10n-en0 only, PianoWifiEthernet's start | as 10m-en0's (`en0: before the stand-down ...`, `the interface is detached`, `free after N ms`, the publish line `primary (en0 was freed)`), and later no `PianoNullEthernet: en0 (built-in ...)` line again (or `PianoNullEthernet: not started again: en0 is Wi-Fi's for this boot`) | `ifconfig -a`: en0 is ours (`...:01`), en1; the network checks on en0 |
 
+**The review of 2026-11-14 (`private/host-checks/20261114-flash/review-wifi.md`), what changed (10o):** F1, the park handshake
+is the number of the sleep the ladder parked for (it only grows: no 1 that a wake clears before the hook sees it), and the
+hook touches nothing when the sleep's wake has come already (inferred: the power manager's serialization made the race hard to
+reach, the change makes it impossible); F2, the profile file is read again on a changed stamp (above, §13.2); F3, the newline
+rule in both readers; F4, `stopRadio` leaves a radio the ladder's thread still owns to it, which powers it down when its
+teardown ends (and a level 6 teardown runs once); F5, the rejoin's back-off grows past 60 s to 2 and then 5 minutes (it never
+gives up: a network switched off for the night is joined again when it is back); F6, no pass begins after a shutdown that came
+with a wake; F7, the supplicant says `an EAPOL frame came, but there is no usable join profile` and reads it again then.
+
+**Boots 10o and 10o-en0** (built 2026-11-14 from branch commit `e673bc8` (main merged), collection `9357cc35...`, the installed v5 recipe:
+the v5 entry's line and tail without `piano-boot-args` and `data-store-lba`, `data-persist=0`, `piano-wifi-l8status=5000`, the
+v2 seed and the v4 layer's trust cache; each 237281280 bytes, `verify-ram-images.py` PASS: `out/ram-k273-wifi-10o` sha256 `3a8bc1aea5c1a977eacdbe067bb97975c19bead20a3f7fd4a7f19f117f800d5e`,
+`out/ram-k273-wifi-10o-en0` sha256 `2f85caf6b1662ed9e7b52b2603e7cc8200d74867318c8704e9ca4e3b23d2ecaa`). Arguments added: 10n's tests (`piano-wifi-droptest=90 piano-sleep=1
+piano-sleep-test=420 piano-sleep-max=60 piano-wifi-crashtest=120`, `piano-reset-after=1200`); 10o-en0 `piano-wifi-en0=1`. The
+supplicant of this commit for the run: sha256 `a20aac1ab2ea354d...` (built as `configs/userland.toml` builds it). Checklist: 10n's, and:
+
+| When | Line / command | Expected |
+|---|---|---|
+| the first join | `join profile read from its root-only file (while the join waits, generation 1) ...` (the profile placed after the boot) | — |
+| port open + about 30 s (before the drop test) | the profile placed again the same way (`wifi-profile-place.sh`: a new file); at the drop test's rejoin `join profile: its root-only file was replaced or touched (before the rejoin), the same profile as before (generation 1 kept)` | the rejoin's handshake as before |
+| the sleep | `PianoWifi: power: the radio is parked for system sleep 1 (N ms after the sleep's stop)` | no `did not park` and no `has woken before the ladder parked` |
+| the run's end | the halt watch's lines (10n); `shutdown: stopping the radio (the ladder's thread is done)` | — |
+
 **10k-en0** (the same collection, 10i's arguments and `piano-wifi-en0=1`, no tests): `PianoWifiEthernet: en0: PianoNullEthernet
 is asked to stand down (piano-wifi-en0=1)`, `en0: free after N ms`, at the link's up `en0 (attached to the network stack) ...
 (up 1, running 1)`, `ifconfig -a` en0 (`...:01`, ours) and en1 only, DHCP and ping on en0; the desktop and the USB shell stay up.
@@ -2029,6 +2052,16 @@ owner has to answer (the last paragraph).
    # optional: bssid=<the access point's address, aa:bb:cc:dd:ee:ff>
    # optional: mac=<the station's own address, locally administered: 02:…>
    ```
+
+   **Writing it (2026-11-14, after the review of that day):** every line ends with a newline, the last one too — a file whose
+   last line has none is refused by both readers (the kext's and the supplicant's) as a file still being written, so that a
+   passphrase cut short is never taken. Replace the file with a temporary one and `rename(2)` it into place (`mv`, or
+   `install -S`), never by rewriting it where it is. The kext reads the file again whenever its stamp (inode, size,
+   modification and change time) differs from its last read — at each join, at a restart's first join, and while a join waits
+   — and logs `join profile changed: read again from its root-only file (...)` (lengths only) when its content changed, or
+   `its root-only file was replaced or touched (...), the same profile as before`; a profile that came from the file is dropped
+   when the file is gone. The supplicant reads it at each association as well, so a new passphrase reaches both at the next
+   join.
 
    Nothing reads the profile yet: level 7's step machine is the next piece, and it waits for level 6 to deliver beacons
    (P23).
