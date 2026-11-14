@@ -362,8 +362,11 @@ bool PianoWifiEthernet::takeOverEn0()
 bool PianoWifiEthernet::start(IOService *provider)
 {
   if (!IOEthernetController::start(provider)) return false;
-  uint32_t takeEn0 = 0;
-  if (!PE_parse_boot_argn("piano-wifi-en0", &takeEn0, sizeof takeEn0)) takeEn0 = 0;
+  // piano-wifi-en0: by default at level 8 (piano-wifi=8, since boot 10o-en0) this interface takes en0 over from
+  // PianoNullEthernet; the same default as PianoWifi's, whose station takes the null's address for it.
+  uint32_t level = 0, takeEn0 = 0;
+  if (!PE_parse_boot_argn("piano-wifi", &level, sizeof level)) level = 0;
+  if (!PE_parse_boot_argn("piano-wifi-en0", &takeEn0, sizeof takeEn0)) takeEn0 = level >= 8 ? 1 : 0;
   fTakeEn0 = takeEn0 != 0;
   // PianoWifi is the service that published the resource this driver matched: its properties are the scan's.
   OSDictionary *matching = IOService::serviceMatching("PianoWifi");

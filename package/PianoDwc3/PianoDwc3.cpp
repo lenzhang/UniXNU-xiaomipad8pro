@@ -719,7 +719,13 @@ void execute(const char *line)
     }
     cprintf("restarting\n");
     IOSleep(200);
-    PEHaltRestart(kPERestartCPU);
+    // Every reboot of the 27.3 line ends in IOPlatformExpert's "Halt/Restart Timed Out" panic 30 s later, and PianoWifi's halt
+    // watch saw no driver and no power change holding it: whether PEHaltRestart returns at all (the notifications done and the
+    // platform's restart not taken) or stays inside them is what this line tells.
+    const uint64_t began = nowNs();
+    const int rc = PEHaltRestart(kPERestartCPU);
+    IOLog("PianoDwc3: reset: PEHaltRestart returned %d after %llu ms: the shutdown notifications are done and the platform did "
+          "not restart\n", rc, (unsigned long long)((nowNs() - began) / 1000000ull));
   } else if (word(s, "panic")) {
     panic("PianoDwc3: panic requested on the USB console");
   } else if (*s) {

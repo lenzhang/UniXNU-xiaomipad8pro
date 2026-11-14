@@ -129,7 +129,7 @@ struct Args {
   uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step, l7file, l7cands;
   uint32_t l8, l8status, l8blocks, l8tracems;
   uint32_t sleepOff, rejoin, dropTest, clientWaitMs;
-  uint32_t restart, restartCap, crashTest, fastRestart, haltWatch;
+  uint32_t restart, restartCap, crashTest, fastRestart, haltWatch, en0;
 };
 Args gArgs;
 
@@ -296,6 +296,9 @@ void readArgs()
   // +8 s and +20 s the services whose shutdown is not acknowledged yet and those with a power change in progress: macOS's own
   // "Halt/Restart Timed Out" (30 s, every reboot of the 27.3 line, with or without this driver) names nothing.
   gArgs.haltWatch = bootArg("piano-wifi-haltwatch", 1);
+  // piano-wifi-en0 (default 1 at level 8 since boot 10o-en0, 0 below): the station takes PianoNullEthernet's address and
+  // PianoWifiEthernet its en0 (the null stands down); 0 keeps Wi-Fi a second interface of its own address (en2).
+  gArgs.en0 = bootArg("piano-wifi-en0", gArgs.level >= 8 ? 1 : 0);
   if (gArgs.sleepOff == 2 && !(gArgs.level >= 8 && gArgs.restart)) gArgs.sleepOff = 1;   // no restart: nothing brings it back
 }
 
@@ -2389,7 +2392,13 @@ bool startChannel(uint32_t channel)
          gIpcr.error ? gIpcr.error : "a command is in flight");
     return false;
   }
-  const uint64_t deadline = nowMs() + kMhiCommandTimeoutMs;
+  // Boot 10o's first pass: channel 20's start got no completion in 2 s (once in about 20 boots; the restart's pass then started
+  // it in 4 ms) and the pass was lost. The command ring's and the event rings' doorbells are rung again at 250 and 1000 ms, as
+  // the MHI host does at an M0 (a doorbell the device missed while it settled into mission mode is then seen); a start that
+  // still gets nothing leaves the rings' state in the log.
+  using namespace ipcrdetail;
+  const uint64_t began = nowMs(), deadline = began + kMhiCommandTimeoutMs;
+  unsigned rerings = 0;
   while (nowMs() < deadline && !levelLate()) {
     bool stop = false;
     pump(stop);
@@ -2397,14 +2406,36 @@ bool startChannel(uint32_t channel)
       note("level 5: the chip died while channel %u was being started", channel);
       return false;
     }
-    if ((channel == kChanIpcrOut && gIpcr.started[0]) || (channel == kChanIpcrIn && gIpcr.started[1])) return true;
+    if ((channel == kChanIpcrOut && gIpcr.started[0]) || (channel == kChanIpcrIn && gIpcr.started[1])) {
+      if (rerings)
+        note("level 5: channel %u started %llu ms after its command, %u ring(s) of the doorbells later", channel,
+             (unsigned long long)(nowMs() - began), rerings);
+      return true;
+    }
     if (gIpcr.commandErrors) {
       note("level 5: the chip refused to start channel %u (completion code %#x)", channel, gIpcr.lastCode);
       return false;
     }
+    const uint64_t at = nowMs() - began;
+    if ((rerings == 0 && at >= 250) || (rerings == 1 && at >= 1000)) {
+      ++rerings;
+      const unsigned rung = ipcrRingAll(gIpcr, gContexts, gMhiIo);
+      note("level 5: no completion yet for the start of channel %u after %llu ms: %u doorbell(s) rung again (MHI state %#x, "
+           "the command ring: the chip read to %#llx, written to %#llx)",
+           channel, (unsigned long long)at, rung, mhiStateRead(gBoot), (unsigned long long)get64(gIpcr.cmd.ctx + kChanRp),
+           (unsigned long long)get64(gIpcr.cmd.ctx + kChanWp));
+    }
     IOSleep(2);
   }
-  note("level 5: no completion for the start of channel %u within %u ms", channel, kMhiCommandTimeoutMs);
+  {
+    uint8_t *ev = mhiEventCtx(gContexts, 0);
+    note("level 5: no completion for the start of channel %u within %u ms (MHI state %#x, EE %s; the command ring: the chip read "
+         "to %#llx, written to %#llx, element %#llx waiting; the control event ring: read to %#llx, written to %#llx)",
+         channel, kMhiCommandTimeoutMs, mhiStateRead(gBoot), mhiEeName(mhiEeRead(gBoot)),
+         (unsigned long long)get64(gIpcr.cmd.ctx + kChanRp), (unsigned long long)get64(gIpcr.cmd.ctx + kChanWp),
+         (unsigned long long)gIpcr.cmdPending, (unsigned long long)(ev ? get64(ev + 28) : 0),
+         (unsigned long long)(ev ? get64(ev + 36) : 0));
+  }
   return false;
 }
 
@@ -2663,6 +2694,8 @@ struct PassEnd {
   bool failed = false;        // that level failed
   bool opened = false;        // the port opened on this pass (Wi-Fi was back)
   bool fast = false;          // a restart's fast join: no scan, the last network directly (piano-wifi-fastrestart)
+  uint64_t profileAt = 0;     // when the join profile was handed to this pass's first join (boot 10o: a restart's "Wi-Fi is
+                              // back after 103 s" was the wait for a profile placed after the boot)
 };
 PassEnd gPass;
 bool gFastNext;               // the next pass is a fast one (restartWait decides)
@@ -2865,7 +2898,7 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
     note("level 6: a fast restart: no scan (the last network is joined directly; piano-wifi-fastrestart=0 scans as the boot)");
   if (gArgs.level >= 7) options.ownMacSet = profileOwnMac(options.ownMac);
   // piano-wifi-en0=1: the station takes PianoNullEthernet's address, as PianoWifiEthernet then takes over its en0.
-  if (!options.ownMacSet && bootArg("piano-wifi-en0", 0)) {
+  if (!options.ownMacSet && gArgs.en0) {
     const uint8_t en0[6] = {0x02, 0x50, 0x49, 0x41, 0x4e, 0x01};
     for (unsigned i = 0; i < 6; ++i) options.ownMac[i] = en0[i];
     options.ownMacSet = true;
@@ -4359,8 +4392,12 @@ __attribute__((noinline)) void restartTurn(IOService *owner, uint64_t now, uint6
     gLastNet = gSta.choice.net;   // the next fast restart joins it directly
     gLastNetValid = true;
     if (e.pass > 1) {
-      note("restart %u (%s): Wi-Fi is back: the port opened %llu ms after the restart began (pass %u)", gRestarts, gRestartWhy,
-           (unsigned long long)(now - gRestartBegan), e.pass);
+      const uint64_t profileWait = e.profileAt > gRestartBegan + 1000 ? e.profileAt - gRestartBegan : 0;
+      char waited[96] = "";
+      if (profileWait)
+        snprintf(waited, sizeof waited, "; the join profile came only %llu ms after it began", (unsigned long long)profileWait);
+      note("restart %u (%s): Wi-Fi is back: the port opened %llu ms after the restart began (pass %u%s)", gRestarts, gRestartWhy,
+           (unsigned long long)(now - gRestartBegan), e.pass, waited);
       char line[200];
       snprintf(line, sizeof line, "restart %u (%s): the port opened %llu ms after it began", gRestarts, gRestartWhy,
                (unsigned long long)(now - gRestartBegan));
@@ -4617,6 +4654,7 @@ int level7(IOService *owner)
     }
     if (!holdForClient && !gSta.profileSet && profileToSta(gSta, generation) && !profileNoted) {
       profileNoted = true;
+      if (!gPass.profileAt) gPass.profileAt = now;
       note("level 7: the join profile was handed over after %llu ms: a network name of %u byte(s), %s, the access point %s "
            "(none of it is logged)",
            (unsigned long long)(now - started), unsigned(gSta.ssidLength), piano_wifi_security_name(gSta.security),
@@ -5080,6 +5118,7 @@ int PianoWifi::runPass(uint32_t pass, PowerState &power, const Options &opt)
   e.level = 0;
   e.failed = e.opened = false;
   e.fast = pass > 1 && gFastNext;
+  e.profileAt = 0;
   bool wakeReleased = false;
   // A ladder that ended well lets the device idle again (the wake doorbell back to 0, as the MHI host's last release does),
   // since nothing answers it after this thread is gone.

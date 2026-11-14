@@ -250,7 +250,7 @@ void netThread(void *arg, wait_result_t)
     if (taken) pianonet::usbKick();   // room for the next NTB from the Mac
     if (!named && bsdName()) {
       named = true;
-      IOLog("PianoDwc3: net: macOS named the interface %s (en0 stays PianoNullEthernet's built-in one)\n", bsdName());
+      IOLog("PianoDwc3: net: macOS named the interface %s (en0 is the built-in one: PianoNullEthernet's, or Wi-Fi's with piano-wifi-en0)\n", bsdName());
     }
     const uint64_t now = nowNs(), sum[3] = {gCount.sent + gCount.sendDrops, gCount.received + gCount.receiveDrops + gCount.notUp,
                                             gGadget ? uint64_t(gGadget->ntbErrors) + gGadget->badDatagrams + gGadget->rxDrops : 0};
