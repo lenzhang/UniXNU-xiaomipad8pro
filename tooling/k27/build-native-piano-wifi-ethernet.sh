@@ -27,5 +27,7 @@ KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 [ ! -f "$KERNEL" ] || python3 "$D/tooling/k27/check-kext-imports.py" "$O/objects.json" "$KERNEL" \
   --library-prefix __ZN18IONetworkInterface --library-prefix __ZN19IONetworkController --library-prefix __ZNK19IONetworkController \
   --library-prefix __ZN20IOEthernetController --library-prefix __ZNK20IOEthernetController --library-prefix __ZN15IONetworkMedium \
-  --library-prefix __ZN19IOEthernetInterface --library-prefix __ZTV19IONetworkController \
+  --library-prefix __ZN19IOEthernetInterface --library-prefix __ZNK18IONetworkInterface \
+  --library-prefix __ZNK19IOEthernetInterface --library-prefix __ZTV18IONetworkInterface \
+  --library-prefix __ZTV19IOEthernetInterface --library-prefix __ZTV19IONetworkController \
   --library-prefix __ZTV20IOEthernetController --library-prefix _piano_wifi_net_ | cut -c1-160 >&2

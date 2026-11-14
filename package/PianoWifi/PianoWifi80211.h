@@ -31,6 +31,7 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/copyio.h>   // copyin / copyout of the requesting task's buffers
 #include <net/kpi_interfacefilter.h>
+#include <IOKit/IOUserClient.h>
 #include <sys/kern_event.h>
 #include <sys/proc.h>     // proc_selfname, proc_selfpid: who asked for a scan
 #include <sys/sysctl.h>
@@ -81,6 +82,9 @@ class PianoWifi80211 : public IO80211Controller {
   uint64_t fReported = ~0ull;
   uint32_t fEventCodesLogged = 0;
   volatile uint32_t fCallsArmed = 0, fCallsInside = 0;   // thread calls armed / inside their callback (review F4)
+  uint32_t fUcMode = 0;            // kUc*: the user-client switches (docs/drivers/wifi-menu.md section 7)
+  uint64_t fUcOpens = 0, fUcRefused = 0, fUcSelectors = 0;   // newUserClient calls answered / refused, selectors served
+  uint32_t fUcClients = 0;         // clients alive now
   uint32_t fScanLines = 0;   // the scans logged one by one (with the asking process), at most kScanLinesMax
   unsigned long fOtherSeen[16] = {};
   unsigned fOtherCount = 0;
@@ -100,6 +104,8 @@ class PianoWifi80211 : public IO80211Controller {
   void scanStarted();
   void noteOtherIoctl(unsigned long cmd);
   void report(const char *why);
+  void eventPayload(uint32_t code, uint8_t *buffer, uint32_t capacity, uint32_t &length);
+  IONetworkInterface *createInterface() override;
 
   // Armed only while the driver runs, and counted: stop() waits for every call to be out of its callback (review F4).
   void arm(thread_call_t call, unsigned ms)
@@ -134,7 +140,25 @@ class PianoWifi80211 : public IO80211Controller {
   void setAcceptMode(uint32_t mode, const char *why);
   bool start(IOService *provider) override;
   void stop(IOService *provider) override;
+  // the user client's side (PianoWifi80211Uc.h)
+  IOReturn newUserClient(task_t owningTask, void *security, UInt32 type, OSDictionary *properties, IOUserClient **handler) override;
+  IOReturn ucRequest(IOExternalMethodArguments *args, bool large, uint32_t &answered);
+  uint32_t ucMode();
+  void noteUserClient(const char *what, task_t task, uint32_t type, uint64_t calls);
+  void noteSelector(uint32_t selector, uint32_t inBytes, uint32_t outBytes, uint32_t scalarIn, uint32_t scalarOut,
+                    uint32_t answered, IOReturn result, uint64_t calls);
+  static int sysctlUc(struct sysctl_oid *, void *, int, struct sysctl_req *req);
+  void setUcMode(uint32_t mode, const char *why);
 };
+
+// Our own class named IO80211Interface (kUcInterfaceClass, wm2-diag Rank 2): nothing but the name, as IO80211Controller above.
+// It overrides nothing, so its vtable is the family's with our metaclass only.
+class IO80211Interface : public IOEthernetInterface {
+  OSDeclareDefaultStructors(IO80211Interface)
+};
+OSDefineMetaClassAndStructors(IO80211Interface, IOEthernetInterface)
+
+#include "PianoWifi80211Uc.h"
 
 OSDefineMetaClassAndStructors(PianoWifi80211, IO80211Controller)
 
@@ -158,7 +182,7 @@ void note80211(const char *fmt, ...)
 IOSimpleLock *gA80211Gate;             // guards the two words below
 PianoWifi80211 *gA80211;               // retained while set
 unsigned gA80211Busy;                  // handlers inside the gate
-struct sysctl_oid gA80211Oid;
+struct sysctl_oid gA80211Oid, gA80211UcOid;
 
 // The driver for a sysctl handler, retained for the call (nullptr once the unregister has closed the gate).
 PianoWifi80211 *a80211Enter()
@@ -219,12 +243,23 @@ bool registerAcceptSysctl(PianoWifi80211 *self)
   gA80211Oid.oid_descr = "PianoWifi80211's accept mode for apple80211 requests without a layout (docs/drivers/wifi-menu.md 6)";
   gA80211Oid.oid_version = SYSCTL_OID_VERSION;
   sysctl_register_oid(&gA80211Oid);
+  bzero(&gA80211UcOid, sizeof gA80211UcOid);
+  gA80211UcOid.oid_parent = &sysctl__machdep_children;
+  gA80211UcOid.oid_number = OID_AUTO;
+  gA80211UcOid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gA80211UcOid.oid_name = "piano_wifi_a80211_uc";
+  gA80211UcOid.oid_handler = PianoWifi80211::sysctlUc;
+  gA80211UcOid.oid_fmt = "I";
+  gA80211UcOid.oid_descr = "PianoWifi80211's user-client switches (docs/drivers/wifi-menu.md section 7)";
+  gA80211UcOid.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gA80211UcOid);
   return true;
 }
 // The gate closed, every handler inside it waited for, then the retain given back: after this the driver may be freed.
 void unregisterAcceptSysctl()
 {
   sysctl_unregister_oid(&gA80211Oid);
+  sysctl_unregister_oid(&gA80211UcOid);
   if (!gA80211Gate) return;
   const IOInterruptState state = IOSimpleLockLockDisableInterrupt(gA80211Gate);
   PianoWifi80211 *self = gA80211;
@@ -249,6 +284,18 @@ IOService *PianoWifi80211::probe(IOService *provider, SInt32 *score)
   uint32_t on = 0;
   if (!PE_parse_boot_argn("piano-wifi-apple80211", &on, sizeof on) || !on) return nullptr;
   return IO80211Controller::probe(provider, score);
+}
+
+// kUcInterfaceClass (wm2-diag Rank 2): the interface object is of our own class named IO80211Interface instead of
+// IOEthernetInterface. It overrides nothing, so the only difference is the name a class-name test sees. A boot argument only
+// (the interface is made once, here).
+IONetworkInterface *PianoWifi80211::createInterface()
+{
+  if (!(fUcMode & pianowifi::a80211::kUcInterfaceClass)) return IO80211Controller::createInterface();
+  IO80211Interface *netif = OSTypeAlloc(IO80211Interface);
+  if (netif && !netif->init(this)) OSSafeReleaseNULL(netif);
+  note80211("the interface's class is %s (user-client mode 0x8)", netif ? "IO80211Interface (ours)" : "IOEthernetInterface: ours failed");
+  return netif ? netif : IO80211Controller::createInterface();
 }
 
 // Inside PianoWifiEthernet::start's attachInterface, before the interface is registered (and so before the network stack
@@ -281,6 +328,8 @@ bool PianoWifi80211::start(IOService *provider)
   reset(*fState);
   uint32_t accept = 0;
   if (PE_parse_boot_argn("piano-wifi-apple80211-accept", &accept, sizeof accept)) fState->accept = accept;
+  uint32_t uc = 0;
+  if (PE_parse_boot_argn("piano-wifi-apple80211-uc", &uc, sizeof uc)) fUcMode = uc & 0x1f;
   if (!IO80211Controller::start(provider)) return false;   // PianoWifiEthernet: the interface, its data path, the link down
   IOEthernetAddress mac = {};
   getHardwareAddress(&mac);
@@ -297,6 +346,9 @@ bool PianoWifi80211::start(IOService *provider)
   note80211("started (piano-wifi-apple80211=1): %u network(s) in PianoWifi's scan list%s; waiting for the BSD interface",
             unsigned(networks), fWifi ? "" : " (PianoWifi not found: no scan list)");
   fSysctl = registerAcceptSysctl(this);
+  note80211("user-client mode %#x (machdep.piano_wifi_a80211_uc changes it at run time: 0x1 a client offered, 0x2 the controller "
+            "carries IOInterfaceName, 0x4 event payloads, 0x8 the interface's class IO80211Interface (boot only), 0x10 the event "
+            "pipe)", unsigned(fUcMode));
   note80211("accept mode %#x (machdep.piano_wifi_a80211 changes it at run time: 0x1 INFRA_ENUMERATED set, 0x2 any other set, "
             "0x4 any other get zeroed, 0x8 VIRTUAL_IF_ROLE answered)", unsigned(fState->accept));
   arm(fAttachCall, kAttachTickMs);
@@ -342,6 +394,13 @@ void PianoWifi80211::attachStep()
   pianowifi::a80211::LinkEvent down = {};
   down.down = 1;
   postEvent(pianowifi::a80211::kEvLinkChanged, &down, sizeof down);
+  if (fUcMode & pianowifi::a80211::kUcControllerName) {
+    // The lookup user space makes by IOInterfaceName takes any class: with these the controller can be what it finds and opens.
+    setProperty("IOInterfaceName", fIfName);
+    setProperty("IO80211InterfaceRole", "Infrastructure");
+    setProperty("IOInterfaceNamePrefix", "en");
+    note80211("%s: the controller carries IOInterfaceName and the Infrastructure role too (user-client mode 0x2)", fIfName);
+  }
   setProperty("piano-wifi-apple80211-answering", fIfName);   // the BSD name; the airportd starter waits for this key
   registerService();
   fRegistered = true;
@@ -483,11 +542,45 @@ void PianoWifi80211::refreshScanLocked()
   ++fListRefreshes;
 }
 
+// kUcEventPayloads (wm2-diag Rank 3): the payload a 27.3 reader expects for the events we post without one. POWER_CHANGED: the
+// power structure (the same {version, radios, state} the POWER get answers). SCAN_DONE: a status word (0: the scan is done).
+// Both are our own reading of the layouts the get answers carry; nothing was copied.
+void PianoWifi80211::eventPayload(uint32_t code, uint8_t *buffer, uint32_t capacity, uint32_t &length)
+{
+  using namespace pianowifi::a80211;
+  length = 0;
+  if (!(ucMode() & kUcEventPayloads) || !buffer) return;
+  if (code == kEvPowerChanged && capacity >= sizeof(Power)) {
+    Power p;
+    bzero(&p, sizeof p);
+    p.version = 1;
+    p.radios = 1;
+    IOLockLock(fLock);
+    p.state[0] = fState->power ? 1 : 0;
+    IOLockUnlock(fLock);
+    memcpy(buffer, &p, sizeof p);
+    length = sizeof p;
+  } else if (code == kEvScanDone && capacity >= 8) {
+    const uint32_t done[2] = {1, 0};   // {version, status 0: the scan finished}
+    memcpy(buffer, done, sizeof done);
+    length = sizeof done;
+  }
+}
+
 // Vendor Apple, class 6 (IEEE 802.11), subclass 1 (apple80211), the interface's name (16 bytes) and the payload.
 void PianoWifi80211::postEvent(uint32_t code, const void *payload, uint32_t length)
 {
   char name[16] = {};
   memcpy(name, fIfName, sizeof name);
+  uint8_t made[32];
+  if (!payload || !length) {
+    uint32_t madeLength = 0;
+    eventPayload(code, made, sizeof made, madeLength);
+    if (madeLength) {
+      payload = made;
+      length = madeLength;
+    }
+  }
   struct kev_msg m;
   bzero(&m, sizeof m);
   m.vendor_code = KEV_VENDOR_APPLE;
@@ -542,6 +635,166 @@ void PianoWifi80211::noteOtherIoctl(unsigned long cmd)
               (cmd >> 16) & 0x1fff);
 }
 
+uint32_t PianoWifi80211::ucMode()
+{
+  IOLockLock(fLock);
+  const uint32_t mode = fUcMode;
+  IOLockUnlock(fLock);
+  return mode;
+}
+
+void PianoWifi80211::setUcMode(uint32_t mode, const char *why)
+{
+  IOLockLock(fLock);
+  const uint32_t was = fUcMode;
+  fUcMode = mode & 0x1f;
+  IOLockUnlock(fLock);
+  // kUcControllerName takes effect at once; the interface's class is decided when the interface is made (a boot argument only).
+  const bool name = (fUcMode & pianowifi::a80211::kUcControllerName) != 0;
+  if (name != ((was & pianowifi::a80211::kUcControllerName) != 0)) {
+    if (name) {
+      setProperty("IOInterfaceName", fIfName);
+      setProperty("IO80211InterfaceRole", "Infrastructure");
+      setProperty("IOInterfaceNamePrefix", "en");
+    } else {
+      removeProperty("IOInterfaceName");
+    }
+  }
+  note80211("%s: user-client mode %#x (was %#x, %s): 0x1 a client offered, 0x2 the controller carries IOInterfaceName%s, "
+            "0x4 event payloads, 0x8 the interface's class (boot only), 0x10 the event pipe",
+            fIfName, unsigned(fUcMode), unsigned(was), why, name ? " (set now)" : "");
+}
+
+// Every open logged, whoever asks and whatever it asks for: that is the question wm3 answers.
+IOReturn PianoWifi80211::newUserClient(task_t owningTask, void *security, UInt32 type, OSDictionary *properties,
+                                       IOUserClient **handler)
+{
+  const uint32_t mode = ucMode();
+  if (!(mode & pianowifi::a80211::kUcOffer)) {
+    IOLockLock(fLock);
+    ++fUcRefused;
+    IOLockUnlock(fLock);
+    noteUserClient("refused (no client offered: mode 0x1 is off)", owningTask, uint32_t(type), 0);
+    return IO80211Controller::newUserClient(owningTask, security, type, properties, handler);
+  }
+  PianoWifi80211Uc *client = OSTypeAlloc(PianoWifi80211Uc);
+  if (!client || !client->initWithOwner(this, owningTask, uint32_t(type))) {
+    OSSafeReleaseNULL(client);
+    IOLockLock(fLock);
+    ++fUcRefused;
+    IOLockUnlock(fLock);
+    noteUserClient("refused (no memory)", owningTask, uint32_t(type), 0);
+    return kIOReturnNoMemory;
+  }
+  if (!client->attach(this) || !client->start(this)) {
+    client->detach(this);
+    client->release();
+    IOLockLock(fLock);
+    ++fUcRefused;
+    IOLockUnlock(fLock);
+    noteUserClient("refused (the client did not start)", owningTask, uint32_t(type), 0);
+    return kIOReturnError;
+  }
+  IOLockLock(fLock);
+  ++fUcOpens;
+  ++fUcClients;
+  IOLockUnlock(fLock);
+  noteUserClient("opened", owningTask, uint32_t(type), 0);
+  *handler = client;
+  return kIOReturnSuccess;
+}
+
+// An apple80211 request through the client: the five fields of the structure read, the request answered by the same handler the
+// ioctls use, and the request's own length and value written back into the caller's structure output.
+IOReturn PianoWifi80211::ucRequest(IOExternalMethodArguments *args, bool large, uint32_t &answered)
+{
+  using namespace pianowifi::a80211;
+  const uint32_t want = large ? kUcLargeBytes : kUcSmallBytes;
+  const uint32_t offset = large ? kUcLargeBytes - kUcSmallBytes : 0;
+  const uint8_t *in = static_cast<const uint8_t *>(args->structureInput);
+  if (!in || args->structureInputSize < want) return kIOReturnBadArgument;
+  uint32_t cmd = 0, length = 0, type = 0;
+  int32_t val = 0;
+  uint64_t data = 0;
+  memcpy(&cmd, in + kUcCmdAt, 4);
+  memcpy(&length, in + kUcLenAt, 4);
+  memcpy(&data, in + kUcDataAt, 8);
+  memcpy(&type, in + offset + kUcTypeAt, 4);
+  memcpy(&val, in + offset + kUcValAt, 4);
+  if (cmd != kUcGetCmd && cmd != kUcSetCmd) return kIOReturnBadArgument;
+  Req rq;
+  bzero(&rq, sizeof rq);
+  memcpy(rq.name, in + offset + kUcNameAt, sizeof rq.name);
+  rq.name[sizeof rq.name - 1] = 0;
+  rq.type = int32_t(type);
+  rq.value = val;
+  rq.length = length;
+  rq.data = data;
+  const errno_t e = apple80211(cmd == kUcSetCmd, rq);
+  // The answer's own length and value go back to the caller, as the ioctl's struct would carry them.
+  uint8_t *out = static_cast<uint8_t *>(args->structureOutput);
+  if (out && args->structureOutputSize >= want) {
+    memcpy(out, in, want);
+    memcpy(out + kUcLenAt, &rq.length, 4);
+    memcpy(out + offset + kUcValAt, &rq.value, 4);
+    answered = want;
+  } else if (out && args->structureOutputSize >= 8) {
+    memcpy(out, &rq.length, 4);
+    memcpy(out + 4, &rq.value, 4);
+    answered = 8;
+  }
+  IOLockLock(fLock);
+  ++fUcSelectors;
+  IOLockUnlock(fLock);
+  if (e == EJUSTRETURN || e == 0) return kIOReturnSuccess;
+  // The driver's own errno reaches user space here (which the ioctl path cannot do): 5 ends a scan's result list.
+  return unsigned(e) & 0x3fff ? IOReturn(sub_iokit_common | (unsigned(e) & 0x3fff)) : kIOReturnError;
+}
+
+void PianoWifi80211::noteUserClient(const char *what, task_t task, uint32_t type, uint64_t calls)
+{
+  char name[32] = "?";
+  int pid = -1;
+  if (task) {
+    proc_t p = (proc_t)get_bsdtask_info(task);
+    if (p) {
+      pid = proc_pid(p);
+      proc_name(pid, name, sizeof name);
+    }
+  }
+  note80211("%s: a user client was %s: type %u, task %s[%d], %llu call(s) so far (opens %llu, refused %llu, alive %u)", fIfName,
+            what, unsigned(type), name, pid, calls, fUcOpens, fUcRefused, unsigned(fUcClients));
+}
+
+void PianoWifi80211::noteSelector(uint32_t selector, uint32_t inBytes, uint32_t outBytes, uint32_t scalarIn, uint32_t scalarOut,
+                                  uint32_t answered, IOReturn result, uint64_t calls)
+{
+  note80211("%s: selector %u: struct in %u out %u, scalars in %u out %u -> %#x (wrote %u), call %llu", fIfName,
+            unsigned(selector), unsigned(inBytes), unsigned(outBytes), unsigned(scalarIn), unsigned(scalarOut),
+            unsigned(answered), unsigned(result), calls);
+}
+
+int PianoWifi80211::sysctlUc(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  PianoWifi80211 *self = a80211Enter();
+  struct Leave {
+    PianoWifi80211 *held;
+    ~Leave()
+    {
+      if (held) a80211Leave();
+    }
+  } leave{self};
+  int value = self ? int(self->ucMode()) : -1;
+  int err = SYSCTL_OUT(req, &value, sizeof value);
+  if (err || !req->newptr) return err;
+  int incoming = 0;
+  err = SYSCTL_IN(req, &incoming, sizeof incoming);
+  if (err) return err;
+  if (!self) return ENODEV;
+  self->setUcMode(uint32_t(incoming), "machdep.piano_wifi_a80211_uc");
+  return 0;
+}
+
 uint32_t PianoWifi80211::acceptMode()
 {
   IOLockLock(fLock);
@@ -569,7 +822,8 @@ void PianoWifi80211::report(const char *why)
   const uint32_t kinds = fSeen->count, overflow = fSeen->overflow, scans = fState->scanRequests, results = fState->resultsServed;
   const uint32_t ends = fState->listEnds, networks = fState->scan.count, powerSets = fState->powerSets;
   const bool power = fState->power;
-  const uint32_t accept = fState->accept, accepted = fState->acceptedUnknown;
+  const uint32_t accept = fState->accept, accepted = fState->acceptedUnknown, ucMode = fUcMode, ucClients = fUcClients;
+  const uint64_t ucOpens = fUcOpens, ucRefused = fUcRefused, ucSelectors = fUcSelectors;
   const uint64_t stamp = requests + events + other;
   const bool changed = stamp != fReported;
   fReported = stamp;
@@ -585,12 +839,16 @@ void PianoWifi80211::report(const char *why)
     }
     it->release();
   }
-  note80211("%s (%s): %llu request(s) of %u kind(s)%s, %llu unknown; accept mode %#x (%u answered by it); %u scan(s), %u "
+  // The client line goes first and alone: in wm2 four of six summaries were cut by interleaving and this tail was lost.
+  note80211("%s (%s): the controller's clients: %u (%s); user clients: %llu opened, %llu refused, %u alive, %llu selector call(s); "
+            "modes accept %#x uc %#x", fIfName, why, clients, names, ucOpens, ucRefused, unsigned(ucClients), ucSelectors,
+            unsigned(accept), unsigned(ucMode));
+  note80211("%s (%s): %llu request(s) of %u kind(s)%s, %llu unknown, %u answered by the accept mode; %u scan(s), %u "
             "result(s) served, %u list end(s), %u network(s); power %s (%u set(s)); %llu event(s), %llu refused; %llu other "
-            "ioctl(s); the controller's clients: %u (%s)",
-            fIfName, why, requests, unsigned(kinds), overflow ? " (the kind table is full)" : "", unknown, unsigned(accept),
-            unsigned(accepted), unsigned(scans), unsigned(results), unsigned(ends), unsigned(networks), power ? "on" : "off",
-            unsigned(powerSets), events, eventErrors, other, clients, names);
+            "ioctl(s)",
+            fIfName, why, requests, unsigned(kinds), overflow ? " (the kind table is full)" : "", unknown, unsigned(accepted),
+            unsigned(scans), unsigned(results), unsigned(ends), unsigned(networks), power ? "on" : "off", unsigned(powerSets),
+            events, eventErrors, other);
 }
 
 void PianoWifi80211::reportTick(thread_call_param_t p, thread_call_param_t)
