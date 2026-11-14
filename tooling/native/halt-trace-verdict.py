@@ -63,6 +63,26 @@ def tagged(line):
 
 
 START = re.compile(r'piano-halt: PEHaltRestart type (\d+) at t=(\d+) ms', re.I)
+
+
+def fuzzy_has(text, phrase):
+    """PHRASE in TEXT without case, or a window of its length with at most len/12 characters flipped (a mailbox's bit flips
+    can hit any byte, punctuation too: "handlePlatforM@adtRestart returned"). Under 12 characters: exact (without case)."""
+    t, ph = text.lower(), phrase.lower()
+    if ph in t:
+        return True
+    n = len(ph)
+    allowed = n // 12   # none under 12 characters ("PM quiesced" vs "PM quiesce callback"), 2 at 24-35
+    for i in range(0, len(t) - n + 1):
+        wrong = 0
+        for a, b in zip(t[i:i + n], ph):
+            if a != b:
+                wrong += 1
+                if wrong > allowed:
+                    break
+        if wrong <= allowed:
+            return True
+    return False
 TIMEOUT = re.compile(r'piano-halt: timed out after (\d+) s at t=(\d+) ms', re.I)
 
 
@@ -95,11 +115,11 @@ def verdict(lines):
         return found[-1] if found else None
 
     def has(text):
-        return re.search(re.escape(text), joined, re.I) is not None
+        return fuzzy_has(joined, text)
 
     # PSCI and the platform's haltRestart: after handlePlatformHaltRestart returned
-    if has('handlePlatformHaltRestart returned'):
-        handler = last(r'piano-psci-halt: PE_halt_restart\((\d+)\) at (\d+) ms: PSCI (\S+)')
+    if has('handlePlatformHaltRestart returned') or last(r'::haltRestart\(\d+\) ->') or last(r'piano-psci-halt: PE_halt_restart\('):
+        handler = last(r'piano-psci-halt: PE_halt_restart\((\d+)\) at (\d+) \S+ PSCI (\S+)')
         if handler:
             refused = last(r'piano-psci-halt: PSCI (\S+) returned (-?\d+)')
             if refused:
@@ -258,6 +278,12 @@ SELF_TESTS = [
       "paano-halt: phase 'QuiesCing PM' at t=104 ms",
       'piano-halt: quiescePowerTree retupned 0x0; waiting for the callback',
       'piano-halt: PM quieqce callback at t=104 ms'], 'the quiesce request retired/called back but the waiter did not wake'),
+    # halt2 R1 (2026-11-14) as logged: the return line and the handler's "ms" bit-flipped; the later markers say it returned
+    (HALT1[:25] + ['piano-halt: handlePlatforM@adtRestart returned after 49 ms',
+                   'piano-halt: ArmDTPlatform::haltRestart(1) -> (PE_halt_restart set) at t=109347 ms',
+                   'piano-psci-halt: PE_halt_restart(1) at 109347 m3: PSCI SYSTEM_RESET (0x84000009) through smc, the restart reason '
+                   '!s it is'],
+     'piano-psci-halt (k27 0069): PSCI SYSTEM_RESET issued at 109347 ms and it did not return: the reset/power-off was taken'),
     # k27 0069: the handler's reset taken, or refused
     (['piano-halt: PEHaltRestart type 1 at t=100 ms (timeout 30 s): handlePlatformHaltRestart ->',
       'piano-halt: handlePlatformHaltRestart returned after 240 ms',
@@ -284,7 +310,8 @@ def self_test():
     assert len(markers) == 30 and sum('PEHaltRestart' in m for m in markers) == 1, len(markers)
     print('halt-trace-verdict: self-test PASS (%d cases: priority client, power plane, platform action, quiesce blocker, quiesce '
           'bookkeeping, platform haltRestart, PSCI refused, PSCI silent, last-of-two with a damaged line, halt1 as logged (bit '
-          'flips), flipped priority and quiesce words, 0069 reset taken, 0069 power-off refused, no marker)' % len(SELF_TESTS))
+          'flips), flipped priority and quiesce words, halt2 R1 as logged, 0069 reset taken, 0069 power-off refused, no marker)'
+          % len(SELF_TESTS))
 
 
 def main():
