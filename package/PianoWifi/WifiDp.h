@@ -32,6 +32,13 @@ constexpr uint32_t kDpTxBuffers = 32, kDpTxBufferBytes = 2048;
 constexpr uint32_t kDpLinkDescBytes = 128;
 constexpr uint32_t kDpFrameMax = 1600;   // an 802.3 frame of en0 (1514 and a VLAN tag, rounded)
 
+// piano-wifi-l8=N, level 8's switches (each the A/B of a default): bit 0 the receive buffers return to software ring 1 (the
+// refill ring's manager; off: the firmware's own, as levels 6 and 7 have it), bit 1 the receive ring selection sent for both
+// radio buffer rings, bit 2 the data path's rings programmed at level 6's start (off: level 8 does nothing), bit 3 EAPOL frames
+// also to en0 (by default only to the 802.1X port), bit 4 the transmit side (off: nothing is sent, the receive side runs).
+constexpr uint32_t kL8RbmSw1 = 1u << 0, kL8RxSelection = 1u << 1, kL8Rings = 1u << 2, kL8EapolToEn0 = 1u << 3, kL8Tx = 1u << 4;
+constexpr uint32_t kL8Default = kL8RbmSw1 | kL8RxSelection | kL8Rings | kL8Tx;
+
 struct DpTxBuf {
   uint8_t *va = nullptr;
   uint64_t bus = 0;

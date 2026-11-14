@@ -81,12 +81,18 @@
 #include <stdarg.h>
 #include <PianoPowerContract.h>
 #include <sys/sysctl.h>
+#include <sys/errno.h>
+#include <sys/kern_control.h>
+#include <sys/kpi_mbuf.h>
+#include "PianoWifiNet.h"
 #include "SmmuStream.h"
 #include "WifiBringup.h"
 #include "WifiChannels.h"
+#include "WifiDp.h"
 #include "WifiFirmware.h"
 #include "WifiLink.h"
 #include "WifiMhi.h"
+#include "WifiNet.h"
 #include "WifiPbl.h"
 #include "WifiProfile.h"
 #include "WifiRddm.h"
@@ -118,6 +124,7 @@ struct Args {
   uint32_t rddm, defer, wake;
   uint32_t deadlineMs;
   uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step, l7file, l7cands;
+  uint32_t l8, l8status;
 };
 Args gArgs;
 
@@ -211,8 +218,10 @@ void readArgs()
   gArgs.l7 = bootArg("piano-wifi-l7", kStaFlagsDefault);
   gArgs.l7wait = bootArg("piano-wifi-l7wait", kAssocProfileWaitMs);
   if (gArgs.l7wait > 3600000) gArgs.l7wait = kAssocProfileWaitMs;
-  gArgs.l7hold = bootArg("piano-wifi-l7hold", kAssocHoldMs);
-  if (gArgs.l7hold > 3600000) gArgs.l7hold = kAssocHoldMs;
+  // Level 8 keeps the association until a suspend by default (the station is for use, not a watch); level 7 watches 30 s.
+  const uint32_t holdDefault = gArgs.level >= 8 ? 0 : kAssocHoldMs;
+  gArgs.l7hold = bootArg("piano-wifi-l7hold", holdDefault);
+  if (gArgs.l7hold > 3600000) gArgs.l7hold = holdDefault;
   gArgs.l7tries = bootArg("piano-wifi-l7tries", kAssocFrameTries);
   if (!gArgs.l7tries || gArgs.l7tries > 10) gArgs.l7tries = kAssocFrameTries;
   gArgs.l7scans = bootArg("piano-wifi-l7scans", 3);
@@ -227,6 +236,12 @@ void readArgs()
   if (gArgs.l7frame < 50 || gArgs.l7frame > 10000) gArgs.l7frame = kAssocFrameWaitMs;
   gArgs.l7step = bootArg("piano-wifi-l7step", 3000);
   if (gArgs.l7step < 200 || gArgs.l7step > 30000) gArgs.l7step = 3000;
+  // Level 8, the data path (WifiDp.h, docs §13.6) and the network boundary (PianoWifiNet.h, §13.7): piano-wifi-l8=N its
+  // switches (WifiDp.h kL8*, default 0x17), piano-wifi-l8status=MS how often its counters are logged while associated
+  // (5000; 0 only at the association's end).
+  gArgs.l8 = bootArg("piano-wifi-l8", kL8Default);
+  gArgs.l8status = bootArg("piano-wifi-l8status", 5000);
+  if (gArgs.l8status && gArgs.l8status < 500) gArgs.l8status = 500;
 }
 
 uint64_t nowMs();
@@ -265,9 +280,12 @@ void note(const char *fmt, ...)
   vsnprintf(line, sizeof line, fmt, ap);
   va_end(ap);
   if (gDeferBuf && current_thread() == gDeferThread) {
+    // A ring of kDeferLines: a line is written over only once the helper has printed it (level 8 runs for minutes after the
+    // ladder's start, and its lines would not fit a buffer that is only filled once).
     const unsigned n = gDeferCount;
-    if (n < kDeferLines) {
-      snprintf(gDeferBuf + n * kDeferBytes, kDeferBytes, "%s [+%llu ms]", line, (unsigned long long)(nowMs() - gDeferSince));
+    if (n - __atomic_load_n(&gDeferPrinted, __ATOMIC_ACQUIRE) < kDeferLines) {
+      snprintf(gDeferBuf + (n % kDeferLines) * kDeferBytes, kDeferBytes, "%s [+%llu ms]", line,
+               (unsigned long long)(nowMs() - gDeferSince));
       __atomic_store_n(&gDeferCount, n + 1, __ATOMIC_RELEASE);   // the helper reads the line only after this
     } else {
       ++gDeferDropped;
@@ -286,7 +304,7 @@ unsigned deferPrintHeld(const char *buffer)
     const unsigned count = __atomic_load_n(&gDeferCount, __ATOMIC_ACQUIRE);
     if (at >= count) return printed;
     if (!__atomic_compare_exchange_n(&gDeferPrinted, &at, at + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
-    IOLog("PianoWifi: %s\n", buffer + at * kDeferBytes);
+    IOLog("PianoWifi: %s\n", buffer + (at % kDeferLines) * kDeferBytes);
     ++printed;
   }
 }
@@ -366,7 +384,9 @@ void deferFlush()
   IOLog("PianoWifi: log: %u line(s) held for %llu ms, %u printed by the helper thread and %u now%s\n", gDeferCount,
         (unsigned long long)(nowMs() - gDeferSince), before, here,
         __atomic_load_n(&gPrinterExited, __ATOMIC_ACQUIRE) ? "" : " (the helper is still inside the console: its buffer is kept)");
-  if (gDeferDropped) IOLog("PianoWifi: log: %u later line(s) did not fit and were not kept\n", gDeferDropped);
+  if (gDeferDropped)
+    IOLog("PianoWifi: log: %u line(s) came while %u held ones were not printed yet and were not kept\n", gDeferDropped,
+          kDeferLines);
   if (__atomic_load_n(&gPrinterExited, __ATOMIC_ACQUIRE)) IOFreeData(buffer, kDeferLines * kDeferBytes);
 }
 
@@ -2533,6 +2553,8 @@ int level5(PowerState &power, const Options &opt)
 Ce gCe;
 HttRx gHtt;                         // the receive rings and their buffers (P23), out of the same window
 bool gHttPlanned;
+Dp gDp;                             // level 8: the data path's rings (WifiDp.h), out of the same window
+bool gDpPlanned;
 Link gLink;
 volatile bool gLinkRunning;         // the ladder's thread is inside level 6 or 7: the power hook asks it to stop instead of racing
 volatile uint32_t gStopRequested;   // set by the power hook, read by the ladder each turn
@@ -2637,13 +2659,25 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
   }
   gHttPlanned = false;
   if (wantRx) {
-    gHttPlanned = httPlan(gHtt, gArena, (gArgs.l6pre & kPreRbmSw1) != 0);
+    gHttPlanned = httPlan(gHtt, gArena, (gArgs.l6pre & kPreRbmSw1) || (gArgs.level >= 8 && (gArgs.l8 & kL8RbmSw1)));
     if (gHttPlanned) httFill(gHtt);
     note("level 6: the receive rings: %s (a refill ring of %u buffers of %u bytes for the firmware, %u radio buffer rings of "
          "%u, an error ring of %u, %u status rings of %u buffers; the buffers return to %s)",
          gHttPlanned ? "planned and filled, announced after the first scan" : "not planned: the window has no room for them",
          kRxRefillEntries - 1, kRxBufferBytes, kRxRadios, kRxMacBufEntries, kRxErrDstEntries, kRxRadios,
-         kRxMonStatusEntries - 1, (gArgs.l6pre & kPreRbmSw1) ? "software ring 1" : "the firmware's own manager");
+         kRxMonStatusEntries - 1, gHtt.rbm == kRxBufRbmSw1 ? "software ring 1" : "the firmware's own manager");
+  }
+  // Level 8: the data path's rings (WifiDp.h) out of the window and programmed now, before the receive rings are announced
+  // and before anything is associated: a frame the reorder unit pushes must find its destination ring and the receive DMA
+  // its link descriptors from the first data frame on.
+  gDpPlanned = false;
+  if (gArgs.level >= 8 && gHttPlanned && (gArgs.l8 & kL8Rings)) {
+    const uint32_t before = gArena.used;
+    gDpPlanned = dpPlan(gDp, gArena, &gHtt);
+    if (gDpPlanned) dpProgram(gDp, gChipIo);
+    note("level 8: the data path's rings %s (%u bytes of the window; %u of %u used)",
+         gDpPlanned ? "planned and programmed" : "NOT planned: the window has no room for them", gArena.used - before,
+         gArena.used, gArena.bytes);
   }
   ceProgram(gCe, gChipIo);
   unsigned posted = 0;
@@ -3017,8 +3051,11 @@ bool profileToSta(Sta &s, uint32_t &generationSeen)
   return handed;
 }
 
+bool level8Event(uint32_t id, const uint8_t *payload, uint32_t length);
+
 bool staHook(void *, uint32_t id, const uint8_t *payload, uint32_t length, uint64_t now)
 {
+  if (level8Event(id, payload, length)) return true;
   return staOnEvent(gSta, id, payload, length, now);
 }
 
@@ -3121,6 +3158,717 @@ void staReport(void *, uint32_t what, uint32_t a, uint32_t b)
   }
 }
 
+// ============================================================== level 8: the data path (WifiDp.h) and the network boundary
+// On level 7's association: the rings level 6 programmed carry the station's frames; EAPOL frames go to the 802.1X port (a
+// kernel control socket, PianoWifiNet.h) and every other frame to en0 (PianoWifiEthernet, through piano_wifi_net_*). The keys
+// and the authorization come back through the port. Everything that touches the chip runs on the ladder's thread
+// (level8Turn); the boundary's other threads (en0's output, the port's client) only fill queues under short locks.
+// docs/drivers/wifi.md §13.6 (the data path) and §13.7 (the boundary). The log carries counts, lengths, states and the
+// handshake's message numbers, never an address, a frame's bytes or a key.
+IOLock *gNetLock;       // the client of en0 and the association's snapshot (gNetLink)
+IOLock *gNetCallLock;    // held while a callback of en0's client runs: a detach waits on it
+IOLock *gTxLock;         // the frame queue
+IOLock *gPortLock;       // the 802.1X port: its client's unit, its requests, the keys
+piano_wifi_net_client gNetClient;
+bool gNetAttached, gNetToldUp, gNetToldAny;
+NetQueue gTxQueue;       // frames of en0 and EAPOL frames of the port, for the ladder's thread to send
+// The association as the other threads may read it (under gNetLock): what EAPOL_TX's frame needs and what a request must name.
+struct NetLink {
+  uint32_t state = PIANO_WIFI_8021X_STATE_IDLE, generation = 0;
+  uint8_t own[6] = {}, bssid[6] = {};
+  bool txEapol = false, txData = false;   // EAPOL frames may go out (associated); every frame may (authorized)
+};
+NetLink gNetLink;
+// The port (under gPortLock).
+kern_ctl_ref gCtlRef;
+bool gCtlRegistered;
+uint32_t gCtlUnit;                // the connected client's unit, 0 none
+uint32_t gCtlConnects, gCtlRefused, gCtlBadMessages;
+bool gPortLinkWanted;             // a LINK message is due (a connect, LINK_QUERY)
+bool gPortAuthorizeWanted, gPortLeaveWanted;
+uint32_t gPortAuthorizeSeq, gPortLeaveSeq;
+uint16_t gPortLeaveReason;
+NetKeys gKeys;
+struct PortResult {
+  uint32_t seq, request, detail, generation;
+  int status;
+};
+constexpr unsigned kPortResults = 8;
+PortResult gPortResult[kPortResults];
+unsigned gPortResultHead, gPortResultTail;
+// The ladder's own (no lock: only its thread).
+struct Level8 {
+  bool on = false, selectionSent = false, txUp = false, authorizedSent = false, linkUpTold = false;
+  uint32_t selectionTries = 0, selections = 0;
+  uint64_t associatedAt = 0, firstRxAt = 0, firstEapolAt = 0, lastStatus = 0;
+  uint32_t eapolLogged = 0, eapolToPort = 0, eapolDropped = 0, eapolNotFromAp = 0, eapolMsg[7] = {};
+  uint32_t toEn0 = 0, en0Dropped = 0, keyCommands = 0, keyComplete = 0, keyTimeouts = 0;
+  uint32_t portSeq = 0, portOut = 0, portOutFailed = 0;
+  uint32_t lastState = PIANO_WIFI_8021X_STATE_IDLE;
+  uint16_t lastReason = 0;
+  KeyComplete key;
+  bool keyAnswered = false;
+};
+Level8 gL8;
+uint8_t gL8Out[kStaOutBytes + 64];   // a command of level 8's own (a key is 25 words and its bytes)
+
+void portEnqueue(const uint8_t *message, uint32_t length)
+{
+  IOLockLock(gPortLock);
+  const uint32_t unit = gCtlUnit;
+  IOLockUnlock(gPortLock);
+  if (!unit || !gCtlRegistered) return;
+  // outside the lock: the socket's own lock is taken inside, and a disconnect may be waiting for ours
+  if (ctl_enqueuedata(gCtlRef, unit, const_cast<uint8_t *>(message), length, CTL_DATA_EOR) == 0) ++gL8.portOut;
+  else ++gL8.portOutFailed;
+}
+
+void portResult(uint32_t seq, uint32_t request, int status, uint32_t detail, uint32_t generation)
+{
+  // called with gPortLock held or not: it takes its own turn on it
+  IOLockLock(gPortLock);
+  if ((gPortResultHead + 1) % kPortResults != gPortResultTail) {
+    gPortResult[gPortResultHead] = PortResult{seq, request, detail, generation, status};
+    gPortResultHead = (gPortResultHead + 1) % kPortResults;
+  }
+  IOLockUnlock(gPortLock);
+}
+
+// ---- the port's callbacks (the client's threads) ----
+errno_t portConnect(kern_ctl_ref, struct sockaddr_ctl *sac, void **unitinfo)
+{
+  IOLockLock(gPortLock);
+  if (gCtlUnit) {
+    ++gCtlRefused;
+    IOLockUnlock(gPortLock);
+    return EBUSY;
+  }
+  gCtlUnit = sac ? sac->sc_unit : 0;
+  ++gCtlConnects;
+  gPortLinkWanted = true;
+  IOLockUnlock(gPortLock);
+  if (unitinfo) *unitinfo = nullptr;
+  return 0;
+}
+
+errno_t portDisconnect(kern_ctl_ref, u_int32_t unit, void *)
+{
+  IOLockLock(gPortLock);
+  if (gCtlUnit == unit) {
+    gCtlUnit = 0;
+    // nothing of the client outlives it: its keys not sent yet are wiped
+    netKeysReset(gKeys);
+    gPortAuthorizeWanted = gPortLeaveWanted = false;
+    gPortResultHead = gPortResultTail = 0;
+  }
+  IOLockUnlock(gPortLock);
+  return 0;
+}
+
+errno_t portSend(kern_ctl_ref, u_int32_t unit, void *, mbuf_t m, int)
+{
+  static uint8_t buffer[PIANO_WIFI_8021X_MSG_MAX];   // one client at a time, and its sends come one at a time (gPortLock)
+  size_t total = 0;
+  for (mbuf_t at = m; at; at = mbuf_next(at)) total += mbuf_len(at);
+  IOLockLock(gPortLock);
+  if (unit != gCtlUnit || total > sizeof buffer || mbuf_copydata(m, 0, total, buffer) != 0) {
+    ++gCtlBadMessages;
+    IOLockUnlock(gPortLock);
+    mbuf_freem(m);
+    return EINVAL;
+  }
+  mbuf_freem(m);
+  NetRequest r = netParseRequest(buffer, uint32_t(total));
+  IOLockLock(gNetLock);
+  const NetLink link = gNetLink;
+  IOLockUnlock(gNetLock);
+  const bool live = link.state != PIANO_WIFI_8021X_STATE_IDLE;
+  const bool stale = r.kind != kNetReqLinkQuery && r.generation != link.generation;
+  int status = 0;
+  bool answerNow = true;
+  switch (r.kind) {
+  case kNetReqEapol: {
+    if (!live) status = ENOTCONN;
+    else if (stale) status = ESTALE;
+    else {
+      uint8_t frame[14 + PIANO_WIFI_8021X_EAPOL_MAX];
+      const uint32_t length = netEapolFrame(frame, sizeof frame, link.own, link.bssid, r.pdu, r.pduLength);
+      IOLockLock(gTxLock);
+      const bool queued = length && netQueuePut(gTxQueue, frame, length, true);
+      IOLockUnlock(gTxLock);
+      status = queued ? 0 : ENOBUFS;
+    }
+    break;
+  }
+  case kNetReqKey:
+    if (!live) status = ENOTCONN;
+    else if (stale) status = ESTALE;
+    else if (!netKeysOffer(gKeys, r.key, r.seq)) status = EBUSY;
+    else answerNow = false;   // the firmware's completion answers it
+    break;
+  case kNetReqAuthorize:
+    if (!live) status = ENOTCONN;
+    else if (stale) status = ESTALE;
+    else if (gPortAuthorizeWanted) status = EBUSY;
+    else {
+      gPortAuthorizeWanted = true;
+      gPortAuthorizeSeq = r.seq;
+      answerNow = false;
+    }
+    break;
+  case kNetReqLeave:
+    if (!live) status = ENOTCONN;
+    else if (stale) status = ESTALE;
+    else {
+      gPortLeaveWanted = true;
+      gPortLeaveSeq = r.seq;
+      gPortLeaveReason = r.reason;
+      answerNow = false;
+    }
+    break;
+  case kNetReqLinkQuery:
+    gPortLinkWanted = true;
+    answerNow = false;
+    break;
+  default:
+    ++gCtlBadMessages;
+    status = r.error ? r.error : EINVAL;
+    break;
+  }
+  netWipeRequest(r);
+  for (uint32_t i = 0; i < sizeof buffer; ++i) buffer[i] = 0;   // a key's bytes do not stay in it
+  IOLockUnlock(gPortLock);
+  // EAPOL_TX is answered only when it was refused (a client sends four of them per handshake)
+  if (answerNow && !(r.kind == kNetReqEapol && status == 0)) portResult(r.seq, r.type, status, 0, link.generation);
+  return 0;
+}
+
+void portRegister()
+{
+  gPortLock = IOLockAlloc();
+  if (!gPortLock) return;
+  kern_ctl_reg reg;
+  bzero(&reg, sizeof reg);
+  strlcpy(reg.ctl_name, PIANO_WIFI_8021X_CONTROL, sizeof reg.ctl_name);
+  reg.ctl_flags = CTL_FLAG_PRIVILEGED;
+  reg.ctl_recvsize = 64 * 1024;   // a burst of EAPOL frames and LINK messages waits there for the client
+  reg.ctl_sendsize = 8 * 1024;
+  reg.ctl_connect = portConnect;
+  reg.ctl_disconnect = portDisconnect;
+  reg.ctl_send = portSend;
+  const errno_t rc = ctl_register(&reg, &gCtlRef);
+  gCtlRegistered = rc == 0;
+  note("level 8: the 802.1X port (the kernel control %s, root only, one client): %s", PIANO_WIFI_8021X_CONTROL,
+       gCtlRegistered ? "registered" : "NOT registered");
+  if (!gCtlRegistered) note("level 8: ctl_register refused it (%d): the WPA2 handshake has no way in", rc);
+}
+
+// ---- en0's side (PianoWifiEthernet's threads) ----
+void netLinkSnapshot(uint32_t state, bool txEapol, bool txData)
+{
+  IOLockLock(gNetLock);
+  gNetLink.state = state;
+  gNetLink.txEapol = txEapol;
+  gNetLink.txData = txData;
+  IOLockUnlock(gNetLock);
+}
+
+// en0's link, told on the ladder's thread (and once by the attach itself).
+void netTellLink(bool up)
+{
+  if (!gNetCallLock) return;
+  IOLockLock(gNetCallLock);
+  IOLockLock(gNetLock);
+  const bool attached = gNetAttached;
+  const piano_wifi_net_client client = gNetClient;
+  uint8_t mac[6];
+  for (unsigned i = 0; i < 6; ++i) mac[i] = gNetLink.own[i];
+  IOLockUnlock(gNetLock);
+  if (attached && client.link) client.link(client.ctx, up ? 1 : 0, mac);
+  gNetToldUp = up;
+  gNetToldAny = true;
+  IOLockUnlock(gNetCallLock);
+}
+
+}  // namespace
+
+extern "C" int piano_wifi_net_attach(const struct piano_wifi_net_client *client)
+{
+  if (!client || client->version != PIANO_WIFI_NET_VERSION || !client->input || !client->link) return EINVAL;
+  if (!gNetLock || !gNetCallLock) return ENODEV;
+  IOLockLock(gNetCallLock);
+  IOLockLock(gNetLock);
+  if (gNetAttached) {
+    IOLockUnlock(gNetLock);
+    IOLockUnlock(gNetCallLock);
+    return EBUSY;
+  }
+  gNetClient = *client;
+  gNetAttached = true;
+  const bool up = gNetLink.txData;
+  uint8_t mac[6];
+  for (unsigned i = 0; i < 6; ++i) mac[i] = gNetLink.own[i];
+  IOLockUnlock(gNetLock);
+  client->link(client->ctx, up ? 1 : 0, mac);
+  IOLockUnlock(gNetCallLock);
+  return 0;
+}
+
+extern "C" void piano_wifi_net_detach(void *ctx)
+{
+  if (!gNetLock || !gNetCallLock) return;
+  IOLockLock(gNetCallLock);   // no callback runs once this is held
+  IOLockLock(gNetLock);
+  if (gNetAttached && gNetClient.ctx == ctx) {
+    gNetAttached = false;
+    gNetClient = piano_wifi_net_client{};
+  }
+  IOLockUnlock(gNetLock);
+  IOLockUnlock(gNetCallLock);
+}
+
+extern "C" int piano_wifi_net_send(const uint8_t *frame, uint32_t length)
+{
+  if (!frame || length < 14 || length > PIANO_WIFI_NET_FRAME_MAX) return EMSGSIZE;
+  if (!gNetLock || !gTxLock) return ENETDOWN;
+  IOLockLock(gNetLock);
+  const bool open = gNetLink.txData;
+  IOLockUnlock(gNetLock);
+  if (!open) return ENETDOWN;
+  IOLockLock(gTxLock);
+  const bool queued = netQueuePut(gTxQueue, frame, length, frame[12] == 0x88 && frame[13] == 0x8e);
+  IOLockUnlock(gTxLock);
+  return queued ? 0 : ENOBUFS;
+}
+
+namespace {
+
+void netRegister()
+{
+  gNetLock = IOLockAlloc();
+  gNetCallLock = IOLockAlloc();
+  gTxLock = IOLockAlloc();
+}
+
+// ---- the ladder's side ----
+// The LINK message of the moment.
+void portSendLink(uint32_t state)
+{
+  piano_wifi_8021x_link l;
+  bzero(&l, sizeof l);
+  l.version = PIANO_WIFI_8021X_VERSION;
+  l.state = state;
+  IOLockLock(gNetLock);
+  l.generation = gNetLink.generation;
+  for (unsigned i = 0; i < 6; ++i) {
+    l.own[i] = gNetLink.own[i];
+    l.bssid[i] = gNetLink.bssid[i];
+  }
+  IOLockUnlock(gNetLock);
+  l.aid = gSta.aid;
+  l.freq = uint16_t(gSta.choice.freq);
+  l.security = gSta.rsn ? 1 : 0;
+  l.pairwise = gSta.rsn ? gSta.pairwise : 0;
+  l.group = gSta.rsn ? gSta.groupCipher : 0;
+  l.akm = gSta.rsn ? gSta.akm : 0;
+  l.reason = gL8.lastReason;
+  if (gSta.rsn) {
+    const ScanEntry &net = gSta.choice.net;
+    l.ap_rsn_len = net.rsnElementLength <= sizeof l.ap_rsn ? net.rsnElementLength : 0;
+    for (uint32_t i = 0; i < l.ap_rsn_len; ++i) l.ap_rsn[i] = net.rsnElement[i];
+    l.own_rsn_len = uint8_t(netRsnElement(l.own_rsn, sizeof l.own_rsn, gSta.groupCipher, gSta.pairwise, gSta.akm));
+  }
+  uint8_t m[kNetHdrBytes + sizeof l];
+  const uint32_t n = netBuildLink(m, sizeof m, ++gL8.portSeq, l);
+  if (n) portEnqueue(m, n);
+}
+
+void level8Status(uint64_t now, const char *why)
+{
+  const DpStats &st = gDp.st;
+  uint32_t queued = 0, full = 0, sent = 0, dropped = 0;
+  IOLockLock(gTxLock);
+  queued = netQueueCount(gTxQueue);
+  full = gTxQueue.full;
+  sent = gTxQueue.sent;
+  dropped = gTxQueue.dropped;
+  IOLockUnlock(gTxLock);
+  IOLockLock(gPortLock);
+  const uint32_t unit = gCtlUnit, connects = gCtlConnects, bad = gCtlBadMessages;
+  IOLockUnlock(gPortLock);
+  note("level 8 %s (%llu ms after the association): received %u entries, %u frames (%u bytes), %u EAPOL (to the port %u, "
+       "no client %u), to en0 %u (%u dropped while en0's link was down); not delivered: not done %u, errors %u (last %#x), "
+       "null data %u, more than one buffer %u, not Ethernet %u, bad cookie %u, link descriptors %u; buffers posted again %u "
+       "(%u with no room), released %u/%u (%u posted again), exceptions %u (push %u error %u); refill: the firmware's tail at %u",
+       why, (unsigned long long)(gL8.associatedAt ? now - gL8.associatedAt : 0), st.rxEntries, st.rxFrames, st.rxBytes,
+       st.rxEapol, gL8.eapolToPort, gL8.eapolDropped, gL8.toEn0, gL8.en0Dropped, st.rxNotDone, st.rxErrors, st.lastErrors,
+       st.rxNullData, st.rxMulti, st.rxNotEthernet, st.rxBadCookie, st.rxLinkDesc, st.rxRecycled, st.rxRecycleFull,
+       st.rel1Entries, st.rel3Entries, st.relRecycled, st.excEntries, st.lastPushReason, st.lastErrorCode, gHtt.refillTaken);
+  note("level 8 %s: sent %u frames (%u bytes, %u EAPOL), completions %u (acknowledged %u, not %u, last reason %u, by the "
+       "firmware %u, other %u, bad cookie %u); held back: not ready %u, no buffer %u, ring full %u; the queue: %u waiting, %u "
+       "sent, %u dropped, %u refused as full; the port: %s (%u connect(s), %u bad message(s)), %u message(s) out (%u failed); "
+       "keys: %u command(s), %u installed, %u refused, %u not answered",
+       why, st.txFrames, st.txBytes, st.txEapol, st.txCompletions, st.txAcked, st.txNotAcked, st.lastTxReason, st.txFwReleased,
+       st.txOtherRelease, st.txBadCookie, st.txNotReady, st.txNoBuffer, st.txRingFull, queued, sent, dropped, full,
+       unit ? "a client connected" : "no client", connects, bad, gL8.portOut, gL8.portOutFailed, gL8.keyCommands,
+       gKeys.installed, gKeys.refused, gL8.keyTimeouts);
+}
+
+// Before the join: the receive ring selection for both radio buffer rings (the TLVs where WifiHw.h has them, data frames to
+// the host). Sent on the data interface's endpoint; a turn without a transport buffer tries again.
+void level8Begin(uint64_t now)
+{
+  gL8 = Level8{};
+  gL8.on = gDpPlanned && gDp.programmed;
+  gL8.lastStatus = now;
+  if (!gL8.on) {
+    note("level 8: not run: the data path's rings were %s", gDpPlanned ? "planned but not programmed" : "not planned");
+    return;
+  }
+  note("level 8: piano-wifi-l8=%#x (buffers to software ring 1 %u, the receive ring selection %u, the transmit side %u, "
+       "EAPOL also to en0 %u); the rings: transmit %u, its completions %u, received %u, exceptions %u, released 2 x %u, idle "
+       "link %u (%u link descriptors), %u transmit buffers; %u register writes; cookie conversion %s (%#x, %#x)",
+       gArgs.l8, (gArgs.l8 & kL8RbmSw1) ? 1u : 0u, (gArgs.l8 & kL8RxSelection) ? 1u : 0u, (gArgs.l8 & kL8Tx) ? 1u : 0u,
+       (gArgs.l8 & kL8EapolToEn0) ? 1u : 0u, kDpTclEntries, kDpTxCompEntries, kDpReoEntries, kDpReoExcEntries, kDpRelEntries,
+       kDpIdleEntries, gDp.linkDescs, kDpTxBuffers, gDp.writes, dpCookieConversionOn(gDp) ? "ON (something set it up)" : "off",
+       gDp.reoCookieCfg, gDp.wbmCookieConvert);
+  if (!(gArgs.l8 & kL8RxSelection)) gL8.selectionSent = true;
+}
+
+void level8Selection()
+{
+  if (gL8.selectionSent || gL8.selectionTries > 200) return;
+  ++gL8.selectionTries;
+  while (gL8.selections < kRxRadios) {
+    uint8_t m[kHttRxSelectionWords * 4];
+    const uint32_t n = httBuildRxSelection(m, sizeof m, gL8.selections);
+    const int rc = n ? linkSendHtt(gLink, m, n) : -1;
+    if (rc != 1) {
+      if (rc < 0) {
+        note("level 8: the receive ring selection for radio ring %u was refused by the transport: data frames may not reach "
+             "the host", gL8.selections);
+        gL8.selectionSent = true;
+      }
+      return;
+    }
+    ++gL8.selections;
+  }
+  gL8.selectionSent = true;
+  note("level 8: the receive ring selection sent for both radio buffer rings (data frames to the host, the descriptor's "
+       "TLVs at 0, 140 and 264, the frame at %u)", kRxDescBytes);
+}
+
+// One received frame: EAPOL to the port, everything else to en0 (while its link is up).
+void level8Deliver(uint32_t kind, const uint8_t *frame, uint32_t length, uint64_t now)
+{
+  if (!gL8.firstRxAt) {
+    gL8.firstRxAt = now;
+    note("level 8: the first frame of the data path: %u bytes, %s, %llu ms after the association", length,
+         kind == kDpRxEapol ? "EAPOL" : "Ethernet", (unsigned long long)(gL8.associatedAt ? now - gL8.associatedAt : 0));
+  }
+  if (kind == kDpRxEapol) {
+    bool fromAp = true;
+    for (unsigned i = 0; i < 6; ++i) fromAp = fromAp && frame[6 + i] == gSta.bssid[i];
+    if (!fromAp) ++gL8.eapolNotFromAp;
+    const uint8_t *pdu = frame + 14;
+    const uint32_t pduLength = length - 14;
+    const EapolKind k = netEapolKind(pdu, pduLength);
+    if (k.message < 7) ++gL8.eapolMsg[k.message];
+    if (!gL8.firstEapolAt) gL8.firstEapolAt = now;
+    IOLockLock(gPortLock);
+    const bool client = gCtlUnit != 0;
+    IOLockUnlock(gPortLock);
+    if (gL8.eapolLogged < 24) {
+      ++gL8.eapolLogged;
+      note("level 8: EAPOL frame %u %s: %u bytes (PDU %u), %s (descriptor %u, key information %#x, key data %u bytes), "
+           "%llu ms after the association; %s",
+           gDp.st.rxEapol, fromAp ? "from the access point" : "NOT from the access point", length, pduLength,
+           netEapolMessageName(k.message), k.descriptor, k.keyInfo, k.keyDataLength,
+           (unsigned long long)(gL8.associatedAt ? now - gL8.associatedAt : 0),
+           client ? "handed to the 802.1X port" : "no 802.1X client is connected: counted only");
+      deferPhase();
+    }
+    if (client && pduLength <= PIANO_WIFI_8021X_EAPOL_MAX) {
+      static uint8_t m[kNetHdrBytes + sizeof(piano_wifi_8021x_eapol) + PIANO_WIFI_8021X_EAPOL_MAX];
+      IOLockLock(gNetLock);
+      const uint32_t generation = gNetLink.generation;
+      IOLockUnlock(gNetLock);
+      const uint32_t n = netBuildEapolRx(m, sizeof m, ++gL8.portSeq, generation, frame + 6, pdu, pduLength);
+      if (n) {
+        portEnqueue(m, n);
+        ++gL8.eapolToPort;
+      }
+    } else {
+      ++gL8.eapolDropped;
+    }
+    if (!(gArgs.l8 & kL8EapolToEn0)) return;
+  }
+  if (!gNetToldUp && kind != kDpRxEapol) {
+    ++gL8.en0Dropped;
+    return;
+  }
+  IOLockLock(gNetCallLock);
+  IOLockLock(gNetLock);
+  const bool attached = gNetAttached;
+  const piano_wifi_net_client client = gNetClient;
+  IOLockUnlock(gNetLock);
+  if (attached && client.input) {
+    client.input(client.ctx, frame, length);
+    ++gL8.toEn0;
+  } else {
+    ++gL8.en0Dropped;
+  }
+  IOLockUnlock(gNetCallLock);
+}
+
+// The association's state, as the join machine has it, into the data path, en0 and the port.
+void level8Follow(uint64_t now)
+{
+  const bool associated = gSta.vdevUp && !gSta.disconnect && (gSta.step == kStaAssociated || gSta.step == kStaAuthorize);
+  if (associated && !gL8.txUp) {
+    gL8.txUp = true;
+    gL8.associatedAt = gSta.associatedAt ? gSta.associatedAt : now;
+    const HttPeerMap *peer = httPeerMapOf(gHtt, gLink.options.vdevId, gSta.bssid);
+    if (gArgs.l8 & kL8Tx) dpTxSetupPeer(gDp, gChipIo, gLink.options.vdevId, kDpPdevSingle, peer);
+    IOLockLock(gNetLock);
+    ++gNetLink.generation;
+    for (unsigned i = 0; i < 6; ++i) {
+      gNetLink.own[i] = gLink.vdevMac[i];
+      gNetLink.bssid[i] = gSta.bssid[i];
+    }
+    const uint32_t generation = gNetLink.generation;
+    IOLockUnlock(gNetLock);
+    IOLockLock(gPortLock);
+    netKeysReset(gKeys);
+    IOLockUnlock(gPortLock);
+    netLinkSnapshot(PIANO_WIFI_8021X_STATE_ASSOCIATED, gDp.txReady, false);
+    note("level 8: the station's data path is up (generation %u): the transmit side %s (bank %#x, search index %s), %s",
+         generation, gDp.txReady ? "ready" : "off (piano-wifi-l8 bit 4)", kDpBankStation,
+         peer && peer->hasSearch ? "from the peer map" : "0: the peer map carried none",
+         gSta.rsn ? "the port is closed until the 802.1X client authorizes it (the four-way handshake)"
+                  : "an open network: the port opens at once");
+    gL8.lastState = PIANO_WIFI_8021X_STATE_ASSOCIATED;
+    portSendLink(PIANO_WIFI_8021X_STATE_ASSOCIATED);
+    deferPhase();
+  }
+  if (gL8.txUp && associated && gSta.authorized && !gL8.linkUpTold) {
+    gL8.linkUpTold = true;
+    netLinkSnapshot(PIANO_WIFI_8021X_STATE_AUTHORIZED, gDp.txReady, gDp.txReady);
+    netTellLink(true);
+    gL8.lastState = PIANO_WIFI_8021X_STATE_AUTHORIZED;
+    portSendLink(PIANO_WIFI_8021X_STATE_AUTHORIZED);
+    note("level 8: the port is open: en0's link is up%s", gNetAttached ? "" : " (en0 is not attached yet: it is told when it is)");
+    deferPhase();
+  }
+  if (gL8.txUp && !associated) {
+    gL8.txUp = false;
+    gL8.linkUpTold = false;
+    gL8.lastReason = uint16_t(gSta.disconnectReason);
+    dpTxStop(gDp);
+    netLinkSnapshot(PIANO_WIFI_8021X_STATE_IDLE, false, false);
+    if (gNetToldUp) netTellLink(false);
+    IOLockLock(gTxLock);
+    netQueueClear(gTxQueue);
+    IOLockUnlock(gTxLock);
+    IOLockLock(gPortLock);
+    netKeysReset(gKeys);
+    IOLockUnlock(gPortLock);
+    gL8.lastState = PIANO_WIFI_8021X_STATE_IDLE;
+    portSendLink(PIANO_WIFI_8021X_STATE_IDLE);
+    level8Status(now, "at the association's end");
+  }
+}
+
+// The port's requests: a key (one at a time, the pairwise one first), the authorization, the leave; and its answers out.
+void level8Requests(uint64_t now)
+{
+  // the answers queued by the client's thread or by this one
+  for (;;) {
+    IOLockLock(gPortLock);
+    if (gPortResultTail == gPortResultHead) {
+      IOLockUnlock(gPortLock);
+      break;
+    }
+    const PortResult r = gPortResult[gPortResultTail];
+    gPortResultTail = (gPortResultTail + 1) % kPortResults;
+    IOLockUnlock(gPortLock);
+    uint8_t m[kNetHdrBytes + sizeof(piano_wifi_8021x_result)];
+    const uint32_t n = netBuildResult(m, sizeof m, r.seq, r.request, r.status, r.detail, r.generation);
+    if (n) portEnqueue(m, n);
+  }
+  IOLockLock(gPortLock);
+  const bool linkWanted = gPortLinkWanted;
+  gPortLinkWanted = false;
+  IOLockUnlock(gPortLock);
+  if (linkWanted) portSendLink(gL8.lastState);
+  if (!gL8.txUp || gSta.outLength) return;   // the join's own command first
+  IOLockLock(gNetLock);
+  const uint32_t generation = gNetLink.generation;
+  IOLockUnlock(gNetLock);
+  // a key's completion, or its time running out
+  if (gKeys.inFlight && (gL8.keyAnswered || now > gKeys.inFlightAt + 2000)) {
+    const bool answered = gL8.keyAnswered;
+    const bool ok = answered && gL8.key.status == 0;
+    gL8.keyAnswered = false;
+    IOLockLock(gPortLock);
+    const bool group = gKeys.inFlightGroup;
+    const uint32_t seq = netKeysDone(gKeys, ok);
+    IOLockUnlock(gPortLock);
+    if (!answered) ++gL8.keyTimeouts;
+    note("level 8: the %s key: %s", group ? "group" : "pairwise",
+         ok ? "installed" : answered ? "refused by the firmware" : "not answered within 2 s");
+    portResult(seq, PIANO_WIFI_8021X_KEY, ok ? 0 : answered ? EIO : ETIMEDOUT, answered ? gL8.key.status : 0, generation);
+  }
+  // the next key
+  IOLockLock(gPortLock);
+  uint32_t seq = 0;
+  const piano_wifi_8021x_key *next = netKeysNext(gKeys, &seq);
+  if (next) {
+    KeyInstall k;
+    k.vdevId = gLink.options.vdevId;
+    k.index = next->index;
+    k.group = next->group != 0;
+    k.cipher = next->cipher == kRsnCipherTkip ? kWmiCipherTkip : kWmiCipherCcmp;
+    for (unsigned i = 0; i < 6; ++i) k.peer[i] = gSta.bssid[i];
+    k.key = next->key;
+    k.keyBytes = next->key_len;
+    k.rsc = next->rsc & 0xffffffffffffull;
+    WmiWriter w;
+    const uint32_t n = assocBuildInstallKey(w, gL8Out, sizeof gL8Out, k);
+    const int rc = n ? linkSendWmi(gLink, gL8Out, n) : -1;
+    for (uint32_t i = 0; i < sizeof gL8Out; ++i) gL8Out[i] = 0;   // the key's bytes do not stay in our buffer
+    if (rc == 1) {
+      const bool group = k.group;
+      netKeysSent(gKeys, group, now);
+      IOLockUnlock(gPortLock);
+      ++gL8.keyCommands;
+      gL8.keyAnswered = false;
+      note("level 8: the %s key sent to the firmware (index %u, %u bytes, %s)", group ? "group" : "pairwise", k.index,
+           k.keyBytes, k.cipher == kWmiCipherTkip ? "TKIP" : "CCMP-128");
+      return;
+    }
+    IOLockUnlock(gPortLock);
+    if (rc < 0) note("level 8: the key's command could not be built or sent");
+    return;
+  }
+  const bool authorize = gPortAuthorizeWanted && !gKeys.inFlight;
+  const uint32_t authorizeSeq = gPortAuthorizeSeq;
+  const bool leave = gPortLeaveWanted;
+  const uint32_t leaveSeq = gPortLeaveSeq;
+  const uint16_t leaveReason = gPortLeaveReason;
+  IOLockUnlock(gPortLock);
+  if (authorize) {
+    if (gSta.authorized) {
+      IOLockLock(gPortLock);
+      gPortAuthorizeWanted = false;
+      IOLockUnlock(gPortLock);
+      portResult(authorizeSeq, PIANO_WIFI_8021X_AUTHORIZE, 0, 0, generation);
+    } else {
+      WmiWriter w;
+      const uint8_t *peer = gSta.bssid;
+      const uint32_t n = assocBuildPeerSetParam(w, gL8Out, sizeof gL8Out, gLink.options.vdevId, peer, kWmiPeerParamAuthorize, 1);
+      const int rc = n ? linkSendWmi(gLink, gL8Out, n) : -1;
+      if (rc != 0) {
+        IOLockLock(gPortLock);
+        gPortAuthorizeWanted = false;
+        IOLockUnlock(gPortLock);
+        if (rc == 1) gSta.authorized = true;
+        note("level 8: the 802.1X client authorized the port: %s", rc == 1 ? "the peer is authorized" : "the command failed");
+        portResult(authorizeSeq, PIANO_WIFI_8021X_AUTHORIZE, rc == 1 ? 0 : EIO, 0, generation);
+      }
+    }
+    return;
+  }
+  if (leave) {
+    IOLockLock(gPortLock);
+    gPortLeaveWanted = false;
+    IOLockUnlock(gPortLock);
+    note("level 8: the 802.1X client gave up (reason %u): the association is taken down", leaveReason);
+    staStop(gSta, now);
+    portResult(leaveSeq, PIANO_WIFI_8021X_LEAVE, 0, 0, generation);
+  }
+}
+
+// The frames waiting to go out: EAPOL ones once associated, the rest once the port is open.
+void level8Transmit()
+{
+  for (unsigned budget = 0; budget < 16; ++budget) {
+    IOLockLock(gTxLock);
+    const NetFrame *f = netQueuePeek(gTxQueue);
+    if (!f) {
+      IOLockUnlock(gTxLock);
+      return;
+    }
+    if (!gDp.txReady || (!f->eapol && !gSta.authorized)) {
+      netQueuePop(gTxQueue, false);
+      IOLockUnlock(gTxLock);
+      continue;
+    }
+    const bool sent = dpSend(gDp, gChipIo, f->bytes, f->length);
+    if (sent) netQueuePop(gTxQueue, true);
+    IOLockUnlock(gTxLock);
+    if (!sent) return;   // no buffer or no ring entry: the completions of the next turn free them
+  }
+}
+
+// One turn of level 8 on the ladder's thread.
+void level8Turn(uint64_t now)
+{
+  if (!gL8.on) return;
+  level8Selection();
+  dpPoll(gDp, gChipIo, [&](uint32_t kind, const uint8_t *frame, uint32_t length) { level8Deliver(kind, frame, length, now); });
+  level8Follow(now);
+  level8Requests(now);
+  level8Transmit();
+  if (gArgs.l8status && gL8.txUp && now >= gL8.lastStatus + gArgs.l8status) {
+    gL8.lastStatus = now;
+    level8Status(now, "while associated");
+  }
+}
+
+void level8End(IOService *owner, uint64_t now)
+{
+  if (!gL8.on) return;
+  if (gL8.txUp) {
+    gL8.txUp = false;
+    dpTxStop(gDp);
+    netLinkSnapshot(PIANO_WIFI_8021X_STATE_IDLE, false, false);
+    if (gNetToldUp) netTellLink(false);
+    gL8.lastState = PIANO_WIFI_8021X_STATE_IDLE;
+    portSendLink(PIANO_WIFI_8021X_STATE_IDLE);
+  }
+  IOLockLock(gTxLock);
+  netQueueClear(gTxQueue);
+  IOLockUnlock(gTxLock);
+  IOLockLock(gPortLock);
+  netKeysReset(gKeys);
+  IOLockUnlock(gPortLock);
+  level8Status(now, "at its end");
+  note("level 8: EAPOL by message: four-way 1 %u, 2 %u, 3 %u, 4 %u; group 1 %u, 2 %u; other %u; not from the access point %u; "
+       "the first frame %llu ms and the first EAPOL frame %llu ms after the association",
+       gL8.eapolMsg[1], gL8.eapolMsg[2], gL8.eapolMsg[3], gL8.eapolMsg[4], gL8.eapolMsg[5], gL8.eapolMsg[6], gL8.eapolMsg[0],
+       gL8.eapolNotFromAp,
+       (unsigned long long)(gL8.firstRxAt && gL8.associatedAt ? gL8.firstRxAt - gL8.associatedAt : 0),
+       (unsigned long long)(gL8.firstEapolAt && gL8.associatedAt ? gL8.firstEapolAt - gL8.associatedAt : 0));
+  char state[200];
+  snprintf(state, sizeof state, "rx %u eapol %u (m1 %u m3 %u) tx %u acked %u keys %u authorized %u", gDp.st.rxFrames,
+           gDp.st.rxEapol, gL8.eapolMsg[1], gL8.eapolMsg[3], gDp.st.txFrames, gDp.st.txAcked, gKeys.installed,
+           gSta.authorized ? 1u : 0u);
+  if (owner) owner->setProperty("piano-wifi-level8", state);
+}
+
+// The firmware's answer to a key (the only event level 8 reads itself).
+bool level8Event(uint32_t id, const uint8_t *payload, uint32_t length)
+{
+  if (!gL8.on || id != uint32_t(kWmiEvtVdevInstallKeyComplete)) return false;
+  KeyComplete k;
+  if (!assocParseKeyComplete(k, payload, length)) return false;
+  gL8.key = k;
+  gL8.keyAnswered = true;
+  ++gL8.keyComplete;
+  return true;
+}
+
 int level7(IOService *owner)
 {
   using namespace stadetail;
@@ -3182,6 +3930,7 @@ int level7(IOService *owner)
   gSta.report = staReport;
   gSta.ctx = nullptr;
   const uint64_t started = nowMs();
+  if (gArgs.level >= 8) level8Begin(started);
   staBegin(gSta, o, env, started);
   gLink.hook = staHook;
   uint32_t generation = 0;
@@ -3211,6 +3960,7 @@ int level7(IOService *owner)
       why = linkErrorName(gLink.error);
       break;
     }
+    if (gArgs.level >= 8) level8Turn(now);
     // The root-only profile file, read by the kext itself while the join waits (a RAM probe's Data may have no helper); the
     // sysctl stays the other way in, and whichever comes first is taken.
     if (!gSta.profileSet && gArgs.l7file && gSta.step == kStaProfileWait && now >= nextFileTry && gProfileLock) {
@@ -3289,6 +4039,7 @@ int level7(IOService *owner)
          "buffer rings filled to %u and %u; status buffers given back %u, error entries %u",
          gHtt.peerMaps, gHtt.peerUnmaps, gHtt.t2hMessages, gHtt.refillTaken, gHtt.macBufFilled[0], gHtt.macBufFilled[1],
          gHtt.statusRecycled, gHtt.errorsSeen);
+  if (gArgs.level >= 8) level8End(owner, nowMs());
   char state[200];
   snprintf(state, sizeof state, "step %d %s%s%s; aid %u, status %u/%u, %s", at, staStepName(at), done ? "" : ": ",
            done ? "" : staErrorName(gSta.error), gSta.aid, gSta.authStatus, gSta.assocStatus, staDisconnectName(gSta.disconnect));
@@ -3339,7 +4090,11 @@ bool PianoWifi::start(IOService *provider)
          "phase timeout %u ms, qmi timeout %u ms, iova %u, mode %u, shadow %u, wmi timeout %u ms, scan wait %u ms, band %u, "
          "bssid %u)",
          gArgs.level >= 4 ? ", 4 MHI firmware" : "", gArgs.level >= 5 ? ", 5 QMI" : "",
-         gArgs.level >= 7 ? ", 6 the copy engine, the transport and a scan, 7 the join" : gArgs.level >= 6 ? ", 6 the copy engine, the transport and a scan" : "", gArgs.gen, gArgs.physeq, gArgs.rcg,
+         gArgs.level >= 8   ? ", 6 the copy engine, the transport and a scan, 7 the join, 8 the data path"
+         : gArgs.level >= 7 ? ", 6 the copy engine, the transport and a scan, 7 the join"
+         : gArgs.level >= 6 ? ", 6 the copy engine, the transport and a scan"
+                            : "",
+         gArgs.gen, gArgs.physeq, gArgs.rcg,
          gArgs.blind, gArgs.release, gArgs.stop, gArgs.dmaMib, gArgs.fwTimeoutMs, gArgs.qmiTimeoutMs, gArgs.iova, gArgs.mode,
          gArgs.shadow, gArgs.wmiTimeoutMs, gArgs.scanWaitMs, gArgs.band, gArgs.bssid);
   if (gArgs.level >= 3)
@@ -3352,12 +4107,15 @@ bool PianoWifi::start(IOService *provider)
     note("options: rddm %u (crash dump), defer %u (lines held from the doorbell, printed by a helper thread), wake %u (device "
          "wake), deadline %u ms (each level's hard deadline)",
          gArgs.rddm, gArgs.defer, gArgs.wake, gArgs.deadlineMs);
-  if (gArgs.level > 7) note("piano-wifi=%u: levels above 7 are not implemented; running up to level 7", gArgs.level);
+  if (gArgs.level > 8) note("piano-wifi=%u: levels above 8 are not implemented; running up to level 8", gArgs.level);
   note("level 1: loads only, nothing written%s", gArgs.spmi || gArgs.level >= 2 ? "; SPMI observer read commands for the PMIC part"
                                                                                : "");
   setProperty("piano-wifi", gArgs.level, 32);
   // Level 7's join profile has a way in from level 6 on (the scan's list is what a join picks from); nothing reads it below.
   if (gArgs.level >= 6) registerJoinSysctl();
+  // en0's way in (PianoWifiNet.h) exists whenever PianoWifiEthernet may attach; the 802.1X port only with level 8.
+  if (gArgs.level >= 6) netRegister();
+  if (gArgs.level >= 8) portRegister();
   // From level 2 on something is powered, so the driver joins the power tree: its kOff stops the radio (the power contract,
   // package/include/PianoPowerContract.h). Below level 2 nothing of the chip is on and there is nothing to do.
   if (gArgs.level >= 2) {
