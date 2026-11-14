@@ -92,9 +92,11 @@ meanings: `docs/drivers/wifi.md`.
 | `WifiWmi.h` | portable: the firmware's message interface — the codec, the initialisation, the capability and ready events, a virtual device, the scan, the management-frame parse and the scan list |
 | `WifiLink.h` | portable: level 6's ladder over those three, as one step machine with a clock and one outstanding command; with level 7 it keeps the device after the scan and hands its transport over (an event hook, `linkSendWmi`) |
 | `WifiSta.h` | portable: level 7, the join — the profile's network chosen from the scan list, the station's parameters, the peer and its HTT peer map, its default routing and 17 reorder queues, the start, Open System authentication, the association, the peer's association, the station up, the watch, the teardown |
+| `WifiDp.h` | portable: level 8, the data path — the transmit, completion, reorder, exception, release and idle link rings the host programs itself, the reorder unit's set-up, the receive ring selection, the receive turn (frames out of their buffers, EAPOL told apart, every buffer posted again) and a frame sent |
+| `WifiNet.h`, `PianoWifiNet.h` | the network boundary (docs §13.7): `PianoWifiNet.h` is the C contract en0 and user space include (the in-kernel frame interface, the 802.1X port's messages); `WifiNet.h` its portable side (the messages read and built, EAPOL frames wrapped, the handshake's messages named, the frame queue, the keys' order) |
 | `WifiDot11.h` | portable: the 802.11 frames of the join (authentication, association request with the RSN element, the answers, deauthentication), from IEEE 802.11 |
 | `WifiProfile.h` | the join profile's structure and rules, shared with `tooling/native/piano-wifi-join` |
-| `PianoWifiEthernet.cpp` | the macOS side: `en1` (built in, link down) with the scan list; its own kext, gated on the resource `PianoWifiLink` |
+| `PianoWifiEthernet.cpp` | the macOS side: `en0` on the 27.3 line (built in) with the scan list, and with level 8 the station's 802.3 frames and link through PianoWifi's boundary; its own kext, gated on the resource `PianoWifiLink`, linked against PianoWifi |
 | `WifiHw.h` | the register facts, each with its source |
 | `SpmiObserver.h`, `SmmuStream.h`, `FatVolume.c/.h` | copies of PianoPower's and PianoDwc3's (`UPSTREAM`; those packages are not modified) |
 | `tests/wifi_host.cpp` | host tests of level 1 against register models (gates, decoders, SMMU, cmd-db, PMIC) |
@@ -102,6 +104,7 @@ meanings: `docs/drivers/wifi.md`.
 | `tests/qmi_host.cpp` | host tests of level 5: the QMI codec, the copied router, the two MHI channels, the firmware's service and the 32-bit window, each with injected faults |
 | `tests/wmi_host.cpp` | host tests of level 6: the copy engine's registers and rings against a model of the chip, the transport's handshake and credits, the initialisation's TLVs, the scan and its list, the hand-off to level 7, each with injected faults |
 | `tests/assoc_host.cpp`, `tests/sta_host.cpp` | host tests of level 7: its messages read back as the firmware reads them; the frames, the choice, the reorder queues, the peer map and the whole join against a firmware and access-point model (refusals, silence, a late profile, a disconnect, a stop) |
+| `tests/dp_host.cpp`, `tests/net_host.cpp` | host tests of level 8: the rings' registers, the received frames and their buffers, a frame sent and its completion against a ring model; the 802.1X port's messages, the EAPOL frames, the frame queue and the keys' order |
 
 Build: `tooling/k27/build-native-piano-wifi.sh` (the four host test programs, the `FatVolume.c` drift check, the objects, the
 import check) and `tooling/k27/build-native-piano-wifi-ethernet.sh` for the macOS side. Both are in

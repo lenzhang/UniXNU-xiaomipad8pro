@@ -160,6 +160,14 @@ four-way handshake in user space) and the data path are the next two pieces; unt
 association after a few seconds, and level 7 logs how. Host-tested in `tests/sta_host.cpp` against a firmware and access-point
 model. Next: §8.8 boot 10a.
 
+**Level 8, the data path (`piano-wifi=8`, §13.6) and the network boundary (§13.7), is built (2026-11-14, host-tested; first
+probe `ram-k273-wifi-10c`, §8.8 boot 10c).** The host programs the transmit, completion, reorder, exception, release and idle
+link rings itself at level 6's start, sends the receive ring selection, keeps the refill ring full (every buffer that comes
+back is posted again), and carries 802.3 frames to and from en0 (PianoWifiEthernet). EAPOL frames go to the **802.1X port**,
+a root-only kernel control socket over which user space runs the four-way handshake and installs the keys and opens the port
+(`package/PianoWifi/PianoWifiNet.h`). Gate of boot 10c: message 1 of the four-way handshake received from the access point
+and counted (length only).
+
 Level 7's **messages** are built and host-tested (`package/PianoWifi/WifiAssoc.h`, `tests/assoc_host.cpp`): the regulatory
 rules, `WMI_SCAN_CHAN_LIST`, `WMI_VDEV_START`/`UP`/`STOP`/`DOWN`, `WMI_PEER_CREATE`/`ASSOC`/`SET_PARAM`,
 `WMI_VDEV_INSTALL_KEY` and `WMI_MGMT_TX`; the step machine that drives them, the four-way handshake and the path the
@@ -277,7 +285,7 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 
 | Boot arg | Default | Effect |
 |---|---|---|
-| `piano-wifi=N` | 0 (probe() declines, nothing mapped) | 1: the read-only survey (loads only); 2: + the power sequence; 3: + the link, BAR0 and the SMMU stream; 4: + the firmware over MHI; 5: + the IPC router channels, QRTR and the firmware's QMI service; 6: + the copy engine, the host transport, the firmware's message interface and a passive scan (and `piano-wifi-mode` defaults to 1, since level 6 needs the firmware's radio running); 7: + the join on level 6's virtual device (§13.3); above 7: runs level 7 |
+| `piano-wifi=N` | 0 (probe() declines, nothing mapped) | 1: the read-only survey (loads only); 2: + the power sequence; 3: + the link, BAR0 and the SMMU stream; 4: + the firmware over MHI; 5: + the IPC router channels, QRTR and the firmware's QMI service; 6: + the copy engine, the host transport, the firmware's message interface and a passive scan (and `piano-wifi-mode` defaults to 1, since level 6 needs the firmware's radio running); 7: + the join on level 6's virtual device (§13.3); 8: + the data path and the 802.1X port (§13.6, §13.7); above 8: runs level 8 |
 | `piano-wifi-gen=N` | 2 | the root port's target link speed (1–3). Gen3 needs cx/mx at NOM, which nothing here votes |
 | `piano-wifi-physeq=0` | 1 | apply only the PHY sequence's frame writes (power-down, reset release, start), not the 128-write table: tells "the table is wrong for piano" from "the PHY does not come up at all" |
 | `piano-wifi-rcg=0` | 1 | leave the aux / rchng RCG sources as the boot stages left them |
@@ -296,7 +304,7 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-ctxearly=1` | 0 | also write the MHI context and host-range registers before the doorbell (what every boot before the fourth round did). By default they are written once the device reports READY, as the MHI host does |
 | `piano-wifi-ras=0` | 1 | no TLP counters. By default level 4 switches on the DesignWare RAS DES counters of both ends of the link before the doorbell (TLPs by kind, UR, CA, completion timeouts) and logs their deltas (§8.4) |
 | `piano-wifi-rddm=0` | 1 (from the fifth round) | no crash dump. By default level 4 gives the chip the crash dump's vector table before the boot loader's doorbell (nine 512 KiB segments of the DMA window, 0x420000 bytes as this chip's host reserves, right after the receive block's clear, as the MHI host does), and when the firmware reports its crash dump environment or a system error at any level the dump is waited for (at most 4 s) and decoded into a few lines: the header's files, the firmware's failure reason, nothing else (`package/PianoWifi/WifiRddm.h`, §10.24) |
-| `piano-wifi-defer=0`, `=2` | 1 (from the fifth round) | print every line when it is written. By default the ladder's lines from the boot loader's doorbell on are held in a heap buffer (480 lines, 320 before the seventh round; more are counted, not kept; a crash prints them at once and its own lines directly), each with `[+N ms]` since the doorbell, and printed by a helper thread (sixth round): at every phase change (a stage, a level 4 phase, a level 5 or 6 step) and any line held for a second, so the console stalls the helper and never the ladder (wifi-4a: the console held the ladder's thread for 2 s right after mission mode and the firmware was dead when it came back, §10.24), and a ladder that hangs still has its lines out (desk-dev8n: printed only at the ladder's end, which never came). `=2`: held and printed only when the ladder stops, with no helper and no deadline watch (the fifth round's way: the A/B if the helper's console traffic is ever suspected) |
+| `piano-wifi-defer=0`, `=2` | 1 (from the fifth round) | print every line when it is written. By default the ladder's lines from the boot loader's doorbell on are held in a heap buffer (480 lines, 320 before the seventh round; more are counted, not kept; a crash prints them at once and its own lines directly), each with `[+N ms]` since the doorbell, and printed by a helper thread (sixth round; a ring since level 8, a line is dropped only when 480 are waiting to be printed): at every phase change (a stage, a level 4 phase, a level 5 or 6 step) and any line held for a second, so the console stalls the helper and never the ladder (wifi-4a: the console held the ladder's thread for 2 s right after mission mode and the firmware was dead when it came back, §10.24), and a ladder that hangs still has its lines out (desk-dev8n: printed only at the ladder's end, which never came). `=2`: held and printed only when the ladder stops, with no helper and no deadline watch (the fifth round's way: the A/B if the helper's console traffic is ever suspected) |
 | `piano-wifi-deadline=MS` | 60000 (from the sixth round) | the hard deadline of each of levels 4, 5 and 6 as a whole (level 6: at least its own overall bound and 5 s), 10000 to 600000. Every wait inside a level has its own shorter bound; this one ends the level whatever it waits for (a `hard deadline … passed` line, then the level's usual failure), and the helper thread prints `watchdog: level N is … ms past its hard deadline` (every 30 s) when the ladder's thread does not come back from it |
 | `piano-wifi-wake=0` | 1 (from the fifth round) | no device wake doorbell. By default mission mode asserts it (channel 127's doorbell = 1), as the MHI host's mission-mode transition does, it stays asserted while the levels run and is released when the ladder ends well; an M1 the chip reports anyway is answered with M2 and a wake toggle, an M0 by ringing every event ring and running channel again |
 | `piano-wifi-smmu=N` | 1 | 0: the SMMU is left alone (level 4 then needs stream 0x1401 to bypass already); 1: the endpoint's stream 0x1401 through a bypass context bank; 2: also the root port's 0x1400 |
@@ -312,9 +320,11 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-l6pre=N` | `0x1bf` = 447 (P22 §10.27, P23 §10.28; a decimal value is always safe to write) | the radio's set-up between the firmware's ready event and level 6's virtual device, as a bitmask: `0x01` the hardware mode (`WMI_PDEV_SET_HW_MODE`, two bands at once), `0x02` the radio's six parameters, `0x04` the channel list of its regulatory event (`WMI_SCAN_CHAN_LIST`; this driver's own list when no event came), `0x08` a usable device address (never all zeros), `0x10` wait for the regulatory event before the list, `0x20` pace the commands apart so a log names the last one before a firmware death, `0x40` **no scan at all** (the device is created, the level holds and tears down: it tells a death at the device from one at the scan), `0x80` **the receive buffers** (the data interface, its version, the six receive rings, and a second scan after them: the first scan is the A/B control), `0x100` the scan's diagnostics (channel-visit counters, the radio's statistics after each round, event counts), `0x200` the receive buffers return to software ring 1 instead of the firmware's own manager. `0` is the 2026-11-12 boot that asserted the firmware; `63` the 02:05 boot that scanned and kept no frame |
 | `piano-wifi-l6regwait=MS`, `piano-wifi-l6pace=MS`, `piano-wifi-l6hold=MS` | 2000, 50, 8000 | how long level 6 waits for the regulatory event, how far apart it paces the radio's set-up, and how long `0x40` holds after the virtual device |
 | `piano-wifi-l7=N` | `0x3f` = 63 (a decimal value is always safe to write) | level 7's pieces (§13.3, `WifiSta.h` `kStaFlag*`): `0x01` the station's parameters after the virtual device (802.3 out and in, the stream count, three power-save parameters, power save off), `0x02` the peer's data set-up (its default routing and one reorder queue per traffic identifier 0-16), `0x04` wait for the data interface's peer map, `0x08` a 5 GHz access point before a 2.4 GHz one (unless it is weaker than -82 dBm), `0x10` a radar channel may be chosen (joined passively), `0x20` a deauthentication of ours at the teardown, `0x40` native Wi-Fi frames instead of 802.3 (the A/B of `0x01`'s format), `0x80` **a dry run**: the network is chosen and logged, nothing is created; since boot 10a also `0x100` the radio's transmit power limits with `0x01`'s parameters, `0x200` level 7's own scans begin with directed probes naming the profile's network (a network that hides its name), `0x400` an access point that does not answer or refuses is taken down and the next candidate tried. Default since boot 10a: `0x73f` = 1855 |
-| `piano-wifi-l7wait=MS`, `piano-wifi-l7hold=MS` | 600000, 30000 | how long level 7 waits for the join profile after the scan (a RAM probe's profile is written over the USB shell after the boot), and how long an association is watched before the teardown (`0`: until a suspend; the level then has no hard deadline) |
+| `piano-wifi-l7wait=MS`, `piano-wifi-l7hold=MS` | 600000, 30000 (0 at level 8) | how long level 7 waits for the join profile after the scan (a RAM probe's profile is written over the USB shell after the boot), and how long an association is watched before the teardown (`0`: until a suspend; the level then has no hard deadline) |
 | `piano-wifi-l7file=0`, `piano-wifi-l7cands=N` | 1, 4 | `0`: the join profile only through the sysctl (by default the kext also reads the root-only file `/private/var/db/piano-wifi/profile` itself every 2 s while it waits, with the helper's checks); how many access points of the profile's name are tried in turn (at most 6) |
 | `piano-wifi-l7tries=N`, `piano-wifi-l7frame=MS`, `piano-wifi-l7step=MS`, `piano-wifi-l7scans=N` | 3, 500, 3000, 3 | the tries of the authentication and of the association request, the wait for each answer (the association's is twice it), the wait for a command's answer (the start response, the peer map, the confirmation, the teardown's), and how many scans of its own level 7 runs when the network is not in the list |
+| `piano-wifi-l8=N` | `0x17` = 23 | level 8's switches (§13.6, `WifiDp.h` `kL8*`): `0x01` the receive buffers return to software ring 1 (off: the firmware's own manager, as at levels 6 and 7), `0x02` the receive ring selection for both radio buffer rings, `0x04` the data path's rings programmed at level 6's start (off: level 8 is level 7), `0x08` EAPOL frames also to en0, `0x10` the transmit side |
+| `piano-wifi-l8status=MS` | 5000 | how often level 8 logs its counters while associated (at least 500; `0`: only at the association's end) |
 
 ## 7. Build, kernel collection
 
@@ -995,6 +1005,15 @@ after 5 ms, the station up, `step 714: associated`; 7.3 s later `the association
 four-way handshake never ran), the teardown (station down, peer deleted and device stopped, both answered), `step 716: done`,
 no crash. Confirmed on the tablet: the off-channel frequency was boot 10a's cause; level 7's join works up to the keys.
 Next: the data path (level 8), whose gate is the access point's first EAPOL-Key frame received and counted.
+
+**Boot 10c: level 8, the data path (§13.6, §13.7).** The same recipe as 10b with `piano-wifi=8 piano-wifi-l7hold=180000` in
+the line's driver arguments (the hold only so that the level's end lines are printed within the run; the WPA2 access point
+ends the association by itself without the handshake): `out/ram-k273-wifi-10c` (@PROBE@). The profile is placed as for 10b.
+No 802.1X client is needed for the gate (none exists yet: the frames are counted and logged by length and message number).
+
+| # | Boot args (beyond the image's) | Gate | Then |
+|---|---|---|---|
+| 10c | `piano-wifi=8 piano-wifi-iova=1 piano-wifi-l7hold=180000` | Level 6: `level 8: the data path's rings planned and programmed (N bytes of the window; U of T used)` before `level 6: 4 pipes`; `the receive rings: planned and filled ... the buffers return to software ring 1`; round 2 with `K ≥ 1` networks as in 10b. `level 8: the 802.1X port (the kernel control com.unixnu.driver.PianoWifi.8021x, root only, one client): registered`; `PianoWifiEthernet: en0 published (...); PianoWifi's data path attached`. Level 7 as 10b; at its start `level 8: piano-wifi-l8=0x17 (...); ... cookie conversion off (0x0, 0x0)` and `level 8: the receive ring selection sent for both radio buffer rings`. After `the association answer: status 0 (success), AID A`: `level 8: the association is live for the data path (generation 1, AID A): the port is closed until ...`, `level 8: the station is up N ms after the association: the transmit side ready (bank 0x4a04, search index ...)`. **Gate: `level 8: EAPOL frame 1 from the access point: L bytes (PDU P), message 1 of the four-way handshake (descriptor 2, key information 0x8a, key data D bytes), T ms after the association; no 802.1X client is connected: counted only`** (L about 113-135; T well under a second; usually 3-4 such frames a second apart, then the access point's `the association ended: a deauthentication, reason 15` or a beacon miss). Every 5 s the two `level 8 while associated` lines; at the end `level 8 at its end`, `level 8: EAPOL by message: four-way 1 N, ...`; on the tablet `ioreg -l \| grep piano-wifi-level8`. No `crash:` line | **No EAPOL frame and `received 0 entries`**: nothing reached REO2SW1 — read `released a/b`, `exceptions N (push P error E)`, the refill ring's tail and level 7's `radio buffer rings filled to` line: exceptions with an error code point at the reorder queues (§13.3's 17 descriptors), releases at the receive DMA's errors, nothing at all at the ring selection (`piano-wifi-l8=0x15` is its A/B) or the hash routing. **Entries but `bad cookie`** (or `cookie conversion ON`): the entries carry converted addresses — the conversion must be set up or switched off. **`not Ethernet`**: the station's receive format is not 802.3 (level 7's `0x01` parameters). **`errors (last 0x...)`**: the bits name it (`0x20000000` decryption: a key where none should be). **Level 6's scan without frames** after the change of manager: `piano-wifi-l8=0x16` (the firmware's manager) is the control. **A crash after 710**: the `crash:` lines; `piano-wifi-l8=0x07` (no transmit side) and `piano-wifi-l8=0` (level 7 alone) are the controls |
 
 ## 9. Fallback
 
@@ -1747,7 +1766,11 @@ not programmed yet (level 8): that is the probe's main risk (§8.8 boot 10a, "a 
 802.1X frames to send and keys to install, and authorise the peer once the pairwise and group keys are in (`WMI_VDEV_INSTALL_KEY`,
 then `WMI_PEER_SET_PARAM` 3); that interface lives with the data path (level 8), which is what carries EAPOL in both directions.
 
-### 13.4 Status of levels 7 and 8 (2026-11-13, updated 2026-11-14 after boot 10a)
+### 13.4 Status of levels 7 and 8 (2026-11-13, updated 2026-11-14 after boot 10b)
+
+**2026-11-14, level 8 built (§13.6, §13.7):** the data path's rings, the refill ring kept full, en0's frames, the 802.1X port
+for the four-way handshake in user space; host-tested (`tests/dp_host.cpp`, `tests/net_host.cpp`); probe `ram-k273-wifi-10c`
+(§8.8 boot 10c), whose gate is message 1 of the handshake received and counted. Piece 2's "not started" below is history.
 
 **2026-11-14, boot 10b: the association works on the tablet** (AID 20 on 5200 MHz; §8.8 after 10b). **2026-11-14:** boot
 10a's two failures are understood and fixed (§8.8 after 10a: the off-channel frequency; the hidden
@@ -1826,6 +1849,120 @@ through `linkSendWmi`, the teardown after), `tests/profile_host.cpp` (the parser
     virtual device deleted, the rings disabled`, `stage 718: level 7: the join ran to its end`; no `crash:` line.
 A crash after step 710 is the unprogrammed receive rings meeting the first data frame (level 8 fixes it; `piano-wifi-l7=61`
 is the control without the peer data set-up). Each other failure's meaning is in §8.8 boot 10a's last column.
+
+### 13.6 Level 8 as built: the data path (2026-11-14)
+
+`piano-wifi=8` runs everything of level 7 and carries the station's frames. New code: `WifiDp.h` (the rings, the receive and
+transmit turns), `WifiNet.h` and `PianoWifiNet.h` (the boundary, §13.7), the level 8 parts of `WifiHtt.h` (the refill ring
+kept full, the frames' buffers' addresses, the peer map's search entry) and of `PianoWifi.cpp` (the glue), and
+`PianoWifiEthernet.cpp` (en0's frames). Facts: WifiHw.h's level 8 block (the Ubuntu tree of §3 for WCN7860: QCC2072's HAL and
+registers, WCN7850's transmit map), read for register offsets, field places and bit values only.
+
+**The rings** (all programmed by the host itself through the chip window, with the copy engine's register sequence; none of
+them is announced to the firmware):
+
+| Ring | Direction | Entries x words | Registers (R0 / R2) | Use |
+|---|---|---|---|---|
+| TCL data 1 | host -> TCL | 64 x 8 | TCL + `0x918` / `0x2000` | an 802.3 frame out: one descriptor naming one of 32 transmit buffers of 2 KiB |
+| WBM2SW0 (ring 128) | WBM -> host | 64 x 8 | WBM + `0xe08` / `0x30c8` | the transmit completions (TCL ring 0's buffers return here, manager "software 0") |
+| REO2SW1 (ring 1) | REO -> host | 256 x 8 | REO + `0x500` / `0x3048` | every received MSDU of our peer, reordered (the 32 hash entries all point here) |
+| REO2SW0 (ring 0) | REO -> host | 64 x 8 | REO + `0x8c0` / `0x3088` | the reorder unit's exceptions, fragments and BARs: counted, passed over |
+| WBM2SW1, WBM2SW3 (129, 131) | WBM -> host | 64 x 8 each | WBM + `0xe08` + 0x78 n / `0x30c8` + 8 n | receive buffers released by the hardware (SW3 is the receive error ring): posted again |
+| WBM idle link | host -> WBM | 1024 x 2 | WBM + `0xd3c` / `0x30b8` | 1023 link descriptors of 128 bytes (the receive DMA's and the reorder unit's lists); no ring identifier check, no tail address |
+
+At level 6's start (before the receive rings are announced, before any association) the rings are planned out of the DMA
+window (about 220 KiB) and programmed, the idle ring filled, and the reorder unit set up: aging list and flush on, fragments
+and BARs to REO2SW0, the four aging thresholds (100 ms, VO 40 ms), the 32 hash entries all to REO2SW1. The receive buffers'
+manager becomes software ring 1 (this chip's host's choice; levels 6 and 7 use the firmware's own) so that released buffers
+come back to the host. Before the join, level 8 sends the receive ring selection for both radio buffer rings (HTT `0x0c`):
+data frames (unicast, multicast, null data) and BARs to the host, the descriptor's TLVs where QCC2072's descriptor has them
+(MSDU end 0, MPDU start 140, the 802.11 header 264), the frame at 392.
+
+**Receive** (every turn of level 7's loop, from its start): each REO2SW1 entry names a refill buffer by its cookie (the
+buffer's index; no cookie conversion runs, and its two enables are read back for the log); the buffer's address must match
+the cookie's; the descriptor must say "MSDU done", no error bit (FCS, decryption, TKIP MIC, MPDU/MSDU length, overflow,
+A-MSDU), not null data, one buffer (first and last), Ethernet II decapsulation (level 7's `0x01` parameters); then the frame
+is at 392 + the L3 padding, its length from the descriptor. An EAPOL frame (type `0x888e`) is counted, named (which message of
+the four-way or group handshake, from its key information bits) and handed to the 802.1X port; every other frame goes to
+en0 while its link is up. **Every buffer goes back into the refill ring at once**, whatever its frame was (before level 8
+the 511 buffers were handed out once and never came back), and so do the buffers on the two release rings.
+
+**Transmit:** from the station's up (step 712) the TCL bank 0 is set for a station (Ethernet encapsulation, the index lookup,
+address Y search, the vdev check: `0x4a04`), the TCL metadata names the device (vdev based, radio 0: this chip runs as one
+radio) and the search index and hash come from the peer map's second or third form (0 for the first form, as this chip's
+host does). A frame is copied into a free transmit buffer, its descriptor written (buffer, manager "software 0", cookie, bank,
+metadata, length, TID overwrite 0, vdev, search index) and the head moved; its completion frees the buffer (TQM reason 0 is
+acknowledged). EAPOL frames may go out from the station's up; every other frame only after the authorization.
+
+**State:** the data path is "live" from the association's answer with status 0 (message 1 of the handshake comes right
+after it, before the peer's association and the station's up), its transmit side from the station's up, en0's link from the
+authorization (open networks: level 7's own; WPA2: the port's AUTHORIZE). The association's end (a deauthentication, a
+kickout, a beacon miss, the client's LEAVE, a stop) stops the transmit side, takes en0's link down, clears the queue and
+wipes every key copy.
+
+**Switches:** `piano-wifi-l8=N` (default `0x17` = 23): `0x01` buffers to software ring 1, `0x02` the receive ring selection,
+`0x04` the rings at all (off: level 8 is level 7), `0x08` EAPOL frames also to en0, `0x10` the transmit side.
+`piano-wifi-l8status=MS` (5000) the counters while associated. At level 8 `piano-wifi-l7hold` defaults to 0 (the association
+is kept until a suspend).
+
+**The log** (`level 8:` lines; counts, lengths, states and message numbers only): the rings and their register writes at
+level 6; the options line with cookie conversion's state; the ring selection; `the association is live for the data path
+(generation G, AID A)`; `the first frame of the data path`; each EAPOL frame (the first 24): `EAPOL frame N from the access
+point: L bytes (PDU P), message 1 of the four-way handshake (descriptor 2, key information 0x8a, key data D bytes), T ms after
+the association; ...`; `the station is up ...: the transmit side ready (bank 0x4a04, search index ...)`; two status lines every
+5 s (received: entries, frames, EAPOL, to en0, every reason a frame was not delivered, buffers posted again, release and
+exception rings, the refill ring's tail; sent: frames, completions by kind, held back by kind, the queue, the port, the keys);
+at the end the EAPOL frames by message and the first frame's and first EAPOL frame's times. Registry: `piano-wifi-level8`.
+
+**Host tests:** `tests/dp_host.cpp` (every ring's registers, the idle list, the reorder unit's set-up, the selection message
+word by word, received frames delivered and their buffers posted again (an EAPOL and an Ethernet frame, a wrapped ring), the
+frames that must not be delivered, a full refill ring, the release and exception rings, the peer map's search entry of each
+form, a frame sent field by field and its completion, the limits), `tests/net_host.cpp` (§13.7's messages and rules).
+
+**Not in this version** (each a later refinement once the tablet says the base works): A-MSDUs and frames over one buffer
+(counted as `more than one buffer`), the exception ring's frames (fragments, BARs: counted), the reorder unit's command and
+status rings (queue flushes), checksum offload, more than one transmit ring, reconnecting after a disconnect (the level ends).
+
+### 13.7 The network boundary: en0 and the 802.1X port (for the user-space side, piece 3)
+
+`package/PianoWifi/PianoWifiNet.h` is the whole contract; it is C with only `<stdint.h>`, so the user-space supplicant
+includes the same file. Two interfaces cross it:
+
+**1. en0 (in the kernel).** PianoWifiEthernet attaches with `piano_wifi_net_attach` (a version, a context, an input callback
+and a link callback), sends with `piano_wifi_net_send` (a copy into PianoWifi's queue; `ENETDOWN` before the authorization,
+`ENOBUFS` when the 31-frame queue is full) and detaches with `piano_wifi_net_detach` (returns when no callback runs). Frames
+are Ethernet II without FCS, 14 to 1600 bytes. PianoWifi's thread calls `input` for every received frame that is not EAPOL,
+and `link(up, mac)` when the port is authorized and when the association ends. en0's address is the virtual device's
+(`piano-wifi-mac`); en0 never sees EAPOL frames (switch `0x08` adds them, for a BPF-based supplicant).
+
+**2. The 802.1X port (kernel <-> user space).** A kernel control socket named `com.unixnu.driver.PianoWifi.8021x`
+(`PF_SYSTEM`, `SOCK_DGRAM`, `SYSPROTO_CONTROL`; `CTLIOCGINFO` for its id, `connect` with `sc_unit` 0). Root only; one client at
+a time (a second connect gets `EBUSY`); it exists only with `piano-wifi=8`. Datagrams: each `send` is one message, each `recv`
+one message (buffer of 2048 bytes). Every message starts with an 8-byte header `{uint16 type, uint16 length (whole message),
+uint32 seq}`, little endian, followed by exactly the structure its type names.
+
+| Type | Direction | Body | Meaning |
+|---|---|---|---|
+| 1 `LINK` | kext -> client | `piano_wifi_8021x_link` (164 bytes) | the association: state (0 idle, 1 associated with the port closed, 2 authorized), generation, the station's and the access point's addresses (SPA and AA), AID, frequency, security, the pairwise and group cipher and AKM suite types, the access point's RSN element as its beacon carried it and ours as the association request carried it (whole elements, for the handshake's checks and message 2's key data), and after an association the reason it ended. Sent on connect, at every change, and on `LINK_QUERY` |
+| 2 `EAPOL_RX` | kext -> client | `piano_wifi_8021x_eapol` (generation, source address, PDU length) + the PDU | an EAPOL frame from the access point, from the 802.1X header on (version, type, length, then the EAPOL-Key body) |
+| 3 `RESULT` | kext -> client | `piano_wifi_8021x_result` (request type, status, detail, generation) | the answer to a request (its `seq`): 0 done, else `ESTALE`, `ENOTCONN`, `EINVAL`, `EBUSY`, `ENOBUFS`, `EIO` (the firmware refused: `detail` is its status), `ETIMEDOUT` (no answer within 2 s). `EAPOL_TX` is answered only when refused |
+| 16 `EAPOL_TX` | client -> kext | `piano_wifi_8021x_eapol` (generation; the address is ignored) + the PDU | an EAPOL frame to the access point; the kext adds the Ethernet header (to the AA, from the SPA, `0x888e`). Queued from the association's answer, sent from the station's up |
+| 17 `KEY` | client -> kext | `piano_wifi_8021x_key` (48 bytes) | a key: pairwise (`group` 0, index 0, the TK, 16 bytes for CCMP-128) or group (`group` 1, the GTK's index 1-3, 16 bytes CCMP-128 or 32 TKIP: the key, then the station's transmit Michael key, then its receive one, i.e. the KDE's bytes 0-15, 24-31, 16-23 as a supplicant swaps them; its RSC from message 3). The kext installs the pairwise key first; a group key that comes first waits for the pairwise key's completion. Every copy of the bytes is wiped once the command is sent |
+| 18 `AUTHORIZE` | client -> kext | `piano_wifi_8021x_request` (generation) | the port opens (the peer is authorized at the firmware): data frames flow, en0's link comes up, a `LINK` with state 2 follows |
+| 19 `LINK_QUERY` | client -> kext | `piano_wifi_8021x_request` | a `LINK` message comes back |
+| 20 `LEAVE` | client -> kext | `piano_wifi_8021x_request` (generation, an 802.11 reason) | the client gives up (a wrong passphrase, say): the kext deauthenticates and the association ends |
+
+**The WPA2-PSK exchange** as the client runs it: on `LINK` state 1 (generation G) wait for `EAPOL_RX` message 1 (the ANonce,
+replay counter R); derive the PTK from the PMK (PBKDF2 of the passphrase and the name, which the client has: it wrote the
+profile), AA, SPA, ANonce and its SNonce; send `EAPOL_TX` message 2 (replay counter R, the SNonce, the MIC, key data = the
+`own_rsn` element of the `LINK` message); on message 3 check its MIC, its replay counter, that its RSN element is the
+`ap_rsn` of `LINK`, and decrypt its key data (the GTK KDE: index, GTK; the RSC from the frame); send message 4; send `KEY`
+pairwise (the TK) and `KEY` group (the GTK, its index and the RSC); wait for both `RESULT`s with status 0; send `AUTHORIZE`.
+Group rekeys later come as `EAPOL_RX` group message 1; answer with group message 2 and a `KEY` group. Every request carries G;
+a request of another generation is refused with `ESTALE` (a late client never installs a key into the next association).
+
+**What never crosses either interface:** the network's name, the passphrase and the PMK (the client has them); the log
+carries none of the addresses, frames or keys either.
 
 ## 14. Level 6's message table
 
