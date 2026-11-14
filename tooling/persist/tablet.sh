@@ -110,6 +110,24 @@ copy)
 	dd if="/dev/$1" of="/dev/$1" bs=4096 skip="$2" seek="$3" count="$4" conv=notrunc,fsync 2>"$P/dd.err" || { cat "$P/dd.err"; die "dd copy"; }
 	tail -1 "$P/dd.err"; echo "copied=$4"
 	;;
+copy-list)   # FILE DEV: FILE's lines "SRC DST COUNT" (4096-byte blocks of /dev/DEV), each run copied, then one sync
+	[ -f "$P/$1" ] || die "no $1"
+	n=0
+	while read -r s d c; do
+		dd if="/dev/$2" of="/dev/$2" bs=4096 skip="$s" seek="$d" count="$c" conv=notrunc 2>"$P/dd.err" || { cat "$P/dd.err"; die "dd copy-list"; }
+		n=$((n + c))
+	done < "$P/$1"
+	sync
+	echo "copied=$n"
+	;;
+hash-list)   # FILE DEV COLUMN: the SHA-256 of FILE's runs read from the medium in order (COLUMN 1: the SRC blocks, 2: the DST blocks)
+	[ -f "$P/$1" ] || die "no $1"
+	sync; { echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null
+	while read -r s d c; do
+		if [ "$3" = 1 ]; then at=$s; else at=$d; fi
+		dd if="/dev/$2" bs=4096 skip="$at" count="$c" 2>/dev/null
+	done < "$P/$1" | sha256sum | cut -d' ' -f1 | sed 's/^/sha256=/'
+	;;
 write)
 	dd if="$P/$1" of="/dev/$2" bs="$4" seek="$3" conv=notrunc,fsync 2>"$P/dd.err" || { cat "$P/dd.err"; die "dd write"; }
 	tail -1 "$P/dd.err"; echo "written=$1"
@@ -162,6 +180,6 @@ zero)
 	tail -1 "$P/dd.err"; echo "zeroed=$1 bytes=$bytes"
 	;;
 *)
-	die "usage: tablet.sh map|hash|zero-sha|peek|send|fetch|file-sha|copy|write|restore|job|job-status|drop-caches|rereadpt|discard-info|discard|zero"
+	die "usage: tablet.sh map|hash|zero-sha|peek|send|fetch|file-sha|copy|copy-list|hash-list|write|restore|job|job-status|drop-caches|rereadpt|discard-info|discard|zero"
 	;;
 esac

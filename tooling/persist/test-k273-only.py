@@ -447,7 +447,7 @@ def snapshot(root, out):
             'boot_b': tp.sha_region(lun4, tp.LUN4['boot_b'][1], tp.LUN4['boot_b'][2])}
 
 
-def test_session(tmp, out, dual, seed273):
+def test_session(tmp, out, dual, seed273, inputs):
     print('== maint-session.py: the 27.3-only ESP and linux_rootfs (a fake tablet)')
     root = build_tablet(tmp, out, dual, seed273)
     lun0, lun4 = root / 'lun0.img', root / 'lun4.img'
@@ -638,6 +638,75 @@ def test_session(tmp, out, dual, seed273):
     for key in start:
         check(end[key] == start[key], f'at the end: {key} as at the start')
 
+    # -- the whole-disk layout (2026-11-14): the root on linux_rootfs, the owner's store carried into all of linux_data -----------
+    print('== the whole-disk layout: linux-data-root --root-part linux_rootfs, k273-store-grow')
+    run('map', 'esp-final', *esp)
+    run('map', 'rootfs-clear', *esp)
+    po, bo = seed273['pages'], common.bitmap_blocks(seed273['pages'])
+    present = [0, 1, 2, 1000, 1001, 1002, 1003, 40000, po - 1]
+    bitmap = bytearray(bo * B)
+    for i in present:
+        bitmap[i // 8] |= 1 << (i % 8)
+    tp.write_at(lun0, (STORE_LBA + 1) * B, bytes(bitmap))
+    pages = {i: os.urandom(B) for i in present}
+    for i, data in pages.items():
+        tp.write_at(lun0, (STORE_LBA + 1 + bo + i) * B, data)
+    old_window = tp.sha_region(lun0, STORE_LBA * B, (1 + bo) * B), {i: tp.read(lun0, (STORE_LBA + 1 + bo + i) * B, B) for i in present}
+    grown = bytearray(inputs['seed273'])
+    struct.pack_into('<Q', grown, 16, 200 << 30)
+    (tmp / 'seed-200.img').write_bytes(bytes(grown))
+    make_dual(out, 'esp-dual-short', line_273(long=False), inputs)
+    build(out, 'esp-dual-short', '--name', 'esp-k273-short')   # as on the tablet: v2 is built from a 27.3-only record (no --split here)
+    rc, log = build(out, 'esp-k273-short', '--seed', str(tmp / 'seed-200.img'), '--root-part', 'linux_rootfs', '--name', 'esp-k273-v2')
+    v2 = json.loads((out / 'esp-k273-v2.json').read_text()) if rc == 0 else {}
+    nf, pn = v2.get('store', {}).get('first_lba', 0), v2.get('seed', {}).get('pages', 0)
+    bn = common.bitmap_blocks(pn)
+    check(rc == 0 and pn == 200 << 18 and nf + 1 + bn + po <= STORE_LBA, f'the v2 ESP: 200 GiB seed, its store at LBA {nf} below the old one')
+    other = bytearray(make_seed(200 << 30, 3))
+    (tmp / 'seed-other.img').write_bytes(bytes(other))
+    rc, _ = build(out, 'esp-k273-short', '--seed', str(tmp / 'seed-other.img'), '--root-part', 'linux_rootfs', '--name', 'esp-k273-v2x')
+    root_new = bytearray(16 * B)
+    root_new[:8] = b'SHNGROOT'
+    struct.pack_into('<IIQ', root_new, 8, 1, 2, len(root_new))
+    root_new[B:] = os.urandom(15 * B)
+    (tmp / 'root-new.img').write_bytes(bytes(root_new))
+    V2 = ['--esp', 'esp-k273-v2.img', '--esp-final', 'esp-k273-v2.img', '--root-part', 'linux_rootfs',
+          '--root-image', str(tmp / 'root-new.img'), '--root-sha256', sha(bytes(root_new))]
+    log = run('--dry-run', 'map', 'backup', 'k273-store-backup', 'linux-data-root', 'k273-store-grow', 'esp-final', 'check',
+              'maint-exit', *V2, '--new-backup')
+    check('would stop a real run' not in log and 'done (dry run' in log, 'dry run of the whole-disk session: clean')
+    head0 = tp.read(lun0, nf * B, B)
+    log = run('k273-store-grow', *V2, expect=3)
+    check('no verified NAS backup of linux_data-k273-store' in log and tp.read(lun0, nf * B, B) == head0,
+          'k273-store-grow without the old store\'s backup: refused, nothing written')
+    st = state()
+    st['backups']['linux_data-k273-store'] = {'file': 'linux_data-k273-store.img', 'sha256': '0' * 64, 'verified': True}
+    state_path.write_text(json.dumps(st))
+    log = run('k273-store-grow', '--esp', 'esp-k273-v2x.img', expect=3)
+    check('FAIL  the new seed is the old one with zeros appended' in log and tp.read(lun0, nf * B, B) == head0,
+          'k273-store-grow to a seed that is not the old one grown: refused, nothing written')
+    log = run('map', 'linux-data-root', 'k273-store-grow', 'esp-final', 'check', *V2)
+    hdr = common.store_header(tp.read(lun0, nf * B, 128))
+    newmap = tp.read(lun0, (nf + 1) * B, bn * B)
+    check(hdr.get('state') == 'valid' and hdr.get('pages') == pn and hdr.get('bound_lba') == nf and hdr.get('generation') == 3 and
+          hdr.get('identity') == v2['seed']['identity_sha256'], f'the new header: valid, {pn} pages, the grown seed, bound to LBA {nf}, '
+                                                              'the old generation')
+    check(newmap[:bo * B] == bytes(bitmap) and not any(newmap[bo * B:]), 'the new bitmap: the old one, then zeros')
+    check(all(tp.read(lun0, (nf + 1 + bn + i) * B, B) == pages[i] for i in present), 'every present page at its index in the new window')
+    check(tp.sha_region(lun0, STORE_LBA * B, (1 + bo) * B) == old_window[0] and
+          all(tp.read(lun0, (STORE_LBA + 1 + bo + i) * B, B) == old_window[1][i] for i in present), 'the old window untouched')
+    check('the old store holds 9 pages in 4 runs' in log and 'IS the one this ESP resumes' in log.split('step check')[-1] and
+          tp.read(lun0, ROOTFS_FIRST * B, len(root_new)) == bytes(root_new) and esp_region() == v2['sha256'] and
+          json.loads((out / 'installed.json').read_text())['image'] == 'esp-k273-v2.img',
+          'the session: 9 pages in 4 runs, the root on linux_rootfs, the v2 ESP installed, check reads the grown store as the one it resumes')
+    root_old = bytearray(root_new)
+    root_old[B:] = os.urandom(15 * B)
+    (tmp / 'root-old.img').write_bytes(bytes(root_old))
+    log = run('rollback', 'k273-store-grow', '--esp', 'esp-k273-v2.img', '--root-image', str(tmp / 'root-old.img'),
+              '--root-sha256', sha(bytes(root_old)))
+    check(tp.read(lun0, common.DATA_FIRST * B, len(root_old)) == bytes(root_old) and
+          tp.sha_region(lun0, STORE_LBA * B, (1 + bo) * B) == old_window[0], 'rollback k273-store-grow: the old root back on linux_data')
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -650,7 +719,7 @@ def main():
         out, dual, inputs, seed273 = test_builder(tmp)
         (tmp / 'sh').mkdir()
         test_tablet_sh(tmp / 'sh')
-        test_session(tmp, out, dual, seed273)
+        test_session(tmp, out, dual, seed273, inputs)
     finally:
         if not a.keep:
             shutil.rmtree(tmp, ignore_errors=True)

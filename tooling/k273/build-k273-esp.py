@@ -224,7 +224,9 @@ def main():
             line = ' '.join(kept)
 
         # -- firmware the 27.3 collection pins; other non-payload files stay; the 27.0.1 payload goes --------------------------
-        carried, dropped, fw = dict(payload.items()), [], []
+        # non-payload files only: the payload is staged above (with --kc/--adt/--trust/--seed and the ADT tail) and must not be
+        # overwritten by the base's (2026-11-14: esp-k273-v2 573187af... was built so: the base's payload under the new line)
+        carried, dropped, fw = {}, [], []
         pins = firmware.kc_pins(kc)
         pinned = {f'{firmware.ESP_DIR}/{pin["path"]}': pin for pin in pins}
         for path, pin in pinned.items():
@@ -308,6 +310,15 @@ def main():
     for path in carried.values():
         if new['files'].get(path) != files[path]:
             problems.append(f'{path} changed')
+    for role, given in overrides.items():   # the image holds what was given (the ADT: plus the tail when split)
+        if role == 'adt' and split:
+            continue
+        if h(new['files'].get(payload[role], b'')) != given['sha256']:
+            problems.append(f'{payload[role]} is not the given {role} ({given["from"]})')
+    if split:
+        tails = boot_args.sets(new['files'].get(payload['adt'], b''))
+        if tails.get(split['property']) != split['tail']:
+            problems.append(f'{payload["adt"]}: /chosen/{split["property"]} is not the tail ({tails.get(split["property"])!r})')
     back_config = tomllib.loads(new['files'].get(TOML, b'').decode())
     back_entry = next((e for e in back_config.get('entry', []) if e['id'] == a.entry), {})
     if back_entry.get('args') != line or back_entry != k_entry or back_config['boot']['default'] != a.entry:

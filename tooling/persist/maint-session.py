@@ -126,6 +126,14 @@ def esp_store(record):
     return None
 
 
+def esp_root_part(record):
+    """The partition an ESP's default entry mounts its root image from (native-ufs-root-part; NativeUfs's default linux_rootfs).
+    The 27.3-only ESP of 2026-11-13 keeps it on linux_data with its store; the whole-disk layout (2026-11-14) on linux_rootfs, the store
+    on all of linux_data (data-store-part)."""
+    line = ((record or {}).get('cmdlines') or {}).get((record or {}).get('default'), '')
+    return common.root_part_of(line.split())
+
+
 # LUN 0 partitions by their GPT name -> the key map_nodes keeps them under (tablet.sh map reports these)
 PART_KEYS = {'linux_rootfs': 'rootfs', 'linux_data': 'linux_data', 'esp': 'esp'}
 
@@ -874,6 +882,17 @@ def linux_data_root(s):
         s.job('root-write', 'restore', 'root.img', dev, 0, B, s.a.http_port, timeout=4 * 3600)
     got = s.region_sha(dev, 0, n // B, B, name='root-check')
     s.need(got == s.a.root_sha256.lower() if s.execute else None, f'{part} read back over {n} bytes: {got} = {s.a.root_sha256[:16]}')
+    if s.execute:
+        # step check compares the root partitions' block 0 with what map read: it is this image's now
+        with open(img, 'rb') as f:
+            head = f.read(B)
+        block0 = hashlib.sha256(head).hexdigest()
+        image_bytes = int.from_bytes(head[16:24], 'little') if head[:8] == b'SHNGROOT' else None
+        if part == 'linux_rootfs':
+            s.save(manifest_sha256=block0)
+        if (s.state.get('root_manifest') or {}).get('partition') == part:
+            s.save(root_manifest={'partition': part, 'sha256': block0, 'image_bytes': image_bytes})
+        s.save(root_written={'partition': part, 'sha256': got, 'bytes': n, 'block0_sha256': block0})
 
 
 @step('k273-store', 'maintenance, read only')
@@ -949,6 +968,138 @@ def k273_store_backup_back(s):
     s.log(f'  info  the store of {saved.get("esp")} goes back to LBA {first} ({saved.get("blocks")} blocks); install that ESP again after it')
     map_nodes(s)
     s.restore('linux_data-k273-store', s.nodes['lun0'], first, B)
+
+
+def esp_seed_regions(record):
+    """(logical bytes, sorted extents) of the 27.3 seed inside an ESP image of OUT (its packed DBRDISK1 file), read from the image."""
+    image = OUT / record['image']
+    if not image.is_file() or common.sha(image) != record['sha256']:
+        raise Stop(f'{record["image"]}: not in {OUT} or not its record\'s image (its seed is read from it)')
+    files = common.fat32_read(image)['files']
+    seed = next((files[k] for k in ('EFI/UniXNU/Payloads/k273/scratch-data.img', 'EFI/UniXNU/Payloads/scratch-data.img') if k in files), None)
+    if seed is None or seed[:8] != b'DBRDISK1':
+        raise Stop(f'{record["image"]}: no packed seed in the image')
+    logical, count = struct.unpack_from('<QQ', seed, 16)
+    extents, cursor = [], 32 + count * 16
+    for i in range(count):
+        at, length = struct.unpack_from('<QQ', seed, 32 + i * 16)
+        extents.append((at, hashlib.sha256(seed[cursor:cursor + length]).hexdigest(), length))
+        cursor += length
+    return logical, sorted(extents)
+
+
+@step('k273-store-grow', 'maintenance, WRITE linux_data: the installed 27.3 store carried into --esp\'s larger window',
+      writes='LUN 0: the new store window\'s pages that the old store holds, its bitmap and header (linux_data)')
+def k273_store_grow(s):
+    """The installed 27.3 Data store (installed.json's record, backed up by k273-store-backup) carried into the store window of --esp
+    (build-k273-esp.py --seed: a larger disk), so the new ESP resumes the owner's Data instead of starting a fresh store. Only for a
+    new seed that is the old one with zeros appended (compact-seed.py --grow-gib --disk-only: the same extents, a larger logical
+    size): the old store's disk read over the new seed is then the old disk followed by zeros, and the container is grown on the
+    running system (diskutil apfs resizeContainer). Page i keeps its index; its block moves from the old window to the new one.
+
+    The old window is only read. Written, in this order: every run of present pages (copied on the tablet, one dd per run), the new
+    bitmap (the old bitmap, then zeros), the new header last (the old one's generation and flags, the new seed's identity and page
+    count, bound to the new window's LBA). Before the header lands the new window's block 0 holds no store (blank), so a cut leaves
+    the old ESP's store whole. Refused when the windows meet. rollback k273-store-grow writes the old layout's root back to
+    linux_data (the old store was never written)."""
+    name, old = installed_k273_store(s)
+    old_rec, record = s.esp_record(name), s.esp
+    new = esp_store(record)
+    if not new or not record:
+        raise Stop(f'--esp {s.a.esp}: no 27.3 store elsewhere in its record (build-k273-esp.py)')
+    po, pn = old_rec['seed']['pages'], record['seed']['pages']
+    of, nf = old['first_lba'], new['first_lba']
+    bo, bn = common.bitmap_blocks(po), common.bitmap_blocks(pn)
+    s.log(f'  info  from {name}: LBA {of}, {po} pages (seed {old_rec["seed"]["identity_sha256"][:16]}) -> {record["image"]}: LBA {nf}, '
+          f'{pn} pages (seed {record["seed"]["identity_sha256"][:16]})')
+    s.need(old['blocks'] == 1 + bo + po and new['blocks'] == 1 + bn + pn, 'both windows: header + bitmap + one block per page')
+    s.need(old['partition'] == new['partition'] == 'linux_data', 'both stores on linux_data')
+    s.need(pn > po, f'the new disk is larger ({pn} > {po} pages)')
+    lo, eo = esp_seed_regions(old_rec)
+    ln, en = esp_seed_regions(record)
+    s.need(lo == po * B and ln == pn * B and eo == en,
+           f'the new seed is the old one with zeros appended: the same {len(eo)} extents, {lo} -> {ln} bytes')
+    # what is written: [nf, nf + 1 + bn + po) (pages above po are never present); the old window [of, of + 1 + bo + po) only read
+    s.need(nf + 1 + bn + po <= of or of + 1 + bo + po <= nf, f'the written part LBA {nf}-{nf + bn + po} and the old window LBA {of}-'
+                                                             f'{of + bo + po} do not meet')
+    s.need(common.DATA_FIRST <= nf and nf + new['blocks'] <= common.DATA_LAST + 1 - common.RESERVE_BLOCKS,
+           f'the new window LBA {nf}-{nf + new["blocks"] - 1} inside linux_data below the reserve')
+    s.require_backup('linux_data-k273-store')
+    map_nodes(s)
+    lun0 = s.nodes['lun0']
+    h = s.t('peek', lun0, of, 0, 128)
+    header = common.store_header(bytes.fromhex(h['hex'])) if h else {}
+    if s.execute:
+        s.need(header.get('state') == 'valid' and header.get('pages') == po and
+               header.get('identity') == old_rec['seed']['identity_sha256'] and header.get('bound_lba') == of,
+               f'the old store at LBA {of}: valid, {po} pages, of seed {old_rec["seed"]["identity_sha256"][:16]}, bound to LBA {of} '
+               f'({header})')
+    # the old bitmap, to the host (it names the runs to copy)
+    work = s.dir / 'store-grow'
+    work.mkdir(exist_ok=True)
+    want = s.region_sha(lun0, of + 1, bo, name='sha-old-bitmap')
+    bitmap = b''
+    if s.execute:
+        got_n, got = s.receive(lun0, of + 1, bo, B, [work / 'old-bitmap.bin'])
+        s.need(got_n == bo * B and got == want, f'the old bitmap received: {got_n} bytes, sha256 {got[:16]} = the tablet\'s {want[:16]}')
+        bitmap = (work / 'old-bitmap.bin').read_bytes()
+    else:
+        s.t('send', lun0, of + 1, bo, B, s.a.nc_port)
+    runs = common.bit_runs(bitmap, po) if s.execute else []
+    present = sum(c for _, c in runs)
+    s.log(f'  info  the old store holds {present} pages in {len(runs)} runs')
+    if s.execute:
+        s.need(present == bin(int.from_bytes(bitmap, 'little')).count('1'), f'the runs cover every set bit ({present})')
+    (work / 'runs.txt').write_text(''.join(f'{of + 1 + bo + i} {nf + 1 + bn + i} {c}\n' for i, c in runs))
+    new_bitmap = bitmap + bytes(bn * B - len(bitmap)) if s.execute else bytes(bn * B)
+    (work / 'new-bitmap.bin').write_bytes(new_bitmap)
+    head = common.store_header_block(pn, record['seed']['identity_sha256'], header.get('generation', 1),
+                                     flags=header.get('flags', 0) & common.SELF_CONTAINED, flattened=header.get('flattened', 0),
+                                     bound_lba=nf)
+    (work / 'new-header.bin').write_bytes(head)
+    check = common.store_header(head)
+    s.need(check['state'] == 'valid' and check['pages'] == pn and check['bound_lba'] == nf and
+           check['identity'] == record['seed']['identity_sha256'], f'the new header: valid, {pn} pages, bound to LBA {nf}')
+    # 1. the present pages, run by run (the new window's block 0 is not a store until step 3)
+    s.fetch('store-grow-runs.txt', work / 'runs.txt', common.sha(work / 'runs.txt'))
+    src = s.job('grow-src-sha', 'hash-list', 'store-grow-runs.txt', lun0, 1, timeout=7200) if runs else None
+    if s.write(f'{present} present pages in {len(runs)} runs: old window LBA {of + 1 + bo}+ -> new window LBA {nf + 1 + bn}+'):
+        if runs:
+            s.job('grow-copy', 'copy-list', 'store-grow-runs.txt', lun0, timeout=4 * 3600)
+    if runs or not s.execute:
+        dst = s.job('grow-dst-sha', 'hash-list', 'store-grow-runs.txt', lun0, 2, timeout=7200)
+        s.need(src['sha256'] == dst['sha256'] if s.execute else None,
+               f'the copied pages read back: {(dst or {}).get("sha256", "")[:16]} = the old window\'s {(src or {}).get("sha256", "")[:16]}')
+    again = s.region_sha(lun0, of + 1, bo, name='sha-old-bitmap-again')
+    s.need(again == want if s.execute else None, 'the old bitmap unchanged since it was read')
+    # 2. the bitmap
+    s.fetch('store-grow-bitmap.bin', work / 'new-bitmap.bin', common.sha(work / 'new-bitmap.bin'))
+    if s.write(f'the new bitmap ({bn} blocks: the old {bo}, then zeros) -> LBA {nf + 1}'):
+        s.t('write', 'store-grow-bitmap.bin', lun0, nf + 1, B, timeout=600)
+    got = s.region_sha(lun0, nf + 1, bn, name='sha-new-bitmap')
+    s.need(got == common.sha(work / 'new-bitmap.bin') if s.execute else None, f'the new bitmap read back: {got}')
+    # 3. the header, last
+    s.fetch('store-grow-header.bin', work / 'new-header.bin', common.sha(work / 'new-header.bin'))
+    if s.write(f'the new header -> LBA {nf} (bound to it, seed {record["seed"]["identity_sha256"][:16]}, generation '
+               f'{header.get("generation")})'):
+        s.t('write', 'store-grow-header.bin', lun0, nf, B)
+    got = s.region_sha(lun0, nf, 1, name='sha-new-header')
+    s.need(got == common.sha(work / 'new-header.bin') if s.execute else None, f'the new header read back: {got}')
+    ok, text = bound_store(s, record)
+    s.need(ok, text)
+    if s.execute:
+        s.save(k273_store_grown={'from': name, 'from_first': of, 'esp': record['image'], 'first': nf, 'present': present,
+                                 'runs': len(runs)})
+
+
+@rollback('k273-store-grow')
+def k273_store_grow_back(s):
+    """The old layout's root image (--root-image, --root-sha256) written back to linux_data from block 0, read back: the copy and the
+    new window's bitmap and header lay over it. The old store's window was only read. Afterwards the old ESP (rollback esp-final)
+    boots the old root with the old store."""
+    s.a.root_part = 'linux_data'
+    linux_data_root(s)
+    s.save(k273_store_grown=None)
 
 
 @step('abl-check', 'ABL fastboot, read only')
@@ -1055,14 +1206,23 @@ def map_step(s):
             s.need(image_bytes + 1024 * B <= room, f'root image ({image_bytes} bytes) + 1024 blocks below the new store place (NativeUfs rule)')
             s.save(image_bytes=image_bytes)
     if elsewhere:
-        # this ESP's root: the manifest at block 0 of the store's partition, the image + 1024 blocks below the store window
-        part = elsewhere['partition']
+        # this ESP's root: the manifest at block 0 of its root partition; on the store's partition the image + 1024 blocks below the
+        # store window (NativeUfs rule); on a partition of its own (the whole-disk layout) inside it, or written by this session
+        part = esp_root_part(target)
         digest, image_bytes, magic = root_manifest(s, part)
         if magic is not None:
-            _, start, _ = part_geometry(s, part)
-            s.need(image_bytes is not None, f'{part} block 0 is the SHNGROOT manifest (the root of {target["image"]})')
-            s.need(image_bytes is not None and image_bytes + 1024 * B <= (elsewhere['first_lba'] - start) * B,
-                   f'root image ({image_bytes} bytes) + 1024 blocks below the store window at LBA {elsewhere["first_lba"]} (NativeUfs rule)')
+            _, start, blocks = part_geometry(s, part)
+            planned = 'linux-data-root' in s.a.steps and (getattr(s.a, 'root_part', None) or 'linux_data') == part
+            if part == elsewhere['partition']:
+                s.need(image_bytes is not None, f'{part} block 0 is the SHNGROOT manifest (the root of {target["image"]})')
+                s.need(image_bytes is not None and image_bytes + 1024 * B <= (elsewhere['first_lba'] - start) * B,
+                       f'root image ({image_bytes} bytes) + 1024 blocks below the store window at LBA {elsewhere["first_lba"]} (NativeUfs rule)')
+            elif image_bytes is None:
+                s.need(planned, f'{part} block 0 holds no root manifest yet: linux-data-root --root-part {part} in this session writes '
+                                f'the root of {target["image"]} there')
+            else:
+                s.need(image_bytes <= blocks * B, f'{part} block 0 is the SHNGROOT manifest (the root of {target["image"]}): '
+                                                  f'{image_bytes} bytes inside the partition' + (' (linux-data-root writes it again)' if planned else ''))
             s.save(root_manifest={'partition': part, 'sha256': digest, 'image_bytes': image_bytes})
     rootfs_first, rootfs_blocks = s.starts.get('rootfs', common.ROOTFS_FIRST), (s.sizes.get('rootfs') or 0) // B
     for where, first in (('old', store_old(s)), ('new', store_new(s))):
@@ -1375,14 +1535,16 @@ def check_step(s):
     rec = record_now or (s.esp if not s.execute else None)
     if esp_store(rec):
         # the ESP's own root and store (the 27.3 line on linux_data): the manifest as map read it, the store bound and of its seed
-        saved = s.state.get('root_manifest') or {}
-        digest, image, _ = root_manifest(s, esp_store(rec)['partition'])
-        if saved.get('partition') == esp_store(rec)['partition'] or not s.execute:
+        saved, part = s.state.get('root_manifest') or {}, esp_root_part(rec)
+        digest, image, _ = root_manifest(s, part)
+        if saved.get('partition') == part or not s.execute:
             s.need(digest == saved.get('sha256') if s.execute else None,
-                   f'{esp_store(rec)["partition"]} block 0 (the root manifest of {rec["image"]}) unchanged')
+                   f'{part} block 0 (the root manifest of {rec["image"]}) as map read it or linux-data-root wrote it')
         else:
-            s.log(f'  info  {esp_store(rec)["partition"]} block 0: {"SHNGROOT, " + str(image) + " bytes" if image else "no manifest"} '
+            s.log(f'  info  {part} block 0: {"SHNGROOT, " + str(image) + " bytes" if image else "no manifest"} '
                   f'(map ran without --esp {rec["image"]}: nothing to compare with)')
+        if s.execute:
+            s.need(image is not None, f'{part} block 0 is a root manifest (the root {rec["image"]} mounts)')
         ok, text = bound_store(s, rec)
         s.need(ok, text)
         return

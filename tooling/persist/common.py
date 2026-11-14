@@ -198,6 +198,63 @@ def store_args_of(args):
     return part, int(lba, 0) if lba else None
 
 
+def root_part_of(args):
+    """The partition NativeUfs mounts the root image from, for a kernel argument list: native-ufs-root-part, default linux_rootfs."""
+    return dict(x.split('=', 1) for x in args if '=' in x).get('native-ufs-root-part', 'linux_rootfs')
+
+
+def bitmap_blocks(pages):
+    """PersistOverlay.h bitmapBlocks: the presence bitmap's blocks for PAGES pages (one bit each)."""
+    return (pages + 8 * LBA - 1) // (8 * LBA)
+
+
+def store_header_block(pages, identity, generation, flags=0, flattened=0, bound_lba=None):
+    """PersistOverlay.h encodeHeader: block 0 of a store window (LBA bytes). IDENTITY: the seed identity (hex). BOUND_LBA sets kBound."""
+    if bound_lba:
+        flags |= BOUND
+    raw = bytearray(LBA)
+    raw[:8] = b'SHNGDATA'
+    struct.pack_into('<IIQ', raw, 8, 1, 64, pages)
+    raw[24:56] = bytes.fromhex(identity)
+    struct.pack_into('<I', raw, 56, generation)
+    struct.pack_into('<I', raw, 60, zlib.crc32(bytes(raw[:60])))
+    if flags:
+        raw[64:72] = b'SHNGEXT1'
+        struct.pack_into('<IIQ', raw, 72, flags, 0, flattened)
+        if flags & BOUND:
+            struct.pack_into('<Q', raw, 88, bound_lba)
+        struct.pack_into('<I', raw, 124, zlib.crc32(bytes(raw[64:124]), zlib.crc32(bytes(raw[:60]))))
+    return bytes(raw)
+
+
+def bit_runs(bitmap, pages):
+    """[(first page, count)] of the set bits of a presence bitmap (bit i: byte i // 8, bit i % 8), pages below PAGES only."""
+    runs, start = [], None
+    nbytes = (pages + 7) // 8
+    zero = bytes(4096)
+    for at in range(0, nbytes, 4096):
+        chunk = bitmap[at:min(at + 4096, nbytes)]
+        if chunk == zero[:len(chunk)]:   # fast path: no page present in these 32768 pages
+            if start is not None:
+                runs.append((start, at * 8 - start))
+                start = None
+            continue
+        for j, byte in enumerate(chunk):
+            for bit in range(8):
+                i = (at + j) * 8 + bit
+                if i >= pages:
+                    break
+                if byte >> bit & 1:
+                    if start is None:
+                        start = i
+                elif start is not None:
+                    runs.append((start, i - start))
+                    start = None
+    if start is not None:
+        runs.append((start, pages - start))
+    return runs
+
+
 def entry_uses_rootfs(entry):
     """Why a unixnu.toml entry (a dict) would use linux_rootfs, or None. NativeUfs mounts its root from linux_rootfs unless
     native-ufs-root-part names another partition, and the Data store lives on the root partition (store_args_of), so an entry that

@@ -193,6 +193,20 @@ def fake_tablet(root, pp, argv):
                 n = min(256 * B, length - off)
                 write_at(path, dst + off, read(path, src + off, n))
             return f'copied={a[3]}'
+        if cmd in ('copy-list', 'hash-list'):
+            runs = [tuple(int(x) for x in line.split()) for line in (pp / a[0]).read_text().splitlines() if line.strip()]
+            h, n = hashlib.sha256(), 0
+            for s, d, c in runs:
+                path, src, length = region(nodes, a[1], s, c, B)
+                _, dst, _ = region(nodes, a[1], d, c, B)
+                if cmd == 'copy-list':
+                    for off in range(0, length, 256 * B):
+                        k = min(256 * B, length - off)
+                        write_at(path, dst + off, read(path, src + off, k))
+                else:
+                    h.update(read(path, src if a[2] == '1' else dst, length))
+                n += c
+            return f'copied={n}' if cmd == 'copy-list' else f'sha256={h.hexdigest()}'
         if cmd == 'write':
             data = (pp / a[0]).read_bytes()
             path, start, _ = region(nodes, a[1], int(a[2]), len(data) // int(a[3]) or 1, int(a[3]))

@@ -819,6 +819,37 @@ Host tests (no tablet): `tooling/persist/test-k273-only.py` makes every fixture 
 GPT, the fake tablet of `test-persist.py`) and covers the builder, `tablet.sh`'s guard, the gate, both rootfs steps with their
 refusals, a broken and a stopped transfer, a device that keeps data after a discard, and the rollbacks back to the first byte.
 
+### 13.8 The whole-disk layout: the root on linux_rootfs, the owner's Data grown over linux_data (2026-11-14)
+
+The ESP `esp-k273-v2.img` (`build-k273-esp.py --base esp-k273-only.json --kc/--adt out/k273-v2/kernel.macho* --trust <layer trust>
+--seed seed-200.img --root-part linux_rootfs --arg piano-power-ps=1 --split`) mounts the 27.3 root from linux_rootfs and puts the
+Data store on all of linux_data (`data-store-part=linux_data`, `data-store-lba=71859642`, 52430401 blocks). Its seed is the installed
+24 GiB seed with zeros appended to 200 GiB (`compact-seed.py --grow-gib 200 --disk-only`: the same 276 extents), so the owner's store
+is carried over instead of starting a fresh Data:
+
+1. `k273-store-backup`: the installed store's window (LBA 117998394, 6291649 blocks) to the backup disk with the three checks.
+2. `linux-data-root --root-part linux_rootfs`: the root image onto the cleared linux_rootfs, read back (only after `rootfs-clear`).
+3. `k273-store-grow`: refused unless the new seed is the old one grown (the extents compared in both ESP images), the windows do not
+   meet, the old header is the installed seed's and bound to its LBA, and the old store's backup is verified. The old bitmap comes to
+   the host; each run of present pages is copied on the tablet (`tablet.sh copy-list`, page i stays page i), the runs read back
+   equal (`hash-list`), then the new bitmap (the old one, then zeros), then the header last (the new seed, page count and LBA, the
+   old generation). Until the header lands, the new window's block 0 is no store, so a cut leaves the old layout whole.
+4. `esp-final` writes v2 only when that store is valid and bound to LBA 71859642 (the same gate as 13.3).
+
+Session (from ABL fastboot): `python3 $P maint-boot map backup k273-store-backup linux-data-root k273-store-grow esp-final check
+maint-exit --esp esp-k273-v2.img --esp-final esp-k273-v2.img --root-part linux_rootfs --root-image <root.img> --root-sha256 <hex>
+--new-backup`. Its RAM test is `out/ram-k273-v2ro`: the v2 line with `data-persist=1`, i.e. the grown store opened read-only
+(state 6) and Data volatile over it. It must show the owner's Data, the root on linux_rootfs and the battery. On the running system:
+`diskutil apfs resizeContainer <the Data container> 0` (after `diskutil repairDisk` if the GPT's backup header is not at the end).
+
+Rollback: `rollback esp-final` (esp-k273-only), `rollback k273-store-grow --root-image <the old root> --root-sha256 <hex>` (the root
+back onto linux_data; the old store window was only read), then `map check maint-exit --esp esp-k273-only.img`.
+
+Found by the host test of this step: `build-k273-esp.py` wrote the base's payload over the given `--kc/--adt/--trust/--seed` and
+over the ADT tail (the first esp-k273-v2, 573187af..., had the new line over the old payload). Fixed: the image is checked to
+hold the given files and the tail. `test-k273-only.py` covers the whole session on the fake tablet (refusals, the copy, the
+rollback).
+
 ## Done 2026-11-11 (sessions 1-3)
 
 - Session 1 (07:5x): NAS backups with read-back (boot_a 389d4271, boot_b 17e89056, vendor_boot_a 50f70e36, init_boot_a bbebc3d1,
