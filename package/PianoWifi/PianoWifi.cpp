@@ -3117,6 +3117,7 @@ volatile uint32_t gSleeps, gWakes;   // system sleeps and wakes seen with the ra
 PowerState *gPowerState;
 Options gPowerOptions;
 bool gRadioStopped;
+bool gStopLeftToLadder;   // stopRadio found the ladder's thread still at work and left the power-down to it (review F4)
 
 void profileClear();
 
@@ -3134,6 +3135,7 @@ void stopRadio(const char *why)
     // review F4: the ladder's thread still owns the hardware (a teardown that does not end): powering it down from here would
     // put WLAN_EN low and PERST# under its register writes. It powers the radio down itself once it is out (chipDown).
     note("%s: the radio is left to the ladder's thread, which powers it down when its teardown ends", why);
+    __atomic_store_n(&gStopLeftToLadder, true, __ATOMIC_SEQ_CST);
     return;
   }
   if (gLink.ce) linkTeardown();
@@ -5099,7 +5101,7 @@ void PianoWifi::run()
     const int end = runPass(pass, power, opt);
     if (!restarts) {
       // a stop that found the ladder still at work left the power-down to it (review F4)
-      if (gRadioStopped && gChipHeld) chipDown(power, opt);
+      if (gRadioStopped && __atomic_load_n(&gStopLeftToLadder, __ATOMIC_SEQ_CST) && gChipHeld) chipDown(power, opt);
       if (end == kPassUnmap) unmapWindows();
       break;
     }
@@ -5414,7 +5416,7 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
   bool parked = false, woke = false;
   for (;;) {
     if (gRadioStopped) {   // a shutdown: stopRadio powered the radio down, unless the ladder still had it (then here)
-      if (gChipHeld) chipDown(power, opt);
+      if (__atomic_load_n(&gStopLeftToLadder, __ATOMIC_SEQ_CST) && gChipHeld) chipDown(power, opt);
       return false;
     }
     if (__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST)) {
@@ -5447,7 +5449,10 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
     }
     IOSleep(50);
   }
-  if (gRadioStopped) return false;   // a shutdown that came with the wake: no pass begins (review F6)
+  if (gRadioStopped) {   // a shutdown that came with the wake: no pass begins (review F6)
+    if (__atomic_load_n(&gStopLeftToLadder, __ATOMIC_SEQ_CST) && gChipHeld) chipDown(power, opt);
+    return false;
+  }
   // The restart.
   ++gRestarts;
   if (woke) {
