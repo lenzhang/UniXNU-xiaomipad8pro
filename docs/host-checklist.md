@@ -39,7 +39,9 @@ builds or checks a 27.0.1 image.
 ## 2. Per-driver host tests (each script runs its kext's host tests first, then compiles the kext object)
 
 Inputs: `PIANO_K27_TREE` from the env file. Use the 27.3 kernel for the import checks: `export
-K27_KERNEL=out/ram-k273-bootargs/kernel-k273-0066-s0001-native.macho` (if that file is missing, mark the section SKIPPED). Each
+K27_KERNEL=out/ram-k273-bootargs/kernel-k273-0066-s0001-native.macho; export KC_BASE=out/inputs/k273/kc/kc273-mac17j.bin` (the 27.3
+kernel with 27.3's own collection base: PianoDwc3's trial collections link against `KC_BASE`; with the 27.0.1 base they fail
+`__TEXT_EXEC ... lies outside the collection`). If either file is missing, mark the section SKIPPED. Each
 script writes its objects to `out/native-kexts/<NAME>/` (expected; nothing else).
 
 Run them one after the other:
@@ -71,7 +73,7 @@ Pass per driver: exit 0, and its log has no line starting with `FAIL` and no `Er
 | 4.1 | `for j in out/ram-k273-*/build-A-bundled.json; do echo "== $j"; python3 tooling/bootimg/verify-ram-images.py "$j" 2>&1 \| tail -1; done > "$R"/41-verify-k273.log` | every 27.3 image set prints `PASS: 0 failure(s)`. The image limit is 250,000,000 bytes: an older oversized set (if one still exists) must FAIL; name it in the summary |
 | 4.2 | `shasum -a 256 out/persistent/esp-dual33d-k273d.img > "$R"/42-esp.log; python3 -c "import json;print(json.load(open('out/persistent/esp-dual33d-k273d.json'))['sha256'])" >> "$R"/42-esp.log` | both lines show `93baea7af730611145f97e51b09b1779dbacd043700aa5f156b044d56a855f59` (the ESP installed on 2026-11-13 09:45) |
 | 4.3 | `python3 tooling/adt/check-ram-window.py --adt out/ram-k273-bootargs/piano-k27.adt --kc out/ram-k273-bootargs/kc-k27-native.bin --fd out/fd/piano-uefi-A-bundled.fd > "$R"/43-ram-window.log 2>&1` | exit 0; the last line names the window `0x8c0004000..0xbffe04000 (13310 MiB)` |
-| 4.4 | `python3 -c "import json;print(json.load(open('out/ram-k273-bootargs/build-A-bundled.json'))['boot_args'])" > "$R"/44-adt-args.log 2>&1` | exit 0; the record names the set `ram` and a tail of 407 bytes (the ADT in that folder is the build's input, before the set was added, so `boot_args.py --show` on it finds none) |
+| 4.4 | `python3 -c "import json;print(json.load(open('out/ram-k273-bootargs/build-A-bundled.json'))['images']['boot-piano-macos-ram-A-bundled.img']['boot_args']['set'])" > "$R"/44-adt-args.log 2>&1` | exit 0 and the output `ram` (the record of the image's ADT set; the ADT file in that folder is the build's input, before the set was added) |
 | 4.5 | `for d in "$PIANO_BACKUP_DIR"/persistent-boot-*/; do echo "== $d"; (cd "$d" && shasum -a 256 -c SHA256SUMS); done > "$R"/45-backups.log 2>&1` | every file `OK`; no `FAILED`. These are the pre-write backups of the tablet's partitions on the external SSD (read only) |
 | 4.6 | `(cd "$(eval echo "$PIANO_BACKUP_NAS")" 2>/dev/null && for d in persistent-boot-2026111[23]-*/; do echo "== $d"; (cd "$d" && shasum -a 256 -c SHA256SUMS); done) > "$R"/46-backups-nas.log 2>&1` | if the NAS is not mounted: SKIPPED. Otherwise every file `OK`, and every set of 4.5 also exists here (the background copy finished) |
 
