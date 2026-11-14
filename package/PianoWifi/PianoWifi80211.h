@@ -32,6 +32,7 @@
 #include <libkern/copyio.h>   // copyin / copyout of the requesting task's buffers
 #include <net/kpi_interfacefilter.h>
 #include <sys/kern_event.h>
+#include <sys/proc.h>     // proc_selfname, proc_selfpid: who asked for a scan
 #include <sys/sysctl.h>
 #include "WifiApple80211.h"
 
@@ -61,6 +62,7 @@ class PianoWifi80211 : public IO80211Controller {
   static constexpr unsigned kScanDoneMs = 2000;   // a scan answered from the list completes after a short scan's time (sheng:
                                                   // answered at once, the daemon asks again straight away)
   static constexpr unsigned kReportMs = 60000;
+  static constexpr uint32_t kScanLinesMax = 400;   // two lines a scan: about 200 scans, the first half hour of a boot
 
   IOLock *fLock = nullptr;
   State *fState = nullptr;          // data allocations (no pointer in them): the state, the scratch buffer, the log's table
@@ -78,6 +80,7 @@ class PianoWifi80211 : public IO80211Controller {
   uint64_t fRequests = 0, fUnknown = 0, fEvents = 0, fEventErrors = 0, fListRefreshes = 0, fOtherIoctls = 0;
   uint64_t fReported = ~0ull;
   uint32_t fEventCodesLogged = 0;
+  uint32_t fScanLines = 0;   // the scans logged one by one (with the asking process), at most kScanLinesMax
   unsigned long fOtherSeen[16] = {};
   unsigned fOtherCount = 0;
 
@@ -337,6 +340,16 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq)
     note80211("%s: POWER set %s by airportd (M1: scans %s; the chip stays up)", fIfName, power ? "on" : "off",
               power ? "answered again" : "refused with EPWROFF");
     postEvent(kEvPowerChanged);
+  }
+  // Every scan request, not only its first kind: which process asked (a scheduled scan of airportd's or a client's through it),
+  // and what it got, so that a client's scan that fails at once can be told from one that never reached the driver.
+  if (scanSet || (!set && type == kScanResult && a.error == kErrEndOfResults)) {
+    if (__atomic_fetch_add(&fScanLines, 1u, __ATOMIC_RELAXED) < kScanLinesMax) {
+      char proc[32] = "?";
+      proc_selfname(proc, sizeof proc);
+      note80211("%s: scan %s by %s[%d]: %s len %u -> %d (%u network(s))", fIfName, scanSet ? "asked" : "read to its end", proc,
+                proc_selfpid(), requestName(type), unsigned(length), a.error, unsigned(networks));
+    }
   }
   if (a.effects & kDoScanStarted) scanStarted();
   return a.error ? a.error : EJUSTRETURN;   // EJUSTRETURN: answered, nothing after this filter runs (ifnet_ioctl makes it 0)
