@@ -1617,8 +1617,8 @@ def esp_delta(s):
         backups = dict(s.state.get('backups', {}))
         entry = backups.get('linux_rootfs-tail-esp') or {}
         if not (entry.get('verified') and entry.get('sha256') == old['sha256']):
-            if entry.get('verified') and s.state.get('esp_written'):
-                raise Stop('this backup set holds an ESP backup of another image: start a new set (--new-backup)')
+            if entry.get('verified'):   # never write over a verified backup of something else (review 2026-11-14)
+                raise Stop('this backup set holds an ESP-region backup of another image: start a new set (--new-backup)')
             dest = nas / 'linux_rootfs-tail-esp.img'
             shutil.copyfile(old_img, dest)
             again = s.sha_nocache(dest)
