@@ -21,7 +21,7 @@ A `fastboot boot` RAM image always wins over the installed copy (`firmware/patch
 ## 2. The installed profile
 
 The installed profile is the 27.3-only `macos-27.3` entry built by `tooling/k273/build-k273-esp.py`; the installed ESP is
-`esp-k273-v2` with the v3 delta. The root is on `linux_rootfs` and the owner's 200 GiB Data store on `linux_data`. The exact
+`esp-k273-v4` (Wi-Fi on; written over v2 by `esp-delta`; v5 next: Wi-Fi back after sleep). The root is on `linux_rootfs` and the owner's 200 GiB Data store on `linux_data`. The exact
 inputs, RAM test, install session and rollback are [persistent-boot.md](persistent-boot.md) §13 and §13.8 (the retired
 `build-esp.py --profile daily` / `esp-daily<N>` line is not used). Opt-in drivers join the installed profile only after a RAM
 test passed on the tablet.
@@ -82,7 +82,7 @@ The Metal plugin and our userland change; they are the **system layer**, install
 5. Tablet to ABL fastboot (§3), then on the install state of the persist worktree (`PIANO_PERSIST_OUT=<persist worktree>/out/persistent`,
    with the image and its record copied there; this checkout's tooling; steps before options):
    `python3 tooling/persist/maint-session.py maint-boot map backup [store-backup] esp-final check maint-exit --esp <esp-k273-...>.img --esp-final <esp-k273-...>.img --new-backup`
-   then `abl-final reboot`. The installed ESP is `esp-k273-v2` with the v3 delta; `esp-k273-only` is a rollback target. Every
+   then `abl-final reboot`. The installed ESP is `esp-k273-v4` (v5 next); `esp-k273-v2` and `esp-k273-only` are rollback targets. Every
    write is preceded by a verified backup and followed by a SHA-256 read-back. `store-backup` adds a verified copy of the Data
    store itself (200 GiB logical, 52430401 blocks; `rollback store-backup` restores it).
 6. With a layer: install it on the running system (`docs/userland.md` §7; the first time with the owner, `docs/persistent-boot.md` §11.6).

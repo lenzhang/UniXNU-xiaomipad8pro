@@ -32,9 +32,10 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   The USB root shell and ssh over the cable; charging that keeps going (level 2, the DSP started at once).
 - Cameras: frames from both sensors and the first pictures through a user client (`piano-camera-grab`); a macOS camera
   extension is next ([docs/drivers/camera.md](docs/drivers/camera.md)).
-- Wi-Fi: scan, association, the WPA2 four-way handshake, DHCP, gateway and Internet pings, DNS and HTTPS passed on the tablet
-  (boot 10i, 2026-11-14). The built-in `en0` handoff and sleep/rejoin probes are next
-  ([docs/drivers/wifi.md](docs/drivers/wifi.md), [docs/results-2026-11-14.md](docs/results-2026-11-14.md)).
+- Wi-Fi: the installed system joins by itself at boot (WPA2, DHCP, DNS, HTTPS; ESP v4, 2026-11-14), rejoins after a drop,
+  and in boot 10m came back by itself after a system sleep and after a firmware crash (ESP v5 brings that to the installed
+  system). The macOS Wi-Fi menu is in design ([docs/drivers/wifi-menu.md](docs/drivers/wifi-menu.md)); joining is a profile
+  file and our supplicant until then ([docs/drivers/wifi.md](docs/drivers/wifi.md)).
 - Latest results: [docs/results-2026-11-14.md](docs/results-2026-11-14.md) (Wi-Fi internet and the installed 27.3-only
   whole-disk layout); the day before: [docs/results-2026-11-13.md](docs/results-2026-11-13.md).
 - Most other drivers (power and charging, touch, keyboard cover, backlight, audio, sensors, thermal, USB host, video,
