@@ -485,8 +485,8 @@ root shell and no network job, so the first time needs the owner at the keyboard
    sudo sh /private/var/piano/userland/install.sh --check
    ```
    `live.log` lists each file `installed`, the base's three plugin files `kept as /private/var/db/piano-userland/prev/...`, the
-   jobs loaded, `--live done: ok`; `--check` exits 0. `cat /private/var/log/piano-still-wallpaper.log`: `login picture written`
-   or `kept` per account.
+   jobs loaded, `--live done: ok`; `--check` exits 0. `cat /private/var/log/piano-still-wallpaper.log`: `login picture written`,
+   `replaced ours` or `kept the user's` per account (the stock default still picture; only our earlier choice is replaced).
 5. Optional, the same Terminal (attended-desktop.md §3; each undone with `launchctl enable` and a restart):
    `sudo launchctl disable system/com.apple.PerfPowerServices` (1.7 cores at the idle login window), likewise
    `system/com.apple.watchdogd`, `system/com.apple.mobileactivationd`, `system/com.apple.security.xprotectd`.

@@ -808,26 +808,35 @@ from IOSurface 0x12` every 100 ms (runs `20261112-104004` and `-105345`: 14559 a
 fallback are macOS 26's code (this Mac's, read for behaviour); macOS 27's binaries are not here, its console agrees.
 
 `DESK_WALLPAPER=still` (the default of `tooling/k27/build-desktop-images.sh` and `tooling/k27/build-gfx-test-images.sh`) stages
-`tooling/k27/still-wallpaper.sh` and its files (`tooling/k27/still-wallpaper.py`: a 3200x2136 picture of one colour, `#5A4A2E`, a dark
-ochre that is neither an undrawn wallpaper's grey nor black nor the boot screen's blue; the `Metadata.plist` of an image choice; a
-wallpaper store `Index.plist` with the same choice) into each staged seed, and the boot job runs the script first after the clock, as
-root (SecurityAgent reads the picture about 7 s later). For every local account (uid 501 or more, its GeneratedUID read from the local
-directory node at boot: only root may read it, so it cannot be staged) and for root's and _securityagent's fallback ids it writes
-`/var/db/Wallpapers/<id>/Wallpaper.png` and `Metadata.plist` (root's, 0644, as `wallpaperexportd` leaves them), the picture as
-`/Library/Desktop Pictures/UniXNU Still.png`, and the account's store when it has none (so the desktop after the login is still too).
-Nothing that exists is replaced. Console: `still-wallpaper: root and _securityagent: login picture written, written`, `still-wallpaper:
-uid 501: login picture written, store written`. `DESK_WALLPAPER=video` stages none of it: the aerial video, the path this fix makes
-drawable. `build-desktop-images.sh plain` keeps the stock seed (the video). Not verified on the tablet: that macOS 27 shows only the
-picture (macOS 26's code turns the live layer off once it has one), and that its wallpaper agent takes the hand-written store; if the
-desktop after the login still plays the aerial, the login window is still still (the boot job writes its picture at every boot of a
-volatile Data).
+`tooling/k27/still-wallpaper.sh` and its files (`tooling/k27/still-wallpaper.py`) into each staged seed, and the boot job runs the
+script first after the clock, as root (SecurityAgent reads the picture about 7 s later). Since 2026-11-14 the `Metadata.plist` and
+wallpaper-store `Index.plist` choose Apple's own `/System/Library/CoreServices/DefaultDesktop.heic` by file URL. Read-only inspection
+of the tablet's macOS 27.3 confirmed that this is a symlink to `/System/Library/Wallpapers/.default/DefaultAerial.heic`, the still
+picture of the default wallpaper: HEIC, 3840x2160, 8,365,830 bytes. No Apple picture or property list is copied into this repository
+or staged; the picture is read from the tablet's own system volume at run time.
+
+Once a boot the script uses macOS's `sips -s format png -z 2136 3200` to convert that stock picture to the panel's 3200x2136 PNG in a
+temporary file. The generated one-colour `still.png` (`#5A4A2E`, dark ochre) is now only the fallback when the stock picture is absent
+or conversion fails. For every local account (uid 501 or more, its GeneratedUID read from the local directory node at boot: only root
+may read it, so it cannot be staged) and for root's and _securityagent's fallback ids it installs
+`/var/db/Wallpapers/<id>/Wallpaper.png` and `Metadata.plist` (root's, 0644, as `wallpaperexportd` leaves them), and the account's
+store for the desktop after the login. The choice files name the stock picture even when the login export has to use the fallback.
+
+An absent choice is written. So is one that is ours: either the earlier ochre choice, recognised by `UniXNU Still` in the existing
+binary `Metadata.plist` / `Index.plist`, or the current generated choice, recognised byte for byte. Anything else is the user's choice
+and stays untouched; an existing partial export whose metadata cannot establish that it is ours is conservatively kept too. Console:
+`still-wallpaper: uid 501: login picture replaced ours, store replaced ours`, with `written` for an absent choice and `kept the user's`
+for another one. `tooling/k27/test-still-wallpaper.py` exercises those rules, the `sips` arguments, both fallbacks and cleanup against
+a temporary fake root, with synthetic fixtures only. `DESK_WALLPAPER=video` stages none of it: the aerial video, the path this fix
+makes drawable. `build-desktop-images.sh plain` keeps the stock seed (the video).
 
 **The installed system** (2026-11-12): its seed is the store's base and is never restaged ([data-store.md](../data-store.md) §9), so the
 same script and files come with the system layer as the unit `piano-still-wallpaper` (`configs/userland.toml`: the script as
 `/usr/local/libexec/piano-still-wallpaper`, its files in `/usr/local/share/piano/wallpaper`, a LaunchDaemon that runs it once a boot,
-log `/private/var/log/piano-still-wallpaper.log`). It runs at the layer's installation and at every boot after. On the owner's Data
-an account that already has a login picture (an export of a wallpaper chosen there) keeps it (`login picture kept`): then the still
-picture is the owner's choice in System Settings › Wallpaper (`/Library/Desktop Pictures/UniXNU Still.png`).
+log `/private/var/log/piano-still-wallpaper.log`). It runs at the layer's installation and at every boot after. On the owner's Data the
+existing `UniXNU Still` login exports and account store are replaced by the stock choice; a wallpaper the owner has since chosen is kept.
+The new stock-picture conversion and replacement behaviour have not yet run on the tablet. **Revisit the default video wallpaper when
+hardware video decode (backlog B10, Iris) works.**
 
 ### The verification image
 
@@ -858,8 +867,9 @@ Console lines, in order (`grep -a -E` on the USB console):
 The webcam (`imagesnap -d "HD Pro Webcam C920" -w 1.5 cam-$(date +%H%M%S).jpg`): `ram-gfx-video` shows the login window over a moving
 aerial landscape (sky, sea, terrain: its colours change between two pictures a few seconds apart), where every run so far showed flat
 grey (`mean #909090`); `NativeGopDisplay: thumb frame ...` lines then report a non-grey mean that changes from thumbnail to thumbnail.
-`ram-gfx-fix` shows the login window over the uniform dark ochre picture (thumbnails' mean near `#5a4a2e` under the login window's
-tint), with `still-wallpaper: ... login picture written` on the console and no VTDecoderXPCService start before a login.
+`ram-gfx-fix` shows the login window over Apple's stock default still picture (the fallback is uniform dark ochre only if the stock
+picture cannot be converted), with `still-wallpaper: ... login picture written` or `replaced ours` on the console and no
+VTDecoderXPCService start before a login.
 
 Built offline 2026-11-12 in an agent worktree (the 0064 kernel, 24 native kexts, every vtable check 0 problem slots, the native kext
 rule passed): KC `a5706b5b5e5c76f0…`; `ram-gfx-video` `5cba0b63fdb287cb…` (seed `921b5d98…`), `ram-gfx-fix` `7f36b4eaaf6223bf…` (seed

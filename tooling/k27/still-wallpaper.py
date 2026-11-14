@@ -5,17 +5,18 @@ tooling/k27/still-wallpaper.sh installs at boot, written here once, the same byt
 
     still-wallpaper.py OUTDIR      -> OUTDIR/still.png, OUTDIR/Metadata.plist, OUTDIR/Index.plist; prints the --file arguments
 
-- still.png: the picture, one colour (#5A4A2E, a dark ochre: neither the grey of an undrawn wallpaper nor black nor the boot screen's
-  blue), 3200x2136 (the panel), about 20 KB. The login window shows it from /var/db/Wallpapers/<GeneratedUID>/Wallpaper.png, the file
-  macOS's login window (SecurityAgent's loginwindow plugin) reads for the account before it falls back to the default aerial video
-  (macOS 26's code; macOS 27's console of run 20261112-104004: SecurityAgent "Failed to load wallpaper image for user with UUID ...",
-  ImageIO "can't open '/var/db/Wallpapers/...'", then the video's decoder).
-- Metadata.plist: what wallpaperexportd writes beside that picture, the choice it was exported from (an image file choice of
-  /Library/Desktop Pictures/UniXNU Still.png): the wallpaper agent compares it with the account's choice at login and exports again
-  when they differ.
+- still.png: the fallback picture, one colour (#5A4A2E, a dark ochre: neither the grey of an undrawn wallpaper nor black nor the boot
+  screen's blue), 3200x2136 (the panel), about 20 KB. The login window normally shows a PNG made at boot from macOS 27.3's own
+  /System/Library/CoreServices/DefaultDesktop.heic; this fallback is used only when that stock picture is missing or cannot be converted.
+  The login window reads /var/db/Wallpapers/<GeneratedUID>/Wallpaper.png before it falls back to the default aerial video (macOS 26's
+  code; macOS 27's console of run 20261112-104004: SecurityAgent "Failed to load wallpaper image for user with UUID ...", ImageIO
+  "can't open '/var/db/Wallpapers/...'", then the video's decoder).
+- Metadata.plist: what wallpaperexportd writes beside that picture, the choice it was exported from (an image file choice of the stock
+  picture on the system volume): the wallpaper agent compares it with the account's choice at login and exports again when they differ.
+  No Apple picture or property list is stored in this repository or staged; the stock picture is read on the tablet at run time.
 - Index.plist: the account's wallpaper store (~/Library/Application Support/com.apple.wallpaper/Store/Index.plist) with the same choice
-  for every space and display, for the desktop after the login; written only where the account has none.
-The formats are those of macOS 26's own files (binary property lists); macOS 27's were not read (no system image here).
+  for every space and display, for the desktop after the login; written where the account has none or the existing choice is ours.
+The formats are those of macOS 26's own files (binary property lists); macOS 27.3's stock picture path was read on the tablet.
 """
 import datetime
 import plistlib
@@ -23,10 +24,12 @@ import struct
 import sys
 import zlib
 from pathlib import Path
+from urllib.parse import quote
 
 WIDTH, HEIGHT = 3200, 2136
 COLOR = (0x5A, 0x4A, 0x2E)
-PICTURE = 'file:///Library/Desktop%20Pictures/UniXNU%20Still.png'
+PICTURE_PATH = '/System/Library/CoreServices/DefaultDesktop.heic'
+PICTURE = 'file://' + quote(PICTURE_PATH)
 # A fixed time for the store's LastSet/LastUse: the staged seed keeps its identity across rebuilds.
 WHEN = datetime.datetime(2026, 11, 12, 0, 0, 0)
 

@@ -4,7 +4,8 @@
      images"; docs/persistent-boot.md section 11.6). Install as /Library/LaunchDaemons/com.unixnu.piano-still-wallpaper.plist
      (root:wheel 644) with the script at /usr/local/libexec/piano-still-wallpaper (tooling/k27/still-wallpaper.sh, root:wheel 755) and
      its three files in /usr/local/share/piano/wallpaper: configs/userland.toml, docs/userland.md. One run per boot (LaunchOnlyOnce),
-     as root: it writes the login window's picture for every local account that has none, and replaces nothing that exists. -->
+     as root: it converts the system volume's stock DefaultDesktop.heic for the login window (one-colour fallback), writes absent
+     choices, replaces our earlier UniXNU Still/generated choices, and keeps any wallpaper the user chose. -->
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.unixnu.piano-still-wallpaper</string>

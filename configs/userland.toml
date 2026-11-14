@@ -148,7 +148,7 @@ mode = "0644"
 
 [[unit]]
 name = "piano-still-wallpaper"
-about = "the still login wallpaper (docs/drivers/gpu-userspace.md): once a boot, the login window's picture for every local account that has none (no software video decode at the login window); replaces nothing"
+about = "Apple's stock default still picture (the system volume's DefaultDesktop.heic, converted once a boot; one-colour fallback): writes absent wallpaper choices and replaces only our earlier UniXNU Still/generated choices, never the user's; no software video decode"
 default_on = true
 
 [[unit.file]]
