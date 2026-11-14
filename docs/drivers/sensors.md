@@ -659,6 +659,37 @@ the defaults `-rpc-frame=1 -rpc-ladder=1 -rpc-deadline=15`): what it must show, 
 | Charging unchanged | PianoPower's mca writes `ok (0)` with read-backs `as written`, `[Ns] mca:` lines without timeouts, the same policy steps as the batch run |
 | If the bring-up fails anyway | `rpc released the sensors PD's session rc=0 value=0 ms=N after the attach` with N below 16000, then `guard: off: the file service failed after the attach`; whether the DSP then stays up past T+90 s answers whether the release ends the PD's wait |
 
+**The s1b result** (one RAM boot, 2026-11-14 21:41, image `71357c94…`): the framing did its job and the death moved one step deeper.
+The boot ended about 36 s after XNU start (`back in ABL fastboot after 55 s`, the panic, not the 900 s guard). Item by item:
+
+| Question | Answer |
+|---|---|
+| The framing | **PASS** — `rpc attached to the sensors PD pa=0x9d200000 bank=3 ms=25905 frame=meta deadline=15000` (console 3823): attach answered 0 with the meta framing |
+| init2 answered 0 | **PASS — H1 (the payload page) confirmed on the tablet**: `rpc listening frame=meta inits=1 ms=26032 after_attach_ms=84` (console 3825): the first init2, with the metadata page, was accepted 84 ms after the attach. No refusal, no ladder step, no `adsp_listener init2 failed` anywhere: the first S2's EBADPARM is gone |
+| The file service serves | **PARTIAL — reached the serve state, died on the first call**: `rpc first call of the DSP handle=0 sc=0x20200` exists only in the mailbox (3826; the console capture had ended at the disconnect), then `Unaligned kernel data abort` (`esr: 0x96000021`, `far: 0xfffffffb5ce21021`) and `MACH Reboot` (mailbox 3827-3837). No `rpc open` for sns_reg_config, json.lst or the registry, no `declined`, no `release`: nothing was served |
+| S3 | **FAIL** again: `type=registry found=0`, then accel, gyro, mag, ambient_light, proximity (mailbox 3809-3822), `sensor list settled` — consistent, the PD never got its files |
+| S4 | NOT SEEN |
+| No DSP fatal for 10 minutes | ran out by the host panic, not by a DSP event: `fatal 0/0` throughout, no `crash reason`, the guard only `wait`→`run`. The batch run's `sns_watchdog` death did not recur — this death was XNU-side |
+| Charging unchanged | as far as it went: mca writes `ok (0)` with read-backs `as written`, the 900→1500 mA step held `5051 mV with 791 mA`, charger generation 1; the ladder beyond 1500 mA never ran |
+| The release path | NOT APPLICABLE — the bring-up succeeded, so rule 7 never triggered |
+
+The new blocker is the PD's first reverse call, one step deeper than init2. Confirmed facts: the abort line and its registers
+(`far = x8+0x21`, x13−x8 = `0xf000` = `kInCapacity`, x20 = the call's sc), `MACH Reboot`; `sc=0x20200` is the remotectl-open shape
+(method 2, 2 in / 2 out — exactly our own `SC(kMethodOpen,2,2)`, inferred). The exact line is inferred: the pc is in kernel/kext text,
+the mailbox holds no backtrace, and the only unlogged window between `listening` and the disconnect is the read/dispatch of that first
+request (a refusal would have logged `dsp opens ...` at log=2); the non-canonical `lr` fits a corrupted in-buffer length or pointer that
+passed the arena bounds but not the page mapping. Whether it reproduces (deterministic vs a flipped PD message — the mailbox carried
+421620 majority-corrected bytes, but the abort itself is console-timed) is unknown from one boot.
+
+What the next image must change (inferred): before anything else, harden the first-call path — bounds-check the request blob against the
+mapped arena pages, not just against `kInCapacity`, clamp and validate every buffer `n` before dereference, cap `text_of`/`same` reads to
+the mapped region, and treat an out-of-range length as `SSR_EBADPARM` instead of touching it; that is the single step between "listening"
+and "serving". An A/B boot arg (default keep serving) that answers the first reverse call with an error without parsing it discriminates
+"the PD's message content is the trigger" vs "our parse is". Repeat the same image once unchanged if the panic reproduces. S3/S4 stay
+blocked behind serving; `-settle=20` stays (the attach at T≈26 s was answered and the PD called back at once; the watchdog never fired).
+The release path stays queued for a boot where the bring-up fails. Sources: the live console capture (one boot, quoted throughout); the
+mailbox only for the lines the console lost, quoted where the majority-corrected copy reads cleanly.
+
 ## 9. Fallback
 
 `piano-sensors=0` (the default): nothing runs, as today. Brightness by the keys (PianoBacklight), rotation manual (R1's System Settings
