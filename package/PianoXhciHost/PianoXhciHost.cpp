@@ -34,7 +34,11 @@
 
 namespace {
 
-// The register file behind Apple's 64-bit accessors: `base` is the mapped window Apple's driver passes, `offset` the register.
+// The register file behind the 64-bit accessors. The collection's own signature takes the base as an integer
+// (`regRead64(unsigned long long, unsigned int)`), which arrives in the same register as a pointer; it is **inferred** - from
+// QcomDwc3 doing exactly this on the same class, and from the 32-bit accessors next to it - that the value is the mapped virtual
+// address of the controller's register window. The first eight accesses of each kind log that base, so the first tablet log says
+// whether the assumption holds (an implausible value, or a fault at the first access, means it does not).
 struct Window {
   volatile uint32_t *at;
   uint32_t load(uint64_t offset) { return at[offset / 4]; }
@@ -67,8 +71,8 @@ public:
     const uint64_t value = pianoxhci::read64(w, offset);
     const uint64_t count = ++gReads;
     if (logging(count))
-      IOLog("PianoXhciHost: read64 #%llu +%#x = %#llx (low %#x, high %#x)\n", (unsigned long long)count, offset,
-            (unsigned long long)value, uint32_t(value), uint32_t(value >> 32));
+      IOLog("PianoXhciHost: read64 #%llu base %#llx +%#x = %#llx (low %#x, high %#x)\n", (unsigned long long)count,
+            (unsigned long long)base, offset, (unsigned long long)value, uint32_t(value), uint32_t(value >> 32));
     return value;
   }
 
@@ -79,8 +83,8 @@ public:
     pianoxhci::write64(w, offset, value);
     const uint64_t count = ++gWrites;
     if (logging(count))
-      IOLog("PianoXhciHost: write64 #%llu +%#x = %#llx (high %#x first, then low %#x)\n", (unsigned long long)count, offset,
-            (unsigned long long)value, uint32_t(value >> 32), uint32_t(value));
+      IOLog("PianoXhciHost: write64 #%llu base %#llx +%#x = %#llx (high %#x first, then low %#x)\n", (unsigned long long)count,
+            (unsigned long long)base, offset, (unsigned long long)value, uint32_t(value >> 32), uint32_t(value));
   }
 };
 OSDefineMetaClassAndStructors(PianoXhciHost, AppleUSBXHCI)
