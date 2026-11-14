@@ -35,6 +35,14 @@ for f in FatVolume.c FatVolume.h; do
 done
 python3 "$D/tooling/k27/build-native-kext.py" PianoWifi "$P/PianoWifi.cpp" "$D/tooling/k27/NativeKextGlue.cpp" \
   "$P/WifiFirmware.c" "$P/FatVolume.c" "$P/WifiQrtr.c" "$P/WifiProfileFile.c" -I "$P" --obj "${K27_OBJ:-k27-native-obj}"
+# The ladder's own frames stay well inside its 16 KiB kernel stack (boots 10c, 10d and 10d-ctl, 2026-11-14, overflowed it as level
+# 6 began, with about 16 KiB of them: whole-object resets inlined into level 6, now renew() in place): at most 6 KiB from each
+# thread's entry, the function-pointer targets of the I/O tables, the hooks and en0's callbacks included (an over-estimate).
+IND=spmiRd,spmiWr,spmiDelay,hwRead,hwWrite,hwUdelay,hwMsleep,hwNow,hwVoteLock,hwVrm,hwPmic,hwStep,barRd,barWr,chipIoRead,chipIoWrite
+IND=$IND,linkNote,staNote,staReport,staHook,wlfwClaim,wlfwSendMessage,wlfwFileSize,wlfwFileRead,wlfwMemory,wlfwStepNote,wlfwEventNote
+for entry in __ZN9PianoWifi6threadEPvi __ZN9PianoWifi10stopThreadEPvi deferPrinter portSend; do
+  python3 "$D/tooling/k27/check-kext-stack.py" "$O/PianoWifi.o" "$entry" --max 6144 --brief --indirect "$IND" >&2
+done
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
 # PianoA830's lock words and NativeUfs's partition reader come from those kexts (libraries in PianoWifi.json, both linked before
 # PianoWifi in configs/k27-native-kexts.txt), resolved by the KC link.

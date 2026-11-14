@@ -182,7 +182,7 @@ inline uint64_t addrOf(const uint8_t *e) { return uint64_t(get32(e)) | uint64_t(
 inline bool dpPlan(Dp &dp, Arena &arena, HttRx *rx)
 {
   using namespace dpdetail;
-  dp = Dp{};
+  renew(dp);
   dp.rx = rx;
   uint64_t pointersBus = 0;
   uint8_t *pointers = arenaAlloc(arena, 4 * 8, &pointersBus);

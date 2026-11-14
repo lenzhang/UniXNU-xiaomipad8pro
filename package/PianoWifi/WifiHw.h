@@ -14,9 +14,28 @@
 //          chip on the OnePlus 13T, host-tested only): the same GCC/PARF/PHY/TCSR offsets as mainline, the PMIC LDO page rule, hwcg
 // docs/drivers/wifi.md section 2 has the same facts with their state (verified / inferred / needs-boot).
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
+#if __has_include(<new>)
+#include <new>
+#else
+// The kernel has no <new>: XNU's own forward declaration (libkern/c++/safe_allocation.h). The reserved placement form, which the
+// compiler emits as its pointer argument (no call, no import).
+void *operator new(size_t, void *) noexcept;
+#endif
 
 namespace pianowifi {
+
+// A value reset in place. `x = T{}` builds the fresh T on the stack first and copies it over: with Link (the scan list,
+// about 12 KiB) and HttRx (the buffers' addresses, about 13 KiB) inlined into level 6, the ladder's 16 KiB kernel stack
+// overflowed as level 6 began (boots 10c, 10d and 10d-ctl, 2026-11-14: "Invalid kernel stack pointer (probable overflow)" in
+// the mailbox). Every whole-object reset of this package is renew() for that reason.
+template <class T>
+inline void renew(T &x)
+{
+  x.~T();
+  ::new (static_cast<void *>(&x)) T();
+}
 
 // ---- PCIe0 root complex (DT pcie@1c00000, qcom,pcie-sm8750 + qcom,pcie-sm8550, num-lanes 2, linux,pci-domain 0) ----
 // reg: parf 0x1c00000+0x3000, dbi 0x40000000+0xf1d, elbi 0x40000f20+0xa8, atu 0x40001000+0x1000, config 0x40100000+0x100000,

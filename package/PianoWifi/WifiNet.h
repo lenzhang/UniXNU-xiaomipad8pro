@@ -308,7 +308,7 @@ inline void netKeysReset(NetKeys &k)
   netdetail::wipe(reinterpret_cast<volatile uint8_t *>(&k.pairwise), sizeof k.pairwise);
   netdetail::wipe(reinterpret_cast<volatile uint8_t *>(&k.group), sizeof k.group);
   const uint32_t installed = k.installed, refused = k.refused;
-  k = NetKeys{};
+  renew(k);
   k.installed = installed;
   k.refused = refused;
 }

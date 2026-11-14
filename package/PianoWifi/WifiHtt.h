@@ -129,7 +129,7 @@ inline uint32_t slotOf(const HttRing &r, uint32_t words) { return r.entryWords ?
 inline bool httPlan(HttRx &rx, Arena &arena, bool rbmSw1)
 {
   using namespace httdetail;
-  rx = HttRx{};
+  renew(rx);
   rx.rbm = rbmSw1 ? kRxBufRbmSw1 : kRxBufRbmFw;
   uint64_t pointersBus = 0;
   uint8_t *pointers = arenaAlloc(arena, 4 * 2 * kHttRings, &pointersBus);
@@ -235,7 +235,7 @@ inline void httReceive(HttRx &rx, const uint8_t *payload, uint32_t length)
     if (length < 12) return;
     const bool unmap = type == kHttT2hPeerUnmap || type == kHttT2hPeerUnmap2;
     HttPeerMap &p = rx.peer[rx.peerEvents % kHttPeerMapsKept];
-    p = HttPeerMap{};
+    renew(p);
     p.type = type;
     p.unmapped = unmap;
     p.vdevId = (word0 >> 8) & 0xffu;

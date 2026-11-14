@@ -239,7 +239,7 @@ inline uint32_t mhiStateRead(MhiBoot &m)
 // Reads the register layout; false when the boot interfaces do not lie inside the register space the owner mapped.
 inline bool mhiOpen(MhiBoot &m, const MhiIo &io, uint32_t space)
 {
-  m = MhiBoot{};
+  renew(m);
   m.io = io;
   m.space = space;
   m.reglen = space ? space : mhidetail::rd(m, kMhiRegLen);
@@ -464,7 +464,7 @@ inline bool mhiContextsPlan(MhiContexts &c, uint8_t *va, uint64_t bus, uint32_t 
   using namespace mhidetail;
   static_assert(kMhiChannels * kMhiContextStride <= kMhiEventCtxOffset, "the channel contexts reach the event contexts");
   static_assert(kMhiEventCtxOffset + kMhiEventRings * kMhiContextStride <= kMhiCommandCtxOffset, "the event contexts overlap");
-  c = MhiContexts{};
+  renew(c);
   c.va = va;
   c.bus = bus;
   c.bytes = bytes;

@@ -42,7 +42,7 @@ inline void chipPowerOnReset(const ChipIo &io, Delay delayMs, uint32_t bhiOff, C
 {
   auto rd = [&](uint32_t a) { return io.read(io.ctx, a); };
   auto wr = [&](uint32_t a, uint32_t v) { io.write(io.ctx, a, v); };
-  r = ChipReset{};
+  renew(r);
   // The chip's PARF LTSSM word: retried while it does not read back, with a pause when the link does not answer.
   uint32_t v = r.ltssmBefore = rd(kChipParfLtssm);
   for (unsigned i = 0; v != kChipParfLtssmValue && i < kChipLtssmTries; ++i) {
@@ -97,7 +97,7 @@ struct MsiSetup {
 template <class Read, class Write>
 inline bool msiEnable(MsiSetup &m, Read rd, Write wr, uint32_t cap, uint64_t address, uint16_t data)
 {
-  m = MsiSetup{};
+  renew(m);
   m.cap = cap;
   if (!cap || (cap & 3) || cap < 0x40 || cap > 0xf0) return m.why = "no MSI capability", false;
   const uint32_t head = rd(cap);
@@ -152,7 +152,7 @@ template <class Read, class Write>
 inline void rasDesArm(RasDes &r, Read rd, Write wr)
 {
   const uint32_t at = r.at;
-  r = RasDes{};
+  renew(r);
   r.at = at;
   if (!at) return;
   for (unsigned i = 0; i < kRasEventCount; ++i) {

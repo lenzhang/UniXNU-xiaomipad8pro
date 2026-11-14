@@ -454,7 +454,7 @@ inline bool wlfwStart(WlfwClient &c, const WlfwIo &io, unsigned mode, unsigned s
     wlfwdetail::fail(c, kWlfwErrState);
     return false;
   }
-  c = WlfwClient{};
+  renew(c);
   c.io = io;
   c.mode = mode;
   c.shadow = shadow;

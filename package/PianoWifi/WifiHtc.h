@@ -73,7 +73,7 @@ inline uint32_t get32(const uint8_t *at)
 // control (its messages are small and the firmware answers them one at a time).
 inline void htcBegin(Htc &htc)
 {
-  htc = Htc{};
+  renew(htc);
   HtcEndpoint &zero = htc.ep[0];
   zero.service = uint16_t(kSvcCtrl);
   zero.id = 0;

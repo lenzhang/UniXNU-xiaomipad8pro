@@ -110,6 +110,8 @@ extern "C" {
 volatile int32_t piano_wifi_stage = 0;
 // WifiProfileFile.c: the join profile out of its root-only file (0, ENOENT for no file, else the reason in *problem).
 int piano_wifi_profile_read_file(struct piano_wifi_profile *out, const char **problem);
+// XNU's (osfmk/arm64): the bytes left on the current thread's kernel stack (or the interrupt stack it is on).
+vm_offset_t ml_stack_remaining(void);
 }
 
 namespace {
@@ -254,6 +256,25 @@ void readArgs()
 
 uint64_t nowMs();
 
+// ---- the ladder's stack (boots 10c, 10d and 10d-ctl, 2026-11-14) ----
+// The ladder's thread has XNU's 16 KiB kernel stack. Level 6 inlined two whole-object resets (Link and HttRx, about 12 KiB of
+// temporaries) and overflowed it as it began: "Invalid kernel stack pointer (probable overflow)" in the mailbox. The objects
+// are reset in place now (renew, WifiHw.h) and tooling/k27/check-kext-stack.py bounds the thread's own frames in the build;
+// on the tablet the least free stack seen at any log line (and at level 8's turns) is reported at each level's start.
+constexpr vm_offset_t kStackBytes = 16384;
+thread_t gLadderThread;
+vm_offset_t gStackStart = kStackBytes, gStackLeast = kStackBytes;
+int32_t gStackLeastAt;
+inline void stackMark()
+{
+  if (!gLadderThread || current_thread() != gLadderThread) return;
+  const vm_offset_t left = ml_stack_remaining();
+  if (left < gStackLeast) {
+    gStackLeast = left;
+    gStackLeastAt = piano_wifi_stage;
+  }
+}
+
 // ---- the log, and why part of it waits (wifi-4a, 2026-11-12) ----
 // IOLog goes to the console, and the console can hold the calling thread for seconds while the rest of the boot prints (wifi-4a:
 // the line after "changed +477 ms" took 2027 ms to come out, while the root volume mounted and launchd started; the firmware
@@ -289,6 +310,7 @@ unsigned deferPrintHeld(const char *buffer);
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void note(const char *fmt, ...)
 {
+  stackMark();
   char line[400];
   va_list ap;
   va_start(ap, fmt);
@@ -413,6 +435,14 @@ void deferFlush()
 
 // A phase change: the helper prints what is held (a stage, a level 4 phase, a level 5 or 6 step).
 void deferPhase() { __atomic_add_fetch(&gDeferPhase, 1u, __ATOMIC_ACQ_REL); }
+
+void reportStack(const char *where)
+{
+  if (!gLadderThread) return;
+  stackMark();
+  note("stack: %lu of %lu bytes free at the thread's start, the least so far %lu (at stage %d); %s", (unsigned long)gStackStart,
+       (unsigned long)kStackBytes, (unsigned long)gStackLeast, gStackLeastAt, where);
+}
 
 void stage(int32_t value, const char *what)
 {
@@ -1917,7 +1947,7 @@ bool loadFirmware(FirmwarePlan &plan)
     return note("firmware: the boot loader could not be read"), false;
   // The parts as the chip will read them, for the identity check below and the one after a failure (§10.23): the boot loader's
   // buffer, then the segments. With peach's split the file is the buffer and the segments; with one image it is the segments.
-  gImage = ImageParts{};
+  renew(gImage);
   gImage.spans[gImage.count++] = Span{sbl, plan.layout.sblBytes};
   uint64_t addresses[kMhiMaxSegments] = {};
   for (uint32_t i = 0; i < plan.segments; ++i) {
@@ -3561,7 +3591,7 @@ void level8Status(uint64_t now, const char *why)
 // the host). Sent on the data interface's endpoint; a turn without a transport buffer tries again.
 void level8Begin(uint64_t now)
 {
-  gL8 = Level8{};
+  renew(gL8);
   if (!gDpPlanned && gHttPlanned && (gArgs.l8 & kL8Rings)) level8Program("at level 7's start");
   gL8.on = gDpPlanned && gDp.programmed;
   gL8.lastStatus = now;
@@ -3607,6 +3637,7 @@ void level8Selection()
 // One received frame: EAPOL to the port, everything else to en0 (while its link is up).
 void level8Deliver(uint32_t kind, const uint8_t *frame, uint32_t length, uint64_t now)
 {
+  stackMark();
   if (!gL8.firstRxAt) {
     gL8.firstRxAt = now;
     note("level 8: the first frame of the data path: %u bytes, %s, %llu ms after the association", length,
@@ -3877,6 +3908,7 @@ void level8Transmit()
 void level8Turn(uint64_t now)
 {
   if (!gL8.on) return;
+  stackMark();
   level8Selection();
   level8Follow(now);   // the association's answer of this turn first: message 1 may be in the same turn's frames
   dpPoll(gDp, gChipIo, [&](uint32_t kind, const uint8_t *frame, uint32_t length) { level8Deliver(kind, frame, length, now); });
@@ -3892,6 +3924,7 @@ void level8Turn(uint64_t now)
 void level8End(IOService *owner, uint64_t now)
 {
   if (!gL8.on) return;
+  reportStack("level 8 ends");
   if (gL8.live) {
     gL8.live = false;
     gL8.txUp = false;
@@ -4201,6 +4234,9 @@ bool PianoWifi::start(IOService *provider)
 void PianoWifi::thread(void *self, wait_result_t)
 {
   thread_set_thread_name(current_thread(), "piano-wifi");
+  gLadderThread = current_thread();
+  gStackStart = ml_stack_remaining();
+  gStackLeast = gStackStart;
   static_cast<PianoWifi *>(self)->run();
 }
 
@@ -4241,7 +4277,10 @@ void PianoWifi::run()
     IOSleep(gArgs.delay * 1000);
   }
   stage(1, "GCC, TCSR and TLMM (read only)");
-  Survey s;
+  // The surveys live in static storage, not on the ladder's 16 KiB stack (boots 10c-10d-ctl overflowed it).
+  static Survey gSurveyFirst, gSurveyAgain;
+  Survey &s = gSurveyFirst;
+  renew(s);
   surveyClocks(s, load, gArgs.hwcg != 0);
   surveyPins(s, load);
   reportClocks(s.clocks);
@@ -4279,7 +4318,8 @@ void PianoWifi::run()
                             : "level 2 must do the whole power-up (rails, WLAN_EN, domains, clocks, PHY, PERST#, LTSSM)");
   for (uint32_t i = 1; gArgs.repeat && i <= gArgs.samples; ++i) {
     IOSleep(gArgs.repeat * 1000);
-    Survey again;
+    Survey &again = gSurveyAgain;
+    renew(again);
     survey(again, load, gArgs.hwcg != 0);
     summary(again, line, sizeof line);
     note("sample %u (+%u s): %s", i, i * gArgs.repeat, line);
@@ -4307,6 +4347,7 @@ void PianoWifi::run()
     unmapAll();
     return;
   }
+  reportStack("level 2 begins");
   note("level 2: the six PMU rails, PERST# low, WLAN_EN; the PHY's two LDOs are read only (one is the UFS PHY's PLL)");
   // The rails through the shared helper first (PianoBluetooth may hold them already: then only a read-back), then level 2's own
   // steps, the PMU lock across both: BT_EN never rises between our rails and WLAN_EN. powerUp's steps 201..203 then find the
@@ -4348,8 +4389,11 @@ void PianoWifi::run()
 
   // ---- level 3 ---------------------------------------------------------------------------------------------------------
   // The DMA path's bandwidth before the controller's clocks, as pcie-qcom does (WifiHw.h: the PCIe NoC's bus clock manager).
+  reportStack("level 3 begins");
   nocVote(true);
-  LinkState link;
+  static LinkState gLinkState;   // static, as the surveys: the ladder's stack stays small
+  LinkState &link = gLinkState;
+  renew(link);
   rc = linkUp(link, power, gHw, opt);
   reportLink(link);
   writeSummary("level 3");
@@ -4406,6 +4450,7 @@ void PianoWifi::run()
     note("level %u: device wake %s", gArgs.level,
          mhiDevWake(gMhiIo, gMhiRegLen, false) ? "released (the chip may idle)" : "not released");
   };
+  reportStack("level 4 begins");
   stage(400, "level 4: the DMA window, BAR0's MHI registers, the firmware over BHI/BHIe");
   if (!dmaWindow()) {
     stage(-400, "level 4: no DMA window; nothing was given to the endpoint");
@@ -4438,6 +4483,7 @@ void PianoWifi::run()
   }
 
   // ---- level 5 ---------------------------------------------------------------------------------------------------------
+  reportStack("level 5 begins");
   levelBegin(5, gArgs.deadlineMs);
   rc = level5(power, opt);
   levelEnd();
@@ -4473,6 +4519,7 @@ void PianoWifi::run()
                          ((gArgs.l6pre & kPreRxRings) ? gArgs.scanWaitMs + 4000u : 0u) +
                          ((gArgs.l6pre & kPreDiag) ? 2000u : 0u) + 5000;
     levelBegin(6, own > gArgs.deadlineMs ? own : gArgs.deadlineMs);
+    reportStack("level 6 begins");
   }
   rc = level6(this, power, opt);
   levelEnd();
@@ -4494,6 +4541,7 @@ void PianoWifi::run()
   const bool level6Up = rc == 0;   // the chip is alive and its link up: only then may the wake doorbell be written
   if (!rc && gLink.step == kLinkHandOff) {
     // ---- level 7 -------------------------------------------------------------------------------------------------------
+    reportStack("level 7 begins");
     // Its own hard deadline: the profile's wait, its scans, the join's steps and the watch, with room for the teardown. A
     // watch without end (piano-wifi-l7hold=0) has none.
     const uint64_t own = uint64_t(gArgs.l7wait) + uint64_t(gArgs.l7scans) * gArgs.scanWaitMs +
@@ -4511,5 +4559,6 @@ void PianoWifi::run()
     }
   }
   if (level6Up && !gChipDead) releaseWake();
+  reportStack("the ladder's end");
   unmapAll();
 }

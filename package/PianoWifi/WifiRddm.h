@@ -75,7 +75,7 @@ inline bool printable(uint8_t c) { return c >= 0x20 && c < 0x7f; }
 inline bool rddmPlan(Rddm &r, Arena &arena, uint32_t bytes, uint32_t segBytes = kRddmSegBytes)
 {
   using namespace rddmdetail;
-  r = Rddm{};
+  renew(r);
   if (!bytes || !segBytes) return false;
   const uint32_t n = (bytes + segBytes - 1) / segBytes;
   if (n > kRddmMaxSegments || n * 16 > kRddmTableBytes) return false;

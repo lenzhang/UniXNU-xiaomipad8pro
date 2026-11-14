@@ -327,7 +327,7 @@ inline int send(Link &link, uint8_t endpoint, Build build)
 // The one command outstanding, if the turn can send it. Returns true when it went out.
 inline bool sendPending(Link &link, uint64_t nowMs)
 {
-  const WmiScanRequest request = link.request;
+  const WmiScanRequest &request = link.request;   // by reference: the request is a few hundred bytes
   const uint32_t vdevId = link.options.vdevId;
   int rc = 0;
   switch (link.pending) {
@@ -860,7 +860,7 @@ inline void linkBegin(Link &link, Ce &ce, const ChipIo &io, const LinkOptions &o
   void *const ctx = link.noteCtx;
   const auto hook = link.hook;
   void *const hookCtx = link.hookCtx;
-  link = Link{};
+  renew(link);
   link.ce = &ce;
   link.io = io;
   link.options = options;

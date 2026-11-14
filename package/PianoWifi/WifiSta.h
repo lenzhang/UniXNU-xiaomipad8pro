@@ -634,12 +634,12 @@ inline void resetJoin(Sta &s)
   s.tidsSent = 0;
   s.peerCreated = s.peerMapped = s.vdevStartSent = s.vdevStarted = s.vdevUp = s.authorized = false;
   s.peerId = s.hwPeerId = 0;
-  s.startResp = VdevStartResp{};
+  renew(s.startResp);
   s.tries = 0;
   s.frameOut = false;
   s.authAnswered = s.assocAnswered = s.peerAssocConf = false;
   s.authStatus = s.assocStatus = s.aid = s.assocCapability = 0;
-  s.assocAnswer = Dot11Answer{};
+  renew(s.assocAnswer);
   s.authMs = s.assocMs = 0;
   s.associatedAt = 0;
   s.disconnect = kStaDiscNone;
@@ -694,7 +694,7 @@ inline constexpr uint8_t kProbeIes24[] = {kDot11ElementRates, 8, 0x82, 0x84, 0x8
 // that names it), and the rest passive over every channel; without bit 9 all are passive. Returns the kind (1, 2, 3).
 inline uint32_t planScan(const Sta &s, uint32_t n, WmiScanRequest &req)
 {
-  req = WmiScanRequest{};
+  renew(req);
   req.scanId = kAssocScanId + n;
   req.requestorId = kWmiScanRequestorId;
   req.vdevId = s.options.vdevId;
@@ -748,7 +748,7 @@ inline void staBegin(Sta &s, const StaOptions &options, const StaEnv &env, uint6
   const bool bssidGiven = s.bssidGiven;
   for (unsigned i = 0; i < kSsidMax; ++i) ssid[i] = s.ssid[i];
   for (unsigned i = 0; i < 6; ++i) bssid[i] = s.bssidPref[i];
-  s = Sta{};
+  renew(s);
   s.note = note;
   s.report = report;
   s.ctx = ctx;
@@ -982,7 +982,7 @@ inline int staRun(Sta &s, uint64_t nowMs)
     s.hiddenSeen = hidden;
     s.candAt = 0;
     if (!s.candCount) {
-      s.choice = StaChoice{};
+      renew(s.choice);
       s.choice.candidates = total;
       s.choice.excludedRadar = radar;
       if (s.rescansDone < s.options.rescans) {

@@ -55,7 +55,7 @@ inline bool regParse(RegDomain &out, const uint8_t *payload, uint32_t length, bo
   uint32_t size = 0;
   const uint8_t *ev = wmiFind(payload, length, tag, &size);
   if (!ev || size < kRegEventWords * 4) return false;
-  out = RegDomain{};
+  renew(out);
   out.seen = true;
   out.extended = extended;
   out.status = wmiGet(ev, 0);
@@ -117,7 +117,7 @@ struct RegChannel {
 
 inline bool regChannel(const RegDomain &reg, uint32_t freq, RegChannel &out)
 {
-  out = RegChannel{};
+  renew(out);
   out.freq = freq;
   const uint32_t low = freq - 10, high = freq + 10;
   for (uint32_t i = 0; i < reg.ruleCount; ++i) {
@@ -159,7 +159,7 @@ inline uint32_t chanInfoWord(const RegChannel &channel, uint32_t mode)
 // which is the unit of this command (a started device's own are whole dBm).
 inline void chanListBuild(ChanList &list, const RegDomain &reg, bool with5GHz)
 {
-  list = ChanList{};
+  renew(list);
   for (unsigned band = 0; band < 2; ++band) {
     if (band == 1 && !with5GHz) break;
     const uint32_t *channels = band ? kAssocChannels5 : kAssocChannels24;
@@ -276,7 +276,7 @@ constexpr uint32_t kPdevParamCount = 6;
 // firmware's event did not arrive (the event is always preferred: it is the chip's own domain).
 inline void chanListFallback(ChanList &list, bool with5GHz)
 {
-  list = ChanList{};
+  renew(list);
   for (unsigned band = 0; band < 2; ++band) {
     if (band == 1 && !with5GHz) break;
     const uint32_t *channels = band ? kAssocChannels5 : kAssocChannels24;

@@ -460,7 +460,7 @@ inline int cmdDbBcm(const uint8_t *db, uint64_t bytes, const char *name, uint32_
 {
   uint64_t aux = 0;
   uint32_t length = 0;
-  out = BcmAux{};
+  renew(out);
   const int rc = cmdDbEntry(db, bytes, name, address, &aux, &length);
   if (rc) return rc;
   if (length < 7) return -4;
