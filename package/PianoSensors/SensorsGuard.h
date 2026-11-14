@@ -15,7 +15,9 @@
  *   SG_RUN      requests may go, at most bucket at once, refilled at refill_per_s
  *   SG_BACKOFF  a request failed: nothing new until the backoff ends (first_ms, doubling to max_ms; a success resets it)
  *   SG_OFF      for the rest of the boot: the DSP's fatal bit or a crash reason, the charger domain restarted (a new generation) or the
- *               link went down after we started, strikes failures within window_ms, or the DSP asking for files in a loop */
+ *               link went down after we started, strikes failures within window_ms, the DSP asking for files in a loop, or the file
+ *               service failing after the attach (its session released: without its files the sensor PD has no sensors, and nothing
+ *               more is asked of it) */
 #ifndef SENSORS_GUARD_H
 #define SENSORS_GUARD_H
 #include <stdint.h>
@@ -26,7 +28,7 @@ extern "C" {
 enum {SG_WAIT = 0, SG_RUN = 1, SG_BACKOFF = 2, SG_OFF = 3};
 enum {
     SG_REASON_NONE = 0, SG_REASON_FATAL = 1, SG_REASON_CRASH = 2, SG_REASON_CHARGER = 3, SG_REASON_LINK = 4, SG_REASON_ERRORS = 5,
-    SG_REASON_FILE_STORM = 6, SG_REASON_DISABLED = 7,
+    SG_REASON_FILE_STORM = 6, SG_REASON_DISABLED = 7, SG_REASON_FILES = 8,
 };
 #define SG_CHARGER_UP 0x1fffffffu        /* SERVREG_STATE_UP, as piano_qrtr_charger_pd() reports it */
 
@@ -81,6 +83,8 @@ void sg_file_call(SgGuard *g, uint64_t now_ms);
 int sg_serve_files(const SgGuard *g);
 /* The owner turns the sensors off (a boot argument, a sysctl): SG_OFF with SG_REASON_DISABLED. */
 void sg_disable(SgGuard *g);
+/* SG_OFF for the rest of the boot with that reason (the glue's own strikes: SG_REASON_FILES). */
+void sg_strike(SgGuard *g, int reason);
 const char *sg_state_name(int state);
 const char *sg_reason_name(int reason);
 /* 1 when a crash reason names the sensor framework (qsh_process, sns_, the sensor watchdog: device.md 2.14, Ubuntu's sensors-prepare). */

@@ -19,7 +19,10 @@
 // Other arguments: piano-sensors-delay=S, -settle=S (20), -rpc-pa=ADDR (the arena; default the sensors' slice of the CDSP carveout,
 // PianoDspMemory.h; 0: no file service), -bank=N (3),
 // -smmu=0 (leave the SMMU alone), -nopack=1 (level 2 without a pack: every open fails, the paths are logged), -channel=0 (level 1
-// does not register the channel), -log=0..2 (1); level 4: -als=0|1|2 (1: follow PianoBacklight's automatic mode; 2: always; 0:
+// does not register the channel), -log=0..2 (1), -rpc-frame=N (1: the file service's framing, SensorsRpc.h's SSR_FRAME_* bits: 1 Linux's
+// metadata page with every invoke, 2 Linux's ctx numbering, 4 a thread id of its own; 0 PaganiSensors' framing, the 2026-11-14 control),
+// -rpc-ladder=0 (an init2 answered with an error is not tried with the next framing), -rpc-deadline=S (15: the attach -> listening at
+// most, then the session is released; 5..45); level 4: -als=0|1|2 (1: follow PianoBacklight's automatic mode; 2: always; 0:
 // never), -rotate=0|1|2 (1: follow piano-rotate; 2: always; 0: never), -accel-hz=N (10), -accel-batch=MS (0), -axes=a.. (a+y+x+z).
 // Without piano-sensors the driver declines in probe() and maps nothing.
 // Properties on the PianoSensors service (stable; sensors.md §5 lists them with their units).
@@ -67,6 +70,7 @@ namespace {
 struct Args {
   uint32_t level, delay, settle, bank, smmu, nopack, channel, log;
   uint64_t rpcPa;
+  uint32_t rpcFrame, rpcLadder, rpcDeadline;   // the file service's framing, its ladder, the attach -> listening deadline (s)
   // level 4 (sensors.md §5c), and the consumers' own arguments it follows
   uint32_t als, rotate, accelHz, accelBatch;
   uint32_t backlight, backlightAuto, rotateAgent, rotateTest;
@@ -100,6 +104,11 @@ void readArgs()
   uint64_t pa = 0;
   if (!PE_parse_boot_argn("piano-sensors-rpc-pa", &pa, sizeof pa)) pa = PS_ARENA_DEFAULT;   // 0 given: no arena
   gArgs.rpcPa = pa;
+  gArgs.rpcFrame = bootArg("piano-sensors-rpc-frame", SSR_FRAME_DEFAULT) & 7u;
+  gArgs.rpcLadder = bootArg("piano-sensors-rpc-ladder", 1) ? 1 : 0;
+  gArgs.rpcDeadline = bootArg("piano-sensors-rpc-deadline", SSR_DEADLINE_MS / 1000);
+  if (gArgs.rpcDeadline < 5) gArgs.rpcDeadline = 5;
+  if (gArgs.rpcDeadline > 45) gArgs.rpcDeadline = 45;   // the sensor PD's watchdog fired 59 s after an attach left unserved
   gArgs.als = bootArg("piano-sensors-als", 1);
   gArgs.rotate = bootArg("piano-sensors-rotate", 1);
   gArgs.accelHz = bootArg("piano-sensors-accel-hz", SS_ACCEL_HZ);
@@ -524,7 +533,22 @@ int opPackRead(void *, uint64_t offset, void *to, uint32_t length)
 }
 void *opAlloc(void *, uint32_t bytes) {return IOMallocData(bytes);}
 int opAdmit(void *) {return guardAdmit();}
-const SsrOps kRpcOps = {nullptr, opNow, opSend, opWait, opTrace, opPublish, opPrepare, opPackSize, opPackRead, opAlloc, opAdmit};
+// The release may go only to the DSP we attached to and only while it shows no sign of dying (a fatal bit or report, a crash reason, the
+// link or the charger domain in another generation): a dying DSP is never touched. PianoPower's quiet does not hold it back (one message,
+// against a sensor PD that would otherwise wait into its watchdog, which takes charging with it).
+int opTellable(void *)
+{
+  PianoAdspHealth h;
+  piano_adsp_health(&h);
+  IOLockLock(gGuardLock);
+  const bool started = gGuard.started != 0;
+  const uint32_t link0 = gGuard.link0, charger0 = gGuard.charger_ups0;
+  IOLockUnlock(gGuardLock);
+  return h.version == PIANO_ADSP_HEALTH_VERSION && h.dsp_up && !h.fatal && !h.fatal_reports && !h.crash[0] &&
+         h.charger_pd == SG_CHARGER_UP && started && h.link_generation == link0 && h.charger_generation == charger0;
+}
+const SsrOps kRpcOps = {nullptr, opNow, opSend, opWait, opTrace, opPublish, opPrepare, opPackSize, opPackRead, opAlloc, opAdmit,
+                        opTellable};
 
 // The arena: checked against the known owners of low DRAM and XNU's window, mapped write-combined, zeroed with 8-byte stores.
 bool mapArena()
@@ -759,6 +783,24 @@ const SsOps kSsOps = {nullptr, ssNow, ssSend, scMayRequest, scResult, ssTrace, s
 // the ports of streams not off are closed); kOn lets them start again.
 volatile uint32_t gAsleep, gAckDue;
 constexpr uint32_t kSleepWaitMs = 800;
+// The file service stopped for good. Before an attach was answered it is one failure (the guard's backoff, as before); after it, the
+// sensors are off for the boot (SG_REASON_FILES: without its files the PD has no sensors, nothing more is asked of it), the session
+// having been released (or withheld from a dying DSP: then the guard is off already).
+void fileServiceStopped()
+{
+  static const char *const releases[] = {"no release needed", "released", "release refused", "release not answered", "release withheld"};
+  const SsrStatus &s = gCore->status;
+  const int r = s.release >= 0 && s.release <= SSR_RELEASE_WITHHELD ? s.release : 0;
+  note("file service stopped: stage %d error %d frame %s inits %u: %s", s.stage, s.error, ssr_frame_name(s.frame), s.inits, releases[r]);
+  if (s.release == SSR_RELEASE_NONE) {
+    guardResult(0);
+    return;
+  }
+  IOLockLock(gGuardLock);
+  sg_strike(&gGuard, SG_REASON_FILES);
+  IOLockUnlock(gGuardLock);
+  wake(&gMainEvents, kEvChannel);   // the main thread reports the strike and stops the SNS client and the streams
+}
 
 }  // namespace
 
@@ -794,6 +836,9 @@ bool PianoSensors::start(IOService *provider)
   note("start: piano-sensors=%u delay=%u settle=%u bank=%u smmu=%u rpc-pa=%#llx nopack=%u channel=%u log=%u", gArgs.level,
        gArgs.delay, gArgs.settle, gArgs.bank, gArgs.smmu, (unsigned long long)gArgs.rpcPa, gArgs.nopack, gArgs.channel, gArgs.log);
   note("a client of PianoPower's DSP (PianoAdspContract.h): it never starts, stops or restarts the DSP");
+  if (gArgs.level >= 2)
+    note("file service: rpc-frame=%u (%s) ladder=%u deadline=%u s: a session that is not listening by then is released", gArgs.rpcFrame,
+         ssr_frame_name(gArgs.rpcFrame), gArgs.rpcLadder, gArgs.rpcDeadline);
   if (gArgs.level >= 4)
     note("level 4: als=%u rotate=%u accel-hz=%u accel-batch=%u axes=%s%s; follows piano-backlight=%u piano-backlight-auto=%u "
          "piano-rotate=%u piano-rotate-test=%u", gArgs.als, gArgs.rotate, gArgs.accelHz, gArgs.accelBatch, gArgs.axesText,
@@ -816,7 +861,8 @@ bool PianoSensors::start(IOService *provider)
   // The arena first (level 2 only), then the core with its final configuration, then the channel: an open the DSP made already is
   // answered at the registration, and its state must find the core ready.
   const bool arena = mapArena();
-  const SsrConfig cfg = {gArena, gArgs.rpcPa, SSR_ARENA_BYTES, gBounce, 1 /* Linux's first client id */, gArgs.bank, gArgs.log};
+  const SsrConfig cfg = {gArena, gArgs.rpcPa, SSR_ARENA_BYTES, gBounce, 1 /* Linux's first client id */, gArgs.bank, gArgs.log,
+                         gArgs.rpcFrame ? gArgs.rpcFrame : SSR_FRAME_PAG, gArgs.rpcLadder ? 0u : 1u, gArgs.rpcDeadline * 1000u};
   ssr_core_init(gCore, &kRpcOps, &cfg);
   if (gArgs.channel || gArgs.level >= 2) {
     static const PianoAdspClient client = {channelState, channelReceive};
@@ -889,10 +935,13 @@ void PianoSensors::publishStatus(const SgDsp &d, const PianoAdspHealth &h)
   setProperty("piano-sensors-smmu", gSmmuText);
   setProperty("piano-sensors-arena", gArenaText);
   const SsrStatus &s = gCore->status;   // a snapshot for a line: a torn counter does no harm
-  snprintf(line, sizeof line, "stage %d error %d attaches %u calls %u opens %u missing %u reads %u refused %u declined %u bytes %llu%s%s",
-           s.stage, s.error, s.attaches, s.calls, s.opens, s.missing, s.reads, s.refused, s.declined, (unsigned long long)s.bytes,
-           s.note[0] ? " first missing " : "", s.note);
-  setProperty("piano-sensors-rpc", line);
+  static const char *const releases[] = {"none", "done", "refused", "unanswered", "withheld"};
+  char rpc[300];
+  snprintf(rpc, sizeof rpc, "stage %d error %d attaches %u frame %s inits %u release %s calls %u opens %u missing %u reads %u refused %u "
+           "declined %u bytes %llu%s%s", s.stage, s.error, s.attaches, ssr_frame_name(s.frame), s.inits,
+           s.release >= 0 && s.release <= SSR_RELEASE_WITHHELD ? releases[s.release] : "?", s.calls, s.opens, s.missing, s.reads,
+           s.refused, s.declined, (unsigned long long)s.bytes, s.note[0] ? " first missing " : "", s.note);
+  setProperty("piano-sensors-rpc", rpc);
   if (gEngine) {
     if (OSDictionary *streams = OSDictionary::withCapacity(SS_STREAMS)) {
       for (int i = 0; i < SS_STREAMS; ++i) {
@@ -1030,7 +1079,7 @@ uint32_t PianoSensors::runStreams(uint64_t t, int state, int reason, const Piano
     // was ours or the charger's restart, the DSP is up without a fatal sign, the charger domain up again and PianoPower not asking
     // for quiet. A dead or dying DSP is never touched.
     const bool tellable = reason == SG_REASON_ERRORS || reason == SG_REASON_FILE_STORM || reason == SG_REASON_DISABLED ||
-                          reason == SG_REASON_CHARGER;
+                          reason == SG_REASON_CHARGER || reason == SG_REASON_FILES;
     if (!closedAfterStrike && tellable && h.version == PIANO_ADSP_HEALTH_VERSION && h.dsp_up && !h.fatal && !h.fatal_reports &&
         !h.crash[0] && !h.quiet && h.charger_pd == SG_CHARGER_UP) {
       ss_close_all(gEngine);
@@ -1110,7 +1159,20 @@ void PianoSensors::runRpc()
   for (;;) {
     const int state = guardState();
     const bool serving = gCore->status.stage >= SsrStListen;
-    if (!serving) {
+    // Between the attach and the listening the sensor PD may already wait for us: the bring-up goes on without tokens (a handful of
+    // calls), is held only while PianoPower asks for quiet, and ends at the guard's strike or the deadline with the session released
+    // (SensorsRpc.c: never to a dying DSP), so no PD thread is left waiting into its watchdog (2026-11-14: the fatal 59 s after).
+    if (ssr_core_bringing_up(gCore)) {
+      if (state == SG_OFF || ssr_core_overdue(gCore)) {
+        ssr_core_abort(gCore, state == SG_OFF ? "the guard is off before the listening" : "the listener was not up within the deadline");
+        fileServiceStopped();
+        return;
+      }
+      if (state == SG_WAIT) {
+        waitEvents(&gRpcEvents, 100);
+        continue;
+      }
+    } else if (!serving) {
       if (state == SG_OFF) {
         if (!parked) {
           IOLockLock(gGuardLock);
@@ -1129,10 +1191,10 @@ void PianoSensors::runRpc()
     }
     const uint32_t attaches = gCore->status.attaches;
     if (!ssr_core_step(gCore)) {
-      note("file service stopped: stage %d error %d", gCore->status.stage, gCore->status.error);
-      guardResult(0);
+      fileServiceStopped();
       return;
     }
     if (gCore->status.attaches != attaches) guardResult(gCore->status.stage >= SsrStAttach);
   }
 }
+

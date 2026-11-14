@@ -131,6 +131,11 @@ void sg_disable(SgGuard *g)
     off(g, SG_REASON_DISABLED);
 }
 
+void sg_strike(SgGuard *g, int reason)
+{
+    off(g, reason);
+}
+
 const char *sg_state_name(int state)
 {
     switch (state) {
@@ -153,6 +158,7 @@ const char *sg_reason_name(int reason)
     case SG_REASON_ERRORS: return "repeated request failures";
     case SG_REASON_FILE_STORM: return "the DSP asks for files in a loop";
     case SG_REASON_DISABLED: return "disabled by the owner";
+    case SG_REASON_FILES: return "the file service failed after the attach";
     }
     return "?";
 }

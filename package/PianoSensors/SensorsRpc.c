@@ -1075,7 +1075,8 @@ static int listener_init(SsrCore *c)
         snt_kd(&t, "rc", rc);
         snt_kd(&t, "value", value);
         if (next) {
-            snt_ks(&t, ": next frame", ssr_frame_name(next));
+            snt_str(&t, ": next");
+            snt_ks(&t, "frame", ssr_frame_name(next));
         }
         end(c);
         if (!next) return stop(c, SsrStListen, rc ? rc : value, "adsp_listener init2 failed");

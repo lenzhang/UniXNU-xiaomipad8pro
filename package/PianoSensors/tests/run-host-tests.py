@@ -7,6 +7,8 @@
   fixed    the integer float conversions and axis maps (PaganiSensors' test)
   orient   the orientation state machine (PaganiSensors' test)
   rpc      the FastRPC file service against PaganiSensors' simulated DSP, then a pack made by tools/make-sensor-pack.py
+  bringup  the file service's bring-up after the tablet's first S2 (2026-11-14): Linux's metadata page with every invoke, the init2
+           framing ladder, the release after the attach (withheld from a dying DSP), the deadline, the guard's file-service strike
   pack     the pack tool: piano's archives, soc0 allowlist, unsafe names, no pack inside a repository's tracked tree
   piano    SensorsGuard, SensorsPolicy, SensorsClient against a simulated hub, SensorsHealth (PianoPower's report), the arena check, a
            declined DSP call, and the independent cross-checks against libqmi, libssc, Linux fastrpc.c and qualcomm/fastrpc
@@ -226,9 +228,9 @@ def addon_checks(pack, scratch):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--only', action='append', default=[],
-                        choices=['wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'streams', 'load', 'addon', 'kernel'])
+                        choices=['wire', 'fixed', 'orient', 'rpc', 'bringup', 'pack', 'piano', 'streams', 'load', 'addon', 'kernel'])
     args = parser.parse_args()
-    want = set(args.only) or {'wire', 'fixed', 'orient', 'rpc', 'pack', 'piano', 'streams', 'load', 'addon', 'kernel'}
+    want = set(args.only) or {'wire', 'fixed', 'orient', 'rpc', 'bringup', 'pack', 'piano', 'streams', 'load', 'addon', 'kernel'}
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
         src = lambda *names: [PKG / n for n in names]
@@ -247,6 +249,8 @@ def main():
             pack = pack_checks(out / 'dump', scratch)
         if 'rpc' in want:
             run(build(out, 'rpc', [HERE / 'rpc.c', *src('SensorsRpc.c', 'SensorsPack.c')], ['-D_DARWIN_C_SOURCE', '-lpthread']), pack)
+        if 'bringup' in want:
+            run(build(out, 'bringup', [HERE / 'bringup.c', *src('SensorsRpc.c', 'SensorsPack.c', 'SensorsGuard.c')]))
         if 'piano' in want:
             run(build(out, 'piano', [HERE / 'piano.c', *src('SensorsGuard.c', 'SensorsPolicy.c', 'SensorsFixed.c', 'SensorsOrient.c',
                                                            'SensorsSsc.c', 'SensorsPb.c', 'SensorsRpc.c', 'SensorsPack.c',
