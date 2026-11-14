@@ -271,3 +271,17 @@ no device behind it — the medium published, the interface attached and marked 
 disabled — re-expressed here with its link left **down**, the scan list of level 6 copied onto it, and an address of this
 driver's own. PianoNullEthernet is not modified, and no kext from outside this repository is linked (the native kext rule,
 tooling/k27/check-native-kexts.py).
+
+WifiApple80211.h and PianoWifi80211.h (the apple80211 front end, docs/drivers/wifi-menu.md section 5) are new code for this
+repository after UniXNU-sheng's package/WifiNet.cpp (main 00ba90984e831e4c6ce30ec3d8a56e6434e9f1af, sha256
+a4738ae766ded21d5a89a891c26f9a5604da37f8162ff24acc4d035776221cae; BSD-2-Clause-Patent, our own organisation's, LICENSE as above):
+  Taken, re-expressed in this repository's structures and checked against the macOS 27.3 host facts (wifi-menu.md section 5.2,
+  section 5.4 marks each): the request's 40-byte layout and the two ioctl numbers; the request numbers it shares with 27.3; the
+  answers' layouts of POWER, STATE, OP_MODE, PHY_MODE, RSSI/NOISE, the channel and the channel list, COUNTRY_CODE, the scan
+  record's head (to its elements at 0x8c) and the SCAN_REQ fields read; the card capability bits it sets; the event codes, the
+  kernel event's form (vendor Apple, class 6, subclass 1, the interface's name then the payload) posted through the private
+  kev_post_msg symbol, and its link-event payload; the scan's completion posted a short while after an answer from the cache;
+  EIO after the last scan record. Not taken: its own ifnet and registry stand-ins (piano uses IONetworkingFamily's interface and
+  an interface filter), its association, keys and data path.
+OpenIntelWireless (itlwm / AirportItlwm, GPL) was not read for this code; its facts reached the design only through the W0
+report's notes (private/host-checks/20261114-io80211), and none of its text is here.
