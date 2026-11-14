@@ -261,7 +261,8 @@ def cmd_collect(a):
     ssh = [str(D / 'tooling/native/desk-ssh.sh')] + (['-a', a.ssh_address] if a.ssh_address else []) + [remote]
     with secret.open('rb') as stdin, pack.open('wb') as stdout:
         r = subprocess.run(ssh, stdin=stdin, stdout=stdout)
-    if r.returncode != 0 or pack.stat().st_size < 1024:
+    # bsdtar answers 1 for warnings (a socket skipped, a file that changed while read): the archive is still whole
+    if r.returncode not in (0, 1) or pack.stat().st_size < 1024:
         raise SystemExit(f'collect: ssh/tar answered {r.returncode}, {pack.stat().st_size} bytes: nothing usable (USB network up? '
                          'logged in? tooling/native/desk-ssh.sh true)')
     members = listing(pack)
