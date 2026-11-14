@@ -851,20 +851,29 @@ def linux_data_root(s):
     first (without the page cache) and again on the medium after the write. Nothing else is written: no GPT change, linux_rootfs
     (the installed system's windows and the owner's Data store) untouched."""
     map_nodes(s)
-    dev, size = s.nodes.get('linux_data'), s.sizes.get('linux_data')
-    s.need(bool(dev) and bool(size) if s.execute else None, f'linux_data found: /dev/{dev}, {size} bytes')
+    part = getattr(s.a, 'root_part', None) or 'linux_data'
+    if part not in ('linux_data', 'linux_rootfs'):
+        raise Stop('--root-part: linux_data or linux_rootfs (the partitions macOS owns)')
+    key = PART_KEYS[part]
+    dev, size = s.nodes.get(key), s.sizes.get(key)
+    s.need(bool(dev) and bool(size) if s.execute else None, f'{part} found: /dev/{dev}, {size} bytes')
+    if part == 'linux_rootfs':
+        # The whole-disk layout (2026-11-14): the 27.3 root on linux_rootfs, all of linux_data for Data. linux_rootfs held the
+        # retired 27.0.1 system: write only after rootfs-clear (its backup verified) in this session or an earlier one.
+        cleared = s.state.get('rootfs_cleared') or s.state.get('rootfs_clear') or {}
+        s.need(bool(cleared) if s.execute else None, 'linux_rootfs was cleared (rootfs-clear) after its verified backup')
     if not s.a.root_image or not s.a.root_sha256:
         raise Stop('linux-data-root needs --root-image IMG and --root-sha256 HEX')
     img = Path(s.a.root_image).expanduser()
     n = img.stat().st_size if img.is_file() else 0
-    s.need(n > 0 and n % B == 0 and (not size or n <= size), f'{img.name}: {n} bytes, a whole number of {B}-byte blocks inside linux_data')
+    s.need(n > 0 and n % B == 0 and (not size or n <= size), f'{img.name}: {n} bytes, a whole number of {B}-byte blocks inside {part}')
     if s.execute:
         s.need(s.sha_nocache(img) == s.a.root_sha256.lower(), f'{img.name} hashes to {s.a.root_sha256[:16]} on the host')
     s.serve({'root.img': img})
     if s.write(f'{img.name} -> /dev/{dev} from block 0 ({n // B} blocks of {B} bytes)'):
         s.job('root-write', 'restore', 'root.img', dev, 0, B, s.a.http_port, timeout=4 * 3600)
     got = s.region_sha(dev, 0, n // B, B, name='root-check')
-    s.need(got == s.a.root_sha256.lower() if s.execute else None, f'linux_data read back over {n} bytes: {got} = {s.a.root_sha256[:16]}')
+    s.need(got == s.a.root_sha256.lower() if s.execute else None, f'{part} read back over {n} bytes: {got} = {s.a.root_sha256[:16]}')
 
 
 @step('k273-store', 'maintenance, read only')
@@ -1976,6 +1985,8 @@ def main():
     p.add_argument('--esp', default='esp-base-diag.img', help='the ESP image of step esp (out/persistent)')
     p.add_argument('--root-image', help='step linux-data-root: the root image written onto linux_data')
     p.add_argument('--root-sha256', help='step linux-data-root: its sha256')
+    p.add_argument('--root-part', default='linux_data', help='step linux-data-root: the partition (linux_data, or linux_rootfs for the '
+                   'whole-disk layout after rootfs-clear)')
     p.add_argument('--esp-final', default='esp-base-macos.img', help='the ESP image of step esp-final')
     p.add_argument('--boot-image', default='boot-piano-macos-persistent-v4-signed.img', help='the boot_a image (out/persistent)')
     p.add_argument('--dump-image', default=str(D / 'out/ram-dump/boot-piano-macos-ram-A-bundled.img'))

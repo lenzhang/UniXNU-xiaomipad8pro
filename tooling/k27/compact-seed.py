@@ -43,10 +43,28 @@ def main():
     p.add_argument('out', type=Path)
     p.add_argument('--work', type=Path)
     p.add_argument('--grow-gib', type=int)
+    p.add_argument('--disk-only', action='store_true',
+                   help='with --grow-gib: only the disk grows (no hdiutil/diskutil: no zero fill, the APFS container keeps its size); '
+                        'grow the container later on the running system (diskutil apfs resizeContainer DISK 0)')
     a = p.parse_args()
     a.out.parent.mkdir(parents=True, exist_ok=True)
     before = packed_ramdisk.inspect(a.seed)[0]
     logical, extents = packed_ramdisk.regions(a.seed.read_bytes())
+    if a.disk_only:
+        if not a.grow_gib or a.grow_gib << 30 <= logical:
+            raise SystemExit('--disk-only needs --grow-gib larger than the seed')
+        with tempfile.TemporaryDirectory(prefix='seed-grow-', dir=str(a.work or a.out.parent)) as scratch:
+            raw = Path(scratch) / 'seed.raw'
+            with raw.open('wb') as handle:
+                handle.truncate(a.grow_gib << 30)
+                for offset, data in extents:
+                    handle.seek(offset)
+                    handle.write(data)
+            a.out.unlink(missing_ok=True)
+            meta = packed_ramdisk.pack(raw, a.out)
+        print(f'{a.out}: the disk grown to {a.grow_gib} GiB (the container unchanged: resize it on the system), {meta["encoded_bytes"]} '
+              f'bytes packed, logical {meta["bytes"]}, identity {meta["sha256"][:16]} (input {before["sha256"][:16]})')
+        return
     with tempfile.TemporaryDirectory(prefix='seed-compact-', dir=str(a.work or a.out.parent)) as scratch:
         raw = Path(scratch) / 'seed.raw'
         with raw.open('wb') as handle:
@@ -54,19 +72,13 @@ def main():
             for offset, data in extents:
                 handle.seek(offset)
                 handle.write(data)
-            if a.grow_gib:
-                if a.grow_gib << 30 <= logical:
-                    raise SystemExit(f'--grow-gib {a.grow_gib}: the seed is {logical} bytes already')
-                handle.truncate(a.grow_gib << 30)
+            if a.grow_gib and a.grow_gib << 30 <= logical:
+                raise SystemExit(f'--grow-gib {a.grow_gib}: the seed is {logical} bytes already')
         run('hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nomount', '-nobrowse', str(raw), stdout=subprocess.DEVNULL)
         disk_of = [sys.executable, str(D / 'tooling/k273/disk-of.py')]
         whole = subprocess.run([*disk_of, 'whole', str(raw)], check=True, capture_output=True, text=True).stdout.strip()
         try:
             volume = subprocess.run([*disk_of, 'volume', whole], check=True, capture_output=True, text=True).stdout.strip()
-            if a.grow_gib:
-                container = volume.rsplit('s', 1)[0]   # /dev/diskNs1 -> /dev/diskN, the container on the image's disk
-                run('diskutil', 'apfs', 'resizeContainer', container, '0', stdout=subprocess.DEVNULL)
-                print(f'{container}: grown to {a.grow_gib} GiB')
             mount = Path(scratch) / 'mnt'
             mount.mkdir()
             run('diskutil', 'mount', '-mountPoint', str(mount), volume, stdout=subprocess.DEVNULL)
@@ -93,6 +105,21 @@ def main():
                 run('diskutil', 'unmount', str(mount), stdout=subprocess.DEVNULL)
         finally:
             run('hdiutil', 'detach', whole, stdout=subprocess.DEVNULL)
+        # The growth comes after the zero fill: the new space is never written (a sparse file keeps it as holes), so a large grown
+        # seed costs no disk space here (2026-11-14: filling a 176 GiB container ran the build disk full).
+        if a.grow_gib:
+            with raw.open('r+b') as handle:
+                handle.truncate(a.grow_gib << 30)
+            run('hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nomount', '-nobrowse', str(raw),
+                stdout=subprocess.DEVNULL)
+            whole = subprocess.run([*disk_of, 'whole', str(raw)], check=True, capture_output=True, text=True).stdout.strip()
+            try:
+                volume = subprocess.run([*disk_of, 'volume', whole], check=True, capture_output=True, text=True).stdout.strip()
+                container = volume.rsplit('s', 1)[0]   # /dev/diskNs1 -> /dev/diskN, the container on the image's disk
+                run('diskutil', 'apfs', 'resizeContainer', container, '0', stdout=subprocess.DEVNULL)
+                print(f'{container}: grown to {a.grow_gib} GiB')
+            finally:
+                run('hdiutil', 'detach', whole, stdout=subprocess.DEVNULL)
         a.out.unlink(missing_ok=True)
         meta = packed_ramdisk.pack(raw, a.out)
     print(f'{a.out}: {meta["encoded_bytes"]} bytes packed (was {a.seed.stat().st_size}), logical {meta["bytes"]}, '

@@ -104,6 +104,8 @@ def main():
     p.add_argument('--seed', type=Path, help='a new Data seed: a new store (its window from the seed\'s size, data-store-lba set)')
     p.add_argument('--arg', action='append', default=[], metavar='NAME=VALUE', help='one more argument for the entry (replaces NAME)')
     p.add_argument('--drop-arg', action='append', default=[], metavar='NAME', help='an argument of the base line left out')
+    p.add_argument('--root-part', metavar='NAME', help='the root image\'s partition (native-ufs-root-part; the store then stays on '
+                   'linux_data through data-store-part): linux_rootfs for the whole-disk layout of 2026-11-14')
     p.add_argument('--split', action='store_true', help='move the piano-* arguments into the ADT (k27 0066) even when the line fits')
     p.add_argument('--diag-reset-after', type=int, default=240, metavar='SECS',
                    help='the -diag entry\'s reset (only built when its line stays under 1000 bytes)')
@@ -182,6 +184,10 @@ def main():
             raise SystemExit(f'{a.entry}\'s ADT has the GpuAddon slot of a RAM test image')
         seed = common.seed_info(seed_file)
         edits = list(a.arg) + ([f'data-store-lba={common.k273_store_first(seed)}'] if a.seed else [])
+        if a.root_part:
+            if a.root_part not in ('linux_data', 'linux_rootfs'):
+                raise SystemExit('--root-part: linux_data or linux_rootfs')
+            edits += [f'native-ufs-root-part={a.root_part}'] + (['data-store-part=linux_data'] if a.root_part != 'linux_data' else [])
         if edits or a.drop_arg:
             names = {name_of(x) for x in edits} | set(a.drop_arg)
             line = ' '.join([x for x in line.split() if name_of(x) not in names] + edits)
@@ -261,6 +267,8 @@ def main():
         if parsed['boot']['default'] != a.entry or parsed['entry'][0] != (k_entry if (overrides or edits or a.drop_arg or split) else entry):
             raise SystemExit('the 27.3 entry changed in the new unixnu.toml: refused')
         rootfs = {e['id']: why for e in parsed['entry'] if (why := common.entry_uses_rootfs(e))}
+        if a.root_part == 'linux_rootfs':   # the whole-disk layout: the 27.3 root image is on linux_rootfs by design
+            rootfs = {k: v for k, v in rootfs.items() if v not in ('names linux_rootfs', 'mounts its UFS root from linux_rootfs (no native-ufs-root-part)')}
         if rootfs:
             raise SystemExit(f'entries that would use linux_rootfs: {rootfs}')
         (stage / TOML).write_text(new_text)

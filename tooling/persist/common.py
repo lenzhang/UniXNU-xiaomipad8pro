@@ -190,10 +190,12 @@ def k273_store_first(seed):
 
 
 def store_args_of(args):
-    """(root partition, data-store-lba or None) of a kernel argument list."""
+    """(the Data store's partition, data-store-lba or None) of a kernel argument list: data-store-part when given (NativeUfs,
+    2026-11-14: the store in another partition than the root image), else the root's (native-ufs-root-part, default linux_rootfs)."""
     named = dict(x.split('=', 1) for x in args if '=' in x)
     lba = named.get('data-store-lba')
-    return named.get('native-ufs-root-part', 'linux_rootfs'), int(lba, 0) if lba else None
+    part = named.get('data-store-part') or named.get('native-ufs-root-part', 'linux_rootfs')
+    return part, int(lba, 0) if lba else None
 
 
 def entry_uses_rootfs(entry):

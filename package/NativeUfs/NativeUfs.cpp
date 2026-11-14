@@ -1588,24 +1588,54 @@ static unsigned storeMode (void)
 
 extern "C" unsigned native_ufs_store_mode (void) { return storeMode (); }
 
+extern "C" int native_ufs_part_find (const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks);
+
+// UniXNU-piano: data-store-part=NAME (docs/k273-line.md, 2026-11-14): the Data store in another GPT partition of LUN 0 than the
+// root image's (the root on linux_rootfs, all of linux_data for Data). Only the two partitions macOS owns; the window sits at the
+// partition's end below the same reserve as in the root's partition (tooling/persist/common.py k273_store_first). 1 and the
+// partition's bounds and the root image's blocks inside it (0 in another partition); 0 and a reason when the name is refused.
+static int storePartition (uint64_t *partFirst, uint64_t *partLast, uint64_t *imageBlocks, const char **why)
+{
+  *partFirst = gStoreGeometry.first;
+  *partLast = gStoreGeometry.last;
+  *imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
+  char name[32] = {};
+  if (!PE_parse_boot_arg_str ("data-store-part", name, sizeof (name)) || !name[0] || !strcmp (name, gRootPartition)) return 1;
+  if (strcmp (name, "linux_data") && strcmp (name, "linux_rootfs")) {
+    *why = "data-store-part: not linux_data or linux_rootfs";
+    return 0;
+  }
+  uint32_t lun = 9;
+  uint64_t first = 0, count = 0;
+  if (!native_ufs_part_find (name, &lun, &first, &count) || lun != 0 || !count) {
+    *why = "data-store-part: no such partition on LUN 0";
+    return 0;
+  }
+  *partFirst = first;
+  *partLast = first + count - 1;
+  *imageBlocks = 0;
+  return 1;
+}
+
 // Returns 1 and the first absolute 4096-byte LBA of the window, 0 on refusal (reason in *why, may be null).
 extern "C" int native_ufs_store_open (uint64_t blocks, uint64_t *firstLba, const char **why)
 {
   const char *reason = "";
   int ok = 0;
+  uint64_t partFirst = 0, partLast = 0, imageBlocks = 0;
   if (!storeMode ()) reason = "off";
   else if (!gStoreGeometry.valid || !gHost.ready) reason = "no root layout";
   else if (gStoreRegionBlocks) reason = "already open";
+  else if (!storePartition (&partFirst, &partLast, &imageBlocks, &reason)) {}
   else {
-    uint64_t partition = gStoreGeometry.last - gStoreGeometry.first + 1;
-    uint64_t imageBlocks = (gStoreGeometry.imageBytes + 4095) / 4096;
+    uint64_t partition = partLast - partFirst + 1;
     const uint64_t reserve = reserveBlocks ();
     if (!blocks || reserve >= partition || blocks > partition - reserve) reason = "size";
     else if (partition - blocks - reserve < imageBlocks + 1024) reason = "overlaps the root image";
     else {
       // The reserve at the end of the partition belongs to the diagnostic log (its last 32 MiB, with the export region below them);
       // the store ends just below it.
-      uint64_t first = gStoreGeometry.last + 1 - reserve - blocks;
+      uint64_t first = partLast + 1 - reserve - blocks;
       // UniXNU-piano: data-store-lba=N (a second store, docs/k273-line.md): the window only at LBA N. Another place (another
       // partition, seed size or reserve) is refused before anything is read or written there.
       uint64_t expected = 0;
