@@ -70,12 +70,12 @@ Offline design started 2026-11-11: B1a (DPU survey + design), B3 (sensors design
 design), B10 (video design + survey), B11 (camera design), B12 (torch, built), B9 (Bluetooth design + level 1). Each item's page
 lives in `docs/drivers/`; this table is updated when an item moves.
 
-## 4. Decisions waiting for the owner (nothing proceeds on these without his word)
+## 4. Owner decisions (open ones: nothing proceeds on these without his word)
 
 | Item | Question | Default meanwhile |
 |---|---|---|
-| B7 USB host, path A2 | binary analysis of `AppleUSBXHCI`'s vtable for our KC build (a subclass fixture) | path A1 only (codeless personality on our own nub) |
-| PianoWifi upper levels | use Ath12kWifi (GPL sources, no LICENSE) as an external build input | levels 1-4 from BSD sources only |
+| B7 USB host, path A2 | binary analysis of `AppleUSBXHCI`'s vtable for our KC build (a subclass fixture): **approved 2026-11-14 15:33**. Apple's binaries and payloads stay out of the public repository; our analysis notes and the offsets, as our own data, may be committed | A1 first as planned; A2 may proceed (slotted after the Wi-Fi link work) |
+| PianoWifi upper levels | use Ath12kWifi (GPL sources, no LICENSE) as an external build input: **approved 2026-11-14 15:33**, and more: the Ath12k GPL driver sources may be brought directly into the project, in their own clearly marked directory with their licence note and provenance (upstream, commit pin); our own code stays outside it under its own licence | slotted after the current link work (DHCP and ping, probes 10i and on) |
 | B11 cameras | (1) the sensors' register tables exist only in GPL drivers: **decided 2026-11-12**: they are hardware calibration data and are committed as data (`data/camera/*.tbl`, our own format, extracted by our tool from the pinned Ubuntu kernel files yzddmr6/linux-sm8750-piano 7f8d6bed `s5kjn1.c`/`ov32d40.c`; provenance in `data/camera/README.md`, a MANIFEST the build checks); no GPL code in committed files; a unit's own calibration stays local. (2) the CSIPHY lane table L3 needs (a PHY tuning table): **decided 2026-11-12**, PHY tuning tables from the Linux drivers are committed as data with a provenance note, nothing rewritten for licence reasons: `data/camera/csiphy-v2.4.tbl` (the same tool, format rules and MANIFEST, from `camss-csiphy-3ph-1-0.c` at the same pin) | the sensor and CSIPHY tables as data |
-| B9 Bluetooth, path A | patch Apple's bluetoothd for our 26A434 build (QcaBluetooth's route: binary analysis of the daemon) | A0 (probe the stock daemon through a device-tree `bluetooth` service and a serial device), then path C (an own HID host) (`docs/drivers/bluetooth.md` §5) |
+| B9 Bluetooth, path A | patch Apple's bluetoothd for our 26A434 build (QcaBluetooth's route: binary analysis of the daemon): **open** (owner reviewing, 2026-11-14) | A0 (probe the stock daemon through a device-tree `bluetooth` service and a serial device), then path C (an own HID host) (`docs/drivers/bluetooth.md` §5) |
 | B8 DisplayPort | the DP PHY tuning tables: **decided 2026-11-12** with the CSIPHY's (B11 (2)): committed as data in their own directory with a provenance note, our own extractor and format; not extracted yet | read-only slices only (D1, D2, D6) until the tables are carried |
