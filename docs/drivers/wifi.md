@@ -1042,6 +1042,29 @@ reset leaves the kernel log in the mailbox):
 | 10d-ctl | `piano-wifi=7 piano-wifi-iova=1` (every other switch at its default, as 10b) | 10b's path on the new collection: level 6's round 2 with K ≥ 1 networks, `step 629`, `stage 700`, the profile, `the association answer: status 0 (success), AID A`, the teardown, no `crash:` line. **Gate: the association answer with status 0** | A reset before level 6's scan: something outside level 8 (the collection, the held-line ring) — compare its last line with 10c's |
 | 10d | `piano-wifi=8 piano-wifi-iova=1 piano-wifi-l7hold=180000 piano-wifi-l8=22 piano-wifi-defer=3` | `log: piano-wifi-defer=3: from here every line is printed at once`; level 6 as 10d-ctl; at level 7's start `level 8: the data path's rings planned at level 7's start (...); programming blocks 0-7, each line printed at once and 50 ms before the block's first access`, then `level 8: block 0: two reads ...: registers 0xa38000-0xa34d4c` through `level 8: block 7: the reorder unit's set-up ...`, each marked `printed at once`, then `level 8: 8 of 8 block(s) done, N register writes; the reads of block 0: REO1_GEN_ENABLE 0x..., the idle link ring's misc 0x...`; then 10c's checklist from `level 8: piano-wifi-l8=0x16` on. **Gate 1: `8 of 8 block(s) done` and the system still running. Gate 2 (10c's): `EAPOL frame 1 from the access point: ... message 1 of the four-way handshake`** | **A reset after `block K: ...`**: block K's registers are the cause (its line names them); the next probe stops before it (`piano-wifi-l8blocks=K-1`) and the question becomes how this chip's host reaches that unit (the shadow registers of §10.18/10.19, a wake, a clock). **A reset after block 0's line**: even a read of the data path's units takes the system down — none of them is reachable this way. **A reset before `programming blocks`**: not level 8's registers at all (then 10d-ctl decides) |
 
+**10d and 10d-ctl ran on 2026-11-14 (report and mailbox in the coordinator's run logs): both reset at the same place as 10c,
+10d-ctl at `piano-wifi=7` too — so not level 8's registers.** 10d's mailbox (the kernel log, dumped after the reset) has
+level 5 complete (`step 518: done`, `the firmware is ready; level 6 follows` at +671 ms), then `piano-wifi-defer=3: from here
+every line is printed at once`, then **`Invalid kernel stack pointer (probable overflow)`** (esr `0x96000047`, the fault
+address 8 bytes above the stack pointer) and `MACH Reboot`. **Confirmed cause:** the ladder's thread overflowed XNU's 16 KiB
+kernel stack as level 6 began (PianoCamera's failure of 2026-11-13, the same mechanism). `check-kext-stack.py` on 10d's
+object: 16496 bytes of the kext's own frames from the thread's entry, level 6's frame alone 12272 bytes — the whole-object
+resets inlined into it (`linkBegin`'s `link = Link{}`, the scan list included, and `httPlan`'s `rx = HttRx{}`, whose new
+frame addresses added 4 KiB) each built a temporary on the stack; 10b's collection was just under the limit. The 10c
+"inferred" analysis above (the ring programming) was wrong; the instrumentation it added stays useful.
+**Fixed:** every whole-object reset is `renew()` in place (WifiHw.h, XNU's placement new); run()'s surveys and link state are
+static; the scan request is taken by reference. Level 6's frame is 800 bytes, level 7's 896; the static bound from the thread's
+entry is 5168 bytes (over-estimated: every function-pointer target counted), and `build-native-piano-wifi.sh` fails above
+6 KiB. On the tablet each level's start logs `stack: N of 16384 bytes free at the thread's start, the least so far M (at stage
+S); level K begins`.
+
+**Boot 10e and its control 10e-ctl** (built 2026-11-14 11:15 from branch commit `7912ef5`, collection `f1cd3e7d...` (0066 kernel, 26 native kexts), store seed `89860516...`, `data-persist=0`, `piano-reset-after=900 piano-reset-to=bootloader`, `verify-ram-images.py` PASS: `out/ram-k273-wifi-10e` 237281280 bytes sha256 `ba3a24e43904fb7d44fa2a12e68819e065f801c35f65e5cb27de8877e8433378`; `out/ram-k273-wifi-10e-ctl` 237281280 bytes sha256 `cceaf07902ef714a86769f3cf3aefc278415fef6b75193d622ea409df8c4f7cd`):
+
+| # | Boot args (beyond the image's) | Gate | Then |
+|---|---|---|---|
+| 10e-ctl | `piano-wifi=7 piano-wifi-iova=1` | 10b's path as 10d-ctl's row; plus `stack: ... the least so far M (at stage S); level 6 begins` and `level 7 begins` with M well above 6000. **Gate: the association answer with status 0** | A stack line with M under 4000: a frame the static check does not see (the kernel's paths) |
+| 10e | `piano-wifi=8 piano-wifi-iova=1 piano-wifi-l7hold=180000 piano-wifi-l8=22 piano-wifi-defer=3` | 10d's row (the eight blocks, `8 of 8 block(s) done`), the stack lines at each level's start and `level 8 ends` (M well above 6000), then 10c's checklist. **Gate: `EAPOL frame 1 from the access point: ... message 1 of the four-way handshake`** | As 10d's row |
+
 ## 9. Fallback
 
 `piano-wifi=0` (the default): nothing runs. Network meanwhile: PianoNullEthernet's `en0` (no traffic) and, once built, the USB-C
