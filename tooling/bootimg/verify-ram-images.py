@@ -176,6 +176,21 @@ def main():
         check(kernel[shim + len(fd):] == dtb_bytes, 'the boot DTB is appended after the FD')
         check(dtb == dtb_bytes, 'v2 dtb section is the boot DTB')
         check(hashlib.sha256(ramdisk).hexdigest() == info.get('payload_sha256'), 'ramdisk is the payload the build recorded')
+        store = info.get('data_store')
+        if store:
+            seed, installed = (store.get('seed_identity') or '')[:8], (store.get('installed_seed') or '')[:8]
+            print(f'  info  data store: data-persist={store.get("data_persist")}, seed {seed or "?"}, installed seed {installed or "unknown"} '
+                  f'({store.get("installed_seed_from", "?")}){" (the same)" if store.get("same_seed") else ""}')
+            if store.get('data_persist') == 2 and not store.get('same_seed'):
+                print(f'  WARN  data-persist=2 with seed {seed}, not the installed seed {installed or "unknown"}: the store guard keeps '
+                      'the owner\'s store only while it is not self-contained (flattened); is the installed seed record current?')
+            # 2026-11-14: a warm RAM test seed (tooling/k27/warm-seed.py registers each in out/warm-seeds.json) never opens the store
+            registry = Path(__file__).resolve().parents[2] / 'out/warm-seeds.json'
+            warm = json.loads(registry.read_text()).get(info.get('seed_sha256', ''), None) if registry.is_file() else None
+            if warm:
+                print(f'  info  warm seed {warm.get("identity", "")[:16]} (pack {warm.get("pack_sha256", "")[:16]}, '
+                      f'{warm.get("pack_bytes")} bytes; {warm.get("out")})')
+                check(store.get('data_persist') == 0, f'a warm test seed runs data-persist=0 (this image: {store.get("data_persist")})')
         ok, files = fat_files(ramdisk)
         check(ok and files, f'ramdisk is a FAT volume with {len(files)} files')
         for name, (size, digest, text) in files.items():

@@ -326,6 +326,14 @@ def cmd_build(a):
     record['output'] = {'seed_sha256': sha(seed), 'identity': meta['sha256'], 'trust_sha256': sha(trust),
                         'seed_bytes': seed.stat().st_size, 'grew_bytes': seed.stat().st_size - before}
     (a.out / 'stage.json').write_text(json.dumps(record, indent=1) + '\n')
+    # the registry verify-ram-images.py reads: an image with one of these seeds must run data-persist=0
+    registry = D / 'out/warm-seeds.json'
+    known = json.loads(registry.read_text()) if registry.is_file() else {}
+    known[record['output']['seed_sha256']] = {'identity': meta['sha256'], 'pack_sha256': record['warm']['pack_sha256'],
+                                              'pack_bytes': record['warm']['pack_bytes'], 'out': str(a.out),
+                                              'base_seed_sha256': record['inputs']['seed_sha256']}
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps(known, indent=1) + '\n')
     print(f'{seed}: {seed.stat().st_size} bytes packed (+{seed.stat().st_size - before} over the input), identity {meta["sha256"][:16]}: '
           'a new identity, so build-ram-images.py gives its images data-persist=0; the RAM image must stay under 250 MB')
     return 0
