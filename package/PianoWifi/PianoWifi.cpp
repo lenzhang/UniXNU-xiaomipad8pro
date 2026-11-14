@@ -2696,6 +2696,7 @@ struct PassEnd {
   bool opened = false;        // the port opened on this pass (Wi-Fi was back)
   bool fast = false;          // a restart's fast join: no scan, the last network directly (piano-wifi-fastrestart)
   bool fastJoinFailed = false;   // the fast join ended without the port opening (not a stopped link, not a dead chip)
+  uint64_t level7At = 0;      // when level 7 began on this pass (the profile's wait is counted from here)
   uint64_t profileAt = 0;     // when the join profile was handed to this pass's first join (boot 10o: a restart's "Wi-Fi is
                               // back after 103 s" was the wait for a profile placed after the boot)
 };
@@ -4424,10 +4425,12 @@ __attribute__((noinline)) void restartTurn(IOService *owner, uint64_t now, uint6
     gLastNet = gSta.choice.net;   // the next fast restart joins it directly
     gLastNetValid = true;
     if (e.pass > 1) {
-      const uint64_t profileWait = e.profileAt > gRestartBegan + 1000 ? e.profileAt - gRestartBegan : 0;
+      // (10p said "came only 1890 ms after it began" of a profile that was there at once: levels 2 to 6 took that long; the
+      // wait is counted from level 7's start)
+      const uint64_t profileWait = e.level7At && e.profileAt > e.level7At + 1000 ? e.profileAt - e.level7At : 0;
       char waited[96] = "";
       if (profileWait)
-        snprintf(waited, sizeof waited, "; the join profile came only %llu ms after it began", (unsigned long long)profileWait);
+        snprintf(waited, sizeof waited, "; level 7 waited %llu ms for the join profile", (unsigned long long)profileWait);
       note("restart %u (%s): Wi-Fi is back: the port opened %llu ms after the restart began (pass %u%s)", gRestarts, gRestartWhy,
            (unsigned long long)(now - gRestartBegan), e.pass, waited);
       char line[200];
@@ -4634,6 +4637,7 @@ int level7(IOService *owner)
   const char *why = nullptr;
   uint32_t sendWaits = 0;
   gBgScan = gPass.fast ? kBgScanArmed : kBgScanNone;   // a fast pass scans beside its association (bgScanTurn)
+  if (!gPass.level7At) gPass.level7At = nowMs();
   if (gPass.fast && gLastNetValid) {
     // the fast restart: the last network as the only entry of the list (level 6 did not scan)
     gLink.scan.entries[0] = gLastNet;
@@ -5191,6 +5195,7 @@ int PianoWifi::runPass(uint32_t pass, PowerState &power, const Options &opt)
   e.failed = e.opened = false;
   e.fast = pass > 1 && gFastNext;
   e.fastJoinFailed = false;
+  e.level7At = 0;
   e.profileAt = 0;
   bool wakeReleased = false;
   // A ladder that ended well lets the device idle again (the wake doorbell back to 0, as the MHI host's last release does),
