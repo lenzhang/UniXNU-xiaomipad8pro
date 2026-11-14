@@ -247,11 +247,12 @@ void readArgs()
   // After boot 10c (the tablet reset right after the firmware's mode, with the rings programmed at level 6's start and none of
   // the lines printed): piano-wifi-l8blocks=N programs the data path's register blocks 0..N only (WifiDp.h DpBlock: 0 reads
   // only, 7 all, the default), and piano-wifi-l8tracems=MS how long the ladder waits after each block's line, printed at once
-  // (not held) so that the console and the kernel log have it before the block's first access (50; 0 no wait).
+  // (not held) so that the console and the kernel log have it before the block's first access (5; 0 no wait: the blocks run
+  // between the firmware's mode and the copy engine).
   gArgs.l8blocks = bootArg("piano-wifi-l8blocks", kDpBlocks - 1);
   if (gArgs.l8blocks >= kDpBlocks) gArgs.l8blocks = kDpBlocks - 1;
-  gArgs.l8tracems = bootArg("piano-wifi-l8tracems", 50);
-  if (gArgs.l8tracems > 2000) gArgs.l8tracems = 50;
+  gArgs.l8tracems = bootArg("piano-wifi-l8tracems", 5);
+  if (gArgs.l8tracems > 2000) gArgs.l8tracems = 5;
 }
 
 uint64_t nowMs();

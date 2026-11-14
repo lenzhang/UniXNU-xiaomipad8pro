@@ -38,11 +38,14 @@ constexpr uint32_t kDpFrameMax = 1600;   // an 802.3 frame of en0 (1514 and a VL
 // refill ring's manager; off: the firmware's own, as levels 6 and 7 have it), bit 1 the receive ring selection sent for both
 // radio buffer rings, bit 2 the data path's rings programmed at all (off: level 8 does nothing), bit 3 EAPOL frames
 // also to en0 (by default only to the 802.1X port), bit 4 the transmit side (off: nothing is sent, the receive side runs).
-// Bit 5: the rings programmed at level 6's start, before the copy engine (boot 10c's placement, which reset the tablet right
-// after the firmware's mode); by default they are programmed at level 7's start, once level 6 has run as on boot 10b.
+// Bit 5: the rings programmed at level 6's start, before the copy engine (off: at level 7's start). Boot 10c's reset at that
+// placement was the ladder's stack overflowing (10d's mailbox), not the rings.
 constexpr uint32_t kL8RbmSw1 = 1u << 0, kL8RxSelection = 1u << 1, kL8Rings = 1u << 2, kL8EapolToEn0 = 1u << 3, kL8Tx = 1u << 4,
                    kL8AtLevel6 = 1u << 5;
-constexpr uint32_t kL8Default = kL8RbmSw1 | kL8RxSelection | kL8Rings | kL8Tx;
+// Since boots 10f-a/b (2026-11-14): software ring 1 for the buffers, confirmed on the tablet (with the firmware's manager the
+// firmware asserts as the first data frames come; 10f-b), and the rings at level 6's start so that a buffer released during
+// the scan finds its ring: 0x37.
+constexpr uint32_t kL8Default = kL8RbmSw1 | kL8RxSelection | kL8Rings | kL8Tx | kL8AtLevel6;
 
 struct DpTxBuf {
   uint8_t *va = nullptr;
