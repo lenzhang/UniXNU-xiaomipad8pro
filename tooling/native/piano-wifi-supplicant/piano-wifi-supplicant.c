@@ -332,7 +332,8 @@ static int read_profile(const char *path, struct profile *p)
   if (!slash) return -1;
   *slash = 0;
   struct stat sd, sf;
-  if (lstat(dir, &sd) != 0 || !S_ISDIR(sd.st_mode) || sd.st_uid != 0 || (sd.st_mode & 0077)) { say("the profile's directory is not root-only (mode 700): refused"); return -1; }
+  if (lstat(dir, &sd) != 0) { say("no join profile yet (its directory is not there)"); return -1; }
+  if (!S_ISDIR(sd.st_mode) || sd.st_uid != 0 || (sd.st_mode & 0077)) { say("the profile's directory is not root-only (mode 700): refused"); return -1; }
   int fd = open(path, O_RDONLY | O_NOFOLLOW);
   if (fd < 0 || fstat(fd, &sf) != 0 || !S_ISREG(sf.st_mode) || sf.st_uid != 0 || (sf.st_mode & 0077) || sf.st_size > 4096) {
     if (fd >= 0) close(fd);
@@ -364,6 +365,38 @@ static int pmk_of_profile(const struct profile *p, uint8_t pmk[32])
     return 0;
   }
   return pmk_from_passphrase(p->psk, p->ssid, p->ssid_len, pmk);
+}
+
+// The PMK of the profile file as it is now: read again only when the file changed (its inode, size or time), so a profile placed
+// or replaced while the daemon runs is taken at the next association, and the daemon never has to exit for want of one (an exit
+// left launchd's 10 s respawn throttle between the daemon and the port: the access point's message 1 came and went unanswered).
+struct pmk_state {
+  bool have;
+  uint8_t pmk[32];
+  ino_t ino;
+  off_t size;
+  struct timespec mtime;
+};
+
+static bool load_pmk(const char *path, struct pmk_state *ps)
+{
+  struct stat st;
+  bool stamped = lstat(path, &st) == 0;
+  if (stamped && ps->have && st.st_ino == ps->ino && st.st_size == ps->size && st.st_mtimespec.tv_sec == ps->mtime.tv_sec &&
+      st.st_mtimespec.tv_nsec == ps->mtime.tv_nsec)
+    return true;
+  wipe(ps->pmk, sizeof ps->pmk);
+  ps->have = false;
+  struct profile prof;
+  if (!stamped || read_profile(path, &prof) != 0) return false;
+  bool ok = pmk_of_profile(&prof, ps->pmk) == 0;
+  wipe(&prof, sizeof prof);
+  if (!ok) { say("the PMK could not be derived"); wipe(ps->pmk, sizeof ps->pmk); return false; }
+  ps->have = true;
+  ps->ino = st.st_ino;
+  ps->size = st.st_size;
+  ps->mtime = st.st_mtimespec;
+  return true;
 }
 
 // --------------------------------------------------------------------------------------------------------- the socket
@@ -400,11 +433,8 @@ static int open_port(void)
 
 static int run(const char *profile_path, bool once)
 {
-  struct profile prof;
-  if (read_profile(profile_path, &prof) != 0) return 2;
-  uint8_t pmk[32];
-  if (pmk_of_profile(&prof, pmk) != 0) { wipe(&prof, sizeof prof); say("the PMK could not be derived"); return 2; }
-  wipe(prof.psk, sizeof prof.psk);
+  struct pmk_state ps = {0};
+  load_pmk(profile_path, &ps);   // a profile already there is ready before the first association; none is no reason to exit
   for (int tries = 0; (gSock = open_port()) < 0; tries++) {
     if (tries % 30 == 0) say("the 802.1X port is not there yet (%s): waiting", strerror(-gSock));
     sleep(2);
@@ -449,6 +479,7 @@ static int run(const char *profile_path, bool once)
         associated_at = time(NULL);
         say("associated (generation %u, AID %u, %u MHz, pairwise %u, group %u, AKM %u): the four-way handshake's turn",
             l.generation, l.aid, l.freq, l.pairwise, l.group, l.akm);
+        if (!load_pmk(profile_path, &ps)) say("no usable join profile: the four-way handshake cannot run (generation %u)", l.generation);
       } else if (l.state == PIANO_WIFI_8021X_STATE_AUTHORIZED) {
         say("the port is open (generation %u)", l.generation);
       } else if (l.state == PIANO_WIFI_8021X_STATE_IDLE) {
@@ -460,8 +491,8 @@ static int run(const char *profile_path, bool once)
     } else if (hd.type == PIANO_WIFI_8021X_EAPOL_RX && body_len >= sizeof(struct piano_wifi_8021x_eapol)) {
       struct piano_wifi_8021x_eapol e;
       memcpy(&e, body, sizeof e);
-      if (e.generation != h.generation || sizeof e + e.pdu_len > body_len) continue;
-      int rc = on_eapol(pmk, &h, body + sizeof e, e.pdu_len, sock_send, NULL);
+      if (e.generation != h.generation || sizeof e + e.pdu_len > body_len || !ps.have) continue;
+      int rc = on_eapol(ps.pmk, &h, body + sizeof e, e.pdu_len, sock_send, NULL);
       if (rc == 1) {
         int ra = send_request(sock_send, NULL, PIANO_WIFI_8021X_AUTHORIZE, h.generation, 0);
         say("authorize sent: %d", ra);
@@ -478,7 +509,7 @@ static int run(const char *profile_path, bool once)
     }
     wipe(msg, sizeof msg);
   }
-  wipe(pmk, sizeof pmk);
+  wipe(ps.pmk, sizeof ps.pmk);
   wipe(&h, sizeof h);
   return 0;
 }
