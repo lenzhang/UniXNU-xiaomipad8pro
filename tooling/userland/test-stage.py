@@ -721,8 +721,9 @@ def live_tests(tmp):
         real = json.loads((tmp / 'real/live/live.json').read_text())
         machos = {f['dest']: f['cdhash'] for f in real['files'] if f['cdhash']}
         check(set(machos) == {'/usr/local/libexec/pianousb-shell', '/usr/local/libexec/piano-rotated', '/usr/local/bin/piano-torch',
-                              '/usr/local/libexec/piano-wifi-join', '/usr/local/bin/piano-camera-grab'},
-              'five Mach-Os with CDHashes: ' + ', '.join(f'{Path(d).name} {h[:12]}' for d, h in sorted(machos.items())))
+                              '/usr/local/libexec/piano-wifi-join', '/usr/local/bin/piano-camera-grab',
+                              '/usr/local/libexec/piano-wifi-supplicant'},
+              'six Mach-Os with CDHashes: ' + ', '.join(f'{Path(d).name} {h[:12]}' for d, h in sorted(machos.items())))
         archs = {d: subprocess.run(['lipo', '-archs', str(tmp / 'real/live/staging/files' / f['unit'] / Path(d).name)],
                                    capture_output=True, text=True).stdout.strip() for d in machos for f in real['files'] if f['dest'] == d}
         check(set(archs.values()) == {'arm64'}, 'each one thin arm64')
@@ -735,10 +736,11 @@ def live_tests(tmp):
         code, out = rig.run()
         want = {'system/com.unixnu.pianousb-shell', 'system/com.unixnu.piano-policy-agent', 'system/com.unixnu.piano-pmset-defaults',
                 'system/com.unixnu.piano-still-wallpaper', 'system/com.unixnu.piano-wifi-join', 'system/com.unixnu.piano-camera-grab',
+                'system/com.unixnu.piano-wifi-supplicant',
                 f'gui/{rig.uid}/com.unixnu.piano-rotated', f'gui/{rig.uid}/com.unixnu.piano-login-front'}
         check(code == 0 and rig.loaded() == want and rig.root('/usr/local/bin/piano-torch').is_file() and
               rig.root('/usr/local/share/piano/wallpaper/still.png').read_bytes()[:8] == b'\x89PNG\r\n\x1a\n',
-              f'the real staging installed on a scratch root ({sorted(rig.loaded() ^ want) or "as wanted"}): six daemons and the two agents loaded, piano-torch in /usr/local/bin, '
+              f'the real staging installed on a scratch root ({sorted(rig.loaded() ^ want) or "as wanted"}): seven daemons and the two agents loaded, piano-torch in /usr/local/bin, '
               'the still picture in /usr/local/share/piano/wallpaper')
         code, out = rig.run('--check')
         check(code == 0, 'and --check passes on it')

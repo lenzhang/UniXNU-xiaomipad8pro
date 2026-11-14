@@ -191,6 +191,24 @@ dest = "/Library/LaunchDaemons/com.unixnu.piano-still-wallpaper.plist"
 mode = "0644"
 
 [[unit]]
+name = "piano-wifi-supplicant"
+about = "the WPA2-Personal key handshake of PianoWifi's station over its 802.1X port (docs/drivers/wifi.md section 13.7): reads the root-only join profile, answers the four-way and group handshakes, hands the keys to the kext and opens the port; logs states and lengths only"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-wifi-supplicant/piano-wifi-supplicant.c"
+build = "cc"
+arch = "arm64"
+dest = "/usr/local/libexec/piano-wifi-supplicant"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/native/piano-wifi-supplicant/com.unixnu.piano-wifi-supplicant.plist"
+build = "copy"
+dest = "/Library/LaunchDaemons/com.unixnu.piano-wifi-supplicant.plist"
+mode = "0644"
+
+[[unit]]
 name = "piano-wifi-join"
 about = "hands PianoWifi the join profile once at boot, from the root-only file /private/var/db/piano-wifi/profile (the owner places it; never in a repository) into the root-only sysctl machdep.piano_wifi_join; logs lengths only (docs/drivers/wifi.md section 13.2); exits at once with no profile or no PianoWifi"
 default_on = true
