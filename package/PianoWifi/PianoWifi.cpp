@@ -127,6 +127,7 @@ struct Args {
   uint32_t deadlineMs;
   uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step, l7file, l7cands;
   uint32_t l8, l8status, l8blocks, l8tracems;
+  uint32_t sleepOff, rejoin, dropTest;
 };
 Args gArgs;
 
@@ -253,6 +254,17 @@ void readArgs()
   if (gArgs.l8blocks >= kDpBlocks) gArgs.l8blocks = kDpBlocks - 1;
   gArgs.l8tracems = bootArg("piano-wifi-l8tracems", 5);
   if (gArgs.l8tracems > 2000) gArgs.l8tracems = 5;
+  // For daily use (after boot 10i): piano-wifi-sleepoff=1 powers the radio off at a system sleep, as every level before 8 does
+  // (and it stays off until the next boot); by default at level 8 the radio stays on through the sleep (suspend-to-idle: the
+  // chip keeps its association by itself, or the rejoin below takes it up again at the wake). piano-wifi-rejoin=0: when an
+  // association ends (the access point's deauthentication, a beacon miss, a kickout, the 802.1X client's LEAVE, a join that
+  // fails) the level ends, as before; by default at level 8 it joins again from the profile, after 2, 5, 10, 20, 30 and then
+  // 60 s. piano-wifi-droptest=S: a test, S s after the port first opens the station drops its association itself (our own
+  // deauthentication, as the access point's would), once, so that one unattended boot shows the rejoin.
+  gArgs.sleepOff = bootArg("piano-wifi-sleepoff", gArgs.level >= 8 ? 0 : 1);
+  gArgs.rejoin = bootArg("piano-wifi-rejoin", gArgs.level >= 8 ? 1 : 0);
+  gArgs.dropTest = bootArg("piano-wifi-droptest", 0);
+  if (gArgs.dropTest > 3600) gArgs.dropTest = 0;
 }
 
 uint64_t nowMs();
@@ -2610,6 +2622,7 @@ bool gDpPlanned;
 Link gLink;
 volatile bool gLinkRunning;         // the ladder's thread is inside level 6 or 7: the power hook asks it to stop instead of racing
 volatile uint32_t gStopRequested;   // set by the power hook, read by the ladder each turn
+const char *volatile gStopWhy = "a stop";   // what asked (stopRadio's caller: "suspend", "shutdown")
 bool profileOwnMac(uint8_t *mac);   // level 7's join profile (below): the station's address, when it names one
 
 void linkNote(void *, int step, const char *what)
@@ -2987,6 +3000,7 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
 // hardware, so the hook asks it to stop and waits for it (bounded); then the scan and the virtual device are gone, the rings
 // are disabled, and WLAN_EN goes low with PERST# asserted. Nothing is brought back on the wake.
 PowerState gPowerStorage;       // the rails and pins as level 2 left them: what safeOff needs, from any thread
+volatile uint32_t gSleeps, gWakes;   // system sleeps and wakes seen with the radio kept on (level 8)
 PowerState *gPowerState;
 Options gPowerOptions;
 bool gRadioStopped;
@@ -2998,6 +3012,7 @@ void stopRadio(const char *why)
   if (gRadioStopped || gArgs.level < 2) return;
   gRadioStopped = true;
   profileClear();   // the join profile does not outlive the radio
+  gStopWhy = why;
   __atomic_store_n(&gStopRequested, 1u, __ATOMIC_RELEASE);
   const uint64_t deadline = nowMs() + 2500;   // level 7's fast teardown (each answer 300 ms) fits in it
   while (gLinkRunning && nowMs() < deadline) IOSleep(10);
@@ -3108,7 +3123,8 @@ void registerJoinSysctl()
 // counts and lengths, never the network's name, an address or a key.
 Sta gSta;
 StaDma gStaFrames[kAssocFrameBuffers];
-StaDma gStaReoq;
+StaDma gStaReoq, gStaReoq2;      // the second for the rejoin: the queues of two peers in a row never share memory
+bool gL7EndedOnRequest;
 bool gStaPlanned;
 
 bool profileOwnMac(uint8_t *mac)
@@ -4071,6 +4087,34 @@ bool level8Event(uint32_t id, const uint8_t *payload, uint32_t length)
   return true;
 }
 
+// The join machine's two entries, not inlined into level7: their own temporaries (a choice, a frame's parts) stay out of
+// level7's frame (the ladder's 16 KiB stack).
+__attribute__((noinline)) void staBeginOnce(const StaOptions &o, const StaEnv &env, uint64_t now) { staBegin(gSta, o, env, now); }
+__attribute__((noinline)) void staRunOnce(uint64_t now) { staRun(gSta, now); }
+
+// The rejoin's back-off: the transport and the data path kept running (their turns) until it ends, a stop is asked for, the
+// link stops or the chip dies. Not inlined into level7, whose frame stays small (the ladder's 16 KiB stack).
+__attribute__((noinline)) const char *rejoinWait(uint32_t waitMs, bool &stoppedOnRequest)
+{
+  const uint64_t until = nowMs() + waitMs;
+  while (nowMs() < until) {
+    const uint64_t now = nowMs();
+    if (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE)) {
+      stoppedOnRequest = true;
+      return nullptr;
+    }
+    linkRun(gLink, now);
+    if (gLink.step == kLinkStopped) return linkErrorName(gLink.error);
+    if (gArgs.level >= 8) level8Turn(now);
+    if (mhiHealth(gMhiIo, gBoot.bhi).dead()) {
+      gChipDead = true;
+      return "the chip died";
+    }
+    IOSleep(20);
+  }
+  return nullptr;
+}
+
 int level7(IOService *owner)
 {
   using namespace stadetail;
@@ -4133,23 +4177,64 @@ int level7(IOService *owner)
   gSta.ctx = nullptr;
   const uint64_t started = nowMs();
   if (gArgs.level >= 8) level8Begin(started);
-  staBegin(gSta, o, env, started);
+  // The rejoin (level 8, piano-wifi-rejoin): one join per pass of this loop; after an association ends, the next pass waits
+  // its back-off and joins again from the profile. The reorder queues alternate between two blocks of the window, so a new
+  // peer's queues never reuse the memory of the one just deleted.
+  static const uint32_t kRejoinBackoffMs[] = {2000, 5000, 10000, 20000, 30000, 60000};
+  uint32_t joins = 0, rejoinStep = 0, wakesSeen = 0, sleepsSeen = 0;
+  bool stoppedOnRequest = false, dropDone = false;
+  uint64_t firstOpenAt = 0;
+  const char *why = nullptr;
+  uint32_t sendWaits = 0;
+  for (;;) {
+  ++joins;
+  if (joins > 1) {
+    if (!gStaReoq2.va) {
+      gStaReoq2.va = arenaAlloc(gArena, kStaReoqBytes, &gStaReoq2.bus);
+      gStaReoq2.bytes = kStaReoqBytes;
+    }
+    env.reoq = (joins % 2 == 0 && gStaReoq2.va) ? gStaReoq2 : gStaReoq;
+  }
+  staBeginOnce(o, env, nowMs());
   gLink.hook = staHook;
   uint32_t generation = 0;
   uint64_t nextFileTry = 0;
   const char *lastFileProblem = nullptr;
-  bool stopping = false, profileNoted = false;
+  bool stopping = false, profileNoted = false, dropThisJoin = false;
   uint64_t stopAt = 0;
-  uint32_t sendWaits = 0;
-  const char *why = nullptr;
+  why = nullptr;
   while (!staFinished(gSta)) {
     const uint64_t now = nowMs();
+    // a system sleep and its wake with the radio kept on (level 8): noted once each, the association looked at by the turn
+    if (gSleeps != sleepsSeen || gWakes != wakesSeen) {
+      if (gWakes != wakesSeen)
+        note("level 7: woke from system sleep %u during %s (the association %s)", gWakes, staStepName(gSta.step),
+             gSta.disconnect ? "ended" : gSta.vdevUp ? "is still up as far as the firmware has said" : "was not up");
+      sleepsSeen = gSleeps;
+      wakesSeen = gWakes;
+    }
+    // piano-wifi-droptest=S: once, S s after the port first opened, the station leaves (its own deauthentication) and the
+    // rejoin must bring it back without anybody
+    if (gArgs.level >= 8 && gSta.authorized && !firstOpenAt) firstOpenAt = now;
+    if (gArgs.dropTest && !dropDone && firstOpenAt && now >= firstOpenAt + uint64_t(gArgs.dropTest) * 1000 && !stopping &&
+        gSta.step == kStaAssociated) {
+      dropDone = true;
+      dropThisJoin = true;
+      note("level 7: the drop test (piano-wifi-droptest=%u): the station leaves its association now (our deauthentication); "
+           "the rejoin follows",
+           gArgs.dropTest);
+      staStop(gSta, now);   // the teardown sends our deauthentication: the access point drops us as it would on its own
+    }
     if (!stopping && (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE) || levelLate())) {
-      const bool suspend = __atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE) != 0;
+      const bool requested = __atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE) != 0;
+      if (requested) stoppedOnRequest = true;
       note("level 7: %s during %s: the join is taken down",
-           suspend ? "a suspend asked the radio to stop" : "the level's hard deadline passed", staStepName(gSta.step));
+           requested ? (gStopWhy[0] == 's' && gStopWhy[1] == 'h' ? "a shutdown or restart asked the radio to stop"
+                                                                 : "a suspend asked the radio to stop")
+                     : "the level's hard deadline passed",
+           staStepName(gSta.step));
       // a suspend's power hook waits 2.5 s for this thread: each answer of the teardown is then waited for 300 ms at most
-      staStop(gSta, now, suspend ? 300u : 0u);
+      staStop(gSta, now, requested ? 300u : 0u);
       stopping = true;
       stopAt = now;
     }
@@ -4199,7 +4284,7 @@ int level7(IOService *owner)
            (unsigned long long)(now - started), unsigned(gSta.ssidLength), piano_wifi_security_name(gSta.security),
            gSta.bssidGiven ? "given" : "not given");
     }
-    staRun(gSta, now);
+    staRunOnce(now);
     if (gSta.outLength) {
       const int rc = linkSendWmi(gLink, gSta.out, gSta.outLength);
       if (rc == 1) staSent(gSta, now);
@@ -4220,12 +4305,31 @@ int level7(IOService *owner)
     IOSleep(gSta.step == kStaProfileWait ? 20 : 2);
   }
   gLink.hook = nullptr;
+  // ---- the rejoin's decision: only an association that ended or a join that failed, never a stop, a dead chip, a dead link
+  // or a missing profile
+  const bool joinEndedByItself = !why && !stoppedOnRequest && gSta.error != kStaErrNoProfile;
+  if (gArgs.level >= 8 && gArgs.rejoin && joinEndedByItself) {
+    const bool wasUp = gSta.vdevUp;
+    if (gSta.authorized) rejoinStep = 0;   // a port that opened: the next one starts the back-off afresh
+    const uint32_t waitMs = kRejoinBackoffMs[rejoinStep < 6 ? rejoinStep : 5];
+    if (rejoinStep < 5) ++rejoinStep;
+    note("level 7: join %u ended (%s%s): joining again in %u s, from the profile", joins,
+         wasUp ? "the association ended: " : "the join failed: ",
+         dropThisJoin ? "the drop test's own leave" : gSta.disconnect ? staDisconnectName(gSta.disconnect)
+                                                    : wasUp ? "the station left (a stop or the 802.1X client's LEAVE)"
+                                                            : staErrorName(gSta.error),
+         waitMs / 1000);
+    why = rejoinWait(waitMs, stoppedOnRequest);
+    if (!why && !stoppedOnRequest) continue;
+  }
+  break;
+  }   // the rejoin's loop
   if (why) note("level 7: the loop ended early: %s (step %d: %s)", why, gSta.step, staStepName(gSta.step));
   const bool done = gSta.step == kStaDone;
   const int at = done ? gSta.step : gSta.failedStep;
-  note("level 7: %s after %llu ms (step %d: %s%s%s); %s", done ? "done" : "stopped", (unsigned long long)(nowMs() - started), at,
-       staStepName(at), done ? "" : ", ", done ? "" : staErrorName(gSta.error),
-       gSta.rsn ? "WPA2-PSK (CCMP, PSK)" : gSta.profileSet ? "open" : "no profile");
+  note("level 7: %s after %llu ms (step %d: %s%s%s); %s; %u join(s)", done ? "done" : stoppedOnRequest ? "stopped on request" : "stopped",
+       (unsigned long long)(nowMs() - started), at, staStepName(at), done ? "" : ", ", done ? "" : staErrorName(gSta.error),
+       gSta.rsn ? "WPA2-PSK (CCMP, PSK)" : gSta.profileSet ? "open" : "no profile", joins);
   note("level 7: %u command(s) (%u transport wait(s)), %u event(s), %u management frame(s) of the join and %u of others, %u "
        "frame(s) sent, %u acknowledged",
        gSta.commands, sendWaits, gSta.events, gSta.mgmtOurs, gSta.mgmtOthers, gSta.descId, gSta.txAcked);
@@ -4253,7 +4357,10 @@ int level7(IOService *owner)
   gSta.ssidLength = 0;
   linkTeardown();
   gLinkRunning = false;
-  return done ? 0 : -1;
+  // A stop that a suspend or a shutdown asked for is the level's normal end, not its failure (boot 10i's "FAILED at stage
+  // 718" was the restart that ended the run).
+  gL7EndedOnRequest = stoppedOnRequest && !gChipDead;
+  return done || gL7EndedOnRequest ? 0 : -1;
 }
 }  // namespace
 
@@ -4351,6 +4458,19 @@ void PianoWifi::thread(void *self, wait_result_t)
 // (docs/power.md §4), and the waiting happens on a thread of its own.
 IOReturn PianoWifi::setPowerState(unsigned long state, IOService *)
 {
+  // Level 8 for daily use: the radio stays on through a system sleep (piano-wifi-sleepoff=0, its default). Nothing is
+  // stopped; the ladder's thread is frozen with every other while the system is suspended, and at the wake it finds the
+  // association as the firmware kept it, or ended (then the rejoin takes it up again).
+  if (gArgs.level >= 8 && !gArgs.sleepOff && !gRadioStopped) {
+    if (state == pianopower::kOff) {
+      __atomic_add_fetch(&gSleeps, 1u, __ATOMIC_ACQ_REL);
+      IOLog("PianoWifi: power: a system sleep (%u): the radio stays on (piano-wifi-sleepoff=0)\n", gSleeps);
+    } else if (state == pianopower::kOn && gSleeps) {
+      __atomic_add_fetch(&gWakes, 1u, __ATOMIC_ACQ_REL);
+      IOLog("PianoWifi: power: the wake (%u): the ladder looks at the association\n", gWakes);
+    }
+    return pianopower::kAckNow;
+  }
   if (state != pianopower::kOff || gArgs.level < 2 || gRadioStopped) return pianopower::kAckNow;
   thread_t t = nullptr;
   if (kernel_thread_start(&PianoWifi::stopThread, this, &t) != KERN_SUCCESS) {
@@ -4496,8 +4616,8 @@ void PianoWifi::run()
   // The DMA path's bandwidth before the controller's clocks, as pcie-qcom does (WifiHw.h: the PCIe NoC's bus clock manager).
   reportStack("level 3 begins");
   nocVote(true);
-  static LinkState gLinkState;   // static, as the surveys: the ladder's stack stays small
-  LinkState &link = gLinkState;
+  static LinkState gLadderLinkState;   // static, as the surveys: the ladder's stack stays small
+  LinkState &link = gLadderLinkState;
   renew(link);
   rc = linkUp(link, power, gHw, opt);
   reportLink(link);
@@ -4656,7 +4776,9 @@ void PianoWifi::run()
     rc = level7(this);
     levelEnd();
     writeSummary("level 7");
-    stage(rc ? -718 : 718, rc ? "level 7 stopped before its end" : "level 7: the join ran to its end");
+    stage(rc ? -718 : 718, rc                  ? "level 7 stopped before its end"
+                           : gL7EndedOnRequest ? "level 7: stopped on request (a suspend or a shutdown), its normal end"
+                                               : "level 7: the join ran to its end");
     if (gChipDead) {
       crashReport("level 7");
       safeOff(gHw, power, opt);

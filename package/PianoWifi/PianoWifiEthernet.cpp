@@ -242,9 +242,22 @@ UInt32 PianoWifiEthernet::outputPacket(mbuf_t packet, void *)
 // next free unit (boot 10i). Returns true once no interface is named en0 any more.
 bool PianoWifiEthernet::takeOverEn0()
 {
-  OSDictionary *matching = IOService::serviceMatching("PianoNullEthernet");
-  IOService *null = matching ? IOService::copyMatchingService(matching) : nullptr;
-  OSSafeReleaseNULL(matching);
+  // PianoNullEthernet never calls registerService() on itself (only its interface is registered), so matching does not find
+  // it (boot 10j: "no PianoNullEthernet to stand down"): it is looked for among IOResources' children by its class.
+  IOService *null = nullptr;
+  if (IOService *resources = IOService::getResourceService()) {
+    if (OSIterator *children = resources->getChildIterator(gIOServicePlane)) {
+      while (OSObject *child = children->getNextObject()) {
+        IOService *svc = OSDynamicCast(IOService, child);
+        if (svc && svc->getMetaClass() && strcmp(svc->getMetaClass()->getClassName(), "PianoNullEthernet") == 0) {
+          null = svc;
+          null->retain();
+          break;
+        }
+      }
+      children->release();
+    }
+  }
   if (null) {
     note("en0: PianoNullEthernet is asked to stand down (piano-wifi-en0=1)");
     null->terminate();
