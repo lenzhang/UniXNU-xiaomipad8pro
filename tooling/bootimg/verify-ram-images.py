@@ -29,6 +29,8 @@ FIELDS = ('magic', 'kernel_size', 'kernel_addr', 'ramdisk_size', 'ramdisk_addr',
 SAME_AS_REFERENCE = ('magic', 'kernel_addr', 'ramdisk_addr', 'second_size', 'second_addr', 'tags_addr', 'page_size',
                      'header_version', 'os_version', 'name', 'recovery_dtbo_size', 'recovery_dtbo_offset', 'header_size',
                      'dtb_addr')
+ROOT_27_0_1 = b'C73696D4-CAC4-40A0-90CB-7D0463E4E3E6'   # configs/k27-adt.toml root_match_volume_uuid (retired line)
+ROOT_27_3 = b'84581E99-85BE-4957-AC53-2947E887B3E4'     # configs/k273-adt.toml
 IMAGE_MAX_BYTES = int(os.environ.get('PIANO_IMAGE_MAX_BYTES', '250000000'))   # build-ram-images.py's
 failures = []
 
@@ -186,6 +188,12 @@ def main():
                 check(files.get(name, (0, None))[1] == digest, f'{name} is the input the build recorded')
         if 'EFI/UniXNU/Payloads/kernel.macho' in files:
             check_firmware(ramdisk, files, info)
+        if 'EFI/UniXNU/Payloads/kernel.macho.adt' in files:
+            # only the 27.3 line is built and booted (owner, 2026-11-13); a batch-2 probe once carried the 27.0.1 root
+            # identity and waited on that root all boot (configs/k27-adt.toml vs configs/k273-adt.toml root_match_volume_uuid)
+            adt = fat_file(ramdisk, 'EFI/UniXNU/Payloads/kernel.macho.adt').upper()
+            check(ROOT_27_0_1 not in adt, 'the ADT does not name the retired 27.0.1 root (configs/k27-adt.toml)')
+            check(ROOT_27_3 in adt, 'the ADT names the 27.3 root (configs/k273-adt.toml root_match_volume_uuid)')
         config = files.get('EFI/UniXNU/unixnu.toml', (0, None, None))[2]
         check(config is not None, 'EFI/UniXNU/unixnu.toml present')
         if config:
