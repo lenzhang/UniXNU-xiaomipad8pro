@@ -336,3 +336,65 @@ bytes, sha256 `e5fe6e503c3ea482b34093e87dd0299b206b34cdd3321986cbc1e36c20681d1f`
 0 problem slots`); the v2 seed (identity `9bd6f902...`, `data-persist=0`), the v4 layer's trust cache `57063d6d...`; the
 arguments' tail 496 bytes in `/chosen/piano-boot-args-ram`, the merged line 1164 bytes. Dump image `out/ram-k273-wm2-dump`
 (sha256 `c41f00f504a8aa193a81ef982f06a3d674a6ed87f9631df46a9c391477e3ebd1`); `piano-cwscan` beside the image.
+### 6.5 What wm2 settled, and what it did not
+
+The accept-mode sweep (1, 3, 7, 15) changed nothing: `wdutil` kept `Interface Name: (null)`, corewifi's lookups kept missing, and
+no answer of ours gates adoption. The diagnosis is `private/host-checks/20261114-flash/wm2-diag.md` (§5 ranks the causes, §6 lists
+the log gaps). Its ranking, all **inferred**: (1) no user client to bind — over a whole boot the only client of our service was
+the family's own `IOEthernetInterface`; (2) WiFiManager may want the *interface* to be of a class named `IO80211Interface`;
+(3) our events carry no payload; (4) corewifi asks for an awdl companion with no parent. §7 (wm3) tries 1 to 3 on one boot.
+
+## 7. M1b: the user client (wm3)
+
+Built, **not run on the tablet**. Everything here is off unless asked for, so wm2's behaviour is the default and the same boot
+can be switched back to it for a control.
+
+### 7.1 The switches
+
+`piano-wifi-apple80211-uc=N` at boot, `sudo sysctl machdep.piano_wifi_a80211_uc=N` at run time (0 = wm2):
+
+| Bit | What |
+|---|---|
+| 0x1 | `newUserClient` answers: a client of ours (`package/PianoWifi/PianoWifi80211Uc.h`) is made. Without it, the call is refused and passed to the family — **but it is logged either way**, which is the first question of the boot |
+| 0x2 | the controller also carries `IOInterfaceName` (and the role, and the name prefix), so user space's lookup by `IOInterfaceName` — which takes any class — can find and open the controller instead of the family's interface. Takes effect at once |
+| 0x4 | the events carry payloads (POWER_CHANGED the power structure, SCAN_DONE a status word) instead of none (Rank 3) |
+| 0x8 | the interface object is of our own class named `IO80211Interface` instead of `IOEthernetInterface` (Rank 2). It overrides nothing, so the only difference is the name a class-name test sees; **the interface is made once, so this is a boot argument only** |
+| 0x10 | selector 5 answers 1 (use the family's event pipe) instead of 0 (keep the kernel-event socket) |
+
+### 7.2 The client
+
+Selectors as the host analysis names them (§5.7 item 1): 0 and 6 are an apple80211 request in a 0x3c30- or 0x3c030-byte
+structure (the ioctl number, the length and the user pointer at its head; the name, request number and value at 0x3c08, 0x3c18
+and 0x3c1c of the second part), answered by the same handler the ioctls use — **so the driver's own errno reaches user space**,
+which the ioctl path cannot do (§5.7); 1 `useIOUCWhenPossible` answers 1; 7 DriverKit support answers 0; 5 the event pipe
+answers 0 unless 0x10. The event pipe's own selectors (2, 3, 4) and the buffer mapping (8) are not offered: they are logged and
+refused, which is itself a result. Every call carries its sizes and its answer into the log.
+
+**Not a pin on any Apple symbol:** the structure's five field offsets and the selector numbers are data from the host analysis,
+and the answers are our own (`WifiApple80211.h`). The vtable of our `IO80211Interface` is the family's (it overrides nothing);
+the KC builder's vtable check covers the controller, not this class, which is why 0x8 is off by default.
+
+### 7.3 wm3's checklist
+
+Copy `tooling/native/tmo.sh` to the tablet first (or paste its loop as a shell function) and prefix **every** command with it;
+`piano-cwscan` also ends itself (`piano-cwscan scan 45`). The adoption log (A below), with the broader grep of wm2-diag §6 and
+whole lines:
+
+    tmo 30 log show --last 3m --style syslog --predicate 'process == "airportd"' > /tmp/ap.log
+    grep -iE 'CWFApple80211|WiFiManager|cache|Falling back|no_alt_interface|adopt|attach|BSD driver|role=|parent=' /tmp/ap.log | tail -60
+
+W is `tmo 25 sudo wdutil info | sed -n '/^WIFI/,/^BLUETOOTH/p' | grep -E 'Interface Name|Power|Op Mode|Country Code|Supported Channels'`.
+C is `tmo 20 ioreg -l -r -c PianoWifi80211 -d 3 | grep -E 'IOUserClient|PianoWifi80211Uc|IOInterfaceName|IO80211InterfaceRole|piano-wifi-apple80211'`.
+
+| Step | Command / line | Read |
+|---|---|---|
+| boot (mode 0, the wm2 control) | `PianoWifi80211: user-client mode 0 (machdep.piano_wifi_a80211_uc changes it ...)`, then the M1 lines; the summary's **first** line `the controller's clients: N (...); user clients: ...` | the client line is no longer cut; **any** `a user client was refused (no client offered ...)` line names who tried to open us even in the control |
+| mode 0 | W; A; C | the control: Interface Name (null) |
+| mode 0x1 | `sudo sysctl machdep.piano_wifi_a80211_uc=1`; `sudo launchctl kickstart -k system/com.apple.airportd`; 60 s; W; A; C | `a user client was opened: type T, task airportd[N]` and `selector S: struct in ... -> 0x0`, or no open at all (then the bind does not try the client: Rank 1 is refuted) |
+| mode 0x3 | `=3`, kickstart -k, 60 s, W, A, C | whether the lookup now finds the controller and opens it |
+| mode 0x7 | `=7`, kickstart -k, 60 s, W, A | the events' payloads (Rank 3) |
+| at the first mode where W shows `en2` | `tmo 50 ./piano-cwscan scan 45`; `tmo 40 system_profiler SPAirPortDataType > /tmp/sp.txt; grep -c 'Security:' /tmp/sp.txt`; the webcam at the desktop (log in first), then the Wi-Fi menu opened with `piano-input.py` | about 15 networks in both, and the menu's list |
+| if none of them does | the next boot is `piano-wifi-apple80211-uc=9` (0x8 with the client: the interface's class, Rank 2) and then `=0x19`; keep A's `role=`/`parent=` lines for the awdl question (Rank 4) | — |
+| throughout | `grep -c "a user client was" console; grep "selector " console` | every open and every selector, with sizes |
+| the end | console `reset fastboot` | — |
+
