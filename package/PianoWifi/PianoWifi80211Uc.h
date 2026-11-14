@@ -53,8 +53,9 @@ enum : uint32_t {
   kUcControllerName = 0x2,   // the controller also carries IOInterfaceName / IO80211InterfaceRole, so user space's lookup by
                              // IOInterfaceName (any class) can find the controller and open it
   kUcEventPayloads = 0x4,    // the events carry 27.3-shaped payloads instead of none (wm2-diag Rank 3)
-  kUcInterfaceClass = 0x8,   // the interface object is of a class of ours named IO80211Interface (wm2-diag Rank 2)
+  kUcOverride = 0x8,         // IOClassNameOverride = "IO80211Controller" on the controller (ADOPTION.md P0, wm3's stage 1)
   kUcUsePipe = 0x10,         // selector 5 answers 1 (the event pipe) instead of 0
+  kUcOverrideIf = 0x20,      // the same override on the interface object too
 };
 
 }  // namespace a80211

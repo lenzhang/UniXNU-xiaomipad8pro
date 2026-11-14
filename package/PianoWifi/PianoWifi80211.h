@@ -86,6 +86,8 @@ class PianoWifi80211 : public IO80211Controller {
   uint64_t fUcOpens = 0, fUcRefused = 0, fUcSelectors = 0;   // newUserClient calls answered / refused, selectors served
   uint32_t fUcClients = 0;         // clients alive now
   uint32_t fScanLines = 0;   // the scans logged one by one (with the asking process), at most kScanLinesMax
+  uint64_t fScanSerial = 0;  // every SCAN_REQ gets one (ADOPTION.md 6.1 item 3): the 15 ms CoreWLAN scan is found by it
+  uint32_t fScanRecords = 0; // records served since the serial's scan; printed at its list end
   unsigned long fOtherSeen[16] = {};
   unsigned fOtherCount = 0;
 
@@ -105,7 +107,8 @@ class PianoWifi80211 : public IO80211Controller {
   void noteOtherIoctl(unsigned long cmd);
   void report(const char *why);
   void eventPayload(uint32_t code, uint8_t *buffer, uint32_t capacity, uint32_t &length);
-  IONetworkInterface *createInterface() override;
+  void noteIdentity(const char *why);
+  void setOverride(bool on, bool onInterface);
 
   // Armed only while the driver runs, and counted: stop() waits for every call to be out of its callback (review F4).
   void arm(thread_call_t call, unsigned ms)
@@ -151,12 +154,9 @@ class PianoWifi80211 : public IO80211Controller {
   void setUcMode(uint32_t mode, const char *why);
 };
 
-// Our own class named IO80211Interface (kUcInterfaceClass, wm2-diag Rank 2): nothing but the name, as IO80211Controller above.
-// It overrides nothing, so its vtable is the family's with our metaclass only.
-class IO80211Interface : public IOEthernetInterface {
-  OSDeclareDefaultStructors(IO80211Interface)
-};
-OSDefineMetaClassAndStructors(IO80211Interface, IOEthernetInterface)
+// (A subclass of IOEthernetInterface named IO80211Interface was tried for wm2-diag's Rank 2 and cannot be built: the 27.3
+// IONetworkingFamily does not export IONetworkInterface's reserved slot 10, so such a subclass's vtable does not link. The
+// interface's identity is given by properties instead — IOClassNameOverride below, which is what 27.3's CoreWiFi reads anyway.)
 
 #include "PianoWifi80211Uc.h"
 
@@ -286,18 +286,6 @@ IOService *PianoWifi80211::probe(IOService *provider, SInt32 *score)
   return IO80211Controller::probe(provider, score);
 }
 
-// kUcInterfaceClass (wm2-diag Rank 2): the interface object is of our own class named IO80211Interface instead of
-// IOEthernetInterface. It overrides nothing, so the only difference is the name a class-name test sees. A boot argument only
-// (the interface is made once, here).
-IONetworkInterface *PianoWifi80211::createInterface()
-{
-  if (!(fUcMode & pianowifi::a80211::kUcInterfaceClass)) return IO80211Controller::createInterface();
-  IO80211Interface *netif = OSTypeAlloc(IO80211Interface);
-  if (netif && !netif->init(this)) OSSafeReleaseNULL(netif);
-  note80211("the interface's class is %s (user-client mode 0x8)", netif ? "IO80211Interface (ours)" : "IOEthernetInterface: ours failed");
-  return netif ? netif : IO80211Controller::createInterface();
-}
-
 // Inside PianoWifiEthernet::start's attachInterface, before the interface is registered (and so before the network stack
 // attaches it): the subfamily and the role, which the network stack and airportd read once.
 bool PianoWifi80211::configureInterface(IONetworkInterface *netif)
@@ -306,6 +294,9 @@ bool PianoWifi80211::configureInterface(IONetworkInterface *netif)
   fNetif = netif;
   fSubtypeTaken = piano_netif_set_subtype(netif, 3 /* IFNET_SUBFAMILY_WIFI */);
   netif->setProperty("IO80211InterfaceRole", "Infrastructure");
+  // The production form of ADOPTION.md P0: the override is on both services before this interface registers, so CoreWiFi cannot
+  // see the child before the controller's identity is there (the sysctl's late set is the A/B of the same thing).
+  if (fUcMode & pianowifi::a80211::kUcOverride) setOverride(true, (fUcMode & pianowifi::a80211::kUcOverrideIf) != 0);
   note80211("the interface is a Wi-Fi one: subfamily 3 %s, IO80211InterfaceRole Infrastructure",
             fSubtypeTaken ? "taken" : "REFUSED (the interface was attached already)");
   return true;
@@ -402,6 +393,7 @@ void PianoWifi80211::attachStep()
     note80211("%s: the controller carries IOInterfaceName and the Infrastructure role too (user-client mode 0x2)", fIfName);
   }
   setProperty("piano-wifi-apple80211-answering", fIfName);   // the BSD name; the airportd starter waits for this key
+  noteIdentity("at the filter's attach");
   registerService();
   fRegistered = true;
   note80211("%s: the controller is registered (class chain PianoWifi80211 < IO80211Controller < PianoWifiEthernet): airportd's "
@@ -482,14 +474,36 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq)
               power ? "answered again" : "refused with EPWROFF");
     postEvent(kEvPowerChanged);
   }
-  // Every scan request, not only its first kind: which process asked (a scheduled scan of airportd's or a client's through it),
-  // and what it got, so that a client's scan that fails at once can be told from one that never reached the driver.
-  if (scanSet || (!set && type == kScanResult && a.error == kErrEndOfResults)) {
-    if (__atomic_fetch_add(&fScanLines, 1u, __ATOMIC_RELAXED) < kScanLinesMax) {
+  // Every scan request and every list end, with a serial and the asking process (ADOPTION.md 6.1 item 3): that is how a
+  // client's scan through airportd — CoreWLAN's, which came back empty in 15 ms — is told from airportd's own scheduled ones.
+  if (scanSet || (!set && type == kScanResult)) {
+    uint64_t serial = 0;
+    uint32_t records = 0;
+    bool end = false;
+    IOLockLock(fLock);
+    if (scanSet) {
+      serial = ++fScanSerial;
+      fScanRecords = 0;
+    } else {
+      serial = fScanSerial;
+      if (a.error == kErrEndOfResults) {
+        end = true;
+        records = fScanRecords;
+      } else if (!a.error) {
+        ++fScanRecords;
+      }
+    }
+    IOLockUnlock(fLock);
+    if ((scanSet || end) && __atomic_fetch_add(&fScanLines, 1u, __ATOMIC_RELAXED) < kScanLinesMax) {
       char proc[32] = "?";
       proc_selfname(proc, sizeof proc);
-      note80211("%s: scan %s by %s[%d]: %s len %u -> %d (%u network(s))", fIfName, scanSet ? "asked" : "read to its end", proc,
-                proc_selfpid(), requestName(type), unsigned(length), a.error, unsigned(networks));
+      if (scanSet)
+        note80211("%s: scan %llu asked by %s[%d]: %s len %u -> %d (%u network(s) in the list%s)", fIfName, serial, proc,
+                  proc_selfpid(), requestName(type), unsigned(length), a.error, unsigned(networks),
+                  directed ? ", a directed scan" : "");
+      else
+        note80211("%s: scan %llu read to its end by %s[%d]: %u record(s) served, the list end answered %d", fIfName, serial, proc,
+                  proc_selfpid(), unsigned(records), a.error);
     }
   }
   if (a.effects & kDoScanStarted) scanStarted();
@@ -643,12 +657,57 @@ uint32_t PianoWifi80211::ucMode()
   return mode;
 }
 
+// The discovery identity 27.3's CoreWiFi reads, on one line (ADOPTION.md 6.1 item 2): the controller's override, the
+// interface's class and its names.
+void PianoWifi80211::noteIdentity(const char *why)
+{
+  char override[48] = "(absent)", ifClass[48] = "?", role[32] = "(absent)", name[20] = "(absent)", prefix[12] = "(absent)";
+  int unit = -1;
+  auto text = [](IORegistryEntry *where, const char *key, char *out, size_t size) {
+    if (!where) return;
+    OSObject *o = where->copyProperty(key);
+    if (OSString *str = OSDynamicCast(OSString, o)) strlcpy(out, str->getCStringNoCopy(), size);
+    OSSafeReleaseNULL(o);
+  };
+  text(this, "IOClassNameOverride", override, sizeof override);
+  if (fNetif) {
+    strlcpy(ifClass, fNetif->getMetaClass() ? fNetif->getMetaClass()->getClassName() : "?", sizeof ifClass);
+    text(fNetif, "IO80211InterfaceRole", role, sizeof role);
+    text(fNetif, "IOInterfaceName", name, sizeof name);
+    text(fNetif, "IOInterfaceNamePrefix", prefix, sizeof prefix);
+    OSObject *o = fNetif->copyProperty("IOInterfaceUnit");
+    if (OSNumber *n = OSDynamicCast(OSNumber, o)) unit = int(n->unsigned32BitValue());
+    OSSafeReleaseNULL(o);
+  }
+  char ifOverride[48] = "(absent)";
+  if (fNetif) text(fNetif, "IOClassNameOverride", ifOverride, sizeof ifOverride);
+  note80211("identity (%s): controller class PianoWifi80211 < IO80211Controller, IOClassNameOverride %s; interface class %s, "
+            "IOClassNameOverride %s, IO80211InterfaceRole %s, IOInterfaceName %s, IOInterfaceNamePrefix %s, IOInterfaceUnit %d; "
+            "BSD %s", why, override, ifClass, ifOverride, role, name, prefix, unit, fIfName[0] ? fIfName : "(none yet)");
+}
+
+// IOClassNameOverride = "IO80211Controller" (ADOPTION.md P0): the one discovery input of 27.3's CoreWiFi that we lack. CoreWiFi
+// reads registry properties (it imports no IOObjectConformsTo), so the class-name chain that satisfies launchd and
+// SystemConfiguration says nothing to it.
+void PianoWifi80211::setOverride(bool on, bool onInterface)
+{
+  if (on) setProperty("IOClassNameOverride", "IO80211Controller");
+  else removeProperty("IOClassNameOverride");
+  if (fNetif) {
+    if (onInterface) fNetif->setProperty("IOClassNameOverride", "IO80211Controller");
+    else fNetif->removeProperty("IOClassNameOverride");
+  }
+}
+
 void PianoWifi80211::setUcMode(uint32_t mode, const char *why)
 {
   IOLockLock(fLock);
   const uint32_t was = fUcMode;
-  fUcMode = mode & 0x1f;
+  fUcMode = mode & 0x3f;
   IOLockUnlock(fLock);
+  using namespace pianowifi::a80211;
+  if ((fUcMode & (kUcOverride | kUcOverrideIf)) != (was & (kUcOverride | kUcOverrideIf)))
+    setOverride((fUcMode & kUcOverride) != 0, (fUcMode & kUcOverrideIf) != 0);
   // kUcControllerName takes effect at once; the interface's class is decided when the interface is made (a boot argument only).
   const bool name = (fUcMode & pianowifi::a80211::kUcControllerName) != 0;
   if (name != ((was & pianowifi::a80211::kUcControllerName) != 0)) {
@@ -660,9 +719,10 @@ void PianoWifi80211::setUcMode(uint32_t mode, const char *why)
       removeProperty("IOInterfaceName");
     }
   }
-  note80211("%s: user-client mode %#x (was %#x, %s): 0x1 a client offered, 0x2 the controller carries IOInterfaceName%s, "
-            "0x4 event payloads, 0x8 the interface's class (boot only), 0x10 the event pipe",
-            fIfName, unsigned(fUcMode), unsigned(was), why, name ? " (set now)" : "");
+  note80211("%s: stage mode %#x (was %#x, %s): 0x1 a user client offered, 0x2 the controller carries IOInterfaceName%s, "
+            "0x4 event payloads, 0x8 IOClassNameOverride on the controller, 0x10 the event pipe, 0x20 the override on the "
+            "interface too", fIfName, unsigned(fUcMode), unsigned(was), why, name ? " (set now)" : "");
+  noteIdentity(why);
 }
 
 // Every open logged, whoever asks and whatever it asks for: that is the question wm3 answers.
@@ -823,7 +883,7 @@ void PianoWifi80211::report(const char *why)
   const uint32_t ends = fState->listEnds, networks = fState->scan.count, powerSets = fState->powerSets;
   const bool power = fState->power;
   const uint32_t accept = fState->accept, accepted = fState->acceptedUnknown, ucMode = fUcMode, ucClients = fUcClients;
-  const uint64_t ucOpens = fUcOpens, ucRefused = fUcRefused, ucSelectors = fUcSelectors;
+  const uint64_t ucOpens = fUcOpens, ucRefused = fUcRefused, ucSelectors = fUcSelectors, serial = fScanSerial;
   const uint64_t stamp = requests + events + other;
   const bool changed = stamp != fReported;
   fReported = stamp;
@@ -843,12 +903,12 @@ void PianoWifi80211::report(const char *why)
   note80211("%s (%s): the controller's clients: %u (%s); user clients: %llu opened, %llu refused, %u alive, %llu selector call(s); "
             "modes accept %#x uc %#x", fIfName, why, clients, names, ucOpens, ucRefused, unsigned(ucClients), ucSelectors,
             unsigned(accept), unsigned(ucMode));
-  note80211("%s (%s): %llu request(s) of %u kind(s)%s, %llu unknown, %u answered by the accept mode; %u scan(s), %u "
+  note80211("%s (%s): %llu request(s) of %u kind(s)%s, %llu unknown, %u answered by the accept mode; %u scan(s) (serial %llu), %u "
             "result(s) served, %u list end(s), %u network(s); power %s (%u set(s)); %llu event(s), %llu refused; %llu other "
             "ioctl(s)",
             fIfName, why, requests, unsigned(kinds), overflow ? " (the kind table is full)" : "", unknown, unsigned(accepted),
-            unsigned(scans), unsigned(results), unsigned(ends), unsigned(networks), power ? "on" : "off", unsigned(powerSets),
-            events, eventErrors, other);
+            unsigned(scans), serial, unsigned(results), unsigned(ends), unsigned(networks), power ? "on" : "off",
+            unsigned(powerSets), events, eventErrors, other);
 }
 
 void PianoWifi80211::reportTick(thread_call_param_t p, thread_call_param_t)
