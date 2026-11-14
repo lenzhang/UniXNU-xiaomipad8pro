@@ -196,6 +196,10 @@ void PianoWifi80211::attachStep()
     return;
   }
   snprintf(fIfName, sizeof fIfName, "%s%u", ifnet_name(ifp), unsigned(ifnet_unit(ifp)));
+  // IO80211.framework finds the interface's service by the property IOInterfaceName (any class) and reads the role there; the
+  // family sets it with the name, this only makes sure of it.
+  const bool named = fNetif->getProperty("IOInterfaceName") != nullptr;
+  if (!named) fNetif->setProperty("IOInterfaceName", fIfName);
   iff_filter filter = {};
   filter.iff_cookie = this;
   filter.iff_name = "com.unixnu.driver.PianoWifi80211";
@@ -210,9 +214,9 @@ void PianoWifi80211::attachStep()
     note80211("%s: the interface filter was refused (%d): the apple80211 requests are not answered", fIfName, e);
     return;
   }
-  note80211("%s: apple80211 requests answered from now on (after %u ms); the BSD interface reads type %u, family %u, subfamily %u",
-            fIfName, fAttachTries * kAttachTickMs, unsigned(ifnet_type(ifp)), unsigned(ifnet_family(ifp)),
-            unsigned(ifnet_subfamily(ifp)));
+  note80211("%s: apple80211 requests answered from now on (after %u ms); the BSD interface reads type %u, family %u, subfamily %u; "
+            "IOInterfaceName %s", fIfName, fAttachTries * kAttachTickMs, unsigned(ifnet_type(ifp)), unsigned(ifnet_family(ifp)),
+            unsigned(ifnet_subfamily(ifp)), named ? "the family's" : "set here");
   postEvent(pianowifi::a80211::kEvPowerChanged);
   pianowifi::a80211::LinkEvent down = {};
   down.down = 1;

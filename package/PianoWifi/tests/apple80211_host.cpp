@@ -101,20 +101,22 @@ int main()
   // ---- the bind's three: DRIVER_VERSION with a 0x180-byte buffer, CARD_CAPABILITIES, STATUS_DEV_NAME
   {
     Rig r;
+    // 27.3: a 384-byte buffer, a NUL-terminated string from offset 0, zeros after it
     Answer a = r.ask(false, kDriverVersion, 0x180);
-    CHECK(a.error == 0 && a.wrote == sizeof(Version));
-    CHECK(r.u32(0) == 1);
-    uint16_t len;
-    std::memcpy(&len, r.at(4), 2);
-    CHECK(len == std::strlen(kId.driverVersion) && std::memcmp(r.at(6), kId.driverVersion, len) == 0 && r.at(6)[len] == 0);
+    CHECK(a.error == 0 && a.wrote == 0x180 && std::strcmp(reinterpret_cast<const char *>(r.at(0)), kId.driverVersion) == 0);
+    CHECK(r.at(0x17f)[0] == 0 && r.at(0x180)[0] == 0xa5);   // nothing beyond the buffer
     a = r.ask(false, kHardwareVersion, 0x180);
-    CHECK(a.error == 0 && std::memcmp(r.at(6), "WCN7860", 8) == 0);
-    a = r.ask(false, kCardCapabilities, 64);
-    CHECK(a.error == 0 && a.wrote == kCapBytes && r.rq.length == kCapBytes);
+    CHECK(a.error == 0 && std::strcmp(reinterpret_cast<const char *>(r.at(0)), "WCN7860") == 0);
+    // the bind's only sanity request on the ioctl path: CARD_CAPABILITIES with 23 bytes, a raw bitmap from offset 0
+    std::memset(r.user.mem.data(), 0xa5, 64);
+    a = r.ask(false, kCardCapabilities, 23);
+    CHECK(a.error == 0 && a.wrote == 23 && r.rq.length == 23 && r.at(23)[0] == 0xa5);
     for (uint8_t b : kCapBits) CHECK(r.at(0)[b / 8] & (1u << (b % 8)));
-    CHECK((r.at(0)[0] & 0x1) == 0);   // no WEP
+    CHECK((r.at(0)[0] & 0x1) == 0);                          // no WEP
+    CHECK((r.at(0)[46 / 8] & (1u << (46 % 8))) == 0);        // no wait for a scan-done event
+    CHECK((r.at(0)[73 / 8] & (1u << (73 % 8))) == 0);        // directed scans as SCAN_REQ
     a = r.ask(false, kStatusDevName, 1028);
-    CHECK(a.error == 0 && r.u32(0) == 1 && std::strcmp(reinterpret_cast<const char *>(r.at(4)), "PianoWifi") == 0);
+    CHECK(a.error == 0 && std::strcmp(reinterpret_cast<const char *>(r.at(0)), "PianoWifi") == 0);
     // a get without a buffer is refused (the bind always gives one)
     a = r.ask(false, kDriverVersion, 0x180, false);
     CHECK(a.error == kErrInval);
@@ -169,6 +171,8 @@ int main()
     CHECK(a.error == 0 && std::memcmp(r.at(0), "XX", 3) == 0 && r.rq.length == 3);
     // unknown requests, both ways
     CHECK(r.ask(false, kInfraEnumerated, 16).error == kErrUnsupported);
+    CHECK(r.ask(false, kVirtualIfRole, 8).error == kErrUnsupported);   // the infrastructure interface is not a virtual one
+    CHECK(r.ask(true, kInfraEnumerated, 8).error == kErrUnsupported);  // airportd ignores this set's result
     CHECK(r.ask(true, kAssociate, 656).error == kErrUnsupported);
     CHECK(r.ask(true, kCipherKey, 148).error == kErrUnsupported);
     CHECK(r.ask(false, 9999, 16).error == kErrUnsupported);
@@ -202,10 +206,13 @@ int main()
     r.rq.length = 0x80;
     r.rq.data = User::kBase;
     CHECK(scanReqSsidLength(r.rq, r.io) == 4);
-    Answer a = r.ask(true, kScanReq, 0x80);
+    Answer a = r.ask(true, kScanReq, 5528);
     CHECK(a.error == 0 && (a.effects & kDoScanStarted) && r.st.scanRequests == 1);
-    a = r.ask(false, kScanResult, sizeof(ScanResult));
-    CHECK(a.error == 0 && a.wrote == 1164);
+    // 27.3's 2280-byte record: the head and the elements written, its tail (a request identifier user space put at 0x88c) kept
+    std::memset(r.user.mem.data(), 0, kScanResultBytes27);
+    std::memcpy(r.user.mem.data() + 0x88c, "request-7", 10);
+    a = r.ask(false, kScanResult, kScanResultBytes27);
+    CHECK(a.error == 0 && a.wrote == 0x8c + 47 && std::memcmp(r.at(0x88c), "request-7", 10) == 0);
     ScanResult got;
     std::memcpy(&got, r.at(0), sizeof got);
     CHECK(got.version == 1 && got.channel.channel == 36 && (got.channel.flags & kChan5GHz) && got.rssi == -48 && got.noise == -95);
@@ -233,6 +240,7 @@ int main()
     // a short buffer: the head of the record
     a = r.ask(false, kScanResult, 0x8c);
     CHECK(a.error == 0 && a.wrote == 0x8c);
+    CHECK(resultBytes(got) == 0x8c + got.elementsLength);
     // SCANCACHE_CLEAR: nothing until the next scan; then the list again
     CHECK(r.ask(true, kScanCacheClear, 0, false).error == 0);
     CHECK(r.ask(false, kScanResult, sizeof(ScanResult)).error == kErrEndOfResults);

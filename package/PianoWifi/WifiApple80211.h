@@ -41,7 +41,7 @@ enum : int32_t {
   kScanResult = 11, kCardCapabilities = 12, kState = 13, kPhyMode = 14, kOpMode = 15, kRssi = 16, kNoise = 17, kPower = 19,
   kAssociate = 20, kAssociateResult = 21, kDisassociate = 22, kStatusDevName = 23, kSupportedChannels = 27, kLocale = 28,
   kDeauth = 29, kDriverVersion = 43, kHardwareVersion = 44, kRsnIe = 46, kCountryCode = 51, kRadioInfo = 54, kRsnConf = 77,
-  kPmkCache = 83, kScanReqMultiple = 86, kScanCacheClear = 90, kCurrentNetwork = 103, kOffloadRsn = 177, kChannelsInfo = 207,
+  kPmkCache = 83, kScanReqMultiple = 86, kVirtualIfRole = 96, kScanCacheClear = 90, kCurrentNetwork = 103, kOffloadRsn = 177, kChannelsInfo = 207,
   kHwSupportedChannels = 254, kScanControl = 360, kCurPmk = 376, kRsnXe = 457, kInfraEnumerated = 512, kHeCapability = 570,
   kSuspendInterface = 606, kAggressiveEdca = 607,
 };
@@ -83,6 +83,7 @@ inline const char *requestName(int32_t type)
   case kPmkCache: return "PMK_CACHE";
   case kScanReqMultiple: return "SCAN_REQ_MULTIPLE";
   case kScanCacheClear: return "SCANCACHE_CLEAR";
+  case kVirtualIfRole: return "VIRTUAL_IF_ROLE";
   case kCurrentNetwork: return "CURRENT_NETWORK";
   case kOffloadRsn: return "OFFLOAD_RSN";
   case kChannelsInfo: return "CHANNELS_INFO";
@@ -126,12 +127,19 @@ constexpr uint32_t kPhySupported = kPhyAuto | kPhy11a | kPhy11b | kPhy11g | kPhy
 // conservative scan-channel flags).
 enum : uint32_t { kChan20MHz = 0x2, kChan2GHz = 0x8, kChan5GHz = 0x10, kChanActive = 0x80 };
 // Card capabilities, the bit numbers of the bitmap: AES, AES-CCM, power management, short slot, short preamble, WPA2, short
-// guard interval at 20 MHz, TSN — sheng's set (what this station does: WPA2-PSK with CCMP, power save, 11n).
+// guard interval at 20 MHz, TSN — sheng's set (what this station does: WPA2-PSK with CCMP, power save, 11n). 27.3 (host analysis
+// 2026-11-14, docs/drivers/wifi-menu.md section 5.2): a raw 23-byte bitmap from offset 0, no version word, asked by
+// the bind (the only sanity request of the ioctl path: any error fails the bind); bit 46 would make airportd wait for a scan's
+// completion event and bit 73 choose SCAN_REQ_MULTIPLE for directed scans: neither is set.
 constexpr uint8_t kCapBits[] = {2, 3, 6, 9, 10, 14, 17, 19};
-constexpr uint32_t kCapBytes = 12;   // the raw bitmap's length (sheng: 12; 27.3's raw length not re-read: we copy what fits)
+constexpr uint32_t kCapBytes = 23;
 constexpr int kErrPowerOff = 82;      // EPWROFF on Darwin: "device power is off"
 constexpr int kErrNotAssociated = 2;  // ENOENT (sheng's answer for what needs an association)
-constexpr int kErrEndOfResults = 5;   // EIO after the last scan result (sheng's; the cursor starts again)
+// EIO after the last scan result (sheng's; the cursor starts again). 27.3's synchronous scan ends its result loop well only on a
+// get that returns exactly 5: whether the ioctl path hands it errno (then this works) or ioctl()'s -1 (then a scan over ioctls
+// always fails and only a user client can end it) was not settled on the host: the M1 boot's first question
+// (docs/drivers/wifi-menu.md section 5.7).
+constexpr int kErrEndOfResults = 5;
 constexpr int kErrUnsupported = 102;  // EOPNOTSUPP on Darwin
 constexpr int kErrInval = 22, kErrFault = 14;
 
@@ -141,8 +149,8 @@ struct Channel {
 };
 static_assert(sizeof(Channel) == 12, "channel");
 
-// {version, count, channels}: sheng's 24A446 list holds 401 entries (4824 bytes); the old macOS one 64. Only the count we have
-// is written, so either fits.
+// {version, count, channels}: 4824 bytes on 27.3 (count at 4, entries from 8, stride 12; user space does not bound the count:
+// at most 401), as sheng's 24A446 list. Only the entries we have are written.
 constexpr uint32_t kChannelsMax = 64;
 struct ChannelList {
   uint32_t version, count;
@@ -150,8 +158,11 @@ struct ChannelList {
 };
 static_assert(sizeof(ChannelList) == 8 + 12 * kChannelsMax, "channel list");
 
-// A scan result: 1164 bytes, the elements inline at 0x8c with their length at 0x8a (27.3's parser reads those two: REPORT.md
-// 2.3); the fields before them are sheng's 24A446 layout.
+// A scan result's head: the fields to the elements are sheng's 24A446 layout, which 27.3 keeps (the element length at 0x8a, preset
+// by user space to its capacity, the elements at 0x8c). 27.3's record is 2280 bytes: 2048 bytes of elements, then fields from
+// 0x88c (a request identifier user space puts there itself, a timestamp, an RSN priority, the AP's PHY mode, MLO flags). The
+// answer writes the head and the elements it has, never the tail (resultBytes()); 1024 bytes of elements are more than the
+// rebuilt ones ever take.
 struct ScanResult {
   uint32_t version;              // 0x00
   Channel channel;               // 0x04
@@ -170,12 +181,14 @@ struct ScanResult {
   uint16_t elementsLength;       // 0x8a
   uint8_t elements[1024];        // 0x8c
 };
+constexpr uint32_t kScanResultBytes27 = 2280;   // what airportd asks with (its SCAN_RESULT and CURRENT_NETWORK buffers)
 static_assert(sizeof(ScanResult) == 1164 && __builtin_offsetof(ScanResult, rssi) == 0x16 &&
               __builtin_offsetof(ScanResult, bssid) == 0x1c && __builtin_offsetof(ScanResult, ssidLength) == 0x60 &&
               __builtin_offsetof(ScanResult, ageMs) == 0x84 && __builtin_offsetof(ScanResult, elementsLength) == 0x8a &&
               __builtin_offsetof(ScanResult, elements) == 0x8c, "scan result layout");
 
-// POWER: {version, radios, state per radio}; 24 bytes (sheng's; 27.3 not re-read). The set reads state[0].
+// POWER: {version, radios, state per radio}; 24 bytes on 27.3 as in sheng's. The set reads state[0]; airportd's set first gets the
+// radio count, so radios must not be 0.
 struct Power {
   uint32_t version, radios, state[4];
 };
@@ -185,29 +198,22 @@ static_assert(sizeof(Power) == 24, "power");
 struct PhyMode {
   uint32_t version, supported, active;
 };
-// RSSI and NOISE: {version, radios, unit (0 dBm), per chain[4], aggregate, extension per chain[4], its aggregate} (sheng's).
+// RSSI and NOISE: {version, radios (0 is an error), unit (0 dBm), per chain[4], aggregate, extension per chain[4], its aggregate}:
+// 52 bytes on 27.3 as in sheng's.
 struct Rssi {
   uint32_t version, radios, unit;
   int32_t chain[4], aggregate, extChain[4], extAggregate;
 };
 static_assert(sizeof(Rssi) == 52, "rssi");
 
-// DRIVER_VERSION / HARDWARE_VERSION: {version, the string's length, the string}. airportd's bind asks with a 0x180-byte buffer
-// (REPORT.md 2.1); where it reads the string is not re-read: the string sits both after the 6-byte header (the old macOS
-// layout) ... see versionAnswer(): the layout used is kVersionLayout.
-constexpr uint32_t kVersionStringMax = 256;
-struct Version {
-  uint32_t version;
-  uint16_t length;
-  char string[kVersionStringMax];
-};
-static_assert(__builtin_offsetof(Version, string) == 6, "version");
+// DRIVER_VERSION / HARDWARE_VERSION: 27.3 asks with a 384-byte buffer and reads a NUL-terminated UTF-8 string from offset 0 (no
+// version word, no number checked; sheng's layout). airportd's interface set-up fails without a DRIVER_VERSION answer.
+constexpr uint32_t kVersionBytes = 384;
+// STATUS_DEV_NAME: not asked by 27.3's bind; answered like the versions (a string from offset 0), its layout not re-read.
+// COUNTRY_CODE: 3 bytes, a C string (27.3, as sheng's).
 
-// STATUS_DEV_NAME: {version, the device's name}.
-constexpr uint32_t kDevNameMax = 64;   // the old macOS buffer is MAXPATHLEN; we write what fits of ours
-// COUNTRY_CODE: the two letters and a NUL (sheng: a 3-byte buffer).
-
-// SCAN_REQ (the parts read): version, BSS type, BSSID, the SSID's length at 16 and its bytes at 20 (sheng's).
+// SCAN_REQ (the parts read; 5528 bytes on 27.3, SCAN_REQ_MULTIPLE 5352): version, BSS type, BSSID, the SSID's length at 16 and
+// its bytes at 20 (27.3, as sheng's).
 constexpr uint32_t kScanReqSsidLengthAt = 16, kScanReqSsidAt = 20;
 
 // ------------------------------------------------------------------------------------------------- our scan list, compact
@@ -293,6 +299,9 @@ inline uint32_t buildElements(const Bss &b, uint8_t *out, uint32_t capacity)
   return n;
 }
 
+// The bytes of a filled result to copy out: the head and the elements it has (never 27.3's tail, from 0x88c).
+inline uint32_t resultBytes(const ScanResult &r) { return uint32_t(__builtin_offsetof(ScanResult, elements)) + r.elementsLength; }
+
 inline void fillScanResult(ScanResult &r, const Bss &b)
 {
   uint8_t *raw = reinterpret_cast<uint8_t *>(&r);
@@ -369,7 +378,7 @@ struct UserIo {
 // The scratch buffer the kext gives the handler (never on the stack: the largest answer is the scan result, 1164 bytes, and the
 // channel list; the caller's kernel stack is the requesting thread's 16 KiB).
 constexpr uint32_t kScratchBytes = 2048;
-static_assert(sizeof(ScanResult) <= kScratchBytes && sizeof(ChannelList) <= kScratchBytes && sizeof(Version) <= kScratchBytes,
+static_assert(sizeof(ScanResult) <= kScratchBytes && sizeof(ChannelList) <= kScratchBytes && kVersionBytes <= kScratchBytes,
               "the scratch buffer holds every answer");
 
 namespace detail {
@@ -483,19 +492,11 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
   switch (rq.type) {
   case kDriverVersion:
   case kHardwareVersion:
-  case kStatusDevName: {
+  case kStatusDevName: {   // a NUL-terminated string from offset 0, the rest of the buffer zeros
     const char *text = rq.type == kDriverVersion ? id.driverVersion : rq.type == kHardwareVersion ? id.hardwareVersion : id.devName;
-    Version *v = reinterpret_cast<Version *>(scratch);
-    v->version = 1;
-    const uint32_t n = strLen(text, rq.type == kStatusDevName ? kDevNameMax - 1 : kVersionStringMax - 1);
-    if (rq.type == kStatusDevName) {   // {version, name}
-      for (uint32_t i = 0; i < n; ++i) scratch[4 + i] = uint8_t(text[i]);
-      a.error = copyOut(rq, io, scratch, 4 + kDevNameMax, a);
-      return a;
-    }
-    v->length = uint16_t(n);
-    for (uint32_t i = 0; i < n; ++i) v->string[i] = text[i];
-    a.error = copyOut(rq, io, v, sizeof *v, a);
+    const uint32_t n = strLen(text, kVersionBytes - 1);
+    for (uint32_t i = 0; i < n; ++i) scratch[i] = uint8_t(text[i]);
+    a.error = copyOut(rq, io, scratch, kVersionBytes, a);
     return a;
   }
   case kCardCapabilities: {
@@ -545,6 +546,9 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
   case kAssociateResult:
     a.error = value(rq, io, 0, a);   // pending: nothing was asked
     return a;
+  case kVirtualIfRole:   // an answer would make airportd take the interface for a virtual one: the infrastructure one has none
+    a.error = kErrUnsupported;
+    return a;
   case kAuthType:
     w[0] = 1;
     w[1] = 1;   // open system
@@ -574,7 +578,7 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     ScanResult *r = reinterpret_cast<ScanResult *>(scratch);
     fillScanResult(*r, s.scan.bss[s.cursor++]);
     ++s.resultsServed;
-    a.error = copyOut(rq, io, r, sizeof *r, a);
+    a.error = copyOut(rq, io, r, resultBytes(*r), a);
     return a;
   }
   default:
