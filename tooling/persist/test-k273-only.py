@@ -679,9 +679,18 @@ def test_session(tmp, out, dual, seed273, inputs):
     log = run('k273-store-grow', *V2, expect=3)
     check('no verified NAS backup of linux_data-k273-store' in log and tp.read(lun0, nf * B, B) == head0,
           'k273-store-grow without the old store\'s backup: refused, nothing written')
+    log = run('map', 'k273-store-backup', *esp)
     st = state()
-    st['backups']['linux_data-k273-store'] = {'file': 'linux_data-k273-store.img', 'sha256': '0' * 64, 'verified': True}
-    state_path.write_text(json.dumps(st))
+    folder = nas / st['backup_name']
+    kept = st['backups'].get('linux_data-k273-store') or {}
+    runs_text = (folder / 'linux_data-k273-store-runs.txt').read_text() if kept else ''
+    want = b''.join(pages[i] for i in present)   # the runs joined across gaps of up to 32 pages: 0-2, 1000-1003, 40000, the last
+    pieces = [tp.read(lun0, (STORE_LBA + 1 + bo + a) * B, (b - a + 1) * B) for a, b in ((0, 2), (1000, 1003), (40000, 40000), (po - 1, po - 1))]
+    check(kept.get('sparse', {}).get('present') == 9 and kept.get('bytes') == 9 * B and
+          (folder / kept.get('file', 'x')).read_bytes() == b''.join(pieces) == want and len(runs_text.splitlines()) == 4 and
+          'linux_data-k273-store-runs.txt' in (folder / 'SHA256SUMS').read_text() and
+          (folder / 'linux_data-k273-store-head.img').read_bytes() == tp.read(lun0, STORE_LBA * B, (1 + bo) * B),
+          'k273-store-backup: only what differs from the seed (header, bitmap, the 9 present pages in 4 runs), runs list in SHA256SUMS')
     log = run('k273-store-grow', '--esp', 'esp-k273-v2x.img', expect=3)
     check('FAIL  the new seed is the old one with zeros appended' in log and tp.read(lun0, nf * B, B) == head0,
           'k273-store-grow to a seed that is not the old one grown: refused, nothing written')
@@ -699,6 +708,15 @@ def test_session(tmp, out, dual, seed273, inputs):
           tp.read(lun0, ROOTFS_FIRST * B, len(root_new)) == bytes(root_new) and esp_region() == v2['sha256'] and
           json.loads((out / 'installed.json').read_text())['image'] == 'esp-k273-v2.img',
           'the session: 9 pages in 4 runs, the root on linux_rootfs, the v2 ESP installed, check reads the grown store as the one it resumes')
+    # rollback k273-store-backup over a damaged old window: the pages, then the header and bitmap, back
+    for i in (1, 40000):
+        tp.write_at(lun0, (STORE_LBA + 1 + bo + i) * B, os.urandom(B))
+    tp.write_at(lun0, (STORE_LBA + 1) * B, os.urandom(B))
+    run('map', '--esp', 'esp-k273-v2.img')
+    run('rollback', 'k273-store-backup', '--esp', 'esp-k273-v2.img')
+    check(tp.sha_region(lun0, STORE_LBA * B, (1 + bo) * B) == old_window[0] and
+          all(tp.read(lun0, (STORE_LBA + 1 + bo + i) * B, B) == pages[i] for i in present),
+          'rollback k273-store-backup: the present pages, the bitmap and the header as backed up')
     root_old = bytearray(root_new)
     root_old[B:] = os.urandom(15 * B)
     (tmp / 'root-old.img').write_bytes(bytes(root_old))

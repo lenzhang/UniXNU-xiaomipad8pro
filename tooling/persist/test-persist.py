@@ -193,6 +193,23 @@ def fake_tablet(root, pp, argv):
                 n = min(256 * B, length - off)
                 write_at(path, dst + off, read(path, src + off, n))
             return f'copied={a[3]}'
+        if cmd == 'send-list':
+            runs = [tuple(int(x) for x in line.split()) for line in (pp / a[0]).read_text().splitlines() if line.strip()]
+            s = socket.create_connection(('127.0.0.1', int(a[2])))
+            for first, _, count in runs:
+                path, start, length = region(nodes, a[1], first, count, B)
+                s.sendall(read(path, start, length))
+            s.close()
+            return 'sent=0'
+        if cmd == 'restore-list':
+            runs = [tuple(int(x) for x in line.split()) for line in (pp / a[0]).read_text().splitlines() if line.strip()]
+            n = 0
+            for k, (_, d, count) in enumerate(runs):
+                data = http_get(a[2], f'{a[3]}@{k}')
+                path, start, _ = region(nodes, a[1], d, count, B)
+                write_at(path, start, data)
+                n += count
+            return f'restored={n}'
         if cmd in ('copy-list', 'hash-list'):
             runs = [tuple(int(x) for x in line.split()) for line in (pp / a[0]).read_text().splitlines() if line.strip()]
             h, n = hashlib.sha256(), 0

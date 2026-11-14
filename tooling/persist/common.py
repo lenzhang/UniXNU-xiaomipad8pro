@@ -255,6 +255,17 @@ def bit_runs(bitmap, pages):
     return runs
 
 
+def merge_runs(runs, gap=32):
+    """RUNS (first page, count) with gaps of at most GAP pages joined (fewer dd calls; the joined clear pages are copied as they are)."""
+    out = []
+    for first, count in runs:
+        if out and first - (out[-1][0] + out[-1][1]) <= gap:
+            out[-1] = (out[-1][0], first + count - out[-1][0])
+        else:
+            out.append((first, count))
+    return out
+
+
 def entry_uses_rootfs(entry):
     """Why a unixnu.toml entry (a dict) would use linux_rootfs, or None. NativeUfs mounts its root from linux_rootfs unless
     native-ufs-root-part names another partition, and the Data store lives on the root partition (store_args_of), so an entry that

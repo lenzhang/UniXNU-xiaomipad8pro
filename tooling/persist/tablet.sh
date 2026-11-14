@@ -128,6 +128,23 @@ hash-list)   # FILE DEV COLUMN: the SHA-256 of FILE's runs read from the medium 
 		dd if="/dev/$2" bs=4096 skip="$at" count="$c" 2>/dev/null
 	done < "$P/$1" | sha256sum | cut -d' ' -f1 | sed 's/^/sha256=/'
 	;;
+send-list)   # FILE DEV PORT: FILE's runs (column 1: the SRC blocks, COUNT) read from /dev/DEV in order, one stream to the host
+	[ -f "$P/$1" ] || die "no $1"
+	while read -r s d c; do
+		dd if="/dev/$2" bs=4096 skip="$s" count="$c" 2>/dev/null
+	done < "$P/$1" | nc "$(host_ip)" "$3"
+	echo "sent=$?"
+	;;
+restore-list)   # FILE DEV PORT NAME: run K of FILE from the host's NAME@K, written at its DST blocks (column 2) of /dev/DEV; one sync
+	[ -f "$P/$1" ] || die "no $1"
+	k=0; n=0
+	while read -r s d c; do
+		wget -q -O - "http://$(host_ip):$3/$4@$k" | dd of="/dev/$2" bs=4096 seek="$d" conv=notrunc 2>"$P/dd.err" || { cat "$P/dd.err"; die "restore-list run $k"; }
+		k=$((k + 1)); n=$((n + c))
+	done < "$P/$1"
+	sync
+	echo "restored=$n"
+	;;
 write)
 	dd if="$P/$1" of="/dev/$2" bs="$4" seek="$3" conv=notrunc,fsync 2>"$P/dd.err" || { cat "$P/dd.err"; die "dd write"; }
 	tail -1 "$P/dd.err"; echo "written=$1"
@@ -180,6 +197,6 @@ zero)
 	tail -1 "$P/dd.err"; echo "zeroed=$1 bytes=$bytes"
 	;;
 *)
-	die "usage: tablet.sh map|hash|zero-sha|peek|send|fetch|file-sha|copy|copy-list|hash-list|write|restore|job|job-status|drop-caches|rereadpt|discard-info|discard|zero"
+	die "usage: tablet.sh map|hash|zero-sha|peek|send|fetch|file-sha|copy|copy-list|hash-list|send-list|restore-list|write|restore|job|job-status|drop-caches|rereadpt|discard-info|discard|zero"
 	;;
 esac

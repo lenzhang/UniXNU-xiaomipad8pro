@@ -827,7 +827,11 @@ Data store on all of linux_data (`data-store-part=linux_data`, `data-store-lba=7
 24 GiB seed with zeros appended to 200 GiB (`compact-seed.py --grow-gib 200 --disk-only`: the same 276 extents), so the owner's store
 is carried over instead of starting a fresh Data:
 
-1. `k273-store-backup`: the installed store's window (LBA 117998394, 6291649 blocks) to the backup disk with the three checks.
+1. `k273-store-backup`: only what differs from the seed we flashed (owner, 2026-11-14): the installed store's header and presence
+   bitmap (LBA 117998394, 193 blocks) with the three checks, then its present pages (about 534551, joined across gaps of up to 32
+   pages; `tablet.sh send-list`) as one stream whose tablet-side SHA-256 = the received = the stored copy re-read without cache, and
+   the runs list (in SHA256SUMS). A clear bit reads the seed's page, which the old ESP image holds. Rollback: `restore-list` (one
+   HTTP range per run), read back, then the header and bitmap.
 2. `linux-data-root --root-part linux_rootfs`: the root image onto the cleared linux_rootfs, read back (only after `rootfs-clear`).
 3. `k273-store-grow`: refused unless the new seed is the old one grown (the extents compared in both ESP images), the windows do not
    meet, the old header is the installed seed's and bound to its LBA, and the old store's backup is verified. The old bitmap comes to

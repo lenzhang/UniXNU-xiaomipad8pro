@@ -179,7 +179,7 @@ class Session:
         self.state = json.loads(self.state_path.read_text()) if self.state_path.is_file() else {}
         self.env = self.piano_env()
         self.serial = self.env.get('PIANO_SERIAL', '<PIANO_SERIAL>')
-        self.http, self.files, self.dry_failures = None, {}, []
+        self.http, self.files, self.dry_failures, self.slices = None, {}, [], {}
         if a.new_backup and self.execute:
             self.state.pop('backup_name', None)
             self.state.pop('backups', None)
@@ -439,7 +439,25 @@ class Session:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                path = session.files.get(self.path.lstrip('/'))
+                name = self.path.lstrip('/')
+                base, _, k = name.rpartition('@')
+                if base in session.slices and k.isdigit():   # NAME@K: the K-th byte range of a file (restore-list)
+                    src, ranges = session.slices[base]
+                    if int(k) >= len(ranges):
+                        self.send_error(404)
+                        return
+                    at, left = ranges[int(k)]
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(left))
+                    self.end_headers()
+                    with open(src, 'rb') as f:
+                        f.seek(at)
+                        while left:
+                            chunk = f.read(min(MiB, left))
+                            self.wfile.write(chunk)
+                            left -= len(chunk)
+                    return
+                path = session.files.get(name)
                 gz = isinstance(path, tuple)
                 if not path or not (path[1] if gz else path).is_file():
                     self.send_error(404)
@@ -461,14 +479,20 @@ class Session:
         self.http = http.server.ThreadingHTTPServer((self.host_ip(), self.a.http_port), Handler)
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
 
+    def serve_slices(self, name, path, ranges):
+        """HTTP NAME@K: bytes RANGES[K] = (offset, length) of PATH (tablet.sh restore-list)."""
+        self.slices[name] = (Path(path), list(ranges))
+        self.log(f'  host  serves {name}@0..{len(ranges) - 1} ({Path(path).name}, {len(ranges)} ranges)')
+        self.serve({})
+
     def fetch(self, name, path, digest):
         """The tablet downloads a host file to /run/pp/NAME and checks its SHA-256."""
         self.serve({name: path})
         return self.t('fetch', name, digest, self.a.http_port, timeout=900)
 
-    def receive(self, dev, skip, count, bs, dests):
+    def receive(self, dev, skip, count, bs, dests, send=None):
         """The tablet streams a region to the host over one TCP connection; written to every path in DESTS. Returns
-        (bytes, sha256) of what arrived."""
+        (bytes, sha256) of what arrived. SEND: another tablet.sh command that streams COUNT * BS bytes to the port (send-list)."""
         total = count * bs
         server = socket.create_server((self.host_ip(), self.a.nc_port))
         server.settimeout(120)
@@ -502,10 +526,11 @@ class Session:
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
+        argv = send or ('send', dev, skip, count, bs, self.a.nc_port)
         if total > 256 * MiB:
-            self.job(f'send-{skip}', 'send', dev, skip, count, bs, self.a.nc_port, timeout=4 * 3600)
+            self.job(f'send-{skip}', *argv, timeout=4 * 3600)
         else:
-            self.t('send', dev, skip, count, bs, self.a.nc_port, timeout=600)
+            self.t(*argv, timeout=600)
         thread.join(4 * 3600)
         server.close()
         if 'error' in got:
@@ -943,31 +968,118 @@ def installed_k273_store(s):
 
 @step('k273-store-backup', 'maintenance, read only on the tablet; writes the backup of the installed 27.3 Data store')
 def k273_store_backup(s):
-    """The installed 27.3 Data store (the window on linux_data that the installed ESP's record names), backed up with the three
-    checks before a new ESP starts another store (e.g. a larger window that overlaps this one). Read only on the tablet.
-    rollback k273-store-backup writes it back to the same window (then the old ESP resumes it)."""
+    """The installed 27.3 Data store (the window on linux_data that the installed ESP's record names), backed up before a new ESP
+    starts another store (e.g. a larger window over this one). Read only on the tablet. Only what differs from the seed we flashed
+    is copied (owner, 2026-11-14): a clear bit reads the seed's page, which the ESP image of that seed holds. So: the header and the
+    presence bitmap (backup's three checks), then the present pages' runs (joined across gaps of up to 32 pages) read on the tablet
+    in order as one stream: the tablet's SHA-256 of the runs = the bytes received = the stored copy re-read without cache; the runs
+    list beside it (in SHA256SUMS and manifest.json). No present page: the header and bitmap only. rollback k273-store-backup
+    writes the pages, then the header and bitmap, back to the same window (then the old ESP resumes it)."""
     name, store = installed_k273_store(s)
     map_nodes(s)
     first, blocks = store['first_lba'], store['blocks']
+    seed = s.esp_record(name)['seed']
+    pages = seed['pages']
+    bo = common.bitmap_blocks(pages)
     s.need(common.DATA_FIRST <= first and first + blocks <= common.DATA_LAST + 1,
            f'the installed store\'s window LBA {first}-{first + blocks - 1} lies inside linux_data')
-    s.backup('linux_data-k273-store', s.nodes['lun0'], first, blocks, B,
-             f'LUN 0 LBA {first}-{first + blocks - 1}: the installed 27.3 Data store ({name}, bound to LBA {first})')
-    if s.execute:
-        s.save(k273_store_backup={'first': first, 'blocks': blocks, 'esp': name})   # where it goes back, whatever is installed later
+    s.need(blocks == 1 + bo + pages, f'its window: header, {bo} bitmap blocks, {pages} pages')
+    lun0 = s.nodes['lun0']
+    h = s.t('peek', lun0, first, 0, 128)
+    if h:
+        header = common.store_header(bytes.fromhex(h['hex']))
+        s.need(header['state'] == 'valid' and common.store_usable(header, seed) and header.get('bound_lba') == first,
+               f'the store at LBA {first}: valid, of seed {seed["identity_sha256"][:16]}, bound to LBA {first} ({header})')
+    s.backup('linux_data-k273-store-head', lun0, first, 1 + bo, B,
+             f'LUN 0 LBA {first}-{first + bo}: the installed 27.3 Data store\'s header and presence bitmap ({name})')
+    runs_name, pages_name = 'linux_data-k273-store-runs.txt', 'linux_data-k273-store-pages.img'
+    if not s.execute:
+        s.t('fetch', 'k273-store-runs.txt', '<sha256>', s.a.http_port)
+        s.t('job', 'sha-k273-pages', 'hash-list', 'k273-store-runs.txt', lun0, 1)
+        s.t('send-list', 'k273-store-runs.txt', lun0, s.a.nc_port)
+        s.log(f'  check the present pages\' runs: received = the tablet\'s sha256; {pages_name} re-read without cache = the same')
+        return
+    nas, _ = s.nas()
+    head_entry = s.state['backups']['linux_data-k273-store-head']
+    head_path = (s.dir if head_entry.get('local') else nas) / head_entry['file']
+    head = head_path.read_bytes()
+    s.need(hashlib.sha256(head).hexdigest() == head_entry['sha256'], f'the stored header and bitmap read back ({head_path.name})')
+    bitmap = head[B:]
+    exact = common.bit_runs(bitmap, pages)
+    present = sum(c for _, c in exact)
+    runs = common.merge_runs(exact)
+    copied = sum(c for _, c in runs)
+    s.log(f'  info  the store holds {present} pages beyond its seed in {len(exact)} runs; {copied} pages in {len(runs)} joined runs '
+          f'({copied * B >> 20} MiB) instead of the {blocks * B >> 30} GiB window')
+    (nas / runs_name).write_text(''.join(f'{first + 1 + bo + i} {first + 1 + bo + i} {c}\n' for i, c in runs))
+    runs_sha = s.sha_nocache(nas / runs_name)
+    backups = dict(s.state.get('backups', {}))
+    backups['linux_data-k273-store-runs'] = {'file': runs_name, 'sha256': runs_sha, 'bytes': (nas / runs_name).stat().st_size,
+                                             'what': f'the runs of present pages (first block, first block, blocks) of the store at LBA '
+                                                     f'{first}', 'verified': True, 'time': time.strftime('%Y-%m-%d %H:%M:%S')}
+    sparse = {'head': 'linux_data-k273-store-head', 'runs': 'linux_data-k273-store-runs', 'first': first, 'pages': pages,
+              'present': present, 'runs_count': len(runs), 'copied_pages': copied, 'seed': seed['identity_sha256']}
+    if not runs:
+        s.log('  info  no page differs from the seed: the header and bitmap are the whole backup')
+        backups['linux_data-k273-store'] = dict(head_entry, sparse=sparse)
+    else:
+        s.fetch('k273-store-runs.txt', nas / runs_name, runs_sha)
+        want = s.job('sha-k273-pages', 'hash-list', 'k273-store-runs.txt', lun0, 1, timeout=7200)['sha256']
+        old = backups.get('linux_data-k273-store') or {}
+        if old.get('verified') and old.get('sha256') == want and (old.get('sparse') or {}).get('first') == first and \
+                (nas / pages_name).is_file() and s.sha_nocache(nas / pages_name) == want:
+            s.log(f'  ok    the present pages are backed up and verified already (sha256 {want[:16]})')
+        else:
+            n, got = s.receive(lun0, 0, copied, B, [nas / pages_name], send=('send-list', 'k273-store-runs.txt', lun0, s.a.nc_port))
+            s.need(n == copied * B and got == want, f'the present pages received: {n} bytes, sha256 {got} = the tablet\'s {want}')
+            again = s.sha_nocache(nas / pages_name)
+            s.need(again == want, f'{pages_name} read back without cache: {again}')
+        backups['linux_data-k273-store'] = {'file': pages_name, 'sha256': want, 'bytes': copied * B, 'dev': lun0, 'bs': B,
+                                            'what': f'the present pages of the store at LBA {first} ({name}), runs in {runs_name}',
+                                            'verified': True, 'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'local': False,
+                                            'sparse': sparse}
+    s.save(backups=backups)
+    s.write_manifest(nas, backups)
+    s.save(k273_store_backup={'first': first, 'blocks': blocks, 'esp': name, 'sparse': True})   # where it goes back
 
 
 @rollback('k273-store-backup')
 def k273_store_backup_back(s):
-    """The 27.3 Data store as step k273-store-backup saved it, written back to its window and read back: the Data of that moment;
-    only with the ESP of that store (its record's LBA and seed) on the tablet afterwards."""
+    """The 27.3 Data store as step k273-store-backup saved it, written back to its window and read back: the present pages run by
+    run (restore-list), then the header and bitmap; the Data of that moment, only with the ESP of that store (its record's LBA and
+    seed) on the tablet afterwards."""
     saved = s.state.get('k273_store_backup') or {}
     if 'first' not in saved:
         raise Stop('this session has no k273-store-backup (its window is recorded with the backup): nothing to put back')
     first = saved['first']
     s.log(f'  info  the store of {saved.get("esp")} goes back to LBA {first} ({saved.get("blocks")} blocks); install that ESP again after it')
     map_nodes(s)
-    s.restore('linux_data-k273-store', s.nodes['lun0'], first, B)
+    lun0 = s.nodes['lun0']
+    entry = s.require_backup('linux_data-k273-store')
+    sparse = (entry or {}).get('sparse')
+    if entry and not sparse:   # a whole-window backup of before
+        s.restore('linux_data-k273-store', lun0, first, B)
+        return
+    nas, _ = s.nas()
+    if s.execute and sparse.get('runs_count'):
+        runs_entry = s.require_backup(sparse['runs'])
+        runs_path, pages_path = nas / runs_entry['file'], nas / entry['file']
+        s.need(s.sha_nocache(runs_path) == runs_entry['sha256'] and s.sha_nocache(pages_path) == entry['sha256'],
+               'the runs list and the pages still hash to their records')
+        ranges, at = [], 0
+        for line in runs_path.read_text().splitlines():
+            count = int(line.split()[2])
+            ranges.append((at, count * B))
+            at += count * B
+        s.fetch('k273-store-runs.txt', runs_path, runs_entry['sha256'])
+        s.serve_slices('k273-store-pages', pages_path, ranges)
+        if s.write(f'{len(ranges)} runs of present pages -> their places in the window at LBA {first}'):
+            s.job('restore-k273-pages', 'restore-list', 'k273-store-runs.txt', lun0, s.a.http_port, 'k273-store-pages', timeout=4 * 3600)
+        got = s.job('check-k273-pages', 'hash-list', 'k273-store-runs.txt', lun0, 2, timeout=7200)['sha256']
+        s.need(got == entry['sha256'], f'the pages read back: {got[:16]} = {entry["sha256"][:16]}')
+    elif not s.execute:
+        s.log('  check the runs list and the pages hash to their records; restore-list; hash-list = the pages\' sha256')
+    s.restore('linux_data-k273-store-head', lun0, first, B)   # the header and bitmap last
 
 
 def esp_seed_regions(record):
