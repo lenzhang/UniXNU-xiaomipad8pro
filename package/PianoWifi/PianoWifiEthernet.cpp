@@ -20,6 +20,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOBSD.h>   // kIOBSDNameKey
+#include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/kpi_mbuf.h>
 #include <net/kpi_interface.h>
@@ -55,6 +56,8 @@ class PianoWifiEthernet : public IOEthernetController {
 
   IOEthernetInterface *fInterface = nullptr;
   IONetworkMedium *fMedium = nullptr;
+  bool fTakeEn0 = false;   // piano-wifi-en0=1: take over PianoNullEthernet's built-in en0 (its address, primary)
+  bool takeOverEn0();
   // A work loop of its own (PianoUsbNet's pattern). Boot 10g: without one the controller had its provider's (IOResources,
   // none), the family's command gate never ran, and en0 was UP and RUNNING in ifconfig while enable() was never called and
   // not one frame reached outputPacket.
@@ -231,9 +234,54 @@ UInt32 PianoWifiEthernet::outputPacket(mbuf_t packet, void *)
   return kIOReturnOutputSuccess;
 }
 
+// piano-wifi-en0=1: the Wi-Fi interface becomes the built-in en0. PianoNullEthernet publishes en0 at boot (TimeSync takes
+// its clock identifier from a built-in interface's address once, at its start, and WindowServer waits for that); once level
+// 6 is up and this driver starts, PianoNullEthernet is terminated, its interface leaves the network stack, and this one
+// registers with the same address (02:50:49:41:4e:01, which PianoWifi then gives the firmware's virtual device too), built
+// in and primary — so configd's saved naming gives it en0 again. Off by default: the interface takes its own address and the
+// next free unit (boot 10i). Returns true once no interface is named en0 any more.
+bool PianoWifiEthernet::takeOverEn0()
+{
+  OSDictionary *matching = IOService::serviceMatching("PianoNullEthernet");
+  IOService *null = matching ? IOService::copyMatchingService(matching) : nullptr;
+  OSSafeReleaseNULL(matching);
+  if (null) {
+    note("en0: PianoNullEthernet is asked to stand down (piano-wifi-en0=1)");
+    null->terminate();
+    null->release();
+  } else {
+    note("en0: no PianoNullEthernet to stand down");
+  }
+  for (unsigned i = 0; i < 100; ++i) {
+    OSDictionary *named = IOService::serviceMatching("IONetworkInterface");
+    OSDictionary *props = OSDictionary::withCapacity(1);
+    OSString *en0 = OSString::withCString("en0");
+    IOService *still = nullptr;
+    if (named && props && en0) {
+      props->setObject(kIOBSDNameKey, en0);
+      named->setObject(gIOPropertyMatchKey, props);
+      still = IOService::copyMatchingService(named);
+    }
+    OSSafeReleaseNULL(named);
+    OSSafeReleaseNULL(props);
+    OSSafeReleaseNULL(en0);
+    if (!still) {
+      note("en0: free after %u ms", i * 100);
+      return true;
+    }
+    still->release();
+    IOSleep(100);
+  }
+  note("en0: still taken after 10 s: the interface keeps its own name");
+  return false;
+}
+
 bool PianoWifiEthernet::start(IOService *provider)
 {
   if (!IOEthernetController::start(provider)) return false;
+  uint32_t takeEn0 = 0;
+  if (!PE_parse_boot_argn("piano-wifi-en0", &takeEn0, sizeof takeEn0)) takeEn0 = 0;
+  fTakeEn0 = takeEn0 != 0;
   // PianoWifi is the service that published the resource this driver matched: its properties are the scan's.
   OSDictionary *matching = IOService::serviceMatching("PianoWifi");
   IOService *wifi = matching ? IOService::waitForMatchingService(matching, kWaitNs) : nullptr;
@@ -260,7 +308,9 @@ bool PianoWifiEthernet::start(IOService *provider)
     return false;
   }
   fInterface->setProperty(kIOBuiltin, true);
-  fInterface->setProperty(kIOPrimaryInterface, false);   // PianoNullEthernet keeps the primary built-in en0 (TimeSync)
+  // PianoNullEthernet keeps the primary built-in en0 (TimeSync), unless this interface takes it over (piano-wifi-en0=1).
+  const bool en0Free = fTakeEn0 && takeOverEn0();
+  fInterface->setProperty(kIOPrimaryInterface, en0Free);
   fInterface->registerService(kIOServiceSynchronous);
   // PianoWifi's network boundary: from here its thread may hand frames and the link's state to this driver.
   piano_wifi_net_client client;

@@ -2772,6 +2772,12 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
   // join profile already set that names the station's address gives the device that address (en1 takes the same).
   options.handOff = gArgs.level >= 7 && !(gArgs.l6pre & kPreNoScan);
   if (gArgs.level >= 7) options.ownMacSet = profileOwnMac(options.ownMac);
+  // piano-wifi-en0=1: the station takes PianoNullEthernet's address, as PianoWifiEthernet then takes over its en0.
+  if (!options.ownMacSet && bootArg("piano-wifi-en0", 0)) {
+    const uint8_t en0[6] = {0x02, 0x50, 0x49, 0x41, 0x4e, 0x01};
+    for (unsigned i = 0; i < 6; ++i) options.ownMac[i] = en0[i];
+    options.ownMacSet = true;
+  }
   note("level 6: before the virtual device (piano-wifi-l6pre=%#x): hardware mode %u, the radio's parameters %u, the channel "
        "list %u (the regulatory event waited for %u, up to %u ms), a usable device address %u, paced %u ms, no scan %u",
        gArgs.l6pre, (gArgs.l6pre & kPreHwMode) ? 1u : 0u, (gArgs.l6pre & kPrePdevParams) ? 1u : 0u,
