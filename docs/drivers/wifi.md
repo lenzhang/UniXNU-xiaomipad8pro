@@ -324,6 +324,9 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-l7file=0`, `piano-wifi-l7cands=N` | 1, 4 | `0`: the join profile only through the sysctl (by default the kext also reads the root-only file `/private/var/db/piano-wifi/profile` itself every 2 s while it waits, with the helper's checks); how many access points of the profile's name are tried in turn (at most 6) |
 | `piano-wifi-l7tries=N`, `piano-wifi-l7frame=MS`, `piano-wifi-l7step=MS`, `piano-wifi-l7scans=N` | 3, 500, 3000, 3 | the tries of the authentication and of the association request, the wait for each answer (the association's is twice it), the wait for a command's answer (the start response, the peer map, the confirmation, the teardown's), and how many scans of its own level 7 runs when the network is not in the list |
 | `piano-wifi-l8=N` | `0x37` = 55 (since boot 10f: software ring 1 and the rings at level 6's start; `0x17` before) | level 8's switches (§13.6, `WifiDp.h` `kL8*`): `0x01` the receive buffers return to software ring 1 (off: the firmware's own manager, as at levels 6 and 7), `0x02` the receive ring selection for both radio buffer rings, `0x04` the data path's rings programmed at all (off: level 8 is level 7), `0x08` EAPOL frames also to en0, `0x10` the transmit side, `0x20` the rings programmed at level 6's start instead of level 7's (10c's reset there was the stack overflow, not the rings) |
+| `piano-wifi-sleepoff=1` | 0 at level 8, 1 below | power the radio off at a system sleep (it then stays off until the next boot). By default at level 8 the radio stays on through the sleep: nothing is stopped (suspend-to-idle freezes the ladder's thread with every other); at the wake the association is as the firmware kept it, or it ended and the rejoin takes it up |
+| `piano-wifi-rejoin=0` | 1 at level 8 | when an association ends (the access point's deauthentication or disassociation, a beacon miss, a kickout, the 802.1X client's `LEAVE`, our own leave) or a join fails, end the level (as before). By default level 7 joins again from the profile after 2, 5, 10, 20, 30, then 60 s (back to 2 s after a port that opened); never after a stop, a dead chip or no profile |
+| `piano-wifi-droptest=S` | 0 | a test: S s after the port first opens the station leaves its association once (our deauthentication), so that an unattended boot shows the rejoin |
 | `piano-wifi-en0=1` | 0 | the Wi-Fi interface takes over the built-in `en0`: PianoWifiEthernet terminates PianoNullEthernet when it starts (after level 6; TimeSync and WindowServer have had their built-in interface since the boot), waits for `en0` to leave the network stack (at most 10 s) and registers built in and primary with PianoNullEthernet's address `02:50:49:41:4e:01`, which level 6 then gives the firmware's virtual device too, so the saved naming (NetworkInterfaces.plist) gives it `en0`. Off: the station has its own address `...:04` and the next free unit (since boot 10i) |
 | `piano-wifi-l8blocks=N`, `piano-wifi-l8tracems=MS` | 7, 5 (50 before boot 10f) | program the data path's register blocks 0..N only (`WifiDp.h` `DpBlock`: 0 two reads, 1 TCL ring 1, 2 WBM2SW0, 3 REO2SW1, 4 REO2SW0, 5 WBM2SW3, 6 the idle link ring, 7 the reorder unit's set-up; below 7 level 8 does not run), and how long the ladder waits after each block's line (printed at once, not held) before the block's first access |
 | `piano-wifi-l8status=MS` | 5000 | how often level 8 logs its counters while associated (at least 500; `0`: only at the association's end) |
@@ -1212,6 +1215,37 @@ it by its address. After `the port is open`, as root:
 | the desktop and the USB shell stay up after en0 changes hands | (TimeSync took its identifier at the boot) |
 
 `en0: still taken after 10 s`: the null interface did not leave; then ours keeps its own name, and the line before says why.
+
+**10i ran on 2026-11-14 15:34 and passed every gate (report `private/host-checks/20261114-10i`): Wi-Fi works on the tablet.**
+The interface named en2 and attached, a DHCP address, the gateway 5/5, an Internet address 3/3, DNS, HTTPS 200, 1380
+acknowledged completions; it is the installed default (ESP v3). **10j** (the en0 take-over) failed: `en0: no PianoNullEthernet
+to stand down` — PianoNullEthernet never registers itself, so matching does not find it; ours then met the 10h conflict (two
+`...:01` interfaces), while the desktop and the USB shell stayed up. Fixed (found among IOResources' children by its class).
+
+**For daily use (2026-11-14, after 10i):** the radio stays on through a system sleep (`piano-wifi-sleepoff`), an association
+that ends is joined again with a back-off (`piano-wifi-rejoin`), `piano-wifi-droptest` tests the rejoin, and a stop a suspend
+or a shutdown asked for is the level's normal end (10i's `FAILED at stage 718` was the restart that ended the run; now `stage
+718: level 7: stopped on request (a suspend or a shutdown), its normal end`).
+
+**Boot 10k: sleep and wake, the rejoin, one unattended boot** (built 2026-11-14 16:10 from branch commit `dd61a83` (main merged), collection `1d311e39...`, the v2 recipe: `out/ram-k273-wifi-10k` sha256 `cc5a8911967dab95e6c48f4d8fbc2194e5fda229be8d1912740434c5c80c8eb6` and `out/ram-k273-wifi-10k-en0` sha256 `9f5c50ae0258cfff2c1790254bf5da3c4ef16acaf64326efc6be48b730441ef6`, each 237281280 bytes, `verify-ram-images.py` PASS). Arguments: 10i's and `piano-wifi-droptest=90
+piano-sleep=1 piano-sleep-test=420 piano-sleep-max=60` (the drop 90 s after the port first opens; the system sleeps 420 s after
+the boot completes, for 60 s, and the timer wakes it). Profile and supplicant as for 10i; DHCP and ping on the interface found
+by its address (`...:04`), three times: after the first port open, after the rejoin, after the wake.
+
+| When | Line / command | Expected |
+|---|---|---|
+| the first join | as 10i: the port open, `ifconfig $I` with an address, `ping -c 5 <router>` 5/5 | as 10i |
+| +90 s | `level 7: the drop test (piano-wifi-droptest=90): the station leaves its association now (our deauthentication); the rejoin follows`, `level 7: the teardown: ...` | — |
+| +2 s | `level 7: join 1 ended (the association ended: the drop test's own leave): joining again in 2 s, from the profile` | — |
+| the rejoin | `stage 700`-like steps again: `the network: ...`, `the association answer: status 0`, `level 8: the association is live for the data path (generation 2, ...)`; the supplicant `associated (generation 2, ...)`, the four-way handshake again, `the port is open (generation 2)`; `PianoWifiEthernet: the link is down`, then `... is up` | a port open again within about 10 s |
+| after the rejoin | `ipconfig getifaddr $I`, `ping -c 5 <router>` | an address again (DHCP renewed), 5/5 |
+| boot + 420 s | `piano-sleep: test sleep 1 of 1`, `PianoWifi: power: a system sleep (1): the radio stays on (piano-wifi-sleepoff=0)`, `piano-sleep: suspend 1: ...`, `piano-sleep: suspend 1: woke after 60.0 s by timer`, `PianoWifi: power: the wake (1): the ladder looks at the association`, `level 7: woke from system sleep 1 during associated (the association ...)` | the system wakes; no `crash:` line |
+| after the wake | either the association still up (a ping works at once), or `level 7: join N ended (the association ended: a beacon miss / a deauthentication ...)` and a rejoin with the handshake (generation 3); then `ipconfig getifaddr $I`, `ping -c 5 <router>`; `sysctl machdep.piano_sleep` | an address, 5/5 |
+| the run's end (`reset fastboot`) | `level 7: a shutdown or restart asked the radio to stop during ...`, `stage 718: level 7: stopped on request (a suspend or a shutdown), its normal end`; no `FAILED at stage 718` | — |
+
+**10k-en0** (the same collection, 10i's arguments and `piano-wifi-en0=1`, no tests): `PianoWifiEthernet: en0: PianoNullEthernet
+is asked to stand down (piano-wifi-en0=1)`, `en0: free after N ms`, at the link's up `en0 (attached to the network stack) ...
+(up 1, running 1)`, `ifconfig -a` en0 (`...:01`, ours) and en1 only, DHCP and ping on en0; the desktop and the USB shell stay up.
 
 ## 9. Fallback
 
