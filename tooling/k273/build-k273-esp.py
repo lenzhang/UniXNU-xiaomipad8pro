@@ -38,6 +38,9 @@ sys.path.insert(0, str(D / 'tooling/persist'))
 import common  # noqa: E402
 import firmware  # noqa: E402
 
+spec = importlib.util.spec_from_file_location('boot_args', D / 'tooling/adt/boot_args.py')
+boot_args = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(boot_args)
 spec = importlib.util.spec_from_file_location('build_esp', D / 'tooling/persist/build-esp.py')
 build_esp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(build_esp)
@@ -95,6 +98,13 @@ def main():
     p.add_argument('--expect-seed', metavar='HEX', help='refuse unless the entry\'s seed identity starts with HEX (8+ hex digits)')
     p.add_argument('--expect-store-lba', type=int, metavar='N', help='refuse unless the line binds the store to LBA N')
     p.add_argument('--expect-store-part', metavar='NAME', help='refuse unless the line puts root and store on partition NAME')
+    p.add_argument('--kc', type=Path, help='a new kernel collection for the entry (a 27.3 build: tooling/k273/build-k273-image.sh)')
+    p.add_argument('--adt', type=Path, help='its ADT (the same build)')
+    p.add_argument('--trust', type=Path, help='a new trust cache (it must cover the seed\'s and the system\'s code)')
+    p.add_argument('--seed', type=Path, help='a new Data seed: a new store (its window from the seed\'s size, data-store-lba set)')
+    p.add_argument('--arg', action='append', default=[], metavar='NAME=VALUE', help='one more argument for the entry (replaces NAME)')
+    p.add_argument('--drop-arg', action='append', default=[], metavar='NAME', help='an argument of the base line left out')
+    p.add_argument('--split', action='store_true', help='move the piano-* arguments into the ADT (k27 0066) even when the line fits')
     p.add_argument('--diag-reset-after', type=int, default=240, metavar='SECS',
                    help='the -diag entry\'s reset (only built when its line stays under 1000 bytes)')
     a = p.parse_args()
@@ -152,6 +162,14 @@ def main():
             (stage / path).parent.mkdir(parents=True, exist_ok=True)
             (stage / path).write_bytes(files[path])
         kc, adt, seed_file = stage / payload['kc'], stage / payload['adt'], stage / payload['seed']
+        overrides = {}
+        for role in ('kc', 'adt', 'trust', 'seed'):
+            given = getattr(a, role)
+            if given:
+                (stage / payload[role]).write_bytes(given.read_bytes())
+                overrides[role] = {'from': str(given.name), 'sha256': h((stage / payload[role]).read_bytes())}
+        if bool(a.kc) != bool(a.adt):
+            raise SystemExit('--kc and --adt come together (one build)')
         natives, vm_era, kc_rtc, kc_guard = build_esp.kc_bundles(kc)
         store_guard = common.kc_has_store_guard(kc)
         if vm_era:
@@ -163,6 +181,10 @@ def main():
         if common.adt_addon_slot(adt):
             raise SystemExit(f'{a.entry}\'s ADT has the GpuAddon slot of a RAM test image')
         seed = common.seed_info(seed_file)
+        edits = list(a.arg) + ([f'data-store-lba={common.k273_store_first(seed)}'] if a.seed else [])
+        if edits or a.drop_arg:
+            names = {name_of(x) for x in edits} | set(a.drop_arg)
+            line = ' '.join([x for x in line.split() if name_of(x) not in names] + edits)
         args = line.split()
         named = dict(x.split('=', 1) for x in args if '=' in x)
         part, lba = common.store_args_of(args)
@@ -183,6 +205,17 @@ def main():
         old_k = (base.get('k273') or {}).get('store') or {}
         if old_k and (old_k.get('first_lba'), old_k.get('partition')) != (lba, part):
             raise SystemExit(f'{base_json.name}: its k273 store ({old_k.get("partition")} LBA {old_k.get("first_lba")}) is not the line\'s')
+
+        # -- the arguments past DarwinBoot's line: the ADT's /chosen/piano-boot-args-macos (k27 0066) -----------------------------
+        split = None
+        if len(line) >= LINE_MAX or a.split:
+            if b'piano-boot-args: /chosen/' not in kc.read_bytes():
+                raise SystemExit(f'{a.entry}: a {len(line)}-byte line needs the ADT tail, and this collection\'s kernel lacks k27 0066')
+            kept, tail = boot_args.fit(line.split(), 'macos', force=True)
+            adt.write_bytes(boot_args.with_set(adt.read_bytes(), 'macos', tail))
+            split = {'set': 'macos', 'property': boot_args.prop_name('macos'), 'tail': ' '.join(tail), 'tail_bytes': len(' '.join(tail)),
+                     'line_bytes': len(' '.join(kept)), 'full_bytes': len(line)}
+            line = ' '.join(kept)
 
         # -- firmware the 27.3 collection pins; other non-payload files stay; the 27.0.1 payload goes --------------------------
         carried, dropped, fw = dict(payload.items()), [], []
@@ -209,6 +242,7 @@ def main():
 
         # -- the menu ------------------------------------------------------------------------------------------------------
         k_entry = {k: entry[k] for k in ('id', 'title', 'type', 'path', 'initrd', 'args')}
+        k_entry['args'] = line
         entries = [k_entry]
         diag = diag_line(line, a.diag_reset_after)
         diag_info = {'bytes': len(diag), 'included': len(diag) < LINE_MAX}
@@ -224,7 +258,7 @@ def main():
                 raise SystemExit(f'{e["id"]}: kernel command line of {len(e["args"])} bytes, or a quote or backslash in it')
         new_text = config_text(base['image'], config['boot']['timeout'], entries, store, seed)
         parsed = tomllib.loads(new_text)
-        if parsed['boot']['default'] != a.entry or parsed['entry'][0] != entry:
+        if parsed['boot']['default'] != a.entry or parsed['entry'][0] != (k_entry if (overrides or edits or a.drop_arg or split) else entry):
             raise SystemExit('the 27.3 entry changed in the new unixnu.toml: refused')
         rootfs = {e['id']: why for e in parsed['entry'] if (why := common.entry_uses_rootfs(e))}
         if rootfs:
@@ -233,6 +267,7 @@ def main():
         for path in [stage, *stage.rglob('*')]:
             build_esp.os.utime(path, (build_esp.EPOCH, build_esp.EPOCH))
         want = {str(f.relative_to(stage)): h(f.read_bytes()) for f in sorted(stage.rglob('*')) if f.is_file()}
+        staged = {role: (stage / path).read_bytes() for role, path in payload.items()}
         image = out / f'{a.name}.img'
         out.mkdir(parents=True, exist_ok=True)
         image.unlink(missing_ok=True)
@@ -259,15 +294,15 @@ def main():
         problems.append('read back differs from the stage')
     if 'sector size: 4096 bytes' not in minfo:
         problems.append('minfo sector size')
-    for path in payload.values():
-        if new['files'].get(path) != files[path]:
-            problems.append(f'{path} is not the base\'s byte for byte')
+    for role, path in payload.items():
+        if new['files'].get(path) != staged[role]:
+            problems.append(f'{path} is not the staged {role} byte for byte')
     for path in carried.values():
         if new['files'].get(path) != files[path]:
             problems.append(f'{path} changed')
     back_config = tomllib.loads(new['files'].get(TOML, b'').decode())
     back_entry = next((e for e in back_config.get('entry', []) if e['id'] == a.entry), {})
-    if back_entry.get('args') != line or back_entry != entry or back_config['boot']['default'] != a.entry:
+    if back_entry.get('args') != line or back_entry != k_entry or back_config['boot']['default'] != a.entry:
         problems.append(f'the {a.entry} entry read back is not the base\'s (line {len(back_entry.get("args", ""))} bytes)')
     if any(p.startswith(PAYLOADS) and not p.startswith(payload_dir) for p in got):
         problems.append('a payload file outside the 27.3 entry\'s directory')
@@ -290,7 +325,8 @@ def main():
         # XNU's RAM window the ADT asks for: maint-session.py writes the ESP only onto a boot_a whose DarwinBoot takes it
         'ram_window': window,
         # the payload as it is on the base ESP (IMAGE:PATH; tooling/persist/base-seed.py and common.installed_trust read real files only)
-        'inputs': {role: {'path': f'{base["image"]}:{path}', 'sha256': h(files[path])} for role, path in payload.items()},
+        'inputs': {role: {'path': f'{a.name}.img:{path}', 'sha256': h(staged[role])} for role, path in payload.items()},
+        'overrides': overrides, 'arg_edits': {'add': edits, 'drop': list(a.drop_arg)}, 'boot_args_split': split,
         'firmware': {'files': [{'path': f'{firmware.ESP_DIR}/{pin["path"]}', 'bytes': pin['size'], 'private': pin['private'],
                                 'sha256': None if pin['private'] else pin['sha256'], 'placed': True, 'problem': None} for pin in fw]},
         'seed': seed,

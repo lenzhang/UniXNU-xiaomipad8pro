@@ -901,6 +901,47 @@ def k273_store(s):
         s.need(header['state'] != 'valid' or 'bound_lba' not in header, 'installed store unbound (only the 27.3 kernel binds)')
 
 
+def installed_k273_store(s):
+    """The store the installed ESP resumes on linux_data (OUT/installed.json's record), or Stop."""
+    try:
+        name = json.loads((OUT / 'installed.json').read_text())['image']
+    except (OSError, ValueError, KeyError):
+        raise Stop('no OUT/installed.json: which ESP is installed is not known here')
+    store = esp_store(s.esp_record(name))
+    if not store:
+        raise Stop(f'{name}: its record names no store on linux_data (not a 27.3 ESP)')
+    return name, store
+
+
+@step('k273-store-backup', 'maintenance, read only on the tablet; writes the backup of the installed 27.3 Data store')
+def k273_store_backup(s):
+    """The installed 27.3 Data store (the window on linux_data that the installed ESP's record names), backed up with the three
+    checks before a new ESP starts another store (e.g. a larger window that overlaps this one). Read only on the tablet.
+    rollback k273-store-backup writes it back to the same window (then the old ESP resumes it)."""
+    name, store = installed_k273_store(s)
+    map_nodes(s)
+    first, blocks = store['first_lba'], store['blocks']
+    s.need(common.DATA_FIRST <= first and first + blocks <= common.DATA_LAST + 1,
+           f'the installed store\'s window LBA {first}-{first + blocks - 1} lies inside linux_data')
+    s.backup('linux_data-k273-store', s.nodes['lun0'], first, blocks, B,
+             f'LUN 0 LBA {first}-{first + blocks - 1}: the installed 27.3 Data store ({name}, bound to LBA {first})')
+    if s.execute:
+        s.save(k273_store_backup={'first': first, 'blocks': blocks, 'esp': name})   # where it goes back, whatever is installed later
+
+
+@rollback('k273-store-backup')
+def k273_store_backup_back(s):
+    """The 27.3 Data store as step k273-store-backup saved it, written back to its window and read back: the Data of that moment;
+    only with the ESP of that store (its record's LBA and seed) on the tablet afterwards."""
+    saved = s.state.get('k273_store_backup') or {}
+    if 'first' not in saved:
+        raise Stop('this session has no k273-store-backup (its window is recorded with the backup): nothing to put back')
+    first = saved['first']
+    s.log(f'  info  the store of {saved.get("esp")} goes back to LBA {first} ({saved.get("blocks")} blocks); install that ESP again after it')
+    map_nodes(s)
+    s.restore('linux_data-k273-store', s.nodes['lun0'], first, B)
+
+
 @step('abl-check', 'ABL fastboot, read only')
 def abl_check(s):
     """fastboot getvar from ABL (read only): identity, unlock, slot A state, battery, boot_a size."""
