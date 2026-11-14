@@ -2060,6 +2060,7 @@ extern "C" IOService *native_ufs_source_create (void)
 extern "C" {
 volatile uint32_t native_ufs_blocks_published = 0;
 volatile uint64_t native_ufs_block_reads = 0;
+volatile uint64_t native_ufs_bytes_read = 0;   // the root and Data windows' bytes handed up (native-ufs-iolog)
 volatile uint64_t native_ufs_block_failures = 0;
 }
 
@@ -2376,7 +2377,10 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     }
     uint64_t copy (uint64_t offset, const void *data, uint64_t length) {
       uint64_t copied = buffer->writeBytes (offset, data, length);
-      if (copied == length) __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
+      if (copied == length) {
+        __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add (&native_ufs_bytes_read, length, __ATOMIC_RELAXED);
+      }
       return copied;
     }
   } operations = { buffer
@@ -2600,6 +2604,25 @@ extern unsigned int vm_page_free_count, vm_page_active_count, vm_page_inactive_c
 extern uint32_t vm_page_pages;
 extern unsigned int memorystatus_available_pages;
 extern int nprocs;
+}
+
+// native-ufs-iolog=S (UniXNU-piano, 2026-11-14, the boot-time question): for S seconds after NativeUfs starts, one line a second with
+// the reads and MiB handed up in that second, so a boot log tells an I/O-bound stretch (launchd's 40 s before its first line) from
+// a CPU-bound one. Off by default; nothing else changes.
+static void ioLogThread (void *argument, wait_result_t)
+{
+  unsigned seconds = static_cast<unsigned> (reinterpret_cast<uintptr_t> (argument));
+  uint64_t lastReads = native_ufs_block_reads, lastBytes = native_ufs_bytes_read, totalBytes = 0;
+  for (unsigned s = 1; s <= seconds; s++) {
+    IOSleep (1000);
+    uint64_t reads = native_ufs_block_reads, bytes = native_ufs_bytes_read;
+    uint64_t dr = reads - lastReads, db = bytes - lastBytes;
+    totalBytes += db;
+    if (dr) IOLog ("NativeUfs: iolog %u s: %llu reads, %llu KiB (%llu MiB so far)\n", s, dr, db >> 10, totalBytes >> 20);
+    lastReads = reads;
+    lastBytes = bytes;
+  }
+  IOLog ("NativeUfs: iolog ends after %u s: %llu MiB read in it\n", seconds, totalBytes >> 20);
 }
 
 static void statsThread (void *argument, wait_result_t)
@@ -2827,6 +2850,14 @@ bool NativeUfs::start (IOService *provider)
       return false;
     }
     bzero (gScratch, kDataMax);
+  }
+  unsigned iolog = 0;
+  if (PE_parse_boot_argn ("native-ufs-iolog", &iolog, sizeof (iolog)) && iolog) {
+    if (iolog > 600) iolog = 600;
+    thread_t thread = nullptr;
+    if (kernel_thread_start (ioLogThread, reinterpret_cast<void *> (static_cast<uintptr_t> (iolog)), &thread) == KERN_SUCCESS) {
+      thread_deallocate (thread);
+    }
   }
   unsigned diagnostic = 0;
   PE_parse_boot_argn ("native-ufs-diagnostics", &diagnostic, sizeof (diagnostic));
