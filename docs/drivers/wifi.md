@@ -1170,6 +1170,34 @@ procedure and the table of 10g hold; the lines that must now change:
 | `level 8 ...: sent N frames ...; completions N (acked N ...)` | data frames acknowledged |
 | `ipconfig getifaddr en0`, `ping -c 5 <router>` | an address, 5 answers |
 
+**10h ran on 2026-11-14 (report `private/host-checks/20261114-10h`): receiving works, confirmed on the tablet.** `its own work
+loop running`; the access point's group frames delivered (`PianoWifiEthernet: in: frame 1..6`, types `0x9000` and `0x0800`;
+`received 2 entries, 2544 frames (426415 bytes) ... to en0 2542`). Still nothing sent: the driver's own view at the link's up
+and in every 256-frame line `interface flags 0 (up 0, running 0), enables 0; out 0 sent`, while ifconfig's `en0` was UP,
+RUNNING, `status: active`. **Cause (from the console, confirmed by its own lines):** `PianoNullEthernet: en0 (built-in, no
+hardware ...), MAC 02:50:49:41:4e:01` — the station's interface carried the same address (level 6's locally administered
+one), so macOS never gave it a name of its own and never attached it to the network stack (its ifnet flags read 0: no ifnet
+at all); every `en0` check since boot 10a was PianoNullEthernet's, and PianoWifiEthernet's `en0 published` was the unit
+number before any name existed. **Fixed:** the station's address is `02:50:49:41:4e:04` (01 PianoNullEthernet, 02 and 03 the
+USB network's two ends); the interface is built in but not primary; its counters' lines carry its BSD name and whether it is
+attached.
+
+**Boot 10i: DHCP and a gateway ping** (built 2026-11-14 15:33 from branch commit `13a9d08` (main merged), collection `5951c3de...`, the v2 recipe of 10g/10h: `out/ram-k273-wifi-10i` 237281280 bytes, sha256 `f6fe69e08abd8e4033961d588bf32b9df267d79d920d17dbd324165c0f55d506`, `verify-ram-images.py` PASS), the 10h recipe and arguments. **The interface is not en0 any more:** find
+it by its address. After `the port is open`, as root:
+
+    I=$(ifconfig -l | tr ' ' '\n' | while read i; do ifconfig "$i" 2>/dev/null | grep -q 'ether 02:50:49:41:4e:04' && echo "$i"; done); echo "wifi interface: $I"
+    ifconfig "$I"; ipconfig getifaddr "$I" || { ipconfig set "$I" DHCP; sleep 15; ipconfig getifaddr "$I"; }
+    R=$(ipconfig getoption "$I" router); ping -c 5 "$R"
+
+| Line / command | Expected |
+|---|---|
+| `PianoWifiEthernet: the interface is published (MAC 02:50:49:..:04, built in, not primary, ...)` | at level 6 |
+| `PianoWifiEthernet: at the link's up: enN (attached to the network stack), interface flags 0x8863 (up 1, running 1)` | a name other than en0/en1, attached |
+| `PianoWifiEthernet: the interface is brought up (enable 1)` | at the boot or at `ipconfig set` |
+| `PianoWifiEthernet: out: frame 1, ~342 bytes, type 0x0800, group addressed: handed to PianoWifi (0)` | the DHCP discover |
+| `level 8 ...: sent N frames ...; completions N (acked N ...)` | data frames acknowledged |
+| `ifconfig $I`, `ipconfig getifaddr $I`, `ping -c 5 <router>` | ether `...:04`; an address; 5 answers |
+
 ## 9. Fallback
 
 `piano-wifi=0` (the default): nothing runs. Network meanwhile: PianoNullEthernet's `en0` (no traffic) and, once built, the USB-C
