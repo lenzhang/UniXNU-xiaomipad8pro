@@ -127,7 +127,7 @@ struct Args {
   uint32_t deadlineMs;
   uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step, l7file, l7cands;
   uint32_t l8, l8status, l8blocks, l8tracems;
-  uint32_t sleepOff, rejoin, dropTest;
+  uint32_t sleepOff, rejoin, dropTest, clientWaitMs;
 };
 Args gArgs;
 
@@ -265,6 +265,12 @@ void readArgs()
   gArgs.rejoin = bootArg("piano-wifi-rejoin", gArgs.level >= 8 ? 1 : 0);
   gArgs.dropTest = bootArg("piano-wifi-droptest", 0);
   if (gArgs.dropTest > 3600) gArgs.dropTest = 0;
+  // piano-wifi-clientwait=MS (level 8, default 30000; 0 off): a WPA2 profile is handed to the join only once an 802.1X client
+  // is connected to the port, waited for up to MS on each join; then the join goes ahead anyway (the rejoin retries a missed
+  // handshake). The installed boot of 2026-11-14 (ESP v3) associated with no client: its three message 1s were counted only
+  // and the access point dropped us after 3.3 s (reason 15) while launchd was still respawning the supplicant.
+  gArgs.clientWaitMs = bootArg("piano-wifi-clientwait", gArgs.level >= 8 ? 30000 : 0);
+  if (gArgs.clientWaitMs > 600000) gArgs.clientWaitMs = 30000;
 }
 
 uint64_t nowMs();
@@ -4092,6 +4098,45 @@ bool level8Event(uint32_t id, const uint8_t *payload, uint32_t length)
 __attribute__((noinline)) void staBeginOnce(const StaOptions &o, const StaEnv &env, uint64_t now) { staBegin(gSta, o, env, now); }
 __attribute__((noinline)) void staRunOnce(uint64_t now) { staRun(gSta, now); }
 
+// The wait for the 802.1X client (piano-wifi-clientwait, level 8): true while a WPA2 profile is ready for the join but no
+// client is connected to the port and the wait has time left; the join's profile deadline moves along meanwhile. waitFrom is
+// the join's own (0 until a wait begins). Not inlined into level7 (the ladder's 16 KiB stack).
+__attribute__((noinline)) bool clientWaitHold(uint64_t now, uint64_t &waitFrom, uint32_t generationSeen)
+{
+  if (gArgs.level < 8 || !gArgs.clientWaitMs || gSta.profileSet || gSta.step != kStaProfileWait || !gProfileLock || !gPortLock)
+    return false;
+  IOLockLock(gProfileLock);
+  const bool wpa2 = gProfileSet && gProfileGeneration != generationSeen && gProfile.security == PianoWifiSecWpa2Psk;
+  IOLockUnlock(gProfileLock);
+  if (!wpa2) return false;
+  IOLockLock(gPortLock);
+  const bool client = gCtlUnit != 0;
+  const uint32_t connects = gCtlConnects;
+  IOLockUnlock(gPortLock);
+  if (client) {
+    if (waitFrom)
+      note("level 7: the 802.1X client connected after %llu ms of the wait (connect %u): the join goes ahead",
+           (unsigned long long)(now - waitFrom), connects);
+    waitFrom = 0;
+    return false;
+  }
+  if (!waitFrom) {
+    waitFrom = now ? now : 1;
+    note("level 7: waiting for the 802.1X client (a WPA2 profile, no client on the port, %u connect(s) so far): up to %u s "
+         "before the join goes ahead (piano-wifi-clientwait)",
+         connects, gArgs.clientWaitMs / 1000);
+  }
+  if (now >= waitFrom + gArgs.clientWaitMs) {
+    note("level 7: no 802.1X client after %u s of waiting: the join goes ahead without one (its handshake will be missed; the "
+         "rejoin tries again)",
+         gArgs.clientWaitMs / 1000);
+    waitFrom = 0;
+    return false;
+  }
+  if (gSta.deadline < now + 1000) gSta.deadline = now + 1000;   // the profile is there: the wait is not the profile's
+  return true;
+}
+
 // The rejoin's back-off: the transport and the data path kept running (their turns) until it ends, a stop is asked for, the
 // link stops or the chip dies. Not inlined into level7, whose frame stays small (the ladder's 16 KiB stack).
 __attribute__((noinline)) const char *rejoinWait(uint32_t waitMs, bool &stoppedOnRequest)
@@ -4200,8 +4245,8 @@ int level7(IOService *owner)
   uint32_t generation = 0;
   uint64_t nextFileTry = 0;
   const char *lastFileProblem = nullptr;
-  bool stopping = false, profileNoted = false, dropThisJoin = false;
-  uint64_t stopAt = 0;
+  bool stopping = false, profileNoted = false, dropThisJoin = false, clientWaitOver = false;
+  uint64_t stopAt = 0, clientWaitFrom = 0;
   why = nullptr;
   while (!staFinished(gSta)) {
     const uint64_t now = nowMs();
@@ -4277,7 +4322,14 @@ int level7(IOService *owner)
         }
       }
     }
-    if (!gSta.profileSet && profileToSta(gSta, generation) && !profileNoted) {
+    // a WPA2 profile waits for the 802.1X client (piano-wifi-clientwait), once per join: its end, either way, lets it pass
+    bool holdForClient = false;
+    if (!clientWaitOver) {
+      const bool waiting = clientWaitFrom != 0;
+      holdForClient = clientWaitHold(now, clientWaitFrom, generation);
+      if (waiting && !clientWaitFrom) clientWaitOver = true;
+    }
+    if (!holdForClient && !gSta.profileSet && profileToSta(gSta, generation) && !profileNoted) {
       profileNoted = true;
       note("level 7: the join profile was handed over after %llu ms: a network name of %u byte(s), %s, the access point %s "
            "(none of it is logged)",
@@ -4770,7 +4822,8 @@ void PianoWifi::run()
     // Its own hard deadline: the profile's wait, its scans, the join's steps and the watch, with room for the teardown. A
     // watch without end (piano-wifi-l7hold=0) has none.
     const uint64_t own = uint64_t(gArgs.l7wait) + uint64_t(gArgs.l7scans) * gArgs.scanWaitMs +
-                         uint64_t(gArgs.l7step) * 30 + uint64_t(gArgs.l7frame) * gArgs.l7tries * 3 + gArgs.l7hold + 15000;
+                         uint64_t(gArgs.l7step) * 30 + uint64_t(gArgs.l7frame) * gArgs.l7tries * 3 + gArgs.l7hold +
+                         gArgs.clientWaitMs + 15000;
     if (gArgs.l7hold) levelBegin(7, own > 0xffffffffull ? 0xffffffffu : uint32_t(own));
     else levelEnd();
     rc = level7(this);
