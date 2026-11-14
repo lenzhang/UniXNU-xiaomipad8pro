@@ -34,9 +34,10 @@ then the outputs are left byte for byte as they are and the seed keeps its ident
 added once, CDHashes the input already has are not added again.
 
 The seed mechanics are tooling/k27/stage-soft-metal.py's (imported, not changed: its sha256 is in build-native-image.sh's stamp):
-the packed DBRDISK1 disk unpacked to a sparse raw file in OUT, attached with hdiutil (no mount), its APFS volume Data mounted with
-diskutil (no sudo: ownership is ignored, the copies are stored as uid/gid 99 with their modes), the files written, the volume
-unmounted, the disk packed again. The owners and modes of configs/userland.toml are applied on the tablet by install.sh, as root,
+the packed DBRDISK1 disk unpacked to a sparse raw file in OUT, attached and its APFS volume mounted in one hdiutil step (no
+diskutil: this Mac's diskutil mount hangs some days; no sudo: ownership is ignored, the copies are stored as uid/gid 99 with their
+modes), the files written, the disk detached and packed again. Every external command runs under a timeout (sh). The owners and
+modes of configs/userland.toml are applied on the tablet by install.sh, as root,
 from the boot job (launchd refuses a job file that is not root's, and this Mac cannot make one on the seed's volume).
 
 Every run that changes the staging makes a new seed identity (APFS writes times and transaction ids): docs/data-store.md applies.
@@ -102,6 +103,15 @@ def rel(path):
     """PATH relative to the repository when it is inside it (records and messages carry no home directories)."""
     path = Path(path).resolve()
     return path.relative_to(D).as_posix() if path.is_relative_to(D) else str(path)
+
+
+def sh(command, *, timeout=600, **kw):
+    """subprocess.run for every external command this tool starts, always bounded: one that stops answering (this Mac's disk tools
+    have hung on some days) fails the run with a clear message instead of hanging it forever. TIMEOUT is per command."""
+    try:
+        return subprocess.run(command, timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f'{command[0]}: no answer within {timeout} s ({shlex.join(command)}); giving up on it') from None
 
 
 # ---- the manifest ------------------------------------------------------------------------------------------------------------
@@ -294,7 +304,7 @@ def toolchain():
         parts = []
         for command in (['xcrun', 'clang', '--version'], ['xcrun', '--show-sdk-path'], ['xcrun', '--show-sdk-version'],
                         ['xcrun', 'ld', '-v']):
-            r = subprocess.run(command, capture_output=True, text=True)
+            r = sh(command, timeout=60, capture_output=True, text=True)
             parts.append((r.stdout + r.stderr).strip())
         _TOOLCHAIN = '\n'.join(parts)
     return _TOOLCHAIN
@@ -328,7 +338,7 @@ def build_file(f, build_dir):
         return out
     log = out.with_name(out.name + '.log')
     with log.open('w') as handle:
-        result = subprocess.run(command, cwd=D, stdout=handle, stderr=subprocess.STDOUT)
+        result = sh(command, timeout=600, cwd=D, stdout=handle, stderr=subprocess.STDOUT)
     if result.returncode:
         tail = log.read_text().strip().splitlines()[-15:]
         raise SystemExit(f'{f["dest"]}: the build failed ({shlex.join(command)}); {rel(log)}:\n  ' + '\n  '.join(tail))
@@ -419,7 +429,7 @@ def sync_tree(root, tree):
     for path in [root, *[p for p in root.rglob('*') if p.is_dir()]]:
         os.chmod(path, 0o755)
     # the build Mac's com.apple.provenance tag (its sandboxed tools write it) is not carried into the tablet's volume
-    subprocess.run(['xattr', '-cr', str(root)], check=False)
+    sh(['xattr', '-cr', str(root)], timeout=60, check=False)
     return written, removed
 
 
@@ -441,14 +451,18 @@ def add_boot_command(job, command, settime):
     script = argv[2].replace(settime, f'{settime}; {command}', 1)
     record['ProgramArguments'] = ['/bin/sh', '-c', script]
     job.write_bytes(plistlib.dumps(record, fmt=plistlib.FMT_XML))
-    subprocess.run(['xattr', '-c', str(job)], check=False)
+    sh(['xattr', '-c', str(job)], timeout=60, check=False)
     return script, True
 
 
 @contextlib.contextmanager
 def mounted_seed(seed, out, result):
     """SEED's Data volume, mounted read-write from a sparse raw copy under OUT; packed again to OUT/scratch-data.img afterwards
-    (RESULT gets packed_ramdisk.pack's metadata). stage-soft-metal.py's steps, in its order."""
+    (RESULT gets packed_ramdisk.pack's metadata). stage-soft-metal.py's unpack/pack steps, in its order; the attach and mount are
+    hdiutil's in one step (no diskutil: this Mac's diskutil mount hangs some days, hdiutil does not). Non-sudo like the old
+    `diskutil mount`, so the volume ignores ownership the same way: the copies are stored as uid/gid 99 with their modes (inferred
+    from the mount running as this uid either way; the staging's checks below would catch a mount of the wrong volume: the seed's
+    boot job would be missing)."""
     ssm = soft_metal()
     logical, extents = ssm.packed_ramdisk.regions(seed.read_bytes())
     with tempfile.TemporaryDirectory(prefix='seed-', dir=str(out)) as scratch:
@@ -458,21 +472,29 @@ def mounted_seed(seed, out, result):
             for offset, data in extents:
                 handle.seek(offset)
                 handle.write(data)
-        attached = plistlib.loads(ssm.run('hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nomount', '-nobrowse',
-                                          '-plist', str(raw), capture_output=True).stdout)
-        disks = [e['dev-entry'] for e in attached['system-entities']]
-        whole = min(disks, key=lambda d: (len(d), d)).removeprefix('/dev/')   # the image's disk, before its synthesized container
         mount = Path(scratch) / 'mnt'
         mount.mkdir()
+        entities = sh(['hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nobrowse', '-mountpoint', str(mount),
+                       '-plist', str(raw)], timeout=300, check=True, capture_output=True).stdout
+        attached = plistlib.loads(entities)['system-entities']
+        disks = [e['dev-entry'] for e in attached]
+        whole = min(disks, key=lambda d: (len(d), d)).removeprefix('/dev/')   # the image's disk, before its synthesized container
+        detached = False
+        # hdiutil reports the mount point through its realpath (/private/... for a /tmp/... request; confirmed on the host
+        # 2026-11-14), so compare the resolved form of MOUNT:
+        mount_real = str(mount.resolve())
         try:
-            volume = ssm.data_volume(whole)
-            ssm.run('diskutil', 'mount', '-mountPoint', str(mount), volume, stdout=subprocess.DEVNULL)
+            volume = next((e['dev-entry'].removeprefix('/dev/') for e in attached if e.get('mount-point') == mount_real), None)
+            if volume is None:   # attached but nothing mounted here: refuse before any write
+                raise SystemExit(f'{raw.name}: hdiutil attached the seed but mounted no volume at {mount}; refusing to stage')
             try:
                 yield mount, volume
             finally:
-                ssm.run('diskutil', 'unmount', str(mount), stdout=subprocess.DEVNULL)
+                sh(['hdiutil', 'detach', '/dev/' + whole], timeout=120, check=True, stdout=subprocess.DEVNULL)
+                detached = True
         finally:
-            ssm.run('hdiutil', 'detach', '/dev/' + whole, stdout=subprocess.DEVNULL)
+            if not detached:   # the refusal above, or a detach that failed: force the image off so nothing is left attached
+                sh(['hdiutil', 'detach', '-force', '/dev/' + whole], timeout=120, check=False, stdout=subprocess.DEVNULL)
         packed = out / 'scratch-data.img.new'
         packed.unlink(missing_ok=True)
         result.update(ssm.packed_ramdisk.pack(raw, packed))
@@ -564,7 +586,7 @@ def stage_seed(a, plan):
     with mounted_seed(seed_in, out, packed) as (mount, volume):
         written, removed = sync_tree(mount / staging, tree)
         script, changed = add_boot_command(mount / ssm.BOOT_JOB, command, ssm.SETTIME)
-        listing = subprocess.run(['ls', '-lnR', str(mount / staging)], capture_output=True, text=True).stdout
+        listing = sh(['ls', '-lnR', str(mount / staging)], timeout=60, capture_output=True, text=True).stdout
         listing = listing.replace(str(mount), '')
         print(f'{volume}: /{staging}: {len(written)} written, {len(removed)} removed{": " + " ".join(removed) if removed else ""}\n'
               f'{listing.strip()}')

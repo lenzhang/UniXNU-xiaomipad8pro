@@ -74,6 +74,15 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def sh(command, *, timeout=120, **kw):
+    """subprocess.run for every external command this test starts, always bounded: a command that stops answering (this Mac's
+    diskutil hung over ten minutes on a mount on 2026-11-14) fails the run with a clear message instead of hanging the test."""
+    try:
+        return subprocess.run(command, timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f'{command[0]}: no answer within {timeout} s ({" ".join(map(str, command))}); the test stops here') from None
+
+
 def write(path, text, mode=0o644):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text) if isinstance(text, str) else path.write_bytes(text)
@@ -259,7 +268,7 @@ class Rig:
 
     def run(self, mode='--boot'):
         (self.tmp / 'launchd/calls').write_text('')
-        r = subprocess.run([self.shell, str(self.tmp / 'stage/install.sh'), mode], env=self.env, capture_output=True, text=True)
+        r = sh([self.shell, str(self.tmp / 'stage/install.sh'), mode], timeout=120, env=self.env, capture_output=True, text=True)
         self.calls = (self.tmp / 'launchd/calls').read_text().splitlines()
         return r.returncode, r.stdout + r.stderr
 
@@ -351,7 +360,7 @@ def installer_tests(tmp):
         check(code == 0 and not rig.root('/usr/local/libexec/tool').exists() and not rig.root('/Library/LaunchDaemons/com.test.d.plist').exists()
               and 'bootout system/com.test.d' in rig.calls, f'{tag}: a unit dropped from the manifest: removed, its job booted out')
         check(rig.root('/usr/local/bin/cli').exists() and 'changed since it was installed: left' in out, f'{tag}: a dropped file changed since is left')
-        check(subprocess.run([shell, str(tmp / tag / 'stage/install.sh'), '--bogus'], env=rig.env, capture_output=True).returncode == 2,
+        check(sh([shell, str(tmp / tag / 'stage/install.sh'), '--bogus'], timeout=60, env=rig.env, capture_output=True).returncode == 2,
               f'{tag}: an unknown mode is refused')
         layer_tests(tmp, shell, tag)
 
@@ -444,12 +453,12 @@ def pmset_tests(tmp):
 
         def run(base, env):
             (base / 'calls').write_text('')
-            r = subprocess.run([shell, str(script)], env=env, capture_output=True, text=True)
+            r = sh([shell, str(script)], timeout=120, env=env, capture_output=True, text=True)
             return r.returncode, r.stdout, [c for c in (base / 'calls').read_text().splitlines() if not c.startswith('-g')]
 
         def prefs(base, source, key):
-            r = subprocess.run(['plutil', '-extract', f'{source}.{key}', 'raw', '-o', '-',
-                                str(base / 'root/Library/Preferences/com.apple.PowerManagement.plist')], capture_output=True, text=True)
+            r = sh(['plutil', '-extract', f'{source}.{key}', 'raw', '-o', '-',
+                    str(base / 'root/Library/Preferences/com.apple.PowerManagement.plist')], timeout=60, capture_output=True, text=True)
             return r.stdout.strip() if r.returncode == 0 else None
 
         base, env = rig(CUSTOM_BATTERY + CUSTOM_AC)
@@ -471,13 +480,13 @@ def pmset_tests(tmp):
         code, out, calls = run(base, env)
         check(calls[:1] == ['-b sleep 5'] and not [c for c in calls if c.startswith('-c')], f'{tag}: the battery once it appears, AC not again')
         base, env = rig(CUSTOM_BATTERY + CUSTOM_AC)
-        subprocess.run([str(base / 'bin/pmset'), '-b', 'sleep', '15'], env=env, check=True)
+        sh([str(base / 'bin/pmset'), '-b', 'sleep', '15'], timeout=60, env=env, check=True)
         code, out, calls = run(base, env)
         check(not [c for c in calls if c.startswith('-b')] and calls == ['-c sleep 0', '-c displaysleep 10'] and
               prefs(base, 'Battery Power', 'System Sleep Timer') == '15', f'{tag}: the owner\'s battery timers first: kept, AC set')
         base, env = rig(CUSTOM_AC)
         run(base, env)
-        subprocess.run([str(base / 'bin/pmset'), '-b', 'displaysleep', '7'], env=env, check=True)
+        sh([str(base / 'bin/pmset'), '-b', 'displaysleep', '7'], timeout=60, env=env, check=True)
         write(base / 'custom', CUSTOM_BATTERY + CUSTOM_AC)
         code, out, calls = run(base, env)
         check(calls == [] and 'the owner\'s timers are set' in out and prefs(base, 'Battery Power', 'Display Sleep Timer') == '7',
@@ -525,14 +534,14 @@ def trust_tests(tmp):
 def build_c(tmp, name, text):
     src = write(tmp / f'{name}.c', text)
     out = tmp / name
-    subprocess.run(['xcrun', 'clang', '-arch', 'arm64', '-mmacosx-version-min=14.0', '-O2', str(src), '-o', str(out)], check=True)
+    sh(['xcrun', 'clang', '-arch', 'arm64', '-mmacosx-version-min=14.0', '-O2', str(src), '-o', str(out)], timeout=300, check=True)
     return out
 
 
 def cdhash_tests(tmp):
     print('5. cdhash')
     exe = build_c(tmp, 'hello', '#include <stdio.h>\nint main(void) { puts("hello"); return 0; }\n')
-    info = subprocess.run(['codesign', '-dvvv', str(exe)], capture_output=True, text=True).stderr
+    info = sh(['codesign', '-dvvv', str(exe)], timeout=60, capture_output=True, text=True).stderr
     want = re.search(r'^CDHash=([0-9a-f]+)', info, re.M).group(1)
     check(stage.soft_metal().cdhash(exe).hex() == want, f'cdhash = codesign\'s CDHash ({want[:16]}), linker-signed ad hoc')
     check(stage.soft_metal().cdhash(write(tmp / 'script.sh', '#!/bin/sh\n')) is None, 'a script has no CDHash')
@@ -540,23 +549,31 @@ def cdhash_tests(tmp):
 
 @contextlib.contextmanager
 def attached(raw, readonly=False):
-    """RAW (a bare APFS container image) attached, its Data volume mounted; yields the mount point."""
-    ssm = stage.soft_metal()
-    args = ['hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nomount', '-nobrowse', '-plist']
-    entities = plistlib.loads(subprocess.run(args + (['-readonly'] if readonly else []) + [str(raw)], check=True,
-                                             capture_output=True).stdout)['system-entities']
-    whole = min((e['dev-entry'] for e in entities), key=lambda d: (len(d), d)).removeprefix('/dev/')
+    """RAW (a bare APFS container image) attached and its volume mounted by hdiutil alone, read-only when asked; yields the mount
+    point. No diskutil: its mount hung for ten minutes plus on this Mac on 2026-11-14 while hdiutil answered; the old two-step
+    (hdiutil -nomount + diskutil mount of ssm.data_volume) is one hdiutil step now."""
     mount = Path(tempfile.mkdtemp(prefix='mnt-', dir=raw.parent))
+    # hdiutil answers the mount point through its realpath (/private/var/folders/... where tempfile.mkdtemp gave /var/folders/...;
+    # confirmed on the host 2026-11-14: attaching /tmp/... reports mount-point /private/tmp/...). Compare that form.
+    mount_real = str(mount.resolve())
+    attached = plistlib.loads(sh(['hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nobrowse', '-mountpoint',
+                                  str(mount), '-plist'] + (['-readonly'] if readonly else []) + [str(raw)], timeout=300, check=True,
+                                 capture_output=True).stdout)['system-entities']
+    whole = min((e['dev-entry'] for e in attached), key=lambda d: (len(d), d))   # the image's disk, before its synthesized container
+    detached = False
     try:
-        volume = ssm.data_volume(whole)
-        subprocess.run(['diskutil', 'mount', *(['readOnly'] if readonly else []), '-mountPoint', str(mount), volume], check=True,
-                       stdout=subprocess.DEVNULL)
+        if not any(e.get('mount-point') == mount_real for e in attached):   # attached but nothing mounted here: say so, don't read air
+            raise SystemExit(f'{raw.name}: hdiutil attached it but mounted no volume at {mount} '
+                             f'(entities: {", ".join(e["dev-entry"] for e in attached)})')
         try:
             yield mount
         finally:
-            subprocess.run(['diskutil', 'unmount', str(mount)], check=True, stdout=subprocess.DEVNULL)
+            sh(['hdiutil', 'detach', whole], timeout=120, check=True, stdout=subprocess.DEVNULL)
+            detached = True
     finally:
-        subprocess.run(['hdiutil', 'detach', '/dev/' + whole], check=True, stdout=subprocess.DEVNULL)
+        if not detached:   # the refusal above, or a failed detach: force the image off so nothing is left attached
+            sh(['hdiutil', 'detach', '-force', whole], timeout=120, check=False, stdout=subprocess.DEVNULL)
+        shutil.rmtree(mount, ignore_errors=True)
 
 
 def unpack(seed, raw):
@@ -577,10 +594,10 @@ def make_seed(tmp):
     in the staging directory, packed as DBRDISK1."""
     ssm = stage.soft_metal()
     tmp.mkdir(parents=True, exist_ok=True)
-    subprocess.run(['hdiutil', 'create', '-size', '64m', '-layout', 'NONE', '-fs', 'APFS', '-volname', 'Data', str(tmp / 'data.dmg')],
-                   check=True, stdout=subprocess.DEVNULL)
-    subprocess.run(['hdiutil', 'convert', str(tmp / 'data.dmg'), '-format', 'UDTO', '-o', str(tmp / 'data')], check=True,
-                   stdout=subprocess.DEVNULL)
+    sh(['hdiutil', 'create', '-size', '64m', '-layout', 'NONE', '-fs', 'APFS', '-volname', 'Data', str(tmp / 'data.dmg')],
+       timeout=300, check=True, stdout=subprocess.DEVNULL)
+    sh(['hdiutil', 'convert', str(tmp / 'data.dmg'), '-format', 'UDTO', '-o', str(tmp / 'data')], timeout=300, check=True,
+       stdout=subprocess.DEVNULL)
     raw = tmp / 'data.cdr'
     with attached(raw) as mnt:
         write(mnt / ssm.BOOT_JOB, plistlib.dumps({'Label': Path(ssm.BOOT_JOB).stem, 'ProgramArguments': ['/bin/sh', '-c', BOOT_SCRIPT],
@@ -610,7 +627,7 @@ def test_manifest(tmp):
 
 
 def stage_run(*args):
-    r = subprocess.run([sys.executable, str(HERE / 'stage.py'), *map(str, args)], capture_output=True, text=True)
+    r = sh([sys.executable, str(HERE / 'stage.py'), *map(str, args)], timeout=720, capture_output=True, text=True)
     return r.returncode, r.stdout + r.stderr
 
 
@@ -646,7 +663,7 @@ def seed_tests(tmp):
               'the staging directory holds exactly the plan (the stale file removed)')
         check(oct(on_volume['install.sh'].stat().st_mode & 0o777) == '0o755' and
               oct(on_volume['files/tool/com.test.tool.plist'].stat().st_mode & 0o777) == '0o644', 'modes 755/644 on the volume')
-        check(subprocess.run(['shasum', '-a', '256', '-c', '-s', 'SHA256SUMS'], cwd=root).returncode == 0, 'SHA256SUMS verifies on the volume')
+        check(sh(['shasum', '-a', '256', '-c', '-s', 'SHA256SUMS'], timeout=60, cwd=root).returncode == 0, 'SHA256SUMS verifies on the volume')
         helper = plistlib.loads(on_volume['files/helper/com.test.helper.plist'].read_bytes())
         check(helper.get('Disabled') is True and '\nhelper\tdaemon\t0\t' in manifest_tsv, 'the off job: Disabled in its plist, on 0 in manifest.tsv')
         job = plistlib.loads((mnt / ssm.BOOT_JOB).read_bytes())['ProgramArguments'][2]
@@ -705,11 +722,11 @@ def live_tests(tmp):
         members = tar.getmembers()
         check(all(m.uid == 0 and m.gid == 0 and m.mtime == 0 for m in members), 'archive entries: owner 0:0, time 0')
         tar.extractall(tmp / 'l/x', filter='tar')
-    check(subprocess.run(['shasum', '-a', '256', '-c', '-s', 'SHA256SUMS'], cwd=tmp / 'l/x/userland').returncode == 0,
+    check(sh(['shasum', '-a', '256', '-c', '-s', 'SHA256SUMS'], timeout=60, cwd=tmp / 'l/x/userland').returncode == 0,
           'the extracted archive verifies against its SHA256SUMS')
     apply = (tmp / 'l/live/apply-update.sh').read_text()
     check(sha(first) in apply and 'install.sh --live' in apply and 'nohup' in apply, 'apply-update.sh names the archive and runs install.sh --live detached')
-    check(all(subprocess.run([s, '-n', str(tmp / 'l/live/apply-update.sh')]).returncode == 0 for s in SHELLS), 'apply-update.sh parses (sh -n)')
+    check(all(sh([s, '-n', str(tmp / 'l/live/apply-update.sh')], timeout=30).returncode == 0 for s in SHELLS), 'apply-update.sh parses (sh -n)')
     trusted = write(tmp / 'l/all.trustcache', tc)
     code, text = stage_run('--manifest', manifest, '--live', tmp / 'l/live2', '--installed-trust', trusted)
     check(code == 0 and json.loads((tmp / 'l/live2/live.json').read_text())['untrusted'] == [] and
@@ -724,8 +741,8 @@ def live_tests(tmp):
                               '/usr/local/libexec/piano-wifi-join', '/usr/local/bin/piano-camera-grab',
                               '/usr/local/libexec/piano-wifi-supplicant'},
               'six Mach-Os with CDHashes: ' + ', '.join(f'{Path(d).name} {h[:12]}' for d, h in sorted(machos.items())))
-        archs = {d: subprocess.run(['lipo', '-archs', str(tmp / 'real/live/staging/files' / f['unit'] / Path(d).name)],
-                                   capture_output=True, text=True).stdout.strip() for d in machos for f in real['files'] if f['dest'] == d}
+        archs = {d: sh(['lipo', '-archs', str(tmp / 'real/live/staging/files' / f['unit'] / Path(d).name)], timeout=60,
+                       capture_output=True, text=True).stdout.strip() for d in machos for f in real['files'] if f['dest'] == d}
         check(set(archs.values()) == {'arm64'}, 'each one thin arm64')
         code, text = stage_run('--live', tmp / 'real/live', '--installed-trust', installed)
         again = json.loads((tmp / 'real/live/live.json').read_text())
