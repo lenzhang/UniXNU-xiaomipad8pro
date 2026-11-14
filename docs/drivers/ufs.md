@@ -409,3 +409,17 @@ iolog 36 instead of 39, `Early boot complete` T 38.7 instead of 41.8 s), nothing
 `cpu_idle_latency` 0 (`osfmk/arm64/cpu.c:853`) `ml_delay_should_spin` is always false (`osfmk/arm64/machine_routines.c:3561`), so
 every `IODelay(2)` of the old completion poll is a timed sleep (`osfmk/kern/clock.c:1593-1610`): the 2026-11-12 profile counted
 211,821 such waits from launchd's reads in 30 s.
+
+**Review fixes, 2026-11-14 (`native-ufs-direct`, `review-ufs-xhci` N1-N3).** N1: a direct read whose piece fails now ends with that
+error and the bytes of the pieces before it (`ufsReadWindow`'s shape); before, a quarantine by another command could end it with
+`kIOReturnSuccess` and a short count. N2: when the piece's own command quarantined the transport (it failed and the host was not
+quarantined before it: a timeout or a fatal status, the controller may still write the pages), the buffer stays prepared, an extra
+retain keeps the descriptor, and the request is never completed (`direct read ... held`), so the client cannot recycle those pages
+under the DMA; the bounce path never had this (its targets are the driver's). N3: `readDirect` checks the window geometry and the
+request's bounds as `ufsReadWindow` does before anything else (a refusal goes to the bounce path, which answers
+`kIOReturnBadArgument`). Informational, unchanged: N4 with `native-ufs-async` the completion runs on a `NativeUfs.read` worker thread,
+not the caller's (as a controller's interrupt path would; a client that touched its work-loop state unlocked in the completion
+would race). N5 `hostFlushPhys` relies on `dcache_incoherent_io_flush64` cleaning and invalidating by physical address (read from
+its disassembly: physical aperture or a CPU window per page, `FlushPoC_DcacheRegion`; `remaining` 0 never takes the set/way path).
+N6 perf accounting: a second's `max` depth starts from the depth in flight at the drain; direct reads count one iolog "read" per
+1 MiB piece, the bounce path one per copy.

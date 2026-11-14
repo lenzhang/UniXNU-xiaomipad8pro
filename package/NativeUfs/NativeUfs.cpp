@@ -2163,8 +2163,9 @@ public:
   IOReturn doAsyncReadWrite (IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *) override;
   // One window read, start to completion (the caller's thread, or a read worker with native-ufs-async).
   void serveRead (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, IOStorageCompletion completion, uint64_t requestStart);
-  // native-ufs-direct: the read straight into the buffer's pages; false (nothing read) when it does not qualify.
-  bool readDirect (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, UfsWindowResult *outcome);
+  // native-ufs-direct: the read straight into the buffer's pages; false (nothing read) when it does not qualify. *held: a command of
+  // it may still be live on a quarantined transport (the request must then never be completed).
+  bool readDirect (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, UfsWindowResult *outcome, bool *held);
 };
 OSDefineMetaClassAndStructors (NativeUfsBlock, IOBlockStorageDevice)
 
@@ -2651,13 +2652,26 @@ void NativeUfsBlock::serveRead (IOMemoryDescriptor *buffer, UInt64 block, UInt64
 #endif
   };
   UfsWindowResult outcome;
-  if (!gDirect || !readDirect (buffer, block, count, &outcome)) {
+  bool held = false;
+  if (!gDirect || !readDirect (buffer, block, count, &outcome, &held)) {
     const unsigned bounceIndex = takeBounce ();
     outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounces[bounceIndex], bounceBytes[bounceIndex]);
     giveBounce (bounceIndex);
   }
   IOReturn result = outcome.status;
   uint64_t done = outcome.done;
+  if (held) {
+    // A direct command timed out or met a fatal status: the controller may still write these pages. The request is never completed
+    // and its descriptor stays retained and prepared, so the client cannot drop the pages under that DMA (review N2, 2026-11-14).
+    buffer->retain ();
+    __atomic_fetch_add (&native_ufs_block_failures, 1, __ATOMIC_RELAXED);
+    gRootDiagnostic.result = static_cast<uint32_t> (result);
+    IOLog ("NativeUfs: %s: direct read of %llu sectors at %llu held: the transport is quarantined with its command possibly live; "
+           "the request is never completed (its pages stay the controller's)\n", label, count, block);
+    if (requestStart) perfDepth (gPerfRequests, -1);
+    rootDiagnosticFailure ("root window read failed (direct, held)");
+    return;
+  }
   if (result != kIOReturnSuccess) {
     __atomic_fetch_add (&native_ufs_block_failures, 1, __ATOMIC_RELAXED);
     gRootDiagnostic.result = static_cast<uint32_t> (result);
@@ -2674,14 +2688,20 @@ void NativeUfsBlock::serveRead (IOMemoryDescriptor *buffer, UInt64 block, UInt64
 // (wired) for the read and completed after it; the whole request is checked before the first command (whole device blocks, every
 // segment page aligned, whole pages, within the stream's reach, at most kMaxPrds entries per 1 MiB), so a request either goes
 // entirely this way or entirely through a bounce. Each command's pages are cleaned and invalidated before it and invalidated after it
-// (nothing writes them meanwhile: a read is in flight into them). A command that leaves the host quarantined (timeout, fatal status)
-// keeps the buffer prepared: the controller may still own its pages.
-bool NativeUfsBlock::readDirect (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, UfsWindowResult *outcome)
+// (nothing writes them meanwhile: a read is in flight into them). A failed piece ends the read with its error and the bytes of the pieces
+// before it, never a short success (review N1): a quarantine by another command shows as the next piece's refusal. A piece whose own
+// command quarantined the transport (it failed and the host was not quarantined before it: a timeout or a fatal status, the controller
+// may still own its pages) sets *held: the buffer stays prepared and serveRead never completes the request (review N2).
+bool NativeUfsBlock::readDirect (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, UfsWindowResult *outcome, bool *held)
 {
+  *held = false;
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
   (void) buffer; (void) block; (void) count; (void) outcome;
   return false;
 #else
+  // The window's geometry and the request's bounds, as the bounce path's ufsReadWindow checks them (review N3): a refusal here sends the
+  // request there, which answers kIOReturnBadArgument.
+  if (!ufsWindowGeometry (absolute, bytes) || !count || block >= bytes / 512 || count > bytes / 512 - block) return false;
   const uint64_t start = absolute + block * 512, length = count * 512;
   if (((start | length) & 4095) || !gDmaLimit) return false;
   if (buffer->prepare (kIODirectionIn) != kIOReturnSuccess) return false;
@@ -2709,17 +2729,22 @@ bool NativeUfsBlock::readDirect (IOMemoryDescriptor *buffer, UInt64 block, UInt6
     const unsigned prds = hostPrdsFromSegments (segments, at, piece, prd, gDmaLimit);
     if (!prds) { result.status = kIOReturnIOError; break; }   // checked above; the buffer is wired and cannot change
     hostFlushPhys (prd, prds);
+    const bool quarantinedBefore = gHost.poisoned;
     const uint64_t t0 = timerTicks ();
     result.status = hostReadPrd (0, (start + at) / 4096, static_cast<uint32_t> (piece / 4096), prd, prds);
     __atomic_fetch_add (&native_ufs_read_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
-    if (gHost.poisoned) break;   // the controller may still own the pages: no CPU access, buffer left prepared
+    if (result.status != kIOReturnSuccess && gHost.poisoned && !quarantinedBefore) {
+      *held = true;   // this command may still be live: no CPU access to its pages, the buffer stays prepared
+      break;
+    }
     hostFlushPhys (prd, prds);
-    if (result.status != kIOReturnSuccess) break;
+    if (result.status != kIOReturnSuccess) break;   // the error and the pieces before it
     result.done += piece;
     __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add (&native_ufs_bytes_read, piece, __ATOMIC_RELAXED);
   }
-  if (!gHost.poisoned) buffer->complete (kIODirectionIn);
+  if (result.status == kIOReturnSuccess && result.done != length) result.status = kIOReturnIOError;   // never a short success
+  if (!*held) buffer->complete (kIODirectionIn);
   hostPerfSpan (kUfsPerfDirect, directStart, result.done);
   *outcome = result;
   return true;
