@@ -29,15 +29,26 @@ is the frozen archive of the earlier Linux + Gunyah guest path. The map of repos
   "Snapdragon 8 Elite" chip, 13 GiB of RAM. Its root is on `linux_rootfs`; the owner's 200 GiB Data store spans `linux_data`
   (LBA 71859642, seed `9bd6f902`). The retired 27.0.1 volume/store was cleared and has no menu entry
   ([docs/persistent-boot.md](docs/persistent-boot.md) §13.8, [docs/results-2026-11-14.md](docs/results-2026-11-14.md)).
-  The USB root shell and ssh over the cable; charging that keeps going (level 2, the DSP started at once).
+  The USB root shell and ssh over the cable; charging that keeps going (level 2, the DSP started at once). The current ESP is
+  **v5** (installed 2026-11-14): it carries Wi-Fi's sleep and crash recovery. The desktop and the lock screen show Apple's stock
+  still picture and render right (run h1 on v5, photos).
 - Cameras: frames from both sensors and the first pictures through a user client (`piano-camera-grab`); a macOS camera
   extension is next ([docs/drivers/camera.md](docs/drivers/camera.md)).
-- Wi-Fi: the installed system joins by itself at boot (WPA2, DHCP, DNS, HTTPS; ESP v4, 2026-11-14), rejoins after a drop,
-  and in boot 10m came back by itself after a system sleep and after a firmware crash (ESP v5 brings that to the installed
-  system). The macOS Wi-Fi menu is in design ([docs/drivers/wifi-menu.md](docs/drivers/wifi-menu.md)); joining is a profile
-  file and our supplicant until then ([docs/drivers/wifi.md](docs/drivers/wifi.md)).
-- Latest results: [docs/results-2026-11-14.md](docs/results-2026-11-14.md) (Wi-Fi internet and the installed 27.3-only
-  whole-disk layout); the day before: [docs/results-2026-11-13.md](docs/results-2026-11-13.md).
+- Wi-Fi: the installed system joins by itself at boot (WPA2, DHCP, DNS, HTTPS), rejoins after a drop, and came back by itself
+  after a system sleep and after a firmware crash (boot 10m; ESP v5 brings both to the installed system — its first boot joined
+  on its own). The macOS Wi-Fi menu is in progress ([docs/drivers/wifi-menu.md](docs/drivers/wifi-menu.md)): airportd starts by
+  itself and runs scans through our driver (17 networks served, boot wm1), but its corewifi side has not adopted the interface
+  yet (wm2), so there is no menu network list yet; joining stays a profile file and our supplicant until then
+  ([docs/drivers/wifi.md](docs/drivers/wifi.md)).
+- Boot time is being worked on: most of launchd's 40 s is our 4 KiB code-signature pre-hash of the compressed dyld shared
+  cache (about 37 s on one CPU, hash-bound not disk-bound, probe ufs3). The owner decided 2026-11-14 to skip the eager
+  pre-hash on this development tablet behind a boot-arg switch (`cs-native4k-skip=1`, verification can be turned back on;
+  a parallel version stays the fallback); probes built, then into the installed ESP ([docs/boot-time.md](docs/boot-time.md) §9).
+- Not working yet: the Wi-Fi menu's network list and menu-driven joining, Bluetooth, the sensors, hardware video decode, and
+  a clean restart — every reboot of the 27.3 line ends in IOPlatformExpert's panic 30 s after the halt begins
+  (`Halt/Restart Timed Out`, console captures since 2026-11-13).
+- Latest results: [docs/results-2026-11-14.md](docs/results-2026-11-14.md) (Wi-Fi on the installed system with sleep and crash
+  recovery, the built-in `en0` handed to Wi-Fi, the boot-time probes); the day before: [docs/results-2026-11-13.md](docs/results-2026-11-13.md).
 - Most other drivers (power and charging, touch, keyboard cover, backlight, audio, sensors, thermal, USB host, video,
   Bluetooth, display processor, ...) are built and linked but inert behind their boot arguments, waiting for their tests on the
   tablet. Per-driver state: [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md) §7 and [docs/drivers/README.md](docs/drivers/README.md).
