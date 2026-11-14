@@ -19,7 +19,7 @@ Standing constraints for every item:
 
 | Ubuntu feature | Ours | Gap left |
 |---|---|---|
-| Internal display, screen off/on | NativeGopDisplay (GOP copy) + PianoBacklight (`piano-backlight=2`: levels, sleep off/on, lid opt-in) | real DPU path → B1 |
+| Internal display, screen off/on | NativeGopDisplay (GOP copy) + PianoBacklight (`piano-backlight=2`: levels, sleep off/on, lid opt-in) | real DPU path → B1; low priority: on the installed 27.3 lock screen (2026-11-14 13:02) the column behind the clock and the user picture is drawn in a lighter shade than the rest of the wallpaper, a vertical band from the date to the password field (inferred: the login window's backdrop/blur layer rendered without a GPU; not seen on the desktop) |
 | Brightness | PianoBacklight steps + kernel brightness keys | auto-brightness → B3 |
 | Touch, CSOT/BOE detection | PianoTouch (gpio100 + the unit's calibration panel id, firmware per panel, auto orientation; level 2: tap, hold, drag, two-finger scroll and tap, palm rejection as a HID pointer, host-tested) | Apple's multitouch path (trackpad gestures); a run with a finger; pen not in Ubuntu either |
 | Magnetic keyboard + touchpad, key wake | PianoKeyboard (keys, touchpad, gestures, adaptive polling); hall gpio80 read | wake from screen-off/suspend → B2 |
