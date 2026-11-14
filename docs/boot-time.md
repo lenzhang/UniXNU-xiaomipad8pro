@@ -407,3 +407,156 @@ Recommendation, **inferred** (the score's): put `cs-native4k-threads=6` without 
 (300,772 pages accepted without a hash, zero demand checks all boot) — keep it for dev/test RAM boots only, drop it after
 any install. The two switches are orthogonal. And before arguing over the last 7 s between a and b, chase the ~32 s
 post-EBC launch wave.
+## 10. The halt/restart timeout: result of probe halt1 (2026-11-14, confirmed on the tablet)
+
+This belongs here because every console `reset fastboot` pays for the halt bug: the restart hangs 30 s, panics, and the panic
+reboot reaches ABL only seconds later (halt1: 159 s from the reset command to fastboot). On the installed system it can also
+land in macOS instead of fastboot (§10.3).
+
+### 10.1 What halt1 answered
+
+Probe halt1 (k27 0068, boot-arg-gated `piano-halt-trace=1`, RAM boot 21:38:05, `reset fastboot` sent ~21:40:05) traced the
+whole of `PEHaltRestartInternal()`. **Confirmed on the tablet: the 30 s are the platform's own `haltRestart`, not a driver or a
+power-tree wait.** The sequence:
+
+- IOKit's halt phases finish in **38 ms** (t=99650 → 99688 ms):
+  - NVRAM sync returns at once — it fails (`e00002d8`: `serializeVariables` failed, no `_nvramController`) but takes 0 ms and
+    does not block (inferred: expected without an NVRAM controller driver);
+  - phase 'Notifying priority clients': **4 clients, each returned after 0 ms**;
+  - phase 'Notifying power plane drivers': `notifySystemShutdown` returned after 34 ms;
+  - phase 'Notifying HaltRestart action handlers': **0 registered** actions;
+  - phase 'Quiescing PM': one quiesce request against an **empty work queue (0 services)**, retired at once; PM quiesce
+    callback and PM quiesced at t=99687.
+- Then `piano-halt: ArmDTPlatform::haltRestart(1) -> (PE_halt_restart NULL)` and `haltRestart returned -1` at t=99688 —
+  **no restart was attempted**, and `IOPlatformExpert::haltRestart()` returns -1 when `PE_halt_restart` is NULL
+  (`iokit/Kernel/IOPlatformExpert.cpp:339-368`). Nothing happened afterwards until the 30 s timer fired at t=129651
+  (`piano-halt: timed out after 30 s`; the phase-named line `Restart timed out in phase 'Notifications completed'.
+  Total 30000 ms @IOPMrootDomain.cpp:6289` survives only in the run log's corrected copy). The panic path called
+  `haltRestart` again (-1) and then reached `piano-halt: PSCI SYSTEM_RESET (0x84000009) through smc` — the last marker, with
+  no return line — and that one **did** take the reset: the tablet was back in ABL fastboot 159 s after the command
+  (confirmed: `logs/native-runs/20261114-213805-loop/loop.log`). Inferred: the SMC reset wins the race with the return print.
+- PianoWifi's halt watch at +8 s and +20 s still read `0 service(s) with the shutdown not acknowledged` and
+  `0 of 15 power-plane service(s) with a power change in progress`: nothing was pending on the driver side while it hung.
+
+Evidence: the clean copy of the marker sequence is the dump boot's console replay
+`logs/usb-console/20261114-214008-port0.txt:15-83`, which cuts off at `haltRestart returned -1`; the tail (the 30 s timeout,
+the second attempt, the PSCI line) is in `private/host-checks/20261114-halt/halt1-mailbox.txt:4480-4597` with single-character
+bit flips (batch-wide), repaired, and in its majority-corrected copy `logs/native-runs/20261114-213805-loop/loop.log`. The
+live capture `halt1-console.out` ended before the reset and holds no halt markers.
+
+### 10.2 The same shape in 10p — the mystery it resolves
+
+10p's clean console line (`logs/usb-console/20261114-211416-port0.txt:92`):
+`PianoDwc3: reset: PEHaltRestart returned -1 after 242 ms: the shutdown notifications are done and the platform did not
+restart`, then the bare `Halt/Restart Timed Out @IOPlatformExpert.cpp:884`. Same -1, same "platform did not restart", same
+30 s timeout and panic reboot to fastboot — only the notifications' share differed (242 ms vs halt1's 38 ms). 10p could only
+place the blocker downstream of the notifications; halt1 pins it to `ArmDTPlatform::haltRestart` (the class method) answering
+-1 without trying, with `PE_halt_restart` NULL. 10p's hypothesis: **confirmed on the tablet.**
+
+### 10.3 The guard race during the hang (inferred)
+
+During a hang of this kind on the **installed** boot, the boot guard's 180 s health check can still run (the kernel is alive)
+and reset the restart reason back to normal, so the eventual panic reboot lands in macOS, not ABL fastboot. Inferred from the
+console: the 2026-11-14 20:39:50 `reset fastboot` on installed boot #1 reached the halt hang, and `piano-boot-guard: SDAM
+restart reason 0x04 -> 0x00 ... healthy after 180 s, restart reason normal` printed after the shutdown handoff lines
+(`logs/usb-console/20261114-203949-port0.txt:4915-4917`); the follow-on boot's launchd at 20:41:31
+(`logs/usb-console/20261114-210211-port0.txt:1292-1296`) shows it booted the installed system instead. Full analysis:
+`private/host-checks/20261114-a2run/WHY.md`. Practical rule (already in `boot-guard.md`): on the installed boot, send
+`reset fastboot` only after the guard has printed `healthy after N s`.
+
+### 10.4 Fix direction
+
+k27 0069 `piano-psci-halt`: give `PE_halt_restart` a real handler that performs PSCI `SYSTEM_RESET` itself (logging the
+reason), so `haltRestart` resets instead of answering -1. Target: `reset fastboot` reaches ABL fastboot without the 30 s
+hang and panic, which also removes the guard race of §10.3.
+## 11. The second half after the skip: launchd to the desktop (2026-11-14)
+
+With `cs-native4k-skip=1` the kernel part is done at 3.8 s (`Early boot complete`, confirmed tick in ufs4a); what is left is
+userland. Sources: ufs4a's console (`private/host-checks/20261114-ufs1/ufs4a-console.out`, RAM boot, `data-persist=0`), ufs3's
+`pc-sample=2` boot (the same RAM userland with the pre-hash, its CPU split per task every 2 s), the installed boots of
+`private/host-checks/20261114-flash/desktop-time.md` (v4b6, v5b3: persistent Data).
+
+**Timeline, uptime in s** (ufs4a; the GUI lines bracketed by the per-second iolog, +-0.5 s; launchd lines carry their wall clock):
+
+| Milestone | ufs4a (RAM, skip) | ufs3 (RAM, pre-hash) | v5b3 (installed, pre-hash) |
+|---|---|---|---|
+| launchd `hello` | 1.7 | 37.4 | 40.0 |
+| `Early boot complete` | 3.8 | 38.9 | 41.7 |
+| Installer Progress launched (AMFI line) | 3 | 38 | right after it (no per-second marker there) |
+| WindowServer opens the GPU | 6.8 | 40.5 | 43.0 |
+| ViewBridgeAuxiliary launched | 28 | 64 | ~49 |
+| Installer Progress opens the GPU | 33.5 | 69.5 | 49.4 |
+| first frame (black), SecurityAgent, loginwindow | 34.5-35.8 | 69.5-71.5 | 49.6-55.9 |
+| first lit frame (login window) | <= 44.5 (the first period line after the first frame says lit) | ~69.8 | 65.6 |
+| password typed (desk-login: lit frame + 10 s settle + polling) | ~60.8 | — | 76.6-83.4 |
+| Finder opens the GPU (the desktop) | 85.8 (25 s after the password) | — | 92.4 (~9 s after) |
+
+**Where it goes, ranked** (confirmed = read from those lines; inferred = the attribution):
+
+1. **The clocks (inferred to be the largest lever, every boot).** No profile sets `piano-cpufreq`, so the clusters stay where the
+   boot stages left them: PianoThermal's clock line (30/60/90 s of ufs4a, confirmed) reads cpu0-5 at ~1996 MHz (of 3532.8) and
+   cpu6-7, the ADT's P cores where the scheduler puts foreground work, at ~1016 MHz (of 4320; sustained 4089.6). ufs3's pc-sample
+   shows the second half as single threads at a core each (lsd, ReportCrashService, audiomxd ~0.8, configd ~0.5) with 40-55 % of
+   the samples idle: CPU-bound on slow cores, not waiting on the disk (NativeUfs busy 5-30 % of each second after 15 s, queue depth
+   0.0-0.3, ~150 us a command). Fix: **`piano-cpufreq-boost=S`** (PianoThermal, 2026-11-14, default 0): every cluster at its
+   sustained level until S s of uptime, PianoThermal's 90 C cluster ceiling on top in every mode, then the profile's own level
+   (without `piano-cpufreq`: the boot stages' level again). Host-tested (`thermal_host` testBoost). Probe ufs5.
+2. **The LaunchServices database, on RAM boots only (confirmed timing, inferred cause).** In ufs3, lsd runs at one full core from
+   44 to 66 s (pc-sample) and Installer Progress opens the GPU at 69 s, ~31 s after its launch; ufs4a the same 30 s (3 -> 33 s); on
+   the installed boots 7.7 s. A RAM test boot starts from the seed's Data volume, which has no LaunchServices database (and no
+   font registry, icon cache, ...): lsd rebuilds it every boot, and an AppKit launch waits for lsd. The installed system keeps it in
+   its store. Fix candidates, not done: a seed made after one desktop boot (the caches copied from a running RAM boot, e.g. over
+   ssh, into the seed: a new seed identity, the RAM images' only), or a test-only persistent store window. Every RAM desktop test
+   would gain ~20-25 s.
+3. **locationd's crash, on RAM boots (confirmed, cause open).** `ERROR: [locationd:78] FATAL exception: type=0x1 reason=0x1c
+   code=0x105` at ~8 s of ufs4a and ~45 s of ufs3, not on the installed boots; ReportCrashService then runs at one core for ~20 s
+   (ufs3 pc-sample; ufs4a: two instances, 120 MB high-water marks, killed at 28.5 s). Competes with lsd on the slow cores.
+4. **audiomxd and configd, every boot (confirmed in ufs3's pc-sample, `power.md` §1.2):** ~0.8 and ~0.5 core for the whole boot and
+   after it (no CoreAudio output device). Power more than boot time; `power.md`'s fallback (the jobs off) stands.
+5. **password -> Finder: 25 s on the RAM boot, ~9 s installed** (the user's first-login caches on the seed; iconservicesagent and
+   others at a core each, ufs3 76 s). Item 2's seed would cover it.
+6. **SecurityAgent -> visible login window**: <= 10 s here, 10-16 s installed (desktop-time.md F1). NativeGopDisplay's whole-frame
+   copy costs ~21.5 ms, 17.5 ms of it reading the surface uncached (ufs4a: `read 17456 us`). Copy mode bit 1 (cacheable reads,
+   DC CIVAC first) exists but never ran on the tablet: **`native-gop-display-copy-ab=1`** (2026-11-14) runs both on one boot, one
+   report period each, and the period line gives each mode's read and copy means.
+
+**Markers added for the next boots** (2026-11-14): PianoA830's `X opens the accelerator, type T: R (at N ms)` (every GUI process's
+GPU open with its uptime), NativeGopDisplay's `first frame (swap N) ... (at N ms)` and `first lit frame: frame N, P% non-black,
+mean #RRGGBB, at N ms (N ms after the first frame)` (once, at the first copied frame at least half lit).
+
+**ufs5** (`private/host-checks/20261114-ufs1/CHECKLIST-ufs5.txt`): ufs4a's switches + `piano-cpufreq-boost=120` + `pc-sample=2
+pc-sample-hz=500` + `native-gop-display-copy-ab=1`, kernel 0070 (0069's restart path, 0070's M4 hardening). The control is ufs4a
+(the same image line without the three); `ufs5b` (the same without the boost) separates the boost from the rest if needed.
+
+### 10.1 A warm RAM test seed (tooling/k27/warm-seed.py, 2026-11-14)
+
+Item 2 above, built: the RAM images' seed (seed-200, identity `9bd6f902`) has an empty `private/var/folders`, no `private/var/db/lsd`,
+an empty `Library/Caches` and a home whose `Library` holds only Compositions, Favorites, FontCollections, Input Methods and Preferences
+(`warm-seed.py inspect`, confirmed on the host): every RAM boot rebuilds LaunchServices' databases and every first login the home's
+caches. The installed system keeps them in its store and needs none of this.
+
+- **collect** (one desktop RAM boot, the USB network up, the Finder open and a minute idle): `tooling/k27/warm-seed.py collect --out
+  out/warm-k273-N` runs, as root on the tablet (`sudo -S` with the debug account's password from `private/login.secret` on stdin;
+  never in argv), an xz tar with numeric owners of `private/var/folders` (without the temporary `T` folders), `private/var/db/lsd`,
+  `Library/Caches` and the homes' `Library` (without Keychains and Logs), streamed over `tooling/native/desk-ssh.sh` to
+  `warm.tar.xz`; `collect.json` lists the largest parts.
+- **build**: `tooling/k27/warm-seed.py build --pack out/warm-k273-N/warm.tar.xz --out out/warm-k273-N/seed [--include GLOB]... [--all]`:
+  a copy of the seed (default `/Volumes/ExtSSD/k273/v2/seed-200.img`, trust cache the v4 layer's) with the pack, filtered (default:
+  LaunchServices' databases, lsd's, the font registry and the icon store; every parent directory and AppleDouble entry of a kept
+  member kept, so each folder keeps the tablet's owner and mode), at `private/var/piano/warm/warm.tar.xz`, and a root-owned
+  `private/etc/rc.server`: launchd's `rc.server` boot task (its log line `(rc.server) Doing boot task`, then `optional boot task not
+  present` today) runs it as root before any daemon; it extracts the pack (`tar -x -p --numeric-owner`) and prints
+  `warm-seed: the caches of pack P extracted before the daemons (tar rc N)` on the console. A pack whose system directories are not
+  root's (made anywhere but `collect`) is refused. The seed is mounted by hdiutil alone with owners honoured (`diskutil mount`
+  hangs on these images here some days, as `stage.py` found); `build` needs `sudo -n` on the build Mac for its two root-owned files.
+- The output seed is a **new identity**: `build-ram-images.py` gives its images `data-persist=0` (Data volatile, the tablet's store
+  untouched); `out/warm-seeds.json` registers it and `verify-ram-images.py` fails an image of it with any other mode.
+- **Budget**: `build-ram-images.py` refuses images over 250 MB (`IMAGE_MAX_BYTES`); today's images are 237.3 MB, so the pack has
+  ~12 MB (xz-compressed). `stage.json`'s `grew_bytes` is the seed's growth; narrow `--include` if it does not fit.
+- **Regenerate** after a new seed, a new userland layer or a system update: collect on a desktop boot of the new image, build again.
+- Dry run on the Mac (no tablet content): a tar of a dummy tree, `build --test-pack` (skips the owner check), then
+  `build-ram-images.py --seed <out>/scratch-data.img --trust <out>/kernel.macho.trustcache ...`, then `verify-ram-images.py`; remove
+  the dummy's entry from `out/warm-seeds.json` afterwards. Host test: `tooling/k27/test-warm-seed.py`.
+- Open (the first warm boot answers both): that launchd runs `rc.server` (the console line, before `Early boot complete`), and that
+  lsd keeps the collected database (Installer Progress's `opens the accelerator (at N ms)` near the installed boots' ~8 s after
+  `Early boot complete`, lsd's pc-sample share small).
