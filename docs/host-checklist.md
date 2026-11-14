@@ -14,8 +14,10 @@ builds or checks a 27.0.1 image.
 - **Never publish**: no `private/publish.sh`, no `git push`, no commits. Leave tracked files unchanged; if a check writes into
   `out/`, that is listed below.
 - Do not run two checks that write `out/native-kexts/` at the same time, and none while someone builds in the same checkout.
-- Working directory for every item: the repository root of the main checkout (`UniXNU-piano/`). Run `source ~/.config/piano/env`
-  first in the same shell (it sets `PIANO_K27_TREE`, `PIANO_V110` and the backup paths) and use `bash` for shell snippets.
+- Working directory for every item: the repository root of the main checkout (`UniXNU-piano/`). Start the shell with
+  `set -a; source ~/.config/piano/env; set +a; export PATH=/opt/homebrew/bin:$PATH; unset SDKROOT` (the env file's
+  variables exported to the scripts; `python3` must be 3.11 or newer for `tomllib`: check `python3 --version`; the kext
+  compiles must not see an `SDKROOT`) and use `bash` for shell snippets.
 - In the tables, `\|` is Markdown's escape of `|`: type a plain `|` in the shell.
 - **Results:** make one directory per session, `R=private/host-checks/$(date +%Y%m%d-%H%M); mkdir -p "$R"` (`private/` is
   git-ignored). Each item writes `"$R"/NN-name.log` (its full output, `2>&1`). At the end write `"$R"/SUMMARY.md` with one line
@@ -69,7 +71,7 @@ Pass per driver: exit 0, and its log has no line starting with `FAIL` and no `Er
 | 4.1 | `for j in out/ram-k273-*/build-A-bundled.json; do echo "== $j"; python3 tooling/bootimg/verify-ram-images.py "$j" 2>&1 \| tail -1; done > "$R"/41-verify-k273.log` | every 27.3 image set prints `PASS: 0 failure(s)`. The image limit is 250,000,000 bytes: an older oversized set (if one still exists) must FAIL; name it in the summary |
 | 4.2 | `shasum -a 256 out/persistent/esp-dual33d-k273d.img > "$R"/42-esp.log; python3 -c "import json;print(json.load(open('out/persistent/esp-dual33d-k273d.json'))['sha256'])" >> "$R"/42-esp.log` | both lines show `93baea7af730611145f97e51b09b1779dbacd043700aa5f156b044d56a855f59` (the ESP installed on 2026-11-13 09:45) |
 | 4.3 | `python3 tooling/adt/check-ram-window.py --adt out/ram-k273-bootargs/piano-k27.adt --kc out/ram-k273-bootargs/kc-k27-native.bin --fd out/fd/piano-uefi-A-bundled.fd > "$R"/43-ram-window.log 2>&1` | exit 0; the last line names the window `0x8c0004000..0xbffe04000 (13310 MiB)` |
-| 4.4 | `python3 tooling/adt/boot_args.py --show out/ram-k273-bootargs/piano-k27.adt > "$R"/44-adt-args.log 2>&1` | exit 0; one set `piano-boot-args-ram` of 408 bytes is listed |
+| 4.4 | `python3 -c "import json;print(json.load(open('out/ram-k273-bootargs/build-A-bundled.json'))['boot_args'])" > "$R"/44-adt-args.log 2>&1` | exit 0; the record names the set `ram` and a tail of 407 bytes (the ADT in that folder is the build's input, before the set was added, so `boot_args.py --show` on it finds none) |
 | 4.5 | `for d in "$PIANO_BACKUP_DIR"/persistent-boot-*/; do echo "== $d"; (cd "$d" && shasum -a 256 -c SHA256SUMS); done > "$R"/45-backups.log 2>&1` | every file `OK`; no `FAILED`. These are the pre-write backups of the tablet's partitions on the external SSD (read only) |
 | 4.6 | `(cd "$(eval echo "$PIANO_BACKUP_NAS")" 2>/dev/null && for d in persistent-boot-2026111[23]-*/; do echo "== $d"; (cd "$d" && shasum -a 256 -c SHA256SUMS); done) > "$R"/46-backups-nas.log 2>&1` | if the NAS is not mounted: SKIPPED. Otherwise every file `OK`, and every set of 4.5 also exists here (the background copy finished) |
 
@@ -94,7 +96,7 @@ write the output to `"$R"/5N-*.log`.
 | 6.2 | Privacy audit of the tracked tree without publishing: `P=$(sed -n "s/^P='\(.*\)'$/\1/p" private/publish.sh); git grep -I -l -E "$P" HEAD -- . > "$R"/62-privacy.log; wc -l < "$R"/62-privacy.log` | `0` (no tracked file matches the private-inventory pattern). Do not print the pattern itself into any shared place |
 | 6.3 | Working tree clean: `git status --short > "$R"/63-status.log; wc -l < "$R"/63-status.log` | `0` before and after the session (the checks above must not change tracked files) |
 | 6.4 | README states the current system: `grep -n -E "macOS 27\.3 \(26C5035r\)" README.md > "$R"/64-readme.log` | at least one line |
-| 6.5 | The native kext list and its descriptors agree: `python3 tooling/k27/check-native-kexts.py . tooling/k27/kext/*.json > "$R"/65-kext-list.log 2>&1` | exit 0 |
+| 6.5 | The native kext list and its descriptors agree: `python3 tooling/k27/check-native-kexts.py . tooling/k27/kext/*.json > "$R"/65-kext-list.log 2>&1` | exit 0. It needs section 2's objects in `out/native-kexts/`: run it after section 2 passed; if section 2 failed, record SKIPPED |
 
 The snippet for 6.1:
 
