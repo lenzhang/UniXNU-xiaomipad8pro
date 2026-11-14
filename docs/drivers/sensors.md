@@ -8,7 +8,9 @@ consumer needs it, published as the properties §5 reserved (§5c). Host-tested 
 only, a simulated DSP and hub, the pack on an mtools FAT32 image and in a RAM image's addon, the kernel's no-FP/no-libc compile), compiled
 with the kernel's flags and **linked into the KC** (`configs/k27-native-kexts.txt`, after PianoPower and NativeUfs; the 2026-11-11
 link with level 4: PianoSensors 461 pointers among 21 native kexts, the native kext rule passed), inert without
-`piano-sensors` (and level 4's parts below `piano-sensors=4`). **Not run on hardware.** Template: `README.md`. The macOS-side consumers
+`piano-sensors` (and level 4's parts below `piano-sensors=4`). **On the tablet (2026-11-14):** S1 passed; S2's adsp_listener init2 was
+answered EBADPARM and the sensor PD's watchdog then took the ADSP (§8.2); the framing fix and rule 7 are host-tested, the s1b probe
+is built, not yet run. Template: `README.md`. The macOS-side consumers
 (the rotation agent `piano-rotated`, PianoTouch's transform, PianoBacklight's automatic mode) and the streams' off/on lifecycle, which the
 kext now runs itself, are `package/PianoAuto`, host-tested (§5a).
 
@@ -38,7 +40,7 @@ Project-SunUEFI `docs/devel/hardware/sensors.md`; PAG = PaganiSensors 3d570b7; R
 | FastRPC channel | GLINK `fastrpcglink-apps-dsp` on the `lpass` edge, label `adsp`, **secure** domain (no `qcom,non-secure-domain`: Linux's `/dev/fastrpc-adsp-secure`, the node Ubuntu uses) | DT, UBU udev rule | verified (DT) |
 | Natively | with PianoPower level 2 the DSP **opens `fastrpcglink-apps-dsp`** (with glink_ssr, pcie_drv, mhi_sat, LOOPBACK_CTL_LPASS, adsp_apps, bt_cp_ctrl); nobody served it for 215 s and the DSP stayed up (slave-kernel 0x6: ready + handover, no fatal); the router listed 12 remote services (which: not logged) | RUN | **verified (hardware)** |
 | Sessions | `compute-cb@3..8`, `reg` 3..8, `dma-coherent`; cb@3: SMMU streams `0x1003` mask 0x80 and `0x1043` mask 0x20 (cb@7: 0x1007/0x40, 0x1067, 0x1087). Linux hands out the first free session (sid 3). DMA mask 32 bits; the session id goes in address bits 32 and up (`sid_pos` 32 for `qcom,fastrpc`). `qcom,vmids` LPASS + ADSP_HEAP and the 12 MiB `adsp-rpc-remote-heap` serve static-PD creation (audio PD), not the sensors attach | DT, FRPC | verified (source) |
-| Invoke wire | GLINK message of 40 bytes `{s32 client_id, s32 tid, u64 ctx, u32 handle, u32 sc, u64 addr, u64 size}`, answer `{u64 ctx, s32 retval}`; ctx = context id << 4 \| PD (sensors PD = 2); sc = attr<<29 \| method<<24 \| in<<16 \| out<<8 \| in-handles<<4 \| out-handles; addr/size = the payload: n `{u64 pv, u64 len}`, n `{u32 num, u32 pgidx}`, n `{u64 addr, u64 size}` (page lists, DMA address \| sid<<32), 16 u64 fds, 64 u32 crcs, then the inline buffers (128-byte aligned); attach to the sensors PD = handle 1 (`FASTRPC_INIT_HANDLE`), method 0, one in-buffer {client id}, message client id 0 (`FASTRPC_IOCTL_INIT_ATTACH_SNS`) | FRPC | verified (source) |
+| Invoke wire | GLINK message of 40 bytes `{s32 client_id, s32 tid, u64 ctx, u32 handle, u32 sc, u64 addr, u64 size}`, answer `{u64 ctx, s32 retval}`; ctx = context id << 4 \| PD (sensors PD = 2); sc = attr<<29 \| method<<24 \| in<<16 \| out<<8 \| in-handles<<4 \| out-handles; addr/size = the payload: n `{u64 pv, u64 len}`, n `{u32 num, u32 pgidx}`, n `{u64 addr, u64 size}` (page lists, DMA address \| sid<<32), 16 u64 fds, 64 u32 crcs, then the inline buffers (128-byte aligned); **every invoke carries that payload page, also one without buffers** (`fastrpc_internal_invoke` always runs `fastrpc_get_args`: 384 zero bytes, size 4096, the sid above bit 32); the message's tid is the calling task's id, not the client id; attach to the sensors PD = handle 1 (`FASTRPC_INIT_HANDLE`), method 0, one in-buffer {client id}, message client id 0 (`FASTRPC_IOCTL_INIT_ATTACH_SNS`); release = handle 1, method 1 (`FASTRPC_RMID_INIT_RELEASE`), the same in-buffer, client id 0, sent when the daemon's file closes | FRPC | verified (source) |
 | Listener | remotectl = handle 0 (open 0, close 1: `{name len, err len}` + name -> `{handle, err}` + text); `adsp_default_listener` opened by name, method 0 registers; `adsp_listener` = handle 3: init2 3, next2 4 (inlines 256 bytes of the DSP's call, first call ctx 0 result -1), get_in_bufs2 5; HLOS side: `apps_remotectl` (handle 0), `apps_std`, `apps_mem`, `adspmsgd_apps`; the DSP's call is answered at the next next2 | IDL, HRPC | verified (source) |
 | `apps_std` | methods 0 fopen, 3 fclose, 4 fread, 5 fwrite, 8 ftell, 9 fseek, 10 flen, 12 feof, 19 fopen_with_env, 20 fgets, 22 fileExists, 24 fremove, 26-28 opendir/closedir/readdir, 29 mkdir; 31 is the escape (the real id in in-buffer 0's first word): stat 31, ftrunc 32, frename 33 (sc `0x1f030000`); errors AEE 0xe EBADPARM, 0x14 EUNSUPPORTED | IDL, HRPC | verified (source) |
 | What the PD reads | `/vendor/etc/sensors/sns_reg_config`, `/vendor/etc/sensors/config/*.json`, `/odm/etc/sensors/config/json.lst` + `*.json` (piano needs the ODM tree: HRPC 0003), `/mnt/vendor/persist/sensors/registry/{registry/, sns_reg_version, parsed_file_list.csv}` (also as `/persist/...`), `/sys/devices/soc0/{soc_id, revision, machine, family, platform_subtype(_id), platform_version, hw_platform}`. It **writes** each registry group as `registry/fstempfile` then frename into `registry/registry/` (about 110 per attach on piano) | HRPC 0003/0004/0007, UBU `sensors-prepare` | verified (source); the native list: needs-boot (S3) |
@@ -85,10 +87,16 @@ Cross-checks written here from the other sources, not from PAG (`tests/piano.c`)
 QMI frames against libqmi (also parsed by PianoPower's own `qcom_qmi_parse`), and the file service's whole bring-up against FRPC and the
 IDL: attach `sc 0x00010000` with client id 0, open `0x00020200` "adsp_default_listener", register `0`, close `0x01010200`, init2
 `0x03000000`, first next2 `0x04020200` {0, -1, 0, capacity}, the metadata layout and bank 3 in bits 32 and up. PAG's vector 4 is now framed
-by PianoPower's QcomQrtr. All pass. Two deviations of PAG from Linux, both kept for now: ctx = id << 8 \| PD (Linux id << 4 \| PD; the DSP
-echoes it, the PD sits in the low bits either way), and the buffers sit at fixed arena offsets with the message's `addr/size` covering only
-the metadata page (Linux: one contiguous payload). The DSP maps each buffer by its page list; if S3 shows a refusal, the contiguous
-layout is a contained change in `SensorsRpc.c`'s `invoke()`.
+by PianoPower's QcomQrtr. All passed, and missed one fact: both simulated DSPs (PAG's and ours) required `addr 0 size 0` for an invoke
+without buffers, which is PAG's framing, not Linux's (§2: Linux sends the payload page with every invoke). The tablet's first S2 answered
+exactly those two invokes differently: register took it, adsp_listener's init2 answered EBADPARM (§8.2). Since 2026-11-14 the framing is a
+session property (`SSR_FRAME_*`, `piano-sensors-rpc-frame`): **meta** (the default) sends Linux's page with every invoke; an init2 answered
+with an error is tried again in the same session with **ctx4** added (ctx = id << 4 \| PD as Linux's tree; PAG: id << 8 \| PD, which leaves
+bits 4..7 clear) and then **tid** (a thread id of its own, as Linux's task id; PAG: the client id); the framing that is answered 0 serves the
+session. The simulated DSPs now hold the page to Linux's fact (`tests/bringup.c` scripts the three framings). One deviation stays: the
+buffers sit at fixed arena offsets with the message's `addr/size` covering only the metadata page (Linux: one contiguous payload). The DSP
+maps each buffer by its page list (remotectl open's name and handle went through it on the tablet); a refusal of that would be a
+contained change in `SensorsRpc.c`'s `invoke()`.
 
 ## 5. IOKit family / ABI: the architecture
 
@@ -520,6 +528,9 @@ PianoBacklight told to leave automatic mode: 0x0`, `light: QRTR port 24 closed`.
 | `piano-sensors-smmu=0` | 1 | leave the SMMU alone at level 2 (the streams must bypass already) |
 | `piano-sensors-settle=S` | 20 | seconds of the charger's newest generation before the first request |
 | `piano-sensors-nopack=1` | 0 | level 2 with an empty pack (every open fails and is logged) |
+| `piano-sensors-rpc-frame=N` | 1 | the file service's first framing (§4): bits 1 Linux's metadata page with every invoke, 2 Linux's ctx numbering, 4 a thread id of its own; 0 PaganiSensors' framing (the 2026-11-14 control: with the ladder, the same session then goes on with 1) |
+| `piano-sensors-rpc-ladder=0` | 1 | an init2 answered with an error is not tried again with the next framing |
+| `piano-sensors-rpc-deadline=S` | 15 | the attach answered -> listening at most (5..45 s); then the session is released (§7 rule 7) |
 | `piano-sensors-channel=0` | 1 | level 1 does not register the FastRPC channel |
 | `piano-sensors-delay=S`, `-log=0..2` | 0, 1 | wait first; log volume (2: every SNS line) |
 | `piano-sensors-als=0\|1\|2` (level 4) | 1 | the light stream: 1 while PianoBacklight's automatic mode takes targets (`piano-backlight=2 piano-backlight-auto=1`, not manual by the user's choice); 2 always (lux without a consumer: S4); 0 never |
@@ -554,6 +565,15 @@ level 4 adds none: its requests take the same tokens and count as the same failu
    PD thread, which `sns_watchdog` kills the DSP for); more than 3000 file calls in a minute (a PD in a loop): off.
 6. Read only: persist and the pack are never written; no per-unit value is logged at default levels; only the allowlisted soc0 names
    (no serial number) are served.
+7. The sensor PD is never left waiting (2026-11-14, §8.2): once the attach is answered, the PD asks its files through the listener, and a
+   PD thread unanswered for about a minute is what `sns_watchdog` kills the whole DSP for. So the bring-up after the attach takes no
+   tokens and holds only for PianoPower's quiet; it has a deadline (15 s, `-rpc-deadline`); every stop after an answered attach (a step
+   refused, the framing ladder exhausted, next2 failing, the deadline, a strike before the listening) first sends Linux's INIT_RELEASE
+   (handle 1, method 1: what the PD gets when Linux's daemon goes away), unless the DSP shows a fatal sign, a crash reason or another
+   link or charger generation (a dying DSP is never touched; the release is then withheld and said). Such a stop is a strike
+   (`the file service failed after the attach`): without its files the PD has no sensors, and the SNS client and the streams stop too.
+   Before an answered attach a stop stays one failure (rule 4). Whether the release itself ends the PD's waiting is inferred (Linux sends
+   it at every daemon exit); s1b shows it only if the bring-up fails again.
 
 ## 8. Hardware test plan (after PianoPower level 2 is healthy; attended, RAM boot, charged battery, cable attached)
 
@@ -562,7 +582,7 @@ Every run with `piano-power=2` (PianoPower starts the DSP; the sensors never do)
 | Level | What runs | Pass | State, effort |
 |---|---|---|---|
 | S1 survey | `piano-sensors=1`: health through the guard, the channel registered, the SNS port, the pack loaded and checked, the SMMU entries of 0x1003/0x1083/0x1043/0x1063 planned (loads only), the arena address checked (not mapped); no message to the DSP | `piano-sensors-dsp` up with `charger_pd 0x1fffffff`; `-guard run` 20 s after; `-channel 1` (the DSP's open answered); `-sns` announced; `-pack ok` with all four items; `-smmu` and `-arena` listed; no fatal and the charger generation unchanged for 10 min | built; 1 boot |
-| S2 files | `=2`: the arena (0x9d200000 by default) mapped, the streams bypassed, attach (bank 3, then `-bank=4`), listener, every DSP call answered from the pack, writes declined | `rpc: attached to the sensors PD`, `listening`, `first call of the DSP`, `rpc open` lines for sns_reg_config, json.lst and the registry; `-rpc` declined 0; the refused writes counted; no fatal for 15 min, charger unchanged | built; 2-4 boots |
+| S2 files | `=2`: the arena (0x9d200000 by default) mapped, the streams bypassed, attach (bank 3, then `-bank=4`), listener, every DSP call answered from the pack, writes declined | `rpc: attached to the sensors PD`, `listening frame=...` (§8.2), `first call of the DSP`, `rpc open` lines for sns_reg_config, json.lst and the registry; `-rpc` declined 0; the refused writes counted; no fatal for 15 min, charger unchanged | built; 2-4 boots |
 | S3 sensor list | `=3`: + SUID lookups and attributes, no stream | `-types`: registry, accel, gyro, ambient_light, proximity, mag found with names and rates (without the file service, as SUN saw: accel none); guard `run` all along | built; 1-2 boots |
 | S4 streams | `=4`: light on change -> `piano-sensors-light-target` / PianoBacklight; accel 10 Hz while the cover is detached -> `piano-sensors-edge`; 20 light off/on cycles; the streams off before a system sleep (§5c, §8.1) | lux follows a lamp, the backlight within 2 s; readings after every cycle (v1.1.1); the four edges named right (fix `-axes` if not); `ready for the sleep` before each sleep | built and host-tested; 3 boots (§8.1) |
 | S5 rotation | the agent (staged and signed like the GPU plugin), the cover lock, touch rotation (the consumers' work) | each edge upright with touch at the four corners (Ubuntu's table); attached -> normal | 3-5 days, 2-3 boots |
@@ -598,6 +618,46 @@ charger generation change or failed pass; the tablet's normal boot is a reboot a
 | S4 | `s4` (`-als=2 -rotate=2`: no consumer needed) | a lamp off and on; off the stand: each edge up in turn, then flat; the cover attached and detached; `pmset displaysleepnow` and a key, 20 times | `-lux` follows the lamp within 2 s; `-edge` names the four edges right (else `piano-sensors-axes`, Ubuntu's table) and `none` flat; `accel: off (cover attached)` and on again; a `first sample` line after every wake; `-streams` 0 unanswered, 0 errors; no strike, the charger generation unchanged after 20 min |
 | S4c | `s4c` (the consumers decide) | the lamp again; `piano-backlight-percent` (manual), then `piano-backlight-auto` 1 (setProperties, backlight.md §5) | the backlight follows the lamp within 2 s; manual: `light: off`, `-streams` `consumer: PianoBacklight is in manual mode`; automatic again: a first sample at once |
 | S4z | `s4z` (k27 0062: three test sleeps) | nothing: the sleeps come every 120 s | before each sleep `streams: ready for the sleep after N ms` with N below 800 and no `ports closed`; after each wake `streams: awake` and fresh sessions; the room's level at once |
+
+### 8.2 The first S2 (2026-11-14) and the s1b probe
+
+The batch-2 `adsp` RAM run (level 4, PAG's framing) passed S1 and stopped S2 one step before serving. Console, in order (the file
+service's `ms=` count from its start, about T0; T = the drivers' `[Ns]`):
+
+| T | Line | Meaning |
+|---|---|---|
+| 25.9 | `rpc attached to the sensors PD pa=0x9d200000 bank=3 ms=25890` | attach answered 0 (bank 3, the arena reached through the bypassed stream) |
+| 25.9 | (no `remotectl open failed`, no `register failed`) | open, register (no buffers, addr 0) answered 0; close unchecked |
+| 25.9 | `rpc FAIL st=-6 err=-2147482610 adsp_listener init2 failed` | init2 (handle 3, method 3, sc 0x03000000, no buffers, addr 0 size 0) answered by the DSP (ctx matched) with 0x8000040e = AEE EBADPARM |
+| 25.9 | `file service stopped: stage -6 error -2147482610`, `guard: backoff`, `guard: run` | the service ended; one failure for the guard; S3's lookups went on (all `found=0`) |
+| 83 | `qrtr: the DSP asks the locator for "qsh_process": not answered` | the sensor PD's process asks the locator (not in PianoPower's table) |
+| 84.5 | `crash reason: err_qdi.c:1215:EF:qsh_process:0x4:UTIMER_CLIENT_4:0x1000002f:sns_watchdog.c:84:` | the sensor framework's watchdog, 59 s after the attach: the whole ADSP down, the charger with it (every mca request timed out until the 900 s reset) |
+
+Root cause of the EBADPARM (**inferred from the code**, not yet confirmed on the tablet): the init2 message differs from Linux's in
+three ways, and only one of them is specific to invokes without buffers, the kind init2 is: PAG sent no payload page (`addr 0 size 0`)
+where Linux always sends one (§2, §4). The two others (ctx numbering, the tid) applied equally to open and register, which were answered
+0. Ubuntu's hexagonrpcd made the same calls in the same order (attach, open, register, close, init2, next2) on the same firmware, and its
+init2 was answered 0. Register (a dynamically opened handle) took the page-less invoke; adsp_listener's static handle evidently does
+not. The fix: Linux's page by default, the ladder for the two weaker candidates, all in the same session (§4).
+
+Why the ADSP died (**inferred**, from the timing): the attach (or the register after it) lets the sensor PD start asking its registry
+and configuration through the listener; with init2 refused nothing ever served next2, and a PD thread waited until the watchdog. With no
+attach at all the DSP stayed up (PianoPower level 2 with nobody serving the channel, 215 s, 2026-11-11). Rule 7 (§7) now ends such a session with Linux's INIT_RELEASE within the
+deadline and strikes the guard.
+
+**s1b** (one RAM boot, the batch's adsp recipe with only the sensor and charging arguments, `piano-sensors=4 -als=2 -rotate=2 -settle=20`,
+the defaults `-rpc-frame=1 -rpc-ladder=1 -rpc-deadline=15`): what it must show, and where.
+
+| Question | Pass (console line, or `ioreg -rc PianoSensors -l`) |
+|---|---|
+| The framing | `file service: rpc-frame=1 (meta) ladder=1 deadline=15 s`; `rpc attached to the sensors PD ... frame=meta deadline=15000` |
+| init2 answered 0 | `rpc listening frame=meta inits=1 ...`: H1 (the page) confirmed. `frame=meta+ctx4 inits=2` or `frame=meta+ctx4+tid inits=3` (each refusal logged as `rpc init2 frame=... answered rc=0 value=...: next frame=...`) name the other cause. `adsp_listener init2 failed` after three: none of the three |
+| The file service serves | `rpc first call of the DSP handle=... sc=...`; `rpc open` lines for sns_reg_config, json.lst and the registry; `-rpc` `declined 0`, `release none`; refused writes counted, no loop |
+| S3 | `-types` with `found N: name (vendor) ...` for registry, accel, gyro, mag, ambient_light, proximity (S2 working is what S3's `found=0` was missing) |
+| S4 | `light: on (on change) session=1`, `light: first sample: lux=...`, `accel: on (10.000 Hz asked) session=1`, `accel: first sample: ...`; `-lux`, `-edge`, `-seq`, `-streams` set |
+| No DSP fatal for 10 minutes | no `the DSP reports a FATAL error`, no `crash reason`, `-dsp` `fatal 0/0`, guard never `off`, charger generation 1 throughout |
+| Charging unchanged | PianoPower's mca writes `ok (0)` with read-backs `as written`, `[Ns] mca:` lines without timeouts, the same policy steps as the batch run |
+| If the bring-up fails anyway | `rpc released the sensors PD's session rc=0 value=0 ms=N after the attach` with N below 16000, then `guard: off: the file service failed after the attach`; whether the DSP then stays up past T+90 s answers whether the release ends the PD's wait |
 
 ## 9. Fallback
 

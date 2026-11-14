@@ -9,7 +9,8 @@
 //                    entries of the sensors PD's streams planned (loads only); the arena address checked, not mapped.
 //   piano-sensors=2  + the FastRPC reverse file service (SensorsRpc.c): the arena mapped, the streams through a bypass bank, attach to
 //                    the sensors PD, the listener, every DSP file call answered from the pack in memory, writes declined; the guard's
-//                    tokens before each bring-up call, its strikes after, its decline mode once off.
+//                    tokens before the attach, its strikes after, its decline mode once off; between the attach and the listening a
+//                    deadline and, at any stop, the session released first (sensors.md §7 rule 7: the PD is never left waiting).
 //   piano-sensors=3  + the SNS client (SensorsClient.c): SUID lookups and attributes, the sensor list published; no stream.
 //   piano-sensors=4  + the streams (SensorsStream.c, sensors.md §5c): the ambient light on change and the accelerometer at 10 Hz,
 //                    each on a QRTR port (a QMI client) of its own, only while a consumer needs it (the light: PianoBacklight's

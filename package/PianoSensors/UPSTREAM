@@ -21,9 +21,17 @@ sources (qualcomm/sensinghub, qualcomm/fastrpc), Linux and hexagonrpc read for f
     SensorsRpc.c (ea11dc684c4196c860a07f0d44a2af9d7f832682cc01d43e0ea4106ce95e1def) and SensorsRpc.h
       (b8bf81c2a885182e9e73c815d35f00d4913bcd198dbd5720b04edaac79d5274d): one op added at the end of SsrOps, admit(), asked once for
       each call of the DSP before it is served (0: answered at once with SSR_EUNSUPPORTED and no out buffers), and a declined counter at
-      the end of SsrStatus; the rest unchanged. PianoSensors' guard declines every call once it is off, so the DSP never waits.
+      the end of SsrStatus. PianoSensors' guard declines every call once it is off, so the DSP never waits. After the tablet's first
+      S2 (2026-11-14, docs/drivers/sensors.md 8.2): the framing of a session (SSR_FRAME_*: Linux's metadata page also with an invoke
+      without buffers, the default; Linux's ctx numbering; a thread id of its own) with SsrConfig's frame, no_ladder and deadline_ms at
+      its end, the init2 ladder over them; Linux's INIT_RELEASE (handle 1, method 1) before every stop after an answered attach, gated
+      by a tellable op at the end of SsrOps; a deadline between the attach and the listening; ssr_core_bringing_up, ssr_core_overdue,
+      ssr_core_abort, ssr_frame_name; frame, inits and release at the end of SsrStatus. The rest unchanged.
     Test/rpc.c (dd1a71762a127d344fbc65248cc011f538ef9feff812c7a791175f73e1381edc) -> tests/rpc.c: its SsrOps initializer gains the
-      admit field (0: every call served); the test is otherwise unchanged.
+      admit and tellable fields (0: every call served, always told) and its SsrConfig the three new ones (0: the defaults); the simulated
+      DSP takes Linux's metadata page with every invoke (it required addr 0 size 0 for an invoke without buffers, PAG's framing, not
+      Linux's), answers the release and counts it; the open-refused scenario runs with a 60 s deadline (PAG's 16 tries), one more runs
+      the default deadline; the attach-refused, open-refused and next2-failing scenarios check what was released. Otherwise unchanged.
     Test/wire.c (56299949030a17abdddf0541c932e145c7ff4c779abaa3a9f9769c312be62fae) -> tests/wire.c: one include changed; vector 4 (the
       QRTR data packet around an SNS request) is framed by PianoPower's QcomQrtr.c through tests/qrtr_frame.h (new) instead of
       PaganiAdsp's qcom_qrtr_frame, so the vector checks the router piano really uses.
@@ -53,7 +61,7 @@ New here (UniXNU-piano): PianoSensors.cpp (the kext: levels 1-4 on PianoPower's 
 governor), SensorsHealth.h (PianoPower's health report as the guard's observation), SensorsPolicy.c/.h (piano's facts, the arena check,
 the light curve, the rotation policy), SensorsClient.c/.h (level 3's SNS client: lookups and attributes), SensorsStream.c/.h (level 4's
 streams), SensorsLoad.c/.h (the pack from the ESP), SensorsAddon.c/.h and tools/sensor_addon.py (the pack carried by a RAM test
-image), tests/piano.c, tests/streams.c, tests/load.c and tests/addon.c (their tests and the independent cross-checks),
+image), tests/piano.c, tests/bringup.c, tests/streams.c, tests/load.c and tests/addon.c (their tests and the independent cross-checks),
 tests/qrtr_frame.h, tests/run-host-tests.py.
 
 UniXNU's boot addon, as a format only (no code taken): the container layout of UniXNU's scripts/make-gpu-addon.py ("NGPUADD2", the
