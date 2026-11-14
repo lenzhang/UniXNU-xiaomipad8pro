@@ -179,3 +179,27 @@ The 27.3 store's seed is its base from now on: every later ESP's `macos-27.3` mu
 (`out/inputs/k273/store-seed/scratch-data.img`, identity 89860516...), as the 27.0.1 line keeps its base seed (docs/data-store.md §9).
 Its RAM test: `build-ram-images.py` with `PIANO_EXACT_ARGS` = the entry's line (`out/ram-k273-entry`): the same payload and the same
 arguments, `data-persist=2` on the new store (its first boot creates the store; the installed entry then resumes it).
+
+## 7. 27.3 only (2026-11-14): the 27.3-only ESP, then linux_rootfs retired
+
+Owner decision 2026-11-14: the 27.0.1 line goes. First the installed dual ESP is replaced by one with the 27.3 entry alone, then,
+once that has booted, linux_rootfs (the 27.0.1 system volume and its Data store) is backed up and cleared. The recipe, its checks
+and its rollbacks are [persistent-boot.md](persistent-boot.md) §13.
+
+`tooling/k273/build-k273-esp.py` takes `macos-27.3` from the dual ESP (`esp-dual33d-k273d`, `93baea7a…`) byte for byte: the
+entry's four files in `Payloads/k273/` (collection `3fd3ed71…`, ADT `7e1ce73d…`, trust cache `72ebcaf8…`, seed `848c8252…`), the
+entry's table with its 989-byte line, and the firmware its collection pins. It adds a `fastboot` entry on the same payload (no UFS
+root, no store, no `piano-*` driver, reset after 1 s) and the actions; it has no 27.0.1 payload and no entry that uses linux_rootfs.
+Result: `esp-k273-only.img`, sha256 `9fe17e65015f8c16743bd1faf3c64e060003784a934c409261a021134a4dff3b`. No `macos-27.3-diag`:
+the line with `piano-reset-after/-to` is 1037 bytes, over DarwinBoot's 1000 (k27 0066's ADT arguments, §4, would make room once the
+installed kernel has it).
+
+The store facts come from the inputs, so a later ESP can point at another window: the partition and LBA from the line
+(`native-ufs-root-part=linux_data data-store-lba=117998394`), the window's size from the seed (89860516, 24 GiB: 6291649 blocks).
+The record's `seed` and `store` are the 27.3 store's; `maint-session.py` checks that store on the tablet before it writes the ESP
+(bound to its LBA, of that seed, at NativeUfs's place in linux_data as mapped), and `rootfs-clear` accepts only such an ESP on the
+tablet. The RAM test of this payload and line is `out/ram-k273-entry2` (the same four files, the same line, the v5 FD), and the
+dual ESP has booted the entry as its default since 2026-11-13: no new RAM image is needed.
+
+After step 2 linux_rootfs (LBA 56060928-71527423, 59 GiB) is discarded and free for the 27.3 line; the GPT is unchanged, and its
+later use (a larger root or Data store) is designed separately.

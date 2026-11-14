@@ -660,6 +660,165 @@ python3 $P abl-final reboot
 - The FD build is not bit-reproducible: v5 is identified by hashes (`out/fd/piano-uefi-A-bundled.fd` = `ce719ffb…`; its `.prev` is
   v4's FD).
 
+## 13. macOS 27.3 only: retiring 27.0.1 (built 2026-11-14; not installed)
+
+Owner decision 2026-11-14: (1) replace the installed dual ESP with a 27.3-only ESP; (2) only after that passes, back up and clear
+`linux_rootfs`, which holds the 27.0.1 system volume and its Data store. `boot_a` (v5, DarwinBoot's 13 GiB window) stays as it is,
+and nothing on `linux_data` is written: the 27.3 root from its block 0 and the 27.3 Data store at its end (LBA 117998394-124290042,
+bound to that LBA). No GPT change in either step. The 27.3 line itself: [k273-line.md](k273-line.md) §7.
+
+### 13.1 The image
+
+```sh
+python3 tooling/k273/build-k273-esp.py --base out/persistent/esp-dual33d-k273d.json --out out/persistent \
+        --expect-seed 89860516 --expect-store-lba 117998394 --expect-store-part linux_data
+```
+
+`esp-k273-only.img`, 1073741824 bytes, sha256 **`9fe17e65015f8c16743bd1faf3c64e060003784a934c409261a021134a4dff3b`** (the same
+bytes on every build from the same base), record `esp-k273-only.json` beside it:
+
+| | |
+|---|---|
+| base | `esp-dual33d-k273d.img` (`93baea7a…`, installed since 2026-11-13 09:45), read by the independent FAT reader and by mtools, both checked against its record and against each other |
+| payload, byte for byte | `Payloads/k273/kernel.macho` `3fd3ed71…`, `.adt` `7e1ce73d…` (13310 MiB window), `.trustcache` `72ebcaf8…`, `scratch-data.img` `848c8252…` (seed 89860516, 24 GiB) |
+| firmware | what the 27.3 collection pins, the base's files: `PianoAudio/fs19xx.fsm` `ab060b84…`, `PianoVideo/vpu35_4v.mbn` `95c5882f…` |
+| `macos-27.3` (default, timeout 3 s) | the base's entry, every key byte for byte; the line 989 bytes with `native-ufs-root-part=linux_data data-store-lba=117998394 data-persist=2` |
+| `fastboot` | the 27.3 payload with the line minus the UFS root, the store, the console mirror and every `piano-*` driver, plus `data-persist=0 piano-reset-after=1 piano-reset-to=bootloader` (490 bytes) |
+| `reset`, `shutdown`, `tools` | the standard actions |
+| not there | the 27.0.1 payload (`Payloads/kernel.macho` and its three files), the `macos`, `macos-diag` entries; `macos-27.3-diag` (1037 bytes with the reset: over DarwinBoot's 1000) |
+
+The builder takes the store facts from its inputs, nothing fixed: the partition and the LBA from the entry's line, the window's size
+from the seed, and `common.check_store_size` checks that the LBA is NativeUfs's place for that seed; `--expect-*` only assert them.
+It refuses a menu with any entry that uses linux_rootfs (`common.entry_uses_rootfs`: an entry that mounts a UFS root or opens a
+store without `native-ufs-root-part` uses it as much as one that names it). After writing, the image is read back by both readers:
+every 27.3 file and the line must be the base's. The record's `seed` and `store` are the 27.3 store's (`store.partition linux_data`,
+`first_lba 117998394`, `blocks 6291649`, `bound`), which is what `maint-session.py` gates on (§13.3).
+
+### 13.2 Its RAM test: `out/ram-k273-entry2` counts
+
+No new RAM boot. `ram-k273-entry2` (`3fb5519b…`) carries exactly this entry: its collection, ADT, trust cache and seed hash to the
+four payload files above, its 8-CPU line is the entry's line byte for byte (989 bytes), its firmware files are the same, and its FD
+is v5's (`ce719ffb…`). And the installed dual ESP has booted this entry from these files as its default every day since 2026-11-13
+09:45 (results-2026-11-13.md). What a RAM image cannot exercise is only what changes: the FAT layout and `unixnu.toml`, which UniXNU
+reads from partition 37 alone. Those are covered by the host read-backs (two readers), the session's read-back of partition 37, and
+the first boot, with `rollback esp-final` behind it. Running entry2 again would add nothing and would open the owner's 27.3 store
+read-write (`data-persist=2`): leave it.
+
+### 13.3 What maint-session.py checks for a 27.3-only record
+
+A record whose `store` names its partition and first LBA (`esp_store`) is gated on that store, not on linux_rootfs's:
+- `map` (with `--esp esp-k273-only.img`, else the ESP this install last wrote): linux_data's block 0 is the SHNGROOT manifest with
+  the image + 1024 blocks below the window; the window lies inside linux_data as mapped and at NativeUfs's place for its size there;
+  its header is valid, of the record's seed, bound to that LBA. The line a script gates on:
+  `ok    the store at LBA 117998394 on linux_data (seed 89860516f973e537, generation G, bound to LBA 117998394) IS the one this ESP resumes (seed 89860516f973e537)`.
+  linux_rootfs is only reported (`no entry of esp-k273-only.img uses it`; its block 0 as the 27.0.1 manifest or `zero (cleared)`).
+- `esp-final` reads the same store again and refuses on any mismatch (bound elsewhere, unbound, another seed, blank, a window that
+  is not NativeUfs's place); the pair rule as before (v5's DarwinBoot takes 13310 MiB).
+- `check`: linux_data's manifest block as `map` read it, the store again.
+- `rollback esp(-final)` restores the backed-up ESP and now writes `installed.json` for it (its record's seed); it refuses an ESP
+  whose default entry boots from linux_rootfs while linux_rootfs holds no root image (after `rootfs-clear`: `rollback rootfs-clear`
+  first).
+
+### 13.4 Step 1: install the ESP (session A)
+
+The install state is the main checkout's `out/persistent` (`installed.json`: `esp-dual33d-k273d.img`, `session/state.json`). Run
+there, or from another checkout with `export PIANO_PERSIST_OUT=<main checkout>/out/persistent` and the image and record copied
+into it (`cp -c out/persistent/esp-k273-only.{img,json} $PIANO_PERSIST_OUT/`). `PIANO_BACKUP_DIR` (the external SSD) mounted.
+
+```sh
+P=tooling/persist/maint-session.py; E=esp-k273-only.img
+python3 $P --dry-run maint-boot map backup esp-final check maint-exit --esp $E --esp-final $E --new-backup
+# ends "done (dry run: nothing was sent)", no "would stop a real run"
+python3 tooling/native/usb-console.py --send 'reset fastboot' --capture 5        # the running 27.3 -> ABL fastboot
+python3 $P abl-check
+python3 $P maint-boot map backup esp-final check maint-exit --esp $E --esp-final $E --new-backup
+python3 $P abl-final reboot
+```
+
+- `--new-backup`: a new set on the SSD with both GPT copies, the boot partitions and the ESP region as installed (the dual ESP,
+  `93baea7a…`), each exported, its sha256 equal to the tablet's, read back without the cache. `rollback esp-final` restores the
+  dual ESP from it.
+- `map` must print the `ok ... IS the one this ESP resumes` line of §13.3. `esp-final` writes partition 37 and reads it back
+  through `sda37` and through LUN 0 (= `9fe17e65…`); `check` then reads everything else as unchanged.
+- Then set `PIANO_INSTALLED_SEED` in `~/.config/piano/env` to `89860516` (or `<checkout>/out/persistent/esp-k273-only.json`): it
+  wins over `installed.json` and still names the 27.0.1 seed, which the image builders would otherwise compare against.
+
+First boot (`python3 tooling/native/usb-console.py --capture 600`, started before `reboot`); the owner need not be there:
+- `NativeUfs: ... root-part=linux_data`, the windows published, the root mounted;
+- `NativeRamBlock: Data store state 2 (...), ... first LBA 117998394, 6291456 pages, ... seed 89860516, store seed 89860516, ...`;
+- `piano-boot-guard: healthy after 180 s, restart reason normal`;
+- the USB console and network up: `tooling/native/pianousb-shell` or `desk-ssh.sh` answers, `sw_vers` 27.3 26C5035r; the desktop on
+  the webcam (`imagesnap`), login with `desk-login.sh`.
+
+**Stop** on `state 3`, `state 7`, `kept` or `started over` (then `rollback esp-final`, §13.6).
+
+Attended only, optional: picking `Reset into fastboot (ABL)` in the menu (3 s) lands in ABL fastboot within a few seconds.
+
+### 13.5 Step 2: retire linux_rootfs (session B, after step 1 passed)
+
+```sh
+python3 $P --dry-run maint-boot map rootfs-backup rootfs-clear check maint-exit --esp $E
+python3 tooling/native/usb-console.py --send 'reset fastboot' --capture 5
+python3 $P maint-boot map rootfs-backup rootfs-clear check maint-exit --esp $E
+python3 $P reboot
+```
+
+No `--new-backup` here: the rootfs backup joins session A's set, and that set stays the source of `rollback esp-final`.
+
+`rootfs-backup` (read only on the tablet): the whole linux_rootfs as mapped (`sda35`, LBA 56060928-71527423, 63350767616 bytes) in
+15 pieces of 4096 MiB into `$PIANO_BACKUP_DIR/<set>/linux_rootfs/piece-NNN.img.gz`. Compressed on the host; the checks stay exact
+because all three are on the raw bytes: (1) the tablet's sha256 of the piece read from the medium (page cache dropped), (2) the
+sha256 of the bytes as they arrive, taken before compression, (3) the stored file read back without the page cache and inflated,
+its sha256 = (1). The sha256 of each stored file is recorded too (`SHA256SUMS`, `sha256sum -c` checks the set; `RAW-SHA256SUMS`
+the inflated pieces and the whole partition), and after the last piece every piece is read back again for the whole partition's
+sha256. For a slow USB link: each piece is a detached tablet job with keepalives and a time limit for at least 1 MiB/s, a stream
+that stalls 300 s fails the piece, a piece is tried 3 times, and a stopped run resumes at the first piece not yet verified (run the
+same command line again). The step checks the free space on the SSD first. At the 30 MB/s that `store-backup` measured (§11.7)
+the transfer takes about 35 minutes, the hashes and the read-backs a few more; `rootfs-clear` hashes the 59 GiB on the tablet once
+more (a few minutes). `--rootfs-piece-mib N` for smaller pieces, `--rootfs-compress none` to store them raw. It is read only, so it may also run in
+session A (after `esp-final`) to save a maintenance boot: `rootfs-clear` hashes the partition again and refuses on any change.
+
+`rootfs-clear` refuses unless:
+1. the target is linux_rootfs as mapped: a partition of LUN 0, not the disk, not linux_data, not the ESP, overlapping neither;
+2. the ESP on the tablet, read and hashed, is the image of a 27.3-only record in `out/persistent`, and its menu, read out of that
+   image (which must hash to the record), has no entry that uses linux_rootfs;
+3. a verified backup of exactly this partition (this session's set, or `--rootfs-backup-set NAME` for an earlier set) is on the SSD,
+   every piece there with its recorded size and sha256 (read without the cache), and the partition read now hashes to the backup.
+
+Then `blkdiscard` of `/dev/sda35` (BusyBox's applet; the maintenance image has no util-linux one), the node's PARTNAME, start, size
+and mounts checked again by `tablet.sh` first. Zeros by `dd` instead when the disk takes no discards, or with `--rootfs-zero`.
+Read back from the medium, these must be zero: the first and last 64 MiB and 64 MiB from each old store header place (LBA 68119455,
+68381599); a device that keeps its data after a discard is zeroed and read again. The GPT copies, the ESP, linux_data's block 0
+and the 27.3 store's header are hashed before and after: unchanged. Expected lines:
+`ok    linux_rootfs read now = its backup (...)`, `WRITE discard /dev/sda35: all of linux_rootfs, LUN 0 LBA 56060928-71527423 (63350767616 bytes)`,
+`ok    linux_rootfs reads zero from the medium: LBA 56060928+16384, LBA 68119455+16384, LBA 68381599+16384, LBA 71511040+16384`,
+`ok    GPT head unchanged ...`; `check` then reads the cleared block 0 and the 27.3 store as expected. The next boot is the normal
+27.3 boot of §13.4 (nothing it reads was touched).
+
+### 13.6 Roll back, least invasive first
+
+1. A hang or panic: the boot guard lands in ABL fastboot within 180 s; always: power + volume-down 15-20 s. RAM images still win.
+2. Step 1, from ABL fastboot: `python3 $P maint-boot map`, then `python3 $P rollback esp-final` (the dual ESP from session A's set,
+   read back; `installed.json` names it again), then `python3 $P map check maint-exit --esp esp-dual33d-k273d.img`. Its default is
+   `macos-27.3` too, so the owner's 27.3 Data is resumed either way. Put `PIANO_INSTALLED_SEED` back if you changed it.
+3. Step 2 (`rootfs-backup` writes nothing on the tablet: nothing to undo; the set stays on the SSD until the owner deletes it).
+   After `rootfs-clear`: `python3 $P maint-boot map`, `python3 $P rollback rootfs-clear` (`--rootfs-backup-set NAME` for an earlier
+   set): each piece served inflated, written by `dd`, read back = its sha256, a piece already right is skipped, so a stopped
+   rollback resumes; then the whole partition = the backup's sha256), then `python3 $P map check maint-exit --esp $E`.
+4. Both: `rollback rootfs-clear` first, then `rollback esp-final` (which refuses an ESP whose default boots from linux_rootfs while
+   it is cleared). The dual ESP's 27.0.1 entries boot only once linux_rootfs is back.
+
+### 13.7 Afterwards
+
+linux_rootfs (LUN 0 LBA 56060928-71527423, 59 GiB) is free: discarded, its GPT entry unchanged, used by no entry. It can be taken for
+27.3 (a larger root or Data, with linux_data's unused middle) by the repartition designed separately; nothing here fixes its role
+or size: the steps take every partition from the map, the 27.3-only builder takes the store window from its base's line, and
+`maint-session.py` checks the store where the record says it is.
+
+Host tests (no tablet): `tooling/persist/test-k273-only.py` makes every fixture in a temporary directory (a dual ESP by mtools, a
+GPT, the fake tablet of `test-persist.py`) and covers the builder, `tablet.sh`'s guard, the gate, both rootfs steps with their
+refusals, a broken and a stopped transfer, a device that keeps data after a discard, and the rollbacks back to the first byte.
+
 ## Done 2026-11-11 (sessions 1-3)
 
 - Session 1 (07:5x): NAS backups with read-back (boot_a 389d4271, boot_b 17e89056, vendor_boot_a 50f70e36, init_boot_a bbebc3d1,

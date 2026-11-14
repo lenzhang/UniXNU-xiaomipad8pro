@@ -44,6 +44,7 @@ import http.server
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -557,7 +558,7 @@ class Session:
                 os.fsync(f.fileno())
                 got.update(bytes=n, sha256=raw.hexdigest(), stored_sha256=stored.hexdigest(), stored_bytes=kept)
             except OSError as e:          # the backup disk or the link failed: close, so the tablet's nc ends too
-                got.update(error=str(e).replace(str(Path(dest).parent.parent), '$PIANO_BACKUP_DIR'))
+                got.update(error=str(e).replace(str(Path(dest).parents[2]), '$PIANO_BACKUP_DIR'))   # DIR/<set>/linux_rootfs/piece
             finally:
                 if f:
                     f.close()
@@ -808,10 +809,9 @@ def bound_store(s, record):
                   f'{header["bound_lba"]}) IS the one this ESP resumes (seed {seed["identity_sha256"][:16]})')
 
 
-def root_manifest(s, part, below_lba=None):
-    """Block 0 of partition PART: (sha256, the SHNGROOT manifest's image bytes or None, the first 8 bytes); a dry run (None, None, None).
-    BELOW_LBA: the root image + 1024 blocks must end below it (the NativeUfs rule; the store window's first LBA)."""
-    node, start, _ = part_geometry(s, part)
+def root_manifest(s, part):
+    """Block 0 of partition PART: (sha256, the SHNGROOT manifest's image bytes or None, the first 8 bytes); a dry run (None, None, None)."""
+    node, _, _ = part_geometry(s, part)
     digest = s.region_sha(node, 0, 1, name=f'sha-{part}-0')
     h = s.t('peek', node, 0, 0, 24)
     if not h:
@@ -950,7 +950,10 @@ def map_step(s):
     With an ESP whose store is elsewhere (--esp of build-k273-esp.py: the 27.3 store on linux_data, bound): its root's manifest
     and its store (bound_store) instead; linux_rootfs (the 27.0.1 root and store, or nothing once cleared) is then only reported."""
     r = map_nodes(s)
-    elsewhere = esp_store(s.esp)
+    # the ESP these checks are for: --esp's record, else the one this install last wrote (after rootfs-clear a map without --esp
+    # must not judge linux_rootfs by the 27.0.1 rules)
+    target = s.esp or s.esp_by_sha(s.state.get('esp_sha256'))
+    elsewhere = esp_store(target)
     if r:
         s.need(r['lun0_block_size'] == '4096' and r['lun0_bytes'] == str(LUN0_BYTES), f'LUN 0 {r["lun0"]}: 4096-byte blocks, {LUN0_BYTES} bytes')
         s.need(r['mounted'] == '0', 'nothing from UFS is mounted')
@@ -958,7 +961,7 @@ def map_step(s):
         geometry = start == common.ROOTFS_FIRST * 8 and size in ((common.ROOTFS_LAST - common.ROOTFS_FIRST + 1) * 8,
                                                                  (common.ROOTFS_NEW_LAST - common.ROOTFS_FIRST + 1) * 8)
         if elsewhere:
-            s.log(f'  info  linux_rootfs {r["linux_rootfs"]} (512-byte units): no entry of {s.esp["image"]} uses it')
+            s.log(f'  info  linux_rootfs {r["linux_rootfs"]} (512-byte units): no entry of {target["image"]} uses it')
         else:
             s.need(geometry, f'linux_rootfs {r["linux_rootfs"]} (512-byte units)')
         s.need(r['boot_a'].split()[1:] == [str(common.BOOT_A_START_512), str(common.BOOT_A_SIZE_512)], f'boot_a {r["boot_a"]}')
@@ -1007,7 +1010,7 @@ def map_step(s):
         digest, image_bytes, magic = root_manifest(s, part)
         if magic is not None:
             _, start, _ = part_geometry(s, part)
-            s.need(image_bytes is not None, f'{part} block 0 is the SHNGROOT manifest (the root of {s.esp["image"]})')
+            s.need(image_bytes is not None, f'{part} block 0 is the SHNGROOT manifest (the root of {target["image"]})')
             s.need(image_bytes is not None and image_bytes + 1024 * B <= (elsewhere['first_lba'] - start) * B,
                    f'root image ({image_bytes} bytes) + 1024 blocks below the store window at LBA {elsewhere["first_lba"]} (NativeUfs rule)')
             s.save(root_manifest={'partition': part, 'sha256': digest, 'image_bytes': image_bytes})
@@ -1028,7 +1031,7 @@ def map_step(s):
     old = s.state.get('store_old') or {}
     if elsewhere:
         s.save(store_matches_esp=False)
-        ok, text = bound_store(s, s.esp)
+        ok, text = bound_store(s, target)
         s.log(('  check ' if ok is None else '  ok    ' if ok else '  WARN  ') + text +
               ('' if ok is not False else '; write_esp refuses this ESP'))
         current = s.state.get('store_new') or {}
@@ -1689,6 +1692,15 @@ def rootfs_backup(s):
     folder = nas / ROOTFS_KEY if nas else None
     if folder:
         folder.mkdir(exist_ok=True)
+        # room on the backup disk: the raw size when stored raw; compressed, at least a quarter of it (zeros and free space
+        # shrink a thousandfold, a full APFS container hardly), and a note below the raw size
+        free = shutil.disk_usage(folder).free
+        done_bytes = sum(q['stored_bytes'] for q in progress['pieces'].values())
+        need = (total if compress == 'none' else total // 4) + (1 << 30) - done_bytes
+        s.need(free >= need, f'{free >> 30} GiB free on the backup disk for a {total >> 30} GiB partition ({compress}; at least '
+               f'{need >> 30} GiB)')
+        if compress == 'gzip' and free < total + (1 << 30) - done_bytes:
+            s.log(f'  WARN  {free >> 30} GiB free is less than the raw {total >> 30} GiB: enough only if linux_rootfs compresses')
     suffix = '.img.gz' if compress == 'gzip' else '.img'
     for i, skip, n in pieces:
         file = f'{ROOTFS_KEY}/piece-{i:03d}{suffix}'

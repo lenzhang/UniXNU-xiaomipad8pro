@@ -612,6 +612,9 @@ def test_session(tmp, out, dual, seed273):
           'the regions read back: first and last 64 MiB, 64 MiB from the old store header place LBA 68119455')
     log = run('map', 'check', *esp)
     check('linux_rootfs block 0: zero (cleared)' in log and 'IS the one this ESP resumes' in log, 'map and check after the clear: clean')
+    log = run('map', 'check')
+    check('linux_rootfs block 0: zero (cleared)' in log and 'IS the one this ESP resumes' in log,
+          'map and check without --esp: judged by the ESP this install wrote (the 27.3-only one), not by the 27.0.1 rules')
     dual_text = (out / 'esp-dual.json').read_text()
     common.write_json(out / 'esp-dual.json', dict(dual, default='macos'))
     log = run('rollback', 'esp-final', *esp, expect=3)
