@@ -2977,10 +2977,34 @@ static UfsPerfDepth perfDepthTake (UfsPerfDepth &depth, uint64_t now)
 }
 static uint64_t perfAvg (const UfsPerfSum &sum) { return sum.count ? perfMicros (sum.ticks) / sum.count : 0; }
 static uint64_t perfPerMiB (const UfsPerfSum &sum) { return sum.bytes ? perfMicros (sum.ticks) * 1048576 / sum.bytes : 0; }
+
+// The kernel's native 4K code-signing counters (k27, XNU_NATIVE_CS_HASH_CACHE, bsd/kern/ubc_subr.c): on 4 KiB pages a signature with
+// 16 KiB hash pages is authenticated when it is added (ubc_cs_blob_add -> cs_native4k_prepare): the whole signed range is read with
+// vn_rdwr 16 KiB at a time, each 16 KiB block hashed against the signature and its four 4 KiB pages hashed again for the fault-time
+// table. full_blocks counts those 16 KiB blocks, ready_blobs the signatures done, page_checks the 4 KiB fault validations against the
+// table. Read only, for the third perf line: whether the root windows' bytes in a second are a signature's pre-hash.
+extern "C" {
+extern unsigned long cs_native4k_full_blocks, cs_native4k_page_checks, cs_native4k_ready_blobs, cs_validate_page_bad_hash;
+}
+static unsigned long gCsSeen[4];
+static void perfCsTake (unsigned long out[4])
+{
+  const unsigned long now[4] = { __atomic_load_n (&cs_native4k_full_blocks, __ATOMIC_RELAXED),
+                                 __atomic_load_n (&cs_native4k_ready_blobs, __ATOMIC_RELAXED),
+                                 __atomic_load_n (&cs_native4k_page_checks, __ATOMIC_RELAXED),
+                                 __atomic_load_n (&cs_validate_page_bad_hash, __ATOMIC_RELAXED) };
+  for (unsigned i = 0; i < 4; ++i) {
+    out[i] = now[i] - gCsSeen[i];
+    gCsSeen[i] = now[i];
+  }
+}
+
 static void perfLines (unsigned second, uint64_t windowTicks, bool print)
 {
   if (!gPerf || !gPerfLock || !windowTicks) return;
   const uint64_t now = mach_absolute_time ();
+  unsigned long cs[4];
+  perfCsTake (cs);
   const UfsPerfSum req = perfTake (kUfsPerfRequest), queue = perfTake (kUfsPerfQueue), copy = perfTake (kUfsPerfCopy),
                    bounce = perfTake (kUfsPerfBounceWait), take = perfTake (kUfsPerfTake), clean = perfTake (kUfsPerfClean),
                    dev = perfTake (kUfsPerfDevice), inval = perfTake (kUfsPerfInval), slotCopy = perfTake (kUfsPerfSlotCopy),
@@ -3005,6 +3029,8 @@ static void perfLines (unsigned second, uint64_t windowTicks, bool print)
          second, cmdZc.count, cmdSlot.count, cmdDirect.count, cmdBytes >> 10, cmdAvg, perfAvg (dev), perfMicros (dev.maxTicks),
          busyUs ? dev.bytes / busyUs : 0, perfPerMiB (clean), perfPerMiB (inval), perfPerMiB (slotCopy), perfPerMiB (flush),
          perfAvg (take), cqx10 / 10, cqx10 % 10, cq.max, cq.busy * 100 / windowTicks);
+  IOLog ("NativeUfs: perf %u s: cs native4k: %lu 16K blocks (%lu MiB) pre-hashed, %lu signatures ready, %lu 4K page checks, %lu bad hashes\n",
+         second, cs[0], cs[0] >> 6, cs[1], cs[2], cs[3]);
 }
 
 // native-ufs-perf=1, once after the bring-up (no command is in flight then): the link as the boot firmware left it (UniPro PA
@@ -3285,6 +3311,11 @@ bool NativeUfs::start (IOService *provider)
 #endif
     gPerf = perf == 1;
     if (gPerf && !(gPerfLock = IOSimpleLockAlloc ())) gPerf = false;
+    if (gPerf) {
+      unsigned long before[4];
+      perfCsTake (before);   // the code-signing counters from here on
+      IOLog ("NativeUfs: perf: cs native4k before the root: %lu 16K blocks pre-hashed, %lu signatures ready\n", before[0], before[1]);
+    }
     if (workers > 16) workers = 16;
     gBounceBytes = bounceKiB > kDataMax / 1024 ? (bounceKiB >= kXferMax / 1024 ? kXferMax : (bounceKiB * 1024) & ~(kDataMax - 1)) : kDataMax;
     gMaxIoBytes = maxioKiB >= 64 && maxioKiB <= 16384 ? maxioKiB * 1024 : 0;
