@@ -292,10 +292,11 @@ void readArgs()
   // at a wake or after the firmware died skips them and joins the network of the last open port directly (its access point and
   // channel); a fast join that does not open the port ends the pass, and the next restart scans.
   gArgs.fastRestart = bootArg("piano-wifi-fastrestart", 1);
-  // piano-wifi-haltwatch=0: no watch of the shutdown. By default, from this driver's shutdown notice, a helper thread names at
+  // piano-wifi-haltwatch=1 (a probe; off by default since boot 10o answered it: 0 services unacknowledged and 0 power changes
+  // at +8 s and +20 s): from this driver's shutdown notice, a helper thread names at
   // +8 s and +20 s the services whose shutdown is not acknowledged yet and those with a power change in progress: macOS's own
   // "Halt/Restart Timed Out" (30 s, every reboot of the 27.3 line, with or without this driver) names nothing.
-  gArgs.haltWatch = bootArg("piano-wifi-haltwatch", 1);
+  gArgs.haltWatch = bootArg("piano-wifi-haltwatch", 0);
   // piano-wifi-en0 (default 1 at level 8 since boot 10o-en0, 0 below): the station takes PianoNullEthernet's address and
   // PianoWifiEthernet its en0 (the null stands down); 0 keeps Wi-Fi a second interface of its own address (en2).
   gArgs.en0 = bootArg("piano-wifi-en0", gArgs.level >= 8 ? 1 : 0);
@@ -3177,9 +3178,11 @@ void parkRadio()
     IOLog("PianoWifi: power: system sleep %u has woken before the ladder parked: nothing done here\n", sleep);
     return;
   }
-  IOLog("PianoWifi: power: the ladder's thread did not park the radio within 3.5 s: WLAN_EN low and PERST# asserted from "
-        "here\n");
-  if (gPowerState && gWin[kWinTlmm].va) safeOff(gHw, *gPowerState, gPowerOptions);
+  // review of today's merges, #3 (F4's rule for stopRadio, here too): the ladder's thread still owns the hardware, and powering
+  // it down from this thread would put WLAN_EN low and PERST# under its register writes. It parks the radio itself when it
+  // runs again (after this sleep, if the sleep freezes it first: the radio then stays powered through that sleep).
+  IOLog("PianoWifi: power: the ladder's thread did not park the radio within 3.5 s: it is left to it (nothing done from "
+        "here)\n");
 }
 
 // ------------------------------------------------------------------------------- level 7's join profile (docs §13.2)
@@ -3361,9 +3364,10 @@ __attribute__((noinline)) bool profileFileCheck(const char *when)
     return false;
   }
   lastProblem = nullptr;
-  bool changed = false;
+  bool changed = false, overSysctl = false;
   uint32_t generation = 0;
   IOLockLock(gProfileLock);
+  overSysctl = gProfileSet && !gProfileFromFile;
   if (gProfileSet) {
     const uint8_t *a = reinterpret_cast<const uint8_t *>(&gProfile), *b = reinterpret_cast<const uint8_t *>(&fromFile);
     for (size_t i = 0; i < sizeof gProfile && !changed; ++i) changed = a[i] != b[i];
@@ -3377,6 +3381,13 @@ __attribute__((noinline)) bool profileFileCheck(const char *when)
   }
   gProfileFromFile = true;
   IOLockUnlock(gProfileLock);
+  // The file is the profile's source whenever it exists (review of today's merges, #5): the supplicant derives its key from
+  // the file alone, so a sysctl profile that differs from it could not finish a WPA2 handshake anyway; the sysctl is the way in
+  // without a file. A sysctl profile the file replaces is said so.
+  if (changed && overSysctl)
+    note("join profile: the sysctl's profile is replaced by the root-only file's (%s): the file, when there is one, is the "
+         "profile's source (the supplicant derives the key from it)",
+         when);
   if (changed)
     note("join profile %s its root-only file (%s, generation %u): a network name of %u byte(s), %s%s, the access point %s, the "
          "station's address %s (none of it is logged)",
@@ -3408,9 +3419,27 @@ __attribute__((noinline)) void profileBeforeJoin(const char *when)
 
 bool level8Event(uint32_t id, const uint8_t *payload, uint32_t length);
 
+// Level 7's background scan (review of today's merges, #1): a fast restart publishes no scan list, and the published one is the
+// menu's and every registry reader's; once the fast join's port has been open 10 s, one passive scan of every channel runs
+// beside the association (the firmware leaves the channel between its beacons), its frames fill the link's list as level 6's
+// do, and the list is published at its end.
+enum : uint32_t { kBgScanNone = 0, kBgScanArmed, kBgScanSent, kBgScanOver };
+uint32_t gBgScan;
+bool gBgScanDone;
+uint64_t gBgScanAt;
+bool bgScanEvent(uint32_t id, const uint8_t *payload, uint32_t length)
+{
+  if (id != uint32_t(kWmiEvtScan) || gBgScan != kBgScanSent) return false;
+  WmiScanEvent ev;
+  if (!wmiParseScanEvent(ev, payload, length) || ev.scanId != kBgScanId) return false;
+  if (ev.type & (kWmiScanEvCompleted | kWmiScanEvDequeued | kWmiScanEvStartFailed)) gBgScanDone = true;
+  return true;
+}
+
 bool staHook(void *, uint32_t id, const uint8_t *payload, uint32_t length, uint64_t now)
 {
   if (level8Event(id, payload, length)) return true;
+  if (bgScanEvent(id, payload, length)) return true;
   return staOnEvent(gSta, id, payload, length, now);
 }
 
@@ -4417,6 +4446,38 @@ __attribute__((noinline)) void restartTurn(IOService *owner, uint64_t now, uint6
   }
 }
 
+__attribute__((noinline)) void bgScanTurn(IOService *owner, uint64_t now, uint64_t openedAt, bool stopping)
+{
+  if (gBgScan == kBgScanArmed && !stopping && gSta.step == kStaAssociated && now >= openedAt + 10000) {
+    static WmiScanRequest request;   // a few hundred bytes: not on the ladder's stack
+    request = gLink.request;         // level 6's channels (the regulatory list's), its dwell times
+    request.scanId = kBgScanId;
+    request.vdevId = gLink.options.vdevId;
+    request.passive = true;
+    request.ssidLength = 0;
+    request.extraIe = nullptr;
+    request.extraIeLength = 0;
+    if (!request.channelCount) wmiScanChannels(request, true);
+    WmiWriter w;
+    const uint32_t n = wmiBuildStartScan(w, gL8Out, sizeof gL8Out, request);
+    const int rc = n ? linkSendWmi(gLink, gL8Out, n) : -1;
+    if (rc == 0) return;   // the transport is busy: the next turn
+    gBgScanDone = false;
+    gBgScanAt = now;
+    gBgScan = rc == 1 ? kBgScanSent : kBgScanOver;
+    note("level 7: a background scan beside the association (the fast restart published no list): %u channel(s), %s",
+         request.channelCount, rc == 1 ? "asked for" : "NOT sent (the command could not be built or was refused)");
+    return;
+  }
+  if (gBgScan == kBgScanSent && (gBgScanDone || now > gBgScanAt + gArgs.scanWaitMs + 3000 || stopping)) {
+    gBgScan = kBgScanOver;
+    note("level 7: the background scan %s after %llu ms: %u network(s) in the list, published",
+         gBgScanDone ? "ended" : stopping ? "was cut short by the stop" : "ran out of time",
+         (unsigned long long)(now - gBgScanAt), gLink.scan.count);
+    publishScan(owner, gLink.scan, gArgs.bssid != 0);
+  }
+}
+
 // The radio powered down between two passes (level 8's restart): WLAN_EN low and PERST# asserted, the PCIe NoC's vote and the
 // rails' owner bit given back while this driver holds them, and the link's state renewed (stopRadio's teardown looks at it:
 // nothing may reach the endpoint's registers any more).
@@ -4572,6 +4633,7 @@ int level7(IOService *owner)
   uint64_t firstOpenAt = 0;
   const char *why = nullptr;
   uint32_t sendWaits = 0;
+  gBgScan = gPass.fast ? kBgScanArmed : kBgScanNone;   // a fast pass scans beside its association (bgScanTurn)
   if (gPass.fast && gLastNetValid) {
     // the fast restart: the last network as the only entry of the list (level 6 did not scan)
     gLink.scan.entries[0] = gLastNet;
@@ -4609,7 +4671,10 @@ int level7(IOService *owner)
     // piano-wifi-droptest=S: once, S s after the port first opened, the station leaves (its own deauthentication) and the
     // rejoin must bring it back without anybody
     if (gArgs.level >= 8 && gSta.authorized && !firstOpenAt) firstOpenAt = now;
-    if (firstOpenAt) restartTurn(owner, now, firstOpenAt, stopping);
+    if (firstOpenAt) {
+      restartTurn(owner, now, firstOpenAt, stopping);
+      bgScanTurn(owner, now, firstOpenAt, stopping);
+    }
     if (gArgs.dropTest && !gDropDone && firstOpenAt && now >= firstOpenAt + uint64_t(gArgs.dropTest) * 1000 && !stopping &&
         gSta.step == kStaAssociated) {
       gDropDone = true;   // once a boot (a restart's pass does not drop again)
@@ -4818,6 +4883,7 @@ static void haltWatchReport(unsigned atS)
         nPower, nChanging ? ": " : "", changing);
 }
 
+static volatile uint32_t sHaltWatching;   // a watch is running (a later shutdown notice arms another once it has ended)
 static void haltWatch(void *, wait_result_t)
 {
   thread_set_thread_name(current_thread(), "piano-wifi-haltwatch");
@@ -4825,6 +4891,7 @@ static void haltWatch(void *, wait_result_t)
   haltWatchReport(8);
   IOSleep(12000);
   haltWatchReport(20);
+  __atomic_store_n(&sHaltWatching, 0u, __ATOMIC_RELEASE);
 }
 
 constexpr int kPassEnd = 0, kPassUnmap = 1;   // how a pass of the ladder ended (PianoWifi::runPass)
@@ -4991,14 +5058,15 @@ void PianoWifi::parkThread(void *self, wait_result_t)
 
 void PianoWifi::systemWillShutdown(IOOptionBits specifier)
 {
-  static bool watching;
-  if (gArgs.haltWatch && !watching && (specifier == kIOMessageSystemWillPowerOff || specifier == kIOMessageSystemWillRestart)) {
-    watching = true;
+  uint32_t idle = 0;
+  if (gArgs.haltWatch && (specifier == kIOMessageSystemWillPowerOff || specifier == kIOMessageSystemWillRestart) &&
+      __atomic_compare_exchange_n(&sHaltWatching, &idle, 1u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
     thread_t t = nullptr;
-    if (kernel_thread_start(&haltWatch, nullptr, &t) == KERN_SUCCESS) {
+    if (kernel_thread_start(&haltWatch, nullptr, &t) != KERN_SUCCESS) __atomic_store_n(&sHaltWatching, 0u, __ATOMIC_RELEASE);
+    else {
       thread_deallocate(t);
-      IOLog("PianoWifi: halt watch: armed (+8 s and +20 s from this driver's shutdown notice; piano-wifi-haltwatch=0 turns it "
-            "off)\n");
+      IOLog("PianoWifi: halt watch: armed (+8 s and +20 s from this driver's shutdown notice; piano-wifi-haltwatch=1 asked for it "
+            "here)\n");
     }
   }
   if (specifier == kIOMessageSystemWillPowerOff || specifier == kIOMessageSystemWillRestart) stopRadio("shutdown");

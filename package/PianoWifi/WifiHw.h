@@ -905,6 +905,7 @@ constexpr uint32_t kAssocProfileWaitMs = 600000;  // for the join profile (machd
 constexpr uint32_t kAssocFrameWaitMs = 500, kAssocFrameTries = 3;   // an authentication or association answer, and retries
 constexpr uint32_t kAssocHoldMs = 30000;          // associated: how long the level watches the link before its teardown
 constexpr uint32_t kAssocScanDwellMs = 300;       // the targeted scan's passive dwell on the network's channel
+constexpr uint32_t kBgScanId = 0xa020;             // level 7's background scan after a fast restart (published)
 constexpr uint32_t kAssocScanId = 0xa010;          // level 7's own scans: clear of level 6's 0xa000 and 0xa002
 constexpr uint32_t kAssocFrameBuffers = 4, kAssocFrameBytes = 1024;
 
