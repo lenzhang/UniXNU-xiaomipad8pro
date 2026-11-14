@@ -21,6 +21,7 @@ The files, their owners and modes are not touched; the volume's free blocks beco
 """
 import argparse
 import os
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -74,35 +75,36 @@ def main():
                 handle.write(data)
             if a.grow_gib and a.grow_gib << 30 <= logical:
                 raise SystemExit(f'--grow-gib {a.grow_gib}: the seed is {logical} bytes already')
-        run('hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nomount', '-nobrowse', str(raw), stdout=subprocess.DEVNULL)
+        # hdiutil attaches and mounts in one step (stage.py's pattern since fdf426d): no diskutil, whose mount hangs some days here
+        mount = Path(scratch) / 'mnt'
+        mount.mkdir()
+        attached = plistlib.loads(subprocess.run(['hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nobrowse',
+                                                  '-mountpoint', str(mount), '-plist', str(raw)], check=True, capture_output=True,
+                                                 timeout=300).stdout)['system-entities']
+        whole = min((e['dev-entry'] for e in attached), key=lambda d: (len(d), d))
         disk_of = [sys.executable, str(D / 'tooling/k273/disk-of.py')]
-        whole = subprocess.run([*disk_of, 'whole', str(raw)], check=True, capture_output=True, text=True).stdout.strip()
         try:
-            volume = subprocess.run([*disk_of, 'volume', whole], check=True, capture_output=True, text=True).stdout.strip()
-            mount = Path(scratch) / 'mnt'
-            mount.mkdir()
-            run('diskutil', 'mount', '-mountPoint', str(mount), volume, stdout=subprocess.DEVNULL)
-            try:
-                # a directory this user may write without sudo (the volume root is root's 755)
-                where = next((mount / d for d in ('private/tmp', 'private/var/tmp', 'Library/GPUBundles')
-                              if (mount / d).is_dir() and os.access(mount / d, os.W_OK)), None)
-                if where is None:
-                    raise SystemExit(f'{volume}: no writable directory for the zero fill')
-                fill = where / '.piano-zero-fill'
-                zero = bytes(8 << 20)
-                written = 0
-                with fill.open('wb', buffering=0) as handle:
-                    try:
-                        while True:
-                            written += handle.write(zero)
-                    except OSError:
-                        pass
-                    os.fsync(handle.fileno())
-                fill.unlink()
-                run('sync')
-                print(f'{volume}: {written >> 20} MiB of free space overwritten with zeros')
-            finally:
-                run('diskutil', 'unmount', str(mount), stdout=subprocess.DEVNULL)
+            volume = next((e['dev-entry'] for e in attached if e.get('mount-point') == str(mount.resolve())), None)
+            if volume is None:
+                raise SystemExit(f'{raw.name}: hdiutil attached the seed but mounted no volume at {mount}; nothing filled')
+            # a directory this user may write without sudo (the volume root is root's 755)
+            where = next((mount / d for d in ('private/tmp', 'private/var/tmp', 'Library/GPUBundles')
+                          if (mount / d).is_dir() and os.access(mount / d, os.W_OK)), None)
+            if where is None:
+                raise SystemExit(f'{volume}: no writable directory for the zero fill')
+            fill = where / '.piano-zero-fill'
+            zero = bytes(8 << 20)
+            written = 0
+            with fill.open('wb', buffering=0) as handle:
+                try:
+                    while True:
+                        written += handle.write(zero)
+                except OSError:
+                    pass
+                os.fsync(handle.fileno())
+            fill.unlink()
+            run('sync')
+            print(f'{volume}: {written >> 20} MiB of free space overwritten with zeros')
         finally:
             run('hdiutil', 'detach', whole, stdout=subprocess.DEVNULL)
         # The growth comes after the zero fill: the new space is never written (a sparse file keeps it as holes), so a large grown

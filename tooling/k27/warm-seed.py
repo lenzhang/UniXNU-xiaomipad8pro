@@ -16,9 +16,9 @@ Library/Caches and every home's Library/Caches, streamed to DIR/warm.tar.xz; DIR
 build: a copy of SEED with DIR's pack (filtered to --include globs, default the LaunchServices databases, lsd's, the font registry
 and the icon store; --all: everything collected) at private/var/piano/warm/warm.tar.xz and private/etc/rc.server, which launchd runs
 as a boot task before any daemon (its log: "(rc.server) Doing boot task"; without the file "optional boot task not present") and
-which extracts the pack as root, owners and modes as recorded, then writes one console line. inspect and build need sudo -n on
-this Mac: the seed's volume is mounted with mount_apfs (owners honoured; diskutil mount hangs on these images here) and the two
-files are made root's.
+which extracts the pack as root, owners and modes as recorded, then writes one console line. The seed's volume is mounted by
+hdiutil with owners honoured (no diskutil: its mount hangs on these images here some days); build needs sudo -n to make the two
+files root's.
 The output is OUTDIR/scratch-data.img (a new seed identity: build-ram-images.py gives its images data-persist=0, Data volatile, the
 tablet's store untouched; NativeRamBlock's seed guard keeps the store of another seed in any case), OUTDIR/kernel.macho.trustcache
 (the input's, byte for byte) and OUTDIR/stage.json. The RAM image must stay under build-ram-images.py's IMAGE_MAX_BYTES (250 MB): the
@@ -181,9 +181,10 @@ def sudo_ok():
 
 
 class Mounted:
-    """The seed unpacked to a sparse raw file in SCRATCH, attached (-nomount) and its APFS volume mounted with mount_apfs through
-    sudo -n, owners honoured (read only unless WRITE). Not diskutil mount: on the build Mac it hangs on these images (2026-11-14,
-    twice), while mount_apfs mounts at once."""
+    """The seed unpacked to a sparse raw file in SCRATCH, attached and its APFS volume mounted by hdiutil in one step with owners
+    honoured (-owners on; read only unless WRITE). Not diskutil mount: on the build Mac it hangs on these images some days (twice on
+    2026-11-14; stage.py uses the same hdiutil step since fdf426d). No sudo for the mount; build's two files are made root's with
+    sudo install (checked 2026-11-14: a file so made on such a mount reads uid 0)."""
 
     def __init__(self, ssm, seed, scratch, write=False):
         self.ssm, self.seed, self.scratch, self.write = ssm, seed, Path(scratch), write
@@ -196,34 +197,26 @@ class Mounted:
             for offset, data in extents:
                 handle.seek(offset)
                 handle.write(data)
-        attached = plistlib.loads(self.ssm.run('hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nomount', '-nobrowse',
-                                               '-plist', str(self.raw), capture_output=True).stdout)
-        entities = attached['system-entities']
-        self.whole = min((e['dev-entry'] for e in entities), key=len).removeprefix('/dev/')
         self.mount = self.scratch / 'mnt'
         self.mount.mkdir()
-        try:
-            volumes = [e['dev-entry'] for e in entities if e.get('content-hint') == APFS_VOLUME]
-            if len(volumes) != 1:
-                raise SystemExit(f'{self.seed}: {len(volumes)} APFS volumes in the seed (one, the Data volume, expected)')
-            self.volume = volumes[0]
-            options = 'nobrowse' if self.write else 'rdonly,nobrowse'
-            subprocess.run(['sudo', '-n', '/sbin/mount_apfs', '-o', options, self.volume, str(self.mount)], check=True, timeout=300)
-        except BaseException:
-            subprocess.run(['hdiutil', 'detach', '/dev/' + self.whole], capture_output=True, timeout=120)
-            raise
+        command = ['hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nobrowse', '-owners', 'on',
+                   '-mountpoint', str(self.mount), '-plist', str(self.raw)]
+        if not self.write:
+            command.insert(2, '-readonly')
+        entities = plistlib.loads(subprocess.run(command, check=True, capture_output=True, timeout=300).stdout)['system-entities']
+        self.whole = min((e['dev-entry'] for e in entities), key=lambda d: (len(d), d)).removeprefix('/dev/')
+        mounted = [e['dev-entry'] for e in entities if e.get('mount-point') == str(self.mount.resolve())]   # realpath: /private/...
+        if len(mounted) != 1:
+            subprocess.run(['hdiutil', 'detach', '-force', '/dev/' + self.whole], capture_output=True, timeout=120)
+            raise SystemExit(f'{self.seed}: hdiutil mounted {len(mounted)} volumes at {self.mount} (the Data volume expected)')
+        self.volume = mounted[0]
         return self
 
     def __exit__(self, *exc):
-        try:
-            subprocess.run(['sudo', '-n', '/sbin/umount', str(self.mount)], check=True, timeout=300)
-        finally:
-            subprocess.run(['hdiutil', 'detach', '/dev/' + self.whole], check=True, capture_output=True, timeout=120)
+        subprocess.run(['hdiutil', 'detach', '/dev/' + self.whole], check=True, capture_output=True, timeout=120)
 
 
 def cmd_inspect(a):
-    if not sudo_ok():
-        raise SystemExit('inspect needs sudo -n for mount_apfs (diskutil mount hangs on these images on the build Mac)')
     ssm = load_stage_tools()
     with tempfile.TemporaryDirectory(prefix='warm-inspect-', dir=str(a.scratch)) as scratch:
         with Mounted(ssm, a.seed, scratch) as m:
@@ -245,7 +238,8 @@ def cmd_inspect(a):
                 print(f'/{p.relative_to(root)}: present')
             caches = root / 'Library/Caches'
             print(f'/Library/Caches: {len(os.listdir(caches)) if caches.is_dir() else "absent"} entries')
-            for home in sorted(p for p in (root / 'Users').iterdir() if p.is_dir() and p.name != 'Shared'):
+            users = root / 'Users'
+            for home in sorted(p for p in (users.iterdir() if users.is_dir() else []) if p.is_dir() and p.name != 'Shared'):
                 lib = home / 'Library'
                 print(f'a home\'s Library: {" ".join(sorted(os.listdir(lib))) if lib.is_dir() else "absent"}')
     return 0
@@ -297,7 +291,7 @@ def cmd_build(a):
     trust = a.out / 'kernel.macho.trustcache'
     shutil.copyfile(a.trust, trust)
     if not sudo_ok():
-        raise SystemExit('build needs sudo -n: mount_apfs (diskutil mount hangs on the build Mac) and the two files made root\'s')
+        raise SystemExit('build needs sudo -n: the two files (the pack, rc.server) must be root\'s on the seed')
     record = {'inputs': {'seed': str(a.seed), 'seed_sha256': sha(a.seed), 'trust': str(a.trust), 'trust_sha256': sha(a.trust),
                          'pack': str(a.pack), 'pack_sha256': sha(a.pack)},
               'warm': {'pack_sha256': sha(filtered), 'pack_bytes': filtered.stat().st_size, 'content_bytes': content,

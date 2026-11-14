@@ -15,8 +15,11 @@ changed: no bundle is copied again and the trust cache is copied byte for byte. 
                      runs natively: docs/boot-time.md section 4).
 
 The mechanics are stage-soft-metal.py's (imported, not changed: build-native-image.sh's stamp hashes that file): unpack the DBRDISK1
-seed to a sparse raw file in DIR, hdiutil attach -nomount, diskutil mount the volume named Data (no sudo: ownership ignored, new files
-stored as uid/gid 99; files edited in place keep their owner), then unmount, detach and pack. The output is DIR/scratch-data.img and
+seed to a sparse raw file in DIR, hdiutil attach with its mount point (one step, no diskutil: this Mac's diskutil mount hangs some
+days, as stage.py found; no sudo: ownership ignored for the writes; files edited in place keep their owner, NEW files are stored
+with this Mac user's uid, 501 here, the tablet account's uid too: confirmed on the host 2026-11-14 for every hdiutil -owners mode,
+so the earlier "uid/gid 99" holds at most for diskutil's mount), then
+detach and pack. The output is DIR/scratch-data.img and
 DIR/kernel.macho.trustcache, and DIR/stage.json (inputs, actions, the output identity). A new seed is a new identity:
 build-ram-images.py gives an image with it data-persist=0 (Data volatile, the tablet's store untouched) unless told otherwise.
 """
@@ -122,34 +125,33 @@ def main():
             for offset, data in extents:
                 handle.seek(offset)
                 handle.write(data)
-        attached = plistlib.loads(ssm.run('hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nomount', '-nobrowse',
-                                          '-plist', str(raw), capture_output=True).stdout)
-        disks = [e['dev-entry'] for e in attached['system-entities']]
-        whole = min(disks, key=len).removeprefix('/dev/')
         mount = Path(scratch) / 'mnt'
         mount.mkdir()
+        attached = plistlib.loads(subprocess.run(['hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nobrowse',
+                                                  '-mountpoint', str(mount), '-plist', str(raw)], check=True, capture_output=True,
+                                                 timeout=300).stdout)['system-entities']
+        whole = min((e['dev-entry'] for e in attached), key=lambda d: (len(d), d)).removeprefix('/dev/')
         try:
-            volume = ssm.data_volume(whole)
-            ssm.run('diskutil', 'mount', '-mountPoint', str(mount), volume, stdout=subprocess.DEVNULL)
-            try:
-                for source, dest in files:
-                    target = mount / dest
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(source, target)
-                    os.chmod(target, 0o644)
-                    subprocess.run(['xattr', '-c', str(target)], check=False)
-                    record['files'].append({'dest': '/' + dest, 'source': str(source), 'sha256': sha(source)})
-                    print(f'{volume}: /{dest} <- {source} ({target.stat().st_size} bytes)')
-                if a.boot_run:
-                    record['boot_job'] = append_boot_commands(mount / ssm.BOOT_JOB, a.boot_run)
-                    print(f'/{ssm.BOOT_JOB} runs: {record["boot_job"]}')
-                if a.disable_job:
-                    record['disabled'] = disable_jobs(mount / OVERRIDES, a.disable_job)
-                    print(f'/{OVERRIDES}: disabled {", ".join(record["disabled"])}')
-            finally:
-                ssm.run('diskutil', 'unmount', str(mount), stdout=subprocess.DEVNULL)
+            # hdiutil names the mount point by its realpath (/private/... for /tmp/...)
+            volume = next((e['dev-entry'].removeprefix('/dev/') for e in attached if e.get('mount-point') == str(mount.resolve())), None)
+            if volume is None:
+                raise SystemExit(f'{raw.name}: hdiutil attached the seed but mounted no volume at {mount}; nothing staged')
+            for source, dest in files:
+                target = mount / dest
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+                os.chmod(target, 0o644)
+                subprocess.run(['xattr', '-c', str(target)], check=False)
+                record['files'].append({'dest': '/' + dest, 'source': str(source), 'sha256': sha(source)})
+                print(f'{volume}: /{dest} <- {source} ({target.stat().st_size} bytes)')
+            if a.boot_run:
+                record['boot_job'] = append_boot_commands(mount / ssm.BOOT_JOB, a.boot_run)
+                print(f'/{ssm.BOOT_JOB} runs: {record["boot_job"]}')
+            if a.disable_job:
+                record['disabled'] = disable_jobs(mount / OVERRIDES, a.disable_job)
+                print(f'/{OVERRIDES}: disabled {", ".join(record["disabled"])}')
         finally:
-            ssm.run('hdiutil', 'detach', '/dev/' + whole, stdout=subprocess.DEVNULL)
+            subprocess.run(['hdiutil', 'detach', '/dev/' + whole], check=True, stdout=subprocess.DEVNULL, timeout=120)
         seed = a.out / 'scratch-data.img'
         seed.unlink(missing_ok=True)
         meta = packed_ramdisk.pack(raw, seed)
