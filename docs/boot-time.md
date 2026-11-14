@@ -364,3 +364,46 @@ samples per 2 s (one CPU busy), its hottest pcs corecrypto's SHA-256 (~87 %), th
 
 `native-ufs-fast` alone gave ~3 s (dyld mapped at iolog 36 vs 39, `Early boot complete` T 38.7 vs 41.8 s) and nothing after
 launchd (loginwindow at iolog 70 vs 73: the same ~31 s after `Early boot complete`; the windows busy 5-30 % of each second there).
+
+### 9.1 The ufs4 boots: measured milestones, the seconds saved, and what to install (2026-11-14; `private/host-checks/20261114-ufs1/SCORE-ufs4.md`)
+
+Three single boots of the probes on the tablet — ufs3 (baseline), ufs4a (`cs-native4k-skip=1`), ufs4b
+(`cs-native4k-threads=6 cs-native4k-log=1`). All figures below are quoted from the console captures
+(`ufs3-console.out` / `ufs4a-console.out` / `ufs4b-console.out`); this batch's pstore mailboxes were bit-flipped (~81 % of
+bytes majority-corrected in the run logs) and are not quoted. Times are uptime T; the EBC / exclaves / launchd `hello`
+numbers are tick-CONFIRMED on all three boots, the rest are bracket-inferred at ±0.5 s (iolog ≈ T − 0.3±0.3).
+
+| Milestone (uptime T s) | ufs3 | ufs4a skip | ufs4b threads=6 |
+|---|---|---|---|
+| dyld cache mapped | ≈37.2 | **≈1.5** | **≈8.7** |
+| Early boot complete | 38.86 (tick) | 3.84 (tick) | 10.36 (tick) |
+| WindowServer opens | ≈40.8 | ≈6.8 | ≈12.8 |
+| first lit frame | ≈69.8 | ≈34.8 | ≈41.8 |
+| loginwindow opens | ≈71.8 | ≈35.8 | ≈42.8 |
+| Finder (desktop launch) | not measured | ≈85.8 | ≈95.8 |
+
+Saving to loginwindow: **≈36 s with the skip, ≈29 s with 6 threads** (`Early boot complete` tick-confirmed on all three
+boots). Nothing else moved before dyld's map — GPU bring-up ≈1.8 s on every boot, and EBC→loginwindow is 33.0 / 32.0 /
+32.4 s across ufs3 / ufs4a / ufs4b: the same post-EBC launch wave every time, which is the next boot-time target
+(structural reading, **inferred** from the three boots).
+
+Rate facts: ufs3 hashed 455,833 16 KiB blocks at a mean **12,297 blocks/s on one CPU** (perf lines, whole boot); ufs4b
+hashed 472,393 blocks at a mean **≈60,160 blocks/s over seconds 2–8 on 6 threads** (≈4.9× — attribution to the hash
+threads is **inferred**), every `cs_native4k:` line ending `ok 0`, zero refused signatures; ufs4a's pre-hash Σ = 0 and its
+4 KiB demand-page checks stayed 0 all boot (fact — pages were accepted unhashed; whether verification is deferred to
+exec-time is **inferred**). ufs4b's burst read 6,608 MiB of content against the iolog's `2381 MiB so far` at second 8:
+ratio ×2.8, the predicted compression (CONFIRMED); the flash was no longer the pacer there (inferred).
+
+Code-signing failures seen: **none on any of the three boots** — `KERN_CODESIGN_ERROR`, `cs_invalid_page`, `CODE SIGNING`,
+`Code Signature Invalid`, `taskgated`, `Killed: 9` (plus `AMFI denial` on the two 0067 boots): 0 hits each (fact, console
+scans). The only real `FATAL` line is the same pre-existing locationd crash that is already in `ufs3-console.out` — not
+introduced by either switch. Health on both 0067 boots: `NativeUfs: FAILED` 0 hits, `Data store state 0`, desk-login rc=0
+with the Finder launch confirmed by its console line (post-login the webcam showed the clock/lock face ~40-45 s later on
+both boots — same on both, so not introduced by either switch; fast auto-lock or desktop-not-drawn yet, **inferred**).
+
+Recommendation, **inferred** (the score's): put `cs-native4k-threads=6` without the skip in the installed ESP's boot line
+— ≈28.5 s saved to the login window while keeping full verification (472k blocks verified, every file `ok 0`); leave
+`cs-native4k-log` off in the installed profile. `cs-native4k-skip=1` saves ~7 s more but is a verification-off window
+(300,772 pages accepted without a hash, zero demand checks all boot) — keep it for dev/test RAM boots only, drop it after
+any install. The two switches are orthogonal. And before arguing over the last 7 s between a and b, chase the ~32 s
+post-EBC launch wave.
