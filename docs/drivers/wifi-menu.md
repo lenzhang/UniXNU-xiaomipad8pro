@@ -317,3 +317,12 @@ Name|Power|Op Mode|Supported Channels'` (W below). The adoption log (A below):
 | at the first mode where Interface Name is `en2` | `tmo 50 ./piano-cwscan scan 45`; `tmo 40 system_profiler SPAirPortDataType > /tmp/ap.txt; grep -c 'Security:' /tmp/ap.txt`; webcam the menu bar, open the Wi-Fi menu (`piano-input.py`), photograph it | CoreWLAN's count and the menu's list (counts only) |
 | if no mode changes it | the summary lines (`accept mode 0x.. (N answered by it)`), the full lines of A for each mode | what airportd still lacks: the next step is the IOUserClient bind (§5.7 item 1's selectors), decided on this evidence |
 | the end | console `reset fastboot` | — |
+
+### 6.4 wm2 as built
+
+`out/ram-k273-wm2` (the M1 branch's worktree; built 2026-11-14 from branch commit `765f0b9`, main `bc5e5da` merged): 237281280
+bytes, sha256 `e5fe6e503c3ea482b34093e87dd0299b206b34cdd3321986cbc1e36c20681d1f`, `verify-ram-images.py` PASS. The 27.3 collection
+`a598579c...` (the 0066 kernel, 26 native kexts all this repository's, `vtable check PianoWifiEthernet vs IOEthernetController:
+0 problem slots`); the v2 seed (identity `9bd6f902...`, `data-persist=0`), the v4 layer's trust cache `57063d6d...`; the
+arguments' tail 496 bytes in `/chosen/piano-boot-args-ram`, the merged line 1164 bytes. Dump image `out/ram-k273-wm2-dump`
+(sha256 `c41f00f504a8aa193a81ef982f06a3d674a6ed87f9631df46a9c391477e3ebd1`); `piano-cwscan` beside the image.
