@@ -319,8 +319,13 @@ bool PianoWifi80211::start(IOService *provider)
   reset(*fState);
   uint32_t accept = 0;
   if (PE_parse_boot_argn("piano-wifi-apple80211-accept", &accept, sizeof accept)) fState->accept = accept;
-  uint32_t uc = 0;
-  if (PE_parse_boot_argn("piano-wifi-apple80211-uc", &uc, sizeof uc)) fUcMode = uc & 0x1f;
+  // The production form of ADOPTION.md P0, confirmed on the tablet (wm3b, 2026-11-14: with the override airportd created its
+  // CWFApple80211 and its SystemConfiguration objects for en2; without it, "Did NOT find matching WiFi interface"): the override
+  // on the controller by default, set in configureInterface before the interface registers. piano-wifi-apple80211-uc=0 is the
+  // control without it.
+  uint32_t uc = pianowifi::a80211::kUcOverride;
+  if (PE_parse_boot_argn("piano-wifi-apple80211-uc", &uc, sizeof uc)) uc &= 0x3f;
+  fUcMode = uc;
   if (!IO80211Controller::start(provider)) return false;   // PianoWifiEthernet: the interface, its data path, the link down
   IOEthernetAddress mac = {};
   getHardwareAddress(&mac);
