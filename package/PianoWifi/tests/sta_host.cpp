@@ -108,6 +108,9 @@ static void testFrames()
   CHECK(std::string(net.ssid) == "home???");   // the printable form for the registry
   CHECK(net.security.rsn && net.security.groupCipher == kRsnCipherCcmp && net.security.pairwise == (1u << kRsnCipherCcmp));
   CHECK(net.security.akm == (1u << kRsnAkmPsk) && net.security.rsnCaps == 0x000c && !net.security.truncated);
+  // the element kept whole for level 8's 802.1X port
+  CHECK(net.rsnElementLength == 22 && net.rsnElement[0] == kDot11ElementRsn && net.rsnElement[1] == 20 && net.rsnElement[2] == 1 &&
+        net.rsnElement[7] == kRsnCipherCcmp && net.rsnElement[20] == 0x0c);
   CHECK(net.beaconInterval == 100 && net.dtimPeriod == 2 && net.rateCount == 8 && net.ht);
   AssocRequest r;
   r.own = kOwn;

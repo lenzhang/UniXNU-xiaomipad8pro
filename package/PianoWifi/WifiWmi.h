@@ -467,6 +467,8 @@ struct ScanEntry {
   uint8_t rateCount = 0;
   bool ht = false;
   ScanSecurity security;
+  uint8_t rsnElement[64] = {};      // the RSN element whole (identifier, length, body) for level 8's 802.1X port; 0 bytes when
+  uint8_t rsnElementLength = 0;     // there is none or it is longer than this (the handshake's check then has nothing to compare)
 };
 
 struct ScanList {
@@ -600,6 +602,10 @@ inline bool wmiParseBeacon(ScanEntry &out, const uint8_t *frame, uint32_t length
       out.dtimPeriod = body[1];
     } else if (id == kDot11ElementRsn && bytes >= 2) {
       wmiParseRsn(out.security, body, bytes);
+      if (2 + bytes <= sizeof out.rsnElement) {
+        for (uint32_t i = 0; i < 2 + bytes; ++i) out.rsnElement[i] = frame[at + i];
+        out.rsnElementLength = uint8_t(2 + bytes);
+      }
     } else if (id == kDot11ElementHtCap) {
       out.ht = true;
     } else if (id == kDot11ElementHtOperation && bytes >= 1) {
@@ -670,6 +676,10 @@ inline ScanEntry *scanAdd(ScanList &list, const WmiMgmtRx &rx)
     have.capability = found.capability;
     have.ht = have.ht || found.ht;
     if (found.security.rsn || found.security.wpa1) have.security = found.security;
+    if (found.rsnElementLength) {
+      have.rsnElementLength = found.rsnElementLength;
+      for (unsigned k = 0; k < sizeof have.rsnElement; ++k) have.rsnElement[k] = found.rsnElement[k];
+    }
     if (isProbe) ++have.probes;
     else ++have.beacons;
     return &have;
