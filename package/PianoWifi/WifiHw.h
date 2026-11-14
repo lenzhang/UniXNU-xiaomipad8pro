@@ -960,7 +960,7 @@ constexpr uint32_t kStaListenInterval = kAssocListenInterval;   // what the asso
 // (destination); the host's own pointer in the R2 group, +4 the tail for a destination ring):
 //   TCL data 1 (host -> TCL, the transmit ring): R0 0x918, R2 0x2000 of the TCL unit, 8-word entries
 //   WBM2SW0 (its completions; TCL ring 0 returns its buffers there, manager "software 0"), WBM2SWn at +0x78 * n, R2 +8 * n
-//   WBM2SW1 and WBM2SW3 (released receive buffers: SW1 is their manager, SW3 the receive error ring of this chip's host)
+//   WBM2SW3 (released receive buffers: the receive error ring of this chip's host; WBM2SW1 is never programmed, as that host does)
 //   REO2SW1 (received MSDUs, reordered), REO2SW0 (the reorder unit's exceptions, fragments and BARs), 8-word entries
 //   WBM idle link (host -> WBM: the link descriptors REO and the receive DMA build their lists from), 2-word entries
 constexpr uint32_t kDpTcl1R0 = kUnitTcl + 0x918, kDpTcl1R2 = kUnitTcl + 0x2000;

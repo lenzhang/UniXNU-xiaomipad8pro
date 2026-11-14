@@ -9,9 +9,11 @@
 //   transmit      TCL data ring 1 (host -> TCL), its completions on WBM2SW0: a frame of en0 (802.3) goes out as one
 //                 descriptor naming a transmit buffer of ours; its completion gives the buffer back
 //   receive       REO2SW1: every received MSDU of our peer, reordered (the hash steering of the reorder unit all to this ring);
-//                 REO2SW0: the reorder unit's exceptions (counted and passed over); WBM2SW1 and WBM2SW3: receive buffers the
-//                 hardware or the firmware released (given back); the WBM idle link ring and its link descriptors (the lists
-//                 the receive DMA and the reorder unit build)
+//                 REO2SW0: the reorder unit's exceptions (counted and passed over); WBM2SW3, the receive error ring: receive
+//                 buffers the hardware released (given back); the WBM idle link ring and its link descriptors (the lists the
+//                 receive DMA and the reorder unit build). WBM2SW1 is left alone: this chip's own host never programs it (the
+//                 buffers' manager "software ring 1" names them as the host's, the releases come on ring 3), and a ring the
+//                 firmware may own is not ours to reprogram.
 //   refill        the data interface's refill ring (WifiHtt.h): every receive buffer that comes back is posted again, so the
 //                 radio never runs dry (before level 8 the 511 buffers were handed out once)
 // Received frames are 802.3 (the device's receive decapsulation is Ethernet since level 7's parameters): the frame starts at
@@ -50,7 +52,7 @@ struct DpStats {
   // receive
   uint32_t rxEntries = 0, rxFrames = 0, rxEapol = 0, rxBytes = 0, rxNotDone = 0, rxBadCookie = 0, rxErrors = 0, rxNullData = 0,
            rxMulti = 0, rxNotEthernet = 0, rxTooLong = 0, rxLinkDesc = 0, rxRecycled = 0, rxRecycleFull = 0;
-  uint32_t excEntries = 0, rel1Entries = 0, rel3Entries = 0, relRecycled = 0, relOther = 0;
+  uint32_t excEntries = 0, relEntries = 0, relRecycled = 0, relOther = 0;
   uint32_t lastEapolLength = 0, lastDecap = 0, lastErrors = 0, lastPushReason = 0, lastErrorCode = 0;
   // transmit
   uint32_t txFrames = 0, txBytes = 0, txNoBuffer = 0, txRingFull = 0, txTooLong = 0, txNotReady = 0, txCompletions = 0,
@@ -59,7 +61,7 @@ struct DpStats {
 };
 
 struct Dp {
-  CeRing tcl, txComp, reo, reoExc, rel1, rel3, idle;
+  CeRing tcl, txComp, reo, reoExc, rel3, idle;
   uint8_t *linkVa = nullptr;
   uint64_t linkBus = 0;
   uint32_t linkDescs = 0;
@@ -188,8 +190,6 @@ inline bool dpPlan(Dp &dp, Arena &arena, HttRx *rx)
             index) ||
       !plan(dp.reoExc, arena, kDpReoExcEntries, kDpReoEntryWords, kDpReo2Sw0R0, kDpReo2Sw0R2, kDpRingIdReo2Sw0, pointers,
             pointersBus, index) ||
-      !plan(dp.rel1, arena, kDpRelEntries, kDpWbmEntryWords, kDpWbm2Sw0R0 + kDpWbm2SwR0Stride,
-            kDpWbm2Sw0R2 + kDpWbm2SwR2Stride, kDpRingIdWbm2Sw0 + 1, pointers, pointersBus, index) ||
       !plan(dp.rel3, arena, kDpRelEntries, kDpWbmEntryWords, kDpWbm2Sw0R0 + 3 * kDpWbm2SwR0Stride,
             kDpWbm2Sw0R2 + 3 * kDpWbm2SwR2Stride, kDpRingIdWbm2Sw0 + 3, pointers, pointersBus, index) ||
       !plan(dp.idle, arena, kDpIdleEntries, kDpIdleEntryWords, kDpIdleLinkR0, kDpIdleLinkR2, 0, pointers, pointersBus, index))
@@ -215,7 +215,6 @@ inline void dpProgram(Dp &dp, const ChipIo &io)
   program(dp, io, dp.txComp, false);
   program(dp, io, dp.reo, false);
   program(dp, io, dp.reoExc, false);
-  program(dp, io, dp.rel1, false);
   program(dp, io, dp.rel3, false);
   program(dp, io, dp.idle, true, true);
   // the link descriptors: each one entry of the idle ring (its address, manager "WBM idle descriptor list", cookie = its index)
@@ -469,10 +468,9 @@ inline uint32_t dpPoll(Dp &dp, const ChipIo &io, Deliver deliver)
     }
     if (moved) write(dp, io, r.r2 + 4, r.ours * r.words);
   }
-  // ---- released receive buffers (software ring 1 is their manager; ring 3 is this chip's host's receive error ring)
-  CeRing *const released[2] = {&dp.rel1, &dp.rel3};
-  for (CeRing *ring : released) {
-    CeRing &r = *ring;
+  // ---- released receive buffers (ring 3, this chip's host's receive error ring)
+  {
+    CeRing &r = dp.rel3;
     const uint32_t head = slotOf(r, load(r.theirs));
     bool moved = false;
     while (r.ours != head) {
@@ -481,8 +479,7 @@ inline uint32_t dpPoll(Dp &dp, const ChipIo &io, Deliver deliver)
       r.ours = (r.ours + 1) % r.entries;
       moved = true;
       ++seen;
-      if (ring == &dp.rel1) ++dp.st.rel1Entries;
-      else ++dp.st.rel3Entries;
+      ++dp.st.relEntries;
       HttRx *rx = dp.rx;
       if (rx && cookie + 1 < kRxRefillEntries && addrOf(e) == rx->refillBus[cookie] && httRefillPost(*rx, cookie))
         ++dp.st.relRecycled;

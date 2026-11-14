@@ -127,15 +127,16 @@ int main()
   CHECK(chip.regs[kDpReo2Sw1R0 + kRingBaseMsb] == (uint32_t(dp.reo.bus >> 32) | (kDpReoEntries * 8) << kRingBaseMsbSizeShift));
   CHECK(chip.regs[kDpReo2Sw0R0 + kRingId] == 8u);
   CHECK(chip.regs[kDpReo2Sw0R0 + kDstRingHpAddrLo] == uint32_t(dp.reoExc.theirsBus));
-  // the release rings at their strides (WBM2SW1 at +0x78, ring 129; WBM2SW3 at +3 * 0x78, ring 131)
-  CHECK(chip.regs[kDpWbm2Sw0R0 + 0x78 + kRingId] == (8u | 129u << kRingIdRingIdShift));
+  // the receive error release ring at its stride (WBM2SW3 at +3 * 0x78, ring 131); WBM2SW1 is never touched
   CHECK(chip.regs[kDpWbm2Sw0R0 + 3 * 0x78 + kRingId] == (8u | 131u << kRingIdRingIdShift));
+  for (uint32_t off = 0; off < 0x78; off += 4) CHECK(!written(chip, kDpWbm2Sw0R0 + 0x78 + off));
+  CHECK(!written(chip, kDpWbm2Sw0R2 + 8) && !written(chip, kDpWbm2Sw0R2 + 12));
   CHECK(written(chip, kDpWbm2Sw0R2 + 3 * 8) && written(chip, kDpWbm2Sw0R2 + 3 * 8 + 4));
   // every ring's pointers in host memory are distinct
-  const volatile uint32_t *ptrs[] = {dp.tcl.theirs, dp.txComp.theirs, dp.reo.theirs, dp.reoExc.theirs, dp.rel1.theirs,
-                                     dp.rel3.theirs, dp.idle.theirs};
-  for (unsigned i = 0; i < 7; ++i)
-    for (unsigned k = i + 1; k < 7; ++k) CHECK(ptrs[i] != ptrs[k]);
+  const volatile uint32_t *ptrs[] = {dp.tcl.theirs, dp.txComp.theirs, dp.reo.theirs, dp.reoExc.theirs, dp.rel3.theirs,
+                                     dp.idle.theirs};
+  for (unsigned i = 0; i < 6; ++i)
+    for (unsigned k = i + 1; k < 6; ++k) CHECK(ptrs[i] != ptrs[k]);
   // the idle link ring: no ring identifier check, no tail address, every link descriptor in it, its head after the last one
   CHECK(chip.regs[kDpIdleLinkR0 + kRingMisc] == (kRingMiscEnable | kRingMiscLoopCountDisable | kRingMiscNoRingId));
   CHECK(!written(chip, kDpIdleLinkR0 + kSrcRingTpAddrLo) && !written(chip, kDpIdleLinkR0 + kSrcRingTpAddrHi));
@@ -277,7 +278,7 @@ int main()
     *dp.rel3.theirs = 2 * dp.rel3.words;
     const uint32_t before = dp.st.rxRecycled;
     CHECK(dpPoll(dp, io, deliver) == 2);
-    CHECK(dp.st.rel3Entries == 2 && dp.st.relRecycled == 1 && dp.st.relOther == 1 && dp.st.rxRecycled == before);
+    CHECK(dp.st.relEntries == 2 && dp.st.relRecycled == 1 && dp.st.relOther == 1 && dp.st.rxRecycled == before);
     CHECK(chip.regs[kDpWbm2Sw0R2 + 3 * 8 + 4] == 2 * 8);
   }
   // ---- the exception ring: counted, its push reason and error kept, passed over

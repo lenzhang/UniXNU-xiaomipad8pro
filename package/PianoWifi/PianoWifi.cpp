@@ -3499,11 +3499,11 @@ void level8Status(uint64_t now, const char *why)
   note("level 8 %s (%llu ms after the association): received %u entries, %u frames (%u bytes), %u EAPOL (to the port %u, "
        "no client %u), to en0 %u (%u dropped while en0's link was down); not delivered: not done %u, errors %u (last %#x), "
        "null data %u, more than one buffer %u, not Ethernet %u, bad cookie %u, link descriptors %u; buffers posted again %u "
-       "(%u with no room), released %u/%u (%u posted again), exceptions %u (push %u error %u); refill: the firmware's tail at %u",
+       "(%u with no room), released %u (%u posted again), exceptions %u (push %u error %u); refill: the firmware's tail at %u",
        why, (unsigned long long)(gL8.associatedAt ? now - gL8.associatedAt : 0), st.rxEntries, st.rxFrames, st.rxBytes,
        st.rxEapol, gL8.eapolToPort, gL8.eapolDropped, gL8.toEn0, gL8.en0Dropped, st.rxNotDone, st.rxErrors, st.lastErrors,
        st.rxNullData, st.rxMulti, st.rxNotEthernet, st.rxBadCookie, st.rxLinkDesc, st.rxRecycled, st.rxRecycleFull,
-       st.rel1Entries, st.rel3Entries, st.relRecycled, st.excEntries, st.lastPushReason, st.lastErrorCode, gHtt.refillTaken);
+       st.relEntries, st.relRecycled, st.excEntries, st.lastPushReason, st.lastErrorCode, gHtt.refillTaken);
   note("level 8 %s: sent %u frames (%u bytes, %u EAPOL), completions %u (acknowledged %u, not %u, last reason %u, by the "
        "firmware %u, other %u, bad cookie %u); held back: not ready %u, no buffer %u, ring full %u; the queue: %u waiting, %u "
        "sent, %u dropped, %u refused as full; the port: %s (%u connect(s), %u bad message(s)), %u message(s) out (%u failed); "
