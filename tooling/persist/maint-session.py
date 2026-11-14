@@ -1078,7 +1078,9 @@ def k273_store_backup_back(s):
         got = s.job('check-k273-pages', 'hash-list', 'k273-store-runs.txt', lun0, 2, timeout=7200)['sha256']
         s.need(got == entry['sha256'], f'the pages read back: {got[:16]} = {entry["sha256"][:16]}')
     elif not s.execute:
-        s.log('  check the runs list and the pages hash to their records; restore-list; hash-list = the pages\' sha256')
+        s.log('  dry run: the real run fetches k273-store-runs.txt, serves the pages (serve_slices k273-store-pages), runs '
+              'restore-list k273-store-runs.txt (every run, one piece each) and hash-list column 2 = the pages\' sha256, then '
+              'restores linux_data-k273-store-head last; the dry run prints none of those commands')
     s.restore('linux_data-k273-store-head', lun0, first, B)   # the header and bitmap last
 
 
@@ -1159,7 +1161,11 @@ def k273_store_grow(s):
         s.t('send', lun0, of + 1, bo, B, s.a.nc_port)
     runs = common.bit_runs(bitmap, po) if s.execute else []
     present = sum(c for _, c in runs)
-    s.log(f'  info  the old store holds {present} pages in {len(runs)} runs')
+    if s.execute:
+        s.log(f'  info  the old store holds {present} pages in {len(runs)} runs')
+    else:
+        s.log('  info  dry run: the old bitmap is not fetched, so the present pages, their runs and the copy below are unknown '
+              '(not none); the bitmap and header written to session/store-grow/ are placeholders of the real ones')
     if s.execute:
         s.need(present == bin(int.from_bytes(bitmap, 'little')).count('1'), f'the runs cover every set bit ({present})')
     (work / 'runs.txt').write_text(''.join(f'{of + 1 + bo + i} {nf + 1 + bn + i} {c}\n' for i, c in runs))
