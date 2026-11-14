@@ -324,6 +324,7 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-l7file=0`, `piano-wifi-l7cands=N` | 1, 4 | `0`: the join profile only through the sysctl (by default the kext also reads the root-only file `/private/var/db/piano-wifi/profile` itself every 2 s while it waits, with the helper's checks); how many access points of the profile's name are tried in turn (at most 6) |
 | `piano-wifi-l7tries=N`, `piano-wifi-l7frame=MS`, `piano-wifi-l7step=MS`, `piano-wifi-l7scans=N` | 3, 500, 3000, 3 | the tries of the authentication and of the association request, the wait for each answer (the association's is twice it), the wait for a command's answer (the start response, the peer map, the confirmation, the teardown's), and how many scans of its own level 7 runs when the network is not in the list |
 | `piano-wifi-l8=N` | `0x37` = 55 (since boot 10f: software ring 1 and the rings at level 6's start; `0x17` before) | level 8's switches (§13.6, `WifiDp.h` `kL8*`): `0x01` the receive buffers return to software ring 1 (off: the firmware's own manager, as at levels 6 and 7), `0x02` the receive ring selection for both radio buffer rings, `0x04` the data path's rings programmed at all (off: level 8 is level 7), `0x08` EAPOL frames also to en0, `0x10` the transmit side, `0x20` the rings programmed at level 6's start instead of level 7's (10c's reset there was the stack overflow, not the rings) |
+| `piano-wifi-en0=1` | 0 | the Wi-Fi interface takes over the built-in `en0`: PianoWifiEthernet terminates PianoNullEthernet when it starts (after level 6; TimeSync and WindowServer have had their built-in interface since the boot), waits for `en0` to leave the network stack (at most 10 s) and registers built in and primary with PianoNullEthernet's address `02:50:49:41:4e:01`, which level 6 then gives the firmware's virtual device too, so the saved naming (NetworkInterfaces.plist) gives it `en0`. Off: the station has its own address `...:04` and the next free unit (since boot 10i) |
 | `piano-wifi-l8blocks=N`, `piano-wifi-l8tracems=MS` | 7, 5 (50 before boot 10f) | program the data path's register blocks 0..N only (`WifiDp.h` `DpBlock`: 0 two reads, 1 TCL ring 1, 2 WBM2SW0, 3 REO2SW1, 4 REO2SW0, 5 WBM2SW3, 6 the idle link ring, 7 the reorder unit's set-up; below 7 level 8 does not run), and how long the ladder waits after each block's line (printed at once, not held) before the block's first access |
 | `piano-wifi-l8status=MS` | 5000 | how often level 8 logs its counters while associated (at least 500; `0`: only at the association's end) |
 
@@ -1197,6 +1198,20 @@ it by its address. After `the port is open`, as root:
 | `PianoWifiEthernet: out: frame 1, ~342 bytes, type 0x0800, group addressed: handed to PianoWifi (0)` | the DHCP discover |
 | `level 8 ...: sent N frames ...; completions N (acked N ...)` | data frames acknowledged |
 | `ifconfig $I`, `ipconfig getifaddr $I`, `ping -c 5 <router>` | ether `...:04`; an address; 5 answers |
+
+**Boot 10j: the Wi-Fi interface as the built-in en0** (built 2026-11-14 15:41 from branch commit `0d275e7`, collection `763f0b06...`, the v2 recipe of 10i with `piano-wifi-en0=1`: `out/ram-k273-wifi-10j` 237281280 bytes, sha256 `477ee9b2f6543a38ffab6f0960525dc9c7adfc717050c2cb137d8be77ce9957f`, `verify-ram-images.py` PASS): 10i's arguments and `piano-wifi-en0=1`; 10i is its control.
+
+| Line / command | Expected |
+|---|---|
+| `PianoNullEthernet: en0 (built-in, ...), MAC 02:50:49:41:4e:01; TimeSync released` | at the boot, as always |
+| `PianoWifiEthernet: en0: PianoNullEthernet is asked to stand down (piano-wifi-en0=1)`, `en0: free after N ms` | after level 6 |
+| `PianoWifiEthernet: the interface takes the virtual device's address (its first three bytes 02:50:49)`, the publish line with `MAC 02:50:49:..:01` | the station on the old en0 address |
+| `PianoWifiEthernet: at the link's up: en0 (attached to the network stack), interface flags 0x8863 (up 1, running 1)` | the name en0 |
+| `ifconfig -a` | en0 (`...:01`, ours), en1 (`...:02`), nothing else |
+| DHCP and ping as 10i, on en0 | an address, 5 answers |
+| the desktop and the USB shell stay up after en0 changes hands | (TimeSync took its identifier at the boot) |
+
+`en0: still taken after 10 s`: the null interface did not leave; then ours keeps its own name, and the line before says why.
 
 ## 9. Fallback
 
