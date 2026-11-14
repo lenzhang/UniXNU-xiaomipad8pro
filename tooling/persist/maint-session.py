@@ -1578,6 +1578,92 @@ def write_esp(s, image_name):
                                                    'inputs': record.get('inputs'), 'written': time.strftime('%Y-%m-%d %H:%M:%S')})
 
 
+@step('esp-delta', 'maintenance, WRITE partition 37: only the MiB in which --esp differs from the installed ESP',
+      writes='LUN 0 LBA 71527424-71789567, the changed MiB only')
+def esp_delta(s):
+    """--esp written over the installed ESP piece by piece (owner, 2026-11-14): when only files changed in place (a new kernel
+    collection, ADT or menu at the same clusters), the two images differ in a few MiB, not 1 GiB. The installed ESP is
+    OUT/installed.json's record; its image must be here and hash to it, and the tablet's ESP region must hash to it too (else Stop:
+    use esp-final). That image is the backup of what is overwritten: stored in the backup set (re-read without cache = its
+    sha256) as linux_rootfs-tail-esp, so rollback esp-final writes it back. The same gates as esp-final (the bound store, the pair
+    rule). Then each run of differing MiB is fetched and written, and the whole region read back = --esp's sha256."""
+    record = s.esp
+    if not record:
+        raise Stop('esp-delta needs --esp NEW (a build record in out/persistent)')
+    try:
+        old_name = json.loads((OUT / 'installed.json').read_text())['image']
+    except (OSError, ValueError, KeyError):
+        raise Stop('no OUT/installed.json: which ESP is installed is not known here (use esp-final)')
+    old = s.esp_record(old_name)
+    old_img, new_img = OUT / old_name, OUT / record['image']
+    s.need(old is not None and old_img.is_file() and s.sha_nocache(old_img) == old['sha256'],
+           f'the installed ESP {old_name}: its image is here and hashes to its record ({(old or {}).get("sha256", "")[:16]})')
+    s.need(new_img.is_file() and s.sha_nocache(new_img) == record['sha256'], f'{record["image"]} hashes to its record ({record["sha256"][:16]})')
+    r = map_nodes(s)
+    if r:
+        s.need(r['esp'] != 'none' and r['esp'].split()[1:] == [str(common.ESP_FIRST * 8), str(common.ESP_BLOCKS * 8)], f'esp is {r["esp"]}')
+    esp = s.nodes.get('esp') or 'sda37'
+    now = s.region_sha(esp, 0, 1024, MiB, name='esp-now')
+    s.need(now == old['sha256'] if s.execute else None, f'the tablet\'s ESP = the installed {old_name}: {now}')
+    if esp_store(record):
+        ok, text = bound_store(s, record)
+        s.need(ok, text)
+    window = s.esp_window(record)
+    if window and window > common.OLD_DARWINBOOT_WINDOW_MAX:
+        s.pair(s.tablet_boot_a(), record, f'{record["image"]} asks for {window >> 20} MiB')
+    # the backup: the installed image itself (what every changed MiB held), in the set with its checks
+    if s.execute:
+        nas, _ = s.nas()
+        backups = dict(s.state.get('backups', {}))
+        entry = backups.get('linux_rootfs-tail-esp') or {}
+        if not (entry.get('verified') and entry.get('sha256') == old['sha256']):
+            if entry.get('verified') and s.state.get('esp_written'):
+                raise Stop('this backup set holds an ESP backup of another image: start a new set (--new-backup)')
+            dest = nas / 'linux_rootfs-tail-esp.img'
+            shutil.copyfile(old_img, dest)
+            again = s.sha_nocache(dest)
+            s.need(again == old['sha256'], f'linux_rootfs-tail-esp: {old_name} stored in the backup set, re-read without cache: {again}')
+            backups['linux_rootfs-tail-esp'] = {'file': dest.name, 'sha256': old['sha256'], 'bytes': dest.stat().st_size, 'dev': s.nodes['lun0'],
+                                                'skip': common.ESP_FIRST, 'count': common.ESP_BLOCKS, 'bs': B, 'verified': True, 'local': False,
+                                                'what': f'the installed ESP ({old_name}) = the tablet\'s region, from its image',
+                                                'time': time.strftime('%Y-%m-%d %H:%M:%S')}
+            s.save(backups=backups)
+            s.write_manifest(nas, backups)
+        else:
+            s.log(f'  ok    the backup set holds {old_name} already (sha256 {old["sha256"][:16]})')
+    else:
+        s.log(f'  check {old_name} stored in the backup set as linux_rootfs-tail-esp (re-read without cache = its sha256)')
+    runs = []
+    with open(old_img, 'rb') as fa, open(new_img, 'rb') as fb:
+        for i in range(common.ESP_BLOCKS * B // MiB):
+            if fa.read(MiB) != fb.read(MiB):
+                if runs and runs[-1][0] + runs[-1][1] == i:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([i, 1])
+    s.log(f'  info  {record["image"]} differs from {old_name} in {sum(c for _, c in runs)} MiB in {len(runs)} runs')
+    work = s.dir / 'esp-delta'
+    work.mkdir(exist_ok=True)
+    for first, count in runs:
+        piece = work / f'esp-delta-{first}.bin'
+        with open(new_img, 'rb') as f:
+            f.seek(first * MiB)
+            piece.write_bytes(f.read(count * MiB))
+        s.fetch(piece.name, piece, common.sha(piece))
+        if s.write(f'{piece.name} ({count} MiB) -> /dev/{esp} at MiB {first}'):
+            s.t('write', piece.name, esp, first, MiB, timeout=600)
+    got = s.region_sha(esp, 0, 1024, MiB, name='esp-check')
+    got2 = s.region_sha(s.nodes['lun0'], common.ESP_FIRST * B // MiB, 1024, MiB, name='esp-check-lun0')
+    s.need(got == record['sha256'] and got2 == record['sha256'] if s.execute else None,
+           f'ESP read back through /dev/{esp} and /dev/{s.nodes["lun0"]}: {got} / {got2} = {record["sha256"][:16]}')
+    s.sim['esp'] = record['sha256']
+    if s.execute:
+        s.save(esp_written=record['image'], esp_sha256=record['sha256'])
+        common.write_json(OUT / 'installed.json', {'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'],
+                                                   'inputs': record.get('inputs'), 'written': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                                   'by': f'esp-delta over {old_name}'})
+
+
 @step('esp', 'maintenance, WRITE partition 37 (test-phase ESP)', writes='LUN 0 LBA 71527424-71789567')
 def esp_step(s):
     """The ESP image (--esp, default esp-base-diag.img: default entry macos-diag) onto partition 37; read back through the

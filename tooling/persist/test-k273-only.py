@@ -725,6 +725,21 @@ def test_session(tmp, out, dual, seed273, inputs):
     check(tp.read(lun0, common.DATA_FIRST * B, len(root_old)) == bytes(root_old) and
           tp.sha_region(lun0, STORE_LBA * B, (1 + bo) * B) == old_window[0], 'rollback k273-store-grow: the old root back on linux_data')
 
+    # -- esp-delta: only the changed MiB of a newer ESP over the installed v2; rollback esp-final puts v2 back --------------------
+    rc, _ = build(out, 'esp-k273-short', '--seed', str(tmp / 'seed-200.img'), '--root-part', 'linux_rootfs', '--arg', 'piano-wifi=8',
+                  '--name', 'esp-k273-v3')
+    v3 = json.loads((out / 'esp-k273-v3.json').read_text()) if rc == 0 else {}
+    log = run('map', 'esp-delta', 'check', '--esp', 'esp-k273-v3.img', '--new-backup')
+    check(rc == 0 and esp_region() == v3.get('sha256') and 'differs from esp-k273-v2.img in' in log and
+          json.loads((out / 'installed.json').read_text())['image'] == 'esp-k273-v3.img',
+          'esp-delta: v3 over v2 by its changed MiB only, read back = v3; installed.json follows')
+    run('map', '--esp', 'esp-k273-v3.img')
+    run('rollback', 'esp-final', '--esp', 'esp-k273-v3.img')
+    check(esp_region() == v2['sha256'], 'rollback esp-final after esp-delta: v2 again (its image was the backup)')
+    tp.write_at(lun0, (common.ESP_FIRST + 3) * B, b'not v2')
+    log = run('map', 'esp-delta', '--esp', 'esp-k273-v3.img', '--new-backup', expect=3)
+    check('the tablet\'s ESP = the installed esp-k273-v2.img' in log and 'FAIL' in log, 'esp-delta refuses an ESP region that is not the installed image')
+
 
 def main():
     p = argparse.ArgumentParser()
