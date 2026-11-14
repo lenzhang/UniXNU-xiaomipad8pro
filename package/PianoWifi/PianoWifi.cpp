@@ -3624,10 +3624,10 @@ void level8Status(uint64_t now, const char *why)
   note("level 8 %s: not delivered: not done %u, errors %u (last %#x), null data %u, multi-buffer %u, not Ethernet %u, "
        "bad cookie %u, link descriptors %u",
        why, st.rxNotDone, st.rxErrors, st.lastErrors, st.rxNullData, st.rxMulti, st.rxNotEthernet, st.rxBadCookie, st.rxLinkDesc);
-  note("level 8 %s: buffers posted again %u (%u no room); released %u (%u posted again, %u not ours); exceptions %u (push "
-       "%u, error %u); refill tail %u",
-       why, st.rxRecycled, st.rxRecycleFull, st.relEntries, st.relRecycled, st.relOther, st.excEntries, st.lastPushReason,
-       st.lastErrorCode, gHtt.refillTaken);
+  note("level 8 %s: posted again %u (%u no room); released %u (%u delivered: no queue; %u posted again, %u not ours); "
+       "exceptions %u (push %u, error %u); refill tail %u",
+       why, st.rxRecycled, st.rxRecycleFull, st.relEntries, st.relDelivered, st.relRecycled, st.relOther, st.excEntries,
+       st.lastPushReason, st.lastErrorCode, gHtt.refillTaken);
   note("level 8 %s: sent %u frames (%u bytes, %u EAPOL); completions %u (acked %u, not %u, last reason %u, firmware %u, "
        "other %u, bad cookie %u)",
        why, st.txFrames, st.txBytes, st.txEapol, st.txCompletions, st.txAcked, st.txNotAcked, st.lastTxReason, st.txFwReleased,

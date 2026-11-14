@@ -31,6 +31,7 @@ namespace pianowifi {
 constexpr uint32_t kDpTclEntries = 64, kDpTxCompEntries = 64, kDpReoEntries = 256, kDpReoExcEntries = 128,
                    kDpRelEntries = 256, kDpIdleEntries = 1024;
 constexpr uint32_t kDpTxBuffers = 32, kDpTxBufferBytes = 2048;
+constexpr uint32_t kDpReoErrQueueAddrZero = 0;   // the reorder unit's error 0: no queue descriptor for the frame's TID
 constexpr uint32_t kDpLinkDescBytes = 128;
 constexpr uint32_t kDpFrameMax = 1600;   // an 802.3 frame of en0 (1514 and a VLAN tag, rounded)
 
@@ -67,7 +68,7 @@ struct DpStats {
   // receive
   uint32_t rxEntries = 0, rxFrames = 0, rxEapol = 0, rxBytes = 0, rxNotDone = 0, rxBadCookie = 0, rxErrors = 0, rxNullData = 0,
            rxMulti = 0, rxNotEthernet = 0, rxTooLong = 0, rxLinkDesc = 0, rxRecycled = 0, rxRecycleFull = 0;
-  uint32_t excEntries = 0, relEntries = 0, relRecycled = 0, relOther = 0;
+  uint32_t excEntries = 0, relEntries = 0, relRecycled = 0, relOther = 0, relDelivered = 0;
   uint32_t relBySource[8] = {}, relRxdmaError[32] = {}, relReoError[32] = {}, relGroup = 0, relUnicast = 0;
   DpRelRecord rel[kDpRelRecords];   // the first kDpRelRecords releases
   uint32_t relRecorded = 0;
@@ -450,6 +451,48 @@ inline bool dpSend(Dp &dp, const ChipIo &io, const uint8_t *frame, uint32_t leng
 // What a received frame is to the owner: 0 an 802.3 frame for en0, 1 an EAPOL frame (for the 802.1X path).
 enum DpRxKind : uint32_t { kDpRxEthernet = 0, kDpRxEapol = 1 };
 
+namespace dpdetail {
+// One received MSDU out of its buffer: the descriptor's checks (done, no error, not null data, one buffer, Ethernet II, a
+// length that fits), then deliver(kind, frame, length). `first`/`last`/`continuation` are the MSDU's place in its MPDU, as the
+// ring entry (or, for a released buffer, the descriptor) gives it. Returns true when the frame was delivered.
+template <class Deliver>
+inline bool deliverBuffer(Dp &dp, const uint8_t *va, bool first, bool last, bool continuation, Deliver &deliver)
+{
+  const uint32_t info14 = get32(va + kRxDescInfo14), info13 = get32(va + kRxDescInfo13);
+  const uint32_t info5 = get16(va + kRxDescInfo5), info11 = get32(va + kRxDescInfo11);
+  const uint32_t pad = (info5 >> kRxDescL3PadShift) & kRxDescL3PadMask;
+  const uint32_t length = get32(va + kRxDescInfo10) & kRxDescMsduLenMask;
+  const uint32_t decap = (info11 >> kRxDescDecapShift) & kRxDescDecapMask;
+  dp.st.lastDecap = decap;
+  if (!(info14 & kRxDescMsduDone)) {
+    ++dp.st.rxNotDone;
+  } else if (info13 & kRxDescErrors) {
+    ++dp.st.rxErrors;
+    dp.st.lastErrors = info13 & kRxDescErrors;
+  } else if (info13 & kRxDescNullData) {
+    ++dp.st.rxNullData;
+  } else if (!first || !last || continuation) {
+    ++dp.st.rxMulti;   // an MSDU over more than one buffer: not at this level (2 KiB buffers carry 1500-byte frames)
+  } else if (decap != kRxDecapEthernet) {
+    ++dp.st.rxNotEthernet;
+  } else if (length < 14 || kRxDescBytes + pad + length > kRxBufferBytes) {
+    ++dp.st.rxTooLong;
+  } else {
+    const uint8_t *frame = va + kRxDescBytes + pad;
+    const bool eapol = frame[12] == 0x88 && frame[13] == 0x8e;
+    ++dp.st.rxFrames;
+    dp.st.rxBytes += length;
+    if (eapol) {
+      ++dp.st.rxEapol;
+      dp.st.lastEapolLength = length;
+    }
+    deliver(eapol ? kDpRxEapol : kDpRxEthernet, frame, length);
+    return true;
+  }
+  return false;
+}
+}  // namespace dpdetail
+
 // One turn: the transmit completions, the received MSDUs (each delivered and its buffer posted again), the release rings'
 // buffers posted again, the exception ring passed over. `deliver(kind, frame, length)` gets each frame; the frame lives in the
 // receive buffer only until deliver returns. Returns how many entries were seen.
@@ -510,39 +553,8 @@ inline uint32_t dpPoll(Dp &dp, const ChipIo &io, Deliver deliver)
         continue;
       }
       const uint8_t *va = rx->refillVa[cookie];
-      bool keep = va != nullptr;
-      if (keep) {
-        const uint32_t info14 = get32(va + kRxDescInfo14), info13 = get32(va + kRxDescInfo13);
-        const uint32_t info5 = get16(va + kRxDescInfo5), info11 = get32(va + kRxDescInfo11);
-        const uint32_t pad = (info5 >> kRxDescL3PadShift) & kRxDescL3PadMask;
-        const uint32_t length = get32(va + kRxDescInfo10) & kRxDescMsduLenMask;
-        const uint32_t decap = (info11 >> kRxDescDecapShift) & kRxDescDecapMask;
-        dp.st.lastDecap = decap;
-        if (!(info14 & kRxDescMsduDone)) {
-          ++dp.st.rxNotDone;
-        } else if (info13 & kRxDescErrors) {
-          ++dp.st.rxErrors;
-          dp.st.lastErrors = info13 & kRxDescErrors;
-        } else if (info13 & kRxDescNullData) {
-          ++dp.st.rxNullData;
-        } else if (!(msdu & kDpMsduFirst) || !(msdu & kDpMsduLast) || (msdu & kDpMsduContinuation)) {
-          ++dp.st.rxMulti;   // an MSDU over more than one buffer: not at this level (2 KiB buffers carry 1500-byte frames)
-        } else if (decap != kRxDecapEthernet) {
-          ++dp.st.rxNotEthernet;
-        } else if (length < 14 || kRxDescBytes + pad + length > kRxBufferBytes) {
-          ++dp.st.rxTooLong;
-        } else {
-          const uint8_t *frame = va + kRxDescBytes + pad;
-          const bool eapol = frame[12] == 0x88 && frame[13] == 0x8e;
-          ++dp.st.rxFrames;
-          dp.st.rxBytes += length;
-          if (eapol) {
-            ++dp.st.rxEapol;
-            dp.st.lastEapolLength = length;
-          }
-          deliver(eapol ? kDpRxEapol : kDpRxEthernet, frame, length);
-        }
-      }
+      if (va)
+        deliverBuffer(dp, va, (msdu & kDpMsduFirst) != 0, (msdu & kDpMsduLast) != 0, (msdu & kDpMsduContinuation) != 0, deliver);
       // the buffer goes back into the refill ring whatever its frame was
       if (httRefillPost(*rx, cookie)) ++dp.st.rxRecycled;
       else ++dp.st.rxRecycleFull;
@@ -610,6 +622,16 @@ inline uint32_t dpPoll(Dp &dp, const ChipIo &io, Deliver deliver)
         else ++dp.st.relUnicast;
       }
       if (dp.st.relRecorded < kDpRelRecords) dp.st.rel[dp.st.relRecorded++] = rec;
+      // The reorder unit releases a frame for which it has no queue (push reason 0, error 0: the queue descriptor's address is
+      // zero) — this chip's group-addressed frames when they are not routed to the non-QoS queue (boot 10g: every ARP and
+      // IPv4 broadcast of the access point came this way, decrypted, with no error bit). This chip's host passes such a frame
+      // up after the same checks as any other; so does this one.
+      if (ours && rec.source == kDpRelSrcReo && rec.reoPush == 0 && rec.reoError == kDpReoErrQueueAddrZero && rx->refillVa[cookie]) {
+        const uint8_t *va = rx->refillVa[cookie];
+        const uint32_t info5 = get16(va + kRxDescInfo5);
+        if (deliverBuffer(dp, va, (info5 & kRxDescFirstMsdu) != 0, (info5 & kRxDescLastMsdu) != 0, false, deliver))
+          ++dp.st.relDelivered;
+      }
       if (ours && httRefillPost(*rx, cookie))
         ++dp.st.relRecycled;
       else

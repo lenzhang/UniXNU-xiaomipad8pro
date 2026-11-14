@@ -18,6 +18,7 @@
 // not the unit's (the unit's own is in the `persist` partition, never logged, never committed).
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
+#include <IOKit/IOWorkLoop.h>
 #include <sys/errno.h>
 #include <sys/kpi_mbuf.h>
 #include <net/kpi_interface.h>
@@ -53,6 +54,10 @@ class PianoWifiEthernet : public IOEthernetController {
 
   IOEthernetInterface *fInterface = nullptr;
   IONetworkMedium *fMedium = nullptr;
+  // A work loop of its own (PianoUsbNet's pattern). Boot 10g: without one the controller had its provider's (IOResources,
+  // none), the family's command gate never ran, and en0 was UP and RUNNING in ifconfig while enable() was never called and
+  // not one frame reached outputPacket.
+  IOWorkLoop *fWorkLoop = nullptr;
   // Locally administered, "PIAN"; not the unit's own. The same as WifiHw.h kLocalMac, the virtual device's address when the
   // firmware reports none. PianoWifi publishes the address the device really took as piano-wifi-mac, which wins.
   IOEthernetAddress fAddress = {{0x02, 0x50, 0x49, 0x41, 0x4e, 0x01}};
@@ -70,7 +75,20 @@ class PianoWifiEthernet : public IOEthernetController {
   static void netInput(void *ctx, const uint8_t *frame, uint32_t length);
   static void netLink(void *ctx, int up, const uint8_t *mac);
 
+ protected:
+  bool createWorkLoop() override
+  {
+    fWorkLoop = IOWorkLoop::workLoop();
+    return fWorkLoop != nullptr;
+  }
+  void free() override
+  {
+    OSSafeReleaseNULL(fWorkLoop);
+    IOEthernetController::free();
+  }
+
  public:
+  IOWorkLoop *getWorkLoop() const override { return fWorkLoop; }
   bool start(IOService *provider) override;
   void stop(IOService *provider) override;
   IOReturn getHardwareAddress(IOEthernetAddress *address) override
@@ -182,8 +200,7 @@ void PianoWifiEthernet::netLink(void *ctx, int up, const uint8_t *mac)
 
 UInt32 PianoWifiEthernet::outputPacket(mbuf_t packet, void *)
 {
-  size_t length = 0;
-  for (mbuf_t at = packet; at; at = mbuf_next(at)) length += mbuf_len(at);
+  const size_t length = mbuf_pkthdr_len(packet);
   int rc = EMSGSIZE;
   if (fLinkUp && length >= 14 && length <= sizeof fTxBuffer && mbuf_copydata(packet, 0, length, fTxBuffer) == 0)
     rc = piano_wifi_net_send(fTxBuffer, uint32_t(length));
@@ -248,9 +265,10 @@ bool PianoWifiEthernet::start(IOService *provider)
   client.link = &PianoWifiEthernet::netLink;
   const int rc = piano_wifi_net_attach(&client);
   fAttached = rc == 0;
-  note("en%u published (built in, link down until the station's port is authorized); PianoWifi's data path %s; the scan list "
-       "is the property piano-wifi-scan (tooling/native/piano-wifi prints it)",
-       fInterface->getUnitNumber(), fAttached ? "attached" : rc == ENODEV ? "not there (below level 6)" : "refused the attach");
+  note("en%u published (built in, link down until the station's port is authorized, its own work loop %s); PianoWifi's data "
+       "path %s; the scan list is the property piano-wifi-scan (tooling/native/piano-wifi prints it)",
+       fInterface->getUnitNumber(), fWorkLoop ? "running" : "MISSING",
+       fAttached ? "attached" : rc == ENODEV ? "not there (below level 6)" : "refused the attach");
   return true;
 }
 

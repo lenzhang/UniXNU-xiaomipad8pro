@@ -290,7 +290,26 @@ int main()
     CHECK(dp.st.rel[0].descRead && dp.st.rel[0].groupAddressed && dp.st.rel[0].etherType == 0x0806 &&
           (dp.st.rel[0].info13 & (1u << 28)) && dp.st.rel[0].length == group.size());
     CHECK(!dp.st.rel[1].descRead && dp.st.rel[1].reoPush == 1 && dp.st.rel[1].reoError == 7);
-    CHECK(chip.regs[kDpWbm2Sw0R2 + 3 * 8 + 4] == 2 * 8);
+    // boot 10g: a group frame the reorder unit released for want of a queue (push 0, error 0), decrypted and whole, is
+    // delivered; one with a descriptor error is not
+    got.clear();
+    std::vector<uint8_t> arp = ethFrame(0x0806, 46, 0x33);
+    arp[0] = 0xff;
+    fillRx(rx, 20, arp, 2, kRxDescMcbc);
+    fillRx(rx, 21, arp, 0, kRxDescMcbc | 1u << 29);
+    uint8_t *f = dp.rel3.va + 2 * 32;
+    put32(f, uint32_t(rx.refillBus[20]));
+    put32(f + 4, (uint32_t(rx.refillBus[20] >> 32) & 0xffu) | kDpRbmSw1 << 8 | 20u << 12);
+    put32(f + 8, kDpRelSrcReo);
+    put32(f + 32, uint32_t(rx.refillBus[21]));
+    put32(f + 36, (uint32_t(rx.refillBus[21] >> 32) & 0xffu) | kDpRbmSw1 << 8 | 21u << 12);
+    put32(f + 40, kDpRelSrcReo);
+    *dp.rel3.theirs = 4 * dp.rel3.words;
+    const uint32_t frames = dp.st.rxFrames;
+    CHECK(dpPoll(dp, io, deliver) == 2);
+    CHECK(got.size() == 1 && got[0].kind == kDpRxEthernet && got[0].bytes == arp);
+    CHECK(dp.st.relDelivered == 1 && dp.st.rxFrames == frames + 1 && dp.st.relRecycled == 3);
+    CHECK(chip.regs[kDpWbm2Sw0R2 + 3 * 8 + 4] == 4 * 8);
   }
   // ---- the exception ring: counted, its push reason and error kept, passed over
   {
