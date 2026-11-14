@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- UniXNU-piano: the USB network's debug address kept through configd's own configuration of the interface
+     (docs/drivers/usb-device-debug.md section 14.9). Install as /Library/LaunchDaemons/com.unixnu.piano-usbnet-address.plist
+     (root:wheel 644) with the script at /usr/local/libexec/piano-usbnet-address (root:wheel 755): configs/userland.toml,
+     docs/userland.md. Once per boot; exits at once without piano-usb-net, else after its 600 s guard. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.unixnu.piano-usbnet-address</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>/usr/local/libexec/piano-usbnet-address</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+</dict>
+</plist>

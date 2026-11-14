@@ -650,6 +650,44 @@ desk-dev: iokit busy (configd 260+ s): <name> (<class>) busy 1 (<ms>)       the 
 `named after Ns` with N near 240 means the database did not match: check the MAC in `ifconfig en1`, and
 `/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist` on the tablet. Not yet run on the tablet (2026-11-12 evening).
 
+### 14.9 The address after the login (2026-11-14): `piano-usbnet-address`
+
+What the tablet showed (confirmed in the consoles of ufs4a, ufs4b and the v6 RAM test): desk-dev set `en1 inet 169.254.80.2 (fixed
+link-local)` at T+33-62 s and sshd answered locally, then ssh from the Mac timed out after the desktop login and PianoDwc3's `to the
+Mac` frame counter stopped while `from the Mac` kept growing; on 10p (no login, desk-dev at T+95 s) ssh worked. The reading
+(inferred, H1 of the 2026-11-14 log study): `ipconfig set en1 MANUAL` is IPConfiguration's setting, not a SystemConfiguration
+service; when configd configures en1 itself (the registry's quiet, which on the fast boots comes with the login wave) it applies its
+own service for it, DHCP with a self-assigned link-local address, and 169.254.80.2 is gone. desk-dev's own re-check (`late()`, at
+configd's 260th second) came after the test boots ended.
+
+The fix is a userland unit (`configs/userland.toml`, default on, inert without `piano-usb-net`), so it reaches the test seeds through
+`stage.py` and the owner's installed store through the next live update (`docs/userland.md` §7):
+`/usr/local/libexec/piano-usbnet-address` with `/Library/LaunchDaemons/com.unixnu.piano-usbnet-address.plist` (once per boot):
+
+1. it waits (300 s) for PianoUsbNet's interface (MAC 02:50:49:41:4e:02) and desk-dev's fixed address on it; a DHCP lease (Internet
+   Sharing on the Mac) or no address is left alone;
+2. in the background, the interface's SystemConfiguration service (configd's own for it, else a new "Piano USB" on its hardware
+   port) is set to IPv4 Manual 169.254.80.2/16 with `networksetup`, so configd applies the address itself whenever it configures en1;
+   on the installed store the service persists across boots. `networksetup` waits until configd's interface list is ready; its line
+   says how long;
+3. for 600 s, every 10 s: the address checked; if gone, one line with what is there instead (inet, `scutil --nwi`'s IPv4 part) and
+   the address set again (`ipconfig set en1 MANUAL`). That line is the check of H1 on every boot.
+
+Lines (`grep -a 'piano-usbnet-address:'`):
+
+```
+piano-usbnet-address: en1 has 169.254.80.2 (after N s): its SystemConfiguration service next, the address guarded for 600 s
+piano-usbnet-address: en1: service "NAME" set to IPv4 Manual 169.254.80.2/16 after N s: configd applies it from now on
+piano-usbnet-address: en1 lost 169.254.80.2 (inet now: ...; scutil --nwi: ...): set again (loss N)       H1, seen
+piano-usbnet-address: en1: guard over after 600 s, N losses, 169.254.80.2 present
+```
+
+To confirm H1 by hand on a running boot after the login, in the root shell (`tooling/native/usb-console.py --port 1`):
+`ifconfig en1 | grep -w inet; scutil --nwi; pfctl -s info 2>/dev/null | grep -E '^Status'` (the fixed address gone and a
+self-assigned 169.254.x.y in its place: H1; the address still there and pf enabled: a packet filter instead). Host test:
+`tooling/native/piano-usbnet-address/test_piano_usbnet_address.py` (stub commands: no piano-usb-net, configd's service set Manual,
+a new service when none, a loss logged and repaired, a DHCP lease left alone). Not run on the tablet yet.
+
 ## 15. Power: the USB thread's wait (`piano-usb-idle`, `piano-usb-irq`)
 
 Until 2026-11-11 the USB thread slept 1 ms after every pass without events, forever: about 1000 wake-ups a second even with

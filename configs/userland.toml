@@ -43,6 +43,23 @@ dest = "/Library/LaunchDaemons/com.unixnu.pianousb-shell.plist"
 mode = "0644"
 
 [[unit]]
+name = "piano-usbnet-address"
+about = "the USB network's debug address 169.254.80.2/16 kept through configd's own configuration of the interface (its SystemConfiguration service set Manual, then 600 s of re-checks; docs/drivers/usb-device-debug.md section 14.9); exits at once without piano-usb-net"
+default_on = true
+
+[[unit.file]]
+source = "tooling/native/piano-usbnet-address/piano-usbnet-address.sh"
+build = "copy"
+dest = "/usr/local/libexec/piano-usbnet-address"
+mode = "0755"
+
+[[unit.file]]
+source = "tooling/native/piano-usbnet-address/com.unixnu.piano-usbnet-address.plist"
+build = "copy"
+dest = "/Library/LaunchDaemons/com.unixnu.piano-usbnet-address.plist"
+mode = "0644"
+
+[[unit]]
 name = "piano-policy-agent"
 about = "PianoPolicy's agent (docs/policy.md section 4): Low Power Mode into machdep.piano_policy_lpm, display sleep on a cover closed without sleep; event driven"
 default_on = true
