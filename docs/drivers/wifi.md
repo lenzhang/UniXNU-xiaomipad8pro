@@ -327,13 +327,13 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-sleepoff=M` | 2 at level 8, 1 below | what a system sleep does to the radio. 2 (level 8's default since boot 10k): the ladder's thread stops the join (our deauthentication), powers the radio down (WLAN_EN low, PERST# asserted, the rails given back) and parks; the wake runs the ladder again from level 2 (the restart, below). 1: powered off until the next boot. 0: kept on through the sleep (boot 10k: the firmware died during a 60 s sleep, `cmnos_assert`, SYSERR at the wake) |
 | `piano-wifi-restart=0` | 1 at level 8 | when the firmware dies (SYSERR or its crash dump environment) or a level fails, end the ladder as before. By default the radio is powered down and the ladder runs again from level 2 with every level's state reset (the DMA window's allocations from its start; the window, its translation, the SMMU's stream, the mappings, the join profile, the 802.1X port and en0's attachment kept) after 1, 5, 15, 30, 60, then 120 s; the wake from a system sleep restarts at once |
 | `piano-wifi-restarts=N` | 6 | at most N restarts in a row without the port opening in between; then the radio stays down until the next wake |
-| `piano-wifi-fastrestart=0` | 1 | every restart scans as the boot does (level 6's two passive scans, about 5 s). By default a restart at a wake or after the firmware died skips them and joins the network of the last open port directly (its access point and channel, the join's own copy; its name is never logged); a fast join that does not open the port ends the pass, and the next restart scans |
-| `piano-wifi-haltwatch=0` | 1 | no watch of the shutdown. By default, from this driver's shutdown notice, a helper thread names at +8 s and +20 s the services whose shutdown is not acknowledged (the power manager's `PMShutdown` property) and the power-plane services with a power change in progress (`MachineState` in their power-management record). Reads only |
+| `piano-wifi-fastrestart=0` | 1 | every restart scans as the boot does (level 6's two passive scans, about 5 s). By default a restart at a wake or after the firmware died skips them and joins the network of the last open port directly (its access point and channel, the join's own copy; its name is never logged); a fast join that does not open the port ends the pass, and the next restart scans. 10 s after a fast join's port opens, one passive background scan of every channel runs beside the association and its list is published (`piano-wifi-scan`, the Wi-Fi menu's and every registry reader's source), so a fast pass never leaves the boot's list in place |
+| `piano-wifi-haltwatch=1` | 0 (since 10p; 1 in 10n-10p) | a probe of the shutdown: from this driver's shutdown notice a helper thread names at +8 s and +20 s the services whose shutdown is not acknowledged (the power manager's `PMShutdown` property) and the power-plane services with a power change in progress (`MachineState`). Boot 10o answered it (0 and 0 of 15): it is off by default, so that a default boot does not walk the registry during its halt; a later shutdown notice arms it again once a watch has ended |
 | `piano-wifi-crashtest=S` | 0 | a test: S s after the port first opens on a pass a restart began, the chip is asked once for its crash dump environment (MHI's SoC reset request, as the MHI host forces a dump), so that one unattended boot shows the restart after a crash |
 | `piano-wifi-rejoin=0` | 1 at level 8 | when an association ends (the access point's deauthentication or disassociation, a beacon miss, a kickout, the 802.1X client's `LEAVE`, our own leave) or a join fails, end the level (as before). By default level 7 joins again from the profile after 2, 5, 10, 20, 30, then 60 s (back to 2 s after a port that opened); never after a stop, a dead chip or no profile |
 | `piano-wifi-droptest=S` | 0 | a test: S s after the port first opens the station leaves its association once (our deauthentication), so that an unattended boot shows the rejoin |
 | `piano-wifi-clientwait=MS` | 30000 at level 8, 0 below | a WPA2 profile is handed to the join only once an 802.1X client is connected to the port, waited for up to MS on each join; then the join goes ahead anyway (its handshake is missed and the rejoin tries again). 0: no wait; none either when the port is not registered. The installed v3 boot of 2026-11-14 associated before its supplicant was connected and was dropped after 3.3 s (reason 15) |
-| `piano-wifi-en0=1` | 0 | the Wi-Fi interface takes over the built-in `en0`: PianoWifiEthernet terminates PianoNullEthernet when it starts (after level 6; TimeSync and WindowServer have had their built-in interface since the boot), waits for `en0` to leave the network stack (at most 10 s) and registers built in and primary with PianoNullEthernet's address `02:50:49:41:4e:01`, which level 6 then gives the firmware's virtual device too, so the saved naming (NetworkInterfaces.plist) gives it `en0`. Off: the station has its own address `...:04` and the next free unit (since boot 10i) |
+| `piano-wifi-en0=0` | 1 at level 8 (since 10o-en0), 0 below | keep Wi-Fi a second interface of its own address (`...:04`, the next free unit, en2). By default at level 8 the Wi-Fi interface takes over the built-in `en0`: when PianoWifiEthernet starts (after level 6) it asks PianoNullEthernet to detach its interface (synchronously; the null controller stays without it, and an instance started later does not come up), waits for the stack to have no `en0` (at most 10 s) and registers built in and primary with the null's address `02:50:49:41:4e:01`, which level 6 gives the firmware's virtual device too |
 | `piano-wifi-apple80211=1` | 0 | the Wi-Fi interface as Apple's stack sees a Wi-Fi one (milestone M1 of [wifi-menu.md](wifi-menu.md) §5): `PianoWifi80211` (a subclass of `PianoWifiEthernet`, under a class named `IO80211Controller`) starts instead of `PianoWifiEthernet`; its interface has the Wi-Fi subfamily and `IO80211InterfaceRole = Infrastructure`, answers airportd's apple80211 requests (`SIOCSA80211`/`SIOCGA80211`) from the scan list and its own state (never associated in M1), posts the apple80211 kernel events, and the controller is registered so that launchd's match starts airportd. The data path, the link, the join from the profile and `piano-wifi-en0` are `PianoWifiEthernet`'s, unchanged. Off: `PianoWifiEthernet` as before (the control). With it, `piano-wifi-apple80211-accept=N` (default 1) is how requests without a layout of ours are answered (wifi-menu.md §6.2: 0x1 INFRA_ENUMERATED set, 0x2 other sets, 0x4 other gets zeroed, 0x8 VIRTUAL_IF_ROLE), also at run time through `sysctl machdep.piano_wifi_a80211` |
 | `piano-wifi-l8blocks=N`, `piano-wifi-l8tracems=MS` | 7, 5 (50 before boot 10f) | program the data path's register blocks 0..N only (`WifiDp.h` `DpBlock`: 0 two reads, 1 TCL ring 1, 2 WBM2SW0, 3 REO2SW1, 4 REO2SW0, 5 WBM2SW3, 6 the idle link ring, 7 the reorder unit's set-up; below 7 level 8 does not run), and how long the ladder waits after each block's line (printed at once, not held) before the block's first access |
 | `piano-wifi-l8status=MS` | 5000 | how often level 8 logs its counters while associated (at least 500; `0`: only at the association's end) |
@@ -1225,14 +1225,15 @@ it by its address. After `the port is open`, as root:
 
 **10i ran on 2026-11-14 15:34 and passed every gate (report `private/host-checks/20261114-10i`): Wi-Fi works on the tablet.**
 The interface named en2 and attached, a DHCP address, the gateway 5/5, an Internet address 3/3, DNS, HTTPS 200, 1380
-acknowledged completions; it is the installed default (ESP v3). **10j** (the en0 take-over) failed: `en0: no PianoNullEthernet
+acknowledged completions. The installed ESP is **v5 since 2026-11-14 19:00**, with the 10m kernel; v4 had already made this driver line
+the installed default, while v3 was rolled back twice before v4 (§8.8 below). **10j** (the en0 take-over) failed: `en0: no PianoNullEthernet
 to stand down` — PianoNullEthernet never registers itself, so matching does not find it; ours then met the 10h conflict (two
 `...:01` interfaces), while the desktop and the USB shell stayed up. Fixed (found among IOResources' children by its class).
 
-**For daily use (2026-11-14, after 10i):** the radio stays on through a system sleep (`piano-wifi-sleepoff`), an association
-that ends is joined again with a back-off (`piano-wifi-rejoin`), `piano-wifi-droptest` tests the rejoin, and a stop a suspend
-or a shutdown asked for is the level's normal end (10i's `FAILED at stage 718` was the restart that ended the run; now `stage
-718: level 7: stopped on request (a suspend or a shutdown), its normal end`).
+**For daily use (2026-11-14, after 10m):** a system sleep stops and powers down the radio and the wake restarts the ladder
+(`piano-wifi-sleepoff=2`); a firmware death restarts it too (`piano-wifi-restart`). An association that ends is joined again with
+a back-off (`piano-wifi-rejoin`), and `piano-wifi-droptest` tests the rejoin. A suspend or shutdown requested by the owner is the
+level's normal end; a forced firmware crash ends that pass with `FAILED at stage 718` before its restart (10m).
 
 **Boot 10k: sleep and wake, the rejoin, one unattended boot** (built 2026-11-14 16:10 from branch commit `dd61a83` (main merged), collection `1d311e39...`, the v2 recipe: `out/ram-k273-wifi-10k` sha256 `cc5a8911967dab95e6c48f4d8fbc2194e5fda229be8d1912740434c5c80c8eb6` and `out/ram-k273-wifi-10k-en0` sha256 `9f5c50ae0258cfff2c1790254bf5da3c4ef16acaf64326efc6be48b730441ef6`, each 237281280 bytes, `verify-ram-images.py` PASS). Arguments: 10i's and `piano-wifi-droptest=90
 piano-sleep=1 piano-sleep-test=420 piano-sleep-max=60` (the drop 90 s after the port first opens; the system sleeps 420 s after
@@ -1288,13 +1289,27 @@ after the first port open, after the rejoin, after the wake, after the crash's r
 | the first join, the drop test, the rejoin | as 10k (and 10l's client wait line, if any) | as 10k |
 | boot + 420 s | `PianoWifi: power: a system sleep (1): the radio is stopped and powered down; the wake brings it up again (piano-wifi-sleepoff=2)`, `level 7: a suspend asked the radio to stop during associated`, `stage 718: level 7: stopped on request ...`, `restart: the radio is powered down (WLAN_EN low, PERST# asserted; ...)`, `restart: the radio is parked for system sleep 1 ...`, `PianoWifi: power: the radio is parked for system sleep 1 (N ms after the sleep's stop)` | N under 3500; no `did not park the radio within 3.5 s` |
 | the wake | `piano-sleep: suspend 1: woke after 60.0 s by timer`, `PianoWifi: power: the wake (1): the ladder brings the radio up again (the restart)`, `restart 1 begins (the wake from a system sleep), N ms after pass 1 ended ...`, then levels 2 to 7 again (`level 2: done`, `level 3: done (L0 ...)`, `stage 401`, `stage 504`, `stage 613`), `level 8: the association is live for the data path (generation 3, ...)`, the supplicant's generation-3 handshake | no `crash:` line |
-| Wi-Fi back | `restart 1 (the wake from a system sleep): Wi-Fi is back: the port opened N ms after the restart began (pass 2)`; `ipconfig getifaddr $I`, `ping -c 5 <router>`, an Internet address, `ioreg -l -w0 \| grep piano-wifi-restart` | N about 10 000 to 20 000; an address, 5/5 |
+| Wi-Fi back | `restart 1 (the wake from a system sleep): Wi-Fi is back: the port opened N ms after the restart began (pass 2)`; `ipconfig getifaddr $I`, `ping -c 5 <router>`, an Internet address, `ioreg -l -w0 \| grep piano-wifi-restart` | N a few seconds; an address, 5/5 (10m measured 6939 ms) |
 | port open + 120 s | `level 7: the crash test (piano-wifi-crashtest=120): the chip is asked for its crash dump environment now (MHI's SoC reset request); the restart follows`, then either `level 7: the chip reported a system error or its crash dump environment during associated` and the `crash:` lines (the dump, the firmware's reason), or the link's stop; `restart: pass 2 ended at level 7 (the firmware died): the radio is powered down and the ladder runs again from level 2 in 1000 ms (restart 2, 1 in a row of at most 6)`, `restart 2 begins (the firmware died) ...` | — |
 | after the crash | `restart 2 (the firmware died): Wi-Fi is back: the port opened N ms after the restart began (pass 3)`; DHCP, ping, an Internet address; `ioreg ... piano-wifi-restarts` = `2 restart(s): 1 at a wake, 1 after the firmware died, ...` | an address, 5/5 |
-| the run's end (`reset fastboot`) | `stage 718: level 7: stopped on request (a suspend or a shutdown), its normal end`; no `FAILED at stage 718` after the crash's restart | — |
+| the run's end (an explicit `reset fastboot`) | `stage 718: level 7: stopped on request (a suspend or a shutdown), its normal end`; no `FAILED at stage 718` after the crash's restart | the crash request itself ends pass 2 with `FAILED at stage 718`; if the image's reset backstop ends the run instead, no final stage-718 line is required |
 
 Should the wake's restart fail: the pass's failing level (`FAILED at stage ...`) and `restart 1 (...) did not bring Wi-Fi back:
 pass 2 ended at level L`, then the back-off's next restart; that line names the level to look at.
+
+**10m ran on 2026-11-14 18:00-18:13 and passed the join, rejoin, wake-restart and crash-restart gates**
+(`private/host-checks/20261114-10m`; its report remained partial, so the console capture and `10m-restarts.txt` are the evidence).
+The radio parked 239 ms after the sleep's stop. The wake's restart reopened the port after 6939 ms (generation 3), and the forced
+firmware death's restart after 6945 ms (pass 3). After the first join, the rejoin and both restarts, DHCP, the gateway 5/5, an
+Internet address 3/3, DNS and HTTPS 200 all passed (`10m-network-{1,2,3,4}.txt`). The registry recorded two restarts: one at a
+wake, one after the firmware died. The crash request produced `FAILED at stage 718` before restart 2; the image's reset backstop
+ended the run after 827 s, so there was no later normal-end line.
+
+**Installed ESP v4/v5 (2026-11-14):** v4 (first disk boot about 17:35, the 10l kernel) joined after the profile was placed once
+and joined by itself after a plain reboot, with DHCP, gateway/Internet pings, DNS and HTTPS 200 on en2
+(`private/host-checks/20261114-v4/REPORT.md`). **v5 replaced v4 at 19:00** with the 10m kernel (sleep/crash restart and radio
+parked at sleep); its first boot resumed the owner's store and joined by itself with DHCP, DNS and HTTPS 200
+(`private/host-checks/20261114-v5/v5.log`, `3-network.txt`). V3 had been rolled back twice before v4.
 
 **10k-en0 ran on 2026-11-14 and the take-over failed again:** `en0: PianoNullEthernet is asked to stand down`, `en0: free after
 0 ms`, ours at the link's up `no BSD name yet (not attached)`, and `en0` in ifconfig still the null's (one interface with
@@ -1327,6 +1342,9 @@ named yet —, `the interface is detached (synchronously)`, `free after 0 ms`, o
 the controller's `terminate()` let IOResources' next matching start a second PianoNullEthernet during launchd's boot tasks,
 which took en0 again (`interface name en0 is unavailable` for ours). Now the controller is kept without its interface, and an
 instance started later does not come up (`PianoNullEthernet: not started again: en0 is Wi-Fi's for this boot`).
+The en0 network gate did not pass on that boot either (`10men0-console.out`, `10men0-network.txt`): at link up the station still
+had `no BSD name yet (not attached), interface flags 0`; DHCP gave no IPv4 address and no router, and ping, DNS and HTTPS
+failed. The lock screen and the USB shell stayed up.
 
 **The halt timeout:** `Halt/Restart Timed Out @IOPlatformExpert.cpp:884` ends every reboot of the 27.3 line, also on a run
 of 2026-11-13 without PianoWifi at all: it is not this driver's. It is IOPlatformExpert's panic 30 s after the halt began
@@ -1373,9 +1391,55 @@ supplicant of this commit for the run: sha256 `a20aac1ab2ea354d...` (built as `c
 | the sleep | `PianoWifi: power: the radio is parked for system sleep 1 (N ms after the sleep's stop)` | no `did not park` and no `has woken before the ladder parked` |
 | the run's end | the halt watch's lines (10n); `shutdown: stopping the radio (the ladder's thread is done)` | — |
 
+**10o and 10o-en0 ran on 2026-11-14 20:06-20:28 (`private/host-checks/20261114-10o`, the files tagged 10n):** the F2 check
+(`its root-only file was replaced or touched (before the rejoin), the same profile as before (generation 1 kept)`, the rejoin's
+network check passed), the crash test's fast restart (`restart 2 (the firmware died): Wi-Fi is back: the port opened 2832 ms
+...`), the wake's fast restart (`restart 3 (the wake from a system sleep): Wi-Fi is back: the port opened 2827 ms ... (pass 4)`:
+restart 1 had been taken by the boot), the park (236 ms). Pass 1 lost level 5 once: `no completion for the start of channel 20
+within 2000 ms` (the first time in about 20 boots; every later pass started it in 4-5 ms); the restart came 1 s later and its
+level 7 waited for the profile, placed 103 s after the boot — the "103377 ms" of restart 1 was that wait, not the recovery. The
+halt watch: `0 service(s) with the shutdown not acknowledged`, `0 of 15 power-plane service(s) with a power change in progress`
+at +8 s and +20 s. **10o-en0:** en0 is Wi-Fi's (`...:01`), DHCP, the gateway, the Internet, DNS and HTTPS; one PianoNullEthernet
+start only; the login window up. So en0 is Wi-Fi's by default at level 8 now (`piano-wifi-en0=0` keeps en2).
+
+**Boot 10p** (built 2026-11-14 from branch commit `781d76f` (main merged), collection `14d210db...`, the v5 recipe as 10o, 237281280 bytes,
+`verify-ram-images.py` PASS: `out/ram-k273-wifi-10p` sha256 `dd16ddd9482f445754b04a81279e2d4fd767ab98bb434e538a7070b13d457106`; 10o's arguments, en0 by its new default): a channel start
+without a completion rings the command and event doorbells again at 250 and 1000 ms and leaves the rings' state in the log; a
+restart's line says when the profile came late; the ladder powers the radio down at a shutdown only when `stopRadio` left it to
+it; PianoDwc3's console `reset` says whether `PEHaltRestart` returns. Checklist: 10o's, with the interface `en0` (`...:01`), and:
+
+| When | Line / command | Expected |
+|---|---|---|
+| level 5 (any pass) | normally `both channels run ... N ms after level 5 began`; if not: `no completion yet for the start of channel 20 after 250 ms: N doorbell(s) rung again (MHI state ..., the command ring: the chip read to ..., written to ...)`, then `channel 20 started N ms after its command, K ring(s) of the doorbells later` | no `FAILED at stage 501` |
+| PianoWifiEthernet's start | `en0: free after N ms ...`, the publish line `primary (en0 was freed)` | `ifconfig -a`: en0 ours (`...:01`), en1 |
+| the run's end (`reset fastboot`) | the halt watch's lines; then either `PianoDwc3: reset: PEHaltRestart returned R after N ms: the shutdown notifications are done and the platform did not restart` (the restart itself is not taken: the platform's halt function) or no such line before `Halt/Restart Timed Out` (the halt stays inside PEHaltRestart: the notifications, the power manager's quiesce, or the platform's own restart call) | the line, or its absence |
+
+**Known and accepted after the findings check of 2026-11-14 (`private/host-checks/20261114-flash/findings-status.md`):** R3,
+with `piano-wifi-sleepoff=1` a teardown that does not end within 2.5 s leaves the radio powered through that sleep (the ladder's
+thread powers it down when it runs again; level 8's default, `sleepoff=2`, parks it instead); R5, the rejoin never gives up and
+keeps the radio and the transport up through its 2- and 5-minute waits (a network switched off for the night is joined again
+when it is back; the price is an idle radio); R13, the halt watch arms once per boot (one halt per boot). The halt itself:
+`private/host-checks/20261114-halt/REPORT.md` walks the 30 s timer around all of `PEHaltRestartInternal`; the PianoDwc3 line
+above tells whether the notifications return, and the next step is the kernel's own markers there (not this driver's).
+
+**The review of today's merges (`private/host-checks/20261114-flash/review-merge3.md`), after 10p:** #1, a fast pass's
+background scan publishes a fresh list (above, §6); #3, the park hook never powers the radio down under the ladder's
+register writes: a ladder that has not parked within 3.5 s is left to it (`it is left to it (nothing done from here)`), and
+the radio then stays powered through that sleep if the sleep freezes the ladder first (the same price as F4's, R3's); #4, the
+halt watch is off by default (a probe, `piano-wifi-haltwatch=1`) and arms again after a watch has ended; #5, the file is the
+profile's source (§13.2); #7, the airportd kick ends at once without `piano-wifi-apple80211=1` in the boot arguments; #8, a
+ladder that never leaves its teardown at a shutdown leaves the radio powered into the restart (inferred: the restart's reset of
+the pins takes WLAN_EN low; the next boot's level 2 powers it up from scratch either way) — accepted, as stopRadio must not
+write under the ladder's registers.
+
 **10k-en0** (the same collection, 10i's arguments and `piano-wifi-en0=1`, no tests): `PianoWifiEthernet: en0: PianoNullEthernet
 is asked to stand down (piano-wifi-en0=1)`, `en0: free after N ms`, at the link's up `en0 (attached to the network stack) ...
 (up 1, running 1)`, `ifconfig -a` en0 (`...:01`, ours) and en1 only, DHCP and ping on en0; the desktop and the USB shell stay up.
+
+**10k-en0's clean rerun on 2026-11-14 failed the same attachment and traffic gates** (`private/host-checks/20261114-10k/REPORT.md`):
+the stand-down and release completed, but at link up the station was not attached, DHCP gave no address or router, and no stack
+output was queued. The USB shell and lock screen stayed up. En0 take-over therefore remains open; the default en2 path is the
+working one.
 
 ## 9. Fallback
 
@@ -1941,64 +2005,57 @@ model of the copy engine's registers and a firmware that speaks both protocols):
 (`WMI_SCAN_CHAN_LIST`, §10.17 — **built since P22**, §10.27: level 6 now sends it before its own scan, so level 7 inherits
 both the event's rules and the list); the virtual device started on the owner's channel; a peer created for the access point;
 the four-way handshake, with the keys installed by `WMI_VDEV_INSTALL_KEY`; and the management frames the handshake needs sent
-through `WMI_MGMT_TX`. The wire side of all of that is built and host-tested (`package/PianoWifi/WifiAssoc.h`,
-`tests/assoc_host.cpp`): the regulatory rules and the channel list, `WMI_VDEV_START`/`UP`/`STOP`/`DOWN` with the channel
-structure, `WMI_PEER_CREATE`/`DELETE`/`SET_PARAM`, `WMI_PEER_ASSOC` with the peer's flags and legacy rates,
-`WMI_VDEV_INSTALL_KEY` for a pairwise and a group key, and `WMI_MGMT_TX` with the frame in the 32-bit window. What is not
-built yet is the step machine that drives them (`piano-wifi=7`), the supplicant's four-way handshake and the path the
-passphrase takes — §13.2 is the plan, and none of it may run before level 6 passes on the tablet. **Level 8 (traffic)**: the
+through `WMI_MGMT_TX`. The wire side (`package/PianoWifi/WifiAssoc.h`, `tests/assoc_host.cpp`) covers the regulatory rules and
+channel list, `WMI_VDEV_START`/`UP`/`STOP`/`DOWN` with the channel structure, `WMI_PEER_CREATE`/`DELETE`/`SET_PARAM`,
+`WMI_PEER_ASSOC` with the peer's flags and legacy rates, `WMI_VDEV_INSTALL_KEY` for pairwise and group keys, and `WMI_MGMT_TX`
+with the frame in the 32-bit window. The step machine (§13.3) and the
+user-space supplicant's four-way handshake (§13.7) are built and have run on the tablet: association on 10b, the complete
+handshake on 10f-c, and Internet traffic on 10i (§8.8). **Level 8 (traffic)**: the
 data path's rings (the transmit-command, reorder and buffer-manager units whose head pointers §12's shadow list already names),
 the firmware's data interface (HTT) connected as a second transport service, and the receive and transmit paths wired to the
-Ethernet interface below — which is where `en1` gains its link.
+Ethernet interface below — which is where the station interface (`en2` by default) gains its link.
 
-Expected effort: 4-8 weeks each written fresh, or 1-2 weeks of board glue if the owner decides for Ath12kWifi (section 10.8 —
-the decision is still open, and nothing in levels 1-6 depends on it).
+The original effort estimate for levels 7 and 8 is moot: both landed and ran on 2026-11-13→14. The separate Ath12kWifi decision
+(section 10.8) remains open.
 
-### 13.1 The macOS side: `en1` as built, and the association design
+### 13.1 The macOS side: the station interface as built
 
 The station the levels above build has to appear to macOS as something it can route over, and section 5.2 settles what that is:
-**an Ethernet-like interface**, not a Wi-Fi one. What is built, and what is still design:
+**an Ethernet-like interface**, not a Wi-Fi one. The apple80211 binding is a separate workstream ([wifi-menu.md](wifi-menu.md)).
+The current state:
 
-1. **Built**: `package/PianoWifi/PianoWifiEthernet.cpp`, an `IOEthernetController` publishing `en1` with `IOBuiltin` and without
-   `IOPrimaryInterface` — exactly the shape `PianoNullEthernet` has in the collection, and its vtable check passes the same way.
-   Its link status is **valid but not active** (macOS shows the interface down and routes nothing over it), every frame handed
-   to it is dropped and counted, and it carries level 6's scan list as the property `piano-wifi-scan` (one dictionary per
+1. **Built and tablet-tested**: `package/PianoWifi/PianoWifiEthernet.cpp`, an `IOEthernetController` publishing **en2** with
+   `IOBuiltin` and without `IOPrimaryInterface` in the default mode. Its vtable check passes. Its link goes up when the port is
+   authorized; 10i delivered 3328 frames to it with zero link-down drops and sent DHCP and Internet traffic
+   (`private/host-checks/20261114-10i/REPORT.md`). It carries level 6's scan list as `piano-wifi-scan` (one dictionary per
    network: name, address, channel, frequency, signal strength, beacon and probe counts, and whether the network says its name).
    It owns no hardware: its personality matches the resource `PianoWifiLink`, which PianoWifi publishes only when level 6 came
-   up, so `piano-wifi=0..5` leaves macOS with `en0` alone.
+   up, so `piano-wifi=0..5` leaves macOS without the station interface.
 2. **Built**: `tooling/native/piano-wifi` on the tablet — `piano-wifi` prints the table with every address masked to its first
-   three bytes, `--full` prints them whole, `status` prints what the ladder reached and whether `en1` is there, `--raw` the
+   three bytes, `--full` prints them whole, `status` prints what the ladder reached and whether `en2` is there, `--raw` the
    property as `ioreg` gives it. It reads the registry and nothing else.
-3. The interface's address: this unit's own is in the `persist` partition and is read by the same read-only path levels 4 and 5
-   use for `modem_a` — **still design**. Until then `en1` takes a locally administered address of piano's own (not the unit's),
-   or the one the firmware's ready event reports when that is not all zeros (the property `piano-wifi-mac`). Neither is ever
-   logged whole or committed (section 11).
-4. **Design — the association path.** A kernel control socket (`kern_control`, a name of this driver's) is the control endpoint:
-   a user-space supplicant opens it, reads the scan list, and asks for a join with a profile (the network's name, its address,
-   the security it wants). WPA2-PSK and WPA3-SAE both run their handshakes **in user space** — wpa_supplicant 2.12 is
-   BSD-licensed, and its `driver_*.c` shape is what the control messages mirror — so the key material never enters this
-   repository and never enters a log: the kernel side is given the pairwise and group keys only as opaque bytes to install, and
-   the driver logs that a key of N bytes was installed for a peer, never the bytes. The profile lives under
-   `/private/var/db/piano-wifi/` (mode 600, never in a repository), and the CLI gains `join NAME`, `leave` and `status` over the
-   same socket. **How the passphrase gets there**: it exists on the Mac only, in a mode-600 file outside every repository; the Mac
-   copies it over the USB network (the `desk-ssh` path, standard input, never an argument, never echoed) into
-   `/private/var/db/piano-wifi/` on the tablet, owned by root, the directory mode 700 and the file 600, and the supplicant reads
-   it there at run time. It never goes into a boot argument (the command line is in every console log and in the ADT), an image,
-   the console, a log line, a commit or a document; the network's name is a run-time argument of `join` for the same reason (the
-   home network's names are private: they are not written here). The first association test prefers the 5 GHz network. What the kernel side owes the supplicant: the scan list, the management frames of the handshake in both
-   directions, the association state, and the keys' installation — nothing more.
-5. `en0` stays `PianoNullEthernet` until the clock identity question of section 5.3 is answered: TimeSync derives its identity
-   from a built-in interface's MAC at its start, and this interface appears seconds later (level 6 takes tens of seconds). Once
-   a boot shows the identity stays stable, the Wi-Fi controller can be published early (link down) as `en0` and
-   PianoNullEthernet dropped.
-6. No Wi-Fi menu, no AirDrop, no location by Wi-Fi: section 5.2 is where that trade is written down, and the USB-C network
-   (section 5.2 C) stays the first network while this is built.
+3. The interface's address: reading this unit's own address from `persist` through the same read-only path levels 4 and 5
+   use for `modem_a` is **still design**. The station instead uses its own locally administered address `02:50:49:41:4e:04`
+   since the 10h fix (10i and the installed v4/v5 confirm it); `piano-wifi-en0=1` uses `...:4e:01`. A profile `mac=` or the
+   firmware's ready event can supply the virtual device's address. Neither is ever logged whole or committed (section 11).
+4. **Built and tablet-tested — the association path.** The kext reads the root-only profile itself, chooses the access point and
+   drives the join (§13.3). `piano-wifi-supplicant` reads the same profile and runs the WPA2 four-way handshake in user space;
+   the kext receives only the pairwise and group keys through the 802.1X kernel-control contract (§13.7). This path ran on
+   10e/10f-c and carried Internet traffic on 10i. The profile stays under `/private/var/db/piano-wifi/` (directory mode 700,
+   file 600); its name, passphrase and keys never go into a boot argument, image, console log, commit or document. The first
+   association choice prefers a suitable 5 GHz access point.
+5. `en0` stays `PianoNullEthernet` by default so TimeSync's clock identity is settled at boot. With `piano-wifi-en0=1`, 10k-en0
+   and 10m-en0 confirmed the synchronous stand-down and that the lock screen/USB shell survive, but not station attachment or
+   traffic. The take-over remains open; the installed v4/v5 use the working en2 path.
+6. No working Wi-Fi menu, network list, AirDrop or location by Wi-Fi yet. Wi-Fi has been a working Internet path since 10i and
+   auto-joins in installed v4/v5; the Apple Wi-Fi stack work is tracked separately in [wifi-menu.md](wifi-menu.md).
 
-### 13.2 Level 7 as planned: the step machine, the handshake, and how the passphrase gets in
+### 13.2 Level 7's original plan (superseded by §13.3 and §13.7)
 
-What is **built** (host-tested, inert: no boot argument reaches it yet) is the wire side in `package/PianoWifi/WifiAssoc.h`
-and its facts in `WifiHw.h`. What follows is the plan for the rest, in the order it will be built, and the one question the
-owner has to answer (the last paragraph).
+**Superseded on 2026-11-13→14.** The built step machine is §13.3. The kext reads the root-only profile itself; the user-space
+`piano-wifi-supplicant` reads it too, derives the PMK/PTK and runs the four-way handshake, then hands only the keys to the kext
+(§13.7). Association passed on 10b and the handshake on 10f-c. The numbered proposal below is retained as design history, not as
+the current implementation or a pending checklist.
 
 1. **The step machine (`piano-wifi=7`, steps 701-711).** After level 6's scan: the regulatory event and the channel list are
    already sent (level 6 does it since §10.27); a **targeted scan** of the chosen network's channel refreshes its beacon and
@@ -2061,14 +2118,15 @@ owner has to answer (the last paragraph).
    — and logs `join profile changed: read again from its root-only file (...)` (lengths only) when its content changed, or
    `its root-only file was replaced or touched (...), the same profile as before`; a profile that came from the file is dropped
    when the file is gone. The supplicant reads it at each association as well, so a new passphrase reaches both at the next
-   join.
+   join. **The file is the profile's source whenever it exists** (the sysctl is the way in without one): the supplicant
+   derives the key from the file alone, so a sysctl profile that differs from the file could not finish a WPA2 handshake
+   anyway; a sysctl profile the file replaces is logged (`join profile: the sysctl's profile is replaced by the root-only
+   file's (...)`). To test another network, write it into the file (temp + rename).
 
-   Nothing reads the profile yet: level 7's step machine is the next piece, and it waits for level 6 to deliver beacons
-   (P23).
-4. **What stays out of the first version:** roaming, power save (the radio stays awake: `WMI_STA_POWERSAVE_MODE` off),
-   protected management frames beyond what the access point requires, and the data path. Without level 8 an association
-   gives `en1` a link that carries no traffic yet — which is still the gate this level has to pass: the firmware's
-   `WMI_VDEV_UP` accepted, the keys installed, and the access point's own log showing the tablet joined.
+   At that point nothing read the profile yet. Since 10b the kext reads it directly through `WifiProfileFile.c`; the supplicant
+   also reads it for the user-space handshake (§13.7).
+4. **What the first version left out:** roaming, power save, protected management frames beyond what the access point required,
+   and the data path. Level 8 and rejoin have since landed and run; §13.6 lists the refinements still absent.
 
 ### 13.3 Level 7 as built: the join (2026-11-13)
 
@@ -2123,10 +2181,10 @@ hand-over (the name's length, the security); the peer map's peer identifiers; ea
 name), the AID, each frame's completion status; how the association ended and its reason; the teardown's pieces. **Never** the
 network's name, an access point's address, a passphrase or a key. `piano-wifi-level7` (registry) has the end state.
 
-The address: en1 (`PianoWifiEthernet`) now takes the virtual device's own address (`piano-wifi-mac`, published by level 6
-whatever it came from): before, the device was created with piano's `...:4e:01` and en1 kept `...:4e:03`, so a level 8 frame
-from en1 would have carried a source address the firmware does not know. A profile that gives `mac=` and is already set when
-level 6 creates its device gives the device that address.
+The address: the station interface is **en2** by default and carries its own `02:50:49:41:4e:04` since the 10h fix; 10i
+confirmed that macOS attaches and routes over it. With `piano-wifi-en0=1` it instead takes the virtual device's `...:4e:01`
+address for the attempted en0 take-over. A profile that gives `mac=` and is already set when level 6 creates its device gives
+the device that address.
 
 **What a WPA2 join does without piece 3:** the association succeeds (status 0, an AID), the access point sends the first
 EAPOL-Key frame as data, nothing answers it (no data path yet, no supplicant), and after its handshake timeout (a few seconds)
@@ -2138,25 +2196,26 @@ not programmed yet (level 8): that is the probe's main risk (§8.8 boot 10a, "a 
 802.1X frames to send and keys to install, and authorise the peer once the pairwise and group keys are in (`WMI_VDEV_INSTALL_KEY`,
 then `WMI_PEER_SET_PARAM` 3); that interface lives with the data path (level 8), which is what carries EAPOL in both directions.
 
-### 13.4 Status of levels 7 and 8 (2026-11-13, updated 2026-11-14 after boot 10b)
+### 13.4 Status of levels 7 and 8 (2026-11-14, updated after installed ESP v5)
 
-**2026-11-14, level 8 built (§13.6, §13.7):** the data path's rings, the refill ring kept full, en0's frames, the 802.1X port
-for the four-way handshake in user space; host-tested (`tests/dp_host.cpp`, `tests/net_host.cpp`); probe `ram-k273-wifi-10c`
-(§8.8 boot 10c), whose gate is message 1 of the handshake received and counted. Piece 2's "not started" below is history.
+**Built and confirmed on the tablet.** Level 7's join passed on 10b (2026-11-14 08:45). Level 8's data path and 802.1X boundary
+ran on 10e/10f; the full user-space four-way handshake passed on 10f-c. 10i passed DHCP and Internet traffic on en2. 10k passed
+the generation-2 rejoin but showed that keeping the radio on through sleep kills the firmware. 10m passed the park/restart sleep
+path and the firmware-crash restart. Installed v4 auto-joined after a plain reboot; **v5, installed at 19:00 with the 10m kernel,
+auto-joined on its first boot**. See §8.8 for the gates and evidence.
 
-**2026-11-14, boot 10b: the association works on the tablet** (AID 20 on 5200 MHz; §8.8 after 10b). **2026-11-14:** boot
-10a's two failures are understood and fixed (§8.8 after 10a: the off-channel frequency; the hidden
-name); the candidates, directed probes, frame checks, power limits and the kext's own read of the profile file are in, host
-tested, and probe `ram-k273-wifi-10b` carries them (§8.8 boot 10b). The parts below are the state of 2026-11-13.
+The en0 take-over is not part of that working path: 10k-en0 and 10m-en0 released the old interface but did not attach the new
+one or pass traffic. Reading the unit's persistent address and the level 8 refinements listed in §13.6 remain open.
 
-**Landed (branch commits, host-tested, not yet run on the tablet):**
+**Landed and tablet-tested:**
 - Piece 1, the join (`piano-wifi=7`, §13.3): `WifiSta.h`, `WifiDot11.h`, the level 7 parts of `WifiAssoc.h`, `WifiHtt.h`
   (peer maps), `WifiWmi.h` (the scan entry's raw name, rates, RSN suites, beacon interval, DTIM), `WifiLink.h` (the hand-off
   at step 629, the event hook, `linkSendWmi`, the profile's station address), `PianoWifi.cpp` (level 7, its arguments, its
-  deadline, the fast teardown on a suspend, `piano-wifi-level7`), en1 on the virtual device's address (`PianoWifiEthernet.cpp`).
-- The profile file's parser shared by the helper and the kext (`WifiProfile.h` `piano_wifi_profile_parse`).
-- The kexts build (`tooling/k27/build-native-piano-wifi.sh`, `build-native-piano-wifi-ethernet.sh`: objects and the import
-  check, 344 kernel imports, no new library).
+  deadline, the fast teardown on a suspend, `piano-wifi-level7`), and the station interface.
+- The profile file's parser shared by the helper and the kext (`WifiProfile.h` `piano_wifi_profile_parse`) and the kext's vnode
+  read (`WifiProfileFile.c`). 10b confirmed that the kext reads the root-only file itself; the sysctl helper remains available.
+- Piece 2, the data path (§13.6): the rings, register sequence, HTT selection, receive/transmit turns and buffer refills.
+- Piece 3, the boundary (§13.7): the kernel-control port and `piano-wifi-supplicant`. The four-way handshake runs in user space.
 
 **Host-tested:** `tests/sta_host.cpp` (the frames byte for byte, the answers, the RSN parse, the reorder queue descriptors, the
 peer maps, the choice of network, and the whole join against a firmware and access-point model: WPA2 and open, the command
@@ -2165,69 +2224,22 @@ authentication and the association, a late profile, no profile, a network found 
 kickout, a disconnect, a stop, the dry run, the A/B switches), `tests/wmi_host.cpp` (the hand-off: device kept, hook, a command
 through `linkSendWmi`, the teardown after), `tests/profile_host.cpp` (the parser); every older test unchanged and passing.
 
-**Still open:**
-- **The profile on a RAM probe.** The helper `piano-wifi-join` (configs/userland.toml) was added after the 27.3 store seed was
-  made (helper 2026-11-13 09:52, seed 01:42), so a probe built on that seed most likely has no `/usr/local/libexec/piano-wifi-join`.
-  Two ways: (a) the kext reads the root-only file itself while level 7 waits (the parser is in; the read through the vnode
-  KPI, as PianoPower's `PianoAdspFirmware.c` reads files, is **not written yet**); (b) write the sysctl with a helper copied to
-  the tablet. The sysctl's input is one `struct piano_wifi_profile` of **124 bytes**, little endian: magic `0x314a5750` at 0,
-  version 1 at 4, flags at 8 (bit 0 access point given, bit 1 station address given), security at 12 (0 open, 1 WPA2-PSK),
-  name length at 13, passphrase length at 14, a zero byte at 15, the name at 16 (32 bytes), the access point at 48 (6), the
-  station address at 54 (6), the passphrase at 60 (64); written with `sysctlbyname("machdep.piano_wifi_join", NULL, NULL, &p,
-  124)` as root, read back as a status line of lengths only.
-- **The 27.3 collection with level 7 links** (`tooling/k273/build-k273-image.sh`, the 0066 kernel, 2026-11-13 12:10: 26 native
-  kexts, none from outside this repository; PianoWifiEthernet's vtable check 0 problem slots; `out/k27/kc-k27-native.bin` of
-  this branch's worktree, 114212864 bytes, sha256 `5a8ca2a4...`). That script's own RAM image (the Turnip-staged 27.3 root
-  seed) came out at 251961344 bytes and was refused by the 250 MB rule, as expected for that seed: it is not the probe.
-- **The probe image** (§8.8 boot 10a): not built. The recipe is boot 9a's (`/tmp/a18-build-probe.sh` in the main agent's notes:
-  the installed 27.3 entry's line with `data-persist=0`, `PIANO_EXTRA_ARGS="piano-reset-after=900 piano-reset-to=bootloader"`,
-  the store seed and its trust cache, the 27.3 collection with the 0066 kernel) with `piano-wifi=6` replaced by `piano-wifi=7`
-  in the line's driver arguments (they move into `/chosen/piano-boot-args-ram`).
-- **Piece 2, the data path (level 8):** not started in code. Gathered so far (facts of Ubuntu's ath12k for WCN7860, which
-  takes QCC2072's HAL and registers): the UMAC units (REO `0xa38000`, TCL `0xa44000`, WBM `0xa34000`), QCC2072's R0 offsets
-  (TCL1 ring base `0x918`, REO1 `0x500`, REO2SW0 exception `0x8c0`, WBM idle link `0xd3c`, WBM2SW0 release `0xe08`, WBM2SW1
-  `0xe80`, the TCL bank register `0xa4408c`) and the common R2 offsets (TCL1 HP `0x2000`, REO1 HP `0x3048`, REO2SW0 `0x3088`,
-  idle link `0x30b8`, WBM2SW0 `0x30c8`), the register sequence of a ring (the copy engine's, which level 6 already drives),
-  the ring identifiers (REO2SW1 1, SW2TCL1 24, WBM idle link 120, WBM2SW0 128, WBM2SW3 131 the receive error ring), the
-  transmit-ring map (TCL 0 -> WBM2SW0, RBM SW0) and the receive buffers' manager (software ring 1). Still to read: the TCL
-  data command and bank fields, the WBM release entry, the REO destination entry, the QCC2072 receive descriptor, the REO
-  general/routing registers, the idle link list, the HTT receive-ring selection.
-- **Piece 3's boundary** (EAPOL in and out, keys in, the peer authorised): rides on piece 2; not built.
+**The sysctl profile interface remains:** its input is one `struct piano_wifi_profile` of **124 bytes**, little endian: magic
+`0x314a5750` at 0, version 1 at 4, flags at 8 (bit 0 access point given, bit 1 station address given), security at 12 (0 open,
+1 WPA2-PSK), name length at 13, passphrase length at 14, a zero byte at 15, the name at 16 (32 bytes), the access point at 48
+(6), the station address at 54 (6), the passphrase at 60 (64). It is written with
+`sysctlbyname("machdep.piano_wifi_join", NULL, NULL, &p, 124)` as root and read back as a status line of lengths only.
 
-**What the next 27.3 boot (10a) must answer, with its log lines** (the full table is §8.8 boot 10a):
-1. Level 6 unchanged: `level 6: scan round 2 (with the receive buffers): ... K network(s)` with K >= 1.
-2. The hand-off: `step 629: the scan is done: the virtual device stays for level 7`; no `the teardown:` line of level 6 yet.
-3. en1's address: `PianoWifiEthernet: the interface takes the virtual device's address (its first three bytes 02:50:49)`;
-   on the tablet `ifconfig en1 | grep ether` gives `02:50:49:41:4e:01`.
-4. Level 7 starts: `stage 700: level 7: the join on level 6's virtual device`, `level 7: piano-wifi-l7=0x3f ...`,
-   `step 701: waiting for the join profile`.
-5. The profile: `join profile set (generation 1): a network name of N byte(s), WPA2-PSK with a passphrase ...` then
-   `level 7: the join profile was handed over after N ms: a network name of N byte(s), WPA2-PSK ...`.
-6. The choice: `step 702: the network`, `level 7: the network: entry E of the scan list (C access point(s) carry the profile's
-   name, ...): F MHz, channel X (5 GHz), signal S dBm`, `level 7: its elements: ... RSN (group 4, pairwise 0x10, key management
-   0x4, ...)`.
-7. The set-up: `step 704`, `step 705: the peer`, `step 706: the peer's map` with `level 7: the data interface named the peer:
-   peer P, hardware peer H`, `step 707: the peer's data set-up`.
-8. The start: `step 708: the device started`, `level 7: the device's start response: status 0 (started) after N ms`.
-9. Authentication: `step 709: authentication`, `level 7: authentication: try 1 of 3`, `level 7: frame 1: acknowledged
-   (completion status 0)`, `level 7: the authentication answer: status 0 (success) after N ms`.
-10. **The gate:** `step 710: the association`, `level 7: frame 2: acknowledged ...`, **`level 7: the association answer:
-    status 0 (success), AID A, after N ms`**.
-11. After it: `step 711: the peer's association` with `level 7: the peer's association confirmed after N ms`, `step 712: the
-    station up`, `step 714: associated`; then (WPA2, no keys yet) `level 7: the association ended: a deauthentication (or a
-    disassociation), reason R (...), N ms after the station came up`.
-12. The teardown: `step 715: the teardown`, `level 7: the teardown: the station down`, `... the peer deleted (answered)`,
-    `... the device stopped (answered)`, `step 716: done`, `level 7: done after N ms ...`, `level 6: the teardown: ... the
-    virtual device deleted, the rings disabled`, `stage 718: level 7: the join ran to its end`; no `crash:` line.
-A crash after step 710 is the unprogrammed receive rings meeting the first data frame (level 8 fixes it; `piano-wifi-l7=61`
-is the control without the peer data set-up). Each other failure's meaning is in §8.8 boot 10a's last column.
+The original 10a checklist formerly here ran on 2026-11-13; 10b answered its association gate on 2026-11-14. Its expected
+`en1`/`...:01` name and `piano-wifi-l7=0x3f` default were superseded by **en2/`...:04`** and **`0x73f`**. The full checklist and
+the subsequent tablet results are in §8.8.
 
 ### 13.6 Level 8 as built: the data path (2026-11-14)
 
 `piano-wifi=8` runs everything of level 7 and carries the station's frames. New code: `WifiDp.h` (the rings, the receive and
 transmit turns), `WifiNet.h` and `PianoWifiNet.h` (the boundary, §13.7), the level 8 parts of `WifiHtt.h` (the refill ring
 kept full, the frames' buffers' addresses, the peer map's search entry) and of `PianoWifi.cpp` (the glue), and
-`PianoWifiEthernet.cpp` (en0's frames). Facts: WifiHw.h's level 8 block (the Ubuntu tree of §3 for WCN7860: QCC2072's HAL and
+`PianoWifiEthernet.cpp` (the station interface's frames). Facts: WifiHw.h's level 8 block (the Ubuntu tree of §3 for WCN7860: QCC2072's HAL and
 registers, WCN7850's transmit map), read for register offsets, field places and bit values only.
 
 **The rings** (all programmed by the host itself through the chip window, with the copy engine's register sequence; none of
@@ -2242,13 +2254,15 @@ them is announced to the firmware):
 | WBM2SW3 (ring 131) | WBM -> host | 64 x 8 | WBM + `0xe08` + 3 x 0x78 / `0x30c8` + 3 x 8 | the receive error ring: buffers the hardware released, posted again. WBM2SW1 is left alone (this chip's own host never programs it) |
 | WBM idle link | host -> WBM | 1024 x 2 | WBM + `0xd3c` / `0x30b8` | 1023 link descriptors of 128 bytes (the receive DMA's and the reorder unit's lists); no ring identifier check, no tail address |
 
-At level 7's start (since boot 10c: level 6 runs exactly as on boot 10b; `piano-wifi-l8` bit 5 restores the placement at
-level 6's start that reset the tablet on 10c) the rings are planned out of the DMA window (about 220 KiB) and programmed in
+**Ring placement:** 10c tried level 6's start; 10e then used level 7's start. **Since boot 10f the default `0x20` places them at
+level 6's start** (clearing that bit restores level 7 placement). 10d's mailbox showed that 10c's reset was a kernel stack
+overflow, not the ring registers (§8.8). In either placement the rings are planned out of the DMA window (about 220 KiB) and programmed in
 eight named blocks (each block's line printed at once, with its registers, before its first access), the idle ring filled,
 and the reorder unit set up: aging list and flush on, fragments
 and BARs to REO2SW0, the four aging thresholds (100 ms, VO 40 ms), the 32 hash entries all to REO2SW1. The receive buffers'
-manager becomes software ring 1 (this chip's host's choice; levels 6 and 7 use the firmware's own) so that released buffers
-come back to the host. Before the join, level 8 sends the receive ring selection for both radio buffer rings (HTT `0x0c`):
+manager is software ring 1 at levels 6-8 by default. Confirmed on 10f-a/10f-b: the firmware's own manager asserted after
+association, while software ring 1 scanned and received EAPOL without that crash (§8.8). Released buffers therefore come back
+to the host. Before the join, level 8 sends the receive ring selection for both radio buffer rings (HTT `0x0c`):
 data frames (unicast, multicast, null data) and BARs to the host, the descriptor's TLVs where QCC2072's descriptor has them
 (MSDU end 0, MPDU start 140, the 802.11 header 264), the frame at 392.
 
@@ -2258,7 +2272,7 @@ the cookie's; the descriptor must say "MSDU done", no error bit (FCS, decryption
 A-MSDU), not null data, one buffer (first and last), Ethernet II decapsulation (level 7's `0x01` parameters); then the frame
 is at 392 + the L3 padding, its length from the descriptor. An EAPOL frame (type `0x888e`) is counted, named (which message of
 the four-way or group handshake, from its key information bits) and handed to the 802.1X port; every other frame goes to
-en0 while its link is up. **Every buffer goes back into the refill ring at once**, whatever its frame was (before level 8
+the station interface while its link is up. **Every buffer goes back into the refill ring at once**, whatever its frame was (before level 8
 the 511 buffers were handed out once and never came back), and so do the buffers on the release ring.
 
 **Transmit:** from the station's up (step 712) the TCL bank 0 is set for a station (Ethernet encapsulation, the index lookup,
@@ -2269,18 +2283,19 @@ metadata, length, TID overwrite 0, vdev, search index) and the head moved; its c
 acknowledged). EAPOL frames may go out from the station's up; every other frame only after the authorization.
 
 **State:** the data path is "live" from the association's answer with status 0 (message 1 of the handshake comes right
-after it, before the peer's association and the station's up), its transmit side from the station's up, en0's link from the
-authorization (open networks: level 7's own; WPA2: the port's AUTHORIZE). The association's end (a deauthentication, a
-kickout, a beacon miss, the client's LEAVE, a stop) stops the transmit side, takes en0's link down, clears the queue and
+after it, before the peer's association and the station's up), its transmit side from the station's up, the station interface's
+link from the authorization (open networks: level 7's own; WPA2: the port's AUTHORIZE). The association's end (a deauthentication,
+a kickout, a beacon miss, the client's LEAVE, a stop) stops the transmit side, takes that link down, clears the queue and
 wipes every key copy.
 
-**Switches:** `piano-wifi-l8=N` (default `0x17` = 23): `0x01` buffers to software ring 1, `0x02` the receive ring selection,
-`0x04` the rings at all (off: level 8 is level 7), `0x08` EAPOL frames also to en0, `0x10` the transmit side.
+**Switches:** `piano-wifi-l8=N` (default **`0x37` = 55 since boot 10f**, confirmed by installed v4/v5): `0x01` buffers to
+software ring 1, `0x02` the receive ring selection, `0x04` the rings at all (off: level 8 is level 7), `0x08` EAPOL frames also
+to the station interface, `0x10` the transmit side, `0x20` the rings at level 6's start instead of level 7's.
 `piano-wifi-l8status=MS` (5000) the counters while associated. At level 8 `piano-wifi-l7hold` defaults to 0 (the association
 is kept until a suspend).
 
 **The log** (`level 8:` lines; counts, lengths, states and message numbers only): the rings and their register writes at
-level 6; the options line with cookie conversion's state; the ring selection; `the association is live for the data path
+level 6's start by default (level 7's start with bit `0x20` clear), in eight blocks; the options line with cookie conversion's state; the ring selection; `the association is live for the data path
 (generation G, AID A)`; `the first frame of the data path`; each EAPOL frame (the first 24): `EAPOL frame N from the access
 point: L bytes (PDU P), message 1 of the four-way handshake (descriptor 2, key information 0x8a, key data D bytes), T ms after
 the association; ...`; `the station is up ...: the transmit side ready (bank 0x4a04, search index ...)`; two status lines every
@@ -2293,21 +2308,23 @@ word by word, received frames delivered and their buffers posted again (an EAPOL
 frames that must not be delivered, a full refill ring, the release and exception rings, the peer map's search entry of each
 form, a frame sent field by field and its completion, the limits), `tests/net_host.cpp` (§13.7's messages and rules).
 
-**Not in this version** (each a later refinement once the tablet says the base works): A-MSDUs and frames over one buffer
-(counted as `more than one buffer`), the exception ring's frames (fragments, BARs: counted), the reorder unit's command and
-status rings (queue flushes), checksum offload, more than one transmit ring, reconnecting after a disconnect (the level ends).
+**Not in this version:** A-MSDUs and frames over one buffer (counted as `more than one buffer`), the exception ring's frames
+(fragments, BARs: counted), the reorder unit's command and status rings (queue flushes), checksum offload and more than one
+transmit ring. Rejoin after a disconnect is in (`piano-wifi-rejoin`) and passed on 10k; sleep/crash restart passed on 10m.
 
-### 13.7 The network boundary: en0 and the 802.1X port (for the user-space side, piece 3)
+### 13.7 The network boundary: the station interface and the 802.1X port (piece 3)
 
 `package/PianoWifi/PianoWifiNet.h` is the whole contract; it is C with only `<stdint.h>`, so the user-space supplicant
 includes the same file. Two interfaces cross it:
 
-**1. en0 (in the kernel).** PianoWifiEthernet attaches with `piano_wifi_net_attach` (a version, a context, an input callback
-and a link callback), sends with `piano_wifi_net_send` (a copy into PianoWifi's queue; `ENETDOWN` before the authorization,
-`ENOBUFS` when the 31-frame queue is full) and detaches with `piano_wifi_net_detach` (returns when no callback runs). Frames
-are Ethernet II without FCS, 14 to 1600 bytes. PianoWifi's thread calls `input` for every received frame that is not EAPOL,
-and `link(up, mac)` when the port is authorized and when the association ends. en0's address is the virtual device's
-(`piano-wifi-mac`); en0 never sees EAPOL frames (switch `0x08` adds them, for a BPF-based supplicant).
+**1. The station interface (in the kernel; en2 by default, en0 with `piano-wifi-en0=1`).** PianoWifiEthernet attaches with
+`piano_wifi_net_attach` (a version, a context, an input callback and a link callback), sends with `piano_wifi_net_send` (a copy
+into PianoWifi's queue; `ENETDOWN` before the authorization, `ENOBUFS` when the 31-frame queue is full) and detaches with
+`piano_wifi_net_detach` (returns when no callback runs). Frames are Ethernet II without FCS, 14 to 1600 bytes. PianoWifi's thread
+calls `input` for every received frame that is not EAPOL, and `link(up, mac)` when the port is authorized and when the association
+ends. The default station's address is its own `02:50:49:41:4e:04`; the en0 take-over uses `...:01`. The station never sees
+EAPOL frames by default (switch `0x08` adds them, for a BPF-based supplicant). Some driver counters still call this interface
+"en0" as a historical name, whatever its BSD name is.
 
 **2. The 802.1X port (kernel <-> user space).** A kernel control socket named `com.unixnu.driver.PianoWifi.8021x`
 (`PF_SYSTEM`, `SOCK_DGRAM`, `SYSPROTO_CONTROL`; `CTLIOCGINFO` for its id, `connect` with `sc_unit` 0). Root only; one client at
@@ -2341,7 +2358,8 @@ carries none of the addresses, frames or keys either.
 **A listener for the tablet:** `tooling/native/piano-wifi-port.c` (built on the Mac: `clang -O2 -Wall -Wextra -I
 package/PianoWifi tooling/native/piano-wifi-port.c -o out/piano-wifi-port`) connects to the port as root, asks for the LINK
 message and prints every message by type, state, generation, length and handshake message number (nothing private), for
-`SECONDS` (default 300). It answers nothing; it is the boundary's first check and a skeleton for the client.
+`SECONDS` (default 300). It answers nothing; it was the boundary's first check on 10c and a skeleton for the real client,
+`piano-wifi-supplicant`, which has superseded it for the four-way handshake since 10e/10f.
 
 ## 14. Level 6's message table
 

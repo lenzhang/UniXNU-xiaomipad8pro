@@ -1,11 +1,13 @@
-# The macOS Wi-Fi menu: PianoWifi under Apple's Wi-Fi stack (design, 2026-11-14)
+# The macOS Wi-Fi menu: PianoWifi under Apple's Wi-Fi stack (design and first probes, 2026-11-14)
 
-Status: **M1 ran on the tablet (wm1, 2026-11-14 19:01, §6.1)**: the interface is "Wi-Fi" for SystemConfiguration and `ifconfig`,
-airportd starts by itself, binds and scans it (17 networks served, the list's end answered), but WiFiManager/corewifi does not
-adopt it (`wdutil`: Interface Name (null)), so CoreWLAN and the menu see no interface. M1b (accept modes, §6.2) built: probe
-`ram-k273-wm2` (§6.3). The link itself works since boot 10i (2026-11-14: WPA2, DHCP, the internet over
-`PianoWifiEthernet`, an Ethernet-like interface, with our own supplicant; [wifi.md](wifi.md) §8.8, §13). The owner's next step:
-the Wi-Fi menu, Settings › Wi-Fi and CoreWLAN, through airportd and IO80211Family, as on a Mac.
+Status: the narrow apple80211 binding is built; M1 is partial. The Ethernet link works since boot 10i (WPA2, DHCP and Internet
+over `PianoWifiEthernet` with our own supplicant). 10m added park/restart at sleep and restart after a firmware crash. Installed
+ESP v4 auto-joined after a plain reboot; **v5, installed 2026-11-14 19:00 with the 10m kernel, auto-joined on its first boot**
+([wifi.md](wifi.md) §8.8, §13). On the Apple path, wm1 made en2 a Wi-Fi hardware port and served scans to airportd (17 networks,
+the list's end answered), but airportd's corewifi side did not adopt it (`wdutil`: Interface Name (null)); wm1b then made
+CoreWLAN enumerate it (§6.1b). M1b's accept modes are a run-time switch (§6.2) and probe `ram-k273-wm2` (§6.3, §6.4) is built for
+them. There is no menu network list or menu-driven join yet. The owner's next step remains the Wi-Fi menu, Settings › Wi-Fi and
+CoreWLAN, through airportd and IO80211Family, as on a Mac.
 
 ## 1. What has to change
 
@@ -29,7 +31,7 @@ it (airportd instead of our profile file) and through which interface (apple8021
 | W1 | A minimal IO80211 controller + interface beside `PianoWifiEthernet` (a switch, default off): registers, answers the card capabilities, power, MAC, driver/hardware versions | `ifconfig` shows the Wi-Fi interface, `networksetup -listallhardwareports` lists "Wi-Fi", the menu extra shows Wi-Fi: On |
 | W2 | Scan through apple80211 (our level 6/7 scan list as the result) | the Wi-Fi menu lists the networks; `wdutil`/CoreWLAN scan returns them |
 | W3 | Join through apple80211 (associate with the SSID/BSSID/RSN element airportd gives), EAPOL to eapolclient, keys from it (CIPHER_KEY) into our key installation, the port authorized | choosing the network in the menu with its password joins; DHCP; the menu shows the bars |
-| W4 | Known networks and auto-join at boot (airportd's), roaming between the same SSID's access points (our rejoin), sleep/wake (10k) | after a reboot the menu joins by itself; Settings › Wi-Fi works |
+| W4 | Known networks and auto-join at boot (airportd's), roaming between the same SSID's access points (our rejoin), sleep/wake (10m's park-and-restart) | after a reboot the menu joins by itself; Settings › Wi-Fi works |
 
 The Ethernet path (`PianoWifiEthernet`, the supplicant, the profile file) stays the default until W3 passes and remains a fallback
 switch afterwards.
@@ -46,7 +48,7 @@ switch afterwards.
 ## 4. W0's answers and the decision (2026-11-14 17:40)
 
 From the host research (`private/host-checks/20261114-io80211/REPORT.md`, static analysis of the 27.3 KC, airportd, IO80211.framework
-and eapolclient; not yet tablet-confirmed):
+and eapolclient); the first tablet checks are in §5:
 
 - airportd's control plane is **BSD ioctls on enX**: `SIOCSA80211` `0x802869c8` / `SIOCGA80211` `0xc02869c9` with the 40-byte
   `apple80211req` (name, type, value, length, pointer). The user-space IO80211 library prefers an IOUserClient but falls back to
@@ -66,8 +68,9 @@ and eapolclient; not yet tablet-confirmed):
 `performCommand`, reports the Wi-Fi subfamily and the Infrastructure role, posts the apple80211 kernel events (power, scan done,
 link, association done) with `kev_post_msg`, and passes EAPOL frames up the interface to eapolclient. This is the model of our own
 earlier UniXNU-sheng `WifiNet.cpp` (BSD-2-Clause-Patent; its 656-byte association and inline-element scan layouts match what 27.3
-builds). No Apple class is subclassed, nothing is added to the collection. airportd's launch on the controller match is the open
-point: if it does not start by itself, a LaunchDaemon of ours starts it (`launchctl kickstart`), to be measured on M1.
+builds). No Apple class is subclassed, nothing is added to the collection. **airportd did start by itself on wm1**; a helper
+LaunchDaemon is not needed for the launch. airportd's CoreWLAN cache and a complete CoreWLAN scan result remain the open M1
+points (§5).
 
 M1 (one boot, the Ethernet path as control behind `piano-wifi-apple80211=1`): Wi-Fi: On in the menu, the scan list shown, power
 off/on answered. M2: ASSOCIATE from the menu with the password, EAPOL to eapolclient, CIPHER_KEY into our key installation, the
@@ -270,6 +273,13 @@ CoreWLAN's `scanForNetworks` did not return within minutes (it held the session'
 The requests airportd asked that we refused (`-> 102`), by kind: get 207 CHANNELS_INFO (10016 bytes), get 96 VIRTUAL_IF_ROLE,
 set 512 INFRA_ENUMERATED (1 byte), set 85 (2068), set 490 (300), set 469 (8), set 575 (4), get 108 (88), get 115 (2600), get 97
 (16), get 87 (8), get 174 (24), get 175 (16), get 194 (8), get 353 / 393 / 55 / 57 (no buffer).
+
+### 6.1b wm1b (2026-11-14 19:46-19:57; private/host-checks/20261114-wm1)
+
+**wm1b, 19:46-19:57** (`wm1b-remote.txt`, `wm1b-console.out`): the CoreWLAN helper enumerated en2 with power on, mode 1, an
+active service and 22 channels; power off/on worked, and System Profiler listed a third-party wireless card. CoreWLAN's scan
+returned zero networks in 15 ms (wm1's scan never returned; the accept modes of §6.2 were in between). No menu network list or
+join has passed yet.
 
 ### 6.2 M1b: what the next boot varies
 
