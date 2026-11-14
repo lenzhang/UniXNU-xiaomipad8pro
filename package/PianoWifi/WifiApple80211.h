@@ -445,6 +445,7 @@ inline int zeros(Req &rq, const UserIo &io, uint8_t *scratch, uint32_t scratchBy
     at += n;
   }
   a.wrote = total;
+  rq.length = total;   // what was written, as bytes() does (review F8: a request over 64 KiB is clipped)
   return 0;
 }
 inline int copyIn(const Req &rq, const UserIo &io, void *dst, uint32_t size)
@@ -634,9 +635,11 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
       return a;
     }
     ScanResult *r = reinterpret_cast<ScanResult *>(scratch);
-    fillScanResult(*r, s.scan.bss[s.cursor++]);
-    ++s.resultsServed;
+    fillScanResult(*r, s.scan.bss[s.cursor]);
     a.error = copyOut(rq, io, r, resultBytes(*r), a);
+    if (a.error) return a;   // the cursor stays where it is: a faulted record is asked for again (review 2026-11-14 F9)
+    ++s.cursor;
+    ++s.resultsServed;
     return a;
   }
   default:
@@ -675,7 +678,9 @@ struct Seen {
   // true the first time a kind is seen (and remembered); false after (and when the table is full: counted in overflow)
   bool first(int32_t type, bool set, uint32_t length, int error)
   {
-    const uint64_t key = uint64_t(uint32_t(type)) << 32 | uint64_t(set ? 1u : 0u) << 31 | uint64_t(length & 0xffffu) << 8 |
+    // The length is folded, not cut (review F10: two requests of the same kind whose lengths differ above 16 bits were one).
+    const uint32_t folded = (length ^ (length >> 16)) & 0xffffu;
+    const uint64_t key = uint64_t(uint32_t(type)) << 32 | uint64_t(set ? 1u : 0u) << 31 | uint64_t(folded) << 8 |
                          uint64_t(uint32_t(error) & 0xffu);
     for (uint32_t i = 0; i < count; ++i)
       if (keys[i] == key) return false;

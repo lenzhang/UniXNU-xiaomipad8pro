@@ -80,6 +80,7 @@ class PianoWifi80211 : public IO80211Controller {
   uint64_t fRequests = 0, fUnknown = 0, fEvents = 0, fEventErrors = 0, fListRefreshes = 0, fOtherIoctls = 0;
   uint64_t fReported = ~0ull;
   uint32_t fEventCodesLogged = 0;
+  volatile uint32_t fCallsArmed = 0, fCallsInside = 0;   // thread calls armed / inside their callback (review F4)
   uint32_t fScanLines = 0;   // the scans logged one by one (with the asking process), at most kScanLinesMax
   unsigned long fOtherSeen[16] = {};
   unsigned fOtherCount = 0;
@@ -100,12 +101,27 @@ class PianoWifi80211 : public IO80211Controller {
   void noteOtherIoctl(unsigned long cmd);
   void report(const char *why);
 
+  // Armed only while the driver runs, and counted: stop() waits for every call to be out of its callback (review F4).
   void arm(thread_call_t call, unsigned ms)
   {
+    if (fStopping) return;
     uint64_t deadline = 0;
     clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+    __atomic_fetch_add(&fCallsArmed, 1u, __ATOMIC_ACQ_REL);
     thread_call_enter_delayed(call, deadline);
   }
+  // A callback's own frame: it holds the count while it runs, so stop() cannot free under it.
+  struct Tick {
+    PianoWifi80211 *self;
+    bool run;
+    explicit Tick(PianoWifi80211 *s) : self(s), run(!s->fStopping)
+    {
+      __atomic_fetch_add(&self->fCallsInside, 1u, __ATOMIC_ACQ_REL);
+      __atomic_fetch_sub(&self->fCallsArmed, 1u, __ATOMIC_ACQ_REL);
+    }
+    ~Tick() { __atomic_fetch_sub(&self->fCallsInside, 1u, __ATOMIC_ACQ_REL); }
+  };
+  void quiesceCalls();
 
  protected:
   bool configureInterface(IONetworkInterface *netif) override;
@@ -137,15 +153,43 @@ void note80211(const char *fmt, ...)
 }
 // machdep.piano_wifi_a80211 (root to write): the accept mode, read and set at run time. Filled in at run time rather than by
 // SYSCTL_OID's static initializer: its parent and handler are signed pointers on arm64e (PianoWifi.cpp's pattern).
-PianoWifi80211 *volatile gA80211;
+// The object behind it is held by a retain of its own and by a gate (review 2026-11-14 F1): the handler takes the gate, which
+// the unregister closes and then waits to be empty, so a handler in flight can never meet a freed driver.
+IOSimpleLock *gA80211Gate;             // guards the two words below
+PianoWifi80211 *gA80211;               // retained while set
+unsigned gA80211Busy;                  // handlers inside the gate
 struct sysctl_oid gA80211Oid;
+
+// The driver for a sysctl handler, retained for the call (nullptr once the unregister has closed the gate).
+PianoWifi80211 *a80211Enter()
+{
+  if (!gA80211Gate) return nullptr;
+  const IOInterruptState state = IOSimpleLockLockDisableInterrupt(gA80211Gate);
+  PianoWifi80211 *self = gA80211;
+  if (self) ++gA80211Busy;
+  IOSimpleLockUnlockEnableInterrupt(gA80211Gate, state);
+  return self;
+}
+void a80211Leave()
+{
+  const IOInterruptState state = IOSimpleLockLockDisableInterrupt(gA80211Gate);
+  if (gA80211Busy) --gA80211Busy;
+  IOSimpleLockUnlockEnableInterrupt(gA80211Gate, state);
+}
 }  // namespace
 
 SYSCTL_DECL(_machdep);
 
 int PianoWifi80211::sysctlAccept(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 {
-  PianoWifi80211 *self = gA80211;
+  PianoWifi80211 *self = a80211Enter();
+  struct Leave {
+    PianoWifi80211 *held;
+    ~Leave()
+    {
+      if (held) a80211Leave();
+    }
+  } leave{self};
   int value = self ? int(self->acceptMode()) : -1;
   int err = SYSCTL_OUT(req, &value, sizeof value);
   if (err || !req->newptr) return err;
@@ -158,9 +202,13 @@ int PianoWifi80211::sysctlAccept(struct sysctl_oid *, void *, int, struct sysctl
 }
 
 namespace {
-void registerAcceptSysctl(PianoWifi80211 *self)
+bool registerAcceptSysctl(PianoWifi80211 *self)
 {
+  gA80211Gate = IOSimpleLockAlloc();
+  if (!gA80211Gate) return false;
+  self->retain();   // given back by unregisterAcceptSysctl
   gA80211 = self;
+  gA80211Busy = 0;
   bzero(&gA80211Oid, sizeof gA80211Oid);
   gA80211Oid.oid_parent = &sysctl__machdep_children;
   gA80211Oid.oid_number = OID_AUTO;
@@ -171,11 +219,27 @@ void registerAcceptSysctl(PianoWifi80211 *self)
   gA80211Oid.oid_descr = "PianoWifi80211's accept mode for apple80211 requests without a layout (docs/drivers/wifi-menu.md 6)";
   gA80211Oid.oid_version = SYSCTL_OID_VERSION;
   sysctl_register_oid(&gA80211Oid);
+  return true;
 }
+// The gate closed, every handler inside it waited for, then the retain given back: after this the driver may be freed.
 void unregisterAcceptSysctl()
 {
   sysctl_unregister_oid(&gA80211Oid);
+  if (!gA80211Gate) return;
+  const IOInterruptState state = IOSimpleLockLockDisableInterrupt(gA80211Gate);
+  PianoWifi80211 *self = gA80211;
   gA80211 = nullptr;
+  IOSimpleLockUnlockEnableInterrupt(gA80211Gate, state);
+  for (unsigned waited = 0; waited < 500; ++waited) {
+    const IOInterruptState inner = IOSimpleLockLockDisableInterrupt(gA80211Gate);
+    const unsigned busy = gA80211Busy;
+    IOSimpleLockUnlockEnableInterrupt(gA80211Gate, inner);
+    if (!busy) break;
+    IOSleep(10);
+  }
+  IOSimpleLockFree(gA80211Gate);
+  gA80211Gate = nullptr;
+  if (self) self->release();
 }
 }  // namespace
 
@@ -232,8 +296,7 @@ bool PianoWifi80211::start(IOService *provider)
   setProperty("piano-wifi-apple80211", true);
   note80211("started (piano-wifi-apple80211=1): %u network(s) in PianoWifi's scan list%s; waiting for the BSD interface",
             unsigned(networks), fWifi ? "" : " (PianoWifi not found: no scan list)");
-  registerAcceptSysctl(this);
-  fSysctl = true;
+  fSysctl = registerAcceptSysctl(this);
   note80211("accept mode %#x (machdep.piano_wifi_a80211 changes it at run time: 0x1 INFRA_ENUMERATED set, 0x2 any other set, "
             "0x4 any other get zeroed, 0x8 VIRTUAL_IF_ROLE answered)", unsigned(fState->accept));
   arm(fAttachCall, kAttachTickMs);
@@ -254,7 +317,9 @@ void PianoWifi80211::attachStep()
   snprintf(fIfName, sizeof fIfName, "%s%u", ifnet_name(ifp), unsigned(ifnet_unit(ifp)));
   // IO80211.framework finds the interface's service by the property IOInterfaceName (any class) and reads the role there; the
   // family sets it with the name, this only makes sure of it.
-  const bool named = fNetif->getProperty("IOInterfaceName") != nullptr;
+  OSObject *existingName = fNetif->copyProperty("IOInterfaceName");
+  const bool named = existingName != nullptr;
+  OSSafeReleaseNULL(existingName);
   if (!named) fNetif->setProperty("IOInterfaceName", fIfName);
   iff_filter filter = {};
   filter.iff_cookie = this;
@@ -285,9 +350,11 @@ void PianoWifi80211::attachStep()
   arm(fReportCall, 5000);   // the first summary soon (who matched the controller), then every minute
 }
 
-void PianoWifi80211::attachTick(thread_call_param_t self, thread_call_param_t)
+void PianoWifi80211::attachTick(thread_call_param_t p, thread_call_param_t)
 {
-  static_cast<PianoWifi80211 *>(self)->attachStep();
+  auto *self = static_cast<PianoWifi80211 *>(p);
+  Tick tick(self);
+  if (tick.run) self->attachStep();
 }
 
 errno_t PianoWifi80211::filterIoctl(void *cookie, ifnet_t, protocol_family_t, unsigned long cmd, void *arg)
@@ -300,20 +367,35 @@ errno_t PianoWifi80211::filterIoctl(void *cookie, ifnet_t, protocol_family_t, un
   return EOPNOTSUPP;   // not ours: the protocol and the interface handle it as before
 }
 
+// The stack has freed the filter (our detach, or the interface's own teardown): nothing may be detached after this.
 void PianoWifi80211::filterDetached(void *cookie, ifnet_t)
 {
   auto *self = static_cast<PianoWifi80211 *>(cookie);
+  self->fFilter = nullptr;
   self->fFilterGone = true;
   self->release();
 }
 
 // One request, in the requesting thread (airportd's ioctl): the answer under the lock, its log line and its effects after.
+// F3 (review 2026-11-14, accepted): the user copies happen under fLock, because the state and the one scratch buffer are shared.
+// A paged-out user buffer therefore stalls other apple80211 requests, the summary line and the accept sysctl — never the data
+// path, the link or PianoWifi's ladder, which share no lock with this. The buffers are airportd's own, small and touched again
+// and again; a separate per-request buffer would be the fix if that ever shows up on the tablet.
 errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq)
 {
   using namespace pianowifi::a80211;
   const int32_t type = rq.type, value = rq.value;
   const uint32_t length = rq.length;
   const UserIo io = {nullptr, &PianoWifi80211::userIn, &PianoWifi80211::userOut};
+  // F6 (review 2026-11-14): the request carries the interface's name; one naming another interface is refused, even though the
+  // BSD layer routed it to this ifnet (the filter sees whatever the caller sent).
+  if (rq.name[0] && strncmp(rq.name, fIfName, sizeof rq.name) != 0) {
+    char named[17] = {};
+    memcpy(named, rq.name, sizeof rq.name);
+    static unsigned said;
+    if (said++ < 8) note80211("%s: a request of type %d names %.16s, not this interface: ENXIO", fIfName, int(type), named);
+    return ENXIO;
+  }
   const bool scanSet = set && (type == kScanReq || type == kScanReqMultiple);
   uint32_t directed = 0;
   IOLockLock(fLock);
@@ -432,15 +514,18 @@ void PianoWifi80211::postEvent(uint32_t code, const void *payload, uint32_t leng
 // that had not started; one that runs posts its own), this one's after kScanDoneMs.
 void PianoWifi80211::scanStarted()
 {
-  if (thread_call_cancel(fScanDoneCall)) postEvent(pianowifi::a80211::kEvScanDone);
+  if (thread_call_cancel(fScanDoneCall)) {   // it had not started: this one's completion stands for both
+    __atomic_fetch_sub(&fCallsArmed, 1u, __ATOMIC_ACQ_REL);
+    postEvent(pianowifi::a80211::kEvScanDone);
+  }
   arm(fScanDoneCall, kScanDoneMs);
 }
 
 void PianoWifi80211::scanDoneTick(thread_call_param_t p, thread_call_param_t)
 {
   auto *self = static_cast<PianoWifi80211 *>(p);
-  if (self->fStopping) return;
-  self->postEvent(pianowifi::a80211::kEvScanDone);
+  Tick tick(self);
+  if (tick.run) self->postEvent(pianowifi::a80211::kEvScanDone);
 }
 
 void PianoWifi80211::noteOtherIoctl(unsigned long cmd)
@@ -511,9 +596,26 @@ void PianoWifi80211::report(const char *why)
 void PianoWifi80211::reportTick(thread_call_param_t p, thread_call_param_t)
 {
   auto *self = static_cast<PianoWifi80211 *>(p);
-  if (self->fStopping) return;
+  Tick tick(self);
+  if (!tick.run) return;
   self->report("summary");
   self->arm(self->fReportCall, kReportMs);
+}
+
+// Every thread call out of its callback and none armed: fStopping is already set, so no callback arms another (review F4).
+void PianoWifi80211::quiesceCalls()
+{
+  if (fAttachCall) thread_call_cancel_wait(fAttachCall);
+  if (fScanDoneCall) thread_call_cancel_wait(fScanDoneCall);
+  if (fReportCall) thread_call_cancel_wait(fReportCall);
+  for (unsigned waited = 0; waited < 500; ++waited) {
+    if (!__atomic_load_n(&fCallsArmed, __ATOMIC_ACQUIRE) && !__atomic_load_n(&fCallsInside, __ATOMIC_ACQUIRE)) return;
+    if (fAttachCall) thread_call_cancel_wait(fAttachCall);
+    if (fScanDoneCall) thread_call_cancel_wait(fScanDoneCall);
+    if (fReportCall) thread_call_cancel_wait(fReportCall);
+    IOSleep(10);
+  }
+  note80211("a thread call was still armed or running after 5 s at the stop");
 }
 
 void PianoWifi80211::stop(IOService *provider)
@@ -521,13 +623,15 @@ void PianoWifi80211::stop(IOService *provider)
   fStopping = true;
   if (fSysctl) unregisterAcceptSysctl();
   fSysctl = false;
-  if (fAttachCall) thread_call_cancel_wait(fAttachCall);
-  if (fScanDoneCall) thread_call_cancel_wait(fScanDoneCall);
-  if (fReportCall) thread_call_cancel_wait(fReportCall);
-  if (fFilter) {
-    iflt_detach(fFilter);   // the detached callback gives the filter's reference back
-    for (unsigned i = 0; i < 200 && !fFilterGone; ++i) IOSleep(10);
+  quiesceCalls();
+  // Only a filter the stack has not freed itself may be detached (review F2): fFilterGone / fFilter are set by the detached
+  // callback, which the stack calls for its own teardown too.
+  interface_filter_t filter = fFilter;
+  if (filter && !fFilterGone) {
     fFilter = nullptr;
+    iflt_detach(filter);   // the detached callback gives the filter's reference back
+    for (unsigned i = 0; i < 200 && !fFilterGone; ++i) IOSleep(10);
+    if (!fFilterGone) note80211("the interface filter did not report its detach within 2 s");
   }
   if (fRegistered) report("at the stop");
   OSSafeReleaseNULL(fWifi);
