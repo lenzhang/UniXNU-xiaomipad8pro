@@ -4103,7 +4103,9 @@ __attribute__((noinline)) void staRunOnce(uint64_t now) { staRun(gSta, now); }
 // the join's own (0 until a wait begins). Not inlined into level7 (the ladder's 16 KiB stack).
 __attribute__((noinline)) bool clientWaitHold(uint64_t now, uint64_t &waitFrom, uint32_t generationSeen)
 {
-  if (gArgs.level < 8 || !gArgs.clientWaitMs || gSta.profileSet || gSta.step != kStaProfileWait || !gProfileLock || !gPortLock)
+  // no port (ctl_register refused it): no client can come, so nothing is waited for
+  if (gArgs.level < 8 || !gArgs.clientWaitMs || gSta.profileSet || gSta.step != kStaProfileWait || !gProfileLock || !gPortLock ||
+      !gCtlRegistered)
     return false;
   IOLockLock(gProfileLock);
   const bool wpa2 = gProfileSet && gProfileGeneration != generationSeen && gProfile.security == PianoWifiSecWpa2Psk;
