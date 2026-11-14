@@ -174,8 +174,10 @@ static IOReturn hostIssue (const UfsSlot &slot, uint32_t direction, uint32_t dat
   return kIOReturnSuccess;
 }
 
+// *live (when given): set when this command was rung and did not complete (a timeout or a transfer error): the controller may still
+// own its data pages. The only such case; a refusal before the doorbell or a completed command with a bad response leaves it false.
 static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t deadline, uint32_t *ocs, const void *buffer = nullptr,
-                           bool dataSynced = false)
+                           bool dataSynced = false, bool *live = nullptr)
 {
   HardwareTransferPort port = { slot, deadline, 0 };
   UfsTransferPoll state;
@@ -191,6 +193,7 @@ static IOReturn hostAwait (const UfsSlot &slot, uint32_t dataBytes, uint64_t dea
   if (end != UfsTransferEnd::Completed) {
     // No cancel/reset/retry: the controller may still own the buffer, even
     // with DB=0. Keep it allocated and prohibit all subsequent CPU writes.
+    if (live) *live = true;
     gHost.poisoned = true;
     gHost.ready = false;
     return recordTransport (end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
@@ -301,11 +304,11 @@ static IOReturn hostScsiIssue (const UfsSlot &slot, uint8_t lun, const uint8_t *
 }
 
 static IOReturn hostScsiAwait (const UfsSlot &slot, uint8_t lun, uint32_t dataBytes, uint64_t deadline, uint32_t *scsiStatus,
-                               const void *buffer = nullptr, bool dataSynced = false)
+                               const void *buffer = nullptr, bool dataSynced = false, bool *live = nullptr)
 {
   *scsiStatus = 0xffff;
   uint32_t ocs = 0xf;
-  IOReturn status = hostAwait (slot, dataBytes, deadline, &ocs, buffer, dataSynced);
+  IOReturn status = hostAwait (slot, dataBytes, deadline, &ocs, buffer, dataSynced, live);
   if (status != kIOReturnSuccess) return status;
   const uint8_t tag = static_cast<uint8_t> (slot.entry);
   status = hostResponseHeader (slot, 0x21, lun, tag);
@@ -332,13 +335,14 @@ static IOReturn hostScsiAwait (const UfsSlot &slot, uint8_t lun, uint32_t dataBy
 
 static IOReturn hostScsiDir (const UfsSlot &slot, uint8_t lun, const uint8_t *cdb, unsigned cdbLength, unsigned direction,
                              uint32_t dataBytes, uint32_t timeoutUs, uint32_t *scsiStatus,
-                             const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr, bool dataSynced = false)
+                             const UfsPrd *prd = nullptr, unsigned prds = 0, const void *buffer = nullptr, bool dataSynced = false,
+                             bool *live = nullptr)
 {
   uint64_t deadline = 0;
   IOReturn status = hostScsiIssue (slot, lun, cdb, cdbLength, direction, dataBytes, timeoutUs, &deadline, scsiStatus, prd, prds, buffer,
                                    dataSynced);
   return status != kIOReturnSuccess ? status : hostScsiAwait (slot, lun, dataBytes, deadline, scsiStatus, prds ? buffer : nullptr,
-                                                              dataSynced);
+                                                              dataSynced, live);
 }
 
 // The original read-only entry point: data, when present, always flows device -> host.
@@ -578,8 +582,11 @@ static unsigned hostPrdsFromSegments (Segments &segments, uint64_t offset, uint6
 
 // READ(10) of `blocks` 4096-byte blocks into the physical pages of `prd` (hostPrdsFromSegments): one command, busy retries as
 // hostRead4k. The caller cleans the pages before and invalidates them after (dataSynced); nothing is copied.
-static IOReturn hostReadPrd (uint8_t lun, uint64_t lba, uint32_t blocks, const UfsPrd *prd, unsigned prds)
+// *live (when given): set when the read's own command was rung and did not complete (hostAwait): its pages may still be the
+// controller's (review H1, 2026-11-14: only then may a caller hold them).
+static IOReturn hostReadPrd (uint8_t lun, uint64_t lba, uint32_t blocks, const UfsPrd *prd, unsigned prds, bool *live = nullptr)
 {
+  if (live) *live = false;
   if (!gHost.ready || !prd || !prds || prds > kMaxPrds || !blocks || blocks > kXferMax / 4096 || lba > 0xffffffffULL - (blocks - 1))
     return kIOReturnBadArgument;
   uint64_t sum = 0;
@@ -596,7 +603,7 @@ static IOReturn hostReadPrd (uint8_t lun, uint64_t lba, uint32_t blocks, const U
   uint32_t scsi = 0;
   IOReturn status;
   for (unsigned attempt = 0;; ++attempt) {
-    status = hostScsiDir (slot, lun, cdb, 10, 2, blocks * 4096U, 1000000, &scsi, prd, prds, nullptr, true);
+    status = hostScsiDir (slot, lun, cdb, 10, 2, blocks * 4096U, 1000000, &scsi, prd, prds, nullptr, true, live);
     if (!hostRetryable (status, scsi, attempt)) break;
   }
   hostSlotGive (slot, pooled);

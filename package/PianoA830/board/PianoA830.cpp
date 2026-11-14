@@ -1291,7 +1291,10 @@ IOReturn AGXAccelerator::newUserClient(task_t owningTask, void *securityID, UInt
     logged++;
     char name[20] = {};
     proc_selfname(name, sizeof name);
-    piano_a830_note("%s opens the accelerator, type %#x: %#x", name, unsigned(type), status);
+    uint64_t ns = 0;   // the uptime: the boot-time timeline's GUI milestones (docs/boot-time.md section 10), to the millisecond
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    piano_a830_note("%s opens the accelerator, type %#x: %#x (at %llu ms)", name, unsigned(type), status,
+                    (unsigned long long)(ns / 1000000ull));
   }
   return status;
 }

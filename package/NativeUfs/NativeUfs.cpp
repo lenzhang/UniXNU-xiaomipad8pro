@@ -2690,8 +2690,10 @@ void NativeUfsBlock::serveRead (IOMemoryDescriptor *buffer, UInt64 block, UInt64
 // entirely this way or entirely through a bounce. Each command's pages are cleaned and invalidated before it and invalidated after it
 // (nothing writes them meanwhile: a read is in flight into them). A failed piece ends the read with its error and the bytes of the pieces
 // before it, never a short success (review N1): a quarantine by another command shows as the next piece's refusal. A piece whose own
-// command quarantined the transport (it failed and the host was not quarantined before it: a timeout or a fatal status, the controller
-// may still own its pages) sets *held: the buffer stays prepared and serveRead never completes the request (review N2).
+// command was rung and did not complete (a timeout or a transfer error: the controller may still own its pages) sets *held: the
+// buffer stays prepared and serveRead never completes the request (review N2). Since review H1 (2026-11-14) only that: a piece
+// refused before its doorbell (another command's quarantine, a fatal status seen first) or completed with a bad response fails
+// with its error like any other, even when it is the one that quarantined the transport.
 bool NativeUfsBlock::readDirect (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, UfsWindowResult *outcome, bool *held)
 {
   *held = false;
@@ -2729,11 +2731,11 @@ bool NativeUfsBlock::readDirect (IOMemoryDescriptor *buffer, UInt64 block, UInt6
     const unsigned prds = hostPrdsFromSegments (segments, at, piece, prd, gDmaLimit);
     if (!prds) { result.status = kIOReturnIOError; break; }   // checked above; the buffer is wired and cannot change
     hostFlushPhys (prd, prds);
-    const bool quarantinedBefore = gHost.poisoned;
+    bool live = false;
     const uint64_t t0 = timerTicks ();
-    result.status = hostReadPrd (0, (start + at) / 4096, static_cast<uint32_t> (piece / 4096), prd, prds);
+    result.status = hostReadPrd (0, (start + at) / 4096, static_cast<uint32_t> (piece / 4096), prd, prds, &live);
     __atomic_fetch_add (&native_ufs_read_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
-    if (result.status != kIOReturnSuccess && gHost.poisoned && !quarantinedBefore) {
+    if (result.status != kIOReturnSuccess && live) {
       *held = true;   // this command may still be live: no CPU access to its pages, the buffer stays prepared
       break;
     }

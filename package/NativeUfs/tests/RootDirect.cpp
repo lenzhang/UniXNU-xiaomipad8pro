@@ -93,6 +93,15 @@ int main ()
   // Busy and task-set-full answers are sent again, as for hostRead4k; a timeout quarantines the transport.
   reset (Fault::Busy); m.busyLeft = 3; assert (hostReadPrd (0, 9, 5, two, 2) == 0 && !gHost.poisoned);
   reset (Fault::Timeout); assert (hostReadPrd (0, 9, 5, two, 2) != 0); assertQuarantined ();
+  // Review H1 (2026-11-14): *live only when the read's own command was rung and did not complete; a refusal before the doorbell or a
+  // completed command with a bad response or a SCSI error is an ordinary failure (the pages are the caller's again).
+  bool live = true;
+  reset (Fault::None); assert (hostReadPrd (0, 9, 5, two, 2, &live) == 0 && !live);
+  reset (Fault::Timeout); live = false; assert (hostReadPrd (0, 9, 5, two, 2, &live) != 0 && live); assertQuarantined ();
+  reset (Fault::Type); live = true; assert (hostReadPrd (0, 9, 5, two, 2, &live) != 0 && !live && gHost.poisoned);
+  reset (Fault::CheckCondition); live = true; assert (hostReadPrd (0, 9, 5, two, 2, &live) != 0 && !live);
+  reset (Fault::None); gHost.poisoned = true; live = true;
+  assert (hostReadPrd (0, 9, 5, two, 2, &live) == kIOReturnNotReady && !live);   // another command's quarantine: never rung
   puts ("PASS: direct READ(10): the table in the descriptor, no data maintenance in the command path, bad tables refused before the "
-        "controller, busy retries, quarantine on timeout");
+        "controller, busy retries, quarantine on timeout; live only for a rung command that did not complete (review H1)");
 }

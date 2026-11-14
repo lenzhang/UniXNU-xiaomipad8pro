@@ -316,6 +316,10 @@ private:
         uint32_t centre;
     };
     uint64_t fLastLitPerMille, fLastMean, fLastCenter;
+    // The boot-time timeline (docs/boot-time.md section 10): the uptime of WindowServer's first frame and of the first frame copied
+    // at least half lit (the login window), each logged once with its uptime in ms.
+    uint64_t fFirstFrameMs = 0;
+    bool fFirstLitLogged = false;
     // The thumbnail (boot-arg native-gop-display-thumb=SECONDS, default 30, 0 off): a coarse picture of a frame as copied, logged on the
     // first frame and then every period, so a run without a camera shows what the panel showed. kThumbCols x kThumbRows cells, each the
     // mean luminance of its samples, as one of kThumbRamp's characters.
@@ -473,6 +477,13 @@ private:
     //          before the read, so the read streams through the cache instead of single uncached loads
     static constexpr uint32_t kCopyFencedRefresh = 1, kCopyCachedRead = 2;
     uint32_t fCopyMode;
+    // native-gop-display-copy-ab=1 (2026-11-14, one-boot A/B of copy mode bit 1): every report period the work loop asks for the
+    // other read mode (fCopyModeWanted), the copy thread takes it before its next job (its surface maps let go, so the next jobs map
+    // them again the new way), and each whole-frame copy's read time is counted by the mode it really used (fAbReads/fAbReadNs:
+    // [0] uncached, [1] cached), printed in the period line.
+    bool fCopyAB = false;
+    volatile uint32_t fCopyModeWanted = 0;
+    uint64_t fAbReads[2] = {}, fAbReadNs[2] = {}, fAbCopyNs[2] = {}, fAbSwitches = 0;
     bool fCachedMapRefused;
     uint64_t fRefreshSkipped, fInvalidateNs, fInvalidates;
     bool gpuFence(uint32_t *fence);
@@ -684,6 +695,10 @@ bool NativeGopDisplay::start(IOService *provider)
     fGpuFences = gpuFence != 0;
     fGpuFenceSymbol = OSSymbol::withCStringNoCopy("native-adreno-fences");
     PE_parse_boot_argn("native-gop-display-copy", &fCopyMode, sizeof(fCopyMode));
+    unsigned copyAB = 0;
+    PE_parse_boot_argn("native-gop-display-copy-ab", &copyAB, sizeof(copyAB));
+    fCopyAB = copyAB != 0;
+    fCopyModeWanted = fCopyMode;
     if (fExternal) {   // D6: its own timing and size; nothing scans the RAM surface, so no refresh copies; none of the panel's callouts
         fRefreshHz = fFake.hz;
         fWidthMM = fFake.widthMm;
@@ -735,6 +750,9 @@ bool NativeGopDisplay::start(IOService *provider)
     }
     if ((fCopyMode & kCopyFencedRefresh) && fRefreshPolicy == gopcompose::kRefreshAlways)
         fRefreshPolicy = gopcompose::kRefreshUncovered;
+    if (fCopyAB)
+        GOPLOG("copy A/B: surface reads uncached and cached by turns, one report period each (native-gop-display-copy-ab); "
+              "the period line counts each copy by the mode it used\n");
     if (fCopyMode)
         GOPLOG("copy mode %#x:%s%s (native-gop-display-copy)\n", fCopyMode,
               fCopyMode & kCopyFencedRefresh ? " refresh copies only when no GPU fence covered the frame (and the last one)" : "",
@@ -1176,6 +1194,15 @@ IOReturn NativeGopDisplay::swap_begin_gated()
                   fCachedMapRefused ? " (a cacheable mapping was refused: those surfaces read uncached)" : "");
             fInvalidates = fInvalidateNs = 0;
         }
+        if (fCopyAB) {
+            GOPLOG("copy A/B: uncached %llu copies, read mean %llu us, copy mean %llu us; cached %llu copies, read mean %llu us, "
+                  "copy mean %llu us; %llu switches; next period %s\n", fAbReads[0], fAbReads[0] ? fAbReadNs[0] / fAbReads[0] / 1000 : 0,
+                  fAbReads[0] ? fAbCopyNs[0] / fAbReads[0] / 1000 : 0, fAbReads[1], fAbReads[1] ? fAbReadNs[1] / fAbReads[1] / 1000 : 0,
+                  fAbReads[1] ? fAbCopyNs[1] / fAbReads[1] / 1000 : 0, fAbSwitches,
+                  (fCopyModeWanted & kCopyCachedRead) ? "uncached" : "cached");
+            fAbReads[0] = fAbReads[1] = fAbReadNs[0] = fAbReadNs[1] = fAbCopyNs[0] = fAbCopyNs[1] = 0;
+            __atomic_store_n(&fCopyModeWanted, fCopyModeWanted ^ kCopyCachedRead, __ATOMIC_RELEASE);
+        }
         fRefreshSkipped = 0;
         fGpuWaits = fGpuWaitNs = fGpuWaitMaxNs = fGpuTimeouts = 0;
         fFenceWaits = fFenceWaitNs = fFenceWaitMaxNs = 0;
@@ -1419,8 +1446,11 @@ void NativeGopDisplay::program_hardware_gated()
         if (!fFrames++) {   // WindowServer's first frame: the verbose boot console stops drawing over the framebuffer
             if (!fExternal)
                 PE_initialize_console(nullptr, kPEDisableScreen);
-            GOPLOG("first frame (swap %u)%s\n", swapID,
-                   fExternal ? ": WindowServer draws on the second display" : "; boot console released from the screen");
+            uint64_t ns = 0;
+            absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+            fFirstFrameMs = ns / 1000000ull;
+            GOPLOG("first frame (swap %u)%s (at %llu ms)\n", swapID,
+                   fExternal ? ": WindowServer draws on the second display" : "; boot console released from the screen", fFirstFrameMs);
         }
         uint64_t now = mach_absolute_time(), second = 0;
         fLastFrameTime = now;
@@ -1863,6 +1893,14 @@ void NativeGopDisplay::copyLoop()
             if (waited > fWakeMaxNs)
                 fWakeMaxNs = waited;
         }
+        if (fCopyAB) {   // native-gop-display-copy-ab: the read mode the work loop asked for, from this job on
+            const uint32_t wanted = __atomic_load_n(&fCopyModeWanted, __ATOMIC_ACQUIRE);
+            if (wanted != fCopyMode) {
+                releaseSurfaceMaps();
+                fCopyMode = wanted;
+                fAbSwitches++;
+            }
+        }
         bool answered = false;   // a GPU that does not answer has no fence to go by: drawn as without fences
         const bool retired = !job.fenced || waitGpuFence(job.fence, &answered) || !answered;
         const bool covered = job.fenced && answered && retired;
@@ -2084,6 +2122,7 @@ bool NativeGopDisplay::compose(const gopcompose::Plan &plan, const Job &job, IOS
     uint64_t partialLaps = 0;
     uint64_t &prepareNs = full ? fPrepareNs : partialLaps, &readNs = full ? fReadNs : partialLaps;
     uint64_t &convertNs = full ? fConvertNs : partialLaps, &writeNs = full ? fWriteNs : partialLaps;
+    const uint64_t abReadBefore = readNs;   // copy-ab: this copy's own read time
     const uint64_t began = mach_absolute_time();
     uint64_t mark = began, now;
     auto lap = [&](uint64_t &total) {
@@ -2190,6 +2229,12 @@ bool NativeGopDisplay::compose(const gopcompose::Plan &plan, const Job &job, IOS
     fCopyNs += ns;
     if (ns > fCopyMaxNs)
         fCopyMaxNs = ns;
+    if (fCopyAB && haveBase) {
+        const unsigned m = baseMap.cached ? 1 : 0;
+        fAbReads[m]++;
+        fAbReadNs[m] += readNs - abReadBefore;
+        fAbCopyNs[m] += ns;
+    }
     const uint32_t format = haveBase ? baseRows.format : 0;
     if (first && haveBase)
         GOPLOG("first copy %llux%llu format %#x into the framebuffer in %llu us\n", width, height, format, ns / 1000);
@@ -2210,6 +2255,14 @@ bool NativeGopDisplay::compose(const gopcompose::Plan &plan, const Job &job, IOS
     fLastLitPerMille = stats.lit * 1000 / samples;
     fLastMean = (stats.red / samples) << 16 | (stats.green / samples) << 8 | stats.blue / samples;
     fLastCenter = stats.centre;
+    if (!fFirstLitLogged && stats.samples && fLastLitPerMille >= 500) {   // the login window (or a desktop) reached the panel
+        fFirstLitLogged = true;
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+        GOPLOG("first lit frame: frame %llu, %llu.%llu%% non-black, mean #%06llx, at %llu ms (%llu ms after the first frame)\n", fFrames,
+              fLastLitPerMille / 10, fLastLitPerMille % 10, fLastMean, ns / 1000000ull,
+              fFirstFrameMs && ns / 1000000ull >= fFirstFrameMs ? ns / 1000000ull - fFirstFrameMs : 0);
+    }
     if (haveBase && format != gopcompose::kFormatBGRA && (fFrames <= 8 || fFrames % 50 == 0))
         GOPLOG("frame %llu: %llu of %llu sampled pixels non-black, %llu nonzero in the source, centre #%06x\n", fFrames,
               stats.lit, stats.samples, stats.raw, stats.centre);
