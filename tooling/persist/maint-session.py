@@ -62,6 +62,7 @@ D = common.DEVICE
 # (docs/persistent-boot.md section 11.5). tooling/persist/test-persist.py sets it, and PIANO_MAINT_SHELL, for its fake tablet.
 OUT = Path(os.environ.get('PIANO_PERSIST_OUT', D / 'out/persistent'))
 MAINT_SHELL = Path(os.environ.get('PIANO_MAINT_SHELL', D / 'tooling/native/maint-shell.py'))
+JOB_POLL = float(os.environ.get('PIANO_JOB_POLL', '15'))   # s between a tablet job's status reads (a fake tablet's test: less)
 TABLET_SH = D / 'tooling/persist/tablet.sh'
 XNU_LOG = D / 'tooling/native/xnu-log.py'
 V110 = Path(os.path.expanduser(os.environ.get('PIANO_V110', str(Path.home() / 'Downloads/XiaomiPad8Pro-Ubuntu/v1.1.0'))))   # the Ubuntu v1.1.0 release (or its few files)
@@ -375,11 +376,12 @@ class Session:
             raise Stop(f'tablet: {values["error"]}')
         return values
 
-    def job(self, name, *argv, timeout=3600, every=15):
+    def job(self, name, *argv, timeout=3600, every=None):
         """A long tablet.sh subcommand, detached on the tablet (survives the telnet line), polled until it ends."""
         self.t('job', name, *argv)
         if not self.execute:
             return None
+        every = every or JOB_POLL
         t0 = time.time()
         while time.time() - t0 < timeout:
             time.sleep(every)
@@ -777,7 +779,7 @@ def bound_store(s, record):
     node, start, size = part_geometry(s, part)
     if not s.execute:
         return None, (f'the store at LBA {first} on {part} (a {blocks}-block window at NativeUfs\'s place in {part} as mapped) is valid, '
-                      f'of seed {seed["identity_sha256"][:16]}, bound to LBA {first}: then it IS the one this ESP resumes')
+                      f'of seed {seed["identity_sha256"][:16]}, bound to LBA {first} (then this ESP resumes it)')
     problems, header = [], {}
     if not node or not size:
         problems.append(f'the map has no partition {part}')

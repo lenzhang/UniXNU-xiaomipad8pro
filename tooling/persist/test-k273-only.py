@@ -465,10 +465,11 @@ def test_session(tmp, out, dual, seed273):
                                        f'sys.argv[0] = {str(MAINT)!r}\nrunpy.run_path({str(MAINT)!r}, run_name="__main__")\n')
     env = dict(os.environ, FAKE_ROOT=str(root), PIANO_PERSIST_OUT=str(out), PIANO_MAINT_HOST='127.0.0.1', PIANO_BACKUP_DIR=str(nas),
                PIANO_SERIAL='test', PIANO_MAINT_SHELL=str(tmp / 'fake-shell.py'), PYTHONDONTWRITEBYTECODE='1', HOME=str(home),
+               PIANO_JOB_POLL='0.2',
                FAKE_VENDOR_BOOT_A_SHA256=tp.sha_region(lun4, tp.LUN4['vendor_boot_a'][1], tp.LUN4['vendor_boot_a'][2]),
                FAKE_INIT_BOOT_A_SHA256=tp.sha_region(lun4, tp.LUN4['init_boot_a'][1], tp.LUN4['init_boot_a'][2]))
     for k in [k for k in env if k.startswith('PIANO_') and k not in ('PIANO_PERSIST_OUT', 'PIANO_MAINT_HOST', 'PIANO_BACKUP_DIR',
-                                                                       'PIANO_SERIAL', 'PIANO_MAINT_SHELL')]:
+                                                                       'PIANO_SERIAL', 'PIANO_MAINT_SHELL', 'PIANO_JOB_POLL')]:
         env.pop(k)
     E = 'esp-k273-only.img'
     esp = ['--esp', E, '--esp-final', E]
