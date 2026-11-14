@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: UniXNU-piano
 Date: Sat, 14 Nov 2026 20:30:00 +0800
-Subject: [PATCH] k27: cs-native4k-threads=N: the native 4K code-signing
- pre-hash in parallel and in large reads
+Subject: [PATCH] k27: cs-native4k-threads=N and cs-native4k-skip=1: the
+ native 4K code-signing pre-hash in parallel, or skipped
 
 On the 4 KiB-page native kernel ubc_cs_blob_add authenticates a 16 KiB-page signature up front
 (cs_native4k_prepare, XNU_NATIVE_CS_HASH_CACHE): the whole signed range read with vn_rdwr 16 KiB at
@@ -20,16 +20,26 @@ while the caller holds the vnode's iocount and waits for them. Default (threads 
 the original loop, unchanged. cs-native4k-log=MiB: a console line per signature of at least that
 size (time, threads, read size, result, running totals); counters cs_native4k_prepare_count, _bytes,
 _ns for every signature.
+
+cs-native4k-skip=1 (owner decision 2026-11-14, a development tablet): no pre-hash. The signature's
+own checks in ubc_cs_blob_add (code directory, cdhash, trust cache) are unchanged; it is published
+without the 4 KiB table, and cs_validate_hash, the table's only reader, accepts that signature's
+4 KiB pages without hashing them (validated; NX for the page crossing codeLimit, as the hashed path;
+pages past codeLimit answered as before). The contents of those files' pages are then not checked
+against their signatures. One summary line cs-native4k-skip-report seconds (default 120) after the
+first skip: "code-signature pre-hash skipped (cs-native4k-skip=1): N files, M MiB not hashed (P 4 KiB
+pages accepted without a hash so far)"; counters cs_native4k_skipped_blobs, _bytes, _pages. Default
+0: today's verification. Skip wins over threads.
 ---
  bsd/kern/cs_native4k_policy.h | new file
- bsd/kern/ubc_subr.c           | the parallel pass, the tunables, the log
+ bsd/kern/ubc_subr.c           | the parallel pass, the skip, the tunables, the log
  2 files changed
 
 diff --git a/bsd/kern/cs_native4k_policy.h b/bsd/kern/cs_native4k_policy.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/kern/cs_native4k_policy.h
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,172 @@
 +/*
 + * SPDX-License-Identifier: BSD-2-Clause-Patent
 + *
@@ -185,22 +195,39 @@ new file mode 100644
 +	}
 +}
 +
++/*
++ * cs-native4k-skip=1 (owner decision 2026-11-14): whether cs_validate_hash accepts, without hashing, the 4 KiB page at signed-range
++ * offset `offset` of a signature published without its 4 KiB table (has_table 0), and with which taint: *nx 1 for the page that
++ * crosses code_limit (the hashed path answers that page NX too). A page off a 4 KiB boundary or at/after code_limit is not
++ * accepted here (the caller answers it as it does without the skip); with the skip off or a table present nothing is.
++ */
++static inline int
++cs4k_skip_accepts(uint32_t skip, int has_table, uint64_t offset, uint64_t code_limit, int *nx)
++{
++	if (!skip || has_table || (offset % CS4K_PAGE) || offset >= code_limit) {
++		return 0;
++	}
++	*nx = offset + CS4K_PAGE > code_limit;
++	return 1;
++}
++
 +#endif /* CS_NATIVE4K_POLICY_H */
 diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
 --- a/bsd/kern/ubc_subr.c
 +++ b/bsd/kern/ubc_subr.c
-@@ -106,6 +106,10 @@
+@@ -106,6 +106,11 @@
  static kern_return_t ubc_cs_convert_to_multilevel_hash(struct cs_blob *blob);
  #if defined(XNU_NATIVE_CS_HASH_CACHE) && XNU_NATIVE_CS_HASH_CACHE
  #include <mach/mach_vm.h>   /* mach_vm_protect */
 +#include <kern/startup.h>   /* TUNABLE: k27 0067's cs-native4k-* */
 +#include <machine/machine_routines.h>   /* ml_get_max_cpu_number */
 +#include <mach/thread_act.h>   /* thread_terminate */
++#include <kern/thread_call.h>   /* cs-native4k-skip's report */
 +#include "cs_native4k_policy.h"
  static int cs_native4k_prepare(vnode_t vp, struct cs_blob *blob);
  #endif
  
-@@ -5864,7 +5868,159 @@
+@@ -5864,7 +5869,197 @@
  unsigned long cs_native4k_full_blocks = 0;
  unsigned long cs_native4k_page_checks = 0;
  unsigned long cs_native4k_ready_blobs = 0;
@@ -221,6 +248,44 @@ diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
 +static TUNABLE(uint32_t, cs_native4k_log_mib, "cs-native4k-log", 0);
 +uint64_t cs_native4k_prepare_count = 0, cs_native4k_prepare_bytes = 0, cs_native4k_prepare_ns = 0;
 +
++/*
++ * cs-native4k-skip=1 (owner decision 2026-11-14, this development tablet): no pre-hash at all. A 16 KiB-page signature is checked
++ * as before (its code directory, cdhash and trust cache in ubc_cs_blob_add) and published without the 4 KiB table, and
++ * cs_validate_hash accepts the 4 KiB pages of such a signature without hashing them (validated; NX for the page that crosses
++ * codeLimit, as the hashed path answers). The page contents of those files are then not verified against their signature.
++ * Default 0: today's verification. One summary line, cs-native4k-skip-report seconds (default 120) after the first skip.
++ */
++static TUNABLE(uint32_t, cs_native4k_skip, "cs-native4k-skip", 0);
++static TUNABLE(uint32_t, cs_native4k_skip_report_s, "cs-native4k-skip-report", 120);
++uint64_t cs_native4k_skipped_blobs = 0, cs_native4k_skipped_bytes = 0, cs_native4k_skipped_pages = 0;
++static uint32_t cs_native4k_skip_reported = 0;
++static thread_call_t cs_native4k_skip_call;
++
++static void
++cs_native4k_skip_report(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	printf("code-signature pre-hash skipped (cs-native4k-skip=1): %llu files, %llu MiB not hashed (%llu 4 KiB pages accepted "
++	    "without a hash so far)\n", os_atomic_load(&cs_native4k_skipped_blobs, relaxed),
++	    os_atomic_load(&cs_native4k_skipped_bytes, relaxed) >> 20, os_atomic_load(&cs_native4k_skipped_pages, relaxed));
++}
++
++/* A 16 KiB-page signature of `limit` signed bytes goes without its table; the summary is scheduled once. */
++static void
++cs_native4k_note_skip(uint64_t limit)
++{
++	os_atomic_inc(&cs_native4k_skipped_blobs, relaxed);
++	os_atomic_add(&cs_native4k_skipped_bytes, limit, relaxed);
++	if (os_atomic_cmpxchg(&cs_native4k_skip_reported, 0, 1, relaxed)) {
++		thread_call_t call = thread_call_allocate(cs_native4k_skip_report, NULL);
++		if (call != NULL) {
++			uint64_t deadline;
++			clock_interval_to_deadline(cs_native4k_skip_report_s, NSEC_PER_SEC, &deadline);
++			cs_native4k_skip_call = call;
++			thread_call_enter_delayed(call, deadline);
++		}
++	}
++}
++
 +struct cs4k_job {
 +	vnode_t vp;
 +	kauth_cred_t cred;
@@ -237,7 +302,7 @@ diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
 +	int error;              /* the first error (cs4k_fail) */
 +	uint32_t active;        /* helpers still running */
 +};
- 
++
 +static int
 +cs4k_read(void *context, uint8_t *buffer, uint32_t length, uint64_t position)
 +{
@@ -283,7 +348,7 @@ diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
 +	job->md->cs_final(digest, &ctx);
 +	memcpy((void *)(job->storage + page * job->md->cs_size), digest, job->md->cs_size);
 +}
-+
+ 
 +static const struct cs4k_ops cs4k_ops = { cs4k_read, cs4k_verify, cs4k_derive };
 +
 +/*
@@ -360,7 +425,19 @@ diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
  /* The original signed 16K hash authenticates the whole immutable input
   * buffer first. Only then derive native-page digests from that same buffer.
   * Publish nothing until every original block has passed, and make the
-@@ -5910,6 +6066,16 @@
+@@ -5900,6 +6095,11 @@
+ 	    ntohl(cd->nCodeSlots) != ((limit + 16383) >> 14)) {
+ 		return ENOTSUP;
+ 	}
++	if (cs_native4k_skip) {
++		/* cs-native4k-skip=1: no table; cs_validate_hash accepts this signature's 4 KiB pages unhashed */
++		cs_native4k_note_skip(limit);
++		return 0;
++	}
+ 	count = (limit + PAGE_MASK) >> PAGE_SHIFT;
+ 	if (os_mul_overflow(count, (vm_size_t)md->cs_size, &allocation) ||
+ 	    round_page_overflow(allocation, &allocation)) {
+@@ -5910,6 +6110,16 @@
  	if (kr != KERN_SUCCESS) {
  		return ENOMEM;
  	}
@@ -377,7 +454,7 @@ diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
  	buffer = kalloc_data(16384, Z_WAITOK);
  	for (offset = 0; offset < limit; offset += 16384) {
  		union cs_hash_union ctx;
-@@ -5954,6 +6120,7 @@
+@@ -5954,6 +6164,7 @@
  			memcpy((void *)(storage + index * md->cs_size), digest, md->cs_size);
  		}
  	}
@@ -385,7 +462,7 @@ diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
  	kr = mach_vm_protect(kernel_map, storage, allocation, TRUE, VM_PROT_READ);
  	if (kr != KERN_SUCCESS) {
  		error = EPERM;
-@@ -5966,9 +6133,27 @@
+@@ -5966,10 +6177,28 @@
  	os_atomic_inc(&cs_native4k_ready_blobs, relaxed);
  	error = 0;
  out:
@@ -395,7 +472,7 @@ diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
 +	}
  	if (storage) {
  		kmem_free(kernel_map, storage, allocation);
-+	}
+ 	}
 +	{
 +		uint64_t ns = 0;
 +		absolutetime_to_nanoseconds(mach_absolute_time() - started, &ns);
@@ -411,9 +488,26 @@ diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
 +			    os_atomic_load(&cs_native4k_prepare_bytes, relaxed) >> 20, os_atomic_load(&cs_native4k_prepare_ns, relaxed) / 1000000);
 +			vnode_putname_printable(name);
 +		}
- 	}
++	}
  	return error;
  }
+ #endif
+@@ -6046,6 +6275,15 @@
+ 				    offset < (off_t)(((uint64_t)codeLimit + 16383) & ~16383ULL)) {
+ 					*bytes_processed = PAGE_SIZE;
+ 					*tainted = CS_VALIDATE_NX;
++					return TRUE;
++				}
++				int skip_nx = 0;
++				if (cs4k_skip_accepts(cs_native4k_skip, blob->csb_native4k_hashes != NULL, (uint64_t)offset,
++				    (uint64_t)codeLimit, &skip_nx)) {
++					/* cs-native4k-skip=1: published without a table (cs_native4k_prepare): accepted unhashed */
++					*bytes_processed = PAGE_SIZE;
++					*tainted = skip_nx ? CS_VALIDATE_NX : 0;
++					os_atomic_inc(&cs_native4k_skipped_pages, relaxed);
+ 					return TRUE;
+ 				}
+ 				if ((offset & PAGE_MASK) || offset >= codeLimit ||
 -- 
 2.39.0
 

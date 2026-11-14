@@ -316,8 +316,28 @@ split per task, the hottest kernel pcs, launchd's threads and their kernel stack
 `tooling/native/pc-sample-symbolize.py LOG --kc out/k273-ufs3/kernel.macho --kernel <the 0066 kernel>
 --natives out/k273-ufs3/kernel.macho.natives.json` names the pcs (kernel symbols, kext + offset, `[sha256 insns]`).
 
+**Decision 2026-11-14 (owner): skip the eager pre-hash on this development tablet.** Switch `cs-native4k-skip=1` (k27 0067, default
+0 = verification as before). Trade-off: the system boots without the ~37 s pre-hash, and in exchange the contents of the pages of
+every file signed with 16 KiB pages (all of Apple's arm64e code, the dyld cache included) are no longer checked against their
+signatures on this 4 KiB-page kernel; each signature's own checks (code directory, cdhash, trust cache) still run. To turn the
+verification back on: remove `cs-native4k-skip=1` from the line (or set `cs-native4k-skip=0`); `cs-native4k-threads=6` keeps it on
+and parallel instead. The boot says `code-signature pre-hash skipped (cs-native4k-skip=1): N files, M MiB not hashed (P 4 KiB pages
+accepted without a hash so far)` once, 120 s after the first skip (`cs-native4k-skip-report=S`).
+
+| Kernel argument (k27 0067) | Default | Effect |
+|---|---|---|
+| `cs-native4k-skip=1` | 0 | no pre-hash; pages of 16 KiB-page signatures accepted unhashed (above) |
+| `cs-native4k-skip-report=S` | 120 | seconds from the first skip to the one summary line |
+| `cs-native4k-threads=N` | 1 | the pre-hash on N participants (1..16, at most the CPUs); 1: the original loop |
+| `cs-native4k-read-kib=K` | 0 | the parallel pass's read size (0: 1024 KiB); any value takes the parallel path |
+| `cs-native4k-log=MiB` | 0 | one line per pre-hashed signature of at least MiB (`cs_native4k: NAME: ... in T ms, N threads ...`) |
+
+ufs3 (2026-11-14 20:3x, the measurement probe) confirmed the attribution: `perf ... cs native4k` ~12,300 16 KiB blocks (~192 MiB
+of decompressed content) a second on one CPU, 0 bad hashes, against ~80 MiB/s on the windows; `pc-sample`: launchd ~996 kernel
+samples per 2 s (one CPU busy), its hottest pcs corecrypto's SHA-256 (~87 %), then the LZBITMAP decompressor and memmove.
+
 **Fixes, in order:**
-1. **Built: k27 0067, `cs-native4k-threads=N`** (`patches/k27/0067-*`, `patches/k27/README.md`): `cs_native4k_prepare` on the
+1. **Built: k27 0067, `cs-native4k-threads=N`** (the fallback that keeps verification on) (`patches/k27/0067-*`, `patches/k27/README.md`): `cs_native4k_prepare` on the
    caller and N-1 kernel threads, each claiming 1 MiB chunks (`cs-native4k-read-kib`) and reading each with one `vn_rdwr` (decmpfs
    serves concurrent readers of one file: its compressed-data lock is taken shared), verifying the chunk's 16 KiB blocks and
    filling their 4 KiB slots; the first error stops everyone and is returned; publication only after every helper finished without

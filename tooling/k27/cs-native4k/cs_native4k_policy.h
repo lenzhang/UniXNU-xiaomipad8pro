@@ -153,4 +153,20 @@ cs4k_participate(const struct cs4k_ops *ops, void *context, uint64_t limit, uint
 	}
 }
 
+/*
+ * cs-native4k-skip=1 (owner decision 2026-11-14): whether cs_validate_hash accepts, without hashing, the 4 KiB page at signed-range
+ * offset `offset` of a signature published without its 4 KiB table (has_table 0), and with which taint: *nx 1 for the page that
+ * crosses code_limit (the hashed path answers that page NX too). A page off a 4 KiB boundary or at/after code_limit is not
+ * accepted here (the caller answers it as it does without the skip); with the skip off or a table present nothing is.
+ */
+static inline int
+cs4k_skip_accepts(uint32_t skip, int has_table, uint64_t offset, uint64_t code_limit, int *nx)
+{
+	if (!skip || has_table || (offset % CS4K_PAGE) || offset >= code_limit) {
+		return 0;
+	}
+	*nx = offset + CS4K_PAGE > code_limit;
+	return 1;
+}
+
 #endif /* CS_NATIVE4K_POLICY_H */

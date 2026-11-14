@@ -218,6 +218,21 @@ main(void)
 	cs4k_fail(&error, 8);
 	cs4k_fail(&error, 5);
 	assert(error == 8);
+	/* cs-native4k-skip: only with the skip on and no table; whole pages before codeLimit; NX for the one that crosses it */
+	int nx = -1;
+	const uint64_t code_limit = 5 * CS4K_BLOCK + 100;   /* ends 100 bytes into page 20 */
+	assert(!cs4k_skip_accepts(0, 0, 0, code_limit, &nx) && nx == -1);
+	assert(!cs4k_skip_accepts(1, 1, 0, code_limit, &nx) && nx == -1);
+	assert(cs4k_skip_accepts(1, 0, 0, code_limit, &nx) && nx == 0);
+	assert(cs4k_skip_accepts(1, 0, 19 * CS4K_PAGE, code_limit, &nx) && nx == 0);
+	assert(cs4k_skip_accepts(1, 0, 20 * CS4K_PAGE, code_limit, &nx) && nx == 1);
+	nx = -1;
+	assert(!cs4k_skip_accepts(1, 0, 21 * CS4K_PAGE, code_limit, &nx) && nx == -1);   /* past codeLimit: answered as without */
+	assert(!cs4k_skip_accepts(1, 0, 4096 + 512, code_limit, &nx) && nx == -1);       /* not a page boundary */
+	assert(cs4k_skip_accepts(1, 0, 3 * CS4K_PAGE, 4 * CS4K_PAGE, &nx) && nx == 0);   /* a range ending on a page */
+	assert(!cs4k_skip_accepts(1, 0, 4 * CS4K_PAGE, 4 * CS4K_PAGE, &nx));
+	printf("PASS: cs_native4k_policy.h: cs-native4k-skip accepts whole pages before codeLimit of a signature without a table "
+	    "(NX for the crossing page), nothing else\n");
 	printf("PASS: cs_native4k_policy.h: %u passes (1-16 participants, chunks 16 KiB-4 MiB, block buffers, ranges ending inside a block): "
 	    "the same 4 KiB table as one thread, every block verified and every page derived once; bad blocks and read errors fail the "
 	    "pass with the first error; claiming stops after an error\n", passes);
