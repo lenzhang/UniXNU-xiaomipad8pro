@@ -100,9 +100,18 @@ int main()
     CHECK(piano_wifi_profile_parse(reinterpret_cast<const uint8_t *>(text), sizeof text - 1, &q) == nullptr);
     CHECK(q.ssid_len == 7 && std::memcmp(q.ssid, "my home", 7) == 0 && q.security == PianoWifiSecWpa2Psk);
     CHECK(q.psk_len == 13 && (q.flags & PianoWifiProfileBssid) && q.bssid[0] == 0x3c && q.bssid[5] == 0x30);
-    const char open[] = "ssid=cafe\nsecurity=open";   // no final newline
+    const char open[] = "ssid=cafe\nsecurity=open\n";
     CHECK(piano_wifi_profile_parse(reinterpret_cast<const uint8_t *>(open), sizeof open - 1, &q) == nullptr);
     CHECK(q.security == PianoWifiSecOpen && q.psk_len == 0 && q.ssid_len == 4);
+    // a file still being written: no final newline (a passphrase cut short would pass every other rule)
+    const char half[] = "ssid=cafe\nsecurity=wpa2-psk\npsk=correct hor";
+    CHECK(piano_wifi_profile_parse(reinterpret_cast<const uint8_t *>(half), sizeof half - 1, &q) != nullptr);
+    const char nonl[] = "ssid=cafe\nsecurity=open";
+    CHECK(piano_wifi_profile_parse(reinterpret_cast<const uint8_t *>(nonl), sizeof nonl - 1, &q) != nullptr);
+    piano_wifi_profile_stamp s1 = {7, 99, 1, 2, 3, 4}, s2 = s1;
+    CHECK(piano_wifi_profile_stamp_same(&s1, &s2));
+    s2.ctime_nsec = 5;   // a chmod
+    CHECK(!piano_wifi_profile_stamp_same(&s1, &s2));
     const char *bad[] = {"ssid=x\nsecurity=wep\n", "ssid=x\n", "ssid=x\nsecurity=open\ncolour=blue\n",
                          "ssid=x\nsecurity=wpa2-psk\npsk=short\n", "ssid=x\nsecurity=open\nmac=02:00:00:00:00\n",
                          "ssid=012345678901234567890123456789012\nsecurity=open\n"};

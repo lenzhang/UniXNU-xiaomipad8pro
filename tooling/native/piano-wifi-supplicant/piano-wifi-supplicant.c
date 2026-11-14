@@ -344,6 +344,11 @@ static int read_profile(const char *path, struct profile *p)
   ssize_t n = read(fd, buf, sizeof buf - 1);
   close(fd);
   if (n <= 0) return -1;
+  if (buf[n - 1] != '\n') {   // a file still being written (writers replace it by a rename): not taken until it is whole
+    wipe(buf, sizeof buf);
+    say("the profile's last line has no newline (a file still being written?): not taken yet");
+    return -1;
+  }
   buf[n] = 0;
   for (char *line = strtok(buf, "\n"); line; line = strtok(NULL, "\n")) {
     if (!strncmp(line, "ssid=", 5)) { p->ssid_len = strlen(line + 5); if (p->ssid_len > 32) p->ssid_len = 0; else memcpy(p->ssid, line + 5, p->ssid_len); }
@@ -445,6 +450,7 @@ static int run(const char *profile_path, bool once)
   struct timeval tv = { .tv_sec = 1 };
   setsockopt(gSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   time_t associated_at = 0;
+  uint32_t nopmk_generation = 0;   // the association whose EAPOL frames found no profile (said once)
   for (;;) {
     uint8_t msg[PIANO_WIFI_8021X_MSG_MAX];
     ssize_t n = recv(gSock, msg, sizeof msg, 0);
@@ -491,7 +497,14 @@ static int run(const char *profile_path, bool once)
     } else if (hd.type == PIANO_WIFI_8021X_EAPOL_RX && body_len >= sizeof(struct piano_wifi_8021x_eapol)) {
       struct piano_wifi_8021x_eapol e;
       memcpy(&e, body, sizeof e);
-      if (e.generation != h.generation || sizeof e + e.pdu_len > body_len || !ps.have) continue;
+      if (e.generation != h.generation || sizeof e + e.pdu_len > body_len) continue;
+      if (!ps.have && !load_pmk(profile_path, &ps)) {   // the profile may have come after the association
+        if (nopmk_generation != h.generation) {
+          say("an EAPOL frame came, but there is no usable join profile: dropped (generation %u)", h.generation);
+          nopmk_generation = h.generation;
+        }
+        continue;
+      }
       int rc = on_eapol(ps.pmk, &h, body + sizeof e, e.pdu_len, sock_send, NULL);
       if (rc == 1) {
         int ra = send_request(sock_send, NULL, PIANO_WIFI_8021X_AUTHORIZE, h.generation, 0);

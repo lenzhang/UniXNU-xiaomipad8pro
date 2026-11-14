@@ -33,6 +33,19 @@ struct piano_wifi_profile {
   uint8_t psk[64];
 };
 
+// The profile file's stamp (the kext's reader, WifiProfileFile.c): the file is read again whenever it differs from the last
+// read's. The change time is in it so that a chmod (a file first refused for its mode) is seen as well.
+struct piano_wifi_profile_stamp {
+  uint64_t fileid, size;
+  int64_t mtime_sec, mtime_nsec, ctime_sec, ctime_nsec;
+};
+
+static inline int piano_wifi_profile_stamp_same(const struct piano_wifi_profile_stamp *a, const struct piano_wifi_profile_stamp *b)
+{
+  return a->fileid == b->fileid && a->size == b->size && a->mtime_sec == b->mtime_sec && a->mtime_nsec == b->mtime_nsec &&
+         a->ctime_sec == b->ctime_sec && a->ctime_nsec == b->ctime_nsec;
+}
+
 // What is wrong with a profile, or 0. The checks are the ones a supplicant makes: a name of 1 to 32 bytes, a passphrase of 8
 // to 63 printable characters or 64 hex digits for WPA2-PSK and none for an open network, an address of the station that is
 // locally administered and not a group address. Nothing else of the profile is looked at.
@@ -119,6 +132,10 @@ static inline const char *piano_wifi_profile_parse(const uint8_t *text, uint32_t
   p->version = PIANO_WIFI_PROFILE_VERSION;
   p->security = 0xff;
   if (!text) return "no text";
+  // A file still being written (truncated and rewritten in place) ends in the middle of a line: its last line must end with a
+  // newline, so that a passphrase cut short is never taken for the whole one (review of 2026-11-14, F3). Writers replace the
+  // file with a temporary one and rename(2).
+  if (!length || text[length - 1] != '\n') return "its last line has no newline (a file still being written?)";
   while (at < length && !bad) {
     uint32_t end = at, n, eq;
     while (end < length && text[end] != '\n') ++end;

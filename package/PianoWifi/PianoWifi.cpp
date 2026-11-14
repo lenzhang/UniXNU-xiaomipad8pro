@@ -109,7 +109,8 @@ extern "C" {
 // Post-mortem breadcrumb (also in the console log): the last stage reached, negative when it failed there.
 volatile int32_t piano_wifi_stage = 0;
 // WifiProfileFile.c: the join profile out of its root-only file (0, ENOENT for no file, else the reason in *problem).
-int piano_wifi_profile_read_file(struct piano_wifi_profile *out, const char **problem);
+int piano_wifi_profile_read_file(struct piano_wifi_profile *out, struct piano_wifi_profile_stamp *stamp, const char **problem);
+int piano_wifi_profile_file_stamp(struct piano_wifi_profile_stamp *stamp);
 // XNU's (osfmk/arm64): the bytes left on the current thread's kernel stack (or the interrupt stack it is on).
 vm_offset_t ml_stack_remaining(void);
 }
@@ -2796,8 +2797,11 @@ void level8Program(const char *where)
 }
 
 // The teardown: the scan stopped and the virtual device deleted, waited for (bounded), then the rings disabled.
+bool gLinkTornDown;   // linkTeardown ran since level 6's linkBegin (stopRadio's does not run it twice)
 void linkTeardown()
 {
+  if (gLinkTornDown) return;
+  gLinkTornDown = true;
   const uint64_t deadline = nowMs() + 1000;
   bool idle = false;
   while (!idle && nowMs() < deadline) {
@@ -2876,6 +2880,7 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
   gLink.noteCtx = nullptr;
   const uint64_t started = nowMs();
   linkBegin(gLink, gCe, gChipIo, options, started);
+  gLinkTornDown = false;
   gLinkRunning = true;
   // Six message steps, the four of the radio's set-up (P22) and the scan — or the hold instead of it.
   // P23 adds the data interface's connection, two statistics waits, its version, the rings and a second scan.
@@ -3092,7 +3097,13 @@ void stopRadio(const char *why)
   const uint64_t deadline = nowMs() + 2500;   // level 7's fast teardown (each answer 300 ms) fits in it
   while (gLinkRunning && nowMs() < deadline) IOSleep(10);
   note("%s: stopping the radio (the ladder's thread %s)", why, gLinkRunning ? "did not finish in 2.5 s" : "is done");
-  if (!gLinkRunning && gLink.ce) linkTeardown();
+  if (gLinkRunning) {
+    // review F4: the ladder's thread still owns the hardware (a teardown that does not end): powering it down from here would
+    // put WLAN_EN low and PERST# under its register writes. It powers the radio down itself once it is out (chipDown).
+    note("%s: the radio is left to the ladder's thread, which powers it down when its teardown ends", why);
+    return;
+  }
+  if (gLink.ce) linkTeardown();
   if (gPowerState && gWin[kWinTlmm].va) {
     safeOff(gHw, *gPowerState, gPowerOptions);
     nocVote(false);   // PERST# is asserted: nothing crosses the PCIe NoC any more
@@ -3110,15 +3121,24 @@ void stopRadio(const char *why)
 // hook's 4 s) and, should it not come, puts WLAN_EN low and PERST# asserted itself. The join profile is kept: the wake's
 // restart joins again from it.
 volatile uint32_t gParked;
+// The number of the last system sleep the ladder parked the radio for: it only ever grows, so the hook below cannot miss it the
+// way it could miss gParked's short 1 (review of 2026-11-14, F1: a park and a wake in the same turn of the ladder's loop).
+volatile uint32_t gParkedFor;
 void parkRadio()
 {
+  const uint32_t sleep = __atomic_load_n(&gSleeps, __ATOMIC_SEQ_CST);
   gStopWhy = "suspend";
   __atomic_store_n(&gStopRequested, 1u, __ATOMIC_SEQ_CST);
   const uint64_t started = nowMs(), deadline = started + 3500;
-  while (!__atomic_load_n(&gParked, __ATOMIC_SEQ_CST) && nowMs() < deadline) IOSleep(10);
-  if (__atomic_load_n(&gParked, __ATOMIC_SEQ_CST)) {
-    IOLog("PianoWifi: power: the radio is parked for system sleep %u (%llu ms after the sleep's stop)\n", gSleeps,
+  while (__atomic_load_n(&gParkedFor, __ATOMIC_SEQ_CST) < sleep && nowMs() < deadline) IOSleep(10);
+  if (__atomic_load_n(&gParkedFor, __ATOMIC_SEQ_CST) >= sleep) {
+    IOLog("PianoWifi: power: the radio is parked for system sleep %u (%llu ms after the sleep's stop)\n", sleep,
           (unsigned long long)(nowMs() - started));
+    return;
+  }
+  // the wake of this sleep has come already (its pass may be running): nothing of the hardware is touched from here
+  if (__atomic_load_n(&gWakes, __ATOMIC_SEQ_CST) >= sleep) {
+    IOLog("PianoWifi: power: system sleep %u has woken before the ladder parked: nothing done here\n", sleep);
     return;
   }
   IOLog("PianoWifi: power: the ladder's thread did not park the radio within 3.5 s: WLAN_EN low and PERST# asserted from "
@@ -3134,6 +3154,8 @@ IOLock *gProfileLock;
 piano_wifi_profile gProfile;
 uint32_t gProfileGeneration;   // under gProfileLock
 bool gProfileSet;
+piano_wifi_profile_stamp gProfileStamp;   // the file's at the last read (profileFileCheck)
+bool gProfileStampValid, gProfileFromFile, gProfileReadOnce;
 
 void profileClear()
 {
@@ -3174,6 +3196,7 @@ int sysctlJoin(struct sysctl_oid *, void *, int, struct sysctl_req *req)
   IOLockLock(gProfileLock);
   gProfile = incoming;
   gProfileSet = true;
+  gProfileFromFile = false;   // the sysctl's (the next look at the file compares it with this one)
   const uint32_t generation = ++gProfileGeneration;
   IOLockUnlock(gProfileLock);
   note("join profile set (generation %u): a network name of %u byte(s), %s%s, the access point %s, the station's address %s "
@@ -3241,6 +3264,7 @@ bool profileOwnMac(uint8_t *mac)
 // The profile into the join once it is set (the sysctl may be written at any time while the join waits for it). Only the
 // name, the security and the preferred access point cross; the passphrase stays in the profile (the four-way handshake is
 // user space's, piece 3).
+uint32_t gStaProfileGeneration;   // the profile generation the join machine holds (profileToSta)
 bool profileToSta(Sta &s, uint32_t &generationSeen)
 {
   if (!gProfileLock) return false;
@@ -3250,9 +3274,100 @@ bool profileToSta(Sta &s, uint32_t &generationSeen)
     handed = staSetProfile(s, gProfile.ssid, gProfile.ssid_len, gProfile.security,
                            (gProfile.flags & PianoWifiProfileBssid) ? gProfile.bssid : nullptr);
     generationSeen = gProfileGeneration;
+    if (handed) gStaProfileGeneration = gProfileGeneration;
   }
   IOLockUnlock(gProfileLock);
   return handed;
+}
+
+// The root-only profile file against the profile in use (review of 2026-11-14, F2): the supplicant reads the same file at each
+// association, so the kext reads it again whenever its stamp (inode, size, modification and change time) differs from its last
+// read — at each join, at a restart's first, and while the join waits — and a profile that came from the file goes with it
+// when the file is gone. Only lengths are logged. Returns true when the profile in use changed.
+__attribute__((noinline)) bool profileFileCheck(const char *when)
+{
+  static const char *lastProblem;
+  if (!gArgs.l7file || !gProfileLock) return false;
+  piano_wifi_profile_stamp stamp = {};
+  const int rc = piano_wifi_profile_file_stamp(&stamp);
+  if (rc == ENOENT) {
+    bool dropped = false;
+    IOLockLock(gProfileLock);
+    if (gProfileSet && gProfileFromFile) {
+      piano_wifi_profile_wipe(&gProfile);
+      gProfileSet = gProfileFromFile = false;
+      ++gProfileGeneration;
+      dropped = true;
+    }
+    IOLockUnlock(gProfileLock);
+    gProfileStampValid = false;
+    if (dropped) note("level 7: the join profile's file is gone (%s): the profile it gave is dropped; the join waits for one", when);
+    return dropped;
+  }
+  if (rc == 0 && gProfileStampValid && piano_wifi_profile_stamp_same(&stamp, &gProfileStamp)) return false;
+  piano_wifi_profile fromFile;
+  const char *problem = nullptr;
+  piano_wifi_profile_stamp read = {};
+  const int r = piano_wifi_profile_read_file(&fromFile, &read, &problem);
+  // a version whose text was refused or not read whole is not read again until it changes; a refusal for its owner or mode
+  // (or its directory's) is tried again at each check
+  if (r == 0 || r == EINVAL || r == EIO) {
+    gProfileStamp = read;
+    gProfileStampValid = true;
+  }
+  if (r) {
+    piano_wifi_profile_wipe(&fromFile);
+    if (problem && problem != lastProblem) {
+      lastProblem = problem;
+      note("level 7: the profile file is there but not taken (%s): %s; %s", when, problem,
+           gProfileSet ? "the profile in use stays" : "the sysctl is still waited for");
+    }
+    return false;
+  }
+  lastProblem = nullptr;
+  bool changed = false;
+  uint32_t generation = 0;
+  IOLockLock(gProfileLock);
+  if (gProfileSet) {
+    const uint8_t *a = reinterpret_cast<const uint8_t *>(&gProfile), *b = reinterpret_cast<const uint8_t *>(&fromFile);
+    for (size_t i = 0; i < sizeof gProfile && !changed; ++i) changed = a[i] != b[i];
+  } else {
+    changed = true;
+  }
+  if (changed) {
+    gProfile = fromFile;
+    gProfileSet = true;
+    generation = ++gProfileGeneration;
+  }
+  gProfileFromFile = true;
+  IOLockUnlock(gProfileLock);
+  if (changed)
+    note("join profile %s its root-only file (%s, generation %u): a network name of %u byte(s), %s%s, the access point %s, the "
+         "station's address %s (none of it is logged)",
+         gProfileReadOnce ? "changed: read again from" : "read from", when, generation, unsigned(fromFile.ssid_len),
+         piano_wifi_security_name(fromFile.security), fromFile.psk_len ? " with a passphrase" : "",
+         (fromFile.flags & PianoWifiProfileBssid) ? "given" : "not given", (fromFile.flags & PianoWifiProfileMac) ? "given" : "not given");
+  else if (gProfileReadOnce)
+    note("join profile: its root-only file was replaced or touched (%s), the same profile as before (generation %u kept)", when,
+         gProfileGeneration);
+  gProfileReadOnce = true;
+  piano_wifi_profile_wipe(&fromFile);
+  return changed;
+}
+
+// Before a join: the file looked at, and a join machine that still holds an older profile than the one in use made to take it.
+__attribute__((noinline)) void profileBeforeJoin(const char *when)
+{
+  profileFileCheck(when);
+  if (!gProfileLock) return;
+  IOLockLock(gProfileLock);
+  const uint32_t generation = gProfileGeneration;
+  IOLockUnlock(gProfileLock);
+  if (gSta.profileSet && gStaProfileGeneration != generation) {
+    gSta.profileSet = false;   // staBegin then waits for the profile, which profileToSta hands over at once
+    for (unsigned i = 0; i < kSsidMax; ++i) gSta.ssid[i] = 0;
+    gSta.ssidLength = 0;
+  }
 }
 
 bool level8Event(uint32_t id, const uint8_t *payload, uint32_t length);
@@ -4408,7 +4523,9 @@ int level7(IOService *owner)
   // The rejoin (level 8, piano-wifi-rejoin): one join per pass of this loop; after an association ends, the next pass waits
   // its back-off and joins again from the profile. The reorder queues alternate between two blocks of the window, so a new
   // peer's queues never reuse the memory of the one just deleted.
-  static const uint32_t kRejoinBackoffMs[] = {2000, 5000, 10000, 20000, 30000, 60000};
+  // (review F5: after 60 s the back-off grows to 2 and then 5 minutes rather than give up, so that a network switched off for
+  // the night costs a join every 5 minutes and is joined again when it is back)
+  static const uint32_t kRejoinBackoffMs[] = {2000, 5000, 10000, 20000, 30000, 60000, 60000, 120000, 300000};
   // (a restart's pass begins after the wake that began it: that wake is not one this pass slept through)
   uint32_t joins = 0, rejoinStep = 0, wakesSeen = gWakes, sleepsSeen = gSleeps;
   bool stoppedOnRequest = false;
@@ -4431,11 +4548,11 @@ int level7(IOService *owner)
     }
     env.reoq = (joins % 2 == 0 && gStaReoq2.va) ? gStaReoq2 : gStaReoq;
   }
+  profileBeforeJoin(joins == 1 ? "at the join's start" : "before the rejoin");
   staBeginOnce(o, env, nowMs());
   gLink.hook = staHook;
   uint32_t generation = 0;
   uint64_t nextFileTry = 0;
-  const char *lastFileProblem = nullptr;
   bool stopping = false, profileNoted = false, dropThisJoin = false, clientWaitOver = false;
   uint64_t stopAt = 0, clientWaitFrom = 0;
   why = nullptr;
@@ -4489,30 +4606,7 @@ int level7(IOService *owner)
     // sysctl stays the other way in, and whichever comes first is taken.
     if (!gSta.profileSet && gArgs.l7file && gSta.step == kStaProfileWait && now >= nextFileTry && gProfileLock) {
       nextFileTry = now + 2000;
-      IOLockLock(gProfileLock);
-      const bool have = gProfileSet;
-      IOLockUnlock(gProfileLock);
-      if (!have) {
-        piano_wifi_profile fromFile;
-        const char *problem = nullptr;
-        const int rc = piano_wifi_profile_read_file(&fromFile, &problem);
-        if (!rc) {
-          IOLockLock(gProfileLock);
-          gProfile = fromFile;
-          gProfileSet = true;
-          const uint32_t gen = ++gProfileGeneration;
-          IOLockUnlock(gProfileLock);
-          note("join profile read from its root-only file (generation %u): a network name of %u byte(s), %s%s, the access point "
-               "%s, the station's address %s (none of it is logged)",
-               gen, unsigned(fromFile.ssid_len), piano_wifi_security_name(fromFile.security),
-               fromFile.psk_len ? " with a passphrase" : "", (fromFile.flags & PianoWifiProfileBssid) ? "given" : "not given",
-               (fromFile.flags & PianoWifiProfileMac) ? "given" : "not given");
-          piano_wifi_profile_wipe(&fromFile);
-        } else if (problem && problem != lastFileProblem) {
-          lastFileProblem = problem;
-          note("level 7: the profile file is there but not read: %s (the sysctl is still waited for)", problem);
-        }
-      }
+      profileFileCheck("while the join waits");
     }
     // a WPA2 profile waits for the 802.1X client (piano-wifi-clientwait), once per join: its end, either way, lets it pass
     bool holdForClient = false;
@@ -4560,8 +4654,8 @@ int level7(IOService *owner)
   } else if (gArgs.level >= 8 && gArgs.rejoin && joinEndedByItself) {
     const bool wasUp = gSta.vdevUp;
     if (gSta.authorized) rejoinStep = 0;   // a port that opened: the next one starts the back-off afresh
-    const uint32_t waitMs = kRejoinBackoffMs[rejoinStep < 6 ? rejoinStep : 5];
-    if (rejoinStep < 5) ++rejoinStep;
+    const uint32_t waitMs = kRejoinBackoffMs[rejoinStep < 9 ? rejoinStep : 8];
+    if (rejoinStep < 8) ++rejoinStep;
     note("level 7: join %u ended (%s%s): joining again in %u s, from the profile", joins,
          wasUp ? "the association ended: " : "the join failed: ",
          dropThisJoin ? "the drop test's own leave" : gSta.disconnect ? staDisconnectName(gSta.disconnect)
@@ -4966,6 +5060,8 @@ void PianoWifi::run()
   for (uint32_t pass = 1;; ++pass) {
     const int end = runPass(pass, power, opt);
     if (!restarts) {
+      // a stop that found the ladder still at work left the power-down to it (review F4)
+      if (gRadioStopped && gChipHeld) chipDown(power, opt);
       if (end == kPassUnmap) unmapWindows();
       break;
     }
@@ -5278,7 +5374,10 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
   const uint64_t until = ended + waitMs;
   bool parked = false, woke = false;
   for (;;) {
-    if (gRadioStopped) return false;   // a shutdown (stopRadio has powered the radio down)
+    if (gRadioStopped) {   // a shutdown: stopRadio powered the radio down, unless the ladder still had it (then here)
+      if (gChipHeld) chipDown(power, opt);
+      return false;
+    }
     if (__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST)) {
       if (!parked) {
         if (chipOn) {
@@ -5290,6 +5389,7 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
              "wake brings it up again",
              gSleeps);
         __atomic_store_n(&gParked, 1u, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&gParkedFor, __atomic_load_n(&gSleeps, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
       }
       if (__atomic_load_n(&gWakes, __ATOMIC_SEQ_CST) >= __atomic_load_n(&gSleeps, __ATOMIC_SEQ_CST)) {
         __atomic_store_n(&gParked, 0u, __ATOMIC_SEQ_CST);
@@ -5308,6 +5408,7 @@ bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt
     }
     IOSleep(50);
   }
+  if (gRadioStopped) return false;   // a shutdown that came with the wake: no pass begins (review F6)
   // The restart.
   ++gRestarts;
   if (woke) {
