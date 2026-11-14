@@ -20,6 +20,8 @@
 #include <IOKit/IOService.h>
 #include <sys/errno.h>
 #include <sys/kpi_mbuf.h>
+#include <net/kpi_interface.h>
+#include <net/if.h>   // IFF_UP, IFF_RUNNING
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-anon-enum-enum-conversion"   // the family's headers mix anonymous enums
 #define __PRIVATE_SPI__   // the shipped family uses IONetworkController's reserved slots 2-5, as PianoNullEthernet does
@@ -56,6 +58,12 @@ class PianoWifiEthernet : public IOEthernetController {
   IOEthernetAddress fAddress = {{0x02, 0x50, 0x49, 0x41, 0x4e, 0x01}};
   bool fAttached = false, fLinkUp = false;
   UInt64 fTxFrames = 0, fTxDrops = 0, fRxFrames = 0, fRxDrops = 0, fLinkChanges = 0;
+  // after boot 10f-c (the port open, en0 "link up", and not one frame of en0's ever handed to PianoWifi): why each output was
+  // dropped, whether the stack brought the interface up at all, and the first frames each way (length, type, group bit)
+  UInt64 fTxDown = 0, fTxSize = 0, fTxRefused = 0, fEnables = 0, fDisables = 0;
+  int fLastRefusal = 0;
+  unsigned fTxLogged = 0, fRxLogged = 0;
+  void counters(const char *why);
   uint8_t fTxBuffer[PIANO_WIFI_NET_FRAME_MAX];   // one output at a time (the family serializes outputPacket)
 
   void takeScanList(IOService *wifi);
@@ -70,8 +78,18 @@ class PianoWifiEthernet : public IOEthernetController {
     *address = fAddress;
     return kIOReturnSuccess;
   }
-  IOReturn enable(IONetworkInterface *) override { return kIOReturnSuccess; }
-  IOReturn disable(IONetworkInterface *) override { return kIOReturnSuccess; }
+  IOReturn enable(IONetworkInterface *) override
+  {
+    ++fEnables;
+    note("the interface is brought up (enable %llu): the stack may send now%s", fEnables, fLinkUp ? "" : " (the link is down)");
+    return kIOReturnSuccess;
+  }
+  IOReturn disable(IONetworkInterface *) override
+  {
+    ++fDisables;
+    note("the interface is taken down (disable %llu)", fDisables);
+    return kIOReturnSuccess;
+  }
   UInt32 getFeatures() const override { return kIONetworkFeatureNoBSDWait; }
   UInt32 outputPacket(mbuf_t packet, void *) override;
   IOReturn setPromiscuousMode(bool) override { return kIOReturnSuccess; }
@@ -107,6 +125,15 @@ void PianoWifiEthernet::takeScanList(IOService *wifi)
   }
 }
 
+void PianoWifiEthernet::counters(const char *why)
+{
+  const uint32_t flags = fInterface ? uint32_t(ifnet_flags(fInterface->getIfnet())) : 0;
+  note("%s: interface flags %#x (up %u, running %u), enables %llu; out %llu sent, dropped %llu (link down %llu, size %llu, "
+       "refused %llu, last %d); in %llu, dropped %llu",
+       why, flags, (flags & IFF_UP) ? 1u : 0u, (flags & IFF_RUNNING) ? 1u : 0u, fEnables, fTxFrames, fTxDrops, fTxDown, fTxSize,
+       fTxRefused, fLastRefusal, fRxFrames, fRxDrops);
+}
+
 // A received frame, on PianoWifi's thread (one at a time): into an mbuf of the family's and up the stack.
 void PianoWifiEthernet::netInput(void *ctx, const uint8_t *frame, uint32_t length)
 {
@@ -124,6 +151,12 @@ void PianoWifiEthernet::netInput(void *ctx, const uint8_t *frame, uint32_t lengt
   }
   self->fInterface->inputPacket(m, length);
   ++self->fRxFrames;
+  if (self->fRxLogged < 6) {
+    ++self->fRxLogged;
+    note("in: frame %llu, %u bytes, type %#06x, %s", self->fRxFrames, length, unsigned(frame[12] << 8 | frame[13]),
+         (frame[0] & 1) ? "group addressed" : "to us");
+  }
+  if ((self->fRxFrames & 255) == 0) self->counters("every 256 frames in");
 }
 
 // The link's state, on PianoWifi's thread (and once from the attach).
@@ -144,6 +177,7 @@ void PianoWifiEthernet::netLink(void *ctx, int up, const uint8_t *mac)
   self->setLinkStatus(now ? (kIONetworkLinkValid | kIONetworkLinkActive) : kIONetworkLinkValid, self->fMedium,
                       now ? kLinkSpeed : 0);
   note("the link is %s (PianoWifi's port %s)", now ? "up" : "down", now ? "is authorized" : "closed: the association ended");
+  self->counters(now ? "at the link's up" : "at the link's down");
 }
 
 UInt32 PianoWifiEthernet::outputPacket(mbuf_t packet, void *)
@@ -156,11 +190,22 @@ UInt32 PianoWifiEthernet::outputPacket(mbuf_t packet, void *)
   else if (!fLinkUp)
     rc = ENETDOWN;
   freePacket(packet);
+  if (fTxLogged < 6 && length >= 14) {
+    ++fTxLogged;
+    note("out: frame %llu, %zu bytes, type %#06x, %s: %s (%d)", fTxFrames + fTxDrops + 1, length,
+         unsigned(fTxBuffer[12] << 8 | fTxBuffer[13]), (fTxBuffer[0] & 1) ? "group addressed" : "unicast",
+         rc ? "dropped" : "handed to PianoWifi", rc);
+  }
   if (rc) {
     ++fTxDrops;
+    if (!fLinkUp) ++fTxDown;
+    else if (rc == EMSGSIZE) ++fTxSize;
+    else ++fTxRefused;
+    fLastRefusal = rc;
     return kIOReturnOutputDropped;
   }
   ++fTxFrames;
+  if ((fTxFrames & 255) == 0) counters("every 256 frames out");
   return kIOReturnOutputSuccess;
 }
 
@@ -213,8 +258,7 @@ void PianoWifiEthernet::stop(IOService *provider)
 {
   if (fAttached) piano_wifi_net_detach(this);   // returns when no callback of ours runs
   fAttached = false;
-  note("%llu frame(s) sent, %llu dropped; %llu received, %llu dropped; %llu link change(s)", fTxFrames, fTxDrops, fRxFrames,
-       fRxDrops, fLinkChanges);
+  counters("at the stop");
   if (fInterface) {
     detachInterface(fInterface);
     OSSafeReleaseNULL(fInterface);

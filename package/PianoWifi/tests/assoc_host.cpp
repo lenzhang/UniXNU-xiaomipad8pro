@@ -447,6 +447,20 @@ static void testKeys()
   const uint8_t *groupCmd = fixedOf(groupBuffer, groupLength, kWmiTagVdevInstallKeyCmd, &size);
   CHECK(groupCmd && wmiGet(groupCmd, 3) == 1 && wmiGet(groupCmd, 4) == kWmiKeyGroup);
   CHECK(groupCmd && wmiGet(groupCmd, 6) == 0x33445566u && wmiGet(groupCmd, 7) == 0x1122u);
+  // A TKIP group key (boot 10f-c): its two Michael keys' lengths, 8 and 8, in words 21 and 22.
+  {
+    uint8_t tkip[32];
+    for (unsigned i = 0; i < sizeof tkip; ++i) tkip[i] = uint8_t(0x40 + i);
+    KeyInstall t = install;
+    t.cipher = kWmiCipherTkip;
+    t.key = tkip;
+    t.keyBytes = 32;
+    WmiWriter wt;
+    uint8_t tb[256] = {};
+    const uint32_t tl = assocBuildInstallKey(wt, tb, sizeof tb, t);
+    const uint8_t *tc = fixedOf(tb, tl, kWmiTagVdevInstallKeyCmd, &size);
+    CHECK(tc && wmiGet(tc, 5) == kWmiCipherTkip && wmiGet(tc, 20) == 32 && wmiGet(tc, 21) == 8 && wmiGet(tc, 22) == 8);
+  }
   // A key whose length is not a whole number of words is padded, and its real length is the one word 20 carries.
   install.keyBytes = 13;
   WmiWriter w3;

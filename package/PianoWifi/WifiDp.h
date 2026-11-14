@@ -51,11 +51,23 @@ struct DpTxBuf {
   bool busy = false;
 };
 
+// One released receive buffer as the release ring and the buffer itself describe it (boot 10f-c: 1891 releases after the
+// keys, no frame delivered): the release's source and its push reason and error code, the descriptor's error bits, and two
+// protocol facts of the frame (group addressed or not, its Ethernet type). Nothing private: no address, no payload.
+struct DpRelRecord {
+  uint32_t source = 0, rxdmaPush = 0, rxdmaError = 0, reoPush = 0, reoError = 0, info13 = 0, length = 0, etherType = 0;
+  bool groupAddressed = false, descRead = false;
+};
+constexpr unsigned kDpRelRecords = 16;
+
 struct DpStats {
   // receive
   uint32_t rxEntries = 0, rxFrames = 0, rxEapol = 0, rxBytes = 0, rxNotDone = 0, rxBadCookie = 0, rxErrors = 0, rxNullData = 0,
            rxMulti = 0, rxNotEthernet = 0, rxTooLong = 0, rxLinkDesc = 0, rxRecycled = 0, rxRecycleFull = 0;
   uint32_t excEntries = 0, relEntries = 0, relRecycled = 0, relOther = 0;
+  uint32_t relBySource[8] = {}, relRxdmaError[32] = {}, relReoError[32] = {}, relGroup = 0, relUnicast = 0;
+  DpRelRecord rel[kDpRelRecords];   // the first kDpRelRecords releases
+  uint32_t relRecorded = 0;
   uint32_t lastEapolLength = 0, lastDecap = 0, lastErrors = 0, lastPushReason = 0, lastErrorCode = 0;
   // transmit
   uint32_t txFrames = 0, txBytes = 0, txNoBuffer = 0, txRingFull = 0, txTooLong = 0, txNotReady = 0, txCompletions = 0,
@@ -567,7 +579,35 @@ inline uint32_t dpPoll(Dp &dp, const ChipIo &io, Deliver deliver)
       ++seen;
       ++dp.st.relEntries;
       HttRx *rx = dp.rx;
-      if (rx && cookie + 1 < kRxRefillEntries && addrOf(e) == rx->refillBus[cookie] && httRefillPost(*rx, cookie))
+      const bool ours = rx && cookie + 1 < kRxRefillEntries && addrOf(e) == rx->refillBus[cookie];
+      // why it was released: info0 (word 2) the source (2:0), the receive DMA's push reason (18:17) and error (23:19), the
+      // reorder unit's push reason (25:24) and error (30:26)
+      const uint32_t info0 = get32(e + 8);
+      DpRelRecord rec;
+      rec.source = info0 & kDpRelSrcMask;
+      rec.rxdmaPush = (info0 >> 17) & 0x3u;
+      rec.rxdmaError = (info0 >> 19) & 0x1fu;
+      rec.reoPush = (info0 >> 24) & 0x3u;
+      rec.reoError = (info0 >> 26) & 0x1fu;
+      ++dp.st.relBySource[rec.source];
+      if (rec.source == kDpRelSrcRxdma) ++dp.st.relRxdmaError[rec.rxdmaError];
+      if (rec.source == kDpRelSrcReo) ++dp.st.relReoError[rec.reoError];
+      if (ours && rx->refillVa[cookie]) {
+        const uint8_t *va = rx->refillVa[cookie];
+        rec.descRead = true;
+        rec.info13 = get32(va + kRxDescInfo13);
+        rec.length = get32(va + kRxDescInfo10) & kRxDescMsduLenMask;
+        const uint32_t pad = (get16(va + kRxDescInfo5) >> kRxDescL3PadShift) & kRxDescL3PadMask;
+        const uint8_t *frame = va + kRxDescBytes + pad;
+        if (rec.length >= 14 && kRxDescBytes + pad + 14 <= kRxBufferBytes) {
+          rec.groupAddressed = (frame[0] & 1) != 0;
+          rec.etherType = uint32_t(frame[12]) << 8 | frame[13];
+        }
+        if (rec.groupAddressed || (rec.info13 & kRxDescMcbc)) ++dp.st.relGroup;
+        else ++dp.st.relUnicast;
+      }
+      if (dp.st.relRecorded < kDpRelRecords) dp.st.rel[dp.st.relRecorded++] = rec;
+      if (ours && httRefillPost(*rx, cookie))
         ++dp.st.relRecycled;
       else
         ++dp.st.relOther;

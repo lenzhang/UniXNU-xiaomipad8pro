@@ -142,9 +142,10 @@ struct piano_wifi_8021x_eapol {
 } __attribute__((packed));
 
 /* KEY: one key. Pairwise (`group` 0): index 0, the TK of the PTK (16 bytes for CCMP-128). Group (`group` 1): the GTK's index
- * (1-3) from the KDE, its bytes (16 for CCMP-128; 32 for TKIP: the key, then the Michael key for transmit, then for receive,
- * as the GTK KDE carries them), and its receive sequence counter (the RSC of message 3, the low 6 bytes used). The kext copies
- * the bytes into the firmware's command and wipes every copy of its own as soon as the command is sent. */
+ * (1-3) from the KDE, its bytes (16 for CCMP-128; 32 for TKIP: exactly as the GTK KDE carries them, the key, then the
+ * authenticator's transmit Michael key, then its receive one; the kext puts them in the station's order for the firmware),
+ * and its receive sequence counter (the RSC of message 3, the low 6 bytes used). The kext copies the bytes into the firmware's
+ * command and wipes every copy of its own as soon as the command is sent. */
 struct piano_wifi_8021x_key {
   uint32_t generation;
   uint8_t group;           /* 0 pairwise, 1 group */

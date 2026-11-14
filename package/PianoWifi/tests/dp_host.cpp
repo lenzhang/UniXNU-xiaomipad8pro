@@ -273,12 +273,23 @@ int main()
     uint8_t *e = dp.rel3.va;
     put32(e, uint32_t(rx.refillBus[13]));
     put32(e + 4, (uint32_t(rx.refillBus[13] >> 32) & 0xffu) | kDpRbmSw1 << 8 | 13u << 12);
+    put32(e + 8, kDpRelSrcRxdma | 4u << 19);   // released by the receive DMA, its error 4
+    std::vector<uint8_t> group = ethFrame(0x0806, 50, 0x22);
+    group[0] = 0xff;                          // a broadcast
+    fillRx(rx, 13, group, 0, 1u << 28 | kRxDescMcbc);
     put32(e + 32, 0x12345678);   // the next entry: not a buffer of ours
     put32(e + 36, 0xffu << 12);
+    put32(e + 40, kDpRelSrcReo | 1u << 24 | 7u << 26);
     *dp.rel3.theirs = 2 * dp.rel3.words;
     const uint32_t before = dp.st.rxRecycled;
     CHECK(dpPoll(dp, io, deliver) == 2);
     CHECK(dp.st.relEntries == 2 && dp.st.relRecycled == 1 && dp.st.relOther == 1 && dp.st.rxRecycled == before);
+    // why: by source and code, and the first one read out of its buffer
+    CHECK(dp.st.relBySource[kDpRelSrcRxdma] == 1 && dp.st.relRxdmaError[4] == 1 && dp.st.relBySource[kDpRelSrcReo] == 1 &&
+          dp.st.relReoError[7] == 1 && dp.st.relGroup == 1 && dp.st.relUnicast == 0 && dp.st.relRecorded == 2);
+    CHECK(dp.st.rel[0].descRead && dp.st.rel[0].groupAddressed && dp.st.rel[0].etherType == 0x0806 &&
+          (dp.st.rel[0].info13 & (1u << 28)) && dp.st.rel[0].length == group.size());
+    CHECK(!dp.st.rel[1].descRead && dp.st.rel[1].reoPush == 1 && dp.st.rel[1].reoError == 7);
     CHECK(chip.regs[kDpWbm2Sw0R2 + 3 * 8 + 4] == 2 * 8);
   }
   // ---- the exception ring: counted, its push reason and error kept, passed over

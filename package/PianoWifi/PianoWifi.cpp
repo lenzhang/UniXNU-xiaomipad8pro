@@ -3253,6 +3253,7 @@ IOLock *gPortLock;       // the 802.1X port: its client's unit, its requests, th
 piano_wifi_net_client gNetClient;
 bool gNetAttached, gNetToldUp, gNetToldAny;
 NetQueue gTxQueue;       // frames of en0 and EAPOL frames of the port, for the ladder's thread to send
+uint32_t gNetSendDown, gNetSendFull, gNetSendSize, gNetSendOk;   // piano_wifi_net_send's answers (atomics)
 // The association as the other threads may read it (under gNetLock): what EAPOL_TX's frame needs and what a request must name.
 struct NetLink {
   uint32_t state = PIANO_WIFI_8021X_STATE_IDLE, generation = 0;
@@ -3510,15 +3511,22 @@ extern "C" void piano_wifi_net_detach(void *ctx)
 
 extern "C" int piano_wifi_net_send(const uint8_t *frame, uint32_t length)
 {
-  if (!frame || length < 14 || length > PIANO_WIFI_NET_FRAME_MAX) return EMSGSIZE;
+  if (!frame || length < 14 || length > PIANO_WIFI_NET_FRAME_MAX) {
+    __atomic_add_fetch(&gNetSendSize, 1u, __ATOMIC_RELAXED);
+    return EMSGSIZE;
+  }
   if (!gNetLock || !gTxLock) return ENETDOWN;
   IOLockLock(gNetLock);
   const bool open = gNetLink.txData;
   IOLockUnlock(gNetLock);
-  if (!open) return ENETDOWN;
+  if (!open) {
+    __atomic_add_fetch(&gNetSendDown, 1u, __ATOMIC_RELAXED);
+    return ENETDOWN;
+  }
   IOLockLock(gTxLock);
   const bool queued = netQueuePut(gTxQueue, frame, length, frame[12] == 0x88 && frame[13] == 0x8e);
   IOLockUnlock(gTxLock);
+  __atomic_add_fetch(queued ? &gNetSendOk : &gNetSendFull, 1u, __ATOMIC_RELAXED);
   return queued ? 0 : ENOBUFS;
 }
 
@@ -3564,6 +3572,35 @@ void portSendLink(uint32_t state)
   if (n) portEnqueue(m, n);
 }
 
+// Why receive buffers came back on the release ring (after boot 10f-c: 1891 after the keys, no frame delivered): by source,
+// the receive DMA's and the reorder unit's error codes, group or unicast; and, once, the first releases one by one.
+bool gRelRecordsLogged;
+void level8Releases(const char *why, bool records)
+{
+  const DpStats &st = gDp.st;
+  char rx[120] = {}, reo[120] = {};
+  uint32_t at = 0;
+  for (uint32_t c = 0; c < 32 && at + 12 < sizeof rx; ++c)
+    if (st.relRxdmaError[c]) at += uint32_t(snprintf(rx + at, sizeof rx - at, "%s%u:%u", at ? " " : "", c, st.relRxdmaError[c]));
+  at = 0;
+  for (uint32_t c = 0; c < 32 && at + 12 < sizeof reo; ++c)
+    if (st.relReoError[c]) at += uint32_t(snprintf(reo + at, sizeof reo - at, "%s%u:%u", at ? " " : "", c, st.relReoError[c]));
+  note("level 8 %s: released by TQM %u, RXDMA %u (errors %s), REO %u (errors %s), firmware %u, other %u; group %u unicast %u",
+       why, st.relBySource[0], st.relBySource[1], rx[0] ? rx : "none", st.relBySource[2], reo[0] ? reo : "none",
+       st.relBySource[3], st.relBySource[4] + st.relBySource[5] + st.relBySource[6] + st.relBySource[7], st.relGroup,
+       st.relUnicast);
+  if (!records || gRelRecordsLogged || !st.relRecorded) return;
+  gRelRecordsLogged = true;
+  for (uint32_t i = 0; i < st.relRecorded; ++i) {
+    const DpRelRecord &r = st.rel[i];
+    note("level 8: release %u: source %u, RXDMA push %u error %u, REO push %u error %u; desc %s errors %#x, %u bytes, type "
+         "%#06x, %s",
+         i + 1, r.source, r.rxdmaPush, r.rxdmaError, r.reoPush, r.reoError, r.descRead ? "read," : "not read,",
+         r.info13 & (kRxDescErrors | kRxDescMcbc | kRxDescNullData), r.length, r.etherType,
+         r.groupAddressed ? "group" : "unicast");
+  }
+}
+
 // The counters, in lines short enough for the console (boot 10e: the console and the kernel log cut a line at about 250
 // bytes, and the release, exception and refill counts of the old two-line form never came out).
 void level8Status(uint64_t now, const char *why)
@@ -3596,6 +3633,10 @@ void level8Status(uint64_t now, const char *why)
        st.txOtherRelease, st.txBadCookie);
   note("level 8 %s: held back: not ready %u, no buffer %u, ring full %u; queue %u waiting, %u sent, %u dropped, %u full",
        why, st.txNotReady, st.txNoBuffer, st.txRingFull, queued, sent, dropped, full);
+  note("level 8 %s: en0's sends: %u queued, refused %u (link down), %u (queue full), %u (size)", why,
+       __atomic_load_n(&gNetSendOk, __ATOMIC_RELAXED), __atomic_load_n(&gNetSendDown, __ATOMIC_RELAXED),
+       __atomic_load_n(&gNetSendFull, __ATOMIC_RELAXED), __atomic_load_n(&gNetSendSize, __ATOMIC_RELAXED));
+  level8Releases(why, false);
   note("level 8 %s: the port: %s (%u connect(s), %u bad), %u message(s) out (%u failed); keys: %u sent, %u installed, %u "
        "refused, %u unanswered",
        why, unit ? "a client" : "no client", connects, bad, gL8.portOut, gL8.portOutFailed, gL8.keyCommands, gKeys.installed,
@@ -3857,13 +3898,25 @@ void level8Requests(uint64_t now)
     k.group = next->group != 0;
     k.cipher = next->cipher == kRsnCipherTkip ? kWmiCipherTkip : kWmiCipherCcmp;
     for (unsigned i = 0; i < 6; ++i) k.peer[i] = gSta.bssid[i];
-    k.key = next->key;
+    // A TKIP group key comes as the GTK KDE carries it: the key, the authenticator's transmit Michael key, its receive one.
+    // The firmware takes the station's view (its transmit Michael key, then its receive one), so the two halves change
+    // places, as a station's supplicant does before it hands a TKIP group key to its driver (boot 10f-c: group frames all
+    // released after an unswapped TKIP group key).
+    static uint8_t keyBytes[32];
+    for (unsigned i = 0; i < sizeof keyBytes; ++i) keyBytes[i] = i < next->key_len ? next->key[i] : 0;
+    if (k.cipher == kWmiCipherTkip && next->key_len == 32)
+      for (unsigned i = 0; i < 8; ++i) {
+        keyBytes[16 + i] = next->key[24 + i];
+        keyBytes[24 + i] = next->key[16 + i];
+      }
+    k.key = keyBytes;
     k.keyBytes = next->key_len;
     k.rsc = next->rsc & 0xffffffffffffull;
     WmiWriter w;
     const uint32_t n = assocBuildInstallKey(w, gL8Out, sizeof gL8Out, k);
     const int rc = n ? linkSendWmi(gLink, gL8Out, n) : -1;
-    for (uint32_t i = 0; i < sizeof gL8Out; ++i) gL8Out[i] = 0;   // the key's bytes do not stay in our buffer
+    for (uint32_t i = 0; i < sizeof gL8Out; ++i) gL8Out[i] = 0;   // the key's bytes do not stay in our buffers
+    for (unsigned i = 0; i < sizeof keyBytes; ++i) keyBytes[i] = 0;
     if (rc == 1) {
       const bool group = k.group;
       netKeysSent(gKeys, group, now);
@@ -3957,6 +4010,7 @@ void level8Turn(uint64_t now)
     level8Pointers(now, "after the association");
     gL8.nextPointers = now - gL8.associatedAt < 1000 ? now + 50 : now - gL8.associatedAt < 10000 ? now + 1000 : 0;
   }
+  if (gL8.live && !gRelRecordsLogged && gDp.st.relRecorded >= kDpRelRecords) level8Releases("after 16 releases", true);
   if (gArgs.l8status && gL8.live && now >= gL8.lastStatus + gArgs.l8status) {
     gL8.lastStatus = now;
     level8Status(now, "while associated");
@@ -3984,6 +4038,7 @@ void level8End(IOService *owner, uint64_t now)
   IOLockUnlock(gPortLock);
   level8Pointers(now, "at its end");
   level8Status(now, "at its end");
+  level8Releases("at its end", true);
   note("level 8: EAPOL by message: four-way 1 %u, 2 %u, 3 %u, 4 %u; group 1 %u, 2 %u; other %u; not from the access point %u; "
        "the first frame %llu ms and the first EAPOL frame %llu ms after the association",
        gL8.eapolMsg[1], gL8.eapolMsg[2], gL8.eapolMsg[3], gL8.eapolMsg[4], gL8.eapolMsg[5], gL8.eapolMsg[6], gL8.eapolMsg[0],

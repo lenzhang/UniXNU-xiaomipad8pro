@@ -870,6 +870,7 @@ constexpr uint32_t kWmiPeerAssocWords = 61, kWmiVhtRateSetWords = 5;
 constexpr uint32_t kWmiInstallKeyWords = 25;
 constexpr uint32_t kWmiKeyPairwise = 0, kWmiKeyGroup = 1;
 constexpr uint32_t kWmiCipherNone = 0, kWmiCipherTkip = 2, kWmiCipherCcmp = 4, kWmiCipherCmac = 7;
+constexpr uint32_t kWmiTkipMicBytes = 8;   // each Michael key of a TKIP key (transmit, then receive)
 constexpr uint32_t kWmiPeerFlagAuth = 0x1, kWmiPeerFlagQos = 0x2, kWmiPeerFlagNeedPtk4Way = 0x4, kWmiPeerFlagNeedGtk2Way = 0x10,
                    kWmiPeerFlagPmf = 0x08000000;
 constexpr uint32_t kWmiRateCck = 0x80;            // a legacy rate byte: 500 kb/s units, bit 7 for the CCK rates

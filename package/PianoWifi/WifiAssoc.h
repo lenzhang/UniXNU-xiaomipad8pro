@@ -681,8 +681,10 @@ inline uint32_t assocBuildInstallKey(WmiWriter &w, uint8_t *buffer, uint32_t cap
     wmiPut(cmd, 6, uint32_t(key.rsc & 0xffffffffu));
     wmiPut(cmd, 7, uint32_t(key.rsc >> 32));
     wmiPut(cmd, 20, key.keyBytes);
-    wmiPut(cmd, 21, 0);
-    wmiPut(cmd, 22, 0);
+    // TKIP: the key's last 16 bytes are the two Michael keys, 8 each (this chip's host says so; 0 for every other cipher).
+    // Boot 10f-c installed its TKIP group key with 0 and 0, and every group frame after it was released, not delivered.
+    wmiPut(cmd, 21, key.cipher == kWmiCipherTkip ? kWmiTkipMicBytes : 0u);
+    wmiPut(cmd, 22, key.cipher == kWmiCipherTkip ? kWmiTkipMicBytes : 0u);
   }
   const uint32_t padded = (key.keyBytes + 3u) & ~3u;
   uint8_t *at = wmiTlv(w, kWmiTagArrayByte, padded);
