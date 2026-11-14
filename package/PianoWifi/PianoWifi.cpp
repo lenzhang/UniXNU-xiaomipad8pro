@@ -2795,6 +2795,9 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
       break;
     }
     step = linkRun(gLink, nowMs());
+    // Level 8's rings programmed at level 6's start (bit 5): released buffers are given back from here on; frames are counted
+    // and dropped (nothing is associated yet).
+    if (gDpPlanned && gDp.programmed) dpPoll(gDp, gChipIo, [](uint32_t, const uint8_t *, uint32_t) {});
     if (mhiHealth(gMhiIo, gBoot.bhi).dead()) {   // MHI still carries the firmware's health while the copy engine runs
       note("level 6: the chip reported a system error or its crash dump environment during %s", linkStepName(step));
       gChipDead = true;
@@ -2806,6 +2809,11 @@ int level6(IOService *owner, PowerState &power, const Options &opt)
     }
     if (step != kLinkDone && step != kLinkStopped) IOSleep(2);
   }
+  if (gDpPlanned && gDp.programmed)
+    note("level 8 during level 6: received %u entries, released %u (%u posted again, %u not ours), exceptions %u; the "
+         "release ring %u/%u (hardware/ours)",
+         gDp.st.rxEntries, gDp.st.relEntries, gDp.st.relRecycled, gDp.st.relOther, gDp.st.excEntries,
+         gDp.rel3.theirs ? (*gDp.rel3.theirs % (gDp.rel3.entries * gDp.rel3.words)) / gDp.rel3.words : 0u, gDp.rel3.ours);
   // What the firmware said, and what the scan found.
   note("level 6: the transport: %u credits of %u bytes, %u endpoints, version %#x; our endpoint %d (pipes %u out, %u in), "
        "%u credit reports (%u credits), %u control messages",
@@ -3273,7 +3281,7 @@ unsigned gPortResultHead, gPortResultTail;
 struct Level8 {
   bool on = false, selectionSent = false, live = false, txUp = false, linkUpTold = false;
   uint32_t selectionTries = 0, selections = 0;
-  uint64_t associatedAt = 0, firstRxAt = 0, firstEapolAt = 0, lastStatus = 0;
+  uint64_t associatedAt = 0, firstRxAt = 0, firstEapolAt = 0, lastStatus = 0, nextPointers = 0;
   uint32_t eapolLogged = 0, eapolToPort = 0, eapolDropped = 0, eapolNotFromAp = 0, eapolMsg[7] = {};
   uint32_t toEn0 = 0, en0Dropped = 0, keyCommands = 0, keyComplete = 0, keyTimeouts = 0;
   uint32_t portSeq = 0, portOut = 0, portOutFailed = 0;
@@ -3556,6 +3564,8 @@ void portSendLink(uint32_t state)
   if (n) portEnqueue(m, n);
 }
 
+// The counters, in lines short enough for the console (boot 10e: the console and the kernel log cut a line at about 250
+// bytes, and the release, exception and refill counts of the old two-line form never came out).
 void level8Status(uint64_t now, const char *why)
 {
   const DpStats &st = gDp.st;
@@ -3570,21 +3580,47 @@ void level8Status(uint64_t now, const char *why)
   const uint32_t unit = gCtlUnit, connects = gCtlConnects, bad = gCtlBadMessages;
   IOLockUnlock(gPortLock);
   note("level 8 %s (%llu ms after the association): received %u entries, %u frames (%u bytes), %u EAPOL (to the port %u, "
-       "no client %u), to en0 %u (%u dropped while en0's link was down); not delivered: not done %u, errors %u (last %#x), "
-       "null data %u, more than one buffer %u, not Ethernet %u, bad cookie %u, link descriptors %u; buffers posted again %u "
-       "(%u with no room), released %u (%u posted again), exceptions %u (push %u error %u); refill: the firmware's tail at %u",
+       "no client %u), to en0 %u (%u dropped, link down)",
        why, (unsigned long long)(gL8.associatedAt ? now - gL8.associatedAt : 0), st.rxEntries, st.rxFrames, st.rxBytes,
-       st.rxEapol, gL8.eapolToPort, gL8.eapolDropped, gL8.toEn0, gL8.en0Dropped, st.rxNotDone, st.rxErrors, st.lastErrors,
-       st.rxNullData, st.rxMulti, st.rxNotEthernet, st.rxBadCookie, st.rxLinkDesc, st.rxRecycled, st.rxRecycleFull,
-       st.relEntries, st.relRecycled, st.excEntries, st.lastPushReason, st.lastErrorCode, gHtt.refillTaken);
-  note("level 8 %s: sent %u frames (%u bytes, %u EAPOL), completions %u (acknowledged %u, not %u, last reason %u, by the "
-       "firmware %u, other %u, bad cookie %u); held back: not ready %u, no buffer %u, ring full %u; the queue: %u waiting, %u "
-       "sent, %u dropped, %u refused as full; the port: %s (%u connect(s), %u bad message(s)), %u message(s) out (%u failed); "
-       "keys: %u command(s), %u installed, %u refused, %u not answered",
+       st.rxEapol, gL8.eapolToPort, gL8.eapolDropped, gL8.toEn0, gL8.en0Dropped);
+  note("level 8 %s: not delivered: not done %u, errors %u (last %#x), null data %u, multi-buffer %u, not Ethernet %u, "
+       "bad cookie %u, link descriptors %u",
+       why, st.rxNotDone, st.rxErrors, st.lastErrors, st.rxNullData, st.rxMulti, st.rxNotEthernet, st.rxBadCookie, st.rxLinkDesc);
+  note("level 8 %s: buffers posted again %u (%u no room); released %u (%u posted again, %u not ours); exceptions %u (push "
+       "%u, error %u); refill tail %u",
+       why, st.rxRecycled, st.rxRecycleFull, st.relEntries, st.relRecycled, st.relOther, st.excEntries, st.lastPushReason,
+       st.lastErrorCode, gHtt.refillTaken);
+  note("level 8 %s: sent %u frames (%u bytes, %u EAPOL); completions %u (acked %u, not %u, last reason %u, firmware %u, "
+       "other %u, bad cookie %u)",
        why, st.txFrames, st.txBytes, st.txEapol, st.txCompletions, st.txAcked, st.txNotAcked, st.lastTxReason, st.txFwReleased,
-       st.txOtherRelease, st.txBadCookie, st.txNotReady, st.txNoBuffer, st.txRingFull, queued, sent, dropped, full,
-       unit ? "a client connected" : "no client", connects, bad, gL8.portOut, gL8.portOutFailed, gL8.keyCommands,
-       gKeys.installed, gKeys.refused, gL8.keyTimeouts);
+       st.txOtherRelease, st.txBadCookie);
+  note("level 8 %s: held back: not ready %u, no buffer %u, ring full %u; queue %u waiting, %u sent, %u dropped, %u full",
+       why, st.txNotReady, st.txNoBuffer, st.txRingFull, queued, sent, dropped, full);
+  note("level 8 %s: the port: %s (%u connect(s), %u bad), %u message(s) out (%u failed); keys: %u sent, %u installed, %u "
+       "refused, %u unanswered",
+       why, unit ? "a client" : "no client", connects, bad, gL8.portOut, gL8.portOutFailed, gL8.keyCommands, gKeys.installed,
+       gKeys.refused, gL8.keyTimeouts);
+}
+
+// Where every ring's two sides stand (after boot 10e, whose firmware died 236 ms after the association with nothing in our
+// rings): the hardware's pointer (in host memory) against ours, in entries, for the data path's rings and the data interface's.
+void level8Pointers(uint64_t now, const char *why)
+{
+  auto at = [](const CeRing &r) -> uint32_t {
+    const uint32_t size = r.entries * r.words;
+    return (r.theirs && size) ? (*r.theirs % size) / r.words : 0xffffu;
+  };
+  auto hat = [](const HttRing &r, bool head) -> uint32_t {
+    const volatile uint32_t *p = head ? r.head : r.tail;
+    return (p && r.entryWords && r.entries) ? (*p / r.entryWords) % r.entries : 0xffffu;
+  };
+  note("level 8 rings %s (+%llu ms): REO2SW1 %u/%u, REO2SW0 %u/%u, WBM2SW3 %u/%u, WBM2SW0 %u/%u, TCL %u/%u (hardware/ours)",
+       why, (unsigned long long)(gL8.associatedAt ? now - gL8.associatedAt : 0), at(gDp.reo), gDp.reo.ours, at(gDp.reoExc),
+       gDp.reoExc.ours, at(gDp.rel3), gDp.rel3.ours, at(gDp.txComp), gDp.txComp.ours, at(gDp.tcl), gDp.tcl.ours);
+  note("level 8 rings %s: refill head %u tail %u; radio rings head %u, %u; errors head %u tail %u; status tails %u, %u",
+       why, hat(gHtt.ring[kHttRefill], true), hat(gHtt.ring[kHttRefill], false), hat(gHtt.ring[kHttMacBuf0], true),
+       hat(gHtt.ring[kHttMacBuf1], true), hat(gHtt.ring[kHttErrDst], true), hat(gHtt.ring[kHttErrDst], false),
+       hat(gHtt.ring[kHttStatus0], false), hat(gHtt.ring[kHttStatus1], false));
 }
 
 // Before the join: the receive ring selection for both radio buffer rings (the TLVs where WifiHw.h has them, data frames to
@@ -3728,6 +3764,8 @@ void level8Follow(uint64_t now)
                   : "an open network: the port opens once the station is up");
     gL8.lastState = PIANO_WIFI_8021X_STATE_ASSOCIATED;
     portSendLink(PIANO_WIFI_8021X_STATE_ASSOCIATED);
+    level8Pointers(now, "at the association");
+    gL8.nextPointers = now + 50;
     deferPhase();
   }
   if (up && !gL8.txUp) {
@@ -3915,6 +3953,10 @@ void level8Turn(uint64_t now)
   level8Follow(now);
   level8Requests(now);
   level8Transmit();
+  if (gL8.live && gL8.nextPointers && now >= gL8.nextPointers) {
+    level8Pointers(now, "after the association");
+    gL8.nextPointers = now - gL8.associatedAt < 1000 ? now + 50 : now - gL8.associatedAt < 10000 ? now + 1000 : 0;
+  }
   if (gArgs.l8status && gL8.live && now >= gL8.lastStatus + gArgs.l8status) {
     gL8.lastStatus = now;
     level8Status(now, "while associated");
@@ -3940,6 +3982,7 @@ void level8End(IOService *owner, uint64_t now)
   IOLockLock(gPortLock);
   netKeysReset(gKeys);
   IOLockUnlock(gPortLock);
+  level8Pointers(now, "at its end");
   level8Status(now, "at its end");
   note("level 8: EAPOL by message: four-way 1 %u, 2 %u, 3 %u, 4 %u; group 1 %u, 2 %u; other %u; not from the access point %u; "
        "the first frame %llu ms and the first EAPOL frame %llu ms after the association",

@@ -28,8 +28,8 @@
 
 namespace pianowifi {
 
-constexpr uint32_t kDpTclEntries = 64, kDpTxCompEntries = 64, kDpReoEntries = 256, kDpReoExcEntries = 64,
-                   kDpRelEntries = 64, kDpIdleEntries = 1024;
+constexpr uint32_t kDpTclEntries = 64, kDpTxCompEntries = 64, kDpReoEntries = 256, kDpReoExcEntries = 128,
+                   kDpRelEntries = 256, kDpIdleEntries = 1024;
 constexpr uint32_t kDpTxBuffers = 32, kDpTxBufferBytes = 2048;
 constexpr uint32_t kDpLinkDescBytes = 128;
 constexpr uint32_t kDpFrameMax = 1600;   // an 802.3 frame of en0 (1514 and a VLAN tag, rounded)
