@@ -422,3 +422,13 @@ driver; if one did, its completion line says how many records it took.
 | stage 2b, only if W shows `en2` at some stage | at that stage: a scan step, then `tmo 40 system_profiler SPAirPortDataType > /tmp/sp.txt; grep -c 'Security:' /tmp/sp.txt`; log in, then the webcam at the desktop and at the opened Wi-Fi menu (`piano-input.py`) | about 15 networks in both and the menu's list |
 | if no stage adopts | keep I, W and A per stage, the scan serials, and A's `role=`/`parent=` lines; the next step is decided on that evidence (ADOPTION.md §5 P1's country code, or the event payloads `=4`) | — |
 | the end | console `reset fastboot` | — |
+
+### 7.5 wm3 as built
+
+`out/ram-k273-wm3` (the M1 branch's worktree; built 2026-11-14 from branch commit `1ea2fa2`, main `d0d8aac` merged): 237281280
+bytes, sha256 `5a9ac99c586a4a9ce0006c3678f69047c47a562d1e66819980b6b0c2b24e1364`, `verify-ram-images.py` PASS. The 27.3 collection
+`9c02815c...` (the 0066 kernel, 26 native kexts all this repository's, `vtable check PianoWifiEthernet vs IOEthernetController:
+0 problem slots`); the v5 recipe (its line and tail), the v2 seed (identity `9bd6f902...`, `data-persist=0`), the v4 layer's
+trust cache `57063d6d...`; the arguments' tail 496 bytes, the merged line 1164 bytes, `piano-wifi-apple80211=1` and no
+`-uc` argument, so it boots in stage 0 (= wm2) and every stage is a sysctl away. Dump image `out/ram-k273-wm3-dump` (sha256
+`976c5c408bb1a1ffcb69b0170f5af7a11ab833b85b9dcfae634422930f78da9a`). `piano-cwscan` and `tmo.sh` are beside the image.
