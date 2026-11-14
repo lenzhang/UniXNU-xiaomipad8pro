@@ -32,6 +32,7 @@
 #include <libkern/copyio.h>   // copyin / copyout of the requesting task's buffers
 #include <net/kpi_interfacefilter.h>
 #include <sys/kern_event.h>
+#include <sys/sysctl.h>
 #include "WifiApple80211.h"
 
 // The KPI's private poster (Unsupported.exports): kev_msg_post refuses Apple's vendor code, which the apple80211 events carry.
@@ -72,7 +73,7 @@ class PianoWifi80211 : public IO80211Controller {
   thread_call_t fAttachCall = nullptr, fScanDoneCall = nullptr, fReportCall = nullptr;
   char fIfName[16] = {};
   unsigned fAttachTries = 0;
-  bool fSubtypeTaken = false, fRegistered = false;
+  bool fSubtypeTaken = false, fRegistered = false, fSysctl = false;
   // counters (under fLock)
   uint64_t fRequests = 0, fUnknown = 0, fEvents = 0, fEventErrors = 0, fListRefreshes = 0, fOtherIoctls = 0;
   uint64_t fReported = ~0ull;
@@ -95,6 +96,7 @@ class PianoWifi80211 : public IO80211Controller {
   void scanStarted();
   void noteOtherIoctl(unsigned long cmd);
   void report(const char *why);
+
   void arm(thread_call_t call, unsigned ms)
   {
     uint64_t deadline = 0;
@@ -108,6 +110,9 @@ class PianoWifi80211 : public IO80211Controller {
 
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
+  uint32_t acceptMode();
+  static int sysctlAccept(struct sysctl_oid *, void *, int, struct sysctl_req *req);
+  void setAcceptMode(uint32_t mode, const char *why);
   bool start(IOService *provider) override;
   void stop(IOService *provider) override;
 };
@@ -126,6 +131,48 @@ void note80211(const char *fmt, ...)
   vsnprintf(line, sizeof line, fmt, ap);
   va_end(ap);
   IOLog("PianoWifi80211: %s\n", line);
+}
+// machdep.piano_wifi_a80211 (root to write): the accept mode, read and set at run time. Filled in at run time rather than by
+// SYSCTL_OID's static initializer: its parent and handler are signed pointers on arm64e (PianoWifi.cpp's pattern).
+PianoWifi80211 *volatile gA80211;
+struct sysctl_oid gA80211Oid;
+}  // namespace
+
+SYSCTL_DECL(_machdep);
+
+int PianoWifi80211::sysctlAccept(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+  PianoWifi80211 *self = gA80211;
+  int value = self ? int(self->acceptMode()) : -1;
+  int err = SYSCTL_OUT(req, &value, sizeof value);
+  if (err || !req->newptr) return err;
+  int incoming = 0;
+  err = SYSCTL_IN(req, &incoming, sizeof incoming);
+  if (err) return err;
+  if (!self) return ENODEV;
+  self->setAcceptMode(uint32_t(incoming), "machdep.piano_wifi_a80211");
+  return 0;
+}
+
+namespace {
+void registerAcceptSysctl(PianoWifi80211 *self)
+{
+  gA80211 = self;
+  bzero(&gA80211Oid, sizeof gA80211Oid);
+  gA80211Oid.oid_parent = &sysctl__machdep_children;
+  gA80211Oid.oid_number = OID_AUTO;
+  gA80211Oid.oid_kind = int(CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2);
+  gA80211Oid.oid_name = "piano_wifi_a80211";
+  gA80211Oid.oid_handler = PianoWifi80211::sysctlAccept;
+  gA80211Oid.oid_fmt = "I";
+  gA80211Oid.oid_descr = "PianoWifi80211's accept mode for apple80211 requests without a layout (docs/drivers/wifi-menu.md 6)";
+  gA80211Oid.oid_version = SYSCTL_OID_VERSION;
+  sysctl_register_oid(&gA80211Oid);
+}
+void unregisterAcceptSysctl()
+{
+  sysctl_unregister_oid(&gA80211Oid);
+  gA80211 = nullptr;
 }
 }  // namespace
 
@@ -165,6 +212,8 @@ bool PianoWifi80211::start(IOService *provider)
     return false;
   }
   reset(*fState);
+  uint32_t accept = 0;
+  if (PE_parse_boot_argn("piano-wifi-apple80211-accept", &accept, sizeof accept)) fState->accept = accept;
   if (!IO80211Controller::start(provider)) return false;   // PianoWifiEthernet: the interface, its data path, the link down
   IOEthernetAddress mac = {};
   getHardwareAddress(&mac);
@@ -180,6 +229,10 @@ bool PianoWifi80211::start(IOService *provider)
   setProperty("piano-wifi-apple80211", true);
   note80211("started (piano-wifi-apple80211=1): %u network(s) in PianoWifi's scan list%s; waiting for the BSD interface",
             unsigned(networks), fWifi ? "" : " (PianoWifi not found: no scan list)");
+  registerAcceptSysctl(this);
+  fSysctl = true;
+  note80211("accept mode %#x (machdep.piano_wifi_a80211 changes it at run time: 0x1 INFRA_ENUMERATED set, 0x2 any other set, "
+            "0x4 any other get zeroed, 0x8 VIRTUAL_IF_ROLE answered)", unsigned(fState->accept));
   arm(fAttachCall, kAttachTickMs);
   return true;
 }
@@ -276,8 +329,9 @@ errno_t PianoWifi80211::apple80211(bool set, pianowifi::a80211::Req &rq)
     char extra[64] = "";
     if (scanSet) snprintf(extra, sizeof extra, "; %u network(s)%s", unsigned(networks), directed ? ", a directed scan" : "");
     else if (type == kScanResult && !set) snprintf(extra, sizeof extra, "; cursor %u of %u", unsigned(cursor), unsigned(networks));
-    note80211("%s: %s %d %s len %u val %d -> %d (wrote %u, len %u, val %d)%s", fIfName, set ? "set" : "get", int(type),
-              requestName(type), unsigned(length), int(value), a.error, unsigned(a.wrote), unsigned(rq.length), int(rq.value), extra);
+    note80211("%s: %s %d %s len %u val %d -> %d (wrote %u, len %u, val %d)%s%s", fIfName, set ? "set" : "get", int(type),
+              requestName(type), unsigned(length), int(value), a.error, unsigned(a.wrote), unsigned(rq.length), int(rq.value), extra,
+              a.accepted ? " [accept mode]" : "");
   }
   if (a.effects & kDoPowerChanged) {
     note80211("%s: POWER set %s by airportd (M1: scans %s; the chip stays up)", fIfName, power ? "on" : "off",
@@ -390,6 +444,26 @@ void PianoWifi80211::noteOtherIoctl(unsigned long cmd)
               (cmd >> 16) & 0x1fff);
 }
 
+uint32_t PianoWifi80211::acceptMode()
+{
+  IOLockLock(fLock);
+  const uint32_t mode = fState->accept;
+  IOLockUnlock(fLock);
+  return mode;
+}
+
+// A new accept mode: the kind table starts again, so the log shows every kind airportd asks from now on with the new answers.
+void PianoWifi80211::setAcceptMode(uint32_t mode, const char *why)
+{
+  IOLockLock(fLock);
+  const uint32_t was = fState->accept;
+  fState->accept = mode & 0xf;
+  fSeen->clear();
+  IOLockUnlock(fLock);
+  note80211("%s: accept mode %#x (was %#x, %s): every request kind is logged again from here", fIfName, unsigned(mode & 0xf),
+            unsigned(was), why);
+}
+
 void PianoWifi80211::report(const char *why)
 {
   IOLockLock(fLock);
@@ -397,6 +471,7 @@ void PianoWifi80211::report(const char *why)
   const uint32_t kinds = fSeen->count, overflow = fSeen->overflow, scans = fState->scanRequests, results = fState->resultsServed;
   const uint32_t ends = fState->listEnds, networks = fState->scan.count, powerSets = fState->powerSets;
   const bool power = fState->power;
+  const uint32_t accept = fState->accept, accepted = fState->acceptedUnknown;
   const uint64_t stamp = requests + events + other;
   const bool changed = stamp != fReported;
   fReported = stamp;
@@ -412,11 +487,12 @@ void PianoWifi80211::report(const char *why)
     }
     it->release();
   }
-  note80211("%s (%s): %llu request(s) of %u kind(s)%s, %llu unknown; %u scan(s), %u result(s) served, %u list end(s), %u "
-            "network(s); power %s (%u set(s)); %llu event(s), %llu refused; %llu other ioctl(s); the controller's clients: %u (%s)",
-            fIfName, why, requests, unsigned(kinds), overflow ? " (the kind table is full)" : "", unknown, unsigned(scans),
-            unsigned(results), unsigned(ends), unsigned(networks), power ? "on" : "off", unsigned(powerSets), events, eventErrors,
-            other, clients, names);
+  note80211("%s (%s): %llu request(s) of %u kind(s)%s, %llu unknown; accept mode %#x (%u answered by it); %u scan(s), %u "
+            "result(s) served, %u list end(s), %u network(s); power %s (%u set(s)); %llu event(s), %llu refused; %llu other "
+            "ioctl(s); the controller's clients: %u (%s)",
+            fIfName, why, requests, unsigned(kinds), overflow ? " (the kind table is full)" : "", unknown, unsigned(accept),
+            unsigned(accepted), unsigned(scans), unsigned(results), unsigned(ends), unsigned(networks), power ? "on" : "off",
+            unsigned(powerSets), events, eventErrors, other, clients, names);
 }
 
 void PianoWifi80211::reportTick(thread_call_param_t p, thread_call_param_t)
@@ -430,6 +506,8 @@ void PianoWifi80211::reportTick(thread_call_param_t p, thread_call_param_t)
 void PianoWifi80211::stop(IOService *provider)
 {
   fStopping = true;
+  if (fSysctl) unregisterAcceptSysctl();
+  fSysctl = false;
   if (fAttachCall) thread_call_cancel_wait(fAttachCall);
   if (fScanDoneCall) thread_call_cancel_wait(fScanDoneCall);
   if (fReportCall) thread_call_cancel_wait(fReportCall);

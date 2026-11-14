@@ -171,13 +171,43 @@ int main()
     CHECK(a.error == 0 && std::memcmp(r.at(0), "XX", 3) == 0 && r.rq.length == 3);
     // unknown requests, both ways
     CHECK(r.ask(false, kInfraEnumerated, 16).error == kErrUnsupported);
-    CHECK(r.ask(false, kVirtualIfRole, 8).error == kErrUnsupported);   // the infrastructure interface is not a virtual one
-    CHECK(r.ask(true, kInfraEnumerated, 8).error == kErrUnsupported);  // airportd ignores this set's result
+    CHECK(r.ask(false, kVirtualIfRole, 0, false).error == kErrUnsupported);   // the infrastructure interface is not a virtual one
+    Answer e = r.ask(true, kInfraEnumerated, 1);                               // accepted by default (kAcceptInfraEnumerated)
+    CHECK(e.error == 0 && e.accepted && r.st.acceptedUnknown == 1);
     CHECK(r.ask(true, kAssociate, 656).error == kErrUnsupported);
     CHECK(r.ask(true, kCipherKey, 148).error == kErrUnsupported);
     CHECK(r.ask(false, 9999, 16).error == kErrUnsupported);
     // accepted sets that change nothing
     CHECK(r.ask(true, kCountryCode, 8).error == 0 && r.ask(true, kPowerSave, 8).error == 0);
+  }
+
+  // ---- the accept modes: unknown sets accepted, unknown gets zeroed at their own length (in pieces), VIRTUAL_IF_ROLE answered
+  {
+    Rig r;
+    CHECK(r.st.accept == kAcceptDefault);
+    CHECK(r.ask(true, 85, 2068).error == kErrUnsupported && r.ask(false, 115, 2600).error == kErrUnsupported);
+    r.st.accept = kAcceptDefault | kAcceptUnknownSets;
+    Answer a = r.ask(true, 85, 2068);
+    CHECK(a.error == 0 && a.accepted);
+    CHECK(r.ask(false, 115, 2600).error == kErrUnsupported);   // gets still refused
+    r.st.accept |= kAcceptUnknownGets;
+    std::memset(r.user.mem.data(), 0xa5, 4096);
+    a = r.ask(false, 115, 2600);
+    CHECK(a.error == 0 && a.accepted && a.wrote == 2600 && r.at(0)[0] == 0 && r.at(2599)[0] == 0 && r.at(2600)[0] == 0xa5);
+    a = r.ask(false, 353, 0, false);
+    CHECK(a.error == 0 && r.rq.value == 0);
+    CHECK(r.ask(false, kVirtualIfRole, 0, false).error == kErrUnsupported);   // not by kAcceptUnknownGets
+    r.st.accept |= kAcceptVirtualRole;
+    a = r.ask(false, kVirtualIfRole, 0, false);
+    CHECK(a.error == 0 && a.accepted && r.rq.value == 0);
+    // the handlers of ours and the join's sets (M2) are not changed by any mode
+    CHECK(r.ask(false, kRssi, 52).error == kErrNotAssociated && r.ask(true, kAssociate, 656).error == kErrUnsupported);
+    r.st.accept = 0;
+    CHECK(r.ask(true, kInfraEnumerated, 1).error == kErrUnsupported && r.ask(true, kAssociate, 656).error == kErrUnsupported);
+    Seen seen;
+    CHECK(seen.first(85, true, 2068, 0) && !seen.first(85, true, 2068, 0));
+    seen.clear();
+    CHECK(seen.count == 0 && seen.first(85, true, 2068, 0));
   }
 
   // ---- channels: the 22 this station scans, each with its band

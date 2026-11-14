@@ -326,6 +326,16 @@ inline void fillScanResult(ScanResult &r, const Bss &b)
 }
 
 // ----------------------------------------------------------------------------------------------------------- the handler
+// The accept modes (machdep.piano_wifi_a80211, piano-wifi-apple80211-accept=N): what the requests airportd asks on the tablet,
+// whose layouts we do not have, get. Each one switchable at run time, so one boot compares them (docs/drivers/wifi-menu.md 6).
+enum : uint32_t {
+  kAcceptInfraEnumerated = 0x1,   // INFRA_ENUMERATED (512) set: accepted (airportd's own value; its result was found ignored)
+  kAcceptUnknownSets = 0x2,       // any other set without a handler: accepted (0), the value ignored
+  kAcceptUnknownGets = 0x4,       // any other get without a handler: a zeroed buffer of the asked length (0 in req_val without one)
+  kAcceptVirtualRole = 0x8,       // VIRTUAL_IF_ROLE (96) get: 0 in req_val (else refused: an answer may make the interface virtual)
+};
+constexpr uint32_t kAcceptDefault = kAcceptInfraEnumerated;
+
 // The interface's apple80211 state (one per interface; the kext keeps it under its lock). No pointer in it: the kext keeps it in
 // a data allocation.
 struct State {
@@ -336,6 +346,8 @@ struct State {
   uint8_t mac[6] = {};
   char country[3] = {'X', 'X', 0};   // the world domain: the list keeps no Country element
   uint32_t scanRequests = 0, resultsServed = 0, listEnds = 0, powerSets = 0;
+  uint32_t accept = kAcceptDefault;   // kAccept*: how requests without a layout of ours are answered (a runtime switch, M1b)
+  uint32_t acceptedUnknown = 0;   // requests answered only because of `accept`
 };
 
 // A state as a fresh interface has it, in place (the kext's is a zeroed data allocation, too large for a temporary on the stack).
@@ -346,6 +358,7 @@ inline void reset(State &s)
   s.power = true;
   s.country[0] = 'X';
   s.country[1] = 'X';
+  s.accept = kAcceptDefault;
 }
 
 // The identity strings (the kext's; the host test passes its own).
@@ -366,6 +379,7 @@ struct Answer {
   int error = 0;           // the ioctl's result (0 or an errno)
   uint32_t effects = 0;    // kDo*
   uint32_t wrote = 0;      // bytes copied out (the log line's "wrote")
+  bool accepted = false;   // answered by an accept mode, not by a handler of ours
 };
 
 // The user-space copies (copyin/copyout in the kext, memcpy in the host test); each returns 0 or an errno.
@@ -415,6 +429,23 @@ inline int bytes(Req &rq, const UserIo &io, const void *src, uint32_t size, Answ
   const int e = n ? io.copyOut(io.ctx, src, rq.data, n) : 0;
   if (!e) a.wrote = n;
   return e ? kErrFault : 0;
+}
+// A zeroed answer of the asked length (kAcceptUnknownGets), in scratch-sized pieces; 0 in req_val when no buffer is given.
+inline int zeros(Req &rq, const UserIo &io, uint8_t *scratch, uint32_t scratchBytes, Answer &a)
+{
+  if (rq.length == 0 || !rq.data) {
+    rq.value = 0;
+    return 0;
+  }
+  zero(scratch, scratchBytes);
+  const uint32_t total = clip(rq.length, 64 * 1024);
+  for (uint32_t at = 0; at < total;) {
+    const uint32_t n = clip(total - at, scratchBytes);
+    if (io.copyOut(io.ctx, scratch, rq.data + at, n)) return kErrFault;
+    at += n;
+  }
+  a.wrote = total;
+  return 0;
 }
 inline int copyIn(const Req &rq, const UserIo &io, void *dst, uint32_t size)
 {
@@ -484,7 +515,28 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     case kLocale:
     case kPowerSave:
       return a;   // accepted, nothing to change in M1
+    case kAssociate:
+    case kDisassociate:
+    case kDeauth:
+    case kCipherKey:
+    case kAuthType:
+    case kRsnIe:
+      a.error = kErrUnsupported;   // the join's sets: M2, never accepted by a mode
+      return a;
+    case kInfraEnumerated:
+      if (s.accept & kAcceptInfraEnumerated) {
+        a.accepted = true;
+        ++s.acceptedUnknown;
+        return a;
+      }
+      a.error = kErrUnsupported;
+      return a;
     default:
+      if (s.accept & kAcceptUnknownSets) {
+        a.accepted = true;
+        ++s.acceptedUnknown;
+        return a;
+      }
       a.error = kErrUnsupported;
       return a;
     }
@@ -546,7 +598,13 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
   case kAssociateResult:
     a.error = value(rq, io, 0, a);   // pending: nothing was asked
     return a;
-  case kVirtualIfRole:   // an answer would make airportd take the interface for a virtual one: the infrastructure one has none
+  case kVirtualIfRole:   // an answer may make airportd take the interface for a virtual one: refused unless kAcceptVirtualRole
+    if (s.accept & kAcceptVirtualRole) {
+      a.accepted = true;
+      ++s.acceptedUnknown;
+      a.error = value(rq, io, 0, a);
+      return a;
+    }
     a.error = kErrUnsupported;
     return a;
   case kAuthType:
@@ -582,6 +640,12 @@ inline Answer handle(State &s, const Identity &id, bool set, Req &rq, const User
     return a;
   }
   default:
+    if (s.accept & kAcceptUnknownGets) {
+      a.accepted = true;
+      ++s.acceptedUnknown;
+      a.error = zeros(rq, io, scratch, kScratchBytes, a);
+      return a;
+    }
     a.error = kErrUnsupported;
     return a;
   }
@@ -603,6 +667,11 @@ struct Seen {
   static constexpr uint32_t kMax = 192;
   uint64_t keys[kMax] = {};
   uint32_t count = 0, overflow = 0;
+  void clear()
+  {
+    for (uint32_t i = 0; i < kMax; ++i) keys[i] = 0;
+    count = overflow = 0;
+  }
   // true the first time a kind is seen (and remembered); false after (and when the table is full: counted in overflow)
   bool first(int32_t type, bool set, uint32_t length, int error)
   {

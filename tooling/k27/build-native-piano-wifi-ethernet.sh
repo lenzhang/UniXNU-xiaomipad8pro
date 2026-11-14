@@ -20,7 +20,7 @@ python3 "$D/tooling/k27/build-native-kext.py" PianoWifiEthernet "$D/package/Pian
   "$D/tooling/k27/NativeKextGlue.cpp" -I "$K/out/x12377/inc-net-piano" --obj "${K27_OBJ:-k27-native-obj}"
 # PianoWifi80211's entries run on a requesting process's kernel stack (the ioctl, airportd's: 16 KiB with the syscall's and the
 # network stack's frames above ours) and on thread calls: at most 3 KiB of our own frames each.
-for entry in filterIoctl attachTick scanDoneTick reportTick; do
+for entry in filterIoctl attachTick scanDoneTick reportTick sysctlAccept; do
   python3 "$D/tooling/k27/check-kext-stack.py" "$O/PianoWifiEthernet.o" "$entry" --max 3072 --brief --indirect userIn,userOut >&2
 done
 KERNEL=${K27_KERNEL:-$K/out/k27/kernel-k27-0059-native.macho}
