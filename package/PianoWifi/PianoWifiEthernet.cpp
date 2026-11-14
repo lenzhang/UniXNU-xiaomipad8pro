@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // PianoWifiEthernet: the macOS side of the Wi-Fi path as docs/drivers/wifi.md section 5.2 B settles it — **an Ethernet-like
-// interface, not a Wi-Fi one**. This is the skeleton of it: an IOEthernetController that publishes `en1` (built in, not the
-// primary interface) with its **link down**, carrying the networks PianoWifi's level 6 scan found as the registry property
-// `piano-wifi-scan`. No frame flows through it yet: a station has to associate first, which is levels 7 and 8.
+// interface, not a Wi-Fi one**: an IOEthernetController that publishes the interface (en0 on the 27.3 line, boot 10b; en1 where
+// PianoNullEthernet takes en0), built in, carrying the networks PianoWifi's level 6 scan found as the registry property
+// `piano-wifi-scan`. With PianoWifi's level 8 it carries the station's frames (802.3 both ways) through PianoWifi's network
+// boundary (PianoWifiNet.h): it attaches with piano_wifi_net_attach, its output goes to piano_wifi_net_send, PianoWifi's thread
+// hands it the received frames and the link's state (up once the port is authorized, down when the association ends). EAPOL
+// frames never come here: they are the 802.1X port's (docs §13.7).
 //
 // Why a separate kext: the controller needs IONetworkingFamily, and PianoWifi — which owns the chip, the rails and the DMA
 // window — needs nothing of it. This one has no hardware of its own: it matches the resource `PianoWifiLink`, which PianoWifi
 // publishes only when level 6 came up, so without `piano-wifi=6` (or when the level failed) macOS never sees the interface.
-// Its shape is PianoNullEthernet's, which is already vtable-checked in this collection (tooling/k27/kext/
-// PianoWifiEthernet.json carries the same check).
+// It links against PianoWifi (a library dependency) for the three boundary functions. Its shape is PianoNullEthernet's, which
+// is already vtable-checked in this collection (tooling/k27/kext/PianoWifiEthernet.json carries the same check).
 //
-// The address: this unit's own is in the `persist` partition (never logged, never committed), and the firmware's ready event
-// reports zeros on this chip. Until the read-at-run-time path of section 13.1 is built, the interface takes the locally
-// administered address below, which is piano's own made-up one and is not the unit's. When PianoWifi does publish an address
-// (the property `piano-wifi-mac`, from the firmware's ready event when it is not all zeros), this driver uses that instead.
+// The address: the interface takes the virtual device's (PianoWifi's property `piano-wifi-mac`), which the station's frames
+// carry as their source; until that is there it keeps the locally administered address below, piano's own made-up one and
+// not the unit's (the unit's own is in the `persist` partition, never logged, never committed).
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
+#include <sys/errno.h>
+#include <sys/kpi_mbuf.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-anon-enum-enum-conversion"   // the family's headers mix anonymous enums
 #define __PRIVATE_SPI__   // the shipped family uses IONetworkController's reserved slots 2-5, as PianoNullEthernet does
@@ -24,9 +28,10 @@
 #include <IOKit/network/IONetworkMedium.h>
 #include <IOKit/network/IOOutputQueue.h>   // kIOReturnOutputDropped
 #pragma clang diagnostic pop
+#include "PianoWifiNet.h"
 
 namespace {
-constexpr UInt64 kLinkSpeed = 150 * 1000000ULL;      // what a 2.4 GHz link of this chip reaches; the link is down regardless
+constexpr UInt64 kLinkSpeed = 150 * 1000000ULL;      // what a 2.4 GHz link of this chip reaches; macOS shows it, nothing more
 constexpr uint64_t kWaitNs = 2ULL * 1000 * 1000 * 1000;
 
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -45,13 +50,17 @@ class PianoWifiEthernet : public IOEthernetController {
   OSDeclareDefaultStructors(PianoWifiEthernet)
 
   IOEthernetInterface *fInterface = nullptr;
+  IONetworkMedium *fMedium = nullptr;
   // Locally administered, "PIAN"; not the unit's own. The same as WifiHw.h kLocalMac, the virtual device's address when the
-  // firmware reports none: en1 must carry the station's address (a frame from it with another source address is the
-  // firmware's to drop). PianoWifi publishes the address the device really took as piano-wifi-mac, which wins.
+  // firmware reports none. PianoWifi publishes the address the device really took as piano-wifi-mac, which wins.
   IOEthernetAddress fAddress = {{0x02, 0x50, 0x49, 0x41, 0x4e, 0x01}};
-  UInt64 fTxDrops = 0;
+  bool fAttached = false, fLinkUp = false;
+  UInt64 fTxFrames = 0, fTxDrops = 0, fRxFrames = 0, fRxDrops = 0, fLinkChanges = 0;
+  uint8_t fTxBuffer[PIANO_WIFI_NET_FRAME_MAX];   // one output at a time (the family serializes outputPacket)
 
   void takeScanList(IOService *wifi);
+  static void netInput(void *ctx, const uint8_t *frame, uint32_t length);
+  static void netLink(void *ctx, int up, const uint8_t *mac);
 
  public:
   bool start(IOService *provider) override;
@@ -64,13 +73,7 @@ class PianoWifiEthernet : public IOEthernetController {
   IOReturn enable(IONetworkInterface *) override { return kIOReturnSuccess; }
   IOReturn disable(IONetworkInterface *) override { return kIOReturnSuccess; }
   UInt32 getFeatures() const override { return kIONetworkFeatureNoBSDWait; }
-  // Nothing is associated, so nothing can be carried: every frame is dropped and counted (the counter is in the registry).
-  UInt32 outputPacket(mbuf_t packet, void *) override
-  {
-    ++fTxDrops;
-    freePacket(packet);
-    return kIOReturnOutputDropped;
-  }
+  UInt32 outputPacket(mbuf_t packet, void *) override;
   IOReturn setPromiscuousMode(bool) override { return kIOReturnSuccess; }
   IOReturn setMulticastMode(bool) override { return kIOReturnSuccess; }
   IOReturn setMulticastList(IOEthernetAddress *, UInt32) override { return kIOReturnSuccess; }
@@ -104,6 +107,63 @@ void PianoWifiEthernet::takeScanList(IOService *wifi)
   }
 }
 
+// A received frame, on PianoWifi's thread (one at a time): into an mbuf of the family's and up the stack.
+void PianoWifiEthernet::netInput(void *ctx, const uint8_t *frame, uint32_t length)
+{
+  auto *self = static_cast<PianoWifiEthernet *>(ctx);
+  if (!self || !self->fInterface || !frame || length < 14 || length > PIANO_WIFI_NET_FRAME_MAX) return;
+  mbuf_t m = self->allocatePacket(length);
+  if (!m) {
+    ++self->fRxDrops;
+    return;
+  }
+  if (mbuf_copyback(m, 0, length, frame, MBUF_DONTWAIT) != 0) {
+    self->freePacket(m);
+    ++self->fRxDrops;
+    return;
+  }
+  self->fInterface->inputPacket(m, length);
+  ++self->fRxFrames;
+}
+
+// The link's state, on PianoWifi's thread (and once from the attach).
+void PianoWifiEthernet::netLink(void *ctx, int up, const uint8_t *mac)
+{
+  auto *self = static_cast<PianoWifiEthernet *>(ctx);
+  if (!self) return;
+  const bool now = up != 0;
+  if (mac && now) {
+    bool same = true;
+    for (unsigned i = 0; i < 6; ++i) same = same && mac[i] == self->fAddress.bytes[i];
+    if (!same) note("the station's address is not the interface's: its frames would carry the wrong source (the interface "
+                    "keeps its own; docs §13.7)");
+  }
+  if (now == self->fLinkUp) return;
+  self->fLinkUp = now;
+  ++self->fLinkChanges;
+  self->setLinkStatus(now ? (kIONetworkLinkValid | kIONetworkLinkActive) : kIONetworkLinkValid, self->fMedium,
+                      now ? kLinkSpeed : 0);
+  note("the link is %s (PianoWifi's port %s)", now ? "up" : "down", now ? "is authorized" : "closed: the association ended");
+}
+
+UInt32 PianoWifiEthernet::outputPacket(mbuf_t packet, void *)
+{
+  size_t length = 0;
+  for (mbuf_t at = packet; at; at = mbuf_next(at)) length += mbuf_len(at);
+  int rc = EMSGSIZE;
+  if (fLinkUp && length >= 14 && length <= sizeof fTxBuffer && mbuf_copydata(packet, 0, length, fTxBuffer) == 0)
+    rc = piano_wifi_net_send(fTxBuffer, uint32_t(length));
+  else if (!fLinkUp)
+    rc = ENETDOWN;
+  freePacket(packet);
+  if (rc) {
+    ++fTxDrops;
+    return kIOReturnOutputDropped;
+  }
+  ++fTxFrames;
+  return kIOReturnOutputSuccess;
+}
+
 bool PianoWifiEthernet::start(IOService *provider)
 {
   if (!IOEthernetController::start(provider)) return false;
@@ -125,29 +185,40 @@ bool PianoWifiEthernet::start(IOService *provider)
   }
   media->release();
   setSelectedMedium(medium);
-  // The interface exists and is valid, but there is no link: macOS shows it down and routes nothing over it until a later
-  // level associates (and then this is where setLinkStatus gains kIONetworkLinkActive).
+  fMedium = medium;   // kept for the link's changes (released in stop)
+  // The interface exists and is valid, but there is no link until PianoWifi's port is authorized.
   setLinkStatus(kIONetworkLinkValid, medium, 0);
-  medium->release();
   if (!attachInterface(reinterpret_cast<IONetworkInterface **>(&fInterface), false)) {
     note("cannot attach the interface");
     return false;
   }
-  // Built in, but not the primary interface: PianoNullEthernet stays en0 for TimeSync (wifi.md section 5.3), so this is en1.
   fInterface->setProperty(kIOBuiltin, true);
   fInterface->registerService(kIOServiceSynchronous);
-  note("en%u published (built in, link down: the station of levels 7 and 8 is what brings it up); the scan list is the "
-       "property piano-wifi-scan (tooling/native/piano-wifi prints it)",
-       fInterface->getUnitNumber());
+  // PianoWifi's network boundary: from here its thread may hand frames and the link's state to this driver.
+  piano_wifi_net_client client;
+  bzero(&client, sizeof client);
+  client.version = PIANO_WIFI_NET_VERSION;
+  client.ctx = this;
+  client.input = &PianoWifiEthernet::netInput;
+  client.link = &PianoWifiEthernet::netLink;
+  const int rc = piano_wifi_net_attach(&client);
+  fAttached = rc == 0;
+  note("en%u published (built in, link down until the station's port is authorized); PianoWifi's data path %s; the scan list "
+       "is the property piano-wifi-scan (tooling/native/piano-wifi prints it)",
+       fInterface->getUnitNumber(), fAttached ? "attached" : rc == ENODEV ? "not there (below level 6)" : "refused the attach");
   return true;
 }
 
 void PianoWifiEthernet::stop(IOService *provider)
 {
-  if (fTxDrops) note("%llu frame(s) were dropped: nothing is associated yet", fTxDrops);
+  if (fAttached) piano_wifi_net_detach(this);   // returns when no callback of ours runs
+  fAttached = false;
+  note("%llu frame(s) sent, %llu dropped; %llu received, %llu dropped; %llu link change(s)", fTxFrames, fTxDrops, fRxFrames,
+       fRxDrops, fLinkChanges);
   if (fInterface) {
     detachInterface(fInterface);
     OSSafeReleaseNULL(fInterface);
   }
+  OSSafeReleaseNULL(fMedium);
   IOEthernetController::stop(provider);
 }

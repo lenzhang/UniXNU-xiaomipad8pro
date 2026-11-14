@@ -3198,7 +3198,7 @@ PortResult gPortResult[kPortResults];
 unsigned gPortResultHead, gPortResultTail;
 // The ladder's own (no lock: only its thread).
 struct Level8 {
-  bool on = false, selectionSent = false, txUp = false, authorizedSent = false, linkUpTold = false;
+  bool on = false, selectionSent = false, live = false, txUp = false, linkUpTold = false;
   uint32_t selectionTries = 0, selections = 0;
   uint64_t associatedAt = 0, firstRxAt = 0, firstEapolAt = 0, lastStatus = 0;
   uint32_t eapolLogged = 0, eapolToPort = 0, eapolDropped = 0, eapolNotFromAp = 0, eapolMsg[7] = {};
@@ -3291,7 +3291,7 @@ errno_t portSend(kern_ctl_ref, u_int32_t unit, void *, mbuf_t m, int)
     if (!live) status = ENOTCONN;
     else if (stale) status = ESTALE;
     else {
-      uint8_t frame[14 + PIANO_WIFI_8021X_EAPOL_MAX];
+      static uint8_t frame[14 + PIANO_WIFI_8021X_EAPOL_MAX];   // under gPortLock, as the message buffer
       const uint32_t length = netEapolFrame(frame, sizeof frame, link.own, link.bssid, r.pdu, r.pduLength);
       IOLockLock(gTxLock);
       const bool queued = length && netQueuePut(gTxQueue, frame, length, true);
@@ -3624,12 +3624,16 @@ void level8Deliver(uint32_t kind, const uint8_t *frame, uint32_t length, uint64_
 // The association's state, as the join machine has it, into the data path, en0 and the port.
 void level8Follow(uint64_t now)
 {
-  const bool associated = gSta.vdevUp && !gSta.disconnect && (gSta.step == kStaAssociated || gSta.step == kStaAuthorize);
-  if (associated && !gL8.txUp) {
-    gL8.txUp = true;
-    gL8.associatedAt = gSta.associatedAt ? gSta.associatedAt : now;
-    const HttPeerMap *peer = httPeerMapOf(gHtt, gLink.options.vdevId, gSta.bssid);
-    if (gArgs.l8 & kL8Tx) dpTxSetupPeer(gDp, gChipIo, gLink.options.vdevId, kDpPdevSingle, peer);
+  // Live from the association's answer on: the access point sends message 1 of the handshake right after it, before the
+  // peer's association and the station's up have gone out, and the port must have the association's generation by then. The
+  // transmit side waits for the station's up (a frame before it is the firmware's to drop): EAPOL_TX frames wait in the queue.
+  const bool live = gSta.assocAnswered && gSta.assocStatus == kDot11StatusSuccess && !gSta.disconnect &&
+                    (gSta.step == kStaPeerAssoc || gSta.step == kStaVdevUp || gSta.step == kStaAuthorize ||
+                     gSta.step == kStaAssociated);
+  const bool up = live && gSta.vdevUp;
+  if (live && !gL8.live) {
+    gL8.live = true;
+    gL8.associatedAt = now;
     IOLockLock(gNetLock);
     ++gNetLink.generation;
     for (unsigned i = 0; i < 6; ++i) {
@@ -3641,26 +3645,34 @@ void level8Follow(uint64_t now)
     IOLockLock(gPortLock);
     netKeysReset(gKeys);
     IOLockUnlock(gPortLock);
-    netLinkSnapshot(PIANO_WIFI_8021X_STATE_ASSOCIATED, gDp.txReady, false);
-    note("level 8: the station's data path is up (generation %u): the transmit side %s (bank %#x, search index %s), %s",
-         generation, gDp.txReady ? "ready" : "off (piano-wifi-l8 bit 4)", kDpBankStation,
-         peer && peer->hasSearch ? "from the peer map" : "0: the peer map carried none",
+    netLinkSnapshot(PIANO_WIFI_8021X_STATE_ASSOCIATED, true, false);
+    note("level 8: the association is live for the data path (generation %u, AID %u): %s", generation, gSta.aid,
          gSta.rsn ? "the port is closed until the 802.1X client authorizes it (the four-way handshake)"
-                  : "an open network: the port opens at once");
+                  : "an open network: the port opens once the station is up");
     gL8.lastState = PIANO_WIFI_8021X_STATE_ASSOCIATED;
     portSendLink(PIANO_WIFI_8021X_STATE_ASSOCIATED);
     deferPhase();
   }
-  if (gL8.txUp && associated && gSta.authorized && !gL8.linkUpTold) {
+  if (up && !gL8.txUp) {
+    gL8.txUp = true;
+    const HttPeerMap *peer = httPeerMapOf(gHtt, gLink.options.vdevId, gSta.bssid);
+    if (gArgs.l8 & kL8Tx) dpTxSetupPeer(gDp, gChipIo, gLink.options.vdevId, kDpPdevSingle, peer);
+    note("level 8: the station is up %llu ms after the association: the transmit side %s (bank %#x, search index %s)",
+         (unsigned long long)(now - gL8.associatedAt), gDp.txReady ? "ready" : "off (piano-wifi-l8 bit 4)", kDpBankStation,
+         peer && peer->hasSearch ? "from the peer map" : "0: the peer map carried none");
+    deferPhase();
+  }
+  if (up && gSta.authorized && !gL8.linkUpTold) {
     gL8.linkUpTold = true;
-    netLinkSnapshot(PIANO_WIFI_8021X_STATE_AUTHORIZED, gDp.txReady, gDp.txReady);
+    netLinkSnapshot(PIANO_WIFI_8021X_STATE_AUTHORIZED, true, gDp.txReady);
     netTellLink(true);
     gL8.lastState = PIANO_WIFI_8021X_STATE_AUTHORIZED;
     portSendLink(PIANO_WIFI_8021X_STATE_AUTHORIZED);
     note("level 8: the port is open: en0's link is up%s", gNetAttached ? "" : " (en0 is not attached yet: it is told when it is)");
     deferPhase();
   }
-  if (gL8.txUp && !associated) {
+  if (gL8.live && !live) {
+    gL8.live = false;
     gL8.txUp = false;
     gL8.linkUpTold = false;
     gL8.lastReason = uint16_t(gSta.disconnectReason);
@@ -3701,7 +3713,7 @@ void level8Requests(uint64_t now)
   gPortLinkWanted = false;
   IOLockUnlock(gPortLock);
   if (linkWanted) portSendLink(gL8.lastState);
-  if (!gL8.txUp || gSta.outLength) return;   // the join's own command first
+  if (!gL8.txUp || gSta.outLength) return;   // keys and the authorization once the station is up; the join's own command first
   IOLockLock(gNetLock);
   const uint32_t generation = gNetLink.generation;
   IOLockUnlock(gNetLock);
@@ -3799,6 +3811,10 @@ void level8Transmit()
       IOLockUnlock(gTxLock);
       return;
     }
+    if (f->eapol && !gDp.txReady && gL8.live && (gArgs.l8 & kL8Tx)) {
+      IOLockUnlock(gTxLock);   // the station is not up yet: the frame waits for it
+      return;
+    }
     if (!gDp.txReady || (!f->eapol && !gSta.authorized)) {
       netQueuePop(gTxQueue, false);
       IOLockUnlock(gTxLock);
@@ -3816,11 +3832,12 @@ void level8Turn(uint64_t now)
 {
   if (!gL8.on) return;
   level8Selection();
+  level8Follow(now);   // the association's answer of this turn first: message 1 may be in the same turn's frames
   dpPoll(gDp, gChipIo, [&](uint32_t kind, const uint8_t *frame, uint32_t length) { level8Deliver(kind, frame, length, now); });
   level8Follow(now);
   level8Requests(now);
   level8Transmit();
-  if (gArgs.l8status && gL8.txUp && now >= gL8.lastStatus + gArgs.l8status) {
+  if (gArgs.l8status && gL8.live && now >= gL8.lastStatus + gArgs.l8status) {
     gL8.lastStatus = now;
     level8Status(now, "while associated");
   }
@@ -3829,7 +3846,8 @@ void level8Turn(uint64_t now)
 void level8End(IOService *owner, uint64_t now)
 {
   if (!gL8.on) return;
-  if (gL8.txUp) {
+  if (gL8.live) {
+    gL8.live = false;
     gL8.txUp = false;
     dpTxStop(gDp);
     netLinkSnapshot(PIANO_WIFI_8021X_STATE_IDLE, false, false);
