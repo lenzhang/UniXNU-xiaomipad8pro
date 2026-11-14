@@ -128,6 +128,7 @@ struct Args {
   uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step, l7file, l7cands;
   uint32_t l8, l8status, l8blocks, l8tracems;
   uint32_t sleepOff, rejoin, dropTest, clientWaitMs;
+  uint32_t restart, restartCap, crashTest;
 };
 Args gArgs;
 
@@ -261,7 +262,11 @@ void readArgs()
   // fails) the level ends, as before; by default at level 8 it joins again from the profile, after 2, 5, 10, 20, 30 and then
   // 60 s. piano-wifi-droptest=S: a test, S s after the port first opens the station drops its association itself (our own
   // deauthentication, as the access point's would), once, so that one unattended boot shows the rejoin.
-  gArgs.sleepOff = bootArg("piano-wifi-sleepoff", gArgs.level >= 8 ? 0 : 1);
+  // piano-wifi-sleepoff=2 (level 8's default since boot 10k, whose firmware died during a 60 s sleep with the radio kept on,
+  // as the chip's own host powers it down at a suspend): the radio is stopped and powered down at a system sleep and brought
+  // up again from level 2 at the wake (the restart below); 1 stops it until the next boot; 0 keeps it on (10k).
+  gArgs.sleepOff = bootArg("piano-wifi-sleepoff", gArgs.level >= 8 ? 2 : 1);
+  if (gArgs.sleepOff > 2) gArgs.sleepOff = gArgs.level >= 8 ? 2 : 1;
   gArgs.rejoin = bootArg("piano-wifi-rejoin", gArgs.level >= 8 ? 1 : 0);
   gArgs.dropTest = bootArg("piano-wifi-droptest", 0);
   if (gArgs.dropTest > 3600) gArgs.dropTest = 0;
@@ -271,6 +276,18 @@ void readArgs()
   // and the access point dropped us after 3.3 s (reason 15) while launchd was still respawning the supplicant.
   gArgs.clientWaitMs = bootArg("piano-wifi-clientwait", gArgs.level >= 8 ? 30000 : 0);
   if (gArgs.clientWaitMs > 600000) gArgs.clientWaitMs = 30000;
+  // The restart (level 8, after boot 10k): piano-wifi-restart=0 ends the ladder as before when the firmware dies or a level
+  // fails; by default the radio is powered down (WLAN_EN low, PERST# asserted, the rails given back) and the ladder runs again
+  // from level 2 after 1, 5, 15, 30, 60 and then 120 s, at most piano-wifi-restarts=N times in a row (6) without the port
+  // opening in between (then not until the next wake), and at once at the wake from a system sleep (piano-wifi-sleepoff=2).
+  // piano-wifi-crashtest=S: a test, S s after the port first opens on a pass a restart began, the chip is asked once for its
+  // crash dump environment (MHI's SoC reset request, as the MHI host forces a dump), so that one boot shows a crash's restart.
+  gArgs.restart = bootArg("piano-wifi-restart", gArgs.level >= 8 ? 1 : 0);
+  gArgs.restartCap = bootArg("piano-wifi-restarts", 6);
+  if (!gArgs.restartCap || gArgs.restartCap > 100) gArgs.restartCap = 6;
+  gArgs.crashTest = bootArg("piano-wifi-crashtest", 0);
+  if (gArgs.crashTest > 3600) gArgs.crashTest = 0;
+  if (gArgs.sleepOff == 2 && !(gArgs.level >= 8 && gArgs.restart)) gArgs.sleepOff = 1;   // no restart: nothing brings it back
 }
 
 uint64_t nowMs();
@@ -478,8 +495,13 @@ void levelBegin(uint32_t level, uint32_t ms)
   __atomic_store_n(&gLevelDeadline, nowMs() + ms, __ATOMIC_RELEASE);
 }
 void levelEnd() { __atomic_store_n(&gLevelDeadline, uint64_t(0), __ATOMIC_RELEASE); }
+extern volatile uint32_t gStopRequested;
+extern const char *volatile gStopWhy;
 bool levelLate()
 {
+  // A stop asked for (a suspend, a shutdown) ends every wait of levels 4 to 6 as their hard deadline does: a restart's bring-up
+  // that a system sleep interrupts gives the chip up at once (the power hook waits for the ladder to park the radio).
+  if (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE)) return true;
   const uint64_t deadline = __atomic_load_n(&gLevelDeadline, __ATOMIC_ACQUIRE);
   return deadline && nowMs() > deadline;
 }
@@ -1228,10 +1250,12 @@ PIANO_WCN_KERNEL_RAILS(gWcn, PianoWcnTagWifi, "PianoWifi", wcnVrm, hwPmic, nullp
 unsigned wcnPutOwners() { return piano_wcn_rails_put(&gWcn.rails, PIANO_WCN_WLAN | (gArgs.release ? unsigned(PIANO_WCN_RELEASE) : 0u)); }
 void wcnPut() { (void)wcnPutOwners(); }
 // A level from 3 up gave the chip up: the PCIe NoC's vote goes (PCIe0 is Wi-Fi's alone), the rails' owner bit with it.
+bool gChipHeld;   // level 2 came up and nothing has given the chip up since (the restart powers it down only then)
 void chipPut()
 {
   nocVote(false);
   wcnPut();
+  gChipHeld = false;
 }
 
 Options options()
@@ -2106,7 +2130,10 @@ int level4(const LinkState &link, PowerState &power, const Options &opt)
       if (!levelLate()) continue;
     }
     if (now - since > gArgs.fwTimeoutMs || levelLate()) {
-      if (levelLate()) note("level 4: the level's hard deadline (%u ms) passed in phase %s", gArgs.deadlineMs, mhiPhaseName(phase));
+      if (__atomic_load_n(&gStopRequested, __ATOMIC_ACQUIRE))
+        note("level 4: a stop was asked for (%s) in phase %s", gStopWhy, mhiPhaseName(phase));
+      else if (levelLate())
+        note("level 4: the level's hard deadline (%u ms) passed in phase %s", gArgs.deadlineMs, mhiPhaseName(phase));
       phase = mhiTimedOut(boot);
       break;
     }
@@ -3036,6 +3063,27 @@ void stopRadio(const char *why)
   }
 }
 
+// A system sleep with piano-wifi-sleepoff=2: the ladder's thread is asked to stop (every level's waits end, level 7 tears its
+// join down with 300 ms per answer), powers the radio down and parks; this waits for that (3.5 s at most, inside the power
+// hook's 4 s) and, should it not come, puts WLAN_EN low and PERST# asserted itself. The join profile is kept: the wake's
+// restart joins again from it.
+volatile uint32_t gParked;
+void parkRadio()
+{
+  gStopWhy = "suspend";
+  __atomic_store_n(&gStopRequested, 1u, __ATOMIC_SEQ_CST);
+  const uint64_t started = nowMs(), deadline = started + 3500;
+  while (!__atomic_load_n(&gParked, __ATOMIC_SEQ_CST) && nowMs() < deadline) IOSleep(10);
+  if (__atomic_load_n(&gParked, __ATOMIC_SEQ_CST)) {
+    IOLog("PianoWifi: power: the radio is parked for system sleep %u (%llu ms after the sleep's stop)\n", gSleeps,
+          (unsigned long long)(nowMs() - started));
+    return;
+  }
+  IOLog("PianoWifi: power: the ladder's thread did not park the radio within 3.5 s: WLAN_EN low and PERST# asserted from "
+        "here\n");
+  if (gPowerState && gWin[kWinTlmm].va) safeOff(gHw, *gPowerState, gPowerOptions);
+}
+
 // ------------------------------------------------------------------------------- level 7's join profile (docs §13.2)
 // machdep.piano_wifi_join: written once by root (the LaunchDaemon com.unixnu.piano-wifi-join, from the root-only file
 // /private/var/db/piano-wifi/profile) with a struct piano_wifi_profile; read by anyone as a status line of lengths only. No byte
@@ -3132,6 +3180,18 @@ StaDma gStaFrames[kAssocFrameBuffers];
 StaDma gStaReoq, gStaReoq2;      // the second for the rejoin: the queues of two peers in a row never share memory
 bool gL7EndedOnRequest;
 bool gStaPlanned;
+// The ladder's passes (level 8's restart, after boot 10k): the current one, and the restarts so far.
+struct PassEnd {
+  uint32_t pass = 0;
+  int level = 0;              // the level the pass reached
+  bool failed = false;        // that level failed
+  bool opened = false;        // the port opened on this pass (Wi-Fi was back)
+};
+PassEnd gPass;
+uint32_t gRestarts, gRestartRun, gRestartsWake, gRestartsCrash, gRestartsFail;   // gRestartRun: in a row, without a port open
+uint64_t gRestartBegan;
+const char *gRestartWhy = "";
+bool gLinkPublished, gDropDone, gCrashTestDone;
 
 bool profileOwnMac(uint8_t *mac)
 {
@@ -4139,6 +4199,91 @@ __attribute__((noinline)) bool clientWaitHold(uint64_t now, uint64_t &waitFrom, 
   return true;
 }
 
+// The port opened on this pass: once, the line that says Wi-Fi is back after a restart (and the registry's line); and the
+// crash test (piano-wifi-crashtest, once a boot, on a pass a restart began): the chip asked for its crash dump environment
+// through MHI's SoC reset request, as the MHI host forces a dump, so that the restart after a crash shows on one boot.
+__attribute__((noinline)) void restartTurn(IOService *owner, uint64_t now, uint64_t openedAt, bool stopping)
+{
+  PassEnd &e = gPass;
+  if (!e.opened) {
+    e.opened = true;
+    if (e.pass > 1) {
+      note("restart %u (%s): Wi-Fi is back: the port opened %llu ms after the restart began (pass %u)", gRestarts, gRestartWhy,
+           (unsigned long long)(now - gRestartBegan), e.pass);
+      char line[200];
+      snprintf(line, sizeof line, "restart %u (%s): the port opened %llu ms after it began", gRestarts, gRestartWhy,
+               (unsigned long long)(now - gRestartBegan));
+      owner->setProperty("piano-wifi-restart-last", line);
+    }
+  }
+  if (gArgs.crashTest && !gCrashTestDone && e.pass > 1 && !stopping && gSta.step == kStaAssociated &&
+      now >= openedAt + uint64_t(gArgs.crashTest) * 1000) {
+    gCrashTestDone = true;
+    note("level 7: the crash test (piano-wifi-crashtest=%u): the chip is asked for its crash dump environment now (MHI's SoC "
+         "reset request); the restart follows",
+         gArgs.crashTest);
+    barWr(nullptr, kMhiSocResetReq, kMhiSocResetReqBit);
+  }
+}
+
+// The radio powered down between two passes (level 8's restart): WLAN_EN low and PERST# asserted, the PCIe NoC's vote and the
+// rails' owner bit given back while this driver holds them, and the link's state renewed (stopRadio's teardown looks at it:
+// nothing may reach the endpoint's registers any more).
+void chipDown(PowerState &power, const Options &opt)
+{
+  if (gWin[kWinTlmm].va) safeOff(gHw, power, opt);
+  const bool held = gChipHeld;
+  if (held) chipPut();
+  renew(gLink);
+  gLinkRunning = false;
+  note("restart: the radio is powered down (WLAN_EN low, PERST# asserted%s)",
+       held ? "; the PCIe NoC's vote and the rails' owner bit given back" : "");
+}
+
+// Every level's state as at the boot, before a restart's pass (the chip is powered down: nothing of the window is in use any
+// more, so its allocations start again from its beginning). The DMA window, its translation, the SMMU's stream, the windows'
+// mappings, BAR0's, the join profile, the 802.1X port and en0's attachment are kept.
+__attribute__((noinline)) void ladderReset()
+{
+  gArena.used = 0;
+  gArena.allocations = 0;
+  gArena.failures = 0;
+  piano_wifi_firmware_close();
+  renew(gImage);
+  renew(gContexts);
+  renew(gIpcr);
+  gIpcrPlanned = false;
+  renew(gBoot);
+  gLinkState = nullptr;
+  renew(gRddm);
+  gRddmArmed = false;
+  gCrashReported = false;
+  renew(gMsi);
+  gMsiSinkVa = nullptr;
+  gMsiSinkBus = 0;
+  gChipDead = false;
+  gM0Events = gM1Answers = 0;
+  renew(gRouter);
+  renew(gClient);
+  gQrtrUnrouted = 0;
+  gWlfwInstance = kWlfwInstanceWord;
+  renew(gCe);
+  renew(gHtt);
+  gHttPlanned = false;
+  renew(gDp);
+  gDpPlanned = false;
+  renew(gLink);
+  gLinkRunning = false;
+  renew(gSta);
+  for (StaDma &f : gStaFrames) renew(f);
+  renew(gStaReoq);
+  renew(gStaReoq2);
+  gStaPlanned = false;
+  gL7EndedOnRequest = false;
+  renew(gL8);
+  gSyncAfterLevel5 = 0;   // levels 4 and 5 hold their lines again (piano-wifi-defer=3), as at the boot
+}
+
 // The rejoin's back-off: the transport and the data path kept running (their turns) until it ends, a stop is asked for, the
 // link stops or the chip dies. Not inlined into level7, whose frame stays small (the ladder's 16 KiB stack).
 __attribute__((noinline)) const char *rejoinWait(uint32_t waitMs, bool &stoppedOnRequest)
@@ -4228,8 +4373,9 @@ int level7(IOService *owner)
   // its back-off and joins again from the profile. The reorder queues alternate between two blocks of the window, so a new
   // peer's queues never reuse the memory of the one just deleted.
   static const uint32_t kRejoinBackoffMs[] = {2000, 5000, 10000, 20000, 30000, 60000};
-  uint32_t joins = 0, rejoinStep = 0, wakesSeen = 0, sleepsSeen = 0;
-  bool stoppedOnRequest = false, dropDone = false;
+  // (a restart's pass begins after the wake that began it: that wake is not one this pass slept through)
+  uint32_t joins = 0, rejoinStep = 0, wakesSeen = gWakes, sleepsSeen = gSleeps;
+  bool stoppedOnRequest = false;
   uint64_t firstOpenAt = 0;
   const char *why = nullptr;
   uint32_t sendWaits = 0;
@@ -4263,9 +4409,10 @@ int level7(IOService *owner)
     // piano-wifi-droptest=S: once, S s after the port first opened, the station leaves (its own deauthentication) and the
     // rejoin must bring it back without anybody
     if (gArgs.level >= 8 && gSta.authorized && !firstOpenAt) firstOpenAt = now;
-    if (gArgs.dropTest && !dropDone && firstOpenAt && now >= firstOpenAt + uint64_t(gArgs.dropTest) * 1000 && !stopping &&
+    if (firstOpenAt) restartTurn(owner, now, firstOpenAt, stopping);
+    if (gArgs.dropTest && !gDropDone && firstOpenAt && now >= firstOpenAt + uint64_t(gArgs.dropTest) * 1000 && !stopping &&
         gSta.step == kStaAssociated) {
-      dropDone = true;
+      gDropDone = true;   // once a boot (a restart's pass does not drop again)
       dropThisJoin = true;
       note("level 7: the drop test (piano-wifi-droptest=%u): the station leaves its association now (our deauthentication); "
            "the rejoin follows",
@@ -4419,12 +4566,18 @@ int level7(IOService *owner)
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------------------ the service
+constexpr int kPassEnd = 0, kPassUnmap = 1;   // how a pass of the ladder ended (PianoWifi::runPass)
+
 class PianoWifi : public IOService {
   OSDeclareDefaultStructors(PianoWifi)
   void run();
+  bool runSurvey();
+  int runPass(uint32_t pass, PowerState &power, const Options &opt);
+  bool restartWait(uint32_t pass, PowerState &power, const Options &opt);
   static void thread(void *self, wait_result_t);
 
   static void stopThread(void *self, wait_result_t);
+  static void parkThread(void *self, wait_result_t);
 
  public:
   IOService *probe(IOService *provider, SInt32 *score) override;
@@ -4506,13 +4659,14 @@ void PianoWifi::thread(void *self, wait_result_t)
   static_cast<PianoWifi *>(self)->run();
 }
 
-// The power contract: kOff stops the radio (and nothing comes back on the wake, §10.14). Stopping it waits for the ladder's own
+// The power contract: kOff stops the radio (below level 8, and with piano-wifi-sleepoff=1, nothing comes back on the wake,
+// §10.14; level 8's default parks it and the wake's restart brings it back, below). Stopping it waits for the ladder's own
 // thread (at most 2 s) and then for the chip to take the two commands (at most 1 s), which is longer than the one second a
 // synchronous answer may take — so the answer is a deadline in microseconds and an acknowledgement when it is done
 // (docs/power.md §4), and the waiting happens on a thread of its own.
 IOReturn PianoWifi::setPowerState(unsigned long state, IOService *)
 {
-  // Level 8 for daily use: the radio stays on through a system sleep (piano-wifi-sleepoff=0, its default). Nothing is
+  // piano-wifi-sleepoff=0 (boot 10k's way; its firmware died during a 60 s sleep): the radio stays on. Nothing is
   // stopped; the ladder's thread is frozen with every other while the system is suspended, and at the wake it finds the
   // association as the firmware kept it, or ended (then the rejoin takes it up again).
   if (gArgs.level >= 8 && !gArgs.sleepOff && !gRadioStopped) {
@@ -4522,6 +4676,29 @@ IOReturn PianoWifi::setPowerState(unsigned long state, IOService *)
     } else if (state == pianopower::kOn && gSleeps) {
       __atomic_add_fetch(&gWakes, 1u, __ATOMIC_ACQ_REL);
       IOLog("PianoWifi: power: the wake (%u): the ladder looks at the association\n", gWakes);
+    }
+    return pianopower::kAckNow;
+  }
+  // Level 8's default (piano-wifi-sleepoff=2, after boot 10k): at a system sleep the ladder's thread stops the join, powers the
+  // radio down and parks it (a thread of this driver's waits for that, the acknowledgement late); at the wake the ladder runs
+  // again from level 2 (the restart).
+  if (gArgs.level >= 8 && gArgs.sleepOff == 2 && !gRadioStopped) {
+    if (state == pianopower::kOff) {
+      const uint32_t n = __atomic_add_fetch(&gSleeps, 1u, __ATOMIC_SEQ_CST);
+      IOLog("PianoWifi: power: a system sleep (%u): the radio is stopped and powered down; the wake brings it up again "
+            "(piano-wifi-sleepoff=2)\n",
+            n);
+      thread_t t = nullptr;
+      if (kernel_thread_start(&PianoWifi::parkThread, this, &t) != KERN_SUCCESS) {
+        parkRadio();
+        return pianopower::kAckNow;
+      }
+      thread_deallocate(t);
+      return 4000000;
+    }
+    if (state == pianopower::kOn && gSleeps != gWakes) {
+      __atomic_store_n(&gWakes, __atomic_load_n(&gSleeps, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
+      IOLog("PianoWifi: power: the wake (%u): the ladder brings the radio up again (the restart)\n", gWakes);
     }
     return pianopower::kAckNow;
   }
@@ -4543,13 +4720,22 @@ void PianoWifi::stopThread(void *self, wait_result_t)
   driver->acknowledgeSetPowerState();
 }
 
+void PianoWifi::parkThread(void *self, wait_result_t)
+{
+  thread_set_thread_name(current_thread(), "piano-wifi-park");
+  PianoWifi *driver = static_cast<PianoWifi *>(self);
+  parkRadio();
+  driver->acknowledgeSetPowerState();
+}
+
 void PianoWifi::systemWillShutdown(IOOptionBits specifier)
 {
   if (specifier == kIOMessageSystemWillPowerOff || specifier == kIOMessageSystemWillRestart) stopRadio("shutdown");
   IOService::systemWillShutdown(specifier);
 }
 
-void PianoWifi::run()
+// Level 1, the survey (reads only). Not inlined into run(): its lines and records stay out of the frame the passes run under.
+__attribute__((noinline)) bool PianoWifi::runSurvey()
 {
   if (gArgs.delay) {
     note("waiting %u s", gArgs.delay);
@@ -4608,9 +4794,14 @@ void PianoWifi::run()
        (unsigned long long)gLoads, gSpmiStores, gPageCount, gMapFailures);
   if (gArgs.level < 2) {
     unmapAll();
-    return;
+    return false;
   }
+  return true;
+}
 
+void PianoWifi::run()
+{
+  if (!runSurvey()) return;
   // ---- level 2 and up: the first writes of this driver -----------------------------------------------------------------
   const Options opt = options();
   PowerState &power = gPowerStorage;   // a file-scope state, so that the power hook's safeOff has it on its own thread
@@ -4626,6 +4817,55 @@ void PianoWifi::run()
     unmapAll();
     return;
   }
+  // The lines level 4 starts holding at the boot loader's doorbell (note(), deferStart) come out on every way out of the ladder.
+  struct LadderExit {
+    ~LadderExit()
+    {
+      levelEnd();
+      deferFlush();
+    }
+  } ladderExit;
+  // One pass of levels 2 to 7 at the boot; at level 8 another after each restart (the firmware died, a level failed, the wake
+  // from a system sleep): the chip is powered down between two passes and every level's state is as at the boot.
+  const bool restarts = gArgs.level >= 8 && gArgs.restart;
+  for (uint32_t pass = 1;; ++pass) {
+    const int end = runPass(pass, power, opt);
+    if (!restarts) {
+      if (end == kPassUnmap) unmapWindows();
+      break;
+    }
+    if (!restartWait(pass, power, opt)) break;
+  }
+  reportStack("the ladder's end");
+  unmapAll();
+}
+
+// One pass of the ladder from level 2: the boot's, or a restart's. gPass says how it ended. kPassUnmap: a failure after which
+// the ladder without restarts gives its windows up as well.
+int PianoWifi::runPass(uint32_t pass, PowerState &power, const Options &opt)
+{
+  PassEnd &e = gPass;
+  e.pass = pass;
+  e.level = 0;
+  e.failed = e.opened = false;
+  bool wakeReleased = false;
+  // A ladder that ended well lets the device idle again (the wake doorbell back to 0, as the MHI host's last release does),
+  // since nothing answers it after this thread is gone.
+  auto releaseWake = [&]() {
+    if (!gArgs.wake || wakeReleased || gChipDead) return;
+    wakeReleased = true;
+    note("level %u: device wake %s", gArgs.level,
+         mhiDevWake(gMhiIo, gMhiRegLen, false) ? "released (the chip may idle)" : "not released");
+  };
+  // A stop asked for (a system sleep at level 8) between two levels: the chip is given up before the next one begins.
+  auto stopAsked = [&]() {
+    if (!__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST)) return false;
+    note("level %d: done, but a stop was asked for (%s): the next level does not begin", e.level, gStopWhy);
+    safeOff(gHw, power, opt);
+    chipPut();
+    e.failed = true;
+    return true;
+  };
   reportStack("level 2 begins");
   note("level 2: the six PMU rails, PERST# low, WLAN_EN; the PHY's two LDOs are read only (one is the UFS PHY's PLL)");
   // The rails through the shared helper first (PianoBluetooth may hold them already: then only a read-back), then level 2's own
@@ -4652,19 +4892,18 @@ void PianoWifi::run()
   reportPower(power);
   reportSpmiLock("level 2");
   writeSummary("level 2");
+  e.level = 2;
   if (rc) {
     stage(power.step, "level 2 stopped here");
     note("level 2: FAILED at step %d (%s): WLAN_EN is low and PERST# asserted; nothing above this level ran", power.step,
          errorName(power.error));
-    unmapWindows();
-    unmapAll();
-    return;
+    e.failed = true;
+    return kPassUnmap;
   }
+  gChipHeld = true;
   note("level 2: done (rails voted, WLAN_EN high, PERST# low, SW_CTRL in %u)", power.swCtrlIo & 1u);
-  if (gArgs.level < 3) {
-    unmapAll();
-    return;
-  }
+  if (gArgs.level < 3) return kPassEnd;
+  if (stopAsked()) return kPassEnd;
 
   // ---- level 3 ---------------------------------------------------------------------------------------------------------
   // The DMA path's bandwidth before the controller's clocks, as pcie-qcom does (WifiHw.h: the PCIe NoC's bus clock manager).
@@ -4682,70 +4921,57 @@ void PianoWifi::run()
            (link.debug1 & kPortDebug1LinkUp) ? "up" : "down", (link.linkStatus >> 16) & 0xfu,
            (unsigned long long)(link.barBytes / 1024), (unsigned long long)link.barAddress);
   setProperty("piano-wifi-link", state);
+  e.level = 3;
   if (rc) {
     stage(link.step, "level 3 stopped here");
     note("level 3: FAILED at step %d (%s): WLAN_EN is low and PERST# asserted", link.step, errorName(link.error));
     chipPut();
-    unmapWindows();
-    unmapAll();
-    return;
+    e.failed = true;
+    return kPassUnmap;
   }
   note("level 3: done (L0 at Gen%u x%u, the endpoint answers 17cb:110e, BAR0 %llu KiB at %#llx)", (link.linkStatus >> 16) & 0xfu,
        (link.linkStatus >> 20) & 0x3fu, (unsigned long long)(link.barBytes / 1024), (unsigned long long)link.barAddress);
-  if (gArgs.smmu) {
+  // The endpoint's SMMU stream is set up once: the controller's reset in a restart's level 3 leaves the SMMU as it was (and its
+  // translation, iovaWindow below, in place).
+  if (pass > 1) {
+    note("level 3: the SMMU's stream for the endpoint is kept from pass 1");
+  } else if (gArgs.smmu) {
     stage(kStepBar + 1, "the SMMU: the endpoint's stream through a bypass context bank");
     if (!smmuStream(kStreamEndpoint)) {
       stage(-(kStepBar + 1), "level 3: the endpoint's SMMU stream was not set up; no DMA is started");
       safeOff(gHw, power, opt);
       chipPut();
-      unmapWindows();
-      unmapAll();
-      return;
+      e.failed = true;
+      return kPassUnmap;
     }
     if (gArgs.smmu >= 2) (void)smmuStream(kStreamRoot);
   } else {
     note("level 3: piano-wifi-smmu=0: the SMMU is untouched (level 4 then needs stream 0x1401 to bypass already)");
   }
-  if (gArgs.level < 4) {
-    unmapAll();
-    return;
-  }
+  if (gArgs.level < 4) return kPassEnd;
+  if (stopAsked()) return kPassEnd;
 
   // ---- level 4 ---------------------------------------------------------------------------------------------------------
-  // The lines level 4 starts holding at the boot loader's doorbell (note(), deferStart) come out on every way out of the ladder
-  // from here; and a ladder that ended well lets the device idle again (the wake doorbell back to 0, as the MHI host's last
-  // release does), since nothing answers it after this thread is gone.
-  struct LadderExit {
-    bool released = false;
-    ~LadderExit()
-    {
-      levelEnd();
-      deferFlush();
-    }
-  } ladderExit;
-  auto releaseWake = [&]() {
-    if (!gArgs.wake || ladderExit.released || gChipDead) return;
-    ladderExit.released = true;
-    note("level %u: device wake %s", gArgs.level,
-         mhiDevWake(gMhiIo, gMhiRegLen, false) ? "released (the chip may idle)" : "not released");
-  };
   reportStack("level 4 begins");
   stage(400, "level 4: the DMA window, BAR0's MHI registers, the firmware over BHI/BHIe");
+  e.level = 4;
   if (!dmaWindow()) {
     stage(-400, "level 4: no DMA window; nothing was given to the endpoint");
     safeOff(gHw, power, opt);
     chipPut();
-    unmapWindows();
-    unmapAll();
-    return;
+    e.failed = true;
+    return kPassUnmap;
   }
-  if (gArgs.iova && !iovaWindow()) {
-    stage(-400, "level 4: the window's 32-bit addresses were not set up; nothing was given to the endpoint");
-    safeOff(gHw, power, opt);
-    chipPut();
-    unmapWindows();
-    unmapAll();
-    return;
+  static bool iovaReady;   // the window's translation, once (a restart keeps it)
+  if (gArgs.iova && !iovaReady) {
+    if (!iovaWindow()) {
+      stage(-400, "level 4: the window's 32-bit addresses were not set up; nothing was given to the endpoint");
+      safeOff(gHw, power, opt);
+      chipPut();
+      e.failed = true;
+      return kPassUnmap;
+    }
+    iovaReady = true;
   }
   levelBegin(4, gArgs.deadlineMs);
   rc = level4(link, power, opt);
@@ -4754,12 +4980,16 @@ void PianoWifi::run()
   stage(rc ? -401 : 401, rc ? "level 4 stopped before mission mode" : "level 4: the firmware runs (mission mode)");
   note("level 4: %s%s", rc ? "the chip did not reach mission mode" : "the chip is in mission mode",
        rc ? "" : gArgs.level < 5 ? "; the ladder ends here (QMI is level 5, WMI and the station levels 6 and up)" : "");
-  if (rc) chipPut();   // level 4's failures end in safeOff: WLAN_EN low
-  if (rc || gArgs.level < 5) {
-    if (!rc) releaseWake();
-    unmapAll();
-    return;
+  if (rc) {
+    chipPut();   // level 4's failures end in safeOff: WLAN_EN low
+    e.failed = true;
+    return kPassEnd;
   }
+  if (gArgs.level < 5) {
+    releaseWake();
+    return kPassEnd;
+  }
+  if (stopAsked()) return kPassEnd;
 
   // ---- level 5 ---------------------------------------------------------------------------------------------------------
   reportStack("level 5 begins");
@@ -4769,22 +4999,26 @@ void PianoWifi::run()
   piano_wifi_firmware_close();
   if (rc) chipPut();   // level 5's failures end in safeOff too
   writeSummary("level 5");
+  e.level = 5;
   stage(rc ? -504 : 504, rc ? "level 5 stopped before the firmware was ready" : "level 5: the firmware is ready");
   note("level 5: %s; %s", rc ? "the firmware did not become ready" : "the firmware is ready",
        rc ? "the ladder ends here"
           : gArgs.level < 6 ? "the copy engine, the transport and the scan are level 6 (docs/drivers/wifi.md section 13)"
                             : "level 6 follows: the copy engine, the transport and a passive scan");
-  if (rc || gArgs.level < 6) {
-    if (!rc) releaseWake();
-    unmapAll();
-    return;
+  if (rc) {
+    e.failed = true;
+    return kPassEnd;
+  }
+  if (gArgs.level < 6) {
+    releaseWake();
+    return kPassEnd;
   }
   if (!gArgs.mode) {
     note("level 6: not run: the firmware's radio was not started (piano-wifi-mode=0); piano-wifi=6 needs it");
     releaseWake();
-    unmapAll();
-    return;
+    return kPassEnd;
   }
+  if (stopAsked()) return kPassEnd;
 
   // ---- level 6 ---------------------------------------------------------------------------------------------------------
   if (gArgs.defer == 3) {
@@ -4804,23 +5038,30 @@ void PianoWifi::run()
   levelEnd();
   if (rc) chipPut();   // level 6's failures end in safeOff as well
   writeSummary("level 6");
+  e.level = 6;
   stage(rc ? -613 : 613, rc ? "level 6 stopped before the scan was done" : "level 6: the scan is done");
   note("level 6: %s; %s", rc ? "the scan did not finish" : "the scan is done",
        rc ? "the ladder ends here"
           : gArgs.level >= 7 && gLink.step == kLinkHandOff
               ? "level 7 joins on its virtual device (docs/drivers/wifi.md section 13.3)"
               : "association, keys and the data path are levels 7 and 8 (docs/drivers/wifi.md section 13)");
-  if (!rc) {
-    // The gate PianoWifiEthernet waits for: en1 appears (link down, with the scan list and the virtual device's address) only
-    // when level 6 came up — before level 7's join, so that en1 is there when the link comes up.
+  if (rc) {
+    e.failed = true;
+    return kPassEnd;
+  }
+  // The gate PianoWifiEthernet waits for: en1 appears (link down, with the scan list and the virtual device's address) only
+  // when level 6 came up — before level 7's join, so that en1 is there when the link comes up. Once: a restart's interface is
+  // the same one.
+  if (!gLinkPublished) {
+    gLinkPublished = true;
     publishResource("PianoWifiLink");
     note("level 6: the resource PianoWifiLink is published: PianoWifiEthernet's interface may come up (link down, the scan "
          "list in the property piano-wifi-scan; tooling/native/piano-wifi prints it)");
   }
-  const bool level6Up = rc == 0;   // the chip is alive and its link up: only then may the wake doorbell be written
-  if (!rc && gLink.step == kLinkHandOff) {
+  if (gLink.step == kLinkHandOff) {
     // ---- level 7 -------------------------------------------------------------------------------------------------------
     reportStack("level 7 begins");
+    e.level = 7;
     // Its own hard deadline: the profile's wait, its scans, the join's steps and the watch, with room for the teardown. A
     // watch without end (piano-wifi-l7hold=0) has none.
     const uint64_t own = uint64_t(gArgs.l7wait) + uint64_t(gArgs.l7scans) * gArgs.scanWaitMs +
@@ -4834,13 +5075,122 @@ void PianoWifi::run()
     stage(rc ? -718 : 718, rc                  ? "level 7 stopped before its end"
                            : gL7EndedOnRequest ? "level 7: stopped on request (a suspend or a shutdown), its normal end"
                                                : "level 7: the join ran to its end");
+    if (rc) e.failed = true;
     if (gChipDead) {
       crashReport("level 7");
       safeOff(gHw, power, opt);
       chipPut();
     }
   }
-  if (level6Up && !gChipDead) releaseWake();
-  reportStack("the ladder's end");
-  unmapAll();
+  if (!gChipDead) releaseWake();
+  return kPassEnd;
+}
+
+// Between two passes (level 8, piano-wifi-restart): why the pass ended, the chip powered down, the wait (a back-off; a system
+// sleep's park until its wake; or, after a normal end with the chip left on, nothing until a sleep), and every level's state
+// reset. False: the ladder ends (a shutdown, or the radio stopped until the next boot).
+bool PianoWifi::restartWait(uint32_t pass, PowerState &power, const Options &opt)
+{
+  static const uint32_t kRestartBackoffMs[] = {1000, 5000, 15000, 30000, 60000, 120000};
+  enum Next { kNextSleep, kNextFailure, kNextIdle };
+  const PassEnd &e = gPass;
+  const uint64_t ended = nowMs();
+  if (e.opened) gRestartRun = 0;   // Wi-Fi came back on this pass: the next failure starts the back-off afresh
+  if (gRestarts && !e.opened)
+    note("restart %u (%s) did not bring Wi-Fi back: pass %u ended at level %d%s", gRestarts, gRestartWhy, pass, e.level,
+         gChipDead ? " (the firmware died)" : e.failed ? " (it failed)" : "");
+  Next next = kNextIdle;
+  const char *why = "its normal end";
+  if (__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST)) {
+    next = kNextSleep;
+    why = "a system sleep";
+  } else if (gChipDead) {
+    next = kNextFailure;
+    why = "the firmware died";
+  } else if (e.failed && e.level == 7 && gSta.error == kStaErrNoProfile) {
+    why = "no join profile came";   // nothing to restart for: the chip stays as it is
+  } else if (e.failed) {
+    next = kNextFailure;
+    why = e.level == 7 ? "level 7 failed (the link to the firmware stopped)" : "a level failed";
+  }
+  bool capped = false;
+  uint32_t waitMs = 0;
+  if (next == kNextFailure) {
+    if (gRestartRun >= gArgs.restartCap) {
+      capped = true;
+      note("restart: %u restart(s) in a row did not bring Wi-Fi back: the radio stays down until the next wake from a system "
+           "sleep (piano-wifi-restarts=%u)",
+           gRestartRun, gArgs.restartCap);
+    } else {
+      waitMs = kRestartBackoffMs[gRestartRun < 6 ? gRestartRun : 5];
+    }
+    // after a failure the chip may still be on (level 7's link stopped): it is powered down now in any case
+    chipDown(power, opt);
+  }
+  bool chipOn = gChipHeld;   // after a normal end the chip is on (the firmware idle); a sleep parks it below
+  if (next == kNextFailure && !capped)
+    note("restart: pass %u ended at level %d (%s): the radio is powered down and the ladder runs again from level 2 in %u ms "
+         "(restart %u, %u in a row of at most %u)",
+         pass, e.level, why, waitMs, gRestarts + 1, gRestartRun + 1, gArgs.restartCap);
+  else if (next == kNextIdle)
+    note("restart: pass %u ended at level %d (%s): the radio stays as it is until a system sleep", pass, e.level, why);
+  // The wait. A system sleep parks the radio (powered down) and only its wake ends the wait; a back-off ends by itself.
+  const bool untilWake = next != kNextFailure || capped;
+  const uint64_t until = ended + waitMs;
+  bool parked = false, woke = false;
+  for (;;) {
+    if (gRadioStopped) return false;   // a shutdown (stopRadio has powered the radio down)
+    if (__atomic_load_n(&gStopRequested, __ATOMIC_SEQ_CST)) {
+      if (!parked) {
+        if (chipOn) {
+          chipDown(power, opt);
+          chipOn = false;
+        }
+        parked = true;
+        note("restart: the radio is parked for system sleep %u: WLAN_EN low and PERST# asserted, the rails given back; the "
+             "wake brings it up again",
+             gSleeps);
+        __atomic_store_n(&gParked, 1u, __ATOMIC_SEQ_CST);
+      }
+      if (__atomic_load_n(&gWakes, __ATOMIC_SEQ_CST) >= __atomic_load_n(&gSleeps, __ATOMIC_SEQ_CST)) {
+        __atomic_store_n(&gParked, 0u, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&gStopRequested, 0u, __ATOMIC_SEQ_CST);
+        // a new sleep between that wake and the clear above: its stop is asked for again, and the radio parked again
+        if (__atomic_load_n(&gWakes, __ATOMIC_SEQ_CST) < __atomic_load_n(&gSleeps, __ATOMIC_SEQ_CST)) {
+          __atomic_store_n(&gStopRequested, 1u, __ATOMIC_SEQ_CST);
+          parked = false;
+          continue;
+        }
+        woke = true;
+        break;
+      }
+    } else if (!untilWake && nowMs() >= until) {
+      break;
+    }
+    IOSleep(50);
+  }
+  // The restart.
+  ++gRestarts;
+  if (woke) {
+    ++gRestartsWake;
+    gRestartRun = 0;   // a wake is a fresh start: the cap counts again from here
+    gRestartWhy = "the wake from a system sleep";
+  } else {
+    ++gRestartRun;
+    if (gChipDead) ++gRestartsCrash;
+    else ++gRestartsFail;
+    gRestartWhy = why;
+  }
+  gRestartBegan = nowMs();
+  char line[200];
+  snprintf(line, sizeof line, "%u restart(s): %u at a wake, %u after the firmware died, %u after a failed level; the last: %s",
+           gRestarts, gRestartsWake, gRestartsCrash, gRestartsFail, gRestartWhy);
+  setProperty("piano-wifi-restarts", line);
+  if (chipOn) chipDown(power, opt);
+  ladderReset();
+  note("restart %u begins (%s), %llu ms after pass %u ended: every level's state as at the boot, the window's %u MiB free "
+       "again; levels 2 to 8 follow",
+       gRestarts, gRestartWhy, (unsigned long long)(gRestartBegan - ended), pass, gArena.bytes >> 20);
+  deferPhase();
+  return true;
 }

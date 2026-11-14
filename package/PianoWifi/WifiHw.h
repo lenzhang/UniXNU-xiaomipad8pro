@@ -215,6 +215,9 @@ constexpr uint32_t kLinkTrainMs = 1000, kEndpointAnswerMs = 1000;
 // The endpoint's MHI registers live at the start of BAR0 (sheng, PAGANI; ath12k maps them the same way). BHI and BHIe are at the
 // offsets the device reports in BHIOFF / BHIEOFF.
 constexpr uint32_t kMhiRegLen = 0x00, kMhiBhiOff = 0x28, kMhiBhieOff = 0x2c, kMhiCtrl = 0x38, kMhiStatus = 0x48;
+// The SoC reset request (bit 0): the MHI host writes it to force a device that supports a crash dump into its crash dump
+// environment (the restart's test, piano-wifi-crashtest).
+constexpr uint32_t kMhiSocResetReq = 0xb0, kMhiSocResetReqBit = 1u << 0;
 constexpr uint32_t kMhiCfg = 0x10, kMhiErdbOff = 0x20, kMhiCcabap = 0x58, kMhiEcabap = 0x60, kMhiCrcbap = 0x68,
                    kMhiCtrlBase = 0x80, kMhiCtrlLimit = 0x88, kMhiDataBase = 0x98, kMhiDataLimit = 0xa0;
 constexpr uint32_t kMhiCtrlReset = 1u << 1, kMhiStatusReady = 1u << 0, kMhiStatusSysErr = 1u << 2, kMhiStateShift = 8;
