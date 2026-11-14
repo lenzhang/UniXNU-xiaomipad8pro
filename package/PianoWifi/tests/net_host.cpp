@@ -13,7 +13,7 @@ using namespace pianowifi;
 static int failures;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
 
-static const uint8_t kOwn[6] = {0x02, 0x50, 0x49, 0x41, 0x4e, 0x01};
+static const uint8_t kOwn[6] = {0x02, 0x50, 0x49, 0x41, 0x4e, 0x04};
 static const uint8_t kAp[6] = {0x3c, 0x52, 0xa1, 0x10, 0x20, 0x30};
 
 template <class Body>

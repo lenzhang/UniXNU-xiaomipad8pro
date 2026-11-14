@@ -704,8 +704,11 @@ constexpr uint32_t kWmiPdevParamTxChainMask = 0x01, kWmiPdevParamRxChainMask = 0
                    kWmiPdevParamPmfQos = 0x22, kWmiPdevParamArpAcOverride = 0x23, kWmiPdevParamMeshMcastEnable = 0x8f;
 // The address a virtual device takes when the firmware reports none: locally administered (bit 1 of the first byte), not a
 // group address, and piano's own three middle bytes so that two tablets on one network cannot collide by construction. The
-// unit's own address is in the persist partition and is never built into an image (docs §13.1).
-constexpr uint8_t kLocalMac[6] = {0x02, 0x50, 0x49, 0x41, 0x4e, 0x01};
+// unit's own address is in the persist partition and is never built into an image (docs §13.1). The last byte is 0x04:
+// 0x01 is PianoNullEthernet's built-in en0, 0x02 and 0x03 the two ends of PianoDwc3's USB network. Boot 10h: with 0x01 the
+// station's interface carried en0's address, macOS never gave it a name of its own (it was never attached to the network
+// stack), and ifconfig's "en0" was PianoNullEthernet all along.
+constexpr uint8_t kLocalMac[6] = {0x02, 0x50, 0x49, 0x41, 0x4e, 0x04};
 // The bits of piano-wifi-l6pre: which of those pieces level 6 does before it creates its virtual device, so that one boot can
 // take Ubuntu's whole order and the next can leave a piece out without a rebuild.
 constexpr uint32_t kPreHwMode = 1u << 0, kPrePdevParams = 1u << 1, kPreChanList = 1u << 2, kPreVdevMac = 1u << 3,

@@ -19,6 +19,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOBSD.h>   // kIOBSDNameKey
 #include <sys/errno.h>
 #include <sys/kpi_mbuf.h>
 #include <net/kpi_interface.h>
@@ -59,8 +60,9 @@ class PianoWifiEthernet : public IOEthernetController {
   // not one frame reached outputPacket.
   IOWorkLoop *fWorkLoop = nullptr;
   // Locally administered, "PIAN"; not the unit's own. The same as WifiHw.h kLocalMac, the virtual device's address when the
-  // firmware reports none. PianoWifi publishes the address the device really took as piano-wifi-mac, which wins.
-  IOEthernetAddress fAddress = {{0x02, 0x50, 0x49, 0x41, 0x4e, 0x01}};
+  // firmware reports none; never PianoNullEthernet's 0x01 (boot 10h: an interface with en0's address got no name of its own).
+  // PianoWifi publishes the address the device really took as piano-wifi-mac, which wins.
+  IOEthernetAddress fAddress = {{0x02, 0x50, 0x49, 0x41, 0x4e, 0x04}};
   bool fAttached = false, fLinkUp = false;
   UInt64 fTxFrames = 0, fTxDrops = 0, fRxFrames = 0, fRxDrops = 0, fLinkChanges = 0;
   // after boot 10f-c (the port open, en0 "link up", and not one frame of en0's ever handed to PianoWifi): why each output was
@@ -145,10 +147,13 @@ void PianoWifiEthernet::takeScanList(IOService *wifi)
 
 void PianoWifiEthernet::counters(const char *why)
 {
-  const uint32_t flags = fInterface ? uint32_t(ifnet_flags(fInterface->getIfnet())) : 0;
-  note("%s: interface flags %#x (up %u, running %u), enables %llu; out %llu sent, dropped %llu (link down %llu, size %llu, "
-       "refused %llu, last %d); in %llu, dropped %llu",
-       why, flags, (flags & IFF_UP) ? 1u : 0u, (flags & IFF_RUNNING) ? 1u : 0u, fEnables, fTxFrames, fTxDrops, fTxDown, fTxSize,
+  ifnet_t ifp = fInterface ? fInterface->getIfnet() : nullptr;
+  const uint32_t flags = ifp ? uint32_t(ifnet_flags(ifp)) : 0;
+  OSString *name = fInterface ? OSDynamicCast(OSString, fInterface->getProperty(kIOBSDNameKey)) : nullptr;
+  note("%s: %s (%s), interface flags %#x (up %u, running %u), enables %llu; out %llu sent, dropped %llu (link down %llu, "
+       "size %llu, refused %llu, last %d); in %llu, dropped %llu",
+       why, name ? name->getCStringNoCopy() : "no BSD name yet", ifp ? "attached to the network stack" : "not attached",
+       flags, (flags & IFF_UP) ? 1u : 0u, (flags & IFF_RUNNING) ? 1u : 0u, fEnables, fTxFrames, fTxDrops, fTxDown, fTxSize,
        fTxRefused, fLastRefusal, fRxFrames, fRxDrops);
 }
 
@@ -255,6 +260,7 @@ bool PianoWifiEthernet::start(IOService *provider)
     return false;
   }
   fInterface->setProperty(kIOBuiltin, true);
+  fInterface->setProperty(kIOPrimaryInterface, false);   // PianoNullEthernet keeps the primary built-in en0 (TimeSync)
   fInterface->registerService(kIOServiceSynchronous);
   // PianoWifi's network boundary: from here its thread may hand frames and the link's state to this driver.
   piano_wifi_net_client client;
@@ -265,9 +271,12 @@ bool PianoWifiEthernet::start(IOService *provider)
   client.link = &PianoWifiEthernet::netLink;
   const int rc = piano_wifi_net_attach(&client);
   fAttached = rc == 0;
-  note("en%u published (built in, link down until the station's port is authorized, its own work loop %s); PianoWifi's data "
-       "path %s; the scan list is the property piano-wifi-scan (tooling/native/piano-wifi prints it)",
-       fInterface->getUnitNumber(), fWorkLoop ? "running" : "MISSING",
+  // The BSD name comes later, from configd (the counters' lines carry it): getUnitNumber() is 0 until then, which is why boot
+  // 10a's "en0 published" was taken for the BSD name it never had.
+  note("the interface is published (MAC %02x:%02x:%02x:..:%02x, built in, not primary, link down until the station's port is "
+       "authorized, its own work loop %s; macOS names it); PianoWifi's data path %s; the scan list is the property "
+       "piano-wifi-scan",
+       fAddress.bytes[0], fAddress.bytes[1], fAddress.bytes[2], fAddress.bytes[5], fWorkLoop ? "running" : "MISSING",
        fAttached ? "attached" : rc == ENODEV ? "not there (below level 6)" : "refused the attach");
   return true;
 }
