@@ -67,23 +67,6 @@ def entry_text(entry):
     return '[[entry]]\n' + ''.join(f'{k} = "{v}"\n' for k, v in entry.items())
 
 
-def uses_rootfs(entry):
-    """Why an xnu entry would use linux_rootfs (None: it does not). NativeUfs takes its root from linux_rootfs unless
-    native-ufs-root-part names another partition, and the store lives on the root partition (common.store_args_of)."""
-    if entry.get('type') != 'xnu':
-        return None
-    args = entry.get('args', '').split()
-    named = dict(x.split('=', 1) for x in args if '=' in x)
-    if 'linux_rootfs' in entry.get('args', ''):
-        return 'names linux_rootfs'
-    part, _ = common.store_args_of(args)
-    if named.get('native-ufs-root', '0') not in ('0', '') and part == 'linux_rootfs':
-        return 'mounts its UFS root from linux_rootfs (no native-ufs-root-part)'
-    if named.get('data-persist', '0') != '0' and part == 'linux_rootfs':
-        return 'opens a Data store on linux_rootfs (no native-ufs-root-part)'
-    return None
-
-
 def fastboot_line(line):
     args = [x for x in line.split() if name_of(x) not in FASTBOOT_DROP and not x.startswith('piano-')]
     return ' '.join(args + FASTBOOT_TAIL)
@@ -243,7 +226,7 @@ def main():
         parsed = tomllib.loads(new_text)
         if parsed['boot']['default'] != a.entry or parsed['entry'][0] != entry:
             raise SystemExit('the 27.3 entry changed in the new unixnu.toml: refused')
-        rootfs = {e['id']: why for e in parsed['entry'] if (why := uses_rootfs(e))}
+        rootfs = {e['id']: why for e in parsed['entry'] if (why := common.entry_uses_rootfs(e))}
         if rootfs:
             raise SystemExit(f'entries that would use linux_rootfs: {rootfs}')
         (stage / TOML).write_text(new_text)

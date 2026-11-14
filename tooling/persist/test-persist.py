@@ -164,6 +164,12 @@ def fake_tablet(root, pp, argv):
         if cmd == 'send':
             path, start, length = region(nodes, a[0], int(a[1]), int(a[2]), int(a[3]))
             s = socket.create_connection(('127.0.0.1', int(a[4])))
+            # FAKE_SEND_FAIL=once:SKIP|always:SKIP: the stream of the piece at block SKIP breaks halfway (a flaky USB link)
+            how, _, at = os.environ.get('FAKE_SEND_FAIL', '').partition(':')
+            marker = root / f'send-failed-{at}'
+            if at == a[1] and (how == 'always' or (how == 'once' and not marker.exists())):
+                marker.touch()
+                length //= 2
             with open(path, 'rb') as f:
                 f.seek(start)
                 left = length
@@ -210,6 +216,21 @@ def fake_tablet(root, pp, argv):
             return 'dropped=1'
         if cmd == 'rereadpt':
             return 'reread=partx'
+        if cmd == 'discard-info':
+            on = os.environ.get('FAKE_NO_DISCARD') != '1'
+            return f'discard_max_bytes={4 << 30 if on else 0}\ndiscard_granularity=4096\ntool=busybox-blkdiscard\ndiscard={int(on)}'
+        if cmd in ('discard', 'zero'):
+            # tablet.sh part_guard: a LUN 0 partition with this name, start and size (512-byte units), never the disk
+            names = {'sda35': 'linux_rootfs', 'sda36': 'linux_data', 'sda37': 'esp'}
+            node, name, start, size = a[0], a[1], int(a[2]), int(a[3])
+            if names.get(node) != name or node not in nodes or (nodes[node][1] // 512, nodes[node][2] // 512) != (start, size):
+                return f'error={node} is not the partition {name} at {start}+{size}'
+            path, off, length = nodes[node]
+            if cmd == 'discard' and os.environ.get('FAKE_DISCARD_KEEPS') == '1':
+                return f'discarded={node} bytes={length} tool=busybox-blkdiscard'   # a device that reads old data after unmap
+            for at in range(0, length, 4 * MiB):
+                write_at(path, off + at, bytes(min(4 * MiB, length - at)))
+            return f'{"discarded" if cmd == "discard" else "zeroed"}={node} bytes={length}'
         return f'error=unknown {cmd}'
     except Exception as e:  # noqa: BLE001
         return f'error={e}'

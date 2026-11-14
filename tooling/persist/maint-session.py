@@ -23,6 +23,9 @@ Order (sessions as in the plan; s = the maintenance RAM image, a = ABL fastboot)
   a  abl-final reboot
   later, an ESP update on the installed tablet (docs/persistent-boot.md section 11):
   s  maint-boot map backup [store-backup] esp-final check maint-exit --esp E --esp-final E --new-backup
+  later, the 27.3-only ESP, then linux_rootfs retired (docs/persistent-boot.md section 13; E = esp-k273-only.img):
+  s  maint-boot map backup esp-final check maint-exit --esp E --esp-final E --new-backup
+  s  maint-boot map rootfs-backup rootfs-clear check maint-exit --esp E
   later, a new boot_a FD with its ESP (docs/persistent-boot.md section 12; B = boot-piano-macos-persistent-vN-signed.img):
   a  ram-boot-a --boot-image B                       fastboot boot only: B boots the installed ESP (no reset: the USB console)
   s  maint-boot map backup [store-backup] boot-a esp-final check maint-exit --boot-image B --esp E --esp-final E --new-backup
@@ -47,6 +50,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -74,10 +78,23 @@ ABL_EXPECT = {'product': 'piano', 'unlocked': 'yes', 'current-slot': 'a', 'slot-
               'battery-soc-ok': 'yes', 'partition-size:boot_a': '0x6000000'}
 ABL_SHOW = ('slot-retry-count:a', 'battery-voltage')
 SMALL = 128 * MiB            # backups up to this size are also kept in out/persistent/session/
+# A slow USB link (the big regions: rootfs-backup, rootfs-clear and its rollback): the slowest rate the time limits allow for, and how
+# long a stream may stall before its piece counts as failed (then retried).
+SLOW_LINK = 1 * MiB          # bytes per second over USB
+SLOW_MEDIUM = 20 * MiB       # bytes per second for a hash, discard or zeroing on the tablet
+STALL = 300
+PIECE_TRIES = 3
+
+
+def limit(nbytes, rate=SLOW_LINK, floor=1800):
+    """The time limit (s) for moving NBYTES at no less than RATE, never under FLOOR."""
+    return max(floor, int(nbytes / rate) + 600)
 
 
 def store_window(s):
-    return s.esp['store']['window_blocks'] if s.esp else 3145825
+    """The 27.0.1 store's window (linux_rootfs): the --esp record's, else that store's own (12 GiB seed). A record whose store is
+    elsewhere (esp_store) has none: the linux_rootfs places are then only read for information."""
+    return ((s.esp or {}).get('store') or {}).get('window_blocks') or 3145825
 
 
 def store_old(s):
@@ -95,6 +112,52 @@ def rel(lba):
 
 class Stop(Exception):
     pass
+
+
+def esp_store(record):
+    """The Data store an ESP resumes when it is not the 27.0.1 line's (unbound, at the end of linux_rootfs): the record's store
+    with its partition and first LBA (tooling/k273/build-k273-esp.py: the 27.3 store, bound to that LBA). None: the legacy store,
+    checked as before (store_new, the record's seed)."""
+    store = (record or {}).get('store') or {}
+    if store.get('partition') and store['partition'] != 'linux_rootfs' and store.get('first_lba') is not None:
+        return store
+    return None
+
+
+# LUN 0 partitions by their GPT name -> the key map_nodes keeps them under (tablet.sh map reports these)
+PART_KEYS = {'linux_rootfs': 'rootfs', 'linux_data': 'linux_data', 'esp': 'esp'}
+
+
+def read_nocache(path, digest=None):
+    """A file's bytes in 4 MiB chunks, read with the page cache off (F_NOCACHE): the backup as stored, not the bytes just written.
+    DIGEST (a hashlib object) is fed them."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+        while chunk := os.read(fd, 4 * MiB):
+            if digest is not None:
+                digest.update(chunk)
+            yield chunk
+    finally:
+        os.close(fd)
+
+
+def inflate(path, digest=None):
+    """A gzip file's contents (every member), read as read_nocache reads it; DIGEST is fed the stored bytes."""
+    z = zlib.decompressobj(31)
+    for data in read_nocache(path, digest):
+        while data:
+            out = z.decompress(data, 16 * MiB)    # bounded: a chunk of zeros inflates a thousandfold
+            if out:
+                yield out
+            if z.eof:                             # the next member starts in what is left
+                data = z.unused_data
+                z = zlib.decompressobj(31)
+            else:
+                data = z.unconsumed_tail
+    out = z.flush()
+    if out:
+        yield out
 
 
 class Session:
@@ -120,6 +183,8 @@ class Session:
                                               'boot_b': '<boot_b>', 'vendor_boot_a': '<vendor_boot_a>', 'init_boot_a': '<init_boot_a>'})
         self.sizes = self.state.get('sizes', {'boot_a': common.BOOT_PARTITION_BYTES, 'boot_b': common.BOOT_PARTITION_BYTES,
                                               'vendor_boot_a': common.BOOT_PARTITION_BYTES, 'init_boot_a': 8 * MiB})
+        # LUN 0 partitions' first LBAs (4096-byte blocks) as the map found them; the GPT's of today until a map ran
+        self.starts = self.state.get('starts', {'rootfs': common.ROOTFS_FIRST, 'linux_data': common.DATA_FIRST, 'esp': common.ESP_FIRST})
 
     # -- bookkeeping ---------------------------------------------------------------------------------------------------
     @staticmethod
@@ -164,8 +229,10 @@ class Session:
         return 'unknown contents', None
 
     def esp_by_sha(self, sha):
-        """The build record (out/persistent/*.json) of the ESP image with this sha256, else None."""
+        """The build record (out/persistent/*.json) of the ESP image with this sha256, else None (installed.json is no record)."""
         for path in sorted(OUT.glob('*.json')):
+            if path.name == 'installed.json':
+                continue
             try:
                 record = json.loads(path.read_text())
             except ValueError:
@@ -256,14 +323,9 @@ class Session:
     def nas(self):
         """The backup directory of this install on the NAS: PIANO_BACKUP_DIR (runtime only) / persistent-boot-<time>."""
         name = self.state.get('backup_name') or f'persistent-boot-{time.strftime("%Y%m%d-%H%M%S")}'
-        raw = self.env.get('PIANO_BACKUP_DIR')
-        if not self.execute:
+        base = self.backup_root()
+        if base is None:
             return None, name
-        if not raw:
-            raise Stop('PIANO_BACKUP_DIR is not set (~/.config/piano/env); the NAS backup comes before any write')
-        base = Path(os.path.expanduser(os.path.expandvars(raw)))
-        if not base.is_dir() or not os.access(base, os.W_OK):
-            raise Stop('PIANO_BACKUP_DIR is not a writable directory (is the NAS mounted?)')
         (base / name).mkdir(exist_ok=True)
         if 'backup_name' not in self.state:
             self.save(backup_name=name, backups={})
@@ -355,10 +417,11 @@ class Session:
         return ip
 
     def serve(self, files):
-        """HTTP for the tablet's wget: only the named files, on the host's USB-link address."""
-        self.files.update({name: Path(path) for name, path in files.items()})
+        """HTTP for the tablet's wget: only the named files, on the host's USB-link address. A value ('gzip', PATH, BYTES) serves
+        PATH inflated (BYTES long): a piece of rootfs-backup."""
+        self.files.update({name: (path if isinstance(path, tuple) else Path(path)) for name, path in files.items()})
         for name, path in files.items():
-            self.log(f'  host  serves {name} ({Path(path).name})')
+            self.log(f'  host  serves {name} ({Path(path[1]).name + ", inflated" if isinstance(path, tuple) else Path(path).name})')
         if not self.execute or self.http:
             return
         session = self
@@ -366,12 +429,17 @@ class Session:
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 path = session.files.get(self.path.lstrip('/'))
-                if not path or not path.is_file():
+                gz = isinstance(path, tuple)
+                if not path or not (path[1] if gz else path).is_file():
                     self.send_error(404)
                     return
                 self.send_response(200)
-                self.send_header('Content-Length', str(path.stat().st_size))
+                self.send_header('Content-Length', str(path[2] if gz else path.stat().st_size))
                 self.end_headers()
+                if gz:
+                    for chunk in inflate(path[1]):
+                        self.wfile.write(chunk)
+                    return
                 with open(path, 'rb') as f:
                     while chunk := f.read(MiB):
                         self.wfile.write(chunk)
@@ -446,6 +514,106 @@ class Session:
             os.close(fd)
         return h.hexdigest()
 
+    def receive_piece(self, dev, skip, count, bs, dest, compress, name):
+        """One piece of a big region, streamed by the tablet over one TCP connection (a detached job: survives the telnet line) into
+        DEST, gzip-compressed on the host when COMPRESS. The sha256 is of the raw bytes as they arrive, before compression; a stall of
+        STALL s ends the piece. Returns (raw bytes, raw sha256, stored sha256, stored bytes); (None, ...) in a dry run."""
+        total = count * bs
+        if not self.execute:
+            self.t('job', name, 'send', dev, skip, count, bs, self.a.nc_port)
+            return None, None, None, None
+        server = socket.create_server((self.host_ip(), self.a.nc_port))
+        server.settimeout(120)
+        got, held = {}, {}
+
+        def run():
+            conn, f = None, None
+            try:
+                conn, _ = server.accept()
+                held['conn'] = conn
+                conn.settimeout(STALL)
+                raw, stored, n, kept = hashlib.sha256(), hashlib.sha256(), 0, 0
+                z = zlib.compressobj(1, zlib.DEFLATED, 31) if compress == 'gzip' else None
+                f = open(dest, 'wb')
+                while n < total:
+                    chunk = conn.recv(min(MiB, total - n))
+                    if not chunk:
+                        break
+                    raw.update(chunk)
+                    n += len(chunk)
+                    out = z.compress(chunk) if z else chunk
+                    if out:
+                        f.write(out)
+                        stored.update(out)
+                        kept += len(out)
+                if z:
+                    out = z.flush()
+                    f.write(out)
+                    stored.update(out)
+                    kept += len(out)
+                f.flush()
+                os.fsync(f.fileno())
+                got.update(bytes=n, sha256=raw.hexdigest(), stored_sha256=stored.hexdigest(), stored_bytes=kept)
+            except OSError as e:          # the backup disk or the link failed: close, so the tablet's nc ends too
+                got.update(error=str(e).replace(str(Path(dest).parent.parent), '$PIANO_BACKUP_DIR'))
+            finally:
+                if f:
+                    f.close()
+                if conn:
+                    conn.close()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        try:
+            if total > 256 * MiB:
+                self.job(name, 'send', dev, skip, count, bs, self.a.nc_port, timeout=limit(total))
+            else:
+                self.t('send', dev, skip, count, bs, self.a.nc_port, timeout=limit(total, floor=600))
+            thread.join(STALL + 60)
+        finally:
+            if thread.is_alive() and held.get('conn'):
+                held['conn'].shutdown(socket.SHUT_RDWR)   # the tablet's side ended or failed: do not wait out the stall
+                thread.join(30)
+            server.close()
+        if 'error' in got or 'bytes' not in got:
+            raise Stop(f'piece {name} of /dev/{dev} did not arrive: {got.get("error", "the stream ended early")}')
+        return got['bytes'], got['sha256'], got['stored_sha256'], got['stored_bytes']
+
+    @staticmethod
+    def read_back(path, compress, whole=None):
+        """A stored piece read without the page cache (F_NOCACHE): (raw sha256, raw bytes, stored sha256). Inflated when gzip; WHOLE
+        (a hashlib object) is fed the raw bytes too."""
+        raw, stored, n = hashlib.sha256(), hashlib.sha256(), 0
+        for chunk in inflate(path, stored) if compress == 'gzip' else read_nocache(path, stored):
+            raw.update(chunk)
+            n += len(chunk)
+            if whole is not None:
+                whole.update(chunk)
+        return raw.hexdigest(), n, stored.hexdigest()
+
+    def backup_root(self):
+        """PIANO_BACKUP_DIR (the external SSD), a writable directory; None in a dry run."""
+        raw = self.env.get('PIANO_BACKUP_DIR')
+        if not self.execute:
+            return None
+        if not raw:
+            raise Stop('PIANO_BACKUP_DIR is not set (~/.config/piano/env); the backup comes before any write')
+        base = Path(os.path.expanduser(os.path.expandvars(raw)))
+        if not base.is_dir() or not os.access(base, os.W_OK):
+            raise Stop('PIANO_BACKUP_DIR is not a writable directory (is the backup disk mounted?)')
+        return base
+
+    def write_manifest(self, nas, backups):
+        """SHA256SUMS (sha256sum -c: each stored file; a piecewise backup's pieces as stored) and manifest.json of a backup set."""
+        lines = []
+        for e in backups.values():
+            if e.get('pieces'):
+                lines += [f'{q["stored_sha256"]}  {q["file"]}\n' for q in e['pieces']]
+            else:
+                lines.append(f'{e["sha256"]}  {e["file"]}\n')
+        (nas / 'SHA256SUMS').write_text(''.join(lines))
+        (nas / 'manifest.json').write_text(json.dumps({'device': 'piano (Xiaomi Pad 8 Pro), UFS', 'backups': backups}, indent=2) + '\n')
+
     def backup(self, key, dev, skip, count, bs, what):
         """A verified NAS backup of one region (see the module doc, rule 1). Skipped when an identical verified one exists."""
         total = count * bs
@@ -478,8 +646,7 @@ class Session:
                  'what': what, 'verified': True, 'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'local': total <= SMALL}
         backups = dict(self.state.get('backups', {}), **{key: entry})
         self.save(backups=backups)
-        (nas / 'SHA256SUMS').write_text(''.join(f'{e["sha256"]}  {e["file"]}\n' for e in backups.values()))
-        (nas / 'manifest.json').write_text(json.dumps({'device': 'piano (Xiaomi Pad 8 Pro), UFS', 'backups': backups}, indent=2) + '\n')
+        self.write_manifest(nas, backups)
         return want
 
     def restore(self, key, dev, seek, bs):
@@ -578,16 +745,99 @@ def map_nodes(s):
     r = s.t('map')
     if not r:
         return None
-    nodes, sizes = {'lun0': r['lun0']}, {}
+    nodes, sizes, starts = {'lun0': r['lun0']}, {}, {}
     for key, name in (('rootfs', 'linux_rootfs'), ('linux_data', 'linux_data'), ('esp', 'esp'), ('boot_a', 'boot_a'), ('boot_b', 'boot_b'),
                       ('vendor_boot_a', 'vendor_boot_a'), ('init_boot_a', 'init_boot_a')):
         fields = r.get(name, 'none').split()
         nodes[key] = fields[0] if fields != ['none'] else None
         if len(fields) == 3:
             sizes[key] = int(fields[2]) * 512
-    s.nodes, s.sizes = nodes, sizes
-    s.save(nodes=nodes, sizes=sizes, map=r)
+            if name in PART_KEYS:          # LUN 0's: the first LBA in 4096-byte blocks
+                starts[key] = int(fields[1]) * 512 // B
+    s.nodes, s.sizes, s.starts = nodes, sizes, starts
+    s.save(nodes=nodes, sizes=sizes, starts=starts, map=r)
     return r
+
+
+def part_geometry(s, name):
+    """(node, first LBA, blocks) of LUN 0 partition NAME (4096-byte blocks) as the last map found it."""
+    key = PART_KEYS.get(name)
+    if not key:
+        raise Stop(f'partition {name}: not one that tablet.sh map reports ({", ".join(PART_KEYS)})')
+    return s.nodes.get(key), s.starts.get(key), (s.sizes.get(key) or 0) // B
+
+
+def bound_store(s, record):
+    """The store an ESP of a bound-store record (esp_store) resumes, read from the tablet: the window inside its partition as mapped
+    and at NativeUfs's place there for its size (the end of the partition below the reserve: native_ufs_store_open), the header
+    valid, of the record's seed, bound to that LBA (PersistOverlay.h kBound). Returns (True/False, the line; None in a dry run).
+    The line of a store that passes reads "... the store at LBA N on PART ... IS the one this ESP resumes ..."."""
+    store, seed = esp_store(record), record['seed']
+    first, blocks, part = store['first_lba'], store.get('blocks') or seed['store_blocks'], store['partition']
+    node, start, size = part_geometry(s, part)
+    if not s.execute:
+        return None, (f'the store at LBA {first} on {part} (a {blocks}-block window at NativeUfs\'s place in {part} as mapped) is valid, '
+                      f'of seed {seed["identity_sha256"][:16]}, bound to LBA {first}: then it IS the one this ESP resumes')
+    problems, header = [], {}
+    if not node or not size:
+        problems.append(f'the map has no partition {part}')
+    else:
+        last = start + size - 1
+        if not start <= first <= first + blocks - 1 <= last:
+            problems.append(f'its window LBA {first}-{first + blocks - 1} is not inside {part} (LBA {start}-{last})')
+        elif common.store_first(last, blocks) != first:
+            problems.append(f'NativeUfs puts a {blocks}-block window on {part} as mapped (LBA {start}-{last}) at LBA '
+                            f'{common.store_first(last, blocks)}, not {first}: the binding would refuse it')
+    if not problems:
+        header = common.store_header(bytes.fromhex(s.t('peek', node, first - start, 0, 128)['hex']))
+        if header['state'] != 'valid':
+            problems.append(f'its header is {header["state"]} (no store of this seed there)')
+        else:
+            if header.get('bound_lba') != first:
+                problems.append(f'it is bound to {header.get("bound_lba", "no LBA (unbound)")}, not LBA {first}')
+            if not common.store_usable(header, seed):
+                problems.append(f'it is of seed {header["identity"][:16]} ({header["pages"]} pages), not {seed["identity_sha256"][:16]} '
+                                f'({seed["pages"]} pages)')
+    s.save(esp_store={'partition': part, 'first_lba': first, 'node': node, 'header': header, 'problems': problems})
+    if problems:
+        return False, (f'the store at LBA {first} on {part} is NOT the one this ESP resumes (seed {seed["identity_sha256"][:16]}): '
+                       + '; '.join(problems) + ': its boots would keep it and run Data VOLATILE, or not find it')
+    return True, (f'the store at LBA {first} on {part} (seed {header["identity"][:16]}, generation {header["generation"]}, bound to LBA '
+                  f'{header["bound_lba"]}) IS the one this ESP resumes (seed {seed["identity_sha256"][:16]})')
+
+
+def root_manifest(s, part, below_lba=None):
+    """Block 0 of partition PART: (sha256, the SHNGROOT manifest's image bytes or None, the first 8 bytes); a dry run (None, None, None).
+    BELOW_LBA: the root image + 1024 blocks must end below it (the NativeUfs rule; the store window's first LBA)."""
+    node, start, _ = part_geometry(s, part)
+    digest = s.region_sha(node, 0, 1, name=f'sha-{part}-0')
+    h = s.t('peek', node, 0, 0, 24)
+    if not h:
+        return None, None, None
+    raw = bytes.fromhex(h['hex'])
+    image = int.from_bytes(raw[16:24], 'little') if raw[:8] == b'SHNGROOT' else None
+    return digest, image, raw[:8]
+
+
+def entries_using_rootfs(s, record):
+    """{entry id: why} of the ESP's entries that use linux_rootfs (common.entry_uses_rootfs), read from the image file itself when it
+    is in OUT and hashes to its record (the bytes the tablet holds), else from the record's unixnu.toml."""
+    text = record.get('unixnu_toml', '')
+    image = OUT / record['image']
+    if image.is_file():
+        if common.sha(image) != record['sha256']:
+            raise Stop(f'{image.name} does not hash to its record\'s {record["sha256"][:16]}')
+        try:
+            text = common.fat32_read(image)['files']['EFI/UniXNU/unixnu.toml'].decode()
+        except (ValueError, IndexError, KeyError, struct.error):
+            raise Stop(f'{image.name}: no unixnu.toml readable in the image')
+        if record.get('unixnu_toml') and text != record['unixnu_toml']:
+            raise Stop(f'{image.name}: its unixnu.toml is not its record\'s')
+    elif s.execute:
+        raise Stop(f'{record["image"]} is not in {OUT}: its menu cannot be read from the bytes on the tablet')
+    import tomllib   # Python 3.11 (here only: the other steps run on older ones too)
+    entries = tomllib.loads(text).get('entry', []) if text else []
+    return {e['id']: why for e in entries if (why := common.entry_uses_rootfs(e))}
 
 
 @step('linux-data-root', 'maintenance, WRITE linux_data from its first block (a second root image)',
@@ -622,9 +872,9 @@ def k273_store(s):
     block is blank (no SHNGDATA: before the entry's first data-persist=2 boot) or a valid store of the record's seed bound to that
     LBA (PersistOverlay.h kBound). The installed store's header in linux_rootfs is read too: unbound, the installed seed's."""
     record = s.esp_record(s.a.esp)
-    k = (record or {}).get('k273')
+    k = (record or {}).get('k273') or ({'store': esp_store(record), 'seed': record['seed']} if esp_store(record) else None)
     if not k:
-        raise Stop(f'{s.a.esp}: its record has no k273 entry (tooling/k273/build-dual-esp.py)')
+        raise Stop(f'{s.a.esp}: its record has no k273 entry (tooling/k273/build-dual-esp.py) and no store elsewhere (build-k273-esp.py)')
     store = k['store']
     first, blocks = store['first_lba'], store['blocks']
     root_end = (store.get('root_last_lba') or 0) + 1 or None
@@ -694,15 +944,21 @@ def maint_boot(s):
 @step('map', 'maintenance, read only')
 def map_step(s):
     """Map and check before any write: LUN 0 geometry, both GPT copies (old or new tables, nothing else), the boot partitions,
-    the root manifest and image size, both Data store places with their seed identity (against the ESP's), the ESP region."""
+    the root manifest and image size, both Data store places with their seed identity (against the ESP's), the ESP region.
+    With an ESP whose store is elsewhere (--esp of build-k273-esp.py: the 27.3 store on linux_data, bound): its root's manifest
+    and its store (bound_store) instead; linux_rootfs (the 27.0.1 root and store, or nothing once cleared) is then only reported."""
     r = map_nodes(s)
+    elsewhere = esp_store(s.esp)
     if r:
         s.need(r['lun0_block_size'] == '4096' and r['lun0_bytes'] == str(LUN0_BYTES), f'LUN 0 {r["lun0"]}: 4096-byte blocks, {LUN0_BYTES} bytes')
         s.need(r['mounted'] == '0', 'nothing from UFS is mounted')
-        start, size = (int(x) for x in r['linux_rootfs'].split()[1:])
-        s.need(start == common.ROOTFS_FIRST * 8 and size in ((common.ROOTFS_LAST - common.ROOTFS_FIRST + 1) * 8,
-                                                             (common.ROOTFS_NEW_LAST - common.ROOTFS_FIRST + 1) * 8),
-               f'linux_rootfs {r["linux_rootfs"]} (512-byte units)')
+        start, size = (int(x) for x in r['linux_rootfs'].split()[1:]) if r['linux_rootfs'] != 'none' else (None, None)
+        geometry = start == common.ROOTFS_FIRST * 8 and size in ((common.ROOTFS_LAST - common.ROOTFS_FIRST + 1) * 8,
+                                                                 (common.ROOTFS_NEW_LAST - common.ROOTFS_FIRST + 1) * 8)
+        if elsewhere:
+            s.log(f'  info  linux_rootfs {r["linux_rootfs"]} (512-byte units): no entry of {s.esp["image"]} uses it')
+        else:
+            s.need(geometry, f'linux_rootfs {r["linux_rootfs"]} (512-byte units)')
         s.need(r['boot_a'].split()[1:] == [str(common.BOOT_A_START_512), str(common.BOOT_A_SIZE_512)], f'boot_a {r["boot_a"]}')
         s.need(r['boot_b'] != 'none', f'boot_b {r["boot_b"]} (backed up only)')
     lun0, rootfs = s.nodes['lun0'], s.nodes['rootfs']
@@ -735,12 +991,30 @@ def map_step(s):
     if h:
         raw = bytes.fromhex(h['hex'])
         image_bytes = int.from_bytes(raw[16:24], 'little')
-        s.need(raw[:8] == b'SHNGROOT', 'linux_rootfs block 0 is the SHNGROOT manifest')
-        room = (store_new(s) - common.ROOTFS_FIRST) * B
-        s.need(image_bytes + 1024 * B <= room, f'root image ({image_bytes} bytes) + 1024 blocks below the new store place (NativeUfs rule)')
-        s.save(image_bytes=image_bytes)
+        if elsewhere:
+            s.log(f'  info  linux_rootfs block 0: ' + ('the SHNGROOT manifest of a root image of ' + str(image_bytes) + ' bytes (the 27.0.1 '
+                  'root)' if raw[:8] == b'SHNGROOT' else 'zero (cleared)' if not any(raw) else f'no manifest ({raw[:8].hex()})'))
+        else:
+            s.need(raw[:8] == b'SHNGROOT', 'linux_rootfs block 0 is the SHNGROOT manifest')
+            room = (store_new(s) - common.ROOTFS_FIRST) * B
+            s.need(image_bytes + 1024 * B <= room, f'root image ({image_bytes} bytes) + 1024 blocks below the new store place (NativeUfs rule)')
+            s.save(image_bytes=image_bytes)
+    if elsewhere:
+        # this ESP's root: the manifest at block 0 of the store's partition, the image + 1024 blocks below the store window
+        part = elsewhere['partition']
+        digest, image_bytes, magic = root_manifest(s, part)
+        if magic is not None:
+            _, start, _ = part_geometry(s, part)
+            s.need(image_bytes is not None, f'{part} block 0 is the SHNGROOT manifest (the root of {s.esp["image"]})')
+            s.need(image_bytes is not None and image_bytes + 1024 * B <= (elsewhere['first_lba'] - start) * B,
+                   f'root image ({image_bytes} bytes) + 1024 blocks below the store window at LBA {elsewhere["first_lba"]} (NativeUfs rule)')
+            s.save(root_manifest={'partition': part, 'sha256': digest, 'image_bytes': image_bytes})
+    rootfs_first, rootfs_blocks = s.starts.get('rootfs', common.ROOTFS_FIRST), (s.sizes.get('rootfs') or 0) // B
     for where, first in (('old', store_old(s)), ('new', store_new(s))):
-        h = s.t('peek', rootfs, rel(first), 0, 128)   # the version 1 header and its extension (docs/data-store.md)
+        if s.execute and not rootfs_first <= first < rootfs_first + rootfs_blocks:
+            s.log(f'  info  the {where} store place LBA {first} is outside linux_rootfs as mapped: not read')
+            continue
+        h = s.t('peek', rootfs, first - rootfs_first, 0, 128)   # the version 1 header and its extension (docs/data-store.md)
         if h:
             raw = bytes.fromhex(h['hex'])
             info = {'first_lba': first, 'magic': raw[:8].decode(errors='replace'), 'pages': int.from_bytes(raw[16:24], 'little'),
@@ -750,6 +1024,16 @@ def map_step(s):
             s.log(f'  info  store header at the {where} place (LBA {first}): {info}')
             s.save(**{f'store_{where}': info})
     old = s.state.get('store_old') or {}
+    if elsewhere:
+        s.save(store_matches_esp=False)
+        ok, text = bound_store(s, s.esp)
+        s.log(('  check ' if ok is None else '  ok    ' if ok else '  WARN  ') + text +
+              ('' if ok is not False else '; write_esp refuses this ESP'))
+        current = s.state.get('store_new') or {}
+        if current.get('state') == 'valid':
+            s.log(f'  info  the 27.0.1 store at LBA {store_new(s)} on linux_rootfs (seed {current["identity"][:16]}, generation '
+                  f'{current["generation"]}): no entry of this ESP opens it')
+        return
     if s.esp and old:
         # A store the ESP's NativeRamBlock resumes: made for its seed, or self-contained (flattened: any seed of its size).
         same = old.get('magic') == 'SHNGDATA' and old.get('pages') == s.esp['seed']['pages'] and \
@@ -937,7 +1221,11 @@ def write_esp(s, image_name):
         now = s.region_sha(lun0, common.ESP_FIRST, common.ESP_BLOCKS, name='esp-region-sha')
         s.require_backup('linux_rootfs-tail-esp', now if s.execute else None)
     current = s.state.get('store_new') or {}
-    if s.state.get('gpt_state') == 'new' and current.get('state') == 'valid' and not common.store_usable(current, record['seed']) \
+    if esp_store(record):
+        # the 27.3-only ESP (build-k273-esp.py): the store it resumes is on its own partition, bound to its LBA; read it now
+        ok, text = bound_store(s, record)
+        s.need(ok, text)
+    elif s.state.get('gpt_state') == 'new' and current.get('state') == 'valid' and not common.store_usable(current, record['seed']) \
             and not (record.get('data_store') or {}).get('replace'):
         raise Stop(f'{record["image"]}: its seed {record["seed"]["identity_sha256"][:16]} is not the seed of the store at LBA {store_new(s)} '
                    f'({current["identity"][:16]}, as step map read it): every boot of it would keep that store untouched and run the '
@@ -949,7 +1237,7 @@ def write_esp(s, image_name):
     else:
         s.log(f'  info  {record["image"]}: RAM window {window >> 20 if window else "-"} MiB, which every DarwinBoot takes')
     s.fetch(record['image'], OUT / record['image'], record['sha256'])
-    if s.write(f'{record["image"]} (default {record["default"]}, profile {record["profile"]}) -> /dev/{esp} (LUN 0 LBA {common.ESP_FIRST}, 1 GiB)'):
+    if s.write(f'{record["image"]} (default {record["default"]}, profile {record.get("profile")}) -> /dev/{esp} (LUN 0 LBA {common.ESP_FIRST}, 1 GiB)'):
         s.job('esp-write', 'write', record['image'], esp, 0, MiB, timeout=1800)
     got = s.region_sha(esp, 0, 1024, MiB, name='esp-check')
     got2 = s.region_sha(lun0, common.ESP_FIRST * B // MiB, 1024, MiB, name='esp-check-lun0')
@@ -980,11 +1268,25 @@ def esp_back(s):
     window = s.esp_window(record)
     if window and window > common.OLD_DARWINBOOT_WINDOW_MAX:
         s.pair(s.tablet_boot_a(), record, f'the backed-up ESP {record["image"]} asks for {window >> 20} MiB')
+    if record:
+        # an ESP whose default entry boots from linux_rootfs needs its root there: after rootfs-clear, rollback rootfs-clear first
+        why = common.entry_uses_rootfs({'type': 'xnu', 'args': (record.get('cmdlines') or {}).get(record.get('default'), '')})
+        if why:
+            _, image, magic = root_manifest(s, 'linux_rootfs')
+            cleared = image is None if magic is not None else bool(s.state.get('rootfs_cleared'))
+            s.need(not cleared, f'the backed-up ESP {record["image"]}\'s default entry {record.get("default")} {why}, which ' +
+                   ('holds no root image now: rollback rootfs-clear first' if cleared else 'still holds its root image'))
     s.restore('linux_rootfs-tail-esp', s.nodes['lun0'], common.ESP_FIRST, B)
     s.sim['esp'] = entry.get('sha256')
     if s.execute:
-        s.save(esp_written=None, esp_sha256=None)
-        (OUT / 'installed.json').unlink(missing_ok=True)   # the region holds what it held before this install
+        if record:   # an ESP of a build record (an earlier install's): the installed seed is its seed again
+            s.save(esp_written=record['image'], esp_sha256=record['sha256'])
+            common.write_json(OUT / 'installed.json', {'image': record['image'], 'sha256': record['sha256'], 'seed': record['seed'],
+                                                       'inputs': record.get('inputs'), 'written': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                                       'by': 'rollback esp'})
+        else:
+            s.save(esp_written=None, esp_sha256=None)
+            (OUT / 'installed.json').unlink(missing_ok=True)   # the region holds what it held before this install
 
 
 # esp-final writes the same region as esp, so its rollback is the same (the step's own hint names it)
@@ -1013,7 +1315,22 @@ def check_step(s):
         got = s.region_sha(lun0, common.ESP_FIRST * B // MiB, 1024, MiB, name='esp-check-lun0')
         s.need(got == s.state.get('esp_sha256') if s.execute else None, f'ESP = {s.state.get("esp_written", "the image written")}')
         esp_now = got if s.execute else esp_now
-    s.pair(boot_now, s.esp_by_sha(esp_now) if esp_now else None, 'the pair on the tablet')
+    record_now = s.esp_by_sha(esp_now) if esp_now else None
+    s.pair(boot_now, record_now, 'the pair on the tablet')
+    rec = record_now or (s.esp if not s.execute else None)
+    if esp_store(rec):
+        # the ESP's own root and store (the 27.3 line on linux_data): the manifest as map read it, the store bound and of its seed
+        saved = s.state.get('root_manifest') or {}
+        digest, image, _ = root_manifest(s, esp_store(rec)['partition'])
+        if saved.get('partition') == esp_store(rec)['partition'] or not s.execute:
+            s.need(digest == saved.get('sha256') if s.execute else None,
+                   f'{esp_store(rec)["partition"]} block 0 (the root manifest of {rec["image"]}) unchanged')
+        else:
+            s.log(f'  info  {esp_store(rec)["partition"]} block 0: {"SHNGROOT, " + str(image) + " bytes" if image else "no manifest"} '
+                  f'(map ran without --esp {rec["image"]}: nothing to compare with)')
+        ok, text = bound_store(s, rec)
+        s.need(ok, text)
+        return
     h = s.t('peek', rootfs, rel(store_new(s)), 0, 8)
     if h:
         s.log(f'  info  store header at LBA {store_new(s)}: {bytes.fromhex(h["hex"])!r}'
@@ -1305,6 +1622,293 @@ def reboot(s):
 
 
 # ------------------------------------------------------------------------------------------------------------------------
+# linux_rootfs once 27.0.1 is retired (docs/persistent-boot.md section 13): a verified backup of the whole partition, then a discard.
+# The partition is taken from the map (node, first LBA, size), never from the GPT of today, so a later layout keeps working.
+
+ROOTFS_KEY = 'linux_rootfs'
+
+
+def rootfs_target(s):
+    """linux_rootfs as mapped: (node, first LBA, blocks, bs, count). bs is 1 MiB when the partition is a whole number of MiB (else
+    4096); the node must be a partition of LUN 0 that overlaps neither linux_data nor the ESP."""
+    node, start, blocks = part_geometry(s, ROOTFS_KEY)
+    lun0 = s.nodes.get('lun0')
+    if s.execute:
+        s.need(bool(node) and blocks > 0, f'linux_rootfs found: /dev/{node}, LBA {start}, {blocks} blocks')
+        s.need(node != lun0 and re.fullmatch(re.escape(lun0 or '?') + r'\d+', node or '') is not None,
+               f'/dev/{node} is a partition of LUN 0 /dev/{lun0}, not the disk')
+        for other in ('linux_data', 'esp'):
+            onode, ostart, oblocks = part_geometry(s, other)
+            s.need(onode != node and (not oblocks or ostart + oblocks <= start or start + blocks <= ostart),
+                   f'/dev/{node} is not {other} (/dev/{onode}, LBA {ostart}+{oblocks}) and does not overlap it')
+    else:
+        blocks = blocks or (common.ROOTFS_NEW_LAST - common.ROOTFS_FIRST + 1)
+    total = blocks * B
+    bs = MiB if total % MiB == 0 else B
+    return node, start, blocks, bs, total // bs
+
+
+def rootfs_pieces(s, count, bs):
+    per = max(1, s.a.rootfs_piece_mib * MiB // bs)
+    return [(i, skip, min(per, count - skip)) for i, skip in enumerate(range(0, count, per))]
+
+
+@step('rootfs-backup', 'maintenance, read only on the tablet; writes the backup of the whole linux_rootfs (PIANO_BACKUP_DIR)')
+def rootfs_backup(s):
+    """A verified backup of the whole linux_rootfs (the 27.0.1 root image and its Data store; about 59 GiB), before rootfs-clear.
+    The partition as mapped, in pieces of --rootfs-piece-mib (default 4096 MiB) into PIANO_BACKUP_DIR/<set>/linux_rootfs/, each
+    gzip-compressed on the host (--rootfs-compress none: raw). The checks stay exact, on the raw bytes: (1) the tablet's own
+    sha256 of the piece read from the medium (page cache dropped); (2) the sha256 of the bytes as they arrive, before they are
+    compressed; (3) the stored file read back without the page cache (F_NOCACHE) and inflated: its sha256 is (1). The compressed
+    file's own sha256 is recorded too (SHA256SUMS), so rootfs-clear and the rollback can recheck the copy without inflating it.
+    At the end every piece is read back once more and the whole partition's sha256 is taken over the inflated pieces in order.
+    A slow or flaky USB link: each piece is a detached tablet job polled with keepalives, its time limit scaled to its size (at
+    least 1 MiB/s), a stream that stalls 300 s fails the piece, a failed piece is tried 3 times, and a step stopped anywhere
+    resumes at the first piece not yet verified (the progress is in the state). Nothing is written on the tablet."""
+    map_nodes(s)
+    node, start, blocks, bs, count = rootfs_target(s)
+    total, compress = count * bs, s.a.rootfs_compress
+    pieces = rootfs_pieces(s, count, bs)
+    nas, name = s.nas()
+    s.log(f'  backup {ROOTFS_KEY}: /dev/{node} (LUN 0 LBA {start}-{start + blocks - 1}), {total} bytes in {len(pieces)} pieces of up to '
+          f'{s.a.rootfs_piece_mib} MiB, {compress} -> {name}/{ROOTFS_KEY}/')
+    entry = (s.state.get('backups') or {}).get(ROOTFS_KEY)
+    if entry and entry.get('verified'):
+        s.need((entry['first_lba'], entry['blocks']) == (start, blocks), f'the verified backup in {name} is of this partition '
+               f'(LBA {entry["first_lba"]}+{entry["blocks"]})')
+        now = s.region_sha(node, 0, count, bs, name='sha-rootfs-now')
+        s.need(now == entry['sha256'], f'linux_rootfs now = its verified backup ({entry["sha256"][:16]}); --new-backup for another set')
+        s.log('  ok    already backed up and verified')
+        return
+    want_plan = {'set': name, 'first_lba': start, 'blocks': blocks, 'bs': bs, 'piece_mib': s.a.rootfs_piece_mib, 'compress': compress}
+    progress = s.state.get('rootfs_backup_progress') or {}
+    if {k: progress.get(k) for k in want_plan} != want_plan:
+        progress = dict(want_plan, pieces={})
+    folder = nas / ROOTFS_KEY if nas else None
+    if folder:
+        folder.mkdir(exist_ok=True)
+    suffix = '.img.gz' if compress == 'gzip' else '.img'
+    for i, skip, n in pieces:
+        file = f'{ROOTFS_KEY}/piece-{i:03d}{suffix}'
+        want = s.region_sha(node, skip, n, bs, name=f'sha-rootfs-{i:03d}')
+        if not s.execute:
+            s.receive_piece(node, skip, n, bs, None, compress, f'send-rootfs-{i:03d}')
+            continue
+        done = progress['pieces'].get(str(i))
+        if done and done['sha256'] == want and (nas / file).is_file() and (nas / file).stat().st_size == done['stored_bytes']:
+            s.log(f'  ok    piece {i}: verified in an earlier run (sha256 {want[:16]})')
+            continue
+        for attempt in range(1, PIECE_TRIES + 1):
+            try:
+                got, raw, stored, kept = s.receive_piece(node, skip, n, bs, nas / file, compress, f'send-rootfs-{i:03d}')
+                back, back_n, back_stored = s.read_back(nas / file, compress)
+                if (got, raw) == (n * bs, want) and (back_n, back, back_stored) == (n * bs, want, stored):
+                    break
+                s.log(f'  WARN  piece {i}, try {attempt}: received {got} bytes {raw}, read back {back_n} bytes {back}; the tablet\'s {want}')
+            except Stop as e:
+                s.log(f'  WARN  piece {i}, try {attempt}: {e}')
+        else:
+            raise Stop(f'piece {i} of linux_rootfs failed {PIECE_TRIES} times: run rootfs-backup again (it resumes here)')
+        s.log(f'  ok    piece {i}/{len(pieces) - 1}: {n * bs} bytes, sha256 {want[:16]} = received = read back without cache '
+              f'({kept} bytes stored)')
+        progress['pieces'][str(i)] = {'file': file, 'skip': skip, 'count': n, 'sha256': want, 'stored_sha256': stored, 'stored_bytes': kept}
+        s.save(rootfs_backup_progress=progress)
+    if not s.execute:
+        s.log('  check every piece: received bytes and sha256 = the tablet\'s; the stored file read back without cache (inflated) = the '
+              'same; then the whole partition\'s sha256 over all pieces read back again')
+        return
+    whole, problems = hashlib.sha256(), []
+    for i, skip, n in pieces:
+        q = progress['pieces'][str(i)]
+        back, back_n, back_stored = s.read_back(nas / q['file'], compress, whole)
+        if (back, back_n, back_stored) != (q['sha256'], n * bs, q['stored_sha256']):
+            problems.append(f'piece {i}')
+    s.need(not problems, f'every piece read back again without cache = its sha256 ({", ".join(problems) or "all"})')
+    entry = {'file': f'{ROOTFS_KEY}/', 'sha256': whole.hexdigest(), 'bytes': total, 'dev': node, 'skip': 0, 'count': count, 'bs': bs,
+             'partition': ROOTFS_KEY, 'first_lba': start, 'blocks': blocks, 'compression': compress,
+             'what': f'partition linux_rootfs (whole, LUN 0 LBA {start}-{start + blocks - 1}), {len(pieces)} pieces',
+             'verified': True, 'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'local': False,
+             'pieces': [progress['pieces'][str(i)] for i, _, _ in pieces]}
+    s.log(f'  ok    linux_rootfs backed up: {total} bytes, sha256 {entry["sha256"]} ({sum(q["stored_bytes"] for q in entry["pieces"])} '
+          f'bytes stored)')
+    backups = dict(s.state.get('backups', {}), **{ROOTFS_KEY: entry})
+    s.state.pop('rootfs_backup_progress', None)
+    s.save(backups=backups)
+    s.write_manifest(nas, backups)
+    (nas / ROOTFS_KEY / 'RAW-SHA256SUMS').write_text(
+        ''.join(f'{q["sha256"]}  {q["file"]} (inflated)\n' for q in entry['pieces']) + f'{entry["sha256"]}  linux_rootfs (whole)\n')
+
+
+def rootfs_backup_entry(s):
+    """The verified linux_rootfs backup rootfs-clear and its rollback use: this state's (step rootfs-backup), or the one in
+    PIANO_BACKUP_DIR/<--rootfs-backup-set>/manifest.json (an earlier session's set). Every stored piece is there, with its recorded
+    size, and hashes to its recorded sha256 read without the page cache. Returns (entry, the set's directory); a dry run (entry, None)."""
+    if s.a.rootfs_backup_set:
+        if not s.execute:
+            s.log(f'  check the verified backup of linux_rootfs in PIANO_BACKUP_DIR/{s.a.rootfs_backup_set} (its manifest.json)')
+            return None, None
+        where = s.backup_root() / s.a.rootfs_backup_set
+        manifest = where / 'manifest.json'
+        if not manifest.is_file():
+            raise Stop(f'--rootfs-backup-set {s.a.rootfs_backup_set}: no manifest.json in that set')
+        entry = json.loads(manifest.read_text())['backups'].get(ROOTFS_KEY)
+        source = f'set {s.a.rootfs_backup_set}'
+    else:
+        entry = (s.state.get('backups') or {}).get(ROOTFS_KEY)
+        source = f'this session\'s set {s.state.get("backup_name")}'
+        if not s.execute:
+            s.log('  check a verified backup of linux_rootfs in this session\'s state (step rootfs-backup), or --rootfs-backup-set NAME')
+            return entry, None
+        if not entry:
+            raise Stop('no verified backup of linux_rootfs in this session\'s state: run step rootfs-backup first, or name an '
+                       'earlier set with --rootfs-backup-set NAME')
+        where = s.backup_root() / s.state['backup_name']
+    s.need(bool(entry) and entry.get('verified') and entry.get('pieces'), f'a verified backup of linux_rootfs in {source}')
+    covered = 0
+    for q in entry['pieces']:
+        s.need(q['skip'] == covered, f'piece {q["file"]} follows the one before (block {covered})')
+        covered += q['count']
+    s.need(covered == entry['count'], f'the pieces cover the partition ({covered} of {entry["count"]} blocks of {entry["bs"]} bytes)')
+    bad = [q['file'] for q in entry['pieces'] if not (where / q['file']).is_file() or (where / q['file']).stat().st_size != q['stored_bytes']
+           or s.sha_nocache(where / q['file']) != q['stored_sha256']]
+    s.need(not bad, f'every stored piece is there and hashes to its recorded sha256 (read without cache){": " + str(bad) if bad else ""}')
+    return entry, where
+
+
+def rootfs_zero_regions(s, start, blocks):
+    """(first LBA, blocks) that must read zero after the clear: the first and last 64 MiB of the partition, and 64 MiB from each
+    27.0.1 Data store header place inside it (the map's, and the places of today's layout: LBA 68119455, 68381599)."""
+    span = min(blocks, 64 * MiB // B)
+    lbas = {start, start + blocks - span}
+    for first in [(s.state.get(k) or {}).get('first_lba') for k in ('store_new', 'store_old')] + [store_new(s), store_old(s)]:
+        if first is not None and start <= first < start + blocks:
+            lbas.add(first)
+    return sorted((lba, min(span, start + blocks - lba)) for lba in lbas)
+
+
+def zero_sha(nbytes, cache={}):
+    if nbytes not in cache:
+        h, left = hashlib.sha256(), nbytes
+        while left:
+            h.update(bytes(min(left, 16 * MiB)))
+            left -= min(left, 16 * MiB)
+        cache[nbytes] = h.hexdigest()
+    return cache[nbytes]
+
+
+def rootfs_zero(s, node, start, blocks):
+    """Do the check regions read zero (from the medium)? (all zero, [the regions that do not])."""
+    wrong = []
+    for lba, n in rootfs_zero_regions(s, start, blocks):
+        got = s.region_sha(node, lba - start, n, name=f'zero-check-{lba}')
+        if s.execute and got != zero_sha(n * B):
+            wrong.append(lba)
+    return not wrong, wrong
+
+
+def keep_hashes(s, record):
+    """What rootfs-clear must leave as it is, read from the medium: both GPT copies, the ESP, block 0 of linux_data (the 27.3 root's
+    manifest) and the header block of the ESP's store."""
+    lun0 = s.nodes['lun0']
+    out = {'GPT head': s.region_sha(lun0, 0, 6), 'GPT tail': s.region_sha(lun0, TAIL_LBA, 5), 'ESP': s.tablet_esp()}
+    store = esp_store(record)
+    if store:
+        node, start, _ = part_geometry(s, store['partition'])
+        out[f'{store["partition"]} block 0'] = s.region_sha(node, 0, 1)
+        out[f'store header LBA {store["first_lba"]}'] = s.region_sha(node, store['first_lba'] - start, 1)
+    return out
+
+
+@step('rootfs-clear', 'maintenance, WRITE (discard) all of linux_rootfs', writes='LUN 0 partition linux_rootfs, all of it (no GPT change)')
+def rootfs_clear(s):
+    """Retire the 27.0.1 system: discard the whole linux_rootfs partition (its root image and its Data store). Refused unless
+    (1) the target is linux_rootfs as mapped: a partition of LUN 0 (never the disk), not linux_data, not the ESP, overlapping
+    neither; (2) the ESP on the tablet, read and hashed, is the image of a 27.3-only record here (build-k273-esp.py: its store
+    elsewhere, bound) whose menu, read out of that image, has no entry that uses linux_rootfs; (3) a verified backup of exactly this
+    partition (rootfs-backup, this session's or --rootfs-backup-set NAME's) is on the backup disk, every stored piece there and
+    hashing to its record, and the partition read now on the tablet hashes to the backup. Then `blkdiscard` of the partition node
+    (BusyBox's in the maintenance image; tablet.sh checks the node's name, start and size again first), or zeros by dd when the
+    disk takes no discards (--rootfs-zero: always zeros). Read back from the medium: the first and last 64 MiB and 64 MiB from each
+    old store header place must be zero (a device that does not read zeros after a discard is zeroed, then read again). The GPT,
+    the ESP, linux_data's manifest block and the 27.3 store's header are hashed before and after: unchanged. Undo: rollback
+    rootfs-clear (the backup, piece by piece)."""
+    map_nodes(s)
+    node, start, blocks, bs, count = rootfs_target(s)
+    esp_sha = s.tablet_esp()
+    record = s.esp_by_sha(esp_sha) if esp_sha else (s.esp if not s.execute else None)
+    s.need(record is not None if s.execute else None, f'the ESP on the tablet ({esp_sha and esp_sha[:16]}) is the image of a build record '
+           f'in {OUT.name}')
+    if record:
+        s.need(bool(esp_store(record)), f'{record["image"]} is a 27.3-only ESP (its store: '
+               f'{(esp_store(record) or {}).get("partition", "linux_rootfs, the 27.0.1 store")})')
+        users = entries_using_rootfs(s, record)
+        s.need(not users, f'no entry of {record["image"]} uses linux_rootfs (its unixnu.toml read out of the image)' +
+               (f': {users}' if users else ''))
+    entry, _ = rootfs_backup_entry(s)
+    if s.execute:
+        s.need((entry['first_lba'], entry['blocks'], entry['bs'], entry['count']) == (start, blocks, bs, count),
+               f'the backup is of linux_rootfs as mapped (LBA {entry["first_lba"]}+{entry["blocks"]})')
+    now = s.region_sha(node, 0, count, bs, name='sha-rootfs-now')
+    s.need(now == entry['sha256'] if s.execute else None, f'linux_rootfs read now = its backup ({entry["sha256"][:16] if entry else "-"})')
+    before = keep_hashes(s, record)
+    info = s.t('discard-info', node) or {}
+    method = 'zero' if s.a.rootfs_zero or (s.execute and info.get('discard') != '1') else 'discard'
+    s.log(f'  info  discard: {info or "(dry run)"} -> {method}')
+    guard = (node, ROOTFS_KEY, start * B // 512, blocks * B // 512)
+    if s.write(f'{method} /dev/{node}: all of linux_rootfs, LUN 0 LBA {start}-{start + blocks - 1} ({blocks * B} bytes)'):
+        s.job(f'rootfs-{method}', method, *guard, timeout=limit(blocks * B, SLOW_MEDIUM))
+    zero, wrong = rootfs_zero(s, node, start, blocks)
+    if s.execute and not zero and method == 'discard':
+        s.log(f'  WARN  after the discard, LBA {wrong} do not read zero (the device keeps old data on unmap): zeros instead')
+        method = 'discard+zero'
+        if s.write(f'zero /dev/{node}: all of linux_rootfs'):
+            s.job('rootfs-zero', 'zero', *guard, timeout=limit(blocks * B, SLOW_MEDIUM))
+        zero, wrong = rootfs_zero(s, node, start, blocks)
+    regions = ', '.join(f'LBA {lba}+{n}' for lba, n in rootfs_zero_regions(s, start, blocks))
+    s.need(zero if s.execute else None, f'linux_rootfs reads zero from the medium: {regions}' + (f' (not: {wrong})' if wrong else ''))
+    after = keep_hashes(s, record)
+    for key in before:
+        s.need(after[key] == before[key] if s.execute else None, f'{key} unchanged ({(after[key] or "-")[:16]})')
+    if s.execute:
+        s.save(rootfs_cleared={'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'method': method, 'first_lba': start, 'blocks': blocks,
+                               'sha256_before': now, 'backup_set': s.a.rootfs_backup_set or s.state.get('backup_name')},
+               manifest_sha256=s.region_sha(node, 0, 1))
+
+
+@rollback('rootfs-clear')
+def rootfs_clear_back(s):
+    """linux_rootfs as rootfs-backup saved it (this session's set, or --rootfs-backup-set NAME), piece by piece from the backup disk:
+    each served inflated, written by dd from the maintenance image, read back from the medium = its sha256; a piece that already
+    reads as backed up is skipped (a stopped rollback resumes). Then the whole partition = the backup's sha256. The partition as
+    mapped must be the backup's (first LBA and size); the GPT is not touched. Only then may an ESP with 27.0.1 entries go back."""
+    map_nodes(s)
+    node, start, blocks, bs, count = rootfs_target(s)
+    entry, where = rootfs_backup_entry(s)
+    if not s.execute:
+        s.log(f'  check per piece: the tablet\'s sha256 of its blocks; if not the backup\'s: served inflated, restored by dd, read back')
+        s.write(f'the pieces of the backup -> /dev/{node} from block 0 ({count} blocks of {bs} bytes)')
+        s.region_sha(node, 0, count, bs, name='rootfs-check')
+        return
+    s.need((entry['first_lba'], entry['blocks'], entry['bs'], entry['count']) == (start, blocks, bs, count),
+           f'linux_rootfs as mapped is the backup\'s partition (LBA {entry["first_lba"]}+{entry["blocks"]})')
+    for q in entry['pieces']:
+        now = s.region_sha(node, q['skip'], q['count'], bs, name=f'sha-rootfs-{q["skip"]}')
+        if now == q['sha256']:
+            s.log(f'  ok    {q["file"]}: already as backed up')
+            continue
+        served = ('gzip', where / q['file'], q['count'] * bs) if entry.get('compression') == 'gzip' else where / q['file']
+        piece = Path(q['file']).name
+        s.serve({piece: served})
+        if s.write(f'{q["file"]} -> /dev/{node} at block {q["skip"]} of {bs} bytes'):
+            s.job(f'restore-rootfs-{q["skip"]}', 'restore', piece, node, q['skip'], bs, s.a.http_port, timeout=limit(q['count'] * bs))
+        got = s.region_sha(node, q['skip'], q['count'], bs, name=f'check-rootfs-{q["skip"]}')
+        s.need(got == q['sha256'], f'{q["file"]} restored: read back {got[:16]} = {q["sha256"][:16]}')
+    got = s.region_sha(node, 0, count, bs, name='rootfs-check')
+    s.need(got == entry['sha256'], f'linux_rootfs restored: {got} = the backup\'s {entry["sha256"][:16]}')
+    s.save(rootfs_cleared=None, manifest_sha256=s.region_sha(node, 0, 1))
+
+
+# ------------------------------------------------------------------------------------------------------------------------
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1324,6 +1928,13 @@ def main():
     p.add_argument('--dev-image', default=str(D / 'out/ram-precedence/boot-piano-macos-ram-A-bundled.img'))
     p.add_argument('--session', type=Path, default=OUT / 'session')
     p.add_argument('--new-backup', action='store_true', help='start a new NAS backup set (the old one stays on the NAS)')
+    p.add_argument('--rootfs-piece-mib', type=int, default=4096, metavar='MIB',
+                   help='rootfs-backup: the size of a piece (each its own stream, checked, retried, resumed)')
+    p.add_argument('--rootfs-compress', choices=('gzip', 'none'), default='gzip',
+                   help='rootfs-backup: gzip each piece on the host (the checks are on the raw bytes), or store it raw')
+    p.add_argument('--rootfs-backup-set', metavar='NAME', help='rootfs-clear and its rollback: the verified linux_rootfs backup of '
+                   'this earlier set in PIANO_BACKUP_DIR (default: this session\'s)')
+    p.add_argument('--rootfs-zero', action='store_true', help='rootfs-clear: zeros by dd instead of a discard')
     p.add_argument('--http-port', type=int, default=8000)
     p.add_argument('--nc-port', type=int, default=9000)
     a = p.parse_args()

@@ -196,6 +196,25 @@ def store_args_of(args):
     return named.get('native-ufs-root-part', 'linux_rootfs'), int(lba, 0) if lba else None
 
 
+def entry_uses_rootfs(entry):
+    """Why a unixnu.toml entry (a dict) would use linux_rootfs, or None. NativeUfs mounts its root from linux_rootfs unless
+    native-ufs-root-part names another partition, and the Data store lives on the root partition (store_args_of), so an entry that
+    mounts a UFS root or opens a store without native-ufs-root-part uses linux_rootfs as much as one that names it."""
+    if entry.get('type') != 'xnu':
+        return None
+    text = entry.get('args', '')
+    args = text.split()
+    named = dict(x.split('=', 1) for x in args if '=' in x)
+    if 'linux_rootfs' in text:
+        return 'names linux_rootfs'
+    part, _ = store_args_of(args)
+    if named.get('native-ufs-root', '0') not in ('0', '') and part == 'linux_rootfs':
+        return 'mounts its UFS root from linux_rootfs (no native-ufs-root-part)'
+    if named.get('data-persist', '0') != '0' and part == 'linux_rootfs':
+        return 'opens a Data store on linux_rootfs (no native-ufs-root-part)'
+    return None
+
+
 def check_store_size(seed, args=()):
     """SystemExit when SEED (seed_info) would put its store window somewhere else than the installed store's. A store on linux_data
     (ARGS: native-ufs-root-part=linux_data, the 27.3 line) is not the installed one: any size, but only bound to its window
