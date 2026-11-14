@@ -228,6 +228,18 @@ class Governor {
     return top;
   }
   unsigned floorLevel() const { return config_.floorKhz ? slowestAtLeast(config_.floorKhz) : 0; }
+  // piano-cpufreq-boost=S (2026-11-14, boot time): the level while the boot boost lasts, in every mode (report included): the
+  // sustained level, or the fastest at or under capKhz when one is given (piano-cpufreq-boost-cap), never above the thermal limit.
+  unsigned boostLevel(uint32_t capKhz) const
+  {
+    unsigned top = sustained_;
+    if (capKhz) {
+      const unsigned l = fastestAtMost(capKhz);
+      if (l < top) top = l;
+    }
+    return limit_ < top ? limit_ : top;
+  }
+  unsigned sustained() const { return sustained_; }
   unsigned level() const { return level_; }
   unsigned limit() const { return limit_; }
   unsigned count() const { return count_; }
@@ -264,6 +276,15 @@ class Governor {
   uint64_t downAtMs_ = 0, upAtMs_ = 0, coolSinceMs_ = 0;
   bool cooling_ = false;
 };
+
+// The boot boost (piano-cpufreq-boost=S) of one domain at a poll at uptime nowMs: boost (send boostLevel) until endMs, then end
+// once (report mode back to the level the boot stages left, the other modes on from where the domain is), then none. endMs 0: off.
+enum class BoostStep : uint8_t { none, boost, end };
+inline BoostStep boostStep(uint64_t nowMs, uint64_t endMs, bool ended)
+{
+  if (!endMs || ended) return BoostStep::none;
+  return nowMs < endMs ? BoostStep::boost : BoostStep::end;
+}
 
 // Per mille busy of one core over a window: wall time minus its idle time and minus the time PianoThermal's own thread ran on that
 // core in the window (its sensor polls, SCMI waits and load reads: P9 of 2026-11-12, the governor must not count its own work as

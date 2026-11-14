@@ -609,6 +609,33 @@ static void testGovernor()
 // ------------------------------------------------------------------------------------------------------------- profile, sleep
 // PianoPolicy's profile (docs/policy.md 5.2): what the governor is handed as its power source, and so its ceiling; the fixed level
 // ignores it. The sleep plan: what kOff and kOn do, once each.
+// piano-cpufreq-boost (2026-11-14): the sustained level in every mode until the end, the thermal limit on top, a cap if given; the
+// step machine boosts until endMs, ends once, then nothing; 0 = off.
+static void testBoost()
+{
+  GovernorConfig gc;
+  Governor g;
+  g.init(CpuMode::report, gc, kNcc1, 16, 14, 0);   // report mode at the slowest level (cluster 1 as the boot stages leave it)
+  CHECK(g.sustained() == 14 && g.boostLevel(0) == 14);                    // 4089.6 MHz, not the 4320 boost level
+  CHECK(g.boostLevel(capKhz(3000)) == 9 && g.boostLevel(capKhz(1000)) == 0);   // 2918.4 MHz; under the slowest: the slowest
+  CHECK(g.tick(tick(1000)) == 0 && g.enforce(PowerSource::external) == 0);   // report mode itself never moves
+  uint64_t t = 1000;
+  g.thermal(hot(), t);
+  CHECK(g.limit() == 14 && g.boostLevel(0) == 14);
+  for (int i = 0; i < 4; ++i) g.thermal(hot(), t += 20);
+  CHECK(g.limit() == 10 && g.boostLevel(0) == 10 && g.boostLevel(capKhz(2100)) == 5);   // the thermal limit wins
+  g.thermal(cut(), t += 1);
+  CHECK(g.boostLevel(0) == 0);
+  Governor f;
+  gc.capKhz = capKhz(1958);
+  f.init(CpuMode::fixed, gc, kNcc1, 16, 14, 4);
+  CHECK(f.boostLevel(0) == 14 && f.tick(tick(0)) == 4);   // the boost ignores the mode's cap; after it the fixed level again
+  CHECK(boostStep(0, 0, false) == BoostStep::none);          // off
+  CHECK(boostStep(500, 60000, false) == BoostStep::boost && boostStep(59999, 60000, false) == BoostStep::boost);
+  CHECK(boostStep(60000, 60000, false) == BoostStep::end && boostStep(90000, 60000, false) == BoostStep::end);
+  CHECK(boostStep(60000, 60000, true) == BoostStep::none && boostStep(100, 60000, true) == BoostStep::none);   // ended: never again
+}
+
 static void testProfileAndSleep()
 {
   CHECK(profileValid(0) && profileValid(1) && profileValid(2) && !profileValid(3) && !profileValid(~uintptr_t(0)));
@@ -864,6 +891,7 @@ int main(int argc, char **argv)
   testScmi();
   testLoadWindow();
   testGovernor();
+  testBoost();
   testProfileAndSleep();
   testCluster();
   testInterruptsAndPolling();

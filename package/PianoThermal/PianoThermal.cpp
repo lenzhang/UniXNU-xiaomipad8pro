@@ -23,6 +23,8 @@
 //                    / on power (Balanced: 3532 / 4089) from the IOPMPowerSource's ExternalConnected (unknown = battery), thermal
 //                    limit on top. Its busy figure leaves out this thread's own time on each core (2026-11-12, P9), and the window
 //                    holding the per-core clock measurement makes no decision.
+//   piano-cpufreq-boost=S  (2026-11-14) the boot boost: every cluster at its sustained level until S s of uptime, the thermal limit
+//                    on top, then the mode's own level (implies piano-cpufreq=1: then back to the boot stages' level); -cap=<MHz>.
 // The thermal limit of modes 2 and 3 (Cluster.h) works on a hard ceiling since 2026-11-12: one level down per 10 ms while any cpu-*
 // sensor of the cluster is at piano-cpufreq-hot (default 90 C, never above the zone's stock passive trip; 0 = the stock trips),
 // whatever piano-thermal says.
@@ -92,7 +94,7 @@ constexpr uint32_t kA830Valid = 1u << 0, kA830Limiting = 1u << 1, kA830Emergency
 constexpr int kRbHalt = 0x08;                                                                   // bsd/sys/reboot.h RB_HALT
 
 struct Args {
-  uint32_t level, cpufreq, shutdown, pollMs, logS, clock, srot, warmC, marginC, delay, sleepMask;
+  uint32_t level, cpufreq, shutdown, pollMs, logS, clock, srot, warmC, marginC, delay, sleepMask, boostS, boostCap;
   uint32_t cap[2], bat[2], ac[2], minMhz[2], hispeed[2], tickMs, fastMs, warmMs, warmPollC, fastMhz, fastTempC, clockMs, gpuMhz, hotC,
       releaseC, cutC;
   bool capGiven[2];
@@ -116,6 +118,13 @@ void readArgs()
   gArgs.level = bootArg("piano-thermal", 0);
   gArgs.cpufreq = bootArg("piano-cpufreq", 0);
   if (gArgs.cpufreq > 3) gArgs.cpufreq = 3;
+  // piano-cpufreq-boost=S (2026-11-14, boot time): every cluster that allows LEVEL_SET at its sustained level (3532.8 / 4089.6 MHz)
+  // until S s of uptime, the thermal limit on top, then the mode's own level; it implies piano-cpufreq=1, whose clusters go back to
+  // the level the boot stages left (the clock line of 2026-11-14's boots: cluster 0 about 2.0 GHz, cluster 1, the ADT's P cores,
+  // about 1.0 GHz). piano-cpufreq-boost-cap=<MHz>: no faster than that. 0 (the default): nothing changes.
+  gArgs.boostS = clampU(bootArg("piano-cpufreq-boost", 0), 0, 3600);
+  gArgs.boostCap = bootArg("piano-cpufreq-boost-cap", 0);
+  if (gArgs.boostS && !gArgs.cpufreq) gArgs.cpufreq = 1;
   if (gArgs.level > 2) gArgs.level = 2;
   if (gArgs.cpufreq && !gArgs.level) gArgs.level = 1;
   if (adc::hookLevel() && !gArgs.level) gArgs.level = 1;   // B6: the board thermistors come with the level 1 readout
@@ -543,6 +552,9 @@ class PianoThermal : public IOService {
   PowerSource power_ = PowerSource::unknown;
   uint64_t powerAtNs_ = 0;
   bool cpuOk_ = false;
+  // piano-cpufreq-boost: its end (uptime ns, 0 off) and, per domain, whether it has ended / its level was reached (one line each)
+  uint64_t boostEndNs_ = 0;
+  bool boostEnded_[kDomains] = {}, boostNoted_[kDomains] = {};
   // PianoPolicy's profile (any thread writes it; the governor reads it each tick) and what the 30 s report last named
   volatile uint32_t profile_ = 0;
   // system sleep: the thread parks between kOff and kOn (SleepPlan says what each does)
@@ -957,6 +969,14 @@ void PianoThermal::cpuStart()
   power_ = readPowerSource();
   powerAtNs_ = nowNs();
   if (mode >= CpuMode::fixed) note("cpufreq: power source: %s", powerName(power_));
+  if (gArgs.boostS && cpuOk_) {
+    boostEndNs_ = uint64_t(gArgs.boostS) * 1000000000ull;
+    char cap[48] = "";
+    if (gArgs.boostCap) snprintf(cap, sizeof cap, " (no faster than %u MHz)", gArgs.boostCap);
+    note("cpufreq: boot boost: every cluster that allows LEVEL_SET at its sustained level%s until %u s of uptime (piano-cpufreq-boost), "
+         "the thermal limit on top (%s); then %s", cap, gArgs.boostS, tripsText(),
+         mode == CpuMode::report ? "back to the level the boot stages left" : mode == CpuMode::fixed ? "the fixed level" : "the governor");
+  }
 }
 
 // The level the governor wants for domain d, sent when it differs from the one set last.
@@ -1009,6 +1029,31 @@ void PianoThermal::cpuTick(const Monitor &m, bool slow, bool loadTick)
   for (unsigned d = 0; d < kDomains; ++d) {
     if (!domainOk_[d]) continue;
     Governor &g = governor_[d];
+    // piano-cpufreq-boost: the sustained level (the thermal limit on top, in every mode) until its end, then once the mode's own
+    const BoostStep step = domain_[d].canSet ? boostStep(now / 1000000ull, boostEndNs_ / 1000000ull, boostEnded_[d]) : BoostStep::none;
+    if (step != BoostStep::none) {
+      g.thermal(clusterThermal(m, d, gTrips, critical), now / 1000000ull);
+      if (step == BoostStep::boost) {
+        const unsigned want = g.boostLevel(capKhz(gArgs.boostCap));
+        cpuApply(d, want, now);
+        if (!boostNoted_[d] && set_[d] == want) {
+          boostNoted_[d] = true;
+          note("[%us] cpufreq: domain %u: boot boost at %u MHz (uptime %llu ms)", upS(), d, domain_[d].levels[want].khz / 1000,
+               (unsigned long long)(now / 1000000ull));
+        }
+        continue;
+      }
+      boostEnded_[d] = true;
+      if (g.mode() == CpuMode::report) {
+        cpuApply(d, unsigned(boot_[d]), now);
+        note("[%us] cpufreq: domain %u: boot boost over at %u s of uptime: back to the boot stages' %u MHz", upS(), d, gArgs.boostS,
+             domain_[d].levels[set_[d]].khz / 1000);
+        continue;
+      }
+      g.setLevel(set_[d]);
+      note("[%us] cpufreq: domain %u: boot boost over at %u s of uptime: %s from %u MHz", upS(), d, gArgs.boostS,
+           g.mode() == CpuMode::fixed ? "the fixed level" : "the governor", domain_[d].levels[set_[d]].khz / 1000);
+    }
     if (g.mode() == CpuMode::report) {
       if (!slow) continue;
       int idx = -1;
@@ -1150,7 +1195,8 @@ void PianoThermal::run()
     bool limited = false, clusterFast = false;
     for (unsigned k = 0; k < kDomains; ++k) {
       if (!domainOk_[k]) continue;
-      limited |= governor_[k].mode() >= CpuMode::fixed && governor_[k].limit() < governor_[k].count() - 1u;
+      limited |= (governor_[k].mode() >= CpuMode::fixed || (boostEndNs_ && !boostEnded_[k])) &&
+                 governor_[k].limit() < governor_[k].count() - 1u;
       clusterFast |= boot_[k] >= 0 && domain_[k].levels[set_[k]].khz > gArgs.fastMhz * 1000u;
     }
     // with piano-thermal-irq at rest: the same without the warm rule and the fast-clock rule (the upper interrupt stands in for them)
