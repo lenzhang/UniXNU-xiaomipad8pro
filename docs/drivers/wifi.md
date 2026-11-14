@@ -1034,7 +1034,7 @@ after +633 ms were held for the helper thread and never printed. Levels 4 and 5 
 6 is 10b's again, the programming runs in eight named blocks each printed at once before its first access, and
 `piano-wifi-defer=3` prints every line at once from level 6 on.
 
-**Boot 10d and its control 10d-ctl** (the same collection; booted through the queue's runner with the 27.3 dump image, so a
+**Boot 10d and its control 10d-ctl** (built 2026-11-14 10:54 from branch commit `82475c8`, the 27.3 collection `019f3346...` (0066 kernel, 26 native kexts), store seed `89860516...`, `data-persist=0`, `piano-reset-after=900 piano-reset-to=bootloader`, `verify-ram-images.py` PASS: `out/ram-k273-wifi-10d` 237281280 bytes sha256 `bd739bb7b93f769a1dab71993cd7dd4105a6d608603160260e3a7e657ec35578`; `out/ram-k273-wifi-10d-ctl` 237281280 bytes sha256 `1508fa2d87ac99964f50ae191b01f3db910ebc5c1a2bdd5e685195e1ed320476`; the same collection; booted through the queue's runner with the 27.3 dump image, so a
 reset leaves the kernel log in the mailbox):
 
 | # | Boot args (beyond the image's) | Gate | Then |
