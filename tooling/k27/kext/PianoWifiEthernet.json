@@ -21,6 +21,14 @@
       "IOProviderClass": "IOResources",
       "IOResourceMatch": "PianoWifiLink",
       "IOMatchCategory": "PianoWifiEthernet"
+    },
+    "PianoWifi80211": {
+      "CFBundleIdentifier": "com.unixnu.driver.PianoWifiEthernet",
+      "IOClass": "PianoWifi80211",
+      "IOProviderClass": "IOResources",
+      "IOResourceMatch": "PianoWifiLink",
+      "IOMatchCategory": "PianoWifiEthernet",
+      "IOProbeScore": 1000
     }
   },
   "vtable": {

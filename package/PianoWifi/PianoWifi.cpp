@@ -2692,6 +2692,25 @@ void publishScan(IOService *owner, const ScanList &list, bool full)
     if (beacons) one->setObject("beacons", beacons);
     if (probes) one->setObject("probes", probes);
     one->setObject("hidden", entry.hidden ? kOSBooleanTrue : kOSBooleanFalse);
+    // For the apple80211 scan results (PianoWifi80211.h, docs/drivers/wifi-menu.md section 5): the name's own bytes, the
+    // capability field, the beacon interval, the rates and the RSN element as the frame carried them.
+    OSData *ssidRaw = OSData::withBytes(entry.ssidRaw, entry.ssidLength <= kSsidMax ? entry.ssidLength : kSsidMax);
+    OSNumber *capability = OSNumber::withNumber(uint64_t(entry.capability), 32);
+    OSNumber *interval = OSNumber::withNumber(uint64_t(entry.beaconInterval), 32);
+    OSData *rates = entry.rateCount ? OSData::withBytes(entry.rates, entry.rateCount <= sizeof entry.rates ? entry.rateCount
+                                                                                                         : sizeof entry.rates)
+                                    : nullptr;
+    OSData *rsn = entry.rsnElementLength ? OSData::withBytes(entry.rsnElement, entry.rsnElementLength) : nullptr;
+    if (ssidRaw) one->setObject("ssid-raw", ssidRaw);
+    if (capability) one->setObject("capability", capability);
+    if (interval) one->setObject("beacon-interval", interval);
+    if (rates) one->setObject("rates", rates);
+    if (rsn) one->setObject("rsn", rsn);
+    OSSafeReleaseNULL(ssidRaw);
+    OSSafeReleaseNULL(capability);
+    OSSafeReleaseNULL(interval);
+    OSSafeReleaseNULL(rates);
+    OSSafeReleaseNULL(rsn);
     OSSafeReleaseNULL(ssid);
     OSSafeReleaseNULL(address);
     OSSafeReleaseNULL(channel);

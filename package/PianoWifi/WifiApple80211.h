@@ -329,6 +329,16 @@ struct State {
   uint32_t scanRequests = 0, resultsServed = 0, listEnds = 0, powerSets = 0;
 };
 
+// A state as a fresh interface has it, in place (the kext's is a zeroed data allocation, too large for a temporary on the stack).
+inline void reset(State &s)
+{
+  uint8_t *raw = reinterpret_cast<uint8_t *>(&s);
+  for (uint32_t i = 0; i < sizeof s; ++i) raw[i] = 0;
+  s.power = true;
+  s.country[0] = 'X';
+  s.country[1] = 'X';
+}
+
 // The identity strings (the kext's; the host test passes its own).
 struct Identity {
   const char *driverVersion;   // "PianoWifi 1.0 (apple80211 M1)"

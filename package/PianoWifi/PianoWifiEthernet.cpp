@@ -426,3 +426,7 @@ void PianoWifiEthernet::stop(IOService *provider)
   OSSafeReleaseNULL(fMedium);
   IOEthernetController::stop(provider);
 }
+
+// piano-wifi-apple80211=1: the same controller as a Wi-Fi interface for airportd (docs/drivers/wifi-menu.md section 5): a
+// subclass of the class above, kept in its own file and compiled in this translation unit (it needs the class's declaration).
+#include "PianoWifi80211.h"
