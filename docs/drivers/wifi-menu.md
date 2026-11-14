@@ -226,3 +226,16 @@ row):
 | the screen | webcam `imagesnap -d "HD Pro Webcam C920" /tmp/wm1-menubar.jpg`; then click the menu bar's Wi-Fi icon (`piano-input.py`) and photograph the open menu | the Wi-Fi icon in the menu bar; the open menu lists networks (count them; record no names) |
 | last: the data path's control | place the profile (`/tmp/wifi-profile-place.sh`, as for 10i): the station joins as on 10i; `ipconfig getifaddr $I`, `ping -c 5 <router>` | as 10i: an address and 5/5, now on an interface typed Wi-Fi (airportd still says not associated: M2) |
 | the end | console `reset fastboot` once the rows are read | — |
+
+### 5.9 The probe as built
+
+`out/ram-k273-wm1` (in the M1 branch's worktree; built 2026-11-14 18:50 from branch commit `82d8b53`): 237281280 bytes, sha256
+`452d0db9f23eae9e9cdf222e25750a9a1f1a8c45248bf39b64d464838a43a6bb`, `verify-ram-images.py` PASS. The 27.3 collection
+`01d21b4d...` (`tooling/k273/build-k273-image.sh`, the 0066 27.3 kernel `8b70f531...`, 26 native kexts all this repository's,
+`vtable check PianoWifiEthernet vs IOEthernetController: 0 problem slots`, the KC link resolving `setInterfaceSubType` from
+IONetworkingFamily); the v2 seed (identity `9bd6f902...`, `data-persist=0`: the owner's store is not opened), the v4 layer's
+trust cache `57063d6d...`; 27 arguments (492 bytes) in `/chosen/piano-boot-args-ram`, the merged line 1160 bytes, with
+`piano-wifi-apple80211=1 piano-reset-after=900 piano-reset-to=bootloader`. Its dump image: `out/ram-k273-wm1-dump` (sha256
+`65ac4f35165d32b1245ab837823f9dc73750501084fd0f7d0a4e4f9492f02f1d`, the same collection). `piano-cwscan` is beside the image.
+The image's own control is boot 10i/10l (the same line without the switch): their `PianoWifiEthernet:` lines are what
+`PianoWifi80211`'s parent must still print.
