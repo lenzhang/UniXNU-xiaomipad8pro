@@ -324,7 +324,10 @@ PianoNullEthernet, after checking that the TimeSync clock ID stays stable. The M
 | `piano-wifi-l7file=0`, `piano-wifi-l7cands=N` | 1, 4 | `0`: the join profile only through the sysctl (by default the kext also reads the root-only file `/private/var/db/piano-wifi/profile` itself every 2 s while it waits, with the helper's checks); how many access points of the profile's name are tried in turn (at most 6) |
 | `piano-wifi-l7tries=N`, `piano-wifi-l7frame=MS`, `piano-wifi-l7step=MS`, `piano-wifi-l7scans=N` | 3, 500, 3000, 3 | the tries of the authentication and of the association request, the wait for each answer (the association's is twice it), the wait for a command's answer (the start response, the peer map, the confirmation, the teardown's), and how many scans of its own level 7 runs when the network is not in the list |
 | `piano-wifi-l8=N` | `0x37` = 55 (since boot 10f: software ring 1 and the rings at level 6's start; `0x17` before) | level 8's switches (§13.6, `WifiDp.h` `kL8*`): `0x01` the receive buffers return to software ring 1 (off: the firmware's own manager, as at levels 6 and 7), `0x02` the receive ring selection for both radio buffer rings, `0x04` the data path's rings programmed at all (off: level 8 is level 7), `0x08` EAPOL frames also to en0, `0x10` the transmit side, `0x20` the rings programmed at level 6's start instead of level 7's (10c's reset there was the stack overflow, not the rings) |
-| `piano-wifi-sleepoff=1` | 0 at level 8, 1 below | power the radio off at a system sleep (it then stays off until the next boot). By default at level 8 the radio stays on through the sleep: nothing is stopped (suspend-to-idle freezes the ladder's thread with every other); at the wake the association is as the firmware kept it, or it ended and the rejoin takes it up |
+| `piano-wifi-sleepoff=M` | 2 at level 8, 1 below | what a system sleep does to the radio. 2 (level 8's default since boot 10k): the ladder's thread stops the join (our deauthentication), powers the radio down (WLAN_EN low, PERST# asserted, the rails given back) and parks; the wake runs the ladder again from level 2 (the restart, below). 1: powered off until the next boot. 0: kept on through the sleep (boot 10k: the firmware died during a 60 s sleep, `cmnos_assert`, SYSERR at the wake) |
+| `piano-wifi-restart=0` | 1 at level 8 | when the firmware dies (SYSERR or its crash dump environment) or a level fails, end the ladder as before. By default the radio is powered down and the ladder runs again from level 2 with every level's state reset (the DMA window's allocations from its start; the window, its translation, the SMMU's stream, the mappings, the join profile, the 802.1X port and en0's attachment kept) after 1, 5, 15, 30, 60, then 120 s; the wake from a system sleep restarts at once |
+| `piano-wifi-restarts=N` | 6 | at most N restarts in a row without the port opening in between; then the radio stays down until the next wake |
+| `piano-wifi-crashtest=S` | 0 | a test: S s after the port first opens on a pass a restart began, the chip is asked once for its crash dump environment (MHI's SoC reset request, as the MHI host forces a dump), so that one unattended boot shows the restart after a crash |
 | `piano-wifi-rejoin=0` | 1 at level 8 | when an association ends (the access point's deauthentication or disassociation, a beacon miss, a kickout, the 802.1X client's `LEAVE`, our own leave) or a join fails, end the level (as before). By default level 7 joins again from the profile after 2, 5, 10, 20, 30, then 60 s (back to 2 s after a port that opened); never after a stop, a dead chip or no profile |
 | `piano-wifi-droptest=S` | 0 | a test: S s after the port first opens the station leaves its association once (our deauthentication), so that an unattended boot shows the rejoin |
 | `piano-wifi-clientwait=MS` | 30000 at level 8, 0 below | a WPA2 profile is handed to the join only once an 802.1X client is connected to the port, waited for up to MS on each join; then the join goes ahead anyway (its handshake is missed and the rejoin tries again). 0: no wait; none either when the port is not registered. The installed v3 boot of 2026-11-14 associated before its supplicant was connected and was dropped after 3.3 s (reason 15) |
@@ -1257,6 +1260,38 @@ checklist, and one line more before the first join:
 | When | Line / command | Expected |
 |---|---|---|
 | the profile's hand-over | if the supplicant is not connected yet: `level 7: waiting for the 802.1X client (a WPA2 profile, no client on the port, N connect(s) so far): up to 30 s before the join goes ahead (piano-wifi-clientwait)`, then `level 7: the 802.1X client connected after N ms of the wait (connect M): the join goes ahead`, or after 30 s `level 7: no 802.1X client after 30 s of waiting: the join goes ahead without one ...` and, after the missed handshake, a rejoin; with the supplicant connected first, no wait line | then `the join profile was handed over`; no `no 802.1X client is connected: counted only` on message 1 |
+
+**10k ran on 2026-11-14 (`private/host-checks/20261114-10k`):** the first join (en2, DHCP, the gateway 5/5, the Internet 3/3,
+DNS, HTTPS 200) and **the rejoin after the drop test passed** (the supplicant's `the port is open (generation 2)`, then DHCP,
+the gateway, the Internet, DNS and HTTPS again). The sleep with the radio kept on did not: `power: a system sleep (1): the radio
+stays on`, the wake after 60.020 s by the timer, and at once `crash: level 7: MHISTATUS 0000ff05 (state 0xff, SYSERR), EE RDDM`,
+the firmware's reason `cmnos_assert_patched.c:604`: the firmware does not survive a host frozen for 60 s with the radio on.
+
+**The restart (after 10k):** level 8 now powers the radio down at a system sleep and brings it up again from level 2 at the
+wake (`piano-wifi-sleepoff=2`), as the chip's own host powers it down at a suspend and up at the resume (Linux's behaviour,
+inferred from its driver, not measured here); the same restart follows a firmware crash or a failed level, with a back-off and
+a cap. Keeping the radio on through the sleep would need the MHI M3/M0 exchange and the firmware's suspend messages, which
+nothing here has yet; the power-down is the path whose every step already runs at each boot.
+
+**Boot 10m: the restart at the wake and after a crash, one unattended boot** (built 2026-11-14 from branch commit `c627d3b` (main
+merged), collection `2e0a9d81...`, the v2 recipe: `out/ram-k273-wifi-10m` sha256 `826d6b5f134f719dc27ecb647ca090d12d0aee5abecf6b4461ad2df6cb86ffb5`, 237281280 bytes, `verify-ram-images.py` PASS; the
+collection and ADT copied next to it). Arguments: 10k's (`piano-wifi-droptest=90 piano-sleep=1 piano-sleep-test=420
+piano-sleep-max=60`), `piano-wifi-crashtest=120`, and `piano-reset-after=1200`. Profile and supplicant as for 10i (the
+supplicant that stays connected, main `0ebff98`); DHCP and ping on the interface found by its address (`...:04`) four times:
+after the first port open, after the rejoin, after the wake, after the crash's restart.
+
+| When | Line / command | Expected |
+|---|---|---|
+| the first join, the drop test, the rejoin | as 10k (and 10l's client wait line, if any) | as 10k |
+| boot + 420 s | `PianoWifi: power: a system sleep (1): the radio is stopped and powered down; the wake brings it up again (piano-wifi-sleepoff=2)`, `level 7: a suspend asked the radio to stop during associated`, `stage 718: level 7: stopped on request ...`, `restart: the radio is powered down (WLAN_EN low, PERST# asserted; ...)`, `restart: the radio is parked for system sleep 1 ...`, `PianoWifi: power: the radio is parked for system sleep 1 (N ms after the sleep's stop)` | N under 3500; no `did not park the radio within 3.5 s` |
+| the wake | `piano-sleep: suspend 1: woke after 60.0 s by timer`, `PianoWifi: power: the wake (1): the ladder brings the radio up again (the restart)`, `restart 1 begins (the wake from a system sleep), N ms after pass 1 ended ...`, then levels 2 to 7 again (`level 2: done`, `level 3: done (L0 ...)`, `stage 401`, `stage 504`, `stage 613`), `level 8: the association is live for the data path (generation 3, ...)`, the supplicant's generation-3 handshake | no `crash:` line |
+| Wi-Fi back | `restart 1 (the wake from a system sleep): Wi-Fi is back: the port opened N ms after the restart began (pass 2)`; `ipconfig getifaddr $I`, `ping -c 5 <router>`, an Internet address, `ioreg -l -w0 \| grep piano-wifi-restart` | N about 10 000 to 20 000; an address, 5/5 |
+| port open + 120 s | `level 7: the crash test (piano-wifi-crashtest=120): the chip is asked for its crash dump environment now (MHI's SoC reset request); the restart follows`, then either `level 7: the chip reported a system error or its crash dump environment during associated` and the `crash:` lines (the dump, the firmware's reason), or the link's stop; `restart: pass 2 ended at level 7 (the firmware died): the radio is powered down and the ladder runs again from level 2 in 1000 ms (restart 2, 1 in a row of at most 6)`, `restart 2 begins (the firmware died) ...` | — |
+| after the crash | `restart 2 (the firmware died): Wi-Fi is back: the port opened N ms after the restart began (pass 3)`; DHCP, ping, an Internet address; `ioreg ... piano-wifi-restarts` = `2 restart(s): 1 at a wake, 1 after the firmware died, ...` | an address, 5/5 |
+| the run's end (`reset fastboot`) | `stage 718: level 7: stopped on request (a suspend or a shutdown), its normal end`; no `FAILED at stage 718` after the crash's restart | — |
+
+Should the wake's restart fail: the pass's failing level (`FAILED at stage ...`) and `restart 1 (...) did not bring Wi-Fi back:
+pass 2 ended at level L`, then the back-off's next restart; that line names the level to look at.
 
 **10k-en0** (the same collection, 10i's arguments and `piano-wifi-en0=1`, no tests): `PianoWifiEthernet: en0: PianoNullEthernet
 is asked to stand down (piano-wifi-en0=1)`, `en0: free after N ms`, at the link's up `en0 (attached to the network stack) ...
