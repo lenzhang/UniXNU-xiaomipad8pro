@@ -441,6 +441,10 @@ struct ScanEntry {
   int32_t rssi = 0;
   uint32_t beacons = 0, probes = 0;
   uint16_t capability = 0;
+  uint32_t heardFreq = 0;           // where the radio was tuned when it heard the frame (a strong neighbour leaks into the
+                                    // channels next to its own: boot 10a heard a channel 40 access point while on 5260 MHz)
+  bool offChannel = false;          // heardFreq is not the frequency of the channel the network names
+  uint8_t htPrimary = 0;            // the HT operation element's primary channel, 0 when none
   uint16_t beaconInterval = 0;      // in TU, from the frame's fixed fields
   uint8_t dtimPeriod = 0;           // from the TIM element (beacons only), 0 when none was seen
   uint8_t rates[16] = {};           // the supported and extended rates, as the frame carries them (bit 7: basic)
@@ -489,6 +493,18 @@ inline bool wmiParseMgmtRx(WmiMgmtRx &out, const uint8_t *payload, uint32_t leng
 // The identifier and the address out of a beacon or a probe answer: the frame's third address is the network's, and its body
 // carries the elements, of which element 0 is the name and element 3 the channel. An element that runs past the frame ends the
 // walk (a frame from the air is never trusted for its own length).
+// A channel number's centre frequency: 1-13 and 14 on 2.4 GHz, 32-177 on 5 GHz (which band a number is in is plain from the
+// number on these two bands). `heard` decides only for a 6 GHz frame (a number that is not a 2.4/5 GHz one), whose frequency
+// is then the header's. 0 when the number is no channel of ours.
+inline uint32_t dot11ChannelFreq(uint32_t channel, uint32_t heard)
+{
+  if (heard >= 5925) return 0;
+  if (channel >= 1 && channel <= 13) return 2407 + 5 * channel;
+  if (channel == 14) return 2484;
+  if (channel >= 32 && channel <= 177) return 5000 + 5 * channel;
+  return 0;
+}
+
 // The RSN element's body (version, group suite, pairwise suites, key-management suites, capabilities), from the air: every
 // count is checked against what is left, and a field cut short ends the read with `truncated` (what came before stands).
 inline void wmiParseRsn(ScanSecurity &out, const uint8_t *body, uint32_t bytes)
@@ -570,6 +586,8 @@ inline bool wmiParseBeacon(ScanEntry &out, const uint8_t *frame, uint32_t length
       wmiParseRsn(out.security, body, bytes);
     } else if (id == kDot11ElementHtCap) {
       out.ht = true;
+    } else if (id == kDot11ElementHtOperation && bytes >= 1) {
+      out.htPrimary = body[0];
     } else if (id == kDot11ElementVendor && bytes >= 4 && body[0] == 0x00 && body[1] == 0x50 && body[2] == 0xf2 &&
                body[3] == 0x01) {
       out.security.wpa1 = true;
@@ -595,10 +613,17 @@ inline ScanEntry *scanAdd(ScanList &list, const WmiMgmtRx &rx)
     ++list.ignored;
     return nullptr;
   }
-  // The frequency is the header's (a firmware that sends the shorter header gives none, and then only the channel is known:
-  // the header's channel is a channel number, not a frequency, so the two are never mixed).
-  found.freq = rx.freq;
+  // The network's own channel is what its frame says (the DS parameter set, else the HT operation's primary channel), and
+  // its frequency is that channel's: the header's frequency is only where the radio was tuned when it heard the frame, which
+  // for a strong neighbour can be another channel altogether (boot 10a, 2026-11-13: an access point of channel 40 heard at
+  // 5260 MHz, joined on 5260, and its authentication never acknowledged). The header's channel number and frequency are
+  // used only when the frame names no channel.
+  found.heardFreq = rx.freq;
+  if (!found.channel && found.htPrimary) found.channel = found.htPrimary;
   if (!found.channel && rx.channel && rx.channel <= 233) found.channel = uint8_t(rx.channel);
+  const uint32_t named = dot11ChannelFreq(found.channel, rx.freq);
+  found.freq = named ? named : rx.freq;
+  found.offChannel = named && rx.freq && rx.freq != named;
   found.rssi = rx.signalDbm;
   if (isProbe) ++list.probes;
   else ++list.beacons;
@@ -616,6 +641,9 @@ inline ScanEntry *scanAdd(ScanList &list, const WmiMgmtRx &rx)
     }
     if (found.channel) have.channel = found.channel;
     if (found.freq) have.freq = found.freq;
+    if (found.heardFreq) have.heardFreq = found.heardFreq;
+    have.offChannel = found.offChannel;
+    if (found.htPrimary) have.htPrimary = found.htPrimary;
     // The newest frame's elements stand (a probe answer carries no TIM, so the DTIM period is kept from a beacon).
     if (found.beaconInterval) have.beaconInterval = found.beaconInterval;
     if (found.dtimPeriod) have.dtimPeriod = found.dtimPeriod;

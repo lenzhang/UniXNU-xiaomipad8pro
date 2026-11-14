@@ -1686,7 +1686,8 @@ static void testCodec()
   ScanList list;
   const ScanEntry *entry = scanAdd(list, mgmt);
   CHECK(entry && list.count == 1);
-  CHECK(entry && std::string(entry->ssid) == "slow" && entry->channel == 36 && entry->freq == 0 && entry->rssi == -61);
+  // the shorter header gives no frequency: the channel number names it (boot 10a: the frequency is always the channel's)
+  CHECK(entry && std::string(entry->ssid) == "slow" && entry->channel == 36 && entry->freq == 5180 && entry->rssi == -61);
 }
 
 int main()

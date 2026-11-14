@@ -937,7 +937,7 @@ constexpr uint32_t kWmiRoamReasonMask = 0xf, kWmiRoamReasonBeaconMiss = 2;
 // management (capability bit 8: the access point wants the power capability and the supported channels elements), and the
 // status codes the log names.
 constexpr uint16_t kDot11CapSpectrumMgmt = 0x0100, kDot11CapQos = 0x0200;
-constexpr uint32_t kDot11ElementPowerCap = 33, kDot11ElementSupportedChannels = 36, kDot11ElementHtCap = 45,
+constexpr uint32_t kDot11ElementPowerCap = 33, kDot11ElementSupportedChannels = 36, kDot11ElementHtCap = 45, kDot11ElementHtOperation = 61,
                    kDot11ElementVendor = 221;
 constexpr uint32_t kDot11AuthRespSeq = 2, kDot11AssocRespFixed = 6;
 constexpr uint16_t kDot11StatusSuccess = 0;
