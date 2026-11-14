@@ -54,8 +54,46 @@ constexpr uint32_t kStaFlagRadarOk = 1u << 4;     // a radar channel may be chos
 constexpr uint32_t kStaFlagDeauth = 1u << 5;      // the teardown says goodbye with a deauthentication of ours
 constexpr uint32_t kStaFlagNativeWifi = 1u << 6;  // native Wi-Fi frames out and in instead of 802.3 (the A/B of 704's format)
 constexpr uint32_t kStaFlagNoJoin = 1u << 7;      // choose and log the network, then stop: nothing is created (a dry run)
+// Boot 10a (2026-11-13): these three came with its lessons.
+constexpr uint32_t kStaFlagTxPower = 1u << 8;     // the radio's transmit power limits (both bands) with the parameters of 704
+constexpr uint32_t kStaFlagDirected = 1u << 9;    // level 7's own scans begin with directed probes (a network that hides its name)
+constexpr uint32_t kStaFlagNextAp = 1u << 10;     // an access point that does not answer or refuses: the next candidate is tried
 constexpr uint32_t kStaFlagsDefault = kStaFlagParams | kStaFlagPeerData | kStaFlagPeerMap | kStaFlagPrefer5 |
-                                      kStaFlagRadarOk | kStaFlagDeauth;
+                                      kStaFlagRadarOk | kStaFlagDeauth | kStaFlagTxPower | kStaFlagDirected | kStaFlagNextAp;
+
+// The order the candidates are tried in, by their channel's class: a 5 GHz channel the station may transmit on at once, then a
+// radar (passive) 5 GHz one, then 2.4 GHz, then a 5 GHz one weaker than minRssi5. Each try's class is logged, which separates
+// "transmission on a passive or radar channel is blocked" from "our frame is wrong everywhere".
+enum StaClass : uint32_t { kStaClass5 = 0, kStaClassRadar = 1, kStaClass24 = 2, kStaClassWeak5 = 3 };
+constexpr unsigned kStaCandidatesMax = 6;
+
+inline const char *staClassName(uint32_t c)
+{
+  switch (c) {
+  case kStaClass5: return "5 GHz, not radar";
+  case kStaClassRadar: return "5 GHz, radar (passive)";
+  case kStaClass24: return "2.4 GHz";
+  default: return "5 GHz, weak";
+  }
+}
+
+// The self-check of every management frame before it goes out (WifiSta.h postFrame): what the frame and its command carry,
+// against what they must, as one bit each; all set is kStaFrameCheckAll. Only these booleans are logged, never an address.
+enum StaFrameCheck : uint32_t {
+  kStaChkAddr1 = 1u << 0,    // the receiver is the access point
+  kStaChkAddr2 = 1u << 1,    // the transmitter is the virtual device's own address
+  kStaChkAddr3 = 1u << 2,    // the network is the access point
+  kStaChkType = 1u << 3,     // a management frame of the subtype meant
+  kStaChkFlags = 1u << 4,    // no frame-control flags (not to or from DS, not protected, no retry)
+  kStaChkSeq = 1u << 5,      // the sequence control carries our sequence number, fragment 0
+  kStaChkVdev = 1u << 6,     // the command names our device
+  kStaChkFreq = 1u << 7,     // the command's frequency is 0: the device's own (started) channel
+  kStaChkTxParams = 1u << 8, // no transmit parameters
+  kStaChkInline = 1u << 9,   // the inline copy is the frame's first bytes, at most 64
+  kStaChkBus = 1u << 10,     // the frame's bus address is in the 32-bit window, its length the frame's
+  kStaChkOwnUsable = 1u << 11,   // our address is a usable individual one
+};
+constexpr uint32_t kStaFrameCheckAll = 0xfffu;
 
 // What the owner reports as it happens (the kext prints a line for each; the tests count them).
 enum StaReport : uint32_t {
@@ -70,6 +108,10 @@ enum StaReport : uint32_t {
   kStaRepTry,              // a: the step, b: the try (1, 2, ...)
   kStaRepScanDone,         // a: the rescan's number, b: how many entries the list has now
   kStaRepTeardown,         // a: the piece (StaTeardownPiece), b: 1 answered / 0 not
+  kStaRepCandidate,        // a: the candidate's number (1, 2, ...), b: its class (StaClass)
+  kStaRepCandidateEnd,     // a: the candidate's number, b: what ended it (the StaError, as a positive number)
+  kStaRepFrameCheck,       // a: the frame's descriptor, b: the check's bits (StaFrameCheck)
+  kStaRepScanPlan,         // a: the scan's number, b: its kind (1 directed 5 GHz, 2 directed 2.4 GHz, 3 passive) | channels << 8
 };
 
 enum StaDisconnect : uint32_t { kStaDiscNone = 0, kStaDiscDeauth, kStaDiscDisassoc, kStaDiscKickout, kStaDiscBeaconMiss };
@@ -137,7 +179,8 @@ struct StaOptions {
   uint32_t stepMs = 3000;              // a command's answer (the start response, the peer map, the confirmation)
   uint32_t frameWaitMs = kAssocFrameWaitMs, frameTries = kAssocFrameTries;
   uint32_t holdMs = kAssocHoldMs;      // associated: how long the watch runs; 0: until the owner stops it
-  uint32_t rescans = 2, scanWaitMs = kScanWaitMsDefault;
+  uint32_t rescans = 3, scanWaitMs = kScanWaitMsDefault;
+  uint32_t maxCandidates = 4;          // how many access points of the name are tried, one after another (bit 10)
   uint32_t paceMs = 20;                // between the many small commands of 704 and 707
   int32_t minRssi5 = -82;              // a 5 GHz access point weaker than this loses to a stronger 2.4 GHz one
 };
@@ -167,6 +210,7 @@ struct StaChoice {
   int32_t rssi = 0;
   bool band5 = false, passive = false, radar = false;
   int32_t powerDbm = 20;
+  uint32_t cls = kStaClass5;            // StaClass
   ScanEntry net;                        // a copy: a rescan may change the list
 };
 
@@ -182,6 +226,10 @@ struct Sta {
   bool profileSet = false, bssidGiven = false;
   uint8_t ssid[kSsidMax] = {}, ssidLength = 0, security = 0, bssidPref[6] = {};
   StaChoice choice;
+  StaChoice cand[kStaCandidatesMax];    // every access point of the name, in the order they are tried
+  uint32_t candCount = 0, candAt = 0, hiddenSeen = 0;
+  int candResult[kStaCandidatesMax] = {};
+  bool nextCandidate = false;           // the teardown running is between two candidates: the next one follows it
   uint8_t bssid[6] = {};
   bool rsn = false;
   uint8_t groupCipher = 0, pairwise = 0, akm = 0;
@@ -196,7 +244,7 @@ struct Sta {
   bool peerCreated = false, peerMapped = false, vdevStartSent = false, vdevStarted = false, vdevUp = false, authorized = false;
   uint32_t peerId = 0, hwPeerId = 0;
   VdevStartResp startResp;
-  uint32_t tries = 0, descId = 0;
+  uint32_t tries = 0, descId = 0, lastFrameCheck = 0;
   uint16_t seq = 0;
   bool frameOut = false;                // the current frame went out (its answer is waited for)
   bool authAnswered = false, assocAnswered = false, peerAssocConf = false;
@@ -298,46 +346,81 @@ inline void channelFacts(const Sta &s, StaChoice &c)
   c.passive = c.radar;
 }
 
-// The profile's network out of the scan list: the names compared byte for byte; the profile's access point when it names one
-// that is there; else the strongest, a 5 GHz one first unless it is weaker than minRssi5 and a 2.4 GHz one is there.
-inline StaChoice choose(const Sta &s)
+// The class a candidate is tried in (StaClass): a 5 GHz one weaker than minRssi5 goes after the 2.4 GHz ones.
+inline uint32_t classOf(const Sta &s, const StaChoice &c)
 {
-  StaChoice best;
-  if (!s.env.scan) return best;
+  if (!c.band5) return kStaClass24;
+  if (c.rssi < s.options.minRssi5) return kStaClassWeak5;
+  return c.radar ? kStaClassRadar : kStaClass5;
+}
+
+// Every access point of the profile's network out of the scan list (the names compared byte for byte), in the order they are
+// tried: the profile's access point first when it names one in the list; then by class (with bit 3) — 5 GHz not radar, 5 GHz
+// radar, 2.4 GHz, weak 5 GHz — and the strongest first inside a class; a radar channel only with bit 4. Returns how many were
+// kept (at most `capacity`); `total` counts every entry of the name, `radar` those left out for their radar channel, `hidden`
+// the list's entries that do not say their name (a directed probe is what can name them).
+inline uint32_t chooseAll(const Sta &s, StaChoice *out, uint32_t capacity, uint32_t &total, uint32_t &radar, uint32_t &hidden)
+{
+  total = radar = hidden = 0;
+  if (!s.env.scan || !out || !capacity) return 0;
   const ScanList &list = *s.env.scan;
-  int bestIndex = -1;
-  int32_t bestScore = -100000;
+  uint32_t kept = 0;
+  int32_t keys[kStaCandidatesMax + 1] = {};
   for (uint32_t i = 0; i < list.count; ++i) {
     const ScanEntry &e = list.entries[i];
-    if (e.hidden || e.ssidLength != s.ssidLength) continue;
+    if (e.hidden) {
+      ++hidden;
+      continue;
+    }
+    if (e.ssidLength != s.ssidLength) continue;
     bool same = true;
     for (uint32_t k = 0; k < s.ssidLength && same; ++k) same = e.ssidRaw[k] == s.ssid[k];
     if (!same || !e.freq) continue;
-    ++best.candidates;
+    ++total;
     StaChoice c;
+    c.found = true;
+    c.index = i;
     c.freq = e.freq;
+    c.rssi = e.rssi;
+    c.net = e;
     channelFacts(s, c);
     if (c.radar && !(s.options.flags & kStaFlagRadarOk)) {
-      ++best.excludedRadar;
+      ++radar;
       continue;
     }
-    int32_t score = e.rssi;
-    if (s.bssidGiven && sameMac(e.bssid, s.bssidPref)) score += 10000;   // the profile's access point wins outright
-    if ((s.options.flags & kStaFlagPrefer5) && c.band5 && e.rssi >= s.options.minRssi5) score += 1000;
-    if (score > bestScore) {
-      bestScore = score;
-      bestIndex = int(i);
+    c.cls = classOf(s, c);
+    // a smaller key is tried first
+    int32_t key = ((s.options.flags & kStaFlagPrefer5) ? int32_t(c.cls) * 1000 : 0) - c.rssi;
+    if (s.bssidGiven && sameMac(e.bssid, s.bssidPref)) key = -100000;
+    uint32_t at = kept;
+    while (at > 0 && keys[at - 1] > key) --at;
+    if (at >= capacity) continue;
+    const uint32_t last = kept < capacity ? kept : capacity - 1;
+    for (uint32_t k = last; k > at; --k) {
+      out[k] = out[k - 1];
+      keys[k] = keys[k - 1];
     }
+    out[at] = c;
+    keys[at] = key;
+    if (kept < capacity) ++kept;
   }
-  if (bestIndex < 0) return best;
-  const ScanEntry &e = list.entries[bestIndex];
-  best.found = true;
-  best.index = uint32_t(bestIndex);
-  best.freq = e.freq;
-  best.rssi = e.rssi;
-  best.net = e;
-  channelFacts(s, best);
-  return best;
+  for (uint32_t i = 0; i < kept; ++i) {
+    out[i].candidates = total;
+    out[i].excludedRadar = radar;
+  }
+  return kept;
+}
+
+// The first candidate (the tests' and the dry run's view).
+inline StaChoice choose(const Sta &s)
+{
+  StaChoice list[kStaCandidatesMax];
+  uint32_t total = 0, radar = 0, hidden = 0;
+  const uint32_t n = chooseAll(s, list, kStaCandidatesMax, total, radar, hidden);
+  StaChoice none;
+  none.candidates = total;
+  none.excludedRadar = radar;
+  return n ? list[0] : none;
 }
 
 // The security the profile wants against the network's: an open profile needs an open network; WPA2-PSK needs an RSN element
@@ -364,8 +447,10 @@ inline bool securityFits(Sta &s)
 }
 
 // The station's parameters, in the order this chip's own host sends them after a virtual device: the transmit
-// encapsulation, the receive decapsulation, the stream count, the three power-save parameters, power save off.
-constexpr uint32_t kStaParamCount = 7;
+// encapsulation, the receive decapsulation, the stream count, the three power-save parameters, power save off — and (bit 8)
+// the radio's transmit power limits for both bands, which that host sends right after them (its value for this chip: 30
+// half-dB with the SAR reason). Level 6 sent none of them before boot 10a.
+inline uint32_t paramCount(const Sta &s) { return (s.options.flags & kStaFlagTxPower) ? 9u : 7u; }
 
 inline bool postParam(Sta &s, uint32_t index)
 {
@@ -380,7 +465,9 @@ inline bool postParam(Sta &s, uint32_t index)
     case 3: return assocBuildStaPsParam(w, b, c, vdev, kWmiStaPsParamRxWakePolicy, kWmiStaPsRxWakePolicyWake);
     case 4: return assocBuildStaPsParam(w, b, c, vdev, kWmiStaPsParamTxWakeThreshold, kWmiStaPsTxWakeThresholdAlways);
     case 5: return assocBuildStaPsParam(w, b, c, vdev, kWmiStaPsParamPspollCount, kWmiStaPsPspollCountNoMax);
-    default: return assocBuildPowersaveOff(w, b, c, vdev);
+    case 6: return assocBuildPowersaveOff(w, b, c, vdev);
+    case 7: return assocBuildPdevSetParam(w, b, c, kWmiPdevParamTxPowerLimit2g, kWmiTxPowerLimitValue);
+    default: return assocBuildPdevSetParam(w, b, c, kWmiPdevParamTxPowerLimit5g, kWmiTxPowerLimitValue);
     }
   });
 }
@@ -389,7 +476,45 @@ inline bool postParam(Sta &s, uint32_t index)
 inline uint32_t reoqOffset(uint32_t tid) { return tid == kStaNonQosTid ? 16 * kReoQueueQosBytes : tid * kReoQueueQosBytes; }
 constexpr uint32_t kStaReoqBytes = 16 * kReoQueueQosBytes + kReoQueueNonQosBytes;
 
-inline bool postFrame(Sta &s, unsigned which, uint32_t length)
+// The frame and its command, checked against what they must carry (StaFrameCheck), from the bytes that go out: the frame in
+// the window and the command in the outbox, read back as the firmware and the access point read them.
+inline uint32_t frameCheck(const Sta &s, const StaDma &d, uint32_t length, uint8_t subtype)
+{
+  uint32_t bits = 0;
+  const uint8_t *f = d.va;
+  if (f && length >= kDot11HeaderBytes) {
+    if (sameMac(f + 4, s.bssid)) bits |= kStaChkAddr1;
+    if (s.env.ownMac && sameMac(f + 10, s.env.ownMac)) bits |= kStaChkAddr2;
+    if (sameMac(f + 16, s.bssid)) bits |= kStaChkAddr3;
+    if ((f[0] & kDot11FcTypeMask) == kDot11FcTypeManagement && (f[0] & kDot11FcSubtypeMask) == subtype &&
+        (f[0] & 0x03) == 0)
+      bits |= kStaChkType;
+    if (f[1] == 0) bits |= kStaChkFlags;
+    if (uint32_t(f[22] | f[23] << 8) == uint32_t(s.seq) << kStaFrameSeqShift) bits |= kStaChkSeq;
+  }
+  if (s.env.ownMac && wmiMacUsable(s.env.ownMac)) bits |= kStaChkOwnUsable;
+  if (s.outLength > kWmiCmdHeaderBytes) {
+    uint32_t size = 0;
+    const uint8_t *cmd = wmiFind(s.out + kWmiCmdHeaderBytes, s.outLength - kWmiCmdHeaderBytes, kWmiTagMgmtTxSendCmd, &size);
+    if (cmd && size >= kWmiMgmtTxWords * 4) {
+      if (wmiGet(cmd, 0) == s.options.vdevId) bits |= kStaChkVdev;
+      if (wmiGet(cmd, 2) == 0) bits |= kStaChkFreq;
+      if (wmiGet(cmd, 7) == 0) bits |= kStaChkTxParams;
+      const uint64_t bus = uint64_t(wmiGet(cmd, 3)) | uint64_t(wmiGet(cmd, 4)) << 32;
+      if (bus == d.bus && bus && bus + length <= (1ull << 32) && wmiGet(cmd, 5) == length && length <= d.bytes)
+        bits |= kStaChkBus;
+      const uint32_t want = length < kWmiMgmtTxInlineMax ? length : kWmiMgmtTxInlineMax;
+      uint32_t inlineSize = 0;
+      const uint8_t *inl = wmiFind(s.out + kWmiCmdHeaderBytes, s.outLength - kWmiCmdHeaderBytes, kWmiTagArrayByte, &inlineSize);
+      bool same = inl && wmiGet(cmd, 6) == want && inlineSize >= want && f;
+      for (uint32_t i = 0; same && i < want; ++i) same = inl[i] == f[i];
+      if (same) bits |= kStaChkInline;
+    }
+  }
+  return bits;
+}
+
+inline bool postFrame(Sta &s, unsigned which, uint32_t length, uint8_t subtype)
 {
   const StaDma &d = s.env.frame[which];
   MgmtTx tx;
@@ -399,14 +524,17 @@ inline bool postFrame(Sta &s, unsigned which, uint32_t length)
   tx.bus = d.bus;
   tx.frame = d.va;
   tx.bytes = length;
-  return post(s, [&](WmiWriter &w, uint8_t *b, uint32_t c) { return assocBuildMgmtTx(w, b, c, tx); });
+  if (!post(s, [&](WmiWriter &w, uint8_t *b, uint32_t c) { return assocBuildMgmtTx(w, b, c, tx); })) return false;
+  s.lastFrameCheck = frameCheck(s, d, length, subtype);
+  say(s, kStaRepFrameCheck, tx.descId, s.lastFrameCheck);
+  return true;
 }
 
 inline bool postAuth(Sta &s)
 {
   const StaDma &d = s.env.frame[kStaFrameAuth];
   const uint32_t length = dot11BuildAuth(d.va, d.bytes, s.env.ownMac, s.bssid, ++s.seq);
-  return length && postFrame(s, kStaFrameAuth, length);
+  return length && postFrame(s, kStaFrameAuth, length, kDot11Auth);
 }
 
 inline bool postAssoc(Sta &s)
@@ -429,7 +557,7 @@ inline bool postAssoc(Sta &s)
   r.firstChannel = uint8_t(s.choice.channel >= 149 ? 149 : s.choice.channel >= 100 ? 100 : s.choice.channel >= 52 ? 52 : 36);
   r.channelCount = uint8_t(s.choice.channel >= 149 ? 5 : s.choice.channel >= 100 ? 12 : 4);
   const uint32_t length = dot11BuildAssocRequest(d.va, d.bytes, r);
-  return length && postFrame(s, kStaFrameAssoc, length);
+  return length && postFrame(s, kStaFrameAssoc, length, kDot11AssocRequest);
 }
 
 inline uint32_t phyMode(const Sta &s)
@@ -482,6 +610,127 @@ inline bool postVdevStart(Sta &s)
   v.radar = false;   // the radar flag is an access point's business; a station's channel is only passive
   v.pmf = false;
   return post(s, [&](WmiWriter &w, uint8_t *b, uint32_t c) { return assocBuildVdevStart(w, b, c, v); });
+}
+
+// The candidate at candAt, or the next one whose security fits the profile: its choice, its address, its security. False when
+// none is left.
+inline bool takeCandidate(Sta &s)
+{
+  while (s.candAt < s.candCount) {
+    s.choice = s.cand[s.candAt];
+    for (unsigned i = 0; i < 6; ++i) s.bssid[i] = s.choice.net.bssid[i];
+    if (securityFits(s)) return true;
+    s.candResult[s.candAt] = kStaErrSecurity;
+    say(s, kStaRepCandidateEnd, s.candAt + 1, uint32_t(-kStaErrSecurity));
+    ++s.candAt;
+  }
+  return false;
+}
+
+// What one candidate's join left behind, cleared for the next one (the station's parameters stay: they are the device's).
+inline void resetJoin(Sta &s)
+{
+  s.routingSent = false;
+  s.tidsSent = 0;
+  s.peerCreated = s.peerMapped = s.vdevStartSent = s.vdevStarted = s.vdevUp = s.authorized = false;
+  s.peerId = s.hwPeerId = 0;
+  s.startResp = VdevStartResp{};
+  s.tries = 0;
+  s.frameOut = false;
+  s.authAnswered = s.assocAnswered = s.peerAssocConf = false;
+  s.authStatus = s.assocStatus = s.aid = s.assocCapability = 0;
+  s.assocAnswer = Dot11Answer{};
+  s.authMs = s.assocMs = 0;
+  s.associatedAt = 0;
+  s.disconnect = kStaDiscNone;
+  s.disconnectReason = s.disconnectMs = 0;
+  s.deauthSent = s.downSent = s.peerDeleteSent = s.peerDeleted = s.stopSent = s.vdevStopped = false;
+  s.tdPhase = 0;
+  s.teardownWait = 0;
+}
+
+// The next candidate after one that failed (its teardown done): the join again from its peer.
+inline void advanceCandidate(Sta &s, uint64_t nowMs)
+{
+  s.nextCandidate = false;
+  resetJoin(s);
+  ++s.candAt;
+  if (!takeCandidate(s)) {
+    s.step = kStaStopped;   // the last candidate's error stands
+    if (s.note) s.note(s.ctx, kStaStopped, staStepName(kStaStopped));
+    return;
+  }
+  s.error = kStaErrNone;
+  s.failedStep = 0;
+  say(s, kStaRepCandidate, s.candAt + 1, s.choice.cls);
+  enter(s, kStaPeerCreate, nowMs, s.options.stepMs);
+}
+
+// A failure of this candidate (no answer, a refusal): with bit 10 and another candidate left, its pieces are taken down and the
+// next one is tried; else the join fails as before.
+inline int failCandidate(Sta &s, int error, uint64_t nowMs)
+{
+  if (s.candAt < kStaCandidatesMax) s.candResult[s.candAt] = error;
+  say(s, kStaRepCandidateEnd, s.candAt + 1, uint32_t(-error));
+  if ((s.options.flags & kStaFlagNextAp) && s.candAt + 1 < s.candCount) {
+    s.failedStep = s.step;
+    s.error = error;
+    s.nextCandidate = true;
+    if (s.peerCreated || s.vdevStartSent) beginTeardown(s, nowMs);
+    else advanceCandidate(s, nowMs);
+    return error;
+  }
+  return fail(s, error, nowMs);
+}
+
+// The probe requests' rates (a probe request must carry them): the 5 GHz band's eight OFDM rates; the 2.4 GHz band's four
+// CCK rates and four OFDM ones, and the other four OFDM rates as extended rates (500 kb/s units, bit 7 basic).
+inline constexpr uint8_t kProbeIes5[] = {kDot11ElementRates, 8, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c};
+inline constexpr uint8_t kProbeIes24[] = {kDot11ElementRates, 8, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24,
+                                          kDot11ElementExtRates, 4, 0x30, 0x48, 0x60, 0x6c};
+
+// Level 7's own scan number `n` (0, 1, ...): with bit 9 the first is an active scan with a directed probe on the 5 GHz
+// channels the station may transmit on, the second the same on 2.4 GHz (a network that hides its name answers only a probe
+// that names it), and the rest passive over every channel; without bit 9 all are passive. Returns the kind (1, 2, 3).
+inline uint32_t planScan(const Sta &s, uint32_t n, WmiScanRequest &req)
+{
+  req = WmiScanRequest{};
+  req.scanId = kAssocScanId + n;
+  req.requestorId = kWmiScanRequestorId;
+  req.vdevId = s.options.vdevId;
+  uint32_t kind = (s.options.flags & kStaFlagDirected) ? (n == 0 ? 1u : n == 1 ? 2u : 3u) : 3u;
+  for (int pass = 0; pass < 2; ++pass) {
+    req.channelCount = 0;
+    if (s.env.chanList && s.env.chanList->count) {
+      for (uint32_t i = 0; i < s.env.chanList->count && req.channelCount < sizeof req.channels / sizeof req.channels[0]; ++i) {
+        const ChanListEntry &e = s.env.chanList->entry[i];
+        const bool five = e.freq >= 4900, passive = (e.info & kWmiChanInfoPassive) != 0;
+        if (kind == 1 && (!five || passive)) continue;
+        if (kind == 2 && (five || passive)) continue;
+        req.channels[req.channelCount++] = e.freq;
+      }
+    } else {
+      wmiScanChannels(req, true);
+      if (kind != 3) {
+        uint32_t keep = 0;
+        for (uint32_t i = 0; i < req.channelCount; ++i) {
+          const bool five = req.channels[i] >= 4900;
+          if ((kind == 1) == five) req.channels[keep++] = req.channels[i];
+        }
+        req.channelCount = keep;
+      }
+    }
+    if (req.channelCount || kind == 3) break;
+    kind = 3;   // no channel of that kind: a passive scan instead
+  }
+  req.passive = kind == 3;
+  if (kind != 3) {
+    req.ssidLength = s.ssidLength;
+    for (uint32_t i = 0; i < s.ssidLength && i < kSsidMax; ++i) req.ssid[i] = s.ssid[i];
+    req.extraIe = kind == 1 ? kProbeIes5 : kProbeIes24;
+    req.extraIeLength = kind == 1 ? uint32_t(sizeof kProbeIes5) : uint32_t(sizeof kProbeIes24);
+  }
+  return kind;
 }
 
 }  // namespace stadetail
@@ -571,7 +820,7 @@ inline bool staOnEvent(Sta &s, uint32_t id, const uint8_t *payload, uint32_t len
     if (s.step == kStaVdevStart) {
       say(s, kStaRepStartResp, r.status, uint32_t(nowMs - s.sentAt));
       if (r.status != kWmiVdevStartOk) {
-        fail(s, kStaErrStartRefused, nowMs);
+        failCandidate(s, kStaErrStartRefused, nowMs);
         return true;
       }
       s.vdevStarted = true;
@@ -609,7 +858,7 @@ inline bool staOnEvent(Sta &s, uint32_t id, const uint8_t *payload, uint32_t len
       s.authMs = uint32_t(nowMs - s.sentAt);
       say(s, kStaRepAuthAnswer, a.status, s.authMs);
       if (a.status != kDot11StatusSuccess) {
-        fail(s, kStaErrAuthRefused, nowMs);
+        failCandidate(s, kStaErrAuthRefused, nowMs);
         return true;
       }
       s.tries = 0;
@@ -626,7 +875,7 @@ inline bool staOnEvent(Sta &s, uint32_t id, const uint8_t *payload, uint32_t len
       s.assocAnswer = a;
       say(s, kStaRepAssocAnswer, a.status, a.aid);
       if (a.status != kDot11StatusSuccess) {
-        fail(s, kStaErrAssocRefused, nowMs);
+        failCandidate(s, kStaErrAssocRefused, nowMs);
         return true;
       }
       s.aid = a.aid;
@@ -643,7 +892,7 @@ inline bool staOnEvent(Sta &s, uint32_t id, const uint8_t *payload, uint32_t len
       s.disconnectMs = s.associatedAt ? uint32_t(nowMs - s.associatedAt) : 0;
       say(s, kStaRepDisconnect, s.disconnect, a.reason);
       if (s.step == kStaAssociated) beginTeardown(s, nowMs);
-      else if (s.step != kStaTeardown) fail(s, kStaErrDisconnected, nowMs);
+      else if (s.step != kStaTeardown) failCandidate(s, kStaErrDisconnected, nowMs);
       return true;
     }
     ++s.mgmtOthers;
@@ -726,26 +975,24 @@ inline int staRun(Sta &s, uint64_t nowMs)
     if (nowMs > s.deadline) fail(s, kStaErrNoProfile, nowMs);
     break;
   case kStaChoose: {
-    s.choice = choose(s);
-    if (!s.choice.found) {
+    uint32_t total = 0, radar = 0, hidden = 0;
+    const uint32_t cap = s.options.maxCandidates && s.options.maxCandidates < kStaCandidatesMax ? s.options.maxCandidates
+                                                                                                  : kStaCandidatesMax;
+    s.candCount = chooseAll(s, s.cand, cap, total, radar, hidden);
+    s.hiddenSeen = hidden;
+    s.candAt = 0;
+    if (!s.candCount) {
+      s.choice = StaChoice{};
+      s.choice.candidates = total;
+      s.choice.excludedRadar = radar;
       if (s.rescansDone < s.options.rescans) {
-        // a scan of our own, every channel of the regulatory list, then the choice again
         WmiScanRequest req;
-        req.scanId = kAssocScanId + s.rescansDone;
-        req.requestorId = kWmiScanRequestorId;
-        req.vdevId = s.options.vdevId;
-        req.passive = true;
-        if (s.env.chanList && s.env.chanList->count) {
-          req.channelCount = 0;
-          for (uint32_t i = 0; i < s.env.chanList->count && i < sizeof req.channels / sizeof req.channels[0]; ++i)
-            req.channels[req.channelCount++] = s.env.chanList->entry[i].freq;
-        } else {
-          wmiScanChannels(req, true);
-        }
+        const uint32_t kind = planScan(s, s.rescansDone, req);
         s.scanId = req.scanId;
         s.scanAsked = true;
         s.scanDone = false;
         ++s.rescansDone;
+        say(s, kStaRepScanPlan, s.rescansDone, kind | req.channelCount << 8);
         enter(s, kStaRescan, nowMs, s.options.scanWaitMs);
         if (!post(s, [&](WmiWriter &w, uint8_t *b, uint32_t c) { return wmiBuildStartScan(w, b, c, req); }))
           fail(s, kStaErrBuild, nowMs);
@@ -754,12 +1001,12 @@ inline int staRun(Sta &s, uint64_t nowMs)
       fail(s, kStaErrNotFound, nowMs);
       break;
     }
-    for (unsigned i = 0; i < 6; ++i) s.bssid[i] = s.choice.net.bssid[i];
-    say(s, kStaRepChosen, s.choice.index, s.choice.candidates);
-    if (!securityFits(s)) {
+    if (!takeCandidate(s)) {
       fail(s, kStaErrSecurity, nowMs);
       break;
     }
+    say(s, kStaRepChosen, s.choice.index, s.choice.candidates);
+    say(s, kStaRepCandidate, s.candAt + 1, s.choice.cls);
     if (s.options.flags & kStaFlagNoJoin) {
       s.step = kStaDone;
       if (s.note) s.note(s.ctx, kStaDone, "done (piano-wifi-l7 bit 7: the network was chosen, nothing joined)");
@@ -788,7 +1035,7 @@ inline int staRun(Sta &s, uint64_t nowMs)
     break;
   case kStaParams:
     if (!paced) break;
-    if (s.paramsSent < kStaParamCount) {
+    if (s.paramsSent < paramCount(s)) {
       if (!postParam(s, s.paramsSent)) fail(s, kStaErrBuild, nowMs);
       else ++s.paramsSent;
       break;
@@ -874,7 +1121,7 @@ inline int staRun(Sta &s, uint64_t nowMs)
     if (!s.frameOut) {
       if (!paced) break;
       if (s.tries >= s.options.frameTries) {
-        fail(s, kStaErrNoAnswer, nowMs);
+        failCandidate(s, kStaErrNoAnswer, nowMs);
         break;
       }
       ++s.tries;
@@ -938,7 +1185,7 @@ inline int staRun(Sta &s, uint64_t nowMs)
       if (s.vdevUp && !s.disconnect && (s.options.flags & kStaFlagDeauth) && s.env.frame[kStaFrameDeauth].va) {
         const StaDma &d = s.env.frame[kStaFrameDeauth];
         const uint32_t length = dot11BuildDeauth(d.va, d.bytes, s.env.ownMac, s.bssid, ++s.seq, kDot11ReasonLeaving);
-        if (length && postFrame(s, kStaFrameDeauth, length)) {
+        if (length && postFrame(s, kStaFrameDeauth, length, kDot11Deauth)) {
           s.deauthSent = true;
           s.teardownWait = nowMs + 150;   // the frame leaves before the station goes down
           say(s, kStaRepTeardown, kStaTdDeauth, 1);
@@ -972,6 +1219,10 @@ inline int staRun(Sta &s, uint64_t nowMs)
     default:
       if (s.stopSent) say(s, kStaRepTeardown, kStaTdStop, s.vdevStopped ? 1 : 0);
       s.teardownWait = 0;
+      if (s.nextCandidate && !s.stopAsked) {
+        advanceCandidate(s, nowMs);
+        break;
+      }
       s.step = s.error ? kStaStopped : kStaDone;
       if (s.note) s.note(s.ctx, s.step, staStepName(s.step));
       break;

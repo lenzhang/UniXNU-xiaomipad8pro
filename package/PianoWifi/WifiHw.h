@@ -898,6 +898,11 @@ constexpr uint32_t kWmiTxRxRaw = 0, kWmiTxRxNativeWifi = 1, kWmiTxRxEthernet = 2
 constexpr uint32_t kWmiCmdStaPowersaveParam = 0x09002, kWmiTagStaPowersaveParamCmd = 0x06d;
 constexpr uint32_t kWmiStaPsParamRxWakePolicy = 0, kWmiStaPsParamTxWakeThreshold = 1, kWmiStaPsParamPspollCount = 2;
 constexpr uint32_t kWmiStaPsRxWakePolicyWake = 0, kWmiStaPsTxWakeThresholdAlways = 1, kWmiStaPsPspollCountNoMax = 0;
+// The radio's transmit power limits (WMI_PDEV_SET_PARAM 3 and 4, 2.4 and 5 GHz), which this chip's host sends right after a
+// virtual device: the value in half-dB (7:0) and a reason (15:8). For WCN7860 that host sends its platform limit, 30 (15 dBm),
+// with the SAR reason 1 (the value the vendor host sends at every start).
+constexpr uint32_t kWmiPdevParamTxPowerLimit2g = 0x03, kWmiPdevParamTxPowerLimit5g = 0x04;
+constexpr uint32_t kWmiTxPowerLimitValue = 30u | 1u << 8;
 // The peer's data set-up: WMI_PEER_SET_PARAM "default routing" = hash steering on (bit 0) and the receive ring the peer's
 // frames go to in 3:1 (the ring's number counts from 1: radio 0's ring is 1); then WMI_PEER_REORDER_QUEUE_SETUP for each
 // traffic identifier 0-16 (16 is the non-QoS one): the device, the peer's address, the identifier, the queue descriptor's bus

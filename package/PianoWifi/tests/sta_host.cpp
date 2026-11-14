@@ -437,7 +437,19 @@ struct Model {
   uint64_t now = 1000;
   // what the firmware saw
   std::vector<uint32_t> commands;
-  std::vector<std::pair<uint32_t, uint32_t>> vdevParams, psParams;
+  std::vector<std::pair<uint32_t, uint32_t>> vdevParams, psParams, pdevParams;
+  struct Scan {
+    bool passive = true;
+    uint32_t channels = 0, ssids = 0, ieLength = 0;
+    std::vector<uint32_t> freqs;
+    std::vector<uint8_t> ssid, ies;
+  };
+  std::vector<Scan> scanLog;
+  bool hiddenAnswers = false;
+  uint32_t hiddenFreq = 5200;
+  std::vector<std::vector<uint8_t>> silentAuth;   // access points that never answer an authentication
+  std::vector<uint32_t> authFreqs;                // the device's channel at each authentication frame
+  std::vector<uint32_t> checks;                   // every frame check's bits
   uint32_t psMode = 0xffffffff, routing = 0, nonQosTidBus = 0;
   std::vector<uint32_t> tids;
   uint32_t startFreq = 0, startMode = 0xff, startInfo = 0, startBi = 0, startDtim = 0;
@@ -467,7 +479,9 @@ struct Model {
   static void note(void *ctx, int step, const char *) { static_cast<Model *>(ctx)->steps.push_back(step); }
   static void report(void *ctx, uint32_t what, uint32_t a, uint32_t b)
   {
-    static_cast<Model *>(ctx)->reports.push_back({what, {a, b}});
+    Model &m = *static_cast<Model *>(ctx);
+    m.reports.push_back({what, {a, b}});
+    if (what == kStaRepFrameCheck) m.checks.push_back(b);
   }
 
   bool hasReport(uint32_t what, uint32_t a) const
@@ -627,7 +641,10 @@ struct Model {
       const uint8_t sub = frame[0];
       if (sub == kDot11Auth) {
         authFrame = frame;
-        if (answerAuth)
+        authFreqs.push_back(startFreq);
+        bool silent = false;
+        for (const auto &b : silentAuth) silent = silent || std::memcmp(b.data(), bssid(), 6) == 0;
+        if (answerAuth && !silent)
           frameUp(5, answerFrame(kDot11Auth, kOwn, bssid(), {0, 0, 2, 0, uint8_t(authStatus), uint8_t(authStatus >> 8)}), startFreq);
       } else if (sub == kDot11AssocRequest) {
         assocFrame = frame;
@@ -689,11 +706,44 @@ struct Model {
       stopped = true;
       event(5, kWmiEvtVdevStopped, fixed(kWmiTagVdevStoppedEvent, {0}));
       return;
+    case kWmiCmdPdevSetParam: {
+      const uint8_t *c = wmiFind(tlvs, left, kWmiTagPdevSetParamCmd, &size);
+      CHECK(c && size == 12);
+      if (c) pdevParams.push_back({wmiGet(c, 1), wmiGet(c, 2)});
+      return;
+    }
     case kWmiCmdStartScan: {
       ++scans;
       const uint8_t *c = wmiFind(tlvs, left, kWmiTagStartScanCmd, &size);
       CHECK(c && wmiGet(c, 0) == kAssocScanId + scans - 1);
-      if (answerScan && c)
+      if (!c) return;
+      Scan sc;
+      sc.passive = (wmiGet(c, 14) & kWmiScanFlagPassive) != 0;
+      sc.channels = wmiGet(c, 16);
+      sc.ssids = wmiGet(c, 18);
+      sc.ieLength = wmiGet(c, 19);
+      const uint8_t *chans = wmiFind(tlvs, left, kWmiTagArrayUint32, &size);
+      CHECK(chans && size == sc.channels * 4);
+      for (uint32_t i = 0; chans && i < sc.channels; ++i) sc.freqs.push_back(wmiGet(chans, i));
+      const uint8_t *names = wmiFind(tlvs, left, kWmiTagArrayFixedStruct, &size);   // the first fixed array: the names
+      CHECK(names && size == sc.ssids * (4 + kSsidMax));
+      if (names && sc.ssids) sc.ssid.assign(names + 4, names + 4 + wmiGet(names, 0));
+      // the elements: the array of bytes (the last one of the command)
+      const uint8_t *at = tlvs;
+      uint32_t leftover = left;
+      WmiTlvRef tlv;
+      while (wmiNext(at, leftover, tlv))
+        if (tlv.tag == kWmiTagArrayByte) sc.ies.assign(tlv.value, tlv.value + sc.ieLength);
+      scanLog.push_back(sc);
+      // a network that hides its name answers a directed probe that names it (what level 6's scan list then gets)
+      if (hiddenAnswers && !sc.passive && sc.ssid == std::vector<uint8_t>(kName, kName + sizeof kName))
+        for (uint32_t f : sc.freqs)
+          if (f == hiddenFreq) {
+            std::vector<uint8_t> probe = beacon(kAp5, kName, sizeof kName, true, true, kDot11CapEss | kDot11CapPrivacy);
+            probe[0] = kDot11SubtypeProbeResponse;
+            addToList(list, probe, f, -42);
+          }
+      if (answerScan)
         event(50, kWmiEvtScan, fixed(kWmiTagScanEvent, {kWmiScanEvCompleted, 0, 0, kWmiScanRequestorId, wmiGet(c, 0), 0}));
       return;
     }
@@ -772,8 +822,8 @@ static void testJoinWpa2()
   // the order of the commands, Ubuntu's: the parameters, the peer, its routing and 17 queues, the start, the two frames, the
   // peer's association, the station up; then (the access point ended it) the station down, the peer deleted, the device stopped
   std::vector<uint32_t> want = {kWmiCmdVdevSetParam, kWmiCmdVdevSetParam, kWmiCmdVdevSetParam, kWmiCmdStaPowersaveParam,
-                                kWmiCmdStaPowersaveParam, kWmiCmdStaPowersaveParam, kWmiCmdStaPowersaveMode, kWmiCmdPeerCreate,
-                                kWmiCmdPeerSetParam};
+                                kWmiCmdStaPowersaveParam, kWmiCmdStaPowersaveParam, kWmiCmdStaPowersaveMode, kWmiCmdPdevSetParam,
+                                kWmiCmdPdevSetParam, kWmiCmdPeerCreate, kWmiCmdPeerSetParam};
   for (uint32_t t = 0; t < kStaTids; ++t) want.push_back(kWmiCmdPeerReorderQueueSetup);
   for (uint32_t c : {kWmiCmdVdevStart, kWmiCmdMgmtTxSend, kWmiCmdMgmtTxSend, kWmiCmdPeerAssoc, kWmiCmdVdevUp, kWmiCmdVdevDown,
                      kWmiCmdPeerDelete, kWmiCmdVdevStop})
@@ -786,6 +836,12 @@ static void testJoinWpa2()
   CHECK(m.psParams.size() == 3 && m.psParams[0] == std::make_pair(kWmiStaPsParamRxWakePolicy, kWmiStaPsRxWakePolicyWake));
   CHECK(m.psParams[1] == std::make_pair(kWmiStaPsParamTxWakeThreshold, kWmiStaPsTxWakeThresholdAlways));
   CHECK(m.psParams[2] == std::make_pair(kWmiStaPsParamPspollCount, kWmiStaPsPspollCountNoMax) && m.psMode == kWmiStaPsOff);
+  // the transmit power limits of both bands: 30 half-dB with the SAR reason (bit 8)
+  CHECK(m.pdevParams.size() == 2 && m.pdevParams[0] == std::make_pair(kWmiPdevParamTxPowerLimit2g, 30u | 1u << 8));
+  CHECK(m.pdevParams[1] == std::make_pair(kWmiPdevParamTxPowerLimit5g, 30u | 1u << 8));
+  // every frame checked out whole: the addresses, the type, the sequence, the command's fields
+  CHECK(m.checks.size() == 2 && m.checks[0] == kStaFrameCheckAll && m.checks[1] == kStaFrameCheckAll);
+  CHECK(m.hasReport(kStaRepCandidate, 1));
   // the 5 GHz access point, its peer mapped, its routing (hash on, ring 1) and the 17 queues in order
   CHECK(m.sta.choice.found && m.sta.choice.band5 && std::memcmp(m.sta.bssid, kAp5, 6) == 0);
   CHECK(m.sta.peerMapped && m.sta.peerId == 3 && m.hasReport(kStaRepPeerMap, 3));
@@ -842,16 +898,43 @@ static void testJoinOpen()
 
 static void testFailures()
 {
-  {   // no answer to the authentication: three tries, then the teardown (the peer deleted, the device stopped; never "down")
+  {   // no answer to the authentication from anyone: three tries on each of the two candidates (5 GHz, then 2.4 GHz), a
+      // teardown after each (the peer deleted, the device stopped; never "down"), then the end
     Model m;
     m.networks();
     m.answerAuth = false;
     m.begin(fastOptions());
     CHECK(m.run() == kStaStopped && m.sta.error == kStaErrNoAnswer && m.sta.failedStep == kStaAuth);
-    unsigned frames = 0;
-    for (uint32_t c : m.commands) frames += c == kWmiCmdMgmtTxSend;
-    CHECK(frames == 3 && m.sta.tries == 3 && m.hasReport(kStaRepTry, kStaAuth));
+    unsigned frames = 0, deletes = 0, stops = 0, starts = 0;
+    for (uint32_t c : m.commands) {
+      frames += c == kWmiCmdMgmtTxSend;
+      deletes += c == kWmiCmdPeerDelete;
+      stops += c == kWmiCmdVdevStop;
+      starts += c == kWmiCmdVdevStart;
+    }
+    CHECK(frames == 6 && starts == 2 && deletes == 2 && stops == 2 && m.sta.tries == 3 && m.hasReport(kStaRepTry, kStaAuth));
+    CHECK(m.authFreqs.size() == 6 && m.authFreqs[0] == 5200 && m.authFreqs[5] == 2437);
+    CHECK(m.hasReport(kStaRepCandidate, 1) && m.hasReport(kStaRepCandidate, 2) && m.hasReport(kStaRepCandidateEnd, 2));
     CHECK(!m.down && m.peerDeleted && m.stopped);
+    // the parameters went out once (they are the device's, not the candidate's)
+    CHECK(m.vdevParams.size() == 3 && m.pdevParams.size() == 2);
+  }
+  {   // the 5 GHz access point is silent, the 2.4 GHz one answers: joined on the second candidate
+    Model m;
+    m.networks();
+    m.silentAuth.push_back(std::vector<uint8_t>(kAp5, kAp5 + 6));
+    m.deauthAfterUpMs = 200;
+    m.begin(fastOptions());
+    CHECK(m.run() == kStaDone && m.sta.error == kStaErrNone && m.sta.aid == 5 && m.sta.candAt == 1);
+    CHECK(std::memcmp(m.upBssid, kAp24, 6) == 0 && m.startFreq == 2437 && m.sta.candResult[0] == kStaErrNoAnswer);
+    // without bit 10 the first one's silence ends the join
+    Model one;
+    one.networks();
+    one.silentAuth.push_back(std::vector<uint8_t>(kAp5, kAp5 + 6));
+    StaOptions o = fastOptions();
+    o.flags &= ~kStaFlagNextAp;
+    one.begin(o);
+    CHECK(one.run() == kStaStopped && one.sta.error == kStaErrNoAnswer && one.sta.candAt == 0);
   }
   {   // the association refused (17: no room)
     Model m;
@@ -868,18 +951,87 @@ static void testFailures()
     m.begin(fastOptions());
     CHECK(m.run() == kStaStopped && m.sta.error == kStaErrStartRefused && m.authFrame.empty() && m.peerDeleted && m.stopped);
   }
-  {   // the network is not in the list: two scans of our own (every channel of the regulatory list), then the end; nothing made
+  {   // the network is not in the list: three scans of our own — directed probes on the 5 GHz channels the station may transmit
+      // on, then on 2.4 GHz, then a passive one over every channel — then the end; nothing made
     Model m;
     m.reg.seen = true;
-    m.reg.ruleCount = 1;
+    m.reg.ruleCount = 3;
     m.reg.rule[0] = RegRule{2402, 2482, 40, 20, 0};
+    m.reg.rule[1] = RegRule{5170, 5250, 80, 23, 0};
+    m.reg.rule[2] = RegRule{5250, 5330, 80, 23, kRegRuleFlagRadar};
     chanListBuild(m.chanList, m.reg, true);
     m.begin(fastOptions());
     CHECK(m.run() == kStaStopped && m.sta.error == kStaErrNotFound);
-    CHECK(m.scans == 2 && m.commands.size() == 2 && !m.peerCreated);
-    CHECK(m.hasReport(kStaRepScanDone, 1) && m.hasReport(kStaRepScanDone, 2));
+    CHECK(m.scans == 3 && m.commands.size() == 3 && !m.peerCreated && m.scanLog.size() == 3);
+    CHECK(m.hasReport(kStaRepScanDone, 1) && m.hasReport(kStaRepScanDone, 3));
+    const std::vector<uint8_t> name(kName, kName + sizeof kName);
+    // 1: active, the profile's name, 5180-5240 only (5260-5320 are radar: passive), the 5 GHz rates
+    CHECK(!m.scanLog[0].passive && m.scanLog[0].ssids == 1 && m.scanLog[0].ssid == name);
+    CHECK(m.scanLog[0].freqs == std::vector<uint32_t>({5180, 5200, 5220, 5240}));
+    CHECK(m.scanLog[0].ies == std::vector<uint8_t>({kDot11ElementRates, 8, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c}));
+    // 2: active on the 13 channels of 2.4 GHz with its rates and extended rates
+    CHECK(!m.scanLog[1].passive && m.scanLog[1].ssid == name && m.scanLog[1].channels == 13 && m.scanLog[1].ieLength == 16);
+    // 3: passive over every channel, no name
+    CHECK(m.scanLog[2].passive && m.scanLog[2].ssids == 0 && m.scanLog[2].ieLength == 0 && m.scanLog[2].channels == 21);
+    CHECK(m.hasReport(kStaRepScanPlan, 1) && m.hasReport(kStaRepScanPlan, 3));
   }
-  {   // a network found by our scan (the beacon arrives while it runs)
+  {   // a network that hides its name: the list has it only as a nameless entry; the directed probe names it, and the join goes on
+    Model m;
+    m.reg.seen = true;
+    m.reg.ruleCount = 2;
+    m.reg.rule[0] = RegRule{2402, 2482, 40, 20, 0};
+    m.reg.rule[1] = RegRule{5170, 5250, 80, 23, 0};
+    chanListBuild(m.chanList, m.reg, true);
+    const uint8_t nothing[1] = {};
+    addToList(m.list, beacon(kAp5, nothing, 0, true, true, kDot11CapEss | kDot11CapPrivacy), 5200, -42);
+    CHECK(m.list.count == 1 && m.list.entries[0].hidden);
+    m.hiddenAnswers = true;
+    m.deauthAfterUpMs = 100;
+    m.begin(fastOptions());
+    CHECK(m.run() == kStaDone && m.sta.aid == 5 && m.scans == 1 && m.list.count == 1 && !m.list.entries[0].hidden);
+    CHECK(std::memcmp(m.upBssid, kAp5, 6) == 0 && m.startFreq == 5200);
+  }
+  {   // boot 10a: the access point names channel 40 but was heard at 5260 MHz: the join runs on 5200 MHz, not on 5260
+    Model m;
+    m.reg.seen = true;
+    m.reg.ruleCount = 3;
+    m.reg.rule[0] = RegRule{2402, 2482, 40, 20, 0};
+    m.reg.rule[1] = RegRule{5170, 5250, 80, 23, 0};
+    m.reg.rule[2] = RegRule{5250, 5330, 80, 23, kRegRuleFlagRadar};
+    chanListBuild(m.chanList, m.reg, true);
+    std::vector<uint8_t> b = beacon(kAp5, kName, sizeof kName, true, true, kDot11CapEss | kDot11CapPrivacy);
+    b.push_back(kDot11ElementDsParams);
+    b.push_back(1);
+    b.push_back(40);
+    addToList(m.list, b, 5260, -39);
+    CHECK(m.list.entries[0].freq == 5200 && m.list.entries[0].heardFreq == 5260 && m.list.entries[0].offChannel);
+    m.deauthAfterUpMs = 100;
+    m.begin(fastOptions());
+    CHECK(m.run() == kStaDone && m.startFreq == 5200 && !(m.startInfo & kWmiChanInfoPassive) && m.sta.choice.cls == kStaClass5);
+  }
+  {   // the order of the candidates: 5 GHz not radar, then radar, then 2.4 GHz, whatever their strength
+    Model m;
+    m.reg.seen = true;
+    m.reg.ruleCount = 3;
+    m.reg.rule[0] = RegRule{2402, 2482, 40, 20, 0};
+    m.reg.rule[1] = RegRule{5170, 5250, 80, 23, 0};
+    m.reg.rule[2] = RegRule{5250, 5330, 80, 23, kRegRuleFlagRadar};
+    chanListBuild(m.chanList, m.reg, true);
+    const uint8_t apRadar[6] = {0x3c, 0x52, 0xa1, 0x10, 0x20, 0x40};
+    const uint16_t cap = kDot11CapEss | kDot11CapPrivacy;
+    addToList(m.list, beacon(kAp24, kName, sizeof kName, true, false, cap), 2437, -30);
+    addToList(m.list, beacon(apRadar, kName, sizeof kName, true, true, cap), 5260, -35);
+    addToList(m.list, beacon(kAp5, kName, sizeof kName, true, true, cap), 5200, -60);
+    m.silentAuth.push_back(std::vector<uint8_t>(kAp5, kAp5 + 6));
+    m.silentAuth.push_back(std::vector<uint8_t>(apRadar, apRadar + 6));
+    m.deauthAfterUpMs = 100;
+    m.begin(fastOptions());
+    CHECK(m.run() == kStaDone && m.sta.candCount == 3 && m.sta.candAt == 2);
+    CHECK(m.sta.cand[0].cls == kStaClass5 && m.sta.cand[1].cls == kStaClassRadar && m.sta.cand[2].cls == kStaClass24);
+    CHECK(m.authFreqs.size() == 7 && m.authFreqs[0] == 5200 && m.authFreqs[3] == 5260 && m.authFreqs[6] == 2437);
+    CHECK(m.hasReport(kStaRepCandidate, 3));
+  }
+  {   // a network found by our scan (the beacon arrives while it runs; the first scan is the directed one on 5 GHz)
     Model m;
     m.reg.seen = true;
     m.reg.ruleCount = 2;

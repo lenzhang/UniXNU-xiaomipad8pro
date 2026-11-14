@@ -102,6 +102,8 @@ using namespace pianowifi;
 extern "C" {
 // Post-mortem breadcrumb (also in the console log): the last stage reached, negative when it failed there.
 volatile int32_t piano_wifi_stage = 0;
+// WifiProfileFile.c: the join profile out of its root-only file (0, ENOENT for no file, else the reason in *problem).
+int piano_wifi_profile_read_file(struct piano_wifi_profile *out, const char **problem);
 }
 
 namespace {
@@ -115,7 +117,7 @@ struct Args {
   uint32_t noc, socreset, msi, ctxearly, ras;
   uint32_t rddm, defer, wake;
   uint32_t deadlineMs;
-  uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step;
+  uint32_t l7, l7wait, l7hold, l7tries, l7scans, l7frame, l7step, l7file, l7cands;
 };
 Args gArgs;
 
@@ -213,8 +215,14 @@ void readArgs()
   if (gArgs.l7hold > 3600000) gArgs.l7hold = kAssocHoldMs;
   gArgs.l7tries = bootArg("piano-wifi-l7tries", kAssocFrameTries);
   if (!gArgs.l7tries || gArgs.l7tries > 10) gArgs.l7tries = kAssocFrameTries;
-  gArgs.l7scans = bootArg("piano-wifi-l7scans", 2);
-  if (gArgs.l7scans > 10) gArgs.l7scans = 2;
+  gArgs.l7scans = bootArg("piano-wifi-l7scans", 3);
+  if (gArgs.l7scans > 10) gArgs.l7scans = 3;
+  // piano-wifi-l7file=0: the profile only through the sysctl (by default the kext also reads the root-only profile file
+  // itself while it waits, every 2 s: a RAM probe's Data may have no helper); piano-wifi-l7cands=N: how many access points of
+  // the profile's name are tried in turn (4, at most 6).
+  gArgs.l7file = bootArg("piano-wifi-l7file", 1);
+  gArgs.l7cands = bootArg("piano-wifi-l7cands", 4);
+  if (!gArgs.l7cands || gArgs.l7cands > kStaCandidatesMax) gArgs.l7cands = 4;
   gArgs.l7frame = bootArg("piano-wifi-l7frame", kAssocFrameWaitMs);
   if (gArgs.l7frame < 50 || gArgs.l7frame > 10000) gArgs.l7frame = kAssocFrameWaitMs;
   gArgs.l7step = bootArg("piano-wifi-l7step", 3000);
@@ -2591,9 +2599,11 @@ void publishScan(IOService *owner, const ScanList &list, bool full)
       snprintf(name, sizeof name, "\"%s\"", entry.ssidLength ? entry.ssid : "");
     else
       snprintf(name, sizeof name, "of %u byte(s)", unsigned(entry.ssidLength));
-    note("level 6: network %u: a name %s%s, bssid %s channel %u (%u MHz) signal %d dBm, %u beacon(s) %u probe(s)", i, name,
-         entry.hidden ? " (it does not say its name)" : "", bssid, entry.channel, entry.freq, int(entry.rssi), entry.beacons,
-         entry.probes);
+    char heard[40] = {};
+    if (entry.offChannel) snprintf(heard, sizeof heard, ", heard at %u MHz", entry.heardFreq);
+    note("level 6: network %u: a name %s%s, bssid %s channel %u (%u MHz%s) signal %d dBm, %u beacon(s) %u probe(s)", i, name,
+         entry.hidden ? " (it does not say its name)" : "", bssid, entry.channel, entry.freq, heard, int(entry.rssi),
+         entry.beacons, entry.probes);
   }
 }
 
@@ -3024,10 +3034,13 @@ void staReport(void *, uint32_t what, uint32_t a, uint32_t b)
   switch (what) {
   case kStaRepChosen: {
     const StaChoice &c = gSta.choice;
-    note("level 7: the network: entry %u of the scan list (%u access point(s) carry the profile's name, %u on a radar channel "
-         "left out): %u MHz, channel %u (%s GHz%s%s), signal %d dBm",
-         a, b, c.excludedRadar, c.freq, c.channel, c.band5 ? "5" : "2.4", c.passive ? ", passive" : "", c.radar ? ", radar" : "",
-         int(c.rssi));
+    note("level 7: the network: entry %u of the scan list (%u access point(s) carry the profile's name, %u tried in turn, %u "
+         "on a radar channel left out, %u nameless entries in the list): %u MHz, channel %u (%s GHz%s%s), signal %d dBm",
+         a, b, gSta.candCount, c.excludedRadar, gSta.hiddenSeen, c.freq, c.channel, c.band5 ? "5" : "2.4",
+         c.passive ? ", passive" : "", c.radar ? ", radar" : "", int(c.rssi));
+    if (c.net.offChannel)
+      note("level 7: its frames were heard while the radio was on %u MHz: the channel the network names (%u) is the one joined",
+           c.net.heardFreq, c.channel);
     const ScanSecurity &sec = c.net.security;
     note("level 7: its elements: beacon interval %u TU, DTIM %u, %u rate(s)%s, capability %#x; %s (group %u, pairwise %#x, key "
          "management %#x, capabilities %#x%s%s)",
@@ -3069,6 +3082,34 @@ void staReport(void *, uint32_t what, uint32_t a, uint32_t b)
     return;
   case kStaRepScanDone:
     note("level 7: our scan %u is done: the list has %u network(s)", a, b);
+    return;
+  case kStaRepCandidate: {
+    const StaChoice &c = gSta.choice;
+    note("level 7: candidate %u of %u: %s, %u MHz channel %u%s, signal %d dBm, list entry %u", a, gSta.candCount,
+         staClassName(b), c.freq, c.channel, c.passive ? " (passive)" : "", int(c.rssi), c.index);
+    return;
+  }
+  case kStaRepCandidateEnd:
+    note("level 7: candidate %u ended: %s (%s)%s", a, staErrorName(-int(b)),
+         a <= kStaCandidatesMax ? staClassName(gSta.cand[a - 1].cls) : "?",
+         (gArgs.l7 & kStaFlagNextAp) && a < gSta.candCount ? "; the next one follows its teardown" : "");
+    return;
+  case kStaRepFrameCheck:
+    note("level 7: frame %u check %s (%#x): to the network %s, from us %s, the network %s, the type %s, no flags %s, the "
+         "sequence %s; the command's device %s, frequency field 0 %s, no transmit parameters %s, the inline copy %s, the window "
+         "address and length %s, our address usable %s",
+         a, b == kStaFrameCheckAll ? "whole" : "NOT whole", b, (b & kStaChkAddr1) ? "yes" : "NO", (b & kStaChkAddr2) ? "yes" : "NO",
+         (b & kStaChkAddr3) ? "yes" : "NO", (b & kStaChkType) ? "yes" : "NO", (b & kStaChkFlags) ? "yes" : "NO",
+         (b & kStaChkSeq) ? "yes" : "NO", (b & kStaChkVdev) ? "yes" : "NO", (b & kStaChkFreq) ? "yes" : "NO",
+         (b & kStaChkTxParams) ? "yes" : "NO", (b & kStaChkInline) ? "yes" : "NO", (b & kStaChkBus) ? "yes" : "NO",
+         (b & kStaChkOwnUsable) ? "yes" : "NO");
+    return;
+  case kStaRepScanPlan:
+    note("level 7: our scan %u: %s on %u channel(s)", a,
+         (b & 0xff) == 1 ? "active, a probe naming the profile's network, 5 GHz (not radar)"
+         : (b & 0xff) == 2 ? "active, a probe naming the profile's network, 2.4 GHz"
+                           : "passive",
+         b >> 8);
     return;
   case kStaRepTeardown:
     note("level 7: the teardown: %s%s",
@@ -3122,12 +3163,17 @@ int level7(IOService *owner)
   env.htt = (gHttPlanned && gLink.httEndpoint > 0) ? &gHtt : nullptr;
   for (unsigned i = 0; i < kAssocFrameBuffers; ++i) env.frame[i] = gStaFrames[i];
   env.reoq = gStaReoq;
+  o.maxCandidates = gArgs.l7cands;
   note("level 7: piano-wifi-l7=%#x (parameters %u, peer data %u, peer map %u, 5 GHz first %u, radar %u, deauth %u, %s frames, "
-       "dry run %u); the profile waited for up to %u ms, %u try(s) of %u ms per frame, watched %u ms%s, %u scan(s) of our own",
+       "dry run %u, transmit power %u, directed probes %u, next access point %u)",
        o.flags, (o.flags & kStaFlagParams) ? 1u : 0u, (o.flags & kStaFlagPeerData) ? 1u : 0u, (o.flags & kStaFlagPeerMap) ? 1u : 0u,
        (o.flags & kStaFlagPrefer5) ? 1u : 0u, (o.flags & kStaFlagRadarOk) ? 1u : 0u, (o.flags & kStaFlagDeauth) ? 1u : 0u,
-       (o.flags & kStaFlagNativeWifi) ? "native Wi-Fi" : "802.3", (o.flags & kStaFlagNoJoin) ? 1u : 0u, o.profileWaitMs, o.frameTries,
-       o.frameWaitMs, o.holdMs, o.holdMs ? "" : " (until a suspend)", o.rescans);
+       (o.flags & kStaFlagNativeWifi) ? "native Wi-Fi" : "802.3", (o.flags & kStaFlagNoJoin) ? 1u : 0u,
+       (o.flags & kStaFlagTxPower) ? 1u : 0u, (o.flags & kStaFlagDirected) ? 1u : 0u, (o.flags & kStaFlagNextAp) ? 1u : 0u);
+  note("level 7: the profile waited for up to %u ms (the sysctl%s), %u try(s) of %u ms per frame, up to %u access point(s), "
+       "watched %u ms%s, %u scan(s) of our own",
+       o.profileWaitMs, gArgs.l7file ? " or its root-only file, read every 2 s" : " only", o.frameTries, o.frameWaitMs,
+       o.maxCandidates, o.holdMs, o.holdMs ? "" : " (until a suspend)", o.rescans);
   note("level 7: the device %u (its address from %s), %u chain(s), %u network(s) in the list, the data interface %s; %u frame "
        "buffer(s) and %u bytes of reorder queues in the window",
        o.vdevId, gLink.vdevMacFrom, o.chains, gLink.scan.count, env.htt ? "connected (the peer map is waited for)" : "not connected",
@@ -3139,6 +3185,8 @@ int level7(IOService *owner)
   staBegin(gSta, o, env, started);
   gLink.hook = staHook;
   uint32_t generation = 0;
+  uint64_t nextFileTry = 0;
+  const char *lastFileProblem = nullptr;
   bool stopping = false, profileNoted = false;
   uint64_t stopAt = 0;
   uint32_t sendWaits = 0;
@@ -3162,6 +3210,35 @@ int level7(IOService *owner)
     if (gLink.step == kLinkStopped) {
       why = linkErrorName(gLink.error);
       break;
+    }
+    // The root-only profile file, read by the kext itself while the join waits (a RAM probe's Data may have no helper); the
+    // sysctl stays the other way in, and whichever comes first is taken.
+    if (!gSta.profileSet && gArgs.l7file && gSta.step == kStaProfileWait && now >= nextFileTry && gProfileLock) {
+      nextFileTry = now + 2000;
+      IOLockLock(gProfileLock);
+      const bool have = gProfileSet;
+      IOLockUnlock(gProfileLock);
+      if (!have) {
+        piano_wifi_profile fromFile;
+        const char *problem = nullptr;
+        const int rc = piano_wifi_profile_read_file(&fromFile, &problem);
+        if (!rc) {
+          IOLockLock(gProfileLock);
+          gProfile = fromFile;
+          gProfileSet = true;
+          const uint32_t gen = ++gProfileGeneration;
+          IOLockUnlock(gProfileLock);
+          note("join profile read from its root-only file (generation %u): a network name of %u byte(s), %s%s, the access point "
+               "%s, the station's address %s (none of it is logged)",
+               gen, unsigned(fromFile.ssid_len), piano_wifi_security_name(fromFile.security),
+               fromFile.psk_len ? " with a passphrase" : "", (fromFile.flags & PianoWifiProfileBssid) ? "given" : "not given",
+               (fromFile.flags & PianoWifiProfileMac) ? "given" : "not given");
+          piano_wifi_profile_wipe(&fromFile);
+        } else if (problem && problem != lastFileProblem) {
+          lastFileProblem = problem;
+          note("level 7: the profile file is there but not read: %s (the sysctl is still waited for)", problem);
+        }
+      }
     }
     if (!gSta.profileSet && profileToSta(gSta, generation) && !profileNoted) {
       profileNoted = true;
@@ -3287,6 +3364,9 @@ bool PianoWifi::start(IOService *provider)
     const IOReturn rc = pianopower::join(this);
     if (rc != kIOReturnSuccess) note("the power tree refused this driver (%#x): a suspend will not stop the radio", rc);
   }
+  // Registered so that a lookup by class finds it: PianoWifiEthernet copies the scan list and the virtual device's address from
+  // this driver's properties (boot 10a: unregistered, it found nothing and kept its own default address).
+  registerService();
   thread_t t = nullptr;
   if (kernel_thread_start(&PianoWifi::thread, this, &t) != KERN_SUCCESS) {
     stage(-1, "no thread");
@@ -3582,8 +3662,8 @@ void PianoWifi::run()
     // The gate PianoWifiEthernet waits for: en1 appears (link down, with the scan list and the virtual device's address) only
     // when level 6 came up — before level 7's join, so that en1 is there when the link comes up.
     publishResource("PianoWifiLink");
-    note("level 6: the resource PianoWifiLink is published: PianoWifiEthernet's en1 may come up (link down, the scan list in "
-         "the property piano-wifi-scan; tooling/native/piano-wifi prints it)");
+    note("level 6: the resource PianoWifiLink is published: PianoWifiEthernet's interface may come up (link down, the scan "
+         "list in the property piano-wifi-scan; tooling/native/piano-wifi prints it)");
   }
   const bool level6Up = rc == 0;   // the chip is alive and its link up: only then may the wake doorbell be written
   if (!rc && gLink.step == kLinkHandOff) {

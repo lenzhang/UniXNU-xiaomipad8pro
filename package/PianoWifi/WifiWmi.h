@@ -317,6 +317,13 @@ struct WmiScanRequest {
   bool passive = true;
   uint32_t dwellActiveMs = kWmiScanDwellActiveMs, dwellPassiveMs = kWmiScanDwellPassiveMs;
   uint32_t maxScanTimeMs = kWmiScanMaxTimeMs;
+  // An active scan's directed probe (level 7, a network that does not say its name): the name the probe requests carry, and
+  // the elements the firmware appends to them (the rates: a probe request must carry them). Empty: a wildcard probe, or none
+  // at all for a passive scan.
+  uint8_t ssid[kSsidMax] = {};
+  uint32_t ssidLength = 0;
+  const uint8_t *extraIe = nullptr;
+  uint32_t extraIeLength = 0;
 };
 
 // The channel list this level scans: the 2.4 GHz band, then the 5 GHz band's channels that need no radar detection.
@@ -353,8 +360,8 @@ inline uint32_t wmiBuildStartScan(WmiWriter &w, uint8_t *buffer, uint32_t capaci
     wmiPut(cmd, 16, request.channelCount);
     wmiPut(cmd, 17, 1);                        // one address to look for, the broadcast one below (this firmware's own host
                                                // always sends it, so that a later active scan's probes carry it)
-    wmiPut(cmd, 18, 0);                        // and no network asked for by name: a passive scan listens to every one
-    wmiPut(cmd, 19, 0);                        // no elements added to a probe
+    wmiPut(cmd, 18, request.ssidLength ? 1u : 0u);   // a network asked for by name (a directed probe), or none
+    wmiPut(cmd, 19, request.extraIe ? request.extraIeLength : 0u);   // the elements added to a probe (their real length)
     wmiPut(cmd, 20, 0);                        // and no probe repeats
     wmiPut(cmd, 35, kWmiScanDwellActive2GhzMs);   // none of its own for the 2.4 GHz band: it takes the general one
     wmiPut(cmd, 36, kWmiScanDwell6GhzMs);         // and the 6 GHz band's two, which this scan never reaches
@@ -363,11 +370,20 @@ inline uint32_t wmiBuildStartScan(WmiWriter &w, uint8_t *buffer, uint32_t capaci
   uint8_t *channels = wmiTlv(w, kWmiTagArrayUint32, request.channelCount * 4);
   if (channels)
     for (uint32_t i = 0; i < request.channelCount; ++i) wmiPut(channels, i, request.channels[i]);
-  (void)wmiTlv(w, kWmiTagArrayFixedStruct, 0);              // the names to look for: none
+  // the names to look for: none, or one {length word, 32 bytes}
+  uint8_t *names = wmiTlv(w, kWmiTagArrayFixedStruct, request.ssidLength ? 4u + kSsidMax : 0u);
+  if (names && request.ssidLength) {
+    wmiPut(names, 0, request.ssidLength);
+    for (uint32_t i = 0; i < request.ssidLength && i < kSsidMax; ++i) names[4 + i] = request.ssid[i];
+  }
   uint8_t *bssid = wmiTlv(w, kWmiTagArrayFixedStruct, 8);   // one address entry: six bytes and two of padding
   if (bssid)
     for (unsigned i = 0; i < 6; ++i) bssid[i] = 0xff;
-  (void)wmiTlv(w, kWmiTagArrayByte, 0);                     // the elements to add to a probe: none
+  // the elements to add to a probe: none, or the request's (padded to a whole word; the fixed structure has their length)
+  const uint32_t ieBytes = request.extraIe ? request.extraIeLength : 0u;
+  uint8_t *ies = wmiTlv(w, kWmiTagArrayByte, ieBytes);
+  if (ies)
+    for (uint32_t i = 0; i < ieBytes; ++i) ies[i] = request.extraIe[i];
   return wmiEnd(w);
 }
 
