@@ -39,7 +39,7 @@ static int pack_answer = SsrPackOk, pack_not_yet;
 
 /* the simulated DSP's state */
 static struct {
-    uint32_t messages, attaches, opens, registers, closes, inits, mmaps;
+    uint32_t messages, attaches, opens, registers, closes, inits, mmaps, releases;
     int refuse_attach, ignore_attach, refuse_open, refuse_send;
     int next2_error[4], next2_errors;
     uint32_t attached;                 /* the process id */
@@ -183,8 +183,7 @@ static int op_send(void *x, const uint8_t *m, uint32_t length)
         memcpy(first_metadata, arena, 40);
     }
     CHECK((ctx & 0xff) == SSR_PD_SENSORS && ctx >> 8 && ctx >> 16 == 0 && tid == PROCESS && !(sc & 0xff) && !(sc >> 29));
-    if (in + out) views(addr, size, in + out, v);
-    else CHECK(!addr && !size);
+    views(addr, size, in + out, v);                      /* as Linux: the metadata page also with no buffers (PianoSensors) */
     if (dsp.order < 8) dsp.last_order[dsp.order++] = handle << 8 | method;
     if (handle == 1 && method == 0) {                    /* attach */
         CHECK(pid == 0 && in == 1 && out == 0 && v[0].length == 4);
@@ -204,6 +203,12 @@ static int op_send(void *x, const uint8_t *m, uint32_t length)
         CHECK(heap >= arena + SSR_CALL_BYTES);
         dsp.mmaps++;
         wr64(v[2].p, 0xe0000000ull + (page & 0xfffff));
+        respond(ctx, 0);
+        return 0;
+    }
+    if (handle == 1 && method == 1) {                    /* release (PianoSensors): Linux's INIT_RELEASE, pid 0, our process id */
+        CHECK(pid == 0 && in == 1 && out == 0 && v[0].length == 4 && rd32(v[0].p) == PROCESS && dsp.attached == PROCESS);
+        dsp.releases++;
         respond(ctx, 0);
         return 0;
     }
@@ -271,7 +276,7 @@ static int op_prepare(void *x)
     return prepare_error;
 }
 
-static const SsrOps ops = {0, op_now, op_send, op_wait, op_trace, op_publish, op_prepare, op_pack_size, op_pack_read, op_alloc, 0};
+static const SsrOps ops = {0, op_now, op_send, op_wait, op_trace, op_publish, op_prepare, op_pack_size, op_pack_read, op_alloc, 0, 0};
 
 /* ---- the service's thread ---- */
 static int service_stopped;
@@ -516,15 +521,16 @@ static const Item kItems[] = {
 };
 static uint8_t pack_store[0x40000];
 
-static uint32_t start_log = 2;
+static uint32_t start_log = 2, start_deadline;
 
 static void start(int pack)
 {
-    static const SsrConfig base = {0, ARENA_PA, SSR_ARENA_BYTES, bounce, PROCESS, SSR_CONTEXT_BANK, 2};
+    static const SsrConfig base = {0, ARENA_PA, SSR_ARENA_BYTES, bounce, PROCESS, SSR_CONTEXT_BANK, 2, 0, 0, 0};
     SsrConfig cfg = base;
     cfg.arena = arena;
     cfg.bank = expected_bank;
     cfg.log = start_log;
+    cfg.deadline_ms = start_deadline;
     memset(&dsp, 0, sizeof dsp);
     memset(arena, 0x5a, SSR_ARENA_BYTES);
     if (pack) {
@@ -797,6 +803,8 @@ static void bring_up(void)
     release_next2(78, 0, 0, 0, 0);
     pthread_join(thread, 0);
     CHECK(core.status.stage == -SsrStServing && core.status.error == 78 && logged("FAIL st=-7 err=78 next2 failed twice"));
+    /* PianoSensors: and the session released, so that no PD thread waits for a listener that is gone */
+    CHECK(dsp.releases == 1 && core.status.release == SSR_RELEASE_DONE && logged("released the sensors PD's session rc=0 value=0"));
 }
 
 static void failures(void)
@@ -837,14 +845,26 @@ static void failures(void)
     ssr_core_channel(&core, 1);
     pthread_join(thread, 0);
     CHECK(core.status.stage == -SsrStAttach && dsp.attaches == 120 && logged("FAIL st=-4 err=32768 the sensors PD never took the attach"));
+    CHECK(dsp.releases == 0 && core.status.release == SSR_RELEASE_NONE);   /* never attached: nothing to release */
 
-    /* the listener does not open */
+    /* the listener does not open (PianoSensors: a deadline long enough for PAG's 16 tries; then released) */
+    start_deadline = 60000;
     start(1);
     dsp.refuse_open = 1 << 30;
     pthread_create(&thread, 0, service, 0);
     ssr_core_channel(&core, 1);
     pthread_join(thread, 0);
     CHECK(core.status.stage == -SsrStRegister && dsp.opens == 16 && logged("dlerr=7 dlopen failed"));
+    CHECK(dsp.releases == 1 && core.status.release == SSR_RELEASE_DONE);
+
+    /* PianoSensors: the default deadline (15 s from the attach) ends the same tries sooner, released */
+    start_deadline = 0;
+    start(1);
+    dsp.refuse_open = 1 << 30;
+    pthread_create(&thread, 0, service, 0);
+    ssr_core_channel(&core, 1);
+    pthread_join(thread, 0);
+    CHECK(core.status.stage == -SsrStRegister && dsp.opens < 16 && dsp.releases == 1 && logged("the listener was not up within the deadline"));
 
     /* sends refused: an attach is counted as a try */
     start(1);

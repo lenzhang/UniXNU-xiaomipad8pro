@@ -17,7 +17,7 @@ enum {
     /* the protocol */
     kHandleRemotectl = 0, kHandleInit = 1, kHandleListener = 3,
     kLocalRemotectl = 0, kLocalStd = 1, kLocalMem = 2,
-    kMethodAttach = 0, kMethodMmap = 4, kMethodInit2 = 3, kMethodNext2 = 4, kMethodOpen = 0, kMethodClose = 1,
+    kMethodAttach = 0, kMethodRelease = 1, kMethodMmap = 4, kMethodInit2 = 3, kMethodNext2 = 4, kMethodOpen = 0, kMethodClose = 1,
     kExtended = 31,                    /* the method id is the first word of in buffer 0 */
     kFdBytes = 16 * 8, kCrcBytes = 64 * 4,
     kPage = 0x1000,
@@ -116,7 +116,9 @@ static void summary(SsrCore *c)
     end(c);
 }
 
-/* The service stops for good: the stage, the reason. */
+static void release(SsrCore *c);
+
+/* The service stops for good: the stage, the reason. A session between the attach and the listening is released first (UPSTREAM). */
 static int stop(SsrCore *c, int32_t stage, int32_t error, const char *why)
 {
     SntText t;
@@ -129,7 +131,14 @@ static int stop(SsrCore *c, int32_t stage, int32_t error, const char *why)
     snt_char(&t, ' ');
     snt_str(&t, why);
     end(c);
+    if (c->attached) release(c);
     return 0;
+}
+
+const char *ssr_frame_name(uint32_t frame)
+{
+    static const char *const names[8] = {"pag", "meta", "ctx4", "meta+ctx4", "tid", "meta+tid", "ctx4+tid", "meta+ctx4+tid"};
+    return names[frame & 7];
 }
 
 /* ---- the DSP thread's two entry points ---- */
@@ -174,20 +183,23 @@ static void metadata(SsrCore *c, const Arg *args, uint32_t n)
 }
 
 /* kernel: the bring-up's invokes carry process id 0. timeout 0: as long as it takes (next2). */
+/* The framing (UPSTREAM, SensorsRpc.h): META a metadata page also with no buffers (Linux's fastrpc_get_args runs for every invoke: 16
+ * zero fds, 64 zero crcs), CTX4 the context number as Linux's tree places it, TID a thread id that is not the client id. */
 static int invoke(SsrCore *c, int kernel, uint32_t handle, uint32_t sc, const Arg *args, uint32_t timeout_ms, int32_t *value)
 {
     const uint32_t n = ((sc >> 16) & 0xff) + ((sc >> 8) & 0xff);
+    const int page = n || (c->frame & SSR_FRAME_META);
     uint8_t message[SSR_MESSAGE];
     c->next_id = c->next_id >= 255 ? 1 : c->next_id + 1;
-    const uint64_t ctx = (uint64_t)c->next_id << 8 | SSR_PD_SENSORS;
-    if (n) metadata(c, args, n);
+    const uint64_t ctx = (uint64_t)c->next_id << (c->frame & SSR_FRAME_CTX4 ? 4 : 8) | SSR_PD_SENSORS;
+    if (page) metadata(c, args, n);
     put32(message, kernel ? 0 : c->cfg.process);
-    put32(message + 4, c->cfg.process);
+    put32(message + 4, c->frame & SSR_FRAME_TID ? c->cfg.process + SSR_TID_OFFSET : c->cfg.process);
     put64(message + 8, ctx);
     put32(message + 16, handle);
     put32(message + 20, sc);
-    put64(message + 24, n ? bus(c, c->cfg.arena_pa + kMeta) : 0);
-    put64(message + 32, n ? kPage : 0);
+    put64(message + 24, page ? bus(c, c->cfg.arena_pa + kMeta) : 0);
+    put64(message + 32, page ? kPage : 0);
     uint32_t seen = __atomic_load_n(&c->responses, __ATOMIC_ACQUIRE);
     if (c->ops->publish) c->ops->publish(CTX);
     if (c->ops->send(CTX, message, sizeof message)) return InvokeRefused;
@@ -872,6 +884,60 @@ static int serve_one(SsrCore *c)
 }
 
 /* ---- the bring-up ---- */
+/* The release (UPSTREAM): Linux's INIT_RELEASE, the message the sensor PD gets when Linux's daemon goes away: our process is gone, so
+ * nothing waits for its listener any more. Once per session, never to a DSP the tellable op withholds. */
+static void release(SsrCore *c)
+{
+    SntText t;
+    int32_t value = 0;
+    c->attached = 0;
+    if (c->ops->tellable && !c->ops->tellable(CTX)) {
+        c->status.release = SSR_RELEASE_WITHHELD;
+        begin(c, &t, "release withheld: the DSP may not be told (a fatal sign, or another link or charger generation)");
+        end(c);
+        return;
+    }
+    put32(c->cfg.arena + kPrimIn, c->cfg.process);
+    const Arg arg = {kPrimIn, 4};
+    const int rc = invoke(c, 1, kHandleInit, SC(kMethodRelease, 1, 0), &arg, kInvokeMs, &value);
+    c->status.release = rc ? SSR_RELEASE_UNANSWERED : value ? SSR_RELEASE_REFUSED : SSR_RELEASE_DONE;
+    begin(c, &t, rc ? "release not answered" : value ? "release answered with an error" : "released the sensors PD's session");
+    snt_kd(&t, "rc", rc);
+    snt_kd(&t, "value", value);
+    snt_kd(&t, "ms", (int64_t)(now(c) - c->attached_ms));
+    snt_str(&t, " after the attach");
+    end(c);
+}
+
+static uint32_t deadline(const SsrCore *c) {return c->cfg.deadline_ms ? c->cfg.deadline_ms : SSR_DEADLINE_MS;}
+
+int ssr_core_bringing_up(const SsrCore *c)
+{
+    return c->attached && c->phase >= PhaseOpen && c->phase <= PhaseInit;
+}
+
+int ssr_core_overdue(SsrCore *c)
+{
+    return ssr_core_bringing_up(c) && now(c) - c->attached_ms >= deadline(c);
+}
+
+static int32_t bring_up_stage(int phase) {return phase == PhaseInit ? SsrStListen : phase >= PhaseOpen ? SsrStRegister : SsrStAttach;}
+
+void ssr_core_abort(SsrCore *c, const char *why)
+{
+    if (c->phase == PhaseStopped) return;
+    stop(c, bring_up_stage(c->phase), InvokeTimeout, why);
+}
+
+/* The next framing to try after an init2 the DSP answered with an error: + META, then + CTX4, then + TID; 0 when none is left. */
+static uint32_t next_frame(uint32_t frame)
+{
+    if (!(frame & SSR_FRAME_META)) return frame | SSR_FRAME_META;
+    if (!(frame & SSR_FRAME_CTX4)) return frame | SSR_FRAME_CTX4;
+    if (!(frame & SSR_FRAME_TID)) return frame | SSR_FRAME_TID;
+    return 0;
+}
+
 static void forget_session(SsrCore *c)
 {
     for (uint32_t i = 0; i < SSR_FILES; ++i) c->file[i].used = 0;
@@ -883,6 +949,7 @@ static void forget_session(SsrCore *c)
     c->next_failures = 0;
     c->tries = 0;
     c->retry_at = 0;
+    c->attached = 0;                              /* the link went away: the DSP's side of the session is gone with it */
 }
 
 static int attach(SsrCore *c)
@@ -909,11 +976,15 @@ static int attach(SsrCore *c)
         c->status.stage = SsrStAttach;
         c->tries = 0;
         c->phase = PhaseOpen;
+        c->attached = 1;
+        c->attached_ms = now(c);
         if (ordinary(c)) {
             begin(c, &t, "attached to the sensors PD");
             snt_kx(&t, "pa", c->cfg.arena_pa);
             snt_kd(&t, "bank", c->cfg.bank);
             snt_kd(&t, "ms", (int64_t)(at - c->started_ms));
+            snt_ks(&t, "frame", ssr_frame_name(c->frame));
+            snt_kd(&t, "deadline", deadline(c));
             end(c);
         }
         return 1;
@@ -987,13 +1058,31 @@ static int close_handle(SsrCore *c)
     return 1;
 }
 
+/* init2, and the framing ladder (UPSTREAM): an answer with an error is tried again with the next framing, which then stays. Every answer
+ * is logged: the run says which framing the DSP takes. */
 static int listener_init(SsrCore *c)
 {
     SntText t;
     int32_t value = 0;
     const int rc = invoke(c, 0, kHandleListener, SC(kMethodInit2, 0, 0), 0, kInvokeMs, &value);
     if (rc == InvokeLink) return 1;
-    if (rc || value) return stop(c, SsrStListen, rc ? rc : value, "adsp_listener init2 failed");
+    if (!rc) c->status.inits++;
+    const uint32_t next = !rc && value && !c->cfg.no_ladder ? next_frame(c->frame) : 0;
+    if (rc || value) {
+        begin(c, &t, "init2");
+        snt_ks(&t, "frame", ssr_frame_name(c->frame));
+        snt_str(&t, rc ? " not answered" : " answered");
+        snt_kd(&t, "rc", rc);
+        snt_kd(&t, "value", value);
+        if (next) {
+            snt_ks(&t, ": next frame", ssr_frame_name(next));
+        }
+        end(c);
+        if (!next) return stop(c, SsrStListen, rc ? rc : value, "adsp_listener init2 failed");
+        c->frame = next;
+        c->status.frame = next;
+        return 1;
+    }
     c->status.stage = SsrStListen;
     c->rctx = 0;
     c->result = -1;
@@ -1001,7 +1090,10 @@ static int listener_init(SsrCore *c)
     c->phase = PhaseServe;
     if (ordinary(c)) {
         begin(c, &t, "listening");
+        snt_ks(&t, "frame", ssr_frame_name(c->frame));
+        snt_kd(&t, "inits", c->status.inits);
         snt_kd(&t, "ms", (int64_t)(now(c) - c->started_ms));
+        snt_kd(&t, "after_attach_ms", (int64_t)(now(c) - c->attached_ms));
         end(c);
     }
     return 1;
@@ -1017,6 +1109,8 @@ void ssr_core_init(SsrCore *c, const SsrOps *ops, const SsrConfig *config)
     c->phase = PhaseChannel;
     c->result = -1;
     c->started_ms = now(c);
+    c->frame = config->frame == 0 ? SSR_FRAME_DEFAULT : config->frame & SSR_FRAME_PAG ? 0 : config->frame & 7u;
+    c->status.frame = c->frame;
     SntText t;
     snt_start(&t, c->library_path, sizeof c->library_path);
     snt_str(&t, SSR_LIBRARY_PATH);
@@ -1071,6 +1165,17 @@ int ssr_core_step(SsrCore *c)
         return 1;
     }
     case PhaseAttach: return attach(c);
+    default: break;
+    }
+    /* UPSTREAM: the attach answered, not yet listening: a deadline, then the release (the sensor PD's watchdog is about a minute) */
+    if (ssr_core_overdue(c)) {
+        begin(c, &t, "the listener is not up");
+        snt_kd(&t, "ms", (int64_t)(now(c) - c->attached_ms));
+        snt_str(&t, " after the attach");
+        end(c);
+        return stop(c, bring_up_stage(c->phase), InvokeTimeout, "the listener was not up within the deadline");
+    }
+    switch (c->phase) {
     case PhaseOpen: return open_listener(c);
     case PhaseRegister: return register_listener(c);
     case PhaseClose: return close_handle(c);

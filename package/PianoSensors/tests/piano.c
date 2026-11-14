@@ -407,15 +407,14 @@ static void dsp(void)
     const uint32_t n = (sc >> 16 & 0xff) + (sc >> 8 & 0xff) + (sc >> 4 & 0xf) + (sc & 0xf);
     const uint8_t *meta = NULL;
     CHECK((ctx & 0xf) == PS_PD_SENSORS && tid == 5);     // the PD in the low bits (Linux: ctxid | fl->pd)
-    if (n) {
-        // the metadata: n remote_arg {u64 pv, u64 len}, n invoke_buf {u32 num, u32 pgidx}, n phy_page {u64 addr, u64 size}, 16 u64 fds,
-        // 64 u32 crcs (fastrpc_get_meta_size); the message's addr is its first page with the bank in bits 32 and up, size whole pages
-        CHECK(addr >> 32 == PS_CONTEXT_BANK && !(addr & 0xfff) && size >= (uint64_t)(40 * n + 128 + 256) && !(size & 0xfff));
-        meta = arena + ((addr & 0xffffffffull) - ARENA_PA);
-        for (unsigned i = 0; i < 16; ++i) CHECK(!rd64(meta + 40 * n + 8 * i));   // no fds
-    } else {
-        CHECK(!addr && !size);
-    }
+    // the metadata: n remote_arg {u64 pv, u64 len}, n invoke_buf {u32 num, u32 pgidx}, n phy_page {u64 addr, u64 size}, 16 u64 fds,
+    // 64 u32 crcs (fastrpc_get_meta_size); the message's addr is its first page with the bank in bits 32 and up, size whole pages.
+    // Linux makes it for every invoke (fastrpc_internal_invoke always calls fastrpc_get_args), with no buffers too: 384 zero bytes, one
+    // page. PAG sent addr 0 size 0 then, and the tablet's init2 was answered EBADPARM (2026-11-14).
+    CHECK(addr >> 32 == PS_CONTEXT_BANK && !(addr & 0xfff) && size >= (uint64_t)(40 * n + 128 + 256) && !(size & 0xfff));
+    meta = arena + ((addr & 0xffffffffull) - ARENA_PA);
+    for (unsigned i = 0; i < 16; ++i) CHECK(!rd64(meta + 40 * n + 8 * i));   // no fds
+    for (unsigned i = 0; i < 64; ++i) CHECK(!rd32(meta + 40 * n + 128 + 4 * i));   // no crcs
     uint64_t len = 0;
     uint8_t *b;
     switch (step) {
@@ -484,11 +483,11 @@ static void ops_wait(void *c, uint32_t ms)
 static void fastrpc(void)
 {
     static const SsrOps ops = {NULL, ops_now, ops_send, ops_wait, ops_trace, ops_publish, ops_prepare, ops_pack_size, ops_pack_read,
-                               ops_alloc, ops_admit};
+                               ops_alloc, ops_admit, NULL};
     arena = aligned_alloc(0x1000, SSR_ARENA_BYTES);
     CHECK(arena);
     memset(arena, 0, SSR_ARENA_BYTES);
-    const SsrConfig cfg = {arena, ARENA_PA, SSR_ARENA_BYTES, bounce, 5, PS_CONTEXT_BANK, 0};
+    const SsrConfig cfg = {arena, ARENA_PA, SSR_ARENA_BYTES, bounce, 5, PS_CONTEXT_BANK, 0, 0, 0, 0};
     clock_ms = 1;
     ssr_core_init(&core, &ops, &cfg);
     ssr_core_channel(&core, 1);
