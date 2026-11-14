@@ -344,57 +344,81 @@ the log gaps). Its ranking, all **inferred**: (1) no user client to bind — ove
 the family's own `IOEthernetInterface`; (2) WiFiManager may want the *interface* to be of a class named `IO80211Interface`;
 (3) our events carry no payload; (4) corewifi asks for an awdl companion with no parent. §7 (wm3) tries 1 to 3 on one boot.
 
-## 7. M1b: the user client (wm3)
 
-Built, **not run on the tablet**. Everything here is off unless asked for, so wm2's behaviour is the default and the same boot
-can be switched back to it for a control.
+## 7. M1b (wm3): the controller's identity for CoreWiFi, and the user client
 
-### 7.1 The switches
+Built, **not run on the tablet**. One boot, three stages switched at run time; stage 0 is wm2, so the boot carries its own control.
 
-`piano-wifi-apple80211-uc=N` at boot, `sudo sysctl machdep.piano_wifi_a80211_uc=N` at run time (0 = wm2):
+### 7.1 Why the identity, and why it is first
+
+Two host analyses now disagree about what adoption needs, and wm3 settles both on one boot:
+
+- `private/host-checks/20261114-io80211/ADOPTION.md` (strings, imports and plists; no disassembly): 27.3's **CoreWiFi has its own
+  discovery** (`__findWiFiController`, the `CWFIO80211` cluster) keyed on registry properties — `IOClass`, `BSD Name`,
+  `IOInterfaceName`/`Prefix`/`Unit`, `IOEthernetInterface`, and **`IOClassNameOverride` / `IO80211Controller`**. It imports no
+  `IOObjectConformsTo`, so the class-name chain that satisfies launchd and SystemConfiguration says nothing to it; and it imports
+  no `IOServiceOpen`/`IOConnectCall*`, so a user client is demoted. **P0: the one discovery input we lack is
+  `IOClassNameOverride = "IO80211Controller"` on the controller.**
+- `private/host-checks/20261114-flash/wm2-diag.md` §5 Rank 1: the only client of our service over a whole boot was the family's
+  own interface, so a user client to bind might be what is missing.
+
+Both are inferred. The property is nearly free and is tried first; the user client rides along on the same boot.
+
+### 7.2 The switches
+
+`piano-wifi-apple80211-uc=N` at boot, `sudo sysctl machdep.piano_wifi_a80211_uc=N` at run time (0 = wm2's behaviour):
 
 | Bit | What |
 |---|---|
-| 0x1 | `newUserClient` answers: a client of ours (`package/PianoWifi/PianoWifi80211Uc.h`) is made. Without it, the call is refused and passed to the family — **but it is logged either way**, which is the first question of the boot |
-| 0x2 | the controller also carries `IOInterfaceName` (and the role, and the name prefix), so user space's lookup by `IOInterfaceName` — which takes any class — can find and open the controller instead of the family's interface. Takes effect at once |
-| 0x4 | the events carry payloads (POWER_CHANGED the power structure, SCAN_DONE a status word) instead of none (Rank 3) |
-| 0x8 | the interface object is of our own class named `IO80211Interface` instead of `IOEthernetInterface` (Rank 2). It overrides nothing, so the only difference is the name a class-name test sees; **the interface is made once, so this is a boot argument only** |
-| 0x10 | selector 5 answers 1 (use the family's event pipe) instead of 0 (keep the kernel-event socket) |
+| 0x8 | `IOClassNameOverride = "IO80211Controller"` on the controller (ADOPTION.md P0). At boot it is set **before the interface registers** (the production form of P0: CoreWiFi cannot meet the child before the controller's identity is there); by sysctl it is set late, which is the A/B of the same thing and needs airportd restarted after it |
+| 0x20 | the same override on the interface object too |
+| 0x1 | `newUserClient` answers: a client of ours (`PianoWifi80211Uc.h`) is made. Without it the call is refused and passed to the family — **but every call is logged either way**, so even stage 0 says whether anything tries to open us |
+| 0x2 | the controller also carries `IOInterfaceName`, the role and the name prefix, so a lookup by `IOInterfaceName` (which takes any class) can find and open the controller |
+| 0x4 | the events carry payloads (POWER_CHANGED the power structure, SCAN_DONE a status word) instead of none (wm2-diag Rank 3) |
+| 0x10 | selector 5 answers 1 (the family's event pipe) instead of 0 (keep the kernel-event socket) |
 
-### 7.2 The client
+Not in wm3: a country code other than XX, an awdl stub, another accept mode (ADOPTION.md §5 P1 and "demoted"). The accept mode
+stays `0x1` for every stage, so the stages have one variable each.
 
-Selectors as the host analysis names them (§5.7 item 1): 0 and 6 are an apple80211 request in a 0x3c30- or 0x3c030-byte
-structure (the ioctl number, the length and the user pointer at its head; the name, request number and value at 0x3c08, 0x3c18
-and 0x3c1c of the second part), answered by the same handler the ioctls use — **so the driver's own errno reaches user space**,
-which the ioctl path cannot do (§5.7); 1 `useIOUCWhenPossible` answers 1; 7 DriverKit support answers 0; 5 the event pipe
-answers 0 unless 0x10. The event pipe's own selectors (2, 3, 4) and the buffer mapping (8) are not offered: they are logged and
-refused, which is itself a result. Every call carries its sizes and its answer into the log.
+Rank 2 of wm2-diag (an interface object of a class named `IO80211Interface`) **cannot be built**: the 27.3 IONetworkingFamily does
+not export `IONetworkInterface`'s reserved slot 10, so a subclass of `IOEthernetInterface` does not link. The override property
+is what replaces it, and it is what CoreWiFi reads anyway.
 
-**Not a pin on any Apple symbol:** the structure's five field offsets and the selector numbers are data from the host analysis,
-and the answers are our own (`WifiApple80211.h`). The vtable of our `IO80211Interface` is the family's (it overrides nothing);
-the KC builder's vtable check covers the controller, not this class, which is why 0x8 is off by default.
+### 7.3 The user client
 
-### 7.3 wm3's checklist
+Selectors as the host analysis of 27.3's user-space IO80211 names them (§5.7 item 1): 0 and 6 are an apple80211 request in a
+0x3c30- or 0x3c030-byte structure (the ioctl number, length and user pointer at its head; the name, request number and value at
+0x3c08, 0x3c18 and 0x3c1c of the second part), answered by the same handler the ioctls use — **so the driver's own errno reaches
+user space**, which the ioctl path cannot do; 1 `useIOUCWhenPossible` answers 1; 7 DriverKit answers 0; 5 the event pipe answers 0
+unless 0x10. The pipe's own selectors (2, 3, 4) and the buffer mapping (8) are logged and refused, which is itself a result.
 
-Copy `tooling/native/tmo.sh` to the tablet first (or paste its loop as a shell function) and prefix **every** command with it;
-`piano-cwscan` also ends itself (`piano-cwscan scan 45`). The adoption log (A below), with the broader grep of wm2-diag §6 and
-whole lines:
+The five field offsets and the selector numbers are data from the host analysis; the answers are our own (`WifiApple80211.h`). No
+Apple code or binary is in the repository.
 
-    tmo 30 log show --last 3m --style syslog --predicate 'process == "airportd"' > /tmp/ap.log
-    grep -iE 'CWFApple80211|WiFiManager|cache|Falling back|no_alt_interface|adopt|attach|BSD driver|role=|parent=' /tmp/ap.log | tail -60
+### 7.4 wm3's checklist
 
-W is `tmo 25 sudo wdutil info | sed -n '/^WIFI/,/^BLUETOOTH/p' | grep -E 'Interface Name|Power|Op Mode|Country Code|Supported Channels'`.
-C is `tmo 20 ioreg -l -r -c PianoWifi80211 -d 3 | grep -E 'IOUserClient|PianoWifi80211Uc|IOInterfaceName|IO80211InterfaceRole|piano-wifi-apple80211'`.
+Copy `tooling/native/tmo.sh` to the tablet first and prefix **every** command with it (`tmo 25 ...`); `piano-cwscan` also ends
+itself. Three shorthands, used per stage:
 
-| Step | Command / line | Read |
+- **I** (the identity, no network data):
+  `tmo 20 ioreg -l -r -c PianoWifi80211 -d 2 | grep -E 'IOClassNameOverride|IOClass"|IO80211InterfaceRole|IOInterfaceName|IOInterfaceUnit|BSD Name|IOUserClient'`
+- **W** (four fields): `tmo 25 sudo wdutil info | sed -n '/^WIFI/,/^BLUETOOTH/p' | grep -E 'Interface Name|Power|Op Mode|Supported Channels'`
+- **A** (whole lines, no `head`, no `cut`; ADOPTION.md §6.2's pattern):
+
+      tmo 40 log show --last 3m --info --debug --style compact --predicate 'process == "airportd"' > /tmp/ap.log
+      grep -E '\[iflist\]|CWFIO80211|CWFApple80211|Failed to match cached|not a valid 80211|WiFi network interface added|Falling back to IOCTL|Invalid interface specified|Failed to get Apple80211|Failed to get country code|Failed to get supported channels|No channels configured|Configured scan manager|Starting scan sequence|Completed UI scan sequence|UI scan sequence finished' /tmp/ap.log
+
+A scan step is: read the serial (`grep -c 'scan .* asked by' <console>` or the summary's `serial N`), run
+`tmo 50 ./piano-cwscan scan 45`, read the serial again. If no serial appeared between them, CoreWLAN's request never reached the
+driver; if one did, its completion line says how many records it took.
+
+| Stage | Commands | Read |
 |---|---|---|
-| boot (mode 0, the wm2 control) | `PianoWifi80211: user-client mode 0 (machdep.piano_wifi_a80211_uc changes it ...)`, then the M1 lines; the summary's **first** line `the controller's clients: N (...); user clients: ...` | the client line is no longer cut; **any** `a user client was refused (no client offered ...)` line names who tried to open us even in the control |
-| mode 0 | W; A; C | the control: Interface Name (null) |
-| mode 0x1 | `sudo sysctl machdep.piano_wifi_a80211_uc=1`; `sudo launchctl kickstart -k system/com.apple.airportd`; 60 s; W; A; C | `a user client was opened: type T, task airportd[N]` and `selector S: struct in ... -> 0x0`, or no open at all (then the bind does not try the client: Rank 1 is refuted) |
-| mode 0x3 | `=3`, kickstart -k, 60 s, W, A, C | whether the lookup now finds the controller and opens it |
-| mode 0x7 | `=7`, kickstart -k, 60 s, W, A | the events' payloads (Rank 3) |
-| at the first mode where W shows `en2` | `tmo 50 ./piano-cwscan scan 45`; `tmo 40 system_profiler SPAirPortDataType > /tmp/sp.txt; grep -c 'Security:' /tmp/sp.txt`; the webcam at the desktop (log in first), then the Wi-Fi menu opened with `piano-input.py` | about 15 networks in both, and the menu's list |
-| if none of them does | the next boot is `piano-wifi-apple80211-uc=9` (0x8 with the client: the interface's class, Rank 2) and then `=0x19`; keep A's `role=`/`parent=` lines for the awdl question (Rank 4) | — |
-| throughout | `grep -c "a user client was" console; grep "selector " console` | every open and every selector, with sizes |
+| boot, stage 0 (= wm2) | the M1 lines; `PianoWifi80211: stage mode 0 (...)`; `identity (at the filter's attach): controller ... IOClassNameOverride (absent); interface class IOEthernetInterface, ... IOInterfaceName en2, ... IOInterfaceUnit 2; BSD en2`; the summary's first line (clients, user clients) | the identity line is complete; `IOInterfaceUnit`/`BSD Name` are in it (they were never printed before) |
+| stage 0 | I, W, A, a scan step | the control: Interface Name (null), no `CWFApple80211`; a CoreWLAN scan that does not reach us (expected: the serial does not move) |
+| stage 1 (P0) | `sudo sysctl machdep.piano_wifi_a80211_uc=8`; `sudo launchctl kickstart -k system/com.apple.airportd`; 60 s; I, W, A, a scan step | `identity (machdep...): ... IOClassNameOverride IO80211Controller ...`; **the question of the boot**: W's Interface Name `en2` and a `CWFApple80211`/`WiFi network interface added` line, or the same misses as stage 0 |
+| stage 1b | `=40` (0x8 + 0x20: the interface too), kickstart -k, 60 s, I, W, A | whether the child's own override is what CoreWiFi wants |
+| stage 2 | `=41` (0x8 + 0x20 + the user client), kickstart -k, 60 s, I, W, A | `a user client was opened: type T, task airportd[N]` and `selector S: struct in ... -> 0x0`, or no open at all (then nothing binds a client: that rank is refuted) |
+| stage 2b, only if W shows `en2` at some stage | at that stage: a scan step, then `tmo 40 system_profiler SPAirPortDataType > /tmp/sp.txt; grep -c 'Security:' /tmp/sp.txt`; log in, then the webcam at the desktop and at the opened Wi-Fi menu (`piano-input.py`) | about 15 networks in both and the menu's list |
+| if no stage adopts | keep I, W and A per stage, the scan serials, and A's `role=`/`parent=` lines; the next step is decided on that evidence (ADOPTION.md §5 P1's country code, or the event payloads `=4`) | — |
 | the end | console `reset fastboot` | — |
-
