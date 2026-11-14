@@ -432,3 +432,221 @@ bytes, sha256 `5a9ac99c586a4a9ce0006c3678f69047c47a562d1e66819980b6b0c2b24e1364`
 trust cache `57063d6d...`; the arguments' tail 496 bytes, the merged line 1164 bytes, `piano-wifi-apple80211=1` and no
 `-uc` argument, so it boots in stage 0 (= wm2) and every stage is a sysctl away. Dump image `out/ram-k273-wm3-dump` (sha256
 `976c5c408bb1a1ffcb69b0170f5af7a11ab833b85b9dcfae634422930f78da9a`). `piano-cwscan` and `tmo.sh` are beside the image.
+
+### 7.6 wm3 on the tablet (21:20) and wm3b
+
+**wm3 answered nothing:** about 50 s into user space launchd rebooted "due to critical process crashes: configd", after thousands
+of `decmpfs_pagein_compressed: err 12` / `apfs_pagein ... error 12` lines (ENOMEM page-ins; 27378 of them;
+private/host-checks/20261114-wm3). **Inferred cause: the kernel's private data range was full, not PianoWifi80211.** The boot's own
+lines give the budget: kmem's private data range is 2643 MiB (boot lines 22, 24), and NativeRamBlock takes 2048 MiB of it at once
+for the volatile Data disk (`data-volatile-reserve-mib`, default the budget), leaving about 595 MiB for every other data allocation
+in the kernel. The first refusal is PianoA830's (`gpu open refused: loginwindow ... NoMemory`, line 4313, with 519 MiB of its pool
+in use), six lines before decmpfs's first failed decompression buffer (4319). PianoWifi80211 was in stage 0 there: three fixed
+allocations under 16 KiB taken at its start and none per request (`apple80211_host` now bounds it: 35000 requests of every kind
+change nothing), no user client asked for (0 opened, 0 refused), no scan yet.
+
+**wm3b** carries `data-volatile-reserve-mib=1024` (the budget stays 2048 MiB: the pool grows past the reserve as Data is written;
+wm2's Data peaked at 1189 MiB resident), so at the login burst about 1.6 GiB of the range stays free. This is a mitigation for the
+probe; the budget itself (the reserve against the range, now that the GPU and the desktop share it) belongs to NativeRamBlock's
+owner. The boot's `NativeRamBlock: volatile: ... reserved at start` line says which reserve it ran with; if wm3b fails the same way
+with it, the cause is elsewhere.
+
+`out/ram-k273-wm3b` (built from branch commit `1e25edf`, main merged; the 0066 kernel): 237281280 bytes, sha256
+`5195d1553c3d16106f69d9803a4fedb5e747eb02be18b4ecb25a6e3e0d5c5337`, `verify-ram-images.py` PASS; collection `8469f62d...` (26 native
+kexts all this repository's, the vtable check clean); the v5 recipe, the v2 seed volatile, the v4 trust cache; the merged line 1195
+bytes. Dump image `out/ram-k273-wm3b-dump` (sha256 `17038b843c7d792439914562ba0c502461f2fc9bd6047565a50d6b7e1f95cc99`). The
+checklist is §7.4's, unchanged, with one row first: `NativeRamBlock: volatile: ... 1024 MiB reserved at start`.
+
+### 7.7 wm3b on the tablet: P0 confirmed, and the default since
+
+**Confirmed on the tablet (wm3b, 2026-11-14 22:08-22:17, private/host-checks/20261114-wm3b):** with `IOClassNameOverride =
+"IO80211Controller"` on the controller (stage 1), the airportd started by the kickstart logged `[iflist] Successfully created
+CWFApple80211 (en2)`, `WiFi network interface added (en2), posted notification`, and created its SystemConfiguration service,
+interface and 802.1X objects for en2; the stage-0 airportd (no override) had `Did NOT find matching WiFi interface ...
+role=undefined/infra`. The data-range mitigation held: no page-in failure on this boot (1024 MiB reserved at start).
+
+**Still not working at stages 1, 1b and 2:** `wdutil` keeps `Interface Name (null)`, `Power Off []`, and CoreWLAN's scan returns
+0 networks in about 35 ms although each CoreWLAN scan reaches the driver (the scan serial moves by 3 per scan step, each scan
+served its 19 records and its list end). Open; not settled here.
+
+**Since then the override is the default** (`piano-wifi-apple80211-uc` defaults to 0x8), in P0's production form: set in
+`configureInterface`, before the interface registers, whenever `piano-wifi-apple80211=1`. `piano-wifi-apple80211-uc=0` is the
+control without it.
+
+## 8. M2 plan: the menu's join (2026-11-14; condensed from the host study `private/host-checks/20261114-io80211/JOIN.md`)
+
+M2 is §2's W3/W4 made concrete: joining when the user picks a network in the menu. The study's direct 27.3 facts
+(REPORT.md §2-§4): the central join request is **SET 20 ASSOCIATE**, version 1, **656 bytes** (Apple's `Apple80211Associate2`
+builds exactly this size; whether the current menu route through CoreWiFi's direct `Apple80211Set` uses the same wire buffer is
+**inferred**); WPA2 runs in **eapolclient** in user space over an `AF_NDRV` raw socket on enX (EtherType 0x888e) and installs
+the keys with **SET 3 CIPHER_KEY**, **148 bytes** (the size is confirmed from its call sites); the 27.3 event table has
+SSID_CHANGED 2, BSSID_CHANGED 3, LINK_CHANGED 4, ASSOC_DONE 9, RSN_HANDSHAKE_DONE 20. Everything marked **inferred** below is a
+hypothesis that the first M2 boot's request/event capture must confirm. In the implementation, **log every join-related request
+and posted event** (serial, process, generation, number, length, result) and log credential/key **metadata only** — never key
+bytes, passphrases or nonces.
+
+### 8.1 What a menu join sends
+
+The chain is symbol-confirmed: the menu's pick goes through CoreWLAN/CoreWiFi's XPC to airportd, which owns network selection,
+passwords and policy, and issues apple80211 requests on enX; the driver associates, and for Apple-managed WPA2 airportd controls
+eapolclient. Which route one menu action takes, and every fixed daemon order beyond the facts above, is **inferred** — the driver
+must log what actually arrives and tolerate harmless reordering. The sequence to implement and instrument:
+
+| Phase | Request or event | What our driver must do | Confidence |
+|---|---|---|---|
+| Before the join | GET 19 POWER, GET 13 STATE, the M1 gets | no driver action until airportd asks | request surface confirmed; the exact per-join set inferred |
+| Refresh candidates | SET 10 SCAN_REQ (or 86), then GET 11 to the end | a directed scan may precede association; fresh cached results are acceptable | order inferred (normal airportd behaviour) |
+| Old-link teardown | SET 22 DISASSOCIATE (no payload), sometimes SET 29 DEAUTH | stop the old generation, clear keys and the visible snapshot, keep the port closed | request classes confirmed; whether it precedes every join inferred |
+| Security compatibility | SET 2 AUTH_TYPE, SET 46 RSN_IE | accept and record them per generation; **never require them as a separate preamble** — the association buffer already carries security and authentication parameters | requests confirmed; separate-call order inferred |
+| Join | **SET 20 ASSOCIATE** (§8.2) | validate, clear stale visible state, allocate a generation, start the join asynchronously, return success only for acceptance | request and length confirmed |
+| Progress | GET 13 STATE (0 INIT, 1 SCAN, 2 AUTH, 3 ASSOC, 4 RUN), GET 21 ASSOCIATE_RESULT (0 pending, 1 success, 2 failure, 9 timeout, 21 bad key; the numbers are prior art) | keep the 802.11 association and the port authorization distinct: ASSOC with a pending result while the WPA handshake runs, RUN only once authorized | state values prior art; polling order inferred |
+| 802.11 association ends | **event 9 ASSOC_DONE** (§8.3) | where Apple's supplicant runs WPA, post after the 802.11 result while STATE is still ASSOC so the handshake can start; where ours runs WPA, hold the public completion until it authorizes | event code confirmed; payload and timing inferred |
+| WPA2 handshake | EAPOL through enX, then **SET 3 CIPHER_KEY** (§8.2) | route EAPOL before authorization, translate and install the keys, keep ordinary data blocked | mechanism confirmed on 27.3; the exact call interleaving inferred |
+| Security complete | **event 20 RSN_HANDSHAKE_DONE** | first try: once, after both keys and port authorization | code confirmed; payload and cardinality inferred |
+| Connected | **2 SSID_CHANGED, 3 BSSID_CHANGED, 4 LINK_CHANGED up**, STATE=RUN | publish the snapshot before posting; requests 1/9/4/16/103 agree with it; then allow DHCP and data | consumers confirmed; the final order inferred |
+| Leave/loss | SET 22 DISASSOCIATE, or an unsolicited link loss | clear keys and the current network, LINK_CHANGED down, complete any pending join exactly once | request/event classes confirmed |
+
+For **open** networks skip the handshake rows: associate, authorize the peer at once, complete the result, publish RUN and the
+connected events — no EAPOL, no CIPHER_KEY, no RSN event. For **PSK with our supplicant** (§8.4, mode A) EAPOL and keys stay on
+our private control port and the public success waits for our AUTHORIZE.
+
+Requests that must not gate the first milestone: GET 50 ASSOCIATION_STATUS (27.3 names it, its layout was not recovered — log it
+if seen rather than guessing a response); ASSOCIATE_EXTENDED_RESULT (named, number unknown — do not invent one; request 21 stays
+the result path); GET 156 LINK_CHANGED_EVENT_DATA (a prior-art reconstruction, a companion to our inline payload only); and
+RSN_CONF 77, PMK_CACHE 83, CUR_PMK 376, RSN_XE 457, OFFLOAD_RSN 177 — broader caching/WPA3/offload paths where a clear
+`EOPNOTSUPP` beats a fake success; plain WPA2-PSK through eapolclient needs no RSN offload.
+
+### 8.2 The layouts to accept
+
+**ASSOCIATE, 656 bytes**: version 1 confirmed on 27.3. The prefix is the layout our own sheng binding parses on iPadOS 24A446
+(our BSD-2-Clause-Patent prior art): version at `0x00`; the authentication words widened to 32 bits at `0x08` (lower selector:
+open system is 1) and `0x0c` (upper bitmask: WPA2-Personal is `0x10`); SSID length at `0x10` (1–32) with 32 raw SSID bytes at
+`0x14`; a preferred BSSID at `0x34` (all zero means unspecified); the credential block from `0x3c`. The credential rules that
+binding demonstrated: length zero is an open network; cipher **10** with 8–63 bytes is a passphrase; cipher **6** with exactly
+32 bytes is a PMK; anything else is rejected rather than reinterpreted as open or as a password. Everything after the credential
+window through `0x28f` is **unknown**: keep the whole request and log an unexpected length instead of truncating it into a guess.
+The first WPA2-PSK/CCMP join builds its own RSN element from the selected scan entry's policy (our existing association-request
+builder) instead of depending on the unrecovered trailing IE offset; a separate RSN_IE set, if received, is retained and checked
+for consistency.
+
+The other sizes: **AUTH_TYPE** 16 bytes (version, lower, upper, reserved, all 32-bit words; a 12-byte legacy set form is accepted
+as a compatibility convenience; lower 1 = open system, upper `0x10` = WPA2-Personal in our working binding). **RSN_IE** 264 bytes
+(prior art, not independently proven on 27.3): a version word, a 2-byte IE length at `4`, 257 bytes of IE storage at `6`, and the
+IE is the **whole element** including its type and length bytes — validate `2 + ie[1]` against what was supplied. **CIPHER_KEY**
+148 bytes, size confirmed on 27.3; its field map is Sonoma-era reconstruction, so the offsets are **inferred**: flags exactly
+**4** is the pairwise key (install with index 0 and RSC 0), flags exactly **0** is the group key (use its key index and the low
+six RSC bytes); Apple cipher **5** is AES-CCMP — translate it to our RSN suite type 4, never pass it through as an RSN suite
+number; cipher 3 (TKIP) stays outside the first CCMP-only gate rather than being silently mapped; ciphers 6/10 inside ASSOCIATE
+are credential forms, not key algorithms. PTK before GTK is the normal handshake order but our existing key sequencer enforces
+it, not request timing; a group key that arrives first waits for pairwise completion. The peer address is a consistency check.
+Ignore the WoW fields for now; wipe the whole request and every temporary key copy after use.
+
+### 8.3 Events and their first payload candidates
+
+- **ASSOC_DONE (9)** — code confirmed. First candidate: the 540-byte form our sheng binding uses for a 656-byte association
+  (ten 52-byte attempt records from `0x000`, reason at `0x210`, result at `0x214`, result-valid at `0x218`): zero it, put the
+  attempted BSSID in the first attempt record, set the result with valid=1, fill the reason when known. **Inferred from 24A446**,
+  not a recovered 27.3 layout; keep request 21 correct even if the daemon ignores the event's payload.
+- **LINK_CHANGED (4)** — our 32-byte inline candidate (down byte at `0`, RSSI at `4`, SNR at `8`, noise at `0xa`, reason at
+  `0x14`) is the size M1 already posts; its 27.3 semantics are **inferred** — leave reason and the disconnect flags zero unless
+  known. GET 156 is implemented only as a companion: the two prior-art models disagree about the disconnect flag's meaning, so
+  neither is proof.
+- **RSN_HANDSHAKE_DONE (20)** — code confirmed; an empty payload is the first candidate; post once after the group key plus peer
+  authorization and instrument whether airportd/CoreWLAN act on it (the historical driver sometimes emitted one per key and
+  sometimes none, which cannot settle our cardinality).
+- **SSID_CHANGED (2) / BSSID_CHANGED (3)** — empty payload; the values are read through requests 1 and 9.
+- For every transition update the driver's snapshot and the BSD link state **before** posting: up = SSID, BSSID, LINK up; down =
+  LINK down, SSID, BSSID, and the getters then answer no network. Signal-quality updates while up may reuse LINK_CHANGED without
+  flapping the link. Which single event repaints the menu is **inferred** — the plan satisfies the whole coherent set (a
+  successful join result, RSN completion for PSK, an active link, RUN, agreeing current-network getters) rather than one guessed
+  event.
+
+### 8.4 Two ways WPA2 can run
+
+**A — ours (compatibility mode).** airportd only picks the network: ASSOCIATE gives us the SSID, an optional BSSID and the
+credential, which we hand to our existing supplicant as an ephemeral per-generation credential (never to the profile file, never
+to the logs; the supplicant rereads only the file today, so it needs a session-credential handoff). EAPOL stays on our private
+control port; profile-driven auto-join is disabled for the menu-directed generation so it cannot race the pick; a same-name
+request still authenticates with the newly supplied credential, never a synthetic success. After our KEY/AUTHORIZE completes and
+firmware accepts, set RUN and publish the connected set. This is demonstrated by our sheng binding on 24A446; whether 27.3
+airportd tolerates it — refraining from starting eapolclient in every PSK case — is **inferred**. If CIPHER_KEY arrives or Apple
+EAPOL starts while our handshake runs, stop the experiment rather than acknowledging keys we did not install: only one
+supplicant may own it.
+
+**B — Apple's (the native target).** airportd and eapolclient own WPA2: we associate, keep the data port closed, eapolclient
+exchanges EAPOL over its AF_NDRV tap on enX, and installs PTK/GTK through CIPHER_KEY, which we translate to our WMI key
+installation, then authorize, raise the link and post the completion events. Two changes at the Ethernet boundary are required:
+EAPOL received before authorization must reach enX's input path (today it goes only to our control port), and
+`PianoWifiEthernet::outputPacket` must recognize an Ethernet-II EAPOL frame and route it to the existing pre-authorization EAPOL
+transmit path while `fLinkUp` is false, with all other data still blocked — the tap must work while the advertised link is down,
+so this is not fixed by raising the data link early. Our private key contract becomes a second frontend to the same key
+operation, not a parallel implementation: the ioctl may return once the key is validated and queued, completion waits for the
+firmware, generation checks reject keys of a previous association, and a firmware failure produces no RSN event and no link-up.
+B is the long-term default — it follows the Apple lifecycle the 27.3 facts show and leaves room for enterprise extensions later;
+A stays as the fallback and the A/B control.
+
+### 8.5 Staged milestones, each with its one-boot test
+
+**Entry gate:** the adoption question is settled on the tablet first (wm2's mode sweep, §6.2–§6.3): until CoreWiFi reports our
+interface in `wdutil` and CoreWLAN scans through, M2 cannot be validated. The gate also requires the logging of §7, host
+fixtures for the exact 656/148/16/264/540/32-byte candidates and for malformed lengths/IEs (each inferred fixture marked with its
+provenance so a tablet observation replaces it without rewriting the state machine), and the Ethernet path kept as a run-time
+A/B control (`piano-wifi-apple80211`, §5); Apple-directed auto-join and our profile auto-join are mutually exclusive per
+generation.
+
+- **M2a — the menu shows a join we started ourselves** (no menu-initiated association). A structured association snapshot from
+  PianoWifi (generation, raw SSID, BSSID, channel, RSSI/PHY, security, associated/authorized, disconnect reason) replaces M1's
+  hard-coded `ENOENT`/INIT answers for STATE, SSID, BSSID, CHANNEL, RSSI, PHY_MODE, RATE, CURRENT_NETWORK, AUTH_TYPE and
+  ASSOCIATE_RESULT; the existing authorized-link hook posts the transitions after the snapshot updates; do not synthesize
+  ASSOC_DONE for a join airportd did not request; the snapshot is cleared before down events and key wipe, and a joined station
+  is not taken off channel (that would lose EAPOL and data). *One boot answers:* with the usual profile join the menu and `wdutil`
+  name the current network with its signal, CoreWLAN's current-network query matches our station snapshot, DHCP/data keep working
+  through the existing authorized path, a loss or leave produces exactly one down transition and a clean disconnected menu with no
+  stale SSID/BSSID; anything airportd initiates by itself (a DISASSOCIATE, its own association) is logged and handled
+  deliberately, not hidden as a display success.
+- **M2b-A — menu-directed open, then PSK, with our supplicant.** Open first: DISASSOCIATE and ASSOCIATE with no credential,
+  asynchronous join, the pending/success/failure result through request 21, the ASSOC_DONE candidate, immediate peer
+  authorization, connected getters and events — this validates the whole public join state machine without EAPOL or keys. Then
+  WPA2-PSK: the credential handoff of §8.4A, public success delayed until AUTHORIZE, passphrase and PMK forms only with anything
+  else rejected; switching, cancellation, timeout, wrong-key failure, duplicate completion and stale-generation callbacks are
+  modelled on the host first. *One boot answers:* picking an open network and then a PSK network in the menu joins each, the menu
+  reports connected, DHCP and data work, and the log says whether airportd started eapolclient or sent CIPHER_KEY — if it did,
+  that is recorded and we move to M2b-B rather than adding a no-op CIPHER_KEY success.
+- **M2b-B — the native eapolclient menu join** (the completion target even when A passes first). Reuse the same ASSOCIATE/state/
+  event machine, but emit ASSOC_DONE before WPA key completion; our supplicant and profile own nothing in that generation; EAPOL
+  routes through enX/NDRV with §8.4B's TX gate; real 148-byte CIPHER_KEY parsing with the cipher translation, PTK/GTK sequencing,
+  generation checks, asynchronous WMI completion and key wiping; after GTK plus authorization post RSN_HANDSHAKE_DONE and the
+  connected set, set RUN and activate the BSD link (open networks keep the no-EAPOL path); the teardown and failure paths —
+  DISASSOCIATE, association failure, EAPOL timeout or cancellation, key-install failure, late events from an old generation —
+  exist before the milestone is called complete. *One boot answers:* an airportd/eapolclient PSK join shows the PTK and GTK
+  CIPHER_KEY requests and no private-supplicant activity, the keys install, RSN completes, the menu and CoreWLAN show connected,
+  DHCP and data work; a repeated join and a disconnect leak no old keys and report no stale current network.
+
+### 8.6 The questions the first M2 boot answers
+
+These share one image/boot once M2b-A reaches the tablet (this section was written with no tablet access):
+
+1. Did the menu use the 656-byte ASSOCIATE directly, call `Apple80211Associate2`, or send a different length?
+2. Did AUTH_TYPE and RSN_IE arrive as separate sets, inline only, or both?
+3. Was ASSOC_DONE consumed with the 540-byte payload, and was request 21 polled before or after it?
+4. Did airportd start eapolclient for PSK right after the 802.11 association, only after LINK_CHANGED, or not at all?
+5. For the PTK and GTK CIPHER_KEY, what were flags, index, cipher and RSC length (metadata only)?
+6. Was RSN_HANDSHAKE_DONE required once, after each key, or ignored in favour of EAP status plus link and state?
+7. Did LINK_CHANGED need the 32-byte inline payload, an empty event plus GET 156, or either?
+
+### 7.8 wm3c: the override in its production form
+
+`out/ram-k273-wm3c` (built from branch commit `19abd9e`, main merged; the 0066 kernel): 237281280 bytes, sha256
+`5f5e7ec093cc1e1df58934b942a19cc7c70eaefd41241a0a426c27a0284825cf`, `verify-ram-images.py` PASS; collection `b8e53fe2...` (26 native
+kexts all this repository's, the vtable check clean); the v5 recipe with `data-volatile-reserve-mib=1024`, the v2 seed volatile,
+the v4 trust cache. Dump image `out/ram-k273-wm3c-dump` (sha256 `ece0cf242dbc2f2ad3ecb1cff35707df5ba608e1a0c7aee68e4a6d77e4c284a8`).
+
+What it answers: whether the override set **before the interface registers** (the default now) makes the **first** airportd adopt
+en2 at boot, with no kickstart. Its checklist is §7.4's with stage 0 now meaning the override on:
+
+| Step | Command / line | Read |
+|---|---|---|
+| boot | `NativeRamBlock: volatile: ... 1024 MiB reserved at start`; `PianoWifi80211: user-client mode 0x8 ...`; the identity line with `IOClassNameOverride IO80211Controller` already at the filter's attach | the production form in effect |
+| 2 min after the registration, no kickstart | A (the `[iflist] Successfully created CWFApple80211 (en2)` / `WiFi network interface added (en2)` lines from airportd's first pid), W, I, a scan step | adoption at the first start |
+| the control on the same boot | `sudo sysctl machdep.piano_wifi_a80211_uc=0`, kickstart -k, 60 s, A, W | `Did NOT find matching WiFi interface` again (the override is what adopts) |
+| the end | console `reset fastboot` | — |
