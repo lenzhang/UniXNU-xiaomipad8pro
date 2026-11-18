@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: BSD-2-Clause-Patent
+# Packaging on a GitHub macOS runner: the FD, the 27.3 kernel-collection inputs, and (when the k27
+# tree is available) RAM images, as run artifacts. Draft: see docs/ci-packaging.md for the three
+# inputs a public runner cannot reconstruct by itself, marked TODO below.
+name: package
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_tag:
+        description: "k27 tag for the kernel (prepare-k27-tree.sh argument)"
+        default: "0070"
+        required: false
+      make_images:
+        description: "Assemble RAM images (needs the k27 tree and the IPSW inputs)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    # macOS is not optional: hdiutil, newfs_apfs, cp -c, codesign and the XNU toolchain.
+    runs-on: macos-26
+    timeout-minutes: 300
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      UNIXNU_RESEARCH: ${{ github.workspace }}/unixnu-research
+      PIANO_K27_TREE: ${{ github.workspace }}/k27
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: tools
+        run: |
+          set -euo pipefail
+          brew install dtc llvm lld cmake mtools
+          go install github.com/blacktop/ipsw@latest || true
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          for t in dtc cmake mtools; do command -v "$t" >/dev/null || { echo "::error::missing $t"; exit 1; }; done
+          command -v ipsw || echo "::warning::ipsw not installed; the IPSW stage will be skipped"
+
+      - name: pinned sources (unixnu.lock)
+        run: python3 scripts/fetch-pins.py --lock unixnu.lock
+
+      - name: firmware (FD)
+        id: firmware
+        run: |
+          set -euo pipefail
+          tooling/unixnu.sh build firmware --skip-preflight
+          fd=$(find out -name '*.fd' | head -1)
+          [ -n "$fd" ] || { echo "::error::no firmware FD produced"; exit 1; }
+          echo "fd=$fd" >> "$GITHUB_OUTPUT"
+          shasum -a 256 "$fd" | tee firmware.sha256
+
+      - name: IPSW inputs (27.3 kernel collection)
+        id: ipsw
+        if: ${{ vars.PIANO_IPSW_URL != '' }}
+        env:
+          IPSW_URL: ${{ vars.PIANO_IPSW_URL }}
+        run: |
+          set -euo pipefail
+          # TODO: the extraction is tooling/k273/ipsw-members.py + decompress-kernelcache.py;
+          # check the invocation against docs/k273-line.md before trusting the output.
+          mkdir -p out/inputs/k273/kc
+          ipsw download ipsw --url "$IPSW_URL" --output out/ipsw
+          ipsw extract --kernel out/ipsw/*.ipsw --output out/ipsw/kc
+          python3 tooling/k273/decompress-kernelcache.py out/ipsw/kc \
+            --out out/inputs/k273/kc/kc273-mac17j.bin
+
+      - name: k27 tree
+        id: k27
+        if: ${{ vars.PIANO_K27_TREE_URL != '' }}
+        env:
+          TREE_URL: ${{ vars.PIANO_K27_TREE_URL }}
+        run: |
+          set -euo pipefail
+          # The k27 tree is a local branch in unixnu.lock ("local: the k27 tree"), so a runner can
+          # only get it as a published tarball: see docs/ci-packaging.md, unknown 1.
+          curl -fsSL "$TREE_URL" | tar -xJ -C "$(dirname "$PIANO_K27_TREE")"
+          tooling/k273/prepare-k27-tree.sh "${{ inputs.kernel_tag }}"
+
+      - name: RAM images
+        id: images
+        if: ${{ inputs.make_images && steps.k27.outcome == 'success' && steps.ipsw.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          K273_KERNEL=$(ls -t "$PIANO_K27_TREE"/out/k27/kernel-k273-*-native.macho | head -1)
+          export K273_KERNEL
+          tooling/k273/build-k273-image.sh
+          python3 tooling/bootimg/verify-ram-images.py out/ram/build-A-bundled.json
+
+      - name: artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: piano-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            ${{ steps.firmware.outputs.fd }}
+            firmware.sha256
+            out/inputs/k273/kc/kc273-mac17j.bin
+            out/ram/*.img
+            out/ram/*.json
+            artifacts/ARTIFACTS.md
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### piano package"
+            echo
+            echo "| stage | outcome |"
+            echo "|---|---|"
+            echo "| firmware | ${{ steps.firmware.outcome }} |"
+            echo "| ipsw inputs | ${{ steps.ipsw.outcome }} |"
+            echo "| k27 tree | ${{ steps.k27.outcome }} |"
+            echo "| RAM images | ${{ steps.images.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
