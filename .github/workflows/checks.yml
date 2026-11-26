@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Scanner self-test
@@ -44,7 +44,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Every unixnu.lock pin (and submodule pin) fetches by its commit
         run: python3 scripts/fetch-pins.py --verify
       - name: The k27 tree from upstream plus patches/k27-tree has the pinned tree id
@@ -55,7 +55,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Host tools the tests call (mtools for the FAT images, llvm for the freestanding selector build)
         run: brew install mtools llvm
       - name: Host tests (no Apple content, no out/, no tablet)

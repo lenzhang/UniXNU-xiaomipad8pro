@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Pinned commits fetch
         run: python3 scripts/fetch-pins.py --verify
       - name: Pins behind their upstream branch (report)
@@ -28,7 +28,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Apple OSS pins of the kernel environment
         run: WORK="$RUNNER_TEMP/ci" bash tooling/ci/k27-kernel.sh verify
       - name: The IPSW's index is still served (no member downloaded)
