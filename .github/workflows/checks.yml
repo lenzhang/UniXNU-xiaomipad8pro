@@ -63,7 +63,7 @@ jobs:
         env:
           SELFTEST_TIMEOUT: "1500"
         run: python3 scripts/ci/self-tests.py --junit "$RUNNER_TEMP/self-tests.xml"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: self-tests-report

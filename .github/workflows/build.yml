@@ -53,7 +53,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/fd"
           shasum -a 256 out/fd/piano-uefi-A-bundled.fd | tee "$RUNNER_TEMP/fd/fd.sha256"
           cp out/fd/build-A-bundled.log "$RUNNER_TEMP/fd/" || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: fd-hash
@@ -112,7 +112,7 @@ jobs:
           { echo "commit $(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"; echo "k27 tree $(git -C "$WORK/k27-tree" rev-parse 'HEAD^{tree}')"
             echo "xnu source $(git -C "$WORK/k27-tree/out/k27/xnu" rev-parse 'HEAD^{tree}')"; xcodebuild -version | tr '\n' ' '; echo; } > BUILD-INFO.txt
           cat SHA256SUMS BUILD-INFO.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kernel-kexts
           path: |
