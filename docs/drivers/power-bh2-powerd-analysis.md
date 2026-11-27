@@ -292,6 +292,42 @@ this is not a captured daily write return and does not retroactively prove the
 older receiver/backend. An earlier policy denial could also mask the receiver's
 return. `IODTNVRAM=1` in an allocation census cannot overcome this routing gap.
 
+### Verified platform publication site (`ArmDTPlatform::excludeList`)
+
+A read-only live registry inspection on installed `v13.1y12q` (2026-11-27,
+`ioreg -r -c IODTNVRAM -l -w0` and `ioreg -p IODeviceTree -n options -w0`)
+together with source inspection of XNU `IOPlatformExpert.cpp` and
+`ArmDTPlatform.cpp` (pinned commit `e8bd8d5d`) establishes the exact site where
+the duplicate `IOPlatformDevice` nub replaces `IODTNVRAM`:
+
+1. In `IODTPlatformExpert::processTopLevel(rootEntry)` (`IOPlatformExpert.cpp:1737`),
+   `publishNVRAM()` creates the real `IODTNVRAM` object (`gIOOptionsEntry`,
+   observed live in `IOService` as `options <class IODTNVRAM, id 0x10000011a>`
+   with active child `IODTNVRAMDiags` reporting `CommonUsed = 11` bytes out of
+   `0x800`, `SystemUsed = 0`, `Version = 1`, and child `options-common
+   <class IODTNVRAMVariables>`).
+2. Twelve lines later (`IOPlatformExpert.cpp:1749`), `processTopLevel()` runs
+   `createNubs(this, IODTFindMatchingEntries(rootEntry, kIODTExclusive, excludeList()))`.
+3. `ArmDTPlatform::excludeList()` returns `"()"` (empty list; compare
+   `GenericARMPE::excludeList()` which explicitly includes `'options'`).
+4. Consequently `createNubs()` instantiates an `IOPlatformDevice` nub for every
+   top-level device-tree child including `options` (observed live 49 objects
+   later as `options <class IOPlatformDevice, id 0x10000014b>` under
+   `IODeviceTree:/`), shadowing `IODTNVRAM` (`0x10000011a`) at
+   `IODeviceTree:/options`.
+5. The same live check also confirmed `/var/MobileSoftwareUpdate/Hardware/Battery/`
+   is absent and `hw.model = Mac17,11` / `hw.targettype = K114c`.
+
+Excluding `'options'` in `ArmDTPlatform::excludeList()` (returning `"('options')"`
+while keeping `chosen`, `cpus`, `arm-io`, `defaults`, `product`, and `buttons`
+unchanged) is therefore the exact, minimal single-site edit needed to preserve
+the canonical `IODTNVRAM` receiver at `IODeviceTree:/options`. Because
+`ArmDTPlatform` is linked into the kernel binary (`stage_platform` in
+`tooling/ci/k27-kernel.sh`), shipping it requires a dedicated kernel build and
+separate RAM qualification (not mixed into the `v13.1y12u` ESP-only daily
+update on kernel `0076`). Durable cross-reboot NVRAM persistence remains a
+separate follow-up requirement (`IONVRAMController`).
+
 ### If the receiver is the actual IODTNVRAM
 
 | Function | 0076 address | Verified behavior relevant here |
@@ -475,18 +511,18 @@ The daily Mac write target would additionally dispatch to IOPlatformDevice's
 Unsupported method; even correcting that route leaves missing durability.
 No evidence supports missing system partition as the unique root cause.
 
-**ONE change:** **Design only: preserve the existing IODTNVRAM object as the
-canonical `IODeviceTree:/options` receiver during platform publication**, behind
-a default-off qualification gate. Retain its original validation/setProperties
-methods and security policies; prevent a generic platform nub from replacing
-that path. Do not implement a forwarding bypass or generic writable options
-dictionary. This is the smallest identified **Mac property-dispatch repair**:
-it removes the proven Unsupported receiver, not the daily input failure or the
-durability gap. Identify and inspect the actual ArmDTPlatform publication edit
-site before a patch; the supplied captures do not establish where replacement
-occurred. An edit involving platform/kernel publication must be reviewed as
-such, not shipped as an ADT partition tweak. No speculative kernel/platform
-patch is committed here.
+**ONE change:** **Design verified (`ArmDTPlatform::excludeList()` -> `"('options')"`):
+preserve the existing IODTNVRAM object (`0x10000011a`) as the canonical
+`IODeviceTree:/options` receiver during platform publication**, so
+`IODTPlatformExpert::processTopLevel()` (`IOPlatformExpert.cpp:1749`) stops
+creating the duplicate `IOPlatformDevice` nub (`0x10000014b`) that shadows it.
+Retain `IODTNVRAM`'s original validation/`setProperties` methods and security
+policies; keep `chosen`/`cpus`/`arm-io`/`defaults`/`product`/`buttons`
+unchanged. Do not implement a forwarding bypass or generic writable options
+dictionary. Because `ArmDTPlatform` is linked into the kernel binary
+(`tooling/ci/k27-kernel.sh` `stage_platform`), shipping this requires a
+dedicated kernel build and RAM qualification separate from the `v13.1y12u`
+kernel-`0076` daily line; no kernel/platform patch is committed here yet.
 
 For that one proposed change, the host review gate must prove a single canonical
 IODTNVRAM path, no duplicate/replacement on repeated nub publication, unchanged
