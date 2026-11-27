@@ -1,11 +1,12 @@
 # BH-2: macOS 27.3 powerd storage contract
 
-**OWNER-0748(b), 2026-11-27. Host analysis and opt-in publisher port only;
-storage fix and fix-image gate HOLD.** The saved `v131y12t-qual1` capture proves
-a persistent-write failure after pack discovery. It does **not** preserve the
-selected-backend log or the underlying IOKit property-write result. The exact
-error-producing conditions in powerd are identified below; choosing one kernel
-root cause or claiming a persistence fix from this evidence would be unjustified.
+**OWNER-0748(b), updated 2026-11-27. Host analysis only; fix-image gate HOLD.**
+The fresh `v131y12u-daily1` error is **powerd's own missing-BatteryData return**,
+before a persistent write. `serviceFlags=4` is its literal baseline battery-health
+service-flags seed, not a storage-backend selector. The older `v131y12t-qual1`
+`0xe00002ca` occurs later, after record construction, in the persistent writer.
+Kernel CHRP synchronization independently returns `0xe00002d8` for its missing
+controller. Equal numeric codes do not connect these different call paths.
 
 Both `piano-power-ps-fields` and `piano-power-ps-health` remain default **0**.
 The latter requires `piano-power-ps=1 piano-power-ps-fields=1`. The 80/75% charge
@@ -40,6 +41,9 @@ ported; previous analysis documents containing local paths were not copied.
 
 ## Saved failure evidence
 
+The following table describes the **older health-enabled** `v131y12t-qual1`
+capture. The new daily capture is analyzed separately below.
+
 | Saved reference | Sanitized observation | Consequence |
 |---|---|---|
 | `bf-grade.txt`, `bf-pack.txt` | Exactly one registered `AppleSmartBatteryPack`, ID 0, FeatureFlags 1024; nested identity present; full/raw/nominal 8781 mAh, design 9200 mAh, cycles 122 | The earlier missing class/dictionary explanation no longer explains this failure. |
@@ -53,6 +57,92 @@ The saved health log has no `batteryHealthStoragePersistent` messages naming
 the selected storage type and no raw `IORegistryEntrySetCFProperty` result.
 The kernel console does not identify the failed battery-health write's size,
 permission decision, or return code. These absences bound the diagnosis.
+
+## Fresh daily evidence and exact NotReady path
+
+Read directly: `20261127-runs/v131y12u-daily1/bh2-probe.txt` (876 lines) and
+`console.out` (30,257 lines), supplied private host captures for `84d8bfdb`,
+27.3 / `26C5035r`, with `piano-power-ps-fields=0 piano-power-ps-health=0`.
+Raw captures and runtime identity data are not copied into this repository.
+
+| Input | SHA-256 |
+|---|---|
+| `bh2-probe.txt` | `44541e3eab5fb62b7540175a6c8fac3d4098f5357e0ace26fc24e941cc1f69d8` |
+| `console.out` | `597cf9d926bec7368fbdaf3fd0588ca72ce8c3a83971e80ff80c135a1a17c021` |
+| `kernel-k273-0076-native.macho` | `00840bd590be173af429eb7a322534e6fa8a33b1ae9653a3218e5311eee76521` |
+
+| Exact capture location | Observation | What it establishes |
+|---|---|---|
+| Probe line 12, class-instance counts | AppleSmartBattery=1, AppleSmartBatteryPack=0, IODTNVRAM=1, IONVRAMController=0 | An allocated NVRAM object does not establish the class of the DT path receiver. No opt-in pack exists in this capture. |
+| Probe lines 321–327 | DT options is **IOPlatformDevice**; its only displayed property and the sole `nvram -p` entry are empty boot-args | The path used by powerd is a generic platform nub in this snapshot. It is not an IODTNVRAM receiver. |
+| Probe lines 331–335, repeated through 875 | Validation status 0 with null stored serial; create status `0xe00002d8`, serviceFlags 4; reset/init/update errors follow | 109 occurrences of each message; zero Created new pack health data and zero Failed to write pack health data messages. The initialization failure precedes writing. Periodic sequences are about five seconds apart, with additional interleaved callbacks. |
+| Console lines 44–49 | Bank 8192 bytes, common data offset `0x30`, size `0x800`, system offset `0xffffffff`, size 0; ephemeral mode unsupported | CHRP proxy was decoded. The missing system partition is not evidence of failure to initialize the format. |
+| Console lines 1137–1149 | CHRP serializeVariables: No _nvramController; sync returns `0xe00002d8` | A separate controller-dependent sync fails. These lines do not identify a battery-health property write. |
+| Console lines 1162–1165 | Image4 requires immutable NVRAM; allowed to mutate NVRAM: 0 | Preserve this posture. The message alone does not identify the return of the battery-health writer or prove a blanket denial of all IOKit NVRAM variables. |
+
+### Literal origin of serviceFlags=4
+
+In the exact supplied arm64e powerd, reset/create routine `sub_10001eaa0`
+starts status at `0xe00002c2` (BadArgument) at `0x10001eacc–0x10001ead0`.
+It calls `BHStorageSession resetForPack:` at `0x10001eaf8`, then checks the
+source, source properties, logical pack and **cached pack BatteryData**:
+
+1. `0x10001eb40` calls `sub_100012a80(packId)`. That accessor resolves the
+   logical pack with `sub_1000123f4`, then returns its pointer at **`pack+0xa0`**
+   (`0x100012aac`). The refresh path loads registry **BatteryData** into exactly
+   that slot at `0x100017928–0x100017940`. Discovery separately matches the
+   AppleSmartBatteryPack class and ID at `0x100016e40–0x100017050`.
+2. `0x10001eb4c` branches on a null accessor result to `0x10001ebd8`.
+   **`0x10001ebdc` adds `0x16` to `0xe00002c2`, producing `0xe00002d8`.**
+3. `0x10001eb78` loads **literal 4** into w24. The cold log stub receives
+   status=w22 and serviceFlags=x24 at `0x10001ec90–0x10001ec9c`, then
+   `sub_1000696f0` emits Failed to create persistent storage
+   (`0x10006971c`, log call `0x100069728`).
+4. The same routine logs Failed to reset data for pack through
+   `sub_100069738` (`0x10001ecac`), and returns status at `0x10001ebb4`.
+
+**Meaning:** 4 is the baseline seed of powerd's **Battery Service Flags** word.
+It has no SMC/NVRAM/CFPreferences selection meaning and is not read from an
+IOService matching result, source FeatureFlags, options, or a controller.
+Successful construction also seeds 4 (`0x10001ed24–0x10001ed30`), ORs in
+additional conditions, and stores the word under Battery Service Flags at
+`0x10001ee9c–0x10001eec0`. It therefore does not itself mean a missing controller
+or a missing serial. Serial validation separately adds `0x400` for absent/wrong
+type or `0x800` for empty at `sub_1000153c4`. The null-BatteryData exit precedes
+that check. The stripped binary does not provide the private enum's source
+spelling; no invented symbolic name or independent bit-2 fault is assigned here.
+
+### Validation and propagation to the five messages
+
+`sub_10001e43c` reads stored history through `sub_100015770` at `0x10001e4c8`.
+It accepts a stored dictionary only with a nonempty Battery Serial and a Battery
+Service Flags value. A successful read with nil history reaches the validation
+error at `0x10001e794–0x10001e804`: the displayed serial is taken from the
+**stored history**, and status is the read's w25=0. This does not report a
+failed NVRAM set or a hardware serial read.
+
+After the authentication gate (`0x10001e5ac`), it calls reset/create at
+`0x10001e5c0`. The returned NotReady is copied to w19 at
+`0x10001e5d4–0x10001e5d8`. The init error is emitted through
+`sub_1000695fc` at `0x10001e82c` (format `0x100069620`, log `0x10006962c`).
+The final update error uses `sub_10006963c`, called at `0x10001e6c0`, and
+returns the same w19 at `0x10001e690`.
+
+The write at **`0x10001e6d0` is reachable only when reset/create returns zero**.
+The daily null-BatteryData exit never reaches it. It neither calls
+nvramRawDataWrite nor obtains its NotReady from AppleSMC, a pack user client,
+IODTNVRAM setProperty/setProperties, CHRP setVariable, or sync. Source properties
+and a logical pack passed the earlier checks (otherwise status would remain
+BadArgument); the failed prerequisite is specifically the cached BatteryData.
+Zero live pack instances and both disabled publisher gates explain that missing
+input without postulating a persistent-write attempt.
+
+The **older** enabled run instead logs Created new pack health data and then
+Failed to write pack health data. It passes reset/create and reaches
+`sub_100015fd0`. Its `0xe00002ca` is the later normalized writer error described
+below. The change in code is explained by reaching different stages with
+different published inputs; it is not evidence that a storage error changed
+from IOError to NotReady.
 
 ## End-to-end path table
 
