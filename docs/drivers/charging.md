@@ -742,3 +742,24 @@ analysis, the fix and its images: [charging-policy.md](charging-policy.md) §17.
   stayed so: the early DSP (`piano-power-delay=0`) is the most promising next test.
 - **Built (not run):** the whole complex logged and diffed with every report, the 2 s watch of the stop, the IORegistry picture for
   a shell (`PianoChargerText`, `PianoCharger`, `PianoChargerChanges`), and `piano-power-chgfix` (default 0; level 1) (§20.4-20.8).
+
+## Measured 2026-11-27 (installed `v13.1y12q` & `v13.1y12u` on Mac mini 5 V / 3 A USB-C port)
+
+Live `PianoPower` / `PianoCharge` telemetry on the Mac mini 5 V USB-C host port (`OWNER-0939`, `OWNER-1001`,
+`OWNER-1015`; `80/75%` hold ON, Charge Pump `CPControl=2` read-only/OFF, `MiPPS=0`, all thermal guards ON):
+
+| State | `ICL` (`0x2008`) / `AICL` (`0x2029`) / `FCC` | Bus input (`IBUS` / `VBUS` / `InputMW`) | Battery net (`Pack0+Pack1` / `BatteryMW`) | Display & policy |
+|---|---|---|---|---|
+| Installed `v13.1y12q` loginwindow idle (`09:39`, `34%`) | `3000` / `1650` / `1500 mA` (`RpMA=3000`, `PD=0`) | `1644 mA` @ `4727 mV` (`7771 mW`) | **`+701 mA`** (`+350/+351 mA`, **`+2691 mW`**) | Lit (auto `250/1952`), `powermode=2` |
+| Installed `v13.1y12u` desktop idle (`10:14`, `34%`) | `3000` / `1650` / `1500 mA` (`RpMA=3000`, `PD=0`) | `1644 mA` @ `4719–4723 mV` (`7758–7764 mW`) | **`+514 to +543 mA`** (**`+1990 to +2078 mW`**) | Lit (`1086/1952`), `powermode=2`, CPU `85–86%` idle |
+| Installed `v13.1y12u` LPM + display off (`10:15–10:17`, `34%`) | `3000` / `1650` / `1500 mA` (`RpMA=3000`, `PD=0`) | `1644 mA` @ `4723–4728 mV` (`7764–7772 mW`) | **`+362 → +535 mA`** (**`+1385 → +2049 mW`** rising as background idle jobs finished) | `piano-display-power=No`, both KTZ8866 `lit=No`, `powermode=1` (`Power Saver`, GPU `342 MHz` cap); restored to `powermode=2` after check |
+
+- **Bus vs battery current:** The 2026-11-12 P2 figure (`1453–1594 mA` at ~7.8 W) was USB **bus** current (`0x20004`),
+  when packs still discharged `−173 → −46 mA` under higher idle draw. Current installed builds already hold
+  `ICLReadback=3000 mA` with hardware AICL at `1650 mA` (`IBUS=1644 mA`, `7.77 W`), leaving `+2.0–2.7 W` net positive
+  charge into the battery while idle on the Mac port.
+- **Display sleep permission:** `pmset displaysleepnow` returns `error 1004` from a non-root SSH shell at loginwindow
+  but succeeds cleanly (`DSN_RC=0`, turning off both KTZ8866 backlights and `piano-display-power`) when invoked as root.
+- **Queue battery-net check (`OWNER-1015`):** the tablet test queue runs a lightweight read-only check
+  (`tablet-batt-net.sh`) logging per-run battery net (`ABL mV` or macOS `%` + signed `BatteryMW`) and pausing runs
+  only when consecutive checks show sustained net discharge below the safety floor. [November 27 results](../results-2026-11-27.md#live-5-v-usb-c-charging-and-low-power-check)
