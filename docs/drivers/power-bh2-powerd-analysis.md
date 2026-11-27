@@ -169,9 +169,9 @@ capability. `unknown` identifies a missing observation or an unqualified path.
 | Internal write caller | `0x100015fd0–0x10001611c` | ours-OK | Validate pack dictionary and look up existing pack; call persistent singleton `dataWrite:forPack:`. Failure is logged and propagated, without a successful history publication. |
 | Per-pack root shape | `dataCopyForPack:outData:` `0x100002934`; `dataWrite:forPack:` `0x100002b74` | ours-OK | Root `BatteryPacks` dictionary indexed by decimal ID string; per-pack dictionary. Read accepts legacy flat root. Write replaces one record and preserves other packs. Host replay covers this contract. |
 | Backend selection | `storageTypeGet` `0x1000026dc`; predicate `0x10002a2c8` | unknown | Return `isMac XOR 1`; isMac compares MGCopyAnswer(DeviceClass) to Mac. Mac gives type 0 NVRAM; other/missing class gives type 1 CFPreferences. Runtime DeviceClass/type was not saved. |
-| Root dispatch | write `0x1000026f8`; copy `0x1000027e8` | ours-OK | Type 0 NVRAM, type 1 CFPreferences, type 2 Unsupported (`0xe00002c9`). No retry on the other backend after failure. |
+| Root dispatch | write `0x1000026f8`; copy `0x1000027e8` | ours-OK | Type 0 NVRAM, type 1 CFPreferences, type 2 InternalError (`0xe00002c9`). No retry on the other backend after failure. |
 | NVRAM encoding | `rootDictNVRAMWrite:` `0x100001f6c`; copy `0x100002034` | ours-OK | Foundation JSON bytes in NSData; decoded root must be a dictionary. Successful writes/copies cache the root in process memory. Invalid JSON and wrong types have separate errors. |
-| NVRAM target | `init` `0x100001d0c–0x100001d58`; raw copy `0x100001de4`; raw write `0x100001e9c` | unknown | `IODeviceTree:/options`, key `40A0DDD2-77F8-4392-B4A3-1E7304206516:battery-health`. Existing proxy is proven; this operation's raw result is not. The UUID is a public variable namespace, not a unit identity. |
+| NVRAM target | `init` `0x100001d0c–0x100001d58`; raw copy `0x100001de4`; raw write `0x100001e9c` | ours-missing | `IODeviceTree:/options`, key `40A0DDD2-77F8-4392-B4A3-1E7304206516:battery-health`. Daily receiver is IOPlatformDevice, whose property method is Unsupported; the old run's raw result remains unknown. The UUID is a public variable namespace, not a unit identity. |
 | IOKit wrapper | cache `_IORegistryEntrySetCFProperty` `0x184eca620`; plural `0x184eca6a8` | ours-OK | Wrap one key/value in CFDictionary, IOCFSerialize, issue registry-set-properties MIG call; choose transport error if nonzero, otherwise return the kernel method's result. Does not itself map every error to IOError. |
 | Kernel property method | local XNU `IOUserClient.cpp`, `is_io_registry_entry_set_properties`; `IONVRAM.cpp`, `IODTNVRAM::setProperties` | unknown | Unserialize, MAC policy / allowable-property checks, then setProperties and per-key setter. The failed call's actual result was not captured. |
 | Kernel variable validation | `IODTNVRAM::setPropertyWithGUIDAndName` | unknown | Require initialized format; enforce variable permission, type, size; translate GUID, call format setVariable. Static candidates include NotPermitted/NotPrivileged/BadArgument/NoSpace/NotReady. The executable carries system-NVRAM allowance; runtime entitlement recognition was not measured. |
@@ -205,7 +205,7 @@ and also requires a matching stored ID, before calling the Objective-C writer.
 Missing history is success with a nil output; it is distinct from a failed
 read. Public tester endpoints do not expose a generic unrestricted storage API.
 
-## Exact error conditions and root-cause boundary
+## Older IOError: exact writer conditions and evidence boundary
 
 On the **NVRAM branch**, the failing path is:
 
@@ -236,7 +236,7 @@ This branch can produce **the identical saved code** without a NVRAM property
 write. The current log does not distinguish it. Assuming that an Apple-looking
 model name proves MG DeviceClass=Mac is insufficient.
 
-**Root cause established:** the new telemetry passes discovery/initial creation,
+**Older-run root cause established:** the new telemetry passes discovery/initial creation,
 but persistent-write success is a required dependency and fails. **Exact kernel
 leaf / backend: unknown.** The strongest conditional location is the masked
 NVRAM property failure above; the alternative CFPreferences synchronization
@@ -251,6 +251,115 @@ existing more complete capture or a separately qualified diagnostic build.
 This task performs no new capture on the tablet. Do not disable entitlement
 checks, expand global NVRAM permissions, patch the daemon, select a false device
 class or fabricate UI fields to work around an unidentified error.
+
+## Kernel 0076: receiver, setter and synchronization
+
+These are direct disassembly findings in the supplied, hashed **0076** kernel,
+using its symbol table. Kernel addresses are unslid full VAs. Public
+[IONVRAM.cpp](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IONVRAM.cpp)
+and
+[IONVRAMCHRPHandler.cpp](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IONVRAMCHRPHandler.cpp)
+provide readable context for the same division between property validation,
+in-memory variable updates and controller-dependent serialization. The public
+sources are not substituted for the 0076 binary.
+
+### The live options receiver matters before the CHRP path
+
+The cache's IOKit wrapper was re-disassembled directly from the supplied 27.3
+dyld cache: `_IORegistryEntrySetCFProperty` at `0x184eca620` creates the
+single-entry CFDictionary and calls the plural method at `0x184eca678`.
+The plural method serializes, calls MIG at `0x184eca704`, then selects transport
+error or kernel result at **`0x184eca714–0x184eca71c`**. The IOError masking
+belongs to powerd's raw writer, not this framework.
+
+0076 `_is_io_registry_entry_set_properties` starts at `0xfffffff00c224064`.
+It checks the decoded object, MAC policy (`0xfffffff00c224160`) and allowable
+properties before the virtual **setProperties** call at `0xfffffff00c224368`.
+This is an IOReturn method, not the boolean setProperty overload.
+
+The live **IOPlatformDevice** vtable (`0xfffffff007e63198`) has the inherited
+setProperties slot at table+`0x330` (object vptr+`0x320`). Its chained pointer
+resolves to **IORegistryEntry::setProperties**, `0xfffffff00c1967b4`, which
+returns literal **`0xe00002c7` (Unsupported)**. The equivalent IODTNVRAM
+vtable slot (`0xfffffff007e66590+0x330`) resolves to `0xfffffff00c217c24`.
+The class name in the fresh probe is therefore a functional distinction.
+
+**Conditional consequence:** on the Mac writer, with the daily receiver and
+successful transport/serialization/MAC checks, the battery-health property set
+would return Unsupported and powerd would normalize it to IOError. It would
+never reach IODTNVRAM or CHRP. The current daily initialization stops earlier;
+this is not a captured daily write return and does not retroactively prove the
+older receiver/backend. An earlier policy denial could also mask the receiver's
+return. `IODTNVRAM=1` in an allocation census cannot overcome this routing gap.
+
+### If the receiver is the actual IODTNVRAM
+
+| Function | 0076 address | Verified behavior relevant here |
+|---|---|---|
+| IODTNVRAM::setProperties | `0xfffffff00c217c24` | Iterates dictionary entries; calls setPropertyInternal at `0xfffffff00c217cfc`, propagating the first nonzero IOReturn. |
+| IODTNVRAM::setProperty | `0xfffffff00c217a2c` | Calls setPropertyInternal at `0xfffffff00c217a38`; converts success to bool. It is not the MIG setter's result-bearing entry. |
+| IODTNVRAM::setPropertyInternal | `0xfffffff00c2178a4` | Parses GUID/name; calls setPropertyWithGUIDAndName at `0xfffffff00c2179f8`. |
+| IODTNVRAM::setPropertyWithGUIDAndName | `0xfffffff00c20ae14` | Checks format at `0xfffffff00c20ae8c`; missing format returns NotReady at `0xfffffff00c20b8a4–0xfffffff00c20b8b0`. Ordinary data writes check permission/type/size, translate GUID at `0xfffffff00c20b7c4`, then call format setVariable at `0xfffffff00c20b7f0`. |
+| IONVRAMCHRPHandler::setVariable | `0xfffffff00c20fc00` | System-active query and GUID selection; locks variable dictionary; calls setVariableInternal at `0xfffffff00c20fd74`. **No serializeVariables/sync/controller check.** |
+| IONVRAMCHRPHandler::setVariableInternal | `0xfffffff00c20dc98` | Computes encoded replacement delta against selected partition usage/size. Common exhaustion returns NoSpace (`0xe00002db`) at `0xfffffff00c20de04`; system exhaustion at `0xfffffff00c20ded4`. Successful dictionary mutation marks new data; no controller required. |
+| IODTNVRAM::syncInternal(bool) | `0xfffffff00c216284` | Checks safe context/format; normal sync-now is rate limited. Calls format sync at `0xfffffff00c21640c`, preserves its IOReturn. |
+| IONVRAMCHRPHandler::sync | `0xfffffff00c20feb0` | Calls serializeVariables at `0xfffffff00c20fef0`; logs nonzero result and returns it at `0xfffffff00c20ff14`. |
+| IONVRAMCHRPHandler::serializeVariables | `0xfffffff00c20ee54` | Controller pointer at this+`0x18`; null test `0xfffffff00c20eec0–0xfffffff00c20eec4`, also after the lock assertion at `0xfffffff00c20f7ac`. Null branch logs No _nvramController at `0xfffffff00c20f7d4`; constructs `0xe00002bd + 0x1b = 0xe00002d8` at `0xfffffff00c20f7dc–0xfffffff00c20f7e4`. |
+| IODTNVRAM::registerNVRAMController | `0xfffffff00c2160fc` | If format exists, delegates to format setController at `0xfffffff00c216198`. Does not create a controller from proxy data. |
+| IONVRAMCHRPHandler::setController | `0xfffffff00c20fdd0` | Installs controller if absent, then reloads backing data. Controller registration is not a harmless flag toggle. |
+
+Only the special string-valued `IONVRAM-SYNCNOW-PROPERTY` /
+`IONVRAM-FORCESYNCNOW-PROPERTY` branches call syncInternal
+(`0xfffffff00c20b1d4`). The ordinary battery-health NSData branch does not.
+Consequently the proposed chain **battery-health set → setVariable → sync →
+No _nvramController → powerd NotReady** does not exist here. Even a raw
+NotReady from a property failure would be masked to IOError by powerd; an
+error from the subsequent explicit sync is discarded.
+
+The observed initialized CHRP format rules out its missing-format branch for
+that object at initialization time. The Image4 immutable-NVRAM log remains
+separate evidence of security posture; neither its code nor its policy should
+be changed to make this experiment pass.
+
+## ADT provenance and rejected partition-only repair
+
+[make-piano-adt.py](../../tooling/adt/make-piano-adt.py) imports
+`unixnu.devicetree.generate` from the local research UniXNU checkout's
+`scripts/` directory. That generator's `empty_nvram_proxy()` supplies
+chosen's four NVRAM properties. The inspected sheng
+`scripts/make-sheng-adt.py::empty_nvram_proxy()` independently has the same
+layout and explicitly describes it as volatile, without a controller:
+
+| Bank region | Header offset | Total / payload size |
+|---|---|---|
+| nvram | `0x0` | Apple header `0x20` |
+| common | `0x20` | `0x810` including header; data `0x30..0x82f` (`0x800` bytes) |
+| free | `0x830` | Remaining `0x17d0` bytes including header |
+
+Bank size is `0x2000`, count 1, current bank 0. Each CHRP header has an
+end-around checksum; the Apple header carries Adler-32 of bytes `[20:]`.
+There is no system partition, persistent backing file, or controller in this
+generator. Repo `tooling/adt/`, `package/`, and `patches/` contain no NVRAM
+controller/storage implementation; the NVRAM references in kernel patch 0068
+only trace halt-time sync. The inspected sheng package/patch sources likewise
+provide no controller implementation.
+
+Crucially, **0076 already handles an absent system partition**.
+CHRP setVariable queries getSystemPartitionActive; with false it maps the
+Apple system GUID to the common GUID (`0xfffffff00c20fcd0`,
+`0xfffffff00c20fd3c–0xfffffff00c20fd48`). With a system region it selects that
+region (`0xfffffff00c20fd30`). Partition absence is therefore not an automatic
+NoSpace/NotReady error. Adding system changes routing, available capacity and
+system-variable policy context; it supplies neither missing BatteryData, a
+correct options receiver, nor persistence. It is not the selected fix.
+
+A RAM-only controller could let sync report success but would still lose
+history across reboot. Registering it can reload/merge its own bank image;
+blank backing, false successful durability and interactions with Image4's
+global NVRAM consumer make it unsuitable as a battery-only repair. Real storage
+requires an owned durable medium, crash-consistent updates and boot reload,
+bounded writes/wear, and unchanged variable permissions and immutable security
+state. No existing implementation/evidence here justifies those guarantees.
 
 ## What Normal and Maximum Capacity require
 
@@ -309,7 +418,7 @@ IODTNVRAM, MAC policy, the real CFPreferences container, or System Information.
 Temporary files prove the replay provider can persist, not that the product
 has a persistent backend. No test success is a RAM/UI qualification.
 
-Validation on this branch (2026-11-27):
+Prior publisher-port validation (2026-11-27, retained for provenance):
 
 | Command | Result |
 |---|---|
@@ -319,34 +428,79 @@ Validation on this branch (2026-11-27):
 | `python3 scripts/ci/privacy-scan.py` | **PASS:** 0 hits, 0 refused files. Staged additions and the full branch diff also pass with 0/0. |
 | `git diff --check` | **PASS.** |
 
-The opt-in publisher, contract replays and analysis are committed. **No
-production storage repair is claimed:** the raw failed-operation evidence
-required to select that change remains missing.
+Current root-cause branch validation (2026-11-27):
+
+| Command / check | Result |
+|---|---|
+| `python3 scripts/ci/self-tests.py --only package/PianoPower/ --only tooling/adt/` | **PASS:** 12 passed, 0 failed, 2 suite-owned skips, 19 existing C/C++ sources without standalone build lines. Includes charge/platform suites, ASan/UBSan health/storage replays and all four ADT tests. |
+| Fresh disassembly | **PASS:** original powerd SHA matches; 460 history/init, 337 reset/create and 95 cold-log instructions freshly decoded from arm64e match the supplied disassembly. Required 0076 setter/CHRP/controller routines and receiver vtable inspected; IOKit property wrapper inspected directly in the supplied cache. Symbol caches/disassemblies are temporary host artifacts, not repository payloads. |
+| `python3 scripts/ci/test-doc-links.py` | **PASS:** 174 Markdown files, 2217 relative links, 462 heading references, 61/61 driver index entries; 0 errors. |
+| `python3 scripts/ci/privacy-scan.py` | **PASS:** 0 hits, 0 refused files. |
+| `git diff --check` | **PASS.** |
+
+No production code, ADT, kernel patch, boot configuration or test model was
+changed by this root-cause analysis. Existing contract tests already cover raw
+Unsupported/NotReady normalization, ignored sync failures and reboot loss.
+Passing them is not qualification of a real backend or a storage repair.
 
 ## Fix-image gate
 
-**Status: HOLD — no root-cause storage fix or fix image.**
+**Status: HOLD — no verified single storage repair, no fix image.** A partition
+edit or controller stub does not directly solve the daily error-producing call.
 
-**Path:** Measured gauges → opt-in source/pack ID 0 → powerd history init/update
-→ dataWrite:forPack → rootDictWrite → selected persistent backend → readback
-→ BatteryPacks[0].BatteryHealth → System Information.
+**Path:** Daily: source → logical pack → absent cached BatteryData →
+`sub_10001eaa0` returns local NotReady → no persistent write. Enabled historical
+path: measured pack → reset/create success → `sub_100015fd0` →
+dataWrite:forPack → rootDictWrite → runtime backend → write/readback →
+BatteryPacks[0].BatteryHealth → System Information. On the Mac branch, correct
+options routing and a durable backend are separate requirements.
 
-**Checks:** Pack shape passed in the saved run; host schema/JSON/error regressions
-are available. Storage backend selection, raw failed-operation return, actual
-successful write/readback, durable reboot history, Normal condition and populated
-maximum are **not qualified**. Preserve MaxCapacity=100, percentage, charging/AC
-state, 80/75 hold and unknown time on AC idle/full/hold. Recheck transient partial
-telemetry and truthful faults. Do not clear history to obtain 96%.
+**Checks:** Fresh gates-off absence and local error origin are established;
+older gates-on construction/write failure is established. The daily receiver's
+Unsupported implementation and CHRP's missing-controller sync error are verified
+in 0076. Host tests pass within the bounds above. The older selected backend/raw
+return, a correctly routed permitted write, encoded size/partition usage and
+durable reboot history remain unqualified. Required later checks are actual
+storageType/MG DeviceClass, receiver class and identity at the write, raw IOKit
+status, unchanged MAC/entitlement decisions, write/readback and a true reboot
+readback. Then check Normal/maximum, truthful faults and pack-replacement
+identity limitations. Preserve source MaxCapacity=100, percentage, charging/AC
+state, 80/75 hold, fixed-PD policy and unknown time on AC idle/full/hold.
 
-**Root cause:** Persistent write dependency fails with normalized `0xe00002ca`.
-Exact NVRAM setter failure versus CFPreferences synchronize failure remains
-unknown because the saved log lacks backend/raw-result evidence. NVRAM
-controller absence is independently proven, but its ignored sync error does
-not explain this code. A unique production fix cannot yet be selected.
+**Root cause:** The daily `0xe00002d8, serviceFlags=4` is missing cached pack
+BatteryData with baseline service flags, expected with the publisher opt-ins
+off. It is not the kernel sync return. The earlier `0xe00002ca` is a later
+persistent-writer failure whose raw cause/backend was erased or not captured.
+The daily Mac write target would additionally dispatch to IOPlatformDevice's
+Unsupported method; even correcting that route leaves missing durability.
+No evidence supports missing system partition as the unique root cause.
 
-**ONE change:** **Not selected; HOLD.** The carried default-off publisher is a
-prerequisite port, not a new fix for this failure. No speculative storage change
-is committed. Identify the backend and raw failure first, then specify exactly
-one corresponding storage repair and its bounds/error/durability checks before
-building a fix image. Both opt-ins remain 0 until a later RAM-qualified result;
-rollback is omission/0. This analysis authorizes no new device operation.
+**ONE change:** **Design only: preserve the existing IODTNVRAM object as the
+canonical `IODeviceTree:/options` receiver during platform publication**, behind
+a default-off qualification gate. Retain its original validation/setProperties
+methods and security policies; prevent a generic platform nub from replacing
+that path. Do not implement a forwarding bypass or generic writable options
+dictionary. This is the smallest identified **Mac property-dispatch repair**:
+it removes the proven Unsupported receiver, not the daily input failure or the
+durability gap. Identify and inspect the actual ArmDTPlatform publication edit
+site before a patch; the supplied captures do not establish where replacement
+occurred. An edit involving platform/kernel publication must be reviewed as
+such, not shipped as an ADT partition tweak. No speculative kernel/platform
+patch is committed here.
+
+For that one proposed change, the host review gate must prove a single canonical
+IODTNVRAM path, no duplicate/replacement on repeated nub publication, unchanged
+variable and MAC checks, unchanged boot-args/security variables, and clean
+gate-off behavior. Kernel/platform execution and crash/reboot durability cannot
+be established by the existing Foundation replay. If the historical backend is
+CFPreferences, this route repair does not address it. A persistent controller
+would be a separate design with the storage/security tradeoffs above, not an
+addition hidden inside this change. This is why no safe complete fix image can
+be selected from the present evidence.
+
+Both `piano-power-ps-fields` and **BH-2 `piano-power-ps-health` stay default 0**;
+existing health opt-in still requires fields and source. No new enablement is
+made merely to remove the daily log. Rollback remains omission/0. **No SIP/CSR
+changes, no Image4/security weakening, no history deletion; 80/75 hold and Charge
+Pump OFF remain untouched.** No tablet, queue, frozen output, login secret,
+publish or push operation is authorized/performed by this work.
